@@ -116,7 +116,11 @@ export function fetchPacks(): Promise<void> {
   return dispatch((id) => ({ type: "pipeline.pack.list", id }), false);
 }
 
-/** Pull + in-memory reload a registry's installed packs (scope `pipeline:manage`). */
+/**
+ * Pull + in-memory reload a registry's installed packs (scope `pipeline:manage`).
+ * `name` is required here; the protocol supports omitting it (refresh all registries),
+ * but the web UI only exposes per-registry refresh.
+ */
 export function refreshRegistry(name: string): Promise<void> {
   return dispatch((id) => ({ type: "pipeline.registry.refresh", id, name }), true);
 }

@@ -446,7 +446,7 @@ describe("refreshRegistry", () => {
 
     await svc.refreshRegistry("reg");
 
-    expect(installCallCount).toBeGreaterThan(countAfterInstall); // installPack was called again
+    expect(installCallCount).toBe(countAfterInstall + 1); // installPack called exactly once on refresh
     const reloaded = sink._packs.get("ref-pack");
     expect(reloaded).toBeTruthy();
     expect(reloaded!.pipeline).toHaveLength(2); // was 1, now 2 after reload

@@ -176,6 +176,17 @@ describe("pipeline.registry.refresh", () => {
     const res = await run({ type: "pipeline.registry.refresh", id: "ref3" }, OWNER);
     expect(res.type).toBe("pipeline.pack.list.result");
   });
+
+  test("refresh with an installed pack returns that pack in the list result", async () => {
+    const dir = join(tmp, "refreshable");
+    writePack(dir, "refreshable");
+    await run({ type: "pipeline.pack.install", id: "ref4", dir }, OWNER);
+    const res = await run({ type: "pipeline.registry.refresh", id: "ref5" }, OWNER);
+    expect(res.type).toBe("pipeline.pack.list.result");
+    if (res.type === "pipeline.pack.list.result") {
+      expect(res.installed.find((p) => p.id === "refreshable")).toBeTruthy();
+    }
+  });
 });
 
 describe("error + guard branches", () => {
