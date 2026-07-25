@@ -35,6 +35,7 @@ import {
   fetchPacks,
   installPack,
   packsState,
+  refreshRegistry,
   removePack,
   selectPack,
   trustPack,
@@ -124,6 +125,7 @@ const PackBrowser: Component = () => {
                 registries={s().registries}
                 busy={s().busy}
                 onAddRegistry={(url, name, ref) => void addRegistry(url, name, ref)}
+                onRefresh={(name) => void refreshRegistry(name)}
                 onInstall={(packId, trusted) => void installPack(packId, trusted)}
                 onRemove={(packId) => void removePack(packId)}
                 onTrust={(packId, trusted) => void trustPack(packId, trusted)}
@@ -156,6 +158,7 @@ export interface PackBrowserViewProps {
   /** A mutation is in flight — disable action buttons. */
   busy?: boolean;
   onAddRegistry: (url: string, name?: string, ref?: string) => void;
+  onRefresh: (name: string) => void;
   onInstall: (packId: string, trusted: boolean) => void;
   onRemove: (packId: string) => void;
   onTrust: (packId: string, trusted: boolean) => void;
@@ -176,6 +179,7 @@ export const PackBrowserView: Component<PackBrowserViewProps> = (props) => {
         registries={props.registries}
         busy={props.busy}
         onAddRegistry={props.onAddRegistry}
+        onRefresh={props.onRefresh}
       />
       <InstalledSection
         installed={props.installed}
@@ -203,6 +207,7 @@ const RegistriesSection: Component<{
   registries: RegistryWire[];
   busy?: boolean;
   onAddRegistry: (url: string, name?: string, ref?: string) => void;
+  onRefresh: (name: string) => void;
 }> = (props) => {
   const [url, setUrl] = createSignal("");
   const [name, setName] = createSignal("");
@@ -314,10 +319,21 @@ const RegistriesSection: Component<{
                       @{r.ref}
                     </span>
                   </Show>
-                  <span class="ml-auto text-[11px] text-fg-faint">
+                  <span class="ml-auto flex items-center gap-2">
                     <Show when={r.packCount !== undefined}>
-                      {r.packCount} pack{r.packCount === 1 ? "" : "s"}
+                      <span class="text-[11px] text-fg-faint">
+                        {r.packCount} pack{r.packCount === 1 ? "" : "s"}
+                      </span>
                     </Show>
+                    <button
+                      type="button"
+                      class="rounded border border-border px-2 py-0.5 text-[11px] text-fg-muted hover:border-accent/40 hover:text-fg disabled:opacity-50"
+                      disabled={props.busy}
+                      onClick={() => props.onRefresh(r.name)}
+                      title="Pull + reload this registry"
+                    >
+                      ↻
+                    </button>
                   </span>
                 </div>
                 <div class="mt-1 break-all font-mono text-[11px] text-fg-faint">

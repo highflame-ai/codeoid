@@ -10,6 +10,7 @@ vi.mock("./connection", () => ({
 import {
   fetchPacks,
   addRegistry,
+  refreshRegistry,
   installPack,
   selectPack,
   packsState,
@@ -82,6 +83,17 @@ describe("packs store", () => {
       type: "pipeline.pack.select",
       packId: null,
     });
+  });
+
+  it("refreshRegistry sends the verb with the registry name and applies the result", async () => {
+    clientRequestMock.mockResolvedValueOnce(
+      result({ registries: [{ name: "ai-factory", url: "u", cached: true }] }),
+    );
+    await refreshRegistry("ai-factory");
+    const sent = clientRequestMock.mock.calls[0]?.[0];
+    expect(sent).toMatchObject({ type: "pipeline.registry.refresh", name: "ai-factory" });
+    expect(packsState().busy).toBe(false);
+    expect(packsState().registries[0]?.name).toBe("ai-factory");
   });
 
   it("surfaces a forbidden response.error without crashing", async () => {

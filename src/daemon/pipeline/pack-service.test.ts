@@ -6,7 +6,7 @@
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Pack } from "./interface";
@@ -412,5 +412,60 @@ describe("installed() resilience", () => {
     expect(installed).toHaveLength(1);
     expect(installed[0]!.error).toBeTruthy();
     expect(installed[0]!.active).toBe(false);
+  });
+});
+
+describe("refreshRegistry", () => {
+  test("reloads a changed pack.yaml into the live manager without reinstall", async () => {
+    const fixture = tmp();
+    writeRegistry(fixture, ["ref-pack"]);
+    const cacheDir = tmp();
+    const base = fakeSink();
+    let installCallCount = 0;
+    const sink = {
+      installPack: (p: Pack) => { installCallCount++; base.installPack(p); },
+      registries: base.registries,
+      _packs: base._packs,
+    } as ReturnType<typeof fakeSink>;
+
+    const { svc } = makeService({ cacheDir, fixture, sink });
+    await svc.addRegistry({ url: "https://github.com/x/reg.git", name: "reg" });
+    svc.install({ packId: "ref-pack", trusted: true });
+    const countAfterInstall = installCallCount;
+
+    // Simulate git pull delivering a second phase to the pack.yaml.
+    const packYamlPath = join(cacheDir, "reg", "packs", "ref-pack", "pack.yaml");
+    const original = readFileSync(packYamlPath, "utf8");
+    writeFileSync(
+      packYamlPath,
+      original.replace(
+        "phases:\n  - { id: impl",
+        "phases:\n  - { id: plan, kind: skill, skill: build, role: implementer }\n  - { id: impl",
+      ),
+    );
+
+    await svc.refreshRegistry("reg");
+
+    expect(installCallCount).toBe(countAfterInstall + 1); // installPack called exactly once on refresh
+    const reloaded = sink._packs.get("ref-pack");
+    expect(reloaded).toBeTruthy();
+    expect(reloaded!.pipeline).toHaveLength(2); // was 1, now 2 after reload
+  });
+
+  test("does not link skills for untrusted packs on refresh", async () => {
+    const fixture = tmp();
+    writeRegistry(fixture, ["untrusted-pack"], ["spec"]);
+    const cacheDir = tmp();
+    const skillsDir = tmp();
+    const sink = fakeSink();
+    const { svc } = makeService({ cacheDir, skillsDir, fixture, sink });
+
+    await svc.addRegistry({ url: "https://github.com/x/reg.git", name: "reg" });
+    svc.install({ packId: "untrusted-pack", trusted: false });
+
+    await svc.refreshRegistry("reg");
+
+    // No skills should be linked — untrusted packs never get #linkSkills called.
+    expect(readdirSync(skillsDir)).toHaveLength(0);
   });
 });

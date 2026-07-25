@@ -784,6 +784,7 @@ export type ClientMessage =
   | PipelineReviseMsg
   | PipelinePackListMsg
   | PipelineRegistryAddMsg
+  | PipelineRegistryRefreshMsg
   | PipelinePackInstallMsg
   | PipelinePackRemoveMsg
   | PipelinePackTrustMsg
@@ -1763,6 +1764,11 @@ export interface PipelineRegistryAddMsg extends BaseClientMsg {
   url: string;
   name?: string;
   ref?: string;
+}
+export interface PipelineRegistryRefreshMsg extends BaseClientMsg {
+  type: "pipeline.registry.refresh";
+  /** Registry name to refresh. Omit to refresh all configured registries. */
+  name?: string;
 }
 export interface PipelinePackInstallMsg extends BaseClientMsg {
   type: "pipeline.pack.install";

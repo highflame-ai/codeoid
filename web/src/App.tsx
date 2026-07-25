@@ -12,6 +12,7 @@ import { Component, Show, createEffect, createSignal, on, onCleanup, onMount } f
 
 import { rememberedApiKey, rememberedOAuthToken } from "./lib/auth";
 import { consumeHandoffCredential, readEmbedAllowedOrigins } from "./lib/handoff";
+import { installEmbedSessionRefresh } from "./lib/embed-refresh";
 import SignIn from "./components/SignIn";
 import Shell from "./components/Shell";
 import {
@@ -20,6 +21,7 @@ import {
   connectionStatus,
   newRequestId,
   send,
+  ZEROID_URL,
 } from "./state/connection";
 import { attachRetryEpoch, attachSession } from "./state/attach";
 import { closeFile, openedFile } from "./state/files";
@@ -46,9 +48,8 @@ const App: Component = () => {
     // The helper enforces a fail-closed trusted-framing-origin gate against the
     // daemon-published allowlist: it consumes the hash ONLY when this page is
     // embedded by an allowlisted parent origin, closing the login-CSRF vector.
-    const handoff = consumeHandoffCredential({
-      allowedOrigins: readEmbedAllowedOrigins(),
-    });
+    const allowedOrigins = readEmbedAllowedOrigins();
+    const handoff = consumeHandoffCredential({ allowedOrigins });
 
     const savedKey = rememberedApiKey();
     const savedToken = rememberedOAuthToken();
@@ -70,6 +71,16 @@ const App: Component = () => {
         // bootstrap surfaces the reason via bootstrapError; SignIn renders it.
       }
     }
+
+    // Embed self-refresh: when the host handed off a rotating refresh token
+    // (persisted by consumeHandoffCredential above), start the scheduler that
+    // rotates our OWN access token shortly before it expires and reconnects
+    // with the fresh one — so the embedded session survives past the token's
+    // 15-minute life with no host re-mint. No-op when no refresh token was
+    // handed off (native / api-key sessions). Started after bootstrap so it
+    // schedules off the token actually in use.
+    onCleanup(installEmbedSessionRefresh({ zeroidUrl: ZEROID_URL }));
+
     setTried(true);
   });
 

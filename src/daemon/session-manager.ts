@@ -632,6 +632,8 @@ mcpHub: this.#mcpHub,
         return this.#packList(msg, auth);
       case "pipeline.registry.add":
         return this.#registryAdd(msg, auth);
+      case "pipeline.registry.refresh":
+        return this.#registryRefresh(msg, auth);
       case "pipeline.pack.install":
         return this.#packInstall(msg, auth);
       case "pipeline.pack.remove":
@@ -2193,6 +2195,20 @@ mcpHub: this.#mcpHub,
     if (denied) return denied;
     try {
       await this.#packs.addRegistry({ url: msg.url, name: msg.name, ref: msg.ref });
+      return this.#packListResult(msg.id);
+    } catch (e) {
+      return this.#pipelineError(msg.id, e);
+    }
+  }
+
+  async #registryRefresh(
+    msg: Extract<ClientMessage, { type: "pipeline.registry.refresh" }>,
+    auth: AuthContext,
+  ): Promise<DaemonMessage> {
+    const denied = this.#packManageGuard(msg.id, auth);
+    if (denied) return denied;
+    try {
+      await this.#packs.refreshRegistry(msg.name);
       return this.#packListResult(msg.id);
     } catch (e) {
       return this.#pipelineError(msg.id, e);

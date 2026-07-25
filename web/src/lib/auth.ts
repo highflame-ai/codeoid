@@ -19,6 +19,15 @@
 
 export const STORAGE_KEY_API_KEY = "codeoid.apiKey";
 export const STORAGE_KEY_TOKEN = "codeoid.token";
+// The rotating refresh token (ZeroID `zid_rt_`) handed off by an embedding host
+// (Studio) alongside the access token. When present, the web UI renews its OWN
+// access token by rotating this at ZeroID's /oauth2/token — the self-reliant
+// embed session model — instead of the host re-minting on a timer. Rotated
+// (replaced) on every successful refresh; single-use like every ZeroID refresh
+// token. SECURITY: same durable-credential caveat as the api key (readable by
+// same-origin script) — it is shorter-lived (bounded by the audience refresh
+// TTL) and audience-scoped, but still never logged.
+export const STORAGE_KEY_REFRESH_TOKEN = "codeoid.refreshToken";
 
 export interface ResolveOptions {
   /** Pre-issued daemon JWT. Takes precedence. */
@@ -178,6 +187,145 @@ export function rememberOAuthToken(token: string): void {
   localStorage.setItem(STORAGE_KEY_TOKEN, token);
 }
 
+/** Persist a rotating refresh token for the self-reliant embed session. */
+export function rememberRefreshToken(refreshToken: string): void {
+  localStorage.setItem(STORAGE_KEY_REFRESH_TOKEN, refreshToken);
+}
+
+/** The stored rotating refresh token, or null when none was handed off. */
+export function rememberedRefreshToken(): string | null {
+  return localStorage.getItem(STORAGE_KEY_REFRESH_TOKEN);
+}
+
+/** Forget the stored refresh token — on sign-out or once it is spent/rejected. */
+export function forgetRefreshToken(): void {
+  localStorage.removeItem(STORAGE_KEY_REFRESH_TOKEN);
+}
+
+/** Decode a JWT payload without verifying it — for reading non-authoritative
+ * hints (exp, aud) the CLIENT uses only for scheduling/routing. The daemon
+ * re-verifies every token on the WS handshake, so a forged payload here buys
+ * nothing. Returns {} on any malformed input (never throws). */
+function decodeJwtPayload(token: string): Record<string, unknown> {
+  try {
+    const part = token.split(".")[1];
+    if (!part) return {};
+    // base64url → base64, then atob. Pad to a multiple of 4.
+    const b64 = part.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+    const json = atob(padded);
+    const parsed = JSON.parse(json) as unknown;
+    return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
+/** The token's `exp` as epoch milliseconds, or null when absent/unparseable. */
+export function jwtExpiryMs(token: string): number | null {
+  const exp = decodeJwtPayload(token)["exp"];
+  return typeof exp === "number" && exp > 0 ? exp * 1000 : null;
+}
+
+/** The token's first `aud` value (its audience-profile name), or null. Used as
+ * the `client_id` binding when rotating the refresh token (ZeroID binds the
+ * audience-profile refresh token to that name — RFC 6749 §10.4). */
+export function jwtAudience(token: string): string | null {
+  const aud = decodeJwtPayload(token)["aud"];
+  if (typeof aud === "string") return aud;
+  if (Array.isArray(aud) && typeof aud[0] === "string") return aud[0];
+  return null;
+}
+
+/** Default `client_id` for refresh rotation when the access token carries no
+ * usable `aud` claim (should not happen for a codeoid-audience token). */
+const DEFAULT_REFRESH_CLIENT_ID = "codeoid";
+
+/**
+ * Rotate the stored refresh token for a fresh access token at ZeroID's
+ * `/oauth2/token` (`grant_type=refresh_token`). This is the self-reliant embed
+ * refresh: no host round-trip, no Clerk. On success BOTH tokens are persisted
+ * (the refresh token rotates — single-use) and the new access token is returned.
+ *
+ * client_id is the access token's audience-profile name (the binding ZeroID
+ * set at issuance). Public/client-less: no secret is sent.
+ *
+ * On failure the refresh token is FORGOTTEN (a rejected/expired refresh token
+ * is dead — ZeroID rotates single-use and revokes the family on reuse), so the
+ * caller falls back to sign-in rather than looping on a dead token.
+ */
+export async function refreshAccessToken(opts: {
+  zeroidUrl?: string;
+  signal?: AbortSignal;
+} = {}): Promise<string> {
+  const refreshToken = rememberedRefreshToken();
+  if (!refreshToken) {
+    throw new AuthError("no refresh token to rotate", "missing");
+  }
+
+  const zeroidUrl = opts.zeroidUrl ?? "";
+  const url = zeroidUrl ? `${zeroidUrl.replace(/\/+$/, "")}/oauth2/token` : "/oauth2/token";
+
+  // Bind the rotation to the audience the current access token carries.
+  const currentToken = localStorage.getItem(STORAGE_KEY_TOKEN);
+  const clientId =
+    (currentToken && jwtAudience(currentToken)) || DEFAULT_REFRESH_CLIENT_ID;
+
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+        client_id: clientId,
+      }),
+      signal: opts.signal,
+    });
+  } catch (err) {
+    // A network error is TRANSIENT — do NOT forget the token; the caller can
+    // retry (e.g. the next reconnect) once connectivity returns.
+    throw new AuthError(`cannot reach ZeroID at ${url}`, "exchange_failed", err);
+  }
+
+  if (!res.ok) {
+    // A 4xx means the refresh token is spent/expired/revoked — forget it so we
+    // don't loop. (A 5xx is arguably transient, but ZeroID returns 400
+    // invalid_grant for a dead token; treat any non-2xx as terminal for the
+    // token to keep the fallback simple and fail toward sign-in.)
+    forgetRefreshToken();
+    const body = await res.text().catch(() => "");
+    throw new AuthError(
+      `refresh token rejected (${res.status}): ${body.slice(0, 200) || res.statusText}`,
+      "exchange_failed",
+    );
+  }
+
+  let payload: unknown;
+  try {
+    payload = await res.json();
+  } catch (err) {
+    throw new AuthError("ZeroID returned non-JSON on refresh", "exchange_failed", err);
+  }
+  if (!payload || typeof payload !== "object") {
+    throw new AuthError("ZeroID refresh response was not an object", "exchange_failed");
+  }
+  const obj = payload as { access_token?: unknown; refresh_token?: unknown };
+  if (typeof obj.access_token !== "string" || !obj.access_token) {
+    throw new AuthError("ZeroID refresh response missing access_token", "exchange_failed");
+  }
+
+  rememberOAuthToken(obj.access_token);
+  // Rotation: ZeroID returns a fresh refresh token each time. Persist it so the
+  // NEXT rotation uses the successor (reusing the old one trips reuse-detection
+  // and revokes the family). If the server ever omits it, keep the current one.
+  if (typeof obj.refresh_token === "string" && obj.refresh_token) {
+    rememberRefreshToken(obj.refresh_token);
+  }
+  return obj.access_token;
+}
+
 /** Minimal window surface consumeEmbedToken needs — so it's unit-testable. */
 interface EmbedWindowLike {
   parent: unknown;
@@ -231,6 +379,7 @@ export function consumeEmbedToken(
 export function forgetApiKey(): void {
   localStorage.removeItem(STORAGE_KEY_API_KEY);
   localStorage.removeItem(STORAGE_KEY_TOKEN);
+  localStorage.removeItem(STORAGE_KEY_REFRESH_TOKEN);
 }
 
 /** Forget only the stored OAuth JWT (not the API key). Used when the daemon

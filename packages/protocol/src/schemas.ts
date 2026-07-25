@@ -465,6 +465,12 @@ export const pipelineRegistryAddSchema = z.object({
   ref: gitRefField.optional(),
 });
 
+export const pipelineRegistryRefreshSchema = z.object({
+  ...base,
+  type: z.literal("pipeline.registry.refresh"),
+  name: nameField.optional(),
+});
+
 // Install a pack by its registry `id` OR from a local `dir` — exactly one.
 export const pipelinePackInstallSchema = z
   .object({
@@ -541,6 +547,7 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   pipelineReviseSchema,
   pipelinePackListSchema,
   pipelineRegistryAddSchema,
+  pipelineRegistryRefreshSchema,
   pipelinePackInstallSchema,
   pipelinePackRemoveSchema,
   pipelinePackTrustSchema,

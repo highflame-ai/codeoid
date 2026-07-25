@@ -116,6 +116,15 @@ export function fetchPacks(): Promise<void> {
   return dispatch((id) => ({ type: "pipeline.pack.list", id }), false);
 }
 
+/**
+ * Pull + in-memory reload a registry's installed packs (scope `pipeline:manage`).
+ * `name` is required here; the protocol supports omitting it (refresh all registries),
+ * but the web UI only exposes per-registry refresh.
+ */
+export function refreshRegistry(name: string): Promise<void> {
+  return dispatch((id) => ({ type: "pipeline.registry.refresh", id, name }), true);
+}
+
 /** Add + clone a git pack registry (scope `pipeline:manage`). */
 export function addRegistry(url: string, name?: string, ref?: string): Promise<void> {
   return dispatch(

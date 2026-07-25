@@ -155,6 +155,7 @@ const samples: { [T in ClientTypes]: Extract<ClientMessage, { type: T }> } = {
     url: "git@github.com:highflame-ai/ai-factory.git",
     name: "ai-factory",
   },
+  "pipeline.registry.refresh": { type: "pipeline.registry.refresh", id: "r39b", name: "ai-factory" },
   "pipeline.pack.install": { type: "pipeline.pack.install", id: "r40", packId: "aif-sdlc", trusted: false },
   "pipeline.pack.remove": { type: "pipeline.pack.remove", id: "r41", packId: "aif-sdlc" },
   "pipeline.pack.trust": { type: "pipeline.pack.trust", id: "r42", packId: "aif-sdlc", trusted: true },

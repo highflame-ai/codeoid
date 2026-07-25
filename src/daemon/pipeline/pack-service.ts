@@ -201,6 +201,29 @@ export class PackService {
     }
   }
 
+  // Two steps required: pull alone leaves the live pipeline stale (issue #236).
+  // Skills re-linked only for trusted packs — invariant from install()/trust() (issue #233).
+  async refreshRegistry(name?: string): Promise<void> {
+    await this.refresh(name);
+    const mgr = this.#manager?.();
+    const skillRoots = new Set<string>();
+    for (const entry of this.#packs) {
+      if (name !== undefined && entry.registry !== name) continue;
+      if (!entry.registry) continue; // dir-installed pack — no registry to reload from
+      try {
+        const loaded = loadPack(entry.dir, { trusted: entry.trusted });
+        mgr?.installPack(loaded);
+      } catch (e) {
+        console.warn(`[PackService] refreshRegistry: failed to reload ${entry.dir}:`, e);
+      }
+      if (entry.trusted) {
+        const root = this.#cachePath(entry.registry);
+        if (existsSync(root)) skillRoots.add(root);
+      }
+    }
+    for (const root of skillRoots) this.#linkSkills(root);
+  }
+
   // ── Discovery ───────────────────────────────────────────────────────────────
 
   /** Directories under `<registry>/packs` that contain a pack.yaml. */

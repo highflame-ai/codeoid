@@ -154,6 +154,41 @@ describe("install → select → remove flow (local dir)", () => {
   });
 });
 
+describe("pipeline.registry.refresh", () => {
+  test("needs pipeline:manage — read-only scope is rejected", async () => {
+    const denied = await run(
+      { type: "pipeline.registry.refresh", id: "ref1" },
+      auth([SCOPES.PIPELINE_READ]),
+    );
+    expect(denied.type).toBe("response.error");
+    if (denied.type === "response.error") expect(denied.code).toBe("forbidden");
+  });
+
+  test("refresh on an uncached registry name returns a valid pack list (no error)", async () => {
+    // PackService.refresh() skips registries whose cache dir has no .git — so
+    // refreshing a name that never existed is not an error.
+    const res = await run({ type: "pipeline.registry.refresh", id: "ref2", name: "nonexistent" }, OWNER);
+    expect(res.type).toBe("pipeline.pack.list.result");
+    if (res.type === "pipeline.pack.list.result") expect(res.installed).toEqual([]);
+  });
+
+  test("refresh with no name succeeds when there are no registries", async () => {
+    const res = await run({ type: "pipeline.registry.refresh", id: "ref3" }, OWNER);
+    expect(res.type).toBe("pipeline.pack.list.result");
+  });
+
+  test("refresh with an installed pack returns that pack in the list result", async () => {
+    const dir = join(tmp, "refreshable");
+    writePack(dir, "refreshable");
+    await run({ type: "pipeline.pack.install", id: "ref4", dir }, OWNER);
+    const res = await run({ type: "pipeline.registry.refresh", id: "ref5" }, OWNER);
+    expect(res.type).toBe("pipeline.pack.list.result");
+    if (res.type === "pipeline.pack.list.result") {
+      expect(res.installed.find((p) => p.id === "refreshable")).toBeTruthy();
+    }
+  });
+});
+
 describe("error + guard branches", () => {
   test("registry.add is rejected without pipeline:manage (before any git)", async () => {
     const denied = await run(

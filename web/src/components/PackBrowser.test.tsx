@@ -50,6 +50,7 @@ function baseProps() {
     available: [],
     registries: [],
     onAddRegistry: noop,
+    onRefresh: noop,
     onInstall: noop,
     onRemove: noop,
     onTrust: noop,
@@ -147,6 +148,25 @@ describe("PackBrowserView", () => {
     ));
     expect(getByText("Fresh Pack")).toBeTruthy();
     expect(queryByText("Already Installed")).toBeNull();
+  });
+
+  it("fires onRefresh with the registry name when the Refresh button is clicked", () => {
+    const onRefresh = vi.fn();
+    const { getAllByTitle } = render(() => (
+      <PackBrowserView
+        {...baseProps()}
+        onRefresh={onRefresh}
+        registries={[
+          registry({ name: "ai-factory" }),
+          registry({ name: "my-other-registry" }),
+        ]}
+      />
+    ));
+    const refreshBtns = getAllByTitle("Pull + reload this registry");
+    fireEvent.click(refreshBtns[0]!);
+    expect(onRefresh).toHaveBeenCalledWith("ai-factory");
+    fireEvent.click(refreshBtns[1]!);
+    expect(onRefresh).toHaveBeenCalledWith("my-other-registry");
   });
 
   it("fires onAddRegistry with the typed git URL", () => {

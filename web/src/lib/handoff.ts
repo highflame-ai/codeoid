@@ -49,10 +49,14 @@
  * bridge — a long-lived secret in a hash is a durable-credential leak.
  */
 
-import { STORAGE_KEY_API_KEY, STORAGE_KEY_TOKEN } from "./auth";
+import { STORAGE_KEY_API_KEY, STORAGE_KEY_REFRESH_TOKEN, STORAGE_KEY_TOKEN } from "./auth";
 
 const HANDOFF_TOKEN_PARAM = "codeoid_token";
 const HANDOFF_KEY_PARAM = "codeoid_key";
+// The rotating refresh token handed off alongside the access token so the
+// embedded UI can renew its own session (self-reliant refresh) without the host
+// re-minting. Persisted like the others and stripped from the URL on consume.
+const HANDOFF_REFRESH_PARAM = "codeoid_refresh";
 
 /** Global the daemon injects into index.html carrying the embed allowlist. */
 declare global {
@@ -67,6 +71,8 @@ export interface HandoffCredential {
   token?: string;
   /** ZeroID API key (`zid_sk_...`) handed in via `#codeoid_key=`. */
   apiKey?: string;
+  /** Rotating refresh token handed in via `#codeoid_refresh=`. */
+  refreshToken?: string;
 }
 
 export interface HandoffOptions {
@@ -170,6 +176,7 @@ export function consumeHandoffCredential(opts: HandoffOptions = {}): HandoffCred
     // non-`key=value` hash content (e.g. anchors / client routes).
     let token: string | undefined;
     let apiKey: string | undefined;
+    let refreshToken: string | undefined;
     const kept: string[] = [];
     let consumedAny = false;
 
@@ -186,6 +193,11 @@ export function consumeHandoffCredential(opts: HandoffOptions = {}): HandoffCred
       if (key === HANDOFF_KEY_PARAM) {
         consumedAny = true;
         apiKey = safeDecode(value).trim() || undefined;
+        continue;
+      }
+      if (key === HANDOFF_REFRESH_PARAM) {
+        consumedAny = true;
+        refreshToken = safeDecode(value).trim() || undefined;
         continue;
       }
       kept.push(segment);
@@ -206,6 +218,10 @@ export function consumeHandoffCredential(opts: HandoffOptions = {}): HandoffCred
     if (apiKey) {
       localStorage.setItem(STORAGE_KEY_API_KEY, apiKey);
       result.apiKey = apiKey;
+    }
+    if (refreshToken) {
+      localStorage.setItem(STORAGE_KEY_REFRESH_TOKEN, refreshToken);
+      result.refreshToken = refreshToken;
     }
 
     // Strip the handoff params from the URL (preserving any other hash content)
