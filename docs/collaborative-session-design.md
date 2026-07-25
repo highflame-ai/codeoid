@@ -1,6 +1,6 @@
 # Codeoid Collaborative Sessions — Design Proposal
 
-> Status: **DRAFT for grilling** · Author: design session 2026-07-25
+> Status: **DRAFT — grilled 2026-07-25** · Author: design session 2026-07-25
 > Goal: let a user open a session in which **multiple models from different
 > backends work one goal in coordinated, specialized roles** — an orchestrator
 > that plans and routes, a searcher, a reasoner, an architect, and a panel of
@@ -34,11 +34,32 @@ When the user states a goal, the orchestrator decomposes it, delegates to the ro
 - **Unify into packs/pipeline.**
   A collaborative session **is a pack**: roles gain a `(provider, model, policy)` binding, phases gain enforced `reads`/`writes`, and a new `panel` phase kind fans a phase out across backends.
   A pure collaborative session is a degenerate one-goal pack; an SDLC pack gets a cross-backend `panel` review phase for free.
-- **Coordination = orchestrator-LLM-driven planning over a daemon-owned typed-artifact blackboard.**
+- **Coordination = orchestrator-LLM-driven dispatch over a daemon-owned typed-artifact blackboard.**
   The orchestrator plans dynamically and delegates via tool calls (choreography lives in editable skill prose, not compiled control flow), but role-agents hand off through **structured artifacts in the daemon**, not through the orchestrator's context (§4).
-  This is the recommended flexible model, upgraded with the structural advantage codeoid's architecture uniquely allows.
+  **v1 is lean**: orchestrator-driven dispatch (the existing `dispatch.ts` queue) + the blackboard as a typed-handoff store + one parallel primitive (the review panel).
+  The full "scheduler over a dependency graph" (auto-firing a role the moment its inputs exist) is the **end-state (P4)**, not v1 — in v1 the reserved `reads`/`writes` are enforced *access scoping*, and become scheduling *edges* in P4 (§8).
 - **Review = a breadth panel.**
   "All models take a stab at review" means N different-backend reviewers, each reading the same input artifact, each writing independent findings, merged by a synthesis step — with an optional cross-critique (debate) round before synthesis (§7).
+
+**Grill outcomes (2026-07-25) — additional decisions locked:**
+
+- **Orchestrator = Claude for v1; tools built as a *mountable* MCP server.**
+  The fleet + blackboard tool surface is built as a mountable MCP server (stdio/registry) rather than the in-process Claude-SDK object (`createSdkMcpServer`, `src/daemon/fleet.ts`), so letting gemini/openai/codex orchestrate later (they already parse `mcp__*`) is a mount-config change, not a rewrite.
+  Worker roles run on any backend in v1; any-backend orchestrator is tracked in **#245**.
+- **Blackboard schema = fixed-core + scoped `extra`.**
+  A first-class typed set (`spec`, `research`, `adr`, `task-list`, `diff`, `findings`) — versioned, UI-rendered, per-role read/write enforced — plus an `extra/<key>` namespace for ad-hoc artifacts that is *still* per-role scoped (no "unenforced field is false security" hole).
+- **Role-child lifetime = per-goal; cross-goal continuity via the blackboard.**
+  A role-child lives for one goal/run (survives the implement↔review fix-loop, keeps its worktree/branch), and is torn down at goal completion.
+  Continuity across goals rides durable blackboard artifacts, not live children — preserving the conductor's low-credentials-at-rest discipline.
+- **Cost/concurrency guards ship in v1 (lightweight).**
+  A per-session **live-worker cap** (closing omnigent's cross-turn concurrency gap), a **per-collaboration cost roll-up surfaced at the R3 approve-time**, and reuse of the existing per-child tool budget + failure-limit auto-block.
+  Hard token ceilings and Cedar/Shield governance stay P6.
+- **Create UX = a first-class Collaborative toggle that compiles to an ephemeral one-goal pack.**
+  The create dialog leads with a Collaborative toggle + role→backend pickers and compiles to a one-goal pack + orchestrator under the hood; pack vocabulary stays hidden for this path.
+  The `/pipeline` pack-selector remains the surface for pre-authored SDLC packs.
+- **Synthesis + independence defaults.**
+  The orchestrator merges the panel's findings by default (the human always sees disagreement; a dedicated *judge* role is a pack option).
+  Reviewers read `diff`+`spec` only — never implementer reasoning — enforced at the `canUseTool` fence.
 
 ---
 
@@ -95,6 +116,11 @@ That makes the coordinator the bottleneck — its context bloats with each round
 5. **Independence becomes an enforced policy, not a convention.**
    A reviewer identity may read `diff`+`spec` but not `implementer-reasoning`; the reviewer is unbiased *because it cannot see the author's reasoning*, enforced at the tool fence — not because a prompt asked it not to peek.
 
+**v1 scope (from the 2026-07-25 grill).**
+In v1 the orchestrator drives dispatch explicitly (the existing `dispatch.ts` queue) and the blackboard is the typed-handoff store; the only *parallel* primitive is the review panel (§7).
+The deterministic "fire a role the moment its inputs exist" scheduler — where `reads`/`writes` are live dependency edges — is the **end-state (P4, §8)**, because most SDLC flow is sequential and the structured-handoff win does not require it.
+In v1, `reads`/`writes` are enforced *access scoping*; in P4 they also become scheduling *edges*.
+
 **This is codeoid's intended direction, not an invention.**
 `PhaseDef` already reserves `reads`/`writes` fields, documented as "*Reserved metadata (not yet consumed)*" (`src/daemon/pipeline/interface.ts`).
 The blackboard is the convergence point of three existing investments — canonical history, the memory engine, and the reserved `reads`/`writes` — which is why it is the right "best-in-class" bet rather than an over-engineered detour.
@@ -113,9 +139,9 @@ Additions, no architectural change:
 | Addition | What it is | Mirrors existing |
 | --- | --- | --- |
 | **Collaboration profile on session-create** | An optional `collaboration` object on `SessionCreateMsg` binding each role to `{ providerId, model }` + policy; validated fail-closed against the provider registry. | `providerId`/`pack`/`packRole` on `session.create` (`packages/protocol/src/types.ts`) |
-| **Orchestrator role** | A conductor-shaped `Session` (`role: "conductor"`-class) whose fleet MCP surface gains role-aware delegation; holds no repo-write tools by ZeroID scope. | `#createConductor` + `buildFleetMcpServer` (`src/daemon/session-manager.ts`, `src/daemon/fleet.ts`) |
+| **Orchestrator role** | A conductor-shaped `Session` (`role: "conductor"`-class) whose fleet MCP surface gains role-aware delegation; holds no repo-write tools by ZeroID scope. **v1: Claude only** (mounts the fleet MCP); any-backend orchestrator tracked in #245. | `#createConductor` + `buildFleetMcpServer` (`src/daemon/session-manager.ts`, `src/daemon/fleet.ts`) |
 | **Role-bound child sessions** | One disposable `role: "worker"` `Session` per active role, each with its own `providerId`+`model`+`initialMode` and a delegated leaf identity. | `spawnWorker` (`src/daemon/session-manager.ts`), generalized to carry provider/model |
-| **Goal blackboard** | A daemon-owned, goal-scoped typed-artifact store + an in-process MCP tool surface bound to the collaborating sessions, read/write-scoped per role. | `buildMemoryMcpServer` binding + the `dispatch_tasks`/`dispatch_events` tables (`src/daemon/store.ts`) |
+| **Goal blackboard** | A daemon-owned, goal-scoped typed-artifact store (fixed-core + scoped `extra`) + a **mountable** MCP tool surface (stdio/registry, not the in-process Claude-SDK object — so non-Claude orchestrators are a later mount, #245), read/write-scoped per role. | `buildMemoryMcpServer` binding + the `dispatch_tasks`/`dispatch_events` tables (`src/daemon/store.ts`) |
 | **`panel` phase kind + dispatch barrier** | A phase that fans out to N role-children on distinct backends and **joins** on all of them, then synthesizes. | the reserved `"panel"` kind in the phase-kind union (`src/daemon/pipeline/interface.ts`) + `Dispatcher` (`src/daemon/dispatch.ts`) |
 
 ---
@@ -151,7 +177,7 @@ We build that, and keep the **correctness gate** as a composable option.
 1. When `diff` lands, the orchestrator fans out to N reviewers on **distinct backends** (a `panel` phase, §8).
 2. Each reviewer reads **only** `diff`+`spec`+the acceptance contract (independence enforced at the fence, §4/§6) and writes an independent `findings` artifact: `{ blocking[], non-blocking[], suggestions[] }` with file:line evidence.
 3. The dispatch **barrier** joins on all reviewers (the one genuinely new dispatch primitive — today dispatch is per-task event injection, not an N-way join).
-4. A **synthesis** step (the orchestrator, or a dedicated judge role) merges the findings, de-duplicates, and surfaces the merged verdict to the user.
+4. A **synthesis** step merges the findings, de-duplicates, and surfaces the merged verdict to the user — **the orchestrator by default; a dedicated `judge` role is a pack option**.
    Following omnigent, there is **no silent auto-vote** — a model or the human synthesizes, and disagreement is shown, not hidden.
 5. Optionally, a **debate round** relays each reviewer's findings to the others for one pass of cross-critique before synthesis (borrowed from omnigent's `/debate`), for goals where surfacing disagreement is worth the extra turn.
 
@@ -187,10 +213,11 @@ No second wire API, no second create dialog, no duplicated governance.
 
 Reuse the pattern `pipeline-run.md` already established: the run **is** a session plus a goal and a config, so it extends the **existing create-session dialog** rather than a bespoke panel.
 
-- A **Collaborative** toggle reveals per-role pickers.
+- A first-class **Collaborative** toggle reveals per-role pickers and **compiles to an ephemeral one-goal pack + orchestrator under the hood** — pack vocabulary stays hidden for this path.
+  The `/pipeline` pack-selector remains the surface for pre-authored SDLC packs.
 - Each picker lists backends from `AuthOkMsg.providers` (`packages/protocol/src/types.ts`, "first entry = default") and models from `models.list` (per-provider), gated by the capability matrix (§6) — a backend that can't hard-deny is flagged, not hidden, for the `review` role.
-- Submit → `session.create { …, collaboration: { enabled, roles } }` (or `pipeline.create { pack, roleBindings }` for the packaged form).
-- The collaboration config persists as a JSON column (`#addColumnIfMissing`, `src/daemon/store.ts`) and is stamped into transcript meta, so it survives a daemon restart the way `providerId`/`role` already do.
+  The **orchestrator** picker is Claude-only in v1 (#245); the worker pickers are open.
+- Submit compiles to a pack and creates the run; the collaboration config persists as a JSON column (`#addColumnIfMissing`, `src/daemon/store.ts`) and is stamped into transcript meta, so it survives a daemon restart the way `providerId`/`role` already do.
 
 Daemon-wide **default** role→backend mappings belong in the settings manifest (`src/daemon/settings/manifest.ts`, which already exposes `conductor.provider`/`conductor.model`); the per-session config is a create-request concern, not a manifest knob.
 
@@ -203,11 +230,12 @@ Daemon-wide **default** role→backend mappings belong in the settings manifest 
 **New to build** —
 1. Role→backend binding in `roleSchema` + collaboration config on `SessionCreateMsg` (+ Zod, fail-closed validation).
 2. `provider`/`model` plumbed through `spawnWorker`/`DispatchTaskRow` (+ a provider-aware model-id validation path — today `resolveModelId`/`set_model` are Claude-only, `src/daemon/models.ts`).
-3. The **goal blackboard**: typed-artifact store (schema + tables) + an in-process MCP tool surface, read/write-scoped per role at the `canUseTool` fence.
+3. The **goal blackboard**: fixed-core typed-artifact store (schema + tables) + scoped `extra` + a **mountable** MCP tool surface (stdio/registry, not the Claude-SDK in-process object, #245), read/write-scoped per role at the `canUseTool` fence.
 4. The dispatch **barrier/join** over a dispatch group (today: per-task event injection).
 5. The **`panel`** phase kind + the **synthesis/merge** step.
 6. The per-backend **capability matrix + verification bench**.
-7. Create-time collaboration UI + persistence column.
+7. Create-time collaboration UI (toggle → ephemeral one-goal pack) + persistence column.
+8. v1 **guards**: a per-session live-worker cap + a per-collaboration cost roll-up surfaced at approve-time (reusing per-turn metrics + the per-child budget/failure auto-block).
 
 ---
 
@@ -219,17 +247,18 @@ Vertical slices; each ends in a working, shippable daemon.
    Generalize `spawnWorker`/`DispatchTaskRow` to carry `(provider, model)`; add a provider-aware model-id validation path.
    Exit: a dispatched worker runs on a chosen non-default backend; `conductor-session`-style tests prove per-child provider.
 2. **P1 — Collaboration config + create path.**
-   `collaboration` on `SessionCreateMsg` + Zod + fail-closed provider validation + persistence column; a collaborative session spawns its role-children on their bound backends.
-   Exit: create a collaborative session from the CLI; children come up on the right backends with the right leaf scopes.
+   `collaboration` on `SessionCreateMsg` + Zod + fail-closed provider validation + persistence column; the toggle **compiles to an ephemeral one-goal pack**; a collaborative session spawns its role-children (per-goal lifetime) on their bound backends.
+   Exit: create a collaborative session from the CLI; children come up on the right backends with the right leaf scopes and are torn down at goal completion.
 3. **P2 — Goal blackboard.**
-   Typed-artifact store + tables + the read/write-scoped MCP tool surface; enforce `reads`/`writes` at the `canUseTool` fence (Claude-hard, advisory-logged elsewhere).
-   Exit: searcher→architect→reasoner hand off through artifacts; the orchestrator holds only an index; a restart resumes mid-graph.
-4. **P3 — Panel + barrier + synthesis.**
-   The dispatch barrier over a dispatch group; the `panel` phase kind; the synthesis step; optional debate round.
-   Exit: N cross-backend reviewers run in parallel on one `diff`, join, and a merged verdict surfaces; reviewers provably cannot read author reasoning or write files.
-5. **P4 — Unify with packs/pipeline.**
-   `(provider, model)` on `roleSchema`; wire the dormant per-phase override onto child selection; an SDLC pack's `review` phase becomes a panel.
-   Exit: `/pipeline` runs a pack whose review phase is a cross-backend panel; a pure collaborative session is a one-goal pack.
+   Fixed-core typed-artifact store (+ scoped `extra`) + tables + the **mountable** MCP tool surface (stdio/registry, #245); enforce `reads`/`writes` as *access scoping* at the `canUseTool` fence (Claude-hard, advisory-logged elsewhere).
+   Exit: searcher→architect→reasoner hand off through artifacts; the orchestrator holds only an index; a restart resumes mid-goal.
+4. **P3 — Panel + barrier + synthesis + v1 guards.**
+   The dispatch barrier over a dispatch group; the `panel` phase kind; orchestrator synthesis (judge role optional); optional debate round.
+   Plus the lightweight guards: a per-session **live-worker cap** and a **per-collaboration cost roll-up surfaced at approve-time** (reusing per-turn metrics + the existing per-child budget/failure auto-block).
+   Exit: N cross-backend reviewers run in parallel on one `diff`, join, and a merged verdict surfaces; reviewers provably cannot read author reasoning or write files; a runaway fan-out is capped and its cost is visible before approval.
+5. **P4 — Unify with packs/pipeline (+ dependency-graph scheduling).**
+   `(provider, model)` on `roleSchema`; wire the dormant per-phase override onto child selection; `reads`/`writes` graduate from access scoping to **live scheduling edges** (auto-fire a role when its inputs exist); an SDLC pack's `review` phase becomes a panel.
+   Exit: `/pipeline` runs a pack whose review phase is a cross-backend panel; a pure collaborative session is a one-goal pack; ready roles fire without explicit orchestrator dispatch.
 6. **P5 — Front doors + capability matrix.**
    The extended create dialog (web + Telegram + CLI); the declared per-backend capability matrix + verification bench driving the role-picker.
    Exit: toggle Collaborative, assign models to roles, watch the graph run live, approve dispatches — from web and Telegram.
@@ -260,22 +289,21 @@ Watch the footguns omnigent hit: no cross-turn concurrency accounting (add a liv
 
 ---
 
-## 13. Open questions (grill seeds)
+## 13. Grill outcomes (2026-07-25) & remaining open questions
 
-1. **Blackboard artifact schema — fixed vs. open.**
-   Ship a fixed typed set (`spec`/`research`/`adr`/`diff`/`findings`) for governance and UI, or an open key→typed-blob store the orchestrator can extend at runtime for novel goals?
-   Leaning fixed-core + an `extra` escape hatch, enforced-scoped.
-2. **Orchestrator backend constraint.**
-   Fleet MCP tools surface only under the Claude provider today (`fleet.ts`, `session-manager.ts`) — so the orchestrator role is effectively Claude-pinned until other providers grow MCP.
-   Accept the pin for v1 and log it, or invest in MCP-on-other-providers first?
-3. **Concurrency ceiling.**
-   Per-turn fan-out cap (omnigent's v1) vs. a true live-worker cap across turns; where does the cost/loop guard live before P6 governance?
-4. **Synthesis authority.**
-   Orchestrator-synthesizes vs. a dedicated judge role vs. human-decides — per pack, or a session-level policy?
-5. **Independence vs. context.**
-   Which artifacts is each role allowed to read by default?
-   Reviewers text-isolated from author reasoning is the strong default; is there a goal class where a reviewer *should* see the reasoning?
-6. **Degenerate-pack ergonomics.**
-   Is "a pure collaborative session is a one-goal pack" the right mental model for users, or should the create dialog present Collaborative as a first-class mode that compiles to a pack under the hood?
-7. **Cost visibility.**
-   N backends on one goal multiplies spend; the existing per-turn metrics (tokens/cost/turns) need a per-collaboration roll-up so the user sees the multiplier before approving a large fan-out.
+The adversarial grill resolved every original open question:
+
+1. **Blackboard schema** → fixed-core + scoped `extra` (§2, §4).
+2. **Orchestrator backend** → Claude for v1, tools built as a *mountable* MCP server; any-backend orchestrator tracked in **#245**.
+3. **Concurrency ceiling** → v1 live-worker cap + approve-time cost roll-up; hard ceilings + Cedar/Shield stay P6.
+4. **Synthesis authority** → orchestrator by default; a `judge` role is a pack option.
+5. **Independence vs. context** → reviewers read `diff`+`spec` only, never implementer reasoning, enforced at the `canUseTool` fence.
+6. **Degenerate-pack ergonomics** → a first-class Collaborative toggle that compiles to an ephemeral one-goal pack (§9).
+7. **Cost visibility** → per-collaboration roll-up surfaced at the R3 approve-time.
+
+**Deferred to implementation / later phases (not design branches):**
+
+- The exact typed schema of each core artifact (`spec`/`research`/`adr`/`task-list`/`diff`/`findings`) — settled in P2.
+- The `reads`/`writes` → scheduling-edge semantics and cycle/deadlock handling — settled in P4 when they graduate from access scoping.
+- The concrete contents of the per-backend capability matrix + the verification bench — settled in P5.
+- Whether a debate round is on by default — a P3 pack-config knob.
