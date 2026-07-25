@@ -1,180 +1,114 @@
 // @vitest-environment jsdom
 /**
- * embed-refresh.ts tests — installEmbedTokenRefresh.
+ * installEmbedSessionRefresh tests — the proactive self-refresh scheduler.
  *
- * All cases assume we have a DOM (jsdom). Gate conditions tested:
- *   1. Not framed (top === self) → no listener, onRefresh never called.
- *   2. Framed, empty allowlist → no listener, onRefresh never called.
- *   3. Framed, allowlist, WRONG origin → onRefresh NOT called.
- *   4. Framed, allowlist, correct origin, wrong message type → NOT called.
- *   5. Framed, allowlist, correct origin, token not a string → NOT called.
- *   6. Framed, allowlist, correct origin, empty token string → NOT called.
- *   7. Framed, allowlist, correct origin, correct shape → onRefresh called.
- *   8. Origin matching is case-insensitive (Studio origin in Mixed case).
- *   9. Cleanup: returned function removes the listener.
- *  10. Non-object data ignored.
+ * The scheduler rotates the stored refresh token shortly before the access
+ * token expires and forces a reconnect with the fresh token. We mock the
+ * rotation call (auth.refreshAccessToken) and the reconnect (connection.
+ * reconnectNow) and drive fake timers.
  */
 
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { installEmbedTokenRefresh, EMBED_REFRESH_TYPE } from "./embed-refresh";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const ALLOWED = "https://studio.highflame.com";
-const OTHER = "https://evil.example.com";
-const ALLOWLIST = [ALLOWED];
-const FRESH_TOKEN = "eyJhbGciOiJSUzI1NiJ9.fresh.token";
+import * as auth from "./auth";
+import * as connection from "../state/connection";
+import { installEmbedSessionRefresh } from "./embed-refresh";
 
-function simulateMessage(origin: string, data: unknown): void {
-  window.dispatchEvent(new MessageEvent("message", { data, origin }));
-}
+const { STORAGE_KEY_TOKEN, STORAGE_KEY_REFRESH_TOKEN } = auth;
 
-/** Make window.top !== window.self (framed). */
-function setFramed(framed: boolean): void {
-  Object.defineProperty(window, "top", {
-    configurable: true,
-    value: framed ? ({} as Window) : window,
-  });
+/** Build an unsigned JWT whose payload has the given `exp` (seconds). Only the
+ * payload segment matters — jwtExpiryMs decodes it without verifying. */
+function tokenExpiringInSeconds(secondsFromNow: number): string {
+  const payload = { exp: Math.floor(Date.now() / 1000) + secondsFromNow, aud: ["codeoid"] };
+  const b64 = btoa(JSON.stringify(payload)).replace(/=+$/, "");
+  return `header.${b64}.sig`;
 }
 
 beforeEach(() => {
-  setFramed(true);
+  vi.useFakeTimers();
+  localStorage.clear();
 });
 
-describe("installEmbedTokenRefresh", () => {
-  it("returns noop and never calls onRefresh when not framed", () => {
-    setFramed(false);
-    const onRefresh = vi.fn();
-    const cleanup = installEmbedTokenRefresh({ allowedOrigins: ALLOWLIST, onRefresh });
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.useRealTimers();
+});
 
-    simulateMessage(ALLOWED, { type: EMBED_REFRESH_TYPE, token: FRESH_TOKEN });
+describe("installEmbedSessionRefresh", () => {
+  it("is a no-op (and returns a callable cleanup) when no refresh token is stored", () => {
+    const spy = vi.spyOn(auth, "refreshAccessToken").mockResolvedValue("new-access");
+    const cleanup = installEmbedSessionRefresh({ zeroidUrl: "" });
 
-    expect(onRefresh).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(60 * 60_000);
+
+    expect(spy).not.toHaveBeenCalled();
     expect(cleanup).toBeTypeOf("function");
-    cleanup(); // must not throw
-  });
-
-  it("returns noop when allowedOrigins is empty", () => {
-    const onRefresh = vi.fn();
-    const cleanup = installEmbedTokenRefresh({ allowedOrigins: [], onRefresh });
-
-    simulateMessage(ALLOWED, { type: EMBED_REFRESH_TYPE, token: FRESH_TOKEN });
-
-    expect(onRefresh).not.toHaveBeenCalled();
     cleanup();
   });
 
-  it("ignores messages from an origin not in the allowlist", () => {
-    const onRefresh = vi.fn();
-    const cleanup = installEmbedTokenRefresh({ allowedOrigins: ALLOWLIST, onRefresh });
+  it("rotates the token near expiry and reconnects with the fresh one", async () => {
+    localStorage.setItem(STORAGE_KEY_REFRESH_TOKEN, "zid_rt_abc");
+    // Access token valid for 10 minutes → refresh scheduled ~8.75 min out
+    // (10min - 75s skew).
+    localStorage.setItem(STORAGE_KEY_TOKEN, tokenExpiringInSeconds(600));
 
-    simulateMessage(OTHER, { type: EMBED_REFRESH_TYPE, token: FRESH_TOKEN });
+    const refreshSpy = vi
+      .spyOn(auth, "refreshAccessToken")
+      .mockImplementation(async () => {
+        // Simulate rotation: a fresh, longer-lived access token is persisted.
+        localStorage.setItem(STORAGE_KEY_TOKEN, tokenExpiringInSeconds(600));
+        localStorage.setItem(STORAGE_KEY_REFRESH_TOKEN, "zid_rt_next");
+        return "new-access";
+      });
+    const reconnectSpy = vi.spyOn(connection, "reconnectNow").mockImplementation(() => {});
 
-    expect(onRefresh).not.toHaveBeenCalled();
+    const cleanup = installEmbedSessionRefresh({ zeroidUrl: "" });
+
+    // Not yet due.
+    await vi.advanceTimersByTimeAsync(8 * 60_000);
+    expect(refreshSpy).not.toHaveBeenCalled();
+
+    // Cross the (10min - 75s) boundary → rotation fires, then reconnect.
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(refreshSpy).toHaveBeenCalledOnce();
+    expect(reconnectSpy).toHaveBeenCalledOnce();
+
     cleanup();
   });
 
-  it("ignores messages with the wrong type", () => {
-    const onRefresh = vi.fn();
-    const cleanup = installEmbedTokenRefresh({ allowedOrigins: ALLOWLIST, onRefresh });
+  it("stops scheduling once the refresh token is gone (rotation forgot a dead one)", async () => {
+    localStorage.setItem(STORAGE_KEY_REFRESH_TOKEN, "zid_rt_dead");
+    localStorage.setItem(STORAGE_KEY_TOKEN, tokenExpiringInSeconds(120));
 
-    simulateMessage(ALLOWED, { type: "SOME_OTHER_MESSAGE", token: FRESH_TOKEN });
-
-    expect(onRefresh).not.toHaveBeenCalled();
-    cleanup();
-  });
-
-  it("ignores messages where token is not a string", () => {
-    const onRefresh = vi.fn();
-    const cleanup = installEmbedTokenRefresh({ allowedOrigins: ALLOWLIST, onRefresh });
-
-    simulateMessage(ALLOWED, { type: EMBED_REFRESH_TYPE, token: 42 });
-
-    expect(onRefresh).not.toHaveBeenCalled();
-    cleanup();
-  });
-
-  it("ignores messages where token is an empty string", () => {
-    const onRefresh = vi.fn();
-    const cleanup = installEmbedTokenRefresh({ allowedOrigins: ALLOWLIST, onRefresh });
-
-    simulateMessage(ALLOWED, { type: EMBED_REFRESH_TYPE, token: "   " });
-
-    expect(onRefresh).not.toHaveBeenCalled();
-    cleanup();
-  });
-
-  it("ignores non-object data", () => {
-    const onRefresh = vi.fn();
-    const cleanup = installEmbedTokenRefresh({ allowedOrigins: ALLOWLIST, onRefresh });
-
-    simulateMessage(ALLOWED, "just a string");
-    simulateMessage(ALLOWED, null);
-    simulateMessage(ALLOWED, 123);
-
-    expect(onRefresh).not.toHaveBeenCalled();
-    cleanup();
-  });
-
-  it("calls onRefresh with the token when gate passes", async () => {
-    const onRefresh = vi.fn();
-    const cleanup = installEmbedTokenRefresh({ allowedOrigins: ALLOWLIST, onRefresh });
-
-    simulateMessage(ALLOWED, { type: EMBED_REFRESH_TYPE, token: FRESH_TOKEN });
-
-    // onRefresh is called synchronously inside the message handler
-    await Promise.resolve(); // flush any microtasks
-    expect(onRefresh).toHaveBeenCalledOnce();
-    expect(onRefresh).toHaveBeenCalledWith(FRESH_TOKEN);
-    cleanup();
-  });
-
-  it("trims whitespace from the token before calling onRefresh", async () => {
-    const onRefresh = vi.fn();
-    const cleanup = installEmbedTokenRefresh({ allowedOrigins: ALLOWLIST, onRefresh });
-
-    simulateMessage(ALLOWED, { type: EMBED_REFRESH_TYPE, token: `  ${FRESH_TOKEN}  ` });
-
-    await Promise.resolve();
-    expect(onRefresh).toHaveBeenCalledWith(FRESH_TOKEN);
-    cleanup();
-  });
-
-  it("origin matching is case-insensitive", async () => {
-    const onRefresh = vi.fn();
-    const cleanup = installEmbedTokenRefresh({
-      allowedOrigins: ["HTTPS://Studio.Highflame.Com"],
-      onRefresh,
+    const refreshSpy = vi.spyOn(auth, "refreshAccessToken").mockImplementation(async () => {
+      // Simulate a terminal failure: the dead refresh token is forgotten.
+      localStorage.removeItem(STORAGE_KEY_REFRESH_TOKEN);
+      throw new auth.AuthError("refresh token rejected (400)", "exchange_failed");
     });
+    vi.spyOn(connection, "reconnectNow").mockImplementation(() => {});
 
-    simulateMessage(ALLOWED, { type: EMBED_REFRESH_TYPE, token: FRESH_TOKEN });
+    const cleanup = installEmbedSessionRefresh({ zeroidUrl: "" });
 
-    await Promise.resolve();
-    expect(onRefresh).toHaveBeenCalledOnce();
+    // First rotation fires (120s - 75s ≈ 45s) and fails terminally.
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(refreshSpy).toHaveBeenCalledOnce();
+
+    // No token remains → no further rotation attempts, ever.
+    await vi.advanceTimersByTimeAsync(60 * 60_000);
+    expect(refreshSpy).toHaveBeenCalledOnce();
+
     cleanup();
   });
 
-  it("cleanup removes the listener so subsequent messages are ignored", async () => {
-    const onRefresh = vi.fn();
-    const cleanup = installEmbedTokenRefresh({ allowedOrigins: ALLOWLIST, onRefresh });
+  it("cleanup cancels a pending rotation", async () => {
+    localStorage.setItem(STORAGE_KEY_REFRESH_TOKEN, "zid_rt_abc");
+    localStorage.setItem(STORAGE_KEY_TOKEN, tokenExpiringInSeconds(600));
+    const refreshSpy = vi.spyOn(auth, "refreshAccessToken").mockResolvedValue("new-access");
 
+    const cleanup = installEmbedSessionRefresh({ zeroidUrl: "" });
     cleanup();
 
-    simulateMessage(ALLOWED, { type: EMBED_REFRESH_TYPE, token: FRESH_TOKEN });
-
-    await Promise.resolve();
-    expect(onRefresh).not.toHaveBeenCalled();
-  });
-
-  it("swallows errors thrown by onRefresh (does not propagate)", async () => {
-    const onRefresh = vi.fn().mockRejectedValue(new Error("bootstrap failed"));
-    const cleanup = installEmbedTokenRefresh({ allowedOrigins: ALLOWLIST, onRefresh });
-
-    // Should not throw to window error handlers.
-    expect(() =>
-      simulateMessage(ALLOWED, { type: EMBED_REFRESH_TYPE, token: FRESH_TOKEN }),
-    ).not.toThrow();
-
-    await Promise.resolve();
-    expect(onRefresh).toHaveBeenCalledOnce();
-    cleanup();
+    await vi.advanceTimersByTimeAsync(60 * 60_000);
+    expect(refreshSpy).not.toHaveBeenCalled();
   });
 });

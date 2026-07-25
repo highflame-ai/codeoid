@@ -24,7 +24,7 @@
 
 import { describe, it, expect, beforeEach } from "vitest";
 import { consumeHandoffCredential, readEmbedAllowedOrigins } from "./handoff";
-import { STORAGE_KEY_API_KEY, STORAGE_KEY_TOKEN } from "./auth";
+import { STORAGE_KEY_API_KEY, STORAGE_KEY_REFRESH_TOKEN, STORAGE_KEY_TOKEN } from "./auth";
 
 const ALLOWED = "https://studio.highflame.com";
 const OTHER = "https://evil.example.com";
@@ -231,6 +231,20 @@ describe("consumeHandoffCredential — token + key together", () => {
     expect(result).toEqual({ token: "jwt-1", apiKey: "zid_sk_2" });
     expect(localStorage.getItem(STORAGE_KEY_TOKEN)).toBe("jwt-1");
     expect(localStorage.getItem(STORAGE_KEY_API_KEY)).toBe("zid_sk_2");
+    expect(window.location.hash).toBe("");
+  });
+});
+
+// ── Refresh token handoff (self-reliant embed session) ─────────────────────────
+
+describe("consumeHandoffCredential — refresh token", () => {
+  it("reads #codeoid_refresh alongside the access token, persists both, strips both", () => {
+    setHash("#codeoid_token=jwt-9&codeoid_refresh=zid_rt_r9");
+    const result = consume();
+
+    expect(result).toEqual({ token: "jwt-9", refreshToken: "zid_rt_r9" });
+    expect(localStorage.getItem(STORAGE_KEY_TOKEN)).toBe("jwt-9");
+    expect(localStorage.getItem(STORAGE_KEY_REFRESH_TOKEN)).toBe("zid_rt_r9");
     expect(window.location.hash).toBe("");
   });
 });

@@ -1,90 +1,112 @@
 /**
- * postMessage token-refresh listener for the embed SSO flow.
+ * Self-reliant embed session refresh.
  *
- * Highflame Studio sends a fresh codeoid SSO token every 12 minutes via
- * `postMessage` so the embedded UI can silently re-authenticate without a
- * full page reload (which would wipe the running codeoid session).
+ * When an embedding host (Highflame Studio) hands off a rotating refresh token
+ * alongside the access token, the codeoid web UI keeps its OWN session alive by
+ * rotating that refresh token at ZeroID — no host re-mint on a timer, no
+ * postMessage. This module owns the PROACTIVE half: a scheduler that rotates the
+ * access token shortly before it expires and forces the live socket to
+ * re-authenticate with the fresh token, so the session never blips.
  *
- * ── Security gate ──────────────────────────────────────────────────────────
- * Mirrors the hash-handoff gate in `handoff.ts`. A message is accepted ONLY
- * when ALL of the following hold:
- *   1. This page IS embedded (`window.top !== window.self`). A top-level page
- *      cannot receive a meaningful refresh message, and accepting postMessages
- *      from arbitrary origins at the top level would be an open injection
- *      vector.
- *   2. `event.origin` is in the daemon-published allowlist (same allowlist as
- *      the hash handoff — `CODEOID_EMBED_ALLOWED_ORIGINS`). We compare
- *      lowercased origins to avoid case-sensitivity surprises.
- *   3. The message data has the exact expected shape:
- *        `{ type: "CODEOID_TOKEN_REFRESH", token: "<non-empty string>" }`
- *      Any other message type or structure is silently ignored — we don't
- *      break third-party postMessage users (Monaco, analytics, etc.).
- * On any failing condition the message is silently ignored (fail closed).
- * ──────────────────────────────────────────────────────────────────────────
+ * The REACTIVE half lives in state/connection.ts:
+ *   - `freshAccessToken()` rotates on demand for any (re)connect, so a socket
+ *     that drops (network blip, laptop waking past expiry) recovers on its own.
+ *   - the `failed`-status handler rotates + re-bootstraps if the daemon ever
+ *     closes 4003 before this scheduler fired.
+ * Together they make an embedded session survive tab switches, reloads, and long
+ * idle periods, bounded only by the refresh token's own TTL.
+ *
+ * A `setTimeout` is throttled/suspended while the tab is backgrounded, so we also
+ * refresh on `visibilitychange`→visible when the scheduled time has passed.
  */
 
-/** The message type Studio posts when it has a refreshed token ready. */
-export const EMBED_REFRESH_TYPE = "CODEOID_TOKEN_REFRESH";
+import {
+  jwtExpiryMs,
+  refreshAccessToken,
+  rememberedOAuthToken,
+  rememberedRefreshToken,
+} from "./auth";
+import { reconnectNow } from "../state/connection";
 
-export interface EmbedRefreshOptions {
-  /** Origins allowed to send a token refresh. Empty ⇒ refresh disabled. */
-  allowedOrigins: readonly string[];
-  /**
-   * Called with the fresh token once the gate passes. May be async; errors are
-   * swallowed (the message handler must never throw to the browser's error
-   * event — a refresh failure degrades gracefully to the existing session
-   * expiry path).
-   */
-  onRefresh: (token: string) => void | Promise<void>;
+/** Rotate this many ms before the access token's `exp`, covering clock skew +
+ * the round-trip so the fresh token is in place before the daemon closes 4003. */
+const REFRESH_SKEW_MS = 75_000;
+/** Never schedule sooner than this, so a token minted already near expiry (or a
+ * refresh returning a short-lived token) can't spin a tight rotation loop. */
+const MIN_DELAY_MS = 5_000;
+/** Fallback cadence when the access token carries no readable `exp`. */
+const FALLBACK_DELAY_MS = 10 * 60_000;
+
+export interface EmbedSessionRefreshOptions {
+  /** ZeroID base URL passed through to the rotation call. */
+  zeroidUrl?: string;
 }
 
 /**
- * Register the `postMessage` listener for embed token refreshes. Returns a
- * cleanup function that removes it (call on component unmount or `onCleanup`).
- *
- * No-ops and returns a no-op cleanup when:
- *   - Outside a browser context (SSR / tests without a DOM).
- *   - Not embedded (`window.top === window.self`).
- *   - `allowedOrigins` is empty (refresh disabled by the daemon config).
+ * Start the proactive refresh scheduler. No-op (returns a no-op cleanup) when no
+ * refresh token was handed off — i.e. this is not a self-refreshing embed
+ * session (native sign-in, api-key flow, or an older host/ZeroID that didn't
+ * issue one). Returns a cleanup function; call it on teardown.
  */
-export function installEmbedTokenRefresh(opts: EmbedRefreshOptions): () => void {
+export function installEmbedSessionRefresh(
+  opts: EmbedSessionRefreshOptions = {},
+): () => void {
   if (typeof window === "undefined") return noop;
+  if (!rememberedRefreshToken()) return noop;
 
-  // Only install when actually framed — the refresh channel is meaningless at
-  // the top level, and listening there would silently accept postMessages from
-  // any allowlisted parent even when the user opened codeoid in a new tab.
-  if (window.top === window.self) return noop;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let stopped = false;
 
-  const allowedLower = opts.allowedOrigins
-    .map((o) => o.trim().toLowerCase())
-    .filter(Boolean);
-
-  // Empty allowlist → refresh disabled (same safe default as the hash handoff).
-  if (allowedLower.length === 0) return noop;
-
-  function handleMessage(event: MessageEvent): void {
-    // 1. Origin gate — must be in the trusted allowlist.
-    if (!allowedLower.includes(event.origin.toLowerCase())) return;
-
-    // 2. Shape gate — must be exactly our message type with a string token.
-    //    Other postMessages (Monaco, third-party widgets, etc.) pass through.
-    const data = event.data as unknown;
-    if (!data || typeof data !== "object") return;
-    const d = data as Record<string, unknown>;
-    if (d["type"] !== EMBED_REFRESH_TYPE) return;
-    if (typeof d["token"] !== "string") return;
-
-    const token = d["token"].trim();
-    if (!token) return;
-
-    // Deliver to the connection layer. Swallow errors — a failed refresh is not
-    // a crash; the existing session will expire naturally (fail-open on refresh,
-    // fail-close on initial auth).
-    void Promise.resolve(opts.onRefresh(token)).catch(() => {});
+  /** ms until we should next rotate, from the current stored access token. */
+  function delayUntilRefresh(): number {
+    const token = rememberedOAuthToken();
+    const expMs = token ? jwtExpiryMs(token) : null;
+    if (expMs === null) return FALLBACK_DELAY_MS;
+    return Math.max(MIN_DELAY_MS, expMs - REFRESH_SKEW_MS - Date.now());
   }
 
-  window.addEventListener("message", handleMessage);
-  return () => window.removeEventListener("message", handleMessage);
+  function schedule(): void {
+    if (stopped) return;
+    if (timer !== undefined) clearTimeout(timer);
+    // If no refresh token remains (signed out, or a rotation forgot a dead one),
+    // stop scheduling — nothing to rotate.
+    if (!rememberedRefreshToken()) return;
+    timer = setTimeout(runRefresh, delayUntilRefresh());
+  }
+
+  async function runRefresh(): Promise<void> {
+    if (stopped) return;
+    if (!rememberedRefreshToken()) return;
+    try {
+      await refreshAccessToken({ zeroidUrl: opts.zeroidUrl });
+      // Apply the fresh token to the live socket before the daemon closes the
+      // expiring one — a brief, seamless reconnect (scrollback replays).
+      reconnectNow();
+    } catch {
+      // Rotation failed. If it was terminal (dead refresh token), refreshAccessToken
+      // already forgot it, so the next schedule() bails and the connection layer's
+      // failed-recovery / sign-in path takes over. If transient, the next reconnect
+      // (freshAccessToken) will retry. Either way, reschedule to keep trying while a
+      // token remains.
+    }
+    schedule();
+  }
+
+  function onVisible(): void {
+    // Background tabs throttle/suspend timers; when we return to the foreground,
+    // re-evaluate immediately (delayUntilRefresh clamps to MIN_DELAY so an
+    // already-overdue token rotates right away rather than on the stale timer).
+    if (document.visibilityState === "visible") schedule();
+  }
+
+  document.addEventListener("visibilitychange", onVisible);
+  schedule();
+
+  return () => {
+    stopped = true;
+    if (timer !== undefined) clearTimeout(timer);
+    document.removeEventListener("visibilitychange", onVisible);
+  };
 }
 
 function noop(): void {}
