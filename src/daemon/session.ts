@@ -79,7 +79,12 @@ import type { Attachment } from "../protocol/types.js";
 import { resolveAttachments } from "./attachments.js";
 import type { CodeoidConfig } from "../config.js";
 import type { CompressionRegistry } from "./compress/index.js";
-import { findModel, resolveModelId } from "./models.js";
+import {
+  CLAUDE_PROVIDER_ID,
+  findModel,
+  resolveModelId,
+  resolveModelIdForProvider,
+} from "./models.js";
 import {
   callContextSize,
   decideRotation,
@@ -625,17 +630,34 @@ export class Session {
     this.#lastRotatedAt = stats.lastRotatedAt;
 
     // Model selection — prefer persisted session choice, then a per-session
-    // default (conductor's config.conductor.model), then the config default,
-    // else leave null (provider default). Always resolve to full id so
-    // downstream code doesn't see aliases.
+    // default (conductor's config.conductor.model, or a dispatch task's
+    // per-child model), then the config default, else leave null (provider
+    // default). Always resolve to full id so downstream code doesn't see
+    // aliases. Resolution is provider-aware: `config.session.defaultModel`
+    // is a global, so on a non-Claude backend a Claude alias like "opus"
+    // must NOT expand to claude-opus-* and get handed to that backend — it
+    // resolves to null and the provider picks its own default instead.
     const persistedModel = this.#store.getSessionModel(this.id);
+    // Resolve against the provider the session will ACTUALLY be built from —
+    // an explicit choice, else the registry's default. Using `opts.providerId`
+    // directly would silently assume claude whenever the caller didn't
+    // specify, which happens to be right only because the built-in registry's
+    // default is claude. Don't bake that coincidence in.
+    const effectiveProviderId =
+      opts.providerId ?? this.#providersRegistry?.defaultId ?? CLAUDE_PROVIDER_ID;
     this.#model =
       persistedModel.model ??
-      resolveModelId(opts.defaultModel ?? opts.config?.session.defaultModel ?? "") ??
+      resolveModelIdForProvider(
+        opts.defaultModel ?? opts.config?.session.defaultModel ?? "",
+        effectiveProviderId,
+      ) ??
       null;
     this.#fallbackModel =
       persistedModel.fallbackModel ??
-      resolveModelId(opts.config?.session.fallbackModel ?? "") ??
+      resolveModelIdForProvider(
+        opts.config?.session.fallbackModel ?? "",
+        effectiveProviderId,
+      ) ??
       null;
 
     this.#provider = opts._testProvider ?? this.#createProvider(opts.providerId);

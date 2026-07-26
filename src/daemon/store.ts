@@ -26,6 +26,15 @@ export interface DispatchTaskRow {
   targetSession: string | null;
   workdir: string | null;
   prompt: string;
+  /**
+   * Backend the spawned worker runs on. NULL = the daemon default provider,
+   * which is what every task written before per-role backends carried.
+   * Ignored for `kind: "send"` — that delivers into an existing session which
+   * already has a provider of its own.
+   */
+  provider: string | null;
+  /** Per-child model, already resolved against `provider`. NULL = provider default. */
+  model: string | null;
   status: DispatchTaskStatus;
   attempts: number;
   failureLimit: number;
@@ -59,6 +68,8 @@ interface RawDispatchRow {
   target_session: string | null;
   workdir: string | null;
   prompt: string;
+  provider: string | null;
+  model: string | null;
   status: DispatchTaskStatus;
   attempts: number;
   failure_limit: number;
@@ -83,6 +94,10 @@ function rowToDispatchTask(r: RawDispatchRow): DispatchTaskRow {
     targetSession: r.target_session,
     workdir: r.workdir,
     prompt: r.prompt,
+    // Pre-upgrade rows have no column at all; `?? null` normalizes both the
+    // missing-column undefined and a stored NULL to the same "use default".
+    provider: r.provider ?? null,
+    model: r.model ?? null,
     status: r.status,
     attempts: r.attempts,
     failureLimit: r.failure_limit,
@@ -236,6 +251,8 @@ export class Store {
         target_session    TEXT,                      -- send: existing session id
         workdir           TEXT,                      -- spawn: worker workdir
         prompt            TEXT NOT NULL,
+        provider          TEXT,                      -- spawn: per-child backend id; NULL = daemon default
+        model             TEXT,                      -- spawn: per-child model, resolved against the provider above
         status            TEXT NOT NULL DEFAULT 'queued',
         attempts          INTEGER NOT NULL DEFAULT 0,
         failure_limit     INTEGER NOT NULL DEFAULT 2,
@@ -271,6 +288,15 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_dispatch_events_pending
         ON dispatch_events(account_id, project_id, delivered_at);
     `);
+
+    // Per-child backend selection on spawn tasks. Additive so a database
+    // written before collaborative sessions keeps its queued tasks: NULL on
+    // an existing row means "daemon default provider", which is exactly the
+    // pre-upgrade behaviour. Declared inline on the CREATE above for fresh
+    // databases; this ALTER covers the ones already on disk.
+    this.#addColumnIfMissing("dispatch_tasks", "provider", "TEXT");
+    this.#addColumnIfMissing("dispatch_tasks", "model", "TEXT");
+
     // Pre-release single-row predecessor of provider_model_catalogs — never
     // shipped in a tagged version; drop from dev databases that ran the branch.
     this.#db.exec("DROP TABLE IF EXISTS cached_model_catalog");
@@ -582,6 +608,10 @@ export class Store {
     targetSession?: string;
     workdir?: string;
     prompt: string;
+    /** Per-child backend for a spawn task; omit for the daemon default. */
+    provider?: string;
+    /** Per-child model, already resolved against `provider`. */
+    model?: string;
     failureLimit: number;
     createdBy: string;
     now: number;
@@ -590,8 +620,8 @@ export class Store {
       .prepare(
         `INSERT INTO dispatch_tasks
            (id, account_id, project_id, kind, shape, target_session, workdir,
-            prompt, failure_limit, created_by, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            prompt, provider, model, failure_limit, created_by, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         task.id,
@@ -602,6 +632,8 @@ export class Store {
         task.targetSession ?? null,
         task.workdir ?? null,
         task.prompt,
+        task.provider ?? null,
+        task.model ?? null,
         task.failureLimit,
         task.createdBy,
         task.now,

@@ -12,6 +12,8 @@ import {
   MODEL_CATALOG,
   findModel,
   resolveModelId,
+  resolveModelIdForProvider,
+  CLAUDE_PROVIDER_ID,
   DEFAULT_MODEL_ALIAS,
   fallbackModelInfos,
   resolveAgainstList,
@@ -112,6 +114,50 @@ describe("findModel + resolveModelId", () => {
 
   it("trims whitespace around aliases", () => {
     expect(resolveModelId("  sonnet  ")).toMatch(/^claude-sonnet-/);
+  });
+});
+
+describe("resolveModelIdForProvider (per-child backend resolution)", () => {
+  it("behaves exactly like resolveModelId on the claude backend", () => {
+    for (const input of ["opus", "sonnet", "haiku", "claude-opus-4-9-hypothetical"]) {
+      expect(resolveModelIdForProvider(input, CLAUDE_PROVIDER_ID)).toBe(
+        resolveModelId(input),
+      );
+    }
+  });
+
+  it("treats an unspecified provider as claude", () => {
+    expect(resolveModelIdForProvider("opus")).toBe(resolveModelId("opus"));
+    expect(resolveModelIdForProvider("opus", undefined)).toMatch(/^claude-opus-/);
+  });
+
+  // The regression this function exists for: config.session.defaultModel is a
+  // global, so a Claude alias must not expand onto a non-Claude backend.
+  it("does NOT leak a claude alias onto a non-claude backend", () => {
+    expect(resolveModelIdForProvider("opus", "gemini")).toBeNull();
+    expect(resolveModelIdForProvider("sonnet", "openai")).toBeNull();
+    expect(resolveModelIdForProvider("haiku", "codex")).toBeNull();
+  });
+
+  it("does NOT forward a full claude id onto a non-claude backend", () => {
+    expect(resolveModelIdForProvider("claude-opus-4-8", "gemini")).toBeNull();
+    expect(resolveModelIdForProvider("claude-anything-at-all", "pi")).toBeNull();
+  });
+
+  it("passes a provider-native model through untouched", () => {
+    expect(resolveModelIdForProvider("gemini-2.5-pro", "gemini")).toBe("gemini-2.5-pro");
+    expect(resolveModelIdForProvider("gpt-5-codex", "openai")).toBe("gpt-5-codex");
+    expect(resolveModelIdForProvider("  gpt-5-codex  ", "openai")).toBe("gpt-5-codex");
+  });
+
+  it("returns null on empty / whitespace regardless of provider", () => {
+    expect(resolveModelIdForProvider("", "gemini")).toBeNull();
+    expect(resolveModelIdForProvider("   ", "gemini")).toBeNull();
+    expect(resolveModelIdForProvider("", CLAUDE_PROVIDER_ID)).toBeNull();
+  });
+
+  it("keeps CLAUDE_PROVIDER_ID in lockstep with DEFAULT_PROVIDER_ID", () => {
+    expect(DEFAULT_PROVIDER_ID).toBe(CLAUDE_PROVIDER_ID);
   });
 });
 

@@ -235,6 +235,9 @@ describe("fleet handlers — read surface", () => {
 });
 
 describe("fleet handlers — send-class (P4, post-approval)", () => {
+  /** Stand-in for the daemon's provider registry ids. */
+  const KNOWN_PROVIDERS = ["claude", "gemini", "openai", "codex", "pi"];
+
   function makeDispatch(): {
     dispatch: FleetDispatchDeps;
     enqueued: Array<Parameters<FleetDispatchDeps["enqueue"]>[0]>;
@@ -278,6 +281,17 @@ describe("fleet handlers — send-class (P4, post-approval)", () => {
           interrupted.push(sessionId);
         },
         checkWorkdir: (path) => (path.startsWith("/ok") ? path : null),
+        // Mirrors the real SessionManager closure: fail closed on an
+        // unregistered provider, pass a valid selection straight through.
+        resolveBackend: (provider, model) => {
+          if (provider !== undefined && !KNOWN_PROVIDERS.includes(provider)) {
+            return {
+              ok: false,
+              error: `Unknown provider "${provider}" — available: ${KNOWN_PROVIDERS.join(", ")}`,
+            };
+          }
+          return { ok: true, provider, model };
+        },
         listTasks: () => tasks,
       },
     };
@@ -328,6 +342,60 @@ describe("fleet handlers — send-class (P4, post-approval)", () => {
     expect(enqueued).toEqual([
       { kind: "spawn", shape: "scout", workdir: "/ok/repo", prompt: "investigate" },
     ]);
+  });
+
+  test("fleet_spawn forwards a chosen provider + model onto the task (P0)", async () => {
+    const { dispatch, enqueued } = makeDispatch();
+    const handlers = createFleetHandlers(makeDeps({ dispatch }));
+
+    const out = await handlers.fleet_spawn({
+      workdir: "/ok/repo",
+      task: "review this diff",
+      shape: "scout",
+      provider: "gemini",
+      model: "gemini-2.5-pro",
+    });
+    // The conductor is told which backend it got, so its next dispatch
+    // decision is informed by what is already running where.
+    expect(out).toContain("on gemini/gemini-2.5-pro");
+    expect(enqueued).toEqual([
+      {
+        kind: "spawn",
+        shape: "scout",
+        workdir: "/ok/repo",
+        prompt: "review this diff",
+        provider: "gemini",
+        model: "gemini-2.5-pro",
+      },
+    ]);
+  });
+
+  test("fleet_spawn rejects an unregistered provider BEFORE queueing", async () => {
+    const { dispatch, enqueued } = makeDispatch();
+    const handlers = createFleetHandlers(makeDeps({ dispatch }));
+
+    const out = await handlers.fleet_spawn({
+      workdir: "/ok/repo",
+      task: "x",
+      provider: "not-a-backend",
+    });
+    expect(out).toContain('Unknown provider "not-a-backend"');
+    expect(out).toContain("claude"); // names the available ones
+    expect(enqueued).toHaveLength(0);
+    // Audited as a rejection so a conductor probing backends is visible.
+    expect(
+      audits.some((a) => a.action === "fleet.spawn" && a.detail.includes("backend=rejected")),
+    ).toBe(true);
+  });
+
+  test("fleet_spawn without provider/model stays on the daemon default", async () => {
+    const { dispatch, enqueued } = makeDispatch();
+    const handlers = createFleetHandlers(makeDeps({ dispatch }));
+
+    const out = await handlers.fleet_spawn({ workdir: "/ok/repo", task: "x" });
+    expect(out).not.toContain(" on ");
+    expect(enqueued[0]!.provider).toBeUndefined();
+    expect(enqueued[0]!.model).toBeUndefined();
   });
 
   test("fleet_interrupt resolves and interrupts, refusing self", async () => {

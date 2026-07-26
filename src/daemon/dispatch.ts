@@ -156,6 +156,16 @@ export class Dispatcher {
     targetSession?: string;
     workdir?: string;
     prompt: string;
+    /**
+     * Backend the spawned worker runs on. Omit for the daemon default.
+     * Validated by the caller (the fleet tool / SessionManager) against the
+     * provider registry — the dispatcher persists it and hands it to the
+     * host, it does not resolve it. Meaningless on `kind: "send"`, which
+     * targets a session that already has its own provider.
+     */
+    provider?: string;
+    /** Per-child model, already resolved against `provider`. */
+    model?: string;
     createdBy: string;
   }): string {
     const id = randomUUID();
@@ -167,7 +177,8 @@ export class Dispatcher {
     });
     this.#host.audit(
       "dispatch.enqueued",
-      `task=${id} kind=${input.kind} shape=${input.shape} target=${input.targetSession ?? input.workdir ?? "-"}`,
+      `task=${id} kind=${input.kind} shape=${input.shape} target=${input.targetSession ?? input.workdir ?? "-"}` +
+        `${input.provider ? ` provider=${input.provider}` : ""}${input.model ? ` model=${input.model}` : ""}`,
     );
     return id;
   }
