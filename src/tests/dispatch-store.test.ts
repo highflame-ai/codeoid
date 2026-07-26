@@ -47,6 +47,42 @@ afterEach(() => {
   rmSync(tmp, { recursive: true, force: true });
 });
 
+describe("dispatch queue — per-child backend columns (P0)", () => {
+  test("provider + model round-trip through enqueue → get → listForTenant", () => {
+    const id = enqueue({ provider: "gemini", model: "gemini-2.5-pro" });
+    const row = store.dispatchGet(id)!;
+    expect(row.provider).toBe("gemini");
+    expect(row.model).toBe("gemini-2.5-pro");
+    const listed = store.dispatchListForTenant(TENANT.accountId, TENANT.projectId, 10);
+    expect(listed[0]!.provider).toBe("gemini");
+    expect(listed[0]!.model).toBe("gemini-2.5-pro");
+  });
+
+  test("omitting them stores NULL — the pre-collaboration default-backend meaning", () => {
+    const row = store.dispatchGet(enqueue())!;
+    expect(row.provider).toBeNull();
+    expect(row.model).toBeNull();
+  });
+
+  test("a provider with no model is valid (provider's own default)", () => {
+    const row = store.dispatchGet(enqueue({ provider: "openai" }))!;
+    expect(row.provider).toBe("openai");
+    expect(row.model).toBeNull();
+  });
+
+  test("the selection survives a claim + reclaim cycle", () => {
+    const id = enqueue({ provider: "codex", model: "gpt-5-codex" });
+    store.dispatchClaimNext("boot-1", 1_000);
+    const claimed = store.dispatchGet(id)!;
+    expect(claimed.provider).toBe("codex");
+    expect(claimed.model).toBe("gpt-5-codex");
+    // Reclaimed by a different boot (crash recovery) — still bound to codex.
+    const reclaimed = store.dispatchReclaimStale("boot-2", 1_000, 100_000);
+    expect(reclaimed.map((r) => r.provider)).toContain("codex");
+    expect(store.dispatchGet(id)!.model).toBe("gpt-5-codex");
+  });
+});
+
 describe("dispatch queue — claims", () => {
   test("claims are oldest-first and exclusive", () => {
     const first = enqueue();

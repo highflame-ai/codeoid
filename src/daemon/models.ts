@@ -108,6 +108,52 @@ export function resolveModelId(identifier: string): string | null {
 /** Default model when nothing else is specified. */
 export const DEFAULT_MODEL_ALIAS = "opus";
 
+/**
+ * The provider id whose model space this catalog describes. Must match the
+ * default id the provider registry is built with
+ * (`createDefaultProviderRegistry` → `new ProviderRegistry("claude")`);
+ * `DEFAULT_PROVIDER_ID` in session-manager re-exports this so there is one
+ * source of truth.
+ */
+export const CLAUDE_PROVIDER_ID = "claude";
+
+/**
+ * Provider-aware model resolution — the entry point every *session
+ * construction* path must use, because `resolveModelId` speaks only Claude.
+ *
+ * The hazard it closes: model defaults arrive from provider-agnostic places
+ * (`config.session.defaultModel`, a conductor/role override, a dispatch
+ * task) but `resolveModelId` expands aliases against MODEL_CATALOG. Feed it
+ * `"opus"` while building a session on the gemini backend and the session
+ * silently carries `claude-opus-4-8` into a Google API call.
+ *
+ * Rules:
+ *   - claude (or unspecified) backend → unchanged `resolveModelId` behavior.
+ *   - any other backend → a value that is *Claude-specific* (a catalog alias
+ *     or id, or a bare `claude-*` id) is *not applicable* here, so we return
+ *     null and let the provider choose its own default. That is strictly
+ *     better than forwarding a foreign id the backend will reject.
+ *   - any other backend, non-Claude-looking value (`gemini-2.5-pro`,
+ *     `gpt-5-codex`) → passed through untouched. Explicit per-child model
+ *     choices are the point of per-role backends; we don't gatekeep them.
+ *     The live backend catalog (`resolveAgainstList`, used on the
+ *     `/model` change path) remains the real validator.
+ */
+export function resolveModelIdForProvider(
+  identifier: string,
+  providerId?: string,
+): string | null {
+  const trimmed = identifier?.trim();
+  if (!trimmed) return null;
+  if (!providerId || providerId === CLAUDE_PROVIDER_ID) {
+    return resolveModelId(trimmed);
+  }
+  // Non-Claude backend: drop Claude-shaped values instead of forwarding them.
+  if (findModel(trimmed)) return null;
+  if (/^claude-/i.test(trimmed)) return null;
+  return trimmed;
+}
+
 // ── Dynamic (live-backend) model resolution ──────────────────────────────
 
 /**

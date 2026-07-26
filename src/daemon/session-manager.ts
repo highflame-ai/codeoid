@@ -31,7 +31,12 @@ import {
   isProtectedPath,
 } from "./fs.js";
 import { readClaudeConfig } from "./claude-config.js";
-import { fallbackModelInfos, resolveAgainstList } from "./models.js";
+import {
+  CLAUDE_PROVIDER_ID,
+  fallbackModelInfos,
+  resolveAgainstList,
+  resolveModelIdForProvider,
+} from "./models.js";
 import {
   packSession,
   unpackBundle,
@@ -166,9 +171,10 @@ const RESUME_DEADLINE_MS = 20_000;
 const RESUME_TRANSCRIPT_MAX_BYTES = 24 * 1024 * 1024;
 
 /** Provider assumed when a client doesn't say which catalog it wants.
- *  Sessions are Claude-backed today; when the provider registry is wired
- *  into session creation this becomes the configured default provider. */
-export const DEFAULT_PROVIDER_ID = "claude";
+ *  Re-exported from models.ts so the id that gates Claude-only alias
+ *  expansion (`resolveModelIdForProvider`) and the id used for catalog
+ *  defaults can never drift apart. */
+export const DEFAULT_PROVIDER_ID = CLAUDE_PROVIDER_ID;
 
 /** Sort key for resume ordering: most-recently-active first. Falls back to
  * createdAt, then 0, so a malformed timestamp never throws. */
@@ -2336,12 +2342,29 @@ mcpHub: this.#mcpHub,
             `workdir not usable: ${task.workdir ?? "(none)"}`,
           );
         }
+        // Same reasoning for the backend: the task was validated when queued,
+        // but the registry is rebuilt at startup and gates backends on their
+        // env keys / binaries, so a task that outlived a restart can name a
+        // provider that no longer exists. ProviderRegistry.resolve() would
+        // quietly fall back to claude and we'd run the worker on the wrong
+        // vendor while reporting success — fail the task instead.
+        if (task.provider && !this.#providers.has(task.provider)) {
+          throw new NonRetryableDispatchError(
+            `provider "${task.provider}" is not registered on this daemon — available: ${this.#providers.ids().join(", ")}`,
+          );
+        }
         const budget = this.#dispatcher.config.workerToolBudget;
         const session = new Session({
           name: `worker-${task.shape}-${task.id.slice(0, 8)}`,
           workdir,
           role: "worker",
           workerShape: task.shape,
+          // Per-role backend (P0). NULL provider = daemon default, which is
+          // the pre-collaboration behaviour. `defaultModel` is resolved
+          // provider-aware inside Session, so a Claude alias inherited from
+          // config.session.defaultModel cannot ride onto another vendor.
+          providerId: task.provider ?? undefined,
+          defaultModel: task.model ?? undefined,
           // Autonomous with a bounded budget: unattended until the budget
           // exhausts, then guarded → waiting_approval, which the dispatcher
           // treats as a wedge (lease stops renewing, reclaim handles it).
@@ -2557,6 +2580,39 @@ mcpHub: this.#mcpHub,
         await session.interrupt(this.#dispatchSystemAuth(accountId, projectId));
       },
       checkWorkdir: (path: string) => normalizeWorkdir(path),
+      resolveBackend: (provider?: string, model?: string) => {
+        // Fail closed on an unknown provider — same rule and same wording as
+        // session.create / fork / set_provider. Rejecting here (pre-queue)
+        // means the conductor can correct itself in the same turn; letting it
+        // through would only fail at claim time and burn a task attempt.
+        if (provider !== undefined && !this.#providers.has(provider)) {
+          return {
+            ok: false,
+            error: `Unknown provider "${provider}" — available: ${this.#providers.ids().join(", ")}`,
+          };
+        }
+        if (model === undefined) return { ok: true, provider };
+        // Validate the model against THIS provider's catalog (live, persisted,
+        // or fallback) so a typo is caught before the worker spawns. Absent a
+        // catalog for the backend, resolveModelIdForProvider's passthrough
+        // applies and the backend stays the real validator.
+        const providerId = provider ?? DEFAULT_PROVIDER_ID;
+        const { models } = this.#currentModels(providerId);
+        const resolved =
+          models.length > 0
+            ? (resolveAgainstList(model, models) ??
+              resolveModelIdForProvider(model, providerId))
+            : resolveModelIdForProvider(model, providerId);
+        if (!resolved) {
+          const known = models.map((m) => m.value).join(", ");
+          const available = known ? ` — available: ${known}` : "";
+          return {
+            ok: false,
+            error: `Model "${model}" is not valid for provider "${providerId}"${available}. Omit \`model\` to use the provider's default.`,
+          };
+        }
+        return { ok: true, provider, model: resolved };
+      },
       listTasks: (limit: number): FleetTaskView[] =>
         this.#store
           .dispatchListForTenant(accountId, projectId, limit)
