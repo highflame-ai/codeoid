@@ -2,6 +2,27 @@
 
 > Configuration reference for Codeoid. For install and a quick tour, start with the [README](../README.md).
 
+## Auth posture: ZeroID or local
+
+Codeoid has exactly two auth postures, chosen at daemon startup.
+
+| | **ZeroID** (default) | **Local** (`--local`) |
+|---|---|---|
+| Setup | `codeoid login` with a `zid_sk_…` key | none |
+| Credential | short-lived RS256 JWT, verified against the issuer's JWKS | one 256-bit token, minted per boot |
+| Identity | real, per-agent and per-sub-agent | self-asserted `anonymous:operator` |
+| Delegation, attenuation, revocation | ✅ | ❌ |
+| Audit attribution | cryptographic | records the action; principal is self-asserted |
+| Tenant | from the token's `account_id` / `project_id` claims | reserved `local` / `local` |
+| Bind | any host | loopback only (override with `--local-allow-remote`) |
+| Telegram frontend | ✅ | refused |
+
+Everything below applies to both unless noted. Scope enforcement is *identical* in
+both — local mode changes the issuer, not the mechanism.
+
+→ **[Local mode reference](local-mode.md)** — the full trust model, the tenant
+one-way door, and how clients discover the token.
+
 ## Permission scopes
 
 | Scope | Description |
@@ -43,6 +64,18 @@ ZEROID_URL=highflame                    # issuer: preset (highflame | highflame-
 ZEROID_ISSUER=                          # expected `iss` claim; defaults to the resolved ZEROID_URL
 ZEROID_ACCOUNT_ID=personal              # Enable agent identities
 ZEROID_PROJECT_ID=dev
+
+# Local mode (no ZeroID) — see docs/local-mode.md
+CODEOID_LOCAL_TOKEN=                    # daemon: use this instead of minting one (pins it
+                                        #   across restarts, e.g. in a container)
+                                        # client: present this token
+                                        # Clients otherwise read ~/.codeoid/local-token-<port>,
+                                        #   which a `--local` daemon publishes while it runs.
+
+# Session limits — UNLIMITED by default (0). Running many sessions in parallel
+# is the point; set these only for a shared multi-user daemon.
+CODEOID_MAX_SESSIONS_PER_USER=0         # concurrent sessions per subject (0 = unlimited)
+CODEOID_MAX_SESSIONS_PER_HOUR=0         # session creations per subject per hour (0 = unlimited)
 
 # Daemon
 CODEOID_DAEMON_URL=ws://127.0.0.1:7400  # (for CLI + TUI client)

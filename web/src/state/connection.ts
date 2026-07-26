@@ -13,6 +13,7 @@ import { createSignal } from "solid-js";
 import {
   forgetOAuthToken,
   jwtExpiryMs,
+  readLocalModeToken,
   refreshAccessToken,
   rememberedApiKey,
   rememberedOAuthToken,
@@ -164,6 +165,12 @@ export async function refreshSessions(): Promise<SessionInfo[]> {
  * token, or if a rotation attempt fails transiently.
  */
 async function freshAccessToken(): Promise<string> {
+  // Local mode: the injected token is the credential and it never expires
+  // (its lifetime is the daemon process). No exchange, no rotation — presenting
+  // it again is exactly right, and reaching for ZeroID here would fail.
+  const injected = readLocalModeToken();
+  if (injected) return injected;
+
   const hasApiKey = Boolean(rememberedApiKey());
   if (!hasApiKey && rememberedRefreshToken()) {
     const stored = rememberedOAuthToken();

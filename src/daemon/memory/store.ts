@@ -19,6 +19,7 @@ import { resolve, isAbsolute } from "node:path";
 import type { ClusterableEpisode } from "./cluster.js";
 import type { Episode, FileReadRecord, RecallQuery } from "./types.js";
 import type { TurnUsage } from "../../protocol/types.js";
+import { BUSY_TIMEOUT_MS } from "../store.js";
 
 /** Default byte ceiling for the decoded embedding-matrix cache (#154).
  * 128 MiB ≈ 87k episodes of 384-dim float32 — generous for interactive
@@ -207,6 +208,9 @@ export class SqliteEpisodeStore {
       Math.floor(opts.vectorCacheMaxBytes ?? DEFAULT_VECTOR_CACHE_MAX_BYTES),
     );
     this.#db = new Database(dbPath, { create: true });
+    // Before any lock-taking statement — SQLite's default is fail-instantly.
+    // See BUSY_TIMEOUT_MS in ../store.ts for why every writable store sets it.
+    this.#db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
     this.#db.exec("PRAGMA journal_mode = WAL");
     this.#db.exec("PRAGMA synchronous = NORMAL");
     this.#db.exec("PRAGMA foreign_keys = ON");

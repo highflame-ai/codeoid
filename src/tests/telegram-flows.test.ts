@@ -27,6 +27,7 @@ import { afterAll, afterEach, beforeAll, describe, it, expect } from "bun:test";
 import { Bot } from "grammy";
 import type { UserFromGetMe } from "grammy/types";
 import { TelegramFrontend } from "../frontends/telegram/index.js";
+import { ZeroIdVerifier } from "../daemon/auth.js";
 import type { FrontendContext } from "../frontends/types.js";
 import type { AttachedClient } from "../daemon/session.js";
 import type { DaemonMessage, ToolState } from "../protocol/types.js";
@@ -311,6 +312,8 @@ async function boot(opts: BootOpts = {}) {
     manager: manager as never,
     store: { audit() {} } as never,
     auth: { baseUrl: authBaseUrl },
+    // Real ZeroID verification against the local JWKS server (see module doc).
+    verifier: new ZeroIdVerifier({ baseUrl: authBaseUrl }),
     httpServer: {} as never,
     host: "localhost",
     port: 0,

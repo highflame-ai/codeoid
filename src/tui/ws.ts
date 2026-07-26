@@ -8,6 +8,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { PROTOCOL_VERSION } from "../protocol/types.js";
 import type {
   Attachment,
   ClientMessage,
@@ -16,6 +17,7 @@ import type {
   ToolState,
 } from "../protocol/types.js";
 import { ALL_SCOPES_STRING } from "../protocol/scopes.js";
+import { resolveLocalToken } from "../config.js";
 import type { CodeoidConfig } from "../config.js";
 import type { Dispatch } from "react";
 import type { TuiAction } from "./types.js";
@@ -268,7 +270,17 @@ export class TuiWsClient {
     ws.onopen = () => {
       // A newer connect may have superseded this socket while it was opening.
       if (this.#ws !== ws) return;
-      ws.send(JSON.stringify({ token }));
+      // `type: "auth"` is REQUIRED — the daemon validates this pre-auth frame
+      // against `authMsgSchema` and closes 4001 on anything else. A bare
+      // `{ token }` frame is rejected outright.
+      ws.send(
+        JSON.stringify({
+          type: "auth",
+          token,
+          protocolVersion: PROTOCOL_VERSION,
+          client: "codeoid-tui-ink",
+        }),
+      );
     };
 
     ws.onmessage = (event) => {
@@ -504,10 +516,16 @@ export class TuiWsClient {
   }
 
   async #getToken(): Promise<string> {
+    // Local mode first — see TerminalClient#getToken and config.resolveLocalToken
+    // for why a token published for this daemon's port outranks a durable apiKey.
+    const localToken = resolveLocalToken(this.#config.daemonUrl);
+    if (localToken) return localToken;
+
     const token = this.#config.apiKey;
     if (!token) {
       throw new TokenExchangeError(
-        "No API key configured. Set CODEOID_API_KEY or add apiKey to ~/.codeoid/config.json.",
+        "No API key configured. Set CODEOID_API_KEY or add apiKey to ~/.codeoid/config.json, " +
+          "run `codeoid login`, or start the daemon with `codeoid start --local` to try it with no account.",
         false,
       );
     }

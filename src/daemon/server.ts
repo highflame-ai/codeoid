@@ -9,7 +9,13 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { verifyToken, type AuthConfig } from "./auth.js";
+import { ZeroIdVerifier, type AuthConfig } from "./auth.js";
+import type { TokenVerifier } from "./verifier.js";
+import {
+  LocalVerifier,
+  removeLocalTokenFile,
+  writeLocalTokenFile,
+} from "./local-auth.js";
 import { SessionManager } from "./session-manager.js";
 import { Store } from "./store.js";
 import { TranscriptStore } from "./transcript.js";
@@ -111,12 +117,38 @@ function proxyRateOk(ip: string): boolean {
   return true;
 }
 
+/**
+ * Local mode (`codeoid start --local`) — see ./local-auth.ts for the full
+ * rationale and for what this posture gives up. Presence of this field is the
+ * ONE switch that selects the degraded issuer; everything downstream of the
+ * verifier is unchanged.
+ */
+export interface LocalModeConfig {
+  /** The single bearer token this daemon accepts. Minted per boot. */
+  token: string;
+  /**
+   * Where to publish the token for local clients (0600). Written on `start()`,
+   * removed on shutdown — so the file's presence means "a local-mode daemon is
+   * running here", which is what lets `codeoid tui` self-configure. Omit to
+   * skip publication (the operator hands the token over some other way).
+   */
+  tokenFile?: string;
+}
+
 export interface DaemonConfig {
   port: number;
   host: string;
   dbPath: string;
   transcriptDir: string;
   auth: AuthConfig;
+  /**
+   * When set, the daemon authenticates with a locally-minted token instead of
+   * ZeroID: no account, no login, no network. Mutually exclusive with the
+   * ZeroID path in practice — `auth` is still required (and still used for the
+   * ZeroID base URL by non-auth call sites), but no token is ever verified
+   * against it while this is present.
+   */
+  localMode?: LocalModeConfig;
   oauth?: OAuthConfig;
   agentIdentity?: {
     accountId: string;
@@ -164,6 +196,8 @@ export class DaemonServer {
   #frontends: Frontend[] = [];
   #httpHandlers: Array<(req: IncomingMessage, res: ServerResponse) => boolean> = [];
   #oauthHandler: OAuthHandler | null = null;
+  /** The one function that turns a bearer token into an AuthContext. */
+  #verifier: TokenVerifier;
 
   constructor(config: DaemonConfig) {
     this.#config = config;
@@ -175,17 +209,46 @@ export class DaemonServer {
     this.#transcriptStore = new TranscriptStore(config.transcriptDir);
     this.#shutdown = new ShutdownManager();
 
-    if (config.oauth) {
+    // The auth posture is chosen exactly once, here. Every enforcement site
+    // downstream reads the resulting AuthContext and never learns which issuer
+    // produced it (see ./verifier.ts — REVIEW INVARIANT).
+    if (config.localMode) {
+      this.#verifier = new LocalVerifier(config.localMode.token);
+      // Loud and unmissable. The failure this guards against is demonstrating
+      // an identity-first control plane in the mode that has no identity.
+      console.warn("[codeoid] ┌──────────────────────────────────────────────────────────────┐");
+      console.warn("[codeoid] │  LOCAL MODE — no ZeroID, no verified identity                │");
+      console.warn("[codeoid] │  Principal is self-asserted; agent identity, delegation,     │");
+      console.warn("[codeoid] │  revocation and cryptographic attribution are OFF.           │");
+      console.warn("[codeoid] │  For real identities: codeoid login  (docs/local-mode.md)    │");
+      console.warn("[codeoid] └──────────────────────────────────────────────────────────────┘");
+    } else {
+      // Bound to a local so the issuer read needs no cast — a `as ZeroIdVerifier`
+      // here would keep compiling if these branches were ever reordered.
+      const zeroid = new ZeroIdVerifier(config.auth);
+      this.#verifier = zeroid;
+      console.log(`[codeoid] auth: ZeroID (issuer ${zeroid.issuer})`);
+    }
+
+    // Google OAuth mints tokens by exchanging at the ZeroID token endpoint, so
+    // it is meaningless (and would reach the network) under local mode.
+    if (config.oauth && !config.localMode) {
       const idp = new GoogleOAuthProvider({
         clientId: config.oauth.googleClientId,
         clientSecret: config.oauth.googleClientSecret,
       });
       this.#oauthHandler = new OAuthHandler(config.oauth, idp);
       console.log(`[codeoid] auth provider: ${idp.name}`);
+    } else if (config.oauth) {
+      console.warn("[codeoid] local mode: Google OAuth sign-in disabled (it needs ZeroID)");
     }
 
+    // Agent identity registers SPIFFE/WIMSE identities against ZeroID. In local
+    // mode there is nothing to register against, and attempting it is exactly
+    // the boot-time network dependency local mode exists to avoid. Guarded here
+    // (not only in the CLI) so any embedder gets the same guarantee.
     let identityManager: AgentIdentityManager | undefined;
-    if (config.agentIdentity) {
+    if (config.agentIdentity && !config.localMode) {
       identityManager = new AgentIdentityManager(
         {
           auth: config.auth,
@@ -194,6 +257,10 @@ export class DaemonServer {
           registrarKey: config.agentIdentity.registrarKey,
         },
         this.#store,
+      );
+    } else if (config.agentIdentity) {
+      console.warn(
+        "[codeoid] local mode: per-agent ZeroID identity disabled (agents run as anonymous:*)",
       );
     }
 
@@ -210,7 +277,16 @@ export class DaemonServer {
       console.log(`[codeoid] hooks: ${hooks.size} configured`);
     }
 
-    const rateLimiter = new RateLimiter();
+    // Unlimited unless the operator configured a bound — see rate-limit.ts for
+    // why a hardcoded cap was the wrong default for a single-operator daemon.
+    const rateLimiter = new RateLimiter(config.fullConfig?.rateLimit);
+    if (config.fullConfig?.rateLimit && !rateLimiter.disabled) {
+      const { maxSessionsPerUser, maxCreationsPerHour } = config.fullConfig.rateLimit;
+      console.log(
+        `[codeoid] session limits: ${maxSessionsPerUser || "unlimited"} concurrent, ` +
+          `${maxCreationsPerHour || "unlimited"}/hr per subject`,
+      );
+    }
     this.#manager = new SessionManager(
       this.#store, this.#transcriptStore, identityManager, rateLimiter,
       // Memory is wired post-construction via initMemory() — see start()
@@ -245,10 +321,32 @@ export class DaemonServer {
     this.#shutdown.register("server", () => {
       this.#bunServer?.stop();
     });
+    // LIFO: registered last → runs FIRST, so the published token stops being
+    // discoverable before anything else winds down. The token dies with the
+    // process (a fresh one is minted next boot), which is what keeps it from
+    // becoming a durable credential lying around in the config dir.
+    const tokenFile = config.localMode?.tokenFile;
+    if (tokenFile) {
+      this.#shutdown.register("local-token", () => removeLocalTokenFile(tokenFile));
+    }
   }
 
   get manager(): SessionManager {
     return this.#manager;
+  }
+
+  /**
+   * The port actually being listened on — differs from `config.port` when the
+   * caller passed 0 to let the OS pick. Falls back to the configured value
+   * before `start()`.
+   */
+  get port(): number {
+    return this.#bunServer?.port ?? this.#config.port;
+  }
+
+  /** Which issuer this daemon verifies tokens against. */
+  get authMode(): TokenVerifier["mode"] {
+    return this.#verifier.mode;
   }
 
   // ── Frontend plugin management ──────────────────────────────────────
@@ -269,6 +367,15 @@ export class DaemonServer {
   async start(): Promise<void> {
     // Install signal handlers
     this.#shutdown.install();
+
+    // Publish the local-mode token for clients on this machine BEFORE the
+    // socket opens, so `codeoid tui` in another terminal can never observe a
+    // listening daemon without a readable token.
+    const localMode = this.#config.localMode;
+    if (localMode?.tokenFile) {
+      writeLocalTokenFile(localMode.tokenFile, localMode.token);
+      console.log(`[codeoid] local-mode token published to ${localMode.tokenFile} (0600)`);
+    }
 
     // Boot memory engine if configured — before resume so ingestion queue is ready.
     if (this.#config.memory) {
@@ -397,7 +504,13 @@ export class DaemonServer {
         }
 
         if (url.pathname === "/config") {
-          return Response.json({ zeroid_url: authConfig.baseUrl });
+          return Response.json({
+            zeroid_url: authConfig.baseUrl,
+            // Which issuer this daemon actually verifies against. Same value as
+            // `auth.ok`'s authMode; exposed here too so an operator can check
+            // the posture with curl before connecting anything.
+            auth_mode: self.#verifier.mode,
+          });
         }
 
         // Token exchange proxy (avoids CORS). `/oauth2/token` is the path the
@@ -408,6 +521,16 @@ export class DaemonServer {
           (url.pathname === "/auth/token" || url.pathname === "/oauth2/token") &&
           req.method === "POST"
         ) {
+          // Local mode has no issuer to exchange against, and forwarding would
+          // turn the daemon into an unauthenticated egress path to ZeroID for
+          // any local process. Refuse it outright rather than proxying a token
+          // that could never authenticate here anyway.
+          if (self.#config.localMode) {
+            return Response.json(
+              { error: "token exchange unavailable in local mode" },
+              { status: 503 },
+            );
+          }
           const ip = server.requestIP(req)?.address ?? "unknown";
           if (!proxyRateOk(ip)) {
             return Response.json({ error: "rate limited" }, { status: 429 });
@@ -544,7 +667,7 @@ export class DaemonServer {
             const authMsg = authParse.value;
 
             try {
-              data.auth = await verifyToken(authMsg.token, authConfig);
+              data.auth = await self.#verifier.verify(authMsg.token);
             } catch (err) {
               ws.close(4003, `Authentication failed: ${err instanceof Error ? err.message : "unknown"}`);
               return;
@@ -576,6 +699,9 @@ export class DaemonServer {
               // Registered backends, default first — feeds the new-session
               // provider picker (see AuthOkMsg.providers).
               providers: self.#manager.providerIds(),
+              // Which issuer authenticated this connection. Clients render
+              // "local" as a visible badge — degradation must never be silent.
+              authMode: self.#verifier.mode,
             }));
             return;
           }
@@ -688,6 +814,7 @@ export class DaemonServer {
       manager: this.#manager,
       store: this.#store,
       auth: this.#config.auth,
+      verifier: this.#verifier,
       httpServer: null as unknown as Server, // Not used with Bun.serve
       host: this.#config.host,
       port: this.#config.port,

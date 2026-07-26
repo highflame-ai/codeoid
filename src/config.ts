@@ -20,6 +20,11 @@ import { homedir } from "node:os";
 import { z } from "zod";
 import type { AuthConfig } from "./daemon/auth.js";
 import type { OAuthConfig } from "./daemon/oauth.js";
+import {
+  LOCAL_TOKEN_ENV,
+  localTokenFilename,
+  readLocalTokenFile,
+} from "./daemon/local-auth.js";
 import { HOOK_EVENTS, type HookEntryConfig } from "./daemon/hooks/types.js";
 
 // ── Paths ────────────────────────────────────────────────────────────────
@@ -31,6 +36,59 @@ export function getConfigDir(): string {
   const xdg = process.env.XDG_CONFIG_HOME;
   if (xdg && xdg.length > 0) return join(xdg, "codeoid");
   return DEFAULT_CONFIG_DIR;
+}
+
+/**
+ * Where a local-mode daemon on `port` publishes its token for local clients.
+ * Port-scoped so two local daemons never share (or delete) each other's
+ * credential — see `localTokenFilename`.
+ */
+export function getLocalTokenPath(port: number | string): string {
+  return join(getConfigDir(), localTokenFilename(port));
+}
+
+/** Default daemon port, used when a daemon URL carries no explicit one. */
+const DEFAULT_DAEMON_PORT = "7400";
+
+/**
+ * The port a client will dial, from its configured daemon URL. Falls back to
+ * codeoid's default port when the URL omits one (`ws://host/`), which is what
+ * the connection itself would do. Returns null only for an unparseable URL.
+ */
+export function daemonPortFromUrl(daemonUrl: string): string | null {
+  try {
+    const port = new URL(daemonUrl).port;
+    return port.length > 0 ? port : DEFAULT_DAEMON_PORT;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The local-mode token to present to the daemon at `daemonUrl`, or null.
+ *
+ * Precedence, and the reasoning behind it:
+ *   1. `CODEOID_LOCAL_TOKEN` — an explicit, per-invocation decision.
+ *   2. the token file published for THAT daemon's port — written by
+ *      `codeoid start --local` and removed on its shutdown, so its presence
+ *      means "a local-mode daemon is listening on this port right now". That
+ *      makes it a stronger signal than a durable `apiKey` in config.json, which
+ *      says nothing about the daemon currently listening. Clients therefore
+ *      prefer it, and someone who ran `--local` once for a demo doesn't have to
+ *      unwind their config to go back to ZeroID (or vice versa).
+ *
+ * Keyed by port so a second local daemon (or a ZeroID daemon) elsewhere on the
+ * machine can neither hijack nor invalidate this lookup.
+ */
+export function resolveLocalToken(
+  daemonUrl: string,
+  env: Record<string, string | undefined> = process.env,
+): string | null {
+  const fromEnv = env[LOCAL_TOKEN_ENV];
+  if (fromEnv && fromEnv.length > 0) return fromEnv;
+  const port = daemonPortFromUrl(daemonUrl);
+  if (!port) return null;
+  return readLocalTokenFile(getLocalTokenPath(port));
 }
 
 /**
@@ -354,6 +412,27 @@ const OAuthSchemaFields = z
  * autonomously up to `workerToolBudget` tool calls, then wedge safely (the
  * lease reclaims them).
  */
+/**
+ * Per-subject session limits. BOTH DEFAULT TO 0 = UNLIMITED.
+ *
+ * codeoid's normal shape is one operator driving many parallel worktrees, and a
+ * hardcoded cap (this used to be 10 concurrent / 30 per hour, unconfigurable)
+ * trips over that — the README's own hero shot runs 12 sessions. The runaway
+ * case is bounded where it actually originates instead, by `dispatch`'s
+ * maxConcurrentWorkers / workerToolBudget / failureLimit.
+ *
+ * Kept configurable for a shared multi-user daemon, where a per-subject bound
+ * is a reasonable thing to want. See src/daemon/rate-limit.ts.
+ */
+const RateLimitSchema = z
+  .object({
+    /** Sessions alive at once per subject. 0 = unlimited. */
+    maxSessionsPerUser: z.number().int().min(0).default(0),
+    /** Session creations per subject per hour. 0 = unlimited. */
+    maxCreationsPerHour: z.number().int().min(0).default(0),
+  })
+  .default({ maxSessionsPerUser: 0, maxCreationsPerHour: 0 });
+
 const DispatchSchema = z
   .object({
     enabled: z.boolean().default(true),
@@ -605,6 +684,7 @@ const RootSchema = z.object({
   session: SessionSchema,
   conductor: ConductorSchema,
   dispatch: DispatchSchema,
+  rateLimit: RateLimitSchema,
   pipeline: PipelineSchema,
   providers: ProvidersSchema,
   mcpServers: McpServersSchema,
@@ -732,6 +812,16 @@ export interface CodeoidConfig {
    * configs stay minimal; loadConfig always populates it. Absent = enabled
    * with defaults.
    */
+  /**
+   * Per-subject session limits. Both default to 0 = unlimited (see
+   * RateLimitSchema); set them only for a shared multi-user daemon. Optional in
+   * the type so hand-built test configs stay minimal; loadConfig always
+   * populates it.
+   */
+  rateLimit?: {
+    maxSessionsPerUser: number;
+    maxCreationsPerHour: number;
+  };
   dispatch?: {
     enabled: boolean;
     tickMs: number;
@@ -865,6 +955,8 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   // without touching config.json. Other dispatch knobs are file-config only,
   // matching the conductor block's convention.
   { env: "CODEOID_DISPATCH_ENABLED", path: "dispatch.enabled", kind: "boolean" },
+  { env: "CODEOID_MAX_SESSIONS_PER_USER", path: "rateLimit.maxSessionsPerUser", kind: "int" },
+  { env: "CODEOID_MAX_SESSIONS_PER_HOUR", path: "rateLimit.maxCreationsPerHour", kind: "int" },
   // Pipeline enable/kill switch — turn the SDLC pipeline on/off per-invocation
   // without touching config.json (on by default; set false to opt out). Other
   // pipeline knobs are file-config only, matching the dispatch/conductor convention.
@@ -1074,6 +1166,7 @@ export function loadConfig(opts: LoadOptions = {}): CodeoidConfig {
     session: parsed.session,
     conductor: parsed.conductor,
     dispatch: parsed.dispatch,
+    rateLimit: parsed.rateLimit,
     pipeline: parsed.pipeline,
     providers: parsed.providers,
     mcpServers: parsed.mcpServers,

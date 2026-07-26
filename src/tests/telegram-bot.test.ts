@@ -20,6 +20,8 @@ import { describe, it, expect } from "bun:test";
 import { Bot } from "grammy";
 import type { UserFromGetMe } from "grammy/types";
 import { TelegramFrontend, isStaleBroadcast } from "../frontends/telegram/index.js";
+import { ZeroIdVerifier } from "../daemon/auth.js";
+import { LocalVerifier, mintLocalToken } from "../daemon/local-auth.js";
 import type { FrontendContext } from "../frontends/types.js";
 import type { DaemonMessage } from "../protocol/types.js";
 import { formatSessionLine, escMd, escCode } from "../frontends/telegram/stream.js";
@@ -83,6 +85,7 @@ function fakeContext(): FrontendContext {
     manager: {} as never,
     store: { audit() {} } as never,
     auth: { baseUrl: "http://localhost:0" },
+    verifier: new ZeroIdVerifier({ baseUrl: "http://localhost:0" }),
     httpServer: {} as never,
     host: "localhost",
     port: 0,
@@ -259,5 +262,33 @@ describe("isStaleBroadcast — drop daemon messages from unattached sessions", (
     const pong = { type: "response.ok", requestId: "r1" } as unknown as DaemonMessage;
     expect(isStaleBroadcast(pong, "sess-A")).toBe(false);
     expect(isStaleBroadcast(pong, null)).toBe(false);
+  });
+});
+
+describe("Telegram frontend refuses local mode", () => {
+  // Telegram is reached through Telegram's servers — a remote surface. Local
+  // mode's trust model is "whoever can read a 0600 file on this machine".
+  // Pairing them would let a locally-minted token stand in for a verified
+  // identity over the public internet, so the frontend fail-closes rather than
+  // relying on the CLI alone to decline registering it.
+  it("throws on start() when the daemon has no ZeroID verifier", async () => {
+    const bot = new Bot("44:TEST_TOKEN", { botInfo });
+    const fe = new TelegramFrontend("44:TEST_TOKEN", [1], bot);
+    const ctx = {
+      ...fakeContext(),
+      verifier: new LocalVerifier(mintLocalToken()),
+    };
+    await expect(fe.start(ctx)).rejects.toThrow(/requires ZeroID auth/);
+  });
+
+  it("still starts under a ZeroID verifier", async () => {
+    const bot = new Bot("44:TEST_TOKEN", { botInfo });
+    // Swallow the long-poll so start() doesn't hang the test.
+    bot.api.config.use(async (_prev, method) =>
+      method === "getUpdates" ? ({ ok: true, result: [] } as never) : ({ ok: true, result: true } as never),
+    );
+    const fe = new TelegramFrontend("44:TEST_TOKEN", [1], bot);
+    await fe.start(fakeContext());
+    await bot.stop().catch(() => {});
   });
 });

@@ -1,15 +1,21 @@
 /**
- * ZeroID JWT verification for Codeoid connections.
+ * ZeroID JWT verification for Codeoid connections — the primary auth path.
  *
  * Every WebSocket connection and every Telegram message must present a valid
  * ZeroID JWT. The token is verified locally against the JWKS endpoint (no
  * round-trip to ZeroID on the hot path). Scopes in the token are mapped to
  * Codeoid permission scopes and enforced per-message by the daemon.
+ *
+ * `ZeroIdVerifier` at the bottom of this file is the `TokenVerifier`
+ * (./verifier.ts) implementation of this path — a thin wrapper carrying no
+ * behaviour of its own, so that swapping the *issuer* (see ./local-auth.ts)
+ * never touches what happens after a token becomes an `AuthContext`.
  */
 
 import { ZeroIDClient } from "@highflame/sdk";
 import type { AuthContext } from "../protocol/types.js";
 import type { Scope } from "../protocol/scopes.js";
+import type { AuthMode, TokenVerifier } from "./verifier.js";
 
 export interface AuthConfig {
   /** ZeroID base URL, e.g. "http://localhost:8899" */
@@ -95,6 +101,34 @@ function identityToAuthContext(identity: VerifiedIdentity): AuthContext {
     projectId: identity.project_id,
     exp: identity.exp,
   };
+}
+
+/**
+ * The primary path as a `TokenVerifier`.
+ *
+ * Deliberately behaviour-free: it holds the `AuthConfig` and delegates to
+ * `verifyToken` above, unchanged. Every guarantee of the ZeroID path —
+ * signature verification, issuer pinning, audience checks, mandatory `exp`,
+ * mandatory tenancy claims — lives in that function and is reached identically
+ * whether the caller went through this class or called it directly.
+ */
+export class ZeroIdVerifier implements TokenVerifier {
+  readonly mode: AuthMode = "zeroid";
+
+  readonly #config: AuthConfig;
+
+  constructor(config: AuthConfig) {
+    this.#config = config;
+  }
+
+  /** The issuer this verifier trusts — used for operator-facing logging. */
+  get issuer(): string {
+    return this.#config.issuer ?? this.#config.baseUrl;
+  }
+
+  verify(token: string): Promise<AuthContext> {
+    return verifyToken(token, this.#config);
+  }
 }
 
 /**

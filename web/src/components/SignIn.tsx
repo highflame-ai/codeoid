@@ -118,6 +118,17 @@ const SignIn: Component<{ onSignedIn: () => void }> = (props) => {
             class="w-full rounded border border-border bg-bg px-3 py-2 font-mono text-sm text-fg outline-none placeholder:text-fg-faint focus:border-accent"
             disabled={busy()}
           />
+          {/*
+            A loopback local-mode daemon injects its token and this screen never
+            renders. It IS reached when the daemon runs `--local` on a wide bind
+            (where injecting into the HTML would hand control to anyone who can
+            reach the port), so name the paste-it path rather than leaving the
+            operator staring at a ZeroID-only prompt.
+          */}
+          <span class="block text-[11px] text-fg-faint">
+            No account? Start the daemon with <code class="font-mono">codeoid start --local</code>{" "}
+            and paste its <code class="font-mono">codeoid_local_…</code> token here.
+          </span>
         </label>
 
         <button

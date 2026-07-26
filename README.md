@@ -10,9 +10,22 @@
 
 **Identity-first control plane for AI coding agents — multi-session, multi-frontend, with cross-session memory.**
 
-Run N parallel coding-agent sessions across repos — Claude Code by default, with Codex, Gemini, OpenAI, and pi as drop-in backends. Switch between them from a terminal cockpit, a web UI, or Telegram. Every action auditable; every agent (and sub-agent) has a cryptographic identity via [ZeroID](https://github.com/highflame-ai/zeroid). Memory persists across sessions, so each agent inherits what the last one learned.
+Run N parallel coding-agent sessions across repos — Claude Code by default, with Codex, Gemini, OpenAI, and pi as drop-in backends.
+Switch between them from a terminal cockpit, a web UI, or Telegram.
+Memory persists across sessions, so each agent inherits what the last one learned.
+Every action is auditable, and with [ZeroID](https://github.com/highflame-ai/zeroid) every agent and sub-agent carries a cryptographic identity.
 
-> **Terminal client lives in its own repo.** The recommended cockpit is [**codeoid-tui**](https://github.com/highflame-ai/codeoid-ui) — a native Rust/[Ratatui](https://ratatui.rs) client that speaks the daemon's WebSocket protocol. A built-in `codeoid tui` (Ink/React) ships in this repo as a zero-install fallback. See [Terminal client](docs/FEATURES.md#terminal-client).
+```bash
+bun install -g codeoid
+codeoid start --local          # no account, no login, no config — running in seconds
+```
+
+That's the whole first run. [Add real identities](#path-b--zeroid-identities-for-real-work) whenever you're ready.
+
+> **Terminal client lives in its own repo.**
+> The recommended cockpit is [**codeoid-tui**](https://github.com/highflame-ai/codeoid-ui) — a native Rust/[Ratatui](https://ratatui.rs) client that speaks the daemon's WebSocket protocol.
+> A built-in `codeoid tui` (Ink/React) ships in this repo as a zero-install fallback.
+> See [Terminal client](docs/FEATURES.md#terminal-client).
 
 <p align="center">
   <img src="docs/screenshots/tui.webp" width="860"
@@ -24,9 +37,9 @@ Run N parallel coding-agent sessions across repos — Claude Code by default, wi
 
 ## Contents
 
+- [Quick start](#quick-start)
 - [Why Codeoid](#why-codeoid)
 - [How Codeoid compares](#how-codeoid-compares)
-- [Quick start](#quick-start)
 - [Backends](#backends)
 - [Architecture](#architecture)
 - [Features](#features)
@@ -35,50 +48,33 @@ Run N parallel coding-agent sessions across repos — Claude Code by default, wi
 - [Development](#development)
 - [Contributing & security](#contributing--security)
 
-## Why Codeoid
-
-You're orchestrating AI coding agents. Codeoid solves the things Claude Code's single-terminal experience can't:
-
-- **Parallel sessions, shared workspace memory** — Two sessions on two git worktrees building feature A and feature B. Both inherit the same workspace's history. Session B can `recall()` what Session A learned yesterday, no re-read.
-- **Never-lose-detail memory** — Every tool call, result, and reasoning block persists as a retrievable episode. No lossy compaction. Recall returns the real bytes.
-- **Three-layer context reduction** — Pre-entry compression of CLI output + auto-rotation of the backing context + verbatim recall. Turns that would have cost $0.30 drop to pennies; peak occupancy stays below compaction.
-- **Mid-turn streaming input (VSCode parity)** — Send a follow-up message while Claude is already responding. Priority semantics (`now` / `next` / `later`) let you interrupt-and-re-integrate or gracefully queue for the next turn.
-- **Production-grade token instrumentation** — Per-turn input/output/cache/cost persisted to SQLite. Live StatusBar shows cumulative + Δ this-turn + cache hit rate + current context occupancy + queue depth + rotation count.
-- **Autonomous runs with a budget** — Flip a session to autonomous mode; it auto-approves safe operations until a write/exec budget is spent, then hands control back.
-- **Device handoff** — Start a session on your laptop, attach from your phone. Scrollback replays. Same conversation.
-- **Identity-grade audit** — Every tool call stamped with the SPIFFE URI of the agent that made it. Sub-agents get their own attenuated identities. Delegation chain traceable top to bottom.
-- **Multi-frontend** — same session accessible from terminal TUI, browser, or Telegram bot. Share read-only tokens with a teammate.
-
-## How Codeoid compares
-
-Codeoid isn't a general-purpose IDE assistant. It's built for **long-horizon, multi-session agent work**, where context continuity and token economics matter more than inline code actions — so it optimizes for what the tools you already use don't: verbatim cross-session memory, parallel sessions on one control plane, a cryptographic identity per agent and sub-agent, and per-turn token economics.
-
-Its closest peer is **[Omnigent](https://github.com/omnigent-ai/omnigent)**, another multi-harness meta-harness — both run Claude, Codex, Gemini, OpenAI, and pi. They optimize for different things. Omnigent leans on **breadth and isolation**: the widest harness set (incl. Cursor, OpenCode, Hermes), an OS-level sandbox, and credential brokering. Codeoid leans on **memory and identity**: workspace-scoped verbatim recall, a cryptographic identity per agent and sub-agent (ZeroID), and per-turn token economics — reachable from a terminal, a browser, or your phone. Rule of thumb: reach for Omnigent when you need OS-level isolation and the broadest harness set; reach for Codeoid when you want persistent cross-session memory and per-agent audit for long-horizon work.
-
-📊 **[Full capability matrix →](docs/COMPARISON.md)** — feature by feature against Claude Code CLI, the VSCode extension, Cursor, Aider, and Omnigent.
-
 ## Quick start
 
-### Prerequisites
+### 1. Prerequisites
 
 - [Bun](https://bun.sh) v1.0+
-- Claude Code CLI logged in (`claude login`) or `ANTHROPIC_API_KEY` set — the default backend. Other backends (Codex, Gemini CLI, pi, OpenAI, Gemini) are optional — see [Backends](#backends) for each one's setup.
-- A ZeroID identity — either the hosted Highflame SaaS (no infra) or a [self-hosted ZeroID](https://github.com/highflame-ai/zeroid)
+- **An agent backend.** Claude is the default: either `claude login` (uses your Claude/Anthropic plan) or `ANTHROPIC_API_KEY` in the environment. Every other backend is optional — see [Backends](#backends).
 
-### Install
+That's it for the local path. No account, no identity provider, nothing to sign up for.
 
-Pick **one** path. This guide writes every command as `codeoid <cmd>` (the global install); **from a source checkout, run `bun src/cli.ts <cmd>` instead** — they're interchangeable. Don't mix the two.
+### 2. Install
 
-**A. From npm — recommended, to just use it.** Codeoid runs on Bun, so install it with Bun (`npm` also works, as long as Bun is on your `PATH` — it's the runtime):
+Pick **one** path.
+This guide writes every command as `codeoid <cmd>` (the global install); **from a source checkout, run `bun src/cli.ts <cmd>` instead** — they're interchangeable.
+Don't mix the two.
+
+**A. From npm — recommended, to just use it.**
+Codeoid runs on Bun, so install it with Bun (`npm` also works, as long as Bun is on your `PATH` — it's the runtime):
 
 ```bash
 bun install -g codeoid        # or: npm install -g codeoid
 codeoid --help                # confirm it's on your PATH
 ```
 
-This puts a `codeoid` command on your `PATH`; use `codeoid <cmd>` everywhere below. If `codeoid` isn't found afterward, your global-bin directory isn't on `PATH` — add Bun's (`~/.bun/bin`) to it, or use path **B**.
+If `codeoid` isn't found afterward, your global-bin directory isn't on `PATH` — add Bun's (`~/.bun/bin`) to it, or use path **B**.
 
-**B. From source — to hack on it.** Clone, then **run `bun install` before anything else**:
+**B. From source — to hack on it.**
+Clone, then **run `bun install` before anything else**:
 
 ```bash
 git clone https://github.com/highflame-ai/codeoid.git
@@ -86,13 +82,64 @@ cd codeoid
 bun install                   # REQUIRED first — pulls commander and the rest
 ```
 
-> ⚠️ Skipping `bun install` and running `bun src/cli.ts …` straight from a fresh clone fails with `error: ENOENT while resolving package 'commander'`. Run `bun install` once in the checkout and it's fixed. From source, use `bun src/cli.ts <cmd>` wherever this guide says `codeoid <cmd>`.
+> ⚠️ Skipping `bun install` and running `bun src/cli.ts …` straight from a fresh clone fails with `error: ENOENT while resolving package 'commander'`.
+> Run `bun install` once in the checkout and it's fixed.
 
-### Authenticate
+### 3. Choose an auth posture
 
-Codeoid needs one thing to start: a ZeroID key. Two ways to get one.
+Codeoid has exactly two, and you pick at startup. Start with **local**; graduate when you need identity.
 
-**Option A — Highflame SaaS (recommended, no infra)**
+| | **Local** — `codeoid start --local` | **ZeroID** — `codeoid start` |
+|---|---|---|
+| Setup | none | `codeoid login` with a key |
+| Best for | trying it, solo work on your own machine, demos | real work, teams, anything audited or shared |
+| Identity per agent + sub-agent | ❌ self-asserted operator | ✅ cryptographic (SPIFFE/WIMSE) |
+| Delegation, scope attenuation, revocation | ❌ | ✅ |
+| Audit attribution | records every action; principal self-asserted | cryptographically attributable |
+| Reachable from other machines | loopback only | ✅ |
+| Telegram frontend | ❌ | ✅ |
+| Memory, every backend, fork, conductor, telemetry, TUI + web | ✅ | ✅ |
+
+Everything that isn't about *identity* works identically in both.
+Scope enforcement is the same code path in both — local mode changes the issuer, not the mechanism.
+
+### Path A — Local: no account, no login
+
+```bash
+codeoid start --local
+```
+
+The daemon mints a one-off token, prints it, publishes it to `~/.codeoid/local-token-<port>` (mode `0600`), and binds `127.0.0.1` only.
+Then, from another terminal:
+
+```bash
+codeoid tui                                  # the cockpit — token picked up automatically
+```
+
+or drive it one command at a time:
+
+```bash
+codeoid new demo .                           # a session in the current directory
+codeoid send demo "what does this repo do?"
+codeoid ls
+```
+
+or open **<http://localhost:7400/ui/>** — already signed in, because the daemon hands the page its token.
+
+**What `--local` is and isn't.** It is not "auth off": the daemon runs agents with shell and file-write access, so a token-less port would be an RCE surface for any local process. The minted token, the `0600` file, and the loopback bind are the [Jupyter model](docs/local-mode.md#the-trust-model) — and none of them cost you a setup step. A non-loopback `--host` is refused unless you explicitly pass `--local-allow-remote`.
+
+**Two things to know before you invest work in it:**
+
+1. **No verified identity.** No per-agent ZeroID identity, no delegated sub-agent tokens, no scope attenuation, no revocation, and audit attribution is self-asserted (`anonymous:operator`). Every surface says so — a startup banner, a `local mode` badge in the web UI, and a warning in the identity drawer.
+2. **Local sessions live in a reserved `local/local` tenant**, so they won't be listed after a later `codeoid login`. That's correct isolation, but it reads like data loss if you aren't expecting it.
+
+→ **[Full local-mode reference](docs/local-mode.md)** — trust model, the tenant boundary, how clients find the token, and the design invariant.
+
+### Path B — ZeroID: identities for real work
+
+You need a ZeroID key. Two ways to get one.
+
+**Option 1 — Highflame SaaS (recommended, no infra)**
 
 1. Sign up at [highflame.ai](https://highflame.ai) and open Studio → **Code Agents**.
 2. Create a code agent and mint its key — you'll get a `zid_sk_...`, shown once, so copy it now.
@@ -103,9 +150,10 @@ Codeoid needs one thing to start: a ZeroID key. Two ways to get one.
    codeoid login                 # prompts for the key (hidden), verifies it, saves to ~/.codeoid/config.json
    ```
 
-**Option B — Self-hosted ZeroID (local, ~2 min)**
+**Option 2 — Self-hosted ZeroID (local, ~2 min)**
 
-[ZeroID](https://github.com/highflame-ai/zeroid) is open source. Bring it up with Docker, mint a key, then point Codeoid at it.
+[ZeroID](https://github.com/highflame-ai/zeroid) is open source.
+Bring it up with Docker, mint a key, then point Codeoid at it.
 
 First, in a directory **outside** your Codeoid checkout, run ZeroID:
 
@@ -128,18 +176,27 @@ codeoid login --zeroid local                       # localhost:8899
 codeoid login --zeroid https://zeroid.mycorp.com
 ```
 
-`--zeroid` accepts a preset (`highflame`, `highflame-dev`, `local`) or any URL. The issuer is pinned to whatever you log in against — a token minted by any other issuer is rejected. `login` exchanges the key on the spot and prints the subject + granted scopes so you know it works before the daemon ever starts.
+`--zeroid` accepts a preset (`highflame`, `highflame-dev`, `local`) or any URL.
+The issuer is pinned to whatever you log in against — a token minted by any other issuer is rejected.
+`login` exchanges the key on the spot and prints the subject + granted scopes so you know it works before the daemon ever starts.
 
 > The daemon fetches the issuer's JWKS to verify tokens, so wherever ZeroID runs must be reachable from the daemon.
 
-### Run
+**Then start it:**
 
 ```bash
-# Start the daemon — serves TUI/web/Telegram + mounts memory
-codeoid start
+codeoid start                 # no --local
 ```
 
-Then connect a client:
+> **Each client authenticates itself — not just the daemon.**
+> `codeoid login` authorizes the *daemon* (saved to `~/.codeoid/config.json`).
+> A browser or Telegram client is a separate client under the same zero-trust model, so the web UI's first-run splash asks for a credential too — paste the same `zid_sk_...` key (or a scoped [share token](docs/CONFIGURATION.md)) once; the browser remembers it and exchanges it for a short-lived JWT to talk to the daemon.
+> Logging in on the CLI does **not** carry over to the browser.
+> (In local mode this step disappears: the daemon hands the browser its token directly.)
+
+### 4. Connect a client
+
+Any of these, against either posture:
 
 ```bash
 # Recommended: the native Rust cockpit (separate repo).
@@ -150,9 +207,45 @@ Then connect a client:
 codeoid tui
 ```
 
-Or browse to http://localhost:7400/ui/ for the web UI.
+Or browse to <http://localhost:7400/ui/> for the web UI.
+Telegram is available on the ZeroID path — set `TELEGRAM_BOT_TOKEN` + `TELEGRAM_ALLOWED_USER_IDS` in `~/.codeoid/.env`.
 
-> **Each client authenticates itself — not just the daemon.** `codeoid login` authorizes the *daemon* (saved to `~/.codeoid/config.json`). A browser or Telegram client is a separate client under the same zero-trust model, so the web UI's first-run splash asks for a credential too — paste the same `zid_sk_...` key (or a scoped [share token](docs/CONFIGURATION.md)) once; the browser remembers it and exchanges it for a short-lived JWT to talk to the daemon. Logging in on the CLI does **not** carry over to the browser.
+### 5. First things worth trying
+
+```bash
+codeoid new feat-a . --worktree feat-a     # a session in its own git worktree
+codeoid new feat-b . --worktree feat-b     # a second one, in parallel — same workspace memory
+```
+
+Then, in a session: ask it something, and in the *next* session ask `what did we learn about X yesterday?` — recall returns the real bytes, not a summary.
+`/who` prints the identity chain (rich on the ZeroID path, honest about being self-asserted on the local one).
+
+## Why Codeoid
+
+You're orchestrating AI coding agents. Codeoid solves the things Claude Code's single-terminal experience can't:
+
+- **Parallel sessions, shared workspace memory** — Two sessions on two git worktrees building feature A and feature B. Both inherit the same workspace's history. Session B can `recall()` what Session A learned yesterday, no re-read.
+- **Never-lose-detail memory** — Every tool call, result, and reasoning block persists as a retrievable episode. No lossy compaction. Recall returns the real bytes.
+- **Three-layer context reduction** — Pre-entry compression of CLI output + auto-rotation of the backing context + verbatim recall. Turns that would have cost $0.30 drop to pennies; peak occupancy stays below compaction.
+- **Mid-turn streaming input (VSCode parity)** — Send a follow-up message while Claude is already responding. Priority semantics (`now` / `next` / `later`) let you interrupt-and-re-integrate or gracefully queue for the next turn.
+- **Production-grade token instrumentation** — Per-turn input/output/cache/cost persisted to SQLite. Live StatusBar shows cumulative + Δ this-turn + cache hit rate + current context occupancy + queue depth + rotation count.
+- **Autonomous runs with a budget** — Flip a session to autonomous mode; it auto-approves safe operations until a write/exec budget is spent, then hands control back.
+- **Device handoff** — Start a session on your laptop, attach from your phone. Scrollback replays. Same conversation.
+- **Identity-grade audit** — Every tool call stamped with the SPIFFE URI of the agent that made it. Sub-agents get their own attenuated identities. Delegation chain traceable top to bottom.
+- **Multi-frontend** — same session accessible from terminal TUI, browser, or Telegram bot. Share read-only tokens with a teammate.
+
+## How Codeoid compares
+
+Codeoid isn't a general-purpose IDE assistant.
+It's built for **long-horizon, multi-session agent work**, where context continuity and token economics matter more than inline code actions — so it optimizes for what the tools you already use don't: verbatim cross-session memory, parallel sessions on one control plane, a cryptographic identity per agent and sub-agent, and per-turn token economics.
+
+Its closest peer is **[Omnigent](https://github.com/omnigent-ai/omnigent)**, another multi-harness meta-harness — both run Claude, Codex, Gemini, OpenAI, and pi.
+They optimize for different things.
+Omnigent leans on **breadth and isolation**: the widest harness set (incl. Cursor, OpenCode, Hermes), an OS-level sandbox, and credential brokering.
+Codeoid leans on **memory and identity**: workspace-scoped verbatim recall, a cryptographic identity per agent and sub-agent (ZeroID), and per-turn token economics — reachable from a terminal, a browser, or your phone.
+Rule of thumb: reach for Omnigent when you need OS-level isolation and the broadest harness set; reach for Codeoid when you want persistent cross-session memory and per-agent audit for long-horizon work.
+
+📊 **[Full capability matrix →](docs/COMPARISON.md)** — feature by feature against Claude Code CLI, the VSCode extension, Cursor, Aider, and Omnigent.
 
 ## Backends
 
@@ -161,9 +254,12 @@ Or browse to http://localhost:7400/ui/ for the web UI.
 - **CLI backends** (`codex`, `gemini-cli`, `pi`) run their own agent CLI. **Codex** and **pi** authenticate with their own login (your existing Codex / pi subscription); **`gemini-cli`** uses a Gemini API key or Vertex. `gemini-cli` and `pi` ship **bundled** with Codeoid (no separate install); `codex` you install yourself.
 - **In-daemon API backends** (`openai`, `gemini`) register only when their **API key** is set in `~/.codeoid/.env`. These bill against the key, not a subscription.
 
-Pick a backend per session with `codeoid new <name> --provider <id>`, or switch a live session with `/provider <id>`. Set keys from the Settings screen (⚙ / `/settings`) or by editing `~/.codeoid/.env` — see [Configuration](docs/CONFIGURATION.md) for every variable.
+Pick a backend per session with `codeoid new <name> --provider <id>`, or switch a live session with `/provider <id>`.
+Set keys from the Settings screen (⚙ / `/settings`) or by editing `~/.codeoid/.env` — see [Configuration](docs/CONFIGURATION.md) for every variable.
 
-> **Gemini needs an API key (or Vertex) — a consumer Google (AI Pro/Ultra) subscription can't be used with Codeoid.** Both Gemini backends authenticate with `GEMINI_API_KEY` / `GOOGLE_API_KEY` (from [AI Studio](https://aistudio.google.com/apikey)) or Vertex. The difference is capability: `gemini-cli` runs the full Gemini CLI over ACP (streaming + its own tools/MCP), while `gemini` is a lightweight in-daemon API client.
+> **Gemini needs an API key (or Vertex) — a consumer Google (AI Pro/Ultra) subscription can't be used with Codeoid.**
+> Both Gemini backends authenticate with `GEMINI_API_KEY` / `GOOGLE_API_KEY` (from [AI Studio](https://aistudio.google.com/apikey)) or Vertex.
+> The difference is capability: `gemini-cli` runs the full Gemini CLI over ACP (streaming + its own tools/MCP), while `gemini` is a lightweight in-daemon API client.
 
 <details>
 <summary><b>Claude</b> — default, always on (Anthropic)</summary>
@@ -233,11 +329,17 @@ In one Bun process the daemon brokers everything between your clients and Claude
 
 - **Session Manager** — per-session mode + write/exec budget, pinned files, the sub-agent tree, scrollback, and a JSONL transcript for crash-safe resume.
 - **Memory Engine** — a chunker turns every tool call into a verbatim *episode*; a hybrid ranker (vectors + FTS5 BM25 + recency + path overlap) serves it back. Backed by SQLite (FTS5 + embeddings + file-read cache) and exposed to Claude as an **in-process MCP server** — `recall()`, `recall_file()`, `timeline()`.
-- **ZeroID client** — registers the session's SPIFFE identity and mints attenuated tokens for each sub-agent.
+- **ZeroID client** — registers the session's SPIFFE identity and mints attenuated tokens for each sub-agent. (Not initialized in [local mode](docs/local-mode.md) — that's the one subsystem the degraded posture turns off.)
 
-Each session drives its own provider backend — the **Claude Agent SDK** by default, or Codex, Gemini, OpenAI, pi, or the Gemini CLI, all behind one `SessionProvider` interface (adding a backend is one factory + one `register()`). The diagram above shows how the pieces fit.
+Each session drives its own provider backend — the **Claude Agent SDK** by default, or Codex, Gemini, OpenAI, pi, or the Gemini CLI, all behind one `SessionProvider` interface (adding a backend is one factory + one `register()`).
+The diagram above shows how the pieces fit.
 
-Sessions are daemon-owned. Clients are stateless; they attach, receive scrollback replay, and stream live deltas. Detach and re-attach from anywhere.
+Auth is a single seam: one `TokenVerifier` converts a bearer token into an `AuthContext`, and every enforcement site downstream reads that data without knowing which issuer produced it.
+That's what lets local mode be a second *implementation* rather than a bypass — see [the design invariant](docs/local-mode.md#for-contributors--the-design-invariant).
+
+Sessions are daemon-owned.
+Clients are stateless; they attach, receive scrollback replay, and stream live deltas.
+Detach and re-attach from anywhere.
 
 ## Features
 
@@ -259,12 +361,13 @@ Full detail — keybindings, slash commands, ranking weights, rotation threshold
 
 **Identity & resilience**
 
-- **[Cryptographic identity per agent + sub-agent](docs/FEATURES.md#identity-chain)** — ZeroID SPIFFE/WIMSE URIs stamped on every tool call; `/who` prints the full delegation chain, and revoking the parent kills it.
+- **[Cryptographic identity per agent + sub-agent](docs/FEATURES.md#identity-chain)** — ZeroID SPIFFE/WIMSE URIs stamped on every tool call; `/who` prints the full delegation chain, and revoking the parent kills it. (ZeroID posture only — [local mode](docs/local-mode.md) trades this away by design.)
 - **[Production resilience](docs/FEATURES.md#production-resilience)** — retry-with-fallback, graceful shutdown, transcript-based resume, rate limiting, keep-warm interrupt, and never-lose-message persistence.
 
 ### Interfaces
 
-One daemon, one source of truth, three ways in: the [terminal cockpit](docs/FEATURES.md#terminal-client) (shown at the top), a browser, and Telegram. [Device handoff](docs/FEATURES.md#device-handoff) lets you start on one and pick the session up on another — scrollback replays.
+One daemon, one source of truth, three ways in: the [terminal cockpit](docs/FEATURES.md#terminal-client) (shown at the top), a browser, and Telegram.
+[Device handoff](docs/FEATURES.md#device-handoff) lets you start on one and pick the session up on another — scrollback replays.
 
 <p align="center">
   <img src="docs/screenshots/web-ui.webp" width="820"
@@ -286,9 +389,11 @@ Full keybindings, slash commands, and the Telegram command set → **[docs/FEATU
 
 ## Configuration
 
-Codeoid reads `~/.codeoid/config.json` and environment variables; env-only secrets (like the Telegram bot token) live in `~/.codeoid/.env` so they survive daemon restarts. Every client action is gated by a ZeroID permission scope, and scopes attenuate into revocable read-only share tokens for teammates.
+Codeoid reads `~/.codeoid/config.json` and environment variables; env-only secrets (like the Telegram bot token) live in `~/.codeoid/.env` so they survive daemon restarts.
+Every client action is gated by a permission scope — identically in both auth postures — and on the ZeroID path scopes attenuate into revocable read-only share tokens for teammates.
 
 → **[Configuration & permission scopes](docs/CONFIGURATION.md)** — every environment variable, the `config.json` schema, the `~/.codeoid/.env` file, and the full scope list.
+→ **[Local mode](docs/local-mode.md)** — the no-ZeroID posture in full.
 
 ## CLI reference
 
@@ -296,13 +401,17 @@ Commands below use the global install (`codeoid`). From a source checkout, repla
 
 ```bash
 codeoid start [--port 7400] [--host 127.0.0.1] [--no-telegram] [--no-web]
+  --local                                            #   no ZeroID: mint a token, loopback only, no login
+  --local-allow-remote                               #   allow --local on a non-loopback bind (unsafe)
 
+codeoid login [key] [--zeroid <preset|url>]          # save + verify a ZeroID key
 codeoid tui                                          # Launch the cockpit TUI
 codeoid ls                                           # List sessions
 codeoid new <name> [workdir]                         # Create session
   --worktree <branch>                                #   auto-spawn a git worktree
   --repo <path>                                      #   worktree source (default: cwd)
   --worktree-dir <path>                              #   override target dir
+  --provider <id>                                    #   pick a backend for this session
 codeoid attach <session>                             # Readline streaming attach
 codeoid send <session> <message...>                  # One-shot send
 codeoid interrupt <session>                          # Interrupt
@@ -327,6 +436,9 @@ bun test                 # run unit tests (memory, attachments, etc.)
 |---|---|
 | CLI + command routing | [src/cli.ts](src/cli.ts) |
 | Daemon HTTP + WebSocket | [src/daemon/server.ts](src/daemon/server.ts) |
+| Auth seam (verifier interface) | [src/daemon/verifier.ts](src/daemon/verifier.ts) |
+| ZeroID verification | [src/daemon/auth.ts](src/daemon/auth.ts) |
+| Local mode (no-ZeroID posture) | [src/daemon/local-auth.ts](src/daemon/local-auth.ts) |
 | Session orchestration | [src/daemon/session-manager.ts](src/daemon/session-manager.ts), [src/daemon/session.ts](src/daemon/session.ts) |
 | Memory engine | [src/daemon/memory/](src/daemon/memory/) |
 | Attachments + limits | [src/daemon/attachments.ts](src/daemon/attachments.ts) |
@@ -336,12 +448,12 @@ bun test                 # run unit tests (memory, attachments, etc.)
 | Telegram bot | [src/frontends/telegram/index.ts](src/frontends/telegram/index.ts) |
 | Built-in TUI (Ink, legacy fallback) | [src/tui/](src/tui/) |
 | Native TUI (Rust, recommended) | [highflame-ai/codeoid-ui](https://github.com/highflame-ai/codeoid-ui) |
-| Protocol types | [src/protocol/types.ts](src/protocol/types.ts) |
+| Protocol types | [packages/protocol/src/types.ts](packages/protocol/src/types.ts) |
 
 ## Contributing & security
 
-PRs welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). For vulnerabilities, see
-[SECURITY.md](SECURITY.md) (please don't open public issues for security).
+PRs welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
+For vulnerabilities, see [SECURITY.md](SECURITY.md) (please don't open public issues for security).
 
 ## License
 
@@ -349,4 +461,5 @@ PRs welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). For vulnerabilities, see
 
 ---
 
-Powered by [ZeroID](https://github.com/highflame-ai/zeroid) with pluggable agent backends (default [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-typescript)). Terminal cockpit: [codeoid-tui](https://github.com/highflame-ai/codeoid-ui).
+Powered by [ZeroID](https://github.com/highflame-ai/zeroid) with pluggable agent backends (default [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-typescript)).
+Terminal cockpit: [codeoid-tui](https://github.com/highflame-ai/codeoid-ui).

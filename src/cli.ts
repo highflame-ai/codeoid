@@ -22,10 +22,18 @@ import { program } from "commander";
 import pkg from "../package.json" with { type: "json" };
 import { DaemonServer } from "./daemon/server.js";
 import { parseRoleSpec } from "./daemon/collaboration.js";
+import {
+  assertLocalBindAllowed,
+  isLoopbackHost,
+  LOCAL_TOKEN_ENV,
+  mintLocalToken,
+  removeLocalTokenFile,
+} from "./daemon/local-auth.js";
 import type { CollaborationConfig } from "./protocol/types.js";
 import { TerminalClient } from "./terminal/client.js";
 import {
   getConfigDir,
+  getLocalTokenPath,
   loadConfig,
   loadDotEnv,
   resolveZeroidUrl,
@@ -46,6 +54,14 @@ program
   .option("--host <host>", "Host to bind to", "127.0.0.1")
   .option("--no-telegram", "Disable Telegram bot")
   .option("--no-web", "Disable Web UI")
+  .option(
+    "--local",
+    "Run without ZeroID: no account, no login, no network. Mints a token for local clients and binds loopback only. Degraded — no verified identity (see docs/local-mode.md)",
+  )
+  .option(
+    "--local-allow-remote",
+    "Permit --local on a non-loopback bind. UNSAFE: the minted token becomes the only thing guarding an agent with shell access",
+  )
   .action(async (opts) => {
     // Load ~/.codeoid/.env before anything reads process.env — this is where
     // env-only secrets (TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_IDS) live so
@@ -57,14 +73,42 @@ program
       );
     }
     const config = loadConfig();
+
+    // ── Auth posture ──────────────────────────────────────────────
+    // Exactly one decision, made here: local mode or the ZeroID path. It
+    // reaches the daemon as `localMode` and nothing downstream branches again.
+    let localMode: { token: string; tokenFile: string } | undefined;
+    const bindHost: string = opts.host;
+    const bindPort = Number.parseInt(opts.port, 10);
+    if (opts.local) {
+      try {
+        assertLocalBindAllowed(bindHost, Boolean(opts.localAllowRemote));
+      } catch (err) {
+        console.error(`\n${err instanceof Error ? err.message : String(err)}\n`);
+        process.exit(1);
+      }
+      // An operator-supplied token (CODEOID_LOCAL_TOKEN) lets a container or a
+      // script pin it; otherwise mint a fresh one for this process.
+      localMode = {
+        token: process.env[LOCAL_TOKEN_ENV] || mintLocalToken(),
+        // Port-scoped: a second local daemon must not clobber this one's token,
+        // nor delete it on its own shutdown.
+        tokenFile: getLocalTokenPath(bindPort),
+      };
+    }
+
     const daemon = new DaemonServer({
-      port: Number.parseInt(opts.port, 10),
-      host: opts.host,
+      port: bindPort,
+      host: bindHost,
       dbPath: config.dbPath,
       transcriptDir: config.transcriptDir,
       auth: config.auth,
-      oauth: config.oauth,
-      agentIdentity: config.agentIdentity,
+      localMode,
+      // ZeroID-dependent subsystems are simply not passed in local mode. (The
+      // daemon guards these too — belt and suspenders — so an embedder that
+      // builds its own DaemonConfig gets the same offline guarantee.)
+      oauth: localMode ? undefined : config.oauth,
+      agentIdentity: localMode ? undefined : config.agentIdentity,
       memory: config.memory?.enabled
         ? {
             dbPath: config.memory.dbPath,
@@ -83,9 +127,15 @@ program
     // single-origin so one HTTPS tunnel also serves as a Telegram Mini App.
     if (opts.web !== false) {
       const { WebUiFrontend } = await import("./frontends/web-ui/index.js");
+      // In local mode on a loopback bind, hand the browser the token directly so
+      // /ui needs no sign-in at all. On a wide bind we deliberately do NOT — the
+      // HTML would be readable by anything that can reach the port — so the
+      // operator pastes the token into the sign-in box instead.
+      const injectToken =
+        localMode && isLoopbackHost(bindHost) ? localMode.token : undefined;
       // Thread the embed-SSO allowlist so the served index.html publishes it to
       // the web UI's trusted-framing-origin gate. Empty ⇒ hash handoff disabled.
-      daemon.use(new WebUiFrontend(config.embed?.allowedOrigins ?? []));
+      daemon.use(new WebUiFrontend(config.embed?.allowedOrigins ?? [], injectToken));
     }
 
     // Telegram (enabled when TELEGRAM_BOT_TOKEN is set)
@@ -96,7 +146,16 @@ program
         .map(Number)
         .filter(Boolean);
 
-      if (botToken && allowedIds.length > 0) {
+      if (botToken && localMode) {
+        // Telegram is reached through Telegram's servers — a remote surface.
+        // Local mode's trust model is "whoever can read a file on this box".
+        // Those two do not belong together, so this is a hard skip, not a
+        // warning-and-continue. (The frontend itself also refuses.)
+        console.warn(
+          "[codeoid] local mode: Telegram frontend NOT started (it needs ZeroID identities). " +
+            "Run `codeoid login` and start without --local to use it.",
+        );
+      } else if (botToken && allowedIds.length > 0) {
         const { TelegramFrontend } = await import("./frontends/telegram/index.js");
         daemon.use(new TelegramFrontend(botToken, allowedIds));
       } else if (botToken) {
@@ -106,11 +165,86 @@ program
 
     await daemon.start();
 
+    // ZeroID mode: sweep a stale local-mode token for THIS port. Reaching here
+    // means we successfully bound it, so no local-mode daemon can be listening
+    // on it, so any token file left by one (killed -9, power loss — the graceful
+    // path removes its own) is definitively dead. Without this, clients would
+    // keep presenting it and get an opaque 4003 against a ZeroID daemon.
+    // Deliberately AFTER the bind — doing it before would delete a live
+    // daemon's credential when our own bind then failed with EADDRINUSE.
+    if (!localMode) {
+      removeLocalTokenFile(getLocalTokenPath(bindPort));
+    }
+
+    const displayHost = bindHost === "0.0.0.0" || bindHost === "::" ? "localhost" : bindHost;
     if (opts.web !== false) {
-      const url = `http://${opts.host === "0.0.0.0" ? "localhost" : opts.host}:${opts.port}/ui/`;
-      console.log(`[codeoid] web UI: ${url}`);
+      console.log(`[codeoid] web UI: http://${displayHost}:${opts.port}/ui/`);
+    }
+
+    if (localMode) {
+      printLocalModeBanner({
+        token: localMode.token,
+        tokenFile: localMode.tokenFile,
+        host: displayHost,
+        port: String(opts.port),
+        loopback: isLoopbackHost(bindHost),
+        web: opts.web !== false,
+      });
     }
   });
+
+/**
+ * The post-start local-mode banner.
+ *
+ * Prints what the operator needs to do next and what they gave up, in that
+ * order. The token is printed on purpose (the Jupyter model): it is a
+ * loopback-scoped, process-lifetime credential, and printing it is what makes
+ * the mode usable from a second terminal without any setup step.
+ */
+function printLocalModeBanner(o: {
+  token: string;
+  tokenFile: string;
+  host: string;
+  port: string;
+  loopback: boolean;
+  web: boolean;
+}): void {
+  const lines: string[] = [
+    "",
+    "  Codeoid is running in LOCAL MODE — no ZeroID, no account, no login.",
+    "",
+    "  Connect from another terminal (the token is picked up automatically):",
+    "      codeoid tui",
+    "      codeoid new demo .        # then: codeoid send demo \"summarize this repo\"",
+    "",
+  ];
+  if (o.web) {
+    lines.push(
+      o.loopback
+        ? `  Or open the web UI — already signed in:  http://${o.host}:${o.port}/ui/`
+        : `  Or open the web UI and paste the token below:  http://${o.host}:${o.port}/ui/`,
+      "",
+    );
+  }
+  lines.push(
+    `  Token:  ${o.token}`,
+    `          (also at ${o.tokenFile}, removed on shutdown; set CODEOID_LOCAL_TOKEN to pin it)`,
+    "",
+    "  What is OFF in this mode: per-agent and sub-agent identity, delegation,",
+    "  scope attenuation, revocation, cryptographic audit attribution, sharing.",
+    "  Audit still records every action, but the principal is self-asserted.",
+    "",
+    "  What still works: memory + recall, every backend, cross-backend fork,",
+    "  conductor + dispatch, compression, worktrees, cost telemetry, TUI + web.",
+    "",
+    "  Sessions here live in the reserved `local/local` tenant, so they will NOT",
+    "  appear after a later `codeoid login`. That is isolation, not data loss.",
+    "",
+    "  Ready for real identities?  codeoid login    (docs/local-mode.md)",
+    "",
+  );
+  console.log(lines.join("\n"));
+}
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
@@ -301,6 +435,10 @@ program
     "Override the worktree directory (default: <repo>.wt-<branch>).",
   )
   .option(
+    "--provider <id>",
+    "Agent backend for this session (claude | codex | gemini-cli | pi | openai | gemini). Default: the daemon's default.",
+  )
+  .option(
     "--pack <id>",
     "Activate an installed SDLC pack on the session (inject its constitution, expose its skills/subagents).",
   )
@@ -326,6 +464,7 @@ program
         worktree?: string;
         repo?: string;
         worktreeDir?: string;
+        provider?: string;
         pack?: string;
         packRole?: string;
         collaborate?: string;
@@ -378,6 +517,7 @@ program
       const client = new TerminalClient(config);
       await client.connect();
       await client.createSession(name, resolvedWorkdir, {
+        providerId: opts.provider,
         pack: opts.pack,
         packRole: opts.packRole,
         collaboration,

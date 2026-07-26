@@ -6,7 +6,9 @@
 
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
+import { resolveLocalToken } from "../config.js";
 import type { CodeoidConfig } from "../config.js";
+import { PROTOCOL_VERSION } from "../protocol/types.js";
 import type {
   ClientMessage,
   CollaborationConfig,
@@ -147,7 +149,18 @@ export class TerminalClient {
       this.#ws = new WebSocket(this.#config.daemonUrl);
 
       this.#ws.onopen = () => {
-        this.#ws!.send(JSON.stringify({ token }));
+        // `type: "auth"` is REQUIRED — the daemon validates the pre-auth frame
+        // against `authMsgSchema` and closes 4001 on anything else. A bare
+        // `{ token }` frame (what this sent before) is rejected outright, which
+        // made every one-shot CLI command fail with "Authentication timeout".
+        this.#ws!.send(
+          JSON.stringify({
+            type: "auth",
+            token,
+            protocolVersion: PROTOCOL_VERSION,
+            client: "codeoid-cli",
+          }),
+        );
       };
 
       this.#ws.onmessage = (event) => {
@@ -273,13 +286,22 @@ export class TerminalClient {
   async createSession(
     name: string,
     workdir: string,
-    opts: { pack?: string; packRole?: string; collaboration?: CollaborationConfig } = {},
+    opts: {
+      pack?: string;
+      packRole?: string;
+      providerId?: string;
+      collaboration?: CollaborationConfig;
+    } = {},
   ): Promise<void> {
     const resp = await this.#request({
       type: "session.create",
       id: randomUUID(),
       name,
       workdir,
+      // The daemon fail-closes on an id it hasn't registered (it advertises the
+      // set on auth.ok), so a typo is rejected rather than silently handing back
+      // a claude session.
+      ...(opts.providerId ? { providerId: opts.providerId } : {}),
       ...(opts.pack ? { pack: opts.pack } : {}),
       ...(opts.packRole ? { packRole: opts.packRole } : {}),
       ...(opts.collaboration ? { collaboration: opts.collaboration } : {}),
@@ -288,7 +310,8 @@ export class TerminalClient {
     if (resp.type === "response.ok") {
       const data = resp.data as SessionInfo;
       const profile = data.profile ? ` [pack: ${data.profile}]` : "";
-      console.log(`Session created: ${data.name} (${data.id})${profile}`);
+      const provider = data.providerId ? ` [${data.providerId}]` : "";
+      console.log(`Session created: ${data.name} (${data.id})${provider}${profile}`);
       if (data.collaboration) {
         // Echo the RESOLVED bindings, not the requested ones: the daemon
         // normalizes (count defaults, model resolved against its own
@@ -600,12 +623,21 @@ export class TerminalClient {
   }
 
   async #getToken(): Promise<string> {
+    // Local mode first: a token published for THIS daemon's port means a
+    // `--local` daemon is listening there right now, which is a stronger signal
+    // about what it will accept than a durable apiKey in config.json (see
+    // resolveLocalToken). Zero setup — this is what makes `codeoid start
+    // --local` + `codeoid tui` work with no copy-paste.
+    const localToken = resolveLocalToken(this.#config.daemonUrl);
+    if (localToken) return localToken;
+
     const token = this.#config.apiKey;
     if (!token) {
       console.error("No API key configured.\n");
       console.error("  Set CODEOID_API_KEY environment variable");
       console.error("  Or add apiKey to ~/.codeoid/config.json");
-      console.error("  Or run: codeoid login\n");
+      console.error("  Or run: codeoid login");
+      console.error("  Or, to try codeoid with no account at all: codeoid start --local\n");
       process.exit(1);
     }
 

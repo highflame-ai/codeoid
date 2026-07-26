@@ -19,12 +19,12 @@
 import { Bot, type Context, InlineKeyboard } from "grammy";
 import { autoRetry } from "@grammyjs/auto-retry";
 import { randomUUID } from "node:crypto";
-import { verifyToken } from "../../daemon/auth.js";
 import { getManifest, getSnapshot } from "../../daemon/settings/store.js";
 import { ALL_SCOPES_STRING } from "../../protocol/scopes.js";
 import type { Frontend, FrontendContext } from "../types.js";
 import type { SessionManager } from "../../daemon/session-manager.js";
 import type { AuthConfig } from "../../daemon/auth.js";
+import type { TokenVerifier } from "../../daemon/verifier.js";
 import type { Store } from "../../daemon/store.js";
 import type {
   AuthContext,
@@ -141,6 +141,7 @@ export class TelegramFrontend implements Frontend {
   #allowedUserIds: Set<number>;
   #manager!: SessionManager;
   #authConfig!: AuthConfig;
+  #verifier!: TokenVerifier;
   #store!: Store;
   #users = new Map<number, UserState>();
   /** `${userId}:${short}` → pending approval (inline-keyboard approvals). */
@@ -174,7 +175,20 @@ export class TelegramFrontend implements Frontend {
   async start(ctx: FrontendContext): Promise<void> {
     this.#manager = ctx.manager;
     this.#authConfig = ctx.auth;
+    this.#verifier = ctx.verifier;
     this.#store = ctx.store;
+    // Telegram is a REMOTE surface reached through Telegram's servers; local
+    // mode's trust model is "whoever can read a 0600 file on this machine".
+    // Pairing them would let a locally-minted token, or a bot-allowlist entry,
+    // stand in for a verified identity over the public internet. The CLI
+    // already declines to register this frontend under --local; this is the
+    // fail-closed backstop for any other embedder.
+    if (ctx.verifier.mode !== "zeroid") {
+      throw new Error(
+        "the Telegram frontend requires ZeroID auth — it is not available in local mode " +
+          "(run `codeoid login`, then start without --local)",
+      );
+    }
     this.#setupHandlers();
     // Register the command menu so Telegram shows a tappable "/" list with
     // descriptions (autocomplete) instead of making the user remember+type.
@@ -317,7 +331,7 @@ export class TelegramFrontend implements Frontend {
         token = ((await resp.json()) as { access_token: string }).access_token;
       }
 
-      const auth = await verifyToken(token, this.#authConfig);
+      const auth = await this.#verifier.verify(token);
       const state = this.#getOrCreate(userId);
       state.auth = auth;
 

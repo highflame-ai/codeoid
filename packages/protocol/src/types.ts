@@ -1967,6 +1967,22 @@ export interface AuthOkMsg {
    * session creation (assume claude-only).
    */
   providers?: string[];
+  /**
+   * Which issuer authenticated this connection.
+   *
+   * - `"zeroid"` — a ZeroID-issued JWT was verified cryptographically. The
+   *   identity is real: attributable, delegatable, revocable.
+   * - `"local"` — the daemon is running in local mode (`codeoid start --local`)
+   *   and accepted a locally-minted token. The principal is SELF-ASSERTED:
+   *   there is no per-agent identity, no delegation, no revocation, and audit
+   *   attribution is not cryptographic.
+   *
+   * Clients MUST surface `"local"` visibly (a badge, a banner — not a tooltip):
+   * the failure mode this field exists to prevent is someone demonstrating an
+   * identity-first control plane in the one mode that has no identity. Absent
+   * on daemons that predate the field; treat absent as `"zeroid"`.
+   */
+  authMode?: "zeroid" | "local";
 }
 
 export interface ResponseOkMsg {
