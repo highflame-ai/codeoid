@@ -21,6 +21,8 @@ import { program } from "commander";
 // string to drift). release-smoke asserts these two stay equal.
 import pkg from "../package.json" with { type: "json" };
 import { DaemonServer } from "./daemon/server.js";
+import { parseRoleSpec } from "./daemon/collaboration.js";
+import type { CollaborationConfig } from "./protocol/types.js";
 import { TerminalClient } from "./terminal/client.js";
 import {
   getConfigDir,
@@ -306,11 +308,29 @@ program
     "--pack-role <role>",
     "Run the session under a capability role the pack declares (e.g. reviewer = read-only). Requires --pack.",
   )
+  .option(
+    "--collaborate <goal>",
+    "Make this a collaborative session working <goal> with several role-children on their own backends. Requires at least one --role, including an orchestrator.",
+  )
+  .option(
+    "--role <spec>",
+    'Role→backend binding, repeatable: "name:provider[:model][*count]" (e.g. orchestrator:claude, reasoning:openai:gpt-5-codex, review:gemini*3). Requires --collaborate.',
+    (value: string, previous: string[] = []) => [...previous, value],
+    [] as string[],
+  )
   .action(
     async (
       name: string,
       workdir: string | undefined,
-      opts: { worktree?: string; repo?: string; worktreeDir?: string; pack?: string; packRole?: string },
+      opts: {
+        worktree?: string;
+        repo?: string;
+        worktreeDir?: string;
+        pack?: string;
+        packRole?: string;
+        collaborate?: string;
+        role: string[];
+      },
     ) => {
       const config = loadConfig();
       let resolvedWorkdir = workdir;
@@ -327,9 +347,41 @@ program
         console.error("workdir is required (pass as argument or use --worktree).");
         process.exit(1);
       }
+
+      // Collaborative session (docs/collaborative-session-design.md). Parsed
+      // here for a fast, local error; the daemon re-validates the semantics
+      // (provider registered, exactly one orchestrator, claude-only
+      // orchestrator in v1) so the CLI and the wire path fail identically.
+      let collaboration: CollaborationConfig | undefined;
+      const roleSpecs = opts.role ?? [];
+      if (opts.collaborate) {
+        if (roleSpecs.length === 0) {
+          console.error(
+            '--collaborate requires at least one --role (e.g. --role orchestrator:claude --role review:gemini*3).',
+          );
+          process.exit(1);
+        }
+        try {
+          collaboration = {
+            goal: opts.collaborate,
+            roles: roleSpecs.map(parseRoleSpec),
+          };
+        } catch (e) {
+          console.error(e instanceof Error ? e.message : String(e));
+          process.exit(1);
+        }
+      } else if (roleSpecs.length > 0) {
+        console.error("--role requires --collaborate <goal>.");
+        process.exit(1);
+      }
+
       const client = new TerminalClient(config);
       await client.connect();
-      await client.createSession(name, resolvedWorkdir, { pack: opts.pack, packRole: opts.packRole });
+      await client.createSession(name, resolvedWorkdir, {
+        pack: opts.pack,
+        packRole: opts.packRole,
+        collaboration,
+      });
       client.disconnect();
     },
   );

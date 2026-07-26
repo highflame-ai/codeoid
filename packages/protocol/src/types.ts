@@ -116,6 +116,16 @@ export const LIMITS = {
   UI_TEXT_MAX: 65_536,
   /** Max number of options on a `session.ui_request` select. */
   UI_OPTIONS_MAX: 64,
+  /** Max `CollaborationConfig.goal` length. A goal is a brief, not a spec. */
+  COLLABORATION_GOAL_MAX: 8192,
+  /** Max distinct roles in one collaboration. */
+  COLLABORATION_ROLES_MAX: 16,
+  /**
+   * Max children a single role may fan out to (`CollaborationRole.count`).
+   * A schema-level backstop only — the live-worker cap (P3) is what actually
+   * governs concurrency at run time.
+   */
+  COLLABORATION_ROLE_COUNT_MAX: 8,
 } as const;
 
 // =============================================================================
@@ -230,6 +240,12 @@ export interface SessionInfo {
    * workdir with no git isolation.
    */
   worktree?: SessionWorktree;
+  /**
+   * Collaboration this session orchestrates, when it was created with the
+   * Collaborative toggle. Absent = a normal session. Persisted, so it
+   * survives a daemon restart the way `role`/`providerId` already do.
+   */
+  collaboration?: CollaborationConfig;
 }
 
 /** A git worktree backing a session's workdir (see SessionInfo.worktree). */
@@ -795,10 +811,69 @@ interface BaseClientMsg {
   id: string;
 }
 
+/**
+ * One role in a collaborative session — a `{backend, model}` binding chosen
+ * per purpose (docs/collaborative-session-design.md §3).
+ *
+ * `name` is deliberately a free-form string, not an enum: "a role is data,
+ * not an enum". The five defaults (orchestrator / search / reasoning /
+ * architecture / review) are a starting profile, so adding
+ * "security-reviewer" or "test-author" stays a config change, never a code
+ * change.
+ */
+export interface CollaborationRole {
+  /** Role name, unique within the collaboration. */
+  name: string;
+  /**
+   * Backend this role's children run on. Must be an id the daemon
+   * advertised in `AuthOkMsg.providers`; an unregistered id is rejected with
+   * `invalid_request` rather than silently falling back — the same
+   * fail-closed rule as `SessionCreateMsg.providerId`.
+   */
+  providerId: string;
+  /** Model within that backend. Absent = that backend's own default. */
+  model?: string;
+  /**
+   * How many children to fan out for this role. >1 is what makes a review
+   * panel a panel (§7). Absent = 1.
+   */
+  count?: number;
+  /** What this role is for; surfaced in the child's brief. */
+  purpose?: string;
+}
+
+/** The role name that must be present exactly once in a collaboration, and
+ *  which drives dispatch for the goal. */
+export const ORCHESTRATOR_ROLE = "orchestrator";
+
+/**
+ * Collaborative-session config: one goal worked by several role-children on
+ * possibly different backends. Set on `session.create` behind the
+ * Collaborative toggle, which compiles it to an ephemeral one-goal pack
+ * (§9) — pack vocabulary stays hidden on this path.
+ */
+export interface CollaborationConfig {
+  /** The single goal this collaboration works. */
+  goal: string;
+  /**
+   * Role→backend bindings. Exactly one role must be named "orchestrator";
+   * in v1 it must sit on the claude backend, the only one that mounts the
+   * fleet MCP server (non-Claude orchestrators tracked in #245).
+   */
+  roles: CollaborationRole[];
+}
+
 export interface SessionCreateMsg extends BaseClientMsg {
   type: "session.create";
   name: string;
   workdir: string;
+  /**
+   * Turn this into a collaborative session: one goal, several role-children
+   * on their own backends (docs/collaborative-session-design.md). Validated
+   * fail-closed — unknown provider, missing/duplicate orchestrator, or a
+   * model that doesn't belong to its role's backend all reject the create.
+   */
+  collaboration?: CollaborationConfig;
   /**
    * Session role. "conductor" requests THE per-tenant conductor session —
    * the daemon chooses its name/workdir itself, creates it on first request,

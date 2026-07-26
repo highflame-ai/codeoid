@@ -37,6 +37,7 @@ import {
   resolveAgainstList,
   resolveModelIdForProvider,
 } from "./models.js";
+import { validateCollaboration } from "./collaboration.js";
 import {
   packSession,
   unpackBundle,
@@ -81,6 +82,7 @@ import type { CompressionRegistry } from "./compress/index.js";
 import type {
   AuthContext,
   ClientMessage,
+  CollaborationConfig,
   DaemonMessage,
   McpServerStatus,
   ModelInfo,
@@ -440,6 +442,10 @@ mcpHub: this.#mcpHub,
           providerId: meta.providerId,
           forkedFrom: meta.forkedFrom,
           worktree: meta.worktree,
+          // A collaboration is durable state, not turn state: the goal and
+          // its role→backend bindings must come back after a restart or the
+          // orchestrator resumes with no idea what it was coordinating.
+          collaboration: meta.collaboration,
           defaultModel:
             meta.role === "conductor" ? this.#config?.conductor?.model : undefined,
           fleet:
@@ -1390,6 +1396,24 @@ mcpHub: this.#mcpHub,
       };
     }
 
+    // Collaborative session (docs/collaborative-session-design.md §9): the
+    // role→backend bindings are validated fail-closed up front, for the same
+    // reason `providerId` is — a collaboration whose roles silently collapse
+    // onto the default backend would be "multi-model" in name only.
+    let collaboration: CollaborationConfig | undefined;
+    if (msg.collaboration) {
+      const checked = validateCollaboration(msg.collaboration, this.#providers);
+      if (!checked.ok) {
+        return {
+          type: "response.error",
+          requestId: msg.id,
+          error: checked.error,
+          code: "invalid_request",
+        };
+      }
+      collaboration = checked.config;
+    }
+
     // Ambient pack activation (docs/pack-loading.md): resolve the requested pack
     // (+ optional capability role) up front; fail-closed on an unknown pack/role.
     let pack: PackActivation | undefined;
@@ -1413,6 +1437,7 @@ mcpHub: this.#mcpHub,
       hooks: this.#hooks,
       providerId: msg.providerId,
       pack,
+      collaboration,
       identityManager: this.#identityManager,
       memory: this.#memory,
       memoryMcp: this.#memoryMcp,

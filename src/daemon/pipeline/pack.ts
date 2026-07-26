@@ -33,6 +33,20 @@ const idField = z
 export const roleSchema = z.object({
   name: z.string().min(1).max(64),
   summary: z.string().max(500).optional(),
+  /**
+   * Backend this role runs on (docs/collaborative-session-design.md §8.1).
+   * A role has always been a capability envelope; this also makes it a
+   * role→backend binding, so one engine covers both topologies — a
+   * sequential pack phase and a collaborative fan-out.
+   *
+   * Absent = the session's own backend, which is what every existing pack
+   * relies on. Consumed only on the fleet/child path, where a provider picks
+   * the CHILD a role runs on; it is never a request to mutate a bound
+   * session's backend mid-run.
+   */
+  provider: z.string().min(1).max(64).optional(),
+  /** Model within `provider`. Absent = that backend's default. */
+  model: z.string().min(1).max(256).optional(),
   write: z.boolean(),
   network: z.union([z.boolean(), z.literal("read-only")]).default(false),
   envelope: z.union([z.literal("all"), z.array(z.string().max(32)).max(32)]),
