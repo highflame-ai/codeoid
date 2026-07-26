@@ -34,6 +34,7 @@ import type { HookSessionContext } from "./hooks/types.js";
 import { randomUUID } from "node:crypto";
 import type {
   AuthContext,
+  CollaborationConfig,
   SessionInfo,
   SessionMode,
   SessionStatus,
@@ -234,6 +235,13 @@ export interface SessionCreateOptions {
    */
   worktree?: SessionWorktree;
   /**
+   * Collaboration this session orchestrates — goal + role→backend bindings,
+   * already validated and normalized by `validateCollaboration`. Persisted
+   * in meta and surfaced in SessionInfo, so it survives a daemon restart.
+   * Absent = a normal session.
+   */
+  collaboration?: CollaborationConfig;
+  /**
    * Pre-built codeoid_fleet MCP server (conductor sessions only). Built by
    * the SessionManager because its tools close over the manager's tenant-
    * scoped session view; the Session just hands it to the provider.
@@ -306,6 +314,13 @@ export class Session {
   readonly forkedFrom?: { sessionId: string; name: string; atTurn: number };
   /** Git worktree backing workdir, when isolated (set from opts / meta). */
   readonly worktree?: SessionWorktree;
+  /**
+   * Goal + role→backend bindings when this session was created with the
+   * Collaborative toggle (set from opts / restored from meta). Readonly: the
+   * bindings are fixed for the life of the goal (§2, per-goal child
+   * lifetime); changing backends mid-goal would orphan live children.
+   */
+  readonly collaboration?: CollaborationConfig;
   readonly createdBy: string;
   readonly createdAt: string;
   /**
@@ -595,6 +610,7 @@ export class Session {
     this.#pack = opts.pack;
     this.forkedFrom = opts.forkedFrom;
     this.worktree = opts.worktree;
+    this.collaboration = opts.collaboration;
     this.#onStatusChange = opts.onStatusChange;
     this.#workerShape = opts.workerShape;
     if (opts.initialMode) {
@@ -738,6 +754,7 @@ export class Session {
         providerId: this.#provider.id,
         forkedFrom: this.forkedFrom,
         worktree: this.worktree,
+        collaboration: this.collaboration,
         // Fire-and-forget: saveMeta's write chain owns the failure log; an
         // unconsumed rejection here would be an unhandled-rejection crash.
       }).catch(() => {});
@@ -2203,6 +2220,7 @@ export class Session {
       fallbackModel: this.#fallbackModel ?? undefined,
       forkedFrom: this.forkedFrom,
       worktree: this.worktree,
+      collaboration: this.collaboration,
       // Ambient pack driving this session (docs/pack-loading.md) — id, or
       // "id (role)" when a capability role is active.
       ...(this.#pack
@@ -4043,6 +4061,12 @@ export class Session {
       providerId: this.#provider.id,
       forkedFrom: this.forkedFrom,
       worktree: this.worktree,
+      // MUST be written here too, not only at create: #writeMetaAtomic
+      // serializes the whole object and renames over the file, so any field
+      // omitted from THIS write is erased from the meta the resume path
+      // reads. Leaving it out cost the collaboration on the first status
+      // transition — i.e. on every session that had taken a single turn.
+      collaboration: this.collaboration,
     }).catch(() => {});
   }
 }

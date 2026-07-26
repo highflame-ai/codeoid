@@ -30,6 +30,27 @@ const nameField = z.string().min(1).max(LIMITS.NAME_MAX);
 
 const base = { id: idField };
 
+// ── Collaboration ─────────────────────────────────────────────────────────────
+
+/**
+ * A role→backend binding (`CollaborationRole`). `name` and `providerId` are
+ * bounded strings rather than enums: role taxonomy is data (§3), and an
+ * unknown provider must reach the daemon so it can name the registered ones
+ * back to the caller.
+ */
+export const collaborationRoleSchema = z.object({
+  name: nameField,
+  providerId: z.string().min(1).max(64),
+  model: z.string().max(LIMITS.MODEL_MAX).optional(),
+  count: z.number().int().min(1).max(LIMITS.COLLABORATION_ROLE_COUNT_MAX).optional(),
+  purpose: z.string().max(500).optional(),
+});
+
+export const collaborationConfigSchema = z.object({
+  goal: z.string().min(1).max(LIMITS.COLLABORATION_GOAL_MAX),
+  roles: z.array(collaborationRoleSchema).min(1).max(LIMITS.COLLABORATION_ROLES_MAX),
+});
+
 // ── Attachments ───────────────────────────────────────────────────────────────
 
 export const attachmentSchema = z
@@ -76,6 +97,17 @@ export const sessionCreateSchema = z.object({
    * schema opaquely rejecting the whole create.
    */
   providerId: z.string().min(1).max(64).optional(),
+  /**
+   * Collaborative session config (docs/collaborative-session-design.md §9).
+   *
+   * Shape only, here. The SEMANTIC rules — provider registered, exactly one
+   * orchestrator, orchestrator on claude in v1, model belongs to its role's
+   * backend — live in the daemon, not the schema, for the same reason
+   * `providerId` is a bounded string rather than an enum: the frame must
+   * PARSE so the daemon can answer with a specific, actionable error
+   * instead of the schema opaquely rejecting the whole create.
+   */
+  collaboration: collaborationConfigSchema.optional(),
   /**
    * Activate an installed SDLC pack on this session (ambient mode —
    * docs/pack-loading.md): its constitution is injected into the system

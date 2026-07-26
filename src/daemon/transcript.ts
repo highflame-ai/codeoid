@@ -16,7 +16,13 @@
 import { existsSync, mkdirSync } from "node:fs";
 import { appendFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { DaemonMessage, SessionMessage, SessionStatus, SessionWorktree } from "../protocol/types.js";
+import type {
+  CollaborationConfig,
+  DaemonMessage,
+  SessionMessage,
+  SessionStatus,
+  SessionWorktree,
+} from "../protocol/types.js";
 
 /** Persistent entry in the transcript. */
 export interface TranscriptEntry {
@@ -97,6 +103,12 @@ export interface TranscriptMeta {
   forkedFrom?: { sessionId: string; name: string; atTurn: number };
   /** Git worktree backing workdir (fork isolation / bind). Absent = shared. */
   worktree?: SessionWorktree;
+  /**
+   * Collaboration this session orchestrates (goal + role→backend bindings).
+   * Absent = a normal session. Stamped here, not just in the sessions table,
+   * because meta is what the resume path actually reads.
+   */
+  collaboration?: CollaborationConfig;
 }
 
 /** Types we persist. Skip ephemeral events like heartbeats. */

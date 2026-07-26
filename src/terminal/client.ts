@@ -7,7 +7,13 @@
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 import type { CodeoidConfig } from "../config.js";
-import type { ClientMessage, DaemonMessage, PipelineWire, SessionInfo } from "../protocol/types.js";
+import type {
+  ClientMessage,
+  CollaborationConfig,
+  DaemonMessage,
+  PipelineWire,
+  SessionInfo,
+} from "../protocol/types.js";
 import { ALL_SCOPES_STRING } from "../protocol/scopes.js";
 import { sanitizeTerminalOutput } from "../tui/ansi/codes.js";
 import { formatPackList, formatPackShow } from "./pack-format.js";
@@ -264,7 +270,11 @@ export class TerminalClient {
     for (const line of formatPackList(resp)) console.log(line);
   }
 
-  async createSession(name: string, workdir: string, opts: { pack?: string; packRole?: string } = {}): Promise<void> {
+  async createSession(
+    name: string,
+    workdir: string,
+    opts: { pack?: string; packRole?: string; collaboration?: CollaborationConfig } = {},
+  ): Promise<void> {
     const resp = await this.#request({
       type: "session.create",
       id: randomUUID(),
@@ -272,12 +282,24 @@ export class TerminalClient {
       workdir,
       ...(opts.pack ? { pack: opts.pack } : {}),
       ...(opts.packRole ? { packRole: opts.packRole } : {}),
+      ...(opts.collaboration ? { collaboration: opts.collaboration } : {}),
     });
 
     if (resp.type === "response.ok") {
       const data = resp.data as SessionInfo;
       const profile = data.profile ? ` [pack: ${data.profile}]` : "";
       console.log(`Session created: ${data.name} (${data.id})${profile}`);
+      if (data.collaboration) {
+        // Echo the RESOLVED bindings, not the requested ones: the daemon
+        // normalizes (count defaults, model resolved against its own
+        // backend), so this is the user's confirmation of what they got.
+        console.log(`  goal: ${data.collaboration.goal}`);
+        for (const r of data.collaboration.roles) {
+          const model = r.model ? `:${r.model}` : "";
+          const fanout = (r.count ?? 1) > 1 ? ` ×${r.count}` : "";
+          console.log(`  role: ${r.name} → ${r.providerId}${model}${fanout}`);
+        }
+      }
     } else {
       this.#printError(resp);
     }

@@ -165,6 +165,12 @@ export class Store {
     // daemon restarts. NULL = normal session / claude (pre-upgrade rows).
     this.#addColumnIfMissing("sessions", "role", "TEXT");
     this.#addColumnIfMissing("sessions", "provider", "TEXT");
+    // Collaborative sessions (docs/collaborative-session-design.md §9): the
+    // goal + role→backend bindings, as a JSON blob. NULL = a normal session.
+    // The resume path reads transcript meta, not this column; it exists so a
+    // collaboration is visible to anything querying the sessions table
+    // directly (audit, future admin surfaces) rather than only via meta.
+    this.#addColumnIfMissing("sessions", "collaboration", "TEXT");
 
     this.#db.exec(`
 
@@ -345,8 +351,8 @@ export class Store {
   createSession(session: SessionInfo & { accountId: string; projectId: string }): void {
     this.#db
       .prepare(
-        `INSERT OR REPLACE INTO sessions (id, name, workdir, status, created_by, account_id, project_id, created_at, role, provider)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT OR REPLACE INTO sessions (id, name, workdir, status, created_by, account_id, project_id, created_at, role, provider, collaboration)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         session.id,
@@ -359,6 +365,7 @@ export class Store {
         session.createdAt,
         session.role ?? null,
         session.providerId ?? null,
+        session.collaboration ? JSON.stringify(session.collaboration) : null,
       );
   }
 
