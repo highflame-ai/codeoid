@@ -242,6 +242,14 @@ export interface SessionCreateOptions {
    */
   collaboration?: CollaborationConfig;
   /**
+   * Set on a role-CHILD of a collaborative session. The mirror of
+   * `collaboration` (which is set on the orchestrating parent), so the
+   * manager can DERIVE a collaboration's membership from the live session set
+   * rather than keeping a side registry that could drift out of sync and
+   * orphan an agent subprocess.
+   */
+  collaborationRole?: SessionInfo["collaborationRole"];
+  /**
    * Pre-built codeoid_fleet MCP server (conductor sessions only). Built by
    * the SessionManager because its tools close over the manager's tenant-
    * scoped session view; the Session just hands it to the provider.
@@ -321,6 +329,8 @@ export class Session {
    * lifetime); changing backends mid-goal would orphan live children.
    */
   readonly collaboration?: CollaborationConfig;
+  /** Which collaboration + role this session serves, when it is a child. */
+  readonly collaborationRole?: SessionInfo["collaborationRole"];
   readonly createdBy: string;
   readonly createdAt: string;
   /**
@@ -620,6 +630,7 @@ export class Session {
     this.forkedFrom = opts.forkedFrom;
     this.worktree = opts.worktree;
     this.collaboration = opts.collaboration;
+    this.collaborationRole = opts.collaborationRole;
     this.#onStatusChange = opts.onStatusChange;
     this.#workerShape = opts.workerShape;
     if (opts.initialMode) {
@@ -765,6 +776,7 @@ export class Session {
         forkedFrom: this.forkedFrom,
         worktree: this.worktree,
         collaboration: this.collaboration,
+        collaborationRole: this.collaborationRole,
         // Fire-and-forget: saveMeta's write chain owns the failure log; an
         // unconsumed rejection here would be an unhandled-rejection crash.
       }).catch(() => {});
@@ -2248,6 +2260,7 @@ export class Session {
       forkedFrom: this.forkedFrom,
       worktree: this.worktree,
       collaboration: this.collaboration,
+      collaborationRole: this.collaborationRole,
       // Ambient pack driving this session (docs/pack-loading.md) — id, or
       // "id (role)" when a capability role is active.
       ...(this.#pack
@@ -4117,6 +4130,7 @@ export class Session {
       // reads. Leaving it out cost the collaboration on the first status
       // transition — i.e. on every session that had taken a single turn.
       collaboration: this.collaboration,
+      collaborationRole: this.collaborationRole,
     }).catch(() => {});
   }
 }

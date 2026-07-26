@@ -256,6 +256,24 @@ export interface SessionInfo {
    * survives a daemon restart the way `role`/`providerId` already do.
    */
   collaboration?: CollaborationConfig;
+  /**
+   * Set on a role-CHILD of a collaborative session: which collaboration it
+   * belongs to and which role it plays. Absent = not a collaboration child.
+   *
+   * The mirror of `collaboration` (set on the parent), so a client can group
+   * a fleet without inferring it from names. `ordinal` distinguishes the
+   * members of a fanned-out role (`review` ×3 → ordinals 1..3).
+   */
+  collaborationRole?: {
+    /** Session id of the orchestrating parent. */
+    parentSessionId: string;
+    /** Role name from the parent's config (already lowercased). */
+    roleName: string;
+    /** 1-based index within this role's fan-out. */
+    ordinal: number;
+    /** Whether this child's identity carries write authority. */
+    write: boolean;
+  };
 }
 
 /** A git worktree backing a session's workdir (see SessionInfo.worktree). */
@@ -852,6 +870,19 @@ export interface CollaborationRole {
   count?: number;
   /** What this role is for; surfaced in the child's brief. */
   purpose?: string;
+  /**
+   * Whether this role's children may modify the workspace.
+   *
+   * **Absent = false**, and that default is the point. §3 gives `review` and
+   * `search` no repo write, and §6 wants a reviewer that *provably* cannot
+   * write rather than one asked not to — so write authority is opt-in per
+   * role and is enforced by the child's leaf identity holding no
+   * `tools:write` scope at all, not by a line in a prompt.
+   *
+   * Maps onto the existing dispatch worker shapes: `true` → "ship",
+   * `false` → "scout".
+   */
+  write?: boolean;
 }
 
 /** The role name that must be present exactly once in a collaboration, and

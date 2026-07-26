@@ -38,7 +38,15 @@ import {
   resolveAgainstList,
   resolveModelIdForProvider,
 } from "./models.js";
-import { orchestratorRole, validateCollaboration } from "./collaboration.js";
+import {
+  childBrief,
+  childSessionName,
+  compileGoalPack,
+  orchestratorRole,
+  planChildren,
+  validateCollaboration,
+  type PlannedChild,
+} from "./collaboration.js";
 import {
   packSession,
   unpackBundle,
@@ -1390,10 +1398,10 @@ mcpHub: this.#mcpHub,
     return this.#config?.conductor?.name ?? "conductor";
   }
 
-  #create(
+  async #create(
     msg: Extract<ClientMessage, { type: "session.create" }>,
     auth: AuthContext,
-  ): DaemonMessage {
+  ): Promise<DaemonMessage> {
     if (!hasScope(auth.scopes as string[], SCOPES.SESSION_CREATE)) {
       return { type: "response.error", requestId: msg.id, error: "Missing scope: session:create", code: "forbidden" };
     }
@@ -1465,6 +1473,18 @@ mcpHub: this.#mcpHub,
         };
       }
       collaboration = checked.config;
+      // Two different topologies competing for one constitution: the
+      // collaborative toggle compiles its OWN ephemeral one-goal pack (§9),
+      // so an installed pack would either be silently overridden or silently
+      // override it. Neither is acceptable — say so instead.
+      if (msg.pack) {
+        return {
+          type: "response.error",
+          requestId: msg.id,
+          error: "collaboration and pack are mutually exclusive — a collaborative session compiles its own one-goal pack. Use /pipeline for a pre-authored pack.",
+          code: "invalid_request",
+        };
+      }
       const orchestrator = orchestratorRole(collaboration);
       if (orchestrator) {
         if (providerId && providerId !== orchestrator.providerId) {
@@ -1494,6 +1514,32 @@ mcpHub: this.#mcpHub,
       return { type: "response.error", requestId: msg.id, error: "packRole requires pack", code: "invalid_request" };
     }
 
+    // Plan the role-children BEFORE creating anything, so a fan-out over the
+    // ceiling rejects the request outright instead of leaving a half-built
+    // collaboration behind.
+    let planned: PlannedChild[] = [];
+    if (collaboration) {
+      const plan = planChildren(collaboration);
+      if (!plan.ok) {
+        return {
+          type: "response.error",
+          requestId: msg.id,
+          error: plan.error,
+          code: "invalid_request",
+        };
+      }
+      planned = plan.children;
+      // The orchestrator runs under the compiled one-goal pack: the goal, its
+      // fleet roster, and the delegation rules become its constitution, so
+      // pack vocabulary never surfaces on this path.
+      const compiled = compileGoalPack(collaboration, planned);
+      pack = {
+        id: compiled.id,
+        constitution: compiled.constitution,
+        subagents: compiled.subagents,
+      };
+    }
+
     const session = new Session({
       name: msg.name,
       workdir,
@@ -1521,11 +1567,157 @@ mcpHub: this.#mcpHub,
     this.#sessions.set(session.id, session);
     this.#rateLimiter.recordCreation(auth.sub);
 
+    if (collaboration && planned.length > 0) {
+      const spawned = await this.#spawnCollaborationChildren(session, collaboration, planned, auth);
+      if (!spawned.ok) {
+        // All-or-nothing: a collaboration missing a role is not a working
+        // collaboration, and leaving the orchestrator up with a partial fleet
+        // would have it delegate to children that don't exist. Unwind.
+        await this.#teardownCollaborationChildren(session.id, "partial spawn rolled back");
+        try {
+          await session.destroy(auth);
+        } catch {
+          // Best-effort — the error we report is the spawn failure.
+        }
+        this.#sessions.delete(session.id);
+        this.#rateLimiter.recordDestruction(auth.sub);
+        return {
+          type: "response.error",
+          requestId: msg.id,
+          error: spawned.error,
+          code: "internal",
+        };
+      }
+    }
+
     return {
       type: "response.ok",
       requestId: msg.id,
       data: session.toInfo(),
     };
+  }
+
+  /**
+   * Bring up a collaborative session's role-children (P1b).
+   *
+   * Each child is a normal long-lived session — NOT a dispatch-spawned
+   * disposable worker. That distinction is deliberate: the dispatcher destroys
+   * a spawn-task worker the moment its turn ends (`#finishWorkerTask`), which
+   * is wrong for a role that has to survive the implement↔review fix-loop.
+   * These children instead receive `fleet_send` dispatches, which the
+   * dispatcher delivers without taking ownership of their lifetime, so the
+   * collaboration owns teardown.
+   *
+   * No brief is SENT here. The child's role, contract, and goal ride in its
+   * pack constitution instead, so bringing up a fleet of N costs zero tokens
+   * and no child burns a turn just to learn it should wait.
+   */
+  async #spawnCollaborationChildren(
+    parent: Session,
+    collaboration: CollaborationConfig,
+    planned: readonly PlannedChild[],
+    auth: AuthContext,
+  ): Promise<{ ok: true } | { ok: false; error: string }> {
+    for (const child of planned) {
+      try {
+        const childSession = new Session({
+          name: childSessionName(parent.name, child),
+          workdir: parent.workdir,
+          auth,
+          store: this.#store,
+          transcriptStore: this.#transcriptStore,
+          providers: this.#providers,
+          hooks: this.#hooks,
+          providerId: child.providerId,
+          defaultModel: child.model,
+          role: "worker",
+          // The enforcement behind §6: a read-only role becomes a "scout",
+          // whose LEAF identity profile carries no tools:write at all, so it
+          // cannot mint write authority even via a sub-agent.
+          workerShape: child.shape,
+          // ...and the same restriction at the canUseTool fence, where
+          // roleDeniesTool turns `write: false` into a hard tool deny
+          // (Claude-hard; advisory + logged on backends whose tools don't all
+          // route through the gate — see roleEnforcement).
+          pack: {
+            id: "collaboration",
+            constitution: childBrief(collaboration, child),
+            role: {
+              name: child.roleName,
+              write: child.write,
+              // Not `false`: §3 gives the search role web access, and
+              // roleDeniesTool only denies network tools on an explicit false.
+              // Per-role network gating is a later phase.
+              network: "read-only",
+              envelope: "all",
+            },
+            roleName: child.roleName,
+            subagents: [],
+          },
+          collaborationRole: {
+            parentSessionId: parent.id,
+            roleName: child.roleName,
+            ordinal: child.ordinal,
+            write: child.write,
+          },
+          identityManager: this.#identityManager,
+          memory: this.#memory,
+          memoryMcp: this.#memoryMcp,
+          mcpRegistry: this.#mcpRegistry,
+          mcpHub: this.#mcpHub,
+          config: this.#config,
+          compressionRegistry: this.#compressionRegistry,
+          _testProvider: this.#testProviderFactory?.(),
+          onStatusChange: this.#statusObserver,
+          onModels: (providerId, m) => this._cacheModels(providerId, m),
+        });
+        this.#sessions.set(childSession.id, childSession);
+        // No rate-limiter charge: the human called session.create once, and
+        // the child count is already bounded by MAX_COLLABORATION_CHILDREN.
+        // Mirrors spawnWorker, which charges nothing for the same reason.
+        this.#store.audit(
+          auth.sub,
+          "collaboration.child_spawned",
+          childSession.id,
+          `parent=${parent.id} role=${child.roleName}#${child.ordinal} provider=${child.providerId}${child.model ? `/${child.model}` : ""} shape=${child.shape}`,
+        );
+      } catch (err) {
+        return {
+          ok: false,
+          error: `Failed to bring up collaboration role "${child.roleName}" on "${child.providerId}": ${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
+    }
+    return { ok: true };
+  }
+
+  /**
+   * Tear down every live child of a collaboration (goal end).
+   *
+   * Membership is DERIVED from the live session set rather than tracked in a
+   * side map, so it cannot drift out of sync with reality — the failure mode
+   * of a parallel registry here is an orphaned agent subprocess.
+   */
+  async #teardownCollaborationChildren(parentSessionId: string, reason: string): Promise<void> {
+    const children = [...this.#sessions.values()].filter(
+      (s) => s.collaborationRole?.parentSessionId === parentSessionId,
+    );
+    for (const child of children) {
+      try {
+        await child.destroy(this.#dispatchSystemAuth(child.accountId, child.projectId));
+      } catch (err) {
+        console.error(
+          `[codeoid/collaboration] child teardown failed (${reason}): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      this.#sessions.delete(child.id);
+      this.#store.audit(
+        "system:collaboration",
+        "collaboration.child_destroyed",
+        child.id,
+        `parent=${parentSessionId} role=${child.collaborationRole?.roleName ?? "?"} reason=${reason}`,
+      );
+    }
   }
 
   /**
@@ -3423,6 +3615,15 @@ mcpHub: this.#mcpHub,
     // races the still-running consumer task and the appendFile that
     // landed in P1 #10 — ENOENT or partially-written final lines on
     // the new session.
+    // Goal end for a collaborative session: its role-children have per-goal
+    // lifetime, so they go with it. Children FIRST — the orchestrator is what
+    // the owner asked to destroy, and returning OK while N child agent
+    // subprocesses are still live would orphan them with no handle left to
+    // reach them by.
+    if (session.collaboration) {
+      await this.#teardownCollaborationChildren(msg.sessionId, "collaboration goal ended");
+    }
+
     await session.destroy(auth);
     this.#sessions.delete(msg.sessionId);
     return { type: "response.ok", requestId: msg.id };
