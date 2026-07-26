@@ -1579,8 +1579,13 @@ mcpHub: this.#mcpHub,
         } catch {
           // Best-effort — the error we report is the spawn failure.
         }
+        // Removing it from #sessions is the whole rollback: the concurrency
+        // count is derived from the live session set (see rate-limit.ts on why
+        // it is no longer a stored counter), so there is nothing to decrement.
+        // The hourly creation timestamp stays recorded on purpose — the create
+        // was attempted, and a failed spawn shouldn't refund an attempt into a
+        // retry loop.
         this.#sessions.delete(session.id);
-        this.#rateLimiter.recordDestruction(auth.sub);
         return {
           type: "response.error",
           requestId: msg.id,
