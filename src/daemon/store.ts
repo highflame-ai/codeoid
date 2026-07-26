@@ -619,6 +619,19 @@ export class Store {
   }
 
   /**
+   * Rename a session (`session.rename`). The `name` column is otherwise
+   * written ONLY by createSession's INSERT OR REPLACE, so without this a
+   * rename never reaches the row and every reader that goes to the store
+   * rather than the live Session keeps reporting the old name forever
+   * (#257).
+   */
+  updateSessionName(id: string, name: string): void {
+    this.#db
+      .prepare("UPDATE sessions SET name = ?, updated_at = datetime('now') WHERE id = ?")
+      .run(name, id);
+  }
+
+  /**
    * Claude Code backing session id — separate from codeoid's stable
    * session.id so we can rotate the underlying context without breaking
    * user-facing identifiers.

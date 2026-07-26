@@ -351,6 +351,15 @@ export class Session {
   /** Trailing-debounce timer coalescing persistence of ACTIVE status flips
    * (thinking ↔ tool_running). See #setStatus. */
   #statusPersistTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Last time this session actually did something, as persisted in
+   * `TranscriptMeta.lastActivityAt`. Tracked (rather than stamped fresh at
+   * every meta write) because `resumeSortKey` orders the resumed session list
+   * by it — so a metadata-only write like `rename()` must reuse the current
+   * value instead of bumping it and silently reordering the user's list.
+   * Initialised to createdAt in the constructor.
+   */
+  #lastActivityAt: string;
   #clients = new Map<string, AttachedClient>();
   #store: Store;
   #transcriptStore: TranscriptStore;
@@ -620,6 +629,7 @@ export class Session {
     }
     this.createdBy = opts.auth.sub;
     this.createdAt = new Date().toISOString();
+    this.#lastActivityAt = this.createdAt;
     this.accountId = opts.auth.accountId;
     this.projectId = opts.auth.projectId;
     this.#store = opts.store;
@@ -1075,6 +1085,23 @@ export class Session {
       `from=${this.name} to=${trimmed}`,
     );
     this.name = trimmed;
+    // Persist BOTH stores before broadcasting. The sessions row is the cold
+    // read path and the transcript meta is the restart-resume source of truth;
+    // leaving either behind is #257 (rename reverts on restart, and
+    // store-backed readers keep the stale name indefinitely). Neither write
+    // may break the rename — the in-memory name and the broadcast are already
+    // correct, so a failed persist degrades to "reverts on restart", not
+    // "rename silently did nothing".
+    try {
+      this.#store.updateSessionName(this.id, trimmed);
+    } catch (err) {
+      console.error(
+        `[codeoid/session ${this.id}] rename persist failed (name may revert on restart): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+    this.#saveMetaNow();
     this.#broadcastInfoUpdate();
   }
 
@@ -4047,6 +4074,29 @@ export class Session {
         );
       }
     }
+    this.#lastActivityAt = new Date().toISOString();
+    this.#saveMetaNow();
+  }
+
+  /**
+   * Write the session's CURRENT identity/state through to the transcript meta.
+   * Extracted so metadata-only mutations (`rename()`) persist immediately
+   * instead of waiting for the next status flip to carry them — the #257 bug,
+   * where renaming an idle session and restarting the daemon silently restored
+   * the old name because this file was the resume source of truth and nothing
+   * had rewritten it.
+   *
+   * Uses the tracked `#lastActivityAt` rather than "now" so callers that
+   * aren't real activity don't reorder the resumed session list.
+   *
+   * The trailing `.catch(() => {})` is empty by contract, not by omission:
+   * `saveMeta`'s stored write chain owns the exactly-once "meta write failed"
+   * log and still returns a rejecting promise so awaiting callers can react.
+   * Fire-and-forget callers like this one must absorb that rejection (an
+   * unconsumed one is an unhandled-rejection crash under Bun); logging here
+   * would duplicate the message TranscriptStore deliberately emits once.
+   */
+  #saveMetaNow(): void {
     this.#transcriptStore.saveMeta({
       sessionId: this.id,
       sessionName: this.name,
@@ -4054,7 +4104,7 @@ export class Session {
       createdBy: this.createdBy,
       createdAt: this.createdAt,
       lastStatus: this.#status,
-      lastActivityAt: new Date().toISOString(),
+      lastActivityAt: this.#lastActivityAt,
       accountId: this.accountId,
       projectId: this.projectId,
       role: this.role,
