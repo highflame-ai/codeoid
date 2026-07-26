@@ -566,6 +566,24 @@ const PipelineSchema = z
   })
   .default({ enabled: true, defaultPack: null, packs: [], registries: [] });
 
+/**
+ * Push notifications (docs/push.md). When a session blocks on a tool approval,
+ * the daemon sends a CONTENT-BLIND wake-up (an opaque session id only, never
+ * tool args) to the configured transport so the session owner's registered
+ * devices are alerted off-LAN. `transport: "none"` (default) disables push.
+ */
+const PushSchema = z
+  .object({
+    /** Delivery transport. "expo" routes through Expo's push service (which
+     *  relays to APNs/FCM); "none" disables push. A self-hosted content-blind
+     *  relay transport swaps in behind this seam later. */
+    transport: z.enum(["expo", "none"]).default("none"),
+    /** Expo access token (Bearer) for the push API. Optional — Expo accepts
+     *  unauthenticated sends, but a token enables receipts + higher limits. */
+    expoAccessToken: z.string().optional(),
+  })
+  .default({ transport: "none" });
+
 const RootSchema = z.object({
   daemonUrl: z.string().default("ws://127.0.0.1:7400"),
   dbPath: z.string().default("codeoid.db"),
@@ -592,6 +610,7 @@ const RootSchema = z.object({
   mcpServers: McpServersSchema,
   hooks: HooksSchema,
   embed: EmbedSchema,
+  push: PushSchema,
   fork: z
     .object({
       /** Shell command run once in a freshly-created fork worktree to make it
@@ -774,6 +793,14 @@ export interface CodeoidConfig {
     entries: HookEntryConfig[];
   };
   /**
+   * Push notifications. Optional in the type so hand-built test configs stay
+   * minimal; loadConfig always populates it (schema default: transport "none").
+   */
+  push?: {
+    transport: "expo" | "none";
+    expoAccessToken?: string;
+  };
+  /**
    * Embed trust — origins permitted to frame the web UI and pre-authenticate
    * it via the URL-hash credential handoff. The web UI's trusted-framing-origin
    * gate consults this allowlist; empty ⇒ the hash handoff is disabled (safe
@@ -846,6 +873,10 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   // Hooks kill switch — disable every configured hook per-invocation without
   // touching config.json. Entries themselves are file-config only.
   { env: "CODEOID_HOOKS_ENABLED", path: "hooks.enabled", kind: "boolean" },
+  // Push transport switch + Expo token — per-invocation without touching
+  // config.json (e.g. CODEOID_PUSH_TRANSPORT=expo).
+  { env: "CODEOID_PUSH_TRANSPORT", path: "push.transport", kind: "string" },
+  { env: "CODEOID_EXPO_ACCESS_TOKEN", path: "push.expoAccessToken", kind: "string" },
   { env: "CODEOID_TURN_STALL_TIMEOUT_MS", path: "session.turnStallTimeoutMs", kind: "int" },
   { env: "CODEOID_MCP_TOOL_TIMEOUT_MS", path: "session.mcpToolTimeoutMs", kind: "int" },
   // Embed-SSO trusted framing origins (comma-separated). Each is an exact
@@ -1048,6 +1079,7 @@ export function loadConfig(opts: LoadOptions = {}): CodeoidConfig {
     mcpServers: parsed.mcpServers,
     hooks: parsed.hooks,
     embed: parsed.embed,
+    push: parsed.push,
     fork: parsed.fork,
   };
 }

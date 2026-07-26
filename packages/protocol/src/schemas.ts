@@ -170,6 +170,21 @@ export const sessionApproveSchema = z.object({
   updatedInput: z.record(z.string(), z.unknown()).optional(),
 });
 
+const pushTokenField = z.string().min(1).max(LIMITS.PUSH_TOKEN_MAX);
+
+export const pushRegisterSchema = z.object({
+  ...base,
+  type: z.literal("push.register"),
+  token: pushTokenField,
+  platform: z.enum(["ios", "android"]),
+});
+
+export const pushUnregisterSchema = z.object({
+  ...base,
+  type: z.literal("push.unregister"),
+  token: pushTokenField,
+});
+
 export const sessionUiResponseSchema = z
   .object({
     ...base,
@@ -584,6 +599,8 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   pipelinePackRemoveSchema,
   pipelinePackTrustSchema,
   pipelinePackSelectSchema,
+  pushRegisterSchema,
+  pushUnregisterSchema,
 ]);
 
 /**

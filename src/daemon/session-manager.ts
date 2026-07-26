@@ -19,6 +19,7 @@ import {
 } from "./providers/registry.js";
 import type { HookBus } from "./hooks/bus.js";
 import type { Store } from "./store.js";
+import { createPushTransport, PushService } from "./push/index.js";
 import { hasScope, SCOPES } from "../protocol/scopes.js";
 import { applyPatches, getManifest, getSnapshot } from "./settings/store.js";
 import { RateLimiter } from "./rate-limit.js";
@@ -204,6 +205,9 @@ export class SessionManager {
   #config?: CodeoidConfig;
   #compressionRegistry?: CompressionRegistry;
   #dispatcher: Dispatcher;
+  /** Content-blind push notifications — resolves a blocked session's owner to
+   *  their registered devices. Noop transport when push is disabled (default). */
+  #pushService: PushService;
   /** SDLC pipeline manager — undefined when the pipeline is disabled (default). */
   #pipelines?: PipelineManager;
   /** Pack curation surface (registries + install/trust/select) — always present,
@@ -221,6 +225,22 @@ export class SessionManager {
   /** Stable observer identity — every Session reports status transitions here. */
   #statusObserver = (sessionId: string, status: SessionInfo["status"]): void => {
     this.#dispatcher.onSessionStatus(sessionId, status);
+    // Content-blind push: a session that just blocked on approval alerts its
+    // owner's registered devices off-LAN. Fire-and-forget — a push hiccup must
+    // never touch the status path (the emit itself only ever sees an opaque
+    // session id, never the tool's args/description).
+    if (status === "waiting_approval" && this.#pushService.enabled) {
+      const session = this.#sessions.get(sessionId);
+      if (session) {
+        void this.#pushService
+          .notifyApproval(sessionId, {
+            sub: session.createdBy,
+            accountId: session.accountId,
+            projectId: session.projectId,
+          })
+          .catch((err) => console.error("[codeoid/push] notify failed:", err));
+      }
+    }
     // A pipeline phase driving this session awaits its next rest; resolve it.
     // (Non-run sessions never have a waiter, so this is a no-op for them.)
     //
@@ -281,6 +301,7 @@ export class SessionManager {
       this.#makeDispatcherHost(),
       opts?.config?.dispatch,
     );
+    this.#pushService = new PushService(store, createPushTransport(opts?.config?.push));
     // SDLC pipeline (docs/sdlc-pipeline.md) — off by default; when enabled, the
     // manager shares the daemon DB (one connection) and rehydrates non-terminal
     // pipelines on construction (resume). The runner drives prompt/slash phases
@@ -655,6 +676,10 @@ mcpHub: this.#mcpHub,
         return this.#packTrust(msg, auth);
       case "pipeline.pack.select":
         return this.#packSelect(msg, auth);
+      case "push.register":
+        return this.#pushRegister(msg, auth);
+      case "push.unregister":
+        return this.#pushUnregister(msg, auth);
       default: {
         // Inbound messages are cast from raw JSON at the transport, so an
         // unknown/malformed `type` reaches here. Without this the function
@@ -2850,6 +2875,27 @@ mcpHub: this.#mcpHub,
       };
     }
     session.unpinFile(msg.path, auth);
+    return { type: "response.ok", requestId: msg.id };
+  }
+
+  #pushRegister(
+    msg: Extract<ClientMessage, { type: "push.register" }>,
+    auth: AuthContext,
+  ): DaemonMessage {
+    // No scope gate: registration is inherently self-scoped — the token is
+    // bound to the caller's own identity (auth.sub) + tenant, so a client can
+    // only ever register its own device. Gated by authentication + the PUSH
+    // capability, mirroring how session.ui_response avoids a bespoke scope.
+    this.#store.registerPush(msg.token, msg.platform, auth.sub, auth.accountId, auth.projectId);
+    return { type: "response.ok", requestId: msg.id };
+  }
+
+  #pushUnregister(
+    msg: Extract<ClientMessage, { type: "push.unregister" }>,
+    auth: AuthContext,
+  ): DaemonMessage {
+    // Owner-scoped delete — a client can only remove its own device token.
+    this.#store.unregisterPush(msg.token, auth.sub);
     return { type: "response.ok", requestId: msg.id };
   }
 

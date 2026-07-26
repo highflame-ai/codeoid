@@ -71,6 +71,14 @@ export const CAPABILITIES = {
    * full-buffer replay.
    */
   SCROLLBACK_PAGING: "scrollback.paging",
+  /**
+   * Push notifications. Declared by the DAEMON when a push transport is
+   * configured (so clients can feature-detect before registering) and by
+   * CLIENTS that can receive them. A client registers a device token via
+   * `push.register`; the daemon then sends content-blind wake-ups (only opaque
+   * ids, never tool args) when one of that user's sessions blocks on approval.
+   */
+  PUSH: "push",
 } as const;
 
 export type Capability = (typeof CAPABILITIES)[keyof typeof CAPABILITIES];
@@ -126,6 +134,8 @@ export const LIMITS = {
    * governs concurrency at run time.
    */
   COLLABORATION_ROLE_COUNT_MAX: 8,
+  /** Max device push-token length (`push.register`). Expo tokens are ~40 chars. */
+  PUSH_TOKEN_MAX: 512,
 } as const;
 
 // =============================================================================
@@ -804,7 +814,9 @@ export type ClientMessage =
   | PipelinePackInstallMsg
   | PipelinePackRemoveMsg
   | PipelinePackTrustMsg
-  | PipelinePackSelectMsg;
+  | PipelinePackSelectMsg
+  | PushRegisterMsg
+  | PushUnregisterMsg;
 
 interface BaseClientMsg {
   /** Request ID for correlating responses */
@@ -1083,6 +1095,27 @@ export interface SessionApproveMsg extends BaseClientMsg {
    * returning `{ behavior: "allow", updatedInput: ... }` to the SDK.
    */
   updatedInput?: Record<string, unknown>;
+}
+
+/** Device platform for a push registration. */
+export type PushPlatform = "ios" | "android";
+
+/**
+ * Register a device to receive push notifications for the authenticated
+ * user's sessions. Scoped to the caller's identity (ZeroID `sub`) and tenant
+ * (account/project) server-side — a client can only register its own devices.
+ * `token` is the opaque transport token (an Expo push token today).
+ */
+export interface PushRegisterMsg extends BaseClientMsg {
+  type: "push.register";
+  token: string;
+  platform: PushPlatform;
+}
+
+/** Remove a previously-registered device token (e.g. on sign-out). */
+export interface PushUnregisterMsg extends BaseClientMsg {
+  type: "push.unregister";
+  token: string;
 }
 
 /**
