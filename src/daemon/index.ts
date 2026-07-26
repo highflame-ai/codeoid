@@ -22,7 +22,8 @@ export {
   LOCAL_PROJECT_ID,
   LOCAL_SUBJECT,
   LOCAL_TOKEN_ENV,
-  LOCAL_TOKEN_FILENAME,
+  LOCAL_TOKEN_FILE_PREFIX,
+  localTokenFilename,
   LOCAL_TOKEN_PREFIX,
 } from "./local-auth.js";
 export { AgentIdentityManager, type AgentIdentityConfig } from "./agent-identity.js";

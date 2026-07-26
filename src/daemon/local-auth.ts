@@ -89,8 +89,26 @@ export const LOCAL_TOKEN_PREFIX = "codeoid_local_";
 /** Env var that supplies (daemon) or presents (client) the local-mode token. */
 export const LOCAL_TOKEN_ENV = "CODEOID_LOCAL_TOKEN";
 
-/** Basename of the 0600 token file dropped in the config dir while running. */
-export const LOCAL_TOKEN_FILENAME = "local-token";
+/** Basename prefix of the 0600 token file dropped in the config dir. */
+export const LOCAL_TOKEN_FILE_PREFIX = "local-token";
+
+/**
+ * Basename of the token file for a daemon listening on `port`.
+ *
+ * Port-scoped deliberately. The token is per-DAEMON state, and two local-mode
+ * daemons on one machine share a config dir — with a single global filename the
+ * second to start silently overwrites the first's token (breaking its clients
+ * with a bare 4003) and the first to shut down deletes the survivor's token
+ * (breaking its clients with "No API key configured"). Both were reproduced
+ * before this was scoped; see `src/tests/local-auth.test.ts`.
+ *
+ * The port is the right key because it is exactly what a client already knows
+ * about the daemon it is dialing (`config.daemonUrl`), so lookup needs no extra
+ * coordination.
+ */
+export function localTokenFilename(port: number | string): string {
+  return `${LOCAL_TOKEN_FILE_PREFIX}-${port}`;
+}
 
 /**
  * Mint a local-mode token: 256 bits of CSPRNG entropy, base64url-encoded.
@@ -235,9 +253,18 @@ export function assertLocalBindAllowed(host: string, allowRemote: boolean): void
  */
 export function writeLocalTokenFile(path: string, token: string): void {
   mkdirSync(dirname(path), { recursive: true });
+  // Unlink first so we never write a secret THROUGH a pre-existing symlink (a
+  // stale link, or one planted at this path, would otherwise redirect the token
+  // to its target — and the chmod below would loosen/tighten that target
+  // instead). Creating fresh also guarantees the 0600 mode actually applies,
+  // since writeFileSync's `mode` is ignored for an existing file.
+  try {
+    rmSync(path, { force: true });
+  } catch {
+    /* if it can't be removed, the write below will surface the real problem */
+  }
   writeFileSync(path, `${token}\n`, { mode: 0o600 });
-  // writeFileSync's `mode` only applies when it CREATES the file; an existing
-  // file keeps its old (possibly wider) mode. Tighten unconditionally.
+  // Belt and suspenders against a permissive umask on the create path.
   try {
     chmodSync(path, 0o600);
   } catch {

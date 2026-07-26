@@ -109,7 +109,7 @@ Scope enforcement is the same code path in both — local mode changes the issue
 codeoid start --local
 ```
 
-The daemon mints a one-off token, prints it, publishes it to `~/.codeoid/local-token` (mode `0600`), and binds `127.0.0.1` only.
+The daemon mints a one-off token, prints it, publishes it to `~/.codeoid/local-token-<port>` (mode `0600`), and binds `127.0.0.1` only.
 Then, from another terminal:
 
 ```bash

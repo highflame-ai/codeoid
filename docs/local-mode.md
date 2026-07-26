@@ -54,7 +54,8 @@ If you ever see Codeoid demoed as "identity-first" without that badge missing, y
 The daemon runs coding agents with shell and file-write authority. A token-less port would be a remote-code-execution surface for any other process on the box — and any LAN peer, if bound wide. Local mode therefore follows the Jupyter model:
 
 1. **A random 256-bit token is minted at startup** and printed in the banner.
-2. **It is published to `~/.codeoid/local-token`** (mode `0600`) so clients on this machine pick it up with zero setup — and **removed when the daemon shuts down**, so it never becomes a durable credential lying around.
+2. **It is published to `~/.codeoid/local-token-<port>`** (mode `0600`) so clients on this machine pick it up with zero setup — and **removed when the daemon shuts down**, so it never becomes a durable credential lying around.
+   The filename is scoped to the daemon's port, so two local daemons on one machine can't overwrite or delete each other's credential.
 3. **The bind is loopback-only.** A non-loopback `--host` is *refused* unless you also pass `--local-allow-remote`.
 
 None of that costs you a setup step. Nothing is typed, nothing is registered, nothing is fetched.
@@ -101,12 +102,14 @@ The database file is the same, so nothing is deleted and the embedding-model cac
 Every Codeoid client resolves a credential in this order:
 
 1. **`CODEOID_LOCAL_TOKEN`** — an explicit, per-invocation decision. Set it on the daemon too, to pin the token across restarts (useful in a container or a script).
-2. **`~/.codeoid/local-token`** — the file the running local-mode daemon published.
+2. **`~/.codeoid/local-token-<port>`** — the file published by the local-mode daemon *on the port this client is dialing* (from `config.json`'s `daemonUrl`).
 3. **`CODEOID_API_KEY` / `config.json`'s `apiKey`** — the ZeroID path.
 
-The published file outranks a stored ZeroID key on purpose. It exists *only while a local-mode daemon is listening* (it is written at boot and removed at shutdown), so it is a statement about the daemon you're about to talk to, whereas `apiKey` is durable config that says nothing about it. That's what lets you flip between postures without editing config either way.
+The published file outranks a stored ZeroID key on purpose. It exists *only while a local-mode daemon is listening on that port* (written at boot, removed at shutdown), so it is a statement about the daemon you're about to talk to, whereas `apiKey` is durable config that says nothing about it. That's what lets you flip between postures without editing config either way.
 
-A stale file left by a crash fails closed at the daemon's verifier with a message naming the file — it never silently authenticates anyone.
+**Why the port is in the filename.** The token is per-daemon state. With a single shared filename, a second local daemon's startup silently overwrote the first's token, and the first to shut down deleted the survivor's — so a perfectly healthy daemon's clients would start failing. Scoping by port removes the shared mutable state, and the port is exactly what a client already knows about the daemon it is dialing.
+
+**Stale files.** The graceful shutdown path removes the token, so a leftover file means the daemon was killed hard (`kill -9`, power loss). Starting a **ZeroID-mode** daemon on that port sweeps it — successfully binding the port proves no local daemon is listening on it, so any token file for it is dead. (The sweep runs *after* the bind, so a failed bind can never delete a live daemon's credential.) A stale file with nothing listening just fails to connect.
 
 For the web UI, the daemon-injected global takes precedence over anything in `localStorage`, for the same reason.
 
@@ -123,7 +126,7 @@ For the web UI, the daemon-injected global takes precedence over anything in `lo
 
 | Path | Contents |
 |---|---|
-| `~/.codeoid/local-token` | The published token, mode `0600`. Written at boot, removed at shutdown. |
+| `~/.codeoid/local-token-<port>` | The published token for the daemon on `<port>`, mode `0600`. Written at boot, removed at shutdown. |
 
 Check a running daemon's posture without connecting anything:
 

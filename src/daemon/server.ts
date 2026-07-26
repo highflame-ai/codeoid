@@ -212,11 +212,8 @@ export class DaemonServer {
     // The auth posture is chosen exactly once, here. Every enforcement site
     // downstream reads the resulting AuthContext and never learns which issuer
     // produced it (see ./verifier.ts — REVIEW INVARIANT).
-    this.#verifier = config.localMode
-      ? new LocalVerifier(config.localMode.token)
-      : new ZeroIdVerifier(config.auth);
-
     if (config.localMode) {
+      this.#verifier = new LocalVerifier(config.localMode.token);
       // Loud and unmissable. The failure this guards against is demonstrating
       // an identity-first control plane in the mode that has no identity.
       console.warn("[codeoid] ┌──────────────────────────────────────────────────────────────┐");
@@ -226,7 +223,11 @@ export class DaemonServer {
       console.warn("[codeoid] │  For real identities: codeoid login  (docs/local-mode.md)    │");
       console.warn("[codeoid] └──────────────────────────────────────────────────────────────┘");
     } else {
-      console.log(`[codeoid] auth: ZeroID (issuer ${(this.#verifier as ZeroIdVerifier).issuer})`);
+      // Bound to a local so the issuer read needs no cast — a `as ZeroIdVerifier`
+      // here would keep compiling if these branches were ever reordered.
+      const zeroid = new ZeroIdVerifier(config.auth);
+      this.#verifier = zeroid;
+      console.log(`[codeoid] auth: ZeroID (issuer ${zeroid.issuer})`);
     }
 
     // Google OAuth mints tokens by exchanging at the ZeroID token endpoint, so

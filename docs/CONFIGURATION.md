@@ -69,7 +69,7 @@ ZEROID_PROJECT_ID=dev
 CODEOID_LOCAL_TOKEN=                    # daemon: use this instead of minting one (pins it
                                         #   across restarts, e.g. in a container)
                                         # client: present this token
-                                        # Clients otherwise read ~/.codeoid/local-token,
+                                        # Clients otherwise read ~/.codeoid/local-token-<port>,
                                         #   which a `--local` daemon publishes while it runs.
 
 # Daemon

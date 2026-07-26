@@ -8,7 +8,13 @@ import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getLocalTokenPath, loadConfig, resolveLocalToken, resolveZeroidUrl } from "../config.js";
+import {
+  daemonPortFromUrl,
+  getLocalTokenPath,
+  loadConfig,
+  resolveLocalToken,
+  resolveZeroidUrl,
+} from "../config.js";
 import {
   mintLocalToken,
   removeLocalTokenFile,
@@ -508,6 +514,8 @@ describe("resolveLocalToken — client-side local-mode discovery", () => {
   // published file is removed when that daemon shuts down, so it only outranks
   // a durable apiKey while a local daemon is actually listening.
   const XDG = "XDG_CONFIG_HOME";
+  const URL_A = "ws://127.0.0.1:7400";
+  const URL_B = "ws://127.0.0.1:7401";
   let prevXdg: string | undefined;
 
   beforeEach(() => {
@@ -520,38 +528,88 @@ describe("resolveLocalToken — client-side local-mode discovery", () => {
   });
 
   it("is null when no local daemon has published a token", () => {
-    expect(resolveLocalToken({})).toBeNull();
+    expect(resolveLocalToken(URL_A, {})).toBeNull();
   });
 
-  it("reads the token a local daemon published", () => {
+  it("reads the token a local daemon published for that port", () => {
     const token = mintLocalToken();
-    writeLocalTokenFile(getLocalTokenPath(), token);
-    expect(resolveLocalToken({})).toBe(token);
+    writeLocalTokenFile(getLocalTokenPath(7400), token);
+    expect(resolveLocalToken(URL_A, {})).toBe(token);
   });
 
   it("prefers CODEOID_LOCAL_TOKEN over the published file", () => {
-    writeLocalTokenFile(getLocalTokenPath(), mintLocalToken());
-    expect(resolveLocalToken({ CODEOID_LOCAL_TOKEN: "codeoid_local_pinned" })).toBe(
+    writeLocalTokenFile(getLocalTokenPath(7400), mintLocalToken());
+    expect(resolveLocalToken(URL_A, { CODEOID_LOCAL_TOKEN: "codeoid_local_pinned" })).toBe(
       "codeoid_local_pinned",
     );
   });
 
   it("ignores an empty env override", () => {
     const token = mintLocalToken();
-    writeLocalTokenFile(getLocalTokenPath(), token);
-    expect(resolveLocalToken({ CODEOID_LOCAL_TOKEN: "" })).toBe(token);
+    writeLocalTokenFile(getLocalTokenPath(7400), token);
+    expect(resolveLocalToken(URL_A, { CODEOID_LOCAL_TOKEN: "" })).toBe(token);
   });
 
   it("goes back to null once the daemon removes its token on shutdown", () => {
-    const path = getLocalTokenPath();
+    const path = getLocalTokenPath(7400);
     writeLocalTokenFile(path, mintLocalToken());
     removeLocalTokenFile(path);
     // This is what makes the precedence safe: no lingering credential means a
     // ZeroID client is never hijacked by a stale local token.
-    expect(resolveLocalToken({})).toBeNull();
+    expect(resolveLocalToken(URL_A, {})).toBeNull();
   });
 
   it("honours XDG_CONFIG_HOME for the token path", () => {
-    expect(getLocalTokenPath()).toBe(join(tmp, "codeoid", "local-token"));
+    expect(getLocalTokenPath(7400)).toBe(join(tmp, "codeoid", "local-token-7400"));
+  });
+
+  // ── The multi-daemon regression ───────────────────────────────────────────
+  // Both halves of this were REPRODUCED against a single global `local-token`
+  // file: daemon B's startup overwrote daemon A's token (A's clients got a bare
+  // 4003), and B's shutdown deleted the file outright (A's clients then got "No
+  // API key configured" while A was still happily listening). Port-scoping is
+  // what fixes it, so these lock it down.
+
+  it("keeps two local daemons' tokens separate", () => {
+    const tokenA = mintLocalToken();
+    const tokenB = mintLocalToken();
+    writeLocalTokenFile(getLocalTokenPath(7400), tokenA);
+    writeLocalTokenFile(getLocalTokenPath(7401), tokenB);
+
+    expect(getLocalTokenPath(7400)).not.toBe(getLocalTokenPath(7401));
+    expect(resolveLocalToken(URL_A, {})).toBe(tokenA);
+    expect(resolveLocalToken(URL_B, {})).toBe(tokenB);
+  });
+
+  it("one daemon's shutdown does not invalidate another's clients", () => {
+    const tokenA = mintLocalToken();
+    writeLocalTokenFile(getLocalTokenPath(7400), tokenA);
+    writeLocalTokenFile(getLocalTokenPath(7401), mintLocalToken());
+
+    removeLocalTokenFile(getLocalTokenPath(7401)); // daemon B stops
+    expect(resolveLocalToken(URL_A, {})).toBe(tokenA); // A unaffected
+    expect(resolveLocalToken(URL_B, {})).toBeNull();
+  });
+
+  it("does not hand a token to a client dialing a different port", () => {
+    writeLocalTokenFile(getLocalTokenPath(7400), mintLocalToken());
+    expect(resolveLocalToken(URL_B, {})).toBeNull();
+  });
+});
+
+describe("daemonPortFromUrl", () => {
+  it("reads the explicit port", () => {
+    expect(daemonPortFromUrl("ws://127.0.0.1:7411")).toBe("7411");
+    expect(daemonPortFromUrl("wss://host.example:8443/path")).toBe("8443");
+  });
+
+  it("falls back to codeoid's default when the URL omits one", () => {
+    // Matches what the connection itself would do.
+    expect(daemonPortFromUrl("ws://127.0.0.1")).toBe("7400");
+  });
+
+  it("returns null for an unparseable URL rather than guessing", () => {
+    expect(daemonPortFromUrl("not a url")).toBeNull();
+    expect(daemonPortFromUrl("")).toBeNull();
   });
 });

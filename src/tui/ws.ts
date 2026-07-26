@@ -517,8 +517,8 @@ export class TuiWsClient {
 
   async #getToken(): Promise<string> {
     // Local mode first — see TerminalClient#getToken and config.resolveLocalToken
-    // for why a published local token outranks a durable apiKey.
-    const localToken = resolveLocalToken();
+    // for why a token published for this daemon's port outranks a durable apiKey.
+    const localToken = resolveLocalToken(this.#config.daemonUrl);
     if (localToken) return localToken;
 
     const token = this.#config.apiKey;

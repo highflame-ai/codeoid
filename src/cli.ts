@@ -27,6 +27,7 @@ import {
   isLoopbackHost,
   LOCAL_TOKEN_ENV,
   mintLocalToken,
+  removeLocalTokenFile,
 } from "./daemon/local-auth.js";
 import type { CollaborationConfig } from "./protocol/types.js";
 import { TerminalClient } from "./terminal/client.js";
@@ -78,6 +79,7 @@ program
     // reaches the daemon as `localMode` and nothing downstream branches again.
     let localMode: { token: string; tokenFile: string } | undefined;
     const bindHost: string = opts.host;
+    const bindPort = Number.parseInt(opts.port, 10);
     if (opts.local) {
       try {
         assertLocalBindAllowed(bindHost, Boolean(opts.localAllowRemote));
@@ -89,12 +91,14 @@ program
       // script pin it; otherwise mint a fresh one for this process.
       localMode = {
         token: process.env[LOCAL_TOKEN_ENV] || mintLocalToken(),
-        tokenFile: getLocalTokenPath(),
+        // Port-scoped: a second local daemon must not clobber this one's token,
+        // nor delete it on its own shutdown.
+        tokenFile: getLocalTokenPath(bindPort),
       };
     }
 
     const daemon = new DaemonServer({
-      port: Number.parseInt(opts.port, 10),
+      port: bindPort,
       host: bindHost,
       dbPath: config.dbPath,
       transcriptDir: config.transcriptDir,
@@ -160,6 +164,17 @@ program
     }
 
     await daemon.start();
+
+    // ZeroID mode: sweep a stale local-mode token for THIS port. Reaching here
+    // means we successfully bound it, so no local-mode daemon can be listening
+    // on it, so any token file left by one (killed -9, power loss — the graceful
+    // path removes its own) is definitively dead. Without this, clients would
+    // keep presenting it and get an opaque 4003 against a ZeroID daemon.
+    // Deliberately AFTER the bind — doing it before would delete a live
+    // daemon's credential when our own bind then failed with EADDRINUSE.
+    if (!localMode) {
+      removeLocalTokenFile(getLocalTokenPath(bindPort));
+    }
 
     const displayHost = bindHost === "0.0.0.0" || bindHost === "::" ? "localhost" : bindHost;
     if (opts.web !== false) {

@@ -623,12 +623,12 @@ export class TerminalClient {
   }
 
   async #getToken(): Promise<string> {
-    // Local mode first: a published token means a `--local` daemon is running
-    // on this machine right now, which is a stronger signal about what the
-    // daemon will accept than a durable apiKey in config.json (see
+    // Local mode first: a token published for THIS daemon's port means a
+    // `--local` daemon is listening there right now, which is a stronger signal
+    // about what it will accept than a durable apiKey in config.json (see
     // resolveLocalToken). Zero setup — this is what makes `codeoid start
     // --local` + `codeoid tui` work with no copy-paste.
-    const localToken = resolveLocalToken();
+    const localToken = resolveLocalToken(this.#config.daemonUrl);
     if (localToken) return localToken;
 
     const token = this.#config.apiKey;

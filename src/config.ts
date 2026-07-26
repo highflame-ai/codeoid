@@ -22,7 +22,7 @@ import type { AuthConfig } from "./daemon/auth.js";
 import type { OAuthConfig } from "./daemon/oauth.js";
 import {
   LOCAL_TOKEN_ENV,
-  LOCAL_TOKEN_FILENAME,
+  localTokenFilename,
   readLocalTokenFile,
 } from "./daemon/local-auth.js";
 import { HOOK_EVENTS, type HookEntryConfig } from "./daemon/hooks/types.js";
@@ -38,33 +38,57 @@ export function getConfigDir(): string {
   return DEFAULT_CONFIG_DIR;
 }
 
-/** Where a local-mode daemon publishes its token for clients on this machine. */
-export function getLocalTokenPath(): string {
-  return join(getConfigDir(), LOCAL_TOKEN_FILENAME);
+/**
+ * Where a local-mode daemon on `port` publishes its token for local clients.
+ * Port-scoped so two local daemons never share (or delete) each other's
+ * credential — see `localTokenFilename`.
+ */
+export function getLocalTokenPath(port: number | string): string {
+  return join(getConfigDir(), localTokenFilename(port));
+}
+
+/** Default daemon port, used when a daemon URL carries no explicit one. */
+const DEFAULT_DAEMON_PORT = "7400";
+
+/**
+ * The port a client will dial, from its configured daemon URL. Falls back to
+ * codeoid's default port when the URL omits one (`ws://host/`), which is what
+ * the connection itself would do. Returns null only for an unparseable URL.
+ */
+export function daemonPortFromUrl(daemonUrl: string): string | null {
+  try {
+    const port = new URL(daemonUrl).port;
+    return port.length > 0 ? port : DEFAULT_DAEMON_PORT;
+  } catch {
+    return null;
+  }
 }
 
 /**
- * The local-mode token to present to the daemon, or null.
+ * The local-mode token to present to the daemon at `daemonUrl`, or null.
  *
  * Precedence, and the reasoning behind it:
  *   1. `CODEOID_LOCAL_TOKEN` — an explicit, per-invocation decision.
- *   2. the published token file — written by `codeoid start --local` and
- *      REMOVED on its shutdown, so its presence means "a local-mode daemon is
- *      running on this machine right now". That makes it a stronger signal than
- *      a durable `apiKey` in config.json, which says nothing about the daemon
- *      currently listening. Clients therefore prefer it, and someone who ran
- *      `--local` once for a demo doesn't have to unwind their config to go
- *      back to ZeroID (or vice versa).
+ *   2. the token file published for THAT daemon's port — written by
+ *      `codeoid start --local` and removed on its shutdown, so its presence
+ *      means "a local-mode daemon is listening on this port right now". That
+ *      makes it a stronger signal than a durable `apiKey` in config.json, which
+ *      says nothing about the daemon currently listening. Clients therefore
+ *      prefer it, and someone who ran `--local` once for a demo doesn't have to
+ *      unwind their config to go back to ZeroID (or vice versa).
  *
- * A stale file (left by a crash) fails closed at the daemon's verifier with a
- * message naming the file, rather than silently authenticating as anyone.
+ * Keyed by port so a second local daemon (or a ZeroID daemon) elsewhere on the
+ * machine can neither hijack nor invalidate this lookup.
  */
 export function resolveLocalToken(
+  daemonUrl: string,
   env: Record<string, string | undefined> = process.env,
 ): string | null {
   const fromEnv = env[LOCAL_TOKEN_ENV];
   if (fromEnv && fromEnv.length > 0) return fromEnv;
-  return readLocalTokenFile(getLocalTokenPath());
+  const port = daemonPortFromUrl(daemonUrl);
+  if (!port) return null;
+  return readLocalTokenFile(getLocalTokenPath(port));
 }
 
 /**
