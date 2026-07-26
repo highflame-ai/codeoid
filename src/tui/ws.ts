@@ -8,6 +8,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { PROTOCOL_VERSION } from "../protocol/types.js";
 import type {
   Attachment,
   ClientMessage,
@@ -268,7 +269,17 @@ export class TuiWsClient {
     ws.onopen = () => {
       // A newer connect may have superseded this socket while it was opening.
       if (this.#ws !== ws) return;
-      ws.send(JSON.stringify({ token }));
+      // `type: "auth"` is REQUIRED — the daemon validates this pre-auth frame
+      // against `authMsgSchema` and closes 4001 on anything else. A bare
+      // `{ token }` frame is rejected outright.
+      ws.send(
+        JSON.stringify({
+          type: "auth",
+          token,
+          protocolVersion: PROTOCOL_VERSION,
+          client: "codeoid-tui-ink",
+        }),
+      );
     };
 
     ws.onmessage = (event) => {

@@ -7,6 +7,7 @@
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 import type { CodeoidConfig } from "../config.js";
+import { PROTOCOL_VERSION } from "../protocol/types.js";
 import type {
   ClientMessage,
   CollaborationConfig,
@@ -147,7 +148,18 @@ export class TerminalClient {
       this.#ws = new WebSocket(this.#config.daemonUrl);
 
       this.#ws.onopen = () => {
-        this.#ws!.send(JSON.stringify({ token }));
+        // `type: "auth"` is REQUIRED — the daemon validates the pre-auth frame
+        // against `authMsgSchema` and closes 4001 on anything else. A bare
+        // `{ token }` frame (what this sent before) is rejected outright, which
+        // made every one-shot CLI command fail with "Authentication timeout".
+        this.#ws!.send(
+          JSON.stringify({
+            type: "auth",
+            token,
+            protocolVersion: PROTOCOL_VERSION,
+            client: "codeoid-cli",
+          }),
+        );
       };
 
       this.#ws.onmessage = (event) => {
