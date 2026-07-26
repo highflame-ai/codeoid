@@ -4048,6 +4048,13 @@ export class Session {
    *
    * Uses the tracked `#lastActivityAt` rather than "now" so callers that
    * aren't real activity don't reorder the resumed session list.
+   *
+   * The trailing `.catch(() => {})` is empty by contract, not by omission:
+   * `saveMeta`'s stored write chain owns the exactly-once "meta write failed"
+   * log and still returns a rejecting promise so awaiting callers can react.
+   * Fire-and-forget callers like this one must absorb that rejection (an
+   * unconsumed one is an unhandled-rejection crash under Bun); logging here
+   * would duplicate the message TranscriptStore deliberately emits once.
    */
   #saveMetaNow(): void {
     this.#transcriptStore.saveMeta({
