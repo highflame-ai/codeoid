@@ -16,7 +16,7 @@
  */
 
 import type { CollaborationConfig, CollaborationRole } from "../protocol/types.js";
-import { ORCHESTRATOR_ROLE } from "../protocol/types.js";
+import { LIMITS, ORCHESTRATOR_ROLE } from "../protocol/types.js";
 import { CLAUDE_PROVIDER_ID, resolveModelIdForProvider } from "./models.js";
 
 /** The provider-registry surface this module needs — kept narrow so tests
@@ -45,6 +45,23 @@ export function validateCollaboration(
   const goal = config.goal?.trim();
   if (!goal) return { ok: false, error: "collaboration.goal must not be empty" };
 
+  // Re-check the published bounds here, not only in Zod. Embedded frontends
+  // hold the SessionManager directly and never cross `parseClientMessage`, so
+  // the wire schema is not the only door into this function — and the design's
+  // own rule is that an unenforced field is false security.
+  if (goal.length > LIMITS.COLLABORATION_GOAL_MAX) {
+    return {
+      ok: false,
+      error: `collaboration.goal is ${goal.length} chars — max ${LIMITS.COLLABORATION_GOAL_MAX}`,
+    };
+  }
+  if (config.roles.length > LIMITS.COLLABORATION_ROLES_MAX) {
+    return {
+      ok: false,
+      error: `collaboration has ${config.roles.length} roles — max ${LIMITS.COLLABORATION_ROLES_MAX}`,
+    };
+  }
+
   const roles: CollaborationRole[] = [];
   const seen = new Set<string>();
 
@@ -69,10 +86,23 @@ export function validateCollaboration(
       };
     }
 
+    const count = raw.count ?? 1;
+    if (!Number.isInteger(count) || count < 1) {
+      return { ok: false, error: `Role "${name}" count must be a positive integer` };
+    }
+    if (count > LIMITS.COLLABORATION_ROLE_COUNT_MAX) {
+      return {
+        ok: false,
+        error: `Role "${name}" count is ${count} — max ${LIMITS.COLLABORATION_ROLE_COUNT_MAX}`,
+      };
+    }
+
     // Provider-aware model check. resolveModelIdForProvider returns null for
     // a Claude-shaped value on a non-Claude backend, which is exactly the
     // mistake worth catching at create time ("review on gemini with model
-    // opus") rather than at first turn.
+    // opus") rather than at first turn. It does NOT catch a typo in a
+    // provider-native id — models.ts leaves the backend as the real validator
+    // (a cached catalog goes stale the moment a vendor ships a point release).
     let model: string | undefined;
     if (raw.model !== undefined && raw.model.trim() !== "") {
       const resolved = resolveModelIdForProvider(raw.model, raw.providerId);
@@ -86,10 +116,14 @@ export function validateCollaboration(
     }
 
     roles.push({
-      name,
+      // Store the lowercased name. Matching is case-insensitive everywhere
+      // (uniqueness above, orchestratorRole below), so keeping the caller's
+      // casing would let `ORCHESTRATOR:claude` validate and then miss any
+      // exact-match lookup downstream.
+      name: key,
       providerId: raw.providerId,
       ...(model !== undefined ? { model } : {}),
-      count: raw.count ?? 1,
+      count,
       ...(raw.purpose !== undefined ? { purpose: raw.purpose } : {}),
     });
   }
@@ -132,6 +166,20 @@ export function validateCollaboration(
 }
 
 /**
+ * The orchestrator binding of a validated config.
+ *
+ * Safe to assume present: `validateCollaboration` rejects a config without
+ * exactly one orchestrator, so every `CollaborationConfig` that reaches the
+ * rest of the daemon has one. Matching is case-insensitive to agree with the
+ * validator, even though it also lowercases the stored name.
+ */
+export function orchestratorRole(
+  config: CollaborationConfig,
+): CollaborationRole | undefined {
+  return config.roles.find((r) => r.name.toLowerCase() === ORCHESTRATOR_ROLE);
+}
+
+/**
  * Parse one `--role` CLI spec into a `CollaborationRole`.
  *
  * Format: `name:provider[:model][*count]` — e.g.
@@ -159,6 +207,13 @@ export function parseRoleSpec(spec: string): CollaborationRole {
     }
     count = Number.parseInt(raw, 10);
     if (count < 1) throw new Error(`Invalid count in --role "${spec}" — must be at least 1`);
+    // Bound it here so an over-large fan-out gets this message rather than a
+    // raw schema error from the daemon's wire validation.
+    if (count > LIMITS.COLLABORATION_ROLE_COUNT_MAX) {
+      throw new Error(
+        `Invalid count in --role "${spec}" — max ${LIMITS.COLLABORATION_ROLE_COUNT_MAX}`,
+      );
+    }
     body = body.slice(0, star);
   }
 

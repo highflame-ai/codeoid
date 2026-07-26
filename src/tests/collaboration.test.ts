@@ -16,11 +16,12 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CodeoidConfig } from "../config.js";
 import {
+  orchestratorRole,
   parseRoleSpec,
   validateCollaboration,
   type ProviderLookup,
@@ -32,6 +33,7 @@ import { SessionManager } from "../daemon/session-manager.js";
 import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
 import { ALL_SCOPES } from "../protocol/scopes.js";
+import { LIMITS } from "../protocol/types.js";
 import type {
   AuthContext,
   ClientMessage,
@@ -141,6 +143,53 @@ describe("validateCollaboration", () => {
     const r = ok("g", [{ name: "orchestrator", providerId: "claude", model: "  " }]);
     expect(r.ok).toBe(true);
     if (r.ok) expect(r.config.roles[0]!.model).toBeUndefined();
+  });
+
+  // Stored lowercase so a downstream exact-match lookup can't miss a role
+  // that validated case-insensitively.
+  test("role names are normalized to lowercase", () => {
+    const r = ok("g", [
+      { name: "ORCHESTRATOR", providerId: "claude" },
+      { name: "Review", providerId: "gemini" },
+    ]);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.config.roles.map((x) => x.name)).toEqual(["orchestrator", "review"]);
+    expect(orchestratorRole(r.config)?.providerId).toBe("claude");
+  });
+
+  // The published LIMITS are enforced here too, not only in the wire schema:
+  // embedded frontends hold the SessionManager directly and never cross Zod.
+  test("enforces the published bounds independently of Zod", () => {
+    const many = ok(
+      "g",
+      Array.from({ length: LIMITS.COLLABORATION_ROLES_MAX + 1 }, (_, i) => ({
+        name: `r${i}`,
+        providerId: "gemini",
+      })),
+    );
+    expect(many.ok).toBe(false);
+    if (!many.ok) expect(many.error).toMatch(/roles — max/);
+
+    const big = ok("x".repeat(LIMITS.COLLABORATION_GOAL_MAX + 1), [
+      { name: "orchestrator", providerId: "claude" },
+    ]);
+    expect(big.ok).toBe(false);
+    if (!big.ok) expect(big.error).toMatch(/goal is \d+ chars — max/);
+
+    const fanout = ok("g", [
+      { name: "orchestrator", providerId: "claude" },
+      { name: "review", providerId: "gemini", count: LIMITS.COLLABORATION_ROLE_COUNT_MAX + 1 },
+    ]);
+    expect(fanout.ok).toBe(false);
+    if (!fanout.ok) expect(fanout.error).toMatch(/count is \d+ — max/);
+
+    const frac = ok("g", [
+      { name: "orchestrator", providerId: "claude" },
+      { name: "review", providerId: "gemini", count: 2.5 },
+    ]);
+    expect(frac.ok).toBe(false);
+    if (!frac.ok) expect(frac.error).toMatch(/positive integer/);
   });
 });
 
@@ -331,6 +380,40 @@ describe("session.create --collaborate", () => {
     expect(parsed.roles.map((r) => r.providerId)).toEqual(["claude", "gemini"]);
   });
 
+  // Regression: the status-persist saveMeta rewrites the WHOLE meta file
+  // (writeMetaAtomic serializes + renames, it does not merge), so a field
+  // written only at create time is erased by the first status transition —
+  // and the resume path reads exactly that file. Asserting the create-time
+  // write alone is not enough; this drives a real turn first.
+  test("collaboration survives a status-triggered meta rewrite (resume path)", async () => {
+    const resp = await run({
+      type: "session.create",
+      id: "meta1",
+      name: "collab-meta",
+      workdir,
+      collaboration: VALID,
+    });
+    expect(resp.type).toBe("response.ok");
+    if (resp.type !== "response.ok") return;
+    const id = (resp.data as SessionInfo).id;
+    const metaPath = transcript.metaPath(id);
+
+    await Bun.sleep(250); // the create-time meta write is fire-and-forget
+    const atCreate = JSON.parse(readFileSync(metaPath, "utf-8")) as {
+      collaboration?: CollaborationConfig;
+    };
+    expect(atCreate.collaboration?.goal).toBe(VALID.goal);
+
+    await run({ type: "session.send", id: "meta2", sessionId: id, text: "go" });
+    await Bun.sleep(400);
+
+    const afterTurn = JSON.parse(readFileSync(metaPath, "utf-8")) as {
+      collaboration?: CollaborationConfig;
+    };
+    expect(afterTurn.collaboration?.goal).toBe(VALID.goal);
+    expect(afterTurn.collaboration?.roles).toHaveLength(2);
+  });
+
   test("a normal create leaves collaboration absent and the column NULL", async () => {
     const resp = await run({ type: "session.create", id: "3", name: "plain", workdir });
     expect(resp.type).toBe("response.ok");
@@ -391,5 +474,68 @@ describe("session.create --collaborate fails closed", () => {
     });
     expect(resp.type).toBe("response.error");
     if (resp.type === "response.error") expect(resp.error).toMatch(/got none/);
+  });
+});
+
+// A collaborative session IS its orchestrator, so the claude-only rule has to
+// bind THIS session's backend — not just a config row that nothing runs on.
+describe("the session is its orchestrator", () => {
+  test("providerId is derived from the orchestrator role when omitted", async () => {
+    const resp = await run({
+      type: "session.create",
+      id: "o1",
+      name: "orch1",
+      workdir,
+      collaboration: VALID,
+    });
+    expect(resp.type).toBe("response.ok");
+    if (resp.type === "response.ok") {
+      expect((resp.data as SessionInfo).providerId).toBe("claude");
+    }
+  });
+
+  test("a providerId that contradicts the orchestrator role is rejected", async () => {
+    const resp = await run({
+      type: "session.create",
+      id: "o2",
+      name: "orch2",
+      workdir,
+      providerId: "gemini", // but the orchestrator role says claude
+      collaboration: VALID,
+    });
+    expect(resp.type).toBe("response.error");
+    if (resp.type === "response.error") {
+      expect(resp.code).toBe("invalid_request");
+      expect(resp.error).toMatch(/conflicts with the "orchestrator" role's backend "claude"/);
+    }
+  });
+
+  test("a providerId that agrees with the orchestrator role is accepted", async () => {
+    const resp = await run({
+      type: "session.create",
+      id: "o3",
+      name: "orch3",
+      workdir,
+      providerId: "claude",
+      collaboration: VALID,
+    });
+    expect(resp.type).toBe("response.ok");
+    if (resp.type === "response.ok") {
+      expect((resp.data as SessionInfo).providerId).toBe("claude");
+    }
+  });
+
+  test("a non-collaborative session still honors an explicit providerId", async () => {
+    const resp = await run({
+      type: "session.create",
+      id: "o4",
+      name: "orch4",
+      workdir,
+      providerId: "gemini",
+    });
+    expect(resp.type).toBe("response.ok");
+    if (resp.type === "response.ok") {
+      expect((resp.data as SessionInfo).providerId).toBe("gemini");
+    }
   });
 });

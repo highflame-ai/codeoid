@@ -4061,6 +4061,12 @@ export class Session {
       providerId: this.#provider.id,
       forkedFrom: this.forkedFrom,
       worktree: this.worktree,
+      // MUST be written here too, not only at create: #writeMetaAtomic
+      // serializes the whole object and renames over the file, so any field
+      // omitted from THIS write is erased from the meta the resume path
+      // reads. Leaving it out cost the collaboration on the first status
+      // transition — i.e. on every session that had taken a single turn.
+      collaboration: this.collaboration,
     }).catch(() => {});
   }
 }

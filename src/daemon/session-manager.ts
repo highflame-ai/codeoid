@@ -37,7 +37,7 @@ import {
   resolveAgainstList,
   resolveModelIdForProvider,
 } from "./models.js";
-import { validateCollaboration } from "./collaboration.js";
+import { orchestratorRole, validateCollaboration } from "./collaboration.js";
 import {
   packSession,
   unpackBundle,
@@ -79,6 +79,7 @@ import type { McpRegistry } from "./mcp/registry.js";
 import type { McpHub } from "./mcp/hub.js";
 import { type CodeoidConfig, mutateConfigFile } from "../config.js";
 import type { CompressionRegistry } from "./compress/index.js";
+import { ORCHESTRATOR_ROLE } from "../protocol/types.js";
 import type {
   AuthContext,
   ClientMessage,
@@ -1401,6 +1402,13 @@ mcpHub: this.#mcpHub,
     // reason `providerId` is — a collaboration whose roles silently collapse
     // onto the default backend would be "multi-model" in name only.
     let collaboration: CollaborationConfig | undefined;
+    // The session created here IS the orchestrator (§9: the toggle compiles to
+    // a pack and creates the run). So the backend that must mount the fleet
+    // MCP server is THIS session's — which makes `providerId` the thing the
+    // claude-only orchestrator rule has to agree with. Validating the role
+    // entry alone would leave that rule guarding a config row while the
+    // session actually doing the orchestrating ran on anything at all.
+    let providerId = msg.providerId;
     if (msg.collaboration) {
       const checked = validateCollaboration(msg.collaboration, this.#providers);
       if (!checked.ok) {
@@ -1412,6 +1420,20 @@ mcpHub: this.#mcpHub,
         };
       }
       collaboration = checked.config;
+      const orchestrator = orchestratorRole(collaboration);
+      if (orchestrator) {
+        if (providerId && providerId !== orchestrator.providerId) {
+          return {
+            type: "response.error",
+            requestId: msg.id,
+            error: `providerId "${providerId}" conflicts with the "${ORCHESTRATOR_ROLE}" role's backend "${orchestrator.providerId}" — a collaborative session IS its orchestrator, so omit providerId or set it to "${orchestrator.providerId}".`,
+            code: "invalid_request",
+          };
+        }
+        // Derive it, so the session can't land on a backend that cannot drive
+        // the fleet merely because the caller left providerId unset.
+        providerId = orchestrator.providerId;
+      }
     }
 
     // Ambient pack activation (docs/pack-loading.md): resolve the requested pack
@@ -1435,7 +1457,8 @@ mcpHub: this.#mcpHub,
       transcriptStore: this.#transcriptStore,
       providers: this.#providers,
       hooks: this.#hooks,
-      providerId: msg.providerId,
+      // Derived above for a collaborative session; otherwise msg.providerId.
+      providerId,
       pack,
       collaboration,
       identityManager: this.#identityManager,
@@ -2617,23 +2640,31 @@ mcpHub: this.#mcpHub,
           };
         }
         if (model === undefined) return { ok: true, provider };
-        // Validate the model against THIS provider's catalog (live, persisted,
-        // or fallback) so a typo is caught before the worker spawns. Absent a
-        // catalog for the backend, resolveModelIdForProvider's passthrough
-        // applies and the backend stays the real validator.
+        // Canonicalize the model against THIS provider's catalog when we have
+        // one — that turns a display name ("Opus") into the value the backend
+        // expects, and stops a Claude alias riding onto another vendor.
+        //
+        // It does NOT reject unknown models, and deliberately so: models.ts
+        // sets the house policy ("the live backend is the real validator —
+        // refusing an unknown-but-valid value here is worse than letting the
+        // SDK reject a genuine typo"), because our cached catalog goes stale
+        // the moment a vendor ships a point release. So a typo reaches the
+        // backend and fails there with the vendor's own message.
+        //
+        // An earlier version chained `resolveAgainstList(...) ?? resolveModel-
+        // IdForProvider(...)`, which read as strict validation but could never
+        // reject anything — the fallback's last branch returns the input
+        // unchanged. The dead branch is gone; only the real rule remains.
         const providerId = provider ?? DEFAULT_PROVIDER_ID;
         const { models } = this.#currentModels(providerId);
-        const resolved =
-          models.length > 0
-            ? (resolveAgainstList(model, models) ??
-              resolveModelIdForProvider(model, providerId))
-            : resolveModelIdForProvider(model, providerId);
+        const canonical =
+          models.length > 0 ? resolveAgainstList(model, models) : null;
+        const resolved = canonical ?? resolveModelIdForProvider(model, providerId);
         if (!resolved) {
-          const known = models.map((m) => m.value).join(", ");
-          const available = known ? ` — available: ${known}` : "";
+          // Reachable only for a Claude-shaped model on a non-Claude backend.
           return {
             ok: false,
-            error: `Model "${model}" is not valid for provider "${providerId}"${available}. Omit \`model\` to use the provider's default.`,
+            error: `Model "${model}" is not valid for provider "${providerId}". Omit \`model\` to use the provider's default.`,
           };
         }
         return { ok: true, provider, model: resolved };
