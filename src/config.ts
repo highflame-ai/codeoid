@@ -20,6 +20,11 @@ import { homedir } from "node:os";
 import { z } from "zod";
 import type { AuthConfig } from "./daemon/auth.js";
 import type { OAuthConfig } from "./daemon/oauth.js";
+import {
+  LOCAL_TOKEN_ENV,
+  LOCAL_TOKEN_FILENAME,
+  readLocalTokenFile,
+} from "./daemon/local-auth.js";
 import { HOOK_EVENTS, type HookEntryConfig } from "./daemon/hooks/types.js";
 
 // ── Paths ────────────────────────────────────────────────────────────────
@@ -31,6 +36,35 @@ export function getConfigDir(): string {
   const xdg = process.env.XDG_CONFIG_HOME;
   if (xdg && xdg.length > 0) return join(xdg, "codeoid");
   return DEFAULT_CONFIG_DIR;
+}
+
+/** Where a local-mode daemon publishes its token for clients on this machine. */
+export function getLocalTokenPath(): string {
+  return join(getConfigDir(), LOCAL_TOKEN_FILENAME);
+}
+
+/**
+ * The local-mode token to present to the daemon, or null.
+ *
+ * Precedence, and the reasoning behind it:
+ *   1. `CODEOID_LOCAL_TOKEN` — an explicit, per-invocation decision.
+ *   2. the published token file — written by `codeoid start --local` and
+ *      REMOVED on its shutdown, so its presence means "a local-mode daemon is
+ *      running on this machine right now". That makes it a stronger signal than
+ *      a durable `apiKey` in config.json, which says nothing about the daemon
+ *      currently listening. Clients therefore prefer it, and someone who ran
+ *      `--local` once for a demo doesn't have to unwind their config to go
+ *      back to ZeroID (or vice versa).
+ *
+ * A stale file (left by a crash) fails closed at the daemon's verifier with a
+ * message naming the file, rather than silently authenticating as anyone.
+ */
+export function resolveLocalToken(
+  env: Record<string, string | undefined> = process.env,
+): string | null {
+  const fromEnv = env[LOCAL_TOKEN_ENV];
+  if (fromEnv && fromEnv.length > 0) return fromEnv;
+  return readLocalTokenFile(getLocalTokenPath());
 }
 
 /**

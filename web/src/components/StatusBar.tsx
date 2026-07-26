@@ -47,6 +47,7 @@ const StatusBar: Component = () => {
       <ConnectionPill />
       <Sep />
       <IdentityChip />
+      <LocalModeChip />
       <span class="ml-auto flex items-center gap-3">
         <SessionMetrics />
         <SearchHotkey />
@@ -115,6 +116,33 @@ const IdentityChip: Component = () => {
           </span>
         </button>
       )}
+    </Show>
+  );
+};
+
+/**
+ * Local-mode badge.
+ *
+ * The daemon reports `authMode: "local"` on `auth.ok` when it is running
+ * without ZeroID. Rendering that is not decoration — it is the thing that stops
+ * someone demonstrating an identity-first control plane in the one mode with no
+ * identity. Deliberately styled as a warning and always visible (not a
+ * tooltip-only hint) whenever the posture is degraded.
+ */
+const LocalModeChip: Component = () => {
+  return (
+    <Show when={authIdentity()?.authMode === "local"}>
+      <span
+        class="rounded border border-warn/40 bg-warn/10 px-1.5 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-wide text-warn"
+        title={
+          "LOCAL MODE — this daemon runs without ZeroID.\n" +
+          "The principal is self-asserted: no per-agent identity, no delegation,\n" +
+          "no revocation, and audit attribution is not cryptographic.\n" +
+          "Run `codeoid login` and restart without --local for real identities."
+        }
+      >
+        local mode
+      </span>
     </Show>
   );
 };
@@ -221,18 +249,23 @@ const SettingsButton: Component = () => (
 );
 
 const SignOut: Component = () => {
+  // Nothing to sign out OF in local mode: there is no account, and the daemon
+  // re-hands the page its token on the next load — so the button would
+  // "log you out" and then silently log you back in. Hide it instead.
   return (
-    <button
-      class="text-xs text-fg-faint underline-offset-2 hover:text-fg-muted hover:underline"
-      onClick={() => {
-        forgetApiKey();
-        disconnect();
-        // Force the auth gate to re-render. App.tsx subscribes to
-        // authIdentity() being null, so this triggers automatically.
-      }}
-    >
-      sign out
-    </button>
+    <Show when={authIdentity()?.authMode !== "local"}>
+      <button
+        class="text-xs text-fg-faint underline-offset-2 hover:text-fg-muted hover:underline"
+        onClick={() => {
+          forgetApiKey();
+          disconnect();
+          // Force the auth gate to re-render. App.tsx subscribes to
+          // authIdentity() being null, so this triggers automatically.
+        }}
+      >
+        sign out
+      </button>
+    </Show>
   );
 };
 

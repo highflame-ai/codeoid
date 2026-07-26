@@ -10,7 +10,7 @@
 
 import { Component, Show, createEffect, createSignal, on, onCleanup, onMount } from "solid-js";
 
-import { rememberedApiKey, rememberedOAuthToken } from "./lib/auth";
+import { readLocalModeToken, rememberedApiKey, rememberedOAuthToken } from "./lib/auth";
 import { consumeHandoffCredential, readEmbedAllowedOrigins } from "./lib/handoff";
 import { installEmbedSessionRefresh } from "./lib/embed-refresh";
 import SignIn from "./components/SignIn";
@@ -53,13 +53,19 @@ const App: Component = () => {
 
     const savedKey = rememberedApiKey();
     const savedToken = rememberedOAuthToken();
+    // A daemon in local mode injected its token into this page. That is
+    // authoritative about which credential the daemon will accept, so it beats
+    // everything else — including a stored ZeroID key from a previous session,
+    // which would exchange successfully and then be rejected on the handshake.
+    const localToken = readLocalModeToken();
 
     // A freshly handed-in credential beats a stored one: a handed-in api key
     // exchanges for a fresh JWT; a handed-in token is used directly. Otherwise
     // fall back to the remembered-cred flow — prefer a stored api key exchange
     // (yields a fresh JWT), else let resolveToken use the stored OAuth token.
     let opts: { apiKey?: string; token?: string } | null = null;
-    if (handoff.apiKey) opts = { apiKey: handoff.apiKey };
+    if (localToken) opts = { token: localToken };
+    else if (handoff.apiKey) opts = { apiKey: handoff.apiKey };
     else if (handoff.token) opts = { token: handoff.token };
     else if (savedKey) opts = { apiKey: savedKey };
     else if (savedToken) opts = {};

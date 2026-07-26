@@ -20,6 +20,7 @@ import {
   rememberedOAuthToken,
   fetchOAuthProvider,
   consumeEmbedToken,
+  readLocalModeToken,
   AuthError,
 } from "./auth";
 
@@ -266,5 +267,76 @@ describe("consumeEmbedToken", () => {
     expect(consumeEmbedToken(win)).toBe(false);
     expect(rememberedOAuthToken()).toBeNull();
     expect(replaced).toEqual([]);
+  });
+});
+
+// ── F. Local mode (no ZeroID) ────────────────────────────────────────────────
+
+describe("readLocalModeToken + local-mode precedence", () => {
+  const W = globalThis as { window?: unknown };
+  let savedWindow: unknown;
+
+  beforeEach(() => {
+    savedWindow = W.window;
+    W.window = {};
+  });
+  afterEach(() => {
+    if (savedWindow === undefined) delete W.window;
+    else W.window = savedWindow;
+  });
+
+  function injectLocalToken(token: string): void {
+    (W.window as { __CODEOID_LOCAL_TOKEN__?: string }).__CODEOID_LOCAL_TOKEN__ = token;
+  }
+
+  it("returns null when the daemon injected nothing (ZeroID mode)", () => {
+    expect(readLocalModeToken()).toBeNull();
+  });
+
+  it("ignores a non-string or empty global", () => {
+    (W.window as { __CODEOID_LOCAL_TOKEN__?: unknown }).__CODEOID_LOCAL_TOKEN__ = 42;
+    expect(readLocalModeToken()).toBeNull();
+    (W.window as { __CODEOID_LOCAL_TOKEN__?: unknown }).__CODEOID_LOCAL_TOKEN__ = "";
+    expect(readLocalModeToken()).toBeNull();
+  });
+
+  it("reads the injected token", () => {
+    injectLocalToken("codeoid_local_abc");
+    expect(readLocalModeToken()).toBe("codeoid_local_abc");
+  });
+
+  it("BEATS a stored ZeroID key — the daemon's posture is authoritative", async () => {
+    // Without this precedence the stored key would exchange successfully at
+    // ZeroID and then be rejected on the daemon handshake, dumping the user at
+    // a sign-in screen on a daemon that needs no sign-in.
+    rememberApiKey("zid_sk_stale");
+    injectLocalToken("codeoid_local_wins");
+    mockFetch({ access_token: "should-not-be-used" });
+
+    const result = await resolveToken({});
+    expect(result.token).toBe("codeoid_local_wins");
+    expect(result.exchanged).toBe(false);
+  });
+
+  it("yields to an explicitly supplied token (embed handoff)", async () => {
+    injectLocalToken("codeoid_local_abc");
+    const result = await resolveToken({ token: "explicit-jwt" });
+    expect(result.token).toBe("explicit-jwt");
+  });
+
+  it("accepts a hand-pasted local token verbatim, with no exchange", async () => {
+    // The manual path for a --local daemon on a non-loopback bind, where the
+    // token is deliberately NOT injected into the page.
+    (globalThis as { fetch: unknown }).fetch = async () => {
+      throw new Error("must not attempt a token exchange");
+    };
+    const result = await resolveToken({ apiKey: "codeoid_local_pasted" });
+    expect(result.token).toBe("codeoid_local_pasted");
+    expect(result.exchanged).toBe(false);
+  });
+
+  it("still rejects a credential that is neither a ZeroID key nor a local token", async () => {
+    await expect(resolveToken({ apiKey: "garbage_key" })).rejects.toThrow(AuthError);
+    await expect(resolveToken({ apiKey: "garbage_key" })).rejects.toThrow(/codeoid_local_/);
   });
 });

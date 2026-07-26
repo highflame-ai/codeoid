@@ -82,6 +82,26 @@ export interface ResolvedAuth {
   exchanged: boolean;
 }
 
+/** Prefix on a codeoid local-mode token — never exchanged, presented as-is. */
+export const LOCAL_TOKEN_PREFIX = "codeoid_local_";
+
+/**
+ * The local-mode token the daemon injected into this page, or null.
+ *
+ * A daemon running `codeoid start --local` on a loopback bind publishes its
+ * minted token as a synchronous global in the served `index.html` (the same
+ * channel as the embed allowlist — see src/frontends/web-ui/index.ts), so the
+ * UI connects with no sign-in step. Its presence is also authoritative about
+ * the daemon's posture: only a local-mode daemon ever injects it, so it must
+ * take precedence over any stored ZeroID credential from a previous session —
+ * exchanging that key would succeed at ZeroID and then be rejected here.
+ */
+export function readLocalModeToken(): string | null {
+  if (typeof window === "undefined") return null;
+  const raw = (window as { __CODEOID_LOCAL_TOKEN__?: unknown }).__CODEOID_LOCAL_TOKEN__;
+  return typeof raw === "string" && raw.length > 0 ? raw : null;
+}
+
 export class AuthError extends Error {
   constructor(
     message: string,
@@ -95,6 +115,10 @@ export class AuthError extends Error {
 
 export async function resolveToken(opts: ResolveOptions): Promise<ResolvedAuth> {
   if (opts.token) return { token: opts.token, exchanged: false };
+
+  // Local mode wins over every stored credential — see readLocalModeToken.
+  const injected = readLocalModeToken();
+  if (injected) return { token: injected, exchanged: false };
 
   // After Google OAuth, /auth/callback stores a ZeroID RS256 token directly
   // in localStorage. Use it only when no API key is available (explicit or stored),
@@ -112,9 +136,15 @@ export async function resolveToken(opts: ResolveOptions): Promise<ResolvedAuth> 
       "missing",
     );
   }
+  // A local-mode token is presented verbatim: there is no issuer to exchange it
+  // at. This is the manual path for a `--local` daemon on a non-loopback bind,
+  // where the token is deliberately not injected into the page.
+  if (apiKey.startsWith(LOCAL_TOKEN_PREFIX)) {
+    return { token: apiKey, exchanged: false };
+  }
   if (!apiKey.startsWith("zid_sk_")) {
     throw new AuthError(
-      `api key must start with "zid_sk_" — got "${apiKey.slice(0, 8)}…"`,
+      `api key must start with "zid_sk_" (or "${LOCAL_TOKEN_PREFIX}" for a local-mode daemon) — got "${apiKey.slice(0, 8)}…"`,
       "invalid",
     );
   }

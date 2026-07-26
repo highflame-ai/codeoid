@@ -9,6 +9,7 @@
 
 import type { SessionManager } from "../daemon/session-manager.js";
 import type { AuthConfig } from "../daemon/auth.js";
+import type { TokenVerifier } from "../daemon/verifier.js";
 import type { Store } from "../daemon/store.js";
 import type { Server } from "node:http";
 
@@ -18,8 +19,15 @@ export interface FrontendContext {
   manager: SessionManager;
   /** The shared SQLite store (audit log, session metadata). */
   store: Store;
-  /** ZeroID auth config for token verification. */
+  /** ZeroID auth config — the issuer URL a frontend exchanges keys against. */
   auth: AuthConfig;
+  /**
+   * The daemon's token verifier. A frontend that authenticates its own users
+   * (Telegram) MUST go through this rather than calling `verifyToken` directly,
+   * so it inherits whichever posture the daemon is running in — and can check
+   * `verifier.mode` to refuse a posture it shouldn't be paired with.
+   */
+  verifier: TokenVerifier;
   /** The daemon's HTTP server — frontends can mount routes on it. */
   httpServer: Server;
   /** Daemon host and port (for constructing URLs). */

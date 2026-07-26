@@ -61,6 +61,7 @@ const IdentityDrawer: Component = () => {
             </button>
           </header>
 
+          <LocalModeNotice />
           <ConnectedAs />
           <FrontendInfo />
           <SessionAgent />
@@ -71,6 +72,30 @@ const IdentityDrawer: Component = () => {
     </Show>
   );
 };
+
+/**
+ * Local-mode disclaimer, first thing in the drawer.
+ *
+ * This panel's whole premise is ZeroID provenance. In local mode there is none,
+ * so every field below it is self-asserted — saying so up front is the
+ * difference between an honest surface and a misleading one.
+ */
+const LocalModeNotice: Component = () => (
+  <Show when={authIdentity()?.authMode === "local"}>
+    <div class="mb-4 rounded border border-warn/40 bg-warn/10 p-3 text-[11px] leading-relaxed text-warn">
+      <div class="mb-1 font-semibold uppercase tracking-wider">Local mode — no verified identity</div>
+      This daemon runs without ZeroID, so everything below is{" "}
+      <strong>self-asserted</strong>, not cryptographically verified. Per-agent and
+      sub-agent identities, delegated tokens, scope attenuation, and cascading
+      revocation are all off. The audit log still records every action, but not who
+      it can prove made it.
+      <div class="mt-1.5 text-fg-muted">
+        For real identities: <code class="font-mono">codeoid login</code>, then restart
+        the daemon without <code class="font-mono">--local</code>.
+      </div>
+    </div>
+  </Show>
+);
 
 const Section: Component<{ title: string; children: JSX.Element }> = (props) => (
   <section class="mb-5">

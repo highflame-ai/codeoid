@@ -17,6 +17,7 @@ import type {
   ToolState,
 } from "../protocol/types.js";
 import { ALL_SCOPES_STRING } from "../protocol/scopes.js";
+import { resolveLocalToken } from "../config.js";
 import type { CodeoidConfig } from "../config.js";
 import type { Dispatch } from "react";
 import type { TuiAction } from "./types.js";
@@ -515,10 +516,16 @@ export class TuiWsClient {
   }
 
   async #getToken(): Promise<string> {
+    // Local mode first — see TerminalClient#getToken and config.resolveLocalToken
+    // for why a published local token outranks a durable apiKey.
+    const localToken = resolveLocalToken();
+    if (localToken) return localToken;
+
     const token = this.#config.apiKey;
     if (!token) {
       throw new TokenExchangeError(
-        "No API key configured. Set CODEOID_API_KEY or add apiKey to ~/.codeoid/config.json.",
+        "No API key configured. Set CODEOID_API_KEY or add apiKey to ~/.codeoid/config.json, " +
+          "run `codeoid login`, or start the daemon with `codeoid start --local` to try it with no account.",
         false,
       );
     }

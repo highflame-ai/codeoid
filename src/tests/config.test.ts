@@ -8,7 +8,12 @@ import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadConfig, resolveZeroidUrl } from "../config.js";
+import { getLocalTokenPath, loadConfig, resolveLocalToken, resolveZeroidUrl } from "../config.js";
+import {
+  mintLocalToken,
+  removeLocalTokenFile,
+  writeLocalTokenFile,
+} from "../daemon/local-auth.js";
 
 let tmp: string;
 let configPath: string;
@@ -494,5 +499,59 @@ describe("loadConfig — mcpServers registry", () => {
   it("defaults to an empty registry when omitted", () => {
     writeConfig({});
     expect(loadConfig({ configPath, env: {} }).mcpServers).toEqual({});
+  });
+});
+
+describe("resolveLocalToken — client-side local-mode discovery", () => {
+  // Precedence exists so `codeoid start --local` + `codeoid tui` needs zero
+  // setup, AND so someone who ran --local once for a demo isn't stuck: the
+  // published file is removed when that daemon shuts down, so it only outranks
+  // a durable apiKey while a local daemon is actually listening.
+  const XDG = "XDG_CONFIG_HOME";
+  let prevXdg: string | undefined;
+
+  beforeEach(() => {
+    prevXdg = process.env[XDG];
+    process.env[XDG] = tmp; // getConfigDir() → <tmp>/codeoid
+  });
+  afterEach(() => {
+    if (prevXdg === undefined) delete process.env[XDG];
+    else process.env[XDG] = prevXdg;
+  });
+
+  it("is null when no local daemon has published a token", () => {
+    expect(resolveLocalToken({})).toBeNull();
+  });
+
+  it("reads the token a local daemon published", () => {
+    const token = mintLocalToken();
+    writeLocalTokenFile(getLocalTokenPath(), token);
+    expect(resolveLocalToken({})).toBe(token);
+  });
+
+  it("prefers CODEOID_LOCAL_TOKEN over the published file", () => {
+    writeLocalTokenFile(getLocalTokenPath(), mintLocalToken());
+    expect(resolveLocalToken({ CODEOID_LOCAL_TOKEN: "codeoid_local_pinned" })).toBe(
+      "codeoid_local_pinned",
+    );
+  });
+
+  it("ignores an empty env override", () => {
+    const token = mintLocalToken();
+    writeLocalTokenFile(getLocalTokenPath(), token);
+    expect(resolveLocalToken({ CODEOID_LOCAL_TOKEN: "" })).toBe(token);
+  });
+
+  it("goes back to null once the daemon removes its token on shutdown", () => {
+    const path = getLocalTokenPath();
+    writeLocalTokenFile(path, mintLocalToken());
+    removeLocalTokenFile(path);
+    // This is what makes the precedence safe: no lingering credential means a
+    // ZeroID client is never hijacked by a stale local token.
+    expect(resolveLocalToken({})).toBeNull();
+  });
+
+  it("honours XDG_CONFIG_HOME for the token path", () => {
+    expect(getLocalTokenPath()).toBe(join(tmp, "codeoid", "local-token"));
   });
 });
