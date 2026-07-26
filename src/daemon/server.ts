@@ -157,6 +157,9 @@ export class DaemonServer {
   #mcpRegistry: McpRegistry | null = null;
   #mcpHub: McpHub | null = null;
   #bunServer: ReturnType<typeof Bun.serve> | null = null;
+  /** Capabilities advertised on auth.ok — SERVER_CAPABILITIES plus PUSH when a
+   *  push transport is configured, so clients can feature-detect push support. */
+  #advertisedCapabilities: string[];
   #sockets = new Map<string, AuthenticatedSocket>();
   #frontends: Frontend[] = [];
   #httpHandlers: Array<(req: IncomingMessage, res: ServerResponse) => boolean> = [];
@@ -164,6 +167,10 @@ export class DaemonServer {
 
   constructor(config: DaemonConfig) {
     this.#config = config;
+    const pushOn = (config.fullConfig?.push?.transport ?? "none") !== "none";
+    this.#advertisedCapabilities = pushOn
+      ? [...SERVER_CAPABILITIES, CAPABILITIES.PUSH]
+      : SERVER_CAPABILITIES;
     this.#store = new Store(config.dbPath);
     this.#transcriptStore = new TranscriptStore(config.transcriptDir);
     this.#shutdown = new ShutdownManager();
@@ -565,7 +572,7 @@ export class DaemonServer {
               },
               scopes: data.auth.scopes,
               protocolVersion: PROTOCOL_VERSION,
-              capabilities: SERVER_CAPABILITIES,
+              capabilities: self.#advertisedCapabilities,
               // Registered backends, default first — feeds the new-session
               // provider picker (see AuthOkMsg.providers).
               providers: self.#manager.providerIds(),

@@ -5,7 +5,7 @@
  */
 
 import { Database } from "bun:sqlite";
-import type { ModelInfo, SessionInfo, SessionStatus } from "../protocol/types.js";
+import type { ModelInfo, PushPlatform, SessionInfo, SessionStatus } from "../protocol/types.js";
 
 // ── Dispatch queue types (P4) ─────────────────────────────────────────────
 
@@ -197,6 +197,23 @@ export class Store {
       );
       CREATE INDEX IF NOT EXISTS idx_session_pins_session ON session_pins(session_id);
 
+      -- Device push registrations, keyed by the owner's ZeroID identity
+      -- (owner_sub == sessions.created_by == AuthContext.sub), tenant-scoped by
+      -- account/project. NOT session-scoped: a device registers once and is
+      -- notified for any of that owner's sessions that block on approval. The
+      -- token is the opaque transport token (an Expo push token today).
+      CREATE TABLE IF NOT EXISTS push_registrations (
+        token       TEXT PRIMARY KEY,
+        platform    TEXT NOT NULL,
+        owner_sub   TEXT NOT NULL,
+        account_id  TEXT NOT NULL,
+        project_id  TEXT NOT NULL,
+        created_at  INTEGER NOT NULL,
+        last_seen   INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS idx_push_reg_owner
+        ON push_registrations(owner_sub, account_id, project_id);
+
       -- Last live model catalog per provider (claude, gemini, openai, ...),
       -- as reported by that provider's backend. Served as the models.list
       -- fallback on boots where no session has run a turn yet, so the picker
@@ -344,6 +361,61 @@ export class Store {
       )
       .all(sessionId) as Array<{ file_path: string }>;
     return rows.map((r) => r.file_path);
+  }
+
+  // ── Push registrations ────────────────────────────────────────────────
+
+  /**
+   * Register (or refresh) a device token for an owner. Re-registering the same
+   * token updates its owner/tenant/last_seen — a physical device maps to one
+   * token, and a token can only belong to whoever last registered it.
+   */
+  registerPush(
+    token: string,
+    platform: PushPlatform,
+    ownerSub: string,
+    accountId: string,
+    projectId: string,
+  ): void {
+    const now = Date.now();
+    this.#db
+      .prepare(
+        `INSERT INTO push_registrations
+           (token, platform, owner_sub, account_id, project_id, created_at, last_seen)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(token) DO UPDATE SET
+           platform = excluded.platform,
+           owner_sub = excluded.owner_sub,
+           account_id = excluded.account_id,
+           project_id = excluded.project_id,
+           last_seen = excluded.last_seen`,
+      )
+      .run(token, platform, ownerSub, accountId, projectId, now, now);
+  }
+
+  /**
+   * Remove a device token — owner-scoped so a client can only unregister its
+   * own device, never another user's token.
+   */
+  unregisterPush(token: string, ownerSub: string): void {
+    this.#db
+      .prepare("DELETE FROM push_registrations WHERE token = ? AND owner_sub = ?")
+      .run(token, ownerSub);
+  }
+
+  /** Device tokens to notify for a given owner within a tenant. */
+  listPushForOwner(
+    ownerSub: string,
+    accountId: string,
+    projectId: string,
+  ): Array<{ token: string; platform: PushPlatform }> {
+    const rows = this.#db
+      .prepare(
+        `SELECT token, platform FROM push_registrations
+         WHERE owner_sub = ? AND account_id = ? AND project_id = ?`,
+      )
+      .all(ownerSub, accountId, projectId) as Array<{ token: string; platform: PushPlatform }>;
+    return rows;
   }
 
   // ── Sessions ──────────────────────────────────────────────────────────
