@@ -125,6 +125,9 @@ export function validateCollaboration(
       ...(model !== undefined ? { model } : {}),
       count,
       ...(raw.purpose !== undefined ? { purpose: raw.purpose } : {}),
+      // Normalize to an explicit boolean so downstream code never has to
+      // re-decide what "absent" means for write authority.
+      write: raw.write === true,
     });
   }
 
@@ -177,6 +180,160 @@ export function orchestratorRole(
   config: CollaborationConfig,
 ): CollaborationRole | undefined {
   return config.roles.find((r) => r.name.toLowerCase() === ORCHESTRATOR_ROLE);
+}
+
+// ── Role → children (P1b) ───────────────────────────────────────────────────
+
+/**
+ * Ceiling on the total children one collaboration may bring up.
+ *
+ * The per-role and per-collaboration schema bounds multiply: 15 worker roles
+ * × 8 fan-out is 120 live agent subprocesses from a single `session.create`.
+ * The real concurrency governor is the live-worker cap in P3; this is the
+ * blast-radius backstop that must exist BEFORE anything spawns, because
+ * without it one create request can exhaust the machine.
+ */
+export const MAX_COLLABORATION_CHILDREN = 12;
+
+/** One child to bring up: a role instance bound to a backend. */
+export interface PlannedChild {
+  roleName: string;
+  /** 1-based index within this role's fan-out (`review` ×3 → 1, 2, 3). */
+  ordinal: number;
+  providerId: string;
+  model?: string;
+  /** Dispatch worker shape, derived from the role's write authority. */
+  shape: "ship" | "scout";
+  write: boolean;
+  purpose?: string;
+}
+
+/**
+ * Flatten a validated config into the children to spawn.
+ *
+ * The orchestrator is deliberately EXCLUDED: the collaborative session itself
+ * is the orchestrator (that is why `#create` derives its provider from this
+ * role), so spawning a child for it would double it.
+ *
+ * Fails rather than truncating when the total exceeds the ceiling — silently
+ * dropping roles would give the caller a collaboration quietly missing a
+ * reviewer, which is worse than a clear rejection.
+ */
+export function planChildren(
+  config: CollaborationConfig,
+):
+  | { ok: true; children: PlannedChild[] }
+  | { ok: false; error: string } {
+  const children: PlannedChild[] = [];
+  for (const role of config.roles) {
+    if (role.name.toLowerCase() === ORCHESTRATOR_ROLE) continue;
+    const count = role.count ?? 1;
+    for (let ordinal = 1; ordinal <= count; ordinal++) {
+      children.push({
+        roleName: role.name,
+        ordinal,
+        providerId: role.providerId,
+        ...(role.model !== undefined ? { model: role.model } : {}),
+        // scout holds no tools:write — see WORKER_SCOPE_PROFILES. This is the
+        // enforcement behind §6's "a reviewer that provably cannot write".
+        shape: role.write === true ? "ship" : "scout",
+        write: role.write === true,
+        ...(role.purpose !== undefined ? { purpose: role.purpose } : {}),
+      });
+    }
+  }
+  if (children.length > MAX_COLLABORATION_CHILDREN) {
+    return {
+      ok: false,
+      error: `Collaboration would spawn ${children.length} children — max ${MAX_COLLABORATION_CHILDREN}. Reduce role count or fan-out.`,
+    };
+  }
+  return { ok: true, children };
+}
+
+/** Stable display name for a child session. */
+export function childSessionName(parentName: string, child: PlannedChild): string {
+  const suffix = child.ordinal > 1 ? `-${child.ordinal}` : "";
+  return `${parentName}:${child.roleName}${suffix}`;
+}
+
+/**
+ * The goal brief handed to a role-child on spawn.
+ *
+ * Deliberately narrow. A child is told its goal, its role, and its contract —
+ * never how the other roles are doing, and never the orchestrator's
+ * reasoning. §6's independence property depends on a reviewer not seeing the
+ * implementer's thinking, and the cheapest way to honor that is to not put it
+ * in the brief in the first place. Structured handoffs arrive through the
+ * blackboard in the next phase, scoped per role.
+ */
+export function childBrief(
+  config: CollaborationConfig,
+  child: PlannedChild,
+): string {
+  const contract = child.write
+    ? "You MAY modify files in your workdir. Keep the diff minimal and verify your work."
+    : "You are READ-ONLY: your identity holds no write scope, so file edits will be denied. Investigate and report — your written findings are the deliverable.";
+  return [
+    `<collaboration role="${child.roleName}"${child.ordinal > 1 ? ` member="${child.ordinal}"` : ""}>`,
+    `You are the "${child.roleName}" role in a collaborative session working one shared goal.`,
+    child.purpose ? `Your purpose: ${child.purpose}` : null,
+    contract,
+    "You are one of several agents on this goal, possibly on different model backends. You cannot see the others' work or the orchestrator's reasoning — that is deliberate, so your contribution stays independent.",
+    "Wait for instructions from the orchestrator before acting; it will send you a specific task.",
+    "</collaboration>",
+    "",
+    `GOAL: ${config.goal}`,
+  ]
+    .filter((l) => l !== null)
+    .join("\n");
+}
+
+/**
+ * Compile a collaboration into the ephemeral one-goal pack activation the
+ * orchestrator session runs under (§9: the toggle "compiles to an ephemeral
+ * one-goal pack" and pack vocabulary stays hidden on this path).
+ *
+ * `id` is synthetic and never installed on disk — it exists so `SessionInfo.
+ * profile` reads sensibly and so the pipeline machinery, which already keys
+ * off an activation, needs no special case for collaborations.
+ */
+export function compileGoalPack(
+  config: CollaborationConfig,
+  children: readonly PlannedChild[],
+): { id: string; constitution: string; subagents: [] } {
+  const roster = children
+    .map(
+      (c) =>
+        `- ${c.roleName}${c.ordinal > 1 ? ` #${c.ordinal}` : ""} — ${c.providerId}${c.model ? `/${c.model}` : ""}, ${c.write ? "may write" : "read-only"}`,
+    )
+    .join("\n");
+  return {
+    id: "collaboration",
+    constitution: [
+      "# Collaborative session",
+      "",
+      "You are the ORCHESTRATOR of a collaborative session working ONE goal:",
+      "",
+      config.goal,
+      "",
+      "## Your role",
+      "",
+      "You plan, delegate, and synthesize. You do NOT do the work yourself — that is what your role-children are for.",
+      "Direct them with the fleet tools; each dispatch needs the owner's approval, and the owner sees your exact tool input first.",
+      "",
+      "## Your fleet",
+      "",
+      roster || "(no role-children — this collaboration declared only an orchestrator)",
+      "",
+      "## Rules",
+      "",
+      "- A read-only child CANNOT edit files; its identity holds no write scope. Don't ask it to.",
+      "- Children cannot see each other's work or your reasoning. When a role needs another's output, you pass it deliberately.",
+      "- Reviewers must stay independent: give them the change and the goal, never the implementer's reasoning or another reviewer's findings.",
+    ].join("\n"),
+    subagents: [],
+  };
 }
 
 /**

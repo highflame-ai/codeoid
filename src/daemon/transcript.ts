@@ -19,6 +19,7 @@ import { join } from "node:path";
 import type {
   CollaborationConfig,
   DaemonMessage,
+  SessionInfo,
   SessionMessage,
   SessionStatus,
   SessionWorktree,
@@ -109,6 +110,13 @@ export interface TranscriptMeta {
    * because meta is what the resume path actually reads.
    */
   collaboration?: CollaborationConfig;
+  /**
+   * Which collaboration + role this session serves, when it is a child.
+   * Written in BOTH saveMeta calls (create and status-persist) — meta is a
+   * whole-file overwrite, so a field present in only one of them is erased by
+   * the first status transition.
+   */
+  collaborationRole?: SessionInfo["collaborationRole"];
 }
 
 /** Types we persist. Skip ephemeral events like heartbeats. */

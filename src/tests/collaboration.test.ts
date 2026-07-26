@@ -23,6 +23,7 @@ import type { CodeoidConfig } from "../config.js";
 import {
   orchestratorRole,
   parseRoleSpec,
+  planChildren,
   validateCollaboration,
   type ProviderLookup,
 } from "../daemon/collaboration.js";
@@ -32,6 +33,7 @@ import type { ProviderEvent } from "../daemon/providers/interface.js";
 import { SessionManager } from "../daemon/session-manager.js";
 import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
+import { roleDeniesTool } from "../daemon/providers/tool-safety.js";
 import { ALL_SCOPES } from "../protocol/scopes.js";
 import { LIMITS } from "../protocol/types.js";
 import type {
@@ -332,6 +334,11 @@ afterEach(async () => {
   try {
     await manager.drain(3_000);
   } catch {}
+  // Let in-flight fire-and-forget meta writes land before the tmp dir goes
+  // away. Without this, tearing down a collaboration's children races their
+  // own meta writes and floods the output with ENOENT rename warnings that
+  // would mask a real failure.
+  await Bun.sleep(150);
   rmSync(tmp, { recursive: true, force: true });
 });
 
@@ -474,6 +481,262 @@ describe("session.create --collaborate fails closed", () => {
     });
     expect(resp.type).toBe("response.error");
     if (resp.type === "response.error") expect(resp.error).toMatch(/got none/);
+  });
+});
+
+// ── 4. Role children (P1b) ──────────────────────────────────────────────────
+
+/** Every live session for this tenant, parent + children. */
+async function allSessions(): Promise<SessionInfo[]> {
+  const resp = await run({ type: "session.list", id: `ls-${Math.random()}` });
+  return (resp as { sessions: SessionInfo[] }).sessions;
+}
+
+const childrenOf = (all: SessionInfo[], parentId: string) =>
+  all
+    .filter((s) => s.collaborationRole?.parentSessionId === parentId)
+    .sort((a, b) =>
+      `${a.collaborationRole?.roleName}${a.collaborationRole?.ordinal}`.localeCompare(
+        `${b.collaborationRole?.roleName}${b.collaborationRole?.ordinal}`,
+      ),
+    );
+
+describe("planChildren", () => {
+  test("excludes the orchestrator — the session itself plays that role", () => {
+    const r = validateCollaboration(
+      { goal: "g", roles: [{ name: "orchestrator", providerId: "claude" }] },
+      LOOKUP,
+    );
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    const plan = planChildren(r.config);
+    expect(plan.ok).toBe(true);
+    if (plan.ok) expect(plan.children).toHaveLength(0);
+  });
+
+  test("expands fan-out into ordinals", () => {
+    const r = validateCollaboration(
+      {
+        goal: "g",
+        roles: [
+          { name: "orchestrator", providerId: "claude" },
+          { name: "review", providerId: "gemini", count: 3 },
+        ],
+      },
+      LOOKUP,
+    );
+    if (!r.ok) throw new Error(r.error);
+    const plan = planChildren(r.config);
+    if (!plan.ok) throw new Error(plan.error);
+    expect(plan.children.map((c) => c.ordinal)).toEqual([1, 2, 3]);
+    expect(plan.children.every((c) => c.roleName === "review")).toBe(true);
+  });
+
+  // Least privilege: absent `write` means the child's identity carries no
+  // write scope at all, which is what makes §6's reviewer guarantee real.
+  test("defaults a role to the read-only scout shape", () => {
+    const r = validateCollaboration(
+      {
+        goal: "g",
+        roles: [
+          { name: "orchestrator", providerId: "claude" },
+          { name: "review", providerId: "gemini" },
+          { name: "reasoning", providerId: "openai", write: true },
+        ],
+      },
+      LOOKUP,
+    );
+    if (!r.ok) throw new Error(r.error);
+    const plan = planChildren(r.config);
+    if (!plan.ok) throw new Error(plan.error);
+    const byRole = Object.fromEntries(plan.children.map((c) => [c.roleName, c]));
+    expect(byRole.review!.shape).toBe("scout");
+    expect(byRole.review!.write).toBe(false);
+    expect(byRole.reasoning!.shape).toBe("ship");
+    expect(byRole.reasoning!.write).toBe(true);
+  });
+
+  // Rejects rather than truncating: a collaboration quietly missing a reviewer
+  // is worse than one that refused to start.
+  test("rejects a fan-out over the child ceiling instead of truncating", () => {
+    const r = validateCollaboration(
+      {
+        goal: "g",
+        roles: [
+          { name: "orchestrator", providerId: "claude" },
+          { name: "a", providerId: "gemini", count: 8 },
+          { name: "b", providerId: "openai", count: 8 },
+        ],
+      },
+      LOOKUP,
+    );
+    if (!r.ok) throw new Error(r.error);
+    const plan = planChildren(r.config);
+    expect(plan.ok).toBe(false);
+    if (!plan.ok) {
+      expect(plan.error).toMatch(/would spawn 16 children — max 12/);
+    }
+  });
+});
+
+// The security claim in §6 is that a reviewer *provably* cannot write, not
+// that it was asked not to. Two independent mechanisms back that, so assert
+// the envelope actually denies rather than trusting the shape label.
+describe("read-only roles are enforced, not requested", () => {
+  const envelopeFor = (write: boolean) => ({
+    write,
+    network: "read-only" as const,
+    envelope: "all" as const,
+  });
+
+  test("the envelope built for a read-only role denies every write tool", () => {
+    const readOnly = envelopeFor(false);
+    for (const tool of ["Write", "Edit", "MultiEdit", "NotebookEdit"]) {
+      expect(roleDeniesTool(readOnly, tool)).toMatch(/read-only/);
+    }
+  });
+
+  test("it still permits reads and the web tools a search role needs", () => {
+    const readOnly = envelopeFor(false);
+    for (const tool of ["Read", "Grep", "Glob", "Bash", "WebSearch", "WebFetch"]) {
+      expect(roleDeniesTool(readOnly, tool)).toBeNull();
+    }
+  });
+
+  test("a write role is permitted the write tools", () => {
+    const writer = envelopeFor(true);
+    for (const tool of ["Write", "Edit"]) {
+      expect(roleDeniesTool(writer, tool)).toBeNull();
+    }
+  });
+});
+
+describe("collaboration children come up and are torn down", () => {
+  const THREE: CollaborationConfig = {
+    goal: "Add rate limiting to the public API",
+    roles: [
+      { name: "orchestrator", providerId: "claude" },
+      { name: "reasoning", providerId: "claude", write: true },
+      { name: "review", providerId: "gemini", count: 2 },
+    ],
+  };
+
+  test("children spawn on their own bound backends", async () => {
+    const resp = await run({
+      type: "session.create",
+      id: "c1",
+      name: "collab",
+      workdir,
+      collaboration: THREE,
+    });
+    expect(resp.type).toBe("response.ok");
+    if (resp.type !== "response.ok") return;
+    const parent = resp.data as SessionInfo;
+
+    const kids = childrenOf(await allSessions(), parent.id);
+    expect(kids).toHaveLength(3); // reasoning ×1 + review ×2, orchestrator excluded
+    expect(kids.map((k) => k.collaborationRole!.roleName)).toEqual([
+      "reasoning",
+      "review",
+      "review",
+    ]);
+    // The whole point: each child is on the backend its role named.
+    expect(kids.map((k) => k.providerId)).toEqual(["claude", "gemini", "gemini"]);
+    expect(kids.map((k) => k.collaborationRole!.ordinal)).toEqual([1, 1, 2]);
+    // Write authority is per role, and read-only is the default.
+    expect(kids.map((k) => k.collaborationRole!.write)).toEqual([true, false, false]);
+    // Children are workers, so they can never see or direct the fleet.
+    expect(kids.every((k) => k.role === "worker")).toBe(true);
+  });
+
+  test("the parent runs under the compiled one-goal pack", async () => {
+    const resp = await run({
+      type: "session.create",
+      id: "c2",
+      name: "collab2",
+      workdir,
+      collaboration: THREE,
+    });
+    expect(resp.type).toBe("response.ok");
+    if (resp.type !== "response.ok") return;
+    // Compiled, not installed — pack vocabulary stays hidden on this path.
+    expect((resp.data as SessionInfo).profile).toBe("collaboration");
+  });
+
+  test("destroying the parent tears down every child", async () => {
+    const resp = await run({
+      type: "session.create",
+      id: "c3",
+      name: "collab3",
+      workdir,
+      collaboration: THREE,
+    });
+    expect(resp.type).toBe("response.ok");
+    if (resp.type !== "response.ok") return;
+    const parent = resp.data as SessionInfo;
+    expect(childrenOf(await allSessions(), parent.id)).toHaveLength(3);
+
+    const destroyed = await run({
+      type: "session.destroy",
+      id: "c3d",
+      sessionId: parent.id,
+    });
+    expect(destroyed.type).toBe("response.ok");
+
+    const after = await allSessions();
+    expect(childrenOf(after, parent.id)).toHaveLength(0);
+    expect(after.find((s) => s.id === parent.id)).toBeUndefined();
+  });
+
+  test("a collaboration with only an orchestrator spawns nothing", async () => {
+    const resp = await run({
+      type: "session.create",
+      id: "c4",
+      name: "collab4",
+      workdir,
+      collaboration: { goal: "g", roles: [{ name: "orchestrator", providerId: "claude" }] },
+    });
+    expect(resp.type).toBe("response.ok");
+    if (resp.type !== "response.ok") return;
+    expect(childrenOf(await allSessions(), (resp.data as SessionInfo).id)).toHaveLength(0);
+  });
+
+  test("collaboration and pack are mutually exclusive", async () => {
+    const resp = await run({
+      type: "session.create",
+      id: "c5",
+      name: "collab5",
+      workdir,
+      collaboration: THREE,
+      pack: "some-pack",
+    });
+    expect(resp.type).toBe("response.error");
+    if (resp.type === "response.error") {
+      expect(resp.code).toBe("invalid_request");
+      expect(resp.error).toMatch(/mutually exclusive/);
+    }
+  });
+
+  test("an over-ceiling fan-out is rejected before anything is created", async () => {
+    const before = (await allSessions()).length;
+    const resp = await run({
+      type: "session.create",
+      id: "c6",
+      name: "collab6",
+      workdir,
+      collaboration: {
+        goal: "g",
+        roles: [
+          { name: "orchestrator", providerId: "claude" },
+          { name: "a", providerId: "gemini", count: 8 },
+          { name: "b", providerId: "gemini", count: 8 },
+        ],
+      },
+    });
+    expect(resp.type).toBe("response.error");
+    if (resp.type === "response.error") expect(resp.error).toMatch(/max 12/);
+    // Nothing half-built.
+    expect((await allSessions()).length).toBe(before);
   });
 });
 

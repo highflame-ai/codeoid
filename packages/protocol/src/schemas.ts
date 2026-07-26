@@ -44,6 +44,8 @@ export const collaborationRoleSchema = z.object({
   model: z.string().max(LIMITS.MODEL_MAX).optional(),
   count: z.number().int().min(1).max(LIMITS.COLLABORATION_ROLE_COUNT_MAX).optional(),
   purpose: z.string().max(500).optional(),
+  /** Opt-in write authority. Absent = read-only (least privilege). */
+  write: z.boolean().optional(),
 });
 
 export const collaborationConfigSchema = z.object({
