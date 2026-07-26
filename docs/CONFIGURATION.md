@@ -72,6 +72,11 @@ CODEOID_LOCAL_TOKEN=                    # daemon: use this instead of minting on
                                         # Clients otherwise read ~/.codeoid/local-token-<port>,
                                         #   which a `--local` daemon publishes while it runs.
 
+# Session limits — UNLIMITED by default (0). Running many sessions in parallel
+# is the point; set these only for a shared multi-user daemon.
+CODEOID_MAX_SESSIONS_PER_USER=0         # concurrent sessions per subject (0 = unlimited)
+CODEOID_MAX_SESSIONS_PER_HOUR=0         # session creations per subject per hour (0 = unlimited)
+
 # Daemon
 CODEOID_DAEMON_URL=ws://127.0.0.1:7400  # (for CLI + TUI client)
 CODEOID_DB_PATH=~/.codeoid/codeoid.db   # SQLite path

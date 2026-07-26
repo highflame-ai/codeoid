@@ -134,8 +134,11 @@ indefinitely with up to 5-minute backoff.
 Sessions drained (in-flight work interrupted), store flushed, WebSockets closed,
 frontends stopped. 30-second grace period before forced exit.
 
-**Rate limiting**: per-user limits on concurrent sessions (default 10) and hourly
-creation rate (default 30/hr). Sliding window with automatic pruning.
+**Session limits**: none by default — parallel sessions are the point, so
+`rateLimit.maxSessionsPerUser` and `rateLimit.maxCreationsPerHour` both default
+to `0` (unlimited). Set them for a shared multi-user daemon. Automated spawning
+is bounded where it originates instead (`dispatch.maxConcurrentWorkers`,
+`workerToolBudget`, `failureLimit`).
 
 **Permission correlation**: each approval request has a unique `approvalId`.
 Clients respond referencing the specific request. Multiple concurrent approvals

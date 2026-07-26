@@ -9,12 +9,17 @@
 import { Database } from "bun:sqlite";
 import type { PipelineState } from "./interface";
 import { ACTIVE_STATUSES } from "./interface";
+import { BUSY_TIMEOUT_MS } from "../store.js";
 
 export class PipelineStore {
   #db: Database;
 
   constructor(db: Database | string) {
     this.#db = typeof db === "string" ? new Database(db, { create: true }) : db;
+    // Before any lock-taking statement — SQLite's default is fail-instantly.
+    // See BUSY_TIMEOUT_MS in ../store.ts. Harmless when `db` is the daemon's
+    // shared connection (which already set it); required when it's our own.
+    this.#db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
     this.#db.exec("PRAGMA journal_mode = WAL");
     this.#db.exec("PRAGMA synchronous = NORMAL");
     this.#migrate();

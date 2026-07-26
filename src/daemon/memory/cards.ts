@@ -20,6 +20,7 @@
 
 import { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
+import { BUSY_TIMEOUT_MS } from "../store.js";
 
 export interface SessionCard {
   sessionId: string;
@@ -92,6 +93,9 @@ export class SessionCardStore {
 
   constructor(dbPath: string) {
     this.#db = new Database(dbPath, { create: true });
+    // Before any lock-taking statement — SQLite's default is fail-instantly.
+    // See BUSY_TIMEOUT_MS in ../store.ts for why every writable store sets it.
+    this.#db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
     this.#db.exec("PRAGMA journal_mode = WAL");
     this.#db.exec("PRAGMA synchronous = NORMAL");
     this.#migrate();

@@ -113,20 +113,98 @@ function rowToDispatchTask(r: RawDispatchRow): DispatchTaskRow {
   };
 }
 
+/**
+ * How long SQLite waits for a lock before giving up, on every writable store.
+ *
+ * SQLite defaults this to 0, which means "fail instantly" — a design that only
+ * makes sense for a single-connection process. codeoid has several connections
+ * (sessions store, memory store, memory cards, an optional second daemon) over
+ * WAL databases, so brief contention is normal and instant failure is not.
+ * 5s is far longer than any lock this daemon holds and far shorter than a user
+ * would wait before assuming a hang.
+ */
+export const BUSY_TIMEOUT_MS = 5_000;
+
+/** Bounded retry budget for the journal-mode switch. 20 × 25ms = 500ms. */
+const WAL_RETRY_ATTEMPTS = 20;
+const WAL_RETRY_SLEEP_MS = 25;
+
+/**
+ * Switch a database to WAL, tolerating a concurrent switch by another process.
+ *
+ * `busy_timeout` does NOT cover this: SQLite returns SQLITE_BUSY from a
+ * `journal_mode` change *without* invoking the busy handler, because the
+ * conflict is another connection's lock on the database header rather than an
+ * ordinary write contention. So two daemons cold-starting the same fresh
+ * database still raced here even with a timeout set — reproduced as 1 failure
+ * in 12 concurrent starts.
+ *
+ * Retry briefly, and treat "someone else already made it WAL" as success —
+ * which is the only thing we actually cared about. Sleeps are synchronous, but
+ * this runs once at construction (before the daemon serves anything) and the
+ * whole budget is half a second.
+ */
+function enableWalWithRetry(db: Database, dbPath: string): void {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < WAL_RETRY_ATTEMPTS; attempt++) {
+    try {
+      db.exec("PRAGMA journal_mode = WAL");
+    } catch (err) {
+      lastErr = err;
+    }
+    // Authoritative check either way: another process switching it concurrently
+    // is a success for us, and a silent no-op would otherwise go unnoticed.
+    const row = db.prepare("PRAGMA journal_mode").get() as
+      | { journal_mode?: string }
+      | null;
+    if (row?.journal_mode?.toLowerCase() === "wal") return;
+    Bun.sleepSync(WAL_RETRY_SLEEP_MS);
+  }
+  const because = lastErr instanceof Error ? `: ${lastErr.message}` : "";
+  throw new Error(
+    `could not switch ${dbPath} to WAL journal mode after ${WAL_RETRY_ATTEMPTS} attempts${because}`,
+  );
+}
+
 export class Store {
   #db: Database;
 
   constructor(dbPath: string) {
-    this.#db = new Database(dbPath, { create: true });
-    this.#db.exec("PRAGMA journal_mode = WAL");
-    // Under WAL the default is synchronous=FULL, which fsyncs the WAL on every
-    // commit. audit() is a synchronous write on the hot path (fires per tool
-    // call / attach / send), so FULL stalls the event loop. NORMAL only syncs
-    // at checkpoints — safe under WAL (worst case loses the last few committed
-    // txns on OS crash, never corruption). Matches the memory store.
-    this.#db.exec("PRAGMA synchronous = NORMAL");
-    this.#db.exec("PRAGMA foreign_keys = ON");
-    this.#migrate();
+    try {
+      this.#db = new Database(dbPath, { create: true });
+      // FIRST statement, before anything that can take a lock. SQLite's default
+      // busy_timeout is 0 — it fails INSTANTLY on contention rather than
+      // waiting. `journal_mode = WAL` below needs a brief exclusive lock when it
+      // CHANGES the mode, so two daemons initializing the same fresh database
+      // raced and the loser died at construction with a raw
+      // `SQLiteError: database is locked` stack trace before it could even
+      // report which file was at fault. A timeout makes SQLite retry internally
+      // — for the pragma here and for every statement for the process lifetime.
+      this.#db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
+      enableWalWithRetry(this.#db, dbPath);
+      // Under WAL the default is synchronous=FULL, which fsyncs the WAL on every
+      // commit. audit() is a synchronous write on the hot path (fires per tool
+      // call / attach / send), so FULL stalls the event loop. NORMAL only syncs
+      // at checkpoints — safe under WAL (worst case loses the last few committed
+      // txns on OS crash, never corruption). Matches the memory store.
+      this.#db.exec("PRAGMA synchronous = NORMAL");
+      this.#db.exec("PRAGMA foreign_keys = ON");
+      this.#migrate();
+    } catch (err) {
+      // Opening the store is the daemon's first real action, so a failure here
+      // is the user's first impression. Say which file and what to do about it
+      // instead of surfacing a bare driver error from a constructor.
+      const detail = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        [
+          `Cannot open the codeoid database at ${dbPath}: ${detail}`,
+          "  • another codeoid daemon may already be running — check with: ps aux | grep codeoid",
+          "  • to run a second daemon independently, give it its own data dir: XDG_CONFIG_HOME=... codeoid start",
+          "  • if no daemon is running, check the file's permissions and free disk space",
+        ].join("\n"),
+        { cause: err },
+      );
+    }
   }
 
   /** The underlying connection — shared with sibling stores in the same daemon
@@ -135,7 +213,29 @@ export class Store {
     return this.#db;
   }
 
+  /**
+   * Run the schema migration under a single IMMEDIATE transaction.
+   *
+   * Two daemons can initialize the same database concurrently (a shared config
+   * dir, two ports), and the `#addColumnIfMissing` steps are check-then-act —
+   * `PRAGMA table_info` then `ALTER TABLE`. Without a write lock held across
+   * BOTH halves, each process reads "column missing" and the second `ALTER`
+   * dies with `duplicate column name: model`. Reproduced in 4 of 8 concurrent
+   * cold starts before this wrapper existed.
+   *
+   * IMMEDIATE, not deferred: it takes the write lock at BEGIN, *before* the
+   * first read, so there is no window between the check and the act. The loser
+   * blocks (that's what `busy_timeout` is for — the two fixes compose), then
+   * re-reads a fully migrated schema and every step no-ops.
+   *
+   * `journal_mode` is deliberately NOT in here — SQLite cannot change it inside
+   * a transaction, which is why the caller runs it first.
+   */
   #migrate(): void {
+    this.#db.transaction(() => this.#migrateInTransaction()).immediate();
+  }
+
+  #migrateInTransaction(): void {
     this.#db.exec(`
       CREATE TABLE IF NOT EXISTS sessions (
         id          TEXT PRIMARY KEY,

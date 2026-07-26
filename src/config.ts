@@ -412,6 +412,27 @@ const OAuthSchemaFields = z
  * autonomously up to `workerToolBudget` tool calls, then wedge safely (the
  * lease reclaims them).
  */
+/**
+ * Per-subject session limits. BOTH DEFAULT TO 0 = UNLIMITED.
+ *
+ * codeoid's normal shape is one operator driving many parallel worktrees, and a
+ * hardcoded cap (this used to be 10 concurrent / 30 per hour, unconfigurable)
+ * trips over that — the README's own hero shot runs 12 sessions. The runaway
+ * case is bounded where it actually originates instead, by `dispatch`'s
+ * maxConcurrentWorkers / workerToolBudget / failureLimit.
+ *
+ * Kept configurable for a shared multi-user daemon, where a per-subject bound
+ * is a reasonable thing to want. See src/daemon/rate-limit.ts.
+ */
+const RateLimitSchema = z
+  .object({
+    /** Sessions alive at once per subject. 0 = unlimited. */
+    maxSessionsPerUser: z.number().int().min(0).default(0),
+    /** Session creations per subject per hour. 0 = unlimited. */
+    maxCreationsPerHour: z.number().int().min(0).default(0),
+  })
+  .default({ maxSessionsPerUser: 0, maxCreationsPerHour: 0 });
+
 const DispatchSchema = z
   .object({
     enabled: z.boolean().default(true),
@@ -663,6 +684,7 @@ const RootSchema = z.object({
   session: SessionSchema,
   conductor: ConductorSchema,
   dispatch: DispatchSchema,
+  rateLimit: RateLimitSchema,
   pipeline: PipelineSchema,
   providers: ProvidersSchema,
   mcpServers: McpServersSchema,
@@ -790,6 +812,16 @@ export interface CodeoidConfig {
    * configs stay minimal; loadConfig always populates it. Absent = enabled
    * with defaults.
    */
+  /**
+   * Per-subject session limits. Both default to 0 = unlimited (see
+   * RateLimitSchema); set them only for a shared multi-user daemon. Optional in
+   * the type so hand-built test configs stay minimal; loadConfig always
+   * populates it.
+   */
+  rateLimit?: {
+    maxSessionsPerUser: number;
+    maxCreationsPerHour: number;
+  };
   dispatch?: {
     enabled: boolean;
     tickMs: number;
@@ -923,6 +955,8 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   // without touching config.json. Other dispatch knobs are file-config only,
   // matching the conductor block's convention.
   { env: "CODEOID_DISPATCH_ENABLED", path: "dispatch.enabled", kind: "boolean" },
+  { env: "CODEOID_MAX_SESSIONS_PER_USER", path: "rateLimit.maxSessionsPerUser", kind: "int" },
+  { env: "CODEOID_MAX_SESSIONS_PER_HOUR", path: "rateLimit.maxCreationsPerHour", kind: "int" },
   // Pipeline enable/kill switch — turn the SDLC pipeline on/off per-invocation
   // without touching config.json (on by default; set false to opt out). Other
   // pipeline knobs are file-config only, matching the dispatch/conductor convention.
@@ -1132,6 +1166,7 @@ export function loadConfig(opts: LoadOptions = {}): CodeoidConfig {
     session: parsed.session,
     conductor: parsed.conductor,
     dispatch: parsed.dispatch,
+    rateLimit: parsed.rateLimit,
     pipeline: parsed.pipeline,
     providers: parsed.providers,
     mcpServers: parsed.mcpServers,

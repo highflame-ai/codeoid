@@ -360,6 +360,26 @@ export class SessionManager {
   }
 
   /**
+   * How many sessions this subject currently has alive.
+   *
+   * The authoritative source for the concurrent-session limit. Derived from the
+   * live map on every check rather than tracked in a counter, because a counter
+   * got both of its edges wrong: resumed sessions never re-registered (so a
+   * restart reset the allowance) and three of the four session-removal paths
+   * never decremented (so it drifted upward until restart). Reading the map
+   * cannot do either. O(sessions) on a session-create — negligible next to
+   * spawning an agent, and skipped entirely when limits are off (the default).
+   */
+  #liveSessionCountFor(sub: string): number {
+    if (this.#rateLimiter.disabled) return 0;
+    let n = 0;
+    for (const session of this.#sessions.values()) {
+      if (session.createdBy === sub) n++;
+    }
+    return n;
+  }
+
+  /**
    * Registered provider ids, default first — advertised on `auth.ok` so
    * clients can populate the new-session provider picker.
    */
@@ -811,7 +831,7 @@ mcpHub: this.#mcpHub,
     // Same per-user rate limit as session.create — import allocates a
     // fresh Session, SDK identity, and DB rows. Without this gate a
     // tight loop of inline imports OOMs the daemon.
-    const rateCheck = this.#rateLimiter.check(auth.sub);
+    const rateCheck = this.#rateLimiter.check(auth.sub, this.#liveSessionCountFor(auth.sub));
     if (!rateCheck.allowed) {
       return {
         type: "response.error",
@@ -1391,7 +1411,7 @@ mcpHub: this.#mcpHub,
     }
 
     // Rate limit check
-    const rateCheck = this.#rateLimiter.check(auth.sub);
+    const rateCheck = this.#rateLimiter.check(auth.sub, this.#liveSessionCountFor(auth.sub));
     if (!rateCheck.allowed) {
       return { type: "response.error", requestId: msg.id, error: rateCheck.reason, code: "rate_limited" };
     }
@@ -1545,7 +1565,7 @@ mcpHub: this.#mcpHub,
       };
     }
 
-    const rateCheck = this.#rateLimiter.check(auth.sub);
+    const rateCheck = this.#rateLimiter.check(auth.sub, this.#liveSessionCountFor(auth.sub));
     if (!rateCheck.allowed) {
       return { type: "response.error", requestId: msg.id, error: rateCheck.reason, code: "rate_limited" };
     }
@@ -1755,7 +1775,7 @@ mcpHub: this.#mcpHub,
       return { type: "response.ok", requestId: msg.id, data: existing.toInfo() };
     }
 
-    const rateCheck = this.#rateLimiter.check(auth.sub);
+    const rateCheck = this.#rateLimiter.check(auth.sub, this.#liveSessionCountFor(auth.sub));
     if (!rateCheck.allowed) {
       return { type: "response.error", requestId: msg.id, error: rateCheck.reason, code: "rate_limited" };
     }
@@ -3380,7 +3400,6 @@ mcpHub: this.#mcpHub,
     // the new session.
     await session.destroy(auth);
     this.#sessions.delete(msg.sessionId);
-    this.#rateLimiter.recordDestruction(auth.sub);
     return { type: "response.ok", requestId: msg.id };
   }
 

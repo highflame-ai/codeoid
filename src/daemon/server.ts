@@ -277,7 +277,16 @@ export class DaemonServer {
       console.log(`[codeoid] hooks: ${hooks.size} configured`);
     }
 
-    const rateLimiter = new RateLimiter();
+    // Unlimited unless the operator configured a bound — see rate-limit.ts for
+    // why a hardcoded cap was the wrong default for a single-operator daemon.
+    const rateLimiter = new RateLimiter(config.fullConfig?.rateLimit);
+    if (config.fullConfig?.rateLimit && !rateLimiter.disabled) {
+      const { maxSessionsPerUser, maxCreationsPerHour } = config.fullConfig.rateLimit;
+      console.log(
+        `[codeoid] session limits: ${maxSessionsPerUser || "unlimited"} concurrent, ` +
+          `${maxCreationsPerHour || "unlimited"}/hr per subject`,
+      );
+    }
     this.#manager = new SessionManager(
       this.#store, this.#transcriptStore, identityManager, rateLimiter,
       // Memory is wired post-construction via initMemory() — see start()

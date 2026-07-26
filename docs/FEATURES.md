@@ -370,7 +370,7 @@ Thinking content and sub-agent tool calls surface as separate italic messages. S
 | **Retry with fallback model** | Exponential backoff with jitter, 429/529/5xx categorization, falls back to cheaper model after 3 capacity failures. |
 | **Graceful shutdown** | LIFO cleanup registry with 30s grace. SIGTERM / SIGINT / SIGHUP handlers drain sessions before closing the store. |
 | **Session resume** | JSONL transcripts per session; user prompts written BEFORE API calls. On daemon restart, sessions rebuild from transcript; `#hasQueried` flag ensures Claude Code's own session store is reused via `resume` instead of re-creating. |
-| **Rate limiting** | Per-user sliding window: max 10 concurrent sessions, 30 creations/hour. |
+| **Session limits** | **None by default** — running many sessions in parallel is the point. `rateLimit.maxSessionsPerUser` / `rateLimit.maxCreationsPerHour` default to `0` (unlimited); set either for a shared multi-user daemon. Automated spawning is bounded at its source by `dispatch.maxConcurrentWorkers`. |
 | **Tool approval correlation** | Each approval request has a unique `approvalId`; first response wins; multiple concurrent approvals supported. |
 | **Subprocess stderr capture** | Claude Code subprocess stderr is piped into the daemon log so SDK-level failures are debuggable. |
 | **Keep-warm interrupt** | Interrupt (Esc / `⏹` / `Ctrl-X`) stops the in-flight turn via the SDK's `Query.interrupt()` — it reaps the running tool but keeps the backing session alive, so your next message continues on the same context. No re-`query()`, no resume handshake. Claude Code parity. |
