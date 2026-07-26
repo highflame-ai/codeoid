@@ -3185,6 +3185,18 @@ mcpHub: this.#mcpHub,
         code: "invalid_request",
       };
     }
+    // Same reservation #create enforces: a normal session named "conductor"
+    // shadows the singleton in session.list and makes findByName (a first-match
+    // scan) insertion-order dependent. Enforcing it only on create left the
+    // hazard reachable by renaming into the name instead (#257).
+    if (trimmed === this.#conductorName()) {
+      return {
+        type: "response.error",
+        requestId: msg.id,
+        error: `"${trimmed}" is reserved for the conductor session`,
+        code: "invalid_request",
+      };
+    }
     const session = this.#getOwnedSession(msg.sessionId, auth);
     if (!session) {
       return {
@@ -3192,6 +3204,19 @@ mcpHub: this.#mcpHub,
         requestId: msg.id,
         error: "Session not found",
         code: "not_found",
+      };
+    }
+    // The inverse: the conductor's name is config-derived (#conductorName), so
+    // renaming it away from that value orphans it — it would no longer match
+    // its own reservation, and the next conductor lookup/creation would see the
+    // name as free.
+    if (session.role === "conductor") {
+      return {
+        type: "response.error",
+        requestId: msg.id,
+        error:
+          "The conductor session cannot be renamed — its name comes from config.conductor.name",
+        code: "invalid_request",
       };
     }
     session.rename(trimmed, auth);

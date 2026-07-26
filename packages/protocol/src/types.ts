@@ -894,11 +894,16 @@ export interface SessionForkMsg extends BaseClientMsg {
 }
 
 /**
- * Rename a session. Daemon updates `SessionInfo.name` in-memory + in the
- * transcript store and broadcasts `session.info_update` so every attached
- * client refreshes its tab label. The sessionId is stable — callers can
- * keep using it. Rejected with `invalid_request` if `name` is empty or
- * whitespace-only.
+ * Rename a session. The daemon updates `SessionInfo.name` in memory, writes it
+ * through to BOTH the sessions row and the transcript meta (so it survives a
+ * daemon restart even if the session is idle), and broadcasts
+ * `session.info_update` so every attached client refreshes its tab label. The
+ * sessionId is stable — callers can keep using it.
+ *
+ * Requires the `session:approve` scope. Rejected with `invalid_request` if
+ * `name` is empty or whitespace-only, if it collides with the conductor's
+ * reserved name (`config.conductor.name`), or if the target is the conductor
+ * session itself.
  */
 export interface SessionRenameMsg extends BaseClientMsg {
   type: "session.rename";
