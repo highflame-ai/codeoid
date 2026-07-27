@@ -23,7 +23,7 @@ import { createPushTransport, PushService } from "./push/index.js";
 import { hasScope, SCOPES } from "../protocol/scopes.js";
 import { applyPatches, getManifest, getSnapshot } from "./settings/store.js";
 import { RateLimiter } from "./rate-limit.js";
-import type { TranscriptStore } from "./transcript.js";
+import type { TranscriptMeta, TranscriptStore } from "./transcript.js";
 import {
   FsAccessError,
   handleFsBrowseDir,
@@ -39,14 +39,17 @@ import {
   resolveModelIdForProvider,
 } from "./models.js";
 import { Blackboard, type OwnerBlackboard } from "./blackboard/service.js";
-import { BlackboardStore } from "./blackboard/store.js";
+import { BlackboardStore, type GoalScope } from "./blackboard/store.js";
 import { BlackboardMcpHttp } from "./blackboard/mcp-http.js";
 import {
   childBrief,
   childSessionName,
   compileGoalPack,
   orchestratorRole,
+  orphanedChildBrief,
   planChildren,
+  plannedChildFor,
+  roleChildPosture,
   validateCollaboration,
   type PlannedChild,
 } from "./collaboration.js";
@@ -103,6 +106,7 @@ import type {
   PipelinePhaseWire,
   PipelineWire,
   SessionInfo,
+  SessionMode,
   SessionWorktree,
 } from "../protocol/types.js";
 import type { Scope } from "../protocol/scopes.js";
@@ -459,9 +463,20 @@ export class SessionManager {
       (a, b) => resumeSortKey(b) - resumeSortKey(a),
     );
     const capped = sorted.slice(0, RESUME_MAX_SESSIONS);
+    // Goal config by orchestrator session id, built from EVERY meta on disk
+    // rather than from `capped`. A child inside this boot's resume window whose
+    // orchestrator fell outside it still needs its restrictions and its brief,
+    // and the blackboard is keyed on (tenant, goal id) in SQLite — so the
+    // child's mount works whether or not the orchestrator object is resident.
+    const goalConfigs = new Map<string, CollaborationConfig>();
+    for (const m of allMetas) {
+      if (m.collaboration) goalConfigs.set(m.sessionId, m.collaboration);
+    }
     const deadline = Date.now() + RESUME_DEADLINE_MS;
     let resumed = 0;
     let skippedDeadline = 0;
+    let resumedChildren = 0;
+    let orphanedChildren = 0;
 
     for (let i = 0; i < capped.length; i++) {
       // Time-box: a few huge transcripts shouldn't wedge startup. Stop and
@@ -472,6 +487,14 @@ export class SessionManager {
       }
       const meta = capped[i]!;
       try {
+        // Role-children need their restrictions rebuilt BEFORE construction —
+        // worker shape and capability role are constructor inputs, not things
+        // that can be attached afterwards.
+        const child = this.#resumeRoleChild(meta, goalConfigs);
+        if (child) {
+          if (child.orphaned) orphanedChildren++;
+          else resumedChildren++;
+        }
         const session = new Session({
           name: meta.sessionName,
           // Heal a workdir persisted with a literal `~` or one that has since
@@ -508,6 +531,10 @@ mcpHub: this.#mcpHub,
           // its role→backend bindings must come back after a restart or the
           // orchestrator resumes with no idea what it was coordinating.
           collaboration: meta.collaboration,
+          // ...and the same is true of a CHILD's restrictions. Spread after
+          // `role` so the worker role from the posture wins over `meta.role`
+          // (they agree — both are "worker" — but the posture is the authority).
+          ...(child?.options ?? {}),
           defaultModel:
             meta.role === "conductor" ? this.#config?.conductor?.model : undefined,
           fleet:
@@ -536,6 +563,17 @@ mcpHub: this.#mcpHub,
         });
 
         this.#sessions.set(session.id, session);
+        // Track a resumed child's mount so teardown revokes it. Without this a
+        // restart leaks one still-valid blackboard credential per child on
+        // every boot, and destroying the goal would not revoke them.
+        if (child?.options.blackboardMcp) {
+          this.#blackboardTokens.set(session.id, child.options.blackboardMcp.token);
+        }
+        // An orchestrator's own mount is scoped to its own id, so it can only
+        // be attached now — exactly as on the create path.
+        if (meta.collaboration) {
+          this.#attachOrchestratorBlackboard(session, meta.collaboration);
+        }
         // Resume is NOT a creation — don't burn a slot in the
         // per-user concurrency cap. Otherwise restarting with N
         // persisted sessions saturates the limit on the spot and the
@@ -554,8 +592,118 @@ mcpHub: this.#mcpHub,
         `[codeoid] resume: restored ${resumed} of ${sorted.length} session(s); ${droppedCap} left over the ${RESUME_MAX_SESSIONS}-session cap, ${skippedDeadline} skipped past the ${RESUME_DEADLINE_MS}ms deadline (still on disk; loadable on a future restart).`,
       );
     }
+    if (resumedChildren > 0) {
+      console.log(
+        `[codeoid] resume: ${resumedChildren} collaboration role-child(ren) restored with their role scoping + goal blackboard`,
+      );
+    }
+    // Loud, because it is the one path where a role-child comes back WITHOUT
+    // its goal: its restrictions hold, but it cannot coordinate, and a silent
+    // degrade would look identical to a healthy fleet in the session list.
+    if (orphanedChildren > 0) {
+      console.warn(
+        `[codeoid] resume: ${orphanedChildren} role-child(ren) had no recoverable goal config — restored read-only-as-configured, with no blackboard mount and no autonomous budget`,
+      );
+    }
 
     return resumed;
+  }
+
+  /**
+   * Rebuild a role-child's restrictions from disk, or `undefined` when this
+   * meta isn't a role-child at all.
+   *
+   * Why this exists: `collaborationRole` was persisted from the first day of
+   * P1b, and resume read `meta.collaboration` while silently ignoring it. The
+   * visible symptom was cosmetic (children detached from their parent in the
+   * session list). The real one was not — a resumed child came back with:
+   *
+   *   - no `workerShape`, so its next turn registered a FULL session agent
+   *     instead of a scope-capped `scout` leaf (`#ensureAgentIdentity`);
+   *   - no capability role, so `roleDeniesTool` had nothing to deny with and a
+   *     read-only reviewer's write tools degraded from denied to merely asked;
+   *   - no blackboard mount, so it could not publish a handoff; and
+   *   - no autonomous budget, so it came back `guarded` — which, with nobody
+   *     ever attached to a child, parks it at `waiting_approval` forever on its
+   *     first non-safe tool call. The fleet looked alive and was dead.
+   *
+   * Nothing about a child needs a new persisted field: its identity
+   * (`collaborationRole`) plus its goal's config reproduces the plan it spawned
+   * under, via `plannedChildFor`.
+   */
+  #resumeRoleChild(
+    meta: TranscriptMeta,
+    goalConfigs: ReadonlyMap<string, CollaborationConfig>,
+  ):
+    | {
+        orphaned: boolean;
+        options: {
+          role: "worker";
+          workerShape: "ship" | "scout";
+          pack: ReturnType<typeof roleChildPosture>["pack"];
+          collaborationRole: ReturnType<typeof roleChildPosture>["collaborationRole"];
+          initialMode?: { mode: SessionMode; maxTurns?: number };
+          blackboardMcp?: { url: string; token: string };
+        };
+      }
+    | undefined {
+    const role = meta.collaborationRole;
+    if (!role) return undefined;
+
+    const collaboration = goalConfigs.get(role.parentSessionId);
+    const planned = collaboration
+      ? plannedChildFor(collaboration, role.roleName, role.ordinal)
+      : undefined;
+
+    if (!collaboration || !planned) {
+      // Torn state: the child's transcript survived while its orchestrator's
+      // did not (teardown removes both). Restore the FENCE from what the child
+      // itself carries — `write` is on `collaborationRole` — and nothing else.
+      // Deliberately no autonomous budget: an agent that cannot coordinate
+      // should not be able to burn turns unattended.
+      return {
+        orphaned: true,
+        options: roleChildPosture(
+          {
+            roleName: role.roleName,
+            ordinal: role.ordinal,
+            providerId: meta.providerId ?? "claude",
+            shape: role.write ? "ship" : "scout",
+            write: role.write,
+          },
+          role.parentSessionId,
+          orphanedChildBrief(role.roleName, role.write),
+        ),
+      };
+    }
+
+    return {
+      orphaned: false,
+      options: {
+        ...roleChildPosture(planned, role.parentSessionId, childBrief(collaboration, planned)),
+        // Re-armed per boot, not persisted: the budget is a per-stretch-of-work
+        // allowance, and carrying a spent one across a restart would resume a
+        // child with zero turns left.
+        initialMode: {
+          mode: "autonomous",
+          maxTurns: this.#dispatcher.config.workerToolBudget,
+        },
+        // Scoped to the child's OWN tenant plus its goal id. Same authorSub the
+        // pre-restart versions carry, so its history stays one contributor.
+        ...(() => {
+          const mount = this.#blackboardMountFor(
+            {
+              accountId: meta.accountId,
+              projectId: meta.projectId,
+              goalSessionId: role.parentSessionId,
+            },
+            planned,
+            collaboration.roles.find((r) => r.name === role.roleName),
+          );
+          return mount ? { blackboardMcp: mount } : {};
+        })(),
+      },
+    };
   }
 
   /**
@@ -1482,6 +1630,15 @@ mcpHub: this.#mcpHub,
   }
 
   /**
+   * Unscoped session lookup — tests only, and named so a production call site
+   * is obvious in review. Everything user-facing must go through
+   * `#getOwnedSession`, which gates on tenancy.
+   */
+  _sessionForTest(id: string): Session | undefined {
+    return this.#sessions.get(id);
+  }
+
+  /**
    * The URL a role-child mounts the blackboard from. Loopback regardless of the
    * daemon's bind address — the agent subprocess runs on this host, and the
    * endpoint must not become reachable off-box merely because the daemon binds
@@ -1737,30 +1894,7 @@ mcpHub: this.#mcpHub,
     this.#sessions.set(session.id, session);
     this.#rateLimiter.recordCreation(auth.sub);
 
-    // The orchestrator needs the blackboard too, and needs it MOST: §4 has it
-    // holding the index of artifact states, and §7 has it reading every
-    // reviewer's findings to synthesize. Without a mount it cannot see a
-    // single thing its children publish, and the coordination loop never
-    // closes. Attached here rather than passed to the constructor because the
-    // goal id it is scoped to IS this session's id.
-    if (collaboration) {
-      const orchestrator = orchestratorRole(collaboration);
-      const mount = this.#blackboardMountFor(
-        session,
-        {
-          roleName: ORCHESTRATOR_ROLE,
-          ordinal: 1,
-          providerId: session.providerId,
-          shape: "scout",
-          write: false,
-        },
-        orchestrator,
-      );
-      if (mount) {
-        session.attachBlackboard(mount);
-        this.#blackboardTokens.set(session.id, mount.token);
-      }
-    }
+    if (collaboration) this.#attachOrchestratorBlackboard(session, collaboration);
 
     if (collaboration && planned.length > 0) {
       const spawned = await this.#spawnCollaborationChildren(session, collaboration, planned, auth);
@@ -1845,30 +1979,70 @@ mcpHub: this.#mcpHub,
    *
    * The minted token carries the role's scope, so the child's mount is its
    * permission — there is no wider handle reachable from it.
+   *
+   * Takes the goal SCOPE rather than a live parent `Session` so the resume path
+   * can mint a mount without one. The blackboard is keyed on
+   * (tenant, goalSessionId) in SQLite, so a child's access to its goal does not
+   * depend on the orchestrator object being resident — which matters because
+   * resume is capped and time-boxed, and a parent can legitimately miss the
+   * window its own children made.
    */
   #blackboardMountFor(
-    parent: Session,
+    scope: GoalScope,
     child: PlannedChild,
     role: CollaborationRole | undefined,
   ): { url: string; token: string } | undefined {
     if (!this.#blackboardUrl) return undefined;
     const handle = this.#goalBlackboard().forRole(
-      {
-        accountId: parent.accountId,
-        projectId: parent.projectId,
-        goalSessionId: parent.id,
-      },
+      scope,
       {
         roleName: child.roleName,
         ordinal: child.ordinal,
         // Attribution keyed to the ROLE within the goal, not the child's
         // session id: a role-child replaced after a restart is still the same
         // contributor, and its earlier artifacts should keep reading that way.
-        authorSub: `agent:${parent.id}:${child.roleName}#${child.ordinal}`,
+        // That property is what makes resume work at all — a resumed child
+        // writes under the authorSub its pre-restart versions carry.
+        authorSub: `agent:${scope.goalSessionId}:${child.roleName}#${child.ordinal}`,
       },
       role ? { reads: role.reads, writes: role.writes } : undefined,
     );
     return { url: this.#blackboardUrl, token: this.#blackboardMcp.mint(handle) };
+  }
+
+  /**
+   * Give an orchestrator its own blackboard mount.
+   *
+   * The orchestrator needs the blackboard MOST: §4 has it holding the index of
+   * artifact states, and §7 has it reading every reviewer's findings to
+   * synthesize. Without a mount it cannot see a single thing its children
+   * publish and the coordination loop never closes.
+   *
+   * Called post-construction in both `#create` and resume, because the goal id
+   * it is scoped to IS this session's own id.
+   */
+  #attachOrchestratorBlackboard(
+    session: Session,
+    collaboration: CollaborationConfig,
+  ): void {
+    const mount = this.#blackboardMountFor(
+      {
+        accountId: session.accountId,
+        projectId: session.projectId,
+        goalSessionId: session.id,
+      },
+      {
+        roleName: ORCHESTRATOR_ROLE,
+        ordinal: 1,
+        providerId: session.providerId,
+        shape: "scout",
+        write: false,
+      },
+      orchestratorRole(collaboration),
+    );
+    if (!mount) return;
+    session.attachBlackboard(mount);
+    this.#blackboardTokens.set(session.id, mount.token);
   }
 
   async #spawnCollaborationChildren(
@@ -1882,7 +2056,11 @@ mcpHub: this.#mcpHub,
         // Minted before construction so the child's provider can mount it from
         // the start — the token carries this role's read/write scope.
         const blackboard = this.#blackboardMountFor(
-          parent,
+          {
+            accountId: parent.accountId,
+            projectId: parent.projectId,
+            goalSessionId: parent.id,
+          },
           child,
           collaboration.roles.find((r) => r.name === child.roleName),
         );
@@ -1896,36 +2074,10 @@ mcpHub: this.#mcpHub,
           hooks: this.#hooks,
           providerId: child.providerId,
           defaultModel: child.model,
-          role: "worker",
-          // The enforcement behind §6: a read-only role becomes a "scout",
-          // whose LEAF identity profile carries no tools:write at all, so it
-          // cannot mint write authority even via a sub-agent.
-          workerShape: child.shape,
-          // ...and the same restriction at the canUseTool fence, where
-          // roleDeniesTool turns `write: false` into a hard tool deny
-          // (Claude-hard; advisory + logged on backends whose tools don't all
-          // route through the gate — see roleEnforcement).
-          pack: {
-            id: "collaboration",
-            constitution: childBrief(collaboration, child),
-            role: {
-              name: child.roleName,
-              write: child.write,
-              // Not `false`: §3 gives the search role web access, and
-              // roleDeniesTool only denies network tools on an explicit false.
-              // Per-role network gating is a later phase.
-              network: "read-only",
-              envelope: "all",
-            },
-            roleName: child.roleName,
-            subagents: [],
-          },
-          collaborationRole: {
-            parentSessionId: parent.id,
-            roleName: child.roleName,
-            ordinal: child.ordinal,
-            write: child.write,
-          },
+          // Worker shape, capability role, brief, and collaborationRole — the
+          // whole restriction set, from the one function the resume path also
+          // calls so the two can't drift.
+          ...roleChildPosture(child, parent.id, childBrief(collaboration, child)),
           // Autonomous with a bounded budget — the same posture dispatch gives
           // its workers, and for the same reason: NOBODY ATTACHES TO A CHILD.
           // The owner's approval happens once at dispatch time (the R3 gate on

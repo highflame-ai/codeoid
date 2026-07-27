@@ -22,9 +22,13 @@ import { join } from "node:path";
 import type { CodeoidConfig } from "../config.js";
 import {
   orchestratorRole,
+  orphanedChildBrief,
   parseRoleSpec,
   planChildren,
+  plannedChildFor,
+  roleChildPosture,
   validateCollaboration,
+  type PlannedChild,
   type ProviderLookup,
 } from "../daemon/collaboration.js";
 import { MockSessionProvider, mockResult } from "../daemon/providers/mock/session-provider.js";
@@ -1102,3 +1106,315 @@ describe("blackboard.index / blackboard.read", () => {
     expect(resp.code).toBe("not_found");
   });
 });
+
+// ── Resume: the child's restrictions are DERIVED, never re-invented ──────────
+
+// The security property lives in this pair of pure functions, so it is pinned
+// here rather than only through a manager. `plannedChildFor` is implemented by
+// calling `planChildren` precisely so a resumed child cannot compute a
+// different shape than the one it spawned under — and the direction that drift
+// fails is a read-only reviewer coming back able to write.
+describe("plannedChildFor", () => {
+  const CONFIG: CollaborationConfig = {
+    goal: "g",
+    roles: [
+      { name: "orchestrator", providerId: "claude" },
+      { name: "review", providerId: "gemini", count: 3, write: false },
+      { name: "reasoning", providerId: "openai", write: true, model: "gpt-5-codex" },
+    ],
+  };
+
+  test("reproduces exactly what planChildren produced, member for member", () => {
+    const planned = planChildren(CONFIG);
+    expect(planned.ok).toBe(true);
+    if (!planned.ok) return;
+    for (const child of planned.children) {
+      expect(plannedChildFor(CONFIG, child.roleName, child.ordinal)).toEqual(child);
+    }
+  });
+
+  test("carries the write authority and the shape that follows from it", () => {
+    expect(plannedChildFor(CONFIG, "review", 2)).toMatchObject({
+      write: false,
+      shape: "scout",
+      providerId: "gemini",
+      ordinal: 2,
+    });
+    expect(plannedChildFor(CONFIG, "reasoning", 1)).toMatchObject({
+      write: true,
+      shape: "ship",
+      model: "gpt-5-codex",
+    });
+  });
+
+  test("fails closed on a role or ordinal that is no longer in the config", () => {
+    // No plan means no restored authority — the safe direction.
+    expect(plannedChildFor(CONFIG, "review", 4)).toBeUndefined();
+    expect(plannedChildFor(CONFIG, "gone", 1)).toBeUndefined();
+    // The orchestrator is never a child (planChildren excludes it).
+    expect(plannedChildFor(CONFIG, "orchestrator", 1)).toBeUndefined();
+  });
+});
+
+describe("roleChildPosture", () => {
+  const scout: PlannedChild = {
+    roleName: "review",
+    ordinal: 2,
+    providerId: "gemini",
+    shape: "scout",
+    write: false,
+  };
+
+  test("a read-only role gets BOTH fences, not one of them", () => {
+    const p = roleChildPosture(scout, "goal-1", "BRIEF");
+    // The leaf identity profile: scout holds no tools:write.
+    expect(p.workerShape).toBe("scout");
+    // ...and the canUseTool gate, independently.
+    expect(p.pack.role.write).toBe(false);
+    expect(roleDeniesTool(p.pack.role, "Write")).toMatch(/read-only/);
+    expect(roleDeniesTool(p.pack.role, "Edit")).toMatch(/read-only/);
+    // Reads stay allowed — a reviewer that cannot read is useless.
+    expect(roleDeniesTool(p.pack.role, "Read")).toBeNull();
+  });
+
+  test("network stays read-only, not false — the search role needs the web", () => {
+    const p = roleChildPosture(scout, "goal-1", "BRIEF");
+    expect(p.pack.role.network).toBe("read-only");
+    expect(roleDeniesTool(p.pack.role, "WebFetch")).toBeNull();
+  });
+
+  test("a writing role gets ship and an unblocked write path", () => {
+    const p = roleChildPosture(
+      { roleName: "reasoning", ordinal: 1, providerId: "openai", shape: "ship", write: true },
+      "goal-1",
+      "BRIEF",
+    );
+    expect(p.workerShape).toBe("ship");
+    expect(p.pack.role.write).toBe(true);
+    expect(roleDeniesTool(p.pack.role, "Write")).toBeNull();
+  });
+
+  test("stamps the collaborationRole a client groups the fleet by", () => {
+    const p = roleChildPosture(scout, "goal-1", "BRIEF");
+    expect(p.collaborationRole).toEqual({
+      parentSessionId: "goal-1",
+      roleName: "review",
+      ordinal: 2,
+      write: false,
+    });
+    expect(p.role).toBe("worker");
+  });
+});
+
+describe("orphanedChildBrief", () => {
+  test("says the goal is gone and tells the agent to stop", () => {
+    const b = orphanedChildBrief("review", false);
+    expect(b).toMatch(/did not survive a daemon restart/);
+    expect(b).toMatch(/blackboard is NOT mounted/);
+    expect(b).toMatch(/Do not start new work/);
+    expect(b).toMatch(/READ-ONLY/);
+  });
+
+  test("does not claim read-only for a role that writes", () => {
+    expect(orphanedChildBrief("reasoning", true)).not.toMatch(/READ-ONLY/);
+  });
+});
+
+// ── Resume: a real restart, driven through resumeSessions() ─────────────────
+
+// A second SessionManager over the SAME sqlite file and transcript dir is what
+// a daemon restart actually is. Asserting through `session.list` rather than
+// through internals keeps these honest about what a client can observe.
+//
+// Every one of these failed before this change, and the cosmetic one was the
+// least of it: children came back with no worker shape, no capability role, no
+// blackboard mount, and in `guarded` mode with nobody attached — so the fleet
+// rendered as unrelated sessions AND deadlocked on its first handoff.
+describe("collaboration survives a daemon restart", () => {
+  const CONFIG: CollaborationConfig = {
+    goal: "Survive the restart",
+    roles: [
+      { name: "orchestrator", providerId: "claude" },
+      { name: "review", providerId: "gemini", count: 2 },
+      { name: "reasoning", providerId: "claude", write: true },
+    ],
+  };
+
+  const BLACKBOARD_URL = "http://127.0.0.1:7400/mcp/blackboard";
+
+  /** Restart: a fresh manager over the same on-disk state. */
+  async function restart(): Promise<SessionManager> {
+    await manager.drain(3_000);
+    await Bun.sleep(150); // let in-flight meta writes land
+    const next = new SessionManager(
+      new Store(join(tmp, "codeoid.db")),
+      new TranscriptStore(join(tmp, "transcripts")),
+      undefined,
+      undefined,
+      undefined,
+      { config: mkConfig(), providers: makeRegistry() },
+    );
+    next.setBlackboardUrl(BLACKBOARD_URL);
+    await next.resumeSessions();
+    manager = next; // so afterEach drains the live one
+    return next;
+  }
+
+  const listFrom = async (m: SessionManager): Promise<SessionInfo[]> => {
+    const resp = await m.handle(
+      { type: "session.list", id: `ls-${Math.random()}` },
+      AUTH,
+      CLIENT,
+    );
+    return (resp as { sessions: SessionInfo[] }).sessions;
+  };
+
+  const createGoal = async (id: string): Promise<SessionInfo> => {
+    manager.setBlackboardUrl(BLACKBOARD_URL);
+    const resp = await run({ type: "session.create", id, name: id, workdir, collaboration: CONFIG });
+    if (resp.type !== "response.ok") throw new Error(`create failed: ${JSON.stringify(resp)}`);
+    return resp.data as SessionInfo;
+  };
+
+  test("children come back attached to their parent, with role + ordinal", async () => {
+    const parent = await createGoal("rs1");
+    const before = childrenOf(await allSessions(), parent.id);
+    expect(before).toHaveLength(3);
+
+    const kids = childrenOf(await listFrom(await restart()), parent.id);
+    // Without collaborationRole these are three unrelated sessions whose only
+    // hint of belonging together is a name prefix.
+    expect(kids).toHaveLength(3);
+    expect(
+      kids.map((k) => `${k.collaborationRole!.roleName}#${k.collaborationRole!.ordinal}`).sort(),
+    ).toEqual(["reasoning#1", "review#1", "review#2"]);
+  });
+
+  test("write authority is restored per role, not uniformly", async () => {
+    const parent = await createGoal("rs2");
+    const kids = childrenOf(await listFrom(await restart()), parent.id);
+    const byRole = new Map(kids.map((k) => [`${k.collaborationRole!.roleName}#${k.collaborationRole!.ordinal}`, k]));
+    expect(byRole.get("review#1")!.collaborationRole!.write).toBe(false);
+    expect(byRole.get("review#2")!.collaborationRole!.write).toBe(false);
+    expect(byRole.get("reasoning#1")!.collaborationRole!.write).toBe(true);
+  });
+
+  test("the capability role comes back, so roleDeniesTool has something to deny with", async () => {
+    // `profile` is "collaboration (<role>)" only when the pack AND its
+    // capability role are active. Before this change a resumed child had
+    // neither, so a read-only reviewer's Write went from denied to merely asked.
+    const parent = await createGoal("rs3");
+    const kids = childrenOf(await listFrom(await restart()), parent.id);
+    expect(kids.map((k) => k.profile).sort()).toEqual([
+      "collaboration (reasoning)",
+      "collaboration (review)",
+      "collaboration (review)",
+    ]);
+    expect(kids.every((k) => k.role === "worker")).toBe(true);
+  });
+
+  test("children come back autonomous with a fresh budget, not guarded", async () => {
+    // NOBODY ATTACHES TO A CHILD. Guarded means the first non-safe tool call
+    // parks at waiting_approval with zero clients and the goal deadlocks.
+    const parent = await createGoal("rs4");
+    const kids = childrenOf(await listFrom(await restart()), parent.id);
+    expect(kids.map((k) => k.mode)).toEqual(["autonomous", "autonomous", "autonomous"]);
+    expect(kids.every((k) => (k.turnsRemaining ?? 0) > 0)).toBe(true);
+  });
+
+  test("every member holds an ATTACHED mount, not just a minted token", async () => {
+    // Asserted per session rather than via `activeTokens`, which counts tokens
+    // ever minted — a mount minted and then dropped on the floor looks
+    // identical there to one a session actually holds, and that difference is
+    // exactly whether a resumed child can publish a handoff.
+    const parent = await createGoal("rs5");
+    const next = await restart();
+
+    const resumedParent = (await listFrom(next)).find((s) => s.id === parent.id)!;
+    expect(resumedParent.collaboration?.goal).toBe(CONFIG.goal);
+    expect(resumedParent.collaboration?.roles).toHaveLength(3);
+
+    const held = (id: string) => next._sessionForTest(id)?.hasBlackboardMount;
+    expect(held(parent.id)).toBe(true); // §4 index + §7 synthesis
+
+    // Guard the guard: the per-child assertions below live inside a loop, so
+    // without this a regression that returns NO children passes vacuously —
+    // which is exactly what happened on the first draft of this test.
+    const kids = childrenOf(await listFrom(next), parent.id);
+    expect(kids).toHaveLength(3);
+    for (const kid of kids) {
+      expect(held(kid.id)).toBe(true);
+    }
+    expect(next.blackboardMcp.activeTokens).toBe(4);
+  });
+
+  test("a resumed child can still read the artifacts it wrote before the restart", async () => {
+    // The end-to-end point of the whole change: attribution is keyed to the
+    // ROLE within the goal, so a resumed child's mount addresses the same
+    // artifacts its pre-restart self published.
+    const parent = await createGoal("rs6");
+    const bb = new Blackboard(new BlackboardStore(store.database));
+    const scope = {
+      accountId: AUTH.accountId,
+      projectId: AUTH.projectId,
+      goalSessionId: parent.id,
+    };
+    bb.forRole(scope, {
+      roleName: "reasoning",
+      ordinal: 1,
+      authorSub: `agent:${parent.id}:reasoning#1`,
+    }).write("diff", "PRE-RESTART DIFF");
+
+    const next = await restart();
+    const idx = await next.handle(
+      { type: "blackboard.index", id: "i1", sessionId: parent.id },
+      AUTH,
+      CLIENT,
+    );
+    expect(idx.type).toBe("blackboard.index.result");
+    if (idx.type !== "blackboard.index.result") return;
+    expect(idx.entries.map((e) => e.kind)).toEqual(["diff"]);
+    expect(idx.entries[0]!.authorSub).toBe(`agent:${parent.id}:reasoning#1`);
+  });
+
+  test("destroying the goal after a restart revokes every resumed token", async () => {
+    // The tokens minted during resume must be tracked, or each boot leaks one
+    // still-valid credential per child and teardown revokes none of them.
+    const parent = await createGoal("rs7");
+    const next = await restart();
+    expect(next.blackboardMcp.activeTokens).toBe(4);
+    const destroyed = await next.handle(
+      { type: "session.destroy", id: "d1", sessionId: parent.id },
+      AUTH,
+      CLIENT,
+    );
+    expect(destroyed.type).toBe("response.ok");
+    expect(next.blackboardMcp.activeTokens).toBe(0);
+  });
+
+  test("an orphaned child keeps its fence but gets no mount and no budget", async () => {
+    // Torn state: the child's transcript survives, its orchestrator's doesn't.
+    const parent = await createGoal("rs8");
+    await manager.drain(3_000);
+    await Bun.sleep(150);
+    rmSync(join(tmp, "transcripts", `${parent.id}.meta.json`), { force: true });
+    rmSync(join(tmp, "transcripts", parent.id), { recursive: true, force: true });
+
+    const next = await restart();
+    const kids = childrenOf(await listFrom(next), parent.id);
+    expect(kids).toHaveLength(3);
+    // The fence holds — that is the part that must never fail open.
+    const review = kids.find((k) => k.collaborationRole!.roleName === "review")!;
+    expect(review.collaborationRole!.write).toBe(false);
+    expect(review.profile).toBe("collaboration (review)");
+    // ...but it cannot coordinate, so it is not handed turns to burn.
+    expect(kids.every((k) => k.mode !== "autonomous")).toBe(true);
+    // No goal, no board: minting a mount for artifacts that were dropped with
+    // the goal would hand out a credential to nothing.
+    for (const kid of kids) {
+      expect(next._sessionForTest(kid.id)?.hasBlackboardMount).toBe(false);
+    }
+    expect(next.blackboardMcp.activeTokens).toBe(0);
+  });
+});
+

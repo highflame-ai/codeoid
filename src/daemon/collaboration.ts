@@ -291,6 +291,123 @@ export function childSessionName(parentName: string, child: PlannedChild): strin
 }
 
 /**
+ * Recover the `PlannedChild` for one live role instance, from the goal config
+ * plus the identity a child already carries (`collaborationRole`).
+ *
+ * The resume counterpart of `planChildren`, and deliberately implemented BY
+ * calling it rather than re-deriving `shape`/`write`/`reads`/`writes` from the
+ * role entry a second time. A resumed child that computed its own shape would
+ * be one edit away from disagreeing with the one it spawned under — and the
+ * direction that disagreement fails is a read-only reviewer coming back able to
+ * write. Sharing the derivation makes that class of drift unrepresentable.
+ *
+ * `undefined` when the role or ordinal is no longer in the config, which is the
+ * fail-closed direction: no plan, no restored authority.
+ */
+export function plannedChildFor(
+  config: CollaborationConfig,
+  roleName: string,
+  ordinal: number,
+): PlannedChild | undefined {
+  const planned = planChildren(config);
+  if (!planned.ok) return undefined;
+  return planned.children.find(
+    (c) => c.roleName === roleName && c.ordinal === ordinal,
+  );
+}
+
+/**
+ * Everything about a role-child's Session that ENCODES ITS RESTRICTIONS —
+ * worker shape, capability role, and the brief that states the contract.
+ *
+ * One function, two callers: `#spawnCollaborationChildren` on create and the
+ * resume path on restart. They were separate before, and the omission was
+ * silent in exactly the worst way: a resumed reviewer came back with no
+ * `workerShape` (so its next turn registered a full session agent instead of a
+ * scope-capped `scout` leaf) and no capability role (so `roleDeniesTool` had
+ * nothing to deny with). Nothing failed; the fence was just gone.
+ *
+ * `constitution` is a parameter rather than computed here so the degraded
+ * resume path — child on disk, goal config unrecoverable — can substitute an
+ * honest "your goal was lost" brief while still getting the real restrictions.
+ */
+export function roleChildPosture(
+  child: PlannedChild,
+  parentSessionId: string,
+  constitution: string,
+): {
+  role: "worker";
+  workerShape: "ship" | "scout";
+  pack: {
+    id: string;
+    constitution: string;
+    role: { name: string; write: boolean; network: "read-only"; envelope: "all" };
+    roleName: string;
+    subagents: never[];
+  };
+  collaborationRole: {
+    parentSessionId: string;
+    roleName: string;
+    ordinal: number;
+    write: boolean;
+  };
+} {
+  return {
+    role: "worker",
+    // The enforcement behind §6: a read-only role becomes a "scout", whose
+    // LEAF identity profile carries no tools:write at all, so it cannot mint
+    // write authority even via a sub-agent.
+    workerShape: child.shape,
+    // ...and the same restriction at the canUseTool fence, where
+    // roleDeniesTool turns `write: false` into a hard tool deny (Claude-hard;
+    // advisory + logged on backends whose tools don't all route through the
+    // gate — see roleEnforcement).
+    pack: {
+      id: "collaboration",
+      constitution,
+      role: {
+        name: child.roleName,
+        write: child.write,
+        // Not `false`: §3 gives the search role web access, and roleDeniesTool
+        // only denies network tools on an explicit false. Per-role network
+        // gating is a later phase.
+        network: "read-only",
+        envelope: "all",
+      },
+      roleName: child.roleName,
+      subagents: [],
+    },
+    collaborationRole: {
+      parentSessionId,
+      roleName: child.roleName,
+      ordinal: child.ordinal,
+      write: child.write,
+    },
+  };
+}
+
+/**
+ * The brief for a child whose goal config could not be recovered on resume.
+ *
+ * Reachable only from a torn state (the child's transcript survived while its
+ * orchestrator's did not — teardown normally removes both). It says so plainly
+ * instead of leaving the agent to infer a goal from its own transcript, and it
+ * tells it to stop rather than resume work it can no longer coordinate.
+ */
+export function orphanedChildBrief(roleName: string, write: boolean): string {
+  return [
+    `<collaboration role="${roleName}" state="orphaned">`,
+    `You are the "${roleName}" role of a collaborative session whose goal configuration did not survive a daemon restart.`,
+    write
+      ? "Your write authority is unchanged."
+      : "You are READ-ONLY: your identity holds no write scope, so file edits will be denied.",
+    "The goal blackboard is NOT mounted — the goal it belonged to is gone, and its artifacts were dropped with it.",
+    "Do not start new work and do not guess the goal. Report your state if asked, and stop.",
+    "</collaboration>",
+  ].join("\n");
+}
+
+/**
  * The goal brief handed to a role-child on spawn.
  *
  * Deliberately narrow. A child is told its goal, its role, and its contract —
