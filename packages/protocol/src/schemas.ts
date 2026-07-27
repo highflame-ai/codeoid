@@ -46,6 +46,13 @@ export const collaborationRoleSchema = z.object({
   purpose: z.string().max(500).optional(),
   /** Opt-in write authority. Absent = read-only (least privilege). */
   write: z.boolean().optional(),
+  /**
+   * Blackboard artifact scoping. Bounded string arrays here; whether each name
+   * is a real kind is checked by the daemon, so an unknown kind gets a specific
+   * error naming the valid set instead of an opaque schema rejection.
+   */
+  reads: z.array(z.string().min(1).max(64)).max(16).optional(),
+  writes: z.array(z.string().min(1).max(64)).max(16).optional(),
 });
 
 export const collaborationConfigSchema = z.object({

@@ -18,6 +18,7 @@
 import type { CollaborationConfig, CollaborationRole } from "../protocol/types.js";
 import { LIMITS, ORCHESTRATOR_ROLE } from "../protocol/types.js";
 import { CLAUDE_PROVIDER_ID, resolveModelIdForProvider } from "./models.js";
+import { CORE_ARTIFACT_KINDS, isValidArtifactKind } from "./blackboard/types.js";
 
 /** The provider-registry surface this module needs — kept narrow so tests
  *  can pass a stub instead of building a real registry. */
@@ -86,6 +87,25 @@ export function validateCollaboration(
       };
     }
 
+    // Blackboard scoping: an unknown kind must reject here. Left to pass, a
+    // typo like `reads: ["diffs"]` would produce a role that appears scoped but
+    // can never read the artifact it needs, and the failure would surface much
+    // later as an agent inexplicably waiting on a handoff.
+    for (const [field, kinds] of [
+      ["reads", raw.reads],
+      ["writes", raw.writes],
+    ] as const) {
+      if (!kinds) continue;
+      for (const kind of kinds) {
+        if (!isValidArtifactKind(kind)) {
+          return {
+            ok: false,
+            error: `Role "${name}" ${field} unknown artifact kind "${kind}" — valid: ${CORE_ARTIFACT_KINDS.join(", ")}, or extra/<key>`,
+          };
+        }
+      }
+    }
+
     const count = raw.count ?? 1;
     if (!Number.isInteger(count) || count < 1) {
       return { ok: false, error: `Role "${name}" count must be a positive integer` };
@@ -128,6 +148,13 @@ export function validateCollaboration(
       // Normalize to an explicit boolean so downstream code never has to
       // re-decide what "absent" means for write authority.
       write: raw.write === true,
+      // Left ABSENT when undeclared, deliberately — the blackboard service
+      // distinguishes "declared nothing" (fall back to the §3 default profile
+      // for this role name) from "declared an empty list" (reads/writes
+      // nothing). Defaulting to [] here would erase that distinction and
+      // silently strip every default profile.
+      ...(raw.reads !== undefined ? { reads: [...raw.reads] } : {}),
+      ...(raw.writes !== undefined ? { writes: [...raw.writes] } : {}),
     });
   }
 

@@ -883,6 +883,30 @@ export interface CollaborationRole {
    * `false` → "scout".
    */
   write?: boolean;
+  /**
+   * Blackboard artifact kinds this role may READ — `spec`, `research`, `adr`,
+   * `task-list`, `diff`, `findings`, or `extra/<key>`
+   * (docs/collaborative-session-design.md §4).
+   *
+   * Absent = the default profile for this role name from §3. A role name with
+   * no profile and no declaration reads NOTHING — fail-closed in both
+   * directions, because the design's standing rule is that an unenforced field
+   * is false security.
+   *
+   * This is what makes reviewer independence structural rather than polite:
+   * `review` reads `diff`+`spec` and NOT `research` (the implementer's
+   * reasoning by proxy) or `findings` (its peers' opinions).
+   */
+  reads?: string[];
+  /**
+   * Blackboard artifact kinds this role may WRITE. Absent = the §3 default
+   * profile for this role name; an unprofiled role that declares nothing
+   * writes nothing.
+   *
+   * A role writing a multi-writer kind (`findings`) writes into its OWN slot,
+   * chosen by the daemon — so one reviewer can never overwrite another's.
+   */
+  writes?: string[];
 }
 
 /** The role name that must be present exactly once in a collaboration, and
