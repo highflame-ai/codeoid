@@ -651,15 +651,47 @@ const PipelineSchema = z
  * tool args) to the configured transport so the session owner's registered
  * devices are alerted off-LAN. `transport: "none"` (default) disables push.
  */
+/** APNs token-auth credentials for embedded (`native`) mode. */
+const ApnsSchema = z.object({
+  keyId: z.string(),
+  teamId: z.string(),
+  bundleId: z.string(),
+  /** PEM contents of the `.p8` key (multi-line — lives in config.json). */
+  p8: z.string(),
+  /** Use the APNs sandbox host (development builds). */
+  sandbox: z.boolean().default(false),
+});
+
+/** FCM v1 service-account credentials for embedded (`native`) mode. */
+const FcmSchema = z.object({
+  projectId: z.string(),
+  clientEmail: z.string(),
+  /** PEM contents of the service-account private key. */
+  privateKey: z.string(),
+});
+
 const PushSchema = z
   .object({
-    /** Delivery transport. "expo" routes through Expo's push service (which
-     *  relays to APNs/FCM); "none" disables push. A self-hosted content-blind
-     *  relay transport swaps in behind this seam later. */
-    transport: z.enum(["expo", "none"]).default("none"),
-    /** Expo access token (Bearer) for the push API. Optional — Expo accepts
-     *  unauthenticated sends, but a token enables receipts + higher limits. */
+    /**
+     * Delivery transport:
+     *   - "expo"   — Expo's push service relays to APNs/FCM (a third party in
+     *     the path; simplest to set up).
+     *   - "native" — the daemon holds APNs/FCM creds and sends DIRECTLY (no
+     *     third party). Fits when the daemon operator is the app publisher.
+     *   - "relay"  — the daemon POSTs a content-blind wake-up to a self-hosted
+     *     relay that sends via APNs/FCM (no creds in the daemon).
+     *   - "none"   — push disabled (default).
+     */
+    transport: z.enum(["expo", "native", "relay", "none"]).default("none"),
+    /** Expo access token (Bearer) — `expo` transport only. */
     expoAccessToken: z.string().optional(),
+    /** APNs creds — `native` transport (iOS). */
+    apns: ApnsSchema.optional(),
+    /** FCM creds — `native` transport (Android). */
+    fcm: FcmSchema.optional(),
+    /** Relay base URL + shared bearer token — `relay` transport (no local creds). */
+    relayUrl: z.string().optional(),
+    relayToken: z.string().optional(),
   })
   .default({ transport: "none" });
 
@@ -887,8 +919,12 @@ export interface CodeoidConfig {
    * minimal; loadConfig always populates it (schema default: transport "none").
    */
   push?: {
-    transport: "expo" | "none";
+    transport: "expo" | "native" | "relay" | "none";
     expoAccessToken?: string;
+    apns?: { keyId: string; teamId: string; bundleId: string; p8: string; sandbox: boolean };
+    fcm?: { projectId: string; clientEmail: string; privateKey: string };
+    relayUrl?: string;
+    relayToken?: string;
   };
   /**
    * Embed trust — origins permitted to frame the web UI and pre-authenticate
@@ -969,6 +1005,9 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   // config.json (e.g. CODEOID_PUSH_TRANSPORT=expo).
   { env: "CODEOID_PUSH_TRANSPORT", path: "push.transport", kind: "string" },
   { env: "CODEOID_EXPO_ACCESS_TOKEN", path: "push.expoAccessToken", kind: "string" },
+  // Relay-mode endpoint — per-invocation without touching config.json.
+  { env: "CODEOID_PUSH_RELAY_URL", path: "push.relayUrl", kind: "string" },
+  { env: "CODEOID_PUSH_RELAY_TOKEN", path: "push.relayToken", kind: "string" },
   { env: "CODEOID_TURN_STALL_TIMEOUT_MS", path: "session.turnStallTimeoutMs", kind: "int" },
   { env: "CODEOID_MCP_TOOL_TIMEOUT_MS", path: "session.mcpToolTimeoutMs", kind: "int" },
   // Embed-SSO trusted framing origins (comma-separated). Each is an exact

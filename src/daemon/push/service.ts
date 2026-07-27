@@ -6,14 +6,23 @@
  * tenant-scoped by account/project — so only the human who owns the session is
  * alerted, and never across tenants.
  */
+import { createPushSender, type ApnsCreds, type FcmCreds } from "../../push-core/index.js";
 import type { Store } from "../store.js";
 import { ExpoPushTransport } from "./expo.js";
+import { NativePushTransport } from "./native.js";
+import { RelayPushTransport } from "./relay.js";
 import type { PushNotification, PushTransport } from "./types.js";
 
 /** Config shape this module needs (a subset of CodeoidConfig["push"]). */
 export interface PushConfig {
-  transport: "expo" | "none";
+  transport: "expo" | "native" | "relay" | "none";
   expoAccessToken?: string;
+  /** Embedded (native) mode — APNs/FCM creds the daemon sends with directly. */
+  apns?: ApnsCreds;
+  fcm?: FcmCreds;
+  /** Relay mode — where to POST content-blind wake-ups (no creds in the daemon). */
+  relayUrl?: string;
+  relayToken?: string;
 }
 
 const noopTransport: PushTransport = {
@@ -21,11 +30,32 @@ const noopTransport: PushTransport = {
   async send() {},
 };
 
-/** Build the transport for the daemon's push config. */
-export function createPushTransport(config: PushConfig | undefined): PushTransport {
-  if (!config || config.transport === "none") return noopTransport;
-  if (config.transport === "expo") return new ExpoPushTransport(config.expoAccessToken);
-  return noopTransport;
+/**
+ * Build the transport for the daemon's push config. `onUnregistered` is invoked
+ * with dead device tokens (native mode) so the caller can prune the registry.
+ */
+export function createPushTransport(
+  config: PushConfig | undefined,
+  onUnregistered?: (token: string) => void,
+): PushTransport {
+  if (!config) return noopTransport;
+  switch (config.transport) {
+    case "expo":
+      return new ExpoPushTransport(config.expoAccessToken);
+    case "native":
+      return new NativePushTransport(
+        createPushSender({ apns: config.apns, fcm: config.fcm }),
+        onUnregistered,
+      );
+    case "relay":
+      if (!config.relayUrl || !config.relayToken) {
+        console.error("[codeoid/push] transport=relay needs relayUrl + relayToken; push disabled");
+        return noopTransport;
+      }
+      return new RelayPushTransport(config.relayUrl, config.relayToken);
+    default:
+      return noopTransport;
+  }
 }
 
 /** Owner identity + tenant of a session — the push routing key. */

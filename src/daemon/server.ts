@@ -203,9 +203,18 @@ export class DaemonServer {
 
   constructor(config: DaemonConfig) {
     this.#config = config;
-    const pushOn = (config.fullConfig?.push?.transport ?? "none") !== "none";
-    this.#advertisedCapabilities = pushOn
-      ? [...SERVER_CAPABILITIES, CAPABILITIES.PUSH]
+    // Advertise the capability matching the token type this transport needs:
+    // `expo` wants Expo push tokens (PUSH); `native`/`relay` send via APNs/FCM
+    // and want native device tokens (PUSH_NATIVE). `none` advertises neither.
+    const transport = config.fullConfig?.push?.transport ?? "none";
+    const pushCapability =
+      transport === "expo"
+        ? CAPABILITIES.PUSH
+        : transport === "native" || transport === "relay"
+          ? CAPABILITIES.PUSH_NATIVE
+          : null;
+    this.#advertisedCapabilities = pushCapability
+      ? [...SERVER_CAPABILITIES, pushCapability]
       : SERVER_CAPABILITIES;
     this.#store = new Store(config.dbPath);
     this.#transcriptStore = new TranscriptStore(config.transcriptDir);
