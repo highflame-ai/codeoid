@@ -2259,6 +2259,21 @@ export class Session {
     this.#blackboardMcp = mount;
   }
 
+  /**
+   * Whether a goal-blackboard mount is attached to THIS session.
+   *
+   * Deliberately not inferable from `BlackboardMcpHttp.activeTokens`: that
+   * counts tokens ever minted, so a mount that was minted and then dropped on
+   * the floor is indistinguishable there from one a session actually holds.
+   * The distinction is the whole difference between a resumed role-child that
+   * can publish a handoff and one that silently cannot.
+   *
+   * The token itself is never exposed — only whether one is present.
+   */
+  get hasBlackboardMount(): boolean {
+    return this.#blackboardMcp !== undefined;
+  }
+
   toInfo(): SessionInfo {
     return {
       id: this.id,
