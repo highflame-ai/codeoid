@@ -30,6 +30,31 @@ function sess(id: string, name: string, workdir = "/tmp"): SessionInfo {
   } as SessionInfo;
 }
 
+/** An orchestrator: a session carrying a `collaboration` config. */
+function orchestrator(id: string, name: string, goal: string): SessionInfo {
+  return {
+    ...sess(id, name, "/repo/fleet"),
+    collaboration: { goal, roles: [{ name: "orchestrator", providerId: "claude" }] },
+  } as SessionInfo;
+}
+
+/** A role-child: a session carrying `collaborationRole` pointing at its parent. */
+function roleChild(
+  parentId: string,
+  parentName: string,
+  roleName: string,
+  ordinal: number,
+  write: boolean,
+  providerId = "claude",
+): SessionInfo {
+  const suffix = ordinal > 1 ? `-${ordinal}` : "";
+  return {
+    ...sess(`${parentId}:${roleName}${suffix}`, `${parentName}:${roleName}${suffix}`, "/repo/fleet"),
+    providerId,
+    collaborationRole: { parentSessionId: parentId, roleName, ordinal, write },
+  } as SessionInfo;
+}
+
 afterEach(() => {
   cleanup();
   _resetSessionsForTest();
@@ -80,5 +105,93 @@ describe("SessionListPane — session filter", () => {
     expect(queryByText("beta")).toBeNull();
     fireEvent.click(getByLabelText("Clear filter"));
     expect(getByText("beta")).toBeTruthy();
+  });
+});
+
+describe("SessionListPane — fleet rendering", () => {
+  const FLEET = [
+    orchestrator("p", "refactor-auth", "make auth boring again"),
+    roleChild("p", "refactor-auth", "review", 2, false, "gemini"),
+    roleChild("p", "refactor-auth", "search", 1, false, "claude"),
+    roleChild("p", "refactor-auth", "review", 1, false, "gemini"),
+    roleChild("p", "refactor-auth", "reasoning", 1, true, "openai"),
+    sess("solo", "unrelated", "/tmp/other"),
+  ];
+
+  it("renders children by role label, not by their prefixed session name", () => {
+    ingestSessionList(FLEET);
+    const { getByText, queryByText } = render(() => <SessionListPane />);
+
+    expect(getByText("refactor-auth")).toBeTruthy();
+    // `review` ×2 fan-out gets ordinals; singletons don't.
+    expect(getByText("review")).toBeTruthy();
+    expect(getByText("review#2")).toBeTruthy();
+    expect(getByText("search")).toBeTruthy();
+    expect(getByText("reasoning")).toBeTruthy();
+    // The daemon-generated name is in the tooltip, not the visible label.
+    expect(queryByText("refactor-auth:review-2")).toBeNull();
+  });
+
+  it("shows the goal on the orchestrator row", () => {
+    ingestSessionList(FLEET);
+    const { getByText } = render(() => <SessionListPane />);
+    expect(getByText(/make auth boring again/)).toBeTruthy();
+  });
+
+  it("badges read-only roles and marks the writer differently", () => {
+    ingestSessionList(FLEET);
+    const { getAllByTitle } = render(() => <SessionListPane />);
+    // search, review, review#2 are read-only; reasoning writes.
+    expect(getAllByTitle(/Read-only role/)).toHaveLength(3);
+    expect(getAllByTitle(/may write to the workspace/)).toHaveLength(1);
+  });
+
+  it("shows every child's backend, including claude", () => {
+    // A mixed fleet is the point; "claude" must be stated, not implied by the
+    // absence of a chip the way it is for standalone sessions.
+    ingestSessionList(FLEET);
+    const { getAllByTitle, queryAllByTitle } = render(() => <SessionListPane />);
+    expect(getAllByTitle(/Backend: gemini/)).toHaveLength(2);
+    expect(getAllByTitle(/Backend: openai/)).toHaveLength(1);
+    expect(getAllByTitle(/Backend: claude/)).toHaveLength(1);
+    // ...but the standalone session still suppresses the default-backend chip.
+    expect(queryAllByTitle(/Backend: claude/)).toHaveLength(1);
+  });
+
+  it("collapses and re-expands the fleet from the group toggle", () => {
+    ingestSessionList(FLEET);
+    const { getByLabelText, queryByText, getByText } = render(() => <SessionListPane />);
+
+    fireEvent.click(getByLabelText(/Collapse fleet \(4 roles\)/));
+    expect(queryByText("search")).toBeNull();
+    expect(queryByText("review#2")).toBeNull();
+    // The orchestrator itself stays put.
+    expect(getByText("refactor-auth")).toBeTruthy();
+
+    fireEvent.click(getByLabelText(/Expand fleet \(4 roles\)/));
+    expect(getByText("search")).toBeTruthy();
+  });
+
+  it("keeps the orchestrator visible as context when only a child matches", () => {
+    ingestSessionList(FLEET);
+    const { getByLabelText, getByText, queryByText } = render(() => <SessionListPane />);
+    fireEvent.input(getByLabelText("Filter sessions by name"), {
+      target: { value: "reasoning" },
+    });
+    // A bare role row with no indication of its goal would be unreadable.
+    expect(getByText("refactor-auth")).toBeTruthy();
+    expect(getByText("reasoning")).toBeTruthy();
+    expect(queryByText("search")).toBeNull();
+    expect(queryByText("unrelated")).toBeNull();
+  });
+
+  it("keeps an orphan child visible, at top level, with its role badges intact", () => {
+    // Parent destroyed while the child drains — the child must not vanish. It
+    // shows its full name (no parent row above it to supply the context) but
+    // still reads as a role-child.
+    ingestSessionList([roleChild("ghost", "gone", "search", 1, false)]);
+    const { getByText, getByTitle } = render(() => <SessionListPane />);
+    expect(getByText("gone:search")).toBeTruthy();
+    expect(getByTitle(/Read-only role/)).toBeTruthy();
   });
 });
