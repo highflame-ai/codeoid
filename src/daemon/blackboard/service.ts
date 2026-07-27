@@ -60,6 +60,27 @@ export const DEFAULT_ROLE_IO: Readonly<Record<string, RoleIo>> = {
  */
 export const MULTI_WRITER_KINDS: ReadonlySet<string> = new Set(["findings"]);
 
+/**
+ * Resolve a role's effective artifact scope: what it declared, else the §3
+ * default profile for its name, else nothing.
+ *
+ * Exported and shared with `childBrief` on purpose. The brief TELLS a child
+ * what it may touch and this function DECIDES it; if those were computed
+ * separately they would eventually disagree, and the agent would be told it
+ * can read something the fence then refuses — the most confusing possible
+ * failure for a model to recover from.
+ */
+export function resolveRoleIo(
+  roleName: string,
+  declared?: { reads?: readonly string[]; writes?: readonly string[] },
+): RoleIo {
+  const fallback = DEFAULT_ROLE_IO[roleName];
+  return {
+    reads: declared?.reads ?? fallback?.reads ?? [],
+    writes: declared?.writes ?? fallback?.writes ?? [],
+  };
+}
+
 export type BlackboardDenial = { ok: false; error: string };
 export type BlackboardResult<T> = { ok: true; value: T } | BlackboardDenial;
 
@@ -205,12 +226,12 @@ export class Blackboard {
     identity: RoleIdentity,
     declared?: { reads?: readonly string[]; writes?: readonly string[] },
   ): RoleBlackboard {
-    const fallback = DEFAULT_ROLE_IO[identity.roleName];
-    const io: RoleIo = {
-      reads: declared?.reads ?? fallback?.reads ?? [],
-      writes: declared?.writes ?? fallback?.writes ?? [],
-    };
-    return new RoleBlackboard(this.#store, scope, identity, io);
+    return new RoleBlackboard(
+      this.#store,
+      scope,
+      identity,
+      resolveRoleIo(identity.roleName, declared),
+    );
   }
 
   /** Drop a goal's artifacts. Called on collaboration teardown. */

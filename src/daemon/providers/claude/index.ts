@@ -33,6 +33,7 @@ import {
   MEMORY_TOOL_NAMES,
   type MemoryEngine,
 } from "../../memory/index.js";
+import { BLACKBOARD_MCP_SERVER_NAME } from "../../blackboard/mcp-http.js";
 import type { McpRegistry } from "../../mcp/registry.js";
 import { resolveEnvMap } from "../../mcp/types.js";
 import type { CompressionRegistry } from "../../compress/index.js";
@@ -79,6 +80,13 @@ export interface ClaudeProviderInit {
   memory?: MemoryEngine;
   /** codeoid_fleet MCP server — conductor sessions only (read-only fleet view). */
   fleet?: McpSdkServerConfigWithInstance;
+  /**
+   * Role-scoped goal-blackboard mount for a collaboration child. Unlike the
+   * memory mount, the token is minted ONCE by the SessionManager (it encodes
+   * this role's read/write scope) and revoked at collaboration teardown — so
+   * this provider carries it, it does not mint or revoke.
+   */
+  blackboardMcp?: { url: string; token: string };
   /** Cross-backend MCP registry — external servers are mounted natively on the
    *  SDK (claude owns its own MCP client); approval flows through canUseTool. */
   mcpRegistry?: McpRegistry;
@@ -388,6 +396,18 @@ export class ClaudeProvider implements SessionProvider {
       // Conductor sessions only — the read-only fleet view (P3). In-process,
       // so the external-server timeout doesn't apply.
       ...(init.fleet ? { codeoid_fleet: init.fleet } : {}),
+      // Collaboration children only — the role-scoped goal blackboard. Mounted
+      // over HTTP rather than in-process precisely so the SAME surface works on
+      // gemini/codex; claude deliberately gets no privileged path here (#245).
+      ...(init.blackboardMcp
+        ? {
+            [BLACKBOARD_MCP_SERVER_NAME]: {
+              type: "http",
+              url: init.blackboardMcp.url,
+              headers: { Authorization: `Bearer ${init.blackboardMcp.token}` },
+            } as unknown as McpServerConfig,
+          }
+        : {}),
       // Registry servers — mounted natively on the SDK (claude owns its client);
       // tool calls surface as `mcp__<server>__<tool>` and gate via canUseTool.
       ...withMcpToolTimeout(registryServersForClaude(init.mcpRegistry), mcpToolTimeoutMs),

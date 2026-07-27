@@ -45,6 +45,14 @@ export const BLACKBOARD_MCP_PATH = "/mcp/blackboard";
  */
 export const BLACKBOARD_MCP_SERVER_NAME = "codeoid_blackboard";
 
+/**
+ * Env var carrying the bearer token for backends that mount by config rather
+ * than by header (codex reads `bearer_token_env_var`). Keeping the token out of
+ * the `-c` args matters: process argv is world-readable on Linux, and these
+ * tokens are the scope.
+ */
+export const BLACKBOARD_MCP_TOKEN_ENV = "CODEOID_BLACKBOARD_TOKEN";
+
 const SERVER_INFO = { name: BLACKBOARD_MCP_SERVER_NAME, version: "0.1.0" } as const;
 
 /** What a mount hands to a session so it can reach the blackboard. */

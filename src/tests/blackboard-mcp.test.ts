@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { BlackboardMcpHttp, BLACKBOARD_MCP_PATH } from "../daemon/blackboard/mcp-http.js";
 import { Blackboard, type RoleIdentity } from "../daemon/blackboard/service.js";
 import { BlackboardStore, type GoalScope } from "../daemon/blackboard/store.js";
+import { isSafeTool } from "../daemon/providers/tool-safety.js";
 import { Store } from "../daemon/store.js";
 
 let tmp: string;
@@ -238,5 +239,33 @@ describe("the token carries the role's scope", () => {
     const token = mcp.mint(bb.forRole(GOAL, ident("review")));
     const r = await rpc(token, "resources/list");
     expect(r.body.error.code).toBe(-32601);
+  });
+});
+
+// ── Tool-safety classification ──────────────────────────────────────────────
+
+describe("blackboard tool safety", () => {
+  test("reads auto-approve under both namespacing conventions", () => {
+    for (const p of ["mcp__codeoid_blackboard__", "codeoid_blackboard__"]) {
+      for (const t of ["blackboard_index", "blackboard_read", "blackboard_read_all"]) {
+        expect(isSafeTool(`${p}${t}`)).toBe(true);
+      }
+    }
+  });
+
+  // Scope decides whether a write is PERMITTED; this decides whether it happens
+  // without anyone looking. A write publishes into shared state peers act on.
+  test("blackboard_write never auto-approves", () => {
+    expect(isSafeTool("mcp__codeoid_blackboard__blackboard_write")).toBe(false);
+    expect(isSafeTool("codeoid_blackboard__blackboard_write")).toBe(false);
+  });
+
+  test("a look-alike server name does not auto-approve", () => {
+    expect(isSafeTool("x_codeoid_blackboard__blackboard_read")).toBe(false);
+    expect(isSafeTool("mcp__codeoid_blackboard_evil__blackboard_read")).toBe(false);
+  });
+
+  test("an unknown blackboard tool does not auto-approve", () => {
+    expect(isSafeTool("mcp__codeoid_blackboard__blackboard_wipe")).toBe(false);
   });
 });

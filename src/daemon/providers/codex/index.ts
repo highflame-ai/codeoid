@@ -61,6 +61,10 @@ import { buildCodexEnv } from "../env.js";
 import { CodexRpcProcess } from "./rpc.js";
 import type { SessionMode } from "../../../protocol/types.js";
 import { MEMORY_MCP_SERVER_NAME, MEMORY_MCP_TOKEN_ENV, type MemoryMcpMount } from "../../memory/mcp-http.js";
+import {
+  BLACKBOARD_MCP_SERVER_NAME,
+  BLACKBOARD_MCP_TOKEN_ENV,
+} from "../../blackboard/mcp-http.js";
 import type { McpRegistry } from "../../mcp/registry.js";
 import { resolveEnvMap } from "../../mcp/types.js";
 
@@ -89,6 +93,14 @@ export interface CodexProviderInit {
    * codex can page the verbatim store on demand — the precondition for VWS.
    */
   memoryMcp?: MemoryMcpMount;
+  /**
+   * Role-scoped goal-blackboard mount for a collaboration child. Unlike the
+   * memory mount, the token is minted ONCE by the SessionManager (it encodes
+   * this role's read/write scope) and revoked at collaboration teardown — so
+   * this provider carries it, it does not mint or revoke.
+   */
+  blackboardMcp?: { url: string; token: string };
+
   /** Cross-backend MCP registry — external servers mount natively via `-c
    *  mcp_servers.*` (codex owns its client); approval flows through canUseTool. */
   mcpRegistry?: McpRegistry;
@@ -198,6 +210,8 @@ export class CodexProvider implements SessionProvider {
   #onModels?: CodexProviderInit["onModels"];
   #workspaceId: string;
   #memoryMcp: MemoryMcpMount | null;
+  /** Role-scoped blackboard mount; token minted+revoked by the SessionManager. */
+  readonly #blackboardMcp: { url: string; token: string } | null;
   #mcpRegistry: McpRegistry | null;
   /** Live scoped token for the mounted memory endpoint; revoked on teardown. */
   #memoryToken: string | null = null;
@@ -241,6 +255,7 @@ export class CodexProvider implements SessionProvider {
     this.#onModels = init.onModels;
     this.#workspaceId = init.workspaceId ?? init.sessionId;
     this.#memoryMcp = init.memoryMcp ?? null;
+    this.#blackboardMcp = init.blackboardMcp ?? null;
     this.#mcpRegistry = init.mcpRegistry ?? null;
   }
 
@@ -312,6 +327,27 @@ export class CodexProvider implements SessionProvider {
         "-c", `${key}.bearer_token_env_var=${JSON.stringify(MEMORY_MCP_TOKEN_ENV)}`,
       ],
       env: { [MEMORY_MCP_TOKEN_ENV]: this.#memoryToken },
+    };
+  }
+
+  /**
+   * `-c mcp_servers.codeoid_blackboard.*` — the role-scoped goal blackboard for
+   * a collaboration child, same TOML shape as the memory mount above.
+   *
+   * No mint/revoke here: the SessionManager owns this token, because the scope
+   * it carries belongs to the collaboration rather than to a codex backing
+   * session that may be recreated mid-goal.
+   */
+  #blackboardMcpSpawn(): { args: string[]; env: Record<string, string> } {
+    const mount = this.#blackboardMcp;
+    if (!mount) return { args: [], env: {} };
+    const key = `mcp_servers.${BLACKBOARD_MCP_SERVER_NAME}`;
+    return {
+      args: [
+        "-c", `${key}.url=${JSON.stringify(mount.url)}`,
+        "-c", `${key}.bearer_token_env_var=${JSON.stringify(BLACKBOARD_MCP_TOKEN_ENV)}`,
+      ],
+      env: { [BLACKBOARD_MCP_TOKEN_ENV]: mount.token },
     };
   }
 
@@ -452,13 +488,14 @@ export class CodexProvider implements SessionProvider {
       // demand. No CODEX_HOME/auth.json juggling — the default ~/.codex keeps
       // the user's auth + config; these just add the one server.
       const mcp = this.#memoryMcpSpawn();
+      const bb = this.#blackboardMcpSpawn();
       const reg = this.#registryMcpArgs();
       this.#proc = new CodexRpcProcess({
         command: this.#command,
         argsPrefix: this.#argsPrefix,
-        args: [...mcp.args, ...reg.args],
+        args: [...mcp.args, ...bb.args, ...reg.args],
         cwd: opts.workdir,
-        env: { ...buildCodexEnv(), ...mcp.env, ...reg.env },
+        env: { ...buildCodexEnv(), ...mcp.env, ...bb.env, ...reg.env },
         onNotification: (method, params) => this.#onNotification(method, params),
         onServerRequest: (method, params) => this.#onServerRequest(method, params),
         onExit: ({ code, signal, stderrTail }) => {
