@@ -325,7 +325,10 @@ export class SessionManager {
       this.#makeDispatcherHost(),
       opts?.config?.dispatch,
     );
-    this.#pushService = new PushService(store, createPushTransport(opts?.config?.push));
+    this.#pushService = new PushService(
+      store,
+      createPushTransport(opts?.config?.push, (token) => store.pruneDeadToken(token)),
+    );
     // SDLC pipeline (docs/sdlc-pipeline.md) — off by default; when enabled, the
     // manager shares the daemon DB (one connection) and rehydrates non-terminal
     // pipelines on construction (resume). The runner drives prompt/slash phases

@@ -518,6 +518,15 @@ export class Store {
     return rows;
   }
 
+  /**
+   * Delete a device token that APNs/FCM reported dead (uninstalled / rotated) —
+   * regardless of owner, since a dead token is globally invalid. Keeps the
+   * registry from accumulating tokens that will never deliver again.
+   */
+  pruneDeadToken(token: string): void {
+    this.#db.prepare("DELETE FROM push_registrations WHERE token = ?").run(token);
+  }
+
   // ── Sessions ──────────────────────────────────────────────────────────
 
   createSession(session: SessionInfo & { accountId: string; projectId: string }): void {

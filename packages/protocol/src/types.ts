@@ -86,6 +86,13 @@ export const CAPABILITIES = {
    * showing one that errors on click.
    */
   BLACKBOARD: "blackboard",
+  /**
+   * Push via NATIVE device tokens (APNs/FCM) rather than Expo. Advertised by
+   * the daemon when the `native` or `relay` transport is configured; a client
+   * seeing this registers its native `getDevicePushTokenAsync` token (vs the
+   * Expo token it sends for `PUSH`).
+   */
+  PUSH_NATIVE: "push.native",
 } as const;
 
 export type Capability = (typeof CAPABILITIES)[keyof typeof CAPABILITIES];
