@@ -740,6 +740,79 @@ describe("collaboration children come up and are torn down", () => {
   });
 });
 
+// ── Regressions found by the live smoke test + audit ────────────────────────
+//
+// Every one of these passed CI and the unit suite while the feature was
+// actually broken end to end. They exist because "the tests are green" was not
+// the same as "an agent can complete a handoff".
+describe("live-verified wiring", () => {
+  const CONFIG: CollaborationConfig = {
+    goal: "Ship it",
+    roles: [
+      { name: "orchestrator", providerId: "claude" },
+      { name: "search", providerId: "claude" },
+    ],
+  };
+
+  const createCollab = async (id: string, name: string) => {
+    manager.setBlackboardUrl("http://127.0.0.1:7400/mcp/blackboard");
+    const resp = await run({
+      type: "session.create",
+      id,
+      name,
+      workdir,
+      collaboration: CONFIG,
+    });
+    if (resp.type !== "response.ok") throw new Error("create failed");
+    return resp.data as SessionInfo;
+  };
+
+  // Observed live: children spawned interactive, `blackboard_write` needs
+  // approval, and NOBODY attaches to a child — so the first handoff parked at
+  // waiting_approval with zero clients and the collaboration deadlocked.
+  test("children spawn autonomous, because no one is there to approve", async () => {
+    const parent = await createCollab("lv1", "lv1");
+    const kids = childrenOf(await allSessions(), parent.id);
+    expect(kids).toHaveLength(1);
+    expect(kids[0]!.mode).toBe("autonomous");
+    expect(kids[0]!.turnsRemaining).toBeGreaterThan(0);
+  });
+
+  // Observed by audit: only children got a mount, so the orchestrator could
+  // not call blackboard_index or read findings — §4's index and §7's synthesis
+  // were both impossible and the coordination loop never closed.
+  // The orchestrator is the one that MOST needs the blackboard (§4 index, §7
+  // synthesis) and originally got no mount at all. Paired with the teardown
+  // test below, which fails if the mount is minted but never registered.
+  test("a token is minted for the orchestrator as well as each child", async () => {
+    const before = manager.blackboardMcp.activeTokens;
+    const parent = await createCollab("lv2", "lv2");
+    const kids = childrenOf(await allSessions(), parent.id);
+    expect(manager.blackboardMcp.activeTokens).toBe(before + kids.length + 1);
+  });
+
+  // Observed by audit: destroying a child directly skipped revocation, leaving
+  // a credential that still authorized reads/writes on the goal.
+  test("destroying a child directly revokes its token", async () => {
+    const parent = await createCollab("lv3", "lv3");
+    const kid = childrenOf(await allSessions(), parent.id)[0]!;
+    const withChild = manager.blackboardMcp.activeTokens;
+
+    const destroyed = await run({ type: "session.destroy", id: "lv3d", sessionId: kid.id });
+    expect(destroyed.type).toBe("response.ok");
+    expect(manager.blackboardMcp.activeTokens).toBe(withChild - 1);
+  });
+
+  test("goal teardown revokes the orchestrator's token too", async () => {
+    const before = manager.blackboardMcp.activeTokens;
+    const parent = await createCollab("lv4", "lv4");
+    expect(manager.blackboardMcp.activeTokens).toBeGreaterThan(before);
+
+    await run({ type: "session.destroy", id: "lv4d", sessionId: parent.id });
+    expect(manager.blackboardMcp.activeTokens).toBe(before);
+  });
+});
+
 // A collaborative session IS its orchestrator, so the claude-only rule has to
 // bind THIS session's backend — not just a config row that nothing runs on.
 describe("the session is its orchestrator", () => {

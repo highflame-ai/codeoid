@@ -94,12 +94,14 @@ export interface CodexProviderInit {
    */
   memoryMcp?: MemoryMcpMount;
   /**
-   * Role-scoped goal-blackboard mount for a collaboration child. Unlike the
-   * memory mount, the token is minted ONCE by the SessionManager (it encodes
-   * this role's read/write scope) and revoked at collaboration teardown — so
-   * this provider carries it, it does not mint or revoke.
+   * Role-scoped goal-blackboard mount, resolved LAZILY.
+   *
+   * A getter rather than a value because the orchestrator's own mount is
+   * scoped to a goal id that IS its session id — so it cannot exist until
+   * after the Session is constructed. Providers read it when they build their
+   * server list (per turn for claude), by which time it is set.
    */
-  blackboardMcp?: { url: string; token: string };
+  blackboardMcp?: () => { url: string; token: string } | undefined;
 
   /** Cross-backend MCP registry — external servers mount natively via `-c
    *  mcp_servers.*` (codex owns its client); approval flows through canUseTool. */
@@ -211,7 +213,7 @@ export class CodexProvider implements SessionProvider {
   #workspaceId: string;
   #memoryMcp: MemoryMcpMount | null;
   /** Role-scoped blackboard mount; token minted+revoked by the SessionManager. */
-  readonly #blackboardMcp: { url: string; token: string } | null;
+  readonly #blackboardMcp: (() => { url: string; token: string } | undefined) | null;
   #mcpRegistry: McpRegistry | null;
   /** Live scoped token for the mounted memory endpoint; revoked on teardown. */
   #memoryToken: string | null = null;
@@ -339,7 +341,7 @@ export class CodexProvider implements SessionProvider {
    * session that may be recreated mid-goal.
    */
   #blackboardMcpSpawn(): { args: string[]; env: Record<string, string> } {
-    const mount = this.#blackboardMcp;
+    const mount = this.#blackboardMcp?.();
     if (!mount) return { args: [], env: {} };
     const key = `mcp_servers.${BLACKBOARD_MCP_SERVER_NAME}`;
     return {

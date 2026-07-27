@@ -59,12 +59,14 @@ export interface GeminiAcpProviderInit {
    */
   memoryMcp?: MemoryMcpMount;
   /**
-   * Role-scoped goal-blackboard mount for a collaboration child. Unlike the
-   * memory mount, the token is minted ONCE by the SessionManager (it encodes
-   * this role's read/write scope) and revoked at collaboration teardown — so
-   * this provider carries it, it does not mint or revoke.
+   * Role-scoped goal-blackboard mount, resolved LAZILY.
+   *
+   * A getter rather than a value because the orchestrator's own mount is
+   * scoped to a goal id that IS its session id — so it cannot exist until
+   * after the Session is constructed. Providers read it when they build their
+   * server list (per turn for claude), by which time it is set.
    */
-  blackboardMcp?: { url: string; token: string };
+  blackboardMcp?: () => { url: string; token: string } | undefined;
 
   /** Cross-backend MCP registry — external servers mount on session/new
    *  (gemini-cli owns its client); approval flows through canUseTool. */
@@ -87,7 +89,7 @@ export class GeminiAcpProvider implements SessionProvider {
   #workspaceId: string;
   #memoryMcp: MemoryMcpMount | null;
   /** Role-scoped blackboard mount; token minted+revoked by the SessionManager. */
-  readonly #blackboardMcp: { url: string; token: string } | null;
+  readonly #blackboardMcp: (() => { url: string; token: string } | undefined) | null;
   #mcpRegistry: McpRegistry | null;
   /** Live scoped token for the mounted memory endpoint; revoked on teardown. */
   #memoryToken: string | null = null;
@@ -366,12 +368,13 @@ export class GeminiAcpProvider implements SessionProvider {
     // collaboration rather than to a backing session that resetToNewSession
     // may recreate. Re-minting per backing session would hand this child a
     // second live token the manager can't revoke at teardown.
-    if (this.#blackboardMcp) {
+    const bb = this.#blackboardMcp?.();
+    if (bb) {
       servers.push({
         type: "http",
         name: BLACKBOARD_MCP_SERVER_NAME,
-        url: this.#blackboardMcp.url,
-        headers: [{ name: "Authorization", value: `Bearer ${this.#blackboardMcp.token}` }],
+        url: bb.url,
+        headers: [{ name: "Authorization", value: `Bearer ${bb.token}` }],
       });
     }
     // Registry servers — native mount (gemini-cli owns its MCP client). ACP's
