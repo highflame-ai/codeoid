@@ -79,6 +79,13 @@ export const CAPABILITIES = {
    * ids, never tool args) when one of that user's sessions blocks on approval.
    */
   PUSH: "push",
+  /**
+   * Goal-blackboard inspection (`blackboard.index` / `blackboard.read`).
+   * Declared by the daemon; clients feature-detect before offering an artifact
+   * panel, so an older daemon simply doesn't grow the affordance rather than
+   * showing one that errors on click.
+   */
+  BLACKBOARD: "blackboard",
 } as const;
 
 export type Capability = (typeof CAPABILITIES)[keyof typeof CAPABILITIES];
@@ -812,6 +819,8 @@ export type ClientMessage =
   | FsReadMsg
   | FsBrowseDirMsg
   | ClaudeConfigMsg
+  | BlackboardIndexMsg
+  | BlackboardReadMsg
   | ModelsListMsg
   | SessionExportMsg
   | SessionImportMsg
@@ -1417,6 +1426,42 @@ export interface ClaudeConfigMsg extends BaseClientMsg {
 }
 
 /**
+ * List what a collaboration's goal blackboard holds — kind, slot, version,
+ * author, size — without any artifact bodies
+ * (docs/collaborative-session-design.md §4).
+ *
+ * `sessionId` may name either the orchestrator or any of its role-children;
+ * the daemon resolves a child to its parent's goal. Every client would
+ * otherwise have to duplicate that hop, and getting it wrong yields a
+ * confusing empty board rather than an error.
+ */
+export interface BlackboardIndexMsg extends BaseClientMsg {
+  type: "blackboard.index";
+  sessionId: string;
+}
+
+/**
+ * Read one artifact body from a collaboration's goal blackboard.
+ *
+ * Unlike the agent-facing `blackboard_read` MCP tool, this is NOT filtered by
+ * a role's read scope: role scoping exists to keep the agents independent of
+ * each other (§6 — a reviewer that can read its peers is an echo, not a
+ * panel), which says nothing about the human who owns the goal and can already
+ * read every child's transcript.
+ */
+export interface BlackboardReadMsg extends BaseClientMsg {
+  type: "blackboard.read";
+  sessionId: string;
+  /** A core kind (`spec`, `research`, …) or `extra/<key>`. */
+  kind: string;
+  /** Multi-writer slot as reported by the index; omit for the singleton. */
+  slot?: string | null;
+  /** A specific version; omit for the latest. Writes never overwrite, so
+   *  older versions stay readable for auditing a handoff after the fact. */
+  version?: number;
+}
+
+/**
  * Ask the daemon for the model catalog the Claude Code backend actually
  * supports (via the SDK's `supportedModels()`), rather than a hardcoded
  * list that goes stale. Daemon-wide — no sessionId. Returns the cached
@@ -1622,6 +1667,56 @@ export interface ClaudeConfigResultMsg {
   skills: ClaudeConfigSkill[];
   mcpServers: ClaudeConfigMcpServer[];
   hooks: ClaudeConfigHook[];
+}
+
+/** One index row: what exists, at what version, by whom — never a body. */
+export interface BlackboardIndexEntry {
+  /** A core kind (`spec`, `research`, …) or `extra/<key>`. */
+  kind: string;
+  /** Multi-writer discriminator (`review#2`); null = the singleton slot. */
+  slot: string | null;
+  /** Latest version present. Writes append, so this only ever grows. */
+  version: number;
+  /** ZeroID subject of the producing agent. */
+  authorSub: string;
+  /** Collaboration role that wrote it, when written by a role-child. */
+  authorRole: string | null;
+  /** Epoch ms of the latest version. */
+  updatedAt: number;
+  /** Body size of the latest version, so a client can warn before fetching. */
+  bytes: number;
+}
+
+export interface BlackboardIndexResultMsg {
+  type: "blackboard.index.result";
+  requestId: string;
+  /** The GOAL session — the orchestrator, even when a child was asked for. */
+  sessionId: string;
+  /** The collaboration's goal text, for labelling the board. */
+  goal: string;
+  entries: BlackboardIndexEntry[];
+}
+
+/** One artifact version, body included. */
+export interface BlackboardArtifact {
+  kind: string;
+  slot: string | null;
+  version: number;
+  content: string;
+  authorSub: string;
+  authorRole: string | null;
+  createdAt: number;
+}
+
+export interface BlackboardReadResultMsg {
+  type: "blackboard.read.result";
+  requestId: string;
+  /** The GOAL session — the orchestrator, even when a child was asked for. */
+  sessionId: string;
+  /** Null when nothing has been written to that kind/slot/version yet. Not an
+   *  error: "the searcher hasn't produced research yet" is a normal state of a
+   *  collaboration in flight, and clients render it as pending. */
+  artifact: BlackboardArtifact | null;
 }
 
 export interface ModelsListResultMsg {
@@ -1993,6 +2088,8 @@ export type DaemonMessage =
   | FsReadResultMsg
   | FsBrowseDirResultMsg
   | ClaudeConfigResultMsg
+  | BlackboardIndexResultMsg
+  | BlackboardReadResultMsg
   | ModelsListResultMsg
   | SessionExportResultMsg
   | SessionImportResultMsg

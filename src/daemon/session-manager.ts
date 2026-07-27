@@ -38,7 +38,7 @@ import {
   resolveAgainstList,
   resolveModelIdForProvider,
 } from "./models.js";
-import { Blackboard } from "./blackboard/service.js";
+import { Blackboard, type OwnerBlackboard } from "./blackboard/service.js";
 import { BlackboardStore } from "./blackboard/store.js";
 import { BlackboardMcpHttp } from "./blackboard/mcp-http.js";
 import {
@@ -674,6 +674,10 @@ mcpHub: this.#mcpHub,
         return this.#fsBrowseDir(msg, auth);
       case "claude.config":
         return this.#claudeConfig(msg, auth);
+      case "blackboard.index":
+        return this.#blackboardIndex(msg, auth);
+      case "blackboard.read":
+        return this.#blackboardRead(msg, auth);
       case "models.list":
         return this.#modelsList(msg);
       case "session.export":
@@ -1308,6 +1312,145 @@ mcpHub: this.#mcpHub,
     } catch (err) {
       return this.#fsErr(msg.id, err);
     }
+  }
+
+  // ---------- goal blackboard (owner-facing) ----------
+
+  /**
+   * Resolve a client-supplied session id to the collaboration goal it belongs
+   * to, or an error message naming why it doesn't belong to one.
+   *
+   * Accepts either the orchestrator or one of its role-children. Every client
+   * would otherwise have to walk `collaborationRole.parentSessionId` itself,
+   * and a client that got it wrong would see an EMPTY board rather than an
+   * error — the least debuggable possible outcome.
+   *
+   * The parent is re-fetched through `#getOwnedSession`, not trusted from the
+   * child's field: the ownership check must be made against the session whose
+   * artifacts are about to be read, not against the one that named it.
+   */
+  #resolveGoalSession(
+    sessionId: string,
+    auth: AuthContext,
+  ): { ok: true; goal: Session } | { ok: false; error: string; code: "not_found" | "invalid_request" } {
+    const session = this.#getOwnedSession(sessionId, auth);
+    if (!session) return { ok: false, error: "Session not found", code: "not_found" };
+    if (session.collaboration) return { ok: true, goal: session };
+
+    const parentId = session.collaborationRole?.parentSessionId;
+    if (!parentId) {
+      return {
+        ok: false,
+        error: `Session "${session.name}" is not part of a collaboration — it has no goal blackboard`,
+        code: "invalid_request",
+      };
+    }
+    const parent = this.#getOwnedSession(parentId, auth);
+    if (!parent?.collaboration) {
+      // The orchestrator was destroyed but this child hasn't finished draining.
+      // Teardown drops the artifacts with the goal, so there is nothing to show.
+      return {
+        ok: false,
+        error: "The orchestrator for this role-child is gone; its blackboard was torn down with it",
+        code: "not_found",
+      };
+    }
+    return { ok: true, goal: parent };
+  }
+
+  #ownerBlackboard(goal: Session): OwnerBlackboard {
+    return this.#goalBlackboard().forOwner({
+      accountId: goal.accountId,
+      projectId: goal.projectId,
+      goalSessionId: goal.id,
+    });
+  }
+
+  /**
+   * The board's contents at a glance. Gated on `session:list` rather than a new
+   * scope: an index is metadata about a session the holder can already
+   * enumerate, it carries no bodies, and inventing a scope would 403 every
+   * token minted before this shipped.
+   */
+  #blackboardIndex(
+    msg: Extract<ClientMessage, { type: "blackboard.index" }>,
+    auth: AuthContext,
+  ): DaemonMessage {
+    if (!hasScope(auth.scopes as string[], SCOPES.SESSION_LIST)) {
+      return {
+        type: "response.error",
+        requestId: msg.id,
+        error: "Missing scope: session:list",
+        code: "forbidden",
+      };
+    }
+    const resolved = this.#resolveGoalSession(msg.sessionId, auth);
+    if (!resolved.ok) {
+      return {
+        type: "response.error",
+        requestId: msg.id,
+        error: resolved.error,
+        code: resolved.code,
+      };
+    }
+    return {
+      type: "blackboard.index.result",
+      requestId: msg.id,
+      sessionId: resolved.goal.id,
+      goal: resolved.goal.collaboration?.goal ?? "",
+      entries: this.#ownerBlackboard(resolved.goal).index(),
+    };
+  }
+
+  /**
+   * One artifact body. Gated on `session:watch` — a body is session CONTENT,
+   * the same class as the streamed output a watcher already receives, and a
+   * step above the `session:list` metadata the index exposes.
+   */
+  #blackboardRead(
+    msg: Extract<ClientMessage, { type: "blackboard.read" }>,
+    auth: AuthContext,
+  ): DaemonMessage {
+    if (!hasScope(auth.scopes as string[], SCOPES.SESSION_WATCH)) {
+      return {
+        type: "response.error",
+        requestId: msg.id,
+        error: "Missing scope: session:watch",
+        code: "forbidden",
+      };
+    }
+    const resolved = this.#resolveGoalSession(msg.sessionId, auth);
+    if (!resolved.ok) {
+      return {
+        type: "response.error",
+        requestId: msg.id,
+        error: resolved.error,
+        code: resolved.code,
+      };
+    }
+    const found = this.#ownerBlackboard(resolved.goal).read(
+      msg.kind,
+      msg.slot ?? null,
+      msg.version,
+    );
+    return {
+      type: "blackboard.read.result",
+      requestId: msg.id,
+      sessionId: resolved.goal.id,
+      // `id`/`goalSessionId` are dropped: the id is an internal row key with no
+      // client use, and the goal is already on the envelope.
+      artifact: found
+        ? {
+            kind: found.kind,
+            slot: found.slot,
+            version: found.version,
+            content: found.content,
+            authorSub: found.authorSub,
+            authorRole: found.authorRole,
+            createdAt: found.createdAt,
+          }
+        : null,
+    };
   }
 
   #fsErr(requestId: string, err: unknown): DaemonMessage {

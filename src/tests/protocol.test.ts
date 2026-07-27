@@ -432,6 +432,10 @@ describe("DaemonMessage routing", () => {
         case "fs.browse_dir.result": return `fs.browse:${msg.entries.length}`;
         case "claude.config.result":
           return `cc:${msg.agents.length}/${msg.skills.length}`;
+        case "blackboard.index.result":
+          return `bb.index:${msg.entries.length}`;
+        case "blackboard.read.result":
+          return `bb.read:${msg.artifact?.kind ?? "none"}`;
         case "models.list.result":
           return `models:${msg.models.length}`;
         case "session.export.result":

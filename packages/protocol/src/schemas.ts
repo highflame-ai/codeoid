@@ -342,6 +342,27 @@ export const claudeConfigSchema = z.object({
   sessionId: sessionIdField,
 });
 
+/**
+ * Goal-blackboard inspection. `kind` is a bounded string rather than an enum
+ * for the same reason the role scoping fields are: `extra/<key>` is an open
+ * namespace, and the daemon's `isValidArtifactKind` gives a specific error
+ * naming the valid core kinds instead of an opaque schema rejection.
+ */
+export const blackboardIndexSchema = z.object({
+  ...base,
+  type: z.literal("blackboard.index"),
+  sessionId: sessionIdField,
+});
+
+export const blackboardReadSchema = z.object({
+  ...base,
+  type: z.literal("blackboard.read"),
+  sessionId: sessionIdField,
+  kind: z.string().min(1).max(64),
+  slot: z.string().min(1).max(128).nullish(),
+  version: z.number().int().positive().optional(),
+});
+
 export const modelsListSchema = z.object({
   ...base,
   type: z.literal("models.list"),
@@ -587,6 +608,8 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   fsReadSchema,
   fsBrowseDirSchema,
   claudeConfigSchema,
+  blackboardIndexSchema,
+  blackboardReadSchema,
   modelsListSchema,
   sessionExportSchema,
   sessionImportSchema,

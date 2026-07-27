@@ -30,6 +30,9 @@ import {
 import { MockSessionProvider, mockResult } from "../daemon/providers/mock/session-provider.js";
 import { ProviderRegistry } from "../daemon/providers/registry.js";
 import type { ProviderEvent } from "../daemon/providers/interface.js";
+import { Blackboard } from "../daemon/blackboard/service.js";
+import { BlackboardStore } from "../daemon/blackboard/store.js";
+import { parseClientMessage } from "@codeoid/protocol/schemas";
 import { SessionManager } from "../daemon/session-manager.js";
 import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
@@ -873,5 +876,229 @@ describe("the session is its orchestrator", () => {
     if (resp.type === "response.ok") {
       expect((resp.data as SessionInfo).providerId).toBe("gemini");
     }
+  });
+});
+
+// ── The owner-facing blackboard wire verbs ──────────────────────────────────
+
+// `blackboard.index` / `blackboard.read` are the only path by which a HUMAN
+// sees what their fleet produced. The agent-facing MCP tools are role-scoped
+// by design (§6); these are not, so what guards them is ownership of the goal
+// session — and that has to hold for every way a caller can name one.
+describe("blackboard.index / blackboard.read", () => {
+  const CONFIG: CollaborationConfig = {
+    goal: "Ship the blackboard panel",
+    roles: [
+      { name: "orchestrator", providerId: "claude" },
+      { name: "review", providerId: "gemini", count: 2 },
+    ],
+  };
+
+  /** Same daemon, a different tenant — the isolation probe. */
+  const OTHER_AUTH: AuthContext = {
+    ...AUTH,
+    sub: "user:other",
+    accountId: "acc-other",
+    projectId: "proj-other",
+  };
+
+  const runAs = (msg: ClientMessage, auth: AuthContext): Promise<DaemonMessage> =>
+    manager.handle(msg, auth, { id: "c2", auth, send: () => {} });
+
+  /** Write through the REAL role-scoped path so slots + attribution are the
+   *  ones agents actually produce, then read back over the wire. */
+  const board = () => new Blackboard(new BlackboardStore(store.database));
+  const writeAs = (goalId: string, role: string, ordinal: number, kind: string, content: string) =>
+    board()
+      .forRole(
+        { accountId: AUTH.accountId, projectId: AUTH.projectId, goalSessionId: goalId },
+        { roleName: role, ordinal, authorSub: `agent:${goalId}:${role}#${ordinal}` },
+      )
+      .write(kind, content);
+
+  const createCollab = async (id: string): Promise<SessionInfo> => {
+    manager.setBlackboardUrl("http://127.0.0.1:7400/mcp/blackboard");
+    const resp = await run({ type: "session.create", id, name: id, workdir, collaboration: CONFIG });
+    if (resp.type !== "response.ok") throw new Error(`create failed: ${JSON.stringify(resp)}`);
+    return resp.data as SessionInfo;
+  };
+
+  test("indexes what the roles wrote, with the goal text for labelling", async () => {
+    const parent = await createCollab("bb1");
+    writeAs(parent.id, "orchestrator", 1, "spec", "SPEC BODY");
+    writeAs(parent.id, "review", 1, "findings", "R1");
+    writeAs(parent.id, "review", 2, "findings", "R2");
+
+    const resp = await run({ type: "blackboard.index", id: "i1", sessionId: parent.id });
+    expect(resp.type).toBe("blackboard.index.result");
+    if (resp.type !== "blackboard.index.result") return;
+    expect(resp.goal).toBe(CONFIG.goal);
+    expect(resp.sessionId).toBe(parent.id);
+    // Each reviewer occupies its own slot — a panel collapsed to one entry is
+    // the exact failure MULTI_WRITER_KINDS exists to prevent.
+    expect(resp.entries.map((e) => `${e.kind}:${e.slot ?? "-"}`).sort()).toEqual([
+      "findings:review",
+      "findings:review#2",
+      "spec:-",
+    ]);
+    expect(resp.entries.find((e) => e.kind === "spec")?.bytes).toBe("SPEC BODY".length);
+    // Bodies never travel on the index.
+    expect(JSON.stringify(resp.entries)).not.toContain("SPEC BODY");
+  });
+
+  test("a role-child resolves to its parent's goal, not to an empty board", async () => {
+    // Clients focus children as often as orchestrators; making each one walk
+    // parentSessionId itself means a client that gets it wrong sees an EMPTY
+    // board rather than an error.
+    const parent = await createCollab("bb2");
+    writeAs(parent.id, "orchestrator", 1, "spec", "S");
+    const kid = childrenOf(await allSessions(), parent.id)[0]!;
+
+    const resp = await run({ type: "blackboard.index", id: "i2", sessionId: kid.id });
+    expect(resp.type).toBe("blackboard.index.result");
+    if (resp.type !== "blackboard.index.result") return;
+    expect(resp.sessionId).toBe(parent.id);
+    expect(resp.entries.map((e) => e.kind)).toEqual(["spec"]);
+  });
+
+  test("a plain session says it has no blackboard instead of returning nothing", async () => {
+    const resp0 = await run({ type: "session.create", id: "p1", name: "plain", workdir });
+    const plain = (resp0 as { data: SessionInfo }).data;
+    const resp = await run({ type: "blackboard.index", id: "i3", sessionId: plain.id });
+    expect(resp.type).toBe("response.error");
+    if (resp.type !== "response.error") return;
+    expect(resp.code).toBe("invalid_request");
+    expect(resp.error).toMatch(/not part of a collaboration/);
+  });
+
+  test("another tenant gets not_found, never someone else's board", async () => {
+    const parent = await createCollab("bb3");
+    writeAs(parent.id, "orchestrator", 1, "spec", "SECRET");
+
+    const idx = await runAs(
+      { type: "blackboard.index", id: "i4", sessionId: parent.id },
+      OTHER_AUTH,
+    );
+    expect(idx.type).toBe("response.error");
+    if (idx.type === "response.error") expect(idx.code).toBe("not_found");
+
+    const read = await runAs(
+      { type: "blackboard.read", id: "i5", sessionId: parent.id, kind: "spec" },
+      OTHER_AUTH,
+    );
+    expect(read.type).toBe("response.error");
+    expect(JSON.stringify(read)).not.toContain("SECRET");
+  });
+
+  test("index needs session:list and read needs session:watch", async () => {
+    const parent = await createCollab("bb4");
+    writeAs(parent.id, "orchestrator", 1, "spec", "S");
+
+    // A token holding everything EXCEPT the one scope each verb requires.
+    const without = (drop: string): AuthContext => ({
+      ...AUTH,
+      scopes: AUTH.scopes.filter((s) => s !== drop) as AuthContext["scopes"],
+    });
+
+    const idx = await runAs(
+      { type: "blackboard.index", id: "i6", sessionId: parent.id },
+      without("session:list"),
+    );
+    expect(idx.type).toBe("response.error");
+    if (idx.type === "response.error") expect(idx.code).toBe("forbidden");
+
+    const read = await runAs(
+      { type: "blackboard.read", id: "i7", sessionId: parent.id, kind: "spec" },
+      without("session:watch"),
+    );
+    expect(read.type).toBe("response.error");
+    if (read.type === "response.error") expect(read.code).toBe("forbidden");
+
+    // ...and the index still works for a watch-less token, since it carries
+    // no bodies. The two verbs are deliberately gated at different tiers.
+    const idxOk = await runAs(
+      { type: "blackboard.index", id: "i8", sessionId: parent.id },
+      without("session:watch"),
+    );
+    expect(idxOk.type).toBe("blackboard.index.result");
+  });
+
+  test("reads a body, including a specific reviewer's slot", async () => {
+    const parent = await createCollab("bb5");
+    writeAs(parent.id, "review", 1, "findings", "FIRST OPINION");
+    writeAs(parent.id, "review", 2, "findings", "SECOND OPINION");
+
+    const first = await run({
+      type: "blackboard.read", id: "r1", sessionId: parent.id, kind: "findings", slot: "review",
+    });
+    expect(first.type).toBe("blackboard.read.result");
+    if (first.type !== "blackboard.read.result") return;
+    expect(first.artifact?.content).toBe("FIRST OPINION");
+    expect(first.artifact?.authorRole).toBe("review");
+
+    const second = await run({
+      type: "blackboard.read", id: "r2", sessionId: parent.id, kind: "findings", slot: "review#2",
+    });
+    if (second.type !== "blackboard.read.result") return;
+    expect(second.artifact?.content).toBe("SECOND OPINION");
+  });
+
+  test("a superseded version is still readable — writes append, never overwrite", async () => {
+    const parent = await createCollab("bb6");
+    writeAs(parent.id, "orchestrator", 1, "spec", "v1 text");
+    writeAs(parent.id, "orchestrator", 1, "spec", "v2 text");
+
+    const latest = await run({
+      type: "blackboard.read", id: "r3", sessionId: parent.id, kind: "spec",
+    });
+    if (latest.type !== "blackboard.read.result") return;
+    expect(latest.artifact?.version).toBe(2);
+    expect(latest.artifact?.content).toBe("v2 text");
+
+    const old = await run({
+      type: "blackboard.read", id: "r4", sessionId: parent.id, kind: "spec", version: 1,
+    });
+    if (old.type !== "blackboard.read.result") return;
+    expect(old.artifact?.content).toBe("v1 text");
+  });
+
+  test("an unwritten artifact is null, not an error", async () => {
+    // A collaboration in flight legitimately has empty lanes; a client renders
+    // that as pending, which it cannot do if the daemon returns an error.
+    const parent = await createCollab("bb7");
+    const resp = await run({
+      type: "blackboard.read", id: "r5", sessionId: parent.id, kind: "research",
+    });
+    expect(resp.type).toBe("blackboard.read.result");
+    if (resp.type !== "blackboard.read.result") return;
+    expect(resp.artifact).toBeNull();
+  });
+
+  test("a malformed request is rejected at the schema, before any handler", () => {
+    const rejected = (over: Record<string, unknown>) =>
+      parseClientMessage({
+        type: "blackboard.read", id: "r6", sessionId: "s", kind: "spec", ...over,
+      }).ok;
+    expect(rejected({ kind: "" })).toBe(false);
+    expect(rejected({ kind: "x".repeat(65) })).toBe(false);
+    expect(rejected({ version: 0 })).toBe(false);
+    expect(rejected({ version: -1 })).toBe(false);
+    expect(rejected({ slot: "s".repeat(129) })).toBe(false);
+    // `extra/<key>` is an open namespace — the schema must let it through and
+    // leave validity to the daemon, which can name the valid core kinds back.
+    expect(rejected({ kind: "extra/bench-results" })).toBe(true);
+  });
+
+  test("an orphaned child reports the torn-down goal rather than an empty board", async () => {
+    const parent = await createCollab("bb8");
+    const kid = childrenOf(await allSessions(), parent.id)[0]!;
+    // Teardown deletes the goal's artifacts, so "empty" and "gone" would be
+    // indistinguishable to a client if this returned a result.
+    await run({ type: "session.destroy", id: "d1", sessionId: parent.id });
+
+    const resp = await run({ type: "blackboard.index", id: "i9", sessionId: kid.id });
+    expect(resp.type).toBe("response.error");
+    if (resp.type !== "response.error") return;
+    expect(resp.code).toBe("not_found");
   });
 });
