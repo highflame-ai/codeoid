@@ -33,6 +33,7 @@ import {
   MEMORY_TOOL_NAMES,
   type MemoryEngine,
 } from "../../memory/index.js";
+import { BLACKBOARD_MCP_SERVER_NAME } from "../../blackboard/mcp-http.js";
 import type { McpRegistry } from "../../mcp/registry.js";
 import { resolveEnvMap } from "../../mcp/types.js";
 import type { CompressionRegistry } from "../../compress/index.js";
@@ -48,6 +49,21 @@ import type { PackSubagent } from "../../pipeline/subagents.js";
 
 /** Map ambient-pack subagents to the Claude Agent SDK's programmatic `agents`
  *  option (keyed by name). Empty → no `agents` key at all. */
+/** `{ codeoid_blackboard: … }` when a mount is present, else `{}`. Split out so
+ *  the spread never introduces an `undefined`-valued key. */
+function blackboardServerEntry(
+  mount: { url: string; token: string } | undefined,
+): Record<string, McpServerConfig> {
+  if (!mount) return {};
+  return {
+    [BLACKBOARD_MCP_SERVER_NAME]: {
+      type: "http",
+      url: mount.url,
+      headers: { Authorization: `Bearer ${mount.token}` },
+    } as unknown as McpServerConfig,
+  };
+}
+
 function packAgentsOption(
   subs?: readonly PackSubagent[],
 ): { agents?: Record<string, { description: string; prompt: string; tools?: string[] }> } {
@@ -79,6 +95,15 @@ export interface ClaudeProviderInit {
   memory?: MemoryEngine;
   /** codeoid_fleet MCP server — conductor sessions only (read-only fleet view). */
   fleet?: McpSdkServerConfigWithInstance;
+  /**
+   * Role-scoped goal-blackboard mount, resolved LAZILY.
+   *
+   * A getter rather than a value because the orchestrator's own mount is
+   * scoped to a goal id that IS its session id — so it cannot exist until
+   * after the Session is constructed. Providers read it when they build their
+   * server list (per turn for claude), by which time it is set.
+   */
+  blackboardMcp?: () => { url: string; token: string } | undefined;
   /** Cross-backend MCP registry — external servers are mounted natively on the
    *  SDK (claude owns its own MCP client); approval flows through canUseTool. */
   mcpRegistry?: McpRegistry;
@@ -388,6 +413,12 @@ export class ClaudeProvider implements SessionProvider {
       // Conductor sessions only — the read-only fleet view (P3). In-process,
       // so the external-server timeout doesn't apply.
       ...(init.fleet ? { codeoid_fleet: init.fleet } : {}),
+      // Collaboration children only — the role-scoped goal blackboard. Mounted
+      // over HTTP rather than in-process precisely so the SAME surface works on
+      // gemini/codex; claude deliberately gets no privileged path here (#245).
+      // Resolved per query build, not captured at construction — the
+      // orchestrator's mount is attached after its Session exists.
+      ...blackboardServerEntry(init.blackboardMcp?.()),
       // Registry servers — mounted natively on the SDK (claude owns its client);
       // tool calls surface as `mcp__<server>__<tool>` and gate via canUseTool.
       ...withMcpToolTimeout(registryServersForClaude(init.mcpRegistry), mcpToolTimeoutMs),

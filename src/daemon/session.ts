@@ -250,6 +250,14 @@ export interface SessionCreateOptions {
    */
   collaborationRole?: SessionInfo["collaborationRole"];
   /**
+   * Role-scoped goal-blackboard mount for a collaboration child: the endpoint
+   * URL plus a bearer token that IS the scope (one goal, this role's read/write
+   * set). Handed to the provider like `memoryMcp`, so any backend able to mount
+   * an MCP URL gets it — which is the point of making the blackboard mountable
+   * rather than an in-process Claude-SDK server (#245).
+   */
+  blackboardMcp?: { url: string; token: string };
+  /**
    * Pre-built codeoid_fleet MCP server (conductor sessions only). Built by
    * the SessionManager because its tools close over the manager's tenant-
    * scoped session view; the Session just hands it to the provider.
@@ -331,6 +339,10 @@ export class Session {
   readonly collaboration?: CollaborationConfig;
   /** Which collaboration + role this session serves, when it is a child. */
   readonly collaborationRole?: SessionInfo["collaborationRole"];
+  /** Role-scoped blackboard mount. NOT readonly: the orchestrator's own mount
+   *  is scoped to a goal id that IS this session's id, so it can only be
+   *  attached after construction (see attachBlackboard). */
+  #blackboardMcp?: { url: string; token: string };
   readonly createdBy: string;
   readonly createdAt: string;
   /**
@@ -631,6 +643,7 @@ export class Session {
     this.worktree = opts.worktree;
     this.collaboration = opts.collaboration;
     this.collaborationRole = opts.collaborationRole;
+    this.#blackboardMcp = opts.blackboardMcp;
     this.#onStatusChange = opts.onStatusChange;
     this.#workerShape = opts.workerShape;
     if (opts.initialMode) {
@@ -824,6 +837,9 @@ export class Session {
       identityManager: this.#identityManager,
       memory: this.#memory,
       memoryMcp: this.#memoryMcp,
+      // A getter, so a mount attached after construction still reaches the
+      // provider when it next builds its server list.
+      blackboardMcp: () => this.#blackboardMcp,
       mcpRegistry: this.#mcpRegistry,
       mcpHub: this.#mcpHub,
       fleet: this.#fleet,
@@ -2230,6 +2246,17 @@ export class Session {
     if (messages.length > 0) {
       this.#provider.setHasQueried(true);
     }
+  }
+
+  /**
+   * Attach this session's role-scoped blackboard mount.
+   *
+   * Used for the ORCHESTRATOR, whose goal id is its own session id and so
+   * cannot be known before construction. Providers resolve the mount lazily,
+   * so one attached before the first turn is picked up normally.
+   */
+  attachBlackboard(mount: { url: string; token: string }): void {
+    this.#blackboardMcp = mount;
   }
 
   toInfo(): SessionInfo {

@@ -39,6 +39,7 @@ import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from ".
 import { buildGeminiCliEnv } from "../env.js";
 import { StdioJsonRpcProcess } from "../jsonrpc-stdio.js";
 import { MEMORY_MCP_SERVER_NAME, type MemoryMcpMount } from "../../memory/mcp-http.js";
+import { BLACKBOARD_MCP_SERVER_NAME } from "../../blackboard/mcp-http.js";
 import type { McpRegistry } from "../../mcp/registry.js";
 import { resolveEnvMap } from "../../mcp/types.js";
 
@@ -57,6 +58,16 @@ export interface GeminiAcpProviderInit {
    * store on demand — the precondition for the Verbatim Working Set strategy.
    */
   memoryMcp?: MemoryMcpMount;
+  /**
+   * Role-scoped goal-blackboard mount, resolved LAZILY.
+   *
+   * A getter rather than a value because the orchestrator's own mount is
+   * scoped to a goal id that IS its session id — so it cannot exist until
+   * after the Session is constructed. Providers read it when they build their
+   * server list (per turn for claude), by which time it is set.
+   */
+  blackboardMcp?: () => { url: string; token: string } | undefined;
+
   /** Cross-backend MCP registry — external servers mount on session/new
    *  (gemini-cli owns its client); approval flows through canUseTool. */
   mcpRegistry?: McpRegistry;
@@ -77,6 +88,8 @@ export class GeminiAcpProvider implements SessionProvider {
   #argsPrefix: string[];
   #workspaceId: string;
   #memoryMcp: MemoryMcpMount | null;
+  /** Role-scoped blackboard mount; token minted+revoked by the SessionManager. */
+  readonly #blackboardMcp: (() => { url: string; token: string } | undefined) | null;
   #mcpRegistry: McpRegistry | null;
   /** Live scoped token for the mounted memory endpoint; revoked on teardown. */
   #memoryToken: string | null = null;
@@ -110,6 +123,7 @@ export class GeminiAcpProvider implements SessionProvider {
     this.#argsPrefix = init.argsPrefix ?? [];
     this.#workspaceId = init.workspaceId ?? init.sessionId;
     this.#memoryMcp = init.memoryMcp ?? null;
+    this.#blackboardMcp = init.blackboardMcp ?? null;
     this.#mcpRegistry = init.mcpRegistry ?? null;
   }
 
@@ -346,6 +360,21 @@ export class GeminiAcpProvider implements SessionProvider {
         name: MEMORY_MCP_SERVER_NAME,
         url: mount.url,
         headers: [{ name: "Authorization", value: `Bearer ${this.#memoryToken}` }],
+      });
+    }
+    // Role-scoped goal blackboard (collaboration children). Deliberately NO
+    // mint/revoke here, unlike memory above: the SessionManager owns this
+    // token's lifetime, because the scope it encodes belongs to the
+    // collaboration rather than to a backing session that resetToNewSession
+    // may recreate. Re-minting per backing session would hand this child a
+    // second live token the manager can't revoke at teardown.
+    const bb = this.#blackboardMcp?.();
+    if (bb) {
+      servers.push({
+        type: "http",
+        name: BLACKBOARD_MCP_SERVER_NAME,
+        url: bb.url,
+        headers: [{ name: "Authorization", value: `Bearer ${bb.token}` }],
       });
     }
     // Registry servers — native mount (gemini-cli owns its MCP client). ACP's

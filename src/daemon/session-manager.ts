@@ -38,6 +38,9 @@ import {
   resolveAgainstList,
   resolveModelIdForProvider,
 } from "./models.js";
+import { Blackboard } from "./blackboard/service.js";
+import { BlackboardStore } from "./blackboard/store.js";
+import { BlackboardMcpHttp } from "./blackboard/mcp-http.js";
 import {
   childBrief,
   childSessionName,
@@ -93,6 +96,7 @@ import type {
   AuthContext,
   ClientMessage,
   CollaborationConfig,
+  CollaborationRole,
   DaemonMessage,
   McpServerStatus,
   ModelInfo,
@@ -204,6 +208,14 @@ export class SessionManager {
   #rateLimiter: RateLimiter;
   #memory?: MemoryEngine;
   #memoryMcp?: MemoryMcpMount;
+  /** Goal-blackboard MCP endpoint + the loopback URL children mount it from.
+   *  Always constructed: with no minted tokens every request fails closed. */
+  readonly #blackboardMcp = new BlackboardMcpHttp();
+  #blackboardUrl?: string;
+  /** Per-goal artifact store, lazily built on the shared DB connection. */
+  #blackboard?: Blackboard;
+  /** child session id → its blackboard bearer token, revoked on teardown. */
+  readonly #blackboardTokens = new Map<string, string>();
   #mcpRegistry?: McpRegistry;
   #mcpHub?: McpHub;
   /** Live model catalogs by provider id (via each backend's supportedModels
@@ -1321,6 +1333,21 @@ mcpHub: this.#mcpHub,
     this.#memoryMcp = mount;
   }
 
+  /** The goal-blackboard MCP endpoint, routed by the HTTP server. */
+  get blackboardMcp(): BlackboardMcpHttp {
+    return this.#blackboardMcp;
+  }
+
+  /**
+   * The URL a role-child mounts the blackboard from. Loopback regardless of the
+   * daemon's bind address — the agent subprocess runs on this host, and the
+   * endpoint must not become reachable off-box merely because the daemon binds
+   * wide. Same reasoning as the memory mount.
+   */
+  setBlackboardUrl(url: string): void {
+    this.#blackboardUrl = url;
+  }
+
   /** Inject the cross-backend MCP registry + daemon-owned client pool. Sessions
    *  hand both to every provider so the registry's servers mount on all backends. */
   setMcp(registry: McpRegistry, hub: McpHub): void {
@@ -1567,6 +1594,31 @@ mcpHub: this.#mcpHub,
     this.#sessions.set(session.id, session);
     this.#rateLimiter.recordCreation(auth.sub);
 
+    // The orchestrator needs the blackboard too, and needs it MOST: §4 has it
+    // holding the index of artifact states, and §7 has it reading every
+    // reviewer's findings to synthesize. Without a mount it cannot see a
+    // single thing its children publish, and the coordination loop never
+    // closes. Attached here rather than passed to the constructor because the
+    // goal id it is scoped to IS this session's id.
+    if (collaboration) {
+      const orchestrator = orchestratorRole(collaboration);
+      const mount = this.#blackboardMountFor(
+        session,
+        {
+          roleName: ORCHESTRATOR_ROLE,
+          ordinal: 1,
+          providerId: session.providerId,
+          shape: "scout",
+          write: false,
+        },
+        orchestrator,
+      );
+      if (mount) {
+        session.attachBlackboard(mount);
+        this.#blackboardTokens.set(session.id, mount.token);
+      }
+    }
+
     if (collaboration && planned.length > 0) {
       const spawned = await this.#spawnCollaborationChildren(session, collaboration, planned, auth);
       if (!spawned.ok) {
@@ -1617,6 +1669,65 @@ mcpHub: this.#mcpHub,
    * pack constitution instead, so bringing up a fleet of N costs zero tokens
    * and no child burns a turn just to learn it should wait.
    */
+  /**
+   * Revoke a collaboration child's blackboard token. Idempotent, and safe to
+   * call for any session id.
+   *
+   * Must be called from EVERY path that removes a child from `#sessions`, not
+   * just goal teardown. The token lives in the endpoint's binding map, not on
+   * the Session, so dropping the session without revoking leaves a credential
+   * that still authorizes reads and writes against the goal — anything still
+   * holding the URL (a wedged subprocess, a leaked env var) keeps working after
+   * the child is gone. Destroying a child directly used to do exactly that.
+   */
+  #revokeBlackboardToken(sessionId: string): void {
+    const token = this.#blackboardTokens.get(sessionId);
+    if (!token) return;
+    this.#blackboardMcp.revoke(token);
+    this.#blackboardTokens.delete(sessionId);
+  }
+
+  /** Lazily build the blackboard over the daemon's existing DB connection. */
+  #goalBlackboard(): Blackboard {
+    if (!this.#blackboard) {
+      this.#blackboard = new Blackboard(new BlackboardStore(this.#store.database));
+    }
+    return this.#blackboard;
+  }
+
+  /**
+   * Mount config for one role-child's blackboard access, or undefined when the
+   * URL isn't known yet (the HTTP server sets it at startup; unit tests that
+   * construct a bare SessionManager legitimately have none).
+   *
+   * The minted token carries the role's scope, so the child's mount is its
+   * permission — there is no wider handle reachable from it.
+   */
+  #blackboardMountFor(
+    parent: Session,
+    child: PlannedChild,
+    role: CollaborationRole | undefined,
+  ): { url: string; token: string } | undefined {
+    if (!this.#blackboardUrl) return undefined;
+    const handle = this.#goalBlackboard().forRole(
+      {
+        accountId: parent.accountId,
+        projectId: parent.projectId,
+        goalSessionId: parent.id,
+      },
+      {
+        roleName: child.roleName,
+        ordinal: child.ordinal,
+        // Attribution keyed to the ROLE within the goal, not the child's
+        // session id: a role-child replaced after a restart is still the same
+        // contributor, and its earlier artifacts should keep reading that way.
+        authorSub: `agent:${parent.id}:${child.roleName}#${child.ordinal}`,
+      },
+      role ? { reads: role.reads, writes: role.writes } : undefined,
+    );
+    return { url: this.#blackboardUrl, token: this.#blackboardMcp.mint(handle) };
+  }
+
   async #spawnCollaborationChildren(
     parent: Session,
     collaboration: CollaborationConfig,
@@ -1625,6 +1736,13 @@ mcpHub: this.#mcpHub,
   ): Promise<{ ok: true } | { ok: false; error: string }> {
     for (const child of planned) {
       try {
+        // Minted before construction so the child's provider can mount it from
+        // the start — the token carries this role's read/write scope.
+        const blackboard = this.#blackboardMountFor(
+          parent,
+          child,
+          collaboration.roles.find((r) => r.name === child.roleName),
+        );
         const childSession = new Session({
           name: childSessionName(parent.name, child),
           workdir: parent.workdir,
@@ -1665,6 +1783,21 @@ mcpHub: this.#mcpHub,
             ordinal: child.ordinal,
             write: child.write,
           },
+          // Autonomous with a bounded budget — the same posture dispatch gives
+          // its workers, and for the same reason: NOBODY ATTACHES TO A CHILD.
+          // The owner's approval happens once at dispatch time (the R3 gate on
+          // fleet_send/fleet_spawn), not per tool call. Left interactive, a
+          // child's first non-safe tool call parks it at waiting_approval with
+          // zero clients and the collaboration deadlocks on its very first
+          // handoff — observed live before this was set.
+          initialMode: {
+            mode: "autonomous",
+            maxTurns: this.#dispatcher.config.workerToolBudget,
+          },
+          // Role-scoped goal blackboard, mountable by ANY backend (#245) —
+          // this is how a gemini reviewer and an openai reasoner hand work to
+          // each other without the orchestrator relaying it as prose.
+          blackboardMcp: blackboard,
           identityManager: this.#identityManager,
           memory: this.#memory,
           memoryMcp: this.#memoryMcp,
@@ -1677,6 +1810,7 @@ mcpHub: this.#mcpHub,
           onModels: (providerId, m) => this._cacheModels(providerId, m),
         });
         this.#sessions.set(childSession.id, childSession);
+        if (blackboard) this.#blackboardTokens.set(childSession.id, blackboard.token);
         // No rate-limiter charge: the human called session.create once, and
         // the child count is already bounded by MAX_COLLABORATION_CHILDREN.
         // Mirrors spawnWorker, which charges nothing for the same reason.
@@ -1715,6 +1849,7 @@ mcpHub: this.#mcpHub,
           `[codeoid/collaboration] child teardown failed (${reason}): ${err instanceof Error ? err.message : String(err)}`,
         );
       }
+      this.#revokeBlackboardToken(child.id);
       this.#sessions.delete(child.id);
       this.#store.audit(
         "system:collaboration",
@@ -2617,6 +2752,16 @@ mcpHub: this.#mcpHub,
             `target session ${task.targetSession ?? "?"} no longer exists`,
           );
         }
+        // Re-arm a collaboration child's autonomous budget on every dispatch.
+        // A child is long-lived across the whole goal (unlike a disposable
+        // spawn worker), so one initial budget is spent down across successive
+        // dispatches and the child would silently wedge at waiting_approval
+        // partway through — with nobody attached to approve. Same reasoning as
+        // continueWorker re-arming after a restart; the approval that
+        // authorizes this work already happened at the R3 dispatch gate.
+        if (target.collaborationRole) {
+          target.setMode("autonomous", this.#dispatcher.config.workerToolBudget);
+        }
         await target.send(
           `[conductor dispatch ${task.id.slice(0, 8)} — owner-approved]\n\n${task.prompt}`,
           this.#dispatchSenderAuth(task),
@@ -2762,6 +2907,9 @@ mcpHub: this.#mcpHub,
             `[codeoid/dispatch] worker teardown failed (${reason}): ${err instanceof Error ? err.message : String(err)}`,
           );
         }
+        // A collaboration child is role:"worker", so it can reach this path.
+        // Revoke before dropping, same reason as the destroy handler.
+        this.#revokeBlackboardToken(sessionId);
         this.#sessions.delete(sessionId);
       },
 
@@ -3627,9 +3775,28 @@ mcpHub: this.#mcpHub,
     // reach them by.
     if (session.collaboration) {
       await this.#teardownCollaborationChildren(msg.sessionId, "collaboration goal ended");
+      // ...and the orchestrator's own mount.
+      this.#revokeBlackboardToken(msg.sessionId);
+      // Artifacts are goal-scoped, so they die with the goal. Dropped AFTER the
+      // children so a child mid-write can't recreate rows behind the delete.
+      try {
+        this.#goalBlackboard().deleteGoal({
+          accountId: session.accountId,
+          projectId: session.projectId,
+          goalSessionId: session.id,
+        });
+      } catch (err) {
+        console.error(
+          `[codeoid/collaboration] artifact cleanup failed for ${session.id}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     }
 
     await session.destroy(auth);
+    // Covers destroying a CHILD directly (not via goal teardown) — without
+    // this its token stays live in the endpoint's binding map and keeps
+    // authorizing reads/writes on the goal after the session is gone.
+    this.#revokeBlackboardToken(msg.sessionId);
     this.#sessions.delete(msg.sessionId);
     return { type: "response.ok", requestId: msg.id };
   }

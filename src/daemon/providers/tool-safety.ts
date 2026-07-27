@@ -5,6 +5,7 @@
  * widen: an over-broad match here is a prompt-bypass, so it's security-relevant.
  */
 
+import { BLACKBOARD_MCP_SERVER_NAME } from "../blackboard/mcp-http.js";
 import { MEMORY_MCP_SERVER_NAME } from "../memory/mcp-http.js";
 import { MEMORY_TOOL_NAMES } from "../memory/tools.js";
 
@@ -15,6 +16,27 @@ const SAFE_TOOLS = new Set<string>(["Read", "Grep", "Glob"]);
 const MEMORY_TOOL_PREFIXES = [
   `mcp__${MEMORY_MCP_SERVER_NAME}__`, // Claude in-process MCP
   `${MEMORY_MCP_SERVER_NAME}__`, // gemini-cli / codex URL mount
+] as const;
+
+/** Same two namespacing conventions, for the goal-blackboard mount. */
+const BLACKBOARD_TOOL_PREFIXES = [
+  `mcp__${BLACKBOARD_MCP_SERVER_NAME}__`,
+  `${BLACKBOARD_MCP_SERVER_NAME}__`,
+] as const;
+
+/**
+ * Blackboard tools that may run unprompted.
+ *
+ * READS ONLY. `blackboard_write` is deliberately absent even though the service
+ * already scope-checks it: a write publishes into shared state other agents act
+ * on, so it stays on the same footing as any other write tool. The role's write
+ * scope decides whether it is *permitted*; this decides whether it happens
+ * *without anyone looking*, and those are different questions.
+ */
+const BLACKBOARD_SAFE_TOOLS = [
+  "blackboard_index",
+  "blackboard_read",
+  "blackboard_read_all",
 ] as const;
 
 /**
@@ -31,6 +53,11 @@ export function isSafeTool(name: string): boolean {
   for (const prefix of MEMORY_TOOL_PREFIXES) {
     if (name.startsWith(prefix)) {
       return (MEMORY_TOOL_NAMES as readonly string[]).includes(name.slice(prefix.length));
+    }
+  }
+  for (const prefix of BLACKBOARD_TOOL_PREFIXES) {
+    if (name.startsWith(prefix)) {
+      return (BLACKBOARD_SAFE_TOOLS as readonly string[]).includes(name.slice(prefix.length));
     }
   }
   return false;

@@ -32,6 +32,7 @@ import {
   MEMORY_MCP_PATH,
   type MemoryEngine,
 } from "./memory/index.js";
+import { BLACKBOARD_MCP_PATH } from "./blackboard/mcp-http.js";
 import { McpRegistry } from "./mcp/registry.js";
 import { McpHub } from "./mcp/hub.js";
 import { importClaudeMcpServers } from "./mcp/import-claude.js";
@@ -449,6 +450,12 @@ export class DaemonServer {
       daemonEnv: process.env,
     });
     for (const w of this.#mcpRegistry.warnings) console.warn(`[codeoid] ${w}`);
+    // Goal blackboard: loopback URL regardless of bind address — the agent
+    // subprocess runs on this host, and the endpoint must not become
+    // reachable off-box just because the daemon binds wide.
+    this.#manager.setBlackboardUrl(
+      `http://127.0.0.1:${this.#config.port}${BLACKBOARD_MCP_PATH}`,
+    );
     this.#manager.setMcp(this.#mcpRegistry, this.#mcpHub);
     const mcpCount = this.#mcpRegistry.list().filter((s) => !s.builtin).length;
     if (mcpCount > 0) console.log(`[codeoid] mcp: ${mcpCount} external server(s) registered`);
@@ -501,6 +508,15 @@ export class DaemonServer {
           const ep = self.#memoryMcp;
           if (!ep) return new Response("memory disabled", { status: 503 });
           return ep.handle(req);
+        }
+
+        // Goal-blackboard MCP endpoint. Same contract as memory: the bearer
+        // token minted per role-child IS the scope (one goal, one role's
+        // read/write set), and an unknown token fails closed. Always mounted —
+        // unlike memory it has no enable flag, and with no minted tokens every
+        // request 401s anyway.
+        if (url.pathname === BLACKBOARD_MCP_PATH) {
+          return self.#manager.blackboardMcp.handle(req);
         }
 
         if (url.pathname === "/config") {

@@ -18,6 +18,8 @@
 import type { CollaborationConfig, CollaborationRole } from "../protocol/types.js";
 import { LIMITS, ORCHESTRATOR_ROLE } from "../protocol/types.js";
 import { CLAUDE_PROVIDER_ID, resolveModelIdForProvider } from "./models.js";
+import { CORE_ARTIFACT_KINDS, isValidArtifactKind } from "./blackboard/types.js";
+import { resolveRoleIo } from "./blackboard/service.js";
 
 /** The provider-registry surface this module needs — kept narrow so tests
  *  can pass a stub instead of building a real registry. */
@@ -86,6 +88,25 @@ export function validateCollaboration(
       };
     }
 
+    // Blackboard scoping: an unknown kind must reject here. Left to pass, a
+    // typo like `reads: ["diffs"]` would produce a role that appears scoped but
+    // can never read the artifact it needs, and the failure would surface much
+    // later as an agent inexplicably waiting on a handoff.
+    for (const [field, kinds] of [
+      ["reads", raw.reads],
+      ["writes", raw.writes],
+    ] as const) {
+      if (!kinds) continue;
+      for (const kind of kinds) {
+        if (!isValidArtifactKind(kind)) {
+          return {
+            ok: false,
+            error: `Role "${name}" ${field} unknown artifact kind "${kind}" — valid: ${CORE_ARTIFACT_KINDS.join(", ")}, or extra/<key>`,
+          };
+        }
+      }
+    }
+
     const count = raw.count ?? 1;
     if (!Number.isInteger(count) || count < 1) {
       return { ok: false, error: `Role "${name}" count must be a positive integer` };
@@ -128,6 +149,13 @@ export function validateCollaboration(
       // Normalize to an explicit boolean so downstream code never has to
       // re-decide what "absent" means for write authority.
       write: raw.write === true,
+      // Left ABSENT when undeclared, deliberately — the blackboard service
+      // distinguishes "declared nothing" (fall back to the §3 default profile
+      // for this role name) from "declared an empty list" (reads/writes
+      // nothing). Defaulting to [] here would erase that distinction and
+      // silently strip every default profile.
+      ...(raw.reads !== undefined ? { reads: [...raw.reads] } : {}),
+      ...(raw.writes !== undefined ? { writes: [...raw.writes] } : {}),
     });
   }
 
@@ -206,6 +234,9 @@ export interface PlannedChild {
   shape: "ship" | "scout";
   write: boolean;
   purpose?: string;
+  /** Declared blackboard scope, if the role set one; absent = §3 default. */
+  reads?: readonly string[];
+  writes?: readonly string[];
 }
 
 /**
@@ -239,6 +270,8 @@ export function planChildren(
         shape: role.write === true ? "ship" : "scout",
         write: role.write === true,
         ...(role.purpose !== undefined ? { purpose: role.purpose } : {}),
+        ...(role.reads !== undefined ? { reads: role.reads } : {}),
+        ...(role.writes !== undefined ? { writes: role.writes } : {}),
       });
     }
   }
@@ -274,12 +307,25 @@ export function childBrief(
   const contract = child.write
     ? "You MAY modify files in your workdir. Keep the diff minimal and verify your work."
     : "You are READ-ONLY: your identity holds no write scope, so file edits will be denied. Investigate and report — your written findings are the deliverable.";
+  const io = resolveRoleIo(child.roleName, { reads: child.reads, writes: child.writes });
   return [
     `<collaboration role="${child.roleName}"${child.ordinal > 1 ? ` member="${child.ordinal}"` : ""}>`,
     `You are the "${child.roleName}" role in a collaborative session working one shared goal.`,
     child.purpose ? `Your purpose: ${child.purpose}` : null,
     contract,
     "You are one of several agents on this goal, possibly on different model backends. You cannot see the others' work or the orchestrator's reasoning — that is deliberate, so your contribution stays independent.",
+    "",
+    "## Handing work off",
+    "",
+    "Shared state lives on the goal BLACKBOARD, not in chat. Use the blackboard tools:",
+    "- `blackboard_index` — what exists, at what version, written by whom (no contents).",
+    "- `blackboard_read` / `blackboard_read_all` — read an artifact you are scoped for.",
+    "- `blackboard_write` — publish YOUR output. It appends a version; it never overwrites, and for multi-writer kinds you write your own entry.",
+    "",
+    `You can READ: ${io.reads.length > 0 ? io.reads.join(", ") : "(nothing — you work only from the task you are sent)"}`,
+    `You can WRITE: ${io.writes.length > 0 ? io.writes.join(", ") : "(nothing — report back in your reply instead)"}`,
+    "Anything outside that is refused by the daemon, not by your own judgement — don't work around it, and don't ask another agent to fetch it for you.",
+    "",
     "Wait for instructions from the orchestrator before acting; it will send you a specific task.",
     "</collaboration>",
     "",

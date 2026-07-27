@@ -52,6 +52,9 @@ export interface ProviderSessionInit {
   /** Shared in-daemon memory MCP endpoint + URL — mounted by URL-based backends
    *  (gemini-cli, later codex). Present only when memory is enabled. */
   memoryMcp?: MemoryMcpMount;
+  /** Role-scoped goal-blackboard mount, resolved lazily — see the provider
+   *  inits for why it is a getter and not a value. */
+  blackboardMcp?: () => { url: string; token: string } | undefined;
   /** Cross-backend MCP registry — the servers to mount on this session's backend. */
   mcpRegistry?: McpRegistry;
   /** Daemon-owned MCP client pool backing the registry (Model-B backends execute
@@ -173,6 +176,7 @@ export function createDefaultProviderRegistry(config?: CodeoidConfig): ProviderR
         identityManager: init.identityManager,
         memory: init.memory,
         fleet: init.fleet,
+        blackboardMcp: init.blackboardMcp,
         mcpRegistry: init.mcpRegistry,
         config: init.config,
         compressionRegistry: init.compressionRegistry,
@@ -282,6 +286,7 @@ export function createDefaultProviderRegistry(config?: CodeoidConfig): ProviderR
             store: init.store,
             workspaceId: init.workspaceId,
             memoryMcp: init.memoryMcp,
+            blackboardMcp: init.blackboardMcp,
             mcpRegistry: init.mcpRegistry,
             onModels: init.onModels,
           }),
@@ -311,6 +316,7 @@ export function createDefaultProviderRegistry(config?: CodeoidConfig): ProviderR
             store: init.store,
             workspaceId: init.workspaceId,
             memoryMcp: init.memoryMcp,
+            blackboardMcp: init.blackboardMcp,
             mcpRegistry: init.mcpRegistry,
             onModels: init.onModels,
           }),
