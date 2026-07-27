@@ -30,7 +30,9 @@ import {
 } from "../state/sessions";
 import { fetchModels, modelCatalog } from "../state/models";
 import { effectiveMode } from "../lib/session-mode";
+import { CAPABILITIES } from "../protocol/types";
 import type { ClientMessage, SessionInfo, SessionMode } from "../protocol/types";
+import { openBlackboard } from "../state/blackboard";
 import { openExportModal } from "./SessionExportModal";
 
 const MODE_OPTIONS: { value: SessionMode; label: string; hint: string }[] = [
@@ -89,6 +91,7 @@ const SessionControls: Component = () => {
         <div class="flex flex-wrap items-center gap-1.5 text-[11px]">
           <ForkedFromChip forkedFrom={s().forkedFrom} />
           <WorktreeChip worktree={s().worktree} />
+          <BlackboardButton session={s()} />
           <InterruptButton sessionId={s().id} status={s().status} />
           <RotateButton sessionId={s().id} />
           <ModePicker sessionId={s().id} current={effectiveMode(s())} />
@@ -104,6 +107,34 @@ const SessionControls: Component = () => {
           <DestroyButton sessionId={s().id} name={s().name} />
         </div>
       )}
+    </Show>
+  );
+};
+
+/**
+ * Opens the goal blackboard for a session that is part of a collaboration —
+ * the orchestrator or any role-child, since the daemon resolves the hop.
+ *
+ * Capability-gated rather than always rendered: against a daemon that predates
+ * `blackboard.index` the affordance simply doesn't appear, instead of
+ * appearing and erroring on click.
+ */
+const BlackboardButton: Component<{ session: SessionInfo }> = (props) => {
+  const partOfCollab = () =>
+    Boolean(props.session.collaboration ?? props.session.collaborationRole);
+  const supported = () =>
+    authIdentity()?.capabilities?.includes(CAPABILITIES.BLACKBOARD) ?? false;
+  return (
+    <Show when={partOfCollab() && supported()}>
+      <button
+        type="button"
+        onClick={() => openBlackboard(props.session.id)}
+        class="flex items-center gap-1 rounded border border-accent/30 bg-accent/5 px-2 py-1 font-mono text-[11px] text-fg-muted transition hover:border-accent/50 hover:text-fg"
+        title="Goal blackboard — what this collaboration's roles have handed each other"
+      >
+        <span class="text-accent">▤</span>
+        <span>board</span>
+      </button>
     </Show>
   );
 };

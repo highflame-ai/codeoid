@@ -1,0 +1,208 @@
+/**
+ * Goal-blackboard slice — the index of a collaboration's artifacts and the
+ * body of whichever one the user selected.
+ *
+ * Daemon-canonical, like every other slice here: nothing is derived locally.
+ * The daemon resolves a role-child's session id to its parent's goal, so
+ * `goalSessionId` is always taken from the RESULT rather than from whatever
+ * the caller passed — focusing a child and focusing its orchestrator must land
+ * on the same board.
+ */
+
+import { createSignal } from "solid-js";
+
+import { getClient, newRequestId } from "./connection";
+import type {
+  BlackboardArtifact,
+  BlackboardIndexEntry,
+  BlackboardIndexResultMsg,
+  BlackboardReadResultMsg,
+} from "../protocol/types";
+
+/** Identifies one artifact within a board. `slot: null` = the singleton. */
+export interface ArtifactRef {
+  kind: string;
+  slot: string | null;
+}
+
+interface State {
+  /** Session id the board was requested for (the goal, per the daemon). */
+  goalSessionId: string | null;
+  goal: string;
+  entries: BlackboardIndexEntry[];
+  loading: boolean;
+  error: string | null;
+  fetchedAt: number;
+  selected: ArtifactRef | null;
+  artifact: BlackboardArtifact | null;
+  artifactLoading: boolean;
+  artifactError: string | null;
+}
+
+const EMPTY: State = {
+  goalSessionId: null,
+  goal: "",
+  entries: [],
+  loading: false,
+  error: null,
+  fetchedAt: 0,
+  selected: null,
+  artifact: null,
+  artifactLoading: false,
+  artifactError: null,
+};
+
+const [state, setState] = createSignal<State>(EMPTY);
+const [openSignal, setOpenSignal] = createSignal(false);
+
+export const blackboard = state;
+export const isBlackboardOpen = openSignal;
+
+/**
+ * Stable key for an artifact ref — also the row key in the index list.
+ *
+ * Separated by an explicit U+0000 escape rather than a printable character:
+ * `kind` is an open namespace (`extra/<key>`) and `slot` is daemon-generated,
+ * so any visible delimiter is one future naming choice away from letting two
+ * distinct artifacts collide onto one key — which would silently show the
+ * wrong body under the right row. Written as `\u0000`, never as a literal
+ * control byte: a raw NUL in source is invisible and makes git treat the whole
+ * file as binary.
+ */
+const REF_KEY_SEP = "\u0000";
+
+export function refKey(ref: ArtifactRef): string {
+  return `${ref.kind}${REF_KEY_SEP}${ref.slot ?? ""}`;
+}
+
+/**
+ * Which request each async path is currently serving. Compared on arrival so a
+ * slow reply for a board (or artifact) the user has already navigated away
+ * from is dropped instead of overwriting the newer one.
+ */
+let indexInflight: string | null = null;
+let artifactInflight: string | null = null;
+
+/**
+ * Open the drawer for a session that is part of a collaboration — either the
+ * orchestrator or any of its role-children; the daemon resolves the hop.
+ *
+ * Switching to a DIFFERENT session resets the board. Re-opening the same one
+ * keeps the current entries on screen and refreshes underneath, so the panel
+ * doesn't blank out on every open.
+ */
+export function openBlackboard(sessionId: string): void {
+  setOpenSignal(true);
+  void fetchIndex(sessionId);
+}
+
+export function closeBlackboard(): void {
+  setOpenSignal(false);
+}
+
+export async function fetchIndex(sessionId: string): Promise<void> {
+  indexInflight = sessionId;
+  setState((s) =>
+    s.goalSessionId === sessionId
+      ? { ...s, loading: true, error: null }
+      : { ...EMPTY, goalSessionId: sessionId, loading: true },
+  );
+  try {
+    const id = newRequestId();
+    const result = await getClient().request<BlackboardIndexResultMsg>(
+      { type: "blackboard.index", id, sessionId },
+      {
+        waitForResult: (m) =>
+          m.type === "blackboard.index.result" && m.requestId === id ? m : undefined,
+        timeoutMs: 8_000,
+      },
+    );
+    if (indexInflight !== sessionId) return;
+    setState((s) => ({
+      ...s,
+      // The daemon's answer, not our question: a child id in, its parent out.
+      goalSessionId: result.sessionId,
+      goal: result.goal,
+      entries: result.entries,
+      loading: false,
+      error: null,
+      fetchedAt: Date.now(),
+      // Drop a selection whose artifact is no longer on the board (goal torn
+      // down and rebuilt) — otherwise the body pane shows a stale artifact
+      // with nothing in the list pointing at it.
+      ...(s.selected && !result.entries.some((e) => refKey(e) === refKey(s.selected!))
+        ? { selected: null, artifact: null, artifactError: null }
+        : {}),
+    }));
+  } catch (err) {
+    if (indexInflight !== sessionId) return;
+    setState((s) => ({ ...s, loading: false, error: message(err) }));
+  }
+}
+
+/** Re-fetch the currently-open board. No-op when nothing is open. */
+export function refreshBlackboard(): Promise<void> {
+  const id = state().goalSessionId;
+  return id ? fetchIndex(id) : Promise.resolve();
+}
+
+/** Load one artifact's body into the detail pane. */
+export async function selectArtifact(ref: ArtifactRef): Promise<void> {
+  const sessionId = state().goalSessionId;
+  if (!sessionId) return;
+  const key = refKey(ref);
+  artifactInflight = key;
+  setState((s) => ({
+    ...s,
+    selected: ref,
+    // Keep the previous body visible while the new one loads rather than
+    // flashing empty — but never show it as if it were the new selection.
+    artifact: s.selected && refKey(s.selected) === key ? s.artifact : null,
+    artifactLoading: true,
+    artifactError: null,
+  }));
+  try {
+    const id = newRequestId();
+    const result = await getClient().request<BlackboardReadResultMsg>(
+      { type: "blackboard.read", id, sessionId, kind: ref.kind, slot: ref.slot },
+      {
+        waitForResult: (m) =>
+          m.type === "blackboard.read.result" && m.requestId === id ? m : undefined,
+        timeoutMs: 15_000,
+      },
+    );
+    if (artifactInflight !== key) return;
+    setState((s) => ({
+      ...s,
+      artifact: result.artifact,
+      artifactLoading: false,
+      artifactError: null,
+    }));
+  } catch (err) {
+    if (artifactInflight !== key) return;
+    setState((s) => ({ ...s, artifactLoading: false, artifactError: message(err) }));
+  }
+}
+
+export function clearSelection(): void {
+  artifactInflight = null;
+  setState((s) => ({
+    ...s,
+    selected: null,
+    artifact: null,
+    artifactLoading: false,
+    artifactError: null,
+  }));
+}
+
+function message(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** Test hook — reset the slice between tests. */
+export function _resetBlackboardForTest(): void {
+  indexInflight = null;
+  artifactInflight = null;
+  setState(EMPTY);
+  setOpenSignal(false);
+}

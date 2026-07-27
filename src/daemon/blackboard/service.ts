@@ -205,12 +205,67 @@ export class RoleBlackboard {
   }
 }
 
+/**
+ * The goal owner's view: the whole board, no role filter.
+ *
+ * This is the ONE handle that is not `reads`/`writes`-scoped, so it is a
+ * separate class rather than a flag on `RoleBlackboard` — a flag would make
+ * "unscoped" reachable by passing a boolean, and it must instead take an
+ * explicit `forOwner()` that grep finds.
+ *
+ * Why the exemption is sound rather than a hole in §6: role scoping keeps the
+ * AGENTS independent of each other (a reviewer that can read its peers is an
+ * echo, not a panel). The human who created the collaboration is not a
+ * participant in it — they can already read every child's transcript, so
+ * withholding the artifacts those transcripts produced protects nothing and
+ * only makes the fleet unobservable. Tenant scoping still applies in full; the
+ * caller must prove ownership of the goal session before getting here.
+ *
+ * Read-only by construction: there is no `write`. Owner writes would enter the
+ * board with no role attribution and no scope check, and nothing needs them.
+ */
+export class OwnerBlackboard {
+  #store: BlackboardStore;
+  #scope: GoalScope;
+
+  constructor(store: BlackboardStore, scope: GoalScope) {
+    this.#store = store;
+    this.#scope = scope;
+  }
+
+  /** Every artifact at its latest version — kind, slot, size. No bodies. */
+  index(): ArtifactIndexEntry[] {
+    return this.#store.index(this.#scope);
+  }
+
+  /**
+   * One artifact body. `version` omitted = latest; a specific version reads
+   * back a superseded one, which is the point of the append-only contract.
+   * `null` = never written (a normal state mid-collaboration), not an error.
+   */
+  read(kind: string, slot?: string | null, version?: number): Artifact | null {
+    if (!isValidArtifactKind(kind)) return null;
+    return version === undefined
+      ? this.#store.latest(this.#scope, kind, slot ?? null)
+      : this.#store.version(this.#scope, kind, version, slot ?? null);
+  }
+}
+
 /** The daemon-owned blackboard: one store, many goal-and-role-scoped views. */
 export class Blackboard {
   #store: BlackboardStore;
 
   constructor(store: BlackboardStore) {
     this.#store = store;
+  }
+
+  /**
+   * The goal owner's unscoped-by-role view. Callers must have already checked
+   * that the requester owns `scope.goalSessionId`; this class does not and
+   * cannot verify that itself.
+   */
+  forOwner(scope: GoalScope): OwnerBlackboard {
+    return new OwnerBlackboard(this.#store, scope);
   }
 
   /**

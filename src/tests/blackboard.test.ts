@@ -316,3 +316,69 @@ describe("the default profile wires the §3 handoff chain", () => {
     expect(bb.forRole(GOAL, ident("review")).read("research").ok).toBe(false);
   });
 });
+
+// ── Service: the owner's view ───────────────────────────────────────────────
+
+// The one handle that is not role-scoped. Its job is to be complete WITHOUT
+// becoming a bypass: it must still be tenant-scoped, and it must not be able
+// to write (an owner write would land with no role attribution and no scope
+// check on a board whose whole contract is attributable handoffs).
+describe("the goal owner's view", () => {
+  test("reads across every role's lane, which no single role can", () => {
+    bb.forRole(GOAL, ident("orchestrator")).write("spec", "SPEC");
+    bb.forRole(GOAL, ident("search")).write("research", "RESEARCH");
+    bb.forRole(GOAL, ident("reasoning")).write("diff", "DIFF");
+
+    const owner = bb.forOwner(GOAL);
+    expect(owner.read("spec")?.content).toBe("SPEC");
+    expect(owner.read("research")?.content).toBe("RESEARCH");
+    expect(owner.read("diff")?.content).toBe("DIFF");
+
+    // No role can do that: the reasoner reaches `diff` but never `research`.
+    expect(bb.forRole(GOAL, ident("reasoning")).read("research").ok).toBe(false);
+  });
+
+  test("still cannot cross a tenant or project boundary", () => {
+    bb.forRole(GOAL, ident("search")).write("research", "MINE");
+    expect(bb.forOwner(OTHER_TENANT).read("research")).toBeNull();
+    expect(bb.forOwner(OTHER_PROJECT).read("research")).toBeNull();
+    expect(bb.forOwner(OTHER_TENANT).index()).toHaveLength(0);
+  });
+
+  test("reaches each reviewer's own slot separately", () => {
+    bb.forRole(GOAL, ident("review", 1)).write("findings", "FIRST");
+    bb.forRole(GOAL, ident("review", 2)).write("findings", "SECOND");
+
+    const owner = bb.forOwner(GOAL);
+    expect(owner.read("findings", "review")?.content).toBe("FIRST");
+    expect(owner.read("findings", "review#2")?.content).toBe("SECOND");
+  });
+
+  test("reads a superseded version, so the append-only history is inspectable", () => {
+    const orch = bb.forRole(GOAL, ident("orchestrator"));
+    orch.write("spec", "v1");
+    orch.write("spec", "v2");
+
+    const owner = bb.forOwner(GOAL);
+    expect(owner.read("spec")?.content).toBe("v2"); // latest by default
+    expect(owner.read("spec")?.version).toBe(2);
+    expect(owner.read("spec", null, 1)?.content).toBe("v1");
+    expect(owner.read("spec", null, 99)).toBeNull();
+  });
+
+  test("an unwritten kind reads null — a normal mid-flight state, not an error", () => {
+    expect(bb.forOwner(GOAL).read("findings")).toBeNull();
+  });
+
+  test("a malformed kind reads null rather than reaching the store", () => {
+    expect(bb.forOwner(GOAL).read("Spec")).toBeNull();
+    expect(bb.forOwner(GOAL).read("extra/")).toBeNull();
+    expect(bb.forOwner(GOAL).read("../../etc/passwd")).toBeNull();
+  });
+
+  test("exposes no write path at all", () => {
+    // Not a style assertion: `write` on this handle would be an unattributed,
+    // unscoped mutation of an append-only, attributable board.
+    expect("write" in bb.forOwner(GOAL)).toBe(false);
+  });
+});

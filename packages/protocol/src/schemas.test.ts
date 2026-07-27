@@ -106,6 +106,15 @@ const samples: { [T in ClientTypes]: Extract<ClientMessage, { type: T }> } = {
   "fs.read": { type: "fs.read", id: "r18", sessionId: "s1", path: "src/a.ts", maxBytes: 1024 },
   "fs.browse_dir": { type: "fs.browse_dir", id: "r19", path: "/home" },
   "claude.config": { type: "claude.config", id: "r20", sessionId: "s1" },
+  "blackboard.index": { type: "blackboard.index", id: "r60", sessionId: "s1" },
+  "blackboard.read": {
+    type: "blackboard.read",
+    id: "r61",
+    sessionId: "s1",
+    kind: "findings",
+    slot: "review#2",
+    version: 3,
+  },
   "models.list": { type: "models.list", id: "r21", provider: "claude" },
   "session.export": { type: "session.export", id: "r22", sessionId: "s1", includeMemory: true, toFile: false },
   "session.import": {

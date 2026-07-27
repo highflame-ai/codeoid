@@ -17,6 +17,8 @@ vi.mock("../state/connection", () => ({
 const fetchModelsMock = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 vi.mock("../state/models", () => ({ fetchModels: fetchModelsMock, modelCatalog: () => [] }));
 vi.mock("./SessionExportModal", () => ({ openExportModal: vi.fn() }));
+const openBlackboardMock = vi.hoisted(() => vi.fn());
+vi.mock("../state/blackboard", () => ({ openBlackboard: openBlackboardMock }));
 
 import SessionControls from "./SessionControls";
 import {
@@ -43,12 +45,13 @@ function sess(providerId?: string, status: SessionInfo["status"] = "idle"): Sess
   } as SessionInfo;
 }
 
-function mockAuth(providers?: string[]): void {
+function mockAuth(providers?: string[], capabilities?: string[]): void {
   authMock.mockReturnValue({
     type: "auth.ok",
     identity: { sub: "u", type: "human" },
     scopes: [],
     ...(providers ? { providers } : {}),
+    ...(capabilities ? { capabilities } : {}),
   });
 }
 
@@ -614,5 +617,53 @@ describe("ForkedFromChip — lineage", () => {
     // Switch focus to the non-fork — must not throw as the chip disposes.
     expect(() => focusSession("s")).not.toThrow();
     expect(queryByText("· turn 4")).toBeNull();
+  });
+});
+
+describe("SessionControls — goal blackboard button", () => {
+  const orchestrator = () =>
+    ({
+      ...sess(),
+      collaboration: { goal: "g", roles: [{ name: "orchestrator", providerId: "claude" }] },
+    }) as SessionInfo;
+
+  const roleChild = () =>
+    ({
+      ...sess(),
+      collaborationRole: { parentSessionId: "p", roleName: "review", ordinal: 1, write: false },
+    }) as SessionInfo;
+
+  it("offers the board for an orchestrator when the daemon advertises it", () => {
+    mockAuth(undefined, ["blackboard"]);
+    ingestSessionList([orchestrator()]);
+    focusSession("s");
+    const { getByText } = render(() => <SessionControls />);
+    fireEvent.click(getByText("board"));
+    expect(openBlackboardMock).toHaveBeenCalledWith("s");
+  });
+
+  it("offers it for a role-child too — the daemon resolves the parent hop", () => {
+    mockAuth(undefined, ["blackboard"]);
+    ingestSessionList([roleChild()]);
+    focusSession("s");
+    const { getByText } = render(() => <SessionControls />);
+    expect(getByText("board")).toBeTruthy();
+  });
+
+  it("hides it on a daemon that doesn't advertise the capability", () => {
+    // An affordance that errors on click is worse than no affordance.
+    mockAuth();
+    ingestSessionList([orchestrator()]);
+    focusSession("s");
+    const { queryByText } = render(() => <SessionControls />);
+    expect(queryByText("board")).toBeNull();
+  });
+
+  it("hides it for a session with no collaboration at all", () => {
+    mockAuth(undefined, ["blackboard"]);
+    ingestSessionList([sess()]);
+    focusSession("s");
+    const { queryByText } = render(() => <SessionControls />);
+    expect(queryByText("board")).toBeNull();
   });
 });

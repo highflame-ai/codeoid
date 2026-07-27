@@ -17,6 +17,7 @@
 
 import { Component, Show, createMemo } from "solid-js";
 
+import BlackboardDrawer from "./BlackboardDrawer";
 import CapabilitiesDrawer from "./CapabilitiesDrawer";
 import CenterPane from "./CenterPane";
 import FileViewer from "./files/FileViewer";
@@ -60,6 +61,7 @@ const Shell: Component = () => {
       <NewSessionModal />
       <IdentityDrawer />
       <CapabilitiesDrawer />
+      <BlackboardDrawer />
       <SessionExportModal />
       <SessionImportModal />
       <SettingsDrawer />

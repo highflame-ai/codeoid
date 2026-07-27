@@ -5,9 +5,16 @@
  * chat area dominates the viewport.
  */
 
-import { Component, createSignal, For, Show } from "solid-js";
+import { Component, createMemo, createSignal, For, Show } from "solid-js";
 
 import { formatCostUsd, formatTokens, relativeTime } from "../lib/format";
+import {
+  countVisible,
+  filterFleet,
+  groupFleet,
+  roleLabel,
+  type FilteredFleetGroup,
+} from "../lib/fleet";
 import { sessionAgentLabel, shortSub } from "../lib/identity";
 import { nowTick } from "../state/clock";
 import {
@@ -43,19 +50,38 @@ function newSession(): void {
   openNewSessionModal();
 }
 
+/**
+ * Fleets the user has folded shut, by orchestrator id. Collapsed is the
+ * exception, so absence means expanded — a fleet that spawns while you're
+ * looking at it opens rather than hiding its own arrival.
+ *
+ * Module-level so the choice survives the pane unmounting (mobile drawer,
+ * sidebar collapse) — a fold that reopens itself every time you close the
+ * drawer isn't a fold.
+ */
+const [collapsedFleets, setCollapsedFleets] = createSignal<ReadonlySet<string>>(
+  new Set(),
+);
+
+function toggleFleet(parentId: string): void {
+  setCollapsedFleets((prev) => {
+    const next = new Set(prev);
+    if (!next.delete(parentId)) next.add(parentId);
+    return next;
+  });
+}
+
 const SessionListPane: Component = () => {
   const [showAnalytics, setShowAnalytics] = createSignal(false);
-  // Instant client-side filter by session name/workdir. Complements the
+  // Instant client-side filter by session name/workdir/role. Complements the
   // semantic cross-session content search (Ctrl+K) — this is the fast
   // "find the session called X" pass, and it works without the memory engine.
   const [filter, setFilter] = createSignal("");
-  const filtered = (): SessionInfo[] => {
-    const q = filter().trim().toLowerCase();
-    if (!q) return sessionList();
-    return sessionList().filter(
-      (s) => s.name.toLowerCase().includes(q) || s.workdir.toLowerCase().includes(q),
-    );
-  };
+  // Group BEFORE filtering: a filter that matches only a child still needs its
+  // orchestrator around to say which goal that child belongs to.
+  const groups = createMemo<FilteredFleetGroup[]>(() =>
+    filterFleet(groupFleet(sessionList()), filter()),
+  );
 
   return (
     <Show
@@ -65,7 +91,7 @@ const SessionListPane: Component = () => {
       <aside class="row-start-2 col-start-1 flex h-full flex-col overflow-y-auto border-r border-border bg-bg-elev">
         <SectionHeader
           title="Sessions"
-          count={sessionList().length}
+          count={filter().trim() ? countVisible(groups()) : sessionList().length}
           showAnalytics={showAnalytics()}
           onToggleAnalytics={() => setShowAnalytics((v) => !v)}
         />
@@ -89,10 +115,10 @@ const SessionListPane: Component = () => {
           fallback={<EmptyState />}
         >
           <SessionFilter value={filter()} onInput={setFilter} />
-          <Show when={filtered().length > 0} fallback={<NoMatch query={filter()} />}>
+          <Show when={groups().length > 0} fallback={<NoMatch query={filter()} />}>
             <ul class="flex flex-col py-1">
-              <For each={filtered()}>
-                {(s) => <SessionRow session={s} />}
+              <For each={groups()}>
+                {(g) => <FleetGroupRows group={g} />}
               </For>
             </ul>
           </Show>
@@ -126,23 +152,54 @@ const CollapsedRail: Component = () => (
       ＋
     </button>
     <div class="my-1 h-px w-6 bg-border" />
-    <For each={sessionList()}>
-      {(s) => (
-        <button
-          type="button"
-          onClick={() => pickSession(s.id)}
-          class={`flex h-7 w-7 items-center justify-center rounded text-[11px] font-mono transition ${
-            focusedSessionId() === s.id
-              ? "bg-accent/20 text-accent"
-              : "text-fg-muted hover:bg-bg-hover hover:text-fg"
-          }`}
-          title={`${s.name} · ${s.workdir}`}
-        >
-          {s.name.slice(0, 2).toUpperCase()}
-        </button>
+    {/* Same grouping as the expanded pane, reduced to what fits in 56px: a
+        fleet's members sit in an inset, ruled column under their orchestrator
+        and are keyed by role rather than by name (every child's name starts
+        with the parent's, so name initials would all collide). */}
+    <For each={groupFleet(sessionList())}>
+      {(g) => (
+        <>
+          <RailButton
+            session={g.lead}
+            label={g.lead.name.slice(0, 2).toUpperCase()}
+            title={`${g.lead.name} · ${g.lead.workdir}${g.lead.collaboration ? `\n◇ ${g.lead.collaboration.goal}` : ""}`}
+          />
+          <Show when={g.children.length > 0}>
+            <div class="flex w-full flex-col items-end gap-1 border-l border-border/70 pl-2">
+              <For each={g.children}>
+                {(c) => (
+                  <RailButton
+                    session={c}
+                    label={(roleLabel(c) ?? c.name).slice(0, 2).toLowerCase()}
+                    title={`${roleLabel(c)} — ${c.name}${c.collaborationRole?.write ? "" : " (read-only)"}`}
+                  />
+                )}
+              </For>
+            </div>
+          </Show>
+        </>
       )}
     </For>
   </aside>
+);
+
+const RailButton: Component<{
+  session: SessionInfo;
+  label: string;
+  title: string;
+}> = (props) => (
+  <button
+    type="button"
+    onClick={() => pickSession(props.session.id)}
+    class={`flex h-7 w-7 shrink-0 items-center justify-center rounded font-mono text-[11px] transition ${
+      focusedSessionId() === props.session.id
+        ? "bg-accent/20 text-accent"
+        : "text-fg-muted hover:bg-bg-hover hover:text-fg"
+    }`}
+    title={props.title}
+  >
+    {props.label}
+  </button>
 );
 
 const SectionHeader: Component<{
@@ -228,24 +285,100 @@ const NoMatch: Component<{ query: string }> = (props) => (
   </div>
 );
 
-const SessionRow: Component<{ session: SessionInfo }> = (props) => {
-  const isActive = () => focusedSessionId() === props.session.id;
+/**
+ * One top-level session and, when it orchestrates a collaboration, its
+ * role-children indented beneath it.
+ *
+ * The children are real sessions you can focus and read — they are long-lived,
+ * not transient dispatch workers — so they stay clickable rows rather than a
+ * summary line. What changes is that they're visibly *of* the orchestrator.
+ */
+const FleetGroupRows: Component<{ group: FilteredFleetGroup }> = (props) => {
+  const collapsed = () => collapsedFleets().has(props.group.lead.id);
+  const hasChildren = () => props.group.children.length > 0;
+
   return (
-    <li>
+    <>
+      <SessionRow
+        session={props.group.lead}
+        dimmed={!props.group.leadMatched}
+        fleet={
+          props.group.isFleet
+            ? {
+                childCount: props.group.children.length,
+                collapsed: collapsed(),
+                onToggle: () => toggleFleet(props.group.lead.id),
+              }
+            : undefined
+        }
+      />
+      <Show when={hasChildren() && !collapsed()}>
+        <li>
+          {/* The rail is the grouping: one continuous line down the left of
+              the fleet, so a child is unmistakably subordinate even when the
+              orchestrator has scrolled out of view. */}
+          <ul class="ml-[1.4rem] flex flex-col border-l border-border/70">
+            <For each={props.group.children}>
+              {(c) => <SessionRow session={c} nested />}
+            </For>
+          </ul>
+        </li>
+      </Show>
+    </>
+  );
+};
+
+interface FleetLeadProps {
+  childCount: number;
+  collapsed: boolean;
+  onToggle: () => void;
+}
+
+const SessionRow: Component<{
+  session: SessionInfo;
+  /**
+   * Rendered indented under its orchestrator. Distinct from "is a role-child":
+   * an orphan child (parent destroyed or not yet delivered) is a role-child
+   * rendered at top level, and must keep its role badges while showing its
+   * full name — there's no parent row above it to supply the context.
+   */
+  nested?: boolean;
+  /** Present when this session orchestrates a collaboration. */
+  fleet?: FleetLeadProps;
+  /** Shown only to give matching children a parent — not a filter hit itself. */
+  dimmed?: boolean;
+}> = (props) => {
+  const isActive = () => focusedSessionId() === props.session.id;
+  const role = () => props.session.collaborationRole;
+  // A child's daemon-generated name is `<parent>:<role>[-N]`; under the parent
+  // that prefix is pure repetition, so a nested row leads with the role and
+  // keeps the full name in the tooltip.
+  const title = () =>
+    (props.nested && roleLabel(props.session)) || props.session.name;
+  return (
+    <li class="flex items-stretch">
       <button
         type="button"
         onClick={() => pickSession(props.session.id)}
-        class={`flex w-full flex-col gap-1 border-l-2 px-3 py-2 text-left transition hover:bg-bg-hover ${
+        title={props.nested ? props.session.name : undefined}
+        class={`flex min-w-0 flex-1 flex-col gap-1 border-l-2 text-left transition hover:bg-bg-hover ${
+          props.nested ? "py-1.5 pl-2 pr-3" : "px-3 py-2"
+        } ${
           isActive()
             ? "border-l-accent bg-bg-active"
             : "border-l-transparent"
-        }`}
+        } ${props.dimmed ? "opacity-60" : ""}`}
       >
         <div class="flex items-center gap-2">
           <StatusDot status={props.session.status} />
-          <span class="flex-1 truncate text-sm font-medium text-fg">
-            {props.session.name}
+          <span
+            class={`flex-1 truncate font-medium text-fg ${props.nested ? "font-mono text-[12px]" : "text-sm"}`}
+          >
+            {title()}
           </span>
+          <Show when={role()}>
+            {(r) => <WriteBadge write={r().write} />}
+          </Show>
           <Show when={props.session.usage}>
             {(u) => (
               <span class="font-mono text-[11px] text-accent" title="Estimated cost">
@@ -254,20 +387,45 @@ const SessionRow: Component<{ session: SessionInfo }> = (props) => {
             )}
           </Show>
         </div>
-        <div
-          class="truncate text-[11px] text-fg-faint"
-          title={props.session.workdir}
-        >
-          {props.session.workdir}
-        </div>
+        {/* Children share the orchestrator's workdir verbatim (spawned with
+            `workdir: parent.workdir`), so repeating it on every child row is
+            noise. The goal is what distinguishes a fleet; show that instead. */}
+        <Show when={!props.nested}>
+          <div
+            class="truncate text-[11px] text-fg-faint"
+            title={props.session.workdir}
+          >
+            {props.session.workdir}
+          </div>
+        </Show>
+        <Show when={props.session.collaboration}>
+          {(c) => (
+            <div
+              class="truncate text-[11px] italic text-fg-muted"
+              title={c().goal}
+            >
+              ◇ {c().goal}
+            </div>
+          )}
+        </Show>
         <div class="flex items-center gap-2 text-[11px] text-fg-muted">
-          <span title={`Agent: ${props.session.agentUri ?? "anonymous"}`}>
-            ⌬ <span class="font-mono">{sessionAgentLabel(props.session)}</span>
-          </span>
-          <Show when={props.session.providerId && props.session.providerId !== "claude"}>
+          <Show when={!props.nested}>
+            <span title={`Agent: ${props.session.agentUri ?? "anonymous"}`}>
+              ⌬ <span class="font-mono">{sessionAgentLabel(props.session)}</span>
+            </span>
+          </Show>
+          {/* Children always show their backend, including "claude": which model
+              is behind which role is the entire point of a mixed fleet, so it
+              must not be inferable only from the absence of a chip. */}
+          <Show
+            when={
+              props.session.providerId &&
+              (role() !== undefined || props.session.providerId !== "claude")
+            }
+          >
             <span
               class="rounded border border-accent/40 bg-accent/10 px-1 font-mono text-[10px] text-accent"
-              title={`Backend: ${props.session.providerId}`}
+              title={`Backend: ${props.session.providerId}${props.session.model ? ` · model: ${props.session.model}` : ""}`}
             >
               {props.session.providerId}
             </span>
@@ -307,13 +465,59 @@ const SessionRow: Component<{ session: SessionInfo }> = (props) => {
             </span>
           </Show>
         </div>
-        <div class="text-[10px] text-fg-faint">
-          created {relativeTime(props.session.createdAt, nowTick())}
-        </div>
+        <Show when={!props.nested}>
+          <div class="text-[10px] text-fg-faint">
+            created {relativeTime(props.session.createdAt, nowTick())}
+          </div>
+        </Show>
       </button>
+      {/* Sibling of the row, not nested inside it — a button inside a button is
+          invalid HTML and browsers resolve the click ambiguity differently. */}
+      <Show when={props.fleet}>
+        {(f) => (
+          <button
+            type="button"
+            onClick={f().onToggle}
+            aria-expanded={!f().collapsed}
+            aria-label={`${f().collapsed ? "Expand" : "Collapse"} fleet (${f().childCount} role${f().childCount === 1 ? "" : "s"})`}
+            title={`${f().childCount} role${f().childCount === 1 ? "" : "s"} — click to ${f().collapsed ? "expand" : "collapse"}`}
+            class="flex w-7 shrink-0 flex-col items-center justify-center gap-0.5 border-l border-border/50 text-fg-faint transition hover:bg-bg-hover hover:text-fg"
+          >
+            <span class="text-[10px] leading-none">{f().collapsed ? "▸" : "▾"}</span>
+            <span class="font-mono text-[10px] leading-none">{f().childCount}</span>
+          </button>
+        )}
+      </Show>
     </li>
   );
 };
+
+/**
+ * Whether a role-child may write. Read-only is the interesting state — it's the
+ * §6 independence property made visible (a scout's leaf identity carries no
+ * `tools:write` at all), so it gets the badge and write gets a quiet marker
+ * rather than both shouting equally.
+ */
+const WriteBadge: Component<{ write: boolean }> = (props) => (
+  <Show
+    when={props.write}
+    fallback={
+      <span
+        class="rounded border border-border bg-bg px-1 font-mono text-[10px] uppercase tracking-wider text-fg-muted"
+        title="Read-only role — its identity carries no write authority, and write tools are denied at the fence"
+      >
+        ro
+      </span>
+    }
+  >
+    <span
+      class="font-mono text-[10px] text-warn"
+      title="This role may write to the workspace"
+    >
+      ✎
+    </span>
+  </Show>
+);
 
 const StatusDot: Component<{ status: SessionStatus }> = (props) => {
   const cls = () => {
