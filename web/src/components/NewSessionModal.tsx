@@ -28,9 +28,36 @@ import { focusSession, mergeSession, sessionList } from "../state/sessions";
 import type { PackWire, SessionInfo } from "../protocol/types";
 import DirectoryPicker from "./files/DirectoryPicker";
 
-/** The modal serves two flows from one dialog (docs/pipeline-run.md): a plain
- *  session, or a governed pipeline run (adds a goal box + requires a pack). */
-type Mode = "session" | "pipeline";
+/** The modal serves three flows from one dialog: a plain session, a governed
+ *  pipeline run (docs/pipeline-run.md — adds a goal box + requires a pack), or
+ *  a COLLABORATIVE session (docs/collaborative-session-design.md §9 — a goal
+ *  plus role→backend bindings, which the daemon compiles to an ephemeral
+ *  one-goal pack; pack vocabulary deliberately stays hidden on that path). */
+type Mode = "session" | "pipeline" | "collaborate";
+
+/** One editable role row. Kept as strings so partially-typed input renders;
+ *  it is normalized into the wire shape at submit. */
+interface CollabRoleRow {
+  name: string;
+  /** "" = the daemon default backend. */
+  providerId: string;
+  /** "" = that backend's own default model. */
+  model: string;
+  count: number;
+  /** Opt-in write authority. Default OFF — §3 gives review/search no repo
+   *  write, and a read-only child's identity carries no write scope at all. */
+  write: boolean;
+}
+
+/** The §3 starting profile: an orchestrator plus one worker. The orchestrator
+ *  is claude-pinned in v1 (#245) — it is the only backend that mounts the
+ *  fleet MCP server, and the daemon rejects anything else. */
+function defaultRoles(): CollabRoleRow[] {
+  return [
+    { name: "orchestrator", providerId: "claude", model: "", count: 1, write: false },
+    { name: "search", providerId: "", model: "", count: 1, write: false },
+  ];
+}
 
 const [openSignal, setOpenSignal] = createSignal(false);
 const [mode, setMode] = createSignal<Mode>("session");
@@ -45,6 +72,14 @@ export function openNewSessionModal(): void {
 /** Open the SAME dialog in pipeline mode: a goal / feature box + a required pack.
  *  Submitting starts a governed run and focuses its bound session (the run shows
  *  up as a normal chat). Wired to `/pipeline` and the Pack Browser's Run action. */
+/** Open the dialog in COLLABORATIVE mode: one goal worked by several
+ *  role-children on their own backends. */
+export function openCollaborateModal(goal?: string): void {
+  setMode("collaborate");
+  setGoalPrefill(goal ?? "");
+  setOpenSignal(true);
+}
+
 export function openPipelineModal(goal?: string): void {
   setMode("pipeline");
   setGoalPrefill(goal ?? "");
@@ -65,6 +100,38 @@ const NewSessionModal: Component = () => {
   const [packId, setPackId] = createSignal("");
   // Capability role declared by the chosen pack; "" = no role restriction.
   const [packRole, setPackRole] = createSignal("");
+
+  // ── Collaborative mode ────────────────────────────────────────────────────
+  // One row per role. The orchestrator is always present and is NOT removable:
+  // the daemon requires exactly one, and the session being created IS it.
+  const [roles, setRoles] = createSignal<CollabRoleRow[]>(defaultRoles());
+
+  const updateRole = (i: number, patch: Partial<CollabRoleRow>): void => {
+    setRoles((rs) => rs.map((r, j) => (j === i ? { ...r, ...patch } : r)));
+  };
+  const addRole = (): void => {
+    setRoles((rs) => [...rs, { name: "", providerId: "", model: "", count: 1, write: false }]);
+  };
+  const removeRole = (i: number): void => {
+    setRoles((rs) => rs.filter((_, j) => j !== i));
+  };
+
+  /** Client-side pre-flight. The daemon re-validates everything — this only
+   *  spares a round-trip on the mistakes that are obvious locally. */
+  const collabProblem = createMemo<string | null>(() => {
+    if (mode() !== "collaborate") return null;
+    if (!goal().trim()) return "a goal is required";
+    const named = roles().filter((r) => r.name.trim());
+    if (named.length !== roles().length) return "every role needs a name";
+    const seen = new Set<string>();
+    for (const r of named) {
+      const key = r.name.trim().toLowerCase();
+      if (seen.has(key)) return `duplicate role "${r.name.trim()}"`;
+      seen.add(key);
+    }
+    if (!seen.has("orchestrator")) return 'one role must be named "orchestrator"';
+    return null;
+  });
 
   // Backends this daemon registered (auth.ok `providers`, default first).
   // Older daemons don't advertise — hide the picker, sessions stay claude.
@@ -141,7 +208,8 @@ const NewSessionModal: Component = () => {
       if (v) {
         setBusy(false);
         setError(null);
-        if (mode() === "pipeline") setGoal(goalPrefill());
+        if (mode() === "pipeline" || mode() === "collaborate") setGoal(goalPrefill());
+        if (mode() === "collaborate") setRoles(defaultRoles());
         // Refresh the pack list every open. fetchPacks swallows its own
         // errors (it sets pack-state.error rather than rejecting), but guard
         // anyway so a rejected read can never break opening the modal.
@@ -189,6 +257,63 @@ const NewSessionModal: Component = () => {
         setPackId("");
         setPackRole("");
       } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+        setBusy(false);
+      }
+      return;
+    }
+
+    // ── Collaborative session ─────────────────────────────────────────────────
+    if (mode() === "collaborate") {
+      const problem = collabProblem();
+      if (problem) {
+        setError(problem);
+        return;
+      }
+      if (!n) {
+        setError("name required");
+        return;
+      }
+      setBusy(true);
+      setError(null);
+      try {
+        const data = (await request({
+          type: "session.create",
+          id: newRequestId(),
+          name: n,
+          workdir: workdir().trim() || ".",
+          collaboration: {
+            goal: goal().trim(),
+            roles: roles().map((r) => ({
+              name: r.name.trim(),
+              // A blank picker means "daemon default"; the wire field is
+              // required, so resolve it to the advertised default here.
+              providerId: r.providerId || providers()[0] || "claude",
+              ...(r.model.trim() ? { model: r.model.trim() } : {}),
+              ...(r.count > 1 ? { count: r.count } : {}),
+              ...(r.write ? { write: true } : {}),
+            })),
+          },
+          // providerId is deliberately NOT sent: a collaborative session IS its
+          // orchestrator, so the daemon derives the backend from that role and
+          // rejects a conflicting explicit value.
+        })) as SessionInfo | undefined;
+        if (data && typeof data === "object" && "id" in data) {
+          mergeSession(data);
+          focusSession(data.id);
+        } else {
+          await refreshSessions().catch(() => []);
+        }
+        setBusy(false);
+        setOpenSignal(false);
+        setName("");
+        setWorkdir("");
+        setGoal("");
+        setRoles(defaultRoles());
+      } catch (err) {
+        // The daemon's message is the useful one here — it names the exact
+        // rule broken (unknown provider, non-claude orchestrator, over the
+        // child ceiling), so surface it verbatim rather than paraphrasing.
         setError(err instanceof Error ? err.message : String(err));
         setBusy(false);
       }
@@ -251,14 +376,46 @@ const NewSessionModal: Component = () => {
           onSubmit={submit}
           class="mt-[16vh] w-full max-w-md space-y-4 rounded-lg border border-border bg-bg-elev p-5 shadow-2xl"
         >
-          <header class="space-y-1">
+          <header class="space-y-2">
             <h2 class="text-base font-semibold tracking-tight text-fg">
-              {mode() === "pipeline" ? "Start a pipeline run" : "New session"}
+              {mode() === "pipeline"
+                ? "Start a pipeline run"
+                : mode() === "collaborate"
+                  ? "New collaborative session"
+                  : "New session"}
             </h2>
+            {/* Plain ↔ collaborative is a toggle on the SAME dialog (§9): a
+                collaboration is a session plus a goal and role bindings, not a
+                separate object. Pipeline mode is entered from /pipeline, so it
+                isn't offered here. */}
+            <Show when={mode() !== "pipeline"}>
+              <div class="flex gap-1" role="radiogroup" aria-label="Session kind">
+                <For each={["session", "collaborate"] as const}>
+                  {(m) => (
+                    <button
+                      type="button"
+                      role="radio"
+                      aria-checked={mode() === m}
+                      onClick={() => setMode(m)}
+                      class={`rounded border px-2 py-0.5 text-[12px] transition ${
+                        mode() === m
+                          ? "border-accent/60 bg-accent/10 text-accent"
+                          : "border-border bg-bg text-fg-muted hover:border-accent/40 hover:text-fg"
+                      }`}
+                      disabled={busy()}
+                    >
+                      {m === "session" ? "Single agent" : "Collaborative"}
+                    </button>
+                  )}
+                </For>
+              </div>
+            </Show>
             <p class="text-xs text-fg-muted">
               {mode() === "pipeline"
                 ? "Run an installed pack against a goal. It creates a session, auto-advances through the pack's phases, and halts at each boundary for you to Approve / Revise / Reject."
-                : "A session is one Claude conversation rooted at a workdir. The daemon registers a per-session ZeroID agent identity automatically."}
+                : mode() === "collaborate"
+                  ? "One goal, several agents in named roles — each on its own backend. This session is the orchestrator; the others come up as its children and hand work to each other through a shared goal blackboard."
+                  : "A session is one Claude conversation rooted at a workdir. The daemon registers a per-session ZeroID agent identity automatically."}
             </p>
           </header>
 
@@ -335,14 +492,18 @@ const NewSessionModal: Component = () => {
             </p>
           </label>
 
-          <Show when={mode() === "pipeline"}>
+          <Show when={mode() === "pipeline" || mode() === "collaborate"}>
             <label class="block space-y-1.5">
               <span class="text-[11px] font-medium uppercase tracking-wider text-fg-faint">
-                Goal / feature
+                Goal{mode() === "collaborate" ? "" : " / feature"}
               </span>
               <textarea
-                rows={4}
-                placeholder="Describe the feature to build — this seeds the run's spec phase…"
+                rows={mode() === "collaborate" ? 3 : 4}
+                placeholder={
+                  mode() === "collaborate"
+                    ? "The one goal every role works on — e.g. Add rate limiting to the public API"
+                    : "Describe the feature to build — this seeds the run's spec phase…"
+                }
                 value={goal()}
                 onInput={(e) => setGoal(e.currentTarget.value)}
                 class="w-full resize-y rounded border border-border bg-bg px-3 py-1.5 font-mono text-sm leading-6 text-fg outline-none focus:border-accent"
@@ -350,6 +511,118 @@ const NewSessionModal: Component = () => {
                 aria-label="Goal"
               />
             </label>
+          </Show>
+
+          {/* Role→backend bindings (§3: a role is data, not an enum — the names
+              are free-form, and the five defaults are just a starting profile). */}
+          <Show when={mode() === "collaborate"}>
+            <div class="block space-y-2">
+              <span class="text-[11px] font-medium uppercase tracking-wider text-fg-faint">
+                Roles
+              </span>
+              <For each={roles()}>
+                {(r, i) => {
+                  const isOrchestrator = () => r.name.trim().toLowerCase() === "orchestrator";
+                  return (
+                    <div class="space-y-1.5 rounded border border-border bg-bg p-2">
+                      <div class="flex gap-1.5">
+                        <input
+                          type="text"
+                          placeholder="role name"
+                          value={r.name}
+                          onInput={(e) => updateRole(i(), { name: e.currentTarget.value })}
+                          class="min-w-0 flex-1 rounded border border-border bg-bg-elev px-2 py-1 font-mono text-[12px] text-fg outline-none focus:border-accent"
+                          disabled={busy() || isOrchestrator()}
+                          aria-label="Role name"
+                        />
+                        <select
+                          value={r.providerId}
+                          onChange={(e) => updateRole(i(), { providerId: e.currentTarget.value })}
+                          class="rounded border border-border bg-bg-elev px-2 py-1 font-mono text-[12px] text-fg outline-none focus:border-accent disabled:cursor-not-allowed disabled:opacity-60"
+                          /* Claude-only in v1: it is the only backend that
+                             mounts the fleet MCP server (#245), and the daemon
+                             rejects any other orchestrator outright. */
+                          disabled={busy() || isOrchestrator()}
+                          aria-label="Backend"
+                        >
+                          <Show when={!isOrchestrator()}>
+                            <option value="">default</option>
+                          </Show>
+                          <For each={providers()}>{(id) => <option value={id}>{id}</option>}</For>
+                        </select>
+                        <button
+                          type="button"
+                          onClick={() => removeRole(i())}
+                          class="rounded border border-border px-2 py-1 text-[12px] text-fg-muted transition hover:border-danger/40 hover:text-danger disabled:cursor-not-allowed disabled:opacity-30"
+                          /* The daemon requires exactly one orchestrator, and
+                             this session IS it — so it can't be removed. */
+                          disabled={busy() || isOrchestrator()}
+                          title={isOrchestrator() ? "the orchestrator is required" : "remove role"}
+                          aria-label="Remove role"
+                        >
+                          ×
+                        </button>
+                      </div>
+                      <div class="flex flex-wrap items-center gap-2">
+                        <input
+                          type="text"
+                          placeholder="model (optional)"
+                          value={r.model}
+                          onInput={(e) => updateRole(i(), { model: e.currentTarget.value })}
+                          class="min-w-0 flex-1 rounded border border-border bg-bg-elev px-2 py-1 font-mono text-[11px] text-fg outline-none focus:border-accent"
+                          disabled={busy()}
+                          aria-label="Model"
+                        />
+                        <Show when={!isOrchestrator()}>
+                          <label class="flex items-center gap-1 text-[11px] text-fg-muted">
+                            ×
+                            <input
+                              type="number"
+                              min={1}
+                              max={8}
+                              value={r.count}
+                              onInput={(e) =>
+                                updateRole(i(), {
+                                  count: Math.max(1, Number(e.currentTarget.value) || 1),
+                                })
+                              }
+                              class="w-12 rounded border border-border bg-bg-elev px-1 py-1 text-center font-mono text-[11px] text-fg outline-none focus:border-accent"
+                              disabled={busy()}
+                              aria-label="Count"
+                            />
+                          </label>
+                          <label
+                            class="flex items-center gap-1 text-[11px] text-fg-muted"
+                            title="Off = this role's agents hold no write scope at all and cannot edit files"
+                          >
+                            <input
+                              type="checkbox"
+                              checked={r.write}
+                              onChange={(e) => updateRole(i(), { write: e.currentTarget.checked })}
+                              disabled={busy()}
+                            />
+                            can write
+                          </label>
+                        </Show>
+                      </div>
+                    </div>
+                  );
+                }}
+              </For>
+              <button
+                type="button"
+                onClick={addRole}
+                class="rounded border border-border px-2 py-1 text-[12px] text-fg-muted transition hover:border-accent/40 hover:text-fg disabled:opacity-50"
+                disabled={busy()}
+              >
+                + add role
+              </button>
+              <p class="text-[10px] text-fg-faint">
+                Roles are free-form. Known names (search, architecture, reasoning, review) come with
+                a default blackboard scope; anything else starts with none. Read-only is the
+                default — the daemon gives a non-writing role an identity that holds no write scope.
+              </p>
+            </div>
           </Show>
 
           <Show when={providers().length > 1}>
@@ -441,6 +714,12 @@ const NewSessionModal: Component = () => {
             </div>
           </Show>
 
+          <Show when={mode() === "collaborate" && !error() && collabProblem()}>
+            {/* A disabled Create with no explanation is the worst version of
+                this form — say which rule is unmet. */}
+            <p class="text-[11px] text-fg-faint">{collabProblem()}</p>
+          </Show>
+
           <div class="flex items-center gap-2">
             <button
               type="button"
@@ -453,7 +732,14 @@ const NewSessionModal: Component = () => {
             <button
               type="submit"
               class="ml-auto rounded bg-accent px-3 py-1.5 text-sm font-semibold text-bg transition hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
-              disabled={busy() || (mode() === "pipeline" ? !packId() || !goal().trim() : !name().trim())}
+              disabled={
+                busy() ||
+                (mode() === "pipeline"
+                  ? !packId() || !goal().trim()
+                  : mode() === "collaborate"
+                    ? !name().trim() || collabProblem() !== null
+                    : !name().trim())
+              }
             >
               {busy()
                 ? mode() === "pipeline"
@@ -461,7 +747,9 @@ const NewSessionModal: Component = () => {
                   : "creating…"
                 : mode() === "pipeline"
                   ? "start run"
-                  : "create"}
+                  : mode() === "collaborate"
+                    ? "create collaboration"
+                    : "create"}
             </button>
           </div>
         </form>

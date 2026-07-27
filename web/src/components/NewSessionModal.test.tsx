@@ -40,7 +40,11 @@ const runPipelineMock = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 vi.mock("../state/pipelines", () => ({ runPipeline: runPipelineMock }));
 
 import type { PackWire } from "../protocol/types";
-import NewSessionModal, { openNewSessionModal, openPipelineModal } from "./NewSessionModal";
+import NewSessionModal, {
+  openCollaborateModal,
+  openNewSessionModal,
+  openPipelineModal,
+} from "./NewSessionModal";
 import { _resetSessionsForTest } from "../state/sessions";
 
 /** Minimal installed PackWire for the modal's pack/role selectors. */
@@ -272,5 +276,131 @@ describe("NewSessionModal pipeline mode", () => {
     const { getByText } = render(() => <NewSessionModal />);
     openPipelineModal();
     expect((getByText("start run") as HTMLButtonElement).disabled).toBe(true);
+  });
+});
+
+
+describe("NewSessionModal collaborative mode", () => {
+  /** Open in collaborative mode with a name filled in. */
+  function openCollab(providers = ["claude", "gemini"]) {
+    authMock.mockReturnValue(authOk(providers));
+    requestMock.mockResolvedValue({ id: "s-collab", name: "demo", workdir: "/w" });
+    const r = render(() => <NewSessionModal />);
+    openCollaborateModal();
+    fireEvent.input(r.getByPlaceholderText("e.g. shield-refactor"), {
+      target: { value: "demo" },
+    });
+    return r;
+  }
+
+  const goalBox = (r: ReturnType<typeof render>) =>
+    r.getByPlaceholderText(
+      "The one goal every role works on — e.g. Add rate limiting to the public API",
+    );
+
+  it("sends a collaboration with the default orchestrator + worker profile", async () => {
+    const r = openCollab();
+    fireEvent.input(goalBox(r), { target: { value: "Ship rate limiting" } });
+    fireEvent.click(r.getByText("create collaboration"));
+
+    await waitFor(() => expect(requestMock).toHaveBeenCalled());
+    const sent = requestMock.mock.calls[0]![0] as Record<string, unknown>;
+    expect(sent.type).toBe("session.create");
+    const collab = sent.collaboration as { goal: string; roles: Array<Record<string, unknown>> };
+    expect(collab.goal).toBe("Ship rate limiting");
+    expect(collab.roles.map((x) => x.name)).toEqual(["orchestrator", "search"]);
+    // The orchestrator is claude-pinned in v1 (#245).
+    expect(collab.roles[0]!.providerId).toBe("claude");
+  });
+
+  // A collaborative session IS its orchestrator, so the daemon derives the
+  // backend from that role and REJECTS a conflicting explicit providerId.
+  // Sending one would turn every create into an error.
+  it("never sends a top-level providerId", async () => {
+    const r = openCollab();
+    fireEvent.input(goalBox(r), { target: { value: "g" } });
+    fireEvent.click(r.getByText("create collaboration"));
+    await waitFor(() => expect(requestMock).toHaveBeenCalled());
+    const sent = requestMock.mock.calls[0]![0] as Record<string, unknown>;
+    expect("providerId" in sent).toBe(false);
+  });
+
+  it("omits optional fields rather than sending empty values", async () => {
+    const r = openCollab();
+    fireEvent.input(goalBox(r), { target: { value: "g" } });
+    fireEvent.click(r.getByText("create collaboration"));
+    await waitFor(() => expect(requestMock).toHaveBeenCalled());
+    const sent = requestMock.mock.calls[0]![0] as Record<string, unknown>;
+    const roles = (sent.collaboration as { roles: Array<Record<string, unknown>> }).roles;
+    // count:1 and write:false are the daemon's defaults — sending them adds
+    // noise, and an empty-string model would fail provider-aware validation.
+    for (const role of roles) {
+      expect("model" in role).toBe(false);
+      expect("count" in role).toBe(false);
+      expect("write" in role).toBe(false);
+    }
+  });
+
+  it("blocks submit until a goal is given, and says why", async () => {
+    const r = openCollab();
+    expect(r.getByText("a goal is required")).toBeTruthy();
+    expect((r.getByText("create collaboration") as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.input(goalBox(r), { target: { value: "g" } });
+    await waitFor(() =>
+      expect((r.getByText("create collaboration") as HTMLButtonElement).disabled).toBe(false),
+    );
+  });
+
+  it("rejects duplicate role names before hitting the daemon", async () => {
+    const r = openCollab();
+    fireEvent.input(goalBox(r), { target: { value: "g" } });
+    fireEvent.click(r.getByText("+ add role"));
+    const nameInputs = r.getAllByLabelText("Role name") as HTMLInputElement[];
+    // Row 0 is the orchestrator (locked); rename the two workers to collide.
+    fireEvent.input(nameInputs[1]!, { target: { value: "review" } });
+    fireEvent.input(nameInputs[2]!, { target: { value: "Review" } });
+    await waitFor(() => expect(r.getByText('duplicate role "Review"')).toBeTruthy());
+    expect(requestMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps the orchestrator row non-removable and claude-pinned", () => {
+    const r = openCollab();
+    const removes = r.getAllByLabelText("Remove role") as HTMLButtonElement[];
+    expect(removes[0]!.disabled).toBe(true);
+    const backends = r.getAllByLabelText("Backend") as HTMLSelectElement[];
+    expect(backends[0]!.disabled).toBe(true);
+    expect(backends[0]!.value).toBe("claude");
+  });
+
+  it("carries model, count and write when set", async () => {
+    const r = openCollab();
+    fireEvent.input(goalBox(r), { target: { value: "g" } });
+    const models = r.getAllByLabelText("Model") as HTMLInputElement[];
+    fireEvent.input(models[1]!, { target: { value: "gemini-2.5-pro" } });
+    const counts = r.getAllByLabelText("Count") as HTMLInputElement[];
+    fireEvent.input(counts[0]!, { target: { value: "3" } });
+    const writes = r.container.querySelectorAll('input[type="checkbox"]');
+    fireEvent.click(writes[0]!);
+
+    fireEvent.click(r.getByText("create collaboration"));
+    await waitFor(() => expect(requestMock).toHaveBeenCalled());
+    const sent = requestMock.mock.calls[0]![0] as Record<string, unknown>;
+    const worker = (sent.collaboration as { roles: Array<Record<string, unknown>> }).roles[1]!;
+    expect(worker.model).toBe("gemini-2.5-pro");
+    expect(worker.count).toBe(3);
+    expect(worker.write).toBe(true);
+  });
+
+  it("a plain session still sends no collaboration", async () => {
+    authMock.mockReturnValue(authOk(["claude"]));
+    requestMock.mockResolvedValue({ id: "s", name: "n", workdir: "/w" });
+    const r = render(() => <NewSessionModal />);
+    openNewSessionModal();
+    fireEvent.input(r.getByPlaceholderText("e.g. shield-refactor"), {
+      target: { value: "plain" },
+    });
+    fireEvent.click(r.getByText("create"));
+    await waitFor(() => expect(requestMock).toHaveBeenCalled());
+    expect("collaboration" in (requestMock.mock.calls[0]![0] as object)).toBe(false);
   });
 });
