@@ -25,6 +25,14 @@
  */
 
 import { randomUUID } from "node:crypto";
+import {
+  DEFAULT_MCP_PROTOCOL_VERSION,
+  ok,
+  rpcErr,
+  tokenFrom,
+  type JsonRpcMessage,
+  type JsonRpcResponse,
+} from "../mcp/jsonrpc-http.js";
 import type { MemoryEngine } from "./engine.js";
 import { memoryToolDefs, type MemoryToolContext, type MemoryToolDef } from "./tools.js";
 
@@ -58,42 +66,11 @@ export interface MemoryMcpMount {
 }
 
 const SERVER_INFO = { name: "codeoid-memory", version: "0.1.0" } as const;
-/** Echoed only when the client doesn't propose its own protocolVersion. */
-const DEFAULT_PROTOCOL_VERSION = "2025-06-18";
 
-type JsonRpcId = string | number | null;
-interface JsonRpcMessage {
-  jsonrpc?: string;
-  id?: JsonRpcId;
-  method?: string;
-  params?: Record<string, unknown>;
-}
-interface JsonRpcResponse {
-  jsonrpc: "2.0";
-  id: JsonRpcId;
-  result?: unknown;
-  error?: { code: number; message: string; data?: unknown };
-}
 
-function ok(id: JsonRpcId, result: unknown): JsonRpcResponse {
-  return { jsonrpc: "2.0", id, result };
-}
-function rpcErr(id: JsonRpcId, code: number, message: string): JsonRpcResponse {
-  return { jsonrpc: "2.0", id, error: { code, message } };
-}
+
 
 /** Bearer token from the Authorization header, or a `?token=` query fallback. */
-function tokenFrom(req: Request): string | null {
-  const auth = req.headers.get("authorization");
-  if (auth && auth.length > 7 && auth.slice(0, 7).toLowerCase() === "bearer ") {
-    const t = auth.slice(7).trim();
-    if (t) return t;
-  }
-  // Fallback base so a relative req.url (some test/client setups) can't throw;
-  // Bun.serve hands us absolute URLs, the base is only used to parse the query.
-  const q = new URL(req.url, "http://localhost").searchParams.get("token");
-  return q && q.length > 0 ? q : null;
-}
 
 export class MemoryMcpHttp {
   readonly #engine: MemoryEngine;
@@ -188,7 +165,7 @@ export class MemoryMcpHttp {
       case "initialize": {
         const requested = msg?.params?.protocolVersion;
         return ok(id, {
-          protocolVersion: typeof requested === "string" ? requested : DEFAULT_PROTOCOL_VERSION,
+          protocolVersion: typeof requested === "string" ? requested : DEFAULT_MCP_PROTOCOL_VERSION,
           capabilities: { tools: {} },
           serverInfo: SERVER_INFO,
         });

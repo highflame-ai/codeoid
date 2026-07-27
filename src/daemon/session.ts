@@ -250,6 +250,14 @@ export interface SessionCreateOptions {
    */
   collaborationRole?: SessionInfo["collaborationRole"];
   /**
+   * Role-scoped goal-blackboard mount for a collaboration child: the endpoint
+   * URL plus a bearer token that IS the scope (one goal, this role's read/write
+   * set). Handed to the provider like `memoryMcp`, so any backend able to mount
+   * an MCP URL gets it — which is the point of making the blackboard mountable
+   * rather than an in-process Claude-SDK server (#245).
+   */
+  blackboardMcp?: { url: string; token: string };
+  /**
    * Pre-built codeoid_fleet MCP server (conductor sessions only). Built by
    * the SessionManager because its tools close over the manager's tenant-
    * scoped session view; the Session just hands it to the provider.
@@ -331,6 +339,8 @@ export class Session {
   readonly collaboration?: CollaborationConfig;
   /** Which collaboration + role this session serves, when it is a child. */
   readonly collaborationRole?: SessionInfo["collaborationRole"];
+  /** Role-scoped blackboard mount (URL + scope-bearing token), when a child. */
+  readonly #blackboardMcp?: { url: string; token: string };
   readonly createdBy: string;
   readonly createdAt: string;
   /**
@@ -631,6 +641,7 @@ export class Session {
     this.worktree = opts.worktree;
     this.collaboration = opts.collaboration;
     this.collaborationRole = opts.collaborationRole;
+    this.#blackboardMcp = opts.blackboardMcp;
     this.#onStatusChange = opts.onStatusChange;
     this.#workerShape = opts.workerShape;
     if (opts.initialMode) {
@@ -824,6 +835,7 @@ export class Session {
       identityManager: this.#identityManager,
       memory: this.#memory,
       memoryMcp: this.#memoryMcp,
+      blackboardMcp: this.#blackboardMcp,
       mcpRegistry: this.#mcpRegistry,
       mcpHub: this.#mcpHub,
       fleet: this.#fleet,

@@ -52,6 +52,13 @@ export interface ProviderSessionInit {
   /** Shared in-daemon memory MCP endpoint + URL — mounted by URL-based backends
    *  (gemini-cli, later codex). Present only when memory is enabled. */
   memoryMcp?: MemoryMcpMount;
+  /**
+   * Role-scoped goal-blackboard mount for a collaboration child (URL + a bearer
+   * token that IS the scope). URL-mounting backends surface it as an MCP
+   * server; that mountability is the whole reason it isn't an in-process
+   * Claude-SDK object (#245).
+   */
+  blackboardMcp?: { url: string; token: string };
   /** Cross-backend MCP registry — the servers to mount on this session's backend. */
   mcpRegistry?: McpRegistry;
   /** Daemon-owned MCP client pool backing the registry (Model-B backends execute
