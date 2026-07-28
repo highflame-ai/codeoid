@@ -320,6 +320,36 @@ describe("loadConfig — failure modes", () => {
   });
 });
 
+describe("loadConfig — collaboration.maxLiveChildren", () => {
+  it("defaults to two full-size fleets", () => {
+    const c = loadConfig({ configPath, env: {} });
+    expect(c.collaboration?.maxLiveChildren).toBe(24);
+  });
+
+  it("accepts 0 (unlimited) and any value at or above the per-goal cap", () => {
+    for (const n of [0, 12, 13, 100]) {
+      writeConfig({ collaboration: { maxLiveChildren: n } });
+      expect(loadConfig({ configPath, env: {} }).collaboration?.maxLiveChildren).toBe(n);
+    }
+  });
+
+  it("loud-fails between 1 and 11, where it would contradict the per-goal cap", () => {
+    // A tenant cap below MAX_COLLABORATION_CHILDREN (12) would reject a single
+    // collaboration that planChildren explicitly permits — two bounds
+    // disagreeing, with the user told "max 12" by one and "over the limit" by
+    // the other. Refuse the config instead of shipping the contradiction.
+    for (const n of [1, 6, 11]) {
+      writeConfig({ collaboration: { maxLiveChildren: n } });
+      expect(() => loadConfig({ configPath, env: {} })).toThrow(/Invalid config/);
+    }
+  });
+
+  it("loud-fails on a negative value", () => {
+    writeConfig({ collaboration: { maxLiveChildren: -1 } });
+    expect(() => loadConfig({ configPath, env: {} })).toThrow(/Invalid config/);
+  });
+});
+
 describe("resolveZeroidUrl", () => {
   it("maps known preset names to their URLs", () => {
     expect(resolveZeroidUrl("highflame")).toBe("https://auth.highflame.ai");

@@ -436,16 +436,64 @@ async function probeGit(workdir: string): Promise<string> {
   }
 }
 
-export function buildFleetMcpServer(deps: FleetDeps): McpSdkServerConfigWithInstance {
+/**
+ * The tool subset a COLLABORATION ORCHESTRATOR gets
+ * (docs/collaborative-session-design.md line 142: "a conductor-shaped Session
+ * whose fleet MCP surface gains role-aware delegation").
+ *
+ * Deliberately four tools, and the omissions carry as much intent as the
+ * inclusions:
+ *
+ * - **no `fleet_spawn`** — §2 fixes a goal's role bindings for its whole life
+ *   ("changing backends mid-goal would orphan live children"). The roster is
+ *   declared at create time, and it is also what the tenant-wide live-children
+ *   cap counts, so letting an orchestrator grow its own fleet ad hoc would
+ *   route around a bound the owner set.
+ * - **no `fleet_find` / `fleet_recall` / `fleet_summary`** — these query the
+ *   memory engine across the whole tenant, and their `listSessions()` call is
+ *   used only to LABEL results, never to bound them. An orchestrator holding
+ *   them could recall episodes from sessions outside its goal. They would also
+ *   undercut the blackboard: §4 has the orchestrator hold an INDEX of typed
+ *   artifacts, and raw episode recall over its own children is a second,
+ *   unscoped channel for exactly the material the blackboard mediates.
+ * - **no `machine_map`** — machine-wide repo topology is a conductor concern,
+ *   not a goal's.
+ *
+ * The orchestrator's `FleetDeps` also passes no `memory`, so the excluded
+ * memory-backed tools fail closed ("memory is disabled") even if a future edit
+ * adds one back to this set. Two independent reasons for them not to work.
+ */
+export const ORCHESTRATOR_FLEET_TOOLS: ReadonlySet<string> = new Set([
+  "fleet_list",
+  "fleet_tasks",
+  "fleet_send",
+  "fleet_interrupt",
+]);
+
+export function buildFleetMcpServer(
+  deps: FleetDeps,
+  opts?: {
+    /**
+     * Restrict the exposed tools to these names. Absent = the full conductor
+     * surface. Filtering here rather than building a second server keeps one
+     * definition of every tool's schema and description, so the orchestrator
+     * can never drift into a differently-worded `fleet_send`.
+     */
+    tools?: ReadonlySet<string>;
+  },
+): McpSdkServerConfigWithInstance {
   const handlers = createFleetHandlers(deps);
   const text = (payload: string) => ({
     content: [{ type: "text" as const, text: payload }],
   });
+  const allowed = opts?.tools;
+  const pick = <T extends { name: string }>(tools: T[]): T[] =>
+    allowed ? tools.filter((t) => allowed.has(t.name)) : tools;
 
   return createSdkMcpServer({
     name: "codeoid-fleet",
     version: "0.1.0",
-    tools: [
+    tools: pick([
       tool(
         "fleet_list",
         "List every session in the fleet, grouped by workspace — names, status, provider, attached clients. Your view of what exists right now.",
@@ -526,6 +574,6 @@ export function buildFleetMcpServer(deps: FleetDeps): McpSdkServerConfigWithInst
         },
         async ({ session }) => text(await handlers.fleet_interrupt({ session })),
       ),
-    ],
+    ]),
   });
 }

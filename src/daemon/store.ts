@@ -986,18 +986,35 @@ export class Store {
     return row ? rowToDispatchTask(row) : null;
   }
 
+  /**
+   * The tenant's task board, newest first.
+   *
+   * `createdBy` narrows it to one dispatcher's own tasks. A collaboration
+   * orchestrator gets a fleet surface scoped to its own goal, and a task board
+   * showing every other session's dispatches — target names, prompts' result
+   * digests — would be the one place that scoping leaked. Filtered in SQL, not
+   * after the fact, so `limit` still returns `limit` of the caller's own rows.
+   */
   dispatchListForTenant(
     accountId: string,
     projectId: string,
     limit = 30,
+    createdBy?: string,
   ): DispatchTaskRow[] {
     const rows = this.#db
       .prepare(
         `SELECT * FROM dispatch_tasks
          WHERE account_id = ? AND project_id = ?
+           AND (? IS NULL OR created_by = ?)
          ORDER BY created_at DESC LIMIT ?`,
       )
-      .all(accountId, projectId, limit) as RawDispatchRow[];
+      .all(
+        accountId,
+        projectId,
+        createdBy ?? null,
+        createdBy ?? null,
+        limit,
+      ) as RawDispatchRow[];
     return rows.map(rowToDispatchTask);
   }
 
