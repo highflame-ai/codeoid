@@ -61,7 +61,14 @@ import {
   type ImportedSessionInit,
 } from "./share/index.js";
 import type { AgentIdentityManager } from "./agent-identity.js";
-import { buildFleetMcpServer, type FleetDispatchDeps, type FleetSessionView, type FleetTaskView } from "./fleet.js";
+import {
+  buildFleetMcpServer,
+  ORCHESTRATOR_FLEET_TOOLS,
+  type FleetDeps,
+  type FleetDispatchDeps,
+  type FleetSessionView,
+  type FleetTaskView,
+} from "./fleet.js";
 import {
   Dispatcher,
   NonRetryableDispatchError,
@@ -99,6 +106,7 @@ import type {
   AuthContext,
   ClientMessage,
   CollaborationConfig,
+  CollaborationCost,
   CollaborationRole,
   DaemonMessage,
   McpServerStatus,
@@ -540,10 +548,22 @@ mcpHub: this.#mcpHub,
           ...(child?.options ?? {}),
           defaultModel:
             meta.role === "conductor" ? this.#config?.conductor?.model : undefined,
+          // Conductor gets the tenant-wide surface; a collaboration
+          // orchestrator gets the role-aware one scoped to its own children.
+          // Its id is already known here, so the thunk is trivial.
           fleet:
             meta.role === "conductor"
               ? this.#buildFleetServer(meta.accountId, meta.projectId)
-              : undefined,
+              : meta.collaboration
+                ? this.#buildOrchestratorFleetServer(
+                    () => meta.sessionId,
+                    meta.accountId,
+                    meta.projectId,
+                  )
+                : undefined,
+          collaborationCost: meta.collaboration
+            ? () => this.#collaborationCostRollup(meta.sessionId)
+            : undefined,
           _testProvider: this.#testProviderFactory?.(),
           onStatusChange: this.#statusObserver,
           onModels: (providerId, m) => this._cacheModels(providerId, m),
@@ -1633,6 +1653,15 @@ mcpHub: this.#mcpHub,
   }
 
   /**
+   * The cost roll-up for one goal — tests only. The production path reaches it
+   * through the `collaborationCost` callback handed to each orchestrator
+   * Session, which is not observable from outside.
+   */
+  _collaborationCostForTest(goalSessionId: string): CollaborationCost | undefined {
+    return this.#collaborationCostRollup(goalSessionId);
+  }
+
+  /**
    * Unscoped session lookup — tests only, and named so a production call site
    * is obvious in review. Everything user-facing must go through
    * `#getOwnedSession`, which gates on tenancy.
@@ -1859,6 +1888,19 @@ mcpHub: this.#mcpHub,
         };
       }
       planned = plan.children;
+      // Tenant-wide blast-radius backstop, checked BEFORE anything is built so
+      // a refusal costs nothing to unwind (§11 P3). `planChildren` has already
+      // bounded THIS goal at MAX_COLLABORATION_CHILDREN; this bounds the number
+      // of goals, which nothing did — see #liveCollaborationChildren.
+      const overCap = this.#liveChildrenCapExceededBy(auth, planned.length);
+      if (overCap) {
+        return {
+          type: "response.error",
+          requestId: msg.id,
+          error: overCap,
+          code: "rate_limited",
+        };
+      }
       // The orchestrator runs under the compiled one-goal pack: the goal, its
       // fleet roster, and the delegation rules become its constitution, so
       // pack vocabulary never surfaces on this path.
@@ -1870,10 +1912,29 @@ mcpHub: this.#mcpHub,
       };
     }
 
+    // The orchestrator's role-aware fleet surface, scoped to this goal's own
+    // children. Built BEFORE the session because `fleet` is a constructor
+    // input; the id it scopes to is read lazily through the thunk, which is
+    // only ever called from a tool handler mid-turn.
+    let goalSessionId = "";
+    const orchestratorFleet = collaboration
+      ? this.#buildOrchestratorFleetServer(
+          () => goalSessionId,
+          auth.accountId,
+          auth.projectId,
+        )
+      : undefined;
+
     const session = new Session({
       name: msg.name,
       workdir,
       auth,
+      fleet: orchestratorFleet,
+      // Same thunk trick as `fleet`: the goal id is generated inside this
+      // constructor, and the callback is only invoked from an approval request.
+      collaborationCost: collaboration
+        ? () => this.#collaborationCostRollup(goalSessionId)
+        : undefined,
       store: this.#store,
       transcriptStore: this.#transcriptStore,
       providers: this.#providers,
@@ -1894,6 +1955,10 @@ mcpHub: this.#mcpHub,
       onModels: (providerId, m) => this._cacheModels(providerId, m),
     });
 
+    // Resolve the thunk the fleet server closes over. Set before any child
+    // exists, and before the session can take a turn, so no tool handler can
+    // observe the empty string.
+    goalSessionId = session.id;
     this.#sessions.set(session.id, session);
     this.#rateLimiter.recordCreation(auth.sub);
 
@@ -1965,6 +2030,104 @@ mcpHub: this.#mcpHub,
     if (!token) return;
     this.#blackboardMcp.revoke(token);
     this.#blackboardTokens.delete(sessionId);
+  }
+
+  /**
+   * Live role-children this tenant is currently running, across every goal.
+   *
+   * Counted from the live session map rather than from a table: a role-child
+   * IS a session (per-goal lifetime, not a dispatch task), so the session map
+   * is the authority on how many are actually running right now. Counting rows
+   * in `dispatch_tasks` — which is what `dispatch.maxConcurrentWorkers` does —
+   * finds none of them, and that is precisely the gap this closes.
+   */
+  #liveCollaborationChildren(accountId: string, projectId: string): number {
+    let n = 0;
+    for (const s of this.#sessions.values()) {
+      if (
+        s.collaborationRole !== undefined &&
+        s.accountId === accountId &&
+        s.projectId === projectId
+      ) {
+        n++;
+      }
+    }
+    return n;
+  }
+
+  /**
+   * The refusal message when spawning `incoming` more children would cross the
+   * tenant cap, or `null` when it fits.
+   *
+   * A blast-radius backstop, not a scheduler: it refuses the create outright
+   * rather than queueing it. Queueing would leave the user with a collaboration
+   * that exists but is not working, which is strictly harder to reason about
+   * than being told no — and the fix (destroy a finished goal) is one command.
+   *
+   * Absent config means UNLIMITED. `loadConfig` always populates a default, so
+   * an absent value only happens for a hand-built config in a test or an
+   * embedder, and inventing a cap those never asked for would be the surprising
+   * direction.
+   */
+  #liveChildrenCapExceededBy(auth: AuthContext, incoming: number): string | null {
+    const cap = this.#config?.collaboration?.maxLiveChildren ?? 0;
+    if (cap <= 0) return null;
+    const live = this.#liveCollaborationChildren(auth.accountId, auth.projectId);
+    if (live + incoming <= cap) return null;
+    return [
+      `Collaboration would bring live role-children to ${live + incoming}, over the limit of ${cap}`,
+      `(${live} already running across your goals).`,
+      "Destroy a finished collaboration, reduce this one's fan-out, or raise",
+      "`collaboration.maxLiveChildren` in ~/.codeoid/config.json.",
+    ].join(" ");
+  }
+
+  /**
+   * What one collaboration has spent so far: the orchestrator plus every live
+   * role-child (§11 P3's cost roll-up).
+   *
+   * Summed live from the session map rather than kept as a running total. The
+   * child set changes over a goal's life — children are torn down, and a
+   * restart rebuilds them — so a stored counter would drift from reality in
+   * both directions, and this is read once per approval, not per turn.
+   *
+   * `undefined` when the id names no live collaborative session, which is the
+   * normal answer for every non-collaboration approval.
+   */
+  #collaborationCostRollup(goalSessionId: string): CollaborationCost | undefined {
+    const goal = this.#sessions.get(goalSessionId);
+    if (!goal?.collaboration) return undefined;
+
+    const rollup: CollaborationCost = {
+      goalSessionId,
+      children: 0,
+      totalCostUsd: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      numTurns: 0,
+    };
+    const add = (s: Session): void => {
+      const u = s.toInfo().usage;
+      if (!u) return;
+      rollup.totalCostUsd += u.totalCostUsd;
+      rollup.inputTokens += u.inputTokens;
+      rollup.outputTokens += u.outputTokens;
+      rollup.numTurns += u.numTurns;
+    };
+
+    add(goal);
+    for (const s of this.#sessions.values()) {
+      if (
+        s.collaborationRole?.parentSessionId !== goalSessionId ||
+        s.accountId !== goal.accountId ||
+        s.projectId !== goal.projectId
+      ) {
+        continue;
+      }
+      rollup.children++;
+      add(s);
+    }
+    return rollup;
   }
 
   /** Lazily build the blackboard over the daemon's existing DB connection. */
@@ -3248,7 +3411,13 @@ mcpHub: this.#mcpHub,
    * population — tenant-scoped exactly like session.list.
    */
   #buildFleetServer(accountId: string, projectId: string) {
-    return buildFleetMcpServer({
+    return buildFleetMcpServer(this.#conductorFleetDeps(accountId, projectId));
+  }
+
+  /** The conductor's tenant-wide deps. Extracted from `#buildFleetServer` so a
+   *  test can compare them against the orchestrator's scoped ones. */
+  #conductorFleetDeps(accountId: string, projectId: string): FleetDeps {
+    return {
       listSessions: (): FleetSessionView[] => {
         const views: FleetSessionView[] = [];
         for (const s of this.#sessions.values()) {
@@ -3285,7 +3454,7 @@ mcpHub: this.#mcpHub,
         this.#config?.dispatch?.enabled === false
           ? undefined
           : this._fleetDispatchDeps(accountId, projectId),
-    });
+    };
   }
 
   /**
@@ -3360,6 +3529,189 @@ mcpHub: this.#mcpHub,
       listTasks: (limit: number): FleetTaskView[] =>
         this.#store
           .dispatchListForTenant(accountId, projectId, limit)
+          .map((t) => ({
+            id: t.id,
+            kind: t.kind,
+            shape: t.shape,
+            status: t.status,
+            attempts: t.attempts,
+            target: t.targetSession ?? t.workdir,
+            createdAt: t.createdAt,
+            error: t.error,
+            resultDigest: t.resultDigest,
+          })),
+    };
+  }
+
+  /**
+   * The COLLABORATION ORCHESTRATOR's fleet surface — role-aware delegation
+   * (docs/collaborative-session-design.md line 142).
+   *
+   * The design has always called for this and it was never wired: `#create`
+   * passed `fleet` only for `role: "conductor"`, while `compileGoalPack` told
+   * the orchestrator "Direct them with the fleet tools." It was instructed to
+   * use tools it did not have.
+   *
+   * The conductor's own server could not simply be reused. It is ONE
+   * deliberate, per-tenant privileged session; collaborations are user-created
+   * and many, so handing an orchestrator `#buildFleetServer` would let any of
+   * them direct every session in the tenant. Everything here is therefore
+   * scoped to the goal's own children, and the scoping lives in the DEPS — not
+   * in the tool descriptions — so a future caller of these closures cannot get
+   * an unscoped view by asking differently. Same doctrine as the blackboard
+   * service.
+   *
+   * `goalId` is a thunk because the orchestrator's session id is generated
+   * inside its own constructor, and the server has to be passed IN to that
+   * constructor. Tool handlers only run during a turn, long after the id
+   * exists.
+   */
+  #buildOrchestratorFleetServer(
+    goalId: () => string,
+    accountId: string,
+    projectId: string,
+  ) {
+    return buildFleetMcpServer(this.#orchestratorFleetDeps(goalId, accountId, projectId), {
+      tools: ORCHESTRATOR_FLEET_TOOLS,
+    });
+  }
+
+  /**
+   * Underscore-public so tests can exercise the REAL closures — the scoping
+   * here is a security boundary, and asserting it through the MCP transport
+   * would test the transport instead. Mirrors `_fleetDispatchDeps`.
+   */
+  _orchestratorFleetDepsForTest(
+    goalId: string,
+    accountId: string,
+    projectId: string,
+  ): FleetDeps {
+    return this.#orchestratorFleetDeps(() => goalId, accountId, projectId);
+  }
+
+  /**
+   * The CONDUCTOR's deps — tests only, and paired with the orchestrator
+   * accessor above so the two surfaces can be asserted differentially. An
+   * "the orchestrator doesn't get X" test proves nothing unless something in
+   * the same run shows X was actually available to give.
+   */
+  _fleetDepsForTest(accountId: string, projectId: string): FleetDeps {
+    return this.#conductorFleetDeps(accountId, projectId);
+  }
+
+  #orchestratorFleetDeps(
+    goalId: () => string,
+    accountId: string,
+    projectId: string,
+  ): FleetDeps {
+    /** This goal's live children — the orchestrator's entire visible world. */
+    const children = (): Session[] => {
+      const parentId = goalId();
+      const out: Session[] = [];
+      for (const s of this.#sessions.values()) {
+        if (
+          s.collaborationRole?.parentSessionId === parentId &&
+          s.accountId === accountId &&
+          s.projectId === projectId
+        ) {
+          out.push(s);
+        }
+      }
+      return out;
+    };
+    /** Attribution for this goal's dispatches — stable across restarts, since
+     *  it keys off the goal id rather than any per-boot identity. */
+    const createdBy = () => `orchestrator:${goalId()}`;
+
+    return {
+        listSessions: (): FleetSessionView[] =>
+          children().map((s) => ({
+            id: s.id,
+            name: s.name,
+            workdir: s.workdir,
+            workspaceId: s.workspaceId,
+            status: s.status,
+            role: s.role,
+            providerId: s.providerId,
+            model: s.toInfo().model,
+            attachedClients: s.attachedClientCount,
+            createdAt: s.createdAt,
+          })),
+        // No memory engine on purpose — see ORCHESTRATOR_FLEET_TOOLS. The
+        // memory-backed tools are excluded from the set AND would fail closed
+        // if one were ever added back.
+        audit: (action, detail) =>
+          this.#store.audit(createdBy(), action, goalId(), detail),
+        // Excluded from fleet_find results; harmless here since that tool isn't
+        // exposed, but the deps must still be complete.
+        conductorSessionId: () => goalId(),
+        dispatch:
+          this.#config?.dispatch?.enabled === false
+            ? undefined
+            : this.#orchestratorDispatchDeps(children, createdBy, accountId, projectId),
+    };
+  }
+
+  /**
+   * Send-class dispatch for an orchestrator, restricted to its own children.
+   *
+   * Every method re-resolves the child set at call time rather than closing
+   * over a snapshot: a goal's children can be torn down mid-turn, and a stale
+   * snapshot would let a dispatch land on a session that no longer belongs to
+   * this goal.
+   */
+  #orchestratorDispatchDeps(
+    children: () => Session[],
+    createdBy: () => string,
+    accountId: string,
+    projectId: string,
+  ): FleetDispatchDeps {
+    const tenant = this._fleetDispatchDeps(accountId, projectId);
+    /** A child of THIS goal, by id — the only legal dispatch target. */
+    const ownChild = (sessionId: string): Session | undefined =>
+      children().find((c) => c.id === sessionId);
+
+    return {
+      ...tenant,
+      enqueue: (input) => {
+        // §2 fixes a goal's role bindings for its whole life, and the roster is
+        // what the tenant-wide live-children cap counts. An orchestrator that
+        // could spawn would grow its fleet past a bound the owner set.
+        if (input.kind === "spawn") {
+          throw new Error(
+            "An orchestrator cannot spawn workers — its roster is fixed for the life of the goal. Direct one of its existing role-children instead.",
+          );
+        }
+        if (!input.targetSession || !ownChild(input.targetSession)) {
+          throw new Error(
+            "Target is not a role-child of this collaboration. You can only direct your own fleet; use fleet_list to see it.",
+          );
+        }
+        // Straight to the dispatcher, NOT through `tenant.enqueue` — that
+        // closure stamps the CONDUCTOR's `createdBy`, which would both
+        // misattribute the task and defeat the `listTasks` filter below (the
+        // orchestrator would see the whole tenant board again). `createdBy` is
+        // not part of the FleetDispatchDeps contract, so there is no way to
+        // override it from the outside; going direct is the honest path.
+        return this.#dispatcher.enqueue({
+          ...input,
+          accountId,
+          projectId,
+          createdBy: createdBy(),
+        });
+      },
+      interrupt: async (sessionId: string) => {
+        if (!ownChild(sessionId)) {
+          throw new Error("Target is not a role-child of this collaboration.");
+        }
+        await tenant.interrupt(sessionId);
+      },
+      // Only this goal's own dispatches. The tenant board would show every
+      // other session's targets and result digests — the one place the scoping
+      // above would otherwise leak.
+      listTasks: (limit: number): FleetTaskView[] =>
+        this.#store
+          .dispatchListForTenant(accountId, projectId, limit, createdBy())
           .map((t) => ({
             id: t.id,
             kind: t.kind,

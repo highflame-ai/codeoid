@@ -39,6 +39,7 @@ import type {
   SessionMode,
   SessionStatus,
   SessionUsage,
+  CollaborationCost,
   TurnUsage,
   DaemonMessage,
   SessionMessage,
@@ -277,6 +278,13 @@ export interface SessionCreateOptions {
    */
   onStatusChange?: (sessionId: string, status: SessionStatus) => void;
   /**
+   * What this session's collaboration has spent so far, for the approval
+   * prompt on a send-class dispatch. Injected by the manager because a Session
+   * cannot see its siblings — the roll-up spans the orchestrator and every live
+   * role-child. Returns undefined when there is nothing to report.
+   */
+  collaborationCost?: () => CollaborationCost | undefined;
+  /**
    * Initial execution mode + autonomous tool budget. Spawned workers start
    * "autonomous" with a bounded budget so they can work unattended; when the
    * budget exhausts, the mode reverts to guarded and the session waits for
@@ -493,6 +501,7 @@ export class Session {
   // until budget) are opt-in via /mode.
   #mode: SessionMode = "guarded";
   #onStatusChange?: (sessionId: string, status: SessionStatus) => void;
+  #collaborationCost?: () => CollaborationCost | undefined;
   #workerShape?: "ship" | "scout";
   #turnsRemaining: number | undefined = undefined;
 
@@ -646,6 +655,7 @@ export class Session {
     this.#blackboardMcp = opts.blackboardMcp;
     this.#onStatusChange = opts.onStatusChange;
     this.#workerShape = opts.workerShape;
+    this.#collaborationCost = opts.collaborationCost;
     if (opts.initialMode) {
       this.#mode = opts.initialMode.mode;
       this.#turnsRemaining =
@@ -2260,6 +2270,27 @@ export class Session {
   }
 
   /**
+   * The collaboration cost roll-up to hang on an approval request, as a
+   * spreadable fragment (`{}` when there is nothing to attach).
+   *
+   * Only for a SEND-class fleet dispatch: that is the moment the owner
+   * authorizes more spend, and it is the only moment where the number changes a
+   * decision. Attaching it to every approval would make it wallpaper.
+   *
+   * Never throws. A roll-up that could fail an approval would be worse than no
+   * roll-up at all — the dispatch path must not be wedgeable by a cost display.
+   */
+  #collaborationCostFor(toolName: string): { collaborationCost?: CollaborationCost } {
+    if (!this.#collaborationCost || !isFleetSendTool(toolName)) return {};
+    try {
+      const cost = this.#collaborationCost();
+      return cost ? { collaborationCost: cost } : {};
+    } catch {
+      return {};
+    }
+  }
+
+  /**
    * Whether a goal-blackboard mount is attached to THIS session.
    *
    * Deliberately not inferable from `BlackboardMcpHttp.activeTokens`: that
@@ -3546,6 +3577,7 @@ export class Session {
                   input: event.input,
                   description: `${event.name}(${Object.keys(event.input).join(", ")})`,
                   approvalId: event.approvalId,
+                  ...this.#collaborationCostFor(event.name),
                 } as unknown as ToolState),
           },
         );

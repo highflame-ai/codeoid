@@ -21,6 +21,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CodeoidConfig } from "../config.js";
 import {
+  compileGoalPack,
   orchestratorRole,
   orphanedChildBrief,
   parseRoleSpec,
@@ -32,6 +33,7 @@ import {
   type ProviderLookup,
 } from "../daemon/collaboration.js";
 import { MockSessionProvider, mockResult } from "../daemon/providers/mock/session-provider.js";
+import type { MemoryEngine } from "../daemon/memory/index.js";
 import { ProviderRegistry } from "../daemon/providers/registry.js";
 import type { ProviderEvent } from "../daemon/providers/interface.js";
 import { Blackboard } from "../daemon/blackboard/service.js";
@@ -41,6 +43,14 @@ import { SessionManager } from "../daemon/session-manager.js";
 import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
 import { roleDeniesTool } from "../daemon/providers/tool-safety.js";
+import {
+  buildFleetMcpServer,
+  FLEET_SEND_TOOL_NAMES,
+  FLEET_TOOL_NAMES,
+  isFleetSendTool,
+  ORCHESTRATOR_FLEET_TOOLS,
+  type FleetDeps,
+} from "../daemon/fleet.js";
 import { ALL_SCOPES } from "../protocol/scopes.js";
 import { LIMITS } from "../protocol/types.js";
 import type {
@@ -275,7 +285,7 @@ const textTurn = (text: string): ProviderEvent[] => [
   { type: "turn_done", result: mockResult() } as ProviderEvent,
 ];
 
-function mkConfig(): CodeoidConfig {
+function mkConfig(over: Partial<CodeoidConfig> = {}): CodeoidConfig {
   return {
     daemonUrl: "ws://127.0.0.1:7400",
     dbPath: "/tmp/codeoid.db",
@@ -290,6 +300,7 @@ function mkConfig(): CodeoidConfig {
     session: {},
     conductor: { enabled: false, name: "conductor", provider: "claude" },
     dispatch: { enabled: false, tickMs: 999_999, leaseMs: 60_000, failureLimit: 2, maxConcurrentWorkers: 2, workerToolBudget: 7, retryBaseMs: 0 },
+    ...over,
   };
 }
 
@@ -1418,3 +1429,472 @@ describe("collaboration survives a daemon restart", () => {
   });
 });
 
+
+// ── Guard: the tenant-wide live-children cap (§11 P3) ───────────────────────
+
+// The hole this closes, verified before it was written: role-children are
+// long-lived `send`-driven sessions, not `kind:"spawn"` dispatch tasks, so
+// `dispatchActiveSpawnCount` — the query behind `dispatch.maxConcurrentWorkers`
+// — counts exactly zero of them. `MAX_COLLABORATION_CHILDREN` bounds ONE goal
+// at 12; nothing bounded the number of goals, and `rateLimit` is unlimited by
+// design. Ten collaborations meant 120 live autonomous agents, uncapped.
+describe("live role-children are capped per tenant", () => {
+  /** 2 children per goal, so a cap of 12 is reached in 6 creates. */
+  const SMALL: CollaborationConfig = {
+    goal: "small goal",
+    roles: [
+      { name: "orchestrator", providerId: "claude" },
+      { name: "review", providerId: "gemini", count: 2 },
+    ],
+  };
+
+  /** Rebuild the manager with a specific cap. */
+  function withCap(maxLiveChildren: number): void {
+    manager = new SessionManager(store, transcript, undefined, undefined, undefined, {
+      config: mkConfig({ collaboration: { maxLiveChildren } }),
+      providers: makeRegistry(),
+    });
+  }
+
+  const create = (id: string, config = SMALL) =>
+    run({ type: "session.create", id, name: id, workdir, collaboration: config });
+
+  test("allows collaborations up to the cap, then refuses the one that crosses it", async () => {
+    withCap(12);
+    for (let i = 1; i <= 6; i++) {
+      const ok = await create(`c${i}`);
+      expect(ok.type).toBe("response.ok");
+    }
+    expect(childrenOf(await allSessions(), "").length).toBe(0); // sanity: no orphans
+    const all = await allSessions();
+    expect(all.filter((s) => s.collaborationRole).length).toBe(12);
+
+    const over = await create("c7");
+    expect(over.type).toBe("response.error");
+    if (over.type !== "response.error") return;
+    expect(over.code).toBe("rate_limited");
+    // The message has to be actionable — the count, the cap, and the way out.
+    expect(over.error).toMatch(/14, over the limit of 12/);
+    expect(over.error).toMatch(/12 already running/);
+    expect(over.error).toMatch(/collaboration\.maxLiveChildren/);
+  });
+
+  test("refuses BEFORE building anything — no orphan orchestrator left behind", async () => {
+    withCap(12);
+    for (let i = 1; i <= 6; i++) await create(`b${i}`);
+    const before = (await allSessions()).length;
+
+    const over = await create("b7");
+    expect(over.type).toBe("response.error");
+    // A rejected create that still left its orchestrator would be worse than
+    // no cap: a session that exists and can never get its fleet.
+    const after = await allSessions();
+    expect(after.length).toBe(before);
+    expect(after.some((s) => s.name === "b7")).toBe(false);
+  });
+
+  test("counts across goals, not within one", async () => {
+    // Each goal is well under MAX_COLLABORATION_CHILDREN; the cap is about
+    // their sum, which is the dimension nothing measured before.
+    withCap(4);
+    expect((await create("x1")).type).toBe("response.ok");
+    expect((await create("x2")).type).toBe("response.ok");
+    const third = await create("x3");
+    expect(third.type).toBe("response.error");
+  });
+
+  test("destroying a finished collaboration frees its capacity", async () => {
+    withCap(4);
+    const first = await create("f1");
+    await create("f2");
+    expect((await create("f3")).type).toBe("response.error");
+
+    const goalId = (first as { data: SessionInfo }).data.id;
+    expect((await run({ type: "session.destroy", id: "d", sessionId: goalId })).type).toBe(
+      "response.ok",
+    );
+    // Cascade teardown removed its 2 children, so there is room again.
+    expect((await create("f4")).type).toBe("response.ok");
+  });
+
+  test("0 means unlimited, matching the rateLimit opt-out convention", async () => {
+    withCap(0);
+    for (let i = 1; i <= 8; i++) {
+      expect((await create(`u${i}`)).type).toBe("response.ok");
+    }
+    expect((await allSessions()).filter((s) => s.collaborationRole).length).toBe(16);
+  });
+
+  test("an absent config is unlimited, not the default cap", async () => {
+    // loadConfig always populates a default; an absent value only happens for a
+    // hand-built config (a test, an embedder), and silently imposing a cap it
+    // never declared would be the surprising direction.
+    manager = new SessionManager(store, transcript, undefined, undefined, undefined, {
+      config: mkConfig(),
+      providers: makeRegistry(),
+    });
+    for (let i = 1; i <= 8; i++) {
+      expect((await create(`n${i}`)).type).toBe("response.ok");
+    }
+  });
+
+  test("another tenant's children do not consume this tenant's budget", async () => {
+    withCap(4);
+    const other: AuthContext = {
+      ...AUTH,
+      sub: "user:other",
+      accountId: "acc-other",
+      projectId: "proj-other",
+    };
+    for (let i = 1; i <= 2; i++) {
+      const resp = await manager.handle(
+        { type: "session.create", id: `o${i}`, name: `o${i}`, workdir, collaboration: SMALL },
+        other,
+        { id: "c-other", auth: other, send: () => {} },
+      );
+      expect(resp.type).toBe("response.ok");
+    }
+    // 4 children live, but all in the other tenant — ours is still empty.
+    expect((await create("m1")).type).toBe("response.ok");
+    expect((await create("m2")).type).toBe("response.ok");
+    expect((await create("m3")).type).toBe("response.error");
+  });
+
+  test("a single max-size collaboration is never blocked by the cap's floor", async () => {
+    // The config schema refuses a cap below MAX_COLLABORATION_CHILDREN
+    // precisely so the two bounds cannot contradict each other.
+    withCap(12);
+    const big: CollaborationConfig = {
+      goal: "big",
+      roles: [
+        { name: "orchestrator", providerId: "claude" },
+        { name: "review", providerId: "gemini", count: 8 },
+        { name: "search", providerId: "claude", count: 4 },
+      ],
+    };
+    expect((await create("big1", big)).type).toBe("response.ok");
+    expect((await allSessions()).filter((s) => s.collaborationRole).length).toBe(12);
+  });
+});
+
+// ── The orchestrator's role-aware fleet surface ─────────────────────────────
+
+// Design line 142 has always called for "a conductor-shaped Session whose fleet
+// MCP surface gains role-aware delegation". It was never wired: `#create`
+// passed `fleet` only for role:"conductor", while compileGoalPack's constitution
+// told the orchestrator "Direct them with the fleet tools" — instructing it to
+// use tools it did not have.
+//
+// The conductor's server could not be reused as-is. It is ONE per-tenant
+// privileged session; collaborations are user-created and many, so the
+// conductor's surface would let any orchestrator direct every session in the
+// tenant. These tests hit the real dependency closures rather than the MCP
+// transport, because that is where the scoping lives.
+describe("the orchestrator's fleet surface is scoped to its own children", () => {
+  const CONFIG: CollaborationConfig = {
+    goal: "scoped fleet",
+    roles: [
+      { name: "orchestrator", providerId: "claude" },
+      { name: "review", providerId: "gemini", count: 2 },
+    ],
+  };
+
+  // The shared harness disables dispatch, which would make `deps.dispatch`
+  // undefined and quietly turn every enforcement assertion below into a test of
+  // nothing. Enabled here with an inert tick so no dispatcher loop actually runs.
+  beforeEach(() => {
+    manager = new SessionManager(store, transcript, undefined, undefined, undefined, {
+      config: mkConfig({
+        dispatch: {
+          enabled: true,
+          tickMs: 999_999,
+          leaseMs: 60_000,
+          failureLimit: 2,
+          maxConcurrentWorkers: 2,
+          workerToolBudget: 7,
+          retryBaseMs: 0,
+        },
+      }),
+      providers: makeRegistry(),
+    });
+  });
+
+  const createGoal = async (id: string): Promise<SessionInfo> => {
+    const resp = await run({ type: "session.create", id, name: id, workdir, collaboration: CONFIG });
+    if (resp.type !== "response.ok") throw new Error(`create failed: ${JSON.stringify(resp)}`);
+    return resp.data as SessionInfo;
+  };
+
+  const depsFor = (goalId: string): FleetDeps =>
+    manager._orchestratorFleetDepsForTest(goalId, AUTH.accountId, AUTH.projectId);
+
+  test("sees its own children and nothing else — not itself, not other goals", async () => {
+    const mine = await createGoal("sf1");
+    const other = await createGoal("sf2");
+    await run({ type: "session.create", id: "sf3", name: "unrelated", workdir });
+
+    const visible = depsFor(mine.id).listSessions();
+    const myKids = childrenOf(await allSessions(), mine.id);
+    expect(visible.map((v) => v.id).sort()).toEqual(myKids.map((k) => k.id).sort());
+    expect(visible).toHaveLength(2);
+    // The three things it must NOT see.
+    expect(visible.some((v) => v.id === mine.id)).toBe(false);
+    expect(visible.some((v) => v.name === "unrelated")).toBe(false);
+    for (const kid of childrenOf(await allSessions(), other.id)) {
+      expect(visible.some((v) => v.id === kid.id)).toBe(false);
+    }
+  });
+
+  test("another tenant's identically-shaped goal is invisible", async () => {
+    const mine = await createGoal("sf4");
+    const other: AuthContext = { ...AUTH, accountId: "acc-x", projectId: "proj-x" };
+    await manager.handle(
+      { type: "session.create", id: "sfx", name: "sfx", workdir, collaboration: CONFIG },
+      other,
+      { id: "c-x", auth: other, send: () => {} },
+    );
+    // Same goal shape, different tenant — and the deps are built per tenant.
+    expect(depsFor(mine.id).listSessions()).toHaveLength(2);
+    expect(
+      manager
+        ._orchestratorFleetDepsForTest(mine.id, "acc-x", "proj-x")
+        .listSessions(),
+    ).toHaveLength(0);
+  });
+
+  test("carries no memory engine even when the daemon has one", async () => {
+    // fleet_find / fleet_recall query memory tenant-wide and use listSessions
+    // only to LABEL results, never to bound them. Excluded from the tool set
+    // AND denied the dependency — two independent reasons not to work.
+    //
+    // Asserted against a daemon that HAS a memory engine, and differentially
+    // against the conductor's deps. Without both halves this passes trivially,
+    // because the shared harness injects no engine at all — a mutation that
+    // handed `this.#memory` straight to the orchestrator went undetected until
+    // this test was written this way.
+    const stub = { marker: "memory-engine" } as unknown as MemoryEngine;
+    manager.setMemory(stub);
+    const mine = await createGoal("sf5");
+
+    expect(depsFor(mine.id).memory).toBeUndefined();
+    // The conductor legitimately gets it — proving the engine really is
+    // reachable from the manager and the omission above is a choice.
+    expect(manager._fleetDepsForTest(AUTH.accountId, AUTH.projectId).memory).toBe(stub);
+  });
+
+  test("refuses to spawn — the roster is fixed for the life of the goal", async () => {
+    const mine = await createGoal("sf6");
+    const dispatch = depsFor(mine.id).dispatch!;
+    expect(() =>
+      dispatch.enqueue({ kind: "spawn", shape: "scout", workdir, prompt: "go" }),
+    ).toThrow(/cannot spawn workers/);
+  });
+
+  test("refuses a send to anything that is not its own child", async () => {
+    const mine = await createGoal("sf7");
+    const other = await createGoal("sf8");
+    const plainResp = await run({ type: "session.create", id: "sf9", name: "plain", workdir });
+    const plain = (plainResp as { data: SessionInfo }).data;
+    const dispatch = depsFor(mine.id).dispatch!;
+
+    const send = (targetSession: string) =>
+      dispatch.enqueue({ kind: "send", shape: "scout", targetSession, prompt: "do it" });
+
+    // Another goal's child, an unrelated session, the orchestrator itself, and
+    // a target that doesn't exist — all the same refusal.
+    const theirKidId = childrenOf(await allSessions(), other.id)[0]!.id;
+    expect(() => send(theirKidId)).toThrow(/not a role-child/);
+    expect(() => send(plain.id)).toThrow(/not a role-child/);
+    expect(() => send(mine.id)).toThrow(/not a role-child/);
+    expect(() => send("does-not-exist")).toThrow(/not a role-child/);
+  });
+
+  test("allows a send to its own child, attributed to the goal", async () => {
+    const mine = await createGoal("sf10");
+    const kid = childrenOf(await allSessions(), mine.id)[0]!;
+    const dispatch = depsFor(mine.id).dispatch!;
+
+    const taskId = dispatch.enqueue({
+      kind: "send",
+      shape: "scout",
+      targetSession: kid.id,
+      prompt: "review the diff",
+    });
+    expect(typeof taskId).toBe("string");
+    // Attribution keys off the GOAL id, so it survives a restart the way the
+    // blackboard's authorSub does.
+    const board = store.dispatchListForTenant(AUTH.accountId, AUTH.projectId, 20);
+    expect(board.find((t) => t.id === taskId)?.createdBy).toBe(`orchestrator:${mine.id}`);
+  });
+
+  test("interrupt is scoped the same way as send", async () => {
+    const mine = await createGoal("sf11");
+    const other = await createGoal("sf12");
+    const dispatch = depsFor(mine.id).dispatch!;
+    const theirKid = childrenOf(await allSessions(), other.id)[0]!;
+    await expect(dispatch.interrupt(theirKid.id)).rejects.toThrow(/not a role-child/);
+  });
+
+  test("its task board shows only its own dispatches", async () => {
+    // The tenant board carries every session's targets and result digests —
+    // the one place the scoping above would otherwise leak.
+    const mine = await createGoal("sf13");
+    const other = await createGoal("sf14");
+    const myKid = childrenOf(await allSessions(), mine.id)[0]!;
+    const theirKid = childrenOf(await allSessions(), other.id)[0]!;
+
+    const myTask = depsFor(mine.id).dispatch!.enqueue({
+      kind: "send", shape: "scout", targetSession: myKid.id, prompt: "mine",
+    });
+    const theirTask = depsFor(other.id).dispatch!.enqueue({
+      kind: "send", shape: "scout", targetSession: theirKid.id, prompt: "theirs",
+    });
+
+    const board = depsFor(mine.id).dispatch!.listTasks(20);
+    expect(board.map((t) => t.id)).toEqual([myTask]);
+    expect(board.some((t) => t.id === theirTask)).toBe(false);
+    // ...and the tenant-wide view (the conductor's) still sees both.
+    expect(store.dispatchListForTenant(AUTH.accountId, AUTH.projectId, 20)).toHaveLength(2);
+  });
+});
+
+describe("ORCHESTRATOR_FLEET_TOOLS", () => {
+  test("excludes spawn, the memory-backed tools, and machine_map", () => {
+    expect([...ORCHESTRATOR_FLEET_TOOLS].sort()).toEqual([
+      "fleet_interrupt",
+      "fleet_list",
+      "fleet_send",
+      "fleet_tasks",
+    ]);
+    for (const denied of ["fleet_spawn", "fleet_find", "fleet_recall", "fleet_summary", "machine_map"]) {
+      expect(ORCHESTRATOR_FLEET_TOOLS.has(denied)).toBe(false);
+    }
+  });
+
+  test("the BUILT server registers exactly those tools, not just the constant", () => {
+    // Asserting the constant alone would pass while `pick()` silently ignored
+    // it — the filter is what actually reaches the model.
+    const deps = { listSessions: () => [], audit: () => {}, conductorSessionId: () => "g" };
+    const registered = (server: unknown) =>
+      Object.keys(
+        (server as { instance: { _registeredTools: Record<string, unknown> } }).instance
+          ._registeredTools,
+      ).sort();
+
+    expect(
+      registered(buildFleetMcpServer(deps as never, { tools: ORCHESTRATOR_FLEET_TOOLS })),
+    ).toEqual(["fleet_interrupt", "fleet_list", "fleet_send", "fleet_tasks"]);
+    // ...and the unfiltered conductor build still gets everything, so `pick()`
+    // is a filter rather than a truncation.
+    expect(registered(buildFleetMcpServer(deps as never))).toEqual(
+      [...FLEET_TOOL_NAMES, ...FLEET_SEND_TOOL_NAMES].sort(),
+    );
+  });
+
+  test("its send-class tools still trip the R3 hard approval gate", () => {
+    // The subset must not accidentally become auto-approvable: keeping these
+    // off allowedTools is what makes every dispatch show the owner the input.
+    for (const t of ORCHESTRATOR_FLEET_TOOLS) {
+      const qualified = `mcp__codeoid_fleet__${t}`;
+      const isSend = t === "fleet_send" || t === "fleet_interrupt";
+      expect(isFleetSendTool(qualified)).toBe(isSend);
+    }
+  });
+});
+
+describe("the orchestrator's constitution matches the tools it actually has", () => {
+  test("names each granted tool and states that spawn is absent", () => {
+    // An orchestrator told to "use the fleet tools" burns a turn discovering
+    // which exist; one told it has fleet_spawn burns a turn discovering it
+    // doesn't. Both happened before this.
+    const compiled = compileGoalPack(
+      { goal: "g", roles: [{ name: "orchestrator", providerId: "claude" }] },
+      [],
+    );
+    for (const t of ORCHESTRATOR_FLEET_TOOLS) {
+      expect(compiled.constitution).toContain(`\`${t}\``);
+    }
+    expect(compiled.constitution).toMatch(/NO spawn tool/);
+    expect(compiled.constitution).toMatch(/roster is fixed/);
+    expect(compiled.constitution).not.toContain("fleet_spawn");
+  });
+});
+
+// ── Guard: the per-collaboration cost roll-up at approve-time (§11 P3) ──────
+
+// The design words it as "surfaced at approve-time", and approve-time is the R3
+// gate on a send-class fleet dispatch — which is why this guard needed the
+// orchestrator's dispatch surface to exist first. Cost shown on a dashboard is
+// trivia; cost shown on the button that authorizes more work is a control.
+describe("the collaboration cost roll-up", () => {
+  const CONFIG: CollaborationConfig = {
+    goal: "spend something",
+    roles: [
+      { name: "orchestrator", providerId: "claude" },
+      { name: "review", providerId: "gemini", count: 2 },
+    ],
+  };
+
+  const createGoal = async (id: string): Promise<SessionInfo> => {
+    const resp = await run({ type: "session.create", id, name: id, workdir, collaboration: CONFIG });
+    if (resp.type !== "response.ok") throw new Error("create failed");
+    return resp.data as SessionInfo;
+  };
+
+  test("covers the orchestrator plus every live child, and counts them", async () => {
+    const goal = await createGoal("cr1");
+    const rollup = manager._collaborationCostForTest(goal.id)!;
+    expect(rollup.goalSessionId).toBe(goal.id);
+    // 2 children; the orchestrator is counted in the totals but is not a child.
+    expect(rollup.children).toBe(2);
+    // Nothing has run, so a fresh goal rolls up to zero rather than undefined —
+    // a client renders "$0 so far", which is true and useful.
+    expect(rollup.totalCostUsd).toBe(0);
+    expect(rollup.numTurns).toBe(0);
+  });
+
+  test("is undefined for a session that is not a collaboration", async () => {
+    const resp = await run({ type: "session.create", id: "cr2", name: "plain", workdir });
+    const plain = (resp as { data: SessionInfo }).data;
+    expect(manager._collaborationCostForTest(plain.id)).toBeUndefined();
+    expect(manager._collaborationCostForTest("does-not-exist")).toBeUndefined();
+  });
+
+  test("does not count another goal's children, or another tenant's", async () => {
+    const mine = await createGoal("cr3");
+    await createGoal("cr4");
+    const other: AuthContext = { ...AUTH, accountId: "acc-y", projectId: "proj-y" };
+    await manager.handle(
+      { type: "session.create", id: "cry", name: "cry", workdir, collaboration: CONFIG },
+      other,
+      { id: "c-y", auth: other, send: () => {} },
+    );
+    // Four other children exist across two other goals; mine still has 2.
+    expect(manager._collaborationCostForTest(mine.id)!.children).toBe(2);
+  });
+
+  test("shrinks when a child is destroyed", async () => {
+    const goal = await createGoal("cr5");
+    const kid = childrenOf(await allSessions(), goal.id)[0]!;
+    expect(manager._collaborationCostForTest(goal.id)!.children).toBe(2);
+    await run({ type: "session.destroy", id: "crd", sessionId: kid.id });
+    // Summed live from the session map, so teardown is reflected immediately —
+    // a stored counter would have drifted here.
+    expect(manager._collaborationCostForTest(goal.id)!.children).toBe(1);
+  });
+
+  test("survives a restart and still finds the resumed fleet", async () => {
+    const goal = await createGoal("cr6");
+    await manager.drain(3_000);
+    await Bun.sleep(150);
+    const next = new SessionManager(
+      new Store(join(tmp, "codeoid.db")),
+      new TranscriptStore(join(tmp, "transcripts")),
+      undefined, undefined, undefined,
+      { config: mkConfig(), providers: makeRegistry() },
+    );
+    await next.resumeSessions();
+    manager = next;
+    expect(next._collaborationCostForTest(goal.id)!.children).toBe(2);
+  });
+});

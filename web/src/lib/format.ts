@@ -8,6 +8,7 @@ export {
   ctxWindowSeverity,
   elapsedSince,
   formatClock,
+  formatCollaborationCost,
   formatCostUsd,
   formatDuration,
   formatPercent,

@@ -26,6 +26,10 @@ import {
   readLocalTokenFile,
 } from "./daemon/local-auth.js";
 import { HOOK_EVENTS, type HookEntryConfig } from "./daemon/hooks/types.js";
+// The per-goal child cap, so the tenant-wide bound below can refuse to be set
+// below it rather than silently contradicting it. No cycle: collaboration.ts
+// reaches only protocol types, models.ts, and blackboard/{types,service}.ts.
+import { MAX_COLLABORATION_CHILDREN } from "./daemon/collaboration.js";
 
 // ── Paths ────────────────────────────────────────────────────────────────
 
@@ -460,6 +464,43 @@ const DispatchSchema = z
   });
 
 /**
+ * Collaborative-session bounds (docs/collaborative-session-design.md §11 P3).
+ *
+ * `MAX_COLLABORATION_CHILDREN` already caps ONE goal at 12. Nothing capped the
+ * number of goals, and role-children are long-lived `send`-driven sessions
+ * rather than `kind:"spawn"` dispatch tasks — so `dispatch.maxConcurrentWorkers`
+ * (which counts spawn tasks) never saw them. Ten collaborations meant 120 live
+ * autonomous agents with no bound anywhere, since `rateLimit` defaults to
+ * unlimited by design.
+ *
+ * This is the tenant-wide backstop for that. It is a BLAST-RADIUS bound, not a
+ * scheduler: it refuses a create that would cross the line, and never queues,
+ * throttles, or kills anything already running.
+ */
+const CollaborationSchema = z
+  .object({
+    /**
+     * Live role-children allowed at once per tenant, across every goal.
+     * 0 = unlimited (same opt-out convention as `rateLimit`).
+     *
+     * Floor of 12 is deliberate: a lower value would reject a single
+     * max-size collaboration that `MAX_COLLABORATION_CHILDREN` permits, so the
+     * two bounds would contradict each other. The default of 24 is exactly two
+     * full-size fleets — enough that the normal case never notices, low enough
+     * that a runaway is caught early.
+     */
+    maxLiveChildren: z
+      .number()
+      .int()
+      .min(0)
+      .refine((n) => n === 0 || n >= MAX_COLLABORATION_CHILDREN, {
+        message: `collaboration.maxLiveChildren must be 0 (unlimited) or at least ${MAX_COLLABORATION_CHILDREN}, or it would reject a single max-size collaboration`,
+      })
+      .default(24),
+  })
+  .default({ maxLiveChildren: 24 });
+
+/**
  * Daemon-native hooks (docs/hooks.md) — config-declared commands/webhooks
  * dispatched at Session's seams (tool_call, tool_result, before_turn,
  * after_turn, lifecycle) uniformly across every backend. Matcher regexes
@@ -716,6 +757,7 @@ const RootSchema = z.object({
   session: SessionSchema,
   conductor: ConductorSchema,
   dispatch: DispatchSchema,
+  collaboration: CollaborationSchema,
   rateLimit: RateLimitSchema,
   pipeline: PipelineSchema,
   providers: ProvidersSchema,
@@ -862,6 +904,15 @@ export interface CodeoidConfig {
     maxConcurrentWorkers: number;
     workerToolBudget: number;
     retryBaseMs: number;
+  };
+  /**
+   * Collaborative-session bounds (see CollaborationSchema). Optional in the
+   * type so hand-built test configs stay minimal; loadConfig always populates
+   * it, and an absent value means UNLIMITED rather than the default — a
+   * hand-built config must not silently acquire a cap it never declared.
+   */
+  collaboration?: {
+    maxLiveChildren: number;
   };
   /**
    * SDLC pipeline — ON by default (docs/sdlc-pipeline.md); a PipelineManager is
@@ -1205,6 +1256,7 @@ export function loadConfig(opts: LoadOptions = {}): CodeoidConfig {
     session: parsed.session,
     conductor: parsed.conductor,
     dispatch: parsed.dispatch,
+    collaboration: parsed.collaboration,
     rateLimit: parsed.rateLimit,
     pipeline: parsed.pipeline,
     providers: parsed.providers,

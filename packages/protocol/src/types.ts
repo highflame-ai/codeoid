@@ -635,6 +635,32 @@ export interface ToolStreamingState {
   partialInput?: unknown;
 }
 
+/**
+ * What a collaboration has spent so far, rolled up across its orchestrator and
+ * every live role-child (docs/collaborative-session-design.md §11 P3).
+ *
+ * Attached to a send-class dispatch approval so the owner sees the goal's
+ * running total on the button they are about to press. Cost shown anywhere else
+ * is trivia; cost shown at the moment of authorizing more work is a control.
+ *
+ * Optional on the wire and computed per request. A client that doesn't know the
+ * field ignores it; a daemon that fails to compute it omits it — the roll-up
+ * must never be able to block a dispatch, since an approval path wedged by a
+ * cost display is strictly worse than no cost display.
+ */
+export interface CollaborationCost {
+  /** The goal (orchestrator) session id these totals cover. */
+  goalSessionId: string;
+  /** Live role-children included in the roll-up. */
+  children: number;
+  /** Summed `SessionUsage.totalCostUsd` across orchestrator + children. */
+  totalCostUsd: number;
+  inputTokens: number;
+  outputTokens: number;
+  /** Summed turns — how much agent work the goal has already consumed. */
+  numTurns: number;
+}
+
 export interface ToolWaitingConfirmationState {
   phase: "waiting_confirmation";
   /** Complete tool input */
@@ -643,6 +669,12 @@ export interface ToolWaitingConfirmationState {
   description: string;
   /** Unique ID for this confirmation — client responds with this */
   approvalId: string;
+  /**
+   * Present only for a send-class fleet dispatch from a collaborative session:
+   * what the goal has cost so far. Absent everywhere else, and absent if the
+   * roll-up could not be computed.
+   */
+  collaborationCost?: CollaborationCost;
 }
 
 export interface ToolExecutingState {
