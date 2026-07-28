@@ -93,3 +93,29 @@ function trimZeros(n: number): string {
   const s = n.toFixed(1);
   return s.endsWith(".0") ? s.slice(0, -2) : s;
 }
+
+/**
+ * One-line summary of what a collaboration has spent, for the approval prompt.
+ *
+ * Lives in core rather than in any one client because all three approval
+ * surfaces — web, Telegram, TUI — must show the owner the SAME number in the
+ * same words. Three independent format helpers would drift, and a cost that
+ * reads differently depending on where you approve from is worse than none.
+ *
+ * Deliberately compact: this sits next to a decision, not on a dashboard.
+ */
+export function formatCollaborationCost(c: {
+  children: number;
+  totalCostUsd: number;
+  inputTokens: number;
+  outputTokens: number;
+  numTurns: number;
+}): string {
+  const fleet = `${c.children + 1} session${c.children === 0 ? "" : "s"}`;
+  return [
+    `this goal so far: ${formatCostUsd(c.totalCostUsd)}`,
+    `${formatTokens(c.inputTokens)}/${formatTokens(c.outputTokens)} tok`,
+    `${c.numTurns} turn${c.numTurns === 1 ? "" : "s"}`,
+    `across ${fleet}`,
+  ].join(" · ");
+}

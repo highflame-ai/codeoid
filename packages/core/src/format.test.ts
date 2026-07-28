@@ -1,5 +1,6 @@
 import { describe, it, expect } from "bun:test";
 import {
+  formatCollaborationCost,
   formatTokens,
   formatCostUsd,
   formatDuration,
@@ -153,5 +154,34 @@ describe("relativeTime", () => {
 
   it("renders yesterday in the 24-48h window", () => {
     expect(relativeTime(NOW - 30 * 3_600_000, NOW)).toBe("yesterday");
+  });
+});
+
+describe("formatCollaborationCost", () => {
+  const base = { children: 2, totalCostUsd: 1.234, inputTokens: 45_000, outputTokens: 3_200, numTurns: 7 };
+
+  it("reads as one compact decision-side line", () => {
+    expect(formatCollaborationCost(base)).toBe(
+      "this goal so far: $1.23 · 45k/3.2k tok · 7 turns · across 3 sessions",
+    );
+  });
+
+  it("counts the orchestrator in the session total, not just the children", () => {
+    // "across N sessions" is children + 1. Reporting only the children would
+    // understate the fleet the owner is paying for.
+    expect(formatCollaborationCost({ ...base, children: 0 })).toContain("across 1 session");
+    expect(formatCollaborationCost({ ...base, children: 1 })).toContain("across 2 sessions");
+  });
+
+  it("singularizes one turn and one session", () => {
+    const s = formatCollaborationCost({ ...base, children: 0, numTurns: 1 });
+    expect(s).toContain("1 turn ·");
+    expect(s).toContain("across 1 session");
+  });
+
+  it("survives a zero-cost goal that has not spent anything yet", () => {
+    expect(
+      formatCollaborationCost({ children: 3, totalCostUsd: 0, inputTokens: 0, outputTokens: 0, numTurns: 0 }),
+    ).toBe("this goal so far: $0 · 0/0 tok · 0 turns · across 4 sessions");
   });
 });

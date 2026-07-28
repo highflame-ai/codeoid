@@ -19,6 +19,7 @@
 import { Bot, type Context, InlineKeyboard } from "grammy";
 import { autoRetry } from "@grammyjs/auto-retry";
 import { randomUUID } from "node:crypto";
+import { formatCollaborationCost } from "@codeoid/core";
 import { getManifest, getSnapshot } from "../../daemon/settings/store.js";
 import { ALL_SCOPES_STRING } from "../../protocol/scopes.js";
 import type { Frontend, FrontendContext } from "../types.js";
@@ -1196,13 +1197,21 @@ export class TelegramFrontend implements Frontend {
 
     const desc =
       "description" in tool.state ? tool.state.description : tool.name;
+    // A send-class fleet dispatch carries the goal's running spend. Telegram is
+    // where an owner approves from a phone — the surface LEAST able to go check
+    // cost somewhere else — so it gets the same line the web bar and the TUI
+    // show, from the same shared formatter.
+    const cost =
+      "collaborationCost" in tool.state && tool.state.collaborationCost
+        ? `\n◇ ${formatCollaborationCost(tool.state.collaborationCost)}`
+        : "";
     const kb = new InlineKeyboard()
       .text("✅ Approve", `a:${short}:y`)
       .text("❌ Deny", `a:${short}:n`);
     this.#bot.api
       .sendMessage(
         chatId,
-        `⚠️ Permission needed — ${tool.name}\n${String(desc).slice(0, 800)}`,
+        `⚠️ Permission needed — ${tool.name}\n${String(desc).slice(0, 800)}${cost}`,
         { reply_markup: kb } as Record<string, unknown>,
       )
       .catch(() => {});

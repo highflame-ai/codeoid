@@ -21,12 +21,14 @@
  */
 
 import type {
+	CollaborationCost,
 	MessageIdentity,
 	SessionInfo,
 	SessionMessage,
 	ToolInfo,
 	ToolState,
 } from "../../protocol/types.js";
+import { formatCollaborationCost } from "@codeoid/core";
 import { renderMarkdown, type Segment } from "../markdown.js";
 import { computeDiff, truncateToolOutput } from "../diff.js";
 import { fileUri, maybeLink } from "../osc8.js";
@@ -249,6 +251,12 @@ function renderToolRow(
 	if (phase === "waiting_confirmation" && "description" in tool.state) {
 		const description = (tool.state as { description: string }).description;
 		lines.push(dim(red(description)));
+		// A send-class fleet dispatch carries the goal's running spend. Same
+		// shared formatter as the web bar and Telegram, so the owner reads the
+		// same number in the same words wherever they approve from.
+		const cost = (tool.state as { collaborationCost?: CollaborationCost })
+			.collaborationCost;
+		if (cost) lines.push(dim(`  \u25c7 ${formatCollaborationCost(cost)}`));
 	}
 
 	if (isEdit) {

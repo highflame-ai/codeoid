@@ -38,7 +38,8 @@ import { newRequestId, request } from "../../state/connection";
 import { epochOf, focusedSessionMessages } from "../../state/messages";
 import { focusedSession, focusedSessionId } from "../../state/sessions";
 import { findPendingApproval } from "../../lib/approvals";
-import type { SessionMessage } from "../../protocol/types";
+import type { CollaborationCost, SessionMessage } from "../../protocol/types";
+import { formatCollaborationCost } from "../../lib/format";
 
 /** Custom event the prompt listens for so "Refine" can focus + hint. */
 function focusPromptWithHint(hint: string): void {
@@ -120,6 +121,7 @@ const ApprovalBar: Component = () => {
       description: s.description,
       input: s.input,
       toolName: m.tool.name,
+      collaborationCost: s.collaborationCost,
     };
   });
 
@@ -204,6 +206,7 @@ const ApprovalBar: Component = () => {
               <BinaryBar
                 toolName={snap().toolName}
                 description={snap().description}
+                collaborationCost={snap().collaborationCost}
                 isPlanMode={isPlanMode()}
                 busy={busy()}
                 onApprove={() => safeApprove(true)}
@@ -235,6 +238,8 @@ const ApprovalBar: Component = () => {
 const BinaryBar: Component<{
   toolName: string;
   description: string;
+  /** Present only for a send-class fleet dispatch from a collaborative session. */
+  collaborationCost?: CollaborationCost;
   isPlanMode: boolean;
   busy: boolean;
   onApprove: () => void;
@@ -255,6 +260,16 @@ const BinaryBar: Component<{
             ? "Review the plan above. Approve to start coding, refine to give Claude feedback."
             : props.description}
         </div>
+        {/* What the goal has already cost, on the button that authorizes more.
+            Shared formatter so web, Telegram and the TUI show the owner the
+            same number in the same words. */}
+        <Show when={props.collaborationCost}>
+          {(c) => (
+            <div class="mt-1 truncate font-mono text-[11px] text-warn" title="Rolled up across this collaboration's orchestrator and its live role-children">
+              ◇ {formatCollaborationCost(c())}
+            </div>
+          )}
+        </Show>
       </div>
       <button
         type="button"

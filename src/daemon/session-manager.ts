@@ -106,6 +106,7 @@ import type {
   AuthContext,
   ClientMessage,
   CollaborationConfig,
+  CollaborationCost,
   CollaborationRole,
   DaemonMessage,
   McpServerStatus,
@@ -560,6 +561,9 @@ mcpHub: this.#mcpHub,
                     meta.projectId,
                   )
                 : undefined,
+          collaborationCost: meta.collaboration
+            ? () => this.#collaborationCostRollup(meta.sessionId)
+            : undefined,
           _testProvider: this.#testProviderFactory?.(),
           onStatusChange: this.#statusObserver,
           onModels: (providerId, m) => this._cacheModels(providerId, m),
@@ -1649,6 +1653,15 @@ mcpHub: this.#mcpHub,
   }
 
   /**
+   * The cost roll-up for one goal — tests only. The production path reaches it
+   * through the `collaborationCost` callback handed to each orchestrator
+   * Session, which is not observable from outside.
+   */
+  _collaborationCostForTest(goalSessionId: string): CollaborationCost | undefined {
+    return this.#collaborationCostRollup(goalSessionId);
+  }
+
+  /**
    * Unscoped session lookup — tests only, and named so a production call site
    * is obvious in review. Everything user-facing must go through
    * `#getOwnedSession`, which gates on tenancy.
@@ -1917,6 +1930,11 @@ mcpHub: this.#mcpHub,
       workdir,
       auth,
       fleet: orchestratorFleet,
+      // Same thunk trick as `fleet`: the goal id is generated inside this
+      // constructor, and the callback is only invoked from an approval request.
+      collaborationCost: collaboration
+        ? () => this.#collaborationCostRollup(goalSessionId)
+        : undefined,
       store: this.#store,
       transcriptStore: this.#transcriptStore,
       providers: this.#providers,
@@ -2062,6 +2080,54 @@ mcpHub: this.#mcpHub,
       "Destroy a finished collaboration, reduce this one's fan-out, or raise",
       "`collaboration.maxLiveChildren` in ~/.codeoid/config.json.",
     ].join(" ");
+  }
+
+  /**
+   * What one collaboration has spent so far: the orchestrator plus every live
+   * role-child (§11 P3's cost roll-up).
+   *
+   * Summed live from the session map rather than kept as a running total. The
+   * child set changes over a goal's life — children are torn down, and a
+   * restart rebuilds them — so a stored counter would drift from reality in
+   * both directions, and this is read once per approval, not per turn.
+   *
+   * `undefined` when the id names no live collaborative session, which is the
+   * normal answer for every non-collaboration approval.
+   */
+  #collaborationCostRollup(goalSessionId: string): CollaborationCost | undefined {
+    const goal = this.#sessions.get(goalSessionId);
+    if (!goal?.collaboration) return undefined;
+
+    const rollup: CollaborationCost = {
+      goalSessionId,
+      children: 0,
+      totalCostUsd: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      numTurns: 0,
+    };
+    const add = (s: Session): void => {
+      const u = s.toInfo().usage;
+      if (!u) return;
+      rollup.totalCostUsd += u.totalCostUsd;
+      rollup.inputTokens += u.inputTokens;
+      rollup.outputTokens += u.outputTokens;
+      rollup.numTurns += u.numTurns;
+    };
+
+    add(goal);
+    for (const s of this.#sessions.values()) {
+      if (
+        s.collaborationRole?.parentSessionId !== goalSessionId ||
+        s.accountId !== goal.accountId ||
+        s.projectId !== goal.projectId
+      ) {
+        continue;
+      }
+      rollup.children++;
+      add(s);
+    }
+    return rollup;
   }
 
   /** Lazily build the blackboard over the daemon's existing DB connection. */

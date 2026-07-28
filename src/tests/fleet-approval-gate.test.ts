@@ -209,3 +209,115 @@ describe("elicitation hard gate", () => {
     await until(() => session.status === "idle" || session.status === "error");
   });
 });
+
+// ── The cost roll-up rides the same gate ────────────────────────────────────
+
+// §11 P3 words the guard as a roll-up "surfaced at approve-time", and
+// approve-time IS this gate. The roll-up therefore has to appear on exactly the
+// approvals a dispatch produces and nowhere else — attached to every approval it
+// becomes wallpaper, which is the failure mode that makes a cost display stop
+// being read at all.
+describe("the collaboration cost roll-up on an approval request", () => {
+  const ROLLUP = {
+    goalSessionId: "goal-1",
+    children: 2,
+    totalCostUsd: 1.5,
+    inputTokens: 1000,
+    outputTokens: 200,
+    numTurns: 4,
+  };
+
+  function makeSessionWithRollup(
+    provider: MockSessionProvider,
+    collaborationCost: () => typeof ROLLUP | undefined,
+  ): Session {
+    const id = randomUUID();
+    store.createSession({
+      id,
+      name: "rollup-test",
+      workdir: tmp,
+      status: "idle",
+      createdBy: TEST_AUTH.sub,
+      createdAt: new Date().toISOString(),
+      attachedClients: 0,
+      accountId: TEST_AUTH.accountId,
+      projectId: TEST_AUTH.projectId,
+    });
+    return new Session({
+      name: "rollup-test",
+      workdir: tmp,
+      auth: TEST_AUTH,
+      store,
+      transcriptStore,
+      existingId: id,
+      _testProvider: provider,
+      collaborationCost,
+    });
+  }
+
+  /** The waiting_confirmation tool_call the client actually receives. */
+  const pendingCall = (received: DaemonMessage[]) =>
+    received.find(
+      (m) =>
+        m.type === "session.message" &&
+        m.tool?.state?.phase === "waiting_confirmation",
+    ) as { tool?: { state?: Record<string, unknown> } } | undefined;
+
+  test("rides along with a send-class dispatch approval", async () => {
+    const provider = new MockSessionProvider("mock", [
+      toolTurn("mcp__codeoid_fleet__fleet_send", { session: "review", message: "go" }),
+    ]);
+    const session = makeSessionWithRollup(provider, () => ROLLUP);
+    const received = attachRecorder(session);
+    void session.send("dispatch", TEST_AUTH);
+
+    await until(() => pendingCall(received) !== undefined);
+    expect(pendingCall(received)!.tool!.state!.collaborationCost).toEqual(ROLLUP);
+  });
+
+  test("is ABSENT on an ordinary tool's approval", async () => {
+    // The gate that keeps it meaningful. Without it every Bash/Edit prompt
+    // carries the goal's spend and the number stops being information.
+    const provider = new MockSessionProvider("mock", [
+      toolTurn("Bash", { command: "ls" }),
+    ]);
+    const session = makeSessionWithRollup(provider, () => ROLLUP);
+    const received = attachRecorder(session);
+    void session.send("run it", TEST_AUTH);
+
+    await until(() => pendingCall(received) !== undefined);
+    const state = pendingCall(received)!.tool!.state!;
+    expect(state.phase).toBe("waiting_confirmation");
+    expect(state.collaborationCost).toBeUndefined();
+  });
+
+  test("omitted, not fatal, when the roll-up throws", async () => {
+    // A cost display that can wedge the dispatch path is strictly worse than no
+    // cost display: the approval must still reach the owner.
+    const provider = new MockSessionProvider("mock", [
+      toolTurn("mcp__codeoid_fleet__fleet_send", { session: "review", message: "go" }),
+    ]);
+    const session = makeSessionWithRollup(provider, () => {
+      throw new Error("session map exploded");
+    });
+    const received = attachRecorder(session);
+    void session.send("dispatch", TEST_AUTH);
+
+    await until(() => pendingCall(received) !== undefined);
+    const state = pendingCall(received)!.tool!.state!;
+    expect(state.approvalId).toBeTruthy();
+    expect(state.collaborationCost).toBeUndefined();
+  });
+
+  test("omitted when the session is not part of a collaboration", async () => {
+    const provider = new MockSessionProvider("mock", [
+      toolTurn("mcp__codeoid_fleet__fleet_send", { session: "review", message: "go" }),
+    ]);
+    const session = makeSessionWithRollup(provider, () => undefined);
+    const received = attachRecorder(session);
+    void session.send("dispatch", TEST_AUTH);
+
+    await until(() => pendingCall(received) !== undefined);
+    expect(pendingCall(received)!.tool!.state!.collaborationCost).toBeUndefined();
+  });
+});
