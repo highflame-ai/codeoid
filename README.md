@@ -8,7 +8,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Runtime: Bun](https://img.shields.io/badge/runtime-Bun-000000.svg?logo=bun)](https://bun.sh)
 
-**Identity-first control plane for AI coding agents — multi-session, multi-frontend, with cross-session memory.**
+**Multi-agent harness for AI coding agents — multi-session, multi-frontend, with cross-session memory.**
 
 Run N parallel coding-agent sessions across repos — Claude Code by default, with Codex, Gemini, OpenAI, and pi as drop-in backends.
 Switch between them from a terminal cockpit, a web UI, or Telegram.
