@@ -80,10 +80,10 @@ class FakeHost implements DispatcherHost {
     _accountId: string,
     _projectId: string,
     events: DispatchEventRow[],
-  ): Promise<boolean> {
-    if (!this.conductorAcceptsEvents) return false;
+  ): Promise<readonly number[]> {
+    if (!this.conductorAcceptsEvents) return [];
     this.delivered.push(events);
-    return true;
+    return events.map((e) => e.id);
   }
 
   audit(action: string, detail: string): void {
@@ -564,6 +564,61 @@ describe("dispatch barrier — N-way join", () => {
     expect(host.sent).toHaveLength(1); // still only the original delivery
     expect(store.dispatchGet(taskIds[0]!)!.status).toBe("done");
     expect(joined()).toHaveLength(1);
+  });
+
+  test("two live tasks can share a target — the second must not evict the first", async () => {
+    // #watched used to be Map<sessionId, taskId>. Every key was a freshly
+    // created spawn worker, unique by construction — but a grouped send watches
+    // a PRE-EXISTING session, and the same role-child can be the target of two
+    // live dispatches. The second registration evicted the first, whose task
+    // then sat in `running` until the lease expired, hanging its barrier.
+    const panelA = enqueuePanel(["kid-a", "kid-b"]);
+    host.statuses.set("kid-a", "thinking");
+    host.statuses.set("kid-b", "thinking");
+    await dispatcher.tick();
+
+    // A second panel over kid-a while the first is still running.
+    const panelB = enqueuePanel(["kid-a", "kid-c"]);
+    host.statuses.set("kid-c", "thinking");
+    await dispatcher.tick();
+    expect(dispatcher.tasksForSession("kid-a")).toHaveLength(2);
+
+    // kid-a finishes once; BOTH of its tasks must complete.
+    dispatcher.onSessionStatus("kid-a", "idle");
+    await Bun.sleep(20);
+    const aTasks = [panelA.taskIds[0]!, panelB.taskIds[0]!];
+    for (const id of aTasks) {
+      expect(store.dispatchGet(id)!.status).toBe("done");
+    }
+
+    // Finish the rest; both panels join independently. A tick flushes — two
+    // joins landing in the same burst hit the delivery re-entrancy guard, which
+    // is deliberate (burst-collapse), so the second waits for the next pass.
+    dispatcher.onSessionStatus("kid-b", "idle");
+    dispatcher.onSessionStatus("kid-c", "idle");
+    await Bun.sleep(20);
+    await dispatcher.tick();
+    expect(joined()).toHaveLength(2);
+  });
+
+  test("a wedged member is REPORTED, not absorbed by the barrier", async () => {
+    // #emitEvent is also how a waiting_approval wedge is surfaced, and the
+    // barrier absorbed it — so a panel member whose budget ran out went
+    // unreported and the panel hung to lease expiry. That notice is the one
+    // message whose whole purpose is to reach a human.
+    enqueuePanel(["kid-a", "kid-b"]);
+    host.statuses.set("kid-a", "thinking");
+    host.statuses.set("kid-b", "thinking");
+    await dispatcher.tick();
+
+    dispatcher.onSessionStatus("kid-a", "waiting_approval");
+    await Bun.sleep(20);
+    // The wedge notice is written with keepPending, so a tick delivers it.
+    await dispatcher.tick();
+    const wedge = host.delivered.flat().filter((e) => /WAITING FOR APPROVAL/.test(e.digest));
+    expect(wedge).toHaveLength(1);
+    // ...and it is NOT the join: the group is still running.
+    expect(joined()).toHaveLength(0);
   });
 
   test("groups are tenant-scoped — a group id is not a permission", () => {

@@ -303,3 +303,208 @@ describe("dispatch host — fleet dispatch deps (real closures)", () => {
     await mine.interrupt(id); // idle session — harmless no-op interrupt
   });
 });
+
+// ── Dispatch-event ROUTING (the real host, not a fake) ──────────────────────
+
+// These exist because `dispatcher.test.ts` drives a FakeHost whose
+// `deliverEvents` always accepts. Every barrier test passed against events that
+// were, in production, undeliverable: the real host sent everything to the
+// tenant's CONDUCTOR, so a collaboration orchestrator never received its own
+// dispatch results — and with no conductor on the daemon (the common case, since
+// one is only created on explicit request) they were retried forever. A fake
+// that rubber-stamps the last mile cannot see a last-mile bug.
+describe("dispatch host — event routing", () => {
+  const COLLAB = {
+    goal: "route my results",
+    roles: [
+      { name: "orchestrator", providerId: "claude" },
+      { name: "review", providerId: "claude", count: 2 },
+    ],
+  };
+
+  const createCollab = async (): Promise<SessionInfo> => {
+    manager.setBlackboardUrl("http://127.0.0.1:1/mcp/bb");
+    const resp = await manager.handle(
+      { type: "session.create", id: "c1", name: "goal", workdir, collaboration: COLLAB },
+      AUTH,
+      { id: "cl", auth: AUTH, send: () => {} },
+    );
+    if (resp.type !== "response.ok") throw new Error(`create failed: ${JSON.stringify(resp)}`);
+    return resp.data as SessionInfo;
+  };
+
+  const childrenOf = async (parentId: string): Promise<SessionInfo[]> => {
+    const resp = await manager.handle({ type: "session.list", id: "l" }, AUTH, {
+      id: "cl",
+      auth: AUTH,
+      send: () => {},
+    });
+    return (resp as { sessions: SessionInfo[] }).sessions.filter(
+      (s) => s.collaborationRole?.parentSessionId === parentId,
+    );
+  };
+
+  const pending = () => store.dispatchEventsPending(AUTH.accountId, AUTH.projectId);
+
+  /**
+   * Turns this session has taken.
+   *
+   * Delivery calls `session.send()`, which runs a turn — so a rise here is proof
+   * the injection reached THIS session. Asserting only `pending().length === 0`
+   * was the flaw in the first draft of these tests: an event RETIRED as
+   * undeliverable also drains the queue, so a mutation reverting to
+   * conductor-only routing passed. Draining is not delivering.
+   */
+  const turnsOf = (sessionId: string): number =>
+    manager._sessionForTest(sessionId)?.toInfo().usage?.numTurns ?? 0;
+
+  /** Wait for an injected turn to actually complete on `sessionId`.
+   *  `Session.send()` resolves before the turn finishes, so a bare read of
+   *  `numTurns` right after the tick races the turn it is trying to observe. */
+  const untilTurn = (sessionId: string) => until(() => turnsOf(sessionId) > 0);
+
+  test("an orchestrator's panel result reaches the ORCHESTRATOR, with no conductor present", async () => {
+    const goal = await createCollab();
+    const kids = await childrenOf(goal.id);
+    expect(kids).toHaveLength(2);
+    // Nobody asked for a conductor, so there isn't one. This is the case that
+    // made the whole barrier→synthesis loop unreachable.
+    expect(manager._sessionForTest(goal.id)!.role).toBeUndefined();
+
+    const deps = manager._orchestratorFleetDepsForTest(goal.id, AUTH.accountId, AUTH.projectId);
+    const { groupId } = deps.dispatch!.enqueuePanel!({
+      targets: kids.map((k) => k.id),
+      prompt: "review",
+      shape: "scout",
+    });
+    for (const m of store.dispatchGroupMembers(AUTH.accountId, AUTH.projectId, groupId)) {
+      store.dispatchComplete(m.id, `digest ${m.id.slice(0, 4)}`, Date.now());
+    }
+    store.dispatchEventAdd({
+      accountId: AUTH.accountId,
+      projectId: AUTH.projectId,
+      taskId: store.dispatchGroupMembers(AUTH.accountId, AUTH.projectId, groupId)[0]!.id,
+      type: "group_done",
+      digest: `group=${groupId} joined`,
+      now: Date.now(),
+    });
+
+    expect(turnsOf(goal.id)).toBe(0);
+    await manager.dispatcher.tick();
+
+    // Delivered TO THE ORCHESTRATOR — proven by it having taken a turn, not
+    // merely by the queue draining (a retired event drains it too).
+    // Delivered TO THE ORCHESTRATOR — proven by a completed turn on that exact
+    // session, not by the queue draining (a retired event drains it too).
+    await untilTurn(goal.id);
+    expect(turnsOf(goal.id)).toBeGreaterThan(0);
+    expect(pending()).toHaveLength(0);
+  });
+
+  test("a conductor's own dispatch still goes to the conductor", async () => {
+    // The contrast, so the routing can't be over-applied: an event whose task
+    // was NOT created by an orchestrator keeps its original destination.
+    const conductor = await manager.handle(
+      { type: "session.create", id: "cd", name: "conductor", workdir, role: "conductor" },
+      AUTH,
+      { id: "cl", auth: AUTH, send: () => {} },
+    );
+    expect(conductor.type).toBe("response.ok");
+    const target = await manager.handle(
+      { type: "session.create", id: "t1", name: "target", workdir },
+      AUTH,
+      { id: "cl", auth: AUTH, send: () => {} },
+    );
+    const targetId = (target as { data: SessionInfo }).data.id;
+
+    const taskId = manager._fleetDispatchDeps(AUTH.accountId, AUTH.projectId).enqueue({
+      kind: "send",
+      shape: "ship",
+      targetSession: targetId,
+      prompt: "go",
+    });
+    store.dispatchComplete(taskId, "delivered", Date.now());
+    store.dispatchEventAdd({
+      accountId: AUTH.accountId,
+      projectId: AUTH.projectId,
+      taskId,
+      type: "task_done",
+      digest: "done",
+      now: Date.now(),
+    });
+    const conductorId = (conductor as { data: SessionInfo }).data.id;
+    expect(turnsOf(conductorId)).toBe(0);
+    await manager.dispatcher.tick();
+    // The contrast: routing must not be over-applied. A non-orchestrator task's
+    // event still lands on the conductor.
+    await untilTurn(conductorId);
+    expect(turnsOf(conductorId)).toBeGreaterThan(0);
+    expect(pending()).toHaveLength(0);
+  });
+
+  test("events for a destroyed collaboration are retired, not retried forever", async () => {
+    const goal = await createCollab();
+    const kids = await childrenOf(goal.id);
+    const deps = manager._orchestratorFleetDepsForTest(goal.id, AUTH.accountId, AUTH.projectId);
+    const { groupId } = deps.dispatch!.enqueuePanel!({
+      targets: kids.map((k) => k.id),
+      prompt: "review",
+      shape: "scout",
+    });
+    const first = store.dispatchGroupMembers(AUTH.accountId, AUTH.projectId, groupId)[0]!;
+    store.dispatchEventAdd({
+      accountId: AUTH.accountId,
+      projectId: AUTH.projectId,
+      taskId: first.id,
+      type: "group_done",
+      digest: "joined",
+      now: Date.now(),
+    });
+    // The goal goes away before the event is delivered.
+    await manager.handle({ type: "session.destroy", id: "d", sessionId: goal.id }, AUTH, {
+      id: "cl",
+      auth: AUTH,
+      send: () => {},
+    });
+
+    await manager.dispatcher.tick();
+    // Retired rather than left pending: there is nothing to deliver them to,
+    // and holding them makes the queue grow forever.
+    expect(pending()).toHaveLength(0);
+  });
+
+  test("a busy recipient holds only ITS events — others still deliver", async () => {
+    // Why deliverEvents returns ids instead of a boolean. With two possible
+    // recipients, "one is mid-turn" is normal, and all-or-nothing would either
+    // stall the idle one or re-deliver it later as a duplicate.
+    const goal = await createCollab();
+    const kids = await childrenOf(goal.id);
+    const deps = manager._orchestratorFleetDepsForTest(goal.id, AUTH.accountId, AUTH.projectId);
+    const { groupId } = deps.dispatch!.enqueuePanel!({
+      targets: kids.map((k) => k.id),
+      prompt: "review",
+      shape: "scout",
+    });
+    const member = store.dispatchGroupMembers(AUTH.accountId, AUTH.projectId, groupId)[0]!;
+
+    // An orchestrator event (deliverable) and a conductor-attributed one whose
+    // conductor does not exist (must stay pending).
+    store.dispatchEventAdd({
+      accountId: AUTH.accountId, projectId: AUTH.projectId, taskId: member.id,
+      type: "group_done", digest: "joined", now: Date.now(),
+    });
+    const orphanTask = manager._fleetDispatchDeps(AUTH.accountId, AUTH.projectId).enqueue({
+      kind: "send", shape: "ship", targetSession: kids[0]!.id, prompt: "x",
+    });
+    store.dispatchEventAdd({
+      accountId: AUTH.accountId, projectId: AUTH.projectId, taskId: orphanTask,
+      type: "task_done", digest: "conductor-bound", now: Date.now(),
+    });
+
+    await manager.dispatcher.tick();
+    const left = pending();
+    // The orchestrator's landed; the conductor-bound one waits for a conductor.
+    expect(left).toHaveLength(1);
+    expect(left[0]!.digest).toBe("conductor-bound");
+  });
+});

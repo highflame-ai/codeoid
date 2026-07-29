@@ -46,6 +46,8 @@ import {
   childSessionName,
   compileGoalPack,
   orchestratorRole,
+  goalIdFromCreatedBy,
+  orchestratorCreatedBy,
   orphanedChildBrief,
   planChildren,
   plannedChildFor,
@@ -2651,6 +2653,37 @@ mcpHub: this.#mcpHub,
   }
 
   /** The tenant's conductor session, if one is live. */
+  /**
+   * The live orchestrator a dispatch event belongs to, or undefined when that
+   * collaboration is gone (destroyed, or outside this tenant).
+   *
+   * Tenant-checked even though the event row is already tenant-scoped: the goal
+   * id comes out of a `created_by` string, and a string is not a permission.
+   */
+  #dispatchEventGoalTarget(
+    goalId: string,
+    accountId: string,
+    projectId: string,
+  ): Session | undefined {
+    const goal = this.#sessions.get(goalId);
+    if (!goal || goal.accountId !== accountId || goal.projectId !== projectId) {
+      return undefined;
+    }
+    return goal;
+  }
+
+  /** The `<fleet_events>` injection body for one recipient's batch. */
+  #fleetEventsBody(events: readonly DispatchEventRow[]): string {
+    return [
+      "<fleet_events>",
+      "(daemon-injected dispatch notifications — NOT a message from the owner)",
+      ...events.map((e) => `- [${e.type}] ${e.digest}`),
+      "</fleet_events>",
+      "",
+      "Summarize these outcomes for the owner. Decide any follow-up dispatch yourself — it will require approval as usual.",
+    ].join("\n");
+  }
+
   #conductorFor(accountId: string, projectId: string): Session | undefined {
     for (const session of this.#sessions.values()) {
       if (
@@ -3378,25 +3411,58 @@ mcpHub: this.#mcpHub,
         accountId: string,
         projectId: string,
         events: DispatchEventRow[],
-      ): Promise<boolean> => {
+      ): Promise<readonly number[]> => {
+        // Route each event to the session that DISPATCHED it, not to the
+        // conductor unconditionally. A collaboration orchestrator queues its own
+        // tasks (fleet_send / fleet_panel) and needs their results to close its
+        // coordination loop; sending them to the conductor meant the orchestrator
+        // never learned its panel had joined, and with no conductor on the daemon
+        // at all — the common case, since one is only created on explicit
+        // request — the events were simply undeliverable and retried forever.
         const conductor = this.#conductorFor(accountId, projectId);
-        // Hold until there IS an idle conductor — events are durable, and
-        // interrupting a mid-turn conductor would corrupt its work. One
-        // batched injection per delivery: N completions = one wake.
-        if (!conductor || conductor.status !== "idle") return false;
-        const body = [
-          "<fleet_events>",
-          "(daemon-injected dispatch notifications — NOT a message from the owner)",
-          ...events.map((e) => `- [${e.type}] ${e.digest}`),
-          "</fleet_events>",
-          "",
-          "Summarize these outcomes for the owner. Decide any follow-up dispatch yourself — it will require approval as usual.",
-        ].join("\n");
-        await conductor.send(
-          body,
-          this.#dispatchSystemAuth(accountId, projectId),
-        );
-        return true;
+        const batches = new Map<Session, DispatchEventRow[]>();
+        const undeliverable: number[] = [];
+
+        for (const e of events) {
+          const task = this.#store.dispatchGet(e.taskId);
+          const goalId = task ? goalIdFromCreatedBy(task.createdBy) : undefined;
+          const target = goalId
+            ? this.#dispatchEventGoalTarget(goalId, accountId, projectId)
+            : conductor;
+          if (!target) {
+            // An orchestrator whose goal is gone has nothing to come back to,
+            // so its events are retired rather than retried forever. A missing
+            // CONDUCTOR is different — it may yet be created, so those stay
+            // pending (target is undefined only for a resolved-but-dead goal).
+            if (goalId) undeliverable.push(e.id);
+            continue;
+          }
+          const batch = batches.get(target);
+          if (batch) batch.push(e);
+          else batches.set(target, [e]);
+        }
+
+        const delivered: number[] = [...undeliverable];
+        for (const [session, batch] of batches) {
+          // Hold until the recipient is idle — events are durable, and
+          // interrupting a mid-turn session would corrupt its work. One batched
+          // injection per recipient: N completions = one wake.
+          if (session.status !== "idle") continue;
+          await session.send(
+            this.#fleetEventsBody(batch),
+            this.#dispatchSystemAuth(accountId, projectId),
+          );
+          delivered.push(...batch.map((e) => e.id));
+        }
+        if (undeliverable.length > 0) {
+          this.#store.audit(
+            "system:dispatch",
+            "dispatch.events_retired",
+            undefined,
+            `${undeliverable.length} event(s) dropped — their originating collaboration no longer exists`,
+          );
+        }
+        return delivered;
       },
 
       audit: (action: string, detail: string): void => {
@@ -3635,7 +3701,7 @@ mcpHub: this.#mcpHub,
     };
     /** Attribution for this goal's dispatches — stable across restarts, since
      *  it keys off the goal id rather than any per-boot identity. */
-    const createdBy = () => `orchestrator:${goalId()}`;
+    const createdBy = () => orchestratorCreatedBy(goalId());
 
     return {
         listSessions: (): FleetSessionView[] =>

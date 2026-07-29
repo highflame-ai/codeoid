@@ -284,6 +284,33 @@ export function planChildren(
   return { ok: true, children };
 }
 
+/**
+ * Dispatch attribution for a collaboration orchestrator's own tasks.
+ *
+ * Two functions rather than a bare prefix constant, because BOTH directions are
+ * load-bearing and they must agree: the orchestrator's dispatch deps stamp
+ * `createdBy` on every task it queues, and the dispatch-event router parses it
+ * back to decide which session gets the completion. When those were an inline
+ * template string on one side and a `startsWith` on the other, the completion
+ * simply went to the wrong session — a whole feedback loop lost to a string
+ * literal nobody owned.
+ *
+ * Keyed on the GOAL id, not a per-boot identity, so attribution survives a
+ * restart the same way the blackboard's `authorSub` does.
+ */
+const ORCHESTRATOR_DISPATCH_PREFIX = "orchestrator:";
+
+export function orchestratorCreatedBy(goalSessionId: string): string {
+  return `${ORCHESTRATOR_DISPATCH_PREFIX}${goalSessionId}`;
+}
+
+/** The goal session id behind an orchestrator-attributed task, else undefined. */
+export function goalIdFromCreatedBy(createdBy: string): string | undefined {
+  if (!createdBy.startsWith(ORCHESTRATOR_DISPATCH_PREFIX)) return undefined;
+  const id = createdBy.slice(ORCHESTRATOR_DISPATCH_PREFIX.length);
+  return id.length > 0 ? id : undefined;
+}
+
 /** Stable display name for a child session. */
 export function childSessionName(parentName: string, child: PlannedChild): string {
   const suffix = child.ordinal > 1 ? `-${child.ordinal}` : "";
