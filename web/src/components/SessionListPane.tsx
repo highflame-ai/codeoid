@@ -5,7 +5,7 @@
  * chat area dominates the viewport.
  */
 
-import { Component, createMemo, createSignal, For, Show } from "solid-js";
+import { Component, createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js";
 
 import { formatCostUsd, formatTokens, relativeTime } from "../lib/format";
 import {
@@ -16,8 +16,10 @@ import {
   type FilteredFleetGroup,
 } from "../lib/fleet";
 import { sessionAgentLabel, shortSub } from "../lib/identity";
+import { fetchPanels, livePanel, livePanelMember, resetPanels } from "../state/panels";
 import { nowTick } from "../state/clock";
 import {
+  focusedSession,
   focusedSessionId,
   focusSession,
   sessionList,
@@ -51,6 +53,12 @@ function newSession(): void {
 }
 
 /**
+ * Panel-state poll cadence. Matches the blackboard drawer's: a fan-out moves on
+ * the scale of a model turn, and this is a metadata read with no bodies.
+ */
+const PANEL_POLL_MS = 3_000;
+
+/**
  * Fleets the user has folded shut, by orchestrator id. Collapsed is the
  * exception, so absence means expanded — a fleet that spawns while you're
  * looking at it opens rather than hiding its own arrival.
@@ -82,6 +90,26 @@ const SessionListPane: Component = () => {
   const groups = createMemo<FilteredFleetGroup[]>(() =>
     filterFleet(groupFleet(sessionList()), filter()),
   );
+
+  // Poll panel state for the focused collaboration only. There is no push
+  // channel for dispatch state, and a fan-out changes over minutes — a static
+  // indicator would show a finished panel as still running. Scoped to the
+  // focused goal rather than every visible fleet so the cost stays one cheap
+  // metadata query per tick regardless of how many collaborations exist.
+  createEffect(() => {
+    const focused = focusedSession();
+    const goalId =
+      focused?.collaboration !== undefined
+        ? focused.id
+        : focused?.collaborationRole?.parentSessionId;
+    if (!goalId) {
+      resetPanels();
+      return;
+    }
+    void fetchPanels(goalId);
+    const t = setInterval(() => void fetchPanels(goalId), PANEL_POLL_MS);
+    onCleanup(() => clearInterval(t));
+  });
 
   return (
     <Show
@@ -379,6 +407,11 @@ const SessionRow: Component<{
           <Show when={role()}>
             {(r) => <WriteBadge write={r().write} />}
           </Show>
+          {/* Which children are in the LIVE fan-out, and where each one is.
+              Session-keyed, because a role can have several members. */}
+          <Show when={livePanelMember(props.session.id)}>
+            {(m) => <PanelMemberBadge ordinal={m().ordinal} status={m().status} />}
+          </Show>
           <Show when={props.session.usage}>
             {(u) => (
               <span class="font-mono text-[11px] text-accent" title="Estimated cost">
@@ -406,6 +439,16 @@ const SessionRow: Component<{
             >
               ◇ {c().goal}
             </div>
+          )}
+        </Show>
+        {/* The fan-out, while it runs. This is the whole point of a panel and
+            was invisible until the daemon started reporting it. */}
+        <Show when={props.fleet ? livePanel() : null}>
+          {(p) => (
+            <PanelProgress
+              settled={p().settled}
+              total={p().members.length}
+            />
           )}
         </Show>
         <div class="flex items-center gap-2 text-[11px] text-fg-muted">
@@ -489,6 +532,73 @@ const SessionRow: Component<{
         )}
       </Show>
     </li>
+  );
+};
+
+/**
+ * Live fan-out progress on the orchestrator row: "⇉ panel 2/3".
+ *
+ * Counts SETTLED members, not successful ones — the barrier joins on terminal,
+ * so a panel with a failed member is 3/3 and finished. Showing successes would
+ * leave the bar short of full on a panel that is already done, which is exactly
+ * the confusion the indicator exists to remove.
+ */
+const PanelProgress: Component<{ settled: number; total: number }> = (props) => {
+  const pct = () => (props.total === 0 ? 0 : (props.settled / props.total) * 100);
+  return (
+    <div
+      class="flex items-center gap-1.5"
+      title={`Panel in flight — ${props.settled} of ${props.total} member(s) finished. Counts members that have SETTLED (including failures), because the join fires on all-terminal.`}
+    >
+      <span class="font-mono text-[10px] text-warn">⇉ panel</span>
+      <span
+        class="h-1 flex-1 overflow-hidden rounded-full bg-bg"
+        role="progressbar"
+        aria-valuenow={props.settled}
+        aria-valuemin={0}
+        aria-valuemax={props.total}
+        aria-label="Panel members finished"
+      >
+        <span
+          class="block h-full rounded-full bg-warn transition-[width] duration-300"
+          style={{ width: `${pct()}%` }}
+        />
+      </span>
+      <span class="font-mono text-[10px] text-warn">
+        {props.settled}/{props.total}
+      </span>
+    </div>
+  );
+};
+
+/** A child's position and state within the live fan-out. */
+const PanelMemberBadge: Component<{
+  ordinal: number;
+  status: "queued" | "claimed" | "running" | "done" | "failed" | "blocked";
+}> = (props) => {
+  const look = () => {
+    switch (props.status) {
+      case "running":
+      case "claimed":
+        return { cls: "border-warn/50 bg-warn/10 text-warn animate-pulse", note: "working" };
+      case "done":
+        return { cls: "border-success/50 bg-success/10 text-success", note: "finished" };
+      case "failed":
+      case "blocked":
+        // Shown, never hidden — §7's "disagreement is shown" applies to a
+        // member that failed just as much as to one that disagreed.
+        return { cls: "border-danger/50 bg-danger/10 text-danger", note: props.status };
+      default:
+        return { cls: "border-border bg-bg text-fg-muted", note: "queued" };
+    }
+  };
+  return (
+    <span
+      class={`rounded border px-1 font-mono text-[10px] ${look().cls}`}
+      title={`Panel member ${props.ordinal} — ${look().note}`}
+    >
+      ⇉{props.ordinal}
+    </span>
   );
 };
 

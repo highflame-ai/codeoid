@@ -436,6 +436,8 @@ describe("DaemonMessage routing", () => {
           return `bb.index:${msg.entries.length}`;
         case "blackboard.read.result":
           return `bb.read:${msg.artifact?.kind ?? "none"}`;
+        case "collaboration.panels.result":
+          return `panels:${msg.panels.length}`;
         case "models.list.result":
           return `models:${msg.models.length}`;
         case "session.export.result":

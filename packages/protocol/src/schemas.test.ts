@@ -107,6 +107,7 @@ const samples: { [T in ClientTypes]: Extract<ClientMessage, { type: T }> } = {
   "fs.browse_dir": { type: "fs.browse_dir", id: "r19", path: "/home" },
   "claude.config": { type: "claude.config", id: "r20", sessionId: "s1" },
   "blackboard.index": { type: "blackboard.index", id: "r60", sessionId: "s1" },
+  "collaboration.panels": { type: "collaboration.panels", id: "r62", sessionId: "s1" },
   "blackboard.read": {
     type: "blackboard.read",
     id: "r61",

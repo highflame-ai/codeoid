@@ -1938,3 +1938,171 @@ describe("the collaboration cost roll-up", () => {
     expect(next._collaborationCostForTest(goal.id)!.children).toBe(2);
   });
 });
+
+// ── collaboration.panels — making the parallelism visible ───────────────────
+
+// A panel's whole point is that N agents work AT ONCE, and until this verb
+// existed nothing on the wire carried that: a client could see the fleet and
+// the joined result but never the fan-out in flight. Verified live before it was
+// built — two frontier models reviewed the same file simultaneously and the web
+// UI rendered it as an ordinary transcript message.
+describe("collaboration.panels", () => {
+  const CONFIG: CollaborationConfig = {
+    goal: "watch me fan out",
+    roles: [
+      { name: "orchestrator", providerId: "claude" },
+      { name: "review", providerId: "gemini", count: 3 },
+    ],
+  };
+
+  function withDispatch(): void {
+    manager = new SessionManager(store, transcript, undefined, undefined, undefined, {
+      config: mkConfig({
+        dispatch: {
+          enabled: true, tickMs: 999_999, leaseMs: 60_000, failureLimit: 2,
+          maxConcurrentWorkers: 2, workerToolBudget: 7, retryBaseMs: 0,
+        },
+      }),
+      providers: makeRegistry(),
+    });
+  }
+
+  const createGoal = async (id: string): Promise<SessionInfo> => {
+    const resp = await run({ type: "session.create", id, name: id, workdir, collaboration: CONFIG });
+    if (resp.type !== "response.ok") throw new Error("create failed");
+    return resp.data as SessionInfo;
+  };
+
+  const panelsOf = async (sessionId: string) => {
+    const resp = await run({ type: "collaboration.panels", id: `p-${Math.random()}`, sessionId });
+    if (resp.type !== "collaboration.panels.result") throw new Error(`unexpected ${resp.type}`);
+    return resp;
+  };
+
+  test("reports members in fan-out order with live status, before anything settles", async () => {
+    withDispatch();
+    const goal = await createGoal("pn1");
+    const kids = childrenOf(await allSessions(), goal.id);
+    const deps = manager._orchestratorFleetDepsForTest(goal.id, AUTH.accountId, AUTH.projectId);
+    deps.dispatch!.enqueuePanel!({ targets: kids.map((k) => k.id), prompt: "review", shape: "scout" });
+
+    const { panels, sessionId } = await panelsOf(goal.id);
+    expect(sessionId).toBe(goal.id);
+    expect(panels).toHaveLength(1);
+    const p = panels[0]!;
+    expect(p.members.map((m) => m.ordinal)).toEqual([1, 2, 3]);
+    expect(p.members.map((m) => m.sessionId)).toEqual(kids.map((k) => k.id));
+    expect(p.members.every((m) => m.status === "queued")).toBe(true);
+    // Nothing terminal yet — this is the state a UI must be able to render.
+    expect(p.settled).toBe(0);
+    expect(p.joined).toBe(false);
+  });
+
+  test("settled count rises as members finish, and joined flips only at the end", async () => {
+    withDispatch();
+    const goal = await createGoal("pn2");
+    const kids = childrenOf(await allSessions(), goal.id);
+    const deps = manager._orchestratorFleetDepsForTest(goal.id, AUTH.accountId, AUTH.projectId);
+    const { groupId } = deps.dispatch!.enqueuePanel!({
+      targets: kids.map((k) => k.id), prompt: "review", shape: "scout",
+    });
+    const members = store.dispatchGroupMembers(AUTH.accountId, AUTH.projectId, groupId);
+
+    store.dispatchComplete(members[0]!.id, "one", Date.now());
+    let p = (await panelsOf(goal.id)).panels[0]!;
+    expect(p.settled).toBe(1);
+    expect(p.joined).toBe(false); // 1/3 — a UI shows progress, not completion
+
+    store.dispatchComplete(members[1]!.id, "two", Date.now());
+    store.dispatchComplete(members[2]!.id, "three", Date.now());
+    p = (await panelsOf(goal.id)).panels[0]!;
+    expect(p.settled).toBe(3);
+    expect(p.joined).toBe(true);
+  });
+
+  test("a FAILED member counts as settled — the barrier joins on terminal, not success", async () => {
+    // If `joined` waited for success, a UI would show a panel spinning forever
+    // on a member that already gave up. The rendered state has to match the
+    // barrier's actual rule.
+    withDispatch();
+    const goal = await createGoal("pn3");
+    const kids = childrenOf(await allSessions(), goal.id);
+    const deps = manager._orchestratorFleetDepsForTest(goal.id, AUTH.accountId, AUTH.projectId);
+    const { groupId } = deps.dispatch!.enqueuePanel!({
+      targets: kids.map((k) => k.id), prompt: "review", shape: "scout",
+    });
+    const members = store.dispatchGroupMembers(AUTH.accountId, AUTH.projectId, groupId);
+    store.dispatchComplete(members[0]!.id, "ok", Date.now());
+    store.dispatchComplete(members[1]!.id, "ok", Date.now());
+    // Burn the third to blocked.
+    for (let i = 0; i < 3; i++) store.dispatchFail(members[2]!.id, "nope", Date.now(), { retryable: false });
+
+    const p = (await panelsOf(goal.id)).panels[0]!;
+    expect(p.members.some((m) => m.status === "failed" || m.status === "blocked")).toBe(true);
+    expect(p.settled).toBe(3);
+    expect(p.joined).toBe(true);
+  });
+
+  test("a child id resolves to its parent's panels", async () => {
+    withDispatch();
+    const goal = await createGoal("pn4");
+    const kids = childrenOf(await allSessions(), goal.id);
+    manager._orchestratorFleetDepsForTest(goal.id, AUTH.accountId, AUTH.projectId)
+      .dispatch!.enqueuePanel!({ targets: kids.map((k) => k.id), prompt: "r", shape: "scout" });
+    const viaChild = await panelsOf(kids[0]!.id);
+    expect(viaChild.sessionId).toBe(goal.id);
+    expect(viaChild.panels).toHaveLength(1);
+  });
+
+  test("one goal never sees another's panels", async () => {
+    withDispatch();
+    const mine = await createGoal("pn5");
+    const other = await createGoal("pn6");
+    const all = await allSessions();
+    manager._orchestratorFleetDepsForTest(other.id, AUTH.accountId, AUTH.projectId)
+      .dispatch!.enqueuePanel!({
+        targets: childrenOf(all, other.id).map((k) => k.id), prompt: "r", shape: "scout",
+      });
+    // Their panel exists; mine has none.
+    expect((await panelsOf(other.id)).panels).toHaveLength(1);
+    expect((await panelsOf(mine.id)).panels).toHaveLength(0);
+  });
+
+  test("a plain session is told it has no collaboration", async () => {
+    withDispatch();
+    const resp0 = await run({ type: "session.create", id: "pn7", name: "plain", workdir });
+    const plain = (resp0 as { data: SessionInfo }).data;
+    const resp = await run({ type: "collaboration.panels", id: "pn7q", sessionId: plain.id });
+    expect(resp.type).toBe("response.error");
+    if (resp.type === "response.error") expect(resp.code).toBe("invalid_request");
+  });
+
+  test("requires session:list", async () => {
+    withDispatch();
+    const goal = await createGoal("pn8");
+    const noList: AuthContext = {
+      ...AUTH,
+      scopes: AUTH.scopes.filter((s) => s !== "session:list") as AuthContext["scopes"],
+    };
+    const resp = await manager.handle(
+      { type: "collaboration.panels", id: "pn8q", sessionId: goal.id },
+      noList,
+      { id: "c2", auth: noList, send: () => {} },
+    );
+    expect(resp.type).toBe("response.error");
+    if (resp.type === "response.error") expect(resp.code).toBe("forbidden");
+  });
+
+  test("history is bounded — a long-running goal does not stream every fan-out", async () => {
+    withDispatch();
+    const goal = await createGoal("pn9");
+    const kids = childrenOf(await allSessions(), goal.id).map((k) => k.id);
+    const deps = manager._orchestratorFleetDepsForTest(goal.id, AUTH.accountId, AUTH.projectId);
+    for (let i = 0; i < 8; i++) {
+      deps.dispatch!.enqueuePanel!({ targets: kids, prompt: `round ${i}`, shape: "scout" });
+    }
+    const { panels } = await panelsOf(goal.id);
+    expect(panels.length).toBeLessThanOrEqual(5);
+    expect(panels.length).toBeGreaterThan(0);
+  });
+});

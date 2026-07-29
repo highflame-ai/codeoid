@@ -109,6 +109,7 @@ import type {
   ClientMessage,
   CollaborationConfig,
   CollaborationCost,
+  CollaborationPanel,
   CollaborationRole,
   DaemonMessage,
   McpServerStatus,
@@ -193,6 +194,19 @@ function normalizeWorkdir(input: string): string | null {
  * unbounded resume can block startup or OOM. Cap to the newest-N sessions and
  * stop past a deadline (applied WITHIN each transcript parse too, not just
  * between sessions); the rest stay on disk (loadable on a future restart). */
+/**
+ * Recent fan-outs a client is shown per goal. A sidebar needs the live one plus
+ * a little history for context, not an orchestrator's whole dispatch career.
+ */
+const PANEL_HISTORY_LIMIT = 5;
+
+/** Task statuses that will never change again — mirrors the barrier's rule. */
+const TERMINAL_TASK_STATUS: ReadonlySet<string> = new Set([
+  "done",
+  "failed",
+  "blocked",
+]);
+
 const RESUME_MAX_SESSIONS = 50;
 const RESUME_DEADLINE_MS = 20_000;
 /** Per-session transcript read budget on resume. Scrollback keeps at most
@@ -851,6 +865,8 @@ mcpHub: this.#mcpHub,
         return this.#blackboardIndex(msg, auth);
       case "blackboard.read":
         return this.#blackboardRead(msg, auth);
+      case "collaboration.panels":
+        return this.#collaborationPanels(msg, auth);
       case "models.list":
         return this.#modelsList(msg);
       case "session.export":
@@ -1623,6 +1639,83 @@ mcpHub: this.#mcpHub,
             createdAt: found.createdAt,
           }
         : null,
+    };
+  }
+
+  /**
+   * Live panel state for one goal (§7) — what a client needs to SHOW a fan-out
+   * while it is running.
+   *
+   * Gated on `session:list`, the same tier as `blackboard.index`: this is
+   * metadata about sessions the holder can already enumerate, carrying no
+   * prompts and no artifact bodies. Scoped to the goal's OWN dispatches via
+   * `createdBy`, so one collaboration's panels never surface in another's UI.
+   */
+  #collaborationPanels(
+    msg: Extract<ClientMessage, { type: "collaboration.panels" }>,
+    auth: AuthContext,
+  ): DaemonMessage {
+    if (!hasScope(auth.scopes as string[], SCOPES.SESSION_LIST)) {
+      return {
+        type: "response.error",
+        requestId: msg.id,
+        error: "Missing scope: session:list",
+        code: "forbidden",
+      };
+    }
+    const resolved = this.#resolveGoalSession(msg.sessionId, auth);
+    if (!resolved.ok) {
+      return {
+        type: "response.error",
+        requestId: msg.id,
+        error: resolved.error,
+        code: resolved.code,
+      };
+    }
+    const goal = resolved.goal;
+    const rows = this.#store.dispatchRecentGroups(
+      goal.accountId,
+      goal.projectId,
+      orchestratorCreatedBy(goal.id),
+      PANEL_HISTORY_LIMIT,
+    );
+
+    // Group in insertion order of first appearance: the store already returns
+    // newest-group-first, so a Map preserves that without a second sort.
+    const byGroup = new Map<string, CollaborationPanel>();
+    for (const t of rows) {
+      if (!t.groupId) continue;
+      let panel = byGroup.get(t.groupId);
+      if (!panel) {
+        panel = {
+          groupId: t.groupId,
+          createdAt: t.createdAt,
+          members: [],
+          settled: 0,
+          joined: false,
+        };
+        byGroup.set(t.groupId, panel);
+      }
+      panel.members.push({
+        sessionId: t.targetSession,
+        ordinal: t.groupOrdinal ?? panel.members.length + 1,
+        status: t.status,
+      });
+      if (TERMINAL_TASK_STATUS.has(t.status)) panel.settled++;
+    }
+    const panels = [...byGroup.values()].map((p) => ({
+      ...p,
+      members: [...p.members].sort((a, b) => a.ordinal - b.ordinal),
+      // `joined` is derived from the members rather than from a stored flag, so
+      // it cannot disagree with what the same payload shows.
+      joined: p.members.length > 0 && p.settled === p.members.length,
+    }));
+
+    return {
+      type: "collaboration.panels.result",
+      requestId: msg.id,
+      sessionId: goal.id,
+      panels,
     };
   }
 
