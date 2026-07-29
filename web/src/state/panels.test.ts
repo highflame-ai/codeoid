@@ -14,6 +14,8 @@ import {
   lastJoinedPanel,
   livePanel,
   livePanelMember,
+  livePanels,
+  liveProgress,
   panelState,
   _resetPanelsForTest,
 } from "./panels";
@@ -149,5 +151,47 @@ describe("livePanelMember", () => {
     requestMock.mockResolvedValueOnce(result([panel("g1", ["done", "done"])]));
     await fetchPanels("goal-1");
     expect(livePanelMember("kid-1")).toBeNull();
+  });
+});
+
+describe("concurrent fan-outs", () => {
+  // Two live panels at once is legal — an orchestrator can start a second while
+  // the first resolves, which is why the dispatcher watches a SET of tasks per
+  // session. Reporting only the first understated the parallelism this UI exists
+  // to show, and left a child in the other panel with no badge.
+  const twoLive = () =>
+    result([
+      panel("newer", ["running", "queued"]),
+      panel("older", ["done", "running", "running"]),
+      panel("finished", ["done", "done"]),
+    ]);
+
+  beforeEach(async () => {
+    requestMock.mockResolvedValueOnce(twoLive());
+    await fetchPanels("goal-1");
+    requestMock.mockReset();
+  });
+
+  it("reports every live fan-out, not just the newest", () => {
+    expect(livePanels().map((p) => p.groupId)).toEqual(["newer", "older"]);
+    expect(livePanel()?.groupId).toBe("newer");
+  });
+
+  it("aggregates progress across all of them", () => {
+    // newer: 0 of 2 settled; older: 1 of 3. A single panel's numbers would
+    // misstate how much work is outstanding.
+    expect(liveProgress()).toEqual({ settled: 1, total: 5, panels: 2 });
+  });
+
+  it("finds a member of an OLDER live fan-out", () => {
+    // `older` has three members; kid-3 exists only there.
+    expect(livePanelMember("kid-3")).toEqual({ ordinal: 3, status: "running" });
+  });
+
+  it("liveProgress is null when everything has joined", async () => {
+    requestMock.mockResolvedValueOnce(result([panel("finished", ["done", "done"])]));
+    await fetchPanels("goal-1");
+    expect(liveProgress()).toBeNull();
+    expect(livePanels()).toEqual([]);
   });
 });

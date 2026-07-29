@@ -74,6 +74,7 @@ import {
 import {
   Dispatcher,
   NonRetryableDispatchError,
+  TERMINAL_TASK_STATUS,
   type DispatcherHost,
 } from "./dispatch.js";
 import { createPipelineManagerFromConfig } from "./pipeline/wiring.js";
@@ -199,13 +200,6 @@ function normalizeWorkdir(input: string): string | null {
  * a little history for context, not an orchestrator's whole dispatch career.
  */
 const PANEL_HISTORY_LIMIT = 5;
-
-/** Task statuses that will never change again — mirrors the barrier's rule. */
-const TERMINAL_TASK_STATUS: ReadonlySet<string> = new Set([
-  "done",
-  "failed",
-  "blocked",
-]);
 
 const RESUME_MAX_SESSIONS = 50;
 const RESUME_DEADLINE_MS = 20_000;

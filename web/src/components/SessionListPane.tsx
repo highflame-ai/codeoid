@@ -16,7 +16,7 @@ import {
   type FilteredFleetGroup,
 } from "../lib/fleet";
 import { sessionAgentLabel, shortSub } from "../lib/identity";
-import { fetchPanels, livePanel, livePanelMember, resetPanels } from "../state/panels";
+import { fetchPanels, liveProgress, livePanelMember, resetPanels } from "../state/panels";
 import { nowTick } from "../state/clock";
 import {
   focusedSession,
@@ -91,17 +91,29 @@ const SessionListPane: Component = () => {
     filterFleet(groupFleet(sessionList()), filter()),
   );
 
-  // Poll panel state for the focused collaboration only. There is no push
-  // channel for dispatch state, and a fan-out changes over minutes — a static
-  // indicator would show a finished panel as still running. Scoped to the
-  // focused goal rather than every visible fleet so the cost stays one cheap
-  // metadata query per tick regardless of how many collaborations exist.
-  createEffect(() => {
+  // The goal whose panels we poll, as a plain STRING.
+  //
+  // A memo over a primitive, deliberately. Reading `focusedSession()?.collaboration`
+  // directly inside the effect subscribed it to that store property — and
+  // `mergeSession` reassigns every field on each `session.info_update` with no
+  // equality guard, so `collaboration` gets a fresh object reference on every
+  // status flip. The effect then tore down and rebuilt its interval, firing an
+  // immediate poll each time: during a tool-heavy turn that turned a 3s cadence
+  // into a burst of queries. A memo returning a string only notifies when the id
+  // actually changes.
+  const polledGoalId = createMemo<string | null>(() => {
     const focused = focusedSession();
-    const goalId =
-      focused?.collaboration !== undefined
-        ? focused.id
-        : focused?.collaborationRole?.parentSessionId;
+    if (!focused) return null;
+    if (focused.collaboration !== undefined) return focused.id;
+    return focused.collaborationRole?.parentSessionId ?? null;
+  });
+
+  // There is no push channel for dispatch state, and a fan-out changes over
+  // minutes — a static indicator would show a finished panel as still running.
+  // Scoped to the focused goal so the cost stays one cheap metadata query per
+  // tick regardless of how many collaborations exist.
+  createEffect(() => {
+    const goalId = polledGoalId();
     if (!goalId) {
       resetPanels();
       return;
@@ -443,11 +455,12 @@ const SessionRow: Component<{
         </Show>
         {/* The fan-out, while it runs. This is the whole point of a panel and
             was invisible until the daemon started reporting it. */}
-        <Show when={props.fleet ? livePanel() : null}>
+        <Show when={props.fleet ? liveProgress() : null}>
           {(p) => (
             <PanelProgress
               settled={p().settled}
-              total={p().members.length}
+              total={p().total}
+              panels={p().panels}
             />
           )}
         </Show>
@@ -543,14 +556,22 @@ const SessionRow: Component<{
  * leave the bar short of full on a panel that is already done, which is exactly
  * the confusion the indicator exists to remove.
  */
-const PanelProgress: Component<{ settled: number; total: number }> = (props) => {
+const PanelProgress: Component<{
+  settled: number;
+  total: number;
+  /** How many fan-outs are live. More than one is legal — an orchestrator can
+   *  run a second panel while the first is still resolving. */
+  panels: number;
+}> = (props) => {
   const pct = () => (props.total === 0 ? 0 : (props.settled / props.total) * 100);
   return (
     <div
       class="flex items-center gap-1.5"
-      title={`Panel in flight — ${props.settled} of ${props.total} member(s) finished. Counts members that have SETTLED (including failures), because the join fires on all-terminal.`}
+      title={`${props.panels === 1 ? "Panel" : `${props.panels} panels`} in flight — ${props.settled} of ${props.total} member(s) finished. Counts members that have SETTLED (including failures), because the join fires on all-terminal.`}
     >
-      <span class="font-mono text-[10px] text-warn">⇉ panel</span>
+      <span class="font-mono text-[10px] text-warn">
+        ⇉ {props.panels === 1 ? "panel" : `panels ×${props.panels}`}
+      </span>
       <span
         class="h-1 flex-1 overflow-hidden rounded-full bg-bg"
         role="progressbar"

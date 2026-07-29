@@ -64,15 +64,44 @@ export async function fetchPanels(sessionId: string): Promise<void> {
 }
 
 /**
- * The fan-out currently in flight, if any.
+ * Every fan-out currently in flight.
  *
- * "Live" means not yet joined — deliberately keyed off `joined` rather than off
- * member statuses, so this can never disagree with the barrier's own rule about
- * when a panel is finished.
+ * PLURAL, because concurrent panels are legal: an orchestrator can start a
+ * second one while the first is still resolving, which is exactly why the
+ * dispatcher tracks a SET of watchers per session. Reporting only the first
+ * unjoined panel under-counted the parallelism this UI exists to show — a child
+ * in the other live panel got no badge at all.
+ *
+ * "Live" means not yet joined — keyed off `joined` rather than off member
+ * statuses, so this can never disagree with the barrier's own rule about when a
+ * panel is finished.
  */
-export const livePanel = createMemo<CollaborationPanel | null>(
-  () => state().panels.find((p) => !p.joined) ?? null,
+export const livePanels = createMemo<CollaborationPanel[]>(() =>
+  state().panels.filter((p) => !p.joined),
 );
+
+/** The first live fan-out, for callers that only need one. */
+export const livePanel = createMemo<CollaborationPanel | null>(
+  () => livePanels()[0] ?? null,
+);
+
+/**
+ * Aggregate progress across every live fan-out, or null when none is running.
+ *
+ * Summed rather than showing one panel's numbers: with two panels in flight a
+ * single panel's "1/3" is a lie about how much work is outstanding.
+ */
+export const liveProgress = createMemo<
+  { settled: number; total: number; panels: number } | null
+>(() => {
+  const live = livePanels();
+  if (live.length === 0) return null;
+  return {
+    settled: live.reduce((n, p) => n + p.settled, 0),
+    total: live.reduce((n, p) => n + p.members.length, 0),
+    panels: live.length,
+  };
+});
 
 /** The most recently joined fan-out — context once the live one is gone. */
 export const lastJoinedPanel = createMemo<CollaborationPanel | null>(
@@ -88,10 +117,13 @@ export const lastJoinedPanel = createMemo<CollaborationPanel | null>(
 export function livePanelMember(
   sessionId: string,
 ): { ordinal: number; status: CollaborationPanel["members"][number]["status"] } | null {
-  const p = livePanel();
-  if (!p) return null;
-  const m = p.members.find((x) => x.sessionId === sessionId);
-  return m ? { ordinal: m.ordinal, status: m.status } : null;
+  // Searches EVERY live fan-out, not just the newest: a child participating only
+  // in an older still-running panel showed no badge before this.
+  for (const p of livePanels()) {
+    const m = p.members.find((x) => x.sessionId === sessionId);
+    if (m) return { ordinal: m.ordinal, status: m.status };
+  }
+  return null;
 }
 
 export function resetPanels(): void {

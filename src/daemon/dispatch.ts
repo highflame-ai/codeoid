@@ -99,8 +99,20 @@ export interface DispatcherHost {
   audit(action: string, detail: string): void;
 }
 
-/** Terminal statuses — a member in one of these will never run again. */
-const TERMINAL: ReadonlySet<string> = new Set(["done", "failed", "blocked"]);
+/**
+ * Terminal statuses — a task in one of these will never run again.
+ *
+ * Exported because the barrier and the client-facing panel view must agree on
+ * it: the barrier joins when every member is terminal, and the UI renders
+ * "settled" from the same rule. They were two separate literals in two files,
+ * so adding a status would have left the sidebar quietly disagreeing with the
+ * barrier about whether a fan-out had finished.
+ */
+export const TERMINAL_TASK_STATUS: ReadonlySet<string> = new Set([
+  "done",
+  "failed",
+  "blocked",
+]);
 
 /** Statuses that mean "the worker's current turn is still in flight". */
 const WORKER_ACTIVE: ReadonlySet<string> = new Set([
@@ -663,9 +675,9 @@ export class Dispatcher {
     // one place: a non-terminal task has not completed, so it is not the
     // barrier's business.
     const self = members.find((m) => m.id === task.id);
-    if (!self || !TERMINAL.has(self.status)) return false;
+    if (!self || !TERMINAL_TASK_STATUS.has(self.status)) return false;
 
-    const pending = members.filter((m) => !TERMINAL.has(m.status));
+    const pending = members.filter((m) => !TERMINAL_TASK_STATUS.has(m.status));
     if (pending.length > 0) {
       this.#host.audit(
         "dispatch.group_waiting",
