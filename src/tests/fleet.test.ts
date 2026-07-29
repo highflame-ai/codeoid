@@ -151,6 +151,9 @@ describe("fleet handlers — read surface", () => {
       "fleet_send",
       "fleet_interrupt",
       "fleet_spawn",
+      // A panel is N dispatches at once, so it belongs here and NOT in the
+      // read list — being send-class is what puts it behind owner approval.
+      "fleet_panel",
     ]);
     for (const sendTool of FLEET_SEND_TOOL_NAMES) {
       expect(FLEET_TOOL_NAMES).not.toContain(sendTool);

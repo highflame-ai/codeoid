@@ -92,6 +92,17 @@ export interface FleetDispatchDeps {
     | { ok: false; error: string };
   /** The tenant's task board, newest first. */
   listTasks(limit: number): FleetTaskView[];
+  /**
+   * Fan one brief out to N targets as a dispatch GROUP, joined by the barrier
+   * (§7). Absent = this dispatcher cannot fan out, and `fleet_panel` says so
+   * rather than silently degrading to N independent sends — which would look
+   * identical to the model and then never join.
+   */
+  enqueuePanel?(input: {
+    targets: string[];
+    prompt: string;
+    shape: "ship" | "scout";
+  }): { groupId: string; taskIds: string[] };
 }
 
 export interface FleetDeps {
@@ -131,6 +142,10 @@ export const FLEET_SEND_TOOL_NAMES = [
   "fleet_send",
   "fleet_interrupt",
   "fleet_spawn",
+  // A panel is N sends at once, so it is send-class by definition. Being on
+  // this list is what makes it ride the R3 approval flow (and, for a
+  // collaborative session, carry the goal's cost roll-up into that prompt).
+  "fleet_panel",
 ] as const;
 
 /**
@@ -347,6 +362,56 @@ export function createFleetHandlers(deps: FleetDeps) {
       return `Queued task ${taskId.slice(0, 8)}: send to ${target.name} (${target.workdir}). Delivery happens on the next dispatcher tick — track it with fleet_tasks.`;
     },
 
+    /**
+     * The breadth panel (§7): one brief, N targets, ONE joined result.
+     *
+     * Not sugar over N `fleet_send` calls. N sends produce N independent
+     * completions that arrive one at a time, which gives the orchestrator N
+     * chances to synthesize from partial input — a panel silently degraded into
+     * a race. A group is joined by the dispatch barrier and reports once.
+     */
+    async fleet_panel(args: {
+      sessions: string[];
+      message: string;
+      shape?: "ship" | "scout";
+    }): Promise<string> {
+      if (!deps.dispatch) return "Dispatch is disabled on this daemon.";
+      if (!deps.dispatch.enqueuePanel) {
+        return "This daemon cannot fan out a panel. Use fleet_send per target instead — but note those complete independently and will NOT join.";
+      }
+      const sessions = deps.listSessions();
+      const self = deps.conductorSessionId();
+      const resolved: FleetSessionView[] = [];
+      const unknown: string[] = [];
+      for (const ref of args.sessions) {
+        const t = resolveSession(sessions, ref);
+        if (!t || t.id === self) unknown.push(ref);
+        else if (!resolved.some((r) => r.id === t.id)) resolved.push(t);
+      }
+      deps.audit(
+        "fleet.panel",
+        `requested=${args.sessions.length} resolved=${resolved.length} unknown=${unknown.length}`,
+      );
+      // Fail the whole fan-out rather than quietly running a smaller panel: the
+      // owner approved a panel of N, and a 2-of-3 panel reached without anyone
+      // saying so is exactly the silent degradation §7 warns about.
+      if (unknown.length > 0) {
+        return `Not dispatched — these are not in your fleet: ${unknown.join(", ")}. Use fleet_list to see your members, then call again with all targets valid.`;
+      }
+      if (resolved.length < 2) {
+        return "A panel needs at least 2 distinct targets. For one target use fleet_send.";
+      }
+      const { groupId, taskIds } = deps.dispatch.enqueuePanel({
+        targets: resolved.map((r) => r.id),
+        prompt: args.message,
+        shape: args.shape ?? "scout",
+      });
+      return [
+        `Queued panel ${groupId.slice(0, 8)} — ${taskIds.length} members: ${resolved.map((r) => r.name).join(", ")}.`,
+        "They run in parallel. You will get ONE joined result when every member finishes; do not synthesize before it arrives.",
+      ].join("\n");
+    },
+
     async fleet_spawn(args: {
       workdir: string;
       task: string;
@@ -468,6 +533,10 @@ export const ORCHESTRATOR_FLEET_TOOLS: ReadonlySet<string> = new Set([
   "fleet_tasks",
   "fleet_send",
   "fleet_interrupt",
+  // The breadth panel (§7) is the orchestrator's headline primitive: fan the
+  // same brief to N reviewers on distinct backends and get ONE joined result.
+  // Scoped like every other verb here — its targets must be its own children.
+  "fleet_panel",
 ]);
 
 export function buildFleetMcpServer(
@@ -552,6 +621,26 @@ export function buildFleetMcpServer(
         },
         async ({ session, message, shape }) =>
           text(await handlers.fleet_send({ session, message, shape })),
+      ),
+      tool(
+        "fleet_panel",
+        "Fan ONE brief out to N sessions at once and get a SINGLE joined result when every one of them finishes — the review-panel primitive. REQUIRES the owner's approval. Prefer this over repeated fleet_send whenever you need all the answers together: separate sends complete independently and never join, so you would be synthesizing from partial input.",
+        {
+          sessions: z
+            .array(z.string())
+            .min(2)
+            .max(12)
+            .describe("Target session names/ids — at least 2, all in your own fleet"),
+          message: z
+            .string()
+            .describe("The brief every member receives — complete and self-contained"),
+          shape: z
+            .enum(["ship", "scout"])
+            .optional()
+            .describe("scout = investigate and report (default for a panel); ship = deliver a change"),
+        },
+        async ({ sessions, message, shape }) =>
+          text(await handlers.fleet_panel({ sessions, message, shape })),
       ),
       tool(
         "fleet_spawn",

@@ -3526,6 +3526,20 @@ mcpHub: this.#mcpHub,
         }
         return { ok: true, provider, model: resolved };
       },
+      enqueuePanel: (input) =>
+        this.#dispatcher.enqueueGroup({
+          accountId,
+          projectId,
+          createdBy:
+            this.#identityManager?.conductorUri ??
+            `conductor:${accountId}/${projectId}`,
+          prompt: input.prompt,
+          members: input.targets.map((targetSession) => ({
+            kind: "send" as const,
+            shape: input.shape,
+            targetSession,
+          })),
+        }),
       listTasks: (limit: number): FleetTaskView[] =>
         this.#store
           .dispatchListForTenant(accountId, projectId, limit)
@@ -3705,6 +3719,29 @@ mcpHub: this.#mcpHub,
           throw new Error("Target is not a role-child of this collaboration.");
         }
         await tenant.interrupt(sessionId);
+      },
+      // A panel is N sends, so it carries the same scoping as one — every
+      // target must be this goal's own child. Checked here in the DEPS, not in
+      // the tool's target resolution, so the fence holds even though
+      // `listSessions()` already only shows its own fleet.
+      enqueuePanel: (input) => {
+        const stranger = input.targets.find((id) => !ownChild(id));
+        if (stranger) {
+          throw new Error(
+            "Panel targets must all be role-children of this collaboration. Use fleet_list to see your fleet.",
+          );
+        }
+        return this.#dispatcher.enqueueGroup({
+          accountId,
+          projectId,
+          createdBy: createdBy(),
+          prompt: input.prompt,
+          members: input.targets.map((targetSession) => ({
+            kind: "send" as const,
+            shape: input.shape,
+            targetSession,
+          })),
+        });
       },
       // Only this goal's own dispatches. The tenant board would show every
       // other session's targets and result digests — the one place the scoping
