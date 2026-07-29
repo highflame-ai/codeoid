@@ -80,10 +80,10 @@ class FakeHost implements DispatcherHost {
     _accountId: string,
     _projectId: string,
     events: DispatchEventRow[],
-  ): Promise<boolean> {
-    if (!this.conductorAcceptsEvents) return false;
+  ): Promise<readonly number[]> {
+    if (!this.conductorAcceptsEvents) return [];
     this.delivered.push(events);
-    return true;
+    return events.map((e) => e.id);
   }
 
   audit(action: string, detail: string): void {
@@ -370,5 +370,267 @@ describe("dispatcher — approval wedge + lease", () => {
     expect(
       store.dispatchEventsPending(TENANT.accountId, TENANT.projectId),
     ).toHaveLength(0);
+  });
+});
+
+// ── The dispatch barrier (docs/collaborative-session-design.md §7 step 3) ────
+
+// The one genuinely new dispatch primitive: N members, ONE joined completion.
+// Everything here is about the join being trustworthy — it must not fire early,
+// must not hang on a failed member, must not report twice, and above all must
+// not tear down the long-lived role-children it dispatched to.
+describe("dispatch barrier — N-way join", () => {
+  const PANEL = ["kid-a", "kid-b", "kid-c"];
+
+  function enqueuePanel(targets = PANEL, shape: "ship" | "scout" = "scout") {
+    return dispatcher.enqueueGroup({
+      ...TENANT,
+      createdBy: "orchestrator:goal-1",
+      prompt: "review the diff",
+      members: targets.map((targetSession) => ({
+        kind: "send" as const,
+        shape,
+        targetSession,
+      })),
+    });
+  }
+
+  /** All group_done events delivered so far. */
+  const joined = () =>
+    host.delivered.flat().filter((e) => e.type === "group_done");
+  /** Any per-member event — there should never be one for a grouped task. */
+  const perMember = () =>
+    host.delivered.flat().filter((e) => e.type !== "group_done");
+
+  test("a grouped send waits for the target's TURN, not for delivery", async () => {
+    // The bug this exists to prevent: an ungrouped send completes the moment
+    // the prompt is handed over, so a barrier over delivery-completion would
+    // fire before any reviewer had read anything.
+    const { taskIds } = enqueuePanel(["kid-a"]);
+    host.statuses.set("kid-a", "thinking");
+    await dispatcher.tick();
+
+    expect(host.sent).toHaveLength(1);
+    const task = store.dispatchGet(taskIds[0]!)!;
+    expect(task.status).toBe("running"); // NOT "done"
+    expect(joined()).toHaveLength(0);
+  });
+
+  test("an UNGROUPED send still completes on delivery — unchanged", async () => {
+    const id = enqueueSend();
+    await dispatcher.tick();
+    expect(store.dispatchGet(id)!.status).toBe("done");
+  });
+
+  test("stays silent until the last member finishes, then reports once", async () => {
+    const { groupId, taskIds } = enqueuePanel();
+    for (const t of PANEL) host.statuses.set(t, "thinking");
+    await dispatcher.tick();
+    expect(host.sent).toHaveLength(3);
+
+    // Two of three finish — still nothing.
+    dispatcher.onSessionStatus("kid-a", "idle");
+    dispatcher.onSessionStatus("kid-b", "idle");
+    await Bun.sleep(20);
+    expect(joined()).toHaveLength(0);
+    expect(perMember()).toHaveLength(0);
+
+    // The last one closes the barrier.
+    dispatcher.onSessionStatus("kid-c", "idle");
+    await Bun.sleep(20);
+    expect(joined()).toHaveLength(1);
+    expect(joined()[0]!.digest).toContain(`group=${groupId}`);
+    expect(joined()[0]!.digest).toContain("all completed");
+    // Every member's digest is in the one event, so synthesis sees them together.
+    for (const id of taskIds) {
+      expect(store.dispatchGet(id)!.status).toBe("done");
+    }
+    expect(joined()[0]!.digest).toMatch(/1\. DONE/);
+    expect(joined()[0]!.digest).toMatch(/3\. DONE/);
+  });
+
+  test("NEVER destroys a panel member — they are long-lived role-children", async () => {
+    // The catastrophic-and-silent failure mode. `#finishWorkerTask` tears down
+    // spawned workers on turn end (design R2), and grouped sends are the first
+    // sends ever routed through that path. Destroying a role-child would
+    // dismantle the fleet every time a panel joined.
+    enqueuePanel();
+    for (const t of PANEL) host.statuses.set(t, "thinking");
+    await dispatcher.tick();
+    for (const t of PANEL) dispatcher.onSessionStatus(t, "idle");
+    await Bun.sleep(20);
+
+    expect(joined()).toHaveLength(1);
+    expect(host.destroyed).toEqual([]);
+  });
+
+  test("a spawned worker IS still destroyed — the guard is per-kind, not blanket", async () => {
+    // Contrast, so the guard above can't be over-applied into a leak.
+    enqueueSpawn();
+    await dispatcher.tick();
+    const worker = host.spawned[0] ? "worker-1" : "";
+    dispatcher.onSessionStatus(worker, "idle");
+    await Bun.sleep(20);
+    expect(host.destroyed.map((d) => d.sessionId)).toEqual([worker]);
+  });
+
+  test("joins on ALL-TERMINAL, so one failed member cannot hang the panel", async () => {
+    const { taskIds } = enqueuePanel();
+    for (const t of PANEL) host.statuses.set(t, "thinking");
+    await dispatcher.tick();
+
+    dispatcher.onSessionStatus("kid-a", "idle");
+    // kid-b errors repeatedly until it auto-blocks (failureLimit 2).
+    dispatcher.onSessionStatus("kid-b", "error");
+    await Bun.sleep(20);
+    await dispatcher.tick();
+    host.statuses.set("kid-b", "thinking");
+    dispatcher.onSessionStatus("kid-b", "error");
+    await Bun.sleep(20);
+    dispatcher.onSessionStatus("kid-c", "idle");
+    await Bun.sleep(20);
+
+    expect(joined()).toHaveLength(1);
+    const digest = joined()[0]!.digest;
+    // The failure is REPORTED, not dropped and not left blocking its peers.
+    expect(digest).toMatch(/2 completed, 1 did not|1 completed, 2 did not/);
+    expect(digest).toMatch(/BLOCKED|FAILED/);
+    const statuses = taskIds.map((id) => store.dispatchGet(id)!.status);
+    expect(statuses.filter((s) => s === "done").length).toBeGreaterThanOrEqual(2);
+  });
+
+  test("a member whose target vanished fails the member, not the panel", async () => {
+    const { taskIds } = enqueuePanel(["kid-a", "gone"]);
+    host.statuses.set("kid-a", "thinking");
+    host.sendError = new NonRetryableDispatchError("target session no longer exists");
+    await dispatcher.tick();
+    host.sendError = null;
+    await dispatcher.tick();
+    dispatcher.onSessionStatus("kid-a", "idle");
+    await Bun.sleep(20);
+
+    // Whatever the ordering, the barrier resolves rather than waiting forever.
+    expect(joined()).toHaveLength(1);
+    expect(taskIds.map((id) => store.dispatchGet(id)!.status).every((s) =>
+      ["done", "failed", "blocked"].includes(s),
+    )).toBe(true);
+  });
+
+  test("reports exactly once even if extra status events arrive", async () => {
+    enqueuePanel();
+    for (const t of PANEL) host.statuses.set(t, "thinking");
+    await dispatcher.tick();
+    for (const t of PANEL) dispatcher.onSessionStatus(t, "idle");
+    await Bun.sleep(20);
+    // Duplicate transitions (a re-broadcast, a racing tick) must not re-emit.
+    for (const t of PANEL) dispatcher.onSessionStatus(t, "idle");
+    await dispatcher.tick();
+    await Bun.sleep(20);
+    expect(joined()).toHaveLength(1);
+  });
+
+  test("re-watches after a restart instead of re-sending the brief", async () => {
+    // Re-delivery is not idempotent: a reviewer handed its brief twice would
+    // do the work twice and the digest would describe the second pass only.
+    const { taskIds } = enqueuePanel(["kid-a"]);
+    host.statuses.set("kid-a", "thinking");
+    await dispatcher.tick();
+    expect(host.sent).toHaveLength(1);
+
+    // Simulate a crash + reboot: a new dispatcher reclaims the running task.
+    dispatcher = makeDispatcher();
+    await dispatcher.tick(); // reclaim (stale claim from the old boot)
+    await dispatcher.tick(); // re-execute
+    expect(host.sent).toHaveLength(1); // NOT re-sent
+    expect(store.dispatchGet(taskIds[0]!)!.status).toBe("running");
+
+    dispatcher.onSessionStatus("kid-a", "idle");
+    await Bun.sleep(20);
+    expect(joined()).toHaveLength(1);
+  });
+
+  test("a target that finished while the daemon was down completes without re-sending", async () => {
+    const { taskIds } = enqueuePanel(["kid-a"]);
+    host.statuses.set("kid-a", "thinking");
+    await dispatcher.tick();
+
+    // It went idle while we were away — nobody will send us a transition.
+    host.statuses.set("kid-a", "idle");
+    dispatcher = makeDispatcher();
+    await dispatcher.tick();
+    await dispatcher.tick();
+    await Bun.sleep(20);
+
+    expect(host.sent).toHaveLength(1); // still only the original delivery
+    expect(store.dispatchGet(taskIds[0]!)!.status).toBe("done");
+    expect(joined()).toHaveLength(1);
+  });
+
+  test("two live tasks can share a target — the second must not evict the first", async () => {
+    // #watched used to be Map<sessionId, taskId>. Every key was a freshly
+    // created spawn worker, unique by construction — but a grouped send watches
+    // a PRE-EXISTING session, and the same role-child can be the target of two
+    // live dispatches. The second registration evicted the first, whose task
+    // then sat in `running` until the lease expired, hanging its barrier.
+    const panelA = enqueuePanel(["kid-a", "kid-b"]);
+    host.statuses.set("kid-a", "thinking");
+    host.statuses.set("kid-b", "thinking");
+    await dispatcher.tick();
+
+    // A second panel over kid-a while the first is still running.
+    const panelB = enqueuePanel(["kid-a", "kid-c"]);
+    host.statuses.set("kid-c", "thinking");
+    await dispatcher.tick();
+    expect(dispatcher.tasksForSession("kid-a")).toHaveLength(2);
+
+    // kid-a finishes once; BOTH of its tasks must complete.
+    dispatcher.onSessionStatus("kid-a", "idle");
+    await Bun.sleep(20);
+    const aTasks = [panelA.taskIds[0]!, panelB.taskIds[0]!];
+    for (const id of aTasks) {
+      expect(store.dispatchGet(id)!.status).toBe("done");
+    }
+
+    // Finish the rest; both panels join independently. A tick flushes — two
+    // joins landing in the same burst hit the delivery re-entrancy guard, which
+    // is deliberate (burst-collapse), so the second waits for the next pass.
+    dispatcher.onSessionStatus("kid-b", "idle");
+    dispatcher.onSessionStatus("kid-c", "idle");
+    await Bun.sleep(20);
+    await dispatcher.tick();
+    expect(joined()).toHaveLength(2);
+  });
+
+  test("a wedged member is REPORTED, not absorbed by the barrier", async () => {
+    // #emitEvent is also how a waiting_approval wedge is surfaced, and the
+    // barrier absorbed it — so a panel member whose budget ran out went
+    // unreported and the panel hung to lease expiry. That notice is the one
+    // message whose whole purpose is to reach a human.
+    enqueuePanel(["kid-a", "kid-b"]);
+    host.statuses.set("kid-a", "thinking");
+    host.statuses.set("kid-b", "thinking");
+    await dispatcher.tick();
+
+    dispatcher.onSessionStatus("kid-a", "waiting_approval");
+    await Bun.sleep(20);
+    // The wedge notice is written with keepPending, so a tick delivers it.
+    await dispatcher.tick();
+    const wedge = host.delivered.flat().filter((e) => /WAITING FOR APPROVAL/.test(e.digest));
+    expect(wedge).toHaveLength(1);
+    // ...and it is NOT the join: the group is still running.
+    expect(joined()).toHaveLength(0);
+  });
+
+  test("groups are tenant-scoped — a group id is not a permission", () => {
+    const { groupId } = enqueuePanel();
+    expect(store.dispatchGroupMembers(TENANT.accountId, TENANT.projectId, groupId)).toHaveLength(3);
+    expect(store.dispatchGroupMembers("acc-other", "proj-other", groupId)).toHaveLength(0);
+  });
+
+  test("members are listed in fan-out order, so the digest is comparable", () => {
+    const { taskIds, groupId } = enqueuePanel();
+    const members = store.dispatchGroupMembers(TENANT.accountId, TENANT.projectId, groupId);
+    expect(members.map((m) => m.id)).toEqual(taskIds);
+    expect(members.map((m) => m.groupId)).toEqual([groupId, groupId, groupId]);
   });
 });

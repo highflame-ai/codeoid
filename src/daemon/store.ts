@@ -45,6 +45,19 @@ export interface DispatchTaskRow {
   resultDigest: string | null;
   error: string | null;
   createdBy: string;
+  /**
+   * Dispatch group this task belongs to (the barrier, §7). NULL = standalone,
+   * which is every task queued before panels existed — those keep emitting
+   * their own completion event, ungrouped.
+   */
+  groupId: string | null;
+  /**
+   * 1-based position within the group, as fanned out. Stored rather than
+   * derived: every member is inserted in the same transaction with the same
+   * `created_at`, so a timestamp sort falls back to the random UUID and the
+   * "member 1 of 3" labels in a joined digest would shuffle between reads.
+   */
+  groupOrdinal: number | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -54,7 +67,12 @@ export interface DispatchEventRow {
   accountId: string;
   projectId: string;
   taskId: string;
-  type: "task_done" | "task_failed" | "task_blocked";
+  /**
+   * `group_done` is the BARRIER's merged completion for a whole dispatch group
+   * (§7). Its members emit nothing individually, so a panel produces exactly
+   * one event no matter how wide the fan-out.
+   */
+  type: "task_done" | "task_failed" | "task_blocked" | "group_done";
   digest: string;
   createdAt: number;
 }
@@ -80,6 +98,8 @@ interface RawDispatchRow {
   result_digest: string | null;
   error: string | null;
   created_by: string;
+  group_id: string | null;
+  group_ordinal: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -108,6 +128,8 @@ function rowToDispatchTask(r: RawDispatchRow): DispatchTaskRow {
     resultDigest: r.result_digest,
     error: r.error,
     createdBy: r.created_by,
+    groupId: r.group_id ?? null,
+    groupOrdinal: r.group_ordinal ?? null,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -386,6 +408,8 @@ export class Store {
         result_digest     TEXT,
         error             TEXT,
         created_by        TEXT NOT NULL,             -- conductor WIMSE URI / sub
+        group_id          TEXT,                      -- dispatch group (barrier); NULL = a standalone task
+        group_ordinal     INTEGER,                   -- 1-based position within the group; NULL when ungrouped
         created_at        INTEGER NOT NULL,
         updated_at        INTEGER NOT NULL
       );
@@ -419,6 +443,24 @@ export class Store {
     // databases; this ALTER covers the ones already on disk.
     this.#addColumnIfMissing("dispatch_tasks", "provider", "TEXT");
     this.#addColumnIfMissing("dispatch_tasks", "model", "TEXT");
+    // Dispatch groups (the barrier, docs/collaborative-session-design.md §7).
+    // NULL on an existing row means "standalone task", which is exactly the
+    // pre-upgrade behaviour — every task queued before panels existed keeps
+    // emitting its own completion event.
+    this.#addColumnIfMissing("dispatch_tasks", "group_id", "TEXT");
+    this.#addColumnIfMissing("dispatch_tasks", "group_ordinal", "INTEGER");
+    // AFTER the ALTERs, never inside the CREATE block above. On an existing
+    // database `CREATE TABLE IF NOT EXISTS` is a no-op, so an index declared
+    // there would run against a table that does not have the column yet and
+    // SQLite fails the whole migration with "no such column: group_id" — the
+    // daemon then refuses to open a database it had already been using. Every
+    // unit test builds a fresh database and is structurally blind to this; a
+    // live upgrade probe caught it, and `dispatch-store.test.ts` now reproduces
+    // the upgrade path so it can never regress silently again.
+    this.#db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_dispatch_group
+        ON dispatch_tasks(group_id) WHERE group_id IS NOT NULL;
+    `);
 
     // Pre-release single-row predecessor of provider_model_catalogs — never
     // shipped in a tagged version; drop from dev databases that ran the branch.
@@ -815,14 +857,19 @@ export class Store {
     model?: string;
     failureLimit: number;
     createdBy: string;
+    /** Dispatch group for a barrier fan-out; omit for a standalone task. */
+    groupId?: string;
+    /** 1-based position within that group. */
+    groupOrdinal?: number;
     now: number;
   }): void {
     this.#db
       .prepare(
         `INSERT INTO dispatch_tasks
            (id, account_id, project_id, kind, shape, target_session, workdir,
-            prompt, provider, model, failure_limit, created_by, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            prompt, provider, model, failure_limit, created_by, group_id,
+            group_ordinal, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         task.id,
@@ -837,6 +884,8 @@ export class Store {
         task.model ?? null,
         task.failureLimit,
         task.createdBy,
+        task.groupId ?? null,
+        task.groupOrdinal ?? null,
         task.now,
         task.now,
       );
@@ -987,6 +1036,50 @@ export class Store {
   }
 
   /**
+   * Insert every member of a dispatch group atomically.
+   *
+   * One transaction, not N calls: a crash part-way through a fan-out would
+   * leave a group smaller than the panel the owner approved, and the barrier
+   * would then fire on a quorum nobody asked for. IMMEDIATE so the write lock
+   * is taken up front rather than upgraded mid-transaction.
+   */
+  dispatchEnqueueGroup(
+    tasks: ReadonlyArray<Parameters<Store["dispatchEnqueue"]>[0]>,
+  ): void {
+    this.#db
+      .transaction(() => {
+        for (const t of tasks) this.dispatchEnqueue(t);
+      })
+      .immediate();
+  }
+
+  /**
+   * Every member of one dispatch group, oldest first — the barrier's read
+   * (docs/collaborative-session-design.md §7 step 3).
+   *
+   * Ordered by `created_at` so a joined digest lists reviewers in the order
+   * they were fanned out, which is the order the orchestrator named them.
+   * Unordered output would shuffle the panel between reads and make a merged
+   * verdict harder to compare against the request that produced it.
+   *
+   * Tenant-scoped like everything else here: a group id is not a permission.
+   */
+  dispatchGroupMembers(
+    accountId: string,
+    projectId: string,
+    groupId: string,
+  ): DispatchTaskRow[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT * FROM dispatch_tasks
+          WHERE account_id = ? AND project_id = ? AND group_id = ?
+          ORDER BY group_ordinal ASC, created_at ASC, id ASC`,
+      )
+      .all(accountId, projectId, groupId) as RawDispatchRow[];
+    return rows.map(rowToDispatchTask);
+  }
+
+  /**
    * The tenant's task board, newest first.
    *
    * `createdBy` narrows it to one dispatcher's own tasks. A collaboration
@@ -1036,7 +1129,7 @@ export class Store {
     accountId: string;
     projectId: string;
     taskId: string;
-    type: "task_done" | "task_failed" | "task_blocked";
+    type: "task_done" | "task_failed" | "task_blocked" | "group_done";
     digest: string;
     now: number;
   }): void {

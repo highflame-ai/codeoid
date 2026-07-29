@@ -82,17 +82,25 @@ export interface DispatcherHost {
   /** Tear down a finished worker session (best-effort). */
   destroyWorker(sessionId: string, reason: string): Promise<void>;
   /**
-   * Inject pending events into the tenant's conductor session as ONE batched
-   * turn. Returns true when delivered; false when held (conductor missing or
-   * busy — the events stay pending and re-try next tick).
+   * Inject pending events into whichever session each one belongs to, batched
+   * per target — the tenant's conductor for its own dispatches, and the
+   * originating ORCHESTRATOR for a collaboration's.
+   *
+   * Returns the ids it actually delivered. Not a boolean: with several possible
+   * targets, "one recipient is mid-turn" is a normal state, and an all-or-nothing
+   * answer would either hold an idle recipient's events back or re-deliver them
+   * later as duplicates. Anything omitted stays pending and is retried.
    */
   deliverEvents(
     accountId: string,
     projectId: string,
     events: DispatchEventRow[],
-  ): Promise<boolean>;
+  ): Promise<readonly number[]>;
   audit(action: string, detail: string): void;
 }
+
+/** Terminal statuses — a member in one of these will never run again. */
+const TERMINAL: ReadonlySet<string> = new Set(["done", "failed", "blocked"]);
 
 /** Statuses that mean "the worker's current turn is still in flight". */
 const WORKER_ACTIVE: ReadonlySet<string> = new Set([
@@ -106,8 +114,38 @@ export class Dispatcher {
   #host: DispatcherHost;
   #config: DispatchConfig;
   #timer: ReturnType<typeof setInterval> | null = null;
-  /** worker session id → task id, for routing status transitions. */
-  #watched = new Map<string, string>();
+  /**
+   * session id → the task ids currently watching it, for routing status
+   * transitions.
+   *
+   * A SET, not a single id. Every watched session used to be a freshly-created
+   * spawn worker, unique by construction — but a grouped send watches a
+   * PRE-EXISTING session, and the same role-child can legitimately be the target
+   * of two live dispatches (a second panel, or a plain `fleet_send` alongside a
+   * running one). With one id per key the second registration silently evicted
+   * the first, whose task then sat in `running` until the lease expired — and
+   * its barrier hung for the whole lease with it.
+   */
+  #watched = new Map<string, Set<string>>();
+
+  /** Register a task as watching `sessionId`. */
+  #watch(sessionId: string, taskId: string): void {
+    const existing = this.#watched.get(sessionId);
+    if (existing) existing.add(taskId);
+    else this.#watched.set(sessionId, new Set([taskId]));
+  }
+
+  /** Stop watching one task; drops the key when it was the last watcher. */
+  #unwatch(sessionId: string, taskId?: string): void {
+    const set = this.#watched.get(sessionId);
+    if (!set) return;
+    if (taskId === undefined) {
+      this.#watched.delete(sessionId);
+      return;
+    }
+    set.delete(taskId);
+    if (set.size === 0) this.#watched.delete(sessionId);
+  }
   /** Re-entrancy guard — a slow tick must not overlap the next. */
   #ticking = false;
   #deliveringEvents = false;
@@ -124,7 +162,16 @@ export class Dispatcher {
 
   /** Task currently watched for a worker session (undefined = not a worker). */
   taskForWorker(sessionId: string): string | undefined {
-    return this.#watched.get(sessionId);
+    // First (and usually only) watcher. A spawn worker always has exactly one;
+    // a shared send target can have several, and this accessor exists for the
+    // spawn case — see `tasksForSession` when you need all of them.
+    const set = this.#watched.get(sessionId);
+    return set ? set.values().next().value : undefined;
+  }
+
+  /** Every task currently watching `sessionId`. */
+  tasksForSession(sessionId: string): string[] {
+    return [...(this.#watched.get(sessionId) ?? [])];
   }
 
   start(): void {
@@ -184,6 +231,73 @@ export class Dispatcher {
   }
 
   /**
+   * Fan one task out to N targets as a dispatch GROUP — the barrier primitive
+   * (docs/collaborative-session-design.md §7 step 3).
+   *
+   * The members run exactly like standalone tasks; the only difference is what
+   * happens when they finish. Instead of N separate completion events arriving
+   * one at a time, the group's members stay silent until the LAST one reaches a
+   * terminal state, and then one merged event lands. That is the whole point:
+   * §7's synthesis step needs every reviewer's verdict in a single turn, and N
+   * trickling events give the orchestrator N chances to synthesize early from
+   * partial input — which is how a panel silently degrades into a race.
+   *
+   * All members are inserted before any tick can observe the group, so the
+   * barrier can never see a half-built group and fire on member 1 of 3.
+   */
+  enqueueGroup(input: {
+    accountId: string;
+    projectId: string;
+    createdBy: string;
+    /** Same brief for every member; each gets its own target. */
+    prompt: string;
+    members: Array<{
+      kind: "send" | "spawn";
+      shape: "ship" | "scout";
+      targetSession?: string;
+      workdir?: string;
+      provider?: string;
+      model?: string;
+      /** Per-member brief; falls back to the shared `prompt`. */
+      prompt?: string;
+    }>;
+  }): { groupId: string; taskIds: string[] } {
+    const groupId = randomUUID();
+    const now = Date.now();
+    const taskIds: string[] = [];
+    const rows = input.members.map((m, i) => {
+      const id = randomUUID();
+      taskIds.push(id);
+      return {
+        id,
+        accountId: input.accountId,
+        projectId: input.projectId,
+        kind: m.kind,
+        shape: m.shape,
+        targetSession: m.targetSession,
+        workdir: m.workdir,
+        prompt: m.prompt ?? input.prompt,
+        provider: m.provider,
+        model: m.model,
+        failureLimit: this.#config.failureLimit,
+        createdBy: input.createdBy,
+        groupId,
+        groupOrdinal: i + 1,
+        now,
+      };
+    });
+    this.#store.dispatchEnqueueGroup(rows);
+    this.#host.audit(
+      "dispatch.group_enqueued",
+      `group=${groupId} members=${taskIds.length} targets=${input.members
+        .map((m) => m.targetSession ?? m.workdir ?? "-")
+        .join(",")
+        .slice(0, 300)}`,
+    );
+    return { groupId, taskIds };
+  }
+
+  /**
    * One dispatcher pass: reclaim stale claims, renew live leases, claim +
    * execute ready tasks, deliver pending conductor events. Public so tests
    * drive it deterministically without timers.
@@ -211,19 +325,26 @@ export class Dispatcher {
    * worker's turn completion becomes a digest without polling.
    */
   onSessionStatus(sessionId: string, status: SessionStatus): void {
-    const taskId = this.#watched.get(sessionId);
-    if (!taskId) return;
+    const taskIds = this.tasksForSession(sessionId);
+    if (taskIds.length === 0) return;
     if (status === "idle" || status === "error") {
-      this.#watched.delete(sessionId);
-      void this.#finishWorkerTask(taskId, sessionId, status);
-    } else if (status === "waiting_approval") {
+      // Every task watching this session completes on the same transition —
+      // dropping all but one is what left a panel member's task orphaned.
+      for (const taskId of taskIds) {
+        this.#unwatch(sessionId, taskId);
+        void this.#finishWorkerTask(taskId, sessionId, status);
+      }
+      return;
+    }
+    if (status === "waiting_approval") {
       // The worker wedged: autonomous budget exhausted or a gated tool. With
       // no client attached nobody can approve — surface it to the conductor
       // and STOP renewing the lease; expiry reclaims (attempts++) and either
       // retries fresh or auto-blocks. The owner can also attach and approve
       // before the lease runs out — then the turn simply continues.
-      const task = this.#store.dispatchGet(taskId);
-      if (task) {
+      for (const taskId of taskIds) {
+        const task = this.#store.dispatchGet(taskId);
+        if (!task) continue;
         this.#emitEvent(task, "task_failed", // type refined below if it recovers
           `worker for task ${task.id.slice(0, 8)} (${task.shape}) is WAITING FOR APPROVAL in session ${sessionId.slice(0, 8)} — its autonomous tool budget is exhausted or it hit a gated tool. Attach and approve to let it continue, or it will be reclaimed when the lease expires.`,
           { keepPending: true },
@@ -246,7 +367,7 @@ export class Dispatcher {
       Date.now(),
     );
     for (const task of reclaimed) {
-      if (task.workerSessionId) this.#watched.delete(task.workerSessionId);
+      if (task.workerSessionId) this.#unwatch(task.workerSessionId, task.id);
       this.#host.audit(
         "dispatch.reclaimed",
         `task=${task.id} attempts=${task.attempts} status=${task.status}`,
@@ -273,9 +394,11 @@ export class Dispatcher {
   /** Renew leases only for workers that are verifiably alive AND working. */
   #renewLiveLeases(): void {
     const alive: string[] = [];
-    for (const [sessionId, taskId] of this.#watched) {
+    for (const [sessionId, taskIds] of this.#watched) {
       const status = this.#host.workerStatus(sessionId);
-      if (status && WORKER_ACTIVE.has(status)) alive.push(taskId);
+      // Every task watching a live session renews — a shared target keeps all
+      // of its dispatches leased, not just whichever registered first.
+      if (status && WORKER_ACTIVE.has(status)) alive.push(...taskIds);
       // idle/error are handled by onSessionStatus; waiting_approval and a
       // vanished session deliberately do NOT renew — the lease reclaims them.
     }
@@ -315,6 +438,15 @@ export class Dispatcher {
     const now = Date.now();
     try {
       if (task.kind === "send") {
+        // A GROUPED send completes when its target finishes the WORK, not when
+        // the prompt is handed over. An ungrouped send has always meant
+        // "delivered" and still does — nobody is joining on it. But a barrier
+        // over delivery-completion would fire the instant all N briefs were
+        // handed out, before a single reviewer had read anything, and a panel
+        // that joins on nothing is worse than no panel.
+        if (task.groupId && task.targetSession) {
+          return await this.#startGroupedSend(task, now);
+        }
         await this.#host.sendToSession(task);
         this.#store.dispatchComplete(
           task.id,
@@ -330,7 +462,7 @@ export class Dispatcher {
         const continued = await this.#host.continueWorker(task);
         if (continued) {
           this.#store.dispatchMarkRunning(task.id, task.workerSessionId, now);
-          this.#watched.set(task.workerSessionId, task.id);
+          this.#watch(task.workerSessionId, task.id);
           this.#host.audit(
             "dispatch.continued",
             `task=${task.id} worker=${task.workerSessionId}`,
@@ -341,7 +473,7 @@ export class Dispatcher {
       }
       const { sessionId } = await this.#host.spawnWorker(task);
       this.#store.dispatchMarkRunning(task.id, sessionId, Date.now());
-      this.#watched.set(sessionId, task.id);
+      this.#watch(sessionId, task.id);
       this.#host.audit("dispatch.spawned", `task=${task.id} worker=${sessionId}`);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -366,7 +498,7 @@ export class Dispatcher {
         // a continueWorker attempt that threw after the session was found) —
         // mirror #finishWorkerTask's blocked-path teardown.
         if (task.kind === "spawn" && task.workerSessionId) {
-          this.#watched.delete(task.workerSessionId);
+          this.#unwatch(task.workerSessionId, task.id);
           await this.#host.destroyWorker(
             task.workerSessionId,
             `task ${task.id} ${status}`,
@@ -377,6 +509,64 @@ export class Dispatcher {
   }
 
   /** Worker turn ended — digest, complete/fail, notify, tear down. */
+  /**
+   * Deliver (or re-attach to) a grouped send and watch its target to completion.
+   *
+   * Three things make this different from the spawn path it borrows from:
+   *
+   *  1. **The target is not disposable.** It is a long-lived role-child, so
+   *     `#finishWorkerTask` must not tear it down — see the `kind === "spawn"`
+   *     guard there.
+   *  2. **Re-delivery is not idempotent.** After a restart the task is
+   *     requeued and re-executed, and blindly re-sending would hand the
+   *     reviewer its brief twice. `workerSessionId` being set is the marker
+   *     that delivery already happened, so this re-WATCHES instead.
+   *  3. **The turn may have finished while the daemon was down.** Re-watching
+   *     an already-idle target would wait for a transition that never comes,
+   *     until the lease expired and burned an attempt. So the current status
+   *     decides: still working → watch; already settled → finish now; gone →
+   *     fail non-retryably, and the barrier joins with that member marked
+   *     failed rather than hanging on it.
+   */
+  async #startGroupedSend(task: DispatchTaskRow, now: number): Promise<void> {
+    const target = task.targetSession!;
+    const alreadyDelivered = task.workerSessionId !== null;
+
+    if (alreadyDelivered) {
+      const status = this.#host.workerStatus(target);
+      if (!status) {
+        throw new NonRetryableDispatchError(
+          `panel target ${target.slice(0, 8)} no longer exists`,
+        );
+      }
+      this.#store.dispatchMarkRunning(task.id, target, now);
+      if (!WORKER_ACTIVE.has(status)) {
+        // Settled while we were away — complete from what it left behind.
+        await this.#finishWorkerTask(task.id, target, status === "error" ? "error" : "idle");
+        return;
+      }
+      this.#watch(target, task.id);
+      this.#host.audit(
+        "dispatch.group_rewatched",
+        `task=${task.id} group=${task.groupId} target=${target} status=${status}`,
+      );
+      return;
+    }
+
+    // Marked running BEFORE the send, deliberately. `running` is already a
+    // reclaimable state, so ordering it first costs nothing — whereas marking
+    // it after leaves a window where a crash between delivery and the marker
+    // makes the retry re-send, and the reviewer works its brief twice while the
+    // digest describes only the second pass.
+    this.#store.dispatchMarkRunning(task.id, target, now);
+    this.#watch(target, task.id);
+    await this.#host.sendToSession(task);
+    this.#host.audit(
+      "dispatch.group_sent",
+      `task=${task.id} group=${task.groupId} target=${target}`,
+    );
+  }
+
   async #finishWorkerTask(
     taskId: string,
     sessionId: string,
@@ -395,7 +585,15 @@ export class Dispatcher {
         // Disposable children (design R2): the work products live in the
         // workdir/git and the digest in the task row — the session itself
         // has no reason to outlive the turn.
-        await this.#host.destroyWorker(sessionId, `task ${task.id} done`);
+        //
+        // ONLY a spawned worker. A `send` task's target is a session that
+        // existed before the task and must outlive it — for a panel member that
+        // is a long-lived ROLE-CHILD, and destroying it would tear down the
+        // fleet mid-goal every time a panel joined. Sends never reached this
+        // path until grouped sends started being watched here.
+        if (task.kind === "spawn") {
+          await this.#host.destroyWorker(sessionId, `task ${task.id} done`);
+        }
       } else {
         const failNow = Date.now();
         const failStatus = this.#store.dispatchFail(
@@ -410,7 +608,10 @@ export class Dispatcher {
             "task_blocked",
             `task ${task.id.slice(0, 8)} auto-BLOCKED after repeated worker errors. Last digest:\n${digest}`,
           );
-          await this.#host.destroyWorker(sessionId, `task ${task.id} blocked`);
+          // Same rule as the done path: only a spawned worker is ours to destroy.
+          if (task.kind === "spawn") {
+            await this.#host.destroyWorker(sessionId, `task ${task.id} blocked`);
+          }
         }
         // retryable requeue keeps the worker session for continuation.
         this.#host.audit(
@@ -425,12 +626,114 @@ export class Dispatcher {
     }
   }
 
+  /**
+   * The BARRIER (docs/collaborative-session-design.md §7 step 3).
+   *
+   * Called on every terminal transition of a grouped task, in place of that
+   * task's own completion event. Returns true when it handled the event —
+   * either by absorbing it (the group is still running) or by emitting the
+   * merged one (this member was the last).
+   *
+   * Fires on ALL-TERMINAL, not all-done. A panel where one reviewer errors must
+   * still join: waiting for success would hang the goal on its weakest member,
+   * and §7 is explicit that disagreement is shown rather than hidden — a failed
+   * reviewer is a form of that, so it appears in the merged digest as a failure
+   * rather than being silently dropped or blocking its peers forever.
+   *
+   * Idempotent by construction: the merged event is emitted by whichever member
+   * observes the last terminal transition, and a member can only transition to
+   * terminal once (the store's status guard), so exactly one emission happens.
+   */
+  #barrierAbsorb(task: DispatchTaskRow): boolean {
+    if (!task.groupId) return false;
+    const members = this.#store.dispatchGroupMembers(
+      task.accountId,
+      task.projectId,
+      task.groupId,
+    );
+    // A group of one is a fan-out of one; still joins, and the digest shape
+    // stays identical so a synthesizing orchestrator has no special case.
+    if (members.length === 0) return false;
+
+    // Absorb only this member's COMPLETION. `#emitEvent` is also how a wedged
+    // worker is reported (`waiting_approval`, still `running`), and that notice
+    // is the one message whose entire purpose is to reach a human — absorbing it
+    // left a panel member stuck with nobody told, until the lease expired.
+    // Checking THIS member's status rather than the event type keeps the rule in
+    // one place: a non-terminal task has not completed, so it is not the
+    // barrier's business.
+    const self = members.find((m) => m.id === task.id);
+    if (!self || !TERMINAL.has(self.status)) return false;
+
+    const pending = members.filter((m) => !TERMINAL.has(m.status));
+    if (pending.length > 0) {
+      this.#host.audit(
+        "dispatch.group_waiting",
+        `group=${task.groupId} done=${members.length - pending.length}/${members.length} last=${task.id}`,
+      );
+      return true; // absorbed — no event yet
+    }
+    this.#emitGroupEvent(task, members);
+    return true;
+  }
+
+  /**
+   * One merged event for a joined group: per-member outcome plus each member's
+   * digest, in fan-out order.
+   *
+   * Deliberately NOT a verdict. §7 forbids a silent auto-vote — the merge is
+   * mechanical (collect, label, order) and the *judgement* is the orchestrator's
+   * synthesis step or a human's. Counting votes here would bury exactly the
+   * disagreement the panel exists to surface.
+   */
+  #emitGroupEvent(last: DispatchTaskRow, members: readonly DispatchTaskRow[]): void {
+    const failed = members.filter((m) => m.status !== "done");
+    const lines = members.map((m, i) => {
+      const target = m.targetSession?.slice(0, 8) ?? m.workdir ?? "-";
+      // Position from the stored ordinal, falling back to array index for a
+      // group written before group_ordinal existed.
+      const pos = m.groupOrdinal ?? i + 1;
+      const head = `${pos}. ${m.status.toUpperCase()} — ${target} (${m.kind}/${m.shape})`;
+      const body = m.status === "done" ? m.resultDigest : (m.error ?? "no error recorded");
+      return `${head}
+${body ?? "no digest"}`;
+    });
+    const header =
+      failed.length === 0
+        ? `Panel of ${members.length} joined — all completed.`
+        : `Panel of ${members.length} joined — ${members.length - failed.length} completed, ${failed.length} did not.`;
+    this.#store.dispatchEventAdd({
+      accountId: last.accountId,
+      projectId: last.projectId,
+      // Attributed to the member that closed the barrier. The group id is in
+      // the digest, so the orchestrator can still correlate the whole fan-out.
+      taskId: last.id,
+      type: "group_done",
+      digest: [
+        header,
+        `group=${last.groupId}`,
+        "",
+        ...lines,
+        "",
+        "Every member is finished. Synthesize now: read each role's artifact from the blackboard, merge, and SHOW disagreement rather than resolving it silently.",
+      ].join("\n"),
+      now: Date.now(),
+    });
+    this.#host.audit(
+      "dispatch.group_joined",
+      `group=${last.groupId} members=${members.length} failed=${failed.length}`,
+    );
+    void this.#deliverPendingEvents();
+  }
+
   #emitEvent(
     task: DispatchTaskRow,
     type: "task_done" | "task_failed" | "task_blocked",
     digest: string,
     opts?: { keepPending?: boolean },
   ): void {
+    // A grouped task's completion is the barrier's business, not its own.
+    if (this.#barrierAbsorb(task)) return;
     this.#store.dispatchEventAdd({
       accountId: task.accountId,
       projectId: task.projectId,
@@ -467,11 +770,10 @@ export class Dispatcher {
             tenant.projectId,
             events,
           );
-          if (delivered) {
-            this.#store.dispatchEventsMarkDelivered(
-              events.map((e) => e.id),
-              Date.now(),
-            );
+          // Mark exactly what the host says it delivered. Marking the whole
+          // batch on a partial success would silently drop the rest.
+          if (delivered.length > 0) {
+            this.#store.dispatchEventsMarkDelivered([...delivered], Date.now());
           }
         } catch (err) {
           console.error(

@@ -1735,6 +1735,40 @@ describe("the orchestrator's fleet surface is scoped to its own children", () =>
     await expect(dispatch.interrupt(theirKid.id)).rejects.toThrow(/not a role-child/);
   });
 
+  test("a panel must target only its own children", async () => {
+    // A panel is N sends, so it inherits the same fence — enforced in the DEPS,
+    // not in the tool's target resolution, so a second caller of this closure
+    // cannot fan out across the tenant by passing raw ids.
+    const mine = await createGoal("sfp1");
+    const other = await createGoal("sfp2");
+    const myKids = childrenOf(await allSessions(), mine.id).map((k) => k.id);
+    const theirKid = childrenOf(await allSessions(), other.id)[0]!.id;
+    const dispatch = depsFor(mine.id).dispatch!;
+
+    expect(() =>
+      dispatch.enqueuePanel!({ targets: [...myKids, theirKid], prompt: "review", shape: "scout" }),
+    ).toThrow(/must all be role-children/);
+    // ...and one stranger poisons the whole fan-out rather than running a
+    // smaller panel than the owner approved.
+    expect(store.dispatchListForTenant(AUTH.accountId, AUTH.projectId, 20)).toHaveLength(0);
+  });
+
+  test("a panel over its own children queues one group, attributed to the goal", async () => {
+    const mine = await createGoal("sfp3");
+    const myKids = childrenOf(await allSessions(), mine.id).map((k) => k.id);
+    const { groupId, taskIds } = depsFor(mine.id).dispatch!.enqueuePanel!({
+      targets: myKids,
+      prompt: "review the diff",
+      shape: "scout",
+    });
+    expect(taskIds).toHaveLength(myKids.length);
+    const members = store.dispatchGroupMembers(AUTH.accountId, AUTH.projectId, groupId);
+    expect(members.map((m) => m.targetSession).sort()).toEqual([...myKids].sort());
+    expect(members.every((m) => m.createdBy === `orchestrator:${mine.id}`)).toBe(true);
+    // Ordinals are stored, so the joined digest's "member N" labels are stable.
+    expect(members.map((m) => m.groupOrdinal)).toEqual([1, 2]);
+  });
+
   test("its task board shows only its own dispatches", async () => {
     // The tenant board carries every session's targets and result digests —
     // the one place the scoping above would otherwise leak.
@@ -1763,6 +1797,7 @@ describe("ORCHESTRATOR_FLEET_TOOLS", () => {
     expect([...ORCHESTRATOR_FLEET_TOOLS].sort()).toEqual([
       "fleet_interrupt",
       "fleet_list",
+      "fleet_panel",
       "fleet_send",
       "fleet_tasks",
     ]);
@@ -1783,7 +1818,7 @@ describe("ORCHESTRATOR_FLEET_TOOLS", () => {
 
     expect(
       registered(buildFleetMcpServer(deps as never, { tools: ORCHESTRATOR_FLEET_TOOLS })),
-    ).toEqual(["fleet_interrupt", "fleet_list", "fleet_send", "fleet_tasks"]);
+    ).toEqual(["fleet_interrupt", "fleet_list", "fleet_panel", "fleet_send", "fleet_tasks"]);
     // ...and the unfiltered conductor build still gets everything, so `pick()`
     // is a filter rather than a truncation.
     expect(registered(buildFleetMcpServer(deps as never))).toEqual(
@@ -1794,11 +1829,16 @@ describe("ORCHESTRATOR_FLEET_TOOLS", () => {
   test("its send-class tools still trip the R3 hard approval gate", () => {
     // The subset must not accidentally become auto-approvable: keeping these
     // off allowedTools is what makes every dispatch show the owner the input.
+    // Derived from FLEET_SEND_TOOL_NAMES rather than hardcoded, so adding a
+    // send-class tool to the orchestrator's set can never quietly land outside
+    // the R3 gate — which is what `fleet_panel` would have done.
     for (const t of ORCHESTRATOR_FLEET_TOOLS) {
       const qualified = `mcp__codeoid_fleet__${t}`;
-      const isSend = t === "fleet_send" || t === "fleet_interrupt";
+      const isSend = (FLEET_SEND_TOOL_NAMES as readonly string[]).includes(t);
       expect(isFleetSendTool(qualified)).toBe(isSend);
     }
+    // ...and a panel specifically IS send-class: it is N dispatches at once.
+    expect(isFleetSendTool("mcp__codeoid_fleet__fleet_panel")).toBe(true);
   });
 });
 

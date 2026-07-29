@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Database } from "bun:sqlite";
 import { Store } from "../daemon/store.js";
 
 let tmp: string;
@@ -259,5 +260,102 @@ describe("dispatch events — durable conductor notifications", () => {
     expect(store.dispatchEventTenants()).toEqual([
       { accountId: "acc-b", projectId: "proj-b" },
     ]);
+  });
+});
+
+// ── The additive-migration path (upgrading an EXISTING database) ─────────────
+
+// Every other test here builds a fresh database, where `CREATE TABLE` declares
+// every column and the migration's ALTER path never runs. That blind spot let a
+// real bug ship to a live probe: a partial index on `group_id` was declared
+// inside the `CREATE TABLE IF NOT EXISTS` block, which is a no-op on an
+// existing database — so the index ran before `ADD COLUMN` and SQLite failed
+// the whole migration with "no such column: group_id". The daemon then refused
+// to open a database it had been using happily.
+//
+// These tests reproduce the upgrade by removing the columns from a built
+// database and reopening it, which is what an older binary's file looks like.
+describe("migration — opening a database written before dispatch groups", () => {
+  /** Strip the group columns + index, simulating a pre-panel database file. */
+  function downgrade(dbPath: string): void {
+    const db = new Database(dbPath);
+    db.exec("DROP INDEX IF EXISTS idx_dispatch_group");
+    db.exec("ALTER TABLE dispatch_tasks DROP COLUMN group_ordinal");
+    db.exec("ALTER TABLE dispatch_tasks DROP COLUMN group_id");
+    db.close();
+  }
+
+  const columns = (dbPath: string): string[] => {
+    const db = new Database(dbPath, { readonly: true });
+    const cols = (
+      db.prepare("PRAGMA table_info(dispatch_tasks)").all() as Array<{ name: string }>
+    ).map((c) => c.name);
+    db.close();
+    return cols;
+  };
+
+  test("adds the group columns in place, without losing existing rows", () => {
+    const dbPath = join(tmp, "upgrade.db");
+    const old = new Store(dbPath);
+    old.dispatchEnqueue({
+      id: "pre-upgrade-task",
+      ...TENANT,
+      kind: "send",
+      shape: "ship",
+      targetSession: "sess-1",
+      prompt: "queued before panels existed",
+      failureLimit: 2,
+      createdBy: "conductor",
+      now: Date.now(),
+    });
+    downgrade(dbPath);
+    expect(columns(dbPath)).not.toContain("group_id");
+
+    // Reopening must MIGRATE, not throw. This is the assertion that was missing.
+    const upgraded = new Store(dbPath);
+    expect(columns(dbPath)).toContain("group_id");
+    expect(columns(dbPath)).toContain("group_ordinal");
+
+    // The pre-upgrade row survives and reads as standalone — which is exactly
+    // the old behaviour: it keeps emitting its own completion event.
+    const row = upgraded.dispatchGet("pre-upgrade-task");
+    expect(row?.prompt).toBe("queued before panels existed");
+    expect(row?.groupId).toBeNull();
+    expect(row?.groupOrdinal).toBeNull();
+  });
+
+  test("is idempotent — opening an already-migrated database is a no-op", () => {
+    const dbPath = join(tmp, "twice.db");
+    new Store(dbPath);
+    downgrade(dbPath);
+    new Store(dbPath); // migrates
+    expect(() => new Store(dbPath)).not.toThrow(); // and again
+    expect(columns(dbPath).filter((c) => c === "group_id")).toHaveLength(1);
+  });
+
+  test("groups work on an upgraded database, not just a fresh one", () => {
+    const dbPath = join(tmp, "grouped.db");
+    new Store(dbPath);
+    downgrade(dbPath);
+    const upgraded = new Store(dbPath);
+
+    upgraded.dispatchEnqueueGroup(
+      ["a", "b"].map((t, i) => ({
+        id: `g-${t}`,
+        ...TENANT,
+        kind: "send" as const,
+        shape: "scout" as const,
+        targetSession: t,
+        prompt: "review",
+        failureLimit: 2,
+        createdBy: "orchestrator:goal-1",
+        groupId: "grp-1",
+        groupOrdinal: i + 1,
+        now: Date.now(),
+      })),
+    );
+    const members = upgraded.dispatchGroupMembers(TENANT.accountId, TENANT.projectId, "grp-1");
+    expect(members.map((m) => m.id)).toEqual(["g-a", "g-b"]);
+    expect(members.map((m) => m.groupOrdinal)).toEqual([1, 2]);
   });
 });
