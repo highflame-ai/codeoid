@@ -348,6 +348,12 @@ export const claudeConfigSchema = z.object({
  * namespace, and the daemon's `isValidArtifactKind` gives a specific error
  * naming the valid core kinds instead of an opaque schema rejection.
  */
+export const collaborationPanelsSchema = z.object({
+  ...base,
+  type: z.literal("collaboration.panels"),
+  sessionId: sessionIdField,
+});
+
 export const blackboardIndexSchema = z.object({
   ...base,
   type: z.literal("blackboard.index"),
@@ -610,6 +616,7 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   claudeConfigSchema,
   blackboardIndexSchema,
   blackboardReadSchema,
+  collaborationPanelsSchema,
   modelsListSchema,
   sessionExportSchema,
   sessionImportSchema,

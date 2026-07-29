@@ -87,6 +87,11 @@ export const CAPABILITIES = {
    */
   BLACKBOARD: "blackboard",
   /**
+   * Live collaboration panel state (`collaboration.panels`). Declared by the
+   * daemon so a client only offers panel UI when the data exists behind it.
+   */
+  PANELS: "collaboration.panels",
+  /**
    * Push via NATIVE device tokens (APNs/FCM) rather than Expo. Advertised by
    * the daemon when the `native` or `relay` transport is configured; a client
    * seeing this registers its native `getDevicePushTokenAsync` token (vs the
@@ -860,6 +865,7 @@ export type ClientMessage =
   | ClaudeConfigMsg
   | BlackboardIndexMsg
   | BlackboardReadMsg
+  | CollaborationPanelsMsg
   | ModelsListMsg
   | SessionExportMsg
   | SessionImportMsg
@@ -1480,6 +1486,23 @@ export interface BlackboardIndexMsg extends BaseClientMsg {
 }
 
 /**
+ * Live panel state for a collaboration — which fan-outs are in flight and how
+ * far along each member is (docs/collaborative-session-design.md §7).
+ *
+ * Exists because nothing else on the wire carries it. A panel's whole point is
+ * that N agents work AT ONCE, and a client could previously see the fleet and
+ * the joined result but never the parallelism itself — the most legible part of
+ * the feature was the one part invisible to the UI.
+ *
+ * `sessionId` may name the orchestrator or any of its role-children; the daemon
+ * resolves a child to its parent's goal, exactly as `blackboard.index` does.
+ */
+export interface CollaborationPanelsMsg extends BaseClientMsg {
+  type: "collaboration.panels";
+  sessionId: string;
+}
+
+/**
  * Read one artifact body from a collaboration's goal blackboard.
  *
  * Unlike the agent-facing `blackboard_read` MCP tool, this is NOT filtered by
@@ -1706,6 +1729,42 @@ export interface ClaudeConfigResultMsg {
   skills: ClaudeConfigSkill[];
   mcpServers: ClaudeConfigMcpServer[];
   hooks: ClaudeConfigHook[];
+}
+
+/** One member of a dispatch group, as a client sees it. */
+export interface CollaborationPanelMember {
+  /** Target session id. Null for a member with no session (a spawn-shaped one). */
+  sessionId: string | null;
+  /** 1-based position within the fan-out, as dispatched — stable across reads. */
+  ordinal: number;
+  /**
+   * Queue state. Terminal values are `done` / `failed` / `blocked`; the barrier
+   * fires once every member reaches one, which is why a client can render
+   * "2 of 3 settled" without knowing the barrier's rules.
+   */
+  status: "queued" | "claimed" | "running" | "done" | "failed" | "blocked";
+}
+
+/** One fan-out (a dispatch group) and how far along it is. */
+export interface CollaborationPanel {
+  groupId: string;
+  /** Epoch ms the fan-out was queued. */
+  createdAt: number;
+  /** Members in fan-out order. */
+  members: CollaborationPanelMember[];
+  /** How many members have reached a terminal state. */
+  settled: number;
+  /** True once every member is terminal — i.e. the barrier has joined. */
+  joined: boolean;
+}
+
+export interface CollaborationPanelsResultMsg {
+  type: "collaboration.panels.result";
+  requestId: string;
+  /** The GOAL session — the orchestrator, even when a child was asked for. */
+  sessionId: string;
+  /** Newest fan-out first. */
+  panels: CollaborationPanel[];
 }
 
 /** One index row: what exists, at what version, by whom — never a body. */
@@ -2129,6 +2188,7 @@ export type DaemonMessage =
   | ClaudeConfigResultMsg
   | BlackboardIndexResultMsg
   | BlackboardReadResultMsg
+  | CollaborationPanelsResultMsg
   | ModelsListResultMsg
   | SessionExportResultMsg
   | SessionImportResultMsg

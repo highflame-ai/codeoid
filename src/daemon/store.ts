@@ -1054,6 +1054,47 @@ export class Store {
   }
 
   /**
+   * Members of the most recent dispatch GROUPS created by one dispatcher, newest
+   * group first and ordinal-ordered within each — the client-facing panel view.
+   *
+   * Returns member rows rather than pre-grouped shapes so the caller decides how
+   * many groups to keep; `limitGroups` bounds the work in SQL via a subquery on
+   * distinct group ids, because an orchestrator that has run fifty panels should
+   * not stream fifty groups to a sidebar.
+   */
+  dispatchRecentGroups(
+    accountId: string,
+    projectId: string,
+    createdBy: string,
+    limitGroups = 5,
+  ): DispatchTaskRow[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT * FROM dispatch_tasks
+          WHERE account_id = ? AND project_id = ? AND created_by = ?
+            AND group_id IN (
+              SELECT group_id FROM dispatch_tasks
+               WHERE account_id = ? AND project_id = ? AND created_by = ?
+                 AND group_id IS NOT NULL
+               GROUP BY group_id
+               ORDER BY MAX(created_at) DESC
+               LIMIT ?
+            )
+          ORDER BY created_at DESC, group_ordinal ASC, id ASC`,
+      )
+      .all(
+        accountId,
+        projectId,
+        createdBy,
+        accountId,
+        projectId,
+        createdBy,
+        limitGroups,
+      ) as RawDispatchRow[];
+    return rows.map(rowToDispatchTask);
+  }
+
+  /**
    * Every member of one dispatch group, oldest first — the barrier's read
    * (docs/collaborative-session-design.md §7 step 3).
    *

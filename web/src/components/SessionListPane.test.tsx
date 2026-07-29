@@ -12,6 +12,16 @@ vi.mock("../state/connection", () => ({
 vi.mock("./files/FileTree", () => ({ default: () => null }));
 vi.mock("./AnalyticsPanel", () => ({ default: () => null }));
 vi.mock("./NewSessionModal", () => ({ openNewSessionModal: vi.fn() }));
+// Panel state is daemon-fed; drive it directly so the render is under test
+// rather than the polling transport.
+const livePanelMock = vi.hoisted(() => vi.fn<() => unknown>(() => null));
+const livePanelMemberMock = vi.hoisted(() => vi.fn<(id: string) => unknown>(() => null));
+vi.mock("../state/panels", () => ({
+  fetchPanels: vi.fn(() => Promise.resolve()),
+  resetPanels: vi.fn(),
+  livePanel: livePanelMock,
+  livePanelMember: livePanelMemberMock,
+}));
 
 import SessionListPane from "./SessionListPane";
 import { ingestSessionList, _resetSessionsForTest } from "../state/sessions";
@@ -193,5 +203,83 @@ describe("SessionListPane — fleet rendering", () => {
     const { getByText, getByTitle } = render(() => <SessionListPane />);
     expect(getByText("gone:search")).toBeTruthy();
     expect(getByTitle(/Read-only role/)).toBeTruthy();
+  });
+});
+
+describe("SessionListPane — live panel state", () => {
+  const FLEET = [
+    orchestrator("p", "refactor-auth", "make auth boring again"),
+    roleChild("p", "refactor-auth", "review", 1, false, "gemini"),
+    roleChild("p", "refactor-auth", "review", 2, false, "gemini"),
+    roleChild("p", "refactor-auth", "search", 1, false, "claude"),
+  ];
+
+  afterEach(() => {
+    livePanelMock.mockReturnValue(null);
+    livePanelMemberMock.mockReturnValue(null);
+  });
+
+  it("shows nothing when no fan-out is in flight", () => {
+    ingestSessionList(FLEET);
+    const { queryByText } = render(() => <SessionListPane />);
+    expect(queryByText(/panel/)).toBeNull();
+  });
+
+  it("shows settled-of-total on the orchestrator while a panel runs", () => {
+    livePanelMock.mockReturnValue({
+      groupId: "g1",
+      createdAt: 0,
+      settled: 2,
+      joined: false,
+      members: [
+        { sessionId: "p:review", ordinal: 1, status: "done" },
+        { sessionId: "p:review-2", ordinal: 2, status: "blocked" },
+        { sessionId: "p:search", ordinal: 3, status: "running" },
+      ],
+    });
+    ingestSessionList(FLEET);
+    const { getByText, getByRole } = render(() => <SessionListPane />);
+
+    expect(getByText("2/3")).toBeTruthy();
+    const bar = getByRole("progressbar");
+    expect(bar.getAttribute("aria-valuenow")).toBe("2");
+    expect(bar.getAttribute("aria-valuemax")).toBe("3");
+  });
+
+  it("counts SETTLED members, so a failed member does not stall the bar", () => {
+    // The barrier joins on all-terminal. Counting successes would leave a
+    // finished panel showing 2/3 forever — the exact confusion this removes.
+    livePanelMock.mockReturnValue({
+      groupId: "g1", createdAt: 0, settled: 3, joined: false,
+      members: [
+        { sessionId: "p:review", ordinal: 1, status: "done" },
+        { sessionId: "p:review-2", ordinal: 2, status: "failed" },
+        { sessionId: "p:search", ordinal: 3, status: "blocked" },
+      ],
+    });
+    ingestSessionList(FLEET);
+    const { getByText, getByTitle } = render(() => <SessionListPane />);
+    expect(getByText("3/3")).toBeTruthy();
+    expect(getByTitle(/including failures/)).toBeTruthy();
+  });
+
+  it("badges each participating child with its position and state", () => {
+    livePanelMock.mockReturnValue({
+      groupId: "g1", createdAt: 0, settled: 1, joined: false,
+      members: [{ sessionId: "x", ordinal: 1, status: "running" }],
+    });
+    livePanelMemberMock.mockImplementation((id: string) =>
+      id === "p:review" ? { ordinal: 1, status: "running" }
+      : id === "p:review-2" ? { ordinal: 2, status: "failed" }
+      : null,
+    );
+    ingestSessionList(FLEET);
+    const { getByTitle, queryAllByTitle } = render(() => <SessionListPane />);
+
+    expect(getByTitle("Panel member 1 — working")).toBeTruthy();
+    // A failed member is SHOWN, not hidden — same rule as the joined digest.
+    expect(getByTitle("Panel member 2 — failed")).toBeTruthy();
+    // The non-participating child carries no badge.
+    expect(queryAllByTitle(/Panel member/)).toHaveLength(2);
   });
 });
