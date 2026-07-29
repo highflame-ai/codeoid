@@ -27,7 +27,7 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CodexRpcProcess } from "../daemon/providers/codex/rpc.js";
-import { CodexProvider } from "../daemon/providers/codex/index.js";
+import { CodexProvider, describeCodexError } from "../daemon/providers/codex/index.js";
 import { MemoryMcpHttp, MEMORY_MCP_SERVER_NAME } from "../daemon/memory/mcp-http.js";
 import { McpRegistry } from "../daemon/mcp/registry.js";
 import type { RawMcpServerConfig } from "../config.js";
@@ -762,5 +762,54 @@ describe("codex resolution + registry", () => {
     // Equal versions (incl. a missing patch component) compare as 0.
     expect(compareNodeVersionsDesc("v18.0.0", "v18.0")).toBe(0);
     expect(compareNodeVersionsDesc("v18.1.0", "v18.1.0")).toBe(0);
+  });
+});
+
+// ── error reporting ─────────────────────────────────────────────────────────
+
+// This exists because a live role-child failed twice with the literal
+// `Error: [object Object]` and nothing anywhere said why. The `error`
+// notification carries an OBJECT on this wire, and the handler cast it
+// `as string` then String()'d it — destroying the cause at the one place whose
+// entire job was to report it. A backend whose failures are unreadable is a
+// backend nobody can debug.
+describe("describeCodexError", () => {
+  it("extracts a JSON-RPC-style error object rather than stringifying it", () => {
+    const out = describeCodexError({
+      error: { code: -32603, message: "model gpt-5.6-sol is not available to this account" },
+    });
+    expect(out).toContain("not available to this account");
+    expect(out).toContain("-32603");
+    expect(out).not.toContain("[object Object]");
+  });
+
+  it("prefers a direct message when present", () => {
+    expect(describeCodexError({ message: "stream closed" })).toBe("stream closed");
+  });
+
+  it("accepts a bare string error", () => {
+    expect(describeCodexError({ error: "rate limited" })).toBe("rate limited");
+  });
+
+  it("falls back to bounded JSON for an unrecognised shape", () => {
+    // Tolerating shape beats asserting it: a wrong assumption here costs the
+    // whole diagnostic, which is exactly what happened.
+    const out = describeCodexError({ error: { unexpected: { nested: true } } });
+    expect(out).toContain("unexpected");
+    expect(out).not.toContain("[object Object]");
+  });
+
+  it("never returns [object Object], whatever it is handed", () => {
+    for (const params of [
+      {},
+      { error: {} },
+      { error: null },
+      { message: 42 },
+      { error: { message: null, code: 7 } },
+    ] as Array<Record<string, unknown>>) {
+      const out = describeCodexError(params);
+      expect(out).not.toContain("[object Object]");
+      expect(out.length).toBeGreaterThan(0);
+    }
   });
 });
