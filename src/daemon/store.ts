@@ -417,10 +417,6 @@ export class Store {
         ON dispatch_tasks(status, created_at);
       CREATE INDEX IF NOT EXISTS idx_dispatch_tenant
         ON dispatch_tasks(account_id, project_id, created_at DESC);
-      -- The barrier reads "every member of this group" on each member's
-      -- terminal transition, so it is the hottest lookup a panel performs.
-      CREATE INDEX IF NOT EXISTS idx_dispatch_group
-        ON dispatch_tasks(group_id) WHERE group_id IS NOT NULL;
 
       -- Durable conductor notifications (task completions/failures). An event
       -- survives a crash between "worker finished" and "conductor saw it";
@@ -453,6 +449,18 @@ export class Store {
     // emitting its own completion event.
     this.#addColumnIfMissing("dispatch_tasks", "group_id", "TEXT");
     this.#addColumnIfMissing("dispatch_tasks", "group_ordinal", "INTEGER");
+    // AFTER the ALTERs, never inside the CREATE block above. On an existing
+    // database `CREATE TABLE IF NOT EXISTS` is a no-op, so an index declared
+    // there would run against a table that does not have the column yet and
+    // SQLite fails the whole migration with "no such column: group_id" — the
+    // daemon then refuses to open a database it had already been using. Every
+    // unit test builds a fresh database and is structurally blind to this; a
+    // live upgrade probe caught it, and `dispatch-store.test.ts` now reproduces
+    // the upgrade path so it can never regress silently again.
+    this.#db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_dispatch_group
+        ON dispatch_tasks(group_id) WHERE group_id IS NOT NULL;
+    `);
 
     // Pre-release single-row predecessor of provider_model_catalogs — never
     // shipped in a tagged version; drop from dev databases that ran the branch.
