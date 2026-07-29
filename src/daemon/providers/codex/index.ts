@@ -199,6 +199,40 @@ function sandboxPolicyWire(mode: SandboxMode, workdir: string): Record<string, u
   }
 }
 
+/**
+ * Best-effort human-readable text for a codex `error` notification.
+ *
+ * Deliberately tolerant of shape rather than asserting one: the payload has
+ * carried a bare `message` string in some versions and a JSON-RPC-style
+ * `{code, message, data}` object in others, and a wrong assumption here costs
+ * the entire diagnostic. Falls back to bounded JSON so an unrecognised shape
+ * still tells the operator something.
+ */
+export function describeCodexError(params: Record<string, unknown>): string {
+  const direct = params.message;
+  if (typeof direct === "string" && direct.length > 0) return direct;
+
+  const err = params.error;
+  if (typeof err === "string" && err.length > 0) return err;
+  if (err && typeof err === "object") {
+    const o = err as { message?: unknown; code?: unknown; data?: unknown };
+    const msg = typeof o.message === "string" ? o.message : undefined;
+    const code = o.code !== undefined ? ` (code ${String(o.code)})` : "";
+    if (msg) return `${msg}${code}`;
+    try {
+      return JSON.stringify(err).slice(0, 500);
+    } catch {
+      return "unserializable error payload";
+    }
+  }
+  try {
+    const dump = JSON.stringify(params);
+    return dump && dump !== "{}" ? dump.slice(0, 500) : "unspecified codex error";
+  } catch {
+    return "unspecified codex error";
+  }
+}
+
 export class CodexProvider implements SessionProvider {
   readonly id = "codex";
   readonly displayName = "Codex (OpenAI)";
@@ -652,8 +686,12 @@ export class CodexProvider implements SessionProvider {
         break;
       }
       case "error": {
-        const message = (params.message ?? params.error ?? "codex error") as string;
-        this.#push({ type: "error", message: String(message) });
+        // `params.error` is an OBJECT on this wire ({code, message, data}), so
+        // the previous `as string` + String() turned every codex failure into
+        // the literal "[object Object]" — the cause destroyed at the one place
+        // it was supposed to be reported. Observed live: a role-child failed
+        // twice with `Error: [object Object]` and nothing anywhere said why.
+        this.#push({ type: "error", message: `codex: ${describeCodexError(params)}` });
         break;
       }
       default:

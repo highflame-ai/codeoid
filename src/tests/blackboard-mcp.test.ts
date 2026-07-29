@@ -170,19 +170,69 @@ describe("the token carries the role's scope", () => {
 
   // No tool takes a goal id, so a child cannot address another goal even by
   // guessing one — the mount is the boundary.
-  test("no tool accepts a goal id, a session id, or a slot", async () => {
+  //
+  // This test used to forbid `slot` on EVERY tool, which was stricter than the
+  // design and made the feature wrong: §4 forbids a slot on `write` (so a writer
+  // cannot name a peer's slot and overwrite it), but a READER must be able to
+  // address the slot the index just showed it. With reads slotless, every
+  // multi-writer artifact was unreachable — observed live, an orchestrator read
+  // `findings` six times, was told it did not exist, and gave up on the board.
+  // The invariant is now stated per-tool instead of as one blanket rule.
+  test("no tool accepts a goal id or a session id", async () => {
     const token = mcp.mint(bb.forRole(GOAL, ident("review")));
     const list = await rpc(token, "tools/list");
     // Assert on PARAMETER names, not the serialized blob — the descriptions
     // legitimately mention "this goal" in prose.
-    const params = (list.body.result.tools as Array<{ inputSchema: { properties: object } }>)
-      .flatMap((t) => Object.keys(t.inputSchema.properties ?? {}))
-      .sort();
-    // The full parameter vocabulary of the surface is exactly two names.
-    expect([...new Set(params)]).toEqual(["content", "kind"]);
-    for (const forbidden of ["goal", "goalSessionId", "sessionId", "slot", "accountId"]) {
+    const tools = list.body.result.tools as Array<{
+      name: string;
+      inputSchema: { properties?: object };
+    }>;
+    const params = tools.flatMap((t) => Object.keys(t.inputSchema.properties ?? {})).sort();
+    // Scope is carried by the TOKEN, never named by the caller.
+    for (const forbidden of ["goal", "goalSessionId", "sessionId", "accountId", "projectId"]) {
       expect(params).not.toContain(forbidden);
     }
+    // The whole parameter vocabulary, so a new knob cannot appear unnoticed.
+    expect([...new Set(params)].sort()).toEqual(["content", "kind", "slot"]);
+  });
+
+  test("`slot` is readable but never writable — a writer cannot name a peer's slot", async () => {
+    const token = mcp.mint(bb.forRole(GOAL, ident("review")));
+    const list = await rpc(token, "tools/list");
+    const byName = new Map(
+      (list.body.result.tools as Array<{ name: string; inputSchema: { properties?: object } }>).map(
+        (t) => [t.name, Object.keys(t.inputSchema.properties ?? {})],
+      ),
+    );
+    // The asymmetry IS the security model (§4): the service picks a writer's
+    // slot from its own identity, so exposing one on write would hand a
+    // reviewer the ability to overwrite another reviewer's findings.
+    expect(byName.get("blackboard_write")).not.toContain("slot");
+    expect(byName.get("blackboard_read")).toContain("slot");
+  });
+
+  test("a reader can fetch a multi-writer artifact by the slot the index reports", async () => {
+    // The end-to-end shape of the live failure: two reviewers write `findings`,
+    // the index reports their slots, and a read must be able to use them.
+    bb.forRole(GOAL, ident("review", 1)).write("findings", "FIRST OPINION");
+    bb.forRole(GOAL, ident("review", 2)).write("findings", "SECOND OPINION");
+    const token = mcp.mint(bb.forRole(GOAL, ident("orchestrator")));
+
+    const idx = await call(token, "blackboard_index", {});
+    expect(textOf(idx.body)).toContain("review#2");
+
+    const first = await call(token, "blackboard_read", { kind: "findings", slot: "review" });
+    expect(textOf(first.body)).toContain("FIRST OPINION");
+    const second = await call(token, "blackboard_read", { kind: "findings", slot: "review#2" });
+    expect(textOf(second.body)).toContain("SECOND OPINION");
+
+    // And a slotless read now POINTS AT the slots instead of claiming the
+    // artifact does not exist — the message that misled a live orchestrator.
+    const slotless = await call(token, "blackboard_read", { kind: "findings" });
+    const text = textOf(slotless.body);
+    expect(text).toMatch(/writer slot\(s\) exist/);
+    expect(text).toContain("review#2");
+    expect(text).not.toMatch(/has been written on this goal yet/);
   });
 
   // Two goals, two tokens: neither can see the other's artifacts.

@@ -102,19 +102,48 @@ const TOOLS: ToolDef[] = [
   {
     name: "blackboard_read",
     description:
-      "Read the latest version of one artifact. Denied if your role's read scope doesn't include it.",
+      "Read the latest version of one artifact. Pass `slot` for a multi-writer kind — blackboard_index shows each entry's slot. Denied if your role's read scope doesn't include the kind.",
     jsonSchema: {
       type: "object",
-      properties: { kind: { type: "string", description: KIND_DESC } },
+      properties: {
+        kind: { type: "string", description: KIND_DESC },
+        // `read` takes a slot; `write` deliberately does NOT (§4 — a writer must
+        // not be able to name a peer's slot and overwrite it). Without this,
+        // every multi-writer artifact was unreachable: the index advertised
+        // `findings` in slot "review", and a slotless read looked in the
+        // singleton slot and reported it did not exist. Observed live — an
+        // orchestrator retried six times and concluded the board was broken.
+        slot: {
+          type: "string",
+          description:
+            "Writer slot, exactly as blackboard_index reports it (e.g. \"review\" or \"review#2\"). Omit for a single-writer kind.",
+        },
+      },
       required: ["kind"],
       additionalProperties: false,
     },
     run: (args, bb) => {
-      const r = bb.read(str(args.kind));
+      const kind = str(args.kind);
+      const slot = args.slot === undefined ? null : str(args.slot);
+      const r = bb.read(kind, slot);
       if (!r.ok) throw new Error(r.error);
-      if (!r.value) return `No "${str(args.kind)}" has been written on this goal yet.`;
+      if (!r.value) {
+        // Point at the slots that DO exist rather than a bare "not written":
+        // the caller usually asked for the right kind with the wrong slot, and
+        // the index already knows the answer.
+        const slots = bb
+          .index()
+          .filter((e) => e.kind === kind)
+          .map((e) => e.slot)
+          .filter((sl): sl is string => sl !== null);
+        if (slot === null && slots.length > 0) {
+          return `"${kind}" has no single-writer entry, but ${slots.length} writer slot(s) exist: ${slots.join(", ")}. Re-read with \`slot\`, or use blackboard_read_all to get every writer's entry at once.`;
+        }
+        return `No "${kind}"${slot ? ` in slot "${slot}"` : ""} has been written on this goal yet.`;
+      }
       const a = r.value;
-      return `${a.kind} v${a.version} (by ${a.authorRole ?? a.authorSub}):\n\n${a.content}`;
+      const where = a.slot ? ` slot ${a.slot}` : "";
+      return `${a.kind}${where} v${a.version} (by ${a.authorRole ?? a.authorSub}):\n\n${a.content}`;
     },
   },
   {
