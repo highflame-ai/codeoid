@@ -6,7 +6,7 @@ on:
 
 permissions:
   contents: write # create the GitHub Release
-  id-token: write # npm provenance (public repo)
+  id-token: write # npm OIDC Trusted Publishing + provenance
 
 jobs:
   npm:
@@ -34,55 +34,36 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      # Every publishable package ships at the SAME version, and the tag is that
+      # version. One gate replaces per-package version bookkeeping: if this
+      # passes, all three publishes below are known-correct and known-new.
+      - name: Verify workspace versions are in lockstep with the tag
+        run: bun run check:versions "${GITHUB_REF_NAME}"
+
       - name: Build web UI
         run: cd web && bun install --frozen-lockfile && bun run build
 
       - name: Test
         run: bun run test
 
-      - name: Verify package version matches the tag
-        run: |
-          PKG="$(node -p "require('./package.json').version")"
-          TAG="${GITHUB_REF_NAME#v}"
-          if [ "$PKG" != "$TAG" ]; then
-            echo "::error::package.json version ($PKG) does not match tag ($TAG)"
-            exit 1
-          fi
+      # Publish order is dependency order: protocol → core → the CLI, so each
+      # tarball's declared deps are resolvable on the registry the moment it
+      # lands. No NODE_AUTH_TOKEN anywhere — auth is the GitHub OIDC id-token
+      # via each package's Trusted Publisher (configured at npmjs.com), and
+      # provenance is generated from that same identity. `--access public` is
+      # not passed: every manifest carries `publishConfig.access`, so a manual
+      # publish and this pipeline run the exact same command.
+      #
+      # A new package NAME requires one manual bootstrap publish before a
+      # Trusted Publisher can be configured for it — see RELEASING.md.
+      - name: Publish @highflame/codeoid-protocol
+        run: cd packages/protocol && npm publish --provenance
 
-      # @codeoid/protocol is a workspace dependency of codeoid; publish it FIRST
-      # (only when its version is new) so codeoid's published dep resolves.
-      # NOTE: requires a separate npm Trusted Publisher configured for
-      # @codeoid/protocol at npmjs.com (same OIDC setup as codeoid) before the
-      # first release that introduces a new protocol version.
-      - name: Publish @codeoid/protocol (OIDC) — only if version is new
-        run: |
-          cd packages/protocol
-          VER="$(node -p "require('./package.json').version")"
-          if npm view "@codeoid/protocol@$VER" version >/dev/null 2>&1; then
-            echo "@codeoid/protocol@$VER already published — skipping"
-          else
-            npm publish --provenance --access public
-          fi
+      - name: Publish @highflame/codeoid-core
+        run: cd packages/core && npm publish --provenance
 
-      # @codeoid/core (client transport + store semantics — consumed by the
-      # mobile app from the registry; web uses the in-repo copy). Publishes
-      # after protocol (its peer dep) and needs its own Trusted Publisher +
-      # one-time manual bootstrap publish, same as protocol.
-      - name: Publish @codeoid/core (OIDC) — only if version is new
-        run: |
-          cd packages/core
-          VER="$(node -p "require('./package.json').version")"
-          if npm view "@codeoid/core@$VER" version >/dev/null 2>&1; then
-            echo "@codeoid/core@$VER already published — skipping"
-          else
-            npm publish --provenance --access public
-          fi
-
-      # No NODE_AUTH_TOKEN: auth comes from the GitHub OIDC id-token via npm's
-      # Trusted Publisher (configured on the package at npmjs.com). Provenance
-      # is generated automatically from the same OIDC identity.
-      - name: Publish codeoid to npm (OIDC Trusted Publishing)
-        run: npm publish --provenance --access public
+      - name: Publish @highflame/codeoid
+        run: npm publish --provenance
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

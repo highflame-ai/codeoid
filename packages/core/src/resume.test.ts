@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "bun:test";
 import { ResumeCursors } from "./resume.js";
-import type { ScrollbackReplayMsg } from "@codeoid/protocol";
+import type { ScrollbackReplayMsg } from "@highflame/codeoid-protocol";
 
 function replayFrame(overrides: Partial<ScrollbackReplayMsg> = {}): ScrollbackReplayMsg {
   return {

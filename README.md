@@ -16,7 +16,7 @@ Memory persists across sessions, so each agent inherits what the last one learne
 Every action is auditable, and with [ZeroID](https://github.com/highflame-ai/zeroid) every agent and sub-agent carries a cryptographic identity.
 
 ```bash
-bun install -g codeoid
+bun install -g @highflame/codeoid
 codeoid start --local          # no account, no login, no config — running in seconds
 ```
 
@@ -67,11 +67,15 @@ Don't mix the two.
 Codeoid runs on Bun, so install it with Bun (`npm` also works, as long as Bun is on your `PATH` — it's the runtime):
 
 ```bash
-bun install -g codeoid        # or: npm install -g codeoid
-codeoid --help                # confirm it's on your PATH
+bun install -g @highflame/codeoid   # or: npm install -g @highflame/codeoid
+codeoid --help                      # confirm it's on your PATH
 ```
 
 If `codeoid` isn't found afterward, your global-bin directory isn't on `PATH` — add Bun's (`~/.bun/bin`) to it, or use path **B**.
+
+> **Renamed.** codeoid used to publish as the unscoped `codeoid` package. It now
+> ships from the Highflame org as **`@highflame/codeoid`**; the old package is
+> deprecated on npm and stops at `0.3.4`. The command is still `codeoid`.
 
 **B. From source — to hack on it.**
 Clone, then **run `bun install` before anything else**:

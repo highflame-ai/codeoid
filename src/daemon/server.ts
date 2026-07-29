@@ -43,7 +43,7 @@ import {
 import { createHookBus } from "./hooks/bus.js";
 import type { CodeoidConfig } from "../config.js";
 import { CAPABILITIES, PROTOCOL_VERSION, type AuthContext, type DaemonMessage } from "../protocol/types.js";
-import { parseAuthMsg, parseClientMessage } from "@codeoid/protocol/schemas";
+import { parseAuthMsg, parseClientMessage } from "@highflame/codeoid-protocol/schemas";
 import type { AttachedClient } from "./session.js";
 import type { Frontend, FrontendContext } from "../frontends/types.js";
 import type { Server } from "node:http";

@@ -18,7 +18,7 @@
  * `MessageStore` and pass it to `MessageStore.ingest()`.
  */
 
-import type { ScrollbackReplayMsg } from "@codeoid/protocol";
+import type { ScrollbackReplayMsg } from "@highflame/codeoid-protocol";
 
 interface Cursor {
   key: string;

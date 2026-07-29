@@ -1,4 +1,4 @@
 /**
- * Re-export shim — URI sanitizers live in `@codeoid/core`.
+ * Re-export shim — URI sanitizers live in `@highflame/codeoid-core`.
  */
-export { safeImageUri, safeLinkUri } from "@codeoid/core";
+export { safeImageUri, safeLinkUri } from "@highflame/codeoid-core";

@@ -6,6 +6,58 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-29
+
+codeoid moves to the Highflame npm org. npm has no way to transfer a package
+between scopes, so all three published packages are renamed rather than moved,
+and their versions are unified onto one line so a single tag cuts the whole
+release.
+
+### Changed
+
+- **Renamed on npm** — the packages now ship from the `@highflame` scope:
+
+  | Before              | After                         |
+  | ------------------- | ----------------------------- |
+  | `codeoid`           | `@highflame/codeoid`          |
+  | `@codeoid/protocol` | `@highflame/codeoid-protocol` |
+  | `@codeoid/core`     | `@highflame/codeoid-core`     |
+
+  Install with `bun install -g @highflame/codeoid`. The binary is still
+  `codeoid`, and no runtime behaviour changed. The predecessor packages are
+  deprecated on npm and frozen at `0.3.4` / `0.2.0` / `0.2.0`; existing installs
+  keep resolving. Downstream consumers (the mobile app, any external importer)
+  need to update their dependency names — the import specifiers changed with the
+  package names.
+
+- **Lockstep versioning.** All three packages now ship at the same version from
+  one `vX.Y.Z` tag, replacing the per-package "publish only if the version is
+  new" logic in the release workflow. `bun run check:versions` enforces it on
+  every PR, in `bun run smoke`, and against the tag at release time;
+  `bun run version:set <x.y.z>` is the only sanctioned way to bump. The wire
+  protocol version (`PROTOCOL_VERSION`) remains a separate, independently-moving
+  number.
+
+### Fixed
+
+- **The client core was an undeclared dependency of the CLI.** The TUI renderer
+  and the Telegram frontend both statically import `formatCollaborationCost` from
+  the client core (added in 8e709ec, after `0.3.4`), but it was never listed in
+  the CLI's `dependencies` — only the protocol package was. A registry install
+  would have had no client core in `node_modules` and failed to resolve the
+  import on any code path reaching either module, `codeoid attach` among them.
+  Caught before it shipped: `0.3.4` predates the import and is unaffected. Now
+  declared, and verified by installing the packed tarball and resolving that
+  module.
+
+- **`web/` no longer needs the registry to install.** `web/` is a separate
+  install root, so the workspace packages come in as `file:` copies — but the
+  core package's peer range on the protocol package was still resolved from the
+  registry, meaning a fresh `bun install` in `web/` depended on what had been
+  published rather than on the working tree (and broke outright for a
+  not-yet-published package name). An `overrides` entry pins that peer to the
+  in-repo copy.
+
 ## [0.3.4] - 2026-07-23
 
 The governed pipeline becomes reliable end-to-end. Phase boundaries are now

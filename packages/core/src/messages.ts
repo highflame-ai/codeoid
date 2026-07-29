@@ -28,7 +28,7 @@ import type {
   SessionMessage,
   SessionMessageDelta,
   ToolState,
-} from "@codeoid/protocol";
+} from "@highflame/codeoid-protocol";
 import type { ResumeCursors } from "./resume.js";
 
 // =============================================================================

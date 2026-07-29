@@ -45,7 +45,7 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { ALL_SCOPES, type AuthContext } from "@codeoid/protocol";
+import { ALL_SCOPES, type AuthContext } from "@highflame/codeoid-protocol";
 import type { AuthMode, TokenVerifier } from "./verifier.js";
 
 /**

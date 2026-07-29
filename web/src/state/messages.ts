@@ -16,7 +16,7 @@
 
 import { batch, createMemo, createRoot } from "solid-js";
 import { createStore, produce } from "solid-js/store";
-import { dedupeReplay, mergeDeltaInto } from "@codeoid/core";
+import { dedupeReplay, mergeDeltaInto } from "@highflame/codeoid-core";
 
 import type { SessionMessage, SessionMessageDelta } from "../protocol/types";
 
@@ -181,7 +181,7 @@ export function applyDelta(delta: SessionMessageDelta): void {
         const target = buf[idx];
         if (!target) return;
 
-        // The merge semantics live in @codeoid/core so every frontend
+        // The merge semantics live in @highflame/codeoid-core so every frontend
         // accumulates transcripts identically; inside produce() the store
         // proxy records the same fine-grained paths the inline code did.
         mergeDeltaInto(target, delta);

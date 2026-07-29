@@ -11,7 +11,7 @@ import type {
   ScrollbackReplayMsg,
   SessionMessage,
   SessionMessageDelta,
-} from "@codeoid/protocol";
+} from "@highflame/codeoid-protocol";
 import { MessageStore, dedupeReplay, mergeDeltaInto } from "./messages.js";
 import { ResumeCursors } from "./resume.js";
 

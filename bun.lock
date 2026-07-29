@@ -3,12 +3,13 @@
   "configVersion": 0,
   "workspaces": {
     "": {
-      "name": "codeoid",
+      "name": "@highflame/codeoid",
       "dependencies": {
         "@anthropic-ai/claude-agent-sdk": "^0.3.220",
-        "@codeoid/protocol": "^0.2.0",
         "@google/generative-ai": "^0.24.1",
         "@grammyjs/auto-retry": "^2.0.2",
+        "@highflame/codeoid-core": "^0.4.0",
+        "@highflame/codeoid-protocol": "^0.4.0",
         "@highflame/sdk": "^0.3.18",
         "@xenova/transformers": "^2.17.2",
         "commander": "^13.0.0",
@@ -32,15 +33,15 @@
       },
     },
     "packages/core": {
-      "name": "@codeoid/core",
-      "version": "0.2.0",
+      "name": "@highflame/codeoid-core",
+      "version": "0.4.0",
       "peerDependencies": {
-        "@codeoid/protocol": "^0.1.0",
+        "@highflame/codeoid-protocol": "^0.4.0",
       },
     },
     "packages/protocol": {
-      "name": "@codeoid/protocol",
-      "version": "0.2.0",
+      "name": "@highflame/codeoid-protocol",
+      "version": "0.4.0",
       "peerDependencies": {
         "zod": "^4.0.0",
       },
@@ -140,10 +141,6 @@
 
     "@biomejs/cli-win32-x64": ["@biomejs/cli-win32-x64@1.9.4", "", { "os": "win32", "cpu": "x64" }, "sha512-8Y5wMhVIPaWe6jw2H+KlEm4wP/f7EW3810ZLmDlrEEy5KvBsb9ECEfu/kMWD484ijfQ8+nIi0giMgu9g1UAuuA=="],
 
-    "@codeoid/core": ["@codeoid/core@workspace:packages/core"],
-
-    "@codeoid/protocol": ["@codeoid/protocol@workspace:packages/protocol"],
-
     "@earendil-works/pi-agent-core": ["@earendil-works/pi-agent-core@0.80.6", "", { "dependencies": { "@earendil-works/pi-ai": "^0.80.6", "ignore": "7.0.5", "typebox": "1.1.38", "yaml": "2.9.0" } }, "sha512-Lvn89ko42h5ETUb6Z0Ku6ldskEqXaTdQBYvSa0+7bdG9V6rUEpXptv5e0OVZ1HDcvi8s6/2lGCQWsxKX+DFHNw=="],
 
     "@earendil-works/pi-ai": ["@earendil-works/pi-ai@0.80.6", "", { "dependencies": { "@anthropic-ai/sdk": "0.91.1", "@aws-sdk/client-bedrock-runtime": "3.1048.0", "@google/genai": "1.52.0", "@mistralai/mistralai": "2.2.6", "@opentelemetry/api": "1.9.0", "@smithy/node-http-handler": "4.7.3", "http-proxy-agent": "7.0.2", "https-proxy-agent": "7.0.6", "openai": "6.26.0", "partial-json": "0.1.7", "typebox": "1.1.38" }, "bin": { "pi-ai": "dist/cli.js" } }, "sha512-7xfLk8sANBp+bpPEbjoOZTbPxsa+++b1JXAoSJsNa3vbs9AHHEclmvg54XLQcxH+fuwaeti/g2jeIfJ+mVYLpA=="],
@@ -163,6 +160,10 @@
     "@grammyjs/auto-retry": ["@grammyjs/auto-retry@2.0.2", "", { "dependencies": { "debug": "^4.3.4" }, "peerDependencies": { "grammy": "^1.10.0" } }, "sha512-b4A4p5jlYDiQtW0c0FXYe11WMkYoiW+5rvOaDMCOk1h7Pu2SDl7B7gmFF8cthWCx2+M2nWLOsBxAgbBG4kKWYg=="],
 
     "@grammyjs/types": ["@grammyjs/types@3.25.0", "", {}, "sha512-iN9i5p+8ZOu9OMxWNcguojQfz4K/PDyMPOnL7PPCON+SoA/F8OKMH3uR7CVUkYfdNe0GCz8QOzAWrnqusQYFOg=="],
+
+    "@highflame/codeoid-core": ["@highflame/codeoid-core@workspace:packages/core"],
+
+    "@highflame/codeoid-protocol": ["@highflame/codeoid-protocol@workspace:packages/protocol"],
 
     "@highflame/sdk": ["@highflame/sdk@0.3.18", "", { "peerDependencies": { "@aws/bedrock-ai-agents-strands": ">=1.0.0", "@azure/ai-projects": ">=2.0.0", "@langchain/core": ">=0.3.0", "@langchain/langgraph": ">=1.0.0", "@opentelemetry/api": "^1.4.0", "@strands-agents/sdk": ">=1.0.0" }, "optionalPeers": ["@aws/bedrock-ai-agents-strands", "@azure/ai-projects", "@langchain/core", "@langchain/langgraph", "@opentelemetry/api", "@strands-agents/sdk"] }, "sha512-+crXG4VCkrmAfBUGe4eDIE0ICCVLswL5MsXKCHu7ZnBv/s/ubziNrAdqAZPtRAkpwo6FomtvDqHSxk7ORuR0+g=="],
 

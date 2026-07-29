@@ -24,8 +24,8 @@ import type {
   DaemonMessage,
   ResponseErrorMsg,
   ResponseOkMsg,
-} from "@codeoid/protocol";
-import { PROTOCOL_VERSION } from "@codeoid/protocol";
+} from "@highflame/codeoid-protocol";
+import { PROTOCOL_VERSION } from "@highflame/codeoid-protocol";
 
 export type ClientStatus =
   | { kind: "idle" }

@@ -1,4 +1,4 @@
-# @codeoid/core
+# @highflame/codeoid-core
 
 Framework-agnostic client core for the [Codeoid](https://github.com/highflame-ai/codeoid)
 daemon — everything a frontend needs except the pixels:
@@ -20,8 +20,8 @@ daemon — everything a frontend needs except the pixels:
   `identityLabel`, …), approval scanning, slash-command parsing.
 
 ```ts
-import { CodeoidClient, MessageStore, ResumeCursors } from "@codeoid/core";
-import { CAPABILITIES } from "@codeoid/protocol";
+import { CodeoidClient, MessageStore, ResumeCursors } from "@highflame/codeoid-core";
+import { CAPABILITIES } from "@highflame/codeoid-protocol";
 
 const store = new MessageStore();
 const cursors = new ResumeCursors();
@@ -36,4 +36,4 @@ await client.connect();
 ```
 
 Ships TypeScript source (every consumer transpiles TS — Bun, Vite, Metro).
-`@codeoid/protocol` is a peer dependency.
+`@highflame/codeoid-protocol` is a peer dependency.

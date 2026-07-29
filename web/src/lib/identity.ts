@@ -1,5 +1,5 @@
 /**
- * Identity helpers — provenance labelling lives in `@codeoid/core` (shared
+ * Identity helpers — provenance labelling lives in `@highflame/codeoid-core` (shared
  * with the TUI and mobile); only the Tailwind colour mapping is web-local.
  */
 import type { IdentityType } from "../protocol/types";
@@ -9,7 +9,7 @@ export {
   sessionAgentLabel,
   shortSub,
   truncateWimseUri,
-} from "@codeoid/core";
+} from "@highflame/codeoid-core";
 
 /** Tailwind classes for the role pill — match the TUI palette intent. */
 export function roleColorClass(role: string): string {

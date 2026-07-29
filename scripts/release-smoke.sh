@@ -5,9 +5,10 @@
 # Runs everything CI runs (lint / typecheck / test / build for the daemon and
 # the web app) PLUS the layers CI can't:
 #
-#   • version coherence — the built `codeoid --version` matches package.json
-#     (guards against the hand-synced version string drifting from the
-#     published package);
+#   • version coherence — the built `codeoid --version` matches package.json,
+#     and every publishable workspace package is in lockstep with it (guards
+#     against the hand-synced version string drifting from the published
+#     package, and against a partial `version:set`);
 #   • daemon boot probe — the actual built bundle starts and binds its port
 #     (catches runtime-boot breakage a `bun build` alone won't: bad dynamic
 #     imports, top-level-await regressions, ESM path mistakes);
@@ -105,6 +106,7 @@ echo
 
 # ── Daemon gates (mirror CI) ──────────────────────────────────────────────────
 run_stage "daemon: lint"      bun run lint
+run_stage "workspace: versions" bun run check:versions
 run_stage "daemon: typecheck" bun run typecheck
 run_stage "daemon: test"      bun run test
 run_stage "daemon: build"     bun run build

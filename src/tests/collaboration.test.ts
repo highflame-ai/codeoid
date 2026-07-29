@@ -41,7 +41,7 @@ import { ProviderRegistry } from "../daemon/providers/registry.js";
 import type { ProviderEvent } from "../daemon/providers/interface.js";
 import { Blackboard } from "../daemon/blackboard/service.js";
 import { BlackboardStore } from "../daemon/blackboard/store.js";
-import { parseClientMessage } from "@codeoid/protocol/schemas";
+import { parseClientMessage } from "@highflame/codeoid-protocol/schemas";
 import { SessionManager } from "../daemon/session-manager.js";
 import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";

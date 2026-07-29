@@ -28,7 +28,7 @@ import type {
 	ToolInfo,
 	ToolState,
 } from "../../protocol/types.js";
-import { formatCollaborationCost } from "@codeoid/core";
+import { formatCollaborationCost } from "@highflame/codeoid-core";
 import { renderMarkdown, type Segment } from "../markdown.js";
 import { computeDiff, truncateToolOutput } from "../diff.js";
 import { fileUri, maybeLink } from "../osc8.js";

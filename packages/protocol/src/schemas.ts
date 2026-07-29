@@ -3,8 +3,8 @@
  * surface. The daemon validates every frame against these before acting on
  * it; clients may use them to pre-validate.
  *
- * Import via the subpath export — `@codeoid/protocol/schemas` — which keeps
- * the root package (`@codeoid/protocol`) dependency-free for type-only
+ * Import via the subpath export — `@highflame/codeoid-protocol/schemas` — which keeps
+ * the root package (`@highflame/codeoid-protocol`) dependency-free for type-only
  * consumers. `zod` is an optional peer dependency: only installs that import
  * this module need it.
  *
