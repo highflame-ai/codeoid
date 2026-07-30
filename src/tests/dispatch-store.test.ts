@@ -279,7 +279,11 @@ describe("migration — opening a database written before dispatch groups", () =
   /** Strip the group columns + index, simulating a pre-panel database file. */
   function downgrade(dbPath: string): void {
     const db = new Database(dbPath);
+    // Both group indexes reference the columns below; SQLite refuses to drop a
+    // column an index depends on, so they go first. The REAL migration only ever
+    // ADDS, so this ordering is an artifact of simulating a downgrade.
     db.exec("DROP INDEX IF EXISTS idx_dispatch_group");
+    db.exec("DROP INDEX IF EXISTS idx_dispatch_panels");
     db.exec("ALTER TABLE dispatch_tasks DROP COLUMN group_ordinal");
     db.exec("ALTER TABLE dispatch_tasks DROP COLUMN group_id");
     db.close();
@@ -357,5 +361,83 @@ describe("migration — opening a database written before dispatch groups", () =
     const members = upgraded.dispatchGroupMembers(TENANT.accountId, TENANT.projectId, "grp-1");
     expect(members.map((m) => m.id)).toEqual(["g-a", "g-b"]);
     expect(members.map((m) => m.groupOrdinal)).toEqual([1, 2]);
+  });
+});
+
+// ── Index coverage for the polled panel query ───────────────────────────────
+
+// `dispatchRecentGroups` backs a client poll that runs every few seconds while a
+// collaboration is focused. Without a supporting index SQLite could only use the
+// (account, project) index and then filter `created_by` row by row across the
+// tenant's ENTIRE task history — measured at 17.8ms per call over 20k tasks, and
+// growing with history rather than with panel count. Asserting the PLAN rather
+// than a duration, because a timing assertion in CI is a flake generator.
+describe("dispatchRecentGroups is index-covered", () => {
+  test("seeks on (account, project, created_by) instead of scanning history", () => {
+    const dbPath = join(tmp, "plan.db");
+    const s = new Store(dbPath);
+    // A realistic long-lived daemon: mostly ungrouped conductor tasks, a few panels.
+    for (let i = 0; i < 300; i++) {
+      s.dispatchEnqueue({
+        id: `bulk-${i}`, ...TENANT, kind: "send", shape: "ship",
+        targetSession: "t", prompt: "p", failureLimit: 2,
+        createdBy: "conductor:acc-a/proj-a", now: i,
+      });
+    }
+    s.dispatchEnqueueGroup(
+      [1, 2, 3].map((n) => ({
+        id: `grp-${n}`, ...TENANT, kind: "send" as const, shape: "scout" as const,
+        targetSession: `kid-${n}`, prompt: "review", failureLimit: 2,
+        createdBy: "orchestrator:goal-1", groupId: "g1", groupOrdinal: n, now: 9_000,
+      })),
+    );
+
+    const db = new Database(dbPath, { readonly: true });
+    const plan = (
+      db
+        .prepare(
+          `EXPLAIN QUERY PLAN
+           SELECT * FROM dispatch_tasks
+             WHERE account_id = ? AND project_id = ? AND created_by = ?
+               AND group_id IN (
+                 SELECT group_id FROM dispatch_tasks
+                  WHERE account_id = ? AND project_id = ? AND created_by = ?
+                    AND group_id IS NOT NULL
+                  GROUP BY group_id ORDER BY MAX(created_at) DESC LIMIT ?)
+             ORDER BY created_at DESC, group_ordinal ASC, id ASC`,
+        )
+        .all(
+          TENANT.accountId, TENANT.projectId, "orchestrator:goal-1",
+          TENANT.accountId, TENANT.projectId, "orchestrator:goal-1", 5,
+        ) as Array<{ detail: string }>
+    ).map((r) => r.detail);
+    db.close();
+
+    // Both the outer query and the group subquery must use it — the subquery is
+    // the one that would otherwise walk every task the tenant has ever queued.
+    const seeks = plan.filter((d) => d.includes("idx_dispatch_panels"));
+    expect(seeks.length).toBeGreaterThanOrEqual(2);
+    expect(plan.some((d) => /SCAN dispatch_tasks(?!.*USING)/.test(d))).toBe(false);
+
+    // ...and it still returns the right rows, in fan-out order.
+    const members = s.dispatchRecentGroups(
+      TENANT.accountId, TENANT.projectId, "orchestrator:goal-1", 5,
+    );
+    expect(members.map((m) => m.groupOrdinal)).toEqual([1, 2, 3]);
+    expect(members.every((m) => m.createdBy === "orchestrator:goal-1")).toBe(true);
+  });
+
+  test("never returns another dispatcher's groups", () => {
+    const s = new Store(join(tmp, "scoped.db"));
+    s.dispatchEnqueueGroup([
+      { id: "a1", ...TENANT, kind: "send", shape: "scout", targetSession: "k", prompt: "p",
+        failureLimit: 2, createdBy: "orchestrator:goal-A", groupId: "gA", groupOrdinal: 1, now: 1 },
+      { id: "b1", ...TENANT, kind: "send", shape: "scout", targetSession: "k", prompt: "p",
+        failureLimit: 2, createdBy: "orchestrator:goal-B", groupId: "gB", groupOrdinal: 1, now: 2 },
+    ]);
+    const mine = s.dispatchRecentGroups(TENANT.accountId, TENANT.projectId, "orchestrator:goal-A");
+    expect(mine.map((m) => m.id)).toEqual(["a1"]);
+    // And a different tenant sees nothing, group id or not.
+    expect(s.dispatchRecentGroups("acc-x", "proj-x", "orchestrator:goal-A")).toEqual([]);
   });
 });

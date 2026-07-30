@@ -14,12 +14,12 @@ vi.mock("./AnalyticsPanel", () => ({ default: () => null }));
 vi.mock("./NewSessionModal", () => ({ openNewSessionModal: vi.fn() }));
 // Panel state is daemon-fed; drive it directly so the render is under test
 // rather than the polling transport.
-const livePanelMock = vi.hoisted(() => vi.fn<() => unknown>(() => null));
+const liveProgressMock = vi.hoisted(() => vi.fn<() => unknown>(() => null));
 const livePanelMemberMock = vi.hoisted(() => vi.fn<(id: string) => unknown>(() => null));
 vi.mock("../state/panels", () => ({
   fetchPanels: vi.fn(() => Promise.resolve()),
   resetPanels: vi.fn(),
-  livePanel: livePanelMock,
+  liveProgress: liveProgressMock,
   livePanelMember: livePanelMemberMock,
 }));
 
@@ -215,7 +215,7 @@ describe("SessionListPane — live panel state", () => {
   ];
 
   afterEach(() => {
-    livePanelMock.mockReturnValue(null);
+    liveProgressMock.mockReturnValue(null);
     livePanelMemberMock.mockReturnValue(null);
   });
 
@@ -226,20 +226,9 @@ describe("SessionListPane — live panel state", () => {
   });
 
   it("shows settled-of-total on the orchestrator while a panel runs", () => {
-    livePanelMock.mockReturnValue({
-      groupId: "g1",
-      createdAt: 0,
-      settled: 2,
-      joined: false,
-      members: [
-        { sessionId: "p:review", ordinal: 1, status: "done" },
-        { sessionId: "p:review-2", ordinal: 2, status: "blocked" },
-        { sessionId: "p:search", ordinal: 3, status: "running" },
-      ],
-    });
+    liveProgressMock.mockReturnValue({ settled: 2, total: 3, panels: 1 });
     ingestSessionList(FLEET);
     const { getByText, getByRole } = render(() => <SessionListPane />);
-
     expect(getByText("2/3")).toBeTruthy();
     const bar = getByRole("progressbar");
     expect(bar.getAttribute("aria-valuenow")).toBe("2");
@@ -249,25 +238,26 @@ describe("SessionListPane — live panel state", () => {
   it("counts SETTLED members, so a failed member does not stall the bar", () => {
     // The barrier joins on all-terminal. Counting successes would leave a
     // finished panel showing 2/3 forever — the exact confusion this removes.
-    livePanelMock.mockReturnValue({
-      groupId: "g1", createdAt: 0, settled: 3, joined: false,
-      members: [
-        { sessionId: "p:review", ordinal: 1, status: "done" },
-        { sessionId: "p:review-2", ordinal: 2, status: "failed" },
-        { sessionId: "p:search", ordinal: 3, status: "blocked" },
-      ],
-    });
+    liveProgressMock.mockReturnValue({ settled: 3, total: 3, panels: 1 });
     ingestSessionList(FLEET);
     const { getByText, getByTitle } = render(() => <SessionListPane />);
     expect(getByText("3/3")).toBeTruthy();
     expect(getByTitle(/including failures/)).toBeTruthy();
   });
 
+  it("aggregates when TWO fan-outs are live at once", () => {
+    // Concurrent panels are legal — an orchestrator can start a second while the
+    // first resolves. Showing one panel's numbers understates the outstanding work.
+    liveProgressMock.mockReturnValue({ settled: 1, total: 5, panels: 2 });
+    ingestSessionList(FLEET);
+    const { getByText, getByTitle } = render(() => <SessionListPane />);
+    expect(getByText(/panels ×2/)).toBeTruthy();
+    expect(getByText("1/5")).toBeTruthy();
+    expect(getByTitle(/2 panels in flight/)).toBeTruthy();
+  });
+
   it("badges each participating child with its position and state", () => {
-    livePanelMock.mockReturnValue({
-      groupId: "g1", createdAt: 0, settled: 1, joined: false,
-      members: [{ sessionId: "x", ordinal: 1, status: "running" }],
-    });
+    liveProgressMock.mockReturnValue({ settled: 1, total: 2, panels: 1 });
     livePanelMemberMock.mockImplementation((id: string) =>
       id === "p:review" ? { ordinal: 1, status: "running" }
       : id === "p:review-2" ? { ordinal: 2, status: "failed" }
@@ -275,11 +265,9 @@ describe("SessionListPane — live panel state", () => {
     );
     ingestSessionList(FLEET);
     const { getByTitle, queryAllByTitle } = render(() => <SessionListPane />);
-
     expect(getByTitle("Panel member 1 — working")).toBeTruthy();
     // A failed member is SHOWN, not hidden — same rule as the joined digest.
     expect(getByTitle("Panel member 2 — failed")).toBeTruthy();
-    // The non-participating child carries no badge.
     expect(queryAllByTitle(/Panel member/)).toHaveLength(2);
   });
 });
