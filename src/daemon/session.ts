@@ -1840,6 +1840,52 @@ export class Session {
     this.#broadcastInfoUpdate();
   }
 
+  /**
+   * Drop every sub-agent still registered and revoke its ZeroID identity.
+   *
+   * A Task sub-agent cannot outlive the turn that spawned it, so once that turn
+   * ends — or the provider it was running under goes away — any surviving entry
+   * is stale by definition.
+   *
+   * Before this existed the ONLY cleanup path was the provider's
+   * `subagent_stop` event, which originates in the SDK's SubagentStop hook.
+   * That hook cannot fire when the query is aborted mid-turn (interrupt,
+   * setModel, rotate, provider switch — all of which call
+   * `#abortController.abort()`), so each abort permanently orphaned every
+   * in-flight sub-agent. Three consequences, all of which this fixes:
+   *
+   *   1. `subagentSnapshot` (→ `/who`, `toInfo().subagents`) only ever grew —
+   *      the reported count climbed across turns and never came back down.
+   *   2. `#subagents` + `#subagentRegistrations` grew unbounded for the
+   *      lifetime of a long-lived session.
+   *   3. Worst: each orphan kept a LIVE delegated ZeroID token. Revocation is
+   *      supposed to ride the sub-agent's own stop; instead it waited for
+   *      `deactivateSessionAgent`'s cascade at session destroy, so a dead
+   *      sub-agent's credential stayed valid for as long as the session lived.
+   *
+   * Idempotent and cheap — a no-op when the map is empty, which is the common
+   * case. Double-revocation is safe: `deactivateSubagent` no-ops on an id it
+   * has already dropped, so a `subagent_stop` arriving after a sweep (or a
+   * sweep racing a trailing stop) costs nothing.
+   */
+  #sweepStaleSubagents(reason: string): void {
+    if (this.#subagents.size === 0) return;
+    const orphaned = [...this.#subagents.keys()];
+    for (const agentId of orphaned) {
+      // Fire-and-forget, matching the subagent_stop path: revocation must never
+      // block a turn boundary, and deactivateSubagent logs its own failures.
+      void this.#identityManager?.deactivateSubagent(this.id, agentId);
+      this.#subagentRegistrations.delete(agentId);
+      this.#subagents.delete(agentId);
+    }
+    // Worth a line: a non-empty sweep means a SubagentStop never arrived, which
+    // is expected on abort but would otherwise be invisible.
+    console.log(
+      `[codeoid/session ${this.id}] swept ${orphaned.length} stale sub-agent(s) at ${reason}`,
+    );
+    this.#broadcastInfoUpdate();
+  }
+
   async #teardownProvider(): Promise<void> {
     // Capture before nulling: provider.teardown() may trigger onRecoveryNeeded,
     // which installs a new #eventConsumerTask. Awaiting the snapshot drains
@@ -1851,6 +1897,10 @@ export class Session {
     this.#eventConsumerTask = null;
     await this.#provider.teardown();
     try { await taskToAwait; } catch { /* consumer handles its own errors */ }
+    // teardown() aborts the SDK query, so any sub-agent still in flight will
+    // never get its SubagentStop hook. This is the setModel / rotate /
+    // switchProvider path — the session survives, so the orphans would too.
+    this.#sweepStaleSubagents("provider teardown");
     // The drained consumer's `finally` skips its own idle reset here: we nulled
     // #activeRun above, so its run-ownership guard (`#activeRun === run`) is
     // false. Without this, tearing a provider down mid-turn (setModel / rotate)
@@ -1917,12 +1967,16 @@ export class Session {
     if (run) {
       try {
         await run.interrupt();
+        // Interrupting kills the turn, so every sub-agent it spawned is done
+        // whether or not the SDK got to run their stop hooks.
+        this.#sweepStaleSubagents("interrupt");
         if (this.#status !== "error") this.#setStatus("idle");
         return;
       } catch {
         // fall through to hard abort
       }
     }
+    this.#sweepStaleSubagents("interrupt");
     if (this.#status !== "error") this.#setStatus("idle");
   }
 
@@ -3762,6 +3816,10 @@ export class Session {
       case "turn_done": {
         this.#accumulator.handleEvent(event);
         this.#recordTurnFromResult(event.result);
+        // The turn is over, so no Task sub-agent it spawned can still be alive.
+        // Normally every one of them already emitted subagent_stop and this is a
+        // no-op; it's the backstop for the ones whose hook never fired.
+        this.#sweepStaleSubagents("turn end");
         // Hook seam: observe-only (git-checkpoint per turn, usage export).
         this.#hookBus?.emit("after_turn", this.#hookContext(), {
           result: event.result,
