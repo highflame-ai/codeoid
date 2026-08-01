@@ -1747,8 +1747,21 @@ export class Session {
       this.#persistAndBuffer(midTurnMsg);
       this.#broadcastRaw(midTurnMsg);
       this.#accumulator.pushUserTurn(effectivePrompt);
-      this.#pendingMidTurnCount++;
-      this.#activeRun.pushMidTurn(effectivePrompt, effectivePriority ?? "now");
+      // Count ONLY pushes that start a new query, because only those produce an
+      // extra turn_done for #consumeEvents to absorb. A "later" push merges into
+      // the running turn (ClaudeProvider: `shouldQuery = priority !== "later"`),
+      // so counting it made the consumer treat the turn's REAL terminal
+      // turn_done as an intermediate boundary: it decremented, re-asserted
+      // "thinking", and `continue`d — waiting forever for a turn_done that was
+      // never going to be emitted.
+      //
+      // That is the stuck spinner. The model has answered, but the session sits
+      // at "thinking" until the 5-minute stall watchdog fires or the next send
+      // closes the queue. It also strands the turn's sub-agents and tools:
+      // neither the mid-turn flush nor the consumer's finally reconciles them,
+      // because the loop never exits.
+      if (effectivePriority !== "later") this.#pendingMidTurnCount++;
+      this.#activeRun.pushMidTurn(effectivePrompt, effectivePriority);
       // Keep waiting_approval visible — the approval is still pending and
       // every frontend keys its approval bar off it; the queued text is
       // consumed after the user answers.
@@ -3363,6 +3376,11 @@ export class Session {
           this.#recordTurnFromResult(event.result);
           // Flush per-turn accumulators so the continuation turn starts clean.
           this.#completeActiveTools();
+          // Same boundary, same reasoning: the sub-agents of the partial turn
+          // are done with it. This branch `continue`s without dispatching to
+          // #handleProviderEvent, so it is the only place that can reconcile
+          // them for an absorbed mid-turn boundary.
+          this.#sweepStaleSubagents("mid-turn boundary");
           this.#flushActiveAssistant();
           this.#finalizeActiveThinking();
           this.#chunker?.onTurnEnd();
@@ -3394,6 +3412,17 @@ export class Session {
     } finally {
       this.#pendingMidTurnCount = 0; // safety: reset on any exit path
       this.#completeActiveTools();
+      // Sub-agent reconciliation belongs beside the tool reconciliation: this
+      // finally is the one path every turn exit goes through — clean turn_done,
+      // error, stall recovery, ownership loss. #completeActiveTools has always
+      // existed here because provider events can be lost; sub-agents were simply
+      // never added to the same backstop.
+      this.#sweepStaleSubagents("turn exit");
+      // Tell the provider this turn's stream has no reader anymore. Without it
+      // the queue stays open and unconsumed until the NEXT turn replaces it, so
+      // a late event is silently buffered into a queue nobody will ever drain.
+      // Closing converts that invisible loss into the provider's carryover path.
+      try { run.endTurn?.(); } catch { /* best-effort */ }
       this.#flushActiveAssistant();
       this.#finalizeActiveThinking();
       this.#chunker?.onTurnEnd();
@@ -3816,10 +3845,9 @@ export class Session {
       case "turn_done": {
         this.#accumulator.handleEvent(event);
         this.#recordTurnFromResult(event.result);
-        // The turn is over, so no Task sub-agent it spawned can still be alive.
-        // Normally every one of them already emitted subagent_stop and this is a
-        // no-op; it's the backstop for the ones whose hook never fired.
-        this.#sweepStaleSubagents("turn end");
+        // No sweep here: a terminal turn_done breaks #consumeEvents, whose
+        // finally reconciles sub-agents alongside tools. Sweeping here too would
+        // just be a redundant pass a few statements earlier.
         // Hook seam: observe-only (git-checkpoint per turn, usage export).
         this.#hookBus?.emit("after_turn", this.#hookContext(), {
           result: event.result,

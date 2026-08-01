@@ -248,6 +248,22 @@ export interface TurnRun {
   interrupt(): Promise<void>;
   /** Push a message mid-turn (ClaudeProvider only). */
   pushMidTurn?(content: string, priority: "now" | "next" | "later"): void;
+  /**
+   * Signal that the consumer has stopped reading `events` — called from
+   * Session's turn-exit path, exactly once per run.
+   *
+   * Keep-warm providers hold one queue per turn but only close it when the NEXT
+   * turn replaces it. Between those points the queue is open with nobody
+   * draining it, so a late event (a `SubagentStop` hook resolving after the
+   * result message, a trailing tool_result) is accepted and then discarded
+   * unread — the silent loss that leaves sub-agents dangling and tools stuck
+   * "running". Closing here turns that into an observable, recoverable case:
+   * the provider sees the closed queue and can buffer or log instead.
+   *
+   * Optional and best-effort — providers with no per-turn queue omit it, and it
+   * must never throw into the consumer's finally.
+   */
+  endTurn?(): void;
 }
 
 // ── ModelInfo ─────────────────────────────────────────────────────────────────
