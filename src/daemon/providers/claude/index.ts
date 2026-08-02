@@ -119,6 +119,25 @@ export interface ClaudeProviderInit {
   onRecoveryNeeded?: (content: string) => void;
 }
 
+/**
+ * Events safe to replay into a LATER turn when they can't be delivered now.
+ *
+ * Both are addressed by an id the Session tracks (`agentId`, `sdkToolUseId`)
+ * and both handlers no-op on an unknown id, so arriving late is harmless —
+ * whereas losing them leaves a dangling sub-agent (with a live delegated token)
+ * or a tool stuck "running". Deliberately excludes `turn_done` (a stale one
+ * would end the next turn the moment it starts) and streamed text (it would
+ * corrupt the next turn's transcript).
+ */
+export const CARRYOVER_EVENT_TYPES: ReadonlySet<ProviderEvent["type"]> = new Set([
+  "subagent_stop",
+  "tool_complete",
+]);
+
+/** Ceiling on buffered undeliverable events, so a pathological loop can't turn
+ *  a delivery failure into unbounded memory growth. */
+export const MAX_CARRYOVER_EVENTS = 100;
+
 // ── ClaudeProvider ────────────────────────────────────────────────────────────
 
 export class ClaudeProvider implements SessionProvider {
@@ -164,6 +183,12 @@ export class ClaudeProvider implements SessionProvider {
   // Long-running event queue — closed only when the SDK loop ends.
   // turn_done events are emitted as regular items; Session decides when to stop.
   #currentTurnQueue: AsyncQueue<ProviderEvent> | null = null;
+  /** Id-keyed lifecycle events that arrived with no live queue, replayed into
+   *  the next turn. See #handleUndeliverable. */
+  #carryover: ProviderEvent[] = [];
+  /** Dedupe keys for the undeliverable-event log, so a persistent loss reports
+   *  once per loop generation instead of once per event. */
+  #undeliverableLogged = new Set<string>();
 
   /**
    * Mutable callback — Session updates this before each runTurn() call to
@@ -226,6 +251,28 @@ export class ClaudeProvider implements SessionProvider {
     const turnQueue = new AsyncQueue<ProviderEvent>();
     this.#currentTurnQueue = turnQueue;
 
+    // Replay lifecycle events that arrived while no queue was live — a
+    // SubagentStop hook resolving after the previous turn ended, a trailing
+    // tool_result. Their handlers are id-keyed and idempotent, so a duplicate
+    // costs nothing; losing them is what left sub-agents dangling and tools
+    // stuck "running" for the rest of the session.
+    if (this.#carryover.length > 0) {
+      const replay = this.#carryover;
+      this.#carryover = [];
+      console.error(
+        `[claude-provider ${this.#claudeCodeSessionId.slice(0, 8)}] replaying ${replay.length} carried-over event(s) into the new turn`,
+      );
+      for (const ev of replay) {
+        try {
+          turnQueue.push(ev);
+        } catch {
+          // A brand-new queue should never reject; if it somehow does, the
+          // boundary sweep is still the backstop.
+          break;
+        }
+      }
+    }
+
     let userMessage = opts.userMessage;
     if (this.#pendingHistorySeed && userMessage) {
       // Post-switch seeding: this fresh Claude Code session has never seen
@@ -256,7 +303,23 @@ export class ClaudeProvider implements SessionProvider {
         // A "later" mid-turn injection is meant to MERGE into the running turn
         // (no new query); "now"/"next" should query. Only the primary prompt
         // (above, via the default) always queries.
+        //
+        // NOTE for callers: only the querying variants produce an additional
+        // turn_done. Session mirrors this when deciding whether to expect an
+        // intermediate turn boundary — counting a "later" push there makes it
+        // swallow the turn's terminal turn_done and hang at "thinking".
         this.#pushSDKMessage(content, priority, priority !== "later");
+      },
+      endTurn: () => {
+        // The consumer for THIS turn has stopped reading. Close its queue so a
+        // late event surfaces through #handleUndeliverable (logged, and buffered
+        // if it's id-keyed) instead of being pushed into a queue nobody drains.
+        // Generation/identity guarded: a rebuilt loop or a newer turn may
+        // already own #currentTurnQueue, and closing that would kill a live turn.
+        if (this.#currentTurnQueue === turnQueue) {
+          this.#currentTurnQueue.close();
+          this.#currentTurnQueue = null;
+        }
       },
     };
   }
@@ -652,11 +715,54 @@ export class ClaudeProvider implements SessionProvider {
 
   /** Push a ProviderEvent to the active per-turn queue. */
   #emit(event: ProviderEvent): void {
-    try {
-      this.#currentTurnQueue?.push(event);
-    } catch {
-      // Queue may be closed if the turn ended early — ignore.
+    const queue = this.#currentTurnQueue;
+    if (queue) {
+      try {
+        queue.push(event);
+        return;
+      } catch (err) {
+        this.#handleUndeliverable(event, err instanceof Error ? err.name : "unknown");
+        return;
+      }
     }
+    this.#handleUndeliverable(event, "no-queue");
+  }
+
+  /**
+   * A provider event had nowhere to go — the turn queue was closed (the
+   * consumer finished and called endTurn), full, or already nulled after the
+   * SDK loop ended.
+   *
+   * This used to be a bare `catch {}`, which is how the whole class of bugs
+   * stayed invisible: a lost `subagent_stop` left its sub-agent dangling for the
+   * life of the session (and its delegated ZeroID token live), and a lost
+   * `tool_complete` stranded the status at `tool_running`, with nothing logged
+   * to explain either.
+   *
+   * Id-keyed lifecycle events are buffered and replayed into the next turn's
+   * queue, where their handlers are idempotent no-ops if the boundary sweep
+   * already reconciled them. Everything else is logged only — replaying a stale
+   * `turn_done` would end the next turn the instant it began, and stale text
+   * would corrupt its transcript.
+   */
+  #handleUndeliverable(event: ProviderEvent, reason: string): void {
+    const carryable = CARRYOVER_EVENT_TYPES.has(event.type);
+    if (carryable && this.#carryover.length < MAX_CARRYOVER_EVENTS) {
+      this.#carryover.push(event);
+    }
+    // One line per (loop generation, event type, reason): enough to diagnose a
+    // recurring loss, not enough to flood a long session.
+    const key = `${this.#loopGeneration}:${event.type}:${reason}`;
+    if (this.#undeliverableLogged.has(key)) return;
+    this.#undeliverableLogged.add(key);
+    const disposition = carryable
+      ? this.#carryover.length < MAX_CARRYOVER_EVENTS
+        ? "buffered for the next turn"
+        : "DROPPED (carryover full)"
+      : "dropped";
+    console.error(
+      `[claude-provider ${this.#claudeCodeSessionId.slice(0, 8)}] "${event.type}" undeliverable (${reason}) — ${disposition}`,
+    );
   }
 
   /**

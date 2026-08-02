@@ -107,6 +107,27 @@ export class MockSessionProvider implements SessionProvider {
   /** Every pushMidTurn injection observed — inspect in tests. */
   readonly midTurnPushes: Array<{ content: string; priority: string }> = [];
 
+  /** Times Session called `TurnRun.endTurn()` — the turn-exit signal. */
+  endTurnCount = 0;
+
+  /**
+   * Push an event into the LIVE turn queue from a test: the deterministic
+   * stand-in for "the SDK emitted this later in the turn". Needed to model a
+   * terminal turn_done arriving after a mid-turn push (the pendingMidTurnCount
+   * hang), which a static script can't express. Returns false when the turn's
+   * queue is already gone or closed.
+   */
+  emitLive(event: ProviderEvent): boolean {
+    const q = this.#currentQueue;
+    if (!q) return false;
+    try {
+      q.push(event);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   constructor(
     id = "mock-session",
     script: ProviderEvent[][] = [],
@@ -198,6 +219,13 @@ export class MockSessionProvider implements SessionProvider {
       events: queue,
       interrupt: async () => {
         queue.close(); // idempotent — safe to call even if already closed
+      },
+      endTurn: () => {
+        // Mirror ClaudeProvider: the consumer has stopped reading, so close the
+        // queue rather than leaving it open and undrained.
+        this.endTurnCount++;
+        queue.close();
+        if (this.#currentQueue === queue) this.#currentQueue = null;
       },
     };
     if (this.#midTurn) {

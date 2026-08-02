@@ -1747,8 +1747,21 @@ export class Session {
       this.#persistAndBuffer(midTurnMsg);
       this.#broadcastRaw(midTurnMsg);
       this.#accumulator.pushUserTurn(effectivePrompt);
-      this.#pendingMidTurnCount++;
-      this.#activeRun.pushMidTurn(effectivePrompt, effectivePriority ?? "now");
+      // Count ONLY pushes that start a new query, because only those produce an
+      // extra turn_done for #consumeEvents to absorb. A "later" push merges into
+      // the running turn (ClaudeProvider: `shouldQuery = priority !== "later"`),
+      // so counting it made the consumer treat the turn's REAL terminal
+      // turn_done as an intermediate boundary: it decremented, re-asserted
+      // "thinking", and `continue`d — waiting forever for a turn_done that was
+      // never going to be emitted.
+      //
+      // That is the stuck spinner. The model has answered, but the session sits
+      // at "thinking" until the 5-minute stall watchdog fires or the next send
+      // closes the queue. It also strands the turn's sub-agents and tools:
+      // neither the mid-turn flush nor the consumer's finally reconciles them,
+      // because the loop never exits.
+      if (effectivePriority !== "later") this.#pendingMidTurnCount++;
+      this.#activeRun.pushMidTurn(effectivePrompt, effectivePriority);
       // Keep waiting_approval visible — the approval is still pending and
       // every frontend keys its approval bar off it; the queued text is
       // consumed after the user answers.
@@ -1840,6 +1853,52 @@ export class Session {
     this.#broadcastInfoUpdate();
   }
 
+  /**
+   * Drop every sub-agent still registered and revoke its ZeroID identity.
+   *
+   * A Task sub-agent cannot outlive the turn that spawned it, so once that turn
+   * ends — or the provider it was running under goes away — any surviving entry
+   * is stale by definition.
+   *
+   * Before this existed the ONLY cleanup path was the provider's
+   * `subagent_stop` event, which originates in the SDK's SubagentStop hook.
+   * That hook cannot fire when the query is aborted mid-turn (interrupt,
+   * setModel, rotate, provider switch — all of which call
+   * `#abortController.abort()`), so each abort permanently orphaned every
+   * in-flight sub-agent. Three consequences, all of which this fixes:
+   *
+   *   1. `subagentSnapshot` (→ `/who`, `toInfo().subagents`) only ever grew —
+   *      the reported count climbed across turns and never came back down.
+   *   2. `#subagents` + `#subagentRegistrations` grew unbounded for the
+   *      lifetime of a long-lived session.
+   *   3. Worst: each orphan kept a LIVE delegated ZeroID token. Revocation is
+   *      supposed to ride the sub-agent's own stop; instead it waited for
+   *      `deactivateSessionAgent`'s cascade at session destroy, so a dead
+   *      sub-agent's credential stayed valid for as long as the session lived.
+   *
+   * Idempotent and cheap — a no-op when the map is empty, which is the common
+   * case. Double-revocation is safe: `deactivateSubagent` no-ops on an id it
+   * has already dropped, so a `subagent_stop` arriving after a sweep (or a
+   * sweep racing a trailing stop) costs nothing.
+   */
+  #sweepStaleSubagents(reason: string): void {
+    if (this.#subagents.size === 0) return;
+    const orphaned = [...this.#subagents.keys()];
+    for (const agentId of orphaned) {
+      // Fire-and-forget, matching the subagent_stop path: revocation must never
+      // block a turn boundary, and deactivateSubagent logs its own failures.
+      void this.#identityManager?.deactivateSubagent(this.id, agentId);
+      this.#subagentRegistrations.delete(agentId);
+      this.#subagents.delete(agentId);
+    }
+    // Worth a line: a non-empty sweep means a SubagentStop never arrived, which
+    // is expected on abort but would otherwise be invisible.
+    console.log(
+      `[codeoid/session ${this.id}] swept ${orphaned.length} stale sub-agent(s) at ${reason}`,
+    );
+    this.#broadcastInfoUpdate();
+  }
+
   async #teardownProvider(): Promise<void> {
     // Capture before nulling: provider.teardown() may trigger onRecoveryNeeded,
     // which installs a new #eventConsumerTask. Awaiting the snapshot drains
@@ -1851,6 +1910,10 @@ export class Session {
     this.#eventConsumerTask = null;
     await this.#provider.teardown();
     try { await taskToAwait; } catch { /* consumer handles its own errors */ }
+    // teardown() aborts the SDK query, so any sub-agent still in flight will
+    // never get its SubagentStop hook. This is the setModel / rotate /
+    // switchProvider path — the session survives, so the orphans would too.
+    this.#sweepStaleSubagents("provider teardown");
     // The drained consumer's `finally` skips its own idle reset here: we nulled
     // #activeRun above, so its run-ownership guard (`#activeRun === run`) is
     // false. Without this, tearing a provider down mid-turn (setModel / rotate)
@@ -1917,12 +1980,16 @@ export class Session {
     if (run) {
       try {
         await run.interrupt();
+        // Interrupting kills the turn, so every sub-agent it spawned is done
+        // whether or not the SDK got to run their stop hooks.
+        this.#sweepStaleSubagents("interrupt");
         if (this.#status !== "error") this.#setStatus("idle");
         return;
       } catch {
         // fall through to hard abort
       }
     }
+    this.#sweepStaleSubagents("interrupt");
     if (this.#status !== "error") this.#setStatus("idle");
   }
 
@@ -3309,6 +3376,11 @@ export class Session {
           this.#recordTurnFromResult(event.result);
           // Flush per-turn accumulators so the continuation turn starts clean.
           this.#completeActiveTools();
+          // Same boundary, same reasoning: the sub-agents of the partial turn
+          // are done with it. This branch `continue`s without dispatching to
+          // #handleProviderEvent, so it is the only place that can reconcile
+          // them for an absorbed mid-turn boundary.
+          this.#sweepStaleSubagents("mid-turn boundary");
           this.#flushActiveAssistant();
           this.#finalizeActiveThinking();
           this.#chunker?.onTurnEnd();
@@ -3340,6 +3412,17 @@ export class Session {
     } finally {
       this.#pendingMidTurnCount = 0; // safety: reset on any exit path
       this.#completeActiveTools();
+      // Sub-agent reconciliation belongs beside the tool reconciliation: this
+      // finally is the one path every turn exit goes through — clean turn_done,
+      // error, stall recovery, ownership loss. #completeActiveTools has always
+      // existed here because provider events can be lost; sub-agents were simply
+      // never added to the same backstop.
+      this.#sweepStaleSubagents("turn exit");
+      // Tell the provider this turn's stream has no reader anymore. Without it
+      // the queue stays open and unconsumed until the NEXT turn replaces it, so
+      // a late event is silently buffered into a queue nobody will ever drain.
+      // Closing converts that invisible loss into the provider's carryover path.
+      try { run.endTurn?.(); } catch { /* best-effort */ }
       this.#flushActiveAssistant();
       this.#finalizeActiveThinking();
       this.#chunker?.onTurnEnd();
@@ -3762,6 +3845,9 @@ export class Session {
       case "turn_done": {
         this.#accumulator.handleEvent(event);
         this.#recordTurnFromResult(event.result);
+        // No sweep here: a terminal turn_done breaks #consumeEvents, whose
+        // finally reconciles sub-agents alongside tools. Sweeping here too would
+        // just be a redundant pass a few statements earlier.
         // Hook seam: observe-only (git-checkpoint per turn, usage export).
         this.#hookBus?.emit("after_turn", this.#hookContext(), {
           result: event.result,
