@@ -237,3 +237,62 @@ describe("sessions store", () => {
     expect(focusedSessionId()).toBe("a");
   });
 });
+
+describe("removeSession — collaboration cascade", () => {
+  /**
+   * Destroying a collaboration goal tears its role-children down on the daemon
+   * too (they have per-goal lifetime). The store used to drop only the goal, so
+   * the sidebar kept listing children whose sessions no longer existed —
+   * clicking one attached to nothing, and the ghosts survived until a refresh.
+   */
+  const child = (id: string, parentSessionId: string, createdAt: string) =>
+    s(id, createdAt, {
+      collaborationRole: { parentSessionId, roleName: "review", ordinal: 1, write: false },
+    } as Partial<SessionInfo>);
+
+  beforeEach(() => {
+    _resetSessionsForTest();
+    _resetDraftsForTest();
+  });
+
+  it("removes a goal's role-children along with the goal", () => {
+    ingestSessionList([
+      s("goal", "2026-01-01T00:00:00Z"),
+      child("kid-1", "goal", "2026-01-01T00:00:01Z"),
+      child("kid-2", "goal", "2026-01-01T00:00:02Z"),
+      s("unrelated", "2026-01-01T00:00:03Z"),
+    ]);
+
+    removeSession("goal");
+
+    expect(sessionList().map((x) => x.id)).toEqual(["unrelated"]);
+  });
+
+  it("leaves siblings alone when a single child is destroyed", () => {
+    ingestSessionList([
+      s("goal", "2026-01-01T00:00:00Z"),
+      child("kid-1", "goal", "2026-01-01T00:00:01Z"),
+      child("kid-2", "goal", "2026-01-01T00:00:02Z"),
+    ]);
+
+    // Children are individually destroyable; that must not take the goal or the
+    // sibling with it.
+    removeSession("kid-1");
+
+    expect(sessionList().map((x) => x.id).sort()).toEqual(["goal", "kid-2"]);
+  });
+
+  it("refocuses off a child that went with its goal", () => {
+    ingestSessionList([
+      s("goal", "2026-01-01T00:00:00Z"),
+      child("kid-1", "goal", "2026-01-01T00:00:01Z"),
+      s("other", "2026-01-01T00:00:02Z"),
+    ]);
+    focusSession("kid-1");
+
+    removeSession("goal");
+
+    // Focus must not be left pointing at a session that no longer exists.
+    expect(focusedSessionId()).toBe("other");
+  });
+});

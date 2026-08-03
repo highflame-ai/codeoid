@@ -211,17 +211,29 @@ export function setSessionStatus(id: string, status: SessionStatus): void {
 
 export function removeSession(id: string): void {
   batch(() => {
-    clearSessionMessages(id);
-    clearResumeCursor(id);
-    clearDraft(id);
-    statusUpdatedAt.delete(id);
+    // A collaboration's role-children have per-goal lifetime: destroying the
+    // goal tears them down on the daemon too. Mirror that here or the sidebar
+    // keeps listing children whose sessions no longer exist — clicking one then
+    // attaches to nothing, and the ghosts survive until a full refresh.
+    const ids = [
+      id,
+      ...Object.values(state.byId)
+        .filter((s) => s.collaborationRole?.parentSessionId === id)
+        .map((s) => s.id),
+    ];
+    for (const sid of ids) {
+      clearSessionMessages(sid);
+      clearResumeCursor(sid);
+      clearDraft(sid);
+      statusUpdatedAt.delete(sid);
+    }
     setState(
       "byId",
       produce<Record<string, SessionInfo>>((m) => {
-        delete m[id];
+        for (const sid of ids) delete m[sid];
       }),
     );
-    if (focusedId() === id) {
+    if (ids.includes(focusedId() ?? "")) {
       const remaining = sessionList();
       setFocusedId(remaining[0]?.id ?? null);
     }
