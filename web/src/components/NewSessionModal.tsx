@@ -12,6 +12,7 @@
 import {
   Component,
   For,
+  Index,
   Show,
   createEffect,
   createMemo,
@@ -520,24 +521,24 @@ const NewSessionModal: Component = () => {
               <span class="text-[11px] font-medium uppercase tracking-wider text-fg-faint">
                 Roles
               </span>
-              <For each={roles()}>
+              <Index each={roles()}>
                 {(r, i) => {
-                  const isOrchestrator = () => r.name.trim().toLowerCase() === "orchestrator";
+                  const isOrchestrator = () => r().name.trim().toLowerCase() === "orchestrator";
                   return (
                     <div class="space-y-1.5 rounded border border-border bg-bg p-2">
                       <div class="flex gap-1.5">
                         <input
                           type="text"
                           placeholder="role name"
-                          value={r.name}
-                          onInput={(e) => updateRole(i(), { name: e.currentTarget.value })}
+                          value={r().name}
+                          onInput={(e) => updateRole(i, { name: e.currentTarget.value })}
                           class="min-w-0 flex-1 rounded border border-border bg-bg-elev px-2 py-1 font-mono text-[12px] text-fg outline-none focus:border-accent"
                           disabled={busy() || isOrchestrator()}
                           aria-label="Role name"
                         />
                         <select
-                          value={r.providerId}
-                          onChange={(e) => updateRole(i(), { providerId: e.currentTarget.value })}
+                          value={r().providerId}
+                          onChange={(e) => updateRole(i, { providerId: e.currentTarget.value })}
                           class="rounded border border-border bg-bg-elev px-2 py-1 font-mono text-[12px] text-fg outline-none focus:border-accent disabled:cursor-not-allowed disabled:opacity-60"
                           /* Claude-only in v1: it is the only backend that
                              mounts the fleet MCP server (#245), and the daemon
@@ -552,7 +553,7 @@ const NewSessionModal: Component = () => {
                         </select>
                         <button
                           type="button"
-                          onClick={() => removeRole(i())}
+                          onClick={() => removeRole(i)}
                           class="rounded border border-border px-2 py-1 text-[12px] text-fg-muted transition hover:border-danger/40 hover:text-danger disabled:cursor-not-allowed disabled:opacity-30"
                           /* The daemon requires exactly one orchestrator, and
                              this session IS it — so it can't be removed. */
@@ -567,8 +568,8 @@ const NewSessionModal: Component = () => {
                         <input
                           type="text"
                           placeholder="model (optional)"
-                          value={r.model}
-                          onInput={(e) => updateRole(i(), { model: e.currentTarget.value })}
+                          value={r().model}
+                          onInput={(e) => updateRole(i, { model: e.currentTarget.value })}
                           class="min-w-0 flex-1 rounded border border-border bg-bg-elev px-2 py-1 font-mono text-[11px] text-fg outline-none focus:border-accent"
                           disabled={busy()}
                           aria-label="Model"
@@ -580,9 +581,9 @@ const NewSessionModal: Component = () => {
                               type="number"
                               min={1}
                               max={8}
-                              value={r.count}
+                              value={r().count}
                               onInput={(e) =>
-                                updateRole(i(), {
+                                updateRole(i, {
                                   count: Math.max(1, Number(e.currentTarget.value) || 1),
                                 })
                               }
@@ -597,8 +598,8 @@ const NewSessionModal: Component = () => {
                           >
                             <input
                               type="checkbox"
-                              checked={r.write}
-                              onChange={(e) => updateRole(i(), { write: e.currentTarget.checked })}
+                              checked={r().write}
+                              onChange={(e) => updateRole(i, { write: e.currentTarget.checked })}
                               disabled={busy()}
                             />
                             can write
@@ -608,7 +609,7 @@ const NewSessionModal: Component = () => {
                     </div>
                   );
                 }}
-              </For>
+              </Index>
               <button
                 type="button"
                 onClick={addRole}

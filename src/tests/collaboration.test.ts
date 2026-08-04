@@ -2106,3 +2106,60 @@ describe("collaboration.panels", () => {
     expect(panels.length).toBeGreaterThan(0);
   });
 });
+
+describe("collaboration auto-start", () => {
+  /**
+   * Creating a collaboration used to BUILD everything and start nothing: the
+   * goal was compiled into the orchestrator's constitution, the role-children
+   * came up silent, and then the whole goal sat at "idle" with no transcript
+   * until the owner typed into a session that already knew what it was for.
+   * Observed as a collaboration reporting its children in the sidebar while the
+   * centre pane stayed empty and no work ever happened.
+   */
+  test("starts the orchestrator on its goal instead of leaving it idle", async () => {
+    const created: MockSessionProvider[] = [];
+    const registry = new ProviderRegistry("claude");
+    for (const id of ["claude", "gemini"] as const) {
+      registry.register({
+        id,
+        displayName: id,
+        create: () => {
+          const p = new MockSessionProvider(id, [textTurn(`${id} ok`)]);
+          created.push(p);
+          return p;
+        },
+      });
+    }
+    manager = new SessionManager(store, transcript, undefined, undefined, undefined, {
+      config: mkConfig(),
+      providers: registry,
+    });
+
+    const resp = await run({
+      type: "session.create",
+      id: "auto-start",
+      name: "collab-auto",
+      workdir,
+      collaboration: VALID,
+    });
+    expect(resp.type).toBe("response.ok");
+
+    // The orchestrator's provider is built first; the role-children follow.
+    const orchestrator = created[0]!;
+    const deadline = Date.now() + 2000;
+    while (orchestrator.capturedOpts.length === 0) {
+      if (Date.now() > deadline) throw new Error("orchestrator never took a turn");
+      await Bun.sleep(10);
+    }
+
+    // It opens on the goal itself, so the transcript is self-describing on
+    // attach and on resume rather than starting with a contentless directive.
+    expect(orchestrator.capturedOpts[0]!.userMessage).toContain(VALID.goal);
+
+    // The children must STILL be silent — bringing up a fleet of N costs zero
+    // tokens, and none of them should burn a turn learning to wait.
+    for (const child of created.slice(1)) {
+      expect(child.capturedOpts).toHaveLength(0);
+    }
+  });
+});

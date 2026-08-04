@@ -1328,3 +1328,110 @@ describe("ClaudeProvider – VWS wiring (#178 Phase 1)", () => {
     await provider.teardown();
   });
 });
+
+describe("auto-approved tools still emit tool_start", () => {
+  /**
+   * Tools listed by EXACT NAME in `allowedTools` are approved by the SDK before
+   * canUseTool runs — it reports this itself as CLAUDE_SDK_CAN_USE_TOOL_SHADOWED.
+   * canUseTool is this provider's only tool_start emitter, so every such call
+   * used to execute completely invisibly: no tool_call message in the
+   * transcript, nothing in the UI, nothing in the verbatim episode record.
+   *
+   * Observed on a live instance: 409 mcp.init tool listings across 18
+   * transcripts and zero memory tool calls, while `Read` appeared 594 times.
+   */
+  const fleetStub = { type: "sdk", name: "codeoid_fleet", instance: {} } as never;
+
+  function providerWithFleet(): ClaudeProvider {
+    return new ClaudeProvider({
+      sessionId: "auto", initialBackingId: "b", workspaceId: "ws",
+      fleet: fleetStub,
+      store: {
+        audit: () => {},
+        getClaudeCodeSessionId: () => null,
+        setClaudeCodeSessionId: () => {},
+        getSkillCommandGrants: () => new Map<string, boolean>(),
+        setSkillCommandGrant: () => {},
+      } as never,
+    });
+  }
+
+  async function firstPreToolUseHook(): Promise<(i: unknown) => Promise<unknown>> {
+    const deadline = Date.now() + 1000;
+    while (!capturedQueryOpts) {
+      if (Date.now() > deadline) throw new Error("query() never built");
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    const options = (capturedQueryOpts as { options?: Record<string, unknown> }).options ?? capturedQueryOpts!;
+    const hooks = (options as { hooks?: Record<string, Array<{ hooks: Array<(i: unknown) => Promise<unknown>> }>> }).hooks;
+    return hooks!.PreToolUse![0]!.hooks[0]!;
+  }
+
+  it("emits tool_start for a pre-approved tool, correlated on the SDK's tool_use_id", async () => {
+    const provider = providerWithFleet();
+    capturedQueryOpts = null;
+    sdkMessages = [{ type: "result", subtype: "success", is_error: false, num_turns: 1, result: "ok", modelUsage: {} }];
+    let release!: () => void;
+    sdkGate = new Promise<void>((r) => { release = r; });
+
+    const events: ProviderEvent[] = [];
+    const run = provider.runTurn({
+      history: [], userMessage: "hi", workdir: ".",
+      canUseTool: async () => ({ behavior: "allow" as const }),
+    });
+    const drain = (async () => { for await (const e of run.events) events.push(e); })();
+
+    const preToolUse = await firstPreToolUseHook();
+    await preToolUse({
+      hook_event_name: "PreToolUse",
+      tool_name: "mcp__codeoid_fleet__fleet_list",
+      tool_input: { scope: "all" },
+      tool_use_id: "toolu_abc123",
+    });
+
+    release();
+    sdkGate = null;
+    await drain;
+
+    const started = events.filter((e) => e.type === "tool_start");
+    expect(started).toHaveLength(1);
+    expect(started[0]).toMatchObject({
+      name: "mcp__codeoid_fleet__fleet_list",
+      // The SDK's own id, so tool_complete correlates exactly as it would have
+      // if the call had gone through canUseTool.
+      sdkToolUseId: "toolu_abc123",
+      input: { scope: "all" },
+    });
+  });
+
+  it("does NOT emit for a tool that still reaches canUseTool (no double tool_start)", async () => {
+    const provider = providerWithFleet();
+    capturedQueryOpts = null;
+    sdkMessages = [{ type: "result", subtype: "success", is_error: false, num_turns: 1, result: "ok", modelUsage: {} }];
+    let release!: () => void;
+    sdkGate = new Promise<void>((r) => { release = r; });
+
+    const events: ProviderEvent[] = [];
+    const run = provider.runTurn({
+      history: [], userMessage: "hi", workdir: ".",
+      canUseTool: async () => ({ behavior: "allow" as const }),
+    });
+    const drain = (async () => { for await (const e of run.events) events.push(e); })();
+
+    const preToolUse = await firstPreToolUseHook();
+    // Read is NOT in allowedTools — it goes through canUseTool, which emits.
+    // Emitting here too would duplicate every ordinary tool call.
+    await preToolUse({
+      hook_event_name: "PreToolUse",
+      tool_name: "Read",
+      tool_input: { file_path: "/tmp/x" },
+      tool_use_id: "toolu_read",
+    });
+
+    release();
+    sdkGate = null;
+    await drain;
+
+    expect(events.filter((e) => e.type === "tool_start")).toHaveLength(0);
+  });
+});

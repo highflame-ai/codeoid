@@ -2081,6 +2081,33 @@ mcpHub: this.#mcpHub,
       }
     }
 
+    // Kick the orchestrator off on its own goal.
+    //
+    // Everything above only BUILDS the collaboration: the goal is compiled into
+    // the orchestrator's constitution and the role-children are brought up
+    // deliberately silent (see #spawnCollaborationChildren — a fleet of N costs
+    // zero tokens). Nothing sent a turn, so before this the whole goal sat idle
+    // at "no messages, no progress" until the owner happened to type something
+    // into a session that already knew exactly what it was for.
+    //
+    // The goal text is sent as the opening user turn rather than a bare "begin":
+    // it makes the transcript self-describing (the goal is the first thing you
+    // read on attach, and on resume) instead of opening with a directive whose
+    // subject lives only in the constitution.
+    //
+    // Fire-and-forget on purpose — create must not block on the first model
+    // call, and a send failure has to leave a usable (if idle) collaboration
+    // rather than failing the create that already spawned children.
+    if (collaboration) {
+      void session.send(collaboration.goal, auth).catch((err: unknown) => {
+        console.error(
+          `[codeoid] collaboration ${session.id.slice(0, 8)} failed to start on its goal (send it a message to begin): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      });
+    }
+
     return {
       type: "response.ok",
       requestId: msg.id,

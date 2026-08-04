@@ -330,7 +330,20 @@ describe("dispatch host — event routing", () => {
       { id: "cl", auth: AUTH, send: () => {} },
     );
     if (resp.type !== "response.ok") throw new Error(`create failed: ${JSON.stringify(resp)}`);
-    return resp.data as SessionInfo;
+    const info = resp.data as SessionInfo;
+    // Creating a collaboration now starts the orchestrator on its goal, so it
+    // is BUSY the moment create returns. These tests are about dispatch
+    // routing, not about that opening turn: let it settle so each test starts
+    // from an idle orchestrator, the precondition they were written against.
+    // Wait for that turn to have RUN, not merely for the session to look idle:
+    // the kickoff send is fire-and-forget, so an immediate status read still
+    // sees "idle" before it has started, and the test would then tick the
+    // dispatcher into a mid-turn orchestrator and see its event held back.
+    await until(() => {
+      const s = manager._sessionForTest(info.id);
+      return (s?.toInfo().usage?.numTurns ?? 0) > 0 && s?.status === "idle";
+    });
+    return info;
   };
 
   const childrenOf = async (parentId: string): Promise<SessionInfo[]> => {
@@ -389,15 +402,16 @@ describe("dispatch host — event routing", () => {
       now: Date.now(),
     });
 
-    expect(turnsOf(goal.id)).toBe(0);
+    // Baseline, not zero: the orchestrator already took its opening goal turn.
+    const turnsBefore = turnsOf(goal.id);
     await manager.dispatcher.tick();
 
     // Delivered TO THE ORCHESTRATOR — proven by it having taken a turn, not
     // merely by the queue draining (a retired event drains it too).
     // Delivered TO THE ORCHESTRATOR — proven by a completed turn on that exact
     // session, not by the queue draining (a retired event drains it too).
-    await untilTurn(goal.id);
-    expect(turnsOf(goal.id)).toBeGreaterThan(0);
+    await until(() => turnsOf(goal.id) > turnsBefore);
+    expect(turnsOf(goal.id)).toBeGreaterThan(turnsBefore);
     expect(pending()).toHaveLength(0);
   });
 

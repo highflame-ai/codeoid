@@ -183,6 +183,14 @@ export class ClaudeProvider implements SessionProvider {
   // Long-running event queue — closed only when the SDK loop ends.
   // turn_done events are emitted as regular items; Session decides when to stop.
   #currentTurnQueue: AsyncQueue<ProviderEvent> | null = null;
+  /**
+   * Exact tool names the SDK auto-approves from `allowedTools`, which means it
+   * never calls canUseTool for them. Since canUseTool is this provider's only
+   * tool_start emitter, the PreToolUse hook emits on their behalf — consulted
+   * there to decide which calls need that, and to guarantee we never
+   * double-emit for a tool that does reach the gate.
+   */
+  #autoApprovedTools = new Set<string>();
   /** Id-keyed lifecycle events that arrived with no live queue, replayed into
    *  the next turn. See #handleUndeliverable. */
   #carryover: ProviderEvent[] = [];
@@ -417,6 +425,20 @@ export class ClaudeProvider implements SessionProvider {
     const desiredAppend = opts.systemPromptAppend ?? "";
     const skillAllowRules = this.#resolveSkillGrants(opts);
     const desiredGrants = skillAllowRules.join("\n");
+
+    // Exact tool names we hand the SDK as pre-approved. Kept as its own list
+    // (rather than inlined into `allowedTools`) because the PreToolUse hook has
+    // to know precisely which tools will SKIP canUseTool, so it can emit the
+    // tool_start that canUseTool would otherwise have emitted.
+    const autoApprovedToolNames = [
+      ...(this.#init.memory ? MEMORY_TOOL_NAMES.map((t) => `mcp__codeoid_memory__${t}`) : []),
+      // Widened for the conductor's fleet server — without these entries the
+      // mounted server's tools stay unreachable (design §3 gotcha). Note this
+      // is FLEET_TOOL_NAMES (the READ set) only: the send-class verbs are
+      // deliberately absent so they still ride the owner's approval flow.
+      ...(this.#init.fleet ? FLEET_TOOL_NAMES.map((t) => `mcp__codeoid_fleet__${t}`) : []),
+    ];
+    this.#autoApprovedTools = new Set(autoApprovedToolNames);
     if (this.#consumerTask && this.#inputQueue && !this.#inputQueue.closed) {
       if (
         this.#builtSystemPromptAppend === desiredAppend &&
@@ -499,14 +521,18 @@ export class ClaudeProvider implements SessionProvider {
         // buildAgentEnv (GHSA-38vh vector 3).
         env: buildAgentEnv(),
         allowedTools: [
-          ...(init.memory
-            ? MEMORY_TOOL_NAMES.map((t) => `mcp__codeoid_memory__${t}`)
-            : []),
-          // Widened for the conductor's fleet server — without these entries
-          // the mounted server's tools stay unreachable (design §3 gotcha).
-          ...(init.fleet
-            ? FLEET_TOOL_NAMES.map((t) => `mcp__codeoid_fleet__${t}`)
-            : []),
+          // Every EXACT TOOL NAME here is auto-approved by the SDK BEFORE
+          // canUseTool is consulted, so it never reaches our gate — the SDK
+          // says so itself via CLAUDE_SDK_CAN_USE_TOOL_SHADOWED. Since
+          // canUseTool is this provider's only tool_start emitter, each of
+          // these would otherwise run completely invisibly. They are recorded
+          // in #autoApprovedTools so the PreToolUse hook can emit their
+          // tool_start instead.
+          //
+          // Bash allow-RULES (`Bash(cmd:*)`) are patterns, not tool names, and
+          // are deliberately NOT recorded: Bash itself still goes through
+          // canUseTool, which already emits for it.
+          ...autoApprovedToolNames,
           // Verbatim grants for the shell substitutions our installed skills
           // declare — without these a headless session silently expands the
           // whole slash command to nothing. See skillCommandAllowRules.
@@ -561,6 +587,31 @@ export class ClaudeProvider implements SessionProvider {
           PreToolUse: [{
             hooks: [async (rawInput) => {
               const input = rawInput as PreToolUseHookInput;
+              // Stand in for canUseTool on the tools the SDK pre-approved.
+              // Those never reach the gate, and the gate is the only place this
+              // provider emits tool_start — so without this every memory recall
+              // and every conductor fleet read executed with no tool_call
+              // message at all: absent from the transcript, absent from the UI,
+              // and absent from the verbatim episode record that is the point
+              // of capturing them. Confirmed on a live instance: 409 mcp.init
+              // listings across 18 transcripts, and zero memory tool calls.
+              //
+              // Emitted ONLY for names in #autoApprovedTools, which is exactly
+              // the set that skips canUseTool, so a tool can never be emitted
+              // twice. tool_use_id is the SDK's own id, matching what
+              // canUseTool would have used, so tool_complete correlates and
+              // Session's own auto-approve (these are isSafeTool reads) keeps
+              // them from prompting.
+              if (this.#autoApprovedTools.has(input.tool_name)) {
+                this.#emit({
+                  type: "tool_start",
+                  toolId: randomUUID(),
+                  sdkToolUseId: input.tool_use_id,
+                  name: input.tool_name,
+                  input: (input.tool_input ?? {}) as Record<string, unknown>,
+                  approvalId: randomUUID(),
+                });
+              }
               init.store.audit(
                 this.#currentSender?.sub ?? "unknown",
                 "session.tool_call",
