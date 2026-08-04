@@ -3,6 +3,13 @@
 > Companion to [conductor-design.md](./conductor-design.md) (architecture +
 > decisions) and [conductor-session-resolution.md](./conductor-session-resolution.md)
 > (the retrieval deep-dive). Those two docs ARE the spec; this is the sequencing.
+>
+> **2026-08-05 — R6 capability reframe.** The conductor is an assistant whose fleet
+> is *one capability*, not a fleet supervisor. Design §5 carries the full capability
+> surface and §3 the write-scoping rule. Ordering effects on the phases below:
+> a new tool-surface slice lands first, **P5 (front doors)** and the mountable fleet
+> MCP (#245) move up, and **P4.5 (routines)** gains the spend ceiling from
+> P8 as a hard prerequisite. Phase *contents* below are otherwise unchanged.
 
 ## Branch strategy
 
@@ -254,8 +261,9 @@ list + switch into any individual session; both stay in sync (daemon-owned state
   holding only `email.send`), never on the conductor directly.
 - **Owner approval gate** showing recipient + subject + body preview (informed
   approval, not theater).
-- Web lookup delegated to children (they already have `WebSearch`/`WebFetch`);
-  conductor gets digests back.
+- Web lookup: the conductor uses `WebSearch`/`WebFetch` directly for ad-hoc
+  questions (R6 — delegation is a context-cost decision, not a trust one), and
+  delegates to a child only when the *reading* would threaten its own context.
 
 **Exit:** "email X the summary" → conductor drafts → approval with full preview →
 send; research tasks delegated and returned as digests. **No Shield yet** (P8).
@@ -302,11 +310,15 @@ shipped conductor built as codeoid's architectural inverse. It validates our
 daemon + identity + structured-memory foundation and yields refinements folded
 into the phases:
 
-- **P3/P4 — conductor is read-only over targets *by construction*.** The
-  `codeoid_fleet` surface is read + dispatch only; no file/git/shell-write tool on
-  target repos. All mutation flows through crewmates behind approval — and we
-  *enforce* it by denying write scopes to the conductor identity (firstmate can
-  only ask via prompt). Turns R3/R4 into an architectural invariant.
+- **P3/P4 — conductor mutation flows through children behind approval.** All
+  mutation of a target repo goes through a crewmate the owner approved.
+  ⚠️ **Superseded in part by R6** ([conductor-design.md](./conductor-design.md#decisions-locked-from-grilling)):
+  this bullet used to claim we *enforce* read-only "by construction" by denying
+  write scopes to the conductor identity. We do not — the ZeroID scopes never
+  gated the conductor session's local tool surface, `Bash` sits outside
+  `WRITE_TOOLS` by design, and `fleet_spawn(shape:"ship")` grants transitive write
+  anyway. The invariant we actually keep is **path scope**: the conductor stays out
+  of repos. See the R6 table in design §3.
 - **P4 — supervision is zero-token + event-driven.** Conductor LLM turns fire only
   on *actionable* daemon events; benign ones are absorbed with no turn; heartbeat
   backstop with exponential backoff; actionable events hit a durable queue for
