@@ -486,6 +486,22 @@ const SessionRow: Component<{
               {props.session.providerId}
             </span>
           </Show>
+          {/* Ambient pack, from `profile` ("pack-id" or "pack-id (role)").
+              The daemon has shipped this field since ambient activation existed
+              and NO client rendered it — so a pack-activated session was
+              indistinguishable from a freestyle one, and the person who picked
+              the pack had no way to confirm it took effect. That is the whole
+              reported symptom: "not sure if the pack is actually honored". */}
+          <Show when={props.session.profile}>
+            {(prof) => (
+              <span
+                class="rounded border border-success/40 bg-success/10 px-1 font-mono text-[10px] text-success"
+                title={`Ambient pack: ${prof()} — its constitution, skills and subagents are loaded. Packs run phases only in Pipeline mode.`}
+              >
+                ⬢ {prof()}
+              </span>
+            )}
+          </Show>
           <Show when={props.session.usage}>
             {(u) => (
               <>

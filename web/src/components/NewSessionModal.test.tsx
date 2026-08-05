@@ -404,3 +404,105 @@ describe("NewSessionModal collaborative mode", () => {
     expect("collaboration" in (requestMock.mock.calls[0]![0] as object)).toBe(false);
   });
 });
+
+// ── Pipeline as a first-class third mode ─────────────────────────────────────
+
+// The reported symptom: a user opened `+ new session`, picked a pack, and saw
+// no phase tracing. The pack WAS honored — as ambient activation — but pipeline
+// mode was reachable only from /pipeline and the Pack Browser, so the dialog
+// offered a pack picker whose meaning depended on a mode you couldn't select.
+// Design §9: "the run IS a session plus a goal and a config, so it extends the
+// existing create-session dialog rather than a bespoke panel."
+describe("NewSessionModal — three modes", () => {
+  it("offers Pipeline in the kind toggle alongside the other two", async () => {
+    packsHolder.installed = [pack({ id: "sdlc", name: "SDLC" })];
+    openNewSessionModal();
+    const { getByRole } = render(() => <NewSessionModal />);
+    // All three are radios in one group — the discovery fix.
+    expect(getByRole("radio", { name: "Single agent" })).toBeTruthy();
+    expect(getByRole("radio", { name: "Collaborative" })).toBeTruthy();
+    expect(getByRole("radio", { name: "Pipeline" })).toBeTruthy();
+  });
+
+  it("keeps the toggle visible IN pipeline mode, so you can leave it", async () => {
+    // Arriving from Pack Browser → Run used to hide the toggle entirely, which
+    // left you in a mode you could neither see nor exit.
+    packsHolder.installed = [pack({ id: "sdlc", name: "SDLC" })];
+    openPipelineModal();
+    const { getByRole } = render(() => <NewSessionModal />);
+    expect(getByRole("radio", { name: "Pipeline" }).getAttribute("aria-checked")).toBe("true");
+    expect(getByRole("radio", { name: "Single agent" })).toBeTruthy();
+  });
+
+  it("states what a pack MEANS in each mode — ambient vs phases", async () => {
+    packsHolder.installed = [pack({ id: "sdlc", name: "SDLC" })];
+    openNewSessionModal();
+    const { getByRole, getByText } = render(() => <NewSessionModal />);
+    // Session mode: the same picker means ambient activation, and says so.
+    expect(getByText(/pack here is AMBIENT/)).toBeTruthy();
+    fireEvent.click(getByRole("radio", { name: "Pipeline" }));
+    expect(getByText(/auto-advances through the pack's PHASES/)).toBeTruthy();
+  });
+
+  it("preserves the chosen pack across a mode switch", async () => {
+    // Not data loss: pipeline → session with the pack kept IS the other
+    // legitimate use of that pack ("constitution, not phases").
+    packsHolder.installed = [pack({ id: "sdlc", name: "SDLC" })];
+    openNewSessionModal();
+    const { getByRole, getByLabelText } = render(() => <NewSessionModal />);
+    const picker = getByLabelText("Pack") as HTMLSelectElement;
+    fireEvent.change(picker, { target: { value: "sdlc" } });
+    expect(picker.value).toBe("sdlc");
+
+    fireEvent.click(getByRole("radio", { name: "Pipeline" }));
+    expect((getByLabelText("Pack") as HTMLSelectElement).value).toBe("sdlc");
+    fireEvent.click(getByRole("radio", { name: "Single agent" }));
+    expect((getByLabelText("Pack") as HTMLSelectElement).value).toBe("sdlc");
+  });
+
+  it("drops packRole when leaving session mode — a pipeline sets roles per-phase", async () => {
+    packsHolder.installed = [pack({ id: "sdlc", name: "SDLC", roles: ["architect"] })];
+    openNewSessionModal();
+    const { getByRole, getByLabelText, queryByLabelText } = render(() => <NewSessionModal />);
+    fireEvent.change(getByLabelText("Pack"), { target: { value: "sdlc" } });
+    fireEvent.change(getByLabelText("Pack role"), { target: { value: "architect" } });
+    expect((getByLabelText("Pack role") as HTMLSelectElement).value).toBe("architect");
+
+    fireEvent.click(getByRole("radio", { name: "Pipeline" }));
+    // The role picker is session-only, and the value is cleared rather than
+    // silently ignored by the daemon.
+    expect(queryByLabelText("Pack role")).toBeNull();
+    fireEvent.click(getByRole("radio", { name: "Single agent" }));
+    expect((getByLabelText("Pack role") as HTMLSelectElement).value).toBe("");
+  });
+
+  it("names an inactive pack instead of silently dropping it from the list", async () => {
+    // Pipeline mode filters to active packs. Carrying an inactive selection in
+    // used to make it vanish with Start disabled and nothing explaining why.
+    packsHolder.installed = [
+      pack({ id: "live", name: "Live" }),
+      pack({ id: "off", name: "Dormant", active: false }),
+    ];
+    openNewSessionModal();
+    const { getByRole, getByLabelText, getByText } = render(() => <NewSessionModal />);
+    fireEvent.change(getByLabelText("Pack"), { target: { value: "off" } });
+    fireEvent.click(getByRole("radio", { name: "Pipeline" }));
+    expect(getByText(/Dormant is installed but not active/)).toBeTruthy();
+  });
+
+  it("still starts a real pipeline run from the toggle path", async () => {
+    // The toggle must reach the SAME run machinery /pipeline uses, not a
+    // look-alike that quietly creates a plain session.
+    packsHolder.installed = [pack({ id: "sdlc", name: "SDLC" })];
+    openNewSessionModal();
+    const { getByRole, getByLabelText } = render(() => <NewSessionModal />);
+    fireEvent.click(getByRole("radio", { name: "Pipeline" }));
+    fireEvent.input(getByLabelText(/Goal/i), { target: { value: "ship the thing" } });
+    fireEvent.change(getByLabelText("Pack"), { target: { value: "sdlc" } });
+    fireEvent.click(getByRole("button", { name: /start|create/i }));
+    await waitFor(() => expect(runPipelineMock).toHaveBeenCalledTimes(1));
+    expect(runPipelineMock).toHaveBeenCalledWith(
+      expect.objectContaining({ pack: "sdlc", goal: "ship the thing" }),
+    );
+  });
+});

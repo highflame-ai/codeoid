@@ -60,6 +60,31 @@ function defaultRoles(): CollabRoleRow[] {
   ];
 }
 
+/** The three kinds, in escalating structure. Order is the reading order of the
+ *  toggle: one agent → several agents → a governed phase sequence. */
+const MODES = ["session", "collaborate", "pipeline"] as const;
+
+const MODE_LABELS: Record<Mode, string> = {
+  session: "Single agent",
+  collaborate: "Collaborative",
+  pipeline: "Pipeline",
+};
+
+/**
+ * One line per mode, stating what you get — and specifically what a PACK means
+ * here, because the same picker means two different things one click apart:
+ * ambient activation in `session`, the phase source in `pipeline`. Adjacency is
+ * exactly what makes saying so necessary.
+ */
+const MODE_BLURBS: Record<Mode, string> = {
+  session:
+    "A session is one agent conversation rooted at a workdir. The daemon registers a per-session ZeroID agent identity automatically. A pack here is AMBIENT — its constitution, skills and subagents load, but no phases are run.",
+  collaborate:
+    "One goal, several agents in named roles — each on its own backend. This session is the orchestrator; the others come up as its children and hand work to each other through a shared goal blackboard.",
+  pipeline:
+    "Run an installed pack against a goal. It creates a session, auto-advances through the pack's PHASES, and halts at each boundary for you to Approve / Revise / Reject.",
+};
+
 const [openSignal, setOpenSignal] = createSignal(false);
 const [mode, setMode] = createSignal<Mode>("session");
 const [goalPrefill, setGoalPrefill] = createSignal("");
@@ -155,6 +180,24 @@ const NewSessionModal: Component = () => {
     mode() === "pipeline" ? installedPacks().filter((p) => p.active && !p.error) : installedPacks(),
   );
 
+  /**
+   * Switching into pipeline mode with an inactive pack selected: the pack list
+   * narrows to active packs, so the selection would silently disappear and Start
+   * would sit disabled with nothing explaining why. Name it instead.
+   *
+   * Deliberately NOT auto-cleared — the user picked that pack, and the fix they
+   * want is usually "activate it", not "lose it".
+   */
+  const inactivePackWarning = createMemo<string | null>(() => {
+    if (mode() !== "pipeline" || !packId()) return null;
+    if (packOptions().some((p) => p.id === packId())) return null;
+    const chosen = installedPacks().find((p) => p.id === packId());
+    if (!chosen) return null;
+    return chosen.error
+      ? `${chosen.name} failed to load (${chosen.error}) — a pipeline needs a healthy pack. Fix it or pick another via /packs.`
+      : `${chosen.name} is installed but not active — activate it via /packs to run its phases, or pick an active pack.`;
+  });
+
   // Changing the pack invalidates any previously-picked role. `defer` so this
   // doesn't clobber the initial empty state on first run.
   createEffect(on(packId, () => setPackRole(""), { defer: true }));
@@ -168,6 +211,33 @@ const NewSessionModal: Component = () => {
     const def = opts.find((p) => p.selected)?.id ?? opts[0]?.id;
     if (def) setPackId(def);
   });
+
+  /**
+   * Mode switching PRESERVES the pack, deliberately.
+   *
+   * Switching pipeline → session with the pack kept is not data loss, it is the
+   * other legitimate use of the same pack: "I want the constitution, not the
+   * phases." Clearing it would force a re-pick to express that. The reverse
+   * direction is equally useful — pick a pack, realise you want its phases,
+   * switch to Pipeline and Start.
+   *
+   * `packRole` is the exception: it is session-only (a pipeline applies each
+   * phase's role per-phase), so it is dropped when leaving session mode rather
+   * than silently ignored by the daemon.
+   */
+  createEffect(
+    on(
+      mode,
+      (m) => {
+        if (m !== "session") setPackRole("");
+      },
+      // `defer` so opening the dialog doesn't count as a switch. Matches the
+      // packId effect above; a `prev === undefined` guard would be wrong here —
+      // Solid passes prev undefined on the first deferred run, which silently
+      // skipped the clear.
+      { defer: true },
+    ),
+  );
 
   let nameRef: HTMLInputElement | undefined;
 
@@ -385,13 +455,20 @@ const NewSessionModal: Component = () => {
                   ? "New collaborative session"
                   : "New session"}
             </h2>
-            {/* Plain ↔ collaborative is a toggle on the SAME dialog (§9): a
-                collaboration is a session plus a goal and role bindings, not a
-                separate object. Pipeline mode is entered from /pipeline, so it
-                isn't offered here. */}
-            <Show when={mode() !== "pipeline"}>
-              <div class="flex gap-1" role="radiogroup" aria-label="Session kind">
-                <For each={["session", "collaborate"] as const}>
+            {/* All three kinds are toggles on the SAME dialog, per design §9:
+                "the run IS a session plus a goal and a config, so it extends the
+                existing create-session dialog rather than a bespoke panel."
+                Pipeline used to be reachable only from /pipeline and the Pack
+                Browser's Run action, so someone who came looking for pack-driven
+                phases in this dialog found the pack picker — which means AMBIENT
+                activation here — and no phase tracing. Same dialog, three honest
+                choices.
+
+                Rendered in EVERY mode, including pipeline: arriving from Pack
+                Browser → Run used to hide the toggle entirely, leaving you in a
+                mode you could neither see nor leave. */}
+            <div class="flex gap-1" role="radiogroup" aria-label="Session kind">
+              <For each={MODES}>
                   {(m) => (
                     <button
                       type="button"
@@ -405,19 +482,12 @@ const NewSessionModal: Component = () => {
                       }`}
                       disabled={busy()}
                     >
-                      {m === "session" ? "Single agent" : "Collaborative"}
+                      {MODE_LABELS[m]}
                     </button>
                   )}
-                </For>
-              </div>
-            </Show>
-            <p class="text-xs text-fg-muted">
-              {mode() === "pipeline"
-                ? "Run an installed pack against a goal. It creates a session, auto-advances through the pack's phases, and halts at each boundary for you to Approve / Revise / Reject."
-                : mode() === "collaborate"
-                  ? "One goal, several agents in named roles — each on its own backend. This session is the orchestrator; the others come up as its children and hand work to each other through a shared goal blackboard."
-                  : "A session is one Claude conversation rooted at a workdir. The daemon registers a per-session ZeroID agent identity automatically."}
-            </p>
+              </For>
+            </div>
+            <p class="text-xs text-fg-muted">{MODE_BLURBS[mode()]}</p>
           </header>
 
           <label class="block space-y-1.5">
@@ -687,6 +757,11 @@ const NewSessionModal: Component = () => {
                   {(p) => <option value={p.id}>{p.name}</option>}
                 </For>
               </select>
+              <Show when={inactivePackWarning()}>
+                <p class="text-[10px] text-warn">{inactivePackWarning()}</p>
+              </Show>
+              {/* Role is SESSION-mode only: a pipeline applies each phase's own
+                  role per-phase, so a manual override here would fight the pack. */}
               <Show when={mode() === "session" && selectedPack() && packRoles().length > 0}>
                 <label class="block space-y-1">
                   <span class="text-[10px] uppercase tracking-wider text-fg-faint">
