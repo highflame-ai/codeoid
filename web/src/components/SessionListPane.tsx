@@ -498,6 +498,27 @@ const SessionRow: Component<{
               </>
             )}
           </Show>
+          {/* Background work the harness is running outside any turn — the
+              model deferred it past its own turn and will be woken when it
+              settles. Rendered even at count 1: an idle-looking session with
+              live background work is exactly the state that used to read as
+              a hang. */}
+          <Show
+            when={
+              props.session.backgroundTasks &&
+              props.session.backgroundTasks.length > 0
+            }
+          >
+            <span class="text-fg-faint">·</span>
+            <span
+              class="animate-pulse text-warn"
+              title={props.session.backgroundTasks
+                ?.map((t) => `[${t.kind}] ${t.description || t.id.slice(0, 8)} — ${t.status}`)
+                .join("\n")}
+            >
+              {props.session.backgroundTasks?.length} bg
+            </span>
+          </Show>
           <Show
             when={
               props.session.subagents &&

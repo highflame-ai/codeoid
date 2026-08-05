@@ -271,3 +271,31 @@ describe("SessionListPane — live panel state", () => {
     expect(queryAllByTitle(/Panel member/)).toHaveLength(2);
   });
 });
+
+describe("SessionListPane — background tasks", () => {
+  it("shows a pulsing bg chip with the task details in the tooltip", () => {
+    ingestSessionList([
+      {
+        ...sess("s1", "paper-review", "/repo/paper"),
+        backgroundTasks: [
+          { id: "abcd1234", kind: "subagent", description: "survey venues", status: "running" },
+          { id: "efgh5678", kind: "shell", description: "", status: "running" },
+        ],
+      } as SessionInfo,
+    ]);
+    const { getByText, getByTitle } = render(() => <SessionListPane />);
+    // The count is the signal: an idle-looking session with live background
+    // work is exactly the state that used to read as a hang.
+    expect(getByText("2 bg")).toBeTruthy();
+    const tip = getByTitle(/survey venues/);
+    expect(tip.getAttribute("title")).toContain("[subagent] survey venues — running");
+    // A task with no description falls back to its id prefix.
+    expect(tip.getAttribute("title")).toContain("[shell] efgh5678 — running");
+  });
+
+  it("shows nothing when the field is absent — older daemons stay clean", () => {
+    ingestSessionList([sess("s1", "plain", "/repo/x")]);
+    const { queryByText } = render(() => <SessionListPane />);
+    expect(queryByText(/bg/)).toBeNull();
+  });
+});

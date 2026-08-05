@@ -218,6 +218,19 @@ export interface SessionInfo {
   agentUri?: string;
   /** Active sub-agents for the identity chain display. */
   subagents?: Subagent[];
+  /**
+   * Background tasks the session's harness is running OUTSIDE any turn —
+   * work the model deferred past its own turn ("I'll report when the agents
+   * land"). Provider-agnostic: `kind` is the harness's own vocabulary
+   * ("shell", "subagent", …) and is display-only. Absent/empty = none, which
+   * is also what daemons that predate this field report.
+   */
+  backgroundTasks?: Array<{
+    id: string;
+    kind: string;
+    description: string;
+    status: string;
+  }>;
   /** Cumulative token + cost usage since the session started. */
   usage?: SessionUsage;
   /**

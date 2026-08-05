@@ -26,6 +26,8 @@ import {
   type UiRequest,
   type UiResponse,
   isSubagentEvent,
+  type BackgroundTaskSnapshot,
+  type SessionScopedEvent,
 } from "./providers/interface.js";
 import { createDefaultProviderRegistry, type ProviderRegistry } from "./providers/registry.js";
 import { selectContextStrategy, renderSessionMap, renderRotationSeed, type ContextStrategy } from "./providers/context-strategy.js";
@@ -533,6 +535,25 @@ export class Session {
   // Populated by SubagentStart / SubagentStop hooks; consulted when building
   // a tool_call SessionMessage so each tool call carries the identity of the
   // agent that actually made it (parent session OR sub-agent worker).
+  /**
+   * Live background tasks, from the provider's session-scoped LEVEL event.
+   * REPLACE semantics on every event (the contract's rule, so a missed event
+   * cannot wedge a stale indicator), and cleared on provider teardown — the
+   * level is per-harness-process, so a rebuilt provider starts empty.
+   */
+  #backgroundTasks = new Map<string, BackgroundTaskSnapshot>();
+  /**
+   * Settled-task digests waiting to be delivered as a wake turn. Queued here
+   * when they arrive mid-turn (or while a wake is already in flight) and
+   * drained in ONE batched injection at the next idle — burst-collapse, same
+   * rule as the dispatcher's <fleet_events>.
+   */
+  #pendingBackgroundReports: Array<{ taskId: string; status: string; summary: string }> = [];
+  /** Task ids already queued or delivered — a settle must wake exactly once. */
+  #reportedBackgroundTasks = new Set<string>();
+  /** Re-entrancy guard: one wake injection at a time. */
+  #deliveringBackgroundReports = false;
+
   #subagents = new Map<
     string,
     {
@@ -721,6 +742,7 @@ export class Session {
       null;
 
     this.#provider = opts._testProvider ?? this.#createProvider(opts.providerId);
+    this.#provider.onSessionEvent = (e) => this.#onSessionScopedEvent(e);
 
     // Restore any pinned files the user had on this session before.
     try {
@@ -969,6 +991,7 @@ export class Session {
     }
 
     this.#provider = this.#createProvider(requested);
+    this.#provider.onSessionEvent = (e) => this.#onSessionScopedEvent(e);
 
     // Offer the canonical history to the incoming provider. Best-effort by
     // contract: a seed failure degrades to an unseeded switch, never a
@@ -1881,6 +1904,102 @@ export class Session {
    * has already dropped, so a `subagent_stop` arriving after a sweep (or a
    * sweep racing a trailing stop) costs nothing.
    */
+  /**
+   * Session-scoped provider events — background work that lives OUTSIDE any
+   * turn. This is the channel that closes the loop the turn queue structurally
+   * cannot: a model that ends its turn with "I'll report when the agents land"
+   * gets its landings delivered as a wake turn instead of dropped unread.
+   */
+  #onSessionScopedEvent(event: SessionScopedEvent): void {
+    switch (event.type) {
+      case "background_tasks": {
+        // LEVEL, replace semantics: swap the whole set. Diffed only to decide
+        // whether clients need a broadcast, never to infer starts/stops.
+        const next = new Map(event.tasks.map((t) => [t.id, { ...t }]));
+        const changed =
+          next.size !== this.#backgroundTasks.size ||
+          [...next.entries()].some(([id, t]) => {
+            const prev = this.#backgroundTasks.get(id);
+            return !prev || prev.status !== t.status || prev.description !== t.description;
+          });
+        this.#backgroundTasks = next;
+        if (changed) this.#broadcastInfoUpdate();
+        break;
+      }
+      case "background_task_settled": {
+        // A settle wakes the session EXACTLY once, whatever the event timing.
+        if (this.#reportedBackgroundTasks.has(event.taskId)) break;
+        this.#reportedBackgroundTasks.add(event.taskId);
+        this.#pendingBackgroundReports.push({
+          taskId: event.taskId,
+          status: event.status,
+          summary: event.summary,
+        });
+        // The level event usually removes it too, but do not depend on
+        // ordering the contract leaves unspecified.
+        if (this.#backgroundTasks.delete(event.taskId)) this.#broadcastInfoUpdate();
+        this.#maybeDeliverBackgroundReports();
+        break;
+      }
+    }
+  }
+
+  /**
+   * Deliver queued settle digests as ONE injected wake turn, iff the session
+   * is idle. Called from two triggers so both arrival orders work: when a
+   * settle lands while idle (the deferred-report case), and when a turn exits
+   * to idle with settles that arrived mid-turn.
+   *
+   * The injection is a normal send under a system principal — it rides the
+   * ordinary turn machinery, so tools still ask for approval in guarded mode
+   * and the autonomous budget still applies. Nothing here grants authority;
+   * it only supplies the information the model was waiting on.
+   */
+  #maybeDeliverBackgroundReports(): void {
+    if (this.#deliveringBackgroundReports) return;
+    if (this.#pendingBackgroundReports.length === 0) return;
+    if (this.#status !== "idle") return;
+
+    const reports = this.#pendingBackgroundReports.splice(0);
+    this.#deliveringBackgroundReports = true;
+    const body = [
+      "<background_tasks>",
+      "(daemon-injected background-task notifications — NOT a message from the owner)",
+      ...reports.map((r) => `- [${r.status}] task ${r.taskId.slice(0, 8)}: ${r.summary}`),
+      "</background_tasks>",
+      "",
+      "Background work you started earlier has finished. Continue what you deferred: report the results you promised, and decide any follow-up yourself.",
+    ].join("\n");
+    const systemAuth: AuthContext = {
+      sub: "system:background",
+      scopes: [],
+      delegationDepth: 0,
+      accountId: this.accountId,
+      projectId: this.projectId,
+    };
+    this.#store.audit(
+      systemAuth.sub,
+      "session.background_wake",
+      this.id,
+      `reports=${reports.length} tasks=${reports.map((r) => r.taskId.slice(0, 8)).join(",")}`,
+    );
+    void this.send(body, systemAuth)
+      .catch((err) => {
+        // A failed wake must not lose the digests — requeue and let the next
+        // idle transition (or the next settle) retry. Re-dedup is already
+        // handled: these ids stay in #reportedBackgroundTasks.
+        this.#pendingBackgroundReports.unshift(...reports);
+        console.error(
+          `[codeoid/session ${this.id.slice(0, 8)}] background wake failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      })
+      .finally(() => {
+        this.#deliveringBackgroundReports = false;
+        // Settles that arrived DURING the wake turn deliver on its idle.
+        this.#maybeDeliverBackgroundReports();
+      });
+  }
+
   #sweepStaleSubagents(reason: string): void {
     if (this.#subagents.size === 0) return;
     const orphaned = [...this.#subagents.keys()];
@@ -1914,6 +2033,14 @@ export class Session {
     // never get its SubagentStop hook. This is the setModel / rotate /
     // switchProvider path — the session survives, so the orphans would too.
     this.#sweepStaleSubagents("provider teardown");
+    // Same per-process rule as the sweep, for background tasks: teardown kills
+    // the harness process, and its tasks die with it. The live LEVEL resets to
+    // empty; queued settle digests are kept — they are self-contained text and
+    // still worth delivering. Broadcast only when something actually cleared.
+    if (this.#backgroundTasks.size > 0) {
+      this.#backgroundTasks.clear();
+      this.#broadcastInfoUpdate();
+    }
     // The drained consumer's `finally` skips its own idle reset here: we nulled
     // #activeRun above, so its run-ownership guard (`#activeRun === run`) is
     // false. Without this, tearing a provider down mid-turn (setModel / rotate)
@@ -2388,6 +2515,9 @@ export class Session {
       pinnedFiles: [...this.#pinnedFiles],
       agentUri: this.#agentIdentity.sub,
       subagents: this.subagentSnapshot,
+      ...(this.#backgroundTasks.size > 0
+        ? { backgroundTasks: [...this.#backgroundTasks.values()].map((t) => ({ ...t })) }
+        : {}),
       usage: { ...this.#usage },
       rotation: {
         count: this.#rotationCount,
@@ -4186,6 +4316,11 @@ export class Session {
     // for clients or for resume — skip the persistence AND the broadcast.
     if (status === this.#status) return;
     this.#status = status;
+
+    // Turn exit with settled background work queued mid-turn: wake now. Runs
+    // AFTER the flip so #maybeDeliverBackgroundReports sees status === "idle";
+    // it no-ops instantly when the queue is empty (the overwhelming case).
+    if (status === "idle") this.#maybeDeliverBackgroundReports();
 
     // Persisted status exists for restart resume (and the session list).
     // Terminal / parked states (idle, waiting_approval, error) mark durable

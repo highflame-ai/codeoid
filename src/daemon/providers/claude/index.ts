@@ -41,7 +41,7 @@ import { FLEET_TOOL_NAMES } from "../../fleet.js";
 import { rewriteBashToolInput } from "../../compress/index.js";
 import type { CodeoidConfig } from "../../../config.js";
 import type { AuthContext } from "../../../protocol/types.js";
-import type { SessionProvider, ModelInfo, NormalizedTurnResult, ProviderEvent, TurnOpts, TurnRun } from "../interface.js";
+import type { SessionProvider, ModelInfo, NormalizedTurnResult, ProviderEvent, SessionScopedEvent, TurnOpts, TurnRun } from "../interface.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
 import { buildSubprocessEnv } from "../env.js";
 import type { LLMCallUsage } from "../../context-math.js";
@@ -203,6 +203,8 @@ export class ClaudeProvider implements SessionProvider {
    * capture the current sender for recovery error handling.
    */
   onRecoveryNeeded: ((content: string) => void) | undefined;
+  /** Session-lifetime listener — see SessionProvider.onSessionEvent. */
+  onSessionEvent: ((event: SessionScopedEvent) => void) | undefined;
 
   // Per-turn mutable canUseTool + sender — updated on each runTurn()
   #currentCanUseTool: TurnOpts["canUseTool"] | null = null;
@@ -974,7 +976,7 @@ export class ClaudeProvider implements SessionProvider {
       this.#translateState.lastLocalCommandStderr = null;
       return;
     }
-    translateSDKMessage(msg, this.#emit.bind(this), this.id, this.#translateState);
+    translateSDKMessage(msg, this.#emit.bind(this), this.id, this.#translateState, (e) => this.onSessionEvent?.(e));
   }
 }
 
@@ -1003,6 +1005,10 @@ export function translateSDKMessage(
   emit: (event: ProviderEvent) => void,
   providerId: string,
   state: TranslateState = { lastLocalCommandStderr: null },
+  /** Session-scoped emitter — background-task events go HERE, never through
+   *  `emit`, because they can fire between turns when the turn queue has no
+   *  reader and would drop them unread. */
+  emitSession?: (event: SessionScopedEvent) => void,
 ): void {
     switch (msg.type) {
       case "assistant": {
@@ -1164,6 +1170,44 @@ export function translateSDKMessage(
         } else if (subtype === "api_retry") {
           const r = msg as { attempt?: number; retry_delay_ms?: number; error_status?: number | null };
           emit({ type: "api_retry", attempt: r.attempt, retryDelayMs: r.retry_delay_ms, errorStatus: r.error_status });
+        } else if (subtype === "background_tasks_changed") {
+          // Level signal: the FULL live set after any membership change,
+          // REPLACE semantics (the SDK's own recommendation — a missed edge
+          // cannot wedge a stale indicator). Session-scoped, so it goes to the
+          // session listener, never the turn queue: it can fire between turns,
+          // when the queue has no reader and would drop it unread.
+          const r = msg as {
+            tasks?: Array<{ task_id?: string; task_type?: string; description?: string; status?: string }>;
+          };
+          emitSession?.({
+            type: "background_tasks",
+            tasks: (r.tasks ?? [])
+              .filter((t) => typeof t.task_id === "string")
+              .map((t) => ({
+                id: t.task_id as string,
+                kind: t.task_type ?? "task",
+                description: t.description ?? "",
+                status: t.status ?? "running",
+              })),
+          });
+        } else if (subtype === "task_notification") {
+          // Edge signal: one task settled, with the outcome digest. This is
+          // the event a session must be WOKEN with — it routinely arrives
+          // after turn_done (the model deferred the work past its own turn),
+          // which is exactly when the turn queue is closed. Observed live: a
+          // session promised "I'll report when the three agents land" and the
+          // landings were discarded unread.
+          const r = msg as { task_id?: string; status?: string; summary?: string };
+          if (typeof r.task_id === "string") {
+            const status =
+              r.status === "failed" || r.status === "stopped" ? r.status : "completed";
+            emitSession?.({
+              type: "background_task_settled",
+              taskId: r.task_id,
+              status,
+              summary: r.summary ?? "(no summary reported)",
+            });
+          }
         }
         break;
       }

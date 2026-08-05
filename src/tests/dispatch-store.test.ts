@@ -441,3 +441,102 @@ describe("dispatchRecentGroups is index-covered", () => {
     expect(s.dispatchRecentGroups("acc-x", "proj-x", "orchestrator:goal-A")).toEqual([]);
   });
 });
+
+// ── audit_log must outlive its subjects ──────────────────────────────────────
+
+// Found while chasing "an interrupt audited with session_id: null" in a real
+// database: the row was never written null. audit_log carried
+// `FOREIGN KEY (session_id) ... ON DELETE SET NULL`, so destroying a session
+// retroactively anonymized its ENTIRE audit trail — 40 rows across 13 actions
+// in the reporting DB, each session.destroy row nulled by its own delete. An
+// audit log exists precisely to survive its subjects.
+describe("audit_log survives session deletion", () => {
+  test("destroying a session no longer anonymizes its audit history", () => {
+    const dbPath = join(tmp, "audit.db");
+    const s = new Store(dbPath);
+    s.createSession({
+      id: "sess-1", name: "n", workdir: "/tmp", status: "idle",
+      createdBy: "u", createdAt: new Date().toISOString(), attachedClients: 0,
+      accountId: "a", projectId: "p",
+    });
+    s.audit("user:me", "session.send", "sess-1", "hello");
+    s.audit("user:me", "session.interrupt", "sess-1");
+    s.deleteSession("sess-1");
+    s.audit("user:me", "session.destroy", "sess-1");
+
+    const db = new Database(dbPath, { readonly: true });
+    const rows = db
+      .prepare("SELECT action, session_id FROM audit_log WHERE session_id = ?")
+      .all("sess-1") as Array<{ action: string }>;
+    db.close();
+    // All three rows keep their session id — including the destroy itself,
+    // and including a write AFTER the sessions row is gone.
+    expect(rows.map((r) => r.action).sort()).toEqual([
+      "session.destroy",
+      "session.interrupt",
+      "session.send",
+    ]);
+  });
+
+  test("an audit BEFORE the sessions row exists keeps its id too", () => {
+    // The old FK also rejected these; the fallback then wrote NULL with the id
+    // folded into detail. History-first ordering is legitimate and now clean.
+    const s = new Store(join(tmp, "audit-pre.db"));
+    s.audit("user:me", "session.create", "not-yet-created", "name=x");
+    const db = new Database(join(tmp, "audit-pre.db"), { readonly: true });
+    const row = db
+      .prepare("SELECT session_id, detail FROM audit_log WHERE action = ?")
+      .get("session.create") as { session_id: string | null; detail: string | null };
+    db.close();
+    expect(row.session_id).toBe("not-yet-created");
+    expect(row.detail).toBe("name=x"); // no [session=...] fold needed anymore
+  });
+
+  test("an existing database with the FK is rebuilt in place, rows and ids intact", () => {
+    const dbPath = join(tmp, "audit-legacy.db");
+    // Fabricate the PRE-FIX schema exactly, with history that survived so far.
+    {
+      const db = new Database(dbPath, { create: true });
+      db.exec(`
+        CREATE TABLE sessions (id TEXT PRIMARY KEY, name TEXT, workdir TEXT,
+          status TEXT, created_by TEXT, created_at TEXT, attached_clients INTEGER,
+          account_id TEXT, project_id TEXT);
+        CREATE TABLE audit_log (
+          id          INTEGER PRIMARY KEY AUTOINCREMENT,
+          timestamp   TEXT NOT NULL DEFAULT (datetime('now')),
+          subject     TEXT NOT NULL,
+          session_id  TEXT,
+          action      TEXT NOT NULL,
+          detail      TEXT,
+          FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE SET NULL
+        );
+        INSERT INTO sessions (id) VALUES ('alive');
+        INSERT INTO audit_log (id, subject, session_id, action, detail)
+          VALUES (13824, 'spiffe://user', 'alive', 'session.interrupt', NULL);
+      `);
+      db.close();
+    }
+    const s = new Store(dbPath); // migration runs here
+    void s;
+    const db = new Database(dbPath, { readonly: true });
+    const ddl = (db.prepare("SELECT sql FROM sqlite_master WHERE name='audit_log'").get() as { sql: string }).sql;
+    const row = db.prepare("SELECT id, session_id FROM audit_log WHERE action='session.interrupt'").get() as {
+      id: number; session_id: string | null;
+    };
+    db.close();
+    // The FK is gone, and row 13824 is STILL row 13824 — audit citations by
+    // row id must keep meaning the same row across the rebuild.
+    expect(ddl).not.toContain("FOREIGN KEY");
+    expect(row).toEqual({ id: 13824, session_id: "alive" });
+  });
+
+  test("the rebuild is idempotent", () => {
+    const dbPath = join(tmp, "audit-idem.db");
+    new Store(dbPath);
+    expect(() => new Store(dbPath)).not.toThrow();
+    const db = new Database(dbPath, { readonly: true });
+    const n = db.prepare("SELECT COUNT(*) n FROM sqlite_master WHERE name LIKE 'audit_log%'").get() as { n: number };
+    db.close();
+    expect(n.n).toBe(1); // no audit_log_rebuild left behind
+  });
+});

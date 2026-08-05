@@ -30,6 +30,7 @@ import type {
   SessionProvider,
   TurnOpts,
   TurnRun,
+  SessionScopedEvent,
 } from "../interface.js";
 import type { ProviderCommand } from "../../../protocol/types.js";
 import type { CanonicalTurn, HistorySeedResult } from "../canonical.js";
@@ -42,6 +43,9 @@ export class MockSessionProvider implements SessionProvider {
 
   /** Set by Session.send() before each runTurn() call. */
   onRecoveryNeeded: ((content: string) => void) | undefined;
+  /** Session-lifetime listener — installed by Session, fired by tests to
+   *  simulate background work settling with or without a turn in flight. */
+  onSessionEvent: ((event: SessionScopedEvent) => void) | undefined;
 
   #backingSessionId: string;
   #hasQueried = false;

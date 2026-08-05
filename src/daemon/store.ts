@@ -300,10 +300,16 @@ export class Store {
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp   TEXT NOT NULL DEFAULT (datetime('now')),
         subject     TEXT NOT NULL,
-        session_id  TEXT,
         action      TEXT NOT NULL,
         detail      TEXT,
-        FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE SET NULL
+        -- NO foreign key on session_id, deliberately. audit_log is append-only
+        -- HISTORY and must outlive the entities it describes. The previous
+        -- ON DELETE SET NULL FK retroactively anonymized a session's entire
+        -- audit trail at destroy (observed: 40 rows across 13 actions nulled
+        -- in a real DB, each destroy row nulled by its own delete) — the exact
+        -- opposite of what an audit log is for. It also rejected inserts that
+        -- legitimately precede the sessions row.
+        session_id  TEXT
       );
 
       CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp);
@@ -447,6 +453,41 @@ export class Store {
     // NULL on an existing row means "standalone task", which is exactly the
     // pre-upgrade behaviour — every task queued before panels existed keeps
     // emitting its own completion event.
+    // ── audit_log FK removal (rebuild) ────────────────────────────────────
+    // Databases created before this build carry
+    //   FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE SET NULL
+    // which retroactively anonymized a session's ENTIRE audit trail the moment
+    // it was destroyed — observed in a real DB as 40 rows across 13 actions
+    // with session_id nulled, each session.destroy row nulled by its own
+    // delete. An audit log exists precisely to survive its subjects, so the FK
+    // has to go; SQLite cannot drop a constraint via ALTER, so the table is
+    // rebuilt once. Rows and their ids are preserved verbatim (ids are how a
+    // human cites an audit finding — "row 13824" must keep meaning row 13824).
+    // Already-nulled rows are unrecoverable: the id was destroyed at delete
+    // time, not hidden.
+    {
+      const ddl = this.#db
+        .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'audit_log'")
+        .get() as { sql?: string } | undefined;
+      if (ddl?.sql?.includes("FOREIGN KEY")) {
+        this.#db.exec(`
+          CREATE TABLE audit_log_rebuild (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp   TEXT NOT NULL DEFAULT (datetime('now')),
+            subject     TEXT NOT NULL,
+            action      TEXT NOT NULL,
+            detail      TEXT,
+            session_id  TEXT
+          );
+          INSERT INTO audit_log_rebuild (id, timestamp, subject, action, detail, session_id)
+            SELECT id, timestamp, subject, action, detail, session_id FROM audit_log;
+          DROP TABLE audit_log;
+          ALTER TABLE audit_log_rebuild RENAME TO audit_log;
+          CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp);
+        `);
+      }
+    }
+
     this.#addColumnIfMissing("dispatch_tasks", "group_id", "TEXT");
     this.#addColumnIfMissing("dispatch_tasks", "group_ordinal", "INTEGER");
     // AFTER the ALTERs, never inside the CREATE block above. On an existing
