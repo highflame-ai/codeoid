@@ -269,6 +269,23 @@ Every new capability means editing that file — and since an over-broad match t
 Each capability should **declare** its read-only verbs; `tool-safety.ts` keeps validating exact names rather than server prefixes, so the fail-safe (unknown tool → prompt) is preserved.
 With one capability this is over-engineering; with six it is the difference between adding a capability being a config change and being a security review.
 
+**The mount contract — this is where the architecture pays off.**
+Declaring verbs is not paperwork; it is the *exchange*. A capability declares its
+read-only verbs and its side-effecting verbs at mount time, and in return the
+daemon stamps every call it makes with identity attribution, an audit row, the
+correct approval classification, and episodic capture. Mandatory in both
+directions: a capability that declines to declare gets no auto-approval (fail
+safe), and a capability that declares gets governance it did not have to build.
+
+Declared-but-**validated**, never declared-and-trusted (open question #11) — the
+registry supplies the list; `tool-safety.ts` still matches exact names, because an
+over-broad match is a prompt bypass no matter who authored it.
+
+That exchange is the difference between codeoid's registry and the plugin systems
+every peer already ships. A plugin mounted elsewhere inherits nothing; a capability
+mounted here inherits the whole substrate. The registry is not the moat — it is
+how the moat reaches third-party code.
+
 **Web reads should auto-approve.**
 An always-on assistant that raises an approval prompt on every `WebFetch` is not an assistant.
 `WebSearch`/`WebFetch` are read-only fetches (`NETWORK_TOOLS` already treats them as such) and belong in the conductor's auto-approved set, unlike anything in §8's send-class egress.
@@ -340,6 +357,28 @@ exact identifiers — `studio#870`, `latest_only`, a branch name, a file path. F
 nails those; embeddings nail "the session where I was frustrated with flaky auth".
 The hybrid is what makes *both* queries land — which is exactly why we extend
 codeoid's existing blended scorer rather than bolt on a pure vector store.
+
+**What is and is not differentiated here — state this honestly.**
+The *ranker* is commodity. Bi-temporal validity intervals, hybrid dense + sparse +
+graph retrieval, RRF/MMR fusion, and cross-encoder reranking are shipped, published,
+and benchmarked by Zep/Graphiti (P95 ~300 ms, no LLM on the retrieval path). Framing
+that stack as codeoid's moat invites a comparison codeoid loses, and hand-rolling it
+is months of work to reach library parity.
+
+Two things *are* differentiated, and both are downstream of the native-protocol
+provider layer rather than of the ranker:
+
+1. **The corpus.** Verbatim, tool-call-granular coding episodes with file paths,
+   worktree-anchored, tenant-scoped, captured with no external service. A memory
+   layer that ingests text cannot produce it, because it never sees a tool call.
+   This is why the file co-occurrence graph and the session-session topology graph
+   are the highest-value retrieval work and also the work no peer can copy.
+2. **The task.** "Fuzzy human reference → the right session across N workspaces" is
+   not fact recall, and no incumbent publishes a number for it. The P0 labeled
+   fixture measures something the field does not benchmark, which makes it a
+   publishable result rather than only an internal gate.
+
+So: invest in retrieval, and position the *corpus and the task*, never the ranker.
 
 **Machine awareness.** A `machine_map` tool enumerates workspaces (repos under the
 root), each session's workdir + git branch/status + running state — so the
@@ -416,6 +455,39 @@ A dogfood story that overstates its own boundary is worse than none, so this tab
 
 The R6 scoping table in §3 is what closes rows 4–6, and it closes them by *path*, which is enforceable today, rather than by *capability*, which is not.
 
+**Two fences, and only one of them is Forge's job.**
+Sandboxing is provided as a **wrapper**: `highflame-forge` provisions the sandbox and
+starts codeoid inside it. That is the right split — it keeps the daemon free of
+`if (sandboxed)` branches, exactly as [local-mode.md](./local-mode.md) keeps the
+verified auth path free of `if (localMode)`. But the wrapper solves one threat model,
+not both:
+
+| Fence | Protects | Provided by |
+| --- | --- | --- |
+| **Outer** | the host from the fleet — filesystem outside the workspace, egress, credential exposure | Forge sandbox (wrapper) |
+| **Inner** | a session's *declared* posture, and fleet members from each other | R6 scoping + the worktree check (daemon) |
+
+Everything in the inner row happens **inside** the outer fence. `sed -i` on a repo
+file works as well sandboxed as not, and the sandbox cannot distinguish "the
+conductor wrote this" from "the session that owns this worktree wrote this" — same
+uid, same namespace. So the outer fence does not touch the multi-writer hazard or
+the conductor's path scope, and R6 is not satisfied by adding a sandbox.
+
+**The inner fence does not need to be OS-level, and it is differentiated.** The
+worktree-conflict check is deterministic, because the daemon already knows which
+session owns which worktree (`fleet_list` returns it). A kernel sandbox has no
+concept of a session, so "do not write where another agent is working" is an
+invariant only a session-owning control plane can enforce — it is not
+sandbox catch-up, it is a primitive peers cannot reach.
+
+**Open topology decision.** codeoid *inside* a sandbox yields **one** fence shared by
+every session on that daemon — tenant- or workspace-granular. Per-session isolation
+would require codeoid *spawning* sandboxes and dispatching into them, which is a
+different topology and a different dispatch path. This matters concretely for two
+things already in the design: a `scout` that "cannot write files" is currently a
+scope claim rather than a fence, and untrusted packs share the fence with everything
+else. Decide the granularity before P4.5 ships anything unattended.
+
 **Prompt injection is the reason the send-class boundary stays trust-based.**
 The conductor is the highest-authority session in the system, always on, and it ingests untrusted text from three directions: web content it fetches, child output arriving as `<fleet_events>`, and whatever a mounted MCP server returns.
 Direct write turns an injected instruction into direct file mutation; routed through dispatch, the same instruction has to survive an owner looking at it.
@@ -470,8 +542,9 @@ What the reframe changes in that plan's ordering:
 
 6. **Spawn ownership semantics.** Conductor-spawned children are disposable and their queue survives restart, but nothing decides whether a *long-running* worker should re-parent to the human rather than die with a revoked conductor. Revocation versus durability, unresolved.
 7. **Cost ceiling — the number, not the principle.** The amended R5 settles *that* routines need a ceiling. What the ceiling is, whether it is per-routine or per-conductor-per-day, and what happens on breach (pause, alert, degrade to a cheaper model) are all undecided.
-8. **Where does path-scoped write get enforced?** `roleDeniesTool` has no notion of paths, so R6's table needs either a path field on the capability role or a check in the session's `canUseTool` gate. The latter is easier; the former is more testable.
-9. **Does the worktree-conflict check belong in `tool-safety.ts`?** Denying a write into a repo a live session owns requires fleet knowledge inside what is currently a pure, dependency-free module — and that purity is deliberate, load-bearing for its tests, and the reason the module is trustworthy.
-10. **Who owns the read-only declaration?** A capability declaring its own safe verbs is the right shape, but an over-broad match in `tool-safety.ts` is a prompt bypass. Registry-*driven* without becoming registry-*trusted*.
-11. **Does the composed prompt need per-backend trimming?** A 20–30B open-weight conductor faces more tool-selection pressure than a frontier model at the same mount count. Whether that is answered by trimming mounts, trimming prompt sections, or a fine-tune is unmeasured — and should be measured against the real mounted surface, not a toy one.
-12. **Is "conductor" still the right name?** It is a fleet-supervision word for something that is now an assistant with a fleet capability, and the name will keep pulling the design back toward fleet-only. Against a rename: `config.conductor.*`, `role: "conductor"`, the store column, and the wire protocol are all load-bearing. Current call is keep the name, fix the framing.
+8. ~~**Where does path-scoped write get enforced?**~~ **Resolved: in the session's `canUseTool` gate, not in the capability role.** The split follows the two questions being different kinds. `tool-safety.ts` stays a **pure classifier** — *is this verb read-only?* — answerable from the tool name alone, with no dependencies and no context. The gate makes the **contextual** decision — *may this session write this path right now?* — which needs the workdir, the repo boundary, and the live worktree map. Keeping the classifier pure is what keeps it reviewable, and a path field on the role would have dragged fleet state into it.
+9. ~~**Does the worktree-conflict check belong in `tool-safety.ts`?**~~ **Resolved: no** — same reasoning as #8, and it answers the objection directly. The module's dependency-free purity is load-bearing for its tests and is the reason it can be trusted as a security boundary; the worktree check lives in the gate, where fleet state already is.
+10. **What granularity of sandbox does Forge actually provide?** codeoid running *inside* a Forge sandbox gives one fence per daemon (tenant- or workspace-granular). Per-session isolation needs codeoid *spawning* sandboxes and dispatching into them — a different topology. Until this is settled, `shape: "scout"` is a scope claim rather than a fence, and untrusted packs share a fence with everything else. Blocking for unattended routines (§7).
+11. **Who owns the read-only declaration?** A capability declaring its own safe verbs is the right shape, but an over-broad match in `tool-safety.ts` is a prompt bypass. Registry-*driven* without becoming registry-*trusted*.
+12. **Does the composed prompt need per-backend trimming?** A 20–30B open-weight conductor faces more tool-selection pressure than a frontier model at the same mount count. Whether that is answered by trimming mounts, trimming prompt sections, or a fine-tune is unmeasured — and should be measured against the real mounted surface, not a toy one.
+13. **Is "conductor" still the right name?** It is a fleet-supervision word for something that is now an assistant with a fleet capability, and the name will keep pulling the design back toward fleet-only. Against a rename: `config.conductor.*`, `role: "conductor"`, the store column, and the wire protocol are all load-bearing. Current call is keep the name, fix the framing.

@@ -8,8 +8,11 @@
 > is *one capability*, not a fleet supervisor. Design §5 carries the full capability
 > surface and §3 the write-scoping rule. Ordering effects on the phases below:
 > a new tool-surface slice lands first, **P5 (front doors)** and the mountable fleet
-> MCP (#245) move up, and **P4.5 (routines)** gains the spend ceiling from
-> P8 as a hard prerequisite. Phase *contents* below are otherwise unchanged.
+> MCP (#245) move up, and **P4.5 (routines)** gains two hard prerequisites — the
+> spend ceiling from P8, and a decision on **sandbox granularity** (the Forge
+> wrapper is one fence per daemon; per-session isolation is a different topology,
+> and until it is settled `shape: "scout"` is a scope claim rather than a fence —
+> design §9). Phase *contents* below are otherwise unchanged.
 
 ## Branch strategy
 
