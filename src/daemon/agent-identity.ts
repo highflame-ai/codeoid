@@ -513,6 +513,18 @@ export class AgentIdentityManager {
     } catch (err) {
       // A failed revocation leaves the token ACTIVE — log it (don't swallow),
       // matching deactivateConductor. The local row is still dropped below.
+      //
+      // ALSO audited, not just logged: a register/deactivate count mismatch is
+      // how a leaked credential is found after the fact, and without this row
+      // the forensics cannot distinguish "daemon died before deactivating"
+      // from "deactivation was attempted and failed". A real investigation hit
+      // exactly that ambiguity (one identity, 11 registered / 10 deactivated).
+      this.#store.audit(
+        agent.wimseUri,
+        "subagent.identity.deactivation_failed",
+        sessionId,
+        err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200),
+      );
       console.error(
         `[codeoid] failed to deactivate subagent identity ${agent.wimseUri} (token may remain active):`,
         err instanceof Error ? err.message : err,
@@ -533,7 +545,17 @@ export class AgentIdentityManager {
       if (key.startsWith(`${sessionId}:`) && key !== sessionId) {
         try {
           await this.#client.agents.deactivate(subagent.identityId);
+          // The cascade path never audited its successes, so identities
+          // revoked at session destroy looked identical to leaks when pairing
+          // registered/deactivated rows. Same row the direct path writes.
+          this.#store.audit(subagent.wimseUri, "subagent.identity.deactivated", sessionId);
         } catch (err) {
+          this.#store.audit(
+            subagent.wimseUri,
+            "subagent.identity.deactivation_failed",
+            sessionId,
+            err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200),
+          );
           console.error(
             `[codeoid] failed to deactivate subagent identity ${subagent.wimseUri} (token may remain active):`,
             err instanceof Error ? err.message : err,
