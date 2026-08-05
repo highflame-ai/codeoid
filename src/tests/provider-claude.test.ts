@@ -14,7 +14,7 @@
  */
 
 import { mock, describe, it, expect, beforeEach } from "bun:test";
-import type { ProviderEvent } from "../daemon/providers/interface.js";
+import type { ProviderEvent , SessionScopedEvent } from "../daemon/providers/interface.js";
 
 // ── SDK mock ──────────────────────────────────────────────────────────────────
 
@@ -1433,5 +1433,103 @@ describe("auto-approved tools still emit tool_start", () => {
     await drain;
 
     expect(events.filter((e) => e.type === "tool_start")).toHaveLength(0);
+  });
+});
+
+// ── Background-task mapping (SDK → SessionScopedEvent) ──────────────────────
+
+// The property under test is ROUTING, not just shape: these events can fire
+// between turns, when the turn queue has no reader and drops events unread —
+// that structural loss is the incident this feature exists to fix. So every
+// case asserts the event reached emitSession AND that nothing leaked into the
+// turn-scoped emit stream.
+describe("translateSDKMessage — background tasks", () => {
+  function run(msg: unknown) {
+    const turnEvents: unknown[] = [];
+    const sessionEvents: SessionScopedEvent[] = [];
+    translateSDKMessage(
+      msg as never,
+      (e) => turnEvents.push(e),
+      "claude",
+      { lastLocalCommandStderr: null },
+      (e) => sessionEvents.push(e),
+    );
+    return { turnEvents, sessionEvents };
+  }
+
+  it("background_tasks_changed maps to the level event with REPLACE payload", () => {
+    const { turnEvents, sessionEvents } = run({
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [
+        { task_id: "t1", task_type: "subagent", description: "survey venues", status: "running" },
+        { task_id: "t2", task_type: "shell", description: "npm test", status: "running" },
+      ],
+    });
+    expect(sessionEvents).toEqual([
+      {
+        type: "background_tasks",
+        tasks: [
+          { id: "t1", kind: "subagent", description: "survey venues", status: "running" },
+          { id: "t2", kind: "shell", description: "npm test", status: "running" },
+        ],
+      },
+    ]);
+    // NEVER through the turn queue — between turns it has no reader.
+    expect(turnEvents).toEqual([]);
+  });
+
+  it("an empty set still emits — 'everything finished' is information", () => {
+    const { sessionEvents } = run({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+    expect(sessionEvents).toEqual([{ type: "background_tasks", tasks: [] }]);
+  });
+
+  it("task_notification maps to the settled edge with the digest", () => {
+    const { turnEvents, sessionEvents } = run({
+      type: "system",
+      subtype: "task_notification",
+      task_id: "t1",
+      status: "completed",
+      output_file: "/tmp/x",
+      summary: "3 venues fit; 1 is a lock",
+    });
+    expect(sessionEvents).toEqual([
+      { type: "background_task_settled", taskId: "t1", status: "completed", summary: "3 venues fit; 1 is a lock" },
+    ]);
+    expect(turnEvents).toEqual([]);
+  });
+
+  it("failed and stopped statuses survive; anything else normalizes to completed", () => {
+    expect(run({ type: "system", subtype: "task_notification", task_id: "a", status: "failed", summary: "s" })
+      .sessionEvents[0]).toMatchObject({ status: "failed" });
+    expect(run({ type: "system", subtype: "task_notification", task_id: "b", status: "stopped", summary: "s" })
+      .sessionEvents[0]).toMatchObject({ status: "stopped" });
+    // Forward-compat: a status this build doesn't know is still a settle.
+    expect(run({ type: "system", subtype: "task_notification", task_id: "c", status: "shiny_new", summary: "s" })
+      .sessionEvents[0]).toMatchObject({ status: "completed" });
+  });
+
+  it("malformed payloads are dropped, not crashed on or half-emitted", () => {
+    // No task_id → nothing to wake with; a bad row inside tasks is skipped.
+    expect(run({ type: "system", subtype: "task_notification", summary: "s" }).sessionEvents).toEqual([]);
+    const { sessionEvents } = run({
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [{ description: "no id" }, { task_id: "ok" }],
+    });
+    expect(sessionEvents[0]).toMatchObject({
+      tasks: [{ id: "ok", kind: "task", description: "", status: "running" }],
+    });
+  });
+
+  it("no emitSession listener → both subtypes are safe no-ops", () => {
+    // A provider embedded without the session channel must not throw.
+    const turnEvents: unknown[] = [];
+    translateSDKMessage(
+      { type: "system", subtype: "task_notification", task_id: "t", status: "completed", summary: "s" } as never,
+      (e) => turnEvents.push(e),
+      "claude",
+    );
+    expect(turnEvents).toEqual([]);
   });
 });

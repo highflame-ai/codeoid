@@ -238,6 +238,57 @@ export function isSubagentEvent(event: ProviderEvent): boolean {
   );
 }
 
+// ── Session-scoped events ─────────────────────────────────────────────────────
+
+/**
+ * One live background task, in provider-agnostic shape.
+ *
+ * `kind` is the provider's own vocabulary ("shell", "subagent", "monitor", …)
+ * and is display-only — the daemon never branches on it, so a new harness can
+ * introduce kinds freely without touching core.
+ */
+export interface BackgroundTaskSnapshot {
+  id: string;
+  kind: string;
+  description: string;
+  status: string;
+}
+
+/**
+ * Events scoped to the SESSION's lifetime rather than to any turn.
+ *
+ * Why this exists as a separate channel: `TurnRun.events` is turn-scoped by
+ * construction — its own contract documents that an event arriving between
+ * turns is "accepted and then discarded unread". Background tasks are the case
+ * that breaks the taxonomy: a model can end its turn with work still running
+ * ("I'll report when the three agents land"), and the completion arrives when
+ * no turn is in flight. Routing it through the turn queue is structural loss,
+ * observed live — a session promised a report, its tasks settled into a closed
+ * queue, and it sat idle until the owner interrupted it.
+ *
+ * Two events, mirroring the level+edge design the Claude SDK itself settled on:
+ *
+ * - `background_tasks` is a LEVEL: the full live set after any membership
+ *   change, with REPLACE semantics. Consumers swap their state for the payload,
+ *   so a missed event can never wedge a stale "running" indicator.
+ * - `background_task_settled` is the EDGE that carries the outcome digest —
+ *   the thing a session must be woken with.
+ *
+ * Provider-agnostic on purpose: claude maps its SDK notifications onto these
+ * today; pi/gemini/codex emit nothing until their harnesses grow background
+ * work, and a future harness only has to speak this shape — core never learns
+ * provider-specific event names.
+ */
+export type SessionScopedEvent =
+  | { type: "background_tasks"; tasks: readonly BackgroundTaskSnapshot[] }
+  | {
+      type: "background_task_settled";
+      taskId: string;
+      status: "completed" | "failed" | "stopped";
+      /** Compressed outcome — what the session is woken with. Never a raw transcript. */
+      summary: string;
+    };
+
 // ── TurnRun ───────────────────────────────────────────────────────────────────
 
 export interface TurnRun {
@@ -353,6 +404,14 @@ export interface AgentProvider {
 export interface SessionProvider extends AgentProvider {
   /** Set by Session before each runTurn(). Handles "backing session lost" errors. */
   onRecoveryNeeded: ((content: string) => void) | undefined;
+  /**
+   * The session-lifetime event listener (at most one — the owning Session).
+   * Session-scoped events MUST be delivered here and never through
+   * `TurnRun.events`: they can fire between turns, when the turn queue has no
+   * reader and would silently drop them. Optional — providers with no
+   * background work simply never call it.
+   */
+  onSessionEvent?: ((event: SessionScopedEvent) => void) | undefined;
   /** Underlying backing session ID (for display and Store persistence). */
   readonly backingSessionId: string;
   /** True once runTurn() has been called at least once (guards agent registration). */
