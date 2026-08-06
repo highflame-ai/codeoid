@@ -1026,13 +1026,29 @@ export interface SessionCreateMsg extends BaseClientMsg {
    */
   providerId?: string;
   /**
+   * Model for this session (docs/role-model-binding.md §6.2). Validated
+   * provider-aware at create (a Claude alias on a non-Claude backend is
+   * rejected); otherwise passed through — the live backend is the real
+   * validator. Absent + `pack`/`packRole` = the daemon resolves through the
+   * role's model-binding chain (config override → role pin → tier map);
+   * absent otherwise = the provider's default.
+   */
+  model?: string;
+  /**
    * Activate an installed SDLC pack on this session (ambient mode): inject its
    * constitution, expose its skills/subagents, and — with `packRole` — run
    * under that capability role. The daemon fail-closes on an unknown pack.
+   *
+   * With `collaboration`, this is pack ADOPTION (docs/role-model-binding.md
+   * §6): the pack — not the collab machinery — defines what each role is.
+   * Role names bind strictly to the pack's declared roles, envelopes come
+   * from the role YAML, and the constitution composes pack ETHOS → goal →
+   * roster under the real pack id.
    */
   pack?: string;
   /** Capability role (declared by `pack`) to run under, e.g. "reviewer"
-   *  (read-only). Requires `pack`. */
+   *  (read-only). Requires `pack`; rejected with `collaboration` (a collab's
+   *  roles each carry their own envelope from the pack). */
   packRole?: string;
 }
 
@@ -1958,6 +1974,13 @@ export interface PipelinePhaseWire {
   /** Capability role this phase runs under (from the pack) — a client can render
    *  the phase's tool envelope (e.g. a read-only reviewer). */
   role?: string;
+  /** The phase's bound backend/model + which precedence rung chose it
+   *  (docs/role-model-binding.md §3) — resolved once at create and persisted,
+   *  so a client can render "claude:claude-fable-5 ← config-tier" and name the
+   *  layer to fix when a model id fails at spawn. Absent = provider default. */
+  provider?: string;
+  model?: string;
+  resolvedFrom?: string;
   summary?: string;
   reason?: string;
   /** Set when status==="halted" — echo back in pipeline.answer / pipeline.revise. */
@@ -2016,6 +2039,11 @@ export interface PipelineCreateMsg extends BaseClientMsg {
   workdir?: string;
   /** Backend for the run's bound session (default: the daemon's default provider). */
   providerId?: string;
+  /** Invocation-time role→model bindings (CLI `--role`), keyed by role name —
+   *  the highest-precedence rung of the model-binding chain
+   *  (docs/role-model-binding.md §3). Keys must name roles the plan declares;
+   *  an unknown role or provider is a create-time error. */
+  roleBindings?: Record<string, { provider: string; model?: string }>;
 }
 export interface PipelineListMsg extends BaseClientMsg {
   type: "pipeline.list";
@@ -2059,6 +2087,10 @@ export interface PipelineSnapshotMsg {
   type: "pipeline.snapshot";
   requestId: string;
   pipeline: PipelineWire;
+  /** Create-time model-binding notes (a binding skipped because it targeted a
+   *  backend other than the run session's, an unmapped tier) — present only on
+   *  the pipeline.create reply, absent on get/answer/abort snapshots. */
+  warnings?: string[];
 }
 /** Reply to pipeline.list. */
 export interface PipelineListResultMsg {
@@ -2077,6 +2109,29 @@ export interface PackPhaseWire {
   role?: string;
   /** Exit-gate id, if the phase declares one. */
   gate?: string;
+}
+
+/** One declared role's effective model binding under the daemon's CURRENT
+ *  config with no CLI overrides — the pre-flight view (`pack show --resolve`,
+ *  docs/role-model-binding.md §4). Phase-level pins are deliberately excluded
+ *  from this per-role view and listed separately (`PackWire.phasePins`). */
+export interface PackResolvedRoleWire {
+  name: string;
+  /** The role's semantic capability class, if it declares one. */
+  tier?: string;
+  provider?: string;
+  model?: string;
+  /** Which precedence rung produced the binding ("config-role" | "role-pin" |
+   *  "config-tier" | "default"). */
+  resolvedFrom: string;
+}
+
+/** A phase-level concrete `provider:`/`model:` pin from pack.yaml — surfaced
+ *  separately so a stale pin stays visible next to the tier map's choice. */
+export interface PackPhasePinWire {
+  phase: string;
+  provider?: string;
+  model?: string;
 }
 
 /** An installed pack + its metadata + trust/selected state, for the browser. */
@@ -2100,6 +2155,13 @@ export interface PackWire {
   gates: { id: string; kind: string }[];
   /** Whether the pack is registered into the live pipeline manager (runnable). */
   active: boolean;
+  /** Pre-flight model-binding view (docs/role-model-binding.md §4): each
+   *  declared role's currently-effective binding under this daemon's config,
+   *  no CLI overrides. Absent on a broken pack. */
+  resolvedRoles?: PackResolvedRoleWire[];
+  /** Phase-level concrete pins from pack.yaml, listed separately from the
+   *  per-role view so staleness is visible. Absent on a broken pack. */
+  phasePins?: PackPhasePinWire[];
   /** Present when the configured pack dir could not be loaded (bad/missing
    *  pack.yaml) — the card renders as broken rather than vanishing silently. */
   error?: string;
@@ -2258,6 +2320,14 @@ export interface ResponseOkMsg {
   type: "response.ok";
   requestId: string;
   data?: unknown;
+  /**
+   * Non-fatal create-time notes the requester should see — e.g. a model
+   * binding skipped because it targeted a different backend, or a pack tier
+   * with no `modelTiers` mapping (docs/role-model-binding.md §5/§6). The
+   * request SUCCEEDED; these name what was quietly adjusted and which layer
+   * to fix. Clients render them; absent/empty means nothing to report.
+   */
+  warnings?: string[];
 }
 
 export interface ResponseErrorMsg {

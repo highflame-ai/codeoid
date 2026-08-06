@@ -16,11 +16,13 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CodeoidConfig } from "../config.js";
 import {
+  adoptPackRoles,
+  childBrief,
   compileGoalPack,
   orchestratorRole,
   orphanedChildBrief,
@@ -32,6 +34,7 @@ import {
   type PlannedChild,
   type ProviderLookup,
 } from "../daemon/collaboration.js";
+import type { RoleDef } from "../daemon/pipeline/pack.js";
 import { MockSessionProvider, mockResult } from "../daemon/providers/mock/session-provider.js";
 import type { MemoryEngine } from "../daemon/memory/index.js";
 import { ProviderRegistry } from "../daemon/providers/registry.js";
@@ -719,7 +722,10 @@ describe("collaboration children come up and are torn down", () => {
     expect(childrenOf(await allSessions(), (resp.data as SessionInfo).id)).toHaveLength(0);
   });
 
-  test("collaboration and pack are mutually exclusive", async () => {
+  // The old mutual-exclusivity rule is gone (docs/role-model-binding.md §6):
+  // a collaboration may now ADOPT a pack — but only an installed one, so an
+  // unknown pack still fail-closes before anything is built.
+  test("a collaboration naming an uninstalled pack rejects the create", async () => {
     const resp = await run({
       type: "session.create",
       id: "c5",
@@ -731,7 +737,7 @@ describe("collaboration children come up and are torn down", () => {
     expect(resp.type).toBe("response.error");
     if (resp.type === "response.error") {
       expect(resp.code).toBe("invalid_request");
-      expect(resp.error).toMatch(/mutually exclusive/);
+      expect(resp.error).toMatch(/not installed/);
     }
   });
 
@@ -755,6 +761,535 @@ describe("collaboration children come up and are torn down", () => {
     if (resp.type === "response.error") expect(resp.error).toMatch(/max 12/);
     // Nothing half-built.
     expect((await allSessions()).length).toBe(before);
+  });
+});
+
+// ── Pack adoption (docs/role-model-binding.md §6) ───────────────────────────
+
+/** The pack roles used across the adoption tests: an orchestrator, a pinned
+ *  implementer (role-pin rung), and a tiered read-only adversary. */
+const ADOPT_ROLES: Record<string, RoleDef> = {
+  orchestrator: { name: "orchestrator", write: false, network: false, envelope: "all" },
+  implementer: {
+    name: "implementer",
+    summary: "Build it.",
+    provider: "claude",
+    model: "claude-pinned-9",
+    write: true,
+    network: "read-only",
+    envelope: "all",
+  },
+  adversary: {
+    name: "adversary",
+    summary: "Refute, don't summarize.",
+    tier: "reasoning-max",
+    write: false,
+    network: false,
+    envelope: ["read", "grep", "glob", "bash"],
+  },
+};
+
+describe("adoptPackRoles (unit)", () => {
+  const adopt = (
+    roles: CollaborationConfig["roles"],
+    modelConfig?: Parameters<typeof adoptPackRoles>[1]["modelConfig"],
+    warn?: (m: string) => void,
+  ) =>
+    adoptPackRoles(
+      { goal: "g", roles },
+      { packId: "pk", roles: ADOPT_ROLES, modelConfig, warn },
+    );
+
+  test("an unbound role name fails, listing the pack's declared roles", () => {
+    const r = adopt([
+      { name: "orchestrator", providerId: "claude" },
+      { name: "review", providerId: "claude" },
+    ]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).toMatch(/declares no role "review"/);
+      expect(r.error).toMatch(/orchestrator, implementer, adversary/);
+    }
+  });
+
+  test("write authority comes from the role YAML, and a conflicting spec is an error", () => {
+    const ok = adopt([
+      { name: "orchestrator", providerId: "claude" },
+      { name: "implementer", providerId: "claude" },
+    ]);
+    expect(ok.ok).toBe(true);
+    if (ok.ok) expect(ok.config.roles[1]!.write).toBe(true); // YAML, not spec default
+
+    const clash = adopt([
+      { name: "orchestrator", providerId: "claude" },
+      { name: "implementer", providerId: "claude", write: false },
+    ]);
+    expect(clash.ok).toBe(false);
+    if (!clash.ok) expect(clash.error).toMatch(/write authority comes from pack/);
+  });
+
+  // The §6.1 chain, minus the phase-pin rung (no phases in a collaboration).
+  test("a cli spec model outranks the role pin and the tier map", () => {
+    const r = adopt(
+      [
+        { name: "orchestrator", providerId: "claude" },
+        { name: "implementer", providerId: "claude", model: "claude-cli-1" },
+      ],
+      { modelRoles: { "pk/implementer": { provider: "claude", model: "claude-surgical-2" } } },
+    );
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.config.roles[1]!.model).toBe("claude-cli-1");
+  });
+
+  test("config modelRoles outranks the role-YAML pin", () => {
+    const r = adopt(
+      [
+        { name: "orchestrator", providerId: "claude" },
+        { name: "implementer", providerId: "claude" },
+      ],
+      { modelRoles: { "pk/implementer": { provider: "claude", model: "claude-surgical-2" } } },
+    );
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.config.roles[1]!.model).toBe("claude-surgical-2");
+  });
+
+  test("the role-YAML pin applies when nothing above it binds", () => {
+    const r = adopt([
+      { name: "orchestrator", providerId: "claude" },
+      { name: "implementer", providerId: "claude" },
+    ]);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.config.roles[1]!.model).toBe("claude-pinned-9");
+  });
+
+  test("the tier map binds a tiered role, and an unmapped tier warns + defaults", () => {
+    const mapped = adopt(
+      [
+        { name: "orchestrator", providerId: "claude" },
+        { name: "adversary", providerId: "claude" },
+      ],
+      { modelTiers: { "reasoning-max": { provider: "claude", model: "claude-tiered-7" } } },
+    );
+    expect(mapped.ok).toBe(true);
+    if (mapped.ok) expect(mapped.config.roles[1]!.model).toBe("claude-tiered-7");
+
+    const warnings: string[] = [];
+    const unmapped = adopt(
+      [
+        { name: "orchestrator", providerId: "claude" },
+        { name: "adversary", providerId: "claude" },
+      ],
+      undefined,
+      (m) => warnings.push(m),
+    );
+    expect(unmapped.ok).toBe(true);
+    if (unmapped.ok) expect(unmapped.config.roles[1]!.model).toBeUndefined();
+    expect(warnings.join("\n")).toMatch(/tier "reasoning-max"/);
+  });
+
+  // The roster's provider is the operator's explicit word (the collab grammar
+  // makes it mandatory): a binding on another backend must not silently move
+  // the role there, and its model id doesn't transfer — fall to the backend
+  // default, loudly.
+  test("a winning binding on a different backend is skipped with a warning", () => {
+    const warnings: string[] = [];
+    const r = adopt(
+      [
+        { name: "orchestrator", providerId: "claude" },
+        { name: "implementer", providerId: "gemini" },
+      ],
+      undefined,
+      (m) => warnings.push(m),
+    );
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.config.roles[1]!.providerId).toBe("gemini"); // roster wins
+      expect(r.config.roles[1]!.model).toBeUndefined(); // pin didn't transfer
+    }
+    expect(warnings.join("\n")).toMatch(/role-pin.*"claude".*"gemini"/);
+  });
+
+  test("purpose defaults to the role YAML's summary, spec wins when set", () => {
+    const r = adopt([
+      { name: "orchestrator", providerId: "claude" },
+      { name: "adversary", providerId: "claude" },
+      { name: "implementer", providerId: "claude", purpose: "custom purpose" },
+    ]);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.config.roles[1]!.purpose).toBe("Refute, don't summarize.");
+    expect(r.config.roles[2]!.purpose).toBe("custom purpose");
+  });
+
+  // A model-only pin must not defeat the cross-vendor guard: a rung that names
+  // no provider still carries a vendor-shaped id, so it applies only when it
+  // validates for the roster's backend — otherwise it is SKIPPED with a
+  // warning, never handed to validateCollaboration to hard-fail a create over
+  // a model the operator never typed.
+  test("a model-only pin is validated for the roster's backend — skipped when vendor-shaped elsewhere", () => {
+    const roles: Record<string, RoleDef> = {
+      orchestrator: { name: "orchestrator", write: false, network: false, envelope: "all" },
+      scribe: {
+        name: "scribe",
+        // Model WITHOUT provider — the shape the original guard missed.
+        model: "claude-fable-5",
+        write: true,
+        network: false,
+        envelope: "all",
+      },
+    };
+    // On a claude roster the model-only pin applies.
+    const onClaude = adoptPackRoles(
+      {
+        goal: "g",
+        roles: [
+          { name: "orchestrator", providerId: "claude" },
+          { name: "scribe", providerId: "claude" },
+        ],
+      },
+      { packId: "pk", roles },
+    );
+    expect(onClaude.ok).toBe(true);
+    if (onClaude.ok) expect(onClaude.config.roles[1]!.model).toBe("claude-fable-5");
+
+    // On a gemini roster the claude-shaped id must NOT transfer: skipped with
+    // a warning naming the rung…
+    const warnings: string[] = [];
+    const onGemini = adoptPackRoles(
+      {
+        goal: "g",
+        roles: [
+          { name: "orchestrator", providerId: "claude" },
+          { name: "scribe", providerId: "gemini" },
+        ],
+      },
+      { packId: "pk", roles, warn: (m) => warnings.push(m) },
+    );
+    expect(onGemini.ok).toBe(true);
+    if (!onGemini.ok) return;
+    expect(onGemini.config.roles[1]!.model).toBeUndefined();
+    expect(warnings.join("\n")).toMatch(/role-pin/);
+    expect(warnings.join("\n")).toMatch(/not valid for backend "gemini"/);
+    // …so the adopted config sails through validateCollaboration instead of
+    // hard-failing on a model the operator never typed.
+    const checked = validateCollaboration(onGemini.config, LOOKUP);
+    expect(checked.ok).toBe(true);
+    if (checked.ok) expect(checked.config.roles[1]!.model).toBeUndefined();
+  });
+});
+
+describe("pack-adopted posture + constitution (unit)", () => {
+  const child: PlannedChild = {
+    roleName: "adversary",
+    ordinal: 1,
+    providerId: "claude",
+    shape: "scout",
+    write: false,
+  };
+
+  test("roleChildPosture passes the role YAML's real envelope through", () => {
+    const p = roleChildPosture(child, "parent", "brief", {
+      packId: "pk",
+      role: ADOPT_ROLES.adversary!,
+    });
+    expect(p.pack.id).toBe("pk");
+    expect(p.pack.role.network).toBe(false);
+    expect(p.pack.role.envelope).toEqual(["read", "grep", "glob", "bash"]);
+    expect(p.pack.role.write).toBe(false);
+    // Scout hardening is unchanged — the shape still comes from the plan.
+    expect(p.workerShape).toBe("scout");
+  });
+
+  test("without adoption the synthesized free-form posture is unchanged", () => {
+    const p = roleChildPosture(child, "parent", "brief");
+    expect(p.pack.id).toBe("collaboration");
+    expect(p.pack.role).toEqual({
+      name: "adversary",
+      write: false,
+      network: "read-only",
+      envelope: "all",
+    });
+  });
+
+  test("compileGoalPack composes ETHOS → goal → roster under the real pack id", () => {
+    const config: CollaborationConfig = { goal: "Ship it", roles: [] };
+    const compiled = compileGoalPack(config, [child], {
+      id: "pk",
+      constitution: "PACK ETHOS: verify, don't trust.",
+    });
+    expect(compiled.id).toBe("pk");
+    const ethosAt = compiled.constitution.indexOf("PACK ETHOS");
+    const goalAt = compiled.constitution.indexOf("Ship it");
+    const rosterAt = compiled.constitution.indexOf("- adversary");
+    expect(ethosAt).toBe(0);
+    expect(goalAt).toBeGreaterThan(ethosAt);
+    expect(rosterAt).toBeGreaterThan(goalAt);
+  });
+
+  test("free-form compileGoalPack keeps the synthetic id and constitution", () => {
+    const config: CollaborationConfig = { goal: "Ship it", roles: [] };
+    const compiled = compileGoalPack(config, [child]);
+    expect(compiled.id).toBe("collaboration");
+    expect(compiled.constitution.startsWith("# Collaborative session")).toBe(true);
+  });
+
+  test("childBrief opens with the pack ETHOS when adopted, unchanged otherwise", () => {
+    const config: CollaborationConfig = { goal: "Ship it", roles: [] };
+    const adopted = childBrief(config, child, "PACK ETHOS: verify, don't trust.");
+    expect(adopted.startsWith("PACK ETHOS")).toBe(true);
+    expect(adopted).toContain("GOAL: Ship it");
+    const plain = childBrief(config, child);
+    expect(plain.startsWith("<collaboration")).toBe(true);
+  });
+});
+
+describe("session.create --collaborate --pack (adoption, end to end)", () => {
+  /** Write a real pack dir the PackService can load. */
+  function writePack(base: string): string {
+    const dir = join(base, "pack-collab");
+    mkdirSync(join(dir, "roles"), { recursive: true });
+    writeFileSync(
+      join(dir, "pack.yaml"),
+      [
+        "schema: codeoid/pack@v1",
+        "id: collab-pack",
+        "name: Collab Pack",
+        "version: 1.0.0",
+        "constitution: ETHOS.md",
+        "roles:",
+        "  - roles/orchestrator.yaml",
+        "  - roles/implementer.yaml",
+        "  - roles/adversary.yaml",
+        "phases:",
+        "  - id: build",
+        "    kind: noop",
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(join(dir, "ETHOS.md"), "PACK ETHOS: verify, don't trust.\n");
+    writeFileSync(
+      join(dir, "roles", "orchestrator.yaml"),
+      "name: orchestrator\nwrite: false\nenvelope: all\n",
+    );
+    writeFileSync(
+      join(dir, "roles", "implementer.yaml"),
+      [
+        "name: implementer",
+        "summary: Build it.",
+        "provider: claude",
+        "model: claude-pinned-9",
+        "write: true",
+        "network: read-only",
+        "envelope: all",
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(
+      join(dir, "roles", "adversary.yaml"),
+      [
+        "name: adversary",
+        "summary: Refute, don't summarize.",
+        "tier: reasoning-max",
+        "write: false",
+        "network: false",
+        "envelope: [read, grep, glob, bash]",
+        "",
+      ].join("\n"),
+    );
+    return dir;
+  }
+
+  /** Swap in a manager whose config has the pack installed + operator maps.
+   *  The module-level `run`/`allSessions` helpers then drive THIS manager. */
+  function useManagerWithPack(): void {
+    const dir = writePack(tmp);
+    manager = new SessionManager(store, transcript, undefined, undefined, undefined, {
+      config: mkConfig({
+        pipeline: {
+          enabled: false,
+          defaultPack: null,
+          packs: [{ dir, trusted: false }],
+          modelTiers: { "reasoning-max": { provider: "claude", model: "claude-tiered-7" } },
+        },
+      }),
+      providers: makeRegistry(),
+    });
+  }
+
+  const ADOPTING: CollaborationConfig = {
+    goal: "Add rate limiting to the public API",
+    roles: [
+      { name: "orchestrator", providerId: "claude" },
+      { name: "implementer", providerId: "claude" },
+      { name: "adversary", providerId: "claude" },
+    ],
+  };
+
+  test("adopts the pack: real id, YAML write authority, chain-resolved models", async () => {
+    useManagerWithPack();
+    const resp = await run({
+      type: "session.create",
+      id: "pa1",
+      name: "adopt1",
+      workdir,
+      collaboration: ADOPTING,
+      pack: "collab-pack",
+    });
+    expect(resp.type).toBe("response.ok");
+    if (resp.type !== "response.ok") return;
+    const parent = resp.data as SessionInfo;
+
+    // The synthetic pack id gave way to the real one.
+    expect(parent.profile).toBe("collab-pack");
+
+    // Adoption rewrote the roles: write from the YAML, models from the chain
+    // (role pin for implementer, tier map for adversary).
+    const roles = Object.fromEntries((parent.collaboration?.roles ?? []).map((r) => [r.name, r]));
+    expect(roles.implementer!.write).toBe(true);
+    expect(roles.implementer!.model).toBe("claude-pinned-9");
+    expect(roles.adversary!.write).toBe(false);
+    expect(roles.adversary!.model).toBe("claude-tiered-7");
+
+    // Children carry the pack posture — profile names the real pack + role.
+    const kids = childrenOf(await allSessions(), parent.id);
+    expect(kids).toHaveLength(2);
+    expect(kids.map((k) => k.profile)).toEqual([
+      "collab-pack (adversary)",
+      "collab-pack (implementer)",
+    ]);
+    expect(kids.map((k) => k.model)).toEqual(["claude-tiered-7", "claude-pinned-9"]);
+    expect(kids.map((k) => k.collaborationRole!.write)).toEqual([false, true]);
+  });
+
+  test("an unbound role name rejects the create, listing the pack's roles", async () => {
+    useManagerWithPack();
+    const resp = await run({
+      type: "session.create",
+      id: "pa2",
+      name: "adopt2",
+      workdir,
+      collaboration: {
+        goal: "g",
+        roles: [
+          { name: "orchestrator", providerId: "claude" },
+          { name: "review", providerId: "gemini", count: 2 },
+        ],
+      },
+      pack: "collab-pack",
+    });
+    expect(resp.type).toBe("response.error");
+    if (resp.type === "response.error") {
+      expect(resp.code).toBe("invalid_request");
+      expect(resp.error).toMatch(/declares no role "review"/);
+      expect(resp.error).toMatch(/orchestrator, implementer, adversary/);
+    }
+    expect((await allSessions()).length).toBe(0);
+  });
+
+  test("packRole is rejected on a collaborative create", async () => {
+    useManagerWithPack();
+    const resp = await run({
+      type: "session.create",
+      id: "pa3",
+      name: "adopt3",
+      workdir,
+      collaboration: ADOPTING,
+      pack: "collab-pack",
+      packRole: "adversary",
+    });
+    expect(resp.type).toBe("response.error");
+    if (resp.type === "response.error") {
+      expect(resp.error).toMatch(/packRole does not apply/);
+    }
+  });
+
+  // §6.2: a single --pack --pack-role session with no --model resolves through
+  // the same chain minus the phase-pin and cli rungs.
+  test("a single pack-role session resolves its model through the chain", async () => {
+    useManagerWithPack();
+    const pinned = await run({
+      type: "session.create",
+      id: "pa5",
+      name: "single-pinned",
+      workdir,
+      pack: "collab-pack",
+      packRole: "implementer",
+    });
+    expect(pinned.type).toBe("response.ok");
+    if (pinned.type === "response.ok") {
+      const info = pinned.data as SessionInfo;
+      expect(info.model).toBe("claude-pinned-9"); // role-pin rung
+      expect(info.providerId).toBe("claude"); // the pin's provider, adopted
+    }
+
+    const tiered = await run({
+      type: "session.create",
+      id: "pa6",
+      name: "single-tiered",
+      workdir,
+      pack: "collab-pack",
+      packRole: "adversary",
+    });
+    expect(tiered.type).toBe("response.ok");
+    if (tiered.type === "response.ok") {
+      expect((tiered.data as SessionInfo).model).toBe("claude-tiered-7"); // tier rung
+    }
+  });
+
+  test("an explicit model outranks the pack role's binding (§6.2 cli rung)", async () => {
+    useManagerWithPack();
+    const resp = await run({
+      type: "session.create",
+      id: "pa7",
+      name: "single-explicit",
+      workdir,
+      pack: "collab-pack",
+      packRole: "implementer",
+      model: "claude-explicit-3",
+    });
+    expect(resp.type).toBe("response.ok");
+    if (resp.type === "response.ok") {
+      expect((resp.data as SessionInfo).model).toBe("claude-explicit-3");
+    }
+  });
+
+  test("model does not apply to a collaborative create", async () => {
+    useManagerWithPack();
+    const resp = await run({
+      type: "session.create",
+      id: "pa8",
+      name: "collab-model",
+      workdir,
+      collaboration: ADOPTING,
+      pack: "collab-pack",
+      model: "claude-explicit-3",
+    });
+    expect(resp.type).toBe("response.error");
+    if (resp.type === "response.error") {
+      expect(resp.error).toMatch(/model does not apply to a collaborative session/);
+    }
+  });
+
+  test("*count fan-out stays valid under adoption", async () => {
+    useManagerWithPack();
+    const resp = await run({
+      type: "session.create",
+      id: "pa4",
+      name: "adopt4",
+      workdir,
+      collaboration: {
+        goal: "g",
+        roles: [
+          { name: "orchestrator", providerId: "claude" },
+          { name: "adversary", providerId: "claude", count: 2 },
+        ],
+      },
+      pack: "collab-pack",
+    });
+    expect(resp.type).toBe("response.ok");
+    if (resp.type !== "response.ok") return;
+    const kids = childrenOf(await allSessions(), (resp.data as SessionInfo).id);
+    expect(kids.map((k) => k.collaborationRole!.ordinal)).toEqual([1, 2]);
   });
 });
 
@@ -1308,6 +1843,31 @@ describe("collaboration survives a daemon restart", () => {
     expect(byRole.get("review#1")!.collaborationRole!.write).toBe(false);
     expect(byRole.get("review#2")!.collaborationRole!.write).toBe(false);
     expect(byRole.get("reasoning#1")!.collaborationRole!.write).toBe(true);
+  });
+
+  test("a child bound to a model resumes WITH it, not on the provider default", async () => {
+    // #resumeRoleChild built its options without defaultModel, so a child
+    // bound via the roster (or the tier map) came back on the provider default
+    // while SessionInfo still displayed the resolved model. Same source as the
+    // spawn path (`plannedChildFor`) — the two cannot drift.
+    manager.setBlackboardUrl(BLACKBOARD_URL);
+    const cfg: CollaborationConfig = {
+      goal: "resume with the bound model",
+      roles: [
+        { name: "orchestrator", providerId: "claude" },
+        { name: "review", providerId: "gemini", model: "gemini-2.5-pro" },
+      ],
+    };
+    const resp = await run({ type: "session.create", id: "rsm", name: "rsm", workdir, collaboration: cfg });
+    if (resp.type !== "response.ok") throw new Error(`create failed: ${JSON.stringify(resp)}`);
+    const parent = resp.data as SessionInfo;
+    const before = childrenOf(await allSessions(), parent.id);
+    expect(before).toHaveLength(1);
+    expect(before[0]!.model).toBe("gemini-2.5-pro");
+
+    const kids = childrenOf(await listFrom(await restart()), parent.id);
+    expect(kids).toHaveLength(1);
+    expect(kids[0]!.model).toBe("gemini-2.5-pro");
   });
 
   test("the capability role comes back, so roleDeniesTool has something to deny with", async () => {

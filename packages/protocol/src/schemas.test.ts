@@ -49,6 +49,7 @@ const samples: { [T in ClientTypes]: Extract<ClientMessage, { type: T }> } = {
     name: "demo",
     workdir: "/tmp/w",
     providerId: "pi",
+    model: "some-model",
   },
   "session.list": { type: "session.list", id: "r3" },
   "session.attach": { type: "session.attach", id: "r4", sessionId: "s1" },
@@ -219,6 +220,53 @@ describe("pipeline.create — pack / role / optional phases", () => {
       pack: "aif-sdlc",
     });
     expect(r.ok).toBe(false);
+  });
+
+  test("roleBindings round-trip through validation (must not be stripped)", () => {
+    const r = parseClientMessage({
+      type: "pipeline.create",
+      id: "x",
+      name: "R",
+      pack: "aif-sdlc",
+      roleBindings: { adversary: { provider: "claude", model: "claude-fable-5" }, verifier: { provider: "claude" } },
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok && r.value.type === "pipeline.create") {
+      expect(r.value.roleBindings).toEqual({
+        adversary: { provider: "claude", model: "claude-fable-5" },
+        verifier: { provider: "claude" },
+      });
+    }
+  });
+
+  test("REJECTS a role binding without a provider", () => {
+    const r = parseClientMessage({
+      type: "pipeline.create",
+      id: "x",
+      name: "R",
+      pack: "aif-sdlc",
+      roleBindings: { adversary: { model: "claude-fable-5" } },
+    });
+    expect(r.ok).toBe(false);
+  });
+
+  test("REJECTS an empty-string phase provider/model (a phantom phase-pin)", () => {
+    // An empty string would persist as a "phase-pin" that wins the binding
+    // chain while meaning nothing — same min(1) bound roleBindings enforce.
+    const emptyProvider = parseClientMessage({
+      type: "pipeline.create",
+      id: "x",
+      name: "R",
+      phases: [{ id: "a", kind: "noop", provider: "" }],
+    });
+    expect(emptyProvider.ok).toBe(false);
+    const emptyModel = parseClientMessage({
+      type: "pipeline.create",
+      id: "x",
+      name: "R",
+      phases: [{ id: "a", kind: "noop", model: "" }],
+    });
+    expect(emptyModel.ok).toBe(false);
   });
 });
 

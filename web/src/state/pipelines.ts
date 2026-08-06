@@ -38,6 +38,10 @@ interface PipelinesState {
   busy: boolean;
   /** Last fetch/steer error (e.g. "Pipeline is disabled" or a scope rejection). */
   error: string | null;
+  /** Create-time model-binding notes from the daemon (a binding skipped because
+   *  it targets a backend other than the run session's, an unmapped tier —
+   *  docs/role-model-binding.md §5). Set once at create; polls don't carry them. */
+  warnings: string[];
 }
 
 const EMPTY: PipelinesState = {
@@ -45,6 +49,7 @@ const EMPTY: PipelinesState = {
   loading: false,
   busy: false,
   error: null,
+  warnings: [],
 };
 
 const [state, setState] = createSignal<PipelinesState>(EMPTY);
@@ -222,6 +227,12 @@ export async function runPipeline(opts: {
       },
     );
     applySnapshot(snap);
+    // Surface the daemon's create-time binding notes (only the create reply
+    // carries them — the poll loop's snapshots don't, so they persist here).
+    if (snap?.warnings && snap.warnings.length > 0) {
+      const warnings = snap.warnings;
+      setState((s) => ({ ...s, warnings }));
+    }
     if (snap?.pipeline) {
       const p = snap.pipeline;
       // Focus the bound session so the run shows up as a normal, interruptible

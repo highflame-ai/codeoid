@@ -22,6 +22,7 @@ import { program } from "commander";
 import pkg from "../package.json" with { type: "json" };
 import { DaemonServer } from "./daemon/server.js";
 import { parseRoleSpec } from "./daemon/collaboration.js";
+import { type ModelBinding, roleBindingsFromSpecs } from "./daemon/pipeline/binding.js";
 import {
   assertLocalBindAllowed,
   isLoopbackHost,
@@ -439,12 +440,16 @@ program
     "Agent backend for this session (claude | codex | gemini-cli | pi | openai | gemini). Default: the daemon's default.",
   )
   .option(
+    "--model <id>",
+    "Model for this session (validated against --provider). Omitted with --pack/--pack-role, the model resolves through the role's binding chain (config override → role pin → tier map).",
+  )
+  .option(
     "--pack <id>",
-    "Activate an installed SDLC pack on the session (inject its constitution, expose its skills/subagents).",
+    "Activate an installed SDLC pack on the session (inject its constitution, expose its skills/subagents). With --collaborate, the collaboration ADOPTS the pack: role names bind strictly to the pack's declared roles.",
   )
   .option(
     "--pack-role <role>",
-    "Run the session under a capability role the pack declares (e.g. reviewer = read-only). Requires --pack.",
+    "Run the session under a capability role the pack declares (e.g. reviewer = read-only). Requires --pack; not valid with --collaborate.",
   )
   .option(
     "--collaborate <goal>",
@@ -465,6 +470,7 @@ program
         repo?: string;
         worktreeDir?: string;
         provider?: string;
+        model?: string;
         pack?: string;
         packRole?: string;
         collaborate?: string;
@@ -518,6 +524,7 @@ program
       await client.connect();
       await client.createSession(name, resolvedWorkdir, {
         providerId: opts.provider,
+        model: opts.model,
         pack: opts.pack,
         packRole: opts.packRole,
         collaboration,
@@ -632,7 +639,13 @@ pack
 pack
   .command("show <id>")
   .description("Show a pack's phases, roles, gates, and trust state")
-  .action((id: string) => withClient((c) => c.packShow(id)));
+  .option(
+    "--resolve",
+    "Also show each role's effective model binding under this daemon's config (the pre-flight view), plus any phase-level pins",
+  )
+  .action((id: string, opts: { resolve?: boolean }) =>
+    withClient((c) => c.packShow(id, { resolve: opts.resolve })),
+  );
 
 pack
   .command("trust <id>")
@@ -662,9 +675,29 @@ pipeline
   .requiredOption("--pack <id>", "Installed pack to run")
   .requiredOption("--goal <text>", "The feature / goal seeding the run")
   .option("--workdir <path>", "Repo the phases operate in (default: current directory)")
-  .action((opts: { pack: string; goal: string; workdir?: string }) =>
-    withClient((c) => c.pipelineRun(opts.pack, opts.goal, opts.workdir ?? process.cwd())),
-  );
+  .option(
+    "--role <spec>",
+    'Bind a role to a backend for this run, repeatable: "name:provider[:model]" (e.g. adversary:claude:claude-fable-5). Outranks config maps and pack pins. No *count — pipelines run one session per phase.',
+    (value: string, previous: string[] = []) => [...previous, value],
+    [] as string[],
+  )
+  .action((opts: { pack: string; goal: string; workdir?: string; role: string[] }) => {
+    // Same grammar as collab `--role` (one grammar everywhere —
+    // docs/role-model-binding.md §2.3). The *count rejection is CLI-only — the
+    // wire `roleBindings` shape has no count field, so a raw wire client can't
+    // express one. The semantic checks (role exists, provider registered)
+    // re-run daemon-side so the CLI and the wire path fail identically.
+    let roleBindings: Record<string, ModelBinding> | undefined;
+    if (opts.role.length > 0) {
+      try {
+        roleBindings = roleBindingsFromSpecs(opts.role.map(parseRoleSpec));
+      } catch (e) {
+        console.error(e instanceof Error ? e.message : String(e));
+        process.exit(1);
+      }
+    }
+    return withClient((c) => c.pipelineRun(opts.pack, opts.goal, opts.workdir ?? process.cwd(), roleBindings));
+  });
 
 pipeline
   .command("list")

@@ -11,6 +11,11 @@
  */
 
 import { randomUUID } from "node:crypto";
+// Provider-aware model validation for resolved bindings — same house policy as
+// explicit --model on session create (docs/role-model-binding.md §5). No
+// Session dependency: models.ts is a pure catalog module.
+import { resolveModelIdForProvider } from "../models.js";
+import { type ModelBinding, type ModelBindingConfig, resolveBinding } from "./binding";
 import { registerBuiltins } from "./builtin";
 import { PipelineEngine } from "./engine";
 import type { Pack, PhaseDef, PipelineRegistries, PipelineState } from "./interface";
@@ -37,6 +42,27 @@ export interface CreatePipelineOpts {
   createdBy: string;
   spec?: string;
   workdir?: string;
+  /** Invocation-time role→model bindings (CLI `--role` / wire `roleBindings`),
+   *  keyed by role name — the highest-precedence rung of the model-binding
+   *  chain (docs/role-model-binding.md §3). Keys must name roles the plan
+   *  declares; an unknown name is a create-time error listing the declared
+   *  roles (discoverability beats silence — §5). */
+  roleBindings?: Record<string, ModelBinding>;
+  /** The operator's tier/role model maps (config `pipeline.modelTiers` /
+   *  `pipeline.modelRoles`), read ONCE here at create. The resolved binding is
+   *  persisted per phase, so resume/retry replay the persisted state and a run
+   *  stays deterministic even if config changes underneath it. */
+  modelConfig?: ModelBindingConfig;
+  /** The bound run-session's backend id. A run drives ONE session on one
+   *  provider, so a resolved binding naming a DIFFERENT provider cannot apply —
+   *  it is skipped here at create (with a warning naming the rung) and never
+   *  persisted as effective (docs/role-model-binding.md §3). Absent = no
+   *  cross-provider filtering (pure unit tests without a session). */
+  sessionProvider?: string;
+  /** Sink for create-time binding warnings (skipped cross-provider bindings,
+   *  invalid model ids, unmapped tiers). Defaults to console.warn; the daemon
+   *  passes a collector so the creating client sees them too. */
+  warn?: (msg: string) => void;
 }
 
 export interface PipelineManagerOptions {
@@ -78,7 +104,8 @@ export class PipelineManager {
    *  kind/gate/skill that isn't registered, a `skill` phase has no skill id, or
    *  two phases share an id (fail fast). */
   create(opts: CreatePipelineOpts): PipelineState {
-    const phases = this.#resolvePhases(opts);
+    const { phases: plan, pack } = this.#resolvePhases(opts);
+    const phases = this.#bindModels(plan, pack, opts);
     this.#validate(phases);
     const ts = Date.now();
     const state: PipelineState = {
@@ -280,18 +307,124 @@ export class PipelineManager {
     return s;
   }
 
-  /** Resolve the phase plan from either explicit `phases` or an installed pack. */
-  #resolvePhases(opts: CreatePipelineOpts): PhaseDef[] {
+  /** Resolve the phase plan from either explicit `phases` or an installed pack.
+   *  Returns the pack too (when used) so model binding can read its roles. */
+  #resolvePhases(opts: CreatePipelineOpts): { phases: PhaseDef[]; pack?: Pack } {
     if (opts.pack && opts.phases) {
       throw new Error("create: provide either `phases` or `pack`, not both");
     }
     if (opts.pack) {
       const pack = this.#registries.packs.resolve(opts.pack);
       if (!pack) throw new Error(`create: unknown pack "${opts.pack}" — install it first (installPack)`);
-      return pack.pipeline;
+      return { phases: pack.pipeline, pack };
     }
-    if (opts.phases) return opts.phases;
+    if (opts.phases) return { phases: opts.phases };
     throw new Error("create: provide `phases` or `pack`");
+  }
+
+  /**
+   * Resolve each phase's model binding ONCE, here at create, and persist it on
+   * the phase def (docs/role-model-binding.md §3) — resume and retry then read
+   * the persisted binding, never re-resolve, so a run is deterministic even if
+   * config changes underneath it. A bound def is a CLONE: a pack's `pipeline`
+   * array is shared by every run created from it, so annotating the originals
+   * would leak one run's bindings into the next run (and into the registry).
+   */
+  #bindModels(phases: PhaseDef[], pack: Pack | undefined, opts: CreatePipelineOpts): PhaseDef[] {
+    const warn = opts.warn ?? ((m: string) => console.warn(`[pipeline] ${m}`));
+    // Role names match case-insensitively — the SAME rule adoptPackRoles applies
+    // on the collab path (one grammar, one rule — docs/role-model-binding.md §5).
+    const bindings = new Map<string, ModelBinding>();
+    for (const [name, b] of Object.entries(opts.roleBindings ?? {})) bindings.set(name.toLowerCase(), b);
+    // Fail fast on a binding for a role the plan doesn't declare — a typo'd
+    // `--role adversry:…` must not silently no-op (§5). Pack path validates
+    // against the pack's declared roles; an explicit plan against the role
+    // names its phases reference.
+    const declared = pack?.roles
+      ? Object.keys(pack.roles)
+      : [...new Set(phases.map((p) => p.role).filter((r): r is string => r !== undefined))];
+    const declaredKeys = new Set(declared.map((n) => n.toLowerCase()));
+    for (const name of Object.keys(opts.roleBindings ?? {})) {
+      if (!declaredKeys.has(name.toLowerCase())) {
+        const have = declared.length > 0 ? declared.join(", ") : "none";
+        const where = pack ? `pack "${pack.id}" declares` : "the phase plan declares";
+        throw new Error(`create: unknown role "${name}" in role bindings — ${where}: ${have}`);
+      }
+    }
+    // An unmapped tier is NEVER an error (packs must stay portable to machines
+    // that haven't mapped anything) — one warning per tier, here at create.
+    const warnedTiers = new Set<string>();
+    // A skipped binding must not be RENDERED as one: strip any pin fields off
+    // the def so status/CLI never display a provider/model that won't apply.
+    const unbound = (def: PhaseDef): PhaseDef => {
+      const clean = { ...def };
+      delete clean.provider;
+      delete clean.model;
+      delete clean.resolvedFrom;
+      return clean;
+    };
+    return phases.map((def) => {
+      const role = def.role !== undefined ? pack?.roles?.[def.role] : undefined;
+      const hasPin = def.provider !== undefined || def.model !== undefined;
+      const resolved = resolveBinding({
+        packId: pack?.id,
+        roleName: def.role,
+        role,
+        cliBinding: def.role !== undefined ? bindings.get(def.role.toLowerCase()) : undefined,
+        phasePin: hasPin ? { provider: def.provider, model: def.model } : undefined,
+        config: opts.modelConfig,
+      });
+      if (resolved.resolvedFrom === "default") {
+        if (role?.tier !== undefined && !warnedTiers.has(role.tier)) {
+          warnedTiers.add(role.tier);
+          warn(
+            `role "${def.role}" declares tier "${role.tier}" but no modelTiers mapping exists — using the provider default`,
+          );
+        }
+        // No binding — leave the def untouched (absent resolvedFrom = default),
+        // exactly today's behavior for role-less / unbound phases.
+        return def;
+      }
+      // A bound run-session cannot swap backends mid-run: a run drives ONE
+      // session on one provider (docs/role-model-binding.md §3). Same rule as
+      // collab adoption — the session's provider is authoritative, so a binding
+      // naming a different backend is SKIPPED here (never persisted as
+      // effective), with a warning naming the rung to fix. It does not fall
+      // through to a lower rung: the winning rung is the operator's intent.
+      if (
+        resolved.provider !== undefined &&
+        opts.sessionProvider !== undefined &&
+        resolved.provider !== opts.sessionProvider
+      ) {
+        warn(
+          `phase "${def.id}"${def.role ? ` (role "${def.role}")` : ""}: the ${resolved.resolvedFrom} binding targets provider "${resolved.provider}" but this run's session is bound to "${opts.sessionProvider}" — a run drives one session on one backend; skipping the binding (using the session's model)`,
+        );
+        return unbound(def);
+      }
+      // Provider-matching (or provider-absent) bindings apply their MODEL —
+      // but only if it validates for the session's backend. A vendor-shaped id
+      // must never silently transfer (a model-only pin written for claude is
+      // meaningless on another backend); skip with a warning, don't hard-fail
+      // a create for a model the operator never typed (§5).
+      if (resolved.model !== undefined) {
+        const target = resolved.provider ?? opts.sessionProvider;
+        if (resolveModelIdForProvider(resolved.model, target) === null) {
+          warn(
+            `phase "${def.id}"${def.role ? ` (role "${def.role}")` : ""}: the ${resolved.resolvedFrom} binding's model "${resolved.model}" is not valid for provider "${target ?? "claude"}" — skipping the binding (using the session's model)`,
+          );
+          return unbound(def);
+        }
+      }
+      // The winning rung supplies the WHOLE binding: a provider-only binding
+      // means "that provider's default model", so a lower rung's model must not
+      // survive underneath it (delete, don't merge).
+      const bound: PhaseDef = { ...def, resolvedFrom: resolved.resolvedFrom };
+      if (resolved.provider !== undefined) bound.provider = resolved.provider;
+      else delete bound.provider;
+      if (resolved.model !== undefined) bound.model = resolved.model;
+      else delete bound.model;
+      return bound;
+    });
   }
 
   #validate(phases: PhaseDef[]): void {

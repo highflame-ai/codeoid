@@ -1,6 +1,8 @@
 # Per-Role Model Binding — Design
 
-> Status: **proposal — decisions resolved, ready to implement** · Builds on
+> Status: **slices 1–3 implemented** — resolution chain, pipeline `--role` +
+> per-phase model application at run time, `pack show --resolve`, pack-adopted
+> collaborations, `--model` on single sessions. Builds on
 > [`pack-loading.md`](./pack-loading.md) and
 > [`collaborative-session-design.md`](./collaborative-session-design.md).
 > Goal: let an operator decide **which model serves each role** — per machine,
@@ -11,12 +13,13 @@
 
 ## 1. Problem
 
-Model choice currently lives in four disconnected places, three of them in
+Model choice currently lives in five disconnected places, four of them in
 codeoid:
 
 | Surface | Mechanism | Granularity | Changeable at invocation? |
 |---|---|---|---|
 | Pack phases | `provider:`/`model:` in `pack.yaml`, baked at `loadPack` | per phase | ❌ — edit + push + re-install |
+| Pack roles | `provider:`/`model:` in the role YAML (the role→backend binding added for the collab fleet path — `roleSchema` in `pack.ts`) | per role | ❌ — edit + push + re-install |
 | Collab sessions | `--role "name:provider[:model][*count]"` (`parseRoleSpec`) | per role-child | ✅ |
 | Single sessions | `--provider` only | per session, provider default model | ⚠️ provider only |
 | ai-factory agents | `tier:` frontmatter + `aif agents render` (class → model map in config, per-agent overrides) | per agent | via config |
@@ -66,7 +69,10 @@ to the provider default and logs one warning at create — never an error
 (packs must stay portable to machines that haven't mapped anything).
 
 Concrete `provider:`/`model:` on a *phase* remain supported (they are part of
-the shipped schema), but registry lint guidance steers pack authors to tiers.
+the shipped schema), as do the role-level `provider:`/`model:` pins already on
+the role YAML (`roleSchema` — added as the role→backend binding for the collab
+fleet path). Both sit in the precedence chain (§3); registry lint guidance
+steers pack authors to tiers.
 
 ### 2.2 Operator config maps tiers → models
 
@@ -107,23 +113,49 @@ codeoid pipeline run --pack yash-dev --goal "…" \
 ## 3. Resolution
 
 Resolved **once, at `pipeline.create`**, per phase, and persisted. Precedence
-(first match wins):
+(first match wins; the winning rung supplies the *whole* `{provider, model}` —
+a provider-only binding means that backend's default model, never a model
+inherited from a lower rung):
 
 1. **CLI `--role`** for the phase's role — the operator's explicit word at
-   invocation.
+   invocation (`resolvedFrom: "cli"`).
 2. **Config `modelRoles["<packId>/<roleName>"]`** — surgical per-pack-role
-   override.
+   override (`"config-role"`).
 3. **Phase-level concrete `provider:`/`model:` pin in `pack.yaml`** — the
    pack author's explicit pin (kept above the tier map so an explicit pin
-   means what it says; see Decision D1).
-4. **Config `modelTiers[<role.tier>]`** — the machine's class map.
-5. **Provider default** — today's behavior, unchanged.
+   means what it says; see Decision D1) (`"phase-pin"`).
+4. **Role-level concrete `provider:`/`model:` pin in the role YAML** — the
+   role→backend binding `roleSchema` already carries for the collab fleet
+   path; a phase pin (more specific) outranks it (`"role-pin"`).
+5. **Config `modelTiers[<role.tier>]`** — the machine's class map
+   (`"config-tier"`).
+6. **Provider default** — today's behavior, unchanged (`"default"`; nothing is
+   persisted on the def, so absence of `resolvedFrom` *is* the default rung).
 
 The resolved `{provider, model, resolvedFrom}` is written into each phase's
 def in `PipelineState` at create. **Resume and retry use the persisted
 binding**, not a re-resolution — a run is deterministic even if config
 changes underneath it. (`resolvedFrom` names the precedence rung, for
-display and debugging.)
+display and debugging.) The chain is one pure function —
+`resolveBinding()` in `src/daemon/pipeline/binding.ts` — shared by
+`manager.create`, `pack show --resolve`, and (slice 3) the collab path.
+
+**The run session's provider is authoritative.** A pipeline run drives ONE
+bound session on one backend, so a resolved binding cannot swap providers
+mid-run. Same rule as collab adoption (§6.1): at create, a winning rung whose
+binding names a provider *different* from the run session's is **skipped** —
+a create-time warning names the rung, and the binding is NOT persisted as
+effective (status never renders a binding that won't apply). It does not fall
+through to a lower rung. Same-provider (or provider-absent) bindings apply
+their **model**, validated provider-aware like an explicit `--model` (§5).
+
+**How the model is applied.** At each phase turn the run host sets the bound
+session's model to the phase's persisted binding before injecting the prompt,
+and restores the previous model after the phase — reliably, even when the
+phase fails. The per-phase override is deliberately NOT persisted as the
+session's model choice (a daemon crash mid-phase resumes on the pre-override
+model; the re-driven phase re-applies it), and an explicit `session.set_model`
+by the user mid-phase wins over the restore.
 
 ## 4. Surfaces
 
@@ -132,25 +164,42 @@ display and debugging.)
   config + no CLI overrides. You can see what a run would use before
   committing to it.
 - **`codeoid pipeline status <id>`** — each phase row gains its bound
-  `provider/model` and, once the phase ran, actual token usage from the
-  session record. This is what makes role→model mapping *tunable*: without
-  per-phase attribution you cannot know whether the expensive adversary
-  round earns its cost.
-- **Wire**: `pipeline.run` params gain optional
-  `roleBindings: Record<string, {provider: string, model?: string}>`;
-  same scope as today's run verb. The CLI compiles `--role` flags into it.
+  `provider/model` and the precedence rung that chose it. (Per-phase token
+  attribution — what would make role→model mapping *tunable* — is a
+  follow-up, not implemented in this iteration; see §7.)
+- **Wire**: `pipeline.create` (the verb `codeoid pipeline run` sends) gains
+  optional `roleBindings: Record<string, {provider: string, model?: string}>`;
+  same scope as today. The CLI compiles `--role` flags into it.
 
 ## 5. Validation & failure modes
 
 - Unknown role name in `--role` → create-time error listing the pack's
-  declared roles (discoverability beats silence).
+  declared roles (discoverability beats silence). **Role names match
+  case-insensitively** on every surface — the same rule the collab validator
+  applies (one grammar, one rule): `--role Adversary:…` binds the pack's
+  `adversary`, and binding the same name twice in any casing is an error.
 - Unknown provider id → create-time error (the provider registry is known).
-- Model strings pass through to the provider — codeoid cannot enumerate a
-  backend's models, so a bad id fails at the phase's session spawn; the
-  phase error message must name the binding and its `resolvedFrom` rung so
-  the operator knows which layer to fix.
+- Cross-provider bindings never transfer. On the pipeline surface a binding
+  naming a provider other than the run session's is skipped at create (§3);
+  on the collab surface the roster's provider is authoritative (§6.1). In
+  both cases the skip is a **warning naming the rung**, never a hard failure
+  — and a **model-only rung** is held to the same guard: its model applies
+  only if it validates provider-aware for the target backend
+  (`resolveModelIdForProvider`), else it is skipped with a warning. Only a
+  model the operator explicitly typed (CLI `--role …:model`, `--model`) may
+  hard-fail create-time validation.
+- Create responses carry the collected warnings back to the creating client
+  (`warnings` on `response.ok` / `pipeline.snapshot`); the CLI and web render
+  them — a warning only the daemon console sees is one the operator never
+  sees.
+- Past that, model strings pass through to the provider — codeoid cannot
+  enumerate a backend's models, so a bad id fails at the phase's turn; the
+  phase error message names the binding **that was actually in effect** and
+  its `resolvedFrom` rung so the operator knows which layer to fix.
 - `*count` in a pipeline `--role` spec → create-time error ("fan-out is a
-  collaboration concept; pipelines run one session per phase").
+  collaboration concept; pipelines run one session per phase"). This
+  rejection is CLI-side only — the wire `roleBindings` shape has no count
+  field, so a raw wire client cannot express one.
 - `tier:` on a role validates as non-empty string ≤64 chars at `loadPack`;
   everything else about tiers is convention.
 
@@ -189,14 +238,44 @@ codeoid new mytask --collaborate "add per-provider rate limits" \
   then the collaboration goal, then the roster — the pack states how to
   work, the goal states what on, the roster states with whom. The synthetic
   `compileGoalPack` id gives way to the real pack id in `SessionInfo.
-  profile`.
+  profile`. *(Implementation note: the full ETHOS → goal → roster
+  composition lands on the orchestrator's constitution; a role-child's
+  brief composes ETHOS → goal but deliberately omits the roster — a child
+  that can enumerate its peers is one prompt away from asking after their
+  work, and reviewer independence is the property the brief protects.)*
 - **The orchestrator rule is unchanged.** A collaboration still requires a
   bound role named `orchestrator`; a pack intended for collab must declare
   one (all three existing packs do). No new flag.
-- **Models resolve through §3's chain minus rung 3** (phase pins don't exist
-  in a collaboration): CLI `--role` model → `modelRoles["<packId>/<role>"]`
-  → `modelTiers[role.tier]` → provider default. `*count` fan-out remains
+- **Models resolve through §3's chain minus the phase-pin rung** (phases
+  don't exist in a collaboration; the role-level pin does): CLI `--role`
+  model → `modelRoles["<packId>/<role>"]` → role-YAML `provider:`/`model:`
+  pin → `modelTiers[role.tier]` → provider default. `*count` fan-out remains
   valid here (it is rejected only on the pipeline path).
+  *(Implementation clarifications, recorded at slice 3:)*
+  - **The roster's provider is authoritative.** The collab grammar makes the
+    backend mandatory (`name:provider[:model]`), and the collab design's
+    standing rule is that a role must never silently land on a backend the
+    operator didn't name — so the chain resolves the **model**, not the
+    provider. A winning rung whose binding targets a *different* provider
+    contributes nothing (a model id doesn't transfer across vendors): the
+    role falls to its named backend's default, with a create-time warning
+    naming the rung to fix. It does not continue down the chain — the
+    winning rung is the operator's intent, and resurrecting a lower rung
+    underneath it would make precedence unreadable. A **model-only** rung
+    (no provider) is held to the same guard: it applies only when the model
+    validates provider-aware for the roster's backend, else it is skipped
+    with the same warning (§5) — never a hard failure for a model the
+    operator didn't type.
+  - **`write` comes from the role YAML.** A spec that sets `write`
+    differently is a create-time error, not a silent override. A spec's
+    omitted `purpose` defaults to the role YAML's `summary`.
+  - **`packRole` is rejected with `collaboration`** — it names one
+    session-wide capability role; a collab binds one per child.
+  - **Resume:** the *resolved* config (models, write flags) is persisted and
+    comes back; the role YAML envelope/`network` posture and the pack ETHOS
+    are not re-resolved on resume — consistent with ambient `--pack`
+    activations, which are not persisted either. A restart degrades a
+    pack-adopted child to the free-form posture (same write fence).
 - **Skills/subagents** follow the existing pack-activation rules: the
   orchestrator session gets the pack's skills/subagents exactly as a
   `--pack` session does today; trust gating for skill linking is unchanged
@@ -208,14 +287,28 @@ codeoid new mytask --collaborate "add per-provider rate limits" \
 
 For symmetry, session create gains `--model <id>` beside `--provider`
 (today model choice is provider-default-only). With `--pack --pack-role`,
-an omitted `--model` resolves through the same chain (minus rung 3 and the
-CLI rung). This closes the last surface where a role exists but a model
+an omitted `--model` resolves through the same chain (minus the phase-pin
+and CLI rungs). This closes the last surface where a role exists but a model
 cannot be chosen.
+
+*(Implementation clarifications, recorded at slice 3:)* an explicit `--model`
+is validated provider-aware at create (a Claude alias on a non-Claude backend
+is rejected; past that the live backend is the real validator) and wins the
+whole chain. When the chain resolves for an omitted `--model`, the winning
+rung supplies the whole binding — including its provider, which fails closed
+if unregistered and is skipped (with a warning) when it contradicts an
+explicit `--provider`. `--model` is rejected on a collaborative create (set
+it per role). Not extended to `session.fork` / `set_provider` this slice —
+those already have their own model-carry semantics.
 
 ## 7. Non-goals (this iteration)
 
-- **Cost estimation / budgets** — we record per-phase usage (§4); we do not
-  predict or cap it here.
+- **Per-phase token attribution in `pipeline status`** — the phase row shows
+  its bound model, not what the phase actually spent. Cost lands on the bound
+  session's cumulative usage, undifferentiated by phase. Splitting it per
+  phase (what would make the tier map *tunable* — "does the expensive
+  adversary round earn its cost?") is a follow-up.
+- **Cost estimation / budgets** — we do not predict or cap spend here.
 - **Mid-run rebinding** — a halted run resumes with its persisted bindings;
   a `pipeline set-role` mutation is a later convenience.
 - **Named profiles** (`--profile max`) — config sugar over §2.2; add only if
@@ -253,10 +346,13 @@ function only.
 1. `src/daemon/pipeline/pack.ts` — `tier` on `roleSchema` (+ carry on
    `RoleDef`); no behavior change.
 2. `src/config.ts` — `pipeline.modelTiers` / `pipeline.modelRoles` schema.
-3. `src/daemon/pipeline/manager.ts` — `CreatePipelineOpts.roleBindings`;
-   resolution as a pure function shared by both paths:
-   `resolveBinding(role, {cliBinding?, phasePin?, config}) → {provider?,
-   model?, resolvedFrom}`; persist into phase defs.
+3. `src/daemon/pipeline/binding.ts` (new) — resolution as a pure function
+   shared by every path: `resolveBinding({packId?, roleName?, role?,
+   cliBinding?, phasePin?, config?}) → {provider?, model?, resolvedFrom}`,
+   plus `roleBindingsFromSpecs` (CLI spec → bindings map, `*count`
+   rejection). `src/daemon/pipeline/manager.ts` — `CreatePipelineOpts.
+   roleBindings` + `modelConfig`; `create` resolves per phase and persists
+   into (cloned) phase defs.
 4. Wire types + verb params (`pipeline.run` gains `roleBindings`).
 5. `src/cli.ts` — `--role` on `pipeline run` (reuse `parseRoleSpec`, reject
    counts); `pipeline status` rendering.

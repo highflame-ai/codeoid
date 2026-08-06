@@ -9,6 +9,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { ModelBindingConfig } from "./binding";
 import type { Pack } from "./interface";
 import { PackService, registryNameFromUrl, type PackServiceConfig } from "./pack-service";
 
@@ -84,6 +85,7 @@ function makeService(opts: {
   fixture?: string; // a prepared registry dir the fake `git clone` copies in
   sink?: ReturnType<typeof fakeSink>;
   initial?: Partial<PackServiceConfig>;
+  modelConfig?: ModelBindingConfig;
 }) {
   const persisted: PackServiceConfig[] = [];
   const gitCalls: string[][] = [];
@@ -96,6 +98,7 @@ function makeService(opts: {
     cacheDir: opts.cacheDir,
     skillsDir: opts.skillsDir,
     manager: opts.sink ? () => opts.sink! : undefined,
+    modelConfig: opts.modelConfig,
     persist: (s) => persisted.push(structuredClone(s)),
     git: async (args, _cwd) => {
       gitCalls.push(args);
@@ -467,5 +470,68 @@ describe("refreshRegistry", () => {
 
     // No skills should be linked — untrusted packs never get #linkSkills called.
     expect(readdirSync(skillsDir)).toHaveLength(0);
+  });
+});
+
+describe("installed() — model-binding resolve view (pack show --resolve)", () => {
+  /** A pack exercising every pack-side binding source: a mapped tier, an
+   *  unmapped tier, and a phase-level pin. */
+  function writeBindingPack(dir: string): void {
+    mkdirSync(join(dir, "roles"), { recursive: true });
+    writeFileSync(
+      join(dir, "roles", "adversary.yaml"),
+      "name: adversary\ntier: reasoning-max\nwrite: false\nenvelope: [read]\n",
+    );
+    writeFileSync(
+      join(dir, "roles", "scribe.yaml"),
+      "name: scribe\ntier: unmapped-tier\nwrite: true\nenvelope: all\n",
+    );
+    writeFileSync(
+      join(dir, "pack.yaml"),
+      `schema: codeoid/pack@v1
+id: bind-pack
+name: Binding
+version: 1.0.0
+roles: [./roles/adversary.yaml, ./roles/scribe.yaml]
+phases:
+  - { id: attack, kind: noop, role: adversary }
+  - { id: pinned, kind: noop, role: scribe, provider: codex, model: codex-max }
+`,
+    );
+  }
+
+  test("reports each role's effective binding and lists phase pins separately", () => {
+    const packDir = join(tmp(), "bind-pack");
+    writeBindingPack(packDir);
+    const { svc } = makeService({
+      cacheDir: join(tmp(), "cache"),
+      modelConfig: { modelTiers: { "reasoning-max": { provider: "claude", model: "claude-fable-5" } } },
+    });
+    svc.install({ dir: packDir });
+
+    const [wire] = svc.installed();
+    expect(wire!.resolvedRoles).toEqual([
+      { name: "adversary", tier: "reasoning-max", provider: "claude", model: "claude-fable-5", resolvedFrom: "config-tier" },
+      // Unmapped tier → provider default; the view says so rather than hiding it.
+      { name: "scribe", tier: "unmapped-tier", provider: undefined, model: undefined, resolvedFrom: "default" },
+    ]);
+    // The phase pin is NOT folded into the per-role view (it would mask what
+    // the tier map picks) — it is listed on its own so staleness is visible.
+    expect(wire!.phasePins).toEqual([{ phase: "pinned", provider: "codex", model: "codex-max" }]);
+  });
+
+  test("modelRoles surgical override shows as config-role in the view", () => {
+    const packDir = join(tmp(), "bind-pack");
+    writeBindingPack(packDir);
+    const { svc } = makeService({
+      cacheDir: join(tmp(), "cache"),
+      modelConfig: {
+        modelTiers: { "reasoning-max": { provider: "claude", model: "claude-fable-5" } },
+        modelRoles: { "bind-pack/adversary": { provider: "openai", model: "o9" } },
+      },
+    });
+    svc.install({ dir: packDir });
+    const [wire] = svc.installed();
+    expect(wire!.resolvedRoles?.[0]).toMatchObject({ name: "adversary", provider: "openai", model: "o9", resolvedFrom: "config-role" });
   });
 });

@@ -20,6 +20,8 @@ import { LIMITS, ORCHESTRATOR_ROLE } from "../protocol/types.js";
 import { CLAUDE_PROVIDER_ID, resolveModelIdForProvider } from "./models.js";
 import { CORE_ARTIFACT_KINDS, isValidArtifactKind } from "./blackboard/types.js";
 import { resolveRoleIo } from "./blackboard/service.js";
+import { resolveBinding, type ModelBindingConfig } from "./pipeline/binding.js";
+import type { RoleDef } from "./pipeline/pack.js";
 
 /** The provider-registry surface this module needs — kept narrow so tests
  *  can pass a stub instead of building a real registry. */
@@ -210,6 +212,132 @@ export function orchestratorRole(
   return config.roles.find((r) => r.name.toLowerCase() === ORCHESTRATOR_ROLE);
 }
 
+// ── Pack adoption (docs/role-model-binding.md §6) ───────────────────────────
+
+/** What a collaboration adopts from an installed pack: its identity, its
+ *  ETHOS, and the role definitions that now define what each collab role IS. */
+export interface PackAdoption {
+  packId: string;
+  /** The pack's declared roles, keyed by name (loadPack's `roles` map). */
+  roles: Record<string, RoleDef>;
+  /** The operator's machine maps (config `pipeline.modelTiers`/`modelRoles`). */
+  modelConfig?: ModelBindingConfig;
+  /** Non-fatal resolution notes (unmapped tier, cross-backend binding). */
+  warn?: (msg: string) => void;
+}
+
+/**
+ * Bind a collaboration's roles to an adopted pack (§6.1), BEFORE
+ * `validateCollaboration` — the output feeds straight into it, so both paths
+ * share every semantic rule that follows.
+ *
+ * Strict binding: every collab role name must match a pack-declared role
+ * (case-insensitively, agreeing with the validator's name keying). Mixing
+ * free-form roles in is refused — strictness is what makes the governance
+ * claim true (an unbound name would run with a synthesized envelope while
+ * claiming the pack's).
+ *
+ * Write authority comes from the role YAML, not the spec: a spec that says
+ * otherwise is an error rather than a silent override, because "the pack
+ * defines what the role is" must not lose an argument to a checkbox.
+ *
+ * Models resolve through §3's chain minus the phase-pin rung. The spec's
+ * PROVIDER stays authoritative — the collab grammar makes the backend an
+ * explicit roster decision, and this module's standing rule is that a role
+ * must never silently land on a backend the operator didn't name. So a
+ * winning rung whose binding targets a different provider contributes
+ * nothing (a model id doesn't transfer across vendors); the role falls to
+ * its backend's default, with a warning naming the rung to fix. A model-only
+ * rung (no provider) is held to the same guard: it applies only if the model
+ * validates for the roster's backend (`resolveModelIdForProvider`), else it
+ * is skipped with a warning — only the spec's own typed model (the cli rung)
+ * may hard-fail `validateCollaboration`.
+ */
+export function adoptPackRoles(
+  config: CollaborationConfig,
+  adoption: PackAdoption,
+): { ok: true; config: CollaborationConfig } | { ok: false; error: string } {
+  const byName = new Map<string, RoleDef>();
+  for (const def of Object.values(adoption.roles)) byName.set(def.name.toLowerCase(), def);
+  const declared = Object.keys(adoption.roles).join(", ") || "none";
+
+  const roles: CollaborationRole[] = [];
+  for (const raw of config.roles) {
+    const name = raw.name?.trim() ?? "";
+    const def = byName.get(name.toLowerCase());
+    if (!def) {
+      return {
+        ok: false,
+        error: `Pack "${adoption.packId}" declares no role "${name}" — declared roles: ${declared}. Role names bind strictly under --pack; drop the pack to run free-form roles.`,
+      };
+    }
+    if (raw.write !== undefined && raw.write !== def.write) {
+      return {
+        ok: false,
+        error: `Role "${name}": write authority comes from pack "${adoption.packId}" (its role YAML says write: ${def.write}) — drop the explicit write flag.`,
+      };
+    }
+
+    // §6.1 chain: cli --role model → modelRoles → role-YAML pin → tier map →
+    // backend default. The cli rung is the spec's own model, when present.
+    const specModel = raw.model !== undefined && raw.model.trim() !== "" ? raw.model : undefined;
+    const resolved = resolveBinding({
+      packId: adoption.packId,
+      roleName: def.name,
+      role: def,
+      cliBinding: specModel !== undefined ? { provider: raw.providerId, model: specModel } : undefined,
+      config: adoption.modelConfig,
+    });
+    let model: string | undefined;
+    if (resolved.resolvedFrom === "default") {
+      if (def.tier !== undefined) {
+        adoption.warn?.(
+          `role "${name}" declares tier "${def.tier}" but no modelTiers mapping exists — using the backend default`,
+        );
+      }
+    } else if (resolved.provider !== undefined && resolved.provider !== raw.providerId) {
+      adoption.warn?.(
+        `role "${name}": the ${resolved.resolvedFrom} binding targets provider "${resolved.provider}" but this role is bound to "${raw.providerId}" — models don't transfer across backends; using the backend default`,
+      );
+    } else if (
+      resolved.resolvedFrom !== "cli" &&
+      resolved.model !== undefined &&
+      resolveModelIdForProvider(resolved.model, raw.providerId) === null
+    ) {
+      // A model-only rung must not defeat the cross-vendor guard: a binding
+      // that names no provider still carries a vendor-shaped id, and it only
+      // applies if it validates for the roster's backend. SKIP with a warning —
+      // never let validateCollaboration hard-fail the create over a model the
+      // operator never typed, and never silently transfer it. (The "cli" rung
+      // IS the operator's typed model, so it passes through and hard-fails
+      // downstream with the validator's own message.)
+      adoption.warn?.(
+        `role "${name}": the ${resolved.resolvedFrom} binding's model "${resolved.model}" is not valid for backend "${raw.providerId}" — using the backend default`,
+      );
+    } else {
+      model = resolved.model;
+    }
+
+    roles.push({
+      name,
+      providerId: raw.providerId,
+      ...(model !== undefined ? { model } : {}),
+      ...(raw.count !== undefined ? { count: raw.count } : {}),
+      // The role YAML's summary doubles as the child's stated purpose unless
+      // the spec brought its own — the pack author already wrote the sentence.
+      ...(raw.purpose !== undefined
+        ? { purpose: raw.purpose }
+        : def.summary !== undefined
+          ? { purpose: def.summary }
+          : {}),
+      write: def.write,
+      ...(raw.reads !== undefined ? { reads: raw.reads } : {}),
+      ...(raw.writes !== undefined ? { writes: raw.writes } : {}),
+    });
+  }
+  return { ok: true, config: { goal: config.goal, roles } };
+}
+
 // ── Role → children (P1b) ───────────────────────────────────────────────────
 
 /**
@@ -357,18 +485,31 @@ export function plannedChildFor(
  * `constitution` is a parameter rather than computed here so the degraded
  * resume path — child on disk, goal config unrecoverable — can substitute an
  * honest "your goal was lost" brief while still getting the real restrictions.
+ *
+ * `adopted` (docs/role-model-binding.md §6.1): under a pack-adopted
+ * collaboration the child's envelope comes from the role YAML — real `write`,
+ * `network`, `envelope`, and `exceptions` — enforced at the same canUseTool
+ * fence `--pack-role` sessions use, and the synthetic pack id gives way to
+ * the real one. Without it, the synthesized free-form posture is unchanged.
  */
 export function roleChildPosture(
   child: PlannedChild,
   parentSessionId: string,
   constitution: string,
+  adopted?: { packId: string; role: RoleDef },
 ): {
   role: "worker";
   workerShape: "ship" | "scout";
   pack: {
     id: string;
     constitution: string;
-    role: { name: string; write: boolean; network: "read-only"; envelope: "all" };
+    role: {
+      name: string;
+      write: boolean;
+      network: boolean | "read-only";
+      envelope: "all" | string[];
+      exceptions?: RoleDef["exceptions"];
+    };
     roleName: string;
     subagents: never[];
   };
@@ -383,24 +524,35 @@ export function roleChildPosture(
     role: "worker",
     // The enforcement behind §6: a read-only role becomes a "scout", whose
     // LEAF identity profile carries no tools:write at all, so it cannot mint
-    // write authority even via a sub-agent.
+    // write authority even via a sub-agent. (Pack adoption preserves this —
+    // `child.write` already came from the role YAML on that path.)
     workerShape: child.shape,
     // ...and the same restriction at the canUseTool fence, where
     // roleDeniesTool turns `write: false` into a hard tool deny (Claude-hard;
     // advisory + logged on backends whose tools don't all route through the
     // gate — see roleEnforcement).
     pack: {
-      id: "collaboration",
+      id: adopted?.packId ?? "collaboration",
       constitution,
-      role: {
-        name: child.roleName,
-        write: child.write,
-        // Not `false`: §3 gives the search role web access, and roleDeniesTool
-        // only denies network tools on an explicit false. Per-role network
-        // gating is a later phase.
-        network: "read-only",
-        envelope: "all",
-      },
+      role: adopted
+        ? {
+            name: child.roleName,
+            write: adopted.role.write,
+            network: adopted.role.network,
+            envelope: adopted.role.envelope,
+            ...(adopted.role.exceptions !== undefined
+              ? { exceptions: adopted.role.exceptions }
+              : {}),
+          }
+        : {
+            name: child.roleName,
+            write: child.write,
+            // Not `false`: §3 gives the search role web access, and roleDeniesTool
+            // only denies network tools on an explicit false. Per-role network
+            // gating is a later phase.
+            network: "read-only",
+            envelope: "all",
+          },
       roleName: child.roleName,
       subagents: [],
     },
@@ -443,16 +595,24 @@ export function orphanedChildBrief(roleName: string, write: boolean): string {
  * implementer's thinking, and the cheapest way to honor that is to not put it
  * in the brief in the first place. Structured handoffs arrive through the
  * blackboard in the next phase, scoped per role.
+ *
+ * `packEthos` (§6.1 "constitution composes, not replaces"): a pack-adopted
+ * child's brief opens with the pack's ETHOS — the pack states HOW to work,
+ * then the brief states what on. The roster is deliberately NOT added here:
+ * a child that can enumerate its peers is one prompt away from asking after
+ * their work, and independence is the property the brief exists to protect.
  */
 export function childBrief(
   config: CollaborationConfig,
   child: PlannedChild,
+  packEthos?: string,
 ): string {
   const contract = child.write
     ? "You MAY modify files in your workdir. Keep the diff minimal and verify your work."
     : "You are READ-ONLY: your identity holds no write scope, so file edits will be denied. Investigate and report — your written findings are the deliverable.";
   const io = resolveRoleIo(child.roleName, { reads: child.reads, writes: child.writes });
   return [
+    ...(packEthos !== undefined && packEthos.trim() !== "" ? [packEthos.trim(), ""] : []),
     `<collaboration role="${child.roleName}"${child.ordinal > 1 ? ` member="${child.ordinal}"` : ""}>`,
     `You are the "${child.roleName}" role in a collaborative session working one shared goal.`,
     child.purpose ? `Your purpose: ${child.purpose}` : null,
@@ -487,10 +647,17 @@ export function childBrief(
  * `id` is synthetic and never installed on disk — it exists so `SessionInfo.
  * profile` reads sensibly and so the pipeline machinery, which already keys
  * off an activation, needs no special case for collaborations.
+ *
+ * `adopted` (docs/role-model-binding.md §6.1): a pack-adopted collaboration
+ * composes rather than replaces — pack ETHOS first (how to work), then the
+ * goal (what on), then the roster (with whom) — and the synthetic id gives
+ * way to the real pack id, so `SessionInfo.profile` names what actually
+ * governs the session.
  */
 export function compileGoalPack(
   config: CollaborationConfig,
   children: readonly PlannedChild[],
+  adopted?: { id: string; constitution?: string },
 ): { id: string; constitution: string; subagents: [] } {
   const roster = children
     .map(
@@ -498,9 +665,11 @@ export function compileGoalPack(
         `- ${c.roleName}${c.ordinal > 1 ? ` #${c.ordinal}` : ""} — ${c.providerId}${c.model ? `/${c.model}` : ""}, ${c.write ? "may write" : "read-only"}`,
     )
     .join("\n");
+  const ethos = adopted?.constitution?.trim();
   return {
-    id: "collaboration",
+    id: adopted?.id ?? "collaboration",
     constitution: [
+      ...(ethos ? [ethos, ""] : []),
       "# Collaborative session",
       "",
       "You are the ORCHESTRATOR of a collaborative session working ONE goal:",

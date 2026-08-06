@@ -391,6 +391,170 @@ describe("NewSessionModal collaborative mode", () => {
     expect(worker.write).toBe(true);
   });
 
+  // ── Pack adoption (docs/role-model-binding.md §6) ─────────────────────────
+
+  /** A pack with declared roles + Slice-2 resolved bindings, for adoption. */
+  const adoptablePack = () =>
+    pack({
+      id: "collab-pack",
+      name: "Collab Pack",
+      roles: ["orchestrator", "implementer", "adversary"],
+      resolvedRoles: [
+        { name: "orchestrator", resolvedFrom: "default" },
+        { name: "implementer", provider: "claude", model: "claude-pinned-9", resolvedFrom: "role-pin" },
+        { name: "adversary", provider: "claude", model: "claude-tiered-7", resolvedFrom: "config-tier" },
+      ],
+    });
+
+  it("offers the pack picker in collaborate mode with a free-form default", () => {
+    packsHolder.installed = [adoptablePack()];
+    const r = openCollab();
+    const packSel = r.getByLabelText("Pack") as HTMLSelectElement;
+    expect(packSel.value).toBe("");
+    expect(r.getByText("None (free-form roles)")).toBeTruthy();
+    // Free-form: role names stay text inputs.
+    expect((r.getAllByLabelText("Role name")[1] as HTMLElement).tagName).toBe("INPUT");
+  });
+
+  it("choosing a pack turns role names into a strict select and hides the write toggle", async () => {
+    packsHolder.installed = [adoptablePack()];
+    const r = openCollab();
+    fireEvent.change(r.getByLabelText("Pack") as HTMLSelectElement, {
+      target: { value: "collab-pack" },
+    });
+
+    // Worker rows become selects over the pack's declared roles; the
+    // orchestrator row stays the locked input (it is the session itself).
+    const names = r.getAllByLabelText("Role name");
+    expect((names[0] as HTMLElement).tagName).toBe("INPUT");
+    expect((names[1] as HTMLElement).tagName).toBe("SELECT");
+    const opts = [...(names[1] as HTMLSelectElement).options].map((o) => o.value);
+    expect(opts).toEqual(["", "implementer", "adversary"]);
+
+    // Write authority comes from the role YAML — no checkbox to argue with it.
+    expect(r.container.querySelector('input[type="checkbox"]')).toBeNull();
+
+    // The effective model (Slice 2's resolvedRoles) surfaces as a placeholder.
+    fireEvent.change(names[1] as HTMLSelectElement, { target: { value: "implementer" } });
+    const models = r.getAllByLabelText("Model") as HTMLInputElement[];
+    expect(models[1]!.placeholder).toBe("claude-pinned-9 (role-pin)");
+  });
+
+  it("sends the pack + selected role names, and never write, when adopted", async () => {
+    packsHolder.installed = [adoptablePack()];
+    const r = openCollab();
+    fireEvent.input(goalBox(r), { target: { value: "g" } });
+    fireEvent.change(r.getByLabelText("Pack") as HTMLSelectElement, {
+      target: { value: "collab-pack" },
+    });
+    const names = r.getAllByLabelText("Role name");
+    fireEvent.change(names[1] as HTMLSelectElement, { target: { value: "adversary" } });
+    fireEvent.click(r.getByText("create collaboration"));
+
+    await waitFor(() => expect(requestMock).toHaveBeenCalled());
+    const sent = requestMock.mock.calls[0]![0] as Record<string, unknown>;
+    expect(sent.pack).toBe("collab-pack");
+    const roles = (sent.collaboration as { roles: Array<Record<string, unknown>> }).roles;
+    expect(roles.map((x) => x.name)).toEqual(["orchestrator", "adversary"]);
+    for (const role of roles) expect("write" in role).toBe(false);
+  });
+
+  it("blocks submit while a role name isn't bound to the pack, and says why", async () => {
+    packsHolder.installed = [adoptablePack()];
+    const r = openCollab();
+    fireEvent.input(goalBox(r), { target: { value: "g" } });
+    fireEvent.change(r.getByLabelText("Pack") as HTMLSelectElement, {
+      target: { value: "collab-pack" },
+    });
+    // The pack change cleared the worker's name — the strict-binding hint
+    // shows and Create stays disabled until a declared role is picked.
+    await waitFor(() => expect(r.getByText("every role needs a name")).toBeTruthy());
+    expect((r.getByText("create collaboration") as HTMLButtonElement).disabled).toBe(true);
+    const names = r.getAllByLabelText("Role name");
+    fireEvent.change(names[1] as HTMLSelectElement, { target: { value: "implementer" } });
+    await waitFor(() =>
+      expect((r.getByText("create collaboration") as HTMLButtonElement).disabled).toBe(false),
+    );
+    expect(requestMock).not.toHaveBeenCalled();
+  });
+
+  it("reopening in collaborate mode after a pipeline open keeps the default role names", async () => {
+    // Exact repro of the open-order bug: pipeline mode auto-selects a pack;
+    // Esc; open collaborate. The open handler seeds defaultRoles() and clears
+    // packId — the leftover packId's transition to "" must NOT then wipe the
+    // freshly-seeded worker names (which left Create permanently disabled).
+    authMock.mockReturnValue(authOk(["claude", "gemini"]));
+    packsHolder.installed = [
+      pack({ id: "aif-sdlc", name: "AIF", selected: true, roles: ["reviewer"] }),
+    ];
+    const r = render(() => <NewSessionModal />);
+    openPipelineModal("some goal");
+    // Let the pipeline-mode default-pack effect select the pack.
+    await waitFor(() =>
+      expect((r.getByLabelText("Pack") as HTMLSelectElement).value).toBe("aif-sdlc"),
+    );
+    fireEvent.keyDown(window, { key: "Escape" });
+    openCollaborateModal();
+    // Flush the deferred packId effect before asserting — the old code wiped
+    // the names exactly here.
+    await new Promise((res) => setTimeout(res, 0));
+    const names = r.getAllByLabelText("Role name") as HTMLInputElement[];
+    expect(names.map((n) => n.value)).toEqual(["orchestrator", "search"]);
+  });
+
+  it("the effective-model placeholder respects the row's chosen backend", () => {
+    packsHolder.installed = [adoptablePack()];
+    const r = openCollab();
+    fireEvent.change(r.getByLabelText("Pack") as HTMLSelectElement, {
+      target: { value: "collab-pack" },
+    });
+    const names = r.getAllByLabelText("Role name");
+    fireEvent.change(names[1] as HTMLSelectElement, { target: { value: "implementer" } });
+    const models = r.getAllByLabelText("Model") as HTMLInputElement[];
+    // Row backend "" = daemon default (claude) — matches the binding's provider.
+    expect(models[1]!.placeholder).toBe("claude-pinned-9 (role-pin)");
+    // On a different backend the daemon will SKIP the binding — don't
+    // advertise a model that won't apply.
+    const backends = r.getAllByLabelText("Backend") as HTMLSelectElement[];
+    fireEvent.change(backends[1]!, { target: { value: "gemini" } });
+    expect(models[1]!.placeholder).toBe("model (optional)");
+  });
+
+  it("create-time warnings from the daemon are shown before the modal closes", async () => {
+    authMock.mockReturnValue(authOk(["claude", "gemini"]));
+    // The real wire shape: response.ok carries {data, warnings}.
+    requestMock.mockResolvedValue({
+      data: { id: "s-warn", name: "demo", workdir: "/w" },
+      warnings: ['role "adversary": the role-pin binding targets provider "claude" but this role is bound to "gemini" — models don\'t transfer across backends; using the backend default'],
+    });
+    const r = render(() => <NewSessionModal />);
+    openCollaborateModal();
+    fireEvent.input(r.getByPlaceholderText("e.g. shield-refactor"), {
+      target: { value: "demo" },
+    });
+    fireEvent.input(goalBox(r), { target: { value: "g" } });
+    fireEvent.click(r.getByText("create collaboration"));
+
+    // The session was created, but the modal stays open showing the warnings.
+    await waitFor(() => expect(r.getByText("Created, with warnings:")).toBeTruthy());
+    expect(r.getByText(/models don't transfer across backends/)).toBeTruthy();
+    // Acknowledge → closes.
+    fireEvent.click(r.getByText("ok"));
+    await waitFor(() => expect(r.queryByText("Created, with warnings:")).toBeNull());
+  });
+
+  it("switching back to free-form restores text inputs in the same rows", () => {
+    packsHolder.installed = [adoptablePack()];
+    const r = openCollab();
+    const packSel = r.getByLabelText("Pack") as HTMLSelectElement;
+    fireEvent.change(packSel, { target: { value: "collab-pack" } });
+    expect((r.getAllByLabelText("Role name")[1] as HTMLElement).tagName).toBe("SELECT");
+    fireEvent.change(packSel, { target: { value: "" } });
+    expect((r.getAllByLabelText("Role name")[1] as HTMLElement).tagName).toBe("INPUT");
+    // Free-form controls come back too.
+    expect(r.container.querySelector('input[type="checkbox"]')).toBeTruthy();
+  });
+
   it("a plain session still sends no collaboration", async () => {
     authMock.mockReturnValue(authOk(["claude"]));
     requestMock.mockResolvedValue({ id: "s", name: "n", workdir: "/w" });

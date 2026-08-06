@@ -99,3 +99,36 @@ describe("formatPackShow", () => {
     expect(formatPackShow(result(), "ghost")).toBeNull();
   });
 });
+
+describe("formatPackShow --resolve (docs/role-model-binding.md §4)", () => {
+  const resolved = pack({
+    resolvedRoles: [
+      { name: "adversary", tier: "reasoning-max", provider: "claude", model: "claude-fable-5", resolvedFrom: "config-tier" },
+      { name: "scribe", tier: "unmapped", resolvedFrom: "default" },
+    ],
+    phasePins: [{ phase: "review", provider: "codex", model: "codex-max" }],
+  });
+
+  test("renders each role's effective binding and lists phase pins separately", () => {
+    const text = formatPackShow(result({ installed: [resolved] }), "aif-sdlc", { resolve: true })!.join("\n");
+    expect(text).toContain("effective model bindings");
+    expect(text).toMatch(/adversary\s+tier=reasoning-max\s+→ claude:claude-fable-5\s+\(config-tier\)/);
+    // Unmapped tier says "provider default" — the gap is visible, not hidden.
+    expect(text).toMatch(/scribe\s+tier=unmapped\s+→ provider default\s+\(default\)/);
+    expect(text).toContain("phase-level pins");
+    expect(text).toContain("review: codex:codex-max");
+  });
+
+  test("without --resolve the binding view is absent (unchanged output)", () => {
+    const text = formatPackShow(result({ installed: [resolved] }), "aif-sdlc")!.join("\n");
+    expect(text).not.toContain("effective model bindings");
+    expect(text).not.toContain("phase-level pins");
+  });
+
+  test("no pins section when the pack declares none", () => {
+    const noPins = pack({ resolvedRoles: [{ name: "implementer", resolvedFrom: "default" }], phasePins: [] });
+    const text = formatPackShow(result({ installed: [noPins] }), "aif-sdlc", { resolve: true })!.join("\n");
+    expect(text).toContain("effective model bindings");
+    expect(text).not.toContain("phase-level pins");
+  });
+});

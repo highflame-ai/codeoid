@@ -261,13 +261,13 @@ export class TerminalClient {
     this.#renderPacks(await this.#request({ type: "pipeline.pack.select", id: randomUUID(), packId: id }));
   }
 
-  async packShow(id: string): Promise<void> {
+  async packShow(id: string, opts: { resolve?: boolean } = {}): Promise<void> {
     const resp = await this.#request({ type: "pipeline.pack.list", id: randomUUID() });
     if (resp.type !== "pipeline.pack.list.result") {
       this.#printError(resp);
       return;
     }
-    const lines = formatPackShow(resp, id);
+    const lines = formatPackShow(resp, id, opts);
     if (lines === null) {
       console.error(`Pack "${id}" not found (installed or available).`);
       return;
@@ -290,6 +290,7 @@ export class TerminalClient {
       pack?: string;
       packRole?: string;
       providerId?: string;
+      model?: string;
       collaboration?: CollaborationConfig;
     } = {},
   ): Promise<void> {
@@ -302,6 +303,7 @@ export class TerminalClient {
       // set on auth.ok), so a typo is rejected rather than silently handing back
       // a claude session.
       ...(opts.providerId ? { providerId: opts.providerId } : {}),
+      ...(opts.model ? { model: opts.model } : {}),
       ...(opts.pack ? { pack: opts.pack } : {}),
       ...(opts.packRole ? { packRole: opts.packRole } : {}),
       ...(opts.collaboration ? { collaboration: opts.collaboration } : {}),
@@ -312,6 +314,9 @@ export class TerminalClient {
       const profile = data.profile ? ` [pack: ${data.profile}]` : "";
       const provider = data.providerId ? ` [${data.providerId}]` : "";
       console.log(`Session created: ${data.name} (${data.id})${provider}${profile}`);
+      // Non-fatal binding notes (skipped cross-vendor bindings, unmapped
+      // tiers) — the daemon adjusted something the operator should know about.
+      for (const w of resp.warnings ?? []) console.log(`  ⚠ ${w}`);
       if (data.collaboration) {
         // Echo the RESOLVED bindings, not the requested ones: the daemon
         // normalizes (count defaults, model resolved against its own
@@ -525,7 +530,12 @@ export class TerminalClient {
     return resp.pipeline;
   }
 
-  async pipelineRun(pack: string, goal: string, workdir: string): Promise<void> {
+  async pipelineRun(
+    pack: string,
+    goal: string,
+    workdir: string,
+    roleBindings?: Record<string, { provider: string; model?: string }>,
+  ): Promise<void> {
     const resp = await this.#request({
       type: "pipeline.create",
       id: randomUUID(),
@@ -533,12 +543,16 @@ export class TerminalClient {
       pack,
       spec: goal,
       workdir,
+      ...(roleBindings ? { roleBindings } : {}),
     });
     if (resp.type !== "pipeline.snapshot") {
       this.#printError(resp);
       return;
     }
     const p = resp.pipeline;
+    // Create-time binding notes (a --role/config binding skipped because it
+    // targets a backend other than the run session's, an unmapped tier).
+    for (const w of resp.warnings ?? []) console.log(`  ⚠ ${w}`);
     // Kick the run off — advance drives all phases server-side (minutes), so
     // fire it and let the user poll status rather than block the CLI.
     this.#fire({ type: "pipeline.advance", id: randomUUID(), pipelineId: p.id });

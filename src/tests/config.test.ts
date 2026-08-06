@@ -472,6 +472,28 @@ describe("loadConfig — hooks", () => {
     expect(off.pipeline?.enabled).toBe(false);
   });
 
+  it("pipeline.modelTiers / modelRoles parse, default to {}, and reject a missing provider", () => {
+    writeConfig({});
+    const c = loadConfig({ configPath, env: {} });
+    expect(c.pipeline?.modelTiers).toEqual({});
+    expect(c.pipeline?.modelRoles).toEqual({});
+
+    writeConfig({
+      pipeline: {
+        modelTiers: { "reasoning-max": { provider: "claude", model: "claude-fable-5" }, mechanical: { provider: "claude" } },
+        modelRoles: { "yash-dev/navigator": { provider: "claude", model: "claude-fable-5" } },
+      },
+    });
+    const filled = loadConfig({ configPath, env: {} });
+    expect(filled.pipeline?.modelTiers?.["reasoning-max"]).toEqual({ provider: "claude", model: "claude-fable-5" });
+    expect(filled.pipeline?.modelTiers?.mechanical).toEqual({ provider: "claude" });
+    expect(filled.pipeline?.modelRoles?.["yash-dev/navigator"]).toMatchObject({ model: "claude-fable-5" });
+
+    // A binding names a provider or it isn't a binding — model-only rejects.
+    writeConfig({ pipeline: { modelTiers: { broken: { model: "m" } } } });
+    expect(() => loadConfig({ configPath, env: {} })).toThrow(/provider/);
+  });
+
   it("CODEOID_HOOKS_ENABLED=false kills every hook per-invocation", () => {
     writeConfig({
       hooks: {

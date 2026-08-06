@@ -42,6 +42,7 @@ import { Blackboard, type OwnerBlackboard } from "./blackboard/service.js";
 import { BlackboardStore, type GoalScope } from "./blackboard/store.js";
 import { BlackboardMcpHttp } from "./blackboard/mcp-http.js";
 import {
+  adoptPackRoles,
   childBrief,
   childSessionName,
   compileGoalPack,
@@ -79,6 +80,8 @@ import {
 } from "./dispatch.js";
 import { createPipelineManagerFromConfig } from "./pipeline/wiring.js";
 import type { PipelineManager } from "./pipeline/manager.js";
+import { resolveBinding, type ModelBindingConfig } from "./pipeline/binding.js";
+import type { RoleDef } from "./pipeline/pack.js";
 import {
   PackService,
   resolvePhaseActivation,
@@ -368,6 +371,9 @@ export class SessionManager {
       },
       manager: () => this.#pipelines,
       persist: (state) => this.#persistPackConfig(state),
+      // The operator's model maps, for the pre-flight `pack show --resolve`
+      // view (docs/role-model-binding.md §4) — same maps pipeline.create reads.
+      modelConfig: { modelTiers: p?.modelTiers, modelRoles: p?.modelRoles },
     });
   }
 
@@ -402,6 +408,15 @@ export class SessionManager {
    *  the CLI + tests. */
   get packs(): PackService {
     return this.#packs;
+  }
+
+  /** The operator's model maps (docs/role-model-binding.md §2.2) — the same
+   *  `pipeline.modelTiers`/`modelRoles` slice pipeline.create resolves with,
+   *  read here for the collab-adoption and single-session (§6.2) chains. */
+  #modelBindingConfig(): ModelBindingConfig | undefined {
+    const p = this.#config?.pipeline;
+    if (!p) return undefined;
+    return { modelTiers: p.modelTiers, modelRoles: p.modelRoles };
   }
 
   /**
@@ -556,8 +571,14 @@ mcpHub: this.#mcpHub,
           // `role` so the worker role from the posture wins over `meta.role`
           // (they agree — both are "worker" — but the posture is the authority).
           ...(child?.options ?? {}),
+          // Conductor: the config override. Role-child: the roster's resolved
+          // model from the posture options — an unconditional `undefined` here
+          // would clobber the spread above and resume a bound child on the
+          // provider default (the regression the resume tests pin).
           defaultModel:
-            meta.role === "conductor" ? this.#config?.conductor?.model : undefined,
+            meta.role === "conductor"
+              ? this.#config?.conductor?.model
+              : child?.options.defaultModel,
           // Conductor gets the tenant-wide surface; a collaboration
           // orchestrator gets the role-aware one scoped to its own children.
           // Its id is already known here, so the thunk is trivial.
@@ -677,6 +698,10 @@ mcpHub: this.#mcpHub,
           collaborationRole: ReturnType<typeof roleChildPosture>["collaborationRole"];
           initialMode?: { mode: SessionMode; maxTurns?: number };
           blackboardMcp?: { url: string; token: string };
+          /** The roster's resolved model for this child (docs/role-model-binding.md
+           *  §6.1) — without it a bound child resumes on the provider default
+           *  while SessionInfo still claims the resolved model. */
+          defaultModel?: string;
         };
       }
     | undefined {
@@ -714,6 +739,9 @@ mcpHub: this.#mcpHub,
       orphaned: false,
       options: {
         ...roleChildPosture(planned, role.parentSessionId, childBrief(collaboration, planned)),
+        // The roster's resolved model comes back with the child — same source
+        // (`plannedChildFor`) as the spawn path, so they can't drift.
+        ...(planned.model !== undefined ? { defaultModel: planned.model } : {}),
         // Re-armed per boot, not persisted: the budget is a per-stretch-of-work
         // allowance, and carrying a spent one across a restart would resume a
         // child with zero turns left.
@@ -1910,8 +1938,57 @@ mcpHub: this.#mcpHub,
     // entry alone would leave that rule guarding a config row while the
     // session actually doing the orchestrating ran on anything at all.
     let providerId = msg.providerId;
+    // Pack ADOPTION (docs/role-model-binding.md §6): a collaboration that
+    // names a pack lets the pack — not the collab machinery — define what
+    // each role is. Resolved BEFORE validation because adoption rewrites the
+    // roles (envelope write from the role YAML, models through the binding
+    // chain) and the rewritten config must pass the same semantic rules as a
+    // free-form one.
+    let adoption: PackActivation | undefined;
+    // Non-fatal binding notes (skipped cross-vendor bindings, unmapped tiers).
+    // Collected and returned on the create response — a warning only the
+    // daemon console sees is one the creating operator never sees.
+    const warnings: string[] = [];
+    const warn = (m: string): void => {
+      warnings.push(m);
+      console.warn(`[codeoid] ${m}`);
+    };
     if (msg.collaboration) {
-      const checked = validateCollaboration(msg.collaboration, this.#providers);
+      let collabConfig = msg.collaboration;
+      if (msg.pack) {
+        // packRole names ONE capability role for an ambient session; a
+        // collaboration binds a role per child, so a single session-wide role
+        // is a category error — reject rather than guess which child it meant.
+        if (msg.packRole) {
+          return {
+            type: "response.error",
+            requestId: msg.id,
+            error: "packRole does not apply to a collaborative session — each role's envelope comes from the pack's role YAML.",
+            code: "invalid_request",
+          };
+        }
+        try {
+          adoption = this.#packs.resolveActivation(msg.pack);
+        } catch (e) {
+          return { type: "response.error", requestId: msg.id, error: e instanceof Error ? e.message : String(e), code: "invalid_request" };
+        }
+        const adopted = adoptPackRoles(collabConfig, {
+          packId: adoption.id,
+          roles: adoption.roles ?? {},
+          modelConfig: this.#modelBindingConfig(),
+          warn: (m) => warn(`pack "${adoption?.id}": ${m}`),
+        });
+        if (!adopted.ok) {
+          return {
+            type: "response.error",
+            requestId: msg.id,
+            error: adopted.error,
+            code: "invalid_request",
+          };
+        }
+        collabConfig = adopted.config;
+      }
+      const checked = validateCollaboration(collabConfig, this.#providers);
       if (!checked.ok) {
         return {
           type: "response.error",
@@ -1921,18 +1998,6 @@ mcpHub: this.#mcpHub,
         };
       }
       collaboration = checked.config;
-      // Two different topologies competing for one constitution: the
-      // collaborative toggle compiles its OWN ephemeral one-goal pack (§9),
-      // so an installed pack would either be silently overridden or silently
-      // override it. Neither is acceptable — say so instead.
-      if (msg.pack) {
-        return {
-          type: "response.error",
-          requestId: msg.id,
-          error: "collaboration and pack are mutually exclusive — a collaborative session compiles its own one-goal pack. Use /pipeline for a pre-authored pack.",
-          code: "invalid_request",
-        };
-      }
       const orchestrator = orchestratorRole(collaboration);
       if (orchestrator) {
         if (providerId && providerId !== orchestrator.providerId) {
@@ -1951,15 +2016,95 @@ mcpHub: this.#mcpHub,
 
     // Ambient pack activation (docs/pack-loading.md): resolve the requested pack
     // (+ optional capability role) up front; fail-closed on an unknown pack/role.
+    // A collaborative create already resolved its pack above (adoption), where
+    // the activation feeds the compiled goal pack instead of activating here.
     let pack: PackActivation | undefined;
-    if (msg.pack) {
+    if (msg.pack && !collaboration) {
       try {
         pack = this.#packs.resolveActivation(msg.pack, msg.packRole);
       } catch (e) {
         return { type: "response.error", requestId: msg.id, error: e instanceof Error ? e.message : String(e), code: "invalid_request" };
       }
-    } else if (msg.packRole) {
+    } else if (msg.packRole && !msg.pack) {
       return { type: "response.error", requestId: msg.id, error: "packRole requires pack", code: "invalid_request" };
+    }
+
+    // Model for a single session (docs/role-model-binding.md §6.2). An explicit
+    // `model` is the operator's word — validated provider-aware (a Claude alias
+    // must not ride onto another vendor; past that, the live backend is the
+    // real validator, same house policy as session.set_model). Omitted, with a
+    // pack capability role active, it resolves through the role's binding
+    // chain minus the phase-pin and cli rungs.
+    let defaultModel: string | undefined;
+    if (msg.model !== undefined && msg.model.trim() !== "") {
+      if (collaboration) {
+        return {
+          type: "response.error",
+          requestId: msg.id,
+          error: "model does not apply to a collaborative session — set it per role (--role name:provider:model).",
+          code: "invalid_request",
+        };
+      }
+      const forProvider = providerId ?? DEFAULT_PROVIDER_ID;
+      const resolved = resolveModelIdForProvider(msg.model, forProvider);
+      if (!resolved) {
+        return {
+          type: "response.error",
+          requestId: msg.id,
+          error: `Model "${msg.model}" is not valid for provider "${forProvider}". Omit model to use the provider's default.`,
+          code: "invalid_request",
+        };
+      }
+      defaultModel = resolved;
+    } else if (pack?.role) {
+      const resolved = resolveBinding({
+        packId: pack.id,
+        roleName: pack.roleName,
+        role: pack.role,
+        config: this.#modelBindingConfig(),
+      });
+      if (resolved.resolvedFrom === "default") {
+        if (pack.role.tier !== undefined) {
+          warn(
+            `pack "${pack.id}" role "${pack.roleName}" declares tier "${pack.role.tier}" but no modelTiers mapping exists — using the provider default`,
+          );
+        }
+      } else if (
+        resolved.provider !== undefined &&
+        msg.providerId !== undefined &&
+        resolved.provider !== msg.providerId
+      ) {
+        // The explicit --provider wins over a config/pack binding on another
+        // backend — a model id doesn't transfer across vendors.
+        warn(
+          `pack "${pack.id}" role "${pack.roleName}": the ${resolved.resolvedFrom} binding targets provider "${resolved.provider}" but the session asked for "${msg.providerId}" — using that backend's default model`,
+        );
+      } else {
+        // The winning rung supplies the whole binding: its provider (when it
+        // names one) fails closed like an explicit providerId would.
+        if (resolved.provider !== undefined && !this.#providers.has(resolved.provider)) {
+          return {
+            type: "response.error",
+            requestId: msg.id,
+            error: `Role "${pack.roleName}" resolves to unknown provider "${resolved.provider}" (via ${resolved.resolvedFrom}) — available: ${this.#providers.ids().join(", ")}`,
+            code: "invalid_request",
+          };
+        }
+        const targetProvider = resolved.provider ?? providerId ?? DEFAULT_PROVIDER_ID;
+        // A chain-resolved model goes through the SAME provider-aware
+        // validation as an explicit --model — but SKIPS with a warning rather
+        // than hard-failing the create: the operator never typed this id, so a
+        // model-only pin written for another vendor must not brick the create
+        // (nor silently transfer). The rung's provider still applies.
+        if (resolved.model !== undefined && resolveModelIdForProvider(resolved.model, targetProvider) === null) {
+          warn(
+            `pack "${pack.id}" role "${pack.roleName}": the ${resolved.resolvedFrom} binding's model "${resolved.model}" is not valid for provider "${targetProvider}" — using that backend's default model`,
+          );
+        } else {
+          defaultModel = resolved.model;
+        }
+        providerId = resolved.provider ?? providerId;
+      }
     }
 
     // Plan the role-children BEFORE creating anything, so a fan-out over the
@@ -1992,12 +2137,19 @@ mcpHub: this.#mcpHub,
       }
       // The orchestrator runs under the compiled one-goal pack: the goal, its
       // fleet roster, and the delegation rules become its constitution, so
-      // pack vocabulary never surfaces on this path.
-      const compiled = compileGoalPack(collaboration, planned);
+      // pack vocabulary never surfaces on this path. Under adoption (§6.1)
+      // the constitution composes pack ETHOS → goal → roster, the real pack
+      // id replaces the synthetic one, and the orchestrator gets the pack's
+      // subagents exactly as a --pack session would.
+      const compiled = compileGoalPack(
+        collaboration,
+        planned,
+        adoption ? { id: adoption.id, constitution: adoption.constitution } : undefined,
+      );
       pack = {
         id: compiled.id,
         constitution: compiled.constitution,
-        subagents: compiled.subagents,
+        subagents: adoption ? adoption.subagents : compiled.subagents,
       };
     }
 
@@ -2030,6 +2182,9 @@ mcpHub: this.#mcpHub,
       hooks: this.#hooks,
       // Derived above for a collaborative session; otherwise msg.providerId.
       providerId,
+      // Explicit `model`, or the pack role's resolved binding (§6.2). Outranks
+      // config.session.defaultModel; still loses to a persisted choice.
+      defaultModel,
       pack,
       collaboration,
       identityManager: this.#identityManager,
@@ -2054,7 +2209,7 @@ mcpHub: this.#mcpHub,
     if (collaboration) this.#attachOrchestratorBlackboard(session, collaboration);
 
     if (collaboration && planned.length > 0) {
-      const spawned = await this.#spawnCollaborationChildren(session, collaboration, planned, auth);
+      const spawned = await this.#spawnCollaborationChildren(session, collaboration, planned, auth, adoption);
       if (!spawned.ok) {
         // All-or-nothing: a collaboration missing a role is not a working
         // collaboration, and leaving the orchestrator up with a partial fleet
@@ -2112,6 +2267,9 @@ mcpHub: this.#mcpHub,
       type: "response.ok",
       requestId: msg.id,
       data: session.toInfo(),
+      // Binding notes collected above (adoption skips, unmapped tiers) — the
+      // create succeeded; these say what was quietly adjusted and where to fix.
+      ...(warnings.length > 0 ? { warnings } : {}),
     };
   }
 
@@ -2332,9 +2490,18 @@ mcpHub: this.#mcpHub,
     collaboration: CollaborationConfig,
     planned: readonly PlannedChild[],
     auth: AuthContext,
+    // Pack adoption (§6.1): children get the role YAML's real envelope and a
+    // brief that opens with the pack's ETHOS. Absent = free-form, unchanged.
+    adoption?: PackActivation,
   ): Promise<{ ok: true } | { ok: false; error: string }> {
+    // Keyed case-insensitively to agree with the validator's lowercased names.
+    const adoptedRoles = new Map<string, RoleDef>();
+    for (const def of Object.values(adoption?.roles ?? {})) {
+      adoptedRoles.set(def.name.toLowerCase(), def);
+    }
     for (const child of planned) {
       try {
+        const adoptedRole = adoption ? adoptedRoles.get(child.roleName.toLowerCase()) : undefined;
         // Minted before construction so the child's provider can mount it from
         // the start — the token carries this role's read/write scope.
         const blackboard = this.#blackboardMountFor(
@@ -2359,7 +2526,12 @@ mcpHub: this.#mcpHub,
           // Worker shape, capability role, brief, and collaborationRole — the
           // whole restriction set, from the one function the resume path also
           // calls so the two can't drift.
-          ...roleChildPosture(child, parent.id, childBrief(collaboration, child)),
+          ...roleChildPosture(
+            child,
+            parent.id,
+            childBrief(collaboration, child, adoption?.constitution),
+            adoptedRole ? { packId: adoption!.id, role: adoptedRole } : undefined,
+          ),
           // Autonomous with a bounded budget — the same posture dispatch gives
           // its workers, and for the same reason: NOBODY ATTACHES TO A CHILD.
           // The owner's approval happens once at dispatch time (the R3 gate on
@@ -2820,9 +2992,13 @@ mcpHub: this.#mcpHub,
    * timeout (the session is attended) and the session is NOT torn down between
    * phases. Satisfies the pipeline package's PhaseTurnHost.
    *
-   * `provider`/`model` on the request are not applied here: a run drives ONE
-   * session with one provider, so per-phase provider overrides are out of scope
-   * for the single-session model (see docs/pipeline-run.md open questions).
+   * `model` on the request is the phase's persisted binding
+   * (docs/role-model-binding.md §3): it is applied to the bound session for
+   * this phase's turn and restored after (finally-reliable, even on phase
+   * failure). `provider` cannot be applied — a run drives ONE session with one
+   * backend — so cross-provider bindings are already skipped at create
+   * (#pipelineCreate → #bindModels); a mismatch reaching here (a run persisted
+   * before that filter existed) is skipped with a warning, never transferred.
    */
   async runPhaseOnSession(req: {
     sessionId: string;
@@ -2834,6 +3010,26 @@ mcpHub: this.#mcpHub,
   }): Promise<PhaseTurnResult> {
     const session = this.#sessions.get(req.sessionId);
     if (!session) throw new Error(`pipeline bound session "${req.sessionId}" not found`);
+    // Per-phase model binding: set the bound model for this phase's turn.
+    // The restore happens in the finally below — even when the phase fails.
+    let override: { prev: string | null; applied: string | null } | null = null;
+    if (req.model !== undefined) {
+      if (req.provider !== undefined && req.provider !== session.providerId) {
+        // Only reachable for runs persisted before the create-time filter, or
+        // a session resumed onto a different backend. Models don't transfer
+        // across vendors — skip, don't guess.
+        console.warn(
+          `[pipeline] phase binding ${req.provider}:${req.model} does not match the run session's backend "${session.providerId}" — skipping (using the session's model)`,
+        );
+      } else {
+        override = await session.overrideModel(req.model);
+        if (!override) {
+          console.warn(
+            `[pipeline] phase model "${req.model}" is not valid for backend "${session.providerId}" — skipping (using the session's model)`,
+          );
+        }
+      }
+    }
     // Per-phase governance: apply this phase's role (+ constitution + subagents)
     // to the live session before its turn. resolvePhaseActivation fails CLOSED
     // when a declared role can't be applied (no silent escalation), SOFT otherwise.
@@ -2939,6 +3135,18 @@ mcpHub: this.#mcpHub,
       }
     } finally {
       this.#phaseWaiters.delete(req.sessionId);
+      // Restore the pre-phase model — reliable even on phase failure. Skipped
+      // when the model changed underneath us (the user ran set_model mid-phase;
+      // their explicit, persisted choice must win over our restore).
+      if (override && session.model === override.applied) {
+        try {
+          await session.overrideModel(override.prev);
+        } catch (err) {
+          console.warn(
+            `[pipeline] failed to restore model after phase: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
     }
   }
 
@@ -3034,6 +3242,11 @@ mcpHub: this.#mcpHub,
       phases: s.phases.map((p) => {
         const st = p.state;
         const w: PipelinePhaseWire = { id: p.def.id, name: p.def.name, role: p.def.role, status: st.status };
+        // The persisted model binding (docs/role-model-binding.md §3) — clients
+        // render provider/model + the precedence rung that chose them.
+        if (p.def.provider !== undefined) w.provider = p.def.provider;
+        if (p.def.model !== undefined) w.model = p.def.model;
+        if (p.def.resolvedFrom !== undefined) w.resolvedFrom = p.def.resolvedFrom;
         if (st.status === "passed") w.summary = st.summary;
         else if (st.status === "failed") w.reason = st.reason;
         else if (st.status === "skipped") w.reason = st.reason;
@@ -3083,6 +3296,14 @@ mcpHub: this.#mcpHub,
         return { type: "response.error", requestId: msg.id, error: `phase "${p.id}": unknown provider "${p.provider}"`, code: "invalid_request" };
       }
     }
+    // Role bindings name a known backend or fail here (§5): the provider
+    // registry is enumerable, unlike model ids (those pass through and fail at
+    // the phase's session spawn, where the error names the binding's rung).
+    for (const [roleName, b] of Object.entries(msg.roleBindings ?? {})) {
+      if (!providerIds.includes(b.provider)) {
+        return { type: "response.error", requestId: msg.id, error: `role "${roleName}": unknown provider "${b.provider}"`, code: "invalid_request" };
+      }
+    }
     // A run is a conductor over a live, attached session (docs/pipeline-run.md):
     // create the bound run-session up front so its phases stream into a real
     // session the client can attach. Created before pm.create so its id is part
@@ -3094,6 +3315,10 @@ mcpHub: this.#mcpHub,
       auth,
     });
     try {
+      // Binding warnings (skipped cross-provider bindings, unmapped tiers) go
+      // to the daemon log AND back to the creating client on the snapshot —
+      // a warning only the daemon console sees is one the operator never sees.
+      const warnings: string[] = [];
       const state = g.pm.create({
         name: msg.name,
         phases: msg.phases,
@@ -3104,8 +3329,27 @@ mcpHub: this.#mcpHub,
         accountId: auth.accountId,
         projectId: auth.projectId,
         createdBy: auth.sub,
+        roleBindings: msg.roleBindings,
+        // The operator's model maps, read once here — the manager persists the
+        // resolved binding per phase (docs/role-model-binding.md §3).
+        modelConfig: {
+          modelTiers: this.#config?.pipeline?.modelTiers,
+          modelRoles: this.#config?.pipeline?.modelRoles,
+        },
+        // The run drives ONE session on this backend — a resolved binding
+        // naming any other provider is skipped at create, not persisted (§3).
+        sessionProvider: runSession.providerId,
+        warn: (m) => {
+          warnings.push(m);
+          console.warn(`[pipeline] ${m}`);
+        },
       });
-      return { type: "pipeline.snapshot", requestId: msg.id, pipeline: this.#pipelineToWire(state) };
+      return {
+        type: "pipeline.snapshot",
+        requestId: msg.id,
+        pipeline: this.#pipelineToWire(state),
+        ...(warnings.length > 0 ? { warnings } : {}),
+      };
     } catch (e) {
       this.#sessions.delete(runSession.id);
       try {

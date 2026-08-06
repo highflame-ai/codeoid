@@ -2804,6 +2804,38 @@ export class Session {
   }
 
   /**
+   * Phase-scoped model override for pipeline runs (docs/role-model-binding.md
+   * §3): the run host sets the phase's bound model before the phase turn and
+   * restores the previous one after. Unlike `setModel` this deliberately does
+   * NOT persist to the store and emits no chat message — the binding lives on
+   * the phase def, and persisting a transient per-phase choice would survive a
+   * mid-phase daemon crash as if the user had picked it. (A crash mid-phase
+   * instead resumes on the pre-override model, and the re-driven phase
+   * re-applies the override — at-least-once, same as the phase itself.)
+   *
+   * Resolution is provider-aware; a model that doesn't validate for this
+   * session's backend is NOT applied (returns null — the caller warns).
+   * Returns `{prev, applied}` so the caller can restore `prev` in a finally,
+   * and skip the restore when the model changed underneath it (the user ran
+   * set_model mid-phase — their explicit choice must win).
+   */
+  async overrideModel(model: string | null): Promise<{ prev: string | null; applied: string | null } | null> {
+    const prev = this.#model;
+    let next: string | null = null;
+    if (model !== null) {
+      const resolved = resolveModelIdForProvider(model, this.providerId);
+      if (!resolved) return null; // not applicable to this backend — leave as-is
+      next = resolved;
+    }
+    if (next === prev) return { prev, applied: next };
+    this.#model = next;
+    // Tear down the current stream so the next send runs on the new model.
+    await this.#teardownProvider();
+    this.#broadcastInfoUpdate();
+    return { prev, applied: next };
+  }
+
+  /**
    * Public entry for `/rotate` slash command — a user-initiated rotation.
    * Still respects the min-turns guard so a fresh session can't rotate to
    * itself on turn 1.

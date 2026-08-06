@@ -239,6 +239,48 @@ describe("pipeline.* handlers", () => {
     if (badProv.type === "response.error") expect(badProv.error).toContain("provider");
   });
 
+  test("create rejects a role binding naming an unknown provider (§5)", async () => {
+    const r = await manager.handle(
+      {
+        type: "pipeline.create",
+        id: "1",
+        name: "R",
+        phases: [{ id: "one", kind: "noop", role: "worker" }],
+        workdir: join(tmp, "repo"),
+        roleBindings: { worker: { provider: "nope-provider" } },
+      },
+      AUTH,
+      CLIENT,
+    );
+    expect(r.type).toBe("response.error");
+    if (r.type === "response.error") {
+      expect(r.code).toBe("invalid_request");
+      expect(r.error).toContain('unknown provider "nope-provider"');
+    }
+  });
+
+  test("create persists a role binding's provider/model + resolvedFrom on the phase wire", async () => {
+    const created = snapshot(
+      await manager.handle(
+        {
+          type: "pipeline.create",
+          id: "1",
+          name: "R",
+          phases: [{ id: "one", kind: "noop", role: "worker" }],
+          workdir: join(tmp, "repo"),
+          roleBindings: { worker: { provider: "claude", model: "claude-fable-5" } },
+        },
+        AUTH,
+        CLIENT,
+      ),
+    );
+    expect(created.phases[0]).toMatchObject({
+      provider: "claude",
+      model: "claude-fable-5",
+      resolvedFrom: "cli",
+    });
+  });
+
   test("create validation surfaces as response.error", async () => {
     const r = await manager.handle(
       { type: "pipeline.create", id: "1", name: "x", phases: [{ id: "one", kind: "nope" }] },

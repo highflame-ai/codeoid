@@ -8,6 +8,8 @@
  * a later slice.
  */
 
+import type { ResolvedFrom, RoleModelSource } from "./binding";
+
 // ── Phase definition (the static plan) ────────────────────────────────────
 
 /**
@@ -38,6 +40,13 @@ export interface PhaseDef {
   provider?: string;
   /** per-phase model override. */
   model?: string;
+  /** Which precedence rung produced this phase's provider/model binding
+   *  (docs/role-model-binding.md §3). Written at `pipeline.create` when a
+   *  binding resolved; absent = no binding (provider-default behavior, today's
+   *  path). Persisted with the run so resume/retry keep the SAME binding even
+   *  if config changes underneath, and status can name the layer to fix when
+   *  a model id fails at spawn. */
+  resolvedFrom?: ResolvedFrom;
   /** exit-gate id — the acceptance predicate evaluated on phase output (§5a.5). */
   gate?: string;
   /** entry (grounding) gate id — a read-only probe before the phase acts (§5a.3). */
@@ -215,4 +224,9 @@ export interface Pack {
   id: string;
   register(r: PipelineRegistries): void;
   pipeline: PhaseDef[];
+  /** Capability roles keyed by name, when the pack declares them (manifest
+   *  packs — `LoadedPack` narrows this to full `RoleDef`s). Read by model-
+   *  binding resolution at create (tier + role-level pin —
+   *  docs/role-model-binding.md); absent on code-defined packs. */
+  roles?: Record<string, RoleModelSource>;
 }

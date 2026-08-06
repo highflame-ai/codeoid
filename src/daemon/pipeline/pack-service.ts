@@ -18,6 +18,7 @@ import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, statSync, 
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { AvailablePackWire, PackWire, RegistryWire } from "@codeoid/protocol";
+import { type ModelBindingConfig, resolveBinding } from "./binding";
 import type { Pack } from "./interface";
 import { loadPack, type LoadedPack, type RoleDef } from "./pack";
 import { loadSubagents, type PackSubagent } from "./subagents";
@@ -31,6 +32,11 @@ export interface PackActivation {
   /** The capability role named at activation (undefined = no tool restriction). */
   role?: RoleDef;
   roleName?: string;
+  /** Every role the pack declares, keyed by name — the collab adoption path
+   *  (docs/role-model-binding.md §6) binds its roster against this set.
+   *  Optional so synthesized activations (compiled goal packs, role-child
+   *  postures) don't have to carry an empty map. */
+  roles?: Record<string, RoleDef>;
   subagents: PackSubagent[];
 }
 
@@ -90,6 +96,10 @@ export interface PackServiceDeps {
   skillsDir?: string;
   /** Run git (injectable). Default: `git` via Bun.spawn. */
   git?: (args: string[], cwd?: string) => Promise<GitResult>;
+  /** The operator's model maps (config `pipeline.modelTiers`/`modelRoles`) —
+   *  drives the pre-flight `pack show --resolve` view (docs/role-model-binding.md
+   *  §4). Omit in tests that don't exercise resolution. */
+  modelConfig?: ModelBindingConfig;
 }
 
 /** Lightweight pack metadata read straight from a pack.yaml (no role/constitution
@@ -130,6 +140,7 @@ export class PackService {
   #git: (args: string[], cwd?: string) => Promise<GitResult>;
   #persist?: (state: PackServiceConfig) => void;
   #manager: PackServiceDeps["manager"];
+  #modelConfig?: ModelBindingConfig;
 
   constructor(deps: PackServiceDeps) {
     this.#registries = [...deps.config.registries];
@@ -140,6 +151,7 @@ export class PackService {
     this.#git = deps.git ?? defaultGit;
     this.#persist = deps.persist;
     this.#manager = deps.manager;
+    this.#modelConfig = deps.modelConfig;
   }
 
   // ── Registries ────────────────────────────────────────────────────────────
@@ -318,6 +330,19 @@ export class PackService {
         roles: Object.keys(loaded.roles),
         gates: loaded.gateSpecs,
         active: mgr?.registries.packs.has(loaded.id) ?? false,
+        // Pre-flight model-binding view (docs/role-model-binding.md §4): each
+        // role's effective binding under THIS machine's config, no CLI
+        // overrides. Phase pins are deliberately ignored here — a phase pin
+        // outranks the tier map at run time, so it is listed SEPARATELY
+        // (phasePins) to keep a stale concrete pin visible next to what the
+        // tier map would choose.
+        resolvedRoles: Object.entries(loaded.roles).map(([name, role]) => {
+          const r = resolveBinding({ packId: loaded.id, roleName: name, role, config: this.#modelConfig });
+          return { name, tier: role.tier, provider: r.provider, model: r.model, resolvedFrom: r.resolvedFrom };
+        }),
+        phasePins: loaded.pipeline
+          .filter((p) => p.provider !== undefined || p.model !== undefined)
+          .map((p) => ({ phase: p.id, provider: p.provider, model: p.model })),
       };
     });
   }
@@ -445,7 +470,7 @@ export class PackService {
     // Subagents ship at the registry root's `agents/` dir (like skills). A
     // local-dir install has no registry → no subagents.
     const subagents = entry.registry ? loadSubagents(join(this.#cachePath(entry.registry), "agents")) : [];
-    return { id: loaded.id, constitution: loaded.constitution, role, roleName, subagents };
+    return { id: loaded.id, constitution: loaded.constitution, role, roleName, roles: loaded.roles, subagents };
   }
 
   // ── internals ───────────────────────────────────────────────────────────────

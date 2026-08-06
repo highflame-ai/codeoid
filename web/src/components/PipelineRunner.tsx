@@ -134,6 +134,15 @@ const PipelineRunner: Component = () => {
             </div>
           </Show>
 
+          {/* Create-time binding notes (a --role/config binding skipped
+              because it targets a backend other than the run session's, an
+              unmapped tier) — non-fatal, but the operator should see them. */}
+          <Show when={pipelinesState().warnings.length > 0}>
+            <div class="border-b border-warn/40 bg-warn/10 px-3 py-2 text-[11px] leading-relaxed text-warn">
+              <For each={pipelinesState().warnings}>{(w) => <div>⚠ {w}</div>}</For>
+            </div>
+          </Show>
+
           <div class="min-h-0 flex-1 overflow-y-auto px-4 py-3">
             <PipelineRunnerView
               pipeline={pipeline()}

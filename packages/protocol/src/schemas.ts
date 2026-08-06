@@ -118,11 +118,19 @@ export const sessionCreateSchema = z.object({
    */
   collaboration: collaborationConfigSchema.optional(),
   /**
+   * Model for this session (docs/role-model-binding.md §6.2). Bounded string,
+   * validated provider-aware by the daemon — the frame must PARSE so the
+   * daemon can answer with a specific error, same rule as `providerId`.
+   */
+  model: z.string().min(1).max(LIMITS.MODEL_MAX).optional(),
+  /**
    * Activate an installed SDLC pack on this session (ambient mode —
    * docs/pack-loading.md): its constitution is injected into the system
    * prompt, its skills/subagents become available, and — if `packRole` is set
    * — the session runs under that capability role. Bounded string; the daemon
-   * fail-closes on an unknown pack.
+   * fail-closes on an unknown pack. Combined with `collaboration`, the
+   * collaboration ADOPTS the pack (docs/role-model-binding.md §6) — role
+   * names bind strictly to the pack's declared roles.
    */
   pack: z.string().max(64).optional(),
   /**
@@ -453,8 +461,10 @@ const phaseDefSchema = z.object({
   skill: z.string().max(64).optional(),
   gate: z.string().max(64).optional(),
   entryGate: z.string().max(64).optional(),
-  provider: z.string().max(64).optional(),
-  model: z.string().max(LIMITS.MODEL_MAX).optional(),
+  // min(1): an empty string would persist as a phantom "phase-pin" that wins
+  // the model-binding chain while meaning nothing (same bounds as roleBindings).
+  provider: z.string().min(1).max(64).optional(),
+  model: z.string().min(1).max(LIMITS.MODEL_MAX).optional(),
   role: z.string().max(64).optional(),
   reads: z.array(z.string().max(256)).max(128).optional(),
   writes: z.string().max(256).optional(),
@@ -482,6 +492,18 @@ export const pipelineCreateSchema = z
     workdir: pathField.optional(),
     /** Backend for the run's bound session (default: the daemon's default provider). */
     providerId: z.string().max(64).optional(),
+    /** Invocation-time role→model bindings, keyed by role name (the CLI's
+     *  `--role` flags compiled — docs/role-model-binding.md §3). */
+    roleBindings: z
+      .record(
+        z.string().min(1).max(64),
+        z.object({
+          provider: z.string().min(1).max(64),
+          model: z.string().min(1).max(LIMITS.MODEL_MAX).optional(),
+        }),
+      )
+      .refine((r) => Object.keys(r).length <= 32, { message: "too many role bindings (max 32)" })
+      .optional(),
   })
   .refine((m) => !(m.phases !== undefined && m.pack !== undefined), {
     message: "provide either `phases` or `pack`, not both",

@@ -10,6 +10,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRegistries } from "./registry";
+import type { PhaseDef } from "./interface";
 import { PipelineManager } from "./manager";
 import { loadPack } from "./pack";
 import { PipelineStore } from "./store";
@@ -508,5 +509,304 @@ describe("pipeline auto-skip (manager end-to-end)", () => {
 
     // Not skipped: it ran, then the exit probe failed (no spec.md) → halted for a human.
     expect(s.phases[0].state.status).toBe("halted");
+  });
+});
+
+// ── Per-role model binding (docs/role-model-binding.md) ────────────────────
+
+/** A pack whose roles exercise every pack-side binding source: a tier, a
+ *  role-level pin, and a phase-level pin. */
+const BINDING_MANIFEST = `schema: codeoid/pack@v1
+id: bind-pack
+name: Binding
+version: 0.0.1
+roles:
+  - ./roles/adversary.yaml
+  - ./roles/scribe.yaml
+  - ./roles/pinned.yaml
+phases:
+  - id: attack
+    kind: noop
+    role: adversary
+  - id: write-up
+    kind: noop
+    role: scribe
+  - id: pinned-phase
+    kind: noop
+    role: pinned
+    provider: codex
+    model: codex-max
+`;
+const ADVERSARY_ROLE = `name: adversary
+tier: reasoning-max
+write: false
+network: read-only
+envelope: [read, grep]
+`;
+const SCRIBE_ROLE = `name: scribe
+write: true
+network: false
+envelope: all
+`;
+const PINNED_ROLE = `name: pinned
+tier: reasoning-max
+provider: openai
+model: gpt-5-codex
+write: false
+network: false
+envelope: all
+`;
+
+function bindingPack(): string {
+  return writePack(BINDING_MANIFEST, {
+    roles: { "adversary.yaml": ADVERSARY_ROLE, "scribe.yaml": SCRIBE_ROLE, "pinned.yaml": PINNED_ROLE },
+  });
+}
+
+const TIERS = { "reasoning-max": { provider: "claude", model: "claude-fable-5" } };
+
+describe("role tier schema (loadPack)", () => {
+  test("tier parses and is carried on the RoleDef", () => {
+    const pack = loadPack(bindingPack());
+    expect(pack.roles.adversary.tier).toBe("reasoning-max");
+    expect(pack.roles.scribe.tier).toBeUndefined();
+    // The role-level pin (fleet path) is also carried — binding rung 4.
+    expect(pack.roles.pinned).toMatchObject({ provider: "openai", model: "gpt-5-codex" });
+  });
+
+  test("rejects an empty tier and one over 64 chars", () => {
+    const bad = (tier: string) =>
+      writePack(
+        "schema: codeoid/pack@v1\nid: p\nname: P\nversion: 0.0.1\nroles: [./roles/r.yaml]\nphases:\n  - id: a\n    kind: noop\n",
+        { roles: { "r.yaml": `name: r\ntier: "${tier}"\nwrite: false\nenvelope: all\n` } },
+      );
+    expect(() => loadPack(bad(""))).toThrow("invalid role");
+    expect(() => loadPack(bad("x".repeat(65)))).toThrow("invalid role");
+  });
+});
+
+describe("model binding at create (manager)", () => {
+  test("resolves per phase and persists {provider, model, resolvedFrom}", () => {
+    const mgr = new PipelineManager(new PipelineStore(new Database(":memory:")));
+    mgr.installPack(loadPack(bindingPack()));
+    const p = mgr.create({ name: "run", pack: "bind-pack", ...tenant, modelConfig: { modelTiers: TIERS } });
+
+    // attack: tier mapped by config → config-tier rung.
+    expect(p.phases[0].def).toMatchObject({
+      provider: "claude",
+      model: "claude-fable-5",
+      resolvedFrom: "config-tier",
+    });
+    // write-up: no tier, no pins, no bindings → untouched (absent = default).
+    expect(p.phases[1].def.provider).toBeUndefined();
+    expect(p.phases[1].def.resolvedFrom).toBeUndefined();
+    // pinned-phase: the phase pin outranks both the role pin and the tier map.
+    expect(p.phases[2].def).toMatchObject({
+      provider: "codex",
+      model: "codex-max",
+      resolvedFrom: "phase-pin",
+    });
+  });
+
+  test("CLI roleBindings outrank every pack-side source, wholesale", () => {
+    const mgr = new PipelineManager(new PipelineStore(new Database(":memory:")));
+    mgr.installPack(loadPack(bindingPack()));
+    const p = mgr.create({
+      name: "run",
+      pack: "bind-pack",
+      ...tenant,
+      roleBindings: { pinned: { provider: "gemini" } }, // provider-only, on the pinned role
+      modelConfig: { modelTiers: TIERS },
+    });
+    // The CLI's provider-only binding replaces the pin ENTIRELY: no model
+    // inherited from the phase pin (gemini's default model, not codex-max).
+    expect(p.phases[2].def.provider).toBe("gemini");
+    expect(p.phases[2].def.model).toBeUndefined();
+    expect(p.phases[2].def.resolvedFrom).toBe("cli");
+  });
+
+  test("role-level pin wins when the phase carries none (rung 4)", () => {
+    const mgr = new PipelineManager(new PipelineStore(new Database(":memory:")));
+    // Same pack, but the phase-level pin removed from pinned-phase.
+    const manifest = BINDING_MANIFEST.replace("    provider: codex\n    model: codex-max\n", "");
+    mgr.installPack(
+      loadPack(
+        writePack(manifest, {
+          roles: { "adversary.yaml": ADVERSARY_ROLE, "scribe.yaml": SCRIBE_ROLE, "pinned.yaml": PINNED_ROLE },
+        }),
+      ),
+    );
+    const p = mgr.create({ name: "run", pack: "bind-pack", ...tenant, modelConfig: { modelTiers: TIERS } });
+    expect(p.phases[2].def).toMatchObject({
+      provider: "openai",
+      model: "gpt-5-codex",
+      resolvedFrom: "role-pin",
+    });
+  });
+
+  test("config modelRoles outranks the phase pin (rung 2 vs 3)", () => {
+    const mgr = new PipelineManager(new PipelineStore(new Database(":memory:")));
+    mgr.installPack(loadPack(bindingPack()));
+    const p = mgr.create({
+      name: "run",
+      pack: "bind-pack",
+      ...tenant,
+      modelConfig: { modelRoles: { "bind-pack/pinned": { provider: "claude", model: "claude-opus-5" } } },
+    });
+    expect(p.phases[2].def).toMatchObject({
+      provider: "claude",
+      model: "claude-opus-5",
+      resolvedFrom: "config-role",
+    });
+  });
+
+  test("persisted bindings survive a config change (deterministic resume)", () => {
+    const store = new PipelineStore(new Database(":memory:"));
+    const mgr = new PipelineManager(store);
+    mgr.installPack(loadPack(bindingPack()));
+    // The config object is read ONCE at create — mutate it afterwards.
+    const modelConfig = { modelTiers: { ...TIERS } };
+    const p = mgr.create({ name: "run", pack: "bind-pack", ...tenant, modelConfig });
+    modelConfig.modelTiers["reasoning-max"] = { provider: "openai", model: "o9" };
+
+    // The live manager AND a restarted one (fresh manager, same store) both
+    // report the binding resolved at create, not the mutated config.
+    expect(mgr.get(p.id)?.phases[0].def.model).toBe("claude-fable-5");
+    const revived = new PipelineManager(store);
+    expect(revived.get(p.id)?.phases[0].def).toMatchObject({
+      provider: "claude",
+      model: "claude-fable-5",
+      resolvedFrom: "config-tier",
+    });
+  });
+
+  test("binding at create does not mutate the installed pack's shared phase defs", () => {
+    const mgr = new PipelineManager(new PipelineStore(new Database(":memory:")));
+    const loaded = loadPack(bindingPack());
+    mgr.installPack(loaded);
+    mgr.create({ name: "run", pack: "bind-pack", ...tenant, modelConfig: { modelTiers: TIERS } });
+    // The registry's defs stay pristine — a second run must re-resolve fresh.
+    expect(loaded.pipeline[0].provider).toBeUndefined();
+    expect(loaded.pipeline[0].resolvedFrom).toBeUndefined();
+  });
+
+  test("unknown role in roleBindings is a create-time error listing the pack's roles", () => {
+    const mgr = new PipelineManager(new PipelineStore(new Database(":memory:")));
+    mgr.installPack(loadPack(bindingPack()));
+    expect(() =>
+      mgr.create({ name: "run", pack: "bind-pack", ...tenant, roleBindings: { adversry: { provider: "claude" } } }),
+    ).toThrow('unknown role "adversry" in role bindings — pack "bind-pack" declares: adversary, scribe, pinned');
+  });
+
+  test("explicit-phases plans validate bindings against the phases' role names", () => {
+    const mgr = new PipelineManager(new PipelineStore(new Database(":memory:")));
+    const phases: PhaseDef[] = [{ id: "a", kind: "noop", role: "worker" }];
+    expect(() =>
+      mgr.create({ name: "run", phases, ...tenant, roleBindings: { ghost: { provider: "claude" } } }),
+    ).toThrow('unknown role "ghost" in role bindings — the phase plan declares: worker');
+    // A binding for a declared role applies (cli rung), even without a pack.
+    const p = mgr.create({ name: "run", phases, ...tenant, roleBindings: { worker: { provider: "claude", model: "m" } } });
+    expect(p.phases[0].def).toMatchObject({ provider: "claude", model: "m", resolvedFrom: "cli" });
+  });
+
+  test("an unmapped tier resolves to default (no binding persisted, no error)", () => {
+    const mgr = new PipelineManager(new PipelineStore(new Database(":memory:")));
+    mgr.installPack(loadPack(bindingPack()));
+    // No modelConfig at all — the adversary tier has nowhere to land.
+    const p = mgr.create({ name: "run", pack: "bind-pack", ...tenant });
+    expect(p.phases[0].def.provider).toBeUndefined();
+    expect(p.phases[0].def.resolvedFrom).toBeUndefined();
+  });
+
+  // ── The run session's provider is authoritative (§3) ──────────────────────
+  // A run drives ONE bound session on one backend; a binding naming a
+  // different provider is skipped at create with a warning naming the rung —
+  // same rule as collab adoption — and is NEVER persisted as effective.
+
+  test("a binding naming a provider other than the run session's is skipped with a warning", () => {
+    const mgr = new PipelineManager(new PipelineStore(new Database(":memory:")));
+    mgr.installPack(loadPack(bindingPack()));
+    const warnings: string[] = [];
+    const p = mgr.create({
+      name: "run",
+      pack: "bind-pack",
+      ...tenant,
+      modelConfig: { modelTiers: TIERS },
+      sessionProvider: "codex",
+      warn: (m) => warnings.push(m),
+    });
+    // attack: config-tier resolves to claude ≠ codex → skipped, nothing persisted.
+    expect(p.phases[0].def.provider).toBeUndefined();
+    expect(p.phases[0].def.model).toBeUndefined();
+    expect(p.phases[0].def.resolvedFrom).toBeUndefined();
+    // pinned-phase: the codex phase pin MATCHES the session provider → applies.
+    expect(p.phases[2].def).toMatchObject({
+      provider: "codex",
+      model: "codex-max",
+      resolvedFrom: "phase-pin",
+    });
+    // The warning names the rung to fix, and only the skipped binding warned.
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/config-tier/);
+    expect(warnings[0]).toMatch(/"claude"/);
+    expect(warnings[0]).toMatch(/"codex"/);
+  });
+
+  test("a skipped binding strips the phase's own pin fields — never rendered as effective", () => {
+    const mgr = new PipelineManager(new PipelineStore(new Database(":memory:")));
+    mgr.installPack(loadPack(bindingPack()));
+    const warnings: string[] = [];
+    const p = mgr.create({
+      name: "run",
+      pack: "bind-pack",
+      ...tenant,
+      sessionProvider: "claude",
+      warn: (m) => warnings.push(m),
+    });
+    // pinned-phase's own codex pin ≠ claude session → the def must come out
+    // CLEAN (persisting the pin would display a binding that won't apply).
+    expect(p.phases[2].def.provider).toBeUndefined();
+    expect(p.phases[2].def.model).toBeUndefined();
+    expect(p.phases[2].def.resolvedFrom).toBeUndefined();
+    expect(warnings.join("\n")).toMatch(/phase-pin/);
+  });
+
+  test("a model-only pin is validated for the session's backend — skipped when vendor-shaped elsewhere", () => {
+    const mgr = new PipelineManager(new PipelineStore(new Database(":memory:")));
+    const phases: PhaseDef[] = [{ id: "a", kind: "noop", model: "opus" }];
+    // "opus" is a Claude alias: on a codex-bound run session it must NOT ride
+    // through — skip with a warning, never a hard failure (§5: the operator
+    // never typed this model at create).
+    const warnings: string[] = [];
+    const skipped = mgr.create({
+      name: "run",
+      phases,
+      ...tenant,
+      sessionProvider: "codex",
+      warn: (m) => warnings.push(m),
+    });
+    expect(skipped.phases[0].def.model).toBeUndefined();
+    expect(skipped.phases[0].def.resolvedFrom).toBeUndefined();
+    expect(warnings.join("\n")).toMatch(/not valid for provider "codex"/);
+    // On a claude session the same pin applies (validation passes; the typed
+    // string is persisted, not its alias expansion).
+    const applied = mgr.create({ name: "run2", phases, ...tenant, sessionProvider: "claude" });
+    expect(applied.phases[0].def).toMatchObject({ model: "opus", resolvedFrom: "phase-pin" });
+  });
+
+  test("role bindings match role names case-insensitively (one rule with the collab path)", () => {
+    const mgr = new PipelineManager(new PipelineStore(new Database(":memory:")));
+    mgr.installPack(loadPack(bindingPack()));
+    const p = mgr.create({
+      name: "run",
+      pack: "bind-pack",
+      ...tenant,
+      roleBindings: { Adversary: { provider: "claude", model: "claude-x" } },
+    });
+    expect(p.phases[0].def).toMatchObject({
+      provider: "claude",
+      model: "claude-x",
+      resolvedFrom: "cli",
+    });
   });
 });

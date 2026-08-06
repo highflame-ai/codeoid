@@ -403,4 +403,51 @@ describe("pack E2E (config → wire create-from-pack → advance)", () => {
       await manager.drain(3_000);
     }
   });
+
+  test("session.create with a pack role surfaces binding warnings on the response", async () => {
+    // A role declaring a tier with no modelTiers mapping resolves to the
+    // provider default (never an error), and the warning must reach the
+    // CREATING CLIENT — not just the daemon console (role-model-binding §5).
+    const packDir = mkdtempSync(join(tmpdir(), "codeoid-tier-pack-"));
+    mkdirSync(join(packDir, "roles"), { recursive: true });
+    writeFileSync(
+      join(packDir, "roles", "adversary.yaml"),
+      "name: adversary\ntier: reasoning-max\nwrite: false\nnetwork: read-only\nenvelope: all\n",
+    );
+    writeFileSync(
+      join(packDir, "pack.yaml"),
+      `schema: codeoid/pack@v1
+id: tier-pack
+name: Tier Pack
+version: 0.0.1
+roles:
+  - ./roles/adversary.yaml
+phases:
+  - { id: attack, kind: noop, role: adversary }
+`,
+    );
+    const manager = makeManager(packDir, false, null);
+    try {
+      const r = await manager.handle(
+        {
+          type: "session.create",
+          id: "1",
+          name: "adv",
+          workdir: join(tmp, "repo"),
+          pack: "tier-pack",
+          packRole: "adversary",
+        },
+        AUTH,
+        CLIENT,
+      );
+      expect(r.type).toBe("response.ok");
+      if (r.type === "response.ok") {
+        expect((r.warnings ?? []).join("\n")).toMatch(/tier "reasoning-max"/);
+        expect((r.warnings ?? []).join("\n")).toMatch(/no modelTiers mapping/);
+      }
+      rmSync(packDir, { recursive: true, force: true });
+    } finally {
+      await manager.drain(3_000);
+    }
+  });
 });
