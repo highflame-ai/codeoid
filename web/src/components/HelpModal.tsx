@@ -11,6 +11,10 @@ import { Component, For, Show, createSignal, onCleanup, onMount } from "solid-js
 
 import { modelCatalog } from "../state/models";
 
+/** Baked in by vite `define` at build time; "dev" under compiles that don't
+ *  substitute it (plain vitest, tsc). */
+const BUILD_COMMIT = typeof __BUILD_COMMIT__ !== "undefined" ? __BUILD_COMMIT__ : "dev";
+
 const [openSignal, setOpenSignal] = createSignal(false);
 
 /** Open the help modal programmatically (wired to the `/help` slash command). */
@@ -72,7 +76,12 @@ const HelpModal: Component = () => {
       >
         <div class="mt-[12vh] w-full max-w-xl rounded-lg border border-border bg-bg-elev shadow-2xl">
           <div class="flex items-center justify-between border-b border-border px-4 py-2.5">
-            <span class="text-sm font-semibold text-fg">Slash commands</span>
+            {/* Build stamp (vite define): a served dist that predates the
+                source is otherwise invisible — hover here to see what the
+                daemon is actually serving. */}
+            <span class="text-sm font-semibold text-fg" title={`ui build ${BUILD_COMMIT}`}>
+              Slash commands
+            </span>
             <button
               type="button"
               class="text-fg-faint hover:text-fg"
@@ -120,6 +129,8 @@ const HelpModal: Component = () => {
             </Show>
             <div class="mt-1 text-[11px] text-fg-faint">
               …or any full <code class="font-mono">claude-*</code> id. Enter sends · Shift+Enter newline · Esc closes
+              {" · "}
+              <span title="git commit this UI bundle was built from">build {BUILD_COMMIT}</span>
             </div>
           </div>
         </div>

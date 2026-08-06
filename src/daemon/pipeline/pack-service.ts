@@ -32,6 +32,11 @@ export interface PackActivation {
   /** The capability role named at activation (undefined = no tool restriction). */
   role?: RoleDef;
   roleName?: string;
+  /** Every role the pack declares, keyed by name — the collab adoption path
+   *  (docs/role-model-binding.md §6) binds its roster against this set.
+   *  Optional so synthesized activations (compiled goal packs, role-child
+   *  postures) don't have to carry an empty map. */
+  roles?: Record<string, RoleDef>;
   subagents: PackSubagent[];
 }
 
@@ -465,7 +470,7 @@ export class PackService {
     // Subagents ship at the registry root's `agents/` dir (like skills). A
     // local-dir install has no registry → no subagents.
     const subagents = entry.registry ? loadSubagents(join(this.#cachePath(entry.registry), "agents")) : [];
-    return { id: loaded.id, constitution: loaded.constitution, role, roleName, subagents };
+    return { id: loaded.id, constitution: loaded.constitution, role, roleName, roles: loaded.roles, subagents };
   }
 
   // ── internals ───────────────────────────────────────────────────────────────

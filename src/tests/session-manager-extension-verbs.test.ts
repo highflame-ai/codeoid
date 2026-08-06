@@ -108,6 +108,42 @@ describe("session.create provider selection", () => {
   });
 });
 
+// `session.create.model` (docs/role-model-binding.md §6.2): the operator's
+// explicit model choice, validated provider-aware at create. The pack-role
+// resolution chain for an OMITTED model is covered in collaboration.test.ts,
+// next to the pack fixture it needs.
+describe("session.create model selection", () => {
+  it("resolves an alias against the provider and stamps the session", async () => {
+    const resp = await manager.handle(
+      { type: "session.create", id: "cm1", name: "with-model", workdir: tmp, model: "opus" },
+      OWNER,
+      client(OWNER),
+    );
+    expect(resp.type).toBe("response.ok");
+    if (resp.type !== "response.ok") return;
+    expect((resp.data as { model?: string }).model).toMatch(/^claude-opus-/);
+  });
+
+  it("rejects a Claude-shaped model on a non-Claude backend fail-closed", async () => {
+    const resp = await manager.handle(
+      {
+        type: "session.create",
+        id: "cm2",
+        name: "wrong-vendor",
+        workdir: tmp,
+        providerId: "pi",
+        model: "opus",
+      },
+      OWNER,
+      client(OWNER),
+    );
+    expect(resp).toMatchObject({ type: "response.error", code: "invalid_request" });
+    if (resp.type === "response.error") {
+      expect(resp.error).toMatch(/Model "opus" is not valid for provider "pi"/);
+    }
+  });
+});
+
 describe("session.commands", () => {
   it("returns the provider catalog with providerId", async () => {
     mock.commands = [{ name: "review", description: "Review the diff", source: "extension" }];

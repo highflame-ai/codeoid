@@ -1026,13 +1026,29 @@ export interface SessionCreateMsg extends BaseClientMsg {
    */
   providerId?: string;
   /**
+   * Model for this session (docs/role-model-binding.md §6.2). Validated
+   * provider-aware at create (a Claude alias on a non-Claude backend is
+   * rejected); otherwise passed through — the live backend is the real
+   * validator. Absent + `pack`/`packRole` = the daemon resolves through the
+   * role's model-binding chain (config override → role pin → tier map);
+   * absent otherwise = the provider's default.
+   */
+  model?: string;
+  /**
    * Activate an installed SDLC pack on this session (ambient mode): inject its
    * constitution, expose its skills/subagents, and — with `packRole` — run
    * under that capability role. The daemon fail-closes on an unknown pack.
+   *
+   * With `collaboration`, this is pack ADOPTION (docs/role-model-binding.md
+   * §6): the pack — not the collab machinery — defines what each role is.
+   * Role names bind strictly to the pack's declared roles, envelopes come
+   * from the role YAML, and the constitution composes pack ETHOS → goal →
+   * roster under the real pack id.
    */
   pack?: string;
   /** Capability role (declared by `pack`) to run under, e.g. "reviewer"
-   *  (read-only). Requires `pack`. */
+   *  (read-only). Requires `pack`; rejected with `collaboration` (a collab's
+   *  roles each carry their own envelope from the pack). */
   packRole?: string;
 }
 

@@ -1,9 +1,27 @@
+import { execSync } from "node:child_process";
 import { defineConfig } from "vite";
 import solid from "vite-plugin-solid";
 import tailwind from "@tailwindcss/vite";
 
+// Build stamp: the daemon serves web/dist as-is, so a stale dist is invisible
+// from the browser — it looks exactly like the source it predates. Baking the
+// git commit in at build time (surfaced in the help modal) makes served-UI
+// drift diagnosable at a glance instead of via a source dig.
+const buildCommit = (() => {
+  try {
+    return execSync("git rev-parse --short HEAD", { stdio: ["ignore", "pipe", "ignore"] })
+      .toString()
+      .trim();
+  } catch {
+    return "unknown";
+  }
+})();
+
 export default defineConfig({
   plugins: [solid(), tailwind()],
+  define: {
+    __BUILD_COMMIT__: JSON.stringify(buildCommit),
+  },
   server: {
     port: 5173,
     strictPort: true,

@@ -290,6 +290,7 @@ export class TerminalClient {
       pack?: string;
       packRole?: string;
       providerId?: string;
+      model?: string;
       collaboration?: CollaborationConfig;
     } = {},
   ): Promise<void> {
@@ -302,6 +303,7 @@ export class TerminalClient {
       // set on auth.ok), so a typo is rejected rather than silently handing back
       // a claude session.
       ...(opts.providerId ? { providerId: opts.providerId } : {}),
+      ...(opts.model ? { model: opts.model } : {}),
       ...(opts.pack ? { pack: opts.pack } : {}),
       ...(opts.packRole ? { packRole: opts.packRole } : {}),
       ...(opts.collaboration ? { collaboration: opts.collaboration } : {}),

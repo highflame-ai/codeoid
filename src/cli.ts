@@ -440,12 +440,16 @@ program
     "Agent backend for this session (claude | codex | gemini-cli | pi | openai | gemini). Default: the daemon's default.",
   )
   .option(
+    "--model <id>",
+    "Model for this session (validated against --provider). Omitted with --pack/--pack-role, the model resolves through the role's binding chain (config override → role pin → tier map).",
+  )
+  .option(
     "--pack <id>",
-    "Activate an installed SDLC pack on the session (inject its constitution, expose its skills/subagents).",
+    "Activate an installed SDLC pack on the session (inject its constitution, expose its skills/subagents). With --collaborate, the collaboration ADOPTS the pack: role names bind strictly to the pack's declared roles.",
   )
   .option(
     "--pack-role <role>",
-    "Run the session under a capability role the pack declares (e.g. reviewer = read-only). Requires --pack.",
+    "Run the session under a capability role the pack declares (e.g. reviewer = read-only). Requires --pack; not valid with --collaborate.",
   )
   .option(
     "--collaborate <goal>",
@@ -466,6 +470,7 @@ program
         repo?: string;
         worktreeDir?: string;
         provider?: string;
+        model?: string;
         pack?: string;
         packRole?: string;
         collaborate?: string;
@@ -519,6 +524,7 @@ program
       await client.connect();
       await client.createSession(name, resolvedWorkdir, {
         providerId: opts.provider,
+        model: opts.model,
         pack: opts.pack,
         packRole: opts.packRole,
         collaboration,

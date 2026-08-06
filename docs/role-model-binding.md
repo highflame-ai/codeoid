@@ -1,6 +1,6 @@
 # Per-Role Model Binding — Design
 
-> Status: **slices 1–2 implemented; slice 3 (collab path) pending** · Builds on
+> Status: **slices 1–3 implemented** · Builds on
 > [`pack-loading.md`](./pack-loading.md) and
 > [`collaborative-session-design.md`](./collaborative-session-design.md).
 > Goal: let an operator decide **which model serves each role** — per machine,
@@ -202,7 +202,11 @@ codeoid new mytask --collaborate "add per-provider rate limits" \
   then the collaboration goal, then the roster — the pack states how to
   work, the goal states what on, the roster states with whom. The synthetic
   `compileGoalPack` id gives way to the real pack id in `SessionInfo.
-  profile`.
+  profile`. *(Implementation note: the full ETHOS → goal → roster
+  composition lands on the orchestrator's constitution; a role-child's
+  brief composes ETHOS → goal but deliberately omits the roster — a child
+  that can enumerate its peers is one prompt away from asking after their
+  work, and reviewer independence is the property the brief protects.)*
 - **The orchestrator rule is unchanged.** A collaboration still requires a
   bound role named `orchestrator`; a pack intended for collab must declare
   one (all three existing packs do). No new flag.
@@ -211,6 +215,27 @@ codeoid new mytask --collaborate "add per-provider rate limits" \
   model → `modelRoles["<packId>/<role>"]` → role-YAML `provider:`/`model:`
   pin → `modelTiers[role.tier]` → provider default. `*count` fan-out remains
   valid here (it is rejected only on the pipeline path).
+  *(Implementation clarifications, recorded at slice 3:)*
+  - **The roster's provider is authoritative.** The collab grammar makes the
+    backend mandatory (`name:provider[:model]`), and the collab design's
+    standing rule is that a role must never silently land on a backend the
+    operator didn't name — so the chain resolves the **model**, not the
+    provider. A winning rung whose binding targets a *different* provider
+    contributes nothing (a model id doesn't transfer across vendors): the
+    role falls to its named backend's default, with a create-time warning
+    naming the rung to fix. It does not continue down the chain — the
+    winning rung is the operator's intent, and resurrecting a lower rung
+    underneath it would make precedence unreadable.
+  - **`write` comes from the role YAML.** A spec that sets `write`
+    differently is a create-time error, not a silent override. A spec's
+    omitted `purpose` defaults to the role YAML's `summary`.
+  - **`packRole` is rejected with `collaboration`** — it names one
+    session-wide capability role; a collab binds one per child.
+  - **Resume:** the *resolved* config (models, write flags) is persisted and
+    comes back; the role YAML envelope/`network` posture and the pack ETHOS
+    are not re-resolved on resume — consistent with ambient `--pack`
+    activations, which are not persisted either. A restart degrades a
+    pack-adopted child to the free-form posture (same write fence).
 - **Skills/subagents** follow the existing pack-activation rules: the
   orchestrator session gets the pack's skills/subagents exactly as a
   `--pack` session does today; trust gating for skill linking is unchanged
@@ -225,6 +250,16 @@ For symmetry, session create gains `--model <id>` beside `--provider`
 an omitted `--model` resolves through the same chain (minus the phase-pin
 and CLI rungs). This closes the last surface where a role exists but a model
 cannot be chosen.
+
+*(Implementation clarifications, recorded at slice 3:)* an explicit `--model`
+is validated provider-aware at create (a Claude alias on a non-Claude backend
+is rejected; past that the live backend is the real validator) and wins the
+whole chain. When the chain resolves for an omitted `--model`, the winning
+rung supplies the whole binding — including its provider, which fails closed
+if unregistered and is skipped (with a warning) when it contradicts an
+explicit `--provider`. `--model` is rejected on a collaborative create (set
+it per role). Not extended to `session.fork` / `set_provider` this slice —
+those already have their own model-carry semantics.
 
 ## 7. Non-goals (this iteration)
 

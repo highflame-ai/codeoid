@@ -118,11 +118,19 @@ export const sessionCreateSchema = z.object({
    */
   collaboration: collaborationConfigSchema.optional(),
   /**
+   * Model for this session (docs/role-model-binding.md §6.2). Bounded string,
+   * validated provider-aware by the daemon — the frame must PARSE so the
+   * daemon can answer with a specific error, same rule as `providerId`.
+   */
+  model: z.string().min(1).max(LIMITS.MODEL_MAX).optional(),
+  /**
    * Activate an installed SDLC pack on this session (ambient mode —
    * docs/pack-loading.md): its constitution is injected into the system
    * prompt, its skills/subagents become available, and — if `packRole` is set
    * — the session runs under that capability role. Bounded string; the daemon
-   * fail-closes on an unknown pack.
+   * fail-closes on an unknown pack. Combined with `collaboration`, the
+   * collaboration ADOPTS the pack (docs/role-model-binding.md §6) — role
+   * names bind strictly to the pack's declared roles.
    */
   pack: z.string().max(64).optional(),
   /**

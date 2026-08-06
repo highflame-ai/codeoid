@@ -49,6 +49,7 @@ const samples: { [T in ClientTypes]: Extract<ClientMessage, { type: T }> } = {
     name: "demo",
     workdir: "/tmp/w",
     providerId: "pi",
+    model: "some-model",
   },
   "session.list": { type: "session.list", id: "r3" },
   "session.attach": { type: "session.attach", id: "r4", sessionId: "s1" },

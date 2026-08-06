@@ -156,6 +156,20 @@ const NewSessionModal: Component = () => {
       seen.add(key);
     }
     if (!seen.has("orchestrator")) return 'one role must be named "orchestrator"';
+    // Pack adoption (docs/role-model-binding.md §6.1): role names bind
+    // STRICTLY to the pack's declared roles — mirror the daemon's rule so the
+    // mistake surfaces before the round-trip. The daemon still re-validates.
+    if (packId()) {
+      const declared = new Set(packRoles().map((n) => n.toLowerCase()));
+      if (!declared.has("orchestrator")) {
+        return `pack "${packId()}" declares no orchestrator role — it can't be adopted by a collaboration`;
+      }
+      for (const r of named) {
+        if (!declared.has(r.name.trim().toLowerCase())) {
+          return `pack "${packId()}" declares no role "${r.name.trim()}"`;
+        }
+      }
+    }
     return null;
   });
 
@@ -173,6 +187,14 @@ const NewSessionModal: Component = () => {
   );
   // Roles the chosen pack declares (populate the role <select>).
   const packRoles = createMemo<string[]>(() => selectedPack()?.roles ?? []);
+
+  /** The pack's currently-effective binding for a collab role name (Slice 2's
+   *  `resolvedRoles`) — shown as the model input's placeholder so an empty
+   *  field reads as what the daemon will actually resolve to. */
+  const effectiveBinding = (name: string) =>
+    selectedPack()?.resolvedRoles?.find(
+      (rr) => rr.name.toLowerCase() === name.trim().toLowerCase(),
+    );
 
   // Pipeline runs need an ACTIVE (registered) pack — an inactive/broken pack
   // can't back a run; ambient session mode can pick any installed pack.
@@ -199,8 +221,27 @@ const NewSessionModal: Component = () => {
   });
 
   // Changing the pack invalidates any previously-picked role. `defer` so this
-  // doesn't clobber the initial empty state on first run.
-  createEffect(on(packId, () => setPackRole(""), { defer: true }));
+  // doesn't clobber the initial empty state on first run. In collaborate mode
+  // it also clears the non-orchestrator role NAMES — a name only means
+  // something relative to the pack that declares it. Signal updates only: the
+  // rows themselves are reused (the <Index> below keys by position), so no
+  // input is remounted and focus survives.
+  createEffect(
+    on(
+      packId,
+      () => {
+        setPackRole("");
+        if (mode() === "collaborate") {
+          setRoles((rs) =>
+            rs.map((r) =>
+              r.name.trim().toLowerCase() === "orchestrator" ? r : { ...r, name: "" },
+            ),
+          );
+        }
+      },
+      { defer: true },
+    ),
+  );
 
   // Pipeline mode requires a pack, so default the picker to the selected/first
   // active pack once the (async) pack list lands — otherwise the <select> shows
@@ -280,7 +321,12 @@ const NewSessionModal: Component = () => {
         setBusy(false);
         setError(null);
         if (mode() === "pipeline" || mode() === "collaborate") setGoal(goalPrefill());
-        if (mode() === "collaborate") setRoles(defaultRoles());
+        if (mode() === "collaborate") {
+          setRoles(defaultRoles());
+          // Fresh dialog = free-form default; a pack left over from a prior
+          // session-mode open would silently bind the default roster.
+          setPackId("");
+        }
         // Refresh the pack list every open. fetchPacks swallows its own
         // errors (it sets pack-state.error rather than rejecting), but guard
         // anyway so a rejected read can never break opening the modal.
@@ -353,6 +399,9 @@ const NewSessionModal: Component = () => {
           id: newRequestId(),
           name: n,
           workdir: workdir().trim() || ".",
+          // Pack ADOPTION (docs/role-model-binding.md §6): the pack — not the
+          // collab machinery — defines what each role is. Omitted = free-form.
+          ...(packId() ? { pack: packId() } : {}),
           collaboration: {
             goal: goal().trim(),
             roles: roles().map((r) => ({
@@ -362,7 +411,9 @@ const NewSessionModal: Component = () => {
               providerId: r.providerId || providers()[0] || "claude",
               ...(r.model.trim() ? { model: r.model.trim() } : {}),
               ...(r.count > 1 ? { count: r.count } : {}),
-              ...(r.write ? { write: true } : {}),
+              // Under a pack, write authority comes from the role YAML — the
+              // daemon rejects a spec that argues with it, so send nothing.
+              ...(r.write && !packId() ? { write: true } : {}),
             })),
           },
           // providerId is deliberately NOT sent: a collaborative session IS its
@@ -381,6 +432,7 @@ const NewSessionModal: Component = () => {
         setWorkdir("");
         setGoal("");
         setRoles(defaultRoles());
+        setPackId("");
       } catch (err) {
         // The daemon's message is the useful one here — it names the exact
         // rule broken (unknown provider, non-claude orchestrator, over the
@@ -597,15 +649,39 @@ const NewSessionModal: Component = () => {
                   return (
                     <div class="space-y-1.5 rounded border border-border bg-bg p-2">
                       <div class="flex gap-1.5">
-                        <input
-                          type="text"
-                          placeholder="role name"
-                          value={r().name}
-                          onInput={(e) => updateRole(i, { name: e.currentTarget.value })}
-                          class="min-w-0 flex-1 rounded border border-border bg-bg-elev px-2 py-1 font-mono text-[12px] text-fg outline-none focus:border-accent"
-                          disabled={busy() || isOrchestrator()}
-                          aria-label="Role name"
-                        />
+                        {/* Under an adopted pack, names bind STRICTLY to the
+                            pack's declared roles (§6.1) — a <select> makes the
+                            legal set visible instead of letting a free-typed
+                            name bounce off the daemon. Same row slot either
+                            way: the <Index> keeps rows stable, only this
+                            element swaps. */}
+                        <Show
+                          when={packId() && !isOrchestrator()}
+                          fallback={
+                            <input
+                              type="text"
+                              placeholder="role name"
+                              value={r().name}
+                              onInput={(e) => updateRole(i, { name: e.currentTarget.value })}
+                              class="min-w-0 flex-1 rounded border border-border bg-bg-elev px-2 py-1 font-mono text-[12px] text-fg outline-none focus:border-accent"
+                              disabled={busy() || isOrchestrator()}
+                              aria-label="Role name"
+                            />
+                          }
+                        >
+                          <select
+                            value={r().name}
+                            onChange={(e) => updateRole(i, { name: e.currentTarget.value })}
+                            class="min-w-0 flex-1 rounded border border-border bg-bg-elev px-2 py-1 font-mono text-[12px] text-fg outline-none focus:border-accent"
+                            disabled={busy()}
+                            aria-label="Role name"
+                          >
+                            <option value="">pick a role…</option>
+                            <For each={packRoles().filter((n) => n.toLowerCase() !== "orchestrator")}>
+                              {(n) => <option value={n}>{n}</option>}
+                            </For>
+                          </select>
+                        </Show>
                         <select
                           value={r().providerId}
                           onChange={(e) => updateRole(i, { providerId: e.currentTarget.value })}
@@ -637,7 +713,16 @@ const NewSessionModal: Component = () => {
                       <div class="flex flex-wrap items-center gap-2">
                         <input
                           type="text"
-                          placeholder="model (optional)"
+                          // Under a pack, an empty model resolves through the
+                          // binding chain — surface the currently-effective
+                          // model (Slice 2's resolvedRoles) as the placeholder
+                          // so "blank" reads as what it will actually mean.
+                          placeholder={(() => {
+                            const eff = packId() ? effectiveBinding(r().name) : undefined;
+                            return eff?.model
+                              ? `${eff.model} (${eff.resolvedFrom})`
+                              : "model (optional)";
+                          })()}
                           value={r().model}
                           onInput={(e) => updateRole(i, { model: e.currentTarget.value })}
                           class="min-w-0 flex-1 rounded border border-border bg-bg-elev px-2 py-1 font-mono text-[11px] text-fg outline-none focus:border-accent"
@@ -662,18 +747,23 @@ const NewSessionModal: Component = () => {
                               aria-label="Count"
                             />
                           </label>
-                          <label
-                            class="flex items-center gap-1 text-[11px] text-fg-muted"
-                            title="Off = this role's agents hold no write scope at all and cannot edit files"
-                          >
-                            <input
-                              type="checkbox"
-                              checked={r().write}
-                              onChange={(e) => updateRole(i, { write: e.currentTarget.checked })}
-                              disabled={busy()}
-                            />
-                            can write
-                          </label>
+                          {/* Under a pack, write authority is the role
+                              YAML's call (§6.1) — offering the checkbox
+                              would only manufacture daemon rejections. */}
+                          <Show when={!packId()}>
+                            <label
+                              class="flex items-center gap-1 text-[11px] text-fg-muted"
+                              title="Off = this role's agents hold no write scope at all and cannot edit files"
+                            >
+                              <input
+                                type="checkbox"
+                                checked={r().write}
+                                onChange={(e) => updateRole(i, { write: e.currentTarget.checked })}
+                                disabled={busy()}
+                              />
+                              can write
+                            </label>
+                          </Show>
                         </Show>
                       </div>
                     </div>
@@ -689,9 +779,9 @@ const NewSessionModal: Component = () => {
                 + add role
               </button>
               <p class="text-[10px] text-fg-faint">
-                Roles are free-form. Known names (search, architecture, reasoning, review) come with
-                a default blackboard scope; anything else starts with none. Read-only is the
-                default — the daemon gives a non-writing role an identity that holds no write scope.
+                {packId()
+                  ? "Pack adopted: role names bind strictly to the pack's declared roles, and each role's write/network envelope comes from its role YAML. Backend, model and fan-out stay yours."
+                  : "Roles are free-form. Known names (search, architecture, reasoning, review) come with a default blackboard scope; anything else starts with none. Read-only is the default — the daemon gives a non-writing role an identity that holds no write scope."}
               </p>
             </div>
           </Show>
@@ -750,8 +840,10 @@ const NewSessionModal: Component = () => {
                 disabled={busy()}
                 aria-label="Pack"
               >
-                <Show when={mode() === "session"}>
-                  <option value="">None (freestyle)</option>
+                <Show when={mode() !== "pipeline"}>
+                  <option value="">
+                    {mode() === "collaborate" ? "None (free-form roles)" : "None (freestyle)"}
+                  </option>
                 </Show>
                 <For each={packOptions()}>
                   {(p) => <option value={p.id}>{p.name}</option>}
