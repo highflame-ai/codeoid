@@ -683,9 +683,10 @@ pipeline
   )
   .action((opts: { pack: string; goal: string; workdir?: string; role: string[] }) => {
     // Same grammar as collab `--role` (one grammar everywhere —
-    // docs/role-model-binding.md §2.3); the *count rejection and the semantic
-    // checks (role exists, provider registered) re-run daemon-side so the CLI
-    // and the wire path fail identically.
+    // docs/role-model-binding.md §2.3). The *count rejection is CLI-only — the
+    // wire `roleBindings` shape has no count field, so a raw wire client can't
+    // express one. The semantic checks (role exists, provider registered)
+    // re-run daemon-side so the CLI and the wire path fail identically.
     let roleBindings: Record<string, ModelBinding> | undefined;
     if (opts.role.length > 0) {
       try {

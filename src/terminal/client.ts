@@ -314,6 +314,9 @@ export class TerminalClient {
       const profile = data.profile ? ` [pack: ${data.profile}]` : "";
       const provider = data.providerId ? ` [${data.providerId}]` : "";
       console.log(`Session created: ${data.name} (${data.id})${provider}${profile}`);
+      // Non-fatal binding notes (skipped cross-vendor bindings, unmapped
+      // tiers) — the daemon adjusted something the operator should know about.
+      for (const w of resp.warnings ?? []) console.log(`  ⚠ ${w}`);
       if (data.collaboration) {
         // Echo the RESOLVED bindings, not the requested ones: the daemon
         // normalizes (count defaults, model resolved against its own
@@ -547,6 +550,9 @@ export class TerminalClient {
       return;
     }
     const p = resp.pipeline;
+    // Create-time binding notes (a --role/config binding skipped because it
+    // targets a backend other than the run session's, an unmapped tier).
+    for (const w of resp.warnings ?? []) console.log(`  ⚠ ${w}`);
     // Kick the run off — advance drives all phases server-side (minutes), so
     // fire it and let the user poll status rather than block the CLI.
     this.#fire({ type: "pipeline.advance", id: randomUUID(), pipelineId: p.id });

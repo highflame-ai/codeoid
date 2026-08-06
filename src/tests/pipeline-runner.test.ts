@@ -14,6 +14,7 @@ import { join } from "node:path";
 import type { CodeoidConfig } from "../config.js";
 import type { ProviderEvent } from "../daemon/providers/interface.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
+import { ProviderRegistry } from "../daemon/providers/registry.js";
 import { PHASE_COMPLETE_MARKER, PHASE_NEEDS_INPUT_MARKER } from "../daemon/pipeline/phase-completion.js";
 import { CAPABILITIES } from "../protocol/types.js";
 import { SessionManager } from "../daemon/session-manager.js";
@@ -382,5 +383,110 @@ describe("pipeline runtime (real SessionManager + mock backend)", () => {
       config: mkConfig(join(tmp, "codeoid2.db"), false),
     });
     expect(m2.pipelines).toBeUndefined();
+  });
+
+  // ── Per-phase model binding actually applies (docs/role-model-binding.md §3) ──
+  // The adversarial review's headline finding was that bindings were resolved,
+  // persisted, and DISPLAYED but never used — the phase turn ran on the
+  // session's own model regardless. These pin the mechanism end to end: the
+  // model handed to the backend for the phase turn IS the bound one, and the
+  // session's model is restored once the phase rests.
+
+  /** A registry whose "claude"/"gemini" backends are phase-completing mocks,
+   *  with every created provider captured for turn-opts inspection. */
+  function makeBindingRegistry(created: MockSessionProvider[]): ProviderRegistry {
+    const registry = new ProviderRegistry("claude");
+    for (const id of ["claude", "gemini"] as const) {
+      registry.register({
+        id,
+        displayName: id,
+        create: () => {
+          const p = new MockSessionProvider(id, [sayTurn(`done\n${PHASE_COMPLETE_MARKER}`)]);
+          created.push(p);
+          return p;
+        },
+      });
+    }
+    return registry;
+  }
+
+  test("the phase turn runs with the BOUND model, and the session's model is restored after", async () => {
+    const created: MockSessionProvider[] = [];
+    const store2 = new Store(join(tmp, "codeoid-bind.db"));
+    const m2 = new SessionManager(store2, transcript, undefined, undefined, undefined, {
+      config: mkConfig(join(tmp, "codeoid-bind.db"), true),
+      providers: makeBindingRegistry(created),
+    });
+    const pm = m2.pipelines;
+    expect(pm).toBeDefined();
+    if (!pm) return;
+    pm.registries.skills.register({ id: "impl", kind: "slash", command: "/impl" });
+    const createdResp = await m2.handle(
+      {
+        type: "pipeline.create",
+        id: "1",
+        name: "R",
+        workdir: join(tmp, "repo"),
+        phases: [{ id: "impl", kind: "skill", skill: "impl", role: "worker" }],
+        roleBindings: { worker: { provider: "claude", model: "claude-fable-5" } },
+      },
+      AUTH,
+      CLIENT,
+    );
+    if (createdResp.type !== "pipeline.snapshot") throw new Error(`create failed: ${JSON.stringify(createdResp)}`);
+    // The binding matches the run session's backend → persisted as effective.
+    expect(createdResp.pipeline.phases[0]).toMatchObject({
+      provider: "claude",
+      model: "claude-fable-5",
+      resolvedFrom: "cli",
+    });
+    const out = await m2.handle({ type: "pipeline.advance", id: "2", pipelineId: createdResp.pipeline.id }, AUTH, CLIENT);
+    if (out.type !== "pipeline.snapshot") throw new Error(`advance failed: ${JSON.stringify(out)}`);
+    expect(out.pipeline.status).toBe("halted");
+    // THE test: the model handed to the backend for the phase turn is the
+    // bound one — not the session default (which would be undefined here).
+    const runProvider = created.find((p) => p.capturedOpts.length > 0);
+    expect(runProvider).toBeDefined();
+    expect(runProvider!.capturedOpts[0]!.model).toBe("claude-fable-5");
+    // …and once the phase rested, the session is back on its own model.
+    const session = m2._sessionForTest(createdResp.pipeline.sessionId!);
+    expect(session?.model).toBeNull();
+    await m2.drain(3_000);
+  });
+
+  test("a cross-provider binding is skipped at create with a warning on the snapshot", async () => {
+    const created: MockSessionProvider[] = [];
+    const store2 = new Store(join(tmp, "codeoid-xprov.db"));
+    const m2 = new SessionManager(store2, transcript, undefined, undefined, undefined, {
+      config: mkConfig(join(tmp, "codeoid-xprov.db"), true),
+      providers: makeBindingRegistry(created),
+    });
+    const pm = m2.pipelines;
+    expect(pm).toBeDefined();
+    if (!pm) return;
+    pm.registries.skills.register({ id: "impl", kind: "slash", command: "/impl" });
+    // gemini IS registered (it passes the provider check) but the run session
+    // is claude-bound — the binding cannot apply, so it must be skipped, not
+    // persisted, and the create reply must say so.
+    const createdResp = await m2.handle(
+      {
+        type: "pipeline.create",
+        id: "1",
+        name: "R",
+        workdir: join(tmp, "repo"),
+        phases: [{ id: "impl", kind: "skill", skill: "impl", role: "worker" }],
+        roleBindings: { worker: { provider: "gemini", model: "gemini-2.5-pro" } },
+      },
+      AUTH,
+      CLIENT,
+    );
+    if (createdResp.type !== "pipeline.snapshot") throw new Error(`create failed: ${JSON.stringify(createdResp)}`);
+    const ph = createdResp.pipeline.phases[0]!;
+    expect(ph.provider).toBeUndefined();
+    expect(ph.model).toBeUndefined();
+    expect(ph.resolvedFrom).toBeUndefined();
+    expect(createdResp.warnings?.join("\n")).toMatch(/targets provider "gemini"/);
+    expect(createdResp.warnings?.join("\n")).toMatch(/"claude"/);
+    await m2.drain(3_000);
   });
 });

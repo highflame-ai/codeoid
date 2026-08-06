@@ -119,6 +119,11 @@ const NewSessionModal: Component = () => {
   const [goal, setGoal] = createSignal("");
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
+  // Non-fatal create-time notes from the daemon (a model binding skipped
+  // because it targeted another backend, an unmapped tier). The session WAS
+  // created — the modal stays open long enough to show them, then closes on
+  // an explicit dismiss instead of vanishing with the information.
+  const [warnings, setWarnings] = createSignal<string[]>([]);
   const [pickerOpen, setPickerOpen] = createSignal(false);
   // "" = daemon default (first advertised provider).
   const [providerId, setProviderId] = createSignal("");
@@ -222,16 +227,22 @@ const NewSessionModal: Component = () => {
 
   // Changing the pack invalidates any previously-picked role. `defer` so this
   // doesn't clobber the initial empty state on first run. In collaborate mode
-  // it also clears the non-orchestrator role NAMES — a name only means
-  // something relative to the pack that declares it. Signal updates only: the
-  // rows themselves are reused (the <Index> below keys by position), so no
-  // input is remounted and focus survives.
+  // selecting a pack also clears the non-orchestrator role NAMES — a name only
+  // means something relative to the pack that declares it. Gated on the
+  // →pack direction (a truthy new id): the pack→"" transition keeps names
+  // (free-form accepts any name), and — the bug this gate fixes — the open
+  // handler's reset (setRoles(defaultRoles()) + setPackId("")) must not have
+  // a leftover pipeline-mode packId's ""-transition wipe the freshly-seeded
+  // default names (repro: open pipeline modal, Esc, open collaborate modal →
+  // blank role names, Create disabled). Signal updates only: the rows
+  // themselves are reused (the <Index> below keys by position), so no input
+  // is remounted and focus survives.
   createEffect(
     on(
       packId,
-      () => {
+      (id) => {
         setPackRole("");
-        if (mode() === "collaborate") {
+        if (id && mode() === "collaborate") {
           setRoles((rs) =>
             rs.map((r) =>
               r.name.trim().toLowerCase() === "orchestrator" ? r : { ...r, name: "" },
@@ -320,6 +331,7 @@ const NewSessionModal: Component = () => {
       if (v) {
         setBusy(false);
         setError(null);
+        setWarnings([]);
         if (mode() === "pipeline" || mode() === "collaborate") setGoal(goalPrefill());
         if (mode() === "collaborate") {
           setRoles(defaultRoles());
@@ -335,6 +347,39 @@ const NewSessionModal: Component = () => {
       }
     }),
   );
+
+  /** `request()` resolves the raw `response.ok` `{data, warnings?}` — unwrap
+   *  it while tolerating older daemons (and test mocks) that hand back the
+   *  created SessionInfo directly. */
+  function unwrapCreate(resp: unknown): { info: SessionInfo | undefined; warnings: string[] } {
+    if (resp && typeof resp === "object" && ("data" in resp || "warnings" in resp)) {
+      const r = resp as { data?: unknown; warnings?: unknown };
+      return {
+        info:
+          r.data && typeof r.data === "object" && "id" in r.data
+            ? (r.data as SessionInfo)
+            : undefined,
+        warnings: Array.isArray(r.warnings) ? (r.warnings as string[]) : [],
+      };
+    }
+    const info =
+      resp && typeof resp === "object" && "id" in resp ? (resp as SessionInfo) : undefined;
+    return { info, warnings: [] };
+  }
+
+  /** Close + reset every field (shared by the success paths and the
+   *  warnings-acknowledged dismiss). */
+  function closeAndReset(): void {
+    setOpenSignal(false);
+    setName("");
+    setWorkdir("");
+    setGoal("");
+    setProviderId("");
+    setPackId("");
+    setPackRole("");
+    setRoles(defaultRoles());
+    setWarnings([]);
+  }
 
   async function submit(ev: Event): Promise<void> {
     ev.preventDefault();
@@ -366,13 +411,9 @@ const NewSessionModal: Component = () => {
           ...(providerId() ? { provider: providerId() } : {}),
         });
         setBusy(false);
-        setOpenSignal(false);
-        setName("");
-        setWorkdir("");
-        setGoal("");
-        setProviderId("");
-        setPackId("");
-        setPackRole("");
+        // Create-time binding warnings for a pipeline surface in the
+        // PipelineRunner cockpit (state/pipelines carries them) — close here.
+        closeAndReset();
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
         setBusy(false);
@@ -419,20 +460,22 @@ const NewSessionModal: Component = () => {
           // providerId is deliberately NOT sent: a collaborative session IS its
           // orchestrator, so the daemon derives the backend from that role and
           // rejects a conflicting explicit value.
-        })) as SessionInfo | undefined;
-        if (data && typeof data === "object" && "id" in data) {
-          mergeSession(data);
-          focusSession(data.id);
+        }));
+        const { info, warnings: warns } = unwrapCreate(data);
+        if (info) {
+          mergeSession(info);
+          focusSession(info.id);
         } else {
           await refreshSessions().catch(() => []);
         }
         setBusy(false);
-        setOpenSignal(false);
-        setName("");
-        setWorkdir("");
-        setGoal("");
-        setRoles(defaultRoles());
-        setPackId("");
+        if (warns.length > 0) {
+          // Created, but the daemon adjusted something (a skipped model
+          // binding, an unmapped tier) — show it before closing.
+          setWarnings(warns);
+        } else {
+          closeAndReset();
+        }
       } catch (err) {
         // The daemon's message is the useful one here — it names the exact
         // rule broken (unknown provider, non-claude orchestrator, over the
@@ -456,7 +499,7 @@ const NewSessionModal: Component = () => {
       // with the created SessionInfo, so a rejection (bad scope/workdir) surfaces
       // as an error instead of silently "succeeding", and we focus the exact new
       // id rather than name-matching (which picked the wrong one on duplicates).
-      const data = (await request({
+      const data = await request({
         type: "session.create",
         id: newRequestId(),
         name: n,
@@ -464,10 +507,11 @@ const NewSessionModal: Component = () => {
         ...(providerId() ? { providerId: providerId() } : {}),
         ...(packId() ? { pack: packId() } : {}),
         ...(packRole() ? { packRole: packRole() } : {}),
-      })) as SessionInfo | undefined;
-      if (data && typeof data === "object" && "id" in data) {
-        mergeSession(data);
-        focusSession(data.id);
+      });
+      const { info, warnings: warns } = unwrapCreate(data);
+      if (info) {
+        mergeSession(info);
+        focusSession(info.id);
       } else {
         // Older daemon without a data payload — fall back to a list refresh.
         const list = await refreshSessions().catch(() => []);
@@ -475,12 +519,13 @@ const NewSessionModal: Component = () => {
         if (created) focusSession(created.id);
       }
       setBusy(false);
-      setOpenSignal(false);
-      setName("");
-      setWorkdir("");
-      setProviderId("");
-      setPackId("");
-      setPackRole("");
+      if (warns.length > 0) {
+        // Created, but with a binding note (e.g. a pack-role model skipped for
+        // this backend, an unmapped tier) — show it before closing.
+        setWarnings(warns);
+      } else {
+        closeAndReset();
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setBusy(false);
@@ -717,11 +762,19 @@ const NewSessionModal: Component = () => {
                           // binding chain — surface the currently-effective
                           // model (Slice 2's resolvedRoles) as the placeholder
                           // so "blank" reads as what it will actually mean.
+                          // Only when the binding fits the row's chosen backend:
+                          // the daemon SKIPS a binding whose provider differs
+                          // from the roster's (models don't transfer across
+                          // vendors), so advertising it here would promise a
+                          // model that won't apply.
                           placeholder={(() => {
                             const eff = packId() ? effectiveBinding(r().name) : undefined;
-                            return eff?.model
-                              ? `${eff.model} (${eff.resolvedFrom})`
-                              : "model (optional)";
+                            if (!eff?.model) return "model (optional)";
+                            const rowProvider = r().providerId || providers()[0] || "claude";
+                            if (eff.provider !== undefined && eff.provider !== rowProvider) {
+                              return "model (optional)";
+                            }
+                            return `${eff.model} (${eff.resolvedFrom})`;
                           })()}
                           value={r().model}
                           onInput={(e) => updateRole(i, { model: e.currentTarget.value })}
@@ -882,44 +935,69 @@ const NewSessionModal: Component = () => {
             </div>
           </Show>
 
-          <Show when={mode() === "collaborate" && !error() && collabProblem()}>
+          {/* Non-fatal create-time notes from the daemon — the session WAS
+              created; these say what was quietly adjusted (a skipped model
+              binding, an unmapped tier) and which layer to fix. */}
+          <Show when={warnings().length > 0}>
+            <div class="space-y-1 rounded border border-warn/40 bg-warn/10 px-3 py-2 text-[12px] leading-relaxed text-warn">
+              <div class="font-semibold">Created, with warnings:</div>
+              <For each={warnings()}>{(w) => <div>⚠ {w}</div>}</For>
+            </div>
+          </Show>
+
+          <Show when={mode() === "collaborate" && !error() && warnings().length === 0 && collabProblem()}>
             {/* A disabled Create with no explanation is the worst version of
                 this form — say which rule is unmet. */}
             <p class="text-[11px] text-fg-faint">{collabProblem()}</p>
           </Show>
 
-          <div class="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => setOpenSignal(false)}
-              class="rounded border border-border px-3 py-1.5 text-sm text-fg-muted hover:bg-bg-hover"
-              disabled={busy()}
-            >
-              cancel
-            </button>
-            <button
-              type="submit"
-              class="ml-auto rounded bg-accent px-3 py-1.5 text-sm font-semibold text-bg transition hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
-              disabled={
-                busy() ||
-                (mode() === "pipeline"
-                  ? !packId() || !goal().trim()
-                  : mode() === "collaborate"
-                    ? !name().trim() || collabProblem() !== null
-                    : !name().trim())
-              }
-            >
-              {busy()
-                ? mode() === "pipeline"
-                  ? "starting…"
-                  : "creating…"
-                : mode() === "pipeline"
-                  ? "start run"
-                  : mode() === "collaborate"
-                    ? "create collaboration"
-                    : "create"}
-            </button>
-          </div>
+          <Show
+            when={warnings().length === 0}
+            fallback={
+              <div class="flex items-center">
+                <button
+                  type="button"
+                  onClick={closeAndReset}
+                  class="ml-auto rounded bg-accent px-3 py-1.5 text-sm font-semibold text-bg transition hover:bg-accent-hover"
+                >
+                  ok
+                </button>
+              </div>
+            }
+          >
+            <div class="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setOpenSignal(false)}
+                class="rounded border border-border px-3 py-1.5 text-sm text-fg-muted hover:bg-bg-hover"
+                disabled={busy()}
+              >
+                cancel
+              </button>
+              <button
+                type="submit"
+                class="ml-auto rounded bg-accent px-3 py-1.5 text-sm font-semibold text-bg transition hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={
+                  busy() ||
+                  (mode() === "pipeline"
+                    ? !packId() || !goal().trim()
+                    : mode() === "collaborate"
+                      ? !name().trim() || collabProblem() !== null
+                      : !name().trim())
+                }
+              >
+                {busy()
+                  ? mode() === "pipeline"
+                    ? "starting…"
+                    : "creating…"
+                  : mode() === "pipeline"
+                    ? "start run"
+                    : mode() === "collaborate"
+                      ? "create collaboration"
+                      : "create"}
+              </button>
+            </div>
+          </Show>
         </form>
         <DirectoryPicker
           open={pickerOpen()}

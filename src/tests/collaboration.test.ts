@@ -920,6 +920,62 @@ describe("adoptPackRoles (unit)", () => {
     expect(r.config.roles[1]!.purpose).toBe("Refute, don't summarize.");
     expect(r.config.roles[2]!.purpose).toBe("custom purpose");
   });
+
+  // A model-only pin must not defeat the cross-vendor guard: a rung that names
+  // no provider still carries a vendor-shaped id, so it applies only when it
+  // validates for the roster's backend — otherwise it is SKIPPED with a
+  // warning, never handed to validateCollaboration to hard-fail a create over
+  // a model the operator never typed.
+  test("a model-only pin is validated for the roster's backend — skipped when vendor-shaped elsewhere", () => {
+    const roles: Record<string, RoleDef> = {
+      orchestrator: { name: "orchestrator", write: false, network: false, envelope: "all" },
+      scribe: {
+        name: "scribe",
+        // Model WITHOUT provider — the shape the original guard missed.
+        model: "claude-fable-5",
+        write: true,
+        network: false,
+        envelope: "all",
+      },
+    };
+    // On a claude roster the model-only pin applies.
+    const onClaude = adoptPackRoles(
+      {
+        goal: "g",
+        roles: [
+          { name: "orchestrator", providerId: "claude" },
+          { name: "scribe", providerId: "claude" },
+        ],
+      },
+      { packId: "pk", roles },
+    );
+    expect(onClaude.ok).toBe(true);
+    if (onClaude.ok) expect(onClaude.config.roles[1]!.model).toBe("claude-fable-5");
+
+    // On a gemini roster the claude-shaped id must NOT transfer: skipped with
+    // a warning naming the rung…
+    const warnings: string[] = [];
+    const onGemini = adoptPackRoles(
+      {
+        goal: "g",
+        roles: [
+          { name: "orchestrator", providerId: "claude" },
+          { name: "scribe", providerId: "gemini" },
+        ],
+      },
+      { packId: "pk", roles, warn: (m) => warnings.push(m) },
+    );
+    expect(onGemini.ok).toBe(true);
+    if (!onGemini.ok) return;
+    expect(onGemini.config.roles[1]!.model).toBeUndefined();
+    expect(warnings.join("\n")).toMatch(/role-pin/);
+    expect(warnings.join("\n")).toMatch(/not valid for backend "gemini"/);
+    // …so the adopted config sails through validateCollaboration instead of
+    // hard-failing on a model the operator never typed.
+    const checked = validateCollaboration(onGemini.config, LOOKUP);
+    expect(checked.ok).toBe(true);
+    if (checked.ok) expect(checked.config.roles[1]!.model).toBeUndefined();
+  });
 });
 
 describe("pack-adopted posture + constitution (unit)", () => {
@@ -1787,6 +1843,31 @@ describe("collaboration survives a daemon restart", () => {
     expect(byRole.get("review#1")!.collaborationRole!.write).toBe(false);
     expect(byRole.get("review#2")!.collaborationRole!.write).toBe(false);
     expect(byRole.get("reasoning#1")!.collaborationRole!.write).toBe(true);
+  });
+
+  test("a child bound to a model resumes WITH it, not on the provider default", async () => {
+    // #resumeRoleChild built its options without defaultModel, so a child
+    // bound via the roster (or the tier map) came back on the provider default
+    // while SessionInfo still displayed the resolved model. Same source as the
+    // spawn path (`plannedChildFor`) — the two cannot drift.
+    manager.setBlackboardUrl(BLACKBOARD_URL);
+    const cfg: CollaborationConfig = {
+      goal: "resume with the bound model",
+      roles: [
+        { name: "orchestrator", providerId: "claude" },
+        { name: "review", providerId: "gemini", model: "gemini-2.5-pro" },
+      ],
+    };
+    const resp = await run({ type: "session.create", id: "rsm", name: "rsm", workdir, collaboration: cfg });
+    if (resp.type !== "response.ok") throw new Error(`create failed: ${JSON.stringify(resp)}`);
+    const parent = resp.data as SessionInfo;
+    const before = childrenOf(await allSessions(), parent.id);
+    expect(before).toHaveLength(1);
+    expect(before[0]!.model).toBe("gemini-2.5-pro");
+
+    const kids = childrenOf(await listFrom(await restart()), parent.id);
+    expect(kids).toHaveLength(1);
+    expect(kids[0]!.model).toBe("gemini-2.5-pro");
   });
 
   test("the capability role comes back, so roleDeniesTool has something to deny with", async () => {

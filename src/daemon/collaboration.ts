@@ -247,7 +247,11 @@ export interface PackAdoption {
  * must never silently land on a backend the operator didn't name. So a
  * winning rung whose binding targets a different provider contributes
  * nothing (a model id doesn't transfer across vendors); the role falls to
- * its backend's default, with a warning naming the rung to fix.
+ * its backend's default, with a warning naming the rung to fix. A model-only
+ * rung (no provider) is held to the same guard: it applies only if the model
+ * validates for the roster's backend (`resolveModelIdForProvider`), else it
+ * is skipped with a warning — only the spec's own typed model (the cli rung)
+ * may hard-fail `validateCollaboration`.
  */
 export function adoptPackRoles(
   config: CollaborationConfig,
@@ -294,6 +298,21 @@ export function adoptPackRoles(
     } else if (resolved.provider !== undefined && resolved.provider !== raw.providerId) {
       adoption.warn?.(
         `role "${name}": the ${resolved.resolvedFrom} binding targets provider "${resolved.provider}" but this role is bound to "${raw.providerId}" — models don't transfer across backends; using the backend default`,
+      );
+    } else if (
+      resolved.resolvedFrom !== "cli" &&
+      resolved.model !== undefined &&
+      resolveModelIdForProvider(resolved.model, raw.providerId) === null
+    ) {
+      // A model-only rung must not defeat the cross-vendor guard: a binding
+      // that names no provider still carries a vendor-shaped id, and it only
+      // applies if it validates for the roster's backend. SKIP with a warning —
+      // never let validateCollaboration hard-fail the create over a model the
+      // operator never typed, and never silently transfer it. (The "cli" rung
+      // IS the operator's typed model, so it passes through and hard-fails
+      // downstream with the validator's own message.)
+      adoption.warn?.(
+        `role "${name}": the ${resolved.resolvedFrom} binding's model "${resolved.model}" is not valid for backend "${raw.providerId}" — using the backend default`,
       );
     } else {
       model = resolved.model;

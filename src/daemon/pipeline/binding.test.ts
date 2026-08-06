@@ -147,4 +147,16 @@ describe("roleBindingsFromSpecs", () => {
       ]),
     ).toThrow('--role "adversary" bound more than once');
   });
+
+  test("duplicate detection is case-insensitive (one rule with the collab validator)", () => {
+    // "Review" and "review" bound to different backends would make every
+    // downstream case-insensitive lookup ambiguous — same rule as
+    // validateCollaboration's uniqueness check.
+    expect(() =>
+      roleBindingsFromSpecs([
+        { name: "review", providerId: "claude" },
+        { name: "Review", providerId: "gemini" },
+      ]),
+    ).toThrow('--role "Review" bound more than once');
+  });
 });

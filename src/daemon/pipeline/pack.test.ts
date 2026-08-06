@@ -717,4 +717,96 @@ describe("model binding at create (manager)", () => {
     expect(p.phases[0].def.provider).toBeUndefined();
     expect(p.phases[0].def.resolvedFrom).toBeUndefined();
   });
+
+  // ── The run session's provider is authoritative (§3) ──────────────────────
+  // A run drives ONE bound session on one backend; a binding naming a
+  // different provider is skipped at create with a warning naming the rung —
+  // same rule as collab adoption — and is NEVER persisted as effective.
+
+  test("a binding naming a provider other than the run session's is skipped with a warning", () => {
+    const mgr = new PipelineManager(new PipelineStore(new Database(":memory:")));
+    mgr.installPack(loadPack(bindingPack()));
+    const warnings: string[] = [];
+    const p = mgr.create({
+      name: "run",
+      pack: "bind-pack",
+      ...tenant,
+      modelConfig: { modelTiers: TIERS },
+      sessionProvider: "codex",
+      warn: (m) => warnings.push(m),
+    });
+    // attack: config-tier resolves to claude ≠ codex → skipped, nothing persisted.
+    expect(p.phases[0].def.provider).toBeUndefined();
+    expect(p.phases[0].def.model).toBeUndefined();
+    expect(p.phases[0].def.resolvedFrom).toBeUndefined();
+    // pinned-phase: the codex phase pin MATCHES the session provider → applies.
+    expect(p.phases[2].def).toMatchObject({
+      provider: "codex",
+      model: "codex-max",
+      resolvedFrom: "phase-pin",
+    });
+    // The warning names the rung to fix, and only the skipped binding warned.
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/config-tier/);
+    expect(warnings[0]).toMatch(/"claude"/);
+    expect(warnings[0]).toMatch(/"codex"/);
+  });
+
+  test("a skipped binding strips the phase's own pin fields — never rendered as effective", () => {
+    const mgr = new PipelineManager(new PipelineStore(new Database(":memory:")));
+    mgr.installPack(loadPack(bindingPack()));
+    const warnings: string[] = [];
+    const p = mgr.create({
+      name: "run",
+      pack: "bind-pack",
+      ...tenant,
+      sessionProvider: "claude",
+      warn: (m) => warnings.push(m),
+    });
+    // pinned-phase's own codex pin ≠ claude session → the def must come out
+    // CLEAN (persisting the pin would display a binding that won't apply).
+    expect(p.phases[2].def.provider).toBeUndefined();
+    expect(p.phases[2].def.model).toBeUndefined();
+    expect(p.phases[2].def.resolvedFrom).toBeUndefined();
+    expect(warnings.join("\n")).toMatch(/phase-pin/);
+  });
+
+  test("a model-only pin is validated for the session's backend — skipped when vendor-shaped elsewhere", () => {
+    const mgr = new PipelineManager(new PipelineStore(new Database(":memory:")));
+    const phases: PhaseDef[] = [{ id: "a", kind: "noop", model: "opus" }];
+    // "opus" is a Claude alias: on a codex-bound run session it must NOT ride
+    // through — skip with a warning, never a hard failure (§5: the operator
+    // never typed this model at create).
+    const warnings: string[] = [];
+    const skipped = mgr.create({
+      name: "run",
+      phases,
+      ...tenant,
+      sessionProvider: "codex",
+      warn: (m) => warnings.push(m),
+    });
+    expect(skipped.phases[0].def.model).toBeUndefined();
+    expect(skipped.phases[0].def.resolvedFrom).toBeUndefined();
+    expect(warnings.join("\n")).toMatch(/not valid for provider "codex"/);
+    // On a claude session the same pin applies (validation passes; the typed
+    // string is persisted, not its alias expansion).
+    const applied = mgr.create({ name: "run2", phases, ...tenant, sessionProvider: "claude" });
+    expect(applied.phases[0].def).toMatchObject({ model: "opus", resolvedFrom: "phase-pin" });
+  });
+
+  test("role bindings match role names case-insensitively (one rule with the collab path)", () => {
+    const mgr = new PipelineManager(new PipelineStore(new Database(":memory:")));
+    mgr.installPack(loadPack(bindingPack()));
+    const p = mgr.create({
+      name: "run",
+      pack: "bind-pack",
+      ...tenant,
+      roleBindings: { Adversary: { provider: "claude", model: "claude-x" } },
+    });
+    expect(p.phases[0].def).toMatchObject({
+      provider: "claude",
+      model: "claude-x",
+      resolvedFrom: "cli",
+    });
+  });
 });

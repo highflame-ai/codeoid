@@ -249,6 +249,25 @@ describe("pipeline.create — pack / role / optional phases", () => {
     });
     expect(r.ok).toBe(false);
   });
+
+  test("REJECTS an empty-string phase provider/model (a phantom phase-pin)", () => {
+    // An empty string would persist as a "phase-pin" that wins the binding
+    // chain while meaning nothing — same min(1) bound roleBindings enforce.
+    const emptyProvider = parseClientMessage({
+      type: "pipeline.create",
+      id: "x",
+      name: "R",
+      phases: [{ id: "a", kind: "noop", provider: "" }],
+    });
+    expect(emptyProvider.ok).toBe(false);
+    const emptyModel = parseClientMessage({
+      type: "pipeline.create",
+      id: "x",
+      name: "R",
+      phases: [{ id: "a", kind: "noop", model: "" }],
+    });
+    expect(emptyModel.ok).toBe(false);
+  });
 });
 
 describe("session.fork — isolation fields survive validation (must not be stripped)", () => {

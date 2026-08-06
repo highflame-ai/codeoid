@@ -461,8 +461,10 @@ const phaseDefSchema = z.object({
   skill: z.string().max(64).optional(),
   gate: z.string().max(64).optional(),
   entryGate: z.string().max(64).optional(),
-  provider: z.string().max(64).optional(),
-  model: z.string().max(LIMITS.MODEL_MAX).optional(),
+  // min(1): an empty string would persist as a phantom "phase-pin" that wins
+  // the model-binding chain while meaning nothing (same bounds as roleBindings).
+  provider: z.string().min(1).max(64).optional(),
+  model: z.string().min(1).max(LIMITS.MODEL_MAX).optional(),
   role: z.string().max(64).optional(),
   reads: z.array(z.string().max(256)).max(128).optional(),
   writes: z.string().max(256).optional(),

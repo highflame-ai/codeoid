@@ -1,6 +1,8 @@
 # Per-Role Model Binding — Design
 
-> Status: **slices 1–3 implemented** · Builds on
+> Status: **slices 1–3 implemented** — resolution chain, pipeline `--role` +
+> per-phase model application at run time, `pack show --resolve`, pack-adopted
+> collaborations, `--model` on single sessions. Builds on
 > [`pack-loading.md`](./pack-loading.md) and
 > [`collaborative-session-design.md`](./collaborative-session-design.md).
 > Goal: let an operator decide **which model serves each role** — per machine,
@@ -138,6 +140,23 @@ display and debugging.) The chain is one pure function —
 `resolveBinding()` in `src/daemon/pipeline/binding.ts` — shared by
 `manager.create`, `pack show --resolve`, and (slice 3) the collab path.
 
+**The run session's provider is authoritative.** A pipeline run drives ONE
+bound session on one backend, so a resolved binding cannot swap providers
+mid-run. Same rule as collab adoption (§6.1): at create, a winning rung whose
+binding names a provider *different* from the run session's is **skipped** —
+a create-time warning names the rung, and the binding is NOT persisted as
+effective (status never renders a binding that won't apply). It does not fall
+through to a lower rung. Same-provider (or provider-absent) bindings apply
+their **model**, validated provider-aware like an explicit `--model` (§5).
+
+**How the model is applied.** At each phase turn the run host sets the bound
+session's model to the phase's persisted binding before injecting the prompt,
+and restores the previous model after the phase — reliably, even when the
+phase fails. The per-phase override is deliberately NOT persisted as the
+session's model choice (a daemon crash mid-phase resumes on the pre-override
+model; the re-driven phase re-applies it), and an explicit `session.set_model`
+by the user mid-phase wins over the restore.
+
 ## 4. Surfaces
 
 - **`codeoid pack show <id> --resolve`** — the pre-flight view: each role
@@ -145,10 +164,9 @@ display and debugging.) The chain is one pure function —
   config + no CLI overrides. You can see what a run would use before
   committing to it.
 - **`codeoid pipeline status <id>`** — each phase row gains its bound
-  `provider/model` and, once the phase ran, actual token usage from the
-  session record. This is what makes role→model mapping *tunable*: without
-  per-phase attribution you cannot know whether the expensive adversary
-  round earns its cost.
+  `provider/model` and the precedence rung that chose it. (Per-phase token
+  attribution — what would make role→model mapping *tunable* — is a
+  follow-up, not implemented in this iteration; see §7.)
 - **Wire**: `pipeline.create` (the verb `codeoid pipeline run` sends) gains
   optional `roleBindings: Record<string, {provider: string, model?: string}>`;
   same scope as today. The CLI compiles `--role` flags into it.
@@ -156,14 +174,32 @@ display and debugging.) The chain is one pure function —
 ## 5. Validation & failure modes
 
 - Unknown role name in `--role` → create-time error listing the pack's
-  declared roles (discoverability beats silence).
+  declared roles (discoverability beats silence). **Role names match
+  case-insensitively** on every surface — the same rule the collab validator
+  applies (one grammar, one rule): `--role Adversary:…` binds the pack's
+  `adversary`, and binding the same name twice in any casing is an error.
 - Unknown provider id → create-time error (the provider registry is known).
-- Model strings pass through to the provider — codeoid cannot enumerate a
-  backend's models, so a bad id fails at the phase's session spawn; the
-  phase error message must name the binding and its `resolvedFrom` rung so
-  the operator knows which layer to fix.
+- Cross-provider bindings never transfer. On the pipeline surface a binding
+  naming a provider other than the run session's is skipped at create (§3);
+  on the collab surface the roster's provider is authoritative (§6.1). In
+  both cases the skip is a **warning naming the rung**, never a hard failure
+  — and a **model-only rung** is held to the same guard: its model applies
+  only if it validates provider-aware for the target backend
+  (`resolveModelIdForProvider`), else it is skipped with a warning. Only a
+  model the operator explicitly typed (CLI `--role …:model`, `--model`) may
+  hard-fail create-time validation.
+- Create responses carry the collected warnings back to the creating client
+  (`warnings` on `response.ok` / `pipeline.snapshot`); the CLI and web render
+  them — a warning only the daemon console sees is one the operator never
+  sees.
+- Past that, model strings pass through to the provider — codeoid cannot
+  enumerate a backend's models, so a bad id fails at the phase's turn; the
+  phase error message names the binding **that was actually in effect** and
+  its `resolvedFrom` rung so the operator knows which layer to fix.
 - `*count` in a pipeline `--role` spec → create-time error ("fan-out is a
-  collaboration concept; pipelines run one session per phase").
+  collaboration concept; pipelines run one session per phase"). This
+  rejection is CLI-side only — the wire `roleBindings` shape has no count
+  field, so a raw wire client cannot express one.
 - `tier:` on a role validates as non-empty string ≤64 chars at `loadPack`;
   everything else about tiers is convention.
 
@@ -225,7 +261,11 @@ codeoid new mytask --collaborate "add per-provider rate limits" \
     role falls to its named backend's default, with a create-time warning
     naming the rung to fix. It does not continue down the chain — the
     winning rung is the operator's intent, and resurrecting a lower rung
-    underneath it would make precedence unreadable.
+    underneath it would make precedence unreadable. A **model-only** rung
+    (no provider) is held to the same guard: it applies only when the model
+    validates provider-aware for the roster's backend, else it is skipped
+    with the same warning (§5) — never a hard failure for a model the
+    operator didn't type.
   - **`write` comes from the role YAML.** A spec that sets `write`
     differently is a create-time error, not a silent override. A spec's
     omitted `purpose` defaults to the role YAML's `summary`.
@@ -263,8 +303,12 @@ those already have their own model-carry semantics.
 
 ## 7. Non-goals (this iteration)
 
-- **Cost estimation / budgets** — we record per-phase usage (§4); we do not
-  predict or cap it here.
+- **Per-phase token attribution in `pipeline status`** — the phase row shows
+  its bound model, not what the phase actually spent. Cost lands on the bound
+  session's cumulative usage, undifferentiated by phase. Splitting it per
+  phase (what would make the tier map *tunable* — "does the expensive
+  adversary round earn its cost?") is a follow-up.
+- **Cost estimation / budgets** — we do not predict or cap spend here.
 - **Mid-run rebinding** — a halted run resumes with its persisted bindings;
   a `pipeline set-role` mutation is a later convenience.
 - **Named profiles** (`--profile max`) — config sugar over §2.2; add only if

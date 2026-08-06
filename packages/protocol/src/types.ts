@@ -2087,6 +2087,10 @@ export interface PipelineSnapshotMsg {
   type: "pipeline.snapshot";
   requestId: string;
   pipeline: PipelineWire;
+  /** Create-time model-binding notes (a binding skipped because it targeted a
+   *  backend other than the run session's, an unmapped tier) — present only on
+   *  the pipeline.create reply, absent on get/answer/abort snapshots. */
+  warnings?: string[];
 }
 /** Reply to pipeline.list. */
 export interface PipelineListResultMsg {
@@ -2316,6 +2320,14 @@ export interface ResponseOkMsg {
   type: "response.ok";
   requestId: string;
   data?: unknown;
+  /**
+   * Non-fatal create-time notes the requester should see — e.g. a model
+   * binding skipped because it targeted a different backend, or a pack tier
+   * with no `modelTiers` mapping (docs/role-model-binding.md §5/§6). The
+   * request SUCCEEDED; these name what was quietly adjusted and which layer
+   * to fix. Clients render them; absent/empty means nothing to report.
+   */
+  warnings?: string[];
 }
 
 export interface ResponseErrorMsg {

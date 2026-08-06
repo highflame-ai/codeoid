@@ -11,9 +11,13 @@ import type { PhaseDef, PipelineState } from "./interface";
 export interface PhaseRunRequest {
   /** the resolved prompt / slash command to run for this phase. */
   prompt: string;
-  /** per-phase backend override — enables cross-provider-per-phase routing. */
+  /** The phase's persisted binding provider. Informational at run time: a run
+   *  drives ONE session on one backend, so cross-provider bindings are
+   *  skipped at create and never persisted (docs/role-model-binding.md §3) —
+   *  the host only uses this to refuse a stale mismatch, never to switch. */
   provider?: string;
-  /** per-phase model override. */
+  /** Per-phase model — applied to the bound session for this phase's turn and
+   *  restored after (docs/role-model-binding.md §3). */
   model?: string;
   pipeline: PipelineState;
   phase: PhaseDef;
@@ -97,9 +101,12 @@ export class SessionPhaseRunner implements PhaseRunner {
     if (finalStatus !== "idle") {
       const detail = text ? `: ${text.slice(0, 300)}` : "";
       // Name the model binding + the rung that chose it (docs/role-model-binding.md
-      // §5): model ids pass through unvalidated, so when a bad one fails HERE the
-      // operator must be able to see which layer (CLI / config map / pack pin)
-      // supplied it — otherwise the fix is a guessing game across five surfaces.
+      // §5). Only bindings ACTUALLY in effect appear here: a skipped binding
+      // (cross-provider / invalid model) is stripped at create and never
+      // persisted on the def. Ids past provider-aware validation still pass
+      // through to the backend, so when a bad one fails HERE the operator must
+      // see which layer (CLI / config map / pack pin) supplied it — otherwise
+      // the fix is a guessing game across five surfaces.
       const target = [req.phase.provider, req.phase.model].filter(Boolean).join(":");
       const rung = req.phase.resolvedFrom ? ` ← ${req.phase.resolvedFrom}` : "";
       const binding = target ? ` [binding: ${target}${rung}]` : "";

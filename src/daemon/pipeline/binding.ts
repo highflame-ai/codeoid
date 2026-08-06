@@ -141,15 +141,21 @@ export interface ParsedRoleSpec {
  */
 export function roleBindingsFromSpecs(specs: ParsedRoleSpec[]): Record<string, ModelBinding> {
   const out: Record<string, ModelBinding> = {};
+  // Case-insensitive, matching the collab validator and the daemon-side lookup
+  // (one grammar, one rule — docs/role-model-binding.md §5): "Review" and
+  // "review" bound to different backends would be ambiguous downstream.
+  const seen = new Set<string>();
   for (const s of specs) {
     if (s.count !== undefined) {
       throw new Error(
         `--role "${s.name}": fan-out is a collaboration concept; pipelines run one session per phase`,
       );
     }
-    if (out[s.name]) {
+    const key = s.name.toLowerCase();
+    if (seen.has(key)) {
       throw new Error(`--role "${s.name}" bound more than once — each role takes one binding`);
     }
+    seen.add(key);
     out[s.name] = { provider: s.providerId, ...(s.model !== undefined ? { model: s.model } : {}) };
   }
   return out;

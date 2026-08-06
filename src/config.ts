@@ -30,6 +30,8 @@ import { HOOK_EVENTS, type HookEntryConfig } from "./daemon/hooks/types.js";
 // below it rather than silently contradicting it. No cycle: collaboration.ts
 // reaches only protocol types, models.ts, and blackboard/{types,service}.ts.
 import { MAX_COLLABORATION_CHILDREN } from "./daemon/collaboration.js";
+// One published bound for model-id strings (wire schemas + config maps agree).
+import { LIMITS } from "./protocol/types.js";
 
 // ── Paths ────────────────────────────────────────────────────────────────
 
@@ -660,7 +662,7 @@ export type RawMcpServerConfig = z.infer<typeof McpServerSchema>;
  *  optionally which model on it (absent = that backend's default). */
 const ModelBindingSchema = z.object({
   provider: z.string().min(1).max(64),
-  model: z.string().min(1).max(256).optional(),
+  model: z.string().min(1).max(LIMITS.MODEL_MAX).optional(),
 });
 
 const PipelineSchema = z
