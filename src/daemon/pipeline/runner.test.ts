@@ -83,3 +83,23 @@ describe("SessionPhaseRunner", () => {
     expect(called).toBe(false);
   });
 });
+
+// A failing turn must name the phase's model binding + the rung that chose it
+// (docs/role-model-binding.md §5): model ids pass through unvalidated, so this
+// error is the operator's only pointer to WHICH layer supplied a bad id.
+test("a non-idle turn's error names the binding and its resolvedFrom rung", async () => {
+  const host: PhaseTurnHost = {
+    async runPhaseOnSession() {
+      return { finalStatus: "error", text: "unknown model" };
+    },
+  };
+  await expect(
+    new SessionPhaseRunner(() => host).runPrompt({
+      prompt: "x",
+      provider: "claude",
+      model: "claude-fable-9",
+      pipeline: fakePipeline(),
+      phase: { id: "one", kind: "skill", provider: "claude", model: "claude-fable-9", resolvedFrom: "config-tier" },
+    }),
+  ).rejects.toThrow('[binding: claude:claude-fable-9 ← config-tier]');
+});

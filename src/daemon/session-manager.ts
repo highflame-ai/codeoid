@@ -368,6 +368,9 @@ export class SessionManager {
       },
       manager: () => this.#pipelines,
       persist: (state) => this.#persistPackConfig(state),
+      // The operator's model maps, for the pre-flight `pack show --resolve`
+      // view (docs/role-model-binding.md §4) — same maps pipeline.create reads.
+      modelConfig: { modelTiers: p?.modelTiers, modelRoles: p?.modelRoles },
     });
   }
 
@@ -3034,6 +3037,11 @@ mcpHub: this.#mcpHub,
       phases: s.phases.map((p) => {
         const st = p.state;
         const w: PipelinePhaseWire = { id: p.def.id, name: p.def.name, role: p.def.role, status: st.status };
+        // The persisted model binding (docs/role-model-binding.md §3) — clients
+        // render provider/model + the precedence rung that chose them.
+        if (p.def.provider !== undefined) w.provider = p.def.provider;
+        if (p.def.model !== undefined) w.model = p.def.model;
+        if (p.def.resolvedFrom !== undefined) w.resolvedFrom = p.def.resolvedFrom;
         if (st.status === "passed") w.summary = st.summary;
         else if (st.status === "failed") w.reason = st.reason;
         else if (st.status === "skipped") w.reason = st.reason;
@@ -3083,6 +3091,14 @@ mcpHub: this.#mcpHub,
         return { type: "response.error", requestId: msg.id, error: `phase "${p.id}": unknown provider "${p.provider}"`, code: "invalid_request" };
       }
     }
+    // Role bindings name a known backend or fail here (§5): the provider
+    // registry is enumerable, unlike model ids (those pass through and fail at
+    // the phase's session spawn, where the error names the binding's rung).
+    for (const [roleName, b] of Object.entries(msg.roleBindings ?? {})) {
+      if (!providerIds.includes(b.provider)) {
+        return { type: "response.error", requestId: msg.id, error: `role "${roleName}": unknown provider "${b.provider}"`, code: "invalid_request" };
+      }
+    }
     // A run is a conductor over a live, attached session (docs/pipeline-run.md):
     // create the bound run-session up front so its phases stream into a real
     // session the client can attach. Created before pm.create so its id is part
@@ -3104,6 +3120,13 @@ mcpHub: this.#mcpHub,
         accountId: auth.accountId,
         projectId: auth.projectId,
         createdBy: auth.sub,
+        roleBindings: msg.roleBindings,
+        // The operator's model maps, read once here — the manager persists the
+        // resolved binding per phase (docs/role-model-binding.md §3).
+        modelConfig: {
+          modelTiers: this.#config?.pipeline?.modelTiers,
+          modelRoles: this.#config?.pipeline?.modelRoles,
+        },
       });
       return { type: "pipeline.snapshot", requestId: msg.id, pipeline: this.#pipelineToWire(state) };
     } catch (e) {

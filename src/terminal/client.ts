@@ -261,13 +261,13 @@ export class TerminalClient {
     this.#renderPacks(await this.#request({ type: "pipeline.pack.select", id: randomUUID(), packId: id }));
   }
 
-  async packShow(id: string): Promise<void> {
+  async packShow(id: string, opts: { resolve?: boolean } = {}): Promise<void> {
     const resp = await this.#request({ type: "pipeline.pack.list", id: randomUUID() });
     if (resp.type !== "pipeline.pack.list.result") {
       this.#printError(resp);
       return;
     }
-    const lines = formatPackShow(resp, id);
+    const lines = formatPackShow(resp, id, opts);
     if (lines === null) {
       console.error(`Pack "${id}" not found (installed or available).`);
       return;
@@ -525,7 +525,12 @@ export class TerminalClient {
     return resp.pipeline;
   }
 
-  async pipelineRun(pack: string, goal: string, workdir: string): Promise<void> {
+  async pipelineRun(
+    pack: string,
+    goal: string,
+    workdir: string,
+    roleBindings?: Record<string, { provider: string; model?: string }>,
+  ): Promise<void> {
     const resp = await this.#request({
       type: "pipeline.create",
       id: randomUUID(),
@@ -533,6 +538,7 @@ export class TerminalClient {
       pack,
       spec: goal,
       workdir,
+      ...(roleBindings ? { roleBindings } : {}),
     });
     if (resp.type !== "pipeline.snapshot") {
       this.#printError(resp);

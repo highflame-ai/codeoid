@@ -59,3 +59,24 @@ describe("formatPipeline", () => {
     expect(text).not.toContain("awaiting your decision");
   });
 });
+
+describe("formatPipeline — model bindings (docs/role-model-binding.md §4)", () => {
+  test("renders the bound provider:model and the resolving rung per phase", () => {
+    const text = formatPipeline(
+      wire({
+        phases: [
+          { id: "attack", role: "adversary", status: "running", provider: "claude", model: "claude-fable-5", resolvedFrom: "config-tier" },
+          { id: "pinned", role: "scribe", status: "pending", provider: "codex", resolvedFrom: "phase-pin" },
+          { id: "plain", status: "pending" },
+        ],
+        cursor: 0,
+      }),
+    ).join("\n");
+    expect(text).toContain("attack [adversary]  running  ⟨claude:claude-fable-5 ← config-tier⟩");
+    // Provider-only binding: no dangling separator.
+    expect(text).toContain("pinned [scribe]  pending  ⟨codex ← phase-pin⟩");
+    // Unbound phase renders exactly as before — no empty ⟨⟩.
+    expect(text).toContain("· plain  pending");
+    expect(text).not.toContain("plain  pending  ⟨");
+  });
+});

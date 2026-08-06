@@ -38,7 +38,11 @@ export function formatPipeline(p: PipelineWire): string[] {
     const ph = p.phases[i]!;
     const cursor = i === p.cursor && !isTerminal(p) ? "→ " : "  ";
     const role = ph.role ? ` [${ph.role}]` : "";
-    out.push(`  ${cursor}${MARK[ph.status]} ${ph.id}${role}  ${ph.status}`);
+    // The persisted model binding + the precedence rung that chose it
+    // (docs/role-model-binding.md §3) — absent = the provider default.
+    const target = [ph.provider, ph.model].filter(Boolean).join(":");
+    const binding = target ? `  ⟨${target}${ph.resolvedFrom ? ` ← ${ph.resolvedFrom}` : ""}⟩` : "";
+    out.push(`  ${cursor}${MARK[ph.status]} ${ph.id}${role}  ${ph.status}${binding}`);
     if (ph.status === "passed" && ph.summary) out.push(`        ↳ ${truncate(ph.summary)}`);
     if (ph.status === "skipped" && ph.reason) out.push(`        ↳ ${truncate(ph.reason)}`);
     if (ph.status === "failed" && ph.reason) out.push(`        ↳ ${truncate(ph.reason)}`);

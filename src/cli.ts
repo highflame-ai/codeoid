@@ -22,6 +22,7 @@ import { program } from "commander";
 import pkg from "../package.json" with { type: "json" };
 import { DaemonServer } from "./daemon/server.js";
 import { parseRoleSpec } from "./daemon/collaboration.js";
+import { type ModelBinding, roleBindingsFromSpecs } from "./daemon/pipeline/binding.js";
 import {
   assertLocalBindAllowed,
   isLoopbackHost,
@@ -632,7 +633,13 @@ pack
 pack
   .command("show <id>")
   .description("Show a pack's phases, roles, gates, and trust state")
-  .action((id: string) => withClient((c) => c.packShow(id)));
+  .option(
+    "--resolve",
+    "Also show each role's effective model binding under this daemon's config (the pre-flight view), plus any phase-level pins",
+  )
+  .action((id: string, opts: { resolve?: boolean }) =>
+    withClient((c) => c.packShow(id, { resolve: opts.resolve })),
+  );
 
 pack
   .command("trust <id>")
@@ -662,9 +669,28 @@ pipeline
   .requiredOption("--pack <id>", "Installed pack to run")
   .requiredOption("--goal <text>", "The feature / goal seeding the run")
   .option("--workdir <path>", "Repo the phases operate in (default: current directory)")
-  .action((opts: { pack: string; goal: string; workdir?: string }) =>
-    withClient((c) => c.pipelineRun(opts.pack, opts.goal, opts.workdir ?? process.cwd())),
-  );
+  .option(
+    "--role <spec>",
+    'Bind a role to a backend for this run, repeatable: "name:provider[:model]" (e.g. adversary:claude:claude-fable-5). Outranks config maps and pack pins. No *count — pipelines run one session per phase.',
+    (value: string, previous: string[] = []) => [...previous, value],
+    [] as string[],
+  )
+  .action((opts: { pack: string; goal: string; workdir?: string; role: string[] }) => {
+    // Same grammar as collab `--role` (one grammar everywhere —
+    // docs/role-model-binding.md §2.3); the *count rejection and the semantic
+    // checks (role exists, provider registered) re-run daemon-side so the CLI
+    // and the wire path fail identically.
+    let roleBindings: Record<string, ModelBinding> | undefined;
+    if (opts.role.length > 0) {
+      try {
+        roleBindings = roleBindingsFromSpecs(opts.role.map(parseRoleSpec));
+      } catch (e) {
+        console.error(e instanceof Error ? e.message : String(e));
+        process.exit(1);
+      }
+    }
+    return withClient((c) => c.pipelineRun(opts.pack, opts.goal, opts.workdir ?? process.cwd(), roleBindings));
+  });
 
 pipeline
   .command("list")

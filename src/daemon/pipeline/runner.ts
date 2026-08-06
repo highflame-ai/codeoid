@@ -96,7 +96,14 @@ export class SessionPhaseRunner implements PhaseRunner {
     // than silently marking the phase passed with a partial/empty summary.
     if (finalStatus !== "idle") {
       const detail = text ? `: ${text.slice(0, 300)}` : "";
-      throw new Error(`phase turn ended in "${finalStatus}"${detail}`);
+      // Name the model binding + the rung that chose it (docs/role-model-binding.md
+      // §5): model ids pass through unvalidated, so when a bad one fails HERE the
+      // operator must be able to see which layer (CLI / config map / pack pin)
+      // supplied it — otherwise the fix is a guessing game across five surfaces.
+      const target = [req.phase.provider, req.phase.model].filter(Boolean).join(":");
+      const rung = req.phase.resolvedFrom ? ` ← ${req.phase.resolvedFrom}` : "";
+      const binding = target ? ` [binding: ${target}${rung}]` : "";
+      throw new Error(`phase turn ended in "${finalStatus}"${binding}${detail}`);
     }
     return { summary: text };
   }

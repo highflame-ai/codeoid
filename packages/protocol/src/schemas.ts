@@ -482,6 +482,18 @@ export const pipelineCreateSchema = z
     workdir: pathField.optional(),
     /** Backend for the run's bound session (default: the daemon's default provider). */
     providerId: z.string().max(64).optional(),
+    /** Invocation-time role→model bindings, keyed by role name (the CLI's
+     *  `--role` flags compiled — docs/role-model-binding.md §3). */
+    roleBindings: z
+      .record(
+        z.string().min(1).max(64),
+        z.object({
+          provider: z.string().min(1).max(64),
+          model: z.string().min(1).max(LIMITS.MODEL_MAX).optional(),
+        }),
+      )
+      .refine((r) => Object.keys(r).length <= 32, { message: "too many role bindings (max 32)" })
+      .optional(),
   })
   .refine((m) => !(m.phases !== undefined && m.pack !== undefined), {
     message: "provide either `phases` or `pack`, not both",

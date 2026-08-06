@@ -656,10 +656,30 @@ export type RawMcpServerConfig = z.infer<typeof McpServerSchema>;
  * + installed on boot (each a `pack.yaml` dir); `trusted` (default false) lets a
  * pack's `command` gates execute on this host — leave off for fetched packs.
  */
+/** One concrete model choice for the pipeline model maps: which backend, and
+ *  optionally which model on it (absent = that backend's default). */
+const ModelBindingSchema = z.object({
+  provider: z.string().min(1).max(64),
+  model: z.string().min(1).max(256).optional(),
+});
+
 const PipelineSchema = z
   .object({
     enabled: z.boolean().default(true),
     defaultPack: z.string().nullable().default(null),
+    /**
+     * Operator model maps for per-role model binding (docs/role-model-binding.md
+     * §2.2). `modelTiers` maps a pack role's semantic `tier` ("reasoning-max")
+     * to a concrete {provider, model} — one edit here upgrades every installed
+     * pack when a new model generation ships. `modelRoles` is the surgical
+     * per-pack-role override, keyed "<packId>/<roleName>". Both are read ONCE
+     * at pipeline create and the resolved binding is persisted per run.
+     * Precedence: CLI --role > modelRoles > pack phase pin > role pin >
+     * modelTiers > provider default.
+     */
+    modelTiers: z.record(z.string().min(1).max(64), ModelBindingSchema).default({}),
+    // Key = "<packId>/<roleName>" — both ids are ≤64 chars, plus the slash.
+    modelRoles: z.record(z.string().min(1).max(129), ModelBindingSchema).default({}),
     packs: z
       .array(
         z.object({
@@ -684,7 +704,7 @@ const PipelineSchema = z
       )
       .default([]),
   })
-  .default({ enabled: true, defaultPack: null, packs: [], registries: [] });
+  .default({ enabled: true, defaultPack: null, packs: [], registries: [], modelTiers: {}, modelRoles: {} });
 
 /**
  * Push notifications (docs/push.md). When a session blocks on a tool approval,
@@ -930,6 +950,13 @@ export interface CodeoidConfig {
      *  type so hand-built test configs stay minimal; loadConfig always populates
      *  it (schema default []). */
     registries?: { name: string; url: string; ref?: string }[];
+    /** Operator model maps for per-role model binding
+     *  (docs/role-model-binding.md §2.2): tier → model, and the surgical
+     *  "<packId>/<roleName>" → model override. Optional in the type so
+     *  hand-built test configs stay minimal; loadConfig always populates them
+     *  (schema default {}). */
+    modelTiers?: Record<string, { provider: string; model?: string }>;
+    modelRoles?: Record<string, { provider: string; model?: string }>;
   };
   /**
    * Per-backend provider settings. Optional in the type so hand-built test

@@ -220,6 +220,34 @@ describe("pipeline.create — pack / role / optional phases", () => {
     });
     expect(r.ok).toBe(false);
   });
+
+  test("roleBindings round-trip through validation (must not be stripped)", () => {
+    const r = parseClientMessage({
+      type: "pipeline.create",
+      id: "x",
+      name: "R",
+      pack: "aif-sdlc",
+      roleBindings: { adversary: { provider: "claude", model: "claude-fable-5" }, verifier: { provider: "claude" } },
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok && r.value.type === "pipeline.create") {
+      expect(r.value.roleBindings).toEqual({
+        adversary: { provider: "claude", model: "claude-fable-5" },
+        verifier: { provider: "claude" },
+      });
+    }
+  });
+
+  test("REJECTS a role binding without a provider", () => {
+    const r = parseClientMessage({
+      type: "pipeline.create",
+      id: "x",
+      name: "R",
+      pack: "aif-sdlc",
+      roleBindings: { adversary: { model: "claude-fable-5" } },
+    });
+    expect(r.ok).toBe(false);
+  });
 });
 
 describe("session.fork — isolation fields survive validation (must not be stripped)", () => {

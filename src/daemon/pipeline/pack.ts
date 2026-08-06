@@ -34,6 +34,16 @@ export const roleSchema = z.object({
   name: z.string().min(1).max(64),
   summary: z.string().max(500).optional(),
   /**
+   * Semantic capability class this role NEEDS ("reasoning-max", "reviewer",
+   * "mechanical", …) — NOT a model id. The operator's config maps tier →
+   * concrete model (`pipeline.modelTiers`), so packs stay portable across
+   * machines and model generations (docs/role-model-binding.md §2.1). Open
+   * vocabulary by design (conventions live in the registry docs); an unmapped
+   * tier resolves to the provider default with a warning at create, never an
+   * error.
+   */
+  tier: z.string().min(1).max(64).optional(),
+  /**
    * Backend this role runs on (docs/collaborative-session-design.md §8.1).
    * A role has always been a capability envelope; this also makes it a
    * role→backend binding, so one engine covers both topologies — a

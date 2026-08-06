@@ -1958,6 +1958,13 @@ export interface PipelinePhaseWire {
   /** Capability role this phase runs under (from the pack) — a client can render
    *  the phase's tool envelope (e.g. a read-only reviewer). */
   role?: string;
+  /** The phase's bound backend/model + which precedence rung chose it
+   *  (docs/role-model-binding.md §3) — resolved once at create and persisted,
+   *  so a client can render "claude:claude-fable-5 ← config-tier" and name the
+   *  layer to fix when a model id fails at spawn. Absent = provider default. */
+  provider?: string;
+  model?: string;
+  resolvedFrom?: string;
   summary?: string;
   reason?: string;
   /** Set when status==="halted" — echo back in pipeline.answer / pipeline.revise. */
@@ -2016,6 +2023,11 @@ export interface PipelineCreateMsg extends BaseClientMsg {
   workdir?: string;
   /** Backend for the run's bound session (default: the daemon's default provider). */
   providerId?: string;
+  /** Invocation-time role→model bindings (CLI `--role`), keyed by role name —
+   *  the highest-precedence rung of the model-binding chain
+   *  (docs/role-model-binding.md §3). Keys must name roles the plan declares;
+   *  an unknown role or provider is a create-time error. */
+  roleBindings?: Record<string, { provider: string; model?: string }>;
 }
 export interface PipelineListMsg extends BaseClientMsg {
   type: "pipeline.list";
@@ -2079,6 +2091,29 @@ export interface PackPhaseWire {
   gate?: string;
 }
 
+/** One declared role's effective model binding under the daemon's CURRENT
+ *  config with no CLI overrides — the pre-flight view (`pack show --resolve`,
+ *  docs/role-model-binding.md §4). Phase-level pins are deliberately excluded
+ *  from this per-role view and listed separately (`PackWire.phasePins`). */
+export interface PackResolvedRoleWire {
+  name: string;
+  /** The role's semantic capability class, if it declares one. */
+  tier?: string;
+  provider?: string;
+  model?: string;
+  /** Which precedence rung produced the binding ("config-role" | "role-pin" |
+   *  "config-tier" | "default"). */
+  resolvedFrom: string;
+}
+
+/** A phase-level concrete `provider:`/`model:` pin from pack.yaml — surfaced
+ *  separately so a stale pin stays visible next to the tier map's choice. */
+export interface PackPhasePinWire {
+  phase: string;
+  provider?: string;
+  model?: string;
+}
+
 /** An installed pack + its metadata + trust/selected state, for the browser. */
 export interface PackWire {
   id: string;
@@ -2100,6 +2135,13 @@ export interface PackWire {
   gates: { id: string; kind: string }[];
   /** Whether the pack is registered into the live pipeline manager (runnable). */
   active: boolean;
+  /** Pre-flight model-binding view (docs/role-model-binding.md §4): each
+   *  declared role's currently-effective binding under this daemon's config,
+   *  no CLI overrides. Absent on a broken pack. */
+  resolvedRoles?: PackResolvedRoleWire[];
+  /** Phase-level concrete pins from pack.yaml, listed separately from the
+   *  per-role view so staleness is visible. Absent on a broken pack. */
+  phasePins?: PackPhasePinWire[];
   /** Present when the configured pack dir could not be loaded (bad/missing
    *  pack.yaml) — the card renders as broken rather than vanishing silently. */
   error?: string;
