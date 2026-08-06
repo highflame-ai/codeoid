@@ -21,7 +21,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { ALL_SCOPES } from "@codeoid/protocol";
+import { ALL_SCOPES } from "@highflame/codeoid-protocol";
 import {
   assertLocalBindAllowed,
   isLocalToken,
@@ -298,13 +298,20 @@ function importGraph(entry: string): { files: Map<string, string>; packages: Set
 describe("local mode is offline-capable by construction", () => {
   const LOCAL_AUTH = resolve(import.meta.dir, "../daemon/local-auth.ts");
 
+  // codeoid's own packages live in the @highflame scope too, so the scope prefix
+  // alone no longer distinguishes "us" from "the ZeroID SDK". Allowlist ours by
+  // name and treat every other @highflame specifier as a violation — that keeps
+  // the check strict enough to catch a convenience import of any Highflame
+  // platform package, not just the SDK we know about today.
+  const OWN_PACKAGES = new Set(["@highflame/codeoid-protocol", "@highflame/codeoid-core"]);
+
   it("never reaches @highflame/sdk, directly or transitively", () => {
     const { files, packages } = importGraph(LOCAL_AUTH);
 
-    // No package specifier anywhere in the graph is the ZeroID SDK. This is the
-    // assertion that fails if someone adds a convenience import to auth.ts (or
-    // anything that pulls it in) from local-auth.ts.
-    const sdkImports = [...packages].filter((p) => p.startsWith("@highflame/"));
+    // No package specifier anywhere in the graph is a Highflame platform package.
+    // This is the assertion that fails if someone adds a convenience import to
+    // auth.ts (or anything that pulls it in) from local-auth.ts.
+    const sdkImports = [...packages].filter((p) => p.startsWith("@highflame/") && !OWN_PACKAGES.has(p));
     expect(sdkImports).toEqual([]);
 
     // Belt and suspenders: no visited SOURCE mentions it either, which also
@@ -320,8 +327,8 @@ describe("local mode is offline-capable by construction", () => {
     expect(packages.has("node:crypto")).toBe(true);
   });
 
-  it("keeps @codeoid/protocol — its one package dependency — SDK-free", async () => {
-    // The graph walker stops at package boundaries, and @codeoid/protocol is
+  it("keeps @highflame/codeoid-protocol — its one package dependency — SDK-free", async () => {
+    // The graph walker stops at package boundaries, and @highflame/codeoid-protocol is
     // the only non-node package local-auth depends on. Scan it directly so the
     // invariant covers the whole reachable set.
     const glob = new Bun.Glob("**/*.ts");

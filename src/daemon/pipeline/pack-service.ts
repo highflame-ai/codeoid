@@ -17,7 +17,7 @@
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import type { AvailablePackWire, PackWire, RegistryWire } from "@codeoid/protocol";
+import type { AvailablePackWire, PackWire, RegistryWire } from "@highflame/codeoid-protocol";
 import { type ModelBindingConfig, resolveBinding } from "./binding";
 import type { Pack } from "./interface";
 import { loadPack, type LoadedPack, type RoleDef } from "./pack";

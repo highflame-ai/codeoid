@@ -25,7 +25,7 @@
  *      first).
  */
 
-import type { SessionMessage, SessionStatus } from "@codeoid/protocol";
+import type { SessionMessage, SessionStatus } from "@highflame/codeoid-protocol";
 
 const APPROVAL_POSSIBLE: ReadonlySet<SessionStatus> = new Set<SessionStatus>([
   "waiting_approval",

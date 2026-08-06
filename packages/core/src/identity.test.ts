@@ -5,7 +5,7 @@ import {
   shortSub,
   truncateWimseUri,
 } from "./identity.js";
-import type { MessageIdentity, SessionInfo } from "@codeoid/protocol";
+import type { MessageIdentity, SessionInfo } from "@highflame/codeoid-protocol";
 
 describe("shortSub", () => {
   it("extracts the trailing segment of a SPIFFE URI", () => {

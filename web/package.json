@@ -11,9 +11,13 @@
     "lint": "eslint src",
     "test": "NODE_OPTIONS=\"--max-old-space-size=4096\" vitest run --pool=forks --poolOptions.forks.singleFork=true"
   },
+  "//overrides": "web/ is its own install root (separate lockfile, vitest+vite toolchain), so the workspace packages come in as file: copies. @highflame/codeoid-core peer-depends on @highflame/codeoid-protocol by RANGE, which bun tries to satisfy from the registry — pin it to the in-repo copy so `bun install` here never depends on what has been published. Keeps the web build reproducible against the working tree, which is the whole point of the file: deps.",
+  "overrides": {
+    "@highflame/codeoid-protocol": "file:../packages/protocol"
+  },
   "dependencies": {
-    "@codeoid/core": "file:../packages/core",
-    "@codeoid/protocol": "file:../packages/protocol",
+    "@highflame/codeoid-core": "file:../packages/core",
+    "@highflame/codeoid-protocol": "file:../packages/protocol",
     "@floating-ui/dom": "^1.7.6",
     "@tanstack/solid-virtual": "^3.13.24",
     "@types/diff": "^8.0.0",

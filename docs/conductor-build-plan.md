@@ -389,7 +389,7 @@ the conductor purely by attaching to the conductor session. This *unblocks* mobi
 it builds its whole P0–P4 on today's attach/scrollback/session-list surface and
 surfaces the conductor the moment our P3+ lands.
 
-**Shared prerequisite — extract `@codeoid/protocol` + `@codeoid/core`** (wire types
+**Shared prerequisite — extract `@highflame/codeoid-protocol` + `@highflame/codeoid-core`** (wire types
 + WS client + reducers) from `codeoid` once, up front. Mobile P0 requires it; the
 conductor and `web/` benefit too (ends today's type triplication). Do it regardless
 of which track leads.

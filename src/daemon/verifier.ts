@@ -26,7 +26,7 @@
  * walking the import graph.
  */
 
-import type { AuthContext } from "@codeoid/protocol";
+import type { AuthContext } from "@highflame/codeoid-protocol";
 
 /**
  * Which issuer authenticated this daemon's connections.

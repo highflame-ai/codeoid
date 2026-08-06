@@ -19,7 +19,7 @@
 import { Bot, type Context, InlineKeyboard } from "grammy";
 import { autoRetry } from "@grammyjs/auto-retry";
 import { randomUUID } from "node:crypto";
-import { formatCollaborationCost } from "@codeoid/core";
+import { formatCollaborationCost } from "@highflame/codeoid-core";
 import { getManifest, getSnapshot } from "../../daemon/settings/store.js";
 import { ALL_SCOPES_STRING } from "../../protocol/scopes.js";
 import type { Frontend, FrontendContext } from "../types.js";

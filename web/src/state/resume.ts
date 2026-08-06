@@ -1,9 +1,9 @@
 /**
- * Web binding for `@codeoid/core`'s ResumeCursors — one singleton per app
+ * Web binding for `@highflame/codeoid-core`'s ResumeCursors — one singleton per app
  * (the web UI holds exactly one daemon connection). Keeps the existing
  * function-style API so call sites stay unchanged.
  */
-import { ResumeCursors } from "@codeoid/core";
+import { ResumeCursors } from "@highflame/codeoid-core";
 import type { ScrollbackReplayMsg } from "../protocol/types";
 
 const cursors = new ResumeCursors();

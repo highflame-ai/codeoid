@@ -30,7 +30,7 @@ import {
   mintLocalToken,
   readLocalTokenFile,
 } from "../daemon/local-auth.js";
-import { ALL_SCOPES } from "@codeoid/protocol";
+import { ALL_SCOPES } from "@highflame/codeoid-protocol";
 import type { AuthOkMsg, DaemonMessage } from "../protocol/types.js";
 
 const TOKEN = mintLocalToken();

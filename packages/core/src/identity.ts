@@ -6,7 +6,7 @@
  * proof of provenance. Colour mapping stays in each frontend.
  */
 
-import type { MessageIdentity, SessionInfo } from "@codeoid/protocol";
+import type { MessageIdentity, SessionInfo } from "@highflame/codeoid-protocol";
 
 /**
  * Last path segment of a SPIFFE / WIMSE URI.

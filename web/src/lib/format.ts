@@ -1,8 +1,8 @@
 /**
- * Display formatters — the data formatting lives in `@codeoid/core` (shared
+ * Display formatters — the data formatting lives in `@highflame/codeoid-core` (shared
  * with the TUI and mobile); only the Tailwind colour mapping is web-local.
  */
-import { ctxWindowSeverity } from "@codeoid/core";
+import { ctxWindowSeverity } from "@highflame/codeoid-core";
 
 export {
   ctxWindowSeverity,
@@ -14,8 +14,8 @@ export {
   formatPercent,
   formatTokens,
   relativeTime,
-} from "@codeoid/core";
-export type { CtxSeverity } from "@codeoid/core";
+} from "@highflame/codeoid-core";
+export type { CtxSeverity } from "@highflame/codeoid-core";
 
 /**
  * Context-window utilization colour cue — maps the shared severity to this

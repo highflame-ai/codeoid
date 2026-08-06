@@ -29,6 +29,11 @@ jobs:
       - name: Lint
         run: bun run lint
 
+      # Catch npm-version drift between the CLI and its workspace packages on
+      # the PR, not at tag time when the release is already in flight.
+      - name: Version lockstep
+        run: bun run check:versions
+
       - name: Typecheck
         run: bun run typecheck
 

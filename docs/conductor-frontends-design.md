@@ -265,7 +265,7 @@ The Rust `SessionInfo` is missing the `role` field entirely; add it first so the
 
 ## 11. Protocol addition (the one required daemon change)
 
-Everything above rests on a single **additive, wire-additive, provider-agnostic** read+subscribe surface in `@codeoid/protocol`, mirrored in the Rust `codeoid-protocol` crate.
+Everything above rests on a single **additive, wire-additive, provider-agnostic** read+subscribe surface in `@highflame/codeoid-protocol`, mirrored in the Rust `codeoid-protocol` crate.
 The daemon already holds every field; this only exposes it.
 Gate it with a new `fleet:read` scope.
 
@@ -326,7 +326,7 @@ Per [conductor-build-plan.md](./conductor-build-plan.md), `main` is ruleset-prot
 User decision (2026-07-17): **docked-first** — skip the drawer/modal stepping-stone and go straight to the docked conductor surface.
 
 **P5.0 — The contract.**
-Add `fleet.subscribe` / `fleet.snapshot.result` / `fleet.update` + the `fleet:read` scope to `@codeoid/protocol`; mirror in the Rust crate *and* add the missing `role` field.
+Add `fleet.subscribe` / `fleet.snapshot.result` / `fleet.update` + the `fleet:read` scope to `@highflame/codeoid-protocol`; mirror in the Rust crate *and* add the missing `role` field.
 Daemon exposes the read surface from `dispatch_tasks` / `dispatch_events` + session population, pushing the *whole subtree* (not just active-session children).
 Ship the capability matrix as data.
 Files: daemon `src/daemon/{fleet.ts,server.ts,store.ts}` · `packages/protocol` · `crates/codeoid-protocol`.

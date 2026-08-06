@@ -18,7 +18,7 @@ import type {
   ClientMessage,
   SessionInfo,
   SessionMode,
-} from "@codeoid/protocol";
+} from "@highflame/codeoid-protocol";
 
 export type SlashCommand =
   | { kind: "new"; name: string; workdir?: string }

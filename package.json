@@ -1,7 +1,7 @@
 {
-  "name": "codeoid",
-  "version": "0.3.4",
-  "description": "Identity-first control plane for AI coding agents \u2014 multi-session, multi-frontend, with cross-session memory",
+  "name": "@highflame/codeoid",
+  "version": "0.4.0",
+  "description": "Identity-first control plane for AI coding agents — multi-session, multi-frontend, with cross-session memory",
   "type": "module",
   "workspaces": [
     "packages/*"
@@ -21,6 +21,9 @@
     "SECURITY.md",
     "docs/architecture.png"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "engines": {
     "bun": ">=1.0.0"
   },
@@ -55,14 +58,17 @@
     "test:integration": "bun test src/integration",
     "test:web": "cd web && bun run test",
     "typecheck": "bun x tsc --noEmit && bun x tsc --noEmit -p packages/protocol && bun x tsc --noEmit -p packages/core",
+    "check:versions": "bun scripts/check-versions.ts",
+    "version:set": "bun scripts/set-version.ts",
     "smoke": "bash scripts/release-smoke.sh",
     "prepublishOnly": "bun run build:web"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.220",
-    "@codeoid/protocol": "^0.2.0",
     "@google/generative-ai": "^0.24.1",
     "@grammyjs/auto-retry": "^2.0.2",
+    "@highflame/codeoid-core": "^0.4.0",
+    "@highflame/codeoid-protocol": "^0.4.0",
     "@highflame/sdk": "^0.3.18",
     "@xenova/transformers": "^2.17.2",
     "commander": "^13.0.0",
