@@ -1,10 +1,11 @@
 # Per-Role Model Binding — Design
 
-> Status: **proposal** · Builds on [`pack-loading.md`](./pack-loading.md) and
+> Status: **proposal — decisions resolved, ready to implement** · Builds on
+> [`pack-loading.md`](./pack-loading.md) and
 > [`collaborative-session-design.md`](./collaborative-session-design.md).
 > Goal: let an operator decide **which model serves each role** — per machine,
 > per run, without editing the pack — through one resolution chain shared by
-> pipelines, collaborations, and (eventually) single sessions.
+> pipelines, pack-adopted collaborations, and single sessions.
 
 ---
 
@@ -153,18 +154,63 @@ display and debugging.)
 - `tier:` on a role validates as non-empty string ≤64 chars at `loadPack`;
   everything else about tiers is convention.
 
-## 6. Horizon: one role system (separate design)
+## 6. Pack-aware collaboration (in scope)
 
 `session-manager.ts` today rejects `--collaborate` + `--pack` ("a
-collaborative session compiles its own one-goal pack"). The end state this
-design points at — but does not implement — is lifting that: a collaboration
-that *adopts* an installed pack binds its role-children by name to the
-pack's roles, taking envelopes from the role YAML (hard tool fence),
-constitution from the pack's ETHOS, and models through the resolution chain
-above, with `--role` then carrying only provider/model/count. Free-form
-collab roles remain valid without `--pack`. That unification — plus `--model`
-on single sessions — deserves its own doc once this lands; §2–§5 are designed
-so nothing here has to change for it.
+collaborative session compiles its own one-goal pack"). This design lifts
+that restriction: a collaboration may **adopt** an installed pack, at which
+point the pack — not the collab machinery — defines what each role is.
+
+```bash
+codeoid new mytask --collaborate "add per-provider rate limits" \
+  --pack yash-dev \
+  --role orchestrator:claude \
+  --role implementer:claude \
+  --role adversary:claude:claude-fable-5 \
+  --role review:claude*2          # ERROR: yash-dev declares no role "review"
+```
+
+### 6.1 Binding semantics
+
+- **Role names bind strictly to the pack's declared roles.** An unbound name
+  is a create-time error listing the pack's roles (same rule as §5's
+  pipeline validation). Mixing free-form roles into a pack-adopted collab is
+  not allowed — run a free-form collab (no `--pack`) if that's what you
+  want. Strictness is what makes the governance claim below true.
+- **Envelopes come from the role YAML.** `roleChildPosture` today
+  synthesizes `{envelope: "all", network: "read-only", write: <from spec>}`;
+  with a pack it passes through the role's real `write`, `network`,
+  `envelope`, and `exceptions`. Read-only roles keep the existing scout
+  hardening (LEAF identity carries no write tools); envelope lists are
+  enforced at the same `canUseTool` fence that `--pack-role` sessions use —
+  Claude-hard, advisory + logged on backends whose tools don't all route
+  through the gate (unchanged from today's posture).
+- **Constitution composes, not replaces.** The child brief is: pack ETHOS,
+  then the collaboration goal, then the roster — the pack states how to
+  work, the goal states what on, the roster states with whom. The synthetic
+  `compileGoalPack` id gives way to the real pack id in `SessionInfo.
+  profile`.
+- **The orchestrator rule is unchanged.** A collaboration still requires a
+  bound role named `orchestrator`; a pack intended for collab must declare
+  one (all three existing packs do). No new flag.
+- **Models resolve through §3's chain minus rung 3** (phase pins don't exist
+  in a collaboration): CLI `--role` model → `modelRoles["<packId>/<role>"]`
+  → `modelTiers[role.tier]` → provider default. `*count` fan-out remains
+  valid here (it is rejected only on the pipeline path).
+- **Skills/subagents** follow the existing pack-activation rules: the
+  orchestrator session gets the pack's skills/subagents exactly as a
+  `--pack` session does today; trust gating for skill linking is unchanged
+  (it happened at install). No command gates are involved — collaborations
+  have no phases — so an untrusted pack can still be adopted; it just
+  contributes constitution + roles.
+
+### 6.2 Single sessions
+
+For symmetry, session create gains `--model <id>` beside `--provider`
+(today model choice is provider-default-only). With `--pack --pack-role`,
+an omitted `--model` resolves through the same chain (minus rung 3 and the
+CLI rung). This closes the last surface where a role exists but a model
+cannot be chosen.
 
 ## 7. Non-goals (this iteration)
 
@@ -175,45 +221,68 @@ so nothing here has to change for it.
 - **Named profiles** (`--profile max`) — config sugar over §2.2; add only if
   the raw map proves unwieldy in practice.
 - **Enforcing tier vocabulary** — conventions doc, not schema enum.
+- **Per-role network gating in collabs beyond the pack YAML's declaration**
+  — the fence honors what the role declares; finer dynamic gating stays "a
+  later phase" as marked in `roleChildPosture`.
 
-## 8. Open decisions
+## 8. Decisions
 
-- **D1 — precedence of pack pin vs machine tier map.** Proposed: pack's
-  concrete phase pin (rung 3) beats the tier map (rung 4), because an
-  explicit pin should mean what it says, and lint pressure moves packs to
-  tiers anyway. Alternative: tier map beats pin, protecting operators from
-  stale public-pack pins at the cost of making pins advisory. **Recommend:
-  pin > map**, with `pack show --resolve` making any stale pin visible.
-- **D2 — tier vocabulary.** Proposed: open string + documented conventions
-  shared with ai-factory's agent tiers. Alternative: closed enum in schema.
-  **Recommend: open** — registries evolve faster than codeoid releases.
-- **D3 — where the operator map lives.** Proposed: codeoid config
-  (`pipeline.modelTiers` / `modelRoles`). Alternative: reuse ai-factory's
-  machine config. **Recommend: codeoid config** — codeoid must not depend on
-  a toolkit's file; ai-factory users can mirror values.
-- **D4 — scope of the collab unification.** Proposed: horizon only (§6),
-  separate design. **Recommend: keep out** — this doc's surface is already
-  the full pipeline path; coupling it to session-manager changes doubles the
-  blast radius.
+Resolved in review (2026-08-06):
+
+- **D1 — precedence: pack pin > machine tier map.** ✅ **Decided as
+  proposed.** An explicit pin means what it says; `pack show --resolve`
+  makes stale pins visible; lint pressure moves packs to tiers.
+- **D2 — tier vocabulary: open strings + shared conventions.** ✅ **Decided
+  as proposed.** Registries evolve faster than codeoid releases.
+- **D3 — operator map lives in codeoid config.** ✅ **Decided as
+  proposed.** codeoid must not depend on a toolkit's file.
+- **D4 — collab unification: IN scope.** ✅ **Decided against the original
+  proposal** — §6 is part of this design, not a horizon. Sub-decisions made
+  there: strict role binding (no free-form mixing under `--pack`),
+  orchestrator-by-name rule unchanged, ETHOS→goal→roster constitution
+  composition, `*count` valid in collabs only.
 
 ## 9. Implementation sketch
 
-Touch set, in dependency order:
+Touch set, in dependency order. Slices 1–2 (pipeline path) and slice 3
+(collab path) are independently shippable; 3 depends on 1's resolution
+function only.
+
+**Slice 1 — resolution + pipeline surface**
 
 1. `src/daemon/pipeline/pack.ts` — `tier` on `roleSchema` (+ carry on
    `RoleDef`); no behavior change.
 2. `src/config.ts` — `pipeline.modelTiers` / `pipeline.modelRoles` schema.
 3. `src/daemon/pipeline/manager.ts` — `CreatePipelineOpts.roleBindings`;
-   resolution in `#resolvePhases` (pure function, unit-testable:
-   `resolveBinding(phase, role, bindings, config) → {provider?, model?,
-   resolvedFrom}`); persist into phase defs.
-4. `src/daemon/pipeline/pack-service.ts` — `--resolve` data for `pack show`.
+   resolution as a pure function shared by both paths:
+   `resolveBinding(role, {cliBinding?, phasePin?, config}) → {provider?,
+   model?, resolvedFrom}`; persist into phase defs.
+4. Wire types + verb params (`pipeline.run` gains `roleBindings`).
 5. `src/cli.ts` — `--role` on `pipeline run` (reuse `parseRoleSpec`, reject
-   counts), `--resolve` on `pack show`; `pipeline status` rendering.
-6. Wire types + verb params.
-7. Docs: registry conventions (recommended tier set) in ai-factory's
-   `packs/CLAUDE.md` — separate PR there.
+   counts); `pipeline status` rendering.
+
+**Slice 2 — visibility**
+
+6. `src/daemon/pipeline/pack-service.ts` + `src/cli.ts` — `pack show
+   --resolve`.
+
+**Slice 3 — pack-aware collaboration + single sessions**
+
+7. `src/daemon/session-manager.ts` — replace the mutual-exclusivity error
+   with pack adoption; strict role-name validation against the pack.
+8. `src/daemon/collaboration.ts` — `roleChildPosture` passes through real
+   role YAML (write/network/envelope/exceptions); `compileGoalPack` composes
+   ETHOS→goal→roster under the real pack id; model resolution via
+   `resolveBinding`.
+9. `src/cli.ts` — allow `--collaborate --pack`; `--model` on session create;
+   `--pack-role` model resolution.
+
+**Follow-up PR (ai-factory)** — registry conventions: recommended tier set
+in `packs/CLAUDE.md`; add `tier:` to the shipped packs' roles.
 
 Tests: resolution precedence table (every rung + `resolvedFrom`), persisted
-bindings survive resume with changed config, create-time validation errors,
-`parseRoleSpec` reuse incl. count rejection, `pack show --resolve` snapshot.
+bindings survive resume with changed config, create-time validation errors
+(unknown role on both paths, count rejection on pipeline path only),
+pack-adopted collab child posture (envelope/write/network from YAML;
+constitution composition order), free-form collab unchanged without
+`--pack`, `--model` on single sessions, `pack show --resolve` snapshot.
