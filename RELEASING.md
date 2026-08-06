@@ -99,6 +99,15 @@ Then, for **each** of the three packages, at
 After that, every subsequent release goes through the tag → workflow path above
 and nothing needs a token again.
 
+The bootstrap publish above and the tag can happen in either order: the
+workflow's publishes go through
+[`scripts/publish-if-new.sh`](scripts/publish-if-new.sh), which skips any
+name@version already on the registry. So the `v0.4.0` tag that follows a manual
+bootstrap does not leave a red pipeline behind, and a release job that dies
+part-way through (network, flaky test, cancelled run) can simply be re-run
+instead of tripping over the packages that already landed. A registry error that
+is *not* a 404 fails the step rather than being read as "not published yet".
+
 ## Notes
 
 - **codeoid runs under [Bun](https://bun.sh).** The published CLI ships `src/`

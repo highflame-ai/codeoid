@@ -56,14 +56,25 @@ jobs:
       #
       # A new package NAME requires one manual bootstrap publish before a
       # Trusted Publisher can be configured for it — see RELEASING.md.
+      #
+      # Each publish is IDEMPOTENT: if this exact version is already on the
+      # registry it is skipped rather than attempted. That is not a concession to
+      # version drift — `check:versions` above already makes drift impossible.
+      # It buys two things drift-checking cannot:
+      #   • a re-run of a job that died after a partial publish (network, a
+      #     flaky test, a cancelled run) completes instead of failing on the
+      #     packages that already landed;
+      #   • the bootstrap release of a NEW package name, which is published by
+      #     hand before a Trusted Publisher can exist, does not leave a red
+      #     pipeline behind on its tag.
       - name: Publish @highflame/codeoid-protocol
-        run: cd packages/protocol && npm publish --provenance
+        run: ./scripts/publish-if-new.sh packages/protocol
 
       - name: Publish @highflame/codeoid-core
-        run: cd packages/core && npm publish --provenance
+        run: ./scripts/publish-if-new.sh packages/core
 
       - name: Publish @highflame/codeoid
-        run: npm publish --provenance
+        run: ./scripts/publish-if-new.sh .
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
