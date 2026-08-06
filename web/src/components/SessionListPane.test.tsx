@@ -299,3 +299,24 @@ describe("SessionListPane — background tasks", () => {
     expect(queryByText(/bg/)).toBeNull();
   });
 });
+
+describe("SessionListPane — ambient pack", () => {
+  it("shows the pack chip from `profile`, with the ambient/phases distinction in the tooltip", () => {
+    // The daemon has shipped `profile` since ambient activation existed and NO
+    // client rendered it, so a pack-activated session was indistinguishable
+    // from a freestyle one — the reported "not sure if pack is actually
+    // honored". The tooltip also says what ambient does NOT do: run phases.
+    ingestSessionList([{ ...sess("s1", "paper", "/repo/p"), profile: "sdlc (architect)" } as SessionInfo]);
+    const { getByText, getByTitle } = render(() => <SessionListPane />);
+    expect(getByText(/sdlc \(architect\)/)).toBeTruthy();
+    expect(getByTitle(/Ambient pack: sdlc \(architect\)/).getAttribute("title")).toContain(
+      "Packs run phases only in Pipeline mode",
+    );
+  });
+
+  it("shows no chip for a freestyle session", () => {
+    ingestSessionList([sess("s1", "plain", "/repo/x")]);
+    const { queryByTitle } = render(() => <SessionListPane />);
+    expect(queryByTitle(/Ambient pack/)).toBeNull();
+  });
+});
