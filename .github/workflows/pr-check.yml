@@ -1,22 +1,29 @@
-name: CI
+name: PR Merge Check - Codeoid
 
 on:
-  push:
-    branches: [main]
   pull_request:
-    branches: [main]
+    types:
+      - opened
+      - synchronize
+      - reopened
+    branches:
+      - "main"
+  merge_group:
+    types:
+      - checks_requested
 
-# Cancel superseded runs on the same branch/PR.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.head_ref }}
   cancel-in-progress: true
 
 jobs:
-  daemon:
-    name: daemon
+  daemon-check:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -29,8 +36,6 @@ jobs:
       - name: Lint
         run: bun run lint
 
-      # Catch npm-version drift between the CLI and its workspace packages on
-      # the PR, not at tag time when the release is already in flight.
       - name: Version lockstep
         run: bun run check:versions
 
@@ -60,14 +65,16 @@ jobs:
       - name: Build
         run: bun run build
 
-  web:
-    name: web
+  web-check:
     runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: web
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2

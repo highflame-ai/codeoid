@@ -1,19 +1,86 @@
-name: Release
+name: Release Build - Codeoid
 
 on:
-  push:
-    tags: ["v*"]
+  release:
+    types:
+      - published
 
-permissions:
-  contents: write # create the GitHub Release
-  id-token: write # npm OIDC Trusted Publishing + provenance
+env:
+  REGEX_PATTERN: "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
 
 jobs:
-  npm:
-    name: Publish to npm
+  highflame-validate:
+    permissions:
+      contents: 'read'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Validate Release Tag
+        id: validate_tag
+        shell: bash
+        run: |-
+          if [[ "${{ env.RELEASE_TAG }}" =~ ${{ env.REGEX_PATTERN }} ]] ; then
+            echo "Valid version format: ${{ env.RELEASE_TAG }}"
+          else
+            echo "Invalid version format: ${{ env.RELEASE_TAG }}"
+            exit 1
+          fi
+
+  highflame-release:
+    needs:
+      - highflame-validate
+    permissions:
+      contents: write
+      id-token: write
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Extract version from release
+        id: version
+        env:
+          RELEASE_NAME: ${{ github.event.release.name }}
+        run: |-
+          VERSION=$(echo "$RELEASE_NAME" | sed 's|^v||g')
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "Releasing version: $VERSION"
+
+      - name: Update root package.json
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |-
+          jq ".version = \"${VERSION}\"" package.json > package.json.tmp
+          mv package.json.tmp package.json
+          echo "Updated root package.json:"
+          grep '"version"' package.json
+
+      - name: Update protocol package.json
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |-
+          cd packages/protocol
+          jq ".version = \"${VERSION}\"" package.json > package.json.tmp
+          mv package.json.tmp package.json
+          echo "Updated protocol package.json:"
+          grep '"version"' package.json
+
+      - name: Update core package.json
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |-
+          cd packages/core
+          jq ".version = \"${VERSION}\"" package.json > package.json.tmp
+          mv package.json.tmp package.json
+          echo "Updated core package.json:"
+          grep '"version"' package.json
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -41,42 +108,54 @@ jobs:
         run: bun run check:versions "${GITHUB_REF_NAME}"
 
       - name: Build web UI
-        run: cd web && bun install --frozen-lockfile && bun run build
+        run: |-
+          cd web
+          bun install --frozen-lockfile
+          bun run build
 
       - name: Test
         run: bun run test
 
-      # Publish order is dependency order: protocol → core → the CLI, so each
-      # tarball's declared deps are resolvable on the registry the moment it
-      # lands. No NODE_AUTH_TOKEN anywhere — auth is the GitHub OIDC id-token
-      # via each package's Trusted Publisher (configured at npmjs.com), and
-      # provenance is generated from that same identity. `--access public` is
-      # not passed: every manifest carries `publishConfig.access`, so a manual
-      # publish and this pipeline run the exact same command.
-      #
-      # A new package NAME requires one manual bootstrap publish before a
-      # Trusted Publisher can be configured for it — see RELEASING.md.
-      #
-      # Each publish is IDEMPOTENT: if this exact version is already on the
-      # registry it is skipped rather than attempted. That is not a concession to
-      # version drift — `check:versions` above already makes drift impossible.
-      # It buys two things drift-checking cannot:
-      #   • a re-run of a job that died after a partial publish (network, a
-      #     flaky test, a cancelled run) completes instead of failing on the
-      #     packages that already landed;
-      #   • the bootstrap release of a NEW package name, which is published by
-      #     hand before a Trusted Publisher can exist, does not leave a red
-      #     pipeline behind on its tag.
-      - name: Publish @highflame/codeoid-protocol
-        run: ./scripts/publish-if-new.sh packages/protocol
+      - name: Verify package version matches the tag
+        run: |-
+          PKG="$(node -p "require('./package.json').version")"
+          TAG="${GITHUB_REF_NAME#v}"
+          if [ "$PKG" != "$TAG" ]; then
+            echo "::error::package.json version ($PKG) does not match tag ($TAG)"
+            exit 1
+          fi
 
-      - name: Publish @highflame/codeoid-core
-        run: ./scripts/publish-if-new.sh packages/core
+      # @highflame/codeoid-protocol is a workspace dependency of codeoid; publish it FIRST
+      # (only when its version is new) so codeoid's published dep resolves.
+      # NOTE: requires a separate npm Trusted Publisher configured for
+      # @highflame/codeoid-protocol at npmjs.com (same OIDC setup as codeoid) before the
+      # first release that introduces a new protocol version.
+      - name: Publish @highflame/codeoid-protocol (OIDC) — only if version is new
+        run: |
+          cd packages/protocol
+          VER="$(node -p "require('./package.json').version")"
+          if npm view "@highflame/codeoid-protocol@$VER" version >/dev/null 2>&1; then
+            echo "@highflame/codeoid-protocol@$VER already published — skipping"
+          else
+            npm publish
+          fi
 
-      - name: Publish @highflame/codeoid
-        run: ./scripts/publish-if-new.sh .
+      # @highflame/codeoid-core (client transport + store semantics — consumed by the
+      # mobile app from the registry; web uses the in-repo copy). Publishes
+      # after protocol (its peer dep) and needs its own Trusted Publisher +
+      # one-time manual bootstrap publish, same as protocol.
+      - name: Publish @highflame/codeoid-core (OIDC) — only if version is new
+        run: |
+          cd packages/core
+          VER="$(node -p "require('./package.json').version")"
+          if npm view "@highflame/codeoid-core@$VER" version >/dev/null 2>&1; then
+            echo "@highflame/codeoid-core@$VER already published — skipping"
+          else
+            npm publish
+          fi
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
+      # No NODE_AUTH_TOKEN: auth comes from the GitHub OIDC id-token via npm's
+      # Trusted Publisher (configured on the package at npmjs.com). Provenance
+      # is generated automatically from the same OIDC identity.
+      - name: Publish codeoid to npm (OIDC Trusted Publishing)
+        run: npm publish
