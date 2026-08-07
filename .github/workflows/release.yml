@@ -5,14 +5,8 @@ on:
     types:
       - published
 
-<<<<<<< Updated upstream
-permissions:
-  contents: write # create the GitHub Release
-  id-token: write # npm OIDC Trusted Publishing + provenance
-=======
 env:
   REGEX_PATTERN: "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
->>>>>>> Stashed changes
 
 jobs:
   highflame-validate:
@@ -122,42 +116,6 @@ jobs:
       - name: Test
         run: bun run test
 
-<<<<<<< Updated upstream
-      # Publish order is dependency order: protocol → core → the CLI, so each
-      # tarball's declared deps are resolvable on the registry the moment it
-      # lands. No NODE_AUTH_TOKEN anywhere — auth is the GitHub OIDC id-token
-      # via each package's Trusted Publisher (configured at npmjs.com), and
-      # provenance is generated from that same identity. `--access public` is
-      # not passed: every manifest carries `publishConfig.access`, so a manual
-      # publish and this pipeline run the exact same command.
-      #
-      # A new package NAME requires one manual bootstrap publish before a
-      # Trusted Publisher can be configured for it — see RELEASING.md.
-      #
-      # Each publish is IDEMPOTENT: if this exact version is already on the
-      # registry it is skipped rather than attempted. That is not a concession to
-      # version drift — `check:versions` above already makes drift impossible.
-      # It buys two things drift-checking cannot:
-      #   • a re-run of a job that died after a partial publish (network, a
-      #     flaky test, a cancelled run) completes instead of failing on the
-      #     packages that already landed;
-      #   • the bootstrap release of a NEW package name, which is published by
-      #     hand before a Trusted Publisher can exist, does not leave a red
-      #     pipeline behind on its tag.
-      - name: Publish @highflame/codeoid-protocol
-        run: ./scripts/publish-if-new.sh packages/protocol
-
-      - name: Publish @highflame/codeoid-core
-        run: ./scripts/publish-if-new.sh packages/core
-
-      - name: Publish @highflame/codeoid
-        run: ./scripts/publish-if-new.sh .
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-=======
       - name: Verify package version matches the tag
         run: |-
           PKG="$(node -p "require('./package.json').version")"
@@ -201,4 +159,3 @@ jobs:
       # is generated automatically from the same OIDC identity.
       - name: Publish codeoid to npm (OIDC Trusted Publishing)
         run: npm publish
->>>>>>> Stashed changes
