@@ -24,10 +24,10 @@ jobs:
         id: validate_tag
         shell: bash
         run: |-
-          if [[ "${{ env.GITHUB_REF_NAME }}" =~ ${{ env.REGEX_PATTERN }} ]] ; then
-            echo "Valid version format: ${{ env.GITHUB_REF_NAME }}"
+          if [[ "${GITHUB_REF_NAME}" =~ ${{ env.REGEX_PATTERN }} ]] ; then
+            echo "Valid version format: ${GITHUB_REF_NAME}"
           else
-            echo "Invalid version format: ${{ env.GITHUB_REF_NAME }}"
+            echo "Invalid version format: ${GITHUB_REF_NAME}"
             exit 1
           fi
 
@@ -48,6 +48,7 @@ jobs:
         id: version
         env:
           RELEASE_NAME: ${{ github.event.release.name }}
+        shell: bash
         run: |-
           VERSION=$(echo "$RELEASE_NAME" | sed 's|^v||g')
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
@@ -56,6 +57,7 @@ jobs:
       - name: Update root package.json
         env:
           VERSION: ${{ steps.version.outputs.VERSION }}
+        shell: bash
         run: |-
           jq ".version = \"${VERSION}\"" package.json > package.json.tmp
           mv package.json.tmp package.json
@@ -65,6 +67,7 @@ jobs:
       - name: Update protocol package.json
         env:
           VERSION: ${{ steps.version.outputs.VERSION }}
+        shell: bash
         run: |-
           cd packages/protocol
           jq ".version = \"${VERSION}\"" package.json > package.json.tmp
@@ -75,6 +78,7 @@ jobs:
       - name: Update core package.json
         env:
           VERSION: ${{ steps.version.outputs.VERSION }}
+        shell: bash
         run: |-
           cd packages/core
           jq ".version = \"${VERSION}\"" package.json > package.json.tmp
@@ -96,9 +100,11 @@ jobs:
       # OIDC Trusted Publishing requires the npm CLI >= 11.5.1; node 22 ships
       # an older 10.x. No token after this — auth is the GitHub OIDC id-token.
       - name: Upgrade npm for Trusted Publishing
+        shell: bash
         run: npm install -g npm@latest
 
       - name: Install dependencies
+        shell: bash
         run: bun install --frozen-lockfile
 
       - name: Update the dependencies version
@@ -120,18 +126,22 @@ jobs:
       # version. One gate replaces per-package version bookkeeping: if this
       # passes, all three publishes below are known-correct and known-new.
       - name: Verify workspace versions are in lockstep with the tag
+        shell: bash
         run: bun run check:versions "${{ env.GITHUB_REF_NAME }}"
 
       - name: Build web UI
+        shell: bash
         run: |-
           cd web
           bun install --frozen-lockfile
           bun run build
 
       - name: Test
+        shell: bash
         run: bun run test
 
       - name: Verify package version matches the tag
+        shell: bash
         run: |-
           PKG="$(node -p "require('./package.json').version")"
           TAG="${GITHUB_REF_NAME#v}"
@@ -146,7 +156,8 @@ jobs:
       # @highflame/codeoid-protocol at npmjs.com (same OIDC setup as codeoid) before the
       # first release that introduces a new protocol version.
       - name: Publish @highflame/codeoid-protocol (OIDC) — only if version is new
-        run: |
+        shell: bash
+        run: |-
           cd packages/protocol
           VER="$(node -p "require('./package.json').version")"
           if npm view "@highflame/codeoid-protocol@$VER" version >/dev/null 2>&1; then
@@ -160,7 +171,8 @@ jobs:
       # after protocol (its peer dep) and needs its own Trusted Publisher +
       # one-time manual bootstrap publish, same as protocol.
       - name: Publish @highflame/codeoid-core (OIDC) — only if version is new
-        run: |
+        shell: bash
+        run: |-
           cd packages/core
           VER="$(node -p "require('./package.json').version")"
           if npm view "@highflame/codeoid-core@$VER" version >/dev/null 2>&1; then
@@ -173,4 +185,5 @@ jobs:
       # Trusted Publisher (configured on the package at npmjs.com). Provenance
       # is generated automatically from the same OIDC identity.
       - name: Publish codeoid to npm (OIDC Trusted Publishing)
+        shell: bash
         run: npm publish
