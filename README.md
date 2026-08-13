@@ -1,10 +1,10 @@
 # Codeoid
 
-[![npm version](https://img.shields.io/npm/v/codeoid?logo=npm&label=npm&color=cb3837)](https://www.npmjs.com/package/codeoid)
-[![npm downloads](https://img.shields.io/npm/dm/codeoid?logo=npm&label=downloads&color=cb3837)](https://www.npmjs.com/package/codeoid)
+[![npm version](https://img.shields.io/npm/v/@highflame/codeoid?logo=npm&label=npm&color=cb3837)](https://www.npmjs.com/package/@highflame/codeoid)
+[![npm downloads](https://img.shields.io/npm/dm/@highflame/codeoid?logo=npm&label=downloads&color=cb3837)](https://www.npmjs.com/package/@highflame/codeoid)
 [![CI](https://github.com/highflame-ai/codeoid/actions/workflows/ci.yml/badge.svg)](https://github.com/highflame-ai/codeoid/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/highflame-ai/codeoid/branch/main/graph/badge.svg)](https://codecov.io/gh/highflame-ai/codeoid)
-[![published with provenance](https://img.shields.io/badge/published%20with-provenance-2da44e?logo=npm)](https://www.npmjs.com/package/codeoid)
+[![published with provenance](https://img.shields.io/badge/published%20with-provenance-2da44e?logo=npm)](https://www.npmjs.com/package/@highflame/codeoid)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Runtime: Bun](https://img.shields.io/badge/runtime-Bun-000000.svg?logo=bun)](https://bun.sh)
 
@@ -75,7 +75,10 @@ If `codeoid` isn't found afterward, your global-bin directory isn't on `PATH` �
 
 > **Renamed.** codeoid used to publish as the unscoped `codeoid` package. It now
 > ships from the Highflame org as **`@highflame/codeoid`**; the old package is
-> deprecated on npm and stops at `0.3.4`. The command is still `codeoid`.
+> frozen at `0.3.4` and gets no further releases. The command is still `codeoid`.
+> npm cannot move a package between scopes, so this is a new package rather than
+> a transfer — `bun update` will not carry you across, and neither will anything
+> still depending on the old name.
 
 **B. From source — to hack on it.**
 Clone, then **run `bun install` before anything else**:
