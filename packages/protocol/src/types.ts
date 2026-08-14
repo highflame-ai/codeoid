@@ -98,6 +98,13 @@ export const CAPABILITIES = {
    * Expo token it sends for `PUSH`).
    */
   PUSH_NATIVE: "push.native",
+  /**
+   * The fleet board read+subscribe surface (`fleet.subscribe` →
+   * `fleet.snapshot.result` + streamed `fleet.update`). Advertised by the
+   * DAEMON; a client feature-detects before offering a conductor surface, so an
+   * older daemon degrades to chat-only rather than showing an empty board.
+   */
+  FLEET_BOARD: "fleet.board",
 } as const;
 
 export type Capability = (typeof CAPABILITIES)[keyof typeof CAPABILITIES];
@@ -901,7 +908,9 @@ export type ClientMessage =
   | PipelinePackTrustMsg
   | PipelinePackSelectMsg
   | PushRegisterMsg
-  | PushUnregisterMsg;
+  | PushUnregisterMsg
+  | FleetSubscribeMsg
+  | FleetUnsubscribeMsg;
 
 interface BaseClientMsg {
   /** Request ID for correlating responses */
@@ -1796,6 +1805,130 @@ export interface CollaborationPanelsResultMsg {
   panels: CollaborationPanel[];
 }
 
+// ── Fleet board (conductor front doors — docs/conductor-frontends-design.md §11) ─
+//
+// The conductor deliberately added ZERO client↔daemon wire types: it renders as
+// an ordinary session, its `fleet_*` calls as tool cards. That is enough to CHAT
+// with it; it is not enough to SEE the fleet, because the task board, worker
+// lifecycle and audit trail live only in daemon SQLite (`dispatch_tasks` /
+// `dispatch_events`).
+//
+// This is the one additive read+subscribe surface that closes that gap. It adds
+// no dispatch semantics — every field below is already held by the daemon.
+
+/**
+ * A dispatch task, projected for a client.
+ *
+ * Named `*Wire` per the `PipelineWire` / `PackWire` convention, and to stay
+ * distinct from the daemon-internal `FleetTaskView` in `src/daemon/fleet.ts`,
+ * which is what the conductor's own `fleet_tasks` TOOL sees. The two are
+ * deliberately different shapes: the tool view is what an LLM should read, this
+ * is what a UI needs to draw a node (worker join key, provenance, cost).
+ */
+export interface FleetTaskWire {
+  id: string;
+  kind: "send" | "spawn";
+  shape: "ship" | "scout";
+  status: "queued" | "claimed" | "running" | "done" | "failed" | "blocked";
+  attempts: number;
+  /** Epoch ms. */
+  createdAt: number;
+  /** spawn: the worker session this task created. Join key into `workers`. */
+  workerSessionId?: string;
+  /** send: the existing session this task was routed to. Join key into `workers`. */
+  targetSession?: string;
+  /** Compressed result — never a raw transcript (the never-OOC guarantee). */
+  resultDigest?: string;
+  error?: string;
+  /** Conductor WIMSE URI — who dispatched this. */
+  createdBy: string;
+  /** Dispatch group (fan-out barrier); absent = a standalone task. */
+  groupId?: string;
+  /**
+   * RESERVED and never populated in P5. The daemon has no dependency model —
+   * the conductor sequences in prose. Present so typed fan-in/join edges are a
+   * later non-breaking add rather than a wire break.
+   */
+  dependsOn?: string[];
+}
+
+/** A dispatch lifecycle event — the audit trail behind the board. */
+export interface FleetEventWire {
+  id: number;
+  taskId: string;
+  type: string;
+  /** Compressed digest of what happened. */
+  digest: string;
+  /** Epoch ms. */
+  createdAt: number;
+}
+
+/** Fleet-wide rollup, normalized across backends so one number spans vendors. */
+export interface FleetUsage {
+  /** Tasks not yet terminal (queued + claimed + running). */
+  activeTasks: number;
+  /** Tasks in `blocked` — the anti-spin failure cap tripped; needs a human. */
+  blockedTasks: number;
+  inputTokens: number;
+  outputTokens: number;
+  /** USD, summed across every backend that reports cost. */
+  totalCostUsd: number;
+}
+
+/** Everything a client needs to draw the fleet, in one payload. */
+export interface FleetSnapshot {
+  /** Absent when the tenant has no conductor session — a valid, common state. */
+  conductor?: SessionInfo;
+  /**
+   * Sessions the board references: spawned workers AND existing sessions that
+   * were dispatched to. Full `SessionInfo`, so a node renders with status,
+   * usage and backend without duplicating those fields onto the task.
+   */
+  workers: SessionInfo[];
+  /** Newest first. */
+  tasks: FleetTaskWire[];
+  /** Newest first. */
+  events: FleetEventWire[];
+  agg: FleetUsage;
+}
+
+/**
+ * An incremental board change. Carries the FULL task/event rather than a patch:
+ * a client that missed a delta still converges, and the payload is small.
+ */
+export type FleetDelta =
+  | { kind: "task"; task: FleetTaskWire; agg: FleetUsage }
+  | { kind: "event"; event: FleetEventWire; agg: FleetUsage };
+
+/** Subscribe to the fleet board: replies with a snapshot, then streams deltas. */
+export interface FleetSubscribeMsg extends BaseClientMsg {
+  type: "fleet.subscribe";
+  /** Only "tenant" today — the caller's own account+project board. */
+  scope: "tenant";
+}
+
+/**
+ * Stop the delta stream. Not in the original §11 sketch, but without it a client
+ * that navigates away from the Conductor home can only stop the stream by
+ * dropping its socket.
+ */
+export interface FleetUnsubscribeMsg extends BaseClientMsg {
+  type: "fleet.unsubscribe";
+}
+
+/** Reply to fleet.subscribe. */
+export interface FleetSnapshotResultMsg {
+  type: "fleet.snapshot.result";
+  requestId: string;
+  fleet: FleetSnapshot;
+}
+
+/** Broadcast to subscribed clients in the tenant (mirrors session.status_change). */
+export interface FleetUpdateMsg {
+  type: "fleet.update";
+  delta: FleetDelta;
+}
+
 /** One index row: what exists, at what version, by whom — never a body. */
 export interface BlackboardIndexEntry {
   /** A core kind (`spec`, `research`, …) or `extra/<key>`. */
@@ -2272,7 +2405,9 @@ export type DaemonMessage =
   | SettingsSetResultMsg
   | PipelineSnapshotMsg
   | PipelineListResultMsg
-  | PackListResultMsg;
+  | PackListResultMsg
+  | FleetSnapshotResultMsg
+  | FleetUpdateMsg;
 
 export interface AuthOkMsg {
   type: "auth.ok";

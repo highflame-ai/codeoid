@@ -32,6 +32,18 @@ export const SCOPES = {
    * interrupt it, or spawn a disposable worker on the owner's behalf.
    */
   SESSION_DISPATCH: "session:dispatch",
+  /**
+   * Subscribe a CLIENT to the fleet board — the conductor's dispatch tasks,
+   * lifecycle events, and aggregate usage (`fleet.subscribe`).
+   *
+   * Distinct from `session:read`/`session:dispatch`, which are ZeroID scopes
+   * delegated to the conductor's own AGENT identity to gate its `fleet_*` MCP
+   * tools. This one gates a human's client reading the board over the wire.
+   * Separate from `session:list` because the board exposes orchestration
+   * internals — what was dispatched, what failed, what it cost — beyond the
+   * session enumeration a watcher already gets.
+   */
+  FLEET_READ: "fleet:read",
   /** Read files and list directories under a session's workdir */
   FS_READ: "fs:read",
   /** Read the settings manifest + current (non-secret) daemon configuration */
@@ -78,6 +90,10 @@ export const OPERATOR_SCOPES: readonly Scope[] = [
   SCOPES.SESSION_SEND,
   SCOPES.SESSION_INTERRUPT,
   SCOPES.SESSION_APPROVE,
+  // An operator drives the fleet, so the conductor board is part of their job.
+  // Deliberately NOT in WATCHER_SCOPES: a read-only watcher can already see
+  // sessions, but the board is orchestration state, not session output.
+  SCOPES.FLEET_READ,
   SCOPES.FS_READ,
   SCOPES.SETTINGS_READ,
   SCOPES.PIPELINE_CREATE,

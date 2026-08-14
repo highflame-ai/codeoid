@@ -325,11 +325,21 @@ Each slice is a shippable PR that leaves both clients in a working state.
 Per [conductor-build-plan.md](./conductor-build-plan.md), `main` is ruleset-protected, so each lands as its own reviewable PR.
 User decision (2026-07-17): **docked-first** — skip the drawer/modal stepping-stone and go straight to the docked conductor surface.
 
-**P5.0 — The contract.**
+**P5.0 — The contract. ✅ SHIPPED.**
 Add `fleet.subscribe` / `fleet.snapshot.result` / `fleet.update` + the `fleet:read` scope to `@highflame/codeoid-protocol`; mirror in the Rust crate *and* add the missing `role` field.
 Daemon exposes the read surface from `dispatch_tasks` / `dispatch_events` + session population, pushing the *whole subtree* (not just active-session children).
 Ship the capability matrix as data.
-Files: daemon `src/daemon/{fleet.ts,server.ts,store.ts}` · `packages/protocol` · `crates/codeoid-protocol`.
+Files: daemon `src/daemon/{session-manager.ts,dispatch.ts,server.ts,store.ts}` · `packages/protocol` · `crates/codeoid-protocol`.
+
+As built, with three decisions the sketch above did not settle:
+
+- **`fleet.unsubscribe` was added.** Without it a client that navigates away from the Conductor home could only stop the delta stream by dropping its socket.
+- **The board change signal is one hook, not fourteen.** `DispatcherHost.onBoardChange` fires once per entry path (enqueue, group enqueue, end of tick) rather than at each individual store mutation. Every mutation happens inside one of those paths, so coverage is complete by construction and a future mutation added inside the tick cannot be missed.
+- **Deltas are exactly-once via a compound watermark.** `updated_at` is millisecond-granular and one tick routinely settles several tasks in the same millisecond, so a single cursor either drops tasks (`>`) or repeats them (`>=`). The watermark carries `taskUpdatedAt` *plus the ids already sent at exactly that millisecond*; the query stays inclusive and the id set suppresses the repeats.
+
+Two things deliberately NOT on the wire: the dispatch `prompt` and the worker `workdir`. The board renders lifecycle, and the prompt is the one task field carrying arbitrary user text to every subscribed client. `dependsOn` is present on the wire type but never populated, exactly as §11 specifies.
+
+The daemon advertises `fleet.board` (`CAPABILITIES.FLEET_BOARD`) so a client feature-detects before offering a conductor surface and an older daemon degrades to chat-only rather than showing an empty board.
 
 **P5.1 — Chat + legible fleet (zero-graph).**
 The conductor chat works the moment you can attach to it — the `role:"conductor"` session renders its transcript + prompt like any agent for free.

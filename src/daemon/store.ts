@@ -1202,6 +1202,99 @@ export class Store {
     return rows.map(rowToDispatchTask);
   }
 
+  /**
+   * Recent dispatch events for the tenant, newest first — the fleet board's
+   * audit trail (`fleet.subscribe`).
+   *
+   * Deliberately NOT `dispatchEventsPending`: that one is the conductor's
+   * delivery queue and drains as events are consumed, so a client reading it
+   * would see an audit trail that empties itself. This reads the durable log
+   * regardless of delivery state.
+   */
+  dispatchEventsRecent(
+    accountId: string,
+    projectId: string,
+    limit = 50,
+  ): DispatchEventRow[] {
+    return this.#db
+      .prepare(
+        `SELECT id, account_id AS accountId, project_id AS projectId, task_id AS taskId,
+                type, digest, created_at AS createdAt
+         FROM dispatch_events
+         WHERE account_id = ? AND project_id = ?
+         ORDER BY id DESC LIMIT ?`,
+      )
+      .all(accountId, projectId, limit) as DispatchEventRow[];
+  }
+
+  /**
+   * Task-status rollup for the tenant — the board's headline counters.
+   *
+   * Computed in SQL over the WHOLE table rather than by counting the capped
+   * task list the snapshot ships: a tenant with more than `limit` tasks would
+   * otherwise report "3 active" purely because the older ones fell off the page.
+   */
+  dispatchStatusCounts(
+    accountId: string,
+    projectId: string,
+  ): { active: number; blocked: number } {
+    const row = this.#db
+      .prepare(
+        `SELECT
+           SUM(CASE WHEN status IN ('queued','claimed','running') THEN 1 ELSE 0 END) AS active,
+           SUM(CASE WHEN status = 'blocked' THEN 1 ELSE 0 END) AS blocked
+         FROM dispatch_tasks
+         WHERE account_id = ? AND project_id = ?`,
+      )
+      .get(accountId, projectId) as { active: number | null; blocked: number | null };
+    // SUM over zero rows is NULL, not 0.
+    return { active: row.active ?? 0, blocked: row.blocked ?? 0 };
+  }
+
+  /**
+   * Tasks whose row changed at or after `since` — the delta feed behind
+   * `fleet.update`.
+   *
+   * Inclusive (`>=`) on purpose. `updated_at` is millisecond-granular and a
+   * single tick can settle several tasks within the same millisecond, so an
+   * exclusive bound would drop every task that shared a timestamp with the
+   * watermark. Re-sending a task the client already has is harmless — a delta
+   * carries the whole row and is idempotent by construction — whereas dropping
+   * one strands a node in a stale state until the next unrelated change.
+   */
+  dispatchTasksUpdatedSince(
+    accountId: string,
+    projectId: string,
+    since: number,
+  ): DispatchTaskRow[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT * FROM dispatch_tasks
+         WHERE account_id = ? AND project_id = ? AND updated_at >= ?
+         ORDER BY updated_at ASC`,
+      )
+      .all(accountId, projectId, since) as RawDispatchRow[];
+    return rows.map(rowToDispatchTask);
+  }
+
+  /** Events with an id greater than `sinceId` — strictly increasing, so an
+   *  exclusive bound is correct here (unlike the timestamp above). */
+  dispatchEventsSince(
+    accountId: string,
+    projectId: string,
+    sinceId: number,
+  ): DispatchEventRow[] {
+    return this.#db
+      .prepare(
+        `SELECT id, account_id AS accountId, project_id AS projectId, task_id AS taskId,
+                type, digest, created_at AS createdAt
+         FROM dispatch_events
+         WHERE account_id = ? AND project_id = ? AND id > ?
+         ORDER BY id ASC`,
+      )
+      .all(accountId, projectId, sinceId) as DispatchEventRow[];
+  }
+
   /** Count of live (claimed/running) spawn tasks — the concurrency-cap read. */
   dispatchActiveSpawnCount(accountId: string, projectId: string): number {
     const row = this.#db

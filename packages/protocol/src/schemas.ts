@@ -362,6 +362,22 @@ export const collaborationPanelsSchema = z.object({
   sessionId: sessionIdField,
 });
 
+/**
+ * Fleet board subscribe/unsubscribe. `scope` is a closed literal rather than a
+ * free string so widening it later ("machine", "account") is an explicit,
+ * reviewable protocol change instead of something a client can just ask for.
+ */
+export const fleetSubscribeSchema = z.object({
+  ...base,
+  type: z.literal("fleet.subscribe"),
+  scope: z.literal("tenant"),
+});
+
+export const fleetUnsubscribeSchema = z.object({
+  ...base,
+  type: z.literal("fleet.unsubscribe"),
+});
+
 export const blackboardIndexSchema = z.object({
   ...base,
   type: z.literal("blackboard.index"),
@@ -662,6 +678,8 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   pipelinePackSelectSchema,
   pushRegisterSchema,
   pushUnregisterSchema,
+  fleetSubscribeSchema,
+  fleetUnsubscribeSchema,
 ]);
 
 /**

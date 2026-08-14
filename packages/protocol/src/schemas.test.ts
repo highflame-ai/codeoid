@@ -173,6 +173,8 @@ const samples: { [T in ClientTypes]: Extract<ClientMessage, { type: T }> } = {
   "pipeline.pack.select": { type: "pipeline.pack.select", id: "r43", packId: "aif-sdlc" },
   "push.register": { type: "push.register", id: "r44", token: "ExponentPushToken[abc]", platform: "ios" },
   "push.unregister": { type: "push.unregister", id: "r45", token: "ExponentPushToken[abc]" },
+  "fleet.subscribe": { type: "fleet.subscribe", id: "r46", scope: "tenant" },
+  "fleet.unsubscribe": { type: "fleet.unsubscribe", id: "r47" },
 };
 
 describe("fidelity — valid samples round-trip unchanged", () => {
