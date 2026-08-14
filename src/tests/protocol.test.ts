@@ -456,6 +456,10 @@ describe("DaemonMessage routing", () => {
           return `pipeline.list:${msg.pipelines.length}`;
         case "pipeline.pack.list.result":
           return `pack.list:${msg.installed.length}/${msg.available.length}`;
+        case "fleet.snapshot.result":
+          return `fleet:${msg.fleet.tasks.length}`;
+        case "fleet.update":
+          return `fleet.update:${msg.delta.kind}`;
       }
     };
 

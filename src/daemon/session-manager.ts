@@ -116,6 +116,9 @@ import type {
   CollaborationPanel,
   CollaborationRole,
   DaemonMessage,
+  FleetEventWire,
+  FleetTaskWire,
+  FleetUsage,
   McpServerStatus,
   ModelInfo,
   PipelinePhaseWire,
@@ -204,6 +207,85 @@ function normalizeWorkdir(input: string): string | null {
  */
 const PANEL_HISTORY_LIMIT = 5;
 
+/**
+ * Board page sizes for `fleet.subscribe`. The snapshot is a UI payload, not an
+ * archive — deeper history is the dispatch-timeline lens (P5.4), which pages.
+ */
+const FLEET_TASK_LIMIT = 100;
+const FLEET_EVENT_LIMIT = 50;
+
+/** Composite tenant key. Both halves are UUIDs, so ":" cannot collide. */
+function tenantKey(accountId: string, projectId: string): string {
+  return `${accountId}:${projectId}`;
+}
+
+/**
+ * How far a tenant's board has been streamed to its subscribers.
+ *
+ * `taskUpdatedAt` alone is not enough to be exactly-once. `updated_at` is
+ * millisecond-granular and one dispatcher tick routinely settles several tasks
+ * inside the same millisecond, which leaves only bad options for a single
+ * cursor: an exclusive `>` bound DROPS every task that shares the boundary
+ * millisecond (a node stuck in a stale state until something unrelated moves
+ * it), and an inclusive `>=` bound RE-SENDS them on every subsequent flush.
+ *
+ * `sentAtWatermark` closes that gap: the ids already delivered at exactly
+ * `taskUpdatedAt`. The query stays inclusive so nothing is dropped, and this
+ * set suppresses the repeats. It only ever holds the tasks sharing one
+ * millisecond, so it stays small and is rebuilt on every advance.
+ */
+interface FleetWatermark {
+  taskUpdatedAt: number;
+  sentAtWatermark: Set<string>;
+  eventId: number;
+}
+
+/** Rebuild the watermark after delivering `tasks`. */
+function advanceWatermark(mark: FleetWatermark, tasks: readonly DispatchTaskRow[]): void {
+  for (const t of tasks) {
+    if (t.updatedAt > mark.taskUpdatedAt) {
+      mark.taskUpdatedAt = t.updatedAt;
+      mark.sentAtWatermark = new Set();
+    }
+    if (t.updatedAt === mark.taskUpdatedAt) mark.sentAtWatermark.add(t.id);
+  }
+}
+
+/**
+ * Project a stored dispatch row onto the wire.
+ *
+ * Drops `prompt`, `workdir`, `claimOwner`, `notBefore` and the lease fields:
+ * the board draws lifecycle, and the prompt is the one field here that can
+ * carry arbitrary user content into every subscribed client. `dependsOn` is
+ * intentionally never set — see FleetTaskWire.
+ */
+function toFleetTaskWire(row: DispatchTaskRow): FleetTaskWire {
+  return {
+    id: row.id,
+    kind: row.kind,
+    shape: row.shape,
+    status: row.status as FleetTaskWire["status"],
+    attempts: row.attempts,
+    createdAt: row.createdAt,
+    workerSessionId: row.workerSessionId ?? undefined,
+    targetSession: row.targetSession ?? undefined,
+    resultDigest: row.resultDigest ?? undefined,
+    error: row.error ?? undefined,
+    createdBy: row.createdBy,
+    groupId: row.groupId ?? undefined,
+  };
+}
+
+function toFleetEventWire(row: DispatchEventRow): FleetEventWire {
+  return {
+    id: row.id,
+    taskId: row.taskId,
+    type: row.type,
+    digest: row.digest,
+    createdAt: row.createdAt,
+  };
+}
+
 const RESUME_MAX_SESSIONS = 50;
 const RESUME_DEADLINE_MS = 20_000;
 /** Per-session transcript read budget on resume. Scrollback keeps at most
@@ -250,6 +332,16 @@ export class SessionManager {
   #config?: CodeoidConfig;
   #compressionRegistry?: CompressionRegistry;
   #dispatcher: Dispatcher;
+  /**
+   * clientId → fleet board subscription. Keyed by client, not by tenant, so a
+   * disconnect reaps in O(1) and one client can never hold two subscriptions.
+   */
+  readonly #fleetSubscribers = new Map<
+    string,
+    { client: AttachedClient; accountId: string; projectId: string }
+  >();
+  /** tenant key → how far the board has been streamed. See #flushFleetDeltas. */
+  readonly #fleetWatermarks = new Map<string, FleetWatermark>();
   /** Content-blind push notifications — resolves a blocked session's owner to
    *  their registered devices. Noop transport when push is disabled (default). */
   #pushService: PushService;
@@ -889,6 +981,10 @@ mcpHub: this.#mcpHub,
         return this.#blackboardRead(msg, auth);
       case "collaboration.panels":
         return this.#collaborationPanels(msg, auth);
+      case "fleet.subscribe":
+        return this.#fleetSubscribe(msg, auth, client);
+      case "fleet.unsubscribe":
+        return this.#fleetUnsubscribe(msg, client);
       case "models.list":
         return this.#modelsList(msg);
       case "session.export":
@@ -1809,6 +1905,9 @@ mcpHub: this.#mcpHub,
     for (const session of this.#sessions.values()) {
       session.detach(clientId);
     }
+    // Also drop any fleet subscription — otherwise a dead socket keeps getting
+    // deltas pushed at it for the life of the daemon.
+    this.#fleetSubscribers.delete(clientId);
   }
 
   /** Get a session by name within the caller's tenant (for Telegram convenience).
@@ -3826,7 +3925,184 @@ mcpHub: this.#mcpHub,
       audit: (action: string, detail: string): void => {
         this.#store.audit("system:dispatch", action, undefined, detail);
       },
+
+      onBoardChange: (): void => {
+        this.#flushFleetDeltas();
+      },
     };
+  }
+
+  // ── Fleet board (docs/conductor-frontends-design.md §11) ──────────────────
+
+  /**
+   * Emit deltas to every fleet subscriber whose tenant board moved.
+   *
+   * Per-tenant watermarks rather than one global cursor: two tenants share a
+   * daemon and a dispatcher tick, so a global cursor would let one tenant's
+   * activity advance past another's unread rows and silently starve its board.
+   *
+   * Cheap when idle — with no subscribers it does not touch the database at
+   * all, which matters because the dispatcher calls this on every tick.
+   */
+  #flushFleetDeltas(): void {
+    if (this.#fleetSubscribers.size === 0) return;
+
+    // Distinct tenants currently being watched.
+    const tenants = new Map<string, { accountId: string; projectId: string }>();
+    for (const sub of this.#fleetSubscribers.values()) {
+      tenants.set(tenantKey(sub.accountId, sub.projectId), {
+        accountId: sub.accountId,
+        projectId: sub.projectId,
+      });
+    }
+
+    for (const [key, { accountId, projectId }] of tenants) {
+      const mark = this.#fleetWatermarks.get(key);
+      // No watermark means nobody has taken a snapshot for this tenant yet, so
+      // there is no baseline to diff against. Skip rather than replay the whole
+      // board as "changes".
+      if (!mark) continue;
+
+      // Inclusive query (nothing dropped) minus what was already delivered at
+      // exactly the boundary millisecond (nothing repeated). See FleetWatermark.
+      const tasks = this.#store
+        .dispatchTasksUpdatedSince(accountId, projectId, mark.taskUpdatedAt)
+        .filter((t) => !(t.updatedAt === mark.taskUpdatedAt && mark.sentAtWatermark.has(t.id)));
+      const events = this.#store.dispatchEventsSince(accountId, projectId, mark.eventId);
+      if (tasks.length === 0 && events.length === 0) continue;
+
+      // Recompute the rollup ONCE per tenant and attach it to each delta, so a
+      // client's counters stay consistent with the rows it just received
+      // without issuing a follow-up read.
+      const agg = this.#fleetUsage(accountId, projectId);
+
+      for (const task of tasks) {
+        this.#sendToFleetSubscribers(accountId, projectId, {
+          type: "fleet.update",
+          delta: { kind: "task", task: toFleetTaskWire(task), agg },
+        });
+      }
+      advanceWatermark(mark, tasks);
+      for (const event of events) {
+        this.#sendToFleetSubscribers(accountId, projectId, {
+          type: "fleet.update",
+          delta: { kind: "event", event: toFleetEventWire(event), agg },
+        });
+        if (event.id > mark.eventId) mark.eventId = event.id;
+      }
+    }
+  }
+
+  #sendToFleetSubscribers(accountId: string, projectId: string, msg: DaemonMessage): void {
+    for (const sub of this.#fleetSubscribers.values()) {
+      if (sub.accountId !== accountId || sub.projectId !== projectId) continue;
+      try {
+        sub.client.send(msg);
+      } catch {
+        /* client may have disconnected mid-broadcast; disconnectClient reaps it */
+      }
+    }
+  }
+
+  /** Task-status + cost rollup for the tenant's board. */
+  #fleetUsage(accountId: string, projectId: string): FleetUsage {
+    const counts = this.#store.dispatchStatusCounts(accountId, projectId);
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let totalCostUsd = 0;
+    for (const session of this.#sessions.values()) {
+      if (session.accountId !== accountId || session.projectId !== projectId) continue;
+      const usage = session.toInfo().usage;
+      if (!usage) continue;
+      inputTokens += usage.inputTokens ?? 0;
+      outputTokens += usage.outputTokens ?? 0;
+      totalCostUsd += usage.totalCostUsd ?? 0;
+    }
+    return {
+      activeTasks: counts.active,
+      blockedTasks: counts.blocked,
+      inputTokens,
+      outputTokens,
+      totalCostUsd,
+    };
+  }
+
+  /**
+   * Snapshot + subscribe. Replies with the whole board and starts streaming
+   * deltas; the watermark is taken from the snapshot so no change can slip
+   * through the gap between the two.
+   */
+  #fleetSubscribe(
+    msg: Extract<ClientMessage, { type: "fleet.subscribe" }>,
+    auth: AuthContext,
+    client: AttachedClient,
+  ): DaemonMessage {
+    if (!hasScope(auth.scopes as string[], SCOPES.FLEET_READ)) {
+      return {
+        type: "response.error",
+        requestId: msg.id,
+        error: "Missing scope: fleet:read",
+        code: "forbidden",
+      };
+    }
+
+    const { accountId, projectId } = auth;
+    const taskRows = this.#store.dispatchListForTenant(accountId, projectId, FLEET_TASK_LIMIT);
+    const eventRows = this.#store.dispatchEventsRecent(accountId, projectId, FLEET_EVENT_LIMIT);
+
+    // Sessions the board references — spawned workers AND existing sessions a
+    // send was routed to — plus the conductor. Full SessionInfo so a node
+    // renders with status/usage/backend without duplicating them onto the task.
+    const referenced = new Set<string>();
+    for (const t of taskRows) {
+      if (t.workerSessionId) referenced.add(t.workerSessionId);
+      if (t.targetSession) referenced.add(t.targetSession);
+    }
+    let conductor: SessionInfo | undefined;
+    const workers: SessionInfo[] = [];
+    for (const session of this.#sessions.values()) {
+      if (session.accountId !== accountId || session.projectId !== projectId) continue;
+      const info = { ...session.toInfo(), attachedClients: session.attachedClientCount };
+      if (info.role === "conductor") conductor = info;
+      if (referenced.has(session.id)) workers.push(info);
+    }
+
+    // Watermark BEFORE registering: taken from the rows just read, so a task
+    // that moves between this read and the subscriber landing in the map is
+    // still picked up by the next flush rather than being skipped.
+    const mark: FleetWatermark = {
+      taskUpdatedAt: 0,
+      sentAtWatermark: new Set(),
+      eventId: eventRows.reduce((max, e) => (e.id > max ? e.id : max), 0),
+    };
+    // Seeded from the very rows this snapshot ships, so the first delta flush
+    // neither replays them nor skips a task that shares their millisecond.
+    advanceWatermark(mark, taskRows);
+    this.#fleetWatermarks.set(tenantKey(accountId, projectId), mark);
+    this.#fleetSubscribers.set(client.id, { client, accountId, projectId });
+
+    return {
+      type: "fleet.snapshot.result",
+      requestId: msg.id,
+      fleet: {
+        conductor,
+        workers,
+        tasks: taskRows.map(toFleetTaskWire),
+        events: eventRows.map(toFleetEventWire),
+        agg: this.#fleetUsage(accountId, projectId),
+      },
+    };
+  }
+
+  #fleetUnsubscribe(
+    msg: Extract<ClientMessage, { type: "fleet.unsubscribe" }>,
+    client: AttachedClient,
+  ): DaemonMessage {
+    // Deliberately not scope-gated: dropping your own subscription is never a
+    // privileged act, and a token that lost fleet:read mid-connection must
+    // still be able to stop the stream.
+    this.#fleetSubscribers.delete(client.id);
+    return { type: "response.ok", requestId: msg.id };
   }
 
   /**

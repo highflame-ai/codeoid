@@ -397,8 +397,10 @@ resolves against the owner's tenancy, so no ownership hack is needed.
   embedded, direct `SessionManager` access). The owner DMs the bot; the message is
   routed to the conductor session. No new channel needed for v1. (Web UI cockpit
   remains the visual view.)
-  **Status: designed, not built.** [conductor-frontends-design.md](./conductor-frontends-design.md) specifies both; neither is implemented — Telegram has no conductor routing and the web UI has no conductor pane, so the only front door today is `codeoid attach conductor` in a terminal.
-  This is the single largest gap between "the feature is implemented" and "the feature is usable", and it is also what generates the usage the rest of the design assumes.
+  **Status: the contract is built; the surfaces are not.** [conductor-frontends-design.md](./conductor-frontends-design.md) specifies both.
+  **P5.0 has landed**: `fleet.subscribe` → `fleet.snapshot.result` + streamed `fleet.update`, gated on the new `fleet:read` scope, advertised as the `fleet.board` capability, and mirrored in the Rust `codeoid-protocol` crate (which also gained the `SessionInfo.role` field it was missing).
+  Clients can now read and follow the board — but **no client draws it yet** (P5.1–P5.4): Telegram has no conductor routing and the web UI has no conductor pane, so the only front door today is still `codeoid attach conductor` in a terminal.
+  This remains the single largest gap between "the feature is implemented" and "the feature is usable", and it is also what generates the usage the rest of the design assumes.
 - **Wake model:** the conductor is event-driven. Wake sources:
   1. owner message (Telegram/Web),
   2. child-session completion (daemon emits an event → conductor turn),

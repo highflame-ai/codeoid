@@ -97,6 +97,20 @@ export interface DispatcherHost {
     events: DispatchEventRow[],
   ): Promise<readonly number[]>;
   audit(action: string, detail: string): void;
+  /**
+   * The task board changed — fleet subscribers need deltas
+   * (docs/conductor-frontends-design.md §11).
+   *
+   * Signalled once per entry path (enqueue, group enqueue, end of tick) rather
+   * than at each of the ~14 individual store mutations. Every mutation happens
+   * inside one of those paths, so this is complete by construction and cannot
+   * be missed by a future mutation added inside the tick. The host derives the
+   * precise deltas from its own watermark; this only says "something moved".
+   *
+   * Optional: a host with no connected clients (tests, a Telegram-only daemon)
+   * simply omits it.
+   */
+  onBoardChange?(): void;
 }
 
 /**
@@ -239,6 +253,7 @@ export class Dispatcher {
       `task=${id} kind=${input.kind} shape=${input.shape} target=${input.targetSession ?? input.workdir ?? "-"}` +
         `${input.provider ? ` provider=${input.provider}` : ""}${input.model ? ` model=${input.model}` : ""}`,
     );
+    this.#signalBoardChange();
     return id;
   }
 
@@ -306,6 +321,7 @@ export class Dispatcher {
         .join(",")
         .slice(0, 300)}`,
     );
+    this.#signalBoardChange();
     return { groupId, taskIds };
   }
 
@@ -328,6 +344,22 @@ export class Dispatcher {
       );
     } finally {
       this.#ticking = false;
+      // In `finally`, and after `#ticking` is cleared: a tick that threw
+      // part-way through has still usually moved some tasks, and a board that
+      // silently stopped updating after one bad tick is worse than a delta the
+      // client can reconcile. Never allowed to throw into the tick.
+      this.#signalBoardChange();
+    }
+  }
+
+  /** Tell the host the board moved. Failure here must never break dispatch. */
+  #signalBoardChange(): void {
+    try {
+      this.#host.onBoardChange?.();
+    } catch (err) {
+      console.error(
+        `[codeoid/dispatch] board-change notify failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }
 

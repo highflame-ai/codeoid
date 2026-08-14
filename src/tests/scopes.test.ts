@@ -15,8 +15,8 @@ import {
 } from "../protocol/scopes.js";
 
 describe("SCOPES constants", () => {
-  test("all 17 scopes are defined", () => {
-    expect(Object.keys(SCOPES)).toHaveLength(17);
+  test("all 18 scopes are defined", () => {
+    expect(Object.keys(SCOPES)).toHaveLength(18);
     expect(SCOPES.SESSION_CREATE).toBe("session:create");
     expect(SCOPES.SESSION_ATTACH).toBe("session:attach");
     expect(SCOPES.SESSION_WATCH).toBe("session:watch");
@@ -27,6 +27,7 @@ describe("SCOPES constants", () => {
     expect(SCOPES.SESSION_LIST).toBe("session:list");
     expect(SCOPES.SESSION_READ).toBe("session:read");
     expect(SCOPES.SESSION_DISPATCH).toBe("session:dispatch");
+    expect(SCOPES.FLEET_READ).toBe("fleet:read");
     expect(SCOPES.FS_READ).toBe("fs:read");
     expect(SCOPES.SETTINGS_READ).toBe("settings:read");
     expect(SCOPES.SETTINGS_WRITE).toBe("settings:write");
@@ -36,8 +37,8 @@ describe("SCOPES constants", () => {
     expect(SCOPES.PIPELINE_MANAGE).toBe("pipeline:manage");
   });
 
-  test("ALL_SCOPES contains all 17", () => {
-    expect(ALL_SCOPES).toHaveLength(17);
+  test("ALL_SCOPES contains all 18", () => {
+    expect(ALL_SCOPES).toHaveLength(18);
     for (const scope of Object.values(SCOPES)) {
       expect(ALL_SCOPES).toContain(scope);
     }
@@ -45,7 +46,7 @@ describe("SCOPES constants", () => {
 
   test("ALL_SCOPES_STRING is space-delimited", () => {
     const parts = ALL_SCOPES_STRING.split(" ");
-    expect(parts).toHaveLength(17);
+    expect(parts).toHaveLength(18);
     for (const scope of ALL_SCOPES) {
       expect(parts).toContain(scope);
     }
