@@ -1785,10 +1785,24 @@ export class Session {
       // because the loop never exits.
       if (effectivePriority !== "later") this.#pendingMidTurnCount++;
       this.#activeRun.pushMidTurn(effectivePrompt, effectivePriority);
-      // Keep waiting_approval visible — the approval is still pending and
-      // every frontend keys its approval bar off it; the queued text is
-      // consumed after the user answers.
-      if (this.#status !== "waiting_approval") this.#setStatus("thinking");
+      // Keep waiting_approval AND tool_running visible. Both are real states the
+      // push does not end, and both are load-bearing in two places:
+      //
+      //   • Frontends key off them — the approval bar off waiting_approval, the
+      //     running-tool card off tool_running. Flipping to "thinking" made the
+      //     session header disagree with the tool card still showing "executing".
+      //   • #watchdogPaused() keys off them. A tool that is genuinely executing
+      //     is a LEGITIMATELY silent run, which is why the stall watchdog pauses
+      //     there. Overwriting the status silently re-armed that watchdog against
+      //     a healthy long tool — a big sweep or build would be force-recovered
+      //     mid-flight at the stall window, taking the user's just-queued message
+      //     down with it. Typing while a tool runs must never shorten its leash.
+      //
+      // Anything else (thinking, idle) becomes thinking: the push does start
+      // model work there.
+      if (this.#status !== "waiting_approval" && this.#status !== "tool_running") {
+        this.#setStatus("thinking");
+      }
       this.#broadcastInfoUpdate();
       return;
     }
