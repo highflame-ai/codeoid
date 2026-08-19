@@ -539,18 +539,48 @@ export const ORCHESTRATOR_FLEET_TOOLS: ReadonlySet<string> = new Set([
   "fleet_panel",
 ]);
 
+export interface FleetToolOpts {
+  /**
+   * Restrict the exposed tools to these names. Absent = the full conductor
+   * surface. Filtering here rather than building a second server keeps one
+   * definition of every tool's schema and description, so the orchestrator
+   * can never drift into a differently-worded `fleet_send`.
+   */
+  tools?: ReadonlySet<string>;
+}
+
+/**
+ * The tool definitions the fleet server exposes, after filtering.
+ *
+ * Split out of `buildFleetMcpServer` so the filter can be asserted directly.
+ * The alternative — reading the built server's `instance._registeredTools` —
+ * couples a test to a PRIVATE field of the MCP SDK, which breaks on an SDK
+ * upgrade and, worse, silently reads the wrong shape whenever another test file
+ * has installed a process-global `mock.module` for the agent SDK (bun's module
+ * mocks leak across files in a run, so this depended on test ORDER).
+ *
+ * `buildFleetMcpServer` passes this array through verbatim, so asserting on it
+ * still proves what actually reaches the model.
+ */
+export function fleetToolDefinitions(
+  deps: FleetDeps,
+  opts?: FleetToolOpts,
+): Array<{ name: string }> {
+  return buildFleetTools(deps, opts);
+}
+
 export function buildFleetMcpServer(
   deps: FleetDeps,
-  opts?: {
-    /**
-     * Restrict the exposed tools to these names. Absent = the full conductor
-     * surface. Filtering here rather than building a second server keeps one
-     * definition of every tool's schema and description, so the orchestrator
-     * can never drift into a differently-worded `fleet_send`.
-     */
-    tools?: ReadonlySet<string>;
-  },
+  opts?: FleetToolOpts,
 ): McpSdkServerConfigWithInstance {
+  return createSdkMcpServer({
+    name: "codeoid-fleet",
+    version: "0.1.0",
+    tools: buildFleetTools(deps, opts) as never,
+  });
+}
+
+function buildFleetTools(deps: FleetDeps, opts?: FleetToolOpts) {
   const handlers = createFleetHandlers(deps);
   const text = (payload: string) => ({
     content: [{ type: "text" as const, text: payload }],
@@ -559,10 +589,7 @@ export function buildFleetMcpServer(
   const pick = <T extends { name: string }>(tools: T[]): T[] =>
     allowed ? tools.filter((t) => allowed.has(t.name)) : tools;
 
-  return createSdkMcpServer({
-    name: "codeoid-fleet",
-    version: "0.1.0",
-    tools: pick([
+  return pick([
       tool(
         "fleet_list",
         "List every session in the fleet, grouped by workspace — names, status, provider, attached clients. Your view of what exists right now.",
@@ -663,6 +690,5 @@ export function buildFleetMcpServer(
         },
         async ({ session }) => text(await handlers.fleet_interrupt({ session })),
       ),
-    ]),
-  });
+  ]);
 }

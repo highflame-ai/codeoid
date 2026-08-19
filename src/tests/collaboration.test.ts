@@ -48,6 +48,7 @@ import { TranscriptStore } from "../daemon/transcript.js";
 import { roleDeniesTool } from "../daemon/providers/tool-safety.js";
 import {
   buildFleetMcpServer,
+  fleetToolDefinitions,
   FLEET_SEND_TOOL_NAMES,
   FLEET_TOOL_NAMES,
   isFleetSendTool,
@@ -2366,24 +2367,42 @@ describe("ORCHESTRATOR_FLEET_TOOLS", () => {
     }
   });
 
-  test("the BUILT server registers exactly those tools, not just the constant", () => {
+  test("the BUILT surface exposes exactly those tools, not just the constant", () => {
     // Asserting the constant alone would pass while `pick()` silently ignored
     // it — the filter is what actually reaches the model.
+    //
+    // Reads the definitions the builder passes through, NOT the built server's
+    // `instance._registeredTools`. That private MCP-SDK field breaks on an SDK
+    // upgrade, and — the reason this changed — it silently reads the wrong
+    // shape whenever another test file has installed a process-global
+    // `mock.module("@anthropic-ai/claude-agent-sdk")`. Bun's module mocks leak
+    // across files in a run, so the old assertion passed or threw purely on
+    // test file ORDER (provider-claude.test.ts installs exactly such a mock,
+    // whose fake server has `instance.tools` and no `_registeredTools`).
     const deps = { listSessions: () => [], audit: () => {}, conductorSessionId: () => "g" };
-    const registered = (server: unknown) =>
-      Object.keys(
-        (server as { instance: { _registeredTools: Record<string, unknown> } }).instance
-          ._registeredTools,
-      ).sort();
+    const names = (opts?: { tools: ReadonlySet<string> }) =>
+      fleetToolDefinitions(deps as never, opts).map((t) => t.name).sort();
 
-    expect(
-      registered(buildFleetMcpServer(deps as never, { tools: ORCHESTRATOR_FLEET_TOOLS })),
-    ).toEqual(["fleet_interrupt", "fleet_list", "fleet_panel", "fleet_send", "fleet_tasks"]);
+    expect(names({ tools: ORCHESTRATOR_FLEET_TOOLS })).toEqual([
+      "fleet_interrupt",
+      "fleet_list",
+      "fleet_panel",
+      "fleet_send",
+      "fleet_tasks",
+    ]);
     // ...and the unfiltered conductor build still gets everything, so `pick()`
     // is a filter rather than a truncation.
-    expect(registered(buildFleetMcpServer(deps as never))).toEqual(
-      [...FLEET_TOOL_NAMES, ...FLEET_SEND_TOOL_NAMES].sort(),
-    );
+    expect(names()).toEqual([...FLEET_TOOL_NAMES, ...FLEET_SEND_TOOL_NAMES].sort());
+  });
+
+  test("the built MCP server is still wired from those same definitions", () => {
+    // Guards the seam the refactor introduced: `fleetToolDefinitions` would be
+    // worthless if `buildFleetMcpServer` stopped using it. Asserts only the
+    // SDK's PUBLIC config shape, so it holds under a real or mocked SDK.
+    const deps = { listSessions: () => [], audit: () => {}, conductorSessionId: () => "g" };
+    const server = buildFleetMcpServer(deps as never, { tools: ORCHESTRATOR_FLEET_TOOLS });
+    expect(server.name).toBe("codeoid-fleet");
+    expect(server.type).toBe("sdk");
   });
 
   test("its send-class tools still trip the R3 hard approval gate", () => {
