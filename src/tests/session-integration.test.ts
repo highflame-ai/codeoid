@@ -1706,6 +1706,107 @@ describe("T10 – send during waiting_approval", () => {
     await session.interrupt(TEST_AUTH);
   });
 
+  it("a mid-turn push during a RUNNING tool leaves the status at tool_running", async () => {
+    // The reported symptom: type while Claude is working and the session goes
+    // quiet. A tool that is genuinely executing is a legitimately-silent state,
+    // and the stall watchdog pauses on `tool_running` for exactly that reason
+    // (#watchdogPaused). Flipping the status to "thinking" on a mid-turn push
+    // silently UNPAUSES it, so a long tool — a Snowflake sweep, a big build —
+    // gets force-recovered at the stall window with the user's queued message
+    // still in it. It also makes every frontend disagree with itself: the tool
+    // card says "executing" while the session header says "thinking".
+    //
+    // waiting_approval already had this carve-out (test above). tool_running is
+    // the same situation for the same reason.
+    const provider = new MockSessionProvider(
+      "claude",
+      [
+        [
+          {
+            type: "tool_start",
+            toolId: "long-sweep",
+            sdkToolUseId: "sdk-long-sweep",
+            name: "Read",
+            input: { file_path: "/big/repo/sweep-results.csv" },
+            approvalId: "ap-long-sweep",
+          },
+        ],
+      ],
+      { stall: true, midTurn: true },
+    );
+    const session = makeSession(provider, "t10-midturn-tool");
+    const { client } = makeClient();
+    session.attach(client);
+
+    await session.send("run the sweep", TEST_AUTH);
+    await waitForStatus(session, "tool_running", 4000);
+
+    // The user adds context while the tool is still running.
+    await session.send("also get me the per-client numbers", TEST_AUTH);
+
+    // Queued into the live run, as designed…
+    expect(provider.midTurnPushes.length).toBe(1);
+    expect(provider.midTurnPushes[0]!.content).toContain("per-client numbers");
+    expect(provider.capturedOpts.length).toBe(1);
+    expect(provider.teardownCount).toBe(0);
+
+    // …and the tool is still executing, so the status must still say so —
+    // otherwise the watchdog starts counting against a healthy tool.
+    expect(session.status).toBe("tool_running");
+
+    await session.interrupt(TEST_AUTH);
+  });
+
+  it("a mid-turn push does not re-arm the stall watchdog against a running tool", async () => {
+    // The damage the status flip actually caused. The watchdog pauses while a
+    // tool executes because silence there is expected. Flipping to "thinking"
+    // on a mid-turn push re-armed it, so once the stall window lapsed the run
+    // was force-recovered — killing a healthy tool AND the message the user had
+    // just queued into it. Short stall window so the test can outlive it.
+    const provider = new MockSessionProvider(
+      "claude",
+      [
+        [
+          {
+            type: "tool_start",
+            toolId: "long-sweep-2",
+            sdkToolUseId: "sdk-long-sweep-2",
+            name: "Read",
+            input: { file_path: "/big/repo/huge.csv" },
+            approvalId: "ap-long-sweep-2",
+          },
+        ],
+      ],
+      { stall: true, midTurn: true },
+    );
+    const session = makeSession(provider, "t10-midturn-nostall", stallConfig(80));
+    const { client, received } = makeClient();
+    session.attach(client);
+
+    await session.send("read the huge file", TEST_AUTH);
+    await waitForStatus(session, "tool_running", 4000);
+
+    await session.send("and summarize the totals", TEST_AUTH);
+    expect(provider.midTurnPushes.length).toBe(1);
+
+    // Sit well past the stall window with the tool still running.
+    await new Promise<void>((r) => setTimeout(r, 400));
+
+    // The run must be untouched: no stall recovery, no provider teardown, no
+    // second turn started behind the user's back.
+    const stalledMsg = received.find(
+      (m) =>
+        m.type === "session.message" &&
+        /timed out|stalled/i.test((m as { content?: string }).content ?? ""),
+    );
+    expect(stalledMsg).toBeUndefined();
+    expect(provider.teardownCount).toBe(0);
+    expect(provider.capturedOpts.length).toBe(1);
+    expect(session.status).toBe("tool_running");
+
+    await session.interrupt(TEST_AUTH);
+  });
+
   it("rejects the send loudly on a backend without mid-turn injection (never auto-denies)", async () => {
     const provider = new MockSessionProvider("claude", approvalToolStart("ap-t10-b"), {
       stall: true,
