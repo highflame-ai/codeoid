@@ -83,6 +83,7 @@ import type { Attachment } from "../protocol/types.js";
 import { resolveAttachments } from "./attachments.js";
 import type { CodeoidConfig } from "../config.js";
 import type { CompressionRegistry } from "./compress/index.js";
+import { PRIMARY_CHAIN, RepeatToolGuard } from "./guard/index.js";
 import {
   CLAUDE_PROVIDER_ID,
   findModel,
@@ -373,6 +374,13 @@ export class Session {
   #compressionRegistry?: CompressionRegistry;
   #onModels?: SessionCreateOptions["onModels"];
   #hookBus?: HookBus;
+  /**
+   * Advisory loop-breaker. Watches `tool_start` for runs of consecutive
+   * identical calls and injects a reminder — never blocks. Undefined when the
+   * guard is disabled, or when its config failed validation (the guard is
+   * optional, so a bad threshold list must not take the session down).
+   */
+  #repeatGuard?: RepeatToolGuard;
 
   #status: SessionStatus = "idle";
   /** True from an interrupt() until the next turn STARTS. An interrupt leaves
@@ -702,6 +710,19 @@ export class Session {
     this.#compressionRegistry = opts.compressionRegistry;
     this.#onModels = opts.onModels;
     this.#hookBus = opts.hooks;
+    // Advisory guard. Config is validated in the guard constructor and fails
+    // loud there; here we degrade to "no guard" and log, because an advisory
+    // plugin must never be the reason a session refuses to start.
+    const repeatCfg = opts.config?.guard?.repeatTool;
+    if (repeatCfg?.enabled !== false) {
+      try {
+        this.#repeatGuard = new RepeatToolGuard(repeatCfg);
+      } catch (err) {
+        console.error(
+          `[codeoid/session ${this.id.slice(0, 8)}] repeat-tool guard disabled — invalid config: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
     // Tenant-scoped (auth carries account_id/project_id) so two accounts in
     // the same directory never share memory.
     this.#workspaceId = workspaceIdFromPath(opts.workdir, opts.auth);
@@ -1628,6 +1649,11 @@ export class Session {
     this.#store.audit(sender.sub, "session.send", this.id);
     // A new turn is starting — clear any interrupt from the previous one.
     this.#turnInterrupted = false;
+    // Any inbound message invalidates a repeat run: the guard only claims
+    // "N identical calls with nothing else happening", and this is something
+    // else happening. Applies to system principals too (a background-task
+    // digest or a dispatch task is new information by the same argument).
+    this.#repeatGuard?.resetAll();
 
     // Fork-setup gate: on a freshly-forked worktree the first turn must wait
     // for `fork.setup` (e.g. `bun install`) to finish, so the agent never
@@ -1942,6 +1968,65 @@ export class Session {
         break;
       }
     }
+  }
+
+  /**
+   * Feed one tool call to the repeat-tool guard and inject its advisory when a
+   * run of consecutive identical calls hits a configured threshold.
+   *
+   * Advisory only: nothing here blocks, denies, or delays the call that
+   * triggered it — that call has already been recorded and is on its way to
+   * approval or execution. The reminder lands in the model's NEXT request.
+   *
+   * Injection uses `later` priority, which merges into the running turn
+   * without starting a fresh query (see the priority notes in `#sendInner`).
+   * That is precisely "add context to the next request" and is why the guard
+   * costs no extra turn. A backend without `pushMidTurn` silently gets no
+   * reminders rather than a queued message that would arrive out of context.
+   */
+  #maybeInjectRepeatReminder(
+    toolName: string,
+    input: Record<string, unknown>,
+    sdkAgentId?: string,
+  ): void {
+    const guard = this.#repeatGuard;
+    if (!guard) return;
+
+    const reminder = guard.observe(sdkAgentId ?? PRIMARY_CHAIN, toolName, input);
+    if (!reminder) return;
+
+    const run = this.#activeRun;
+    if (!run?.pushMidTurn) return;
+
+    // Operator-visible trace. Not sent to the model — the advisory itself is.
+    const infoMsg = this.#makeMessage(
+      "info",
+      `⟳ Repeat-tool guard — ${toolName} called ${reminder.runLength}× with identical arguments; advisory injected`,
+      SYSTEM_IDENTITY,
+      undefined,
+      undefined,
+      {
+        event: "repeat_tool_reminder",
+        tool: toolName,
+        runLength: reminder.runLength,
+        agentId: sdkAgentId ?? PRIMARY_CHAIN,
+      },
+    );
+    this.#persistAndBuffer(infoMsg);
+    this.#broadcastRaw(infoMsg);
+
+    // Model-visible means logged: the advisory reaches the model, so canonical
+    // history has to carry it or a cross-backend fork would replay a
+    // conversation the model never actually had.
+    this.#accumulator.pushUserTurn(reminder.text);
+    run.pushMidTurn(reminder.text, "later");
+
+    this.#store.audit(
+      "system:guard",
+      "session.repeat_tool_reminder",
+      this.id,
+      `tool=${toolName} run=${reminder.runLength} agent=${sdkAgentId ?? PRIMARY_CHAIN}`,
+    );
   }
 
   /**
@@ -3837,6 +3922,7 @@ export class Session {
         }
         this.#persistAndBuffer(toolMsg);
         this.#broadcastRaw(toolMsg);
+        this.#maybeInjectRepeatReminder(event.name, event.input, event.sdkAgentId);
         if (!autoApprove) this.#setStatus("waiting_approval");
         break;
       }
@@ -3926,6 +4012,9 @@ export class Session {
         const agentId = event.agentId;
         void this.#identityManager?.deactivateSubagent(this.id, agentId);
         this.#subagentRegistrations.delete(agentId);
+        // Drop the guard chain with the agent, or a long session accumulates
+        // one dead chain per subagent it ever spawned.
+        this.#repeatGuard?.resetChain(agentId);
         if (this.#subagents.delete(agentId)) {
           this.#broadcastInfoUpdate();
         }
