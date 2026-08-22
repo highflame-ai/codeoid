@@ -15,6 +15,13 @@ import {
   roleLabel,
   type FilteredFleetGroup,
 } from "../lib/fleet";
+import {
+  bandSections,
+  holdOrder,
+  snapshotOrder,
+  type BandedSection,
+  type OrderSnapshot,
+} from "../lib/session-order";
 import { sessionAgentLabel, shortSub } from "../lib/identity";
 import { fetchPanels, liveProgress, livePanelMember, resetPanels } from "../state/panels";
 import { nowTick } from "../state/clock";
@@ -91,6 +98,20 @@ const SessionListPane: Component = () => {
     filterFleet(groupFleet(sessionList()), filter()),
   );
 
+  // Ordering is held while the pointer is over the list: a row that moves
+  // between aiming and clicking opens the wrong session. The pending reorder
+  // lands on leave. Membership still updates live — see holdOrder.
+  const [pointerInside, setPointerInside] = createSignal(false);
+  let heldOrder: OrderSnapshot | null = null;
+  const sections = createMemo<BandedSection<FilteredFleetGroup>[]>(() => {
+    const live = bandSections(groups());
+    if (!pointerInside()) {
+      heldOrder = snapshotOrder(live);
+      return live;
+    }
+    return holdOrder(live, heldOrder);
+  });
+
   // The goal whose panels we poll, as a plain STRING.
   //
   // A memo over a primitive, deliberately. Reading `focusedSession()?.collaboration`
@@ -156,11 +177,26 @@ const SessionListPane: Component = () => {
         >
           <SessionFilter value={filter()} onInput={setFilter} />
           <Show when={groups().length > 0} fallback={<NoMatch query={filter()} />}>
-            <ul class="flex flex-col py-1">
-              <For each={groups()}>
-                {(g) => <FleetGroupRows group={g} />}
+            <div
+              onPointerEnter={() => setPointerInside(true)}
+              onPointerLeave={() => setPointerInside(false)}
+            >
+              <For each={sections()}>
+                {(section) => (
+                  <ul class="flex flex-col py-1">
+                    <li
+                      class="px-3 pb-1 pt-2 text-[10px] font-semibold uppercase tracking-wider text-fg-muted"
+                      aria-hidden="true"
+                    >
+                      {section.label}
+                    </li>
+                    <For each={section.groups}>
+                      {(g) => <FleetGroupRows group={g} />}
+                    </For>
+                  </ul>
+                )}
               </For>
-            </ul>
+            </div>
           </Show>
         </Show>
         <Show when={focusedSessionId()}>
