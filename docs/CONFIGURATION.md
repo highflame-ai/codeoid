@@ -101,6 +101,10 @@ CODEOID_COMPRESS_EXCLUDE=                # comma-separated cmd prefixes to skip
 CODEOID_COMPRESS_PIPES=0                 # allow compressing piped commands
 CODEOID_COMPRESS_MIN_BYTES=1024          # skip compression below this size
 
+# Advisory guards (see FEATURES.md → Guards)
+CODEOID_GUARD_REPEAT_TOOL=1              # loop-breaker advisory; on by default
+CODEOID_GUARD_REPEAT_TOOL_EXCLUDE=       # comma-separated tool patterns to ignore
+
 # Auto-rotation (Layer D)
 CODEOID_AUTO_ROTATE=0                   # auto-rotate backing session near context ceiling
 CODEOID_AUTO_ROTATE_WARN_PCT=0.75        # warn at this occupancy (no action)

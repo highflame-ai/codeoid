@@ -213,6 +213,44 @@ const CompressSchema = z
     minBytes: 1024,
   });
 
+/**
+ * Advisory guards (docs/prior-art-deepseek-harness.md §3.7). These observe the
+ * session and may inject model-facing advice; none of them can block a call.
+ * On by default — the guard is cheap, and the failure it catches (an unattended
+ * worker looping on one tool until its budget is gone) is expensive.
+ */
+const GuardSchema = z
+  .object({
+    repeatTool: z
+      .object({
+        enabled: z.boolean().default(true),
+        /** Consecutive-run lengths that trigger a reminder. Each must be >= 2. */
+        thresholds: z.array(z.number().int().min(2)).nonempty().default([3, 5, 8]),
+        /** Tool-name patterns to track (`*` wildcard). Empty ⇒ all tools. */
+        include: z.array(z.string()).default([]),
+        /** Tool-name patterns transparent to the chain. */
+        exclude: z.array(z.string()).default(["TodoWrite", "todo_write"]),
+        /** Cap on arguments quoted in the reminder — never on detection. */
+        argumentsPreviewChars: z.number().int().positive().default(500),
+      })
+      .default({
+        enabled: true,
+        thresholds: [3, 5, 8],
+        include: [],
+        exclude: ["TodoWrite", "todo_write"],
+        argumentsPreviewChars: 500,
+      }),
+  })
+  .default({
+    repeatTool: {
+      enabled: true,
+      thresholds: [3, 5, 8],
+      include: [],
+      exclude: ["TodoWrite", "todo_write"],
+      argumentsPreviewChars: 500,
+    },
+  });
+
 const WorkspaceIndexSchema = z
   .object({
     enabled: z.boolean().default(true),
@@ -773,6 +811,7 @@ const RootSchema = z.object({
   memory: MemorySchema,
   workspaceIndex: WorkspaceIndexSchema,
   compress: CompressSchema,
+  guard: GuardSchema,
   labeling: LabelingSchema,
   telemetry: TelemetrySchema,
   autoRotate: AutoRotateSchema,
@@ -855,6 +894,20 @@ export interface CodeoidConfig {
     excludePatterns: string[];
     compressPipes: boolean;
     minBytes: number;
+  };
+  /**
+   * Advisory guards — observe and advise, never block. Optional on the type
+   * (like `hooks`) so a hand-built config literal need not carry it; the Zod
+   * schema still defaults it, so anything loaded through `loadConfig` has it.
+   */
+  guard?: {
+    repeatTool: {
+      enabled: boolean;
+      thresholds: number[];
+      include: string[];
+      exclude: string[];
+      argumentsPreviewChars: number;
+    };
   };
   /** Cluster-label settings (Haiku API key). */
   labeling: {
@@ -1059,6 +1112,8 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   { env: "CODEOID_COMPRESS_EXCLUDE_PATTERNS", path: "compress.excludePatterns", kind: "csv" },
   { env: "CODEOID_COMPRESS_PIPES", path: "compress.compressPipes", kind: "boolean" },
   { env: "CODEOID_COMPRESS_MIN_BYTES", path: "compress.minBytes", kind: "int" },
+  { env: "CODEOID_GUARD_REPEAT_TOOL", path: "guard.repeatTool.enabled", kind: "boolean" },
+  { env: "CODEOID_GUARD_REPEAT_TOOL_EXCLUDE", path: "guard.repeatTool.exclude", kind: "csv" },
   { env: "ANTHROPIC_API_KEY", path: "labeling.anthropicApiKey", kind: "string" },
   { env: "CODEOID_OSC8", path: "telemetry.osc8", kind: "string" },
   { env: "CODEOID_AUTO_ROTATE", path: "autoRotate.enabled", kind: "boolean" },
@@ -1279,6 +1334,7 @@ export function loadConfig(opts: LoadOptions = {}): CodeoidConfig {
     },
     workspaceIndex: parsed.workspaceIndex,
     compress: parsed.compress,
+    guard: parsed.guard,
     labeling: parsed.labeling,
     telemetry: { osc8: osc8Mode },
     autoRotate: parsed.autoRotate,

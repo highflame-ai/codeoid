@@ -330,6 +330,48 @@ The session auto-approves up to 50 write/exec actions. Reads + greps + memory re
 
 Status bar shows live budget: `autonomous (37 actions left)`. You can interrupt anytime with `Ctrl-X`.
 
+### Guards
+
+A *guard* observes the session and may inject model-facing advice.
+It never vetoes a tool call, never rewrites arguments, and never appears in the tool list — anything that needs to *stop* a call belongs to the approval flow or the autonomous budget instead.
+
+**Repeat-tool guard** (on by default) is the loop-breaker.
+It counts runs of consecutive calls to the same tool with identical arguments, and at `3`, `5`, and `8` in a row it injects an escalating advisory telling the model to re-read the result it already has and either change approach or conclude.
+
+This matters most where nobody is watching.
+An unattended `dispatch` worker wedged on `Read(same file)` or `Bash(same failing command)` will otherwise burn its whole tool budget and report failure with no diagnosis; the budget caps the damage, the guard catches the cause while the turn can still recover.
+
+Chains are tracked **per emitting agent**, so two subagents hammering the same tool in parallel are two independent runs rather than one interleaved chain that resets forever and never fires.
+Argument comparison is order-insensitive (deep key-sort), so `{a:1, b:2}` and `{b:2, a:1}` are the same call.
+Any inbound message — owner, background-task digest, or dispatch task — resets every chain, because the guard only claims "N identical calls with *nothing else happening*".
+
+```jsonc
+// ~/.codeoid/config.json
+"guard": {
+  "repeatTool": {
+    "enabled": true,
+    "thresholds": [3, 5, 8],       // run lengths that fire; each must be >= 2
+    "include": [],                  // patterns to track; empty = all tools
+    "exclude": ["TodoWrite", "todo_write"],
+    "argumentsPreviewChars": 500    // caps the reminder text, never detection
+  }
+}
+```
+
+Invalid thresholds fail loud at construction rather than silently reverting to defaults — a guard that never fires because of a typo is worse than no guard. If the config is bad the session logs it and starts without the guard; an advisory plugin is never a reason to refuse a session.
+
+#### Model Experience
+
+The advisory arrives as injected context on the model's **next** request, wrapped in a `<repeat_tool_notice>` block and explicitly labelled as daemon-authored so it is never mistaken for owner input. The tool call that triggered it is unaffected — already recorded, already on its way to approval or execution.
+
+Injection uses `later` priority, which merges into the running turn without starting a fresh query, so a reminder costs no extra turn. Backends without mid-turn injection get no reminders rather than a message arriving out of context.
+
+#### KV Cache effect
+
+Append-only. The advisory lands after the reusable request prefix and invalidates no prior cache entry. Cost is the advisory itself: ~60 tokens for the brief form, and up to `argumentsPreviewChars` more for the detailed form.
+
+> The **Model Experience** / **KV Cache effect** headings are a convention borrowed from DeepSeek Harness (see [prior-art-deepseek-harness.md](./prior-art-deepseek-harness.md) §4.9). Any feature that changes what the model sees should state both: what reaches the model, and whether it invalidates the prompt prefix. For a harness, prefix stability *is* cost.
+
 ### Web UI
 
 Mobile-first SolidJS SPA at `http://localhost:7400/ui/`. Also works as a Telegram Mini App:
