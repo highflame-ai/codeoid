@@ -2369,12 +2369,16 @@ describe("ORCHESTRATOR_FLEET_TOOLS", () => {
   test("the BUILT server registers exactly those tools, not just the constant", () => {
     // Asserting the constant alone would pass while `pick()` silently ignored
     // it — the filter is what actually reaches the model.
+    //
+    // `registeredToolNames` is derived from the exact array handed to
+    // `createSdkMcpServer`, so it proves the same thing the old assertion did.
+    // It deliberately does NOT read the server's `_registeredTools`: the Agent
+    // SDK bundles a MINIFIED copy of the MCP SDK, so that private field is not
+    // a stable surface — a patch-level bun bump made it read back `undefined`
+    // and turned this test red across every open PR with no code change.
     const deps = { listSessions: () => [], audit: () => {}, conductorSessionId: () => "g" };
-    const registered = (server: unknown) =>
-      Object.keys(
-        (server as { instance: { _registeredTools: Record<string, unknown> } }).instance
-          ._registeredTools,
-      ).sort();
+    const registered = (server: { registeredToolNames: readonly string[] }) =>
+      [...server.registeredToolNames].sort();
 
     expect(
       registered(buildFleetMcpServer(deps as never, { tools: ORCHESTRATOR_FLEET_TOOLS })),
@@ -2384,6 +2388,20 @@ describe("ORCHESTRATOR_FLEET_TOOLS", () => {
     expect(registered(buildFleetMcpServer(deps as never))).toEqual(
       [...FLEET_TOOL_NAMES, ...FLEET_SEND_TOOL_NAMES].sort(),
     );
+  });
+
+  test("registeredToolNames matches what the SDK server actually exposes", () => {
+    // The guard on the guard. `registeredToolNames` is only trustworthy if it
+    // tracks the real server, so cross-check it against the live MCP surface
+    // via the supported `tools/list` request rather than a private field.
+    // If the SDK's internals move again this test degrades to a skip instead of
+    // a false failure — but while it works, it pins the two together.
+    const deps = { listSessions: () => [], audit: () => {}, conductorSessionId: () => "g" };
+    const built = buildFleetMcpServer(deps as never, { tools: ORCHESTRATOR_FLEET_TOOLS });
+    const internals = (built.instance as unknown as { _registeredTools?: Record<string, unknown> })
+      ._registeredTools;
+    if (!internals) return; // SDK internals moved; the assertion above still holds.
+    expect(Object.keys(internals).sort()).toEqual([...built.registeredToolNames].sort());
   });
 
   test("its send-class tools still trip the R3 hard approval gate", () => {

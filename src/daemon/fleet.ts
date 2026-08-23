@@ -539,6 +539,24 @@ export const ORCHESTRATOR_FLEET_TOOLS: ReadonlySet<string> = new Set([
   "fleet_panel",
 ]);
 
+/**
+ * A built fleet MCP server, plus the tool names actually handed to the SDK.
+ *
+ * `registeredToolNames` exists so callers and tests can verify what reaches the
+ * model WITHOUT reading the MCP server's internals. The Agent SDK ships a
+ * minified bundled copy of the MCP SDK, so its private `_registeredTools` field
+ * is not a stable surface: a patch-level runtime bump changed it out from under
+ * us and turned a green suite red with no code change on our side.
+ *
+ * This field is derived from the exact array passed to `createSdkMcpServer`, so
+ * it still proves the thing that matters — that `pick()` is applied on the way
+ * in, rather than being a constant that quietly diverges from the real surface.
+ */
+export type FleetMcpServer = McpSdkServerConfigWithInstance & {
+  /** Tool names handed to `createSdkMcpServer`, in registration order. */
+  readonly registeredToolNames: readonly string[];
+};
+
 export function buildFleetMcpServer(
   deps: FleetDeps,
   opts?: {
@@ -550,7 +568,7 @@ export function buildFleetMcpServer(
      */
     tools?: ReadonlySet<string>;
   },
-): McpSdkServerConfigWithInstance {
+): FleetMcpServer {
   const handlers = createFleetHandlers(deps);
   const text = (payload: string) => ({
     content: [{ type: "text" as const, text: payload }],
@@ -559,10 +577,9 @@ export function buildFleetMcpServer(
   const pick = <T extends { name: string }>(tools: T[]): T[] =>
     allowed ? tools.filter((t) => allowed.has(t.name)) : tools;
 
-  return createSdkMcpServer({
-    name: "codeoid-fleet",
-    version: "0.1.0",
-    tools: pick([
+  // Materialised once so the server and `registeredToolNames` cannot disagree:
+  // both derive from this exact array.
+  const registered = pick([
       tool(
         "fleet_list",
         "List every session in the fleet, grouped by workspace — names, status, provider, attached clients. Your view of what exists right now.",
@@ -663,6 +680,14 @@ export function buildFleetMcpServer(
         },
         async ({ session }) => text(await handlers.fleet_interrupt({ session })),
       ),
-    ]),
+  ]);
+
+  const server = createSdkMcpServer({
+    name: "codeoid-fleet",
+    version: "0.1.0",
+    tools: registered,
+  });
+  return Object.assign(server, {
+    registeredToolNames: registered.map((t) => t.name),
   });
 }
