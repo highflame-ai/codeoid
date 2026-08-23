@@ -2606,6 +2606,7 @@ export class Session {
       status: this.#status,
       createdBy: this.createdBy,
       createdAt: this.createdAt,
+      lastActivityAt: this.#lastActivityAt,
       attachedClients: this.#clients.size,
       role: this.role,
       providerId: this.#provider.id,

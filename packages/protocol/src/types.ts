@@ -202,6 +202,21 @@ export interface SessionInfo {
   status: SessionStatus;
   createdBy: string;
   createdAt: string;
+  /**
+   * ISO timestamp of the last time this session changed state — a turn started,
+   * a tool ran, it went idle. The daemon has always tracked this (it orders the
+   * resumed session list by it); this puts it on the wire so clients can order
+   * by RELEVANCE instead of by creation time.
+   *
+   * Bumped on state change, so it covers both "I just sent something" and "it
+   * just did something", and is deliberately NOT bumped by metadata-only writes
+   * like `rename()` — renaming a session must not reorder the list.
+   *
+   * Optional: absent from a daemon that predates it. Clients should fall back to
+   * `createdAt` rather than treating a missing value as "never active", which
+   * would sink every session on an older daemon to the bottom.
+   */
+  lastActivityAt?: string;
   attachedClients: number;
   /**
    * Session role. "conductor" marks the per-tenant conductor session (the
