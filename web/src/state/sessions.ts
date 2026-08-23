@@ -13,6 +13,7 @@ import type { SessionInfo, SessionStatus } from "../protocol/types";
 import { clearSessionMessages, setFocusedSessionAccessor } from "./messages";
 import { clearResumeCursor } from "./resume";
 import { clearDraft } from "./prompt-drafts";
+import { compareByRecency } from "../lib/session-order";
 
 interface SessionsState {
   byId: Record<string, SessionInfo>;
@@ -26,10 +27,21 @@ const [focusedId, setFocusedId] = createSignal<string | null>(null);
  * arriving out of order on reconnect. Non-reactive side map. */
 const statusUpdatedAt = new Map<string, number>();
 
-/** Sorted list — most recent activity first. */
+/**
+ * Sorted list — most recent activity first.
+ *
+ * Was `createdAt`, under this same comment: the intent was always recency, the
+ * code delivered creation order, and a session you made last week but have been
+ * driving all morning sat at the bottom. `compareByRecency` uses the daemon's
+ * `lastActivityAt` (falling back to `createdAt` on an older daemon).
+ *
+ * This is the base order. The sidebar bands it by attention state on top — see
+ * lib/session-order.ts — but everything else consuming `sessionList()` gets a
+ * sensible most-recent-first list for free.
+ */
 export const sessionList = createMemo<SessionInfo[]>(() => {
   const items = Object.values(state.byId);
-  items.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+  items.sort(compareByRecency);
   return items;
 });
 
@@ -148,12 +160,12 @@ export function ingestSessionList(
       clearDraft(id);
       statusUpdatedAt.delete(id);
     }
-    // Auto-focus the most recently-created session if nothing is focused.
+    // Auto-focus the most recently-ACTIVE session if nothing is focused.
+    // Creation order picked whatever session happened to be newest, which after
+    // a daemon restart is rarely the one you were working in.
     const cur = focusedId();
     if (!cur || !state.byId[cur]) {
-      const sorted = [...items].sort(
-        (a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt),
-      );
+      const sorted = [...items].sort(compareByRecency);
       setFocusedId(sorted[0]?.id ?? null);
     }
   });
