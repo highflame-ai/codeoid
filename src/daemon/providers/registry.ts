@@ -31,6 +31,7 @@ import { CodexProvider } from "./codex/index.js";
 import { CODEX_INSTALL_HINT, resolveCodexCommand } from "./codex/resolve.js";
 import { GeminiAcpProvider } from "./acp/index.js";
 import { GEMINI_CLI_INSTALL_HINT, resolveGeminiCliCommand } from "./acp/resolve.js";
+import { QwenProvider } from "./qwen/index.js";
 import { StatelessSessionProvider } from "./stateless.js";
 
 /**
@@ -329,6 +330,29 @@ export function createDefaultProviderRegistry(config?: CodeoidConfig): ProviderR
           : GEMINI_CLI_INSTALL_HINT,
       );
     }
+  }
+  if (config?.providers?.qwen?.enabled !== false) {
+    // No binary probe: @qwen-code/sdk bundles the CLI it drives, so the backend
+    // is always activatable (same reasoning as the bundled gemini-cli, minus the
+    // PATH lookup). Auth is checked at first turn, not at registration —
+    // `qwen-oauth` credentials and `OPENAI_API_KEY` are both late-bound, and a
+    // subscription user has neither set in the daemon env.
+    registry.register({
+      id: "qwen",
+      displayName: "Qwen Code (Alibaba)",
+      create: (init) =>
+        new QwenProvider({
+          sessionId: init.sessionId,
+          initialBackingId: init.initialBackingId,
+          workspaceId: init.workspaceId,
+          store: init.store,
+          memory: init.memory,
+          fleet: init.fleet as { type: "sdk"; name: string; instance: unknown } | undefined,
+          mcpRegistry: init.mcpRegistry,
+          config: init.config,
+          onModels: init.onModels,
+        }),
+    });
   }
   return registry;
 }

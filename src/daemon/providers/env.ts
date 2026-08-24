@@ -142,3 +142,44 @@ export function buildGeminiCliEnv(
     base,
   );
 }
+
+/** The qwen-code allowlist policy — shared by the builder and its tests. */
+const QWEN_ENV_POLICY: SubprocessEnvPolicy = {
+  // The CLI's own namespaces: OPENAI_* is its OpenAI-compatible auth path
+  // (key + base URL + model), QWEN_* its own config/runtime namespace,
+  // DASHSCOPE_* the Alibaba Model Studio key. Plus POSIX locale categories.
+  prefixes: ["OPENAI_", "QWEN_", "DASHSCOPE_", "LC_"],
+  suffixes: ["_API_KEY"],
+};
+
+/**
+ * Environment for the qwen-code CLI the `@qwen-code/sdk` spawns.
+ *
+ * qwen-code's subscription credential store is `~/.qwen/oauth_creds.json`
+ * (HOME is in the shared basics — qwen.ai OAuth never transits codeoid),
+ * with env fallbacks for the API-key path (`OPENAI_API_KEY` +
+ * `OPENAI_BASE_URL` + `OPENAI_MODEL`, or `DASHSCOPE_API_KEY`).
+ *
+ * SECURITY — why this returns MORE than an allowlist. Unlike the Claude
+ * Agent SDK (which replaces the child env outright), `@qwen-code/sdk` spawns
+ * with `{ ...process.env, ...options.env }`. A plain allowlist would
+ * therefore be a no-op: everything we left out is still inherited, including
+ * the secrets `loadDotEnv` puts in the daemon's env (`CODEOID_API_KEY` = the
+ * root ZeroID key, `TELEGRAM_BOT_TOKEN`, provider keys). Since a merge can
+ * only add or override keys — never delete them — we explicitly map every
+ * non-allowlisted name in `base` to the empty string. After the SDK's merge
+ * the child sees exactly the allowlist, and every daemon secret reads as
+ * empty rather than leaking to the agent's Bash tool or stdio MCP servers.
+ *
+ * Pure + exported for unit testing.
+ */
+export function buildQwenEnv(
+  base: Record<string, string | undefined> = process.env,
+): Record<string, string> {
+  const allowed = buildSubprocessEnv(QWEN_ENV_POLICY, base);
+  const out: Record<string, string> = { ...allowed };
+  for (const name of Object.keys(base)) {
+    if (!(name in allowed)) out[name] = "";
+  }
+  return out;
+}
