@@ -629,12 +629,61 @@ const ProvidersSchema = z
         command: z.string().default("gemini"),
       })
       .default({ enabled: true, command: "gemini" }),
+    /** Alibaba Qwen Code, driven in-process via `@qwen-code/sdk`. */
+    qwen: z
+      .object({
+        enabled: z.boolean().default(true),
+        /**
+         * Credential path. `openai` = the OpenAI-compatible API-key path
+         * (`OPENAI_API_KEY` + `baseUrl`); `qwen-oauth` = a qwen.ai
+         * subscription already logged in under `~/.qwen`. Omit to
+         * auto-detect: OAuth creds on disk win, else the key.
+         */
+        authType: z.enum(["openai", "qwen-oauth"]).optional(),
+        /**
+         * OpenAI-compatible gateway. Accepts a {@link QWEN_BASE_URL_PRESETS}
+         * name or a full URL. Omit to let the CLI use its own default (or
+         * `OPENAI_BASE_URL` from the environment).
+         */
+        baseUrl: z.string().optional(),
+        /** Default model when the session doesn't pick one (e.g. `qwen3.8-max`). */
+        model: z.string().optional(),
+        /**
+         * Override the CLI the SDK drives. Omit to use the CLI bundled inside
+         * `@qwen-code/sdk`, which is the version this provider was tested
+         * against — the same posture as the pinned gemini-cli dependency.
+         */
+        command: z.string().optional(),
+      })
+      .default({ enabled: true }),
   })
   .default({
     pi: { enabled: true, command: "pi" },
     codex: { enabled: true, command: "codex" },
     geminiCli: { enabled: true, command: "gemini" },
+    qwen: { enabled: true },
   });
+
+/**
+ * Named Qwen gateways, so an operator never has to discover these by hand.
+ *
+ * `bailian-plan-*` is the endpoint behind a Model Studio *plan-specific* key
+ * (`sk-sp-…`, issued by the Bailian token-plan installer). It is NOT the
+ * standard DashScope host — plan keys are rejected there with
+ * `invalid_api_key`, which is a confusing failure to debug from scratch.
+ */
+export const QWEN_BASE_URL_PRESETS: Record<string, string> = {
+  "dashscope-intl": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+  "dashscope-cn": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+  "bailian-plan-intl":
+    "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+};
+
+/** Resolve a `providers.qwen.baseUrl` preset name (or pass a URL through). */
+export function resolveQwenBaseUrl(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  return QWEN_BASE_URL_PRESETS[value] ?? value;
+}
 
 /**
  * A single MCP server in the canonical registry (see
@@ -1029,6 +1078,13 @@ export interface CodeoidConfig {
     geminiCli: {
       enabled: boolean;
       command: string;
+    };
+    qwen: {
+      enabled: boolean;
+      authType?: "openai" | "qwen-oauth";
+      baseUrl?: string;
+      model?: string;
+      command?: string;
     };
   };
   /**
