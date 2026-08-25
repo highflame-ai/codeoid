@@ -119,10 +119,13 @@ describe("decideRotation", () => {
     expect(out.reason).toBe("no_signal");
   });
 
-  it("below min-turns guard → no rotation even at high occupancy", () => {
+  it("below min-turns guard → no rotation at elevated (but sub-ceiling) occupancy", () => {
+    // 91%: past the soft threshold, still under the 97% hard ceiling. This is
+    // the guard's actual job — suppress churn in the first few turns after a
+    // rotation, while the seed prompt is still earning its keep.
     const out = decideRotation({
       ...baseInput(),
-      primaryLastTurnContext: 980_000,
+      primaryLastTurnContext: 910_000,
       numTurns: 2,
     });
     expect(out.shouldRotate).toBe(false);
@@ -168,14 +171,36 @@ describe("decideRotation", () => {
     expect(out.reason).toBe("hard_threshold");
   });
 
-  it("hard threshold still respects min-turns (don't rotate fresh sessions)", () => {
+  it("hard threshold PREEMPTS min-turns — the net is unconditional", () => {
+    // Deliberate inversion of the previous behaviour. The ceiling is the last
+    // defence before the backend rejects the prompt outright, so no other
+    // guard may gate it. A session that reaches 97% inside its first turns —
+    // one large paste, a wide repo scan — needs the net more than a
+    // long-running one, not less.
+    //
+    // This ordering also means a stuck turn counter can no longer disable the
+    // net silently, which is precisely how it failed: with memory enabled the
+    // counter never advanced past 0, so `below_min_turns` was returned on
+    // every check and a 999,627-token session rotated zero times.
     const out = decideRotation({
       ...baseInput(),
       numTurns: 1,
       primaryLastTurnContext: 999_999,
     });
-    expect(out.shouldRotate).toBe(false);
-    expect(out.reason).toBe("below_min_turns");
+    expect(out.shouldRotate).toBe(true);
+    expect(out.reason).toBe("hard_threshold");
+  });
+
+  it("a never-advancing turn counter cannot suppress the ceiling", () => {
+    // The exact shape of the bug: numTurns pinned at 0 forever.
+    const out = decideRotation({
+      ...baseInput(),
+      enabled: false,
+      numTurns: 0,
+      primaryLastTurnContext: 999_627, // the observed live value
+    });
+    expect(out.shouldRotate).toBe(true);
+    expect(out.reason).toBe("hard_threshold");
   });
 
   it("the user's 24-turn 214k avg case: NO rotation (healthy)", () => {
