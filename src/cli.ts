@@ -31,6 +31,7 @@ import {
   removeLocalTokenFile,
 } from "./daemon/local-auth.js";
 import type { CollaborationConfig } from "./protocol/types.js";
+import { ALL_SCOPES_STRING } from "./protocol/scopes.js";
 import { TerminalClient } from "./terminal/client.js";
 import {
   getConfigDir,
@@ -249,27 +250,29 @@ function printLocalModeBanner(o: {
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
-/** The full scope set codeoid asks ZeroID to mint for a session-driving key. */
-const CODEOID_LOGIN_SCOPES = [
-  "session:create",
-  "session:list",
-  "session:attach",
-  "session:watch",
-  "session:send",
-  "session:interrupt",
-  "session:approve",
-  "session:destroy",
-  // Conductor scopes — the owner delegates these to its conductor identity
-  // (owner → conductor RFC 8693 exchange). Without them in the owner's token
-  // the delegation's scope intersection is empty and the conductor can't act.
-  "session:read",
-  "session:dispatch",
-  "fs:read",
-  "tools:read",
-  "tools:write",
-  "tools:execute",
-  "tools:agent",
-].join(" ");
+/**
+ * The full scope set codeoid asks ZeroID to mint for a session-driving key.
+ *
+ * DERIVED, never hand-listed. This was previously a literal array that drifted
+ * from the canonical set in both directions: it omitted seven real scopes
+ * (`settings:read`/`settings:write`, `fleet:read`, and all four `pipeline:*`)
+ * and requested four that were never scopes at all (`tools:*`). A login token
+ * therefore could not reach the settings screen, the fleet board, or any
+ * pipeline verb — which surfaced as a bare "Missing scope: settings:read" on a
+ * daemon whose config was otherwise fine, and which no amount of re-login or
+ * ZeroID upgrading could fix.
+ *
+ * `ALL_SCOPES` is the single source of truth (`ALL_SCOPES_STRING` is the same
+ * join, already used by the terminal + TUI clients). `scopes.drift.test.ts`
+ * fails if a future scope is added and this silently falls behind again.
+ *
+ * Note this is an OWNER-tier token: it includes `settings:write` and
+ * `pipeline:manage`. That matches the single-operator daemon codeoid is built
+ * for — the key is minted by, and for, the person who runs it. Delegated or
+ * shared access is expressed by exchanging this token DOWN (the conductor and
+ * watcher paths already do exactly that), not by under-minting it here.
+ */
+const CODEOID_LOGIN_SCOPES = ALL_SCOPES_STRING;
 
 /** Read a secret from the TTY without echoing it (handles paste + backspace). */
 function readSecret(promptText: string): Promise<string> {
