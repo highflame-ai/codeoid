@@ -96,11 +96,25 @@ export function decideRotation(input: RotationDecisionInput): RotationDecision {
     return { shouldRotate: false, reason: "no_signal", occupancy: 0 };
   }
   const occupancy = ctx / W;
-  if (input.numTurns < input.minTurnsBeforeRotate) {
-    return { shouldRotate: false, reason: "below_min_turns", occupancy };
-  }
+  // The hard ceiling is checked FIRST, ahead of the min-turns guard.
+  //
+  // It is the last line of defence before the backend rejects the prompt
+  // outright, and it is documented to fire regardless of the `enabled`
+  // toggle — so letting a *different* guard preempt it made it conditional
+  // in practice. The min-turns window exists to stop churn right after a
+  // rotation (the seed prompt needs a few turns to earn its keep); it was
+  // never meant to license running past the context ceiling. A session that
+  // legitimately reaches 97% inside its first few turns — one big paste, a
+  // wide repo scan — needs the net MORE than a long-running one, not less.
+  //
+  // Ordering it this way also means a stuck/never-advancing turn counter can
+  // no longer disable the net silently, which is exactly how this failed
+  // before (see the counter hoist in Session#recordUsageFromTurn).
   if (occupancy >= input.hardRotatePct) {
     return { shouldRotate: true, reason: "hard_threshold", occupancy };
+  }
+  if (input.numTurns < input.minTurnsBeforeRotate) {
+    return { shouldRotate: false, reason: "below_min_turns", occupancy };
   }
   if (!input.enabled) {
     return { shouldRotate: false, reason: "disabled_below_hard", occupancy };

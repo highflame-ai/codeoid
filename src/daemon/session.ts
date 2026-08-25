@@ -2691,6 +2691,19 @@ export class Session {
       primaryCacheReadThisTurn = cacheRead; // best we can do on fallback
     }
 
+    // Turns-since-rotation is the min-turns guard's only input, and it is
+    // process-local (never read back from the store), so it MUST advance on
+    // both paths. It used to live inside the `!store` branch below, which
+    // meant that with memory enabled — the common configuration — it stayed
+    // pinned at 0 for the life of the session. `decideRotation` then returned
+    // `below_min_turns` on every check, and because that guard is evaluated
+    // BEFORE the hard-rotate ceiling, it silently disabled auto-rotation
+    // entirely: soft threshold and the "fires even when disabled" safety net
+    // alike. Observed on a 1M session that sat at 999,627 tokens across 52
+    // primary calls, rotated zero times, and then failed the turn outright
+    // with `prompt is too long`.
+    this.#turnsSinceLastRotation += 1;
+
     // If the memory engine isn't enabled we have no durable store — fall
     // back to pure in-memory accumulation so StatusBar still gets usage.
     const store = this.#memory?.store;
@@ -2702,7 +2715,6 @@ export class Session {
       this.#usage.totalCostUsd += result.totalCostUsd;
       this.#usage.durationMs += result.durationMs;
       this.#usage.numTurns += 1;
-      this.#turnsSinceLastRotation += 1;
       // PEAK tracks primary-only — ignore subagent contributions so a
       // subagent-heavy turn doesn't poison the bloat canary.
       this.#usage.peakInputTokens = Math.max(
