@@ -720,6 +720,33 @@ export class Store {
   }
 
   /**
+   * Reconcile non-terminal statuses left behind by a daemon that stopped
+   * mid-turn. Returns the number of rows corrected.
+   *
+   * `thinking` / `tool_running` / `waiting_approval` all describe work owned by
+   * a LIVE process: the provider's turn loop, and for approvals the in-memory
+   * `#pendingApprovals` resolvers. None of that survives a restart — a resumed
+   * Session starts at `idle` (`#status` is initialised, never restored) — but
+   * the row was never corrected, so `codeoid ls` and the web UI kept showing
+   * sessions as busy indefinitely. Observed on a live daemon: rows stuck in
+   * `tool_running` and `waiting_approval` for 11–19 days across restarts.
+   *
+   * `error` is deliberately preserved: it is a terminal state a human may still
+   * want to see, not an artifact of the process dying.
+   *
+   * Call once at boot, BEFORE resumeSessions, so resumed sessions and their
+   * rows agree from the first broadcast.
+   */
+  reconcileStaleSessionStatuses(): number {
+    return this.#db
+      .prepare(
+        `UPDATE sessions SET status = 'idle'
+          WHERE status IN ('thinking', 'tool_running', 'waiting_approval')`,
+      )
+      .run().changes;
+  }
+
+  /**
    * Rename a session (`session.rename`). The `name` column is otherwise
    * written ONLY by createSession's INSERT OR REPLACE, so without this a
    * rename never reaches the row and every reader that goes to the store
