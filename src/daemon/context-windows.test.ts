@@ -35,6 +35,23 @@ describe("contextWindowForModel", () => {
     expect(contextWindowForModel("claude-sonnet-4-5-1m")).toBe(ONE_MILLION_CONTEXT);
   });
 
+  test("bracket [1m] form -> 1M (the form Claude Code actually emits)", () => {
+    // Regression: these resolved to 200k, so asking EXPLICITLY for the 1M
+    // variant sized the window WORSE than the bare `opus` alias — observed on
+    // a live session running `opus[1m]`, which reported ~500% occupancy and a
+    // 5x-too-small fork seed budget.
+    expect(contextWindowForModel("opus[1m]")).toBe(ONE_MILLION_CONTEXT);
+    expect(contextWindowForModel("sonnet[1m]")).toBe(ONE_MILLION_CONTEXT);
+    expect(contextWindowForModel("claude-opus-5[1m]")).toBe(ONE_MILLION_CONTEXT);
+    // Case-insensitive, like every other branch.
+    expect(contextWindowForModel("OPUS[1M]")).toBe(ONE_MILLION_CONTEXT);
+  });
+
+  test("haiku stays 200k in bracket form too", () => {
+    // haiku has no 1M variant; a bracket suffix must not manufacture one.
+    expect(contextWindowForModel("haiku")).toBe(DEFAULT_CONTEXT_WINDOW);
+  });
+
   test("unknown claude model -> conservative 200k miss", () => {
     expect(contextWindowForModel("claude-sonnet-4-0")).toBe(DEFAULT_CONTEXT_WINDOW);
     expect(contextWindowForModel("custom-model")).toBe(DEFAULT_CONTEXT_WINDOW);
