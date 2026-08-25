@@ -51,7 +51,14 @@ export function contextWindowForModel(modelId: string | undefined | null): numbe
   for (const family of ONE_MILLION_FAMILIES) {
     if (m.includes(family)) return ONE_MILLION_CONTEXT;
   }
-  if (m.includes("-1m")) return ONE_MILLION_CONTEXT;
+  // The 1M variant appears in two forms: the suffix on a full model id
+  // (`claude-opus-4-5-1m`) and the BRACKET form Claude Code uses on aliases
+  // and ids alike (`opus[1m]`, `claude-opus-5[1m]`). Matching only the former
+  // meant an EXPLICIT 1M request resolved to 200k while the bare `opus` alias
+  // correctly resolved to 1M — inverting the caller's intent, and under-sizing
+  // the window that drives the percent-of-window display, the fork seed budget
+  // (seedBudgetChars), and auto-rotate occupancy.
+  if (m.includes("-1m") || m.includes("[1m]")) return ONE_MILLION_CONTEXT;
 
   // Aliases (matching the daemon's model resolver: opus → Opus 4.8,
   // sonnet → Sonnet 5 — both 1M; haiku → Haiku 4.5 at 200k).
