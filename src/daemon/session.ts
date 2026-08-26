@@ -1839,7 +1839,7 @@ export class Session {
     // the message is already persisted, the user re-sends after deciding.
     if (this.#status === "waiting_approval") {
       throw new Error(
-        "A tool approval is pending — approve or deny it before sending (this backend can't queue mid-turn).",
+        `${this.#describePendingApprovals()} — approve or deny it before sending (this backend can't queue mid-turn). Your message was saved; send again after deciding.`,
       );
     }
 
@@ -3333,6 +3333,31 @@ export class Session {
   }
 
   // ── Internals ─────────────────────────────────────────────────────────
+
+  /**
+   * Human-readable summary of what is currently blocking a send.
+   *
+   * The old rejection just said "A tool approval is pending", which told the
+   * user that *something* was waiting but not what, and gave them nothing to
+   * act on — so a message sent after stepping away read as the session simply
+   * going silent. Tool names come from the same maps the approval bar uses
+   * (`#approvalIdToMessageId` → `#toolCallMessages`), so no extra bookkeeping.
+   *
+   * Falls back to the generic phrasing when the maps have no entry — the
+   * status is authoritative, the label is best-effort, and a missing name must
+   * never turn a clear refusal into a crash.
+   */
+  #describePendingApprovals(): string {
+    const names: string[] = [];
+    for (const approvalId of this.#pendingApprovals.keys()) {
+      const msgId = this.#approvalIdToMessageId.get(approvalId);
+      const name = msgId ? this.#toolCallMessages.get(msgId)?.tool?.name : undefined;
+      if (name) names.push(name);
+    }
+    if (names.length === 0) return "A tool approval is pending";
+    if (names.length === 1) return `The tool \`${names[0]}\` is waiting for approval`;
+    return `${names.length} tool approvals are pending (${names.join(", ")})`;
+  }
 
   #waitForApproval(
     approvalId: string,

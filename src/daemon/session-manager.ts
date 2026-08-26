@@ -572,6 +572,20 @@ export class SessionManager {
    * Rebuilds in-memory session objects and scrollback buffers.
    */
   async resumeSessions(): Promise<number> {
+    // Correct statuses stranded by a daemon that stopped mid-turn. A resumed
+    // Session always starts `idle` in memory, so a row still claiming
+    // `thinking` / `tool_running` / `waiting_approval` is pure staleness — it
+    // made the session list show work that no longer exists (and, for
+    // `waiting_approval`, an approval whose resolver died with the process).
+    // Done BEFORE resume so rows and live sessions agree from the first
+    // broadcast.
+    const corrected = this.#store.reconcileStaleSessionStatuses();
+    if (corrected > 0) {
+      console.log(
+        `[codeoid] reconciled ${corrected} stale session status(es) left by a previous run`,
+      );
+    }
+
     // Reload the durable conductor identity first (design R2): the persisted
     // {identityId, wimseUri, apiKey} row is reused instead of re-registering,
     // so the conductor keeps ONE stable WIMSE URI across daemon restarts.
