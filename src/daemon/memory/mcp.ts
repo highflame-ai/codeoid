@@ -15,6 +15,7 @@ import {
   type McpSdkServerConfigWithInstance,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { MemoryEngine } from "./engine.js";
+import { MEMORY_MCP_SERVER_NAME } from "./mcp-http.js";
 import { memoryToolDefs, type MemoryToolContext } from "./tools.js";
 
 export interface MemoryMcpBinding {
@@ -38,7 +39,15 @@ export function buildMemoryMcpServer(
     })),
   );
   return createSdkMcpServer({
-    name: "codeoid-memory",
+    // MUST equal MEMORY_MCP_SERVER_NAME. Backends disagree about which name
+    // they namespace mounted tools by: the Claude SDK uses the mcpServers map
+    // KEY (always this constant), while qwen-code uses the server INSTANCE's
+    // own name. While these differed (`codeoid_memory` vs `codeoid-memory`)
+    // the qwen backend exposed `mcp__codeoid-memory__*`, which matched neither
+    // the provider's `allowedTools` grant nor `isSafeTool`'s prefixes — so the
+    // read-only recall tools prompted for approval on every single call.
+    // One name removes the whole class of mismatch.
+    name: MEMORY_MCP_SERVER_NAME,
     version: "0.1.0",
     tools,
   });
