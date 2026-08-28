@@ -178,6 +178,29 @@ export type SessionStatus =
   | "waiting_approval"
   | "error";
 
+/**
+ * Placeholder body for a `thinking` message the backend produced no readable
+ * reasoning for.
+ *
+ * A thinking message must be committed with NON-EMPTY content — the TUI's
+ * "same msgId + content ⇒ committed" rule is what retires the live spinner, so
+ * an empty commit leaves `Thinking…` stuck. Hence a sentinel rather than "".
+ *
+ * Shared (not duplicated) because both sides key off it: the daemon writes it,
+ * and clients use it to tell "reasoning exists, show an expander" apart from
+ * "there is nothing behind this" — an expander that opens onto a placeholder is
+ * worse than no expander at all.
+ *
+ * Whether reasoning arrives at all is a BACKEND property, not a codeoid one.
+ * Claude returns readable text only when `thinking.display` is `"summarized"`
+ * (the API default is `"omitted"`, which streams thinking blocks with empty
+ * text); the raw chain of thought is never exposed on any model. Other
+ * backends — qwen-code, and OSS models behind an OpenAI-compatible gateway —
+ * stream plaintext reasoning directly. So both branches are live at once, and
+ * neither is an error state.
+ */
+export const REASONING_UNAVAILABLE = "(no reasoning returned by this model)";
+
 /** True when the session is mid-turn (either reasoning or running a tool). */
 export function isActiveStatus(s: SessionStatus): boolean {
   return s === "thinking" || s === "tool_running";

@@ -543,7 +543,16 @@ export class ClaudeProvider implements SessionProvider {
         permissionMode: "default",
         includePartialMessages: true,
         persistSession: true,
-        thinking: { type: "adaptive" as const },
+        // `display` defaults to "omitted" on Opus 5 / 4.8 / 4.7, Sonnet 5, and
+        // Fable 5 — which streams thinking blocks whose text is EMPTY. Codeoid
+        // then committed them as a placeholder, so every reasoning block in the
+        // UI expanded onto nothing (measured: 3,445 of 3,450 on one session).
+        // "summarized" returns readable reasoning instead. It is free: display
+        // controls visibility only, and thinking is billed identically either
+        // way — the tokens were already spent, we just weren't being shown
+        // anything for them. (The raw chain of thought is never exposed on any
+        // model; this is a summary of it.)
+        thinking: { type: "adaptive" as const, display: "summarized" as const },
         ...(opts.model ? { model: opts.model } : {}),
         ...(opts.fallbackModel ? { fallbackModel: opts.fallbackModel } : {}),
         stderr: (data: string) => {

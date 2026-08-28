@@ -61,7 +61,13 @@ import { promisify } from "node:util";
 const execFileP = promisify(execFile);
 /** Max wall-clock for a fork.setup command (deps install can be slow). */
 const FORK_SETUP_TIMEOUT_MS = 600_000;
-import { authToIdentity, CAPABILITIES, isActiveStatus, SYSTEM_IDENTITY } from "../protocol/types.js";
+import {
+  authToIdentity,
+  CAPABILITIES,
+  isActiveStatus,
+  REASONING_UNAVAILABLE,
+  SYSTEM_IDENTITY,
+} from "../protocol/types.js";
 import type { Store } from "./store.js";
 import type { AgentIdentityManager } from "./agent-identity.js";
 import { ScrollbackBuffer } from "./scrollback.js";
@@ -4290,7 +4296,11 @@ export class Session {
     this.#activeThinkingMsg = null;
     this.#activeThinkingIndex = null;
     if (!m.content || m.content.length === 0) {
-      m.content = "(reasoning elided)";
+      // Not an elision by codeoid — the backend returned no readable reasoning.
+      // Claude does this whenever `thinking.display` is `"omitted"`; backends
+      // that stream plaintext reasoning (qwen-code, OSS models over an
+      // OpenAI-compatible gateway) land in the branch above with real content.
+      m.content = REASONING_UNAVAILABLE;
     }
     this.#commitStreamed(m);
     this.#broadcastRaw(m);
