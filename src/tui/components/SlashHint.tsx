@@ -25,7 +25,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: "/unpin", description: "Unpin a previously-pinned file" },
   { name: "/context", description: "Show detailed context-budget breakdown — or attach files if paths given" },
   { name: "/rotate", description: "Rotate the Claude Code backing session (fresh context, memory preserved)" },
-  { name: "/search", description: "Search all sessions (Ctrl-F) — keywords + semantic + recency across every message" },
+  { name: "/search", description: "Search sessions (Ctrl-F) — keywords + semantic + recency; Tab toggles this workspace ↔ all" },
   { name: "/model", description: "Switch the Claude model for this session (interactive picker, or /model <alias>)" },
   { name: "/who", description: "Show the identity chain (user → agent → sub-agents)" },
   { name: "/help", description: "Show keybindings" },
