@@ -414,6 +414,7 @@ const AgentIdentitySchema = z
     accountId: z.string().default("personal"),
     projectId: z.string().default("dev"),
     registrarKey: z.string().optional(),
+    identityExpiresAt: z.string().optional(),
   })
   .default({ accountId: "personal", projectId: "dev" });
 
@@ -920,6 +921,14 @@ export interface CodeoidConfig {
      * Distinct from apiKey (the human-operator client token).
      */
     registrarKey?: string;
+    /**
+     * RFC3339 expiry of the identity `registrarKey` belongs to — the sandbox
+     * badge, when Forge injected one. Every identity this daemon registers is
+     * capped to it, so a child cannot outlive the sandbox that created it
+     * (forge#110). Absent outside a sandbox, where there is no such ceiling to
+     * inherit and children expire with the session teardown instead.
+     */
+    identityExpiresAt?: string;
   };
   /** Memory / recall config — when enabled, stores episodes and exposes recall() to Claude. */
   memory?: {
@@ -1154,6 +1163,7 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   { env: "ZEROID_ACCOUNT_ID", path: "agentIdentity.accountId", kind: "string" },
   { env: "ZEROID_PROJECT_ID", path: "agentIdentity.projectId", kind: "string" },
   { env: "ZEROID_REGISTRAR_KEY", path: "agentIdentity.registrarKey", kind: "string" },
+  { env: "ZEROID_IDENTITY_EXPIRES_AT", path: "agentIdentity.identityExpiresAt", kind: "string" },
   { env: "CODEOID_MEMORY", path: "memory.enabled", kind: "boolean" },
   { env: "CODEOID_MEMORY_DB_PATH", path: "memory.dbPath", kind: "string" },
   { env: "CODEOID_MEMORY_MODEL", path: "memory.model", kind: "string" },
@@ -1379,6 +1389,7 @@ export function loadConfig(opts: LoadOptions = {}): CodeoidConfig {
           accountId: parsed.agentIdentity.accountId,
           projectId: parsed.agentIdentity.projectId,
           registrarKey: parsed.agentIdentity.registrarKey,
+          identityExpiresAt: parsed.agentIdentity.identityExpiresAt,
         }
       : undefined,
     memory: {

@@ -583,3 +583,84 @@ describe("AgentIdentityManager session + sub-agent registration", () => {
     expect(rootFallback).toBeUndefined();
   });
 });
+
+/**
+ * forge#110 — a sandbox badge holding `nhi:manage` could register children with
+ * arbitrary `allowed_scopes` and NO expiry. `system:expired_sweep` deactivated
+ * the badge and left the child `active`: a permanent `tools:*` credential in
+ * the user's project, attributed to the launching human, outliving the sandbox
+ * it was minted inside.
+ *
+ * ZeroID applies no register-time ceiling of its own (`allowed_scopes` passes
+ * through unvalidated, and the tenant `default` credential policy's empty
+ * `allowed_scopes` reads as "unrestricted"), so the lifetime cap is what bounds
+ * the over-grant to the sandbox that opened it.
+ */
+describe("child identities expire with the sandbox (forge#110)", () => {
+  let tmpDir: string;
+  let store: Store;
+  let zeroid: FakeZeroID;
+
+  const EXPIRES = "2026-08-28T22:05:00Z";
+  const sandboxConfig = {
+    auth: { baseUrl: BASE_URL },
+    accountId: ACCOUNT,
+    projectId: PROJECT,
+    // No registrarKey: the cap is independent of how admin calls authenticate,
+    // and the fake's api_key grant only knows keys it minted itself.
+    identityExpiresAt: EXPIRES,
+  };
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "codeoid-child-expiry-"));
+    store = new Store(join(tmpDir, "store.db"));
+    zeroid = new FakeZeroID();
+    zeroid.install();
+  });
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    store.close();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test("a session agent is capped at the badge's expiry", async () => {
+    const manager = new AgentIdentityManager(sandboxConfig, store);
+    await manager.registerSessionAgent("sess-1234abcd", "My_Test", "user:owner@test");
+
+    expect(zeroid.registerCalls[0]!.expires_at).toBe(EXPIRES);
+  });
+
+  test("so are workers, sub-agents and the conductor — every registration path", async () => {
+    const manager = new AgentIdentityManager(sandboxConfig, store);
+    await manager.registerConductor("user:owner@test");
+    await manager.registerWorker("sess-worker01", "ship-it", "ship");
+    const parent = await manager.registerSessionAgent(
+      "sess-1234abcd",
+      "My_Test",
+      "user:owner@test",
+    );
+    expect(parent.token).toBeTruthy();
+    await manager.registerSubagent("sess-1234abcd", "agentABCDEF012345", "Explore");
+
+    // Every one of them, not just the first — a single uncapped path is all a
+    // prompt-injected agent needs.
+    expect(zeroid.registerCalls.length).toBeGreaterThanOrEqual(4);
+    for (const call of zeroid.registerCalls) {
+      expect(call.expires_at).toBe(EXPIRES);
+    }
+  });
+
+  test("outside a sandbox the field is omitted, not sent empty", async () => {
+    // No badge to inherit a ceiling from. Sending an explicit null/"" would be
+    // this daemon asserting "no expiry" — the behaviour being fixed — rather
+    // than leaving ZeroID's own default in charge.
+    const manager = new AgentIdentityManager(
+      { auth: { baseUrl: BASE_URL }, accountId: ACCOUNT, projectId: PROJECT },
+      store,
+    );
+    await manager.registerSessionAgent("sess-1234abcd", "My_Test", "user:owner@test");
+
+    expect(zeroid.registerCalls[0]).not.toHaveProperty("expires_at");
+  });
+});
