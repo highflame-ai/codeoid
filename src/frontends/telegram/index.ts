@@ -81,6 +81,8 @@ interface PendingApproval {
 /** Cap the pending-approval map so untapped prompts (interrupted turns, closed
  * chats) can't grow it unbounded, and evict anything older than the TTL. */
 const MAX_PENDING_APPROVALS = 200;
+/** Cap on parked search queries awaiting a "search all workspaces" tap. */
+const MAX_PENDING_SEARCHES = 200;
 const APPROVAL_TTL_MS = 60 * 60 * 1000; // 1 hour
 
 /**
@@ -150,6 +152,13 @@ export class TelegramFrontend implements Frontend {
 
   /** `${userId}:${short}` → pending provider dialog (`session.ui_request`). */
   #uiRequests = new Map<string, PendingUiReq>();
+
+  /**
+   * `${userId}:${short}` → the query behind a "search all workspaces" button.
+   * Telegram callback_data caps at 64 bytes, so the query is held here rather
+   * than encoded into the button.
+   */
+  #pendingSearches = new Map<string, string>();
   /** Approval time-to-live (ms); overridable so tests can exercise expiry. */
   #approvalTtlMs: number;
   /** Send surface handed to each user's StreamRelay. */
@@ -206,7 +215,7 @@ export class TelegramFrontend implements Frontend {
         { command: "fork", description: "Branch this session: /fork [backend]" },
         { command: "rotate", description: "Fresh context (memory kept)" },
         { command: "rename", description: "Rename the attached session" },
-        { command: "search", description: "Search across sessions" },
+        { command: "search", description: "Search sessions: /search <query>" },
         { command: "agents", description: "Subagents available" },
         { command: "skills", description: "Skills available" },
         { command: "mcp", description: "MCP servers" },
@@ -567,16 +576,48 @@ export class TelegramFrontend implements Frontend {
 
     const query = (ctx.message?.text?.split(/\s+/).slice(1).join(" ") ?? "").trim();
     if (!query) {
-      await ctx.reply("Usage: /search <query>\n\nSearches across all sessions in the workspace.");
+      await ctx.reply(
+        "Usage: /search <query>\n\n" +
+          "Searches the attached session's workspace. Not attached? Searches " +
+          "every workspace. A button on the results switches to all workspaces.",
+      );
       return;
     }
+
+    // Attached = there is a workspace worth scoping to, and it is the one the
+    // user is looking at. Unattached, there is nothing to anchor on, so go
+    // straight to cross-workspace rather than letting the daemon guess from
+    // the most recently created session — which is rarely what was meant.
+    const scope: "workspace" | "all" = state.attachedSessionId ? "workspace" : "all";
+    await this.#runSearch(ctx, state, query, scope);
+  }
+
+  /**
+   * Execute one search and render it. Split out of `#handleSearch` so the
+   * "search all workspaces" button can re-run the same query in the other
+   * scope, which is Telegram's equivalent of the TUI's Tab toggle.
+   */
+  async #runSearch(
+    ctx: Context,
+    state: UserState,
+    query: string,
+    scope: "workspace" | "all",
+  ): Promise<void> {
+    // Anchor on the ATTACHED session's workdir. Omitting it made the daemon
+    // fall back to `#guessCallerWorkdir`, which picks the most recently
+    // created session — so "this workspace" could mean a repo the user is
+    // not attached to and never asked about.
+    const attached = state.attachedSessionName
+      ? this.#manager.findByName(state.attachedSessionName, state.auth!)
+      : undefined;
 
     const resp = await this.#manager.handle(
       {
         type: "session.search",
         id: randomUUID(),
         query,
-        scope: "workspace",
+        scope,
+        ...(scope === "workspace" && attached?.workdir ? { workdir: attached.workdir } : {}),
         limit: 5,
       },
       state.auth!,
@@ -591,19 +632,32 @@ export class TelegramFrontend implements Frontend {
     if (resp.type !== "session.search.result") return;
 
     const results = resp as SessionSearchResultMsg;
+
+    // Offered whenever the search was scoped, including on zero hits — that
+    // is exactly when widening is most useful.
+    const widen = scope === "workspace" ? this.#widenKeyboard(ctx, query) : undefined;
+
     if (results.sessions.length === 0) {
-      await ctx.reply(`No results for "${query}".`);
+      const where = scope === "all" ? "any workspace" : "this workspace";
+      await ctx.reply(`No results for "${query}" in ${where}.`, {
+        ...(widen ? { reply_markup: widen } : {}),
+      });
       return;
     }
 
     const lines: string[] = [];
-    lines.push(`🔍 *Search: ${escMd(query)}*\n`);
+    const scopeLabel = scope === "all" ? "all workspaces" : "this workspace";
+    lines.push(`🔍 *Search: ${escMd(query)}* — ${escMd(scopeLabel)}\n`);
 
     for (const hit of results.sessions) {
       const when = formatAgo(hit.lastMatchAt);
       const matchLabel = `${hit.matchCount} match${hit.matchCount === 1 ? "" : "es"}`;
+      // Cross-workspace names are ambiguous on their own — two repos can each
+      // have a "fix auth" session — so name the repo when the scope is global.
+      const repoName = scope === "all" ? basename(hit.workdir) : "";
+      const repo = repoName ? ` \\[${escMd(repoName)}\\]` : "";
       lines.push(
-        `▸ *${escMd(hit.sessionName)}* — ${escMd(matchLabel)} · ${escMd(when)}`,
+        `▸ *${escMd(hit.sessionName)}*${repo} — ${escMd(matchLabel)} · ${escMd(when)}`,
       );
 
       for (const snippet of hit.snippets.slice(0, 2)) {
@@ -627,12 +681,38 @@ export class TelegramFrontend implements Frontend {
     // Telegram has a 4096-char limit; chunk if needed
     const text = lines.join("\n");
     if (text.length <= 4096) {
-      await ctx.reply(text, { parse_mode: "MarkdownV2" });
+      await ctx.reply(text, {
+        parse_mode: "MarkdownV2",
+        ...(widen ? { reply_markup: widen } : {}),
+      });
     } else {
       // Fall back to plain text for very long results
       const plain = lines.join("\n").replace(/\\([_*[\]()~`>#+\-=|{}.!\\])/g, "$1");
       state.relay.sendChunked(ctx.chat!.id, plain);
+      // sendChunked has no keyboard surface, so offer the widen control
+      // as its own follow-up message rather than dropping it.
+      if (widen) {
+        await ctx.reply("Search every workspace?", { reply_markup: widen }).catch(() => {});
+      }
     }
+  }
+
+  /**
+   * Build the "search all workspaces" control — Telegram's stand-in for the
+   * TUI's Tab toggle. The query is parked in `#pendingSearches` because
+   * callback_data is capped at 64 bytes and queries are free text.
+   */
+  #widenKeyboard(ctx: Context, query: string): InlineKeyboard | undefined {
+    const userId = ctx.from?.id;
+    if (userId === undefined) return undefined;
+    if (this.#pendingSearches.size >= MAX_PENDING_SEARCHES) {
+      // Oldest-first eviction; Map preserves insertion order.
+      const oldest = this.#pendingSearches.keys().next();
+      if (!oldest.done) this.#pendingSearches.delete(oldest.value);
+    }
+    const short = randomUUID().slice(0, 8);
+    this.#pendingSearches.set(`${userId}:${short}`, query);
+    return new InlineKeyboard().text("🌐 Search all workspaces", `srchall:${short}`);
   }
 
   // ── Run control ───────────────────────────────────────────────────────
@@ -1254,6 +1334,36 @@ export class TelegramFrontend implements Frontend {
       return;
     }
 
+    // 🌐 Search all workspaces — re-run a scoped search globally. Keyed
+    // `${userId}:${short}` like approvals because the query cannot fit in
+    // callback_data.
+    if (kind === "srchall") {
+      const userId = ctx.from?.id;
+      const state = userId !== undefined ? this.#users.get(userId) : undefined;
+      if (!state?.auth) {
+        await ctx.answerCallbackQuery({ text: "Session expired — re-run /auth." }).catch(() => {});
+        return;
+      }
+      if (this.#authExpired(state)) {
+        this.#expireAuth(userId!, state);
+        await ctx.answerCallbackQuery({ text: "Session expired — re-run /auth." }).catch(() => {});
+        return;
+      }
+      const key = `${userId}:${short}`;
+      const query = this.#pendingSearches.get(key);
+      if (query === undefined) {
+        await ctx.answerCallbackQuery({ text: "Search no longer active — re-run /search." }).catch(() => {});
+        await ctx.editMessageReplyMarkup().catch(() => {});
+        return;
+      }
+      this.#pendingSearches.delete(key);
+      await ctx.answerCallbackQuery({ text: "🌐 Searching every workspace…" }).catch(() => {});
+      // Drop the button so the same widen cannot be fired twice.
+      await ctx.editMessageReplyMarkup().catch(() => {});
+      await this.#runSearch(ctx, state, query, "all");
+      return;
+    }
+
     // Provider dialog answer (`session.ui_request`). Keyed `${userId}:${short}`
     // like approvals; `rest[0]` is the choice: o<idx> | y | n | x(cancel).
     if (kind === "uireq") {
@@ -1572,6 +1682,18 @@ export function isStaleBroadcast(
 }
 
 /** Relative time string from a unix-ms timestamp. */
+/**
+ * Last path segment of a workdir, for labelling cross-workspace hits.
+ * Total on purpose: a hit whose session is no longer live can carry an
+ * empty workdir, and a missing repo label must not break the result list.
+ */
+function basename(p: string | undefined): string {
+  if (!p) return "";
+  const trimmed = p.replace(/[/\\]+$/, "");
+  const cut = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+  return cut === -1 ? trimmed : trimmed.slice(cut + 1);
+}
+
 function formatAgo(when: number): string {
   const dt = Math.max(0, Date.now() - when);
   if (dt < 60_000) return "just now";

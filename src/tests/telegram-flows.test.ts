@@ -121,9 +121,9 @@ afterEach(async () => {
 
 /** Recording fake SessionManager: two known sessions, capture attach clients. */
 function makeFakeManager() {
-  const sessions: Record<string, { id: string; name: string }> = {
-    alpha: { id: "sess-a", name: "alpha" },
-    beta: { id: "sess-b", name: "beta" },
+  const sessions: Record<string, { id: string; name: string; workdir: string }> = {
+    alpha: { id: "sess-a", name: "alpha", workdir: "/repos/alpha" },
+    beta: { id: "sess-b", name: "beta", workdir: "/repos/beta" },
   };
   const handled: any[] = [];
   const disconnected: string[] = [];
@@ -718,6 +718,71 @@ describe("Telegram flows — switch, failed re-attach, detach, destroy, search",
     await drive("/destroy alpha");
     await until(() => texts().some((t) => t.includes("destroyed")));
     expect(manager.handled.some((m) => m.type === "session.destroy" && m.sessionId === "sess-a")).toBe(true);
+  });
+
+  it("/search while attached anchors on the attached session's workspace", async () => {
+    const { drive, manager, texts } = await boot();
+
+    await drive("/attach alpha");
+    await until(() => texts().some((t) => t.startsWith("Attached to")));
+
+    await drive("/search needle");
+    await until(() => manager.handled.some((m: any) => m.type === "session.search"));
+
+    const search = manager.handled.find((m: any) => m.type === "session.search")!;
+    expect(search.scope).toBe("workspace");
+    // Anchored on the ATTACHED session, not left for the daemon to guess from
+    // whichever session happens to have been created most recently.
+    expect(search.workdir).toBe("/repos/alpha");
+  });
+
+  it("/search with no attached session searches every workspace", async () => {
+    const { drive, manager, texts } = await boot();
+
+    await drive("/search needle");
+    await until(() => texts().some((t) => t.includes("Search: needle")));
+
+    const search = manager.handled.find((m: any) => m.type === "session.search")!;
+    // Nothing to anchor on, so don't scope to an arbitrary workspace.
+    expect(search.scope).toBe("all");
+    expect(search.workdir).toBeUndefined();
+  });
+
+  it("the widen button re-runs the query across all workspaces", async () => {
+    const { drive, driveCallback, manager, sent, texts } = await boot();
+
+    await drive("/attach alpha");
+    await until(() => texts().some((t) => t.startsWith("Attached to")));
+
+    await drive("/search needle");
+    await until(() => manager.handled.some((m: any) => m.type === "session.search"));
+
+    // A scoped search offers the widen control.
+    const withKb = sent().find((c) =>
+      JSON.stringify(c.payload.reply_markup ?? {}).includes("srchall:"),
+    );
+    expect(withKb).toBeDefined();
+    const data = JSON.stringify(withKb!.payload.reply_markup).match(
+      /"(srchall:[0-9a-f]{8})"/,
+    )![1]!;
+
+    await driveCallback(data);
+    await until(
+      () => manager.handled.filter((m: any) => m.type === "session.search").length === 2,
+    );
+
+    const searches = manager.handled.filter((m: any) => m.type === "session.search");
+    expect(searches[0].scope).toBe("workspace");
+    expect(searches[1].scope).toBe("all");
+    // Same query, other scope — the Telegram equivalent of the TUI's Tab.
+    expect(searches[1].query).toBe("needle");
+    expect(searches[1].workdir).toBeUndefined();
+
+    // The token is single-use; a second tap finds nothing parked.
+    await driveCallback(data);
+    expect(
+      manager.handled.filter((m: any) => m.type === "session.search").length,
+    ).toBe(2);
   });
 
   it("falls back to plain-text chunked output for >4096-char search results", async () => {
