@@ -36,6 +36,29 @@ export interface AgentIdentityConfig {
    */
   registrarKey?: string;
   /**
+   * RFC3339 expiry of the identity `registrarKey` belongs to — the per-sandbox
+   * badge, when Forge injected one (`ZEROID_IDENTITY_EXPIRES_AT`).
+   *
+   * Every identity registered here is stamped with it, because ZeroID applies
+   * no ceiling of its own: `allowed_scopes` passes through unvalidated at
+   * register, and the tenant `default` credential policy carries an empty
+   * `allowed_scopes`, which the subset check reads as "unrestricted". So a
+   * badge holding `nhi:manage` and no `tools:*` could register a child holding
+   * the full `tools:*` set — and, with no expiry, one that survived the
+   * sandbox: `system:expired_sweep` deactivated the badge and left the child
+   * `active`, a permanent credential in the user's project attributed to the
+   * launching human (forge#110).
+   *
+   * Capping the lifetime does not close the scope gap — that needs the
+   * register-time ceiling in ZeroID — but it does bound it to the sandbox that
+   * opened it, which is the difference between a transient over-grant and a
+   * standing one.
+   *
+   * Absent outside a sandbox: there is no badge to inherit from, and children
+   * are already torn down with their session.
+   */
+  identityExpiresAt?: string;
+  /**
    * Prefix for the conductor's ZeroID external_id. Defaults to
    * "codeoid-conductor"; integration tests override it so their throwaway
    * identities are unmistakable (codeoid-conductor-test-*) and sweepable.
@@ -177,6 +200,20 @@ export class AgentIdentityManager {
   }
 
   /**
+   * The lifetime ceiling stamped on every identity registered here — see
+   * `AgentIdentityConfig.identityExpiresAt` for why (forge#110).
+   *
+   * Spread into the register body so an absent ceiling omits the field
+   * entirely: sending an explicit null/empty would be a caller asserting "no
+   * expiry", which is the behaviour being fixed rather than the default being
+   * inherited.
+   */
+  #expiry(): { expires_at?: string } {
+    const at = this.#config.identityExpiresAt;
+    return at ? { expires_at: at } : {};
+  }
+
+  /**
    * A ZeroID client authed as a specific agent (by its api_key) — used as the
    * delegation *subject* (orchestrator) when minting delegated sub-agent
    * tokens. The api_key grant makes this client speak for that identity.
@@ -210,6 +247,7 @@ export class AgentIdentityManager {
       const registerReq = {
         name: `codeoid/${sessionName}`,
         external_id: externalId,
+        ...this.#expiry(),
         // A coding agent — `identity_type=agent` types the node in the ZeroID
         // registry / delegation explorer, and `sub_type=code_agent` (accepted
         // by ZeroID's register enum) is the accurate role, matching how
@@ -294,6 +332,7 @@ export class AgentIdentityManager {
       const registerReq = {
         name: `codeoid/worker/${shape}/${sessionName}`,
         external_id: externalId,
+        ...this.#expiry(),
         identity_type: "agent" as const,
         sub_type: "tool_agent" as const,
         trust_level: "first_party" as const,
@@ -372,6 +411,7 @@ export class AgentIdentityManager {
       const registerReq = {
         name: `codeoid/${agentType}/${agentId.slice(0, 8)}`,
         external_id: externalId,
+        ...this.#expiry(),
         identity_type: "agent" as const,
         sub_type: "tool_agent" as const,
         trust_level: "first_party" as const,
@@ -589,6 +629,24 @@ export class AgentIdentityManager {
     return this.#agents.get(sessionId)?.wimseUri;
   }
 
+  /**
+   * The credential a session's agent should present on LLM-gateway calls
+   * (forge#111) — its own api_key, which ZeroID resolves to a token carrying
+   * `AGENT_TOOL_SCOPES`.
+   *
+   * The api_key rather than the stored access token, because that is the shape
+   * the gateway's `x-highflame-apikey` header already carries: Forge puts the
+   * sandbox badge's api_key there and the gateway exchanges it. Handing back
+   * the same shape keeps the swap a substitution rather than a protocol change.
+   *
+   * Undefined when no identity is registered for the session — registration is
+   * best-effort by design, and the caller leaves the launch-time credential
+   * alone rather than inventing one.
+   */
+  getGatewayCredential(sessionId: string): string | undefined {
+    return this.#agents.get(sessionId)?.apiKey;
+  }
+
   // ── Conductor identity (durable, owner-delegated — design R1/R2) ──────
 
   /** The conductor's stable WIMSE URI, when one is registered/resumed. */
@@ -624,6 +682,7 @@ export class AgentIdentityManager {
       const registerReq = {
         name: "codeoid/conductor",
         external_id: externalId,
+        ...this.#expiry(),
         identity_type: "agent" as const,
         sub_type: "orchestrator" as const,
         trust_level: "first_party" as const,

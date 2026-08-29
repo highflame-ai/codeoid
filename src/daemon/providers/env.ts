@@ -81,6 +81,73 @@ export function buildSubprocessEnv(
 }
 
 /**
+ * The header Highflame's AI gateway (firehog) authenticates a sandboxed agent
+ * on. Forge injects it at launch carrying the SANDBOX BADGE; see
+ * `withGatewayCredential` for why that is the wrong credential to keep.
+ */
+const GATEWAY_HEADER = "x-highflame-apikey";
+
+/**
+ * Re-point the LLM-gateway credential at the identity actually doing the work.
+ *
+ * Forge launches a sandbox with the per-sandbox BADGE wired in as the gateway
+ * credential (`x-highflame-apikey`, plus `ANTHROPIC_AUTH_TOKEN` when the user
+ * brought no key of their own). The badge is deliberately narrow — `nhi:manage`
+ * so codeoid can register its own identities, plus the `session:*` / `fs:read`
+ * / `pipeline:*` web-operator set — and it holds no `tools:*` at all.
+ *
+ * Shield checks the privilege ceiling before Cedar and before any detector:
+ * `process_prompt` requires `tools:read`. So every LLM call a sandbox made was
+ * denied outright — "token missing required scope tools:read" — while the
+ * correct credential, the per-session identity registered with the full
+ * `tools:*` set, sat unused a few hundred milliseconds away (forge#111).
+ *
+ * Widening the badge would have been the wrong repair: those scopes would then
+ * be held sandbox-wide for the badge's whole life, which is exactly what the
+ * per-session identity exists to avoid. The credential moves instead.
+ *
+ * Two deliberate rules:
+ *
+ * - **Only rewrites what is already there.** No `x-highflame-apikey` header
+ *   means this is not a gateway launch — a local run, or direct-to-provider
+ *   mode — and nothing is added. This function cannot put a credential
+ *   somewhere one was not already flowing.
+ * - **`ANTHROPIC_AUTH_TOKEN` moves only when it is the badge.** Forge sets it
+ *   to the badge only in the key-free case, where the badge doubles as the
+ *   CLI's boot credential; when the user brought BYOK or a subscription token
+ *   it is *theirs* and rides through the gateway to the provider untouched.
+ *   Equality with the gateway header is what tells the two apart, so a user's
+ *   own credential is never silently swapped for an agent identity.
+ *
+ * Pure; `env` is not mutated.
+ */
+export function withGatewayCredential(
+  env: Record<string, string>,
+  credential: string | undefined,
+): Record<string, string> {
+  const headers = env.ANTHROPIC_CUSTOM_HEADERS;
+  if (!credential || !headers) return env;
+
+  let badge: string | undefined;
+  // Claude Code takes newline-separated `Name: value` pairs.
+  const rewritten = headers
+    .split("\n")
+    .map((line) => {
+      const sep = line.indexOf(":");
+      if (sep < 0) return line;
+      if (line.slice(0, sep).trim().toLowerCase() !== GATEWAY_HEADER) return line;
+      badge = line.slice(sep + 1).trim();
+      return `${line.slice(0, sep)}: ${credential}`;
+    })
+    .join("\n");
+  if (badge === undefined) return env;
+
+  const out: Record<string, string> = { ...env, ANTHROPIC_CUSTOM_HEADERS: rewritten };
+  if (out.ANTHROPIC_AUTH_TOKEN === badge) out.ANTHROPIC_AUTH_TOKEN = credential;
+  return out;
+}
+
+/**
  * Environment for the `pi --mode rpc` subprocess.
  *
  * pi's primary credential store is `~/.pi/agent/auth.json` (HOME is in the

@@ -43,7 +43,7 @@ import type { CodeoidConfig } from "../../../config.js";
 import type { AuthContext } from "../../../protocol/types.js";
 import type { SessionProvider, ModelInfo, NormalizedTurnResult, ProviderEvent, SessionScopedEvent, TurnOpts, TurnRun } from "../interface.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
-import { buildSubprocessEnv } from "../env.js";
+import { buildSubprocessEnv, withGatewayCredential } from "../env.js";
 import type { LLMCallUsage } from "../../context-math.js";
 import type { PackSubagent } from "../../pipeline/subagents.js";
 
@@ -521,7 +521,16 @@ export class ClaudeProvider implements SessionProvider {
         // Explicit env allowlist — never inherit the daemon's full process.env
         // (which holds the root ZeroID key + control-channel secrets). See
         // buildAgentEnv (GHSA-38vh vector 3).
-        env: buildAgentEnv(),
+        //
+        // The gateway credential is resolved HERE rather than at construction:
+        // the session identity is registered on the first send
+        // (`#ensureAgentIdentity`, gated on `!provider.hasQueried`), so it does
+        // not exist when this provider is built — and reading it too early
+        // would silently leave every call on the badge, which is the bug
+        // (forge#111) rather than a partial fix for it.
+        env: buildAgentEnv(process.env, {
+          gatewayCredential: init.identityManager?.getGatewayCredential(init.sessionId),
+        }),
         allowedTools: [
           // Every EXACT TOOL NAME here is auto-approved by the SDK BEFORE
           // canUseTool is consulted, so it never reaches our gate — the SDK
@@ -1492,13 +1501,21 @@ export function parseMcpServerConfig(value: unknown): McpServerConfig | null {
  * Vertex) can extend the allowlist via `CODEOID_AGENT_ENV_ALLOW` (comma-
  * separated names) without reopening the hole for unrelated secrets.
  *
+ * `gatewayCredential` re-points a Highflame-gateway launch at the session's own
+ * identity instead of the sandbox badge Forge wired in (forge#111) — see
+ * `withGatewayCredential`, which is a no-op on every other deployment.
+ *
  * Pure + exported for unit testing.
  */
-export function buildAgentEnv(base: Record<string, string | undefined> = process.env): Record<string, string> {
+export function buildAgentEnv(
+  base: Record<string, string | undefined> = process.env,
+  opts: { gatewayCredential?: string } = {},
+): Record<string, string> {
   // The CLI's own namespaces (auth token, base url, model, feature flags)
   // plus POSIX locale categories (LC_ALL, LC_CTYPE, …). Shared basics +
   // CODEOID_AGENT_ENV_ALLOW come from buildSubprocessEnv.
-  return buildSubprocessEnv({ prefixes: ["ANTHROPIC_", "CLAUDE_", "LC_"] }, base);
+  const env = buildSubprocessEnv({ prefixes: ["ANTHROPIC_", "CLAUDE_", "LC_"] }, base);
+  return withGatewayCredential(env, opts.gatewayCredential);
 }
 
 export function extractToolResultText(content: unknown): string {

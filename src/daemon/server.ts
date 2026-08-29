@@ -158,6 +158,9 @@ export interface DaemonConfig {
     projectId: string;
     /** ZeroID registrar key (zid_sk_*) authenticating agent registration. */
     registrarKey?: string;
+    /** RFC3339 expiry of the identity `registrarKey` belongs to — every child
+     *  identity is capped to it, so none outlives the sandbox (forge#110). */
+    identityExpiresAt?: string;
   };
   /** Memory config — when present, episodes are stored and recall() is exposed to Claude. */
   memory?: {
@@ -267,6 +270,7 @@ export class DaemonServer {
           accountId: config.agentIdentity.accountId,
           projectId: config.agentIdentity.projectId,
           registrarKey: config.agentIdentity.registrarKey,
+          identityExpiresAt: config.agentIdentity.identityExpiresAt,
         },
         this.#store,
       );

@@ -5,7 +5,7 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { buildPiEnv, buildSubprocessEnv } from "../daemon/providers/env.js";
+import { buildPiEnv, buildSubprocessEnv, withGatewayCredential } from "../daemon/providers/env.js";
 import { buildAgentEnv } from "../daemon/providers/claude/index.js";
 
 const DAEMON_ENV: Record<string, string> = {
@@ -103,5 +103,78 @@ describe("buildAgentEnv (claude) delegation", () => {
     expect(env.OPENAI_API_KEY).toBeUndefined();
     expect(env.GROQ_API_KEY).toBeUndefined();
     expect(env.TELEGRAM_BOT_TOKEN).toBeUndefined();
+  });
+});
+
+/**
+ * forge#111 — a sandbox sent the BADGE on gateway LLM calls, and the badge
+ * holds no `tools:*`, so Shield denied every request before detectors or Cedar
+ * ran. The per-session identity with the right scopes existed and went unused.
+ */
+describe("withGatewayCredential (forge#111)", () => {
+  const SANDBOX_ENV: Record<string, string> = {
+    ANTHROPIC_BASE_URL: "https://gateway.highflame.ai",
+    ANTHROPIC_CUSTOM_HEADERS: "x-highflame-apikey: zid_sk_badge",
+    ANTHROPIC_AUTH_TOKEN: "zid_sk_badge",
+  };
+
+  it("sends the session credential, not the badge", () => {
+    const env = withGatewayCredential(SANDBOX_ENV, "zid_sk_session");
+    expect(env.ANTHROPIC_CUSTOM_HEADERS).toBe("x-highflame-apikey: zid_sk_session");
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe("zid_sk_session");
+  });
+
+  it("leaves a BYOK auth token alone", () => {
+    // Forge sets ANTHROPIC_AUTH_TOKEN to the badge ONLY when the user brought
+    // no key. A different value means it is the user's own credential, riding
+    // through the gateway to the provider — swapping it for an agent identity
+    // would break the launch mode it belongs to.
+    const env = withGatewayCredential(
+      { ...SANDBOX_ENV, ANTHROPIC_AUTH_TOKEN: "sk-ant-users-own-key" },
+      "zid_sk_session",
+    );
+    expect(env.ANTHROPIC_CUSTOM_HEADERS).toBe("x-highflame-apikey: zid_sk_session");
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe("sk-ant-users-own-key");
+  });
+
+  it("adds nothing when the launch is not gateway-routed", () => {
+    // No x-highflame-apikey = a local run or direct-to-provider mode. This must
+    // never CREATE a credential path that was not already there.
+    const plain = { ANTHROPIC_API_KEY: "ant-key" };
+    expect(withGatewayCredential(plain, "zid_sk_session")).toEqual(plain);
+  });
+
+  it("is a no-op without a session credential", () => {
+    // Identity registration is best-effort; when it failed there is nothing
+    // better to send, so the launch-time credential is left exactly as-is.
+    expect(withGatewayCredential(SANDBOX_ENV, undefined)).toEqual(SANDBOX_ENV);
+  });
+
+  it("rewrites only the gateway header, and matches it case-insensitively", () => {
+    const env = withGatewayCredential(
+      {
+        ANTHROPIC_CUSTOM_HEADERS: "X-Highflame-Apikey: zid_sk_badge\nX-Trace-Id: abc123",
+        ANTHROPIC_AUTH_TOKEN: "zid_sk_badge",
+      },
+      "zid_sk_session",
+    );
+    expect(env.ANTHROPIC_CUSTOM_HEADERS).toBe(
+      "X-Highflame-Apikey: zid_sk_session\nX-Trace-Id: abc123",
+    );
+  });
+
+  it("does not mutate the env it was given", () => {
+    const original = { ...SANDBOX_ENV };
+    withGatewayCredential(SANDBOX_ENV, "zid_sk_session");
+    expect(SANDBOX_ENV).toEqual(original);
+  });
+
+  it("reaches the claude subprocess through buildAgentEnv", () => {
+    const env = buildAgentEnv(
+      { ...SANDBOX_ENV, PATH: "/usr/bin" },
+      { gatewayCredential: "zid_sk_session" },
+    );
+    expect(env.ANTHROPIC_CUSTOM_HEADERS).toBe("x-highflame-apikey: zid_sk_session");
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe("zid_sk_session");
   });
 });
