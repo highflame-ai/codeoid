@@ -61,7 +61,13 @@ import { promisify } from "node:util";
 const execFileP = promisify(execFile);
 /** Max wall-clock for a fork.setup command (deps install can be slow). */
 const FORK_SETUP_TIMEOUT_MS = 600_000;
-import { authToIdentity, CAPABILITIES, isActiveStatus, SYSTEM_IDENTITY } from "../protocol/types.js";
+import {
+  authToIdentity,
+  CAPABILITIES,
+  isActiveStatus,
+  REASONING_UNAVAILABLE,
+  SYSTEM_IDENTITY,
+} from "../protocol/types.js";
 import type { Store } from "./store.js";
 import type { AgentIdentityManager } from "./agent-identity.js";
 import { ScrollbackBuffer } from "./scrollback.js";
@@ -1801,7 +1807,11 @@ export class Session {
     if (wasWorking && this.#activeRun?.pushMidTurn) {
       const hint =
         effectivePriority === "now"
-          ? "⎆ Queued mid-turn — Claude is re-integrating with new context"
+          ? // Provider-agnostic: this path is reached by any keep-warm backend
+            // that supports mid-turn injection, so naming Claude here surfaced
+            // "Claude is re-integrating" in the middle of a Qwen conversation —
+            // which reads like the wrong backend answered.
+            "⎆ Queued mid-turn — the agent is re-integrating with new context"
           : effectivePriority === "next"
             ? "⎆ Queued — will be picked up after current turn completes"
             : "⎆ Queued";
@@ -4310,7 +4320,11 @@ export class Session {
     this.#activeThinkingMsg = null;
     this.#activeThinkingIndex = null;
     if (!m.content || m.content.length === 0) {
-      m.content = "(reasoning elided)";
+      // Not an elision by codeoid — the backend returned no readable reasoning.
+      // Claude does this whenever `thinking.display` is `"omitted"`; backends
+      // that stream plaintext reasoning (qwen-code, OSS models over an
+      // OpenAI-compatible gateway) land in the branch above with real content.
+      m.content = REASONING_UNAVAILABLE;
     }
     this.#commitStreamed(m);
     this.#broadcastRaw(m);

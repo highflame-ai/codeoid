@@ -19,6 +19,7 @@ import {
   createFrameThrottled,
   splitStreamingBlocks,
 } from "../../lib/streaming-markdown";
+import { REASONING_UNAVAILABLE } from "../../protocol/types";
 import type {
   MessageRole,
   SessionMessage,
@@ -208,17 +209,41 @@ const ThinkingBlock: Component<{ text: string; streaming?: boolean }> = (props) 
     () => props.text,
     () => props.streaming === true,
   );
+  /**
+   * Whether there is real reasoning behind this block.
+   *
+   * Backends differ and both branches are normal: qwen-code and OSS models over
+   * an OpenAI-compatible gateway stream plaintext reasoning, while Claude
+   * returns readable text only under `thinking.display: "summarized"`. When
+   * there is nothing, an expander is actively misleading — it advertises
+   * content, counts "1 lines", and opens onto a placeholder. Render a flat
+   * marker instead, so the thinking→answer rhythm still reads without
+   * promising something that can't be shown.
+   */
+  const hasReasoning = createMemo(() => {
+    const t = throttled().trim();
+    return t.length > 0 && t !== REASONING_UNAVAILABLE;
+  });
   const lineCount = createMemo(() => countLines(throttled()));
   return (
-    <details class="text-[12px] italic text-role-thinking" open={props.streaming}>
-      <summary class="cursor-pointer select-none text-fg-faint hover:text-fg-muted">
-        reasoning ({lineCount()} lines)
-        <Show when={props.streaming}>
-          <span class="md-streaming-caret ml-1" aria-label="streaming" />
-        </Show>
-      </summary>
-      <div class="mt-1 whitespace-pre-wrap pl-3">{throttled()}</div>
-    </details>
+    <Show
+      when={hasReasoning()}
+      fallback={
+        <div class="text-[12px] italic text-fg-faint" aria-label="reasoning unavailable">
+          {REASONING_UNAVAILABLE}
+        </div>
+      }
+    >
+      <details class="text-[12px] italic text-role-thinking" open={props.streaming}>
+        <summary class="cursor-pointer select-none text-fg-faint hover:text-fg-muted">
+          reasoning ({lineCount()} {lineCount() === 1 ? "line" : "lines"})
+          <Show when={props.streaming}>
+            <span class="md-streaming-caret ml-1" aria-label="streaming" />
+          </Show>
+        </summary>
+        <div class="mt-1 whitespace-pre-wrap pl-3">{throttled()}</div>
+      </details>
+    </Show>
   );
 };
 
