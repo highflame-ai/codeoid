@@ -657,6 +657,13 @@ export class SessionManager {
           hooks: this.#hooks,
           identityManager: this.#identityManager,
           existingId: meta.sessionId,
+          // Identity timestamps are durable, not turn state. Without these the
+          // constructor re-stamps both to `now`, which re-dates every session
+          // on every restart and ties them all on recency — collapsing the
+          // attention ordering this pass is already sorted by (resumeSortKey
+          // reads the very same `meta.lastActivityAt`).
+          createdAt: meta.createdAt,
+          lastActivityAt: meta.lastActivityAt,
           memory: this.#memory,
           memoryMcp: this.#memoryMcp,
 mcpRegistry: this.#mcpRegistry,
