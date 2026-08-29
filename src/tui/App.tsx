@@ -883,14 +883,18 @@ export function App({ config }: Props) {
   /**
    * Search handler passed into the modal. Returns hits directly so the
    * modal stays in control of its async state (loading, error, stale).
-   * Uses the focused session's workdir to anchor the workspace scope;
-   * falls back to cross-workspace when nothing is focused.
+   * `scope` comes from the modal (Tab toggles it): "workspace" anchors on
+   * the focused session's workdir, "all" runs cross-workspace resolution.
+   * The anchor is omitted for "all" so the daemon searches every workspace.
    */
-  const onSearch = async (q: string): Promise<import("../protocol/types.js").SessionSearchHit[]> => {
+  const onSearch = async (
+    q: string,
+    scope: import("./components/Modal.js").SearchScope,
+  ): Promise<import("../protocol/types.js").SessionSearchHit[]> => {
     const client = wsRef.current;
     if (!client) return [];
-    const workdir = focusedSession?.info.workdir;
-    const resp = await client.search(q, workdir, 10, "workspace");
+    const workdir = scope === "all" ? undefined : focusedSession?.info.workdir;
+    const resp = await client.search(q, workdir, 10, scope);
     if (resp.type === "session.search.result") {
       return resp.sessions;
     }

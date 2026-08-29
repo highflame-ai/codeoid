@@ -338,4 +338,50 @@ describe("SessionManager session.search scope plumbing", () => {
     store.close();
     rmSync(dir, { recursive: true, force: true });
   });
+
+  it('scope:"workspace" with no resolvable anchor falls back to cross-workspace', async () => {
+    // The protocol documents this fallback: when scope="workspace" and no
+    // workdir is supplied, the daemon infers from caller focus — and with no
+    // focus either, searches every workspace. Previously it passed
+    // workspaceId:"" which matched a workspace that does not exist, so the
+    // search silently returned zero hits instead of falling back.
+    const { SessionManager } = await import("../daemon/session-manager.js");
+    const { Store } = await import("../daemon/store.js");
+    const { TranscriptStore } = await import("../daemon/transcript.js");
+
+    const dir = mkdtempSync(join(tmpdir(), "codeoid-search-fallback-"));
+    const store = new Store(join(dir, "db.sqlite"));
+    const transcript = new TranscriptStore(join(dir, "transcripts"));
+
+    const calls: Array<Record<string, unknown>> = [];
+    const fakeMemory = {
+      searchSessions: async (opts: Record<string, unknown>) => {
+        calls.push(opts);
+        return [];
+      },
+    } as unknown as MemoryEngine;
+
+    const manager = new SessionManager(store, transcript, undefined, undefined, fakeMemory);
+    const auth = {
+      sub: "user:t",
+      scopes: ["session:list"],
+      delegationDepth: 0,
+      accountId: "acc",
+      projectId: "proj",
+    };
+    // No sessions exist, so #guessCallerWorkdir has nothing to anchor on.
+    const fakeClient = { id: "c1", auth, send: () => {} };
+
+    await manager.handle(
+      { type: "session.search", id: "r1", query: "auth bug", scope: "workspace" } as never,
+      auth as never,
+      fakeClient as never,
+    );
+
+    expect(calls.length).toBe(1);
+    expect("workspaceId" in calls[0]!).toBe(false);
+
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
 });
