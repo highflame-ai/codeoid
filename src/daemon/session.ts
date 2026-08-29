@@ -185,6 +185,17 @@ export interface SessionCreateOptions {
   identityManager?: AgentIdentityManager;
   existingId?: string;
   /**
+   * Original creation time, restored on resume from `TranscriptMeta.createdAt`.
+   * Absent for a genuinely new session (stamped fresh below).
+   */
+  createdAt?: string;
+  /**
+   * Last activity time, restored on resume from
+   * `TranscriptMeta.lastActivityAt`. Absent for a new session, which falls
+   * back to `createdAt` — the same relationship the live tracker maintains.
+   */
+  lastActivityAt?: string;
+  /**
    * Called once per session with the live model catalog the backend
    * supports (e.g. the Claude Code SDK's `supportedModels()`), tagged with
    * the reporting provider's id so the manager can cache catalogs
@@ -697,8 +708,17 @@ export class Session {
         opts.initialMode.mode === "autonomous" ? opts.initialMode.maxTurns : undefined;
     }
     this.createdBy = opts.auth.sub;
-    this.createdAt = new Date().toISOString();
-    this.#lastActivityAt = this.createdAt;
+    // Restored from TranscriptMeta on resume, stamped fresh only for a new
+    // session. Both were previously unconditional `now`, which meant every
+    // daemon restart re-dated every session: `createdAt` became the restart
+    // moment (so a weeks-old session reported as brand new) and, because
+    // recency is `lastActivityAt ?? createdAt`, every session tied on the same
+    // instant and the attention ordering collapsed to insertion order. The
+    // values were already on disk and already read — SessionManager's
+    // `resumeSortKey` sorts the resume pass by `meta.lastActivityAt` — the
+    // constructor just overwrote them a moment later.
+    this.createdAt = opts.createdAt ?? new Date().toISOString();
+    this.#lastActivityAt = opts.lastActivityAt ?? this.createdAt;
     this.accountId = opts.auth.accountId;
     this.projectId = opts.auth.projectId;
     this.#store = opts.store;
