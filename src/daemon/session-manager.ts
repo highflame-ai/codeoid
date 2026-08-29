@@ -4730,7 +4730,12 @@ mcpHub: this.#mcpHub,
       // Global scope = OMIT workspaceId (the engine treats undefined as
       // "every workspace"); passing "" selected a nonexistent empty
       // workspace and scope:"all" always returned zero hits.
-      ...(scope === "all" ? {} : { workspaceId }),
+      //
+      // The same trap applies when scope="workspace" but no anchor could be
+      // resolved (no msg.workdir and no caller focus). The protocol says that
+      // case "falls back to cross-workspace", so omit the key instead of
+      // passing "" — which matched nothing and silently returned zero hits.
+      ...(scope === "all" || !workspaceId ? {} : { workspaceId }),
       limit,
       sessionNames,
     });
