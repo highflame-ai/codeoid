@@ -11,6 +11,13 @@ import type { ModalState, TuiSession } from "../types.js";
 import type { SessionSearchHit } from "../../protocol/types.js";
 import { MODEL_CATALOG, findModel, type ModelDescriptor } from "../../daemon/models.js";
 
+/**
+ * Which sessions a search covers. `workspace` scopes to the focused session's
+ * repo; `all` runs the cross-workspace resolution path (global fusion +
+ * cross-encoder rerank) — see docs/session-resolution.md.
+ */
+export type SearchScope = "workspace" | "all";
+
 interface Props {
   modal: ModalState;
   sessions: TuiSession[];
@@ -20,7 +27,7 @@ interface Props {
   onConfirmDestroy: (sessionId: string) => void;
   onCancel: () => void;
   /** Run a full-text + semantic session search. Resolves to result hits. */
-  onSearch?: (query: string) => Promise<SessionSearchHit[]>;
+  onSearch?: (query: string, scope: SearchScope) => Promise<SessionSearchHit[]>;
   /** Set the focused session's model. */
   onSetModel?: (model: string) => Promise<void>;
 }
@@ -57,6 +64,9 @@ export function Modal(props: Props) {
       return (
         <SearchModal
           query={props.modal.query}
+          // With no focused session there is no workspace to scope to, so
+          // open straight into cross-workspace rather than a dead scope.
+          initialScope={props.focusedSession ? "workspace" : "all"}
           onSearch={props.onSearch}
           onSelect={props.onSelectSession}
           onCancel={props.onCancel}
@@ -237,16 +247,19 @@ function ConfirmDestroyModal({
 
 function SearchModal({
   query,
+  initialScope,
   onSearch,
   onSelect,
   onCancel,
 }: {
   query: string;
-  onSearch?: (q: string) => Promise<SessionSearchHit[]>;
+  initialScope: SearchScope;
+  onSearch?: (q: string, scope: SearchScope) => Promise<SessionSearchHit[]>;
   onSelect: (id: string) => void;
   onCancel: () => void;
 }) {
   const [q, setQ] = useState(query);
+  const [scope, setScope] = useState<SearchScope>(initialScope);
   const [hits, setHits] = useState<SessionSearchHit[]>([]);
   const [isSearching, setIsSearching] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -254,7 +267,8 @@ function SearchModal({
 
   // Debounce — hit the daemon after the user stops typing for 200 ms.
   // Any typing in between cancels prior in-flight requests via a ref
-  // guard so old results don't race ahead of new ones.
+  // guard so old results don't race ahead of new ones. Toggling scope
+  // re-runs the same query through the other regime.
   const requestSeq = useRef(0);
   useEffect(() => {
     if (!onSearch) return;
@@ -270,7 +284,7 @@ function SearchModal({
       setIsSearching(true);
       setError(null);
       try {
-        const results = await onSearch(trimmed);
+        const results = await onSearch(trimmed, scope);
         if (seq !== requestSeq.current) return; // stale response
         setHits(results);
         setIdx(0);
@@ -283,10 +297,11 @@ function SearchModal({
       }
     }, 200);
     return () => clearTimeout(timer);
-  }, [q, onSearch]);
+  }, [q, scope, onSearch]);
 
   useInput((_input, key) => {
     if (key.escape) onCancel();
+    if (key.tab) setScope((s) => (s === "workspace" ? "all" : "workspace"));
     if (key.upArrow) setIdx((i) => Math.max(0, i - 1));
     if (key.downArrow) setIdx((i) => Math.min(Math.max(0, hits.length - 1), i + 1));
     if (key.return && hits[idx]) onSelect(hits[idx]!.sessionId);
@@ -301,6 +316,10 @@ function SearchModal({
     >
       <Text bold color="cyan">
         🔍 Search across sessions
+        <Text dimColor>{"  ·  scope: "}</Text>
+        <Text color={scope === "all" ? "green" : "yellow"}>
+          {scope === "all" ? "all workspaces" : "this workspace"}
+        </Text>
       </Text>
       <Box marginTop={1}>
         <Text>{"query: "}</Text>
@@ -316,9 +335,11 @@ function SearchModal({
       {q.trim().length === 0 ? (
         <Box marginTop={1}>
           <Text dimColor>
-            Hybrid search (FTS5 keywords + vector + recency). Searches every
-            message, tool call, and assistant reply across all sessions in
-            this workspace.
+            Hybrid search (FTS5 keywords + vector + recency) over every
+            message, tool call, and assistant reply.{" "}
+            {scope === "all"
+              ? "Searching sessions in every workspace, ranked as one batch and reranked by a cross-encoder."
+              : "Searching sessions in this workspace only — press Tab to search every workspace."}
           </Text>
         </Box>
       ) : isSearching && hits.length === 0 ? (
@@ -336,6 +357,7 @@ function SearchModal({
               key={hit.sessionId}
               hit={hit}
               selected={i === idx}
+              showWorkspace={scope === "all"}
             />
           ))}
         </Box>
@@ -343,7 +365,7 @@ function SearchModal({
 
       <Box marginTop={1}>
         <Text dimColor>
-          ↑↓ navigate · Enter to focus session · Esc to close
+          ↑↓ navigate · Enter to focus session · Tab to switch scope · Esc to close
         </Text>
       </Box>
     </Box>
@@ -353,18 +375,23 @@ function SearchModal({
 function SearchHitRow({
   hit,
   selected,
+  showWorkspace,
 }: {
   hit: SessionSearchHit;
   selected: boolean;
+  /** Cross-workspace results are ambiguous without the originating repo. */
+  showWorkspace?: boolean;
 }) {
   const bar = selected ? "▸ " : "  ";
   const when = formatAgo(hit.lastMatchAt);
   const top = hit.snippets[0];
+  const where = showWorkspace ? basename(hit.workdir) : "";
   return (
     <Box flexDirection="column" marginBottom={0}>
       <Text color={selected ? "cyan" : "white"} bold={selected}>
         {bar}
         {hit.sessionName}
+        {where && <Text dimColor>{` [${where}]`}</Text>}
         <Text dimColor>
           {` — ${hit.matchCount} match${hit.matchCount === 1 ? "" : "es"} · ${when}`}
         </Text>
@@ -384,6 +411,13 @@ function SearchHitRow({
       )}
     </Box>
   );
+}
+
+/** Last path segment of a workdir, for labelling cross-workspace hits. */
+function basename(p: string): string {
+  const trimmed = p.replace(/[/\\]+$/, "");
+  const cut = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+  return cut === -1 ? trimmed : trimmed.slice(cut + 1);
 }
 
 function formatAgo(when: number): string {
