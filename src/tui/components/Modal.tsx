@@ -413,8 +413,13 @@ function SearchHitRow({
   );
 }
 
-/** Last path segment of a workdir, for labelling cross-workspace hits. */
-function basename(p: string): string {
+/**
+ * Last path segment of a workdir, for labelling cross-workspace hits.
+ * Total on purpose: a hit whose session is no longer live can carry an
+ * empty workdir, and a missing repo label must not break the result list.
+ */
+function basename(p: string | undefined): string {
+  if (!p) return "";
   const trimmed = p.replace(/[/\\]+$/, "");
   const cut = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
   return cut === -1 ? trimmed : trimmed.slice(cut + 1);
