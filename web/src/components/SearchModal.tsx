@@ -27,6 +27,18 @@ import type {
 
 const DEBOUNCE_MS = 220;
 
+/**
+ * Which sessions a search covers. `workspace` scopes to the focused session's
+ * directory; `all` runs the cross-workspace resolution path (global fusion +
+ * cross-encoder rerank) — see docs/session-resolution.md.
+ *
+ * A workspace is a DIRECTORY, not a session family: every session that ever
+ * ran in that workdir under the same tenant shares it. Forks isolated into a
+ * git worktree get their own path, so they land OUTSIDE the parent's scope —
+ * which is precisely the case cross-workspace search exists to recover.
+ */
+type SearchScope = "workspace" | "all";
+
 const SearchModal: Component = () => {
   const [open, setOpen] = createSignal(false);
   const [query, setQuery] = createSignal("");
@@ -34,6 +46,15 @@ const SearchModal: Component = () => {
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
   const [highlight, setHighlight] = createSignal(0);
+  // Null until the user chooses; the effective scope falls back to "scoped if
+  // something is focused". Keeping the override separate from the derived
+  // default means focusing a session later doesn't silently undo the choice.
+  const [scopeOverride, setScopeOverride] = createSignal<SearchScope | null>(null);
+  const scope = createMemo<SearchScope>(
+    () => scopeOverride() ?? (focusedSession()?.workdir ? "workspace" : "all"),
+  );
+  /** Scoping is only meaningful when there is a workspace to scope to. */
+  const canScope = createMemo(() => Boolean(focusedSession()?.workdir));
 
   let inputRef: HTMLInputElement | undefined;
   let debounceTimer: ReturnType<typeof setTimeout> | undefined;
@@ -45,6 +66,7 @@ const SearchModal: Component = () => {
     setError(null);
     setHighlight(0);
     setBusy(false);
+    setScopeOverride(null);
   }
 
   // Global Ctrl+K to toggle, Esc to close.
@@ -71,9 +93,11 @@ const SearchModal: Component = () => {
     }),
   );
 
-  // Debounce + dispatch search on every query change.
+  // Debounce + dispatch search on every query OR scope change, so flipping
+  // the scope re-runs the current query through the other regime rather than
+  // leaving stale hits from the previous one on screen.
   createEffect(
-    on(query, async (q) => {
+    on([query, scope] as const, async ([q]) => {
       if (debounceTimer) clearTimeout(debounceTimer);
       const trimmed = q.trim();
       if (trimmed.length < 2) {
@@ -97,9 +121,12 @@ const SearchModal: Component = () => {
               id,
               query: trimmed,
               limit: 10,
-              ...(focusedSession()?.workdir
-                ? { workdir: focusedSession()!.workdir, scope: "workspace" }
-                : { scope: "all" }),
+              // Omit the anchor entirely when global — passing a workdir
+              // alongside scope:"all" is contradictory, and the daemon
+              // decides global-vs-scoped on the workspaceId's absence.
+              ...(scope() === "workspace" && focusedSession()?.workdir
+                ? { workdir: focusedSession()!.workdir, scope: "workspace" as const }
+                : { scope: "all" as const }),
             },
             {
               waitForResult: (m) =>
@@ -172,7 +199,41 @@ const SearchModal: Component = () => {
               autocomplete="off"
               spellcheck={false}
             />
-            <span class="rounded border border-border px-1.5 py-0.5 text-[10px] text-fg-faint">
+            <Show when={canScope()}>
+              <div
+                class="flex shrink-0 overflow-hidden rounded border border-border text-[10px]"
+                role="group"
+                aria-label="Search scope"
+              >
+                <button
+                  type="button"
+                  onClick={() => setScopeOverride("workspace")}
+                  aria-pressed={scope() === "workspace"}
+                  title="Search only sessions that ran in this session's directory"
+                  class={`px-2 py-0.5 transition ${
+                    scope() === "workspace"
+                      ? "bg-bg-active text-fg"
+                      : "text-fg-faint hover:bg-bg-hover"
+                  }`}
+                >
+                  This workspace
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setScopeOverride("all")}
+                  aria-pressed={scope() === "all"}
+                  title="Search every workspace, including forks isolated in their own git worktree"
+                  class={`border-l border-border px-2 py-0.5 transition ${
+                    scope() === "all"
+                      ? "bg-bg-active text-fg"
+                      : "text-fg-faint hover:bg-bg-hover"
+                  }`}
+                >
+                  All workspaces
+                </button>
+              </div>
+            </Show>
+            <span class="shrink-0 rounded border border-border px-1.5 py-0.5 text-[10px] text-fg-faint">
               Ctrl+K
             </span>
           </div>
@@ -184,6 +245,8 @@ const SearchModal: Component = () => {
             highlight={highlight()}
             setHighlight={setHighlight}
             onPick={pick}
+            scope={scope()}
+            onWiden={() => setScopeOverride("all")}
           />
         </div>
       </div>
@@ -199,6 +262,8 @@ const ResultsBody: Component<{
   highlight: number;
   setHighlight: (n: number) => void;
   onPick: (idx: number) => void;
+  scope: SearchScope;
+  onWiden: () => void;
 }> = (props) => {
   const empty = createMemo(
     () =>
@@ -216,11 +281,27 @@ const ResultsBody: Component<{
         <div class="p-3 text-xs text-fg-faint">searching…</div>
       </Show>
       <Show when={empty()}>
-        <div class="p-6 text-center text-sm text-fg-muted">No matches.</div>
+        <div class="p-6 text-center text-sm text-fg-muted">
+          <p>No matches in {props.scope === "all" ? "any workspace" : "this workspace"}.</p>
+          <Show when={props.scope === "workspace"}>
+            <button
+              type="button"
+              onClick={props.onWiden}
+              class="mt-2 rounded border border-border px-2 py-1 text-xs text-fg-muted transition hover:bg-bg-hover hover:text-fg"
+            >
+              Search all workspaces
+            </button>
+          </Show>
+        </div>
       </Show>
       <Show when={!props.busy && !props.error && props.query.trim().length < 2}>
         <div class="p-6 text-center text-sm text-fg-muted">
           <p>Type at least 2 characters to search across sessions.</p>
+          <p class="mt-1 text-xs text-fg-faint">
+            {props.scope === "all"
+              ? "Searching every workspace."
+              : "Searching this session's directory only."}
+          </p>
         </div>
       </Show>
       <ul class="divide-y divide-border">
