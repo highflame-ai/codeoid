@@ -114,6 +114,9 @@ export class QwenProvider implements SessionProvider {
   #seenSubagents = new Set<string>();
   /** Model the live loop was built with — the turn_done attribution fallback. */
   #currentModel: string | null = null;
+  /** Resolved gateway URL + credential path of the live loop — see #loadCatalog. */
+  #currentBaseUrl: string | null = null;
+  #currentAuthType: "openai" | "qwen-oauth" | null = null;
 
   constructor(init: QwenProviderInit) {
     this.#backingId = coerceBackingId(init.initialBackingId, init.sessionId);
@@ -198,12 +201,59 @@ export class QwenProvider implements SessionProvider {
   }
 
   async listModels(): Promise<ModelInfo[]> {
-    if (!this.#query) return [];
+    return this.#loadCatalog();
+  }
+
+  /**
+   * The model catalog, unioned from both sources it can come from.
+   *
+   * qwen-code's `getAvailableModels()` is NOT a catalog fetch — it returns
+   * `modelRegistry.getModelsForAuthType(currentAuthType)`, an in-memory
+   * registry seeded once at construction from (a) the hardcoded
+   * `QWEN_OAUTH_MODELS` (a single entry, `coder-model`) for `qwen-oauth` and
+   * (b) the user's `modelProviders` setting for every other authType. Under
+   * `authType: "openai"` with no `modelProviders` declared it returns `[]`,
+   * which is why the picker used to render empty against a gateway serving a
+   * dozen models: qwen-code never asks the gateway what it hosts.
+   *
+   * So on the `openai` path we ask the gateway ourselves — it is an
+   * OpenAI-compatible endpoint, so `GET /models` is authoritative and stays
+   * current as the provider adds models. The registry is still unioned in
+   * (rather than replaced) because it carries real display labels, and because
+   * `qwen-oauth` has a dynamic base URL and no key to present, so HTTP is not
+   * an option there and the registry is the only source.
+   *
+   * Everything the endpoint reports is returned. The response carries only
+   * `{id, object, created, owned_by}` — no modality field — so filtering
+   * non-chat entries (image/audio models) would mean pattern-matching ids,
+   * which is exactly the kind of hardcoded list this method exists to remove.
+   */
+  async #loadCatalog(): Promise<ModelInfo[]> {
+    const registry = this.#query
+      ? await this.#query
+          .getAvailableModels()
+          .then(normalizeModelCatalog)
+          .catch(() => [] as ModelInfo[])
+      : [];
+
+    if (this.#currentAuthType !== "openai") return registry;
+
+    const baseUrl = this.#currentBaseUrl ?? process.env.OPENAI_BASE_URL;
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!baseUrl || !apiKey) return registry;
+
     try {
-      const raw = await this.#query.getAvailableModels();
-      return normalizeModelCatalog(raw);
-    } catch {
-      return [];
+      const live = await fetchOpenAiModelCatalog(baseUrl, apiKey);
+      return unionCatalogs(live, registry);
+    } catch (err) {
+      // A catalog fetch is best-effort: the session still runs on the
+      // configured model, only the picker is poorer for it.
+      console.error(
+        `[qwen-provider ${this.#init.sessionId.slice(0, 8)}] model catalog fetch failed (${
+          err instanceof Error ? err.message : String(err)
+        }) — falling back to the qwen-code registry`,
+      );
+      return registry;
     }
   }
 
@@ -313,6 +363,8 @@ export class QwenProvider implements SessionProvider {
     const baseUrl = resolveQwenBaseUrl(qwenCfg?.baseUrl);
     const model = opts.model ?? qwenCfg?.model;
     this.#currentModel = model ?? null;
+    this.#currentBaseUrl = baseUrl ?? null;
+    this.#currentAuthType = authType;
 
     this.#query = query({
       prompt: this.#inputQueue,
@@ -385,10 +437,10 @@ export class QwenProvider implements SessionProvider {
     this.#hasQueried = true;
 
     if (init.onModels) {
-      void this.#query
-        .getAvailableModels()
-        .then((raw) => {
-          const models = normalizeModelCatalog(raw);
+      // Fired on every loop build, so a model added to the gateway shows up on
+      // the next session rather than waiting for a daemon restart.
+      void this.#loadCatalog()
+        .then((models) => {
           if (models.length > 0) {
             init.onModels?.(
               models.map((m) => ({
@@ -752,9 +804,17 @@ export function resolveQwenAuthType(
 
 /**
  * Normalize `Query.getAvailableModels()`, which is typed only as
- * `Record<string, unknown> | null`. Accepts the observed
- * `{ availableModels: [{ modelId, name, description }] }` shape plus a bare
- * array, and ignores anything else rather than throwing.
+ * `Record<string, unknown> | null`.
+ *
+ * The shape actually emitted by @qwen-code/sdk 0.1.8 is
+ * `{ subtype, models: [{ id, label, capabilities, contextWindowSize }] }` —
+ * note `label`, not `name`, and no `description` (the CLI's
+ * `handleGetAvailableModels` projects the registry entry down to those four
+ * fields, dropping the description the registry itself carries). `name` /
+ * `modelId` / `availableModels` are kept as accepted aliases so a future
+ * rename doesn't silently empty the picker.
+ *
+ * A bare array is accepted too; anything else yields `[]` rather than throwing.
  */
 export function normalizeModelCatalog(raw: unknown): ModelInfo[] {
   const list = Array.isArray(raw)
@@ -774,13 +834,84 @@ export function normalizeModelCatalog(raw: unknown): ModelInfo[] {
     const e = entry as Record<string, unknown>;
     const id = typeof e.modelId === "string" ? e.modelId : typeof e.id === "string" ? e.id : null;
     if (!id) continue;
+    const label =
+      typeof e.label === "string" ? e.label : typeof e.name === "string" ? e.name : id;
     out.push({
       id,
-      displayName: typeof e.name === "string" ? e.name : id,
+      displayName: label,
       ...(typeof e.description === "string" ? { description: e.description } : {}),
     });
   }
   return out;
+}
+
+/** Give up on a catalog fetch well inside any reasonable session-start budget. */
+const CATALOG_FETCH_TIMEOUT_MS = 10_000;
+
+/**
+ * Fetch an OpenAI-compatible `GET /models` catalog.
+ *
+ * Every gateway codeoid points the qwen backend at (DashScope, the Bailian
+ * token-plan host, or a bring-your-own URL) speaks the OpenAI wire protocol —
+ * that is the whole premise of `authType: "openai"` — so `/models` is
+ * available and authoritative. Response shape is
+ * `{ object: "list", data: [{ id, object, created, owned_by }] }`; only `id`
+ * is load-bearing here.
+ *
+ * Exported for unit testing. Throws on transport error or non-2xx.
+ */
+export async function fetchOpenAiModelCatalog(
+  baseUrl: string,
+  apiKey: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<ModelInfo[]> {
+  const url = `${baseUrl.replace(/\/+$/, "")}/models`;
+  const res = await fetchImpl(url, {
+    headers: { Authorization: `Bearer ${apiKey}` },
+    signal: AbortSignal.timeout(CATALOG_FETCH_TIMEOUT_MS),
+  });
+  if (!res.ok) throw new Error(`GET ${url} → ${res.status} ${res.statusText}`);
+  const body: unknown = await res.json();
+  const data = (body as { data?: unknown })?.data;
+  if (!Array.isArray(data)) return [];
+  const out: ModelInfo[] = [];
+  for (const entry of data) {
+    const id =
+      typeof entry === "string"
+        ? entry
+        : typeof (entry as { id?: unknown })?.id === "string"
+          ? ((entry as { id: string }).id)
+          : null;
+    if (id) out.push({ id, displayName: id });
+  }
+  return out;
+}
+
+/**
+ * Union two catalogs, deduped by model id, `primary` order first.
+ *
+ * Where both sources carry the same id, the richer entry wins: an entry whose
+ * `displayName` differs from its id has a real human label behind it (the
+ * qwen-code registry supplies these; `/models` returns bare ids), so that one
+ * is kept and its description carried over.
+ *
+ * Exported for unit testing.
+ */
+export function unionCatalogs(
+  primary: readonly ModelInfo[],
+  secondary: readonly ModelInfo[],
+): ModelInfo[] {
+  const labelled = (m: ModelInfo): boolean => m.displayName !== m.id;
+  const byId = new Map<string, ModelInfo>();
+  for (const m of [...primary, ...secondary]) {
+    const existing = byId.get(m.id);
+    if (!existing) {
+      byId.set(m.id, m);
+      continue;
+    }
+    if (!labelled(existing) && labelled(m)) byId.set(m.id, m);
+  }
+  return [...byId.values()];
 }
 
 /**
