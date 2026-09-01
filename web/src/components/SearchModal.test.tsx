@@ -11,7 +11,11 @@ vi.mock("../state/connection", () => ({
 }));
 
 import SearchModal from "./SearchModal";
-import { _resetSessionsForTest } from "../state/sessions";
+import {
+  _resetSessionsForTest,
+  focusSession,
+  ingestSessionList,
+} from "../state/sessions";
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -83,5 +87,88 @@ describe("SearchModal stale in-flight results", () => {
     fireEvent.input(input, { target: { value: "s" } });
     await vi.advanceTimersByTimeAsync(10);
     expect(queryByText(/search exploded/)).toBeNull();
+  });
+});
+
+describe("SearchModal scope toggle", () => {
+  /** Seed one focused session so there is a workspace worth scoping to. */
+  function seedFocused(workdir = "/repos/alpha") {
+    ingestSessionList([
+      {
+        id: "sess-a",
+        name: "alpha",
+        workdir,
+        status: "idle",
+        createdBy: "user:t",
+        createdAt: new Date().toISOString(),
+      } as never,
+    ]);
+    focusSession("sess-a");
+  }
+
+  function lastSearch(): Record<string, unknown> {
+    return requestMock.mock.calls.at(-1)![0] as Record<string, unknown>;
+  }
+
+  it("scopes to the focused session's workdir by default", async () => {
+    seedFocused();
+    const { input } = openModal();
+
+    fireEvent.input(input, { target: { value: "auth token" } });
+    await vi.advanceTimersByTimeAsync(250);
+
+    expect(lastSearch().scope).toBe("workspace");
+    expect(lastSearch().workdir).toBe("/repos/alpha");
+  });
+
+  it("searches every workspace when nothing is focused", async () => {
+    const { input } = openModal();
+
+    fireEvent.input(input, { target: { value: "auth token" } });
+    await vi.advanceTimersByTimeAsync(250);
+
+    expect(lastSearch().scope).toBe("all");
+    // No anchor may ride along — the daemon decides global on its absence.
+    expect(lastSearch().workdir).toBeUndefined();
+  });
+
+  it("re-runs the query globally when the scope toggle is used", async () => {
+    seedFocused();
+    const { input, getByText } = openModal();
+
+    fireEvent.input(input, { target: { value: "auth token" } });
+    await vi.advanceTimersByTimeAsync(250);
+    expect(lastSearch().scope).toBe("workspace");
+    const before = requestMock.mock.calls.length;
+
+    fireEvent.click(getByText("All workspaces"));
+    await vi.advanceTimersByTimeAsync(250);
+
+    // Same query, other regime — no retyping required.
+    expect(requestMock.mock.calls.length).toBeGreaterThan(before);
+    expect(lastSearch().scope).toBe("all");
+    expect(lastSearch().query).toBe("auth token");
+    expect(lastSearch().workdir).toBeUndefined();
+  });
+
+  it("hides the toggle when there is no workspace to scope to", () => {
+    const { queryByText } = openModal();
+    expect(queryByText("All workspaces")).toBeNull();
+    expect(queryByText("This workspace")).toBeNull();
+  });
+
+  it("offers a widen button when a scoped search finds nothing", async () => {
+    seedFocused();
+    const { input, findByText } = openModal();
+
+    fireEvent.input(input, { target: { value: "auth token" } });
+    await vi.advanceTimersByTimeAsync(250);
+
+    // Zero hits under workspace scope is exactly when widening helps.
+    expect(await findByText(/No matches in this workspace/)).toBeTruthy();
+    fireEvent.click(await findByText("Search all workspaces"));
+    await vi.advanceTimersByTimeAsync(250);
+
+    expect(lastSearch().scope).toBe("all");
   });
 });
