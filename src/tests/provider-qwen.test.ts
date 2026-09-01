@@ -3,6 +3,8 @@ import {
   translateQwenMessage,
   resolveQwenAuthType,
   normalizeModelCatalog,
+  fetchOpenAiModelCatalog,
+  unionCatalogs,
   extractToolResultText,
   coerceBackingId,
   type QwenTranslateState,
@@ -393,11 +395,114 @@ describe("normalizeModelCatalog", () => {
     ).toEqual([{ id: "qwen3.8-max", displayName: "Qwen3.8 Max", description: "flagship" }]);
   });
 
+  // The shape @qwen-code/sdk 0.1.8 actually returns: `models` (not
+  // `availableModels`), `id` (not `modelId`), `label` (not `name`), and no
+  // description. Reading only `name` left every entry displaying its raw id.
+  test("reads the real sdk 0.1.8 shape — models[] with id + label", () => {
+    expect(
+      normalizeModelCatalog({
+        subtype: "get_available_models",
+        models: [
+          { id: "qwen3.8-max", label: "Qwen 3.8 Max", capabilities: {}, contextWindowSize: 1000000 },
+          { id: "glm-5.2", label: "GLM 5.2", capabilities: {}, contextWindowSize: 1000000 },
+        ],
+      }),
+    ).toEqual([
+      { id: "qwen3.8-max", displayName: "Qwen 3.8 Max" },
+      { id: "glm-5.2", displayName: "GLM 5.2" },
+    ]);
+  });
+
+  test("falls back to the id when no label or name is present", () => {
+    expect(normalizeModelCatalog({ models: [{ id: "qwen3.8-flash" }] })).toEqual([
+      { id: "qwen3.8-flash", displayName: "qwen3.8-flash" },
+    ]);
+  });
+
   test("tolerates bare arrays, strings, and junk without throwing", () => {
     expect(normalizeModelCatalog(["a"])).toEqual([{ id: "a", displayName: "a" }]);
     expect(normalizeModelCatalog(null)).toEqual([]);
     expect(normalizeModelCatalog({ nope: 1 })).toEqual([]);
     expect(normalizeModelCatalog([{ noId: true }])).toEqual([]);
+  });
+});
+
+describe("fetchOpenAiModelCatalog", () => {
+  function stubFetch(status: number, body: unknown): typeof fetch {
+    return (async (url: string | URL | Request, init?: RequestInit) => {
+      stubFetch.lastUrl = String(url);
+      stubFetch.lastAuth = (init?.headers as Record<string, string>)?.Authorization;
+      return {
+        ok: status >= 200 && status < 300,
+        status,
+        statusText: String(status),
+        json: async () => body,
+      } as Response;
+    }) as unknown as typeof fetch;
+  }
+  stubFetch.lastUrl = "";
+  stubFetch.lastAuth = "";
+
+  test("reads the OpenAI /models list shape", async () => {
+    const f = stubFetch(200, {
+      object: "list",
+      data: [
+        { id: "qwen3.8-max", object: "model", owned_by: "system" },
+        { id: "glm-5.2", object: "model", owned_by: "system" },
+      ],
+    });
+    expect(await fetchOpenAiModelCatalog("https://gw/v1", "sk-sp-x", f)).toEqual([
+      { id: "qwen3.8-max", displayName: "qwen3.8-max" },
+      { id: "glm-5.2", displayName: "glm-5.2" },
+    ]);
+    expect(stubFetch.lastUrl).toBe("https://gw/v1/models");
+    expect(stubFetch.lastAuth).toBe("Bearer sk-sp-x");
+  });
+
+  test("strips trailing slashes off the base url", async () => {
+    await fetchOpenAiModelCatalog("https://gw/v1//", "k", stubFetch(200, { data: [] }));
+    expect(stubFetch.lastUrl).toBe("https://gw/v1/models");
+  });
+
+  test("throws on non-2xx so the caller can fall back to the registry", async () => {
+    await expect(
+      fetchOpenAiModelCatalog("https://gw/v1", "bad", stubFetch(401, {})),
+    ).rejects.toThrow(/401/);
+  });
+
+  test("tolerates a missing or junk data array", async () => {
+    expect(await fetchOpenAiModelCatalog("https://gw/v1", "k", stubFetch(200, {}))).toEqual([]);
+    expect(
+      await fetchOpenAiModelCatalog("https://gw/v1", "k", stubFetch(200, { data: [{ no: 1 }] })),
+    ).toEqual([]);
+  });
+});
+
+describe("unionCatalogs", () => {
+  test("dedupes by id and keeps the entry that has a real label", () => {
+    // /models returns bare ids; the qwen-code registry supplies labels.
+    const live = [{ id: "qwen3.8-max", displayName: "qwen3.8-max" }, { id: "glm-5.2", displayName: "glm-5.2" }];
+    const registry = [{ id: "qwen3.8-max", displayName: "Qwen 3.8 Max" }];
+    expect(unionCatalogs(live, registry)).toEqual([
+      { id: "qwen3.8-max", displayName: "Qwen 3.8 Max" },
+      { id: "glm-5.2", displayName: "glm-5.2" },
+    ]);
+  });
+
+  test("keeps registry-only models the gateway never reported", () => {
+    // qwen-oauth's built-in `coder-model` has no /models endpoint behind it.
+    expect(
+      unionCatalogs([], [{ id: "coder-model", displayName: "coder-model" }]),
+    ).toEqual([{ id: "coder-model", displayName: "coder-model" }]);
+  });
+
+  test("preserves primary ordering", () => {
+    expect(
+      unionCatalogs(
+        [{ id: "a", displayName: "a" }, { id: "b", displayName: "b" }],
+        [{ id: "b", displayName: "B!" }, { id: "c", displayName: "c" }],
+      ).map((m) => m.id),
+    ).toEqual(["a", "b", "c"]);
   });
 });
 

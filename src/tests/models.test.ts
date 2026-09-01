@@ -384,14 +384,26 @@ describe("models.list serves live → persisted → baked-in fallback, per provi
     expect(res.models.map((m) => m.value)).toEqual(["default", "fable", "opus"]);
   });
 
-  it("first live report wins per provider for the lifetime; empty reports ignored", async () => {
+  // Providers report on every query-loop build, so the newest report is the
+  // most current view of what the backend serves — a model added to a gateway
+  // must appear on the next session, not after a daemon restart.
+  it("latest live report wins per provider; empty reports ignored", async () => {
     const manager = new SessionManager(store, new TranscriptStore(join(tmp, "t")));
     const cache = manager as unknown as CacheModels;
     cache._cacheModels("claude", []);
     expect((await listModels(manager)).live).toBe(false);
     cache._cacheModels("claude", LIVE);
     cache._cacheModels("claude", [{ value: "other", displayName: "Other" }]);
+    expect((await listModels(manager)).models.map((m) => m.value)).toEqual(["other"]);
+  });
+
+  it("an empty report never clobbers an already-cached catalog", async () => {
+    const manager = new SessionManager(store, new TranscriptStore(join(tmp, "t")));
+    const cache = manager as unknown as CacheModels;
+    cache._cacheModels("claude", LIVE);
+    cache._cacheModels("claude", []);
     const res = await listModels(manager);
     expect(res.models.map((m) => m.value)).toEqual(["default", "fable", "opus"]);
+    expect(res.live).toBe(true);
   });
 });

@@ -1366,15 +1366,23 @@ mcpHub: this.#mcpHub,
   }
 
   /**
-   * Cache the live model catalog a provider reported. The list is
-   * version-static per provider within a daemon lifetime, so the first
-   * report per provider wins and we stop overwriting (cheap idempotence;
-   * avoids churn from every new session).
+   * Cache the live model catalog a provider reported.
    *
-   * The first report of each daemon lifetime is also persisted to SQLite
-   * (keyed by provider id), so subsequent boots serve current model names
-   * before any turn runs (see `#currentModels`) instead of the baked-in
-   * fallback that goes stale between codeoid releases.
+   * Every non-empty report wins, overwriting the previous one. Providers
+   * report on each query-loop build (i.e. session start), so a model added to
+   * a backend's gateway appears in the picker on the next session instead of
+   * waiting for a daemon restart — which matters now that the qwen backend
+   * resolves its catalog from a live `/models` call rather than a static list.
+   * An identical report is dropped before touching SQLite, so the common case
+   * (nothing changed since the last session) costs one comparison.
+   *
+   * EMPTY reports are ignored rather than cached: a backend that fails to
+   * answer must not clobber a good catalog with nothing.
+   *
+   * Each accepted report is persisted to SQLite (keyed by provider id), so
+   * subsequent boots serve current model names before any turn runs (see
+   * `#currentModels`) instead of the baked-in fallback that goes stale
+   * between codeoid releases.
    *
    * TypeScript-private (not `#`) so unit tests can exercise the persistence
    * path directly without a live backend query — same convention as
@@ -1385,13 +1393,15 @@ mcpHub: this.#mcpHub,
     providerId: string,
     raw: ReadonlyArray<{ value: string; displayName: string; description?: string }>,
   ): void {
-    if (this.#modelsCache.has(providerId) || raw.length === 0) return;
+    if (raw.length === 0) return;
     const models = raw.map((m) => ({
       value: m.value,
       displayName: m.displayName,
       ...(m.description ? { description: m.description } : {}),
       isDefault: m.value === "default",
     }));
+    const previous = this.#modelsCache.get(providerId);
+    if (previous && JSON.stringify(previous) === JSON.stringify(models)) return;
     this.#modelsCache.set(providerId, models);
     try {
       this.#store.saveModelCatalog(providerId, models);
