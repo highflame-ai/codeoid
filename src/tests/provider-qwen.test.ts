@@ -5,6 +5,7 @@ import {
   normalizeModelCatalog,
   fetchOpenAiModelCatalog,
   unionCatalogs,
+  isBackingSessionMissing,
   extractToolResultText,
   coerceBackingId,
   type QwenTranslateState,
@@ -424,6 +425,29 @@ describe("normalizeModelCatalog", () => {
     expect(normalizeModelCatalog(null)).toEqual([]);
     expect(normalizeModelCatalog({ nope: 1 })).toEqual([]);
     expect(normalizeModelCatalog([{ noId: true }])).toEqual([]);
+  });
+});
+
+describe("isBackingSessionMissing", () => {
+  // A fork primed from its parent's transcript has scrollback but no backing
+  // chat; after a daemon restart restoreScrollback marks it hasQueried, the
+  // next turn issues `resume`, and qwen-code exits 1 during initialization.
+  test("matches the generic CLI exit qwen-code gives for an unknown resume id", () => {
+    expect(isBackingSessionMissing("CLI process exited with code 1")).toBe(true);
+    expect(
+      isBackingSessionMissing("[Query] Initialization error: CLI process exited with code 1"),
+    ).toBe(true);
+  });
+
+  test("matches the claude-style message too", () => {
+    expect(isBackingSessionMissing("No conversation found with session ID: abc")).toBe(true);
+  });
+
+  test("does not match unrelated failures", () => {
+    expect(isBackingSessionMissing("CLI process exited with code 2")).toBe(false);
+    expect(isBackingSessionMissing("fetch failed: ECONNREFUSED")).toBe(false);
+    expect(isBackingSessionMissing("invalid_api_key")).toBe(false);
+    expect(isBackingSessionMissing("")).toBe(false);
   });
 });
 

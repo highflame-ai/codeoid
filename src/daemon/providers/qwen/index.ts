@@ -117,6 +117,10 @@ export class QwenProvider implements SessionProvider {
   /** Resolved gateway URL + credential path of the live loop — see #loadCatalog. */
   #currentBaseUrl: string | null = null;
   #currentAuthType: "openai" | "qwen-oauth" | null = null;
+  /** Guards backing-session recovery to one attempt — see the consumer's catch. */
+  #backingRecoveryAttempted = false;
+  /** Last content pushed to the CLI, replayed if recovery fires. */
+  #lastPushedContent: string | null = null;
 
   constructor(init: QwenProviderInit) {
     this.#backingId = coerceBackingId(init.initialBackingId, init.sessionId);
@@ -148,6 +152,8 @@ export class QwenProvider implements SessionProvider {
     this.#hasQueried = false;
     this.#pendingTools = [];
     this.#seenSubagents.clear();
+    this.#backingRecoveryAttempted = false;
+    this.#lastPushedContent = null;
   }
 
   // ── AgentProvider ─────────────────────────────────────────────────────────
@@ -296,6 +302,7 @@ export class QwenProvider implements SessionProvider {
       return;
     }
     try {
+      this.#lastPushedContent = content;
       this.#inputQueue.push({
         type: "user",
         message: { role: "user", content },
@@ -459,6 +466,8 @@ export class QwenProvider implements SessionProvider {
     const queue$ = this.#inputQueue;
     let selfTask: Promise<void> | null = null;
 
+    let recoverContent: string | null = null;
+
     selfTask = this.#consumerTask = (async () => {
       try {
         for await (const msg of query$) {
@@ -468,8 +477,20 @@ export class QwenProvider implements SessionProvider {
       } catch (err) {
         if (!ac.signal.aborted && this.#loopGeneration === myGeneration) {
           const emsg = err instanceof Error ? err.message : String(err);
-          console.error(`[qwen-provider ${init.sessionId.slice(0, 8)}] SDK query failed: ${emsg}`);
-          this.#emit({ type: "error", message: emsg });
+          if (
+            this.#hasQueried &&
+            !this.#backingRecoveryAttempted &&
+            this.#lastPushedContent !== null &&
+            isBackingSessionMissing(emsg)
+          ) {
+            console.error(
+              `[qwen-provider ${init.sessionId.slice(0, 8)}] backing session missing — scheduling recovery`,
+            );
+            recoverContent = this.#lastPushedContent;
+          } else {
+            console.error(`[qwen-provider ${init.sessionId.slice(0, 8)}] SDK query failed: ${emsg}`);
+            this.#emit({ type: "error", message: emsg });
+          }
         }
       } finally {
         if (this.#loopGeneration === myGeneration) {
@@ -481,6 +502,14 @@ export class QwenProvider implements SessionProvider {
         queue$?.close();
         if (this.#inputQueue === queue$) this.#inputQueue = null;
         if (this.#consumerTask === selfTask) this.#consumerTask = null;
+      }
+
+      // Post-teardown recovery, mirroring ClaudeProvider: Session resets us to
+      // a fresh backing id and replays the turn as a create. Skipped for a
+      // superseded loop — the rebuild already owns session continuity.
+      if (recoverContent !== null && this.#loopGeneration === myGeneration) {
+        this.#backingRecoveryAttempted = true;
+        this.onRecoveryNeeded?.(recoverContent);
       }
     })();
   }
@@ -843,6 +872,34 @@ export function normalizeModelCatalog(raw: unknown): ModelInfo[] {
     });
   }
   return out;
+}
+
+/**
+ * Does this SDK error look like "the backing session I asked to resume does
+ * not exist"?
+ *
+ * ClaudeProvider can match a precise string ("No conversation found with
+ * session ID"). qwen-code gives us nothing that specific: asked to `resume` a
+ * chat id it has no file for, the CLI exits during initialization and the SDK
+ * surfaces the generic `CLI process exited with code 1`. Reproduced against
+ * @qwen-code/sdk 0.1.8 — flipping only `sessionId:` to `resume:` for an
+ * unknown id turns a clean `result success` into exactly that error.
+ *
+ * So the match is necessarily broader than Claude's and will also catch a CLI
+ * that died at startup for an unrelated reason (a rejected key, say). That is
+ * acceptable because of how the call site is guarded: recovery only runs when
+ * we were RESUMING (`hasQueried`), only once per backing session
+ * (`backingRecoveryAttempted`), and it re-runs the same turn as a create. A
+ * misfire therefore costs one retry, after which the real error surfaces
+ * normally instead of being swallowed.
+ *
+ * Exported for unit testing.
+ */
+export function isBackingSessionMissing(message: string): boolean {
+  return (
+    /CLI process exited with code 1/i.test(message) ||
+    /No conversation found with session ID/i.test(message)
+  );
 }
 
 /** Give up on a catalog fetch well inside any reasonable session-start budget. */
