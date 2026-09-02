@@ -44,9 +44,9 @@ export interface ModelDescriptor {
  */
 export const MODEL_CATALOG: readonly ModelDescriptor[] = [
   {
-    id: "claude-opus-4-8",
+    id: "claude-opus-5",
     alias: "opus",
-    label: "Opus 4.8",
+    label: "Opus 5",
     contextWindow: 1_000_000,
     tier: "premium",
     description: "Deepest reasoning. Best for planning, refactoring, and hard problems.",
@@ -170,11 +170,32 @@ export function fallbackModelInfos(): ModelInfo[] {
 }
 
 /**
+ * Strip a context-window variant suffix: `opus[1m]` → `opus`.
+ *
+ * The backend advertises variants as a bracketed suffix on the VALUE, not the
+ * display name — the live list reports `opus[1m]` / "Opus (1M context)". A
+ * user (or a stored session) typing the bare alias `opus` must still match it,
+ * or resolution silently falls through to the baked-in catalog below and
+ * pins them to whatever point release that catalog last knew about.
+ *
+ * Exported for unit testing.
+ */
+export function stripVariantSuffix(value: string): string {
+  const i = value.indexOf("[");
+  return i === -1 ? value : value.slice(0, i);
+}
+
+/**
  * Resolve user input → a canonical model value against a (live or fallback)
- * `ModelInfo[]`. Matches by exact `value` or case-insensitive `displayName`
- * (so `opus` matches the backend's "Opus"), with a `claude-*` passthrough.
- * Returns null when the input matches nothing — the caller surfaces the set
- * of valid values.
+ * `ModelInfo[]`. Matches by exact `value`, by `value` with its variant suffix
+ * stripped (so `opus` matches the backend's `opus[1m]`), or by
+ * case-insensitive `displayName` (so `fable` matches "Fable"), with a
+ * `claude-*` passthrough. Returns null when the input matches nothing — the
+ * caller surfaces the set of valid values.
+ *
+ * Exact matches are checked across the WHOLE list before any suffix-stripped
+ * match, so a backend offering both `opus` and `opus[1m]` resolves `opus` to
+ * the exact entry rather than to whichever came first.
  */
 export function resolveAgainstList(
   input: string,
@@ -185,6 +206,9 @@ export function resolveAgainstList(
   const lower = t.toLowerCase();
   for (const m of models) {
     if (m.value.toLowerCase() === lower) return m.value;
+  }
+  for (const m of models) {
+    if (stripVariantSuffix(m.value).toLowerCase() === lower) return m.value;
     if (m.displayName.toLowerCase() === lower) return m.value;
   }
   if (/^claude-/i.test(t)) return t;
