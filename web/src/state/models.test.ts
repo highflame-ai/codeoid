@@ -14,6 +14,7 @@ import {
   modelCatalog,
   modelsLive,
   _resetModelsForTest,
+  resolveModelInput,
 } from "./models";
 import type { ModelInfo } from "../protocol/types";
 
@@ -123,5 +124,43 @@ describe("fetchModels — per-backend catalog", () => {
     resolveCodex(result("codex", CODEX));
     await codexFetch;
     expect(modelCatalog().map((m) => m.value)).toEqual(["opus", "sonnet"]);
+  });
+});
+
+describe("resolveModelInput — shares the daemon's rule", () => {
+  // The real payload: the backend reports the variant as a suffix on the
+  // VALUE ("opus[1m]") and a display name that never matches the bare alias
+  // ("Opus (1M context)"). The client used to compare only those two fields
+  // verbatim, so `/model opus` was rejected as unknown before the request was
+  // sent — while the daemon behind it resolved the very same input fine.
+  const LIVE: ModelInfo[] = [
+    { value: "default", displayName: "Default (recommended)" },
+    { value: "opus[1m]", displayName: "Opus (1M context)" },
+    { value: "claude-fable-5-1[1m]", displayName: "Fable" },
+    { value: "sonnet", displayName: "Sonnet" },
+  ];
+
+  it("resolves a bare alias against the variant-suffixed value", async () => {
+    requestMock.mockResolvedValueOnce(result("claude", LIVE));
+    await fetchModels("claude");
+    expect(resolveModelInput("opus")).toBe("opus[1m]");
+    expect(resolveModelInput("OPUS")).toBe("opus[1m]");
+  });
+
+  it("resolves an exact value and a display name", async () => {
+    requestMock.mockResolvedValueOnce(result("claude", LIVE));
+    await fetchModels("claude");
+    expect(resolveModelInput("sonnet")).toBe("sonnet");
+    expect(resolveModelInput("fable")).toBe("claude-fable-5-1[1m]");
+  });
+
+  it("passes input through before the catalog has arrived", () => {
+    expect(resolveModelInput("opus")).toBe("opus");
+  });
+
+  it("returns null for input that matches nothing", async () => {
+    requestMock.mockResolvedValueOnce(result("claude", LIVE));
+    await fetchModels("claude");
+    expect(resolveModelInput("nope")).toBeNull();
   });
 });
