@@ -17,31 +17,66 @@ import {
   DEFAULT_MODEL_ALIAS,
   fallbackModelInfos,
   resolveAgainstList,
+  stripVariantSuffix,
 } from "../daemon/models.js";
 import { Store } from "../daemon/store.js";
 import { SessionManager, DEFAULT_PROVIDER_ID } from "../daemon/session-manager.js";
 import { TranscriptStore } from "../daemon/transcript.js";
 
 describe("resolveAgainstList (live-backend resolution)", () => {
+  // Verbatim from `supportedModels()` on claude-agent-sdk 0.3.258. The
+  // previous fixture said the Opus entry's displayName was "Opus", which made
+  // the alias resolve by display-name match; the backend actually reports
+  // "Opus (1M context)", so `opus` matched nothing and silently fell through
+  // to the baked-in catalog. Keep this fixture honest to the real payload.
   const live = [
     { value: "default", displayName: "Default (recommended)", isDefault: true },
-    { value: "opus[1m]", displayName: "Opus" },
+    { value: "opus[1m]", displayName: "Opus (1M context)" },
+    { value: "claude-fable-5-1[1m]", displayName: "Fable" },
     { value: "sonnet", displayName: "Sonnet" },
+    { value: "haiku", displayName: "Haiku" },
   ];
 
   it("matches an exact value", () => {
     expect(resolveAgainstList("opus[1m]", live)).toBe("opus[1m]");
+    expect(resolveAgainstList("sonnet", live)).toBe("sonnet");
   });
-  it("matches a display name case-insensitively (alias-like)", () => {
+  it("matches a bare alias against a variant-suffixed value", () => {
     expect(resolveAgainstList("opus", live)).toBe("opus[1m]");
     expect(resolveAgainstList("OPUS", live)).toBe("opus[1m]");
   });
-  it("passes through a full claude-* id", () => {
-    expect(resolveAgainstList("claude-fable-5[1m]", live)).toBe("claude-fable-5[1m]");
+  it("matches a display name case-insensitively", () => {
+    expect(resolveAgainstList("fable", live)).toBe("claude-fable-5-1[1m]");
+    expect(resolveAgainstList("Default (recommended)", live)).toBe("default");
+  });
+  it("prefers an exact value over a suffix-stripped match", () => {
+    const both = [{ value: "opus[1m]", displayName: "Opus (1M context)" }, { value: "opus", displayName: "Opus" }];
+    expect(resolveAgainstList("opus", both)).toBe("opus");
+  });
+  it("matches a bare full id against its variant-suffixed entry", () => {
+    // Typing the plain id resolves to the 1M variant the backend actually
+    // offers, rather than falling through to the claude-* passthrough.
+    expect(resolveAgainstList("claude-fable-5-1", live)).toBe("claude-fable-5-1[1m]");
+  });
+  it("passes through a claude-* id the backend didn't advertise", () => {
+    // The catalog and the live list both go stale between releases; the
+    // passthrough is what keeps a brand-new id reachable in the meantime.
+    expect(resolveAgainstList("claude-opus-6", live)).toBe("claude-opus-6");
   });
   it("returns null for an unknown value", () => {
     expect(resolveAgainstList("o", live)).toBeNull();
     expect(resolveAgainstList("", live)).toBeNull();
+  });
+});
+
+describe("stripVariantSuffix", () => {
+  it("strips a bracketed context-window variant", () => {
+    expect(stripVariantSuffix("opus[1m]")).toBe("opus");
+    expect(stripVariantSuffix("claude-fable-5[1m]")).toBe("claude-fable-5");
+  });
+  it("leaves an unsuffixed value alone", () => {
+    expect(stripVariantSuffix("sonnet")).toBe("sonnet");
+    expect(stripVariantSuffix("")).toBe("");
   });
 });
 
@@ -55,6 +90,15 @@ describe("fallbackModelInfos", () => {
 });
 
 describe("MODEL_CATALOG shape", () => {
+  // The catalog is only the pre-first-report fallback, but a stale entry here
+  // is not harmless: it silently pins the alias to a superseded model on every
+  // path that misses the live list. `opus` sat on claude-opus-4-8 well after
+  // Opus 5 shipped. This asserts the generation, not the point release, so a
+  // real bump stays a one-line edit while a whole generation going stale fails.
+  it("maps the premium alias to the current Opus generation", () => {
+    expect(resolveModelId("opus")).toBe("claude-opus-5");
+  });
+
   it("covers the three canonical tiers", () => {
     expect(MODEL_CATALOG.length).toBeGreaterThanOrEqual(3);
     const tiers = new Set(MODEL_CATALOG.map((m) => m.tier));
