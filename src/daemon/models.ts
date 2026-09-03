@@ -170,47 +170,10 @@ export function fallbackModelInfos(): ModelInfo[] {
 }
 
 /**
- * Strip a context-window variant suffix: `opus[1m]` → `opus`.
- *
- * The backend advertises variants as a bracketed suffix on the VALUE, not the
- * display name — the live list reports `opus[1m]` / "Opus (1M context)". A
- * user (or a stored session) typing the bare alias `opus` must still match it,
- * or resolution silently falls through to the baked-in catalog below and
- * pins them to whatever point release that catalog last knew about.
- *
- * Exported for unit testing.
+ * Model-value resolution is shared with the web client via
+ * `@highflame/codeoid-core` — a daemon-local copy is how `opus` came to
+ * resolve correctly here while the client still rejected it. Re-exported so
+ * existing daemon imports of `resolveAgainstList` / `stripVariantSuffix` keep
+ * working against the one implementation.
  */
-export function stripVariantSuffix(value: string): string {
-  const i = value.indexOf("[");
-  return i === -1 ? value : value.slice(0, i);
-}
-
-/**
- * Resolve user input → a canonical model value against a (live or fallback)
- * `ModelInfo[]`. Matches by exact `value`, by `value` with its variant suffix
- * stripped (so `opus` matches the backend's `opus[1m]`), or by
- * case-insensitive `displayName` (so `fable` matches "Fable"), with a
- * `claude-*` passthrough. Returns null when the input matches nothing — the
- * caller surfaces the set of valid values.
- *
- * Exact matches are checked across the WHOLE list before any suffix-stripped
- * match, so a backend offering both `opus` and `opus[1m]` resolves `opus` to
- * the exact entry rather than to whichever came first.
- */
-export function resolveAgainstList(
-  input: string,
-  models: readonly ModelInfo[],
-): string | null {
-  const t = input?.trim();
-  if (!t) return null;
-  const lower = t.toLowerCase();
-  for (const m of models) {
-    if (m.value.toLowerCase() === lower) return m.value;
-  }
-  for (const m of models) {
-    if (stripVariantSuffix(m.value).toLowerCase() === lower) return m.value;
-    if (m.displayName.toLowerCase() === lower) return m.value;
-  }
-  if (/^claude-/i.test(t)) return t;
-  return null;
-}
+export { resolveAgainstList, stripVariantSuffix } from "@highflame/codeoid-core";

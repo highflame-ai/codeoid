@@ -7,6 +7,7 @@
  */
 
 import { createSignal } from "solid-js";
+import { resolveAgainstList } from "@highflame/codeoid-core";
 
 import { getClient, newRequestId } from "./connection";
 import type { ModelInfo, ModelsListResultMsg } from "../protocol/types";
@@ -74,25 +75,22 @@ export async function fetchModels(provider?: string, force = false): Promise<voi
 }
 
 /**
- * Resolve user input → a canonical model value against the fetched catalog,
- * mirroring the daemon: exact value, case-insensitive display name, or a
- * claude-* passthrough. Returns null when nothing matches (caller reports the
- * available values). When the catalog is empty (not yet fetched), returns the
- * trimmed input so we don't block before the list arrives — the daemon is the
- * backstop validator.
+ * Resolve user input → a canonical model value against the fetched catalog.
+ *
+ * Delegates to `@highflame/codeoid-core` so this cannot drift from the
+ * daemon's rule again — it previously did, and the client rejected `opus` as
+ * unknown (the live list offers `opus[1m]`) before the request was ever sent,
+ * while the daemon behind it would have resolved it. Returns null when nothing
+ * matches (caller reports the available values). When the catalog is empty
+ * (not yet fetched) the trimmed input passes through, so we don't block before
+ * the list arrives — the daemon is the backstop validator either way.
  */
 export function resolveModelInput(input: string): string | null {
   const t = input.trim();
   if (!t) return null;
   const list = models();
   if (list.length === 0) return t;
-  const lower = t.toLowerCase();
-  for (const m of list) {
-    if (m.value.toLowerCase() === lower) return m.value;
-    if (m.displayName.toLowerCase() === lower) return m.value;
-  }
-  if (/^claude-/i.test(t)) return t;
-  return null;
+  return resolveAgainstList(t, list);
 }
 
 export function _resetModelsForTest(): void {
