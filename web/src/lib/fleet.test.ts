@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 
-import { countVisible, filterFleet, groupFleet, roleLabel } from "./fleet";
+import { countVisible, filterFleet, groupFleet, roleLabel, workerShape } from "./fleet";
 import type { CollaborationConfig, SessionInfo } from "../protocol/types";
 
 function session(
@@ -168,5 +168,85 @@ describe("roleLabel", () => {
 
   it("returns null for a session that is not a role-child", () => {
     expect(roleLabel(session("solo"))).toBeNull();
+  });
+});
+
+describe("groupFleet — conductor and dispatch workers", () => {
+  const conductor = (id = "cond") => session(id, { name: "conductor", role: "conductor" });
+  const worker = (id: string, shape: "ship" | "scout", task: string, createdAt?: string) =>
+    session(id, {
+      name: `worker-${shape}-${task}`,
+      role: "worker",
+      ...(createdAt ? { createdAt } : {}),
+    });
+
+  it("nests dispatch workers under the conductor even though they carry no parent id", () => {
+    const groups = groupFleet([
+      session("plain"),
+      conductor(),
+      worker("w1", "scout", "aaaa1111"),
+      worker("w2", "ship", "bbbb2222"),
+    ]);
+
+    expect(groups.map((g) => g.lead.id)).toEqual(["plain", "cond"]);
+    const cond = groups[1]!;
+    expect(cond.isConductor).toBe(true);
+    expect(cond.children.map((c) => c.id)).toEqual(["w1", "w2"]);
+  });
+
+  it("marks a conductor with no workers as a conductor, not a plain session", () => {
+    const g = groupFleet([conductor()])[0]!;
+    expect(g.isConductor).toBe(true);
+    expect(g.isFleet).toBe(false);
+    expect(g.children).toEqual([]);
+  });
+
+  it("orders workers oldest first, breaking ties by name", () => {
+    const groups = groupFleet([
+      conductor(),
+      worker("late", "scout", "zzz", "2026-07-27T00:00:05.000Z"),
+      worker("early", "scout", "aaa", "2026-07-27T00:00:01.000Z"),
+      worker("tie-b", "ship", "bbb", "2026-07-27T00:00:01.000Z"),
+    ]);
+    // early and tie-b share a timestamp → name decides; late sorts after both.
+    expect(groups[0]!.children.map((c) => c.name)).toEqual([
+      "worker-scout-aaa",
+      "worker-ship-bbb",
+      "worker-scout-zzz",
+    ]);
+  });
+
+  it("promotes workers to top level when no conductor is visible", () => {
+    // The conductor can legitimately be absent — another tenant's client, or a
+    // list that has not been delivered yet. Dropping the rows would be worse.
+    const groups = groupFleet([worker("w1", "scout", "aaaa")]);
+    expect(groups).toHaveLength(1);
+    expect(groups[0]!.lead.id).toBe("w1");
+    expect(groups[0]!.isConductor).toBe(false);
+  });
+
+  it("keeps a collaboration child under its orchestrator, not the conductor", () => {
+    const parent = session("p", { collaboration: GOAL });
+    const groups = groupFleet([conductor(), parent, child("c1", "p", "review")]);
+    expect(groups.map((g) => g.lead.id)).toEqual(["cond", "p"]);
+    expect(groups[1]!.children.map((c) => c.id)).toEqual(["c1"]);
+    expect(groups[0]!.children).toEqual([]);
+  });
+
+  it("labels a worker by shape and task tail", () => {
+    expect(roleLabel(worker("w", "scout", "c0234348"))).toBe("scout·c0234348");
+    expect(workerShape(worker("w", "ship", "x"))).toBe("ship");
+    // A user-named session is never mislabelled: only the daemon sets the role.
+    expect(workerShape(session("s", { name: "worker-ship-nope" }))).toBeNull();
+  });
+
+  it("filters on role and shape, keeping the conductor as context", () => {
+    const groups = groupFleet([conductor(), worker("w1", "scout", "aaaa")]);
+    const g = filterFleet(groups, "scout")[0]!;
+    expect(g.leadMatched).toBe(false);
+    expect(g.lead.id).toBe("cond");
+    expect(g.children.map((c) => c.id)).toEqual(["w1"]);
+
+    expect(filterFleet(groups, "conductor")[0]!.leadMatched).toBe(true);
   });
 });

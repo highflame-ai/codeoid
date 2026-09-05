@@ -13,6 +13,7 @@ import {
   filterFleet,
   groupFleet,
   roleLabel,
+  workerShape,
   type FilteredFleetGroup,
 } from "../lib/fleet";
 import {
@@ -379,7 +380,7 @@ const FleetGroupRows: Component<{ group: FilteredFleetGroup }> = (props) => {
         session={props.group.lead}
         dimmed={!props.group.leadMatched}
         fleet={
-          props.group.isFleet
+          props.group.isFleet || props.group.isConductor
             ? {
                 childCount: props.group.children.length,
                 collapsed: collapsed(),
@@ -452,6 +453,12 @@ const SessionRow: Component<{
           >
             {title()}
           </span>
+          <Show when={props.session.role === "conductor"}>
+            <ConductorBadge />
+          </Show>
+          <Show when={workerShape(props.session)}>
+            {(shape) => <WorkerShapeBadge shape={shape()} />}
+          </Show>
           <Show when={role()}>
             {(r) => <WriteBadge write={r().write} />}
           </Show>
@@ -702,6 +709,46 @@ const PanelMemberBadge: Component<{
  * `tools:write` at all), so it gets the badge and write gets a quiet marker
  * rather than both shouting equally.
  */
+/**
+ * Marks the tenant's conductor. Chrome-coloured rather than semantic: the
+ * status vocabulary (§6 of conductor-frontends-design) owns warn/danger/success,
+ * and "this row is the conductor" is an identity, not a state — a conductor in
+ * trouble must still read as `error` from its StatusDot.
+ */
+const ConductorBadge: Component = () => (
+  <span
+    class="rounded border border-accent/50 bg-accent/10 px-1 font-mono text-[10px] uppercase tracking-wider text-accent"
+    title="The conductor — your fleet's front door. It routes and observes; work happens in the sessions and workers below."
+  >
+    cond
+  </span>
+);
+
+/**
+ * A dispatch worker's ship/scout contract.
+ *
+ * Scout is the safer shape (its identity carries no write scope), so it reads
+ * quiet; ship can mutate a worktree and is warn-coloured for the same reason
+ * `WriteBadge` flags a writing role. A worker whose shape can't be read from
+ * its name renders nothing rather than guessing.
+ */
+const WorkerShapeBadge: Component<{ shape: "ship" | "scout" }> = (props) => (
+  <span
+    class={`rounded border px-1 font-mono text-[10px] uppercase tracking-wider ${
+      props.shape === "ship"
+        ? "border-warn/50 bg-warn/10 text-warn"
+        : "border-border bg-bg text-fg-muted"
+    }`}
+    title={
+      props.shape === "ship"
+        ? "Ship worker — delivers a change; its identity carries write authority"
+        : "Scout worker — investigates and reports; its identity cannot write files"
+    }
+  >
+    {props.shape}
+  </span>
+);
+
 const WriteBadge: Component<{ write: boolean }> = (props) => (
   <Show
     when={props.write}

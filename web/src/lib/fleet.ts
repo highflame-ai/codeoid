@@ -21,9 +21,13 @@ import type { SessionInfo } from "../protocol/types";
  * renderer never branches on "is this a fleet" to decide its outer shape.
  */
 export interface FleetGroup {
-  /** The orchestrator, or the standalone session. */
+  /** The orchestrator, the conductor, or the standalone session. */
   lead: SessionInfo;
-  /** Role-children of `lead`, role-then-ordinal ordered. Empty unless a fleet. */
+  /**
+   * Sessions rendered beneath `lead` — a collaboration's role-children
+   * (role-then-ordinal ordered) or the conductor's dispatch workers (oldest
+   * first). Empty unless a fleet or a conductor.
+   */
   children: SessionInfo[];
   /**
    * True when `lead` orchestrates a collaboration. Distinct from
@@ -32,6 +36,17 @@ export interface FleetGroup {
    * from plain session to fleet a second later.
    */
   isFleet: boolean;
+  /**
+   * True when `lead` is the tenant's conductor. Same reasoning as `isFleet`:
+   * a conductor with nothing dispatched is still a conductor, and must not
+   * render as a plain session until its first worker appears.
+   *
+   * Kept separate from `isFleet` rather than folded into one "has children"
+   * flag because the two group KINDS differ in what their children are: a
+   * collaboration's role-children are long-lived sessions you drive, while
+   * dispatch workers are disposable and die with their task.
+   */
+  isConductor: boolean;
 }
 
 /**
@@ -47,8 +62,22 @@ export function groupFleet(sessions: readonly SessionInfo[]): FleetGroup[] {
   const present = new Set(sessions.map((s) => s.id));
   const childrenByParent = new Map<string, SessionInfo[]>();
 
+  // The tenant's conductor, when this client can see it. Dispatch workers
+  // carry no parent pointer — the conductor→worker link lives in the dispatch
+  // queue, not on SessionInfo — but there is exactly one conductor per tenant
+  // (the daemon enforces the singleton), so it is an unambiguous parent.
+  const conductor = sessions.find((s) => s.role === "conductor");
+
+  const parentOf = (s: SessionInfo): string | undefined => {
+    const collab = s.collaborationRole?.parentSessionId;
+    if (collab) return collab;
+    // A worker never nests under itself, and a conductor is never a worker.
+    if (s.role === "worker" && conductor && conductor.id !== s.id) return conductor.id;
+    return undefined;
+  };
+
   for (const s of sessions) {
-    const parentId = s.collaborationRole?.parentSessionId;
+    const parentId = parentOf(s);
     // A child whose parent is missing is treated as a lead below, so only
     // bucket the ones that actually have somewhere to go.
     if (!parentId || !present.has(parentId)) continue;
@@ -59,11 +88,16 @@ export function groupFleet(sessions: readonly SessionInfo[]): FleetGroup[] {
 
   const groups: FleetGroup[] = [];
   for (const s of sessions) {
-    const parentId = s.collaborationRole?.parentSessionId;
+    const parentId = parentOf(s);
     if (parentId && present.has(parentId)) continue; // rendered under its parent
     const children = childrenByParent.get(s.id) ?? [];
     children.sort(compareChildren);
-    groups.push({ lead: s, children, isFleet: Boolean(s.collaboration) });
+    groups.push({
+      lead: s,
+      children,
+      isFleet: Boolean(s.collaboration),
+      isConductor: s.role === "conductor",
+    });
   }
   return groups;
 }
@@ -76,9 +110,24 @@ export function groupFleet(sessions: readonly SessionInfo[]): FleetGroup[] {
 function compareChildren(a: SessionInfo, b: SessionInfo): number {
   const ra = a.collaborationRole;
   const rb = b.collaborationRole;
-  if (!ra || !rb) return 0;
-  if (ra.roleName !== rb.roleName) return ra.roleName < rb.roleName ? -1 : 1;
-  return ra.ordinal - rb.ordinal;
+  if (ra && rb) {
+    if (ra.roleName !== rb.roleName) return ra.roleName < rb.roleName ? -1 : 1;
+    return ra.ordinal - rb.ordinal;
+  }
+  // Dispatch workers have no role/ordinal. Oldest first, so a worker keeps its
+  // place as siblings come and go — workers are disposable and a list that
+  // reorders itself while you read it is worse than a stale-looking one. Name
+  // breaks ties, since several workers can be spawned in the same millisecond.
+  if (!ra && !rb) {
+    const ta = Date.parse(a.createdAt);
+    const tb = Date.parse(b.createdAt);
+    if (Number.isFinite(ta) && Number.isFinite(tb) && ta !== tb) return ta - tb;
+    return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
+  }
+  // Mixed (a collaboration child beside a dispatch worker) cannot happen today
+  // — a session is one or the other — but order them deterministically rather
+  // than leaving it to sort stability if it ever does.
+  return ra ? -1 : 1;
 }
 
 /**
@@ -121,12 +170,17 @@ export function filterFleet(
   return out;
 }
 
-/** Name, workdir, or — for a child — its role name. */
+/** Name, workdir, role name, or the session role ("conductor" / a worker's shape). */
 function matchesSession(s: SessionInfo, lowercaseQuery: string): boolean {
   if (s.name.toLowerCase().includes(lowercaseQuery)) return true;
   if (s.workdir.toLowerCase().includes(lowercaseQuery)) return true;
   const role = s.collaborationRole?.roleName;
-  return role !== undefined && role.includes(lowercaseQuery);
+  if (role !== undefined && role.includes(lowercaseQuery)) return true;
+  // "conductor" / "worker" / "scout" / "ship" are how you'd actually search
+  // for these rows — the name alone only carries the shape by convention.
+  if (s.role !== undefined && s.role.includes(lowercaseQuery)) return true;
+  const shape = workerShape(s);
+  return shape !== null && shape.includes(lowercaseQuery);
 }
 
 /** How many sessions a filtered group puts on screen — for the header count. */
@@ -144,6 +198,29 @@ export function countVisible(groups: readonly FleetGroup[]): number {
  */
 export function roleLabel(s: SessionInfo): string | null {
   const r = s.collaborationRole;
-  if (!r) return null;
-  return r.ordinal > 1 ? `${r.roleName}#${r.ordinal}` : r.roleName;
+  if (r) return r.ordinal > 1 ? `${r.roleName}#${r.ordinal}` : r.roleName;
+  const shape = workerShape(s);
+  // `worker-scout-c0234348` → `scout·c023448`. The task-id tail is what lets
+  // you match a row against a `fleet_tasks` entry, so it earns its width.
+  if (shape) {
+    const tail = s.name.slice(`worker-${shape}-`.length);
+    return tail ? `${shape}·${tail}` : shape;
+  }
+  return null;
+}
+
+/**
+ * A dispatch worker's shape, or null when this is not a worker.
+ *
+ * Read from the daemon's `worker-<shape>-<task>` naming rather than from a
+ * wire field because `SessionInfo` carries no shape: the ship/scout contract
+ * lives on the dispatch task, which the session list does not join against.
+ * Guarded by `role === "worker"` so a user-named session that happens to start
+ * with `worker-` is never mislabelled — only the daemon sets that role.
+ */
+export function workerShape(s: SessionInfo): "ship" | "scout" | null {
+  if (s.role !== "worker") return null;
+  if (s.name.startsWith("worker-ship-")) return "ship";
+  if (s.name.startsWith("worker-scout-")) return "scout";
+  return null;
 }
