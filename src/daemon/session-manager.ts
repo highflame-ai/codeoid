@@ -415,6 +415,13 @@ export class SessionManager {
        */
       hooks?: HookBus;
       /**
+       * Stable identity of this daemon (host:port), scoping dispatch claims to
+       * its own tasks. Two daemons sharing one database otherwise reclaim each
+       * other's live claims and can claim across tenants — see
+       * `DispatchConfig.daemonId`. Absent in tests = unowned tasks.
+       */
+      daemonId?: string;
+      /**
        * Test-only: provider factory injected into every Session this manager
        * constructs, so manager-level integration tests (conductor injection,
        * worker spawn, dispatch host) run without the Claude Agent SDK
@@ -433,11 +440,10 @@ export class SessionManager {
     this.#providers = opts?.providers ?? createDefaultProviderRegistry(opts?.config);
     this.#hooks = opts?.hooks;
     this.#testProviderFactory = opts?._testProviderFactory;
-    this.#dispatcher = new Dispatcher(
-      store,
-      this.#makeDispatcherHost(),
-      opts?.config?.dispatch,
-    );
+    this.#dispatcher = new Dispatcher(store, this.#makeDispatcherHost(), {
+      ...opts?.config?.dispatch,
+      daemonId: opts?.daemonId,
+    });
     this.#pushService = new PushService(
       store,
       createPushTransport(opts?.config?.push, (token) => store.pruneDeadToken(token)),
