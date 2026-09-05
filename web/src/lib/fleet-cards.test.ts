@@ -1,7 +1,11 @@
 import { describe, it, expect } from "vitest";
 
 import { classifyFleetTool, fleetVerb } from "./fleet-cards";
-import type { ToolInfo } from "../protocol/types";
+import {
+  FLEET_READ_TOOLS,
+  FLEET_SEND_TOOLS,
+  type ToolInfo,
+} from "../protocol/types";
 
 function tool(name: string, input?: unknown): ToolInfo {
   return {
@@ -128,6 +132,25 @@ describe("classifyFleetTool", () => {
     expect(valueOf(card, "task")).toBe("bump the dep");
   });
 
+  it("falls back to state.input when tool.input is an explicit null", () => {
+    // `input` is typed `unknown`, so null is representable — and a JSON round
+    // trip preserves an explicit null while turning a missing key into
+    // undefined. Testing `!== undefined` would accept the null and render the
+    // approval card fieldless, which is the one card that must stay readable.
+    const awaiting = {
+      toolId: "t1",
+      name: "mcp__codeoid_fleet__fleet_send",
+      input: null,
+      state: {
+        phase: "waiting_confirmation",
+        input: { session: "studio-870", message: "run the linter" },
+      },
+    } as unknown as ToolInfo;
+    const card = classifyFleetTool(awaiting)!;
+    expect(card.summary).toBe("Send to studio-870");
+    expect(valueOf(card, "message")).toBe("run the linter");
+  });
+
   it("ignores a half-generated streaming input", () => {
     // partialInput is a fragment; a card built from it would show a workdir the
     // model has not finished writing.
@@ -189,5 +212,40 @@ describe("classifyFleetTool", () => {
         "Spawn worker in b",
       );
     });
+  });
+});
+
+describe("the daemon's own vocabulary", () => {
+  // Both sides import these lists from @highflame/codeoid-protocol, so the two
+  // cannot drift apart by construction — there is no second copy to fall out of
+  // date. What is still worth asserting is that every verb the shared lists
+  // name actually gets a classification consistent with its class.
+
+  it("never classifies a send-class verb as a read", () => {
+    // The security-relevant direction: `unknown` would be acceptable
+    // (fail-safe), a read classification is the bug.
+    for (const verb of FLEET_SEND_TOOLS) {
+      const card = classifyFleetTool(fleet(verb, {}))!;
+      expect(card.kind === "observe" || card.kind === "resolve").toBe(false);
+      expect(card.sendClass).toBe(true);
+    }
+  });
+
+  it("classifies every read verb without falling back to unknown", () => {
+    // The other direction is not dangerous, but an unhandled read verb means
+    // the transcript quietly stops explaining itself.
+    for (const verb of FLEET_READ_TOOLS) {
+      const card = classifyFleetTool(fleet(verb, {}))!;
+      expect(card.kind).not.toBe("unknown");
+      expect(card.sendClass).toBe(false);
+    }
+  });
+
+  it("still fails safe for a verb neither list names", () => {
+    // An older client meeting a newer daemon: unrecognised, so it must not be
+    // dressed up as a harmless read.
+    const card = classifyFleetTool(fleet("fleet_detonate", {}))!;
+    expect(card.kind).toBe("unknown");
+    expect(card.sendClass).toBe(false);
   });
 });

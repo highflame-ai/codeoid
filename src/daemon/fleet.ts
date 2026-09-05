@@ -26,6 +26,11 @@ import {
   type McpSdkServerConfigWithInstance,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { MemoryEngine } from "./memory/index.js";
+import {
+  FLEET_READ_TOOLS,
+  FLEET_SEND_TOOLS,
+  FLEET_TOOL_PREFIX,
+} from "../protocol/types.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -122,14 +127,7 @@ export interface FleetDeps {
  * READ-class tool names — these (and only these) go into the provider's
  * `allowedTools`, so they run silently. (Server key `codeoid_fleet`.)
  */
-export const FLEET_TOOL_NAMES = [
-  "fleet_list",
-  "fleet_find",
-  "fleet_summary",
-  "fleet_recall",
-  "fleet_tasks",
-  "machine_map",
-] as const;
+export const FLEET_TOOL_NAMES = FLEET_READ_TOOLS;
 
 /**
  * SEND-class tool names (P4). Deliberately a SEPARATE list that must NEVER
@@ -138,15 +136,7 @@ export const FLEET_TOOL_NAMES = [
  * makes every dispatch ride the existing approvalId flow, with the full tool
  * input shown to the owner (design R3).
  */
-export const FLEET_SEND_TOOL_NAMES = [
-  "fleet_send",
-  "fleet_interrupt",
-  "fleet_spawn",
-  // A panel is N sends at once, so it is send-class by definition. Being on
-  // this list is what makes it ride the R3 approval flow (and, for a
-  // collaborative session, carry the goal's cost roll-up into that prompt).
-  "fleet_panel",
-] as const;
+export const FLEET_SEND_TOOL_NAMES = FLEET_SEND_TOOLS;
 
 /**
  * True for the fully-qualified MCP name of a send-class fleet tool. Session
@@ -155,9 +145,7 @@ export const FLEET_SEND_TOOL_NAMES = [
  * invariant, not a mode default.
  */
 export function isFleetSendTool(toolName: string): boolean {
-  return FLEET_SEND_TOOL_NAMES.some(
-    (t) => toolName === `mcp__codeoid_fleet__${t}`,
-  );
+  return FLEET_SEND_TOOL_NAMES.some((t) => toolName === `${FLEET_TOOL_PREFIX}${t}`);
 }
 
 /**

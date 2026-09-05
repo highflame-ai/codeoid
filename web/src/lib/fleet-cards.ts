@@ -19,47 +19,28 @@
  * missing fields, never a crash and never a confident lie.
  *
  * **Unknown verbs fail safe.** The read/send split is a SECURITY-relevant
- * classification that the daemon enforces (`FLEET_SEND_TOOL_NAMES` in
- * `src/daemon/fleet.ts` — send-class verbs can never be auto-approved). This
- * module cannot import daemon code, so the vocabulary is duplicated below and
- * can drift. A verb this module does not recognise is therefore classified
- * `"unknown"` — never `"observe"` — so a future send-class verb added daemon-
- * side can never be rendered as a harmless read here.
+ * classification the daemon enforces — send-class verbs can never be
+ * auto-approved (conductor-design R3). The vocabulary is NOT duplicated here:
+ * both sides import `FLEET_READ_TOOLS` / `FLEET_SEND_TOOLS` from
+ * `@highflame/codeoid-protocol`, so the two cannot drift apart. A verb neither
+ * list names — an older client meeting a newer daemon — is still classified
+ * `"unknown"` rather than `"observe"`, so an unrecognised verb can never be
+ * rendered as a harmless read.
  */
 
-import type { ToolInfo } from "../protocol/types";
+import {
+  FLEET_READ_TOOLS,
+  FLEET_SEND_TOOLS,
+  FLEET_TOOL_PREFIX,
+  type ToolInfo,
+} from "../protocol/types";
 
-/** The daemon's in-process fleet MCP server key. */
-const FLEET_TOOL_PREFIX = "mcp__codeoid_fleet__";
+export type FleetVerb =
+  | (typeof FLEET_READ_TOOLS)[number]
+  | (typeof FLEET_SEND_TOOLS)[number];
 
-/**
- * Read-class verbs — observe only, auto-approved daemon-side.
- * Mirrors `FLEET_TOOL_NAMES`; see the fail-safe note in the module header.
- */
-const READ_VERBS = [
-  "fleet_list",
-  "fleet_find",
-  "fleet_summary",
-  "fleet_recall",
-  "fleet_tasks",
-  "machine_map",
-] as const;
-
-/**
- * Send-class verbs — act on the fleet, and never auto-approved daemon-side.
- * Mirrors `FLEET_SEND_TOOL_NAMES`.
- */
-const SEND_VERBS = [
-  "fleet_send",
-  "fleet_spawn",
-  "fleet_interrupt",
-  "fleet_panel",
-] as const;
-
-export type FleetVerb = (typeof READ_VERBS)[number] | (typeof SEND_VERBS)[number];
-
-const READ_SET: ReadonlySet<string> = new Set(READ_VERBS);
-const SEND_SET: ReadonlySet<string> = new Set(SEND_VERBS);
+const READ_SET: ReadonlySet<string> = new Set(FLEET_READ_TOOLS);
+const SEND_SET: ReadonlySet<string> = new Set(FLEET_SEND_TOOLS);
 
 /**
  * What a fleet call is *for*, which is what decides how loud its card should be.
@@ -80,7 +61,12 @@ export interface FleetCard {
    * reported as safe — see the module header.
    */
   sendClass: boolean;
-  /** One-line summary for the card header. Never raw JSON. */
+  /**
+   * One-line summary for the card header. Never raw JSON.
+   *
+   * PLAIN TEXT, and partly model-generated — render via text interpolation
+   * only, never `innerHTML` or a raw-HTML markdown pass. See `FleetCardField`.
+   */
   summary: string;
   /** Ordered detail rows the card renders. Absent fields are omitted, not blanked. */
   fields: FleetCardField[];
@@ -88,6 +74,18 @@ export interface FleetCard {
 
 export interface FleetCardField {
   label: string;
+  /**
+   * PLAIN TEXT. Render via text interpolation only — never `innerHTML`, and
+   * never through a markdown renderer that emits raw HTML.
+   *
+   * This module is safe by construction because it only ever produces strings,
+   * so the guarantee lives entirely at the render site. It matters because the
+   * content is doubly untrusted: model-generated, and frequently lifted from
+   * repo content the model just read — which is exactly the path a prompt
+   * injection takes to put an attacker-chosen string in a `task` or `message`
+   * field. Solid interpolates as text by default, so today's renderer is fine;
+   * this note exists for whoever later adds a rich-text affordance here.
+   */
   value: string;
   /**
    * Long free text (a task brief, a message body) that a card should render in
@@ -233,9 +231,16 @@ const OBSERVE_SUMMARY: Record<string, string> = {
  * `streaming` is deliberately not consulted: its `partialInput` is a
  * half-generated fragment, and a card built from it would show a target or
  * workdir that the model has not finished writing.
+ *
+ * The `!= null` is load-bearing, not sloppiness. `input` is typed `unknown`,
+ * so `null` is representable — and a JSON round-trip preserves an explicit
+ * `null` while turning a missing key into `undefined`. Testing `!== undefined`
+ * would accept that `null`, `isRecord` would then reject it, and the card would
+ * render fieldless: precisely the approval-prompt card this fallback exists to
+ * protect.
  */
 function resolveToolInput(tool: ToolInfo): unknown {
-  if (tool.input !== undefined) return tool.input;
+  if (tool.input != null) return tool.input;
   return tool.state.phase === "waiting_confirmation" ? tool.state.input : undefined;
 }
 
