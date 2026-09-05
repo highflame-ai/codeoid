@@ -14,6 +14,7 @@ import {
   identityLabel,
   shortSub,
 } from "../../lib/identity";
+import { classifyFleetTool, type FleetCard } from "../../lib/fleet-cards";
 import { safeImageUri, safeLinkUri } from "../../lib/sanitize-url";
 import {
   createFrameThrottled,
@@ -269,7 +270,12 @@ const ToolBlock: Component<{ msg: SessionMessage }> = (props) => {
     const candidate = t0.input ?? fromState;
     return isWriteInput(candidate) ? candidate : null;
   };
+  // A fleet call is the conductor's whole vocabulary, so it gets a card that
+  // says what it DOES instead of a raw-JSON `<details>` (conductor-frontends
+  // §5). Everything else keeps the generic rendering unchanged.
+  const fleet = () => classifyFleetTool(t());
   return (
+    <Show when={fleet()} fallback={
     <div class="space-y-1">
       <div class="flex items-center gap-2 font-mono text-xs">
         <span class="font-semibold text-role-tool">{t().name}</span>
@@ -300,6 +306,77 @@ const ToolBlock: Component<{ msg: SessionMessage }> = (props) => {
           edit failed —{" "}
           {(t().state as { output?: string }).output ?? "no error message"}
         </div>
+      </Show>
+    </div>
+    }>
+      {(card) => <FleetActionCard card={card()} state={t().state} toolId={t().toolId} />}
+    </Show>
+  );
+};
+
+/**
+ * A conductor fleet call, rendered as what it does.
+ *
+ * The left border carries the read/act distinction, because that is the thing
+ * you scan a conductor transcript for: `dispatch` is accented (it changed
+ * something, and the owner approved it), `resolve` is warn-toned because a
+ * wrong resolution is what silently misroutes a later dispatch, and plain
+ * observes recede. `unknown` deliberately looks like nothing familiar rather
+ * than borrowing a colour it has not earned — see `classifyFleetTool`.
+ */
+const FleetActionCard: Component<{
+  card: FleetCard;
+  state: ToolState;
+  toolId: string;
+}> = (props) => {
+  const accent = () => {
+    switch (props.card.kind) {
+      case "dispatch":
+        return "border-l-accent";
+      case "resolve":
+        return "border-l-warn/60";
+      case "unknown":
+        return "border-l-danger/50";
+      default:
+        return "border-l-role-tool/40";
+    }
+  };
+  return (
+    <div class={`space-y-1 border-l-2 pl-2 ${accent()}`}>
+      <div class="flex flex-wrap items-center gap-2 text-xs">
+        <span class="font-medium text-fg">{props.card.summary}</span>
+        <Show when={props.card.sendClass}>
+          <span
+            class="rounded border border-accent/50 bg-accent/10 px-1 font-mono text-[10px] uppercase tracking-wider text-accent"
+            title="Send-class: this acts on the fleet and can never be auto-approved"
+          >
+            act
+          </span>
+        </Show>
+        <PhaseBadge state={props.state} />
+        <span class="ml-auto font-mono text-[10px] text-fg-faint">
+          {props.card.verb} · {shortSub(props.toolId)}
+        </span>
+      </div>
+      <Show when={props.card.fields.length > 0}>
+        <dl class="space-y-0.5 text-xs">
+          <Index each={props.card.fields}>
+            {(f) => (
+              <div class={f().block ? "flex flex-col gap-0.5" : "flex gap-2"}>
+                <dt class="shrink-0 font-mono text-[11px] text-fg-muted">{f().label}</dt>
+                <dd
+                  class={
+                    f().block
+                      ? "whitespace-pre-wrap break-words rounded bg-bg px-2 py-1 text-fg"
+                      : "min-w-0 break-all text-fg"
+                  }
+                >
+                  {f().value}
+                </dd>
+              </div>
+            )}
+          </Index>
+        </dl>
       </Show>
     </div>
   );
