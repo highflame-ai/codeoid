@@ -45,6 +45,21 @@ export interface DispatchConfig {
    * the SAME tick and burn its whole failure budget in milliseconds.
    */
   retryBaseMs: number;
+  /**
+   * Stable identity (host:port) of the daemon that owns the tasks it enqueues,
+   * scoping claim and reclaim to its own work.
+   *
+   * `claim_owner` is a BOOT id, which cannot tell "my own crashed run" apart
+   * from "another daemon's healthy claim" — so two daemons sharing one
+   * database reclaimed each other's in-flight tasks and auto-blocked work that
+   * had actually succeeded, and could claim across tenants. Port-scoped for
+   * the same reason `local-mode.md` port-scopes its token file: the port is
+   * what distinguishes two daemons on one machine, and it survives restarts.
+   *
+   * Undefined leaves tasks unowned (claimable by anyone) — the pre-upgrade
+   * path, and the default in tests that run a single dispatcher.
+   */
+  daemonId?: string;
 }
 
 export const DEFAULT_DISPATCH_CONFIG: DispatchConfig = {
@@ -246,6 +261,7 @@ export class Dispatcher {
       id,
       ...input,
       failureLimit: this.#config.failureLimit,
+      ownerDaemon: this.#config.daemonId,
       now: Date.now(),
     });
     this.#host.audit(
@@ -310,6 +326,7 @@ export class Dispatcher {
         createdBy: input.createdBy,
         groupId,
         groupOrdinal: i + 1,
+        ownerDaemon: this.#config.daemonId,
         now,
       };
     });
@@ -409,6 +426,7 @@ export class Dispatcher {
       this.bootId,
       this.#config.leaseMs,
       Date.now(),
+      this.#config.daemonId,
     );
     for (const task of reclaimed) {
       if (task.workerSessionId) this.#unwatch(task.workerSessionId, task.id);
@@ -460,7 +478,12 @@ export class Dispatcher {
     //    starve the rest of the queue).
     const touched: string[] = [];
     for (;;) {
-      const task = this.#store.dispatchClaimNext(this.bootId, Date.now(), touched);
+      const task = this.#store.dispatchClaimNext(
+        this.bootId,
+        Date.now(),
+        touched,
+        this.#config.daemonId,
+      );
       if (!task) return;
       touched.push(task.id);
       if (

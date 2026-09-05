@@ -450,5 +450,10 @@ describe("gemini-cli resolution + registry", () => {
     await proc.exited;
     expect(proc.exitCode).toBe(0);
     expect(out).toMatch(/^\d+\.\d+\.\d+/);
-  });
+    // Cold-starting the bundled gemini-cli (a large JS bundle bun must parse
+    // and run) costs 3-4s on its own, which fits inside the 5s default only
+    // when the machine is idle. Under the full suite's parallel load it tips
+    // over, so this test failed ~2 runs in 3 while the CLI itself was fine.
+    // The generous ceiling keeps it a real smoke test without the flake.
+  }, 30_000);
 });

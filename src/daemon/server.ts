@@ -307,7 +307,15 @@ export class DaemonServer {
       this.#store, this.#transcriptStore, identityManager, rateLimiter,
       // Memory is wired post-construction via initMemory() — see start()
       undefined,
-      { config: config.fullConfig, compressionRegistry, hooks },
+      {
+        config: config.fullConfig,
+        compressionRegistry,
+        hooks,
+        // Port-scoped, for the reason local mode port-scopes its token file:
+        // it is what distinguishes two daemons on one machine, and it survives
+        // restarts so a daemon still recognises its own crashed run.
+        daemonId: `${this.#config.host}:${this.#config.port}`,
+      },
     );
 
     console.log(`[codeoid] providers: ${this.#manager.providerIds().join(", ")}`);
