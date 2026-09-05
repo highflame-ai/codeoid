@@ -451,7 +451,7 @@ The conductor design earns its keep by stating what is enforced versus prompted
 | Concern | Status / mitigation |
 | --- | --- |
 | **A satellite is offline** | The board must render **staleness**, never a lie. `machines.last_seen_at` drives an explicit "laptop · last seen 4h ago" on every view, and recall labels the gap (§7). |
-| **Clock skew** | `facts` are bi-temporal with system time (`cards.ts`). Cross-machine ordering by system time is wrong under skew. Satellites stamp with their own clock; the hub records receipt time separately and orders by receipt. |
+| **Clock skew** | `facts` are bi-temporal with system time (`cards.ts`), and cross-machine ordering by system time is wrong under skew. **Resolved by Hybrid Logical Clocks** (§16.3): constant space, causality-preserving under skew, and still close to wall-clock so existing "last Tuesday" queries keep working. Ordering by hub receipt time — the earlier answer — loses causality whenever replication is batched or delayed, which is exactly when it matters. |
 | **Split-brain (two hubs)** | Prevented by config, not election: `role: "hub"` is declared, and a satellite refuses a second upstream. No consensus protocol, deliberately. |
 | **Conductor on a satellite** | Refused at creation — `role: "conductor"` is a hub-only capability. Otherwise §2's "not one per machine" is prose, not a rule. |
 | **The hub is now the highest-value host** | Bounded by §5's table. The property that carries it is R3 being enforced satellite-side. |
@@ -584,8 +584,17 @@ daemon, each states how you know it is done.
 **F0 — Machine axis.** Additive columns, the `machines` table, `machineId` +
 `role` in config, protocol `scope` widened, `machineId` on `SessionInfo`.
 Single-machine behaviour is bit-identical.
-*Exit:* full test suite green with every row carrying an explicit `machineId`;
-a pre-upgrade database migrates cleanly against a real `bun:sqlite`.
+
+**Add the HLC column here, not later** (§16.3). An `hlc` alongside the existing
+timestamps on every replicated row — `session_cards`, `facts`, `episodes` — is a
+trivial additive column at F0 and an ugly backfill at F2, because by then rows
+exist on several machines with no way to reconstruct their causal order after
+the fact. Single-machine, the logical component simply stays at zero, so nothing
+observable changes until there is a second machine.
+
+*Exit:* full test suite green with every row carrying an explicit `machineId`
+and a monotonic `hlc`; a pre-upgrade database migrates cleanly against a real
+`bun:sqlite`.
 
 **F1 — Satellite link + read-only board.** Outbound WS from satellite to hub,
 satellite ZeroID identity, upstream status/usage replication, heartbeat. Board
@@ -907,3 +916,123 @@ conductor needs zero new wire types, which the mobile plan already established.
   parameter for two properties. What it should actually be depends on how long a
   ZeroID outage must be survivable, which is an operational question rather than
   a design one.
+
+---
+
+## 16. Standards survey
+
+> Added 2026-09-05, before F0. The question asked was "which RFCs or specs should
+> this follow?" — and the most valuable answer turned out to be one to *reject*.
+
+### 16.1 The verdict table
+
+| Concern | Spec | Call |
+| --- | --- | --- |
+| Trust-domain topology | [SPIFFE Federation](https://spiffe.io/docs/latest/spiffe-specs/spiffe_federation/) | **Reject — §16.2** |
+| Machine identity (L2) | [IEEE 802.1AR](https://1.ieee802.org/security/802-1ar/) DevID + TCG TPM binding | **Borrow the LDevID model** |
+| Attestation architecture | [RFC 9334](https://www.rfc-editor.org/info/rfc9334/) (RATS) | **Adopt the vocabulary** |
+| Attestation freshness | RFC 9334 §10 — nonce / timestamp / **epoch ID** | **Adopt epoch ID** |
+| Evidence format | EAT (RFC 9711) | Defer to a real ZeroID `tpm` verifier |
+| Daemon↔daemon transport | [A2A v1.0](https://a2a-protocol.org/latest/specification/) | **Reject here, adopt for #61/#251** |
+| Machine capability description | A2A Agent Card (JWS RFC 7515 + JCS RFC 8785) | **Borrow the concept** |
+| Cross-machine ordering | Hybrid Logical Clocks | **Adopt — §16.3** |
+| Delegation | RFC 8693 token exchange | Already in use, unchanged |
+| Sender-constrained tokens | RFC 9449 DPoP | Revisit if satellite tokens become replayable |
+
+### 16.2 The name collision — and why SPIFFE Federation is the wrong spec
+
+**This document's "federation" is not SPIFFE's "federation", and conflating them
+would be the single most expensive mistake available here.**
+
+SPIFFE Federation exists so that **separate trust domains** — different
+organisations, clusters, or administrative boundaries — can exchange trust
+bundles via bundle endpoints, each relationship configured separately. It is
+machinery for *"my company's workloads must authenticate yours."*
+
+These machines are one owner, one ZeroID tenant, one administrative boundary. A
+laptop and a Hetzner box are **nodes in one trust domain**, not two domains that
+must federate. Modelling them SPIFFE-style would mean treating four of your own
+computers as four organisations: N bundle endpoints, N trust relationships, N
+rotations — all to solve a mutual-distrust problem that does not exist.
+
+The correct SPIFFE analogue is the one already identified in §5.1: **node
+attestation within a single trust domain**, where a node attests, receives an
+identity, and that identity parents every workload on it. That is plain SPIRE,
+not SPIRE federation.
+
+Two consequences:
+
+1. **It confirms open question 6** — machine is an *attribute*, not a tenancy
+   key — and now on a structural argument rather than a convenience one.
+2. **The doc's title is a term-of-art collision.** Keep the name (it is the
+   ordinary-English meaning, and `federation-design.md` is already referenced
+   elsewhere), but a security reviewer fluent in SPIFFE will read it as the
+   spec. Hence this section.
+
+### 16.3 Hybrid Logical Clocks — adopt, and at F0
+
+§9's clock-skew row previously said satellites stamp with their own clock and the
+hub orders by receipt. That is wrong precisely when it matters: replication is
+batched and reconnect-driven, so receipt order diverges from causal order exactly
+during the partitions that make ordering interesting.
+
+HLC is the standard answer and is unusually well-suited here:
+
+- **Constant space** — a timestamp pair, unlike vector clocks which grow per node.
+- **Causality-preserving under skew** — `hlc(e) < hlc(f)` whenever `e` happened
+  before `f`.
+- **Stays close to wall-clock**, so the bi-temporal `facts` queries the design
+  already promises ("what was this session's state last Tuesday?") keep working
+  against the physical component. A pure Lamport clock would break them.
+
+This is the one survey finding with an F0 consequence, because retrofitting a
+causal order onto rows already written across several machines is not possible
+after the fact. See F0 above.
+
+### 16.4 RATS vocabulary, and epoch IDs for freshness
+
+[RFC 9334](https://www.rfc-editor.org/info/rfc9334/) gives the attestation
+architecture a shared vocabulary — Attester, Verifier, Relying Party — and two
+topologies. **ZeroID's flow is already the Passport model**: the workload submits
+evidence, a verifier checks it, and the workload carries the resulting credential
+to relying parties. Naming it as such costs nothing and makes §5.1 legible to
+anyone who has read the RFC.
+
+More usefully, RFC 9334 §10 enumerates three freshness mechanisms, and the third
+is the one open question 10 needed:
+
+| Mechanism | Fit |
+| --- | --- |
+| Nonce | Binds evidence to one challenge; needs a round trip per check |
+| Timestamp | Requires a trustworthy synchronised clock — the thing §9 says we lack |
+| **Epoch ID** | Reusable, shareable across entities, and explicitly designed to work *without* trusted time |
+
+**Adopt epoch IDs**, composed with the credential-renewal trigger already decided
+in open question 10: renewal is *when* re-attestation happens, the epoch ID is
+*how* freshness is expressed without trusting a clock. The two answer different
+halves, and the epoch-ID half is the one that survives clock skew.
+
+### 16.5 A2A — right protocol, wrong surface
+
+[A2A reached v1.0 in 2026](https://a2a-protocol.org/latest/specification/) under
+the Linux Foundation with broad vendor adoption, three interchangeable transports,
+and JWS-signed Agent Cards. It is genuinely the standard for agent interop — and
+it is still the wrong choice for the hub↔satellite link.
+
+A2A solves **cross-organisation, cross-vendor** delegation between agents that
+share no code and no trust. Both ends of this link are codeoid, already speaking
+one typed protocol with ZeroID auth and mirrored Rust types. Re-encoding those
+wire types into a foreign task model would trade a typed, tested contract for
+interoperability with nobody.
+
+Where A2A *is* right is the surface codeoid already has issues for: **#61 (A2A
+Agent Card + task endpoint)** and **#251 (outward control-plane MCP server)** —
+letting *external* agents drive codeoid. Federation is an internal link; those
+are external surfaces. Keeping them separate is what stops the internal protocol
+from being dragged toward a spec written for a different threat model.
+
+**One concept worth borrowing regardless: the Agent Card.** A per-machine
+capability descriptor — available providers, GPU presence, whether this box can
+sign Apple builds — is something the conductor needs for routing anyway ("build
+the iOS target" must land on the Mac). The `machines` table should carry a
+capabilities blob from F0, even though nothing consumes it until F3.
