@@ -352,6 +352,17 @@ gap* ("laptop did not answer"). Silently returning fewer results is the failure
 mode that would make the conductor untrustworthy, which is precisely what §9 is
 about.
 
+**Locked, with a named fallback rather than an open question.** This is the
+design decision most likely to be wrong, so it gets an explicit trip-wire instead
+of a re-litigation: **F2's exit criterion is the test.** If p95 cross-machine
+recall cannot hold the design's 2s budget with one satellite throttled, the
+fallback is *not* to abandon scatter-gather — it is to **replicate episodes for
+specific machines** (a per-machine `replicate: cards | full` setting), keeping
+fan-out for the rest. A laptop that is usually asleep is exactly the machine
+worth mirroring in full; the Hetzner box, which holds the largest corpus and is
+always reachable, is exactly the one worth leaving in place. That degrades one
+machine at a time rather than collapsing the architecture.
+
 ---
 
 ## 8. Federated dispatch
@@ -367,12 +378,68 @@ Almost entirely a filter change, because `dispatch.ts` was built restart-proof.
 - Each satellite's dispatcher claims `WHERE machine_id = :self AND status =
   'queued' AND (not_before IS NULL OR not_before <= :now)`. Atomic claim, stale
   reclaim, and failure-limit auto-block are unchanged.
-- **Stale reclaim needs a rule it does not have today:** `claim_owner` is a boot
-  id, so a satellite that goes offline mid-task leaves a claim nobody can
-  reclaim without knowing whether it is dead or merely partitioned. Reclaim must
-  key on the `machines.last_seen_at` heartbeat, and a reclaimed task must be
-  *idempotent or re-proposed* — a half-finished `ship` re-run on another machine
-  is a lost-update hazard of exactly the kind design §3 already forbids.
+### 8.1 Stale reclaim across a link — resolved
+
+The hazard: `claim_owner` is a boot id and claims are lease-renewed, so
+`#reclaimStale()` (`dispatch.ts:407`) currently treats *any* claim from another
+boot, or any expired lease, as a crashed run to be retried. Federated, a
+satellite that goes offline mid-task leaves a claim the hub cannot distinguish
+from a crash — and blindly retrying a half-finished `ship` elsewhere is the
+lost-update hazard design §3 forbids.
+
+**Options considered.**
+
+| | Approach | Verdict |
+| --- | --- | --- |
+| A | Any dispatcher may reclaim any task | ✗ the hazard itself |
+| B | Two-phase commit / distributed lock across the link | ✗ consensus for a personal fleet; §9 already rejects electing anything |
+| C | **Machine affinity + reconcile-on-return** | ✓ adopted — removes the hazard by construction |
+
+**Resolution — three rules, each resting on something that already exists.**
+
+**1. Reclaim is machine-scoped, so cross-machine re-execution is impossible.**
+A task carries `machine_id` (§6) and only that machine's dispatcher may claim
+it. Reclaim therefore never means "hand to another machine" — it means "return
+to `queued` **for the same machine**". The hazard is removed by construction
+rather than detected, which is why this beats any liveness heuristic: the hub
+never has to decide whether the laptop is dead or merely partitioned, because
+the answer does not change who may execute the task.
+
+**2. On reconnect the satellite reconciles its own claims; it does not re-run
+them.** `dispatch.ts` already writes `worker_session_id` at claim time and
+already tolerates a surviving worker session across restart/reclaim
+(`dispatch.ts:74` returns false when the session no longer exists, and the
+reclaim path comments on resumed workers). So a returning satellite adopts a
+live worker rather than starting a second one, and only a task whose worker
+session is genuinely gone counts as a failed attempt. This is the same principle
+`resume-reconcile.ts` applies to frozen tool phases: **reconcile non-terminal
+state to a settled one, idempotently**, rather than replaying it.
+
+**3. `shape` already encodes how much care each task needs.** A `scout` holds no
+`tools:write` and is read-only by contract, so re-running it is free. A `ship`
+mutates a worktree, so it reconciles or blocks — never a blind retry.
+
+| shape | On return with a live worker | On return with no worker |
+| --- | --- | --- |
+| `scout` | adopt | re-run (attempts++) |
+| `ship` | adopt | **block for owner review**, never silently re-run |
+
+### 8.2 A bug federation would otherwise introduce
+
+Worth stating separately, because it is not the hazard above and is easy to miss:
+**a task must not accrue attempts while its machine is offline.**
+
+Today lease expiry means "the runner crashed", so reclaim increments `attempts`
+and `failureLimit` (default 2) auto-blocks after a couple of passes. Federated,
+a laptop closed overnight would expire its lease on every tick and burn the
+budget on a task that never failed — auto-blocking perfectly good work, with an
+`error` of "stale claim" that describes nothing that went wrong.
+
+So reclaim must gate on machine liveness: while `machines.last_seen_at` is stale,
+the task **parks** — lease released, `attempts` untouched, visible on the board
+as parked rather than failed. It becomes claimable the moment its machine
+returns. `failureLimit` then keeps meaning "this task keeps failing" instead of
+"this machine keeps sleeping".
 
 ---
 
@@ -493,6 +560,14 @@ aggregation, cross-machine retrieval, and per-machine attested identity. The
 first two are engineering. The third (§5.1) is the one no peer can reach,
 because none of them has an identity layer to hang it on.
 
+**Locked: A.** Centralisation is rejected not on principle but on this fleet's
+specifics — Apple signing pins work to the Mac, the corpus pins it to Hetzner,
+and unpushed branches pin it to whichever laptop holds them. Should those stop
+being true (a single always-on workstation, everything pushed), B becomes the
+better design and this decision should be revisited rather than defended. The
+practical hedge is that F1's exit criterion is really a **B-parity test**: a
+reachable satellite must feel no different from a local session.
+
 ## 12. Phases
 
 Vertical slices, same convention as the conductor plan: each ends in a working
@@ -530,11 +605,14 @@ holds its precision@1 within the margin, and p95 stays inside the design's 2s
 budget with one satellite deliberately throttled.
 
 **F3 — Federated dispatch.** `machine` on send/spawn, machine in the R3 prompt,
-remote claim, heartbeat-keyed stale reclaim (§8).
+machine-scoped claim + reconcile-on-return (§8.1), park-while-offline (§8.2).
 *Exit:* "continue the authz fix" resolves to a laptop session from the hub
 conductor, shows repo + branch + **machine** in the approval, executes on the
-laptop, and returns a digest; a satellite killed mid-task does not lose or
-double-execute the work.
+laptop, and returns a digest. Two failure cases are explicit tests: a satellite
+killed mid-task **adopts its surviving worker on return** rather than
+double-executing, and a `ship` whose worker is gone **blocks for review** rather
+than re-running; and a machine offline across many dispatcher ticks leaves its
+task **parked with `attempts` unchanged**, not auto-blocked.
 
 **F4 — Machine awareness.** `machine_map` reports real per-machine topology
 (workspaces, git state, load, last seen); clients render staleness.
@@ -557,6 +635,14 @@ ordering across both plans:
 3. **R6 tool scoping** (#276) — small, closes the prompt-only rows in design §9.
 4. **F2 + F3**, then **routines** (P4.5) with its spend ceiling.
 5. **The playbook** (§10).
+
+**Locked, and the argument is falsifiable rather than a matter of taste.**
+P5 goes first because **no client consumes `FleetSnapshot`** — verifiable by
+grepping `web/src/` and `src/frontends/`, and stated in conductor-design §7.
+Federation's entire output is a richer board. Shipping F0/F1 ahead of a client
+means building an aggregation nothing can display, then tuning it against usage
+that does not exist. The one-line test for anyone who wants to reorder: *if the
+board had a consumer today, F0 would go first.* It does not, so it does not.
 
 ---
 
@@ -746,39 +832,78 @@ conductor needs zero new wire types, which the mobile plan already established.
 
 ## 15. Open questions
 
-1. **Does the hub run sessions of its own, or only the conductor?** A dedicated
-   hub is simpler to reason about; the Hetzner box is currently also the biggest
-   worker. Mixed-role hubs make §9's blast-radius table weaker.
-2. **What is replicated on reconnect after a long partition?** Full card resync
-   is simple and probably fine at this scale, but it is unmeasured.
+> Every item below now carries a recommendation. Ones marked **Decided** are
+> cheap to reverse and should not block F0; ones marked **Open** need either a
+> measurement or an owner's call that changing later would be expensive.
+
+1. ~~**Does the hub run sessions of its own?**~~ **Decided: yes, mixed-role.**
+   The Hetzner box is both the always-on host and the biggest worker; a dedicated
+   hub would idle the best machine in the fleet to buy a cleaner diagram. The
+   blast-radius concern is narrower than it first looks: what is privileged is
+   the *conductor*, not the hub, and hub-local sessions are ordinary sessions
+   with ordinary identities. Revisit only if a second always-on host appears.
+2. ~~**What is replicated on reconnect after a long partition?**~~
+   **Decided: watermarked card resync.** Not a full-table transfer — cards
+   already carry `updated_at` (`cards.ts`), so a satellite sends only cards newer
+   than the hub's high-water mark for that machine. Bounded by *what changed*
+   rather than by corpus size, which is what makes a fortnight offline behave the
+   same as an hour.
 3. ~~**Is `fleet:read` sufficient for a satellite?**~~ **Resolved** by §13.1: a
    satellite *writes* to the hub's mirror, which `fleet:read` does not cover, and
    since federation is ZeroID-only there is no non-ZeroID case to design around.
    Add `fleet:replicate` to the scope vocabulary as `fleet:read` was — and note
    issue **#111** already tracks growing that vocabulary for sensitive verbs.
-4. **Does the mobile app talk to the hub only?** ([mobile-app-design.md](./mobile-app-design.md))
-   Almost certainly yes — but then the hub is a hard availability dependency for
-   the phone, which the single-machine design never had.
-5. **Reclaim semantics for an in-flight `ship`** (§8). Blocking for F3.
-6. **Does `machineId` belong in the tenancy key?** Today tenancy is
-   `(account, project)`. Adding machine would isolate machines by construction —
-   and would also break the cross-machine queries §6 exists to enable. Current
-   call: machine is an *attribute*, not a tenant.
-7. **Should a satellite be able to run a conductor when the hub is unreachable?**
-   A degraded local conductor is attractive for a laptop on a plane and is
-   directly at odds with §2's singularity. Probably no; worth deciding
-   deliberately rather than by omission.
-8. **What is the real trust level of a Mac mini?** (§5.1) It has no TPM, so L2
-   means a Secure Enclave path — a different protocol, a different verifier, and
-   possibly Apple-account-bound in ways that do not fit a `tpm` proof type at
-   all. Either ZeroID grows a fourth proof type or the Mac stays L1 permanently.
-   The second is acceptable; it should be a decision, not a discovery.
-9. **Does a machine's trust level gate capabilities, or only get recorded?**
-   `RequiredTrustLevel` makes "only an L2 machine may run `ship` dispatch"
-   expressible. It is also the kind of rule that turns a dead TPM into an outage
-   on a Sunday. Recommend: record at L1, gate nothing, until there is a second
-   user.
-10. **Attestation freshness.** An attestation is point-in-time; a satellite
-    stays connected for weeks. Re-attestation cadence is unspecified, and the
-    WIMSE draft explicitly punts on it (short token lifetimes + DPoP, no nonce).
-    Tie it to credential expiry rather than inventing a heartbeat proof.
+4. ~~**Does the mobile app talk to the hub only?**~~ **Decided: hub by default,
+   satellite by exception.** ([mobile-app-design.md](./mobile-app-design.md))
+   The dependency is less new than it appears — the phone already requires *a*
+   reachable daemon, and the hub merely fixes *which*. Because a satellite speaks
+   the identical protocol, the app can attach directly to one when the hub is
+   unreachable and it can reach the machine; it loses the aggregated board and
+   keeps the sessions. No new wire types either way.
+5. ~~**Reclaim semantics for an in-flight `ship`**~~ **Resolved in §8.1** —
+   machine-scoped claim plus reconcile-on-return, with `ship` blocking for review
+   rather than re-running when its worker is gone. §8.2 adds the park-while-
+   offline rule that keeps `failureLimit` meaningful. No longer blocking for F3;
+   it *is* F3's exit criterion.
+6. ~~**Does `machineId` belong in the tenancy key?**~~ **Decided: no — machine is
+   an attribute.** Adding it to `(account, project)` would isolate machines by
+   construction and break the cross-machine queries §6 exists to enable. Every
+   machine in this design belongs to one owner; isolating them would be solving a
+   multi-tenant problem that does not exist here.
+7. ~~**Should a satellite run a conductor when the hub is unreachable?**~~
+   **Decided: no.** A second conductor is a second assistant with its own
+   context, its own dispatch queue, and no way to merge either back — §2's
+   singularity is load-bearing, not stylistic. A laptop on a plane keeps its
+   sessions and its local memory; what it loses is the fleet view, which is
+   precisely the thing that has no meaning while disconnected.
+8. ~~**What is the real trust level of a Mac mini?**~~ **Decided: L1, and that is
+   the end state, not a staging post.** (§5.1) It has no TPM, so L2 would mean a
+   Secure Enclave path — a different protocol, a different verifier, and possibly
+   Apple-account-bound in ways that do not fit a `tpm` proof type at all. Since
+   §5.1 already declines to *gate* on trust level (see 9), a permanently-L1
+   machine costs nothing operationally. Recorded as a decision so it is never
+   rediscovered as a surprise mid-implementation.
+9. ~~**Does trust level gate capabilities, or only get recorded?**~~
+   **Decided: record, do not gate — for now.** `RequiredTrustLevel` makes "only
+   an L2 machine may run `ship`" expressible, and that is exactly the rule that
+   turns a dead TPM into a Sunday outage on a single-operator fleet. Record the
+   level, surface it in the machine roster (§14.4), and gate nothing until there
+   is a second user or a compliance reason. Reversing this later is a policy
+   change, not a migration — which is why it is safe to defer.
+10. ~~**Attestation freshness.**~~ **Decided: tie it to credential lifetime.**
+    An attestation is point-in-time while a satellite stays connected for weeks,
+    and the WIMSE draft explicitly punts (short token lifetimes + DPoP, no
+    nonce). Rather than invent a heartbeat proof, re-attestation happens when the
+    satellite's credential is renewed — which makes credential lifetime the
+    single knob for both §13.2's outage window and attestation freshness. One
+    parameter, two properties, no new protocol.
+
+**Still genuinely open — needs measurement, not a decision:**
+
+- **The retrieval fallback trigger (§7).** Whether scatter-gather holds the 2s
+  budget is an empirical question; F2's exit criterion answers it, and the
+  per-machine `replicate: cards | full` fallback is already specified.
+- **Credential lifetime, the number.** Item 10 makes it the load-bearing
+  parameter for two properties. What it should actually be depends on how long a
+  ZeroID outage must be survivable, which is an operational question rather than
+  a design one.

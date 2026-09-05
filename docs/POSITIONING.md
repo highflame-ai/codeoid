@@ -1,7 +1,7 @@
 # codeoid — Positioning & Competitive Strategy
 
-> **Internal working doc — untracked, not published.** Living reference; update as features land and the market moves.
-> Last updated: **2026-07-14**. The landscape here moves in weeks — re-verify dated claims before relying on them.
+> **Internal working doc.** Tracked in-repo (so it reviews like everything else) but not published anywhere. Living reference; update as features land and the market moves.
+> Last updated: **2026-09-05**. The landscape here moves in weeks — re-verify dated claims before relying on them.
 
 ---
 
