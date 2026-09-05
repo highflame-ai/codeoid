@@ -45,6 +45,7 @@ const group = (lead: SessionInfo, children: SessionInfo[] = []): FleetGroup => (
   lead,
   children,
   isFleet: children.length > 0,
+  isConductor: lead.role === "conductor",
 });
 
 describe("bands", () => {
