@@ -93,6 +93,7 @@ interface RawDispatchRow {
   failure_limit: number;
   claim_owner: string | null;
   claimed_at: number | null;
+  owner_daemon: string | null;
   not_before: number | null;
   worker_session_id: string | null;
   result_digest: string | null;
@@ -490,6 +491,18 @@ export class Store {
 
     this.#addColumnIfMissing("dispatch_tasks", "group_id", "TEXT");
     this.#addColumnIfMissing("dispatch_tasks", "group_ordinal", "INTEGER");
+    // Owning daemon (host:port) — the executor scope for claim + reclaim.
+    // `claim_owner` is a BOOT id, which cannot distinguish "my own crashed
+    // run" from "another daemon's healthy claim". Two daemons sharing this
+    // database (a supported setup — local-mode.md port-scopes its token file
+    // for exactly that) therefore stole each other's in-flight tasks and
+    // auto-blocked them, and could claim across tenants. NULL = a pre-upgrade
+    // row, claimable by any daemon so nothing is stranded by the migration.
+    this.#addColumnIfMissing("dispatch_tasks", "owner_daemon", "TEXT");
+    this.#db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_dispatch_owner
+         ON dispatch_tasks(owner_daemon, status, created_at);`,
+    );
     // AFTER the ALTERs, never inside the CREATE block above. On an existing
     // database `CREATE TABLE IF NOT EXISTS` is a no-op, so an index declared
     // there would run against a table that does not have the column yet and
@@ -939,14 +952,20 @@ export class Store {
     /** 1-based position within that group. */
     groupOrdinal?: number;
     now: number;
+    /**
+     * The daemon that may claim and execute this task (host:port). Omit only
+     * in tests that never run two dispatchers — a NULL owner is claimable by
+     * any daemon, which is the pre-upgrade compatibility path.
+     */
+    ownerDaemon?: string;
   }): void {
     this.#db
       .prepare(
         `INSERT INTO dispatch_tasks
            (id, account_id, project_id, kind, shape, target_session, workdir,
             prompt, provider, model, failure_limit, created_by, group_id,
-            group_ordinal, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            group_ordinal, owner_daemon, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         task.id,
@@ -963,6 +982,7 @@ export class Store {
         task.createdBy,
         task.groupId ?? null,
         task.groupOrdinal ?? null,
+        task.ownerDaemon ?? null,
         task.now,
         task.now,
       );
@@ -981,6 +1001,7 @@ export class Store {
     bootId: string,
     now: number,
     excludeIds: readonly string[] = [],
+    ownerDaemon?: string,
   ): DispatchTaskRow | null {
     const row = this.#db
       .prepare(
@@ -990,12 +1011,20 @@ export class Store {
            SELECT id FROM dispatch_tasks
            WHERE status = 'queued'
              AND (not_before IS NULL OR not_before <= ?)
+             AND (owner_daemon IS NULL OR owner_daemon IS ?)
              AND id NOT IN (SELECT value FROM json_each(?))
            ORDER BY created_at LIMIT 1
          )
          RETURNING *`,
       )
-      .get(bootId, now, now, now, JSON.stringify(excludeIds)) as RawDispatchRow | null;
+      .get(
+        bootId,
+        now,
+        now,
+        now,
+        ownerDaemon ?? null,
+        JSON.stringify(excludeIds),
+      ) as RawDispatchRow | null;
     return row ? rowToDispatchTask(row) : null;
   }
 
@@ -1074,7 +1103,21 @@ export class Store {
    * stuck-loop escalation, in queue form. worker_session_id is preserved so
    * a re-claimed spawn can continue its (resumed) worker session.
    */
-  dispatchReclaimStale(bootId: string, leaseMs: number, now: number): DispatchTaskRow[] {
+  /**
+   * Reclaim claims this daemon can prove are dead.
+   *
+   * The `owner_daemon` predicate is load-bearing: `claim_owner` is a BOOT id,
+   * so "not my boot" matches another *live* daemon's claim just as readily as
+   * my own crashed one. Scoping to this daemon's own tasks first is what makes
+   * the boot-id fast path (restart recovery on the first tick) correct rather
+   * than theft. A row with no owner is pre-upgrade and stays lease-governed.
+   */
+  dispatchReclaimStale(
+    bootId: string,
+    leaseMs: number,
+    now: number,
+    ownerDaemon?: string,
+  ): DispatchTaskRow[] {
     const rows = this.#db
       .prepare(
         `UPDATE dispatch_tasks
@@ -1083,10 +1126,24 @@ export class Store {
              claim_owner = NULL, claimed_at = NULL,
              error = COALESCE(error, 'reclaimed: stale claim'), updated_at = ?
          WHERE status IN ('claimed', 'running')
-           AND (claim_owner IS NOT ? OR claimed_at IS NULL OR claimed_at + ? < ?)
+           AND (
+             -- Mine: a previous boot of THIS daemon crashed, or the lease ran out.
+             (owner_daemon IS ? AND (claim_owner IS NOT ? OR claimed_at IS NULL OR claimed_at + ? < ?))
+             -- Unowned (pre-upgrade): lease expiry only — never on boot id, which
+             -- is what let another daemon steal a healthy claim.
+             OR (owner_daemon IS NULL AND (claimed_at IS NULL OR claimed_at + ? < ?))
+           )
          RETURNING *`,
       )
-      .all(now, bootId, leaseMs, now) as RawDispatchRow[];
+      .all(
+        now,
+        ownerDaemon ?? null,
+        bootId,
+        leaseMs,
+        now,
+        leaseMs,
+        now,
+      ) as RawDispatchRow[];
     return rows.map(rowToDispatchTask);
   }
 
