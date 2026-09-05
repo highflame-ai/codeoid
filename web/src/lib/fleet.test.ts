@@ -236,8 +236,24 @@ describe("groupFleet — conductor and dispatch workers", () => {
   it("labels a worker by shape and task tail", () => {
     expect(roleLabel(worker("w", "scout", "c0234348"))).toBe("scout·c0234348");
     expect(workerShape(worker("w", "ship", "x"))).toBe("ship");
-    // A user-named session is never mislabelled: only the daemon sets the role.
-    expect(workerShape(session("s", { name: "worker-ship-nope" }))).toBeNull();
+  });
+
+  it("never trusts the name alone — only the daemon sets role:worker", () => {
+    // A user may name a session anything; the role is the authority. Asserted
+    // through BOTH readers, since they share one guarded parser and a caller
+    // must not be able to bypass it by picking the other entry point.
+    const spoof = session("s", { name: "worker-ship-nope" });
+    expect(workerShape(spoof)).toBeNull();
+    expect(roleLabel(spoof)).toBeNull();
+  });
+
+  it("returns the bare shape when the daemon name carries no task tail", () => {
+    const tailless = session("w", { name: "worker-scout-", role: "worker" });
+    expect(roleLabel(tailless)).toBe("scout");
+    // An unrecognised shape is not a worker label at all, rather than a guess.
+    const odd = session("w2", { name: "worker-courier-abc", role: "worker" });
+    expect(workerShape(odd)).toBeNull();
+    expect(roleLabel(odd)).toBeNull();
   });
 
   it("filters on role and shape, keeping the conductor as context", () => {

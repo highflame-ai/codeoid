@@ -199,28 +199,54 @@ export function countVisible(groups: readonly FleetGroup[]): number {
 export function roleLabel(s: SessionInfo): string | null {
   const r = s.collaborationRole;
   if (r) return r.ordinal > 1 ? `${r.roleName}#${r.ordinal}` : r.roleName;
-  const shape = workerShape(s);
-  // `worker-scout-c0234348` → `scout·c023448`. The task-id tail is what lets
+  const w = parseWorkerName(s);
+  if (!w) return null;
+  // `worker-scout-c0234348` → `scout·c0234348`. The task-id tail is what lets
   // you match a row against a `fleet_tasks` entry, so it earns its width.
-  if (shape) {
-    const tail = s.name.slice(`worker-${shape}-`.length);
-    return tail ? `${shape}·${tail}` : shape;
+  return w.task ? `${w.shape}·${w.task}` : w.shape;
+}
+
+/** The daemon's dispatch-worker naming: `worker-<shape>-<task>`. */
+const WORKER_PREFIX = "worker-";
+const WORKER_SHAPES = ["ship", "scout"] as const;
+
+export type WorkerShape = (typeof WORKER_SHAPES)[number];
+
+/**
+ * Split a dispatch worker's name into its shape and task id, or null when this
+ * is not a worker.
+ *
+ * ONE place owns the `worker-<shape>-<task>` format. It was briefly split
+ * across `workerShape` (matching the prefix) and `roleLabel` (re-deriving the
+ * same prefix to slice the tail), which meant a change to the daemon's naming
+ * had two call sites to find and only one of them would fail loudly.
+ *
+ * Parsed from the name rather than read from a wire field because
+ * `SessionInfo` carries no shape: the ship/scout contract lives on the
+ * dispatch task, which the session list does not join against.
+ *
+ * The `role === "worker"` guard is the security-relevant part and belongs
+ * HERE, not at the call sites — a user is free to name a session
+ * `worker-ship-anything`, and only the daemon sets the role. Callers therefore
+ * cannot opt out of the check by forgetting it.
+ */
+function parseWorkerName(
+  s: SessionInfo,
+): { shape: WorkerShape; task: string } | null {
+  if (s.role !== "worker") return null;
+  for (const shape of WORKER_SHAPES) {
+    const prefix = `${WORKER_PREFIX}${shape}-`;
+    if (s.name.startsWith(prefix)) {
+      return { shape, task: s.name.slice(prefix.length) };
+    }
   }
   return null;
 }
 
 /**
  * A dispatch worker's shape, or null when this is not a worker.
- *
- * Read from the daemon's `worker-<shape>-<task>` naming rather than from a
- * wire field because `SessionInfo` carries no shape: the ship/scout contract
- * lives on the dispatch task, which the session list does not join against.
- * Guarded by `role === "worker"` so a user-named session that happens to start
- * with `worker-` is never mislabelled — only the daemon sets that role.
+ * Thin accessor over {@link parseWorkerName} — see it for the guard rationale.
  */
-export function workerShape(s: SessionInfo): "ship" | "scout" | null {
-  if (s.role !== "worker") return null;
-  if (s.name.startsWith("worker-ship-")) return "ship";
-  if (s.name.startsWith("worker-scout-")) return "scout";
-  return null;
+export function workerShape(s: SessionInfo): WorkerShape | null {
+  return parseWorkerName(s)?.shape ?? null;
 }
