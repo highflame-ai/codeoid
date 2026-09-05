@@ -26,7 +26,7 @@ Almost everything that makes Codeoid interesting is orthogonal to identity, so i
 | Workspace memory index | ✅ auto-injected into every system prompt |
 | Every backend | ✅ Claude, Codex, Gemini, Gemini CLI, OpenAI, pi |
 | Cross-backend session fork | ✅ |
-| Conductor + durable dispatch | ✅ |
+| Conductor + durable dispatch | ✅ — on **this machine**; see federation below |
 | CLI-output compression, auto-rotation | ✅ |
 | Git worktrees, parallel sessions | ✅ |
 | Per-turn token / cost / cache telemetry | ✅ |
@@ -43,6 +43,7 @@ Everything that requires a **verified** principal:
 - **Cryptographic audit attribution.** The audit log still records *what* happened; the principal recorded is `anonymous:operator`, which is **self-asserted**. It proves the daemon accepted a token that could read a file on this machine — nothing more.
 - **Multi-user sharing and delegation.** No scoped read-only share tokens for teammates.
 - **The Telegram frontend.** Refused under `--local` (see [Telegram](#why-telegram-is-refused)).
+- **Federation across machines.** A local daemon is a fleet of one: no hub, no satellites, no cross-machine board or recall. Refused under `--local` (see [Federation](#why-federation-is-refused)).
 - **Google OAuth sign-in for the web UI.** It works by exchanging at ZeroID's token endpoint, so it is disabled.
 
 Every surface says so out loud: a startup banner, `authMode: "local"` on the wire, a `local mode` badge in the web UI status bar, and a warning at the top of the identity drawer.
@@ -86,6 +87,28 @@ Two guards apply:
 ### Why Telegram is refused
 
 Telegram is reached *through Telegram's servers* — a remote surface. Local mode's trust model is "whoever can read a `0600` file on this machine." Pairing them would let a locally-minted token stand in for a verified identity over the public internet, so the frontend refuses to start and the CLI declines to register it. Run `codeoid login` and start without `--local` to use Telegram.
+
+### Why federation is refused
+
+[Federation](federation-design.md) links several machines' daemons into one hub
+view — one conductor, one board, cross-machine recall and dispatch. It is
+refused under `--local`, for the same reason Telegram is and one more.
+
+The link is a surface *between machines*. Local mode's trust model is "whoever
+can read a `0600` file on this machine", so a locally-minted token standing in
+for a verified identity to a hub on another box is the same substitution
+Telegram's refusal exists to prevent. The bind guard above already routes this
+case: *need it remote, use ZeroID.*
+
+The additional reason is tenancy. Local-mode sessions live in the reserved
+`local` / `local` tenant behind the [one-way door](#the-tenant-one-way-door--read-this-before-you-invest-work).
+A hub aggregating several machines' `local/local` sessions would be merging
+buckets that are, by construction, not the same tenant — every one of them a
+self-asserted principal on a different box.
+
+So a local daemon is a fleet of one. `--local` with an upstream or a hub role
+configured fails at startup and names `codeoid login` as the fix, rather than
+failing later as a connection that never establishes.
 
 ## The tenant one-way door — read this before you invest work
 
