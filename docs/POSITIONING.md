@@ -1,7 +1,7 @@
 # codeoid — Positioning & Competitive Strategy
 
-> **Internal working doc — untracked, not published.** Living reference; update as features land and the market moves.
-> Last updated: **2026-07-14**. The landscape here moves in weeks — re-verify dated claims before relying on them.
+> **Internal working doc.** Tracked in-repo (so it reviews like everything else) but not published anywhere. Living reference; update as features land and the market moves.
+> Last updated: **2026-09-05**. The landscape here moves in weeks — re-verify dated claims before relying on them.
 
 ---
 
@@ -67,6 +67,8 @@ Honest caveat: part of Omnigent's weight *buys* the OS sandbox — the gap on ou
 
 **Tier 2 — control-plane completeness (necessary):**
 - **Conductor over all sessions** — finish the provider-agnostic conductor; it's what makes "control plane" true vs "session list."
+- **Federation across machines** ([design](federation-design.md)) — one hub view over N daemons (laptop, workstation, server, Mac). Scanned Sep 2026: happy, Omnara, Vibe Kanban, Sculptor and Coder Agent Relay all do *remote control of one machine*; **nobody aggregates several**. Omnara answers the same need by *migrating* a session to the cloud — the opposite primitive, and it can't serve work that is pinned to a machine (Apple signing, the corpus, an unpushed branch).
+  Two notes that keep this honest: it is a **ZeroID-tier capability** (refused under `--local` — see [local-mode](local-mode.md#why-federation-is-refused)), so it does not widen the OSS surface; and its defensible half is not the aggregation but **per-machine attested identity** (ZeroID already ships the `tpm` proof type + `RequiredTrustLevel` gate), which no peer in that table can reach because none has an identity layer to hang it on. Sequence it *behind* the P5 front doors — an aggregated board with no client drawing it is worth nothing.
 - **Cross-OS web UI** — already true; make it a *headline*, not a footnote.
 
 **Tier 3 — table stakes (build thin, don't out-polish incumbents):**
