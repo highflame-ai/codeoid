@@ -507,6 +507,92 @@ describe("skillCommandAllowRules", () => {
 // Park-and-retry: a blocked skill command must NOT fail the turn (that killed the
 // pipeline — #233). It parks the turn (approval_pending), and on approval the
 // loop rebuilds with the grant and retries the SAME prompt in place.
+/**
+ * The UNEXPLAINED zero-turn: `num_turns: 0` with no `<local-command-stderr>`
+ * naming a cause. The prompt was consumed and the model never ran, so before
+ * this the prompt was simply lost and the user retyped it.
+ *
+ * Distinct from #233 (a blocked skill command, which HAS a stderr cause and
+ * parks for approval) and from the upstream reporting defect
+ * (anthropics/claude-code#80223) — this recovers whatever produced the zero
+ * turn, because it keys on `num_turns` rather than on any cause.
+ */
+describe("ClaudeProvider – unexplained zero-turn re-send", () => {
+  beforeEach(() => { sdkMessages = []; sdkThrowError = null; capturedQueryOpts = null; sdkGate = null; });
+
+  const ZERO_TURN = { type: "result", subtype: "success", is_error: false, num_turns: 0, result: "" };
+  const REAL_TURN = { type: "result", subtype: "success", num_turns: 2, result: "done", modelUsage: {} };
+  const info = (events: ProviderEvent[]) =>
+    events.filter(
+      (e) => e.type === "custom_message" && String((e as { content?: string }).content).includes("re-sending"),
+    );
+  const zeroTurnErrors = (events: ProviderEvent[]) =>
+    events.filter(
+      (e) =>
+        e.type === "turn_done" &&
+        String((e as { result?: { errorMessage?: string } }).result?.errorMessage ?? "").includes(
+          "produced no turn",
+        ),
+    );
+
+  it("re-sends the consumed prompt instead of surfacing an error", async () => {
+    sdkMessages = [ZERO_TURN, REAL_TURN];
+    const events = await collectTurnEvents(makeProvider());
+    // The user is told, once, that the turn is being retried...
+    expect(info(events)).toHaveLength(1);
+    // ...and never sees the zero-turn error, because the turn recovered.
+    expect(zeroTurnErrors(events)).toHaveLength(0);
+    // The turn still ends normally, on the real result.
+    expect(events.some((e) => e.type === "turn_done")).toBe(true);
+  });
+
+  it("gives up after ONE attempt — a second zero-turn is a real error", async () => {
+    sdkMessages = [ZERO_TURN, ZERO_TURN];
+    const events = await collectTurnEvents(makeProvider());
+    expect(info(events)).toHaveLength(1); // not two
+    // The retry failed the same way, so the turn ends honestly rather than
+    // looping on a backend that will never run this prompt.
+    expect(zeroTurnErrors(events)).toHaveLength(1);
+  });
+
+  it("leaves a normal multi-turn result alone", async () => {
+    sdkMessages = [REAL_TURN];
+    const events = await collectTurnEvents(makeProvider());
+    expect(info(events)).toHaveLength(0);
+    expect(zeroTurnErrors(events)).toHaveLength(0);
+  });
+
+  it("does NOT touch a zero-turn that HAS a reported cause", async () => {
+    // A stderr cause that is not a skill-command pattern, so #233's parked
+    // approval declines it too — it must fall through to the honest error with
+    // the real reason, NOT be silently re-sent as if unexplained.
+    sdkMessages = [
+      {
+        type: "user",
+        message: { role: "user", content: "<local-command-stderr>Error: disk on fire</local-command-stderr>" },
+      },
+      ZERO_TURN,
+    ];
+    const events = await collectTurnEvents(makeProvider());
+    expect(info(events)).toHaveLength(0);
+    const errs = zeroTurnErrors(events);
+    expect(errs).toHaveLength(1);
+    expect(String((errs[0] as { result: { errorMessage?: string } }).result.errorMessage)).toContain(
+      "disk on fire",
+    );
+  });
+
+  it("gives each NEW prompt its own single attempt", async () => {
+    const provider = makeProvider();
+    sdkMessages = [ZERO_TURN, REAL_TURN];
+    expect(info(await collectTurnEvents(provider, "first"))).toHaveLength(1);
+    // The one-shot guard is per-turn, not per-session: a later prompt that hits
+    // the same cold-loop failure must still be recoverable.
+    sdkMessages = [ZERO_TURN, REAL_TURN];
+    expect(info(await collectTurnEvents(provider, "second"))).toHaveLength(1);
+  });
+});
+
 describe("ClaudeProvider – skill-command approval (#233)", () => {
   // A Store backed by a real Map, so a persisted grant is visible to the retry's
   // query rebuild (a fixed-map stub could never satisfy the retry).
