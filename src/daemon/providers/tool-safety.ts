@@ -8,6 +8,7 @@
 import { BLACKBOARD_MCP_SERVER_NAME } from "../blackboard/mcp-http.js";
 import { MEMORY_MCP_SERVER_NAME } from "../memory/mcp-http.js";
 import { MEMORY_TOOL_NAMES } from "../memory/tools.js";
+import { FLEET_READ_TOOLS, FLEET_TOOL_PREFIX } from "../../protocol/types.js";
 
 /** Built-in read-only tools that never require confirmation. */
 const SAFE_TOOLS = new Set<string>(["Read", "Grep", "Glob"]);
@@ -22,6 +23,18 @@ const MEMORY_TOOL_PREFIXES = [
 const BLACKBOARD_TOOL_PREFIXES = [
   `mcp__${BLACKBOARD_MCP_SERVER_NAME}__`,
   `${BLACKBOARD_MCP_SERVER_NAME}__`,
+] as const;
+
+/**
+ * Same two namespacing conventions, for the conductor's fleet mount.
+ *
+ * The bare form is unused today — the fleet server is a Claude in-process MCP
+ * object — but is listed so a mounted fleet (#245) does not silently regress to
+ * prompting on every read.
+ */
+const FLEET_TOOL_PREFIXES = [
+  FLEET_TOOL_PREFIX, // `mcp__codeoid_fleet__` — Claude in-process MCP
+  FLEET_TOOL_PREFIX.replace(/^mcp__/, ""), // bare mount
 ] as const;
 
 /**
@@ -58,6 +71,17 @@ export function isSafeTool(name: string): boolean {
   for (const prefix of BLACKBOARD_TOOL_PREFIXES) {
     if (name.startsWith(prefix)) {
       return (BLACKBOARD_SAFE_TOOLS as readonly string[]).includes(name.slice(prefix.length));
+    }
+  }
+  // Fleet READS only. The send-class verbs are absent by construction —
+  // `FLEET_READ_TOOLS` is the read half of the shared vocabulary, so a verb
+  // added to the send half can never leak in here by editing one list. They are
+  // additionally hard-gated before this function is ever consulted
+  // (`isFleetSendTool` in Session#shouldAutoApprove), which is the invariant;
+  // this is defence in depth, not the fence.
+  for (const prefix of FLEET_TOOL_PREFIXES) {
+    if (name.startsWith(prefix)) {
+      return (FLEET_READ_TOOLS as readonly string[]).includes(name.slice(prefix.length));
     }
   }
   return false;
