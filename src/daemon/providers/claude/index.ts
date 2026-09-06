@@ -991,11 +991,24 @@ export class ClaudeProvider implements SessionProvider {
    * the turn open, exactly as the #233 park does.
    */
   #tryRecoverConsumedPrompt(): boolean {
-    if (this.#zeroTurnRecoveryAttempted) return false;
-    if (!this.#lastTurnOpts || this.#lastPushedContent === null) return false;
+    const tag = `[claude-provider ${this.#init.sessionId.slice(0, 8)}]`;
+    // Falling through emits the real turn_done error, so the USER sees the
+    // failure either way. These lines are for the operator: they separate "the
+    // retry ran and also came back empty" from "never retried", which is the
+    // difference between a backend that is wedged and a one-off swallow.
+    if (this.#zeroTurnRecoveryAttempted) {
+      console.error(
+        `${tag} zero-turn again after the re-send — giving up, surfacing as a turn error`,
+      );
+      return false;
+    }
+    if (!this.#lastTurnOpts || this.#lastPushedContent === null) {
+      console.error(`${tag} zero-turn with no reported cause and no prompt to re-send`);
+      return false;
+    }
     this.#zeroTurnRecoveryAttempted = true;
     console.error(
-      `[claude-provider ${this.#init.sessionId.slice(0, 8)}] zero-turn with no reported cause — re-sending the consumed prompt (${this.#lastPushedContent.length}B)`,
+      `${tag} zero-turn with no reported cause — re-sending the consumed prompt (${this.#lastPushedContent.length}B)`,
     );
     this.#emit({
       type: "custom_message",
