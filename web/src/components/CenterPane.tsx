@@ -24,11 +24,13 @@ import UiRequestBar from "./transcript/UiRequestBar";
 import PromptBox from "./prompt/PromptBox";
 import SessionControls from "./SessionControls";
 import Transcript from "./transcript/Transcript";
+import FleetRail from "./FleetRail";
 import WorkerIndicator from "./transcript/WorkerIndicator";
 import { openNewSessionModal } from "./NewSessionModal";
 import { openImportModal } from "./SessionImportModal";
 
 const CenterPane: Component = () => {
+  const isConductor = () => focusedSession()?.role === "conductor";
   return (
     <main class="row-start-2 col-start-3 flex min-h-0 min-w-0 flex-1 flex-col bg-bg">
       <Show
@@ -70,15 +72,35 @@ const CenterPane: Component = () => {
         }
       >
         <SessionHeader />
-        <Transcript />
-        <WorkerIndicator />
-        <ApprovalBar />
-        <UiRequestBar />
-        <PromptBox />
+        {/* The conductor is a lens, not a wall (§3): it gets the SAME chat
+            cockpit every agent gets, with the fleet board docked beside it —
+            never a second, divergent copy of a session's chat. */}
+        <Show when={isConductor()} fallback={<SessionBody />}>
+          <div class="flex min-h-0 flex-1">
+            <div class="flex min-w-0 flex-1 flex-col">
+              <SessionBody />
+            </div>
+            <FleetRail />
+          </div>
+        </Show>
       </Show>
     </main>
   );
 };
+
+/**
+ * Chat cockpit — identical for every session, conductor included. Extracted so
+ * the conductor branch docks a rail beside it rather than reimplementing it.
+ */
+const SessionBody: Component = () => (
+  <>
+    <Transcript />
+    <WorkerIndicator />
+    <ApprovalBar />
+    <UiRequestBar />
+    <PromptBox />
+  </>
+);
 
 const SessionHeader: Component = () => (
   <Show when={focusedSession()}>
