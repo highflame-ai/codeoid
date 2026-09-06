@@ -10,6 +10,8 @@
 
 import { Component, Show } from "solid-js";
 
+import HomeToggle from "./HomeToggle";
+
 import {
   ctxWindowColorClass,
   elapsedSince,
@@ -43,6 +45,9 @@ const StatusBar: Component = () => {
         </button>
       </Show>
       <span class="select-none font-mono font-semibold text-fg">codeoid</span>
+      <Sep />
+      {/* Two co-equal homes, always both available (§3.A) — never a mode. */}
+      <HomeToggle />
       <Sep />
       <ConnectionPill />
       <Sep />
