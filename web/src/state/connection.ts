@@ -40,6 +40,7 @@ import {
 } from "./messages";
 import { noteLiveSeq, noteReplayFrame } from "./resume";
 import { addUiRequest, removeUiRequest } from "./ui-requests";
+import { ingestFleetDelta } from "./fleet";
 
 // Resolve the daemon WebSocket URL:
 //   1. explicit VITE_CODEOID_URL build override, else
@@ -361,6 +362,9 @@ function routeBroadcast(msg: DaemonMessage): void {
     case "session.ui_request":
       addUiRequest(msg);
       return;
+    case "fleet.update":
+      ingestFleetDelta(msg.delta);
+      return;
     case "session.ui_resolved":
       // Authoritative dismiss — fires whether WE answered, another client
       // did, the request timed out, or the turn was interrupted.
@@ -374,6 +378,9 @@ function routeBroadcast(msg: DaemonMessage): void {
     // frame to onMessage handlers even after resolving the pending request,
     // so ingesting here again double-applied every refresh.
     case "session.list.result":
+    // Solicited: the reply to `fleet.subscribe`, already ingested on the
+    // request path by subscribeFleet.
+    case "fleet.snapshot.result":
     case "auth.ok":
     case "response.ok":
     case "response.error":

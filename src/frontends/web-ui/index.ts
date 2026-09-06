@@ -26,7 +26,7 @@
  */
 
 import { existsSync } from "node:fs";
-import { join, normalize, resolve } from "node:path";
+import { join, normalize, resolve, sep } from "node:path";
 import { isLoopbackHost } from "../../daemon/local-auth.js";
 import type { Frontend, FrontendContext } from "../types.js";
 
@@ -63,6 +63,37 @@ export function buildBootScript(opts: {
     script += `window.__CODEOID_LOCAL_TOKEN__=${enc(opts.localToken)};`;
   }
   return `<script>${script}</script>`;
+}
+
+/**
+ * The slice of `node:path` the asset resolver needs. Injectable so the
+ * resolver can be exercised under Windows semantics (`path.win32`) from a
+ * POSIX host — the separator bug this guards against is invisible otherwise.
+ */
+export type PathFlavor = { join: typeof join; normalize: typeof normalize; sep: string };
+
+const NATIVE_PATH: PathFlavor = { join, normalize, sep };
+
+/**
+ * Map a `/ui/...` request path to a file under `distRoot`, or `null` when it
+ * escapes that root.
+ *
+ * The containment check compares against `distRoot + sep`, NOT a hardcoded
+ * `/`. `normalize()` emits the platform separator, so on Windows every legit
+ * asset resolves to `C:\...\web\dist\index.html` — which does not start with
+ * `C:\...\web\dist/`, and the whole UI 403s (issue #299). The separator has to
+ * come from the same path flavor that produced the string being tested.
+ */
+export function resolveUiAsset(
+  distRoot: string,
+  urlPath: string,
+  p: PathFlavor = NATIVE_PATH,
+): { rel: string; target: string } | null {
+  const rel =
+    urlPath === "/ui" || urlPath === "/ui/" ? "index.html" : urlPath.slice("/ui/".length);
+  const target = p.normalize(p.join(distRoot, rel));
+  if (target !== distRoot && !target.startsWith(`${distRoot}${p.sep}`)) return null;
+  return { rel, target };
 }
 
 /** Does this request's `Host` name a loopback address? Fails closed. */
@@ -136,13 +167,10 @@ export class WebUiFrontend implements Frontend {
     const path = new URL(req.url).pathname;
     if (path !== "/ui" && !path.startsWith("/ui/")) return null;
 
-    const rel =
-      path === "/ui" || path === "/ui/" ? "index.html" : path.slice("/ui/".length);
-    const target = normalize(join(DIST, rel));
     // Path-traversal guard — never serve outside the dist root.
-    if (target !== DIST && !target.startsWith(`${DIST}/`)) {
-      return new Response("Forbidden", { status: 403 });
-    }
+    const asset = resolveUiAsset(DIST, path);
+    if (!asset) return new Response("Forbidden", { status: 403 });
+    const { rel, target } = asset;
 
     let file = target;
     if (!existsSync(file)) {
