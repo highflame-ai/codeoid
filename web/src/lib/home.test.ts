@@ -1,6 +1,12 @@
 import { describe, it, expect } from "vitest";
 
-import { DEFAULT_HOME, findConductor, homeTarget, isHome } from "./home";
+import {
+  DEFAULT_HOME,
+  findConductor,
+  homeTarget,
+  isHome,
+  isOrdinarySession,
+} from "./home";
 import type { SessionInfo } from "../protocol/types";
 
 const s = (id: string, role?: "conductor" | "worker"): SessionInfo =>
@@ -31,6 +37,26 @@ describe("findConductor", () => {
   it("finds it, and reports null rather than guessing when absent", () => {
     expect(findConductor([WORK, CONDUCTOR, WORKER])?.id).toBe("cond");
     expect(findConductor([WORK, WORKER])).toBeNull();
+  });
+});
+
+describe("isOrdinarySession", () => {
+  it("accepts only a session with no role", () => {
+    expect(isOrdinarySession(WORK)).toBe(true);
+    expect(isOrdinarySession(CONDUCTOR)).toBe(false);
+    expect(isOrdinarySession(WORKER)).toBe(false);
+  });
+
+  it("EXCLUDES a role this client has never heard of", () => {
+    // The fail-safe, and the reason this is `role === undefined` rather than
+    // `role !== "conductor" && role !== "worker"`. The protocol deliberately
+    // allows roles a client does not know (session.create types role as an open
+    // string "so a future role from a newer client still type-checks"), and the
+    // negative form would silently opt every future kind into being a landing
+    // target. Workers are excluded because they vanish; inheriting that risk
+    // for kinds we know nothing about is the wrong default.
+    const future = { id: "x", name: "x", role: "sandbox" } as unknown as SessionInfo;
+    expect(isOrdinarySession(future)).toBe(false);
   });
 });
 
@@ -79,5 +105,13 @@ describe("homeTarget — Sessions home", () => {
 
   it("leaves focus alone when the conductor is the only session", () => {
     expect(homeTarget([CONDUCTOR], "sessions", "cond", null)).toBeNull();
+  });
+
+  it("never lands on an unknown future role, remembered or not", () => {
+    // Same fail-safe as isOrdinarySession, asserted through the real entry
+    // point: a new session kind must not become a landing target for free.
+    const future = { id: "fut", name: "fut", role: "sandbox" } as unknown as SessionInfo;
+    expect(homeTarget([CONDUCTOR, future], "sessions", "cond", null)).toBeNull();
+    expect(homeTarget([CONDUCTOR, future], "sessions", "cond", "fut")).toBeNull();
   });
 });

@@ -13,7 +13,7 @@
 
 import { Component, createEffect, createMemo, createSignal } from "solid-js";
 
-import { findConductor, homeTarget, type Home } from "../lib/home";
+import { findConductor, homeTarget, isOrdinarySession, type Home } from "../lib/home";
 import { activeHome, setHome } from "../state/layout";
 import { focusedSessionId, focusSession, sessionList } from "../state/sessions";
 
@@ -36,7 +36,7 @@ const HomeToggle: Component = () => {
     const id = focusedSessionId();
     if (!id) return;
     const s = sessionList().find((x) => x.id === id);
-    if (s && s.role === undefined) setLastSessionId(id);
+    if (s && isOrdinarySession(s)) setLastSessionId(id);
   });
 
   // Acting on the choice is an effect rather than click handling, so the two
