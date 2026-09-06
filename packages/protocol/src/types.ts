@@ -43,6 +43,44 @@ export const PROTOCOL_VERSION = 1;
  * can produce, and either side simply doesn't use what the other didn't
  * declare. Unknown capability strings MUST be ignored, never rejected.
  */
+/**
+ * The conductor's fleet MCP server key, and its verb vocabulary split by
+ * class. Shared because BOTH sides need it and they must not disagree: the
+ * daemon uses the read set to build the provider's `allowedTools` and the send
+ * set as the hard "never auto-approve" gate, while a client uses the same split
+ * to render a fleet call as an observation or as an act.
+ *
+ * It lives here rather than in the daemon because a browser bundle cannot
+ * import daemon code — and a duplicated copy in the web client would let the
+ * two drift, with a newly-added send-class verb quietly rendering as a
+ * harmless read until somebody noticed.
+ */
+export const FLEET_TOOL_PREFIX = "mcp__codeoid_fleet__";
+
+/** Read-class: observe only. Safe to auto-approve. */
+export const FLEET_READ_TOOLS = [
+  "fleet_list",
+  "fleet_find",
+  "fleet_summary",
+  "fleet_recall",
+  "fleet_tasks",
+  "machine_map",
+] as const;
+
+/**
+ * Send-class: acts on the fleet. NEVER auto-approved — the owner confirms each
+ * one with the full tool input visible (conductor-design R3).
+ */
+export const FLEET_SEND_TOOLS = [
+  "fleet_send",
+  "fleet_interrupt",
+  "fleet_spawn",
+  "fleet_panel",
+] as const;
+
+export type FleetReadTool = (typeof FLEET_READ_TOOLS)[number];
+export type FleetSendTool = (typeof FLEET_SEND_TOOLS)[number];
+
 export const CAPABILITIES = {
   /** Client renders rich `parts[]` content (vs the plain `content` fallback). */
   PARTS: "parts",
