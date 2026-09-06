@@ -162,6 +162,10 @@ export class ClaudeProvider implements SessionProvider {
   /** Last TurnOpts — the retry after a skill approval rebuilds the loop with
    * these, then re-pushes #lastPushedContent into the SAME turn queue (#233). */
   #lastTurnOpts: TurnOpts | null = null;
+  /** One re-send per turn for an UNEXPLAINED zero-turn result. Reset in
+   * runTurn() so every new prompt gets its own single attempt, and in
+   * resetToNewSession() with the rest of the backing-session state. */
+  #zeroTurnRecoveryAttempted = false;
   /** Rendered transcript from seedFromHistory() — prepended to the next prompt. */
   #pendingHistorySeed: string | null = null;
 
@@ -239,6 +243,7 @@ export class ClaudeProvider implements SessionProvider {
     this.#claudeCodeSessionId = newBackingId;
     this.#hasQueried = false;
     this.#backingRecoveryAttempted = false;
+    this.#zeroTurnRecoveryAttempted = false;
     this.#lastPushedContent = null;
   }
 
@@ -253,6 +258,8 @@ export class ClaudeProvider implements SessionProvider {
     this.#currentRequestUserInput = opts.requestUserInput ?? null;
     this.#currentSender = opts.sender ?? null;
     this.#lastTurnOpts = opts;
+    // A genuinely new prompt earns its own single recovery attempt.
+    this.#zeroTurnRecoveryAttempted = false;
 
     this.#ensureQueryLoop(opts);
 
@@ -955,6 +962,51 @@ export class ClaudeProvider implements SessionProvider {
     this.#pushSDKMessage(this.#lastPushedContent, "later", true);
   }
 
+  /**
+   * Re-send a prompt the backend consumed without running it.
+   *
+   * A zero-turn result with NO `<local-command-stderr>` is the unexplained
+   * variant: the SDK reports `subtype: "success"`, the model never ran, and
+   * nothing says why. Observed after a long session idle, where the result
+   * lands ~2s after the prompt and immediately behind a fresh `system:init` —
+   * i.e. the loop had gone cold and the first prompt into the rebuilt one was
+   * swallowed. Before this, the prompt was simply lost and the user retyped it.
+   *
+   * Re-sending is safe *because* it is a zero-turn: `num_turns === 0` means no
+   * assistant turn ran, so no tool executed and there is no side effect to
+   * duplicate. That is what separates this from a normal failed turn, which we
+   * must never silently repeat.
+   *
+   * Deliberately keyed on `num_turns` — a typed field carrying correct data —
+   * rather than on any cause, so it recovers whatever produced the zero turn
+   * and does not depend on the upstream reporting defect being fixed
+   * (anthropics/claude-code#80223, still open).
+   *
+   * Scoped tightly: only when NO stderr explains it (a real skill-command
+   * denial is #233's parked-approval path, and re-sending it would just be
+   * denied again), and only once per turn.
+   *
+   * Returns true when the turn was re-sent — the caller then suppresses the
+   * translation, so no terminal `turn_done` is emitted and the Session keeps
+   * the turn open, exactly as the #233 park does.
+   */
+  #tryRecoverConsumedPrompt(): boolean {
+    if (this.#zeroTurnRecoveryAttempted) return false;
+    if (!this.#lastTurnOpts || this.#lastPushedContent === null) return false;
+    this.#zeroTurnRecoveryAttempted = true;
+    console.error(
+      `[claude-provider ${this.#init.sessionId.slice(0, 8)}] zero-turn with no reported cause — re-sending the consumed prompt (${this.#lastPushedContent.length}B)`,
+    );
+    this.#emit({
+      type: "custom_message",
+      role: "info",
+      content: "The backend consumed the prompt without running it — re-sending…",
+    });
+    this.#ensureQueryLoop(this.#lastTurnOpts);
+    this.#pushSDKMessage(this.#lastPushedContent, "later", true);
+    return true;
+  }
+
   /** End a parked skill turn as a clean error (denied / dismissed / broken). */
   #failSkillTurn(command: string, reason: string): void {
     const detail = command ? `: ${command}` : "";
@@ -992,6 +1044,12 @@ export class ClaudeProvider implements SessionProvider {
       this.#tryHandleSkillBlock(stderr)
     ) {
       this.#translateState.lastLocalCommandStderr = null;
+      return;
+    }
+    // The UNEXPLAINED zero-turn: same "prompt consumed, model never ran", but
+    // with no stderr naming a cause. Re-send it once rather than losing it.
+    // Same suppression contract as the skill-block branch above.
+    if (m.type === "result" && m.num_turns === 0 && !stderr && this.#tryRecoverConsumedPrompt()) {
       return;
     }
     translateSDKMessage(msg, this.#emit.bind(this), this.id, this.#translateState, (e) => this.onSessionEvent?.(e));
