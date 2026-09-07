@@ -8,6 +8,8 @@
 
 import { batch, createEffect, createSignal } from "solid-js";
 
+import { DEFAULT_HOME, isHome, type Home } from "../lib/home";
+
 const STORAGE_KEY = "codeoid.layout.v1";
 
 interface LayoutState {
@@ -16,6 +18,12 @@ interface LayoutState {
   rightPanePx: number;
   /** Session header collapse — when true, only a 1-line summary shows. */
   headerCollapsed: boolean;
+  /**
+   * Which top-level home the user last chose (§3.A). A navigation preference,
+   * not a mode — see lib/home.ts. Persisted so the toggle is remembered rather
+   * than re-decided on every reload.
+   */
+  home: Home;
 }
 
 const DEFAULTS: LayoutState = {
@@ -23,6 +31,7 @@ const DEFAULTS: LayoutState = {
   leftSidebarCollapsed: false,
   rightPanePx: 576, // 36rem-ish
   headerCollapsed: false,
+  home: DEFAULT_HOME,
 };
 
 const LIMITS = {
@@ -56,6 +65,9 @@ function load(): LayoutState {
         typeof parsed.headerCollapsed === "boolean"
           ? parsed.headerCollapsed
           : DEFAULTS.headerCollapsed,
+      // Validated rather than cast: a stored value from a future build (or a
+      // hand-edited one) must fall back, not select a home that does not exist.
+      home: isHome(parsed.home) ? parsed.home : DEFAULTS.home,
     };
   } catch {
     return DEFAULTS;
@@ -72,6 +84,7 @@ const [rightPanePx, setRightPanePx] = createSignal(initial.rightPanePx);
 const [headerCollapsed, setHeaderCollapsedSig] = createSignal(
   initial.headerCollapsed,
 );
+const [home, setHomeSig] = createSignal<Home>(initial.home);
 
 /** Effective width for the left sidebar accounting for collapse. */
 export function leftSidebarEffectivePx(): number {
@@ -82,6 +95,13 @@ export const sidebarWidth = leftSidebarPx;
 export const isLeftCollapsed = leftSidebarCollapsed;
 export const rightWidth = rightPanePx;
 export const isHeaderCollapsed = headerCollapsed;
+
+/** The user's chosen top-level home (§3.A). */
+export const activeHome = home;
+
+export function setHome(next: Home): void {
+  setHomeSig(next);
+}
 
 // ── Mobile / narrow-viewport (Telegram Mini App) ──────────────────────────
 
@@ -144,6 +164,7 @@ createEffect(() => {
     leftSidebarCollapsed: leftSidebarCollapsed(),
     rightPanePx: rightPanePx(),
     headerCollapsed: headerCollapsed(),
+    home: home(),
   };
   if (typeof localStorage === "undefined") return;
   if (persistTimer !== null) clearTimeout(persistTimer);
