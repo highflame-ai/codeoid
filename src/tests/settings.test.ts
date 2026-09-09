@@ -15,7 +15,7 @@ import { SessionManager } from "../daemon/session-manager.js";
 import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
 import { SCOPES } from "../protocol/scopes.js";
-import type { McpServerStatus, SettingKind } from "../protocol/types.js";
+import type { ClientMessage, McpServerStatus, SettingKind } from "../protocol/types.js";
 import { McpRegistry } from "../daemon/mcp/registry.js";
 import { McpHub } from "../daemon/mcp/hub.js";
 import type { RawMcpServerConfig } from "../config.js";
@@ -316,6 +316,44 @@ describe("settings RPC handlers", () => {
     expect(res.type).toBe("settings.set.result");
     expect(res.ok).toBe(true);
     expect(res.snapshot.values["memory.enabled"]?.value).toBe(false);
+  });
+
+  // ── Interactive backend sign-in ─────────────────────────────────────────────
+  // Gated on settings:write, because a completed login writes a credential to
+  // the same `.env` that scope already governs. These pin the gate; the flow
+  // itself is covered in backend-login.test.ts against a real pty.
+
+  it.each([
+    ["backend.login.start", { type: "backend.login.start", backend: "claude" }],
+    ["backend.login.submit", { type: "backend.login.submit", loginId: "L", code: "c" }],
+    ["backend.login.cancel", { type: "backend.login.cancel", loginId: "L" }],
+  ] as const)("%s requires settings:write (read alone is not enough)", async (_name, msg) => {
+    const denied = await mgr().handle(
+      { ...msg, id: "1" } as ClientMessage,
+      auth([SCOPES.SETTINGS_READ]),
+      client,
+    );
+    expect(denied).toMatchObject({ type: "response.error", code: "forbidden" });
+  });
+
+  it("cancelling an unknown login is a clean no-op, not an error", async () => {
+    const res = await mgr().handle(
+      { type: "backend.login.cancel", id: "1", loginId: "never-existed" },
+      auth([SCOPES.SETTINGS_WRITE]),
+      client,
+    );
+    expect(res).toMatchObject({ type: "backend.login.cancel.result", ok: false });
+  });
+
+  it("submitting against an unknown login reports it plainly, without writing", async () => {
+    const res = (await mgr().handle(
+      { type: "backend.login.submit", id: "1", loginId: "never-existed", code: "abc" },
+      auth([SCOPES.SETTINGS_WRITE]),
+      client,
+    )) as { type: string; ok: boolean; error?: string };
+    expect(res.type).toBe("backend.login.submit.result");
+    expect(res.ok).toBe(false);
+    expect(res.error).toContain("no longer open");
   });
 });
 

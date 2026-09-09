@@ -26,7 +26,10 @@ import { createStore, produce } from "solid-js/store";
 
 import { fetchSettings, saveSettings, settingsState } from "../state/settings";
 import { relativeTime } from "../lib/format";
+import { BackendLoginPanel } from "./BackendLoginPanel";
+import { LOGIN_CAPABLE_BACKENDS } from "../protocol/types";
 import type {
+  LoginBackend,
   McpServerStatus,
   SecretStatus,
   SettingField,
@@ -34,6 +37,15 @@ import type {
   SettingState,
   SettingValue,
 } from "../protocol/types";
+
+/**
+ * A backend tab whose id names a backend codeoid can sign in interactively.
+ * Returns the narrowed id (so the panel is typed) or `null` — every other tab
+ * renders exactly as before.
+ */
+function isLoginBackend(tabId: string): LoginBackend | null {
+  return LOGIN_CAPABLE_BACKENDS.includes(tabId as LoginBackend) ? (tabId as LoginBackend) : null;
+}
 
 const [openSignal, setOpenSignal] = createSignal(false);
 const [activeTab, setActiveTab] = createSignal<string>("");
@@ -203,6 +215,13 @@ const SettingsDrawer: Component = () => {
                         </label>
                       </Show>
                     </div>
+
+                    {/* Signing in is the primary path for a backend that has
+                        one, so it sits above the fields — a pasted key is the
+                        fallback, not the default. */}
+                    <Show when={isLoginBackend(t.id)} keyed>
+                      {(backend) => <BackendLoginPanel backend={backend} />}
+                    </Show>
 
                     <For each={t.groups}>
                       {(g) => {

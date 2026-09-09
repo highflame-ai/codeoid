@@ -322,12 +322,22 @@ const claude: SettingsTab = {
   id: "claude",
   title: "Claude",
   icon: "✳",
-  description: "The default in-process backend (Anthropic SDK). Always enabled. Credentials come from your Claude Code login or ANTHROPIC_API_KEY.",
+  description: "The default in-process backend (Anthropic SDK). Always enabled. Sign in with your Claude subscription, or set an API key.",
   groups: [
     {
       id: "claude-auth",
       title: "Authentication",
+      description: "Sign in above to use a Claude subscription — no key to paste. A key is only needed instead of signing in, or for cluster labeling.",
       fields: [
+        // Written by "Sign in with Claude", not typed. It is still a manifest
+        // field (and so still hand-editable, clearable, and visible as set)
+        // because a credential the UI can create but not show or revoke is a
+        // credential nobody can reason about. `next-session`, not `restart`:
+        // the store updates process.env live and each Claude turn builds its
+        // subprocess env fresh, so the next session picks it up.
+        secret("CLAUDE_CODE_OAUTH_TOKEN", "Claude subscription token", "Set by “Sign in with Claude”. A long-lived token from your Claude subscription, used instead of an API key.", {
+          applies: "next-session",
+        }),
         secret("ANTHROPIC_API_KEY", "Anthropic API key", "Used by the Claude backend when not signed in, and for cluster labeling."),
         env("CLAUDE_CODE_USE_BEDROCK", "Use Amazon Bedrock", "Route Claude through Amazon Bedrock (requires AWS credentials in the environment).", {
           kind: "boolean",

@@ -22,6 +22,7 @@ import type { Store } from "./store.js";
 import { createPushTransport, PushService } from "./push/index.js";
 import { hasScope, SCOPES } from "../protocol/scopes.js";
 import { applyPatches, getManifest, getSnapshot } from "./settings/store.js";
+import { BackendLoginBroker, BackendLoginError, redact } from "./auth/backend-login.js";
 import { RateLimiter } from "./rate-limit.js";
 import type { TranscriptMeta, TranscriptStore } from "./transcript.js";
 import {
@@ -325,6 +326,9 @@ export class SessionManager {
   readonly #blackboardTokens = new Map<string, string>();
   #mcpRegistry?: McpRegistry;
   #mcpHub?: McpHub;
+  /** In-flight interactive backend sign-ins. Daemon-wide, and at most one per
+   *  backend — two live logins would race to write the same credential. */
+  readonly #backendLogin = new BackendLoginBroker();
   /** Live model catalogs by provider id (via each backend's supportedModels
    *  equivalent), cached daemon-wide once any session of that provider
    *  initializes. Empty until then. */
@@ -1024,6 +1028,12 @@ mcpHub: this.#mcpHub,
         return this.#settingsGet(msg, auth);
       case "settings.set":
         return this.#settingsSet(msg, auth);
+      case "backend.login.start":
+        return this.#backendLoginStart(msg, auth);
+      case "backend.login.submit":
+        return this.#backendLoginSubmit(msg, auth);
+      case "backend.login.cancel":
+        return this.#backendLoginCancel(msg, auth);
       case "usage.daily":
         return this.#usageDaily(msg, auth);
       case "pipeline.create":
@@ -1581,6 +1591,107 @@ mcpHub: this.#mcpHub,
     };
   }
 
+  // ── Interactive backend sign-in ─────────────────────────────────────────────
+  //
+  // Gated on `settings:write`, not a scope of its own. A completed login writes
+  // a credential to the same `.env` a caller with that scope can already write
+  // by hand — a separate scope would imply a privilege boundary that does not
+  // exist, and inventing one costs a token migration across every issuer.
+
+  /** Start a backend's login command and return the URL the user must open. */
+  async #backendLoginStart(
+    msg: Extract<ClientMessage, { type: "backend.login.start" }>,
+    auth: AuthContext,
+  ): Promise<DaemonMessage> {
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) {
+      return this.#loginForbidden(msg.id);
+    }
+    try {
+      const login = await this.#backendLogin.start(msg.backend);
+      this.#store.audit(auth.sub, "backend.login.start", "", `backend=${msg.backend}`);
+      return { type: "backend.login.start.result", requestId: msg.id, login };
+    } catch (err) {
+      return {
+        type: "response.error",
+        requestId: msg.id,
+        // The message is authored by the broker for display; redact anyway
+        // rather than depend on every future flow's error being clean.
+        error: redact(err instanceof Error ? err.message : String(err)),
+        code: err instanceof BackendLoginError ? "invalid_request" : "internal",
+      };
+    }
+  }
+
+  /**
+   * Hand the vendor's code to the waiting command, then store whatever
+   * credential it produced through the ordinary settings path — so the secret
+   * lands in the same 0600 `.env`, shows up as set in the same snapshot, and is
+   * cleared by the same control as one that was typed.
+   */
+  async #backendLoginSubmit(
+    msg: Extract<ClientMessage, { type: "backend.login.submit" }>,
+    auth: AuthContext,
+  ): Promise<DaemonMessage> {
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) {
+      return this.#loginForbidden(msg.id);
+    }
+    try {
+      const outcome = await this.#backendLogin.submit(msg.loginId, msg.code);
+      let error = outcome.error;
+      if (outcome.ok && outcome.secret) {
+        const written = applyPatches([{ key: outcome.secret.key, value: outcome.secret.value }]);
+        if (!written.ok) {
+          // Signed in with the vendor but could not persist it: report the
+          // failure rather than a success the next session will not honour.
+          error = `Signed in, but the credential could not be saved: ${
+            written.errors[0]?.message ?? "unknown error"
+          }`;
+        }
+      }
+      const ok = outcome.ok && error === undefined;
+      // Never the code, never the credential — only that an exchange happened.
+      this.#store.audit(auth.sub, "backend.login.submit", "", `ok=${ok}`);
+      return {
+        type: "backend.login.submit.result",
+        requestId: msg.id,
+        ok,
+        ...(error === undefined ? {} : { error }),
+        snapshot: { ...getSnapshot(), mcpServers: this.#mcpServerStatuses() },
+      };
+    } catch (err) {
+      return {
+        type: "response.error",
+        requestId: msg.id,
+        error: redact(err instanceof Error ? err.message : String(err)),
+        code: "internal",
+      };
+    }
+  }
+
+  /** Abandon an in-flight attempt. Idempotent — an unknown id is `ok: false`. */
+  #backendLoginCancel(
+    msg: Extract<ClientMessage, { type: "backend.login.cancel" }>,
+    auth: AuthContext,
+  ): DaemonMessage {
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) {
+      return this.#loginForbidden(msg.id);
+    }
+    return {
+      type: "backend.login.cancel.result",
+      requestId: msg.id,
+      ok: this.#backendLogin.cancel(msg.loginId),
+    };
+  }
+
+  #loginForbidden(requestId: string): DaemonMessage {
+    return {
+      type: "response.error",
+      requestId,
+      error: "Missing scope: settings:write",
+      code: "forbidden",
+    };
+  }
+
   async #fsBrowseDir(
     msg: Extract<ClientMessage, { type: "fs.browse_dir" }>,
     auth: AuthContext,
@@ -1977,6 +2088,9 @@ mcpHub: this.#mcpHub,
    * idle or deadline.
    */
   async drain(timeoutMs = 10_000): Promise<void> {
+    // An abandoned login is a live pty holding an open OAuth attempt. Kill
+    // those first, and unconditionally — they are not work worth draining.
+    this.#backendLogin.dispose();
     const deadline = Date.now() + timeoutMs;
     const systemAuth: AuthContext = {
       sub: "system:shutdown",

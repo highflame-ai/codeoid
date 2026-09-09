@@ -6,6 +6,25 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Sign in with Claude, instead of pasting an API key.** Settings → Claude now
+  has a two-step sign-in: codeoid runs `claude setup-token` for you, shows the
+  link to approve in your own browser, and takes back the code that page
+  displays. The subscription credential it mints is stored as
+  `CLAUDE_CODE_OAUTH_TOKEN` in `~/.codeoid/.env` like any other secret, and
+  applies to new sessions.
+
+  This is for the case where codeoid is the whole surface — a hosted sandbox, a
+  phone — and there is no shell in which to run the vendor's login by hand. On a
+  machine with a shell, `claude login` still works and is still picked up.
+
+  codeoid brokers the vendor's own command rather than implementing anyone
+  else's OAuth, and it runs the `claude` binary the Agent SDK already ships, so
+  there is no new dependency. Wire messages: `backend.login.start` / `.submit` /
+  `.cancel`, all gated on `settings:write`. Claude is wired today; the mechanism
+  is per-backend and the others follow.
+
 ## [0.4.0] - 2026-07-29
 
 codeoid moves to the Highflame npm org. npm has no way to transfer a package
