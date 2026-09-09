@@ -23,6 +23,14 @@ import type {
   SettingsGetResultMsg,
   SettingsSetResultMsg,
 } from "./settings.js";
+import type {
+  BackendLoginStartMsg,
+  BackendLoginSubmitMsg,
+  BackendLoginCancelMsg,
+  BackendLoginStartResultMsg,
+  BackendLoginSubmitResultMsg,
+  BackendLoginCancelResultMsg,
+} from "./backend-login.js";
 
 /**
  * Wire-protocol version. Bump on breaking changes (renamed/removed fields,
@@ -184,6 +192,12 @@ export const LIMITS = {
    * fit comfortably under 8 KiB.
    */
   SETTING_VALUE_MAX: 8192,
+  /**
+   * Max length of a `backend.login.submit` code. A vendor's out-of-band code is
+   * a short opaque string (a few hundred bytes with its state suffix); the cap
+   * is here so a blob never reaches a live pty, not to fit any real code.
+   */
+  LOGIN_CODE_MAX: 1024,
   /** Max free-text length on a `session.ui_response` (`value`). */
   UI_TEXT_MAX: 65_536,
   /** Max number of options on a `session.ui_request` select. */
@@ -968,6 +982,9 @@ export type ClientMessage =
   | SettingsSchemaMsg
   | SettingsGetMsg
   | SettingsSetMsg
+  | BackendLoginStartMsg
+  | BackendLoginSubmitMsg
+  | BackendLoginCancelMsg
   | UsageDailyMsg
   | PipelineCreateMsg
   | PipelineListMsg
@@ -2479,6 +2496,9 @@ export type DaemonMessage =
   | SettingsSchemaResultMsg
   | SettingsGetResultMsg
   | SettingsSetResultMsg
+  | BackendLoginStartResultMsg
+  | BackendLoginSubmitResultMsg
+  | BackendLoginCancelResultMsg
   | PipelineSnapshotMsg
   | PipelineListResultMsg
   | PackListResultMsg

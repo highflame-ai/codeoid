@@ -160,5 +160,23 @@ A variable already set in the real environment still wins.
 # ~/.codeoid/.env
 TELEGRAM_BOT_TOKEN=123456:AA...
 TELEGRAM_ALLOWED_USER_IDS=6714605885
-# ANTHROPIC_API_KEY=          # only if not logged in via `claude login`
+# CLAUDE_CODE_OAUTH_TOKEN=    # written by Settings → Claude → "Sign in with Claude"
+# ANTHROPIC_API_KEY=          # only if you have neither a sign-in nor a Claude Code login
 ```
+
+## Signing a backend in, instead of pasting a key
+
+Settings → **Claude** → **Sign in with Claude** runs the backend's own login
+(`claude setup-token`) inside the daemon and stores the subscription credential
+it mints as `CLAUDE_CODE_OAUTH_TOKEN` in the `.env` above. Two steps: open the
+link it shows, then paste back the code the page displays.
+
+This exists for the case where codeoid IS the whole surface — a hosted sandbox,
+a phone — and there is no shell in which to run the vendor's login by hand. On a
+machine where you do have a shell, `claude login` still works and codeoid picks
+that credential up unchanged; nothing here replaces it.
+
+The sign-in requires the `settings:write` scope, because it writes to the same
+`.env` that scope already governs. It takes effect for **new sessions** — a
+running session keeps the environment it started with. Only Claude is wired
+today; the mechanism is per-backend and the others follow.
