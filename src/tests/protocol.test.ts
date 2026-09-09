@@ -450,6 +450,12 @@ describe("DaemonMessage routing", () => {
           return `settings.get:${Object.keys(msg.snapshot.values).length}`;
         case "settings.set.result":
           return `settings.set:${msg.ok}`;
+        case "backend.login.start.result":
+          return `login.start:${msg.login.backend}`;
+        case "backend.login.submit.result":
+          return `login.submit:${msg.ok}`;
+        case "backend.login.cancel.result":
+          return `login.cancel:${msg.ok}`;
         case "pipeline.snapshot":
           return `pipeline:${msg.pipeline.id}`;
         case "pipeline.list.result":

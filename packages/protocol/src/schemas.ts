@@ -466,6 +466,33 @@ export const settingsSetSchema = z.object({
     .max(256),
 });
 
+/**
+ * The backends a client may ask to sign in. An explicit enum, not a free
+ * string: `start` spawns a process chosen by this value, so the set of things
+ * it can name belongs in the validated surface rather than in a lookup that
+ * happens to miss.
+ */
+const loginBackendField = z.enum(["claude"]);
+
+export const backendLoginStartSchema = z.object({
+  ...base,
+  type: z.literal("backend.login.start"),
+  backend: loginBackendField,
+});
+
+export const backendLoginSubmitSchema = z.object({
+  ...base,
+  type: z.literal("backend.login.submit"),
+  loginId: z.string().min(1).max(128),
+  code: z.string().min(1).max(LIMITS.LOGIN_CODE_MAX),
+});
+
+export const backendLoginCancelSchema = z.object({
+  ...base,
+  type: z.literal("backend.login.cancel"),
+  loginId: z.string().min(1).max(128),
+});
+
 // ── The unions ────────────────────────────────────────────────────────────────
 
 // ── SDLC pipeline ─────────────────────────────────────────────────────────────
@@ -661,6 +688,9 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   settingsSchemaSchema,
   settingsGetSchema,
   settingsSetSchema,
+  backendLoginStartSchema,
+  backendLoginSubmitSchema,
+  backendLoginCancelSchema,
   usageDailySchema,
   pipelineCreateSchema,
   pipelineListSchema,

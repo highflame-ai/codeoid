@@ -127,6 +127,18 @@ const samples: { [T in ClientTypes]: Extract<ClientMessage, { type: T }> } = {
     nameOverride: "imported",
   },
   "usage.daily": { type: "usage.daily", id: "r24", days: 30 },
+  "backend.login.start": { type: "backend.login.start", id: "r25", backend: "claude" },
+  "backend.login.submit": {
+    type: "backend.login.submit",
+    id: "r26",
+    loginId: "11111111-2222-3333-4444-555555555555",
+    code: "abc123#state",
+  },
+  "backend.login.cancel": {
+    type: "backend.login.cancel",
+    id: "r27",
+    loginId: "11111111-2222-3333-4444-555555555555",
+  },
   "settings.schema": { type: "settings.schema", id: "r29" },
   "settings.get": { type: "settings.get", id: "r30" },
   "settings.set": {

@@ -110,6 +110,17 @@ export async function fetchSettings(force = false): Promise<void> {
 }
 
 /**
+ * Adopt a snapshot that arrived on someone else's result message.
+ *
+ * A completed backend sign-in writes a secret, and its result already carries
+ * the settings AFTER that write — so the drawer shows the new credential as set
+ * without a redundant `settings.get`. Values only; the manifest is untouched.
+ */
+export function applySnapshot(snapshot: SettingsSnapshot): void {
+  setState((s) => ({ ...s, snapshot, fetchedAt: Date.now() }));
+}
+
+/**
  * Persist a batch of changes. Returns the result so the caller can clear its
  * dirty state on success / surface per-field errors on failure.
  */
