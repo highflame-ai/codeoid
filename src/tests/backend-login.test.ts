@@ -34,6 +34,8 @@ const TOKEN = "sk-ant-oat01-AAAABBBBCCCCDDDDEEEEFFFFGGGG";
 
 let dir: string;
 let fakeCmd: string;
+/** Prints a non-https "URL" and exits — for the href guard. */
+let evilCmd: string;
 let pidFile: string;
 
 beforeAll(() => {
@@ -68,6 +70,10 @@ sleep 120
     "utf8",
   );
   chmodSync(fakeCmd, 0o755);
+
+  evilCmd = join(dir, "evil-login.sh");
+  writeFileSync(evilCmd, "#!/usr/bin/env bash\necho 'open javascript:alert(1) to sign in'\n", "utf8");
+  chmodSync(evilCmd, 0o755);
 });
 
 /** The real Claude matchers against a fake command — the matching is the point. */
@@ -108,6 +114,26 @@ describe("start", () => {
     const err = await broker.start("claude").catch((e) => e);
     expect(err).toBeInstanceOf(BackendLoginError);
     expect(String(err.message)).toContain("not installed");
+  });
+
+  test("a non-https match is not offered as a link", async () => {
+    // The URL becomes an `href` in every client, so the broker refuses anything
+    // that is not https rather than trusting each flow's regex to stay tight.
+    const pattern = /javascript:[A-Za-z0-9_.()]+/g;
+    // The pattern DOES match what the command prints — so the only reason this
+    // is not handed to a client is the https rule, not a failed match.
+    expect("javascript:alert(1)".match(pattern)).toBeTruthy();
+
+    const broker = newBroker({
+      claude: {
+        ...CLAUDE_LOGIN_FLOW,
+        resolve: () => ({ file: evilCmd, args: [] }),
+        urlPattern: pattern,
+      },
+    });
+    const err = await broker.start("claude").catch((e) => e);
+    expect(err).toBeInstanceOf(BackendLoginError);
+    expect(String(err.message)).toContain("sign-in link");
   });
 
   test("an unknown backend is refused", async () => {
@@ -180,6 +206,20 @@ describe("submit", () => {
   test("an unknown login id is refused", async () => {
     const out = await newBroker().submit("not-a-login", GOOD_CODE);
     expect(out.ok).toBe(false);
+  });
+
+  test("cancelling mid-exchange says so, rather than blaming the command", async () => {
+    // `#dispose` wakes waiters by marking the attempt exited and then drops the
+    // transcript, so a submit racing a cancel would otherwise judge the
+    // exchange against an empty window and report a command failure for what
+    // the user just did on purpose.
+    const broker = newBroker();
+    const login = await broker.start("claude");
+    const pending = broker.submit(login.loginId, "wrong-code");
+    broker.cancel(login.loginId);
+    const out = await pending;
+    expect(out.ok).toBe(false);
+    expect(out.error).toContain("cancelled");
   });
 
   test.each([

@@ -883,6 +883,20 @@ describe("withMcpToolTimeout", () => {
 // ── buildAgentEnv (GHSA-38vh vector 3) ────────────────────────────────────────
 
 describe("buildAgentEnv", () => {
+  it("forwards the subscription token a backend sign-in writes", () => {
+    // The last link in the sign-in chain: "Sign in with Claude" stores
+    // CLAUDE_CODE_OAUTH_TOKEN, the settings store puts it in process.env live,
+    // and THIS allowlist decides whether the agent subprocess ever sees it.
+    // Tighten the prefixes and the sign-in keeps reporting success while
+    // authenticating as nothing — a failure with no error to follow.
+    const env = buildAgentEnv({
+      PATH: "/usr/bin",
+      HOME: "/home/deploy",
+      CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-AAAABBBBCCCCDDDDEEEEFFFF",
+    });
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe("sk-ant-oat01-AAAABBBBCCCCDDDDEEEEFFFF");
+  });
+
   it("passes system + Anthropic/Claude vars through but drops daemon secrets", () => {
     const env = buildAgentEnv({
       PATH: "/usr/bin",

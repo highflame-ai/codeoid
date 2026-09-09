@@ -247,7 +247,13 @@ export class BackendLoginBroker {
     const absorb = (buf: Buffer | string) => {
       append(attempt, String(buf));
       if (!attempt.verificationUrl) {
-        attempt.verificationUrl = longestMatch(attempt.transcript, flow.urlPattern);
+        const found = longestMatch(attempt.transcript, flow.urlPattern);
+        // Enforced here, not left to each flow's regex, because this string
+        // becomes an `href` in every client. Today's patterns are anchored on
+        // `https://claude.com/…` and cannot produce anything else; the point is
+        // that a future flow with a looser pattern cannot turn scraped terminal
+        // output into a `javascript:` link. One place, all flows, all clients.
+        attempt.verificationUrl = found?.startsWith("https://") ? found : null;
       }
       drain(attempt);
     };
@@ -352,6 +358,15 @@ export class BackendLoginBroker {
     } catch {
       this.#dispose(attempt);
       return { ok: false, error: "The sign-in did not complete in time. Start again." };
+    }
+
+    // Cancelled (or expired) out from under us while we waited. `#dispose`
+    // wakes every waiter by marking the attempt exited and then drops the
+    // transcript, so falling through would judge the exchange against an empty
+    // window and report "the sign-in command failed" for what was actually a
+    // user pressing Cancel. Say what happened instead.
+    if (this.#byId.get(loginId) !== attempt) {
+      return { ok: false, error: "That sign-in attempt was cancelled." };
     }
 
     const since = sinceMark();
