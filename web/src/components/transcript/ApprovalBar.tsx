@@ -38,8 +38,24 @@ import { newRequestId, request } from "../../state/connection";
 import { epochOf, focusedSessionMessages } from "../../state/messages";
 import { focusedSession, focusedSessionId } from "../../state/sessions";
 import { findPendingApproval } from "../../lib/approvals";
+import { classifyFleetInput } from "../../lib/fleet-cards";
+import {
+  dispatchPreview,
+  hasUnresolved,
+  type DispatchPreview as DispatchPreviewModel,
+} from "../../lib/dispatch-preview";
+import { sessionList } from "../../state/sessions";
 import type { CollaborationCost, SessionMessage } from "../../protocol/types";
 import { formatCollaborationCost } from "../../lib/format";
+
+/**
+ * Repo/branch/content preview for a send-class fleet dispatch, or null for any
+ * other tool. Non-fleet approvals are untouched.
+ */
+function dispatchFor(toolName: string, input: unknown): DispatchPreviewModel | null {
+  const card = classifyFleetInput(toolName, input);
+  return card ? dispatchPreview(card, sessionList()) : null;
+}
 
 /** Custom event the prompt listens for so "Refine" can focus + hint. */
 function focusPromptWithHint(hint: string): void {
@@ -207,6 +223,7 @@ const ApprovalBar: Component = () => {
                 toolName={snap().toolName}
                 description={snap().description}
                 collaborationCost={snap().collaborationCost}
+                dispatch={dispatchFor(snap().toolName, snap().input)}
                 isPlanMode={isPlanMode()}
                 busy={busy()}
                 onApprove={() => safeApprove(true)}
@@ -235,11 +252,67 @@ const ApprovalBar: Component = () => {
   );
 };
 
+/**
+ * Where a dispatch is actually going — the R3 preview.
+ *
+ * Deliberately compact: this sits above the prompt on every dispatch, and a
+ * block that pushes the buttons off screen gets dismissed rather than read. The
+ * content is clamped for the same reason; the full brief is in the tool card in
+ * the transcript above.
+ */
+const DispatchDetails: Component<{ preview: DispatchPreviewModel }> = (props) => (
+  <div class="mt-1.5 space-y-1 rounded border border-accent/30 bg-bg/50 px-2 py-1.5">
+    <For each={props.preview.targets}>
+      {(t) => (
+        <div class="flex flex-wrap items-center gap-x-2 gap-y-0.5 font-mono text-[11px]">
+          <span class="text-fg">{t.name}</span>
+          <Show when={t.workdir}>
+            {(w) => <span class="truncate text-fg-muted">{w()}</span>}
+          </Show>
+          <Show when={t.branch}>
+            {(b) => (
+              <span class="rounded border border-border bg-bg px-1 text-[10px] text-accent">
+                {b()}
+              </span>
+            )}
+          </Show>
+          {/* Never silent: a prompt showing no repo would read as "no repo
+              involved" rather than "I could not tell you which". The daemon
+              resolves names itself and may still succeed, so this warns
+              without blocking. */}
+          <Show when={t.unresolved}>
+            <span
+              class="rounded border border-warn/50 bg-warn/10 px-1 text-[10px] text-warn"
+              title="No session here matches that name — check the target before approving. The daemon resolves names itself and may still find it."
+            >
+              unresolved
+            </span>
+          </Show>
+        </div>
+      )}
+    </For>
+    <Show when={props.preview.content}>
+      {(c) => (
+        <p class="line-clamp-3 whitespace-pre-wrap text-[11px] leading-snug text-fg-muted">
+          {c()}
+        </p>
+      )}
+    </Show>
+    <Show when={hasUnresolved(props.preview)}>
+      <p class="text-[11px] text-warn">
+        One or more targets did not resolve here — verify before approving.
+      </p>
+    </Show>
+  </div>
+);
+
 const BinaryBar: Component<{
   toolName: string;
   description: string;
   /** Present only for a send-class fleet dispatch from a collaborative session. */
   collaborationCost?: CollaborationCost;
+  /** Present only for a send-class fleet dispatch — repo/branch/content (R3). */
+  dispatch?: DispatchPreviewModel | null;
   isPlanMode: boolean;
   busy: boolean;
   onApprove: () => void;
@@ -263,6 +336,13 @@ const BinaryBar: Component<{
         {/* What the goal has already cost, on the button that authorizes more.
             Shared formatter so web, Telegram and the TUI show the owner the
             same number in the same words. */}
+        {/* R3: a send-class dispatch is proposed with repo + branch + content
+            shown, because silent misrouting is the failure that would kill
+            trust in the conductor. Rendered ABOVE the cost roll-up — where the
+            instruction is going outranks what it has spent. */}
+        <Show when={props.dispatch}>
+          {(d) => <DispatchDetails preview={d()} />}
+        </Show>
         <Show when={props.collaborationCost}>
           {(c) => (
             <div class="mt-1 truncate font-mono text-[11px] text-warn" title="Rolled up across this collaboration's orchestrator and its live role-children">

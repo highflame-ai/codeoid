@@ -106,11 +106,23 @@ export function fleetVerb(toolName: string): string | null {
  * ordinary tool that should keep its existing rendering.
  */
 export function classifyFleetTool(tool: ToolInfo): FleetCard | null {
-  const verb = fleetVerb(tool.name);
+  return classifyFleetInput(tool.name, resolveToolInput(tool));
+}
+
+/**
+ * Same classification from a raw `(toolName, input)` pair.
+ *
+ * The approval gate holds those two directly rather than a `ToolInfo`, and it
+ * is the most important consumer of this module — it renders what the owner is
+ * about to authorize. Splitting the entry point keeps both callers on ONE
+ * classifier rather than letting the approval surface grow its own parser that
+ * could disagree with the transcript about what a dispatch says.
+ */
+export function classifyFleetInput(toolName: string, rawInput: unknown): FleetCard | null {
+  const verb = fleetVerb(toolName);
   if (verb === null) return null;
 
-  const resolved = resolveToolInput(tool);
-  const input = isRecord(resolved) ? resolved : {};
+  const input = isRecord(rawInput) ? rawInput : {};
   const sendClass = SEND_SET.has(verb);
   const known = sendClass || READ_SET.has(verb);
 
