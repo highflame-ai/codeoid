@@ -50,6 +50,15 @@ export function pendingUiRequest(sessionId: string | null): SessionUiRequestMsg 
   return state.bySession[sessionId]?.[0] ?? null;
 }
 
+/**
+ * Every pending dialog, keyed by session — the cross-session attention queue
+ * (lib/attention.ts) needs the whole population, not one session's slice.
+ * Reading the store directly keeps it reactive for callers inside a memo.
+ */
+export function allPendingUiRequests(): Readonly<Record<string, readonly SessionUiRequestMsg[]>> {
+  return state.bySession;
+}
+
 /** Count of pending dialogs for a session (badge / tests). */
 export function pendingUiRequestCount(sessionId: string): number {
   return state.bySession[sessionId]?.length ?? 0;
