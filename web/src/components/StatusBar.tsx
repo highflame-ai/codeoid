@@ -10,6 +10,7 @@
 
 import { Component, Show } from "solid-js";
 
+import AttentionInbox from "./AttentionInbox";
 import HomeToggle from "./HomeToggle";
 
 import {
@@ -54,6 +55,8 @@ const StatusBar: Component = () => {
       <IdentityChip />
       <LocalModeChip />
       <span class="ml-auto flex items-center gap-3">
+        {/* Ambient — §8 wants the count always visible, the queue one click away. */}
+        <AttentionInbox />
         <SessionMetrics />
         <SearchHotkey />
         <SettingsButton />
