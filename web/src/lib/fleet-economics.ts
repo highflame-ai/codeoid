@@ -40,6 +40,15 @@ export interface FleetEconomics {
 const BUSY = new Set(["thinking", "tool_running"]);
 
 /**
+ * Bucket for a session whose backend the daemon did not report.
+ *
+ * Exported so consumers compare against this rather than re-typing the string:
+ * it is a sentinel that reaches the UI, and a caller that wants to style or
+ * filter it should not have to know the literal.
+ */
+export const UNKNOWN_PROVIDER = "unknown" as const;
+
+/**
  * Backend label for a session.
  *
  * A session with no `providerId` is reported as `unknown` rather than silently
@@ -48,7 +57,7 @@ const BUSY = new Set(["thinking", "tool_running"]);
  * view is comparing backends against each other.
  */
 function backendOf(s: SessionInfo): string {
-  return s.providerId ?? "unknown";
+  return s.providerId ?? UNKNOWN_PROVIDER;
 }
 
 /**

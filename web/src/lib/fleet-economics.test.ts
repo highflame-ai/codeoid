@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 
-import { costShare, fleetEconomics } from "./fleet-economics";
+import { costShare, fleetEconomics, UNKNOWN_PROVIDER } from "./fleet-economics";
 import type { SessionInfo, SessionUsage } from "../protocol/types";
 
 const usage = (over: Partial<SessionUsage> = {}): SessionUsage =>
@@ -65,7 +65,7 @@ describe("fleetEconomics", () => {
     // Attributing spend to a provider that may not have incurred it is worse
     // than admitting the gap — the whole point is comparing backends.
     const econ = fleetEconomics([session("a", { usage: usage({ totalCostUsd: 5 }) })]);
-    expect(econ.byBackend[0]!.providerId).toBe("unknown");
+    expect(econ.byBackend[0]!.providerId).toBe(UNKNOWN_PROVIDER);
     expect(econ.byBackend[0]!.costUsd).toBe(5);
   });
 
