@@ -10,6 +10,15 @@ import type { AvailablePackWire, PackListResultMsg } from "../protocol/types.js"
 /** Render the installed / available / registries snapshot as console lines. */
 export function formatPackList(res: PackListResultMsg): string[] {
   const out: string[] = [];
+  // Which way a trusted pack's skills reach sessions (docs/pack-loading.md
+  // §3a). Older daemons don't report it — print nothing rather than guess.
+  if (res.skillScope) {
+    const how =
+      res.skillScope === "session"
+        ? "per-session SDK plugin (nothing linked into ~/.claude/skills)"
+        : "symlinked into ~/.claude/skills (machine-wide)";
+    out.push("", `  Skill scope: ${res.skillScope} — ${how}`);
+  }
   out.push("", "  Registries:");
   if (res.registries.length === 0) {
     out.push("    (none — add one: codeoid pack registry add <git-url>)");

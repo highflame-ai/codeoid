@@ -22,6 +22,7 @@ import type {
 } from "./interface";
 import { isTerminal } from "./interface";
 import { errMessage } from "./errors";
+import { resolveScoped } from "./scoped";
 
 /** Defensive cap against a mis-authored retry loop (each retry is one step). */
 const MAX_STEPS = 10_000;
@@ -199,7 +200,9 @@ export class PipelineEngine {
     phase: PhaseDef,
     at: "entry" | "exit",
   ): Promise<GateVerdict> {
-    const g = this.#registries.gates.resolve(id);
+    // The run's own pack entry first (`<packId>/<id>`), then a bare built-in
+    // (`always` / `manual`) or directly registered gate — see scoped.ts.
+    const g = resolveScoped(this.#registries.gates, pipeline.packId, id);
     if (!g) return { pass: false, reason: `unknown ${at} gate "${id}"` };
     try {
       return await g.evaluate({ pipeline: clone(pipeline), phase });

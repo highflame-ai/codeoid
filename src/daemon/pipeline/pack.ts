@@ -19,6 +19,7 @@ import type {
   PipelineRegistries,
   SkillPlugin,
 } from "./interface";
+import { scopedId } from "./scoped";
 
 // ── Manifest schema (the pack.yaml contract) ──────────────────────────────
 
@@ -301,9 +302,13 @@ export function loadPack(dir: string, opts: LoadPackOptions = {}): LoadedPack {
     dir,
     gateSpecs: m.gates.map((g) => ({ id: g.id, kind: g.kind })),
     pipeline,
+    // Registered under `<packId>/<id>` (scoped.ts) so two installed packs that
+    // both declare `review` / `tests_pass` coexist instead of overwriting each
+    // other in the daemon-wide registries. Phase defs keep the bare ids; the
+    // engine / skill kind / create-validation resolve them pack-first.
     register(r: PipelineRegistries): void {
-      for (const s of skills) r.skills.register(s);
-      for (const g of gates) r.gates.register(g);
+      for (const s of skills) r.skills.register({ ...s, id: scopedId(m.id, s.id) });
+      for (const g of gates) r.gates.register({ ...g, id: scopedId(m.id, g.id) });
     },
   };
 }

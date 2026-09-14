@@ -4,12 +4,13 @@ import { createRegistries } from "./registry";
 import type { PhaseRunner, PhaseRunRequest } from "./runner";
 import { makeSkillPhaseKind } from "./skill-kind";
 
-function ctxFor(phase: PhaseDef, skills: SkillPlugin[]): PhaseCtx {
+function ctxFor(phase: PhaseDef, skills: SkillPlugin[], packId?: string): PhaseCtx {
   const registries = createRegistries();
   for (const s of skills) registries.skills.register(s);
   const pipeline: PipelineState = {
     id: "p",
     name: "p",
+    ...(packId ? { packId } : {}),
     phases: [{ def: phase, state: { status: "running", startedAt: 1, attempts: 0 } }],
     cursor: 0,
     status: "running",
@@ -23,6 +24,30 @@ function ctxFor(phase: PhaseDef, skills: SkillPlugin[]): PhaseCtx {
 }
 
 describe("skill phase kind", () => {
+  test("resolves the run's pack-scoped skill before a bare one of the same id", async () => {
+    const bare: SkillPlugin = {
+      id: "hello",
+      kind: "fn",
+      async run() {
+        return { summary: "bare" };
+      },
+    };
+    const scoped: SkillPlugin = {
+      id: "mypack/hello",
+      kind: "fn",
+      async run() {
+        return { summary: "scoped" };
+      },
+    };
+    const kind = makeSkillPhaseKind();
+    const phase: PhaseDef = { id: "one", kind: "skill", skill: "hello" };
+    // With a packId the pack's own entry wins; without one the bare entry resolves.
+    expect(await kind.run(ctxFor(phase, [bare, scoped], "mypack"))).toMatchObject({ summary: "scoped" });
+    expect(await kind.run(ctxFor(phase, [bare, scoped]))).toMatchObject({ summary: "bare" });
+    // A pack run whose pack didn't declare the id still falls back to bare.
+    expect(await kind.run(ctxFor(phase, [bare], "mypack"))).toMatchObject({ summary: "bare" });
+  });
+
   test("runs an fn skill natively and passes with its summary", async () => {
     const skill: SkillPlugin = {
       id: "hello",

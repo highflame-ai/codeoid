@@ -1906,6 +1906,7 @@ export class Session {
           sender: recoverySender,
           mode: this.#mode,
           subagents: this.#pack?.subagents,
+          pluginDirs: this.#packPluginDirs(),
         });
         this.#activeRun = recoveryRun;
         this.#eventConsumerTask = this.#consumeEvents(recoveryRun, recoverySender);
@@ -1938,6 +1939,7 @@ export class Session {
       sender,
       mode: this.#mode,
       subagents: this.#pack?.subagents,
+      pluginDirs: this.#packPluginDirs(),
     });
     this.#activeRun = run;
     this.#eventConsumerTask = this.#consumeEvents(run, sender);
@@ -3198,6 +3200,15 @@ export class Session {
    */
   applyPhaseActivation(pack: PackActivation | undefined): void {
     this.#pack = pack;
+  }
+
+  /** Session-scoped skill plugins from the active pack (docs/pack-loading.md
+   *  §3a) — read per turn, like subagents, so a phase swap takes effect on the
+   *  next turn. Undefined (not `[]`) when there are none, so the provider's
+   *  rebuild guard sees "no plugins" as one stable value. */
+  #packPluginDirs(): readonly string[] | undefined {
+    const dir = this.#pack?.skillsPluginDir;
+    return dir ? [dir] : undefined;
   }
 
   #buildPromptAppend(): string | undefined {

@@ -472,6 +472,27 @@ describe("loadConfig — hooks", () => {
     expect(off.pipeline?.enabled).toBe(false);
   });
 
+  it("pipeline.skillScope defaults to global, accepts session, honors the env override, and rejects other values", () => {
+    writeConfig({});
+    expect(loadConfig({ configPath, env: {} }).pipeline?.skillScope).toBe("global");
+
+    writeConfig({ pipeline: { skillScope: "session" } });
+    expect(loadConfig({ configPath, env: {} }).pipeline?.skillScope).toBe("session");
+
+    // Per-invocation override wins over the file, in either direction.
+    expect(
+      loadConfig({ configPath, env: { CODEOID_PIPELINE_SKILL_SCOPE: "global" } }).pipeline?.skillScope,
+    ).toBe("global");
+    writeConfig({});
+    expect(
+      loadConfig({ configPath, env: { CODEOID_PIPELINE_SKILL_SCOPE: "session" } }).pipeline?.skillScope,
+    ).toBe("session");
+
+    // The enum is closed — a typo must fail loud, not silently fall back to global.
+    writeConfig({ pipeline: { skillScope: "sesion" } });
+    expect(() => loadConfig({ configPath, env: {} })).toThrow(/skillScope|session|global/);
+  });
+
   it("pipeline.modelTiers / modelRoles parse, default to {}, and reject a missing provider", () => {
     writeConfig({});
     const c = loadConfig({ configPath, env: {} });

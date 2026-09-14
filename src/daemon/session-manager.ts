@@ -476,6 +476,9 @@ export class SessionManager {
       // The operator's model maps, for the pre-flight `pack show --resolve`
       // view (docs/role-model-binding.md §4) — same maps pipeline.create reads.
       modelConfig: { modelTiers: p?.modelTiers, modelRoles: p?.modelRoles },
+      // Machine-wide symlinks (global) vs per-session SDK plugins (session) for
+      // a trusted pack's registry skills (docs/pack-loading.md §3a).
+      skillScope: p?.skillScope,
     });
   }
 
@@ -2400,6 +2403,11 @@ mcpHub: this.#mcpHub,
         id: compiled.id,
         constitution: compiled.constitution,
         subagents: adoption ? adoption.subagents : compiled.subagents,
+        // ...and, under `skillScope: "session"`, the pack's skills too — a
+        // global-scope adoption sees them via ~/.claude/skills; dropping the
+        // plugin here would make the orchestrator the one session that can't
+        // run the methodology's slash skills.
+        ...(adoption?.skillsPluginDir ? { skillsPluginDir: adoption.skillsPluginDir } : {}),
       };
     }
 
@@ -2780,7 +2788,13 @@ mcpHub: this.#mcpHub,
             child,
             parent.id,
             childBrief(collaboration, child, adoption?.constitution),
-            adoptedRole ? { packId: adoption!.id, role: adoptedRole } : undefined,
+            adoptedRole
+              ? {
+                  packId: adoption!.id,
+                  role: adoptedRole,
+                  ...(adoption!.skillsPluginDir ? { skillsPluginDir: adoption!.skillsPluginDir } : {}),
+                }
+              : undefined,
           ),
           // Autonomous with a bounded budget — the same posture dispatch gives
           // its workers, and for the same reason: NOBODY ATTACHES TO A CHILD.

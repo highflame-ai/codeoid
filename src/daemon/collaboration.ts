@@ -496,7 +496,7 @@ export function roleChildPosture(
   child: PlannedChild,
   parentSessionId: string,
   constitution: string,
-  adopted?: { packId: string; role: RoleDef },
+  adopted?: { packId: string; role: RoleDef; skillsPluginDir?: string },
 ): {
   role: "worker";
   workerShape: "ship" | "scout";
@@ -512,6 +512,10 @@ export function roleChildPosture(
     };
     roleName: string;
     subagents: never[];
+    /** Session-scoped pack skills (`pipeline.skillScope: "session"`), carried
+     *  from the adopted pack so a child can run the methodology's slash skills
+     *  exactly as it could under a global-scope link. */
+    skillsPluginDir?: string;
   };
   collaborationRole: {
     parentSessionId: string;
@@ -555,6 +559,7 @@ export function roleChildPosture(
           },
       roleName: child.roleName,
       subagents: [],
+      ...(adopted?.skillsPluginDir ? { skillsPluginDir: adopted.skillsPluginDir } : {}),
     },
     collaborationRole: {
       parentSessionId,
