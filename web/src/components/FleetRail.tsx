@@ -11,9 +11,10 @@
  * here — it is the existing attach flow, reached from a fleet node.
  */
 
-import { Component, For, Show, createMemo, onCleanup, onMount } from "solid-js";
+import { Component, For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 
-import { formatCostUsd } from "../lib/format";
+import { formatCostUsd, formatTokens } from "../lib/format";
+import { costShare, fleetEconomics, type FleetEconomics } from "../lib/fleet-economics";
 import {
   groupIntoLanes,
   needsYouCount,
@@ -77,6 +78,16 @@ const FleetRail: Component = () => {
   });
   const attention = createMemo(() => needsYouCount(lanes()));
 
+  // Per-backend spend across the fleet the board actually describes: the
+  // conductor plus the sessions it has dispatched to or spawned (§9's zoom
+  // ABOVE a single session). Collapsed by default — it answers a question you
+  // ask occasionally, and the lanes answer the one you ask constantly.
+  const [showSpend, setShowSpend] = createSignal(false);
+  const econ = createMemo<FleetEconomics>(() => {
+    const b = board();
+    return fleetEconomics(b.conductor ? [b.conductor, ...b.workers] : b.workers);
+  });
+
   return (
     <aside class="flex w-72 shrink-0 flex-col overflow-y-auto border-l border-border bg-bg-elev/40">
       <header class="sticky top-0 z-10 space-y-1 border-b border-border bg-bg-elev/95 px-3 py-2 backdrop-blur">
@@ -101,10 +112,19 @@ const FleetRail: Component = () => {
               {board().agg.blockedTasks} blocked
             </span>
           </Show>
-          <span class="ml-auto text-accent" title="Fleet cost across every backend">
-            {formatCostUsd(board().agg.totalCostUsd)}
-          </span>
+          <button
+            type="button"
+            onClick={() => setShowSpend((v) => !v)}
+            aria-expanded={showSpend()}
+            class="ml-auto rounded px-1 text-accent transition hover:bg-bg-hover"
+            title="Fleet cost across every backend — click for the per-backend split"
+          >
+            {formatCostUsd(board().agg.totalCostUsd)} {showSpend() ? "▾" : "▸"}
+          </button>
         </div>
+        <Show when={showSpend()}>
+          <BackendSpendTable econ={econ()} />
+        </Show>
       </header>
 
       <Show when={board().error}>
@@ -130,6 +150,51 @@ const FleetRail: Component = () => {
     </aside>
   );
 };
+
+/**
+ * Per-backend spend — the metaharness view no single-vendor tool needs (§7).
+ *
+ * The daemon's own `agg.totalCostUsd` stays the headline number rather than a
+ * sum of these rows: it counts tasks that may have aged off this capped board,
+ * so a locally derived total would drift low on a long-lived fleet. This table
+ * answers a different question — how the spend SPLITS — and says so by showing
+ * its own total separately when the two differ.
+ */
+const BackendSpendTable: Component<{ econ: FleetEconomics }> = (props) => (
+  <Show
+    when={props.econ.byBackend.length > 0}
+    fallback={<p class="pt-1 font-mono text-[10px] text-fg-faint">No sessions on the board yet.</p>}
+  >
+    <ul class="flex flex-col gap-0.5 pt-1">
+      <For each={props.econ.byBackend}>
+        {(b) => (
+          <li class="flex items-center gap-2 font-mono text-[10px]">
+            <span class="w-20 shrink-0 truncate text-fg-muted" title={b.providerId}>
+              {b.providerId}
+            </span>
+            {/* A share bar, not a percentage: the question is "which backend is
+                most of the bill", and a bar answers it without arithmetic. */}
+            <span class="h-1 flex-1 overflow-hidden rounded bg-bg">
+              <span
+                class="block h-full bg-accent/60"
+                style={{ width: `${Math.round(costShare(props.econ, b) * 100)}%` }}
+              />
+            </span>
+            <span class="shrink-0 text-fg-faint" title={`${b.sessions} session(s), ${b.active} working`}>
+              {b.active}/{b.sessions}
+            </span>
+            <span
+              class="w-14 shrink-0 text-right text-accent"
+              title={`${formatTokens(b.inputTokens)} in · ${formatTokens(b.outputTokens)} out`}
+            >
+              {formatCostUsd(b.costUsd)}
+            </span>
+          </li>
+        )}
+      </For>
+    </ul>
+  </Show>
+);
 
 const Lane: Component<{ group: FleetLaneGroup }> = (props) => (
   <section class="flex flex-col">
