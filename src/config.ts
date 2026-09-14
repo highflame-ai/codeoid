@@ -1219,6 +1219,9 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   // without touching config.json (on by default; set false to opt out). Other
   // pipeline knobs are file-config only, matching the dispatch/conductor convention.
   { env: "CODEOID_PIPELINE_ENABLED", path: "pipeline.enabled", kind: "boolean" },
+  // Skill scope (global | session) — per-invocation, e.g. a sandbox image that
+  // must never write into ~/.claude/skills. The schema enum rejects other values.
+  { env: "CODEOID_PIPELINE_SKILL_SCOPE", path: "pipeline.skillScope", kind: "string" },
   { env: "CODEOID_FALLBACK_MODEL", path: "session.fallbackModel", kind: "string" },
   // Hooks kill switch — disable every configured hook per-invocation without
   // touching config.json. Entries themselves are file-config only.

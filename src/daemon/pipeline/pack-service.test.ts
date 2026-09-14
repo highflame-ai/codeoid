@@ -357,6 +357,39 @@ describe("install / trust / select / remove", () => {
     expect(svc.resolveActivation("p").skillsPluginDir).toBe(join(pluginsDir, "reg"));
   });
 
+  test("skillScope: session — the plugin never exposes a symlinked registry entry, and prunes stale links", async () => {
+    const fixture = tmp();
+    writeRegistry(fixture, ["p"], ["spec"]);
+    // Hostile entry inside the registry's skills/: a whole-dir plugin link would
+    // expose it AND widen the read sandbox to its real parent (skillSandboxDirs).
+    symlinkSync("/etc", join(fixture, "skills", "evil"), "dir");
+    const cacheDir = join(tmp(), "c");
+    const pluginsDir = join(tmp(), "plugins");
+    const { svc } = makeService({ cacheDir, pluginsDir, skillScope: "session", fixture });
+    await svc.addRegistry({ url: "https://github.com/a/reg.git" });
+    svc.install({ packId: "p", trusted: true });
+    // The plugin is materialized lazily, at activation (not at install), so it
+    // self-heals on every session/phase that uses it.
+    svc.resolveActivation("p");
+    const pluginSkills = join(pluginsDir, "reg", "skills");
+    const fs = require("node:fs");
+    // A real directory of per-entry links — not one link to the cache dir.
+    expect(fs.lstatSync(pluginSkills).isSymbolicLink()).toBe(false);
+    expect(fs.lstatSync(join(pluginSkills, "spec")).isSymbolicLink()).toBe(true);
+    expect(existsSync(join(pluginSkills, "evil"))).toBe(false);
+    // A stale link (skill removed upstream) is pruned on the next activation;
+    // a link pointing outside the cache is pruned too; a real dir is kept.
+    symlinkSync(join(cacheDir, "reg", "skills", "removed-skill"), join(pluginSkills, "removed-skill"), "dir");
+    symlinkSync("/etc", join(pluginSkills, "outside"), "dir");
+    mkdirSync(join(pluginSkills, "operator-owned"), { recursive: true });
+    svc.resolveActivation("p");
+    expect(fs.existsSync(join(pluginSkills, "removed-skill"))).toBe(false);
+    expect(() => fs.lstatSync(join(pluginSkills, "removed-skill"))).toThrow();
+    expect(() => fs.lstatSync(join(pluginSkills, "outside"))).toThrow();
+    expect(fs.lstatSync(join(pluginSkills, "operator-owned")).isDirectory()).toBe(true);
+    expect(existsSync(join(pluginSkills, "spec", "SKILL.md"))).toBe(true);
+  });
+
   test("skillScope: session — an UNTRUSTED pack gets no plugin (declaring is not executing)", async () => {
     const fixture = tmp();
     writeRegistry(fixture, ["p"], ["spec"]);

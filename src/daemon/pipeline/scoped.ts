@@ -35,3 +35,13 @@ export function resolveScoped<T extends { id: string }>(
 
 export const hasScoped = <T extends { id: string }>(reg: Registry<T>, packId: string | undefined, id: string): boolean =>
   resolveScoped(reg, packId, id) !== undefined;
+
+/** Every pack-scoped entry whose bare part is `id` — for the create-time error
+ *  when an explicit plan names a pack's skill/gate by bare id: the message can
+ *  say which qualified ids exist instead of a flat "unknown". */
+export const scopedMatches = <T extends { id: string }>(reg: Registry<T>, id: string): string[] =>
+  reg
+    .list()
+    .map((x) => x.id)
+    .filter((x) => x.endsWith(`/${id}`))
+    .sort();

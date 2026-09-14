@@ -27,7 +27,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import type { AvailablePackWire, PackWire, RegistryWire } from "@highflame/codeoid-protocol";
 import { type ModelBindingConfig, resolveBinding } from "./binding";
 import type { Pack } from "./interface";
@@ -259,7 +259,8 @@ export class PackService {
     }
   }
 
-  /** The active skill scope (read by tests + `pack list` rendering). */
+  /** The active skill scope — surfaced on the `pipeline.pack.list` snapshot so
+   *  an operator can see which scope is live without opening config.json. */
   get skillScope(): SkillScope {
     return this.#skillScope;
   }
@@ -400,9 +401,21 @@ export class PackService {
     });
   }
 
-  /** The combined pack state (the wire payload for pipeline.pack.list). */
-  snapshot(): { installed: PackWire[]; available: AvailablePackWire[]; registries: RegistryWire[] } {
-    return { installed: this.installed(), available: this.available(), registries: this.listRegistries() };
+  /** The combined pack state (the wire payload for pipeline.pack.list), plus
+   *  the live skill scope so a client can tell how a trusted pack's skills
+   *  reach sessions on this daemon (docs/pack-loading.md §3a). */
+  snapshot(): {
+    installed: PackWire[];
+    available: AvailablePackWire[];
+    registries: RegistryWire[];
+    skillScope: SkillScope;
+  } {
+    return {
+      installed: this.installed(),
+      available: this.available(),
+      registries: this.listRegistries(),
+      skillScope: this.#skillScope,
+    };
   }
 
   // ── Mutations ───────────────────────────────────────────────────────────────
@@ -606,11 +619,25 @@ export class PackService {
   /**
    * Session-scoped skills (`skillScope: "session"`): materialize a Claude-Code-
    * plugin-shaped directory for a registry — `.claude-plugin/plugin.json` naming
-   * the registry, plus `skills` → `<cache>/skills` — and return it for the SDK
-   * `plugins` option. Idempotent and self-repairing (a stale `skills` link is
-   * re-pointed). Registries are data-only, so the manifest is synthesized here
-   * rather than required of them. Plugin skills resolve both bare (`/spec`) and
-   * namespaced (`/<registry>:spec`), so pack `command:` values need no rewrite.
+   * the registry, plus a real `skills/` dir holding ONE symlink per real skill
+   * directory in `<cache>/skills` — and return it for the SDK `plugins` option.
+   *
+   * Per-entry links, not one link to the whole cache dir, on purpose: the same
+   * lstat guard as #linkSkills. A registry could ship `skills/evil -> ~/.ssh`;
+   * a whole-dir link would expose that entry to discovery AND, because
+   * skillSandboxDirs widens the read sandbox to the real parent of every entry,
+   * grant the agent read access to `~` — strictly weaker than the global path,
+   * which never links a symlinked entry. Mirroring the guard keeps the two
+   * scopes equally strong.
+   *
+   * Idempotent and self-healing: links whose source vanished upstream (a skill
+   * removed on `registry refresh`) or that point outside the cache are pruned;
+   * a whole-dir `skills` symlink from a pre-release layout is replaced. A real
+   * skill directory an operator placed here is left alone. Registries are
+   * data-only, so the manifest is synthesized rather than required of them.
+   * Plugin skills resolve both bare (`/spec`) and namespaced
+   * (`/<registry>:spec`); a same-named skill in the user or project tier wins
+   * the bare form, exactly as it wins a global-scope link collision.
    * Returns undefined when the registry ships no `skills/` or the dir can't be
    * written (logged) — the activation then simply carries no plugin.
    */
@@ -618,6 +645,7 @@ export class PackService {
     const skillsSrc = join(this.#cachePath(registry), "skills");
     if (!existsSync(skillsSrc)) return undefined;
     const pluginDir = join(this.#pluginsDir, registry);
+    const skillsDir = join(pluginDir, "skills");
     try {
       mkdirSync(join(pluginDir, ".claude-plugin"), { recursive: true });
       const manifestPath = join(pluginDir, ".claude-plugin", "plugin.json");
@@ -633,21 +661,42 @@ export class PackService {
       if (!existsSync(manifestPath) || readFileSync(manifestPath, "utf8") !== manifest) {
         writeFileSync(manifestPath, manifest);
       }
-      const link = join(pluginDir, "skills");
-      let current: ReturnType<typeof lstatSync> | undefined;
+      // A whole-dir `skills` symlink (pre-release layout) is the exact shape the
+      // per-entry rule exists to prevent — replace it with a real directory.
       try {
-        current = lstatSync(link);
+        if (lstatSync(skillsDir).isSymbolicLink()) unlinkSync(skillsDir);
       } catch {
-        current = undefined;
+        /* absent — created below */
       }
-      if (current?.isSymbolicLink()) {
-        if (readlinkSync(link) !== skillsSrc || !existsSync(link)) unlinkSync(link);
-        else return pluginDir;
-      } else if (current) {
-        // A real directory here is operator-managed — leave it, use it.
-        return pluginDir;
+      mkdirSync(skillsDir, { recursive: true });
+      // Prune: a link we made whose source is gone, or that no longer points
+      // into this registry's cache. Real directories are operator-owned.
+      const srcPrefix = skillsSrc + sep;
+      for (const name of readdirSync(skillsDir)) {
+        const p = join(skillsDir, name);
+        try {
+          if (!lstatSync(p).isSymbolicLink()) continue;
+          if (!readlinkSync(p).startsWith(srcPrefix) || !existsSync(p)) unlinkSync(p);
+        } catch {
+          /* raced away — nothing to prune */
+        }
       }
-      symlinkSync(skillsSrc, link, "dir");
+      // Link: one entry per REAL directory in the cache (lstat, not stat — a
+      // symlinked entry in the registry is never propagated).
+      for (const name of readdirSync(skillsSrc)) {
+        const from = join(skillsSrc, name);
+        const to = join(skillsDir, name);
+        try {
+          if (!lstatSync(from).isDirectory()) continue;
+          if (isDanglingSymlink(to)) unlinkSync(to);
+          else if (existsSync(to)) continue;
+          symlinkSync(from, to, "dir");
+        } catch (e) {
+          console.warn(
+            `[packs] could not expose skill "${name}" from registry "${registry}": ${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
+      }
       return pluginDir;
     } catch (e) {
       console.warn(

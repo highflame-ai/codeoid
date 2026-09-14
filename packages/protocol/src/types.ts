@@ -2464,6 +2464,11 @@ export interface PackListResultMsg {
   installed: PackWire[];
   available: AvailablePackWire[];
   registries: RegistryWire[];
+  /** How a trusted pack's registry skills reach sessions on this daemon
+   *  (`config.pipeline.skillScope`): `global` = symlinked into `~/.claude/skills`
+   *  machine-wide; `session` = exposed only inside pack-activated sessions as an
+   *  SDK plugin. Optional (additive) — absent from older daemons. */
+  skillScope?: "global" | "session";
 }
 
 // =============================================================================

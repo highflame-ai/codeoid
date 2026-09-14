@@ -18,11 +18,11 @@ import { resolveModelIdForProvider } from "../models.js";
 import { type ModelBinding, type ModelBindingConfig, resolveBinding } from "./binding";
 import { registerBuiltins } from "./builtin";
 import { PipelineEngine } from "./engine";
-import type { Pack, PhaseDef, PipelineRegistries, PipelineState } from "./interface";
+import type { Pack, PhaseDef, PipelineRegistries, PipelineState, Registry } from "./interface";
 import { isTerminal } from "./interface";
 import { createRegistries } from "./registry";
 import type { PhaseRunner } from "./runner";
-import { hasScoped } from "./scoped";
+import { hasScoped, scopedMatches } from "./scoped";
 import { makeSkillPhaseKind } from "./skill-kind";
 import type { PipelineStore } from "./store";
 
@@ -429,10 +429,20 @@ export class PipelineManager {
   }
 
   /** `packId` scopes gate/skill lookups to the pack the plan came from
-   *  (`<packId>/<id>` first, bare second — scoped.ts); absent for explicit plans. */
+   *  (`<packId>/<id>` first, bare second — scoped.ts); absent for explicit
+   *  plans, which resolve built-ins and directly registered entries by bare id
+   *  and an installed pack's entries by their qualified `<packId>/<id>`. An
+   *  explicit plan naming a pack's entry by bare id is told the qualified ids
+   *  that exist rather than a flat "unknown". */
   #validate(phases: PhaseDef[], packId?: string): void {
     if (phases.length === 0) throw new Error("pipeline must declare at least one phase");
     const seen = new Set<string>();
+    const unknown = <T extends { id: string }>(what: string, reg: Registry<T>, id: string): string => {
+      const hint = packId ? [] : scopedMatches(reg, id);
+      return hint.length > 0
+        ? `unknown ${what} "${id}" — installed packs declare it as ${hint.map((h) => `"${h}"`).join(", ")}; name it that way, or create the run with \`pack\``
+        : `unknown ${what} "${id}"`;
+    };
     for (const p of phases) {
       if (seen.has(p.id)) throw new Error(`duplicate phase id "${p.id}"`);
       seen.add(p.id);
@@ -440,15 +450,15 @@ export class PipelineManager {
         throw new Error(`phase "${p.id}": unknown kind "${p.kind}"`);
       }
       if (p.gate && !hasScoped(this.#registries.gates, packId, p.gate)) {
-        throw new Error(`phase "${p.id}": unknown gate "${p.gate}"`);
+        throw new Error(`phase "${p.id}": ${unknown("gate", this.#registries.gates, p.gate)}`);
       }
       if (p.entryGate && !hasScoped(this.#registries.gates, packId, p.entryGate)) {
-        throw new Error(`phase "${p.id}": unknown entry gate "${p.entryGate}"`);
+        throw new Error(`phase "${p.id}": ${unknown("entry gate", this.#registries.gates, p.entryGate)}`);
       }
       if (p.kind === "skill") {
         if (!p.skill) throw new Error(`phase "${p.id}": kind "skill" requires a skill id`);
         if (!hasScoped(this.#registries.skills, packId, p.skill)) {
-          throw new Error(`phase "${p.id}": unknown skill "${p.skill}"`);
+          throw new Error(`phase "${p.id}": ${unknown("skill", this.#registries.skills, p.skill)}`);
         }
       }
     }

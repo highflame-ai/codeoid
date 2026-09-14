@@ -161,6 +161,28 @@ phases:
     expect(run.phases[0]!.def).toMatchObject({ skill: "spec", gate: "tests_pass" });
   });
 
+  test("an explicit plan names a pack's skill/gate by its qualified id; a bare id is told what exists", () => {
+    const mgr = new PipelineManager(new PipelineStore(new Database(":memory:")));
+    mgr.installPack(loadPack(fullPack()));
+    const base = { name: "x", accountId: "a", projectId: "p", createdBy: "u" };
+    // Qualified ids resolve through the bare fallback (the id IS the registry key).
+    const ok = mgr.create({
+      ...base,
+      phases: [{ id: "one", kind: "skill", skill: "aif-test/spec", gate: "aif-test/tests_pass" }],
+    });
+    expect(ok.phases[0]!.def.skill).toBe("aif-test/spec");
+    // A bare id no longer borrows an installed pack's entry (that borrowing was
+    // the cross-pack leakage); the error names the qualified ids instead.
+    expect(() => mgr.create({ ...base, phases: [{ id: "one", kind: "skill", skill: "spec" }] })).toThrow(
+      /unknown skill "spec" — installed packs declare it as "aif-test\/spec"/,
+    );
+    expect(() =>
+      mgr.create({ ...base, phases: [{ id: "one", kind: "noop", gate: "tests_pass" }] }),
+    ).toThrow(/unknown gate "tests_pass" — installed packs declare it as "aif-test\/tests_pass"/);
+    // Built-in gates still resolve bare for explicit plans.
+    expect(() => mgr.create({ ...base, phases: [{ id: "one", kind: "noop", gate: "always" }] })).not.toThrow();
+  });
+
   test("kind defaults to 'skill' when a phase declares only a skill", () => {
     const dir = writePack(`schema: codeoid/pack@v1
 id: p

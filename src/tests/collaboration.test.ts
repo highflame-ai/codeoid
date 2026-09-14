@@ -1000,6 +1000,20 @@ describe("pack-adopted posture + constitution (unit)", () => {
     expect(p.workerShape).toBe("scout");
   });
 
+  test("roleChildPosture carries the adopted pack's session-scoped skill plugin, and only then", () => {
+    const withPlugin = roleChildPosture(child, "parent", "brief", {
+      packId: "pk",
+      role: ADOPT_ROLES.adversary!,
+      skillsPluginDir: "/plugins/reg",
+    });
+    expect(withPlugin.pack.skillsPluginDir).toBe("/plugins/reg");
+    // Global scope (no plugin dir on the activation) and free-form both carry none.
+    const global = roleChildPosture(child, "parent", "brief", { packId: "pk", role: ADOPT_ROLES.adversary! });
+    expect(global.pack.skillsPluginDir).toBeUndefined();
+    expect("skillsPluginDir" in global.pack).toBe(false);
+    expect(roleChildPosture(child, "parent", "brief").pack.skillsPluginDir).toBeUndefined();
+  });
+
   test("without adoption the synthesized free-form posture is unchanged", () => {
     const p = roleChildPosture(child, "parent", "brief");
     expect(p.pack.id).toBe("collaboration");

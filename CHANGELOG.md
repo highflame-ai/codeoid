@@ -32,15 +32,19 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   something else (an org bundle linked by hand, another toolkit) that is the
   wrong scope. With `skillScope: "session"` nothing is linked; codeoid
   synthesizes a Claude-Code-plugin-shaped directory per registry
-  (`~/.codeoid/plugins/<registry>/`: a manifest plus `skills → <cache>/skills`)
-  and hands it to the SDK's `plugins` option for pack-activated sessions and
-  pipeline phases, so the methodology's skills exist inside codeoid runs and
-  nowhere else. Plugin skills resolve both bare (`/spec`) and namespaced
-  (`/<registry>:spec`), so pack `command:` values are unchanged; the same trust
-  rule applies (an untrusted pack contributes no runnable skills either way);
-  the read sandbox and the skill-command grants scan the plugin tier too. The
-  default stays `global`. Non-Claude backends ignore the plugin dirs, as they
-  already ignore pack subagents. (docs/pack-loading.md §3a)
+  (`~/.codeoid/plugins/<registry>/`: a manifest plus one symlink per real skill
+  directory in the registry cache, under the same lstat guard as global
+  linking) and hands it to the SDK's `plugins` option for pack-activated
+  sessions and pipeline phases, so the methodology's skills exist inside
+  codeoid runs and nowhere else. Plugin skills resolve both bare (`/spec`) and
+  namespaced (`/<registry>:spec`), so pack `command:` values are unchanged; on a
+  bare-name collision the user- or project-tier skill wins, as it does for a
+  global link. The same trust rule applies (an untrusted pack contributes no
+  runnable skills either way); the read sandbox and the skill-command grants
+  scan the plugin tier too. The default stays `global`;
+  `CODEOID_PIPELINE_SKILL_SCOPE` sets it per invocation. Non-Claude backends
+  ignore the plugin dirs, as they already ignore pack subagents.
+  (docs/pack-loading.md §3a)
 
 ### Fixed
 
@@ -52,8 +56,16 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   second pack's skill. Packs now register under `<packId>/<id>`; the engine, the
   skill phase kind, and create-time validation resolve a run's own pack entry
   first and fall back to the bare id, so built-in gates (`always`, `manual`) and
-  explicit-`phases` plans keep resolving exactly as before. Phase defs, CLI
+  directly registered entries keep resolving exactly as before. Phase defs, CLI
   output, and the web Pack Browser still show the ids as authored.
+
+  One deliberate consequence: an explicit-`phases` plan (wire `pipeline.create`
+  with `phases`, not `pack`) can no longer borrow an installed pack's skill or
+  gate by its bare id — that borrowing was the same leakage, just from the
+  other side. Name the entry by its qualified id (`skill: "org-dev/spec"`), or
+  create the run with `pack`; the create error now lists the qualified ids that
+  exist. The web UI and CLI always send `pack`, so only direct API/SDK clients
+  are affected, and `pipeline.pack.list` now reports the daemon's `skillScope`.
 
 - **A dangling skill symlink blocked that skill from ever being linked again.**
   An older loader linked registry skills from a temp clone under `/tmp`; after
