@@ -18,10 +18,10 @@
 import { Database } from "bun:sqlite";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { SqliteEpisodeStore } from "../memory/store.js";
-import { createEmbedder } from "../memory/embedder.js";
-import { createReranker } from "../memory/reranker.js";
-import { MemoryEngine, type SessionSearchHit } from "../memory/engine.js";
+import { SqliteEpisodeStore } from "@highflame/codeoid-memory/store.js";
+import { createEmbedder } from "@highflame/codeoid-memory/embedder.js";
+import { createReranker } from "@highflame/codeoid-memory/reranker.js";
+import { MemoryEngine, type SessionSearchHit } from "@highflame/codeoid-memory/engine.js";
 import { precisionAt1, mrr, recallAtK, percentile, type EvalCase } from "./metrics.js";
 
 interface FixtureCase {

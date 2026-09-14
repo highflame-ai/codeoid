@@ -17,9 +17,9 @@ import type {
   TurnOpts,
   UiRequestFn,
 } from "../daemon/providers/interface.js";
-import { MemoryEngine } from "../daemon/memory/engine.js";
-import { SqliteEpisodeStore } from "../daemon/memory/store.js";
-import type { Embedder } from "../daemon/memory/embedder.js";
+import { MemoryEngine } from "@highflame/codeoid-memory/engine.js";
+import { SqliteEpisodeStore } from "@highflame/codeoid-memory/store.js";
+import type { Embedder } from "@highflame/codeoid-memory/embedder.js";
 import { McpRegistry } from "../daemon/mcp/registry.js";
 import { McpHub } from "../daemon/mcp/hub.js";
 import type { RawMcpServerConfig } from "../config.js";

@@ -24,12 +24,12 @@ import { createDefaultProviderRegistry } from "../daemon/providers/registry.js";
 import type { ProviderEvent, TurnOpts, TurnRun } from "../daemon/providers/interface.js";
 import type { CodeoidConfig } from "../config.js";
 import type { Store } from "../daemon/store.js";
-import { MemoryMcpHttp, MEMORY_MCP_SERVER_NAME } from "../daemon/memory/mcp-http.js";
+import { MemoryMcpHttp, MEMORY_MCP_SERVER_NAME } from "@highflame/codeoid-memory/mcp-http.js";
 import { McpRegistry } from "../daemon/mcp/registry.js";
 import type { RawMcpServerConfig } from "../config.js";
-import { MemoryEngine } from "../daemon/memory/engine.js";
-import { SqliteEpisodeStore } from "../daemon/memory/store.js";
-import type { Embedder } from "../daemon/memory/embedder.js";
+import { MemoryEngine } from "@highflame/codeoid-memory/engine.js";
+import { SqliteEpisodeStore } from "@highflame/codeoid-memory/store.js";
+import type { Embedder } from "@highflame/codeoid-memory/embedder.js";
 
 const FIXTURE = join(import.meta.dir, "fixtures", "fake-acp.ts");
 

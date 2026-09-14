@@ -1,11 +1,11 @@
 import { describe, test, expect } from "bun:test";
-import { SqliteEpisodeStore } from "./store";
-import { MemoryEngine } from "./engine";
+import { SqliteEpisodeStore } from "@highflame/codeoid-memory/store.js";
+import { MemoryEngine } from "@highflame/codeoid-memory/engine.js";
 import { buildMemoryMcpServer } from "./mcp";
-import { MEMORY_MCP_SERVER_NAME } from "./mcp-http";
-import { MEMORY_TOOL_NAMES } from "./tools";
+import { MEMORY_MCP_SERVER_NAME } from "@highflame/codeoid-memory/mcp-http.js";
+import { MEMORY_TOOL_NAMES } from "@highflame/codeoid-memory/tools.js";
 import { isSafeTool } from "../providers/tool-safety";
-import type { Embedder } from "./embedder";
+import type { Embedder } from "@highflame/codeoid-memory/embedder.js";
 
 class FakeEmbedder implements Embedder {
   readonly modelName = "fake-test";

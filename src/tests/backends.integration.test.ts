@@ -31,10 +31,10 @@ import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
 import { SessionManager } from "../daemon/session-manager.js";
 import { createDefaultProviderRegistry } from "../daemon/providers/registry.js";
-import { MemoryEngine } from "../daemon/memory/engine.js";
-import { SqliteEpisodeStore } from "../daemon/memory/store.js";
-import { createEmbedder } from "../daemon/memory/embedder.js";
-import { MemoryMcpHttp, MEMORY_MCP_PATH } from "../daemon/memory/mcp-http.js";
+import { MemoryEngine } from "@highflame/codeoid-memory/engine.js";
+import { SqliteEpisodeStore } from "@highflame/codeoid-memory/store.js";
+import { createEmbedder } from "@highflame/codeoid-memory/embedder.js";
+import { MemoryMcpHttp, MEMORY_MCP_PATH } from "@highflame/codeoid-memory/mcp-http.js";
 import { ALL_SCOPES } from "../protocol/scopes.js";
 import type { AuthContext, DaemonMessage } from "../protocol/types.js";
 

@@ -1,6 +1,6 @@
 import { describe, test, expect } from "bun:test";
 import { buildBridgeSource, APPROVAL_TITLE, MCP_TOOL_TITLE, MEMORY_TOOL_TITLE } from "../daemon/providers/pi/bridge.js";
-import { MEMORY_TOOL_NAMES } from "../daemon/memory/tools.js";
+import { MEMORY_TOOL_NAMES } from "@highflame/codeoid-memory/tools.js";
 
 describe("pi bridge source", () => {
   test("base bridge (no memory): approval gate present, no memory tools or typebox import", () => {

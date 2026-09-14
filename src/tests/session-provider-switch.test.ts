@@ -26,9 +26,9 @@ import { ProviderRegistry } from "../daemon/providers/registry.js";
 import type { ProviderEvent } from "../daemon/providers/interface.js";
 import type { AuthContext, DaemonMessage, SessionMessage } from "../protocol/types.js";
 import { ALL_SCOPES, SCOPES, type Scope } from "../protocol/scopes.js";
-import { MemoryEngine } from "../daemon/memory/engine.js";
-import { SqliteEpisodeStore } from "../daemon/memory/store.js";
-import type { Embedder } from "../daemon/memory/embedder.js";
+import { MemoryEngine } from "@highflame/codeoid-memory/engine.js";
+import { SqliteEpisodeStore } from "@highflame/codeoid-memory/store.js";
+import type { Embedder } from "@highflame/codeoid-memory/embedder.js";
 
 /** Minimal embedder so a MemoryEngine can be constructed for the VWS test. */
 class FakeEmbedder implements Embedder {

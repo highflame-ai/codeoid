@@ -60,7 +60,7 @@ import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from ".
 import { buildCodexEnv } from "../env.js";
 import { CodexRpcProcess } from "./rpc.js";
 import type { SessionMode } from "../../../protocol/types.js";
-import { MEMORY_MCP_SERVER_NAME, MEMORY_MCP_TOKEN_ENV, type MemoryMcpMount } from "../../memory/mcp-http.js";
+import { MEMORY_MCP_SERVER_NAME, MEMORY_MCP_TOKEN_ENV, type MemoryMcpMount } from "@highflame/codeoid-memory/mcp-http.js";
 import {
   BLACKBOARD_MCP_SERVER_NAME,
   BLACKBOARD_MCP_TOKEN_ENV,

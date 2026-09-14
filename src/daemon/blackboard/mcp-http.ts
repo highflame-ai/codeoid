@@ -31,7 +31,7 @@ import {
   tokenFrom,
   type JsonRpcMessage,
   type JsonRpcResponse,
-} from "../mcp/jsonrpc-http.js";
+} from "@highflame/codeoid-memory/jsonrpc-http.js";
 import type { RoleBlackboard } from "./service.js";
 import { CORE_ARTIFACT_KINDS } from "./types.js";
 

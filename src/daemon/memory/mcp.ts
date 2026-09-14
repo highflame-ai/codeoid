@@ -14,9 +14,9 @@ import {
   tool,
   type McpSdkServerConfigWithInstance,
 } from "@anthropic-ai/claude-agent-sdk";
-import type { MemoryEngine } from "./engine.js";
-import { MEMORY_MCP_SERVER_NAME } from "./mcp-http.js";
-import { memoryToolDefs, type MemoryToolContext } from "./tools.js";
+import type { MemoryEngine } from "@highflame/codeoid-memory/engine.js";
+import { MEMORY_MCP_SERVER_NAME } from "@highflame/codeoid-memory/mcp-http.js";
+import { memoryToolDefs, type MemoryToolContext } from "@highflame/codeoid-memory/tools.js";
 
 export interface MemoryMcpBinding {
   workspaceId: string;

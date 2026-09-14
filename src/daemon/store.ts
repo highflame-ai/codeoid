@@ -6,6 +6,7 @@
 
 import { Database } from "bun:sqlite";
 import type { ModelInfo, PushPlatform, SessionInfo, SessionStatus } from "../protocol/types.js";
+import { BUSY_TIMEOUT_MS } from "@highflame/codeoid-memory/db.js";
 
 // ── Dispatch queue types (P4) ─────────────────────────────────────────────
 
@@ -136,17 +137,9 @@ function rowToDispatchTask(r: RawDispatchRow): DispatchTaskRow {
   };
 }
 
-/**
- * How long SQLite waits for a lock before giving up, on every writable store.
- *
- * SQLite defaults this to 0, which means "fail instantly" — a design that only
- * makes sense for a single-connection process. codeoid has several connections
- * (sessions store, memory store, memory cards, an optional second daemon) over
- * WAL databases, so brief contention is normal and instant failure is not.
- * 5s is far longer than any lock this daemon holds and far shorter than a user
- * would wait before assuming a hang.
- */
-export const BUSY_TIMEOUT_MS = 5_000;
+// Re-exported so `../store.js` importers are unaffected; defined beside the
+// SQLite driver in @highflame/codeoid-memory/db.js.
+export { BUSY_TIMEOUT_MS };
 
 /** Bounded retry budget for the journal-mode switch. 20 × 25ms = 500ms. */
 const WAL_RETRY_ATTEMPTS = 20;

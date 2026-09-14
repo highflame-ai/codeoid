@@ -6,8 +6,8 @@
  */
 
 import { BLACKBOARD_MCP_SERVER_NAME } from "../blackboard/mcp-http.js";
-import { MEMORY_MCP_SERVER_NAME } from "../memory/mcp-http.js";
-import { MEMORY_TOOL_NAMES } from "../memory/tools.js";
+import { MEMORY_MCP_SERVER_NAME } from "@highflame/codeoid-memory/mcp-http.js";
+import { MEMORY_TOOL_NAMES } from "@highflame/codeoid-memory/tools.js";
 import { FLEET_READ_TOOLS, FLEET_TOOL_PREFIX } from "../../protocol/types.js";
 
 /** Built-in read-only tools that never require confirmation. */

@@ -9,9 +9,9 @@ import { join } from "node:path";
 import { McpHub } from "../daemon/mcp/hub.js";
 import type { McpCallScope } from "../daemon/mcp/hub.js";
 import type { McpServerSpec } from "../daemon/mcp/types.js";
-import { MemoryEngine } from "../daemon/memory/engine.js";
-import { SqliteEpisodeStore } from "../daemon/memory/store.js";
-import type { Embedder } from "../daemon/memory/embedder.js";
+import { MemoryEngine } from "@highflame/codeoid-memory/engine.js";
+import { SqliteEpisodeStore } from "@highflame/codeoid-memory/store.js";
+import type { Embedder } from "@highflame/codeoid-memory/embedder.js";
 
 const SCOPE: McpCallScope = { workspaceId: "ws1", sessionId: "sess1" };
 const FIXTURE = join(import.meta.dir, "fixtures", "fake-mcp-stdio.ts");

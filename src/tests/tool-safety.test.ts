@@ -1,7 +1,7 @@
 import { describe, test, expect } from "bun:test";
 import { FLEET_READ_TOOLS, FLEET_SEND_TOOLS } from "../protocol/types.js";
 import { isElicitationTool, isSafeTool } from "../daemon/providers/tool-safety.js";
-import { MEMORY_TOOL_NAMES } from "../daemon/memory/tools.js";
+import { MEMORY_TOOL_NAMES } from "@highflame/codeoid-memory/tools.js";
 
 describe("isSafeTool", () => {
   test("built-in read-only tools are safe", () => {

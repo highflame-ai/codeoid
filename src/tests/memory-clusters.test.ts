@@ -26,7 +26,7 @@ import {
   type Cluster,
   type ClusterLabel,
 } from "../daemon/memory/index.js";
-import type { Episode } from "../daemon/memory/types.js";
+import type { Episode } from "@highflame/codeoid-memory/types.js";
 
 let tmp: string;
 let dbPath: string;

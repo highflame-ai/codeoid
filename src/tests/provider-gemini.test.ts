@@ -77,9 +77,9 @@ mock.module("@google/generative-ai", () => ({
 }));
 
 import { GeminiProvider } from "../daemon/providers/gemini/index.js";
-import { MemoryEngine } from "../daemon/memory/engine.js";
-import { SqliteEpisodeStore } from "../daemon/memory/store.js";
-import type { Embedder } from "../daemon/memory/embedder.js";
+import { MemoryEngine } from "@highflame/codeoid-memory/engine.js";
+import { SqliteEpisodeStore } from "@highflame/codeoid-memory/store.js";
+import type { Embedder } from "@highflame/codeoid-memory/embedder.js";
 
 class FakeEmbedder implements Embedder {
   readonly modelName = "fake-test";

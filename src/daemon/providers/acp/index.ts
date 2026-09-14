@@ -38,7 +38,7 @@ import type {
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
 import { buildGeminiCliEnv } from "../env.js";
 import { StdioJsonRpcProcess } from "../jsonrpc-stdio.js";
-import { MEMORY_MCP_SERVER_NAME, type MemoryMcpMount } from "../../memory/mcp-http.js";
+import { MEMORY_MCP_SERVER_NAME, type MemoryMcpMount } from "@highflame/codeoid-memory/mcp-http.js";
 import { BLACKBOARD_MCP_SERVER_NAME } from "../../blackboard/mcp-http.js";
 import type { McpRegistry } from "../../mcp/registry.js";
 import { resolveEnvMap } from "../../mcp/types.js";

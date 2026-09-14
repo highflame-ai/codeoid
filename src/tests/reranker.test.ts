@@ -43,10 +43,10 @@ mock.module("@xenova/transformers", () => ({
 // Import AFTER mock.module so the dynamic import inside init() resolves to
 // the fake.
 const { createReranker, DEFAULT_RERANKER_MODEL } = await import(
-  "../daemon/memory/reranker.js"
+  "@highflame/codeoid-memory/reranker.js"
 );
 const { TransformersJsReranker } = await import(
-  "../daemon/memory/reranker-transformersjs.js"
+  "@highflame/codeoid-memory/reranker-transformersjs.js"
 );
 
 describe("TransformersJsReranker", () => {

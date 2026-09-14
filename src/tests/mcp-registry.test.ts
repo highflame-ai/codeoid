@@ -7,7 +7,7 @@
 import { describe, it, expect } from "bun:test";
 import { McpRegistry } from "../daemon/mcp/registry.js";
 import { canonicalToolName, isProxied, type McpServerSpec } from "../daemon/mcp/types.js";
-import { MEMORY_MCP_SERVER_NAME } from "../daemon/memory/mcp-http.js";
+import { MEMORY_MCP_SERVER_NAME } from "@highflame/codeoid-memory/mcp-http.js";
 import type { RawMcpServerConfig } from "../config.js";
 
 /** Fill schema defaults so tests only state the fields they care about. */

@@ -19,7 +19,7 @@ import {
   MemoryEngine,
   workspaceIdFromPath,
 } from "../daemon/memory/index.js";
-import type { Embedder } from "../daemon/memory/embedder.js";
+import type { Embedder } from "@highflame/codeoid-memory/embedder.js";
 import type { AuthContext } from "../protocol/types.js";
 import { ALL_SCOPES } from "../protocol/scopes.js";
 

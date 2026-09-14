@@ -18,9 +18,9 @@
  * generation, cross-workspace hybrid recall, and rerank land in P1.
  */
 
-import { Database } from "bun:sqlite";
+import { BUSY_TIMEOUT_MS, Database } from "./db.js";
 import { randomUUID } from "node:crypto";
-import { BUSY_TIMEOUT_MS } from "../store.js";
+
 
 export interface SessionCard {
   sessionId: string;

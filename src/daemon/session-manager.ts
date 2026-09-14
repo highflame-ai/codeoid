@@ -144,7 +144,7 @@ import {
   isGitRepo,
   removeForkWorktree,
 } from "./git-worktree.js";
-import type { DailyUsageBucket, LifetimeUsageTotals } from "./memory/store.js";
+import type { DailyUsageBucket, LifetimeUsageTotals } from "@highflame/codeoid-memory/store.js";
 
 /**
  * Optional safe-root for session workdirs. When `CODEOID_FS_BROWSE_ROOT` is set

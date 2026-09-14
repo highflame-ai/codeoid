@@ -43,12 +43,13 @@ const read = async (rel: string): Promise<Manifest> =>
 const root = await read(".");
 const protocol = await read("packages/protocol");
 const core = await read("packages/core");
+const memory = await read("packages/memory");
 
 const errors: string[] = [];
 const expected = process.argv[2]?.replace(/^v/, "");
 const version = root.version;
 
-for (const pkg of [protocol, core]) {
+for (const pkg of [protocol, core, memory]) {
   if (pkg.version !== version) {
     errors.push(`${pkg.name}@${pkg.version} is not in lockstep with ${root.name}@${version}`);
   }
@@ -59,7 +60,7 @@ if (expected && version !== expected) {
 }
 
 const wantRange = `^${version}`;
-for (const dep of [protocol.name, core.name]) {
+for (const dep of [protocol.name, core.name, memory.name]) {
   const got = root.dependencies?.[dep];
   if (got !== wantRange) {
     errors.push(`${root.name} depends on ${dep}@${got ?? "<missing>"} — expected ${wantRange}`);
@@ -71,6 +72,13 @@ if (peer !== wantRange) {
   errors.push(`${core.name} peer-depends on ${protocol.name}@${peer ?? "<missing>"} — expected ${wantRange}`);
 }
 
+// memory ships the wire types it stores (TurnUsage, SessionMessage), so it takes
+// a hard dependency on protocol rather than a peer range.
+const memProto = memory.dependencies?.[protocol.name];
+if (memProto !== wantRange) {
+  errors.push(`${memory.name} depends on ${protocol.name}@${memProto ?? "<missing>"} — expected ${wantRange}`);
+}
+
 if (errors.length > 0) {
   console.error("version lockstep violated:");
   for (const e of errors) console.error(`  • ${e}`);
@@ -78,4 +86,4 @@ if (errors.length > 0) {
   process.exit(1);
 }
 
-console.log(`versions coherent @ ${version} (${[root.name, protocol.name, core.name].join(", ")})`);
+console.log(`versions coherent @ ${version} (${[root.name, protocol.name, core.name, memory.name].join(", ")})`);

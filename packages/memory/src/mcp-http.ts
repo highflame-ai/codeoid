@@ -32,7 +32,7 @@ import {
   tokenFrom,
   type JsonRpcMessage,
   type JsonRpcResponse,
-} from "../mcp/jsonrpc-http.js";
+} from "./jsonrpc-http.js";
 import type { MemoryEngine } from "./engine.js";
 import { memoryToolDefs, type MemoryToolContext, type MemoryToolDef } from "./tools.js";
 

@@ -28,6 +28,7 @@ if (!version || !/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(version)) {
 const ROOT = new URL("..", import.meta.url).pathname;
 const PROTOCOL = "@highflame/codeoid-protocol";
 const CORE = "@highflame/codeoid-core";
+const MEMORY = "@highflame/codeoid-memory";
 
 /**
  * Rewrites the manifest as TEXT, not as a parsed-and-redumped object: a JSON
@@ -55,8 +56,9 @@ const range = (dep: string): [RegExp, string] => [
 ];
 
 console.log(`setting workspace version to ${version}`);
-await patch(".", [versionField(), range(PROTOCOL), range(CORE)]);
+await patch(".", [versionField(), range(PROTOCOL), range(CORE), range(MEMORY)]);
 await patch("packages/protocol", [versionField()]);
 await patch("packages/core", [versionField(), range(PROTOCOL)]);
+await patch("packages/memory", [versionField(), range(PROTOCOL)]);
 
 console.log("\nnext: bun install && (cd web && bun install), then update CHANGELOG.md");

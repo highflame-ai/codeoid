@@ -12,14 +12,14 @@
  * same interface if we outgrow it.
  */
 
-import { Database } from "bun:sqlite";
+import { BUSY_TIMEOUT_MS, Database } from "./db.js";
 import { randomUUID, createHash } from "node:crypto";
 import { execSync } from "node:child_process";
 import { resolve, isAbsolute } from "node:path";
 import type { ClusterableEpisode } from "./cluster.js";
 import type { Episode, FileReadRecord, RecallQuery } from "./types.js";
-import type { TurnUsage } from "../../protocol/types.js";
-import { BUSY_TIMEOUT_MS } from "../store.js";
+import type { TurnUsage } from "@highflame/codeoid-protocol";
+
 
 /** Default byte ceiling for the decoded embedding-matrix cache (#154).
  * 128 MiB ≈ 87k episodes of 384-dim float32 — generous for interactive

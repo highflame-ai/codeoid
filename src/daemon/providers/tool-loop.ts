@@ -18,8 +18,8 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { memoryToolDefs, type MemoryToolContext } from "../memory/tools.js";
-import { MEMORY_MCP_SERVER_NAME } from "../memory/mcp-http.js";
+import { memoryToolDefs, type MemoryToolContext } from "@highflame/codeoid-memory/tools.js";
+import { MEMORY_MCP_SERVER_NAME } from "@highflame/codeoid-memory/mcp-http.js";
 import type { McpToolHandle, SessionMcpTools } from "../mcp/tool-source.js";
 import type { ProviderEvent, ToolApprovalFn, UiRequest, UiRequestFn } from "./interface.js";
 

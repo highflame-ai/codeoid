@@ -16,7 +16,7 @@ import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-
 import type { Store } from "../store.js";
 import type { AgentIdentityManager } from "../agent-identity.js";
 import type { MemoryEngine } from "../memory/index.js";
-import type { MemoryMcpMount } from "../memory/mcp-http.js";
+import type { MemoryMcpMount } from "@highflame/codeoid-memory/mcp-http.js";
 import type { McpRegistry } from "../mcp/registry.js";
 import type { McpHub } from "../mcp/hub.js";
 import type { CompressionRegistry } from "../compress/index.js";

@@ -10,11 +10,11 @@ import {
   namespacedMemoryToolName,
   MAX_MEMORY_TOOL_ROUNDS,
 } from "../daemon/providers/tool-loop.js";
-import { MemoryEngine } from "../daemon/memory/engine.js";
-import { SqliteEpisodeStore } from "../daemon/memory/store.js";
-import { MEMORY_TOOL_NAMES } from "../daemon/memory/tools.js";
-import type { Embedder } from "../daemon/memory/embedder.js";
-import type { Episode } from "../daemon/memory/types.js";
+import { MemoryEngine } from "@highflame/codeoid-memory/engine.js";
+import { SqliteEpisodeStore } from "@highflame/codeoid-memory/store.js";
+import { MEMORY_TOOL_NAMES } from "@highflame/codeoid-memory/tools.js";
+import type { Embedder } from "@highflame/codeoid-memory/embedder.js";
+import type { Episode } from "@highflame/codeoid-memory/types.js";
 import type { ProviderEvent, UiRequest, UiResponse } from "../daemon/providers/interface.js";
 
 class FakeEmbedder implements Embedder {

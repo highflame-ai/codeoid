@@ -85,10 +85,10 @@ import {
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MemoryEngine } from "../daemon/memory/engine.js";
-import { SqliteEpisodeStore } from "../daemon/memory/store.js";
+import { MemoryEngine } from "@highflame/codeoid-memory/engine.js";
+import { SqliteEpisodeStore } from "@highflame/codeoid-memory/store.js";
 import { MEMORY_TOOL_NAMES } from "../daemon/memory/index.js";
-import type { Embedder } from "../daemon/memory/embedder.js";
+import type { Embedder } from "@highflame/codeoid-memory/embedder.js";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

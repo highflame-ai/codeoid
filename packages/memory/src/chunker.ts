@@ -12,7 +12,7 @@
  * invokes the `emit` callback whenever an episode is ready.
  */
 
-import type { SessionMessage } from "../../protocol/types.js";
+import type { SessionMessage } from "@highflame/codeoid-protocol";
 import type { Episode } from "./types.js";
 
 /** Ceiling on tool output persisted into a memory episode — mirrors the

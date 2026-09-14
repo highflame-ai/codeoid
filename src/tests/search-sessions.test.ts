@@ -15,7 +15,7 @@ import {
   SqliteEpisodeStore,
   MemoryEngine,
 } from "../daemon/memory/index.js";
-import type { Embedder } from "../daemon/memory/embedder.js";
+import type { Embedder } from "@highflame/codeoid-memory/embedder.js";
 
 class StubEmbedder implements Embedder {
   readonly modelName = "stub";

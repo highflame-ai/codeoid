@@ -20,8 +20,8 @@
  */
 
 import { StdioJsonRpcProcess } from "../providers/jsonrpc-stdio.js";
-import { memoryToolDefs, type MemoryToolContext } from "../memory/tools.js";
-import type { MemoryEngine } from "../memory/engine.js";
+import { memoryToolDefs, type MemoryToolContext } from "@highflame/codeoid-memory/tools.js";
+import type { MemoryEngine } from "@highflame/codeoid-memory/engine.js";
 import { resolveEnvMap } from "./types.js";
 import type { McpHttpTransport, McpServerSpec, McpStdioTransport } from "./types.js";
 

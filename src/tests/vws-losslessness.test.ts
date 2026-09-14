@@ -19,11 +19,11 @@
 import { describe, test, expect, afterEach } from "bun:test";
 import { renderHistorySeed, type CanonicalTurn } from "../daemon/providers/canonical.js";
 import { seedBudgetChars } from "../daemon/providers/context-windows.js";
-import { MemoryEngine } from "../daemon/memory/engine.js";
-import { SqliteEpisodeStore } from "../daemon/memory/store.js";
-import { memoryToolDefs, type MemoryToolContext } from "../daemon/memory/tools.js";
-import type { Embedder } from "../daemon/memory/embedder.js";
-import type { Episode } from "../daemon/memory/types.js";
+import { MemoryEngine } from "@highflame/codeoid-memory/engine.js";
+import { SqliteEpisodeStore } from "@highflame/codeoid-memory/store.js";
+import { memoryToolDefs, type MemoryToolContext } from "@highflame/codeoid-memory/tools.js";
+import type { Embedder } from "@highflame/codeoid-memory/embedder.js";
+import type { Episode } from "@highflame/codeoid-memory/types.js";
 
 class FakeEmbedder implements Embedder {
   readonly modelName = "fake-test";

@@ -10,7 +10,7 @@
  */
 
 import type { RawMcpServerConfig } from "../../config.js";
-import { MEMORY_MCP_SERVER_NAME } from "../memory/mcp-http.js";
+import { MEMORY_MCP_SERVER_NAME } from "@highflame/codeoid-memory/mcp-http.js";
 import type { McpServerSpec, McpTransport } from "./types.js";
 
 /** Names codeoid owns internally — a user entry using one is ignored (the

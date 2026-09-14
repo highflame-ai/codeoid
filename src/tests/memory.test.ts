@@ -21,7 +21,7 @@ import {
   workspaceIdFromPath,
   legacyWorkspaceIdFromPath,
 } from "../daemon/memory/index.js";
-import type { Embedder } from "../daemon/memory/embedder.js";
+import type { Embedder } from "@highflame/codeoid-memory/embedder.js";
 import type { SessionMessage, TurnUsage } from "../protocol/types.js";
 
 class StubEmbedder implements Embedder {

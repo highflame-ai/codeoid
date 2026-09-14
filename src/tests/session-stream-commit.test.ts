@@ -38,8 +38,8 @@ import {
   MemoryEngine,
   SqliteEpisodeStore,
 } from "../daemon/memory/index.js";
-import type { Embedder } from "../daemon/memory/embedder.js";
-import type { Episode } from "../daemon/memory/types.js";
+import type { Embedder } from "@highflame/codeoid-memory/embedder.js";
+import type { Episode } from "@highflame/codeoid-memory/types.js";
 import type { DaemonMessage, AuthContext, SessionMessage } from "../protocol/types.js";
 import { SYSTEM_IDENTITY } from "../protocol/types.js";
 import type { ProviderEvent } from "../daemon/providers/interface.js";

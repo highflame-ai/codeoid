@@ -31,8 +31,8 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { BUSY_TIMEOUT_MS, Store } from "../daemon/store.js";
-import { SessionCardStore } from "../daemon/memory/cards.js";
-import { SqliteEpisodeStore } from "../daemon/memory/store.js";
+import { SessionCardStore } from "@highflame/codeoid-memory/cards.js";
+import { SqliteEpisodeStore } from "@highflame/codeoid-memory/store.js";
 import { PipelineStore } from "../daemon/pipeline/store.js";
 
 const dirs: string[] = [];
@@ -139,8 +139,8 @@ describe("all writable stores — structural", () => {
   // tracks execution order there. It is covered behaviourally above instead
   // (it's the only store that exposes its connection).
   const STORES = [
-    "../daemon/memory/store.ts",
-    "../daemon/memory/cards.ts",
+    "../../packages/memory/src/store.ts",
+    "../../packages/memory/src/cards.ts",
     "../daemon/pipeline/store.ts",
   ];
 
