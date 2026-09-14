@@ -126,6 +126,15 @@ export interface TurnOpts {
    * user settings tier). Absent = none.
    */
   subagents?: readonly PackSubagent[];
+  /**
+   * Session-scoped skill plugins from an ambient-activated pack
+   * (`pipeline.skillScope: "session"`, docs/pack-loading.md §3a). Each entry is
+   * a Claude-Code-plugin-shaped directory (`.claude-plugin/plugin.json` +
+   * `skills/`); the Claude backend hands them to the SDK `plugins` option so the
+   * pack's slash skills exist for THIS session without touching
+   * `~/.claude/skills`. Other backends currently ignore them. Absent = none.
+   */
+  pluginDirs?: readonly string[];
 }
 
 // ── Normalized turn result ────────────────────────────────────────────────────

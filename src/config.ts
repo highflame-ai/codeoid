@@ -770,6 +770,15 @@ const PipelineSchema = z
     modelTiers: z.record(z.string().min(1).max(64), ModelBindingSchema).default({}),
     // Key = "<packId>/<roleName>" — both ids are ≤64 chars, plus the slash.
     modelRoles: z.record(z.string().min(1).max(129), ModelBindingSchema).default({}),
+    /**
+     * How a trusted pack's registry skills reach a session (docs/pack-loading.md
+     * §3a). `global` (default): symlinked into `~/.claude/skills`, so every
+     * Claude Code session on the machine sees them. `session`: never linked;
+     * exposed as a per-session SDK plugin only inside pack-activated codeoid
+     * sessions and pipeline runs — the machine-wide `~/.claude` stays whatever
+     * the operator manages by hand.
+     */
+    skillScope: z.enum(["global", "session"]).default("global"),
     packs: z
       .array(
         z.object({
@@ -794,7 +803,15 @@ const PipelineSchema = z
       )
       .default([]),
   })
-  .default({ enabled: true, defaultPack: null, packs: [], registries: [], modelTiers: {}, modelRoles: {} });
+  .default({
+    enabled: true,
+    defaultPack: null,
+    packs: [],
+    registries: [],
+    modelTiers: {},
+    modelRoles: {},
+    skillScope: "global",
+  });
 
 /**
  * Push notifications (docs/push.md). When a session blocks on a tool approval,
@@ -1070,6 +1087,10 @@ export interface CodeoidConfig {
      *  (schema default {}). */
     modelTiers?: Record<string, { provider: string; model?: string }>;
     modelRoles?: Record<string, { provider: string; model?: string }>;
+    /** `global` (default) symlinks trusted pack skills machine-wide; `session`
+     *  exposes them only inside pack-activated sessions via an SDK plugin
+     *  (docs/pack-loading.md §3a). Optional in the type; loadConfig defaults it. */
+    skillScope?: "global" | "session";
   };
   /**
    * Per-backend provider settings. Optional in the type so hand-built test

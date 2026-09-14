@@ -8,6 +8,7 @@
 
 import type { PhaseCtx, PhaseKind, PhaseRunResult, PipelinePhase, SkillPlugin } from "./interface";
 import type { PhaseRunner } from "./runner";
+import { resolveScoped } from "./scoped";
 
 /** Compose a phase's prompt: the skill command/template, the run's goal, and —
  *  on a revise re-run — the phase's prior output + the accumulated human
@@ -42,7 +43,8 @@ export function makeSkillPhaseKind(runner?: PhaseRunner): PhaseKind {
       if (!skillId) {
         return { outcome: "failed", reason: `phase "${ctx.phase.id}" has kind:"skill" but no skill id` };
       }
-      const skill = ctx.registries.skills.resolve(skillId);
+      // The run's own pack entry first (`<packId>/<id>`), bare second — scoped.ts.
+      const skill = resolveScoped(ctx.registries.skills, ctx.pipeline.packId, skillId);
       if (!skill) return { outcome: "failed", reason: `unknown skill "${skillId}"` };
       return runSkill(skill, ctx, runner);
     },

@@ -47,7 +47,7 @@ pipeline runtime on. It owns:
 | `refresh(name?)` | `git pull` a cached registry |
 | `available()` | packs found across caches, not yet installed |
 | `installed()` | loaded packs + metadata + trust + selected flag + status |
-| `install(ref, { trusted })` | resolve a pack (registry `id` or explicit dir) → `loadPack` → persist to `config.pipeline.packs` → `installPack` into the live manager (if any) → link the registry's `skills/` into `~/.claude/skills` so the pack is *runnable* |
+| `install(ref, { trusted })` | resolve a pack (registry `id` or explicit dir) → `loadPack` → persist to `config.pipeline.packs` → `installPack` into the live manager (if any) → under `skillScope: global`, link the registry's `skills/` into `~/.claude/skills` so the pack is *runnable* (see §3a) |
 | `remove(id)` | unregister from the manager + drop from config |
 | `trust(id, trusted)` | update config trust + reload the pack at the new trust |
 | `select(id)` | set `config.pipeline.defaultPack` |
@@ -55,6 +55,35 @@ pipeline runtime on. It owns:
 **Trust default is `false`** (decision): a fetched pack loads and its
 skill/review gates work, but its shell `command` gates fail closed until an
 explicit `trust`. Matches the sandbox zero-standing-privilege posture.
+
+### 3a. Skill scope — machine-wide symlinks or per-session plugins
+
+A trusted pack's registry `skills/` can reach a session two ways, chosen by
+`config.pipeline.skillScope`:
+
+| `skillScope` | How the skills reach a session | Who else sees them |
+| --- | --- | --- |
+| `global` (default) | `#linkSkills` symlinks each `skills/<name>` into `~/.claude/skills` on install / trust / refresh (additive; a **dangling** link left by an older loader is repaired, a real dir or live link is never touched) | every Claude Code session on the machine — the user's own same-named skills win collisions |
+| `session` | nothing is linked; `resolveActivation()` returns `skillsPluginDir`, a synthesized Claude-Code-plugin dir (`~/.codeoid/plugins/<registry>/` = `.claude-plugin/plugin.json` + `skills → <cache>/skills`) that the Claude backend passes to the SDK `plugins` option for that session's turns | only pack-activated codeoid sessions and pipeline phases |
+
+Both scopes apply the same trust rule (an untrusted pack contributes no
+runnable skills either way), and both scan the skills for their `!`…``
+substitutions so the command grants (#233) and the read sandbox work
+identically. Plugin skills resolve both bare (`/spec`) and namespaced
+(`/<registry>:spec`), so pack `command:` values are unchanged.
+
+`session` is the scope for a machine whose `~/.claude` is owned by something
+else (an org bundle symlinked by hand, another toolkit): the methodology's
+skills exist inside codeoid runs and nowhere else. Switching an existing
+machine from `global` to `session` does not remove links already made — delete
+the `~/.claude/skills/<name>` symlinks that point into `~/.codeoid/packs/` if
+you want them gone. Non-Claude backends ignore `pluginDirs` today, exactly as
+they ignore pack subagents.
+
+Registry skills and gates are registered under `<packId>/<id>` (`scoped.ts`)
+so two installed packs declaring the same bare id (`review`, `ship`,
+`tests_pass`) coexist; a run resolves its own pack's entry first and falls back
+to the bare id for built-in gates and explicit-`phases` plans.
 
 Persistence goes through one shared config mutator (`mutateConfigFile`) that
 read → mutates → validates against `RootSchema` → atomically writes `0o600` —

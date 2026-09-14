@@ -22,6 +22,7 @@ import type { Pack, PhaseDef, PipelineRegistries, PipelineState } from "./interf
 import { isTerminal } from "./interface";
 import { createRegistries } from "./registry";
 import type { PhaseRunner } from "./runner";
+import { hasScoped } from "./scoped";
 import { makeSkillPhaseKind } from "./skill-kind";
 import type { PipelineStore } from "./store";
 
@@ -106,7 +107,7 @@ export class PipelineManager {
   create(opts: CreatePipelineOpts): PipelineState {
     const { phases: plan, pack } = this.#resolvePhases(opts);
     const phases = this.#bindModels(plan, pack, opts);
-    this.#validate(phases);
+    this.#validate(phases, pack?.id);
     const ts = Date.now();
     const state: PipelineState = {
       id: randomUUID(),
@@ -427,7 +428,9 @@ export class PipelineManager {
     });
   }
 
-  #validate(phases: PhaseDef[]): void {
+  /** `packId` scopes gate/skill lookups to the pack the plan came from
+   *  (`<packId>/<id>` first, bare second — scoped.ts); absent for explicit plans. */
+  #validate(phases: PhaseDef[], packId?: string): void {
     if (phases.length === 0) throw new Error("pipeline must declare at least one phase");
     const seen = new Set<string>();
     for (const p of phases) {
@@ -436,15 +439,15 @@ export class PipelineManager {
       if (!this.#registries.phases.has(p.kind)) {
         throw new Error(`phase "${p.id}": unknown kind "${p.kind}"`);
       }
-      if (p.gate && !this.#registries.gates.has(p.gate)) {
+      if (p.gate && !hasScoped(this.#registries.gates, packId, p.gate)) {
         throw new Error(`phase "${p.id}": unknown gate "${p.gate}"`);
       }
-      if (p.entryGate && !this.#registries.gates.has(p.entryGate)) {
+      if (p.entryGate && !hasScoped(this.#registries.gates, packId, p.entryGate)) {
         throw new Error(`phase "${p.id}": unknown entry gate "${p.entryGate}"`);
       }
       if (p.kind === "skill") {
         if (!p.skill) throw new Error(`phase "${p.id}": kind "skill" requires a skill id`);
-        if (!this.#registries.skills.has(p.skill)) {
+        if (!hasScoped(this.#registries.skills, packId, p.skill)) {
           throw new Error(`phase "${p.id}": unknown skill "${p.skill}"`);
         }
       }

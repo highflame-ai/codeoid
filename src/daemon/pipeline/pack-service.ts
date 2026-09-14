@@ -14,9 +14,20 @@
  * truth for packs at runtime — this service is.
  */
 
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  readlinkSync,
+  statSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { AvailablePackWire, PackWire, RegistryWire } from "@highflame/codeoid-protocol";
 import { type ModelBindingConfig, resolveBinding } from "./binding";
 import type { Pack } from "./interface";
@@ -38,7 +49,17 @@ export interface PackActivation {
    *  postures) don't have to carry an empty map. */
   roles?: Record<string, RoleDef>;
   subagents: PackSubagent[];
+  /** Session-scoped skill plugin (`pipeline.skillScope: "session"`): a Claude-
+   *  Code-plugin-shaped directory exposing the pack's registry `skills/` to THIS
+   *  session only — nothing is linked into `~/.claude/skills`. Absent under the
+   *  default global scope (skills are symlinked machine-wide instead), for an
+   *  untrusted pack (declaring is not executing), and for a dir-installed pack
+   *  (no registry to expose). */
+  skillsPluginDir?: string;
 }
+
+/** How a trusted pack's registry skills reach a session (docs/pack-loading.md §3a). */
+export type SkillScope = "global" | "session";
 
 /** The minimal slice of PipelineManager the service needs to (un)register packs
  *  for live effect — kept structural so tests can inject a fake. `installPack`
@@ -94,6 +115,17 @@ export interface PackServiceDeps {
   cacheDir?: string;
   /** Where to link a registry's runnable skills (default: ~/.claude/skills). */
   skillsDir?: string;
+  /**
+   * `global` (default): symlink a trusted pack's registry skills into
+   * `skillsDir`, where EVERY Claude Code session on the machine discovers them.
+   * `session`: never link; synthesize a per-registry plugin dir instead and hand
+   * it to pack-activated sessions only (PackActivation.skillsPluginDir → the SDK
+   * `plugins` option), so a methodology's skills exist inside codeoid runs and
+   * nowhere else. Same trust rule either way.
+   */
+  skillScope?: SkillScope;
+  /** Where session-scoped skill plugins are synthesized (default: `<cacheDir>/../plugins`). */
+  pluginsDir?: string;
   /** Run git (injectable). Default: `git` via Bun.spawn. */
   git?: (args: string[], cwd?: string) => Promise<GitResult>;
   /** The operator's model maps (config `pipeline.modelTiers`/`modelRoles`) —
@@ -120,6 +152,16 @@ async function defaultGit(args: string[], cwd?: string): Promise<GitResult> {
   return { ok: code === 0, stderr: stderr.trim() };
 }
 
+/** A symlink whose target no longer exists (`existsSync` follows links, so it
+ *  is false; `lstatSync` sees the link itself). */
+function isDanglingSymlink(path: string): boolean {
+  try {
+    return lstatSync(path).isSymbolicLink() && !existsSync(path);
+  } catch {
+    return false;
+  }
+}
+
 /** Derive a cache-safe registry name from a git URL (last path segment, minus
  *  `.git`). `git@github.com:highflame-ai/ai-factory.git` → `ai-factory`. */
 export function registryNameFromUrl(url: string): string {
@@ -137,6 +179,8 @@ export class PackService {
   #defaultPack: string | null;
   #cacheDir: string;
   #skillsDir: string;
+  #skillScope: SkillScope;
+  #pluginsDir: string;
   #git: (args: string[], cwd?: string) => Promise<GitResult>;
   #persist?: (state: PackServiceConfig) => void;
   #manager: PackServiceDeps["manager"];
@@ -148,6 +192,8 @@ export class PackService {
     this.#defaultPack = deps.config.defaultPack;
     this.#cacheDir = deps.cacheDir ?? join(homedir(), ".codeoid", "packs");
     this.#skillsDir = deps.skillsDir ?? join(homedir(), ".claude", "skills");
+    this.#skillScope = deps.skillScope ?? "global";
+    this.#pluginsDir = deps.pluginsDir ?? join(dirname(this.#cacheDir), "plugins");
     this.#git = deps.git ?? defaultGit;
     this.#persist = deps.persist;
     this.#manager = deps.manager;
@@ -213,8 +259,15 @@ export class PackService {
     }
   }
 
+  /** The active skill scope (read by tests + `pack list` rendering). */
+  get skillScope(): SkillScope {
+    return this.#skillScope;
+  }
+
   // Two steps required: pull alone leaves the live pipeline stale (issue #236).
   // Skills re-linked only for trusted packs — invariant from install()/trust() (issue #233).
+  // Under session scope nothing is linked: the plugin dir points at the cache,
+  // so a pull is already visible to the next pack-activated turn.
   async refreshRegistry(name?: string): Promise<void> {
     await this.refresh(name);
     const mgr = this.#manager?.();
@@ -233,7 +286,7 @@ export class PackService {
         if (existsSync(root)) skillRoots.add(root);
       }
     }
-    for (const root of skillRoots) this.#linkSkills(root);
+    if (this.#skillScope === "global") for (const root of skillRoots) this.#linkSkills(root);
   }
 
   // ── Discovery ───────────────────────────────────────────────────────────────
@@ -399,7 +452,11 @@ export class PackService {
     // gate path already requires — the exact "declaring is not executing" model
     // in loadPack. Only trusted packs get linked; an untrusted pack still
     // installs and indexes, it just contributes no runnable slash-skills.
-    if (registryRoot && trusted) this.#linkSkills(registryRoot);
+    //
+    // Under `skillScope: "session"` nothing is linked here at all: the skills
+    // reach pack-activated sessions through resolveActivation().skillsPluginDir
+    // (same trust rule, applied there).
+    if (registryRoot && trusted && this.#skillScope === "global") this.#linkSkills(registryRoot);
 
     return this.installed();
   }
@@ -427,7 +484,7 @@ export class PackService {
     // and the pack silently stays half-installed. (Toggling OFF leaves the
     // links; removing them belongs to `remove`, and unlinking live skills
     // mid-session is out of scope here.)
-    if (trusted && entry.registry) {
+    if (trusted && entry.registry && this.#skillScope === "global") {
       const root = this.#cachePath(entry.registry);
       if (existsSync(root)) this.#linkSkills(root);
     }
@@ -470,7 +527,22 @@ export class PackService {
     // Subagents ship at the registry root's `agents/` dir (like skills). A
     // local-dir install has no registry → no subagents.
     const subagents = entry.registry ? loadSubagents(join(this.#cachePath(entry.registry), "agents")) : [];
-    return { id: loaded.id, constitution: loaded.constitution, role, roleName, roles: loaded.roles, subagents };
+    // Session-scoped skills: the same trust rule as #linkSkills (an untrusted
+    // pack's `!`…`` frontmatter must not become runnable shell), delivered as a
+    // per-session plugin instead of a machine-wide symlink.
+    const skillsPluginDir =
+      this.#skillScope === "session" && entry.trusted && entry.registry
+        ? this.#ensureSkillPlugin(entry.registry)
+        : undefined;
+    return {
+      id: loaded.id,
+      constitution: loaded.constitution,
+      role,
+      roleName,
+      roles: loaded.roles,
+      subagents,
+      ...(skillsPluginDir ? { skillsPluginDir } : {}),
+    };
   }
 
   // ── internals ───────────────────────────────────────────────────────────────
@@ -490,7 +562,14 @@ export class PackService {
 
   /** Symlink each `skills/<name>` in a registry into the skills dir — additively
    *  (never clobbers an existing skill). Best-effort: a link failure is logged,
-   *  not fatal, since it only affects a pack's *runnability*, not its install. */
+   *  not fatal, since it only affects a pack's *runnability*, not its install.
+   *
+   *  The one existing entry it WILL replace is a dangling symlink: an earlier
+   *  loader linked skills from a temp clone (`/tmp/packsvc-…`) that no longer
+   *  exists, and `existsSync(to)` is false for such a link — so the old code
+   *  tried `symlinkSync`, got EEXIST, warned, and the skill stayed broken on
+   *  every install/trust forever. A dangling link is nobody's skill; relinking
+   *  it is the repair, not a clobber. A real dir or a live link is never touched. */
   #linkSkills(registryRoot: string): string[] {
     const src = join(registryRoot, "skills");
     if (!existsSync(src)) return [];
@@ -508,7 +587,13 @@ export class PackService {
         // an untrusted registry must NOT be treated as a directory and propagated
         // into the host skills dir (it could point at /etc, ~/.ssh, …). A real
         // directory links; a symlink is skipped.
-        if (!lstatSync(from).isDirectory() || existsSync(to)) continue;
+        if (!lstatSync(from).isDirectory()) continue;
+        if (isDanglingSymlink(to)) {
+          unlinkSync(to);
+          console.log(`[packs] repaired dangling skill link "${name}" → ${from}`);
+        } else if (existsSync(to)) {
+          continue;
+        }
         symlinkSync(from, to, "dir");
         linked.push(name);
       } catch (e) {
@@ -516,6 +601,60 @@ export class PackService {
       }
     }
     return linked;
+  }
+
+  /**
+   * Session-scoped skills (`skillScope: "session"`): materialize a Claude-Code-
+   * plugin-shaped directory for a registry — `.claude-plugin/plugin.json` naming
+   * the registry, plus `skills` → `<cache>/skills` — and return it for the SDK
+   * `plugins` option. Idempotent and self-repairing (a stale `skills` link is
+   * re-pointed). Registries are data-only, so the manifest is synthesized here
+   * rather than required of them. Plugin skills resolve both bare (`/spec`) and
+   * namespaced (`/<registry>:spec`), so pack `command:` values need no rewrite.
+   * Returns undefined when the registry ships no `skills/` or the dir can't be
+   * written (logged) — the activation then simply carries no plugin.
+   */
+  #ensureSkillPlugin(registry: string): string | undefined {
+    const skillsSrc = join(this.#cachePath(registry), "skills");
+    if (!existsSync(skillsSrc)) return undefined;
+    const pluginDir = join(this.#pluginsDir, registry);
+    try {
+      mkdirSync(join(pluginDir, ".claude-plugin"), { recursive: true });
+      const manifestPath = join(pluginDir, ".claude-plugin", "plugin.json");
+      const manifest = `${JSON.stringify(
+        {
+          name: registry,
+          description: `codeoid pack registry "${registry}" — skills exposed per session (pipeline.skillScope: session)`,
+          version: "0.0.0",
+        },
+        null,
+        2,
+      )}\n`;
+      if (!existsSync(manifestPath) || readFileSync(manifestPath, "utf8") !== manifest) {
+        writeFileSync(manifestPath, manifest);
+      }
+      const link = join(pluginDir, "skills");
+      let current: ReturnType<typeof lstatSync> | undefined;
+      try {
+        current = lstatSync(link);
+      } catch {
+        current = undefined;
+      }
+      if (current?.isSymbolicLink()) {
+        if (readlinkSync(link) !== skillsSrc || !existsSync(link)) unlinkSync(link);
+        else return pluginDir;
+      } else if (current) {
+        // A real directory here is operator-managed — leave it, use it.
+        return pluginDir;
+      }
+      symlinkSync(skillsSrc, link, "dir");
+      return pluginDir;
+    } catch (e) {
+      console.warn(
+        `[packs] could not materialize the skill plugin for registry "${registry}": ${e instanceof Error ? e.message : String(e)}`,
+      );
+      return undefined;
+    }
   }
 
   #save(): void {

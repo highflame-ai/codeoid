@@ -476,6 +476,9 @@ export class SessionManager {
       // The operator's model maps, for the pre-flight `pack show --resolve`
       // view (docs/role-model-binding.md §4) — same maps pipeline.create reads.
       modelConfig: { modelTiers: p?.modelTiers, modelRoles: p?.modelRoles },
+      // Machine-wide symlinks (global) vs per-session SDK plugins (session) for
+      // a trusted pack's registry skills (docs/pack-loading.md §3a).
+      skillScope: p?.skillScope,
     });
   }
 

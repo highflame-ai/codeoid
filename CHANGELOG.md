@@ -25,6 +25,44 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `.cancel`, all gated on `settings:write`. Claude is wired today; the mechanism
   is per-backend and the others follow.
 
+- **Session-scoped pack skills** (`pipeline.skillScope: "session"`). Until now
+  a trusted pack's registry skills reached a session one way only: symlinked
+  into `~/.claude/skills`, where every Claude Code session on the machine — not
+  just codeoid's — discovered them. On a machine whose `~/.claude` is owned by
+  something else (an org bundle linked by hand, another toolkit) that is the
+  wrong scope. With `skillScope: "session"` nothing is linked; codeoid
+  synthesizes a Claude-Code-plugin-shaped directory per registry
+  (`~/.codeoid/plugins/<registry>/`: a manifest plus `skills → <cache>/skills`)
+  and hands it to the SDK's `plugins` option for pack-activated sessions and
+  pipeline phases, so the methodology's skills exist inside codeoid runs and
+  nowhere else. Plugin skills resolve both bare (`/spec`) and namespaced
+  (`/<registry>:spec`), so pack `command:` values are unchanged; the same trust
+  rule applies (an untrusted pack contributes no runnable skills either way);
+  the read sandbox and the skill-command grants scan the plugin tier too. The
+  default stays `global`. Non-Claude backends ignore the plugin dirs, as they
+  already ignore pack subagents. (docs/pack-loading.md §3a)
+
+### Fixed
+
+- **Two installed packs declaring the same skill or gate id overwrote each
+  other.** Registries were daemon-wide and keyed by bare id, so installing a
+  second pack that also declared `review`, `ship`, or `tests_pass` replaced the
+  first's entries last-wins (the boot log said so: `skill "review" already
+  registered — overwriting`), and a run from the first pack then drove the
+  second pack's skill. Packs now register under `<packId>/<id>`; the engine, the
+  skill phase kind, and create-time validation resolve a run's own pack entry
+  first and fall back to the bare id, so built-in gates (`always`, `manual`) and
+  explicit-`phases` plans keep resolving exactly as before. Phase defs, CLI
+  output, and the web Pack Browser still show the ids as authored.
+
+- **A dangling skill symlink blocked that skill from ever being linked again.**
+  An older loader linked registry skills from a temp clone under `/tmp`; after
+  the cache moved, those links pointed at nothing. `existsSync` is false for a
+  dangling link, so `#linkSkills` tried to create it, hit `EEXIST`, warned, and
+  left the skill broken on every subsequent install and trust. A dangling link
+  is now repaired in place; a real directory or a live link is still never
+  touched.
+
 ## [0.4.0] - 2026-07-29
 
 codeoid moves to the Highflame npm org. npm has no way to transfer a package
