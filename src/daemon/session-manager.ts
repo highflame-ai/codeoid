@@ -130,6 +130,7 @@ import type {
 } from "../protocol/types.js";
 import type { Scope } from "../protocol/scopes.js";
 import type { PipelineState } from "./pipeline/interface.js";
+import { blockingOf, openFindings, renderLedger } from "./pipeline/findings.js";
 
 /** Per-phase autonomous turn budget for a pipeline run. A phase runs the model
  *  to completion within its role (the human gate is the phase boundary, not each
@@ -3523,6 +3524,19 @@ mcpHub: this.#mcpHub,
           if (p.lastSummary) w.summary = p.lastSummary;
         }
         if (p.feedback && p.feedback.length > 0) w.feedback = p.feedback;
+        // The findings loop (findings.ts): counts + the ledger, so a client can
+        // render "2 open (1 blocking), 1 fix leg" and the per-round table.
+        if (p.def.findings && p.findings) {
+          const open = openFindings(p.findings);
+          w.findings = {
+            rounds: p.findings.rounds.length,
+            fixLegs: p.findings.fixLegs,
+            open: open.length,
+            blocking: blockingOf(open, p.def.findings.blocking).length,
+            next: p.findings.next,
+            ledger: renderLedger(p.findings, p.def.findings),
+          };
+        }
         return w;
       }),
     };

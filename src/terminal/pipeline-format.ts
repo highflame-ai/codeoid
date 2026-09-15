@@ -49,6 +49,15 @@ export function formatPipeline(p: PipelineWire): string[] {
     if (ph.feedback && ph.feedback.length > 0) {
       out.push(`        revisions: ${ph.feedback.length}`);
     }
+    // The findings loop (review → fix → re-review): where it stands, and what
+    // the engine runs next while the phase is still in motion.
+    if (ph.findings) {
+      const f = ph.findings;
+      const next = ph.status === "running" ? `, next: ${f.next === "fix" ? "fix leg" : "review leg"}` : "";
+      out.push(
+        `        findings: ${f.open} open (${f.blocking} blocking) after ${f.rounds} review round${f.rounds === 1 ? "" : "s"}, ${f.fixLegs} fix leg${f.fixLegs === 1 ? "" : "s"}${next}`,
+      );
+    }
   }
   const cur = p.phases[p.cursor];
   if (cur && cur.status === "halted") {

@@ -29,6 +29,72 @@ import type { PipelineStore } from "./store";
 /** Max pipelines re-driven concurrently on boot (each may spawn a worker turn). */
 const RESUME_CONCURRENCY = 4;
 
+/**
+ * Resolve the model binding for a findings phase's FIX LEGS (findings.ts) —
+ * the `fixWith` role's tier / config-role / CLI / pin rungs, with exactly the
+ * skip rules a phase gets (cross-provider → skipped; a model the session's
+ * backend can't run → skipped; both with a warning naming the rung). Persisted
+ * on `def.findings.fixWith` so resume and retry keep the same binding.
+ */
+function bindFixWith(
+  def: PhaseDef,
+  pack: Pack | undefined,
+  bindings: ReadonlyMap<string, ModelBinding>,
+  opts: CreatePipelineOpts,
+  warn: (m: string) => void,
+  warnedTiers: Set<string>,
+): PhaseDef {
+  const spec = def.findings;
+  if (!spec) return def;
+  const fw = spec.fixWith;
+  const role = pack?.roles?.[fw.role];
+  const hasPin = fw.provider !== undefined || fw.model !== undefined;
+  const resolved = resolveBinding({
+    packId: pack?.id,
+    roleName: fw.role,
+    role,
+    cliBinding: bindings.get(fw.role.toLowerCase()),
+    phasePin: hasPin ? { provider: fw.provider, model: fw.model } : undefined,
+    config: opts.modelConfig,
+  });
+  const label = `phase "${def.id}" fix leg (role "${fw.role}")`;
+  const unbound = (): PhaseDef => ({ ...def, findings: { ...spec, fixWith: { role: fw.role } } });
+  if (resolved.resolvedFrom === "default") {
+    if (role?.tier !== undefined && !warnedTiers.has(role.tier)) {
+      warnedTiers.add(role.tier);
+      warn(`role "${fw.role}" declares tier "${role.tier}" but no modelTiers mapping exists — using the provider default`);
+    }
+    return unbound();
+  }
+  if (resolved.provider !== undefined && opts.sessionProvider !== undefined && resolved.provider !== opts.sessionProvider) {
+    warn(
+      `${label}: the ${resolved.resolvedFrom} binding targets provider "${resolved.provider}" but this run's session is bound to "${opts.sessionProvider}" — a run drives one session on one backend; skipping the binding (using the session's model)`,
+    );
+    return unbound();
+  }
+  if (resolved.model !== undefined) {
+    const target = resolved.provider ?? opts.sessionProvider;
+    if (resolveModelIdForProvider(resolved.model, target) === null) {
+      warn(
+        `${label}: the ${resolved.resolvedFrom} binding's model "${resolved.model}" is not valid for provider "${target ?? "claude"}" — skipping the binding (using the session's model)`,
+      );
+      return unbound();
+    }
+  }
+  return {
+    ...def,
+    findings: {
+      ...spec,
+      fixWith: {
+        role: fw.role,
+        resolvedFrom: resolved.resolvedFrom,
+        ...(resolved.provider !== undefined ? { provider: resolved.provider } : {}),
+        ...(resolved.model !== undefined ? { model: resolved.model } : {}),
+      },
+    },
+  };
+}
+
 export interface CreatePipelineOpts {
   name: string;
   /** Explicit phase plan, OR provide `pack` to use an installed pack's pipeline. */
@@ -364,7 +430,7 @@ export class PipelineManager {
       delete clean.resolvedFrom;
       return clean;
     };
-    return phases.map((def) => {
+    const bound = phases.map((def) => {
       const role = def.role !== undefined ? pack?.roles?.[def.role] : undefined;
       const hasPin = def.provider !== undefined || def.model !== undefined;
       const resolved = resolveBinding({
@@ -426,6 +492,10 @@ export class PipelineManager {
       else delete bound.model;
       return bound;
     });
+    // The findings loop's fix legs run under their own role (findings.ts), so
+    // they get their own binding through the same six rungs and the same skip
+    // rules — resolved here, once, and persisted on the def like the phase's.
+    return bound.map((def) => bindFixWith(def, pack, bindings, opts, warn, warnedTiers));
   }
 
   /** `packId` scopes gate/skill lookups to the pack the plan came from
@@ -454,6 +524,9 @@ export class PipelineManager {
       }
       if (p.entryGate && !hasScoped(this.#registries.gates, packId, p.entryGate)) {
         throw new Error(`phase "${p.id}": ${unknown("entry gate", this.#registries.gates, p.entryGate)}`);
+      }
+      if (p.findings?.gate && !hasScoped(this.#registries.gates, packId, p.findings.gate)) {
+        throw new Error(`phase "${p.id}": ${unknown("findings fix gate", this.#registries.gates, p.findings.gate)}`);
       }
       if (p.kind === "skill") {
         if (!p.skill) throw new Error(`phase "${p.id}": kind "skill" requires a skill id`);

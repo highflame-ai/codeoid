@@ -13,7 +13,12 @@ import { resolveScoped } from "./scoped";
 /** Compose a phase's prompt: the skill command/template, the run's goal, and —
  *  on a revise re-run — the phase's prior output + the accumulated human
  *  feedback so the agent re-iterates on the same phase (docs/pipeline-run.md). */
-function composePhasePrompt(base: string, spec: string | undefined, phase: PipelinePhase | undefined): string {
+function composePhasePrompt(
+  base: string,
+  spec: string | undefined,
+  phase: PipelinePhase | undefined,
+  append?: string,
+): string {
   const parts = [base];
   if (spec) {
     // Frame the overall goal as CONTEXT, and scope the model to THIS phase's
@@ -32,6 +37,10 @@ function composePhasePrompt(base: string, spec: string | undefined, phase: Pipel
     if (phase?.lastSummary) parts.push(`## Your previous output for this phase\n${phase.lastSummary}`);
     parts.push(`## Reviewer feedback — revise this phase accordingly\n${feedback.map((f, i) => `${i + 1}. ${f}`).join("\n")}`);
   }
+  // Engine contracts (the findings loop) go LAST so they sit right above the
+  // completion marker the host appends — the model reads them as the final
+  // instruction on how to end its report.
+  if (append) parts.push(append);
   return parts.join("\n\n");
 }
 
@@ -74,7 +83,10 @@ async function runSkill(
     };
   }
   const base = skill.kind === "slash" ? skill.command : skill.template;
-  const prompt = composePhasePrompt(base, ctx.pipeline.spec, ctx.pipeline.phases[ctx.pipeline.cursor]);
+  // A fix leg (freshPrompt) is a different actor from the phase's reviewer: it
+  // must not inherit the reviewer's prior output or the human's revise notes.
+  const current = ctx.freshPrompt ? undefined : ctx.pipeline.phases[ctx.pipeline.cursor];
+  const prompt = composePhasePrompt(base, ctx.pipeline.spec, current, ctx.promptAppend);
   const res = await runner.runPrompt({
     prompt,
     provider: ctx.phase.provider,
