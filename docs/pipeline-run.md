@@ -70,9 +70,10 @@ The only thing it saves is one auto-attach, which the client does for free.
 - **Phase boundaries are the human checkpoint.**
   With you present and Approving every boundary, the honest model is: *you* are the reviewer.
   The misleading "gate … is not yet enforced" halt goes away — a boundary reads "phase *N* ready — review the chat above."
-- **`skill` / `review` gates become optional automated verdicts (later slice).**
-  When we do implement them, a gate runs a validation subagent that returns pass/fail (e.g. a spec-completeness check, a reviewer pass), shown alongside the human decision — an *assist*, never a silent pass.
-  Until then they are simply absent, not fake.
+- **`review` gates have a real verdict on a phase that declares `findings:`** — the findings loop (docs/findings-loop.md): the reviewer's structured findings drive a fix leg under a write-capable role and a re-review, and the gate fails while a blocking finding is still open, with the ledger as its reason.
+  On a phase without `findings:` a `review` gate behaves as before (passes; the human is the reviewer).
+- **`skill` gates remain optional automated verdicts (later slice).**
+  Until implemented they are simply absent, not fake.
 
 ---
 
@@ -137,7 +138,7 @@ Full hard enforcement on the other backends (mapping their native tool names, or
    `/pipeline` opens the extended create-session dialog (name · workdir · provider · **goal** · **installed pack**); on submit, focus the run-session.
    Chat-primary layout, a non-modal collapsible cockpit dock over the run's chat.
    (Retires the `#217` bespoke "Start panel".)
-4. **S4 (optional, later) — automated skill/review gate verdicts** via validation subagents, shown as an assist.
+4. **S4 — automated review gate verdicts.** ✅ for `review` gates, via the findings loop (docs/findings-loop.md): structured findings → validated dispositions from a write-capable fix leg → re-review; the gate's verdict is "no blocking finding open". `skill` gates remain future work.
 
 ## Open questions
 

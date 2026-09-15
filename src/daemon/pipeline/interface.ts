@@ -9,6 +9,7 @@
  */
 
 import type { ResolvedFrom, RoleModelSource } from "./binding";
+import type { FindingsLoopState, FindingsSpec } from "./findings";
 
 // ── Phase definition (the static plan) ────────────────────────────────────
 
@@ -71,6 +72,11 @@ export interface PhaseDef {
   writes?: string;
   /** failure policy for this phase. Defaults to `{ action: "halt" }`. */
   onFail?: PhaseFailAction;
+  /** This phase produces FINDINGS and the engine runs the fix-and-re-review
+   *  loop for them (findings.ts): a fix leg under `findings.fixWith.role`
+   *  answers each blocking finding with an engine-validated disposition, then
+   *  this phase re-runs to verify. The phase's own role stays read-only. */
+  findings?: FindingsSpec;
 }
 
 // ── Phase + pipeline runtime state ────────────────────────────────────────
@@ -114,6 +120,9 @@ export interface PipelinePhase {
   /** The phase's most recent run output — kept so a revise re-run can show the
    *  agent its prior attempt (a halt otherwise drops the summary). */
   lastSummary?: string;
+  /** The findings loop's persisted state (rounds, dispositions, what runs
+   *  next) — present only for a phase that declares `def.findings`. */
+  findings?: FindingsLoopState;
 }
 
 /** The full, daemon-owned pipeline state — the source of truth persisted per
@@ -172,6 +181,12 @@ export interface PhaseCtx {
   pipeline: PipelineState;
   phase: PhaseDef;
   registries: PipelineRegistries;
+  /** Engine-supplied text appended to the composed prompt — the findings
+   *  loop's contracts (findings.ts). Absent for an ordinary phase run. */
+  promptAppend?: string;
+  /** When true, the prompt omits the phase's prior output + human revise notes
+   *  (a fix leg is a different actor from the reviewer whose phase it serves). */
+  freshPrompt?: boolean;
 }
 
 export type PhaseRunResult =

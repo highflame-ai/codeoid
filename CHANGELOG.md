@@ -46,6 +46,33 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ignore the plugin dirs, as they already ignore pack subagents.
   (docs/pack-loading.md §3a)
 
+- **The findings loop: review → fix → re-review, in the engine, with the roles
+  left exactly as they are** (docs/findings-loop.md). A read-only review phase
+  had no way to get its findings acted on: the pipeline had no backward edge,
+  so the only exits were "approve anyway" or "re-run the reviewer, who still
+  cannot edit" — and the model would ask to be re-run under a write-capable
+  role, the one thing the role model exists to prevent. A phase now declares
+  `findings: { fixWith: <write-capable role>, blocking?, maxRounds?, gate? }`
+  and the engine does the rest: the reviewer's report must end with a fenced
+  `findings` block (JSON; a missing block is a format failure with one bounded
+  retry); any blocking finding runs a fix leg on the same session under
+  `fixWith`'s role, whose report must end with a `dispositions` block — every
+  blocking finding answered as fixed / not_a_finding / declined / deferred, a
+  reason required unless fixed, validated by the engine, never trusted from
+  prose; an optional fix gate (`tests_pass`) runs on the fix leg; then the
+  reviewer runs again with the ledger and names what remains open. Bounded by
+  `maxRounds`; blocking findings left open fail the boundary with the ledger.
+  `review`-kind gates finally have a real verdict (S4), the fix leg gets its
+  own model binding through the usual rungs, every leg is one persisted engine
+  step (restart-safe), and the pipeline wire / `codeoid pipeline status` show
+  the counts and the ledger. `maxRounds: 0` makes a pure audit phase. On a
+  findings phase `onFail: retry` means another fix loop (fresh fix budget),
+  a failing fix gate repairs the same fix leg once before the phase's onFail
+  applies, the loop's own legs skip the phase's entry gate, and the loader
+  refuses shapes that cannot mean what they say (a read-only fixer,
+  `skipWhenSatisfied`, a review-kind entry or fix gate). Findings loops
+  require a pack; an explicit-`phases` plan cannot declare one.
+
 ### Fixed
 
 - **Two installed packs declaring the same skill or gate id overwrote each

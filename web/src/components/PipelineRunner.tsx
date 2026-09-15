@@ -385,8 +385,20 @@ const HaltCard: Component<{
         </Show>
       </div>
 
+      {/* A findings-loop halt reason carries a multi-line markdown ledger —
+          keep its line breaks so the table doesn't collapse into one run-on
+          line of pipes. */}
       <Show when={props.phase.reason}>
-        <p class="mt-2 text-[12px] text-fg-muted">{props.phase.reason}</p>
+        <p class="mt-2 whitespace-pre-wrap text-[12px] text-fg-muted">{props.phase.reason}</p>
+      </Show>
+
+      <Show when={props.phase.findings}>
+        {(f) => (
+          <p class="mt-1 text-[11px] text-fg-muted">
+            findings: {f().open} open ({f().blocking} blocking) · {f().rounds} review round
+            {f().rounds === 1 ? "" : "s"} · {f().fixLegs} fix leg{f().fixLegs === 1 ? "" : "s"}
+          </p>
+        )}
       </Show>
 
       <Show when={props.phase.summary}>
