@@ -139,8 +139,31 @@ describe("contracts", () => {
     loop.rounds.push({ findings: [F1], dispositions: [{ id: "F1", disposition: "fixed" }] });
     const c = rereviewContract(loop, SPEC);
     expect(c).toContain("Review round 2");
+    expect(c).toContain("A writer responded to your previous findings");
     expect(c).toContain("| F1 | high |");
     expect(c).toContain("ONLY what remains open");
+    // No fix leg ran (audit-only, budget spent, a leg that never committed):
+    // say so rather than claiming a writer responded.
+    const audit = newLoopState();
+    audit.rounds.push({ findings: [F1] });
+    expect(rereviewContract(audit, SPEC)).toContain("No fix leg ran since your previous findings");
+  });
+
+  test("summarizeLoop counts a finding fixed, re-raised, and fixed again once — and never while it is still open", () => {
+    const loop = newLoopState();
+    loop.rounds.push({ findings: [F1], dispositions: [{ id: "F1", disposition: "fixed" }] });
+    loop.rounds.push({ findings: [F1], dispositions: [{ id: "F1", disposition: "fixed" }] }); // re-raised, fixed again
+    loop.fixLegs = 2;
+    expect(summarizeLoop(loop, SPEC)).toContain("1 finding open (1 blocking), 0 fixed"); // still open
+    loop.rounds.push({ findings: [] });
+    expect(summarizeLoop(loop, SPEC)).toContain("0 findings open (0 blocking), 1 fixed");
+  });
+
+  test("the fix contract carries the human's revise notes", () => {
+    const c = fixContract({ findings: [F1] }, SPEC, undefined, ["use a guard clause", "no new deps"]);
+    expect(c).toContain("## Notes from the human (revise)");
+    expect(c).toContain("1. use a guard clause");
+    expect(c).toContain("2. no new deps");
   });
 
   test("the fix contract lists findings, marks blocking, and carries format feedback on a retry", () => {
@@ -148,6 +171,6 @@ describe("contracts", () => {
     expect(c).toContain("**F1** [high, blocking]");
     expect(c).toContain("**F2** [low]");
     expect(c).toContain("```dispositions");
-    expect(c).toContain("did not satisfy the contract");
+    expect(c).toContain('Engine note on your previous attempt: blocking finding "F1" (high) has no disposition');
   });
 });

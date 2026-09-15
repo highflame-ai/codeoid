@@ -171,4 +171,52 @@ describe("findings: on a pack phase", () => {
     expect(warnings.join("\n")).toContain('fix leg (role "implementer")');
     expect(warnings.join("\n")).toContain('targets provider "codex"');
   });
+
+  test("shapes that cannot mean what they say are refused at load", () => {
+    // A findings phase always runs — skipWhenSatisfied would skip the review.
+    expect(() =>
+      loadPack(
+        writePack(
+          MANIFEST(
+            "  - { id: review, skill: review, role: reviewer, gate: bench_clear, skipWhenSatisfied: true, findings: { fixWith: implementer } }",
+          ),
+        ),
+      ),
+    ).toThrow(/skipWhenSatisfied is not allowed/);
+    // A review gate is the loop's EXIT verdict; at entry it would block every revise.
+    expect(() =>
+      loadPack(
+        writePack(
+          MANIFEST("  - { id: review, skill: review, role: reviewer, entryGate: bench_clear, findings: { fixWith: implementer } }"),
+        ),
+      ),
+    ).toThrow(/entryGate "bench_clear" is a review gate/);
+    // The fix gate must be deterministic — a review-kind fix gate always fails.
+    expect(() =>
+      loadPack(
+        writePack(
+          MANIFEST("  - { id: review, skill: review, role: reviewer, findings: { fixWith: implementer, gate: bench_clear } }"),
+        ),
+      ),
+    ).toThrow(/findings.gate "bench_clear" is a review gate/);
+  });
+
+  test("an explicit-phases plan cannot declare a findings loop (no pack, no role check)", () => {
+    const mgr = new PipelineManager(new PipelineStore(new Database(":memory:")));
+    mgr.registries.skills.register({ id: "review", kind: "prompt", template: "x" });
+    expect(() =>
+      mgr.create({
+        ...tenant,
+        name: "r",
+        phases: [
+          {
+            id: "review",
+            kind: "skill",
+            skill: "review",
+            findings: { fixWith: { role: "anything" }, blocking: [], maxRounds: 1_000_000 },
+          },
+        ],
+      }),
+    ).toThrow(/findings loops require a pack/);
+  });
 });

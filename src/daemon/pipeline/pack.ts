@@ -293,6 +293,7 @@ export function loadPack(dir: string, opts: LoadPackOptions = {}): LoadedPack {
   const skillIds = new Set(skills.map((s) => s.id));
 
   const gates: GatePlugin[] = m.gates.map((g) => buildGate(g, dir, opts.trusted ?? false));
+  const gateKinds = new Map(m.gates.map((g) => [g.id, g.kind] as const));
 
   const seen = new Set<string>();
   const pipeline: PhaseDef[] = m.phases.map((p) => {
@@ -317,7 +318,7 @@ export function loadPack(dir: string, opts: LoadPackOptions = {}): LoadedPack {
     if (p.skipWhenSatisfied) def.skipWhenSatisfied = true;
     const onFail = toOnFail(p.onFail);
     if (onFail) def.onFail = onFail;
-    if (p.findings) def.findings = toFindingsSpec(m.id, p.id, p.findings, roles);
+    if (p.findings) def.findings = toFindingsSpec(m.id, p, roles, gateKinds);
     return def;
   });
 
@@ -348,10 +349,12 @@ export function loadPack(dir: string, opts: LoadPackOptions = {}): LoadedPack {
  *  problem this feature exists to remove. */
 function toFindingsSpec(
   packId: string,
-  phaseId: string,
-  f: NonNullable<PackManifest["phases"][number]["findings"]>,
+  p: PackManifest["phases"][number],
   roles: Record<string, RoleDef>,
+  gateKinds: ReadonlyMap<string, string>,
 ): FindingsSpec {
+  const phaseId = p.id;
+  const f = p.findings!;
   const fw = typeof f.fixWith === "string" ? { role: f.fixWith } : f.fixWith;
   const role = roles[fw.role];
   if (!role) {
@@ -361,6 +364,25 @@ function toFindingsSpec(
     throw new Error(
       `pack "${packId}": phase "${phaseId}" findings.fixWith role "${fw.role}" is read-only (write: false) — the fix leg must run under a write-capable role`,
     );
+  }
+  // Shapes that cannot mean what they say on a findings phase — refused at
+  // load rather than discovered as a run that skips its review or can never
+  // be revised out of a halt.
+  if (p.skipWhenSatisfied) {
+    throw new Error(`pack "${packId}": phase "${phaseId}" declares findings — it always runs; skipWhenSatisfied is not allowed`);
+  }
+  if (p.entryGate && gateKinds.get(p.entryGate) === "review") {
+    throw new Error(
+      `pack "${packId}": phase "${phaseId}" entryGate "${p.entryGate}" is a review gate — a review gate is the findings loop's EXIT verdict and cannot ground entry`,
+    );
+  }
+  if (f.gate) {
+    const kind = gateKinds.get(f.gate);
+    if (kind !== undefined && kind !== "command" && kind !== "probe") {
+      throw new Error(
+        `pack "${packId}": phase "${phaseId}" findings.gate "${f.gate}" is a ${kind} gate — the fix gate must be deterministic (command or probe)`,
+      );
+    }
   }
   const spec: FindingsSpec = {
     fixWith: {

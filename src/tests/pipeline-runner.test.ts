@@ -303,6 +303,48 @@ describe("pipeline runtime (real SessionManager + mock backend)", () => {
     const ph = out.pipeline.phases[0];
     expect(ph.status).toBe("halted");
     expect(ph.summary).toContain("implemented the feature");
+    // The summary is the WHOLE of what the model said across the leg's turns,
+    // not only the last one — the pre-nudge report is kept too.
+    expect(ph.summary).toContain("Here's my plan");
+    expect(ph.summary ?? "").not.toContain(PHASE_COMPLETE_MARKER);
+    await m2.drain(3_000);
+  });
+
+  test("a report followed by a bare-marker turn after the nudge keeps the report as the summary", async () => {
+    // The findings loop depends on this: a reviewer writes its report (with the
+    // ```findings block), rests without the marker, is nudged, and answers with
+    // nothing but the marker. The block must survive into the phase summary.
+    const store2 = new Store(join(tmp, "codeoid-bare-marker.db"));
+    const m2 = new SessionManager(store2, transcript, undefined, undefined, undefined, {
+      config: mkConfig(join(tmp, "codeoid-bare-marker.db"), true),
+      _testProviderFactory: () =>
+        new MockSessionProvider("mock", [
+          sayTurn('review report\n\n```findings\n[{"id":"F1","severity":"high","title":"nil deref"}]\n```'),
+          sayTurn(PHASE_COMPLETE_MARKER),
+        ]),
+    });
+    const pm = m2.pipelines;
+    expect(pm).toBeDefined();
+    if (!pm) return;
+    pm.registries.skills.register({ id: "impl", kind: "slash", command: "/impl" });
+    const created = await m2.handle(
+      {
+        type: "pipeline.create",
+        id: "1",
+        name: "R",
+        workdir: join(tmp, "repo"),
+        phases: [{ id: "impl", kind: "skill", skill: "impl" }],
+      },
+      AUTH,
+      CLIENT,
+    );
+    if (created.type !== "pipeline.snapshot") throw new Error(`create failed: ${JSON.stringify(created)}`);
+    const out = await m2.handle({ type: "pipeline.advance", id: "2", pipelineId: created.pipeline.id }, AUTH, CLIENT);
+    if (out.type !== "pipeline.snapshot") throw new Error(`advance failed: ${JSON.stringify(out)}`);
+    expect(out.pipeline.status).toBe("halted");
+    const ph = out.pipeline.phases[0];
+    expect(ph.summary).toContain("```findings");
+    expect(ph.summary).toContain('"id":"F1"');
     expect(ph.summary ?? "").not.toContain(PHASE_COMPLETE_MARKER);
     await m2.drain(3_000);
   });

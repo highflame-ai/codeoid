@@ -164,7 +164,7 @@ describe("findings loop — review → fix → re-review", () => {
     const out = await new PipelineEngine(regs(ok.runner)).run(pipeline([reviewPhase(spec())]));
     expect(ok.calls).toHaveLength(4);
     expect(ok.calls[2]!.phase.id).toBe("review#fix1"); // same leg, retried
-    expect(ok.calls[2]!.prompt).toContain("did not satisfy the contract — no ```dispositions block");
+    expect(ok.calls[2]!.prompt).toContain("Engine note on your previous attempt: no ```dispositions block");
     expect(out.status).toBe("halted");
     expect(out.phases[0]!.findings?.fixLegs).toBe(1);
 
@@ -186,7 +186,7 @@ describe("findings loop — review → fix → re-review", () => {
     const ok = scripted(["looks fine to me", fb([])]);
     const out = await new PipelineEngine(regs(ok.runner)).run(pipeline([reviewPhase(spec())]));
     expect(ok.calls).toHaveLength(2);
-    expect(ok.calls[1]!.prompt).toContain("did not satisfy the contract — no ```findings block");
+    expect(ok.calls[1]!.prompt).toContain("Engine note on your previous attempt: no ```findings block");
     expect(ok.calls[1]!.phase.role).toBe("reviewer");
     expect(out.status).toBe("halted");
     expect(out.phases[0]!.findings?.rounds).toHaveLength(1);
@@ -199,13 +199,104 @@ describe("findings loop — review → fix → re-review", () => {
     if (st.status === "halted") expect(st.reason).toContain("produced no valid findings block");
   });
 
-  test("a fix gate (e.g. tests) that fails after the fix leg halts the phase with that reason", async () => {
-    const { runner, calls } = scripted([fb([F1]), db([{ id: "F1", disposition: "fixed" }])]);
+  test("a failing fix gate repairs the SAME fix leg once (the leg does not count), then halts with the ledger", async () => {
+    // `manual` never passes, so the repair also fails → halt. The leg never
+    // committed: fixLegs stays 0 and the reviewer is never handed a red tree.
+    const { runner, calls } = scripted([fb([F1]), db([{ id: "F1", disposition: "fixed" }]), db([{ id: "F1", disposition: "fixed" }])]);
     const out = await new PipelineEngine(regs(runner)).run(pipeline([reviewPhase(spec({ gate: "manual" }))]));
-    expect(calls).toHaveLength(2); // no re-review: the fixer broke the gate
+    expect(calls).toHaveLength(3);
+    expect(calls[2]!.phase.id).toBe("review#fix1"); // the same leg, repaired
+    expect(calls[2]!.prompt).toContain('Engine note on your previous attempt: fix gate "manual" failed');
+    expect(out.status).toBe("halted");
+    const ph = out.phases[0]!;
+    expect(ph.findings?.fixLegs).toBe(0);
+    expect(ph.findings?.rounds[0]!.dispositions).toBeUndefined();
+    expect(ph.findings?.next).toBe("review"); // a human Revise re-enters at the reviewer
+    if (ph.state.status === "halted") {
+      expect(ph.state.reason).toContain('fix leg "review#fix1" — fix gate "manual" failed');
+      expect(ph.state.reason).toContain("| F1 | high |");
+    }
+  });
+
+  test("a failing fix gate that the repair fixes counts the leg once and continues to the re-review", async () => {
+    // A gate that fails the first evaluation and passes the second.
+    let evals = 0;
+    const flaky = {
+      id: "flaky",
+      at: "exit" as const,
+      async evaluate() {
+        evals += 1;
+        return evals === 1 ? { pass: false, reason: "2 tests failed" } : { pass: true };
+      },
+    };
+    const { runner, calls } = scripted([fb([F1]), db([{ id: "F1", disposition: "fixed" }]), db([{ id: "F1", disposition: "fixed", evidence: "green now" }]), fb([])]);
+    const r = regs(runner);
+    r.gates.register(flaky);
+    const out = await new PipelineEngine(r).run(pipeline([reviewPhase(spec({ gate: "flaky" }))]));
+    expect(calls.map((c) => c.phase.id)).toEqual(["review", "review#fix1", "review#fix1", "review"]);
+    expect(out.status).toBe("halted");
+    expect(out.phases[0]!.findings?.fixLegs).toBe(1);
+    expect(out.phases[0]!.findings?.rounds[0]!.dispositions?.[0]?.evidence).toBe("green now");
+  });
+
+  test("onFail: retry on a findings phase is ANOTHER FIX LOOP — fresh budget, straight to a fix leg, nothing pasted into the human's revise notes", async () => {
+    const { runner, calls } = scripted([
+      fb([F1]), // round 1
+      db([{ id: "F1", disposition: "declined", reason: "by design" }]), // fix leg 1 (budget 1)
+      fb([F1]), // round 2: still open → budget spent → boundary fails → retry
+      db([{ id: "F1", disposition: "fixed" }]), // retry = fresh loop: fix leg first, not the reviewer
+      fb([]), // round 3: clean
+    ]);
+    const out = await new PipelineEngine(regs(runner)).run(
+      pipeline([reviewPhase(spec({ maxRounds: 1 }), { onFail: { action: "retry", max: 2 } })]),
+    );
+    expect(calls.map((c) => c.phase.id)).toEqual(["review", "review#fix1", "review", "review#fix1", "review"]);
+    expect(calls[3]!.prompt).toContain("Engine note on your previous attempt: 1 blocking finding still open");
+    expect(out.status).toBe("halted");
+    const ph = out.phases[0]!;
+    expect(ph.feedback).toBeUndefined(); // the revise channel is the human's
+    if (ph.state.status === "halted") expect(ph.state.reason).toContain("review and approve");
+    // Budget exhausted with blockers still open → failed, as retry semantics demand.
+    const stuck = scripted([fb([F1]), db([{ id: "F1", disposition: "declined", reason: "no" }]), fb([F1]), db([{ id: "F1", disposition: "declined", reason: "no" }]), fb([F1])]);
+    const failed = await new PipelineEngine(regs(stuck.runner)).run(
+      pipeline([reviewPhase(spec({ maxRounds: 1 }), { onFail: { action: "retry", max: 2 } })]),
+    );
+    expect(failed.status).toBe("failed");
+  });
+
+  test("the human's revise notes reach the fixer, and the gate-failure halt keeps the loop summary", async () => {
+    const { runner, calls } = scripted([fb([F1]), db([{ id: "F1", disposition: "fixed" }]), fb([])]);
+    const p = pipeline([reviewPhase(spec(), { gate: "manual" })]);
+    p.phases[0]!.feedback = ["fix F1 with a guard clause, not a try/catch"];
+    const out = await new PipelineEngine(regs(runner)).run(p);
+    expect(calls[1]!.prompt).toContain("## Notes from the human (revise)");
+    expect(calls[1]!.prompt).toContain("guard clause");
+    // Loop clean, but the phase's own `manual` gate fails → halt, and the
+    // reason still carries the loop's one-line summary.
     expect(out.status).toBe("halted");
     const st = out.phases[0]!.state;
-    if (st.status === "halted") expect(st.reason).toContain('fix leg "review#fix1" failed gate "manual"');
+    if (st.status === "halted") {
+      expect(st.reason).toContain("0 findings open (0 blocking), 1 fixed");
+      expect(st.reason).toContain("gate not satisfied");
+    }
+  });
+
+  test("the phase's entry gate grounds the phase run once, not every leg of the loop", async () => {
+    let entries = 0;
+    const counting = {
+      id: "counting",
+      at: "entry" as const,
+      async evaluate() {
+        entries += 1;
+        return { pass: true };
+      },
+    };
+    const { runner } = scripted(["no block", fb([F1]), "no dispositions", db([{ id: "F1", disposition: "fixed" }]), fb([])]);
+    const r = regs(runner);
+    r.gates.register(counting);
+    const out = await new PipelineEngine(r).run(pipeline([reviewPhase(spec(), { entryGate: "counting" })]));
+    expect(out.status).toBe("halted");
+    expect(entries).toBe(1); // review retry, fix leg, fix repair, re-review: all loop legs
   });
 
   test("each leg is one step, and the loop survives a serialize/parse round-trip between legs (restart-safe)", async () => {

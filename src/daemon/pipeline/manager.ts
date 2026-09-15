@@ -525,6 +525,14 @@ export class PipelineManager {
       if (p.entryGate && !hasScoped(this.#registries.gates, packId, p.entryGate)) {
         throw new Error(`phase "${p.id}": ${unknown("entry gate", this.#registries.gates, p.entryGate)}`);
       }
+      if (p.findings && !packId) {
+        // The loop's fix legs run under a PACK role (fixWith) and the loader is
+        // what checks that role is write-capable; an explicit plan has neither,
+        // so its `findings` would run reviewer and fixer with no role at all.
+        throw new Error(
+          `phase "${p.id}": findings loops require a pack (fixWith names a pack role) — create the run with \`pack\``,
+        );
+      }
       if (p.findings?.gate && !hasScoped(this.#registries.gates, packId, p.findings.gate)) {
         throw new Error(`phase "${p.id}": ${unknown("findings fix gate", this.#registries.gates, p.findings.gate)}`);
       }

@@ -64,8 +64,14 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `maxRounds`; blocking findings left open fail the boundary with the ledger.
   `review`-kind gates finally have a real verdict (S4), the fix leg gets its
   own model binding through the usual rungs, every leg is one persisted engine
-  step (restart-safe), and `pipeline.pack.list` / `codeoid pipeline status`
-  show the counts. `maxRounds: 0` makes a pure audit phase.
+  step (restart-safe), and the pipeline wire / `codeoid pipeline status` show
+  the counts and the ledger. `maxRounds: 0` makes a pure audit phase. On a
+  findings phase `onFail: retry` means another fix loop (fresh fix budget),
+  a failing fix gate repairs the same fix leg once before the phase's onFail
+  applies, the loop's own legs skip the phase's entry gate, and the loader
+  refuses shapes that cannot mean what they say (a read-only fixer,
+  `skipWhenSatisfied`, a review-kind entry or fix gate). Findings loops
+  require a pack; an explicit-`phases` plan cannot declare one.
 
 ### Fixed
 

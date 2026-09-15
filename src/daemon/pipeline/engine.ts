@@ -111,16 +111,22 @@ export class PipelineEngine {
       }
     }
 
+    // The findings loop's state (findings.ts), when this phase runs it.
+    const spec = phase.def.findings;
+    if (spec && !phase.findings) phase.findings = newLoopState();
+    const loop = spec ? phase.findings : undefined;
+    // A leg the LOOP dispatched (a fix leg, the re-review right after it, or a
+    // format retry) is not "the phase acting" again — the entry gate is a
+    // grounding probe for a phase run, not for every turn inside the loop.
+    const loopLeg = loop !== undefined && (loop.next === "fix" || loop.rereview === true || loop.formatRetries > 0);
+
     // Entry (grounding) gate — read-only probe before the phase acts (§5a.3).
-    if (phase.def.entryGate) {
+    if (phase.def.entryGate && !loopLeg) {
       const v = await this.#gate(phase.def.entryGate, s, phase.def, "entry");
       if (!v.pass) return applyFail(s, phase, v, attempts, "entry");
     }
 
     // ── Findings loop: a pending FIX LEG runs instead of the phase's own kind.
-    const spec = phase.def.findings;
-    if (spec && !phase.findings) phase.findings = newLoopState();
-    const loop = spec ? phase.findings : undefined;
     if (spec && loop && loop.next === "fix") {
       return this.#fixLeg(s, phase, spec, loop, attempts);
     }
@@ -130,14 +136,12 @@ export class PipelineEngine {
     // throw is treated as a phase failure, then handled by the onFail policy.
     // For a findings phase this is a REVIEW LEG: the first one carries the
     // findings contract, every later one the ledger + re-review contract, and
-    // a format retry carries the exact gap on top.
+    // a retry carries the engine's note on the previous attempt on top.
     const reviewAppend =
       spec && loop
         ? [
             loop.rounds.length === 0 ? findingsContract(spec) : rereviewContract(loop, spec),
-            ...(loop.formatFeedback
-              ? [`\nYour previous report did not satisfy the contract — ${loop.formatFeedback}. Report again.`]
-              : []),
+            ...(loop.formatFeedback ? [`\nEngine note on your previous attempt: ${loop.formatFeedback}\nAddress it and report again.`] : []),
           ].join("\n")
         : undefined;
     const res = await this.#runKind(s, phase.def, reviewAppend ? { promptAppend: reviewAppend } : {});
@@ -163,6 +167,7 @@ export class PipelineEngine {
 
     // ── Findings loop: record the round; dispatch a fix leg if anything blocks.
     if (spec && loop) {
+      loop.rereview = false; // this leg consumed the post-fix re-review
       const parsed = parseFindings(res.summary ?? "");
       if (!parsed.ok) {
         // A report without a valid block is a FORMAT failure, not a verdict:
@@ -173,14 +178,13 @@ export class PipelineEngine {
           loop.formatFeedback = parsed.reason;
           return touch(s);
         }
-        loop.formatRetries = 0;
-        loop.formatFeedback = undefined;
-        return applyFail(
+        return this.#findingsFail(
           s,
           phase,
-          { pass: false, reason: `phase "${phase.def.id}" produced no valid findings block: ${parsed.reason}` },
+          spec,
+          loop,
           attempts,
-          "exit",
+          `phase "${phase.def.id}" produced no valid findings block: ${parsed.reason}`,
         );
       }
       loop.formatRetries = 0;
@@ -210,20 +214,25 @@ export class PipelineEngine {
     let gateReason: string | undefined;
     let verdict: GateVerdict = { pass: true };
     if (phase.def.gate) verdict = await this.#gate(phase.def.gate, s, phase.def, "exit");
-    if (verdict.pass && spec && loop) {
+    const openBlockers = spec && loop ? openBlocking(loop, spec) : [];
+    if (verdict.pass && spec && loop && openBlockers.length > 0) {
       // No gate (or a passing one) but blocking findings are still open — the
       // loop's own verdict fails the boundary, ledger attached, whether or not
       // the pack declared a `review` gate.
-      const open = openBlocking(loop, spec);
-      if (open.length > 0) {
-        verdict = {
-          pass: false,
-          reason: `${open.length} blocking finding${open.length === 1 ? "" : "s"} still open after ${loop.fixLegs} fix leg${loop.fixLegs === 1 ? "" : "s"}:\n${renderLedger(loop, spec)}`,
-        };
-      }
+      verdict = {
+        pass: false,
+        reason: `${openBlockers.length} blocking finding${openBlockers.length === 1 ? "" : "s"} still open after ${loop.fixLegs} fix leg${loop.fixLegs === 1 ? "" : "s"}:\n${renderLedger(loop, spec)}`,
+      };
     }
     if (!verdict.pass) {
       const onFail = phase.def.onFail ?? { action: "halt" };
+      // A findings phase whose boundary fails on OPEN BLOCKERS: `retry` means
+      // "another fix loop" (fresh fix budget, straight to a fix leg — the
+      // reviewer already spoke), never "re-run the read-only reviewer with the
+      // ledger pasted into its revise notes". `abort` fails as usual.
+      if (spec && loop && openBlockers.length > 0 && (onFail.action === "retry" || onFail.action === "abort")) {
+        return this.#findingsFail(s, phase, spec, loop, attempts, verdict.reason ?? "blocking findings open");
+      }
       // A machine retry/abort short-circuits the human boundary.
       if (onFail.action === "retry" || onFail.action === "abort") {
         return applyFail(s, phase, verdict, attempts, "exit");
@@ -231,13 +240,14 @@ export class PipelineEngine {
       gateReason = verdict.reason ?? "gate check failed";
     }
 
-    // The phase's work is done (kept in lastSummary); halt for the human.
+    // The phase's work is done (kept in lastSummary); halt for the human. A
+    // findings phase carries the loop's one-line summary in both branches.
     const ledger = spec && loop ? ` — ${summarizeLoop(loop, spec)}` : "";
     phase.state = {
       status: "halted",
       requestId: `exit:${phase.def.id}`,
       reason: gateReason
-        ? `phase "${phase.def.id}" complete — gate not satisfied: ${gateReason}`
+        ? `phase "${phase.def.id}" complete${ledger} — gate not satisfied: ${gateReason}`
         : `phase "${phase.def.id}" complete${ledger} — review and approve`,
     };
     s.status = "halted";
@@ -274,9 +284,11 @@ export class PipelineEngine {
    * One FIX LEG of the findings loop: run the built-in `findings-fix` skill on
    * the same bound session under the phase's `fixWith` role (the runner swaps
    * the role per leg exactly as it swaps it per phase), parse + validate the
-   * dispositions the engine demanded, run the optional fix gate, and hand the
-   * phase back to a review leg. Format gaps get one bounded retry with the
-   * exact gap; a gap after that halts the phase with the ledger.
+   * dispositions the engine demanded, run the optional fix gate, and only THEN
+   * commit the leg and hand the phase back to a review leg. A format gap or a
+   * failing fix gate gets one bounded repair of the SAME leg with the exact
+   * problem fed back; a problem after that goes to the phase's onFail policy
+   * with the ledger — never to the reviewer with a red tree.
    */
   async #fixLeg(
     s: PipelineState,
@@ -301,8 +313,10 @@ export class PipelineEngine {
       ...(spec.fixWith.model !== undefined ? { model: spec.fixWith.model } : {}),
       ...(spec.fixWith.resolvedFrom !== undefined ? { resolvedFrom: spec.fixWith.resolvedFrom } : {}),
     };
+    // The human's revise notes reach the fixer too — "fix F3 this way" is for
+    // the writer, and a note left while a fix leg was pending must not be lost.
     const res = await this.#runKind(s, legDef, {
-      promptAppend: fixContract(round, spec, loop.formatFeedback),
+      promptAppend: fixContract(round, spec, loop.formatFeedback, phase.feedback),
       freshPrompt: true,
     });
     if (res.outcome === "halted") {
@@ -313,27 +327,42 @@ export class PipelineEngine {
     if (res.outcome === "failed") {
       return applyFail(s, phase, { pass: false, reason: `fix leg "${legDef.id}" failed: ${res.reason}` }, attempts, "kind");
     }
+    // The same-leg repair path: one bounded retry with the exact problem.
+    const repair = (problem: string): PipelineState | null => {
+      if (loop.formatRetries < FORMAT_RETRIES) {
+        loop.formatRetries += 1;
+        loop.formatFeedback = problem;
+        return touch(s); // still running; next stays "fix"
+      }
+      return null;
+    };
     const parsed = parseDispositions(res.summary ?? "");
     const check = parsed.ok ? validateDispositions(round.findings, spec.blocking, parsed.value) : parsed;
     if (!check.ok) {
-      if (loop.formatRetries < FORMAT_RETRIES) {
-        loop.formatRetries += 1;
-        loop.formatFeedback = check.reason;
-        return touch(s); // still running; next stays "fix"
-      }
-      loop.formatRetries = 0;
-      loop.formatFeedback = undefined;
-      loop.next = "review";
-      return applyFail(
-        s,
-        phase,
-        {
-          pass: false,
-          reason: `fix leg "${legDef.id}" did not resolve the findings: ${check.reason}\n${renderLedger(loop, spec)}`,
-        },
-        attempts,
-        "exit",
+      return (
+        repair(check.reason) ??
+        this.#findingsFail(
+          s,
+          phase,
+          spec,
+          loop,
+          attempts,
+          `fix leg "${legDef.id}" did not resolve the findings: ${check.reason}\n${renderLedger(loop, spec)}`,
+        )
       );
+    }
+    // The fix gate (e.g. tests_pass) — evaluated BEFORE the leg counts, so a
+    // fixer that broke the build repairs its own leg instead of handing the
+    // reviewer a red tree (and, on the last budgeted leg, a dead end).
+    if (spec.gate) {
+      const v = await this.#gate(spec.gate, s, legDef, "exit");
+      if (!v.pass) {
+        const problem = `fix gate "${spec.gate}" failed: ${v.reason ?? "check failed"}`;
+        return (
+          repair(problem) ??
+          this.#findingsFail(s, phase, spec, loop, attempts, `fix leg "${legDef.id}" — ${problem}\n${renderLedger(loop, spec)}`)
+        );
+      }
     }
     round.dispositions = parsed.ok ? parsed.value : [];
     round.fixSummary = res.summary;
@@ -341,20 +370,51 @@ export class PipelineEngine {
     loop.formatRetries = 0;
     loop.formatFeedback = undefined;
     loop.next = "review";
-    // The fix gate (e.g. tests_pass): a fixer that broke the build halts the
-    // phase with that reason rather than handing the reviewer a red tree.
-    if (spec.gate) {
-      const v = await this.#gate(spec.gate, s, legDef, "exit");
-      if (!v.pass) {
-        return applyFail(
-          s,
-          phase,
-          { pass: false, reason: `fix leg "${legDef.id}" failed gate "${spec.gate}": ${v.reason ?? "check failed"}` },
-          attempts,
-          "exit",
-        );
-      }
+    loop.rereview = true;
+    return touch(s);
+  }
+
+  /**
+   * A findings phase failed at its loop (a leg exhausted its repair, or
+   * blocking findings stayed open past the budget): apply the phase's onFail
+   * policy WITHOUT the generic retry channel. `retry` on a findings phase is
+   * another fix loop — fresh fix budget, straight to a fix leg when blockers
+   * are open — with the reason carried as the engine's note to the next leg,
+   * never appended to the human's revise notes (where it would be rendered as
+   * revision history and re-pasted into every later prompt).
+   */
+  #findingsFail(
+    s: PipelineState,
+    phase: PipelinePhase,
+    spec: FindingsSpec,
+    loop: FindingsLoopState,
+    attempts: number,
+    reason: string,
+  ): PipelineState {
+    const onFail: PhaseFailAction = phase.def.onFail ?? { action: "halt" };
+    loop.formatRetries = 0;
+    loop.formatFeedback = undefined;
+    loop.rereview = false;
+    const blockersOpen = openBlocking(loop, spec).length > 0;
+    loop.next = blockersOpen ? "fix" : "review";
+    const nextAttempts = attempts + 1;
+    if (onFail.action === "retry" && nextAttempts < onFail.max) {
+      loop.fixLegs = 0;
+      loop.formatFeedback = reason;
+      phase.state = { status: "running", startedAt: now(), attempts: nextAttempts };
+      s.status = "running";
+      return touch(s);
     }
+    if (onFail.action === "halt") {
+      // A human Revise re-enters as a review leg (the reviewer speaks first);
+      // the ledger in the reason is what they decide on.
+      loop.next = "review";
+      phase.state = { status: "halted", requestId: `exit:${phase.def.id}`, reason };
+      s.status = "halted";
+      return touch(s);
+    }
+    phase.state = { status: "failed", reason, attempts: nextAttempts };
+    s.status = "failed";
     return touch(s);
   }
 

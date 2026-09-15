@@ -77,11 +77,15 @@ review leg (role: reviewer)  ──findings block──►  any blocking?  ─�
 3. **Dispositions are validated by the engine.** Every blocking finding needs
    exactly one disposition — `fixed`, `not_a_finding`, `declined`, `deferred` —
    and anything but `fixed` needs a reason. Unknown ids, duplicates, and bare
-   deferrals are refused. A gap is fed back for one bounded retry; a gap after
-   that halts the phase with the ledger.
-4. **Fix gate.** If `fixWith.gate` is set, it is evaluated on the fix leg; a
-   fixer that broke the build halts the phase with that reason rather than
-   handing the reviewer a red tree.
+   deferrals are refused. A gap is fed back for one bounded repair of the same
+   leg; a gap after that goes to the phase's `onFail` policy with the ledger.
+4. **Fix gate.** If `fixWith.gate` is set, it is evaluated on the fix leg
+   *before the leg counts*: a fixer that broke the build repairs its own leg
+   once (the gate's reason fed back), and only a repair that also fails goes to
+   `onFail`. The reviewer is never handed a red tree, and on the last budgeted
+   leg the human is never left with only "approve a red tree or reject".
+   The fix gate must be deterministic (`command` or `probe`); the loader
+   refuses a `review`/`skill`/`self` kind here.
 5. **Re-review.** The reviewer runs again with the ledger: verify each `fixed`
    finding is real and did not regress anything, accept or re-raise the rejected
    ones (same id), keep `deferred` ones open, report anything new, and end with
@@ -126,15 +130,34 @@ The result is persisted on `def.findings.fixWith`, so resume and retry keep the
 same binding. A pack can therefore review on one tier and fix on another, e.g.
 review under a `reasoning-max` role and fix under a `mechanical` one.
 
-## 6. Human semantics
+## 6. Human and policy semantics
 
 - **Approve** at the boundary accepts the phase as-is (open non-blocking
   findings are recorded, not lost). Approving over open *blocking* findings is
   the same deliberate override it always was for a failing gate.
 - **Revise** re-runs the phase as a review leg with the human's notes *and* the
   ledger; if the reviewer reports blocking findings and fix legs remain, the
-  loop continues. The fix budget is per phase, not per revise.
+  loop continues. The human's notes also reach every fix leg ("fix F3 with a
+  guard clause" is for the writer). The fix budget is per phase, not per
+  revise.
 - **Reject** fails the run.
+- **`onFail: retry`** on a findings phase means *another fix loop*: a fresh fix
+  budget and, when blockers are open, straight to a fix leg — the reviewer
+  already spoke. The reason travels as the engine's note to that leg, never
+  into the human's revise notes (which are rendered as revision history and
+  re-pasted into every later prompt). **`onFail: abort`** fails the run.
+- **Entry gates** ground a phase *run*; the loop's own legs (fix legs, the
+  re-review right after one, a format repair) do not re-evaluate them.
+- The loader refuses shapes that cannot mean what they say on a findings
+  phase: a read-only or unknown `fixWith`, `skipWhenSatisfied` (the review
+  would be skipped), a `review`-kind entry gate (it would block every revise),
+  and a non-deterministic fix gate. Findings loops require a pack; an
+  explicit-`phases` plan has no pack role to run the fix leg under and is
+  rejected at create.
+- **Phase summaries are the whole of what the model said** across the turns of
+  a leg, not only its last message — so a reviewer that writes its report,
+  rests without the completion marker, is nudged, and answers with the bare
+  marker still hands the engine its findings block.
 
 ## 7. Why this is different
 

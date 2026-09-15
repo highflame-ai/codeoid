@@ -115,9 +115,14 @@ export interface FindingsLoopState {
   next: "review" | "fix";
   /** Fix legs completed (the `maxRounds` budget). */
   fixLegs: number;
-  /** Format retries consumed by the leg currently pending, and the gap to feed back. */
+  /** Repair retries consumed by the leg currently pending (a malformed block,
+   *  a failing fix gate), and the engine's note to feed back to it. */
   formatRetries: number;
   formatFeedback?: string;
+  /** True between a committed fix leg and the review leg that verifies it —
+   *  that review is the loop's own leg, not the phase acting again (so the
+   *  phase's entry gate is not re-evaluated for it). */
+  rereview?: boolean;
 }
 
 export function newLoopState(): FindingsLoopState {
@@ -250,16 +255,19 @@ export function renderLedger(loop: FindingsLoopState, spec: FindingsSpec): strin
 
 const cell = (s: string): string => s.replace(/\|/g, "\\|").replace(/\s+/g, " ").trim();
 
-/** One line for halt reasons and status rails. */
+/** One line for halt reasons and status rails. "fixed" counts distinct finding
+ *  ids a fix leg marked fixed that are NOT still open — a finding fixed, re-
+ *  raised, and fixed again is one resolved finding, not two. */
 export function summarizeLoop(loop: FindingsLoopState, spec: FindingsSpec): string {
   const open = openFindings(loop);
   const blocking = blockingOf(open, spec.blocking);
-  const fixed = loop.rounds.reduce(
-    (n, r) => n + (r.dispositions?.filter((d) => d.disposition === "fixed").length ?? 0),
-    0,
-  );
+  const openIds = new Set(open.map((f) => f.id));
+  const fixedIds = new Set<string>();
+  for (const r of loop.rounds) {
+    for (const d of r.dispositions ?? []) if (d.disposition === "fixed" && !openIds.has(d.id)) fixedIds.add(d.id);
+  }
   const rounds = `${loop.rounds.length} review round${loop.rounds.length === 1 ? "" : "s"}, ${loop.fixLegs} fix leg${loop.fixLegs === 1 ? "" : "s"}`;
-  return `${open.length} finding${open.length === 1 ? "" : "s"} open (${blocking.length} blocking), ${fixed} fixed — ${rounds}`;
+  return `${open.length} finding${open.length === 1 ? "" : "s"} open (${blocking.length} blocking), ${fixedIds.size} fixed — ${rounds}`;
 }
 
 // ── Prompt contracts ─────────────────────────────────────────────────────────
@@ -295,11 +303,17 @@ export function findingsContract(spec: FindingsSpec): string {
 /** Appended to every review leg after a fix leg — the reviewer sees the ledger
  *  and decides what remains open. */
 export function rereviewContract(loop: FindingsLoopState, spec: FindingsSpec): string {
+  // Say what actually happened: a fix leg answered the last round, or none ran
+  // (audit-only, budget spent, a leg that never committed) and the findings stand.
+  const last = loop.rounds[loop.rounds.length - 1];
+  const intro = last?.dispositions
+    ? "A writer responded to your previous findings. The ledger so far:"
+    : "No fix leg ran since your previous findings — they stand as reported. The ledger so far:";
   return [
     "",
     "---",
     `## Review round ${loop.rounds.length + 1} (engine contract)`,
-    "A writer responded to your previous findings. The ledger so far:",
+    intro,
     "",
     renderLedger(loop, spec),
     "",
@@ -318,8 +332,15 @@ export function rereviewContract(loop: FindingsLoopState, spec: FindingsSpec): s
   ].join("\n");
 }
 
-/** The fix leg's whole brief (appended to the built-in `findings-fix` skill). */
-export function fixContract(round: FindingsRound, spec: FindingsSpec, formatFeedback?: string): string {
+/** The fix leg's whole brief (appended to the built-in `findings-fix` skill).
+ *  `humanNotes` are the phase's revise notes — a "fix F3 this way" is for the
+ *  writer, so the fixer sees them too. */
+export function fixContract(
+  round: FindingsRound,
+  spec: FindingsSpec,
+  formatFeedback?: string,
+  humanNotes?: readonly string[],
+): string {
   const blocking = blockingOf(round.findings, spec.blocking);
   const rows = round.findings.map(
     (f) =>
@@ -349,11 +370,14 @@ export function fixContract(round: FindingsRound, spec: FindingsSpec, formatFeed
     '    "reason": "required unless fixed", "evidence": "what changed / what ran (optional)" }',
     "]",
     "```",
+    ...(humanNotes && humanNotes.length > 0
+      ? ["", "## Notes from the human (revise)", ...humanNotes.map((n, i) => `${i + 1}. ${n}`)]
+      : []),
     ...(formatFeedback
       ? [
           "",
-          `Your previous attempt did not satisfy the contract — ${formatFeedback}. Fix that and`,
-          "report again; the block must be last, before the completion marker.",
+          `Engine note on your previous attempt: ${formatFeedback}`,
+          "Address it and report again; the block must be last, before the completion marker.",
         ]
       : []),
   ].join("\n");
