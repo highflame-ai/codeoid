@@ -81,6 +81,8 @@ import {
   buildAgentEnv,
   skillCommandAllowRules,
   skillSandboxDirs,
+  packPluginsOption,
+  pluginSkillDirs,
 } from "../daemon/providers/claude/index.js";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -389,6 +391,32 @@ describe("skillSandboxDirs", () => {
     symlinkSync(join(tmp, "does-not-exist"), join(tmp, "broken"));
     expect(() => skillSandboxDirs([tmp, join(tmpdir(), "codeoid-absent")])).not.toThrow();
     expect(skillSandboxDirs([tmp])).toEqual([realpathSync(tmp)]);
+    rmSync(tmp, { recursive: true, force: true });
+  });
+});
+
+describe("packPluginsOption / pluginSkillDirs (session-scoped pack skills)", () => {
+  it("maps plugin dirs to the SDK `plugins` option, and omits the key when there are none", () => {
+    expect(packPluginsOption(undefined)).toEqual({});
+    expect(packPluginsOption([])).toEqual({});
+    expect(packPluginsOption(["/p/ai-factory"])).toEqual({ plugins: [{ type: "local", path: "/p/ai-factory" }] });
+  });
+
+  it("derives each plugin's skills tier for the sandbox + grant scans", () => {
+    expect(pluginSkillDirs(undefined)).toEqual([]);
+    expect(pluginSkillDirs(["/p/a", "/p/b"])).toEqual([join("/p/a", "skills"), join("/p/b", "skills")]);
+  });
+
+  it("grants the real parent of a plugin's symlinked skills tier (same rule as linked skills)", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "codeoid-plugin-"));
+    const cacheSkills = join(tmp, "packs", "reg", "skills");
+    mkdirSync(join(cacheSkills, "spec"), { recursive: true });
+    mkdirSync(join(cacheSkills, "templates"), { recursive: true });
+    const plugin = join(tmp, "plugins", "reg");
+    mkdirSync(plugin, { recursive: true });
+    symlinkSync(cacheSkills, join(plugin, "skills"));
+    const dirs = skillSandboxDirs(pluginSkillDirs([plugin]));
+    expect(dirs).toContain(realpathSync(cacheSkills)); // holds templates/
     rmSync(tmp, { recursive: true, force: true });
   });
 });

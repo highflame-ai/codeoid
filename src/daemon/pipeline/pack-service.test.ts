@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ModelBindingConfig } from "./binding";
 import type { Pack } from "./interface";
-import { PackService, registryNameFromUrl, type PackServiceConfig } from "./pack-service";
+import { PackService, registryNameFromUrl, type PackServiceConfig, type SkillScope } from "./pack-service";
 
 const tmps: string[] = [];
 function tmp(): string {
@@ -82,6 +82,8 @@ function fakeSink() {
 function makeService(opts: {
   cacheDir: string;
   skillsDir?: string;
+  skillScope?: SkillScope;
+  pluginsDir?: string;
   fixture?: string; // a prepared registry dir the fake `git clone` copies in
   sink?: ReturnType<typeof fakeSink>;
   initial?: Partial<PackServiceConfig>;
@@ -97,6 +99,8 @@ function makeService(opts: {
     },
     cacheDir: opts.cacheDir,
     skillsDir: opts.skillsDir,
+    skillScope: opts.skillScope,
+    pluginsDir: opts.pluginsDir,
     manager: opts.sink ? () => opts.sink! : undefined,
     modelConfig: opts.modelConfig,
     persist: (s) => persisted.push(structuredClone(s)),
@@ -304,6 +308,109 @@ describe("install / trust / select / remove", () => {
 
     svc.trust("p", true); // trusting it must make the skill runnable
     expect(existsSync(join(skillsDir, "spec"))).toBe(true);
+  });
+
+  test("skill-linking repairs a DANGLING symlink (but still never clobbers a live one)", async () => {
+    const fixture = tmp();
+    writeRegistry(fixture, ["p"], ["spec", "review"]);
+    const skillsDir = join(tmp(), "skills");
+    mkdirSync(skillsDir, { recursive: true });
+    // An earlier loader linked `spec` from a temp clone that no longer exists —
+    // existsSync() is false for it, so the old code hit EEXIST on every install.
+    symlinkSync(join(tmp(), "gone-clone", "skills", "spec"), join(skillsDir, "spec"), "dir");
+    // `review` is a LIVE link to something else the operator manages — untouched.
+    const theirs = join(tmp(), "theirs");
+    mkdirSync(theirs, { recursive: true });
+    symlinkSync(theirs, join(skillsDir, "review"), "dir");
+    const cacheDir = join(tmp(), "c");
+    const { svc } = makeService({ cacheDir, skillsDir, fixture });
+    await svc.addRegistry({ url: "https://github.com/a/reg.git" });
+    svc.install({ packId: "p", trusted: true });
+    const fs = require("node:fs");
+    // The dangling `spec` now points at the registry cache; `review` is untouched.
+    expect(fs.realpathSync(join(skillsDir, "spec"))).toBe(fs.realpathSync(join(cacheDir, "reg", "skills", "spec")));
+    expect(fs.realpathSync(join(skillsDir, "review"))).toBe(fs.realpathSync(theirs));
+  });
+
+  test("skillScope: session — links nothing, exposes a per-session skill plugin instead", async () => {
+    const fixture = tmp();
+    writeRegistry(fixture, ["p"], ["spec", "review"]);
+    const skillsDir = join(tmp(), "skills");
+    const pluginsDir = join(tmp(), "plugins");
+    const { svc } = makeService({ cacheDir: join(tmp(), "c"), skillsDir, pluginsDir, skillScope: "session", fixture });
+    await svc.addRegistry({ url: "https://github.com/a/reg.git" });
+    svc.install({ packId: "p", trusted: true });
+    svc.trust("p", true);
+    await svc.refreshRegistry("reg");
+    // Nothing reaches the machine-wide skills dir on any of install / trust / refresh.
+    expect(existsSync(join(skillsDir, "spec"))).toBe(false);
+    expect(existsSync(join(skillsDir, "review"))).toBe(false);
+    // The activation carries a Claude-Code-plugin-shaped dir for the registry.
+    const act = svc.resolveActivation("p");
+    expect(act.skillsPluginDir).toBe(join(pluginsDir, "reg"));
+    const manifest = JSON.parse(readFileSync(join(pluginsDir, "reg", ".claude-plugin", "plugin.json"), "utf8"));
+    expect(manifest.name).toBe("reg");
+    // `skills` inside the plugin resolves to the registry cache's skills.
+    expect(existsSync(join(pluginsDir, "reg", "skills", "spec", "SKILL.md"))).toBe(true);
+    expect(existsSync(join(pluginsDir, "reg", "skills", "review", "SKILL.md"))).toBe(true);
+    // Idempotent: a second activation neither throws nor changes the dir.
+    expect(svc.resolveActivation("p").skillsPluginDir).toBe(join(pluginsDir, "reg"));
+  });
+
+  test("skillScope: session — the plugin never exposes a symlinked registry entry, and prunes stale links", async () => {
+    const fixture = tmp();
+    writeRegistry(fixture, ["p"], ["spec"]);
+    // Hostile entry inside the registry's skills/: a whole-dir plugin link would
+    // expose it AND widen the read sandbox to its real parent (skillSandboxDirs).
+    symlinkSync("/etc", join(fixture, "skills", "evil"), "dir");
+    const cacheDir = join(tmp(), "c");
+    const pluginsDir = join(tmp(), "plugins");
+    const { svc } = makeService({ cacheDir, pluginsDir, skillScope: "session", fixture });
+    await svc.addRegistry({ url: "https://github.com/a/reg.git" });
+    svc.install({ packId: "p", trusted: true });
+    // The plugin is materialized lazily, at activation (not at install), so it
+    // self-heals on every session/phase that uses it.
+    svc.resolveActivation("p");
+    const pluginSkills = join(pluginsDir, "reg", "skills");
+    const fs = require("node:fs");
+    // A real directory of per-entry links — not one link to the cache dir.
+    expect(fs.lstatSync(pluginSkills).isSymbolicLink()).toBe(false);
+    expect(fs.lstatSync(join(pluginSkills, "spec")).isSymbolicLink()).toBe(true);
+    expect(existsSync(join(pluginSkills, "evil"))).toBe(false);
+    // A stale link (skill removed upstream) is pruned on the next activation;
+    // a link pointing outside the cache is pruned too; a real dir is kept.
+    symlinkSync(join(cacheDir, "reg", "skills", "removed-skill"), join(pluginSkills, "removed-skill"), "dir");
+    symlinkSync("/etc", join(pluginSkills, "outside"), "dir");
+    mkdirSync(join(pluginSkills, "operator-owned"), { recursive: true });
+    svc.resolveActivation("p");
+    expect(fs.existsSync(join(pluginSkills, "removed-skill"))).toBe(false);
+    expect(() => fs.lstatSync(join(pluginSkills, "removed-skill"))).toThrow();
+    expect(() => fs.lstatSync(join(pluginSkills, "outside"))).toThrow();
+    expect(fs.lstatSync(join(pluginSkills, "operator-owned")).isDirectory()).toBe(true);
+    expect(existsSync(join(pluginSkills, "spec", "SKILL.md"))).toBe(true);
+  });
+
+  test("skillScope: session — an UNTRUSTED pack gets no plugin (declaring is not executing)", async () => {
+    const fixture = tmp();
+    writeRegistry(fixture, ["p"], ["spec"]);
+    const pluginsDir = join(tmp(), "plugins");
+    const { svc } = makeService({ cacheDir: join(tmp(), "c"), pluginsDir, skillScope: "session", fixture });
+    await svc.addRegistry({ url: "https://github.com/a/reg.git" });
+    svc.install({ packId: "p" }); // untrusted
+    expect(svc.resolveActivation("p").skillsPluginDir).toBeUndefined();
+    expect(existsSync(join(pluginsDir, "reg"))).toBe(false);
+  });
+
+  test("skillScope: global (default) — links as before and carries no plugin dir", async () => {
+    const fixture = tmp();
+    writeRegistry(fixture, ["p"], ["spec"]);
+    const skillsDir = join(tmp(), "skills");
+    const { svc } = makeService({ cacheDir: join(tmp(), "c"), skillsDir, fixture });
+    await svc.addRegistry({ url: "https://github.com/a/reg.git" });
+    svc.install({ packId: "p", trusted: true });
+    expect(svc.skillScope).toBe("global");
+    expect(existsSync(join(skillsDir, "spec"))).toBe(true);
+    expect(svc.resolveActivation("p").skillsPluginDir).toBeUndefined();
   });
 
   test("select sets the default pack (and rejects an uninstalled id)", () => {

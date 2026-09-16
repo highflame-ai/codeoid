@@ -130,6 +130,7 @@ import type {
 } from "../protocol/types.js";
 import type { Scope } from "../protocol/scopes.js";
 import type { PipelineState } from "./pipeline/interface.js";
+import { blockingOf, openFindings, renderLedger } from "./pipeline/findings.js";
 
 /** Per-phase autonomous turn budget for a pipeline run. A phase runs the model
  *  to completion within its role (the human gate is the phase boundary, not each
@@ -476,6 +477,9 @@ export class SessionManager {
       // The operator's model maps, for the pre-flight `pack show --resolve`
       // view (docs/role-model-binding.md §4) — same maps pipeline.create reads.
       modelConfig: { modelTiers: p?.modelTiers, modelRoles: p?.modelRoles },
+      // Machine-wide symlinks (global) vs per-session SDK plugins (session) for
+      // a trusted pack's registry skills (docs/pack-loading.md §3a).
+      skillScope: p?.skillScope,
     });
   }
 
@@ -2400,6 +2404,11 @@ mcpHub: this.#mcpHub,
         id: compiled.id,
         constitution: compiled.constitution,
         subagents: adoption ? adoption.subagents : compiled.subagents,
+        // ...and, under `skillScope: "session"`, the pack's skills too — a
+        // global-scope adoption sees them via ~/.claude/skills; dropping the
+        // plugin here would make the orchestrator the one session that can't
+        // run the methodology's slash skills.
+        ...(adoption?.skillsPluginDir ? { skillsPluginDir: adoption.skillsPluginDir } : {}),
       };
     }
 
@@ -2780,7 +2789,13 @@ mcpHub: this.#mcpHub,
             child,
             parent.id,
             childBrief(collaboration, child, adoption?.constitution),
-            adoptedRole ? { packId: adoption!.id, role: adoptedRole } : undefined,
+            adoptedRole
+              ? {
+                  packId: adoption!.id,
+                  role: adoptedRole,
+                  ...(adoption!.skillsPluginDir ? { skillsPluginDir: adoption!.skillsPluginDir } : {}),
+                }
+              : undefined,
           ),
           // Autonomous with a bounded budget — the same posture dispatch gives
           // its workers, and for the same reason: NOBODY ATTACHES TO A CHILD.
@@ -3312,6 +3327,20 @@ mcpHub: this.#mcpHub,
     // behind a tools-only turn whose own text is empty). Without this, phase N
     // "completes" instantly by reading phase N-1's marker.
     let textAtSend = session.lastAssistantText ?? "";
+    // Every NEW assistant text this phase produced, in order. The phase's
+    // summary is the whole of what the model said across its turns, not only
+    // the last one: a model that writes its report, rests without the marker,
+    // is nudged, and answers with the bare marker would otherwise hand back an
+    // empty summary — and a findings phase would lose its findings block.
+    const produced: string[] = [];
+    let lastProduced = textAtSend;
+    const summary = (finalText: string): string => {
+      if (produced.length === 0) return finalText;
+      return produced
+        .map((t) => stripPhaseCompleteMarker(stripNeedInputMarker(t)))
+        .filter((t) => t.trim().length > 0)
+        .join("\n\n");
+    };
     let nudges = 0;
     let spurious = 0;
     try {
@@ -3329,11 +3358,11 @@ mcpHub: this.#mcpHub,
         const finalStatus = await done;
         const text = session.lastAssistantText ?? "";
         // A non-idle rest (error / budget-exhausted) is a real phase failure.
-        if (finalStatus !== "idle") return { finalStatus, text };
+        if (finalStatus !== "idle") return { finalStatus, text: summary(text) };
         // The user interrupted (Stop) — an interrupt leaves the session idle,
         // so without this we'd re-drive a nudge over the stop. Hand the partial
         // to the review boundary instead.
-        if (session.turnInterrupted) return { finalStatus: "idle", text };
+        if (session.turnInterrupted) return { finalStatus: "idle", text: summary(text) };
         // The model hasn't COMMITTED a turn in response to our prompt yet — the
         // last canonical turn is still our own USER prompt/nudge, which is where a
         // transient query-loop rebuild idle rests BEFORE the real turn runs. Don't
@@ -3342,15 +3371,19 @@ mcpHub: this.#mcpHub,
         // reaches the human boundary. Immune to history-length / user-turn commit
         // timing — the reason the earlier length watermark missed the rebuild idle.
         if (session.lastTurnRole !== "assistant") {
-          if (++spurious > MAX_SPURIOUS_RESTS) return { finalStatus: "idle", text };
+          if (++spurious > MAX_SPURIOUS_RESTS) return { finalStatus: "idle", text: summary(text) };
           continue;
         }
         spurious = 0;
+        if (text !== lastProduced) {
+          produced.push(text);
+          lastProduced = text;
+        }
         // Deliverable complete → done, marker stripped. Guarded on NEW text: a
         // phase can't "complete" by reading the PRIOR phase's marker still sitting
         // in lastAssistantText (behind a tools-only turn) — only its OWN output.
         if (text !== textAtSend && isPhaseComplete(text)) {
-          return { finalStatus: "idle", text: stripPhaseCompleteMarker(text) };
+          return { finalStatus: "idle", text: summary(text) };
         }
         // The model needs the user's input. Surface the question as an input
         // dialog and feed the answer back as the next turn — a REAL answer is a
@@ -3365,13 +3398,13 @@ mcpHub: this.#mcpHub,
             message: stripNeedInputMarker(text),
             placeholder: "Type your answer…",
           });
-          if (session.turnInterrupted) return { finalStatus: "idle", text };
+          if (session.turnInterrupted) return { finalStatus: "idle", text: summary(text) };
           if (!resp.cancelled && resp.value && resp.value.trim().length > 0) {
             pendingSend = resp.value;
             nudges = 0;
             continue;
           }
-          if (nudges >= MAX_PHASE_NUDGES) return { finalStatus: "idle", text };
+          if (nudges >= MAX_PHASE_NUDGES) return { finalStatus: "idle", text: summary(text) };
           nudges += 1;
           pendingSend = PHASE_NO_INPUT_NUDGE;
           continue;
@@ -3379,7 +3412,7 @@ mcpHub: this.#mcpHub,
         // Rested with new output but no marker (an intermediate pause). Nudge to
         // continue, bounded; after the cap, hand what it has to the human review
         // boundary so a never-completing model still reaches Approve/Reject.
-        if (nudges >= MAX_PHASE_NUDGES) return { finalStatus: "idle", text };
+        if (nudges >= MAX_PHASE_NUDGES) return { finalStatus: "idle", text: summary(text) };
         nudges += 1;
         pendingSend = PHASE_CONTINUE_NUDGE;
       }
@@ -3509,6 +3542,19 @@ mcpHub: this.#mcpHub,
           if (p.lastSummary) w.summary = p.lastSummary;
         }
         if (p.feedback && p.feedback.length > 0) w.feedback = p.feedback;
+        // The findings loop (findings.ts): counts + the ledger, so a client can
+        // render "2 open (1 blocking), 1 fix leg" and the per-round table.
+        if (p.def.findings && p.findings) {
+          const open = openFindings(p.findings);
+          w.findings = {
+            rounds: p.findings.rounds.length,
+            fixLegs: p.findings.fixLegs,
+            open: open.length,
+            blocking: blockingOf(open, p.def.findings.blocking).length,
+            next: p.findings.next,
+            ledger: renderLedger(p.findings, p.def.findings),
+          };
+        }
         return w;
       }),
     };

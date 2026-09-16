@@ -5,7 +5,8 @@
  * ships as separate packs in later slices; nothing here encodes an SDLC.
  */
 
-import type { GatePlugin, PhaseKind, PipelineRegistries } from "./interface";
+import { FINDINGS_FIX_SKILL_ID } from "./findings";
+import type { GatePlugin, PhaseKind, PipelineRegistries, SkillPlugin } from "./interface";
 
 /** A phase kind that does nothing and immediately passes — the minimal runnable
  *  phase. Lets a pipeline advance end to end so the engine, store, and restart
@@ -37,9 +38,23 @@ export const manualGate: GatePlugin = {
   },
 };
 
+/** The fix leg of the findings loop (findings.ts). Content-free on purpose: the
+ *  findings, the disposition contract, and any format feedback are appended by
+ *  the engine per leg (PhaseCtx.promptAppend); this template only names the
+ *  actor. Runs under the phase's `findings.fixWith.role` — a write-capable pack
+ *  role — never under the reviewer's. */
+export const findingsFixSkill: SkillPlugin = {
+  id: FINDINGS_FIX_SKILL_ID,
+  kind: "prompt",
+  template:
+    "You are the implementer for this pipeline run. A review phase has reported findings " +
+    "against the current work; resolve them as instructed below, in the working tree of this run.",
+};
+
 /** Register the built-in plugins into a set of registries. */
 export function registerBuiltins(r: PipelineRegistries): void {
   r.phases.register(noopPhaseKind);
   r.gates.register(alwaysGate);
   r.gates.register(manualGate);
+  r.skills.register(findingsFixSkill);
 }

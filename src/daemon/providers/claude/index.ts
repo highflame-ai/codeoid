@@ -78,6 +78,21 @@ function packAgentsOption(
   return { agents };
 }
 
+/**
+ * Session-scoped skill plugins (docs/pack-loading.md §3a) → the SDK's `plugins`
+ * option. Each dir is a Claude-Code-plugin-shaped tree (`.claude-plugin/
+ * plugin.json` + `skills/`) that PackService synthesizes for a trusted pack's
+ * registry under `pipeline.skillScope: "session"`. Loading it here — instead of
+ * symlinking into `~/.claude/skills` — is what keeps a methodology's skills
+ * inside codeoid sessions and out of every other Claude Code session on the
+ * machine. Plugin skills resolve both bare (`/spec`) and namespaced
+ * (`/<registry>:spec`), so pack `command:` values need no rewrite.
+ */
+export function packPluginsOption(dirs?: readonly string[]): { plugins?: { type: "local"; path: string }[] } {
+  if (!dirs || dirs.length === 0) return {};
+  return { plugins: dirs.map((path) => ({ type: "local" as const, path })) };
+}
+
 // ── Initialisation options ────────────────────────────────────────────────────
 
 export interface ClaudeProviderInit {
@@ -159,6 +174,10 @@ export class ClaudeProvider implements SessionProvider {
    * set forces a rebuild (like #builtSystemPromptAppend) so a just-approved
    * command is actually in allowedTools on the retry (#233). */
   #builtSkillAllowRules = "";
+  /** Session-scoped skill plugin dirs the LIVE query loop was built with. The
+   * SDK fixes `plugins` at query construction, and a pipeline run swaps the pack
+   * activation between phases, so a changed set forces a rebuild too. */
+  #builtPluginDirs = "";
   /** Last TurnOpts — the retry after a skill approval rebuilds the loop with
    * these, then re-pushes #lastPushedContent into the SAME turn queue (#233). */
   #lastTurnOpts: TurnOpts | null = null;
@@ -434,6 +453,7 @@ export class ClaudeProvider implements SessionProvider {
     const desiredAppend = opts.systemPromptAppend ?? "";
     const skillAllowRules = this.#resolveSkillGrants(opts);
     const desiredGrants = skillAllowRules.join("\n");
+    const desiredPlugins = (opts.pluginDirs ?? []).join("\n");
 
     // Exact tool names we hand the SDK as pre-approved. Kept as its own list
     // (rather than inlined into `allowedTools`) because the PreToolUse hook has
@@ -451,21 +471,25 @@ export class ClaudeProvider implements SessionProvider {
     if (this.#consumerTask && this.#inputQueue && !this.#inputQueue.closed) {
       if (
         this.#builtSystemPromptAppend === desiredAppend &&
-        this.#builtSkillAllowRules === desiredGrants
+        this.#builtSkillAllowRules === desiredGrants &&
+        this.#builtPluginDirs === desiredPlugins
       ) {
         return;
       }
       // Per-turn contributions the SDK fixes at query construction changed, so
       // the warm loop would silently use the stale value — rebuild instead.
-      // Two triggers: the system-prompt append (before_turn hooks, memory
-      // workspace-index refresh — #153) and the skill-command grants (a just-
-      // approved command must reach allowedTools on the retry — #233). The
+      // Three triggers: the system-prompt append (before_turn hooks, memory
+      // workspace-index refresh — #153), the skill-command grants (a just-
+      // approved command must reach allowedTools on the retry — #233), and the
+      // session-scoped skill plugins (a pack activation applied or swapped). The
       // fresh query RESUMES the same backing session, so no context is lost.
       // console.log, not error: an expected control-flow event.
       const reason =
         this.#builtSystemPromptAppend !== desiredAppend
           ? `systemPromptAppend changed (${this.#builtSystemPromptAppend.length}B → ${desiredAppend.length}B)`
-          : "skill-command grants changed";
+          : this.#builtSkillAllowRules !== desiredGrants
+            ? "skill-command grants changed"
+            : "session-scoped skill plugins changed";
       console.log(
         `[claude-provider ${this.#init.sessionId.slice(0, 8)}] ${reason} — rebuilding query loop`,
       );
@@ -481,6 +505,7 @@ export class ClaudeProvider implements SessionProvider {
     this.#inputQueue = new AsyncQueue<SDKUserMessage>();
     this.#builtSystemPromptAppend = desiredAppend;
     this.#builtSkillAllowRules = desiredGrants;
+    this.#builtPluginDirs = desiredPlugins;
     this.#loopGeneration += 1;
     const myGeneration = this.#loopGeneration;
 
@@ -591,23 +616,31 @@ export class ClaudeProvider implements SessionProvider {
         // (Pack subagents live in the registry cache, not a `.claude/agents`
         // tier, so they're injected rather than discovered.)
         ...packAgentsOption(opts.subagents),
+        // Session-scoped pack skills (`pipeline.skillScope: "session"`) → the
+        // SDK's `plugins` option: discovered for THIS session only, never
+        // linked into `~/.claude/skills`.
+        ...packPluginsOption(opts.pluginDirs),
         ...sessionOpts,
         // Load BOTH the project tier (`<workdir>/.claude`) and the user tier
-        // (`~/.claude`). A pack installs its runnable skills into
-        // `~/.claude/skills/` (pack-service #linkSkills), so a project-only
-        // source silently dropped them and `/spec`-style skill invocations came
-        // back "Unknown command". `skills: "all"` then enables every discovered
-        // skill for auto-selection + slash invocation. In the sandbox `~/.claude`
-        // is codeoid-controlled; in local mode this also surfaces the user's own
-        // skills, which is the intended behaviour.
+        // (`~/.claude`). Under the default global skill scope a pack installs
+        // its runnable skills into `~/.claude/skills/` (pack-service
+        // #linkSkills), so a project-only source silently dropped them and
+        // `/spec`-style skill invocations came back "Unknown command".
+        // `skills: "all"` then enables every discovered skill (user tier,
+        // project tier, and session plugins alike) for auto-selection + slash
+        // invocation. In the sandbox `~/.claude` is codeoid-controlled; in local
+        // mode this also surfaces the user's own skills, which is the intended
+        // behaviour.
         settingSources: ["project", "user"],
         skills: "all",
         // Permission to RUN a skill's command is not permission to READ the
         // files it touches — the two gates are independent and fail in that
-        // order. See skillSandboxDirs.
+        // order. See skillSandboxDirs. Session plugins' `skills/` are symlinks
+        // into the registry cache, so they need the same real-parent grant.
         additionalDirectories: skillSandboxDirs([
           join(homedir(), ".claude", "skills"),
           join(opts.workdir, ".claude", "skills"),
+          ...pluginSkillDirs(opts.pluginDirs),
         ]),
 
         hooks: {
@@ -860,6 +893,10 @@ export class ClaudeProvider implements SessionProvider {
     const declared = skillCommandAllowRules([
       join(homedir(), ".claude", "skills"),
       join(opts.workdir, ".claude", "skills"),
+      // Session-scoped pack skills declare `!`…`` substitutions too; without
+      // scanning them a plugin skill would expand to nothing exactly like a
+      // linked one did before #233.
+      ...pluginSkillDirs(opts.pluginDirs),
     ]);
     if (declared.length === 0) return [];
     const decided = this.#init.store.getSkillCommandGrants(this.#init.workspaceId);
@@ -1334,6 +1371,13 @@ export function translateSDKMessage(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/** The `skills/` tier of each session-scoped plugin dir — the extra roots that
+ *  skillSandboxDirs / skillCommandAllowRules must scan alongside the user and
+ *  project tiers when a pack is activated under `skillScope: "session"`. */
+export function pluginSkillDirs(pluginDirs?: readonly string[]): string[] {
+  return (pluginDirs ?? []).map((d) => join(d, "skills"));
+}
 
 /**
  * Absolute directories the agent must be able to READ for skills to work,

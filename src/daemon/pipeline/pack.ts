@@ -10,6 +10,14 @@
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, resolve, sep } from "node:path";
 import { z } from "zod";
+import {
+  DEFAULT_BLOCKING,
+  DEFAULT_MAX_ROUNDS,
+  type FindingsSpec,
+  openBlocking,
+  renderLedger,
+  SEVERITIES,
+} from "./findings";
 import { buildProbeGate, probePathEscapes, type ProbeSpec } from "./gate-probes";
 import type {
   GatePlugin,
@@ -19,6 +27,7 @@ import type {
   PipelineRegistries,
   SkillPlugin,
 } from "./interface";
+import { scopedId } from "./scoped";
 
 // ── Manifest schema (the pack.yaml contract) ──────────────────────────────
 
@@ -106,6 +115,24 @@ const gateSchema = z.union([
   z.object({ id: idField, kind: z.literal("review"), role: z.string().max(64).optional(), at: gateAt }),
 ]);
 
+/** The findings loop declaration on a phase (findings.ts). `fixWith` is a pack
+ *  role name — or `{ role, provider?, model? }` to pin the fix legs' backend —
+ *  and MUST be write-capable (checked at load: a read-only fixer is a
+ *  misconfiguration, not a policy). */
+const findingsSchema = z.object({
+  fixWith: z.union([
+    z.string().min(1).max(64),
+    z.object({
+      role: z.string().min(1).max(64),
+      provider: z.string().max(64).optional(),
+      model: z.string().max(256).optional(),
+    }),
+  ]),
+  blocking: z.array(z.enum(SEVERITIES)).min(1).max(SEVERITIES.length).optional(),
+  maxRounds: z.number().int().min(0).max(10).optional(),
+  gate: idField.optional(),
+});
+
 const phaseSchema = z.object({
   id: idField,
   name: z.string().max(128).optional(),
@@ -121,6 +148,8 @@ const phaseSchema = z.object({
    *  OFF by default — no phase auto-skips unless a pack opts in. */
   skipWhenSatisfied: z.boolean().optional(),
   onFail: onFailSchema,
+  /** This phase reports findings; the engine runs the fix-and-re-review loop. */
+  findings: findingsSchema.optional(),
 });
 
 export const packManifestSchema = z.object({
@@ -264,6 +293,7 @@ export function loadPack(dir: string, opts: LoadPackOptions = {}): LoadedPack {
   const skillIds = new Set(skills.map((s) => s.id));
 
   const gates: GatePlugin[] = m.gates.map((g) => buildGate(g, dir, opts.trusted ?? false));
+  const gateKinds = new Map(m.gates.map((g) => [g.id, g.kind] as const));
 
   const seen = new Set<string>();
   const pipeline: PhaseDef[] = m.phases.map((p) => {
@@ -288,6 +318,7 @@ export function loadPack(dir: string, opts: LoadPackOptions = {}): LoadedPack {
     if (p.skipWhenSatisfied) def.skipWhenSatisfied = true;
     const onFail = toOnFail(p.onFail);
     if (onFail) def.onFail = onFail;
+    if (p.findings) def.findings = toFindingsSpec(m.id, p, roles, gateKinds);
     return def;
   });
 
@@ -301,11 +332,69 @@ export function loadPack(dir: string, opts: LoadPackOptions = {}): LoadedPack {
     dir,
     gateSpecs: m.gates.map((g) => ({ id: g.id, kind: g.kind })),
     pipeline,
+    // Registered under `<packId>/<id>` (scoped.ts) so two installed packs that
+    // both declare `review` / `tests_pass` coexist instead of overwriting each
+    // other in the daemon-wide registries. Phase defs keep the bare ids; the
+    // engine / skill kind / create-validation resolve them pack-first.
     register(r: PipelineRegistries): void {
-      for (const s of skills) r.skills.register(s);
-      for (const g of gates) r.gates.register(g);
+      for (const s of skills) r.skills.register({ ...s, id: scopedId(m.id, s.id) });
+      for (const g of gates) r.gates.register({ ...g, id: scopedId(m.id, g.id) });
     },
   };
+}
+
+/** Compile a phase's `findings:` block. The fix role must exist in the pack and
+ *  be write-capable — the loop's whole point is that the reviewer stays
+ *  read-only and someone else writes; a read-only fixer would just re-run the
+ *  problem this feature exists to remove. */
+function toFindingsSpec(
+  packId: string,
+  p: PackManifest["phases"][number],
+  roles: Record<string, RoleDef>,
+  gateKinds: ReadonlyMap<string, string>,
+): FindingsSpec {
+  const phaseId = p.id;
+  const f = p.findings!;
+  const fw = typeof f.fixWith === "string" ? { role: f.fixWith } : f.fixWith;
+  const role = roles[fw.role];
+  if (!role) {
+    throw new Error(`pack "${packId}": phase "${phaseId}" findings.fixWith references unknown role "${fw.role}"`);
+  }
+  if (!role.write) {
+    throw new Error(
+      `pack "${packId}": phase "${phaseId}" findings.fixWith role "${fw.role}" is read-only (write: false) — the fix leg must run under a write-capable role`,
+    );
+  }
+  // Shapes that cannot mean what they say on a findings phase — refused at
+  // load rather than discovered as a run that skips its review or can never
+  // be revised out of a halt.
+  if (p.skipWhenSatisfied) {
+    throw new Error(`pack "${packId}": phase "${phaseId}" declares findings — it always runs; skipWhenSatisfied is not allowed`);
+  }
+  if (p.entryGate && gateKinds.get(p.entryGate) === "review") {
+    throw new Error(
+      `pack "${packId}": phase "${phaseId}" entryGate "${p.entryGate}" is a review gate — a review gate is the findings loop's EXIT verdict and cannot ground entry`,
+    );
+  }
+  if (f.gate) {
+    const kind = gateKinds.get(f.gate);
+    if (kind !== undefined && kind !== "command" && kind !== "probe") {
+      throw new Error(
+        `pack "${packId}": phase "${phaseId}" findings.gate "${f.gate}" is a ${kind} gate — the fix gate must be deterministic (command or probe)`,
+      );
+    }
+  }
+  const spec: FindingsSpec = {
+    fixWith: {
+      role: fw.role,
+      ...(fw.provider !== undefined ? { provider: fw.provider } : {}),
+      ...(fw.model !== undefined ? { model: fw.model } : {}),
+    },
+    blocking: [...(f.blocking ?? DEFAULT_BLOCKING)],
+    maxRounds: f.maxRounds ?? DEFAULT_MAX_ROUNDS,
+  };
+  if (f.gate) spec.gate = f.gate;
+  return spec;
 }
 
 function toOnFail(v: PackManifest["phases"][number]["onFail"]): PhaseFailAction | undefined {
@@ -371,18 +460,44 @@ function buildGate(g: PackManifest["gates"][number], dir: string, trusted: boole
       },
     };
   }
-  // self / skill / review gates carry no AUTOMATED verdict yet. They no longer
-  // fail closed (that surfaced a confusing "not yet enforced" halt): every phase
+  if (g.kind === "review") {
+    // S4 for review gates: a REAL verdict when the phase runs the findings loop
+    // — pass iff no blocking finding is open in the latest review round. On a
+    // phase without `findings:` it behaves as before (human is the reviewer).
+    return findingsReviewGate(g.id, at);
+  }
+  // self / skill gates carry no AUTOMATED verdict yet. They no longer fail
+  // closed (that surfaced a confusing "not yet enforced" halt): every phase
   // already halts at its boundary for a human decision (see engine.ts), so these
-  // gates simply pass and defer to that human review. S4 may turn them into real
-  // subagent verdicts shown alongside the human decision.
+  // gates simply pass and defer to that human review.
   return humanReviewGate(g.id, at);
 }
 
 /** A gate with no automated verdict — it passes, deferring acceptance to the
  *  universal human boundary halt. Distinct from failClosedGate: this is not a
  *  silent success that skips review, because the phase halts for the human
- *  regardless (engine.ts). Used for self/skill/review gate kinds. */
+ *  regardless (engine.ts). Used for self/skill gate kinds. */
 function humanReviewGate(id: string, at: "entry" | "exit"): GatePlugin {
   return { id, at, async evaluate() { return { pass: true }; } };
+}
+
+/** The `review` gate kind: the findings loop's verdict (findings.ts). Reads the
+ *  phase under the cursor — the gate is evaluated at that phase's exit, after
+ *  its last review leg — and fails while a blocking finding is still open. */
+function findingsReviewGate(id: string, at: "entry" | "exit"): GatePlugin {
+  return {
+    id,
+    at,
+    async evaluate(ctx) {
+      const phase = ctx.pipeline.phases[ctx.pipeline.cursor];
+      const spec = phase?.def.findings;
+      if (!phase || !spec || !phase.findings) return { pass: true };
+      const open = openBlocking(phase.findings, spec);
+      if (open.length === 0) return { pass: true };
+      return {
+        pass: false,
+        reason: `${open.length} blocking finding${open.length === 1 ? "" : "s"} still open after ${phase.findings.fixLegs} fix leg${phase.findings.fixLegs === 1 ? "" : "s"}:\n${renderLedger(phase.findings, spec)}`,
+      };
+    },
+  };
 }

@@ -2215,6 +2215,24 @@ export interface PipelinePhaseWire {
   /** Human revise notes accumulated on this phase (newest last) — the client
    *  renders the revision history. */
   feedback?: string[];
+  /** The findings loop's state for a phase that declares `findings:` (the
+   *  engine's review → fix → re-review loop): counts plus a markdown ledger of
+   *  every round. Optional (additive) — absent on phases without the loop and
+   *  from older daemons. */
+  findings?: {
+    /** Review legs completed so far. */
+    rounds: number;
+    /** Fix legs completed so far. */
+    fixLegs: number;
+    /** Findings open after the latest review leg. */
+    open: number;
+    /** Of those, how many block the phase. */
+    blocking: number;
+    /** What the engine runs next for this phase while it is still running. */
+    next: "review" | "fix";
+    /** Markdown ledger of every round (findings + dispositions). */
+    ledger: string;
+  };
 }
 
 /** A pipeline projected for the wire (serializable subset of PipelineState). */
@@ -2464,6 +2482,11 @@ export interface PackListResultMsg {
   installed: PackWire[];
   available: AvailablePackWire[];
   registries: RegistryWire[];
+  /** How a trusted pack's registry skills reach sessions on this daemon
+   *  (`config.pipeline.skillScope`): `global` = symlinked into `~/.claude/skills`
+   *  machine-wide; `session` = exposed only inside pack-activated sessions as an
+   *  SDK plugin. Optional (additive) — absent from older daemons. */
+  skillScope?: "global" | "session";
 }
 
 // =============================================================================

@@ -117,13 +117,70 @@ describe("loadPack", () => {
     expect(pack.pipeline[1].onFail).toEqual({ action: "retry", max: 3 });
   });
 
-  test("register() installs the pack's skills + gates into the registries", () => {
+  test("register() installs the pack's skills + gates into the registries, scoped by pack id", () => {
     const mgr = new PipelineManager(new PipelineStore(new Database(":memory:")));
     mgr.installPack(loadPack(fullPack()));
-    expect(mgr.registries.skills.has("spec")).toBe(true);
-    expect(mgr.registries.skills.has("build")).toBe(true);
-    expect(mgr.registries.gates.has("tests_pass")).toBe(true);
+    // Registered under `<packId>/<id>` (scoped.ts) — never the bare id, so two
+    // packs declaring the same skill/gate id can't overwrite each other.
+    expect(mgr.registries.skills.has("aif-test/spec")).toBe(true);
+    expect(mgr.registries.skills.has("aif-test/build")).toBe(true);
+    expect(mgr.registries.gates.has("aif-test/tests_pass")).toBe(true);
+    expect(mgr.registries.skills.has("spec")).toBe(false);
+    expect(mgr.registries.gates.has("tests_pass")).toBe(false);
     expect(mgr.registries.packs.has("aif-test")).toBe(true);
+  });
+
+  test("two packs declaring the same skill + gate ids coexist (no last-wins overwrite)", () => {
+    const mgr = new PipelineManager(new PipelineStore(new Database(":memory:")));
+    const twin = writePack(`schema: codeoid/pack@v1
+id: twin
+name: Twin
+version: 0.1.0
+skills:
+  - { id: spec, kind: prompt, template: "twin-spec" }
+gates:
+  - { id: tests_pass, kind: command, run: "false" }
+phases:
+  - { id: one, skill: spec, gate: tests_pass }
+`);
+    mgr.installPack(loadPack(fullPack()));
+    mgr.installPack(loadPack(twin));
+    expect(mgr.registries.skills.resolve("aif-test/spec")).toBeDefined();
+    expect(mgr.registries.skills.resolve("twin/spec")).toMatchObject({ kind: "prompt", template: "twin-spec" });
+    expect(mgr.registries.gates.has("aif-test/tests_pass")).toBe(true);
+    expect(mgr.registries.gates.has("twin/tests_pass")).toBe(true);
+    // A run created from either pack validates against ITS OWN entries.
+    const run = mgr.create({
+      name: "t",
+      pack: "twin",
+      accountId: "a",
+      projectId: "p",
+      createdBy: "u",
+    });
+    expect(run.packId).toBe("twin");
+    expect(run.phases[0]!.def).toMatchObject({ skill: "spec", gate: "tests_pass" });
+  });
+
+  test("an explicit plan names a pack's skill/gate by its qualified id; a bare id is told what exists", () => {
+    const mgr = new PipelineManager(new PipelineStore(new Database(":memory:")));
+    mgr.installPack(loadPack(fullPack()));
+    const base = { name: "x", accountId: "a", projectId: "p", createdBy: "u" };
+    // Qualified ids resolve through the bare fallback (the id IS the registry key).
+    const ok = mgr.create({
+      ...base,
+      phases: [{ id: "one", kind: "skill", skill: "aif-test/spec", gate: "aif-test/tests_pass" }],
+    });
+    expect(ok.phases[0]!.def.skill).toBe("aif-test/spec");
+    // A bare id no longer borrows an installed pack's entry (that borrowing was
+    // the cross-pack leakage); the error names the qualified ids instead.
+    expect(() => mgr.create({ ...base, phases: [{ id: "one", kind: "skill", skill: "spec" }] })).toThrow(
+      /unknown skill "spec" — installed packs declare it as "aif-test\/spec"/,
+    );
+    expect(() =>
+      mgr.create({ ...base, phases: [{ id: "one", kind: "noop", gate: "tests_pass" }] }),
+    ).toThrow(/unknown gate "tests_pass" — installed packs declare it as "aif-test\/tests_pass"/);
+    // Built-in gates still resolve bare for explicit plans.
+    expect(() => mgr.create({ ...base, phases: [{ id: "one", kind: "noop", gate: "always" }] })).not.toThrow();
   });
 
   test("kind defaults to 'skill' when a phase declares only a skill", () => {
@@ -415,7 +472,7 @@ describe("pack loader — probe gates", () => {
     const pack = loadPack(writePack(PROBE_MANIFEST));
     const r = createRegistries();
     pack.register(r);
-    const gate = r.gates.resolve("spec-done");
+    const gate = r.gates.resolve("probe-pack/spec-done"); // pack-scoped id (scoped.ts)
     expect(gate).toBeDefined();
 
     const workdir = mkdtempSync(join(tmpdir(), "probe-wd-"));
@@ -454,7 +511,7 @@ phases:
     const workdir = mkdtempSync(join(tmpdir(), "probe-wd-"));
     dirs.push(workdir);
     writeFileSync(join(workdir, "go.mod"), "module x\n");
-    const v = await r.gates.resolve("impl-verify")!.evaluate({
+    const v = await r.gates.resolve("probe-pack/impl-verify")!.evaluate({
       pipeline: { workdir } as never,
       phase: { id: "implement", kind: "skill" },
     });

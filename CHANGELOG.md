@@ -25,6 +25,83 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `.cancel`, all gated on `settings:write`. Claude is wired today; the mechanism
   is per-backend and the others follow.
 
+- **Session-scoped pack skills** (`pipeline.skillScope: "session"`). Until now
+  a trusted pack's registry skills reached a session one way only: symlinked
+  into `~/.claude/skills`, where every Claude Code session on the machine — not
+  just codeoid's — discovered them. On a machine whose `~/.claude` is owned by
+  something else (an org bundle linked by hand, another toolkit) that is the
+  wrong scope. With `skillScope: "session"` nothing is linked; codeoid
+  synthesizes a Claude-Code-plugin-shaped directory per registry
+  (`~/.codeoid/plugins/<registry>/`: a manifest plus one symlink per real skill
+  directory in the registry cache, under the same lstat guard as global
+  linking) and hands it to the SDK's `plugins` option for pack-activated
+  sessions and pipeline phases, so the methodology's skills exist inside
+  codeoid runs and nowhere else. Plugin skills resolve both bare (`/spec`) and
+  namespaced (`/<registry>:spec`), so pack `command:` values are unchanged; on a
+  bare-name collision the user- or project-tier skill wins, as it does for a
+  global link. The same trust rule applies (an untrusted pack contributes no
+  runnable skills either way); the read sandbox and the skill-command grants
+  scan the plugin tier too. The default stays `global`;
+  `CODEOID_PIPELINE_SKILL_SCOPE` sets it per invocation. Non-Claude backends
+  ignore the plugin dirs, as they already ignore pack subagents.
+  (docs/pack-loading.md §3a)
+
+- **The findings loop: review → fix → re-review, in the engine, with the roles
+  left exactly as they are** (docs/findings-loop.md). A read-only review phase
+  had no way to get its findings acted on: the pipeline had no backward edge,
+  so the only exits were "approve anyway" or "re-run the reviewer, who still
+  cannot edit" — and the model would ask to be re-run under a write-capable
+  role, the one thing the role model exists to prevent. A phase now declares
+  `findings: { fixWith: <write-capable role>, blocking?, maxRounds?, gate? }`
+  and the engine does the rest: the reviewer's report must end with a fenced
+  `findings` block (JSON; a missing block is a format failure with one bounded
+  retry); any blocking finding runs a fix leg on the same session under
+  `fixWith`'s role, whose report must end with a `dispositions` block — every
+  blocking finding answered as fixed / not_a_finding / declined / deferred, a
+  reason required unless fixed, validated by the engine, never trusted from
+  prose; an optional fix gate (`tests_pass`) runs on the fix leg; then the
+  reviewer runs again with the ledger and names what remains open. Bounded by
+  `maxRounds`; blocking findings left open fail the boundary with the ledger.
+  `review`-kind gates finally have a real verdict (S4), the fix leg gets its
+  own model binding through the usual rungs, every leg is one persisted engine
+  step (restart-safe), and the pipeline wire / `codeoid pipeline status` show
+  the counts and the ledger. `maxRounds: 0` makes a pure audit phase. On a
+  findings phase `onFail: retry` means another fix loop (fresh fix budget),
+  a failing fix gate repairs the same fix leg once before the phase's onFail
+  applies, the loop's own legs skip the phase's entry gate, and the loader
+  refuses shapes that cannot mean what they say (a read-only fixer,
+  `skipWhenSatisfied`, a review-kind entry or fix gate). Findings loops
+  require a pack; an explicit-`phases` plan cannot declare one.
+
+### Fixed
+
+- **Two installed packs declaring the same skill or gate id overwrote each
+  other.** Registries were daemon-wide and keyed by bare id, so installing a
+  second pack that also declared `review`, `ship`, or `tests_pass` replaced the
+  first's entries last-wins (the boot log said so: `skill "review" already
+  registered — overwriting`), and a run from the first pack then drove the
+  second pack's skill. Packs now register under `<packId>/<id>`; the engine, the
+  skill phase kind, and create-time validation resolve a run's own pack entry
+  first and fall back to the bare id, so built-in gates (`always`, `manual`) and
+  directly registered entries keep resolving exactly as before. Phase defs, CLI
+  output, and the web Pack Browser still show the ids as authored.
+
+  One deliberate consequence: an explicit-`phases` plan (wire `pipeline.create`
+  with `phases`, not `pack`) can no longer borrow an installed pack's skill or
+  gate by its bare id — that borrowing was the same leakage, just from the
+  other side. Name the entry by its qualified id (`skill: "org-dev/spec"`), or
+  create the run with `pack`; the create error now lists the qualified ids that
+  exist. The web UI and CLI always send `pack`, so only direct API/SDK clients
+  are affected, and `pipeline.pack.list` now reports the daemon's `skillScope`.
+
+- **A dangling skill symlink blocked that skill from ever being linked again.**
+  An older loader linked registry skills from a temp clone under `/tmp`; after
+  the cache moved, those links pointed at nothing. `existsSync` is false for a
+  dangling link, so `#linkSkills` tried to create it, hit `EEXIST`, warned, and
+  left the skill broken on every subsequent install and trust. A dangling link
+  is now repaired in place; a real directory or a live link is still never
+  touched.
+
 ## [0.4.0] - 2026-07-29
 
 codeoid moves to the Highflame npm org. npm has no way to transfer a package
