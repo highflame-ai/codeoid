@@ -840,6 +840,16 @@ export function compileGoalPack(
       ...blackboardScopeLines(io),
       "",
       "Coordinate from the index, not from copies: it carries byte counts so you can decide what is worth pulling into your own context. Read an artifact when you need its contents, not to keep a mirror of the board.",
+      // The opening move, which nothing else supplies. Every default worker
+      // read set is rooted at `spec`, and every child brief ends "wait for
+      // instructions" — so a goal whose orchestrator never publishes one
+      // stalls on turn ONE with a searcher reading "no spec has been written
+      // on this goal yet" and no scope to read anything else.
+      ...(io.writes.includes("spec")
+        ? [
+            "Start by writing the `spec`: it is the artifact every other role's scope is rooted at, so until it exists your children have nothing to read. `blackboard_write` asks the owner for approval, like any write.",
+          ]
+        : []),
       "",
       "## Panels and synthesis",
       "",

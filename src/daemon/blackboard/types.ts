@@ -5,8 +5,15 @@
  * The blackboard is how role-children hand work to each other WITHOUT the
  * orchestrator re-serializing it as prose. A searcher writes `research`; an
  * architect reads `research`+`spec` and writes `adr`; each reviewer writes its
- * own `findings` entry. The orchestrator holds an index of what exists at what
- * version — never the artifact bodies.
+ * own `findings` entry. The orchestrator coordinates from an index of what
+ * exists at what version, rather than by relaying bodies between children.
+ *
+ * "Holds an index, not the artifacts" (§4) is about CONTEXT ECONOMICS, not
+ * permission — it stops the coordinator becoming the bottleneck. The
+ * orchestrator may still read every core kind, because §7 also makes it the
+ * synthesizer and the only agent that reports to the owner; #338 is what a read
+ * set narrow enough to forbid that actually cost. Read the sentence as "don't
+ * mirror the board", not as "the orchestrator cannot read".
  *
  * Why a fixed core plus a scoped escape hatch, settled in the 2026-07-25
  * grill: a wholly free-form key space makes access scoping meaningless (you
@@ -96,8 +103,9 @@ export interface Artifact {
   createdAt: number;
 }
 
-/** An index row: what exists, at what version, by whom — no bodies. This is
- *  all the orchestrator ever needs (§4: "holds an index, not the artifacts"). */
+/** An index row: what exists, at what version, by whom — no bodies. Enough to
+ *  schedule from, which is the point: `bytes` lets a reader weigh an artifact
+ *  before pulling it, rather than pulling everything to find out. */
 export interface ArtifactIndexEntry {
   kind: string;
   slot: string | null;

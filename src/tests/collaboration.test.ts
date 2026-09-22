@@ -2281,6 +2281,59 @@ describe("collaboration survives a daemon restart", () => {
     expect(idx.entries[0]!.authorSub).toBe(`agent:${parent.id}:reasoning#1`);
   });
 
+  test("the mount the DAEMON mints carries the child's declared scope", async () => {
+    // The seam where a declared scope becomes a real fence, and it had no
+    // coverage: replacing the scope argument in `#blackboardMountFor` with
+    // `undefined` left the whole suite green. Every hop AROUND it was tested —
+    // parse, validate, plan, brief, `forRole` — but not the one call that
+    // hands the manager's own derivation to the fence, and that call fails
+    // OPEN (to the wider §3 profile) when it misses.
+    //
+    // So observe what the daemon actually MINTS rather than rebuilding a
+    // handle here — rebuilding it only re-tests `forRole`, which blackboard
+    // tests already cover. `RoleBlackboard` exposes its resolved scope, and
+    // the token is minted from it, so this is the fence itself.
+    const minted: { reads: readonly string[]; writes: readonly string[] }[] = [];
+    const mcp = manager.blackboardMcp as unknown as {
+      mint: (h: { reads: readonly string[]; writes: readonly string[] }) => string;
+    };
+    const origMint = mcp.mint.bind(mcp);
+    mcp.mint = (h) => {
+      minted.push({ reads: [...h.reads], writes: [...h.writes] });
+      return origMint(h);
+    };
+
+    manager.setBlackboardUrl(BLACKBOARD_URL);
+    const created = await run({
+      type: "session.create",
+      id: "narrow1",
+      name: "narrow1",
+      workdir,
+      collaboration: {
+        goal: "Narrow one reviewer",
+        roles: [
+          { name: "orchestrator", providerId: "claude" },
+          // `review` defaults to spec+diff. Declared down to `spec` alone, so
+          // a silent fallback to the profile shows up as an EXTRA kind.
+          { name: "review", providerId: "gemini", reads: ["spec"], writes: ["findings"] },
+        ],
+      },
+    });
+    expect(created.type).toBe("response.ok");
+    if (created.type !== "response.ok") return;
+
+    // Orchestrator + one child, both minted through the same seam.
+    expect(minted).toHaveLength(2);
+    const reviewer = minted.find((m) => m.writes.includes("findings"));
+    expect(reviewer).toBeDefined();
+    expect(reviewer!.reads).toEqual(["spec"]);
+    expect(reviewer!.reads).not.toContain("diff"); // the §3 profile would
+
+    // ...and the orchestrator's own mount carries ITS resolved scope.
+    const orch = minted.find((m) => m.writes.includes("task-list"));
+    expect(orch?.reads).toEqual(resolveRoleIo(ORCHESTRATOR_ROLE).reads);
+  });
+
   test("a resumed orchestrator gets its constitution back, not just its fence", async () => {
     // #338's other half. `#attachOrchestratorBlackboard` always ran on resume,
     // so a restarted orchestrator came back holding all four blackboard tools
@@ -2866,6 +2919,21 @@ describe("the orchestrator's constitution states the scope its fence enforces", 
     expect(section).not.toMatch(/the shared spec, the task list/);
   });
 
+  test("it is given an opening move, so the goal cannot stall on turn one", () => {
+    // Every default worker read set is rooted at `spec`, and every child brief
+    // ends "wait for instructions from the orchestrator". Without this the
+    // orchestrator dispatches `search`, `search` reads "no spec has been
+    // written on this goal yet", has no scope on anything else, and the goal
+    // is stuck on its first turn with nothing failing.
+    const c = compile({ name: "orchestrator", providerId: "claude" });
+    expect(c).toMatch(/Start by writing the `spec`/);
+
+    // Derived, like every other claim in that section: an orchestrator that
+    // cannot write `spec` must not be told to.
+    const noWrite = compile({ name: "orchestrator", providerId: "claude", writes: [] });
+    expect(noWrite).not.toMatch(/Start by writing the `spec`/);
+  });
+
   test("the rules do not tell it to relay what the fence keeps apart", () => {
     // Widening the synthesizer's reads made it the one agent that could hand a
     // reviewer the implementer's reasoning by quoting it into a brief. No
@@ -2885,7 +2953,10 @@ describe("the orchestrator's constitution states the scope its fence enforces", 
 
   test("a child's brief and the orchestrator's constitution share one formatter", () => {
     // Same two sentences, same resolver, so a change to one cannot leave the
-    // other saying something the daemon will refuse.
+    // other saying something the daemon will refuse. Both sides compare
+    // against `resolveRoleIo` rather than a prefix: `toContain("You can READ: ")`
+    // is satisfied by a hardcoded "You can READ: spec, findings" — the #338 bug
+    // verbatim — which made the first version of this guard assert nothing.
     const child: PlannedChild = {
       roleName: "review",
       ordinal: 1,
@@ -2893,10 +2964,17 @@ describe("the orchestrator's constitution states the scope its fence enforces", 
       shape: "scout",
       write: false,
     };
-    const brief = childBrief({ goal: "g", roles: [] }, child);
-    expect(brief).toContain("You can READ: spec, diff");
-    expect(brief).toContain("You can WRITE: findings");
-    expect(compile({ name: "orchestrator", providerId: "claude" })).toContain("You can READ: ");
+    const childIo = resolveRoleIo("review");
+    expect(childBrief({ goal: "g", roles: [] }, child)).toContain(
+      `You can READ: ${childIo.reads.join(", ")}`,
+    );
+    const orchIo = resolveRoleIo(ORCHESTRATOR_ROLE);
+    expect(compile({ name: "orchestrator", providerId: "claude" })).toContain(
+      `You can READ: ${orchIo.reads.join(", ")}`,
+    );
+    // The two must not be the same set, or this passes on a formatter that
+    // ignores its argument.
+    expect(orchIo.reads).not.toEqual(childIo.reads);
   });
 });
 

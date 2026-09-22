@@ -116,7 +116,6 @@ import type {
   CollaborationConfig,
   CollaborationCost,
   CollaborationPanel,
-  CollaborationRole,
   DaemonMessage,
   FleetEventWire,
   FleetTaskWire,
@@ -899,7 +898,6 @@ mcpHub: this.#mcpHub,
               goalSessionId: role.parentSessionId,
             },
             planned,
-            collaboration.roles.find((r) => r.name === role.roleName),
           );
           return mount ? { blackboardMcp: mount } : {};
         })(),
@@ -2733,7 +2731,6 @@ mcpHub: this.#mcpHub,
   #blackboardMountFor(
     scope: GoalScope,
     child: PlannedChild,
-    role: CollaborationRole | undefined,
   ): { url: string; token: string } | undefined {
     if (!this.#blackboardUrl) return undefined;
     const handle = this.#goalBlackboard().forRole(
@@ -2748,7 +2745,16 @@ mcpHub: this.#mcpHub,
         // writes under the authorSub its pre-restart versions carry.
         authorSub: `agent:${scope.goalSessionId}:${child.roleName}#${child.ordinal}`,
       },
-      role ? { reads: role.reads, writes: role.writes } : undefined,
+      // From the PLANNED CHILD, which is also what `childBrief` resolves its
+      // READ/WRITE lines from — one derivation, so the fence and the sentence
+      // cannot disagree. This used to take a separate
+      // `collaboration.roles.find((r) => r.name === …)`, an exact-match lookup
+      // in a module that compares names case-insensitively everywhere else: a
+      // miss yielded `undefined`, `resolveRoleIo` fell back to the §3 profile,
+      // and a `+reads=`-narrowed reviewer came back on a WIDER scope than it
+      // declared, with its brief still stating the narrow one. Failing open,
+      // silently, at the one seam where a declared scope becomes a real fence.
+      { reads: child.reads, writes: child.writes },
     );
     return { url: this.#blackboardUrl, token: this.#blackboardMcp.mint(handle) };
   }
@@ -2768,20 +2774,26 @@ mcpHub: this.#mcpHub,
     session: Session,
     collaboration: CollaborationConfig,
   ): void {
+    const orchestrator = orchestratorRole(collaboration);
     const mount = this.#blackboardMountFor(
       {
         accountId: session.accountId,
         projectId: session.projectId,
         goalSessionId: session.id,
       },
+      // The orchestrator is not in `planChildren`'s output (it IS the goal
+      // session), so its PlannedChild is synthesized here — including its own
+      // declared scope, which is what `compileGoalPack` states in the
+      // constitution.
       {
         roleName: ORCHESTRATOR_ROLE,
         ordinal: 1,
         providerId: session.providerId,
         shape: "scout",
         write: false,
+        ...(orchestrator?.reads !== undefined ? { reads: orchestrator.reads } : {}),
+        ...(orchestrator?.writes !== undefined ? { writes: orchestrator.writes } : {}),
       },
-      orchestratorRole(collaboration),
     );
     if (!mount) return;
     session.attachBlackboard(mount);
@@ -2814,7 +2826,6 @@ mcpHub: this.#mcpHub,
             goalSessionId: parent.id,
           },
           child,
-          collaboration.roles.find((r) => r.name === child.roleName),
         );
         const childSession = new Session({
           name: childSessionName(parent.name, child),
