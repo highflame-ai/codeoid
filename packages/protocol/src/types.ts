@@ -212,6 +212,13 @@ export const LIMITS = {
    * governs concurrency at run time.
    */
   COLLABORATION_ROLE_COUNT_MAX: 8,
+  /**
+   * Max artifact kinds in one role's `reads` or `writes` declaration. The core
+   * vocabulary is six kinds, so this only bounds how many `extra/<key>` slots
+   * one role may name — enough headroom for a pack, small enough that a
+   * declaration stays readable in a brief.
+   */
+  COLLABORATION_ROLE_SCOPE_MAX: 16,
   /** Max device push-token length (`push.register`). Expo tokens are ~40 chars. */
   PUSH_TOKEN_MAX: 512,
 } as const;

@@ -10,6 +10,8 @@
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, resolve, sep } from "node:path";
 import { z } from "zod";
+import { LIMITS } from "../../protocol/types.js";
+import { ARTIFACT_KIND_MAX } from "../blackboard/types.js";
 import {
   DEFAULT_BLOCKING,
   DEFAULT_MAX_ROUNDS,
@@ -67,6 +69,23 @@ export const roleSchema = z.object({
   /** Model within `provider`. Absent = that backend's default. */
   model: z.string().min(1).max(256).optional(),
   write: z.boolean(),
+  /**
+   * Blackboard artifact kinds this role may READ / WRITE in a collaboration
+   * (docs/collaborative-session-design.md §4) — a core kind (`spec`,
+   * `research`, `adr`, `task-list`, `diff`, `findings`) or `extra/<key>`.
+   *
+   * Absent = the §3 default profile for the role's NAME, which is what every
+   * pack relies on today. Present = authoritative: it is part of the capability
+   * envelope, like `write`, so a collab spec that declares a scope for the same
+   * role is an error rather than a silent override (`adoptPackRoles`).
+   *
+   * Declaring them here is the "adding a role stays a config change" half of
+   * §3 — before #338 the field existed on the wire and on no reachable path.
+   * Whether each name is a real kind is checked by `validateCollaboration`, so
+   * a typo gets the same sentence on the pack path and the `--role` path.
+   */
+  reads: z.array(z.string().min(1).max(ARTIFACT_KIND_MAX)).max(LIMITS.COLLABORATION_ROLE_SCOPE_MAX).optional(),
+  writes: z.array(z.string().min(1).max(ARTIFACT_KIND_MAX)).max(LIMITS.COLLABORATION_ROLE_SCOPE_MAX).optional(),
   network: z.union([z.boolean(), z.literal("read-only")]).default(false),
   envelope: z.union([z.literal("all"), z.array(z.string().max(32)).max(32)]),
   exceptions: z

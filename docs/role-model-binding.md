@@ -20,7 +20,7 @@ codeoid:
 |---|---|---|---|
 | Pack phases | `provider:`/`model:` in `pack.yaml`, baked at `loadPack` | per phase | ❌ — edit + push + re-install |
 | Pack roles | `provider:`/`model:` in the role YAML (the role→backend binding added for the collab fleet path — `roleSchema` in `pack.ts`) | per role | ❌ — edit + push + re-install |
-| Collab sessions | `--role "name:provider[:model][*count]"` (`parseRoleSpec`) | per role-child | ✅ |
+| Collab sessions | `--role "name:provider[:model][*count][+reads=][+writes=]"` (`parseRoleSpec`) | per role-child | ✅ |
 | Single sessions | `--provider` only | per session, provider default model | ⚠️ provider only |
 | ai-factory agents | `tier:` frontmatter + `aif agents render` (class → model map in config, per-agent overrides) | per agent | via config |
 
@@ -269,6 +269,13 @@ codeoid new mytask --collaborate "add per-provider rate limits" \
   - **`write` comes from the role YAML.** A spec that sets `write`
     differently is a create-time error, not a silent override. A spec's
     omitted `purpose` defaults to the role YAML's `summary`.
+  - **Blackboard `reads`/`writes` come from the role YAML on the same
+    terms** (added for #338): they are the same kind of claim about what a
+    role may touch as `write`/`network`/`envelope`. Unlike `write` they are
+    *optional* in the YAML, so the rule is conditional — a pack that states
+    a scope wins and a spec that also states one is an error; a pack with no
+    opinion leaves the spec's `+reads=`/`+writes=` (or, failing that, the
+    §3 default profile keyed on the role name) in place.
   - **`packRole` is rejected with `collaboration`** — it names one
     session-wide capability role; a collab binds one per child.
   - **Resume:** the *resolved* config (models, write flags) is persisted and

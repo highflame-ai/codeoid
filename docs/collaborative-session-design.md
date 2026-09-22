@@ -76,13 +76,31 @@ The precedent already exists in codeoid.
 Roles as **capability envelopes** also already exist in the pack system — `roleSchema { name, write, network, envelope, exceptions }` (`src/daemon/pipeline/pack.ts`) — but they carry **no** model or provider today.
 The one addition to the schema is an optional `(provider, model)` on a role, plus the enforcement that makes a role's `envelope` real (§6).
 
-| Default role | purpose | typical backend fit | capability policy |
-| --- | --- | --- | --- |
-| orchestrator | plan, delegate, schedule, synthesize | strongest reasoning + tool-use (Claude today, for fleet MCP) | no file/exec write; `session:dispatch` only |
-| search | web research → `research` artifact | any backend with `WebSearch`/`WebFetch` | read + web; no repo write |
-| reasoning | bulk logical work, implementation → `diff` | strong coder | write (in a worktree), execute |
-| architecture | decompose, decide structure → `adr` | strong long-context planner | read + write `adr`; no repo write |
-| review (×N) | independent critique → `findings` | **different** backend from the implementer | read `diff`+`spec`, **no write** (enforced) |
+| Default role | purpose | typical backend fit | capability policy | blackboard `reads` → `writes` |
+| --- | --- | --- | --- | --- |
+| orchestrator | plan, delegate, schedule, synthesize | strongest reasoning + tool-use (Claude today, for fleet MCP) | no file/exec write; `session:dispatch` only | **every core kind** → `spec`, `task-list` |
+| search | web research → `research` artifact | any backend with `WebSearch`/`WebFetch` | read + web; no repo write | `spec` → `research` |
+| reasoning | bulk logical work, implementation → `diff` | strong coder | write (in a worktree), execute | `spec`, `adr`, `task-list` → `diff` |
+| architecture | decompose, decide structure → `adr` | strong long-context planner | read + write `adr`; no repo write | `spec`, `research` → `adr`, `task-list` |
+| review (×N) | independent critique → `findings` | **different** backend from the implementer | read `diff`+`spec`, **no write** (enforced) | `spec`, `diff` → `findings` |
+
+The orchestrator's read set is the whole core vocabulary, and that is not a hole in §6's independence property.
+Independence is a property of the **panel** — a reviewer that can read its peers is an echo, not a panel — and the orchestrator is not a panel member.
+§7 makes it the synthesizer and the only agent that reports to the owner, so a narrower read set leaves it instructed to merge artifacts its own fence refuses (the bug in #338).
+Read scope is not an obligation to read: §4's "holds an index, not the artifacts" is about context economics, and the index carries per-artifact byte counts precisely so the orchestrator can choose what to pull.
+
+**Declaring a scope is a config change, per role.**
+The table is a *default profile* keyed on the role's name, and any role may override it:
+
+| Path | How |
+| --- | --- |
+| CLI | `--role name:provider[:model][*count][+reads=a,b][+writes=c]` — e.g. `--role search:claude+reads=spec,adr+writes=research` |
+| Pack | `reads:` / `writes:` on the role YAML (`roleSchema`), alongside `write`/`network`/`envelope` — authoritative, so a spec that also declares one is an error |
+| Wire | `reads`/`writes` on `CollaborationRole` |
+
+Three distinctions the resolver holds (`resolveRoleIo`, `src/daemon/blackboard/service.ts`):
+**declared nothing** falls back to the profile for the role's name; **declared an empty list** (`+reads=`) touches nothing; a role name with **neither** a profile nor a declaration gets nothing, which is the fail-closed direction.
+`extra/<key>` is never implicit — the scope model is a list of kinds with no wildcard, so a pack handing work off through `extra/` must name those keys.
 
 ---
 

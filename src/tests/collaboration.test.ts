@@ -39,7 +39,7 @@ import { MockSessionProvider, mockResult } from "../daemon/providers/mock/sessio
 import type { MemoryEngine } from "../daemon/memory/index.js";
 import { ProviderRegistry } from "../daemon/providers/registry.js";
 import type { ProviderEvent } from "../daemon/providers/interface.js";
-import { Blackboard } from "../daemon/blackboard/service.js";
+import { Blackboard, resolveRoleIo } from "../daemon/blackboard/service.js";
 import { BlackboardStore } from "../daemon/blackboard/store.js";
 import { parseClientMessage } from "@highflame/codeoid-protocol/schemas";
 import { SessionManager } from "../daemon/session-manager.js";
@@ -55,7 +55,7 @@ import {
   type FleetDeps,
 } from "../daemon/fleet.js";
 import { ALL_SCOPES } from "../protocol/scopes.js";
-import { LIMITS } from "../protocol/types.js";
+import { LIMITS, ORCHESTRATOR_ROLE } from "../protocol/types.js";
 import type {
   AuthContext,
   ClientMessage,
@@ -212,6 +212,34 @@ describe("validateCollaboration", () => {
     ]);
     expect(frac.ok).toBe(false);
     if (!frac.ok) expect(frac.error).toMatch(/positive integer/);
+
+    const scope = ok("g", [
+      { name: "orchestrator", providerId: "claude" },
+      {
+        name: "review",
+        providerId: "gemini",
+        reads: Array.from({ length: LIMITS.COLLABORATION_ROLE_SCOPE_MAX + 1 }, (_, i) => `extra/k${i}`),
+      },
+    ]);
+    expect(scope.ok).toBe(false);
+    if (!scope.ok) expect(scope.error).toMatch(/reads names \d+ artifact kinds — max/);
+  });
+
+  test("carries a declared scope through normalization", () => {
+    // The declaration has to SURVIVE this function to mean anything: it is what
+    // `forRole` hands the fence and what `childBrief` reads back.
+    const r = ok("g", [
+      { name: "orchestrator", providerId: "claude", reads: ["findings"] },
+      { name: "review", providerId: "gemini", reads: [], writes: ["extra/notes"] },
+    ]);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.config.roles[0]!.reads).toEqual(["findings"]);
+    expect(r.config.roles[0]!.writes).toBeUndefined(); // undeclared stays absent
+    // Declared-empty must survive as [], not become absent — absent falls back
+    // to the §3 profile, which is the opposite of what was asked for.
+    expect(r.config.roles[1]!.reads).toEqual([]);
+    expect(r.config.roles[1]!.writes).toEqual(["extra/notes"]);
   });
 });
 
@@ -258,6 +286,57 @@ describe("parseRoleSpec", () => {
     });
   });
 
+  // The `+field=` segments (#338). Before them, `reads`/`writes` existed on the
+  // wire and on the `RoleIo` resolver but on NO user-reachable path — the
+  // escape hatch §3 promises ("adding a role stays a config change") could
+  // only be used by hand-writing a WebSocket client.
+  test("declares a blackboard read scope", () => {
+    expect(parseRoleSpec("orchestrator:claude+reads=spec,findings")).toEqual({
+      name: "orchestrator",
+      providerId: "claude",
+      reads: ["spec", "findings"],
+    });
+  });
+
+  test("declares both scopes alongside a model and a fan-out", () => {
+    expect(parseRoleSpec("review:gemini:gemini-2.5-pro*2+reads=spec,diff+writes=findings")).toEqual({
+      name: "review",
+      providerId: "gemini",
+      model: "gemini-2.5-pro",
+      count: 2,
+      reads: ["spec", "diff"],
+      writes: ["findings"],
+    });
+  });
+
+  test("an empty list is a declaration, not an absence", () => {
+    // `+reads=` means read NOTHING. Collapsing it to `undefined` would restore
+    // the default profile it was written to remove — the one distinction
+    // `resolveRoleIo` exists to make.
+    expect(parseRoleSpec("review:gemini+reads=")).toEqual({
+      name: "review",
+      providerId: "gemini",
+      reads: [],
+    });
+  });
+
+  test("segment order does not matter", () => {
+    expect(parseRoleSpec("review:gemini+writes=findings+reads=diff")).toEqual({
+      name: "review",
+      providerId: "gemini",
+      reads: ["diff"],
+      writes: ["findings"],
+    });
+  });
+
+  test("tolerates whitespace inside a scope list", () => {
+    expect(parseRoleSpec("search:claude +reads= spec , extra/sources ")).toEqual({
+      name: "search",
+      providerId: "claude",
+      reads: ["spec", "extra/sources"],
+    });
+  });
+
   test.each([
     ["", /must not be empty/],
     ["orchestrator", /expected name:provider/],
@@ -267,8 +346,27 @@ describe("parseRoleSpec", () => {
     [":gemini", /role name is empty/],
     ["review:", /provider is empty/],
     ["a:b:c:d", /expected name:provider/],
+    ["review:gemini+reads", /needs a value/],
+    ["review:gemini+peeks=diff", /unknown scope field "peeks"/],
+    ["review:gemini+reads=diff+reads=spec", /"reads" declared more than once/],
+    ["review:gemini+reads=diff,,spec", /empty entry/],
+    [`review:gemini+reads=${Array.from({ length: 17 }, (_, i) => `extra/k${i}`).join(",")}`, /max 16/],
+    [`review:gemini+reads=extra/${"x".repeat(80)}`, /max 64/],
   ])("rejects %p", (spec, match) => {
     expect(() => parseRoleSpec(spec as string)).toThrow(match as RegExp);
+  });
+
+  test("an unknown kind is left to the validator, so both doors fail alike", () => {
+    // Shape-only, deliberately: `parseRoleSpec` accepts `diffs` and
+    // `validateCollaboration` names the valid set — the same sentence a raw
+    // wire client gets. Duplicating the rule here would let the two drift.
+    expect(parseRoleSpec("review:gemini+reads=diffs").reads).toEqual(["diffs"]);
+    const bad = ok("g", [
+      { name: "orchestrator", providerId: "claude" },
+      { name: "review", providerId: "gemini", reads: ["diffs"] },
+    ]);
+    expect(bad.ok).toBe(false);
+    if (!bad.ok) expect(bad.error).toMatch(/unknown artifact kind "diffs"/);
   });
 });
 
@@ -387,6 +485,47 @@ describe("session.create --collaborate", () => {
       providerId: "gemini",
       count: 2,
     });
+  });
+
+  // #338, end to end. A declared scope is only real if what an operator TYPES
+  // reaches the fence, and every hop below used to drop it: the grammar had no
+  // syntax for it, and the wire schema's `reads`/`writes` had no producer.
+  test("a --role spec's declared scope survives the whole path to the fence", async () => {
+    const roles = [
+      parseRoleSpec("orchestrator:claude"),
+      parseRoleSpec("search:claude+reads=spec,findings+writes=research,extra/sources"),
+    ];
+    // Through the REAL wire schema: the fields are optional there, so a shape
+    // regression would be silent if this went straight into the manager.
+    const wire = parseClientMessage({
+      type: "session.create",
+      id: "scope1",
+      name: "collab-scope",
+      workdir,
+      collaboration: { goal: "Declare a scope", roles },
+    });
+    expect(wire.ok).toBe(true);
+    if (!wire.ok) return;
+    const resp = await run(wire.value);
+    expect(resp.type).toBe("response.ok");
+    if (resp.type !== "response.ok") return;
+
+    const config = (resp.data as SessionInfo).collaboration!;
+    expect(config.roles[1]!.reads).toEqual(["spec", "findings"]);
+    expect(config.roles[1]!.writes).toEqual(["research", "extra/sources"]);
+
+    // ...and the fence the child gets is the widened one, not the §3 profile
+    // for `search` (which reads `spec` alone and writes `research` alone).
+    const child = plannedChildFor(config, "search", 1)!;
+    expect(childBrief(config, child)).toContain("You can READ: spec, findings");
+    const handle = new Blackboard(new BlackboardStore(store.database)).forRole(
+      { accountId: AUTH.accountId, projectId: AUTH.projectId, goalSessionId: "scope-goal" },
+      { roleName: "search", ordinal: 1, authorSub: "agent:search#1" },
+      { reads: child.reads, writes: child.writes },
+    );
+    expect(handle.read("findings").ok).toBe(true);
+    expect(handle.write("extra/sources", "URLS").ok).toBe(true);
+    expect(handle.read("diff").ok).toBe(false); // declared, so still bounded
   });
 
   test("the collaboration is persisted to the sessions row", async () => {
@@ -826,6 +965,74 @@ describe("adoptPackRoles (unit)", () => {
     ]);
     expect(clash.ok).toBe(false);
     if (!clash.ok) expect(clash.error).toMatch(/write authority comes from pack/);
+  });
+
+  // Blackboard scope on the same terms as `write` — it is the same kind of
+  // claim about what a role may touch (#338). This is the "adding a role stays
+  // a config change" half of §3: before it, `reads`/`writes` were expressible
+  // on the wire and by no pack.
+  test("a role YAML's blackboard scope is adopted", () => {
+    const r = adoptPackRoles(
+      { goal: "g", roles: [{ name: "orchestrator", providerId: "claude" }] },
+      {
+        packId: "pk",
+        roles: {
+          orchestrator: {
+            name: "orchestrator",
+            write: false,
+            network: false,
+            envelope: "all",
+            reads: ["spec", "findings", "extra/sources"],
+            writes: ["spec"],
+          },
+        },
+      },
+    );
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.config.roles[0]!.reads).toEqual(["spec", "findings", "extra/sources"]);
+    expect(r.config.roles[0]!.writes).toEqual(["spec"]);
+  });
+
+  test("a pack with no opinion leaves the spec's declaration standing", () => {
+    // `reads`/`writes` are OPTIONAL in the role YAML, unlike `write` — so this
+    // cannot be an unconditional "the pack wins", or every existing pack would
+    // silently strip a scope the operator typed.
+    const r = adopt([
+      { name: "orchestrator", providerId: "claude", reads: ["spec", "diff"] },
+      { name: "adversary", providerId: "claude" },
+    ]);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.config.roles[0]!.reads).toEqual(["spec", "diff"]);
+    // And an undeclared role stays undeclared, so the §3 profile still applies.
+    expect(r.config.roles[1]!.reads).toBeUndefined();
+  });
+
+  test("both declaring it is an error, not a silent override", () => {
+    const r = adoptPackRoles(
+      {
+        goal: "g",
+        roles: [{ name: "orchestrator", providerId: "claude", reads: ["spec"] }],
+      },
+      {
+        packId: "pk",
+        roles: {
+          orchestrator: {
+            name: "orchestrator",
+            write: false,
+            network: false,
+            envelope: "all",
+            reads: ["spec", "findings"],
+          },
+        },
+      },
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).toMatch(/reads comes from pack "pk"/);
+      expect(r.error).toMatch(/spec, findings/);
+    }
   });
 
   // The §6.1 chain, minus the phase-pin rung (no phases in a collaboration).
@@ -2449,6 +2656,71 @@ describe("the orchestrator's constitution matches the tools it actually has", ()
     expect(compiled.constitution).toMatch(/NO spawn tool/);
     expect(compiled.constitution).toMatch(/roster is fixed/);
     expect(compiled.constitution).not.toContain("fleet_spawn");
+  });
+});
+
+// ── Guard: the constitution states the scope the fence enforces (#338) ──────
+
+// The reported bug: the constitution told the orchestrator to "read each role's
+// artifact from the blackboard" and nothing in it was derived from the read set
+// `forRole` actually mints. A child was never exposed to that class — its brief
+// has always called `resolveRoleIo` — so the fix is to put the orchestrator on
+// the same resolver, which makes disagreement unrepresentable rather than
+// merely absent today.
+describe("the orchestrator's constitution states the scope its fence enforces", () => {
+  const compile = (role: CollaborationConfig["roles"][number]) =>
+    compileGoalPack({ goal: "g", roles: [role] }, []).constitution;
+
+  test("the default profile's kinds are named, verbatim from the resolver", () => {
+    const io = resolveRoleIo(ORCHESTRATOR_ROLE);
+    const c = compile({ name: "orchestrator", providerId: "claude" });
+    expect(c).toContain(`You can READ: ${io.reads.join(", ")}`);
+    expect(c).toContain(`You can WRITE: ${io.writes.join(", ")}`);
+    // ...and the kinds the synthesis instruction depends on are in it. Without
+    // this the guard above passes on any read set at all, including the two
+    // kinds that produced the bug.
+    for (const kind of ["research", "adr", "diff", "findings"]) {
+      expect(io.reads).toContain(kind);
+      expect(c).toContain(kind);
+    }
+  });
+
+  test("a narrowed orchestrator is told the truth, not the default", () => {
+    const c = compile({
+      name: "orchestrator",
+      providerId: "claude",
+      reads: ["findings"],
+      writes: [],
+    });
+    expect(c).toContain("You can READ: findings");
+    expect(c).toContain("You can WRITE: (nothing");
+    expect(c).not.toContain("You can READ: spec, research");
+  });
+
+  test("names the blackboard tools, and how a panel's entries come back", () => {
+    const c = compile({ name: "orchestrator", providerId: "claude" });
+    for (const t of ["blackboard_index", "blackboard_read", "blackboard_read_all", "blackboard_write"]) {
+      expect(c).toContain(`\`${t}\``);
+    }
+    // §4's context economics: read scope is not an instruction to mirror the
+    // board, and the index carries byte counts so it can choose.
+    expect(c).toMatch(/Coordinate from the index/);
+  });
+
+  test("a child's brief and the orchestrator's constitution share one formatter", () => {
+    // Same two sentences, same resolver, so a change to one cannot leave the
+    // other saying something the daemon will refuse.
+    const child: PlannedChild = {
+      roleName: "review",
+      ordinal: 1,
+      providerId: "gemini",
+      shape: "scout",
+      write: false,
+    };
+    const brief = childBrief({ goal: "g", roles: [] }, child);
+    expect(brief).toContain("You can READ: spec, diff");
+    expect(brief).toContain("You can WRITE: findings");
+    expect(compile({ name: "orchestrator", providerId: "claude" })).toContain("You can READ: ");
   });
 });
 

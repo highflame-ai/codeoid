@@ -75,6 +75,44 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A collaboration's orchestrator could not read the artifacts its own
+  constitution told it to synthesize** (#338). The compiled goal pack instructs
+  it to "read each role's artifact from the blackboard, merge, and show
+  disagreement", while its default profile read `spec` and `findings` only — so
+  `research` (search's output), `adr` (architecture's) and `diff` (reasoning's)
+  all came back as `Role "orchestrator" may not read "research"`. Synthesis
+  collapsed into restating the one artifact it could reach.
+
+  The orchestrator now reads every core kind. The independence property that
+  motivated the narrow read set is about PANEL MEMBERS — a reviewer that can
+  read its peers is an echo, not a panel — and the orchestrator is not one: §7
+  makes it the synthesizer and the only agent that reports to the owner.
+  `review` is unchanged and still cannot reach `research`, `adr` or a peer's
+  `findings`. Read scope is not an obligation to read: the index carries byte
+  counts, and the constitution now says to coordinate from it rather than
+  mirror the board.
+
+  Two related defects closed with it:
+
+  - **The declared-scope escape hatch was unreachable.** `reads`/`writes` were
+    accepted on the wire and honored by `resolveRoleIo`, but no user-facing
+    path produced them — the `--role` grammar had no syntax and the pack role
+    YAML had no field, so overriding a role's scope meant hand-writing a
+    WebSocket client. A `--role` spec now takes
+    `name:provider[:model][*count][+reads=a,b][+writes=c]`, and `roleSchema`
+    takes `reads:`/`writes:` alongside `write`/`network`/`envelope` — where the
+    pack's declaration is authoritative on the same terms as `write` (a spec
+    that also declares one is an error, not a silent override). `+reads=`
+    declares an empty list, which stays distinct from declaring nothing (that
+    falls back to the default profile). The pipeline `--role` path rejects the
+    scope segments rather than accepting and ignoring them.
+  - **The orchestrator's constitution was not derived from its own scope.** A
+    child's brief has always computed READ/WRITE from `resolveRoleIo`; the
+    orchestrator's constitution computed nothing, which is how the instruction
+    and the fence drifted apart in the first place. Both now render from one
+    formatter over one resolver, and the constitution names the four blackboard
+    tools it actually mounts.
+
 - **Two installed packs declaring the same skill or gate id overwrote each
   other.** Registries were daemon-wide and keyed by bare id, so installing a
   second pack that also declared `review`, `ship`, or `tests_pass` replaced the

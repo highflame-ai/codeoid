@@ -18,8 +18,8 @@
 import type { CollaborationConfig, CollaborationRole } from "../protocol/types.js";
 import { LIMITS, ORCHESTRATOR_ROLE } from "../protocol/types.js";
 import { CLAUDE_PROVIDER_ID, resolveModelIdForProvider } from "./models.js";
-import { CORE_ARTIFACT_KINDS, isValidArtifactKind } from "./blackboard/types.js";
-import { resolveRoleIo } from "./blackboard/service.js";
+import { ARTIFACT_KIND_MAX, CORE_ARTIFACT_KINDS, isValidArtifactKind } from "./blackboard/types.js";
+import { resolveRoleIo, type RoleIo } from "./blackboard/service.js";
 import { resolveBinding, type ModelBindingConfig } from "./pipeline/binding.js";
 import type { RoleDef } from "./pipeline/pack.js";
 
@@ -99,6 +99,14 @@ export function validateCollaboration(
       ["writes", raw.writes],
     ] as const) {
       if (!kinds) continue;
+      // Same reason as the goal/role bounds above: an embedded frontend never
+      // crosses the wire schema, so its `.max()` is not the only door.
+      if (kinds.length > LIMITS.COLLABORATION_ROLE_SCOPE_MAX) {
+        return {
+          ok: false,
+          error: `Role "${name}" ${field} names ${kinds.length} artifact kinds — max ${LIMITS.COLLABORATION_ROLE_SCOPE_MAX}`,
+        };
+      }
       for (const kind of kinds) {
         if (!isValidArtifactKind(kind)) {
           return {
@@ -239,7 +247,9 @@ export interface PackAdoption {
  *
  * Write authority comes from the role YAML, not the spec: a spec that says
  * otherwise is an error rather than a silent override, because "the pack
- * defines what the role is" must not lose an argument to a checkbox.
+ * defines what the role is" must not lose an argument to a checkbox. A
+ * role YAML's blackboard `reads`/`writes` are adopted on the same terms —
+ * they are the same kind of claim about what a role may touch.
  *
  * Models resolve through §3's chain minus the phase-pin rung. The spec's
  * PROVIDER stays authoritative — the collab grammar makes the backend an
@@ -276,6 +286,20 @@ export function adoptPackRoles(
         ok: false,
         error: `Role "${name}": write authority comes from pack "${adoption.packId}" (its role YAML says write: ${def.write}) — drop the explicit write flag.`,
       };
+    }
+    // Blackboard scope is part of the capability envelope, so it follows the
+    // `write` rule: when the pack states it, the pack wins and a spec that
+    // also states it is an error, not a silent override. Unlike `write` it is
+    // OPTIONAL in the role YAML — a pack with no opinion leaves the spec's
+    // declaration (or the §3 default profile) in place, which is why this is a
+    // both-declared check rather than an unconditional one.
+    for (const field of ["reads", "writes"] as const) {
+      if (raw[field] !== undefined && def[field] !== undefined) {
+        return {
+          ok: false,
+          error: `Role "${name}": ${field} comes from pack "${adoption.packId}" (its role YAML says ${field}: [${def[field].join(", ")}]) — drop the explicit ${field}.`,
+        };
+      }
     }
 
     // §6.1 chain: cli --role model → modelRoles → role-YAML pin → tier map →
@@ -331,8 +355,20 @@ export function adoptPackRoles(
           ? { purpose: def.summary }
           : {}),
       write: def.write,
-      ...(raw.reads !== undefined ? { reads: raw.reads } : {}),
-      ...(raw.writes !== undefined ? { writes: raw.writes } : {}),
+      // The pack's scope first (checked above to be the only one declared),
+      // then the spec's. `!== undefined` throughout: an empty list means "this
+      // role touches nothing", and collapsing it to absent would silently
+      // restore the default profile it was written to remove.
+      ...(def.reads !== undefined
+        ? { reads: def.reads }
+        : raw.reads !== undefined
+          ? { reads: raw.reads }
+          : {}),
+      ...(def.writes !== undefined
+        ? { writes: def.writes }
+        : raw.writes !== undefined
+          ? { writes: raw.writes }
+          : {}),
     });
   }
   return { ok: true, config: { goal: config.goal, roles } };
@@ -592,6 +628,25 @@ export function orphanedChildBrief(roleName: string, write: boolean): string {
 }
 
 /**
+ * The two lines that TELL an agent its blackboard scope — formatted from the
+ * same `RoleIo` the fence will enforce.
+ *
+ * One formatter over one resolver, shared by `childBrief` and
+ * `compileGoalPack`, because the orchestrator drifted from the fence exactly
+ * once already (#338): its constitution told it to "read each role's artifact"
+ * while nothing in that constitution was derived from its actual read set. A
+ * child was never exposed to that class of bug — `childBrief` has always
+ * called `resolveRoleIo` — and now neither is the orchestrator.
+ */
+function blackboardScopeLines(io: RoleIo): string[] {
+  return [
+    `You can READ: ${io.reads.length > 0 ? io.reads.join(", ") : "(nothing — you have no read scope on this board)"}`,
+    `You can WRITE: ${io.writes.length > 0 ? io.writes.join(", ") : "(nothing — report in your reply instead)"}`,
+    "Anything outside that is refused by the daemon, not by your own judgement — don't work around it, and don't ask another agent to fetch it for you.",
+  ];
+}
+
+/**
  * The goal brief handed to a role-child on spawn.
  *
  * Deliberately narrow. A child is told its goal, its role, and its contract —
@@ -631,9 +686,7 @@ export function childBrief(
     "- `blackboard_read` / `blackboard_read_all` — read an artifact you are scoped for.",
     "- `blackboard_write` — publish YOUR output. It appends a version; it never overwrites, and for multi-writer kinds you write your own entry.",
     "",
-    `You can READ: ${io.reads.length > 0 ? io.reads.join(", ") : "(nothing — you work only from the task you are sent)"}`,
-    `You can WRITE: ${io.writes.length > 0 ? io.writes.join(", ") : "(nothing — report back in your reply instead)"}`,
-    "Anything outside that is refused by the daemon, not by your own judgement — don't work around it, and don't ask another agent to fetch it for you.",
+    ...blackboardScopeLines(io),
     "",
     "Wait for instructions from the orchestrator before acting; it will send you a specific task.",
     "</collaboration>",
@@ -671,6 +724,16 @@ export function compileGoalPack(
     )
     .join("\n");
   const ethos = adopted?.constitution?.trim();
+  // The orchestrator's OWN scope, from the same resolver that mints its
+  // blackboard handle (`#attachOrchestratorBlackboard` → `forRole`). Stating it
+  // is not decoration: the synthesis instruction below tells it to read its
+  // children's artifacts, and #338 was that instruction standing next to a
+  // fence nobody had asked.
+  const orchestrator = orchestratorRole(config);
+  const io = resolveRoleIo(ORCHESTRATOR_ROLE, {
+    reads: orchestrator?.reads,
+    writes: orchestrator?.writes,
+  });
   return {
     id: adopted?.id ?? "collaboration",
     constitution: [
@@ -698,6 +761,16 @@ export function compileGoalPack(
       "",
       "You have NO spawn tool. Your roster is fixed for the life of this goal — work with the children you have.",
       "",
+      "## The goal blackboard",
+      "",
+      "Your children hand work off through the daemon-owned BLACKBOARD, not through chat. You never relay an artifact between them — you decide who runs next, and they read their inputs themselves.",
+      "- `blackboard_index` — every artifact: kind, version, which child wrote it, and its SIZE. Never scoped: you always see what exists, even for a kind you cannot read.",
+      "- `blackboard_read` — one artifact's contents. `blackboard_read_all` — every writer's entry of a multi-writer kind, which is how you collect a whole panel's findings in one call.",
+      "- `blackboard_write` — publish your own artifact (the shared spec, the task list).",
+      "",
+      ...blackboardScopeLines(io),
+      "Coordinate from the index, not from copies: it carries byte counts so you can decide what is worth pulling into your own context. Read an artifact when you need its contents, not to keep a mirror of the board.",
+      "",
       "## Panels and synthesis",
       "",
       // §7: the barrier exists so synthesis sees every verdict at once, and the
@@ -707,7 +780,7 @@ export function compileGoalPack(
       "- Prefer `fleet_panel` over several `fleet_send` calls when the answers belong together. Separate sends finish independently and never join, so you would be reasoning from whoever replied first.",
       "- A panel reports ONCE, as a joined event listing every member\'s outcome. Do not synthesize before it arrives, and do not chase members individually while it is outstanding.",
       "- The join fires when every member is FINISHED, not when every member succeeded. A member that failed is listed as failed — say so in your synthesis rather than dropping it.",
-      "- Then synthesize: read each role\'s artifact from the blackboard, merge the findings, de-duplicate, and SHOW disagreement. Do not take a vote and report only the majority — where reviewers disagree, that disagreement is the finding.",
+      "- Then synthesize: read the members\' artifacts from the blackboard — `blackboard_read_all` on `findings` returns every member\'s entry at once — then merge, de-duplicate, and SHOW disagreement. Do not take a vote and report only the majority; where reviewers disagree, that disagreement is the finding.",
       "- You do not decide the outcome. Present the merged verdict to the owner; releases are theirs.",
       "",
       "## Your fleet",
@@ -724,25 +797,80 @@ export function compileGoalPack(
   };
 }
 
+/** The blackboard-scope fields a `--role` spec may declare. */
+const ROLE_SCOPE_FIELDS = ["reads", "writes"] as const;
+
 /**
  * Parse one `--role` CLI spec into a `CollaborationRole`.
  *
- * Format: `name:provider[:model][*count]` — e.g.
+ * Format: `name:provider[:model][*count][+reads=a,b][+writes=c,d]` — e.g.
  *   orchestrator:claude
  *   reasoning:openai:gpt-5-codex
  *   review:gemini*3
+ *   search:claude+reads=spec+writes=research,extra/sources
+ *
+ * The `+field=` segments are what make a DECLARED blackboard scope reachable
+ * without hand-writing a WebSocket client (#338). They are split off before
+ * anything else, so neither the `*count` suffix nor the `:` walk has to know
+ * about them — the cost is that `+` cannot appear inside a model id, which no
+ * backend's ids use. An empty list stays expressible on purpose: `+reads=` is
+ * "read nothing", which the blackboard distinguishes from declaring nothing at
+ * all (that falls back to the §3 default profile).
  *
  * Shape only; the semantic rules stay in `validateCollaboration` so the CLI
- * and the wire path fail identically. Throws with an actionable message —
- * the caller is a CLI that exits on bad input.
+ * and the wire path fail identically — whether a kind is real is checked
+ * there, for both doors. Throws with an actionable message — the caller is a
+ * CLI that exits on bad input.
  */
 export function parseRoleSpec(spec: string): CollaborationRole {
   const trimmed = spec.trim();
   if (!trimmed) throw new Error("--role must not be empty");
 
-  // Split the fan-out suffix off the RIGHT first, so a `*` can never be
+  const segments = trimmed.split("+");
+  const scope: { reads?: string[]; writes?: string[] } = {};
+  for (const segment of segments.slice(1)) {
+    const eq = segment.indexOf("=");
+    if (eq === -1) {
+      throw new Error(
+        `Invalid --role "${spec}" — scope segment "+${segment.trim()}" needs a value (e.g. "+reads=spec,diff")`,
+      );
+    }
+    const field = segment.slice(0, eq).trim();
+    if (!(ROLE_SCOPE_FIELDS as readonly string[]).includes(field)) {
+      throw new Error(
+        `Invalid --role "${spec}" — unknown scope field "${field}" (expected ${ROLE_SCOPE_FIELDS.join(" or ")})`,
+      );
+    }
+    const key = field as (typeof ROLE_SCOPE_FIELDS)[number];
+    if (scope[key] !== undefined) {
+      throw new Error(`Invalid --role "${spec}" — "${key}" declared more than once`);
+    }
+    const value = segment.slice(eq + 1).trim();
+    // NOT `value.split(",")` on empty — that yields [""] and a bogus kind.
+    const kinds = value === "" ? [] : value.split(",").map((k) => k.trim());
+    if (kinds.some((k) => k === "")) {
+      throw new Error(`Invalid --role "${spec}" — "${key}" has an empty entry (drop the extra comma)`);
+    }
+    // Bound here as well as in the wire schema, for the same reason as *count:
+    // otherwise an over-long declaration comes back as a raw Zod rejection
+    // from the daemon instead of a sentence naming the flag that caused it.
+    if (kinds.length > LIMITS.COLLABORATION_ROLE_SCOPE_MAX) {
+      throw new Error(
+        `Invalid --role "${spec}" — "${key}" names ${kinds.length} kinds, max ${LIMITS.COLLABORATION_ROLE_SCOPE_MAX}`,
+      );
+    }
+    const tooLong = kinds.find((k) => k.length > ARTIFACT_KIND_MAX);
+    if (tooLong !== undefined) {
+      throw new Error(
+        `Invalid --role "${spec}" — artifact kind "${tooLong}" is ${tooLong.length} chars, max ${ARTIFACT_KIND_MAX}`,
+      );
+    }
+    scope[key] = kinds;
+  }
+
+  // Split the fan-out suffix off the RIGHT next, so a `*` can never be
   // confused with part of a model id.
-  let body = trimmed;
+  let body = segments[0]!.trim();
   let count: number | undefined;
   const star = body.lastIndexOf("*");
   if (star !== -1) {
@@ -780,5 +908,9 @@ export function parseRoleSpec(spec: string): CollaborationRole {
     providerId,
     ...(model ? { model } : {}),
     ...(count !== undefined ? { count } : {}),
+    // `!== undefined`, never truthiness: `+reads=` parsed to [] and that empty
+    // list is a declaration ("read nothing"), not an absence.
+    ...(scope.reads !== undefined ? { reads: scope.reads } : {}),
+    ...(scope.writes !== undefined ? { writes: scope.writes } : {}),
   };
 }
