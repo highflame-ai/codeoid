@@ -97,9 +97,14 @@ export function resolveRoleIo(
   declared?: { reads?: readonly string[]; writes?: readonly string[] },
 ): RoleIo {
   const fallback = DEFAULT_ROLE_IO[roleName];
+  // Copied, never aliased. Returning `fallback.reads` directly handed every
+  // caller the live profile array behind a `readonly` type that only the
+  // compiler enforces — one `(io.reads as string[]).push(…)` anywhere would
+  // have widened the fence for every role instance in the process, for the
+  // life of the daemon. `Readonly<Record<…>>` is shallow and does not cover it.
   return {
-    reads: declared?.reads ?? fallback?.reads ?? [],
-    writes: declared?.writes ?? fallback?.writes ?? [],
+    reads: [...(declared?.reads ?? fallback?.reads ?? [])],
+    writes: [...(declared?.writes ?? fallback?.writes ?? [])],
   };
 }
 

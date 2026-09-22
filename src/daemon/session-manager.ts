@@ -44,6 +44,7 @@ import { BlackboardStore, type GoalScope } from "./blackboard/store.js";
 import { BlackboardMcpHttp } from "./blackboard/mcp-http.js";
 import {
   adoptPackRoles,
+  collaborationScopeWarnings,
   childBrief,
   childSessionName,
   compileGoalPack,
@@ -694,6 +695,18 @@ mcpHub: this.#mcpHub,
           // its role→backend bindings must come back after a restart or the
           // orchestrator resumes with no idea what it was coordinating.
           collaboration: meta.collaboration,
+          // ...and so is the constitution compiled FROM those bindings. A
+          // child's came back all along (it rides on `child.options.pack`);
+          // an orchestrator's did not, because `compileGoalPack` ran only at
+          // create and no `pack` is persisted. That left a resumed
+          // orchestrator holding the blackboard mount re-attached below with
+          // no goal, no roster, and no statement of its own scope — #338's
+          // instruction-vs-fence gap, reopened by every restart. Recompiled
+          // from the same config the fence resolves against, so they agree
+          // here exactly as they do on create.
+          ...(!child && meta.collaboration
+            ? { pack: this.#resumeGoalPack(meta.collaboration) }
+            : {}),
           // ...and the same is true of a CHILD's restrictions. Spread after
           // `role` so the worker role from the posture wins over `meta.role`
           // (they agree — both are "worker" — but the posture is the authority).
@@ -2252,6 +2265,10 @@ mcpHub: this.#mcpHub,
         };
       }
       collaboration = checked.config;
+      // A declared scope may hand a reviewer its peers' verdicts or the
+      // implementer's reasoning. That is allowed (§7's debate round wants it)
+      // but must not be silent, now that one CLI flag can do it.
+      for (const note of collaborationScopeWarnings(collaboration)) warn(note);
       const orchestrator = orchestratorRole(collaboration);
       if (orchestrator) {
         if (providerId && providerId !== orchestrator.providerId) {
@@ -2661,6 +2678,33 @@ mcpHub: this.#mcpHub,
       add(s);
     }
     return rollup;
+  }
+
+  /**
+   * Recompile a resumed orchestrator's one-goal pack from its persisted
+   * collaboration config.
+   *
+   * Deliberately calls the SAME `compileGoalPack` the create path calls rather
+   * than persisting the rendered text: the constitution states the role's
+   * blackboard scope, and a stored copy would be a snapshot of whatever
+   * `DEFAULT_ROLE_IO` said on the day it was written — so upgrading the daemon
+   * would leave the sentence and the fence disagreeing again.
+   *
+   * One thing does NOT come back: a pack-adopted collaboration's ETHOS and its
+   * real pack id, because `TranscriptMeta` persists the roster but not the
+   * adoption. The goal, the roster and the scope all return; the pack's "how to
+   * work" preamble does not. Restoring it needs the adoption persisted, which
+   * is a wider change than the gap this closes.
+   */
+  #resumeGoalPack(
+    collaboration: CollaborationConfig,
+  ): { id: string; constitution: string; subagents: [] } | undefined {
+    // The roster is derived, not stored. A config that can no longer be planned
+    // (a cap lowered under it) still deserves the goal and the rules, so fall
+    // back to an empty roster rather than dropping the constitution entirely —
+    // `compileGoalPack` renders "(no role-children …)" for it.
+    const planned = planChildren(collaboration);
+    return compileGoalPack(collaboration, planned.ok ? planned.children : []);
   }
 
   /** Lazily build the blackboard over the daemon's existing DB connection. */

@@ -75,43 +75,34 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **A collaboration's orchestrator could not read the artifacts its own
-  constitution told it to synthesize** (#338). The compiled goal pack instructs
-  it to "read each role's artifact from the blackboard, merge, and show
-  disagreement", while its default profile read `spec` and `findings` only — so
-  `research` (search's output), `adr` (architecture's) and `diff` (reasoning's)
-  all came back as `Role "orchestrator" may not read "research"`. Synthesis
-  collapsed into restating the one artifact it could reach.
+- **A collaboration's orchestrator could not read the artifacts its own constitution told it to synthesize** (#338).
+  The compiled goal pack instructs it to "read each role's artifact from the blackboard, merge, and show disagreement", while its default profile read `spec` and `findings` only.
+  So `research` (search's output), `adr` (architecture's) and `diff` (reasoning's) all came back as `Role "orchestrator" may not read "research"`, and synthesis collapsed into restating the one artifact it could reach.
 
-  The orchestrator now reads every core kind. The independence property that
-  motivated the narrow read set is about PANEL MEMBERS — a reviewer that can
-  read its peers is an echo, not a panel — and the orchestrator is not one: §7
-  makes it the synthesizer and the only agent that reports to the owner.
-  `review` is unchanged and still cannot reach `research`, `adr` or a peer's
-  `findings`. Read scope is not an obligation to read: the index carries byte
-  counts, and the constitution now says to coordinate from it rather than
-  mirror the board.
+  The orchestrator now reads every core kind.
+  The independence property that motivated the narrow read set is about PANEL MEMBERS — a reviewer that can read its peers is an echo, not a panel — and the orchestrator is not one: §7 makes it the synthesizer and the only agent that reports to the owner.
+  `review` is unchanged and still cannot reach `research`, `adr` or a peer's `findings`.
+  Read scope is not an obligation to read: the index carries byte counts, and the constitution now says to coordinate from it rather than mirror the board.
 
-  Two related defects closed with it:
+  Four related defects closed with it:
 
-  - **The declared-scope escape hatch was unreachable.** `reads`/`writes` were
-    accepted on the wire and honored by `resolveRoleIo`, but no user-facing
-    path produced them — the `--role` grammar had no syntax and the pack role
-    YAML had no field, so overriding a role's scope meant hand-writing a
-    WebSocket client. A `--role` spec now takes
-    `name:provider[:model][*count][+reads=a,b][+writes=c]`, and `roleSchema`
-    takes `reads:`/`writes:` alongside `write`/`network`/`envelope` — where the
-    pack's declaration is authoritative on the same terms as `write` (a spec
-    that also declares one is an error, not a silent override). `+reads=`
-    declares an empty list, which stays distinct from declaring nothing (that
-    falls back to the default profile). The pipeline `--role` path rejects the
-    scope segments rather than accepting and ignoring them.
-  - **The orchestrator's constitution was not derived from its own scope.** A
-    child's brief has always computed READ/WRITE from `resolveRoleIo`; the
-    orchestrator's constitution computed nothing, which is how the instruction
-    and the fence drifted apart in the first place. Both now render from one
-    formatter over one resolver, and the constitution names the four blackboard
-    tools it actually mounts.
+  - **The declared-scope escape hatch was unreachable.**
+    `reads`/`writes` were accepted on the wire and honored by `resolveRoleIo`, but no user-facing path produced them — the `--role` grammar had no syntax and the pack role YAML had no field, so overriding a role's scope meant hand-writing a WebSocket client.
+    A `--role` spec now takes `name:provider[:model][*count][+reads=a,b][+writes=c]`, and `roleSchema` takes `reads:`/`writes:` alongside `write`/`network`/`envelope`.
+    A `+` starts a scope segment only when a field name or a `word=` follows it, so it stays legal inside a model id (`reasoning:qwen:some+model`).
+    Under a pack the role YAML is authoritative for the role's scope as a unit — declaring either field claims both, since locking only one left the other operator-overridable — and a spec that also declares one is an error rather than a silent override.
+    `+reads=` declares an empty list, which stays distinct from declaring nothing (that falls back to the default profile).
+    The pipeline `--role` path rejects the scope segments rather than accepting and ignoring them, and a kind that is not a real kind is now rejected when the pack LOADS, not only when a collaboration adopts it.
+  - **The orchestrator's constitution was not derived from its own scope.**
+    A child's brief has always computed READ/WRITE from `resolveRoleIo`; the orchestrator's constitution computed nothing, which is how the instruction and the fence drifted apart in the first place.
+    Both now render from one formatter over one resolver, and every scope claim in the blackboard section — including which kinds `blackboard_write` covers and whether `blackboard_read_all` on `findings` is available — is derived rather than hardcoded.
+  - **A restarted orchestrator got its fence back but not its constitution.**
+    `compileGoalPack` ran only at create and nothing persists the rendered text, while resume re-attached the blackboard mount unconditionally — so after a daemon restart the orchestrator held all four blackboard tools and reads on every core kind with no goal, no roster and no statement of its scope.
+    Resume now recompiles the goal pack from the same persisted config the fence resolves against.
+    (A pack-adopted collaboration's ETHOS and real pack id still do not survive a restart; the adoption itself is not persisted.)
+  - **Declaring a scope could dissolve panel independence silently.**
+    A role that both writes and reads `findings`, or writes `findings` and reads `research`, is a reviewer that can see its peers or the implementer's reasoning.
+    §7's cross-critique round wants exactly that, so it is allowed — but it is now reported as a create-time warning on the response, rather than happening quietly.
 
 - **Two installed packs declaring the same skill or gate id overwrote each
   other.** Registries were daemon-wide and keyed by bare id, so installing a

@@ -2630,6 +2630,21 @@ export class Session {
     return this.#blackboardMcp !== undefined;
   }
 
+  /**
+   * The governing constitution text, if this session runs under one.
+   *
+   * Same reason `hasBlackboardMount` exists: resume rebuilds a session from
+   * disk, and "the fence came back but the instruction that states it did not"
+   * is invisible from `SessionInfo` — `profile` reports only that SOME pack is
+   * attached. A collaboration orchestrator resumed without its compiled goal
+   * pack looked identical from the outside to one resumed with it, which is
+   * how that gap survived (#338). Nothing secret: this is generated text the
+   * owner's own config produced.
+   */
+  get packConstitution(): string | undefined {
+    return this.#pack?.constitution;
+  }
+
   toInfo(): SessionInfo {
     return {
       id: this.id,

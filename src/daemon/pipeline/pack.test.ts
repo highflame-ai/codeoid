@@ -678,6 +678,22 @@ describe("role blackboard scope (loadPack)", () => {
     expect(pack.roles.r.reads).toEqual([]);
   });
 
+  test("rejects an unknown kind at LOAD, not only on the collab path", () => {
+    // A role reached only through a pipeline PHASE never sees
+    // `validateCollaboration`, so leaving the check there would let a typo'd
+    // `reads: ["diffs"]` load clean and fence nothing — the role looks scoped
+    // and is not. Same sentence the `--role` path produces.
+    expect(() => loadPack(withRole('name: r\nwrite: false\nenvelope: all\nreads: ["diffs"]\n'))).toThrow(
+      /unknown artifact kind "diffs"/,
+    );
+    expect(() => loadPack(withRole('name: r\nwrite: false\nenvelope: all\nwrites: ["extra/BAD"]\n'))).toThrow(
+      /unknown artifact kind "extra\/BAD"/,
+    );
+    // ...and a well-formed `extra/<key>` is not collateral damage.
+    expect(loadPack(withRole("name: r\nwrite: false\nenvelope: all\nreads: [extra/bench-results]\n")).roles.r.reads)
+      .toEqual(["extra/bench-results"]);
+  });
+
   test("rejects an over-long list and an over-long kind", () => {
     const many = Array.from({ length: LIMITS.COLLABORATION_ROLE_SCOPE_MAX + 1 }, (_, i) => `extra/k${i}`);
     expect(() => loadPack(withRole(`name: r\nwrite: false\nenvelope: all\nreads: [${many.join(", ")}]\n`))).toThrow(

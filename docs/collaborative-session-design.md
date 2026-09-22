@@ -125,6 +125,8 @@ That makes the coordinator the bottleneck — its context bloats with each round
   **No handoff is ever re-serialized through the orchestrator's context.**
 - The orchestrator holds an **index of artifact states, not the artifacts themselves** — the conductor's founding principle ("holds an index, not transcripts", `docs/conductor-design.md` §2) applied inside a single goal.
   It observes which artifacts exist and at what version, decides what is ready to run (inputs present), delegates, and advances.
+  This is a rule about **context economics, not permission**: coordination runs off the index, and the index carries per-artifact byte counts so the orchestrator can decide what is worth pulling.
+  It may still *read* every core kind, because §7 also makes it the synthesizer and the only agent that reports to the owner — see §3, and #338 for what a read set narrow enough to forbid that actually cost.
 
 **Why this is strictly better than a message relay:**
 1. The orchestrator never becomes the context bottleneck — it carries an index; artifacts live in the daemon.

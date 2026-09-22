@@ -59,6 +59,19 @@ export function isValidArtifactKind(kind: string): boolean {
   return EXTRA_KEY_RE.test(kind.slice(EXTRA_PREFIX.length));
 }
 
+/**
+ * The sentence for a kind that isn't one — one formatter, every door.
+ *
+ * The pack loader, `validateCollaboration` and the MCP tool descriptions all
+ * have to name the valid vocabulary, and hand-copied literals would let a
+ * seventh core kind (or a change to the `extra/` shape) ship on one path while
+ * another still advertises the old set. Callers prefix their own context
+ * (`Role "x" reads …`); the vocabulary half lives here, next to the vocabulary.
+ */
+export function artifactKindError(kind: string): string {
+  return `unknown artifact kind "${kind}" — valid: ${CORE_ARTIFACT_KINDS.join(", ")}, or extra/<key>`;
+}
+
 /** One stored version of one artifact. */
 export interface Artifact {
   id: string;

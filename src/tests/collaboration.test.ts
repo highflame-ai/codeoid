@@ -23,6 +23,7 @@ import type { CodeoidConfig } from "../config.js";
 import {
   adoptPackRoles,
   childBrief,
+  collaborationScopeWarnings,
   compileGoalPack,
   orchestratorRole,
   orphanedChildBrief,
@@ -41,6 +42,7 @@ import { ProviderRegistry } from "../daemon/providers/registry.js";
 import type { ProviderEvent } from "../daemon/providers/interface.js";
 import { Blackboard, resolveRoleIo } from "../daemon/blackboard/service.js";
 import { BlackboardStore } from "../daemon/blackboard/store.js";
+import { CORE_ARTIFACT_KINDS } from "../daemon/blackboard/types.js";
 import { parseClientMessage } from "@highflame/codeoid-protocol/schemas";
 import { SessionManager } from "../daemon/session-manager.js";
 import { Store } from "../daemon/store.js";
@@ -225,6 +227,50 @@ describe("validateCollaboration", () => {
     if (!scope.ok) expect(scope.error).toMatch(/reads names \d+ artifact kinds — max/);
   });
 
+  test("warns, but does not refuse, when a declared scope dissolves the panel", () => {
+    // §7's cross-critique round legitimately wants reviewers to read each
+    // other, so this is not an error. But before `+reads=` was reachable the
+    // only way to give up §6 independence was to hand-write a WebSocket
+    // client; now it is one flag, and it must not happen silently.
+    const echo = collaborationScopeWarnings({
+      goal: "g",
+      roles: [
+        { name: "orchestrator", providerId: "claude" },
+        { name: "review", providerId: "gemini", count: 3, reads: ["spec", "diff", "findings"] },
+      ],
+    });
+    expect(echo).toHaveLength(1);
+    expect(echo[0]).toMatch(/both writes and reads "findings"/);
+
+    const leak = collaborationScopeWarnings({
+      goal: "g",
+      roles: [{ name: "review", providerId: "gemini", reads: ["spec", "diff", "research"] }],
+    });
+    expect(leak[0]).toMatch(/sees the implementer's reasoning/);
+
+    // Keyed on what the role WRITES, not its name — §3 makes the taxonomy
+    // data, so a pack's `critic` is caught on the same terms as `review`.
+    const named = collaborationScopeWarnings({
+      goal: "g",
+      roles: [
+        { name: "critic", providerId: "gemini", reads: ["diff", "findings"], writes: ["findings"] },
+      ],
+    });
+    expect(named).toHaveLength(1);
+
+    // The defaults give up nothing, so a normal collaboration is quiet.
+    expect(
+      collaborationScopeWarnings({
+        goal: "g",
+        roles: [
+          { name: "orchestrator", providerId: "claude" },
+          { name: "review", providerId: "gemini", count: 3 },
+          { name: "reasoning", providerId: "claude" },
+        ],
+      }),
+    ).toEqual([]);
+  });
+
   test("carries a declared scope through normalization", () => {
     // The declaration has to SURVIVE this function to mean anything: it is what
     // `forRole` hands the fence and what `childBrief` reads back.
@@ -346,10 +392,15 @@ describe("parseRoleSpec", () => {
     [":gemini", /role name is empty/],
     ["review:", /provider is empty/],
     ["a:b:c:d", /expected name:provider/],
-    ["review:gemini+reads", /needs a value/],
+    ["review:gemini+reads", /"\+reads" needs a value/],
     ["review:gemini+peeks=diff", /unknown scope field "peeks"/],
+    ["review:gemini+reads=spec+", /stray "\+"/],
     ["review:gemini+reads=diff+reads=spec", /"reads" declared more than once/],
     ["review:gemini+reads=diff,,spec", /empty entry/],
+    // `*count` used to be the only suffix, so trailing it is the natural
+    // mistake; unhandled it becomes `unknown artifact kind "diff*3"` much
+    // later, which names neither the problem nor the fix.
+    ["review:gemini+reads=diff*3", /fan-out count goes on the backend/],
     [`review:gemini+reads=${Array.from({ length: 17 }, (_, i) => `extra/k${i}`).join(",")}`, /max 16/],
     [`review:gemini+reads=extra/${"x".repeat(80)}`, /max 64/],
   ])("rejects %p", (spec, match) => {
@@ -994,6 +1045,66 @@ describe("adoptPackRoles (unit)", () => {
     expect(r.config.roles[0]!.writes).toEqual(["spec"]);
   });
 
+  test("a pack that states either field owns the role's whole scope", () => {
+    // Per FIELD, a pack locking only `reads` left `writes` operator-
+    // overridable: `--role review:gemini+writes=spec` would let a reviewer
+    // publish the singleton `spec` every other role reads. The mirror is
+    // worse — a pack locking only `writes`, plus `+reads=research`, hands a
+    // reviewer the implementer's reasoning. "The pack defines what the role
+    // is" has to cover the role's scope as a unit, not field by field.
+    const packLocksReadsOnly = {
+      packId: "pk",
+      roles: {
+        review: {
+          name: "review",
+          write: false,
+          network: false as const,
+          envelope: "all" as const,
+          reads: ["spec", "diff"],
+        },
+      },
+    };
+    const clash = adoptPackRoles(
+      { goal: "g", roles: [{ name: "review", providerId: "gemini", writes: ["spec"] }] },
+      packLocksReadsOnly,
+    );
+    expect(clash.ok).toBe(false);
+    if (!clash.ok) expect(clash.error).toMatch(/blackboard scope comes from pack "pk"/);
+
+    // The field the pack left out falls to the §3 profile, not to the spec.
+    const clean = adoptPackRoles(
+      { goal: "g", roles: [{ name: "review", providerId: "gemini" }] },
+      packLocksReadsOnly,
+    );
+    expect(clean.ok).toBe(true);
+    if (clean.ok) {
+      expect(clean.config.roles[0]!.reads).toEqual(["spec", "diff"]);
+      expect(clean.config.roles[0]!.writes).toBeUndefined();
+    }
+  });
+
+  test("the adopted scope is a copy, not the pack registry's own array", () => {
+    // `def.reads` belongs to the LoadedPack the pack service caches across
+    // collaborations; handing it out by reference makes one in-place sort or
+    // push rewrite the scope of every future collaboration adopting that pack.
+    const def = {
+      name: "review",
+      write: false,
+      network: false as const,
+      envelope: "all" as const,
+      reads: ["spec", "diff"],
+    };
+    const r = adoptPackRoles(
+      { goal: "g", roles: [{ name: "review", providerId: "gemini" }] },
+      { packId: "pk", roles: { review: def } },
+    );
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.config.roles[0]!.reads).not.toBe(def.reads);
+    r.config.roles[0]!.reads!.push("research");
+    expect(def.reads).toEqual(["spec", "diff"]);
+  });
+
   test("a pack with no opinion leaves the spec's declaration standing", () => {
     // `reads`/`writes` are OPTIONAL in the role YAML, unlike `write` — so this
     // cannot be an unconditional "the pack wins", or every existing pack would
@@ -1030,8 +1141,9 @@ describe("adoptPackRoles (unit)", () => {
     );
     expect(r.ok).toBe(false);
     if (!r.ok) {
-      expect(r.error).toMatch(/reads comes from pack "pk"/);
-      expect(r.error).toMatch(/spec, findings/);
+      expect(r.error).toMatch(/blackboard scope comes from pack "pk"/);
+      expect(r.error).toMatch(/reads: \[spec, findings\]/);
+      expect(r.error).toMatch(/drop the explicit reads/);
     }
   });
 
@@ -2169,6 +2281,31 @@ describe("collaboration survives a daemon restart", () => {
     expect(idx.entries[0]!.authorSub).toBe(`agent:${parent.id}:reasoning#1`);
   });
 
+  test("a resumed orchestrator gets its constitution back, not just its fence", async () => {
+    // #338's other half. `#attachOrchestratorBlackboard` always ran on resume,
+    // so a restarted orchestrator came back holding all four blackboard tools
+    // and reads on every core kind — with no goal, no roster, and no statement
+    // of its own scope, because `compileGoalPack` only ever ran at create and
+    // no constitution is persisted. Instruction and fence, disagreeing again,
+    // on every restart.
+    const parent = await createGoal("rs9");
+    const next = await restart();
+    const orch = next._sessionForTest(parent.id)!;
+    expect(orch.hasBlackboardMount).toBe(true); // the fence came back before
+
+    const c = orch.packConstitution;
+    expect(c).toBeDefined();
+    // Recompiled, not replayed from a stored copy — so the scope it states is
+    // the one TODAY's resolver enforces, which is what makes a daemon upgrade
+    // that widens a profile safe rather than a new source of drift.
+    const io = resolveRoleIo(ORCHESTRATOR_ROLE);
+    expect(c).toContain(`You can READ: ${io.reads.join(", ")}`);
+    expect(c).toContain(CONFIG.goal);
+    // ...and the roster, which is derived from the persisted config.
+    expect(c).toMatch(/review #2/);
+    expect(c).toMatch(/reasoning — claude/);
+  });
+
   test("destroying the goal after a restart revokes every resumed token", async () => {
     // The tokens minted during resume must be tracked, or each boot leaks one
     // still-valid credential per child and teardown revokes none of them.
@@ -2705,6 +2842,45 @@ describe("the orchestrator's constitution states the scope its fence enforces", 
     // §4's context economics: read scope is not an instruction to mirror the
     // board, and the index carries byte counts so it can choose.
     expect(c).toMatch(/Coordinate from the index/);
+  });
+
+  test("the tool descriptions state no scope of their own", () => {
+    // Scoped to the blackboard section on purpose. The tool bullets sit inches
+    // from the scope lines and are read as part of the same grant, so a
+    // hardcoded "publish your artifact (the shared spec, the task list)"
+    // survived `+writes=` removing both — instruction-vs-fence drift on the
+    // write side, invisible to the scope-line assertions above.
+    //
+    // NOT asserted over the whole constitution: "Panels and synthesis"
+    // legitimately names `findings`, because a panel writing `findings` is a
+    // fact about panels (MULTI_WRITER_KINDS), not a claim about this
+    // orchestrator's scope.
+    const section = compile({ name: "orchestrator", providerId: "claude", reads: [], writes: [] })
+      .split("## ")
+      .find((s) => s.startsWith("The goal blackboard"))!;
+    expect(section).toContain("You can READ: (nothing");
+    expect(section).toContain("You can WRITE: (nothing");
+    for (const kind of [...CORE_ARTIFACT_KINDS]) {
+      expect(section).not.toContain(`\`${kind}\``);
+    }
+    expect(section).not.toMatch(/the shared spec, the task list/);
+  });
+
+  test("the rules do not tell it to relay what the fence keeps apart", () => {
+    // Widening the synthesizer's reads made it the one agent that could hand a
+    // reviewer the implementer's reasoning by quoting it into a brief. No
+    // fence can stop that — the text is already in its context — so the rule
+    // has to be stated, and the old "you pass it deliberately" said the
+    // opposite of the blackboard model it now sits next to.
+    const c = compile({ name: "orchestrator", providerId: "claude" });
+    expect(c).toMatch(/name it and let it read/);
+    expect(c).toMatch(/NEVER use that to defeat a scope that exists/);
+    expect(c).not.toMatch(/you pass it deliberately/);
+    // ...and the role with NO scope still has a legal way to receive input.
+    // Deleting "you pass it deliberately" without this left every shipped
+    // pack's roles (all of which resolve to {[], []}) unable to be handed
+    // anything at all.
+    expect(c).toMatch(/A role scoped to read nothing works from the task you write/);
   });
 
   test("a child's brief and the orchestrator's constitution share one formatter", () => {

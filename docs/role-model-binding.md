@@ -101,8 +101,10 @@ differ only in model pins.
 ### 2.3 Invocation overrides, one grammar everywhere
 
 `pipeline run` gains the exact repeatable `--role` flag collab already has,
-reusing `parseRoleSpec` verbatim (minus `*count`, which is meaningless for a
-pipeline — rejected with a clear error):
+reusing `parseRoleSpec` verbatim minus the two segments that are collaboration
+concepts — `*count` (a pipeline runs one session per phase) and
+`+reads=`/`+writes=` (a phase's blackboard scope is not enforced until P4).
+Both are rejected with a clear error rather than accepted and ignored:
 
 ```bash
 codeoid pipeline run --pack yash-dev --goal "…" \
