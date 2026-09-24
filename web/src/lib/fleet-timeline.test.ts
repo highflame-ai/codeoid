@@ -118,6 +118,28 @@ describe("groupByDay", () => {
     expect(days[1]!.day).toBe(new Date(2026, 4, 10).getTime());
   });
 
+  it("hands the header a value that re-reads as the same calendar day", () => {
+    // `day` is consumed as `new Date(day.day).toLocaleDateString(…)` in
+    // FleetRail's TimelineView, so the contract is not just "local midnight" —
+    // it is that re-reading it as a local Date lands back on the day the
+    // entries belong to. The two come apart the moment `day` stops being an
+    // epoch ms: a `"YYYY-MM-DD"` string (a plausible refactor, for a stable
+    // key) is parsed as UTC midnight, which renders as the PREVIOUS day for
+    // every user west of the meridian — and the sibling test above would be
+    // rewritten alongside such a change without ever catching it.
+    //
+    // Raised by review on #335. TZ-independent on purpose: local-time
+    // constructors on both sides, so it holds in every zone rather than
+    // passing only in the one CI happens to run in.
+    const at = new Date(2026, 4, 10, 23, 30).getTime();
+    const days = groupByDay(buildTimeline([task("a", { createdAt: at })], []));
+    expect(days).toHaveLength(1);
+    const rendered = new Date(days[0]!.day);
+    expect(rendered.getFullYear()).toBe(2026);
+    expect(rendered.getMonth()).toBe(4);
+    expect(rendered.getDate()).toBe(10);
+  });
+
   it("keeps same-day entries together in order", () => {
     const days = groupByDay(
       buildTimeline([task("a", { createdAt: T }), task("b", { createdAt: T + 1_000 })], []),
