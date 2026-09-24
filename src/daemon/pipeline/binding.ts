@@ -131,13 +131,18 @@ export interface ParsedRoleSpec {
   providerId: string;
   model?: string;
   count?: number;
+  reads?: string[];
+  writes?: string[];
 }
 
 /**
  * Compile parsed `--role` specs into the pipeline `roleBindings` map. The
- * grammar is the collab one (`parseRoleSpec`) minus `*count`: a pipeline runs
- * ONE session per phase, so a fan-out suffix is a category error rejected here
- * with a create-time message rather than silently ignored (§5).
+ * grammar is the collab one (`parseRoleSpec`) minus `*count` and the
+ * `+reads=`/`+writes=` scope segments: a pipeline runs ONE session per phase,
+ * and a phase's blackboard scope is not consumed until P4 — so both are
+ * category errors rejected here with a create-time message rather than
+ * silently ignored (§5). An accepted-and-ignored scope is the exact shape of
+ * the design's "an unenforced field is false security".
  */
 export function roleBindingsFromSpecs(specs: ParsedRoleSpec[]): Record<string, ModelBinding> {
   const out: Record<string, ModelBinding> = {};
@@ -150,6 +155,13 @@ export function roleBindingsFromSpecs(specs: ParsedRoleSpec[]): Record<string, M
       throw new Error(
         `--role "${s.name}": fan-out is a collaboration concept; pipelines run one session per phase`,
       );
+    }
+    for (const field of ["reads", "writes"] as const) {
+      if (s[field] !== undefined) {
+        throw new Error(
+          `--role "${s.name}": +${field}= is a collaboration concept; a pipeline phase's blackboard scope is not enforced yet (P4)`,
+        );
+      }
     }
     const key = s.name.toLowerCase();
     if (seen.has(key)) {

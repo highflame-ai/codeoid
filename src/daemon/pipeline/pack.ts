@@ -10,6 +10,8 @@
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, resolve, sep } from "node:path";
 import { z } from "zod";
+import { LIMITS } from "../../protocol/types.js";
+import { ARTIFACT_KIND_MAX, artifactKindError, isValidArtifactKind } from "../blackboard/types.js";
 import {
   DEFAULT_BLOCKING,
   DEFAULT_MAX_ROUNDS,
@@ -36,6 +38,31 @@ const idField = z
   .min(1)
   .max(64)
   .regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/, "must be an alphanumeric id (._- allowed)");
+
+/**
+ * A bounded list of blackboard artifact kinds, each checked to be a real one.
+ *
+ * `isValidArtifactKind` here and not only in `validateCollaboration` because a
+ * role can be reached without ever crossing that function (a pipeline phase's
+ * role), and a kind that is silently wrong is worse than one that is loudly
+ * rejected: the role looks scoped and fences nothing.
+ */
+const artifactKinds = () =>
+  z
+    .array(z.string().min(1).max(ARTIFACT_KIND_MAX))
+    // `abort` so an over-long list stops here. Zod does NOT short-circuit a
+    // later `superRefine` on a failed `.max()`, so without it a role YAML with
+    // 100k entries allocates 100k issue objects — each embedding a formatted
+    // copy of the offending string — before reporting "too big".
+    .max(LIMITS.COLLABORATION_ROLE_SCOPE_MAX, { abort: true })
+    .superRefine((kinds, ctx) => {
+      // Reported per entry, and `loadPack` surfaces only `issues[0]`, so name
+      // the offender in the message itself rather than relying on `path`.
+      kinds.forEach((kind, i) => {
+        if (isValidArtifactKind(kind)) return;
+        ctx.addIssue({ code: "custom", path: [i], message: artifactKindError(kind) });
+      });
+    });
 
 /** A capability role (ai-factory `roles/*.yaml` format) — compiled to Cedar and
  *  enforced by Shield in a later slice; parsed + carried on phases now. */
@@ -67,6 +94,35 @@ export const roleSchema = z.object({
   /** Model within `provider`. Absent = that backend's default. */
   model: z.string().min(1).max(256).optional(),
   write: z.boolean(),
+  /**
+   * Blackboard artifact kinds this role may READ / WRITE in a collaboration
+   * (docs/collaborative-session-design.md §4) — a core kind (`spec`,
+   * `research`, `adr`, `task-list`, `diff`, `findings`) or `extra/<key>`.
+   *
+   * Absent = the §3 default profile for the role's NAME, which is what every
+   * pack relies on today. Present = authoritative: it is part of the capability
+   * envelope, like `write`, so a collab spec that declares a scope for the same
+   * role is an error rather than a silent override (`adoptPackRoles`).
+   *
+   * Declaring them here is the "adding a role stays a config change" half of
+   * §3 — before #338 the field existed on the wire and on no reachable path.
+   *
+   * Validated HERE, at load, rather than left to `validateCollaboration`. A
+   * role is shared by both topologies: on the collab path the validator does
+   * see it, but a role used only by a pipeline PHASE never reaches that
+   * function, so a typo'd `reads: ["diffs"]` would load clean and fence
+   * nothing. Fail-fast on the file is the rule the rest of this loader already
+   * follows, and it keeps one message for a bad kind on every path.
+   *
+   * Scope is still only ENFORCED on the collaboration path — a phase's
+   * `reads`/`writes` graduate from metadata to a fence in P4 (§8). That is why
+   * `pipeline run --role` rejects `+reads=` outright (binding.ts): a per-run
+   * override of something no phase reads would be a fence that isn't there,
+   * whereas the role's own YAML is the role's definition and is consumed
+   * wherever the topology supports it.
+   */
+  reads: artifactKinds().optional(),
+  writes: artifactKinds().optional(),
   network: z.union([z.boolean(), z.literal("read-only")]).default(false),
   envelope: z.union([z.literal("all"), z.array(z.string().max(32)).max(32)]),
   exceptions: z

@@ -460,7 +460,7 @@ program
   )
   .option(
     "--role <spec>",
-    'Role→backend binding, repeatable: "name:provider[:model][*count]" (e.g. orchestrator:claude, reasoning:openai:gpt-5-codex, review:gemini*3). Requires --collaborate.',
+    'Role→backend binding, repeatable: "name:provider[:model][*count][+reads=a,b][+writes=c]" (e.g. orchestrator:claude, reasoning:openai:gpt-5-codex, review:gemini*3, search:claude+reads=spec+writes=research). reads/writes override the role\'s default blackboard scope; "+reads=" declares none. Requires --collaborate.',
     (value: string, previous: string[] = []) => [...previous, value],
     [] as string[],
   )
@@ -680,7 +680,7 @@ pipeline
   .option("--workdir <path>", "Repo the phases operate in (default: current directory)")
   .option(
     "--role <spec>",
-    'Bind a role to a backend for this run, repeatable: "name:provider[:model]" (e.g. adversary:claude:claude-fable-5). Outranks config maps and pack pins. No *count — pipelines run one session per phase.',
+    'Bind a role to a backend for this run, repeatable: "name:provider[:model]" (e.g. adversary:claude:claude-fable-5). Outranks config maps and pack pins. No *count — pipelines run one session per phase — and no +reads=/+writes=, which a phase does not enforce yet.',
     (value: string, previous: string[] = []) => [...previous, value],
     [] as string[],
   )
