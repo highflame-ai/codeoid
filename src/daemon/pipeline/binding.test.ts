@@ -139,6 +139,24 @@ describe("roleBindingsFromSpecs", () => {
     ).toThrow("fan-out is a collaboration concept");
   });
 
+  test("rejects a blackboard scope a phase would not enforce", () => {
+    // `parseRoleSpec` is one grammar for both commands, so `+reads=` parses on
+    // the pipeline path too — and a phase's `reads`/`writes` stay reserved
+    // until P4. Accepting one here would be the design's own "an unenforced
+    // field is false security", with the operator believing a fence exists.
+    expect(() =>
+      roleBindingsFromSpecs([{ name: "review", providerId: "gemini", reads: ["spec", "diff"] }]),
+    ).toThrow("+reads= is a collaboration concept");
+    expect(() =>
+      roleBindingsFromSpecs([{ name: "review", providerId: "gemini", writes: ["findings"] }]),
+    ).toThrow("+writes= is a collaboration concept");
+    // Declared-empty is still a declaration, so it is rejected too rather than
+    // slipping through a truthiness check.
+    expect(() =>
+      roleBindingsFromSpecs([{ name: "review", providerId: "gemini", reads: [] }]),
+    ).toThrow("+reads= is a collaboration concept");
+  });
+
   test("rejects the same role bound twice", () => {
     expect(() =>
       roleBindingsFromSpecs([

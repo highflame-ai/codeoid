@@ -278,6 +278,34 @@ describe("the token carries the role's scope", () => {
     expect(text).toMatch(/You may write: findings/);
   });
 
+  test("the orchestrator's live mount reaches every child's artifact (#338)", async () => {
+    // Over the real transport this time: the reported failure was an
+    // orchestrator seeing `research` on the index and getting a denial when it
+    // asked for the body, which left synthesis restating the one kind it could
+    // reach. Each of these was a refusal before the profile was widened.
+    bb.forRole(GOAL, ident("search")).write("research", "SEARCH FOUND THIS");
+    bb.forRole(GOAL, ident("architecture")).write("adr", "THE DECISION");
+    bb.forRole(GOAL, ident("reasoning")).write("diff", "THE CHANGE");
+    bb.forRole(GOAL, ident("review")).write("findings", "THE CRITIQUE");
+    const token = mcp.mint(bb.forRole(GOAL, ident("orchestrator")));
+
+    for (const [kind, body] of [
+      ["research", "SEARCH FOUND THIS"],
+      ["adr", "THE DECISION"],
+      ["diff", "THE CHANGE"],
+      ["findings", "THE CRITIQUE"],
+    ] as const) {
+      const r = await call(token, "blackboard_read", { kind, ...(kind === "findings" ? { slot: "review" } : {}) });
+      expect(textOf(r.body)).toContain(body);
+    }
+
+    // ...and the mount states the widened scope, so the agent plans from it
+    // rather than discovering each kind by being refused.
+    expect(textOf((await call(token, "blackboard_index")).body)).toMatch(
+      /You may read: spec, research, adr, task-list, diff, findings/,
+    );
+  });
+
   test("an unknown tool is an error result, not a crash", async () => {
     const token = mcp.mint(bb.forRole(GOAL, ident("review")));
     const r = await call(token, "blackboard_nope");

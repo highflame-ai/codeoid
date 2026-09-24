@@ -271,6 +271,67 @@ describe("reviewer independence", () => {
   });
 });
 
+// ── Service: the synthesizer's read set (#338) ──────────────────────────────
+
+// Peer isolation is a property of the PANEL. Applied to the orchestrator — the
+// one role §7 makes responsible for merging everybody's output, and the only
+// one that reports to the owner — it produced a constitution instructing the
+// agent to "read each role's artifact" next to a fence that refused all but
+// two kinds. The instruction and the fence agree now because the read set grew,
+// not because the instruction shrank.
+describe("the orchestrator reads what it is told to synthesize", () => {
+  test("its default read set is every core kind", () => {
+    expect(DEFAULT_ROLE_IO.orchestrator).toEqual({
+      reads: [...CORE_ARTIFACT_KINDS],
+      writes: ["spec", "task-list"],
+    });
+  });
+
+  test.each([...CORE_ARTIFACT_KINDS])("is scoped to read %s", (kind) => {
+    expect(bb.forRole(GOAL, ident("orchestrator")).read(kind).ok).toBe(true);
+  });
+
+  test("the #338 repro: a search child's research comes back, not a denial", () => {
+    bb.forRole(GOAL, ident("search")).write("research", "WHAT I FOUND");
+    const r = bb.forRole(GOAL, ident("orchestrator")).read("research");
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.value?.content).toBe("WHAT I FOUND");
+  });
+
+  test("widening the synthesizer did not widen the panel", () => {
+    // The independence property is scoped to PEERS, and must not have moved by
+    // one kind — that would be trading one bug for the worse one.
+    const review = bb.forRole(GOAL, ident("review"));
+    expect(review.read("research").ok).toBe(false);
+    expect(review.read("adr").ok).toBe(false);
+    expect(review.read("findings").ok).toBe(false);
+  });
+
+  test("reading everything is not writing everything", () => {
+    const orch = bb.forRole(GOAL, ident("orchestrator"));
+    expect(orch.write("spec", "S").ok).toBe(true);
+    expect(orch.write("task-list", "T").ok).toBe(true);
+    // Synthesis READS a diff; it does not author one. The orchestrator holds no
+    // repo write authority either (§6), and its board scope agrees.
+    expect(orch.write("diff", "D").ok).toBe(false);
+    expect(orch.write("findings", "F").ok).toBe(false);
+    expect(orch.write("research", "R").ok).toBe(false);
+  });
+
+  test("an extra/<key> handoff still needs declaring — there is no wildcard", () => {
+    bb.forRole(GOAL, ident("search"), { writes: ["extra/sources"] }).write("extra/sources", "URLS");
+    expect(bb.forRole(GOAL, ident("orchestrator")).read("extra/sources").ok).toBe(false);
+    // Declaring it is the other half of #338: reachable from a `--role` spec's
+    // `+reads=` and from a pack role's YAML, not only from a hand-built client.
+    const declared = bb.forRole(GOAL, ident("orchestrator"), {
+      reads: [...CORE_ARTIFACT_KINDS, "extra/sources"],
+    });
+    const r = declared.read("extra/sources");
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.value?.content).toBe("URLS");
+  });
+});
+
 describe("the default profile wires the §3 handoff chain", () => {
   test("search → architecture → reasoning → review flows through artifacts", () => {
     const search = bb.forRole(GOAL, ident("search"));
@@ -324,7 +385,7 @@ describe("the default profile wires the §3 handoff chain", () => {
 // to write (an owner write would land with no role attribution and no scope
 // check on a board whose whole contract is attributable handoffs).
 describe("the goal owner's view", () => {
-  test("reads across every role's lane, which no single role can", () => {
+  test("reads across every role's lane without holding one", () => {
     bb.forRole(GOAL, ident("orchestrator")).write("spec", "SPEC");
     bb.forRole(GOAL, ident("search")).write("research", "RESEARCH");
     bb.forRole(GOAL, ident("reasoning")).write("diff", "DIFF");
@@ -334,7 +395,10 @@ describe("the goal owner's view", () => {
     expect(owner.read("research")?.content).toBe("RESEARCH");
     expect(owner.read("diff")?.content).toBe("DIFF");
 
-    // No role can do that: the reasoner reaches `diff` but never `research`.
+    // A worker cannot: the reasoner reaches `diff` but never `research`. (The
+    // orchestrator does read every core kind — what stays unique to this handle
+    // is needing no role at all, plus superseded versions and undeclared
+    // `extra/` keys, both below.)
     expect(bb.forRole(GOAL, ident("reasoning")).read("research").ok).toBe(false);
   });
 

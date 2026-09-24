@@ -49,10 +49,12 @@ export const collaborationRoleSchema = z.object({
   /**
    * Blackboard artifact scoping. Bounded string arrays here; whether each name
    * is a real kind is checked by the daemon, so an unknown kind gets a specific
-   * error naming the valid set instead of an opaque schema rejection.
+   * error naming the valid set instead of an opaque schema rejection. The
+   * per-entry 64 is `ARTIFACT_KIND_MAX` (`src/daemon/blackboard/types.ts`) —
+   * the daemon's own bound on a stored kind.
    */
-  reads: z.array(z.string().min(1).max(64)).max(16).optional(),
-  writes: z.array(z.string().min(1).max(64)).max(16).optional(),
+  reads: z.array(z.string().min(1).max(64)).max(LIMITS.COLLABORATION_ROLE_SCOPE_MAX).optional(),
+  writes: z.array(z.string().min(1).max(64)).max(LIMITS.COLLABORATION_ROLE_SCOPE_MAX).optional(),
 });
 
 export const collaborationConfigSchema = z.object({

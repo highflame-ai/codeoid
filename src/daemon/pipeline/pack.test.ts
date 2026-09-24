@@ -9,6 +9,8 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { LIMITS } from "../../protocol/types.js";
+import { ARTIFACT_KIND_MAX } from "../blackboard/types.js";
 import { createRegistries } from "./registry";
 import type { PhaseDef } from "./interface";
 import { PipelineManager } from "./manager";
@@ -639,6 +641,67 @@ describe("role tier schema (loadPack)", () => {
       );
     expect(() => loadPack(bad(""))).toThrow("invalid role");
     expect(() => loadPack(bad("x".repeat(65)))).toThrow("invalid role");
+  });
+});
+
+// A role's blackboard scope is part of its capability envelope, so it is
+// declarable where the rest of the envelope is (#338): the role YAML. It had
+// existed on the wire and on no reachable path, which made §3's "adding a role
+// stays a config change" untrue for the one field that scopes handoffs.
+describe("role blackboard scope (loadPack)", () => {
+  const withRole = (yaml: string): string =>
+    writePack(
+      "schema: codeoid/pack@v1\nid: p\nname: P\nversion: 0.0.1\nroles: [./roles/r.yaml]\nphases:\n  - id: a\n    kind: noop\n",
+      { roles: { "r.yaml": yaml } },
+    );
+
+  test("reads/writes parse and are carried on the RoleDef", () => {
+    const pack = loadPack(
+      withRole(
+        "name: r\nwrite: false\nenvelope: all\nreads: [spec, diff, extra/sources]\nwrites: [findings]\n",
+      ),
+    );
+    expect(pack.roles.r.reads).toEqual(["spec", "diff", "extra/sources"]);
+    expect(pack.roles.r.writes).toEqual(["findings"]);
+  });
+
+  test("absent stays absent, so the §3 default profile still applies", () => {
+    // Defaulting to [] here would strip every existing pack's role down to
+    // touching nothing, silently.
+    const pack = loadPack(withRole("name: r\nwrite: false\nenvelope: all\n"));
+    expect(pack.roles.r.reads).toBeUndefined();
+    expect(pack.roles.r.writes).toBeUndefined();
+  });
+
+  test("an empty list is preserved — it declares that the role touches nothing", () => {
+    const pack = loadPack(withRole("name: r\nwrite: false\nenvelope: all\nreads: []\n"));
+    expect(pack.roles.r.reads).toEqual([]);
+  });
+
+  test("rejects an unknown kind at LOAD, not only on the collab path", () => {
+    // A role reached only through a pipeline PHASE never sees
+    // `validateCollaboration`, so leaving the check there would let a typo'd
+    // `reads: ["diffs"]` load clean and fence nothing — the role looks scoped
+    // and is not. Same sentence the `--role` path produces.
+    expect(() => loadPack(withRole('name: r\nwrite: false\nenvelope: all\nreads: ["diffs"]\n'))).toThrow(
+      /unknown artifact kind "diffs"/,
+    );
+    expect(() => loadPack(withRole('name: r\nwrite: false\nenvelope: all\nwrites: ["extra/BAD"]\n'))).toThrow(
+      /unknown artifact kind "extra\/BAD"/,
+    );
+    // ...and a well-formed `extra/<key>` is not collateral damage.
+    expect(loadPack(withRole("name: r\nwrite: false\nenvelope: all\nreads: [extra/bench-results]\n")).roles.r.reads)
+      .toEqual(["extra/bench-results"]);
+  });
+
+  test("rejects an over-long list and an over-long kind", () => {
+    const many = Array.from({ length: LIMITS.COLLABORATION_ROLE_SCOPE_MAX + 1 }, (_, i) => `extra/k${i}`);
+    expect(() => loadPack(withRole(`name: r\nwrite: false\nenvelope: all\nreads: [${many.join(", ")}]\n`))).toThrow(
+      "invalid role",
+    );
+    expect(() =>
+      loadPack(withRole(`name: r\nwrite: false\nenvelope: all\nreads: ["${"x".repeat(ARTIFACT_KIND_MAX + 1)}"]\n`)),
+    ).toThrow("invalid role");
   });
 });
 

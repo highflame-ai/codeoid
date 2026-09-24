@@ -19,11 +19,15 @@
  * by proxy) and may NOT read `findings` — not even another reviewer's. A panel
  * whose members can read each other is not a panel; it's an echo. That is why
  * `review`'s default read set is exactly two kinds.
+ *
+ * That property is about PEERS, and it does not generalize to the whole table.
+ * The orchestrator synthesizes the roster's work and is the one agent that
+ * reports to the owner, so it reads every core kind — see DEFAULT_ROLE_IO.
  */
 
 import type { BlackboardStore, GoalScope } from "./store.js";
 import type { Artifact, ArtifactIndexEntry } from "./types.js";
-import { ARTIFACT_CONTENT_MAX, isValidArtifactKind } from "./types.js";
+import { ARTIFACT_CONTENT_MAX, CORE_ARTIFACT_KINDS, isValidArtifactKind } from "./types.js";
 
 /** What a role may read and write. Both default to EMPTY — fail closed. */
 export interface RoleIo {
@@ -40,9 +44,27 @@ export interface RoleIo {
  * Note what `review` deliberately lacks: `research` (the implementer's
  * reasoning by proxy) and `findings` (its peers' opinions). Independence is a
  * consequence of the read set, not of asking nicely.
+ *
+ * And note what the ORCHESTRATOR deliberately has: every core kind. Peer
+ * isolation is a property of the PANEL — a reviewer that can read its peers is
+ * an echo — and the orchestrator is not a panel member. §7 makes it the
+ * synthesizer and the only agent that reports to the owner, so a read set that
+ * stopped at `spec`+`findings` (as it did until #338) left it instructed to
+ * merge `research`/`adr`/`diff` that the fence then refused. Read scope is not
+ * an obligation to read: §4's "holds an index, not the artifacts" is about
+ * context economics, and the index carries byte counts precisely so the
+ * orchestrator can decide what is worth pulling.
+ *
+ * `extra/<key>` is NOT covered — the scope model is a list of kinds, with no
+ * wildcard. A pack that hands work off through `extra/` must name those keys
+ * in the orchestrator's `reads` (a role YAML field, or `+reads=` on a
+ * `--role` spec).
  */
 export const DEFAULT_ROLE_IO: Readonly<Record<string, RoleIo>> = {
-  orchestrator: { reads: ["spec", "findings"], writes: ["spec", "task-list"] },
+  // Every core kind, by name via CORE_ARTIFACT_KINDS so a seventh kind is
+  // readable by the synthesizer the day it is added rather than the day
+  // someone notices this list did not grow with it.
+  orchestrator: { reads: [...CORE_ARTIFACT_KINDS], writes: ["spec", "task-list"] },
   search: { reads: ["spec"], writes: ["research"] },
   architecture: { reads: ["spec", "research"], writes: ["adr", "task-list"] },
   reasoning: { reads: ["spec", "adr", "task-list"], writes: ["diff"] },
@@ -75,9 +97,14 @@ export function resolveRoleIo(
   declared?: { reads?: readonly string[]; writes?: readonly string[] },
 ): RoleIo {
   const fallback = DEFAULT_ROLE_IO[roleName];
+  // Copied, never aliased. Returning `fallback.reads` directly handed every
+  // caller the live profile array behind a `readonly` type that only the
+  // compiler enforces — one `(io.reads as string[]).push(…)` anywhere would
+  // have widened the fence for every role instance in the process, for the
+  // life of the daemon. `Readonly<Record<…>>` is shallow and does not cover it.
   return {
-    reads: declared?.reads ?? fallback?.reads ?? [],
-    writes: declared?.writes ?? fallback?.writes ?? [],
+    reads: [...(declared?.reads ?? fallback?.reads ?? [])],
+    writes: [...(declared?.writes ?? fallback?.writes ?? [])],
   };
 }
 
@@ -163,6 +190,14 @@ export class RoleBlackboard {
    * into its own slot and has no way to name someone else's. Letting a caller
    * pass a slot would hand one reviewer the ability to overwrite another's
    * findings, which is the whole thing slots exist to prevent.
+   *
+   * Checks `writes` only, and NOT `reads` — a role can publish a kind it cannot
+   * read back. Confirmed deliberate (#338): granting read-back on write would
+   * hand `review` its own `findings` kind, and from there its peers' entries,
+   * collapsing the panel property this file exists to hold. Nothing is lost by
+   * it — writes append rather than overwrite, and a role's own output is
+   * already in its transcript. A role that genuinely needs its prior version
+   * back declares the kind in `reads`.
    */
   write(kind: string, content: string): BlackboardResult<Artifact> {
     if (!isValidArtifactKind(kind)) {
