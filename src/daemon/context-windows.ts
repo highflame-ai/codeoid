@@ -6,6 +6,7 @@
  *
  *   - claude-fable-5 / claude-mythos-5: 1,000,000
  *   - claude-opus-4-5 through claude-opus-4-8: 1,000,000
+ *   - claude-opus-5 / claude-opus-5-5: 1,000,000
  *   - claude-sonnet-5 / claude-sonnet-4-6: 1,000,000
  *   - claude-haiku-4-x: 200,000
  *
@@ -33,6 +34,15 @@ const ONE_MILLION_FAMILIES = [
   "opus-4.7",
   "opus-4-8",
   "opus-4.8",
+  // `opus-5` covers claude-opus-5, claude-opus-5-5 and any later 5.x point
+  // release, since the match is a substring. It was MISSING while the catalog
+  // already pointed `opus` at claude-opus-5, so once the SDK reported the
+  // concrete id back, `SessionInfo.model` became a value this table did not
+  // know and the window collapsed to the 200k fallback — a 5x under-size on
+  // the percent-of-window display, the fork seed budget, and the auto-rotate
+  // occupancy that decides when a session rolls. Confirmed on 0.3.281:
+  // `modelUsage["claude-opus-5-5"].contextWindow` is 1,000,000.
+  "opus-5",
   "sonnet-5",
   "sonnet-4-6",
   "sonnet-4.6",
@@ -60,8 +70,10 @@ export function contextWindowForModel(modelId: string | undefined | null): numbe
   // (seedBudgetChars), and auto-rotate occupancy.
   if (m.includes("-1m") || m.includes("[1m]")) return ONE_MILLION_CONTEXT;
 
-  // Aliases (matching the daemon's model resolver: opus → Opus 4.8,
-  // sonnet → Sonnet 5 — both 1M; haiku → Haiku 4.5 at 200k).
+  // Bare aliases, matching the daemon's model resolver: `opus` and `sonnet`
+  // are 1M families, `haiku` is 200k. Deliberately not versioned here — the
+  // alias floats to whatever the backend currently serves it as, and the
+  // family lists above cover the concrete ids it reports back.
   if (m === "opus" || m === "sonnet") return ONE_MILLION_CONTEXT;
   if (m === "haiku") return DEFAULT_CONTEXT_WINDOW;
 
