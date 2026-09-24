@@ -75,6 +75,27 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The context window is no longer guessed from the model id.**
+  codeoid inferred every window from a substring table over model ids, and that table was wrong the moment a model shipped: `claude-opus-5-5` inferred to the 200k fallback while every turn result reported 1,000,000.
+  Everything sized against it was off by 5× — the percent-of-window display, the fork seed budget, and the auto-rotate occupancy that decides when a session rolls, so auto-rotate fired at about a fifth of real capacity.
+
+  The backends already knew. The daemon now takes what they report and caches it per `(provider, model)`, persisted, so the number survives a restart and the first session to learn a model's window teaches every later one.
+
+  Audited across every backend codeoid drives, because they do not agree on how they publish it — and two ingresses were needed to cover them:
+
+  | Backend | Publishes | Where |
+  | --- | --- | --- |
+  | claude | per turn | `result.modelUsage[model].contextWindow` |
+  | codex | per turn | `thread/tokenUsage/updated` → `tokenUsage.modelContextWindow` |
+  | qwen | **per model, before any turn** | its catalog's `contextWindowSize` |
+  | gemini · openai · pi · acp | nothing | — |
+
+  qwen's is the best signal of the three and was being thrown away: `normalizeModelCatalog` projected the catalog down to id/label/description and dropped the window. codex's arrived on a notification codeoid already handled and read only two of its three fields.
+
+  The static tables stay, demoted to what they always should have been — a bootstrap. Nothing can know a window before a turn completes on the two per-turn backends (a catalog entry carries none there), and four backends report none at all, so an inferred floor is structurally required. It is now the last resort rather than the only answer, and it stays a positive number so a silent backend never divides the percent-of-window by zero.
+
+  Also fixed at the source: the Claude provider derived the turn's model from `Object.keys(modelUsage)[0]`, but that map is keyed by every model a turn touched and ordered by insertion — a Haiku side-call routinely sits in front of the model that did the work. So an Opus turn was labelled Haiku in canonical history, and reading a window off that entry would have reported 200k for a 1M turn: the same bug, at the point that was supposed to cure it. The SDK names the primary model on its `init` message; it is used instead.
+
 - **A collaboration's orchestrator could not read the artifacts its own constitution told it to synthesize** (#338).
   The compiled goal pack instructs it to "read each role's artifact from the blackboard, merge, and show disagreement", while its default profile read `spec` and `findings` only.
   So `research` (search's output), `adr` (architecture's) and `diff` (reasoning's) all came back as `Role "orchestrator" may not read "research"`, and synthesis collapsed into restating the one artifact it could reach.

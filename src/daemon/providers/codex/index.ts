@@ -272,6 +272,8 @@ export class CodexProvider implements SessionProvider {
    * counts. Captured here and folded into turn_done.
    */
   #lastTokenUsage: CodexTokenUsage | null = null;
+  /** Window codex reported for the model driving this thread, if it has. */
+  #modelContextWindow: number | null = null;
   /** item id → {name, input} for items already announced via tool_start. */
   #announcedItems = new Map<string, { name: string; input: Record<string, unknown> }>();
   /**
@@ -674,6 +676,9 @@ export class CodexProvider implements SessionProvider {
           cacheCreationTokens: 0,
           totalCostUsd: 0,
           durationMs: Date.now() - this.#turnStartedAt,
+          ...(this.#modelContextWindow !== null
+            ? { contextWindow: this.#modelContextWindow }
+            : {}),
           stopReason: (turn?.status as string | undefined) ?? undefined,
         };
         this.#push({ type: "turn_done", result });
@@ -681,8 +686,18 @@ export class CodexProvider implements SessionProvider {
         break;
       }
       case "thread/tokenUsage/updated": {
-        const usage = (params.tokenUsage as { last?: CodexTokenUsage } | undefined)?.last;
-        if (usage) this.#lastTokenUsage = usage;
+        // `ThreadTokenUsage` has three fields on this wire — `last`, `total`
+        // and `modelContextWindow` (confirmed in the codex binary's own serde
+        // descriptors: "struct ThreadTokenUsage with 3 elements"). codeoid read
+        // only `last` and inferred the window from the model id instead, which
+        // is the guess this change exists to stop making.
+        const tu = params.tokenUsage as
+          | { last?: CodexTokenUsage; modelContextWindow?: number }
+          | undefined;
+        if (tu?.last) this.#lastTokenUsage = tu.last;
+        if (typeof tu?.modelContextWindow === "number" && tu.modelContextWindow > 0) {
+          this.#modelContextWindow = tu.modelContextWindow;
+        }
         break;
       }
       case "error": {

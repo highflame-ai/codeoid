@@ -16,8 +16,13 @@
  *
  * Conservative-by-design: under-estimating a window over-truncates (safe, and
  * surfaced); over-estimating risks overflowing the model's real window (breaks
- * the turn). Refine entries here as real numbers are confirmed, or later from
- * provider-reported ModelInfo.
+ * the turn).
+ *
+ * Both functions take an optional `reported` window that OUTRANKS everything
+ * here — the daemon caches what each backend said about a model on a completed
+ * turn (`SessionManager.modelContextWindow`). The tables below are the
+ * bootstrap for what that cache cannot answer: a model no turn has run on yet,
+ * and backends that report no limits at all. They are a floor, not the truth.
  */
 
 import { contextWindowForModel as claudeContextWindow } from "../context-windows.js";
@@ -59,7 +64,16 @@ const MODEL_WINDOW_OVERRIDES: ReadonlyArray<{ match: RegExp; window: number }> =
  * Claude-only and drives SessionInfo's percent-of-window UI. This one is
  * provider-aware and sized for cross-backend seeding.
  */
-export function targetContextWindow(providerId: string, model?: string | null): number {
+export function targetContextWindow(
+  providerId: string,
+  model?: string | null,
+  reported?: number,
+): number {
+  // A number the BACKEND reported for this exact (provider, model) beats
+  // every guess below it. The tiers that follow are inference — they exist
+  // because nothing knows a window until a turn has run, and some backends
+  // never report one.
+  if (reported !== undefined && reported > 0) return reported;
   if (model) {
     // Claude models: reuse the canonical Claude catalog (opus/sonnet/haiku +
     // full ids + aliases), so there's one place that knows Claude windows.
@@ -97,9 +111,13 @@ export const SEED_CHARS_PER_TOKEN = 3.5;
  * a huge-context model); it also lets the resume-beyond-budget eval force
  * truncation with a small history instead of ~490k chars.
  */
-export function seedBudgetChars(providerId: string, model?: string | null): number {
+export function seedBudgetChars(
+  providerId: string,
+  model?: string | null,
+  reported?: number,
+): number {
   const override = Number(process.env.CODEOID_SEED_BUDGET_CHARS);
   if (Number.isFinite(override) && override > 0) return Math.floor(override);
-  const window = targetContextWindow(providerId, model);
+  const window = targetContextWindow(providerId, model, reported);
   return Math.floor(window * SEED_WINDOW_FRACTION * SEED_CHARS_PER_TOKEN);
 }

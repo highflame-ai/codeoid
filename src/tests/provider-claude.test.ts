@@ -327,8 +327,69 @@ describe("translateSDKMessage – result", () => {
     expect(errorMessage).toContain("produced no turn");
   });
 
+  it("reports the primary model and its window, not whichever key came first", () => {
+    // Measured on the live backend: a single `opus` turn produces a modelUsage
+    // map with the Haiku side-call (title generation) keyed FIRST, because the
+    // order is insertion, not significance. Taking `Object.keys(...)[0]`
+    // labelled the turn as Haiku and would have read Haiku's 200k window for
+    // a 1M turn — the very bug this change exists to remove, reintroduced at
+    // the source. The SDK names the primary model on `init`; use that.
+    const state = { lastLocalCommandStderr: null as string | null, primaryModel: null as string | null };
+    const out: ProviderEvent[] = [];
+    const emit = (e: ProviderEvent) => out.push(e);
+
+    translateSDKMessage(
+      { type: "system", subtype: "init", model: "claude-opus-5-5", tools: [], mcp_servers: [] } as never,
+      emit,
+      "claude",
+      state,
+    );
+    expect(state.primaryModel).toBe("claude-opus-5-5");
+
+    translateSDKMessage(
+      {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        num_turns: 1,
+        usage: { input_tokens: 2, output_tokens: 4 },
+        modelUsage: {
+          "claude-haiku-4-5-20251001": { inputTokens: 900, outputTokens: 9, contextWindow: 200_000, maxOutputTokens: 32_000 },
+          "claude-opus-5-5": { inputTokens: 2, outputTokens: 4, contextWindow: 1_000_000, maxOutputTokens: 128_000 },
+        },
+      } as never,
+      emit,
+      "claude",
+      state,
+    );
+
+    const done = out.find((e) => e.type === "turn_done") as
+      | { result: { model: string; contextWindow?: number; maxOutputTokens?: number } }
+      | undefined;
+    expect(done).toBeDefined();
+    expect(done!.result.model).toBe("claude-opus-5-5");
+    expect(done!.result.contextWindow).toBe(1_000_000);
+    expect(done!.result.maxOutputTokens).toBe(128_000);
+  });
+
+  it("omits the window when the backend reports no usage for the primary model", () => {
+    // qwen against the Bailian gateway returns an empty usage map. Absent must
+    // stay absent so the caller falls back to inference, rather than becoming
+    // a 0 that divides the percent-of-window by zero.
+    const state = { lastLocalCommandStderr: null as string | null, primaryModel: null as string | null };
+    const out: ProviderEvent[] = [];
+    translateSDKMessage(
+      { type: "result", subtype: "success", is_error: false, num_turns: 1, usage: {}, modelUsage: {} } as never,
+      (e) => out.push(e),
+      "claude",
+      state,
+    );
+    const done = out.find((e) => e.type === "turn_done") as { result: { contextWindow?: number } };
+    expect(done.result.contextWindow).toBeUndefined();
+  });
+
   it("attributes a zero-turn run to the local-command-stderr that caused it", () => {
-    const state = { lastLocalCommandStderr: null as string | null };
+    const state = { lastLocalCommandStderr: null as string | null, primaryModel: null as string | null };
     const out: ProviderEvent[] = [];
     const emit = (e: ProviderEvent) => out.push(e);
     // The SDK reports the cause on an earlier message than the result, so the
@@ -1579,7 +1640,7 @@ describe("translateSDKMessage — background tasks", () => {
       msg as never,
       (e) => turnEvents.push(e),
       "claude",
-      { lastLocalCommandStderr: null },
+      { lastLocalCommandStderr: null, primaryModel: null },
       (e) => sessionEvents.push(e),
     );
     return { turnEvents, sessionEvents };

@@ -1686,6 +1686,19 @@ export interface ModelInfo {
   description?: string;
   /** True for the backend's recommended default. */
   isDefault?: boolean;
+  /**
+   * Context window in tokens, when the BACKEND publishes it on its catalog.
+   *
+   * The better of the two ingresses, because it is known before any turn runs:
+   * qwen-code's model list carries `contextWindowSize` per entry. Claude's
+   * `ModelInfo` carries none and only reports the window on a completed turn,
+   * and codex reports it on its token-usage notification — so the daemon
+   * accepts both and caches whichever arrives (`SessionManager.modelContextWindow`).
+   *
+   * Absent for backends that publish no limits (gemini, openai, pi, acp), where
+   * the daemon falls back to inferring one from the model id.
+   */
+  contextWindow?: number;
 }
 
 /**

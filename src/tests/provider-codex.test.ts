@@ -134,6 +134,10 @@ describe("CodexProvider over fake-codex", () => {
       expect(turnDone.result.inputTokens).toBe(100);
       expect(turnDone.result.outputTokens).toBe(45);
       expect(turnDone.result.cacheReadTokens).toBe(20);
+      // ...and the window codex reported alongside that usage, rather than
+      // codeoid inferring one from the model id. Same notification, third
+      // field; it was being dropped.
+      expect(turnDone.result.contextWindow).toBe(272_000);
     }
   });
 

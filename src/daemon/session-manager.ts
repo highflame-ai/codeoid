@@ -334,6 +334,16 @@ export class SessionManager {
    *  equivalent), cached daemon-wide once any session of that provider
    *  initializes. Empty until then. */
   #modelsCache = new Map<string, ModelInfo[]>();
+  /**
+   * Backend-reported per-model limits, keyed `<providerId>\u0000<model>`.
+   *
+   * Daemon-wide rather than per-session because a context window is a property
+   * of the MODEL, not of whoever happens to be talking to it: the first
+   * session to run a turn on a model teaches every later one, and warming this
+   * from disk at boot is what stops a restart from falling back to inferring
+   * the window from the model id.
+   */
+  #modelLimits = new Map<string, { contextWindow: number; maxOutputTokens?: number }>();
   #config?: CodeoidConfig;
   #compressionRegistry?: CompressionRegistry;
   #dispatcher: Dispatcher;
@@ -436,6 +446,9 @@ export class SessionManager {
     },
   ) {
     this.#store = store;
+    // Before any session exists: a persisted window beats inferring one from
+    // the model id on the very first render after a restart.
+    this.#warmModelLimits();
     this.#transcriptStore = transcriptStore;
     this.#identityManager = identityManager;
     this.#rateLimiter = rateLimiter ?? new RateLimiter();
@@ -737,6 +750,8 @@ mcpHub: this.#mcpHub,
           _testProvider: this.#testProviderFactory?.(),
           onStatusChange: this.#statusObserver,
           onModels: (providerId, m) => this._cacheModels(providerId, m),
+          onModelLimits: (providerId, model, limits) => this._cacheModelLimits(providerId, model, limits),
+          modelWindow: (pid, m) => this.modelContextWindow(pid, m),
         });
 
         // Restore scrollback from transcript, seeding the seq counter past
@@ -1307,6 +1322,8 @@ mcpHub: this.#mcpHub,
               _testProvider: this.#testProviderFactory?.(),
           onStatusChange: this.#statusObserver,
               onModels: (providerId, m) => this._cacheModels(providerId, m),
+          onModelLimits: (providerId, model, limits) => this._cacheModelLimits(providerId, model, limits),
+          modelWindow: (pid, m) => this.modelContextWindow(pid, m),
             });
             this.#sessions.set(session.id, session);
             this.#rateLimiter.recordCreation(auth.sub);
@@ -1420,15 +1437,90 @@ mcpHub: this.#mcpHub,
    * `Session._applyInterruptedStateToTool`. Do NOT call from production code
    * outside the `onModels` wiring.
    */
+  /** Cache key for #modelLimits. NUL-joined: neither a provider id nor a
+   *  model id can contain it, so no pair can collide with another. */
+  static #limitsKey(providerId: string, model: string): string {
+    return `${providerId}\u0000${model}`;
+  }
+
+  /**
+   * Record a model's backend-reported limits (the `onModelLimits` wiring).
+   *
+   * TypeScript-private, same convention as `_cacheModels`: tests drive it
+   * directly rather than standing up a live backend.
+   */
+  private _cacheModelLimits(
+    providerId: string,
+    model: string,
+    limits: { contextWindow: number; maxOutputTokens?: number },
+  ): void {
+    if (!model || model === "unknown" || !(limits.contextWindow > 0)) return;
+    const key = SessionManager.#limitsKey(providerId, model);
+    const previous = this.#modelLimits.get(key);
+    if (previous?.contextWindow === limits.contextWindow && previous.maxOutputTokens === limits.maxOutputTokens) {
+      return;
+    }
+    this.#modelLimits.set(key, limits);
+    try {
+      this.#store.saveModelLimits(providerId, model, limits);
+    } catch (err) {
+      // Best-effort, exactly like the catalog: the in-memory map still serves
+      // this lifetime and the next boot falls back one tier.
+      console.error(
+        `[codeoid/models] failed to persist ${providerId}/${model} limits: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * The backend-reported context window for a (provider, model) pair, or
+   * undefined when no turn has ever reported one. Callers fall back to
+   * inference — see `targetContextWindow`.
+   */
+  modelContextWindow(providerId: string, model?: string | null): number | undefined {
+    if (!model) return undefined;
+    return this.#modelLimits.get(SessionManager.#limitsKey(providerId, model))?.contextWindow;
+  }
+
+  /** Warm #modelLimits from disk. Called once at construction. */
+  #warmModelLimits(): void {
+    try {
+      for (const r of this.#store.getAllModelLimits()) {
+        this.#modelLimits.set(SessionManager.#limitsKey(r.providerId, r.model), {
+          contextWindow: r.contextWindow,
+          ...(r.maxOutputTokens !== undefined ? { maxOutputTokens: r.maxOutputTokens } : {}),
+        });
+      }
+    } catch {
+      // A missing/old table just means nothing is warm yet.
+    }
+  }
+
   private _cacheModels(
     providerId: string,
-    raw: ReadonlyArray<{ value: string; displayName: string; description?: string }>,
+    raw: ReadonlyArray<{
+      value: string;
+      displayName: string;
+      description?: string;
+      contextWindow?: number;
+    }>,
   ): void {
     if (raw.length === 0) return;
+    // The CATALOG ingress into the limits cache. Two backends publish a window
+    // two different ways and both are legitimate: qwen-code puts
+    // `contextWindowSize` on every model it lists (known before any turn runs,
+    // which is the better signal), while Claude reports it only on a completed
+    // turn and codex on its token-usage notification. One cache, either door.
+    for (const m of raw) {
+      if (m.contextWindow !== undefined && m.contextWindow > 0) {
+        this._cacheModelLimits(providerId, m.value, { contextWindow: m.contextWindow });
+      }
+    }
     const models = raw.map((m) => ({
       value: m.value,
       displayName: m.displayName,
       ...(m.description ? { description: m.description } : {}),
+      ...(m.contextWindow !== undefined ? { contextWindow: m.contextWindow } : {}),
       isDefault: m.value === "default",
     }));
     const previous = this.#modelsCache.get(providerId);
@@ -2471,6 +2563,8 @@ mcpHub: this.#mcpHub,
       _testProvider: this.#testProviderFactory?.(),
       onStatusChange: this.#statusObserver,
       onModels: (providerId, m) => this._cacheModels(providerId, m),
+          onModelLimits: (providerId, model, limits) => this._cacheModelLimits(providerId, model, limits),
+          modelWindow: (pid, m) => this.modelContextWindow(pid, m),
     });
 
     // Resolve the thunk the fleet server closes over. Set before any child
@@ -2877,6 +2971,8 @@ mcpHub: this.#mcpHub,
           _testProvider: this.#testProviderFactory?.(),
           onStatusChange: this.#statusObserver,
           onModels: (providerId, m) => this._cacheModels(providerId, m),
+          onModelLimits: (providerId, model, limits) => this._cacheModelLimits(providerId, model, limits),
+          modelWindow: (pid, m) => this.modelContextWindow(pid, m),
         });
         this.#sessions.set(childSession.id, childSession);
         if (blackboard) this.#blackboardTokens.set(childSession.id, blackboard.token);
@@ -3117,6 +3213,8 @@ mcpHub: this.#mcpHub,
         _testProvider: this.#testProviderFactory?.(),
         onStatusChange: this.#statusObserver,
         onModels: (pid, m) => this._cacheModels(pid, m),
+        onModelLimits: (pid, model, limits) => this._cacheModelLimits(pid, model, limits),
+        modelWindow: (pid, m) => this.modelContextWindow(pid, m),
       });
       await fork.primeFromFork(history, transcriptRows, sizeHints, workdirNote);
     } catch (err) {
@@ -3244,6 +3342,8 @@ mcpHub: this.#mcpHub,
       _testProvider: this.#testProviderFactory?.(),
       onStatusChange: this.#statusObserver,
       onModels: (providerId, m) => this._cacheModels(providerId, m),
+          onModelLimits: (providerId, model, limits) => this._cacheModelLimits(providerId, model, limits),
+          modelWindow: (pid, m) => this.modelContextWindow(pid, m),
     });
 
     this.#sessions.set(session.id, session);
@@ -3522,6 +3622,8 @@ mcpHub: this.#mcpHub,
       _testProvider: this.#testProviderFactory?.(),
       onStatusChange: this.#statusObserver,
       onModels: (providerId, m) => this._cacheModels(providerId, m),
+          onModelLimits: (providerId, model, limits) => this._cacheModelLimits(providerId, model, limits),
+          modelWindow: (pid, m) => this.modelContextWindow(pid, m),
     });
     this.#sessions.set(session.id, session);
     return session;
@@ -4022,6 +4124,8 @@ mcpHub: this.#mcpHub,
           _testProvider: this.#testProviderFactory?.(),
           onStatusChange: this.#statusObserver,
           onModels: (providerId, m) => this._cacheModels(providerId, m),
+          onModelLimits: (providerId, model, limits) => this._cacheModelLimits(providerId, model, limits),
+          modelWindow: (pid, m) => this.modelContextWindow(pid, m),
         });
         this.#sessions.set(session.id, session);
         // No rate-limiter charge: the dispatcher's own worker cap governs

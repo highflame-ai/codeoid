@@ -15,6 +15,46 @@ import {
   SEED_CHARS_PER_TOKEN,
 } from "../daemon/providers/context-windows.js";
 
+describe("a backend-reported window outranks every inference", () => {
+  // The point of the change: the tables in context-windows.ts are a bootstrap,
+  // not the truth. They were the truth, and they went stale every time a model
+  // shipped — `claude-opus-5-5` inferred to 200k while the backend reported
+  // 1,000,000 on every single turn.
+  it("wins over the per-model table, even when the table has an answer", () => {
+    // The table says 1M for opus; a backend reporting 512k is still right.
+    expect(targetContextWindow("claude", "opus", 512_000)).toBe(512_000);
+    // ...and over a table answer that is WRONG, which is the real case.
+    expect(targetContextWindow("claude", "claude-opus-9-unknown", 1_000_000)).toBe(1_000_000);
+  });
+
+  it("wins over the per-provider default for an unknown model", () => {
+    expect(targetContextWindow("openai", "some-new-model")).toBe(128_000); // inferred
+    expect(targetContextWindow("openai", "some-new-model", 400_000)).toBe(400_000);
+  });
+
+  it("is ignored when absent or non-positive, so inference still answers", () => {
+    // A backend that reports nothing must not collapse the window to zero —
+    // that would divide-by-zero the percent-of-window and starve the seed.
+    expect(targetContextWindow("claude", "opus", undefined)).toBe(1_000_000);
+    expect(targetContextWindow("claude", "opus", 0)).toBe(1_000_000);
+    expect(targetContextWindow("claude", "opus", -1)).toBe(1_000_000);
+  });
+
+  it("sizes the seed budget from the reported window", () => {
+    const reported = 600_000;
+    expect(seedBudgetChars("claude", "opus", reported)).toBe(
+      Math.floor(reported * SEED_WINDOW_FRACTION * SEED_CHARS_PER_TOKEN),
+    );
+    // The env override still outranks everything, reported included.
+    process.env.CODEOID_SEED_BUDGET_CHARS = "1234";
+    try {
+      expect(seedBudgetChars("claude", "opus", reported)).toBe(1234);
+    } finally {
+      delete process.env.CODEOID_SEED_BUDGET_CHARS;
+    }
+  });
+});
+
 describe("targetContextWindow", () => {
   it("uses the exact Claude catalog window for a known Claude model/alias", () => {
     expect(targetContextWindow("claude", "opus")).toBe(1_000_000);

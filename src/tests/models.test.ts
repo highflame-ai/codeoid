@@ -451,3 +451,92 @@ describe("models.list serves live → persisted → baked-in fallback, per provi
     expect(res.live).toBe(true);
   });
 });
+
+// ── Backend-reported model limits ────────────────────────────────────────────
+
+// The window used to be inferred from the model id by a substring table, which
+// is wrong every time a model ships: `claude-opus-5-5` inferred to 200k while
+// every turn reported 1,000,000. The backend is the only thing that knows, so
+// what it reports is cached per (provider, model) and persisted — a restart
+// must not drop back to inference.
+describe("model limits reported by the backend", () => {
+  interface CacheLimits {
+    _cacheModelLimits(
+      providerId: string,
+      model: string,
+      limits: { contextWindow: number; maxOutputTokens?: number },
+    ): void;
+  }
+
+  let tmp2: string;
+  let store2: Store;
+  beforeEach(() => {
+    tmp2 = mkdtempSync(join(tmpdir(), "codeoid-limits-"));
+    store2 = new Store(join(tmp2, "codeoid.db"));
+  });
+  afterEach(() => {
+    store2.close();
+    rmSync(tmp2, { recursive: true, force: true });
+  });
+
+  const mgr = (s: Store) => new SessionManager(s, new TranscriptStore(join(tmp2, "t")));
+
+  it("serves a reported window and keys it per (provider, model)", () => {
+    const m = mgr(store2);
+    (m as unknown as CacheLimits)._cacheModelLimits("claude", "claude-opus-5-5", {
+      contextWindow: 1_000_000,
+      maxOutputTokens: 128_000,
+    });
+    // Same model NAME on another backend must not inherit it — two gateways
+    // can serve different models under the same string.
+    (m as unknown as CacheLimits)._cacheModelLimits("qwen", "claude-opus-5-5", { contextWindow: 32_768 });
+
+    expect(m.modelContextWindow("claude", "claude-opus-5-5")).toBe(1_000_000);
+    expect(m.modelContextWindow("qwen", "claude-opus-5-5")).toBe(32_768);
+    // Never reported → undefined, so the caller falls back to inference
+    // rather than being handed a wrong number.
+    expect(m.modelContextWindow("claude", "claude-sonnet-5")).toBeUndefined();
+    expect(m.modelContextWindow("claude", undefined)).toBeUndefined();
+  });
+
+  it("survives a daemon restart", () => {
+    (mgr(store2) as unknown as CacheLimits)._cacheModelLimits("claude", "claude-opus-5-5", {
+      contextWindow: 1_000_000,
+    });
+    store2.close();
+    // A fresh Store + manager over the same file, as a restart does.
+    const reopened = new Store(join(tmp2, "codeoid.db"));
+    try {
+      expect(new SessionManager(reopened, new TranscriptStore(join(tmp2, "t"))).modelContextWindow(
+        "claude",
+        "claude-opus-5-5",
+      )).toBe(1_000_000);
+    } finally {
+      reopened.close();
+      store2 = new Store(join(tmp2, "codeoid.db")); // so afterEach can close
+    }
+  });
+
+  it("refuses values that would be worse than inferring", () => {
+    const m = mgr(store2);
+    const c = m as unknown as CacheLimits;
+    // A zero or negative window would divide the percent-of-window by zero
+    // and starve the seed budget; "unknown" is the provider's own placeholder
+    // for "I could not name the model", so it must not become a cache key.
+    c._cacheModelLimits("claude", "claude-opus-5-5", { contextWindow: 0 });
+    c._cacheModelLimits("claude", "m2", { contextWindow: -5 });
+    c._cacheModelLimits("claude", "unknown", { contextWindow: 1_000_000 });
+    c._cacheModelLimits("claude", "", { contextWindow: 1_000_000 });
+    expect(m.modelContextWindow("claude", "claude-opus-5-5")).toBeUndefined();
+    expect(m.modelContextWindow("claude", "m2")).toBeUndefined();
+    expect(m.modelContextWindow("claude", "unknown")).toBeUndefined();
+  });
+
+  it("the latest report wins, so a re-pointed alias is followed", () => {
+    const m = mgr(store2);
+    const c = m as unknown as CacheLimits;
+    c._cacheModelLimits("claude", "opus", { contextWindow: 200_000 });
+    c._cacheModelLimits("claude", "opus", { contextWindow: 1_000_000 });
+    expect(m.modelContextWindow("claude", "opus")).toBe(1_000_000);
+  });
+});

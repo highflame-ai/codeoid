@@ -158,6 +158,20 @@ export interface NormalizedTurnResult {
   cacheCreationTokens: number;
   totalCostUsd: number;
   durationMs: number;
+  /**
+   * The model's context window in tokens, AS THE BACKEND REPORTED IT for this
+   * turn. Absent when the provider doesn't say — the Claude SDK reports it per
+   * model on every result, qwen has been observed returning an empty usage map
+   * against the Bailian gateway, and the others don't surface it yet.
+   *
+   * Authoritative when present. codeoid's alternative is inferring the window
+   * from a substring table keyed on model id, which is wrong every time a
+   * model ships and was silently measuring a 1M Opus against 200k. A number
+   * from the backend that served the turn cannot go stale.
+   */
+  contextWindow?: number;
+  /** Max output tokens for the model, same provenance and same caveats. */
+  maxOutputTokens?: number;
   stopReason?: string;
   isError?: boolean;
   errorMessage?: string;
@@ -332,6 +346,10 @@ export interface ModelInfo {
   id: string;
   displayName: string;
   description?: string;
+  /** Context window in tokens, when the backend publishes it on its catalog
+   *  (qwen-code's `contextWindowSize`). Absent elsewhere — Claude reports the
+   *  window per turn instead, and gemini/openai/pi/acp report none. */
+  contextWindow?: number;
 }
 
 // ── AgentProvider interface ───────────────────────────────────────────────────

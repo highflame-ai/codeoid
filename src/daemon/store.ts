@@ -354,6 +354,21 @@ export class Store {
         cached_at   TEXT NOT NULL DEFAULT (datetime('now'))
       );
 
+      -- Per-model limits as the BACKEND reported them on a completed turn.
+      -- Separate from provider_model_catalogs because the catalog is a
+      -- per-provider list with no window in it (ModelInfo carries none) while
+      -- this is per-MODEL and only knowable once a turn has run. Persisted so
+      -- a restart does not fall back to inferring the window from the model
+      -- id — the inference is what went stale and measured a 1M Opus at 200k.
+      CREATE TABLE IF NOT EXISTS model_limits (
+        provider_id       TEXT NOT NULL,
+        model             TEXT NOT NULL,
+        context_window    INTEGER NOT NULL,
+        max_output_tokens INTEGER,
+        cached_at         TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (provider_id, model)
+      );
+
       -- Durable conductor identity (design R2): one row per tenant, reloaded
       -- on daemon restart so the conductor keeps a stable WIMSE URI across
       -- process lifetimes. api_key is the ONE credential at rest — the
@@ -1459,6 +1474,45 @@ export class Store {
            cached_at = excluded.cached_at`,
       )
       .run(providerId, JSON.stringify(models));
+  }
+
+  /**
+   * Persist a model's backend-reported limits. Keyed (provider, model) so two
+   * backends serving same-named models never collide, and the latest report
+   * wins across daemon lifetimes.
+   */
+  saveModelLimits(
+    providerId: string,
+    model: string,
+    limits: { contextWindow: number; maxOutputTokens?: number },
+  ): void {
+    this.#db
+      .prepare(
+        `INSERT INTO model_limits (provider_id, model, context_window, max_output_tokens, cached_at)
+         VALUES (?, ?, ?, ?, datetime('now'))
+         ON CONFLICT(provider_id, model) DO UPDATE SET
+           context_window = excluded.context_window,
+           max_output_tokens = excluded.max_output_tokens,
+           cached_at = excluded.cached_at`,
+      )
+      .run(providerId, model, limits.contextWindow, limits.maxOutputTokens ?? null);
+  }
+
+  /** Every persisted model limit, for warming the in-memory cache at boot. */
+  getAllModelLimits(): { providerId: string; model: string; contextWindow: number; maxOutputTokens?: number }[] {
+    const rows = this.#db
+      .prepare("SELECT provider_id, model, context_window, max_output_tokens FROM model_limits")
+      .all() as { provider_id: string; model: string; context_window: number; max_output_tokens: number | null }[];
+    return rows
+      // A non-positive window would poison the lookup it is meant to improve;
+      // drop it and let the inference tier answer instead.
+      .filter((r) => typeof r.context_window === "number" && r.context_window > 0)
+      .map((r) => ({
+        providerId: r.provider_id,
+        model: r.model,
+        contextWindow: r.context_window,
+        ...(r.max_output_tokens !== null ? { maxOutputTokens: r.max_output_tokens } : {}),
+      }));
   }
 
   /**

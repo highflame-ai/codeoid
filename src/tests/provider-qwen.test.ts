@@ -399,7 +399,12 @@ describe("normalizeModelCatalog", () => {
   // The shape @qwen-code/sdk 0.1.8 actually returns: `models` (not
   // `availableModels`), `id` (not `modelId`), `label` (not `name`), and no
   // description. Reading only `name` left every entry displaying its raw id.
-  test("reads the real sdk 0.1.8 shape — models[] with id + label", () => {
+  //
+  // `contextWindowSize` is now CARRIED rather than dropped. qwen is the only
+  // backend codeoid drives that publishes a window on its catalog — known
+  // before any turn runs — and the daemon's alternative was inferring one from
+  // the model id, which is wrong for every non-Claude id by construction.
+  test("reads the real sdk 0.1.8 shape — models[] with id + label + window", () => {
     expect(
       normalizeModelCatalog({
         subtype: "get_available_models",
@@ -409,8 +414,8 @@ describe("normalizeModelCatalog", () => {
         ],
       }),
     ).toEqual([
-      { id: "qwen3.8-max", displayName: "Qwen 3.8 Max" },
-      { id: "glm-5.2", displayName: "GLM 5.2" },
+      { id: "qwen3.8-max", displayName: "Qwen 3.8 Max", contextWindow: 1000000 },
+      { id: "glm-5.2", displayName: "GLM 5.2", contextWindow: 1000000 },
     ]);
   });
 

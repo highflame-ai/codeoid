@@ -205,8 +205,41 @@ export interface SessionCreateOptions {
    */
   onModels?: (
     providerId: string,
-    models: ReadonlyArray<{ value: string; displayName: string; description?: string }>,
+    models: ReadonlyArray<{
+      value: string;
+      displayName: string;
+      description?: string;
+      /** Window the backend publishes on its catalog, when it does — qwen
+       *  does, Claude does not. Cached alongside turn-reported limits. */
+      contextWindow?: number;
+    }>,
   ) => void;
+  /**
+   * Called when a turn result carries the backend's own statement of a model's
+   * limits, so the manager can cache them daemon-wide.
+   *
+   * Separate from `onModels` because the two arrive on different schedules and
+   * carry different things: the catalog is reported once per session at
+   * startup and has no window in it at all (`ModelInfo` carries none), while
+   * limits arrive per TURN and are keyed to the model that actually ran. One
+   * hook could not serve both without pretending a startup list knew a number
+   * only a completed turn reveals.
+   */
+  onModelLimits?: (
+    providerId: string,
+    model: string,
+    limits: { contextWindow: number; maxOutputTokens?: number },
+  ) => void;
+  /**
+   * Read side of `onModelLimits`: the daemon-wide reported window for any
+   * (provider, model), or undefined when no turn has reported one.
+   *
+   * Needed separately from this session's own `#reportedContextWindow`
+   * because a cross-backend fork sizes its seed to the TARGET model — one this
+   * session has never run and therefore has no report of its own for, but
+   * another session may well have.
+   */
+  modelWindow?: (providerId: string, model?: string | null) => number | undefined;
   /** Optional memory engine — when provided, episodes are chunked and stored for recall. */
   memory?: MemoryEngine;
   /** Shared in-daemon memory MCP endpoint + URL, for URL-mounting backends. */
@@ -390,6 +423,11 @@ export class Session {
   #fleet?: McpSdkServerConfigWithInstance;
   #compressionRegistry?: CompressionRegistry;
   #onModels?: SessionCreateOptions["onModels"];
+  #onModelLimits?: SessionCreateOptions["onModelLimits"];
+  #modelWindow?: SessionCreateOptions["modelWindow"];
+  /** Backend-reported context window for this session's model, once a turn
+   *  has reported one. Survives a model switch until the next report. */
+  #reportedContextWindow?: number;
   #hookBus?: HookBus;
   /**
    * Advisory loop-breaker. Watches `tool_start` for runs of consecutive
@@ -735,6 +773,8 @@ export class Session {
     this.#fleet = opts.fleet;
     this.#compressionRegistry = opts.compressionRegistry;
     this.#onModels = opts.onModels;
+    this.#onModelLimits = opts.onModelLimits;
+    this.#modelWindow = opts.modelWindow;
     this.#hookBus = opts.hooks;
     // Advisory guard. Config is validated in the guard constructor and fails
     // loud there; here we degrade to "no guard" and log, because an advisory
@@ -2379,7 +2419,11 @@ export class Session {
         provider: this.#provider,
         history: this.#accumulator.history,
         memoryEnabled: this.#memory != null && process.env.CODEOID_MEMORY !== "0",
-        seedBudgetChars: seedBudgetChars(this.#provider.id, this.#model),
+        seedBudgetChars: seedBudgetChars(
+          this.#provider.id,
+          this.#model,
+          this.#reportedContextWindow ?? this.#modelWindow?.(this.#provider.id, this.#model),
+        ),
         buildSessionMap: () => this.#buildSessionMapAnchor(),
       });
       if (outcome.truncation && outcome.truncation.omittedTurns > 0) {
@@ -2402,7 +2446,11 @@ export class Session {
   #surfaceSeedTruncation(result: HistorySeedResult): void {
     const providerId = this.#provider.id;
     const model = this.#model ?? `${providerId} default`;
-    const contextWindow = targetContextWindow(providerId, this.#model);
+    const contextWindow = targetContextWindow(
+      providerId,
+      this.#model,
+      this.#modelWindow?.(providerId, this.#model),
+    );
     const windowK = Math.round(contextWindow / 1000);
     const msg = this.#makeMessage(
       "info",
@@ -2701,6 +2749,23 @@ export class Session {
    * surface (the old inline path used to do this).
    */
   #recordTurnFromResult(result: NormalizedTurnResult): void {
+    // The backend's own statement of the model's limits, when it makes one.
+    // Preferred over `contextWindowForModel` from here on: that function
+    // infers the window from the model ID and is wrong whenever a model ships
+    // that its table has not learned. Reported per turn, so a `/model` switch
+    // re-reports on its next turn and this follows it.
+    //
+    // Sticky on purpose — NOT cleared when a turn omits it. A provider that
+    // reports the window on turn 1 and not on turn 5 has not told us the
+    // window changed; falling back to the table there would make the number
+    // flap between correct and inferred.
+    if (result.contextWindow !== undefined && result.contextWindow > 0) {
+      this.#reportedContextWindow = result.contextWindow;
+      this.#onModelLimits?.(result.providerId, result.model, {
+        contextWindow: result.contextWindow,
+        ...(result.maxOutputTokens !== undefined ? { maxOutputTokens: result.maxOutputTokens } : {}),
+      });
+    }
     // Anthropic semantics: input_tokens = NEW input only (not cache).
     // Total context = input + cache_read + cache_creation.
     const input = result.inputTokens;
@@ -2882,7 +2947,11 @@ export class Session {
       lastTurnOutputTokens: mostRecent?.outputTokens,
       lastTurnCostUsd: mostRecent?.totalCostUsd,
       lastTurnCacheHitRate: mostRecent?.cacheHitRate,
-      contextWindow: contextWindowForModel(this.#model),
+      // Backend-reported first, inferred second. `contextWindowForModel` is
+      // the bootstrap: it has to answer before any turn has run, because the
+      // supported-models list carries no window and a fresh or just-resumed
+      // session still renders a percent-of-window.
+      contextWindow: this.#reportedContextWindow ?? contextWindowForModel(this.#model),
     };
   }
 
