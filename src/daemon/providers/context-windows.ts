@@ -19,10 +19,10 @@
  * the turn).
  *
  * Both functions take an optional `reported` window that OUTRANKS everything
- * here — the daemon caches what each backend said about a model on a completed
- * turn (`SessionManager.modelContextWindow`). The tables below are the
- * bootstrap for what that cache cannot answer: a model no turn has run on yet,
- * and backends that report no limits at all. They are a floor, not the truth.
+ * here: one a backend actually stated, either on a completed turn or on its
+ * catalog (see Session#knownWindow). The tables below answer only what nothing
+ * has stated — a model no turn has run on yet, and backends that publish no
+ * limits (gemini, openai, acp). They are a floor, not the truth.
  */
 
 import { contextWindowForModel as claudeContextWindow } from "../context-windows.js";

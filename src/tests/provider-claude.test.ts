@@ -354,8 +354,8 @@ describe("translateSDKMessage – result", () => {
         num_turns: 1,
         usage: { input_tokens: 2, output_tokens: 4 },
         modelUsage: {
-          "claude-haiku-4-5-20251001": { inputTokens: 900, outputTokens: 9, contextWindow: 200_000, maxOutputTokens: 32_000 },
-          "claude-opus-5-5": { inputTokens: 2, outputTokens: 4, contextWindow: 1_000_000, maxOutputTokens: 128_000 },
+          "claude-haiku-4-5-20251001": { inputTokens: 900, outputTokens: 9, contextWindow: 200_000 },
+          "claude-opus-5-5": { inputTokens: 2, outputTokens: 4, contextWindow: 1_000_000 },
         },
       } as never,
       emit,
@@ -364,12 +364,53 @@ describe("translateSDKMessage – result", () => {
     );
 
     const done = out.find((e) => e.type === "turn_done") as
-      | { result: { model: string; contextWindow?: number; maxOutputTokens?: number } }
+      | { result: { model: string; contextWindow?: number } }
       | undefined;
     expect(done).toBeDefined();
     expect(done!.result.model).toBe("claude-opus-5-5");
     expect(done!.result.contextWindow).toBe(1_000_000);
-    expect(done!.result.maxOutputTokens).toBe(128_000);
+  });
+
+  it("attributes a fallback-served turn to the fallback model", () => {
+    // With fallbackModel set, an overloaded primary re-dispatches the turn and
+    // the CLI says so on system/model_fallback. modelUsage is cumulative, so
+    // the primary's entry is still there from earlier turns — without handling
+    // the message, a turn Haiku served was recorded as Opus with Opus's 1M.
+    const state = { lastLocalCommandStderr: null as string | null, primaryModel: null as string | null };
+    const out: ProviderEvent[] = [];
+    const emit = (e: ProviderEvent) => out.push(e);
+    translateSDKMessage({ type: "system", subtype: "init", model: "claude-opus-5-5", tools: [], mcp_servers: [] } as never, emit, "claude", state);
+    translateSDKMessage(
+      {
+        type: "system",
+        subtype: "model_fallback",
+        original_model: "claude-opus-5-5",
+        fallback_model: "claude-haiku-4-5-20251001",
+        trigger: "overloaded",
+      } as never,
+      emit,
+      "claude",
+      state,
+    );
+    translateSDKMessage(
+      {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        num_turns: 1,
+        usage: { input_tokens: 2, output_tokens: 4 },
+        modelUsage: {
+          "claude-opus-5-5": { inputTokens: 50, outputTokens: 5, contextWindow: 1_000_000 },
+          "claude-haiku-4-5-20251001": { inputTokens: 2, outputTokens: 4, contextWindow: 200_000 },
+        },
+      } as never,
+      emit,
+      "claude",
+      state,
+    );
+    const done = out.find((e) => e.type === "turn_done") as { result: { model: string; contextWindow?: number } };
+    expect(done.result.model).toBe("claude-haiku-4-5-20251001");
+    expect(done.result.contextWindow).toBe(200_000);
   });
 
   it("omits the window when the backend reports no usage for the primary model", () => {

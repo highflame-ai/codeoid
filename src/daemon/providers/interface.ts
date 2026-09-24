@@ -159,19 +159,15 @@ export interface NormalizedTurnResult {
   totalCostUsd: number;
   durationMs: number;
   /**
-   * The model's context window in tokens, AS THE BACKEND REPORTED IT for this
-   * turn. Absent when the provider doesn't say — the Claude SDK reports it per
-   * model on every result, qwen has been observed returning an empty usage map
-   * against the Bailian gateway, and the others don't surface it yet.
+   * Context window of the model that ran this turn, as the backend stated it.
+   * Absent when the backend doesn't say (gemini, openai, acp report none).
    *
-   * Authoritative when present. codeoid's alternative is inferring the window
-   * from a substring table keyed on model id, which is wrong every time a
-   * model ships and was silently measuring a 1M Opus against 200k. A number
-   * from the backend that served the turn cannot go stale.
+   * "Stated" is not "measured": the Claude CLI computes it from its own tables
+   * and per-workdir settings, which is why the daemon scopes what it remembers
+   * (SessionManager.modelContextWindow). It is still the number that backend
+   * enforces, which a model-id table is not.
    */
   contextWindow?: number;
-  /** Max output tokens for the model, same provenance and same caveats. */
-  maxOutputTokens?: number;
   stopReason?: string;
   isError?: boolean;
   errorMessage?: string;
@@ -346,10 +342,34 @@ export interface ModelInfo {
   id: string;
   displayName: string;
   description?: string;
-  /** Context window in tokens, when the backend publishes it on its catalog
-   *  (qwen-code's `contextWindowSize`). Absent elsewhere — Claude reports the
-   *  window per turn instead, and gemini/openai/pi/acp report none. */
+  /** Context window in tokens, when the backend publishes it on its catalog.
+   *  qwen-code and pi do; Claude and codex report the window per turn. */
   contextWindow?: number;
+}
+
+/**
+ * One entry of the catalog a provider reports through `onModels`.
+ *
+ * Named once and used at every hop (provider init → registry → Session →
+ * manager). It used to be written inline at each, and only the two ends
+ * declared `contextWindow` — the field survived only because nothing in
+ * between rebuilt the array, which is exactly how qwen's window had been lost
+ * once already.
+ */
+export interface CatalogEntry {
+  value: string;
+  displayName: string;
+  description?: string;
+  contextWindow?: number;
+}
+
+/**
+ * A turn result's `model` that names no model: "unknown", or a provider's
+ * stand-in for "whatever its default is" (codex reports its own id, pi
+ * "pi-default"). Fine to display against; never a key another session can hit.
+ */
+export function isPlaceholderModel(providerId: string, model: string): boolean {
+  return !model || model === "unknown" || model === providerId || model === `${providerId}-default`;
 }
 
 // ── AgentProvider interface ───────────────────────────────────────────────────

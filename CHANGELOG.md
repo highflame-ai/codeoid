@@ -76,25 +76,40 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - **The context window is no longer guessed from the model id.**
-  codeoid inferred every window from a substring table over model ids, and that table was wrong the moment a model shipped: `claude-opus-5-5` inferred to the 200k fallback while every turn result reported 1,000,000.
-  Everything sized against it was off by 5× — the percent-of-window display, the fork seed budget, and the auto-rotate occupancy that decides when a session rolls, so auto-rotate fired at about a fifth of real capacity.
+  codeoid inferred every window from a substring table over model ids, and that table was wrong the moment a model shipped: `claude-opus-5-5` inferred to the 200k fallback while every turn result stated 1,000,000.
+  The percent-of-window display and the history seed sized for a fork or a provider switch were both built on that guess.
 
-  The backends already knew. The daemon now takes what they report and caches it per `(provider, model)`, persisted, so the number survives a restart and the first session to learn a model's window teaches every later one.
+  The backends already state it, and the daemon now uses what they state.
+  Audited across every backend codeoid drives, because they do not agree on how they publish it:
 
-  Audited across every backend codeoid drives, because they do not agree on how they publish it — and two ingresses were needed to cover them:
-
-  | Backend | Publishes | Where |
+  | Backend | States | Where |
   | --- | --- | --- |
   | claude | per turn | `result.modelUsage[model].contextWindow` |
   | codex | per turn | `thread/tokenUsage/updated` → `tokenUsage.modelContextWindow` |
-  | qwen | **per model, before any turn** | its catalog's `contextWindowSize` |
-  | gemini · openai · pi · acp | nothing | — |
+  | pi | per turn, and on its catalog | `get_session_stats` → `contextUsage.contextWindow`; model objects on `get_available_models` |
+  | qwen | on its catalog | `contextWindowSize` per model |
+  | gemini · openai · acp | nothing | — |
 
-  qwen's is the best signal of the three and was being thrown away: `normalizeModelCatalog` projected the catalog down to id/label/description and dropped the window. codex's arrived on a notification codeoid already handled and read only two of its three fields.
+  Three of those were already arriving and being discarded: codex's on a notification the provider handled while reading two of its three fields, pi's on a stats call made every turn, and qwen's in a catalog projection that dropped it (and, in API-key mode, a catalog union that dropped it again whenever the gateway listed the same model).
 
-  The static tables stay, demoted to what they always should have been — a bootstrap. Nothing can know a window before a turn completes on the two per-turn backends (a catalog entry carries none there), and four backends report none at all, so an inferred floor is structurally required. It is now the last resort rather than the only answer, and it stays a positive number so a silent backend never divides the percent-of-window by zero.
+  One resolver now answers for every consumer: the display, the occupancy caps, auto-rotate, the rotate message, and the seed.
+  It uses the window this session's backend stated for the model it is running, then one stated in the same scope or published on the provider's catalog, then a per-provider floor.
+  The stated window is dropped whenever the model or provider changes, so a switch sizes the incoming backend's seed for that backend.
+  A fork on the same model as its parent inherits the parent's stated window.
 
-  Also fixed at the source: the Claude provider derived the turn's model from `Object.keys(modelUsage)[0]`, but that map is keyed by every model a turn touched and ordered by insertion — a Haiku side-call routinely sits in front of the model that did the work. So an Opus turn was labelled Haiku in canonical history, and reading a window off that entry would have reported 200k for a 1M turn: the same bug, at the point that was supposed to cure it. The SDK names the primary model on its `init` message; it is used instead.
+  What a turn states is remembered per account, project and workdir, not daemon-wide.
+  The Claude CLI derives the number from settings a workdir can override (`CLAUDE_CODE_MAX_CONTEXT_TOKENS` is unclamped), so one workdir must not size another tenant's seeds.
+  A window published on a catalog is read from the catalog, so it goes away when the backend stops publishing it.
+
+  Auto-rotate used a fixed 1M window rather than the table, so for any model below about 970k its 0.97 hard ceiling could never fire before the backend's own limit — a 200k Haiku or a 272k codex session never rotated.
+  It now rotates against the window of the model actually running.
+  The TUI read neither the table nor the stated window; it now shows the same number as the web UI.
+  With the memory engine off, the window was never reported to clients at all; it now always is.
+
+  The static tables stay as the floor for what no backend has stated: before a first turn, and on backends that publish nothing.
+
+  Also fixed at the source: the Claude provider took the turn's model from `Object.keys(modelUsage)[0]`, but that map is keyed by every model the turn touched in insertion order, and a Haiku side-call routinely sits first.
+  It now uses the model the SDK names on `init`, and follows `model_fallback`, so a turn the fallback model served is labelled with that model and its window.
 
 - **`opus` ran Opus 5, months after Opus 5.5 shipped — and a 1M model was measured against a 200k window.**
   Bumps `@anthropic-ai/claude-agent-sdk` 0.3.258 → 0.3.281.

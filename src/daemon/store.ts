@@ -354,19 +354,20 @@ export class Store {
         cached_at   TEXT NOT NULL DEFAULT (datetime('now'))
       );
 
-      -- Per-model limits as the BACKEND reported them on a completed turn.
-      -- Separate from provider_model_catalogs because the catalog is a
-      -- per-provider list with no window in it (ModelInfo carries none) while
-      -- this is per-MODEL and only knowable once a turn has run. Persisted so
-      -- a restart does not fall back to inferring the window from the model
-      -- id — the inference is what went stale and measured a 1M Opus at 200k.
-      CREATE TABLE IF NOT EXISTS model_limits (
-        provider_id       TEXT NOT NULL,
-        model             TEXT NOT NULL,
-        context_window    INTEGER NOT NULL,
-        max_output_tokens INTEGER,
-        cached_at         TEXT NOT NULL DEFAULT (datetime('now')),
-        PRIMARY KEY (provider_id, model)
+      -- Context windows backends reported on completed turns. Scoped by
+      -- tenant AND workdir: the Claude CLI derives the number from settings a
+      -- workdir can override, so it is a fact about that scope, not the model.
+      -- A window a provider publishes on its catalog is not stored here; it
+      -- lives on provider_model_catalogs with the rest of the catalog.
+      CREATE TABLE IF NOT EXISTS model_context_windows (
+        account_id     TEXT NOT NULL,
+        project_id     TEXT NOT NULL,
+        workdir        TEXT NOT NULL,
+        provider_id    TEXT NOT NULL,
+        model          TEXT NOT NULL,
+        context_window INTEGER NOT NULL,
+        cached_at      TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (account_id, project_id, workdir, provider_id, model)
       );
 
       -- Durable conductor identity (design R2): one row per tenant, reloaded
@@ -1476,42 +1477,55 @@ export class Store {
       .run(providerId, JSON.stringify(models));
   }
 
-  /**
-   * Persist a model's backend-reported limits. Keyed (provider, model) so two
-   * backends serving same-named models never collide, and the latest report
-   * wins across daemon lifetimes.
-   */
+  /** Persist a window a completed turn reported, in the scope it was seen. */
   saveModelLimits(
+    scope: { accountId: string; projectId: string; workdir: string },
     providerId: string,
     model: string,
-    limits: { contextWindow: number; maxOutputTokens?: number },
+    contextWindow: number,
   ): void {
     this.#db
       .prepare(
-        `INSERT INTO model_limits (provider_id, model, context_window, max_output_tokens, cached_at)
-         VALUES (?, ?, ?, ?, datetime('now'))
-         ON CONFLICT(provider_id, model) DO UPDATE SET
+        `INSERT INTO model_context_windows
+           (account_id, project_id, workdir, provider_id, model, context_window, cached_at)
+         VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+         ON CONFLICT(account_id, project_id, workdir, provider_id, model) DO UPDATE SET
            context_window = excluded.context_window,
-           max_output_tokens = excluded.max_output_tokens,
            cached_at = excluded.cached_at`,
       )
-      .run(providerId, model, limits.contextWindow, limits.maxOutputTokens ?? null);
+      .run(scope.accountId, scope.projectId, scope.workdir, providerId, model, contextWindow);
   }
 
-  /** Every persisted model limit, for warming the in-memory cache at boot. */
-  getAllModelLimits(): { providerId: string; model: string; contextWindow: number; maxOutputTokens?: number }[] {
+  /** Every persisted window, for warming the in-memory cache at boot. */
+  getAllModelLimits(): {
+    accountId: string;
+    projectId: string;
+    workdir: string;
+    providerId: string;
+    model: string;
+    contextWindow: number;
+  }[] {
     const rows = this.#db
-      .prepare("SELECT provider_id, model, context_window, max_output_tokens FROM model_limits")
-      .all() as { provider_id: string; model: string; context_window: number; max_output_tokens: number | null }[];
+      .prepare(
+        "SELECT account_id, project_id, workdir, provider_id, model, context_window FROM model_context_windows",
+      )
+      .all() as {
+      account_id: string;
+      project_id: string;
+      workdir: string;
+      provider_id: string;
+      model: string;
+      context_window: number;
+    }[];
     return rows
-      // A non-positive window would poison the lookup it is meant to improve;
-      // drop it and let the inference tier answer instead.
       .filter((r) => typeof r.context_window === "number" && r.context_window > 0)
       .map((r) => ({
+        accountId: r.account_id,
+        projectId: r.project_id,
+        workdir: r.workdir,
         providerId: r.provider_id,
         model: r.model,
         contextWindow: r.context_window,
-        ...(r.max_output_tokens !== null ? { maxOutputTokens: r.max_output_tokens } : {}),
       }));
   }
 

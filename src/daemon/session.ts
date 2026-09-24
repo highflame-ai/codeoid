@@ -28,6 +28,8 @@ import {
   isSubagentEvent,
   type BackgroundTaskSnapshot,
   type SessionScopedEvent,
+  type CatalogEntry,
+  isPlaceholderModel,
 } from "./providers/interface.js";
 import { createDefaultProviderRegistry, type ProviderRegistry } from "./providers/registry.js";
 import { selectContextStrategy, renderSessionMap, renderRotationSeed, type ContextStrategy } from "./providers/context-strategy.js";
@@ -176,6 +178,14 @@ export interface AttachedClient {
   capabilities?: readonly string[];
 }
 
+/** Where a context window was observed; the manager scopes what it remembers
+ *  to it (see SessionCreateOptions.onModelLimits). */
+export interface WindowScope {
+  accountId: string;
+  projectId: string;
+  workdir: string;
+}
+
 export interface SessionCreateOptions {
   name: string;
   workdir: string;
@@ -203,43 +213,22 @@ export interface SessionCreateOptions {
    * different model list. The manager caches it daemon-wide so `/model`
    * validation + the picker use the real list.
    */
-  onModels?: (
-    providerId: string,
-    models: ReadonlyArray<{
-      value: string;
-      displayName: string;
-      description?: string;
-      /** Window the backend publishes on its catalog, when it does — qwen
-       *  does, Claude does not. Cached alongside turn-reported limits. */
-      contextWindow?: number;
-    }>,
-  ) => void;
+  onModels?: (providerId: string, models: ReadonlyArray<CatalogEntry>) => void;
   /**
-   * Called when a turn result carries the backend's own statement of a model's
-   * limits, so the manager can cache them daemon-wide.
+   * Called when a completed turn reports the context window of the model that
+   * ran it, so the manager can remember it for later sessions.
    *
-   * Separate from `onModels` because the two arrive on different schedules and
-   * carry different things: the catalog is reported once per session at
-   * startup and has no window in it at all (`ModelInfo` carries none), while
-   * limits arrive per TURN and are keyed to the model that actually ran. One
-   * hook could not serve both without pretending a startup list knew a number
-   * only a completed turn reveals.
+   * Scoped, not daemon-wide: the Claude CLI computes that number from
+   * per-process inputs a workdir's `.claude/settings.json` can set
+   * (`CLAUDE_CODE_MAX_CONTEXT_TOKENS`, `CLAUDE_CODE_DISABLE_1M_CONTEXT`), so
+   * one tenant's workdir must not decide another tenant's seed budget.
    */
-  onModelLimits?: (
-    providerId: string,
-    model: string,
-    limits: { contextWindow: number; maxOutputTokens?: number },
-  ) => void;
+  onModelLimits?: (scope: WindowScope, providerId: string, model: string, contextWindow: number) => void;
   /**
-   * Read side of `onModelLimits`: the daemon-wide reported window for any
-   * (provider, model), or undefined when no turn has reported one.
-   *
-   * Needed separately from this session's own `#reportedContextWindow`
-   * because a cross-backend fork sizes its seed to the TARGET model — one this
-   * session has never run and therefore has no report of its own for, but
-   * another session may well have.
+   * Read side of `onModelLimits`, plus any window the provider published on
+   * its catalog. Undefined when nothing is known for that model in that scope.
    */
-  modelWindow?: (providerId: string, model?: string | null) => number | undefined;
+  modelWindow?: (scope: WindowScope, providerId: string, model: string) => number | undefined;
   /** Optional memory engine — when provided, episodes are chunked and stored for recall. */
   memory?: MemoryEngine;
   /** Shared in-daemon memory MCP endpoint + URL, for URL-mounting backends. */
@@ -425,9 +414,17 @@ export class Session {
   #onModels?: SessionCreateOptions["onModels"];
   #onModelLimits?: SessionCreateOptions["onModelLimits"];
   #modelWindow?: SessionCreateOptions["modelWindow"];
-  /** Backend-reported context window for this session's model, once a turn
-   *  has reported one. Survives a model switch until the next report. */
-  #reportedContextWindow?: number;
+  /**
+   * The window the backend reported on this session's last reporting turn,
+   * and which (provider, model) it was for.
+   *
+   * Carrying the provider and model is the point. A bare number outlived the
+   * thing it described: after `/provider codex` it still held Opus's 1M, so
+   * codex's history seed was sized at 2.45M chars against a 272k window and
+   * overflowed its first turn. It is cleared wherever `#model` changes, and
+   * read only when it matches the provider being asked about.
+   */
+  #observedLimits?: { providerId: string; model: string; contextWindow: number };
   #hookBus?: HookBus;
   /**
    * Advisory loop-breaker. Watches `tool_start` for runs of consecutive
@@ -554,11 +551,6 @@ export class Session {
   // prompt so the agent knows what it was working on. Captured inside
   // rotate() from the most recent user_turn episode.
   #lastUserTurnBeforeRotate: string | null = null;
-  // Claude's context window. The current Opus and Sonnet families share 1M;
-  // we compute occupancy against this constant. Making it tunable per-session
-  // was considered overkill — users rarely run sub-1M models via codeoid.
-  static readonly CONTEXT_WINDOW = 1_000_000;
-
   // Execution mode + turn budget (autonomous mode only).
   // Default `guarded` (≈ Claude Code's default): read-only tools (Read/Grep/Glob
   // + memory) auto-approve, while Write/Edit/Bash and other mutations prompt.
@@ -1067,6 +1059,7 @@ export class Session {
     // catalog) — reset to the incoming provider's default.
     this.#model = null;
     this.#fallbackModel = null;
+    this.#observedLimits = undefined;
     // A pending rotation seed is Claude-worded and now redundant — the
     // switch seeds its own transcript. Without this, the next send() would
     // stack the rotation anchor on top of seedFromHistory's block.
@@ -2419,11 +2412,7 @@ export class Session {
         provider: this.#provider,
         history: this.#accumulator.history,
         memoryEnabled: this.#memory != null && process.env.CODEOID_MEMORY !== "0",
-        seedBudgetChars: seedBudgetChars(
-          this.#provider.id,
-          this.#model,
-          this.#reportedContextWindow ?? this.#modelWindow?.(this.#provider.id, this.#model),
-        ),
+        seedBudgetChars: seedBudgetChars(this.#provider.id, this.#model, this.#knownWindow(this.#provider.id)),
         buildSessionMap: () => this.#buildSessionMapAnchor(),
       });
       if (outcome.truncation && outcome.truncation.omittedTurns > 0) {
@@ -2446,11 +2435,10 @@ export class Session {
   #surfaceSeedTruncation(result: HistorySeedResult): void {
     const providerId = this.#provider.id;
     const model = this.#model ?? `${providerId} default`;
-    const contextWindow = targetContextWindow(
-      providerId,
-      this.#model,
-      this.#modelWindow?.(providerId, this.#model),
-    );
+    // Same inputs as the budget it is explaining. These used to be computed
+    // separately and disagreed after a switch: a 1M-sized budget announced
+    // as a "~256k-token window".
+    const contextWindow = targetContextWindow(providerId, this.#model, this.#knownWindow(providerId));
     const windowK = Math.round(contextWindow / 1000);
     const msg = this.#makeMessage(
       "info",
@@ -2713,7 +2701,10 @@ export class Session {
       ...(this.#backgroundTasks.size > 0
         ? { backgroundTasks: [...this.#backgroundTasks.values()].map((t) => ({ ...t })) }
         : {}),
-      usage: { ...this.#usage },
+      // Resolved on every read rather than snapshotted into #usage: the
+      // snapshot lived inside the memory-only refresh, so with memory off the
+      // field was never set and the web UI divided by its 200k fallback.
+      usage: { ...this.#usage, contextWindow: this.#contextWindow() },
       rotation: {
         count: this.#rotationCount,
         lastRotatedAt: this.#lastRotatedAt,
@@ -2748,23 +2739,75 @@ export class Session {
    * the DB; #usage is a cache for fast broadcasts. Also handles the error
    * surface (the old inline path used to do this).
    */
+  /** The scope a remembered window belongs to (see onModelLimits). */
+  #windowScope(): WindowScope {
+    return { accountId: this.accountId, projectId: this.projectId, workdir: this.workdir };
+  }
+
+  /**
+   * A window some backend actually stated for `providerId`, or undefined.
+   *
+   * This session's own observation first — but only when it is about the same
+   * provider, which is what makes a provider switch fall through to the
+   * incoming backend instead of inheriting the outgoing one's number. Then
+   * whatever this scope has seen or the provider's catalog published for the
+   * model.
+   */
+  #knownWindow(providerId: string): number | undefined {
+    const obs = this.#observedLimits;
+    if (obs && obs.providerId === providerId) return obs.contextWindow;
+    const model = this.#model;
+    if (!model) return undefined;
+    return this.#modelWindow?.(this.#windowScope(), providerId, model);
+  }
+
+  /**
+   * The one context window every consumer uses: display, occupancy caps,
+   * auto-rotate, and the rotate message. Seeding uses the same known window
+   * with a more conservative floor (targetContextWindow), because an
+   * over-sized seed breaks a turn while an over-stated window only warns late.
+   *
+   * The floor, when no backend has said anything: Claude's own table for
+   * Claude (its unset default is the 1M Opus), the provider-aware table for
+   * everything else — the Claude-only table used to answer for every
+   * provider, which put a 128k gpt-4o session against 1M.
+   */
+  #contextWindow(providerId: string = this.#provider.id): number {
+    const known = this.#knownWindow(providerId);
+    if (known !== undefined) return known;
+    return providerId === CLAUDE_PROVIDER_ID
+      ? contextWindowForModel(this.#model)
+      : targetContextWindow(providerId, this.#model);
+  }
+
+  /**
+   * Adopt a parent session's observed window when this session will run the
+   * very same (provider, model) — a fork on the default model is exactly that,
+   * and without it the fork's seed fell back to the 200k floor on a 1M model.
+   * Must run before the fork's history is seeded.
+   */
+  inheritObservedLimits(parent: Session): void {
+    const obs = parent.#observedLimits;
+    if (!obs || obs.providerId !== this.#provider.id || parent.#model !== this.#model) return;
+    this.#observedLimits = { ...obs };
+  }
+
   #recordTurnFromResult(result: NormalizedTurnResult): void {
-    // The backend's own statement of the model's limits, when it makes one.
-    // Preferred over `contextWindowForModel` from here on: that function
-    // infers the window from the model ID and is wrong whenever a model ships
-    // that its table has not learned. Reported per turn, so a `/model` switch
-    // re-reports on its next turn and this follows it.
-    //
-    // Sticky on purpose — NOT cleared when a turn omits it. A provider that
-    // reports the window on turn 1 and not on turn 5 has not told us the
-    // window changed; falling back to the table there would make the number
-    // flap between correct and inferred.
+    // The backend's own statement of the window for the model that ran this
+    // turn. Kept only while it is still about this session's provider and
+    // model (see #observedLimits); a later turn that omits it leaves it be,
+    // because omitting a number is not the same as changing it.
     if (result.contextWindow !== undefined && result.contextWindow > 0) {
-      this.#reportedContextWindow = result.contextWindow;
-      this.#onModelLimits?.(result.providerId, result.model, {
+      this.#observedLimits = {
+        providerId: this.#provider.id,
+        model: result.model,
         contextWindow: result.contextWindow,
-        ...(result.maxOutputTokens !== undefined ? { maxOutputTokens: result.maxOutputTokens } : {}),
-      });
+      };
+      // Placeholders ("unknown", codex's bare "codex", pi's "pi-default")
+      // name no model, so they must not become a key another session can hit.
+      if (!isPlaceholderModel(this.#provider.id, result.model)) {
+        this.#onModelLimits?.(this.#windowScope(), this.#provider.id, result.model, result.contextWindow);
+      }
     }
     // Anthropic semantics: input_tokens = NEW input only (not cache).
     // Total context = input + cache_read + cache_creation.
@@ -2799,7 +2842,7 @@ export class Session {
     if (primaryCtx === 0 && total > 0) {
       // Per-call usage missing — fall back to summed usage but cap at
       // window so a multi-call sum doesn't report > 100% occupancy.
-      primaryCtx = Math.min(total, Session.CONTEXT_WINDOW);
+      primaryCtx = Math.min(total, this.#contextWindow());
       primaryCacheReadThisTurn = cacheRead; // best we can do on fallback
     }
 
@@ -2920,14 +2963,14 @@ export class Session {
     //      tool-heavy turns but the only signal we have for old rows.
     const fallbackTotal = mostRecent
       ? mostRecent.primaryMaxCallInputTokens ??
-        Math.min(mostRecent.totalInputTokens, Session.CONTEXT_WINDOW)
+        Math.min(mostRecent.totalInputTokens, this.#contextWindow())
       : undefined;
     const lastPrimary = primaryCtxHint ?? fallbackTotal;
 
     // Peak: use our in-memory primary-only tracker if populated (live
     // session); fall back to the Store's aggregated peak for historical
     // data, but cap at the window so nothing inflates past 100%.
-    const peakFallback = Math.min(totals.peakInputTokens, Session.CONTEXT_WINDOW);
+    const peakFallback = Math.min(totals.peakInputTokens, this.#contextWindow());
     const peakPrimary = Math.max(this.#primaryPeakContext, peakFallback);
     if (peakPrimary > this.#primaryPeakContext) {
       this.#primaryPeakContext = peakPrimary; // backfill on first load
@@ -2947,11 +2990,7 @@ export class Session {
       lastTurnOutputTokens: mostRecent?.outputTokens,
       lastTurnCostUsd: mostRecent?.totalCostUsd,
       lastTurnCacheHitRate: mostRecent?.cacheHitRate,
-      // Backend-reported first, inferred second. `contextWindowForModel` is
-      // the bootstrap: it has to answer before any turn has run, because the
-      // supported-models list carries no window and a fresh or just-resumed
-      // session still renders a percent-of-window.
-      contextWindow: this.#reportedContextWindow ?? contextWindowForModel(this.#model),
+      contextWindow: this.#contextWindow(),
     };
   }
 
@@ -2993,6 +3032,7 @@ export class Session {
 
     const prev = this.#model;
     this.#model = resolved;
+    if (resolved !== prev) this.#observedLimits = undefined;
     if (nextFallback !== undefined) this.#fallbackModel = nextFallback;
 
     // Persist. Passing `undefined` for the fallback argument means "don't
@@ -3057,6 +3097,7 @@ export class Session {
     }
     if (next === prev) return { prev, applied: next };
     this.#model = next;
+    this.#observedLimits = undefined;
     // Tear down the current stream so the next send runs on the new model.
     await this.#teardownProvider();
     this.#broadcastInfoUpdate();
@@ -3110,7 +3151,10 @@ export class Session {
       rotatePct: ar.rotatePct,
       hardRotatePct: ar.hardRotatePct,
       minTurnsBeforeRotate: ar.minTurnsBeforeRotate,
-      contextWindow: Session.CONTEXT_WINDOW,
+      // The window of the model actually running, not a 1M constant: against
+      // 1M, a 200k Haiku or 272k codex session could never reach the 0.97 hard
+      // ceiling, so codeoid's rotation never fired before the backend's limit.
+      contextWindow: this.#contextWindow(),
     });
     return decision.shouldRotate;
   }
@@ -3163,7 +3207,7 @@ export class Session {
     // real usage row, so 0 is the right value to seed.
     // Capture BEFORE zeroing so the rotation message shows the real pre-rotation value.
     const ctxBefore = this.#usage.lastTurnInputTokens ?? 0;
-    const pctBefore = Math.round((ctxBefore / Session.CONTEXT_WINDOW) * 100);
+    const pctBefore = Math.round((ctxBefore / this.#contextWindow()) * 100);
     this.#usage.lastTurnInputTokens = 0;
     this.#turnsSinceLastRotation = 0;
 

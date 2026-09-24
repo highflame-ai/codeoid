@@ -49,6 +49,7 @@ import type {
   SessionProvider,
   TurnOpts,
   TurnRun,
+  CatalogEntry,
 } from "../interface.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
 import { buildQwenEnv } from "../env.js";
@@ -80,9 +81,7 @@ export interface QwenProviderInit {
   /** Cross-backend MCP registry — mounted natively (qwen owns its MCP client). */
   mcpRegistry?: McpRegistry;
   config?: CodeoidConfig;
-  onModels?: (
-    models: ReadonlyArray<{ value: string; displayName: string; description?: string }>,
-  ) => void;
+  onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
 }
 
 export class QwenProvider implements SessionProvider {
@@ -981,7 +980,13 @@ export function unionCatalogs(
       byId.set(m.id, m);
       continue;
     }
-    if (!labelled(existing) && labelled(m)) byId.set(m.id, m);
+    const winner = !labelled(existing) && labelled(m) ? m : existing;
+    // The label decides which entry wins; the window is a separate fact and
+    // must survive whichever one does. The gateway's `/models` carries no
+    // windows, so on a collision the bare live entry used to win and silently
+    // drop the window qwen-code's registry had for the same id.
+    const window = existing.contextWindow ?? m.contextWindow;
+    byId.set(m.id, window !== undefined ? { ...winner, contextWindow: window } : winner);
   }
   return [...byId.values()];
 }

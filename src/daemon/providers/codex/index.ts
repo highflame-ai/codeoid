@@ -55,6 +55,7 @@ import type {
   TurnOpts,
   TurnRun,
   UiRequestFn,
+  CatalogEntry,
 } from "../interface.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
 import { buildCodexEnv } from "../env.js";
@@ -106,9 +107,7 @@ export interface CodexProviderInit {
   /** Cross-backend MCP registry — external servers mount natively via `-c
    *  mcp_servers.*` (codex owns its client); approval flows through canUseTool. */
   mcpRegistry?: McpRegistry;
-  onModels?: (
-    models: ReadonlyArray<{ value: string; displayName: string; description?: string }>,
-  ) => void;
+  onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
 }
 
 /** Item types that surface as tool records (vs text/reasoning streams). */
@@ -432,6 +431,11 @@ export class CodexProvider implements SessionProvider {
     this.#turnModel = opts.model ?? "codex";
     this.#announcedItems.clear();
     this.#lastTokenUsage = null;
+    // Per turn, like the usage beside it. This provider instance outlives a
+    // `/model` switch or a pipeline overrideModel, so a turn interrupted before
+    // its first token-usage notification would otherwise report the PREVIOUS
+    // model's window under the new model's id — and that pair was persisted.
+    this.#modelContextWindow = null;
     this.#hasQueried = true;
 
     void this.#startTurn(opts).catch((err: unknown) => {

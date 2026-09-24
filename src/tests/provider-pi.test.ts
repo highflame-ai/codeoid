@@ -177,6 +177,10 @@ describe("PiProvider", () => {
       expect(done.result.outputTokens).toBe(40);
       expect(done.result.totalCostUsd).toBeCloseTo(0.01);
       expect(done.result.stopReason).toBe("stop");
+      // pi states its window on the stats call codeoid already makes every
+      // turn (`contextUsage.contextWindow`); it was being dropped, leaving pi
+      // on a model-id guess of 200k for a 1M Gemini.
+      expect(done.result.contextWindow).toBe(1_048_576);
     }
 
     // The pi session file became the persisted backing id.

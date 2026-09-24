@@ -1,18 +1,23 @@
 /**
- * The context window comes from the BACKEND, not from a table keyed on model id.
+ * A session's context window comes from what its backend stated, resolved in
+ * one place and used by every consumer: display, occupancy caps, auto-rotate,
+ * and the history seed a provider switch or fork hands the next backend.
  *
- * codeoid used to infer every window from `contextWindowForModel`, a substring
- * match over model ids. That is wrong the moment a model ships: `claude-opus-5-5`
- * inferred to the 200k fallback while every turn result reported 1,000,000, so
- * the percent-of-window display, the fork seed budget, and the auto-rotate
- * occupancy that decides when a session rolls were all sized against a fifth of
- * the real capacity.
+ * Each block below pins a failure the first version of this change had:
  *
- * The provider now reports what the backend said and the session prefers it.
- * The table stays as the bootstrap — nothing can know the window before a turn
- * completes (the supported-models list carries none) and some backends report
- * none at all — so these tests pin both directions: reported wins when present,
- * inference still answers when it is absent.
+ *   - the stated window was a bare number that outlived the model it described,
+ *     so `/provider codex` from an Opus session seeded codex with a history
+ *     sized for Opus's 1M (2.45M chars into a 272k window, no truncation
+ *     notice) and kept displaying 1M on a backend that never reports;
+ *   - auto-rotate still divided by a 1M constant, so a 200k or 272k session
+ *     could never reach its 0.97 hard ceiling;
+ *   - the display was only computed inside the memory-engine refresh, so with
+ *     memory off it was never set at all;
+ *   - a fork never saw its parent's window, so it seeded against the 200k floor
+ *     on a 1M model.
+ *
+ * The floors still answer when nothing has been stated — before a first turn,
+ * and on backends that publish no limits (gemini, openai, acp).
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
@@ -22,21 +27,21 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
-import { Session } from "../daemon/session.js";
+import { Session, type WindowScope } from "../daemon/session.js";
+import { SessionManager } from "../daemon/session-manager.js";
+import { ProviderRegistry } from "../daemon/providers/registry.js";
 import { MockSessionProvider, mockResult } from "../daemon/providers/mock/session-provider.js";
-import { contextWindowForModel } from "../daemon/context-windows.js";
+import { seedBudgetChars, targetContextWindow } from "../daemon/providers/context-windows.js";
 import type { ProviderEvent } from "../daemon/providers/interface.js";
+import type { CodeoidConfig } from "../config.js";
 import type { AuthContext } from "../protocol/types.js";
 import { ALL_SCOPES } from "../protocol/scopes.js";
-import { SessionManager } from "../daemon/session-manager.js";
-import { normalizeModelCatalog } from "../daemon/providers/qwen/index.js";
-import { targetContextWindow } from "../daemon/providers/context-windows.js";
 import { MemoryEngine } from "../daemon/memory/engine.js";
 import { SqliteEpisodeStore } from "../daemon/memory/store.js";
 import type { Embedder } from "../daemon/memory/embedder.js";
 
-/** `SessionInfo.usage` is assembled by #refreshUsageFromStore, which needs a
- *  memory engine to read turn rows back from — hence the fake embedder. */
+/** `SessionInfo.usage`'s token fields come from #refreshUsageFromStore, which
+ *  reads turn rows back through a memory engine — hence the fake embedder. */
 class FakeEmbedder implements Embedder {
   readonly modelName = "fake-test";
   readonly dimensions = 8;
@@ -69,18 +74,40 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  // Let the fire-and-forget meta writes land before the dir goes away, or
-  // teardown races them and floods the output with ENOENT renames.
-  await Bun.sleep(120);
+  // Drain the fire-and-forget meta writes deterministically before the dir
+  // goes away, rather than sleeping and hoping.
+  try {
+    await transcriptStore.flush();
+  } catch {}
+  await memory.close();
   store.close();
   rmSync(tmp, { recursive: true, force: true });
 });
 
-/** One turn whose result carries (or omits) a backend-reported window. */
-function sessionRunning(
-  turns: ProviderEvent[][],
-  onModelLimits?: (p: string, m: string, l: { contextWindow: number; maxOutputTokens?: number }) => void,
-): Session {
+const turn = (result: Parameters<typeof mockResult>[0]): ProviderEvent[] => [
+  { type: "text_done", content: "ok" } as ProviderEvent,
+  { type: "turn_done", result: mockResult(result) } as ProviderEvent,
+];
+
+/** `send()` resolves once the prompt is queued; the turn drains asynchronously. */
+async function runTurn(s: Session, text: string): Promise<void> {
+  await s.send(text, AUTH);
+  const deadline = Date.now() + 2000;
+  while (s.status !== "idle" && s.status !== "error") {
+    if (Date.now() > deadline) throw new Error(`turn "${text}" never finished`);
+    await Bun.sleep(5);
+  }
+}
+
+function newSession(opts: {
+  turns?: ProviderEvent[][];
+  registry?: ProviderRegistry;
+  providerId?: string;
+  withMemory?: boolean;
+  config?: CodeoidConfig;
+  onModelLimits?: (scope: WindowScope, p: string, m: string, w: number) => void;
+  modelWindow?: (scope: WindowScope, p: string, m: string) => number | undefined;
+}): Session {
   return new Session({
     name: "window-test",
     workdir: tmp,
@@ -88,172 +115,208 @@ function sessionRunning(
     store,
     transcriptStore,
     existingId: randomUUID(),
-    memory,
-    _testProvider: new MockSessionProvider("mock", turns),
-    ...(onModelLimits ? { onModelLimits } : {}),
+    ...(opts.withMemory === false ? {} : { memory }),
+    ...(opts.registry
+      ? { providers: opts.registry, providerId: opts.providerId }
+      : { _testProvider: new MockSessionProvider("mock", opts.turns ?? []) }),
+    ...(opts.config ? { config: opts.config } : {}),
+    ...(opts.onModelLimits ? { onModelLimits: opts.onModelLimits } : {}),
+    ...(opts.modelWindow ? { modelWindow: opts.modelWindow } : {}),
   });
 }
 
-const turn = (result: Parameters<typeof mockResult>[0]): ProviderEvent[] => [
-  { type: "text_done", content: "ok" } as ProviderEvent,
-  { type: "turn_done", result: mockResult(result) } as ProviderEvent,
-];
-
-/** `send()` resolves once the prompt is queued, not once the turn is done —
- *  the events drain asynchronously, so wait for the session to go idle. */
-async function runTurn(s: Session, text: string): Promise<void> {
-  await s.send(text, AUTH);
-  const deadline = Date.now() + 2000;
-  while (s.status !== "idle") {
-    if (Date.now() > deadline) throw new Error(`turn "${text}" never finished`);
-    await Bun.sleep(5);
+/** Two-backend registry, capturing each built provider for inspection. */
+function twoBackends(a: ProviderEvent[][], b: ProviderEvent[][] = []) {
+  const created: Record<string, MockSessionProvider[]> = { "mock-a": [], "mock-b": [] };
+  const registry = new ProviderRegistry("mock-a");
+  for (const id of ["mock-a", "mock-b"] as const) {
+    registry.register({
+      id,
+      displayName: id,
+      create: () => {
+        const p = new MockSessionProvider(id, (id === "mock-a" ? a : b).map((t) => [...t]));
+        created[id]!.push(p);
+        return p;
+      },
+    });
   }
+  return { registry, created };
 }
 
 describe("a session reports the window its backend stated", () => {
-  it("prefers the reported window over what the id would infer", async () => {
-    // `mock-model` is not a Claude id, so inference gives the conservative
-    // 200k default — a value the assertion below would match by accident if
-    // the reported number were ignored. Report something that cannot be
-    // confused with it.
-    expect(contextWindowForModel("mock-model")).not.toBe(777_000);
-
-    const s = sessionRunning([turn({ contextWindow: 777_000, maxOutputTokens: 64_000 })]);
+  it("prefers the stated window over the floor", async () => {
+    const s = newSession({ turns: [turn({ contextWindow: 777_000 })] });
     await runTurn(s, "hi");
     expect(s.toInfo().usage?.contextWindow).toBe(777_000);
   });
 
-  it("falls back to inference before any turn has reported", () => {
-    // The state every fresh session and every just-resumed session is in:
-    // nothing has run, so there is nothing to prefer.
-    const s = sessionRunning([turn({ contextWindow: 777_000 })]);
-    expect(s.toInfo().usage?.contextWindow).toBe(contextWindowForModel(null));
+  it("answers with the provider's floor before any turn has reported", () => {
+    // Every fresh and just-resumed session is here. The floor is provider-
+    // aware: the Claude-only table used to answer for every backend.
+    const s = newSession({ turns: [turn({ contextWindow: 777_000 })] });
+    expect(s.toInfo().usage?.contextWindow).toBe(targetContextWindow("mock", null));
   });
 
-  it("falls back to inference when the backend reports no window", async () => {
-    // qwen against the Bailian gateway returns an empty usage map. That must
-    // land on the inferred number, never on 0 — a zero window would divide
-    // the percent-of-window by zero and starve the seed budget.
-    const s = sessionRunning([turn({})]);
+  it("stays on the floor, never zero, when the backend states nothing", async () => {
+    const s = newSession({ turns: [turn({})] });
     await runTurn(s, "hi");
-    const w = s.toInfo().usage?.contextWindow;
-    expect(w).toBe(contextWindowForModel(null));
-    expect(w).toBeGreaterThan(0);
+    expect(s.toInfo().usage?.contextWindow).toBe(targetContextWindow("mock", null));
   });
 
-  it("keeps the last reported window when a later turn omits it", async () => {
-    // Sticky on purpose. A provider that reports on turn 1 and not on turn 2
-    // has not said the window changed, so flapping back to the inferred value
-    // would make the number oscillate between correct and wrong.
-    const s = sessionRunning([
-      turn({ contextWindow: 777_000 }),
-      turn({}),
-    ]);
+  it("keeps the stated window across a turn that omits it", async () => {
+    // Omitting a number is not changing it; falling back here would make the
+    // window oscillate between stated and guessed.
+    const s = newSession({ turns: [turn({ contextWindow: 777_000 }), turn({})] });
     await runTurn(s, "one");
-    expect(s.toInfo().usage?.contextWindow).toBe(777_000);
     await runTurn(s, "two");
     expect(s.toInfo().usage?.contextWindow).toBe(777_000);
   });
 
-  it("follows the backend when a later turn reports a different window", async () => {
-    // The `/model` switch case: the next turn runs on another model and the
-    // backend says so. Nothing here needs to know which model that was.
-    const s = sessionRunning([
-      turn({ contextWindow: 200_000 }),
-      turn({ contextWindow: 1_000_000 }),
-    ]);
+  it("follows a later turn that states a different window", async () => {
+    const s = newSession({ turns: [turn({ contextWindow: 200_000 }), turn({ contextWindow: 1_000_000 })] });
     await runTurn(s, "one");
     expect(s.toInfo().usage?.contextWindow).toBe(200_000);
     await runTurn(s, "two");
     expect(s.toInfo().usage?.contextWindow).toBe(1_000_000);
   });
 
-  it("hands the limits up so the daemon can cache them for every session", async () => {
-    // A window is a property of the MODEL, not of whoever ran the turn, so the
-    // first session to learn it teaches the rest — and the persisted copy is
-    // what stops a restart from dropping back to inference.
-    const seen: { p: string; m: string; w: number; out?: number }[] = [];
-    const s = sessionRunning(
-      [turn({ model: "some-model", contextWindow: 777_000, maxOutputTokens: 64_000 })],
-      (p, m, l) => seen.push({ p, m, w: l.contextWindow, out: l.maxOutputTokens }),
-    );
+  it("is set even with the memory engine off", async () => {
+    // The display used to be computed only inside the memory refresh, so with
+    // CODEOID_MEMORY=0 it was never emitted and the web UI divided by 200k —
+    // a 1M session at 400k read "ctx 200%".
+    const s = newSession({ turns: [turn({ contextWindow: 1_000_000 })], withMemory: false });
     await runTurn(s, "hi");
-    expect(seen).toEqual([{ p: "mock", m: "some-model", w: 777_000, out: 64_000 }]);
-  });
-
-  it("does not hand up a window the backend never gave", async () => {
-    const seen: unknown[] = [];
-    const s = sessionRunning([turn({})], (...a) => seen.push(a));
-    await runTurn(s, "hi");
-    expect(seen).toEqual([]);
+    expect(s.toInfo().usage?.contextWindow).toBe(1_000_000);
   });
 });
 
-// ── Per-provider ingress ─────────────────────────────────────────────────────
+describe("the stated window never outlives the model it describes", () => {
+  it("a provider switch seeds and displays for the INCOMING backend", async () => {
+    // The headline regression. mock-a states a large window; after switching,
+    // mock-b's seed must be sized for mock-b, not for mock-a's number.
+    const { registry, created } = twoBackends([turn({ contextWindow: 1_000_000 })]);
+    const s = newSession({ registry, providerId: "mock-a" });
+    await runTurn(s, "on a");
+    expect(s.toInfo().usage?.contextWindow).toBe(1_000_000);
 
-// The design has to hold for every backend codeoid drives, and they do not
-// agree on how (or whether) they publish a window. Audited against each:
-//
-//   claude  per-turn   result.modelUsage[model].contextWindow
-//   codex   per-turn   thread/tokenUsage/updated → tokenUsage.modelContextWindow
-//   qwen    per-MODEL  its catalog's contextWindowSize — known BEFORE any turn
-//   gemini  none       direct API; the response carries no window
-//   openai  none       same
-//   pi      none       same
-//   acp     none       gemini-cli over ACP publishes no limits
-//
-// So the daemon accepts two ingresses into one (provider, model) cache and
-// keeps inference as the floor for the four that report nothing. These tests
-// pin that both doors work and that the silent backends stay safe.
-describe("every backend's window ingress", () => {
-  it("accepts a window published on the CATALOG (qwen's shape)", () => {
-    const m = new SessionManager(store, transcriptStore);
-    // qwen lists models with `contextWindowSize`; normalizeModelCatalog maps it
-    // to `contextWindow` and the emit forwards it, so the daemon knows the
-    // window with zero turns run — the one backend where that is possible.
-    (m as unknown as {
-      _cacheModels(p: string, raw: { value: string; displayName: string; contextWindow?: number }[]): void;
-    })._cacheModels("qwen", [
-      { value: "qwen3.8-max", displayName: "qwen3.8-max", contextWindow: 262_144 },
-      { value: "glm-5.3", displayName: "glm-5.3" }, // no window published
-    ]);
-    expect(m.modelContextWindow("qwen", "qwen3.8-max")).toBe(262_144);
-    // An entry without one must not invent a number.
-    expect(m.modelContextWindow("qwen", "glm-5.3")).toBeUndefined();
+    const res = await s.switchProvider("mock-b", AUTH);
+    expect(res.ok).toBe(true);
+    expect(created["mock-b"]![0]!.seededMaxChars).toBe(seedBudgetChars("mock-b", null));
+    expect(s.toInfo().usage?.contextWindow).toBe(targetContextWindow("mock-b", null));
   });
 
-  it("normalizes qwen's contextWindowSize off the real catalog shape", () => {
-    // Verbatim projection @qwen-code/sdk 0.1.8 emits: id/label/capabilities/
-    // contextWindowSize — note `label`, and the window under its own name.
-    const [first, second] = normalizeModelCatalog({
-      subtype: "models",
-      models: [
-        { id: "qwen3.8-max", label: "qwen3.8-max", capabilities: [], contextWindowSize: 262_144 },
-        { id: "auto", label: "auto", capabilities: [] },
-      ],
+  it("a model switch drops it until the new model states its own", async () => {
+    const s = newSession({ turns: [turn({ contextWindow: 777_000 })] });
+    await runTurn(s, "hi");
+    await s.setModel("some-other-model", undefined, AUTH);
+    expect(s.toInfo().usage?.contextWindow).toBe(targetContextWindow("mock", "some-other-model"));
+  });
+});
+
+describe("auto-rotate sizes occupancy against the stated window", () => {
+  it("fires the hard ceiling on a 200k model instead of waiting for 970k", async () => {
+    // Against a 1M constant, 195k is 19.5% — the 0.97 hard net could never
+    // fire for a model whose window is 200k. Against the stated window it is
+    // 97.5%, which is exactly what the net is for.
+    const config = {
+      session: {},
+      autoRotate: { enabled: false, rotatePct: 0.9, hardRotatePct: 0.97, minTurnsBeforeRotate: 5 },
+    } as unknown as CodeoidConfig;
+    const s = newSession({
+      turns: [turn({ inputTokens: 195_000, contextWindow: 200_000 }), turn({ contextWindow: 200_000 })],
+      config,
     });
-    expect(first).toMatchObject({ id: "qwen3.8-max", contextWindow: 262_144 });
-    expect(second?.contextWindow).toBeUndefined();
+    await runTurn(s, "fill");
+    expect(s.toInfo().usage?.lastTurnInputTokens).toBe(195_000);
+    await runTurn(s, "next");
+    expect(s.toInfo().rotation?.count).toBe(1);
+  });
+});
+
+describe("the daemon remembers stated windows per scope", () => {
+  it("hands a stated window up with the scope it was seen in", async () => {
+    const seen: unknown[] = [];
+    const s = newSession({
+      turns: [turn({ model: "some-model", contextWindow: 777_000 })],
+      onModelLimits: (scope, p, m, w) => seen.push({ scope, p, m, w }),
+    });
+    await runTurn(s, "hi");
+    expect(seen).toEqual([
+      { scope: { accountId: "acc-w", projectId: "proj-w", workdir: tmp }, p: "mock", m: "some-model", w: 777_000 },
+    ]);
   });
 
-  it("ignores a non-positive or non-numeric published window", () => {
-    // A backend that sends 0/null must fall through to inference rather than
-    // poisoning the cache with a window that divides by zero.
-    expect(normalizeModelCatalog({ models: [{ id: "m", label: "m", contextWindowSize: 0 }] })[0]
-      ?.contextWindow).toBeUndefined();
-    expect(normalizeModelCatalog({ models: [{ id: "m", label: "m", contextWindowSize: null }] })[0]
-      ?.contextWindow).toBeUndefined();
+  it("never teaches a placeholder model id", async () => {
+    // "unknown" (and codex's bare "codex", pi's "pi-default") name no model;
+    // as a cache key they would answer for whatever that default happens to be.
+    const seen: unknown[] = [];
+    const s = newSession({
+      turns: [turn({ model: "unknown", contextWindow: 777_000 })],
+      onModelLimits: (...a) => seen.push(a),
+    });
+    await runTurn(s, "hi");
+    expect(seen).toEqual([]);
+    // ...though this session still displays what its backend said.
+    expect(s.toInfo().usage?.contextWindow).toBe(777_000);
   });
 
-  it("leaves a silent backend on inference, never on zero", async () => {
-    // gemini / openai / pi / acp report nothing. That is not a failure mode —
-    // it is the case the static table exists for, and it must stay a positive
-    // number so percent-of-window and the seed budget keep working.
-    for (const providerId of ["gemini", "openai", "pi", "gemini-cli"]) {
-      expect(targetContextWindow(providerId, "some-model")).toBeGreaterThan(0);
-      // And nothing was cached for them, so the floor is what answers.
-      expect(new SessionManager(store, transcriptStore).modelContextWindow(providerId, "some-model"))
-        .toBeUndefined();
-    }
+  it("scopes the cache, so one workdir's settings can't size another tenant's seed", () => {
+    // The Claude CLI derives the window from settings a workdir can override
+    // (CLAUDE_CODE_MAX_CONTEXT_TOKENS is unclamped). Unscoped, one workdir's
+    // 4M became every tenant's fork budget.
+    const m = new SessionManager(store, transcriptStore);
+    const cache = m as unknown as { _cacheModelLimits(s: WindowScope, p: string, mo: string, w: number): void };
+    const a: WindowScope = { accountId: "A", projectId: "p", workdir: "/w1" };
+    const b: WindowScope = { accountId: "B", projectId: "p", workdir: "/w2" };
+    cache._cacheModelLimits(a, "claude", "claude-opus-5-5", 4_000_000);
+    expect(m.modelContextWindow(a, "claude", "claude-opus-5-5")).toBe(4_000_000);
+    expect(m.modelContextWindow(b, "claude", "claude-opus-5-5")).toBeUndefined();
+    // Survives a restart, in its own scope only.
+    const next = new SessionManager(store, transcriptStore);
+    expect(next.modelContextWindow(a, "claude", "claude-opus-5-5")).toBe(4_000_000);
+    expect(next.modelContextWindow(b, "claude", "claude-opus-5-5")).toBeUndefined();
+  });
+
+  it("serves a catalog-published window, and stops when the catalog does", () => {
+    // Read from the catalog itself rather than copied into the turn cache:
+    // the copy was upsert-only, so a window the backend stopped publishing
+    // kept winning forever.
+    const m = new SessionManager(store, transcriptStore);
+    const cache = m as unknown as {
+      _cacheModels(p: string, raw: { value: string; displayName: string; contextWindow?: number }[]): void;
+    };
+    const scope: WindowScope = { accountId: "A", projectId: "p", workdir: "/w" };
+    cache._cacheModels("qwen", [{ value: "qwen3.8-max", displayName: "Qwen 3.8 Max", contextWindow: 262_144 }]);
+    expect(m.modelContextWindow(scope, "qwen", "qwen3.8-max")).toBe(262_144);
+    cache._cacheModels("qwen", [{ value: "qwen3.8-max", displayName: "Qwen 3.8 Max" }]);
+    expect(m.modelContextWindow(scope, "qwen", "qwen3.8-max")).toBeUndefined();
+  });
+
+  it("uses a remembered window for the session's model before any turn", async () => {
+    // What makes the persisted cache worth persisting: a resumed session on a
+    // model the table doesn't know renders the stated window, not the guess.
+    const s = newSession({
+      turns: [],
+      modelWindow: (_scope, p, model) => (p === "mock" && model === "known-model" ? 555_000 : undefined),
+    });
+    await s.setModel("known-model", undefined, AUTH);
+    expect(s.toInfo().usage?.contextWindow).toBe(555_000);
+  });
+
+  it("a fork on the same model inherits its parent's stated window", async () => {
+    const parent = newSession({ turns: [turn({ contextWindow: 1_000_000 })] });
+    await runTurn(parent, "hi");
+    const fork = newSession({ turns: [] });
+    fork.inheritObservedLimits(parent);
+    expect(fork.toInfo().usage?.contextWindow).toBe(1_000_000);
+  });
+
+  it("a fork on a different model does not", async () => {
+    const parent = newSession({ turns: [turn({ contextWindow: 1_000_000 })] });
+    await runTurn(parent, "hi");
+    const fork = newSession({ turns: [] });
+    await fork.setModel("different-model", undefined, AUTH);
+    fork.inheritObservedLimits(parent);
+    expect(fork.toInfo().usage?.contextWindow).toBe(targetContextWindow("mock", "different-model"));
   });
 });

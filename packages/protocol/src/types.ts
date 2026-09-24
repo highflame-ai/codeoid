@@ -474,10 +474,12 @@ export interface SessionUsage {
   /** Most recent turn's cache-read ratio (cache_read / total_input). */
   lastTurnCacheHitRate?: number;
   /**
-   * Resolved model's context window in tokens — the denominator for
-   * ctx-occupancy displays. Derived from `SessionInfo.model` via the
-   * daemon's per-model catalog (`contextWindowForModel`). Switching
-   * models mid-session updates this on the next info_update broadcast.
+   * Context window in tokens of the model this session is running — the
+   * denominator for ctx-occupancy displays, and the one the daemon's own
+   * auto-rotate uses. The window the backend reported on its last turn when
+   * there is one, else what the provider publishes for the model, else a
+   * per-provider estimate. Switching model or provider drops the reported
+   * value, so this follows the switch on the next info_update.
    *
    * Optional for back-compat with daemons that pre-date this field;
    * frontends should fall back to a conservative constant (200k) or
@@ -1687,16 +1689,10 @@ export interface ModelInfo {
   /** True for the backend's recommended default. */
   isDefault?: boolean;
   /**
-   * Context window in tokens, when the BACKEND publishes it on its catalog.
-   *
-   * The better of the two ingresses, because it is known before any turn runs:
-   * qwen-code's model list carries `contextWindowSize` per entry. Claude's
-   * `ModelInfo` carries none and only reports the window on a completed turn,
-   * and codex reports it on its token-usage notification — so the daemon
-   * accepts both and caches whichever arrives (`SessionManager.modelContextWindow`).
-   *
-   * Absent for backends that publish no limits (gemini, openai, pi, acp), where
-   * the daemon falls back to inferring one from the model id.
+   * Context window in tokens, when the backend publishes it on its catalog
+   * (qwen-code's `contextWindowSize`, pi's model objects). Known before any
+   * turn runs. Absent where the catalog carries none — Claude and codex report
+   * the window per turn instead, and gemini, openai and acp not at all.
    */
   contextWindow?: number;
 }

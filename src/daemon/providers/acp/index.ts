@@ -34,6 +34,7 @@ import type {
   ToolApprovalFn,
   TurnOpts,
   TurnRun,
+  CatalogEntry,
 } from "../interface.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
 import { buildGeminiCliEnv } from "../env.js";
@@ -71,9 +72,7 @@ export interface GeminiAcpProviderInit {
   /** Cross-backend MCP registry — external servers mount on session/new
    *  (gemini-cli owns its client); approval flows through canUseTool. */
   mcpRegistry?: McpRegistry;
-  onModels?: (
-    models: ReadonlyArray<{ value: string; displayName: string; description?: string }>,
-  ) => void;
+  onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
 }
 
 export class GeminiAcpProvider implements SessionProvider {

@@ -21,7 +21,7 @@ import type { McpRegistry } from "../mcp/registry.js";
 import type { McpHub } from "../mcp/hub.js";
 import type { CompressionRegistry } from "../compress/index.js";
 import type { CodeoidConfig } from "../../config.js";
-import type { SessionProvider } from "./interface.js";
+import type { SessionProvider, CatalogEntry } from "./interface.js";
 import { ClaudeProvider } from "./claude/index.js";
 import { GeminiProvider } from "./gemini/index.js";
 import { OpenAIProvider } from "./openai/index.js";
@@ -66,9 +66,7 @@ export interface ProviderSessionInit {
   config?: CodeoidConfig;
   compressionRegistry?: CompressionRegistry;
   /** Live model-catalog report, already tagged with the factory's id by Session. */
-  onModels?: (
-    models: ReadonlyArray<{ value: string; displayName: string; description?: string }>,
-  ) => void;
+  onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
 }
 
 export interface ProviderFactory {

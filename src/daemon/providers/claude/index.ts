@@ -41,7 +41,7 @@ import { FLEET_TOOL_NAMES } from "../../fleet.js";
 import { rewriteBashToolInput } from "../../compress/index.js";
 import type { CodeoidConfig } from "../../../config.js";
 import type { AuthContext } from "../../../protocol/types.js";
-import type { SessionProvider, ModelInfo, NormalizedTurnResult, ProviderEvent, SessionScopedEvent, TurnOpts, TurnRun } from "../interface.js";
+import type { SessionProvider, ModelInfo, NormalizedTurnResult, ProviderEvent, SessionScopedEvent, TurnOpts, TurnRun, CatalogEntry } from "../interface.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
 import { buildSubprocessEnv, withGatewayCredential } from "../env.js";
 import type { LLMCallUsage } from "../../context-math.js";
@@ -125,7 +125,7 @@ export interface ClaudeProviderInit {
   config?: CodeoidConfig;
   compressionRegistry?: CompressionRegistry;
   /** Called once per session with the live model catalog. */
-  onModels?: (models: ReadonlyArray<{ value: string; displayName: string; description?: string }>) => void;
+  onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
   /**
    * Called when the backing Claude Code session is missing (i.e. the SDK
    * throws "No conversation found with session ID").  Session must enqueue
@@ -1254,7 +1254,6 @@ export function translateSDKMessage(
               inputTokens?: number;
               outputTokens?: number;
               contextWindow?: number;
-              maxOutputTokens?: number;
             }
           >;
         };
@@ -1269,7 +1268,6 @@ export function translateSDKMessage(
         // goes stale every time a model ships (see context-windows.ts).
         const primaryUsage = r.modelUsage?.[model];
         const reportedWindow = primaryUsage?.contextWindow;
-        const reportedMaxOutput = primaryUsage?.maxOutputTokens;
         // A zero-turn run means the assistant never ran — the prompt was
         // consumed and discarded (blocked slash-command expansion, rejected
         // input). The SDK reports this as `subtype: "success", is_error: false`,
@@ -1292,8 +1290,7 @@ export function translateSDKMessage(
           cacheCreationTokens: r.usage?.cache_creation_input_tokens ?? 0,
           totalCostUsd: r.total_cost_usd ?? 0,
           durationMs: r.duration_ms ?? 0,
-          ...(reportedWindow !== undefined ? { contextWindow: reportedWindow } : {}),
-          ...(reportedMaxOutput !== undefined ? { maxOutputTokens: reportedMaxOutput } : {}),
+          ...(typeof reportedWindow === "number" && reportedWindow > 0 ? { contextWindow: reportedWindow } : {}),
           stopReason: r.stop_reason ?? undefined,
           // Preserve `undefined` when the SDK didn't report — only force true.
           isError: zeroTurn ? true : r.is_error,
@@ -1333,6 +1330,14 @@ export function translateSDKMessage(
             tools[server].push(t);
           }
           emit({ type: "mcp_init", servers, tools });
+        } else if (subtype === "model_fallback" || subtype === "model_refusal_fallback") {
+          // The CLI re-dispatched this turn to the configured fallbackModel
+          // (primary overloaded / refused). The turn is now that model's, so
+          // its label and its window must be too — otherwise a turn Haiku
+          // served is recorded as Opus with Opus's 1M. The next turn's `init`
+          // names the primary again, which restores it.
+          const fb = (msg as { fallback_model?: string }).fallback_model;
+          if (fb) state.primaryModel = fb;
         } else if (subtype === "api_retry") {
           const r = msg as { attempt?: number; retry_delay_ms?: number; error_status?: number | null };
           emit({ type: "api_retry", attempt: r.attempt, retryDelayMs: r.retry_delay_ms, errorStatus: r.error_status });

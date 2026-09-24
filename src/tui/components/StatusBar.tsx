@@ -66,10 +66,12 @@ export function StatusBar({
     workingSince !== null && workingSince !== undefined
       ? Math.max(0, Math.floor((Date.now() - workingSince) / 1000))
       : null;
-  // Resolve the denominator for ctx% from the CURRENT model's real window.
-  // Haiku 4.5 = 200k; Opus 4.8 / Sonnet 5 = 1M. Hardcoding 1M made a Haiku
-  // session at 150k look like "15%" when it's really 75% full.
+  // The daemon's resolved window first — the one the backend reported, the
+  // same number the web UI and auto-rotate use. The static catalog only knows
+  // three Claude ids, so a codex session at 250k of 272k read "25%" in green
+  // here while the web UI showed 92%.
   const contextWindow =
+    focused?.info.usage?.contextWindow ||
     (focused?.info.model && findModel(focused.info.model)?.contextWindow) ||
     CONTEXT_WINDOW_FALLBACK;
   // Outer Box is width-constrained to `cols` and the inner <Text> uses

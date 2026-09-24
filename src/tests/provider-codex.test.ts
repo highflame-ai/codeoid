@@ -314,6 +314,25 @@ describe("CodexProvider over fake-codex", () => {
     if (done?.type === "turn_done") expect(done.result.stopReason).toBe("interrupted");
   });
 
+  it("C10b: a turn that reports no usage carries no window from an EARLIER turn", async () => {
+    // The provider instance outlives a /model switch or a pipeline
+    // overrideModel. A window left from the previous turn would be attached
+    // to this one under the NEW model's id — and that pair was persisted.
+    const p = makeProvider();
+    const first = await collect(p.runTurn(turnOpts("hello")));
+    const firstDone = first.find((e) => e.type === "turn_done");
+    expect(firstDone?.type === "turn_done" && firstDone.result.contextWindow).toBe(272_000);
+
+    const run = p.runTurn(turnOpts("hang-forever"));
+    await new Promise((r) => setTimeout(r, 300));
+    await run.interrupt();
+    const events = await collect(run);
+    await p.teardown();
+    const done = events.find((e) => e.type === "turn_done");
+    expect(done?.type === "turn_done" && done.result.stopReason).toBe("interrupted");
+    expect(done?.type === "turn_done" ? done.result.contextWindow : "none").toBeUndefined();
+  });
+
   it("C11: unknown server→client requests are refused with a JSON-RPC error (fail closed)", async () => {
     const p = makeProvider();
     const events = await collect(p.runTurn(turnOpts("unknown-request")));
