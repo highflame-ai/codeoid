@@ -81,6 +81,10 @@ CODEOID_MAX_SESSIONS_PER_HOUR=0         # session creations per subject per hour
 CODEOID_DAEMON_URL=ws://127.0.0.1:7400  # (for CLI + TUI client)
 CODEOID_DB_PATH=~/.codeoid/codeoid.db   # SQLite path
 CODEOID_TRANSCRIPT_DIR=~/.codeoid/transcripts
+CODEOID_RESUME_MAX_SESSIONS=200          # sessions restored from disk at startup, newest-first.
+                                        #   Resume is also time-boxed, so raising this costs
+                                        #   startup time; the remainder stays on disk and loads
+                                        #   on a later restart.
 
 # Memory
 CODEOID_MEMORY=1                        # default: on; set to 0 to disable
