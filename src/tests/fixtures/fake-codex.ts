@@ -50,7 +50,15 @@ function tokenUsage() {
 function emitUsage(threadId: string): void {
   send({
     method: "thread/tokenUsage/updated",
-    params: { threadId, turnId: "turn-1", tokenUsage: { total: tokenUsage(), last: tokenUsage() } },
+    // `ThreadTokenUsage` carries THREE fields on the real wire — `last`,
+    // `total` and `modelContextWindow` (the codex binary's own serde says
+    // "struct ThreadTokenUsage with 3 elements"). The third is how codex tells
+    // us the window; the fixture omitted it, so nothing exercised that path.
+    params: {
+      threadId,
+      turnId: "turn-1",
+      tokenUsage: { total: tokenUsage(), last: tokenUsage(), modelContextWindow: 272_000 },
+    },
   });
 }
 

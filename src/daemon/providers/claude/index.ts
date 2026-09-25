@@ -41,7 +41,7 @@ import { FLEET_TOOL_NAMES } from "../../fleet.js";
 import { rewriteBashToolInput } from "../../compress/index.js";
 import type { CodeoidConfig } from "../../../config.js";
 import type { AuthContext } from "../../../protocol/types.js";
-import type { SessionProvider, ModelInfo, NormalizedTurnResult, ProviderEvent, SessionScopedEvent, TurnOpts, TurnRun } from "../interface.js";
+import type { SessionProvider, ModelInfo, NormalizedTurnResult, ProviderEvent, SessionScopedEvent, TurnOpts, TurnRun, CatalogEntry } from "../interface.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
 import { buildSubprocessEnv, withGatewayCredential } from "../env.js";
 import type { LLMCallUsage } from "../../context-math.js";
@@ -125,7 +125,7 @@ export interface ClaudeProviderInit {
   config?: CodeoidConfig;
   compressionRegistry?: CompressionRegistry;
   /** Called once per session with the live model catalog. */
-  onModels?: (models: ReadonlyArray<{ value: string; displayName: string; description?: string }>) => void;
+  onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
   /**
    * Called when the backing Claude Code session is missing (i.e. the SDK
    * throws "No conversation found with session ID").  Session must enqueue
@@ -166,7 +166,7 @@ export class ClaudeProvider implements SessionProvider {
   #lastPushedContent: string | null = null;
   /** Cross-message carry-over for the translator (see TranslateState) — holds
    * the `<local-command-stderr>` that explains a zero-turn "success". */
-  #translateState: TranslateState = { lastLocalCommandStderr: null };
+  #translateState: TranslateState = { lastLocalCommandStderr: null, primaryModel: null };
   /** Skill commands with an approval prompt in flight — prevents a repeated
    * turn from raising a duplicate prompt for the same command (#233). */
   #pendingSkillApprovals = new Set<string>();
@@ -1118,6 +1118,19 @@ export class ClaudeProvider implements SessionProvider {
 export interface TranslateState {
   /** Last `<local-command-stderr>` seen since the previous result. */
   lastLocalCommandStderr: string | null;
+  /**
+   * The PRIMARY model id for the turn, as the SDK named it on its `init`
+   * message (e.g. `claude-opus-5-5`).
+   *
+   * Load-bearing for two things that used to guess. `result.modelUsage` is a
+   * map keyed by every model the turn touched, and side-calls (title
+   * generation, summaries) put Haiku in there too — often FIRST, since the
+   * order is insertion, not significance. So `Object.keys(modelUsage)[0]`
+   * labelled an Opus turn as Haiku, and reading a context window off that
+   * entry would report 200k for a 1M turn: the very bug being fixed, in a new
+   * place. The SDK already says which model is primary; ask it instead.
+   */
+  primaryModel: string | null;
 }
 
 /**
@@ -1130,7 +1143,7 @@ export function translateSDKMessage(
   msg: SDKMessage,
   emit: (event: ProviderEvent) => void,
   providerId: string,
-  state: TranslateState = { lastLocalCommandStderr: null },
+  state: TranslateState = { lastLocalCommandStderr: null, primaryModel: null },
   /** Session-scoped emitter — background-task events go HERE, never through
    *  `emit`, because they can fire between turns when the turn queue has no
    *  reader and would drop them unread. */
@@ -1235,10 +1248,26 @@ export function translateSDKMessage(
             cache_read_input_tokens?: number;
             cache_creation_input_tokens?: number;
           };
-          modelUsage?: Record<string, { inputTokens?: number; outputTokens?: number }>;
+          modelUsage?: Record<
+            string,
+            {
+              inputTokens?: number;
+              outputTokens?: number;
+              contextWindow?: number;
+            }
+          >;
         };
-        // Derive the model from the first key in modelUsage (most-used model this turn).
-        const model = Object.keys(r.modelUsage ?? {})[0] ?? "unknown";
+        // The primary model the SDK named at `init`, not the first key in
+        // modelUsage: that map is keyed by every model the turn touched and
+        // ordered by insertion, so a Haiku side-call routinely sits in front
+        // of the model that did the work.
+        const usageKeys = Object.keys(r.modelUsage ?? {});
+        const model = state.primaryModel ?? usageKeys[0] ?? "unknown";
+        // Limits as the BACKEND states them for that model. Authoritative:
+        // codeoid otherwise guesses the window from a substring table that
+        // goes stale every time a model ships (see context-windows.ts).
+        const primaryUsage = r.modelUsage?.[model];
+        const reportedWindow = primaryUsage?.contextWindow;
         // A zero-turn run means the assistant never ran — the prompt was
         // consumed and discarded (blocked slash-command expansion, rejected
         // input). The SDK reports this as `subtype: "success", is_error: false`,
@@ -1261,6 +1290,7 @@ export function translateSDKMessage(
           cacheCreationTokens: r.usage?.cache_creation_input_tokens ?? 0,
           totalCostUsd: r.total_cost_usd ?? 0,
           durationMs: r.duration_ms ?? 0,
+          ...(typeof reportedWindow === "number" && reportedWindow > 0 ? { contextWindow: reportedWindow } : {}),
           stopReason: r.stop_reason ?? undefined,
           // Preserve `undefined` when the SDK didn't report — only force true.
           isError: zeroTurn ? true : r.is_error,
@@ -1276,7 +1306,14 @@ export function translateSDKMessage(
       case "system": {
         const subtype = (msg as { subtype?: string }).subtype;
         if (subtype === "init") {
-          const init = msg as { mcp_servers?: { name: string; status: string }[]; tools?: string[] };
+          const init = msg as {
+            mcp_servers?: { name: string; status: string }[];
+            tools?: string[];
+            model?: string;
+          };
+          // Remember which model is actually driving this turn — see
+          // TranslateState.primaryModel for why the result map can't tell us.
+          if (init.model) state.primaryModel = init.model;
           const servers: Record<string, string> = {};
           const tools: Record<string, string[]> = {};
           for (const s of init.mcp_servers ?? []) {
@@ -1293,6 +1330,14 @@ export function translateSDKMessage(
             tools[server].push(t);
           }
           emit({ type: "mcp_init", servers, tools });
+        } else if (subtype === "model_fallback" || subtype === "model_refusal_fallback") {
+          // The CLI re-dispatched this turn to the configured fallbackModel
+          // (primary overloaded / refused). The turn is now that model's, so
+          // its label and its window must be too — otherwise a turn Haiku
+          // served is recorded as Opus with Opus's 1M. The next turn's `init`
+          // names the primary again, which restores it.
+          const fb = (msg as { fallback_model?: string }).fallback_model;
+          if (fb) state.primaryModel = fb;
         } else if (subtype === "api_retry") {
           const r = msg as { attempt?: number; retry_delay_ms?: number; error_status?: number | null };
           emit({ type: "api_retry", attempt: r.attempt, retryDelayMs: r.retry_delay_ms, errorStatus: r.error_status });

@@ -543,11 +543,10 @@ export function App({ config }: Props) {
   const printContextBreakdownMessage = (session: import("./types.js").TuiSession) => {
     const info = session.info;
     const u = info.usage;
-    // Resolve context window from the session's current model (200k for
-    // Haiku, 1M for Opus/Sonnet). Mirrors the StatusBar so both readouts
-    // agree on what "100%" means.
+    // Same resolution as the StatusBar, so both readouts agree on what
+    // "100%" means: the daemon's resolved window, then the static catalog.
     const W =
-      (info.model && findModel(info.model)?.contextWindow) || 1_000_000;
+      u?.contextWindow || (info.model && findModel(info.model)?.contextWindow) || 1_000_000;
 
     const lines: string[] = [];
     lines.push(`## Context breakdown for ${info.name}`);

@@ -22,6 +22,7 @@ import {
 import { contextWindowForModel } from "../daemon/context-windows.js";
 import { Store } from "../daemon/store.js";
 import { SessionManager, DEFAULT_PROVIDER_ID } from "../daemon/session-manager.js";
+import type { WindowScope } from "../daemon/session.js";
 import { TranscriptStore } from "../daemon/transcript.js";
 
 describe("resolveAgainstList (live-backend resolution)", () => {
@@ -484,5 +485,52 @@ describe("models.list serves live → persisted → baked-in fallback, per provi
     const res = await listModels(manager);
     expect(res.models.map((m) => m.value)).toEqual(["default", "fable", "opus"]);
     expect(res.live).toBe(true);
+  });
+});
+
+// ── Stated context windows ───────────────────────────────────────────────────
+
+// Scoping, restart survival and the catalog path are pinned in
+// session-reported-window.test.ts; this block covers what the cache refuses.
+describe("the stated-window cache", () => {
+  interface Cache {
+    _cacheModelLimits(scope: WindowScope, providerId: string, model: string, window: number): void;
+  }
+  const scope: WindowScope = { accountId: "acc", projectId: "proj", workdir: "/w" };
+
+  let tmp2: string;
+  let store2: Store;
+  beforeEach(() => {
+    tmp2 = mkdtempSync(join(tmpdir(), "codeoid-limits-"));
+    store2 = new Store(join(tmp2, "codeoid.db"));
+  });
+  afterEach(() => {
+    store2.close();
+    rmSync(tmp2, { recursive: true, force: true });
+  });
+
+  it("refuses values that would be worse than the floor", () => {
+    const m = new SessionManager(store2, new TranscriptStore(join(tmp2, "t")));
+    const c = m as unknown as Cache;
+    // A non-positive window would divide percent-of-window by zero; a
+    // placeholder model names no model, so it must not become a key.
+    c._cacheModelLimits(scope, "claude", "claude-opus-5-5", 0);
+    c._cacheModelLimits(scope, "claude", "m2", -5);
+    c._cacheModelLimits(scope, "claude", "unknown", 1_000_000);
+    c._cacheModelLimits(scope, "codex", "codex", 272_000);
+    c._cacheModelLimits(scope, "pi", "pi-default", 200_000);
+    expect(m.modelContextWindow(scope, "claude", "claude-opus-5-5")).toBeUndefined();
+    expect(m.modelContextWindow(scope, "claude", "m2")).toBeUndefined();
+    expect(m.modelContextWindow(scope, "claude", "unknown")).toBeUndefined();
+    expect(m.modelContextWindow(scope, "codex", "codex")).toBeUndefined();
+    expect(m.modelContextWindow(scope, "pi", "pi-default")).toBeUndefined();
+  });
+
+  it("the latest report in a scope wins", () => {
+    const m = new SessionManager(store2, new TranscriptStore(join(tmp2, "t")));
+    const c = m as unknown as Cache;
+    c._cacheModelLimits(scope, "claude", "claude-opus-5-5", 200_000);
+    c._cacheModelLimits(scope, "claude", "claude-opus-5-5", 1_000_000);
+    expect(m.modelContextWindow(scope, "claude", "claude-opus-5-5")).toBe(1_000_000);
   });
 });

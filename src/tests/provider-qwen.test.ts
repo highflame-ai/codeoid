@@ -399,7 +399,12 @@ describe("normalizeModelCatalog", () => {
   // The shape @qwen-code/sdk 0.1.8 actually returns: `models` (not
   // `availableModels`), `id` (not `modelId`), `label` (not `name`), and no
   // description. Reading only `name` left every entry displaying its raw id.
-  test("reads the real sdk 0.1.8 shape — models[] with id + label", () => {
+  //
+  // `contextWindowSize` is now CARRIED rather than dropped. qwen is the only
+  // backend codeoid drives that publishes a window on its catalog — known
+  // before any turn runs — and the daemon's alternative was inferring one from
+  // the model id, which is wrong for every non-Claude id by construction.
+  test("reads the real sdk 0.1.8 shape — models[] with id + label + window", () => {
     expect(
       normalizeModelCatalog({
         subtype: "get_available_models",
@@ -409,8 +414,8 @@ describe("normalizeModelCatalog", () => {
         ],
       }),
     ).toEqual([
-      { id: "qwen3.8-max", displayName: "Qwen 3.8 Max" },
-      { id: "glm-5.2", displayName: "GLM 5.2" },
+      { id: "qwen3.8-max", displayName: "Qwen 3.8 Max", contextWindow: 1000000 },
+      { id: "glm-5.2", displayName: "GLM 5.2", contextWindow: 1000000 },
     ]);
   });
 
@@ -503,6 +508,22 @@ describe("fetchOpenAiModelCatalog", () => {
 });
 
 describe("unionCatalogs", () => {
+  test("keeps a window across a collision, whichever entry wins the label", () => {
+    // The gateway's /models carries no windows. When it also listed an id the
+    // qwen-code registry had a window for, the bare live entry won and the
+    // window vanished — exactly the "Custom Provider" setup, whose entries
+    // carry no separate name.
+    const live = [{ id: "qwen3.8-max", displayName: "qwen3.8-max" }];
+    const unlabelled = [{ id: "qwen3.8-max", displayName: "qwen3.8-max", contextWindow: 262_144 }];
+    expect(unionCatalogs(live, unlabelled)).toEqual([
+      { id: "qwen3.8-max", displayName: "qwen3.8-max", contextWindow: 262_144 },
+    ]);
+    const labelled = [{ id: "qwen3.8-max", displayName: "Qwen 3.8 Max", contextWindow: 262_144 }];
+    expect(unionCatalogs(live, labelled)).toEqual([
+      { id: "qwen3.8-max", displayName: "Qwen 3.8 Max", contextWindow: 262_144 },
+    ]);
+  });
+
   test("dedupes by id and keeps the entry that has a real label", () => {
     // /models returns bare ids; the qwen-code registry supplies labels.
     const live = [{ id: "qwen3.8-max", displayName: "qwen3.8-max" }, { id: "glm-5.2", displayName: "glm-5.2" }];
