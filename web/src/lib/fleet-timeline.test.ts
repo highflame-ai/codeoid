@@ -148,6 +148,22 @@ describe("groupByDay", () => {
     expect(days[0]!.entries.map((e) => e.key)).toEqual(["dispatch:b", "dispatch:a"]);
   });
 
+  it("prints each date once even when the input is not sorted", () => {
+    // Grouping only consecutive entries would split one day into two headers
+    // the moment a caller skipped buildTimeline's sort. Raised by review on
+    // #335 — keyed on the day now, so the precondition is gone, not documented.
+    const d1 = new Date(2026, 4, 10, 9).getTime();
+    const d2 = new Date(2026, 4, 11, 9).getTime();
+    const unsorted = [
+      ...buildTimeline([task("a", { createdAt: d1 })], []),
+      ...buildTimeline([task("b", { createdAt: d2 })], []),
+      ...buildTimeline([task("c", { createdAt: d1 + 60_000 })], []),
+    ];
+    const days = groupByDay(unsorted);
+    expect(days.map((d) => d.day)).toEqual([new Date(2026, 4, 11).getTime(), new Date(2026, 4, 10).getTime()]);
+    expect(days[1]!.entries.map((e) => e.key)).toEqual(["dispatch:a", "dispatch:c"]);
+  });
+
   it("returns nothing for an empty timeline", () => {
     expect(groupByDay([])).toEqual([]);
   });

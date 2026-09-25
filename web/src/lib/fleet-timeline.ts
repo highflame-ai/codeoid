@@ -121,7 +121,7 @@ export function buildTimeline(
 }
 
 /**
- * Group consecutive entries by calendar day, for date separators.
+ * Group entries by calendar day, for date separators.
  *
  * Retrospection is the point of this lens, and a flat list of times with no
  * day boundaries is unreadable past the first screen.
@@ -132,17 +132,26 @@ export interface TimelineDay {
   entries: TimelineEntry[];
 }
 
+/**
+ * Days come back newest-first, one per calendar day, whatever order the input
+ * is in. Grouping only CONSECUTIVE entries would print the same date twice for
+ * input that is not already sorted, so this keys on the day instead of relying
+ * on the caller. Within a day, entries keep their input order — `buildTimeline`
+ * has already decided it, including the same-millisecond tie-break.
+ */
 export function groupByDay(entries: readonly TimelineEntry[]): TimelineDay[] {
-  const days: TimelineDay[] = [];
+  const byDay = new Map<number, TimelineEntry[]>();
   for (const entry of entries) {
     const d = new Date(entry.at);
     // LOCAL midnight, not UTC: the user is reading their own day boundaries,
     // and a UTC split puts an evening dispatch on "tomorrow" for anyone east
     // of the meridian.
     const day = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
-    const last = days[days.length - 1];
-    if (last && last.day === day) last.entries.push(entry);
-    else days.push({ day, entries: [entry] });
+    const bucket = byDay.get(day);
+    if (bucket) bucket.push(entry);
+    else byDay.set(day, [entry]);
   }
-  return days;
+  return [...byDay]
+    .map(([day, dayEntries]) => ({ day, entries: dayEntries }))
+    .sort((a, b) => b.day - a.day);
 }

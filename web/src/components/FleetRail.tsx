@@ -68,6 +68,16 @@ const STATE_STYLE: Record<FleetNodeState, { cls: string; title: string }> = {
   idle: { cls: "border-border bg-bg text-fg-faint", title: "Idle — settled and quiet" },
 };
 
+/**
+ * The rail's lenses, in switch order. One list, so adding a lens is one entry
+ * here rather than a hunt for every `"lanes" | "timeline"`.
+ */
+const FLEET_LENSES = [
+  { id: "lanes", label: "Lanes", title: "What needs you now, grouped by state" },
+  { id: "timeline", label: "Timeline", title: "What was dispatched when, and what came back" },
+] as const;
+type FleetLens = (typeof FLEET_LENSES)[number]["id"];
+
 const FleetRail: Component = () => {
   onMount(() => void subscribeFleet());
   onCleanup(() => unsubscribeFleet());
@@ -88,7 +98,7 @@ const FleetRail: Component = () => {
   // Which lens is showing. Lanes answer "what needs me now"; the timeline
   // answers "what happened" (§4). They are different questions, and the second
   // is badly served by a list that re-sorts itself by urgency.
-  const [lens, setLens] = createSignal<"lanes" | "timeline">("lanes");
+  const [lens, setLens] = createSignal<FleetLens>("lanes");
   const timeline = createMemo(() => {
     const b = board();
     return groupByDay(buildTimeline(b.tasks, b.events, (t) => taskSession(b, t)));
@@ -136,8 +146,9 @@ const FleetRail: Component = () => {
           <BackendSpendTable econ={econ()} />
         </Show>
         <div class="flex items-center gap-0.5 pt-0.5" role="group" aria-label="Fleet lens">
-          <LensButton lens="lanes" label="Lanes" active={lens()} onPick={setLens} title="What needs you now, grouped by state" />
-          <LensButton lens="timeline" label="Timeline" active={lens()} onPick={setLens} title="What was dispatched when, and what came back" />
+          <For each={FLEET_LENSES}>
+            {(l) => <LensButton lens={l.id} label={l.label} active={lens()} onPick={setLens} title={l.title} />}
+          </For>
         </div>
       </header>
 
@@ -168,11 +179,11 @@ const FleetRail: Component = () => {
 };
 
 const LensButton: Component<{
-  lens: "lanes" | "timeline";
+  lens: FleetLens;
   label: string;
-  active: "lanes" | "timeline";
+  active: FleetLens;
   title: string;
-  onPick: (l: "lanes" | "timeline") => void;
+  onPick: (l: FleetLens) => void;
 }> = (props) => (
   <button
     type="button"
@@ -204,7 +215,7 @@ const TIMELINE_STYLE: Record<TimelineKind, string> = {
 };
 
 /** What was dispatched when, and what came back (§4's retrospection lens). */
-const TimelineView: Component<{ days: TimelineDay[] }> = (props) => (
+export const TimelineView: Component<{ days: TimelineDay[] }> = (props) => (
   <Show
     when={props.days.length > 0}
     fallback={
