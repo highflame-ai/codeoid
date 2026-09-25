@@ -288,7 +288,9 @@ function toFleetEventWire(row: DispatchEventRow): FleetEventWire {
   };
 }
 
-const RESUME_MAX_SESSIONS = 50;
+/** Fallback when no config is supplied (tests, embedded use). The
+ *  configured value is `session.resumeMaxSessions`. */
+const RESUME_MAX_SESSIONS_DEFAULT = 200;
 const RESUME_DEADLINE_MS = 20_000;
 /** Per-session transcript read budget on resume. Scrollback keeps at most
  * 20 MiB / 5000 messages — parsing history past that would be evicted on
@@ -628,11 +630,13 @@ export class SessionManager {
 
     const allMetas = await this.#transcriptStore.loadAllMeta();
     // Newest-first by last activity so the cap keeps the most relevant
-    // sessions when there are more than RESUME_MAX_SESSIONS on disk.
+    // sessions when there are more than the configured cap on disk.
     const sorted = [...allMetas].sort(
       (a, b) => resumeSortKey(b) - resumeSortKey(a),
     );
-    const capped = sorted.slice(0, RESUME_MAX_SESSIONS);
+    const resumeMaxSessions =
+      this.#config?.session?.resumeMaxSessions ?? RESUME_MAX_SESSIONS_DEFAULT;
+    const capped = sorted.slice(0, resumeMaxSessions);
     // Goal config by orchestrator session id, built from EVERY meta on disk
     // rather than from `capped`. A child inside this boot's resume window whose
     // orchestrator fell outside it still needs its restrictions and its brief,
@@ -796,7 +800,7 @@ mcpHub: this.#mcpHub,
     const droppedCap = sorted.length - capped.length;
     if (droppedCap > 0 || skippedDeadline > 0) {
       console.warn(
-        `[codeoid] resume: restored ${resumed} of ${sorted.length} session(s); ${droppedCap} left over the ${RESUME_MAX_SESSIONS}-session cap, ${skippedDeadline} skipped past the ${RESUME_DEADLINE_MS}ms deadline (still on disk; loadable on a future restart).`,
+        `[codeoid] resume: restored ${resumed} of ${sorted.length} session(s); ${droppedCap} left over the ${resumeMaxSessions}-session cap, ${skippedDeadline} skipped past the ${RESUME_DEADLINE_MS}ms deadline (still on disk; loadable on a future restart).`,
       );
     }
     if (resumedChildren > 0) {

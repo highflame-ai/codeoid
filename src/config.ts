@@ -351,11 +351,21 @@ const SessionSchema = z
      * on big sessions. Legacy clients always get the full buffer.
      */
     attachTailBytes: z.number().int().min(1024).default(512 * 1024),
+    /**
+     * How many sessions the daemon restores from disk on start, newest-first
+     * by last activity. Resume is ALSO time-boxed (RESUME_DEADLINE_MS), so
+     * this is the coarse guard and the deadline is the fine one: raising it
+     * on a box with many long-lived sessions costs startup time, not
+     * correctness. Sessions past the cap stay on disk and load on a later
+     * restart.
+     */
+    resumeMaxSessions: z.number().int().min(1).default(200),
   })
   .default({
     turnStallTimeoutMs: 300_000,
     mcpToolTimeoutMs: 120_000,
     attachTailBytes: 512 * 1024,
+    resumeMaxSessions: 200,
   })
   // Enforce the "SDK signals first" contract across BOTH fields — not just the
   // defaults. An env override / config file could otherwise set the MCP timeout
@@ -1011,6 +1021,8 @@ export interface CodeoidConfig {
     mcpToolTimeoutMs?: number;
     /** Tail window (bytes) replayed on attach for `scrollback.paging` clients; older history is paged on demand. Defaults to 524288 (512 KiB) when omitted. */
     attachTailBytes?: number;
+    /** Sessions restored from disk at daemon start, newest-first by last activity. Resume is also time-boxed, so this is the coarse guard; the remainder stays on disk. Defaults to 200 when omitted. */
+    resumeMaxSessions?: number;
   };
   /**
    * The per-tenant conductor session (fleet supervisor). Optional in the
@@ -1235,6 +1247,7 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   { env: "CODEOID_PUSH_RELAY_TOKEN", path: "push.relayToken", kind: "string" },
   { env: "CODEOID_TURN_STALL_TIMEOUT_MS", path: "session.turnStallTimeoutMs", kind: "int" },
   { env: "CODEOID_MCP_TOOL_TIMEOUT_MS", path: "session.mcpToolTimeoutMs", kind: "int" },
+  { env: "CODEOID_RESUME_MAX_SESSIONS", path: "session.resumeMaxSessions", kind: "int" },
   // Embed-SSO trusted framing origins (comma-separated). Each is an exact
   // origin (scheme://host[:port]) permitted to frame the web UI and hand it a
   // credential via the URL hash. Empty ⇒ hash handoff disabled (safe default).
