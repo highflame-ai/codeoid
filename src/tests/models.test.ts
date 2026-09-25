@@ -19,20 +19,28 @@ import {
   resolveAgainstList,
   stripVariantSuffix,
 } from "../daemon/models.js";
+import { contextWindowForModel } from "../daemon/context-windows.js";
 import { Store } from "../daemon/store.js";
 import { SessionManager, DEFAULT_PROVIDER_ID } from "../daemon/session-manager.js";
+import type { WindowScope } from "../daemon/session.js";
 import { TranscriptStore } from "../daemon/transcript.js";
 
 describe("resolveAgainstList (live-backend resolution)", () => {
-  // Verbatim from `supportedModels()` on claude-agent-sdk 0.3.258. The
-  // previous fixture said the Opus entry's displayName was "Opus", which made
-  // the alias resolve by display-name match; the backend actually reports
-  // "Opus (1M context)", so `opus` matched nothing and silently fell through
-  // to the baked-in catalog. Keep this fixture honest to the real payload.
+  // Verbatim from the live backend on claude-agent-sdk 0.3.281. An earlier
+  // fixture said the Opus entry's displayName was "Opus", which made the alias
+  // resolve by a display-name match that does not exist in the real payload;
+  // the backend reports "Opus (1M context)", so `opus` matched nothing and
+  // silently fell through to the baked-in catalog (#315). Keep this honest to
+  // the real payload — a fixture that flatters the code is why that bug
+  // survived a test which looked like it covered it.
+  //
+  // Note what is NOT here: a versioned Opus id. The backend serves Opus behind
+  // the floating `opus[1m]` alias (now Opus 5.5), which is exactly why the
+  // live list has to win over the catalog.
   const live = [
     { value: "default", displayName: "Default (recommended)", isDefault: true },
     { value: "opus[1m]", displayName: "Opus (1M context)" },
-    { value: "claude-fable-5-1[1m]", displayName: "Fable" },
+    { value: "claude-fable-5-1", displayName: "Fable" },
     { value: "sonnet", displayName: "Sonnet" },
     { value: "haiku", displayName: "Haiku" },
   ];
@@ -46,7 +54,7 @@ describe("resolveAgainstList (live-backend resolution)", () => {
     expect(resolveAgainstList("OPUS", live)).toBe("opus[1m]");
   });
   it("matches a display name case-insensitively", () => {
-    expect(resolveAgainstList("fable", live)).toBe("claude-fable-5-1[1m]");
+    expect(resolveAgainstList("fable", live)).toBe("claude-fable-5-1");
     expect(resolveAgainstList("Default (recommended)", live)).toBe("default");
   });
   it("prefers an exact value over a suffix-stripped match", () => {
@@ -54,9 +62,17 @@ describe("resolveAgainstList (live-backend resolution)", () => {
     expect(resolveAgainstList("opus", both)).toBe("opus");
   });
   it("matches a bare full id against its variant-suffixed entry", () => {
-    // Typing the plain id resolves to the 1M variant the backend actually
-    // offers, rather than falling through to the claude-* passthrough.
-    expect(resolveAgainstList("claude-fable-5-1", live)).toBe("claude-fable-5-1[1m]");
+    // Typing the plain id resolves to the 1M variant, rather than falling
+    // through to the claude-* passthrough.
+    //
+    // Local fixture, not `live`: 0.3.258 reported Fable as
+    // `claude-fable-5-1[1m]` and 0.3.281 reports it bare, so the shared
+    // fixture can no longer carry a suffixed entry and stay verbatim. The
+    // suffix form is a payload detail that moves between releases — which is
+    // the reason to keep handling it, and the reason not to let a fixture
+    // imply the backend always sends it.
+    const suffixed = [{ value: "claude-fable-5-1[1m]", displayName: "Fable" }];
+    expect(resolveAgainstList("claude-fable-5-1", suffixed)).toBe("claude-fable-5-1[1m]");
   });
   it("passes through a claude-* id the backend didn't advertise", () => {
     // The catalog and the live list both go stale between releases; the
@@ -93,10 +109,30 @@ describe("MODEL_CATALOG shape", () => {
   // The catalog is only the pre-first-report fallback, but a stale entry here
   // is not harmless: it silently pins the alias to a superseded model on every
   // path that misses the live list. `opus` sat on claude-opus-4-8 well after
-  // Opus 5 shipped. This asserts the generation, not the point release, so a
-  // real bump stays a one-line edit while a whole generation going stale fails.
-  it("maps the premium alias to the current Opus generation", () => {
-    expect(resolveModelId("opus")).toBe("claude-opus-5");
+  // Opus 5 shipped (#315), then on claude-opus-5 after 5.5 shipped.
+  //
+  // Asserted as an exact id rather than a generation prefix, which is the
+  // lesson of the second occurrence: `claude-opus-5` vs `claude-opus-5-5` is a
+  // POINT release, so a generation-only regex would have called the stale
+  // value correct. The id below is live-verified — an `opus` turn on
+  // agent-sdk 0.3.281 reports `init.model = claude-opus-5-5`.
+  it("maps the premium alias to the current Opus release", () => {
+    expect(resolveModelId("opus")).toBe("claude-opus-5-5");
+  });
+
+  // The cross-check that would have caught this bump's real bug. The catalog
+  // declares a window per entry and `contextWindowForModel` derives one from
+  // the id, and the two silently disagreed: the family list had no `opus-5`,
+  // so once the SDK reported the concrete id back, a 1M model was measured
+  // against a 200k window — under-sizing the percent-of-window display, the
+  // fork seed budget, and the auto-rotate occupancy by 5x.
+  it("declares the same window the context-window table derives", () => {
+    for (const m of MODEL_CATALOG) {
+      expect(contextWindowForModel(m.id)).toBe(m.contextWindow);
+      // ...and via the alias, which is what a session actually carries until
+      // the backend reports a concrete id.
+      expect(contextWindowForModel(m.alias)).toBe(m.contextWindow);
+    }
   });
 
   it("covers the three canonical tiers", () => {
@@ -449,5 +485,52 @@ describe("models.list serves live → persisted → baked-in fallback, per provi
     const res = await listModels(manager);
     expect(res.models.map((m) => m.value)).toEqual(["default", "fable", "opus"]);
     expect(res.live).toBe(true);
+  });
+});
+
+// ── Stated context windows ───────────────────────────────────────────────────
+
+// Scoping, restart survival and the catalog path are pinned in
+// session-reported-window.test.ts; this block covers what the cache refuses.
+describe("the stated-window cache", () => {
+  interface Cache {
+    _cacheModelLimits(scope: WindowScope, providerId: string, model: string, window: number): void;
+  }
+  const scope: WindowScope = { accountId: "acc", projectId: "proj", workdir: "/w" };
+
+  let tmp2: string;
+  let store2: Store;
+  beforeEach(() => {
+    tmp2 = mkdtempSync(join(tmpdir(), "codeoid-limits-"));
+    store2 = new Store(join(tmp2, "codeoid.db"));
+  });
+  afterEach(() => {
+    store2.close();
+    rmSync(tmp2, { recursive: true, force: true });
+  });
+
+  it("refuses values that would be worse than the floor", () => {
+    const m = new SessionManager(store2, new TranscriptStore(join(tmp2, "t")));
+    const c = m as unknown as Cache;
+    // A non-positive window would divide percent-of-window by zero; a
+    // placeholder model names no model, so it must not become a key.
+    c._cacheModelLimits(scope, "claude", "claude-opus-5-5", 0);
+    c._cacheModelLimits(scope, "claude", "m2", -5);
+    c._cacheModelLimits(scope, "claude", "unknown", 1_000_000);
+    c._cacheModelLimits(scope, "codex", "codex", 272_000);
+    c._cacheModelLimits(scope, "pi", "pi-default", 200_000);
+    expect(m.modelContextWindow(scope, "claude", "claude-opus-5-5")).toBeUndefined();
+    expect(m.modelContextWindow(scope, "claude", "m2")).toBeUndefined();
+    expect(m.modelContextWindow(scope, "claude", "unknown")).toBeUndefined();
+    expect(m.modelContextWindow(scope, "codex", "codex")).toBeUndefined();
+    expect(m.modelContextWindow(scope, "pi", "pi-default")).toBeUndefined();
+  });
+
+  it("the latest report in a scope wins", () => {
+    const m = new SessionManager(store2, new TranscriptStore(join(tmp2, "t")));
+    const c = m as unknown as Cache;
+    c._cacheModelLimits(scope, "claude", "claude-opus-5-5", 200_000);
+    c._cacheModelLimits(scope, "claude", "claude-opus-5-5", 1_000_000);
+    expect(m.modelContextWindow(scope, "claude", "claude-opus-5-5")).toBe(1_000_000);
   });
 });

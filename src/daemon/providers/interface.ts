@@ -158,6 +158,16 @@ export interface NormalizedTurnResult {
   cacheCreationTokens: number;
   totalCostUsd: number;
   durationMs: number;
+  /**
+   * Context window of the model that ran this turn, as the backend stated it.
+   * Absent when the backend doesn't say (gemini, openai, acp report none).
+   *
+   * "Stated" is not "measured": the Claude CLI computes it from its own tables
+   * and per-workdir settings, which is why the daemon scopes what it remembers
+   * (SessionManager.modelContextWindow). It is still the number that backend
+   * enforces, which a model-id table is not.
+   */
+  contextWindow?: number;
   stopReason?: string;
   isError?: boolean;
   errorMessage?: string;
@@ -332,6 +342,34 @@ export interface ModelInfo {
   id: string;
   displayName: string;
   description?: string;
+  /** Context window in tokens, when the backend publishes it on its catalog.
+   *  qwen-code and pi do; Claude and codex report the window per turn. */
+  contextWindow?: number;
+}
+
+/**
+ * One entry of the catalog a provider reports through `onModels`.
+ *
+ * Named once and used at every hop (provider init → registry → Session →
+ * manager). It used to be written inline at each, and only the two ends
+ * declared `contextWindow` — the field survived only because nothing in
+ * between rebuilt the array, which is exactly how qwen's window had been lost
+ * once already.
+ */
+export interface CatalogEntry {
+  value: string;
+  displayName: string;
+  description?: string;
+  contextWindow?: number;
+}
+
+/**
+ * A turn result's `model` that names no model: "unknown", or a provider's
+ * stand-in for "whatever its default is" (codex reports its own id, pi
+ * "pi-default"). Fine to display against; never a key another session can hit.
+ */
+export function isPlaceholderModel(providerId: string, model: string): boolean {
+  return !model || model === "unknown" || model === providerId || model === `${providerId}-default`;
 }
 
 // ── AgentProvider interface ───────────────────────────────────────────────────

@@ -49,6 +49,7 @@ import type {
   SessionProvider,
   TurnOpts,
   TurnRun,
+  CatalogEntry,
 } from "../interface.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
 import { buildQwenEnv } from "../env.js";
@@ -80,9 +81,7 @@ export interface QwenProviderInit {
   /** Cross-backend MCP registry — mounted natively (qwen owns its MCP client). */
   mcpRegistry?: McpRegistry;
   config?: CodeoidConfig;
-  onModels?: (
-    models: ReadonlyArray<{ value: string; displayName: string; description?: string }>,
-  ) => void;
+  onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
 }
 
 export class QwenProvider implements SessionProvider {
@@ -454,6 +453,9 @@ export class QwenProvider implements SessionProvider {
                 value: m.id,
                 displayName: m.displayName,
                 ...(m.description ? { description: m.description } : {}),
+                // Forwarded, not dropped: qwen is the one backend that knows
+                // the window before a turn runs.
+                ...(m.contextWindow !== undefined ? { contextWindow: m.contextWindow } : {}),
               })),
             );
           }
@@ -865,10 +867,22 @@ export function normalizeModelCatalog(raw: unknown): ModelInfo[] {
     if (!id) continue;
     const label =
       typeof e.label === "string" ? e.label : typeof e.name === "string" ? e.name : id;
+    // `contextWindowSize` is the one backend in codeoid that publishes a
+    // window on its CATALOG rather than on a turn result — so it is known
+    // before the first turn, which is exactly when the daemon would otherwise
+    // have to infer one from the model id. Dropping it (as this projection
+    // used to) threw away the best signal any provider gives us.
+    const window =
+      typeof e.contextWindowSize === "number"
+        ? e.contextWindowSize
+        : typeof e.contextWindow === "number"
+          ? e.contextWindow
+          : undefined;
     out.push({
       id,
       displayName: label,
       ...(typeof e.description === "string" ? { description: e.description } : {}),
+      ...(window !== undefined && window > 0 ? { contextWindow: window } : {}),
     });
   }
   return out;
@@ -966,7 +980,13 @@ export function unionCatalogs(
       byId.set(m.id, m);
       continue;
     }
-    if (!labelled(existing) && labelled(m)) byId.set(m.id, m);
+    const winner = !labelled(existing) && labelled(m) ? m : existing;
+    // The label decides which entry wins; the window is a separate fact and
+    // must survive whichever one does. The gateway's `/models` carries no
+    // windows, so on a collision the bare live entry used to win and silently
+    // drop the window qwen-code's registry had for the same id.
+    const window = existing.contextWindow ?? m.contextWindow;
+    byId.set(m.id, window !== undefined ? { ...winner, contextWindow: window } : winner);
   }
   return [...byId.values()];
 }

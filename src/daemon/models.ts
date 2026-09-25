@@ -44,9 +44,17 @@ export interface ModelDescriptor {
  */
 export const MODEL_CATALOG: readonly ModelDescriptor[] = [
   {
-    id: "claude-opus-5",
+    // Verified against the live backend on agent-sdk 0.3.281: an `opus` turn
+    // reports `init.model = claude-opus-5-5`, and `modelUsage` carries
+    // `canonicalModel: "claude-opus-5-5"` with a 1,000,000 context window.
+    // This entry is only the PRE-FIRST-REPORT fallback (§ resolveAgainstList
+    // — the live list wins), so leaving it on a superseded generation is not
+    // cosmetic: a session created before the backend has reported its list
+    // gets pinned to the older Opus. That is the #315 bug, and this is the
+    // same edit one generation later.
+    id: "claude-opus-5-5",
     alias: "opus",
-    label: "Opus 5",
+    label: "Opus 5.5",
     contextWindow: 1_000_000,
     tier: "premium",
     description: "Deepest reasoning. Best for planning, refactoring, and hard problems.",

@@ -76,6 +76,13 @@ const general: SettingsTab = {
           default: 524288,
           advanced: true,
         }),
+        cfg("session.resumeMaxSessions", "Resume session cap", "Sessions restored from disk on daemon start, newest-first. Resume is also time-boxed, so raising this costs startup time; sessions past the cap stay on disk.", {
+          kind: "int",
+          envVar: "CODEOID_RESUME_MAX_SESSIONS",
+          min: 1,
+          default: 200,
+          advanced: true,
+        }),
       ],
     },
     {

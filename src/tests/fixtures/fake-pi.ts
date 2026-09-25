@@ -227,6 +227,9 @@ function handle(cmd: Record<string, unknown>): void {
           sessionId,
           tokens: { input: turns * 100, output: turns * 40, cacheRead: turns * 10, cacheWrite: 0, total: turns * 150 },
           cost: turns * 0.01,
+          // Real pi (0.80.6) reports its current model's window here; the
+          // fixture omitted it, so nothing exercised that path.
+          contextUsage: { tokens: turns * 150, contextWindow: 1_048_576, percent: 0 },
         },
       });
       return;
@@ -234,8 +237,8 @@ function handle(cmd: Record<string, unknown>): void {
       respond(cmd.id, "get_available_models", {
         data: {
           models: [
-            { id: "claude-sonnet-4-5", provider: "anthropic", name: "Claude Sonnet 4.5" },
-            { id: "gpt-5", provider: "openai", name: "GPT-5" },
+            { id: "claude-sonnet-4-5", provider: "anthropic", name: "Claude Sonnet 4.5", contextWindow: 200_000 },
+            { id: "gpt-5", provider: "openai", name: "GPT-5", contextWindow: 400_000 },
           ],
         },
       });

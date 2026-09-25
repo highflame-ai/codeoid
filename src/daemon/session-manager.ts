@@ -11,8 +11,8 @@
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, sep } from "node:path";
-import { Session, type AttachedClient } from "./session.js";
-import type { SessionProvider } from "./providers/interface.js";
+import { Session, type AttachedClient, type WindowScope } from "./session.js";
+import { type CatalogEntry, isPlaceholderModel, type SessionProvider } from "./providers/interface.js";
 import {
   createDefaultProviderRegistry,
   type ProviderRegistry,
@@ -288,7 +288,9 @@ function toFleetEventWire(row: DispatchEventRow): FleetEventWire {
   };
 }
 
-const RESUME_MAX_SESSIONS = 50;
+/** Fallback when no config is supplied (tests, embedded use). The
+ *  configured value is `session.resumeMaxSessions`. */
+const RESUME_MAX_SESSIONS_DEFAULT = 200;
 const RESUME_DEADLINE_MS = 20_000;
 /** Per-session transcript read budget on resume. Scrollback keeps at most
  * 20 MiB / 5000 messages — parsing history past that would be evicted on
@@ -334,6 +336,19 @@ export class SessionManager {
    *  equivalent), cached daemon-wide once any session of that provider
    *  initializes. Empty until then. */
   #modelsCache = new Map<string, ModelInfo[]>();
+  /**
+   * Context windows backends reported on completed turns, keyed by
+   * (account, project, workdir, provider, model).
+   *
+   * Scoped, not daemon-wide. The Claude CLI computes the number it reports from
+   * per-process inputs that a workdir's `.claude/settings.json` can set
+   * (`CLAUDE_CODE_MAX_CONTEXT_TOKENS` is unclamped), so an unscoped cache let one
+   * tenant's workdir decide every other tenant's fork seed budget — 4M-sized
+   * seeds into a 1M model. Within a scope it is still shared, which is what a
+   * fork needs: it runs in its parent's workdir. Persisted, so a restart does
+   * not fall back to inferring a window a backend already stated.
+   */
+  #modelLimits = new Map<string, number>();
   #config?: CodeoidConfig;
   #compressionRegistry?: CompressionRegistry;
   #dispatcher: Dispatcher;
@@ -436,6 +451,7 @@ export class SessionManager {
     },
   ) {
     this.#store = store;
+    this.#warmModelLimits();
     this.#transcriptStore = transcriptStore;
     this.#identityManager = identityManager;
     this.#rateLimiter = rateLimiter ?? new RateLimiter();
@@ -614,11 +630,13 @@ export class SessionManager {
 
     const allMetas = await this.#transcriptStore.loadAllMeta();
     // Newest-first by last activity so the cap keeps the most relevant
-    // sessions when there are more than RESUME_MAX_SESSIONS on disk.
+    // sessions when there are more than the configured cap on disk.
     const sorted = [...allMetas].sort(
       (a, b) => resumeSortKey(b) - resumeSortKey(a),
     );
-    const capped = sorted.slice(0, RESUME_MAX_SESSIONS);
+    const resumeMaxSessions =
+      this.#config?.session?.resumeMaxSessions ?? RESUME_MAX_SESSIONS_DEFAULT;
+    const capped = sorted.slice(0, resumeMaxSessions);
     // Goal config by orchestrator session id, built from EVERY meta on disk
     // rather than from `capped`. A child inside this boot's resume window whose
     // orchestrator fell outside it still needs its restrictions and its brief,
@@ -736,7 +754,7 @@ mcpHub: this.#mcpHub,
             : undefined,
           _testProvider: this.#testProviderFactory?.(),
           onStatusChange: this.#statusObserver,
-          onModels: (providerId, m) => this._cacheModels(providerId, m),
+          ...this.#modelHooks,
         });
 
         // Restore scrollback from transcript, seeding the seq counter past
@@ -782,7 +800,7 @@ mcpHub: this.#mcpHub,
     const droppedCap = sorted.length - capped.length;
     if (droppedCap > 0 || skippedDeadline > 0) {
       console.warn(
-        `[codeoid] resume: restored ${resumed} of ${sorted.length} session(s); ${droppedCap} left over the ${RESUME_MAX_SESSIONS}-session cap, ${skippedDeadline} skipped past the ${RESUME_DEADLINE_MS}ms deadline (still on disk; loadable on a future restart).`,
+        `[codeoid] resume: restored ${resumed} of ${sorted.length} session(s); ${droppedCap} left over the ${resumeMaxSessions}-session cap, ${skippedDeadline} skipped past the ${RESUME_DEADLINE_MS}ms deadline (still on disk; loadable on a future restart).`,
       );
     }
     if (resumedChildren > 0) {
@@ -1306,7 +1324,7 @@ mcpHub: this.#mcpHub,
               compressionRegistry: this.#compressionRegistry,
               _testProvider: this.#testProviderFactory?.(),
           onStatusChange: this.#statusObserver,
-              onModels: (providerId, m) => this._cacheModels(providerId, m),
+              ...this.#modelHooks,
             });
             this.#sessions.set(session.id, session);
             this.#rateLimiter.recordCreation(auth.sub);
@@ -1420,15 +1438,18 @@ mcpHub: this.#mcpHub,
    * `Session._applyInterruptedStateToTool`. Do NOT call from production code
    * outside the `onModels` wiring.
    */
-  private _cacheModels(
-    providerId: string,
-    raw: ReadonlyArray<{ value: string; displayName: string; description?: string }>,
-  ): void {
+  private _cacheModels(providerId: string, raw: ReadonlyArray<CatalogEntry>): void {
     if (raw.length === 0) return;
+    // A window the provider publishes on its catalog stays ON the catalog and
+    // is read from there (modelContextWindow). Copying it into the turn cache
+    // made two stores with different lifecycles: the catalog is replaced
+    // wholesale per report, the copy was upsert-only, so a window the backend
+    // stopped publishing kept winning forever.
     const models = raw.map((m) => ({
       value: m.value,
       displayName: m.displayName,
       ...(m.description ? { description: m.description } : {}),
+      ...(m.contextWindow !== undefined ? { contextWindow: m.contextWindow } : {}),
       isDefault: m.value === "default",
     }));
     const previous = this.#modelsCache.get(providerId);
@@ -1444,6 +1465,76 @@ mcpHub: this.#mcpHub,
       );
     }
   }
+
+  /** Cache key for #modelLimits. NUL-joined: no id or path can contain it,
+   *  so no two scopes can collide. */
+  static #limitsKey(scope: WindowScope, providerId: string, model: string): string {
+    return [scope.accountId, scope.projectId, scope.workdir, providerId, model].join("\u0000");
+  }
+
+  /**
+   * Remember a window a completed turn reported (the `onModelLimits` wiring).
+   * TypeScript-private, same convention as `_cacheModels`: tests drive it
+   * directly rather than standing up a live backend.
+   */
+  private _cacheModelLimits(scope: WindowScope, providerId: string, model: string, contextWindow: number): void {
+    if (isPlaceholderModel(providerId, model) || !(contextWindow > 0)) return;
+    const key = SessionManager.#limitsKey(scope, providerId, model);
+    if (this.#modelLimits.get(key) === contextWindow) return;
+    this.#modelLimits.set(key, contextWindow);
+    try {
+      this.#store.saveModelLimits(scope, providerId, model, contextWindow);
+    } catch (err) {
+      // Best-effort, like the catalog: memory still serves this lifetime.
+      console.error(
+        `[codeoid/models] failed to persist ${providerId}/${model} window: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * A window some backend stated for (provider, model): one a turn in this
+   * scope reported, else one the provider publishes on its catalog (qwen-code
+   * and pi do). Undefined when neither knows, and callers fall back to
+   * inference (targetContextWindow / contextWindowForModel).
+   *
+   * A catalog window is the backend's own configured value, not a
+   * measurement — qwen-code fills unconfigured models from its own table
+   * (200k default). It is still the window that backend compacts against,
+   * which makes it a better answer than codeoid's model-id guess.
+   */
+  modelContextWindow(scope: WindowScope, providerId: string, model: string): number | undefined {
+    if (!model) return undefined;
+    const reported = this.#modelLimits.get(SessionManager.#limitsKey(scope, providerId, model));
+    if (reported !== undefined) return reported;
+    const published = this.#currentModels(providerId).models.find((m) => m.value === model)?.contextWindow;
+    return typeof published === "number" && published > 0 ? published : undefined;
+  }
+
+  /** Warm #modelLimits from disk. Called once at construction. */
+  #warmModelLimits(): void {
+    try {
+      for (const r of this.#store.getAllModelLimits()) {
+        this.#modelLimits.set(SessionManager.#limitsKey(r, r.providerId, r.model), r.contextWindow);
+      }
+    } catch {
+      // A missing/old table just means nothing is warm yet.
+    }
+  }
+
+  /**
+   * The model hooks every Session this manager builds gets. One object, spread
+   * at each construction site: pasting the lambdas into all eight meant a
+   * ninth path that forgot them would compile and silently neither teach nor
+   * consult the window cache.
+   */
+  readonly #modelHooks = {
+    onModels: (providerId: string, m: ReadonlyArray<CatalogEntry>) => this._cacheModels(providerId, m),
+    onModelLimits: (scope: WindowScope, providerId: string, model: string, window: number) =>
+      this._cacheModelLimits(scope, providerId, model, window),
+    modelWindow: (scope: WindowScope, providerId: string, model: string) =>
+      this.modelContextWindow(scope, providerId, model),
+  };
 
   /**
    * The model catalog to serve for a provider, best source first:
@@ -2470,7 +2561,7 @@ mcpHub: this.#mcpHub,
       compressionRegistry: this.#compressionRegistry,
       _testProvider: this.#testProviderFactory?.(),
       onStatusChange: this.#statusObserver,
-      onModels: (providerId, m) => this._cacheModels(providerId, m),
+      ...this.#modelHooks,
     });
 
     // Resolve the thunk the fleet server closes over. Set before any child
@@ -2876,7 +2967,7 @@ mcpHub: this.#mcpHub,
           compressionRegistry: this.#compressionRegistry,
           _testProvider: this.#testProviderFactory?.(),
           onStatusChange: this.#statusObserver,
-          onModels: (providerId, m) => this._cacheModels(providerId, m),
+          ...this.#modelHooks,
         });
         this.#sessions.set(childSession.id, childSession);
         if (blackboard) this.#blackboardTokens.set(childSession.id, blackboard.token);
@@ -3116,8 +3207,13 @@ mcpHub: this.#mcpHub,
         compressionRegistry: this.#compressionRegistry,
         _testProvider: this.#testProviderFactory?.(),
         onStatusChange: this.#statusObserver,
-        onModels: (pid, m) => this._cacheModels(pid, m),
+        ...this.#modelHooks,
       });
+      // A fork on the same (provider, model) as its parent runs the model the
+      // parent already reported a window for. Adopting it before seeding is
+      // what sizes the fork's history to the real window instead of the 200k
+      // floor — forks never carry a model id, so the cache alone can't key it.
+      fork.inheritObservedLimits(parent);
       await fork.primeFromFork(history, transcriptRows, sizeHints, workdirNote);
     } catch (err) {
       // Orphan cleanup: if building the fork failed after we created its
@@ -3243,7 +3339,7 @@ mcpHub: this.#mcpHub,
       compressionRegistry: this.#compressionRegistry,
       _testProvider: this.#testProviderFactory?.(),
       onStatusChange: this.#statusObserver,
-      onModels: (providerId, m) => this._cacheModels(providerId, m),
+      ...this.#modelHooks,
     });
 
     this.#sessions.set(session.id, session);
@@ -3521,7 +3617,7 @@ mcpHub: this.#mcpHub,
       compressionRegistry: this.#compressionRegistry,
       _testProvider: this.#testProviderFactory?.(),
       onStatusChange: this.#statusObserver,
-      onModels: (providerId, m) => this._cacheModels(providerId, m),
+      ...this.#modelHooks,
     });
     this.#sessions.set(session.id, session);
     return session;
@@ -4021,7 +4117,7 @@ mcpHub: this.#mcpHub,
           compressionRegistry: this.#compressionRegistry,
           _testProvider: this.#testProviderFactory?.(),
           onStatusChange: this.#statusObserver,
-          onModels: (providerId, m) => this._cacheModels(providerId, m),
+          ...this.#modelHooks,
         });
         this.#sessions.set(session.id, session);
         // No rate-limiter charge: the dispatcher's own worker cap governs

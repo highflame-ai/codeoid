@@ -23,6 +23,7 @@ import { randomUUID } from "node:crypto";
 import { AsyncQueue } from "../../async-queue.js";
 import type { Store } from "../../store.js";
 import type {
+  CatalogEntry,
   ModelInfo,
   NormalizedTurnResult,
   ProviderEvent,
@@ -70,14 +71,14 @@ export interface PiProviderInit {
    *  pi (which has no MCP client) by registering bridge tools that proxy to the hub. */
   mcpRegistry?: McpRegistry;
   mcpHub?: McpHub;
-  onModels?: (
-    models: ReadonlyArray<{ value: string; displayName: string; description?: string }>,
-  ) => void;
+  onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
 }
 
 interface PiSessionStats {
   tokens: { input: number; output: number; cacheRead: number; cacheWrite: number };
   cost: number;
+  /** `contextUsage.contextWindow` — pi's window for its current model. */
+  contextWindow?: number;
 }
 
 const EMPTY_STATS: PiSessionStats = {
@@ -366,12 +367,12 @@ export class PiProvider implements SessionProvider {
     }
   }
 
-  #mapModels(resp: PiFrame): Array<{ value: string; displayName: string; description?: string }> {
+  #mapModels(resp: PiFrame): CatalogEntry[] {
     const data = resp.data as { models?: unknown } | undefined;
     if (!Array.isArray(data?.models)) return [];
     return data.models
       .filter(
-        (m): m is { id: string; provider: string; name?: string } =>
+        (m): m is { id: string; provider: string; name?: string; contextWindow?: unknown } =>
           !!m &&
           typeof m === "object" &&
           typeof (m as { id?: unknown }).id === "string" &&
@@ -380,6 +381,8 @@ export class PiProvider implements SessionProvider {
       .map((m) => ({
         value: `${m.provider}/${m.id}`,
         displayName: typeof m.name === "string" ? m.name : m.id,
+        // pi's catalog entries are full pi-ai Model objects, window included.
+        ...(typeof m.contextWindow === "number" && m.contextWindow > 0 ? { contextWindow: m.contextWindow } : {}),
       }));
   }
 
@@ -401,9 +404,19 @@ export class PiProvider implements SessionProvider {
     try {
       const resp = await this.#proc!.request({ type: "get_session_stats" });
       const data = resp.data as
-        | { tokens?: Partial<PiSessionStats["tokens"]>; cost?: number }
+        | {
+            tokens?: Partial<PiSessionStats["tokens"]>;
+            cost?: number;
+            contextUsage?: { contextWindow?: number };
+          }
         | undefined;
+      // pi reports the window of the model it is running on the same stats
+      // call codeoid already makes every turn (verified against pi 0.80.6:
+      // `contextUsage: { tokens, contextWindow, percent }`). It was dropped
+      // here, which left pi on a model-id guess — 200k for a 1M Gemini.
+      const window = data?.contextUsage?.contextWindow;
       return {
+        ...(typeof window === "number" && window > 0 ? { contextWindow: window } : {}),
         tokens: {
           input: data?.tokens?.input ?? 0,
           output: data?.tokens?.output ?? 0,
@@ -473,6 +486,7 @@ export class PiProvider implements SessionProvider {
       cacheCreationTokens: Math.max(0, stats.tokens.cacheWrite - prev.tokens.cacheWrite),
       totalCostUsd: Math.max(0, stats.cost - prev.cost),
       durationMs: Date.now() - this.#turnStartedAt,
+      ...(stats.contextWindow !== undefined ? { contextWindow: stats.contextWindow } : {}),
       stopReason: this.#lastStopReason,
     };
     queue.push({ type: "turn_done", result });

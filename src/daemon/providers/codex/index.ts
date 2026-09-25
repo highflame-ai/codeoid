@@ -55,6 +55,7 @@ import type {
   TurnOpts,
   TurnRun,
   UiRequestFn,
+  CatalogEntry,
 } from "../interface.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
 import { buildCodexEnv } from "../env.js";
@@ -106,9 +107,7 @@ export interface CodexProviderInit {
   /** Cross-backend MCP registry — external servers mount natively via `-c
    *  mcp_servers.*` (codex owns its client); approval flows through canUseTool. */
   mcpRegistry?: McpRegistry;
-  onModels?: (
-    models: ReadonlyArray<{ value: string; displayName: string; description?: string }>,
-  ) => void;
+  onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
 }
 
 /** Item types that surface as tool records (vs text/reasoning streams). */
@@ -272,6 +271,8 @@ export class CodexProvider implements SessionProvider {
    * counts. Captured here and folded into turn_done.
    */
   #lastTokenUsage: CodexTokenUsage | null = null;
+  /** Window codex reported for the model driving this thread, if it has. */
+  #modelContextWindow: number | null = null;
   /** item id → {name, input} for items already announced via tool_start. */
   #announcedItems = new Map<string, { name: string; input: Record<string, unknown> }>();
   /**
@@ -430,6 +431,11 @@ export class CodexProvider implements SessionProvider {
     this.#turnModel = opts.model ?? "codex";
     this.#announcedItems.clear();
     this.#lastTokenUsage = null;
+    // Per turn, like the usage beside it. This provider instance outlives a
+    // `/model` switch or a pipeline overrideModel, so a turn interrupted before
+    // its first token-usage notification would otherwise report the PREVIOUS
+    // model's window under the new model's id — and that pair was persisted.
+    this.#modelContextWindow = null;
     this.#hasQueried = true;
 
     void this.#startTurn(opts).catch((err: unknown) => {
@@ -674,6 +680,9 @@ export class CodexProvider implements SessionProvider {
           cacheCreationTokens: 0,
           totalCostUsd: 0,
           durationMs: Date.now() - this.#turnStartedAt,
+          ...(this.#modelContextWindow !== null
+            ? { contextWindow: this.#modelContextWindow }
+            : {}),
           stopReason: (turn?.status as string | undefined) ?? undefined,
         };
         this.#push({ type: "turn_done", result });
@@ -681,8 +690,18 @@ export class CodexProvider implements SessionProvider {
         break;
       }
       case "thread/tokenUsage/updated": {
-        const usage = (params.tokenUsage as { last?: CodexTokenUsage } | undefined)?.last;
-        if (usage) this.#lastTokenUsage = usage;
+        // `ThreadTokenUsage` has three fields on this wire — `last`, `total`
+        // and `modelContextWindow` (confirmed in the codex binary's own serde
+        // descriptors: "struct ThreadTokenUsage with 3 elements"). codeoid read
+        // only `last` and inferred the window from the model id instead, which
+        // is the guess this change exists to stop making.
+        const tu = params.tokenUsage as
+          | { last?: CodexTokenUsage; modelContextWindow?: number }
+          | undefined;
+        if (tu?.last) this.#lastTokenUsage = tu.last;
+        if (typeof tu?.modelContextWindow === "number" && tu.modelContextWindow > 0) {
+          this.#modelContextWindow = tu.modelContextWindow;
+        }
         break;
       }
       case "error": {

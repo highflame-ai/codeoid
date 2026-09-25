@@ -354,6 +354,22 @@ export class Store {
         cached_at   TEXT NOT NULL DEFAULT (datetime('now'))
       );
 
+      -- Context windows backends reported on completed turns. Scoped by
+      -- tenant AND workdir: the Claude CLI derives the number from settings a
+      -- workdir can override, so it is a fact about that scope, not the model.
+      -- A window a provider publishes on its catalog is not stored here; it
+      -- lives on provider_model_catalogs with the rest of the catalog.
+      CREATE TABLE IF NOT EXISTS model_context_windows (
+        account_id     TEXT NOT NULL,
+        project_id     TEXT NOT NULL,
+        workdir        TEXT NOT NULL,
+        provider_id    TEXT NOT NULL,
+        model          TEXT NOT NULL,
+        context_window INTEGER NOT NULL,
+        cached_at      TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (account_id, project_id, workdir, provider_id, model)
+      );
+
       -- Durable conductor identity (design R2): one row per tenant, reloaded
       -- on daemon restart so the conductor keeps a stable WIMSE URI across
       -- process lifetimes. api_key is the ONE credential at rest — the
@@ -1459,6 +1475,58 @@ export class Store {
            cached_at = excluded.cached_at`,
       )
       .run(providerId, JSON.stringify(models));
+  }
+
+  /** Persist a window a completed turn reported, in the scope it was seen. */
+  saveModelLimits(
+    scope: { accountId: string; projectId: string; workdir: string },
+    providerId: string,
+    model: string,
+    contextWindow: number,
+  ): void {
+    this.#db
+      .prepare(
+        `INSERT INTO model_context_windows
+           (account_id, project_id, workdir, provider_id, model, context_window, cached_at)
+         VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+         ON CONFLICT(account_id, project_id, workdir, provider_id, model) DO UPDATE SET
+           context_window = excluded.context_window,
+           cached_at = excluded.cached_at`,
+      )
+      .run(scope.accountId, scope.projectId, scope.workdir, providerId, model, contextWindow);
+  }
+
+  /** Every persisted window, for warming the in-memory cache at boot. */
+  getAllModelLimits(): {
+    accountId: string;
+    projectId: string;
+    workdir: string;
+    providerId: string;
+    model: string;
+    contextWindow: number;
+  }[] {
+    const rows = this.#db
+      .prepare(
+        "SELECT account_id, project_id, workdir, provider_id, model, context_window FROM model_context_windows",
+      )
+      .all() as {
+      account_id: string;
+      project_id: string;
+      workdir: string;
+      provider_id: string;
+      model: string;
+      context_window: number;
+    }[];
+    return rows
+      .filter((r) => typeof r.context_window === "number" && r.context_window > 0)
+      .map((r) => ({
+        accountId: r.account_id,
+        projectId: r.project_id,
+        workdir: r.workdir,
+        providerId: r.provider_id,
+        model: r.model,
+        contextWindow: r.context_window,
+      }));
   }
 
   /**

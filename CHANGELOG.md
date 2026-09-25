@@ -75,6 +75,58 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The context window is no longer guessed from the model id.**
+  codeoid inferred every window from a substring table over model ids, and that table was wrong the moment a model shipped: `claude-opus-5-5` inferred to the 200k fallback while every turn result stated 1,000,000.
+  The percent-of-window display and the history seed sized for a fork or a provider switch were both built on that guess.
+
+  The backends already state it, and the daemon now uses what they state.
+  Audited across every backend codeoid drives, because they do not agree on how they publish it:
+
+  | Backend | States | Where |
+  | --- | --- | --- |
+  | claude | per turn | `result.modelUsage[model].contextWindow` |
+  | codex | per turn | `thread/tokenUsage/updated` → `tokenUsage.modelContextWindow` |
+  | pi | per turn, and on its catalog | `get_session_stats` → `contextUsage.contextWindow`; model objects on `get_available_models` |
+  | qwen | on its catalog | `contextWindowSize` per model |
+  | gemini · openai · acp | nothing | — |
+
+  Three of those were already arriving and being discarded: codex's on a notification the provider handled while reading two of its three fields, pi's on a stats call made every turn, and qwen's in a catalog projection that dropped it (and, in API-key mode, a catalog union that dropped it again whenever the gateway listed the same model).
+
+  One resolver now answers for every consumer: the display, the occupancy caps, auto-rotate, the rotate message, and the seed.
+  It uses the window this session's backend stated for the model it is running, then one stated in the same scope or published on the provider's catalog, then a per-provider floor.
+  The stated window is dropped whenever the model or provider changes, so a switch sizes the incoming backend's seed for that backend.
+  A fork on the same model as its parent inherits the parent's stated window.
+
+  What a turn states is remembered per account, project and workdir, not daemon-wide.
+  The Claude CLI derives the number from settings a workdir can override (`CLAUDE_CODE_MAX_CONTEXT_TOKENS` is unclamped), so one workdir must not size another tenant's seeds.
+  A window published on a catalog is read from the catalog, so it goes away when the backend stops publishing it.
+
+  Auto-rotate used a fixed 1M window rather than the table, so for any model below about 970k its 0.97 hard ceiling could never fire before the backend's own limit — a 200k Haiku or a 272k codex session never rotated.
+  It now rotates against the window of the model actually running.
+  The TUI read neither the table nor the stated window; it now shows the same number as the web UI.
+  With the memory engine off, the window was never reported to clients at all; it now always is.
+
+  The static tables stay as the floor for what no backend has stated: before a first turn, and on backends that publish nothing.
+
+  Also fixed at the source: the Claude provider took the turn's model from `Object.keys(modelUsage)[0]`, but that map is keyed by every model the turn touched in insertion order, and a Haiku side-call routinely sits first.
+  It now uses the model the SDK names on `init`, and follows `model_fallback`, so a turn the fallback model served is labelled with that model and its window.
+
+- **`opus` ran Opus 5, months after Opus 5.5 shipped — and a 1M model was measured against a 200k window.**
+  Bumps `@anthropic-ai/claude-agent-sdk` 0.3.258 → 0.3.281.
+  The SDK version tracks the bundled Claude Code CLI 1:1, and the model list comes from that CLI at runtime, so the dependency bump is what surfaces a new model at all: on 0.3.258 the backend reported the `opus` alias as "Opus 5", on 0.3.281 it reports "Opus 5.5".
+  Verified against the live backend — an `opus` turn on 0.3.281 reports `init.model = claude-opus-5-5`.
+
+  Two things were stale behind that, both of them the second occurrence of a bug #315 already fixed once:
+
+  - `MODEL_CATALOG` still pinned the premium alias to `claude-opus-5`.
+    The catalog is only the pre-first-report fallback (the live list wins), but a session created before the backend has reported its list gets pinned to whatever it says — so the alias quietly ran a superseded generation, exactly as it ran `claude-opus-4-8` after Opus 5 shipped.
+  - `contextWindowForModel` had no `opus-5` family, so `claude-opus-5-5` (and `claude-opus-5` before it) fell through to the 200k default.
+    Once the SDK reports the concrete id back, `SessionInfo.model` carries a value the table did not know, and a 1,000,000-token window was measured as 200,000 — a 5× under-size on the percent-of-window display, the fork seed budget, and the auto-rotate occupancy that decides when a session rolls.
+
+  The catalog and the window table are now cross-checked in tests: every catalog entry's declared `contextWindow` must equal what `contextWindowForModel` derives from its id and its alias. That is the assertion that would have caught this, and it fails if either table moves without the other.
+
+  The deeper fix — taking the window from the backend instead of the table — is the entry above.
+
 - **A collaboration's orchestrator could not read the artifacts its own constitution told it to synthesize** (#338).
   The compiled goal pack instructs it to "read each role's artifact from the blackboard, merge, and show disagreement", while its default profile read `spec` and `findings` only.
   So `research` (search's output), `adr` (architecture's) and `diff` (reasoning's) all came back as `Role "orchestrator" may not read "research"`, and synthesis collapsed into restating the one artifact it could reach.
