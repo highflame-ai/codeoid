@@ -15,6 +15,7 @@ import { Component, For, Show, createMemo, createSignal, onCleanup, onMount } fr
 
 import { formatCostUsd, formatTokens } from "../lib/format";
 import { costShare, fleetEconomics, type FleetEconomics } from "../lib/fleet-economics";
+import { buildTimeline, groupByDay, type TimelineDay, type TimelineEntry, type TimelineKind } from "../lib/fleet-timeline";
 import {
   groupIntoLanes,
   needsYouCount,
@@ -67,6 +68,16 @@ const STATE_STYLE: Record<FleetNodeState, { cls: string; title: string }> = {
   idle: { cls: "border-border bg-bg text-fg-faint", title: "Idle — settled and quiet" },
 };
 
+/**
+ * The rail's lenses, in switch order. One list, so adding a lens is one entry
+ * here rather than a hunt for every `"lanes" | "timeline"`.
+ */
+const FLEET_LENSES = [
+  { id: "lanes", label: "Lanes", title: "What needs you now, grouped by state" },
+  { id: "timeline", label: "Timeline", title: "What was dispatched when, and what came back" },
+] as const;
+type FleetLens = (typeof FLEET_LENSES)[number]["id"];
+
 const FleetRail: Component = () => {
   onMount(() => void subscribeFleet());
   onCleanup(() => unsubscribeFleet());
@@ -83,6 +94,15 @@ const FleetRail: Component = () => {
   // ABOVE a single session). Collapsed by default — it answers a question you
   // ask occasionally, and the lanes answer the one you ask constantly.
   const [showSpend, setShowSpend] = createSignal(false);
+
+  // Which lens is showing. Lanes answer "what needs me now"; the timeline
+  // answers "what happened" (§4). They are different questions, and the second
+  // is badly served by a list that re-sorts itself by urgency.
+  const [lens, setLens] = createSignal<FleetLens>("lanes");
+  const timeline = createMemo(() => {
+    const b = board();
+    return groupByDay(buildTimeline(b.tasks, b.events, (t) => taskSession(b, t)));
+  });
   const econ = createMemo<FleetEconomics>(() => {
     const b = board();
     return fleetEconomics(b.conductor ? [b.conductor, ...b.workers] : b.workers);
@@ -125,6 +145,11 @@ const FleetRail: Component = () => {
         <Show when={showSpend()}>
           <BackendSpendTable econ={econ()} />
         </Show>
+        <div class="flex items-center gap-0.5 pt-0.5" role="group" aria-label="Fleet lens">
+          <For each={FLEET_LENSES}>
+            {(l) => <LensButton lens={l.id} label={l.label} active={lens()} onPick={setLens} title={l.title} />}
+          </For>
+        </div>
       </header>
 
       <Show when={board().error}>
@@ -135,21 +160,117 @@ const FleetRail: Component = () => {
         )}
       </Show>
 
-      <Show
-        when={lanes().length > 0}
-        fallback={
-          <p class="px-3 py-4 text-xs text-fg-faint">
-            {board().fetchedAt === 0
-              ? "Connecting to the board…"
-              : "Nothing dispatched yet. Ask the conductor to send or spawn work."}
-          </p>
-        }
-      >
-        <For each={lanes()}>{(lane) => <Lane group={lane} />}</For>
+      <Show when={lens() === "lanes"} fallback={<TimelineView days={timeline()} />}>
+        <Show
+          when={lanes().length > 0}
+          fallback={
+            <p class="px-3 py-4 text-xs text-fg-faint">
+              {board().fetchedAt === 0
+                ? "Connecting to the board…"
+                : "Nothing dispatched yet. Ask the conductor to send or spawn work."}
+            </p>
+          }
+        >
+          <For each={lanes()}>{(lane) => <Lane group={lane} />}</For>
+        </Show>
       </Show>
     </aside>
   );
 };
+
+const LensButton: Component<{
+  lens: FleetLens;
+  label: string;
+  active: FleetLens;
+  title: string;
+  onPick: (l: FleetLens) => void;
+}> = (props) => (
+  <button
+    type="button"
+    onClick={() => props.onPick(props.lens)}
+    aria-pressed={props.active === props.lens}
+    title={props.title}
+    class={`rounded px-1.5 py-0.5 text-[10px] font-medium transition ${
+      props.active === props.lens
+        ? "bg-accent/15 text-accent"
+        : "text-fg-faint hover:text-fg-muted"
+    }`}
+  >
+    {props.label}
+  </button>
+);
+
+/**
+ * Colour by outcome, reusing the lane vocabulary so a `blocked` row reads the
+ * same in both lenses. A `dispatched` row is intentionally quiet: it is the
+ * question, not the answer, and colouring every request would leave nothing
+ * for the outcomes to stand out against.
+ */
+const TIMELINE_STYLE: Record<TimelineKind, string> = {
+  dispatched: "border-border bg-bg text-fg-muted",
+  done: "border-success/40 bg-success/10 text-success",
+  blocked: "border-danger/60 bg-danger/15 text-danger",
+  failed: "border-danger/40 bg-danger/10 text-danger",
+  event: "border-border bg-bg text-fg-faint",
+};
+
+/** What was dispatched when, and what came back (§4's retrospection lens). */
+export const TimelineView: Component<{ days: TimelineDay[] }> = (props) => (
+  <Show
+    when={props.days.length > 0}
+    fallback={
+      <p class="px-3 py-4 text-xs text-fg-faint">
+        Nothing has been dispatched yet, so there is no history to replay.
+      </p>
+    }
+  >
+    <For each={props.days}>
+      {(day) => (
+        <section class="flex flex-col">
+          <h4 class="px-3 pb-1 pt-3 text-[10px] font-semibold uppercase tracking-wider text-fg-muted">
+            {new Date(day.day).toLocaleDateString(undefined, {
+              weekday: "short",
+              month: "short",
+              day: "numeric",
+            })}
+          </h4>
+          <ul class="flex flex-col">
+            <For each={day.entries}>{(e) => <TimelineRow entry={e} />}</For>
+          </ul>
+        </section>
+      )}
+    </For>
+  </Show>
+);
+
+const TimelineRow: Component<{ entry: TimelineEntry }> = (props) => (
+  <li class="flex flex-col gap-0.5 border-b border-border/40 px-3 py-1.5 last:border-b-0">
+    <div class="flex items-center gap-2 font-mono text-[10px]">
+      <span class="shrink-0 tabular-nums text-fg-faint">
+        {new Date(props.entry.at).toLocaleTimeString(undefined, {
+          hour: "2-digit",
+          minute: "2-digit",
+        })}
+      </span>
+      <span
+        class={`shrink-0 rounded border px-1 uppercase tracking-wider ${TIMELINE_STYLE[props.entry.kind]}`}
+      >
+        {props.entry.kind}
+      </span>
+      <span class="min-w-0 flex-1 truncate text-fg">{props.entry.label}</span>
+      {/* The task id is how a row is correlated by eye with fleet_tasks and
+          with an event whose task has aged off the board. */}
+      <span class="shrink-0 text-fg-faint" title={props.entry.taskId}>
+        {props.entry.taskId.slice(0, 8)}
+      </span>
+    </div>
+    <Show when={props.entry.detail}>
+      {(d) => (
+        <p class="line-clamp-2 pl-1 text-[11px] leading-snug text-fg-muted">{d()}</p>
+      )}
+    </Show>
+  </li>
+);
 
 /**
  * Per-backend spend — the metaharness view no single-vendor tool needs (§7).
