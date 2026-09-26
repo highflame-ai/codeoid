@@ -23,7 +23,6 @@ import type { Store } from "./store.js";
 import { createPushTransport, PushService } from "./push/index.js";
 import { hasScope, SCOPES } from "../protocol/scopes.js";
 import { applyPatches, getManifest, getSnapshot, previewPatches } from "./settings/store.js";
-import { fieldByKey } from "./settings/manifest.js";
 import { BackendLoginBroker, BackendLoginError, redact } from "./auth/backend-login.js";
 import { RateLimiter } from "./rate-limit.js";
 import type { TranscriptMeta, TranscriptStore } from "./transcript.js";
@@ -109,7 +108,7 @@ import type { DispatchEventRow, DispatchTaskRow } from "./store.js";
 import { type MemoryEngine, type MemoryMcpMount, workspaceIdFromPath } from "./memory/index.js";
 import type { McpRegistry } from "./mcp/registry.js";
 import type { McpHub } from "./mcp/hub.js";
-import { type CodeoidConfig, loadConfig, mutateConfigFile, validateConfigObject } from "../config.js";
+import { type CodeoidConfig, DEFAULT_PROVIDER_ENV, loadConfig, mutateConfigFile, validateConfigObject } from "../config.js";
 import type { CompressionRegistry } from "./compress/index.js";
 import { ORCHESTRATOR_ROLE } from "../protocol/types.js";
 import type {
@@ -1740,49 +1739,66 @@ mcpHub: this.#mcpHub,
 
   /**
    * Why the config these patches leave behind would stop the next boot, or
-   * undefined. Two ways it can: the config no longer loads, or its default
-   * backend can't be built (typo, disabled, binary or API key gone).
+   * undefined. Two ways it can: the config no longer loads (every batch is
+   * checked — a value can be valid alone and fail against an env override,
+   * like a timeout saved here against a stall timeout set in .env), or its
+   * default backend can't be built (typo, disabled, binary or API key gone).
    *
-   * Refuses only what the batch is responsible for. A batch that SETS the
-   * default is always checked — the operator is choosing it, so it must work.
-   * Any other batch is refused only if the config boots now and wouldn't after
-   * it: when the default is already broken (its binary vanished after an
-   * upgrade, say), an unrelated save must still go through, or the one screen
-   * that could repair things refuses every edit and blames the wrong key.
+   * Refuses only what the batch is responsible for. A default the batch SETS
+   * is always checked, on its own as well as in the merged config — the
+   * operator is choosing it, and an env override masking a typo today would
+   * stop a later boot once the override goes. Anything else is refused only
+   * if the config boots now and wouldn't after the batch: when it is already
+   * broken (the default's binary vanished after an upgrade, say), an
+   * unrelated save must still go through, or the one screen that could
+   * repair things refuses every edit and blames the wrong key.
    *
-   * Only batches that can change the answer are checked: the default itself,
-   * `providers.*`, and env-backed keys (API keys, and env overrides feeding
-   * loadConfig). A batch that can't be previewed (unknown key, unreadable
-   * config.json) is left to `applyPatches`, which rejects it with its own error.
+   * A batch that can't be previewed (unknown key, unreadable config.json) or
+   * whose config.json the schema rejects is left to `applyPatches`, which
+   * rejects it with its own, per-field errors.
    */
   #nextBootProblem(patches: SettingPatch[]): { key: string; message: string } | undefined {
-    const relevant = patches.filter(
-      (p) => p.key === "session.defaultProvider" || p.key.startsWith("providers.") || fieldByKey(p.key)?.backing === "env",
-    );
-    if (relevant.length === 0) return undefined;
+    if (patches.length === 0) return undefined;
     const after = previewPatches(patches);
-    // A config.json the schema rejects is applyPatches' to report — it does so
-    // per field. What only a load catches is an env override that fails the
-    // re-validation, and that is what #bootProblem is left to find.
     if (!after || !validateConfigObject(after.raw).ok) return undefined;
+
+    const setsDefault = patches.find(
+      (p) => p.key === "session.defaultProvider" && typeof p.value === "string" && p.value.trim() !== "",
+    );
+    if (setsDefault) {
+      // The chosen value itself, with no env override in front of it.
+      const { [DEFAULT_PROVIDER_ENV]: _masked, ...unmasked } = after.env;
+      for (const env of [after.env, unmasked]) {
+        const problem = this.#bootProblem({ raw: after.raw, env });
+        if (problem?.kind === "provider") return { key: setsDefault.key, message: problem.message };
+      }
+    }
+
     const problem = this.#bootProblem(after);
     if (!problem) return undefined;
-    const setsDefault = relevant.find((p) => p.key === "session.defaultProvider");
-    if (!setsDefault) {
+    let brokenAlready: boolean;
+    try {
       const before = previewPatches([]);
-      if (!before || this.#bootProblem(before)) return undefined;
+      brokenAlready = !before || this.#bootProblem(before) !== undefined;
+    } catch {
+      // Can't tell whether the current config boots: don't let that block
+      // every save — treat it as already broken and let the batch through.
+      brokenAlready = true;
     }
-    // Blame the default when the batch set it, else the patch that broke it.
-    return { key: (setsDefault ?? relevant[0]!).key, message: problem };
+    if (brokenAlready) return undefined;
+    return { key: patches[0]!.key, message: problem.message };
   }
 
   /** Why a previewed config.json + env would fail the boot, or undefined. */
-  #bootProblem(next: { raw: Record<string, unknown>; env: Record<string, string | undefined> }): string | undefined {
+  #bootProblem(next: {
+    raw: Record<string, unknown>;
+    env: Record<string, string | undefined>;
+  }): { kind: "load" | "provider"; message: string } | undefined {
     let config: CodeoidConfig;
     try {
       config = loadConfig({ raw: next.raw, env: next.env, quiet: true });
     } catch (err) {
-      return err instanceof Error ? err.message : String(err);
+      return { kind: "load", message: err instanceof Error ? err.message : String(err) };
     }
     const id = config.session.defaultProvider;
     if (!id || id === CLAUDE_PROVIDER_ID) return undefined;
@@ -1790,7 +1806,7 @@ mcpHub: this.#mcpHub,
       createDefaultProviderRegistry(config, next.env);
       return undefined;
     } catch (err) {
-      if (err instanceof DefaultProviderError) return err.message;
+      if (err instanceof DefaultProviderError) return { kind: "provider", message: err.message };
       throw err;
     }
   }

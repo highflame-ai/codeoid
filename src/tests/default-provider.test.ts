@@ -57,7 +57,16 @@ let store: Store;
 let transcript: TranscriptStore;
 // The next-boot check reads process.env: keep the shell's out of it, and give
 // it a `pi` on PATH so the pi cases don't hinge on the bundled optional dep.
-const ENV_KEYS = ["XDG_CONFIG_HOME", "CODEOID_DEFAULT_PROVIDER", "PATH"] as const;
+// TELEGRAM_ALLOWED_USER_IDS: applyPatches writes accepted env keys into
+// process.env, so a test that saves one must not leak it to later files.
+const ENV_KEYS = [
+  "XDG_CONFIG_HOME",
+  "CODEOID_DEFAULT_PROVIDER",
+  "CODEOID_TURN_STALL_TIMEOUT_MS",
+  "CODEOID_AUTO_ROTATE_PCT",
+  "TELEGRAM_ALLOWED_USER_IDS",
+  "PATH",
+] as const;
 let savedEnv: Record<string, string | undefined> = {};
 
 beforeEach(() => {
@@ -68,6 +77,8 @@ beforeEach(() => {
   // settings.set writes config.json — keep it off the real ~/.codeoid.
   process.env.XDG_CONFIG_HOME = tmp;
   delete process.env.CODEOID_DEFAULT_PROVIDER;
+  delete process.env.CODEOID_TURN_STALL_TIMEOUT_MS;
+  delete process.env.CODEOID_AUTO_ROTATE_PCT;
   const bin = join(tmp, "bin");
   mkdirSync(bin);
   writeFileSync(join(bin, "pi"), "#!/bin/sh\n");
@@ -293,6 +304,36 @@ describe("settings.set session.defaultProvider", () => {
     const res = await setBatch([{ key: "session.defaultProvider", value: "claud" }]);
     expect(res.ok).toBe(false);
     expect(res.errors[0]).toMatchObject({ key: "session.defaultProvider" });
+  });
+
+  it("refuses a config value that only breaks the boot in combination with an env override", async () => {
+    // Valid on its own (the default stall timeout is 300000), so the schema
+    // check passes — but the next boot applies the env's 150000 and rejects it.
+    process.env.CODEOID_TURN_STALL_TIMEOUT_MS = "150000";
+    const res = await setBatch([{ key: "session.mcpToolTimeoutMs", value: 200000 as unknown as string }]);
+    expect(res.ok).toBe(false);
+    expect(res.errors[0]).toMatchObject({ key: "session.mcpToolTimeoutMs" });
+    expect(res.errors[0]!.message).toMatch(/mcpToolTimeoutMs/);
+    expect(existsSync(configFilePaths().configPath)).toBe(false);
+  });
+
+  it("checks a default the batch sets even when an env override hides it", async () => {
+    // The env wins at boot, so the merged config is fine — but config.json
+    // would carry the typo, and the boot after the override goes would fail.
+    process.env.CODEOID_DEFAULT_PROVIDER = "pi";
+    const res = await setBatch([{ key: "session.defaultProvider", value: "claud" }]);
+    expect(res.ok).toBe(false);
+    expect(res.errors[0]).toMatchObject({ key: "session.defaultProvider" });
+    expect(res.errors[0]!.message).toMatch(/"claud" is not a registered backend/);
+  });
+
+  it("does not blame the default for a load problem that was already there", async () => {
+    // An unrelated env override already breaks loading; setting a working
+    // default neither causes nor fixes that, so it isn't refused for it.
+    process.env.CODEOID_AUTO_ROTATE_PCT = "abc";
+    const res = await setBatch([{ key: "session.defaultProvider", value: "claude" }]);
+    expect(res.errors).toEqual([]);
+    expect(res.ok).toBe(true);
   });
 
   it("records a refused write in the audit log", async () => {

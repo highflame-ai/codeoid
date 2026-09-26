@@ -1196,6 +1196,10 @@ interface EnvOverride {
   kind: OverrideKind;
 }
 
+/** Env override for `session.defaultProvider` — named so the settings check
+ *  can look past it at the value config.json would carry on its own. */
+export const DEFAULT_PROVIDER_ENV = "CODEOID_DEFAULT_PROVIDER";
+
 const ENV_OVERRIDES: readonly EnvOverride[] = [
   { env: "CODEOID_DAEMON_URL", path: "daemonUrl", kind: "string" },
   { env: "CODEOID_DB_PATH", path: "dbPath", kind: "string" },
@@ -1232,7 +1236,7 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   { env: "CODEOID_AUTO_ROTATE_PCT", path: "autoRotate.rotatePct", kind: "float" },
   { env: "CODEOID_AUTO_ROTATE_HARD_PCT", path: "autoRotate.hardRotatePct", kind: "float" },
   { env: "CODEOID_AUTO_ROTATE_MIN_TURNS", path: "autoRotate.minTurnsBeforeRotate", kind: "int" },
-  { env: "CODEOID_DEFAULT_PROVIDER", path: "session.defaultProvider", kind: "string" },
+  { env: DEFAULT_PROVIDER_ENV, path: "session.defaultProvider", kind: "string" },
   { env: "CODEOID_DEFAULT_MODEL", path: "session.defaultModel", kind: "string" },
   // Dispatch kill switch — disable send-class fleet dispatch per-invocation
   // without touching config.json. Other dispatch knobs are file-config only,
