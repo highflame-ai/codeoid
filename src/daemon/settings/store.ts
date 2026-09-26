@@ -177,6 +177,41 @@ export function applyPatches(patches: SettingPatch[]): ApplyResult {
   return { ok: true, errors: [], restartRequired, snapshot: getSnapshot() };
 }
 
+/**
+ * The config.json object and environment the NEXT boot would see if these
+ * patches were applied — computed, never written. Lets the caller check a
+ * write against rules that only run at startup (a default backend the next
+ * boot would refuse) before committing it.
+ *
+ * Returns undefined when the batch can't be previewed (an unknown key, an
+ * unreadable config.json): `applyPatches` rejects those with its own errors.
+ */
+export function previewPatches(
+  patches: SettingPatch[],
+): { raw: Record<string, unknown>; env: Record<string, string | undefined> } | undefined {
+  let raw: Record<string, unknown>;
+  try {
+    raw = readRawConfig();
+  } catch {
+    return undefined;
+  }
+  const env: Record<string, string | undefined> = { ...process.env };
+  for (const p of patches) {
+    const f = fieldByKey(p.key);
+    if (!f) return undefined;
+    if (f.backing === "config") {
+      const coerced = coerceForConfig(p.value, f.kind);
+      if (coerced === undefined) deleteByPath(raw, f.path!);
+      else setByPath(raw, f.path!, coerced);
+    } else {
+      const formatted = formatForEnv(p.value, f.kind);
+      if (formatted === null) delete env[f.envVar!];
+      else env[f.envVar!] = formatted;
+    }
+  }
+  return { raw, env };
+}
+
 // ── config.json IO ──────────────────────────────────────────────────────────
 
 function readRawConfig(): Record<string, unknown> {

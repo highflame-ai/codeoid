@@ -1274,6 +1274,12 @@ export interface LoadOptions {
   configPath?: string;
   /** Env source (default process.env). Tests inject a controlled object. */
   env?: Record<string, string | undefined>;
+  /**
+   * An in-memory config.json object to load INSTEAD of reading the file —
+   * used to preview the config a settings write would leave for the next
+   * boot, through exactly the path that boot takes.
+   */
+  raw?: unknown;
 }
 
 /**
@@ -1295,8 +1301,8 @@ export function loadConfig(opts: LoadOptions = {}): CodeoidConfig {
   const env = opts.env ?? process.env;
 
   // 1. File defaults.
-  let fileConfig: unknown = {};
-  if (existsSync(configPath)) {
+  let fileConfig: unknown = opts.raw ?? {};
+  if (opts.raw === undefined && existsSync(configPath)) {
     try {
       const raw = readFileSync(configPath, "utf8");
       fileConfig = JSON.parse(raw);

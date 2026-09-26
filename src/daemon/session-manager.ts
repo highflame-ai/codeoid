@@ -15,14 +15,15 @@ import { Session, type AttachedClient, type WindowScope } from "./session.js";
 import { type CatalogEntry, isPlaceholderModel, type SessionProvider } from "./providers/interface.js";
 import {
   createDefaultProviderRegistry,
-  defaultProviderProblem,
+  DefaultProviderError,
   type ProviderRegistry,
 } from "./providers/registry.js";
 import type { HookBus } from "./hooks/bus.js";
 import type { Store } from "./store.js";
 import { createPushTransport, PushService } from "./push/index.js";
 import { hasScope, SCOPES } from "../protocol/scopes.js";
-import { applyPatches, getManifest, getSnapshot } from "./settings/store.js";
+import { applyPatches, getManifest, getSnapshot, previewPatches } from "./settings/store.js";
+import { fieldByKey } from "./settings/manifest.js";
 import { BackendLoginBroker, BackendLoginError, redact } from "./auth/backend-login.js";
 import { RateLimiter } from "./rate-limit.js";
 import type { TranscriptMeta, TranscriptStore } from "./transcript.js";
@@ -108,7 +109,7 @@ import type { DispatchEventRow, DispatchTaskRow } from "./store.js";
 import { type MemoryEngine, type MemoryMcpMount, workspaceIdFromPath } from "./memory/index.js";
 import type { McpRegistry } from "./mcp/registry.js";
 import type { McpHub } from "./mcp/hub.js";
-import { type CodeoidConfig, mutateConfigFile } from "../config.js";
+import { type CodeoidConfig, loadConfig, mutateConfigFile } from "../config.js";
 import type { CompressionRegistry } from "./compress/index.js";
 import { ORCHESTRATOR_ROLE } from "../protocol/types.js";
 import type {
@@ -128,6 +129,7 @@ import type {
   SessionInfo,
   SessionMode,
   SessionWorktree,
+  SettingPatch,
 } from "../protocol/types.js";
 import type { Scope } from "../protocol/scopes.js";
 import type { PipelineState } from "./pipeline/interface.js";
@@ -700,11 +702,7 @@ mcpHub: this.#mcpHub,
           // The conductor self-persists (design R2): its role, provider
           // selection, and fleet tools all come back across a restart.
           role: meta.role,
-          // Absent = a meta written before providers existed, which means
-          // claude. NOT the registry default: with session.defaultProvider
-          // set, an old session would otherwise resume on another backend and
-          // lose its backing conversation.
-          providerId: meta.providerId ?? CLAUDE_PROVIDER_ID,
+          providerId: this.#resumeProviderId(meta.providerId, meta.sessionId),
           forkedFrom: meta.forkedFrom,
           worktree: meta.worktree,
           // A collaboration is durable state, not turn state: the goal and
@@ -1664,21 +1662,27 @@ mcpHub: this.#mcpHub,
       };
     }
     // The default backend is only checked at startup, and a bad one refuses
-    // to boot — so a typo saved here would take the daemon down on its next
-    // restart. Check it against the live registry now, with the same rule the
-    // boot uses, and reject the batch before anything is written.
-    const providerErrors = msg.patches.flatMap((p) => {
-      if (p.key !== "session.defaultProvider" || typeof p.value !== "string") return [];
-      const problem = p.value.trim() ? defaultProviderProblem(this.#providers, p.value.trim()) : undefined;
-      return problem ? [{ key: p.key, message: problem }] : [];
-    });
-    if (providerErrors.length > 0) {
+    // to boot — with the web UI down, recovery then needs a shell. So check
+    // every write that could change the answer against the registry the NEXT
+    // boot would build: the default itself, a backend's own switch or binary
+    // (`providers.*`), or an env key (a backend's API key). Checking the live
+    // registry instead would pass "default pi + disable pi" in one batch and
+    // refuse "enable codex + default codex".
+    const bootProblem = this.#nextBootDefaultProviderProblem(msg.patches);
+    if (bootProblem) {
+      const errors = [{ key: bootProblem.key, message: bootProblem.message }];
+      this.#store.audit(
+        auth.sub,
+        "settings.set",
+        "",
+        `keys=${msg.patches.map((p) => p.key).join(",")} ok=false reason=defaultProvider`,
+      );
       return {
         type: "settings.set.result",
         requestId: msg.id,
         ok: false,
         snapshot: { ...getSnapshot(), mcpServers: this.#mcpServerStatuses() },
-        errors: providerErrors,
+        errors,
         restartRequired: false,
       };
     }
@@ -1705,6 +1709,60 @@ mcpHub: this.#mcpHub,
         error: err instanceof Error ? err.message : String(err),
         code: "internal",
       };
+    }
+  }
+
+  /**
+   * Why the config these patches leave behind would stop the next boot on its
+   * default backend, or undefined. Skips batches that can't affect it, and a
+   * claude default (always registered). A batch that fails to preview or
+   * parse is left to `applyPatches`, which reports it with its own errors.
+   */
+  /**
+   * The backend a resumed session comes back on. Never the registry default:
+   * with session.defaultProvider set, that would silently move an existing
+   * session onto a backend it never ran on (losing its backing conversation,
+   * and possibly landing on a weaker approval gate).
+   *
+   * - absent → claude: the meta predates providers, so it IS a claude session.
+   * - no longer registered (key removed, backend disabled, a newer codeoid's
+   *   id) → claude, loudly — the same backend it fell back to before the
+   *   default was configurable.
+   */
+  #resumeProviderId(persisted: string | undefined, sessionId: string): string {
+    if (persisted === undefined) return CLAUDE_PROVIDER_ID;
+    if (this.#providers.has(persisted)) return persisted;
+    console.warn(
+      `[codeoid/resume] session ${sessionId} ran on "${persisted}", which is not available now — resuming it on ${CLAUDE_PROVIDER_ID}`,
+    );
+    return CLAUDE_PROVIDER_ID;
+  }
+
+  #nextBootDefaultProviderProblem(patches: SettingPatch[]): { key: string; message: string } | undefined {
+    const relevant = patches.filter((p) => {
+      if (p.key === "session.defaultProvider" || p.key.startsWith("providers.")) return true;
+      return fieldByKey(p.key)?.backing === "env";
+    });
+    if (relevant.length === 0) return undefined;
+    const next = previewPatches(patches);
+    if (!next) return undefined;
+    let config: CodeoidConfig;
+    try {
+      config = loadConfig({ raw: next.raw, env: next.env });
+    } catch {
+      return undefined;
+    }
+    const id = config.session.defaultProvider;
+    if (!id || id === CLAUDE_PROVIDER_ID) return undefined;
+    try {
+      createDefaultProviderRegistry(config, next.env);
+      return undefined;
+    } catch (err) {
+      if (!(err instanceof DefaultProviderError)) throw err;
+      // Attribute it to the default when the batch set it, else to the patch
+      // that broke an existing default (disabling it, clearing its key).
+      const key = relevant.find((p) => p.key === "session.defaultProvider")?.key ?? relevant[0]!.key;
+      return { key, message: err.message };
     }
   }
 
@@ -4594,7 +4652,10 @@ mcpHub: this.#mcpHub,
             error: `Model "${model}" is not valid for provider "${providerId}". Omit \`model\` to use the provider's default.`,
           };
         }
-        return { ok: true, provider, model: resolved };
+        // Pin the backend the model was validated against. Left unset, the
+        // task would spawn on whatever the default is at CLAIM time — after a
+        // default change and restart, a codex model on a claude worker.
+        return { ok: true, provider: providerId, model: resolved };
       },
       enqueuePanel: (input) =>
         this.#dispatcher.enqueueGroup({

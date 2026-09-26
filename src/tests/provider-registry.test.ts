@@ -131,7 +131,32 @@ describe("ProviderRegistry", () => {
   it("a disabled defaultProvider fails startup and names the switch", () => {
     expect(() =>
       createDefaultProviderRegistry(withDefault("pi", { providers: { pi: { enabled: false, command: "pi" } } })),
-    ).toThrow(/providers\.pi\.enabled is false/);
+    ).toThrow(/"pi" is not a registered backend .*It is disabled — set providers\.pi\.enabled to true\./);
+  });
+
+  it("names the real switch for a backend whose config key differs from its id", () => {
+    expect(() =>
+      createDefaultProviderRegistry(
+        withDefault("gemini-cli", { providers: { geminiCli: { enabled: false, command: "gemini" } } }),
+      ),
+    ).toThrow(/set providers\.geminiCli\.enabled to true/);
+  });
+
+  it("does not suggest a switch for an id that is simply unknown", () => {
+    let message = "";
+    try {
+      createDefaultProviderRegistry(withDefault("claud"));
+    } catch (e) {
+      message = (e as Error).message;
+    }
+    expect(message).toMatch(/Check the spelling\.$/);
+    expect(message).not.toContain("providers.claud");
+  });
+
+  it("reads backend keys from the env it is given, not process.env", () => {
+    // Keys deleted from process.env by beforeEach; the dry-run env has one.
+    const registry = createDefaultProviderRegistry(withDefault("openai"), { ...process.env, OPENAI_API_KEY: "sk-test" });
+    expect(registry.defaultId).toBe("openai");
   });
 
   it("an unavailable defaultProvider fails startup with that backend's own hint", () => {

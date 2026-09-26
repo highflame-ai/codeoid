@@ -51,7 +51,7 @@ const general: SettingsTab = {
       title: "Session defaults",
       description: "Applied when a new session is created.",
       fields: [
-        cfg("session.defaultProvider", "Default backend", "Backend for new sessions that don't pick one (claude, codex, pi, qwen, …). Must be a backend this daemon has available — an unknown or unavailable one stops the daemon at startup. Existing sessions and the conductor keep their own.", {
+        cfg("session.defaultProvider", "Default backend", "Backend for new sessions that don't pick one (claude, codex, pi, qwen, …). Backends differ in how strictly they gate tool use (qwen runs read-only shell commands without asking), so this changes the default posture for every unqualified session. Must be a backend this daemon can start — saving one it can't is refused. Existing sessions and the conductor keep their own.", {
           envVar: "CODEOID_DEFAULT_PROVIDER",
           placeholder: "claude",
         }),

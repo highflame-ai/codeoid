@@ -318,7 +318,10 @@ export class DaemonServer {
       },
     );
 
-    console.log(`[codeoid] providers: ${this.#manager.providerIds().join(", ")}`);
+    // Default first and labelled: with session.defaultProvider set, which
+    // backend unqualified sessions land on is worth seeing at boot.
+    const [defaultProvider, ...otherProviders] = this.#manager.providerIds();
+    console.log(`[codeoid] providers: ${[`${defaultProvider} (default)`, ...otherProviders].join(", ")}`);
     for (const { id, hint } of this.#manager.unavailableProviders()) {
       console.warn(`[codeoid] provider ${id} unavailable: ${hint}`);
     }

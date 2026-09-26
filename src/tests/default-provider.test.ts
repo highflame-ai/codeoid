@@ -148,6 +148,28 @@ describe("resume under a non-claude default", () => {
     expect(m.findByName("legacy", OWNER)?.providerId).toBe("claude");
     expect(m.findByName("modern", OWNER)?.providerId).toBe("pi");
   });
+
+  it("resumes a session whose backend is gone on claude, not on the default", async () => {
+    // e.g. its API key was removed. Falling back to the configured default
+    // would move it onto a backend it never ran on.
+    await transcript.saveMeta(legacyMeta("orphan", "gemini"));
+    await transcript.flush();
+
+    const m = manager();
+    expect(await m.resumeSessions()).toBe(1);
+    expect(m.findByName("orphan", OWNER)?.providerId).toBe("claude");
+  });
+});
+
+describe("dispatch under a non-claude default", () => {
+  it("validates a provider-less spawn's model against the default, and pins it", () => {
+    const deps = manager()._fleetDispatchDeps(OWNER.accountId!, OWNER.projectId!);
+    // Pinned: a task left provider-less would spawn on whatever the default is
+    // at claim time, which may have changed since this model was checked.
+    expect(deps.resolveBackend(undefined, "gpt-5-codex")).toEqual({ ok: true, provider: "pi", model: "gpt-5-codex" });
+    // A Claude alias is not valid for the backend the worker would run on.
+    expect(deps.resolveBackend(undefined, "opus").ok).toBe(false);
+  });
 });
 
 describe("settings.set session.defaultProvider", () => {
@@ -175,6 +197,71 @@ describe("settings.set session.defaultProvider", () => {
     expect(res.restartRequired).toBe(true);
     const onDisk = JSON.parse(readFileSync(configFilePaths().configPath, "utf8"));
     expect(onDisk.session.defaultProvider).toBe("claude");
+  });
+
+  const setBatch = (patches: Array<{ key: string; value: string | boolean | null }>) =>
+    manager().handle({ type: "settings.set", id: "sb", patches }, OWNER, client) as Promise<SettingsSetResultMsg>;
+  const onDisk = () =>
+    existsSync(configFilePaths().configPath) ? JSON.parse(readFileSync(configFilePaths().configPath, "utf8")) : {};
+
+  // The check is against the registry the NEXT boot builds, not the live one:
+  // these are the writes a live-registry check gets wrong in both directions.
+  it("refuses a batch that makes a backend the default and disables it", async () => {
+    const res = await setBatch([
+      { key: "session.defaultProvider", value: "pi" },
+      { key: "providers.pi.enabled", value: false },
+    ]);
+    expect(res.ok).toBe(false);
+    expect(res.errors[0]).toMatchObject({ key: "session.defaultProvider" });
+    expect(res.errors[0]!.message).toMatch(/set providers\.pi\.enabled to true/);
+    expect(existsSync(configFilePaths().configPath)).toBe(false);
+  });
+
+  it("refuses disabling the backend that is already the default, blaming that patch", async () => {
+    expect((await setBatch([{ key: "session.defaultProvider", value: "pi" }])).ok).toBe(true);
+    const res = await setBatch([{ key: "providers.pi.enabled", value: false }]);
+    expect(res.ok).toBe(false);
+    expect(res.errors[0]).toMatchObject({ key: "providers.pi.enabled" });
+    expect(onDisk().providers?.pi?.enabled).toBeUndefined();
+  });
+
+  it("accepts enabling a backend and making it the default in one batch", async () => {
+    expect((await setBatch([{ key: "providers.pi.enabled", value: false }])).ok).toBe(true);
+    const res = await setBatch([
+      { key: "providers.pi.enabled", value: true },
+      { key: "session.defaultProvider", value: "pi" },
+    ]);
+    expect(res.errors).toEqual([]);
+    expect(res.ok).toBe(true);
+    expect(onDisk().session.defaultProvider).toBe("pi");
+  });
+
+  it("refuses clearing the API key the default backend needs", async () => {
+    const saved = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = "sk-test";
+    try {
+      expect((await setBatch([{ key: "session.defaultProvider", value: "openai" }])).ok).toBe(true);
+      const res = await setBatch([{ key: "OPENAI_API_KEY", value: null }]);
+      expect(res.ok).toBe(false);
+      expect(res.errors[0]).toMatchObject({ key: "OPENAI_API_KEY" });
+      expect(res.errors[0]!.message).toMatch(/"openai" is not available on this daemon: .*OPENAI_API_KEY/);
+      expect(process.env.OPENAI_API_KEY).toBe("sk-test");
+    } finally {
+      if (saved === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = saved;
+    }
+  });
+
+  it("records a refused write in the audit log", async () => {
+    await set("claud");
+    // Store has no audit-read API on purpose; read the table directly.
+    const { Database } = await import("bun:sqlite");
+    const db = new Database(join(tmp, "codeoid.db"), { readonly: true });
+    const row = db
+      .prepare("SELECT subject, detail FROM audit_log WHERE action = 'settings.set' ORDER BY id DESC LIMIT 1")
+      .get() as { subject: string; detail: string } | undefined;
+    db.close();
+    expect(row).toEqual({ subject: OWNER.sub, detail: "keys=session.defaultProvider ok=false reason=defaultProvider" });
   });
 
   it("lets the value be cleared back to the built-in default", async () => {

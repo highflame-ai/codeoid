@@ -131,7 +131,7 @@ It is a real turn (§3.C), not a hidden side channel.
 If you are watching that session in another pane or another client, you will see the conductor-issued turn arrive there.
 
 **Caveat (honest scope).**
-Fleet tools are surfaced only by the Claude provider today, and spawned workers currently default to Claude.
+Fleet tools are surfaced only by the Claude provider today, and spawned workers default to the daemon's default backend (`session.defaultProvider`, Claude unless configured).
 So `send`-to-an-existing-session (the Spark case, where the target already runs its own backend) works now.
 True cross-backend *spawn* is spec-not-shipped; the UI must not over-promise it (§7, §13).
 
