@@ -22,6 +22,7 @@ import type { McpHub } from "../mcp/hub.js";
 import type { CompressionRegistry } from "../compress/index.js";
 import type { CodeoidConfig } from "../../config.js";
 import type { SessionProvider, CatalogEntry } from "./interface.js";
+import { CLAUDE_PROVIDER_ID } from "../models.js";
 import { ClaudeProvider } from "./claude/index.js";
 import { GeminiProvider } from "./gemini/index.js";
 import { OpenAIProvider } from "./openai/index.js";
@@ -88,7 +89,7 @@ export class ProviderRegistry {
   /** Id used when a session doesn't carry a provider selection. */
   readonly defaultId: string;
 
-  constructor(defaultId = "claude") {
+  constructor(defaultId = CLAUDE_PROVIDER_ID) {
     this.defaultId = defaultId;
   }
 
@@ -157,12 +158,47 @@ export class ProviderRegistry {
 }
 
 /**
+ * A `session.defaultProvider` the daemon cannot honour. Its own class so the
+ * CLI can print it as the operator's config mistake it is — one line, exit 1
+ * — without also swallowing the stack trace of a genuine startup bug.
+ */
+export class DefaultProviderError extends Error {
+  override name = "DefaultProviderError";
+}
+
+/**
+ * Why `id` cannot be this daemon's default backend, or undefined when it can.
+ *
+ * Shared by startup (`createDefaultProviderRegistry`) and the settings write
+ * path, so a value the settings UI accepts is exactly a value the next boot
+ * accepts. A backend codeoid supports but could not activate (binary missing,
+ * no API key) gets its actionable hint; anything else is a typo or a backend
+ * disabled under `providers.<id>.enabled`.
+ */
+export function defaultProviderProblem(registry: ProviderRegistry, id: string): string | undefined {
+  if (registry.has(id)) return undefined;
+  const hint = registry.unavailableHint(id);
+  if (hint) return `session.defaultProvider "${id}" is not available on this daemon: ${hint}`;
+  return (
+    `session.defaultProvider "${id}" is not a registered backend ` +
+    `(registered: ${registry.ids().join(", ")}). ` +
+    `Check the spelling, or whether providers.${id}.enabled is false.`
+  );
+}
+
+/**
  * The built-in backends. Daemon startup builds exactly one of these.
  * `config` gates optional backends (pi can be disabled) and carries their
  * settings (binary path); absent = every backend with defaults.
+ *
+ * `config.session.defaultProvider` picks the default backend and is checked
+ * once every backend has registered. It THROWS rather than warns: unlike
+ * `resolve()`'s fallback — which exists so resume survives a session written
+ * by a newer codeoid — a misspelled default is operator error, and falling
+ * back would silently put every new session on a backend they opted out of.
  */
 export function createDefaultProviderRegistry(config?: CodeoidConfig): ProviderRegistry {
-  const registry = new ProviderRegistry("claude");
+  const registry = new ProviderRegistry(config?.session?.defaultProvider ?? CLAUDE_PROVIDER_ID);
   registry.register({
     id: "claude",
     displayName: "Claude (Anthropic)",
@@ -352,5 +388,7 @@ export function createDefaultProviderRegistry(config?: CodeoidConfig): ProviderR
         }),
     });
   }
+  const problem = defaultProviderProblem(registry, registry.defaultId);
+  if (problem) throw new DefaultProviderError(problem);
   return registry;
 }

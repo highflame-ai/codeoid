@@ -21,7 +21,9 @@ import {
 } from "../daemon/models.js";
 import { contextWindowForModel } from "../daemon/context-windows.js";
 import { Store } from "../daemon/store.js";
-import { SessionManager, DEFAULT_PROVIDER_ID } from "../daemon/session-manager.js";
+import { SessionManager } from "../daemon/session-manager.js";
+import { createDefaultProviderRegistry } from "../daemon/providers/registry.js";
+import type { CodeoidConfig } from "../config.js";
 import type { WindowScope } from "../daemon/session.js";
 import { TranscriptStore } from "../daemon/transcript.js";
 
@@ -235,10 +237,6 @@ describe("resolveModelIdForProvider (per-child backend resolution)", () => {
     expect(resolveModelIdForProvider("   ", "gemini")).toBeNull();
     expect(resolveModelIdForProvider("", CLAUDE_PROVIDER_ID)).toBeNull();
   });
-
-  it("keeps CLAUDE_PROVIDER_ID in lockstep with DEFAULT_PROVIDER_ID", () => {
-    expect(DEFAULT_PROVIDER_ID).toBe(CLAUDE_PROVIDER_ID);
-  });
 });
 
 describe("Store session.model persistence", () => {
@@ -408,10 +406,25 @@ describe("models.list serves live → persisted → baked-in fallback, per provi
     const manager = new SessionManager(store, new TranscriptStore(join(tmp, "t")));
     const res = await listModels(manager);
     expect(res.live).toBe(false);
-    expect(res.provider).toBe(DEFAULT_PROVIDER_ID);
+    expect(res.provider).toBe(CLAUDE_PROVIDER_ID);
     expect(res.models.map((m) => m.value)).toEqual(
       fallbackModelInfos().map((m) => m.value),
     );
+  });
+
+  it("a configured default backend answers a provider-less request, not claude's fallback", async () => {
+    // #339: "no provider" means the backend a new session would land on. Serving
+    // Claude's catalog here would populate the picker with models the default
+    // backend rejects.
+    const config = { session: { defaultProvider: "qwen" } } as unknown as CodeoidConfig;
+    const manager = new SessionManager(store, new TranscriptStore(join(tmp, "t")), undefined, undefined, undefined, {
+      providers: createDefaultProviderRegistry(config),
+    });
+    const res = await listModels(manager);
+    expect(res.provider).toBe("qwen");
+    expect(res.models).toEqual([]);
+    // Claude's catalog is still Claude's when asked for by name.
+    expect((await listModels(manager, "claude")).models.length).toBeGreaterThan(0);
   });
 
   it("non-default provider with no reports yet: empty list, not the claude fallback", async () => {

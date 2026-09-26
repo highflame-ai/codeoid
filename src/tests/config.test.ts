@@ -173,6 +173,23 @@ describe("loadConfig — env precedence", () => {
     expect(c.compress.excludeCommands).toEqual(["curl", "wget", "playwright"]);
   });
 
+  it("session.defaultProvider: unset by default, set from file, overridden by CODEOID_DEFAULT_PROVIDER", () => {
+    writeConfig({});
+    expect(loadConfig({ configPath, env: {} }).session.defaultProvider).toBeUndefined();
+
+    writeConfig({ session: { defaultProvider: " pi " } });
+    // Trimmed, so a stray space can't become an unregistered id at startup.
+    expect(loadConfig({ configPath, env: {} }).session.defaultProvider).toBe("pi");
+    expect(loadConfig({ configPath, env: { CODEOID_DEFAULT_PROVIDER: "codex" } }).session.defaultProvider).toBe("codex");
+    // Empty env = no override — the file value wins.
+    expect(loadConfig({ configPath, env: { CODEOID_DEFAULT_PROVIDER: "" } }).session.defaultProvider).toBe("pi");
+  });
+
+  it("session.defaultProvider rejects a blank value rather than treating it as a backend id", () => {
+    writeConfig({ session: { defaultProvider: "   " } });
+    expect(() => loadConfig({ configPath, env: {} })).toThrow(/defaultProvider/);
+  });
+
   it("boolean env accepts 1/true, ignores empty", () => {
     writeConfig({ memory: { enabled: true } });
     const c1 = loadConfig({ configPath, env: { CODEOID_MEMORY: "1" } });

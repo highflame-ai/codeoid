@@ -15,6 +15,7 @@ import { Session, type AttachedClient, type WindowScope } from "./session.js";
 import { type CatalogEntry, isPlaceholderModel, type SessionProvider } from "./providers/interface.js";
 import {
   createDefaultProviderRegistry,
+  defaultProviderProblem,
   type ProviderRegistry,
 } from "./providers/registry.js";
 import type { HookBus } from "./hooks/bus.js";
@@ -296,12 +297,6 @@ const RESUME_DEADLINE_MS = 20_000;
  * 20 MiB / 5000 messages — parsing history past that would be evicted on
  * arrival, so cap the read slightly above the scrollback byte cap. */
 const RESUME_TRANSCRIPT_MAX_BYTES = 24 * 1024 * 1024;
-
-/** Provider assumed when a client doesn't say which catalog it wants.
- *  Re-exported from models.ts so the id that gates Claude-only alias
- *  expansion (`resolveModelIdForProvider`) and the id used for catalog
- *  defaults can never drift apart. */
-export const DEFAULT_PROVIDER_ID = CLAUDE_PROVIDER_ID;
 
 /** Sort key for resume ordering: most-recently-active first. Falls back to
  * createdAt, then 0, so a malformed timestamp never throws. */
@@ -705,7 +700,11 @@ mcpHub: this.#mcpHub,
           // The conductor self-persists (design R2): its role, provider
           // selection, and fleet tools all come back across a restart.
           role: meta.role,
-          providerId: meta.providerId,
+          // Absent = a meta written before providers existed, which means
+          // claude. NOT the registry default: with session.defaultProvider
+          // set, an old session would otherwise resume on another backend and
+          // lose its backing conversation.
+          providerId: meta.providerId ?? CLAUDE_PROVIDER_ID,
           forkedFrom: meta.forkedFrom,
           worktree: meta.worktree,
           // A collaboration is durable state, not turn state: the goal and
@@ -882,7 +881,7 @@ mcpHub: this.#mcpHub,
           {
             roleName: role.roleName,
             ordinal: role.ordinal,
-            providerId: meta.providerId ?? "claude",
+            providerId: meta.providerId ?? CLAUDE_PROVIDER_ID,
             shape: role.write ? "ship" : "scout",
             write: role.write,
           },
@@ -1551,7 +1550,8 @@ mcpHub: this.#mcpHub,
     const persisted = this.#persistedModels(providerId);
     if (persisted) return { models: persisted, live: false };
     return {
-      models: providerId === DEFAULT_PROVIDER_ID ? fallbackModelInfos() : [],
+      // The built-in fallback is Claude's catalog, whatever the default is.
+      models: providerId === CLAUDE_PROVIDER_ID ? fallbackModelInfos() : [],
       live: false,
     };
   }
@@ -1574,7 +1574,8 @@ mcpHub: this.#mcpHub,
   #modelsList(
     msg: Extract<ClientMessage, { type: "models.list" }>,
   ): DaemonMessage {
-    const provider = msg.provider ?? DEFAULT_PROVIDER_ID;
+    // No provider = the catalog of the backend a new session would land on.
+    const provider = msg.provider ?? this.#providers.defaultId;
     const { models, live } = this.#currentModels(provider);
     return { type: "models.list.result", requestId: msg.id, models, live, provider };
   }
@@ -1660,6 +1661,25 @@ mcpHub: this.#mcpHub,
         requestId: msg.id,
         error: "Missing scope: settings:write",
         code: "forbidden",
+      };
+    }
+    // The default backend is only checked at startup, and a bad one refuses
+    // to boot — so a typo saved here would take the daemon down on its next
+    // restart. Check it against the live registry now, with the same rule the
+    // boot uses, and reject the batch before anything is written.
+    const providerErrors = msg.patches.flatMap((p) => {
+      if (p.key !== "session.defaultProvider" || typeof p.value !== "string") return [];
+      const problem = p.value.trim() ? defaultProviderProblem(this.#providers, p.value.trim()) : undefined;
+      return problem ? [{ key: p.key, message: problem }] : [];
+    });
+    if (providerErrors.length > 0) {
+      return {
+        type: "settings.set.result",
+        requestId: msg.id,
+        ok: false,
+        snapshot: { ...getSnapshot(), mcpServers: this.#mcpServerStatuses() },
+        errors: providerErrors,
+        restartRequired: false,
       };
     }
     try {
@@ -2405,7 +2425,7 @@ mcpHub: this.#mcpHub,
           code: "invalid_request",
         };
       }
-      const forProvider = providerId ?? DEFAULT_PROVIDER_ID;
+      const forProvider = providerId ?? this.#providers.defaultId;
       const resolved = resolveModelIdForProvider(msg.model, forProvider);
       if (!resolved) {
         return {
@@ -2450,7 +2470,7 @@ mcpHub: this.#mcpHub,
             code: "invalid_request",
           };
         }
-        const targetProvider = resolved.provider ?? providerId ?? DEFAULT_PROVIDER_ID;
+        const targetProvider = resolved.provider ?? providerId ?? this.#providers.defaultId;
         // A chain-resolved model goes through the SAME provider-aware
         // validation as an explicit --model — but SKIPS with a warning rather
         // than hard-failing the create: the operator never typed this id, so a
@@ -3311,8 +3331,10 @@ mcpHub: this.#mcpHub,
     mkdirSync(workdir, { recursive: true });
 
     const conductorConfig = this.#config?.conductor;
-    const providerId = conductorConfig?.provider ?? DEFAULT_PROVIDER_ID;
-    if (providerId !== "claude") {
+    // Deliberately NOT session.defaultProvider: the conductor needs the fleet
+    // MCP tools, which only the claude provider mounts today.
+    const providerId = conductorConfig?.provider ?? CLAUDE_PROVIDER_ID;
+    if (providerId !== CLAUDE_PROVIDER_ID) {
       console.warn(
         `[codeoid] conductor provider is "${providerId}" — MCP fleet tools are only surfaced by the claude provider today; the conductor will chat but cannot see the fleet`,
       );
@@ -4560,7 +4582,7 @@ mcpHub: this.#mcpHub,
         // IdForProvider(...)`, which read as strict validation but could never
         // reject anything — the fallback's last branch returns the input
         // unchanged. The dead branch is gone; only the real rule remains.
-        const providerId = provider ?? DEFAULT_PROVIDER_ID;
+        const providerId = provider ?? this.#providers.defaultId;
         const { models } = this.#currentModels(providerId);
         const canonical =
           models.length > 0 ? resolveAgainstList(model, models) : null;

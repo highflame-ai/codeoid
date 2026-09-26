@@ -308,7 +308,9 @@ const TelemetrySchema = z
  * sane defaults; users can tune via config or env.
  */
 /**
- * Per-session model defaults. `defaultModel` is used on session creation;
+ * Per-session defaults. `defaultProvider` picks the backend a new session runs
+ * on when the caller names none (unset = "claude"); `defaultModel` is used on
+ * session creation;
  * `fallbackModel` is handed to the SDK's `fallbackModel` option so a 429
  * or 529 transparently retries with a cheaper/less-loaded model instead of
  * failing the turn. Both accept aliases (`opus`/`sonnet`/`haiku`) or full
@@ -316,6 +318,14 @@ const TelemetrySchema = z
  */
 const SessionSchema = z
   .object({
+    /**
+     * Backend for a session created without a provider. Must name a backend
+     * this daemon registers — a typo, a disabled backend, or one whose binary
+     * is missing fails daemon startup rather than silently reverting to
+     * "claude". Resumed sessions keep the backend they were created on; the
+     * conductor keeps `conductor.provider`.
+     */
+    defaultProvider: z.string().trim().min(1).optional(),
     defaultModel: z.string().optional(),
     fallbackModel: z.string().optional(),
     /**
@@ -1013,6 +1023,8 @@ export interface CodeoidConfig {
   };
   /** Model selection defaults applied when a session is created. */
   session: {
+    /** Backend for a session created without a provider (unset = "claude"). Validated at startup. */
+    defaultProvider?: string;
     defaultModel?: string;
     fallbackModel?: string;
     /** Stall watchdog: ms of event-stream silence while the model should be generating before a turn is force-recovered (0 = off; paused during tool execution and pending approvals). Defaults to 300000 when omitted. */
@@ -1220,6 +1232,7 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   { env: "CODEOID_AUTO_ROTATE_PCT", path: "autoRotate.rotatePct", kind: "float" },
   { env: "CODEOID_AUTO_ROTATE_HARD_PCT", path: "autoRotate.hardRotatePct", kind: "float" },
   { env: "CODEOID_AUTO_ROTATE_MIN_TURNS", path: "autoRotate.minTurnsBeforeRotate", kind: "int" },
+  { env: "CODEOID_DEFAULT_PROVIDER", path: "session.defaultProvider", kind: "string" },
   { env: "CODEOID_DEFAULT_MODEL", path: "session.defaultModel", kind: "string" },
   // Dispatch kill switch — disable send-class fleet dispatch per-invocation
   // without touching config.json. Other dispatch knobs are file-config only,

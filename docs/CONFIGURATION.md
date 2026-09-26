@@ -85,6 +85,11 @@ CODEOID_RESUME_MAX_SESSIONS=200          # sessions restored from disk at startu
                                         #   Resume is also time-boxed, so raising this costs
                                         #   startup time; the remainder stays on disk and loads
                                         #   on a later restart.
+CODEOID_DEFAULT_PROVIDER=claude         # backend for sessions created without --provider
+                                        #   (claude | codex | pi | qwen | gemini-cli | openai | gemini).
+                                        #   An unknown, disabled or uninstalled backend stops the
+                                        #   daemon at startup. Resumed sessions and the conductor
+                                        #   keep their own backend.
 
 # Memory
 CODEOID_MEMORY=1                        # default: on; set to 0 to disable
@@ -147,6 +152,9 @@ Optional `~/.codeoid/config.json` (env vars take precedence):
     "enabled": true,
     "dbPath": "~/.codeoid/memory.db",
     "model": "Xenova/bge-small-en-v1.5"
+  },
+  "session": {
+    "defaultProvider": "claude"
   }
 }
 ```

@@ -121,9 +121,9 @@ afterEach(async () => {
 
 /** Recording fake SessionManager: two known sessions, capture attach clients. */
 function makeFakeManager() {
-  const sessions: Record<string, { id: string; name: string; workdir: string }> = {
-    alpha: { id: "sess-a", name: "alpha", workdir: "/repos/alpha" },
-    beta: { id: "sess-b", name: "beta", workdir: "/repos/beta" },
+  const sessions: Record<string, { id: string; name: string; workdir: string; providerId: string }> = {
+    alpha: { id: "sess-a", name: "alpha", workdir: "/repos/alpha", providerId: "claude" },
+    beta: { id: "sess-b", name: "beta", workdir: "/repos/beta", providerId: "codex" },
   };
   const handled: any[] = [];
   const disconnected: string[] = [];
@@ -1054,6 +1054,20 @@ describe("Telegram flows — inline-code spans escape only ` and \\", () => {
     expect(msg.payload.text).not.toContain("claude\\-opus");
     // …while the display name outside the span still escapes MarkdownV2.
     expect(msg.payload.text).toContain("Claude Opus 4\\.8");
+  });
+
+  it("/model lists the attached session's backend, not the daemon default's", async () => {
+    // A provider-less models.list answers with the DEFAULT backend's catalog
+    // (#339), which is the wrong list for a session on any other backend.
+    const { drive, texts, manager } = await boot();
+
+    await drive("/attach beta");
+    await until(() => texts().some((t) => t.startsWith("Attached to")));
+    await drive("/model");
+    await until(() => texts().some((t) => t.includes("Models")));
+
+    const req = manager.handled.find((m) => m.type === "models.list");
+    expect(req?.provider).toBe("codex");
   });
 
   it("/who renders identity values in clean code spans", async () => {

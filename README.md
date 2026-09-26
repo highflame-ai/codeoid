@@ -262,6 +262,9 @@ Rule of thumb: reach for Omnigent when you need OS-level isolation and the broad
 - **In-daemon API backends** (`openai`, `gemini`) register only when their **API key** is set in `~/.codeoid/.env`. These bill against the key, not a subscription.
 
 Pick a backend per session with `codeoid new <name> --provider <id>`, or switch a live session with `/provider <id>`.
+To make another backend the default for new sessions, set `session.defaultProvider` in `config.json` (or `CODEOID_DEFAULT_PROVIDER`), e.g. `{"session": {"defaultProvider": "pi"}}`.
+The daemon refuses to start if that backend is misspelled, disabled, or not installed, rather than silently falling back to Claude.
+Existing sessions keep the backend they were created on, and the conductor stays on `conductor.provider`.
 Set keys from the Settings screen (⚙ / `/settings`) or by editing `~/.codeoid/.env` — see [Configuration](docs/CONFIGURATION.md) for every variable.
 
 > **Gemini needs an API key (or Vertex) — a consumer Google (AI Pro/Ultra) subscription can't be used with Codeoid.**

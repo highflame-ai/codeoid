@@ -51,6 +51,10 @@ const general: SettingsTab = {
       title: "Session defaults",
       description: "Applied when a new session is created.",
       fields: [
+        cfg("session.defaultProvider", "Default backend", "Backend for new sessions that don't pick one (claude, codex, pi, qwen, …). Must be a backend this daemon has available — an unknown or unavailable one stops the daemon at startup. Existing sessions and the conductor keep their own.", {
+          envVar: "CODEOID_DEFAULT_PROVIDER",
+          placeholder: "claude",
+        }),
         cfg("session.defaultModel", "Default model", "Model for new sessions — an alias (opus / sonnet / haiku) or a full model id.", {
           envVar: "CODEOID_DEFAULT_MODEL",
           placeholder: "opus",

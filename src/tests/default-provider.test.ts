@@ -1,0 +1,187 @@
+/**
+ * `session.defaultProvider` (#339) at the SessionManager layer.
+ *
+ * The registry-level rules (the configured id becomes `defaultId`; a typo,
+ * a disabled backend or an uninstalled one fails startup) live in
+ * provider-registry.test.ts. These tests pin what the daemon DOES with a
+ * non-Claude default — the places that used to assume "no provider" meant
+ * claude even though the session would be built on the registry default:
+ *
+ *   - a provider-less create lands on the default and validates its model
+ *     against THAT backend, not Claude's catalog;
+ *   - a legacy session meta with no provider resumes on claude, never on the
+ *     new default (it would lose its backing conversation);
+ *   - the settings write path refuses a default the next boot would refuse.
+ *
+ * The registry is real (not `_testProviderFactory`) so the provider a session
+ * reports is the one the registry resolved, which is the thing under test.
+ */
+
+import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Store } from "../daemon/store.js";
+import { TranscriptStore } from "../daemon/transcript.js";
+import { SessionManager } from "../daemon/session-manager.js";
+import { ProviderRegistry, type ProviderFactory } from "../daemon/providers/registry.js";
+import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
+import type { AttachedClient } from "../daemon/session.js";
+import type { AuthContext, SettingsSetResultMsg } from "../protocol/types.js";
+import { ALL_SCOPES } from "../protocol/scopes.js";
+import { configFilePaths } from "../config.js";
+
+const OWNER: AuthContext = {
+  sub: "user:default-provider",
+  scopes: [...ALL_SCOPES] as AuthContext["scopes"],
+  delegationDepth: 0,
+  accountId: "acc-dp",
+  projectId: "proj-dp",
+};
+const client: AttachedClient = { id: "client-dp", auth: OWNER, send: () => {} };
+
+function mockFactory(id: string): ProviderFactory {
+  return { id, displayName: `Mock ${id}`, create: () => new MockSessionProvider(id) };
+}
+
+/** A daemon configured with `session.defaultProvider: "pi"`. */
+function piDefaultRegistry(): ProviderRegistry {
+  const registry = new ProviderRegistry("pi");
+  registry.register(mockFactory("claude"));
+  registry.register(mockFactory("pi"));
+  return registry;
+}
+
+let tmp: string;
+let store: Store;
+let transcript: TranscriptStore;
+let prevXdg: string | undefined;
+
+beforeEach(() => {
+  tmp = mkdtempSync(join(tmpdir(), "codeoid-default-provider-"));
+  store = new Store(join(tmp, "codeoid.db"));
+  transcript = new TranscriptStore(join(tmp, "transcripts"));
+  // settings.set writes config.json — keep it off the real ~/.codeoid.
+  prevXdg = process.env.XDG_CONFIG_HOME;
+  process.env.XDG_CONFIG_HOME = tmp;
+});
+
+afterEach(async () => {
+  if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+  else process.env.XDG_CONFIG_HOME = prevXdg;
+  try { await transcript.flush(); } catch {}
+  try { store.close(); } catch {}
+  try { rmSync(tmp, { recursive: true, force: true }); } catch {}
+});
+
+const manager = () =>
+  new SessionManager(store, transcript, undefined, undefined, undefined, { providers: piDefaultRegistry() });
+
+describe("a non-claude default backend", () => {
+  it("is advertised first, so clients preselect it", () => {
+    expect(manager().providerIds()[0]).toBe("pi");
+  });
+
+  it("is what a provider-less session.create lands on", async () => {
+    const resp = await manager().handle(
+      { type: "session.create", id: "c1", name: "plain", workdir: tmp },
+      OWNER,
+      client,
+    );
+    expect(resp.type).toBe("response.ok");
+    if (resp.type !== "response.ok") return;
+    expect((resp.data as { providerId?: string }).providerId).toBe("pi");
+  });
+
+  it("validates a provider-less create's model against itself, not Claude's catalog", async () => {
+    // Before #339 this resolved "opus" as a Claude alias and built a pi
+    // session carrying claude-opus-*, which pi would reject on the first turn.
+    const resp = await manager().handle(
+      { type: "session.create", id: "c2", name: "opus-on-pi", workdir: tmp, model: "opus" },
+      OWNER,
+      client,
+    );
+    expect(resp).toMatchObject({ type: "response.error", code: "invalid_request" });
+    if (resp.type === "response.error") {
+      expect(resp.error).toMatch(/Model "opus" is not valid for provider "pi"/);
+    }
+  });
+
+  it("still takes an explicit claude session and its alias", async () => {
+    const resp = await manager().handle(
+      { type: "session.create", id: "c3", name: "claude", workdir: tmp, providerId: "claude", model: "opus" },
+      OWNER,
+      client,
+    );
+    expect(resp.type).toBe("response.ok");
+    if (resp.type !== "response.ok") return;
+    const info = resp.data as { providerId?: string; model?: string };
+    expect(info.providerId).toBe("claude");
+    expect(info.model).toMatch(/^claude-opus-/);
+  });
+});
+
+describe("resume under a non-claude default", () => {
+  const legacyMeta = (sessionId: string, providerId?: string) => ({
+    sessionId,
+    sessionName: sessionId,
+    workdir: tmp,
+    createdBy: OWNER.sub,
+    createdAt: new Date().toISOString(),
+    lastStatus: "idle" as const,
+    lastActivityAt: new Date().toISOString(),
+    accountId: OWNER.accountId!,
+    projectId: OWNER.projectId!,
+    ...(providerId ? { providerId } : {}),
+  });
+
+  it("keeps a pre-provider meta on claude instead of moving it to the default", async () => {
+    // A meta with no providerId predates multi-backend support: it IS a
+    // claude session. Resolving it through the registry default would resume
+    // it on pi and orphan its Claude backing conversation.
+    await transcript.saveMeta(legacyMeta("legacy"));
+    await transcript.saveMeta(legacyMeta("modern", "pi"));
+    await transcript.flush();
+
+    const m = manager();
+    expect(await m.resumeSessions()).toBe(2);
+    expect(m.findByName("legacy", OWNER)?.providerId).toBe("claude");
+    expect(m.findByName("modern", OWNER)?.providerId).toBe("pi");
+  });
+});
+
+describe("settings.set session.defaultProvider", () => {
+  const set = (value: string | null) =>
+    manager().handle(
+      { type: "settings.set", id: "s1", patches: [{ key: "session.defaultProvider", value }] },
+      OWNER,
+      client,
+    ) as Promise<SettingsSetResultMsg>;
+
+  it("refuses a backend the next boot would refuse, and writes nothing", async () => {
+    const res = await set("claud");
+    expect(res.type).toBe("settings.set.result");
+    expect(res.ok).toBe(false);
+    expect(res.restartRequired).toBe(false);
+    expect(res.errors).toEqual([
+      { key: "session.defaultProvider", message: expect.stringMatching(/"claud" is not a registered backend/) },
+    ]);
+    expect(existsSync(configFilePaths().configPath)).toBe(false);
+  });
+
+  it("accepts a registered backend and persists it for the next boot", async () => {
+    const res = await set("claude");
+    expect(res.ok).toBe(true);
+    expect(res.restartRequired).toBe(true);
+    const onDisk = JSON.parse(readFileSync(configFilePaths().configPath, "utf8"));
+    expect(onDisk.session.defaultProvider).toBe("claude");
+  });
+
+  it("lets the value be cleared back to the built-in default", async () => {
+    await set("claude");
+    const res = await set(null);
+    expect(res.ok).toBe(true);
+    const onDisk = JSON.parse(readFileSync(configFilePaths().configPath, "utf8"));
+    expect(onDisk.session?.defaultProvider).toBeUndefined();
+  });
+});
