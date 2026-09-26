@@ -18,9 +18,9 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
 import { SessionManager } from "../daemon/session-manager.js";
@@ -55,20 +55,31 @@ function piDefaultRegistry(): ProviderRegistry {
 let tmp: string;
 let store: Store;
 let transcript: TranscriptStore;
-let prevXdg: string | undefined;
+// The next-boot check reads process.env: keep the shell's out of it, and give
+// it a `pi` on PATH so the pi cases don't hinge on the bundled optional dep.
+const ENV_KEYS = ["XDG_CONFIG_HOME", "CODEOID_DEFAULT_PROVIDER", "PATH"] as const;
+let savedEnv: Record<string, string | undefined> = {};
 
 beforeEach(() => {
   tmp = mkdtempSync(join(tmpdir(), "codeoid-default-provider-"));
   store = new Store(join(tmp, "codeoid.db"));
   transcript = new TranscriptStore(join(tmp, "transcripts"));
+  savedEnv = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
   // settings.set writes config.json — keep it off the real ~/.codeoid.
-  prevXdg = process.env.XDG_CONFIG_HOME;
   process.env.XDG_CONFIG_HOME = tmp;
+  delete process.env.CODEOID_DEFAULT_PROVIDER;
+  const bin = join(tmp, "bin");
+  mkdirSync(bin);
+  writeFileSync(join(bin, "pi"), "#!/bin/sh\n");
+  chmodSync(join(bin, "pi"), 0o755);
+  process.env.PATH = `${bin}:${savedEnv.PATH ?? ""}`;
 });
 
 afterEach(async () => {
-  if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
-  else process.env.XDG_CONFIG_HOME = prevXdg;
+  for (const k of ENV_KEYS) {
+    if (savedEnv[k] === undefined) delete process.env[k];
+    else process.env[k] = savedEnv[k];
+  }
   try { await transcript.flush(); } catch {}
   try { store.close(); } catch {}
   try { rmSync(tmp, { recursive: true, force: true }); } catch {}
@@ -252,6 +263,38 @@ describe("settings.set session.defaultProvider", () => {
     }
   });
 
+  // A default that broke AFTER boot (its binary vanished in an upgrade) must
+  // not turn Settings into a wall: only a batch that causes the breakage, or
+  // that picks the default itself, is refused.
+  const brokenDefault = () => {
+    const { configPath } = configFilePaths();
+    mkdirSync(dirname(configPath), { recursive: true });
+    writeFileSync(
+      configPath,
+      JSON.stringify({ session: { defaultProvider: "pi" }, providers: { pi: { command: "/nonexistent/pi" } } }),
+    );
+  };
+
+  it("still accepts unrelated saves while the default is already broken", async () => {
+    brokenDefault();
+    const res = await setBatch([{ key: "TELEGRAM_ALLOWED_USER_IDS", value: "123" }]);
+    expect(res.errors).toEqual([]);
+    expect(res.ok).toBe(true);
+    expect((await setBatch([{ key: "providers.codex.enabled", value: false }])).ok).toBe(true);
+  });
+
+  it("accepts the save that repairs a broken default", async () => {
+    brokenDefault();
+    expect((await setBatch([{ key: "providers.pi.command", value: "pi" }])).ok).toBe(true);
+  });
+
+  it("still checks a default the batch picks, even when the current one is broken", async () => {
+    brokenDefault();
+    const res = await setBatch([{ key: "session.defaultProvider", value: "claud" }]);
+    expect(res.ok).toBe(false);
+    expect(res.errors[0]).toMatchObject({ key: "session.defaultProvider" });
+  });
+
   it("records a refused write in the audit log", async () => {
     await set("claud");
     // Store has no audit-read API on purpose; read the table directly.
@@ -261,7 +304,7 @@ describe("settings.set session.defaultProvider", () => {
       .prepare("SELECT subject, detail FROM audit_log WHERE action = 'settings.set' ORDER BY id DESC LIMIT 1")
       .get() as { subject: string; detail: string } | undefined;
     db.close();
-    expect(row).toEqual({ subject: OWNER.sub, detail: "keys=session.defaultProvider ok=false reason=defaultProvider" });
+    expect(row).toEqual({ subject: OWNER.sub, detail: "keys=session.defaultProvider ok=false reason=next-boot" });
   });
 
   it("lets the value be cleared back to the built-in default", async () => {

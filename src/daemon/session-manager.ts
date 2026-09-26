@@ -109,7 +109,7 @@ import type { DispatchEventRow, DispatchTaskRow } from "./store.js";
 import { type MemoryEngine, type MemoryMcpMount, workspaceIdFromPath } from "./memory/index.js";
 import type { McpRegistry } from "./mcp/registry.js";
 import type { McpHub } from "./mcp/hub.js";
-import { type CodeoidConfig, loadConfig, mutateConfigFile } from "../config.js";
+import { type CodeoidConfig, loadConfig, mutateConfigFile, validateConfigObject } from "../config.js";
 import type { CompressionRegistry } from "./compress/index.js";
 import { ORCHESTRATOR_ROLE } from "../protocol/types.js";
 import type {
@@ -661,7 +661,10 @@ export class SessionManager {
         // Role-children need their restrictions rebuilt BEFORE construction —
         // worker shape and capability role are constructor inputs, not things
         // that can be attached afterwards.
-        const child = this.#resumeRoleChild(meta, goalConfigs);
+        // Resolved once: the role posture and the session must agree on the
+        // backend, including when the persisted one is no longer available.
+        const providerId = this.#resumeProviderId(meta.providerId, meta.sessionId);
+        const child = this.#resumeRoleChild(meta, goalConfigs, providerId);
         if (child) {
           if (child.orphaned) orphanedChildren++;
           else resumedChildren++;
@@ -702,7 +705,7 @@ mcpHub: this.#mcpHub,
           // The conductor self-persists (design R2): its role, provider
           // selection, and fleet tools all come back across a restart.
           role: meta.role,
-          providerId: this.#resumeProviderId(meta.providerId, meta.sessionId),
+          providerId,
           forkedFrom: meta.forkedFrom,
           worktree: meta.worktree,
           // A collaboration is durable state, not turn state: the goal and
@@ -842,6 +845,8 @@ mcpHub: this.#mcpHub,
   #resumeRoleChild(
     meta: TranscriptMeta,
     goalConfigs: ReadonlyMap<string, CollaborationConfig>,
+    /** The backend the child actually resumes on (`#resumeProviderId`). */
+    providerId: string,
   ):
     | {
         orphaned: boolean;
@@ -879,7 +884,7 @@ mcpHub: this.#mcpHub,
           {
             roleName: role.roleName,
             ordinal: role.ordinal,
-            providerId: meta.providerId ?? CLAUDE_PROVIDER_ID,
+            providerId,
             shape: role.write ? "ship" : "scout",
             write: role.write,
           },
@@ -894,8 +899,12 @@ mcpHub: this.#mcpHub,
       options: {
         ...roleChildPosture(planned, role.parentSessionId, childBrief(collaboration, planned)),
         // The roster's resolved model comes back with the child — same source
-        // (`plannedChildFor`) as the spawn path, so they can't drift.
-        ...(planned.model !== undefined ? { defaultModel: planned.model } : {}),
+        // (`plannedChildFor`) as the spawn path, so they can't drift. Only on
+        // the planned backend: if that is gone and the child resumes on claude,
+        // the planned model belongs to another vendor.
+        ...(planned.model !== undefined && planned.providerId === providerId
+          ? { defaultModel: planned.model }
+          : {}),
         // Re-armed per boot, not persisted: the budget is a per-stretch-of-work
         // allowance, and carrying a spent one across a restart would resume a
         // child with zero turns left.
@@ -1661,32 +1670,29 @@ mcpHub: this.#mcpHub,
         code: "forbidden",
       };
     }
-    // The default backend is only checked at startup, and a bad one refuses
-    // to boot — with the web UI down, recovery then needs a shell. So check
-    // every write that could change the answer against the registry the NEXT
-    // boot would build: the default itself, a backend's own switch or binary
-    // (`providers.*`), or an env key (a backend's API key). Checking the live
-    // registry instead would pass "default pi + disable pi" in one batch and
-    // refuse "enable codex + default codex".
-    const bootProblem = this.#nextBootDefaultProviderProblem(msg.patches);
-    if (bootProblem) {
-      const errors = [{ key: bootProblem.key, message: bootProblem.message }];
-      this.#store.audit(
-        auth.sub,
-        "settings.set",
-        "",
-        `keys=${msg.patches.map((p) => p.key).join(",")} ok=false reason=defaultProvider`,
-      );
-      return {
-        type: "settings.set.result",
-        requestId: msg.id,
-        ok: false,
-        snapshot: { ...getSnapshot(), mcpServers: this.#mcpServerStatuses() },
-        errors,
-        restartRequired: false,
-      };
-    }
     try {
+      // The default backend is only checked at startup, and a bad one refuses
+      // to boot — with the web UI down, recovery then needs a shell. So check
+      // the write against the config the NEXT boot would load, not the live
+      // registry (which would pass "default pi + disable pi" in one batch and
+      // refuse "enable codex + default codex").
+      const bootProblem = this.#nextBootProblem(msg.patches);
+      if (bootProblem) {
+        this.#store.audit(
+          auth.sub,
+          "settings.set",
+          "",
+          `keys=${msg.patches.map((p) => p.key).join(",")} ok=false reason=next-boot`,
+        );
+        return {
+          type: "settings.set.result",
+          requestId: msg.id,
+          ok: false,
+          snapshot: { ...getSnapshot(), mcpServers: this.#mcpServerStatuses() },
+          errors: [bootProblem],
+          restartRequired: false,
+        };
+      }
       const result = applyPatches(msg.patches);
       this.#store.audit(
         auth.sub,
@@ -1713,12 +1719,6 @@ mcpHub: this.#mcpHub,
   }
 
   /**
-   * Why the config these patches leave behind would stop the next boot on its
-   * default backend, or undefined. Skips batches that can't affect it, and a
-   * claude default (always registered). A batch that fails to preview or
-   * parse is left to `applyPatches`, which reports it with its own errors.
-   */
-  /**
    * The backend a resumed session comes back on. Never the registry default:
    * with session.defaultProvider set, that would silently move an existing
    * session onto a backend it never ran on (losing its backing conversation,
@@ -1738,19 +1738,51 @@ mcpHub: this.#mcpHub,
     return CLAUDE_PROVIDER_ID;
   }
 
-  #nextBootDefaultProviderProblem(patches: SettingPatch[]): { key: string; message: string } | undefined {
-    const relevant = patches.filter((p) => {
-      if (p.key === "session.defaultProvider" || p.key.startsWith("providers.")) return true;
-      return fieldByKey(p.key)?.backing === "env";
-    });
+  /**
+   * Why the config these patches leave behind would stop the next boot, or
+   * undefined. Two ways it can: the config no longer loads, or its default
+   * backend can't be built (typo, disabled, binary or API key gone).
+   *
+   * Refuses only what the batch is responsible for. A batch that SETS the
+   * default is always checked — the operator is choosing it, so it must work.
+   * Any other batch is refused only if the config boots now and wouldn't after
+   * it: when the default is already broken (its binary vanished after an
+   * upgrade, say), an unrelated save must still go through, or the one screen
+   * that could repair things refuses every edit and blames the wrong key.
+   *
+   * Only batches that can change the answer are checked: the default itself,
+   * `providers.*`, and env-backed keys (API keys, and env overrides feeding
+   * loadConfig). A batch that can't be previewed (unknown key, unreadable
+   * config.json) is left to `applyPatches`, which rejects it with its own error.
+   */
+  #nextBootProblem(patches: SettingPatch[]): { key: string; message: string } | undefined {
+    const relevant = patches.filter(
+      (p) => p.key === "session.defaultProvider" || p.key.startsWith("providers.") || fieldByKey(p.key)?.backing === "env",
+    );
     if (relevant.length === 0) return undefined;
-    const next = previewPatches(patches);
-    if (!next) return undefined;
+    const after = previewPatches(patches);
+    // A config.json the schema rejects is applyPatches' to report — it does so
+    // per field. What only a load catches is an env override that fails the
+    // re-validation, and that is what #bootProblem is left to find.
+    if (!after || !validateConfigObject(after.raw).ok) return undefined;
+    const problem = this.#bootProblem(after);
+    if (!problem) return undefined;
+    const setsDefault = relevant.find((p) => p.key === "session.defaultProvider");
+    if (!setsDefault) {
+      const before = previewPatches([]);
+      if (!before || this.#bootProblem(before)) return undefined;
+    }
+    // Blame the default when the batch set it, else the patch that broke it.
+    return { key: (setsDefault ?? relevant[0]!).key, message: problem };
+  }
+
+  /** Why a previewed config.json + env would fail the boot, or undefined. */
+  #bootProblem(next: { raw: Record<string, unknown>; env: Record<string, string | undefined> }): string | undefined {
     let config: CodeoidConfig;
     try {
-      config = loadConfig({ raw: next.raw, env: next.env });
-    } catch {
-      return undefined;
+      config = loadConfig({ raw: next.raw, env: next.env, quiet: true });
+    } catch (err) {
+      return err instanceof Error ? err.message : String(err);
     }
     const id = config.session.defaultProvider;
     if (!id || id === CLAUDE_PROVIDER_ID) return undefined;
@@ -1758,11 +1790,8 @@ mcpHub: this.#mcpHub,
       createDefaultProviderRegistry(config, next.env);
       return undefined;
     } catch (err) {
-      if (!(err instanceof DefaultProviderError)) throw err;
-      // Attribute it to the default when the batch set it, else to the patch
-      // that broke an existing default (disabling it, clearing its key).
-      const key = relevant.find((p) => p.key === "session.defaultProvider")?.key ?? relevant[0]!.key;
-      return { key, message: err.message };
+      if (err instanceof DefaultProviderError) return err.message;
+      throw err;
     }
   }
 

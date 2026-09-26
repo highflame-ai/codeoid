@@ -1280,6 +1280,9 @@ export interface LoadOptions {
    * boot, through exactly the path that boot takes.
    */
   raw?: unknown;
+  /** Skip the operator-facing startup warnings — for previews that run on
+   *  every settings write, where repeating them is noise. */
+  quiet?: boolean;
 }
 
 /**
@@ -1413,6 +1416,7 @@ export function loadConfig(opts: LoadOptions = {}): CodeoidConfig {
   // daemon's local identity store would be keyed personal/dev while the minted
   // identities live in the badge's actual tenant — a silent split. Surface it.
   if (
+    !opts.quiet &&
     parsed.agentIdentity.registrarKey !== undefined &&
     parsed.agentIdentity.accountId === "personal" &&
     parsed.agentIdentity.projectId === "dev"
