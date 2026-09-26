@@ -377,7 +377,7 @@ Primary view is the state-grouped list; tree/graph is the co-primary map.
 Resolution is visible and correctable before dispatch; dispatched instructions land in the target session's own transcript.
 
 **Open.**
-Cross-backend `spawn`: today spawns default to Claude and fleet tools are Claude-only — sequencing the daemon work to let the conductor spawn a codex/gemini/pi worker (via the anyagent adapter) is out of P5 scope but gates the full §7 story; when does it land?
+Cross-backend `spawn`: today spawns default to `session.defaultProvider` (Claude unless configured) and fleet tools are Claude-only — sequencing the daemon work to let the conductor spawn a codex/gemini/pi worker (via the anyagent adapter) is out of P5 scope but gates the full §7 story; when does it land?
 Default home: does a user with an active conductor default to the Conductor home or the Sessions home?
 Review-queue merge: how much of the sequenced-merge / conflict-pre-detection lands in P5.4 vs a later slice?
 Normalized "conductor credit": exact conversion model across token / credit / quota / GPU-second wallets.
