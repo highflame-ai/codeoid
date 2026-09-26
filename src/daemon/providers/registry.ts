@@ -22,6 +22,7 @@ import type { McpHub } from "../mcp/hub.js";
 import type { CompressionRegistry } from "../compress/index.js";
 import type { CodeoidConfig } from "../../config.js";
 import type { SessionProvider, CatalogEntry } from "./interface.js";
+import { CLAUDE_PROVIDER_ID } from "../models.js";
 import { ClaudeProvider } from "./claude/index.js";
 import { GeminiProvider } from "./gemini/index.js";
 import { OpenAIProvider } from "./openai/index.js";
@@ -88,7 +89,7 @@ export class ProviderRegistry {
   /** Id used when a session doesn't carry a provider selection. */
   readonly defaultId: string;
 
-  constructor(defaultId = "claude") {
+  constructor(defaultId = CLAUDE_PROVIDER_ID) {
     this.defaultId = defaultId;
   }
 
@@ -157,12 +158,62 @@ export class ProviderRegistry {
 }
 
 /**
+ * A `session.defaultProvider` the daemon cannot honour. Its own class so the
+ * CLI can print it as the operator's config mistake it is — one line, exit 1
+ * — without also swallowing the stack trace of a genuine startup bug.
+ */
+export class DefaultProviderError extends Error {
+  override name = "DefaultProviderError";
+}
+
+/**
+ * Why `id` cannot be this daemon's default backend, or undefined when it can.
+ *
+ * Shared by startup (`createDefaultProviderRegistry`) and the settings write
+ * path, so a value the settings UI accepts is exactly a value the next boot
+ * accepts. A backend codeoid supports but could not activate (binary missing,
+ * no API key) gets its actionable hint; anything else is a typo or a backend
+ * disabled under `providers.<id>.enabled`.
+ */
+export function defaultProviderProblem(registry: ProviderRegistry, id: string): string | undefined {
+  if (registry.has(id)) return undefined;
+  // JSON-quoted: the value is caller-supplied on the settings path, and a
+  // quoted string can't smuggle a newline into a log line.
+  const quoted = JSON.stringify(id);
+  const hint = registry.unavailableHint(id);
+  if (hint) return `session.defaultProvider ${quoted} is not available on this daemon: ${hint}`;
+  const toggle = ENABLE_KEY[id];
+  const fix = toggle ? `It is disabled — set providers.${toggle}.enabled to true.` : "Check the spelling.";
+  return `session.defaultProvider ${quoted} is not a registered backend (registered: ${registry.ids().join(", ")}). ${fix}`;
+}
+
+/** Backend id → its `providers.<key>.enabled` switch, for the ones that have one. */
+const ENABLE_KEY: Record<string, string> = {
+  pi: "pi",
+  codex: "codex",
+  "gemini-cli": "geminiCli",
+  qwen: "qwen",
+};
+
+/**
  * The built-in backends. Daemon startup builds exactly one of these.
  * `config` gates optional backends (pi can be disabled) and carries their
  * settings (binary path); absent = every backend with defaults.
+ *
+ * `config.session.defaultProvider` picks the default backend and is checked
+ * once every backend has registered. It THROWS rather than warns: unlike
+ * `resolve()`'s fallback — which exists so resume survives a session written
+ * by a newer codeoid — a misspelled default is operator error, and falling
+ * back would silently put every new session on a backend they opted out of.
  */
-export function createDefaultProviderRegistry(config?: CodeoidConfig): ProviderRegistry {
-  const registry = new ProviderRegistry("claude");
+export function createDefaultProviderRegistry(
+  config?: CodeoidConfig,
+  /** Where backend keys and binary PATH lookups are read. A parameter so the
+   *  settings path can dry-run the NEXT boot's registry without touching the
+   *  live process env. */
+  env: Record<string, string | undefined> = process.env,
+): ProviderRegistry {
+  const registry = new ProviderRegistry(config?.session?.defaultProvider ?? CLAUDE_PROVIDER_ID);
   registry.register({
     id: "claude",
     displayName: "Claude (Anthropic)",
@@ -189,7 +240,7 @@ export function createDefaultProviderRegistry(config?: CodeoidConfig): ProviderR
   // binary checks below. Without this, forking onto e.g. openai created a
   // session that failed cryptically ("401 Incorrect API key: missing")
   // instead of the option simply not appearing.
-  if (process.env.GOOGLE_API_KEY) {
+  if (env.GOOGLE_API_KEY) {
     registry.register({
       id: "gemini",
       displayName: "Gemini (Google)",
@@ -212,7 +263,7 @@ export function createDefaultProviderRegistry(config?: CodeoidConfig): ProviderR
       "GOOGLE_API_KEY is not set — add it to ~/.codeoid/.env to use the Gemini backend",
     );
   }
-  if (process.env.OPENAI_API_KEY) {
+  if (env.OPENAI_API_KEY) {
     registry.register({
       id: "openai",
       displayName: "OpenAI",
@@ -241,7 +292,7 @@ export function createDefaultProviderRegistry(config?: CodeoidConfig): ProviderR
     // resolution means picking pi can't fail on a missing binary; no
     // resolution means the catalog says "not installed" with the fix.
     const configured = config?.providers?.pi?.command;
-    const resolution = resolvePiCommand(configured === "pi" ? undefined : configured);
+    const resolution = resolvePiCommand(configured === "pi" ? undefined : configured, env);
     if (resolution) {
       registry.register({
         id: "pi",
@@ -271,7 +322,7 @@ export function createDefaultProviderRegistry(config?: CodeoidConfig): ProviderR
   }
   if (config?.providers?.codex?.enabled !== false) {
     const configured = config?.providers?.codex?.command;
-    const resolution = resolveCodexCommand(configured === "codex" ? undefined : configured);
+    const resolution = resolveCodexCommand(configured === "codex" ? undefined : configured, env);
     if (resolution) {
       registry.register({
         id: "codex",
@@ -301,7 +352,7 @@ export function createDefaultProviderRegistry(config?: CodeoidConfig): ProviderR
   }
   if (config?.providers?.geminiCli?.enabled !== false) {
     const configured = config?.providers?.geminiCli?.command;
-    const resolution = resolveGeminiCliCommand(configured === "gemini" ? undefined : configured);
+    const resolution = resolveGeminiCliCommand(configured === "gemini" ? undefined : configured, env);
     if (resolution) {
       registry.register({
         id: "gemini-cli",
@@ -352,5 +403,7 @@ export function createDefaultProviderRegistry(config?: CodeoidConfig): ProviderR
         }),
     });
   }
+  const problem = defaultProviderProblem(registry, registry.defaultId);
+  if (problem) throw new DefaultProviderError(problem);
   return registry;
 }

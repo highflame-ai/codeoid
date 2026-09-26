@@ -131,7 +131,7 @@ It is a real turn (§3.C), not a hidden side channel.
 If you are watching that session in another pane or another client, you will see the conductor-issued turn arrive there.
 
 **Caveat (honest scope).**
-Fleet tools are surfaced only by the Claude provider today, and spawned workers currently default to Claude.
+Fleet tools are surfaced only by the Claude provider today, and spawned workers default to the daemon's default backend (`session.defaultProvider`, Claude unless configured).
 So `send`-to-an-existing-session (the Spark case, where the target already runs its own backend) works now.
 True cross-backend *spawn* is spec-not-shipped; the UI must not over-promise it (§7, §13).
 
@@ -377,7 +377,7 @@ Primary view is the state-grouped list; tree/graph is the co-primary map.
 Resolution is visible and correctable before dispatch; dispatched instructions land in the target session's own transcript.
 
 **Open.**
-Cross-backend `spawn`: today spawns default to Claude and fleet tools are Claude-only — sequencing the daemon work to let the conductor spawn a codex/gemini/pi worker (via the anyagent adapter) is out of P5 scope but gates the full §7 story; when does it land?
+Cross-backend `spawn`: today spawns default to `session.defaultProvider` (Claude unless configured) and fleet tools are Claude-only — sequencing the daemon work to let the conductor spawn a codex/gemini/pi worker (via the anyagent adapter) is out of P5 scope but gates the full §7 story; when does it land?
 Default home: does a user with an active conductor default to the Conductor home or the Sessions home?
 Review-queue merge: how much of the sequenced-merge / conflict-pre-detection lands in P5.4 vs a later slice?
 Normalized "conductor credit": exact conversion model across token / credit / quota / GPU-second wallets.

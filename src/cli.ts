@@ -21,6 +21,7 @@ import { program } from "commander";
 // string to drift). release-smoke asserts these two stay equal.
 import pkg from "../package.json" with { type: "json" };
 import { DaemonServer } from "./daemon/server.js";
+import { DefaultProviderError } from "./daemon/providers/registry.js";
 import { parseRoleSpec } from "./daemon/collaboration.js";
 import { type ModelBinding, roleBindingsFromSpecs } from "./daemon/pipeline/binding.js";
 import {
@@ -99,29 +100,38 @@ program
       };
     }
 
-    const daemon = new DaemonServer({
-      port: bindPort,
-      host: bindHost,
-      dbPath: config.dbPath,
-      transcriptDir: config.transcriptDir,
-      auth: config.auth,
-      localMode,
-      // ZeroID-dependent subsystems are simply not passed in local mode. (The
-      // daemon guards these too — belt and suspenders — so an embedder that
-      // builds its own DaemonConfig gets the same offline guarantee.)
-      oauth: localMode ? undefined : config.oauth,
-      agentIdentity: localMode ? undefined : config.agentIdentity,
-      memory: config.memory?.enabled
-        ? {
-            dbPath: config.memory.dbPath,
-            model: config.memory.model,
-            modelCacheDir: config.memory.modelCacheDir,
-          }
-        : undefined,
-      // Forward the full config so session-level features (compress, etc.)
-      // get the parsed shape rather than re-reading env/file.
-      fullConfig: config,
-    });
+    let daemon: DaemonServer;
+    try {
+      daemon = new DaemonServer({
+        port: bindPort,
+        host: bindHost,
+        dbPath: config.dbPath,
+        transcriptDir: config.transcriptDir,
+        auth: config.auth,
+        localMode,
+        // ZeroID-dependent subsystems are simply not passed in local mode. (The
+        // daemon guards these too — belt and suspenders — so an embedder that
+        // builds its own DaemonConfig gets the same offline guarantee.)
+        oauth: localMode ? undefined : config.oauth,
+        agentIdentity: localMode ? undefined : config.agentIdentity,
+        memory: config.memory?.enabled
+          ? {
+              dbPath: config.memory.dbPath,
+              model: config.memory.model,
+              modelCacheDir: config.memory.modelCacheDir,
+            }
+          : undefined,
+        // Forward the full config so session-level features (compress, etc.)
+        // get the parsed shape rather than re-reading env/file.
+        fullConfig: config,
+      });
+    } catch (err) {
+      // A misconfigured default backend is operator error: say what to fix
+      // and stop. Anything else is a bug and keeps its stack trace.
+      if (!(err instanceof DefaultProviderError)) throw err;
+      console.error(`\n[codeoid] ${err.message}\n`);
+      process.exit(1);
+    }
 
     // ── Register frontends ────────────────────────────────────────
 

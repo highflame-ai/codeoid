@@ -10,6 +10,8 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import {
   createDefaultProviderRegistry,
+  DefaultProviderError,
+  defaultProviderProblem,
   ProviderRegistry,
   type ProviderFactory,
   type ProviderSessionInit,
@@ -104,6 +106,71 @@ describe("ProviderRegistry", () => {
       expect(registry.has(id)).toBe(true);
     }
     expect(registry.defaultId).toBe("claude");
+  });
+
+  // session.defaultProvider (#339). A config literal is enough — the registry
+  // reads only `session.defaultProvider` and `providers.*`.
+  const withDefault = (defaultProvider: string, extra: Record<string, unknown> = {}) =>
+    ({ session: { defaultProvider }, ...extra }) as unknown as Parameters<typeof createDefaultProviderRegistry>[0];
+
+  it("session.defaultProvider makes another backend the default", () => {
+    const registry = createDefaultProviderRegistry(withDefault("qwen"));
+    expect(registry.defaultId).toBe("qwen");
+    // A session carrying no provider selection lands on it.
+    expect(registry.resolve(undefined, "test").id).toBe("qwen");
+  });
+
+  it("a misspelled defaultProvider fails startup instead of reverting to claude", () => {
+    // Its own class, so the CLI prints it as a config mistake, not a crash.
+    expect(() => createDefaultProviderRegistry(withDefault("claud"))).toThrow(DefaultProviderError);
+    expect(() => createDefaultProviderRegistry(withDefault("claud"))).toThrow(
+      /session\.defaultProvider "claud" is not a registered backend \(registered: claude,/,
+    );
+  });
+
+  it("a disabled defaultProvider fails startup and names the switch", () => {
+    expect(() =>
+      createDefaultProviderRegistry(withDefault("pi", { providers: { pi: { enabled: false, command: "pi" } } })),
+    ).toThrow(/"pi" is not a registered backend .*It is disabled — set providers\.pi\.enabled to true\./);
+  });
+
+  it("names the real switch for a backend whose config key differs from its id", () => {
+    expect(() =>
+      createDefaultProviderRegistry(
+        withDefault("gemini-cli", { providers: { geminiCli: { enabled: false, command: "gemini" } } }),
+      ),
+    ).toThrow(/set providers\.geminiCli\.enabled to true/);
+  });
+
+  it("does not suggest a switch for an id that is simply unknown", () => {
+    let message = "";
+    try {
+      createDefaultProviderRegistry(withDefault("claud"));
+    } catch (e) {
+      message = (e as Error).message;
+    }
+    expect(message).toMatch(/Check the spelling\.$/);
+    expect(message).not.toContain("providers.claud");
+  });
+
+  it("reads backend keys from the env it is given, not process.env", () => {
+    // Keys deleted from process.env by beforeEach; the dry-run env has one.
+    const registry = createDefaultProviderRegistry(withDefault("openai"), { ...process.env, OPENAI_API_KEY: "sk-test" });
+    expect(registry.defaultId).toBe("openai");
+  });
+
+  it("an unavailable defaultProvider fails startup with that backend's own hint", () => {
+    // Keys deleted by beforeEach, so openai is supported but not activatable.
+    expect(() => createDefaultProviderRegistry(withDefault("openai"))).toThrow(
+      /"openai" is not available on this daemon: .*OPENAI_API_KEY/,
+    );
+  });
+
+  it("defaultProviderProblem accepts exactly the registered backends", () => {
+    const registry = createDefaultProviderRegistry();
+    expect(defaultProviderProblem(registry, "claude")).toBeUndefined();
+    expect(defaultProviderProblem(registry, "qwen")).toBeUndefined();
+    expect(defaultProviderProblem(registry, "nope")).toMatch(/not a registered backend/);
   });
 
   it("config can disable the pi backend", () => {

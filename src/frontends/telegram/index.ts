@@ -806,9 +806,14 @@ export class TelegramFrontend implements Frontend {
     }
     const arg = ctx.message?.text?.split(/\s+/)[1];
     if (!arg) {
-      // No argument → list the live model catalog.
+      // No argument → list the attached session's catalog. Omitting the
+      // provider would list the daemon DEFAULT backend's models, which are
+      // the wrong ones for a session on any other backend.
+      const provider = state.attachedSessionName
+        ? this.#manager.findByName(state.attachedSessionName, state.auth!)?.providerId
+        : undefined;
       const resp = await this.#manager.handle(
-        { type: "models.list", id: randomUUID() },
+        { type: "models.list", id: randomUUID(), ...(provider ? { provider } : {}) },
         state.auth!,
         this.#makeClient(state, ctx),
       );

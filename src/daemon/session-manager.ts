@@ -15,13 +15,14 @@ import { Session, type AttachedClient, type WindowScope } from "./session.js";
 import { type CatalogEntry, isPlaceholderModel, type SessionProvider } from "./providers/interface.js";
 import {
   createDefaultProviderRegistry,
+  DefaultProviderError,
   type ProviderRegistry,
 } from "./providers/registry.js";
 import type { HookBus } from "./hooks/bus.js";
 import type { Store } from "./store.js";
 import { createPushTransport, PushService } from "./push/index.js";
 import { hasScope, SCOPES } from "../protocol/scopes.js";
-import { applyPatches, getManifest, getSnapshot } from "./settings/store.js";
+import { applyPatches, getManifest, getSnapshot, previewPatches } from "./settings/store.js";
 import { BackendLoginBroker, BackendLoginError, redact } from "./auth/backend-login.js";
 import { RateLimiter } from "./rate-limit.js";
 import type { TranscriptMeta, TranscriptStore } from "./transcript.js";
@@ -107,7 +108,7 @@ import type { DispatchEventRow, DispatchTaskRow } from "./store.js";
 import { type MemoryEngine, type MemoryMcpMount, workspaceIdFromPath } from "./memory/index.js";
 import type { McpRegistry } from "./mcp/registry.js";
 import type { McpHub } from "./mcp/hub.js";
-import { type CodeoidConfig, mutateConfigFile } from "../config.js";
+import { type CodeoidConfig, DEFAULT_PROVIDER_ENV, loadConfig, mutateConfigFile, validateConfigObject } from "../config.js";
 import type { CompressionRegistry } from "./compress/index.js";
 import { ORCHESTRATOR_ROLE } from "../protocol/types.js";
 import type {
@@ -127,6 +128,7 @@ import type {
   SessionInfo,
   SessionMode,
   SessionWorktree,
+  SettingPatch,
 } from "../protocol/types.js";
 import type { Scope } from "../protocol/scopes.js";
 import type { PipelineState } from "./pipeline/interface.js";
@@ -296,12 +298,6 @@ const RESUME_DEADLINE_MS = 20_000;
  * 20 MiB / 5000 messages — parsing history past that would be evicted on
  * arrival, so cap the read slightly above the scrollback byte cap. */
 const RESUME_TRANSCRIPT_MAX_BYTES = 24 * 1024 * 1024;
-
-/** Provider assumed when a client doesn't say which catalog it wants.
- *  Re-exported from models.ts so the id that gates Claude-only alias
- *  expansion (`resolveModelIdForProvider`) and the id used for catalog
- *  defaults can never drift apart. */
-export const DEFAULT_PROVIDER_ID = CLAUDE_PROVIDER_ID;
 
 /** Sort key for resume ordering: most-recently-active first. Falls back to
  * createdAt, then 0, so a malformed timestamp never throws. */
@@ -664,7 +660,10 @@ export class SessionManager {
         // Role-children need their restrictions rebuilt BEFORE construction —
         // worker shape and capability role are constructor inputs, not things
         // that can be attached afterwards.
-        const child = this.#resumeRoleChild(meta, goalConfigs);
+        // Resolved once: the role posture and the session must agree on the
+        // backend, including when the persisted one is no longer available.
+        const providerId = this.#resumeProviderId(meta.providerId, meta.sessionId);
+        const child = this.#resumeRoleChild(meta, goalConfigs, providerId);
         if (child) {
           if (child.orphaned) orphanedChildren++;
           else resumedChildren++;
@@ -705,7 +704,7 @@ mcpHub: this.#mcpHub,
           // The conductor self-persists (design R2): its role, provider
           // selection, and fleet tools all come back across a restart.
           role: meta.role,
-          providerId: meta.providerId,
+          providerId,
           forkedFrom: meta.forkedFrom,
           worktree: meta.worktree,
           // A collaboration is durable state, not turn state: the goal and
@@ -845,6 +844,8 @@ mcpHub: this.#mcpHub,
   #resumeRoleChild(
     meta: TranscriptMeta,
     goalConfigs: ReadonlyMap<string, CollaborationConfig>,
+    /** The backend the child actually resumes on (`#resumeProviderId`). */
+    providerId: string,
   ):
     | {
         orphaned: boolean;
@@ -882,7 +883,7 @@ mcpHub: this.#mcpHub,
           {
             roleName: role.roleName,
             ordinal: role.ordinal,
-            providerId: meta.providerId ?? "claude",
+            providerId,
             shape: role.write ? "ship" : "scout",
             write: role.write,
           },
@@ -897,8 +898,12 @@ mcpHub: this.#mcpHub,
       options: {
         ...roleChildPosture(planned, role.parentSessionId, childBrief(collaboration, planned)),
         // The roster's resolved model comes back with the child — same source
-        // (`plannedChildFor`) as the spawn path, so they can't drift.
-        ...(planned.model !== undefined ? { defaultModel: planned.model } : {}),
+        // (`plannedChildFor`) as the spawn path, so they can't drift. Only on
+        // the planned backend: if that is gone and the child resumes on claude,
+        // the planned model belongs to another vendor.
+        ...(planned.model !== undefined && planned.providerId === providerId
+          ? { defaultModel: planned.model }
+          : {}),
         // Re-armed per boot, not persisted: the budget is a per-stretch-of-work
         // allowance, and carrying a spent one across a restart would resume a
         // child with zero turns left.
@@ -1551,7 +1556,8 @@ mcpHub: this.#mcpHub,
     const persisted = this.#persistedModels(providerId);
     if (persisted) return { models: persisted, live: false };
     return {
-      models: providerId === DEFAULT_PROVIDER_ID ? fallbackModelInfos() : [],
+      // The built-in fallback is Claude's catalog, whatever the default is.
+      models: providerId === CLAUDE_PROVIDER_ID ? fallbackModelInfos() : [],
       live: false,
     };
   }
@@ -1574,7 +1580,8 @@ mcpHub: this.#mcpHub,
   #modelsList(
     msg: Extract<ClientMessage, { type: "models.list" }>,
   ): DaemonMessage {
-    const provider = msg.provider ?? DEFAULT_PROVIDER_ID;
+    // No provider = the catalog of the backend a new session would land on.
+    const provider = msg.provider ?? this.#providers.defaultId;
     const { models, live } = this.#currentModels(provider);
     return { type: "models.list.result", requestId: msg.id, models, live, provider };
   }
@@ -1663,6 +1670,29 @@ mcpHub: this.#mcpHub,
       };
     }
     try {
+      // A config the next boot rejects — one that no longer loads, or whose
+      // default backend can't be built — takes the daemon down, and with the
+      // web UI down recovery needs a shell. So every write is checked against
+      // the config the NEXT boot would load (not the live registry, which
+      // would pass "default pi + disable pi" and refuse "enable codex +
+      // default codex"). See #nextBootProblem.
+      const bootProblem = this.#nextBootProblem(msg.patches);
+      if (bootProblem) {
+        this.#store.audit(
+          auth.sub,
+          "settings.set",
+          "",
+          `keys=${msg.patches.map((p) => p.key).join(",")} ok=false reason=next-boot`,
+        );
+        return {
+          type: "settings.set.result",
+          requestId: msg.id,
+          ok: false,
+          snapshot: { ...getSnapshot(), mcpServers: this.#mcpServerStatuses() },
+          errors: [bootProblem],
+          restartRequired: false,
+        };
+      }
       const result = applyPatches(msg.patches);
       this.#store.audit(
         auth.sub,
@@ -1685,6 +1715,123 @@ mcpHub: this.#mcpHub,
         error: err instanceof Error ? err.message : String(err),
         code: "internal",
       };
+    }
+  }
+
+  /**
+   * The backend a resumed session comes back on. Never the registry default:
+   * with session.defaultProvider set, that would silently move an existing
+   * session onto a backend it never ran on (losing its backing conversation,
+   * and possibly landing on a weaker approval gate).
+   *
+   * - absent → claude: the meta predates providers, so it IS a claude session.
+   * - no longer registered (key removed, backend disabled, a newer codeoid's
+   *   id) → claude, loudly — the same backend it fell back to before the
+   *   default was configurable.
+   */
+  #resumeProviderId(persisted: string | undefined, sessionId: string): string {
+    if (persisted === undefined) return CLAUDE_PROVIDER_ID;
+    if (this.#providers.has(persisted)) return persisted;
+    console.warn(
+      `[codeoid/resume] session ${sessionId} ran on "${persisted}", which is not available now — resuming it on ${CLAUDE_PROVIDER_ID}`,
+    );
+    return CLAUDE_PROVIDER_ID;
+  }
+
+  /**
+   * Why the config these patches leave behind would stop the next boot, or
+   * undefined. Two ways it can: the config no longer loads (every batch is
+   * checked — a value can be valid alone and fail against an env override,
+   * like a timeout saved here against a stall timeout set in .env), or its
+   * default backend can't be built (typo, disabled, binary or API key gone).
+   *
+   * Refuses only what the batch is responsible for. A default the batch SETS
+   * is always checked, on its own as well as in the merged config — the
+   * operator is choosing it, and an env override masking a typo today would
+   * stop a later boot once the override goes. Anything else is refused only
+   * if the config boots now and wouldn't after the batch: when it is already
+   * broken (the default's binary vanished after an upgrade, say), an
+   * unrelated save must still go through, or the one screen that could
+   * repair things refuses every edit and blames the wrong key.
+   *
+   * A batch that can't be previewed (unknown key, unreadable config.json) or
+   * whose config.json the schema rejects is left to `applyPatches`, which
+   * rejects it with its own, per-field errors.
+   */
+  #nextBootProblem(patches: SettingPatch[]): { key: string; message: string } | undefined {
+    if (patches.length === 0) return undefined;
+    const after = previewPatches(patches);
+    if (!after || !validateConfigObject(after.raw).ok) return undefined;
+
+    const setsDefault = patches.find(
+      (p) => p.key === "session.defaultProvider" && typeof p.value === "string" && p.value.trim() !== "",
+    );
+    if (setsDefault) {
+      // The chosen value itself, with no env override in front of it: that
+      // covers a bad value and a clash within the batch. A problem only the
+      // override has (its backend gone) isn't this batch's doing, so it goes
+      // through the before/after rule below like anything else.
+      const { [DEFAULT_PROVIDER_ENV]: _masked, ...unmasked } = after.env;
+      const problem = this.#bootProblem({ raw: after.raw, env: unmasked });
+      if (problem?.kind === "provider") return { key: setsDefault.key, message: problem.message };
+    }
+
+    const problem = this.#bootProblem(after);
+    if (!problem) return undefined;
+    let brokenAlready: boolean;
+    try {
+      const before = previewPatches([]);
+      brokenAlready = !before || this.#bootProblem(before) !== undefined;
+    } catch {
+      // Can't tell whether the current config boots: don't let that block
+      // every save — treat it as already broken and let the batch through.
+      brokenAlready = true;
+    }
+    if (brokenAlready) return undefined;
+    return { key: this.#culpritKey(patches), message: problem.message };
+  }
+
+  /**
+   * Which key a refused batch is shown under. The web drawer renders an error
+   * only beside the field whose key matches — and sends edits from every tab
+   * in one batch — so blaming the wrong field hides the error entirely. The
+   * culprit is the patch whose removal makes the next boot work; with none
+   * (or several needed together), `""`, which the drawer shows in its save bar.
+   */
+  #culpritKey(patches: SettingPatch[]): string {
+    if (patches.length === 1) return patches[0]!.key;
+    for (const p of patches) {
+      const without = previewPatches(patches.filter((q) => q !== p));
+      try {
+        if (without && !this.#bootProblem(without)) return p.key;
+      } catch {
+        // Unknown for this patch — try the next.
+      }
+    }
+    return "";
+  }
+
+  /** Why a previewed config.json + env would fail the boot, or undefined. */
+  #bootProblem(next: {
+    raw: Record<string, unknown>;
+    env: Record<string, string | undefined>;
+  }): { kind: "load" | "provider"; message: string } | undefined {
+    let config: CodeoidConfig;
+    try {
+      config = loadConfig({ raw: next.raw, env: next.env, quiet: true });
+    } catch (err) {
+      // Redacted: it's returned to the caller, and a secret pasted into the
+      // wrong numeric env var would otherwise come back in "got \"…\"".
+      return { kind: "load", message: redact(err instanceof Error ? err.message : String(err)) };
+    }
+    const id = config.session.defaultProvider;
+    if (!id || id === CLAUDE_PROVIDER_ID) return undefined;
+    try {
+      createDefaultProviderRegistry(config, next.env);
+      return undefined;
+    } catch (err) {
+      if (err instanceof DefaultProviderError) return { kind: "provider", message: err.message };
+      throw err;
     }
   }
 
@@ -2405,7 +2552,7 @@ mcpHub: this.#mcpHub,
           code: "invalid_request",
         };
       }
-      const forProvider = providerId ?? DEFAULT_PROVIDER_ID;
+      const forProvider = providerId ?? this.#providers.defaultId;
       const resolved = resolveModelIdForProvider(msg.model, forProvider);
       if (!resolved) {
         return {
@@ -2450,7 +2597,7 @@ mcpHub: this.#mcpHub,
             code: "invalid_request",
           };
         }
-        const targetProvider = resolved.provider ?? providerId ?? DEFAULT_PROVIDER_ID;
+        const targetProvider = resolved.provider ?? providerId ?? this.#providers.defaultId;
         // A chain-resolved model goes through the SAME provider-aware
         // validation as an explicit --model — but SKIPS with a warning rather
         // than hard-failing the create: the operator never typed this id, so a
@@ -3311,8 +3458,10 @@ mcpHub: this.#mcpHub,
     mkdirSync(workdir, { recursive: true });
 
     const conductorConfig = this.#config?.conductor;
-    const providerId = conductorConfig?.provider ?? DEFAULT_PROVIDER_ID;
-    if (providerId !== "claude") {
+    // Deliberately NOT session.defaultProvider: the conductor needs the fleet
+    // MCP tools, which only the claude provider mounts today.
+    const providerId = conductorConfig?.provider ?? CLAUDE_PROVIDER_ID;
+    if (providerId !== CLAUDE_PROVIDER_ID) {
       console.warn(
         `[codeoid] conductor provider is "${providerId}" — MCP fleet tools are only surfaced by the claude provider today; the conductor will chat but cannot see the fleet`,
       );
@@ -4560,7 +4709,7 @@ mcpHub: this.#mcpHub,
         // IdForProvider(...)`, which read as strict validation but could never
         // reject anything — the fallback's last branch returns the input
         // unchanged. The dead branch is gone; only the real rule remains.
-        const providerId = provider ?? DEFAULT_PROVIDER_ID;
+        const providerId = provider ?? this.#providers.defaultId;
         const { models } = this.#currentModels(providerId);
         const canonical =
           models.length > 0 ? resolveAgainstList(model, models) : null;
@@ -4572,7 +4721,10 @@ mcpHub: this.#mcpHub,
             error: `Model "${model}" is not valid for provider "${providerId}". Omit \`model\` to use the provider's default.`,
           };
         }
-        return { ok: true, provider, model: resolved };
+        // Pin the backend the model was validated against. Left unset, the
+        // task would spawn on whatever the default is at CLAIM time — after a
+        // default change and restart, a codex model on a claude worker.
+        return { ok: true, provider: providerId, model: resolved };
       },
       enqueuePanel: (input) =>
         this.#dispatcher.enqueueGroup({

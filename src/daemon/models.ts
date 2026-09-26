@@ -117,11 +117,13 @@ export function resolveModelId(identifier: string): string | null {
 export const DEFAULT_MODEL_ALIAS = "opus";
 
 /**
- * The provider id whose model space this catalog describes. Must match the
- * default id the provider registry is built with
- * (`createDefaultProviderRegistry` → `new ProviderRegistry("claude")`);
- * `DEFAULT_PROVIDER_ID` in session-manager re-exports this so there is one
- * source of truth.
+ * The provider id whose model space this catalog (and `DEFAULT_MODEL_ALIAS`)
+ * describes. It is also the registry's default when `session.defaultProvider`
+ * is unset — but only that: the configured default can be any backend, so
+ * code asking "which backend will this session run on?" reads
+ * `ProviderRegistry.defaultId`, and code asking "is this Claude?" compares
+ * against this constant. Conflating the two is how a non-Claude default ends
+ * up validated against Claude's catalog.
  */
 export const CLAUDE_PROVIDER_ID = "claude";
 

@@ -2169,6 +2169,49 @@ describe("collaboration survives a daemon restart", () => {
     ).toEqual(["reasoning#1", "review#1", "review#2"]);
   });
 
+  test("a child whose backend is gone resumes on claude without the other vendor's model", async () => {
+    // The planned model belongs to the planned backend. If that backend is not
+    // available after the restart, the child resumes on claude — and must not
+    // carry a gemini model id into a Claude session.
+    manager.setBlackboardUrl(BLACKBOARD_URL);
+    const resp = await run({
+      type: "session.create",
+      id: "rsg",
+      name: "rsg",
+      workdir,
+      collaboration: {
+        goal: "backend disappears",
+        roles: [
+          { name: "orchestrator", providerId: "claude" },
+          { name: "review", providerId: "gemini", model: "gemini-2.5-pro" },
+        ],
+      },
+    });
+    if (resp.type !== "response.ok") throw new Error(`create failed: ${JSON.stringify(resp)}`);
+    const parent = resp.data as SessionInfo;
+    const [before] = childrenOf(await allSessions(), parent.id);
+    expect(before!.providerId).toBe("gemini");
+    expect(before!.model).toBe("gemini-2.5-pro");
+
+    await manager.drain(3_000);
+    await Bun.sleep(150);
+    const claudeOnly = new ProviderRegistry("claude");
+    claudeOnly.register({ id: "claude", displayName: "claude", create: () => new MockSessionProvider("claude", []) });
+    const next = new SessionManager(
+      new Store(join(tmp, "codeoid.db")),
+      new TranscriptStore(join(tmp, "transcripts")),
+      undefined, undefined, undefined,
+      { config: mkConfig(), providers: claudeOnly },
+    );
+    next.setBlackboardUrl(BLACKBOARD_URL);
+    await next.resumeSessions();
+    manager = next;
+
+    const [after] = childrenOf(await listFrom(next), parent.id);
+    expect(after!.providerId).toBe("claude");
+    expect(after!.model).not.toBe("gemini-2.5-pro");
+  });
+
   test("write authority is restored per role, not uniformly", async () => {
     const parent = await createGoal("rs2");
     const kids = childrenOf(await listFrom(await restart()), parent.id);
