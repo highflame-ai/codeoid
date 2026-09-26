@@ -336,6 +336,40 @@ describe("settings.set session.defaultProvider", () => {
     expect(res.ok).toBe(true);
   });
 
+  it("files a multi-key refusal under the key that caused it", async () => {
+    // The drawer sends every tab's edits in one batch and shows an error only
+    // beside the matching field — blaming the first key would hide it.
+    expect((await setBatch([{ key: "session.defaultProvider", value: "pi" }])).ok).toBe(true);
+    const res = await setBatch([
+      { key: "session.defaultModel", value: "sonnet" },
+      { key: "providers.pi.enabled", value: false },
+    ]);
+    expect(res.ok).toBe(false);
+    expect(res.errors[0]).toMatchObject({ key: "providers.pi.enabled" });
+  });
+
+  it("files it under no field when no single key is to blame", async () => {
+    // Each change alone breaks pi, so dropping either one still leaves the
+    // boot broken — no single field is the fix, so the save bar gets it.
+    expect((await setBatch([{ key: "session.defaultProvider", value: "pi" }])).ok).toBe(true);
+    const res = await setBatch([
+      { key: "providers.pi.command", value: "/nonexistent/pi" },
+      { key: "providers.pi.enabled", value: false },
+    ]);
+    expect(res.ok).toBe(false);
+    expect(res.errors[0]).toMatchObject({ key: "" });
+  });
+
+  it("does not refuse a valid default because the env override's backend broke", async () => {
+    // CODEOID_DEFAULT_PROVIDER names pi, whose binary is gone: the next boot
+    // fails either way, and saving claude to config.json didn't cause that.
+    brokenDefault();
+    process.env.CODEOID_DEFAULT_PROVIDER = "pi";
+    const res = await setBatch([{ key: "session.defaultProvider", value: "claude" }]);
+    expect(res.errors).toEqual([]);
+    expect(res.ok).toBe(true);
+  });
+
   it("records a refused write in the audit log", async () => {
     await set("claud");
     // Store has no audit-read API on purpose; read the table directly.

@@ -1670,11 +1670,12 @@ mcpHub: this.#mcpHub,
       };
     }
     try {
-      // The default backend is only checked at startup, and a bad one refuses
-      // to boot — with the web UI down, recovery then needs a shell. So check
-      // the write against the config the NEXT boot would load, not the live
-      // registry (which would pass "default pi + disable pi" in one batch and
-      // refuse "enable codex + default codex").
+      // A config the next boot rejects — one that no longer loads, or whose
+      // default backend can't be built — takes the daemon down, and with the
+      // web UI down recovery needs a shell. So every write is checked against
+      // the config the NEXT boot would load (not the live registry, which
+      // would pass "default pi + disable pi" and refuse "enable codex +
+      // default codex"). See #nextBootProblem.
       const bootProblem = this.#nextBootProblem(msg.patches);
       if (bootProblem) {
         this.#store.audit(
@@ -1766,12 +1767,13 @@ mcpHub: this.#mcpHub,
       (p) => p.key === "session.defaultProvider" && typeof p.value === "string" && p.value.trim() !== "",
     );
     if (setsDefault) {
-      // The chosen value itself, with no env override in front of it.
+      // The chosen value itself, with no env override in front of it: that
+      // covers a bad value and a clash within the batch. A problem only the
+      // override has (its backend gone) isn't this batch's doing, so it goes
+      // through the before/after rule below like anything else.
       const { [DEFAULT_PROVIDER_ENV]: _masked, ...unmasked } = after.env;
-      for (const env of [after.env, unmasked]) {
-        const problem = this.#bootProblem({ raw: after.raw, env });
-        if (problem?.kind === "provider") return { key: setsDefault.key, message: problem.message };
-      }
+      const problem = this.#bootProblem({ raw: after.raw, env: unmasked });
+      if (problem?.kind === "provider") return { key: setsDefault.key, message: problem.message };
     }
 
     const problem = this.#bootProblem(after);
@@ -1786,7 +1788,27 @@ mcpHub: this.#mcpHub,
       brokenAlready = true;
     }
     if (brokenAlready) return undefined;
-    return { key: patches[0]!.key, message: problem.message };
+    return { key: this.#culpritKey(patches), message: problem.message };
+  }
+
+  /**
+   * Which key a refused batch is shown under. The web drawer renders an error
+   * only beside the field whose key matches — and sends edits from every tab
+   * in one batch — so blaming the wrong field hides the error entirely. The
+   * culprit is the patch whose removal makes the next boot work; with none
+   * (or several needed together), `""`, which the drawer shows in its save bar.
+   */
+  #culpritKey(patches: SettingPatch[]): string {
+    if (patches.length === 1) return patches[0]!.key;
+    for (const p of patches) {
+      const without = previewPatches(patches.filter((q) => q !== p));
+      try {
+        if (without && !this.#bootProblem(without)) return p.key;
+      } catch {
+        // Unknown for this patch — try the next.
+      }
+    }
+    return "";
   }
 
   /** Why a previewed config.json + env would fail the boot, or undefined. */
@@ -1798,7 +1820,9 @@ mcpHub: this.#mcpHub,
     try {
       config = loadConfig({ raw: next.raw, env: next.env, quiet: true });
     } catch (err) {
-      return { kind: "load", message: err instanceof Error ? err.message : String(err) };
+      // Redacted: it's returned to the caller, and a secret pasted into the
+      // wrong numeric env var would otherwise come back in "got \"…\"".
+      return { kind: "load", message: redact(err instanceof Error ? err.message : String(err)) };
     }
     const id = config.session.defaultProvider;
     if (!id || id === CLAUDE_PROVIDER_ID) return undefined;
