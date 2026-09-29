@@ -85,6 +85,7 @@ import {
   withMcpToolTimeout,
   buildAgentEnv,
   skillCommandAllowRules,
+  decodeStderrEntities,
   skillSandboxDirs,
   packPluginsOption,
   pluginSkillDirs,
@@ -637,6 +638,50 @@ describe("skillCommandAllowRules", () => {
     expect(skillCommandAllowRules([join(tmpdir(), "codeoid-absent-dir")])).toEqual([]);
     rmSync(tmp, { recursive: true, force: true });
   });
+
+  // The stderr payload the SDK delivers is HTML-escaped, so a declared command
+  // containing `>` arrives as `&gt;`. `#tryHandleSkillBlock` keys the persisted
+  // grant on that stderr, while this function recomputes the rule from
+  // `SKILL.md` — the two must be the SAME string, or the approval never reaches
+  // `allowedTools` (#233).
+  it("agrees with the grant key decoded from an escaped stderr", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "codeoid-skills-"));
+    write(tmp, "esc", "---\nname: esc\n---\n!`sh x.sh 2>/dev/null || sh y.sh`\n");
+
+    const declared = skillCommandAllowRules([tmp]);
+    // What `#tryHandleSkillBlock` sees on the stderr channel, decoded by the
+    // same helper before it becomes the stored key.
+    const stored = `Bash(${decodeStderrEntities("sh x.sh 2&gt;/dev/null || sh y.sh")})`;
+    expect(declared).toContain(stored);
+    rmSync(tmp, { recursive: true, force: true });
+  });
+});
+
+describe("decodeStderrEntities", () => {
+  it("decodes the entities the SDK emits on the stderr channel", () => {
+    expect(decodeStderrEntities("sh x 2&gt;/dev/null")).toBe("sh x 2>/dev/null");
+    expect(decodeStderrEntities("echo &quot;a&quot; &amp; b &#39;c&#39; &lt;d&gt;")).toBe(
+      `echo "a" & b 'c' <d>`,
+    );
+  });
+
+  // `&apos;` is the XML-named form of `&#39;`; not emitted today, but decoding
+  // both keeps a future encoder change from silently reintroducing the mismatch.
+  it("decodes both spellings of the apostrophe", () => {
+    expect(decodeStderrEntities("echo &apos;a&apos;")).toBe("echo 'a'");
+    expect(decodeStderrEntities("echo &#39;a&#39;")).toBe("echo 'a'");
+  });
+
+  // `&amp;gt;` is the escaped form of the literal text `&gt;`, not of `>`.
+  // Decoding `&amp;` first would collapse it to `>` — over-decoding a command
+  // into one that was never declared, i.e. granting the wrong thing.
+  it("decodes `&` last, so a doubly-escaped entity is not decoded twice", () => {
+    expect(decodeStderrEntities("&amp;gt;")).toBe("&gt;");
+  });
+
+  it("leaves an unescaped command untouched", () => {
+    expect(decodeStderrEntities("sh gate.sh")).toBe("sh gate.sh");
+  });
 });
 
 // Park-and-retry: a blocked skill command must NOT fail the turn (that killed the
@@ -883,6 +928,55 @@ describe("ClaudeProvider – skill-command approval (#233)", () => {
     // Falls through to the normal zero-turn backstop error.
     const done = events.find((e) => e.type === "turn_done") as Extract<ProviderEvent, { type: "turn_done" }>;
     expect(done.result.isError).toBe(true);
+    await provider.teardown?.();
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  // #233, the escaped-key half. A declared command containing `>` arrives on the
+  // stderr channel as `&gt;`. If the grant is persisted under that escaped
+  // spelling it never equals the rule recomputed from `SKILL.md`, so the retry
+  // is refused again. Survivable by luck alone: a turn that happens to run other
+  // tools first is non-zero and never reaches the zero-turn backstop — which is
+  // why the same bug looked flaky in the field and not total.
+  it("grants an escaped command across the rebuild, instead of silently re-blocking", async () => {
+    const tmp = skillDir("---\nname: s\n---\n!`sh x.sh 2>/dev/null || sh y.sh`\n");
+    const { store, writes } = statefulStore();
+    const provider = new ClaudeProvider({ sessionId: "e", initialBackingId: "b", workspaceId: "ws", store });
+
+    // The blocked pattern as the SDK reports it — HTML-escaped.
+    sdkMessages = [blockFor("sh x.sh 2&gt;/dev/null || sh y.sh"), zeroTurn];
+    queryCallCount = 0;
+    let release!: () => void;
+    sdkGate = new Promise<void>((r) => { release = r; });
+
+    const run = provider.runTurn({
+      history: [], userMessage: "/spec", workdir: tmp,
+      canUseTool: async () => ({ behavior: "allow" as const }),
+      requestUserInput: async () => {
+        sdkMessages = [
+          { type: "assistant", message: { content: [{ type: "text", text: "done" }] }, parent_tool_use_id: null },
+          { type: "result", subtype: "success", is_error: false, num_turns: 1, result: "done", modelUsage: {} },
+        ];
+        return { confirmed: true, cancelled: false };
+      },
+    });
+
+    const events: ProviderEvent[] = [];
+    const drain = (async () => { for await (const e of run.events) events.push(e); })();
+    await Bun.sleep(20);
+    release();
+    await drain;
+
+    // The stored key is the DECODED command, so it equals the declared rule...
+    expect(writes).toEqual([["Bash(sh x.sh 2>/dev/null || sh y.sh)", true]]);
+    // ...the rebuilt loop carries that rule, NOT the escaped spelling...
+    const retryAllowed = ((capturedQueryOpts?.options ?? {}) as { allowedTools?: string[] }).allowedTools ?? [];
+    expect(retryAllowed).toContain("Bash(sh x.sh 2>/dev/null || sh y.sh)");
+    expect(retryAllowed.some((r) => r.includes("&gt;"))).toBe(false);
+    // ...so the retry runs instead of hitting the zero-turn backstop.
+    const done = events.find((e) => e.type === "turn_done") as Extract<ProviderEvent, { type: "turn_done" }>;
+    expect(done.result.isError).toBeFalsy();
+
     await provider.teardown?.();
     rmSync(tmp, { recursive: true, force: true });
   });

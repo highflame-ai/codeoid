@@ -1507,9 +1507,9 @@ export function translateSDKMessage(
         // user message, NOT as an error. Stash it so a resulting zero-turn run
         // can report the real cause instead of "no assistant turn ran".
         if (typeof content === "string" && content.includes("<local-command-stderr>")) {
-          state.lastLocalCommandStderr = content
-            .replace(/<\/?local-command-stderr>/g, "")
-            .trim();
+          state.lastLocalCommandStderr = decodeStderrEntities(
+            content.replace(/<\/?local-command-stderr>/g, "").trim(),
+          );
           break;
         }
         // tool_result blocks — close the matching tool call with real output.
@@ -1597,6 +1597,30 @@ export function skillSandboxDirs(skillsDirs: string[]): string[] {
     }
   }
   return [...dirs];
+}
+
+/**
+ * Decode the HTML entities the SDK uses in `<local-command-stderr>`.
+ *
+ * The stderr payload carrying a blocked skill command is HTML-escaped on that
+ * channel, so a declaration like `` !`sh x 2>/dev/null` `` arrives as
+ * `sh x 2&gt;/dev/null`. The rule recomputed from `SKILL.md` is the bare form,
+ * and the two are compared by exact string equality, so decoding here is what
+ * makes the approved command equal the declared one (#233). The set is closed
+ * and small: `&` is decoded LAST so a doubly-escaped `&amp;gt;` resolves to
+ * `&gt;` rather than being decoded twice into `>`. Both spellings of the
+ * apostrophe are handled — `&apos;` is the XML-named form of `&#39;` and is not
+ * emitted today, but decoding it costs nothing and keeps a future encoder
+ * change from silently reintroducing the same mismatch.
+ */
+export function decodeStderrEntities(s: string): string {
+  return s
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, "&");
 }
 
 /**
