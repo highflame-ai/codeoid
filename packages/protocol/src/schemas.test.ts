@@ -139,6 +139,13 @@ const samples: { [T in ClientTypes]: Extract<ClientMessage, { type: T }> } = {
     id: "r27",
     loginId: "11111111-2222-3333-4444-555555555555",
   },
+  "mcp.oauth.begin": { type: "mcp.oauth.begin", id: "r90", server: "notion" },
+  "mcp.oauth.complete": {
+    type: "mcp.oauth.complete",
+    id: "r91",
+    callbackUrl: "http://127.0.0.1:7400/mcp/oauth/callback?code=c&state=s",
+  },
+  "mcp.oauth.disconnect": { type: "mcp.oauth.disconnect", id: "r92", server: "notion" },
   "settings.schema": { type: "settings.schema", id: "r29" },
   "settings.get": { type: "settings.get", id: "r30" },
   "settings.set": {

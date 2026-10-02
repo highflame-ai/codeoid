@@ -108,6 +108,8 @@ import type { DispatchEventRow, DispatchTaskRow } from "./store.js";
 import { type MemoryEngine, type MemoryMcpMount, workspaceIdFromPath } from "./memory/index.js";
 import type { McpRegistry } from "./mcp/registry.js";
 import type { McpHub } from "./mcp/hub.js";
+import { mcpOAuthBindingCookieName, type McpOAuth, type McpOAuthProof, type McpTenant } from "./mcp/oauth.js";
+import { isOAuthServer, type McpServerSpec, NATIVE_MOUNT_BACKENDS } from "./mcp/types.js";
 import { type CodeoidConfig, DEFAULT_PROVIDER_ENV, loadConfig, mutateConfigFile, validateConfigObject } from "../config.js";
 import type { CompressionRegistry } from "./compress/index.js";
 import { ORCHESTRATOR_ROLE } from "../protocol/types.js";
@@ -325,6 +327,7 @@ export class SessionManager {
   readonly #blackboardTokens = new Map<string, string>();
   #mcpRegistry?: McpRegistry;
   #mcpHub?: McpHub;
+  #mcpOAuth?: McpOAuth;
   /** In-flight interactive backend sign-ins. Daemon-wide, and at most one per
    *  backend — two live logins would race to write the same credential. */
   readonly #backendLogin = new BackendLoginBroker();
@@ -1072,6 +1075,12 @@ mcpHub: this.#mcpHub,
         return this.#backendLoginSubmit(msg, auth);
       case "backend.login.cancel":
         return this.#backendLoginCancel(msg, auth);
+      case "mcp.oauth.begin":
+        return this.#mcpOAuthBegin(msg, auth);
+      case "mcp.oauth.complete":
+        return this.#mcpOAuthComplete(msg, auth);
+      case "mcp.oauth.disconnect":
+        return this.#mcpOAuthDisconnect(msg, auth);
       case "usage.daily":
         return this.#usageDaily(msg, auth);
       case "pipeline.create":
@@ -1602,13 +1611,15 @@ mcpHub: this.#mcpHub,
   /** Read-only registry MCP servers + live health for the settings surface.
    *  Config comes from the registry; health/tools reflect what the daemon-owned
    *  hub has observed so far (no live probe — opening settings has no side effects). */
-  #mcpServerStatuses(): McpServerStatus[] {
+  #mcpServerStatuses(auth: AuthContext): McpServerStatus[] {
     const reg = this.#mcpRegistry;
     const hub = this.#mcpHub;
     if (!reg || !hub) return [];
     return reg.list().map((spec) => {
-      const status = hub.statusFor(spec.name);
-      const connected = hub.hasClient(spec.name);
+      // An OAuth server runs as the viewer's tenant: show only that.
+      const tenant = isOAuthServer(spec) ? tenantOf(auth) : undefined;
+      const status = hub.statusFor(spec.name, tenant);
+      const connected = hub.hasClient(spec.name, tenant);
       const health: McpServerStatus["health"] = !spec.enabled
         ? "disabled"
         : status?.error
@@ -1628,8 +1639,18 @@ mcpHub: this.#mcpHub,
         toolCount: status?.tools.length ?? 0,
         tools: status?.tools ?? [],
         ...(status?.error ? { error: status.error } : {}),
+        ...(isOAuthServer(spec) ? { oauth: this.#oauthStatus(spec, auth) } : {}),
       };
     });
+  }
+
+  #oauthStatus(spec: McpServerSpec, auth: AuthContext): NonNullable<McpServerStatus["oauth"]> {
+    return {
+      status: this.#mcpOAuth?.status(spec, tenantOf(auth)) ?? "disconnected",
+      unsupportedBackends: NATIVE_MOUNT_BACKENDS.filter(
+        (b) => spec.backends === undefined || spec.backends.includes(b),
+      ),
+    };
   }
 
   /** Serve the current effective settings (never secret values). `settings:read`. */
@@ -1644,7 +1665,7 @@ mcpHub: this.#mcpHub,
       return {
         type: "settings.get.result",
         requestId: msg.id,
-        snapshot: { ...getSnapshot(), mcpServers: this.#mcpServerStatuses() },
+        snapshot: { ...getSnapshot(), mcpServers: this.#mcpServerStatuses(auth) },
       };
     } catch (err) {
       return {
@@ -1688,7 +1709,7 @@ mcpHub: this.#mcpHub,
           type: "settings.set.result",
           requestId: msg.id,
           ok: false,
-          snapshot: { ...getSnapshot(), mcpServers: this.#mcpServerStatuses() },
+          snapshot: { ...getSnapshot(), mcpServers: this.#mcpServerStatuses(auth) },
           errors: [bootProblem],
           restartRequired: false,
         };
@@ -1704,7 +1725,7 @@ mcpHub: this.#mcpHub,
         type: "settings.set.result",
         requestId: msg.id,
         ok: result.ok,
-        snapshot: { ...result.snapshot, mcpServers: this.#mcpServerStatuses() },
+        snapshot: { ...result.snapshot, mcpServers: this.#mcpServerStatuses(auth) },
         errors: result.errors,
         restartRequired: result.restartRequired,
       };
@@ -1909,7 +1930,7 @@ mcpHub: this.#mcpHub,
         requestId: msg.id,
         ok,
         ...(error === undefined ? {} : { error }),
-        snapshot: { ...getSnapshot(), mcpServers: this.#mcpServerStatuses() },
+        snapshot: { ...getSnapshot(), mcpServers: this.#mcpServerStatuses(auth) },
       };
     } catch (err) {
       return {
@@ -1943,6 +1964,118 @@ mcpHub: this.#mcpHub,
       error: "Missing scope: settings:write",
       code: "forbidden",
     };
+  }
+
+  // ── Remote MCP server sign-in (docs/mcp-oauth-design.md §4) ─────────────────
+  //
+  // `settings:write`, like backend sign-in: connecting an account configures
+  // the tenant. The credential is the tenant's — never returned, never logged.
+
+  /** The OAuth server a request names, or an error reply to send instead. */
+  #oauthTarget(
+    requestId: string,
+    server: string,
+    auth: AuthContext,
+  ): { spec: McpServerSpec; oauth: McpOAuth } | DaemonMessage {
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return this.#loginForbidden(requestId);
+    const spec = this.#mcpRegistry?.get(server);
+    if (!spec || !isOAuthServer(spec) || !this.#mcpOAuth) {
+      return {
+        type: "response.error",
+        requestId,
+        error: `"${server}" is not an OAuth MCP server`,
+        code: "invalid_request",
+      };
+    }
+    return { spec, oauth: this.#mcpOAuth };
+  }
+
+  async #mcpOAuthBegin(
+    msg: Extract<ClientMessage, { type: "mcp.oauth.begin" }>,
+    auth: AuthContext,
+  ): Promise<DaemonMessage> {
+    const target = this.#oauthTarget(msg.id, msg.server, auth);
+    if ("type" in target) return target;
+    try {
+      const begun = await target.oauth.begin(target.spec, tenantOf(auth));
+      this.#store.audit(auth.sub, "mcp.oauth.begin", "", `server=${msg.server} status=${begun.status}`);
+      if (begun.status === "connected") return { type: "mcp.oauth.begin.result", requestId: msg.id, status: "connected" };
+      return {
+        type: "mcp.oauth.begin.result",
+        requestId: msg.id,
+        status: "redirect",
+        url: begun.url,
+        // The browser that started the sign-in is the one that may finish it
+        // on the callback route (see McpOAuth.complete).
+        browserBinding: { cookie: mcpOAuthBindingCookieName(begun.state), value: begun.binding },
+      };
+    } catch (err) {
+      return {
+        type: "response.error",
+        requestId: msg.id,
+        error: redact(err instanceof Error ? err.message : String(err)),
+        code: "internal",
+      };
+    }
+  }
+
+  async #mcpOAuthComplete(
+    msg: Extract<ClientMessage, { type: "mcp.oauth.complete" }>,
+    auth: AuthContext,
+  ): Promise<DaemonMessage> {
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return this.#loginForbidden(msg.id);
+    try {
+      // A pasted URL is honoured only for the tenant that began the sign-in.
+      const done = await this.completeMcpOAuth({ callbackUrl: msg.callbackUrl }, { tenant: tenantOf(auth) });
+      this.#store.audit(auth.sub, "mcp.oauth.complete", "", `server=${done.server}`);
+      return {
+        type: "mcp.oauth.complete.result",
+        requestId: msg.id,
+        server: done.server,
+        snapshot: { ...getSnapshot(), mcpServers: this.#mcpServerStatuses(auth) },
+      };
+    } catch (err) {
+      return {
+        type: "response.error",
+        requestId: msg.id,
+        error: redact(err instanceof Error ? err.message : String(err)),
+        code: "invalid_request",
+      };
+    }
+  }
+
+  #mcpOAuthDisconnect(
+    msg: Extract<ClientMessage, { type: "mcp.oauth.disconnect" }>,
+    auth: AuthContext,
+  ): DaemonMessage {
+    const target = this.#oauthTarget(msg.id, msg.server, auth);
+    if ("type" in target) return target;
+    const tenant = tenantOf(auth);
+    target.oauth.disconnect(target.spec, tenant);
+    this.#mcpHub?.dropTenant(msg.server, tenant);
+    this.#store.audit(auth.sub, "mcp.oauth.disconnect", "", `server=${msg.server}`);
+    return {
+      type: "mcp.oauth.disconnect.result",
+      requestId: msg.id,
+      snapshot: { ...getSnapshot(), mcpServers: this.#mcpServerStatuses(auth) },
+    };
+  }
+
+  /**
+   * Finish an MCP sign-in — from the provider's redirect to the daemon's
+   * callback route (proved by the browser's binding cookie), or a pasted
+   * callback URL (proved by the client's tenant). The tenant's hub client is
+   * dropped so its next call connects with the new credential.
+   */
+  async completeMcpOAuth(
+    input: { callbackUrl: string } | { state: string; code?: string; error?: string; errorDescription?: string },
+    proof: McpOAuthProof,
+  ): Promise<{ server: string; tenant: McpTenant }> {
+    const oauth = this.#mcpOAuth;
+    if (!oauth) throw new Error("OAuth for MCP servers is not available on this daemon.");
+    const done = await oauth.complete(input, proof, (name) => this.#mcpRegistry?.get(name));
+    this.#mcpHub?.dropTenant(done.server, done.tenant);
+    return done;
   }
 
   async #fsBrowseDir(
@@ -2296,9 +2429,10 @@ mcpHub: this.#mcpHub,
 
   /** Inject the cross-backend MCP registry + daemon-owned client pool. Sessions
    *  hand both to every provider so the registry's servers mount on all backends. */
-  setMcp(registry: McpRegistry, hub: McpHub): void {
+  setMcp(registry: McpRegistry, hub: McpHub, oauth?: McpOAuth): void {
     this.#mcpRegistry = registry;
     this.#mcpHub = hub;
+    this.#mcpOAuth = oauth;
   }
 
   /** Remove a client from all sessions (e.g. on disconnect). */
@@ -5789,4 +5923,8 @@ async function resolveImportPath(
     };
   }
   return { ok: true, path: resolved };
+}
+
+function tenantOf(auth: AuthContext): McpTenant {
+  return { accountId: auth.accountId, projectId: auth.projectId };
 }

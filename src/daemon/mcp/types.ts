@@ -33,6 +33,19 @@ export interface McpHttpTransport {
   headers: Record<string, string>;
   /** Env-var NAME the daemon reads the bearer token from (never inline/argv). */
   bearerTokenEnv?: string;
+  /** OAuth per the MCP authorization spec; the daemon holds the token. */
+  oauth?: McpOAuthConfig;
+}
+
+/** A remote server's OAuth settings. Everything is optional: with none, the
+ *  client discovers the authorization server and registers dynamically. */
+export interface McpOAuthConfig {
+  /** Pre-registered client id, for servers without dynamic registration. */
+  clientId?: string;
+  /** Env-var NAME holding that client's secret (never inline). */
+  clientSecretEnv?: string;
+  /** Scopes to request; omitted, the server's advertised scopes apply. */
+  scopes?: string[];
 }
 
 /** codeoid's own in-daemon server (codeoid_memory) — tools run in-process
@@ -71,6 +84,19 @@ export function canonicalToolName(server: string, tool: string): string {
 
 /** True when `spec` should be delivered by codeoid owning the client (Model B
  *  + the default for Model A), vs synced into the backend's native config. */
+/** True when a server is configured for OAuth. */
+export function isOAuthServer(spec: McpServerSpec): boolean {
+  return spec.transport.kind === "http" && spec.transport.oauth !== undefined;
+}
+
+/**
+ * Backends that mount registry servers natively (their own MCP client, headers
+ * fixed at start). They cannot carry a refreshing OAuth token, so they do not
+ * mount OAuth servers; those reach only the daemon-owned client for now
+ * (docs/mcp-oauth-design.md §5).
+ */
+export const NATIVE_MOUNT_BACKENDS: readonly string[] = ["claude", "codex", "gemini-cli", "qwen"];
+
 export function isProxied(spec: McpServerSpec): boolean {
   return !spec.native;
 }

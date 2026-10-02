@@ -495,6 +495,29 @@ export const backendLoginCancelSchema = z.object({
   loginId: z.string().min(1).max(128),
 });
 
+// ── MCP OAuth ────────────────────────────────────────────────────────────────
+
+const mcpServerNameField = z.string().min(1).max(LIMITS.NAME_MAX);
+
+export const mcpOAuthBeginSchema = z.object({
+  ...base,
+  type: z.literal("mcp.oauth.begin"),
+  server: mcpServerNameField,
+});
+
+export const mcpOAuthCompleteSchema = z.object({
+  ...base,
+  type: z.literal("mcp.oauth.complete"),
+  // A callback URL carries a code and state; 8 KiB is far past any real one.
+  callbackUrl: z.string().url().max(8192),
+});
+
+export const mcpOAuthDisconnectSchema = z.object({
+  ...base,
+  type: z.literal("mcp.oauth.disconnect"),
+  server: mcpServerNameField,
+});
+
 // ── The unions ────────────────────────────────────────────────────────────────
 
 // ── SDLC pipeline ─────────────────────────────────────────────────────────────
@@ -693,6 +716,9 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   backendLoginStartSchema,
   backendLoginSubmitSchema,
   backendLoginCancelSchema,
+  mcpOAuthBeginSchema,
+  mcpOAuthCompleteSchema,
+  mcpOAuthDisconnectSchema,
   usageDailySchema,
   pipelineCreateSchema,
   pipelineListSchema,

@@ -43,6 +43,7 @@
  * history without pretending codeoid gated them.
  */
 
+import type { McpTenant } from "../../mcp/oauth.js";
 import { randomUUID } from "node:crypto";
 import { AsyncQueue } from "../../async-queue.js";
 import type { Store } from "../../store.js";
@@ -88,6 +89,8 @@ export interface CodexProviderInit {
   store: Store;
   /** Tenant-scoped memory workspace id — the scope a mounted memory token binds to. */
   workspaceId?: string;
+  /** The session's tenant — whose credentials an OAuth MCP server uses. */
+  tenant?: McpTenant;
   /**
    * Shared in-daemon memory MCP endpoint + URL. When present (memory enabled),
    * the provider mounts it on the app-server via `-c mcp_servers.*` overrides so
@@ -401,8 +404,7 @@ export class CodexProvider implements SessionProvider {
     if (!reg) return { args: [], env: {} };
     const args: string[] = [];
     const env: Record<string, string> = {};
-    for (const spec of reg.forBackend(this.id)) {
-      if (spec.builtin) continue;
+    for (const spec of reg.forNativeMount(this.id)) {
       const key = `mcp_servers.${spec.name}`;
       const t = spec.transport;
       if (t.kind === "stdio") {

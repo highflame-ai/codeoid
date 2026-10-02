@@ -1001,6 +1001,7 @@ export class Session {
       // re-derive it (which would drop the tenant and desync the memory MCP
       // binding from where episodes are actually stored).
       workspaceId: this.#workspaceId,
+      tenant: { accountId: this.accountId, projectId: this.projectId },
       model: this.#model,
       initialBackingId: this.#store.getClaudeCodeSessionId(this.id) ?? this.id,
       store: this.#store,

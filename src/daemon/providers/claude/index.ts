@@ -10,6 +10,7 @@
  * SessionMessage state.  ProviderEvents are the interface between the two.
  */
 
+import type { McpTenant } from "../../mcp/oauth.js";
 import {
   query,
   type Query,
@@ -105,6 +106,8 @@ export interface ClaudeProviderInit {
    * the memory MCP server so recall/timeline read the SAME scope episodes are
    * written under. */
   workspaceId: string;
+  /** The session's tenant — whose credentials an OAuth MCP server uses. */
+  tenant?: McpTenant;
   store: Store;
   identityManager?: AgentIdentityManager;
   /** Codeoid memory engine — injected as an MCP server. */
@@ -1719,8 +1722,7 @@ export function withMcpToolTimeout(
 export function registryServersForClaude(registry: McpRegistry | undefined): Record<string, McpServerConfig> {
   if (!registry) return {};
   const out: Record<string, McpServerConfig> = {};
-  for (const spec of registry.forBackend("claude")) {
-    if (spec.builtin) continue;
+  for (const spec of registry.forNativeMount("claude")) {
     const t = spec.transport;
     if (t.kind === "stdio") {
       out[spec.name] = {

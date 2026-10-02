@@ -136,6 +136,13 @@ export interface McpServerStatus {
   tools: string[];
   /** Last error text when `health === "error"`. */
   error?: string;
+  /** Present for an OAuth server: whether the viewer's tenant has signed in,
+   *  and whether the server can be used from every backend yet. */
+  oauth?: {
+    status: "connected" | "disconnected";
+    /** Backends that mount natively and cannot reach an OAuth server yet. */
+    unsupportedBackends: string[];
+  };
 }
 
 /** The current effective settings — the `settings.get` payload. */
