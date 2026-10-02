@@ -27,6 +27,7 @@ import { createStore, produce } from "solid-js/store";
 import { fetchSettings, saveSettings, settingsState } from "../state/settings";
 import { relativeTime } from "../lib/format";
 import { BackendLoginPanel } from "./BackendLoginPanel";
+import { McpOAuthControls } from "./McpOAuthControls";
 import { LOGIN_CAPABLE_BACKENDS } from "../protocol/types";
 import type {
   LoginBackend,
@@ -291,8 +292,9 @@ export const McpServersPanel: Component<{ servers: McpServerStatus[] }> = (props
       </h3>
       <p class="mt-0.5 text-[12px] text-fg-muted">
         Declared in <code class="font-mono">mcpServers</code> (config + imported from{" "}
-        <code class="font-mono">~/.claude.json</code>) and mounted on every backend. Read-only —
-        edit config.json to change. Health reflects use so far (no live probe).
+        <code class="font-mono">~/.claude.json</code>) and mounted on every backend. Edit
+        config.json to change them; servers with <code class="font-mono">oauth</code> are connected
+        here, per workspace. Health reflects use so far (no live probe).
       </p>
     </div>
     <Show
@@ -340,6 +342,9 @@ export const McpServersPanel: Component<{ servers: McpServerStatus[] }> = (props
               </Show>
               <Show when={s.backends}>
                 {(b) => <div class="mt-1 text-[11px] text-fg-faint">backends: {b().join(", ")}</div>}
+              </Show>
+              <Show when={s.oauth}>
+                <McpOAuthControls server={s} />
               </Show>
             </div>
           )}

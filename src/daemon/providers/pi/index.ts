@@ -19,6 +19,7 @@
  *   - `get_commands` → codeoid `session.commands` (slash passthrough)
  */
 
+import type { McpTenant } from "../../mcp/oauth.js";
 import { randomUUID } from "node:crypto";
 import { AsyncQueue } from "../../async-queue.js";
 import type { Store } from "../../store.js";
@@ -64,6 +65,8 @@ export interface PiProviderInit {
   store: Store;
   /** Tenant-scoped memory workspace id — the scope memory tool calls run under. */
   workspaceId?: string;
+  /** The session's tenant — whose credentials an OAuth MCP server uses. */
+  tenant?: McpTenant;
   /** Memory engine — when present, the bridge registers the recall tools and
    *  the provider runs them against this engine (pi has no MCP; see bridge.ts). */
   memory?: MemoryEngine;
@@ -99,6 +102,7 @@ export class PiProvider implements SessionProvider {
   #store: Store;
   #onModels?: PiProviderInit["onModels"];
   #workspaceId: string;
+  #tenant: McpTenant | undefined;
   #memory: MemoryEngine | null;
   #mcpRegistry: McpRegistry | null;
   #mcpHub: McpHub | null;
@@ -128,6 +132,7 @@ export class PiProvider implements SessionProvider {
     this.#store = init.store;
     this.#onModels = init.onModels;
     this.#workspaceId = init.workspaceId ?? init.sessionId;
+    this.#tenant = init.tenant;
     this.#memory = init.memory ?? null;
     this.#mcpRegistry = init.mcpRegistry ?? null;
     this.#mcpHub = init.mcpHub ?? null;
@@ -645,6 +650,7 @@ export class PiProvider implements SessionProvider {
     return new SessionMcpTools(this.#mcpRegistry, this.#mcpHub, this.id, {
       workspaceId: this.#workspaceId,
       sessionId: this.#sessionId,
+      ...(this.#tenant ? { tenant: this.#tenant } : {}),
     });
   }
 

@@ -22,8 +22,9 @@
 import { StdioJsonRpcProcess } from "../providers/jsonrpc-stdio.js";
 import { memoryToolDefs, type MemoryToolContext } from "../memory/tools.js";
 import type { MemoryEngine } from "../memory/engine.js";
-import { resolveEnvMap } from "./types.js";
+import { isOAuthServer, resolveEnvMap } from "./types.js";
 import type { McpHttpTransport, McpServerSpec, McpStdioTransport } from "./types.js";
+import { McpSignInRequired, type McpCredentialSource, type McpTenant } from "./oauth.js";
 
 /** A tool as codeoid surfaces it to a backend (bare name; the canonical
  *  `mcp__<server>__<tool>` form is applied by the mounters, not here). */
@@ -38,6 +39,8 @@ export interface McpToolDef {
 export interface McpCallScope {
   workspaceId: string;
   sessionId: string;
+  /** The session's tenant — whose credential an OAuth server is called with. */
+  tenant?: McpTenant;
 }
 
 export interface McpCallResult {
@@ -58,6 +61,8 @@ export interface McpHubOptions {
   toolTimeoutMs?: number;
   /** Env the daemon resolves `${VAR}` refs + `bearerTokenEnv` against. */
   daemonEnv?: Record<string, string | undefined>;
+  /** Where OAuth servers' tokens come from (docs/mcp-oauth-design.md). */
+  credentials?: McpCredentialSource;
 }
 
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -75,25 +80,29 @@ export class McpHub {
   readonly #engine: MemoryEngine | null;
   readonly #timeoutMs: number;
   readonly #env: Record<string, string | undefined>;
+  readonly #credentials: McpCredentialSource | null;
 
   constructor(opts: McpHubOptions = {}) {
     this.#engine = opts.engine ?? null;
     this.#timeoutMs = opts.toolTimeoutMs && opts.toolTimeoutMs > 0 ? opts.toolTimeoutMs : DEFAULT_TIMEOUT_MS;
     this.#env = opts.daemonEnv ?? process.env;
+    this.#credentials = opts.credentials ?? null;
   }
 
   /** Tools `spec` exposes, filtered by its allowlist. Never throws — a server
-   *  that fails to list returns [] (its tools are hidden, not presented-and-broken). */
-  async listTools(spec: McpServerSpec): Promise<McpToolDef[]> {
+   *  that fails to list returns [] (its tools are hidden, not presented-and-broken).
+   *  An OAuth server lists with the tenant's credential, so `scope` must carry it. */
+  async listTools(spec: McpServerSpec, scope?: McpCallScope): Promise<McpToolDef[]> {
     try {
-      const client = this.#clientFor(spec);
+      const client = this.#clientFor(spec, scope?.tenant);
       const all = await client.listTools();
       const tools = spec.toolAllowlist ? all.filter((t) => spec.toolAllowlist?.includes(t.name)) : all;
-      this.#status.set(spec.name, { tools: tools.map((t) => t.name) });
+      this.#status.set(clientKey(spec, scope?.tenant), { tools: tools.map((t) => t.name) });
       return tools;
     } catch (e) {
-      this.#status.set(spec.name, { tools: [], error: errMsg(e) });
-      this.#drop(spec.name);
+      // Not having signed in is not a fault of the server.
+      if (!(e instanceof McpSignInRequired)) this.#status.set(clientKey(spec, scope?.tenant), { tools: [], error: errMsg(e) });
+      this.#drop(clientKey(spec, scope?.tenant));
       return [];
     }
   }
@@ -112,31 +121,36 @@ export class McpHub {
     }
     let client: McpClient;
     try {
-      client = this.#clientFor(spec);
+      client = this.#clientFor(spec, scope.tenant);
     } catch (e) {
       return { text: `mcp: ${spec.name} unavailable: ${errMsg(e)}`, isError: true };
     }
     try {
       return await withTimeout(client.callTool(tool, args, scope), this.#timeoutMs, `${spec.name}/${tool}`);
     } catch (e) {
+      this.#drop(clientKey(spec, scope.tenant)); // reconnect on next use
+      if (e instanceof McpSignInRequired) return { text: e.message, isError: true };
       // codeoid has no OTEL; a failed external tool call is worth one daemon log
       // line (transport error / timeout) so a flaky server is diagnosable.
       console.error(`[codeoid] mcp: ${spec.name}/${tool} failed: ${errMsg(e)}`);
-      this.#status.set(spec.name, { tools: this.#status.get(spec.name)?.tools ?? [], error: errMsg(e) });
-      this.#drop(spec.name); // reconnect on next use
+      const key = clientKey(spec, scope.tenant);
+      this.#status.set(key, { tools: this.#status.get(key)?.tools ?? [], error: errMsg(e) });
       return { text: `Error calling ${spec.name}/${tool}: ${errMsg(e)}`, isError: true };
     }
   }
 
   /** Last-observed status for a server (from accumulated use), or undefined if
-   *  the daemon hasn't listed/called it yet. Read by the settings surface. */
-  statusFor(name: string): { tools: string[]; error?: string } | undefined {
-    return this.#status.get(name);
+   *  the daemon hasn't listed/called it yet. Read by the settings surface.
+   *  An OAuth server is called as a tenant, so its status is that tenant's —
+   *  pass `tenant` for one; another tenant's errors and tools are not shown. */
+  statusFor(name: string, tenant?: McpTenant): { tools: string[]; error?: string } | undefined {
+    return this.#status.get(tenantKey(name, tenant));
   }
 
-  /** Whether a live client is currently held for this server (connected). */
-  hasClient(name: string): boolean {
-    return this.#clients.has(name);
+  /** Whether a live client is currently held for this server (for `tenant`,
+   *  for an OAuth server). */
+  hasClient(name: string, tenant?: McpTenant): boolean {
+    return this.#clients.has(tenantKey(name, tenant));
   }
 
   /** Tear down every client (daemon stop / registry reload). */
@@ -145,28 +159,38 @@ export class McpHub {
     this.#clients.clear();
   }
 
-  /** Drop one server's client (registry edit / removal). */
+  /** Drop one server's clients — every tenant's (registry edit / removal). */
   drop(name: string): void {
-    this.#drop(name);
-  }
-
-  #drop(name: string): void {
-    const c = this.#clients.get(name);
-    if (c) {
-      c.close();
-      this.#clients.delete(name);
+    for (const key of [...this.#clients.keys()]) {
+      if (key === name || key.startsWith(`${name}\u0000`)) this.#drop(key);
     }
   }
 
-  #clientFor(spec: McpServerSpec): McpClient {
-    const existing = this.#clients.get(spec.name);
+  /** Drop one tenant's client for a server (it signed out or back in). */
+  dropTenant(name: string, tenant: McpTenant): void {
+    this.#drop(tenantKey(name, tenant));
+  }
+
+  #drop(key: string): void {
+    const c = this.#clients.get(key);
+    if (c) {
+      c.close();
+      this.#clients.delete(key);
+    }
+  }
+
+  /** One client per server — per (server, tenant) for an OAuth server, whose
+   *  upstream session is authenticated as that tenant. */
+  #clientFor(spec: McpServerSpec, tenant: McpTenant | undefined): McpClient {
+    const key = clientKey(spec, tenant);
+    const existing = this.#clients.get(key);
     if (existing) return existing;
-    const client = this.#build(spec);
-    this.#clients.set(spec.name, client);
+    const client = this.#build(spec, tenant);
+    this.#clients.set(key, client);
     return client;
   }
 
-  #build(spec: McpServerSpec): McpClient {
+  #build(spec: McpServerSpec, tenant: McpTenant | undefined): McpClient {
     switch (spec.transport.kind) {
       case "in-process": {
         if (!this.#engine) throw new Error(`in-process server "${spec.name}" needs a memory engine`);
@@ -174,8 +198,15 @@ export class McpHub {
       }
       case "stdio":
         return new StdioMcpClient(spec.name, spec.transport, this.#env);
-      case "http":
-        return new HttpMcpClient(spec.name, spec.transport, this.#env);
+      case "http": {
+        if (!isOAuthServer(spec)) return new HttpMcpClient(spec.name, spec.transport, this.#env);
+        const credentials = this.#credentials;
+        if (!credentials || !tenant) throw new McpSignInRequired(spec.name);
+        return new HttpMcpClient(spec.name, spec.transport, this.#env, {
+          token: () => credentials.accessToken(spec, tenant),
+          rejected: (token) => credentials.rejected(spec, tenant, token),
+        });
+      }
     }
   }
 }
@@ -293,35 +324,64 @@ class HttpMcpClient implements McpClient {
   #sessionId: string | null = null;
   #initialized: Promise<void> | null = null;
 
-  constructor(name: string, transport: McpHttpTransport, env: Record<string, string | undefined>) {
+  readonly #oauth: OAuthBearer | undefined;
+
+  constructor(
+    name: string,
+    transport: McpHttpTransport,
+    env: Record<string, string | undefined>,
+    oauth?: OAuthBearer,
+  ) {
     this.#name = name;
     this.#transport = transport;
     this.#env = env;
+    this.#oauth = oauth;
   }
 
-  #headers(): Record<string, string> {
+  /** Headers for one request; `token` is the OAuth bearer, when there is one. */
+  #headers(token: string | undefined): Record<string, string> {
     const h: Record<string, string> = {
       "Content-Type": "application/json",
       Accept: "application/json, text/event-stream",
       ...this.#transport.headers,
     };
-    if (this.#transport.bearerTokenEnv) {
-      const token = this.#env[this.#transport.bearerTokenEnv];
-      if (token) h.Authorization = `Bearer ${token}`;
+    if (token) {
+      h.Authorization = `Bearer ${token}`;
+    } else if (this.#transport.bearerTokenEnv) {
+      const envToken = this.#env[this.#transport.bearerTokenEnv];
+      if (envToken) h.Authorization = `Bearer ${envToken}`;
     }
     if (this.#sessionId) h["Mcp-Session-Id"] = this.#sessionId;
     return h;
   }
 
+  /** The OAuth bearer for the next request; throws when the tenant must sign in. */
+  async #token(): Promise<string | undefined> {
+    if (!this.#oauth) return undefined;
+    const token = await this.#oauth.token();
+    if (!token) throw new McpSignInRequired(this.#name);
+    return token;
+  }
+
+  /** POST once, and once more with a refreshed token if the server rejects it.
+   *  An OAuth request follows no redirect: the token is bound to this URL and
+   *  must not be replayed to wherever a redirect points. */
+  async #post(body: string): Promise<Response> {
+    const redirect = this.#oauth ? ("error" as const) : ("follow" as const);
+    const token = await this.#token();
+    const resp = await fetch(this.#transport.url, { method: "POST", headers: this.#headers(token), body, redirect });
+    if (resp.status !== 401 || !this.#oauth || !token) return resp;
+    this.#oauth.rejected(token);
+    const retry = await this.#token();
+    return fetch(this.#transport.url, { method: "POST", headers: this.#headers(retry), body, redirect });
+  }
+
   async #rpc(method: string, params: Record<string, unknown>): Promise<unknown> {
     const id = ++this.#id;
-    const resp = await fetch(this.#transport.url, {
-      method: "POST",
-      headers: this.#headers(),
-      body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),
-    });
+    const resp = await this.#post(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
     const sid = resp.headers.get("mcp-session-id");
     if (sid) this.#sessionId = sid;
+    if (resp.status === 401 && this.#oauth) throw new McpSignInRequired(this.#name);
     if (!resp.ok) throw new Error(`HTTP ${resp.status} from ${this.#name}`);
     const frame = parseJsonRpc(await resp.text());
     if (frame.error) throw new Error(frame.error.message ?? `${this.#name} JSON-RPC error`);
@@ -337,11 +397,7 @@ class HttpMcpClient implements McpClient {
           clientInfo: MCP_CLIENT_INFO,
         });
         // notifications/initialized is a notification (no id) → 202, no body.
-        await fetch(this.#transport.url, {
-          method: "POST",
-          headers: this.#headers(),
-          body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
-        }).catch(() => {});
+        await this.#post(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })).catch(() => {});
       })();
     }
     return this.#initialized;
@@ -366,6 +422,21 @@ class HttpMcpClient implements McpClient {
 }
 
 // ── shared helpers ────────────────────────────────────────────────────────────
+
+/** How an HTTP client authenticates to an OAuth server. */
+interface OAuthBearer {
+  token(): Promise<string | undefined>;
+  rejected(token: string): void;
+}
+
+/** A server's client-pool key: per tenant for an OAuth server. */
+function clientKey(spec: McpServerSpec, tenant: McpTenant | undefined): string {
+  return tenantKey(spec.name, isOAuthServer(spec) ? tenant : undefined);
+}
+
+function tenantKey(name: string, tenant: McpTenant | undefined): string {
+  return tenant ? `${name}\u0000${tenant.accountId}\u0000${tenant.projectId}` : name;
+}
 
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const MCP_CLIENT_INFO = { name: "codeoid", version: "1.0" } as const;
