@@ -180,17 +180,16 @@ export class QwenProvider implements SessionProvider {
     return {
       events: turnQueue,
       interrupt: async () => {
-        const q = this.#query;
-        if (q) {
-          try {
-            await q.interrupt();
-            return;
-          } catch {
-            // fall through to hard abort
-          }
-        }
+        // Deliberately NOT `Query.interrupt()`: qwen-code's handler aborts a
+        // session-wide controller it never resets, so the CLI dies on its next
+        // stdin read with "exited with code 1" — which the consumer mistakes for
+        // a missing backing session and "recovers" by replaying the last prompt
+        // into a fresh session. Net effect: Stop restarted the task from scratch.
+        // A hard abort marks our controller aborted (no recovery), and the next
+        // send rebuilds the loop with `resume`, keeping context.
         this.#abortController?.abort();
         this.#inputQueue?.close();
+        this.#pendingTools = [];
       },
       // The Qwen SDK's SDKUserMessage has no priority/shouldQuery fields, so a
       // mid-turn push is just another queued user message.
