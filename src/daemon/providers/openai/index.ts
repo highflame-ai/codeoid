@@ -14,6 +14,7 @@
  *   OpenAIProviderInit.apiKey for programmatic control.
  */
 
+import type { McpTenant } from "../../mcp/oauth.js";
 import OpenAI from "openai";
 import { AsyncQueue } from "../../async-queue.js";
 import type {
@@ -53,6 +54,8 @@ export interface OpenAIProviderInit {
   memory?: MemoryEngine;
   /** Tenant-scoped workspace id + session id — the memory tool call scope. */
   workspaceId?: string;
+  /** The session's tenant — whose credentials an OAuth MCP server uses. */
+  tenant?: McpTenant;
   sessionId?: string;
   /** Cross-backend MCP registry + daemon-owned client — external servers reach
    *  this backend (which has no MCP client) through the hub. */
@@ -68,6 +71,7 @@ export class OpenAIProvider implements AgentProvider {
   #defaultModel: string;
   #memory: MemoryEngine | null;
   #workspaceId: string;
+  #tenant: McpTenant | undefined;
   #sessionId: string;
   #mcpRegistry: McpRegistry | null;
   #mcpHub: McpHub | null;
@@ -80,6 +84,7 @@ export class OpenAIProvider implements AgentProvider {
     this.#defaultModel = init.defaultModel ?? "gpt-4o";
     this.#memory = init.memory ?? null;
     this.#workspaceId = init.workspaceId ?? init.sessionId ?? "";
+    this.#tenant = init.tenant;
     this.#sessionId = init.sessionId ?? "";
     this.#mcpRegistry = init.mcpRegistry ?? null;
     this.#mcpHub = init.mcpHub ?? null;
@@ -152,6 +157,7 @@ export class OpenAIProvider implements AgentProvider {
           ? new SessionMcpTools(this.#mcpRegistry, this.#mcpHub, this.id, {
               workspaceId: this.#workspaceId,
               sessionId: this.#sessionId,
+              ...(this.#tenant ? { tenant: this.#tenant } : {}),
             })
           : null;
       const mcpHandles = mcpTools?.hasServers() ? await mcpTools.handles() : [];

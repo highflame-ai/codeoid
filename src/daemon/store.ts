@@ -5,6 +5,7 @@
  */
 
 import { Database } from "bun:sqlite";
+import { chmodSync, existsSync } from "node:fs";
 import type { ModelInfo, PushPlatform, SessionInfo, SessionStatus } from "../protocol/types.js";
 
 // ── Dispatch queue types (P4) ─────────────────────────────────────────────
@@ -205,6 +206,7 @@ export class Store {
       // — for the pragma here and for every statement for the process lifetime.
       this.#db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
       enableWalWithRetry(this.#db, dbPath);
+      restrictToOwner(dbPath);
       // Under WAL the default is synchronous=FULL, which fsyncs the WAL on every
       // commit. audit() is a synchronous write on the hot path (fires per tool
       // call / attach / send), so FULL stalls the event loop. NORMAL only syncs
@@ -368,6 +370,25 @@ export class Store {
         context_window INTEGER NOT NULL,
         cached_at      TEXT NOT NULL DEFAULT (datetime('now')),
         PRIMARY KEY (account_id, project_id, workdir, provider_id, model)
+      );
+
+      -- OAuth credentials for remote MCP servers (docs/mcp-oauth-design.md),
+      -- one row per tenant, server and server URL: the registered client
+      -- (dynamic registration result) and the tokens, with when they were
+      -- saved so expiry is known. The URL is part of the key so a server
+      -- re-pointed at another host never receives tokens minted for the old
+      -- one. Never returned to a client, never logged. The file is owner-only
+      -- (restrictToOwner) for exactly this reason.
+      CREATE TABLE IF NOT EXISTS mcp_oauth_credentials (
+        account_id      TEXT NOT NULL,
+        project_id      TEXT NOT NULL,
+        server          TEXT NOT NULL,
+        server_url      TEXT NOT NULL,
+        client_json     TEXT,
+        tokens_json     TEXT,
+        tokens_saved_at INTEGER,
+        updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (account_id, project_id, server, server_url)
       );
 
       -- Durable conductor identity (design R2): one row per tenant, reloaded
@@ -1459,6 +1480,88 @@ export class Store {
       .all() as Array<{ accountId: string; projectId: string }>;
   }
 
+  // ── MCP OAuth credentials ─────────────────────────────────────────────
+  //
+  // Addressed by tenant + server name + server URL (see the table comment).
+
+  /** A tenant's stored OAuth state for one MCP server, or undefined. */
+  getMcpOAuthCredential(
+    tenant: { accountId: string; projectId: string },
+    server: { name: string; url: string },
+  ): { client?: Record<string, unknown>; tokens?: Record<string, unknown>; tokensSavedAt?: number } | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT client_json, tokens_json, tokens_saved_at FROM mcp_oauth_credentials
+         WHERE account_id = ? AND project_id = ? AND server = ? AND server_url = ?`,
+      )
+      .get(tenant.accountId, tenant.projectId, server.name, server.url) as
+      | { client_json: string | null; tokens_json: string | null; tokens_saved_at: number | null }
+      | null;
+    if (!row) return undefined;
+    return {
+      ...(row.client_json ? { client: JSON.parse(row.client_json) as Record<string, unknown> } : {}),
+      ...(row.tokens_json ? { tokens: JSON.parse(row.tokens_json) as Record<string, unknown> } : {}),
+      ...(row.tokens_saved_at !== null ? { tokensSavedAt: row.tokens_saved_at } : {}),
+    };
+  }
+
+  /** Save the client a server registered for this tenant (dynamic registration). */
+  saveMcpOAuthClient(
+    tenant: { accountId: string; projectId: string },
+    server: { name: string; url: string },
+    client: object,
+  ): void {
+    this.#db
+      .prepare(
+        `INSERT INTO mcp_oauth_credentials (account_id, project_id, server, server_url, client_json, updated_at)
+         VALUES (?, ?, ?, ?, ?, datetime('now'))
+         ON CONFLICT(account_id, project_id, server, server_url) DO UPDATE SET
+           client_json = excluded.client_json, updated_at = excluded.updated_at`,
+      )
+      .run(tenant.accountId, tenant.projectId, server.name, server.url, JSON.stringify(client));
+  }
+
+  /** Save a tenant's tokens for a server, stamped with when they were issued. */
+  saveMcpOAuthTokens(
+    tenant: { accountId: string; projectId: string },
+    server: { name: string; url: string },
+    tokens: object,
+    savedAtMs: number,
+  ): void {
+    this.#db
+      .prepare(
+        `INSERT INTO mcp_oauth_credentials (account_id, project_id, server, server_url, tokens_json, tokens_saved_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+         ON CONFLICT(account_id, project_id, server, server_url) DO UPDATE SET
+           tokens_json = excluded.tokens_json,
+           tokens_saved_at = excluded.tokens_saved_at,
+           updated_at = excluded.updated_at`,
+      )
+      .run(tenant.accountId, tenant.projectId, server.name, server.url, JSON.stringify(tokens), savedAtMs);
+  }
+
+  /**
+   * Forget part of a tenant's OAuth state for a server: its tokens (sign out,
+   * or the server rejected them), its client registration, or both. A hard
+   * delete on purpose — a credential should not outlive the user's sign-out.
+   */
+  clearMcpOAuth(
+    tenant: { accountId: string; projectId: string },
+    server: { name: string; url: string },
+    what: "tokens" | "client" | "all",
+  ): void {
+    const where = "account_id = ? AND project_id = ? AND server = ? AND server_url = ?";
+    const args = [tenant.accountId, tenant.projectId, server.name, server.url] as const;
+    if (what === "all") {
+      this.#db.prepare(`DELETE FROM mcp_oauth_credentials WHERE ${where}`).run(...args);
+      return;
+    }
+    const cols = what === "tokens" ? "tokens_json = NULL, tokens_saved_at = NULL" : "client_json = NULL";
+    this.#db
+      .prepare(`UPDATE mcp_oauth_credentials SET ${cols}, updated_at = datetime('now') WHERE ${where}`)
+      .run(...args);
+  }
+
   // ── Model catalog cache ───────────────────────────────────────────────
 
   /**
@@ -1592,5 +1695,23 @@ export class Store {
 
   close(): void {
     this.#db.close();
+  }
+}
+
+/**
+ * Make the database (and its WAL/shm sidecars) readable by the owner only.
+ * It holds credentials — MCP OAuth refresh tokens, the conductor's API key —
+ * so it gets the same 0600 as config.json and .env. Best-effort: a filesystem
+ * without POSIX modes, or an in-memory database, is not an error.
+ */
+function restrictToOwner(dbPath: string): void {
+  if (dbPath === ":memory:") return;
+  for (const path of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
+    try {
+      if (existsSync(path)) chmodSync(path, 0o600);
+    } catch (err) {
+      // Not fatal, but the file holds refresh tokens: say it is not owner-only.
+      console.warn(`[codeoid] store: could not restrict ${path} to its owner: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 }

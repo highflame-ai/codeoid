@@ -728,6 +728,22 @@ const McpServerSchema = z
     headers: z.record(z.string(), z.string()).default({}),
     /** Env-var NAME the daemon reads the bearer token from (never inline). */
     bearerTokenEnv: z.string().optional(),
+    /**
+     * OAuth per the MCP authorization spec (docs/mcp-oauth-design.md). `true`
+     * discovers everything and registers dynamically; an object pins a
+     * pre-registered client (secret by env-var NAME) and/or the scopes. The
+     * token lives in the daemon — never in a backend's config or process.
+     */
+    oauth: z
+      .union([
+        z.literal(true),
+        z.object({
+          clientId: z.string().min(1).optional(),
+          clientSecretEnv: z.string().min(1).optional(),
+          scopes: z.array(z.string().min(1)).optional(),
+        }),
+      ])
+      .optional(),
     // ── policy ──
     /** `readonly` → auto-approve on every backend (like the memory tools);
      *  `prompt` → always route through the approval gate. */
@@ -745,6 +761,18 @@ const McpServerSchema = z
   })
   .refine((s) => (s.command === undefined) !== (s.url === undefined), {
     message: "an MCP server must set exactly one of `command` (stdio) or `url` (streamable-HTTP)",
+  })
+  .refine((s) => s.oauth === undefined || s.url !== undefined, {
+    message: "`oauth` applies to a remote (`url`) MCP server only",
+    path: ["oauth"],
+  })
+  .refine((s) => s.oauth === undefined || s.bearerTokenEnv === undefined, {
+    message: "an MCP server authenticates with `oauth` or `bearerTokenEnv`, not both",
+    path: ["oauth"],
+  })
+  .refine((s) => s.oauth === undefined || !s.native, {
+    message: "`oauth` servers are proxied by the daemon; `native: true` hands the client (and its auth) to the backend",
+    path: ["oauth"],
   });
 
 const McpServersSchema = z.record(z.string(), McpServerSchema).default({});
@@ -913,6 +941,15 @@ const RootSchema = z.object({
   hooks: HooksSchema,
   embed: EmbedSchema,
   push: PushSchema,
+  /** OAuth for remote MCP servers (docs/mcp-oauth-design.md). */
+  mcpOAuth: z
+    .object({
+      /** Externally reachable daemon URL for the OAuth redirect — set it when
+       *  the browser reaches the daemon through a tunnel or another host.
+       *  Unset: the loopback `http://127.0.0.1:<port>`. */
+      redirectBaseUrl: z.string().url().optional(),
+    })
+    .default({}),
   fork: z
     .object({
       /** Shell command run once in a freshly-created fork worktree to make it
@@ -1148,6 +1185,8 @@ export interface CodeoidConfig {
    * (schema default: {}).
    */
   mcpServers?: Record<string, RawMcpServerConfig>;
+  /** OAuth for remote MCP servers — see `RootSchema.mcpOAuth`. */
+  mcpOAuth?: { redirectBaseUrl?: string };
   /**
    * Daemon-native hooks — dispatched at Session's seams for every backend.
    * Optional in the type so hand-built test configs stay minimal;
@@ -1238,6 +1277,7 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   { env: "CODEOID_AUTO_ROTATE_MIN_TURNS", path: "autoRotate.minTurnsBeforeRotate", kind: "int" },
   { env: DEFAULT_PROVIDER_ENV, path: "session.defaultProvider", kind: "string" },
   { env: "CODEOID_DEFAULT_MODEL", path: "session.defaultModel", kind: "string" },
+  { env: "CODEOID_MCP_OAUTH_REDIRECT_BASE_URL", path: "mcpOAuth.redirectBaseUrl", kind: "string" },
   // Dispatch kill switch — disable send-class fleet dispatch per-invocation
   // without touching config.json. Other dispatch knobs are file-config only,
   // matching the conductor block's convention.
@@ -1477,6 +1517,7 @@ export function loadConfig(opts: LoadOptions = {}): CodeoidConfig {
     pipeline: parsed.pipeline,
     providers: parsed.providers,
     mcpServers: parsed.mcpServers,
+    mcpOAuth: parsed.mcpOAuth,
     hooks: parsed.hooks,
     embed: parsed.embed,
     push: parsed.push,

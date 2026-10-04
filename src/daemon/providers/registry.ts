@@ -19,6 +19,7 @@ import type { MemoryEngine } from "../memory/index.js";
 import type { MemoryMcpMount } from "../memory/mcp-http.js";
 import type { McpRegistry } from "../mcp/registry.js";
 import type { McpHub } from "../mcp/hub.js";
+import type { McpTenant } from "../mcp/oauth.js";
 import type { CompressionRegistry } from "../compress/index.js";
 import type { CodeoidConfig } from "../../config.js";
 import type { SessionProvider, CatalogEntry } from "./interface.js";
@@ -44,6 +45,8 @@ export interface ProviderSessionInit {
   sessionId: string;
   /** Tenant-scoped memory workspace id (computed once by Session). */
   workspaceId: string;
+  /** The session's tenant — whose credentials an OAuth MCP server uses. */
+  tenant?: McpTenant;
   /** Resolved model id for this session, or null for the provider default. */
   model: string | null;
   /** Persisted backing id from Store, or the session id itself on first run. */
@@ -222,6 +225,7 @@ export function createDefaultProviderRegistry(
         sessionId: init.sessionId,
         initialBackingId: init.initialBackingId,
         workspaceId: init.workspaceId,
+        tenant: init.tenant,
         store: init.store,
         identityManager: init.identityManager,
         memory: init.memory,
@@ -250,6 +254,7 @@ export function createDefaultProviderRegistry(
             defaultModel: init.model ?? undefined,
             memory: init.memory,
             workspaceId: init.workspaceId,
+            tenant: init.tenant,
             sessionId: init.sessionId,
             mcpRegistry: init.mcpRegistry,
             mcpHub: init.mcpHub,
@@ -273,6 +278,7 @@ export function createDefaultProviderRegistry(
             defaultModel: init.model ?? undefined,
             memory: init.memory,
             workspaceId: init.workspaceId,
+            tenant: init.tenant,
             sessionId: init.sessionId,
             mcpRegistry: init.mcpRegistry,
             mcpHub: init.mcpHub,
@@ -305,6 +311,7 @@ export function createDefaultProviderRegistry(
             argsPrefix: resolution.argsPrefix,
             store: init.store,
             workspaceId: init.workspaceId,
+            tenant: init.tenant,
             memory: init.memory,
             mcpRegistry: init.mcpRegistry,
             mcpHub: init.mcpHub,
@@ -335,6 +342,7 @@ export function createDefaultProviderRegistry(
             argsPrefix: resolution.argsPrefix,
             store: init.store,
             workspaceId: init.workspaceId,
+            tenant: init.tenant,
             memoryMcp: init.memoryMcp,
             blackboardMcp: init.blackboardMcp,
             mcpRegistry: init.mcpRegistry,
@@ -365,6 +373,7 @@ export function createDefaultProviderRegistry(
             argsPrefix: resolution.argsPrefix,
             store: init.store,
             workspaceId: init.workspaceId,
+            tenant: init.tenant,
             memoryMcp: init.memoryMcp,
             blackboardMcp: init.blackboardMcp,
             mcpRegistry: init.mcpRegistry,
@@ -394,6 +403,7 @@ export function createDefaultProviderRegistry(
           sessionId: init.sessionId,
           initialBackingId: init.initialBackingId,
           workspaceId: init.workspaceId,
+          tenant: init.tenant,
           store: init.store,
           memory: init.memory,
           fleet: init.fleet as { type: "sdk"; name: string; instance: unknown } | undefined,

@@ -456,6 +456,12 @@ describe("DaemonMessage routing", () => {
           return `login.submit:${msg.ok}`;
         case "backend.login.cancel.result":
           return `login.cancel:${msg.ok}`;
+        case "mcp.oauth.begin.result":
+          return `mcp.oauth.begin:${msg.status}`;
+        case "mcp.oauth.complete.result":
+          return `mcp.oauth.complete:${msg.server}`;
+        case "mcp.oauth.disconnect.result":
+          return "mcp.oauth.disconnect";
         case "pipeline.snapshot":
           return `pipeline:${msg.pipeline.id}`;
         case "pipeline.list.result":
