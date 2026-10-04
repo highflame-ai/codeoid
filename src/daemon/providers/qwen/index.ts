@@ -29,6 +29,7 @@
  *      the daemon's secrets. buildQwenEnv() blanks the rest — see its docs.
  */
 
+import type { McpTenant } from "../../mcp/oauth.js";
 import { query, type Query, type SDKMessage, type SDKUserMessage } from "@qwen-code/sdk";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -74,6 +75,8 @@ export interface QwenProviderInit {
   initialBackingId: string;
   /** Tenant-scoped memory workspace id (computed once by Session). */
   workspaceId: string;
+  /** The session's tenant — whose credentials an OAuth MCP server uses. */
+  tenant?: McpTenant;
   store: Store;
   memory?: MemoryEngine;
   /** codeoid_fleet MCP server — conductor sessions only. */
@@ -1001,8 +1004,7 @@ export function registryServersForQwen(
 ): Record<string, unknown> {
   if (!registry) return {};
   const out: Record<string, unknown> = {};
-  for (const spec of registry.forBackend("qwen")) {
-    if (spec.builtin) continue;
+  for (const spec of registry.forNativeMount("qwen")) {
     const t = spec.transport;
     if (t.kind === "stdio") {
       out[spec.name] = {

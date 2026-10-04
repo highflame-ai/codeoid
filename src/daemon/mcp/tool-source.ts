@@ -57,7 +57,7 @@ export class SessionMcpTools {
   async handles(): Promise<McpToolHandle[]> {
     const out: McpToolHandle[] = [];
     for (const spec of this.#specs()) {
-      const tools: McpToolDef[] = await this.#hub.listTools(spec);
+      const tools: McpToolDef[] = await this.#hub.listTools(spec, this.#scope);
       for (const t of tools) {
         out.push({
           server: spec.name,

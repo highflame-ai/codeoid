@@ -31,6 +31,14 @@ import type {
   BackendLoginSubmitResultMsg,
   BackendLoginCancelResultMsg,
 } from "./backend-login.js";
+import type {
+  McpOAuthBeginMsg,
+  McpOAuthCompleteMsg,
+  McpOAuthDisconnectMsg,
+  McpOAuthBeginResultMsg,
+  McpOAuthCompleteResultMsg,
+  McpOAuthDisconnectResultMsg,
+} from "./mcp-oauth.js";
 
 /**
  * Wire-protocol version. Bump on breaking changes (renamed/removed fields,
@@ -994,6 +1002,9 @@ export type ClientMessage =
   | BackendLoginStartMsg
   | BackendLoginSubmitMsg
   | BackendLoginCancelMsg
+  | McpOAuthBeginMsg
+  | McpOAuthCompleteMsg
+  | McpOAuthDisconnectMsg
   | UsageDailyMsg
   | PipelineCreateMsg
   | PipelineListMsg
@@ -2538,6 +2549,9 @@ export type DaemonMessage =
   | BackendLoginStartResultMsg
   | BackendLoginSubmitResultMsg
   | BackendLoginCancelResultMsg
+  | McpOAuthBeginResultMsg
+  | McpOAuthCompleteResultMsg
+  | McpOAuthDisconnectResultMsg
   | PipelineSnapshotMsg
   | PipelineListResultMsg
   | PackListResultMsg

@@ -35,6 +35,8 @@ import {
 import { BLACKBOARD_MCP_PATH } from "./blackboard/mcp-http.js";
 import { McpRegistry } from "./mcp/registry.js";
 import { McpHub } from "./mcp/hub.js";
+import { MCP_OAUTH_CALLBACK_PATH, McpOAuth, mcpOAuthBindingCookieName } from "./mcp/oauth.js";
+import { redact } from "./auth/backend-login.js";
 import { importClaudeMcpServers } from "./mcp/import-claude.js";
 import {
   type CompressionRegistry,
@@ -470,10 +472,20 @@ export class DaemonServer {
     this.#mcpRegistry = new McpRegistry(mcpServers, {
       memoryEnabled: this.#memory != null,
     });
+    // OAuth for remote servers is codeoid's own — no Highflame dependency. The
+    // redirect is the daemon's loopback unless an externally reachable base is
+    // configured (a tunnelled or remote daemon).
+    const mcpOAuth = new McpOAuth({
+      store: this.#store,
+      redirectBaseUrl: () =>
+        this.#config.fullConfig?.mcpOAuth?.redirectBaseUrl ?? `http://127.0.0.1:${this.port}`,
+      env: process.env,
+    });
     this.#mcpHub = new McpHub({
       engine: this.#memory,
       toolTimeoutMs: this.#config.fullConfig?.session.mcpToolTimeoutMs,
       daemonEnv: process.env,
+      credentials: mcpOAuth,
     });
     for (const w of this.#mcpRegistry.warnings) console.warn(`[codeoid] ${w}`);
     // Goal blackboard: loopback URL regardless of bind address — the agent
@@ -482,7 +494,7 @@ export class DaemonServer {
     this.#manager.setBlackboardUrl(
       `http://127.0.0.1:${this.#config.port}${BLACKBOARD_MCP_PATH}`,
     );
-    this.#manager.setMcp(this.#mcpRegistry, this.#mcpHub);
+    this.#manager.setMcp(this.#mcpRegistry, this.#mcpHub, mcpOAuth);
     const mcpCount = this.#mcpRegistry.list().filter((s) => !s.builtin).length;
     if (mcpCount > 0) console.log(`[codeoid] mcp: ${mcpCount} external server(s) registered`);
 
@@ -543,6 +555,15 @@ export class DaemonServer {
         // request 401s anyway.
         if (url.pathname === BLACKBOARD_MCP_PATH) {
           return self.#manager.blackboardMcp.handle(req);
+        }
+
+        // The provider's redirect after an MCP server sign-in. Unauthenticated
+        // by necessity — the browser arrives from the provider — so it
+        // completes only for the browser that started the sign-in: the
+        // single-use `state` names it, and that browser's binding cookie
+        // proves it (McpOAuth.complete). Anything else completes nothing.
+        if (url.pathname === MCP_OAUTH_CALLBACK_PATH && req.method === "GET") {
+          return self.#mcpOAuthCallback(req, url);
         }
 
         if (url.pathname === "/config") {
@@ -875,4 +896,59 @@ export class DaemonServer {
   async stop(): Promise<void> {
     await this.#shutdown.shutdown("manual");
   }
+
+  /** Complete an MCP server sign-in from the provider's redirect, and tell
+   *  the user in the tab it landed in. */
+  async #mcpOAuthCallback(req: Request, url: URL): Promise<Response> {
+    const q = url.searchParams;
+    const state = q.get("state") ?? "";
+    const cookie = mcpOAuthBindingCookieName(state);
+    try {
+      const done = await this.#manager.completeMcpOAuth(
+        {
+          state,
+          ...(q.get("code") ? { code: q.get("code")! } : {}),
+          ...(q.get("error") ? { error: q.get("error")! } : {}),
+          ...(q.get("error_description") ? { errorDescription: q.get("error_description")! } : {}),
+        },
+        { binding: readCookie(req, cookie) },
+      );
+      // No ZeroID subject on a browser redirect; the tenant the state named stands in.
+      this.#store.audit(
+        "mcp-oauth-callback",
+        "mcp.oauth.complete",
+        "",
+        `server=${done.server} account=${done.tenant.accountId} project=${done.tenant.projectId}`,
+      );
+      return oauthResultPage(200, `${done.server} is connected`, "You can close this tab and return to codeoid.", cookie);
+    } catch (err) {
+      return oauthResultPage(400, "Sign-in did not complete", redact(err instanceof Error ? err.message : String(err)));
+    }
+  }
+}
+
+function readCookie(req: Request, name: string): string | undefined {
+  for (const part of (req.headers.get("cookie") ?? "").split(";")) {
+    const eq = part.indexOf("=");
+    if (eq > 0 && part.slice(0, eq).trim() === name) return part.slice(eq + 1).trim();
+  }
+  return undefined;
+}
+
+function oauthResultPage(status: number, title: string, detail: string, clearCookie?: string): Response {
+  const esc = (s: string) =>
+    s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
+  const body = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${esc(title)}</title><style>body{font-family:system-ui,sans-serif;max-width:32rem;margin:15vh auto;padding:0 16px;color:#222;background:#fff}@media (prefers-color-scheme:dark){body{color:#eee;background:#111}}</style></head><body><h1>${esc(title)}</h1><p>${esc(detail)}</p></body></html>`;
+  return new Response(body, {
+    status,
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      // The URL that reached us carries a code; keep it out of caches and referrers.
+      "Cache-Control": "no-store",
+      "Referrer-Policy": "no-referrer",
+      "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'",
+      // The binding is spent once the sign-in completes.
+      ...(clearCookie ? { "Set-Cookie": `${clearCookie}=; Path=/; Max-Age=0; SameSite=Lax` } : {}),
+    },
+  });
 }

@@ -15,6 +15,7 @@
  *   GeminiProviderInit.apiKey for programmatic control (tests, multi-tenant).
  */
 
+import type { McpTenant } from "../../mcp/oauth.js";
 import {
   GoogleGenerativeAI,
   type FunctionDeclaration,
@@ -56,6 +57,8 @@ export interface GeminiProviderInit {
   memory?: MemoryEngine;
   /** Tenant-scoped workspace id + session id — the memory tool call scope. */
   workspaceId?: string;
+  /** The session's tenant — whose credentials an OAuth MCP server uses. */
+  tenant?: McpTenant;
   sessionId?: string;
   /** Cross-backend MCP registry + daemon-owned client — external servers reach
    *  this backend (which has no MCP client) through the hub. */
@@ -71,6 +74,7 @@ export class GeminiProvider implements AgentProvider {
   #defaultModel: string;
   #memory: MemoryEngine | null;
   #workspaceId: string;
+  #tenant: McpTenant | undefined;
   #sessionId: string;
   #mcpRegistry: McpRegistry | null;
   #mcpHub: McpHub | null;
@@ -80,6 +84,7 @@ export class GeminiProvider implements AgentProvider {
     this.#defaultModel = init.defaultModel ?? "gemini-2.0-flash";
     this.#memory = init.memory ?? null;
     this.#workspaceId = init.workspaceId ?? init.sessionId ?? "";
+    this.#tenant = init.tenant;
     this.#sessionId = init.sessionId ?? "";
     this.#mcpRegistry = init.mcpRegistry ?? null;
     this.#mcpHub = init.mcpHub ?? null;
@@ -155,6 +160,7 @@ export class GeminiProvider implements AgentProvider {
         ? new SessionMcpTools(this.#mcpRegistry, this.#mcpHub, this.id, {
             workspaceId: this.#workspaceId,
             sessionId: this.#sessionId,
+            ...(this.#tenant ? { tenant: this.#tenant } : {}),
           })
         : null;
     const mcpHandles = mcpTools?.hasServers() ? await mcpTools.handles() : [];

@@ -24,6 +24,7 @@
  * agent can become a backend by reusing this shape with a different binary.
  */
 
+import type { McpTenant } from "../../mcp/oauth.js";
 import { AsyncQueue } from "../../async-queue.js";
 import type { Store } from "../../store.js";
 import type {
@@ -53,6 +54,8 @@ export interface GeminiAcpProviderInit {
   store: Store;
   /** Tenant-scoped memory workspace id — the scope a mounted memory token binds to. */
   workspaceId?: string;
+  /** The session's tenant — whose credentials an OAuth MCP server uses. */
+  tenant?: McpTenant;
   /**
    * Shared in-daemon memory MCP endpoint + URL. When present (memory enabled),
    * the provider mounts it on session/new so gemini-cli can page the verbatim
@@ -381,8 +384,7 @@ export class GeminiAcpProvider implements SessionProvider {
     // (env/headers are {name,value} pairs, mirroring the memory http mount).
     const reg = this.#mcpRegistry;
     if (reg) {
-      for (const spec of reg.forBackend(this.id)) {
-        if (spec.builtin) continue;
+      for (const spec of reg.forNativeMount(this.id)) {
         const t = spec.transport;
         if (t.kind === "http") {
           const headers = Object.entries(t.headers ?? {}).map(([name, value]) => ({ name, value }));

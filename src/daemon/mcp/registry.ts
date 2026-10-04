@@ -11,7 +11,7 @@
 
 import type { RawMcpServerConfig } from "../../config.js";
 import { MEMORY_MCP_SERVER_NAME } from "../memory/mcp-http.js";
-import type { McpServerSpec, McpTransport } from "./types.js";
+import { isOAuthServer, type McpServerSpec, type McpTransport } from "./types.js";
 
 /** Names codeoid owns internally — a user entry using one is ignored (the
  *  built-in wins) rather than silently shadowing an internal server. */
@@ -68,6 +68,13 @@ export class McpRegistry {
       (s) => s.enabled && (s.backends === undefined || s.backends.includes(backendId)),
     );
   }
+
+  /** External servers a native-mount backend mounts itself. OAuth servers are
+   *  left out: a header baked in at start cannot follow a token that expires
+   *  and refreshes, and would put the user's token in the agent's process. */
+  forNativeMount(backendId: string): McpServerSpec[] {
+    return this.forBackend(backendId).filter((s) => !s.builtin && !isOAuthServer(s));
+  }
 }
 
 /** Raw (zod-validated) config → normalized spec. Transport is inferred from
@@ -76,7 +83,13 @@ export class McpRegistry {
 function normalizeSpec(name: string, raw: RawMcpServerConfig): McpServerSpec {
   const transport: McpTransport =
     raw.url !== undefined
-      ? { kind: "http", url: raw.url, headers: raw.headers, bearerTokenEnv: raw.bearerTokenEnv }
+      ? {
+          kind: "http",
+          url: raw.url,
+          headers: raw.headers,
+          bearerTokenEnv: raw.bearerTokenEnv,
+          ...(raw.oauth !== undefined ? { oauth: raw.oauth === true ? {} : raw.oauth } : {}),
+        }
       : { kind: "stdio", command: raw.command ?? "", args: raw.args, env: raw.env };
   return {
     name,
