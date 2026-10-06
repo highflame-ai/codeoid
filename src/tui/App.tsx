@@ -20,7 +20,7 @@ import {
 } from "./workspace-commands.js";
 import type { Attachment } from "../protocol/types.js";
 import { parseDialogAnswer } from "../terminal/dialog.js";
-import { dialogHint } from "./dialog-hint.js";
+import { dialogDetail, dialogHint } from "./dialog-hint.js";
 import type { CodeoidConfig } from "../config.js";
 import { findModel } from "../daemon/models.js";
 import {
@@ -323,6 +323,29 @@ export function App({ config }: Props) {
       })
       .catch((err: Error) => dispatch({ type: "error", message: err.message }));
   };
+
+  // The prompt line holds one row, so a long question (a skill command's
+  // tail) would be cut off there. Print each question in full into the
+  // scrollback once, when it first shows, before a one-key answer can land.
+  const shownDialogsRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!focusedSession || !pendingDialog) return;
+    if (shownDialogsRef.current.has(pendingDialog.requestId)) return;
+    shownDialogsRef.current.add(pendingDialog.requestId);
+    dispatch({
+      type: "session.message",
+      sessionId: focusedSession.info.id,
+      message: {
+        type: "session.message",
+        sessionId: focusedSession.info.id,
+        messageId: `local:dialog:${pendingDialog.requestId}`,
+        role: "system",
+        content: dialogDetail(pendingDialog),
+        identity: { sub: "system:codeoid", name: "codeoid", type: "system" },
+        timestamp: new Date().toISOString(),
+      },
+    });
+  }, [focusedSession, pendingDialog]);
 
   useInput(
     (input, key) => {

@@ -44,6 +44,8 @@ export interface StreamRenderState {
   /** approvalId of the most recent waiting_confirmation tool call, so a typed
    *  yes/no can be routed to it. */
   latestApprovalId: string | null;
+  /** messageId of the tool call `latestApprovalId` belongs to — cleared when it leaves waiting_confirmation (answered anywhere). */
+  latestApprovalMsgId?: string | null;
   /**
    * Provider dialogs waiting for an answer (#348), oldest first. Only the
    * oldest is shown; the next typed line answers it, and when it is resolved
@@ -110,8 +112,15 @@ export function renderStreamMessage(msg: DaemonMessage, state: StreamRenderState
         case "tool_call": {
           const phase = sm.tool?.state?.phase ?? "executing";
           const name = S(sm.tool?.name ?? sm.content);
+          if (phase !== "waiting_confirmation" && sm.messageId && sm.messageId === state.latestApprovalMsgId) {
+            // Approved / denied / cancelled elsewhere: a typed yes/no is no longer for it.
+            state.latestApprovalId = null;
+            state.latestApprovalMsgId = null;
+            if (state.lastPrompt === "tool") state.lastPrompt = state.dialogs.length > 0 ? "dialog" : null;
+          }
           if (phase === "waiting_confirmation") {
             state.latestApprovalId = sm.tool?.state?.approvalId ?? null;
+            state.latestApprovalMsgId = sm.messageId ?? null;
             state.lastPrompt = "tool";
             return `\n${id}${RED}⚡ ${name}: ${S(sm.tool?.state?.description)}${RESET}\n  Type 'yes' to approve, 'no' to deny\n`;
           }
@@ -128,6 +137,15 @@ export function renderStreamMessage(msg: DaemonMessage, state: StreamRenderState
     case "session.message.delta": {
       const delta = msg as { contentAppend?: string; messageId?: string; toolStateUpdate?: { phase?: string } };
       if (delta.messageId) state.streamingAssistantMsgId = delta.messageId;
+      if (
+        delta.toolStateUpdate?.phase &&
+        delta.toolStateUpdate.phase !== "waiting_confirmation" &&
+        delta.messageId === state.latestApprovalMsgId
+      ) {
+        state.latestApprovalId = null;
+        state.latestApprovalMsgId = null;
+        if (state.lastPrompt === "tool") state.lastPrompt = state.dialogs.length > 0 ? "dialog" : null;
+      }
       let out = "";
       if (delta.contentAppend) out += S(delta.contentAppend);
       if (delta.toolStateUpdate) out += `${YELLOW}  → ${delta.toolStateUpdate.phase}${RESET}\n`;
@@ -472,17 +490,19 @@ export class TerminalClient {
       // A tool approval printed after the question is what a yes/no answers;
       // then the question is shown again.
       const toolPromptLast = renderState.lastPrompt === "tool" && renderState.latestApprovalId;
+      // Any yes/no form, so "y" meant for the tool can't grant the question.
+      const yesNo = /^(y|yes|n|no)$/i.test(trimmed);
       // A provider dialog is showing: this line answers it. Its resolution
       // (session.ui_resolved) drops it from the queue and shows the next.
       const dialog = renderState.dialogs[0]?.dialog;
-      if (dialog && !(toolPromptLast && (trimmed === "yes" || trimmed === "no"))) {
+      if (dialog && !(toolPromptLast && yesNo)) {
         const answer = parseDialogAnswer(trimmed, dialog);
         if ("error" in answer) {
           console.log(answer.error);
           continue;
         }
         const resp = await this.#request({ type: "session.ui_response", id: randomUUID(), sessionId, requestId: dialog.requestId, ...answer });
-        if (resp.type === "response.error") {
+        if (resp.type === "response.error" && (resp.code === "not_found" || resp.code === "forbidden")) {
           // Not answerable from here (already resolved, or no session:approve):
           // drop it so the next line isn't parsed as an answer again.
           this.#printError(resp);
@@ -493,19 +513,22 @@ export class TerminalClient {
             process.stdout.write(next.prompt);
             renderState.lastPrompt = "dialog";
           }
+        } else if (resp.type === "response.error") {
+          this.#printError(resp); // e.g. an answer too long — try again
         }
         continue;
       }
 
-      if ((trimmed === "yes" || trimmed === "no") && renderState.latestApprovalId) {
+      if (yesNo && renderState.latestApprovalId) {
         await this.#request({
           type: "session.approve",
           id: randomUUID(),
           sessionId,
           approvalId: renderState.latestApprovalId,
-          approved: trimmed === "yes",
+          approved: /^y/i.test(trimmed),
         });
         renderState.latestApprovalId = null;
+        renderState.latestApprovalMsgId = null;
         renderState.lastPrompt = null;
         // Back to the question that was waiting behind the tool approval.
         const head = renderState.dialogs[0];

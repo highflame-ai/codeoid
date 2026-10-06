@@ -1631,7 +1631,19 @@ export class TelegramFrontend implements Frontend {
     }
     kb.text("⨯ Cancel", `uireq:${short}:x`);
 
-    this.#bot.api.sendMessage(chatId, lines.join("\n\n"), { reply_markup: kb }).catch(() => {});
+    const text = lines.join("\n\n");
+    if (text.length > 3800) {
+      // Past Telegram's 4096 limit the send fails. Never show a truncated
+      // question with answer buttons (it could hide what is approved).
+      const notice = new InlineKeyboard().text("⨯ Cancel", `uireq:${short}:x`);
+      this.#bot.api
+        .sendMessage(chatId, "❓ A question is waiting that is too long to show here — answer it in the web UI or with `codeoid attach`.", {
+          reply_markup: notice,
+        })
+        .catch(() => {});
+      return;
+    }
+    this.#bot.api.sendMessage(chatId, text, { reply_markup: kb }).catch(() => {});
   }
 
   /** Answer a pending dialog: send `session.ui_response` and drop the entry. */

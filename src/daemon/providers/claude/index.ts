@@ -44,7 +44,7 @@ import type { CodeoidConfig } from "../../../config.js";
 import type { AuthContext } from "../../../protocol/types.js";
 import type { SessionProvider, ModelInfo, NormalizedTurnResult, ProviderEvent, SessionScopedEvent, TurnOpts, TurnRun, CatalogEntry, UiResponse } from "../interface.js";
 import { isBackgroundLifecycleEvent } from "../interface.js";
-import { redact } from "../../auth/backend-login.js";
+import { isUngrantableSkillCommand, redactCommand } from "../../skill-command.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
 import { buildSubprocessEnv, withGatewayCredential } from "../env.js";
 import type { LLMCallUsage } from "../../context-math.js";
@@ -1049,7 +1049,7 @@ export class ClaudeProvider implements SessionProvider {
       // than ask for an approval that could never take effect.
       this.#failSkillTurn(
         command,
-        "it contains a character (* ( ) ,) that cannot be safely written as a permission rule — allowing it could let the agent run more than this command unasked; change the skill to name a plain command",
+        "it cannot be safely written as a permission rule (a * wildcard, unbalanced parentheses, or a backslash before one) — allowing it could let the agent run more than this command unasked; change the skill to name a plain command",
       );
       return true;
     }
@@ -1110,10 +1110,10 @@ export class ClaudeProvider implements SessionProvider {
         "skill-approval",
         allowed ? "skill.grant" : "skill.deny",
         this.#init.sessionId,
-        `command=${redact(command)}`,
+        `command=${redactCommand(command)}`,
       );
       console.error(
-        `[claude-provider ${this.#init.sessionId.slice(0, 8)}] skill command ${allowed ? "approved" : "denied"}: ${command.slice(0, 60)}`,
+        `[claude-provider ${this.#init.sessionId.slice(0, 8)}] skill command ${allowed ? "approved" : "denied"}: ${redactCommand(command).slice(0, 60)}`,
       );
       if (allowed) this.#retryAfterGrant();
       else this.#failSkillTurn(command, "you denied it");
@@ -1708,9 +1708,8 @@ export function skillCommandAllowRules(skillsDirs: string[]): string[] {
         const argv0 = trimmed.split(/\s+/)[0] ?? "";
         if (!/^[A-Za-z0-9_./~=-]+$/.test(argv0)) continue;
         // A grant becomes a Claude permission rule, which also covers the
-        // agent's own Bash tool: a `*` is a wildcard (`cat *` lets the agent cat
-        // anything, unasked), and `(` `)` `,` can end the rule early in the
-        // comma-joined rule list (`echo ),Read(~/.ssh/id_rsa`). Never derive one (#348).
+        // agent's own Bash tool — never derive one that is a wildcard or could
+        // end early in the comma-joined rule list (#348; see the predicate).
         if (isUngrantableSkillCommand(trimmed)) continue;
         rules.add(`Bash(${trimmed})`);
       }
@@ -1741,14 +1740,6 @@ export function withMcpToolTimeout(
         : ({ ...obj, timeout: ms } as unknown as McpServerConfig);
   }
   return out;
-}
-
-/** A skill command that cannot be safely written as one exact `Bash(…)`
- *  permission rule — never granted (#348): `*` is a wildcard (incl. a `:*`
- *  prefix rule), and `(` `)` `,` can close the rule or split the comma-joined
- *  rule list into an extra rule. */
-export function isUngrantableSkillCommand(command: string): boolean {
-  return /[*(),]/.test(command);
 }
 
 /** Why a skill command was not run, by why its approval got no answer. */

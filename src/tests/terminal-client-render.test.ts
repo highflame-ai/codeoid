@@ -193,6 +193,18 @@ describe("provider dialogs in the CLI attach loop", () => {
     );
     expect(state.lastPrompt).toBe("tool");
     expect(state.latestApprovalId).toBe("a1");
+    // Approved on another surface: the next yes/no goes back to the question.
+    renderStreamMessage(
+      {
+        type: "session.message.delta",
+        sessionId: "s1",
+        messageId: "m1",
+        toolStateUpdate: { phase: "executing" },
+      } as unknown as DaemonMessage,
+      state,
+    );
+    expect(state.latestApprovalId).toBeNull();
+    expect(state.lastPrompt).toBe("dialog");
   });
 
   it("queues several pending questions: shows the oldest, then the next once it resolves", () => {

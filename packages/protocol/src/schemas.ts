@@ -520,20 +520,33 @@ export const mcpOAuthDisconnectSchema = z.object({
 
 // ── Skill command pre-approval (#348) ─────────────────────────────────────────
 
+function parensBalanced(s: string): boolean {
+  let depth = 0;
+  for (const ch of s) {
+    if (ch === "(") depth += 1;
+    else if (ch === ")" && --depth < 0) return false;
+  }
+  return depth === 0;
+}
+
 export const skillGrantSchema = z.object({
   ...base,
   type: z.literal("skill.grant"),
   workdir: pathField.min(1),
   // As a skill declares it inside !`…`: one line, no backticks (the same shape
-  // the provider extracts from a blocked expansion). No `*` ( ) ,: the grant
-  // becomes a `Bash(…)` permission rule that also covers the agent's Bash tool,
-  // where `*` is a wildcard and the others can end the rule early or split the
-  // comma-joined rule list — the provider never derives such a rule either.
+  // the provider extracts from a blocked expansion). The grant becomes a
+  // `Bash(…)` permission rule that also covers the agent's Bash tool, so — as
+  // the provider's isUngrantableSkillCommand — no `*` wildcard, no unbalanced
+  // parenthesis (it would end the rule early in the comma-joined rule list),
+  // no backslash before a paren.
   command: z
     .string()
     .min(1)
     .max(4096)
-    .regex(/^[^`\n\r*(),]+$/, "a skill command is one line with none of: backtick * ( ) ,"),
+    .regex(/^[^`\n\r*]+$/, "a skill command is one line with no backtick and no * wildcard")
+    .refine((c) => !/\\[()]/.test(c) && parensBalanced(c), "a skill command's parentheses must balance")
+    // Whitespace-only would be stored as `Bash()` — every Bash command.
+    .refine((c) => c.trim().length > 0, "a skill command cannot be blank"),
   allowed: z.boolean(),
 });
 

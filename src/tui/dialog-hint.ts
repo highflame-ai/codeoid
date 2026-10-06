@@ -15,3 +15,11 @@ export function dialogHint(d: NonNullable<SessionInfo["pendingDialog"]>): string
       return `? ${title} — type your answer, Enter to send (or /skip)`;
   }
 }
+
+/** The full question, for the scrollback: title, message, numbered options. */
+export function dialogDetail(d: NonNullable<SessionInfo["pendingDialog"]>): string {
+  const lines = [`? ${sanitizeTerminalOutput(d.title)}`];
+  if (d.message) lines.push(sanitizeTerminalOutput(d.message));
+  (d.options ?? []).forEach((o, i) => lines.push(`  ${i + 1}. ${sanitizeTerminalOutput(o)}`));
+  return lines.join("\n");
+}

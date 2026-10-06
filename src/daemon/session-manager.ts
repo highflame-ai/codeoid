@@ -106,6 +106,7 @@ import { roleEnforcement } from "./providers/tool-safety.js";
 import type { DispatchEventRow, DispatchTaskRow } from "./store.js";
 import { type MemoryEngine, type MemoryMcpMount, workspaceIdFromPath } from "./memory/index.js";
 import type { McpRegistry } from "./mcp/registry.js";
+import { redactCommand } from "./skill-command.js";
 import type { McpHub } from "./mcp/hub.js";
 import { mcpOAuthBindingCookieName, type McpOAuth, type McpOAuthProof, type McpTenant } from "./mcp/oauth.js";
 import { isOAuthServer, type McpServerSpec, NATIVE_MOUNT_BACKENDS } from "./mcp/types.js";
@@ -1979,7 +1980,7 @@ mcpHub: this.#mcpHub,
     }
     const command = msg.command.trim();
     this.#store.setSkillCommandGrant(workspaceIdFromPath(workdir, auth), `Bash(${command})`, msg.allowed);
-    this.#store.audit(auth.sub, msg.allowed ? "skill.grant" : "skill.deny", "", `workdir=${workdir} command=${redact(command)}`);
+    this.#store.audit(auth.sub, msg.allowed ? "skill.grant" : "skill.deny", "", `workdir=${workdir} command=${redactCommand(command)}`);
     return { type: "skill.grant.result", requestId: msg.id, workdir, command, allowed: msg.allowed };
   }
 
