@@ -1637,7 +1637,7 @@ export class TelegramFrontend implements Frontend {
       // question with answer buttons (it could hide what is approved).
       const notice = new InlineKeyboard().text("⨯ Cancel", `uireq:${short}:x`);
       this.#bot.api
-        .sendMessage(chatId, "❓ A question is waiting that is too long to show here — answer it in the web UI or with `codeoid attach`.", {
+        .sendMessage(chatId, "❓ A question is waiting that is too long to show here — answer it in the web UI or with: codeoid attach <session>", {
           reply_markup: notice,
         })
         .catch(() => {});

@@ -56,6 +56,17 @@ export interface StreamRenderState {
   lastPrompt: "tool" | "dialog" | null;
 }
 
+/** A tool approval was settled (anywhere): stop routing yes/no to it, and
+ *  return the waiting question's prompt to show again, if it was behind it. */
+function forgetToolPrompt(state: StreamRenderState): string {
+  state.latestApprovalId = null;
+  state.latestApprovalMsgId = null;
+  if (state.lastPrompt !== "tool") return "";
+  const head = state.dialogs[0];
+  state.lastPrompt = head ? "dialog" : null;
+  return head ? head.prompt : "";
+}
+
 export function newStreamRenderState(): StreamRenderState {
   return { streamingAssistantMsgId: null, latestApprovalId: null, dialogs: [], lastPrompt: null };
 }
@@ -112,19 +123,19 @@ export function renderStreamMessage(msg: DaemonMessage, state: StreamRenderState
         case "tool_call": {
           const phase = sm.tool?.state?.phase ?? "executing";
           const name = S(sm.tool?.name ?? sm.content);
-          if (phase !== "waiting_confirmation" && sm.messageId && sm.messageId === state.latestApprovalMsgId) {
-            // Approved / denied / cancelled elsewhere: a typed yes/no is no longer for it.
-            state.latestApprovalId = null;
-            state.latestApprovalMsgId = null;
-            if (state.lastPrompt === "tool") state.lastPrompt = state.dialogs.length > 0 ? "dialog" : null;
-          }
+          // Approved / denied / cancelled elsewhere: a typed yes/no is no longer
+          // for it — back to the waiting question, shown again.
+          const reshow =
+            phase !== "waiting_confirmation" && sm.messageId && sm.messageId === state.latestApprovalMsgId
+              ? forgetToolPrompt(state)
+              : "";
           if (phase === "waiting_confirmation") {
             state.latestApprovalId = sm.tool?.state?.approvalId ?? null;
             state.latestApprovalMsgId = sm.messageId ?? null;
             state.lastPrompt = "tool";
             return `\n${id}${RED}⚡ ${name}: ${S(sm.tool?.state?.description)}${RESET}\n  Type 'yes' to approve, 'no' to deny\n`;
           }
-          return `\n${id}${YELLOW}⚡ ${name} [${phase}]${RESET}\n`;
+          return `\n${id}${YELLOW}⚡ ${name} [${phase}]${RESET}\n${reshow}`;
         }
         case "system":
           return `\n${RED}${S(sm.content)}${RESET}\n`;
@@ -137,16 +148,14 @@ export function renderStreamMessage(msg: DaemonMessage, state: StreamRenderState
     case "session.message.delta": {
       const delta = msg as { contentAppend?: string; messageId?: string; toolStateUpdate?: { phase?: string } };
       if (delta.messageId) state.streamingAssistantMsgId = delta.messageId;
+      let out = "";
       if (
         delta.toolStateUpdate?.phase &&
         delta.toolStateUpdate.phase !== "waiting_confirmation" &&
         delta.messageId === state.latestApprovalMsgId
       ) {
-        state.latestApprovalId = null;
-        state.latestApprovalMsgId = null;
-        if (state.lastPrompt === "tool") state.lastPrompt = state.dialogs.length > 0 ? "dialog" : null;
+        out += forgetToolPrompt(state);
       }
-      let out = "";
       if (delta.contentAppend) out += S(delta.contentAppend);
       if (delta.toolStateUpdate) out += `${YELLOW}  → ${delta.toolStateUpdate.phase}${RESET}\n`;
       return out;

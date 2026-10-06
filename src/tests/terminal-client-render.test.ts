@@ -193,8 +193,9 @@ describe("provider dialogs in the CLI attach loop", () => {
     );
     expect(state.lastPrompt).toBe("tool");
     expect(state.latestApprovalId).toBe("a1");
-    // Approved on another surface: the next yes/no goes back to the question.
-    renderStreamMessage(
+    // Approved on another surface: the next yes/no goes back to the question,
+    // which is shown again.
+    const reshown = renderStreamMessage(
       {
         type: "session.message.delta",
         sessionId: "s1",
@@ -203,6 +204,7 @@ describe("provider dialogs in the CLI attach loop", () => {
       } as unknown as DaemonMessage,
       state,
     );
+    expect(reshown).toContain("Allow the skill command `./probe.sh`?");
     expect(state.latestApprovalId).toBeNull();
     expect(state.lastPrompt).toBe("dialog");
   });

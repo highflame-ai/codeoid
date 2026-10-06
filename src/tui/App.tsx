@@ -339,7 +339,7 @@ export function App({ config }: Props) {
         type: "session.message",
         sessionId: focusedSession.info.id,
         messageId: `local:dialog:${pendingDialog.requestId}`,
-        role: "system",
+        role: "info",
         content: dialogDetail(pendingDialog),
         identity: { sub: "system:codeoid", name: "codeoid", type: "system" },
         timestamp: new Date().toISOString(),

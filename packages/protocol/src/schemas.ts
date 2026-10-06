@@ -520,6 +520,19 @@ export const mcpOAuthDisconnectSchema = z.object({
 
 // ── Skill command pre-approval (#348) ─────────────────────────────────────────
 
+/** As the daemon's isUngrantableSkillCommand: `Bash(<cmd>)` must survive the
+ *  Claude CLI's --allowedTools splitter (one parens flag, not a depth; a
+ *  comma or space outside it ends a rule) as exactly itself. */
+function survivesRuleSplit(cmd: string): boolean {
+  let inParens = false;
+  for (const ch of `Bash(${cmd.trim()})`) {
+    if (ch === "(") inParens = true;
+    else if (ch === ")") inParens = false;
+    else if (!inParens && (ch === "," || ch === " ")) return false;
+  }
+  return true;
+}
+
 function parensBalanced(s: string): boolean {
   let depth = 0;
   for (const ch of s) {
@@ -544,7 +557,10 @@ export const skillGrantSchema = z.object({
     .min(1)
     .max(4096)
     .regex(/^[^`\n\r*]+$/, "a skill command is one line with no backtick and no * wildcard")
-    .refine((c) => !/\\[()]/.test(c) && parensBalanced(c), "a skill command's parentheses must balance")
+    .refine(
+      (c) => !/\\[()]/.test(c) && parensBalanced(c) && survivesRuleSplit(c),
+      "a skill command must stay one exact Bash(…) rule: balanced parentheses, and nothing after an inner ')' that would split it",
+    )
     // Whitespace-only would be stored as `Bash()` — every Bash command.
     .refine((c) => c.trim().length > 0, "a skill command cannot be blank"),
   allowed: z.boolean(),
