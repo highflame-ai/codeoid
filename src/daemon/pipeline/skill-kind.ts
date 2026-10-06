@@ -9,6 +9,7 @@
 import type { PhaseCtx, PhaseKind, PhaseRunResult, PipelinePhase, SkillPlugin } from "./interface";
 import type { PhaseRunner } from "./runner";
 import { resolveScoped } from "./scoped";
+import { PIPELINE_INPUT_REQUEST_PREFIX } from "../../protocol/types.js";
 
 /** Compose a phase's prompt: the skill command/template, the run's goal, and —
  *  on a revise re-run — the phase's prior output + the accumulated human
@@ -97,11 +98,13 @@ async function runSkill(
   if (res.question !== undefined) {
     // The phase asked something nobody connected could answer (#348). Halt on
     // the question — not "complete", which would let Approve skip past it.
-    // Revise re-runs the phase with the reply threaded into its prompt.
+    // Revise re-runs the phase with the reply threaded into its prompt. Named
+    // after the pipeline's phase, not a findings fix leg's synthetic def.
+    const phaseId = ctx.pipeline.phases[ctx.pipeline.cursor]?.def.id ?? ctx.phase.id;
     return {
       outcome: "halted",
-      requestId: `input:${ctx.phase.id}`,
-      reason: `phase "${ctx.phase.id}" needs input — reply with Revise to re-run it with your answer`,
+      requestId: `${PIPELINE_INPUT_REQUEST_PREFIX}${phaseId}`,
+      reason: `phase "${phaseId}" needs input — reply with Revise to re-run it with your answer`,
       questions: [res.question],
     };
   }

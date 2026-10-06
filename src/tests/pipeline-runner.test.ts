@@ -421,15 +421,17 @@ describe("pipeline runtime (real SessionManager + mock backend)", () => {
 
   test("a headless phase asking for input halts on its question; Revise answers it (#348)", async () => {
     const store2 = new Store(join(tmp, "codeoid-headless.db"));
+    const mock = new MockSessionProvider("mock", [
+      // Rests without a marker → nudged to continue; this text is NOT the question.
+      sayTurn("I looked through the repo layout."),
+      sayTurn(`Which language should I use?\n${PHASE_NEEDS_INPUT_MARKER}`),
+      // Driven by the Revise carrying the human's answer.
+      sayTurn(`implemented it in TypeScript\n${PHASE_COMPLETE_MARKER}`),
+    ]);
     const m2 = new SessionManager(store2, transcript, undefined, undefined, undefined, {
       config: mkConfig(join(tmp, "codeoid-headless.db"), true),
       _testDialogNoClientGraceMs: 40,
-      _testProviderFactory: () =>
-        new MockSessionProvider("mock", [
-          sayTurn(`Which language should I use?\n${PHASE_NEEDS_INPUT_MARKER}`),
-          // Driven by the Revise carrying the human's answer.
-          sayTurn(`implemented it in TypeScript\n${PHASE_COMPLETE_MARKER}`),
-        ]),
+      _testProviderFactory: () => mock,
     });
     const pm = m2.pipelines;
     if (!pm) throw new Error("pipeline disabled");
@@ -457,7 +459,18 @@ describe("pipeline runtime (real SessionManager + mock backend)", () => {
     expect(state.requestId).toBe("input:impl");
     expect(state.reason).toContain("needs input");
     expect(state.reason).not.toContain("review and approve");
-    expect(state.questions?.[0]).toContain("Which language");
+    // Just the question — no marker, and no stale summary shown beside it.
+    expect(state.questions).toEqual(["Which language should I use?"]);
+    expect(state.summary).toBeUndefined();
+
+    // Approving would pass the phase without its answer — refused.
+    const approved = await m2.handle(
+      { type: "pipeline.answer", id: "2a", pipelineId: created.pipeline.id, requestId: "input:impl", approved: true } as never,
+      AUTH,
+      CLIENT,
+    );
+    expect(approved).toMatchObject({ type: "response.error" });
+    expect(JSON.stringify(approved)).toContain("waiting for an answer");
 
     // The human answers by revising the phase (works from the CLI, no dialog needed).
     const revised = await m2.handle(
@@ -467,6 +480,9 @@ describe("pipeline runtime (real SessionManager + mock backend)", () => {
     );
     if (revised.type !== "pipeline.snapshot") throw new Error(`revise failed: ${JSON.stringify(revised)}`);
     expect(revised.pipeline.phases[0].summary ?? "").toContain("implemented it in TypeScript");
+    // The re-run prompt pairs the question with the answer.
+    const rerun = mock.capturedOpts.at(-1)!.userMessage;
+    expect(rerun).toContain('Answer to your question "Which language should I use?": TypeScript');
     await m2.drain(3_000);
   });
 

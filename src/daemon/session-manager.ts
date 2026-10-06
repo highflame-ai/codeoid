@@ -3875,10 +3875,12 @@ mcpHub: this.#mcpHub,
             placeholder: "Type your answer…",
           });
           if (session.turnInterrupted) return { finalStatus: "idle", text: summary(text) };
-          // Nobody connected can answer (a headless run, #348): fail the phase
-          // with its question rather than nudge the agent into guessing — a
+          // Nobody connected can answer (a headless run, #348): halt the phase
+          // on its question rather than nudge the agent into guessing — a
           // dismissal is a choice not to answer, this is not.
-          if (resp.cancelled && resp.reason === "no_client") return { finalStatus: "needs_input", text: summary(text) };
+          if (resp.cancelled && resp.reason === "no_client") {
+            return { finalStatus: "needs_input", text: stripNeedInputMarker(text) };
+          }
           if (!resp.cancelled && resp.value && resp.value.trim().length > 0) {
             pendingSend = resp.value;
             nudges = 0;

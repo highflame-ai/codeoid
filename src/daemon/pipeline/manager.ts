@@ -20,6 +20,7 @@ import { registerBuiltins } from "./builtin";
 import { PipelineEngine } from "./engine";
 import type { Pack, PhaseDef, PipelineRegistries, PipelineState, Registry } from "./interface";
 import { isTerminal } from "./interface";
+import { PIPELINE_INPUT_REQUEST_PREFIX } from "../../protocol/types.js";
 import { createRegistries } from "./registry";
 import type { PhaseRunner } from "./runner";
 import { hasScoped, scopedMatches } from "./scoped";
@@ -313,6 +314,13 @@ export class PipelineManager {
     if (current.state.requestId !== requestId) {
       throw new Error(`stale requestId "${requestId}" for pipeline "${id}"`);
     }
+    if (opts.approved && requestId.startsWith(PIPELINE_INPUT_REQUEST_PREFIX)) {
+      // Approving would pass the phase without the answer it asked for, and the
+      // phases after it would build on a guess (#348). Reject still works.
+      throw new Error(
+        `phase "${current.def.id}" is waiting for an answer to its question — reply with revise (it re-runs the phase with your answer), or reject to stop the run`,
+      );
+    }
 
     if (opts.approved) {
       // Record the phase's actual output as its summary (its lastSummary), so
@@ -350,7 +358,13 @@ export class PipelineManager {
     // 0 — a human revise is a fresh, deliberate attempt, not counted against the
     // machine `onFail: retry` budget. The skill kind reads phase.feedback +
     // phase.lastSummary from the pipeline state to build the revised prompt.
-    current.feedback = [...(current.feedback ?? []), note];
+    // Revising a halt on the phase's own question is answering it: carry the
+    // question into the note, so the re-run prompt pairs it with the answer.
+    const question = requestId.startsWith(PIPELINE_INPUT_REQUEST_PREFIX)
+      ? current.state.questions?.[0]
+      : undefined;
+    const recorded = question ? `Answer to your question "${question.slice(0, 2000)}": ${note}` : note;
+    current.feedback = [...(current.feedback ?? []), recorded];
     current.state = { status: "running", startedAt: Date.now(), attempts: 0 };
     s.status = "running";
     s.updatedAt = Date.now();

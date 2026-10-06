@@ -2220,6 +2220,15 @@ export interface SessionCommandsResultMsg {
 // ── SDLC pipeline (docs/sdlc-pipeline.md) — additive; no version bump ─────────
 
 /** A pipeline phase projected for the wire (subset of the daemon PhaseState). */
+/**
+ * `requestId` prefix of a phase halted on a QUESTION it asked that nobody
+ * connected could answer (`questions` holds it). Answer with
+ * `pipeline.revise` — it re-runs the phase with the reply; approving is
+ * refused, since it would pass the phase without the answer. Other halts
+ * (`exit:<phase>`) are review gates, where Approve is the normal path.
+ */
+export const PIPELINE_INPUT_REQUEST_PREFIX = "input:";
+
 export interface PipelinePhaseWire {
   id: string;
   name?: string;
