@@ -286,6 +286,25 @@ describe("dialog deadline follows connected approvers", () => {
     expect(await answer).toEqual({ cancelled: true, reason: "no_client" });
   });
 
+  it("an approver whose token has expired does not count", async () => {
+    await createSession();
+    const session = manager.findByName("ext", OWNER)!;
+    manager.clientConnected("stale-web", { ...OWNER, exp: Math.floor(Date.now() / 1000) - 60 }, ["ui.dialogs"]);
+    const { answer } = raise(session);
+    expect(await answer).toEqual({ cancelled: true, reason: "no_client" });
+  });
+
+  it("an approver's token expiring while a dialog waits re-arms its deadline", async () => {
+    await createSession();
+    const session = manager.findByName("ext", OWNER)!;
+    // Expires in ~1s; the expiry timer fires a second after exp.
+    manager.clientConnected("expiring-web", { ...OWNER, exp: Math.floor(Date.now() / 1000) + 1 }, ["ui.dialogs"]);
+    const { state, answer } = raise(session);
+    await Bun.sleep(150);
+    expect(state.settled).toBe(false);
+    expect(await answer).toEqual({ cancelled: true, reason: "no_client" });
+  }, 10_000);
+
   it("a capable client connecting lifts a deadline already running", async () => {
     await createSession();
     const session = manager.findByName("ext", OWNER)!;

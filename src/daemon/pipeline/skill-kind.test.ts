@@ -93,6 +93,22 @@ describe("skill phase kind", () => {
     if (res.outcome === "failed") expect(res.reason).toContain("needs a phase runner");
   });
 
+  test("a question nobody could answer halts the phase on it, never passes it (#348)", async () => {
+    const runner: PhaseRunner = {
+      async runPrompt() {
+        return { question: "Which database?" };
+      },
+    };
+    const skill: SkillPlugin = { id: "spec", kind: "slash", command: "/spec" };
+    const res = await makeSkillPhaseKind(runner).run(ctxFor({ id: "one", kind: "skill", skill: "spec" }, [skill]));
+    expect(res).toEqual({
+      outcome: "halted",
+      requestId: "input:one",
+      reason: 'phase "one" needs input — reply with Revise to re-run it with your answer',
+      questions: ["Which database?"],
+    });
+  });
+
   test("frames the goal as CONTEXT and scopes the model to THIS phase's deliverable", async () => {
     let prompt = "";
     const runner: PhaseRunner = {

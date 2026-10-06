@@ -94,5 +94,16 @@ async function runSkill(
     pipeline: ctx.pipeline,
     phase: ctx.phase,
   });
+  if (res.question !== undefined) {
+    // The phase asked something nobody connected could answer (#348). Halt on
+    // the question — not "complete", which would let Approve skip past it.
+    // Revise re-runs the phase with the reply threaded into its prompt.
+    return {
+      outcome: "halted",
+      requestId: `input:${ctx.phase.id}`,
+      reason: `phase "${ctx.phase.id}" needs input — reply with Revise to re-run it with your answer`,
+      questions: [res.question],
+    };
+  }
   return { outcome: "passed", summary: res.summary, artifacts: res.artifacts };
 }

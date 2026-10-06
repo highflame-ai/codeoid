@@ -419,7 +419,7 @@ describe("pipeline runtime (real SessionManager + mock backend)", () => {
     await m2.drain(3_000);
   });
 
-  test("a headless phase asking for input pauses with its question instead of guessing (#348)", async () => {
+  test("a headless phase asking for input halts on its question; Revise answers it (#348)", async () => {
     const store2 = new Store(join(tmp, "codeoid-headless.db"));
     const m2 = new SessionManager(store2, transcript, undefined, undefined, undefined, {
       config: mkConfig(join(tmp, "codeoid-headless.db"), true),
@@ -427,8 +427,8 @@ describe("pipeline runtime (real SessionManager + mock backend)", () => {
       _testProviderFactory: () =>
         new MockSessionProvider("mock", [
           sayTurn(`Which language should I use?\n${PHASE_NEEDS_INPUT_MARKER}`),
-          // Only reached if the runner nudged the agent to assume an answer.
-          sayTurn(`guessed: implemented it in COBOL\n${PHASE_COMPLETE_MARKER}`),
+          // Driven by the Revise carrying the human's answer.
+          sayTurn(`implemented it in TypeScript\n${PHASE_COMPLETE_MARKER}`),
         ]),
     });
     const pm = m2.pipelines;
@@ -449,9 +449,24 @@ describe("pipeline runtime (real SessionManager + mock backend)", () => {
     // No client that can show the dialog is connected anywhere.
     const out = await m2.handle({ type: "pipeline.advance", id: "2", pipelineId: created.pipeline.id }, AUTH, CLIENT);
     if (out.type !== "pipeline.snapshot") throw new Error(`advance failed: ${JSON.stringify(out)}`);
-    const ph = out.pipeline.phases[0];
-    expect(ph.summary).toContain("Which language");
-    expect(ph.summary).not.toContain("COBOL");
+    const state = out.pipeline.phases[0];
+    // Halted on the QUESTION — not "complete — review and approve", which would
+    // let a human approve past it, and not a guess.
+    expect(out.pipeline.status).toBe("halted");
+    expect(state.status).toBe("halted");
+    expect(state.requestId).toBe("input:impl");
+    expect(state.reason).toContain("needs input");
+    expect(state.reason).not.toContain("review and approve");
+    expect(state.questions?.[0]).toContain("Which language");
+
+    // The human answers by revising the phase (works from the CLI, no dialog needed).
+    const revised = await m2.handle(
+      { type: "pipeline.revise", id: "3", pipelineId: created.pipeline.id, requestId: "input:impl", feedback: "TypeScript" } as never,
+      AUTH,
+      CLIENT,
+    );
+    if (revised.type !== "pipeline.snapshot") throw new Error(`revise failed: ${JSON.stringify(revised)}`);
+    expect(revised.pipeline.phases[0].summary ?? "").toContain("implemented it in TypeScript");
     await m2.drain(3_000);
   });
 

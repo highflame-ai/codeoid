@@ -1608,11 +1608,13 @@ export class Session {
    */
   syncDialogDeadlines(): void {
     if (this.#pendingUiRequests.size === 0) return;
+    const now = Math.floor(Date.now() / 1000);
     const answerable =
       [...this.#clients.values()].some(
         (c) =>
           c.capabilities?.includes(CAPABILITIES.UI_DIALOGS) &&
-          hasScope(c.auth.scopes as string[], SCOPES.SESSION_APPROVE),
+          hasScope(c.auth.scopes as string[], SCOPES.SESSION_APPROVE) &&
+          !(typeof c.auth.exp === "number" && c.auth.exp > 0 && c.auth.exp <= now),
       ) || this.#dialogAnswererConnected(this.accountId, this.projectId);
     for (const [requestId, pending] of this.#pendingUiRequests) {
       if (answerable && pending.noClientTimer) {

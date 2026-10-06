@@ -1572,7 +1572,7 @@ mcpHub: this.#mcpHub,
    * are attached to the session raising one. The web UI attaches only the
    * session in focus; a user watching the fleet view is still there to answer.
    */
-  readonly #dialogAnswerers = new DialogAnswerers();
+  readonly #dialogAnswerers = new DialogAnswerers((t) => this.#syncDialogDeadlines(t.accountId, t.projectId));
 
   /**
    * Record an authenticated connection. One that can answer dialogs lifts the
@@ -3875,10 +3875,10 @@ mcpHub: this.#mcpHub,
             placeholder: "Type your answer…",
           });
           if (session.turnInterrupted) return { finalStatus: "idle", text: summary(text) };
-          // Nobody connected can answer (a headless run, #348): pause the
-          // phase with its question showing rather than nudge the agent into
-          // guessing — a dismissal is a choice not to answer, this is not.
-          if (resp.cancelled && resp.reason === "no_client") return { finalStatus: "idle", text: summary(text) };
+          // Nobody connected can answer (a headless run, #348): fail the phase
+          // with its question rather than nudge the agent into guessing — a
+          // dismissal is a choice not to answer, this is not.
+          if (resp.cancelled && resp.reason === "no_client") return { finalStatus: "needs_input", text: summary(text) };
           if (!resp.cancelled && resp.value && resp.value.trim().length > 0) {
             pendingSend = resp.value;
             nudges = 0;
@@ -5977,25 +5977,54 @@ function tenantOf(auth: AuthContext): McpTenant {
 
 /** Connected dialog-answering clients, by tenant (see SessionManager.#dialogAnswerers). */
 class DialogAnswerers {
-  readonly #byClient = new Map<string, { accountId: string; projectId: string }>();
+  readonly #byClient = new Map<
+    string,
+    { accountId: string; projectId: string; exp?: number; expiry?: ReturnType<typeof setTimeout> }
+  >();
+  readonly #onExpire: (tenant: { accountId: string; projectId: string }) => void;
+
+  /** `onExpire` runs when a tracked client's token expires, so the tenant's
+   *  deadlines re-arm then rather than at that socket's next message. */
+  constructor(onExpire: (tenant: { accountId: string; projectId: string }) => void) {
+    this.#onExpire = onExpire;
+  }
 
   /** Track `clientId` if it can answer dialogs; true when it was added. */
   connect(clientId: string, auth: AuthContext, capabilities: readonly string[] | undefined): boolean {
     if (!capabilities?.includes(CAPABILITIES.UI_DIALOGS)) return false;
     if (!hasScope(auth.scopes as string[], SCOPES.SESSION_APPROVE)) return false;
-    this.#byClient.set(clientId, { accountId: auth.accountId, projectId: auth.projectId });
+    this.disconnect(clientId);
+    const tenant = { accountId: auth.accountId, projectId: auth.projectId };
+    const exp = typeof auth.exp === "number" && auth.exp > 0 ? auth.exp : undefined;
+    // setTimeout's delay is a 32-bit int; a token living longer than ~24 days
+    // just gets no early re-check (has() still ignores it once expired).
+    const delay = exp === undefined ? undefined : exp * 1000 - Date.now() + 1000;
+    const expiry =
+      delay !== undefined && delay < 2 ** 31 - 1
+        ? setTimeout(() => this.#onExpire(tenant), Math.max(0, delay))
+        : undefined;
+    expiry?.unref?.();
+    this.#byClient.set(clientId, { ...tenant, ...(exp !== undefined ? { exp } : {}), ...(expiry ? { expiry } : {}) });
     return true;
   }
 
   /** Forget `clientId`; its tenant when it was tracked. */
   disconnect(clientId: string): { accountId: string; projectId: string } | undefined {
-    const tenant = this.#byClient.get(clientId);
+    const entry = this.#byClient.get(clientId);
+    if (!entry) return undefined;
+    if (entry.expiry) clearTimeout(entry.expiry);
     this.#byClient.delete(clientId);
-    return tenant;
+    return { accountId: entry.accountId, projectId: entry.projectId };
   }
 
+  /** Whether one is connected in the tenant. A socket whose token has expired
+   *  is not closed until its next message, and could not answer a dialog
+   *  anyway, so it does not count. */
   has(accountId: string, projectId: string): boolean {
-    for (const t of this.#byClient.values()) if (t.accountId === accountId && t.projectId === projectId) return true;
+    const now = Math.floor(Date.now() / 1000);
+    for (const t of this.#byClient.values()) {
+      if (t.accountId === accountId && t.projectId === projectId && (t.exp === undefined || t.exp > now)) return true;
+    }
     return false;
   }
 }
