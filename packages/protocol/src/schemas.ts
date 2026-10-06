@@ -525,8 +525,14 @@ export const skillGrantSchema = z.object({
   type: z.literal("skill.grant"),
   workdir: pathField.min(1),
   // As a skill declares it inside !`…`: one line, no backticks (the same shape
-  // the provider extracts from a blocked expansion).
-  command: z.string().min(1).max(4096).regex(/^[^`\n\r]+$/, "a skill command is one line with no backticks"),
+  // the provider extracts from a blocked expansion). No `*`: the grant becomes
+  // a permission rule that also covers the agent's Bash tool, where `*` is a
+  // wildcard — the provider never derives such a rule either.
+  command: z
+    .string()
+    .min(1)
+    .max(4096)
+    .regex(/^[^`\n\r*]+$/, "a skill command is one line with no backticks and no wildcard (*)"),
   allowed: z.boolean(),
 });
 

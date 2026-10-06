@@ -140,7 +140,7 @@ describe("provider dialogs in the CLI attach loop", () => {
       sessionId: "s1",
       requestId: "r1",
       method: "confirm",
-      title: "Allow a command declared by an installed skill?",
+      title: "Allow the skill command `./probe.sh`?",
       message: "A skill needs to run:\n\n    ./probe.sh",
       timestamp: "t",
       ...over,
@@ -149,10 +149,10 @@ describe("provider dialogs in the CLI attach loop", () => {
   it("renders a yes/no with its message and remembers it as pending", () => {
     const state = newStreamRenderState();
     const out = renderStreamMessage(request(), state);
-    expect(out).toContain("Allow a command declared by an installed skill?");
+    expect(out).toContain("Allow the skill command `./probe.sh`?");
     expect(out).toContain("./probe.sh");
     expect(out).toContain("'yes' or 'no'");
-    expect(state.pendingDialog).toEqual({ requestId: "r1", method: "confirm" });
+    expect(state.dialogs.map((d) => d.dialog)).toEqual([{ requestId: "r1", method: "confirm" }]);
   });
 
   it("numbers a pick list, and strips escapes from untrusted text", () => {
@@ -173,15 +173,31 @@ describe("provider dialogs in the CLI attach loop", () => {
       { type: "session.ui_resolved", sessionId: "s1", requestId: "r1", reason: "interrupted", timestamp: "t" } as unknown as DaemonMessage,
       state,
     );
-    expect(state.pendingDialog).toBeNull();
+    expect(state.dialogs).toEqual([]);
     expect(out).toContain("question closed: interrupted");
-    // A resolution for some other dialog leaves the pending one alone.
-    renderStreamMessage(request({ requestId: "r2" }), state);
-    renderStreamMessage(
+  });
+
+  it("queues several pending questions: shows the oldest, then the next once it resolves", () => {
+    const state = newStreamRenderState();
+    expect(renderStreamMessage(request({ requestId: "r1", title: "First?" }), state)).toContain("First?");
+    // The second waits its turn, silently; a re-send of the first is ignored.
+    expect(renderStreamMessage(request({ requestId: "r2", title: "Second?" }), state)).toBe("");
+    expect(renderStreamMessage(request({ requestId: "r1", title: "First?" }), state)).toBe("");
+    expect(state.dialogs.map((d) => d.dialog.requestId)).toEqual(["r1", "r2"]);
+    const next = renderStreamMessage(
       { type: "session.ui_resolved", sessionId: "s1", requestId: "r1", reason: "answered", timestamp: "t" } as unknown as DaemonMessage,
       state,
     );
-    expect(state.pendingDialog?.requestId).toBe("r2");
+    expect(next).toContain("Second?");
+    expect(state.dialogs.map((d) => d.dialog.requestId)).toEqual(["r2"]);
+    // Resolving a queued (unshown) one prints nothing.
+    renderStreamMessage(request({ requestId: "r3", title: "Third?" }), state);
+    expect(
+      renderStreamMessage(
+        { type: "session.ui_resolved", sessionId: "s1", requestId: "r3", reason: "cancelled", timestamp: "t" } as unknown as DaemonMessage,
+        state,
+      ),
+    ).toBe("");
   });
 });
 

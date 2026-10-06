@@ -99,7 +99,6 @@ import {
   MAX_SPURIOUS_RESTS,
   PHASE_COMPLETION_CONTRACT,
   PHASE_CONTINUE_NUDGE,
-  PHASE_NO_INPUT_NUDGE,
   stripNeedInputMarker,
   stripPhaseCompleteMarker,
 } from "./pipeline/phase-completion.js";
@@ -3715,8 +3714,10 @@ mcpHub: this.#mcpHub,
    * capability role (+ constitution + subagents) to the live session, refreshes
    * the autonomous turn budget, injects the phase prompt (streamed to attached
    * clients), and resolves when the session next rests. There is NO per-phase
-   * timeout (the session is attended) and the session is NOT torn down between
-   * phases. Satisfies the pipeline package's PhaseTurnHost.
+   * timeout and the session is NOT torn down between phases. The phase runs
+   * unattended (#348): nothing in it prompts — a skill command must be
+   * pre-approved, and a question halts the phase. Satisfies the pipeline
+   * package's PhaseTurnHost.
    *
    * `model` on the request is the phase's persisted binding
    * (docs/role-model-binding.md §3): it is applied to the bound session for
@@ -3808,7 +3809,7 @@ mcpHub: this.#mcpHub,
     // prompt — a skill command must be pre-approved, and a question halts the
     // phase. Cleared in the finally, so a human chatting in this session
     // afterwards gets normal dialogs.
-    session.unattended = true;
+    const endUnattended = session.beginUnattended();
     try {
       while (true) {
         const done = new Promise<PhaseTurnResult["finalStatus"]>((resolve) => {
@@ -3822,6 +3823,12 @@ mcpHub: this.#mcpHub,
           textAtSend = session.lastAssistantText ?? "";
         }
         const finalStatus = await done;
+        // A failed turn usually leaves no assistant text, and lastAssistantText
+        // would then be a PREVIOUS phase's output: report why it failed — e.g.
+        // the "codeoid skill allow …" a blocked skill command names (#348).
+        if (finalStatus === "error") {
+          return { finalStatus, text: session.lastTurnError ?? summary(session.lastAssistantText ?? "") };
+        }
         const text = session.lastAssistantText ?? "";
         // A non-idle rest (error / budget-exhausted) is a real phase failure.
         if (finalStatus !== "idle") return { finalStatus, text: summary(text) };
@@ -3853,34 +3860,12 @@ mcpHub: this.#mcpHub,
         }
         // The model needs the user's input. Surface the question as an input
         // dialog and feed the answer back as the next turn — a REAL answer is a
-        // legitimate pause (not a nudge), so it resets the give-up budget; a
-        // dismissed / interrupted dialog falls through to the bounded nudge path
-        // so repeated dismissals can't loop forever. Guarded on NEW text, same as
-        // completion above — never a stale marker from the prior phase.
+        // Guarded on NEW text, same as completion above — never a stale marker
+        // from the prior phase. A phase runs unattended (#348): nobody is at a
+        // keyboard to answer, so the phase halts on its question — answered
+        // with revise, durably — rather than nudging the agent into guessing.
         if (text !== textAtSend && isNeedInput(text)) {
-          const resp = await session.requestUserInput({
-            method: "input",
-            title: "The agent needs your input to continue this phase",
-            message: stripNeedInputMarker(text),
-            placeholder: "Type your answer…",
-          });
-          if (session.turnInterrupted) return { finalStatus: "idle", text: summary(text) };
-          // A phase turn is unattended (#348): nobody is at a keyboard to
-          // answer, so halt the phase on its question — answered with revise —
-          // rather than nudge the agent into guessing. (A dismissal is a choice
-          // not to answer; this is not.)
-          if (resp.cancelled && resp.reason === "unattended") {
-            return { finalStatus: "needs_input", text: stripNeedInputMarker(text) };
-          }
-          if (!resp.cancelled && resp.value && resp.value.trim().length > 0) {
-            pendingSend = resp.value;
-            nudges = 0;
-            continue;
-          }
-          if (nudges >= MAX_PHASE_NUDGES) return { finalStatus: "idle", text: summary(text) };
-          nudges += 1;
-          pendingSend = PHASE_NO_INPUT_NUDGE;
-          continue;
+          return { finalStatus: "needs_input", text: stripNeedInputMarker(text) };
         }
         // Rested with new output but no marker (an intermediate pause). Nudge to
         // continue, bounded; after the cap, hand what it has to the human review
@@ -3890,7 +3875,7 @@ mcpHub: this.#mcpHub,
         pendingSend = PHASE_CONTINUE_NUDGE;
       }
     } finally {
-      session.unattended = false;
+      endUnattended();
       this.#phaseWaiters.delete(req.sessionId);
       // Restore the pre-phase model — reliable even on phase failure. Skipped
       // when the model changed underneath us (the user ran set_model mid-phase;

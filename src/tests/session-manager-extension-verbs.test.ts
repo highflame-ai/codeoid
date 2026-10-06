@@ -274,6 +274,12 @@ describe("skill.grant", () => {
     expect(store.getSkillCommandGrants(workspaceIdFromPath(canonical, OWNER)).get("Bash(./probe.sh)")).toBe(false);
   });
 
+  it("refuses a wildcard command at the protocol boundary", async () => {
+    const { parseClientMessage } = await import("@highflame/codeoid-protocol/schemas");
+    const parsed = parseClientMessage({ type: "skill.grant", id: "g5", workdir: tmp, command: "cat *", allowed: true });
+    expect(parsed.ok).toBe(false);
+  });
+
   it("needs settings:write", async () => {
     const approver = scoped([SCOPES.SESSION_APPROVE, SCOPES.SETTINGS_READ]);
     const res = await manager.handle(

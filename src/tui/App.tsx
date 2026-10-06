@@ -329,14 +329,17 @@ export function App({ config }: Props) {
       if (state.modal) return;
 
       // Dialog hotkeys — y/n for a yes/no, a digit for a pick list — only on an
-      // empty prompt, like the approval keys below.
-      if (pendingDialog && state.input.length === 0) {
+      // empty prompt, like the approval keys below, and never with Ctrl/Meta
+      // (Ink delivers Ctrl-N as "n": it must open a session, not answer No).
+      if (pendingDialog && state.input.length === 0 && !key.ctrl && !key.meta) {
         if (pendingDialog.method === "confirm" && /^[yYnN]$/.test(input)) {
           answerDialog({ confirmed: input === "y" || input === "Y" });
           return;
         }
         const options = pendingDialog.options ?? [];
-        if (pendingDialog.method === "select" && /^[1-9]$/.test(input) && Number(input) <= options.length) {
+        // One keystroke picks only when every option has a single digit; with
+        // ten or more, type the number and press Enter.
+        if (pendingDialog.method === "select" && options.length <= 9 && /^[1-9]$/.test(input) && Number(input) <= options.length) {
           answerDialog({ value: options[Number(input) - 1] });
           return;
         }
@@ -346,6 +349,8 @@ export function App({ config }: Props) {
       if (
         focusedSession?.pendingApproval &&
         state.input.length === 0 &&
+        !key.ctrl &&
+        !key.meta &&
         (input === "y" || input === "Y" || input === "n" || input === "N")
       ) {
         const approved = input === "y" || input === "Y";

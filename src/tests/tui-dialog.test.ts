@@ -19,6 +19,11 @@ describe("TUI dialog hint", () => {
     );
   });
 
+  it("with ten or more options, a number is typed and sent with Enter (one key can't reach 10)", () => {
+    const options = Array.from({ length: 10 }, (_, i) => `o${i + 1}`);
+    expect(dialogHint({ requestId: "r", method: "select", title: "Pick", options })).toContain("type a number, Enter");
+  });
+
   it("a free-text question says Enter sends the answer", () => {
     expect(dialogHint({ requestId: "r", method: "input", title: "Which language?" })).toContain("type your answer");
   });

@@ -668,12 +668,14 @@ export class Session {
   /** Set at the start of destroy(): no wake or adopted turn may start after it. */
   #destroyed = false;
   /**
-   * True while the daemon drives this session with nobody at the keyboard (a
-   * pipeline phase). Like `claude -p`, an unattended turn never prompts: a
+   * Nonzero while the daemon drives this session with nobody at the keyboard
+   * (a pipeline phase; see beginUnattended). Like `claude -p`, an unattended turn never prompts: a
    * dialog is answered at once as cancelled with reason `unattended`, and the
    * caller applies its policy (#348).
    */
-  #unattended = false;
+  #unattended = 0;
+  /** errorMessage of the most recent turn if it ended in an error; cleared when a turn starts. */
+  #lastTurnError: string | null = null;
 
   #subagents = new Map<
     string,
@@ -1209,6 +1211,12 @@ export class Session {
   /** Number of turns (user + assistant) in the canonical history. */
   get historyLength(): number { return this.#accumulator.history.length; }
   /**
+   * Why the most recent turn failed (its errorMessage), or null when it did
+   * not. A failed turn often produces no assistant text, so a caller reporting
+   * the failure — a pipeline phase — needs this, not lastAssistantText.
+   */
+  get lastTurnError(): string | null { return this.#lastTurnError; }
+  /**
    * Role of the MOST RECENT canonical turn (undefined before any turn). Right
    * after `send()` the last turn is our USER prompt/nudge; a transient query-loop
    * rebuild idle rests there WITHOUT the model committing anything, so the last
@@ -1546,7 +1554,7 @@ export class Session {
    * cancelled answer carries `reason`. An unattended turn never waits.
    */
   requestUserInput(req: UiRequest): Promise<UiResponse> {
-    if (this.#unattended) return Promise.resolve({ cancelled: true, reason: "unattended" });
+    if (this.#unattended > 0) return Promise.resolve({ cancelled: true, reason: "unattended" });
     const requestId = randomUUID();
     const msg: SessionUiRequestMsg = {
       type: "session.ui_request",
@@ -1576,11 +1584,22 @@ export class Session {
 
   /** Whether the daemon is driving this session unattended (see #unattended). */
   get unattended(): boolean {
-    return this.#unattended;
+    return this.#unattended > 0;
   }
 
-  set unattended(value: boolean) {
-    this.#unattended = value;
+  /**
+   * Mark this session unattended until the returned release is called (once;
+   * later calls are no-ops). Counted, not a flag, so overlapping unattended
+   * runs don't end it early for each other.
+   */
+  beginUnattended(): () => void {
+    this.#unattended += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.#unattended -= 1;
+    };
   }
 
   /** Count of unanswered provider dialogs (StatusBar / watchdog signal). */
@@ -1803,6 +1822,7 @@ export class Session {
     this.#store.audit(sender.sub, "session.send", this.id);
     // A new turn is starting — clear any interrupt from the previous one.
     this.#turnInterrupted = false;
+    this.#lastTurnError = null;
     // Any inbound message invalidates a repeat run: the guard only claims
     // "N identical calls with nothing else happening", and this is something
     // else happening. Applies to system principals too (a background-task
@@ -2238,6 +2258,7 @@ export class Session {
     // row — which a stateless backend reached by a later switch may reject.
     this.#accumulator.pushUserTurn("(Background work finished; the agent harness delivered the results.)");
     this.#turnInterrupted = false;
+    this.#lastTurnError = null;
     // A turn with no prompt reads as the agent talking to itself; say why.
     const note = this.#makeMessage(
       "info",
@@ -4681,6 +4702,7 @@ export class Session {
         });
         if (event.result.isError) {
           const errText = event.result.errorMessage ?? "Turn ended with an error";
+          this.#lastTurnError = errText;
           const errorMsg = this.#makeMessage("system", `Error: ${errText}`, SYSTEM_IDENTITY, undefined, undefined, { event: "agent_error" });
           this.#persistAndBuffer(errorMsg);
           this.#broadcastRaw(errorMsg);
@@ -4700,7 +4722,7 @@ export class Session {
         // so #consumeEvents must NOT break on this event. Post a visible cue so
         // the user knows their approval is what unblocks it — unless the turn
         // is unattended, where the provider fails it at once with the reason.
-        if (this.#unattended) break;
+        if (this.#unattended > 0) break;
         this.#setStatus("waiting_approval");
         const note = this.#makeMessage(
           "system",

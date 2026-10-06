@@ -271,7 +271,8 @@ describe("provider dialogs: waiting, visibility, unattended", () => {
     const session = makeSession(new MockSessionProvider("mock"), "unattended");
     const web = makeClient([CAPABILITIES.UI_DIALOGS]);
     session.attach(web);
-    session.unattended = true;
+    const endA = session.beginUnattended();
+    const endB = session.beginUnattended(); // an overlapping unattended run
     expect(await session.requestUserInput({ method: "confirm", title: "Allow?" })).toEqual({
       cancelled: true,
       reason: "unattended",
@@ -279,8 +280,13 @@ describe("provider dialogs: waiting, visibility, unattended", () => {
     // Nothing was raised or left pending.
     expect(uiRequestsIn(web.received)).toHaveLength(0);
     expect(session.pendingUiRequestCount).toBe(0);
-    // Attended again (the phase ended): dialogs work normally.
-    session.unattended = false;
+    // One run ending (twice, even) leaves the other's in force.
+    endA();
+    endA();
+    expect(session.unattended).toBe(true);
+    expect((await session.requestUserInput({ method: "confirm", title: "Allow?" })).reason).toBe("unattended");
+    // Attended again (both ended): dialogs work normally.
+    endB();
     const answer = session.requestUserInput({ method: "confirm", title: "Allow?" });
     expect(uiRequestsIn(web.received)).toHaveLength(1);
     session.resolveUiRequestFromClient(uiRequestsIn(web.received)[0]!.requestId, { confirmed: false }, TEST_AUTH);

@@ -44,12 +44,16 @@ export interface StreamRenderState {
   /** approvalId of the most recent waiting_confirmation tool call, so a typed
    *  yes/no can be routed to it. */
   latestApprovalId: string | null;
-  /** The provider dialog being shown (#348) — the next typed line answers it. */
-  pendingDialog: PendingDialog | null;
+  /**
+   * Provider dialogs waiting for an answer (#348), oldest first. Only the
+   * oldest is shown; the next typed line answers it, and when it is resolved
+   * (here or on another surface) the next one is shown.
+   */
+  dialogs: Array<{ dialog: PendingDialog; prompt: string }>;
 }
 
 export function newStreamRenderState(): StreamRenderState {
-  return { streamingAssistantMsgId: null, latestApprovalId: null, pendingDialog: null };
+  return { streamingAssistantMsgId: null, latestApprovalId: null, dialogs: [] };
 }
 
 /**
@@ -137,24 +141,33 @@ export function renderStreamMessage(msg: DaemonMessage, state: StreamRenderState
     // was watching shows up here.
     case "session.ui_request": {
       const req = msg as Extract<DaemonMessage, { type: "session.ui_request" }>;
-      state.pendingDialog = { requestId: req.requestId, method: req.method, ...(req.options ? { options: req.options } : {}) };
-      let out = `\n${RED}? ${S(req.title)}${RESET}\n`;
-      if (req.message) out += `${S(req.message)}\n`;
-      if (req.method === "confirm") out += "  Type 'yes' or 'no' (/skip to dismiss)\n";
+      if (state.dialogs.some((d) => d.dialog.requestId === req.requestId)) return ""; // re-sent
+      let prompt = `\n${RED}? ${S(req.title)}${RESET}\n`;
+      if (req.message) prompt += `${S(req.message)}\n`;
+      if (req.method === "confirm") prompt += "  Type 'yes' or 'no' (/skip to dismiss)\n";
       else if (req.method === "select") {
         (req.options ?? []).forEach((o, i) => {
-          out += `  ${i + 1}. ${S(o)}\n`;
+          prompt += `  ${i + 1}. ${S(o)}\n`;
         });
-        out += "  Type a number (/skip to dismiss)\n";
-      } else out += "  Type your answer (/skip to dismiss)\n";
-      return out;
+        prompt += "  Type a number (/skip to dismiss)\n";
+      } else prompt += "  Type your answer (/skip to dismiss)\n";
+      state.dialogs.push({
+        dialog: { requestId: req.requestId, method: req.method, ...(req.options ? { options: req.options } : {}) },
+        prompt,
+      });
+      // Shown only when it is the one being answered.
+      return state.dialogs.length === 1 ? prompt : "";
     }
 
     case "session.ui_resolved": {
       const res = msg as Extract<DaemonMessage, { type: "session.ui_resolved" }>;
-      if (state.pendingDialog?.requestId !== res.requestId) return "";
-      state.pendingDialog = null;
-      return res.reason === "answered" ? "" : `${DIM}(question closed: ${S(res.reason)})${RESET}\n`;
+      const i = state.dialogs.findIndex((d) => d.dialog.requestId === res.requestId);
+      if (i < 0) return "";
+      state.dialogs.splice(i, 1);
+      if (i > 0) return ""; // a queued one, not yet shown
+      let out = res.reason === "answered" ? "" : `${DIM}(question closed: ${S(res.reason)})${RESET}\n`;
+      if (state.dialogs[0]) out += state.dialogs[0].prompt;
+      return out;
     }
   }
   return "";
@@ -448,16 +461,16 @@ export class TerminalClient {
         continue;
       }
 
-      // A provider dialog is showing: this line answers it.
-      if (renderState.pendingDialog) {
-        const dialog = renderState.pendingDialog;
+      // A provider dialog is showing: this line answers it. Its resolution
+      // (session.ui_resolved) drops it from the queue and shows the next.
+      const dialog = renderState.dialogs[0]?.dialog;
+      if (dialog) {
         const answer = parseDialogAnswer(trimmed, dialog);
         if ("error" in answer) {
           console.log(answer.error);
           continue;
         }
         const resp = await this.#request({ type: "session.ui_response", id: randomUUID(), sessionId, requestId: dialog.requestId, ...answer });
-        if (renderState.pendingDialog?.requestId === dialog.requestId) renderState.pendingDialog = null;
         if (resp.type === "response.error") this.#printError(resp);
         continue;
       }
@@ -533,6 +546,10 @@ export class TerminalClient {
         console.error(`  Answer it with: codeoid attach ${sessionIdOrName}`);
         return;
       }
+      // Show exactly what is being answered — the title names the command,
+      // the message says what it does.
+      console.log(S(dialog.title));
+      if (dialog.message) console.log(S(dialog.message));
       const resp = await this.#request({
         type: "session.ui_response",
         id: randomUUID(),
@@ -540,7 +557,7 @@ export class TerminalClient {
         requestId: dialog.requestId,
         confirmed: approved,
       });
-      if (resp.type === "response.ok") console.log(`${approved ? "Approved" : "Denied"}: ${S(dialog.title)}`);
+      if (resp.type === "response.ok") console.log(approved ? "Approved." : "Denied.");
       else this.#printError(resp);
       return;
     }

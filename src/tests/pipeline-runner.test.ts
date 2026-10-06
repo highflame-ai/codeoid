@@ -267,6 +267,51 @@ describe("pipeline runtime (real SessionManager + mock backend)", () => {
     await m2.drain(3_000);
   });
 
+  test("a failed phase reports its own error, not the previous phase's output (#348)", async () => {
+    const store2 = new Store(join(tmp, "codeoid-err2.db"));
+    const m2 = new SessionManager(store2, transcript, undefined, undefined, undefined, {
+      config: mkConfig(join(tmp, "codeoid-err2.db"), true),
+      _testProviderFactory: () =>
+        new MockSessionProvider("mock", [
+          sayTurn(`spec written\n${PHASE_COMPLETE_MARKER}`),
+          // A zero-turn failure: no assistant text, just why (an unapproved skill command).
+          errorTurn(),
+        ]),
+    });
+    const pm = m2.pipelines;
+    if (!pm) throw new Error("pipeline disabled");
+    pm.registries.skills.register({ id: "spec", kind: "slash", command: "/spec" });
+    pm.registries.skills.register({ id: "impl", kind: "slash", command: "/impl" });
+    const created = await m2.handle(
+      {
+        type: "pipeline.create",
+        id: "1",
+        name: "E",
+        workdir: join(tmp, "repo"),
+        phases: [
+          { id: "spec", kind: "skill", skill: "spec" },
+          { id: "impl", kind: "skill", skill: "impl", onFail: { action: "abort" } },
+        ],
+      },
+      AUTH,
+      CLIENT,
+    );
+    if (created.type !== "pipeline.snapshot") throw new Error(`create failed: ${JSON.stringify(created)}`);
+    const first = await m2.handle({ type: "pipeline.advance", id: "2", pipelineId: created.pipeline.id }, AUTH, CLIENT);
+    if (first.type !== "pipeline.snapshot") throw new Error(`advance failed: ${JSON.stringify(first)}`);
+    const out = await m2.handle(
+      { type: "pipeline.answer", id: "3", pipelineId: created.pipeline.id, requestId: "exit:spec", approved: true } as never,
+      AUTH,
+      CLIENT,
+    );
+    if (out.type !== "pipeline.snapshot") throw new Error(`answer failed: ${JSON.stringify(out)}`);
+    const impl = out.pipeline.phases[1];
+    expect(impl.status).toBe("failed");
+    expect(impl.reason).toContain("backend blew up");
+    expect(impl.reason).not.toContain("spec written");
+    await m2.drain(3_000);
+  });
+
   test("a phase that rests WITHOUT the completion marker is nudged to continue, not halted mid-work", async () => {
     const store2 = new Store(join(tmp, "codeoid-nudge.db"));
     const m2 = new SessionManager(store2, transcript, undefined, undefined, undefined, {

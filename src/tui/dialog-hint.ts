@@ -9,7 +9,7 @@ export function dialogHint(d: NonNullable<SessionInfo["pendingDialog"]>): string
       return `? ${title} — press y/n (or type /skip)`;
     case "select": {
       const opts = (d.options ?? []).map((o, i) => `${i + 1}) ${sanitizeTerminalOutput(o)}`).join("  ");
-      return `? ${title} — ${opts} — press a number (or type /skip)`;
+      return `? ${title} — ${opts} — ${(d.options ?? []).length <= 9 ? "press a number" : "type a number, Enter"} (or type /skip)`;
     }
     default:
       return `? ${title} — type your answer, Enter to send (or /skip)`;

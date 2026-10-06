@@ -1043,6 +1043,15 @@ export class ClaudeProvider implements SessionProvider {
     const command = m[1].trim();
     const rule = `Bash(${command})`;
     if (!this.#currentRequestUserInput) return false;
+    if (isWildcardSkillCommand(command)) {
+      // Not grantable (see skillCommandAllowRules): fail the turn now rather
+      // than ask for an approval that could never take effect.
+      this.#failSkillTurn(
+        command,
+        "it contains a wildcard (*), and allowing it would let the agent run any matching command unasked — change the skill to name an exact command",
+      );
+      return true;
+    }
     const decided = this.#init.store.getSkillCommandGrants(this.#init.workspaceId);
     if (decided.get(rule) === true) return false; // granted yet blocked → don't loop
 
@@ -1077,7 +1086,9 @@ export class ClaudeProvider implements SessionProvider {
       }
       const answer = await ask({
         method: "confirm",
-        title: "Allow a command declared by an installed skill?",
+        // The command is in the TITLE, so every surface that shows only the
+        // title — `codeoid ls`, the TUI prompt line — shows what is approved.
+        title: `Allow the skill command \`${command.length > 160 ? `${command.slice(0, 160)}…` : command}\`?`,
         message: `A skill needs to run:\n\n    ${command}\n\nIt runs when the slash command expands, before the agent starts, so it never appears in the tool stream. Approve and I'll continue automatically; the choice is remembered for this workspace.`,
       });
       // `cancelled` = dismissal / timeout / interrupt / teardown / nobody able
@@ -1090,6 +1101,14 @@ export class ClaudeProvider implements SessionProvider {
       }
       const allowed = answer.confirmed === true;
       this.#init.store.setSkillCommandGrant(this.#init.workspaceId, rule, allowed);
+      // The answering client is audited by the session (session.ui_response);
+      // this records what that answer granted, like skill.grant does.
+      this.#init.store.audit(
+        "skill-approval",
+        allowed ? "skill.grant" : "skill.deny",
+        this.#init.sessionId,
+        `command=${command}`,
+      );
       console.error(
         `[claude-provider ${this.#init.sessionId.slice(0, 8)}] skill command ${allowed ? "approved" : "denied"}: ${command.slice(0, 60)}`,
       );
@@ -1685,6 +1704,10 @@ export function skillCommandAllowRules(skillsDirs: string[]): string[] {
         // an approved grant permanently un-derivable and fail its retry.
         const argv0 = trimmed.split(/\s+/)[0] ?? "";
         if (!/^[A-Za-z0-9_./~=-]+$/.test(argv0)) continue;
+        // A grant becomes a Claude permission rule, which also covers the
+        // agent's own Bash tool — a `*` in it is a wildcard (`cat *` lets the
+        // agent cat anything, unasked). Never derive one (#348).
+        if (isWildcardSkillCommand(trimmed)) continue;
         rules.add(`Bash(${trimmed})`);
       }
     }
@@ -1714,6 +1737,12 @@ export function withMcpToolTimeout(
         : ({ ...obj, timeout: ms } as unknown as McpServerConfig);
   }
   return out;
+}
+
+/** A skill command that would become a wildcard permission rule (`*`, or a
+ *  `:*` prefix rule) — never granted (#348). */
+export function isWildcardSkillCommand(command: string): boolean {
+  return command.includes("*");
 }
 
 /** Why a skill command was not run, by why its approval got no answer. */
