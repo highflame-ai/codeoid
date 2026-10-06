@@ -53,6 +53,20 @@ describe("formatPipeline", () => {
     expect(text).toContain("pipeline revise  pl1");
   });
 
+  test("a halt on the phase's own question hints revise as the answer, not approve (#348)", () => {
+    const asking = wire({
+      cursor: 0,
+      phases: [
+        { id: "impl", status: "halted", requestId: "input:impl", reason: 'phase "impl" needs input', questions: ["Which language?"] },
+      ],
+    });
+    const text = formatPipeline(asking).join("\n");
+    expect(text).toContain("• Which language?");
+    expect(text).toContain('pipeline revise  pl1 "<answer>"');
+    expect(text).not.toContain("pipeline approve");
+    expect(text).toContain("pipeline reject  pl1");
+  });
+
   test("terminal run shows its status, no decision hint", () => {
     const text = formatPipeline(wire({ status: "done", cursor: 3, phases: [{ id: "ship", status: "passed" }] })).join("\n");
     expect(text).toContain("run done.");

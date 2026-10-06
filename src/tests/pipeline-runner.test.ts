@@ -482,7 +482,9 @@ describe("pipeline runtime (real SessionManager + mock backend)", () => {
     expect(revised.pipeline.phases[0].summary ?? "").toContain("implemented it in TypeScript");
     // The re-run prompt pairs the question with the answer.
     const rerun = mock.capturedOpts.at(-1)!.userMessage;
-    expect(rerun).toContain('Answer to your question "Which language should I use?": TypeScript');
+    expect(rerun).toContain(
+      'You asked (your own words, quoted): "Which language should I use?" — the human\'s answer: TypeScript',
+    );
     await m2.drain(3_000);
   });
 

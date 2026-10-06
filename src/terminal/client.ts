@@ -8,7 +8,7 @@ import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 import { resolveLocalToken } from "../config.js";
 import type { CodeoidConfig } from "../config.js";
-import { PROTOCOL_VERSION } from "../protocol/types.js";
+import { PIPELINE_INPUT_REQUEST_PREFIX, PROTOCOL_VERSION } from "../protocol/types.js";
 import type {
   ClientMessage,
   CollaborationConfig,
@@ -585,6 +585,14 @@ export class TerminalClient {
     const reqId = haltedRequestId(p);
     if (!reqId) {
       console.error(`Pipeline ${id} is not awaiting a decision (status: ${p.status}).`);
+      return;
+    }
+    if (kind === "approve" && reqId.startsWith(PIPELINE_INPUT_REQUEST_PREFIX)) {
+      // The daemon refuses this (it would pass the phase without the answer
+      // it asked for), and a fire-and-forget refusal never reaches the user.
+      console.error(
+        `Pipeline ${id} is waiting for an answer to the phase's question — answer it with: codeoid pipeline revise ${id} "<your answer>"`,
+      );
       return;
     }
     if (kind === "revise") {

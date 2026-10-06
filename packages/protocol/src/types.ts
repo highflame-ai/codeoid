@@ -2219,7 +2219,6 @@ export interface SessionCommandsResultMsg {
 
 // ── SDLC pipeline (docs/sdlc-pipeline.md) — additive; no version bump ─────────
 
-/** A pipeline phase projected for the wire (subset of the daemon PhaseState). */
 /**
  * `requestId` prefix of a phase halted on a QUESTION it asked that nobody
  * connected could answer (`questions` holds it). Answer with
@@ -2229,6 +2228,7 @@ export interface SessionCommandsResultMsg {
  */
 export const PIPELINE_INPUT_REQUEST_PREFIX = "input:";
 
+/** A pipeline phase projected for the wire (subset of the daemon PhaseState). */
 export interface PipelinePhaseWire {
   id: string;
   name?: string;
