@@ -504,3 +504,27 @@ describe("turn interrupt signal", () => {
     await session.destroy(TEST_AUTH);
   });
 });
+
+// #348: a pipeline phase reports WHY its turn failed — on every error path,
+// recorded before the status change that wakes the phase waiter.
+describe("lastTurnError", () => {
+  it("is set by a provider error event before the status turns error, and cleared by the next turn", async () => {
+    const provider = new MockSessionProvider("mock", [
+      [{ type: "error", message: "Skill command not run — allow it with: codeoid skill allow 'x'" } as ProviderEvent],
+      [{ type: "turn_done", result: mockResult() }],
+    ]);
+    const session = makeSession(provider, "errs");
+    let seenAtError: string | null | undefined;
+    const client = makeClient();
+    client.send = (m) => {
+      if (m.type === "session.status_change" && m.status === "error") seenAtError = session.lastTurnError;
+    };
+    session.attach(client);
+    await session.send("go", TEST_AUTH);
+    await waitFor(() => session.status === "error");
+    expect(seenAtError).toContain("codeoid skill allow");
+    await session.send("again", TEST_AUTH);
+    expect(session.lastTurnError).toBeNull();
+    await session.destroy(TEST_AUTH);
+  });
+});

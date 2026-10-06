@@ -50,10 +50,12 @@ export interface StreamRenderState {
    * (here or on another surface) the next one is shown.
    */
   dialogs: Array<{ dialog: PendingDialog; prompt: string }>;
+  /** Which prompt was printed last — a typed yes/no answers THAT one. */
+  lastPrompt: "tool" | "dialog" | null;
 }
 
 export function newStreamRenderState(): StreamRenderState {
-  return { streamingAssistantMsgId: null, latestApprovalId: null, dialogs: [] };
+  return { streamingAssistantMsgId: null, latestApprovalId: null, dialogs: [], lastPrompt: null };
 }
 
 /**
@@ -110,6 +112,7 @@ export function renderStreamMessage(msg: DaemonMessage, state: StreamRenderState
           const name = S(sm.tool?.name ?? sm.content);
           if (phase === "waiting_confirmation") {
             state.latestApprovalId = sm.tool?.state?.approvalId ?? null;
+            state.lastPrompt = "tool";
             return `\n${id}${RED}⚡ ${name}: ${S(sm.tool?.state?.description)}${RESET}\n  Type 'yes' to approve, 'no' to deny\n`;
           }
           return `\n${id}${YELLOW}⚡ ${name} [${phase}]${RESET}\n`;
@@ -156,7 +159,9 @@ export function renderStreamMessage(msg: DaemonMessage, state: StreamRenderState
         prompt,
       });
       // Shown only when it is the one being answered.
-      return state.dialogs.length === 1 ? prompt : "";
+      if (state.dialogs.length !== 1) return "";
+      state.lastPrompt = "dialog";
+      return prompt;
     }
 
     case "session.ui_resolved": {
@@ -166,7 +171,10 @@ export function renderStreamMessage(msg: DaemonMessage, state: StreamRenderState
       state.dialogs.splice(i, 1);
       if (i > 0) return ""; // a queued one, not yet shown
       let out = res.reason === "answered" ? "" : `${DIM}(question closed: ${S(res.reason)})${RESET}\n`;
-      if (state.dialogs[0]) out += state.dialogs[0].prompt;
+      if (state.dialogs[0]) {
+        out += state.dialogs[0].prompt;
+        state.lastPrompt = "dialog";
+      }
       return out;
     }
   }
@@ -461,17 +469,31 @@ export class TerminalClient {
         continue;
       }
 
+      // A tool approval printed after the question is what a yes/no answers;
+      // then the question is shown again.
+      const toolPromptLast = renderState.lastPrompt === "tool" && renderState.latestApprovalId;
       // A provider dialog is showing: this line answers it. Its resolution
       // (session.ui_resolved) drops it from the queue and shows the next.
       const dialog = renderState.dialogs[0]?.dialog;
-      if (dialog) {
+      if (dialog && !(toolPromptLast && (trimmed === "yes" || trimmed === "no"))) {
         const answer = parseDialogAnswer(trimmed, dialog);
         if ("error" in answer) {
           console.log(answer.error);
           continue;
         }
         const resp = await this.#request({ type: "session.ui_response", id: randomUUID(), sessionId, requestId: dialog.requestId, ...answer });
-        if (resp.type === "response.error") this.#printError(resp);
+        if (resp.type === "response.error") {
+          // Not answerable from here (already resolved, or no session:approve):
+          // drop it so the next line isn't parsed as an answer again.
+          this.#printError(resp);
+          const i = renderState.dialogs.findIndex((d) => d.dialog.requestId === dialog.requestId);
+          if (i >= 0) renderState.dialogs.splice(i, 1);
+          const next = renderState.dialogs[0];
+          if (next && i === 0) {
+            process.stdout.write(next.prompt);
+            renderState.lastPrompt = "dialog";
+          }
+        }
         continue;
       }
 
@@ -484,6 +506,13 @@ export class TerminalClient {
           approved: trimmed === "yes",
         });
         renderState.latestApprovalId = null;
+        renderState.lastPrompt = null;
+        // Back to the question that was waiting behind the tool approval.
+        const head = renderState.dialogs[0];
+        if (head) {
+          process.stdout.write(head.prompt);
+          renderState.lastPrompt = "dialog";
+        }
         continue;
       }
 

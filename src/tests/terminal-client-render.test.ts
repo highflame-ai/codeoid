@@ -177,6 +177,24 @@ describe("provider dialogs in the CLI attach loop", () => {
     expect(out).toContain("question closed: interrupted");
   });
 
+  it("remembers which prompt was printed last, so a typed yes/no answers that one", () => {
+    const state = newStreamRenderState();
+    renderStreamMessage(request(), state);
+    expect(state.lastPrompt).toBe("dialog");
+    renderStreamMessage(
+      {
+        type: "session.message",
+        role: "tool_call",
+        content: "Bash",
+        messageId: "m1",
+        tool: { name: "Bash", state: { phase: "waiting_confirmation", approvalId: "a1", description: "ls" } },
+      } as unknown as DaemonMessage,
+      state,
+    );
+    expect(state.lastPrompt).toBe("tool");
+    expect(state.latestApprovalId).toBe("a1");
+  });
+
   it("queues several pending questions: shows the oldest, then the next once it resolves", () => {
     const state = newStreamRenderState();
     expect(renderStreamMessage(request({ requestId: "r1", title: "First?" }), state)).toContain("First?");

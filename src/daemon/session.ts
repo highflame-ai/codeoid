@@ -4244,6 +4244,8 @@ export class Session {
       if (!this.#activeRun) return; // torn down, ignore
       const emsg = err instanceof Error ? err.message : String(err);
       console.error(`[codeoid/session ${this.id}] provider event consumer failed:`, err);
+      // Before the status change: it wakes a pipeline phase waiter that reads it.
+      this.#lastTurnError = emsg;
       this.#setStatus("error");
       const errorMsg = this.#makeMessage("system", `Error: ${emsg}`, SYSTEM_IDENTITY, undefined, undefined, { event: "agent_error", errorCode: "agent_error" });
       this.#persistAndBuffer(errorMsg);
@@ -4739,6 +4741,7 @@ export class Session {
 
       case "error": {
         console.error(`[codeoid/session ${this.id}] provider error:`, event.message);
+        this.#lastTurnError = event.message; // before the status change (see above)
         this.#setStatus("error");
         const errorMsg = this.#makeMessage("system", `Error: ${event.message}`, SYSTEM_IDENTITY, undefined, undefined, { event: "agent_error" });
         this.#persistAndBuffer(errorMsg);

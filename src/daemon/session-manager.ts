@@ -1979,7 +1979,7 @@ mcpHub: this.#mcpHub,
     }
     const command = msg.command.trim();
     this.#store.setSkillCommandGrant(workspaceIdFromPath(workdir, auth), `Bash(${command})`, msg.allowed);
-    this.#store.audit(auth.sub, msg.allowed ? "skill.grant" : "skill.deny", "", `workdir=${workdir} command=${command}`);
+    this.#store.audit(auth.sub, msg.allowed ? "skill.grant" : "skill.deny", "", `workdir=${workdir} command=${redact(command)}`);
     return { type: "skill.grant.result", requestId: msg.id, workdir, command, allowed: msg.allowed };
   }
 
