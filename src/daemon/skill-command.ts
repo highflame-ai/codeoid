@@ -40,7 +40,9 @@ export function splitAllowedToolsLikeCli(list: string): string[] {
  *     as an escape), are refused outright.
  */
 export function isUngrantableSkillCommand(command: string): boolean {
-  if (command.includes("*") || /\\[()]/.test(command)) return true;
+  // A trailing backslash escapes the rule's closing `)`: the CLI then reads the
+  // whole thing as an unknown tool name — safe, but an approval that can never work.
+  if (command.includes("*") || /\\[()]/.test(command) || command.endsWith("\\")) return true;
   let depth = 0;
   for (const ch of command) {
     if (ch === "(") depth += 1;

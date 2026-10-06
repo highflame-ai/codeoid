@@ -1049,7 +1049,7 @@ export class ClaudeProvider implements SessionProvider {
       // than ask for an approval that could never take effect.
       this.#failSkillTurn(
         command,
-        "it cannot be safely written as a permission rule (a * wildcard, unbalanced parentheses, or a backslash before one) — allowing it could let the agent run more than this command unasked; change the skill to name a plain command",
+        "it cannot be safely written as one exact permission rule (a * wildcard, unbalanced parentheses, text after an inner ')', or a stray backslash) — allowing it could let the agent run more than this command unasked; change the skill to name a plain command",
       );
       return true;
     }

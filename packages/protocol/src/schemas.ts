@@ -558,7 +558,7 @@ export const skillGrantSchema = z.object({
     .max(4096)
     .regex(/^[^`\n\r*]+$/, "a skill command is one line with no backtick and no * wildcard")
     .refine(
-      (c) => !/\\[()]/.test(c) && parensBalanced(c) && survivesRuleSplit(c),
+      (c) => !/\\[()]/.test(c) && !c.trim().endsWith("\\") && parensBalanced(c) && survivesRuleSplit(c),
       "a skill command must stay one exact Bash(…) rule: balanced parentheses, and nothing after an inner ')' that would split it",
     )
     // Whitespace-only would be stored as `Bash()` — every Bash command.

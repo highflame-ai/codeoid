@@ -21,6 +21,8 @@ describe("isUngrantableSkillCommand", () => {
 
   it("refuses a backslash before a paren, which the CLI may count differently", () => {
     expect(isUngrantableSkillCommand("echo \\( x )")).toBe(true);
+    expect(isUngrantableSkillCommand("echo foo\\")).toBe(true); // escapes the rule's closing ')'
+    expect(isUngrantableSkillCommand("grep -c 'a\\|b' f")).toBe(false); // a backslash elsewhere is fine
   });
 
   it("refuses a command whose rule the CLI would split — it keeps a parens FLAG, not a depth", () => {

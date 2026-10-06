@@ -967,7 +967,7 @@ describe("ClaudeProvider – skill-command approval (#233)", () => {
     expect(asked).toBe(false);
     const done = events.find((e) => e.type === "turn_done") as Extract<ProviderEvent, { type: "turn_done" }>;
     expect(done.result.isError).toBe(true);
-    expect(done.result.errorMessage).toContain("cannot be safely written as a permission rule");
+    expect(done.result.errorMessage).toContain("cannot be safely written as one exact permission rule");
     expect(writes).toEqual([]);
     await provider.teardown?.();
     rmSync(tmp, { recursive: true, force: true });
@@ -986,7 +986,7 @@ describe("ClaudeProvider – skill-command approval (#233)", () => {
     for await (const e of run.events) events.push(e);
     await Bun.sleep(5);
     const done = events.find((e) => e.type === "turn_done") as Extract<ProviderEvent, { type: "turn_done" }>;
-    expect(done.result.errorMessage).toContain("cannot be safely written as a permission rule");
+    expect(done.result.errorMessage).toContain("cannot be safely written as one exact permission rule");
     await provider.teardown?.();
     rmSync(tmp, { recursive: true, force: true });
   });
