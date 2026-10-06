@@ -908,6 +908,30 @@ describe("ClaudeProvider – skill-command approval (#233)", () => {
     rmSync(tmp, { recursive: true, force: true });
   });
 
+  it("says where to approve when no client could show the dialog (#348)", async () => {
+    const tmp = skillDir("---\nname: s\n---\n!`sh headless.sh`\n");
+    const { store, writes } = statefulStore();
+    const provider = new ClaudeProvider({ sessionId: "h", initialBackingId: "b", workspaceId: "ws", store });
+    sdkMessages = [blockFor("sh headless.sh"), zeroTurn];
+
+    const run = provider.runTurn({
+      history: [], userMessage: "/spec", workdir: tmp,
+      canUseTool: async () => ({ behavior: "allow" as const }),
+      requestUserInput: async () => ({ cancelled: true, reason: "no_client" as const }),
+    });
+    const events: ProviderEvent[] = [];
+    for await (const e of run.events) events.push(e);
+    await Bun.sleep(5);
+
+    const done = events.find((e) => e.type === "turn_done") as Extract<ProviderEvent, { type: "turn_done" }>;
+    expect(done.result.isError).toBe(true);
+    expect(done.result.errorMessage).toContain("no client that can show approval dialogs");
+    expect(done.result.errorMessage).toContain("sh headless.sh");
+    expect(writes).toEqual([]);
+    await provider.teardown?.();
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
   it("does not loop: an already-granted command that still blocks fails terminally", async () => {
     const tmp = skillDir("---\nname: s\n---\n!`sh broken.sh`\n");
     const { store } = statefulStore({ "Bash(sh broken.sh)": true }); // already granted

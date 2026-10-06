@@ -42,7 +42,7 @@ import { FLEET_TOOL_NAMES } from "../../fleet.js";
 import { rewriteBashToolInput } from "../../compress/index.js";
 import type { CodeoidConfig } from "../../../config.js";
 import type { AuthContext } from "../../../protocol/types.js";
-import type { SessionProvider, ModelInfo, NormalizedTurnResult, ProviderEvent, SessionScopedEvent, TurnOpts, TurnRun, CatalogEntry } from "../interface.js";
+import type { SessionProvider, ModelInfo, NormalizedTurnResult, ProviderEvent, SessionScopedEvent, TurnOpts, TurnRun, CatalogEntry, UiResponse } from "../interface.js";
 import { isBackgroundLifecycleEvent } from "../interface.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
 import { buildSubprocessEnv, withGatewayCredential } from "../env.js";
@@ -1080,11 +1080,12 @@ export class ClaudeProvider implements SessionProvider {
         title: "Allow a command declared by an installed skill?",
         message: `A skill needs to run:\n\n    ${command}\n\nIt runs when the slash command expands, before the agent starts, so it never appears in the tool stream. Approve and I'll continue automatically; the choice is remembered for this workspace.`,
       });
-      // `cancelled` = dismissal / timeout / interrupt / teardown — "no answer",
-      // never consent. Persist nothing (so a real decision can still be made
-      // later) but fail THIS turn, since a parked turn would otherwise hang.
+      // `cancelled` = dismissal / timeout / interrupt / teardown / nobody able
+      // to answer — "no answer", never consent. Persist nothing (so a real
+      // decision can still be made later) but fail THIS turn, since a parked
+      // turn would otherwise hang.
       if (answer.cancelled) {
-        this.#failSkillTurn(command, "the approval was dismissed");
+        this.#failSkillTurn(command, SKILL_NO_ANSWER[answer.reason ?? "dismissed"]);
         return;
       }
       const allowed = answer.confirmed === true;
@@ -1714,6 +1715,17 @@ export function withMcpToolTimeout(
   }
   return out;
 }
+
+/** Why a skill command was not run, by why its approval got no answer. */
+const SKILL_NO_ANSWER: Record<NonNullable<UiResponse["reason"]>, string> = {
+  dismissed: "the approval was dismissed",
+  timeout: "the approval timed out",
+  interrupted: "the turn was interrupted before it was approved",
+  // A headless run (CLI/TUI, `pipeline run`) attaches nothing that can show
+  // the dialog, so say where it CAN be answered (#348).
+  no_client:
+    "no client that can show approval dialogs was attached — open this session in the web UI (or Telegram) and send again to approve it",
+};
 
 /** Registry servers (external, non-builtin) for the claude backend as SDK
  *  McpServerConfigs — a native mount, since claude's SDK owns its MCP client.

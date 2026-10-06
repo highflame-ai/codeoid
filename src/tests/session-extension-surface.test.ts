@@ -70,7 +70,11 @@ afterEach(async () => {
   try { rmSync(tmp, { recursive: true, force: true }); } catch {}
 });
 
-function makeSession(provider: MockSessionProvider, name = "ext-test"): Session {
+function makeSession(
+  provider: MockSessionProvider,
+  name = "ext-test",
+  extra: { dialogNoClientGraceMs?: number } = {},
+): Session {
   const id = randomUUID();
   store.createSession({
     id,
@@ -91,6 +95,7 @@ function makeSession(provider: MockSessionProvider, name = "ext-test"): Session 
     transcriptStore,
     existingId: id,
     _testProvider: provider,
+    ...extra,
   });
 }
 
@@ -175,7 +180,7 @@ describe("provider dialogs (session.ui_request)", () => {
       timeoutMs: 30,
     });
     const resolved = await answer;
-    expect(resolved.cancelled).toBe(true);
+    expect(resolved).toEqual({ cancelled: true, reason: "timeout" });
     expect(uiResolvedIn(client.received)[0]!.reason).toBe("timeout");
     expect(session.pendingUiRequestCount).toBe(0);
 
@@ -192,7 +197,7 @@ describe("provider dialogs (session.ui_request)", () => {
     await session.interrupt(TEST_AUTH);
 
     const resolved = await answer;
-    expect(resolved.cancelled).toBe(true);
+    expect(resolved).toEqual({ cancelled: true, reason: "interrupted" });
     expect(uiResolvedIn(client.received)[0]!.reason).toBe("interrupted");
 
     await session.destroy(TEST_AUTH);
@@ -217,6 +222,69 @@ describe("provider dialogs (session.ui_request)", () => {
     const resolved = await answer;
     expect(resolved).toEqual({ confirmed: true, cancelled: false });
 
+    await session.destroy(TEST_AUTH);
+  });
+});
+
+// #348: a dialog nobody can render must not park a headless turn forever.
+describe("provider dialogs with no client able to answer", () => {
+  const GRACE = 40;
+
+  it("U5: settles as no_client when only headless clients are attached", async () => {
+    const session = makeSession(new MockSessionProvider("mock"), "headless", { dialogNoClientGraceMs: GRACE });
+    const cli = makeClient(); // CLI/TUI: declares no ui.dialogs
+    session.attach(cli);
+
+    // No timeoutMs — the skill-approval call shape from the issue.
+    const resolved = await session.requestUserInput({ method: "confirm", title: "Allow?" });
+    expect(resolved).toEqual({ cancelled: true, reason: "no_client" });
+    expect(session.pendingUiRequestCount).toBe(0);
+    await session.destroy(TEST_AUTH);
+  });
+
+  it("U6: with a capable client attached, waits for the human past the grace period", async () => {
+    const session = makeSession(new MockSessionProvider("mock"), "watched", { dialogNoClientGraceMs: GRACE });
+    const web = makeClient([CAPABILITIES.UI_DIALOGS]);
+    session.attach(web);
+    let settled = false;
+    const answer = session.requestUserInput({ method: "confirm", title: "Allow?" }).then((r) => {
+      settled = true;
+      return r;
+    });
+    await Bun.sleep(GRACE * 3);
+    expect(settled).toBe(false);
+    const req = uiRequestsIn(web.received)[0]!;
+    session.resolveUiRequestFromClient(req.requestId, { confirmed: true }, TEST_AUTH);
+    expect(await answer).toEqual({ confirmed: true, cancelled: false });
+    await session.destroy(TEST_AUTH);
+  });
+
+  it("U7: a capable client attaching lifts the deadline; its leaving re-arms it", async () => {
+    const session = makeSession(new MockSessionProvider("mock"), "handoff", { dialogNoClientGraceMs: GRACE });
+    let settled = false;
+    const answer = session.requestUserInput({ method: "confirm", title: "Allow?" }).then((r) => {
+      settled = true;
+      return r;
+    });
+    // Reattach from another device inside the grace period.
+    const phone = makeClient([CAPABILITIES.UI_DIALOGS]);
+    session.attach(phone);
+    await Bun.sleep(GRACE * 3);
+    expect(settled).toBe(false);
+    // The last capable client leaves: nothing can answer it any more.
+    session.detach(phone.id);
+    expect(await answer).toEqual({ cancelled: true, reason: "no_client" });
+    await session.destroy(TEST_AUTH);
+  });
+
+  it("U8: a client's dismissal reports reason dismissed", async () => {
+    const session = makeSession(new MockSessionProvider("mock"));
+    const web = makeClient([CAPABILITIES.UI_DIALOGS]);
+    session.attach(web);
+    const answer = session.requestUserInput({ method: "confirm", title: "Allow?" });
+    const req = uiRequestsIn(web.received)[0]!;
+    session.resolveUiRequestFromClient(req.requestId, { cancelled: true }, TEST_AUTH);
+    expect(await answer).toEqual({ cancelled: true, reason: "dismissed" });
     await session.destroy(TEST_AUTH);
   });
 });

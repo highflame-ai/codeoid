@@ -141,6 +141,23 @@ const SUBAGENT_REGISTRATION_FENCE_MS = 5_000;
 const BACKGROUND_WAKE_FALLBACK_MS = 20_000;
 
 /**
+ * How long a provider dialog may wait while NO client that can render dialogs
+ * (`ui.dialogs`) is attached. Past it the dialog settles as cancelled with
+ * reason `no_client`, so a headless run (CLI/TUI, `pipeline run`) fails the
+ * step loudly instead of parking forever (#348). Long enough to reattach from
+ * another device; a capable client attaching lifts the deadline entirely.
+ */
+const DIALOG_NO_CLIENT_GRACE_MS = 120_000;
+
+/** Why a dialog settled without an answer, from the wire `ui_resolved` reason. */
+const CANCEL_REASON: Record<SessionUiResolvedMsg["reason"], NonNullable<UiResponse["reason"]>> = {
+  answered: "dismissed",
+  cancelled: "dismissed",
+  timeout: "timeout",
+  interrupted: "interrupted",
+};
+
+/**
  * A task digest as it sits inside the wake's <background_tasks> block. The
  * digest is sub-agent output, which tool content can steer, so it must not be
  * able to end the block and speak outside its "NOT a message from the owner"
@@ -268,6 +285,8 @@ export interface SessionCreateOptions {
   modelWindow?: (scope: WindowScope, providerId: string, model: string) => number | undefined;
   /** Override for BACKGROUND_WAKE_FALLBACK_MS (tests). */
   backgroundWakeFallbackMs?: number;
+  /** Override for DIALOG_NO_CLIENT_GRACE_MS (tests). */
+  dialogNoClientGraceMs?: number;
   /** Optional memory engine — when provided, episodes are chunked and stored for recall. */
   memory?: MemoryEngine;
   /** Shared in-daemon memory MCP endpoint + URL, for URL-mounting backends. */
@@ -657,6 +676,7 @@ export class Session {
   /** Pending fallback wake for a self-continuing backend (#armBackgroundWakeFallback). */
   #backgroundWakeFallback: ReturnType<typeof setTimeout> | null = null;
   #backgroundWakeFallbackMs = BACKGROUND_WAKE_FALLBACK_MS;
+  #dialogNoClientGraceMs = DIALOG_NO_CLIENT_GRACE_MS;
   /** Set at the start of destroy(): no wake or adopted turn may start after it. */
   #destroyed = false;
 
@@ -727,7 +747,9 @@ export class Session {
    * requestId. Settled by the first client `session.ui_response`, by the
    * request's own timeout, or by interrupt/destroy (as cancelled). Pending
    * requests are re-sent to newly attaching capable clients so a dialog
-   * raised while nobody was watching still gets answered.
+   * raised while nobody was watching still gets answered — within
+   * DIALOG_NO_CLIENT_GRACE_MS (`noClientTimer`, armed only while no capable
+   * client is attached).
    */
   #pendingUiRequests = new Map<
     string,
@@ -735,6 +757,7 @@ export class Session {
       msg: SessionUiRequestMsg;
       resolve: (r: UiResponse) => void;
       timer?: ReturnType<typeof setTimeout>;
+      noClientTimer?: ReturnType<typeof setTimeout>;
     }
   >();
 
@@ -826,6 +849,7 @@ export class Session {
     this.#onModelLimits = opts.onModelLimits;
     this.#modelWindow = opts.modelWindow;
     this.#backgroundWakeFallbackMs = opts.backgroundWakeFallbackMs ?? BACKGROUND_WAKE_FALLBACK_MS;
+    this.#dialogNoClientGraceMs = opts.dialogNoClientGraceMs ?? DIALOG_NO_CLIENT_GRACE_MS;
     this.#hookBus = opts.hooks;
     // Advisory guard. Config is validated in the guard constructor and fails
     // loud there; here we degrade to "no guard" and log, because an advisory
@@ -1321,6 +1345,7 @@ export class Session {
         client.send(pending.msg);
       }
     }
+    this.#syncDialogDeadlines();
 
     // Incremental resume (`replay.resume`): when the client's cursor belongs
     // to THIS replay buffer (key match), replay only the entries mutated
@@ -1515,6 +1540,7 @@ export class Session {
     if (client) {
       this.#store.audit(client.auth.sub, "session.detach", this.id);
       this.#clients.delete(clientId);
+      this.#syncDialogDeadlines();
     }
   }
 
@@ -1523,8 +1549,10 @@ export class Session {
   /**
    * Raise a dialog on behalf of the provider and await the user's answer.
    * Passed to providers as `TurnOpts.requestUserInput`. The promise settles
-   * when the first client answers, the request times out (`timeoutMs`), or
-   * the session is interrupted/destroyed — never rejects.
+   * when the first client answers, the request times out (`timeoutMs`), no
+   * client that can render it is attached for DIALOG_NO_CLIENT_GRACE_MS, or
+   * the session is interrupted/destroyed — never rejects. A cancelled answer
+   * carries `reason`, so the provider can say why it got no answer.
    */
   requestUserInput(req: UiRequest): Promise<UiResponse> {
     const requestId = randomUUID();
@@ -1550,7 +1578,31 @@ export class Session {
           : undefined;
       this.#pendingUiRequests.set(requestId, { msg, resolve, timer });
       this.#broadcastToCapable(CAPABILITIES.UI_DIALOGS, msg);
+      this.#syncDialogDeadlines();
     });
+  }
+
+  /**
+   * Arm or lift each pending dialog's no-client deadline to match who is
+   * attached. With a capable client present a dialog waits for that human,
+   * however long (like a tool approval); with none, nothing can ever answer
+   * it, so it gets DIALOG_NO_CLIENT_GRACE_MS for one to arrive. Called on
+   * every change to either side: a dialog raised, a client attached/detached.
+   */
+  #syncDialogDeadlines(): void {
+    const answerable = [...this.#clients.values()].some((c) =>
+      c.capabilities?.includes(CAPABILITIES.UI_DIALOGS),
+    );
+    for (const [requestId, pending] of this.#pendingUiRequests) {
+      if (answerable && pending.noClientTimer) {
+        clearTimeout(pending.noClientTimer);
+        pending.noClientTimer = undefined;
+      } else if (!answerable && !pending.noClientTimer) {
+        pending.noClientTimer = setTimeout(() => {
+          this.#settleUiRequest(requestId, { cancelled: true, reason: "no_client" }, "timeout");
+        }, this.#dialogNoClientGraceMs);
+      }
+    }
   }
 
   /** Count of unanswered provider dialogs (StatusBar / watchdog signal). */
@@ -1601,7 +1653,12 @@ export class Session {
     if (!pending) return false;
     this.#pendingUiRequests.delete(requestId);
     if (pending.timer) clearTimeout(pending.timer);
-    pending.resolve(response);
+    if (pending.noClientTimer) clearTimeout(pending.noClientTimer);
+    pending.resolve(
+      response.cancelled && response.reason === undefined
+        ? { ...response, reason: CANCEL_REASON[reason] }
+        : response,
+    );
     this.#broadcastToCapable(CAPABILITIES.UI_DIALOGS, {
       type: "session.ui_resolved",
       sessionId: this.id,
@@ -1627,6 +1684,8 @@ export class Session {
         client.send(msg);
       } catch {
         this.#clients.delete(client.id);
+        // Dropping the last capable client leaves pending dialogs unanswerable.
+        queueMicrotask(() => this.#syncDialogDeadlines());
       }
     }
   }

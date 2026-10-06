@@ -83,6 +83,13 @@ export interface UiResponse {
   value?: string;
   confirmed?: boolean;
   cancelled: boolean;
+  /**
+   * Why a cancelled dialog got no answer: a client dismissed it, its own
+   * `timeoutMs` elapsed, the turn was interrupted / the session torn down, or
+   * no client able to render it was attached (`no_client` — a headless run).
+   * Absent when answered.
+   */
+  reason?: "dismissed" | "timeout" | "interrupted" | "no_client";
 }
 
 /** Raise a dialog and await the user's answer. Implemented by Session. */
