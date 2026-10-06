@@ -748,6 +748,7 @@ export class DaemonServer {
               );
             }
             self.#sockets.set(data.clientId, { ws: ws as unknown as WebSocket, clientId: data.clientId, auth: data.auth });
+            self.#manager.clientConnected(data.clientId, data.auth, data.capabilities);
 
             ws.send(JSON.stringify({
               type: "auth.ok",

@@ -112,7 +112,7 @@ import { mcpOAuthBindingCookieName, type McpOAuth, type McpOAuthProof, type McpT
 import { isOAuthServer, type McpServerSpec, NATIVE_MOUNT_BACKENDS } from "./mcp/types.js";
 import { type CodeoidConfig, DEFAULT_PROVIDER_ENV, loadConfig, mutateConfigFile, validateConfigObject } from "../config.js";
 import type { CompressionRegistry } from "./compress/index.js";
-import { ORCHESTRATOR_ROLE } from "../protocol/types.js";
+import { CAPABILITIES, ORCHESTRATOR_ROLE } from "../protocol/types.js";
 import type {
   AuthContext,
   ClientMessage,
@@ -374,6 +374,7 @@ export class SessionManager {
   /** The daemon's hook bus — one instance, shared by every session. */
   #hooks?: HookBus;
   #testProviderFactory?: () => SessionProvider;
+  #testDialogNoClientGraceMs?: number;
   /** Bound run-sessions awaiting a phase turn to rest, keyed by session id. A
    *  pipeline run drives phases on a live session; the phase resolves when that
    *  session next reaches a resting status (see #statusObserver). */
@@ -447,6 +448,8 @@ export class SessionManager {
        * subprocess. Mirrors SessionCreateOptions._testProvider.
        */
       _testProviderFactory?: () => SessionProvider;
+      /** Test-only: DIALOG_NO_CLIENT_GRACE_MS for every Session this manager constructs. */
+      _testDialogNoClientGraceMs?: number;
     },
   ) {
     this.#store = store;
@@ -460,6 +463,7 @@ export class SessionManager {
     this.#providers = opts?.providers ?? createDefaultProviderRegistry(opts?.config);
     this.#hooks = opts?.hooks;
     this.#testProviderFactory = opts?._testProviderFactory;
+    this.#testDialogNoClientGraceMs = opts?._testDialogNoClientGraceMs;
     this.#dispatcher = new Dispatcher(store, this.#makeDispatcherHost(), {
       ...opts?.config?.dispatch,
       daemonId: opts?.daemonId,
@@ -756,7 +760,7 @@ mcpHub: this.#mcpHub,
             : undefined,
           _testProvider: this.#testProviderFactory?.(),
           onStatusChange: this.#statusObserver,
-          ...this.#modelHooks,
+          ...this.#sessionHooks,
         });
 
         // Restore scrollback from transcript, seeding the seq counter past
@@ -1338,7 +1342,7 @@ mcpHub: this.#mcpHub,
               compressionRegistry: this.#compressionRegistry,
               _testProvider: this.#testProviderFactory?.(),
           onStatusChange: this.#statusObserver,
-              ...this.#modelHooks,
+              ...this.#sessionHooks,
             });
             this.#sessions.set(session.id, session);
             this.#rateLimiter.recordCreation(auth.sub);
@@ -1542,6 +1546,18 @@ mcpHub: this.#mcpHub,
    * ninth path that forgot them would compile and silently neither teach nor
    * consult the window cache.
    */
+  /** Daemon-level callbacks every Session gets (spread into each constructor). */
+  get #sessionHooks() {
+    return {
+      ...this.#modelHooks,
+      dialogAnswererConnected: (accountId: string, projectId: string) =>
+        this.#dialogAnswerers.has(accountId, projectId),
+      ...(this.#testDialogNoClientGraceMs !== undefined
+        ? { dialogNoClientGraceMs: this.#testDialogNoClientGraceMs }
+        : {}),
+    };
+  }
+
   readonly #modelHooks = {
     onModels: (providerId: string, m: ReadonlyArray<CatalogEntry>) => this._cacheModels(providerId, m),
     onModelLimits: (scope: WindowScope, providerId: string, model: string, window: number) =>
@@ -1549,6 +1565,30 @@ mcpHub: this.#mcpHub,
     modelWindow: (scope: WindowScope, providerId: string, model: string) =>
       this.modelContextWindow(scope, providerId, model),
   };
+
+  /**
+   * Connected clients that can answer a session's dialogs (#348) — declared
+   * `ui.dialogs` and hold `session:approve` — per tenant, whether or not they
+   * are attached to the session raising one. The web UI attaches only the
+   * session in focus; a user watching the fleet view is still there to answer.
+   */
+  readonly #dialogAnswerers = new DialogAnswerers();
+
+  /**
+   * Record an authenticated connection. One that can answer dialogs lifts the
+   * no-client deadline on its tenant's pending dialogs (Session
+   * #syncDialogDeadlines); `disconnectClient` re-arms them.
+   */
+  clientConnected(clientId: string, auth: AuthContext, capabilities: readonly string[] | undefined): void {
+    if (!this.#dialogAnswerers.connect(clientId, auth, capabilities)) return;
+    this.#syncDialogDeadlines(auth.accountId, auth.projectId);
+  }
+
+  #syncDialogDeadlines(accountId: string, projectId: string): void {
+    for (const session of this.#sessions.values()) {
+      if (session.accountId === accountId && session.projectId === projectId) session.syncDialogDeadlines();
+    }
+  }
 
   /**
    * The model catalog to serve for a provider, best source first:
@@ -2440,6 +2480,8 @@ mcpHub: this.#mcpHub,
     for (const session of this.#sessions.values()) {
       session.detach(clientId);
     }
+    const tenant = this.#dialogAnswerers.disconnect(clientId);
+    if (tenant) this.#syncDialogDeadlines(tenant.accountId, tenant.projectId);
     // Also drop any fleet subscription — otherwise a dead socket keeps getting
     // deltas pushed at it for the life of the daemon.
     this.#fleetSubscribers.delete(clientId);
@@ -2842,7 +2884,7 @@ mcpHub: this.#mcpHub,
       compressionRegistry: this.#compressionRegistry,
       _testProvider: this.#testProviderFactory?.(),
       onStatusChange: this.#statusObserver,
-      ...this.#modelHooks,
+      ...this.#sessionHooks,
     });
 
     // Resolve the thunk the fleet server closes over. Set before any child
@@ -3248,7 +3290,7 @@ mcpHub: this.#mcpHub,
           compressionRegistry: this.#compressionRegistry,
           _testProvider: this.#testProviderFactory?.(),
           onStatusChange: this.#statusObserver,
-          ...this.#modelHooks,
+          ...this.#sessionHooks,
         });
         this.#sessions.set(childSession.id, childSession);
         if (blackboard) this.#blackboardTokens.set(childSession.id, blackboard.token);
@@ -3488,7 +3530,7 @@ mcpHub: this.#mcpHub,
         compressionRegistry: this.#compressionRegistry,
         _testProvider: this.#testProviderFactory?.(),
         onStatusChange: this.#statusObserver,
-        ...this.#modelHooks,
+        ...this.#sessionHooks,
       });
       // A fork on the same (provider, model) as its parent runs the model the
       // parent already reported a window for. Adopting it before seeding is
@@ -3622,7 +3664,7 @@ mcpHub: this.#mcpHub,
       compressionRegistry: this.#compressionRegistry,
       _testProvider: this.#testProviderFactory?.(),
       onStatusChange: this.#statusObserver,
-      ...this.#modelHooks,
+      ...this.#sessionHooks,
     });
 
     this.#sessions.set(session.id, session);
@@ -3833,6 +3875,10 @@ mcpHub: this.#mcpHub,
             placeholder: "Type your answer…",
           });
           if (session.turnInterrupted) return { finalStatus: "idle", text: summary(text) };
+          // Nobody connected can answer (a headless run, #348): pause the
+          // phase with its question showing rather than nudge the agent into
+          // guessing — a dismissal is a choice not to answer, this is not.
+          if (resp.cancelled && resp.reason === "no_client") return { finalStatus: "idle", text: summary(text) };
           if (!resp.cancelled && resp.value && resp.value.trim().length > 0) {
             pendingSend = resp.value;
             nudges = 0;
@@ -3900,7 +3946,7 @@ mcpHub: this.#mcpHub,
       compressionRegistry: this.#compressionRegistry,
       _testProvider: this.#testProviderFactory?.(),
       onStatusChange: this.#statusObserver,
-      ...this.#modelHooks,
+      ...this.#sessionHooks,
     });
     this.#sessions.set(session.id, session);
     return session;
@@ -4400,7 +4446,7 @@ mcpHub: this.#mcpHub,
           compressionRegistry: this.#compressionRegistry,
           _testProvider: this.#testProviderFactory?.(),
           onStatusChange: this.#statusObserver,
-          ...this.#modelHooks,
+          ...this.#sessionHooks,
         });
         this.#sessions.set(session.id, session);
         // No rate-limiter charge: the dispatcher's own worker cap governs
@@ -5927,4 +5973,29 @@ async function resolveImportPath(
 
 function tenantOf(auth: AuthContext): McpTenant {
   return { accountId: auth.accountId, projectId: auth.projectId };
+}
+
+/** Connected dialog-answering clients, by tenant (see SessionManager.#dialogAnswerers). */
+class DialogAnswerers {
+  readonly #byClient = new Map<string, { accountId: string; projectId: string }>();
+
+  /** Track `clientId` if it can answer dialogs; true when it was added. */
+  connect(clientId: string, auth: AuthContext, capabilities: readonly string[] | undefined): boolean {
+    if (!capabilities?.includes(CAPABILITIES.UI_DIALOGS)) return false;
+    if (!hasScope(auth.scopes as string[], SCOPES.SESSION_APPROVE)) return false;
+    this.#byClient.set(clientId, { accountId: auth.accountId, projectId: auth.projectId });
+    return true;
+  }
+
+  /** Forget `clientId`; its tenant when it was tracked. */
+  disconnect(clientId: string): { accountId: string; projectId: string } | undefined {
+    const tenant = this.#byClient.get(clientId);
+    this.#byClient.delete(clientId);
+    return tenant;
+  }
+
+  has(accountId: string, projectId: string): boolean {
+    for (const t of this.#byClient.values()) if (t.accountId === accountId && t.projectId === projectId) return true;
+    return false;
+  }
 }

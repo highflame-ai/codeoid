@@ -189,4 +189,15 @@ describe("ask-user tool", () => {
     expect(out).toMatch(/dismissed|no answer|without answering/i);
     expect(events.find((e) => e.type === "tool_complete")).toMatchObject({ success: false });
   });
+
+  test("with nobody able to answer, says so instead of claiming the user dismissed it (#348)", async () => {
+    const events: ProviderEvent[] = [];
+    const out = await executeAskUserCall(
+      { question: "Proceed?" },
+      { requestUserInput: async () => ({ cancelled: true, reason: "no_client" }), emit: (e) => events.push(e) },
+    );
+    expect(out).toMatch(/nobody was available/i);
+    expect(out).not.toMatch(/dismissed/i);
+    expect(events.find((e) => e.type === "tool_complete")).toMatchObject({ success: false });
+  });
 });

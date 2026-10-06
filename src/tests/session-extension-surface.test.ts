@@ -35,6 +35,7 @@ import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
 import { Session, type AttachedClient } from "../daemon/session.js";
 import { MockSessionProvider, mockResult } from "../daemon/providers/mock/session-provider.js";
+import { SCOPES } from "../protocol/scopes.js";
 import { CAPABILITIES } from "../protocol/types.js";
 import type {
   AuthContext,
@@ -73,7 +74,10 @@ afterEach(async () => {
 function makeSession(
   provider: MockSessionProvider,
   name = "ext-test",
-  extra: { dialogNoClientGraceMs?: number } = {},
+  extra: {
+    dialogNoClientGraceMs?: number;
+    dialogAnswererConnected?: (accountId: string, projectId: string) => boolean;
+  } = {},
 ): Session {
   const id = randomUUID();
   store.createSession({
@@ -100,11 +104,14 @@ function makeSession(
 }
 
 /** In-memory client that records everything it's sent. */
-function makeClient(capabilities?: string[]): AttachedClient & { received: DaemonMessage[] } {
+function makeClient(
+  capabilities?: string[],
+  scopes: string[] = [SCOPES.SESSION_APPROVE],
+): AttachedClient & { received: DaemonMessage[] } {
   const received: DaemonMessage[] = [];
   return {
     id: randomUUID(),
-    auth: TEST_AUTH,
+    auth: { ...TEST_AUTH, scopes: scopes as AuthContext["scopes"] },
     capabilities,
     received,
     send: (m) => { received.push(m); },
@@ -273,6 +280,42 @@ describe("provider dialogs with no client able to answer", () => {
     expect(settled).toBe(false);
     // The last capable client leaves: nothing can answer it any more.
     session.detach(phone.id);
+    expect(await answer).toEqual({ cancelled: true, reason: "no_client" });
+    await session.destroy(TEST_AUTH);
+  });
+
+  it("U9: a watch-only client (no session:approve) does not hold the deadline off", async () => {
+    const session = makeSession(new MockSessionProvider("mock"), "watcher", { dialogNoClientGraceMs: GRACE });
+    const watcher = makeClient([CAPABILITIES.UI_DIALOGS], [SCOPES.SESSION_WATCH]);
+    session.attach(watcher);
+    const resolved = await session.requestUserInput({ method: "confirm", title: "Allow?" });
+    // It still SAW the dialog — it just cannot answer it.
+    expect(uiRequestsIn(watcher.received)).toHaveLength(1);
+    expect(resolved).toEqual({ cancelled: true, reason: "no_client" });
+    await session.destroy(TEST_AUTH);
+  });
+
+  it("U10: a client connected elsewhere in the tenant holds the deadline off; losing it re-arms", async () => {
+    let connected = true;
+    const asked: Array<[string, string]> = [];
+    const session = makeSession(new MockSessionProvider("mock"), "fleet-view", {
+      dialogNoClientGraceMs: GRACE,
+      dialogAnswererConnected: (a, p) => {
+        asked.push([a, p]);
+        return connected;
+      },
+    });
+    let settled = false;
+    const answer = session.requestUserInput({ method: "confirm", title: "Allow?" }).then((r) => {
+      settled = true;
+      return r;
+    });
+    await Bun.sleep(GRACE * 3);
+    expect(settled).toBe(false);
+    // Asked about THIS session's tenant.
+    expect(asked[0]).toEqual([TEST_AUTH.accountId!, TEST_AUTH.projectId!]);
+    connected = false;
+    session.syncDialogDeadlines(); // the manager calls in on a disconnect
     expect(await answer).toEqual({ cancelled: true, reason: "no_client" });
     await session.destroy(TEST_AUTH);
   });

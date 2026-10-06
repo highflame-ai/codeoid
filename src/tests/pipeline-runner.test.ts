@@ -419,6 +419,42 @@ describe("pipeline runtime (real SessionManager + mock backend)", () => {
     await m2.drain(3_000);
   });
 
+  test("a headless phase asking for input pauses with its question instead of guessing (#348)", async () => {
+    const store2 = new Store(join(tmp, "codeoid-headless.db"));
+    const m2 = new SessionManager(store2, transcript, undefined, undefined, undefined, {
+      config: mkConfig(join(tmp, "codeoid-headless.db"), true),
+      _testDialogNoClientGraceMs: 40,
+      _testProviderFactory: () =>
+        new MockSessionProvider("mock", [
+          sayTurn(`Which language should I use?\n${PHASE_NEEDS_INPUT_MARKER}`),
+          // Only reached if the runner nudged the agent to assume an answer.
+          sayTurn(`guessed: implemented it in COBOL\n${PHASE_COMPLETE_MARKER}`),
+        ]),
+    });
+    const pm = m2.pipelines;
+    if (!pm) throw new Error("pipeline disabled");
+    pm.registries.skills.register({ id: "impl", kind: "slash", command: "/impl" });
+    const created = await m2.handle(
+      {
+        type: "pipeline.create",
+        id: "1",
+        name: "H",
+        workdir: join(tmp, "repo"),
+        phases: [{ id: "impl", kind: "skill", skill: "impl" }],
+      },
+      AUTH,
+      CLIENT,
+    );
+    if (created.type !== "pipeline.snapshot") throw new Error(`create failed: ${JSON.stringify(created)}`);
+    // No client that can show the dialog is connected anywhere.
+    const out = await m2.handle({ type: "pipeline.advance", id: "2", pipelineId: created.pipeline.id }, AUTH, CLIENT);
+    if (out.type !== "pipeline.snapshot") throw new Error(`advance failed: ${JSON.stringify(out)}`);
+    const ph = out.pipeline.phases[0];
+    expect(ph.summary).toContain("Which language");
+    expect(ph.summary).not.toContain("COBOL");
+    await m2.drain(3_000);
+  });
+
   test("get pipelines() is undefined when the pipeline is disabled", () => {
     const store2 = new Store(join(tmp, "codeoid2.db"));
     const m2 = new SessionManager(store2, transcript, undefined, undefined, undefined, {

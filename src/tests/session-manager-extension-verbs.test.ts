@@ -49,6 +49,7 @@ beforeEach(() => {
   mock = new MockSessionProvider("mock");
   manager = new SessionManager(store, transcript, undefined, undefined, undefined, {
     _testProviderFactory: () => mock,
+    _testDialogNoClientGraceMs: 40,
   });
 });
 
@@ -249,5 +250,50 @@ describe("session.part_action", () => {
       client(OWNER),
     );
     expect(missing).toMatchObject({ type: "response.error", code: "not_found" });
+  });
+});
+
+// #348: a dialog is answerable while a capable approver is connected anywhere
+// in the tenant — the web UI attaches only the session in focus.
+describe("dialog deadline follows connected approvers", () => {
+  const raise = (session: NonNullable<ReturnType<SessionManager["findByName"]>>) => {
+    const state = { settled: false };
+    const answer = session.requestUserInput({ method: "confirm", title: "Allow?" }).then((r) => {
+      state.settled = true;
+      return r;
+    });
+    return { state, answer };
+  };
+
+  it("a connected web client, not attached, holds the deadline; disconnecting re-arms it", async () => {
+    await createSession();
+    const session = manager.findByName("ext", OWNER)!;
+    manager.clientConnected("web-1", OWNER, ["ui.dialogs"]);
+    const { state, answer } = raise(session);
+    await Bun.sleep(150);
+    expect(state.settled).toBe(false);
+    manager.disconnectClient("web-1");
+    expect(await answer).toEqual({ cancelled: true, reason: "no_client" });
+  });
+
+  it("does not count a client of another tenant, a watch-only client, or one without ui.dialogs", async () => {
+    await createSession();
+    const session = manager.findByName("ext", OWNER)!;
+    manager.clientConnected("other-tenant", { ...OWNER, accountId: "acc-other" }, ["ui.dialogs"]);
+    manager.clientConnected("watcher", scoped([SCOPES.SESSION_WATCH]), ["ui.dialogs"]);
+    manager.clientConnected("cli", OWNER, undefined);
+    const { answer } = raise(session);
+    expect(await answer).toEqual({ cancelled: true, reason: "no_client" });
+  });
+
+  it("a capable client connecting lifts a deadline already running", async () => {
+    await createSession();
+    const session = manager.findByName("ext", OWNER)!;
+    const { state, answer } = raise(session);
+    manager.clientConnected("web-late", OWNER, ["ui.dialogs"]);
+    await Bun.sleep(150);
+    expect(state.settled).toBe(false);
+    await session.interrupt(OWNER);
+    expect(await answer).toEqual({ cancelled: true, reason: "interrupted" });
   });
 });
