@@ -179,6 +179,15 @@ export class TuiWsClient {
     });
   }
 
+  /** Answer a provider dialog (#348) by its request id. */
+  uiRespond(
+    sessionId: string,
+    requestId: string,
+    answer: { value?: string; confirmed?: boolean; cancelled?: boolean },
+  ): Promise<DaemonMessage> {
+    return this.#request({ type: "session.ui_response", id: randomUUID(), sessionId, requestId, ...answer });
+  }
+
   destroy(sessionId: string): Promise<DaemonMessage> {
     return this.#request({ type: "session.destroy", id: randomUUID(), sessionId });
   }

@@ -15,6 +15,7 @@ import {
   newStreamRenderState,
 } from "../terminal/client.js";
 import type { DaemonMessage } from "../protocol/types.js";
+import { type PendingDialog, parseDialogAnswer } from "../terminal/dialog.js";
 
 // An OSC 52 clipboard-write sequence — the headline injection vector.
 const OSC52 = "\x1b]52;c;ZXZpbA==\x07";
@@ -128,5 +129,83 @@ describe("renderStreamMessage — sanitization", () => {
       newStreamRenderState(),
     );
     expect(out).toBe("\n[status] thinking\n");
+  });
+});
+
+// #348: an interactive attach shows provider dialogs and answers them.
+describe("provider dialogs in the CLI attach loop", () => {
+  const request = (over: Record<string, unknown> = {}) =>
+    ({
+      type: "session.ui_request",
+      sessionId: "s1",
+      requestId: "r1",
+      method: "confirm",
+      title: "Allow a command declared by an installed skill?",
+      message: "A skill needs to run:\n\n    ./probe.sh",
+      timestamp: "t",
+      ...over,
+    }) as unknown as DaemonMessage;
+
+  it("renders a yes/no with its message and remembers it as pending", () => {
+    const state = newStreamRenderState();
+    const out = renderStreamMessage(request(), state);
+    expect(out).toContain("Allow a command declared by an installed skill?");
+    expect(out).toContain("./probe.sh");
+    expect(out).toContain("'yes' or 'no'");
+    expect(state.pendingDialog).toEqual({ requestId: "r1", method: "confirm" });
+  });
+
+  it("numbers a pick list, and strips escapes from untrusted text", () => {
+    const state = newStreamRenderState();
+    const out = renderStreamMessage(
+      request({ method: "select", title: "Pick\x1b]52;c;ZXZpbA==\x07 one", message: undefined, options: ["pg", "my\x1b[2Jsql"] }),
+      state,
+    );
+    expect(out).toContain("1. pg");
+    expect(out).toContain("2. mysql");
+    noEscapes(out.replace(/\x1b\[(?:3[16]|2|0)m/g, ""));
+  });
+
+  it("forgets the dialog when it is resolved elsewhere, saying so unless it was answered", () => {
+    const state = newStreamRenderState();
+    renderStreamMessage(request(), state);
+    const out = renderStreamMessage(
+      { type: "session.ui_resolved", sessionId: "s1", requestId: "r1", reason: "interrupted", timestamp: "t" } as unknown as DaemonMessage,
+      state,
+    );
+    expect(state.pendingDialog).toBeNull();
+    expect(out).toContain("question closed: interrupted");
+    // A resolution for some other dialog leaves the pending one alone.
+    renderStreamMessage(request({ requestId: "r2" }), state);
+    renderStreamMessage(
+      { type: "session.ui_resolved", sessionId: "s1", requestId: "r1", reason: "answered", timestamp: "t" } as unknown as DaemonMessage,
+      state,
+    );
+    expect(state.pendingDialog?.requestId).toBe("r2");
+  });
+});
+
+describe("parseDialogAnswer", () => {
+  it("confirm: yes/no in either case; anything else re-prompts", () => {
+    const d = { requestId: "r", method: "confirm" } as const;
+    expect(parseDialogAnswer("Y", d)).toEqual({ confirmed: true });
+    expect(parseDialogAnswer("no", d)).toEqual({ confirmed: false });
+    expect(parseDialogAnswer("maybe", d)).toHaveProperty("error");
+  });
+
+  it("select: a 1-based number or the exact option", () => {
+    const d: PendingDialog = { requestId: "r", method: "select", options: ["pg", "mysql"] };
+    expect(parseDialogAnswer("2", d)).toEqual({ value: "mysql" });
+    expect(parseDialogAnswer("pg", d)).toEqual({ value: "pg" });
+    expect(parseDialogAnswer("3", d)).toHaveProperty("error");
+    expect(parseDialogAnswer("0", d)).toHaveProperty("error");
+  });
+
+  it("input: the trimmed line; empty re-prompts; /skip dismisses any kind", () => {
+    const d = { requestId: "r", method: "input" } as const;
+    expect(parseDialogAnswer("  TypeScript ", d)).toEqual({ value: "TypeScript" });
+    expect(parseDialogAnswer("   ", d)).toHaveProperty("error");
+    expect(parseDialogAnswer("/skip", d)).toEqual({ cancelled: true });
+    expect(parseDialogAnswer("/skip", { requestId: "r", method: "confirm" })).toEqual({ cancelled: true });
   });
 });

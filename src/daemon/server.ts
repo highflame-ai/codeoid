@@ -739,8 +739,7 @@ export class DaemonServer {
             }
             // The socket closed while the token was verifying: its close
             // handler has already run, so registering it now would leave a
-            // dead entry behind — in #sockets, and as a connected dialog
-            // answerer holding its tenant's dialog deadlines off for good.
+            // dead entry in #sockets for good.
             if (data.closed) return;
 
             data.authenticated = true;
@@ -755,7 +754,6 @@ export class DaemonServer {
               );
             }
             self.#sockets.set(data.clientId, { ws: ws as unknown as WebSocket, clientId: data.clientId, auth: data.auth });
-            self.#manager.clientConnected(data.clientId, data.auth, data.capabilities);
 
             ws.send(JSON.stringify({
               type: "auth.ok",

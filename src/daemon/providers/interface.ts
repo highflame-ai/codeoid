@@ -76,8 +76,8 @@ export interface UiRequest {
 
 /**
  * The user's answer to a `UiRequest`. `cancelled: true` covers dismissal,
- * timeout, interrupt, session teardown, and no client able to answer — `reason`
- * says which. Providers must treat it as "no answer", never as consent.
+ * timeout, interrupt, session teardown, and an unattended turn — `reason` says
+ * which. Providers must treat it as "no answer", never as consent.
  */
 export interface UiResponse {
   value?: string;
@@ -86,10 +86,10 @@ export interface UiResponse {
   /**
    * Why a cancelled dialog got no answer: a client dismissed it, its own
    * `timeoutMs` elapsed, the turn was interrupted / the session torn down, or
-   * no client able to render it was attached (`no_client` — a headless run).
-   * Absent when answered.
+   * the turn is unattended (`unattended` — the daemon is driving it, e.g. a
+   * pipeline phase, and never prompts). Absent when answered.
    */
-  reason?: "dismissed" | "timeout" | "interrupted" | "no_client";
+  reason?: "dismissed" | "timeout" | "interrupted" | "unattended";
 }
 
 /** Raise a dialog and await the user's answer. Implemented by Session. */

@@ -112,7 +112,7 @@ import { mcpOAuthBindingCookieName, type McpOAuth, type McpOAuthProof, type McpT
 import { isOAuthServer, type McpServerSpec, NATIVE_MOUNT_BACKENDS } from "./mcp/types.js";
 import { type CodeoidConfig, DEFAULT_PROVIDER_ENV, loadConfig, mutateConfigFile, validateConfigObject } from "../config.js";
 import type { CompressionRegistry } from "./compress/index.js";
-import { CAPABILITIES, ORCHESTRATOR_ROLE } from "../protocol/types.js";
+import { ORCHESTRATOR_ROLE } from "../protocol/types.js";
 import type {
   AuthContext,
   ClientMessage,
@@ -374,7 +374,6 @@ export class SessionManager {
   /** The daemon's hook bus — one instance, shared by every session. */
   #hooks?: HookBus;
   #testProviderFactory?: () => SessionProvider;
-  #testDialogNoClientGraceMs?: number;
   /** Bound run-sessions awaiting a phase turn to rest, keyed by session id. A
    *  pipeline run drives phases on a live session; the phase resolves when that
    *  session next reaches a resting status (see #statusObserver). */
@@ -448,8 +447,6 @@ export class SessionManager {
        * subprocess. Mirrors SessionCreateOptions._testProvider.
        */
       _testProviderFactory?: () => SessionProvider;
-      /** Test-only: DIALOG_NO_CLIENT_GRACE_MS for every Session this manager constructs. */
-      _testDialogNoClientGraceMs?: number;
     },
   ) {
     this.#store = store;
@@ -463,7 +460,6 @@ export class SessionManager {
     this.#providers = opts?.providers ?? createDefaultProviderRegistry(opts?.config);
     this.#hooks = opts?.hooks;
     this.#testProviderFactory = opts?._testProviderFactory;
-    this.#testDialogNoClientGraceMs = opts?._testDialogNoClientGraceMs;
     this.#dispatcher = new Dispatcher(store, this.#makeDispatcherHost(), {
       ...opts?.config?.dispatch,
       daemonId: opts?.daemonId,
@@ -760,7 +756,7 @@ mcpHub: this.#mcpHub,
             : undefined,
           _testProvider: this.#testProviderFactory?.(),
           onStatusChange: this.#statusObserver,
-          ...this.#sessionHooks,
+          ...this.#modelHooks,
         });
 
         // Restore scrollback from transcript, seeding the seq counter past
@@ -1079,6 +1075,8 @@ mcpHub: this.#mcpHub,
         return this.#backendLoginSubmit(msg, auth);
       case "backend.login.cancel":
         return this.#backendLoginCancel(msg, auth);
+      case "skill.grant":
+        return this.#skillGrant(msg, auth);
       case "mcp.oauth.begin":
         return this.#mcpOAuthBegin(msg, auth);
       case "mcp.oauth.complete":
@@ -1342,7 +1340,7 @@ mcpHub: this.#mcpHub,
               compressionRegistry: this.#compressionRegistry,
               _testProvider: this.#testProviderFactory?.(),
           onStatusChange: this.#statusObserver,
-              ...this.#sessionHooks,
+              ...this.#modelHooks,
             });
             this.#sessions.set(session.id, session);
             this.#rateLimiter.recordCreation(auth.sub);
@@ -1541,24 +1539,11 @@ mcpHub: this.#mcpHub,
   }
 
   /**
-   * The daemon-level hooks every Session this manager builds gets: the model
-   * hooks plus dialog presence (#348). One object, spread at each construction
-   * site: pasting the lambdas into all eight meant a ninth path that forgot
-   * them would compile and silently neither teach nor consult the window
-   * cache, nor see a connected approver.
+   * The model hooks every Session this manager builds gets. One object, spread
+   * at each construction site: pasting the lambdas into all eight meant a
+   * ninth path that forgot them would compile and silently neither teach nor
+   * consult the window cache.
    */
-  get #sessionHooks() {
-    return {
-      ...this.#modelHooks,
-      dialogAnswererConnected: (accountId: string, projectId: string) =>
-        this.#dialogAnswerers.has(accountId, projectId),
-      ...(this.#testDialogNoClientGraceMs !== undefined
-        ? { dialogNoClientGraceMs: this.#testDialogNoClientGraceMs }
-        : {}),
-    };
-  }
-
-  /** Model catalog + context-window hooks — part of #sessionHooks. */
   readonly #modelHooks = {
     onModels: (providerId: string, m: ReadonlyArray<CatalogEntry>) => this._cacheModels(providerId, m),
     onModelLimits: (scope: WindowScope, providerId: string, model: string, window: number) =>
@@ -1567,29 +1552,7 @@ mcpHub: this.#mcpHub,
       this.modelContextWindow(scope, providerId, model),
   };
 
-  /**
-   * Connected clients that can answer a session's dialogs (#348) — declared
-   * `ui.dialogs` and hold `session:approve` — per tenant, whether or not they
-   * are attached to the session raising one. The web UI attaches only the
-   * session in focus; a user watching the fleet view is still there to answer.
-   */
-  readonly #dialogAnswerers = new DialogAnswerers((t) => this.#syncDialogDeadlines(t.accountId, t.projectId));
 
-  /**
-   * Record an authenticated connection. One that can answer dialogs lifts the
-   * no-client deadline on its tenant's pending dialogs (Session
-   * #syncDialogDeadlines); `disconnectClient` re-arms them.
-   */
-  clientConnected(clientId: string, auth: AuthContext, capabilities: readonly string[] | undefined): void {
-    if (!this.#dialogAnswerers.connect(clientId, auth, capabilities)) return;
-    this.#syncDialogDeadlines(auth.accountId, auth.projectId);
-  }
-
-  #syncDialogDeadlines(accountId: string, projectId: string): void {
-    for (const session of this.#sessions.values()) {
-      if (session.accountId === accountId && session.projectId === projectId) session.syncDialogDeadlines();
-    }
-  }
 
   /**
    * The model catalog to serve for a provider, best source first:
@@ -1996,6 +1959,29 @@ mcpHub: this.#mcpHub,
       requestId: msg.id,
       ok: this.#backendLogin.cancel(msg.loginId),
     };
+  }
+
+  /**
+   * Pre-approve (or deny) a command a skill declares, for a workspace — the
+   * `--allowedTools` of an unattended run, which never prompts (#348). The
+   * same record the approval dialog writes. `settings:write`: the command then
+   * runs unasked in every later session on that workdir.
+   */
+  #skillGrant(msg: Extract<ClientMessage, { type: "skill.grant" }>, auth: AuthContext): DaemonMessage {
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return this.#loginForbidden(msg.id);
+    const workdir = normalizeWorkdir(msg.workdir);
+    if (!workdir) {
+      return {
+        type: "response.error",
+        requestId: msg.id,
+        error: `"${msg.workdir}" is not a usable workdir`,
+        code: "invalid_request",
+      };
+    }
+    const command = msg.command.trim();
+    this.#store.setSkillCommandGrant(workspaceIdFromPath(workdir, auth), `Bash(${command})`, msg.allowed);
+    this.#store.audit(auth.sub, msg.allowed ? "skill.grant" : "skill.deny", "", `workdir=${workdir} command=${command}`);
+    return { type: "skill.grant.result", requestId: msg.id, workdir, command, allowed: msg.allowed };
   }
 
   #loginForbidden(requestId: string): DaemonMessage {
@@ -2481,8 +2467,6 @@ mcpHub: this.#mcpHub,
     for (const session of this.#sessions.values()) {
       session.detach(clientId);
     }
-    const tenant = this.#dialogAnswerers.disconnect(clientId);
-    if (tenant) this.#syncDialogDeadlines(tenant.accountId, tenant.projectId);
     // Also drop any fleet subscription — otherwise a dead socket keeps getting
     // deltas pushed at it for the life of the daemon.
     this.#fleetSubscribers.delete(clientId);
@@ -2885,7 +2869,7 @@ mcpHub: this.#mcpHub,
       compressionRegistry: this.#compressionRegistry,
       _testProvider: this.#testProviderFactory?.(),
       onStatusChange: this.#statusObserver,
-      ...this.#sessionHooks,
+      ...this.#modelHooks,
     });
 
     // Resolve the thunk the fleet server closes over. Set before any child
@@ -3291,7 +3275,7 @@ mcpHub: this.#mcpHub,
           compressionRegistry: this.#compressionRegistry,
           _testProvider: this.#testProviderFactory?.(),
           onStatusChange: this.#statusObserver,
-          ...this.#sessionHooks,
+          ...this.#modelHooks,
         });
         this.#sessions.set(childSession.id, childSession);
         if (blackboard) this.#blackboardTokens.set(childSession.id, blackboard.token);
@@ -3531,7 +3515,7 @@ mcpHub: this.#mcpHub,
         compressionRegistry: this.#compressionRegistry,
         _testProvider: this.#testProviderFactory?.(),
         onStatusChange: this.#statusObserver,
-        ...this.#sessionHooks,
+        ...this.#modelHooks,
       });
       // A fork on the same (provider, model) as its parent runs the model the
       // parent already reported a window for. Adopting it before seeding is
@@ -3665,7 +3649,7 @@ mcpHub: this.#mcpHub,
       compressionRegistry: this.#compressionRegistry,
       _testProvider: this.#testProviderFactory?.(),
       onStatusChange: this.#statusObserver,
-      ...this.#sessionHooks,
+      ...this.#modelHooks,
     });
 
     this.#sessions.set(session.id, session);
@@ -3820,6 +3804,11 @@ mcpHub: this.#mcpHub,
     };
     let nudges = 0;
     let spurious = 0;
+    // The phase runs unattended (#348): like `claude -p`, nothing in it may
+    // prompt — a skill command must be pre-approved, and a question halts the
+    // phase. Cleared in the finally, so a human chatting in this session
+    // afterwards gets normal dialogs.
+    session.unattended = true;
     try {
       while (true) {
         const done = new Promise<PhaseTurnResult["finalStatus"]>((resolve) => {
@@ -3876,10 +3865,11 @@ mcpHub: this.#mcpHub,
             placeholder: "Type your answer…",
           });
           if (session.turnInterrupted) return { finalStatus: "idle", text: summary(text) };
-          // Nobody connected can answer (a headless run, #348): halt the phase
-          // on its question rather than nudge the agent into guessing — a
-          // dismissal is a choice not to answer, this is not.
-          if (resp.cancelled && resp.reason === "no_client") {
+          // A phase turn is unattended (#348): nobody is at a keyboard to
+          // answer, so halt the phase on its question — answered with revise —
+          // rather than nudge the agent into guessing. (A dismissal is a choice
+          // not to answer; this is not.)
+          if (resp.cancelled && resp.reason === "unattended") {
             return { finalStatus: "needs_input", text: stripNeedInputMarker(text) };
           }
           if (!resp.cancelled && resp.value && resp.value.trim().length > 0) {
@@ -3900,6 +3890,7 @@ mcpHub: this.#mcpHub,
         pendingSend = PHASE_CONTINUE_NUDGE;
       }
     } finally {
+      session.unattended = false;
       this.#phaseWaiters.delete(req.sessionId);
       // Restore the pre-phase model — reliable even on phase failure. Skipped
       // when the model changed underneath us (the user ran set_model mid-phase;
@@ -3949,7 +3940,7 @@ mcpHub: this.#mcpHub,
       compressionRegistry: this.#compressionRegistry,
       _testProvider: this.#testProviderFactory?.(),
       onStatusChange: this.#statusObserver,
-      ...this.#sessionHooks,
+      ...this.#modelHooks,
     });
     this.#sessions.set(session.id, session);
     return session;
@@ -4449,7 +4440,7 @@ mcpHub: this.#mcpHub,
           compressionRegistry: this.#compressionRegistry,
           _testProvider: this.#testProviderFactory?.(),
           onStatusChange: this.#statusObserver,
-          ...this.#sessionHooks,
+          ...this.#modelHooks,
         });
         this.#sessions.set(session.id, session);
         // No rate-limiter charge: the dispatcher's own worker cap governs
@@ -5976,58 +5967,4 @@ async function resolveImportPath(
 
 function tenantOf(auth: AuthContext): McpTenant {
   return { accountId: auth.accountId, projectId: auth.projectId };
-}
-
-/** Connected dialog-answering clients, by tenant (see SessionManager.#dialogAnswerers). */
-class DialogAnswerers {
-  readonly #byClient = new Map<
-    string,
-    { accountId: string; projectId: string; exp?: number; expiry?: ReturnType<typeof setTimeout> }
-  >();
-  readonly #onExpire: (tenant: { accountId: string; projectId: string }) => void;
-
-  /** `onExpire` runs when a tracked client's token expires, so the tenant's
-   *  deadlines re-arm then rather than at that socket's next message. */
-  constructor(onExpire: (tenant: { accountId: string; projectId: string }) => void) {
-    this.#onExpire = onExpire;
-  }
-
-  /** Track `clientId` if it can answer dialogs; true when it was added. */
-  connect(clientId: string, auth: AuthContext, capabilities: readonly string[] | undefined): boolean {
-    if (!capabilities?.includes(CAPABILITIES.UI_DIALOGS)) return false;
-    if (!hasScope(auth.scopes as string[], SCOPES.SESSION_APPROVE)) return false;
-    this.disconnect(clientId);
-    const tenant = { accountId: auth.accountId, projectId: auth.projectId };
-    const exp = typeof auth.exp === "number" && auth.exp > 0 ? auth.exp : undefined;
-    // setTimeout's delay is a 32-bit int; a token living longer than ~24 days
-    // just gets no early re-check (has() still ignores it once expired).
-    const delay = exp === undefined ? undefined : exp * 1000 - Date.now() + 1000;
-    const expiry =
-      delay !== undefined && delay < 2 ** 31 - 1
-        ? setTimeout(() => this.#onExpire(tenant), Math.max(0, delay))
-        : undefined;
-    expiry?.unref?.();
-    this.#byClient.set(clientId, { ...tenant, ...(exp !== undefined ? { exp } : {}), ...(expiry ? { expiry } : {}) });
-    return true;
-  }
-
-  /** Forget `clientId`; its tenant when it was tracked. */
-  disconnect(clientId: string): { accountId: string; projectId: string } | undefined {
-    const entry = this.#byClient.get(clientId);
-    if (!entry) return undefined;
-    if (entry.expiry) clearTimeout(entry.expiry);
-    this.#byClient.delete(clientId);
-    return { accountId: entry.accountId, projectId: entry.projectId };
-  }
-
-  /** Whether one is connected in the tenant. A socket whose token has expired
-   *  is not closed until its next message, and could not answer a dialog
-   *  anyway, so it does not count. */
-  has(accountId: string, projectId: string): boolean {
-    const now = Math.floor(Date.now() / 1000);
-    for (const t of this.#byClient.values()) {
-      if (t.accountId === accountId && t.projectId === projectId && (t.exp === undefined || t.exp > now)) return true;
-    }
-    return false;
-  }
 }

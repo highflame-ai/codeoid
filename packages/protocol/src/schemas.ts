@@ -518,6 +518,18 @@ export const mcpOAuthDisconnectSchema = z.object({
   server: mcpServerNameField,
 });
 
+// ── Skill command pre-approval (#348) ─────────────────────────────────────────
+
+export const skillGrantSchema = z.object({
+  ...base,
+  type: z.literal("skill.grant"),
+  workdir: pathField.min(1),
+  // As a skill declares it inside !`…`: one line, no backticks (the same shape
+  // the provider extracts from a blocked expansion).
+  command: z.string().min(1).max(4096).regex(/^[^`\n\r]+$/, "a skill command is one line with no backticks"),
+  allowed: z.boolean(),
+});
+
 // ── The unions ────────────────────────────────────────────────────────────────
 
 // ── SDLC pipeline ─────────────────────────────────────────────────────────────
@@ -716,6 +728,7 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   backendLoginStartSchema,
   backendLoginSubmitSchema,
   backendLoginCancelSchema,
+  skillGrantSchema,
   mcpOAuthBeginSchema,
   mcpOAuthCompleteSchema,
   mcpOAuthDisconnectSchema,

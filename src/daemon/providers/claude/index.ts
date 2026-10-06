@@ -1085,7 +1085,7 @@ export class ClaudeProvider implements SessionProvider {
       // decision can still be made later) but fail THIS turn, since a parked
       // turn would otherwise hang.
       if (answer.cancelled) {
-        this.#failSkillTurn(command, SKILL_NO_ANSWER[answer.reason ?? "dismissed"]);
+        this.#failSkillTurn(command, skillNoAnswer(answer.reason ?? "dismissed", command, this.#lastTurnOpts?.workdir));
         return;
       }
       const allowed = answer.confirmed === true;
@@ -1717,15 +1717,27 @@ export function withMcpToolTimeout(
 }
 
 /** Why a skill command was not run, by why its approval got no answer. */
-const SKILL_NO_ANSWER: Record<NonNullable<UiResponse["reason"]>, string> = {
-  dismissed: "the approval was dismissed",
-  timeout: "the approval timed out",
-  interrupted: "the turn was interrupted before it was approved",
-  // A headless run (CLI/TUI, `pipeline run`) attaches nothing that can show
-  // the dialog, so say where it CAN be answered (#348).
-  no_client:
-    "no client that can show approval dialogs was attached — open this session in the web UI (or Telegram) and send again to approve it",
-};
+function skillNoAnswer(reason: NonNullable<UiResponse["reason"]>, command: string, workdir: string | undefined): string {
+  switch (reason) {
+    case "dismissed":
+      return "the approval was dismissed";
+    case "timeout":
+      return "the approval timed out";
+    case "interrupted":
+      return "the turn was interrupted before it was approved";
+    case "unattended":
+      // Like `claude -p`: an unattended run (a pipeline phase) never prompts,
+      // so a command must be allowed before the run (#348).
+      return `it is not pre-approved, and this run is unattended — allow it with: codeoid skill allow ${shellQuote(command)}${
+        workdir ? ` --workdir ${shellQuote(workdir)}` : ""
+      }`;
+  }
+}
+
+/** Single-quote for a POSIX shell, so a copied command line runs as shown. */
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
 
 /** Registry servers (external, non-builtin) for the claude backend as SDK
  *  McpServerConfigs — a native mount, since claude's SDK owns its MCP client.

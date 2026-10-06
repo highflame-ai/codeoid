@@ -89,7 +89,6 @@ import type { PackActivation } from "./pipeline/index.js";
 import type { McpRegistry } from "./mcp/registry.js";
 import type { McpHub } from "./mcp/hub.js";
 import type { Attachment } from "../protocol/types.js";
-import { hasScope, SCOPES } from "../protocol/scopes.js";
 import { resolveAttachments } from "./attachments.js";
 import type { CodeoidConfig } from "../config.js";
 import type { CompressionRegistry } from "./compress/index.js";
@@ -140,15 +139,6 @@ const SUBAGENT_REGISTRATION_FENCE_MS = 5_000;
  * that, and it bounds the stall if the backend ever does not continue.
  */
 const BACKGROUND_WAKE_FALLBACK_MS = 20_000;
-
-/**
- * How long a provider dialog may wait while NO client that can render dialogs
- * (`ui.dialogs`) is attached. Past it the dialog settles as cancelled with
- * reason `no_client`, so a headless run (CLI/TUI, `pipeline run`) fails the
- * step loudly instead of parking forever (#348). Long enough to reattach from
- * another device; a capable client attaching lifts the deadline entirely.
- */
-const DIALOG_NO_CLIENT_GRACE_MS = 120_000;
 
 /** Why a dialog settled without an answer, from the wire `ui_resolved` reason. */
 const CANCEL_REASON: Record<SessionUiResolvedMsg["reason"], NonNullable<UiResponse["reason"]>> = {
@@ -286,14 +276,6 @@ export interface SessionCreateOptions {
   modelWindow?: (scope: WindowScope, providerId: string, model: string) => number | undefined;
   /** Override for BACKGROUND_WAKE_FALLBACK_MS (tests). */
   backgroundWakeFallbackMs?: number;
-  /** Override for DIALOG_NO_CLIENT_GRACE_MS (tests). */
-  dialogNoClientGraceMs?: number;
-  /**
-   * Whether a client that can answer dialogs is connected in this tenant,
-   * attached here or not (SessionManager tracks connections). Absent: only
-   * attached clients count.
-   */
-  dialogAnswererConnected?: (accountId: string, projectId: string) => boolean;
   /** Optional memory engine — when provided, episodes are chunked and stored for recall. */
   memory?: MemoryEngine;
   /** Shared in-daemon memory MCP endpoint + URL, for URL-mounting backends. */
@@ -683,10 +665,15 @@ export class Session {
   /** Pending fallback wake for a self-continuing backend (#armBackgroundWakeFallback). */
   #backgroundWakeFallback: ReturnType<typeof setTimeout> | null = null;
   #backgroundWakeFallbackMs = BACKGROUND_WAKE_FALLBACK_MS;
-  #dialogNoClientGraceMs = DIALOG_NO_CLIENT_GRACE_MS;
-  #dialogAnswererConnected: (accountId: string, projectId: string) => boolean = () => false;
   /** Set at the start of destroy(): no wake or adopted turn may start after it. */
   #destroyed = false;
+  /**
+   * True while the daemon drives this session with nobody at the keyboard (a
+   * pipeline phase). Like `claude -p`, an unattended turn never prompts: a
+   * dialog is answered at once as cancelled with reason `unattended`, and the
+   * caller applies its policy (#348).
+   */
+  #unattended = false;
 
   #subagents = new Map<
     string,
@@ -755,9 +742,7 @@ export class Session {
    * requestId. Settled by the first client `session.ui_response`, by the
    * request's own timeout, or by interrupt/destroy (as cancelled). Pending
    * requests are re-sent to newly attaching capable clients so a dialog
-   * raised while nobody was watching still gets answered — within
-   * DIALOG_NO_CLIENT_GRACE_MS (`noClientTimer`, armed only while no capable
-   * client is attached).
+   * raised while nobody was watching still gets answered.
    */
   #pendingUiRequests = new Map<
     string,
@@ -765,7 +750,6 @@ export class Session {
       msg: SessionUiRequestMsg;
       resolve: (r: UiResponse) => void;
       timer?: ReturnType<typeof setTimeout>;
-      noClientTimer?: ReturnType<typeof setTimeout>;
     }
   >();
 
@@ -857,8 +841,6 @@ export class Session {
     this.#onModelLimits = opts.onModelLimits;
     this.#modelWindow = opts.modelWindow;
     this.#backgroundWakeFallbackMs = opts.backgroundWakeFallbackMs ?? BACKGROUND_WAKE_FALLBACK_MS;
-    this.#dialogNoClientGraceMs = opts.dialogNoClientGraceMs ?? DIALOG_NO_CLIENT_GRACE_MS;
-    if (opts.dialogAnswererConnected) this.#dialogAnswererConnected = opts.dialogAnswererConnected;
     this.#hookBus = opts.hooks;
     // Advisory guard. Config is validated in the guard constructor and fails
     // loud there; here we degrade to "no guard" and log, because an advisory
@@ -1354,7 +1336,6 @@ export class Session {
         client.send(pending.msg);
       }
     }
-    this.syncDialogDeadlines();
 
     // Incremental resume (`replay.resume`): when the client's cursor belongs
     // to THIS replay buffer (key match), replay only the entries mutated
@@ -1549,7 +1530,6 @@ export class Session {
     if (client) {
       this.#store.audit(client.auth.sub, "session.detach", this.id);
       this.#clients.delete(clientId);
-      this.syncDialogDeadlines();
     }
   }
 
@@ -1558,12 +1538,15 @@ export class Session {
   /**
    * Raise a dialog on behalf of the provider and await the user's answer.
    * Passed to providers as `TurnOpts.requestUserInput`. The promise settles
-   * when the first client answers, the request times out (`timeoutMs`), no
-   * client that can render it is attached for DIALOG_NO_CLIENT_GRACE_MS, or
-   * the session is interrupted/destroyed — never rejects. A cancelled answer
-   * carries `reason`, so the provider can say why it got no answer.
+   * when the first client answers, the request times out (`timeoutMs`), or
+   * the session is interrupted/destroyed — never rejects. With no deadline it
+   * waits for a human however long, like a tool approval: it is re-sent to
+   * every client that attaches and can render it, and shows in the session's
+   * info (`pendingDialog`) so any surface can see what it is waiting on. A
+   * cancelled answer carries `reason`. An unattended turn never waits.
    */
   requestUserInput(req: UiRequest): Promise<UiResponse> {
+    if (this.#unattended) return Promise.resolve({ cancelled: true, reason: "unattended" });
     const requestId = randomUUID();
     const msg: SessionUiRequestMsg = {
       type: "session.ui_request",
@@ -1587,45 +1570,17 @@ export class Session {
           : undefined;
       this.#pendingUiRequests.set(requestId, { msg, resolve, timer });
       this.#broadcastToCapable(CAPABILITIES.UI_DIALOGS, msg);
-      this.syncDialogDeadlines();
+      this.#broadcastInfoUpdate(); // pendingDialog
     });
   }
 
-  /**
-   * Arm or lift each pending dialog's no-client deadline to match who could
-   * answer it. With such a client present a dialog waits for that human,
-   * however long (like a tool approval); with none, nothing can ever answer
-   * it, so it gets DIALOG_NO_CLIENT_GRACE_MS for one to arrive. Called on
-   * every change to either side: a dialog raised, a client attached/detached
-   * here, or one connecting/disconnecting anywhere in the tenant (the
-   * manager calls in).
-   *
-   * "Can answer" is the capability AND `session:approve` — the scope a
-   * `session.ui_response` requires. A watch-only client renders the dialog
-   * but cannot settle it, so it must not hold the deadline off. A client
-   * connected elsewhere in the tenant counts too: the web UI attaches only
-   * the session in focus, and its user can still open this one.
-   */
-  syncDialogDeadlines(): void {
-    if (this.#pendingUiRequests.size === 0) return;
-    const now = Math.floor(Date.now() / 1000);
-    const answerable =
-      [...this.#clients.values()].some(
-        (c) =>
-          c.capabilities?.includes(CAPABILITIES.UI_DIALOGS) &&
-          hasScope(c.auth.scopes as string[], SCOPES.SESSION_APPROVE) &&
-          !(typeof c.auth.exp === "number" && c.auth.exp > 0 && c.auth.exp <= now),
-      ) || this.#dialogAnswererConnected(this.accountId, this.projectId);
-    for (const [requestId, pending] of this.#pendingUiRequests) {
-      if (answerable && pending.noClientTimer) {
-        clearTimeout(pending.noClientTimer);
-        pending.noClientTimer = undefined;
-      } else if (!answerable && !pending.noClientTimer) {
-        pending.noClientTimer = setTimeout(() => {
-          this.#settleUiRequest(requestId, { cancelled: true, reason: "no_client" }, "timeout");
-        }, this.#dialogNoClientGraceMs);
-      }
-    }
+  /** Whether the daemon is driving this session unattended (see #unattended). */
+  get unattended(): boolean {
+    return this.#unattended;
+  }
+
+  set unattended(value: boolean) {
+    this.#unattended = value;
   }
 
   /** Count of unanswered provider dialogs (StatusBar / watchdog signal). */
@@ -1676,7 +1631,6 @@ export class Session {
     if (!pending) return false;
     this.#pendingUiRequests.delete(requestId);
     if (pending.timer) clearTimeout(pending.timer);
-    if (pending.noClientTimer) clearTimeout(pending.noClientTimer);
     pending.resolve(
       response.cancelled && response.reason === undefined
         ? { ...response, reason: CANCEL_REASON[reason] }
@@ -1689,6 +1643,7 @@ export class Session {
       reason,
       timestamp: new Date().toISOString(),
     });
+    this.#broadcastInfoUpdate(); // pendingDialog cleared
     return true;
   }
 
@@ -1707,8 +1662,6 @@ export class Session {
         client.send(msg);
       } catch {
         this.#clients.delete(client.id);
-        // Dropping the last capable client leaves pending dialogs unanswerable.
-        queueMicrotask(() => this.syncDialogDeadlines());
       }
     }
   }
@@ -3089,6 +3042,23 @@ export class Session {
       ...(this.#pack
         ? { profile: this.#pack.roleName ? `${this.#pack.id} (${this.#pack.roleName})` : this.#pack.id }
         : {}),
+      ...this.#pendingDialogInfo(),
+    };
+  }
+
+  /** The oldest unanswered dialog, for SessionInfo.pendingDialog (#348). */
+  #pendingDialogInfo(): Pick<SessionInfo, "pendingDialog"> {
+    const first = this.#pendingUiRequests.values().next();
+    if (first.done) return {};
+    const m = first.value.msg;
+    return {
+      pendingDialog: {
+        requestId: m.requestId,
+        method: m.method,
+        title: m.title,
+        ...(m.message !== undefined ? { message: m.message } : {}),
+        ...(m.options !== undefined ? { options: m.options } : {}),
+      },
     };
   }
 
@@ -4728,11 +4698,13 @@ export class Session {
         // keeps the phase alive. The turn does NOT end here; the provider
         // retries in place on approval or emits a terminal turn_done on denial,
         // so #consumeEvents must NOT break on this event. Post a visible cue so
-        // the user knows their approval is what unblocks it.
+        // the user knows their approval is what unblocks it — unless the turn
+        // is unattended, where the provider fails it at once with the reason.
+        if (this.#unattended) break;
         this.#setStatus("waiting_approval");
         const note = this.#makeMessage(
           "system",
-          `⏸ A skill needs approval to run \`${event.command}\` before it can continue. Approve it in the web UI or Telegram and it resumes automatically; with no client there to approve it, the turn fails after a couple of minutes.`,
+          `⏸ A skill needs approval to run \`${event.command}\` before it can continue. Approve it — in the web UI, Telegram, \`codeoid attach ${this.name}\` or \`codeoid approve ${this.name}\` — and it resumes automatically.`,
           SYSTEM_IDENTITY,
           undefined,
           undefined,
@@ -5087,7 +5059,6 @@ export class Session {
         client.send(msg);
       } catch {
         this.#clients.delete(client.id);
-        queueMicrotask(() => this.syncDialogDeadlines());
       }
     }
   }

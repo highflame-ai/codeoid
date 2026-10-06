@@ -349,22 +349,16 @@ describe("pipeline runtime (real SessionManager + mock backend)", () => {
     await m2.drain(3_000);
   });
 
-  test("a phase asking for input (NEED-INPUT) raises a dialog; the answer resumes it to completion", async () => {
+  test("a phase asking for input raises no dialog, even with a dialog client attached — it halts (#348)", async () => {
     const captured: Array<{ type: string; [k: string]: unknown }> = [];
     const store2 = new Store(join(tmp, "codeoid-ask.db"));
     const m2 = new SessionManager(store2, transcript, undefined, undefined, undefined, {
       config: mkConfig(join(tmp, "codeoid-ask.db"), true),
       _testProviderFactory: () =>
-        new MockSessionProvider("mock", [
-          // Turn 1 asks a question and ends with the NEED-INPUT marker.
-          sayTurn(`Which language should I use?\n${PHASE_NEEDS_INPUT_MARKER}`),
-          // Turn 2 (driven by the user's answer) finishes and marks complete.
-          sayTurn(`implemented it in TypeScript\n${PHASE_COMPLETE_MARKER}`),
-        ]),
+        new MockSessionProvider("mock", [sayTurn(`Which language should I use?\n${PHASE_NEEDS_INPUT_MARKER}`)]),
     });
     const pm = m2.pipelines;
-    expect(pm).toBeDefined();
-    if (!pm) return;
+    if (!pm) throw new Error("pipeline disabled");
     pm.registries.skills.register({ id: "impl", kind: "slash", command: "/impl" });
     const created = await m2.handle(
       {
@@ -378,48 +372,22 @@ describe("pipeline runtime (real SessionManager + mock backend)", () => {
       CLIENT,
     );
     if (created.type !== "pipeline.snapshot") throw new Error(`create failed: ${JSON.stringify(created)}`);
-    const sessionId = created.pipeline.sessionId;
-    expect(sessionId).toBeTruthy();
-    // Attach a UI_DIALOGS-capable client so the mid-phase question is delivered.
     const capClient = {
       id: "cap",
       auth: AUTH,
       capabilities: [CAPABILITIES.UI_DIALOGS],
       send: (m: unknown) => captured.push(m as { type: string }),
     };
-    await m2.handle(
-      { type: "session.attach", id: "att", sessionId } as never,
-      AUTH,
-      capClient as never,
-    );
-    // Advance drives the phase; it blocks on the input dialog until we answer.
-    const advP = m2.handle({ type: "pipeline.advance", id: "2", pipelineId: created.pipeline.id }, AUTH, CLIENT);
-    // Wait for the question dialog, then answer it.
-    let req: { requestId?: string; method?: string; message?: string } | undefined;
-    for (let i = 0; i < 300 && !req; i++) {
-      req = captured.find((m) => m.type === "session.ui_request") as typeof req;
-      if (!req) await new Promise((r) => setTimeout(r, 10));
-    }
-    if (!req?.requestId) throw new Error("no session.ui_request dialog appeared");
-    expect(req.method).toBe("input");
-    expect(String(req.message)).toContain("Which language");
-    expect(String(req.message)).not.toContain(PHASE_NEEDS_INPUT_MARKER);
-    await m2.handle(
-      { type: "session.ui_response", id: "3", sessionId, requestId: req.requestId, value: "TypeScript" } as never,
-      AUTH,
-      capClient as never,
-    );
-    const out = await advP;
+    await m2.handle({ type: "session.attach", id: "att", sessionId: created.pipeline.sessionId } as never, AUTH, capClient as never);
+    const out = await m2.handle({ type: "pipeline.advance", id: "2", pipelineId: created.pipeline.id }, AUTH, CLIENT);
     if (out.type !== "pipeline.snapshot") throw new Error(`advance failed: ${JSON.stringify(out)}`);
-    // Only halts after the model marked completion on the answer-driven turn.
-    expect(out.pipeline.status).toBe("halted");
-    const ph = out.pipeline.phases[0];
-    expect(ph.status).toBe("halted");
-    expect(ph.summary).toContain("implemented it in TypeScript");
+    expect(captured.some((m) => m.type === "session.ui_request")).toBe(false);
+    expect(out.pipeline.phases[0].status).toBe("halted");
+    expect(out.pipeline.phases[0].questions).toEqual(["Which language should I use?"]);
     await m2.drain(3_000);
   });
 
-  test("a headless phase asking for input halts on its question; Revise answers it (#348)", async () => {
+  test("a phase asking for input halts on its question; Revise answers it (#348)", async () => {
     const store2 = new Store(join(tmp, "codeoid-headless.db"));
     const mock = new MockSessionProvider("mock", [
       // Rests without a marker → nudged to continue; this text is NOT the question.
@@ -430,7 +398,6 @@ describe("pipeline runtime (real SessionManager + mock backend)", () => {
     ]);
     const m2 = new SessionManager(store2, transcript, undefined, undefined, undefined, {
       config: mkConfig(join(tmp, "codeoid-headless.db"), true),
-      _testDialogNoClientGraceMs: 40,
       _testProviderFactory: () => mock,
     });
     const pm = m2.pipelines;
@@ -448,7 +415,7 @@ describe("pipeline runtime (real SessionManager + mock backend)", () => {
       CLIENT,
     );
     if (created.type !== "pipeline.snapshot") throw new Error(`create failed: ${JSON.stringify(created)}`);
-    // No client that can show the dialog is connected anywhere.
+    // A phase turn is unattended: no dialog is raised, attached client or not.
     const out = await m2.handle({ type: "pipeline.advance", id: "2", pipelineId: created.pipeline.id }, AUTH, CLIENT);
     if (out.type !== "pipeline.snapshot") throw new Error(`advance failed: ${JSON.stringify(out)}`);
     const state = out.pipeline.phases[0];

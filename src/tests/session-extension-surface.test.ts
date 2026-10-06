@@ -71,14 +71,7 @@ afterEach(async () => {
   try { rmSync(tmp, { recursive: true, force: true }); } catch {}
 });
 
-function makeSession(
-  provider: MockSessionProvider,
-  name = "ext-test",
-  extra: {
-    dialogNoClientGraceMs?: number;
-    dialogAnswererConnected?: (accountId: string, projectId: string) => boolean;
-  } = {},
-): Session {
+function makeSession(provider: MockSessionProvider, name = "ext-test"): Session {
   const id = randomUUID();
   store.createSession({
     id,
@@ -99,7 +92,6 @@ function makeSession(
     transcriptStore,
     existingId: id,
     _testProvider: provider,
-    ...extra,
   });
 }
 
@@ -233,90 +225,66 @@ describe("provider dialogs (session.ui_request)", () => {
   });
 });
 
-// #348: a dialog nobody can render must not park a headless turn forever.
-describe("provider dialogs with no client able to answer", () => {
-  const GRACE = 40;
+// #348: a pending dialog waits for a human (no deadline), is visible to every
+// surface through the session's info, and an unattended turn never prompts.
+describe("provider dialogs: waiting, visibility, unattended", () => {
+  const infoUpdates = (msgs: DaemonMessage[]) =>
+    msgs.filter((m): m is Extract<DaemonMessage, { type: "session.info_update" }> => m.type === "session.info_update");
 
-  it("U5: settles as no_client when only headless clients are attached", async () => {
-    const session = makeSession(new MockSessionProvider("mock"), "headless", { dialogNoClientGraceMs: GRACE });
-    const cli = makeClient(); // CLI/TUI: declares no ui.dialogs
+  it("U5: with nobody able to answer, the dialog waits — then a client that attaches answers it", async () => {
+    const session = makeSession(new MockSessionProvider("mock"), "waits");
+    const cli = makeClient(); // a one-shot / legacy client: cannot render dialogs
     session.attach(cli);
-
-    // No timeoutMs — the skill-approval call shape from the issue.
-    const resolved = await session.requestUserInput({ method: "confirm", title: "Allow?" });
-    expect(resolved).toEqual({ cancelled: true, reason: "no_client" });
-    expect(session.pendingUiRequestCount).toBe(0);
-    await session.destroy(TEST_AUTH);
-  });
-
-  it("U6: with a capable client attached, waits for the human past the grace period", async () => {
-    const session = makeSession(new MockSessionProvider("mock"), "watched", { dialogNoClientGraceMs: GRACE });
-    const web = makeClient([CAPABILITIES.UI_DIALOGS]);
-    session.attach(web);
     let settled = false;
     const answer = session.requestUserInput({ method: "confirm", title: "Allow?" }).then((r) => {
       settled = true;
       return r;
     });
-    await Bun.sleep(GRACE * 3);
+    await Bun.sleep(150);
     expect(settled).toBe(false);
+    expect(session.pendingUiRequestCount).toBe(1);
+    // Hours later, someone attaches from a surface that can render it.
+    const web = makeClient([CAPABILITIES.UI_DIALOGS]);
+    session.attach(web);
     const req = uiRequestsIn(web.received)[0]!;
     session.resolveUiRequestFromClient(req.requestId, { confirmed: true }, TEST_AUTH);
     expect(await answer).toEqual({ confirmed: true, cancelled: false });
     await session.destroy(TEST_AUTH);
   });
 
-  it("U7: a capable client attaching lifts the deadline; its leaving re-arms it", async () => {
-    const session = makeSession(new MockSessionProvider("mock"), "handoff", { dialogNoClientGraceMs: GRACE });
-    let settled = false;
-    const answer = session.requestUserInput({ method: "confirm", title: "Allow?" }).then((r) => {
-      settled = true;
-      return r;
-    });
-    // Reattach from another device inside the grace period.
-    const phone = makeClient([CAPABILITIES.UI_DIALOGS]);
-    session.attach(phone);
-    await Bun.sleep(GRACE * 3);
-    expect(settled).toBe(false);
-    // The last capable client leaves: nothing can answer it any more.
-    session.detach(phone.id);
-    expect(await answer).toEqual({ cancelled: true, reason: "no_client" });
+  it("U6: the pending dialog shows in the session's info for every client, and clears when answered", async () => {
+    const session = makeSession(new MockSessionProvider("mock"), "visible");
+    const cli = makeClient(); // no ui.dialogs — still sees what it waits on
+    session.attach(cli);
+    const answer = session.requestUserInput({ method: "select", title: "Pick a database", options: ["pg", "mysql"] });
+    const raised = infoUpdates(cli.received).at(-1)!.session.pendingDialog;
+    expect(raised).toMatchObject({ method: "select", title: "Pick a database", options: ["pg", "mysql"] });
+    expect(session.toInfo().pendingDialog?.requestId).toBe(raised!.requestId);
+    session.resolveUiRequestFromClient(raised!.requestId, { value: "pg" }, TEST_AUTH);
+    expect(await answer).toEqual({ value: "pg", cancelled: false });
+    expect(infoUpdates(cli.received).at(-1)!.session.pendingDialog).toBeUndefined();
+    expect(session.toInfo().pendingDialog).toBeUndefined();
     await session.destroy(TEST_AUTH);
   });
 
-  it("U9: a watch-only client (no session:approve) does not hold the deadline off", async () => {
-    const session = makeSession(new MockSessionProvider("mock"), "watcher", { dialogNoClientGraceMs: GRACE });
-    const watcher = makeClient([CAPABILITIES.UI_DIALOGS], [SCOPES.SESSION_WATCH]);
-    session.attach(watcher);
-    const resolved = await session.requestUserInput({ method: "confirm", title: "Allow?" });
-    // It still SAW the dialog — it just cannot answer it.
-    expect(uiRequestsIn(watcher.received)).toHaveLength(1);
-    expect(resolved).toEqual({ cancelled: true, reason: "no_client" });
-    await session.destroy(TEST_AUTH);
-  });
-
-  it("U10: a client connected elsewhere in the tenant holds the deadline off; losing it re-arms", async () => {
-    let connected = true;
-    const asked: Array<[string, string]> = [];
-    const session = makeSession(new MockSessionProvider("mock"), "fleet-view", {
-      dialogNoClientGraceMs: GRACE,
-      dialogAnswererConnected: (a, p) => {
-        asked.push([a, p]);
-        return connected;
-      },
+  it("U7: an unattended turn never prompts — the dialog is answered at once as unattended", async () => {
+    const session = makeSession(new MockSessionProvider("mock"), "unattended");
+    const web = makeClient([CAPABILITIES.UI_DIALOGS]);
+    session.attach(web);
+    session.unattended = true;
+    expect(await session.requestUserInput({ method: "confirm", title: "Allow?" })).toEqual({
+      cancelled: true,
+      reason: "unattended",
     });
-    let settled = false;
-    const answer = session.requestUserInput({ method: "confirm", title: "Allow?" }).then((r) => {
-      settled = true;
-      return r;
-    });
-    await Bun.sleep(GRACE * 3);
-    expect(settled).toBe(false);
-    // Asked about THIS session's tenant.
-    expect(asked[0]).toEqual([TEST_AUTH.accountId!, TEST_AUTH.projectId!]);
-    connected = false;
-    session.syncDialogDeadlines(); // the manager calls in on a disconnect
-    expect(await answer).toEqual({ cancelled: true, reason: "no_client" });
+    // Nothing was raised or left pending.
+    expect(uiRequestsIn(web.received)).toHaveLength(0);
+    expect(session.pendingUiRequestCount).toBe(0);
+    // Attended again (the phase ended): dialogs work normally.
+    session.unattended = false;
+    const answer = session.requestUserInput({ method: "confirm", title: "Allow?" });
+    expect(uiRequestsIn(web.received)).toHaveLength(1);
+    session.resolveUiRequestFromClient(uiRequestsIn(web.received)[0]!.requestId, { confirmed: false }, TEST_AUTH);
+    expect(await answer).toEqual({ confirmed: false, cancelled: false });
     await session.destroy(TEST_AUTH);
   });
 

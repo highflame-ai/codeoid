@@ -908,7 +908,7 @@ describe("ClaudeProvider – skill-command approval (#233)", () => {
     rmSync(tmp, { recursive: true, force: true });
   });
 
-  it("says where to approve when no client could show the dialog (#348)", async () => {
+  it("an unattended run says how to pre-approve the command, and grants nothing (#348)", async () => {
     const tmp = skillDir("---\nname: s\n---\n!`sh headless.sh`\n");
     const { store, writes } = statefulStore();
     const provider = new ClaudeProvider({ sessionId: "h", initialBackingId: "b", workspaceId: "ws", store });
@@ -917,7 +917,7 @@ describe("ClaudeProvider – skill-command approval (#233)", () => {
     const run = provider.runTurn({
       history: [], userMessage: "/spec", workdir: tmp,
       canUseTool: async () => ({ behavior: "allow" as const }),
-      requestUserInput: async () => ({ cancelled: true, reason: "no_client" as const }),
+      requestUserInput: async () => ({ cancelled: true, reason: "unattended" as const }),
     });
     const events: ProviderEvent[] = [];
     for await (const e of run.events) events.push(e);
@@ -925,8 +925,9 @@ describe("ClaudeProvider – skill-command approval (#233)", () => {
 
     const done = events.find((e) => e.type === "turn_done") as Extract<ProviderEvent, { type: "turn_done" }>;
     expect(done.result.isError).toBe(true);
-    expect(done.result.errorMessage).toContain("no client that can show approval dialogs");
-    expect(done.result.errorMessage).toContain("sh headless.sh");
+    expect(done.result.errorMessage).toContain("this run is unattended");
+    // A copy-pasteable command that grants exactly this, for this workdir.
+    expect(done.result.errorMessage).toContain(`codeoid skill allow 'sh headless.sh' --workdir '${tmp}'`);
     expect(writes).toEqual([]);
     await provider.teardown?.();
     rmSync(tmp, { recursive: true, force: true });

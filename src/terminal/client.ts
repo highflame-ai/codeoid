@@ -20,6 +20,7 @@ import { ALL_SCOPES_STRING } from "../protocol/scopes.js";
 import { sanitizeTerminalOutput } from "../tui/ansi/codes.js";
 import { formatPackList, formatPackShow } from "./pack-format.js";
 import { formatPipeline, haltedRequestId } from "./pipeline-format.js";
+import { type PendingDialog, parseDialogAnswer } from "./dialog.js";
 
 // ── Stream rendering (pure, exported for tests) ───────────────────────────────
 
@@ -43,10 +44,12 @@ export interface StreamRenderState {
   /** approvalId of the most recent waiting_confirmation tool call, so a typed
    *  yes/no can be routed to it. */
   latestApprovalId: string | null;
+  /** The provider dialog being shown (#348) — the next typed line answers it. */
+  pendingDialog: PendingDialog | null;
 }
 
 export function newStreamRenderState(): StreamRenderState {
-  return { streamingAssistantMsgId: null, latestApprovalId: null };
+  return { streamingAssistantMsgId: null, latestApprovalId: null, pendingDialog: null };
 }
 
 /**
@@ -128,6 +131,31 @@ export function renderStreamMessage(msg: DaemonMessage, state: StreamRenderState
       const sc = msg as { status?: string };
       return `\n[status] ${sc.status}\n`;
     }
+
+    // A provider dialog (#348): a skill-command approval, an agent's
+    // question. Re-sent on attach while pending, so one raised while nobody
+    // was watching shows up here.
+    case "session.ui_request": {
+      const req = msg as Extract<DaemonMessage, { type: "session.ui_request" }>;
+      state.pendingDialog = { requestId: req.requestId, method: req.method, ...(req.options ? { options: req.options } : {}) };
+      let out = `\n${RED}? ${S(req.title)}${RESET}\n`;
+      if (req.message) out += `${S(req.message)}\n`;
+      if (req.method === "confirm") out += "  Type 'yes' or 'no' (/skip to dismiss)\n";
+      else if (req.method === "select") {
+        (req.options ?? []).forEach((o, i) => {
+          out += `  ${i + 1}. ${S(o)}\n`;
+        });
+        out += "  Type a number (/skip to dismiss)\n";
+      } else out += "  Type your answer (/skip to dismiss)\n";
+      return out;
+    }
+
+    case "session.ui_resolved": {
+      const res = msg as Extract<DaemonMessage, { type: "session.ui_resolved" }>;
+      if (state.pendingDialog?.requestId !== res.requestId) return "";
+      state.pendingDialog = null;
+      return res.reason === "answered" ? "" : `${DIM}(question closed: ${S(res.reason)})${RESET}\n`;
+    }
   }
   return "";
 }
@@ -142,7 +170,12 @@ export class TerminalClient {
     this.#config = config;
   }
 
-  async connect(): Promise<void> {
+  /**
+   * `capabilities`: what this connection declares. An interactive attach
+   * declares `ui.dialogs`, so provider dialogs (and pending ones, on attach)
+   * are sent to it; one-shot commands declare nothing.
+   */
+  async connect(opts: { capabilities?: string[] } = {}): Promise<void> {
     const token = await this.#getToken();
 
     return new Promise((resolve, _reject) => {
@@ -159,6 +192,7 @@ export class TerminalClient {
             token,
             protocolVersion: PROTOCOL_VERSION,
             client: "codeoid-cli",
+            ...(opts.capabilities ? { capabilities: opts.capabilities } : {}),
           }),
         );
       };
@@ -223,6 +257,14 @@ export class TerminalClient {
         const status = this.#formatStatus(s.status);
         console.log(`  ${s.name.padEnd(20)} ${status.padEnd(20)} ${s.workdir}`);
         console.log(`  ${"".padEnd(20)} id: ${s.id}  clients: ${s.attachedClients}`);
+        if (s.pendingDialog) {
+          // What it is waiting on, and how to answer it from here (#348).
+          const how =
+            s.pendingDialog.method === "confirm"
+              ? `codeoid approve ${s.name} [--deny], or codeoid attach ${s.name}`
+              : `codeoid attach ${s.name}`;
+          console.log(`  ${"".padEnd(20)} waiting: ${S(s.pendingDialog.title)} — answer with: ${how}`);
+        }
         console.log();
       }
     } else {
@@ -337,6 +379,28 @@ export class TerminalClient {
     const sessionId = await this.#resolveSession(sessionIdOrName);
     if (!sessionId) return;
 
+    // Streaming/approval bookkeeping, carried across messages. `latestApprovalId`
+    // is read below to route a typed yes/no; both fields are mutated by
+    // renderStreamMessage, which also sanitizes every untrusted field before it
+    // reaches the TTY (OSC/CSI/DCS escapes — see #91/#92).
+    const renderState = newStreamRenderState();
+
+    // Installed BEFORE the attach request: the daemon replays the scrollback
+    // and any pending dialog while handling it, ahead of its reply, and a
+    // handler set afterwards dropped them (#348 — a pending question never
+    // showed). Buffered until the attach succeeds, so nothing prints for a
+    // refused attach and the banner comes first.
+    const early: DaemonMessage[] = [];
+    let attached = false;
+    const render = (msg: DaemonMessage) => {
+      const out = renderStreamMessage(msg, renderState);
+      if (out) process.stdout.write(out);
+    };
+    this.#streamHandler = (msg) => {
+      if (attached) render(msg);
+      else early.push(msg);
+    };
+
     const resp = await this.#request({
       type: "session.attach",
       id: randomUUID(),
@@ -344,22 +408,18 @@ export class TerminalClient {
     });
 
     if (resp.type !== "response.ok") {
+      this.#streamHandler = null;
       this.#printError(resp);
       return;
     }
 
     console.log("\nAttached to session. Type messages below. Ctrl+C to detach.\n");
-
-    // Streaming/approval bookkeeping, carried across messages. `latestApprovalId`
-    // is read below to route a typed yes/no; both fields are mutated by
-    // renderStreamMessage, which also sanitizes every untrusted field before it
-    // reaches the TTY (OSC/CSI/DCS escapes — see #91/#92).
-    const renderState = newStreamRenderState();
-
-    this.#streamHandler = (msg) => {
-      const out = renderStreamMessage(msg, renderState);
-      if (out) process.stdout.write(out);
-    };
+    attached = true;
+    // A pending question last, below the scrollback it belongs after — the
+    // daemon replays dialogs first.
+    const buffered = early.splice(0);
+    for (const msg of buffered) if (msg.type !== "session.ui_request") render(msg);
+    for (const msg of buffered) if (msg.type === "session.ui_request") render(msg);
 
     const rl = createInterface({ input: process.stdin, output: process.stdout });
 
@@ -385,6 +445,20 @@ export class TerminalClient {
 
       if (trimmed === "/interrupt") {
         await this.#request({ type: "session.interrupt", id: randomUUID(), sessionId });
+        continue;
+      }
+
+      // A provider dialog is showing: this line answers it.
+      if (renderState.pendingDialog) {
+        const dialog = renderState.pendingDialog;
+        const answer = parseDialogAnswer(trimmed, dialog);
+        if ("error" in answer) {
+          console.log(answer.error);
+          continue;
+        }
+        const resp = await this.#request({ type: "session.ui_response", id: randomUUID(), sessionId, requestId: dialog.requestId, ...answer });
+        if (renderState.pendingDialog?.requestId === dialog.requestId) renderState.pendingDialog = null;
+        if (resp.type === "response.error") this.#printError(resp);
         continue;
       }
 
@@ -448,6 +522,29 @@ export class TerminalClient {
     const sessionId = await this.#resolveSession(sessionIdOrName);
     if (!sessionId) return;
 
+    // A pending yes/no dialog (e.g. a skill-command approval, #348) is answered
+    // by its real request id, from the session's info.
+    const list = await this.#request({ type: "session.list", id: randomUUID() });
+    const dialog =
+      list.type === "session.list.result" ? list.sessions.find((s) => s.id === sessionId)?.pendingDialog : undefined;
+    if (dialog) {
+      if (dialog.method !== "confirm") {
+        console.error(`The session is waiting on a question, not a yes/no: ${S(dialog.title)}`);
+        console.error(`  Answer it with: codeoid attach ${sessionIdOrName}`);
+        return;
+      }
+      const resp = await this.#request({
+        type: "session.ui_response",
+        id: randomUUID(),
+        sessionId,
+        requestId: dialog.requestId,
+        confirmed: approved,
+      });
+      if (resp.type === "response.ok") console.log(`${approved ? "Approved" : "Denied"}: ${S(dialog.title)}`);
+      else this.#printError(resp);
+      return;
+    }
+
     const resp = await this.#request({
       type: "session.approve",
       id: randomUUID(),
@@ -458,6 +555,16 @@ export class TerminalClient {
 
     if (resp.type === "response.ok") {
       console.log(approved ? "Approved." : "Denied.");
+    } else {
+      this.#printError(resp);
+    }
+  }
+
+  /** Pre-approve (or deny) a skill-declared command for a workdir (#348). */
+  async skillGrant(command: string, workdir: string, allowed: boolean): Promise<void> {
+    const resp = await this.#request({ type: "skill.grant", id: randomUUID(), workdir, command, allowed });
+    if (resp.type === "skill.grant.result") {
+      console.log(`${resp.allowed ? "Allowed" : "Denied"} for ${resp.workdir}: ${S(resp.command)}`);
     } else {
       this.#printError(resp);
     }

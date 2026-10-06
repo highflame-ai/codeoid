@@ -19,6 +19,7 @@ import { MockSessionProvider } from "../daemon/providers/mock/session-provider.j
 import type { AttachedClient } from "../daemon/session.js";
 import type { AuthContext, DaemonMessage, SessionCommandsResultMsg } from "../protocol/types.js";
 import { ALL_SCOPES, SCOPES, type Scope } from "../protocol/scopes.js";
+import { workspaceIdFromPath } from "../daemon/memory/index.js";
 
 const OWNER: AuthContext = {
   sub: "user:ext-verbs",
@@ -49,7 +50,6 @@ beforeEach(() => {
   mock = new MockSessionProvider("mock");
   manager = new SessionManager(store, transcript, undefined, undefined, undefined, {
     _testProviderFactory: () => mock,
-    _testDialogNoClientGraceMs: 40,
   });
 });
 
@@ -253,66 +253,43 @@ describe("session.part_action", () => {
   });
 });
 
-// #348: a dialog is answerable while a capable approver is connected anywhere
-// in the tenant — the web UI attaches only the session in focus.
-describe("dialog deadline follows connected approvers", () => {
-  const raise = (session: NonNullable<ReturnType<SessionManager["findByName"]>>) => {
-    const state = { settled: false };
-    const answer = session.requestUserInput({ method: "confirm", title: "Allow?" }).then((r) => {
-      state.settled = true;
-      return r;
-    });
-    return { state, answer };
-  };
+// #348: pre-approving a skill-declared command — the `--allowedTools` of an
+// unattended run, which never prompts.
+describe("skill.grant", () => {
+  it("records the grant for the workdir's workspace, within the caller's tenant", async () => {
+    const res = await manager.handle(
+      { type: "skill.grant", id: "g1", workdir: tmp, command: "  ./probe.sh  ", allowed: true },
+      OWNER,
+      client(OWNER),
+    );
+    expect(res).toMatchObject({ type: "skill.grant.result", command: "./probe.sh", allowed: true });
+    const canonical = (res as { workdir: string }).workdir;
+    // The same record the approval dialog writes, keyed as the provider reads it.
+    expect(store.getSkillCommandGrants(workspaceIdFromPath(canonical, OWNER)).get("Bash(./probe.sh)")).toBe(true);
+    // Another tenant's workspace on the same path is untouched.
+    const other = { ...OWNER, accountId: "acc-other" };
+    expect(store.getSkillCommandGrants(workspaceIdFromPath(canonical, other)).get("Bash(./probe.sh)")).toBeUndefined();
 
-  it("a connected web client, not attached, holds the deadline; disconnecting re-arms it", async () => {
-    await createSession();
-    const session = manager.findByName("ext", OWNER)!;
-    manager.clientConnected("web-1", OWNER, ["ui.dialogs"]);
-    const { state, answer } = raise(session);
-    await Bun.sleep(150);
-    expect(state.settled).toBe(false);
-    manager.disconnectClient("web-1");
-    expect(await answer).toEqual({ cancelled: true, reason: "no_client" });
+    await manager.handle({ type: "skill.grant", id: "g2", workdir: tmp, command: "./probe.sh", allowed: false }, OWNER, client(OWNER));
+    expect(store.getSkillCommandGrants(workspaceIdFromPath(canonical, OWNER)).get("Bash(./probe.sh)")).toBe(false);
   });
 
-  it("does not count a client of another tenant, a watch-only client, or one without ui.dialogs", async () => {
-    await createSession();
-    const session = manager.findByName("ext", OWNER)!;
-    manager.clientConnected("other-tenant", { ...OWNER, accountId: "acc-other" }, ["ui.dialogs"]);
-    manager.clientConnected("watcher", scoped([SCOPES.SESSION_WATCH]), ["ui.dialogs"]);
-    manager.clientConnected("cli", OWNER, undefined);
-    const { answer } = raise(session);
-    expect(await answer).toEqual({ cancelled: true, reason: "no_client" });
+  it("needs settings:write", async () => {
+    const approver = scoped([SCOPES.SESSION_APPROVE, SCOPES.SETTINGS_READ]);
+    const res = await manager.handle(
+      { type: "skill.grant", id: "g3", workdir: tmp, command: "./probe.sh", allowed: true },
+      approver,
+      client(approver),
+    );
+    expect(res).toMatchObject({ type: "response.error", code: "forbidden" });
   });
 
-  it("an approver whose token has expired does not count", async () => {
-    await createSession();
-    const session = manager.findByName("ext", OWNER)!;
-    manager.clientConnected("stale-web", { ...OWNER, exp: Math.floor(Date.now() / 1000) - 60 }, ["ui.dialogs"]);
-    const { answer } = raise(session);
-    expect(await answer).toEqual({ cancelled: true, reason: "no_client" });
-  });
-
-  it("an approver's token expiring while a dialog waits re-arms its deadline", async () => {
-    await createSession();
-    const session = manager.findByName("ext", OWNER)!;
-    // Expires in ~1s; the expiry timer fires a second after exp.
-    manager.clientConnected("expiring-web", { ...OWNER, exp: Math.floor(Date.now() / 1000) + 1 }, ["ui.dialogs"]);
-    const { state, answer } = raise(session);
-    await Bun.sleep(150);
-    expect(state.settled).toBe(false);
-    expect(await answer).toEqual({ cancelled: true, reason: "no_client" });
-  }, 10_000);
-
-  it("a capable client connecting lifts a deadline already running", async () => {
-    await createSession();
-    const session = manager.findByName("ext", OWNER)!;
-    const { state, answer } = raise(session);
-    manager.clientConnected("web-late", OWNER, ["ui.dialogs"]);
-    await Bun.sleep(150);
-    expect(state.settled).toBe(false);
-    await session.interrupt(OWNER);
-    expect(await answer).toEqual({ cancelled: true, reason: "interrupted" });
+  it("refuses a workdir that does not exist", async () => {
+    const res = await manager.handle(
+      { type: "skill.grant", id: "g4", workdir: join(tmp, "nope"), command: "./probe.sh", allowed: true },
+      OWNER,
+      client(OWNER),
+    );
+    expect(res).toMatchObject({ type: "response.error", code: "invalid_request" });
   });
 });
