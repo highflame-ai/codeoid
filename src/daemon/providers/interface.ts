@@ -76,8 +76,8 @@ export interface UiRequest {
 
 /**
  * The user's answer to a `UiRequest`. `cancelled: true` covers dismissal,
- * timeout, interrupt, and session teardown — providers must treat it as
- * "no answer", never as consent.
+ * timeout, interrupt, session teardown, and no client able to answer — `reason`
+ * says which. Providers must treat it as "no answer", never as consent.
  */
 export interface UiResponse {
   value?: string;

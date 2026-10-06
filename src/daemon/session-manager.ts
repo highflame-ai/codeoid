@@ -1541,12 +1541,12 @@ mcpHub: this.#mcpHub,
   }
 
   /**
-   * The model hooks every Session this manager builds gets. One object, spread
-   * at each construction site: pasting the lambdas into all eight meant a
-   * ninth path that forgot them would compile and silently neither teach nor
-   * consult the window cache.
+   * The daemon-level hooks every Session this manager builds gets: the model
+   * hooks plus dialog presence (#348). One object, spread at each construction
+   * site: pasting the lambdas into all eight meant a ninth path that forgot
+   * them would compile and silently neither teach nor consult the window
+   * cache, nor see a connected approver.
    */
-  /** Daemon-level callbacks every Session gets (spread into each constructor). */
   get #sessionHooks() {
     return {
       ...this.#modelHooks,
@@ -1558,6 +1558,7 @@ mcpHub: this.#mcpHub,
     };
   }
 
+  /** Model catalog + context-window hooks — part of #sessionHooks. */
   readonly #modelHooks = {
     onModels: (providerId: string, m: ReadonlyArray<CatalogEntry>) => this._cacheModels(providerId, m),
     onModelLimits: (scope: WindowScope, providerId: string, model: string, window: number) =>

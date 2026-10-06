@@ -444,7 +444,7 @@ const HaltCard: Component<{
           class={inputClass}
           disabled={props.busy}
           aria-label="Decision note"
-          placeholder="Accepted / rejected because…"
+          placeholder={asksInput() ? "Rejected because…" : "Accepted / rejected because…"}
         />
       </label>
 

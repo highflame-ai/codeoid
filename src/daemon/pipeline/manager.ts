@@ -366,7 +366,7 @@ export class PipelineManager {
     // The question is MODEL-authored: label it so, and JSON-quote it, so its
     // text can't pose as part of the human's note in the re-run prompt.
     const recorded = question
-      ? `You asked (your own words, quoted): ${JSON.stringify(question.slice(0, 2000))} — the human's answer: ${note}`
+      ? `This phase asked (model-authored, quoted): ${JSON.stringify(question.slice(0, 2000))} — the human's answer: ${note}`
       : note;
     current.feedback = [...(current.feedback ?? []), recorded];
     current.state = { status: "running", startedAt: Date.now(), attempts: 0 };

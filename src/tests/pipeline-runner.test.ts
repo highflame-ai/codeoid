@@ -483,7 +483,7 @@ describe("pipeline runtime (real SessionManager + mock backend)", () => {
     // The re-run prompt pairs the question with the answer.
     const rerun = mock.capturedOpts.at(-1)!.userMessage;
     expect(rerun).toContain(
-      'You asked (your own words, quoted): "Which language should I use?" — the human\'s answer: TypeScript',
+      'This phase asked (model-authored, quoted): "Which language should I use?" — the human\'s answer: TypeScript',
     );
     await m2.drain(3_000);
   });
