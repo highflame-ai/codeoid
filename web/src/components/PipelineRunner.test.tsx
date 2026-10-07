@@ -111,6 +111,32 @@ describe("PipelineRunnerView — Run view", () => {
     expect(onReject).toHaveBeenCalledWith("q1", undefined);
   });
 
+  it("a phase halted on its own question offers Answer, not Approve (#348)", () => {
+    const onRevise = vi.fn();
+    const asking = pipeline({
+      status: "halted",
+      cursor: 0,
+      phases: [
+        phase({
+          id: "impl",
+          status: "halted",
+          requestId: "input:impl",
+          reason: 'phase "impl" needs input — reply with Revise to re-run it with your answer',
+          questions: ["Which language should I use?"],
+        }),
+      ],
+    });
+    const { getByText, queryByText, getByLabelText } = render(() => (
+      <PipelineRunnerView {...baseProps()} pipeline={asking} onRevise={onRevise} />
+    ));
+    expect(getByText("Which language should I use?")).toBeTruthy();
+    expect(queryByText("Approve")).toBeNull();
+    expect(getByText("Reject")).toBeTruthy();
+    fireEvent.input(getByLabelText("Your answer"), { target: { value: "TypeScript" } });
+    fireEvent.click(getByText("Answer"));
+    expect(onRevise).toHaveBeenCalledWith("input:impl", "TypeScript");
+  });
+
   it("renders a terminal status", () => {
     const { container } = render(() => (
       <PipelineRunnerView {...baseProps()} pipeline={pipeline({ status: "done" })} />

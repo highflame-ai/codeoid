@@ -26,6 +26,9 @@ export interface PhaseRunRequest {
 export interface PhaseRunOutput {
   summary?: string;
   artifacts?: string[];
+  /** The phase stopped to ask this, and no connected client could answer it
+   *  (#348). The skill kind halts the phase on it for a human. */
+  question?: string;
 }
 
 export interface PhaseRunner {
@@ -33,11 +36,13 @@ export interface PhaseRunner {
 }
 
 /** The resting outcome of a worker turn: the terminal status it reached plus the
- *  assistant's final text. Only `idle` is a success — `error` (turn failed),
+ *  assistant's final text. `idle` is a success; `needs_input` means it asked a
+ *  question no connected client could answer (#348; `text` is the question),
+ *  which halts the phase for a human. `error` (turn failed),
  *  `waiting_approval` (autonomous budget exhausted mid-turn ⇒ incomplete), and
  *  `timeout` (never rested) are failures the runner surfaces to the engine. */
 export interface PhaseTurnResult {
-  finalStatus: "idle" | "error" | "waiting_approval" | "timeout";
+  finalStatus: "idle" | "error" | "waiting_approval" | "timeout" | "needs_input";
   text: string;
 }
 
@@ -98,6 +103,7 @@ export class SessionPhaseRunner implements PhaseRunner {
     // Only `idle` is success. A non-idle turn (error / budget-exhausted /
     // timed-out) is a phase FAILURE — throw so the engine applies onFail rather
     // than silently marking the phase passed with a partial/empty summary.
+    if (finalStatus === "needs_input") return { question: text };
     if (finalStatus !== "idle") {
       const detail = text ? `: ${text.slice(0, 300)}` : "";
       // Name the model binding + the rung that chose it (docs/role-model-binding.md

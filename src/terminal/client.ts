@@ -8,7 +8,7 @@ import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 import { resolveLocalToken } from "../config.js";
 import type { CodeoidConfig } from "../config.js";
-import { PROTOCOL_VERSION } from "../protocol/types.js";
+import { PIPELINE_INPUT_REQUEST_PREFIX, PROTOCOL_VERSION } from "../protocol/types.js";
 import type {
   ClientMessage,
   CollaborationConfig,
@@ -20,6 +20,7 @@ import { ALL_SCOPES_STRING } from "../protocol/scopes.js";
 import { sanitizeTerminalOutput } from "../tui/ansi/codes.js";
 import { formatPackList, formatPackShow } from "./pack-format.js";
 import { formatPipeline, haltedRequestId } from "./pipeline-format.js";
+import { type PendingDialog, parseDialogAnswer } from "./dialog.js";
 
 // ── Stream rendering (pure, exported for tests) ───────────────────────────────
 
@@ -43,10 +44,31 @@ export interface StreamRenderState {
   /** approvalId of the most recent waiting_confirmation tool call, so a typed
    *  yes/no can be routed to it. */
   latestApprovalId: string | null;
+  /** messageId of the tool call `latestApprovalId` belongs to — cleared when it leaves waiting_confirmation (answered anywhere). */
+  latestApprovalMsgId?: string | null;
+  /**
+   * Provider dialogs waiting for an answer (#348), oldest first. Only the
+   * oldest is shown; the next typed line answers it, and when it is resolved
+   * (here or on another surface) the next one is shown.
+   */
+  dialogs: Array<{ dialog: PendingDialog; prompt: string }>;
+  /** Which prompt was printed last — a typed yes/no answers THAT one. */
+  lastPrompt: "tool" | "dialog" | null;
+}
+
+/** A tool approval was settled (anywhere): stop routing yes/no to it, and
+ *  return the waiting question's prompt to show again, if it was behind it. */
+function forgetToolPrompt(state: StreamRenderState): string {
+  state.latestApprovalId = null;
+  state.latestApprovalMsgId = null;
+  if (state.lastPrompt !== "tool") return "";
+  const head = state.dialogs[0];
+  state.lastPrompt = head ? "dialog" : null;
+  return head ? head.prompt : "";
 }
 
 export function newStreamRenderState(): StreamRenderState {
-  return { streamingAssistantMsgId: null, latestApprovalId: null };
+  return { streamingAssistantMsgId: null, latestApprovalId: null, dialogs: [], lastPrompt: null };
 }
 
 /**
@@ -101,11 +123,19 @@ export function renderStreamMessage(msg: DaemonMessage, state: StreamRenderState
         case "tool_call": {
           const phase = sm.tool?.state?.phase ?? "executing";
           const name = S(sm.tool?.name ?? sm.content);
+          // Approved / denied / cancelled elsewhere: a typed yes/no is no longer
+          // for it — back to the waiting question, shown again.
+          const reshow =
+            phase !== "waiting_confirmation" && sm.messageId && sm.messageId === state.latestApprovalMsgId
+              ? forgetToolPrompt(state)
+              : "";
           if (phase === "waiting_confirmation") {
             state.latestApprovalId = sm.tool?.state?.approvalId ?? null;
+            state.latestApprovalMsgId = sm.messageId ?? null;
+            state.lastPrompt = "tool";
             return `\n${id}${RED}⚡ ${name}: ${S(sm.tool?.state?.description)}${RESET}\n  Type 'yes' to approve, 'no' to deny\n`;
           }
-          return `\n${id}${YELLOW}⚡ ${name} [${phase}]${RESET}\n`;
+          return `\n${id}${YELLOW}⚡ ${name} [${phase}]${RESET}\n${reshow}`;
         }
         case "system":
           return `\n${RED}${S(sm.content)}${RESET}\n`;
@@ -119,6 +149,13 @@ export function renderStreamMessage(msg: DaemonMessage, state: StreamRenderState
       const delta = msg as { contentAppend?: string; messageId?: string; toolStateUpdate?: { phase?: string } };
       if (delta.messageId) state.streamingAssistantMsgId = delta.messageId;
       let out = "";
+      if (
+        delta.toolStateUpdate?.phase &&
+        delta.toolStateUpdate.phase !== "waiting_confirmation" &&
+        delta.messageId === state.latestApprovalMsgId
+      ) {
+        out += forgetToolPrompt(state);
+      }
       if (delta.contentAppend) out += S(delta.contentAppend);
       if (delta.toolStateUpdate) out += `${YELLOW}  → ${delta.toolStateUpdate.phase}${RESET}\n`;
       return out;
@@ -127,6 +164,45 @@ export function renderStreamMessage(msg: DaemonMessage, state: StreamRenderState
     case "session.status_change": {
       const sc = msg as { status?: string };
       return `\n[status] ${sc.status}\n`;
+    }
+
+    // A provider dialog (#348): a skill-command approval, an agent's
+    // question. Re-sent on attach while pending, so one raised while nobody
+    // was watching shows up here.
+    case "session.ui_request": {
+      const req = msg as Extract<DaemonMessage, { type: "session.ui_request" }>;
+      if (state.dialogs.some((d) => d.dialog.requestId === req.requestId)) return ""; // re-sent
+      let prompt = `\n${RED}? ${S(req.title)}${RESET}\n`;
+      if (req.message) prompt += `${S(req.message)}\n`;
+      if (req.method === "confirm") prompt += "  Type 'yes' or 'no' (/skip to dismiss)\n";
+      else if (req.method === "select") {
+        (req.options ?? []).forEach((o, i) => {
+          prompt += `  ${i + 1}. ${S(o)}\n`;
+        });
+        prompt += "  Type a number (/skip to dismiss)\n";
+      } else prompt += "  Type your answer (/skip to dismiss)\n";
+      state.dialogs.push({
+        dialog: { requestId: req.requestId, method: req.method, ...(req.options ? { options: req.options } : {}) },
+        prompt,
+      });
+      // Shown only when it is the one being answered.
+      if (state.dialogs.length !== 1) return "";
+      state.lastPrompt = "dialog";
+      return prompt;
+    }
+
+    case "session.ui_resolved": {
+      const res = msg as Extract<DaemonMessage, { type: "session.ui_resolved" }>;
+      const i = state.dialogs.findIndex((d) => d.dialog.requestId === res.requestId);
+      if (i < 0) return "";
+      state.dialogs.splice(i, 1);
+      if (i > 0) return ""; // a queued one, not yet shown
+      let out = res.reason === "answered" ? "" : `${DIM}(question closed: ${S(res.reason)})${RESET}\n`;
+      if (state.dialogs[0]) {
+        out += state.dialogs[0].prompt;
+        state.lastPrompt = "dialog";
+      }
+      return out;
     }
   }
   return "";
@@ -142,7 +218,12 @@ export class TerminalClient {
     this.#config = config;
   }
 
-  async connect(): Promise<void> {
+  /**
+   * `capabilities`: what this connection declares. An interactive attach
+   * declares `ui.dialogs`, so provider dialogs (and pending ones, on attach)
+   * are sent to it; one-shot commands declare nothing.
+   */
+  async connect(opts: { capabilities?: string[] } = {}): Promise<void> {
     const token = await this.#getToken();
 
     return new Promise((resolve, _reject) => {
@@ -159,6 +240,7 @@ export class TerminalClient {
             token,
             protocolVersion: PROTOCOL_VERSION,
             client: "codeoid-cli",
+            ...(opts.capabilities ? { capabilities: opts.capabilities } : {}),
           }),
         );
       };
@@ -223,6 +305,14 @@ export class TerminalClient {
         const status = this.#formatStatus(s.status);
         console.log(`  ${s.name.padEnd(20)} ${status.padEnd(20)} ${s.workdir}`);
         console.log(`  ${"".padEnd(20)} id: ${s.id}  clients: ${s.attachedClients}`);
+        if (s.pendingDialog) {
+          // What it is waiting on, and how to answer it from here (#348).
+          const how =
+            s.pendingDialog.method === "confirm"
+              ? `codeoid approve ${s.name} [--deny], or codeoid attach ${s.name}`
+              : `codeoid attach ${s.name}`;
+          console.log(`  ${"".padEnd(20)} waiting: ${S(s.pendingDialog.title)} — answer with: ${how}`);
+        }
         console.log();
       }
     } else {
@@ -337,6 +427,28 @@ export class TerminalClient {
     const sessionId = await this.#resolveSession(sessionIdOrName);
     if (!sessionId) return;
 
+    // Streaming/approval bookkeeping, carried across messages. `latestApprovalId`
+    // is read below to route a typed yes/no; both fields are mutated by
+    // renderStreamMessage, which also sanitizes every untrusted field before it
+    // reaches the TTY (OSC/CSI/DCS escapes — see #91/#92).
+    const renderState = newStreamRenderState();
+
+    // Installed BEFORE the attach request: the daemon replays the scrollback
+    // and any pending dialog while handling it, ahead of its reply, and a
+    // handler set afterwards dropped them (#348 — a pending question never
+    // showed). Buffered until the attach succeeds, so nothing prints for a
+    // refused attach and the banner comes first.
+    const early: DaemonMessage[] = [];
+    let attached = false;
+    const render = (msg: DaemonMessage) => {
+      const out = renderStreamMessage(msg, renderState);
+      if (out) process.stdout.write(out);
+    };
+    this.#streamHandler = (msg) => {
+      if (attached) render(msg);
+      else early.push(msg);
+    };
+
     const resp = await this.#request({
       type: "session.attach",
       id: randomUUID(),
@@ -344,22 +456,18 @@ export class TerminalClient {
     });
 
     if (resp.type !== "response.ok") {
+      this.#streamHandler = null;
       this.#printError(resp);
       return;
     }
 
     console.log("\nAttached to session. Type messages below. Ctrl+C to detach.\n");
-
-    // Streaming/approval bookkeeping, carried across messages. `latestApprovalId`
-    // is read below to route a typed yes/no; both fields are mutated by
-    // renderStreamMessage, which also sanitizes every untrusted field before it
-    // reaches the TTY (OSC/CSI/DCS escapes — see #91/#92).
-    const renderState = newStreamRenderState();
-
-    this.#streamHandler = (msg) => {
-      const out = renderStreamMessage(msg, renderState);
-      if (out) process.stdout.write(out);
-    };
+    attached = true;
+    // A pending question last, below the scrollback it belongs after — the
+    // daemon replays dialogs first.
+    const buffered = early.splice(0);
+    for (const msg of buffered) if (msg.type !== "session.ui_request") render(msg);
+    for (const msg of buffered) if (msg.type === "session.ui_request") render(msg);
 
     const rl = createInterface({ input: process.stdin, output: process.stdout });
 
@@ -388,15 +496,55 @@ export class TerminalClient {
         continue;
       }
 
-      if ((trimmed === "yes" || trimmed === "no") && renderState.latestApprovalId) {
+      // A tool approval printed after the question is what a yes/no answers;
+      // then the question is shown again.
+      const toolPromptLast = renderState.lastPrompt === "tool" && renderState.latestApprovalId;
+      // Any yes/no form, so "y" meant for the tool can't grant the question.
+      const yesNo = /^(y|yes|n|no)$/i.test(trimmed);
+      // A provider dialog is showing: this line answers it. Its resolution
+      // (session.ui_resolved) drops it from the queue and shows the next.
+      const dialog = renderState.dialogs[0]?.dialog;
+      if (dialog && !(toolPromptLast && yesNo)) {
+        const answer = parseDialogAnswer(trimmed, dialog);
+        if ("error" in answer) {
+          console.log(answer.error);
+          continue;
+        }
+        const resp = await this.#request({ type: "session.ui_response", id: randomUUID(), sessionId, requestId: dialog.requestId, ...answer });
+        if (resp.type === "response.error" && (resp.code === "not_found" || resp.code === "forbidden")) {
+          // Not answerable from here (already resolved, or no session:approve):
+          // drop it so the next line isn't parsed as an answer again.
+          this.#printError(resp);
+          const i = renderState.dialogs.findIndex((d) => d.dialog.requestId === dialog.requestId);
+          if (i >= 0) renderState.dialogs.splice(i, 1);
+          const next = renderState.dialogs[0];
+          if (next && i === 0) {
+            process.stdout.write(next.prompt);
+            renderState.lastPrompt = "dialog";
+          }
+        } else if (resp.type === "response.error") {
+          this.#printError(resp); // e.g. an answer too long — try again
+        }
+        continue;
+      }
+
+      if (yesNo && renderState.latestApprovalId) {
         await this.#request({
           type: "session.approve",
           id: randomUUID(),
           sessionId,
           approvalId: renderState.latestApprovalId,
-          approved: trimmed === "yes",
+          approved: /^y/i.test(trimmed),
         });
         renderState.latestApprovalId = null;
+        renderState.latestApprovalMsgId = null;
+        renderState.lastPrompt = null;
+        // Back to the question that was waiting behind the tool approval.
+        const head = renderState.dialogs[0];
+        if (head) {
+          process.stdout.write(head.prompt);
+          renderState.lastPrompt = "dialog";
+        }
         continue;
       }
 
@@ -448,6 +596,33 @@ export class TerminalClient {
     const sessionId = await this.#resolveSession(sessionIdOrName);
     if (!sessionId) return;
 
+    // A pending yes/no dialog (e.g. a skill-command approval, #348) is answered
+    // by its real request id, from the session's info.
+    const list = await this.#request({ type: "session.list", id: randomUUID() });
+    const dialog =
+      list.type === "session.list.result" ? list.sessions.find((s) => s.id === sessionId)?.pendingDialog : undefined;
+    if (dialog) {
+      if (dialog.method !== "confirm") {
+        console.error(`The session is waiting on a question, not a yes/no: ${S(dialog.title)}`);
+        console.error(`  Answer it with: codeoid attach ${sessionIdOrName}`);
+        return;
+      }
+      // Show exactly what is being answered — the title names the command,
+      // the message says what it does.
+      console.log(S(dialog.title));
+      if (dialog.message) console.log(S(dialog.message));
+      const resp = await this.#request({
+        type: "session.ui_response",
+        id: randomUUID(),
+        sessionId,
+        requestId: dialog.requestId,
+        confirmed: approved,
+      });
+      if (resp.type === "response.ok") console.log(approved ? "Approved." : "Denied.");
+      else this.#printError(resp);
+      return;
+    }
+
     const resp = await this.#request({
       type: "session.approve",
       id: randomUUID(),
@@ -458,6 +633,16 @@ export class TerminalClient {
 
     if (resp.type === "response.ok") {
       console.log(approved ? "Approved." : "Denied.");
+    } else {
+      this.#printError(resp);
+    }
+  }
+
+  /** Pre-approve (or deny) a skill-declared command for a workdir (#348). */
+  async skillGrant(command: string, workdir: string, allowed: boolean): Promise<void> {
+    const resp = await this.#request({ type: "skill.grant", id: randomUUID(), workdir, command, allowed });
+    if (resp.type === "skill.grant.result") {
+      console.log(`${resp.allowed ? "Allowed" : "Denied"} for ${resp.workdir}: ${S(resp.command)}`);
     } else {
       this.#printError(resp);
     }
@@ -585,6 +770,14 @@ export class TerminalClient {
     const reqId = haltedRequestId(p);
     if (!reqId) {
       console.error(`Pipeline ${id} is not awaiting a decision (status: ${p.status}).`);
+      return;
+    }
+    if (kind === "approve" && reqId.startsWith(PIPELINE_INPUT_REQUEST_PREFIX)) {
+      // The daemon refuses this (it would pass the phase without the answer
+      // it asked for), and a fire-and-forget refusal never reaches the user.
+      console.error(
+        `Pipeline ${id} is waiting for an answer to the phase's question — answer it with: codeoid pipeline revise ${id} "<your answer>"`,
+      );
       return;
     }
     if (kind === "revise") {

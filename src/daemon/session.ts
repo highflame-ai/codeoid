@@ -140,6 +140,14 @@ const SUBAGENT_REGISTRATION_FENCE_MS = 5_000;
  */
 const BACKGROUND_WAKE_FALLBACK_MS = 20_000;
 
+/** Why a dialog settled without an answer, from the wire `ui_resolved` reason. */
+const CANCEL_REASON: Record<SessionUiResolvedMsg["reason"], NonNullable<UiResponse["reason"]>> = {
+  answered: "dismissed",
+  cancelled: "dismissed",
+  timeout: "timeout",
+  interrupted: "interrupted",
+};
+
 /**
  * A task digest as it sits inside the wake's <background_tasks> block. The
  * digest is sub-agent output, which tool content can steer, so it must not be
@@ -659,6 +667,15 @@ export class Session {
   #backgroundWakeFallbackMs = BACKGROUND_WAKE_FALLBACK_MS;
   /** Set at the start of destroy(): no wake or adopted turn may start after it. */
   #destroyed = false;
+  /**
+   * Nonzero while the daemon drives this session with nobody at the keyboard
+   * (a pipeline phase; see beginUnattended). Like `claude -p`, an unattended turn never prompts: a
+   * dialog is answered at once as cancelled with reason `unattended`, and the
+   * caller applies its policy (#348).
+   */
+  #unattended = 0;
+  /** errorMessage of the most recent turn if it ended in an error; cleared when a turn starts. */
+  #lastTurnError: string | null = null;
 
   #subagents = new Map<
     string,
@@ -1194,6 +1211,12 @@ export class Session {
   /** Number of turns (user + assistant) in the canonical history. */
   get historyLength(): number { return this.#accumulator.history.length; }
   /**
+   * Why the most recent turn failed (its errorMessage), or null when it did
+   * not. A failed turn often produces no assistant text, so a caller reporting
+   * the failure — a pipeline phase — needs this, not lastAssistantText.
+   */
+  get lastTurnError(): string | null { return this.#lastTurnError; }
+  /**
    * Role of the MOST RECENT canonical turn (undefined before any turn). Right
    * after `send()` the last turn is our USER prompt/nudge; a transient query-loop
    * rebuild idle rests there WITHOUT the model committing anything, so the last
@@ -1524,9 +1547,14 @@ export class Session {
    * Raise a dialog on behalf of the provider and await the user's answer.
    * Passed to providers as `TurnOpts.requestUserInput`. The promise settles
    * when the first client answers, the request times out (`timeoutMs`), or
-   * the session is interrupted/destroyed — never rejects.
+   * the session is interrupted/destroyed — never rejects. With no deadline it
+   * waits for a human however long, like a tool approval: it is re-sent to
+   * every client that attaches and can render it, and shows in the session's
+   * info (`pendingDialog`) so any surface can see what it is waiting on. A
+   * cancelled answer carries `reason`. An unattended turn never waits.
    */
   requestUserInput(req: UiRequest): Promise<UiResponse> {
+    if (this.#unattended > 0) return Promise.resolve({ cancelled: true, reason: "unattended" });
     const requestId = randomUUID();
     const msg: SessionUiRequestMsg = {
       type: "session.ui_request",
@@ -1550,7 +1578,28 @@ export class Session {
           : undefined;
       this.#pendingUiRequests.set(requestId, { msg, resolve, timer });
       this.#broadcastToCapable(CAPABILITIES.UI_DIALOGS, msg);
+      this.#broadcastInfoUpdate(); // pendingDialog
     });
+  }
+
+  /** Whether the daemon is driving this session unattended (see #unattended). */
+  get unattended(): boolean {
+    return this.#unattended > 0;
+  }
+
+  /**
+   * Mark this session unattended until the returned release is called (once;
+   * later calls are no-ops). Counted, not a flag, so overlapping unattended
+   * runs don't end it early for each other.
+   */
+  beginUnattended(): () => void {
+    this.#unattended += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.#unattended -= 1;
+    };
   }
 
   /** Count of unanswered provider dialogs (StatusBar / watchdog signal). */
@@ -1601,7 +1650,11 @@ export class Session {
     if (!pending) return false;
     this.#pendingUiRequests.delete(requestId);
     if (pending.timer) clearTimeout(pending.timer);
-    pending.resolve(response);
+    pending.resolve(
+      response.cancelled && response.reason === undefined
+        ? { ...response, reason: CANCEL_REASON[reason] }
+        : response,
+    );
     this.#broadcastToCapable(CAPABILITIES.UI_DIALOGS, {
       type: "session.ui_resolved",
       sessionId: this.id,
@@ -1609,6 +1662,7 @@ export class Session {
       reason,
       timestamp: new Date().toISOString(),
     });
+    this.#broadcastInfoUpdate(); // pendingDialog cleared
     return true;
   }
 
@@ -1768,6 +1822,7 @@ export class Session {
     this.#store.audit(sender.sub, "session.send", this.id);
     // A new turn is starting — clear any interrupt from the previous one.
     this.#turnInterrupted = false;
+    this.#lastTurnError = null;
     // Any inbound message invalidates a repeat run: the guard only claims
     // "N identical calls with nothing else happening", and this is something
     // else happening. Applies to system principals too (a background-task
@@ -2203,6 +2258,7 @@ export class Session {
     // row — which a stateless backend reached by a later switch may reject.
     this.#accumulator.pushUserTurn("(Background work finished; the agent harness delivered the results.)");
     this.#turnInterrupted = false;
+    this.#lastTurnError = null;
     // A turn with no prompt reads as the agent talking to itself; say why.
     const note = this.#makeMessage(
       "info",
@@ -3007,6 +3063,23 @@ export class Session {
       ...(this.#pack
         ? { profile: this.#pack.roleName ? `${this.#pack.id} (${this.#pack.roleName})` : this.#pack.id }
         : {}),
+      ...this.#pendingDialogInfo(),
+    };
+  }
+
+  /** The oldest unanswered dialog, for SessionInfo.pendingDialog (#348). */
+  #pendingDialogInfo(): Pick<SessionInfo, "pendingDialog"> {
+    const first = this.#pendingUiRequests.values().next();
+    if (first.done) return {};
+    const m = first.value.msg;
+    return {
+      pendingDialog: {
+        requestId: m.requestId,
+        method: m.method,
+        title: m.title,
+        ...(m.message !== undefined ? { message: m.message } : {}),
+        ...(m.options !== undefined ? { options: m.options } : {}),
+      },
     };
   }
 
@@ -4171,6 +4244,8 @@ export class Session {
       if (!this.#activeRun) return; // torn down, ignore
       const emsg = err instanceof Error ? err.message : String(err);
       console.error(`[codeoid/session ${this.id}] provider event consumer failed:`, err);
+      // Before the status change: it wakes a pipeline phase waiter that reads it.
+      this.#lastTurnError = emsg;
       this.#setStatus("error");
       const errorMsg = this.#makeMessage("system", `Error: ${emsg}`, SYSTEM_IDENTITY, undefined, undefined, { event: "agent_error", errorCode: "agent_error" });
       this.#persistAndBuffer(errorMsg);
@@ -4629,6 +4704,7 @@ export class Session {
         });
         if (event.result.isError) {
           const errText = event.result.errorMessage ?? "Turn ended with an error";
+          this.#lastTurnError = errText;
           const errorMsg = this.#makeMessage("system", `Error: ${errText}`, SYSTEM_IDENTITY, undefined, undefined, { event: "agent_error" });
           this.#persistAndBuffer(errorMsg);
           this.#broadcastRaw(errorMsg);
@@ -4646,11 +4722,13 @@ export class Session {
         // keeps the phase alive. The turn does NOT end here; the provider
         // retries in place on approval or emits a terminal turn_done on denial,
         // so #consumeEvents must NOT break on this event. Post a visible cue so
-        // the user knows their approval is what unblocks it.
+        // the user knows their approval is what unblocks it — unless the turn
+        // is unattended, where the provider fails it at once with the reason.
+        if (this.#unattended > 0) break;
         this.#setStatus("waiting_approval");
         const note = this.#makeMessage(
           "system",
-          `⏸ A skill needs approval to run \`${event.command}\` before it can continue. Approve the prompt and it resumes automatically.`,
+          `⏸ A skill needs approval to run \`${event.command}\` before it can continue. Approve it — in the web UI, Telegram, \`codeoid attach ${this.name}\` or \`codeoid approve ${this.name}\` — and it resumes automatically.`,
           SYSTEM_IDENTITY,
           undefined,
           undefined,
@@ -4663,6 +4741,7 @@ export class Session {
 
       case "error": {
         console.error(`[codeoid/session ${this.id}] provider error:`, event.message);
+        this.#lastTurnError = event.message; // before the status change (see above)
         this.#setStatus("error");
         const errorMsg = this.#makeMessage("system", `Error: ${event.message}`, SYSTEM_IDENTITY, undefined, undefined, { event: "agent_error" });
         this.#persistAndBuffer(errorMsg);

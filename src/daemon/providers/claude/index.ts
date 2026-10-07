@@ -42,8 +42,9 @@ import { FLEET_TOOL_NAMES } from "../../fleet.js";
 import { rewriteBashToolInput } from "../../compress/index.js";
 import type { CodeoidConfig } from "../../../config.js";
 import type { AuthContext } from "../../../protocol/types.js";
-import type { SessionProvider, ModelInfo, NormalizedTurnResult, ProviderEvent, SessionScopedEvent, TurnOpts, TurnRun, CatalogEntry } from "../interface.js";
+import type { SessionProvider, ModelInfo, NormalizedTurnResult, ProviderEvent, SessionScopedEvent, TurnOpts, TurnRun, CatalogEntry, UiResponse } from "../interface.js";
 import { isBackgroundLifecycleEvent } from "../interface.js";
+import { isUngrantableSkillCommand, redactCommand } from "../../skill-command.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
 import { buildSubprocessEnv, withGatewayCredential } from "../env.js";
 import type { LLMCallUsage } from "../../context-math.js";
@@ -1042,6 +1043,16 @@ export class ClaudeProvider implements SessionProvider {
     if (!m) return false;
     const command = m[1].trim();
     const rule = `Bash(${command})`;
+    // Before the channel check: explained even when nothing could be asked.
+    if (isUngrantableSkillCommand(command)) {
+      // Not grantable (see skillCommandAllowRules): fail the turn now rather
+      // than ask for an approval that could never take effect.
+      this.#failSkillTurn(
+        command,
+        "it cannot be safely written as one exact permission rule (a * wildcard, unbalanced parentheses, text after an inner ')', or a stray backslash) — allowing it could let the agent run more than this command unasked; change the skill to name a plain command",
+      );
+      return true;
+    }
     if (!this.#currentRequestUserInput) return false;
     const decided = this.#init.store.getSkillCommandGrants(this.#init.workspaceId);
     if (decided.get(rule) === true) return false; // granted yet blocked → don't loop
@@ -1077,20 +1088,32 @@ export class ClaudeProvider implements SessionProvider {
       }
       const answer = await ask({
         method: "confirm",
-        title: "Allow a command declared by an installed skill?",
+        // The WHOLE command is in the title, so every surface that shows only
+        // the title — `codeoid ls`, the TUI prompt line — shows exactly what is
+        // approved (a truncated one could hide its tail behind a one-key yes).
+        title: `Allow the skill command \`${command}\`?`,
         message: `A skill needs to run:\n\n    ${command}\n\nIt runs when the slash command expands, before the agent starts, so it never appears in the tool stream. Approve and I'll continue automatically; the choice is remembered for this workspace.`,
       });
-      // `cancelled` = dismissal / timeout / interrupt / teardown — "no answer",
-      // never consent. Persist nothing (so a real decision can still be made
-      // later) but fail THIS turn, since a parked turn would otherwise hang.
+      // `cancelled` = dismissal / timeout / interrupt / teardown / nobody able
+      // to answer — "no answer", never consent. Persist nothing (so a real
+      // decision can still be made later) but fail THIS turn, since a parked
+      // turn would otherwise hang.
       if (answer.cancelled) {
-        this.#failSkillTurn(command, "the approval was dismissed");
+        this.#failSkillTurn(command, skillNoAnswer(answer.reason ?? "dismissed", command, this.#lastTurnOpts?.workdir));
         return;
       }
       const allowed = answer.confirmed === true;
       this.#init.store.setSkillCommandGrant(this.#init.workspaceId, rule, allowed);
+      // The answering client is audited by the session (session.ui_response);
+      // this records what that answer granted, like skill.grant does.
+      this.#init.store.audit(
+        "skill-approval",
+        allowed ? "skill.grant" : "skill.deny",
+        this.#init.sessionId,
+        `command=${redactCommand(command)}`,
+      );
       console.error(
-        `[claude-provider ${this.#init.sessionId.slice(0, 8)}] skill command ${allowed ? "approved" : "denied"}: ${command.slice(0, 60)}`,
+        `[claude-provider ${this.#init.sessionId.slice(0, 8)}] skill command ${allowed ? "approved" : "denied"}: ${redactCommand(command).slice(0, 60)}`,
       );
       if (allowed) this.#retryAfterGrant();
       else this.#failSkillTurn(command, "you denied it");
@@ -1684,6 +1707,10 @@ export function skillCommandAllowRules(skillsDirs: string[]): string[] {
         // an approved grant permanently un-derivable and fail its retry.
         const argv0 = trimmed.split(/\s+/)[0] ?? "";
         if (!/^[A-Za-z0-9_./~=-]+$/.test(argv0)) continue;
+        // A grant becomes a Claude permission rule, which also covers the
+        // agent's own Bash tool — never derive one that is a wildcard or could
+        // end early in the comma-joined rule list (#348; see the predicate).
+        if (isUngrantableSkillCommand(trimmed)) continue;
         rules.add(`Bash(${trimmed})`);
       }
     }
@@ -1713,6 +1740,29 @@ export function withMcpToolTimeout(
         : ({ ...obj, timeout: ms } as unknown as McpServerConfig);
   }
   return out;
+}
+
+/** Why a skill command was not run, by why its approval got no answer. */
+function skillNoAnswer(reason: NonNullable<UiResponse["reason"]>, command: string, workdir: string | undefined): string {
+  switch (reason) {
+    case "dismissed":
+      return "the approval was dismissed";
+    case "timeout":
+      return "the approval timed out";
+    case "interrupted":
+      return "the turn was interrupted before it was approved";
+    case "unattended":
+      // Like `claude -p`: an unattended run (a pipeline phase) never prompts,
+      // so a command must be allowed before the run (#348).
+      return `it is not pre-approved, and this run is unattended — allow it with: codeoid skill allow ${shellQuote(command)}${
+        workdir ? ` --workdir ${shellQuote(workdir)}` : ""
+      }`;
+  }
+}
+
+/** Single-quote for a POSIX shell, so a copied command line runs as shown. */
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 /** Registry servers (external, non-builtin) for the claude backend as SDK

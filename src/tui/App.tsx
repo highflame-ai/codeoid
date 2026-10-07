@@ -19,6 +19,8 @@ import {
   type WorkspaceCommand,
 } from "./workspace-commands.js";
 import type { Attachment } from "../protocol/types.js";
+import { parseDialogAnswer } from "../terminal/dialog.js";
+import { dialogDetail, dialogHint } from "./dialog-hint.js";
 import type { CodeoidConfig } from "../config.js";
 import { findModel } from "../daemon/models.js";
 import {
@@ -308,14 +310,70 @@ export function App({ config }: Props) {
 
   // ── Keyboard handling ──────────────────────────────────────────────────
 
+  // A provider dialog the focused session is waiting on (#348) — a skill
+  // command approval, an agent's question. From the session's info, so it
+  // clears itself when answered on any surface.
+  const pendingDialog = focusedSession?.pendingApproval ? undefined : focusedSession?.info.pendingDialog;
+  const answerDialog = (answer: { value?: string; confirmed?: boolean; cancelled?: boolean }) => {
+    if (!focusedSession || !pendingDialog) return;
+    void wsRef.current
+      ?.uiRespond(focusedSession.info.id, pendingDialog.requestId, answer)
+      .then((resp) => {
+        if (resp.type === "response.error") dispatch({ type: "error", message: resp.error });
+      })
+      .catch((err: Error) => dispatch({ type: "error", message: err.message }));
+  };
+
+  // The prompt line holds one row, so a long question (a skill command's
+  // tail) would be cut off there. Print each question in full into the
+  // scrollback once, when it first shows, before a one-key answer can land.
+  const shownDialogsRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!focusedSession || !pendingDialog) return;
+    if (shownDialogsRef.current.has(pendingDialog.requestId)) return;
+    shownDialogsRef.current.add(pendingDialog.requestId);
+    dispatch({
+      type: "session.message",
+      sessionId: focusedSession.info.id,
+      message: {
+        type: "session.message",
+        sessionId: focusedSession.info.id,
+        messageId: `local:dialog:${pendingDialog.requestId}`,
+        role: "info",
+        content: dialogDetail(pendingDialog),
+        identity: { sub: "system:codeoid", name: "codeoid", type: "system" },
+        timestamp: new Date().toISOString(),
+      },
+    });
+  }, [focusedSession, pendingDialog]);
+
   useInput(
     (input, key) => {
       if (state.modal) return;
+
+      // Dialog hotkeys — y/n for a yes/no, a digit for a pick list — only on an
+      // empty prompt, like the approval keys below, and never with Ctrl/Meta
+      // (Ink delivers Ctrl-N as "n": it must open a session, not answer No).
+      if (pendingDialog && state.input.length === 0 && !key.ctrl && !key.meta) {
+        if (pendingDialog.method === "confirm" && /^[yYnN]$/.test(input)) {
+          answerDialog({ confirmed: input === "y" || input === "Y" });
+          return;
+        }
+        const options = pendingDialog.options ?? [];
+        // One keystroke picks only when every option has a single digit; with
+        // ten or more, type the number and press Enter.
+        if (pendingDialog.method === "select" && options.length <= 9 && /^[1-9]$/.test(input) && Number(input) <= options.length) {
+          answerDialog({ value: options[Number(input) - 1] });
+          return;
+        }
+      }
 
       // Approval hotkeys — only when input is empty so we don't steal y/n from typing.
       if (
         focusedSession?.pendingApproval &&
         state.input.length === 0 &&
+        !key.ctrl &&
+        !key.meta &&
         (input === "y" || input === "Y" || input === "n" || input === "N")
       ) {
         const approved = input === "y" || input === "Y";
@@ -506,6 +564,19 @@ export function App({ config }: Props) {
     const client = wsRef.current;
     const text = state.input.trim();
     if (!client || !text) return;
+
+    // A pending dialog takes the typed line as its answer (a free-text
+    // question, or "yes"/"3" typed out); `/skip` dismisses it.
+    if (pendingDialog && (!text.startsWith("/") || text === "/skip")) {
+      const answer = parseDialogAnswer(text, pendingDialog);
+      if ("error" in answer) {
+        dispatch({ type: "error", message: answer.error });
+        return;
+      }
+      answerDialog(answer);
+      dispatch({ type: "input.clear" });
+      return;
+    }
 
     // Slash command path.
     if (text.startsWith("/")) {
@@ -927,7 +998,9 @@ export function App({ config }: Props) {
   //   - idle             → normal send copy
   const promptHint = focusedSession?.pendingApproval
     ? `⎆ ${focusedSession.pendingApproval.toolName}: ${focusedSession.pendingApproval.description} — press y/n`
-    : focusedSession?.info.status === "thinking" ||
+    : pendingDialog
+      ? dialogHint(pendingDialog)
+      : focusedSession?.info.status === "thinking" ||
         focusedSession?.info.status === "tool_running"
       ? "⋯ session is working — Enter queues a mid-turn message · Ctrl-F search · Esc / Ctrl-X interrupt"
       : "Enter to send · Ctrl-N new · Ctrl-G switch · Ctrl-F search · Esc clear · Ctrl-X interrupt · ? help · Ctrl-C quit";

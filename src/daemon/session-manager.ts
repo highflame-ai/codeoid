@@ -99,7 +99,6 @@ import {
   MAX_SPURIOUS_RESTS,
   PHASE_COMPLETION_CONTRACT,
   PHASE_CONTINUE_NUDGE,
-  PHASE_NO_INPUT_NUDGE,
   stripNeedInputMarker,
   stripPhaseCompleteMarker,
 } from "./pipeline/phase-completion.js";
@@ -107,6 +106,7 @@ import { roleEnforcement } from "./providers/tool-safety.js";
 import type { DispatchEventRow, DispatchTaskRow } from "./store.js";
 import { type MemoryEngine, type MemoryMcpMount, workspaceIdFromPath } from "./memory/index.js";
 import type { McpRegistry } from "./mcp/registry.js";
+import { redactCommand } from "./skill-command.js";
 import type { McpHub } from "./mcp/hub.js";
 import { mcpOAuthBindingCookieName, type McpOAuth, type McpOAuthProof, type McpTenant } from "./mcp/oauth.js";
 import { isOAuthServer, type McpServerSpec, NATIVE_MOUNT_BACKENDS } from "./mcp/types.js";
@@ -1075,6 +1075,8 @@ mcpHub: this.#mcpHub,
         return this.#backendLoginSubmit(msg, auth);
       case "backend.login.cancel":
         return this.#backendLoginCancel(msg, auth);
+      case "skill.grant":
+        return this.#skillGrant(msg, auth);
       case "mcp.oauth.begin":
         return this.#mcpOAuthBegin(msg, auth);
       case "mcp.oauth.complete":
@@ -1550,6 +1552,8 @@ mcpHub: this.#mcpHub,
       this.modelContextWindow(scope, providerId, model),
   };
 
+
+
   /**
    * The model catalog to serve for a provider, best source first:
    *   1. live    — reported by that provider's backend this daemon lifetime
@@ -1955,6 +1959,29 @@ mcpHub: this.#mcpHub,
       requestId: msg.id,
       ok: this.#backendLogin.cancel(msg.loginId),
     };
+  }
+
+  /**
+   * Pre-approve (or deny) a command a skill declares, for a workspace — the
+   * `--allowedTools` of an unattended run, which never prompts (#348). The
+   * same record the approval dialog writes. `settings:write`: the command then
+   * runs unasked in every later session on that workdir.
+   */
+  #skillGrant(msg: Extract<ClientMessage, { type: "skill.grant" }>, auth: AuthContext): DaemonMessage {
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return this.#loginForbidden(msg.id);
+    const workdir = normalizeWorkdir(msg.workdir);
+    if (!workdir) {
+      return {
+        type: "response.error",
+        requestId: msg.id,
+        error: `"${msg.workdir}" is not a usable workdir`,
+        code: "invalid_request",
+      };
+    }
+    const command = msg.command.trim();
+    this.#store.setSkillCommandGrant(workspaceIdFromPath(workdir, auth), `Bash(${command})`, msg.allowed);
+    this.#store.audit(auth.sub, msg.allowed ? "skill.grant" : "skill.deny", "", `workdir=${workdir} command=${redactCommand(command)}`);
+    return { type: "skill.grant.result", requestId: msg.id, workdir, command, allowed: msg.allowed };
   }
 
   #loginForbidden(requestId: string): DaemonMessage {
@@ -3688,8 +3715,10 @@ mcpHub: this.#mcpHub,
    * capability role (+ constitution + subagents) to the live session, refreshes
    * the autonomous turn budget, injects the phase prompt (streamed to attached
    * clients), and resolves when the session next rests. There is NO per-phase
-   * timeout (the session is attended) and the session is NOT torn down between
-   * phases. Satisfies the pipeline package's PhaseTurnHost.
+   * timeout and the session is NOT torn down between phases. The phase runs
+   * unattended (#348): nothing in it prompts — a skill command must be
+   * pre-approved, and a question halts the phase. Satisfies the pipeline
+   * package's PhaseTurnHost.
    *
    * `model` on the request is the phase's persisted binding
    * (docs/role-model-binding.md §3): it is applied to the bound session for
@@ -3777,6 +3806,11 @@ mcpHub: this.#mcpHub,
     };
     let nudges = 0;
     let spurious = 0;
+    // The phase runs unattended (#348): like `claude -p`, nothing in it may
+    // prompt — a skill command must be pre-approved, and a question halts the
+    // phase. Cleared in the finally, so a human chatting in this session
+    // afterwards gets normal dialogs.
+    const endUnattended = session.beginUnattended();
     try {
       while (true) {
         const done = new Promise<PhaseTurnResult["finalStatus"]>((resolve) => {
@@ -3790,6 +3824,12 @@ mcpHub: this.#mcpHub,
           textAtSend = session.lastAssistantText ?? "";
         }
         const finalStatus = await done;
+        // A failed turn usually leaves no assistant text, and lastAssistantText
+        // would then be a PREVIOUS phase's output: report why it failed — e.g.
+        // the "codeoid skill allow …" a blocked skill command names (#348).
+        if (finalStatus === "error") {
+          return { finalStatus, text: session.lastTurnError ?? summary(session.lastAssistantText ?? "") };
+        }
         const text = session.lastAssistantText ?? "";
         // A non-idle rest (error / budget-exhausted) is a real phase failure.
         if (finalStatus !== "idle") return { finalStatus, text: summary(text) };
@@ -3821,27 +3861,12 @@ mcpHub: this.#mcpHub,
         }
         // The model needs the user's input. Surface the question as an input
         // dialog and feed the answer back as the next turn — a REAL answer is a
-        // legitimate pause (not a nudge), so it resets the give-up budget; a
-        // dismissed / interrupted dialog falls through to the bounded nudge path
-        // so repeated dismissals can't loop forever. Guarded on NEW text, same as
-        // completion above — never a stale marker from the prior phase.
+        // Guarded on NEW text, same as completion above — never a stale marker
+        // from the prior phase. A phase runs unattended (#348): nobody is at a
+        // keyboard to answer, so the phase halts on its question — answered
+        // with revise, durably — rather than nudging the agent into guessing.
         if (text !== textAtSend && isNeedInput(text)) {
-          const resp = await session.requestUserInput({
-            method: "input",
-            title: "The agent needs your input to continue this phase",
-            message: stripNeedInputMarker(text),
-            placeholder: "Type your answer…",
-          });
-          if (session.turnInterrupted) return { finalStatus: "idle", text: summary(text) };
-          if (!resp.cancelled && resp.value && resp.value.trim().length > 0) {
-            pendingSend = resp.value;
-            nudges = 0;
-            continue;
-          }
-          if (nudges >= MAX_PHASE_NUDGES) return { finalStatus: "idle", text: summary(text) };
-          nudges += 1;
-          pendingSend = PHASE_NO_INPUT_NUDGE;
-          continue;
+          return { finalStatus: "needs_input", text: stripNeedInputMarker(text) };
         }
         // Rested with new output but no marker (an intermediate pause). Nudge to
         // continue, bounded; after the cap, hand what it has to the human review
@@ -3851,6 +3876,7 @@ mcpHub: this.#mcpHub,
         pendingSend = PHASE_CONTINUE_NUDGE;
       }
     } finally {
+      endUnattended();
       this.#phaseWaiters.delete(req.sessionId);
       // Restore the pre-phase model — reliable even on phase failure. Skipped
       // when the model changed underneath us (the user ran set_model mid-phase;

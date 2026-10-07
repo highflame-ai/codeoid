@@ -65,6 +65,20 @@ describe("SessionPhaseRunner", () => {
     }
   });
 
+  test("a question nobody could answer comes back as the question, not a failure (#348)", async () => {
+    const host: PhaseTurnHost = {
+      async runPhaseOnSession() {
+        return { finalStatus: "needs_input", text: "Which database?" };
+      },
+    };
+    const out = await new SessionPhaseRunner(() => host).runPrompt({
+      prompt: "x",
+      pipeline: fakePipeline(),
+      phase: { id: "one", kind: "skill" },
+    });
+    expect(out).toEqual({ question: "Which database?" });
+  });
+
   test("throws when the run has no bound session (misconfiguration, fail loud — never runs a phase unbound)", async () => {
     let called = false;
     const host: PhaseTurnHost = {

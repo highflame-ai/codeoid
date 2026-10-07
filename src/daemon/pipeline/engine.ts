@@ -45,6 +45,7 @@ import {
   validateDispositions,
 } from "./findings";
 import { resolveScoped } from "./scoped";
+import { PIPELINE_INPUT_REQUEST_PREFIX } from "../../protocol/types.js";
 
 /** Defensive cap against a mis-authored retry loop (each retry is one step). */
 const MAX_STEPS = 10_000;
@@ -153,6 +154,7 @@ export class PipelineEngine {
         reason: res.reason,
         questions: res.questions,
       };
+      clearSupersededOutput(phase, res.requestId);
       s.status = "halted";
       return touch(s);
     }
@@ -321,6 +323,7 @@ export class PipelineEngine {
     });
     if (res.outcome === "halted") {
       phase.state = { status: "halted", requestId: res.requestId, reason: res.reason, questions: res.questions };
+      clearSupersededOutput(phase, res.requestId);
       s.status = "halted";
       return touch(s);
     }
@@ -518,4 +521,13 @@ function applyFail(
   phase.state = { status: "failed", reason, attempts: nextAttempts };
   s.status = "failed";
   return touch(s);
+}
+
+/**
+ * A phase that halted on a question (#348) produced no output this attempt, so
+ * a summary from an earlier attempt must not be shown beside the question as
+ * what it did.
+ */
+function clearSupersededOutput(phase: PipelinePhase, requestId: string): void {
+  if (requestId.startsWith(PIPELINE_INPUT_REQUEST_PREFIX)) phase.lastSummary = undefined;
 }

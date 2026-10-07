@@ -119,7 +119,9 @@ export async function executeAskUserCall(
       : { method: "input", title: question };
   const resp = await deps.requestUserInput(req);
   const answer = resp.cancelled
-    ? "The user dismissed the question without answering."
+    ? resp.reason === "unattended"
+      ? "Nobody can answer: this run is unattended. Proceed on your best judgement, or stop and say what you need."
+      : "The user dismissed the question without answering."
     : resp.value ?? (resp.confirmed !== undefined ? String(resp.confirmed) : "");
   deps.emit({ type: "tool_complete", sdkToolUseId: toolId, output: answer, success: !resp.cancelled });
   return answer;

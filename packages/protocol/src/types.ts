@@ -31,6 +31,7 @@ import type {
   BackendLoginSubmitResultMsg,
   BackendLoginCancelResultMsg,
 } from "./backend-login.js";
+import type { SkillGrantMsg, SkillGrantResultMsg } from "./skill-grant.js";
 import type {
   McpOAuthBeginMsg,
   McpOAuthCompleteMsg,
@@ -322,6 +323,19 @@ export interface SessionInfo {
   phase?: string;
   /** Methodology pack/profile driving this session's phase. */
   profile?: string;
+  /**
+   * The oldest provider dialog waiting for an answer (a skill-command
+   * approval, an agent's question), so every surface can show what the session
+   * is waiting on — even one that cannot render dialogs. Answer it with
+   * `session.ui_response` (this `requestId`). Absent when nothing is pending.
+   */
+  pendingDialog?: {
+    requestId: string;
+    method: UiRequestMethod;
+    title: string;
+    message?: string;
+    options?: string[];
+  };
   /** Remaining turns budget for autonomous mode (undefined = unbounded, 0 = exhausted). */
   turnsRemaining?: number;
   /** Files pinned to the session — prepended to every turn's prompt. */
@@ -1002,6 +1016,7 @@ export type ClientMessage =
   | BackendLoginStartMsg
   | BackendLoginSubmitMsg
   | BackendLoginCancelMsg
+  | SkillGrantMsg
   | McpOAuthBeginMsg
   | McpOAuthCompleteMsg
   | McpOAuthDisconnectMsg
@@ -2219,6 +2234,15 @@ export interface SessionCommandsResultMsg {
 
 // ── SDLC pipeline (docs/sdlc-pipeline.md) — additive; no version bump ─────────
 
+/**
+ * `requestId` prefix of a phase halted on a QUESTION it asked that nobody
+ * connected could answer (`questions` holds it). Answer with
+ * `pipeline.revise` — it re-runs the phase with the reply; approving is
+ * refused, since it would pass the phase without the answer. Other halts
+ * (`exit:<phase>`) are review gates, where Approve is the normal path.
+ */
+export const PIPELINE_INPUT_REQUEST_PREFIX = "input:";
+
 /** A pipeline phase projected for the wire (subset of the daemon PhaseState). */
 export interface PipelinePhaseWire {
   id: string;
@@ -2549,6 +2573,7 @@ export type DaemonMessage =
   | BackendLoginStartResultMsg
   | BackendLoginSubmitResultMsg
   | BackendLoginCancelResultMsg
+  | SkillGrantResultMsg
   | McpOAuthBeginResultMsg
   | McpOAuthCompleteResultMsg
   | McpOAuthDisconnectResultMsg
