@@ -1,9 +1,9 @@
 name: Release Build - Codeoid
 
 on:
-  release:
-    types:
-      - published
+  push:
+    tags:
+      - "v*.*.*"
 
 env:
   REGEX_PATTERN: "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
@@ -47,7 +47,7 @@ jobs:
       - name: Extract version from release
         id: version
         env:
-          RELEASE_NAME: ${{ github.event.release.name }}
+          RELEASE_NAME: ${{ github.event.release.tag_name || github.ref_name }}
         shell: bash
         run: |-
           VERSION=$(echo "$RELEASE_NAME" | sed 's|^v||g')
