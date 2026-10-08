@@ -4,7 +4,7 @@
  * pack-format.ts).
  */
 
-import type { PipelinePhaseWire, PipelineWire } from "../protocol/types.js";
+import { PIPELINE_INPUT_REQUEST_PREFIX, type PipelinePhaseWire, type PipelineWire } from "../protocol/types.js";
 
 const TERMINAL = new Set(["merged", "done", "failed", "abandoned"]);
 
@@ -64,10 +64,16 @@ export function formatPipeline(p: PipelineWire): string[] {
     out.push("", `  ⏸ awaiting your decision on "${cur.id}"`);
     if (cur.reason) out.push(`     reason: ${cur.reason}`);
     for (const q of cur.questions ?? []) out.push(`     • ${q}`);
+    // A halt on the phase's own question is answered with revise; approving
+    // it is refused (it would pass the phase without the answer).
     out.push(
       "",
-      `     codeoid pipeline approve ${p.id}          # accept + continue`,
-      `     codeoid pipeline revise  ${p.id} "<notes>" # re-run this phase with feedback`,
+      ...(cur.requestId?.startsWith(PIPELINE_INPUT_REQUEST_PREFIX)
+        ? [`     codeoid pipeline revise  ${p.id} "<answer>" # answer — re-runs this phase with it`]
+        : [
+            `     codeoid pipeline approve ${p.id}          # accept + continue`,
+            `     codeoid pipeline revise  ${p.id} "<notes>" # re-run this phase with feedback`,
+          ]),
       `     codeoid pipeline reject  ${p.id}          # stop the run`,
     );
   } else if (isTerminal(p)) {

@@ -538,6 +538,18 @@ describe("skillCommandAllowRules", () => {
   // Regression (#233): a skill's `!`…`` substitution runs at expansion time,
   // which has no approval path in a headless session. Unallowed → the whole
   // slash command silently expands to nothing.
+  it("never derives a rule that could be a wildcard or split the rule list (#348)", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "codeoid-skills-"));
+    write(
+      tmp,
+      "spec",
+      "---\nname: spec\n---\n!`cat *`\n!`git log:*`\n!`echo ),Read(~/.ssh/id_rsa`\n!`node -e console.log(1)`\n!`sh ./ok.sh`\n",
+    );
+    // Balanced parens (and the comma inside them) stay inside one rule.
+    expect(skillCommandAllowRules([tmp]).sort()).toEqual(["Bash(node -e console.log(1))", "Bash(sh ./ok.sh)"]);
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
   it("emits a verbatim rule per declared command", () => {
     const tmp = mkdtempSync(join(tmpdir(), "codeoid-skills-"));
     write(tmp, "spec", "---\nname: spec\n---\n# spec\n!`sh ./ethos.sh`\nctx: !`cat ./x.md`\n");
@@ -779,9 +791,12 @@ describe("ClaudeProvider – skill-command approval (#233)", () => {
   function statefulStore(seed: Record<string, boolean> = {}) {
     const grants = new Map<string, boolean>(Object.entries(seed));
     const writes: Array<[string, boolean]> = [];
+    const audits: string[][] = [];
     return {
       store: {
-        audit: () => {},
+        audit: (...a: string[]) => {
+          audits.push(a);
+        },
         getClaudeCodeSessionId: () => null,
         setClaudeCodeSessionId: () => {},
         getSkillCommandGrants: () => new Map(grants),
@@ -791,6 +806,7 @@ describe("ClaudeProvider – skill-command approval (#233)", () => {
         },
       } as never,
       writes,
+      audits,
     };
   }
 
@@ -904,6 +920,98 @@ describe("ClaudeProvider – skill-command approval (#233)", () => {
     expect(done.result.isError).toBe(true);
     expect(done.result.errorMessage).toContain("dismissed");
     expect(writes).toEqual([]); // no verdict — a real decision can still be made
+    await provider.teardown?.();
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("names the command in the approval's title, and audits what the answer granted (#348)", async () => {
+    const tmp = skillDir("---\nname: s\n---\n!`sh titled.sh`\n");
+    const { store, audits } = statefulStore();
+    const provider = new ClaudeProvider({ sessionId: "t", initialBackingId: "b", workspaceId: "ws", store });
+    sdkMessages = [blockFor("sh titled.sh"), zeroTurn];
+    let asked: { title?: string } = {};
+    const run = provider.runTurn({
+      history: [], userMessage: "/spec", workdir: tmp,
+      canUseTool: async () => ({ behavior: "allow" as const }),
+      requestUserInput: async (req) => {
+        asked = req;
+        return { confirmed: false, cancelled: false };
+      },
+    });
+    for await (const _ of run.events) { /* drain */ }
+    await Bun.sleep(5);
+    // Surfaces that show only the title (codeoid ls, the TUI) still show what is approved.
+    expect(asked.title).toBe("Allow the skill command `sh titled.sh`?");
+    expect(audits).toContainEqual(["skill-approval", "skill.deny", "t", "command=sh titled.sh"]);
+    await provider.teardown?.();
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("refuses a wildcard skill command without asking — it could never be safely granted (#348)", async () => {
+    const tmp = skillDir("---\nname: s\n---\n!`cat *`\n");
+    const { store, writes } = statefulStore();
+    const provider = new ClaudeProvider({ sessionId: "w", initialBackingId: "b", workspaceId: "ws", store });
+    sdkMessages = [blockFor("cat *"), zeroTurn];
+    let asked = false;
+    const run = provider.runTurn({
+      history: [], userMessage: "/spec", workdir: tmp,
+      canUseTool: async () => ({ behavior: "allow" as const }),
+      requestUserInput: async () => {
+        asked = true;
+        return { confirmed: true, cancelled: false };
+      },
+    });
+    const events: ProviderEvent[] = [];
+    for await (const e of run.events) events.push(e);
+    await Bun.sleep(5);
+    expect(asked).toBe(false);
+    const done = events.find((e) => e.type === "turn_done") as Extract<ProviderEvent, { type: "turn_done" }>;
+    expect(done.result.isError).toBe(true);
+    expect(done.result.errorMessage).toContain("cannot be safely written as one exact permission rule");
+    expect(writes).toEqual([]);
+    await provider.teardown?.();
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("explains an ungrantable command even with no channel to ask on (#348)", async () => {
+    const tmp = skillDir("---\nname: s\n---\n!`cat *`\n");
+    const { store } = statefulStore();
+    const provider = new ClaudeProvider({ sessionId: "n", initialBackingId: "b", workspaceId: "ws", store });
+    sdkMessages = [blockFor("cat *"), zeroTurn];
+    const run = provider.runTurn({
+      history: [], userMessage: "/spec", workdir: tmp,
+      canUseTool: async () => ({ behavior: "allow" as const }),
+    });
+    const events: ProviderEvent[] = [];
+    for await (const e of run.events) events.push(e);
+    await Bun.sleep(5);
+    const done = events.find((e) => e.type === "turn_done") as Extract<ProviderEvent, { type: "turn_done" }>;
+    expect(done.result.errorMessage).toContain("cannot be safely written as one exact permission rule");
+    await provider.teardown?.();
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("an unattended run says how to pre-approve the command, and grants nothing (#348)", async () => {
+    const tmp = skillDir("---\nname: s\n---\n!`sh headless.sh`\n");
+    const { store, writes } = statefulStore();
+    const provider = new ClaudeProvider({ sessionId: "h", initialBackingId: "b", workspaceId: "ws", store });
+    sdkMessages = [blockFor("sh headless.sh"), zeroTurn];
+
+    const run = provider.runTurn({
+      history: [], userMessage: "/spec", workdir: tmp,
+      canUseTool: async () => ({ behavior: "allow" as const }),
+      requestUserInput: async () => ({ cancelled: true, reason: "unattended" as const }),
+    });
+    const events: ProviderEvent[] = [];
+    for await (const e of run.events) events.push(e);
+    await Bun.sleep(5);
+
+    const done = events.find((e) => e.type === "turn_done") as Extract<ProviderEvent, { type: "turn_done" }>;
+    expect(done.result.isError).toBe(true);
+    expect(done.result.errorMessage).toContain("this run is unattended");
+    // A copy-pasteable command that grants exactly this, for this workdir.
+    expect(done.result.errorMessage).toContain(`codeoid skill allow 'sh headless.sh' --workdir '${tmp}'`);
+    expect(writes).toEqual([]);
     await provider.teardown?.();
     rmSync(tmp, { recursive: true, force: true });
   });

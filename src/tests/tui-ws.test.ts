@@ -233,6 +233,20 @@ describe("TuiWsClient", () => {
     await expect(pending).rejects.toThrow();
   });
 
+  it("answers a provider dialog by its request id (#348)", async () => {
+    const actions: TuiAction[] = [];
+    const client = makeClient(actions, { heartbeatMs: 0 });
+    const ws = await connect(client);
+    void client.uiRespond("session-1", "req-7", { confirmed: true }).catch(() => {});
+    expect(ws.parsed.at(-1)).toMatchObject({
+      type: "session.ui_response",
+      sessionId: "session-1",
+      requestId: "req-7",
+      confirmed: true,
+    });
+    client.stop();
+  });
+
   it("4001 (handshake failure) stays terminal — re-minting won't fix it", async () => {
     const actions: TuiAction[] = [];
     const client = makeClient(actions, { heartbeatMs: 0, reconnectDelayMs: 5 });

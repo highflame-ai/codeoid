@@ -10,6 +10,7 @@
  *   codeoid send <name|id> <message>      Send a one-shot message
  *   codeoid interrupt <name|id>           Interrupt a running agent
  *   codeoid approve <name|id> [yes|no]    Approve/deny pending permission
+ *   codeoid skill allow <command>          Pre-approve a skill's command (unattended runs)
  *   codeoid destroy <name|id>             Destroy a session
  */
 
@@ -31,7 +32,7 @@ import {
   mintLocalToken,
   removeLocalTokenFile,
 } from "./daemon/local-auth.js";
-import type { CollaborationConfig } from "./protocol/types.js";
+import { CAPABILITIES, type CollaborationConfig } from "./protocol/types.js";
 import { ALL_SCOPES_STRING } from "./protocol/scopes.js";
 import { TerminalClient } from "./terminal/client.js";
 import {
@@ -554,7 +555,8 @@ program
   .action(async (session: string) => {
     const config = loadConfig();
     const client = new TerminalClient(config);
-    await client.connect();
+    // Interactive: render provider dialogs (and get pending ones on attach).
+    await client.connect({ capabilities: [CAPABILITIES.UI_DIALOGS] });
     await client.attachSession(session);
   });
 
@@ -589,9 +591,31 @@ program
     client.disconnect();
   });
 
+const skill = program
+  .command("skill")
+  .description("Pre-approve commands that installed skills declare (for unattended runs like `pipeline run`)");
+
+for (const [verb, allowed] of [["allow", true], ["deny", false]] as const) {
+  skill
+    .command(`${verb} <command>`)
+    .description(
+      allowed
+        ? "Allow a skill-declared command (exactly as in the skill's !`…`) to run in this workdir without asking"
+        : "Remember a refusal for a skill-declared command in this workdir",
+    )
+    .option("--workdir <dir>", "Workspace the grant applies to (default: current directory)")
+    .action(async (command: string, opts: { workdir?: string }) => {
+      const config = loadConfig();
+      const client = new TerminalClient(config);
+      await client.connect();
+      await client.skillGrant(command, opts.workdir ?? process.cwd(), allowed);
+      client.disconnect();
+    });
+}
+
 program
   .command("approve <session>")
-  .description("Approve a pending permission request")
+  .description("Approve a pending permission request or yes/no question")
   .option("--deny", "Deny instead of approve")
   .action(async (session: string, opts: { deny?: boolean }) => {
     const config = loadConfig();

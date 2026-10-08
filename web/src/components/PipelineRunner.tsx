@@ -23,7 +23,7 @@ import { Component, For, Show, createSignal, onCleanup, onMount } from "solid-js
 import { openPipelineModal } from "./NewSessionModal";
 import { abort, approve, pipelinesState, reject, revise } from "../state/pipelines";
 import { focusSession, focusedSessionId, sessionList } from "../state/sessions";
-import type { PipelinePhaseWire, PipelineWire } from "../protocol/types";
+import { PIPELINE_INPUT_REQUEST_PREFIX, type PipelinePhaseWire, type PipelineWire } from "../protocol/types";
 
 // The cockpit can collapse to a thin tab so the run's chat gets the full pane.
 const [collapsed, setCollapsed] = createSignal(false);
@@ -366,6 +366,9 @@ const HaltCard: Component<{
   const [value, setValue] = createSignal("");
   const [feedback, setFeedback] = createSignal("");
   const reqId = () => props.phase.requestId!;
+  // Halted on a question it asked: Revise is the answer; Approve would skip it
+  // (the daemon refuses it too).
+  const asksInput = () => reqId().startsWith(PIPELINE_INPUT_REQUEST_PREFIX);
   const btn =
     "rounded border px-3 py-1.5 text-[12px] font-semibold transition disabled:cursor-not-allowed disabled:opacity-50";
 
@@ -441,41 +444,47 @@ const HaltCard: Component<{
           class={inputClass}
           disabled={props.busy}
           aria-label="Decision note"
-          placeholder="Accepted / rejected because…"
+          placeholder={asksInput() ? "Rejected because…" : "Accepted / rejected because…"}
         />
       </label>
 
       {/* Revise feedback (required to revise). */}
       <label class="mt-2 flex flex-col gap-1">
-        <span class={labelClass}>Revise feedback</span>
+        <span class={labelClass}>{asksInput() ? "Your answer" : "Revise feedback"}</span>
         <textarea
           rows={3}
           value={feedback()}
           onInput={(e) => setFeedback(e.currentTarget.value)}
           class={`${inputClass} resize-y leading-6`}
           disabled={props.busy}
-          aria-label="Revise feedback"
-          placeholder="What should this phase do differently? It re-runs with your notes."
+          aria-label={asksInput() ? "Your answer" : "Revise feedback"}
+          placeholder={
+            asksInput()
+              ? "Answer the question above. The phase re-runs with your answer."
+              : "What should this phase do differently? It re-runs with your notes."
+          }
         />
       </label>
 
       <div class="mt-3 flex flex-wrap items-center gap-2">
-        <button
-          type="button"
-          class={`${btn} border-success/50 bg-success/10 text-success hover:bg-success/20`}
-          disabled={props.busy}
-          onClick={() => props.onApprove(reqId(), value().trim() || undefined)}
-        >
-          Approve
-        </button>
+        <Show when={!asksInput()}>
+          <button
+            type="button"
+            class={`${btn} border-success/50 bg-success/10 text-success hover:bg-success/20`}
+            disabled={props.busy}
+            onClick={() => props.onApprove(reqId(), value().trim() || undefined)}
+          >
+            Approve
+          </button>
+        </Show>
         <button
           type="button"
           class={`${btn} border-accent/50 bg-accent/10 text-accent hover:bg-accent/20`}
           disabled={props.busy || !feedback().trim()}
           onClick={() => props.onRevise(reqId(), feedback().trim())}
-          title={feedback().trim() ? undefined : "Enter feedback to revise"}
+          title={feedback().trim() ? undefined : asksInput() ? "Enter your answer" : "Enter feedback to revise"}
         >
-          Revise
+          {asksInput() ? "Answer" : "Revise"}
         </button>
         <button
           type="button"

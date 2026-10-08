@@ -19,6 +19,7 @@ import { MockSessionProvider } from "../daemon/providers/mock/session-provider.j
 import type { AttachedClient } from "../daemon/session.js";
 import type { AuthContext, DaemonMessage, SessionCommandsResultMsg } from "../protocol/types.js";
 import { ALL_SCOPES, SCOPES, type Scope } from "../protocol/scopes.js";
+import { workspaceIdFromPath } from "../daemon/memory/index.js";
 
 const OWNER: AuthContext = {
   sub: "user:ext-verbs",
@@ -249,5 +250,54 @@ describe("session.part_action", () => {
       client(OWNER),
     );
     expect(missing).toMatchObject({ type: "response.error", code: "not_found" });
+  });
+});
+
+// #348: pre-approving a skill-declared command — the `--allowedTools` of an
+// unattended run, which never prompts.
+describe("skill.grant", () => {
+  it("records the grant for the workdir's workspace, within the caller's tenant", async () => {
+    const res = await manager.handle(
+      { type: "skill.grant", id: "g1", workdir: tmp, command: "  ./probe.sh  ", allowed: true },
+      OWNER,
+      client(OWNER),
+    );
+    expect(res).toMatchObject({ type: "skill.grant.result", command: "./probe.sh", allowed: true });
+    const canonical = (res as { workdir: string }).workdir;
+    // The same record the approval dialog writes, keyed as the provider reads it.
+    expect(store.getSkillCommandGrants(workspaceIdFromPath(canonical, OWNER)).get("Bash(./probe.sh)")).toBe(true);
+    // Another tenant's workspace on the same path is untouched.
+    const other = { ...OWNER, accountId: "acc-other" };
+    expect(store.getSkillCommandGrants(workspaceIdFromPath(canonical, other)).get("Bash(./probe.sh)")).toBeUndefined();
+
+    await manager.handle({ type: "skill.grant", id: "g2", workdir: tmp, command: "./probe.sh", allowed: false }, OWNER, client(OWNER));
+    expect(store.getSkillCommandGrants(workspaceIdFromPath(canonical, OWNER)).get("Bash(./probe.sh)")).toBe(false);
+  });
+
+  it("refuses a wildcard command at the protocol boundary", async () => {
+    const { parseClientMessage } = await import("@highflame/codeoid-protocol/schemas");
+    for (const command of ["cat *", "git log:*", "echo ),Read(~/.ssh/id_rsa", "echo \\) x (", "a (b) ,Read(/etc/shadow) c", "x (y) Bash z", "   "]) {
+      const parsed = parseClientMessage({ type: "skill.grant", id: "g5", workdir: tmp, command, allowed: true });
+      expect(parsed.ok).toBe(false);
+    }
+  });
+
+  it("needs settings:write", async () => {
+    const approver = scoped([SCOPES.SESSION_APPROVE, SCOPES.SETTINGS_READ]);
+    const res = await manager.handle(
+      { type: "skill.grant", id: "g3", workdir: tmp, command: "./probe.sh", allowed: true },
+      approver,
+      client(approver),
+    );
+    expect(res).toMatchObject({ type: "response.error", code: "forbidden" });
+  });
+
+  it("refuses a workdir that does not exist", async () => {
+    const res = await manager.handle(
+      { type: "skill.grant", id: "g4", workdir: join(tmp, "nope"), command: "./probe.sh", allowed: true },
+      OWNER,
+      client(OWNER),
+    );
+    expect(res).toMatchObject({ type: "response.error", code: "invalid_request" });
   });
 });

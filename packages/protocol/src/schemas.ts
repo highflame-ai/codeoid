@@ -518,6 +518,54 @@ export const mcpOAuthDisconnectSchema = z.object({
   server: mcpServerNameField,
 });
 
+// ── Skill command pre-approval (#348) ─────────────────────────────────────────
+
+/** As the daemon's isUngrantableSkillCommand: `Bash(<cmd>)` must survive the
+ *  Claude CLI's --allowedTools splitter (one parens flag, not a depth; a
+ *  comma or space outside it ends a rule) as exactly itself. */
+function survivesRuleSplit(cmd: string): boolean {
+  let inParens = false;
+  for (const ch of `Bash(${cmd.trim()})`) {
+    if (ch === "(") inParens = true;
+    else if (ch === ")") inParens = false;
+    else if (!inParens && (ch === "," || ch === " ")) return false;
+  }
+  return true;
+}
+
+function parensBalanced(s: string): boolean {
+  let depth = 0;
+  for (const ch of s) {
+    if (ch === "(") depth += 1;
+    else if (ch === ")" && --depth < 0) return false;
+  }
+  return depth === 0;
+}
+
+export const skillGrantSchema = z.object({
+  ...base,
+  type: z.literal("skill.grant"),
+  workdir: pathField.min(1),
+  // As a skill declares it inside !`…`: one line, no backticks (the same shape
+  // the provider extracts from a blocked expansion). The grant becomes a
+  // `Bash(…)` permission rule that also covers the agent's Bash tool, so — as
+  // the provider's isUngrantableSkillCommand — no `*` wildcard, no unbalanced
+  // parenthesis (it would end the rule early in the comma-joined rule list),
+  // no backslash before a paren.
+  command: z
+    .string()
+    .min(1)
+    .max(4096)
+    .regex(/^[^`\n\r*]+$/, "a skill command is one line with no backtick and no * wildcard")
+    .refine(
+      (c) => !/\\[()]/.test(c) && !c.trim().endsWith("\\") && parensBalanced(c) && survivesRuleSplit(c),
+      "a skill command must stay one exact Bash(…) rule: balanced parentheses, and nothing after an inner ')' that would split it",
+    )
+    // Whitespace-only would be stored as `Bash()` — every Bash command.
+    .refine((c) => c.trim().length > 0, "a skill command cannot be blank"),
+  allowed: z.boolean(),
+});
+
 // ── The unions ────────────────────────────────────────────────────────────────
 
 // ── SDLC pipeline ─────────────────────────────────────────────────────────────
@@ -716,6 +764,7 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   backendLoginStartSchema,
   backendLoginSubmitSchema,
   backendLoginCancelSchema,
+  skillGrantSchema,
   mcpOAuthBeginSchema,
   mcpOAuthCompleteSchema,
   mcpOAuthDisconnectSchema,

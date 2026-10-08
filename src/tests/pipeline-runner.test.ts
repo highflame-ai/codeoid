@@ -267,6 +267,51 @@ describe("pipeline runtime (real SessionManager + mock backend)", () => {
     await m2.drain(3_000);
   });
 
+  test("a failed phase reports its own error, not the previous phase's output (#348)", async () => {
+    const store2 = new Store(join(tmp, "codeoid-err2.db"));
+    const m2 = new SessionManager(store2, transcript, undefined, undefined, undefined, {
+      config: mkConfig(join(tmp, "codeoid-err2.db"), true),
+      _testProviderFactory: () =>
+        new MockSessionProvider("mock", [
+          sayTurn(`spec written\n${PHASE_COMPLETE_MARKER}`),
+          // A zero-turn failure: no assistant text, just why (an unapproved skill command).
+          errorTurn(),
+        ]),
+    });
+    const pm = m2.pipelines;
+    if (!pm) throw new Error("pipeline disabled");
+    pm.registries.skills.register({ id: "spec", kind: "slash", command: "/spec" });
+    pm.registries.skills.register({ id: "impl", kind: "slash", command: "/impl" });
+    const created = await m2.handle(
+      {
+        type: "pipeline.create",
+        id: "1",
+        name: "E",
+        workdir: join(tmp, "repo"),
+        phases: [
+          { id: "spec", kind: "skill", skill: "spec" },
+          { id: "impl", kind: "skill", skill: "impl", onFail: { action: "abort" } },
+        ],
+      },
+      AUTH,
+      CLIENT,
+    );
+    if (created.type !== "pipeline.snapshot") throw new Error(`create failed: ${JSON.stringify(created)}`);
+    const first = await m2.handle({ type: "pipeline.advance", id: "2", pipelineId: created.pipeline.id }, AUTH, CLIENT);
+    if (first.type !== "pipeline.snapshot") throw new Error(`advance failed: ${JSON.stringify(first)}`);
+    const out = await m2.handle(
+      { type: "pipeline.answer", id: "3", pipelineId: created.pipeline.id, requestId: "exit:spec", approved: true } as never,
+      AUTH,
+      CLIENT,
+    );
+    if (out.type !== "pipeline.snapshot") throw new Error(`answer failed: ${JSON.stringify(out)}`);
+    const impl = out.pipeline.phases[1];
+    expect(impl.status).toBe("failed");
+    expect(impl.reason).toContain("backend blew up");
+    expect(impl.reason).not.toContain("spec written");
+    await m2.drain(3_000);
+  });
+
   test("a phase that rests WITHOUT the completion marker is nudged to continue, not halted mid-work", async () => {
     const store2 = new Store(join(tmp, "codeoid-nudge.db"));
     const m2 = new SessionManager(store2, transcript, undefined, undefined, undefined, {
@@ -349,22 +394,16 @@ describe("pipeline runtime (real SessionManager + mock backend)", () => {
     await m2.drain(3_000);
   });
 
-  test("a phase asking for input (NEED-INPUT) raises a dialog; the answer resumes it to completion", async () => {
+  test("a phase asking for input raises no dialog, even with a dialog client attached — it halts (#348)", async () => {
     const captured: Array<{ type: string; [k: string]: unknown }> = [];
     const store2 = new Store(join(tmp, "codeoid-ask.db"));
     const m2 = new SessionManager(store2, transcript, undefined, undefined, undefined, {
       config: mkConfig(join(tmp, "codeoid-ask.db"), true),
       _testProviderFactory: () =>
-        new MockSessionProvider("mock", [
-          // Turn 1 asks a question and ends with the NEED-INPUT marker.
-          sayTurn(`Which language should I use?\n${PHASE_NEEDS_INPUT_MARKER}`),
-          // Turn 2 (driven by the user's answer) finishes and marks complete.
-          sayTurn(`implemented it in TypeScript\n${PHASE_COMPLETE_MARKER}`),
-        ]),
+        new MockSessionProvider("mock", [sayTurn(`Which language should I use?\n${PHASE_NEEDS_INPUT_MARKER}`)]),
     });
     const pm = m2.pipelines;
-    expect(pm).toBeDefined();
-    if (!pm) return;
+    if (!pm) throw new Error("pipeline disabled");
     pm.registries.skills.register({ id: "impl", kind: "slash", command: "/impl" });
     const created = await m2.handle(
       {
@@ -378,44 +417,86 @@ describe("pipeline runtime (real SessionManager + mock backend)", () => {
       CLIENT,
     );
     if (created.type !== "pipeline.snapshot") throw new Error(`create failed: ${JSON.stringify(created)}`);
-    const sessionId = created.pipeline.sessionId;
-    expect(sessionId).toBeTruthy();
-    // Attach a UI_DIALOGS-capable client so the mid-phase question is delivered.
     const capClient = {
       id: "cap",
       auth: AUTH,
       capabilities: [CAPABILITIES.UI_DIALOGS],
       send: (m: unknown) => captured.push(m as { type: string }),
     };
-    await m2.handle(
-      { type: "session.attach", id: "att", sessionId } as never,
-      AUTH,
-      capClient as never,
-    );
-    // Advance drives the phase; it blocks on the input dialog until we answer.
-    const advP = m2.handle({ type: "pipeline.advance", id: "2", pipelineId: created.pipeline.id }, AUTH, CLIENT);
-    // Wait for the question dialog, then answer it.
-    let req: { requestId?: string; method?: string; message?: string } | undefined;
-    for (let i = 0; i < 300 && !req; i++) {
-      req = captured.find((m) => m.type === "session.ui_request") as typeof req;
-      if (!req) await new Promise((r) => setTimeout(r, 10));
-    }
-    if (!req?.requestId) throw new Error("no session.ui_request dialog appeared");
-    expect(req.method).toBe("input");
-    expect(String(req.message)).toContain("Which language");
-    expect(String(req.message)).not.toContain(PHASE_NEEDS_INPUT_MARKER);
-    await m2.handle(
-      { type: "session.ui_response", id: "3", sessionId, requestId: req.requestId, value: "TypeScript" } as never,
-      AUTH,
-      capClient as never,
-    );
-    const out = await advP;
+    await m2.handle({ type: "session.attach", id: "att", sessionId: created.pipeline.sessionId } as never, AUTH, capClient as never);
+    const out = await m2.handle({ type: "pipeline.advance", id: "2", pipelineId: created.pipeline.id }, AUTH, CLIENT);
     if (out.type !== "pipeline.snapshot") throw new Error(`advance failed: ${JSON.stringify(out)}`);
-    // Only halts after the model marked completion on the answer-driven turn.
+    expect(captured.some((m) => m.type === "session.ui_request")).toBe(false);
+    expect(out.pipeline.phases[0].status).toBe("halted");
+    expect(out.pipeline.phases[0].questions).toEqual(["Which language should I use?"]);
+    await m2.drain(3_000);
+  });
+
+  test("a phase asking for input halts on its question; Revise answers it (#348)", async () => {
+    const store2 = new Store(join(tmp, "codeoid-headless.db"));
+    const mock = new MockSessionProvider("mock", [
+      // Rests without a marker → nudged to continue; this text is NOT the question.
+      sayTurn("I looked through the repo layout."),
+      sayTurn(`Which language should I use?\n${PHASE_NEEDS_INPUT_MARKER}`),
+      // Driven by the Revise carrying the human's answer.
+      sayTurn(`implemented it in TypeScript\n${PHASE_COMPLETE_MARKER}`),
+    ]);
+    const m2 = new SessionManager(store2, transcript, undefined, undefined, undefined, {
+      config: mkConfig(join(tmp, "codeoid-headless.db"), true),
+      _testProviderFactory: () => mock,
+    });
+    const pm = m2.pipelines;
+    if (!pm) throw new Error("pipeline disabled");
+    pm.registries.skills.register({ id: "impl", kind: "slash", command: "/impl" });
+    const created = await m2.handle(
+      {
+        type: "pipeline.create",
+        id: "1",
+        name: "H",
+        workdir: join(tmp, "repo"),
+        phases: [{ id: "impl", kind: "skill", skill: "impl" }],
+      },
+      AUTH,
+      CLIENT,
+    );
+    if (created.type !== "pipeline.snapshot") throw new Error(`create failed: ${JSON.stringify(created)}`);
+    // A phase turn is unattended: no dialog is raised, attached client or not.
+    const out = await m2.handle({ type: "pipeline.advance", id: "2", pipelineId: created.pipeline.id }, AUTH, CLIENT);
+    if (out.type !== "pipeline.snapshot") throw new Error(`advance failed: ${JSON.stringify(out)}`);
+    const state = out.pipeline.phases[0];
+    // Halted on the QUESTION — not "complete — review and approve", which would
+    // let a human approve past it, and not a guess.
     expect(out.pipeline.status).toBe("halted");
-    const ph = out.pipeline.phases[0];
-    expect(ph.status).toBe("halted");
-    expect(ph.summary).toContain("implemented it in TypeScript");
+    expect(state.status).toBe("halted");
+    expect(state.requestId).toBe("input:impl");
+    expect(state.reason).toContain("needs input");
+    expect(state.reason).not.toContain("review and approve");
+    // Just the question — no marker, and no stale summary shown beside it.
+    expect(state.questions).toEqual(["Which language should I use?"]);
+    expect(state.summary).toBeUndefined();
+
+    // Approving would pass the phase without its answer — refused.
+    const approved = await m2.handle(
+      { type: "pipeline.answer", id: "2a", pipelineId: created.pipeline.id, requestId: "input:impl", approved: true } as never,
+      AUTH,
+      CLIENT,
+    );
+    expect(approved).toMatchObject({ type: "response.error" });
+    expect(JSON.stringify(approved)).toContain("waiting for an answer");
+
+    // The human answers by revising the phase (works from the CLI, no dialog needed).
+    const revised = await m2.handle(
+      { type: "pipeline.revise", id: "3", pipelineId: created.pipeline.id, requestId: "input:impl", feedback: "TypeScript" } as never,
+      AUTH,
+      CLIENT,
+    );
+    if (revised.type !== "pipeline.snapshot") throw new Error(`revise failed: ${JSON.stringify(revised)}`);
+    expect(revised.pipeline.phases[0].summary ?? "").toContain("implemented it in TypeScript");
+    // The re-run prompt pairs the question with the answer.
+    const rerun = mock.capturedOpts.at(-1)!.userMessage;
+    expect(rerun).toContain(
+      'This phase asked (model-authored, quoted): "Which language should I use?" — the human\'s answer: TypeScript',
+    );
     await m2.drain(3_000);
   });
 

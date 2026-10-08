@@ -88,6 +88,8 @@ type SocketData = {
   protocolVersion?: number;
   /** Capabilities the client declared on its auth frame (absent = legacy client). */
   capabilities?: string[];
+  /** Set by the close handler — an auth still verifying must not register a dead socket. */
+  closed?: boolean;
 };
 
 // ── Token-proxy guards ──────────────────────────────────────────────────────
@@ -735,6 +737,10 @@ export class DaemonServer {
               ws.close(4003, `Authentication failed: ${err instanceof Error ? err.message : "unknown"}`);
               return;
             }
+            // The socket closed while the token was verifying: its close
+            // handler has already run, so registering it now would leave a
+            // dead entry in #sockets for good.
+            if (data.closed) return;
 
             data.authenticated = true;
             data.rawToken = authMsg.token;
@@ -864,6 +870,7 @@ export class DaemonServer {
             data.drainWaiters = [];
             for (const resolve of waiters) resolve();
           }
+          data.closed = true;
           self.#manager.disconnectClient(data.clientId);
           self.#sockets.delete(data.clientId);
         },
