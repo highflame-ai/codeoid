@@ -46,10 +46,32 @@ export interface CanonicalToolCall {
 }
 
 export type CanonicalTurn =
-  | { role: "user"; content: string }
+  | {
+      role: "user";
+      content: string;
+      /**
+       * Stable id of the turn this prompt starts (#354). Every message the
+       * session emits for the turn carries the same id, so clients can point
+       * at a turn (go back, fork from here, show its diff). Optional: turns
+       * recorded before #354 have none.
+       */
+      turnId?: string;
+      /**
+       * The words the person actually typed, when `content` also carries
+       * context codeoid injected (attached files, a rotation anchor). Used
+       * for turn previews; absent when it equals `content`.
+       */
+      prompt?: string;
+      /** When the turn started (ISO). */
+      at?: string;
+      /** A turn the agent started on its own (background work finished). */
+      background?: boolean;
+    }
   | {
       role: "assistant";
       content: string;
+      /** The turnId of the user turn this answers (#354). */
+      turnId?: string;
       toolCalls?: CanonicalToolCall[];
       thinking?: string;
       /** Which provider produced this turn. */
@@ -308,8 +330,22 @@ export function toAnthropicMessages(
  *   3. On turn_done, the completed assistant CanonicalTurn is appended.
  *   4. history is ready for the next provider's TurnOpts.history.
  */
+/**
+ * A change to the canonical history, for durable persistence (#354). The
+ * history is the backend-neutral record every fork, backend switch and rewind
+ * is built from, so it must survive a daemon restart — a listener appends
+ * these to a per-session log.
+ */
+export type CanonicalHistoryChange =
+  | { op: "append"; turn: CanonicalTurn }
+  | { op: "replace"; turns: readonly CanonicalTurn[] };
+
 export class CanonicalHistoryAccumulator {
   #history: CanonicalTurn[] = [];
+  /** turnId of the latest user turn — stamped on the assistant turn that answers it. */
+  #currentTurnId: string | undefined;
+  /** Notified after every committed change (see CanonicalHistoryChange). */
+  onChange: ((change: CanonicalHistoryChange) => void) | undefined;
 
   // In-progress assistant turn state — reset on each turn_done.
   #currentText = "";
@@ -324,8 +360,30 @@ export class CanonicalHistoryAccumulator {
   }
 
   /** Append a user turn. Call once per runTurn() before feeding events. */
-  pushUserTurn(content: string): void {
-    this.#history.push({ role: "user", content });
+  pushUserTurn(
+    content: string,
+    turnId?: string,
+    extra?: { prompt?: string; at?: string; background?: boolean },
+  ): void {
+    const turn: CanonicalTurn = {
+      role: "user",
+      content,
+      ...(turnId ? { turnId } : {}),
+      ...(extra?.prompt !== undefined && extra.prompt !== content ? { prompt: extra.prompt } : {}),
+      ...(extra?.at ? { at: extra.at } : {}),
+      ...(extra?.background ? { background: true } : {}),
+    };
+    this.#currentTurnId = turnId;
+    this.#history.push(turn);
+    this.#emit({ op: "append", turn });
+  }
+
+  #emit(change: CanonicalHistoryChange): void {
+    try {
+      this.onChange?.(change);
+    } catch {
+      // Persistence must never break the conversation.
+    }
   }
 
   /**
@@ -385,14 +443,17 @@ export class CanonicalHistoryAccumulator {
         const produced =
           this.#currentText.length > 0 || toolCalls.length > 0 || this.#currentThinking.length > 0;
         if (produced) {
-          this.#history.push({
+          const turn: CanonicalTurn = {
             role: "assistant",
             content: this.#currentText,
+            ...(this.#currentTurnId ? { turnId: this.#currentTurnId } : {}),
             ...(toolCalls.length > 0 ? { toolCalls } : {}),
             ...(this.#currentThinking ? { thinking: this.#currentThinking } : {}),
             providerId: event.result.providerId,
             model: event.result.model,
-          });
+          };
+          this.#history.push(turn);
+          this.#emit({ op: "append", turn });
         }
 
         // Reset in-progress state for the next turn.
@@ -406,7 +467,13 @@ export class CanonicalHistoryAccumulator {
 
   /** Reset the entire history. Useful after a session rotation. */
   reset(): void {
+    this.#clear();
+    this.#emit({ op: "replace", turns: [] });
+  }
+
+  #clear(): void {
     this.#history = [];
+    this.#currentTurnId = undefined;
     this.#currentText = "";
     this.#currentThinking = "";
     this.#currentTools.clear();
@@ -420,9 +487,29 @@ export class CanonicalHistoryAccumulator {
    * a mutation on either side can't leak to the other.
    */
   seed(turns: readonly CanonicalTurn[]): void {
-    this.reset();
+    this.#clear();
     this.#history = turns.map((t) => structuredClone(t));
+    this.#currentTurnId = lastTurnId(this.#history);
+    this.#emit({ op: "replace", turns: this.#history });
   }
+
+  /**
+   * Load a persisted history on restart (#354). Like seed(), but silent: the
+   * turns came FROM the log, so writing them back would be a no-op rewrite.
+   */
+  restore(turns: readonly CanonicalTurn[]): void {
+    this.#clear();
+    this.#history = turns.map((t) => structuredClone(t));
+    this.#currentTurnId = lastTurnId(this.#history);
+  }
+}
+
+function lastTurnId(turns: readonly CanonicalTurn[]): string | undefined {
+  for (let i = turns.length - 1; i >= 0; i--) {
+    const id = turns[i]?.turnId;
+    if (id) return id;
+  }
+  return undefined;
 }
 
 // ── History seeding (provider switch) ─────────────────────────────────────────

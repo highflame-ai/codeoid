@@ -23,6 +23,7 @@ import type { Store } from "./store.js";
 import { createPushTransport, PushService } from "./push/index.js";
 import { hasScope, SCOPES } from "../protocol/scopes.js";
 import { applyPatches, getManifest, getSnapshot, previewPatches } from "./settings/store.js";
+import { canonicalFromTranscript } from "./canonical-restore.js";
 import { BackendLoginBroker, BackendLoginError, redact } from "./auth/backend-login.js";
 import { RateLimiter } from "./rate-limit.js";
 import type { TranscriptMeta, TranscriptStore } from "./transcript.js";
@@ -774,6 +775,23 @@ mcpHub: this.#mcpHub,
         session.restoreScrollback(messages, maxSeq + 1, entries.map((e) => e.bytes), {
           partialHistory: loadStats.truncated === true,
         });
+        // The backend-neutral conversation (#354). Without it a restored
+        // session forked / switched backend with no history, and stateless
+        // backends answered the next prompt with no memory of the session.
+        // Sessions from before the log existed are rebuilt from the
+        // transcript once, then read from the log.
+        try {
+          const canonical = await this.#transcriptStore.loadCanonical(meta.sessionId);
+          if (canonical) {
+            session.restoreCanonicalHistory(canonical, { persist: false });
+          } else if (messages.length > 0) {
+            session.restoreCanonicalHistory(canonicalFromTranscript(messages, providerId), { persist: true });
+          }
+        } catch (err) {
+          console.error(
+            `[codeoid/resume] canonical history restore failed for ${meta.sessionId} (session resumes without it): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
 
         this.#sessions.set(session.id, session);
         // Track a resumed child's mount so teardown revokes it. Without this a
@@ -1075,6 +1093,8 @@ mcpHub: this.#mcpHub,
         return this.#backendLoginSubmit(msg, auth);
       case "backend.login.cancel":
         return this.#backendLoginCancel(msg, auth);
+      case "session.turns":
+        return this.#sessionTurns(msg, auth);
       case "skill.grant":
         return this.#skillGrant(msg, auth);
       case "mcp.oauth.begin":
@@ -2519,7 +2539,10 @@ mcpHub: this.#mcpHub,
         (s) =>
           s.status === "thinking" ||
           s.status === "tool_running" ||
-          s.status === "waiting_approval",
+          s.status === "waiting_approval" ||
+          // Looks idle, but a queued send is about to start a turn: stop it
+          // too, or it starts after shutdown began.
+          s.preparingTurn,
       );
       if (working.length === 0) return;
       for (const session of working) {
@@ -5166,6 +5189,24 @@ mcpHub: this.#mcpHub,
 
     session.attach(client, msg.resume);
     return { type: "response.ok", requestId: msg.id, data: session.toInfo() };
+  }
+
+  /** A session's turns (#354) — same read authority as attach. */
+  async #sessionTurns(
+    msg: Extract<ClientMessage, { type: "session.turns" }>,
+    auth: AuthContext,
+  ): Promise<DaemonMessage> {
+    const scope = hasScope(auth.scopes as string[], SCOPES.SESSION_ATTACH)
+      || hasScope(auth.scopes as string[], SCOPES.SESSION_WATCH);
+    if (!scope) {
+      return { type: "response.error", requestId: msg.id, error: "Missing scope: session:attach or session:watch", code: "forbidden" };
+    }
+    const session = this.#getOwnedSession(msg.sessionId, auth);
+    if (!session) {
+      return { type: "response.error", requestId: msg.id, error: "Session not found", code: "not_found" };
+    }
+    const { turns, checkpointsSupported } = await session.turns();
+    return { type: "session.turns.result", requestId: msg.id, sessionId: session.id, turns, checkpointsSupported };
   }
 
   /** History paging (`scrollback.paging`) — same read authority as attach. */

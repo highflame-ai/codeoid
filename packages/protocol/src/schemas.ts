@@ -542,6 +542,12 @@ function parensBalanced(s: string): boolean {
   return depth === 0;
 }
 
+export const sessionTurnsSchema = z.object({
+  ...base,
+  type: z.literal("session.turns"),
+  sessionId: sessionIdField,
+});
+
 export const skillGrantSchema = z.object({
   ...base,
   type: z.literal("skill.grant"),
@@ -765,6 +771,7 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   backendLoginSubmitSchema,
   backendLoginCancelSchema,
   skillGrantSchema,
+  sessionTurnsSchema,
   mcpOAuthBeginSchema,
   mcpOAuthCompleteSchema,
   mcpOAuthDisconnectSchema,

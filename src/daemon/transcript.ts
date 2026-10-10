@@ -16,6 +16,7 @@
 import { existsSync, mkdirSync } from "node:fs";
 import { appendFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import type { CanonicalHistoryChange, CanonicalTurn } from "./providers/canonical.js";
 import type {
   CollaborationConfig,
   DaemonMessage,
@@ -140,6 +141,8 @@ export class TranscriptStore {
   #metaWriteChain = new Map<string, Promise<void>>();
   /** Per-session promise chain for `append()`. See append() docs. */
   #appendChain = new Map<string, Promise<void>>();
+  /** Per-session promise chain for the canonical-history log (#354). */
+  #canonicalChain = new Map<string, Promise<void>>();
   /** Live-file byte counter per session, so rotation doesn't stat per append.
    * Seeded lazily from the file's on-disk size on the first append. */
   #liveBytes = new Map<string, number>();
@@ -174,7 +177,73 @@ export class TranscriptStore {
     await Promise.allSettled([
       ...this.#metaWriteChain.values(),
       ...this.#appendChain.values(),
+      ...this.#canonicalChain.values(),
     ]);
+  }
+
+  // ── Canonical history log (#354) ─────────────────────────────────────────
+  //
+  // The backend-neutral conversation (CanonicalTurn[]) every fork, backend
+  // switch and rewind is built from. It lived only in memory, so after a
+  // restart a session showed its scrollback but forked / switched with NO
+  // conversation. One JSONL per session: `append` lines grow it, a `replace`
+  // (fork seed, rotation reset, rewind) rewrites the file atomically, so the
+  // file is always "last full state + appends" and never needs compaction.
+
+  /** Path to a session's canonical-history log. */
+  canonicalPath(sessionId: string): string {
+    return join(this.#dir, `${sessionId}.canonical.jsonl`);
+  }
+
+  /** Persist one change. Serialized per session; never throws. */
+  recordCanonical(sessionId: string, change: CanonicalHistoryChange): Promise<void> {
+    const path = this.canonicalPath(sessionId);
+    const write = async () => {
+      if (change.op === "append") {
+        await appendFile(path, `${JSON.stringify({ op: "append", turn: change.turn })}\n`, "utf-8");
+      } else {
+        const tmp = `${path}.tmp`;
+        const body = change.turns.map((turn) => `${JSON.stringify({ op: "append", turn })}\n`).join("");
+        await writeFile(tmp, body, "utf-8");
+        await rename(tmp, path);
+      }
+    };
+    const prev = this.#canonicalChain.get(sessionId) ?? Promise.resolve();
+    const stored: Promise<void> = prev
+      .then(write)
+      .catch((err) => {
+        console.error(
+          `[codeoid] canonical log ${sessionId}: write failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      })
+      .finally(() => {
+        if (this.#canonicalChain.get(sessionId) === stored) this.#canonicalChain.delete(sessionId);
+      });
+    this.#canonicalChain.set(sessionId, stored);
+    return stored;
+  }
+
+  /**
+   * Load a session's canonical history, or null when it has no log (a session
+   * from before #354). A torn last line — a crash mid-append — is skipped.
+   */
+  async loadCanonical(sessionId: string): Promise<CanonicalTurn[] | null> {
+    await this.#canonicalChain.get(sessionId);
+    const file = Bun.file(this.canonicalPath(sessionId));
+    if (!(await file.exists())) return null;
+    const turns: CanonicalTurn[] = [];
+    for (const line of (await file.text()).split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const entry = JSON.parse(line) as { op?: string; turn?: CanonicalTurn };
+        if (entry.op === "append" && entry.turn && (entry.turn.role === "user" || entry.turn.role === "assistant")) {
+          turns.push(entry.turn);
+        }
+      } catch {
+        // torn line
+      }
+    }
+    return turns;
   }
 
   /** Path to a session's live (currently-appended) transcript file. */
@@ -226,14 +295,18 @@ export class TranscriptStore {
     const next = prev
       .catch(() => undefined)
       .then(() => this.#appendWithRotation(sessionId, line));
-    this.#appendChain.set(
-      sessionId,
-      next.finally(() => {
-        if (this.#appendChain.get(sessionId) === next) {
-          this.#appendChain.delete(sessionId);
-        }
-      }),
-    );
+    // Same shape as saveMeta: the STORED chain absorbs the rejection (callers
+    // that fire-and-forget never consume it, and a rejected promise left in
+    // the map is an unhandled rejection under Bun) and clears itself once it
+    // is the leaf. It used to compare the map entry against `next` — never
+    // the stored promise — so entries were never removed, and a failed write
+    // escaped as an unhandled rejection. The RETURNED promise still rejects.
+    const stored: Promise<void> = next
+      .catch(() => undefined)
+      .finally(() => {
+        if (this.#appendChain.get(sessionId) === stored) this.#appendChain.delete(sessionId);
+      });
+    this.#appendChain.set(sessionId, stored);
     return next;
   }
 
@@ -518,10 +591,12 @@ export class TranscriptStore {
     await Promise.allSettled([
       this.#appendChain.get(sessionId),
       this.#metaWriteChain.get(sessionId),
+      this.#canonicalChain.get(sessionId),
     ]);
     this.#liveBytes.delete(sessionId);
 
     await rm(this.transcriptPath(sessionId), { force: true });
+    await rm(this.canonicalPath(sessionId), { force: true });
     await rm(this.metaPath(sessionId), { force: true });
     for (let i = 1; i <= this.#maxRotatedSegments; i++) {
       await rm(this.#segmentPath(sessionId, i), { force: true });
