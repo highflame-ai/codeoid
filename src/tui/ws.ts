@@ -213,6 +213,32 @@ export class TuiWsClient {
     return this.#request({ type: "session.turns", id: randomUUID(), sessionId });
   }
 
+  /** Run one prompt on several backends side by side (#357). */
+  compare(
+    sessionId: string,
+    opts: { prompt: string; targets: import("../protocol/types.js").CompareTargetSpec[]; afterTurnId?: string; isolate?: boolean },
+  ): Promise<DaemonMessage> {
+    return this.#request({
+      type: "session.compare",
+      id: randomUUID(),
+      sessionId,
+      prompt: opts.prompt,
+      targets: opts.targets,
+      ...(opts.afterTurnId ? { afterTurnId: opts.afterTurnId } : {}),
+      ...(opts.isolate === false ? { isolate: false } : {}),
+    });
+  }
+
+  /** A session's comparisons, newest first (#357). */
+  compareList(sessionId: string): Promise<DaemonMessage> {
+    return this.#request({ type: "compare.list", id: randomUUID(), sessionId });
+  }
+
+  /** Keep one branch of a comparison (#357). */
+  compareKeep(compareId: string, sessionId: string, discardOthers: boolean): Promise<DaemonMessage> {
+    return this.#request({ type: "compare.keep", id: randomUUID(), compareId, sessionId, ...(discardOthers ? { discardOthers: true } : {}) });
+  }
+
   /** Go back to before `turnId` (#355). */
   rewind(
     sessionId: string,

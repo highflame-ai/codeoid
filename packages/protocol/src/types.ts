@@ -33,6 +33,7 @@ import type {
 } from "./backend-login.js";
 import type { SkillGrantMsg, SkillGrantResultMsg } from "./skill-grant.js";
 import type { SessionRewindMsg, SessionRewindResultMsg, SessionTurnsMsg, SessionTurnsResultMsg } from "./turns.js";
+import type { CompareGetMsg, CompareKeepMsg, CompareListMsg, CompareListResultMsg, CompareStateMsg, SessionCompareMsg } from "./compare.js";
 import type {
   McpOAuthBeginMsg,
   McpOAuthCompleteMsg,
@@ -1026,6 +1027,10 @@ export type ClientMessage =
   | SkillGrantMsg
   | SessionTurnsMsg
   | SessionRewindMsg
+  | SessionCompareMsg
+  | CompareGetMsg
+  | CompareListMsg
+  | CompareKeepMsg
   | McpOAuthBeginMsg
   | McpOAuthCompleteMsg
   | McpOAuthDisconnectMsg
@@ -2592,6 +2597,8 @@ export type DaemonMessage =
   | SkillGrantResultMsg
   | SessionTurnsResultMsg
   | SessionRewindResultMsg
+  | CompareStateMsg
+  | CompareListResultMsg
   | McpOAuthBeginResultMsg
   | McpOAuthCompleteResultMsg
   | McpOAuthDisconnectResultMsg

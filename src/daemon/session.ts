@@ -72,6 +72,7 @@ import {
   endSnapshotId,
   ignoredUnderTree,
   listCheckpoints,
+  numstatTrees,
   restoreTree,
 } from "./checkpoints.js";
 import { applyRewinds, REWIND_EVENT, type TurnIndexEntry } from "./transcript.js";
@@ -5704,6 +5705,23 @@ export class Session {
     // fork has its hand-edit baseline (instead of reporting false conflicts).
     if (opts.asEndOf) await this.#checkpointTurn(endSnapshotId(opts.asEndOf), 10_000, { onlyIfMissing: true, lateWhen: () => false });
     return result;
+  }
+
+  /**
+   * What turn `turnId` changed in the files (#357): its start snapshot →
+   * its end snapshot. Undefined while it runs or when a snapshot is missing.
+   */
+  async turnFiles(turnId: string): Promise<{ changed: number; insertions: number; deletions: number; paths: string[] } | undefined> {
+    if (!this.#checkpointsEnabled()) return undefined;
+    const records = await listCheckpoints(this.#checkpointRoot, this.id);
+    const start = records.get(turnId);
+    const end = records.get(endSnapshotId(turnId));
+    if (!start || !end) return undefined;
+    try {
+      return await numstatTrees(this.#checkpointRoot, this.id, start.sha, end.sha);
+    } catch {
+      return undefined;
+    }
   }
 
   /** Post a notice about a fork's files (#356) into its scrollback. */

@@ -31,6 +31,7 @@ import { EditDiff, WriteFile, isEditInput, isWriteInput } from "./EditDiff";
 import PartsView, { hasRichParts } from "./PartsView";
 import { openRewind } from "../RewindModal";
 import { openForkFromHere } from "../ForkFromHereModal";
+import { openCompare } from "../CompareModal";
 
 const ROLE_LABEL: Record<MessageRole, string> = {
   user: "you",
@@ -90,6 +91,14 @@ const Header: Component<{ msg: SessionMessage }> = (props) => (
           onClick={() => openForkFromHere(props.msg.sessionId, props.msg.turnId!)}
         >
           ⑃ fork from here
+        </button>
+        <button
+          type="button"
+          class="rounded border border-border px-1.5 font-mono text-[10px] text-fg-faint hover:border-accent/40 hover:text-fg"
+          title="Compare backends from here: send one prompt to several backends, each in a fork from this point"
+          onClick={() => openCompare(props.msg.sessionId, props.msg.turnId!)}
+        >
+          ⚖ compare from here
         </button>
         <Show when={props.msg.role === "user"}>
           <button

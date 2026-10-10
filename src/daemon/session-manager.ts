@@ -13,6 +13,8 @@ import { homedir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { type ForkPoint, RewindError, SendStoppedError, Session, type AttachedClient, type WindowScope } from "./session.js";
 import { sweepCheckpoints } from "./checkpoints.js";
+import type { CompareRunRow } from "./store.js";
+import type { CompareState, CompareTargetState } from "../protocol/types.js";
 import { type CatalogEntry, isPlaceholderModel, type SessionProvider } from "./providers/interface.js";
 import {
   createDefaultProviderRegistry,
@@ -1154,6 +1156,14 @@ mcpHub: this.#mcpHub,
         return this.#sessionTurns(msg, auth);
       case "session.rewind":
         return this.#sessionRewind(msg, auth);
+      case "session.compare":
+        return this.#sessionCompare(msg, auth, client);
+      case "compare.get":
+        return this.#compareGet(msg, auth);
+      case "compare.list":
+        return this.#compareList(msg, auth);
+      case "compare.keep":
+        return this.#compareKeep(msg, auth, client);
       case "skill.grant":
         return this.#skillGrant(msg, auth);
       case "mcp.oauth.begin":
@@ -5404,6 +5414,210 @@ mcpHub: this.#mcpHub,
     }
     const { turns, checkpointsSupported } = await session.turns();
     return { type: "session.turns.result", requestId: msg.id, sessionId: session.id, turns, checkpointsSupported };
+  }
+
+  // ── Side-by-side comparisons (#357) ────────────────────────────────────
+  //
+  // Pure orchestration over existing primitives — N × session.fork (own
+  // worktree, own backend/model, optionally from an earlier turn) then the
+  // same prompt to each — so it works with every backend. The record lives in
+  // the store; each branch's live state is read from its session.
+
+  async #sessionCompare(
+    msg: Extract<ClientMessage, { type: "session.compare" }>,
+    auth: AuthContext,
+    client: AttachedClient,
+  ): Promise<DaemonMessage> {
+    for (const scope of [SCOPES.SESSION_CREATE, SCOPES.SESSION_SEND]) {
+      if (!hasScope(auth.scopes as string[], scope)) {
+        return { type: "response.error", requestId: msg.id, error: `Missing scope: ${scope}`, code: "forbidden" };
+      }
+    }
+    const parent = this.#getOwnedSession(msg.sessionId, auth);
+    if (!parent) return { type: "response.error", requestId: msg.id, error: "Session not found", code: "not_found" };
+    if (parent.role) {
+      return { type: "response.error", requestId: msg.id, error: `Cannot compare from a ${parent.role} session`, code: "invalid_request" };
+    }
+    const unknown = msg.targets.find((t) => !this.#providers.has(t.providerId));
+    if (unknown) {
+      return {
+        type: "response.error",
+        requestId: msg.id,
+        error: `Unknown provider "${unknown.providerId}" — available: ${this.#providers.ids().join(", ")}`,
+        code: "invalid_request",
+      };
+    }
+    const compareId = randomUUID();
+    const label = (t: { providerId: string; model?: string }) => `${t.providerId}${t.model ? `:${t.model}` : ""}`;
+
+    // Fork every branch first (sequentially: forks share the parent's
+    // worktree setup and rate limiter), then start them all at once.
+    const targets: CompareRunRow["targets"] = [];
+    const branches: Array<{ index: number; session: Session }> = [];
+    for (const spec of msg.targets) {
+      const target: CompareRunRow["targets"][number] = { providerId: spec.providerId, ...(spec.model ? { model: spec.model } : {}) };
+      targets.push(target);
+      const forked = await this.#fork(
+        {
+          type: "session.fork",
+          id: msg.id,
+          sessionId: parent.id,
+          providerId: spec.providerId,
+          name: `${parent.name} ⚖ ${label(spec)}`,
+          ...(msg.afterTurnId ? { afterTurnId: msg.afterTurnId } : {}),
+          ...(msg.isolate === false ? { isolate: false } : {}),
+        },
+        auth,
+      );
+      if (forked.type !== "response.ok") {
+        target.error = forked.type === "response.error" ? forked.error : "could not create the branch";
+        continue;
+      }
+      const session = this.#sessions.get((forked.data as { id: string }).id)!;
+      target.sessionId = session.id;
+      if (spec.model) {
+        const applied = await session.overrideModel(spec.model);
+        if (!applied) {
+          target.error = `model "${spec.model}" isn't available on ${spec.providerId}`;
+          continue;
+        }
+        try {
+          this.#store.setSessionModel(session.id, applied.applied, null);
+        } catch {
+          // in-memory model governs this lifetime
+        }
+      }
+      branches.push({ index: targets.length - 1, session });
+    }
+    if (branches.length === 0) {
+      return { type: "response.error", requestId: msg.id, error: targets.map((t) => `${label(t)}: ${t.error}`).join("; "), code: "invalid_request" };
+    }
+    await Promise.all(
+      branches.map(async ({ index, session }) => {
+        try {
+          await session.send(msg.prompt, auth);
+          targets[index]!.baseTurnId = session.turnIndex.at(-1)?.turnId;
+        } catch (err) {
+          targets[index]!.error = err instanceof Error ? err.message : String(err);
+        }
+      }),
+    );
+    const row: CompareRunRow = {
+      id: compareId,
+      accountId: parent.accountId,
+      projectId: parent.projectId,
+      parentSessionId: parent.id,
+      ...(msg.afterTurnId ? { afterTurnId: msg.afterTurnId } : {}),
+      prompt: msg.prompt,
+      targets,
+      createdBy: auth.sub,
+      createdAt: new Date().toISOString(),
+    };
+    this.#store.saveCompareRun(row);
+    this.#store.audit(auth.sub, "session.compare", parent.id, `compare=${compareId} targets=${targets.map(label).join(",")}`);
+    void client; // branches are not auto-attached: the client opens the ones it shows
+    return { type: "compare.state", requestId: msg.id, compare: await this.#compareStateOf(row) };
+  }
+
+  /** A comparison's live view: each branch read from its session. */
+  async #compareStateOf(row: CompareRunRow): Promise<CompareState> {
+    const targets: CompareTargetState[] = [];
+    for (const t of row.targets) {
+      const base = { providerId: t.providerId, ...(t.model ? { model: t.model } : {}) };
+      if (!t.sessionId) {
+        targets.push({ ...base, status: "failed", ...(t.error ? { error: t.error } : {}) });
+        continue;
+      }
+      const s = this.#sessions.get(t.sessionId);
+      if (!s) {
+        targets.push({ ...base, sessionId: t.sessionId, status: "gone", ...(t.error ? { error: t.error } : {}) });
+        continue;
+      }
+      const usage = s.toInfo().usage;
+      const reply = s.lastAssistantText ?? undefined;
+      const finished = s.status === "idle" || s.status === "error";
+      const files = finished && t.baseTurnId ? await s.turnFiles(t.baseTurnId) : undefined;
+      const error = t.error ?? (s.status === "error" ? (s.lastTurnError ?? undefined) : undefined);
+      targets.push({
+        ...base,
+        sessionId: s.id,
+        status: t.error && !t.baseTurnId ? "failed" : s.status,
+        ...(error ? { error } : {}),
+        ...(reply ? { reply: reply.length > 4_000 ? `${reply.slice(0, 3_999)}…` : reply } : {}),
+        ...(usage
+          ? {
+              costUsd: usage.totalCostUsd,
+              durationMs: usage.durationMs,
+              inputTokens: usage.inputTokens,
+              outputTokens: usage.outputTokens,
+            }
+          : {}),
+        ...(files ? { files: { ...files, paths: files.paths.slice(0, 200) } } : {}),
+      });
+    }
+    return {
+      compareId: row.id,
+      parentSessionId: row.parentSessionId,
+      prompt: row.prompt,
+      ...(row.afterTurnId ? { afterTurnId: row.afterTurnId } : {}),
+      createdAt: row.createdAt,
+      createdBy: row.createdBy,
+      ...(row.keptSessionId ? { keptSessionId: row.keptSessionId } : {}),
+      targets,
+    };
+  }
+
+  #canRead(auth: AuthContext): boolean {
+    return hasScope(auth.scopes as string[], SCOPES.SESSION_ATTACH) || hasScope(auth.scopes as string[], SCOPES.SESSION_WATCH);
+  }
+
+  async #compareGet(msg: Extract<ClientMessage, { type: "compare.get" }>, auth: AuthContext): Promise<DaemonMessage> {
+    if (!this.#canRead(auth)) {
+      return { type: "response.error", requestId: msg.id, error: "Missing scope: session:attach or session:watch", code: "forbidden" };
+    }
+    const row = this.#store.getCompareRun(msg.compareId, auth.accountId ?? "", auth.projectId ?? "");
+    if (!row) return { type: "response.error", requestId: msg.id, error: "Comparison not found", code: "not_found" };
+    return { type: "compare.state", requestId: msg.id, compare: await this.#compareStateOf(row) };
+  }
+
+  async #compareList(msg: Extract<ClientMessage, { type: "compare.list" }>, auth: AuthContext): Promise<DaemonMessage> {
+    if (!this.#canRead(auth)) {
+      return { type: "response.error", requestId: msg.id, error: "Missing scope: session:attach or session:watch", code: "forbidden" };
+    }
+    const parent = this.#getOwnedSession(msg.sessionId, auth);
+    if (!parent) return { type: "response.error", requestId: msg.id, error: "Session not found", code: "not_found" };
+    const rows = this.#store.listCompareRuns(parent.id, parent.accountId, parent.projectId);
+    const compares: CompareState[] = [];
+    for (const r of rows) compares.push(await this.#compareStateOf(r));
+    return { type: "compare.list.result", requestId: msg.id, sessionId: parent.id, compares };
+  }
+
+  async #compareKeep(
+    msg: Extract<ClientMessage, { type: "compare.keep" }>,
+    auth: AuthContext,
+    client: AttachedClient,
+  ): Promise<DaemonMessage> {
+    if (!hasScope(auth.scopes as string[], SCOPES.SESSION_SEND)) {
+      return { type: "response.error", requestId: msg.id, error: "Missing scope: session:send", code: "forbidden" };
+    }
+    if (msg.discardOthers && !hasScope(auth.scopes as string[], SCOPES.SESSION_DESTROY)) {
+      return { type: "response.error", requestId: msg.id, error: "Missing scope: session:destroy (needed to discard the others)", code: "forbidden" };
+    }
+    const row = this.#store.getCompareRun(msg.compareId, auth.accountId ?? "", auth.projectId ?? "");
+    if (!row) return { type: "response.error", requestId: msg.id, error: "Comparison not found", code: "not_found" };
+    if (!row.targets.some((t) => t.sessionId === msg.sessionId) || !this.#getOwnedSession(msg.sessionId, auth)) {
+      return { type: "response.error", requestId: msg.id, error: "That session isn't a live branch of this comparison", code: "invalid_request" };
+    }
+    row.keptSessionId = msg.sessionId;
+    this.#store.saveCompareRun(row);
+    if (msg.discardOthers) {
+      for (const t of row.targets) {
+        if (!t.sessionId || t.sessionId === msg.sessionId || !this.#sessions.has(t.sessionId)) continue;
+        await this.handle({ type: "session.destroy", id: msg.id, sessionId: t.sessionId }, auth, client);
+      }
+    }
+    this.#store.audit(auth.sub, "compare.keep", msg.sessionId, `compare=${row.id} discardOthers=${msg.discardOthers === true}`);
+    return { type: "compare.state", requestId: msg.id, compare: await this.#compareStateOf(row) };
   }
 
   /**

@@ -37,6 +37,7 @@ import {
 import { CAPABILITIES, type CollaborationConfig } from "./protocol/types.js";
 import { ALL_SCOPES_STRING } from "./protocol/scopes.js";
 import { TerminalClient } from "./terminal/client.js";
+import { parseTargets } from "./terminal/compare.js";
 import {
   getConfigDir,
   getLocalTokenPath,
@@ -626,6 +627,79 @@ program
       ...(o.shared ? { shared: true } : {}),
       ...(o.name ? { name: o.name } : {}),
     });
+    client.disconnect();
+  });
+
+const compare = program
+  .command("compare")
+  .description("Run one prompt on 2–4 backends side by side (each a fork in its own worktree), then keep the best");
+
+compare
+  .command("run <session> <prompt...>")
+  .description("Fork one branch per backend from this session (or after prompt N), send each the prompt, show the results")
+  .requiredOption("--with <backends>", "2–4 backends, comma-separated; backend:model picks a model (e.g. claude,codex:gpt-5.5)")
+  .option("--at <n>", "compare from after prompt N (with the files as they were then)")
+  .option("--shared", "share the parent's folder instead of a worktree per branch")
+  .option("--no-wait", "start the branches and return; see them later with `compare show`")
+  .action(async (session: string, words: string[], o: { with: string; at?: string; shared?: boolean; wait: boolean }) => {
+    const targets = parseTargets(o.with);
+    if ("error" in targets) {
+      console.error(targets.error);
+      process.exit(1);
+    }
+    const at = o.at !== undefined ? Number(o.at) : undefined;
+    if (at !== undefined && (!Number.isInteger(at) || at < 1)) {
+      console.error("--at takes a prompt number (1 = the first)");
+      process.exit(1);
+    }
+    const config = loadConfig();
+    const client = new TerminalClient(config);
+    await client.connect();
+    await client.compareRun(session, targets, words.join(" "), {
+      ...(at !== undefined ? { at } : {}),
+      ...(o.shared ? { shared: true } : {}),
+      wait: o.wait,
+    });
+    client.disconnect();
+  });
+
+compare
+  .command("show <id>")
+  .description("A comparison's branches side by side (id or its first characters)")
+  .option("--wait", "wait for every branch to finish first")
+  .action(async (id: string, o: { wait?: boolean }) => {
+    const config = loadConfig();
+    const client = new TerminalClient(config);
+    await client.connect();
+    await client.compareShow(id, { wait: o.wait === true });
+    client.disconnect();
+  });
+
+compare
+  .command("ls <session>")
+  .description("A session's comparisons, newest first")
+  .action(async (session: string) => {
+    const config = loadConfig();
+    const client = new TerminalClient(config);
+    await client.connect();
+    await client.compareList(session);
+    client.disconnect();
+  });
+
+compare
+  .command("keep <id> <branch>")
+  .description("Keep branch N as the continuation; --discard-others destroys the rest")
+  .option("--discard-others", "destroy the other branches")
+  .action(async (id: string, branch: string, o: { discardOthers?: boolean }) => {
+    const n = Number(branch);
+    if (!Number.isInteger(n) || n < 1) {
+      console.error("<branch> is the number shown next to it (1 = the first)");
+      process.exit(1);
+    }
+    const config = loadConfig();
+    const client = new TerminalClient(config);
+    await client.connect();
+    await client.compareKeep(id, n, o.discardOthers === true);
     client.disconnect();
   });
 

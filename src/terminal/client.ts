@@ -12,6 +12,8 @@ import { PIPELINE_INPUT_REQUEST_PREFIX, PROTOCOL_VERSION } from "../protocol/typ
 import type {
   ClientMessage,
   CollaborationConfig,
+  CompareState,
+  CompareTargetSpec,
   DaemonMessage,
   PipelineWire,
   SessionInfo,
@@ -22,6 +24,7 @@ import { formatPackList, formatPackShow } from "./pack-format.js";
 import { formatPipeline, haltedRequestId } from "./pipeline-format.js";
 import { type PendingDialog, parseDialogAnswer } from "./dialog.js";
 import { formatRewind, parseUndoArgs } from "./rewind.js";
+import { compareSettled, formatCompare } from "./compare.js";
 
 // ── Stream rendering (pure, exported for tests) ───────────────────────────────
 
@@ -725,6 +728,135 @@ export class TerminalClient {
       const snap = t.checkpoint ? "" : list.checkpointsSupported ? "  [no snapshot]" : "";
       console.log(`${String(t.index).padStart(3)}. ${S(t.preview)}${tag}${snap}`);
     }
+  }
+
+  /**
+   * `codeoid compare run` (#357): fork one branch per target, send each the
+   * prompt, and (unless `wait` is false) wait for all of them, then print them
+   * side by side, numbered for `compare keep`.
+   */
+  async compareRun(
+    sessionIdOrName: string,
+    targets: CompareTargetSpec[],
+    prompt: string,
+    opts: { at?: number; shared?: boolean; wait?: boolean },
+  ): Promise<void> {
+    const sessionId = await this.#resolveSession(sessionIdOrName);
+    if (!sessionId) return;
+    let afterTurnId: string | undefined;
+    if (opts.at !== undefined) {
+      const list = await this.#request({ type: "session.turns", id: randomUUID(), sessionId });
+      if (list.type !== "session.turns.result") {
+        this.#printError(list);
+        return;
+      }
+      const t = list.turns[opts.at - 1];
+      if (!t) {
+        console.log(`There is no prompt ${opts.at} (this session has ${list.turns.length}).`);
+        return;
+      }
+      afterTurnId = t.turnId;
+    }
+    const resp = await this.#request({
+      type: "session.compare",
+      id: randomUUID(),
+      sessionId,
+      prompt,
+      targets,
+      ...(afterTurnId ? { afterTurnId } : {}),
+      ...(opts.shared ? { isolate: false } : {}),
+    });
+    if (resp.type !== "compare.state") {
+      this.#printError(resp);
+      return;
+    }
+    let state = resp.compare;
+    if (opts.wait !== false) {
+      console.log(`Comparing on ${targets.length} backends — waiting for them to finish (Ctrl-C to stop waiting; they keep running)…`);
+      state = await this.#waitForCompare(state);
+    }
+    console.log(S(formatCompare(state)));
+    console.log(`\nKeep one: codeoid compare keep ${state.compareId.slice(0, 8)} <branch> [--discard-others]`);
+  }
+
+  async #waitForCompare(state: CompareState): Promise<CompareState> {
+    let s = state;
+    while (!compareSettled(s)) {
+      await new Promise((r) => setTimeout(r, 2_000));
+      const next = await this.#request({ type: "compare.get", id: randomUUID(), compareId: s.compareId });
+      if (next.type !== "compare.state") break;
+      s = next.compare;
+    }
+    return s;
+  }
+
+  /** A comparison by id (or a unique id prefix among the session's, via `compare ls`). */
+  async #resolveCompare(idOrPrefix: string): Promise<CompareState | undefined> {
+    const direct = await this.#request({ type: "compare.get", id: randomUUID(), compareId: idOrPrefix });
+    if (direct.type === "compare.state") return direct.compare;
+    // A short prefix: look through the sessions' comparisons.
+    const sessions = await this.#request({ type: "session.list", id: randomUUID() });
+    if (sessions.type !== "session.list.result") {
+      this.#printError(direct);
+      return undefined;
+    }
+    const matches: CompareState[] = [];
+    for (const info of sessions.sessions) {
+      const list = await this.#request({ type: "compare.list", id: randomUUID(), sessionId: info.id });
+      if (list.type !== "compare.list.result") continue;
+      matches.push(...list.compares.filter((c) => c.compareId.startsWith(idOrPrefix)));
+    }
+    if (matches.length === 1) return matches[0];
+    console.log(matches.length === 0 ? `No comparison ${idOrPrefix}.` : `${idOrPrefix} matches ${matches.length} comparisons — give more of the id.`);
+    return undefined;
+  }
+
+  /** `codeoid compare show <id>` — a comparison's branches, side by side. */
+  async compareShow(idOrPrefix: string, opts: { wait?: boolean } = {}): Promise<void> {
+    let state = await this.#resolveCompare(idOrPrefix);
+    if (!state) return;
+    if (opts.wait) state = await this.#waitForCompare(state);
+    console.log(S(formatCompare(state)));
+  }
+
+  /** `codeoid compare ls <session>` — a session's comparisons, newest first. */
+  async compareList(sessionIdOrName: string): Promise<void> {
+    const sessionId = await this.#resolveSession(sessionIdOrName);
+    if (!sessionId) return;
+    const list = await this.#request({ type: "compare.list", id: randomUUID(), sessionId });
+    if (list.type !== "compare.list.result") {
+      this.#printError(list);
+      return;
+    }
+    if (list.compares.length === 0) console.log("No comparisons yet.");
+    for (const c of list.compares) {
+      const branches = c.targets.map((t) => `${t.providerId}${t.model ? `:${t.model}` : ""}${t.sessionId && t.sessionId === c.keptSessionId ? "★" : ""}`).join(" · ");
+      console.log(`${c.compareId.slice(0, 8)}  ${c.createdAt.slice(0, 16).replace("T", " ")}  ${S(branches)}  "${S(c.prompt.replace(/\s+/g, " ").slice(0, 60))}"`);
+    }
+  }
+
+  /** `codeoid compare keep <id> <branch> [--discard-others]`. */
+  async compareKeep(idOrPrefix: string, branch: number, discardOthers: boolean): Promise<void> {
+    const state = await this.#resolveCompare(idOrPrefix);
+    if (!state) return;
+    const target = state.targets[branch - 1];
+    if (!target?.sessionId) {
+      console.log(`Branch ${branch} isn't a session you can keep (this comparison has ${state.targets.length} branches).`);
+      return;
+    }
+    const resp = await this.#request({
+      type: "compare.keep",
+      id: randomUUID(),
+      compareId: state.compareId,
+      sessionId: target.sessionId,
+      ...(discardOthers ? { discardOthers: true } : {}),
+    });
+    if (resp.type !== "compare.state") {
+      this.#printError(resp);
+      return;
+    }
+    console.log(`Kept [${branch}] ${target.providerId}${target.model ? `:${target.model}` : ""} — session ${target.sessionId}${discardOthers ? "; the other branches were destroyed" : ""}.`);
+    console.log(`Attach with: codeoid attach ${target.sessionId}`);
   }
 
   /** `codeoid undo <session> [files [yes|force]]` — /undo without attaching. */

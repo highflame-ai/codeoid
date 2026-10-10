@@ -22,6 +22,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: "/interrupt", description: "Interrupt the focused session" },
   { name: "/turns", description: "List this session's turns, numbered (the N for /fork N)" },
   { name: "/fork", description: "Fork into a new session — /fork N branches after prompt N (with its files); --shared, --backend <id>" },
+  { name: "/compare", description: "Run a prompt on 2–4 backends side by side — /compare claude,codex [--at N] <prompt>; /compare shows; /compare keep N" },
   { name: "/undo", description: "Take back the last message (the agent forgets it); /undo files [yes|force] also restores the files" },
   { name: "/mode", description: "Cycle session mode (interactive/guarded/autonomous)" },
   { name: "/pin", description: "Pin a file to the session (prepended every turn)" },
