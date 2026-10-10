@@ -224,6 +224,72 @@ describe("OpenAIProvider – listModels", () => {
   });
 });
 
+describe("OpenAIProvider – a second OpenAI-compatible backend", () => {
+  beforeEach(() => {
+    streamChunks = [];
+    streamError = null;
+    modelsResult = [];
+  });
+
+  it("defaults to the openai id and display name", () => {
+    const provider = new OpenAIProvider({ apiKey: "fake-key" });
+    expect(provider.id).toBe("openai");
+    expect(provider.displayName).toBe("GPT (OpenAI)");
+  });
+
+  it("labels its turns with an overridden id — what Session persists for resume", async () => {
+    const provider = new OpenAIProvider({ apiKey: "sk-local", id: "llamacpp", displayName: "llama.cpp (local)" });
+    streamChunks = [{ choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] }];
+    const events = await runProvider(provider);
+    expect(events.find((e) => e.type === "turn_done")).toMatchObject({ result: { providerId: "llamacpp" } });
+  });
+
+  it("reports the window the server says it is running with", async () => {
+    const provider = new OpenAIProvider({ apiKey: "sk-local", contextWindow: async () => 16_384 });
+    streamChunks = [{ choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] }];
+    const done = (await runProvider(provider)).find((e) => e.type === "turn_done");
+    expect(done).toMatchObject({ result: { contextWindow: 16_384 } });
+  });
+
+  it("leaves the window off when the server can't say, instead of failing the turn", async () => {
+    const provider = new OpenAIProvider({
+      apiKey: "sk-local",
+      contextWindow: async () => {
+        throw new Error("connection refused");
+      },
+    });
+    streamChunks = [{ choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] }];
+    const done = (await runProvider(provider)).find((e) => e.type === "turn_done");
+    expect(done?.type).toBe("turn_done");
+    expect((done as { result: { contextWindow?: number } }).result.contextWindow).toBeUndefined();
+  });
+
+  it("fails a turn whose stream ends before its first chunk, instead of recording an empty answer", async () => {
+    // llama-server's over-context error arrives as `error: {...}`, which the SDK
+    // drops — leaving a stream with no chunks at all.
+    const provider = new OpenAIProvider({ apiKey: "sk-local", displayName: "llama.cpp (local)" });
+    streamChunks = [];
+    const events = await runProvider(provider);
+    expect(events.find((e) => e.type === "turn_done")).toBeUndefined();
+    const err = events.find((e) => e.type === "error") as { message: string } | undefined;
+    expect(err?.message).toMatch(/^llama\.cpp \(local\): .*--ctx-size/);
+  });
+
+  it("lists every model a local server serves, by file name", async () => {
+    modelsResult = [{ id: "/models/Qwen2.5-7B-Instruct-Q8_0.gguf" }];
+    const provider = new OpenAIProvider({ apiKey: "sk-local", modelFilter: () => true, fallbackModels: [] });
+    expect(await provider.listModels()).toEqual([
+      { id: "/models/Qwen2.5-7B-Instruct-Q8_0.gguf", displayName: "Qwen2.5-7B-Instruct-Q8_0.gguf" },
+    ]);
+  });
+
+  it("lists nothing, not GPT models, when a local server is down", async () => {
+    modelsResult = new Error("connection refused");
+    const provider = new OpenAIProvider({ apiKey: "sk-local", modelFilter: () => true, fallbackModels: [] });
+    expect(await provider.listModels()).toEqual([]);
+  });
+});
+
 describe("OpenAIProvider – dispose", () => {
   it("dispose() resolves without throwing (stateless provider)", async () => {
     const provider = new OpenAIProvider({ apiKey: "fake-key" });

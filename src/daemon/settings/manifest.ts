@@ -467,6 +467,25 @@ const gemini: SettingsTab = {
   ],
 };
 
+const llamacpp: SettingsTab = {
+  id: "llamacpp",
+  title: "Local (llama.cpp)",
+  icon: "▢",
+  description: "A local llama.cpp server (`llama-server`) for fully offline GGUF models. Off by default — codeoid can't tell at startup whether a server is listening at the configured URL. External MCP servers are opt-in via `providers.llamacpp.mcpServers` in config.json; see docs/local-models.md.",
+  groups: [
+    {
+      id: "llamacpp-provider",
+      title: "Backend",
+      fields: [
+        cfg("providers.llamacpp.enabled", "Enable local backend", "Register the llamacpp backend in the provider catalog.", { kind: "boolean", default: false }),
+        cfg("providers.llamacpp.baseUrl", "Server URL", "llama-server's OpenAI-compatible endpoint.", { default: "http://127.0.0.1:8080/v1" }),
+        cfg("providers.llamacpp.apiKey", "API key", "Only checked if llama-server was started with --api-key; otherwise any non-empty value.", { default: "sk-local", advanced: true }),
+        cfg("providers.llamacpp.model", "Default model name", "Cosmetic — llama-server serves whatever GGUF it was launched with.", { advanced: true }),
+      ],
+    },
+  ],
+};
+
 const identity: SettingsTab = {
   id: "identity",
   title: "Identity & Auth",
@@ -580,7 +599,7 @@ const hooks: SettingsTab = {
 
 export const SETTINGS_MANIFEST: SettingsManifest = {
   version: MANIFEST_VERSION,
-  tabs: [general, memory, fleet, claude, codex, geminiCli, pi, openai, gemini, identity, frontends, hooks],
+  tabs: [general, memory, fleet, claude, codex, geminiCli, pi, openai, gemini, llamacpp, identity, frontends, hooks],
 };
 
 // ── Derived accessors ─────────────────────────────────────────────────────────

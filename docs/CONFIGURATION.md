@@ -86,7 +86,8 @@ CODEOID_RESUME_MAX_SESSIONS=200          # sessions restored from disk at startu
                                         #   startup time; the remainder stays on disk and loads
                                         #   on a later restart.
 CODEOID_DEFAULT_PROVIDER=claude         # backend for sessions created without --provider
-                                        #   (claude | codex | pi | qwen | gemini-cli | openai | gemini).
+                                        #   (claude | codex | pi | qwen | gemini-cli | openai | gemini |
+                                        #    llamacpp — see docs/local-models.md).
                                         #   An unknown, disabled or uninstalled backend stops the
                                         #   daemon at startup. Resumed sessions and the conductor
                                         #   keep their own backend.

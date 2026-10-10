@@ -41,6 +41,9 @@ const PROVIDER_DEFAULT_WINDOW: Readonly<Record<string, number>> = {
   gemini: 1_000_000,
   "gemini-cli": 1_000_000,
   pi: 200_000, // pi is multi-provider (defaults to google/1M); 200k is a safe middle.
+  // llama-server's own default --ctx-size. The server reports its real window
+  // on every turn; this only sizes a seed before the first one.
+  llamacpp: 4_096,
 };
 
 /**

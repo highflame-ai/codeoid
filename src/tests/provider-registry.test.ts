@@ -249,4 +249,47 @@ describe("ProviderRegistry", () => {
       try { rmSync(tmp, { recursive: true, force: true }); } catch {}
     }
   });
+
+  const llamacppOn = { providers: { llamacpp: { enabled: true, baseUrl: "http://127.0.0.1:8080/v1", apiKey: "sk-local" } } };
+
+  it("llamacpp is off by default, even with an OpenAI key present", () => {
+    withApiKeys();
+    expect(createDefaultProviderRegistry().has("llamacpp")).toBe(false);
+  });
+
+  it("providers.llamacpp.enabled registers a local backend without needing OPENAI_API_KEY", () => {
+    // Keys deleted by beforeEach — llamacpp must not depend on them.
+    const registry = createDefaultProviderRegistry(
+      llamacppOn as unknown as Parameters<typeof createDefaultProviderRegistry>[0],
+    );
+    expect(registry.has("llamacpp")).toBe(true);
+    expect(registry.has("openai")).toBe(false);
+  });
+
+  it("llamacpp can be the default provider independently of openai", () => {
+    expect(createDefaultProviderRegistry(withDefault("llamacpp", llamacppOn)).defaultId).toBe("llamacpp");
+  });
+
+  it("a disabled llamacpp default names the toggle that enables it", () => {
+    expect(() => createDefaultProviderRegistry(withDefault("llamacpp"))).toThrow(/providers\.llamacpp\.enabled/);
+  });
+
+  it("the llamacpp factory builds a provider labelled llamacpp, beside a real openai one", () => {
+    withApiKeys();
+    const tmp = mkdtempSync(join(tmpdir(), "codeoid-registry-llamacpp-"));
+    const store = new Store(join(tmp, "codeoid.db"));
+    try {
+      const registry = createDefaultProviderRegistry(
+        llamacppOn as unknown as Parameters<typeof createDefaultProviderRegistry>[0],
+      );
+      const init = makeInit(store);
+      // Session resume reads the live instance's id, so the two backends that
+      // share OpenAIProvider must not both call themselves "openai".
+      expect(registry.getOrThrow("llamacpp").create(init).id).toBe("llamacpp");
+      expect(registry.getOrThrow("openai").create(init).id).toBe("openai");
+    } finally {
+      try { store.close(); } catch {}
+      try { rmSync(tmp, { recursive: true, force: true }); } catch {}
+    }
+  });
 });

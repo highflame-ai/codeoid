@@ -15,6 +15,9 @@
 
 import type { McpCallResult, McpCallScope, McpHub, McpToolDef } from "./hub.js";
 import type { McpRegistry } from "./registry.js";
+
+/** The one thing a session's tool view needs from the registry. */
+export type McpServerSource = Pick<McpRegistry, "forBackend">;
 import { canonicalToolName, type McpServerSpec, type McpTrust } from "./types.js";
 
 /** One tool a backend should expose, already keyed by its canonical name. */
@@ -29,12 +32,12 @@ export interface McpToolHandle {
 }
 
 export class SessionMcpTools {
-  readonly #registry: McpRegistry;
+  readonly #registry: McpServerSource;
   readonly #hub: McpHub;
   readonly #backendId: string;
   readonly #scope: McpCallScope;
 
-  constructor(registry: McpRegistry, hub: McpHub, backendId: string, scope: McpCallScope) {
+  constructor(registry: McpServerSource, hub: McpHub, backendId: string, scope: McpCallScope) {
     this.#registry = registry;
     this.#hub = hub;
     this.#backendId = backendId;

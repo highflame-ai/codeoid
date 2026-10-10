@@ -40,6 +40,9 @@ interface FunctionToolShape {
   parameters: Record<string, unknown>;
 }
 
+/** A tool as the OpenAI chat-completions API takes it. */
+export type OpenAIFunctionTool = { type: "function"; function: FunctionToolShape };
+
 /**
  * The ask-the-user tool. Unlike the memory tools, this backend (openai/gemini)
  * has no native way to ask the human anything mid-turn — this gives it one. A

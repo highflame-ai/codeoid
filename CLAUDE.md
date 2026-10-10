@@ -253,6 +253,25 @@ config file. The shipped default issuer is the Highflame SaaS, so a hosted user
 just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
 `resolveZeroidUrl()` live in `src/config.ts`.
 
+### Local models (llama.cpp)
+
+The `llamacpp` backend drives a `llama-server` the user runs themselves, over
+its OpenAI-compatible API — `OpenAIProvider` under a distinct id
+(`src/daemon/providers/llamacpp/`). Off by default
+(`providers.llamacpp.enabled`). User guide: [docs/local-models.md](docs/local-models.md).
+
+What differs from the cloud `openai` backend, and why:
+
+- **Context window** comes from the server's `/props` after every turn
+  (per-request `n_ctx`), and the pre-first-turn floor is llama-server's own
+  default of 4096 — a cloud-sized table entry would overflow a local server.
+- **External MCP servers are opt-in** (`providers.llamacpp.mcpServers`):
+  tool definitions ride in every prompt, and a few servers' worth exceeds a
+  local context before the user types. Built-in memory tools are always on.
+- **Tool schemas are made strict** (`strictJsonSchema`): llama.cpp compiles
+  them into a grammar and 500s the whole request on an annotation-only
+  subschema such as `{ "description": "any value" }`.
+
 Config file at `~/.codeoid/config.json` (optional). Env vars take precedence.
 
 Data stored at:

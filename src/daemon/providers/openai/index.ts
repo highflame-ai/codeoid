@@ -37,12 +37,22 @@ import {
   MAX_MEMORY_TOOL_ROUNDS,
   mcpToolsAsOpenAI,
   memoryToolsAsOpenAI,
+  type OpenAIFunctionTool,
 } from "../tool-loop.js";
-import { SessionMcpTools } from "../../mcp/tool-source.js";
-import type { McpRegistry } from "../../mcp/registry.js";
+import { SessionMcpTools, type McpServerSource } from "../../mcp/tool-source.js";
 import type { McpHub } from "../../mcp/hub.js";
 
 export interface OpenAIProviderInit {
+  /**
+   * Override the id/displayName this instance reports. Lets the same
+   * wire-compatible client power more than one registry entry (e.g.
+   * "llamacpp" against a local server, "openai" against a cloud gateway)
+   * WITHOUT the two colliding on persisted `providerId` / resume lookups —
+   * those read the live instance's `.id`, not the factory that built it.
+   * Defaults to "openai" / "GPT (OpenAI)".
+   */
+  id?: string;
+  displayName?: string;
   /** Explicit API key — falls back to OPENAI_API_KEY env var. */
   apiKey?: string;
   /** Default model when TurnOpts.model is absent. */
@@ -59,13 +69,40 @@ export interface OpenAIProviderInit {
   sessionId?: string;
   /** Cross-backend MCP registry + daemon-owned client — external servers reach
    *  this backend (which has no MCP client) through the hub. */
-  mcpRegistry?: McpRegistry;
+  mcpRegistry?: McpServerSource;
   mcpHub?: McpHub;
+  /**
+   * Which of the server's models to list. Defaults to OpenAI's chat families;
+   * a local server serves arbitrarily named models, so it lists them all.
+   */
+  modelFilter?: (id: string) => boolean;
+  /** Listed when the server can't be reached. Defaults to a few GPT models. */
+  fallbackModels?: ModelInfo[];
+  /**
+   * The context window the SERVER is running with, asked once per turn and
+   * reported on the turn result. Only a server that can say (llama-server's
+   * `/props`) passes one; without it the daemon falls back to its tables.
+   */
+  contextWindow?: () => Promise<number | undefined>;
+  /**
+   * Rewrite the tool list before it is sent, for servers stricter than
+   * OpenAI's about tool schemas (llama.cpp compiles them into a grammar).
+   */
+  toolsTransform?: (tools: OpenAIFunctionTool[]) => OpenAIFunctionTool[];
 }
 
+const OPENAI_CHAT_MODEL = (id: string) =>
+  id.startsWith("gpt-") || id.startsWith("o1") || id.startsWith("o3");
+
+const OPENAI_FALLBACK_MODELS: ModelInfo[] = [
+  { id: "gpt-4o", displayName: "GPT-4o" },
+  { id: "gpt-4o-mini", displayName: "GPT-4o Mini" },
+  { id: "o3-mini", displayName: "o3-mini" },
+];
+
 export class OpenAIProvider implements AgentProvider {
-  readonly id = "openai";
-  readonly displayName = "GPT (OpenAI)";
+  readonly id: string;
+  readonly displayName: string;
 
   #client: OpenAI;
   #defaultModel: string;
@@ -73,10 +110,16 @@ export class OpenAIProvider implements AgentProvider {
   #workspaceId: string;
   #tenant: McpTenant | undefined;
   #sessionId: string;
-  #mcpRegistry: McpRegistry | null;
+  #mcpRegistry: McpServerSource | null;
   #mcpHub: McpHub | null;
+  #modelFilter: (id: string) => boolean;
+  #fallbackModels: ModelInfo[];
+  #contextWindow: (() => Promise<number | undefined>) | null;
+  #toolsTransform: ((tools: OpenAIFunctionTool[]) => OpenAIFunctionTool[]) | null;
 
   constructor(init: OpenAIProviderInit = {}) {
+    this.id = init.id ?? "openai";
+    this.displayName = init.displayName ?? "GPT (OpenAI)";
     this.#client = new OpenAI({
       apiKey: init.apiKey ?? process.env.OPENAI_API_KEY ?? "missing",
       ...(init.baseURL ? { baseURL: init.baseURL } : {}),
@@ -88,6 +131,10 @@ export class OpenAIProvider implements AgentProvider {
     this.#sessionId = init.sessionId ?? "";
     this.#mcpRegistry = init.mcpRegistry ?? null;
     this.#mcpHub = init.mcpHub ?? null;
+    this.#modelFilter = init.modelFilter ?? OPENAI_CHAT_MODEL;
+    this.#fallbackModels = init.fallbackModels ?? OPENAI_FALLBACK_MODELS;
+    this.#contextWindow = init.contextWindow ?? null;
+    this.#toolsTransform = init.toolsTransform ?? null;
   }
 
   /** The memory recall tools are offered whenever a memory engine is wired,
@@ -162,11 +209,12 @@ export class OpenAIProvider implements AgentProvider {
           : null;
       const mcpHandles = mcpTools?.hasServers() ? await mcpTools.handles() : [];
       const mcpDeps = mcpTools ? { tools: mcpTools, canUseTool: opts.canUseTool, emit } : null;
-      const toolList = [
+      const offered: OpenAIFunctionTool[] = [
         ...(memoryDeps ? memoryToolsAsOpenAI() : []),
         ...mcpToolsAsOpenAI(mcpHandles),
         ...(askDeps ? [askUserToolAsOpenAI()] : []),
       ];
+      const toolList = this.#toolsTransform ? this.#toolsTransform(offered) : offered;
       const tools = toolList.length > 0 ? toolList : undefined;
 
       let finalText = "";
@@ -195,9 +243,11 @@ export class OpenAIProvider implements AgentProvider {
         // OpenAI streams tool_calls as indexed deltas — accumulate by index.
         const toolCalls: Array<{ id: string; name: string; args: string }> = [];
         let finish: string | undefined;
+        let chunks = 0;
 
         for await (const chunk of stream) {
           if (ac.signal.aborted) return;
+          chunks++;
           const choice = chunk.choices[0];
           const delta = choice?.delta?.content;
           if (delta) {
@@ -221,6 +271,17 @@ export class OpenAIProvider implements AgentProvider {
           if (choice?.finish_reason) finish = choice.finish_reason;
         }
         if (ac.signal.aborted) return;
+        if (chunks === 0) {
+          // A stream that ends before its first chunk is a failure the server
+          // reported in a form the client could not parse: llama-server sends
+          // `error: {...}`, which is not an SSE field, so the SDK drops it and
+          // sees a clean [DONE]. Reporting success here would record a turn
+          // with no answer and no reason.
+          throw new Error(
+            "the server ended the response before sending anything. For a local server " +
+              "this usually means the prompt exceeded its context size (--ctx-size).",
+          );
+        }
 
         finalText = roundText;
 
@@ -266,6 +327,10 @@ export class OpenAIProvider implements AgentProvider {
 
       if (ac.signal.aborted) return;
 
+      // Best-effort: a window the server can't report leaves the daemon on its
+      // tables, which is where it would have been anyway.
+      const contextWindow = await this.#contextWindow?.().catch(() => undefined);
+
       queue.push({ type: "text_done", content: finalText });
 
       const result: NormalizedTurnResult = {
@@ -278,6 +343,7 @@ export class OpenAIProvider implements AgentProvider {
         totalCostUsd: 0, // OpenAI does not return cost in the streaming response.
         durationMs: Date.now() - startMs,
         stopReason,
+        ...(contextWindow !== undefined && contextWindow > 0 ? { contextWindow } : {}),
       };
 
       queue.push({ type: "turn_done", result });
@@ -285,7 +351,7 @@ export class OpenAIProvider implements AgentProvider {
       if (!ac.signal.aborted) {
         queue.push({
           type: "error",
-          message: `OpenAIProvider: ${err instanceof Error ? err.message : String(err)}`,
+          message: `${this.displayName}: ${err instanceof Error ? err.message : String(err)}`,
         });
       }
     } finally {
@@ -297,14 +363,12 @@ export class OpenAIProvider implements AgentProvider {
     try {
       const resp = await this.#client.models.list();
       return resp.data
-        .filter((m) => m.id.startsWith("gpt-") || m.id.startsWith("o1") || m.id.startsWith("o3"))
-        .map((m) => ({ id: m.id, displayName: m.id }));
+        .filter((m) => this.#modelFilter(m.id))
+        // A local server names its model by the file it loaded; the path is
+        // noise in a picker, the file name is not.
+        .map((m) => ({ id: m.id, displayName: m.id.split("/").pop() || m.id }));
     } catch {
-      return [
-        { id: "gpt-4o", displayName: "GPT-4o" },
-        { id: "gpt-4o-mini", displayName: "GPT-4o Mini" },
-        { id: "o3-mini", displayName: "o3-mini" },
-      ];
+      return this.#fallbackModels;
     }
   }
 

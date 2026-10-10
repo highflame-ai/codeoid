@@ -697,12 +697,42 @@ const ProvidersSchema = z
         command: z.string().optional(),
       })
       .default({ enabled: true }),
+    /**
+     * A local OpenAI-compatible server (e.g. llama.cpp's `llama-server`) for
+     * running open-weight GGUF models fully offline. Reuses the `openai`
+     * provider's wire format under a distinct id/config, so it can sit
+     * alongside a cloud `openai` gateway instead of replacing it. Off by
+     * default — there's no daemon-startup way to tell whether a server is
+     * actually listening at `baseUrl`, so registering it unconditionally
+     * would advertise a backend that 500s on first use.
+     */
+    llamacpp: z
+      .object({
+        enabled: z.boolean().default(false),
+        /** llama-server's OpenAI-compatible endpoint. */
+        baseUrl: z.string().default("http://127.0.0.1:8080/v1"),
+        /** llama.cpp doesn't check this, but the OpenAI client requires a non-empty string. */
+        apiKey: z.string().default("sk-local"),
+        /** Default model name when a session doesn't pick one. llama-server
+         *  accepts (and generally ignores) this — it always serves whatever
+         *  model it was launched with. */
+        model: z.string().optional(),
+        /**
+         * External MCP servers (by name) whose tools this backend is offered.
+         * Default none: every tool definition rides in every prompt, and a few
+         * servers' worth overflows a local model's context before the user has
+         * typed a word. codeoid's own memory tools are always offered.
+         */
+        mcpServers: z.array(z.string()).default([]),
+      })
+      .default({ enabled: false, baseUrl: "http://127.0.0.1:8080/v1", apiKey: "sk-local", mcpServers: [] }),
   })
   .default({
     pi: { enabled: true, command: "pi" },
     codex: { enabled: true, command: "codex" },
     geminiCli: { enabled: true, command: "gemini" },
     qwen: { enabled: true },
+    llamacpp: { enabled: false, baseUrl: "http://127.0.0.1:8080/v1", apiKey: "sk-local", mcpServers: [] },
   });
 
 /**
@@ -1203,6 +1233,13 @@ export interface CodeoidConfig {
       baseUrl?: string;
       model?: string;
       command?: string;
+    };
+    llamacpp: {
+      enabled: boolean;
+      baseUrl: string;
+      apiKey: string;
+      model?: string;
+      mcpServers: string[];
     };
   };
   /**
