@@ -17,6 +17,7 @@ vi.mock("../state/connection", () => ({
 const fetchModelsMock = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 vi.mock("../state/models", () => ({ fetchModels: fetchModelsMock, modelCatalog: () => [] }));
 vi.mock("./SessionExportModal", () => ({ openExportModal: vi.fn() }));
+vi.mock("./CompareModal", () => ({ openCompare: vi.fn() }));
 const openBlackboardMock = vi.hoisted(() => vi.fn());
 vi.mock("../state/blackboard", () => ({ openBlackboard: openBlackboardMock }));
 

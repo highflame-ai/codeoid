@@ -7,6 +7,7 @@ const openRewindMock = vi.hoisted(() => vi.fn());
 vi.mock("../RewindModal", () => ({ openRewind: openRewindMock }));
 const openForkMock = vi.hoisted(() => vi.fn());
 vi.mock("../ForkFromHereModal", () => ({ openForkFromHere: openForkMock }));
+vi.mock("../CompareModal", () => ({ openCompare: vi.fn() }));
 
 import MessageRow from "./MessageRow";
 import { REASONING_UNAVAILABLE } from "../../protocol/types";

@@ -21,6 +21,7 @@ import {
 import type { Attachment } from "../protocol/types.js";
 import { parseDialogAnswer } from "../terminal/dialog.js";
 import { formatRewind, parseForkArgs, parseUndoArgs } from "../terminal/rewind.js";
+import { formatCompare, parseCompareArgs } from "../terminal/compare.js";
 import { sanitizeTerminalOutput } from "./ansi/codes.js";
 import { dialogDetail, dialogHint } from "./dialog-hint.js";
 import type { CodeoidConfig } from "../config.js";
@@ -52,6 +53,8 @@ export function App({ config }: Props) {
   // Auto-attach to all sessions so unread counters and status changes flow
   // even when the user isn't actively viewing that session.
   const attachedRef = useRef<Set<string>>(new Set());
+  /** Per session, the comparison /compare last started or showed here (#357). */
+  const lastCompareRef = useRef<Map<string, string>>(new Map());
   const prevConnectionRef = useRef(state.connection);
   useEffect(() => {
     const client = wsRef.current;
@@ -919,6 +922,70 @@ export function App({ config }: Props) {
           const info = res.data as import("../protocol/types.js").SessionInfo;
           dispatch({ type: "session.add", session: info });
           dispatch({ type: "focus", sessionId: info.id });
+        })().catch((err: Error) => dispatch({ type: "error", message: err.message }));
+        return;
+      }
+      case "/compare": {
+        // Side by side (#357) — see src/terminal/compare.ts for the grammar.
+        if (!client || !focusedSession) return;
+        const cmd = parseCompareArgs(args);
+        if ("error" in cmd) {
+          dispatch({ type: "error", message: cmd.error });
+          return;
+        }
+        const sessionId = focusedSession.info.id;
+        void (async () => {
+          if (cmd.kind === "start") {
+            let afterTurnId: string | undefined;
+            if (cmd.at !== undefined) {
+              const list = await client.turns(sessionId);
+              if (list.type !== "session.turns.result") throw new Error("could not list turns");
+              const t = list.turns[cmd.at - 1];
+              if (!t) throw new Error(`there is no prompt ${cmd.at} (this session has ${list.turns.length})`);
+              afterTurnId = t.turnId;
+            }
+            const res = await client.compare(sessionId, {
+              prompt: cmd.prompt,
+              targets: cmd.targets,
+              ...(afterTurnId ? { afterTurnId } : {}),
+            });
+            if (res.type !== "compare.state") throw new Error(res.type === "response.error" ? res.error : "compare failed");
+            lastCompareRef.current.set(sessionId, res.compare.compareId);
+            // The branches are new sessions: load them so they can be focused.
+            await client.listSessions();
+            printLocalInfo(
+              sessionId,
+              `${sanitizeTerminalOutput(formatCompare(res.compare))}\n\nThe branches are running as their own sessions (each asks for approvals there). /compare shows how they're doing; /compare keep <branch> [--discard-others] keeps one.`,
+            );
+            return;
+          }
+          // The comparison this TUI last started or showed for this session
+          // (never one another client started meanwhile), else the newest.
+          let compareId = lastCompareRef.current.get(sessionId);
+          if (!compareId) {
+            const list = await client.compareList(sessionId);
+            if (list.type !== "compare.list.result") throw new Error("could not list comparisons");
+            compareId = list.compares[0]?.compareId;
+          }
+          if (!compareId) {
+            printLocalInfo(sessionId, "No comparisons yet. /compare claude,codex <prompt> starts one.");
+            return;
+          }
+          const got = await client.compareGet(compareId);
+          if (got.type !== "compare.state") throw new Error(got.type === "response.error" ? got.error : "could not read the comparison");
+          const latest = got.compare;
+          lastCompareRef.current.set(sessionId, latest.compareId);
+          if (cmd.kind === "show") {
+            printLocalInfo(sessionId, sanitizeTerminalOutput(formatCompare(latest)));
+            return;
+          }
+          const target = latest.targets[cmd.branch - 1];
+          if (!target?.sessionId) throw new Error(`branch ${cmd.branch} isn't a session you can keep`);
+          const res = await client.compareKeep(latest.compareId, target.sessionId, cmd.discardOthers);
+          if (res.type !== "compare.state") throw new Error(res.type === "response.error" ? res.error : "keep failed");
+          await client.listSessions();
+          printLocalInfo(sessionId, `Kept [${cmd.branch}] of comparison ${latest.compareId.slice(0, 8)}.`);
+          dispatch({ type: "focus", sessionId: target.sessionId });
         })().catch((err: Error) => dispatch({ type: "error", message: err.message }));
         return;
       }

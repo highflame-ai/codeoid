@@ -442,6 +442,28 @@ export async function currentTree(opts: {
   }
 }
 
+/** Line counts of what changed between two snapshots (binary files count 0 lines). */
+export async function numstatTrees(
+  root: string,
+  sessionId: string,
+  from: string,
+  to: string,
+): Promise<{ changed: number; insertions: number; deletions: number; paths: string[] }> {
+  const out = await shadowGit(root, sessionId, ["diff-tree", "-r", "-z", "--no-renames", "--numstat", from, to]);
+  let insertions = 0;
+  let deletions = 0;
+  const paths: string[] = [];
+  // -z numstat: "<ins>\t<del>\t<path>\0" per file ("-" for binary).
+  for (const rec of out.split("\0")) {
+    const m = /^(\d+|-)\t(\d+|-)\t([\s\S]+)$/.exec(rec);
+    if (!m) continue;
+    if (m[1] !== "-") insertions += Number(m[1]);
+    if (m[2] !== "-") deletions += Number(m[2]);
+    paths.push(m[3]!);
+  }
+  return { changed: paths.length, insertions, deletions, paths };
+}
+
 /** One path's change between two snapshots. */
 export interface TreeChange {
   /** A = only in `to`; D = only in `from`; M = content or mode differs; T = type differs. */

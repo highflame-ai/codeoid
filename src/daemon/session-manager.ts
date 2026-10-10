@@ -13,6 +13,8 @@ import { homedir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { type ForkPoint, RewindError, SendStoppedError, Session, type AttachedClient, type WindowScope } from "./session.js";
 import { sweepCheckpoints } from "./checkpoints.js";
+import type { CompareRunRow } from "./store.js";
+import { type CompareState, type CompareTargetState, type ErrorCode, LIMITS } from "../protocol/types.js";
 import { type CatalogEntry, isPlaceholderModel, type SessionProvider } from "./providers/interface.js";
 import {
   createDefaultProviderRegistry,
@@ -302,6 +304,9 @@ const RESUME_DEADLINE_MS = 20_000;
  * 20 MiB / 5000 messages — parsing history past that would be evicted on
  * arrival, so cap the read slightly above the scrollback byte cap. */
 const RESUME_TRANSCRIPT_MAX_BYTES = 24 * 1024 * 1024;
+/** A comparison that can't start for a reason the caller can act on (#357). */
+class CompareAbort extends Error {}
+
 /**
  * Transcript rows of a fork from an earlier turn (#356): everything up to the
  * first row, after the chosen turn's last one, that belongs to a turn the fork
@@ -441,6 +446,10 @@ export class SessionManager {
     // phase there would guillotine it mid-work (the bug this used to cause).
     // A tool approval is a tool-level interaction; the phase resumes once the
     // tool is approved and the turn goes on to actually rest (idle).
+    // A comparison branch whose compared turn just settled: freeze its result (#357).
+    if ((status === "idle" || status === "error") && this.#compareBranchOf.has(sessionId)) {
+      void this.#settleCompareBranch(sessionId);
+    }
     if (status === "idle" || status === "error") {
       const waiter = this.#phaseWaiters.get(sessionId);
       if (waiter) {
@@ -1154,6 +1163,14 @@ mcpHub: this.#mcpHub,
         return this.#sessionTurns(msg, auth);
       case "session.rewind":
         return this.#sessionRewind(msg, auth);
+      case "session.compare":
+        return this.#sessionCompare(msg, auth);
+      case "compare.get":
+        return this.#compareGet(msg, auth);
+      case "compare.list":
+        return this.#compareList(msg, auth);
+      case "compare.keep":
+        return this.#compareKeep(msg, auth, client);
       case "skill.grant":
         return this.#skillGrant(msg, auth);
       case "mcp.oauth.begin":
@@ -3458,6 +3475,24 @@ mcpHub: this.#mcpHub,
     // Fork from an earlier turn (#356): the conversation, turn list and files
     // as they were right after it. Otherwise the WHOLE conversation — after a
     // restart memory may hold only its tail.
+    // The parent's pack, re-resolved now rather than reused: a pack the
+    // operator has since untrusted or removed must not ride along into a fork
+    // (its skills); and a fork that can't carry it is refused — never quietly
+    // dropped, which would lose a capability role's tool deny.
+    let forkPack: PackActivation | undefined;
+    const parentPack = parent.packActivation;
+    if (parentPack) {
+      try {
+        forkPack = this.#packs.resolveActivation(parentPack.id, parentPack.roleName);
+      } catch (e) {
+        return {
+          type: "response.error",
+          requestId: msg.id,
+          error: `This session runs under pack "${parentPack.id}", which can't be activated any more (${e instanceof Error ? e.message : String(e)}) — so it can't be forked.`,
+          code: "invalid_request",
+        };
+      }
+    }
     let point: ForkPoint | null = null;
     if (msg.afterTurnId && msg.baseBranch) {
       // A clean base and "the files as they were after turn N" contradict
@@ -3660,6 +3695,9 @@ mcpHub: this.#mcpHub,
           mode: parent.mode,
           ...(parent.turnsRemaining !== undefined ? { maxTurns: parent.turnsRemaining } : {}),
         },
+        // ...and its pack: a capability role's tool deny is part of that trust
+        // (a fork of a read-only session must stay read-only).
+        ...(forkPack ? { pack: forkPack } : {}),
         identityManager: this.#identityManager,
         memory: this.#memory,
         memoryMcp: this.#memoryMcp,
@@ -5406,6 +5444,328 @@ mcpHub: this.#mcpHub,
     return { type: "session.turns.result", requestId: msg.id, sessionId: session.id, turns, checkpointsSupported };
   }
 
+  // ── Side-by-side comparisons (#357) ────────────────────────────────────
+  //
+  // Pure orchestration over existing primitives — N × session.fork (each its
+  // own worktree and backend/model, optionally from an earlier turn), then the
+  // same prompt to each — so it works with every backend. The record lives in
+  // the store. While a branch's compared turn runs, its live status comes from
+  // its session; when that turn settles, what it did (reply, files, cost,
+  // time — of that turn alone) is frozen into the record, so carrying on in a
+  // branch later never changes the comparison.
+
+  /** Comparisons with a branch not yet settled, by id: the one copy every update goes through. */
+  #liveCompares = new Map<string, CompareRunRow>();
+  /** Branch session → its live comparison, to freeze its result when it settles. */
+  #compareBranchOf = new Map<string, string>();
+  /** Branches whose result is being frozen right now (between leaving #compareBranchOf and saving). */
+  #compareSettling = new Set<string>();
+
+  async #sessionCompare(
+    msg: Extract<ClientMessage, { type: "session.compare" }>,
+    auth: AuthContext,
+  ): Promise<DaemonMessage> {
+    const refuse = (error: string, code: ErrorCode = "invalid_request"): DaemonMessage => ({ type: "response.error", requestId: msg.id, error, code });
+    for (const scope of [SCOPES.SESSION_CREATE, SCOPES.SESSION_SEND]) {
+      if (!hasScope(auth.scopes as string[], scope)) return refuse(`Missing scope: ${scope}`, "forbidden");
+    }
+    const parent = this.#getOwnedSession(msg.sessionId, auth);
+    if (!parent) return refuse("Session not found", "not_found");
+    if (parent.role) return refuse(`Cannot compare from a ${parent.role} session`);
+    // Every branch must start from the same conversation and files.
+    if (parent.status === "thinking" || parent.status === "tool_running" || parent.status === "waiting_approval") {
+      return refuse("The session is working — compare once it's done, so every branch starts from the same point.");
+    }
+    const unknown = msg.targets.find((t) => !this.#providers.has(t.providerId));
+    if (unknown) return refuse(`Unknown provider "${unknown.providerId}" — available: ${this.#providers.ids().join(", ")}`);
+    // A model id, never a flag or control text (it can reach a backend CLI's argv).
+    const badModel = msg.targets.find(
+      (t) =>
+        t.model !== undefined &&
+        (!/^[\w.:/@+][\w.:/@+-]*$/.test(t.model) || t.model.includes("..") || resolveModelIdForProvider(t.model, t.providerId) === null),
+    );
+    if (badModel) return refuse(`Model "${badModel.model}" isn't available on ${badModel.providerId}`);
+    // Agents sharing one folder would edit each other's files.
+    if (!(await isGitRepo(parent.workdir))) {
+      return refuse("Compare needs a git repository: each branch runs in its own worktree, so they can't edit each other's files.");
+    }
+    const label = (t: { providerId: string; model?: string }) => `${t.providerId}${t.model ? `:${t.model}` : ""}`;
+
+    // Fork every branch first (one at a time: forks share the parent's
+    // worktree setup and rate limiter); any failure rolls back the ones made.
+    const targets: CompareRunRow["targets"] = [];
+    const created: Session[] = [];
+    try {
+      for (const spec of msg.targets) {
+        const forked = await this.#fork(
+          {
+            type: "session.fork",
+            id: msg.id,
+            sessionId: parent.id,
+            providerId: spec.providerId,
+            name: `${parent.name} ⚖ ${label(spec)}`.slice(0, LIMITS.NAME_MAX),
+            ...(msg.afterTurnId ? { afterTurnId: msg.afterTurnId } : {}),
+          },
+          auth,
+        );
+        if (forked.type !== "response.ok") {
+          throw new CompareAbort(`${label(spec)}: ${forked.type === "response.error" ? forked.error : "could not create the branch"}`);
+        }
+        const session = this.#sessions.get((forked.data as { id: string }).id)!;
+        created.push(session);
+        if (!session.toInfo().worktree?.createdByCodeoid) {
+          throw new CompareAbort(`${label(spec)}: it couldn't get its own git worktree, so the branches would edit each other's files`);
+        }
+        if (spec.model) {
+          const applied = await session.overrideModel(spec.model);
+          if (!applied) throw new CompareAbort(`model "${spec.model}" isn't available on ${spec.providerId}`);
+          try {
+            this.#store.setSessionModel(session.id, applied.applied, null);
+          } catch {
+            // in-memory model governs this lifetime
+          }
+        }
+        targets.push({ providerId: spec.providerId, ...(spec.model ? { model: spec.model } : {}), sessionId: session.id });
+      }
+    } catch (err) {
+      // Roll back what this request made — no half-made comparison left behind.
+      for (const s of created) {
+        await s.destroy(auth, { deleteBranch: true }).catch(() => {});
+        this.#sessions.delete(s.id);
+      }
+      const reason = err instanceof Error ? err.message : String(err);
+      this.#store.audit(auth.sub, "session.compare.failed", parent.id, `targets=${msg.targets.map(label).join(",")} reason=${reason.slice(0, 200)}`);
+      return refuse(`Couldn't start the comparison — ${reason}`, err instanceof CompareAbort ? "invalid_request" : "internal");
+    }
+
+    const row: CompareRunRow = {
+      id: randomUUID(),
+      accountId: parent.accountId,
+      projectId: parent.projectId,
+      parentSessionId: parent.id,
+      ...(msg.afterTurnId ? { afterTurnId: msg.afterTurnId } : {}),
+      prompt: msg.prompt,
+      targets,
+      createdBy: auth.sub,
+      createdAt: new Date().toISOString(),
+    };
+    this.#liveCompares.set(row.id, row);
+    for (const t of targets) this.#compareBranchOf.set(t.sessionId!, row.id);
+    this.#store.saveCompareRun(row);
+    this.#store.audit(auth.sub, "session.compare", parent.id, `compare=${row.id} targets=${targets.map(label).join(",")}`);
+
+    // Start every branch at once, and answer now: a send can wait on a fork's
+    // setup and its snapshot, longer than a client waits for a reply.
+    for (const t of targets) {
+      const session = this.#sessions.get(t.sessionId!)!;
+      session.send(msg.prompt, auth).then(
+        () => {
+          t.baseTurnId = session.turnIndex.at(-1)?.turnId;
+          this.#store.updateCompareRun(row);
+          if (session.status === "idle" || session.status === "error") void this.#settleCompareBranch(session.id);
+        },
+        (err: unknown) => {
+          if (!(err instanceof SendStoppedError)) session.reportSendFailure(err);
+          t.error = err instanceof Error ? err.message : String(err);
+          this.#compareBranchOf.delete(session.id);
+          this.#store.updateCompareRun(row);
+          this.#retireCompareIfSettled(row);
+        },
+      );
+    }
+    return { type: "compare.state", requestId: msg.id, compare: this.#compareStateOf(row) };
+  }
+
+  /**
+   * Freeze what a branch's compared turn did, once it has settled (idle or
+   * error). Once per branch; waits for that turn's end snapshot so the file
+   * counts are final.
+   */
+  async #settleCompareBranch(sessionId: string): Promise<void> {
+    const compareId = this.#compareBranchOf.get(sessionId);
+    const row = compareId ? this.#liveCompares.get(compareId) : undefined;
+    const t = row?.targets.find((x) => x.sessionId === sessionId);
+    const s = this.#sessions.get(sessionId);
+    if (!row || !t || !s || !t.baseTurnId || t.result) return;
+    if (s.status !== "idle" && s.status !== "error") return;
+    this.#compareBranchOf.delete(sessionId);
+    this.#compareSettling.add(sessionId);
+    try {
+      await this.#freezeBranch(t, s);
+    } finally {
+      this.#compareSettling.delete(sessionId);
+    }
+    this.#store.updateCompareRun(row);
+    this.#retireCompareIfSettled(row);
+  }
+
+  async #freezeBranch(t: CompareRunRow["targets"][number], s: Session): Promise<void> {
+    const turnId = t.baseTurnId!;
+    const status: "idle" | "error" = s.status === "error" ? "error" : "idle";
+    // Nothing after the compared turn yet: the branch's totals are that turn's
+    // (a fork starts with none). Read before awaiting — the user may go on.
+    const usage = s.currentTurnId === turnId ? s.toInfo().usage : undefined;
+    const error = status === "error" ? (s.lastTurnError ?? undefined) : undefined;
+    const reply = s.turnReply(turnId);
+    const files = await s.turnFiles(turnId).catch(() => undefined);
+    t.result = {
+      status,
+      ...(error ? { error } : {}),
+      ...(reply ? { reply: reply.length > 4_000 ? `${reply.slice(0, 3_999)}…` : reply } : {}),
+      ...(usage
+        ? { costUsd: usage.totalCostUsd, durationMs: usage.durationMs, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens }
+        : {}),
+      ...(files ? { files: { ...files, paths: files.paths.slice(0, 200) } } : {}),
+    };
+  }
+
+  /** Drop a comparison from the live set once no branch can still settle. */
+  #retireCompareIfSettled(row: CompareRunRow): void {
+    if (this.#liveCompares.get(row.id) !== row) return;
+    const pending = (t: CompareRunRow["targets"][number]) =>
+      !!t.sessionId && !t.result && (this.#compareBranchOf.has(t.sessionId) || this.#compareSettling.has(t.sessionId));
+    if (!row.targets.some(pending)) this.#liveCompares.delete(row.id);
+  }
+
+  /** A destroyed branch can't settle any more: stop waiting for it (it reads as "gone"). */
+  #forgetCompareBranch(sessionId: string): void {
+    const compareId = this.#compareBranchOf.get(sessionId);
+    if (!compareId) return;
+    this.#compareBranchOf.delete(sessionId);
+    const row = this.#liveCompares.get(compareId);
+    if (row) this.#retireCompareIfSettled(row);
+  }
+
+  /** A destroyed session's comparisons leave memory too (the store drops their rows). */
+  #forgetComparesOf(parentSessionId: string): void {
+    for (const [id, row] of this.#liveCompares) {
+      if (row.parentSessionId !== parentSessionId) continue;
+      this.#liveCompares.delete(id);
+      for (const t of row.targets) if (t.sessionId && this.#compareBranchOf.get(t.sessionId) === id) this.#compareBranchOf.delete(t.sessionId);
+    }
+  }
+
+  /**
+   * The comparison to read or change: the live copy when it has one, else the
+   * stored record — re-adopted as live when a branch settled without anyone
+   * watching (e.g. across a restart), so its result still gets frozen.
+   */
+  #compareRow(compareId: string, auth: AuthContext): CompareRunRow | null {
+    const live = this.#liveCompares.get(compareId);
+    if (live) return live.accountId === (auth.accountId ?? "") && live.projectId === (auth.projectId ?? "") ? live : null;
+    const row = this.#store.getCompareRun(compareId, auth.accountId ?? "", auth.projectId ?? "");
+    if (!row) return null;
+    const pending = row.targets.filter(
+      (t) => t.sessionId && t.baseTurnId && !t.result && this.#sessions.has(t.sessionId) && !this.#compareSettling.has(t.sessionId),
+    );
+    if (pending.length > 0) {
+      this.#liveCompares.set(row.id, row);
+      for (const t of pending) this.#compareBranchOf.set(t.sessionId!, row.id);
+    }
+    return row;
+  }
+
+  /** A comparison's view: frozen results for settled branches, live status for the rest. */
+  #compareStateOf(row: CompareRunRow): CompareState {
+    const targets: CompareTargetState[] = row.targets.map((t) => {
+      const base = { providerId: t.providerId, ...(t.model ? { model: t.model } : {}) };
+      if (!t.sessionId) return { ...base, status: "failed", done: true, ...(t.error ? { error: t.error } : {}) };
+      const s = this.#sessions.get(t.sessionId);
+      if (t.result) {
+        const { status, ...rest } = t.result;
+        return { ...base, sessionId: t.sessionId, status: s ? status : "gone", done: true, ...rest };
+      }
+      if (!s) return { ...base, sessionId: t.sessionId, status: "gone", done: true, ...(t.error ? { error: t.error } : {}) };
+      if (t.error && !t.baseTurnId) return { ...base, sessionId: t.sessionId, status: "failed", done: true, error: t.error };
+      // Never started, and nothing will start it now (only a live comparison
+      // has sends in flight — a daemon restart dropped them).
+      if (!t.baseTurnId && !this.#liveCompares.has(row.id)) {
+        return { ...base, sessionId: t.sessionId, status: "failed", done: true, error: "it didn't start (the daemon restarted before its prompt ran)" };
+      }
+      return { ...base, sessionId: t.sessionId, status: s.status, done: false };
+    });
+    return {
+      compareId: row.id,
+      parentSessionId: row.parentSessionId,
+      prompt: row.prompt,
+      ...(row.afterTurnId ? { afterTurnId: row.afterTurnId } : {}),
+      createdAt: row.createdAt,
+      createdBy: row.createdBy,
+      ...(row.keptSessionId ? { keptSessionId: row.keptSessionId } : {}),
+      targets,
+    };
+  }
+
+  #canRead(auth: AuthContext): boolean {
+    return hasScope(auth.scopes as string[], SCOPES.SESSION_ATTACH) || hasScope(auth.scopes as string[], SCOPES.SESSION_WATCH);
+  }
+
+  async #compareGet(msg: Extract<ClientMessage, { type: "compare.get" }>, auth: AuthContext): Promise<DaemonMessage> {
+    if (!this.#canRead(auth)) {
+      return { type: "response.error", requestId: msg.id, error: "Missing scope: session:attach or session:watch", code: "forbidden" };
+    }
+    const row = this.#compareRow(msg.compareId, auth);
+    if (!row) return { type: "response.error", requestId: msg.id, error: "Comparison not found", code: "not_found" };
+    // A branch that has settled but isn't frozen yet: freeze it now, so the
+    // answer is final rather than "done, results to follow".
+    await Promise.all(row.targets.filter((t) => t.sessionId && !t.result).map((t) => this.#settleCompareBranch(t.sessionId!)));
+    return { type: "compare.state", requestId: msg.id, compare: this.#compareStateOf(row) };
+  }
+
+  #compareList(msg: Extract<ClientMessage, { type: "compare.list" }>, auth: AuthContext): DaemonMessage {
+    if (!this.#canRead(auth)) {
+      return { type: "response.error", requestId: msg.id, error: "Missing scope: session:attach or session:watch", code: "forbidden" };
+    }
+    const parent = this.#getOwnedSession(msg.sessionId, auth);
+    if (!parent) return { type: "response.error", requestId: msg.id, error: "Session not found", code: "not_found" };
+    // Cheap by design (no git, no waiting): stored results and live statuses.
+    const rows = this.#store.listCompareRuns(parent.id, parent.accountId, parent.projectId);
+    const compares = rows.map((r) => this.#compareStateOf(this.#liveCompares.get(r.id) ?? r));
+    return { type: "compare.list.result", requestId: msg.id, sessionId: parent.id, compares };
+  }
+
+  async #compareKeep(
+    msg: Extract<ClientMessage, { type: "compare.keep" }>,
+    auth: AuthContext,
+    client: AttachedClient,
+  ): Promise<DaemonMessage> {
+    const refuse = (error: string, code: ErrorCode = "invalid_request"): DaemonMessage => ({ type: "response.error", requestId: msg.id, error, code });
+    if (!hasScope(auth.scopes as string[], SCOPES.SESSION_SEND)) return refuse("Missing scope: session:send", "forbidden");
+    if (msg.discardOthers && !hasScope(auth.scopes as string[], SCOPES.SESSION_DESTROY)) {
+      return refuse("Missing scope: session:destroy (needed to discard the others)", "forbidden");
+    }
+    const row = this.#compareRow(msg.compareId, auth);
+    if (!row) return refuse("Comparison not found", "not_found");
+    // One keep per comparison: a second "keep, discard others" would destroy
+    // the branch kept first — and whatever was done in it since.
+    if (row.keptSessionId && row.keptSessionId !== msg.sessionId) return refuse("This comparison already kept another branch");
+    const target = row.targets.find((t) => t.sessionId === msg.sessionId);
+    const session = target ? this.#getOwnedSession(msg.sessionId, auth) : null;
+    if (!target || !target.baseTurnId || !session) {
+      return refuse("That isn't a branch you can keep — it never ran the prompt, or is gone");
+    }
+    if (session.status === "thinking" || session.status === "tool_running" || session.status === "waiting_approval") {
+      return refuse("That branch is still working — keep it once it's done");
+    }
+    row.keptSessionId = msg.sessionId;
+    this.#store.updateCompareRun(row);
+    const notDiscarded: string[] = [];
+    if (msg.discardOthers) {
+      for (const t of row.targets) {
+        if (!t.sessionId || t.sessionId === msg.sessionId || !this.#sessions.has(t.sessionId)) continue;
+        const r = await this.handle({ type: "session.destroy", id: msg.id, sessionId: t.sessionId }, auth, client);
+        if (r.type !== "response.ok") notDiscarded.push(t.sessionId);
+      }
+    }
+    this.#store.audit(
+      auth.sub,
+      "compare.keep",
+      msg.sessionId,
+      `compare=${row.id} discardOthers=${msg.discardOthers === true}${notDiscarded.length ? ` notDiscarded=${notDiscarded.join(",")}` : ""}`,
+    );
+    return { type: "compare.state", requestId: msg.id, compare: this.#compareStateOf(row) };
+  }
+
   /**
    * Go back a turn (#355). Same authority as sending a message: taking a
    * turn back is a way of steering the session, and restoring files only
@@ -6167,6 +6527,8 @@ mcpHub: this.#mcpHub,
     }
 
     await session.destroy(auth);
+    this.#forgetComparesOf(msg.sessionId);
+    this.#forgetCompareBranch(msg.sessionId);
     // Covers destroying a CHILD directly (not via goal teardown) — without
     // this its token stays live in the endpoint's binding map and keeps
     // authorizing reads/writes on the goal after the session is gone.
