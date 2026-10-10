@@ -59,6 +59,7 @@ import type {
 } from "../protocol/types.js";
 import { dirname, join } from "node:path";
 import { createHash } from "node:crypto";
+import { realpathSync } from "node:fs";
 import { lstat, readdir } from "node:fs/promises";
 import { removeForkWorktree } from "./git-worktree.js";
 import {
@@ -504,8 +505,6 @@ export interface ForkPoint {
   history: readonly CanonicalTurn[];
   /** The turn list through the chosen turn. */
   entries: TurnIndexEntry[];
-  /** Turns after it, which the fork doesn't carry. */
-  laterTurnIds: string[];
   /** 1-based position of the chosen turn (the "forked after prompt N" chip). */
   atTurn: number;
   /**
@@ -3246,6 +3245,9 @@ export class Session {
       });
     }
     await this.#seedProviderFromHistory();
+    // Brand-new backend: if the daemon restarts before the fork's first
+    // prompt, resume must re-seed it, not try to resume nothing.
+    if (history.length > 0) this.#markBackingFresh(true);
     if (note) {
       const msg = this.#makeMessage("info", note, SYSTEM_IDENTITY, undefined, undefined, {
         event: "fork.workdir",
@@ -5437,7 +5439,11 @@ export class Session {
    * turn by a bounded amount; if the turn starts first, the snapshot is
    * recorded as `late`. Never throws.
    */
-  async #checkpointTurn(turnId: string, waitMs?: number, opts: { onlyIfMissing?: boolean } = {}): Promise<void> {
+  async #checkpointTurn(
+    turnId: string,
+    waitMs?: number,
+    opts: { onlyIfMissing?: boolean; lateWhen?: () => boolean } = {},
+  ): Promise<void> {
     if (!this.#checkpointsEnabled() || this.#destroyed) return;
     const cfg = this.#config?.session.checkpoints;
     let started = false;
@@ -5449,7 +5455,9 @@ export class Session {
         workdir: this.workdir,
         sessionId: this.id,
         turnId,
-        isLate: () => started,
+        // Late = the agent may have been editing while it was taken: for a
+        // start snapshot, past its wait; for an end one, the next turn began.
+        isLate: opts.lateWhen ?? (() => started),
         excludeDirs: this.#protectedDirs(),
         limits: this.#checkpointLimits(),
         ...(opts.onlyIfMissing ? { onlyIfMissing: true } : {}),
@@ -5492,7 +5500,7 @@ export class Session {
     const turnId = this.#currentTurnId;
     if (!turnId || turnId === this.#endSnapshotTurn || !this.#turnIndex.some((e) => e.turnId === turnId)) return;
     this.#endSnapshotTurn = turnId;
-    void this.#checkpointTurn(endSnapshotId(turnId), 0, { onlyIfMissing: true });
+    void this.#checkpointTurn(endSnapshotId(turnId), 0, { onlyIfMissing: true, lateWhen: () => this.#currentTurnId !== turnId });
   }
 
   /** Remove a snapshot taken for a turn that never started. Never throws. */
@@ -5581,9 +5589,17 @@ export class Session {
    * all of it comes from codeoid's own records.
    */
   async forkPoint(turnId: string): Promise<ForkPoint> {
-    const pos = this.#turnIndex.findIndex((e) => e.turnId === turnId);
+    // One copy of the turn list: a rewind during the awaits below must not
+    // make the turns and the conversation disagree.
+    const index = this.#turnIndex.map((e) => ({ ...e }));
+    const pos = index.findIndex((e) => e.turnId === turnId);
     if (pos === -1) throw new RewindError("not_found", "That turn isn't in this session (or is older than its turn list).");
-    const later = new Set(this.#turnIndex.slice(pos + 1).map((e) => e.turnId));
+    // A running turn has no reply yet (it lands at the turn's end) and its
+    // files are mid-edit: there is no "right after it" to fork from.
+    if (turnId === this.#currentTurnId && (this.#turnActive() || this.#status === "thinking" || this.#status === "tool_running" || this.#status === "waiting_approval")) {
+      throw new RewindError("busy", "That turn is still running — fork from it once it finishes.");
+    }
+    const later = new Set(index.slice(pos + 1).map((e) => e.turnId));
     const history = await this.fullCanonicalHistory();
     // A turn before a context rotation is still listed, but its conversation
     // was dropped by the rotation: a fork from it would start empty. Say so.
@@ -5595,12 +5611,15 @@ export class Session {
     }
     let cut = history.findIndex((t) => t.turnId !== undefined && later.has(t.turnId));
     if (cut === -1) cut = history.length;
-    const nextTurnId = this.#turnIndex[pos + 1]?.turnId;
+    const nextTurnId = index[pos + 1]?.turnId;
     let files: ForkPoint["files"];
     // The latest turn (no next one): an ordinary fork — the live files ARE
     // "right after it", hand edits since included; no snapshot involved.
     if (nextTurnId && this.#checkpointsEnabled()) {
-      const records = await listCheckpoints(this.#checkpointRoot, this.id);
+      // The snapshot that's wanted may still be being written (an end
+      // snapshot is fire-and-forget): wait for it, in line with snapshots.
+      await Promise.allSettled([...this.#pendingCheckpoints]);
+      const records = await this.#serializedCheckpointOp(() => listCheckpoints(this.#checkpointRoot, this.id));
       const endId = endSnapshotId(turnId);
       const pick = records.has(endId) ? endId : records.has(nextTurnId) ? nextTurnId : undefined;
       const rec = pick ? records.get(pick) : undefined;
@@ -5609,7 +5628,7 @@ export class Session {
           ? {
               checkpointId: pick,
               ...(rec.head ? { head: rec.head } : {}),
-              ...(pick === nextTurnId && rec.late ? { late: true } : {}),
+              ...(rec.late ? { late: true } : {}),
             }
           : { unavailable: "there is no snapshot of the files from right after that turn" };
     } else if (nextTurnId) {
@@ -5617,8 +5636,7 @@ export class Session {
     }
     return {
       history: history.slice(0, cut),
-      entries: this.#turnIndex.slice(0, pos + 1).map((e) => ({ ...e })),
-      laterTurnIds: [...later],
+      entries: index.slice(0, pos + 1),
       atTurn: pos + 1,
       ...(files ? { files } : {}),
     };
@@ -5630,7 +5648,26 @@ export class Session {
    * step git restore as going back; files ignored under that snapshot's
    * rules are left alone. Serialized with snapshots. Throws on failure.
    */
-  async rollFilesTo(checkpointId: string, opts: { asEndOf?: string } = {}): Promise<{ restored: number; removed: number }> {
+  async rollFilesTo(
+    checkpointId: string,
+    opts: { asEndOf?: string; within?: string } = {},
+  ): Promise<{ restored: number; removed: number }> {
+    // Only ever write inside the fork's own worktree, resolved — a symlinked
+    // folder must not carry the roll somewhere else.
+    if (opts.within) {
+      const real = (p: string) => {
+        try {
+          return realpathSync(p);
+        } catch {
+          return null;
+        }
+      };
+      const root = real(opts.within);
+      const here = real(this.workdir);
+      if (!root || !here || (here !== root && !here.startsWith(`${root}/`))) {
+        throw new Error("this fork's folder isn't inside its own worktree");
+      }
+    }
     const result = await this.#serializedCheckpointOp(async () => {
       const rec = (await listCheckpoints(this.#checkpointRoot, this.id)).get(checkpointId);
       if (!rec) throw new Error("that snapshot isn't available to this session");
@@ -5665,7 +5702,7 @@ export class Session {
     // The rolled files are, by definition, how that turn ended for THIS
     // session: record them as its end snapshot, so going back later in this
     // fork has its hand-edit baseline (instead of reporting false conflicts).
-    if (opts.asEndOf) await this.#checkpointTurn(endSnapshotId(opts.asEndOf), 10_000, { onlyIfMissing: true });
+    if (opts.asEndOf) await this.#checkpointTurn(endSnapshotId(opts.asEndOf), 10_000, { onlyIfMissing: true, lateWhen: () => false });
     return result;
   }
 

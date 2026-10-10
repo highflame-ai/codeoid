@@ -30,15 +30,20 @@
  */
 
 import { execFile } from "node:child_process";
-import { existsSync, mkdirSync } from "node:fs";
+import { lstatSync, mkdirSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 
 const execFileP = promisify(execFile);
 
-/** Run git in `cwd`. Generous buffer for large `worktree list` output. */
+/**
+ * Run git in `cwd`. Generous buffer for large `worktree list` output. Hooks
+ * and fsmonitor are off: the daemon runs these on the user's behalf, and a
+ * repo the agent can write to must not get code run by them (a
+ * `post-checkout` hook would fire on every fork).
+ */
 async function git(args: string[], cwd: string): Promise<string> {
-  const { stdout } = await execFileP("git", args, {
+  const { stdout } = await execFileP("git", ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", ...args], {
     cwd,
     timeout: 120_000,
     maxBuffer: 64 * 1024 * 1024,
@@ -129,7 +134,7 @@ export interface ForkWorktree {
  * locally resolvable. Rejects a ref that looks like a git flag. Returns the ref
  * (validated to resolve) to hand to `worktree add`.
  */
-async function resolveBaseRef(mainRoot: string, ref: string): Promise<string> {
+async function resolveBaseRef(mainRoot: string, ref: string, opts: { fetch?: boolean } = {}): Promise<string> {
   if (!ref || ref.startsWith("-")) throw new WorktreeError(`invalid base ref: ${JSON.stringify(ref)}`);
   const resolves = async (): Promise<boolean> => {
     try {
@@ -140,6 +145,7 @@ async function resolveBaseRef(mainRoot: string, ref: string): Promise<string> {
     }
   };
   if (await resolves()) return ref;
+  if (opts.fetch === false) throw new WorktreeError(`base commit not found: ${JSON.stringify(ref)}`);
   await git(["fetch"], mainRoot).catch(() => {}); // best-effort: base may be remote-only
   if (await resolves()) return ref;
   throw new WorktreeError(`base ref not found: ${JSON.stringify(ref)}`);
@@ -187,7 +193,8 @@ export async function createForkWorktree(opts: {
   let carriedSnapshot = false;
   if (opts.baseCommit) {
     if (!/^[0-9a-f]{40,64}$/.test(opts.baseCommit)) throw new WorktreeError("invalid base commit");
-    base = await resolveBaseRef(mainRoot, opts.baseCommit);
+    // Local when it was recorded: a miss means it's gone (gc'd), not remote.
+    base = await resolveBaseRef(mainRoot, opts.baseCommit, { fetch: false });
   } else if (opts.baseBranch) {
     base = await resolveBaseRef(mainRoot, opts.baseBranch);
   } else {
@@ -232,16 +239,19 @@ export async function createForkWorktree(opts: {
   // working in `<repo>/packages/api`, the fork should open in
   // `<worktree>/packages/api`, not the worktree root. Relative to the PARENT's
   // OWN worktree top (handles a parent that is itself a linked worktree). The
-  // existsSync guard matters for baseBranch: the base may not have that subdir.
+  // existence check matters for baseBranch: the base may not have that subdir.
+  // Every component must be a real directory INSIDE the checkout: the commit
+  // checked out may be one the agent chose (#356's recorded HEAD), and a
+  // tracked symlink in the path would point the fork — and the file roll into
+  // it — outside its worktree.
   let workdir = worktreePath;
   let subdirMapped = true;
   try {
     const parentTop = (await git(["rev-parse", "--show-toplevel"], opts.workdir)).trim();
     const rel = path.relative(parentTop, opts.workdir);
     if (rel && !rel.startsWith("..") && !path.isAbsolute(rel)) {
-      const candidate = path.join(worktreePath, rel);
-      if (!existsSync(candidate) && opts.ensureSubdir) mkdirSync(candidate, { recursive: true });
-      if (existsSync(candidate)) workdir = candidate;
+      const mapped = mapSubdir(worktreePath, rel, opts.ensureSubdir === true);
+      if (mapped) workdir = mapped;
       else subdirMapped = false;
     }
   } catch {
@@ -250,6 +260,34 @@ export async function createForkWorktree(opts: {
   }
 
   return { path: worktreePath, workdir, branch, subdirMapped };
+}
+
+/**
+ * `<root>/<rel>` when every component is a real directory (created when
+ * missing and `create`), else null — a symlink or file anywhere on the way
+ * refuses, and the result is checked to resolve inside `root`.
+ */
+function mapSubdir(root: string, rel: string, create: boolean): string | null {
+  let at = root;
+  for (const part of rel.split(path.sep)) {
+    if (!part || part === "." || part === "..") return null;
+    at = path.join(at, part);
+    let st: ReturnType<typeof lstatSync> | undefined;
+    try {
+      st = lstatSync(at);
+    } catch {
+      st = undefined;
+    }
+    if (!st) {
+      if (!create) return null;
+      mkdirSync(at); // non-recursive: the parent was just verified
+      continue;
+    }
+    if (st.isSymbolicLink() || !st.isDirectory()) return null;
+  }
+  const realRoot = realpathSync(root);
+  const real = realpathSync(at);
+  return real === realRoot || real.startsWith(realRoot + path.sep) ? at : null;
 }
 
 /**

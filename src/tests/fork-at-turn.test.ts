@@ -15,7 +15,7 @@ import type { CodeoidConfig } from "../config.js";
 import type { ProviderEvent } from "../daemon/providers/interface.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
 import { ProviderRegistry } from "../daemon/providers/registry.js";
-import { cutRowsBeforeTurns, SessionManager } from "../daemon/session-manager.js";
+import { cutRowsAfterTurn, SessionManager } from "../daemon/session-manager.js";
 import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
 import { ALL_SCOPES } from "../protocol/scopes.js";
@@ -308,6 +308,101 @@ describe("forking from an earlier turn: round-1 regressions", () => {
     expect(readFileSync(join(info.workdir, "a.txt"), "utf8")).toBe("v0\n");
   });
 
+  it("an agent-committed symlink in place of the session's folder can't carry the fork (or its file roll) outside the worktree", async () => {
+    const sub = join(repo, "sub");
+    mkdirSync(sub);
+    writeFileSync(join(sub, "f.txt"), "f0\n");
+    git("add", ".");
+    git("commit", "-qm", "sub");
+    const victim = join(tmp, "victim");
+    mkdirSync(victim);
+    writeFileSync(join(victim, "keep.txt"), "precious\n");
+    const m = newManager([
+      () => {
+        // Turn 1: edit, then commit a symlink `sub -> victim` without touching the working tree.
+        writeFileSync(join(sub, "f.txt"), "planted\n");
+        const blob = execFileSync("git", ["hash-object", "-w", "--stdin"], { cwd: repo, input: victim, encoding: "utf8" }).trim();
+        git("rm", "-r", "--cached", "-q", "sub");
+        git("update-index", "--add", "--cacheinfo", `120000,${blob},sub`);
+        git("commit", "-qm", "wip");
+      },
+      () => {
+        // Turn 2: hide it.
+        git("reset", "--soft", "HEAD~");
+        git("reset", "-q");
+      },
+    ]);
+    const id = await create(m, sub);
+    await sendAndSettle(m, id, "one");
+    await sendAndSettle(m, id, "two");
+    const info = await fork(m, id, { afterTurnId: (await turns(m, id))[0]!.turnId });
+    expect(readFileSync(join(victim, "keep.txt"), "utf8")).toBe("precious\n");
+    expect(existsSync(join(victim, "f.txt"))).toBe(false);
+    const root = info.worktree!.path;
+    expect(info.workdir === root || info.workdir.startsWith(`${root}/`)).toBe(true);
+  });
+
+  it("refuses to fork from the turn that's still running (no reply yet, files mid-edit)", async () => {
+    let during: Promise<unknown> | undefined;
+    let id = "";
+    const m = newManager([
+      undefined,
+      () => {
+        const s = m._sessionForTest(id)!;
+        const turnId = s.turnIndex.at(-1)!.turnId;
+        // As a request would: after the send has started the turn.
+        during = Promise.resolve().then(() =>
+          s.forkPoint(turnId).then(
+            () => "forked",
+            (e: { code?: string }) => e.code,
+          ),
+        );
+      },
+    ]);
+    id = await create(m);
+    await sendAndSettle(m, id, "one");
+    await sendAndSettle(m, id, "two");
+    expect(await during).toBe("busy");
+    // Once it's finished, it's fine.
+    const info = await fork(m, id, { afterTurnId: (await turns(m, id))[1]!.turnId, isolate: false });
+    expect(m._sessionForTest(info.id)!.canonicalHistory.at(-1)!.content).toBe("a2");
+  });
+
+  it("still isolates (and rolls the files) when the commit recorded back then is gone", async () => {
+    const m = newManager([
+      () => {
+        writeFileSync(join(repo, "a.txt"), "v1\n");
+        git("commit", "-qam", "doomed");
+      },
+      () => {
+        git("reset", "-q", "--hard", "HEAD~");
+        git("reflog", "expire", "--expire=now", "--all");
+        git("gc", "-q", "--prune=now");
+        writeFileSync(join(repo, "a.txt"), "v2\n");
+      },
+    ]);
+    const id = await create(m);
+    await sendAndSettle(m, id, "one");
+    await sendAndSettle(m, id, "two");
+    const info = await fork(m, id, { afterTurnId: (await turns(m, id))[0]!.turnId });
+    expect(info.worktree?.createdByCodeoid).toBe(true);
+    expect(info.workdir).not.toBe(repo);
+    expect(readFileSync(join(info.workdir, "a.txt"), "utf8")).toBe("v1\n");
+    const notes = replayOf(m, info.id).map((r) => String(r.content ?? ""));
+    expect(notes.some((t) => t.includes("no longer exists"))).toBe(true);
+  });
+
+  it("marks the fork's backend fresh, so a restart before its first prompt re-seeds it", async () => {
+    const m = newManager();
+    const id = await create(m);
+    await sendAndSettle(m, id, "one");
+    await sendAndSettle(m, id, "two");
+    const info = await fork(m, id, { afterTurnId: (await turns(m, id))[0]!.turnId, isolate: false });
+    await transcript.flush();
+    const meta = JSON.parse(readFileSync(transcript.metaPath(info.id), "utf8")) as { backingFresh?: boolean };
+    expect(meta.backingFresh).toBe(true);
+  });
+
   it("going back later in the fork has its baseline (no false conflicts)", async () => {
     const m = newManager([() => writeFileSync(join(repo, "a.txt"), "after one\n"), () => writeFileSync(join(repo, "a.txt"), "after two\n")]);
     const id = await create(m);
@@ -325,14 +420,19 @@ describe("forking from an earlier turn: round-1 regressions", () => {
   });
 });
 
-describe("cutRowsBeforeTurns", () => {
+describe("cutRowsAfterTurn", () => {
   const row = (id: string, turnId?: string) => ({ message: { type: "session.message", messageId: id, ...(turnId ? { turnId } : {}) } as unknown as DaemonMessage });
-  it("cuts at the first row of the first later turn, notices between turns going with what came after", () => {
-    const out = cutRowsBeforeTurns([row("a", "T1"), row("b", "T1"), row("note"), row("c", "T2"), row("d", "T3")], ["T2", "T3"]);
-    expect(out.map((r) => (r.message as { messageId: string }).messageId)).toEqual(["a", "b", "note"]);
+  const ids = (rows: Array<{ message: DaemonMessage }>) => rows.map((r) => (r.message as { messageId: string }).messageId);
+  it("cuts at the first row of a turn it doesn't carry, notices between turns going with the chosen one", () => {
+    expect(ids(cutRowsAfterTurn([row("a", "T1"), row("b", "T1"), row("note"), row("c", "T2"), row("d", "T3")], ["T1"], "T1"))).toEqual(["a", "b", "note"]);
   });
-  it("keeps everything when no later turn is given or loaded", () => {
-    expect(cutRowsBeforeTurns([row("a", "T1")], [])).toHaveLength(1);
-    expect(cutRowsBeforeTurns([row("a", "T1")], ["T9"])).toHaveLength(1);
+  it("cuts a turn started while the fork was being built (not in the fork's turn list)", () => {
+    expect(ids(cutRowsAfterTurn([row("a", "T1"), row("b", "T2"), row("c", "T9")], ["T1", "T2"], "T2"))).toEqual(["a", "b"]);
+  });
+  it("never splits off rows inside the chosen turn, whatever they're stamped with", () => {
+    expect(ids(cutRowsAfterTurn([row("a", "T1"), row("odd", "X"), row("b", "T1"), row("c", "T2")], ["T1"], "T1"))).toEqual(["a", "odd", "b"]);
+  });
+  it("keeps everything when nothing later is loaded", () => {
+    expect(cutRowsAfterTurn([row("a", "T1")], ["T1"], "T1")).toHaveLength(1);
   });
 });

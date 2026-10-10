@@ -1,8 +1,8 @@
 /**
- * Fork from here (#356): branch a session from an earlier message into a new
- * session that carries the conversation up to that point — its reply
- * included, nothing after — and, in its own worktree, the files as they were
- * right after it. Optionally on another backend. Opened from a message's
+ * Fork from here (#356): branch a session from an earlier turn into a new
+ * session that carries the conversation through the end of that turn — its
+ * whole reply included, nothing after — and, in its own worktree, the files as
+ * they were right after it. Optionally on another backend. Opened from a message's
  * "fork from here" action. The daemon does the work; this only asks.
  */
 
@@ -99,12 +99,12 @@ const ForkFromHereModal: Component = () => {
             </button>
           </header>
           <p class="mb-3 text-[13px] text-fg-muted">
-            A new session with the conversation up to and including this point — nothing after it. This session is left as it is.
+            A new session with the conversation through the end of this turn — this prompt and everything the agent did in reply, nothing after it. This session is left as it is.
           </p>
           <label class="mb-3 flex items-start gap-2 text-[13px] text-fg">
             <input type="checkbox" class="mt-0.5" checked={isolate()} onChange={(e) => setIsolate(e.currentTarget.checked)} />
             <span>
-              Its own git worktree, with the files as they were right after this point
+              Its own git worktree, with the files as they were at the end of this turn
               <span class="block text-[11px] text-fg-faint">Off: share this session's folder (files stay as they are now).</span>
             </span>
           </label>

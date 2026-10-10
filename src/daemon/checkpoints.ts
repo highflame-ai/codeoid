@@ -330,6 +330,13 @@ export async function createCheckpoint(opts: {
       await prune(shadow, keep, t, { reclaimNow: true }).catch(() => {});
       if (keep === 0) break;
     }
+    // The user repo's HEAD, so a fork from this point can start from the same
+    // commit. Read BEFORE the files: a commit landing mid-snapshot then shows
+    // as the files' uncommitted edits, never as reverts of a newer commit.
+    // rev-parse only reads (no hooks, fsmonitor off).
+    const head = await run(["rev-parse", "--verify", "-q", "HEAD^{commit}"], { cwd: opts.workdir, env: gitEnv({}), timeoutMs: t })
+      .then((o) => o.trim())
+      .catch(() => "");
     const staged = await stageWorkTree(shadow, opts.workdir, limits, opts.excludeDirs);
     if (!staged.ok) return staged;
     const late = opts.isLate?.() === true;
@@ -339,11 +346,6 @@ export async function createCheckpoint(opts: {
     const sha = (await run(["commit-tree", tree, "-F", "-"], { cwd: opts.workdir, env, timeoutMs: t, input: message })).trim();
     const shadowEnv = gitEnv({ GIT_DIR: shadow });
     await run(["update-ref", `refs/turns/${opts.turnId}`, sha], { cwd: shadow, env: shadowEnv, timeoutMs: t });
-    // The user repo's HEAD at this moment, so a fork from this point can start
-    // from the same commit. rev-parse only reads (no hooks, fsmonitor off).
-    const head = await run(["rev-parse", "--verify", "-q", "HEAD^{commit}"], { cwd: opts.workdir, env: gitEnv({}), timeoutMs: t })
-      .then((o) => o.trim())
-      .catch(() => "");
     await appendFile(
       path.join(shadow, "turns.log"),
       orderLine({ turnId: opts.turnId, sha, late, ...(/^[0-9a-f]{40,64}$/.test(head) ? { head } : {}) }),

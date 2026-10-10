@@ -86,7 +86,7 @@ const Header: Component<{ msg: SessionMessage }> = (props) => (
         <button
           type="button"
           class="rounded border border-border px-1.5 font-mono text-[10px] text-fg-faint hover:border-accent/40 hover:text-fg"
-          title="Fork from here: a new session with the conversation up to and including this point, optionally on another backend"
+          title="Fork from here: a new session with the conversation through the end of this turn (this prompt and the agent's whole reply), optionally on another backend"
           onClick={() => openForkFromHere(props.msg.sessionId, props.msg.turnId!)}
         >
           ⑃ fork from here
