@@ -115,6 +115,13 @@ When configured, Claude coding agents and their sub-agents get ZeroID identities
 - Scope attenuation: sub-agents get a subset of parent's scopes
 - Cascading revocation: deactivate parent -> all sub-agents revoked
 
+### Turns and checkpoints
+Every prompt, and everything the agent does in reply, belongs to one turn with a stable `turnId` (on each `SessionMessage`; listed by `session.turns`).
+A message sent mid-turn joins the running turn.
+At the start of each turn the working directory is snapshotted into a daemon-owned shadow git repo (`<transcriptDir>/checkpoints/<session>.git`, self-contained, never the user's repo; secrets and dependency dirs excluded; works without git).
+The backend-neutral canonical history is persisted per session (`<id>.canonical.jsonl`) so forks, backend switches and stateless backends keep the conversation across a daemon restart.
+All of it is backend-agnostic: nothing depends on a provider's native session.
+
 ### Device Handoff
 Sessions live in the daemon. Clients are stateless.
 - **Scrollback buffer**: circular ring (500 entries / 1MB) replayed on attach
@@ -251,5 +258,7 @@ Config file at `~/.codeoid/config.json` (optional). Env vars take precedence.
 Data stored at:
 - `~/.codeoid/codeoid.db` — SQLite (sessions, audit log)
 - `~/.codeoid/transcripts/` — JSONL transcripts per session
+- `~/.codeoid/transcripts/<id>.canonical.jsonl`, `<id>.turns.jsonl` — canonical history + turn index
+- `~/.codeoid/transcripts/checkpoints/` — per-session workspace snapshots
 
 Web UI available at `http://localhost:7400/ui/` when daemon is running.
