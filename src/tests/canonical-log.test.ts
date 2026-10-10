@@ -160,6 +160,39 @@ describe("TranscriptStore canonical log", () => {
     expect(turns[0]!.content).not.toStartWith("prompt 0 ");
   });
 
+  it("one turn larger than the window never reads (or compacts) to an empty history", async () => {
+    const small = new TranscriptStore(dir, { canonicalCompactBytes: 200_000 });
+    await small.recordCanonical("w", { op: "append", turn: { role: "user", content: "the prompt" } });
+    // A big assistant turn: many tool calls, each under its own cap.
+    const toolCalls = Array.from({ length: 60 }, (_, i) => ({
+      id: `t${i}`,
+      name: "read_file",
+      input: { path: `f${i}` },
+      output: "o".repeat(30_000),
+      success: true,
+    }));
+    await small.recordCanonical("w", {
+      op: "append",
+      turn: { role: "assistant", content: "done", providerId: "p", model: "m", toolCalls },
+    });
+    const all = (await small.loadCanonical("w"))!;
+    expect(all.turns.map((t) => t.role)).toEqual(["user", "assistant"]);
+    const tail = (await small.loadCanonical("w", { maxBytes: 1000 }))!;
+    expect(tail.turns[0]).toMatchObject({ role: "user", content: "the prompt" });
+  });
+
+  it("caps a whole turn, not just each field", async () => {
+    const toolCalls = Array.from({ length: 400 }, (_, i) => ({
+      id: `t${i}`,
+      name: "read_file",
+      input: { path: `f${i}` },
+      output: "o".repeat(60_000),
+      success: true,
+    }));
+    await store.recordCanonical("big", { op: "append", turn: { role: "assistant", content: "x", providerId: "p", model: "m", toolCalls } });
+    expect(statSync(store.canonicalPath("big")).size).toBeLessThanOrEqual(1024 * 1024 + 1);
+  });
+
   it("writes owner-only files", async () => {
     await store.recordCanonical("s", { op: "append", turn: { role: "user", content: "a" } });
     await store.recordTurn("s", { turnId: "t", kind: "prompt", preview: "a" });

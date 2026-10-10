@@ -1,8 +1,8 @@
 /**
  * Turns (#354): every prompt, and everything the agent does in reply, belongs
  * to one turn with a stable `turnId` (carried on each `SessionMessage`). At the
- * start of each turn in a git workdir, the daemon also snapshots the working
- * tree, so later features can put the files back where they were at that turn
+ * start of each turn the daemon also snapshots the working directory (in its
+ * own storage, git repo or not), so later features can put the files back where they were at that turn
  * (go back a turn, fork from here, per-turn diffs). Backend-agnostic: the turn
  * list and the snapshots come from codeoid's own records, never from a
  * backend's native session.

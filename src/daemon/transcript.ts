@@ -16,7 +16,7 @@
 import { existsSync, mkdirSync } from "node:fs";
 import { appendFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { CanonicalHistoryChange, CanonicalTurn } from "./providers/canonical.js";
+import type { CanonicalHistoryChange, CanonicalToolCall, CanonicalTurn } from "./providers/canonical.js";
 import type { TurnSummary } from "../protocol/types.js";
 
 /** One turn in a session's turn index (#354): what `session.turns` lists. */
@@ -32,20 +32,42 @@ function capText(s: string, cap: number): string {
   return s.length > cap ? `${s.slice(0, cap)}\n… [truncated for the history log: ${s.length} chars total]` : s;
 }
 
-/** One log line for `turn`, with oversized fields capped. */
+/** A whole persisted turn never exceeds this (one line of the log). */
+const CANONICAL_LINE_CAP = 1024 * 1024;
+
+/** One log line for `turn`: oversized fields capped, then the whole turn. */
 function canonicalLine(turn: CanonicalTurn): string {
+  const line = cappedLine(turn, CANONICAL_TEXT_CAP, CANONICAL_TOOL_CAP);
+  if (line.length <= CANONICAL_LINE_CAP) return line;
+  // Many tool calls, each under its own cap, can still add up — squeeze
+  // every field, then keep the newest tool calls that fit.
+  const squeezed = cappedLine(turn, 32 * 1024, 2 * 1024);
+  if (squeezed.length <= CANONICAL_LINE_CAP || turn.role !== "assistant" || !turn.toolCalls) return squeezed;
+  const keep = Math.max(1, Math.floor(turn.toolCalls.length * (CANONICAL_LINE_CAP / squeezed.length) * 0.9));
+  return cappedLine(
+    {
+      ...turn,
+      content: `${turn.content}\n… [${turn.toolCalls.length - keep} earlier tool calls omitted from the history log]`,
+      toolCalls: turn.toolCalls.slice(-keep),
+    },
+    32 * 1024,
+    2 * 1024,
+  );
+}
+
+function cappedLine(turn: CanonicalTurn, textCap: number, toolCap: number): string {
   let t: CanonicalTurn = turn;
   if (t.role === "user") {
-    if (t.content.length > CANONICAL_TEXT_CAP) t = { ...t, content: capText(t.content, CANONICAL_TEXT_CAP) };
+    if (t.content.length > textCap) t = { ...t, content: capText(t.content, textCap) };
   } else {
-    const content = capText(t.content, CANONICAL_TEXT_CAP);
-    const thinking = t.thinking !== undefined ? capText(t.thinking, CANONICAL_TEXT_CAP) : undefined;
-    const toolCalls = t.toolCalls?.map((tc) => {
+    const content = capText(t.content, textCap);
+    const thinking = t.thinking !== undefined ? capText(t.thinking, textCap) : undefined;
+    const toolCalls = t.toolCalls?.map((tc: CanonicalToolCall) => {
       const input = JSON.stringify(tc.input);
       return {
         ...tc,
-        output: capText(tc.output, CANONICAL_TOOL_CAP),
-        input: input.length > CANONICAL_TOOL_CAP ? { truncated: capText(input, CANONICAL_TOOL_CAP) } : tc.input,
+        output: capText(tc.output, toolCap),
+        input: input.length > toolCap ? { truncated: capText(input, toolCap) } : tc.input,
       };
     });
     t = {
@@ -311,6 +333,18 @@ export class TranscriptStore {
   }
 
   async #readCanonical(sessionId: string, maxBytes?: number): Promise<{ turns: CanonicalTurn[]; partial: boolean }> {
+    // A tail must contain at least one whole prompt: widen the window until
+    // it does (or covers the file). Otherwise one turn larger than the window
+    // reads as an EMPTY history — and compaction would persist that.
+    let window = maxBytes;
+    for (;;) {
+      const r = await this.#readCanonicalOnce(sessionId, window);
+      if (!r.partial || r.turns.length > 0 || window === undefined) return r;
+      window *= 2;
+    }
+  }
+
+  async #readCanonicalOnce(sessionId: string, maxBytes?: number): Promise<{ turns: CanonicalTurn[]; partial: boolean }> {
     const path = this.canonicalPath(sessionId);
     const size = Bun.file(path).size;
     const offset = maxBytes !== undefined && size > maxBytes ? size - maxBytes : 0;
@@ -326,13 +360,12 @@ export class TranscriptStore {
         // torn line
       }
     }
-    let partial = offset > 0;
+    const partial = offset > 0;
     if (partial) {
       // A tail read may start mid-turn: drop leading assistant turns.
       const firstUser = turns.findIndex((t) => t.role === "user");
       turns.splice(0, firstUser === -1 ? turns.length : firstUser);
     }
-    if (turns.length === 0 && size > 0 && offset > 0) partial = true;
     return { turns, partial };
   }
 

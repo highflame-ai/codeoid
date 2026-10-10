@@ -9,39 +9,42 @@
  *
  * Storage: a SHADOW git repository per session, owned by the daemon:
  *
- *     <data dir>/checkpoints/<sessionId>.git     (GIT_WORK_TREE = the workdir)
+ *     <transcript dir>/checkpoints/<sessionId>.git   (GIT_WORK_TREE = workdir)
  *       refs/turns/<turnId>  → snapshot commit
  *       turns.log            → daemon-owned order (oldest first)
  *
- * Why not the user's own repository:
+ * Why a shadow repository, and a SELF-CONTAINED one:
  *   - Nothing lands in the user's repo: no refs to push by accident, no
  *     objects that outlive the session, nothing in `git log --all`. Destroy
  *     is `rm -rf` of the shadow directory.
  *   - No repo-controlled code runs. Git reads config only from the shadow
  *     repo (system and global config are switched off), so the user repo's
- *     `core.fsmonitor`, hooks, `core.hooksPath` and filter drivers are never
- *     consulted — a `.gitattributes` naming a filter has no driver to run.
- *     An agent that edits `.git/config` gains nothing here.
- *   - It works in non-git directories too.
+ *     `core.fsmonitor`, hooks and filter drivers are never consulted — a
+ *     `.gitattributes` naming a filter has no driver to run.
+ *   - Nothing from the user's `.git` is trusted: no copied index (an agent
+ *     could plant skip-worktree entries naming any blob), no alternates (a
+ *     rewrite + gc in the user repo would corrupt snapshots; a redirected
+ *     object store could smuggle foreign content in). A snapshot holds
+ *     exactly the bytes in the work tree, stored in the shadow repo itself,
+ *     so a restore can never fail because of something outside it.
+ *   - It works in non-git directories too, identically.
  *   - The child gets a minimal environment, never the daemon's (which holds
  *     credentials — see providers/env.ts).
  *
- * Dedup: when the workdir is inside a git repository, the shadow repo lists
- * that repository's object store as an ALTERNATE, so unchanged tracked files
- * are never copied — only content the user's repo doesn't have is stored.
- * The work tree's own `.gitignore` files are honoured; common secret files
- * (`.env`, private keys, credential dot-files) and dependency directories
- * are excluded by default.
- *
- * Bounded: new (untracked) content per snapshot is capped by size and file
- * count, the shadow repo by total size, the number of snapshots per session
- * by count (oldest pruned), every git call by a timeout, and at most one
- * snapshot runs per session at a time. A failure never fails the turn.
+ * The cost of self-containment is one compressed copy of the work tree on a
+ * session's first snapshot; later snapshots store only what changed (git
+ * dedups by content, and the shadow index's stat cache skips unchanged
+ * files). Bounded: the first snapshot by total size and file count, later
+ * ones by new-file size and count, the repository by a storage budget
+ * (oldest snapshots pruned first), the number of snapshots per session, every
+ * git call by a timeout, and one snapshot per session at a time. Secrets and
+ * dependency directories are excluded with pathspec magic, which a
+ * `.gitignore` negation can't override. A failure never fails the turn.
  */
 
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import { appendFile, copyFile, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 
@@ -50,11 +53,15 @@ const execFileP = promisify(execFile);
 export interface CheckpointLimits {
   /** Newest checkpoints kept per session; older ones are pruned. */
   maxPerSession: number;
-  /** Skip a snapshot when files new to it (not in the user's repo) exceed this many bytes. */
+  /** Later snapshots: skip when files new since the last one exceed this many bytes. */
   maxUntrackedBytes: number;
-  /** Skip a snapshot when there are more new files than this. */
+  /** Later snapshots: skip when there are more new files than this. */
   maxUntrackedFiles: number;
-  /** Stop snapshotting once the session's shadow repository is larger than this. */
+  /** First snapshot: skip when the work tree (minus exclusions) exceeds this many bytes. */
+  maxFirstSnapshotBytes: number;
+  /** First snapshot: skip when the work tree has more files than this. */
+  maxFirstSnapshotFiles: number;
+  /** Storage budget for one session's checkpoints; the oldest are pruned to stay under it. */
   maxRepoBytes: number;
   /** Per-git-call timeout. */
   timeoutMs: number;
@@ -64,7 +71,9 @@ export const DEFAULT_CHECKPOINT_LIMITS: CheckpointLimits = {
   maxPerSession: 200,
   maxUntrackedBytes: 100 * 1024 * 1024,
   maxUntrackedFiles: 20_000,
-  maxRepoBytes: 1024 * 1024 * 1024,
+  maxFirstSnapshotBytes: 1024 * 1024 * 1024,
+  maxFirstSnapshotFiles: 100_000,
+  maxRepoBytes: 2 * 1024 * 1024 * 1024,
   timeoutMs: 30_000,
 };
 
@@ -77,32 +86,38 @@ export interface CheckpointRecord {
 }
 
 /**
- * Never snapshotted: secrets that must not be copied into a second store,
- * and dependency/build directories that are large, regenerable, and would
- * otherwise blow the caps on a non-git directory.
+ * Never snapshotted, as `:(exclude,glob)` pathspecs (they win over any
+ * `.gitignore` negation and cover tracked files too): secrets that must not
+ * be copied into a second store, and large regenerable dependency dirs.
  */
 export const DEFAULT_CHECKPOINT_EXCLUDES = [
-  ".env",
-  ".env.*",
-  "!.env.example",
-  "!.env.sample",
-  "*.pem",
-  "*.key",
-  "*.p12",
-  "*.pfx",
-  "id_rsa*",
-  "id_dsa*",
-  "id_ecdsa*",
-  "id_ed25519*",
-  ".netrc",
-  ".npmrc",
-  ".pypirc",
-  ".aws/",
-  ".ssh/",
-  ".gnupg/",
-  "node_modules/",
-  ".venv/",
-  "__pycache__/",
+  "**/.env",
+  "**/.env.*",
+  "**/.envrc",
+  "**/*.pem",
+  "**/*.key",
+  "**/*.p12",
+  "**/*.pfx",
+  "**/id_rsa*",
+  "**/id_dsa*",
+  "**/id_ecdsa*",
+  "**/id_ed25519*",
+  "**/.netrc",
+  "**/.npmrc",
+  "**/.pypirc",
+  "**/.git-credentials",
+  "**/credentials.json",
+  "**/*.tfvars",
+  "**/*.tfstate",
+  "**/*.tfstate.*",
+  "**/.aws/**",
+  "**/.ssh/**",
+  "**/.gnupg/**",
+  "**/.kube/**",
+  "**/.docker/config.json",
+  "**/node_modules/**",
+  "**/.venv/**",
+  "**/__pycache__/**",
 ];
 
 /** Ids are uuids today; refuse anything that could escape a path or ref namespace. */
@@ -157,80 +172,38 @@ async function run(
 }
 
 /**
- * The user's repository facts for `workdir`, read with the user's own repo
- * but NO config execution: only `rev-parse`, which runs no hooks, filters or
- * fsmonitor. Null when `workdir` is not inside a git work tree.
+ * Create the shadow repository on first use — atomically: built in a temp
+ * directory and renamed into place, so a crash can't leave a repo that looks
+ * ready but lacks its configuration.
  */
-async function userRepo(
-  workdir: string,
-  timeoutMs: number,
-): Promise<{ top: string; objects: string; index: string; head: string | null; prefix: string } | null> {
-  const env = gitEnv({});
+async function ensureShadow(shadow: string, timeoutMs: number): Promise<void> {
+  if (existsSync(path.join(shadow, "HEAD"))) return;
+  const parent = path.dirname(shadow);
+  await mkdir(parent, { recursive: true, mode: 0o700 });
+  const tmp = `${shadow}.init-${process.pid}-${Date.now()}`;
   try {
-    const out = await run(
-      ["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir", "--git-path", "index", "--show-prefix"],
-      { cwd: workdir, env, timeoutMs },
-    );
-    const [top, common, index, prefix = ""] = out.split("\n");
-    if (!top || !common || !index) return null;
-    let head: string | null = null;
+    await run(["init", "-q", "--bare", tmp], { cwd: parent, env: gitEnv({}), timeoutMs });
+    const env = gitEnv({ GIT_DIR: tmp });
+    for (const [k, v] of [
+      ["core.bare", "false"],
+      ["core.hooksPath", "/dev/null"],
+      ["core.fsmonitor", "false"],
+      ["core.autocrlf", "false"],
+      ["core.symlinks", "true"],
+      ["core.splitIndex", "false"],
+      ["gc.auto", "0"],
+      ["advice.addEmbeddedRepo", "false"],
+    ] as const) {
+      await run(["config", k, v], { cwd: tmp, env, timeoutMs });
+    }
     try {
-      head = (await run(["rev-parse", "--verify", "-q", "HEAD^{commit}"], { cwd: workdir, env, timeoutMs })).trim() || null;
-    } catch {
-      head = null; // unborn branch
+      await rename(tmp, shadow);
+    } catch (err) {
+      // Lost a race with a concurrent creator: theirs is as good as ours.
+      if (!existsSync(path.join(shadow, "HEAD"))) throw err;
     }
-    return { top, objects: path.join(common, "objects"), index, head, prefix: prefix.trim() };
-  } catch {
-    return null;
-  }
-}
-
-/** Create the shadow repository on first use. */
-async function ensureShadow(shadow: string, workdir: string, timeoutMs: number): Promise<{ fresh: boolean }> {
-  if (existsSync(path.join(shadow, "HEAD"))) return { fresh: false };
-  await mkdir(path.dirname(shadow), { recursive: true, mode: 0o700 });
-  await run(["init", "-q", "--bare", shadow], { cwd: path.dirname(shadow), env: gitEnv({}), timeoutMs });
-  const env = gitEnv({ GIT_DIR: shadow });
-  for (const [k, v] of [
-    ["core.bare", "false"],
-    ["core.hooksPath", "/dev/null"],
-    ["core.fsmonitor", "false"],
-    ["core.autocrlf", "false"],
-    ["core.symlinks", "true"],
-    ["gc.auto", "0"],
-    ["advice.addEmbeddedRepo", "false"],
-  ] as const) {
-    await run(["config", k, v], { cwd: shadow, env, timeoutMs });
-  }
-  await mkdir(path.join(shadow, "info"), { recursive: true });
-  await writeFile(path.join(shadow, "info", "exclude"), `${DEFAULT_CHECKPOINT_EXCLUDES.join("\n")}\n`, { mode: 0o600 });
-  // Dedup against the user's repository, when there is one.
-  const repo = await userRepo(workdir, timeoutMs);
-  if (repo) {
-    await mkdir(path.join(shadow, "objects", "info"), { recursive: true });
-    await writeFile(path.join(shadow, "objects", "info", "alternates"), `${repo.objects}\n`, { mode: 0o600 });
-  }
-  return { fresh: true };
-}
-
-/**
- * Seed a fresh shadow index from the user's repo, so the first snapshot only
- * re-hashes what changed and the caps measure genuinely new content.
- */
-async function seedIndex(shadow: string, workdir: string, timeoutMs: number): Promise<void> {
-  const repo = await userRepo(workdir, timeoutMs);
-  if (!repo) return;
-  const env = gitEnv({ GIT_DIR: shadow, GIT_WORK_TREE: workdir });
-  try {
-    if (!repo.prefix) {
-      // Same root: the user's index is valid as-is, stat cache included.
-      await copyFile(repo.index, path.join(shadow, "index"));
-    } else if (repo.head) {
-      // Session rooted in a subdirectory: start from HEAD's subtree.
-      await run(["read-tree", `${repo.head}:${repo.prefix}`], { cwd: workdir, env, timeoutMs });
-    }
-  } catch {
-    // Cold start: the first add hashes everything; still correct.
+  } finally {
+    await rm(tmp, { recursive: true, force: true }).catch(() => {});
   }
 }
 
@@ -242,6 +215,11 @@ async function shadowSizeBytes(shadow: string, timeoutMs: number): Promise<numbe
     if ((k === "size" || k === "size-pack") && v) kib += Number(v) || 0;
   }
   return kib * 1024;
+}
+
+/** Pathspecs for a snapshot: everything, minus the exclusions. */
+function pathspecs(extraExcludes: readonly string[]): string[] {
+  return ["--", ".", ...[...DEFAULT_CHECKPOINT_EXCLUDES, ...extraExcludes].map((p) => `:(exclude,glob)${p}`)];
 }
 
 type OrderEntry = { turnId: string; sha: string; late: boolean };
@@ -264,6 +242,29 @@ async function readOrder(shadow: string): Promise<OrderEntry[]> {
   }
 }
 
+
+/**
+ * `git add -A` over the snapshot pathspecs. A nested repository with no
+ * commit checked out makes git refuse the whole add; exclude each one it
+ * names and retry. (Nested repositories are recorded as a pointer to their
+ * checked-out commit, never their files — git's model for embedded repos.)
+ */
+async function addAll(workdir: string, env: Record<string, string>, timeoutMs: number, extra: string[]): Promise<void> {
+  const excludes = [...extra];
+  for (let attempt = 0; attempt < 20; attempt++) {
+    try {
+      await run(["add", "-A", ...pathspecs(excludes)], { cwd: workdir, env, timeoutMs });
+      return;
+    } catch (err) {
+      const stderr = String((err as { stderr?: unknown }).stderr ?? "");
+      const m = /'([^']+)' does not have a commit checked out/.exec(stderr);
+      if (!m?.[1]) throw err;
+      excludes.push(m[1].replace(/\/$/, ""), `${m[1].replace(/\/$/, "")}/**`);
+    }
+  }
+  throw new Error("too many nested repositories without a commit");
+}
+
 /** One snapshot at a time per shadow repo (they share an index). */
 const inFlight = new Set<string>();
 
@@ -277,6 +278,11 @@ export async function createCheckpoint(opts: {
   sessionId: string;
   turnId: string;
   limits?: Partial<CheckpointLimits>;
+  /**
+   * Absolute directories inside the workdir that must never be snapshotted
+   * (the daemon's own data directory, should a workdir contain it).
+   */
+  excludeDirs?: readonly string[];
   /**
    * Asked once the files have been read: has the turn already started? A
    * snapshot that finished after the agent began may include its first edits
@@ -296,18 +302,33 @@ export async function createCheckpoint(opts: {
   inFlight.add(shadow);
   try {
     const t = limits.timeoutMs;
-    const { fresh } = await ensureShadow(shadow, opts.workdir, t);
-    if (fresh) await seedIndex(shadow, opts.workdir, t);
-    if ((await shadowSizeBytes(shadow, t)) > limits.maxRepoBytes) {
-      return { ok: false, reason: `checkpoint storage for this session exceeds ${Math.round(limits.maxRepoBytes / 1024 / 1024)} MB` };
+    await ensureShadow(shadow, t);
+    // Over the storage budget: drop the older snapshots, oldest first, until
+    // it fits — down to none, so a session whose tree alone nears the budget
+    // still always has its latest snapshot rather than none ever again.
+    for (let keep = Math.floor((await readOrder(shadow)).length / 2); (await shadowSizeBytes(shadow, t)) > limits.maxRepoBytes; keep = Math.floor(keep / 2)) {
+      await prune(shadow, keep, t, { reclaimNow: true }).catch(() => {});
+      if (keep === 0) break;
     }
+    // A lock left by a snapshot killed mid-write (crash, forced shutdown).
+    // Ours are serialized by `inFlight`, so any lock here now is stale.
+    await rm(path.join(shadow, "index.lock"), { force: true });
     const env = gitEnv({ GIT_DIR: shadow, GIT_WORK_TREE: opts.workdir });
+    const extra = (opts.excludeDirs ?? [])
+      .map((d) => path.relative(opts.workdir, d))
+      .filter((rel) => rel && !rel.startsWith("..") && !path.isAbsolute(rel))
+      .map((rel) => `${rel.split(path.sep).join("/")}/**`);
+    const spec = pathspecs(extra);
 
-    // Bound the new content before hashing anything.
-    const listed = await run(["ls-files", "--others", "--exclude-standard", "-z"], { cwd: opts.workdir, env, timeoutMs: t });
+    // Bound the content to hash before hashing anything. With no shadow index
+    // yet (first snapshot, or a fork's copied history) every file is new.
+    const first = !existsSync(path.join(shadow, "index"));
+    const maxFiles = first ? limits.maxFirstSnapshotFiles : limits.maxUntrackedFiles;
+    const maxBytes = first ? limits.maxFirstSnapshotBytes : limits.maxUntrackedBytes;
+    const listed = await run(["ls-files", "--others", "--exclude-standard", "-z", ...spec], { cwd: opts.workdir, env, timeoutMs: t });
     const files = listed.split("\0").filter(Boolean);
-    if (files.length > limits.maxUntrackedFiles) {
-      return { ok: false, reason: `too many untracked files (${files.length} > ${limits.maxUntrackedFiles})` };
+    if (files.length > maxFiles) {
+      return { ok: false, reason: `too many ${first ? "files" : "untracked files"} (${files.length} > ${maxFiles})` };
     }
     let bytes = 0;
     for (const f of files) {
@@ -317,12 +338,12 @@ export async function createCheckpoint(opts: {
       } catch {
         // vanished between listing and stat
       }
-      if (bytes > limits.maxUntrackedBytes) {
-        return { ok: false, reason: `untracked files exceed ${Math.round(limits.maxUntrackedBytes / 1024 / 1024)} MB` };
+      if (bytes > maxBytes) {
+        return { ok: false, reason: `${first ? "files" : "untracked files"} exceed ${Math.round(maxBytes / 1024 / 1024)} MB` };
       }
     }
 
-    await run(["add", "-A", "--", "."], { cwd: opts.workdir, env, timeoutMs: t });
+    await addAll(opts.workdir, env, t, extra);
     const late = opts.isLate?.() === true;
     const tree = (await run(["write-tree"], { cwd: opts.workdir, env, timeoutMs: t })).trim();
     const message = `codeoid checkpoint\n\nsession: ${opts.sessionId}\nturn: ${opts.turnId}\n`;
@@ -331,6 +352,9 @@ export async function createCheckpoint(opts: {
     await run(["update-ref", `refs/turns/${opts.turnId}`, sha], { cwd: shadow, env: shadowEnv, timeoutMs: t });
     await appendFile(path.join(shadow, "turns.log"), orderLine({ turnId: opts.turnId, sha, late }), { mode: 0o600 });
     await prune(shadow, limits.maxPerSession, t).catch(() => {});
+    // A first snapshot of a big tree leaves one loose object per file; pack
+    // them so the store stays compact and cheap to copy for forks.
+    if (first) await run(["repack", "-a", "-d", "-q"], { cwd: shadow, env: shadowEnv, timeoutMs: t * 4 }).catch(() => {});
     return { ok: true, sha, late };
   } catch (err) {
     return { ok: false, reason: err instanceof Error ? err.message : String(err) };
@@ -340,18 +364,31 @@ export async function createCheckpoint(opts: {
 }
 
 /** Drop all but the newest `keep` checkpoints, and the objects only they held. */
-async function prune(shadow: string, keep: number, timeoutMs: number): Promise<void> {
+async function prune(shadow: string, keep: number, timeoutMs: number, opts: { reclaimNow?: boolean } = {}): Promise<void> {
   const order = await readOrder(shadow);
-  const excess = order.length - Math.max(1, keep);
+  const excess = order.length - Math.max(0, keep);
   if (excess <= 0) return;
   const doomed = order.slice(0, excess);
   const kept = order.slice(excess);
   const env = gitEnv({ GIT_DIR: shadow });
   const stdin = doomed.map((d) => `delete refs/turns/${d.turnId}\n`).join("");
   await run(["update-ref", "--stdin"], { cwd: shadow, env, timeoutMs, input: stdin });
-  await writeFile(path.join(shadow, "turns.log"), kept.map(orderLine).join(""), { mode: 0o600 });
-  await run(["prune", "--expire=now"], { cwd: shadow, env, timeoutMs });
+  await writeOrder(shadow, kept);
+  // Reclaim the space only the dropped snapshots held — loose and packed —
+  // in batches: it walks every remaining snapshot, too costly per turn.
+  const pendingReclaim = (unreclaimed.get(shadow) ?? 0) + doomed.length;
+  if (opts.reclaimNow || pendingReclaim >= RECLAIM_EVERY) {
+    unreclaimed.delete(shadow);
+    await run(["repack", "-a", "-d", "-q"], { cwd: shadow, env, timeoutMs: timeoutMs * 4 });
+    await run(["prune", "--expire=now"], { cwd: shadow, env, timeoutMs });
+  } else {
+    unreclaimed.set(shadow, pendingReclaim);
+  }
 }
+
+/** Dropped snapshots whose space hasn't been reclaimed yet, per shadow repo. */
+const unreclaimed = new Map<string, number>();
+const RECLAIM_EVERY = 20;
 
 /**
  * Every checkpoint of a session, oldest first: `turnId → sha`. Trusts only
@@ -394,14 +431,12 @@ export async function listCheckpoints(
  * Give a new session (a fork) copies of another session's checkpoints, so its
  * inherited turns keep their snapshots — and keep them after the source
  * session is destroyed. `turnIds` limits the copy; default all. Objects are
- * fetched (the source repo may be deleted later); unchanged content the
- * fork's own repository already has is not duplicated.
+ * fetched, so the copy is self-contained and survives the source repo.
  */
 export async function copyCheckpoints(opts: {
   root: string;
   fromSessionId: string;
   toSessionId: string;
-  toWorkdir: string;
   turnIds?: readonly string[];
   timeoutMs?: number;
 }): Promise<number> {
@@ -412,7 +447,7 @@ export async function copyCheckpoints(opts: {
   if (picked.length === 0) return 0;
   const from = shadowRepoPath(opts.root, opts.fromSessionId);
   const to = shadowRepoPath(opts.root, opts.toSessionId);
-  await ensureShadow(to, opts.toWorkdir, t);
+  await ensureShadow(to, t);
   const env = gitEnv({ GIT_DIR: to });
   const refspecs = picked.map(([turnId]) => `+refs/turns/${turnId}:refs/turns/${turnId}`);
   await run(["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", from, ...refspecs], { cwd: to, env, timeoutMs: t });
@@ -446,6 +481,25 @@ export async function sweepCheckpoints(root: string, knownSessionIds: ReadonlySe
     removed++;
   }
   return removed;
+}
+
+/** Delete one checkpoint (a snapshot for a turn that never started). */
+export async function deleteCheckpoint(root: string, sessionId: string, turnId: string): Promise<void> {
+  if (!SAFE_ID.test(turnId)) return;
+  const shadow = shadowRepoPath(root, sessionId);
+  if (!existsSync(path.join(shadow, "HEAD"))) return;
+  const env = gitEnv({ GIT_DIR: shadow });
+  await run(["update-ref", "-d", `refs/turns/${turnId}`], { cwd: shadow, env, timeoutMs: DEFAULT_CHECKPOINT_LIMITS.timeoutMs }).catch(() => {});
+  const order = await readOrder(shadow);
+  await writeOrder(shadow, order.filter((e) => e.turnId !== turnId));
+}
+
+/** Rewrite turns.log atomically — a torn rewrite would hide every snapshot. */
+async function writeOrder(shadow: string, entries: readonly OrderEntry[]): Promise<void> {
+  const file = path.join(shadow, "turns.log");
+  const tmp = `${file}.tmp`;
+  await writeFile(tmp, entries.map(orderLine).join(""), { mode: 0o600 });
+  await rename(tmp, file);
 }
 
 /** Delete a session's checkpoints (session destroy). Never throws. */

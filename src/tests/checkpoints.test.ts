@@ -13,11 +13,13 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   copyCheckpoints,
   createCheckpoint,
+  deleteCheckpoint,
   deleteCheckpoints,
   listCheckpoints,
   shadowGit,
@@ -91,17 +93,33 @@ describe("createCheckpoint", () => {
     expect(treeFiles("s1", r.sha)).not.toContain("debug.log");
   });
 
-  it("dedups against the user's repo: unchanged tracked files are not copied", async () => {
+  it("is self-contained: snapshots survive the user's repository being rewritten, gc'd, or deleted", async () => {
     initRepo();
-    writeFileSync(join(repo, "big.txt"), "x".repeat(200_000));
-    git("add", "big.txt");
-    git("commit", "-qm", "big");
+    writeFileSync(join(repo, "a.txt"), "staged then changed\n");
+    git("add", "a.txt");
     const r = await createCheckpoint({ root, workdir: repo, sessionId: "s1", turnId: "t1" });
-    expect(r.ok).toBe(true);
-    const sizeKb = Number(
-      (await shadowGit(root, "s1", ["count-objects", "-v"])).match(/^size: (\d+)/m)?.[1] ?? "0",
-    );
-    expect(sizeKb).toBeLessThan(20); // just the tree + commit, not the 200 KB file
+    if (!r.ok) throw new Error(r.reason);
+    expect(existsSync(join(shadowRepoPath(root, "s1"), "objects", "info", "alternates"))).toBe(false);
+    rmSync(join(repo, ".git"), { recursive: true, force: true }); // the worst case
+    expect(show("s1", r.sha, "a.txt")).toBe("staged then changed\n");
+    expect(show("s1", r.sha, ".gitignore")).toBe("*.log\n");
+  });
+
+  it("trusts nothing in the user's index: skip-worktree / assume-unchanged / split index don't affect the snapshot", async () => {
+    initRepo();
+    writeFileSync(join(repo, "b.txt"), "b0\n");
+    git("add", "b.txt");
+    git("commit", "-qm", "b");
+    git("update-index", "--skip-worktree", "a.txt");
+    git("update-index", "--assume-unchanged", "b.txt");
+    git("config", "core.splitIndex", "true");
+    git("update-index", "--split-index");
+    writeFileSync(join(repo, "a.txt"), "edited a\n");
+    writeFileSync(join(repo, "b.txt"), "edited b\n");
+    const r = await createCheckpoint({ root, workdir: repo, sessionId: "s1", turnId: "t1" });
+    if (!r.ok) throw new Error(r.reason);
+    expect(show("s1", r.sha, "a.txt")).toBe("edited a\n");
+    expect(show("s1", r.sha, "b.txt")).toBe("edited b\n");
   });
 
   it("works in a directory that is not a git repository", async () => {
@@ -121,6 +139,58 @@ describe("createCheckpoint", () => {
     if (r.ok) expect(treeFiles("s1", r.sha)).toEqual(["x.ts"]); // scoped to the session's directory
   });
 
+  it("keeps secrets out even when a .gitignore negates them, or they are tracked", async () => {
+    initRepo();
+    writeFileSync(join(repo, ".gitignore"), "*.log\n!.env\n!*.key\n");
+    writeFileSync(join(repo, "server.key"), "k\n");
+    writeFileSync(join(repo, ".env"), "TRACKED_SECRET=1\n");
+    git("add", "-f", ".env");
+    git("commit", "-qm", "oops, committed .env");
+    writeFileSync(join(repo, ".env"), "TRACKED_SECRET=2\n");
+    const r = await createCheckpoint({ root, workdir: repo, sessionId: "s1", turnId: "t1" });
+    if (!r.ok) throw new Error(r.reason);
+    const files = treeFiles("s1", r.sha);
+    expect(files).not.toContain(".env");
+    expect(files).not.toContain("server.key");
+  });
+
+  it("never snapshots the daemon's own data directory", async () => {
+    initRepo();
+    mkdirSync(join(repo, "data", "transcripts"), { recursive: true });
+    writeFileSync(join(repo, "data", "config.json"), '{"apiKey":"zid_sk_x"}');
+    const r = await createCheckpoint({ root, workdir: repo, sessionId: "s1", turnId: "t1", excludeDirs: [join(repo, "data")] });
+    if (!r.ok) throw new Error(r.reason);
+    expect(treeFiles("s1", r.sha).some((f) => f.startsWith("data/"))).toBe(false);
+  });
+
+  it("recovers from a lock left by a snapshot killed mid-write", async () => {
+    initRepo();
+    expect((await createCheckpoint({ root, workdir: repo, sessionId: "s1", turnId: "t1" })).ok).toBe(true);
+    writeFileSync(join(shadowRepoPath(root, "s1"), "index.lock"), "");
+    expect((await createCheckpoint({ root, workdir: repo, sessionId: "s1", turnId: "t2" })).ok).toBe(true);
+  });
+
+  it("a nested repository with no commits doesn't break snapshots", async () => {
+    initRepo();
+    mkdirSync(join(repo, "sub"));
+    execFileSync("git", ["init", "-q"], { cwd: join(repo, "sub") });
+    writeFileSync(join(repo, "sub", "x.txt"), "x\n");
+    writeFileSync(join(repo, "top.txt"), "top\n");
+    const r = await createCheckpoint({ root, workdir: repo, sessionId: "s1", turnId: "t1" });
+    if (!r.ok) throw new Error(r.reason);
+    expect(show("s1", r.sha, "top.txt")).toBe("top\n");
+  });
+
+  it("stays under the storage budget by dropping the oldest snapshots", async () => {
+    initRepo();
+    writeFileSync(join(repo, "blob.bin"), randomBytes(300_000));
+    expect((await createCheckpoint({ root, workdir: repo, sessionId: "s1", turnId: "t1" })).ok).toBe(true);
+    writeFileSync(join(repo, "blob.bin"), randomBytes(300_000));
+    const r = await createCheckpoint({ root, workdir: repo, sessionId: "s1", turnId: "t2", limits: { maxRepoBytes: 200_000 } });
+    expect(r.ok).toBe(true);
+    expect([...(await listCheckpoints(root, "s1")).keys()]).toEqual(["t2"]);
+  });
+
   it("never copies common secret files or dependency directories", async () => {
     initRepo();
     writeFileSync(join(repo, ".env"), "API_KEY=secret\n");
@@ -132,8 +202,8 @@ describe("createCheckpoint", () => {
     const r = await createCheckpoint({ root, workdir: repo, sessionId: "s1", turnId: "t1" });
     if (!r.ok) throw new Error(r.reason);
     const files = treeFiles("s1", r.sha);
-    expect(files).toContain(".env.example");
-    for (const f of [".env", ".env.local", "server.pem", "node_modules/dep/i.js"]) expect(files).not.toContain(f);
+    // .env.example goes too: exclusions are pathspecs (unbeatable by a .gitignore), which can't carve exceptions.
+    for (const f of [".env", ".env.local", ".env.example", "server.pem", "node_modules/dep/i.js"]) expect(files).not.toContain(f);
   });
 
   it("runs none of the code the user's repository configures: fsmonitor, filters, hooks", async () => {
@@ -187,16 +257,24 @@ describe("createCheckpoint", () => {
     expect(execFileSync("git", ["--git-dir", decoy, "count-objects"], { encoding: "utf8" })).toStartWith("0 objects");
   });
 
-  it("skips (with a reason) when new content exceeds the limits", async () => {
+  it("skips (with a reason) when the first snapshot, or a later one's new files, exceed the limits", async () => {
     initRepo();
     writeFileSync(join(repo, "big.bin"), Buffer.alloc(4096));
-    const bySize = await createCheckpoint({ root, workdir: repo, sessionId: "s1", turnId: "t1", limits: { maxUntrackedBytes: 1024 } });
-    expect(bySize.ok).toBe(false);
-    if (!bySize.ok) expect(bySize.reason).toContain("untracked files exceed");
-    const byCount = await createCheckpoint({ root, workdir: repo, sessionId: "s1", turnId: "t2", limits: { maxUntrackedFiles: 0 } });
-    expect(byCount.ok).toBe(false);
-    if (!byCount.ok) expect(byCount.reason).toContain("too many untracked files");
-    expect((await listCheckpoints(root, "s1")).size).toBe(0);
+    const firstBySize = await createCheckpoint({ root, workdir: repo, sessionId: "s1", turnId: "t1", limits: { maxFirstSnapshotBytes: 1024 } });
+    expect(firstBySize.ok).toBe(false);
+    if (!firstBySize.ok) expect(firstBySize.reason).toContain("files exceed");
+    const firstByCount = await createCheckpoint({ root, workdir: repo, sessionId: "s1", turnId: "t1", limits: { maxFirstSnapshotFiles: 1 } });
+    expect(firstByCount.ok).toBe(false);
+    expect((await createCheckpoint({ root, workdir: repo, sessionId: "s1", turnId: "t1" })).ok).toBe(true);
+
+    writeFileSync(join(repo, "new.bin"), Buffer.alloc(4096));
+    const laterBySize = await createCheckpoint({ root, workdir: repo, sessionId: "s1", turnId: "t2", limits: { maxUntrackedBytes: 1024 } });
+    expect(laterBySize.ok).toBe(false);
+    if (!laterBySize.ok) expect(laterBySize.reason).toContain("untracked files exceed");
+    const laterByCount = await createCheckpoint({ root, workdir: repo, sessionId: "s1", turnId: "t3", limits: { maxUntrackedFiles: 0 } });
+    expect(laterByCount.ok).toBe(false);
+    if (!laterByCount.ok) expect(laterByCount.reason).toContain("too many untracked files");
+    expect([...(await listCheckpoints(root, "s1")).keys()]).toEqual(["t1"]);
   });
 
   it("records a snapshot taken after the turn started as late", async () => {
@@ -253,12 +331,17 @@ describe("listing, pruning, copying, sweeping, deleting", () => {
     writeFileSync(join(repo, "a.txt"), "at-t2\n");
     await createCheckpoint({ root, workdir: repo, sessionId: "parent", turnId: "t2" });
 
-    expect(await copyCheckpoints({ root, fromSessionId: "parent", toSessionId: "fork", toWorkdir: repo, turnIds: ["t1"] })).toBe(1);
+    expect(await copyCheckpoints({ root, fromSessionId: "parent", toSessionId: "fork", turnIds: ["t1"] })).toBe(1);
     await deleteCheckpoints(root, "parent");
     expect(existsSync(shadowRepoPath(root, "parent"))).toBe(false);
     const fork = await listCheckpoints(root, "fork");
     expect([...fork.keys()]).toEqual(["t1"]);
     expect(show("fork", fork.get("t1")!.sha, "a.txt")).toBe("at-t1\n");
+    // ...and the fork's own snapshots work, even with tight per-turn caps.
+    const own = await createCheckpoint({ root, workdir: repo, sessionId: "fork", turnId: "f1", limits: { maxUntrackedFiles: 0 } });
+    expect(own.ok).toBe(true);
+    await deleteCheckpoint(root, "fork", "t1");
+    expect([...(await listCheckpoints(root, "fork")).keys()]).toEqual(["f1"]);
   });
 
   it("sweeps the storage of sessions that no longer exist", async () => {

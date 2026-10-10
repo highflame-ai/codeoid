@@ -57,9 +57,9 @@ import type {
   ToolState,
   SessionWorktree,
 } from "../protocol/types.js";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { removeForkWorktree } from "./git-worktree.js";
-import { copyCheckpoints, createCheckpoint, deleteCheckpoints, listCheckpoints } from "./checkpoints.js";
+import { copyCheckpoints, createCheckpoint, deleteCheckpoint, deleteCheckpoints, listCheckpoints } from "./checkpoints.js";
 import type { TurnIndexEntry } from "./transcript.js";
 import type { TurnSummary } from "../protocol/types.js";
 import { execFile } from "node:child_process";
@@ -418,6 +418,10 @@ export interface SessionCreateOptions {
  * was told; callers waiting for the turn treat this like an interrupt, not a
  * failure to report.
  */
+/** Turns listed per session (#354): the newest are kept; older ones drop off. */
+const TURN_INDEX_KEEP = 1000;
+const TURN_INDEX_SLACK = 200;
+
 export class SendStoppedError extends Error {
   constructor() {
     super("Stopped before the agent started on this message");
@@ -2156,14 +2160,23 @@ export class Session {
       ));
     }
 
+    // A message that meant to join a running turn whose run turned out to be
+    // stalled (recovered above) starts a turn of its own instead.
+    if (turnId === previousTurnId) turnId = randomUUID();
+    // Snapshot the files this turn starts from, at the last moment before the
+    // agent can touch them — what "go back to before this message" restores.
+    // Bounded wait; a snapshot still running when the turn starts is `late`.
+    await this.#checkpointTurn(turnId);
     this.#throwIfStoppedBeforeStart(stopGen);
-
     // The backend may have started a turn on its own while this send awaited
-    // (hooks, identity) — join it rather than start a second turn over it,
+    // (hooks, identity, the snapshot) — checked AFTER every await, so nothing
+    // can start in between — join it rather than start a second turn over it,
     // whose runTurn would close the adopted queue mid-reply. Joining means
     // the adopted turn's id, not the one minted for this prompt.
     const adopted = this.#activeRun;
     if (adopted?.pushMidTurn) {
+      // The snapshot was for a turn that won't happen.
+      void this.#dropCheckpoint(turnId);
       // #adoptTurn gave the adopted run its own id (current, unless unset).
       if (this.#currentTurnId === turnId) this.#currentTurnId = previousTurnId;
       this.#accumulator.pushUserTurn(effectivePrompt, this.#currentTurnId ?? undefined, { prompt: text, at: turnAt });
@@ -2174,14 +2187,6 @@ export class Session {
       return;
     }
 
-    // Snapshot the files this turn starts from, at the last moment before the
-    // agent can touch them — what "go back to before this message" restores.
-    // Bounded wait; a snapshot still running when the turn starts is `late`.
-    // A message that meant to join a running turn whose run turned out to be
-    // stalled (recovered above) starts a turn of its own instead.
-    if (turnId === previousTurnId) turnId = randomUUID();
-    await this.#checkpointTurn(turnId);
-    this.#throwIfStoppedBeforeStart(stopGen);
     this.#currentTurnId = turnId;
     this.#indexTurn(turnId, "prompt", text, turnAt);
     this.#accumulator.pushUserTurn(effectivePrompt, turnId, { prompt: text, at: turnAt });
@@ -2210,6 +2215,8 @@ export class Session {
       // belong to the turn that was current before this send, not to a turn
       // that never happened.
       if (this.#currentTurnId === turnId && turnId !== previousTurnId) this.#currentTurnId = previousTurnId;
+      // ...and its snapshot (if one was taken) belongs to no turn.
+      if (turnId !== previousTurnId) void this.#dropCheckpoint(turnId);
       throw err;
     }
   }
@@ -5172,7 +5179,14 @@ export class Session {
       startedAt: at,
     };
     this.#turnIndex.push(entry);
-    if (!this.#destroyed) void this.#transcriptStore.recordTurn(this.id, entry);
+    if (this.#destroyed) return;
+    // Bounded: keep the newest TURN_INDEX_KEEP once it grows past the slack.
+    if (this.#turnIndex.length > TURN_INDEX_KEEP + TURN_INDEX_SLACK) {
+      this.#turnIndex = this.#turnIndex.slice(-TURN_INDEX_KEEP);
+      void this.#transcriptStore.replaceTurnIndex(this.id, this.#turnIndex);
+    } else {
+      void this.#transcriptStore.recordTurn(this.id, entry);
+    }
   }
 
   /**
@@ -5227,6 +5241,9 @@ export class Session {
       sessionId: this.id,
       turnId,
       isLate: () => started,
+      // The daemon's own data (transcripts, checkpoints, config, db) is never
+      // snapshotted, even if a workdir somehow contains it.
+      excludeDirs: [this.#transcriptStore.dir, ...(this.#config?.dbPath ? [dirname(this.#config.dbPath)] : [])],
       limits: {
         ...(cfg?.maxPerSession !== undefined ? { maxPerSession: cfg.maxPerSession } : {}),
         ...(cfg?.maxUntrackedBytes !== undefined ? { maxUntrackedBytes: cfg.maxUntrackedBytes } : {}),
@@ -5242,6 +5259,13 @@ export class Session {
     const wait = waitMs ?? cfg?.waitMs ?? 2_000;
     if (wait > 0) await Promise.race([job, new Promise((r) => setTimeout(r, wait).unref?.())]);
     started = true;
+  }
+
+  /** Remove a snapshot taken for a turn that never started. Never throws. */
+  async #dropCheckpoint(turnId: string): Promise<void> {
+    if (!this.#checkpointsEnabled()) return;
+    await Promise.allSettled([...this.#pendingCheckpoints]);
+    await deleteCheckpoint(this.#checkpointRoot, this.id, turnId).catch(() => {});
   }
 
   /**
@@ -5298,7 +5322,6 @@ export class Session {
         root: this.#checkpointRoot,
         fromSessionId: parent.id,
         toSessionId: this.id,
-        toWorkdir: this.workdir,
         turnIds: entries.map((e) => e.turnId),
       });
     } catch (err) {

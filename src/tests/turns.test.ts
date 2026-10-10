@@ -435,6 +435,35 @@ describe("turn attribution across mid-turn messages, rotation and forks", () => 
   });
 });
 
+describe("a turn the backend starts on its own during the snapshot", () => {
+  it("is joined, never overwritten by a second turn", async () => {
+    // A tree big enough that the snapshot takes a while.
+    for (let i = 0; i < 3000; i++) writeFileSync(join(repo, `f${i}.txt`), `${i}\n`);
+    const m = new SessionManager(store, transcript, undefined, undefined, undefined, {
+      config: mkConfig(tmp),
+      _testProviderFactory: () => {
+        const p = new MockSessionProvider("claude", [], { midTurn: true });
+        p.continuesAfterBackgroundWork = true;
+        providers.push(p);
+        return p;
+      },
+    });
+    managers.push(m);
+    const id = await create(m);
+    const s = m._sessionForTest(id)!;
+    const sending = s.send("is it done?", AUTH);
+    for (let i = 0; i < 500 && !s.preparingTurn; i++) await Bun.sleep(1);
+    await Bun.sleep(5); // inside the snapshot wait
+    providers.at(-1)!.startOwnTurn([{ type: "text_delta", content: "background result…" } as ProviderEvent]);
+    await sending;
+    const p = providers.at(-1)!;
+    expect(p.capturedOpts).toHaveLength(0); // no second runTurn over the adopted turn
+    expect(p.midTurnPushes.map((x) => x.content)).toEqual(["is it done?"]);
+    expect(p.endTurnCount).toBe(0);
+    await s.interrupt(AUTH);
+  });
+});
+
 describe("a pipeline phase and a Stop before its turn starts", () => {
   it("the phase returns instead of waiting forever for a turn that never starts", async () => {
     const m = newManager([say("unused")]);

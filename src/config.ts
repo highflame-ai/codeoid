@@ -371,11 +371,12 @@ const SessionSchema = z
      */
     resumeMaxSessions: z.number().int().min(1).default(200),
     /**
-     * Per-turn workspace snapshots (#354): at the start of every turn in a
-     * git workdir, the working tree (tracked + untracked, non-ignored files)
-     * is recorded under a hidden ref `refs/codeoid/checkpoints/<session>/<turn>`
-     * so a later "go back a turn" / "fork from here" can put the files back.
-     * Never touches the branch, index, stash or working tree. Optional with
+     * Per-turn workspace snapshots (#354): at the start of every turn the
+     * session's working directory (minus .gitignore'd files, secrets and
+     * dependency dirs) is recorded in a daemon-owned shadow git repository
+     * under <transcriptDir>/checkpoints/, so a later "go back a turn" / "fork
+     * from here" can put the files back. Works in git and non-git
+     * directories; never touches the user's repository. Optional with
      * defaults applied at use, so existing configs keep working.
      */
     checkpoints: z

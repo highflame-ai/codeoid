@@ -799,16 +799,21 @@ mcpHub: this.#mcpHub,
             maxBytes: RESUME_CANONICAL_MAX_BYTES,
           });
           const index = await this.#transcriptStore.loadTurnIndex(meta.sessionId);
-          // Rebuilt from the transcript when there is no log — persisted only
-          // when the whole transcript was read, so a bounded read never
-          // becomes the permanent record.
-          const transcriptComplete = loadStats.truncated !== true;
+          // No log: a session from before it existed. Rebuild once from the
+          // WHOLE transcript (the scrollback window above may be a tail) and
+          // persist it — a long session's history must not shrink to the
+          // window, or to just the next turn on the following restart.
+          let rebuildFrom = messages;
+          if (!canonical && loadStats.truncated === true) {
+            const all = await this.#transcriptStore.loadTranscript(meta.sessionId, { deadlineAt: deadline });
+            rebuildFrom = all.map((e) => e.message);
+          }
           const history =
-            canonical?.turns ?? (messages.length > 0 ? canonicalFromTranscript(messages, providerId) : []);
+            canonical?.turns ?? (rebuildFrom.length > 0 ? canonicalFromTranscript(rebuildFrom, providerId) : []);
           session.restoreTurns(history, index ?? turnIndexFromHistory(history), {
-            persistHistory: !canonical && history.length > 0 && transcriptComplete,
+            persistHistory: !canonical && history.length > 0,
             persistIndex: !index && history.some((t) => t.turnId),
-            partial: canonical?.partial ?? !transcriptComplete,
+            partial: canonical?.partial ?? false,
           });
         } catch (err) {
           console.error(
@@ -3572,7 +3577,10 @@ mcpHub: this.#mcpHub,
       await fork.primeFromFork(history, transcriptRows, sizeHints, workdirNote);
       // The inherited turns keep their ids, list entries and file snapshots
       // (#354) — and the snapshots survive the parent being destroyed.
-      await fork.inheritTurns(parent, parent.turnIndex);
+      // Only turns the fork's history actually contains: the parent may have
+      // started another while this fork was being built.
+      const forkTurnIds = new Set(history.map((t) => t.turnId).filter(Boolean));
+      await fork.inheritTurns(parent, parent.turnIndex.filter((e) => forkTurnIds.has(e.turnId)));
     } catch (err) {
       // Orphan cleanup: if building the fork failed after we created its
       // worktree, remove it so no dangling worktree + branch is left behind.
@@ -3874,7 +3882,7 @@ mcpHub: this.#mcpHub,
           } catch (err) {
             // A Stop landed before the turn started: no turn will rest, so
             // don't wait for one — hand back like any interrupt.
-            if (err instanceof SendStoppedError) return { finalStatus: "idle", text: summary(session.lastAssistantText ?? "") };
+            if (err instanceof SendStoppedError) return { finalStatus: "idle", text: "Stopped before the agent started on this phase." };
             throw err;
           }
           pendingSend = null;
@@ -4619,10 +4627,17 @@ mcpHub: this.#mcpHub,
           // interrupting a mid-turn session would corrupt its work. One batched
           // injection per recipient: N completions = one wake.
           if (session.status !== "idle") continue;
-          await session.send(
-            this.#fleetEventsBody(batch),
-            this.#dispatchSystemAuth(accountId, projectId),
-          );
+          try {
+            await session.send(
+              this.#fleetEventsBody(batch),
+              this.#dispatchSystemAuth(accountId, projectId),
+            );
+          } catch (err) {
+            // Stopped before its turn started: not delivered — retried on the
+            // next tick. Other recipients' deliveries still count.
+            if (err instanceof SendStoppedError) continue;
+            throw err;
+          }
           delivered.push(...batch.map((e) => e.id));
         }
         if (undeliverable.length > 0) {
