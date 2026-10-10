@@ -11,6 +11,7 @@
  *   codeoid interrupt <name|id>           Interrupt a running agent
  *   codeoid approve <name|id> [yes|no]    Approve/deny pending permission
  *   codeoid undo <name|id> [files [yes|force]]  Take back the last message
+ *   codeoid fork <name|id> [--at N]       Fork (after prompt N, with its files)
  *   codeoid skill allow <command>          Pre-approve a skill's command (unattended runs)
  *   codeoid destroy <name|id>             Destroy a session
  */
@@ -589,6 +590,31 @@ program
     const client = new TerminalClient(config);
     await client.connect();
     await client.interruptSession(session);
+    client.disconnect();
+  });
+
+program
+  .command("fork <session>")
+  .description("Fork a session into a new one — from its latest point, or after prompt N (with the files as they were then)")
+  .option("--at <n>", "fork after prompt N (1 = the first)")
+  .option("--backend <id>", "continue on another backend")
+  .option("--shared", "share the parent's folder instead of a new git worktree")
+  .option("--name <name>", "name for the fork")
+  .action(async (session: string, o: { at?: string; backend?: string; shared?: boolean; name?: string }) => {
+    const at = o.at !== undefined ? Number(o.at) : undefined;
+    if (at !== undefined && (!Number.isInteger(at) || at < 1)) {
+      console.error("--at takes a prompt number (1 = the first)");
+      process.exit(1);
+    }
+    const config = loadConfig();
+    const client = new TerminalClient(config);
+    await client.connect();
+    await client.forkSession(session, {
+      ...(at !== undefined ? { at } : {}),
+      ...(o.backend ? { backend: o.backend } : {}),
+      ...(o.shared ? { shared: true } : {}),
+      ...(o.name ? { name: o.name } : {}),
+    });
     client.disconnect();
   });
 

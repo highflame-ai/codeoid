@@ -196,6 +196,18 @@ export class TuiWsClient {
     return this.#request({ type: "session.rotate", id: randomUUID(), sessionId });
   }
 
+  /** Fork a session — from its latest point, or after `afterTurnId` (#356). */
+  fork(sessionId: string, opts: { afterTurnId?: string; providerId?: string; isolate?: boolean } = {}): Promise<DaemonMessage> {
+    return this.#request({
+      type: "session.fork",
+      id: randomUUID(),
+      sessionId,
+      ...(opts.afterTurnId ? { afterTurnId: opts.afterTurnId } : {}),
+      ...(opts.providerId ? { providerId: opts.providerId } : {}),
+      ...(opts.isolate === false ? { isolate: false } : {}),
+    });
+  }
+
   /** A session's turns, oldest first (#354). */
   turns(sessionId: string): Promise<DaemonMessage> {
     return this.#request({ type: "session.turns", id: randomUUID(), sessionId });

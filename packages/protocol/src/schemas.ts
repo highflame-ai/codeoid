@@ -308,6 +308,7 @@ export const sessionForkSchema = z.object({
   isolate: z.boolean().optional(),
   workdir: pathField.optional(),
   baseBranch: nameField.optional(),
+  afterTurnId: z.string().min(1).max(128).optional(),
 });
 
 export const scrollbackPageSchema = z.object({

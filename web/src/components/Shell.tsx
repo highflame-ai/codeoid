@@ -30,6 +30,7 @@ import ResizeHandle from "./ResizeHandle";
 import SearchModal from "./SearchModal";
 import SessionExportModal from "./SessionExportModal";
 import RewindModal from "./RewindModal";
+import ForkFromHereModal from "./ForkFromHereModal";
 import SessionImportModal from "./SessionImportModal";
 import SessionListPane from "./SessionListPane";
 import SettingsDrawer from "./SettingsDrawer";
@@ -65,6 +66,7 @@ const Shell: Component = () => {
       <BlackboardDrawer />
       <SessionExportModal />
       <RewindModal />
+      <ForkFromHereModal />
       <SessionImportModal />
       <SettingsDrawer />
       <PackBrowser />

@@ -20,7 +20,7 @@ import {
 } from "./workspace-commands.js";
 import type { Attachment } from "../protocol/types.js";
 import { parseDialogAnswer } from "../terminal/dialog.js";
-import { formatRewind, parseUndoArgs } from "../terminal/rewind.js";
+import { formatRewind, parseForkArgs, parseUndoArgs } from "../terminal/rewind.js";
 import { sanitizeTerminalOutput } from "./ansi/codes.js";
 import { dialogDetail, dialogHint } from "./dialog-hint.js";
 import type { CodeoidConfig } from "../config.js";
@@ -870,6 +870,38 @@ export function App({ config }: Props) {
           .catch((err: Error) =>
             dispatch({ type: "error", message: err.message }),
           );
+        return;
+      }
+      case "/fork": {
+        // Fork from the latest point, or after prompt N (#356): /fork [N] [--shared] [--backend <id>]
+        if (!client || !focusedSession) return;
+        const parsed = parseForkArgs(args);
+        if ("error" in parsed) {
+          dispatch({ type: "error", message: parsed.error });
+          return;
+        }
+        const sessionId = focusedSession.info.id;
+        void (async () => {
+          let afterTurnId: string | undefined;
+          if (parsed.at !== undefined) {
+            const list = await client.turns(sessionId);
+            if (list.type !== "session.turns.result") throw new Error("could not list turns");
+            const t = list.turns[parsed.at - 1];
+            if (!t) throw new Error(`there is no prompt ${parsed.at} (this session has ${list.turns.length})`);
+            afterTurnId = t.turnId;
+          }
+          const res = await client.fork(sessionId, {
+            ...(afterTurnId ? { afterTurnId } : {}),
+            ...(parsed.backend ? { providerId: parsed.backend } : {}),
+            ...(parsed.shared ? { isolate: false } : {}),
+          });
+          if (res.type !== "response.ok" || !res.data) {
+            throw new Error(res.type === "response.error" ? res.error : "fork failed");
+          }
+          const info = res.data as import("../protocol/types.js").SessionInfo;
+          dispatch({ type: "session.add", session: info });
+          dispatch({ type: "focus", sessionId: info.id });
+        })().catch((err: Error) => dispatch({ type: "error", message: err.message }));
         return;
       }
       case "/undo": {

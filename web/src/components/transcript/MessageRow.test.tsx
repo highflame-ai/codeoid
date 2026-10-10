@@ -5,6 +5,8 @@ import { createSignal } from "solid-js";
 
 const openRewindMock = vi.hoisted(() => vi.fn());
 vi.mock("../RewindModal", () => ({ openRewind: openRewindMock }));
+const openForkMock = vi.hoisted(() => vi.fn());
+vi.mock("../ForkFromHereModal", () => ({ openForkFromHere: openForkMock }));
 
 import MessageRow from "./MessageRow";
 import { REASONING_UNAVAILABLE } from "../../protocol/types";
@@ -171,5 +173,30 @@ describe("go back to here (#355)", () => {
     cleanup();
     const t = render(() => <MessageRow msg={thinkingMsg("x")} />);
     expect(t.queryByText(/go back to here/)).toBeNull();
+  });
+});
+
+describe("fork from here (#356)", () => {
+  const msg = (role: "user" | "assistant", turnId?: string): SessionMessage =>
+    ({
+      type: "session.message",
+      sessionId: "s",
+      messageId: `${role}1`,
+      role,
+      content: "x",
+      identity: { sub: "u", type: role === "user" ? "human" : "agent" },
+      timestamp: "2026-05-04T08:00:00Z",
+      ...(turnId ? { turnId } : {}),
+    }) as unknown as SessionMessage;
+
+  it("prompts and replies with a turn id offer forking from there; only prompts offer going back", () => {
+    const r = render(() => <MessageRow msg={msg("assistant", "T7")} />);
+    fireEvent.click(r.getByText(/fork from here/));
+    expect(openForkMock).toHaveBeenCalledWith("s", "T7");
+    expect(r.queryByText(/go back to here/)).toBeNull();
+    cleanup();
+    const u = render(() => <MessageRow msg={msg("user", "T1")} />);
+    expect(u.getByText(/fork from here/)).toBeTruthy();
+    expect(u.getByText(/go back to here/)).toBeTruthy();
   });
 });

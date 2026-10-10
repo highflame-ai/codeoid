@@ -11,7 +11,7 @@
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, sep } from "node:path";
-import { RewindError, SendStoppedError, Session, type AttachedClient, type WindowScope } from "./session.js";
+import { type ForkPoint, RewindError, SendStoppedError, Session, type AttachedClient, type WindowScope } from "./session.js";
 import { sweepCheckpoints } from "./checkpoints.js";
 import { type CatalogEntry, isPlaceholderModel, type SessionProvider } from "./providers/interface.js";
 import {
@@ -302,6 +302,23 @@ const RESUME_DEADLINE_MS = 20_000;
  * 20 MiB / 5000 messages — parsing history past that would be evicted on
  * arrival, so cap the read slightly above the scrollback byte cap. */
 const RESUME_TRANSCRIPT_MAX_BYTES = 24 * 1024 * 1024;
+/**
+ * Transcript rows of a fork from an earlier turn (#356): everything before the
+ * first row of the first later turn (positional — notices between turns go
+ * with what came after them). If none of the later turns' rows are loaded,
+ * drop the rows stamped with them instead of guessing a position.
+ */
+export function cutRowsBeforeTurns<T extends { message: DaemonMessage }>(rows: T[], laterTurnIds: readonly string[]): T[] {
+  if (laterTurnIds.length === 0) return rows;
+  const later = new Set(laterTurnIds);
+  const turnOf = (r: T) => (r.message as { turnId?: string }).turnId;
+  const at = rows.findIndex((r) => {
+    const id = turnOf(r);
+    return id !== undefined && later.has(id);
+  });
+  return at === -1 ? rows : rows.slice(0, at);
+}
+
 /**
  * Newest part of a session's canonical-history log read on resume (#354).
  * The prompts a backend is re-seeded with are budgeted far below this; the
@@ -3427,8 +3444,18 @@ mcpHub: this.#mcpHub,
     // Snapshot the parent's state BEFORE building the fork. Canonical history
     // is the source of truth for the conversation; the transcript rows are
     // replayed into the fork's scrollback for UI visibility.
-    // The WHOLE conversation — after a restart memory may hold only its tail.
-    const history = (await parent.fullCanonicalHistory()).map((t) => ({ ...t }));
+    // Fork from an earlier turn (#356): the conversation, turn list and files
+    // as they were right after it. Otherwise the WHOLE conversation — after a
+    // restart memory may hold only its tail.
+    let point: ForkPoint | null = null;
+    if (msg.afterTurnId) {
+      try {
+        point = await parent.forkPoint(msg.afterTurnId);
+      } catch (err) {
+        return { type: "response.error", requestId: msg.id, error: err instanceof Error ? err.message : String(err), code: "not_found" };
+      }
+    }
+    const history = (point ? point.history : await parent.fullCanonicalHistory()).map((t) => ({ ...t }));
     const parentInfo = parent.toInfo();
     let transcriptRows: DaemonMessage[] = [];
     let sizeHints: Array<number | undefined> = [];
@@ -3436,8 +3463,11 @@ mcpHub: this.#mcpHub,
       const entries = await this.#transcriptStore.loadTranscript(msg.sessionId, {
         maxBytes: RESUME_TRANSCRIPT_MAX_BYTES,
       });
-      transcriptRows = entries.map((e) => e.message);
-      sizeHints = entries.map((e) => e.bytes);
+      // From an earlier turn: only the rows up to it (positional cut at the
+      // next turn's first row; rows of later turns dropped if that's missing).
+      const kept = point ? cutRowsBeforeTurns(entries, point.laterTurnIds) : entries;
+      transcriptRows = kept.map((e) => e.message);
+      sizeHints = kept.map((e) => e.bytes);
     } catch (err) {
       // Scrollback replay is best-effort — the fork's CONVERSATION is carried
       // by the canonical history above, which is already in memory.
@@ -3448,7 +3478,7 @@ mcpHub: this.#mcpHub,
 
     // Branch point = conversation rounds (user turns) carried over — the
     // human "you forked after N prompts" the lineage chip shows.
-    const atTurn = history.filter((t) => t.role === "user").length;
+    const atTurn = point ? point.atTurn : history.filter((t) => t.role === "user").length;
 
     // Git isolation: a fork must not share the parent's working tree, or two
     // agents editing the same files collide. Default: give the fork its OWN
@@ -3583,7 +3613,26 @@ mcpHub: this.#mcpHub,
       // Only turns the fork's history actually contains: the parent may have
       // started another while this fork was being built.
       const forkTurnIds = new Set(history.map((t) => t.turnId).filter(Boolean));
-      await fork.inheritTurns(parent, parent.turnIndex.filter((e) => forkTurnIds.has(e.turnId)));
+      const filesPoint = point?.files && "checkpointId" in point.files ? point.files.checkpointId : undefined;
+      await fork.inheritTurns(
+        parent,
+        (point ? point.entries : parent.turnIndex).filter((e) => forkTurnIds.has(e.turnId)),
+        filesPoint ? [filesPoint] : [],
+      );
+      // ...and the files as they were right after that turn — only in a
+      // worktree codeoid made for this fork, never in a shared or bound one.
+      if (point?.files) {
+        await fork.noteForkFiles(
+          filesPoint && worktree?.createdByCodeoid
+            ? await fork
+                .rollFilesTo(filesPoint)
+                .then(({ restored, removed }) => `📂 Files are as they were right after prompt ${point!.atTurn} (${restored} restored, ${removed} removed).`)
+                .catch((err: unknown) => `⚠️ The files couldn't be put back to right after prompt ${point!.atTurn} (${err instanceof Error ? err.message : String(err)}); this fork has the parent's current files.`)
+            : "unavailable" in point.files
+              ? `⚠️ This fork has the parent's current files: ${point.files.unavailable}.`
+              : `⚠️ This fork shares or binds a working directory, so its files are the current ones, not those from right after prompt ${point.atTurn}.`,
+        );
+      }
     } catch (err) {
       // Orphan cleanup: if building the fork failed after we created its
       // worktree, remove it so no dangling worktree + branch is left behind.

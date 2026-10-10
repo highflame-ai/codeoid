@@ -498,6 +498,23 @@ async function hasSymlinkedParent(workdir: string, rel: string): Promise<boolean
   return false;
 }
 
+/** Where a fork from an earlier turn branches (#356). */
+export interface ForkPoint {
+  /** The conversation through the chosen turn, its reply included. */
+  history: readonly CanonicalTurn[];
+  /** The turn list through the chosen turn. */
+  entries: TurnIndexEntry[];
+  /** Turns after it, which the fork doesn't carry. */
+  laterTurnIds: string[];
+  /** 1-based position of the chosen turn (the "forked after prompt N" chip). */
+  atTurn: number;
+  /**
+   * The files right after that turn: a checkpoint id to copy and roll to, or
+   * why there isn't one. Absent when it's the latest turn (the live files).
+   */
+  files?: { checkpointId: string } | { unavailable: string };
+}
+
 /** A rewind that can't proceed (unknown turn, a turn that wouldn't stop). */
 export class RewindError extends Error {
   constructor(
@@ -5530,23 +5547,110 @@ export class Session {
    * turn list and checkpoints match, and keeps the snapshots alive after the
    * parent is destroyed.
    */
-  async inheritTurns(parent: Session, entries: readonly TurnIndexEntry[]): Promise<void> {
+  async inheritTurns(
+    parent: Session,
+    entries: readonly TurnIndexEntry[],
+    /** More of the parent's checkpoints to copy (a fork point's file snapshot). */
+    extraCheckpointIds: readonly string[] = [],
+  ): Promise<void> {
     this.#turnIndex = entries.map((e) => ({ ...e }));
     this.#endSnapshotTurn = entries.at(-1)?.turnId ?? null;
     void this.#transcriptStore.replaceTurnIndex(this.id, this.#turnIndex);
-    if (!this.#checkpointsEnabled() || entries.length === 0) return;
+    if (!this.#checkpointsEnabled() || (entries.length === 0 && extraCheckpointIds.length === 0)) return;
     try {
       await copyCheckpoints({
         root: this.#checkpointRoot,
         fromSessionId: parent.id,
         toSessionId: this.id,
-        turnIds: entries.flatMap((e) => [e.turnId, endSnapshotId(e.turnId)]),
+        turnIds: [...entries.flatMap((e) => [e.turnId, endSnapshotId(e.turnId)]), ...extraCheckpointIds],
       });
     } catch (err) {
       console.error(
         `[codeoid/fork ${this.id.slice(0, 8)}] could not copy the parent's checkpoints (the fork's earlier turns have no snapshots): ${err instanceof Error ? err.message : String(err)}`,
       );
     }
+  }
+
+  // ── Forking from a turn (#356) ────────────────────────────────────────
+
+  /**
+   * Where a fork "after `turnId`" branches (#356): the conversation through
+   * that turn (its reply included), its turn list, and the snapshot of the
+   * files right after it — that turn's end snapshot, else the next turn's
+   * start, else none (it's the latest turn: the live files). Backend-agnostic:
+   * all of it comes from codeoid's own records.
+   */
+  async forkPoint(turnId: string): Promise<ForkPoint> {
+    const pos = this.#turnIndex.findIndex((e) => e.turnId === turnId);
+    if (pos === -1) throw new RewindError("not_found", "That turn isn't in this session (or is older than its turn list).");
+    const later = new Set(this.#turnIndex.slice(pos + 1).map((e) => e.turnId));
+    const history = await this.fullCanonicalHistory();
+    let cut = history.findIndex((t) => t.turnId !== undefined && later.has(t.turnId));
+    if (cut === -1) cut = history.length;
+    const nextTurnId = this.#turnIndex[pos + 1]?.turnId;
+    let files: ForkPoint["files"];
+    // The latest turn (no next one): an ordinary fork — the live files ARE
+    // "right after it", hand edits since included; no snapshot involved.
+    if (nextTurnId && this.#checkpointsEnabled()) {
+      const records = await listCheckpoints(this.#checkpointRoot, this.id);
+      const endId = endSnapshotId(turnId);
+      if (records.has(endId)) files = { checkpointId: endId };
+      else if (records.has(nextTurnId)) files = { checkpointId: nextTurnId };
+      else files = { unavailable: "there is no snapshot of the files from right after that turn" };
+    } else if (nextTurnId) {
+      files = { unavailable: "workspace snapshots are turned off" };
+    }
+    return {
+      history: history.slice(0, cut),
+      entries: this.#turnIndex.slice(0, pos + 1).map((e) => ({ ...e })),
+      laterTurnIds: [...later],
+      atTurn: pos + 1,
+      ...(files ? { files } : {}),
+    };
+  }
+
+  /**
+   * Make this session's work tree match one of its checkpoints (#356: a fork
+   * branched from an earlier turn starts from that turn's files). Same one-
+   * step git restore as going back; files ignored under that snapshot's
+   * rules are left alone. Serialized with snapshots. Throws on failure.
+   */
+  async rollFilesTo(checkpointId: string): Promise<{ restored: number; removed: number }> {
+    return this.#serializedCheckpointOp(async () => {
+      const rec = (await listCheckpoints(this.#checkpointRoot, this.id)).get(checkpointId);
+      if (!rec) throw new Error("that snapshot isn't available to this session");
+      const now = await currentTree({
+        root: this.#checkpointRoot,
+        workdir: this.workdir,
+        sessionId: this.id,
+        excludeDirs: this.#protectedDirs(),
+        limits: this.#checkpointLimits(),
+      });
+      if (!now.ok) throw new Error(now.reason);
+      const changes = await diffTrees(this.#checkpointRoot, this.id, rec.sha, now.tree);
+      if (changes.length === 0) return { restored: 0, removed: 0 };
+      const created = changes.filter((c) => c.status === "A").map((c) => c.path);
+      const keep = await ignoredUnderTree(this.#checkpointRoot, this.id, rec.sha, created);
+      await restoreTree({
+        root: this.#checkpointRoot,
+        workdir: this.workdir,
+        sessionId: this.id,
+        from: now.tree,
+        to: rec.sha,
+        ...(keep.length > 0 ? { keep } : {}),
+      });
+      return {
+        restored: changes.filter((c) => c.status !== "A").length,
+        removed: created.length - keep.length,
+      };
+    });
+  }
+
+  /** Post a notice about a fork's files (#356) into its scrollback. */
+  async noteForkFiles(text: string): Promise<void> {
+    const msg = this.#makeMessage("info", text, SYSTEM_IDENTITY, undefined, undefined, { event: "fork.files" });
+    this.#persistAndBuffer(msg);
+    this.#broadcastRaw(msg);
   }
 
   // ── Going back a turn (#355) ──────────────────────────────────────────
