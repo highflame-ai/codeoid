@@ -449,6 +449,119 @@ describe("going back a turn: the files", () => {
   });
 });
 
+describe("going back a turn: round-2 regressions", () => {
+  it("after a restart, a hand edit is still a conflict (the real end snapshot isn't re-taken)", async () => {
+    const m = newManager(undefined, [() => writeFileSync(join(repo, "a.txt"), "agent\n")]);
+    const id = await create(m);
+    await sendAndSettle(m, id, "one");
+    await Bun.sleep(200);
+    await m.drain(2_000);
+    await transcript.flush();
+    providers = [];
+    const next = newManager([say("x")]);
+    await next.resumeSessions();
+    writeFileSync(join(repo, "a.txt"), "my edit after the restart\n");
+    const t1 = (await turns(next, id))[0]!.turnId;
+    const dry = await rewind(next, id, t1, { restoreFiles: true, dryRun: true });
+    expect(dry.files?.conflicts).toEqual(["a.txt"]);
+    const real = await rewind(next, id, t1, { restoreFiles: true, planId: dry.planId });
+    expect(real.refused).toBeTruthy();
+    expect(readFileSync(join(repo, "a.txt"), "utf8")).toBe("my edit after the restart\n");
+  });
+
+  it("previewing a running session and confirming goes through (no spurious refusal)", async () => {
+    const m = new SessionManager(store, transcript, undefined, undefined, undefined, {
+      config: mkConfig(tmp),
+      _testProviderFactory: () => {
+        const p = new MockSessionProvider("claude", [say("a1"), [{ type: "text_delta", content: "working…" } as ProviderEvent]], { stall: true });
+        const run = p.runTurn.bind(p);
+        let n = 0;
+        p.runTurn = (opts) => {
+          if (n++ === 1) writeFileSync(join(repo, "a.txt"), "agent mid-turn\n");
+          return run(opts);
+        };
+        providers.push(p);
+        return p;
+      },
+    });
+    managers.push(m);
+    const id = await create(m);
+    await sendAndSettle(m, id, "first");
+    const s = m._sessionForTest(id)!;
+    await s.send("long task", AUTH);
+    for (let i = 0; i < 100 && s.status === "idle"; i++) await Bun.sleep(5);
+    const t2 = (await turns(m, id))[1]!.turnId;
+    const dry = await rewind(m, id, t2, { restoreFiles: true, dryRun: true });
+    expect(dry.files?.conflicts).toEqual([]); // the running turn's edits are the agent's
+    const real = await rewind(m, id, t2, { restoreFiles: true, planId: dry.planId });
+    expect(real.refused).toBeUndefined();
+    expect(readFileSync(join(repo, "a.txt"), "utf8")).toBe("v0\n");
+  });
+
+  it("a message sent while a busy session is being rewound is not cancelled by it", async () => {
+    const m = new SessionManager(store, transcript, undefined, undefined, undefined, {
+      config: mkConfig(tmp),
+      _testProviderFactory: () => {
+        const p = new MockSessionProvider("claude", [say("a1"), [{ type: "text_delta", content: "working…" } as ProviderEvent], say("a3")], { stall: true });
+        providers.push(p);
+        return p;
+      },
+    });
+    managers.push(m);
+    const id = await create(m);
+    await sendAndSettle(m, id, "first");
+    const s = m._sessionForTest(id)!;
+    await s.send("long task", AUTH);
+    for (let i = 0; i < 100 && s.status === "idle"; i++) await Bun.sleep(5);
+    const rewinding = rewind(m, id, (await turns(m, id))[1]!.turnId);
+    const after = s.send("the right message", AUTH);
+    await rewinding;
+    await expect(after).resolves.toBeUndefined();
+    expect(s.canonicalHistory.some((t) => t.content === "the right message")).toBe(true);
+  });
+
+  it("a busy session is never stopped by a caller who can't interrupt, even if it got busy while the rewind queued", async () => {
+    const m = new SessionManager(store, transcript, undefined, undefined, undefined, {
+      config: mkConfig(tmp),
+      _testProviderFactory: () => {
+        const p = new MockSessionProvider("claude", [say("a1"), [{ type: "text_delta", content: "working…" } as ProviderEvent]], { stall: true });
+        providers.push(p);
+        return p;
+      },
+    });
+    managers.push(m);
+    const id = await create(m);
+    await sendAndSettle(m, id, "first");
+    const s = m._sessionForTest(id)!;
+    await s.send("long task", AUTH);
+    for (let i = 0; i < 100 && s.status === "idle"; i++) await Bun.sleep(5);
+    const t2 = (await turns(m, id))[1]!.turnId;
+    // The manager's fast check is bypassed here on purpose: the session itself must refuse.
+    await expect(s.rewind(t2, { canStop: false }, AUTH)).rejects.toThrow(/busy/);
+    await expect(s.rewind("bogus", { canStop: true }, AUTH)).rejects.toThrow(/isn't in this session/);
+    expect(s.status).not.toBe("idle"); // nothing was stopped
+    await s.interrupt(AUTH);
+  });
+
+  it("a path under a symlinked directory is reported as skipped, never written through", async () => {
+    const outside = join(tmp, "outside");
+    mkdirSync(outside);
+    mkdirSync(join(repo, "sub"));
+    writeFileSync(join(repo, "sub", "keep.txt"), "orig\n");
+    const m = newManager(undefined, [
+      () => {
+        rmSync(join(repo, "sub"), { recursive: true });
+        execFileSync("ln", ["-s", outside, join(repo, "sub")]);
+      },
+    ]);
+    const id = await create(m);
+    await sendAndSettle(m, id, "one");
+    const r = await rewind(m, id, (await turns(m, id))[0]!.turnId, { restoreFiles: true, force: true });
+    expect(r.files?.skipped).toContain("sub/keep.txt");
+    expect(existsSync(join(outside, "keep.txt"))).toBe(false);
+  });
+});
+
 describe("going back a turn: the agent really forgets", () => {
   it("two undos in a row leave nothing queued for the backend to replay", async () => {
     const m = newManager();
@@ -556,7 +669,7 @@ describe("irreversibleEffects", () => {
     expect(effects).toEqual([
       { tool: "Bash", detail: "git push origin main" },
       { tool: "mcp__github__create_pr", detail: '{"title":"x"}' },
-      { tool: "bash", detail: "curl -H 'Authorization: Bearer «redacted»' https://x" },
+      { tool: "bash", detail: "curl -H 'Authorization: «redacted»' https://x" },
       { tool: "run_shell_command", detail: "npm publish" },
     ]);
   });

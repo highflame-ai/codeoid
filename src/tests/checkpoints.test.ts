@@ -287,6 +287,17 @@ describe("createCheckpoint", () => {
     expect((await listCheckpoints(root, "s1")).get("t1")?.late).toBe(true);
   });
 
+  it("onlyIfMissing never overwrites an existing checkpoint (an end snapshot is recorded once)", async () => {
+    initRepo();
+    writeFileSync(join(repo, "a.txt"), "as the agent left it\n");
+    const first = await createCheckpoint({ root, workdir: repo, sessionId: "s1", turnId: "t1-end", onlyIfMissing: true });
+    writeFileSync(join(repo, "a.txt"), "edited by hand later\n");
+    const again = await createCheckpoint({ root, workdir: repo, sessionId: "s1", turnId: "t1-end", onlyIfMissing: true });
+    if (!first.ok || !again.ok) throw new Error("snapshot failed");
+    expect(again.sha).toBe(first.sha);
+    expect(show("s1", again.sha, "a.txt")).toBe("as the agent left it\n");
+  });
+
   it("runs one snapshot per session at a time", async () => {
     initRepo();
     const [a, b] = await Promise.all([

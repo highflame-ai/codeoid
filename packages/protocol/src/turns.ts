@@ -63,7 +63,9 @@ export interface SessionTurnsResultMsg {
  * changes nothing; a real restore that would overwrite files changed by
  * hand since the agent's last turn is refused unless `force`.
  *
- * A running turn is stopped first. Scope: `session:send`.
+ * A running turn is stopped first. Scopes: `session:send`; a preview also
+ * needs `session:attach` or `session:watch`; restoring files needs
+ * `session:approve`; stopping a busy session needs `session:interrupt`.
  */
 export interface SessionRewindMsg {
   type: "session.rewind";
@@ -100,6 +102,12 @@ export interface RewindFiles {
   conflicts: string[];
   /** The snapshot was still being taken when that turn's agent started. */
   late?: boolean;
+  /**
+   * Paths left as they are because something else occupies them now (an
+   * ignored file, a file where a deleted directory would go, a symlinked
+   * directory): not restored.
+   */
+  skipped?: string[];
   /**
    * The agent's edits couldn't be told apart from hand edits (a snapshot is
    * missing), so every file that would change is counted as a conflict.

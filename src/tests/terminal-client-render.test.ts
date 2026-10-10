@@ -257,3 +257,24 @@ describe("parseDialogAnswer", () => {
     expect(parseDialogAnswer("/skip", { requestId: "r", method: "confirm" })).toEqual({ cancelled: true });
   });
 });
+
+describe("scrollback replays after going back a turn (#355)", () => {
+  const frame = (over: Record<string, unknown>) =>
+    ({ type: "scrollback.replay", sessionId: "s", mode: "snapshot", messages: [{ type: "session.message", role: "user", content: "hello" }], ...over }) as unknown as DaemonMessage;
+
+  it("prints every chunk of the first (chunked) replay", () => {
+    const state = newStreamRenderState();
+    expect(renderStreamMessage(frame({ seq: 0, final: false }), state)).toContain("hello");
+    expect(renderStreamMessage(frame({ seq: 1, final: false }), state)).toContain("hello");
+    expect(renderStreamMessage(frame({ seq: 2, final: true }), state)).toContain("hello");
+  });
+
+  it("a later full replay is a one-line refresh, chunks included", () => {
+    const state = newStreamRenderState();
+    renderStreamMessage(frame({}), state); // initial, single frame
+    expect(renderStreamMessage(frame({}), state)).toContain("refreshed");
+    expect(renderStreamMessage(frame({ seq: 0, final: false }), state)).toContain("refreshed");
+    expect(renderStreamMessage(frame({ seq: 1, final: true }), state)).toBe("");
+    expect(renderStreamMessage(frame({}), state)).toContain("refreshed");
+  });
+});

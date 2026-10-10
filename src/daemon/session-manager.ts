@@ -5280,15 +5280,25 @@ mcpHub: this.#mcpHub,
     if (session.role) {
       return { type: "response.error", requestId: msg.id, error: `Cannot go back a turn in a ${session.role} session`, code: "invalid_request" };
     }
-    if (msg.dryRun !== true) {
+    const canStop = hasScope(auth.scopes as string[], SCOPES.SESSION_INTERRUPT);
+    if (msg.dryRun === true) {
+      // A preview shows prompts, file paths and commands from the session's
+      // history: same read authority as listing its turns.
+      const canRead = hasScope(auth.scopes as string[], SCOPES.SESSION_ATTACH) || hasScope(auth.scopes as string[], SCOPES.SESSION_WATCH);
+      if (!canRead) {
+        return { type: "response.error", requestId: msg.id, error: "Missing scope: session:attach or session:watch (needed to preview)", code: "forbidden" };
+      }
+    } else {
       // Writing files back (and deleting files created since) bypasses the
       // approval gate every agent write goes through: same trust as
       // approving a write.
       if (msg.restoreFiles === true && !hasScope(auth.scopes as string[], SCOPES.SESSION_APPROVE)) {
         return { type: "response.error", requestId: msg.id, error: "Missing scope: session:approve (needed to restore files)", code: "forbidden" };
       }
-      // Stopping a running turn or background agents is an interrupt.
-      if (session.rewindNeedsStop && !hasScope(auth.scopes as string[], SCOPES.SESSION_INTERRUPT)) {
+      // Stopping a running turn or background agents is an interrupt. Checked
+      // here to fail fast, and again inside the serialized rewind (the state
+      // can change while it queues).
+      if ((session.rewindNeedsStop || session.preparingTurn) && !canStop) {
         return { type: "response.error", requestId: msg.id, error: "Missing scope: session:interrupt (the session is busy)", code: "forbidden" };
       }
     }
@@ -5299,6 +5309,7 @@ mcpHub: this.#mcpHub,
           restoreFiles: msg.restoreFiles === true,
           dryRun: msg.dryRun === true,
           force: msg.force === true,
+          canStop,
           ...(msg.planId ? { planId: msg.planId } : {}),
         },
         auth,

@@ -21,6 +21,7 @@ import {
 import type { Attachment } from "../protocol/types.js";
 import { parseDialogAnswer } from "../terminal/dialog.js";
 import { formatRewind, parseUndoArgs } from "../terminal/rewind.js";
+import { sanitizeTerminalOutput } from "./ansi/codes.js";
 import { dialogDetail, dialogHint } from "./dialog-hint.js";
 import type { CodeoidConfig } from "../config.js";
 import { findModel } from "../daemon/models.js";
@@ -910,8 +911,11 @@ export function App({ config }: Props) {
           if (req.dryRun) undoPreviewRef.current = { sessionId, turnId, planId: res.planId };
           printLocalInfo(sessionId, formatRewind(res));
           if (!res.dryRun && !res.refused && res.restoredPrompt) {
-            dispatch({ type: "input.set", value: res.restoredPrompt });
-            dispatch({ type: "cursor.set", position: res.restoredPrompt.length });
+            // Anyone with send can author a prompt: strip terminal control
+            // sequences before it reaches the editor (newlines kept).
+            const clean = sanitizeTerminalOutput(res.restoredPrompt).replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/g, "");
+            dispatch({ type: "input.set", value: clean });
+            dispatch({ type: "cursor.set", position: clean.length });
           }
         })().catch((err: Error) => dispatch({ type: "error", message: err.message }));
         return;

@@ -59,7 +59,7 @@ import type {
 } from "../protocol/types.js";
 import { dirname, join } from "node:path";
 import { createHash } from "node:crypto";
-import { lstat } from "node:fs/promises";
+import { lstat, readdir } from "node:fs/promises";
 import { removeForkWorktree } from "./git-worktree.js";
 import {
   copyCheckpoints,
@@ -72,7 +72,6 @@ import {
   ignoredUnderTree,
   listCheckpoints,
   restoreTree,
-  shadowGitLiteral,
 } from "./checkpoints.js";
 import { applyRewinds, REWIND_EVENT, type TurnIndexEntry } from "./transcript.js";
 import type { RewindFiles, RewindIrreversible, TurnSummary } from "../protocol/types.js";
@@ -456,14 +455,47 @@ function planHash(parts: readonly string[]): string {
   return createHash("sha256").update(parts.join("\0")).digest("hex").slice(0, 24);
 }
 
-/** Whether `rel` exists in `workdir` (any file type, links not followed). */
-async function existsOnDisk(workdir: string, rel: string): Promise<boolean> {
+/** Whether `rel` exists in `workdir` as something other than a directory (links not followed). */
+async function isNonDirectory(workdir: string, rel: string): Promise<boolean> {
   try {
-    await lstat(join(workdir, rel));
-    return true;
+    return !(await lstat(join(workdir, rel))).isDirectory();
   } catch {
     return false;
   }
+}
+
+/**
+ * Whether an entry with EXACTLY the name `rel` exists in `workdir` (links
+ * not followed). Exact: on a case-insensitive filesystem `lstat("readme.md")`
+ * also finds `README.md`, which would make a case-only rename look occupied.
+ */
+async function existsOnDisk(workdir: string, rel: string): Promise<boolean> {
+  try {
+    await lstat(join(workdir, rel));
+  } catch {
+    return false;
+  }
+  const slash = rel.lastIndexOf("/");
+  const dir = slash === -1 ? workdir : join(workdir, rel.slice(0, slash));
+  const name = slash === -1 ? rel : rel.slice(slash + 1);
+  try {
+    return (await readdir(dir)).includes(name);
+  } catch {
+    return false;
+  }
+}
+
+/** Whether any parent directory of `rel` inside `workdir` is a symlink. */
+async function hasSymlinkedParent(workdir: string, rel: string): Promise<boolean> {
+  const parts = rel.split("/");
+  for (let k = 1; k < parts.length; k++) {
+    try {
+      if ((await lstat(join(workdir, ...parts.slice(0, k)))).isSymbolicLink()) return true;
+    } catch {
+      return false; // missing: nothing to follow
+    }
+  }
+  return false;
 }
 
 /** A rewind that can't proceed (unknown turn, a turn that wouldn't stop). */
@@ -526,13 +558,32 @@ function shellCommandOf(input: Record<string, unknown>): string {
 
 /** Secret-looking values never reach the list (auth headers, tokens, keys). */
 function redactSecrets(s: string): string {
-  return s
-    .replace(/(authorization|x-api-key|api[-_]?key|token|secret|password|passwd)(["']?\s*[:=]\s*["']?|\s+)(bearer\s+)?[^\s"',}]+/gi, "$1$2$3«redacted»")
-    .replace(/\b(sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[abpr]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|zid_sk_[A-Za-z0-9_-]+)\b/g, "«redacted»");
+  return (
+    s
+      // Authorization / Cookie headers: everything after the header name.
+      .replace(/\b(authorization|proxy-authorization|cookie|set-cookie)(\s*[:=]\s*)[^"'\n]+/gi, "$1$2«redacted»")
+      // key=value / key: value / key value for anything secret-shaped.
+      .replace(
+        /\b([\w-]*(?:secret|token|passw(?:or)?d|passwd|api[-_]?key|access[-_]?key|private[-_]?key|credential)[\w-]*)(["']?\s*[:=]\s*|\s+)("[^"]*"|'[^']*'|[^\s"',;}]+)/gi,
+        "$1$2«redacted»",
+      )
+      // user:password@ in URLs.
+      .replace(/(\b[a-z][a-z0-9+.-]*:\/\/)[^\s/:@]+:[^\s/@]+@/gi, "$1«redacted»@")
+      // -u user:pass, -pPASSWORD, --password=x
+      .replace(/(\s-u\s+)[^\s:]+:\S+/g, "$1«redacted»")
+      .replace(/(\s-p)(?=[^\s-])\S+/g, (m, flag: string) => (/\b(mysql|mariadb|mysqldump|mysqladmin)\b/.test(s) ? `${flag}«redacted»` : m))
+      // Well-known token shapes and bare JWTs.
+      .replace(
+        /\b(sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abpr]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|zid_sk_[A-Za-z0-9_-]+|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})\b/g,
+        "«redacted»",
+      )
+  );
 }
 
 function shorten(s: string): string {
-  const one = redactSecrets(s).replace(/\s+/g, " ").trim();
+  // Bounded input: only the start is ever shown, and it keeps the
+  // redaction patterns linear in practice.
+  const one = redactSecrets(s.slice(0, 2_000)).replace(/\s+/g, " ").trim();
   return one.length > 160 ? `${one.slice(0, 159)}…` : one;
 }
 
@@ -2805,13 +2856,15 @@ export class Session {
    * correctness over warmth. Idempotent: a second interrupt on an
    * already-idle session is a harmless no-op.
    */
-  async interrupt(sender: AuthContext): Promise<void> {
+  async interrupt(sender: AuthContext, opts: { keepQueuedSends?: boolean } = {}): Promise<void> {
     this.#store.audit(sender.sub, "session.interrupt", this.id);
     // Mark BEFORE cancelling dialogs, so a driver whose requestUserInput resolves
     // cancelled sees the interrupt and stops rather than treating it as a dismiss.
     this.#turnInterrupted = true;
-    // Sends still preparing their turn are stopped too (#stoppedBeforeStart).
-    this.#stopGen++;
+    // Sends still preparing their turn are stopped too (#stoppedBeforeStart)
+    // — unless the caller already claimed its stop point (a rewind does, so
+    // messages queued AFTER it survive).
+    if (!opts.keepQueuedSends) this.#stopGen++;
     this.#pendingMidTurnCount = 0; // cancel pending mid-turn continuations
     // Finalize any in-flight streaming messages RIGHT NOW so the UI's live
     // region stops spinning on content the model won't finish emitting,
@@ -5367,7 +5420,7 @@ export class Session {
    * turn by a bounded amount; if the turn starts first, the snapshot is
    * recorded as `late`. Never throws.
    */
-  async #checkpointTurn(turnId: string, waitMs?: number): Promise<void> {
+  async #checkpointTurn(turnId: string, waitMs?: number, opts: { onlyIfMissing?: boolean } = {}): Promise<void> {
     if (!this.#checkpointsEnabled() || this.#destroyed) return;
     const cfg = this.#config?.session.checkpoints;
     let started = false;
@@ -5382,6 +5435,7 @@ export class Session {
         isLate: () => started,
         excludeDirs: this.#protectedDirs(),
         limits: this.#checkpointLimits(),
+        ...(opts.onlyIfMissing ? { onlyIfMissing: true } : {}),
       }),
     ).then((r) => {
       if (!r.ok) {
@@ -5405,7 +5459,8 @@ export class Session {
   #checkpointLimits(): Partial<import("./checkpoints.js").CheckpointLimits> {
     const cfg = this.#config?.session.checkpoints;
     return {
-      ...(cfg?.maxPerSession !== undefined ? { maxPerSession: cfg.maxPerSession } : {}),
+      // Two snapshots per turn (start + end): the cap counts turns.
+      maxPerSession: 2 * (cfg?.maxPerSession ?? 200),
       ...(cfg?.maxUntrackedBytes !== undefined ? { maxUntrackedBytes: cfg.maxUntrackedBytes } : {}),
     };
   }
@@ -5420,7 +5475,7 @@ export class Session {
     const turnId = this.#currentTurnId;
     if (!turnId || turnId === this.#endSnapshotTurn || !this.#turnIndex.some((e) => e.turnId === turnId)) return;
     this.#endSnapshotTurn = turnId;
-    void this.#checkpointTurn(endSnapshotId(turnId), 0);
+    void this.#checkpointTurn(endSnapshotId(turnId), 0, { onlyIfMissing: true });
   }
 
   /** Remove a snapshot taken for a turn that never started. Never throws. */
@@ -5477,6 +5532,7 @@ export class Session {
    */
   async inheritTurns(parent: Session, entries: readonly TurnIndexEntry[]): Promise<void> {
     this.#turnIndex = entries.map((e) => ({ ...e }));
+    this.#endSnapshotTurn = entries.at(-1)?.turnId ?? null;
     void this.#transcriptStore.replaceTurnIndex(this.id, this.#turnIndex);
     if (!this.#checkpointsEnabled() || entries.length === 0) return;
     try {
@@ -5510,10 +5566,14 @@ export class Session {
    */
   rewind(
     turnId: string,
-    opts: { restoreFiles?: boolean; dryRun?: boolean; force?: boolean; planId?: string },
+    opts: { restoreFiles?: boolean; dryRun?: boolean; force?: boolean; planId?: string; canStop?: boolean },
     sender: AuthContext,
   ): Promise<RewindOutcome> {
     if (opts.dryRun) return this.#serializedCheckpointOp(() => this.#planRewind(turnId, opts.restoreFiles === true));
+    // Claim the stop point now, synchronously: sends queued before this
+    // rewind (still preparing) are stopped with what runs; sends queued
+    // after it capture the new generation and go ahead once it's done.
+    if (opts.canStop) this.#stopGen++;
     const job = this.#sendChain.catch(() => undefined).then(() => this.#rewindInner(turnId, opts, sender));
     this.#sendChain = job.then(
       () => undefined,
@@ -5581,8 +5641,38 @@ export class Session {
     // since. Never write over a path now held by an ignored/excluded file.
     const created = changes.filter((c) => c.status === "A").map((c) => c.path);
     const keep = new Set(await ignoredUnderTree(this.#checkpointRoot, this.id, start.sha, created));
+    // A path the restore would (re)create must not land on an untracked or
+    // ignored file: one at the path itself (a "D" path is by definition not
+    // in the current tree, so anything on disk there is untracked), or at
+    // any PARENT — a file where a deleted directory must come back. Tracked
+    // files in those spots are in the diff as created ("A") and replaced by
+    // git; untracked ones are kept.
+    const createdSet = new Set(created);
+    // Paths left alone because something else occupies them now (reported).
+    const skipped: string[] = [];
     for (const c of changes) {
-      if (c.status !== "A" && (await existsOnDisk(this.workdir, c.path)) && !(await this.#inTree(now.tree, c.path))) keep.add(c.path);
+      // Never through a symlinked parent (git wouldn't either; say so).
+      if (await hasSymlinkedParent(this.workdir, c.path)) {
+        keep.add(c.path);
+        skipped.push(c.path);
+        continue;
+      }
+      if (c.status === "A") continue;
+      if (c.status === "D" && (await existsOnDisk(this.workdir, c.path))) {
+        keep.add(c.path);
+        skipped.push(c.path);
+        continue;
+      }
+      const parts = c.path.split("/");
+      for (let k = 1; k < parts.length; k++) {
+        const parent = parts.slice(0, k).join("/");
+        if (createdSet.has(parent)) break;
+        if (await isNonDirectory(this.workdir, parent)) {
+          keep.add(c.path);
+          skipped.push(c.path);
+          break;
+        }
+      }
     }
     const effective = changes.filter((c) => !keep.has(c.path));
 
@@ -5592,8 +5682,11 @@ export class Session {
     let unverified = false;
     const handEdited = new Set<string>();
     const gaps: Array<[string | undefined, string | undefined]> = [];
+    const last = this.#turnIndex.length - 1;
     for (let k = pos; k < this.#turnIndex.length; k++) {
-      const end = records.get(endSnapshotId(this.#turnIndex[k]!.turnId))?.sha;
+      // The turn still running has no end snapshot yet: its end is now.
+      const running = k === last && this.rewindNeedsStop;
+      const end = running ? now.tree : records.get(endSnapshotId(this.#turnIndex[k]!.turnId))?.sha;
       const next = k + 1 < this.#turnIndex.length ? records.get(this.#turnIndex[k + 1]!.turnId)?.sha : now.tree;
       gaps.push([end, next]);
     }
@@ -5616,6 +5709,7 @@ export class Session {
         restore: effective.filter((c) => c.status !== "A").map((c) => c.path),
         remove: effective.filter((c) => c.status === "A").map((c) => c.path),
         conflicts,
+        ...(skipped.length > 0 ? { skipped } : {}),
         ...(unverified && conflicts.length > 0 ? { unverified: true } : {}),
         ...(start.late ? { late: true } : {}),
         applied: false,
@@ -5623,21 +5717,21 @@ export class Session {
     };
   }
 
-  async #inTree(tree: string, rel: string): Promise<boolean> {
-    try {
-      const out = await shadowGitLiteral(this.#checkpointRoot, this.id, ["ls-tree", "--full-tree", "--name-only", tree, "--", rel]);
-      return out.trim().length > 0;
-    } catch {
-      return false;
-    }
-  }
-
   async #rewindInner(
     turnId: string,
-    opts: { restoreFiles?: boolean; force?: boolean; planId?: string },
+    opts: { restoreFiles?: boolean; force?: boolean; planId?: string; canStop?: boolean },
     sender: AuthContext,
   ): Promise<RewindOutcome> {
     if (this.#destroyed) throw new RewindError("not_found", "Session is gone");
+    // Validate before touching anything: an unknown turn stops nothing.
+    if (!this.#turnIndex.some((e) => e.turnId === turnId)) {
+      throw new RewindError("not_found", "That turn isn't in this session (or is older than its turn list).");
+    }
+    // Decided HERE, inside the serialized step — the state seen when the
+    // request arrived may have changed while it queued behind a send.
+    if (this.rewindNeedsStop && opts.canStop !== true) {
+      throw new RewindError("busy", "The session is busy; going back would stop it, which needs session:interrupt.");
+    }
     this.#rewinding = true;
     try {
       return await this.#rewindStopped(turnId, opts, sender);
@@ -5648,14 +5742,40 @@ export class Session {
 
   async #rewindStopped(
     turnId: string,
-    opts: { restoreFiles?: boolean; force?: boolean; planId?: string },
+    opts: { restoreFiles?: boolean; force?: boolean; planId?: string; canStop?: boolean },
     sender: AuthContext,
   ): Promise<RewindOutcome> {
+    const wasBusy = this.rewindNeedsStop;
+    const plan = async () => this.#serializedCheckpointOp(() => this.#planRewind(turnId, opts.restoreFiles === true));
+    const refusal = (p: RewindOutcome): RewindOutcome | null => {
+      const note = wasBusy ? "The running turn was stopped; nothing else changed." : "Nothing changed.";
+      if (opts.planId && opts.planId !== p.planId) {
+        this.#auditRewind(sender, turnId, p, "refused: changed since preview", opts.force);
+        return { ...p, refused: `the session changed since the preview — review it again. ${note}` };
+      }
+      if (p.files && p.files.conflicts.length > 0 && !opts.force) {
+        this.#auditRewind(sender, turnId, p, "refused: conflicts", opts.force);
+        return {
+          ...p,
+          refused: p.files.unverified
+            ? `the agent's edits can't be told apart from yours for ${p.files.conflicts.length} file(s); going back would overwrite them. ${note}`
+            : `${p.files.conflicts.length} file(s) were changed by hand during the turns being taken back; going back would overwrite them. ${note}`,
+        };
+      }
+      return null;
+    };
+
+    // Idle: plan and decide BEFORE changing anything, so a refusal really is
+    // "nothing changed".
+    let planned = wasBusy ? null : await plan();
+    if (planned) {
+      const refused = refusal(planned);
+      if (refused) return refused;
+    }
     // Stop whatever runs: the turn (approvals included) and background agents
     // — they belong to the context being taken back. Then tear the backend
     // down, so a cooperative cancel can't finish a write after the restore.
-    const wasBusy = this.rewindNeedsStop;
-    if (wasBusy) await this.interrupt(sender);
+    if (wasBusy) await this.interrupt(sender, { keepQueuedSends: true });
     await this.#teardownProvider();
     // Reports of background work from the removed turns must not wake the
     // fresh agent about work it was told to forget.
@@ -5664,28 +5784,20 @@ export class Session {
       clearTimeout(this.#backgroundWakeFallback);
       this.#backgroundWakeFallback = null;
     }
-    // Let the stopped turn's end snapshot land: it is the hand-edit baseline.
-    this.#snapshotTurnEnd();
-    const plan = await this.#serializedCheckpointOp(() => this.#planRewind(turnId, opts.restoreFiles === true));
-    const stoppedNote = wasBusy ? "The running turn was stopped; nothing else changed." : "Nothing changed.";
-    if (opts.planId && opts.planId !== plan.planId) {
-      this.#auditRewind(sender, turnId, plan, "refused: changed since preview", opts.force);
-      return { ...plan, refused: `the session changed since the preview — review it again. ${stoppedNote}` };
+    if (!planned) {
+      // Busy: plan now that it's stopped — after the stopped turn's end
+      // snapshot, which is the hand-edit baseline.
+      this.#snapshotTurnEnd();
+      planned = await plan();
+      const refused = refusal(planned);
+      if (refused) return refused;
     }
-    if (plan.files && plan.files.conflicts.length > 0 && !opts.force) {
-      this.#auditRewind(sender, turnId, plan, "refused: conflicts", opts.force);
-      return {
-        ...plan,
-        refused: plan.files.unverified
-          ? `the agent's edits can't be told apart from yours for ${plan.files.conflicts.length} file(s); going back would overwrite them. ${stoppedNote}`
-          : `${plan.files.conflicts.length} file(s) were changed by hand during the turns being taken back; going back would overwrite them. ${stoppedNote}`,
-      };
-    }
+    const plan_ = planned;
 
     // Files first: if restoring fails, nothing else has changed (the restore
     // is one git operation that verifies the tree before writing).
-    if (plan.files && plan.checkpointSha && plan.currentTreeSha && plan.fileChanges && plan.fileChanges.length > 0) {
-      const protectedHit = plan.fileChanges.find((c) => this.#isProtectedPath(c.path));
+    if (plan_.files && plan_.checkpointSha && plan_.currentTreeSha && plan_.fileChanges && plan_.fileChanges.length > 0) {
+      const protectedHit = plan_.fileChanges.find((c) => this.#isProtectedPath(c.path));
       if (protectedHit) throw new RewindError("restore_failed", `refusing to restore a path in codeoid's own data: ${protectedHit.path}`);
       try {
         await this.#serializedCheckpointOp(() =>
@@ -5693,20 +5805,20 @@ export class Session {
             root: this.#checkpointRoot,
             workdir: this.workdir,
             sessionId: this.id,
-            from: plan.currentTreeSha!,
-            to: plan.checkpointSha!,
-            ...(plan.keepPaths && plan.keepPaths.length > 0 ? { keep: plan.keepPaths } : {}),
+            from: plan_.currentTreeSha!,
+            to: plan_.checkpointSha!,
+            ...(plan_.keepPaths && plan_.keepPaths.length > 0 ? { keep: plan_.keepPaths } : {}),
           }),
         );
       } catch (err) {
-        this.#auditRewind(sender, turnId, plan, `failed: ${err instanceof Error ? err.message : String(err)}`, opts.force);
-        throw new RewindError("restore_failed", `The files couldn't be restored: ${err instanceof Error ? err.message : String(err)}. ${stoppedNote}`);
+        this.#auditRewind(sender, turnId, plan_, `failed: ${err instanceof Error ? err.message : String(err)}`, opts.force);
+        throw new RewindError("restore_failed", `The files couldn't be restored: ${err instanceof Error ? err.message : String(err)}. ${wasBusy ? "The running turn was stopped; the conversation was not changed." : "Nothing was changed."}`);
       }
     }
-    if (plan.files) plan.files = { ...plan.files, applied: true };
+    if (plan_.files) plan_.files = { ...plan_.files, applied: true };
 
     // The conversation: a fresh backend, re-seeded from what's kept.
-    this.#accumulator.seed(plan.keptHistory);
+    this.#accumulator.seed(plan_.keptHistory);
     const pos = this.#turnIndex.findIndex((e) => e.turnId === turnId);
     this.#turnIndex = this.#turnIndex.slice(0, pos);
     void this.#transcriptStore.replaceTurnIndex(this.id, this.#turnIndex);
@@ -5721,7 +5833,7 @@ export class Session {
       console.error(`[codeoid/session ${this.id}] failed to persist rewind backing id: ${err instanceof Error ? err.message : String(err)}`);
     }
     this.#justRotated = false;
-    if (plan.keptHistory.length > 0) await this.#seedProviderFromHistory();
+    if (plan_.keptHistory.length > 0) await this.#seedProviderFromHistory();
     // Until the next prompt, the backend holds nothing: a restart before then
     // must re-seed from the kept history rather than resume an empty backend.
     this.#markBackingFresh(true);
@@ -5729,20 +5841,20 @@ export class Session {
     // What everyone sees: a durable marker hides the taken-back rows (on
     // replay, restart and paging alike), then every client gets a fresh view.
     const fromMessageId = await this.#firstRowOf(turnId);
-    const preview = this.#previewOf(plan.restoredPrompt);
-    const fileNote = plan.files?.applied
-      ? ` Files restored to how they were then (${plan.files.restore.length} restored, ${plan.files.remove.length} removed).`
+    const preview = this.#previewOf(plan_.restoredPrompt);
+    const fileNote = plan_.files?.applied
+      ? ` Files restored to how they were then (${plan_.files.restore.length} restored, ${plan_.files.remove.length} removed).`
       : "";
     const marker = this.#makeMessage(
       "info",
-      `↩ Went back to before “${preview}” — ${plan.removedTurnIds.length} turn(s) taken back.${fileNote}`,
+      `↩ Went back to before “${preview}” — ${plan_.removedTurnIds.length} turn(s) taken back.${fileNote}`,
       SYSTEM_IDENTITY,
       undefined,
       undefined,
       {
         event: REWIND_EVENT,
         turnId,
-        removedTurnIds: plan.removedTurnIds,
+        removedTurnIds: plan_.removedTurnIds,
         ...(fromMessageId ? { fromMessageId } : {}),
       },
     );
@@ -5752,10 +5864,10 @@ export class Session {
     for (const m of rows) this.#scrollback.push(m);
     this.#resumeKey = randomUUID(); // stale incremental cursors must re-sync
     for (const client of [...this.#clients.values()]) this.#replay(client);
-    this.#auditRewind(sender, turnId, plan, plan.files?.applied ? "files restored" : "conversation only", opts.force);
+    this.#auditRewind(sender, turnId, plan_, plan_.files?.applied ? "files restored" : "conversation only", opts.force);
     this.#setStatus("idle");
     this.#broadcastInfoUpdate();
-    return plan;
+    return plan_;
   }
 
   #markBackingFresh(fresh: boolean): void {
@@ -5802,7 +5914,8 @@ export class Session {
   /** The prompt that started `turnId`: from the history, else its transcript row. */
   async #promptOf(turnId: string, removedCanon: readonly CanonicalTurn[]): Promise<string> {
     const user = removedCanon.find((t) => t.role === "user" && t.turnId === turnId);
-    if (user && user.role === "user") return user.prompt ?? user.content;
+    if (user && user.role === "user") return user.background ? "" : (user.prompt ?? user.content);
+    if (this.#turnIndex.find((e) => e.turnId === turnId)?.kind === "background") return "";
     const row = await this.#findRow((m) => m.role === "user" && m.turnId === turnId);
     return row?.content ?? this.#turnIndex.find((e) => e.turnId === turnId)?.preview ?? "";
   }
@@ -5849,6 +5962,9 @@ export class Session {
     if (opts.persistIndex) void this.#transcriptStore.replaceTurnIndex(this.id, this.#turnIndex);
     this.#canonicalPartial = opts.partial;
     this.#currentTurnId = index.at(-1)?.turnId ?? [...history].reverse().find((t) => t.turnId)?.turnId ?? null;
+    // Every restored turn has ended: its end snapshot (if any) is the real
+    // one — a later idle must not re-take it from today's files.
+    this.#endSnapshotTurn = this.#currentTurnId;
   }
 
   /**

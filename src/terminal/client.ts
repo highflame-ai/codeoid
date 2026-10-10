@@ -55,8 +55,10 @@ export interface StreamRenderState {
   dialogs: Array<{ dialog: PendingDialog; prompt: string }>;
   /** Which prompt was printed last — a typed yes/no answers THAT one. */
   lastPrompt: "tool" | "dialog" | null;
-  /** A scrollback replay has been printed already (later ones are refreshes). */
-  replayed?: boolean;
+  /** The first full replay has been printed (its last chunk arrived). */
+  replayDone?: boolean;
+  /** Inside a later full replay (a refresh after going back): its chunks aren't reprinted. */
+  suppressingReplay?: boolean;
 }
 
 /** A tool approval was settled (anywhere): stop routing yes/no to it, and
@@ -91,11 +93,19 @@ export function renderStreamMessage(msg: DaemonMessage, state: StreamRenderState
       const m = msg as { messages?: Array<{ type: string; role?: string; content?: string; tool?: { name?: string }; identity?: { name?: string } }> };
       const list = m.messages ?? [];
       // A later full snapshot (after going back a turn) refreshes the view;
-      // reprinting the whole session into a terminal helps nobody.
-      if (state.replayed && (msg as { mode?: string }).mode === "snapshot") {
-        return `${DIM}(the session view was refreshed — ${list.length} messages)${RESET}\n`;
+      // reprinting the whole session into a terminal helps nobody. A large
+      // replay arrives in chunks (seq 0…n, final on the last): only a replay
+      // that STARTS after the first one finished is a refresh.
+      const frame = msg as { mode?: string; seq?: number; final?: boolean };
+      if (state.suppressingReplay) {
+        if (frame.final) state.suppressingReplay = false;
+        return "";
       }
-      state.replayed = true;
+      if (state.replayDone && frame.mode === "snapshot" && (frame.seq === undefined || frame.seq === 0)) {
+        state.suppressingReplay = frame.seq === 0 && frame.final === false;
+        return `${DIM}(the session view was refreshed)${RESET}\n`;
+      }
+      if (frame.seq === undefined || frame.final) state.replayDone = true;
       let out = `\n--- scrollback (${list.length} messages) ---\n`;
       for (const e of list) {
         if (e.type !== "session.message") continue;

@@ -44,7 +44,7 @@
 
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import { appendFile, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, copyFile, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -295,6 +295,8 @@ export async function createCheckpoint(opts: {
    * — recorded as `late` so a restore can say so.
    */
   isLate?: () => boolean;
+  /** Record nothing if this turn id already has a checkpoint (never overwrite it). */
+  onlyIfMissing?: boolean;
 }): Promise<CheckpointResult> {
   const limits = { ...DEFAULT_CHECKPOINT_LIMITS, ...opts.limits };
   if (!SAFE_ID.test(opts.turnId)) return { ok: false, reason: `invalid turn id: ${opts.turnId}` };
@@ -309,6 +311,10 @@ export async function createCheckpoint(opts: {
   try {
     const t = limits.timeoutMs;
     await ensureShadow(shadow, t);
+    if (opts.onlyIfMissing) {
+      const existing = (await readOrder(shadow)).find((e) => e.turnId === opts.turnId);
+      if (existing) return { ok: true, sha: existing.sha, late: existing.late };
+    }
     // Over the storage budget: drop the older snapshots, oldest first, until
     // it fits — down to none, so a session whose tree alone nears the budget
     // still always has its latest snapshot rather than none ever again.
@@ -467,7 +473,16 @@ export async function restoreTree(opts: {
     const env = gitEnv({ GIT_DIR: shadow, GIT_WORK_TREE: opts.workdir, GIT_INDEX_FILE: tmpIndex });
     let target = opts.to;
     if (opts.keep && opts.keep.length > 0) target = await treeKeeping(shadow, opts.to, opts.from, opts.keep, t);
-    await run(["read-tree", opts.from], { cwd: opts.workdir, env, timeoutMs: t });
+    // Start from the shadow index — {@link currentTree} just staged `from`
+    // into it, so its stat cache spares a full re-hash on a big tree — then
+    // make it exactly `from` (a one-tree merge keeps the cached stats).
+    try {
+      await copyFile(path.join(shadow, "index"), tmpIndex);
+      await run(["read-tree", "-m", opts.from], { cwd: opts.workdir, env, timeoutMs: t });
+    } catch {
+      await rm(tmpIndex, { force: true }).catch(() => {});
+      await run(["read-tree", opts.from], { cwd: opts.workdir, env, timeoutMs: t });
+    }
     // Stat-refresh so read-tree can verify the work tree still matches `from`.
     await run(["update-index", "--refresh"], { cwd: opts.workdir, env, timeoutMs: t }).catch(() => {});
     try {
@@ -692,11 +707,30 @@ export async function ignoredUnderTree(root: string, sessionId: string, sha: str
       timeoutMs: t,
     });
     const ignoreFiles = listed.split("\0").filter((p) => p === ".gitignore" || p.endsWith("/.gitignore"));
-    for (const rel of ignoreFiles) {
-      const body = await run(["cat-file", "blob", `${sha}:${rel}`], { cwd: shadow, env: gitEnv({ GIT_DIR: shadow }), timeoutMs: t });
-      const dest = path.join(scratch, rel);
-      await mkdir(path.dirname(dest), { recursive: true });
-      await writeFile(dest, body);
+    // One process for every ignore file: `cat-file --batch` answers
+    // "<oid> blob <size>\n<content>\n" per request line.
+    if (ignoreFiles.length > 0) {
+      const raw = await new Promise<Buffer>((resolve, reject) => {
+        const child = execFile(
+          "git",
+          [...SAFE_FLAGS, "cat-file", "--batch"],
+          { cwd: shadow, env: gitEnv({ GIT_DIR: shadow }), timeout: t, maxBuffer: 64 * 1024 * 1024, encoding: "buffer" },
+          (err, stdout) => (err ? reject(err) : resolve(stdout as Buffer)),
+        );
+        child.stdin?.end(`${ignoreFiles.map((rel) => `${sha}:${rel}`).join("\n")}\n`);
+      });
+      let at = 0;
+      for (const rel of ignoreFiles) {
+        const nl = raw.indexOf(0x0a, at);
+        const header = raw.subarray(at, nl).toString("utf8").split(" ");
+        const size = Number(header[2]);
+        if (header[1] !== "blob" || !Number.isFinite(size)) break;
+        const body = raw.subarray(nl + 1, nl + 1 + size);
+        at = nl + 1 + size + 1;
+        const dest = path.join(scratch, rel);
+        await mkdir(path.dirname(dest), { recursive: true });
+        await writeFile(dest, body);
+      }
     }
     await run(["init", "-q", scratch], { cwd: scratch, env: gitEnv({}), timeoutMs: t });
     let out = "";
