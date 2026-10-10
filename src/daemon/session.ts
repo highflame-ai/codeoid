@@ -512,13 +512,13 @@ export interface ForkPoint {
    * The files right after that turn: a checkpoint id to copy and roll to, or
    * why there isn't one. Absent when it's the latest turn (the live files).
    */
-  files?: { checkpointId: string } | { unavailable: string };
+  files?: { checkpointId: string; head?: string; late?: boolean } | { unavailable: string };
 }
 
 /** A rewind that can't proceed (unknown turn, a turn that wouldn't stop). */
 export class RewindError extends Error {
   constructor(
-    readonly code: "not_found" | "busy" | "restore_failed",
+    readonly code: "not_found" | "busy" | "restore_failed" | "before_rotation",
     message: string,
   ) {
     super(message);
@@ -5585,6 +5585,14 @@ export class Session {
     if (pos === -1) throw new RewindError("not_found", "That turn isn't in this session (or is older than its turn list).");
     const later = new Set(this.#turnIndex.slice(pos + 1).map((e) => e.turnId));
     const history = await this.fullCanonicalHistory();
+    // A turn before a context rotation is still listed, but its conversation
+    // was dropped by the rotation: a fork from it would start empty. Say so.
+    if (!history.some((t) => t.turnId === turnId)) {
+      throw new RewindError(
+        "before_rotation",
+        "That point is before a context rotation, so its conversation isn't kept — fork from a later message.",
+      );
+    }
     let cut = history.findIndex((t) => t.turnId !== undefined && later.has(t.turnId));
     if (cut === -1) cut = history.length;
     const nextTurnId = this.#turnIndex[pos + 1]?.turnId;
@@ -5594,9 +5602,16 @@ export class Session {
     if (nextTurnId && this.#checkpointsEnabled()) {
       const records = await listCheckpoints(this.#checkpointRoot, this.id);
       const endId = endSnapshotId(turnId);
-      if (records.has(endId)) files = { checkpointId: endId };
-      else if (records.has(nextTurnId)) files = { checkpointId: nextTurnId };
-      else files = { unavailable: "there is no snapshot of the files from right after that turn" };
+      const pick = records.has(endId) ? endId : records.has(nextTurnId) ? nextTurnId : undefined;
+      const rec = pick ? records.get(pick) : undefined;
+      files =
+        pick && rec
+          ? {
+              checkpointId: pick,
+              ...(rec.head ? { head: rec.head } : {}),
+              ...(pick === nextTurnId && rec.late ? { late: true } : {}),
+            }
+          : { unavailable: "there is no snapshot of the files from right after that turn" };
     } else if (nextTurnId) {
       files = { unavailable: "workspace snapshots are turned off" };
     }
@@ -5615,8 +5630,8 @@ export class Session {
    * step git restore as going back; files ignored under that snapshot's
    * rules are left alone. Serialized with snapshots. Throws on failure.
    */
-  async rollFilesTo(checkpointId: string): Promise<{ restored: number; removed: number }> {
-    return this.#serializedCheckpointOp(async () => {
+  async rollFilesTo(checkpointId: string, opts: { asEndOf?: string } = {}): Promise<{ restored: number; removed: number }> {
+    const result = await this.#serializedCheckpointOp(async () => {
       const rec = (await listCheckpoints(this.#checkpointRoot, this.id)).get(checkpointId);
       if (!rec) throw new Error("that snapshot isn't available to this session");
       const now = await currentTree({
@@ -5629,8 +5644,11 @@ export class Session {
       if (!now.ok) throw new Error(now.reason);
       const changes = await diffTrees(this.#checkpointRoot, this.id, rec.sha, now.tree);
       if (changes.length === 0) return { restored: 0, removed: 0 };
+      const protectedHit = changes.find((c) => this.#isProtectedPath(c.path));
+      if (protectedHit) throw new Error(`refusing to write a path in codeoid's own data: ${protectedHit.path}`);
       const created = changes.filter((c) => c.status === "A").map((c) => c.path);
       const keep = await ignoredUnderTree(this.#checkpointRoot, this.id, rec.sha, created);
+      const kept = new Set(keep);
       await restoreTree({
         root: this.#checkpointRoot,
         workdir: this.workdir,
@@ -5640,10 +5658,15 @@ export class Session {
         ...(keep.length > 0 ? { keep } : {}),
       });
       return {
-        restored: changes.filter((c) => c.status !== "A").length,
-        removed: created.length - keep.length,
+        restored: changes.filter((c) => c.status !== "A" && !kept.has(c.path)).length,
+        removed: created.filter((p) => !kept.has(p)).length,
       };
     });
+    // The rolled files are, by definition, how that turn ended for THIS
+    // session: record them as its end snapshot, so going back later in this
+    // fork has its hand-edit baseline (instead of reporting false conflicts).
+    if (opts.asEndOf) await this.#checkpointTurn(endSnapshotId(opts.asEndOf), 10_000, { onlyIfMissing: true });
+    return result;
   }
 
   /** Post a notice about a fork's files (#356) into its scrollback. */

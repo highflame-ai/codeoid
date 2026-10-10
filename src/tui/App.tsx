@@ -872,6 +872,24 @@ export function App({ config }: Props) {
           );
         return;
       }
+      case "/turns": {
+        // The numbered turns /fork N refers to (#356).
+        if (!client || !focusedSession) return;
+        const sessionId = focusedSession.info.id;
+        void client
+          .turns(sessionId)
+          .then((list) => {
+            if (list.type !== "session.turns.result") throw new Error("could not list turns");
+            printLocalInfo(
+              sessionId,
+              list.turns.length === 0
+                ? "No turns yet."
+                : list.turns.map((t) => `${t.index}. ${t.preview}${t.kind === "background" ? " (background)" : ""}`).join("\n"),
+            );
+          })
+          .catch((err: Error) => dispatch({ type: "error", message: err.message }));
+        return;
+      }
       case "/fork": {
         // Fork from the latest point, or after prompt N (#356): /fork [N] [--shared] [--backend <id>]
         if (!client || !focusedSession) return;

@@ -594,6 +594,17 @@ program
   });
 
 program
+  .command("turns <session>")
+  .description("List a session's turns, numbered — the N that `fork --at N` and /fork N take")
+  .action(async (session: string) => {
+    const config = loadConfig();
+    const client = new TerminalClient(config);
+    await client.connect();
+    await client.listTurns(session);
+    client.disconnect();
+  });
+
+program
   .command("fork <session>")
   .description("Fork a session into a new one — from its latest point, or after prompt N (with the files as they were then)")
   .option("--at <n>", "fork after prompt N (1 = the first)")

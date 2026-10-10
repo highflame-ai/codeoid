@@ -710,6 +710,23 @@ export class TerminalClient {
     console.log(`Attach with: codeoid attach ${info.id}`);
   }
 
+  /** `codeoid turns <session>` — the numbered turns `--at N` / `/fork N` refer to. */
+  async listTurns(sessionIdOrName: string): Promise<void> {
+    const sessionId = await this.#resolveSession(sessionIdOrName);
+    if (!sessionId) return;
+    const list = await this.#request({ type: "session.turns", id: randomUUID(), sessionId });
+    if (list.type !== "session.turns.result") {
+      this.#printError(list);
+      return;
+    }
+    if (list.turns.length === 0) console.log("No turns yet.");
+    for (const t of list.turns) {
+      const tag = t.kind === "background" ? " (background)" : "";
+      const snap = t.checkpoint ? "" : list.checkpointsSupported ? "  [no snapshot]" : "";
+      console.log(`${String(t.index).padStart(3)}. ${S(t.preview)}${tag}${snap}`);
+    }
+  }
+
   /** `codeoid undo <session> [files [yes|force]]` — /undo without attaching. */
   async undoSession(sessionIdOrName: string, args: string[]): Promise<void> {
     const sessionId = await this.#resolveSession(sessionIdOrName);

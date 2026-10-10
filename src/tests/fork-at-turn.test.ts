@@ -237,6 +237,94 @@ describe("forking from an earlier turn", () => {
   });
 });
 
+describe("forking from an earlier turn: round-1 regressions", () => {
+  it("a session in an untracked subdirectory: the fork opens in that subdirectory with its files; the repo's files are intact", async () => {
+    git("init", "-q");
+    writeFileSync(join(repo, "README"), "top\n");
+    git("add", ".");
+    git("commit", "-qm", "readme");
+    const sub = join(repo, "newpkg");
+    mkdirSync(sub);
+    writeFileSync(join(sub, "x.txt"), "x0\n");
+    const m = newManager([() => writeFileSync(join(sub, "x.txt"), "x1\n"), () => writeFileSync(join(sub, "x.txt"), "x2\n")]);
+    const id = await create(m, sub);
+    await sendAndSettle(m, id, "one");
+    await sendAndSettle(m, id, "two");
+    const info = await fork(m, id, { afterTurnId: (await turns(m, id))[0]!.turnId });
+    expect(info.workdir.endsWith("/newpkg")).toBe(true);
+    expect(readFileSync(join(info.workdir, "x.txt"), "utf8")).toBe("x1\n");
+    const root = info.worktree!.path;
+    expect(readFileSync(join(root, "README"), "utf8")).toBe("top\n");
+    expect(readFileSync(join(root, "a.txt"), "utf8")).toBe("v0\n");
+  });
+
+  it("refuses a point before a context rotation instead of forking with no conversation", async () => {
+    const m = newManager();
+    const id = await create(m);
+    await sendAndSettle(m, id, "one");
+    await sendAndSettle(m, id, "two");
+    await sendAndSettle(m, id, "three"); // rotation needs a few turns first
+    const r = await m.handle({ type: "session.rotate", id: "rot", sessionId: id }, AUTH, CLIENT);
+    expect(r).toMatchObject({ type: "response.ok", data: { rotated: true } });
+    await sendAndSettle(m, id, "four");
+    const list = await turns(m, id);
+    const refused = await m.handle({ type: "session.fork", id: "f", sessionId: id, afterTurnId: list[0]!.turnId } as never, AUTH, CLIENT);
+    expect(refused).toMatchObject({ type: "response.error", code: "invalid_request" });
+    expect((refused as { error: string }).error).toContain("context rotation");
+    // A point after the rotation still works.
+    const ok = await fork(m, id, { afterTurnId: list[3]!.turnId, isolate: false });
+    const kept = m._sessionForTest(ok.id)!.canonicalHistory;
+    expect(kept.map((t) => t.turnId)).toEqual([list[3]!.turnId, list[3]!.turnId]);
+    expect(kept.at(-1)!.content).toBe("a4");
+  });
+
+  it("refuses an earlier turn together with a base branch", async () => {
+    const m = newManager();
+    const id = await create(m);
+    await sendAndSettle(m, id, "one");
+    await sendAndSettle(m, id, "two");
+    const r = await m.handle(
+      { type: "session.fork", id: "f", sessionId: id, afterTurnId: (await turns(m, id))[0]!.turnId, baseBranch: "main" } as never,
+      AUTH,
+      CLIENT,
+    );
+    expect(r).toMatchObject({ type: "response.error", code: "invalid_request" });
+  });
+
+  it("starts the fork's git history at the commit checked out back then", async () => {
+    const m = newManager([undefined, () => {
+      writeFileSync(join(repo, "a.txt"), "committed later\n");
+      git("commit", "-qam", "a later commit");
+    }]);
+    const id = await create(m);
+    await sendAndSettle(m, id, "one");
+    const headAtOne = git("rev-parse", "HEAD").trim();
+    await sendAndSettle(m, id, "two");
+    expect(git("rev-parse", "HEAD").trim()).not.toBe(headAtOne);
+    const info = await fork(m, id, { afterTurnId: (await turns(m, id))[0]!.turnId });
+    const wt = (...a: string[]) => execFileSync("git", a, { cwd: info.workdir, encoding: "utf8" });
+    expect(wt("rev-parse", "HEAD").trim()).toBe(headAtOne);
+    expect(wt("status", "--porcelain").trim()).toBe(""); // no phantom revert of later commits
+    expect(readFileSync(join(info.workdir, "a.txt"), "utf8")).toBe("v0\n");
+  });
+
+  it("going back later in the fork has its baseline (no false conflicts)", async () => {
+    const m = newManager([() => writeFileSync(join(repo, "a.txt"), "after one\n"), () => writeFileSync(join(repo, "a.txt"), "after two\n")]);
+    const id = await create(m);
+    await sendAndSettle(m, id, "one");
+    await sendAndSettle(m, id, "two");
+    const { deleteCheckpoint, endSnapshotId } = await import("../daemon/checkpoints.js");
+    const list = await turns(m, id);
+    // Force the next-turn-start fallback.
+    await deleteCheckpoint(join(tmp, "transcripts", "checkpoints"), id, endSnapshotId(list[0]!.turnId));
+    const info = await fork(m, id, { afterTurnId: list[0]!.turnId });
+    await Bun.sleep(100);
+    const r = await m.handle({ type: "session.rewind", id: "rw", sessionId: info.id, turnId: list[0]!.turnId, restoreFiles: true, dryRun: true }, AUTH, CLIENT);
+    if (r.type !== "session.rewind.result") throw new Error(JSON.stringify(r));
+    expect(r.files?.conflicts).toEqual([]);
+  });
+});
+
 describe("cutRowsBeforeTurns", () => {
   const row = (id: string, turnId?: string) => ({ message: { type: "session.message", messageId: id, ...(turnId ? { turnId } : {}) } as unknown as DaemonMessage });
   it("cuts at the first row of the first later turn, notices between turns going with what came after", () => {

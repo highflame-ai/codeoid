@@ -30,7 +30,7 @@
  */
 
 import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 
@@ -115,6 +115,13 @@ export interface ForkWorktree {
   workdir: string;
   /** Branch checked out in the worktree (e.g. "codeoid/fix-login-a1b2c3"). */
   branch: string;
+  /**
+   * Whether `workdir` is the parent's subdirectory equivalent (always true
+   * at the checkout root). False when the subdir doesn't exist in the new
+   * checkout and the fork fell back to the worktree root — paths relative to
+   * the parent's workdir then don't line up with the fork's.
+   */
+  subdirMapped: boolean;
 }
 
 /**
@@ -153,6 +160,16 @@ export async function createForkWorktree(opts: {
   shortId: string;
   /** Branch clean from this ref instead of carrying the parent's state. */
   baseBranch?: string;
+  /**
+   * Branch clean from this exact commit (a checkpoint's recorded HEAD, #356)
+   * instead of carrying the parent's state. Internal: never user input.
+   */
+  baseCommit?: string;
+  /**
+   * Create the parent's subdirectory in the new checkout when it's missing
+   * (an untracked directory isn't carried), so the fork still opens in it.
+   */
+  ensureSubdir?: boolean;
 }): Promise<ForkWorktree> {
   const mainRoot = await mainWorktreeRoot(opts.workdir);
 
@@ -168,7 +185,10 @@ export async function createForkWorktree(opts: {
   let base: string;
   let parentHead: string | null = null;
   let carriedSnapshot = false;
-  if (opts.baseBranch) {
+  if (opts.baseCommit) {
+    if (!/^[0-9a-f]{40,64}$/.test(opts.baseCommit)) throw new WorktreeError("invalid base commit");
+    base = await resolveBaseRef(mainRoot, opts.baseCommit);
+  } else if (opts.baseBranch) {
     base = await resolveBaseRef(mainRoot, opts.baseBranch);
   } else {
     try {
@@ -214,18 +234,22 @@ export async function createForkWorktree(opts: {
   // OWN worktree top (handles a parent that is itself a linked worktree). The
   // existsSync guard matters for baseBranch: the base may not have that subdir.
   let workdir = worktreePath;
+  let subdirMapped = true;
   try {
     const parentTop = (await git(["rev-parse", "--show-toplevel"], opts.workdir)).trim();
     const rel = path.relative(parentTop, opts.workdir);
     if (rel && !rel.startsWith("..") && !path.isAbsolute(rel)) {
       const candidate = path.join(worktreePath, rel);
+      if (!existsSync(candidate) && opts.ensureSubdir) mkdirSync(candidate, { recursive: true });
       if (existsSync(candidate)) workdir = candidate;
+      else subdirMapped = false;
     }
   } catch {
     // Fall back to the worktree root — never fail the fork over a subdir hint.
+    subdirMapped = false;
   }
 
-  return { path: worktreePath, workdir, branch };
+  return { path: worktreePath, workdir, branch, subdirMapped };
 }
 
 /**
