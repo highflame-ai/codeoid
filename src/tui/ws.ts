@@ -216,7 +216,7 @@ export class TuiWsClient {
   /** Run one prompt on several backends side by side (#357). */
   compare(
     sessionId: string,
-    opts: { prompt: string; targets: import("../protocol/types.js").CompareTargetSpec[]; afterTurnId?: string; isolate?: boolean },
+    opts: { prompt: string; targets: import("../protocol/types.js").CompareTargetSpec[]; afterTurnId?: string },
   ): Promise<DaemonMessage> {
     return this.#request({
       type: "session.compare",
@@ -225,7 +225,6 @@ export class TuiWsClient {
       prompt: opts.prompt,
       targets: opts.targets,
       ...(opts.afterTurnId ? { afterTurnId: opts.afterTurnId } : {}),
-      ...(opts.isolate === false ? { isolate: false } : {}),
     });
   }
 

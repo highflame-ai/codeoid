@@ -3356,6 +3356,16 @@ export class Session {
     return this.#pack?.constitution;
   }
 
+  /** The pack this session runs under, for a fork to carry (its role's tool deny included). */
+  get packActivation(): PackActivation | undefined {
+    return this.#pack;
+  }
+
+  /** The turn messages currently belong to (the latest, once it has ended). */
+  get currentTurnId(): string | null {
+    return this.#currentTurnId;
+  }
+
   toInfo(): SessionInfo {
     return {
       id: this.id,
@@ -5708,12 +5718,24 @@ export class Session {
   }
 
   /**
+   * The agent's reply in turn `turnId` (#357), from the canonical history —
+   * only that turn's, never an earlier one. Undefined until the turn has
+   * ended with text.
+   */
+  turnReply(turnId: string): string | undefined {
+    const parts = this.#accumulator.history.filter((t) => t.turnId === turnId && t.role === "assistant" && t.content).map((t) => t.content);
+    return parts.length > 0 ? parts.join("\n\n") : undefined;
+  }
+
+  /**
    * What turn `turnId` changed in the files (#357): its start snapshot →
-   * its end snapshot. Undefined while it runs or when a snapshot is missing.
+   * its end snapshot, once any snapshot still being written has landed.
+   * Undefined while it runs or when a snapshot is missing.
    */
   async turnFiles(turnId: string): Promise<{ changed: number; insertions: number; deletions: number; paths: string[] } | undefined> {
     if (!this.#checkpointsEnabled()) return undefined;
-    const records = await listCheckpoints(this.#checkpointRoot, this.id);
+    await Promise.allSettled([...this.#pendingCheckpoints]);
+    const records = await this.#serializedCheckpointOp(() => listCheckpoints(this.#checkpointRoot, this.id));
     const start = records.get(turnId);
     const end = records.get(endSnapshotId(turnId));
     if (!start || !end) return undefined;

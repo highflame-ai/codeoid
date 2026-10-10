@@ -35,10 +35,17 @@ async function req<T extends DaemonMessage>(msg: Record<string, unknown> & { typ
   );
 }
 
-const RUNNING = new Set(["thinking", "tool_running", "waiting_approval"]);
 
 const statusLabel = (t: CompareTargetState): string =>
-  t.status === "gone" ? "discarded" : t.status === "failed" ? "failed to start" : RUNNING.has(t.status) ? "working…" : t.status;
+  t.status === "gone"
+    ? "discarded"
+    : t.status === "failed"
+      ? "failed to start"
+      : !t.done && t.status === "waiting_approval"
+        ? "needs your approval — open it"
+        : !t.done
+          ? "working…"
+          : t.status;
 
 const Column: Component<{
   t: CompareTargetState;
@@ -55,7 +62,15 @@ const Column: Component<{
           <span class="text-fg-faint">:{props.t.model}</span>
         </Show>
       </span>
-      <span class={`ml-auto text-[11px] ${props.t.status === "error" || props.t.status === "failed" ? "text-danger" : "text-fg-faint"}`}>
+      <span
+        class={`ml-auto text-[11px] ${
+          props.t.status === "error" || props.t.status === "failed"
+            ? "text-danger"
+            : !props.t.done && props.t.status === "waiting_approval"
+              ? "text-warn"
+              : "text-fg-faint"
+        }`}
+      >
         {props.kept ? "kept" : statusLabel(props.t)}
       </span>
     </div>
@@ -104,7 +119,6 @@ const Column: Component<{
 const CompareModal: Component = () => {
   const [targets, setTargets] = createSignal<Array<{ providerId: string; model: string }>>([]);
   const [prompt, setPrompt] = createSignal("");
-  const [isolate, setIsolate] = createSignal(true);
   const [state, setState] = createSignal<CompareState | null>(null);
   const [previous, setPrevious] = createSignal<CompareState[]>([]);
   const [busy, setBusy] = createSignal(false);
@@ -132,7 +146,7 @@ const CompareModal: Component = () => {
       req<CompareStateMsg>({ type: "compare.get", compareId }, "compare.state")
         .then((r) => {
           setState(r.compare);
-          if (!r.compare.targets.some((t) => RUNNING.has(t.status))) stopPolling();
+          if (r.compare.targets.every((t) => t.done)) stopPolling();
         })
         .catch(() => {});
     timer = setInterval(tick, 2_000);
@@ -175,7 +189,6 @@ const CompareModal: Component = () => {
           prompt: prompt(),
           targets: targets().map((t) => ({ providerId: t.providerId, ...(t.model.trim() ? { model: t.model.trim() } : {}) })),
           ...(o.afterTurnId ? { afterTurnId: o.afterTurnId } : {}),
-          ...(isolate() ? {} : { isolate: false }),
         },
         "compare.state",
       );
@@ -236,7 +249,7 @@ const CompareModal: Component = () => {
                 fallback={
                   <div class="space-y-3">
                     <p class="text-[13px] text-fg-muted">
-                      Send one prompt to each backend. Each runs in its own fork, starting from the same conversation and files.
+                      Send one prompt to each backend. Each runs in its own fork and git worktree, starting from the same conversation and files, and asks for approvals in its own session.
                     </p>
                     <div class="space-y-1.5">
                       <Index each={targets()}>
@@ -288,10 +301,6 @@ const CompareModal: Component = () => {
                       class="w-full rounded border border-border bg-bg px-2 py-1.5 text-[13px] text-fg placeholder:text-fg-faint"
                       aria-label="prompt"
                     />
-                    <label class="flex items-center gap-2 text-[12px] text-fg-muted">
-                      <input type="checkbox" checked={isolate()} onChange={(e) => setIsolate(e.currentTarget.checked)} />
-                      Each in its own git worktree (recommended: they won't edit the same files)
-                    </label>
                     <Show when={previous().length > 0}>
                       <div class="text-[11px] text-fg-faint">
                         Earlier comparisons:{" "}
@@ -335,7 +344,7 @@ const CompareModal: Component = () => {
                           <Column
                             t={t}
                             kept={s().keptSessionId === t.sessionId && t.sessionId !== undefined}
-                            canKeep={!s().keptSessionId && !!t.sessionId && t.status !== "gone" && !RUNNING.has(t.status)}
+                            canKeep={!s().keptSessionId && !!t.sessionId && t.done && t.status !== "gone" && t.status !== "failed"}
                             onKeep={(discard) => void keep(t.sessionId!, discard)}
                             onOpen={() => {
                               focusSession(t.sessionId!);

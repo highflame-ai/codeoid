@@ -24,7 +24,7 @@ import { formatPackList, formatPackShow } from "./pack-format.js";
 import { formatPipeline, haltedRequestId } from "./pipeline-format.js";
 import { type PendingDialog, parseDialogAnswer } from "./dialog.js";
 import { formatRewind, parseUndoArgs } from "./rewind.js";
-import { compareSettled, formatCompare } from "./compare.js";
+import { awaitingApproval, compareSettled, formatCompare } from "./compare.js";
 
 // ── Stream rendering (pure, exported for tests) ───────────────────────────────
 
@@ -739,7 +739,7 @@ export class TerminalClient {
     sessionIdOrName: string,
     targets: CompareTargetSpec[],
     prompt: string,
-    opts: { at?: number; shared?: boolean; wait?: boolean },
+    opts: { at?: number; wait?: boolean },
   ): Promise<void> {
     const sessionId = await this.#resolveSession(sessionIdOrName);
     if (!sessionId) return;
@@ -764,7 +764,6 @@ export class TerminalClient {
       prompt,
       targets,
       ...(afterTurnId ? { afterTurnId } : {}),
-      ...(opts.shared ? { isolate: false } : {}),
     });
     if (resp.type !== "compare.state") {
       this.#printError(resp);
@@ -776,7 +775,22 @@ export class TerminalClient {
       state = await this.#waitForCompare(state);
     }
     console.log(S(formatCompare(state)));
-    console.log(`\nKeep one: codeoid compare keep ${state.compareId.slice(0, 8)} <branch> [--discard-others]`);
+    this.#printApprovalHints(state);
+    if (compareSettled(state) && awaitingApproval(state).length === 0) {
+      console.log(`\nKeep one: codeoid compare keep ${state.compareId.slice(0, 8)} <branch> [--discard-others]`);
+    } else {
+      console.log(`\nSee how they're doing: codeoid compare show ${state.compareId.slice(0, 8)} --wait`);
+    }
+  }
+
+  /** Branches can't go on until someone decides: say who and how. */
+  #printApprovalHints(state: CompareState): void {
+    const waiting = awaitingApproval(state);
+    if (waiting.length === 0) return;
+    console.log("");
+    for (const w of waiting) {
+      console.log(`[${w.branch}] ${S(w.name)} is waiting for your approval: codeoid approve ${w.sessionId}  (or codeoid attach ${w.sessionId} to see it)`);
+    }
   }
 
   async #waitForCompare(state: CompareState): Promise<CompareState> {
@@ -817,6 +831,7 @@ export class TerminalClient {
     if (!state) return;
     if (opts.wait) state = await this.#waitForCompare(state);
     console.log(S(formatCompare(state)));
+    this.#printApprovalHints(state);
   }
 
   /** `codeoid compare ls <session>` — a session's comparisons, newest first. */
@@ -855,7 +870,9 @@ export class TerminalClient {
       this.#printError(resp);
       return;
     }
-    console.log(`Kept [${branch}] ${target.providerId}${target.model ? `:${target.model}` : ""} — session ${target.sessionId}${discardOthers ? "; the other branches were destroyed" : ""}.`);
+    const left = resp.compare.targets.filter((t) => t.sessionId !== target.sessionId && t.sessionId && t.status !== "gone").length;
+    const others = !discardOthers ? "" : left === 0 ? "; the other branches were destroyed" : `; ${left} other branch(es) couldn't be destroyed`;
+    console.log(S(`Kept [${branch}] ${target.providerId}${target.model ? `:${target.model}` : ""} — session ${target.sessionId}${others}.`));
     console.log(`Attach with: codeoid attach ${target.sessionId}`);
   }
 
@@ -915,11 +932,19 @@ export class TerminalClient {
       return;
     }
 
+    // A tool approval is answered by its own id (the daemon never guesses
+    // "the first pending" — see Session#approve): read it off the session.
+    const pending = await this.#pendingToolApproval(sessionId);
+    if (!pending) {
+      console.log("Nothing in that session is waiting for an approval.");
+      return;
+    }
+    console.log(`${S(pending.name)}${pending.description ? `: ${S(pending.description)}` : ""}`);
     const resp = await this.#request({
       type: "session.approve",
       id: randomUUID(),
       sessionId,
-      approvalId: "", // Will fall back to first pending
+      approvalId: pending.approvalId,
       approved,
     });
 
@@ -1091,6 +1116,48 @@ export class TerminalClient {
     console.log(`${kind} sent — watch: codeoid pipeline status ${id}`);
   }
 
+  /**
+   * The oldest tool call still waiting for a decision in a session, from its
+   * scrollback (attach, read the replay, detach) — what an attached client
+   * would show as the question.
+   */
+  async #pendingToolApproval(sessionId: string): Promise<{ approvalId: string; name: string; description?: string } | null> {
+    type Row = { type?: string; role?: string; messageId?: string; content?: string; tool?: { name?: string; state?: { phase?: string; approvalId?: string; description?: string } } };
+    const rows: Row[] = [];
+    let done!: () => void;
+    const replayed = new Promise<void>((r) => {
+      done = r;
+    });
+    const prev = this.#streamHandler;
+    this.#streamHandler = (msg) => {
+      const m = msg as { type: string; sessionId?: string; messages?: Row[]; seq?: number; final?: boolean };
+      if (m.type !== "scrollback.replay" || m.sessionId !== sessionId) return;
+      rows.push(...(m.messages ?? []));
+      if (m.seq === undefined || m.final) done();
+    };
+    try {
+      const attached = await this.#request({ type: "session.attach", id: randomUUID(), sessionId });
+      if (attached.type === "response.error") {
+        this.#printError(attached);
+        return null;
+      }
+      await Promise.race([replayed, new Promise((r) => setTimeout(r, 3_000))]);
+    } finally {
+      this.#streamHandler = prev;
+      await this.#request({ type: "session.detach", id: randomUUID(), sessionId }).catch(() => undefined);
+    }
+    // Latest state per tool call, then the oldest still waiting.
+    const latest = new Map<string, Row>();
+    for (const r of rows) if (r.role === "tool_call" && r.messageId) latest.set(r.messageId, r);
+    for (const r of latest.values()) {
+      const st = r.tool?.state;
+      if (st?.phase === "waiting_confirmation" && st.approvalId) {
+        return { approvalId: st.approvalId, name: r.tool?.name ?? r.content ?? "tool", ...(st.description ? { description: st.description } : {}) };
+      }
+    }
+    return null;
+  }
+
   #request(msg: ClientMessage): Promise<DaemonMessage> {
     return new Promise((resolve, reject) => {
       if (!this.#ws || this.#ws.readyState !== WebSocket.OPEN) {
@@ -1194,7 +1261,8 @@ export class TerminalClient {
 
   #printError(resp: DaemonMessage): void {
     if (resp.type === "response.error") {
-      console.error(`Error: ${resp.error} (${resp.code})`);
+      // Errors can quote client- or agent-supplied text (names, model ids).
+      console.error(`Error: ${S(resp.error)} (${resp.code})`);
     }
   }
 }

@@ -946,12 +946,11 @@ export function App({ config }: Props) {
               prompt: cmd.prompt,
               targets: cmd.targets,
               ...(afterTurnId ? { afterTurnId } : {}),
-              ...(cmd.shared ? { isolate: false } : {}),
             });
             if (res.type !== "compare.state") throw new Error(res.type === "response.error" ? res.error : "compare failed");
             printLocalInfo(
               sessionId,
-              `${sanitizeTerminalOutput(formatCompare(res.compare))}\n\nThe branches are running as their own sessions. /compare shows how they're doing; /compare keep <branch> [--discard-others] keeps one.`,
+              `${sanitizeTerminalOutput(formatCompare(res.compare))}\n\nThe branches are running as their own sessions (each asks for approvals there). /compare shows how they're doing; /compare keep <branch> [--discard-others] keeps one.`,
             );
             return;
           }

@@ -632,16 +632,15 @@ program
 
 const compare = program
   .command("compare")
-  .description("Run one prompt on 2–4 backends side by side (each a fork in its own worktree), then keep the best");
+  .description("Run one prompt on 2–4 backends side by side (each a fork in its own git worktree), then keep the best");
 
 compare
   .command("run <session> <prompt...>")
   .description("Fork one branch per backend from this session (or after prompt N), send each the prompt, show the results")
   .requiredOption("--with <backends>", "2–4 backends, comma-separated; backend:model picks a model (e.g. claude,codex:gpt-5.5)")
   .option("--at <n>", "compare from after prompt N (with the files as they were then)")
-  .option("--shared", "share the parent's folder instead of a worktree per branch")
   .option("--no-wait", "start the branches and return; see them later with `compare show`")
-  .action(async (session: string, words: string[], o: { with: string; at?: string; shared?: boolean; wait: boolean }) => {
+  .action(async (session: string, words: string[], o: { with: string; at?: string; wait: boolean }) => {
     const targets = parseTargets(o.with);
     if ("error" in targets) {
       console.error(targets.error);
@@ -657,7 +656,6 @@ compare
     await client.connect();
     await client.compareRun(session, targets, words.join(" "), {
       ...(at !== undefined ? { at } : {}),
-      ...(o.shared ? { shared: true } : {}),
       wait: o.wait,
     });
     client.disconnect();

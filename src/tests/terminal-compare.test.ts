@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { CompareState } from "../protocol/types.js";
-import { compareSettled, formatCompare, parseCompareArgs, parseTargets } from "../terminal/compare.js";
+import { awaitingApproval, compareSettled, formatCompare, parseCompareArgs, parseTargets } from "../terminal/compare.js";
 
 describe("parseTargets", () => {
   it("reads backends and backend:model (a model may contain more colons)", () => {
@@ -28,13 +28,13 @@ describe("parseCompareArgs", () => {
     expect(parseCompareArgs(["keep", "1", "--nope"])).toHaveProperty("error");
   });
   it("targets, then flags, then the prompt (flags after the prompt starts are part of it)", () => {
-    expect(parseCompareArgs(["claude,codex", "--at", "3", "--shared", "fix", "the", "--at", "bug"])).toEqual({
+    expect(parseCompareArgs(["claude,codex", "--at", "3", "fix", "the", "--at", "bug"])).toEqual({
       kind: "start",
       targets: [{ providerId: "claude" }, { providerId: "codex" }],
       at: 3,
-      shared: true,
       prompt: "fix the --at bug",
     });
+    expect(parseCompareArgs(["claude,codex", "go"])).toEqual({ kind: "start", targets: [{ providerId: "claude" }, { providerId: "codex" }], prompt: "go" });
   });
   it("needs a prompt and a valid --at", () => {
     expect(parseCompareArgs(["claude,codex"])).toHaveProperty("error");
@@ -51,9 +51,9 @@ describe("formatCompare", () => {
     createdBy: "u",
     keptSessionId: "s2",
     targets: [
-      { providerId: "claude", sessionId: "s1", status: "idle", reply: "done A", costUsd: 0.0123, durationMs: 4200, files: { changed: 2, insertions: 10, deletions: 3, paths: ["a.ts", "b.ts"] } },
-      { providerId: "codex", model: "gpt-5.5", sessionId: "s2", status: "idle", reply: "done B" },
-      { providerId: "pi", status: "failed", error: "no credentials" },
+      { providerId: "claude", sessionId: "s1", status: "idle", done: true, reply: "done A", costUsd: 0.0123, durationMs: 4200, files: { changed: 2, insertions: 10, deletions: 3, paths: ["a.ts", "b.ts"] } },
+      { providerId: "codex", model: "gpt-5.5", sessionId: "s2", status: "idle", done: true, reply: "done B" },
+      { providerId: "pi", status: "failed", done: true, error: "no credentials" },
     ],
   };
   it("numbers branches for keep, with stats, files, reply, the kept one and failures", () => {
@@ -66,8 +66,14 @@ describe("formatCompare", () => {
     expect(out).toContain("[3] pi — failed");
     expect(out).toContain("error: no credentials");
   });
-  it("settles only when no branch is still working", () => {
+  it("settles only when every branch is done or waiting on an approval, and says who's waiting", () => {
     expect(compareSettled(state)).toBe(true);
-    expect(compareSettled({ ...state, targets: [...state.targets, { providerId: "x", sessionId: "s4", status: "thinking" }] })).toBe(false);
+    const working = { ...state, targets: [...state.targets, { providerId: "x", sessionId: "s4", status: "thinking" as const, done: false }] };
+    expect(compareSettled(working)).toBe(false);
+    expect(formatCompare(working)).toContain("[4] x — working…");
+    const asking = { ...state, targets: [...state.targets, { providerId: "x", sessionId: "s4", status: "waiting_approval" as const, done: false }] };
+    expect(compareSettled(asking)).toBe(true);
+    expect(awaitingApproval(asking)).toEqual([{ branch: 4, sessionId: "s4", name: "x" }]);
+    expect(formatCompare(asking)).toContain("[4] x — needs your approval");
   });
 });

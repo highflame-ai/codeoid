@@ -566,11 +566,20 @@ export const sessionCompareSchema = z.object({
   sessionId: sessionIdField,
   prompt: z.string().min(1).max(LIMITS.SEND_TEXT_MAX),
   targets: z
-    .array(z.object({ providerId: z.string().min(1).max(64), model: z.string().min(1).max(200).optional() }))
+    .array(
+      z.object({
+        providerId: z.string().regex(/^[a-z0-9][a-z0-9_-]*$/i).max(64),
+        // A model id, never a flag or control text (it reaches CLI argv and terminals).
+        model: z
+          .string()
+          .regex(/^[\w.:/@+][\w.:/@+-]*$/)
+          .max(200)
+          .optional(),
+      }),
+    )
     .min(2)
     .max(4),
   afterTurnId: z.string().min(1).max(128).optional(),
-  isolate: z.boolean().optional(),
 });
 
 export const compareGetSchema = z.object({ ...base, type: z.literal("compare.get"), compareId: z.string().min(1).max(128) });

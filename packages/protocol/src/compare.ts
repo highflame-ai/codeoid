@@ -28,10 +28,12 @@ export interface SessionCompareMsg {
   prompt: string;
   /** 2–4 targets. The same backend may appear twice with different models. */
   targets: CompareTargetSpec[];
-  /** Compare from an earlier point (see `session.fork` `afterTurnId`). */
+  /**
+   * Compare from an earlier point (see `session.fork` `afterTurnId`). Each
+   * branch always gets its own git worktree: agents sharing one folder would
+   * edit each other's files, so a comparison needs a git repository.
+   */
   afterTurnId?: string;
-  /** Own git worktree per branch (default true); false shares the folder. */
-  isolate?: boolean;
 }
 
 /** A comparison's current state. Scope: `session:attach` or `session:watch`. */
@@ -68,11 +70,20 @@ export interface CompareTargetState {
   model?: string;
   /** The branch session (absent when it couldn't be created — see `error`). */
   sessionId?: string;
-  /** Session status, or "gone" once the branch session was destroyed. */
+  /**
+   * Session status, or "gone" once the branch session was destroyed.
+   * `waiting_approval` means it needs someone to open it and decide.
+   */
   status: SessionStatus | "gone" | "failed";
+  /**
+   * The compared turn has settled and its result (reply, files, cost, time)
+   * is final — taken from that turn alone, so carrying on in the branch
+   * doesn't change it.
+   */
+  done: boolean;
   /** Why the branch failed to start, or its turn's error. */
   error?: string;
-  /** The branch's reply to the prompt (its latest, shortened). */
+  /** The branch's reply to the prompt (that turn's only; shortened). Set once done. */
   reply?: string;
   costUsd?: number;
   durationMs?: number;

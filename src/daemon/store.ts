@@ -912,6 +912,8 @@ export class Store {
 
   deleteSession(id: string): void {
     this.#db.prepare("DELETE FROM sessions WHERE id = ?").run(id);
+    // Its comparisons (#357) go with it — their prompts must not outlive it.
+    this.#db.prepare("DELETE FROM compare_runs WHERE parent_session_id = ?").run(id);
   }
 
   // ── Conductor identity ────────────────────────────────────────────────
@@ -1775,6 +1777,18 @@ function restrictToOwner(dbPath: string): void {
   }
 }
 
+/** What a comparison branch's turn did (#357), frozen when it settled. */
+export interface CompareBranchResult {
+  status: "idle" | "error";
+  error?: string;
+  reply?: string;
+  costUsd?: number;
+  durationMs?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  files?: { changed: number; insertions: number; deletions: number; paths: string[] };
+}
+
 /** One comparison (#357), as stored. */
 export interface CompareRunRow {
   id: string;
@@ -1783,7 +1797,17 @@ export interface CompareRunRow {
   parentSessionId: string;
   afterTurnId?: string;
   prompt: string;
-  targets: Array<{ sessionId?: string; providerId: string; model?: string; baseTurnId?: string; error?: string }>;
+  targets: Array<{
+    sessionId?: string;
+    providerId: string;
+    model?: string;
+    /** The branch's compared turn, once its prompt started. */
+    baseTurnId?: string;
+    /** Why the branch failed to start. */
+    error?: string;
+    /** Frozen when the compared turn settled: what it did, never what came after. */
+    result?: CompareBranchResult;
+  }>;
   keptSessionId?: string;
   createdBy: string;
   createdAt: string;

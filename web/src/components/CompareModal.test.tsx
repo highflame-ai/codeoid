@@ -22,8 +22,8 @@ const STATE = {
   createdAt: "2026-10-10T00:00:00.000Z",
   createdBy: "u",
   targets: [
-    { providerId: "claude", sessionId: "b1", status: "idle", reply: "reply from claude", files: { changed: 1, insertions: 4, deletions: 1, paths: ["a.ts"] } },
-    { providerId: "codex", model: "gpt-5.5", sessionId: "b2", status: "idle", reply: "reply from codex" },
+    { providerId: "claude", sessionId: "b1", status: "idle", done: true, reply: "reply from claude", files: { changed: 1, insertions: 4, deletions: 1, paths: ["a.ts"] } },
+    { providerId: "codex", model: "gpt-5.5", sessionId: "b2", status: "idle", done: true, reply: "reply from codex" },
   ],
 };
 
@@ -80,6 +80,39 @@ describe("CompareModal", () => {
     const keep = requestMock.mock.calls.map((c) => c[0]).find((m) => m.type === "compare.keep")!;
     expect(keep).toMatchObject({ compareId: "c1", sessionId: "b2", discardOthers: true });
     await r.findByText("kept");
+  });
+
+  it("says when a branch needs an approval, and only lets a finished branch be kept", async () => {
+    respond({
+      "session.compare": {
+        type: "compare.state",
+        requestId: "r",
+        compare: {
+          ...STATE,
+          targets: [
+            { providerId: "claude", sessionId: "b1", status: "waiting_approval", done: false },
+            { providerId: "codex", sessionId: "b2", status: "idle", done: true, reply: "reply from codex" },
+          ],
+        },
+      },
+      "compare.get": {
+        type: "compare.state",
+        requestId: "r",
+        compare: {
+          ...STATE,
+          targets: [
+            { providerId: "claude", sessionId: "b1", status: "waiting_approval", done: false },
+            { providerId: "codex", sessionId: "b2", status: "idle", done: true, reply: "reply from codex" },
+          ],
+        },
+      },
+    });
+    const r = render(() => <CompareModal />);
+    openCompare("s");
+    fireEvent.input(await r.findByLabelText("prompt"), { target: { value: "go" } });
+    fireEvent.click(r.getByRole("button", { name: "Compare 2 backends" }));
+    await r.findByText("needs your approval — open it");
+    expect(r.getAllByRole("button", { name: "keep" })).toHaveLength(1);
   });
 
   it("needs a prompt and shows the daemon's refusal", async () => {

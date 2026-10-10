@@ -126,11 +126,7 @@ async function settled(m: SessionManager, compareId: string): Promise<CompareSta
   for (let i = 0; i < 300; i++) {
     const r = await m.handle({ type: "compare.get", id: "g", compareId }, AUTH, CLIENT);
     if (r.type !== "compare.state") throw new Error(JSON.stringify(r));
-    if (r.compare.targets.every((t) => t.status === "idle" || t.status === "error" || t.status === "failed" || t.status === "gone")) {
-      await Bun.sleep(80); // end-of-turn snapshots
-      const again = await m.handle({ type: "compare.get", id: "g", compareId }, AUTH, CLIENT);
-      if (again.type === "compare.state") return again.compare;
-    }
+    if (r.compare.targets.every((t) => t.done)) return r.compare;
     await Bun.sleep(10);
   }
   throw new Error("comparison never settled");
@@ -180,7 +176,6 @@ describe("session.compare", () => {
     const started = await compare(m, parent, {
       prompt: "alt",
       afterTurnId: turns.turns[0]!.turnId,
-      isolate: false,
       targets: [{ providerId: "claude", model: "opus" }, { providerId: "claude", model: "sonnet" }],
     });
     const done = await settled(m, started.compareId);
@@ -191,14 +186,34 @@ describe("session.compare", () => {
     expect(done.targets.map((t) => t.model)).toEqual(["opus", "sonnet"]);
   });
 
-  it("a branch whose turn fails is reported, and the others carry on", async () => {
+  it("a branch whose turn fails is reported — never with the parent's reply — and the others carry on", async () => {
     const m = newManager();
     const parent = await create(m);
-    const started = await compare(m, parent, { prompt: "go", isolate: false, targets: [{ providerId: "claude" }, { providerId: "pi" }] });
+    const p = m._sessionForTest(parent)!;
+    await p.send("earlier", AUTH);
+    for (let i = 0; i < 200 && p.status !== "idle"; i++) await Bun.sleep(10);
+    expect(p.lastAssistantText).toBe("claude answer");
+    const started = await compare(m, parent, { prompt: "go", targets: [{ providerId: "claude" }, { providerId: "pi" }] });
+    // Running: no reply shown yet (not even the inherited one).
+    expect(started.targets.every((t) => t.reply === undefined && !t.done)).toBe(true);
     const done = await settled(m, started.compareId);
     expect(done.targets[0]!.reply).toBe("claude answer");
     expect(done.targets[1]!.status).toBe("error");
     expect(done.targets[1]!.error).toContain("pi backend failed");
+    expect(done.targets[1]!.reply).toBeUndefined();
+  });
+
+  it("freezes each branch's result: carrying on in it later changes nothing", async () => {
+    const m = newManager();
+    const parent = await create(m);
+    const started = await compare(m, parent, { prompt: "go", targets: [{ providerId: "claude" }, { providerId: "codex" }] });
+    const done = await settled(m, started.compareId);
+    const branch = m._sessionForTest(done.targets[0]!.sessionId!)!;
+    await branch.send("more", AUTH);
+    for (let i = 0; i < 200 && branch.status !== "idle"; i++) await Bun.sleep(10);
+    expect(branch.lastAssistantText).toBe("claude again");
+    const again = await settled(m, started.compareId);
+    expect(again.targets[0]).toMatchObject({ reply: "claude answer", costUsd: done.targets[0]!.costUsd, status: "idle", done: true });
   });
 
   it("keeps one branch and can discard the others", async () => {
@@ -216,6 +231,50 @@ describe("session.compare", () => {
       expect(m._sessionForTest(d.id)).toBeUndefined();
       expect(existsSync(d.wd)).toBe(false); // their worktrees went with them
     }
+    // One keep per comparison: a second can't destroy the first.
+    const second = await m.handle({ type: "compare.keep", id: "k2", compareId: started.compareId, sessionId: started.targets[0]!.sessionId!, discardOthers: true }, AUTH, CLIENT);
+    expect(second).toMatchObject({ type: "response.error", code: "invalid_request" });
+    expect(m._sessionForTest(keep)).toBeDefined();
+  });
+
+  it("refuses up front — leaving nothing behind — a model the backend doesn't have, a busy session, and a folder that isn't a git repo", async () => {
+    const m = newManager();
+    const parent = await create(m);
+    const count = async () => {
+      const r = await m.handle({ type: "session.list", id: "l" }, AUTH, CLIENT);
+      return r.type === "session.list.result" ? r.sessions.length : -1;
+    };
+    const before = await count();
+    const badModel = await m.handle({ type: "session.compare", id: "x", sessionId: parent, prompt: "go", targets: [{ providerId: "claude" }, { providerId: "codex", model: "opus" }] } as never, AUTH, CLIENT);
+    expect(badModel).toMatchObject({ type: "response.error", code: "invalid_request" });
+    const flag = await m.handle({ type: "session.compare", id: "x", sessionId: parent, prompt: "go", targets: [{ providerId: "claude" }, { providerId: "codex", model: "--yolo" }] } as never, AUTH, CLIENT);
+    expect(flag).toMatchObject({ type: "response.error", code: "invalid_request" });
+    expect(await count()).toBe(before);
+
+    const p = m._sessionForTest(parent)!;
+    await p.send("busy", AUTH); // resolves once its turn has started
+    const busy = await m.handle({ type: "session.compare", id: "x", sessionId: parent, prompt: "go", targets: [{ providerId: "claude" }, { providerId: "codex" }] } as never, AUTH, CLIENT);
+    expect(busy).toMatchObject({ type: "response.error", code: "invalid_request" });
+    expect((busy as { error: string }).error).toContain("working");
+    expect(await count()).toBe(before);
+
+    const plain = join(tmp, "plain");
+    mkdirSync(plain);
+    const r = await m.handle({ type: "session.create", id: "c2", name: "plain", workdir: plain }, AUTH, CLIENT);
+    const plainId = (r as { data: { id: string } }).data.id;
+    const noGit = await m.handle({ type: "session.compare", id: "x", sessionId: plainId, prompt: "go", targets: [{ providerId: "claude" }, { providerId: "codex" }] } as never, AUTH, CLIENT);
+    expect(noGit).toMatchObject({ type: "response.error", code: "invalid_request" });
+    expect((noGit as { error: string }).error).toContain("git repository");
+  });
+
+  it("forgets a session's comparisons when the session is destroyed", async () => {
+    const m = newManager();
+    const parent = await create(m);
+    const started = await compare(m, parent, { prompt: "go", targets: [{ providerId: "claude" }, { providerId: "codex" }] });
+    await settled(m, started.compareId);
+    await m.handle({ type: "session.destroy", id: "d", sessionId: parent }, AUTH, CLIENT);
+    const r = await m.handle({ type: "compare.get", id: "g", compareId: started.compareId }, AUTH, CLIENT);
+    expect(r).toMatchObject({ type: "response.error", code: "not_found" });
   });
 
   it("refuses unknown backends, missing scopes and other tenants", async () => {
@@ -227,7 +286,7 @@ describe("session.compare", () => {
     const noCreate = await m.handle({ type: "session.compare", id: "x", sessionId: parent, prompt: "go", targets: [{ providerId: "claude" }, { providerId: "codex" }] } as never, sendOnly, CLIENT);
     expect(noCreate).toMatchObject({ type: "response.error", code: "forbidden" });
 
-    const started = await compare(m, parent, { prompt: "go", isolate: false, targets: [{ providerId: "claude" }, { providerId: "codex" }] });
+    const started = await compare(m, parent, { prompt: "go", targets: [{ providerId: "claude" }, { providerId: "codex" }] });
     const other: AuthContext = { ...AUTH, accountId: "someone-else" };
     const peek = await m.handle({ type: "compare.get", id: "x", compareId: started.compareId }, other, CLIENT);
     expect(peek).toMatchObject({ type: "response.error", code: "not_found" });
@@ -242,7 +301,7 @@ describe("session.compare", () => {
   it("survives a daemon restart", async () => {
     const m = newManager();
     const parent = await create(m);
-    const started = await compare(m, parent, { prompt: "go", isolate: false, targets: [{ providerId: "claude" }, { providerId: "codex" }] });
+    const started = await compare(m, parent, { prompt: "go", targets: [{ providerId: "claude" }, { providerId: "codex" }] });
     await settled(m, started.compareId);
     await m.drain(2_000);
     await transcript.flush();
