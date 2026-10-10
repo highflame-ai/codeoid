@@ -17,6 +17,46 @@ import { existsSync, mkdirSync } from "node:fs";
 import { appendFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { CanonicalHistoryChange, CanonicalTurn } from "./providers/canonical.js";
+import type { TurnSummary } from "../protocol/types.js";
+
+/** One turn in a session's turn index (#354): what `session.turns` lists. */
+export type TurnIndexEntry = Pick<TurnSummary, "turnId" | "kind" | "preview" | "startedAt">;
+
+/** Compact the canonical log past this size (keeps the newest half). */
+export const CANONICAL_COMPACT_BYTES = 32 * 1024 * 1024;
+/** Per-field caps for a persisted canonical turn. */
+const CANONICAL_TEXT_CAP = 256 * 1024;
+const CANONICAL_TOOL_CAP = 64 * 1024;
+
+function capText(s: string, cap: number): string {
+  return s.length > cap ? `${s.slice(0, cap)}\n… [truncated for the history log: ${s.length} chars total]` : s;
+}
+
+/** One log line for `turn`, with oversized fields capped. */
+function canonicalLine(turn: CanonicalTurn): string {
+  let t: CanonicalTurn = turn;
+  if (t.role === "user") {
+    if (t.content.length > CANONICAL_TEXT_CAP) t = { ...t, content: capText(t.content, CANONICAL_TEXT_CAP) };
+  } else {
+    const content = capText(t.content, CANONICAL_TEXT_CAP);
+    const thinking = t.thinking !== undefined ? capText(t.thinking, CANONICAL_TEXT_CAP) : undefined;
+    const toolCalls = t.toolCalls?.map((tc) => {
+      const input = JSON.stringify(tc.input);
+      return {
+        ...tc,
+        output: capText(tc.output, CANONICAL_TOOL_CAP),
+        input: input.length > CANONICAL_TOOL_CAP ? { truncated: capText(input, CANONICAL_TOOL_CAP) } : tc.input,
+      };
+    });
+    t = {
+      ...t,
+      content,
+      ...(thinking !== undefined ? { thinking } : {}),
+      ...(toolCalls ? { toolCalls } : {}),
+    };
+  }
+  return `${JSON.stringify({ op: "append", turn: t })}\n`;
+}
 import type {
   CollaborationConfig,
   DaemonMessage,
@@ -75,6 +115,8 @@ export interface TranscriptStoreOptions {
   segmentMaxBytes?: number;
   /** Rotated segments kept per session (older ones are deleted). Default 2. */
   maxRotatedSegments?: number;
+  /** Compact a session's canonical-history log past this size (#354). Default 32 MiB. */
+  canonicalCompactBytes?: number;
 }
 
 const DEFAULT_SEGMENT_MAX_BYTES = 32 * 1024 * 1024;
@@ -141,13 +183,17 @@ export class TranscriptStore {
   #metaWriteChain = new Map<string, Promise<void>>();
   /** Per-session promise chain for `append()`. See append() docs. */
   #appendChain = new Map<string, Promise<void>>();
-  /** Per-session promise chain for the canonical-history log (#354). */
+  /** Per-session promise chains for the canonical-history log and turn index (#354). */
   #canonicalChain = new Map<string, Promise<void>>();
+  #turnIndexChain = new Map<string, Promise<void>>();
+  /** Canonical log size per session, seeded lazily from disk. */
+  #canonicalBytes = new Map<string, number>();
   /** Live-file byte counter per session, so rotation doesn't stat per append.
    * Seeded lazily from the file's on-disk size on the first append. */
   #liveBytes = new Map<string, number>();
   #segmentMaxBytes: number;
   #maxRotatedSegments: number;
+  #canonicalCompactBytes: number;
 
   constructor(transcriptDir: string, opts: TranscriptStoreOptions = {}) {
     this.#dir = transcriptDir;
@@ -161,6 +207,7 @@ export class TranscriptStore {
       1,
       Math.floor(opts.maxRotatedSegments ?? DEFAULT_MAX_ROTATED_SEGMENTS),
     );
+    this.#canonicalCompactBytes = Math.max(1024, Math.floor(opts.canonicalCompactBytes ?? CANONICAL_COMPACT_BYTES));
     if (!existsSync(this.#dir)) {
       mkdirSync(this.#dir, { recursive: true });
     }
@@ -178,6 +225,7 @@ export class TranscriptStore {
       ...this.#metaWriteChain.values(),
       ...this.#appendChain.values(),
       ...this.#canonicalChain.values(),
+      ...this.#turnIndexChain.values(),
     ]);
   }
 
@@ -187,52 +235,87 @@ export class TranscriptStore {
   // switch and rewind is built from. It lived only in memory, so after a
   // restart a session showed its scrollback but forked / switched with NO
   // conversation. One JSONL per session: `append` lines grow it, a `replace`
-  // (fork seed, rotation reset, rewind) rewrites the file atomically, so the
-  // file is always "last full state + appends" and never needs compaction.
+  // (fork seed, rotation reset, rewind) rewrites the file atomically.
+  //
+  // Bounded on every axis: each turn is capped as it is written (an attached
+  // file or a tool's full output can't make one line huge), the file is
+  // compacted to its newest turns once it outgrows CANONICAL_COMPACT_BYTES,
+  // and resume reads only a tail (`maxBytes`). Lines are serialized at call
+  // time, so a caller mutating its history afterwards can't change what is
+  // written. Files are owner-only (0600): they hold prompts and tool output.
+
+  /** Directory this store writes into. */
+  get dir(): string {
+    return this.#dir;
+  }
 
   /** Path to a session's canonical-history log. */
   canonicalPath(sessionId: string): string {
     return join(this.#dir, `${sessionId}.canonical.jsonl`);
   }
 
-  /** Persist one change. Serialized per session; never throws. */
+  /** Path to a session's turn index (#354). */
+  turnIndexPath(sessionId: string): string {
+    return join(this.#dir, `${sessionId}.turns.jsonl`);
+  }
+
+  /** Persist one canonical-history change. Serialized per session; never throws. */
   recordCanonical(sessionId: string, change: CanonicalHistoryChange): Promise<void> {
     const path = this.canonicalPath(sessionId);
+    // Serialize NOW: the caller's arrays may change before the write runs.
+    const body =
+      change.op === "append"
+        ? canonicalLine(change.turn)
+        : change.turns.map((t) => canonicalLine(t)).join("");
+    const bytes = Buffer.byteLength(body, "utf-8");
     const write = async () => {
       if (change.op === "append") {
-        await appendFile(path, `${JSON.stringify({ op: "append", turn: change.turn })}\n`, "utf-8");
+        let size = this.#canonicalBytes.get(sessionId);
+        if (size === undefined) {
+          const f = Bun.file(path);
+          size = (await f.exists()) ? f.size : 0;
+        }
+        await appendFile(path, body, { encoding: "utf-8", mode: 0o600 });
+        size += bytes;
+        if (size > this.#canonicalCompactBytes) size = await this.#compactCanonical(sessionId);
+        this.#canonicalBytes.set(sessionId, size);
       } else {
-        const tmp = `${path}.tmp`;
-        const body = change.turns.map((turn) => `${JSON.stringify({ op: "append", turn })}\n`).join("");
-        await writeFile(tmp, body, "utf-8");
-        await rename(tmp, path);
+        await this.#writeAtomic(path, body);
+        this.#canonicalBytes.set(sessionId, bytes);
       }
     };
-    const prev = this.#canonicalChain.get(sessionId) ?? Promise.resolve();
-    const stored: Promise<void> = prev
-      .then(write)
-      .catch((err) => {
-        console.error(
-          `[codeoid] canonical log ${sessionId}: write failed: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      })
-      .finally(() => {
-        if (this.#canonicalChain.get(sessionId) === stored) this.#canonicalChain.delete(sessionId);
-      });
-    this.#canonicalChain.set(sessionId, stored);
-    return stored;
+    return this.#chain(this.#canonicalChain, sessionId, write, "canonical log");
+  }
+
+  /** Keep the newest turns (≤ half the ceiling, starting at a user turn). Returns the new size. */
+  async #compactCanonical(sessionId: string): Promise<number> {
+    const { turns } = await this.#readCanonical(sessionId, this.#canonicalCompactBytes / 2);
+    const body = turns.map((t) => canonicalLine(t)).join("");
+    await this.#writeAtomic(this.canonicalPath(sessionId), body);
+    return Buffer.byteLength(body, "utf-8");
   }
 
   /**
    * Load a session's canonical history, or null when it has no log (a session
-   * from before #354). A torn last line — a crash mid-append — is skipped.
+   * from before #354). With `maxBytes`, only the newest turns that fit are
+   * read (`partial: true` when older ones were left out) — always starting at
+   * a user turn. A torn last line (a crash mid-append) is skipped.
    */
-  async loadCanonical(sessionId: string): Promise<CanonicalTurn[] | null> {
+  async loadCanonical(
+    sessionId: string,
+    opts: { maxBytes?: number } = {},
+  ): Promise<{ turns: CanonicalTurn[]; partial: boolean } | null> {
     await this.#canonicalChain.get(sessionId);
-    const file = Bun.file(this.canonicalPath(sessionId));
-    if (!(await file.exists())) return null;
+    if (!(await Bun.file(this.canonicalPath(sessionId)).exists())) return null;
+    return this.#readCanonical(sessionId, opts.maxBytes);
+  }
+
+  async #readCanonical(sessionId: string, maxBytes?: number): Promise<{ turns: CanonicalTurn[]; partial: boolean }> {
+    const path = this.canonicalPath(sessionId);
+    const size = Bun.file(path).size;
+    const offset = maxBytes !== undefined && size > maxBytes ? size - maxBytes : 0;
     const turns: CanonicalTurn[] = [];
-    for (const line of (await file.text()).split("\n")) {
+    for await (const line of readLines(path, offset)) {
       if (!line.trim()) continue;
       try {
         const entry = JSON.parse(line) as { op?: string; turn?: CanonicalTurn };
@@ -243,7 +326,84 @@ export class TranscriptStore {
         // torn line
       }
     }
-    return turns;
+    let partial = offset > 0;
+    if (partial) {
+      // A tail read may start mid-turn: drop leading assistant turns.
+      const firstUser = turns.findIndex((t) => t.role === "user");
+      turns.splice(0, firstUser === -1 ? turns.length : firstUser);
+    }
+    if (turns.length === 0 && size > 0 && offset > 0) partial = true;
+    return { turns, partial };
+  }
+
+  /** Append one turn-index entry (#354). Serialized per session; never throws. */
+  recordTurn(sessionId: string, entry: TurnIndexEntry): Promise<void> {
+    const line = `${JSON.stringify(entry)}\n`;
+    const path = this.turnIndexPath(sessionId);
+    return this.#chain(
+      this.#turnIndexChain,
+      sessionId,
+      () => appendFile(path, line, { encoding: "utf-8", mode: 0o600 }),
+      "turn index",
+    );
+  }
+
+  /** Replace a session's turn index (fork, rewind). */
+  replaceTurnIndex(sessionId: string, entries: readonly TurnIndexEntry[]): Promise<void> {
+    const body = entries.map((e) => `${JSON.stringify(e)}\n`).join("");
+    const path = this.turnIndexPath(sessionId);
+    return this.#chain(this.#turnIndexChain, sessionId, () => this.#writeAtomic(path, body), "turn index");
+  }
+
+  /** A session's turn index, or null when it has none (a session from before #354). */
+  async loadTurnIndex(sessionId: string): Promise<TurnIndexEntry[] | null> {
+    await this.#turnIndexChain.get(sessionId);
+    const file = Bun.file(this.turnIndexPath(sessionId));
+    if (!(await file.exists())) return null;
+    const out: TurnIndexEntry[] = [];
+    for (const line of (await file.text()).split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const e = JSON.parse(line) as TurnIndexEntry;
+        if (typeof e.turnId === "string" && (e.kind === "prompt" || e.kind === "background")) out.push(e);
+      } catch {
+        // torn line
+      }
+    }
+    return out;
+  }
+
+  async #writeAtomic(path: string, body: string): Promise<void> {
+    const tmp = `${path}.tmp`;
+    await writeFile(tmp, body, { encoding: "utf-8", mode: 0o600 });
+    await rename(tmp, path);
+  }
+
+  /**
+   * Run `write` after the session's previous write in `chains`. The stored
+   * promise never rejects (a rejected promise left in the map is an
+   * unhandled rejection under Bun), logs failures once, and removes itself
+   * when it is the leaf.
+   */
+  #chain(
+    chains: Map<string, Promise<void>>,
+    sessionId: string,
+    write: () => Promise<void>,
+    what: string,
+  ): Promise<void> {
+    const prev = chains.get(sessionId) ?? Promise.resolve();
+    const stored: Promise<void> = prev
+      .then(write)
+      .catch((err) => {
+        console.error(
+          `[codeoid] ${what} ${sessionId}: write failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      })
+      .finally(() => {
+        if (chains.get(sessionId) === stored) chains.delete(sessionId);
+      });
+    chains.set(sessionId, stored);
+    return stored;
   }
 
   /** Path to a session's live (currently-appended) transcript file. */
@@ -592,11 +752,16 @@ export class TranscriptStore {
       this.#appendChain.get(sessionId),
       this.#metaWriteChain.get(sessionId),
       this.#canonicalChain.get(sessionId),
+      this.#turnIndexChain.get(sessionId),
     ]);
     this.#liveBytes.delete(sessionId);
+    this.#canonicalBytes.delete(sessionId);
 
     await rm(this.transcriptPath(sessionId), { force: true });
-    await rm(this.canonicalPath(sessionId), { force: true });
+    for (const p of [this.canonicalPath(sessionId), this.turnIndexPath(sessionId)]) {
+      await rm(p, { force: true });
+      await rm(`${p}.tmp`, { force: true }); // a crash mid-rewrite leaves this behind
+    }
     await rm(this.metaPath(sessionId), { force: true });
     for (let i = 1; i <= this.#maxRotatedSegments; i++) {
       await rm(this.#segmentPath(sessionId, i), { force: true });

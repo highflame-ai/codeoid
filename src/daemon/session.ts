@@ -57,8 +57,10 @@ import type {
   ToolState,
   SessionWorktree,
 } from "../protocol/types.js";
+import { join } from "node:path";
 import { removeForkWorktree } from "./git-worktree.js";
-import { createCheckpoint, deleteCheckpoints, gitTopLevel, listCheckpoints } from "./checkpoints.js";
+import { copyCheckpoints, createCheckpoint, deleteCheckpoints, listCheckpoints } from "./checkpoints.js";
+import type { TurnIndexEntry } from "./transcript.js";
 import type { TurnSummary } from "../protocol/types.js";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -410,6 +412,19 @@ export interface SessionCreateOptions {
   _testProvider?: SessionProvider;
 }
 
+/**
+ * A send whose turn never started: a Stop (or destroy) landed while it was
+ * still preparing (#354). The prompt is kept in the transcript and the user
+ * was told; callers waiting for the turn treat this like an interrupt, not a
+ * failure to report.
+ */
+export class SendStoppedError extends Error {
+  constructor() {
+    super("Stopped before the agent started on this message");
+    this.name = "SendStoppedError";
+  }
+}
+
 export class Session {
   readonly id: string;
   /**
@@ -539,12 +554,14 @@ export class Session {
   #currentTurnId: string | null = null;
   /** In-flight workspace snapshot per turn, so destroy can wait for them. */
   #pendingCheckpoints = new Set<Promise<unknown>>();
+  /** The session's turns, oldest first (#354) — see #indexTurn. */
+  #turnIndex: TurnIndexEntry[] = [];
   /**
-   * Until when the workdir is known NOT to be a git work tree — so a non-git
-   * session doesn't spawn git on every turn. Rechecked after it lapses, in
-   * case someone runs `git init` mid-session.
+   * The restored canonical history is only the newest part of the log (a
+   * bounded resume read). Features that need the whole conversation (going
+   * back to, or forking from, an old turn) load the full log on demand.
    */
-  #notGitUntil = 0;
+  #canonicalPartial = false;
   /** Pluggable seed policy for switch/fork. Default `transcript` (no change);
    *  `CODEOID_CONTEXT_STRATEGY=vws` opts into the compact session map. */
   #contextStrategy: ContextStrategy = selectContextStrategy();
@@ -1933,11 +1950,17 @@ export class Session {
       binary: r.binary,
       mimeType: r.mimeType,
     }));
-    // A new turn (#354): this prompt and everything that answers it share
-    // one id. Kept so a send refused below can hand attribution back.
+    // Turn attribution (#354). A prompt starts a new turn: it and everything
+    // that answers it share one id. A message sent while the agent is still
+    // working on a backend that takes it mid-turn JOINS the running turn —
+    // it shapes that run rather than starting one — so the running turn's
+    // remaining output stays attributed to it. `previousTurnId` lets a send
+    // that is refused or stopped below hand attribution back.
+    const joinsRunningTurn = wasWorking && !!this.#activeRun?.pushMidTurn && this.#currentTurnId !== null;
     const previousTurnId = this.#currentTurnId;
-    const turnId = this.#beginTurn();
+    let turnId = joinsRunningTurn ? (previousTurnId as string) : this.#beginTurn();
     const turnAt = new Date().toISOString();
+    try {
     const userMsg = this.#makeMessage(
       "user",
       text,
@@ -1948,10 +1971,6 @@ export class Session {
     );
     this.#persistAndBuffer(userMsg);
     this.#broadcastRaw(userMsg);
-    // Snapshot the files this turn starts from, before the agent can touch
-    // them — what "go back to before this message" restores. Bounded wait.
-    await this.#checkpointTurn(turnId);
-    if (this.#stoppedBeforeStart(stopGen)) return;
 
     // ── From here on, the message is safe. Any throw surfaces as a visible
     //    error (see SessionManager#send -> reportSendFailure), never a silent
@@ -2026,6 +2045,7 @@ export class Session {
       );
       this.#persistAndBuffer(midTurnMsg);
       this.#broadcastRaw(midTurnMsg);
+      if (!joinsRunningTurn) this.#indexTurn(turnId, "prompt", text, turnAt);
       this.#accumulator.pushUserTurn(effectivePrompt, turnId, { prompt: text, at: turnAt });
       // Count ONLY pushes that start a new query, because only those produce an
       // extra turn_done for #consumeEvents to absorb. A "later" push merges into
@@ -2136,14 +2156,17 @@ export class Session {
       ));
     }
 
-    if (this.#stoppedBeforeStart(stopGen)) return;
+    this.#throwIfStoppedBeforeStart(stopGen);
 
     // The backend may have started a turn on its own while this send awaited
     // (hooks, identity) — join it rather than start a second turn over it,
-    // whose runTurn would close the adopted queue mid-reply.
+    // whose runTurn would close the adopted queue mid-reply. Joining means
+    // the adopted turn's id, not the one minted for this prompt.
     const adopted = this.#activeRun;
     if (adopted?.pushMidTurn) {
-      this.#accumulator.pushUserTurn(effectivePrompt, turnId, { prompt: text, at: turnAt });
+      // #adoptTurn gave the adopted run its own id (current, unless unset).
+      if (this.#currentTurnId === turnId) this.#currentTurnId = previousTurnId;
+      this.#accumulator.pushUserTurn(effectivePrompt, this.#currentTurnId ?? undefined, { prompt: text, at: turnAt });
       adopted.bindGate?.(this.#gateFor(sender));
       adopted.pushMidTurn(effectivePrompt, "now");
       this.#pendingMidTurnCount++;
@@ -2151,6 +2174,16 @@ export class Session {
       return;
     }
 
+    // Snapshot the files this turn starts from, at the last moment before the
+    // agent can touch them — what "go back to before this message" restores.
+    // Bounded wait; a snapshot still running when the turn starts is `late`.
+    // A message that meant to join a running turn whose run turned out to be
+    // stalled (recovered above) starts a turn of its own instead.
+    if (turnId === previousTurnId) turnId = randomUUID();
+    await this.#checkpointTurn(turnId);
+    this.#throwIfStoppedBeforeStart(stopGen);
+    this.#currentTurnId = turnId;
+    this.#indexTurn(turnId, "prompt", text, turnAt);
     this.#accumulator.pushUserTurn(effectivePrompt, turnId, { prompt: text, at: turnAt });
     const run = this.#provider.runTurn({
       history: this.#accumulator.history,
@@ -2172,6 +2205,13 @@ export class Session {
     this.#onTurnStarted();
     // Broadcast info_update so StatusBar reflects the new queue depth.
     this.#broadcastInfoUpdate();
+    } catch (err) {
+      // Refused or stopped before its turn started: messages from here on
+      // belong to the turn that was current before this send, not to a turn
+      // that never happened.
+      if (this.#currentTurnId === turnId && turnId !== previousTurnId) this.#currentTurnId = previousTurnId;
+      throw err;
+    }
   }
 
   /**
@@ -2316,11 +2356,14 @@ export class Session {
     // Its own turn (#354), so "go back to before this" can drop what the
     // agent did on its own. No snapshot wait: the backend is already running.
     const turnId = this.#beginTurn();
+    const at = new Date().toISOString();
+    this.#indexTurn(turnId, "background", "Continued after background work finished", at);
     this.#accumulator.pushUserTurn("(Background work finished; the agent harness delivered the results.)", turnId, {
-      at: new Date().toISOString(),
+      at,
       background: true,
     });
-    void this.#checkpointTurn(turnId);
+    // The agent is already running: the snapshot is recorded as late.
+    void this.#checkpointTurn(turnId, 0);
     this.#turnInterrupted = false;
     this.#lastTurnError = null;
     // A turn with no prompt reads as the agent talking to itself; say why.
@@ -2514,8 +2557,10 @@ export class Session {
       this.id,
       `reports=${reports.length} tasks=${reports.map((r) => r.taskId.slice(0, 8)).join(",")}`,
     );
+    let stopped = false;
     void this.send(body, systemAuth)
       .catch((err) => {
+        stopped = err instanceof SendStoppedError;
         // A failed wake must not lose the digests — requeue and let the next
         // idle transition (or the next settle) retry. Re-dedup is already
         // handled: these ids stay in #reportedBackgroundTasks.
@@ -2526,8 +2571,10 @@ export class Session {
       })
       .finally(() => {
         this.#deliveringBackgroundReports = false;
-        // Settles that arrived DURING the wake turn deliver on its idle.
-        this.#maybeDeliverBackgroundReports();
+        // Settles that arrived DURING the wake turn deliver on its idle. Not
+        // after a Stop: re-waking at once would undo it — the requeued
+        // reports go out with the next turn's end instead.
+        if (!stopped) this.#maybeDeliverBackgroundReports();
       });
   }
 
@@ -2791,7 +2838,7 @@ export class Session {
     // Workspace snapshots (#354): drop this session's refs. Before the
     // worktree removal below — git needs the directory to find the repo.
     await Promise.allSettled([...this.#pendingCheckpoints]);
-    await deleteCheckpoints(this.workdir, this.id);
+    await deleteCheckpoints(this.#checkpointRoot, this.id);
     // Remove the isolated worktree codeoid created for this fork (best-effort,
     // never blocks destroy). Ownership-gated: only worktrees WE created
     // (createdByCodeoid) are removed; a user-bound worktree is left alone. The
@@ -5112,14 +5159,34 @@ export class Session {
   }
 
   /**
-   * True — after telling the user — when a Stop (or destroy) landed while
-   * this send was still preparing its turn (snapshot, hooks, identity). The
-   * send awaits several things before the agent starts; without this check
-   * a Stop pressed in that window stopped nothing, and the turn started
-   * anyway once the awaits finished. The prompt stays in the transcript.
+   * Record a turn that has really started in the turn index — what
+   * `session.turns` lists. Kept apart from the canonical history so a
+   * context rotation (which resets that history) doesn't erase the list.
    */
-  #stoppedBeforeStart(stopGen: number): boolean {
-    if (stopGen === this.#stopGen && !this.#destroyed) return false;
+  #indexTurn(turnId: string, kind: TurnIndexEntry["kind"], text: string, at: string): void {
+    const firstLine = text.trim().split("\n", 1)[0] ?? "";
+    const entry: TurnIndexEntry = {
+      turnId,
+      kind,
+      preview: firstLine.length > 120 ? `${firstLine.slice(0, 119)}…` : firstLine,
+      startedAt: at,
+    };
+    this.#turnIndex.push(entry);
+    if (!this.#destroyed) void this.#transcriptStore.recordTurn(this.id, entry);
+  }
+
+  /**
+   * Throw SendStoppedError — after telling the user — when a Stop (or
+   * destroy) landed while this send was still preparing its turn (hooks,
+   * identity, snapshot). The send awaits several things before the agent
+   * starts; without this check a Stop pressed in that window stopped
+   * nothing, and the turn started anyway once the awaits finished. A throw,
+   * not a silent return: callers waiting for the turn (a pipeline phase, a
+   * background wake) must learn it never started. The prompt stays in the
+   * transcript.
+   */
+  #throwIfStoppedBeforeStart(stopGen: number): void {
+    if (stopGen === this.#stopGen && !this.#destroyed) return;
     if (!this.#destroyed) {
       const note = this.#makeMessage(
         "info",
@@ -5132,84 +5199,131 @@ export class Session {
       this.#persistAndBuffer(note);
       this.#broadcastRaw(note);
     }
-    return true;
+    throw new SendStoppedError();
   }
 
   #checkpointsEnabled(): boolean {
     return this.#config?.session.checkpoints?.enabled !== false;
   }
 
+  /** Where this session's checkpoint repositories live (see checkpoints.ts). */
+  get #checkpointRoot(): string {
+    return join(this.#transcriptStore.dir, "checkpoints");
+  }
+
   /**
    * Snapshot the workspace for `turnId` (see checkpoints.ts). Waits at most
-   * `waitMs` so a slow snapshot on a huge tree delays the turn by a bounded
-   * amount; the snapshot itself carries on in the background. Never throws.
+   * `waitMs` (0 = don't wait) so a slow snapshot on a huge tree delays the
+   * turn by a bounded amount; if the turn starts first, the snapshot is
+   * recorded as `late`. Never throws.
    */
-  async #checkpointTurn(turnId: string): Promise<void> {
-    if (!this.#checkpointsEnabled() || Date.now() < this.#notGitUntil) return;
+  async #checkpointTurn(turnId: string, waitMs?: number): Promise<void> {
+    if (!this.#checkpointsEnabled() || this.#destroyed) return;
     const cfg = this.#config?.session.checkpoints;
+    let started = false;
     const job = createCheckpoint({
+      root: this.#checkpointRoot,
       workdir: this.workdir,
       sessionId: this.id,
       turnId,
+      isLate: () => started,
       limits: {
         ...(cfg?.maxPerSession !== undefined ? { maxPerSession: cfg.maxPerSession } : {}),
         ...(cfg?.maxUntrackedBytes !== undefined ? { maxUntrackedBytes: cfg.maxUntrackedBytes } : {}),
       },
     }).then((r) => {
-      if (!r.ok && r.reason === "not a git repository") this.#notGitUntil = Date.now() + 60_000;
-      else if (!r.ok) {
+      if (!r.ok) {
         console.error(`[codeoid/session ${this.id.slice(0, 8)}] checkpoint skipped for turn ${turnId.slice(0, 8)}: ${r.reason}`);
       }
       return r;
     });
     this.#pendingCheckpoints.add(job);
     void job.finally(() => this.#pendingCheckpoints.delete(job));
-    const waitMs = cfg?.waitMs ?? 2_000;
-    await Promise.race([job, new Promise((r) => setTimeout(r, waitMs).unref?.())]);
+    const wait = waitMs ?? cfg?.waitMs ?? 2_000;
+    if (wait > 0) await Promise.race([job, new Promise((r) => setTimeout(r, wait).unref?.())]);
+    started = true;
   }
 
   /**
-   * The session's turns, oldest first, from the canonical history (complete
-   * and restart-proof, unlike the bounded scrollback), each with its
-   * workspace snapshot when one exists.
+   * The session's turns, oldest first, from the turn index (restart-proof,
+   * unlike the bounded scrollback, and not reset by a context rotation),
+   * each with its workspace snapshot when one exists.
    */
   async turns(): Promise<{ turns: TurnSummary[]; checkpointsSupported: boolean }> {
-    const seen = new Set<string>();
-    const turns: TurnSummary[] = [];
-    for (const t of this.#accumulator.history) {
-      if (t.role !== "user" || !t.turnId || seen.has(t.turnId)) continue;
-      seen.add(t.turnId);
-      const text = (t.prompt ?? t.content).trim();
-      const firstLine = text.split("\n", 1)[0] ?? "";
-      turns.push({
-        turnId: t.turnId,
-        index: turns.length + 1,
-        kind: t.background ? "background" : "prompt",
-        preview: firstLine.length > 120 ? `${firstLine.slice(0, 119)}…` : firstLine,
-        ...(t.at ? { startedAt: t.at } : {}),
-      });
-    }
-    const supported = this.#checkpointsEnabled() && (await gitTopLevel(this.workdir)) !== null;
+    const turns: TurnSummary[] = this.#turnIndex.map((e, i) => ({ ...e, index: i + 1 }));
+    const supported = this.#checkpointsEnabled();
     if (supported && turns.length > 0) {
-      const refs = await listCheckpoints(this.workdir, this.id);
+      const records = await listCheckpoints(this.#checkpointRoot, this.id);
       for (const t of turns) {
-        const sha = refs.get(t.turnId);
-        if (sha) t.checkpoint = { sha };
+        const rec = records.get(t.turnId);
+        if (rec) t.checkpoint = rec.late ? { sha: rec.sha, late: true } : { sha: rec.sha };
       }
     }
     return { turns, checkpointsSupported: supported };
   }
 
   /**
-   * Load the canonical history on restart (#354): from the session's log, or
-   * — for a session from before the log existed — rebuilt from its transcript
-   * and written to the log, so the next restart reads it directly.
+   * True when the in-memory canonical history is only the newest part of the
+   * session's log (a bounded read on restart). Callers that need the whole
+   * conversation load it with {@link fullCanonicalHistory}.
    */
-  restoreCanonicalHistory(turns: readonly CanonicalTurn[], opts: { persist: boolean }): void {
-    if (opts.persist) this.#accumulator.seed(turns);
-    else this.#accumulator.restore(turns);
-    const last = [...turns].reverse().find((t) => t.turnId)?.turnId;
-    this.#currentTurnId = last ?? null;
+  get historyIsPartial(): boolean {
+    return this.#canonicalPartial;
+  }
+
+  /** The whole canonical history: from the log when memory holds only its tail. */
+  async fullCanonicalHistory(): Promise<readonly CanonicalTurn[]> {
+    if (!this.#canonicalPartial) return this.#accumulator.history;
+    const full = await this.#transcriptStore.loadCanonical(this.id);
+    return full && full.turns.length >= this.#accumulator.history.length ? full.turns : this.#accumulator.history;
+  }
+
+  /** The turn index, for a fork to inherit. */
+  get turnIndex(): readonly TurnIndexEntry[] {
+    return this.#turnIndex;
+  }
+
+  /**
+   * Inherit a parent's turns and their snapshots (session.fork). The fork's
+   * canonical history already carries the parent's turn ids; this makes its
+   * turn list and checkpoints match, and keeps the snapshots alive after the
+   * parent is destroyed.
+   */
+  async inheritTurns(parent: Session, entries: readonly TurnIndexEntry[]): Promise<void> {
+    this.#turnIndex = entries.map((e) => ({ ...e }));
+    void this.#transcriptStore.replaceTurnIndex(this.id, this.#turnIndex);
+    if (!this.#checkpointsEnabled() || entries.length === 0) return;
+    try {
+      await copyCheckpoints({
+        root: this.#checkpointRoot,
+        fromSessionId: parent.id,
+        toSessionId: this.id,
+        toWorkdir: this.workdir,
+        turnIds: entries.map((e) => e.turnId),
+      });
+    } catch (err) {
+      console.error(
+        `[codeoid/fork ${this.id.slice(0, 8)}] could not copy the parent's checkpoints (the fork's earlier turns have no snapshots): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * Load the turn record on restart (#354): the canonical history (from the
+   * log, or rebuilt from the transcript for a session from before the log
+   * existed — `persist` writes the rebuild back) and the turn index.
+   */
+  restoreTurns(
+    history: readonly CanonicalTurn[],
+    index: readonly TurnIndexEntry[],
+    opts: { persistHistory: boolean; persistIndex: boolean; partial: boolean },
+  ): void {
+    if (opts.persistHistory) this.#accumulator.seed(history);
+    else this.#accumulator.restore(history);
+    this.#turnIndex = index.map((e) => ({ ...e }));
+    if (opts.persistIndex) void this.#transcriptStore.replaceTurnIndex(this.id, this.#turnIndex);
+    this.#canonicalPartial = opts.partial;
+    this.#currentTurnId = index.at(-1)?.turnId ?? [...history].reverse().find((t) => t.turnId)?.turnId ?? null;
   }
 
   /**

@@ -14,7 +14,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CodeoidConfig } from "../config.js";
 import { canonicalFromTranscript } from "../daemon/canonical-restore.js";
-import { listCheckpoints } from "../daemon/checkpoints.js";
+import { listCheckpoints, shadowRepoPath } from "../daemon/checkpoints.js";
+import { SendStoppedError } from "../daemon/session.js";
 import type { ProviderEvent } from "../daemon/providers/interface.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
 import { SessionManager } from "../daemon/session-manager.js";
@@ -98,6 +99,9 @@ function newManager(turns: ProviderEvent[][] = [say("a1"), say("a2"), say("a3")]
 }
 
 const git = (...args: string[]): string => execFileSync("git", args, { cwd: repo, encoding: "utf8" });
+const ckptRoot = (): string => join(tmp, "transcripts", "checkpoints");
+const showAt = (session: string, sha: string, file: string): string =>
+  execFileSync("git", ["--git-dir", shadowRepoPath(ckptRoot(), session), "show", `${sha}:${file}`], { encoding: "utf8" });
 
 beforeEach(() => {
   tmp = mkdtempSync(join(tmpdir(), "codeoid-turns-"));
@@ -191,23 +195,26 @@ describe("session.turns + checkpoints", () => {
     ]);
     expect(r.turns.every((t) => t.startedAt)).toBe(true);
     // Turn 1 started from v0; turn 2 started from v1.
-    expect(git("show", `${r.turns[0]!.checkpoint!.sha}:a.txt`)).toBe("v0\n");
-    expect(git("show", `${r.turns[1]!.checkpoint!.sha}:a.txt`)).toBe("v1\n");
-    // Nothing visible changed in the user's checkout.
+    expect(showAt(id, r.turns[0]!.checkpoint!.sha, "a.txt")).toBe("v0\n");
+    expect(showAt(id, r.turns[1]!.checkpoint!.sha, "a.txt")).toBe("v1\n");
+    expect(r.turns[0]!.checkpoint!.late).toBeUndefined();
+    // Nothing changed in the user's repository: no refs, no log entries.
     expect(git("status", "--porcelain").trim()).toBe("M a.txt");
-    expect(git("log", "--oneline").trim().split("\n")).toHaveLength(1);
+    expect(git("log", "--all", "--oneline").trim().split("\n")).toHaveLength(1);
+    expect(git("for-each-ref").trim().split("\n")).toHaveLength(1);
   });
 
-  it("still lists turns in a non-git workdir, without snapshots", async () => {
+  it("snapshots a workdir that is not a git repository too", async () => {
     const plain = join(tmp, "plain");
     mkdirSync(plain);
+    writeFileSync(join(plain, "notes.md"), "draft\n");
     const m = newManager();
     const id = await create(m, plain);
     await sendAndSettle(m, id, "hello");
     const r = await turnsOf(m, id);
-    expect(r.checkpointsSupported).toBe(false);
-    expect(r.turns).toHaveLength(1);
-    expect(r.turns[0]!.checkpoint).toBeUndefined();
+    expect(r.checkpointsSupported).toBe(true);
+    expect(showAt(id, r.turns[0]!.checkpoint!.sha, "notes.md")).toBe("draft\n");
+    expect(existsSync(join(plain, ".git"))).toBe(false);
   });
 
   it("honours session.checkpoints.enabled = false", async () => {
@@ -220,17 +227,17 @@ describe("session.turns + checkpoints", () => {
     await sendAndSettle(m, id, "hello");
     const r = await turnsOf(m, id);
     expect(r.checkpointsSupported).toBe(false);
-    expect((await listCheckpoints(repo, id)).size).toBe(0);
+    expect((await listCheckpoints(ckptRoot(), id)).size).toBe(0);
   });
 
   it("deletes the session's snapshots when it is destroyed", async () => {
     const m = newManager();
     const id = await create(m);
     await sendAndSettle(m, id, "hello");
-    expect((await listCheckpoints(repo, id)).size).toBe(1);
+    expect((await listCheckpoints(ckptRoot(), id)).size).toBe(1);
     const r = await m.handle({ type: "session.destroy", id: "d", sessionId: id }, AUTH, { id: "cli", auth: AUTH, send: () => {} });
     expect(r.type).toBe("response.ok");
-    expect((await listCheckpoints(repo, id)).size).toBe(0);
+    expect(existsSync(shadowRepoPath(ckptRoot(), id))).toBe(false);
   });
 
   it("requires read access to the session", async () => {
@@ -284,6 +291,29 @@ describe("canonical history survives a restart", () => {
     expect(fork.canonicalHistory.map((t) => t.content)).toEqual(["first", "a1"]);
   });
 
+  it("the turn list and its snapshots survive a restart", async () => {
+    const m = newManager();
+    const id = await create(m);
+    await sendAndSettle(m, id, "first");
+    await sendAndSettle(m, id, "second");
+    const before = await turnsOf(m, id);
+    const next = await restart();
+    expect((await turnsOf(next, id)).turns).toEqual(before.turns);
+  });
+
+  it("when memory holds only the log's tail, forks still get the whole conversation", async () => {
+    const m = newManager();
+    const id = await create(m);
+    await sendAndSettle(m, id, "first");
+    await sendAndSettle(m, id, "second");
+    const s = m._sessionForTest(id)!;
+    const full = [...s.canonicalHistory];
+    await transcript.flush();
+    s.restoreTurns(full.slice(-2), s.turnIndex, { persistHistory: false, persistIndex: false, partial: true });
+    expect(s.historyIsPartial).toBe(true);
+    expect((await s.fullCanonicalHistory()).map((t) => t.content)).toEqual(["first", "a1", "second", "a2"]);
+  });
+
   it("rebuilds the history of a session from before the log existed, once", async () => {
     const m = newManager();
     const id = await create(m);
@@ -313,7 +343,7 @@ describe("a Stop while a send prepares its turn", () => {
     const sending = s.send("go", AUTH);
     expect(s.preparingTurn).toBe(true);
     void s.interrupt(AUTH);
-    await sending;
+    await expect(sending).rejects.toBeInstanceOf(SendStoppedError);
 
     expect(providers.at(-1)!.capturedOpts).toHaveLength(0); // the backend never got the prompt
     expect(seen.some((x) => x.role === "user" && x.content === "go")).toBe(true); // but it was kept
@@ -330,11 +360,93 @@ describe("a Stop while a send prepares its turn", () => {
     const m = newManager();
     const id = await create(m);
     const s = m._sessionForTest(id)!;
-    const sending = s.send("go", AUTH);
+    const sending = s.send("go", AUTH).catch((e) => e);
     await m.drain(2_000);
-    await sending;
+    expect(await sending).toBeInstanceOf(SendStoppedError);
     expect(providers.at(-1)!.capturedOpts).toHaveLength(0);
     expect(s.status).toBe("idle");
+  });
+});
+
+describe("turn attribution across mid-turn messages, rotation and forks", () => {
+  it("a message sent while the agent works joins the running turn", async () => {
+    const m = new SessionManager(store, transcript, undefined, undefined, undefined, {
+      config: mkConfig(tmp),
+      _testProviderFactory: () => {
+        const p = new MockSessionProvider("claude", [[{ type: "text_delta", content: "working…" } as ProviderEvent]], {
+          stall: true,
+          midTurn: true,
+        });
+        providers.push(p);
+        return p;
+      },
+    });
+    managers.push(m);
+    const id = await create(m);
+    const s = m._sessionForTest(id)!;
+    await s.send("do the big thing", AUTH);
+    for (let i = 0; i < 100 && s.status === "idle"; i++) await Bun.sleep(10);
+    await s.send("also add tests", AUTH);
+    expect(providers.at(-1)!.midTurnPushes).toHaveLength(1);
+    const users = s.canonicalHistory.filter((t) => t.role === "user");
+    expect(users).toHaveLength(2);
+    expect(users[1]!.turnId).toBe(users[0]!.turnId); // one turn, not two
+    expect((await turnsOf(m, id)).turns).toHaveLength(1);
+    await s.interrupt(AUTH);
+  });
+
+  it("a context rotation keeps the turn list", async () => {
+    const m = newManager();
+    const id = await create(m);
+    await sendAndSettle(m, id, "first");
+    const r = await m.handle({ type: "session.rotate", id: "rot", sessionId: id }, AUTH, { id: "cli", auth: AUTH, send: () => {} });
+    expect(r.type).toBe("response.ok");
+    await sendAndSettle(m, id, "second");
+    expect((await turnsOf(m, id)).turns.map((t) => t.preview)).toEqual(["first", "second"]);
+  });
+
+  it("a fork inherits the parent's turns and snapshots, which outlive the parent", async () => {
+    const m = newManager();
+    const id = await create(m);
+    await sendAndSettle(m, id, "first");
+    writeFileSync(join(repo, "a.txt"), "v1\n");
+    await sendAndSettle(m, id, "second");
+    const r = await m.handle({ type: "session.fork", id: "f", sessionId: id, isolate: false }, AUTH, { id: "cli", auth: AUTH, send: () => {} });
+    if (r.type !== "response.ok") throw new Error(JSON.stringify(r));
+    const forkId = (r.data as { id: string }).id;
+    await m.handle({ type: "session.destroy", id: "d", sessionId: id }, AUTH, { id: "cli", auth: AUTH, send: () => {} });
+
+    const ft = await turnsOf(m, forkId);
+    expect(ft.turns.map((t) => t.preview)).toEqual(["first", "second"]);
+    expect(showAt(forkId, ft.turns[1]!.checkpoint!.sha, "a.txt")).toBe("v1\n");
+  });
+
+  it("a stopped send is not a turn: nothing is listed and later messages keep the previous turn's id", async () => {
+    const m = newManager();
+    const id = await create(m);
+    const s = m._sessionForTest(id)!;
+    await sendAndSettle(m, id, "real");
+    const sending = s.send("stopped", AUTH);
+    void s.interrupt(AUTH);
+    await expect(sending).rejects.toBeInstanceOf(SendStoppedError);
+    const t = await turnsOf(m, id);
+    expect(t.turns.map((x) => x.preview)).toEqual(["real"]);
+    expect((await listCheckpoints(ckptRoot(), id)).size).toBe(1);
+  });
+});
+
+describe("a pipeline phase and a Stop before its turn starts", () => {
+  it("the phase returns instead of waiting forever for a turn that never starts", async () => {
+    const m = newManager([say("unused")]);
+    const id = await create(m);
+    const s = m._sessionForTest(id)!;
+    const phase = m.runPhaseOnSession({ sessionId: id, prompt: "do the phase" });
+    for (let i = 0; i < 500 && !s.preparingTurn; i++) await Bun.sleep(1);
+    expect(s.preparingTurn).toBe(true);
+    void s.interrupt(AUTH);
+    const result = await Promise.race([phase, Bun.sleep(5_000).then(() => "hung" as const)]);
+    expect(result).not.toBe("hung");
+    expect(providers.at(-1)!.capturedOpts).toHaveLength(0);
   });
 });
 

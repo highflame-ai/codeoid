@@ -12,6 +12,7 @@
  */
 
 import type { DaemonMessage, SessionMessage } from "../protocol/types.js";
+import type { TurnIndexEntry } from "./transcript.js";
 import {
   type CanonicalToolCall,
   type CanonicalTurn,
@@ -21,6 +22,28 @@ import {
 
 /** Text recorded for a turn the agent started on its own (see Session#adoptTurn). */
 const BACKGROUND_TURN_TEXT = "(Background work finished; the agent harness delivered the results.)";
+
+/**
+ * A turn index for a session that has a canonical history but no index file:
+ * one entry per distinct user-turn id, oldest first. Turns recorded before
+ * turn ids existed have none and are not listed.
+ */
+export function turnIndexFromHistory(history: readonly CanonicalTurn[]): TurnIndexEntry[] {
+  const out: TurnIndexEntry[] = [];
+  const seen = new Set<string>();
+  for (const t of history) {
+    if (t.role !== "user" || !t.turnId || seen.has(t.turnId)) continue;
+    seen.add(t.turnId);
+    const first = (t.prompt ?? t.content).trim().split("\n", 1)[0] ?? "";
+    out.push({
+      turnId: t.turnId,
+      kind: t.background ? "background" : "prompt",
+      preview: first.length > 120 ? `${first.slice(0, 119)}…` : first,
+      ...(t.at ? { startedAt: t.at } : {}),
+    });
+  }
+  return out;
+}
 
 export function canonicalFromTranscript(messages: readonly DaemonMessage[], providerId: string): CanonicalTurn[] {
   const out: CanonicalTurn[] = [];

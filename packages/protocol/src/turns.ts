@@ -32,8 +32,12 @@ export interface TurnSummary {
   preview: string;
   /** When the turn started (ISO), when known. */
   startedAt?: string;
-  /** The workspace snapshot taken when the turn started, when one exists. */
-  checkpoint?: { sha: string };
+  /**
+   * The workspace snapshot taken when the turn started, when one exists.
+   * `late`: the snapshot was still being taken when the agent started, so it
+   * may already include the agent's first edits.
+   */
+  checkpoint?: { sha: string; late?: boolean };
 }
 
 export interface SessionTurnsResultMsg {
@@ -42,9 +46,9 @@ export interface SessionTurnsResultMsg {
   sessionId: string;
   turns: TurnSummary[];
   /**
-   * Whether this session's workdir can be snapshotted (a git work tree with
-   * checkpoints enabled). False → turns still have ids, but no files to go
-   * back to.
+   * Whether this session takes workspace snapshots (`session.checkpoints`
+   * enabled; works in any directory, git or not). False → turns still have
+   * ids, but no files to go back to.
    */
   checkpointsSupported: boolean;
 }
