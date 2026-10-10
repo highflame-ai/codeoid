@@ -1690,7 +1690,8 @@ export class Store {
       .prepare(
         `INSERT INTO compare_runs (id, account_id, project_id, parent_session_id, after_turn_id, prompt, targets, kept_session_id, created_by, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET targets = excluded.targets, kept_session_id = excluded.kept_session_id`,
+         ON CONFLICT(id) DO UPDATE SET targets = excluded.targets,
+           kept_session_id = COALESCE(compare_runs.kept_session_id, excluded.kept_session_id)`,
       )
       .run(
         run.id,
@@ -1707,6 +1708,20 @@ export class Store {
   }
 
   /** A comparison, tenant-scoped (another tenant's id reads as absent). */
+  /**
+   * Update a comparison that already exists — never re-create one (its
+   * session may have been destroyed meanwhile, taking the record with it).
+   * A keep, once set, is never cleared.
+   */
+  updateCompareRun(run: CompareRunRow): void {
+    this.#db
+      .prepare(
+        `UPDATE compare_runs SET targets = ?, kept_session_id = COALESCE(kept_session_id, ?)
+         WHERE id = ? AND account_id = ? AND project_id = ?`,
+      )
+      .run(JSON.stringify(run.targets), run.keptSessionId ?? null, run.id, run.accountId, run.projectId);
+  }
+
   getCompareRun(id: string, accountId: string, projectId: string): CompareRunRow | null {
     const row = this.#db
       .prepare("SELECT * FROM compare_runs WHERE id = ? AND account_id = ? AND project_id = ?")

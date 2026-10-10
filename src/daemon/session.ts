@@ -3011,7 +3011,7 @@ export class Session {
     });
   }
 
-  async destroy(sender: AuthContext): Promise<void> {
+  async destroy(sender: AuthContext, opts: { deleteBranch?: boolean } = {}): Promise<void> {
     this.#destroyed = true;
     // Cancel any pending debounced status persist — a write firing after the
     // deletes below would resurrect the meta file for a destroyed session,
@@ -3061,6 +3061,8 @@ export class Session {
         workdir: this.worktree.path,
         worktreePath: this.worktree.path,
         branch: this.worktree.branch,
+        // A session undone by the request that made it leaves no branch behind.
+        ...(opts.deleteBranch ? { deleteBranch: true } : {}),
       }).catch(() => {});
     }
   }

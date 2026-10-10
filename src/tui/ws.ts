@@ -228,6 +228,11 @@ export class TuiWsClient {
     });
   }
 
+  /** One comparison's current state (#357). */
+  compareGet(compareId: string): Promise<DaemonMessage> {
+    return this.#request({ type: "compare.get", id: randomUUID(), compareId });
+  }
+
   /** A session's comparisons, newest first (#357). */
   compareList(sessionId: string): Promise<DaemonMessage> {
     return this.#request({ type: "compare.list", id: randomUUID(), sessionId });

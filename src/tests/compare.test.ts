@@ -298,6 +298,67 @@ describe("session.compare", () => {
     expect(keepNoDestroy).toMatchObject({ type: "response.error", code: "forbidden" });
   });
 
+  it("a slow settle of one branch can't undo a keep of another (so a second keep can't destroy it)", async () => {
+    const m = newManager();
+    const parent = await create(m);
+    const started = await compare(m, parent, { prompt: "do the task", targets: [{ providerId: "claude" }, { providerId: "codex" }] });
+    const a = m._sessionForTest(started.targets[0]!.sessionId!)! as unknown as { turnFiles: (id: string) => Promise<unknown> };
+    const orig = a.turnFiles.bind(a);
+    a.turnFiles = async (id: string) => {
+      await Bun.sleep(600);
+      return orig(id);
+    };
+    const b = started.targets[1]!.sessionId!;
+    for (let i = 0; i < 300 && !store.getCompareRun(started.compareId, AUTH.accountId!, AUTH.projectId!)!.targets[1]!.result; i++) await Bun.sleep(10);
+    const k = await m.handle({ type: "compare.keep", id: "k", compareId: started.compareId, sessionId: b }, AUTH, CLIENT);
+    expect(k.type).toBe("compare.state");
+    await Bun.sleep(900); // A's settle lands
+    expect(store.getCompareRun(started.compareId, AUTH.accountId!, AUTH.projectId!)!.keptSessionId).toBe(b);
+    const k2 = await m.handle({ type: "compare.keep", id: "k2", compareId: started.compareId, sessionId: started.targets[0]!.sessionId!, discardOthers: true }, AUTH, CLIENT);
+    expect(k2).toMatchObject({ type: "response.error", code: "invalid_request" });
+    expect(m._sessionForTest(b)).toBeDefined();
+  });
+
+  it("destroying the session while its branches run doesn't bring the comparison back", async () => {
+    const m = newManager();
+    const parent = await create(m);
+    const started = await compare(m, parent, { prompt: "do the task", targets: [{ providerId: "claude" }, { providerId: "codex" }] });
+    await m.handle({ type: "session.destroy", id: "d", sessionId: parent }, AUTH, CLIENT);
+    for (const t of started.targets) {
+      const s = m._sessionForTest(t.sessionId!)!;
+      for (let i = 0; i < 300 && s.status !== "idle"; i++) await Bun.sleep(10);
+    }
+    await Bun.sleep(200);
+    expect(store.getCompareRun(started.compareId, AUTH.accountId!, AUTH.projectId!)).toBeNull();
+    const r = await m.handle({ type: "compare.get", id: "g", compareId: started.compareId }, AUTH, CLIENT);
+    expect(r).toMatchObject({ type: "response.error", code: "not_found" });
+  });
+
+  it("a branch destroyed while working reads as gone, and a branch that never started (restart) as failed", async () => {
+    const m = newManager();
+    const parent = await create(m);
+    const started = await compare(m, parent, { prompt: "do the task", targets: [{ providerId: "claude" }, { providerId: "codex" }] });
+    await m.handle({ type: "session.destroy", id: "d", sessionId: started.targets[0]!.sessionId! }, AUTH, CLIENT);
+    const done = await settled(m, started.compareId);
+    expect(done.targets[0]).toMatchObject({ status: "gone", done: true });
+
+    // A stored comparison whose branch's prompt never ran (no live sends: as after a restart).
+    const ghost = started.targets[1]!.sessionId!;
+    store.saveCompareRun({
+      id: "ghost-compare",
+      accountId: AUTH.accountId!,
+      projectId: AUTH.projectId!,
+      parentSessionId: parent,
+      prompt: "never ran",
+      targets: [{ providerId: "codex", sessionId: ghost }],
+      createdBy: AUTH.sub,
+      createdAt: new Date().toISOString(),
+    });
+    const g = await settled(m, "ghost-compare");
+    expect(g.targets[0]).toMatchObject({ status: "failed", done: true });
+    expect(g.targets[0]!.error).toContain("didn't start");
+  });
+
   it("survives a daemon restart", async () => {
     const m = newManager();
     const parent = await create(m);

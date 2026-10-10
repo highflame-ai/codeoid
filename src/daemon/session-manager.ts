@@ -3475,6 +3475,24 @@ mcpHub: this.#mcpHub,
     // Fork from an earlier turn (#356): the conversation, turn list and files
     // as they were right after it. Otherwise the WHOLE conversation — after a
     // restart memory may hold only its tail.
+    // The parent's pack, re-resolved now rather than reused: a pack the
+    // operator has since untrusted or removed must not ride along into a fork
+    // (its skills); and a fork that can't carry it is refused — never quietly
+    // dropped, which would lose a capability role's tool deny.
+    let forkPack: PackActivation | undefined;
+    const parentPack = parent.packActivation;
+    if (parentPack) {
+      try {
+        forkPack = this.#packs.resolveActivation(parentPack.id, parentPack.roleName);
+      } catch (e) {
+        return {
+          type: "response.error",
+          requestId: msg.id,
+          error: `This session runs under pack "${parentPack.id}", which can't be activated any more (${e instanceof Error ? e.message : String(e)}) — so it can't be forked.`,
+          code: "invalid_request",
+        };
+      }
+    }
     let point: ForkPoint | null = null;
     if (msg.afterTurnId && msg.baseBranch) {
       // A clean base and "the files as they were after turn N" contradict
@@ -3679,7 +3697,7 @@ mcpHub: this.#mcpHub,
         },
         // ...and its pack: a capability role's tool deny is part of that trust
         // (a fork of a read-only session must stay read-only).
-        ...(parent.packActivation ? { pack: parent.packActivation } : {}),
+        ...(forkPack ? { pack: forkPack } : {}),
         identityManager: this.#identityManager,
         memory: this.#memory,
         memoryMcp: this.#memoryMcp,
@@ -5440,6 +5458,8 @@ mcpHub: this.#mcpHub,
   #liveCompares = new Map<string, CompareRunRow>();
   /** Branch session → its live comparison, to freeze its result when it settles. */
   #compareBranchOf = new Map<string, string>();
+  /** Branches whose result is being frozen right now (between leaving #compareBranchOf and saving). */
+  #compareSettling = new Set<string>();
 
   async #sessionCompare(
     msg: Extract<ClientMessage, { type: "session.compare" }>,
@@ -5460,7 +5480,9 @@ mcpHub: this.#mcpHub,
     if (unknown) return refuse(`Unknown provider "${unknown.providerId}" — available: ${this.#providers.ids().join(", ")}`);
     // A model id, never a flag or control text (it can reach a backend CLI's argv).
     const badModel = msg.targets.find(
-      (t) => t.model !== undefined && (!/^[\w.:/@+][\w.:/@+-]*$/.test(t.model) || resolveModelIdForProvider(t.model, t.providerId) === null),
+      (t) =>
+        t.model !== undefined &&
+        (!/^[\w.:/@+][\w.:/@+-]*$/.test(t.model) || t.model.includes("..") || resolveModelIdForProvider(t.model, t.providerId) === null),
     );
     if (badModel) return refuse(`Model "${badModel.model}" isn't available on ${badModel.providerId}`);
     // Agents sharing one folder would edit each other's files.
@@ -5508,7 +5530,7 @@ mcpHub: this.#mcpHub,
     } catch (err) {
       // Roll back what this request made — no half-made comparison left behind.
       for (const s of created) {
-        await s.destroy(auth).catch(() => {});
+        await s.destroy(auth, { deleteBranch: true }).catch(() => {});
         this.#sessions.delete(s.id);
       }
       const reason = err instanceof Error ? err.message : String(err);
@@ -5539,14 +5561,14 @@ mcpHub: this.#mcpHub,
       session.send(msg.prompt, auth).then(
         () => {
           t.baseTurnId = session.turnIndex.at(-1)?.turnId;
-          this.#store.saveCompareRun(row);
+          this.#store.updateCompareRun(row);
           if (session.status === "idle" || session.status === "error") void this.#settleCompareBranch(session.id);
         },
         (err: unknown) => {
           if (!(err instanceof SendStoppedError)) session.reportSendFailure(err);
           t.error = err instanceof Error ? err.message : String(err);
           this.#compareBranchOf.delete(session.id);
-          this.#store.saveCompareRun(row);
+          this.#store.updateCompareRun(row);
           this.#retireCompareIfSettled(row);
         },
       );
@@ -5567,8 +5589,19 @@ mcpHub: this.#mcpHub,
     if (!row || !t || !s || !t.baseTurnId || t.result) return;
     if (s.status !== "idle" && s.status !== "error") return;
     this.#compareBranchOf.delete(sessionId);
-    const turnId = t.baseTurnId;
-    const status = s.status;
+    this.#compareSettling.add(sessionId);
+    try {
+      await this.#freezeBranch(t, s);
+    } finally {
+      this.#compareSettling.delete(sessionId);
+    }
+    this.#store.updateCompareRun(row);
+    this.#retireCompareIfSettled(row);
+  }
+
+  async #freezeBranch(t: CompareRunRow["targets"][number], s: Session): Promise<void> {
+    const turnId = t.baseTurnId!;
+    const status: "idle" | "error" = s.status === "error" ? "error" : "idle";
     // Nothing after the compared turn yet: the branch's totals are that turn's
     // (a fork starts with none). Read before awaiting — the user may go on.
     const usage = s.currentTurnId === turnId ? s.toInfo().usage : undefined;
@@ -5584,14 +5617,31 @@ mcpHub: this.#mcpHub,
         : {}),
       ...(files ? { files: { ...files, paths: files.paths.slice(0, 200) } } : {}),
     };
-    this.#store.saveCompareRun(row);
-    this.#retireCompareIfSettled(row);
   }
 
   /** Drop a comparison from the live set once no branch can still settle. */
   #retireCompareIfSettled(row: CompareRunRow): void {
-    if (row.targets.every((t) => t.result || !t.sessionId || !this.#compareBranchOf.has(t.sessionId))) {
-      this.#liveCompares.delete(row.id);
+    if (this.#liveCompares.get(row.id) !== row) return;
+    const pending = (t: CompareRunRow["targets"][number]) =>
+      !!t.sessionId && !t.result && (this.#compareBranchOf.has(t.sessionId) || this.#compareSettling.has(t.sessionId));
+    if (!row.targets.some(pending)) this.#liveCompares.delete(row.id);
+  }
+
+  /** A destroyed branch can't settle any more: stop waiting for it (it reads as "gone"). */
+  #forgetCompareBranch(sessionId: string): void {
+    const compareId = this.#compareBranchOf.get(sessionId);
+    if (!compareId) return;
+    this.#compareBranchOf.delete(sessionId);
+    const row = this.#liveCompares.get(compareId);
+    if (row) this.#retireCompareIfSettled(row);
+  }
+
+  /** A destroyed session's comparisons leave memory too (the store drops their rows). */
+  #forgetComparesOf(parentSessionId: string): void {
+    for (const [id, row] of this.#liveCompares) {
+      if (row.parentSessionId !== parentSessionId) continue;
+      this.#liveCompares.delete(id);
+      for (const t of row.targets) if (t.sessionId && this.#compareBranchOf.get(t.sessionId) === id) this.#compareBranchOf.delete(t.sessionId);
     }
   }
 
@@ -5605,7 +5655,9 @@ mcpHub: this.#mcpHub,
     if (live) return live.accountId === (auth.accountId ?? "") && live.projectId === (auth.projectId ?? "") ? live : null;
     const row = this.#store.getCompareRun(compareId, auth.accountId ?? "", auth.projectId ?? "");
     if (!row) return null;
-    const pending = row.targets.filter((t) => t.sessionId && t.baseTurnId && !t.result && this.#sessions.has(t.sessionId));
+    const pending = row.targets.filter(
+      (t) => t.sessionId && t.baseTurnId && !t.result && this.#sessions.has(t.sessionId) && !this.#compareSettling.has(t.sessionId),
+    );
     if (pending.length > 0) {
       this.#liveCompares.set(row.id, row);
       for (const t of pending) this.#compareBranchOf.set(t.sessionId!, row.id);
@@ -5625,6 +5677,11 @@ mcpHub: this.#mcpHub,
       }
       if (!s) return { ...base, sessionId: t.sessionId, status: "gone", done: true, ...(t.error ? { error: t.error } : {}) };
       if (t.error && !t.baseTurnId) return { ...base, sessionId: t.sessionId, status: "failed", done: true, error: t.error };
+      // Never started, and nothing will start it now (only a live comparison
+      // has sends in flight — a daemon restart dropped them).
+      if (!t.baseTurnId && !this.#liveCompares.has(row.id)) {
+        return { ...base, sessionId: t.sessionId, status: "failed", done: true, error: "it didn't start (the daemon restarted before its prompt ran)" };
+      }
       return { ...base, sessionId: t.sessionId, status: s.status, done: false };
     });
     return {
@@ -5691,7 +5748,7 @@ mcpHub: this.#mcpHub,
       return refuse("That branch is still working — keep it once it's done");
     }
     row.keptSessionId = msg.sessionId;
-    this.#store.saveCompareRun(row);
+    this.#store.updateCompareRun(row);
     const notDiscarded: string[] = [];
     if (msg.discardOthers) {
       for (const t of row.targets) {
@@ -6470,6 +6527,8 @@ mcpHub: this.#mcpHub,
     }
 
     await session.destroy(auth);
+    this.#forgetComparesOf(msg.sessionId);
+    this.#forgetCompareBranch(msg.sessionId);
     // Covers destroying a CHILD directly (not via goal teardown) — without
     // this its token stays live in the endpoint's binding map and keeps
     // authorizing reads/writes on the goal after the session is gone.

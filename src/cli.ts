@@ -738,11 +738,18 @@ program
   .command("approve <session>")
   .description("Approve a pending permission request or yes/no question")
   .option("--deny", "Deny instead of approve")
-  .action(async (session: string, opts: { deny?: boolean }) => {
+  .option("--pick <n>", "which waiting tool call, when several are (1 = the oldest)")
+  .option("--yes", "approve without asking to confirm (needed without a terminal)")
+  .action(async (session: string, opts: { deny?: boolean; pick?: string; yes?: boolean }) => {
+    const pick = opts.pick !== undefined ? Number(opts.pick) : undefined;
+    if (pick !== undefined && (!Number.isInteger(pick) || pick < 1)) {
+      console.error("--pick takes a number (1 = the oldest waiting)");
+      process.exit(1);
+    }
     const config = loadConfig();
     const client = new TerminalClient(config);
     await client.connect();
-    await client.approveSession(session, !opts.deny);
+    await client.approveSession(session, !opts.deny, { ...(pick !== undefined ? { pick } : {}), ...(opts.yes ? { yes: true } : {}) });
     client.disconnect();
   });
 

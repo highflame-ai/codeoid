@@ -39,6 +39,13 @@ const RESET = "\x1b[0m";
 /** Strip terminal-control escapes from an untrusted field before it reaches
  *  the TTY (OSC 52 clipboard, cursor moves, DCS, etc. — see #91/#92). */
 const S = (s: string | undefined): string => sanitizeTerminalOutput(s ?? "");
+/** Stricter than S for text a decision rests on: no carriage returns, colours or links that could restyle or overwrite it. */
+const plainText = (s: string): string =>
+  S(s)
+    .replace(/\r/g, "")
+    .replace(/\x1b\[[0-9;:]*m/g, "")
+    .replace(/\x1b\]8;[^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+    .replace(/\x1b/g, "");
 
 /** Streaming/approval bookkeeping carried across messages by the attach loop. */
 export interface StreamRenderState {
@@ -789,7 +796,7 @@ export class TerminalClient {
     if (waiting.length === 0) return;
     console.log("");
     for (const w of waiting) {
-      console.log(`[${w.branch}] ${S(w.name)} is waiting for your approval: codeoid approve ${w.sessionId}  (or codeoid attach ${w.sessionId} to see it)`);
+      console.log(`[${w.branch}] ${S(w.name)} is waiting for your approval — see what it wants and decide: codeoid approve ${w.sessionId}  (or codeoid attach ${w.sessionId})`);
     }
   }
 
@@ -901,7 +908,7 @@ export class TerminalClient {
     }
   }
 
-  async approveSession(sessionIdOrName: string, approved: boolean): Promise<void> {
+  async approveSession(sessionIdOrName: string, approved: boolean, opts: { pick?: number; yes?: boolean } = {}): Promise<void> {
     const sessionId = await this.#resolveSession(sessionIdOrName);
     if (!sessionId) return;
 
@@ -934,12 +941,35 @@ export class TerminalClient {
 
     // A tool approval is answered by its own id (the daemon never guesses
     // "the first pending" — see Session#approve): read it off the session.
-    const pending = await this.#pendingToolApproval(sessionId);
-    if (!pending) {
+    const all = await this.#pendingToolApprovals(sessionId);
+    if (all.length === 0) {
       console.log("Nothing in that session is waiting for an approval.");
       return;
     }
-    console.log(`${S(pending.name)}${pending.description ? `: ${S(pending.description)}` : ""}`);
+    const n = opts.pick ?? 1;
+    const pending = all[n - 1];
+    if (!pending) {
+      console.log(`There are ${all.length} waiting; pick one of 1–${all.length}.`);
+      return;
+    }
+    // Show exactly what would run — the full input, not just its key names —
+    // as plain text the agent can't restyle or overwrite.
+    if (all.length > 1) console.log(`${all.length} tool calls are waiting; this is [${n}] (pick another with --pick N):`);
+    console.log(`${plainText(pending.name)}`);
+    console.log(plainText(pending.input === undefined ? (pending.description ?? "") : JSON.stringify(pending.input, null, 2)).slice(0, 8_000));
+    if (approved && !opts.yes) {
+      if (!process.stdin.isTTY) {
+        console.log("Not approved: pass --yes to approve without a terminal to confirm in.");
+        return;
+      }
+      const rl = createInterface({ input: process.stdin, output: process.stdout });
+      const answer = await new Promise<string>((r) => rl.question("Approve this? [y/N] ", r));
+      rl.close();
+      if (!/^y(es)?$/i.test(answer.trim())) {
+        console.log("Not approved.");
+        return;
+      }
+    }
     const resp = await this.#request({
       type: "session.approve",
       id: randomUUID(),
@@ -1121,8 +1151,14 @@ export class TerminalClient {
    * scrollback (attach, read the replay, detach) — what an attached client
    * would show as the question.
    */
-  async #pendingToolApproval(sessionId: string): Promise<{ approvalId: string; name: string; description?: string } | null> {
-    type Row = { type?: string; role?: string; messageId?: string; content?: string; tool?: { name?: string; state?: { phase?: string; approvalId?: string; description?: string } } };
+  async #pendingToolApprovals(sessionId: string): Promise<Array<{ approvalId: string; name: string; description?: string; input?: unknown }>> {
+    type Row = {
+      type?: string;
+      role?: string;
+      messageId?: string;
+      content?: string;
+      tool?: { name?: string; input?: unknown; state?: { phase?: string; approvalId?: string; description?: string; input?: unknown } };
+    };
     const rows: Row[] = [];
     let done!: () => void;
     const replayed = new Promise<void>((r) => {
@@ -1139,23 +1175,30 @@ export class TerminalClient {
       const attached = await this.#request({ type: "session.attach", id: randomUUID(), sessionId });
       if (attached.type === "response.error") {
         this.#printError(attached);
-        return null;
+        return [];
       }
       await Promise.race([replayed, new Promise((r) => setTimeout(r, 3_000))]);
     } finally {
       this.#streamHandler = prev;
       await this.#request({ type: "session.detach", id: randomUUID(), sessionId }).catch(() => undefined);
     }
-    // Latest state per tool call, then the oldest still waiting.
+    // Latest state per tool call; those still waiting, oldest first.
     const latest = new Map<string, Row>();
     for (const r of rows) if (r.role === "tool_call" && r.messageId) latest.set(r.messageId, r);
+    const out: Array<{ approvalId: string; name: string; description?: string; input?: unknown }> = [];
     for (const r of latest.values()) {
       const st = r.tool?.state;
       if (st?.phase === "waiting_confirmation" && st.approvalId) {
-        return { approvalId: st.approvalId, name: r.tool?.name ?? r.content ?? "tool", ...(st.description ? { description: st.description } : {}) };
+        const input = st.input ?? r.tool?.input;
+        out.push({
+          approvalId: st.approvalId,
+          name: r.tool?.name ?? r.content ?? "tool",
+          ...(st.description ? { description: st.description } : {}),
+          ...(input !== undefined ? { input } : {}),
+        });
       }
     }
-    return null;
+    return out;
   }
 
   #request(msg: ClientMessage): Promise<DaemonMessage> {

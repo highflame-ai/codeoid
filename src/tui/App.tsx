@@ -53,6 +53,8 @@ export function App({ config }: Props) {
   // Auto-attach to all sessions so unread counters and status changes flow
   // even when the user isn't actively viewing that session.
   const attachedRef = useRef<Set<string>>(new Set());
+  /** Per session, the comparison /compare last started or showed here (#357). */
+  const lastCompareRef = useRef<Map<string, string>>(new Map());
   const prevConnectionRef = useRef(state.connection);
   useEffect(() => {
     const client = wsRef.current;
@@ -948,19 +950,31 @@ export function App({ config }: Props) {
               ...(afterTurnId ? { afterTurnId } : {}),
             });
             if (res.type !== "compare.state") throw new Error(res.type === "response.error" ? res.error : "compare failed");
+            lastCompareRef.current.set(sessionId, res.compare.compareId);
+            // The branches are new sessions: load them so they can be focused.
+            await client.listSessions();
             printLocalInfo(
               sessionId,
               `${sanitizeTerminalOutput(formatCompare(res.compare))}\n\nThe branches are running as their own sessions (each asks for approvals there). /compare shows how they're doing; /compare keep <branch> [--discard-others] keeps one.`,
             );
             return;
           }
-          const list = await client.compareList(sessionId);
-          if (list.type !== "compare.list.result") throw new Error("could not list comparisons");
-          const latest = list.compares[0];
-          if (!latest) {
+          // The comparison this TUI last started or showed for this session
+          // (never one another client started meanwhile), else the newest.
+          let compareId = lastCompareRef.current.get(sessionId);
+          if (!compareId) {
+            const list = await client.compareList(sessionId);
+            if (list.type !== "compare.list.result") throw new Error("could not list comparisons");
+            compareId = list.compares[0]?.compareId;
+          }
+          if (!compareId) {
             printLocalInfo(sessionId, "No comparisons yet. /compare claude,codex <prompt> starts one.");
             return;
           }
+          const got = await client.compareGet(compareId);
+          if (got.type !== "compare.state") throw new Error(got.type === "response.error" ? got.error : "could not read the comparison");
+          const latest = got.compare;
+          lastCompareRef.current.set(sessionId, latest.compareId);
           if (cmd.kind === "show") {
             printLocalInfo(sessionId, sanitizeTerminalOutput(formatCompare(latest)));
             return;
@@ -969,6 +983,8 @@ export function App({ config }: Props) {
           if (!target?.sessionId) throw new Error(`branch ${cmd.branch} isn't a session you can keep`);
           const res = await client.compareKeep(latest.compareId, target.sessionId, cmd.discardOthers);
           if (res.type !== "compare.state") throw new Error(res.type === "response.error" ? res.error : "keep failed");
+          await client.listSessions();
+          printLocalInfo(sessionId, `Kept [${cmd.branch}] of comparison ${latest.compareId.slice(0, 8)}.`);
           dispatch({ type: "focus", sessionId: target.sessionId });
         })().catch((err: Error) => dispatch({ type: "error", message: err.message }));
         return;

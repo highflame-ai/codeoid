@@ -573,6 +573,7 @@ export const sessionCompareSchema = z.object({
         model: z
           .string()
           .regex(/^[\w.:/@+][\w.:/@+-]*$/)
+          .refine((m) => !m.includes(".."), "not a model id")
           .max(200)
           .optional(),
       }),
