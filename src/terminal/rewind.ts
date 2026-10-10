@@ -30,6 +30,26 @@ export function parseUndoArgs(args: readonly string[]): UndoRequest | { error: s
   return { error: "Usage: /undo [files [yes|force]]" };
 }
 
+/** `/fork [N] [--shared] [--backend <id>]` (#356) — N is a 1-based prompt number. */
+export function parseForkArgs(
+  args: readonly string[],
+): { at?: number; shared: boolean; backend?: string } | { error: string } {
+  const out: { at?: number; shared: boolean; backend?: string } = { shared: false };
+  const usage = { error: "Usage: /fork [N] [--shared] [--backend <id>]" };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!.trim();
+    if (!a) continue;
+    if (a === "--shared") out.shared = true;
+    else if (a === "--backend") {
+      const v = args[++i]?.trim();
+      if (!v) return usage;
+      out.backend = v;
+    } else if (/^\d+$/.test(a) && out.at === undefined && Number(a) >= 1) out.at = Number(a);
+    else return usage;
+  }
+  return out;
+}
+
 /** A plain-text account of what going back did, or would do. */
 export function formatRewind(r: SessionRewindResultMsg, opts: { hint?: boolean } = {}): string {
   const lines: string[] = [];

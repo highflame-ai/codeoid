@@ -1262,6 +1262,13 @@ export interface SessionForkMsg extends BaseClientMsg {
    * (a base needs its own worktree). Ignored in bind mode (`workdir`).
    */
   baseBranch?: string;
+  /**
+   * Fork from an earlier point (#356): the fork carries the conversation
+   * through this turn (its reply included) — not what came after — and, in a
+   * worktree codeoid creates for it, the files as they were right after it.
+   * Absent = fork from the latest point.
+   */
+  afterTurnId?: string;
 }
 
 /**

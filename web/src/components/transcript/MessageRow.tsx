@@ -30,6 +30,7 @@ import type {
 import { EditDiff, WriteFile, isEditInput, isWriteInput } from "./EditDiff";
 import PartsView, { hasRichParts } from "./PartsView";
 import { openRewind } from "../RewindModal";
+import { openForkFromHere } from "../ForkFromHereModal";
 
 const ROLE_LABEL: Record<MessageRole, string> = {
   user: "you",
@@ -80,17 +81,29 @@ const Header: Component<{ msg: SessionMessage }> = (props) => (
     >
       {identityLabel(props.msg.identity)}
     </span>
-    <Show when={props.msg.role === "user" && props.msg.turnId}>
-      <button
-        type="button"
-        class="ml-auto hidden rounded border border-border px-1.5 font-mono text-[10px] text-fg-faint hover:border-accent/40 hover:text-fg group-hover:inline-block"
-        title="Go back to before this message: take it (and everything after it) back, optionally restoring the files"
-        onClick={() => openRewind(props.msg.sessionId, props.msg.turnId!)}
-      >
-        ↩ go back to here
-      </button>
+    <Show when={(props.msg.role === "user" || props.msg.role === "assistant") && props.msg.turnId}>
+      <span class="ml-auto hidden gap-1 group-hover:inline-flex">
+        <button
+          type="button"
+          class="rounded border border-border px-1.5 font-mono text-[10px] text-fg-faint hover:border-accent/40 hover:text-fg"
+          title="Fork from here: a new session with the conversation through the end of this turn (this prompt and the agent's whole reply), optionally on another backend"
+          onClick={() => openForkFromHere(props.msg.sessionId, props.msg.turnId!)}
+        >
+          ⑃ fork from here
+        </button>
+        <Show when={props.msg.role === "user"}>
+          <button
+            type="button"
+            class="rounded border border-border px-1.5 font-mono text-[10px] text-fg-faint hover:border-accent/40 hover:text-fg"
+            title="Go back to before this message: take it (and everything after it) back, optionally restoring the files"
+            onClick={() => openRewind(props.msg.sessionId, props.msg.turnId!)}
+          >
+            ↩ go back to here
+          </button>
+        </Show>
+      </span>
     </Show>
-    <span class={`${props.msg.role === "user" && props.msg.turnId ? "" : "ml-auto "}font-mono text-fg-faint`}>
+    <span class={`${(props.msg.role === "user" || props.msg.role === "assistant") && props.msg.turnId ? "" : "ml-auto "}font-mono text-fg-faint`}>
       {formatClock(props.msg.timestamp)}
     </span>
   </header>

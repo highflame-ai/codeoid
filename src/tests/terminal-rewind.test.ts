@@ -1,7 +1,7 @@
 /** `/undo` on text surfaces (#355): one grammar and one wording for the CLI, TUI and `codeoid undo`. */
 
 import { describe, expect, it } from "bun:test";
-import { formatRewind, parseUndoArgs } from "../terminal/rewind.js";
+import { formatRewind, parseForkArgs, parseUndoArgs } from "../terminal/rewind.js";
 import type { SessionRewindResultMsg } from "../protocol/types.js";
 
 const base: SessionRewindResultMsg = {
@@ -58,5 +58,14 @@ describe("formatRewind", () => {
 
   it("a refusal says nothing changed", () => {
     expect(formatRewind({ ...base, dryRun: true, refused: "2 file(s) were changed by hand" })).toStartWith("Nothing changed");
+  });
+});
+
+describe("parseForkArgs (#356)", () => {
+  it("maps the grammar", () => {
+    expect(parseForkArgs([])).toEqual({ shared: false });
+    expect(parseForkArgs(["3"])).toEqual({ at: 3, shared: false });
+    expect(parseForkArgs(["2", "--shared", "--backend", "pi"])).toEqual({ at: 2, shared: true, backend: "pi" });
+    for (const bad of [["0"], ["x"], ["--backend"], ["1", "2"]]) expect("error" in parseForkArgs(bad)).toBe(true);
   });
 });

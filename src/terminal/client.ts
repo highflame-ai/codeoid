@@ -667,6 +667,66 @@ export class TerminalClient {
   /** The last `/undo files` preview, which `/undo files yes|force` confirms. */
   #undoPreview: { sessionId: string; turnId: string; planId: string } | null = null;
 
+  /**
+   * `codeoid fork <session> [--at N] [--backend id] [--shared] [--name n]`
+   * (#356): fork from the latest point, or after prompt N with the files as
+   * they were then.
+   */
+  async forkSession(
+    sessionIdOrName: string,
+    opts: { at?: number; backend?: string; shared?: boolean; name?: string },
+  ): Promise<void> {
+    const sessionId = await this.#resolveSession(sessionIdOrName);
+    if (!sessionId) return;
+    let afterTurnId: string | undefined;
+    if (opts.at !== undefined) {
+      const list = await this.#request({ type: "session.turns", id: randomUUID(), sessionId });
+      if (list.type !== "session.turns.result") {
+        this.#printError(list);
+        return;
+      }
+      const t = list.turns[opts.at - 1];
+      if (!t) {
+        console.log(`There is no prompt ${opts.at} (this session has ${list.turns.length}).`);
+        return;
+      }
+      afterTurnId = t.turnId;
+    }
+    const resp = await this.#request({
+      type: "session.fork",
+      id: randomUUID(),
+      sessionId,
+      ...(afterTurnId ? { afterTurnId } : {}),
+      ...(opts.backend ? { providerId: opts.backend } : {}),
+      ...(opts.shared ? { isolate: false } : {}),
+      ...(opts.name ? { name: opts.name } : {}),
+    });
+    if (resp.type !== "response.ok") {
+      this.#printError(resp);
+      return;
+    }
+    const info = resp.data as { id: string; name: string; workdir: string; providerId?: string };
+    console.log(`Forked: ${S(info.name)} (${info.id}) [${S(info.providerId ?? "")}] in ${S(info.workdir)}`);
+    console.log(`Attach with: codeoid attach ${info.id}`);
+  }
+
+  /** `codeoid turns <session>` — the numbered turns `--at N` / `/fork N` refer to. */
+  async listTurns(sessionIdOrName: string): Promise<void> {
+    const sessionId = await this.#resolveSession(sessionIdOrName);
+    if (!sessionId) return;
+    const list = await this.#request({ type: "session.turns", id: randomUUID(), sessionId });
+    if (list.type !== "session.turns.result") {
+      this.#printError(list);
+      return;
+    }
+    if (list.turns.length === 0) console.log("No turns yet.");
+    for (const t of list.turns) {
+      const tag = t.kind === "background" ? " (background)" : "";
+      const snap = t.checkpoint ? "" : list.checkpointsSupported ? "  [no snapshot]" : "";
+      console.log(`${String(t.index).padStart(3)}. ${S(t.preview)}${tag}${snap}`);
+    }
+  }
+
   /** `codeoid undo <session> [files [yes|force]]` — /undo without attaching. */
   async undoSession(sessionIdOrName: string, args: string[]): Promise<void> {
     const sessionId = await this.#resolveSession(sessionIdOrName);

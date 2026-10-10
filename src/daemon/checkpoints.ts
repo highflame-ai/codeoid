@@ -84,6 +84,8 @@ export type CheckpointResult = { ok: true; sha: string; late: boolean } | { ok: 
 export interface CheckpointRecord {
   sha: string;
   late: boolean;
+  /** The user repository's HEAD commit when it was taken, when there is one (#356). */
+  head?: string;
 }
 
 /**
@@ -228,18 +230,24 @@ function pathspecs(extraExcludes: readonly string[]): string[] {
   return ["--", ".", ...[...DEFAULT_CHECKPOINT_EXCLUDES, ...extraExcludes].map((p) => `:(exclude,glob)${p}`)];
 }
 
-type OrderEntry = { turnId: string; sha: string; late: boolean };
+type OrderEntry = { turnId: string; sha: string; late: boolean; head?: string };
 
-const orderLine = (e: OrderEntry): string => `${e.turnId} ${e.sha}${e.late ? " late" : ""}\n`;
+const orderLine = (e: OrderEntry): string => `${e.turnId} ${e.sha}${e.late ? " late" : ""}${e.head ? ` head=${e.head}` : ""}\n`;
 
 async function readOrder(shadow: string): Promise<OrderEntry[]> {
   try {
     const raw = await readFile(path.join(shadow, "turns.log"), "utf8");
     const out: OrderEntry[] = [];
     for (const line of raw.split("\n")) {
-      const [turnId, sha, flag] = line.trim().split(" ");
+      const [turnId, sha, ...rest] = line.trim().split(" ");
       if (turnId && sha && SAFE_ID.test(turnId) && /^[0-9a-f]{40,64}$/.test(sha)) {
-        out.push({ turnId, sha, late: flag === "late" });
+        const head = rest.find((r) => r.startsWith("head="))?.slice(5);
+        out.push({
+          turnId,
+          sha,
+          late: rest.includes("late"),
+          ...(head && /^[0-9a-f]{40,64}$/.test(head) ? { head } : {}),
+        });
       }
     }
     return out;
@@ -322,6 +330,13 @@ export async function createCheckpoint(opts: {
       await prune(shadow, keep, t, { reclaimNow: true }).catch(() => {});
       if (keep === 0) break;
     }
+    // The user repo's HEAD, so a fork from this point can start from the same
+    // commit. Read BEFORE the files: a commit landing mid-snapshot then shows
+    // as the files' uncommitted edits, never as reverts of a newer commit.
+    // rev-parse only reads (no hooks, fsmonitor off).
+    const head = await run(["rev-parse", "--verify", "-q", "HEAD^{commit}"], { cwd: opts.workdir, env: gitEnv({}), timeoutMs: t })
+      .then((o) => o.trim())
+      .catch(() => "");
     const staged = await stageWorkTree(shadow, opts.workdir, limits, opts.excludeDirs);
     if (!staged.ok) return staged;
     const late = opts.isLate?.() === true;
@@ -331,7 +346,11 @@ export async function createCheckpoint(opts: {
     const sha = (await run(["commit-tree", tree, "-F", "-"], { cwd: opts.workdir, env, timeoutMs: t, input: message })).trim();
     const shadowEnv = gitEnv({ GIT_DIR: shadow });
     await run(["update-ref", `refs/turns/${opts.turnId}`, sha], { cwd: shadow, env: shadowEnv, timeoutMs: t });
-    await appendFile(path.join(shadow, "turns.log"), orderLine({ turnId: opts.turnId, sha, late }), { mode: 0o600 });
+    await appendFile(
+      path.join(shadow, "turns.log"),
+      orderLine({ turnId: opts.turnId, sha, late, ...(/^[0-9a-f]{40,64}$/.test(head) ? { head } : {}) }),
+      { mode: 0o600 },
+    );
     await prune(shadow, limits.maxPerSession, t).catch(() => {});
     // A first snapshot of a big tree leaves one loose object per file; pack
     // them so the store stays compact and cheap to copy for forks.
@@ -587,7 +606,7 @@ export async function listCheckpoints(
       const [refname, sha] = line.trim().split(" ");
       if (refname?.startsWith("refs/turns/") && sha) refs.set(refname.slice("refs/turns/".length), sha);
     }
-    for (const { turnId, sha, late } of order) if (refs.get(turnId) === sha) out.set(turnId, { sha, late });
+    for (const { turnId, sha, late, head } of order) if (refs.get(turnId) === sha) out.set(turnId, { sha, late, ...(head ? { head } : {}) });
   } catch {
     // unreadable shadow repo → no checkpoints
   }
@@ -622,7 +641,7 @@ export async function copyCheckpoints(opts: {
   const have = new Set(existing.map((e) => e.turnId));
   const lines = picked
     .filter(([turnId]) => !have.has(turnId))
-    .map(([turnId, rec]) => orderLine({ turnId, sha: rec.sha, late: rec.late }))
+    .map(([turnId, rec]) => orderLine({ turnId, sha: rec.sha, late: rec.late, ...(rec.head ? { head: rec.head } : {}) }))
     .join("");
   if (lines) await appendFile(path.join(to, "turns.log"), lines, { mode: 0o600 });
   return picked.length;

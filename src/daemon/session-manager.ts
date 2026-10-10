@@ -11,7 +11,7 @@
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, sep } from "node:path";
-import { RewindError, SendStoppedError, Session, type AttachedClient, type WindowScope } from "./session.js";
+import { type ForkPoint, RewindError, SendStoppedError, Session, type AttachedClient, type WindowScope } from "./session.js";
 import { sweepCheckpoints } from "./checkpoints.js";
 import { type CatalogEntry, isPlaceholderModel, type SessionProvider } from "./providers/interface.js";
 import {
@@ -302,6 +302,34 @@ const RESUME_DEADLINE_MS = 20_000;
  * 20 MiB / 5000 messages — parsing history past that would be evicted on
  * arrival, so cap the read slightly above the scrollback byte cap. */
 const RESUME_TRANSCRIPT_MAX_BYTES = 24 * 1024 * 1024;
+/**
+ * Transcript rows of a fork from an earlier turn (#356): everything up to the
+ * first row, after the chosen turn's last one, that belongs to a turn the fork
+ * doesn't carry — so a turn the parent started meanwhile, or any row stamped
+ * with another id, is cut. Positional: notices between the chosen turn and the
+ * next stay with the chosen turn, and rows inside it are never split off.
+ */
+export function cutRowsAfterTurn<T extends { message: DaemonMessage }>(
+  rows: T[],
+  keptTurnIds: readonly string[],
+  turnId: string,
+): T[] {
+  const kept = new Set(keptTurnIds);
+  const turnOf = (r: T) => (r.message as { turnId?: string }).turnId;
+  let from = 0;
+  for (let i = rows.length - 1; i >= 0; i--) {
+    if (turnOf(rows[i]!) === turnId) {
+      from = i + 1;
+      break;
+    }
+  }
+  for (let i = from; i < rows.length; i++) {
+    const id = turnOf(rows[i]!);
+    if (id !== undefined && !kept.has(id)) return rows.slice(0, i);
+  }
+  return rows;
+}
+
 /**
  * Newest part of a session's canonical-history log read on resume (#354).
  * The prompts a backend is re-seeded with are budgeted far below this; the
@@ -3427,8 +3455,40 @@ mcpHub: this.#mcpHub,
     // Snapshot the parent's state BEFORE building the fork. Canonical history
     // is the source of truth for the conversation; the transcript rows are
     // replayed into the fork's scrollback for UI visibility.
-    // The WHOLE conversation — after a restart memory may hold only its tail.
-    const history = (await parent.fullCanonicalHistory()).map((t) => ({ ...t }));
+    // Fork from an earlier turn (#356): the conversation, turn list and files
+    // as they were right after it. Otherwise the WHOLE conversation — after a
+    // restart memory may hold only its tail.
+    let point: ForkPoint | null = null;
+    if (msg.afterTurnId && msg.baseBranch) {
+      // A clean base and "the files as they were after turn N" contradict
+      // each other — there is no coherent state that is both.
+      return {
+        type: "response.error",
+        requestId: msg.id,
+        error: "Fork from an earlier turn OR from a base branch, not both",
+        code: "invalid_request",
+      };
+    }
+    if (msg.afterTurnId) {
+      try {
+        point = await parent.forkPoint(msg.afterTurnId);
+      } catch (err) {
+        return {
+          type: "response.error",
+          requestId: msg.id,
+          error: err instanceof Error ? err.message : String(err),
+          code:
+            err instanceof RewindError
+              ? err.code === "not_found"
+                ? "not_found"
+                : err.code === "restore_failed"
+                  ? "internal"
+                  : "invalid_request" // before_rotation, busy: pick another point / wait
+              : "internal",
+        };
+      }
+    }
+    const history = (point ? point.history : await parent.fullCanonicalHistory()).map((t) => ({ ...t }));
     const parentInfo = parent.toInfo();
     let transcriptRows: DaemonMessage[] = [];
     let sizeHints: Array<number | undefined> = [];
@@ -3436,8 +3496,16 @@ mcpHub: this.#mcpHub,
       const entries = await this.#transcriptStore.loadTranscript(msg.sessionId, {
         maxBytes: RESUME_TRANSCRIPT_MAX_BYTES,
       });
-      transcriptRows = entries.map((e) => e.message);
-      sizeHints = entries.map((e) => e.bytes);
+      // From an earlier turn: only the rows through it.
+      const kept = point
+        ? cutRowsAfterTurn(
+            entries,
+            point.entries.map((e) => e.turnId),
+            msg.afterTurnId!,
+          )
+        : entries;
+      transcriptRows = kept.map((e) => e.message);
+      sizeHints = kept.map((e) => e.bytes);
     } catch (err) {
       // Scrollback replay is best-effort — the fork's CONVERSATION is carried
       // by the canonical history above, which is already in memory.
@@ -3446,9 +3514,10 @@ mcpHub: this.#mcpHub,
       );
     }
 
-    // Branch point = conversation rounds (user turns) carried over — the
-    // human "you forked after N prompts" the lineage chip shows.
-    const atTurn = history.filter((t) => t.role === "user").length;
+    // Branch point: the number of turns carried over (same count either way,
+    // from the turn list) — the "forked after prompt N" the lineage chip shows.
+    const atTurn = point ? point.atTurn : parent.turnIndex.length || history.filter((t) => t.role === "user").length;
+    let filesOutcome = "latest";
 
     // Git isolation: a fork must not share the parent's working tree, or two
     // agents editing the same files collide. Default: give the fork its OWN
@@ -3463,6 +3532,9 @@ mcpHub: this.#mcpHub,
     const worktreeShortId = randomUUID().slice(0, 8);
     let forkWorkdir = parent.workdir;
     let worktree: SessionWorktree | undefined;
+    let forkSubdirMapped = true;
+    let forkFromHead: string | undefined;
+    let forkHeadGone = false;
     let workdirNote: string | undefined;
     if (msg.workdir) {
       // Bind mode: run in a dir/worktree the user manages; record its branch
@@ -3485,21 +3557,48 @@ mcpHub: this.#mcpHub,
       // baseBranch implies isolation (a base needs its own worktree).
       if (await isGitRepo(parent.workdir)) {
         try {
-          const wt = await createForkWorktree({
-            workdir: parent.workdir,
-            label: msg.name ?? parentInfo.name,
-            shortId: worktreeShortId,
-            ...(msg.baseBranch ? { baseBranch: msg.baseBranch } : {}),
+          // From an earlier turn: start the worktree at the commit the repo
+          // was on then (recorded with the snapshot), so git history matches
+          // the files rolled in below; make sure the parent's subdirectory
+          // exists so the snapshot lands where it belongs.
+          let rollHead = point?.files && "checkpointId" in point.files ? point.files.head : undefined;
+          const make = (baseCommit?: string) =>
+            createForkWorktree({
+              workdir: parent.workdir,
+              label: msg.name ?? parentInfo.name,
+              shortId: worktreeShortId,
+              ...(msg.baseBranch ? { baseBranch: msg.baseBranch } : {}),
+              ...(baseCommit ? { baseCommit } : {}),
+              ...(point?.files && "checkpointId" in point.files ? { ensureSubdir: true } : {}),
+            });
+          let headGone = false;
+          const wt = await make(rollHead).catch((err: unknown) => {
+            // That commit is gone (amended/rebased away and collected): still
+            // isolate — carry the current state; the roll below sets the files.
+            if (!rollHead) throw err;
+            rollHead = undefined;
+            headGone = true;
+            return make();
           });
           // Fork runs in the parent's equivalent subdir of the worktree; the
           // worktree ROOT (wt.path) is what we remove on destroy.
-          forkWorkdir = wt.workdir;
+          // Same checks as any session's workdir (safe-root, protected dirs),
+          // and it must resolve inside its own worktree — else the root.
+          const checked = normalizeWorkdir(wt.workdir);
+          const realRoot = normalizeWorkdir(wt.path);
+          const inside = !!checked && !!realRoot && (checked === realRoot || checked.startsWith(realRoot + sep));
+          forkWorkdir = inside ? checked : (realRoot ?? wt.path);
           worktree = { path: wt.path, branch: wt.branch, createdByCodeoid: true };
+          forkSubdirMapped = wt.subdirMapped && inside;
+          forkFromHead = rollHead;
+          forkHeadGone = headGone;
           // Surface that this is a fresh isolated worktree (deps aren't
           // present) — previously the isolated path was silent.
           const origin = msg.baseBranch
             ? `forked clean from \`${msg.baseBranch}\``
-            : "carrying your uncommitted changes";
+            : rollHead
+              ? `at commit \`${rollHead.slice(0, 10)}\`, the one checked out right after that turn`
+              : "carrying your uncommitted changes";
           const setupHint = this.#config?.fork?.setup
             ? " Running the configured fork setup now — the first turn will wait for it."
             : " Build dependencies (e.g. node_modules) aren't present in a fresh worktree — run your project's setup before building.";
@@ -3583,7 +3682,51 @@ mcpHub: this.#mcpHub,
       // Only turns the fork's history actually contains: the parent may have
       // started another while this fork was being built.
       const forkTurnIds = new Set(history.map((t) => t.turnId).filter(Boolean));
-      await fork.inheritTurns(parent, parent.turnIndex.filter((e) => forkTurnIds.has(e.turnId)));
+      const filesPoint = point?.files && "checkpointId" in point.files ? point.files.checkpointId : undefined;
+      await fork.inheritTurns(
+        parent,
+        (point ? point.entries : parent.turnIndex).filter((e) => forkTurnIds.has(e.turnId)),
+        filesPoint ? [filesPoint] : [],
+      );
+      // ...and the files as they were right after that turn — only in a
+      // worktree codeoid made for this fork whose folder lines up with the
+      // parent's, never in a shared or bound one.
+      if (point?.files) {
+        // What the fork's folder holds when its files aren't rolled.
+        const asCheckedOut = forkFromHead
+          ? `the files of commit \`${forkFromHead.slice(0, 10)}\` as committed (without that turn's uncommitted changes)`
+          : "the parent's current files";
+        let note: string;
+        if ("unavailable" in point.files) {
+          filesOutcome = "unavailable";
+          note = `⚠️ This fork has the parent's current files: ${point.files.unavailable}.`;
+        } else if (!worktree?.createdByCodeoid) {
+          filesOutcome = "current";
+          note = `⚠️ This fork shares or binds a working directory, so its files are the current ones, not those from right after prompt ${point.atTurn}.`;
+        } else if (!forkSubdirMapped) {
+          filesOutcome = "current";
+          note = `⚠️ This fork's folder doesn't line up with the parent's, so its files weren't put back to right after prompt ${point.atTurn}; it has ${asCheckedOut}.`;
+        } else {
+          note = await fork
+            .rollFilesTo(filesPoint!, { asEndOf: msg.afterTurnId!, within: worktree.path })
+            .then(({ restored, removed }) => {
+              filesOutcome = `rolled(${restored}/${removed})`;
+              const files = point!.files as { late?: boolean };
+              return `📂 Files are as they were right after prompt ${point!.atTurn} (${restored} restored, ${removed} removed)${
+                forkFromHead
+                  ? ""
+                  : forkHeadGone
+                    ? "; git history wasn't rolled back (the commit checked out back then no longer exists)"
+                    : "; git history wasn't rolled back (no commit was recorded with that snapshot)"
+              }${files.late ? "; that snapshot finished after the next prompt's agent had started, so it may include its first edits" : ""}.`;
+            })
+            .catch((err: unknown) => {
+              filesOutcome = "failed";
+              return `⚠️ The files couldn't be put back to right after prompt ${point!.atTurn} (${err instanceof Error ? err.message : String(err)}); this fork has ${asCheckedOut}.`;
+            });
+        }
+        await fork.noteForkFiles(note);
+      }
     } catch (err) {
       // Orphan cleanup: if building the fork failed after we created its
       // worktree, remove it so no dangling worktree + branch is left behind.
@@ -3604,7 +3747,9 @@ mcpHub: this.#mcpHub,
       auth.sub,
       "session.fork",
       fork.id,
-      `from=${msg.sessionId} provider=${providerId ?? "default"} turns=${history.length} worktree=${worktree?.branch ?? "shared"}`,
+      `from=${msg.sessionId} provider=${providerId ?? "default"} turns=${history.length} worktree=${worktree?.branch ?? "shared"}${
+        point ? ` after=${msg.afterTurnId} at=${point.atTurn} files=${filesOutcome}` : ""
+      }`,
     );
 
     // Make the new worktree buildable in the background (fork stays cheap; the
