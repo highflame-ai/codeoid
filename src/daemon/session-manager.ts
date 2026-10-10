@@ -11,7 +11,8 @@
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, sep } from "node:path";
-import { Session, type AttachedClient, type WindowScope } from "./session.js";
+import { SendStoppedError, Session, type AttachedClient, type WindowScope } from "./session.js";
+import { sweepCheckpoints } from "./checkpoints.js";
 import { type CatalogEntry, isPlaceholderModel, type SessionProvider } from "./providers/interface.js";
 import {
   createDefaultProviderRegistry,
@@ -23,6 +24,7 @@ import type { Store } from "./store.js";
 import { createPushTransport, PushService } from "./push/index.js";
 import { hasScope, SCOPES } from "../protocol/scopes.js";
 import { applyPatches, getManifest, getSnapshot, previewPatches } from "./settings/store.js";
+import { canonicalFromTranscript, turnIndexFromHistory } from "./canonical-restore.js";
 import { BackendLoginBroker, BackendLoginError, redact } from "./auth/backend-login.js";
 import { RateLimiter } from "./rate-limit.js";
 import type { TranscriptMeta, TranscriptStore } from "./transcript.js";
@@ -300,6 +302,12 @@ const RESUME_DEADLINE_MS = 20_000;
  * 20 MiB / 5000 messages — parsing history past that would be evicted on
  * arrival, so cap the read slightly above the scrollback byte cap. */
 const RESUME_TRANSCRIPT_MAX_BYTES = 24 * 1024 * 1024;
+/**
+ * Newest part of a session's canonical-history log read on resume (#354).
+ * The prompts a backend is re-seeded with are budgeted far below this; the
+ * whole log is read on demand by the features that need old turns.
+ */
+const RESUME_CANONICAL_MAX_BYTES = 4 * 1024 * 1024;
 
 /** Sort key for resume ordering: most-recently-active first. Falls back to
  * createdAt, then 0, so a malformed timestamp never throws. */
@@ -628,6 +636,13 @@ export class SessionManager {
     }
 
     const allMetas = await this.#transcriptStore.loadAllMeta();
+    // Checkpoint repositories of sessions that no longer exist (#354) — a
+    // crash between destroy's steps, or state lost outside the daemon.
+    // Background: never delays the resume.
+    void sweepCheckpoints(
+      join(this.#transcriptStore.dir, "checkpoints"),
+      new Set(allMetas.map((m) => m.sessionId)),
+    ).catch(() => {});
     // Newest-first by last activity so the cap keeps the most relevant
     // sessions when there are more than the configured cap on disk.
     const sorted = [...allMetas].sort(
@@ -774,6 +789,37 @@ mcpHub: this.#mcpHub,
         session.restoreScrollback(messages, maxSeq + 1, entries.map((e) => e.bytes), {
           partialHistory: loadStats.truncated === true,
         });
+        // The backend-neutral conversation (#354). Without it a restored
+        // session forked / switched backend with no history, and stateless
+        // backends answered the next prompt with no memory of the session.
+        // Sessions from before the log existed are rebuilt from the
+        // transcript once, then read from the log.
+        try {
+          const canonical = await this.#transcriptStore.loadCanonical(meta.sessionId, {
+            maxBytes: RESUME_CANONICAL_MAX_BYTES,
+          });
+          const index = await this.#transcriptStore.loadTurnIndex(meta.sessionId);
+          // No log: a session from before it existed. Rebuild once from the
+          // WHOLE transcript (the scrollback window above may be a tail) and
+          // persist it — a long session's history must not shrink to the
+          // window, or to just the next turn on the following restart.
+          let rebuildFrom = messages;
+          if (!canonical && loadStats.truncated === true) {
+            const all = await this.#transcriptStore.loadTranscript(meta.sessionId, { deadlineAt: deadline });
+            rebuildFrom = all.map((e) => e.message);
+          }
+          const history =
+            canonical?.turns ?? (rebuildFrom.length > 0 ? canonicalFromTranscript(rebuildFrom, providerId) : []);
+          session.restoreTurns(history, index ?? turnIndexFromHistory(history), {
+            persistHistory: !canonical && history.length > 0,
+            persistIndex: !index && history.some((t) => t.turnId),
+            partial: canonical?.partial ?? false,
+          });
+        } catch (err) {
+          console.error(
+            `[codeoid/resume] canonical history restore failed for ${meta.sessionId} (session resumes without it): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
 
         this.#sessions.set(session.id, session);
         // Track a resumed child's mount so teardown revokes it. Without this a
@@ -1075,6 +1121,8 @@ mcpHub: this.#mcpHub,
         return this.#backendLoginSubmit(msg, auth);
       case "backend.login.cancel":
         return this.#backendLoginCancel(msg, auth);
+      case "session.turns":
+        return this.#sessionTurns(msg, auth);
       case "skill.grant":
         return this.#skillGrant(msg, auth);
       case "mcp.oauth.begin":
@@ -2519,7 +2567,10 @@ mcpHub: this.#mcpHub,
         (s) =>
           s.status === "thinking" ||
           s.status === "tool_running" ||
-          s.status === "waiting_approval",
+          s.status === "waiting_approval" ||
+          // Looks idle, but a queued send is about to start a turn: stop it
+          // too, or it starts after shutdown began.
+          s.preparingTurn,
       );
       if (working.length === 0) return;
       for (const session of working) {
@@ -3373,7 +3424,8 @@ mcpHub: this.#mcpHub,
     // Snapshot the parent's state BEFORE building the fork. Canonical history
     // is the source of truth for the conversation; the transcript rows are
     // replayed into the fork's scrollback for UI visibility.
-    const history = parent.canonicalHistory.map((t) => ({ ...t }));
+    // The WHOLE conversation — after a restart memory may hold only its tail.
+    const history = (await parent.fullCanonicalHistory()).map((t) => ({ ...t }));
     const parentInfo = parent.toInfo();
     let transcriptRows: DaemonMessage[] = [];
     let sizeHints: Array<number | undefined> = [];
@@ -3523,6 +3575,12 @@ mcpHub: this.#mcpHub,
       // floor — forks never carry a model id, so the cache alone can't key it.
       fork.inheritObservedLimits(parent);
       await fork.primeFromFork(history, transcriptRows, sizeHints, workdirNote);
+      // The inherited turns keep their ids, list entries and file snapshots
+      // (#354) — and the snapshots survive the parent being destroyed.
+      // Only turns the fork's history actually contains: the parent may have
+      // started another while this fork was being built.
+      const forkTurnIds = new Set(history.map((t) => t.turnId).filter(Boolean));
+      await fork.inheritTurns(parent, parent.turnIndex.filter((e) => forkTurnIds.has(e.turnId)));
     } catch (err) {
       // Orphan cleanup: if building the fork failed after we created its
       // worktree, remove it so no dangling worktree + branch is left behind.
@@ -3819,7 +3877,14 @@ mcpHub: this.#mcpHub,
         // Only (re)drive the turn when we have something to say — a spurious
         // rest below loops back with nothing pending, just awaiting the real turn.
         if (pendingSend !== null) {
-          await session.send(pendingSend, auth);
+          try {
+            await session.send(pendingSend, auth);
+          } catch (err) {
+            // A Stop landed before the turn started: no turn will rest, so
+            // don't wait for one — hand back like any interrupt.
+            if (err instanceof SendStoppedError) return { finalStatus: "idle", text: "Stopped before the agent started on this phase." };
+            throw err;
+          }
           pendingSend = null;
           textAtSend = session.lastAssistantText ?? "";
         }
@@ -4562,10 +4627,17 @@ mcpHub: this.#mcpHub,
           // interrupting a mid-turn session would corrupt its work. One batched
           // injection per recipient: N completions = one wake.
           if (session.status !== "idle") continue;
-          await session.send(
-            this.#fleetEventsBody(batch),
-            this.#dispatchSystemAuth(accountId, projectId),
-          );
+          try {
+            await session.send(
+              this.#fleetEventsBody(batch),
+              this.#dispatchSystemAuth(accountId, projectId),
+            );
+          } catch (err) {
+            // Stopped before its turn started: not delivered — retried on the
+            // next tick. Other recipients' deliveries still count.
+            if (err instanceof SendStoppedError) continue;
+            throw err;
+          }
           delivered.push(...batch.map((e) => e.id));
         }
         if (undeliverable.length > 0) {
@@ -5168,6 +5240,24 @@ mcpHub: this.#mcpHub,
     return { type: "response.ok", requestId: msg.id, data: session.toInfo() };
   }
 
+  /** A session's turns (#354) — same read authority as attach. */
+  async #sessionTurns(
+    msg: Extract<ClientMessage, { type: "session.turns" }>,
+    auth: AuthContext,
+  ): Promise<DaemonMessage> {
+    const scope = hasScope(auth.scopes as string[], SCOPES.SESSION_ATTACH)
+      || hasScope(auth.scopes as string[], SCOPES.SESSION_WATCH);
+    if (!scope) {
+      return { type: "response.error", requestId: msg.id, error: "Missing scope: session:attach or session:watch", code: "forbidden" };
+    }
+    const session = this.#getOwnedSession(msg.sessionId, auth);
+    if (!session) {
+      return { type: "response.error", requestId: msg.id, error: "Session not found", code: "not_found" };
+    }
+    const { turns, checkpointsSupported } = await session.turns();
+    return { type: "session.turns.result", requestId: msg.id, sessionId: session.id, turns, checkpointsSupported };
+  }
+
   /** History paging (`scrollback.paging`) — same read authority as attach. */
   async #pageScrollback(
     msg: Extract<ClientMessage, { type: "scrollback.page" }>,
@@ -5234,7 +5324,11 @@ mcpHub: this.#mcpHub,
     // priority controls mid-turn insertion semantics (default "later" = FIFO).
     session
       .send(msg.text, auth, msg.attachments, msg.priority)
-      .catch((err) => session.reportSendFailure(err));
+      .catch((err) => {
+        // Stopped before its turn started: the user already got a notice.
+        if (err instanceof SendStoppedError) return;
+        session.reportSendFailure(err);
+      });
 
     return { type: "response.ok", requestId: msg.id };
   }

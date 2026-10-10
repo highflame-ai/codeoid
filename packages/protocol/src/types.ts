@@ -32,6 +32,7 @@ import type {
   BackendLoginCancelResultMsg,
 } from "./backend-login.js";
 import type { SkillGrantMsg, SkillGrantResultMsg } from "./skill-grant.js";
+import type { SessionTurnsMsg, SessionTurnsResultMsg } from "./turns.js";
 import type {
   McpOAuthBeginMsg,
   McpOAuthCompleteMsg,
@@ -908,6 +909,12 @@ export interface SessionMessage {
    * longer holds in its replay buffer.
    */
   seq?: number;
+  /**
+   * The turn this message belongs to (#354): the prompt that started it and
+   * everything the agent did in reply share one id. Absent on messages from
+   * before turn ids existed, and on some daemon notices emitted between turns.
+   */
+  turnId?: string;
 }
 
 /**
@@ -1017,6 +1024,7 @@ export type ClientMessage =
   | BackendLoginSubmitMsg
   | BackendLoginCancelMsg
   | SkillGrantMsg
+  | SessionTurnsMsg
   | McpOAuthBeginMsg
   | McpOAuthCompleteMsg
   | McpOAuthDisconnectMsg
@@ -2574,6 +2582,7 @@ export type DaemonMessage =
   | BackendLoginSubmitResultMsg
   | BackendLoginCancelResultMsg
   | SkillGrantResultMsg
+  | SessionTurnsResultMsg
   | McpOAuthBeginResultMsg
   | McpOAuthCompleteResultMsg
   | McpOAuthDisconnectResultMsg

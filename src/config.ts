@@ -370,6 +370,26 @@ const SessionSchema = z
      * restart.
      */
     resumeMaxSessions: z.number().int().min(1).default(200),
+    /**
+     * Per-turn workspace snapshots (#354): at the start of every turn the
+     * session's working directory (minus .gitignore'd files, secrets and
+     * dependency dirs) is recorded in a daemon-owned shadow git repository
+     * under <transcriptDir>/checkpoints/, so a later "go back a turn" / "fork
+     * from here" can put the files back. Works in git and non-git
+     * directories; never touches the user's repository. Optional with
+     * defaults applied at use, so existing configs keep working.
+     */
+    checkpoints: z
+      .object({
+        enabled: z.boolean().optional(),
+        /** Newest snapshots kept per session (default 200). */
+        maxPerSession: z.number().int().min(1).optional(),
+        /** Skip a snapshot when untracked, non-ignored files exceed this (bytes, default 100 MB). */
+        maxUntrackedBytes: z.number().int().min(0).optional(),
+        /** Longest a turn waits for its snapshot before starting anyway (ms, default 2000). */
+        waitMs: z.number().int().min(0).optional(),
+      })
+      .optional(),
   })
   .default({
     turnStallTimeoutMs: 300_000,
@@ -1072,6 +1092,13 @@ export interface CodeoidConfig {
     attachTailBytes?: number;
     /** Sessions restored from disk at daemon start, newest-first by last activity. Resume is also time-boxed, so this is the coarse guard; the remainder stays on disk. Defaults to 200 when omitted. */
     resumeMaxSessions?: number;
+    /** Per-turn workspace snapshots (#354). Enabled unless `enabled: false`. */
+    checkpoints?: {
+      enabled?: boolean;
+      maxPerSession?: number;
+      maxUntrackedBytes?: number;
+      waitMs?: number;
+    };
   };
   /**
    * The per-tenant conductor session (fleet supervisor). Optional in the

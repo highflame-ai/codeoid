@@ -1820,8 +1820,9 @@ describe("T10 – send during waiting_approval", () => {
 
     // No pushMidTurn on this backend: the send must FAIL LOUDLY instead of
     // starting a fresh turn (which would close the turn queue and auto-deny).
+    // Names the tool once its call has registered (generic phrasing before).
     await expect(session.send("hold on, explain first", TEST_AUTH)).rejects.toThrow(
-      /approval is pending/i,
+      /approval is pending|is waiting for approval/i,
     );
 
     // The approval survived: nothing resolved it, no fresh turn started.

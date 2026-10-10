@@ -147,6 +147,7 @@ const samples: { [T in ClientTypes]: Extract<ClientMessage, { type: T }> } = {
   },
   "mcp.oauth.disconnect": { type: "mcp.oauth.disconnect", id: "r92", server: "notion" },
   "skill.grant": { type: "skill.grant", id: "r93", workdir: "/tmp/w", command: "./probe.sh", allowed: true },
+  "session.turns": { type: "session.turns", id: "r94", sessionId: "s1" },
   "settings.schema": { type: "settings.schema", id: "r29" },
   "settings.get": { type: "settings.get", id: "r30" },
   "settings.set": {
