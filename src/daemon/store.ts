@@ -478,6 +478,24 @@ export class Store {
       );
       CREATE INDEX IF NOT EXISTS idx_dispatch_events_pending
         ON dispatch_events(account_id, project_id, delivered_at);
+
+      -- Side-by-side comparisons (#357): one prompt sent to 2-4 forks of a
+      -- session, each on its own backend/model. targets is JSON
+      -- [{sessionId, providerId, model?, baseTurnId?, error?}].
+      CREATE TABLE IF NOT EXISTS compare_runs (
+        id                TEXT PRIMARY KEY,
+        account_id        TEXT NOT NULL,
+        project_id        TEXT NOT NULL,
+        parent_session_id TEXT NOT NULL,
+        after_turn_id     TEXT,
+        prompt            TEXT NOT NULL,
+        targets           TEXT NOT NULL,
+        kept_session_id   TEXT,
+        created_by        TEXT NOT NULL,
+        created_at        TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_compare_runs_parent
+        ON compare_runs(account_id, project_id, parent_session_id);
     `);
 
     // Per-child backend selection on spawn tasks. Additive so a database
@@ -894,6 +912,8 @@ export class Store {
 
   deleteSession(id: string): void {
     this.#db.prepare("DELETE FROM sessions WHERE id = ?").run(id);
+    // Its comparisons (#357) go with it — their prompts must not outlive it.
+    this.#db.prepare("DELETE FROM compare_runs WHERE parent_session_id = ?").run(id);
   }
 
   // ── Conductor identity ────────────────────────────────────────────────
@@ -1663,6 +1683,62 @@ export class Store {
 
   // ── Audit ─────────────────────────────────────────────────────────────
 
+  // ── Comparisons (#357) ────────────────────────────────────────────────
+
+  saveCompareRun(run: CompareRunRow): void {
+    this.#db
+      .prepare(
+        `INSERT INTO compare_runs (id, account_id, project_id, parent_session_id, after_turn_id, prompt, targets, kept_session_id, created_by, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET targets = excluded.targets,
+           kept_session_id = COALESCE(compare_runs.kept_session_id, excluded.kept_session_id)`,
+      )
+      .run(
+        run.id,
+        run.accountId,
+        run.projectId,
+        run.parentSessionId,
+        run.afterTurnId ?? null,
+        run.prompt,
+        JSON.stringify(run.targets),
+        run.keptSessionId ?? null,
+        run.createdBy,
+        run.createdAt,
+      );
+  }
+
+  /** A comparison, tenant-scoped (another tenant's id reads as absent). */
+  /**
+   * Update a comparison that already exists — never re-create one (its
+   * session may have been destroyed meanwhile, taking the record with it).
+   * A keep, once set, is never cleared.
+   */
+  updateCompareRun(run: CompareRunRow): void {
+    this.#db
+      .prepare(
+        `UPDATE compare_runs SET targets = ?, kept_session_id = COALESCE(kept_session_id, ?)
+         WHERE id = ? AND account_id = ? AND project_id = ?`,
+      )
+      .run(JSON.stringify(run.targets), run.keptSessionId ?? null, run.id, run.accountId, run.projectId);
+  }
+
+  getCompareRun(id: string, accountId: string, projectId: string): CompareRunRow | null {
+    const row = this.#db
+      .prepare("SELECT * FROM compare_runs WHERE id = ? AND account_id = ? AND project_id = ?")
+      .get(id, accountId, projectId) as Record<string, unknown> | null;
+    return row ? compareRowFrom(row) : null;
+  }
+
+  /** A session's comparisons, newest first. */
+  listCompareRuns(parentSessionId: string, accountId: string, projectId: string): CompareRunRow[] {
+    const rows = this.#db
+      .prepare(
+        "SELECT * FROM compare_runs WHERE parent_session_id = ? AND account_id = ? AND project_id = ? ORDER BY created_at DESC LIMIT 50",
+      )
+      .all(parentSessionId, accountId, projectId) as Array<Record<string, unknown>>;
+    return rows.map(compareRowFrom);
+  }
+
   audit(subject: string, action: string, sessionId?: string, detail?: string): void {
     // An audit write must NEVER crash the daemon. The session_id FK can fail
     // when the referenced session is no longer in the sessions table — e.g. a
@@ -1714,4 +1790,62 @@ function restrictToOwner(dbPath: string): void {
       console.warn(`[codeoid] store: could not restrict ${path} to its owner: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
+}
+
+/** What a comparison branch's turn did (#357), frozen when it settled. */
+export interface CompareBranchResult {
+  status: "idle" | "error";
+  error?: string;
+  reply?: string;
+  costUsd?: number;
+  durationMs?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  files?: { changed: number; insertions: number; deletions: number; paths: string[] };
+}
+
+/** One comparison (#357), as stored. */
+export interface CompareRunRow {
+  id: string;
+  accountId: string;
+  projectId: string;
+  parentSessionId: string;
+  afterTurnId?: string;
+  prompt: string;
+  targets: Array<{
+    sessionId?: string;
+    providerId: string;
+    model?: string;
+    /** The branch's compared turn, once its prompt started. */
+    baseTurnId?: string;
+    /** Why the branch failed to start. */
+    error?: string;
+    /** Frozen when the compared turn settled: what it did, never what came after. */
+    result?: CompareBranchResult;
+  }>;
+  keptSessionId?: string;
+  createdBy: string;
+  createdAt: string;
+}
+
+function compareRowFrom(row: Record<string, unknown>): CompareRunRow {
+  let targets: CompareRunRow["targets"] = [];
+  try {
+    const parsed = JSON.parse(String(row.targets));
+    if (Array.isArray(parsed)) targets = parsed;
+  } catch {
+    // corrupt row: no targets
+  }
+  return {
+    id: String(row.id),
+    accountId: String(row.account_id),
+    projectId: String(row.project_id),
+    parentSessionId: String(row.parent_session_id),
+    ...(row.after_turn_id ? { afterTurnId: String(row.after_turn_id) } : {}),
+    prompt: String(row.prompt),
+    targets,
+    ...(row.kept_session_id ? { keptSessionId: String(row.kept_session_id) } : {}),
+    createdBy: String(row.created_by),
+    createdAt: String(row.created_at),
+  };
 }

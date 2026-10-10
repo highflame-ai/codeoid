@@ -425,8 +425,14 @@ codeoid new <name> [workdir]                         # Create session
 codeoid attach <session>                             # Readline streaming attach
 codeoid send <session> <message...>                  # One-shot send
 codeoid interrupt <session>                          # Interrupt
-codeoid approve <session> [--deny]                   # Approve / deny pending tool
+codeoid approve <session> [--deny]                   # Show a pending tool call in full, confirm, approve / deny
+  --pick <n>  --yes                                  #   which one when several wait; skip the confirm
 codeoid destroy <session>                            # Destroy
+codeoid turns <session>                              # List turns, numbered (for --at N)
+codeoid fork <session> [--at N] [--backend id]       # Fork (after prompt N, with its files)
+codeoid undo <session> [files [yes|force]]           # Take back the last message
+codeoid compare run <session> --with claude,codex <prompt...>  # Same prompt on 2–4 backends, side by side
+codeoid compare show|ls|keep …                       #   results; keep one [--discard-others]
 ```
 
 ## Development

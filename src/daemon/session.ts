@@ -72,6 +72,7 @@ import {
   endSnapshotId,
   ignoredUnderTree,
   listCheckpoints,
+  numstatTrees,
   restoreTree,
 } from "./checkpoints.js";
 import { applyRewinds, REWIND_EVENT, type TurnIndexEntry } from "./transcript.js";
@@ -3010,7 +3011,7 @@ export class Session {
     });
   }
 
-  async destroy(sender: AuthContext): Promise<void> {
+  async destroy(sender: AuthContext, opts: { deleteBranch?: boolean } = {}): Promise<void> {
     this.#destroyed = true;
     // Cancel any pending debounced status persist — a write firing after the
     // deletes below would resurrect the meta file for a destroyed session,
@@ -3060,6 +3061,8 @@ export class Session {
         workdir: this.worktree.path,
         worktreePath: this.worktree.path,
         branch: this.worktree.branch,
+        // A session undone by the request that made it leaves no branch behind.
+        ...(opts.deleteBranch ? { deleteBranch: true } : {}),
       }).catch(() => {});
     }
   }
@@ -3353,6 +3356,16 @@ export class Session {
    */
   get packConstitution(): string | undefined {
     return this.#pack?.constitution;
+  }
+
+  /** The pack this session runs under, for a fork to carry (its role's tool deny included). */
+  get packActivation(): PackActivation | undefined {
+    return this.#pack;
+  }
+
+  /** The turn messages currently belong to (the latest, once it has ended). */
+  get currentTurnId(): string | null {
+    return this.#currentTurnId;
   }
 
   toInfo(): SessionInfo {
@@ -5704,6 +5717,35 @@ export class Session {
     // fork has its hand-edit baseline (instead of reporting false conflicts).
     if (opts.asEndOf) await this.#checkpointTurn(endSnapshotId(opts.asEndOf), 10_000, { onlyIfMissing: true, lateWhen: () => false });
     return result;
+  }
+
+  /**
+   * The agent's reply in turn `turnId` (#357), from the canonical history —
+   * only that turn's, never an earlier one. Undefined until the turn has
+   * ended with text.
+   */
+  turnReply(turnId: string): string | undefined {
+    const parts = this.#accumulator.history.filter((t) => t.turnId === turnId && t.role === "assistant" && t.content).map((t) => t.content);
+    return parts.length > 0 ? parts.join("\n\n") : undefined;
+  }
+
+  /**
+   * What turn `turnId` changed in the files (#357): its start snapshot →
+   * its end snapshot, once any snapshot still being written has landed.
+   * Undefined while it runs or when a snapshot is missing.
+   */
+  async turnFiles(turnId: string): Promise<{ changed: number; insertions: number; deletions: number; paths: string[] } | undefined> {
+    if (!this.#checkpointsEnabled()) return undefined;
+    await Promise.allSettled([...this.#pendingCheckpoints]);
+    const records = await this.#serializedCheckpointOp(() => listCheckpoints(this.#checkpointRoot, this.id));
+    const start = records.get(turnId);
+    const end = records.get(endSnapshotId(turnId));
+    if (!start || !end) return undefined;
+    try {
+      return await numstatTrees(this.#checkpointRoot, this.id, start.sha, end.sha);
+    } catch {
+      return undefined;
+    }
   }
 
   /** Post a notice about a fork's files (#356) into its scrollback. */

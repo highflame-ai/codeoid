@@ -12,6 +12,8 @@ import { PIPELINE_INPUT_REQUEST_PREFIX, PROTOCOL_VERSION } from "../protocol/typ
 import type {
   ClientMessage,
   CollaborationConfig,
+  CompareState,
+  CompareTargetSpec,
   DaemonMessage,
   PipelineWire,
   SessionInfo,
@@ -22,6 +24,7 @@ import { formatPackList, formatPackShow } from "./pack-format.js";
 import { formatPipeline, haltedRequestId } from "./pipeline-format.js";
 import { type PendingDialog, parseDialogAnswer } from "./dialog.js";
 import { formatRewind, parseUndoArgs } from "./rewind.js";
+import { awaitingApproval, compareSettled, formatCompare } from "./compare.js";
 
 // ── Stream rendering (pure, exported for tests) ───────────────────────────────
 
@@ -36,6 +39,13 @@ const RESET = "\x1b[0m";
 /** Strip terminal-control escapes from an untrusted field before it reaches
  *  the TTY (OSC 52 clipboard, cursor moves, DCS, etc. — see #91/#92). */
 const S = (s: string | undefined): string => sanitizeTerminalOutput(s ?? "");
+/** Stricter than S for text a decision rests on: no carriage returns, colours or links that could restyle or overwrite it. */
+const plainText = (s: string): string =>
+  S(s)
+    .replace(/\r/g, "")
+    .replace(/\x1b\[[0-9;:]*m/g, "")
+    .replace(/\x1b\]8;[^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+    .replace(/\x1b/g, "");
 
 /** Streaming/approval bookkeeping carried across messages by the attach loop. */
 export interface StreamRenderState {
@@ -727,6 +737,152 @@ export class TerminalClient {
     }
   }
 
+  /**
+   * `codeoid compare run` (#357): fork one branch per target, send each the
+   * prompt, and (unless `wait` is false) wait for all of them, then print them
+   * side by side, numbered for `compare keep`.
+   */
+  async compareRun(
+    sessionIdOrName: string,
+    targets: CompareTargetSpec[],
+    prompt: string,
+    opts: { at?: number; wait?: boolean },
+  ): Promise<void> {
+    const sessionId = await this.#resolveSession(sessionIdOrName);
+    if (!sessionId) return;
+    let afterTurnId: string | undefined;
+    if (opts.at !== undefined) {
+      const list = await this.#request({ type: "session.turns", id: randomUUID(), sessionId });
+      if (list.type !== "session.turns.result") {
+        this.#printError(list);
+        return;
+      }
+      const t = list.turns[opts.at - 1];
+      if (!t) {
+        console.log(`There is no prompt ${opts.at} (this session has ${list.turns.length}).`);
+        return;
+      }
+      afterTurnId = t.turnId;
+    }
+    const resp = await this.#request({
+      type: "session.compare",
+      id: randomUUID(),
+      sessionId,
+      prompt,
+      targets,
+      ...(afterTurnId ? { afterTurnId } : {}),
+    });
+    if (resp.type !== "compare.state") {
+      this.#printError(resp);
+      return;
+    }
+    let state = resp.compare;
+    if (opts.wait !== false) {
+      console.log(`Comparing on ${targets.length} backends — waiting for them to finish (Ctrl-C to stop waiting; they keep running)…`);
+      state = await this.#waitForCompare(state);
+    }
+    console.log(S(formatCompare(state)));
+    this.#printApprovalHints(state);
+    if (compareSettled(state) && awaitingApproval(state).length === 0) {
+      console.log(`\nKeep one: codeoid compare keep ${state.compareId.slice(0, 8)} <branch> [--discard-others]`);
+    } else {
+      console.log(`\nSee how they're doing: codeoid compare show ${state.compareId.slice(0, 8)} --wait`);
+    }
+  }
+
+  /** Branches can't go on until someone decides: say who and how. */
+  #printApprovalHints(state: CompareState): void {
+    const waiting = awaitingApproval(state);
+    if (waiting.length === 0) return;
+    console.log("");
+    for (const w of waiting) {
+      console.log(`[${w.branch}] ${S(w.name)} is waiting for your approval — see what it wants and decide: codeoid approve ${w.sessionId}  (or codeoid attach ${w.sessionId})`);
+    }
+  }
+
+  async #waitForCompare(state: CompareState): Promise<CompareState> {
+    let s = state;
+    while (!compareSettled(s)) {
+      await new Promise((r) => setTimeout(r, 2_000));
+      const next = await this.#request({ type: "compare.get", id: randomUUID(), compareId: s.compareId });
+      if (next.type !== "compare.state") break;
+      s = next.compare;
+    }
+    return s;
+  }
+
+  /** A comparison by id (or a unique id prefix among the session's, via `compare ls`). */
+  async #resolveCompare(idOrPrefix: string): Promise<CompareState | undefined> {
+    const direct = await this.#request({ type: "compare.get", id: randomUUID(), compareId: idOrPrefix });
+    if (direct.type === "compare.state") return direct.compare;
+    // A short prefix: look through the sessions' comparisons.
+    const sessions = await this.#request({ type: "session.list", id: randomUUID() });
+    if (sessions.type !== "session.list.result") {
+      this.#printError(direct);
+      return undefined;
+    }
+    const matches: CompareState[] = [];
+    for (const info of sessions.sessions) {
+      const list = await this.#request({ type: "compare.list", id: randomUUID(), sessionId: info.id });
+      if (list.type !== "compare.list.result") continue;
+      matches.push(...list.compares.filter((c) => c.compareId.startsWith(idOrPrefix)));
+    }
+    if (matches.length === 1) return matches[0];
+    console.log(matches.length === 0 ? `No comparison ${idOrPrefix}.` : `${idOrPrefix} matches ${matches.length} comparisons — give more of the id.`);
+    return undefined;
+  }
+
+  /** `codeoid compare show <id>` — a comparison's branches, side by side. */
+  async compareShow(idOrPrefix: string, opts: { wait?: boolean } = {}): Promise<void> {
+    let state = await this.#resolveCompare(idOrPrefix);
+    if (!state) return;
+    if (opts.wait) state = await this.#waitForCompare(state);
+    console.log(S(formatCompare(state)));
+    this.#printApprovalHints(state);
+  }
+
+  /** `codeoid compare ls <session>` — a session's comparisons, newest first. */
+  async compareList(sessionIdOrName: string): Promise<void> {
+    const sessionId = await this.#resolveSession(sessionIdOrName);
+    if (!sessionId) return;
+    const list = await this.#request({ type: "compare.list", id: randomUUID(), sessionId });
+    if (list.type !== "compare.list.result") {
+      this.#printError(list);
+      return;
+    }
+    if (list.compares.length === 0) console.log("No comparisons yet.");
+    for (const c of list.compares) {
+      const branches = c.targets.map((t) => `${t.providerId}${t.model ? `:${t.model}` : ""}${t.sessionId && t.sessionId === c.keptSessionId ? "★" : ""}`).join(" · ");
+      console.log(`${c.compareId.slice(0, 8)}  ${c.createdAt.slice(0, 16).replace("T", " ")}  ${S(branches)}  "${S(c.prompt.replace(/\s+/g, " ").slice(0, 60))}"`);
+    }
+  }
+
+  /** `codeoid compare keep <id> <branch> [--discard-others]`. */
+  async compareKeep(idOrPrefix: string, branch: number, discardOthers: boolean): Promise<void> {
+    const state = await this.#resolveCompare(idOrPrefix);
+    if (!state) return;
+    const target = state.targets[branch - 1];
+    if (!target?.sessionId) {
+      console.log(`Branch ${branch} isn't a session you can keep (this comparison has ${state.targets.length} branches).`);
+      return;
+    }
+    const resp = await this.#request({
+      type: "compare.keep",
+      id: randomUUID(),
+      compareId: state.compareId,
+      sessionId: target.sessionId,
+      ...(discardOthers ? { discardOthers: true } : {}),
+    });
+    if (resp.type !== "compare.state") {
+      this.#printError(resp);
+      return;
+    }
+    const left = resp.compare.targets.filter((t) => t.sessionId !== target.sessionId && t.sessionId && t.status !== "gone").length;
+    const others = !discardOthers ? "" : left === 0 ? "; the other branches were destroyed" : `; ${left} other branch(es) couldn't be destroyed`;
+    console.log(S(`Kept [${branch}] ${target.providerId}${target.model ? `:${target.model}` : ""} — session ${target.sessionId}${others}.`));
+    console.log(`Attach with: codeoid attach ${target.sessionId}`);
+  }
+
   /** `codeoid undo <session> [files [yes|force]]` — /undo without attaching. */
   async undoSession(sessionIdOrName: string, args: string[]): Promise<void> {
     const sessionId = await this.#resolveSession(sessionIdOrName);
@@ -752,7 +908,7 @@ export class TerminalClient {
     }
   }
 
-  async approveSession(sessionIdOrName: string, approved: boolean): Promise<void> {
+  async approveSession(sessionIdOrName: string, approved: boolean, opts: { pick?: number; yes?: boolean } = {}): Promise<void> {
     const sessionId = await this.#resolveSession(sessionIdOrName);
     if (!sessionId) return;
 
@@ -783,11 +939,42 @@ export class TerminalClient {
       return;
     }
 
+    // A tool approval is answered by its own id (the daemon never guesses
+    // "the first pending" — see Session#approve): read it off the session.
+    const all = await this.#pendingToolApprovals(sessionId);
+    if (all.length === 0) {
+      console.log("Nothing in that session is waiting for an approval.");
+      return;
+    }
+    const n = opts.pick ?? 1;
+    const pending = all[n - 1];
+    if (!pending) {
+      console.log(`There are ${all.length} waiting; pick one of 1–${all.length}.`);
+      return;
+    }
+    // Show exactly what would run — the full input, not just its key names —
+    // as plain text the agent can't restyle or overwrite.
+    if (all.length > 1) console.log(`${all.length} tool calls are waiting; this is [${n}] (pick another with --pick N):`);
+    console.log(`${plainText(pending.name)}`);
+    console.log(plainText(pending.input === undefined ? (pending.description ?? "") : JSON.stringify(pending.input, null, 2)).slice(0, 8_000));
+    if (approved && !opts.yes) {
+      if (!process.stdin.isTTY) {
+        console.log("Not approved: pass --yes to approve without a terminal to confirm in.");
+        return;
+      }
+      const rl = createInterface({ input: process.stdin, output: process.stdout });
+      const answer = await new Promise<string>((r) => rl.question("Approve this? [y/N] ", r));
+      rl.close();
+      if (!/^y(es)?$/i.test(answer.trim())) {
+        console.log("Not approved.");
+        return;
+      }
+    }
     const resp = await this.#request({
       type: "session.approve",
       id: randomUUID(),
       sessionId,
-      approvalId: "", // Will fall back to first pending
+      approvalId: pending.approvalId,
       approved,
     });
 
@@ -959,6 +1146,61 @@ export class TerminalClient {
     console.log(`${kind} sent — watch: codeoid pipeline status ${id}`);
   }
 
+  /**
+   * The oldest tool call still waiting for a decision in a session, from its
+   * scrollback (attach, read the replay, detach) — what an attached client
+   * would show as the question.
+   */
+  async #pendingToolApprovals(sessionId: string): Promise<Array<{ approvalId: string; name: string; description?: string; input?: unknown }>> {
+    type Row = {
+      type?: string;
+      role?: string;
+      messageId?: string;
+      content?: string;
+      tool?: { name?: string; input?: unknown; state?: { phase?: string; approvalId?: string; description?: string; input?: unknown } };
+    };
+    const rows: Row[] = [];
+    let done!: () => void;
+    const replayed = new Promise<void>((r) => {
+      done = r;
+    });
+    const prev = this.#streamHandler;
+    this.#streamHandler = (msg) => {
+      const m = msg as { type: string; sessionId?: string; messages?: Row[]; seq?: number; final?: boolean };
+      if (m.type !== "scrollback.replay" || m.sessionId !== sessionId) return;
+      rows.push(...(m.messages ?? []));
+      if (m.seq === undefined || m.final) done();
+    };
+    try {
+      const attached = await this.#request({ type: "session.attach", id: randomUUID(), sessionId });
+      if (attached.type === "response.error") {
+        this.#printError(attached);
+        return [];
+      }
+      await Promise.race([replayed, new Promise((r) => setTimeout(r, 3_000))]);
+    } finally {
+      this.#streamHandler = prev;
+      await this.#request({ type: "session.detach", id: randomUUID(), sessionId }).catch(() => undefined);
+    }
+    // Latest state per tool call; those still waiting, oldest first.
+    const latest = new Map<string, Row>();
+    for (const r of rows) if (r.role === "tool_call" && r.messageId) latest.set(r.messageId, r);
+    const out: Array<{ approvalId: string; name: string; description?: string; input?: unknown }> = [];
+    for (const r of latest.values()) {
+      const st = r.tool?.state;
+      if (st?.phase === "waiting_confirmation" && st.approvalId) {
+        const input = st.input ?? r.tool?.input;
+        out.push({
+          approvalId: st.approvalId,
+          name: r.tool?.name ?? r.content ?? "tool",
+          ...(st.description ? { description: st.description } : {}),
+          ...(input !== undefined ? { input } : {}),
+        });
+      }
+    }
+    return out;
+  }
+
   #request(msg: ClientMessage): Promise<DaemonMessage> {
     return new Promise((resolve, reject) => {
       if (!this.#ws || this.#ws.readyState !== WebSocket.OPEN) {
@@ -1062,7 +1304,8 @@ export class TerminalClient {
 
   #printError(resp: DaemonMessage): void {
     if (resp.type === "response.error") {
-      console.error(`Error: ${resp.error} (${resp.code})`);
+      // Errors can quote client- or agent-supplied text (names, model ids).
+      console.error(`Error: ${S(resp.error)} (${resp.code})`);
     }
   }
 }

@@ -560,6 +560,39 @@ export const sessionRewindSchema = z.object({
   planId: z.string().min(1).max(64).optional(),
 });
 
+export const sessionCompareSchema = z.object({
+  ...base,
+  type: z.literal("session.compare"),
+  sessionId: sessionIdField,
+  prompt: z.string().min(1).max(LIMITS.SEND_TEXT_MAX),
+  targets: z
+    .array(
+      z.object({
+        providerId: z.string().regex(/^[a-z0-9][a-z0-9_-]*$/i).max(64),
+        // A model id, never a flag or control text (it reaches CLI argv and terminals).
+        model: z
+          .string()
+          .regex(/^[\w.:/@+][\w.:/@+-]*$/)
+          .refine((m) => !m.includes(".."), "not a model id")
+          .max(200)
+          .optional(),
+      }),
+    )
+    .min(2)
+    .max(4),
+  afterTurnId: z.string().min(1).max(128).optional(),
+});
+
+export const compareGetSchema = z.object({ ...base, type: z.literal("compare.get"), compareId: z.string().min(1).max(128) });
+export const compareListSchema = z.object({ ...base, type: z.literal("compare.list"), sessionId: sessionIdField });
+export const compareKeepSchema = z.object({
+  ...base,
+  type: z.literal("compare.keep"),
+  compareId: z.string().min(1).max(128),
+  sessionId: sessionIdField,
+  discardOthers: z.boolean().optional(),
+});
+
 export const skillGrantSchema = z.object({
   ...base,
   type: z.literal("skill.grant"),
@@ -785,6 +818,10 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   skillGrantSchema,
   sessionTurnsSchema,
   sessionRewindSchema,
+  sessionCompareSchema,
+  compareGetSchema,
+  compareListSchema,
+  compareKeepSchema,
   mcpOAuthBeginSchema,
   mcpOAuthCompleteSchema,
   mcpOAuthDisconnectSchema,

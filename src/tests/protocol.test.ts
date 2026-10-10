@@ -462,6 +462,10 @@ describe("DaemonMessage routing", () => {
           return `turns:${msg.turns.length}`;
         case "session.rewind.result":
           return `rewind:${msg.removedTurns}`;
+        case "compare.state":
+          return `compare:${msg.compare.targets.length}`;
+        case "compare.list.result":
+          return `compares:${msg.compares.length}`;
         case "mcp.oauth.begin.result":
           return `mcp.oauth.begin:${msg.status}`;
         case "mcp.oauth.complete.result":

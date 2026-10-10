@@ -35,6 +35,7 @@ import type { ClientMessage, SessionInfo, SessionMode } from "../protocol/types"
 import { openBlackboard } from "../state/blackboard";
 import { openExportModal } from "./SessionExportModal";
 import { openUndoLast } from "./RewindModal";
+import { openCompare } from "./CompareModal";
 
 const MODE_OPTIONS: { value: SessionMode; label: string; hint: string }[] = [
   { value: "guarded", label: "guarded", hint: "Read/Grep/Glob auto; Write/Edit/Bash ask (default)" },
@@ -96,6 +97,14 @@ const SessionControls: Component = () => {
           <InterruptButton sessionId={s().id} status={s().status} />
           <Show when={!s().role}>
             <UndoButton sessionId={s().id} />
+            <button
+              type="button"
+              onClick={() => openCompare(s().id)}
+              class="rounded border border-border px-2 py-1 font-mono uppercase tracking-wider text-fg-muted transition hover:border-accent/40 hover:bg-accent/5 hover:text-fg"
+              title="Send one prompt to several backends side by side, then keep the best"
+            >
+              ⚖ compare
+            </button>
           </Show>
           <RotateButton sessionId={s().id} />
           <ModePicker sessionId={s().id} current={effectiveMode(s())} />
