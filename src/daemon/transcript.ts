@@ -771,7 +771,8 @@ export class TranscriptStore {
       }
     }
 
-    return order.map((key) => byMessageId.get(key)!);
+    // "Went back a turn" (#355): hide what was taken back.
+    return applyRewinds(order.map((key) => byMessageId.get(key)!));
   }
 
   /**
@@ -803,6 +804,42 @@ export class TranscriptStore {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
+
+/** metadata.event of the durable marker a rewind appends (#355). */
+export const REWIND_EVENT = "session.rewound";
+
+/**
+ * Apply rewind markers to transcript rows (#355). A marker hides every row
+ * from the first row it took back (`metadata.fromMessageId`, the prompt that
+ * started the turn) up to the marker — positional, so notices between turns
+ * that came after it go too: exactly what the person saw being taken back.
+ * The marker stays, as the visible "went back" notice.
+ *
+ * When that row isn't among `rows` (older than a bounded read, or in a
+ * rotated-away segment), fall back to hiding the rows stamped with a removed
+ * turn id (`metadata.removedTurnIds`) — never guess by position.
+ */
+export function applyRewinds<T extends { message: DaemonMessage }>(rows: T[]): T[] {
+  let out: T[] = [];
+  for (const row of rows) {
+    const m = row.message as Partial<SessionMessage>;
+    if (m.type === "session.message" && m.metadata?.event === REWIND_EVENT) {
+      const from = m.metadata.fromMessageId;
+      const at = typeof from === "string" ? out.findIndex((r) => (r.message as Partial<SessionMessage>).messageId === from) : -1;
+      if (at !== -1) {
+        out.length = at;
+      } else {
+        const removed = new Set(Array.isArray(m.metadata.removedTurnIds) ? (m.metadata.removedTurnIds as string[]) : []);
+        out = out.filter((r) => {
+          const id = (r.message as Partial<SessionMessage>).turnId;
+          return !(id && removed.has(id));
+        });
+      }
+    }
+    out.push(row);
+  }
+  return out;
+}
 
 /**
  * Stream a file's lines without materialising the whole file. With

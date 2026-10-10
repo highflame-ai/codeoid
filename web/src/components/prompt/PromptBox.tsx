@@ -160,11 +160,19 @@ const PromptBox: Component = () => {
       if (detail?.hint) setTransientPlaceholder(detail.hint);
       requestAnimationFrame(() => textareaRef?.focus());
     };
+    // A draft written from elsewhere (going back a turn puts the taken-back
+    // prompt here) — re-read it when it's for the session on screen.
+    const onDraftChanged = (e: Event) => {
+      const detail = (e as CustomEvent<{ sessionId?: string }>).detail;
+      if (detail?.sessionId === draftKey()) hydrate();
+    };
     window.addEventListener("codeoid:focus-prompt", onFocus);
     window.addEventListener("codeoid:focus-prompt-with-hint", onFocusWithHint);
+    window.addEventListener("codeoid:prompt-draft-changed", onDraftChanged);
     onCleanup(() => {
       window.removeEventListener("codeoid:focus-prompt", onFocus);
       window.removeEventListener("codeoid:focus-prompt-with-hint", onFocusWithHint);
+      window.removeEventListener("codeoid:prompt-draft-changed", onDraftChanged);
     });
   });
 

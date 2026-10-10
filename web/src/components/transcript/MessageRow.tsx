@@ -29,6 +29,7 @@ import type {
 } from "../../protocol/types";
 import { EditDiff, WriteFile, isEditInput, isWriteInput } from "./EditDiff";
 import PartsView, { hasRichParts } from "./PartsView";
+import { openRewind } from "../RewindModal";
 
 const ROLE_LABEL: Record<MessageRole, string> = {
   user: "you",
@@ -79,7 +80,17 @@ const Header: Component<{ msg: SessionMessage }> = (props) => (
     >
       {identityLabel(props.msg.identity)}
     </span>
-    <span class="ml-auto font-mono text-fg-faint">
+    <Show when={props.msg.role === "user" && props.msg.turnId}>
+      <button
+        type="button"
+        class="ml-auto hidden rounded border border-border px-1.5 font-mono text-[10px] text-fg-faint hover:border-accent/40 hover:text-fg group-hover:inline-block"
+        title="Go back to before this message: take it (and everything after it) back, optionally restoring the files"
+        onClick={() => openRewind(props.msg.sessionId, props.msg.turnId!)}
+      >
+        ↩ go back to here
+      </button>
+    </Show>
+    <span class={`${props.msg.role === "user" && props.msg.turnId ? "" : "ml-auto "}font-mono text-fg-faint`}>
       {formatClock(props.msg.timestamp)}
     </span>
   </header>

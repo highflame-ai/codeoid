@@ -20,6 +20,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: "/switch", description: "Switch to another session (alias for Ctrl-G)" },
   { name: "/destroy", description: "Destroy the focused session" },
   { name: "/interrupt", description: "Interrupt the focused session" },
+  { name: "/undo", description: "Take back the last message (the agent forgets it); /undo files [yes|force] also restores the files" },
   { name: "/mode", description: "Cycle session mode (interactive/guarded/autonomous)" },
   { name: "/pin", description: "Pin a file to the session (prepended every turn)" },
   { name: "/unpin", description: "Unpin a previously-pinned file" },

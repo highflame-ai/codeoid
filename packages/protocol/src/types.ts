@@ -32,7 +32,7 @@ import type {
   BackendLoginCancelResultMsg,
 } from "./backend-login.js";
 import type { SkillGrantMsg, SkillGrantResultMsg } from "./skill-grant.js";
-import type { SessionTurnsMsg, SessionTurnsResultMsg } from "./turns.js";
+import type { SessionRewindMsg, SessionRewindResultMsg, SessionTurnsMsg, SessionTurnsResultMsg } from "./turns.js";
 import type {
   McpOAuthBeginMsg,
   McpOAuthCompleteMsg,
@@ -1025,6 +1025,7 @@ export type ClientMessage =
   | BackendLoginCancelMsg
   | SkillGrantMsg
   | SessionTurnsMsg
+  | SessionRewindMsg
   | McpOAuthBeginMsg
   | McpOAuthCompleteMsg
   | McpOAuthDisconnectMsg
@@ -2583,6 +2584,7 @@ export type DaemonMessage =
   | BackendLoginCancelResultMsg
   | SkillGrantResultMsg
   | SessionTurnsResultMsg
+  | SessionRewindResultMsg
   | McpOAuthBeginResultMsg
   | McpOAuthCompleteResultMsg
   | McpOAuthDisconnectResultMsg

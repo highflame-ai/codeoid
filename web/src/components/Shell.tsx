@@ -29,6 +29,7 @@ import PipelineRunner from "./PipelineRunner";
 import ResizeHandle from "./ResizeHandle";
 import SearchModal from "./SearchModal";
 import SessionExportModal from "./SessionExportModal";
+import RewindModal from "./RewindModal";
 import SessionImportModal from "./SessionImportModal";
 import SessionListPane from "./SessionListPane";
 import SettingsDrawer from "./SettingsDrawer";
@@ -63,6 +64,7 @@ const Shell: Component = () => {
       <CapabilitiesDrawer />
       <BlackboardDrawer />
       <SessionExportModal />
+      <RewindModal />
       <SessionImportModal />
       <SettingsDrawer />
       <PackBrowser />

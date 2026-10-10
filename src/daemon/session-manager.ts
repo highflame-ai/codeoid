@@ -11,7 +11,7 @@
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, sep } from "node:path";
-import { SendStoppedError, Session, type AttachedClient, type WindowScope } from "./session.js";
+import { RewindError, SendStoppedError, Session, type AttachedClient, type WindowScope } from "./session.js";
 import { sweepCheckpoints } from "./checkpoints.js";
 import { type CatalogEntry, isPlaceholderModel, type SessionProvider } from "./providers/interface.js";
 import {
@@ -1123,6 +1123,8 @@ mcpHub: this.#mcpHub,
         return this.#backendLoginCancel(msg, auth);
       case "session.turns":
         return this.#sessionTurns(msg, auth);
+      case "session.rewind":
+        return this.#sessionRewind(msg, auth);
       case "skill.grant":
         return this.#skillGrant(msg, auth);
       case "mcp.oauth.begin":
@@ -5256,6 +5258,57 @@ mcpHub: this.#mcpHub,
     }
     const { turns, checkpointsSupported } = await session.turns();
     return { type: "session.turns.result", requestId: msg.id, sessionId: session.id, turns, checkpointsSupported };
+  }
+
+  /**
+   * Go back a turn (#355). Same authority as sending a message: taking a
+   * turn back is a way of steering the session, and restoring files only
+   * puts back what the session's own snapshots hold.
+   */
+  async #sessionRewind(
+    msg: Extract<ClientMessage, { type: "session.rewind" }>,
+    auth: AuthContext,
+  ): Promise<DaemonMessage> {
+    if (!hasScope(auth.scopes as string[], SCOPES.SESSION_SEND)) {
+      return { type: "response.error", requestId: msg.id, error: "Missing scope: session:send", code: "forbidden" };
+    }
+    const session = this.#getOwnedSession(msg.sessionId, auth);
+    if (!session) {
+      return { type: "response.error", requestId: msg.id, error: "Session not found", code: "not_found" };
+    }
+    if (session.role) {
+      return { type: "response.error", requestId: msg.id, error: `Cannot go back a turn in a ${session.role} session`, code: "invalid_request" };
+    }
+    try {
+      const r = await session.rewind(
+        msg.turnId,
+        { restoreFiles: msg.restoreFiles === true, dryRun: msg.dryRun === true, force: msg.force === true },
+        auth,
+      );
+      return {
+        type: "session.rewind.result",
+        requestId: msg.id,
+        sessionId: session.id,
+        turnId: msg.turnId,
+        dryRun: msg.dryRun === true || r.refused !== undefined,
+        removedTurns: r.removedTurnIds.length,
+        restoredPrompt: r.restoredPrompt,
+        irreversible: r.irreversible,
+        ...(r.files ? { files: r.files } : {}),
+        ...(r.filesUnavailable ? { filesUnavailable: r.filesUnavailable } : {}),
+        ...(r.refused ? { refused: r.refused } : {}),
+      };
+    } catch (err) {
+      if (err instanceof RewindError) {
+        return {
+          type: "response.error",
+          requestId: msg.id,
+          error: err.message,
+          code: err.code === "busy" ? "invalid_request" : "not_found",
+        };
+      }
+      throw err;
+    }
   }
 
   /** History paging (`scrollback.paging`) — same read authority as attach. */

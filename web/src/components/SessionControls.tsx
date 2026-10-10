@@ -34,6 +34,7 @@ import { CAPABILITIES } from "../protocol/types";
 import type { ClientMessage, SessionInfo, SessionMode } from "../protocol/types";
 import { openBlackboard } from "../state/blackboard";
 import { openExportModal } from "./SessionExportModal";
+import { openUndoLast } from "./RewindModal";
 
 const MODE_OPTIONS: { value: SessionMode; label: string; hint: string }[] = [
   { value: "guarded", label: "guarded", hint: "Read/Grep/Glob auto; Write/Edit/Bash ask (default)" },
@@ -93,6 +94,9 @@ const SessionControls: Component = () => {
           <WorktreeChip worktree={s().worktree} />
           <BlackboardButton session={s()} />
           <InterruptButton sessionId={s().id} status={s().status} />
+          <Show when={!s().role}>
+            <UndoButton sessionId={s().id} />
+          </Show>
           <RotateButton sessionId={s().id} />
           <ModePicker sessionId={s().id} current={effectiveMode(s())} />
           <ModelPicker
@@ -236,6 +240,31 @@ const ExportButton: Component = () => (
     ⤓ export
   </button>
 );
+
+/**
+ * Undo the last message (#355): opens the go-back dialog for the session's
+ * latest turn, which previews what would be taken back before doing it.
+ */
+const UndoButton: Component<{ sessionId: string }> = (props) => {
+  const [note, setNote] = createSignal<string | null>(null);
+  return (
+    <button
+      type="button"
+      onClick={() => {
+        setNote(null);
+        openUndoLast(props.sessionId)
+          .then((ok) => {
+            if (!ok) setNote("nothing to undo");
+          })
+          .catch((e) => setNote(e instanceof Error ? e.message : String(e)));
+      }}
+      class="rounded border border-border px-2 py-1 font-mono uppercase tracking-wider text-fg-muted transition hover:border-accent/40 hover:bg-accent/5 hover:text-fg"
+      title={note() ?? "Undo the last message: take it back (the agent forgets it) and put it back in the composer"}
+    >
+      ↩ undo
+    </button>
+  );
+};
 
 const RotateButton: Component<{ sessionId: string }> = (props) => {
   const act = createAction();

@@ -20,6 +20,7 @@ import {
 } from "./workspace-commands.js";
 import type { Attachment } from "../protocol/types.js";
 import { parseDialogAnswer } from "../terminal/dialog.js";
+import { formatRewind, parseUndoArgs } from "../terminal/rewind.js";
 import { dialogDetail, dialogHint } from "./dialog-hint.js";
 import type { CodeoidConfig } from "../config.js";
 import { findModel } from "../daemon/models.js";
@@ -703,6 +704,23 @@ export function App({ config }: Props) {
     });
   };
 
+  /** A local, never-sent notice in the session's scrollback. */
+  const printLocalInfo = (sessionId: string, content: string) => {
+    dispatch({
+      type: "session.message",
+      sessionId,
+      message: {
+        type: "session.message",
+        sessionId,
+        messageId: `local:info:${Date.now()}:${Math.random()}`,
+        role: "info",
+        content,
+        identity: { sub: "system:codeoid", name: "codeoid", type: "system" },
+        timestamp: new Date().toISOString(),
+      },
+    });
+  };
+
   const printWhoLocalMessage = (session: import("./types.js").TuiSession) => {
     const info = session.info;
     const lines: string[] = [];
@@ -848,6 +866,32 @@ export function App({ config }: Props) {
           .catch((err: Error) =>
             dispatch({ type: "error", message: err.message }),
           );
+        return;
+      }
+      case "/undo": {
+        // Go back a turn (#355) — see src/terminal/rewind.ts for the grammar.
+        if (!client || !focusedSession) return;
+        const req = parseUndoArgs(args);
+        if ("error" in req) {
+          dispatch({ type: "error", message: req.error });
+          return;
+        }
+        const sessionId = focusedSession.info.id;
+        void (async () => {
+          const list = await client.turns(sessionId);
+          if (list.type !== "session.turns.result") throw new Error("could not list turns");
+          const last = list.turns.at(-1);
+          if (!last) throw new Error("nothing to undo");
+          const res = await client.rewind(sessionId, last.turnId, req);
+          if (res.type !== "session.rewind.result") {
+            throw new Error(res.type === "response.error" ? res.error : "undo failed");
+          }
+          printLocalInfo(sessionId, formatRewind(res));
+          if (!res.dryRun && !res.refused && res.restoredPrompt) {
+            dispatch({ type: "input.set", value: res.restoredPrompt });
+            dispatch({ type: "cursor.set", position: res.restoredPrompt.length });
+          }
+        })().catch((err: Error) => dispatch({ type: "error", message: err.message }));
         return;
       }
       case "/rotate": {

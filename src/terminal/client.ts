@@ -21,6 +21,7 @@ import { sanitizeTerminalOutput } from "../tui/ansi/codes.js";
 import { formatPackList, formatPackShow } from "./pack-format.js";
 import { formatPipeline, haltedRequestId } from "./pipeline-format.js";
 import { type PendingDialog, parseDialogAnswer } from "./dialog.js";
+import { formatRewind, parseUndoArgs } from "./rewind.js";
 
 // ── Stream rendering (pure, exported for tests) ───────────────────────────────
 
@@ -496,6 +497,14 @@ export class TerminalClient {
         continue;
       }
 
+      // Go back a turn (#355): the taken-back message comes back to the
+      // prompt line, to edit and resend.
+      if (trimmed === "/undo" || trimmed.startsWith("/undo ")) {
+        const restored = await this.#undo(sessionId, trimmed.split(/\s+/).slice(1));
+        if (restored) rl.write(restored);
+        continue;
+      }
+
       // A tool approval printed after the question is what a yes/no answers;
       // then the question is shown again.
       const toolPromptLast = renderState.lastPrompt === "tool" && renderState.latestApprovalId;
@@ -573,6 +582,51 @@ export class TerminalClient {
     } else {
       this.#printError(resp);
     }
+  }
+
+  /**
+   * Go back a turn (#355) and print what happened. Returns the taken-back
+   * prompt when it was really taken back (not a preview or a refusal).
+   */
+  async #undo(sessionId: string, args: string[]): Promise<string | null> {
+    const req = parseUndoArgs(args);
+    if ("error" in req) {
+      console.log(req.error);
+      return null;
+    }
+    const list = await this.#request({ type: "session.turns", id: randomUUID(), sessionId });
+    if (list.type !== "session.turns.result") {
+      this.#printError(list);
+      return null;
+    }
+    const last = list.turns.at(-1);
+    if (!last) {
+      console.log("Nothing to undo.");
+      return null;
+    }
+    const res = await this.#request({
+      type: "session.rewind",
+      id: randomUUID(),
+      sessionId,
+      turnId: last.turnId,
+      ...(req.restoreFiles ? { restoreFiles: true } : {}),
+      ...(req.dryRun ? { dryRun: true } : {}),
+      ...(req.force ? { force: true } : {}),
+    });
+    if (res.type !== "session.rewind.result") {
+      this.#printError(res);
+      return null;
+    }
+    console.log(S(formatRewind(res)));
+    return !res.dryRun && !res.refused ? res.restoredPrompt : null;
+  }
+
+  /** `codeoid undo <session> [files [yes|force]]` — /undo without attaching. */
+  async undoSession(sessionIdOrName: string, args: string[]): Promise<void> {
+    const sessionId = await this.#resolveSession(sessionIdOrName);
+    if (!sessionId) return;
+    const restored = await this.#undo(sessionId, args);
+    if (restored) console.log(`\nThe message that was taken back:\n${S(restored)}`);
   }
 
   async interruptSession(sessionIdOrName: string): Promise<void> {
