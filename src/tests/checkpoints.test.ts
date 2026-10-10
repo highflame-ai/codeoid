@@ -33,10 +33,13 @@ let root: string;
 
 const git = (...args: string[]): string =>
   execFileSync("git", args, { cwd: repo, encoding: "utf8", env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } });
+/** The test's own git calls: never influenced by GIT_* a test sets on process.env. */
+const cleanEnv = (): NodeJS.ProcessEnv =>
+  Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith("GIT_")));
 const show = (session: string, sha: string, file: string): string =>
-  execFileSync("git", ["--git-dir", shadowRepoPath(root, session), "show", `${sha}:${file}`], { encoding: "utf8" });
+  execFileSync("git", ["--git-dir", shadowRepoPath(root, session), "show", `${sha}:${file}`], { encoding: "utf8", env: cleanEnv() });
 const treeFiles = (session: string, sha: string): string[] =>
-  execFileSync("git", ["--git-dir", shadowRepoPath(root, session), "ls-tree", "-r", "--name-only", sha], { encoding: "utf8" })
+  execFileSync("git", ["--git-dir", shadowRepoPath(root, session), "ls-tree", "-r", "--name-only", sha], { encoding: "utf8", env: cleanEnv() })
     .trim()
     .split("\n")
     .filter(Boolean);
@@ -253,8 +256,8 @@ describe("createCheckpoint", () => {
         else process.env[k] = v;
       }
     }
-    expect(execFileSync("git", ["--git-dir", decoy, "for-each-ref"], { encoding: "utf8" })).toBe("");
-    expect(execFileSync("git", ["--git-dir", decoy, "count-objects"], { encoding: "utf8" })).toStartWith("0 objects");
+    expect(execFileSync("git", ["--git-dir", decoy, "for-each-ref"], { encoding: "utf8", env: cleanEnv() })).toBe("");
+    expect(execFileSync("git", ["--git-dir", decoy, "count-objects"], { encoding: "utf8", env: cleanEnv() })).toStartWith("0 objects");
   });
 
   it("skips (with a reason) when the first snapshot, or a later one's new files, exceed the limits", async () => {
