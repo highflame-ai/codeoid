@@ -35,6 +35,7 @@ import { GeminiAcpProvider } from "./acp/index.js";
 import { GEMINI_CLI_INSTALL_HINT, resolveGeminiCliCommand } from "./acp/resolve.js";
 import { QwenProvider } from "./qwen/index.js";
 import { StatelessSessionProvider } from "./stateless.js";
+import { LLAMACPP_DISPLAY_NAME, LLAMACPP_PROVIDER_ID, createLlamaCppProvider } from "./llamacpp/index.js";
 
 /**
  * Everything a factory may need to construct a provider for ONE session.
@@ -196,6 +197,7 @@ const ENABLE_KEY: Record<string, string> = {
   codex: "codex",
   "gemini-cli": "geminiCli",
   qwen: "qwen",
+  llamacpp: "llamacpp",
 };
 
 /**
@@ -291,6 +293,30 @@ export function createDefaultProviderRegistry(
       "openai",
       "OPENAI_API_KEY is not set — add it to ~/.codeoid/.env to use the OpenAI backend",
     );
+  }
+  // A local OpenAI-compatible server (llama.cpp's `llama-server`) — a
+  // distinct id from "openai" so it runs alongside a cloud gateway there
+  // instead of replacing it. Opt-in: there's no startup-time way to tell
+  // whether something is actually listening at `baseUrl`.
+  const llamacpp = config?.providers?.llamacpp;
+  if (llamacpp?.enabled) {
+    registry.register({
+      id: LLAMACPP_PROVIDER_ID,
+      displayName: LLAMACPP_DISPLAY_NAME,
+      create: (init) =>
+        new StatelessSessionProvider(
+          createLlamaCppProvider(llamacpp, {
+            defaultModel: init.model ?? undefined,
+            memory: init.memory,
+            workspaceId: init.workspaceId,
+            tenant: init.tenant,
+            sessionId: init.sessionId,
+            mcpRegistry: init.mcpRegistry,
+            mcpHub: init.mcpHub,
+          }),
+          init.sessionId,
+        ),
+    });
   }
   if (config?.providers?.pi?.enabled !== false) {
     // Resolve once at startup: explicit config command → system PATH →
