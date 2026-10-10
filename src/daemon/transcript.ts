@@ -165,6 +165,12 @@ export interface TranscriptMeta {
   role?: "conductor" | "worker";
   /** Provider id backing the session; absent = claude (pre-upgrade metas). */
   providerId?: string;
+  /**
+   * The backend was reset (a rewind) and has not run a turn since, so it
+   * holds no conversation: on resume, re-seed it from the canonical history
+   * instead of resuming an empty backing session (#355).
+   */
+  backingFresh?: boolean;
   /** Fork lineage (session.fork). Absent = not a fork. */
   forkedFrom?: { sessionId: string; name: string; atTurn: number };
   /** Git worktree backing workdir (fork isolation / bind). Absent = shared. */
@@ -771,7 +777,8 @@ export class TranscriptStore {
       }
     }
 
-    return order.map((key) => byMessageId.get(key)!);
+    // "Went back a turn" (#355): hide what was taken back.
+    return applyRewinds(order.map((key) => byMessageId.get(key)!));
   }
 
   /**
@@ -803,6 +810,43 @@ export class TranscriptStore {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
+
+/** metadata.event of the durable marker a rewind appends (#355). */
+export const REWIND_EVENT = "session.rewound";
+
+/**
+ * Apply rewind markers to transcript rows (#355). A marker hides every row
+ * from the first row it took back (`metadata.fromMessageId`, the prompt that
+ * started the turn) up to the marker — positional, so notices between turns
+ * that came after it go too: exactly what the person saw being taken back.
+ * The marker stays, as the visible "went back" notice.
+ *
+ * When that row isn't among `rows` (older than a bounded read, or in a
+ * rotated-away segment), fall back to hiding the rows stamped with a removed
+ * turn id (`metadata.removedTurnIds`) — never guess by position.
+ */
+export function applyRewinds<T extends { message: DaemonMessage }>(rows: T[]): T[] {
+  let out: T[] = [];
+  for (const row of rows) {
+    const m = row.message as Partial<SessionMessage>;
+    // Only codeoid's own notice counts — never a row some other identity wrote.
+    if (m.type === "session.message" && m.metadata?.event === REWIND_EVENT && m.identity?.sub === "system:codeoid") {
+      const from = m.metadata.fromMessageId;
+      const at = typeof from === "string" ? out.findIndex((r) => (r.message as Partial<SessionMessage>).messageId === from) : -1;
+      if (at !== -1) {
+        out.length = at;
+      } else {
+        const removed = new Set(Array.isArray(m.metadata.removedTurnIds) ? (m.metadata.removedTurnIds as string[]) : []);
+        out = out.filter((r) => {
+          const id = (r.message as Partial<SessionMessage>).turnId;
+          return !(id && removed.has(id));
+        });
+      }
+    }
+    out.push(row);
+  }
+  return out;
+}
 
 /**
  * Stream a file's lines without materialising the whole file. With

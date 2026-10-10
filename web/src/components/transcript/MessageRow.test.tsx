@@ -1,7 +1,10 @@
 // @vitest-environment jsdom
 import { describe, it, expect, afterEach, vi } from "vitest";
-import { render, cleanup } from "@solidjs/testing-library";
+import { render, cleanup, fireEvent } from "@solidjs/testing-library";
 import { createSignal } from "solid-js";
+
+const openRewindMock = vi.hoisted(() => vi.fn());
+vi.mock("../RewindModal", () => ({ openRewind: openRewindMock }));
 
 import MessageRow from "./MessageRow";
 import { REASONING_UNAVAILABLE } from "../../protocol/types";
@@ -140,5 +143,33 @@ describe("background wake", () => {
     const { container } = render(() => <MessageRow msg={own} />);
     expect(container.querySelector("header")!.textContent).toContain("you");
     expect(container.querySelector("details")).toBeNull();
+  });
+});
+
+describe("go back to here (#355)", () => {
+  const userMsg = (turnId?: string): SessionMessage =>
+    ({
+      type: "session.message",
+      sessionId: "s",
+      messageId: "u1",
+      role: "user",
+      content: "hello",
+      identity: { sub: "u", type: "human" },
+      timestamp: "2026-05-04T08:00:00Z",
+      ...(turnId ? { turnId } : {}),
+    }) as unknown as SessionMessage;
+
+  it("a prompt with a turn id offers going back to before it", () => {
+    const r = render(() => <MessageRow msg={userMsg("T1")} />);
+    fireEvent.click(r.getByText(/go back to here/));
+    expect(openRewindMock).toHaveBeenCalledWith("s", "T1");
+  });
+
+  it("is absent on prompts from before turn ids, and on non-prompts", () => {
+    const r = render(() => <MessageRow msg={userMsg()} />);
+    expect(r.queryByText(/go back to here/)).toBeNull();
+    cleanup();
+    const t = render(() => <MessageRow msg={thinkingMsg("x")} />);
+    expect(t.queryByText(/go back to here/)).toBeNull();
   });
 });

@@ -20,6 +20,8 @@ import {
 } from "./workspace-commands.js";
 import type { Attachment } from "../protocol/types.js";
 import { parseDialogAnswer } from "../terminal/dialog.js";
+import { formatRewind, parseUndoArgs } from "../terminal/rewind.js";
+import { sanitizeTerminalOutput } from "./ansi/codes.js";
 import { dialogDetail, dialogHint } from "./dialog-hint.js";
 import type { CodeoidConfig } from "../config.js";
 import { findModel } from "../daemon/models.js";
@@ -703,6 +705,26 @@ export function App({ config }: Props) {
     });
   };
 
+  /** The last `/undo files` preview, confirmed by `/undo files yes|force` (#355). */
+  const undoPreviewRef = useRef<{ sessionId: string; turnId: string; planId: string } | null>(null);
+
+  /** A local, never-sent notice in the session's scrollback. */
+  const printLocalInfo = (sessionId: string, content: string) => {
+    dispatch({
+      type: "session.message",
+      sessionId,
+      message: {
+        type: "session.message",
+        sessionId,
+        messageId: `local:info:${Date.now()}:${Math.random()}`,
+        role: "info",
+        content,
+        identity: { sub: "system:codeoid", name: "codeoid", type: "system" },
+        timestamp: new Date().toISOString(),
+      },
+    });
+  };
+
   const printWhoLocalMessage = (session: import("./types.js").TuiSession) => {
     const info = session.info;
     const lines: string[] = [];
@@ -848,6 +870,54 @@ export function App({ config }: Props) {
           .catch((err: Error) =>
             dispatch({ type: "error", message: err.message }),
           );
+        return;
+      }
+      case "/undo": {
+        // Go back a turn (#355) — see src/terminal/rewind.ts for the grammar.
+        if (!client || !focusedSession) return;
+        const req = parseUndoArgs(args);
+        if ("error" in req) {
+          dispatch({ type: "error", message: req.error });
+          return;
+        }
+        const sessionId = focusedSession.info.id;
+        void (async () => {
+          // Restoring files confirms exactly the previewed turn and plan
+          // (the daemon refuses if anything changed); without a preview,
+          // preview and confirm that plan in one go.
+          let target = undoPreviewRef.current?.sessionId === sessionId ? undoPreviewRef.current : null;
+          undoPreviewRef.current = null;
+          const latest = async () => {
+            const list = await client.turns(sessionId);
+            if (list.type !== "session.turns.result") throw new Error("could not list turns");
+            const last = list.turns.at(-1);
+            if (!last) throw new Error("nothing to undo");
+            return last.turnId;
+          };
+          if (req.restoreFiles && !req.dryRun && !target) {
+            const turnId = await latest();
+            const pre = await client.rewind(sessionId, turnId, { restoreFiles: true, dryRun: true, force: false });
+            if (pre.type !== "session.rewind.result") throw new Error(pre.type === "response.error" ? pre.error : "undo failed");
+            target = { sessionId, turnId, planId: pre.planId };
+          }
+          const turnId = req.restoreFiles && !req.dryRun ? target!.turnId : await latest();
+          const res = await client.rewind(sessionId, turnId, {
+            ...req,
+            ...(req.restoreFiles && !req.dryRun ? { planId: target!.planId } : {}),
+          });
+          if (res.type !== "session.rewind.result") {
+            throw new Error(res.type === "response.error" ? res.error : "undo failed");
+          }
+          if (req.dryRun) undoPreviewRef.current = { sessionId, turnId, planId: res.planId };
+          printLocalInfo(sessionId, formatRewind(res));
+          if (!res.dryRun && !res.refused && res.restoredPrompt) {
+            // Anyone with send can author a prompt: strip terminal control
+            // sequences before it reaches the editor (newlines kept).
+            const clean = sanitizeTerminalOutput(res.restoredPrompt).replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/g, "");
+            dispatch({ type: "input.set", value: clean });
+            dispatch({ type: "cursor.set", position: clean.length });
+          }
+        })().catch((err: Error) => dispatch({ type: "error", message: err.message }));
         return;
       }
       case "/rotate": {

@@ -320,6 +320,9 @@ export class CodexProvider implements SessionProvider {
   }
 
   resetToNewSession(newBackingId: string): void {
+    // A fresh backing session starts from nothing: a seed queued for the
+    // previous one (a backend switch, a rewind) must not ride along (#355).
+    this.#pendingHistorySeed = null;
     this.#backingSessionId = newBackingId;
     this.#threadId = null;
     this.#hasQueried = false;

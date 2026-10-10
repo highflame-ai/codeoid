@@ -548,6 +548,17 @@ export const sessionTurnsSchema = z.object({
   sessionId: sessionIdField,
 });
 
+export const sessionRewindSchema = z.object({
+  ...base,
+  type: z.literal("session.rewind"),
+  sessionId: sessionIdField,
+  turnId: z.string().min(1).max(128),
+  restoreFiles: z.boolean().optional(),
+  dryRun: z.boolean().optional(),
+  force: z.boolean().optional(),
+  planId: z.string().min(1).max(64).optional(),
+});
+
 export const skillGrantSchema = z.object({
   ...base,
   type: z.literal("skill.grant"),
@@ -772,6 +783,7 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   backendLoginCancelSchema,
   skillGrantSchema,
   sessionTurnsSchema,
+  sessionRewindSchema,
   mcpOAuthBeginSchema,
   mcpOAuthCompleteSchema,
   mcpOAuthDisconnectSchema,

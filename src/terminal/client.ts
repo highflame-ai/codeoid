@@ -21,6 +21,7 @@ import { sanitizeTerminalOutput } from "../tui/ansi/codes.js";
 import { formatPackList, formatPackShow } from "./pack-format.js";
 import { formatPipeline, haltedRequestId } from "./pipeline-format.js";
 import { type PendingDialog, parseDialogAnswer } from "./dialog.js";
+import { formatRewind, parseUndoArgs } from "./rewind.js";
 
 // ── Stream rendering (pure, exported for tests) ───────────────────────────────
 
@@ -54,6 +55,10 @@ export interface StreamRenderState {
   dialogs: Array<{ dialog: PendingDialog; prompt: string }>;
   /** Which prompt was printed last — a typed yes/no answers THAT one. */
   lastPrompt: "tool" | "dialog" | null;
+  /** The first full replay has been printed (its last chunk arrived). */
+  replayDone?: boolean;
+  /** Inside a later full replay (a refresh after going back): its chunks aren't reprinted. */
+  suppressingReplay?: boolean;
 }
 
 /** A tool approval was settled (anywhere): stop routing yes/no to it, and
@@ -87,6 +92,20 @@ export function renderStreamMessage(msg: DaemonMessage, state: StreamRenderState
     case "scrollback.replay": {
       const m = msg as { messages?: Array<{ type: string; role?: string; content?: string; tool?: { name?: string }; identity?: { name?: string } }> };
       const list = m.messages ?? [];
+      // A later full snapshot (after going back a turn) refreshes the view;
+      // reprinting the whole session into a terminal helps nobody. A large
+      // replay arrives in chunks (seq 0…n, final on the last): only a replay
+      // that STARTS after the first one finished is a refresh.
+      const frame = msg as { mode?: string; seq?: number; final?: boolean };
+      if (state.suppressingReplay) {
+        if (frame.final) state.suppressingReplay = false;
+        return "";
+      }
+      if (state.replayDone && frame.mode === "snapshot" && (frame.seq === undefined || frame.seq === 0)) {
+        state.suppressingReplay = frame.seq === 0 && frame.final === false;
+        return `${DIM}(the session view was refreshed)${RESET}\n`;
+      }
+      if (frame.seq === undefined || frame.final) state.replayDone = true;
       let out = `\n--- scrollback (${list.length} messages) ---\n`;
       for (const e of list) {
         if (e.type !== "session.message") continue;
@@ -496,6 +515,19 @@ export class TerminalClient {
         continue;
       }
 
+      // Go back a turn (#355): the taken-back message comes back to the
+      // prompt line, to edit and resend.
+      if (trimmed === "/undo" || trimmed.startsWith("/undo ")) {
+        const restored = await this.#undo(sessionId, trimmed.split(/\s+/).slice(1));
+        // Pre-fill only a single, sanitized line: readline submits every
+        // newline it is fed, so a multi-line prompt (or one carrying
+        // "/undo files force") would be sent — or run — line by line.
+        const oneLine = restored ? S(restored).replace(/[\x00-\x1f\x7f]/g, "") : "";
+        if (restored && !/[\r\n]/.test(restored) && oneLine) rl.write(oneLine);
+        else if (restored) console.log("(It spans several lines, so it isn't pre-filled — copy it from above to send it again.)");
+        continue;
+      }
+
       // A tool approval printed after the question is what a yes/no answers;
       // then the question is shown again.
       const toolPromptLast = renderState.lastPrompt === "tool" && renderState.latestApprovalId;
@@ -573,6 +605,74 @@ export class TerminalClient {
     } else {
       this.#printError(resp);
     }
+  }
+
+  /**
+   * Go back a turn (#355) and print what happened. Returns the taken-back
+   * prompt when it was really taken back (not a preview or a refusal).
+   */
+  async #undo(sessionId: string, args: string[], opts: { confirming?: boolean } = {}): Promise<string | null> {
+    const req = parseUndoArgs(args);
+    if ("error" in req) {
+      console.log(req.error);
+      return null;
+    }
+    // Restoring files acts on exactly what was previewed: the same turn and
+    // plan — the daemon refuses if anything changed in between.
+    let turnId: string;
+    let planId: string | undefined;
+    const preview = this.#undoPreview;
+    if (req.restoreFiles && !req.dryRun && preview && preview.sessionId === sessionId) {
+      ({ turnId, planId } = preview);
+    } else if (req.restoreFiles && !req.dryRun) {
+      // No preview to confirm (e.g. one-shot `codeoid undo … files yes`):
+      // preview now and confirm exactly that plan in the same breath.
+      if ((await this.#undo(sessionId, ["files"], { confirming: true })) === null && !this.#undoPreview) return null;
+      const fresh = this.#undoPreview as { sessionId: string; turnId: string; planId: string } | null;
+      if (!fresh) return null;
+      ({ turnId, planId } = fresh);
+    } else {
+      const list = await this.#request({ type: "session.turns", id: randomUUID(), sessionId });
+      if (list.type !== "session.turns.result") {
+        this.#printError(list);
+        return null;
+      }
+      const last = list.turns.at(-1);
+      if (!last) {
+        console.log("Nothing to undo.");
+        return null;
+      }
+      turnId = last.turnId;
+    }
+    this.#undoPreview = null;
+    const res = await this.#request({
+      type: "session.rewind",
+      id: randomUUID(),
+      sessionId,
+      turnId,
+      ...(req.restoreFiles ? { restoreFiles: true } : {}),
+      ...(req.dryRun ? { dryRun: true } : {}),
+      ...(req.force ? { force: true } : {}),
+      ...(planId ? { planId } : {}),
+    });
+    if (res.type !== "session.rewind.result") {
+      this.#printError(res);
+      return null;
+    }
+    if (req.dryRun) this.#undoPreview = { sessionId, turnId, planId: res.planId };
+    console.log(S(formatRewind(res, { hint: !opts.confirming })));
+    return !res.dryRun && !res.refused ? res.restoredPrompt : null;
+  }
+
+  /** The last `/undo files` preview, which `/undo files yes|force` confirms. */
+  #undoPreview: { sessionId: string; turnId: string; planId: string } | null = null;
+
+  /** `codeoid undo <session> [files [yes|force]]` — /undo without attaching. */
+  async undoSession(sessionIdOrName: string, args: string[]): Promise<void> {
+    const sessionId = await this.#resolveSession(sessionIdOrName);
+    if (!sessionId) return;
+    const restored = await this.#undo(sessionId, args);
+    if (restored) console.log(`\nThe message that was taken back:\n${S(restored)}`);
   }
 
   async interruptSession(sessionIdOrName: string): Promise<void> {

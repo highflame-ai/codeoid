@@ -460,6 +460,8 @@ describe("DaemonMessage routing", () => {
           return `skill.grant:${msg.allowed}`;
         case "session.turns.result":
           return `turns:${msg.turns.length}`;
+        case "session.rewind.result":
+          return `rewind:${msg.removedTurns}`;
         case "mcp.oauth.begin.result":
           return `mcp.oauth.begin:${msg.status}`;
         case "mcp.oauth.complete.result":

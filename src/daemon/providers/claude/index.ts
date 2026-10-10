@@ -290,6 +290,9 @@ export class ClaudeProvider implements SessionProvider {
    * runTurn() creates a fresh Claude Code session rather than resuming.
    */
   resetToNewSession(newBackingId: string): void {
+    // A fresh backing session starts from nothing: a seed queued for the
+    // previous one (a backend switch, a rewind) must not ride along (#355).
+    this.#pendingHistorySeed = null;
     this.#claudeCodeSessionId = newBackingId;
     this.#hasQueried = false;
     this.#backingRecoveryAttempted = false;

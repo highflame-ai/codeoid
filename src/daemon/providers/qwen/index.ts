@@ -150,6 +150,9 @@ export class QwenProvider implements SessionProvider {
   }
 
   resetToNewSession(newBackingId: string): void {
+    // A fresh backing session starts from nothing: a seed queued for the
+    // previous one (a backend switch, a rewind) must not ride along (#355).
+    this.#pendingHistorySeed = null;
     this.#backingId = coerceBackingId(newBackingId, this.#init.sessionId);
     this.#hasQueried = false;
     this.#pendingTools = [];

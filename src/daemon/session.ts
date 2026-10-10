@@ -58,10 +58,23 @@ import type {
   SessionWorktree,
 } from "../protocol/types.js";
 import { dirname, join } from "node:path";
+import { createHash } from "node:crypto";
+import { lstat, readdir } from "node:fs/promises";
 import { removeForkWorktree } from "./git-worktree.js";
-import { copyCheckpoints, createCheckpoint, deleteCheckpoint, deleteCheckpoints, listCheckpoints } from "./checkpoints.js";
-import type { TurnIndexEntry } from "./transcript.js";
-import type { TurnSummary } from "../protocol/types.js";
+import {
+  copyCheckpoints,
+  createCheckpoint,
+  currentTree,
+  deleteCheckpoint,
+  deleteCheckpoints,
+  diffTrees,
+  endSnapshotId,
+  ignoredUnderTree,
+  listCheckpoints,
+  restoreTree,
+} from "./checkpoints.js";
+import { applyRewinds, REWIND_EVENT, type TurnIndexEntry } from "./transcript.js";
+import type { RewindFiles, RewindIrreversible, TurnSummary } from "../protocol/types.js";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
@@ -418,6 +431,162 @@ export interface SessionCreateOptions {
  * was told; callers waiting for the turn treat this like an interrupt, not a
  * failure to report.
  */
+/** What going back a turn did — or, for a dry run / refusal, would do (#355). */
+export interface RewindOutcome {
+  removedTurnIds: string[];
+  keptHistory: readonly CanonicalTurn[];
+  restoredPrompt: string;
+  irreversible: RewindIrreversible[];
+  files?: RewindFiles;
+  filesUnavailable?: string;
+  /** Set when nothing was changed because going back would lose hand edits. */
+  refused?: string;
+  /** Identifies exactly this plan: a real run given it refuses if anything changed. */
+  planId: string;
+  /** Internal: the snapshot, the current tree, the changes to apply, paths left alone. */
+  checkpointSha?: string;
+  currentTreeSha?: string;
+  fileChanges?: import("./checkpoints.js").TreeChange[];
+  keepPaths?: string[];
+}
+
+/** A short, stable id for a rewind plan. */
+function planHash(parts: readonly string[]): string {
+  return createHash("sha256").update(parts.join("\0")).digest("hex").slice(0, 24);
+}
+
+/** Whether `rel` exists in `workdir` as something other than a directory (links not followed). */
+async function isNonDirectory(workdir: string, rel: string): Promise<boolean> {
+  try {
+    return !(await lstat(join(workdir, rel))).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether an entry with EXACTLY the name `rel` exists in `workdir` (links
+ * not followed). Exact: on a case-insensitive filesystem `lstat("readme.md")`
+ * also finds `README.md`, which would make a case-only rename look occupied.
+ */
+async function existsOnDisk(workdir: string, rel: string): Promise<boolean> {
+  try {
+    await lstat(join(workdir, rel));
+  } catch {
+    return false;
+  }
+  const slash = rel.lastIndexOf("/");
+  const dir = slash === -1 ? workdir : join(workdir, rel.slice(0, slash));
+  const name = slash === -1 ? rel : rel.slice(slash + 1);
+  try {
+    return (await readdir(dir)).includes(name);
+  } catch {
+    return false;
+  }
+}
+
+/** Whether any parent directory of `rel` inside `workdir` is a symlink. */
+async function hasSymlinkedParent(workdir: string, rel: string): Promise<boolean> {
+  const parts = rel.split("/");
+  for (let k = 1; k < parts.length; k++) {
+    try {
+      if ((await lstat(join(workdir, ...parts.slice(0, k)))).isSymbolicLink()) return true;
+    } catch {
+      return false; // missing: nothing to follow
+    }
+  }
+  return false;
+}
+
+/** A rewind that can't proceed (unknown turn, a turn that wouldn't stop). */
+export class RewindError extends Error {
+  constructor(
+    readonly code: "not_found" | "busy" | "restore_failed",
+    message: string,
+  ) {
+    super(message);
+    this.name = "RewindError";
+  }
+}
+
+/**
+ * Shell commands whose effects live outside the working directory (or in
+ * git's own state), which restoring files can't undo.
+ */
+const OUTSIDE_EFFECT_COMMAND =
+  /\b(git\s+(push|commit|tag|reset|rebase|merge|checkout|switch|stash|cherry-pick|revert|branch\s+-[dD])|gh\s|curl\s|wget\s|scp\s|rsync\s|ssh\s|npm\s+(publish|install|i\b)|pnpm\s|yarn\s|pip3?\s+install|uv\s+(pip|add)|cargo\s+(publish|install)|docker\s|kubectl\s|helm\s|terraform\s|aws\s|gcloud\s|az\s|deploy|psql\s|mysql\s|redis-cli\s|rm\s+-[a-z]*r|mv\s)/i;
+
+/**
+ * What the taken-back turns did that going back can't undo (#355):
+ * external (MCP) tool calls, and shell commands with effects outside the
+ * working directory. Informational — derived from codeoid's own history, so
+ * it reads the same for every backend.
+ */
+export function irreversibleEffects(turns: readonly CanonicalTurn[]): RewindIrreversible[] {
+  const out: RewindIrreversible[] = [];
+  for (const t of turns) {
+    if (t.role !== "assistant" || !t.toolCalls) continue;
+    for (const tc of t.toolCalls) {
+      const tool = tc.originalName ?? tc.name;
+      if (tc.name.startsWith("mcp__") || tool.startsWith("mcp__")) {
+        out.push({ tool, detail: shorten(JSON.stringify(tc.input)) });
+      } else if (isShellTool(tc.name, tool)) {
+        const cmd = shellCommandOf(tc.input);
+        if (OUTSIDE_EFFECT_COMMAND.test(cmd)) out.push({ tool, detail: shorten(cmd) });
+      }
+    }
+  }
+  return out;
+}
+
+/** Shell tools under every backend's name (normalized or raw: Bash, bash, run_shell_command, shell, exec_command…). */
+const SHELL_TOOL_NAMES = new Set(["run_shell", "bash", "shell", "run_shell_command", "exec_command", "local_shell", "terminal", "exec"]);
+
+function isShellTool(name: string, original: string): boolean {
+  return SHELL_TOOL_NAMES.has(name.toLowerCase()) || SHELL_TOOL_NAMES.has(original.toLowerCase());
+}
+
+/** The command a shell tool ran, whichever field shape the backend used. */
+function shellCommandOf(input: Record<string, unknown>): string {
+  for (const k of ["command", "cmd", "script"]) {
+    const v = input[k];
+    if (typeof v === "string") return v;
+    if (Array.isArray(v)) return v.map(String).join(" ");
+  }
+  return "";
+}
+
+/** Secret-looking values never reach the list (auth headers, tokens, keys). */
+function redactSecrets(s: string): string {
+  return (
+    s
+      // Authorization / Cookie headers: everything after the header name.
+      .replace(/\b(authorization|proxy-authorization|cookie|set-cookie)(\s*[:=]\s*)[^"'\n]+/gi, "$1$2«redacted»")
+      // key=value / key: value / key value for anything secret-shaped.
+      .replace(
+        /\b([\w-]*(?:secret|token|passw(?:or)?d|passwd|api[-_]?key|access[-_]?key|private[-_]?key|credential)[\w-]*)(["']?\s*[:=]\s*|\s+)("[^"]*"|'[^']*'|[^\s"',;}]+)/gi,
+        "$1$2«redacted»",
+      )
+      // user:password@ in URLs.
+      .replace(/(\b[a-z][a-z0-9+.-]*:\/\/)[^\s/:@]+:[^\s/@]+@/gi, "$1«redacted»@")
+      // -u user:pass, -pPASSWORD, --password=x
+      .replace(/(\s-u\s+)[^\s:]+:\S+/g, "$1«redacted»")
+      .replace(/(\s-p)(?=[^\s-])\S+/g, (m, flag: string) => (/\b(mysql|mariadb|mysqldump|mysqladmin)\b/.test(s) ? `${flag}«redacted»` : m))
+      // Well-known token shapes and bare JWTs.
+      .replace(
+        /\b(sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abpr]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|zid_sk_[A-Za-z0-9_-]+|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})\b/g,
+        "«redacted»",
+      )
+  );
+}
+
+function shorten(s: string): string {
+  // Bounded input: only the start is ever shown, and it keeps the
+  // redaction patterns linear in practice.
+  const one = redactSecrets(s.slice(0, 2_000)).replace(/\s+/g, " ").trim();
+  return one.length > 160 ? `${one.slice(0, 159)}…` : one;
+}
+
 /** Turns listed per session (#354): the newest are kept; older ones drop off. */
 const TURN_INDEX_KEEP = 1000;
 const TURN_INDEX_SLACK = 200;
@@ -534,6 +703,14 @@ export class Session {
    * seqs) forces stale cursors down the full-snapshot path.
    */
   #resumeKey = randomUUID();
+  /** Snapshots run one after another (start of a turn waits on the previous end). */
+  #checkpointChain: Promise<unknown> = Promise.resolve();
+  /** The turn whose end-of-turn snapshot has been taken (#355). */
+  #endSnapshotTurn: string | null = null;
+  /** The backend was reset and holds no conversation yet (see TranscriptMeta.backingFresh). */
+  #backingFresh = false;
+  /** A rewind is in progress: nothing may wake the agent meanwhile. */
+  #rewinding = false;
   /**
    * Recently-processed `session.send.clientMsgId`s (`send.idempotency`) —
    * insertion-ordered for FIFO eviction. Bounds the window in which an
@@ -1388,7 +1565,14 @@ export class Session {
         client.send(pending.msg);
       }
     }
+    this.#replay(client, resume);
+  }
 
+  /**
+   * Send `client` the scrollback: an incremental tail when its resume cursor
+   * matches this buffer, else a full snapshot (the client resets on it).
+   */
+  #replay(client: AttachedClient, resume?: { key: string; sinceSeq: number }): void {
     // Incremental resume (`replay.resume`): when the client's cursor belongs
     // to THIS replay buffer (key match), replay only the entries mutated
     // after it — new messages plus older ones grown by deltas / tool-state
@@ -2189,6 +2373,7 @@ export class Session {
 
     this.#currentTurnId = turnId;
     this.#indexTurn(turnId, "prompt", text, turnAt);
+    this.#markBackingFresh(false);
     this.#accumulator.pushUserTurn(effectivePrompt, turnId, { prompt: text, at: turnAt });
     const run = this.#provider.runTurn({
       history: this.#accumulator.history,
@@ -2533,6 +2718,8 @@ export class Session {
     // interrupt) would inject a duplicate turn beside the backend's own.
     if (this.#provider.continuesAfterBackgroundWork && !opts.fallback) return;
     if (this.#destroyed) return;
+    // Mid-rewind: these reports belong to turns being taken back (#355).
+    if (this.#rewinding) return;
     if (this.#deliveringBackgroundReports) return;
     if (this.#pendingBackgroundReports.length === 0) return;
     // Between turns only. A background agent's pending approval (status
@@ -2669,13 +2856,15 @@ export class Session {
    * correctness over warmth. Idempotent: a second interrupt on an
    * already-idle session is a harmless no-op.
    */
-  async interrupt(sender: AuthContext): Promise<void> {
+  async interrupt(sender: AuthContext, opts: { keepQueuedSends?: boolean } = {}): Promise<void> {
     this.#store.audit(sender.sub, "session.interrupt", this.id);
     // Mark BEFORE cancelling dialogs, so a driver whose requestUserInput resolves
     // cancelled sees the interrupt and stops rather than treating it as a dismiss.
     this.#turnInterrupted = true;
-    // Sends still preparing their turn are stopped too (#stoppedBeforeStart).
-    this.#stopGen++;
+    // Sends still preparing their turn are stopped too (#stoppedBeforeStart)
+    // — unless the caller already claimed its stop point (a rewind does, so
+    // messages queued AFTER it survive).
+    if (!opts.keepQueuedSends) this.#stopGen++;
     this.#pendingMidTurnCount = 0; // cancel pending mid-turn continuations
     // Finalize any in-flight streaming messages RIGHT NOW so the UI's live
     // region stops spinning on content the model won't finish emitting,
@@ -5231,34 +5420,62 @@ export class Session {
    * turn by a bounded amount; if the turn starts first, the snapshot is
    * recorded as `late`. Never throws.
    */
-  async #checkpointTurn(turnId: string, waitMs?: number): Promise<void> {
+  async #checkpointTurn(turnId: string, waitMs?: number, opts: { onlyIfMissing?: boolean } = {}): Promise<void> {
     if (!this.#checkpointsEnabled() || this.#destroyed) return;
     const cfg = this.#config?.session.checkpoints;
     let started = false;
-    const job = createCheckpoint({
-      root: this.#checkpointRoot,
-      workdir: this.workdir,
-      sessionId: this.id,
-      turnId,
-      isLate: () => started,
-      // The daemon's own data (transcripts, checkpoints, config, db) is never
-      // snapshotted, even if a workdir somehow contains it.
-      excludeDirs: [this.#transcriptStore.dir, ...(this.#config?.dbPath ? [dirname(this.#config.dbPath)] : [])],
-      limits: {
-        ...(cfg?.maxPerSession !== undefined ? { maxPerSession: cfg.maxPerSession } : {}),
-        ...(cfg?.maxUntrackedBytes !== undefined ? { maxUntrackedBytes: cfg.maxUntrackedBytes } : {}),
-      },
-    }).then((r) => {
+    // Serialized: a turn's start snapshot waits for the previous turn's end
+    // snapshot (within its wait budget) instead of being skipped.
+    const job = this.#checkpointChain.then(() =>
+      createCheckpoint({
+        root: this.#checkpointRoot,
+        workdir: this.workdir,
+        sessionId: this.id,
+        turnId,
+        isLate: () => started,
+        excludeDirs: this.#protectedDirs(),
+        limits: this.#checkpointLimits(),
+        ...(opts.onlyIfMissing ? { onlyIfMissing: true } : {}),
+      }),
+    ).then((r) => {
       if (!r.ok) {
         console.error(`[codeoid/session ${this.id.slice(0, 8)}] checkpoint skipped for turn ${turnId.slice(0, 8)}: ${r.reason}`);
       }
       return r;
     });
+    this.#checkpointChain = job.catch(() => undefined);
     this.#pendingCheckpoints.add(job);
     void job.finally(() => this.#pendingCheckpoints.delete(job));
     const wait = waitMs ?? cfg?.waitMs ?? 2_000;
     if (wait > 0) await Promise.race([job, new Promise((r) => setTimeout(r, wait).unref?.())]);
     started = true;
+  }
+
+  /** The daemon's own data (transcripts, checkpoints, config, db): never snapshotted or restored. */
+  #protectedDirs(): string[] {
+    return [this.#transcriptStore.dir, ...(this.#config?.dbPath ? [dirname(this.#config.dbPath)] : [])];
+  }
+
+  #checkpointLimits(): Partial<import("./checkpoints.js").CheckpointLimits> {
+    const cfg = this.#config?.session.checkpoints;
+    return {
+      // Two snapshots per turn (start + end): the cap counts turns.
+      maxPerSession: 2 * (cfg?.maxPerSession ?? 200),
+      ...(cfg?.maxUntrackedBytes !== undefined ? { maxUntrackedBytes: cfg.maxUntrackedBytes } : {}),
+    };
+  }
+
+  /**
+   * Snapshot the files a turn ENDED with (#355), once per turn, when the
+   * session comes to rest. Comparing it with the files later tells hand edits
+   * apart from the agent's — what "go back a turn" must not overwrite
+   * unasked. Fire and forget.
+   */
+  #snapshotTurnEnd(): void {
+    const turnId = this.#currentTurnId;
+    if (!turnId || turnId === this.#endSnapshotTurn || !this.#turnIndex.some((e) => e.turnId === turnId)) return;
+    this.#endSnapshotTurn = turnId;
+    void this.#checkpointTurn(endSnapshotId(turnId), 0, { onlyIfMissing: true });
   }
 
   /** Remove a snapshot taken for a turn that never started. Never throws. */
@@ -5315,6 +5532,7 @@ export class Session {
    */
   async inheritTurns(parent: Session, entries: readonly TurnIndexEntry[]): Promise<void> {
     this.#turnIndex = entries.map((e) => ({ ...e }));
+    this.#endSnapshotTurn = entries.at(-1)?.turnId ?? null;
     void this.#transcriptStore.replaceTurnIndex(this.id, this.#turnIndex);
     if (!this.#checkpointsEnabled() || entries.length === 0) return;
     try {
@@ -5322,13 +5540,410 @@ export class Session {
         root: this.#checkpointRoot,
         fromSessionId: parent.id,
         toSessionId: this.id,
-        turnIds: entries.map((e) => e.turnId),
+        turnIds: entries.flatMap((e) => [e.turnId, endSnapshotId(e.turnId)]),
       });
     } catch (err) {
       console.error(
         `[codeoid/fork ${this.id.slice(0, 8)}] could not copy the parent's checkpoints (the fork's earlier turns have no snapshots): ${err instanceof Error ? err.message : String(err)}`,
       );
     }
+  }
+
+  // ── Going back a turn (#355) ──────────────────────────────────────────
+
+  /**
+   * Take back `turnId` and every turn after it (#355). Backend-agnostic: the
+   * conversation is cut in codeoid's canonical history and the backend is
+   * reset and re-seeded from what's kept — the same path a backend switch
+   * uses — so every current and future provider forgets the removed turns,
+   * restart or not. With `restoreFiles`, the working directory goes back to
+   * that turn's starting snapshot; files edited by hand during the removed
+   * turns (or when that can't be told) are reported as conflicts and only
+   * overwritten with `force`. `planId` (from a dry run) makes the real run
+   * refuse if anything changed since that preview. A running turn and
+   * background agents are stopped first. Serialized with sends; a dry run
+   * changes nothing and stops nothing.
+   */
+  rewind(
+    turnId: string,
+    opts: { restoreFiles?: boolean; dryRun?: boolean; force?: boolean; planId?: string; canStop?: boolean },
+    sender: AuthContext,
+  ): Promise<RewindOutcome> {
+    if (opts.dryRun) return this.#serializedCheckpointOp(() => this.#planRewind(turnId, opts.restoreFiles === true));
+    // Claim the stop point now, synchronously: sends queued before this
+    // rewind (still preparing) are stopped with what runs; sends queued
+    // after it capture the new generation and go ahead once it's done.
+    if (opts.canStop) this.#stopGen++;
+    const job = this.#sendChain.catch(() => undefined).then(() => this.#rewindInner(turnId, opts, sender));
+    this.#sendChain = job.then(
+      () => undefined,
+      () => undefined,
+    );
+    return job;
+  }
+
+  /** True while anything is running that a rewind must stop first. */
+  get rewindNeedsStop(): boolean {
+    return (
+      this.#activeRun !== null ||
+      isActiveStatus(this.#status) ||
+      this.#status === "waiting_approval" ||
+      this.#backgroundWorkLive()
+    );
+  }
+
+  /** Run `fn` on the snapshot queue, so it never races a snapshot (they share an index). */
+  #serializedCheckpointOp<T>(fn: () => Promise<T>): Promise<T> {
+    const job = this.#checkpointChain.then(fn);
+    this.#checkpointChain = job.catch(() => undefined);
+    return job;
+  }
+
+  /** What going back to before `turnId` would remove, restore and not undo. */
+  async #planRewind(turnId: string, restoreFiles: boolean): Promise<RewindOutcome> {
+    const pos = this.#turnIndex.findIndex((e) => e.turnId === turnId);
+    if (pos === -1) throw new RewindError("not_found", "That turn isn't in this session (or is older than its turn list).");
+    const removedIds = this.#turnIndex.slice(pos).map((e) => e.turnId);
+    const removed = new Set(removedIds);
+    const history = await this.fullCanonicalHistory();
+    let cut = history.findIndex((t) => t.turnId !== undefined && removed.has(t.turnId));
+    if (cut === -1) cut = history.length;
+    const removedCanon = history.slice(cut);
+    const restoredPrompt = await this.#promptOf(turnId, removedCanon);
+    const plan: RewindOutcome = {
+      removedTurnIds: removedIds,
+      keptHistory: history.slice(0, cut),
+      restoredPrompt,
+      irreversible: irreversibleEffects(removedCanon),
+      planId: "",
+    };
+    if (!restoreFiles) return { ...plan, planId: planHash([turnId, ...removedIds]) };
+    if (!this.#checkpointsEnabled()) {
+      return { ...plan, planId: planHash([turnId, ...removedIds]), filesUnavailable: "workspace snapshots are turned off (session.checkpoints.enabled)" };
+    }
+    const records = await listCheckpoints(this.#checkpointRoot, this.id);
+    const start = records.get(turnId);
+    if (!start) {
+      return { ...plan, planId: planHash([turnId, ...removedIds]), filesUnavailable: "there is no snapshot of the files from when that turn started" };
+    }
+    const now = await currentTree({
+      root: this.#checkpointRoot,
+      workdir: this.workdir,
+      sessionId: this.id,
+      excludeDirs: this.#protectedDirs(),
+      limits: this.#checkpointLimits(),
+    });
+    if (!now.ok) return { ...plan, planId: planHash([turnId, ...removedIds]), filesUnavailable: `the current files couldn't be read: ${now.reason}` };
+    const changes = await diffTrees(this.#checkpointRoot, this.id, start.sha, now.tree);
+
+    // Never delete a file the snapshot didn't hold because it was IGNORED
+    // then (a removed turn changed .gitignore): we can't know it was created
+    // since. Never write over a path now held by an ignored/excluded file.
+    const created = changes.filter((c) => c.status === "A").map((c) => c.path);
+    const keep = new Set(await ignoredUnderTree(this.#checkpointRoot, this.id, start.sha, created));
+    // A path the restore would (re)create must not land on an untracked or
+    // ignored file: one at the path itself (a "D" path is by definition not
+    // in the current tree, so anything on disk there is untracked), or at
+    // any PARENT — a file where a deleted directory must come back. Tracked
+    // files in those spots are in the diff as created ("A") and replaced by
+    // git; untracked ones are kept.
+    const createdSet = new Set(created);
+    // Paths left alone because something else occupies them now (reported).
+    const skipped: string[] = [];
+    for (const c of changes) {
+      // Never through a symlinked parent (git wouldn't either; say so).
+      if (await hasSymlinkedParent(this.workdir, c.path)) {
+        keep.add(c.path);
+        skipped.push(c.path);
+        continue;
+      }
+      if (c.status === "A") continue;
+      if (c.status === "D" && (await existsOnDisk(this.workdir, c.path))) {
+        keep.add(c.path);
+        skipped.push(c.path);
+        continue;
+      }
+      const parts = c.path.split("/");
+      for (let k = 1; k < parts.length; k++) {
+        const parent = parts.slice(0, k).join("/");
+        if (createdSet.has(parent)) break;
+        if (await isNonDirectory(this.workdir, parent)) {
+          keep.add(c.path);
+          skipped.push(c.path);
+          break;
+        }
+      }
+    }
+    const effective = changes.filter((c) => !keep.has(c.path));
+
+    // Hand edits: every gap between the removed turns (one's end → the next's
+    // start), and the last end → now. A missing snapshot means we can't tell
+    // the agent's edits from the person's: treat them all as the person's.
+    let unverified = false;
+    const handEdited = new Set<string>();
+    const gaps: Array<[string | undefined, string | undefined]> = [];
+    const last = this.#turnIndex.length - 1;
+    for (let k = pos; k < this.#turnIndex.length; k++) {
+      // The turn still running has no end snapshot yet: its end is now.
+      const running = k === last && this.rewindNeedsStop;
+      const end = running ? now.tree : records.get(endSnapshotId(this.#turnIndex[k]!.turnId))?.sha;
+      const next = k + 1 < this.#turnIndex.length ? records.get(this.#turnIndex[k + 1]!.turnId)?.sha : now.tree;
+      gaps.push([end, next]);
+    }
+    for (const [a, b] of gaps) {
+      if (!a || !b) {
+        unverified = true;
+        continue;
+      }
+      for (const c of await diffTrees(this.#checkpointRoot, this.id, a, b)) handEdited.add(c.path);
+    }
+    const conflicts = effective.filter((c) => unverified || handEdited.has(c.path)).map((c) => c.path);
+    return {
+      ...plan,
+      planId: planHash([turnId, ...removedIds, start.sha, now.tree, ...conflicts.sort()]),
+      fileChanges: effective,
+      checkpointSha: start.sha,
+      currentTreeSha: now.tree,
+      keepPaths: [...keep],
+      files: {
+        restore: effective.filter((c) => c.status !== "A").map((c) => c.path),
+        remove: effective.filter((c) => c.status === "A").map((c) => c.path),
+        conflicts,
+        ...(skipped.length > 0 ? { skipped } : {}),
+        ...(unverified && conflicts.length > 0 ? { unverified: true } : {}),
+        ...(start.late ? { late: true } : {}),
+        applied: false,
+      },
+    };
+  }
+
+  async #rewindInner(
+    turnId: string,
+    opts: { restoreFiles?: boolean; force?: boolean; planId?: string; canStop?: boolean },
+    sender: AuthContext,
+  ): Promise<RewindOutcome> {
+    if (this.#destroyed) throw new RewindError("not_found", "Session is gone");
+    // Validate before touching anything: an unknown turn stops nothing.
+    if (!this.#turnIndex.some((e) => e.turnId === turnId)) {
+      throw new RewindError("not_found", "That turn isn't in this session (or is older than its turn list).");
+    }
+    // Decided HERE, inside the serialized step — the state seen when the
+    // request arrived may have changed while it queued behind a send.
+    if (this.rewindNeedsStop && opts.canStop !== true) {
+      throw new RewindError("busy", "The session is busy; going back would stop it, which needs session:interrupt.");
+    }
+    this.#rewinding = true;
+    try {
+      return await this.#rewindStopped(turnId, opts, sender);
+    } finally {
+      this.#rewinding = false;
+    }
+  }
+
+  async #rewindStopped(
+    turnId: string,
+    opts: { restoreFiles?: boolean; force?: boolean; planId?: string; canStop?: boolean },
+    sender: AuthContext,
+  ): Promise<RewindOutcome> {
+    const wasBusy = this.rewindNeedsStop;
+    const plan = async () => this.#serializedCheckpointOp(() => this.#planRewind(turnId, opts.restoreFiles === true));
+    const refusal = (p: RewindOutcome): RewindOutcome | null => {
+      const note = wasBusy ? "The running turn was stopped; nothing else changed." : "Nothing changed.";
+      if (opts.planId && opts.planId !== p.planId) {
+        this.#auditRewind(sender, turnId, p, "refused: changed since preview", opts.force);
+        return { ...p, refused: `the session changed since the preview — review it again. ${note}` };
+      }
+      if (p.files && p.files.conflicts.length > 0 && !opts.force) {
+        this.#auditRewind(sender, turnId, p, "refused: conflicts", opts.force);
+        return {
+          ...p,
+          refused: p.files.unverified
+            ? `the agent's edits can't be told apart from yours for ${p.files.conflicts.length} file(s); going back would overwrite them. ${note}`
+            : `${p.files.conflicts.length} file(s) were changed by hand during the turns being taken back; going back would overwrite them. ${note}`,
+        };
+      }
+      return null;
+    };
+
+    // Idle: plan and decide BEFORE changing anything, so a refusal really is
+    // "nothing changed".
+    let planned = wasBusy ? null : await plan();
+    if (planned) {
+      const refused = refusal(planned);
+      if (refused) return refused;
+    }
+    // Stop whatever runs: the turn (approvals included) and background agents
+    // — they belong to the context being taken back. Then tear the backend
+    // down, so a cooperative cancel can't finish a write after the restore.
+    if (wasBusy) await this.interrupt(sender, { keepQueuedSends: true });
+    await this.#teardownProvider();
+    // Reports of background work from the removed turns must not wake the
+    // fresh agent about work it was told to forget.
+    this.#pendingBackgroundReports = [];
+    if (this.#backgroundWakeFallback) {
+      clearTimeout(this.#backgroundWakeFallback);
+      this.#backgroundWakeFallback = null;
+    }
+    if (!planned) {
+      // Busy: plan now that it's stopped — after the stopped turn's end
+      // snapshot, which is the hand-edit baseline.
+      this.#snapshotTurnEnd();
+      planned = await plan();
+      const refused = refusal(planned);
+      if (refused) return refused;
+    }
+    const plan_ = planned;
+
+    // Files first: if restoring fails, nothing else has changed (the restore
+    // is one git operation that verifies the tree before writing).
+    if (plan_.files && plan_.checkpointSha && plan_.currentTreeSha && plan_.fileChanges && plan_.fileChanges.length > 0) {
+      const protectedHit = plan_.fileChanges.find((c) => this.#isProtectedPath(c.path));
+      if (protectedHit) throw new RewindError("restore_failed", `refusing to restore a path in codeoid's own data: ${protectedHit.path}`);
+      try {
+        await this.#serializedCheckpointOp(() =>
+          restoreTree({
+            root: this.#checkpointRoot,
+            workdir: this.workdir,
+            sessionId: this.id,
+            from: plan_.currentTreeSha!,
+            to: plan_.checkpointSha!,
+            ...(plan_.keepPaths && plan_.keepPaths.length > 0 ? { keep: plan_.keepPaths } : {}),
+          }),
+        );
+      } catch (err) {
+        this.#auditRewind(sender, turnId, plan_, `failed: ${err instanceof Error ? err.message : String(err)}`, opts.force);
+        throw new RewindError("restore_failed", `The files couldn't be restored: ${err instanceof Error ? err.message : String(err)}. ${wasBusy ? "The running turn was stopped; the conversation was not changed." : "Nothing was changed."}`);
+      }
+    }
+    if (plan_.files) plan_.files = { ...plan_.files, applied: true };
+
+    // The conversation: a fresh backend, re-seeded from what's kept.
+    this.#accumulator.seed(plan_.keptHistory);
+    const pos = this.#turnIndex.findIndex((e) => e.turnId === turnId);
+    this.#turnIndex = this.#turnIndex.slice(0, pos);
+    void this.#transcriptStore.replaceTurnIndex(this.id, this.#turnIndex);
+    this.#currentTurnId = this.#turnIndex.at(-1)?.turnId ?? null;
+    this.#endSnapshotTurn = this.#currentTurnId;
+    this.#canonicalPartial = false;
+    const newBackingId = randomUUID();
+    this.#provider.resetToNewSession(newBackingId);
+    try {
+      this.#store.setClaudeCodeSessionId(this.id, newBackingId);
+    } catch (err) {
+      console.error(`[codeoid/session ${this.id}] failed to persist rewind backing id: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    this.#justRotated = false;
+    if (plan_.keptHistory.length > 0) await this.#seedProviderFromHistory();
+    // Until the next prompt, the backend holds nothing: a restart before then
+    // must re-seed from the kept history rather than resume an empty backend.
+    this.#markBackingFresh(true);
+
+    // What everyone sees: a durable marker hides the taken-back rows (on
+    // replay, restart and paging alike), then every client gets a fresh view.
+    const fromMessageId = await this.#firstRowOf(turnId);
+    const preview = this.#previewOf(plan_.restoredPrompt);
+    const fileNote = plan_.files?.applied
+      ? ` Files restored to how they were then (${plan_.files.restore.length} restored, ${plan_.files.remove.length} removed).`
+      : "";
+    const marker = this.#makeMessage(
+      "info",
+      `↩ Went back to before “${preview}” — ${plan_.removedTurnIds.length} turn(s) taken back.${fileNote}`,
+      SYSTEM_IDENTITY,
+      undefined,
+      undefined,
+      {
+        event: REWIND_EVENT,
+        turnId,
+        removedTurnIds: plan_.removedTurnIds,
+        ...(fromMessageId ? { fromMessageId } : {}),
+      },
+    );
+    this.#persistAndBuffer(marker);
+    const rows = applyRewinds(this.#scrollback.read().map((message) => ({ message }))).map((r) => r.message);
+    this.#scrollback.clear();
+    for (const m of rows) this.#scrollback.push(m);
+    this.#resumeKey = randomUUID(); // stale incremental cursors must re-sync
+    for (const client of [...this.#clients.values()]) this.#replay(client);
+    this.#auditRewind(sender, turnId, plan_, plan_.files?.applied ? "files restored" : "conversation only", opts.force);
+    this.#setStatus("idle");
+    this.#broadcastInfoUpdate();
+    return plan_;
+  }
+
+  #markBackingFresh(fresh: boolean): void {
+    if (this.#backingFresh === fresh) return;
+    this.#backingFresh = fresh;
+    this.#saveMetaNow();
+  }
+
+  /**
+   * On resume of a session whose backend was reset and never used since
+   * (#355): the backend has nothing to resume, and the seed that would have
+   * carried the conversation lived only in memory. Start it fresh and
+   * re-seed it from the restored canonical history.
+   */
+  async reseedFreshBacking(): Promise<void> {
+    this.#backingFresh = true;
+    this.#provider.setHasQueried(false);
+    if (this.#accumulator.history.length > 0) await this.#seedProviderFromHistory();
+  }
+
+  #auditRewind(sender: AuthContext, turnId: string, plan: RewindOutcome, outcome: string, force?: boolean): void {
+    this.#store.audit(
+      sender.sub,
+      "session.rewind",
+      this.id,
+      `turn=${turnId} removed=${plan.removedTurnIds.length} outcome=${outcome}${force ? " force" : ""}${
+        plan.files ? ` restore=${plan.files.restore.length} remove=${plan.files.remove.length} conflicts=${plan.files.conflicts.length}` : ""
+      }`,
+    );
+  }
+
+  /**
+   * A workdir-relative path inside one of codeoid's own data directories
+   * that lies WITHIN the workdir (the snapshot excludes exactly those; a data
+   * directory above the workdir contains it and protects nothing here).
+   */
+  #isProtectedPath(rel: string): boolean {
+    const abs = join(this.workdir, rel);
+    return this.#protectedDirs()
+      .filter((d) => d.startsWith(`${this.workdir}/`))
+      .some((d) => abs === d || abs.startsWith(`${d}/`));
+  }
+
+  /** The prompt that started `turnId`: from the history, else its transcript row. */
+  async #promptOf(turnId: string, removedCanon: readonly CanonicalTurn[]): Promise<string> {
+    const user = removedCanon.find((t) => t.role === "user" && t.turnId === turnId);
+    if (user && user.role === "user") return user.background ? "" : (user.prompt ?? user.content);
+    if (this.#turnIndex.find((e) => e.turnId === turnId)?.kind === "background") return "";
+    const row = await this.#findRow((m) => m.role === "user" && m.turnId === turnId);
+    return row?.content ?? this.#turnIndex.find((e) => e.turnId === turnId)?.preview ?? "";
+  }
+
+  /** The first message of `turnId` (its prompt), for the rewind marker. */
+  async #firstRowOf(turnId: string): Promise<string | undefined> {
+    return (await this.#findRow((m) => m.turnId === turnId))?.messageId;
+  }
+
+  /** First message matching `pred`: scrollback first, then the transcript on disk. */
+  async #findRow(pred: (m: SessionMessage) => boolean): Promise<SessionMessage | undefined> {
+    for (const m of this.#scrollback.read()) {
+      if (m.type === "session.message" && pred(m as SessionMessage)) return m as SessionMessage;
+    }
+    try {
+      const entries = await this.#transcriptStore.loadTranscript(this.id, { deadlineAt: Date.now() + 5_000 });
+      for (const e of entries) {
+        if (e.message.type === "session.message" && pred(e.message as SessionMessage)) return e.message as SessionMessage;
+      }
+    } catch {
+      // unreadable transcript → no row
+    }
+    return undefined;
+  }
+
+  #previewOf(text: string): string {
+    const first = text.trim().split("\n", 1)[0] ?? "";
+    return first.length > 80 ? `${first.slice(0, 79)}…` : first;
   }
 
   /**
@@ -5347,6 +5962,9 @@ export class Session {
     if (opts.persistIndex) void this.#transcriptStore.replaceTurnIndex(this.id, this.#turnIndex);
     this.#canonicalPartial = opts.partial;
     this.#currentTurnId = index.at(-1)?.turnId ?? [...history].reverse().find((t) => t.turnId)?.turnId ?? null;
+    // Every restored turn has ended: its end snapshot (if any) is the real
+    // one — a later idle must not re-take it from today's files.
+    this.#endSnapshotTurn = this.#currentTurnId;
   }
 
   /**
@@ -5459,6 +6077,8 @@ export class Session {
     // AFTER the flip so #maybeDeliverBackgroundReports sees status === "idle";
     // it no-ops instantly when the queue is empty (the overwhelming case).
     if (status === "idle") this.#maybeDeliverBackgroundReports();
+    // At rest: record the files the turn ended with (#355).
+    if (status === "idle" || status === "error") this.#snapshotTurnEnd();
 
     // Persisted status exists for restart resume (and the session list).
     // Terminal / parked states (idle, waiting_approval, error) mark durable
@@ -5555,6 +6175,7 @@ export class Session {
       projectId: this.projectId,
       role: this.role,
       providerId: this.#provider.id,
+      ...(this.#backingFresh ? { backingFresh: true } : {}),
       forkedFrom: this.forkedFrom,
       worktree: this.worktree,
       // MUST be written here too, not only at create: #writeMetaAtomic

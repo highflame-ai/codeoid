@@ -10,6 +10,7 @@
  *   codeoid send <name|id> <message>      Send a one-shot message
  *   codeoid interrupt <name|id>           Interrupt a running agent
  *   codeoid approve <name|id> [yes|no]    Approve/deny pending permission
+ *   codeoid undo <name|id> [files [yes|force]]  Take back the last message
  *   codeoid skill allow <command>          Pre-approve a skill's command (unattended runs)
  *   codeoid destroy <name|id>             Destroy a session
  */
@@ -588,6 +589,17 @@ program
     const client = new TerminalClient(config);
     await client.connect();
     await client.interruptSession(session);
+    client.disconnect();
+  });
+
+program
+  .command("undo <session> [args...]")
+  .description("Take back the last message (the agent forgets it); 'files' previews restoring the files, 'files yes' does it")
+  .action(async (session: string, args: string[]) => {
+    const config = loadConfig();
+    const client = new TerminalClient(config);
+    await client.connect();
+    await client.undoSession(session, args ?? []);
     client.disconnect();
   });
 

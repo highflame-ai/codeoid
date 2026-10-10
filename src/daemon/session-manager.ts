@@ -11,7 +11,7 @@
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, sep } from "node:path";
-import { SendStoppedError, Session, type AttachedClient, type WindowScope } from "./session.js";
+import { RewindError, SendStoppedError, Session, type AttachedClient, type WindowScope } from "./session.js";
 import { sweepCheckpoints } from "./checkpoints.js";
 import { type CatalogEntry, isPlaceholderModel, type SessionProvider } from "./providers/interface.js";
 import {
@@ -815,6 +815,7 @@ mcpHub: this.#mcpHub,
             persistIndex: !index && history.some((t) => t.turnId),
             partial: canonical?.partial ?? false,
           });
+          if (meta.backingFresh) await session.reseedFreshBacking();
         } catch (err) {
           console.error(
             `[codeoid/resume] canonical history restore failed for ${meta.sessionId} (session resumes without it): ${err instanceof Error ? err.message : String(err)}`,
@@ -1123,6 +1124,8 @@ mcpHub: this.#mcpHub,
         return this.#backendLoginCancel(msg, auth);
       case "session.turns":
         return this.#sessionTurns(msg, auth);
+      case "session.rewind":
+        return this.#sessionRewind(msg, auth);
       case "skill.grant":
         return this.#skillGrant(msg, auth);
       case "mcp.oauth.begin":
@@ -5256,6 +5259,86 @@ mcpHub: this.#mcpHub,
     }
     const { turns, checkpointsSupported } = await session.turns();
     return { type: "session.turns.result", requestId: msg.id, sessionId: session.id, turns, checkpointsSupported };
+  }
+
+  /**
+   * Go back a turn (#355). Same authority as sending a message: taking a
+   * turn back is a way of steering the session, and restoring files only
+   * puts back what the session's own snapshots hold.
+   */
+  async #sessionRewind(
+    msg: Extract<ClientMessage, { type: "session.rewind" }>,
+    auth: AuthContext,
+  ): Promise<DaemonMessage> {
+    if (!hasScope(auth.scopes as string[], SCOPES.SESSION_SEND)) {
+      return { type: "response.error", requestId: msg.id, error: "Missing scope: session:send", code: "forbidden" };
+    }
+    const session = this.#getOwnedSession(msg.sessionId, auth);
+    if (!session) {
+      return { type: "response.error", requestId: msg.id, error: "Session not found", code: "not_found" };
+    }
+    if (session.role) {
+      return { type: "response.error", requestId: msg.id, error: `Cannot go back a turn in a ${session.role} session`, code: "invalid_request" };
+    }
+    const canStop = hasScope(auth.scopes as string[], SCOPES.SESSION_INTERRUPT);
+    if (msg.dryRun === true) {
+      // A preview shows prompts, file paths and commands from the session's
+      // history: same read authority as listing its turns.
+      const canRead = hasScope(auth.scopes as string[], SCOPES.SESSION_ATTACH) || hasScope(auth.scopes as string[], SCOPES.SESSION_WATCH);
+      if (!canRead) {
+        return { type: "response.error", requestId: msg.id, error: "Missing scope: session:attach or session:watch (needed to preview)", code: "forbidden" };
+      }
+    } else {
+      // Writing files back (and deleting files created since) bypasses the
+      // approval gate every agent write goes through: same trust as
+      // approving a write.
+      if (msg.restoreFiles === true && !hasScope(auth.scopes as string[], SCOPES.SESSION_APPROVE)) {
+        return { type: "response.error", requestId: msg.id, error: "Missing scope: session:approve (needed to restore files)", code: "forbidden" };
+      }
+      // Stopping a running turn or background agents is an interrupt. Checked
+      // here to fail fast, and again inside the serialized rewind (the state
+      // can change while it queues).
+      if ((session.rewindNeedsStop || session.preparingTurn) && !canStop) {
+        return { type: "response.error", requestId: msg.id, error: "Missing scope: session:interrupt (the session is busy)", code: "forbidden" };
+      }
+    }
+    try {
+      const r = await session.rewind(
+        msg.turnId,
+        {
+          restoreFiles: msg.restoreFiles === true,
+          dryRun: msg.dryRun === true,
+          force: msg.force === true,
+          canStop,
+          ...(msg.planId ? { planId: msg.planId } : {}),
+        },
+        auth,
+      );
+      return {
+        type: "session.rewind.result",
+        requestId: msg.id,
+        sessionId: session.id,
+        turnId: msg.turnId,
+        dryRun: msg.dryRun === true || r.refused !== undefined,
+        planId: r.planId,
+        removedTurns: r.removedTurnIds.length,
+        restoredPrompt: r.restoredPrompt,
+        irreversible: r.irreversible,
+        ...(r.files ? { files: r.files } : {}),
+        ...(r.filesUnavailable ? { filesUnavailable: r.filesUnavailable } : {}),
+        ...(r.refused ? { refused: r.refused } : {}),
+      };
+    } catch (err) {
+      if (err instanceof RewindError) {
+        return {
+          type: "response.error",
+          requestId: msg.id,
+          error: err.message,
+          code: err.code === "not_found" ? "not_found" : "invalid_request",
+        };
+      }
+      throw err;
+    }
   }
 
   /** History paging (`scrollback.paging`) — same read authority as attach. */

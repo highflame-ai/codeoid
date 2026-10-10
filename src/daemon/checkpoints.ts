@@ -44,7 +44,8 @@
 
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import { appendFile, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, copyFile, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 
@@ -122,6 +123,11 @@ export const DEFAULT_CHECKPOINT_EXCLUDES = [
 
 /** Ids are uuids today; refuse anything that could escape a path or ref namespace. */
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+
+/** The checkpoint id of the files a turn ENDED with (#355). */
+export function endSnapshotId(turnId: string): string {
+  return `${turnId}-end`;
+}
 
 /** Where a session's shadow repository lives. */
 export function shadowRepoPath(root: string, sessionId: string): string {
@@ -289,6 +295,8 @@ export async function createCheckpoint(opts: {
    * — recorded as `late` so a restore can say so.
    */
   isLate?: () => boolean;
+  /** Record nothing if this turn id already has a checkpoint (never overwrite it). */
+  onlyIfMissing?: boolean;
 }): Promise<CheckpointResult> {
   const limits = { ...DEFAULT_CHECKPOINT_LIMITS, ...opts.limits };
   if (!SAFE_ID.test(opts.turnId)) return { ok: false, reason: `invalid turn id: ${opts.turnId}` };
@@ -303,6 +311,10 @@ export async function createCheckpoint(opts: {
   try {
     const t = limits.timeoutMs;
     await ensureShadow(shadow, t);
+    if (opts.onlyIfMissing) {
+      const existing = (await readOrder(shadow)).find((e) => e.turnId === opts.turnId);
+      if (existing) return { ok: true, sha: existing.sha, late: existing.late };
+    }
     // Over the storage budget: drop the older snapshots, oldest first, until
     // it fits — down to none, so a session whose tree alone nears the budget
     // still always has its latest snapshot rather than none ever again.
@@ -310,41 +322,10 @@ export async function createCheckpoint(opts: {
       await prune(shadow, keep, t, { reclaimNow: true }).catch(() => {});
       if (keep === 0) break;
     }
-    // A lock left by a snapshot killed mid-write (crash, forced shutdown).
-    // Ours are serialized by `inFlight`, so any lock here now is stale.
-    await rm(path.join(shadow, "index.lock"), { force: true });
-    const env = gitEnv({ GIT_DIR: shadow, GIT_WORK_TREE: opts.workdir });
-    const extra = (opts.excludeDirs ?? [])
-      .map((d) => path.relative(opts.workdir, d))
-      .filter((rel) => rel && !rel.startsWith("..") && !path.isAbsolute(rel))
-      .map((rel) => `${rel.split(path.sep).join("/")}/**`);
-    const spec = pathspecs(extra);
-
-    // Bound the content to hash before hashing anything. With no shadow index
-    // yet (first snapshot, or a fork's copied history) every file is new.
-    const first = !existsSync(path.join(shadow, "index"));
-    const maxFiles = first ? limits.maxFirstSnapshotFiles : limits.maxUntrackedFiles;
-    const maxBytes = first ? limits.maxFirstSnapshotBytes : limits.maxUntrackedBytes;
-    const listed = await run(["ls-files", "--others", "--exclude-standard", "-z", ...spec], { cwd: opts.workdir, env, timeoutMs: t });
-    const files = listed.split("\0").filter(Boolean);
-    if (files.length > maxFiles) {
-      return { ok: false, reason: `too many ${first ? "files" : "untracked files"} (${files.length} > ${maxFiles})` };
-    }
-    let bytes = 0;
-    for (const f of files) {
-      try {
-        const s = await stat(path.join(opts.workdir, f));
-        if (s.isFile()) bytes += s.size;
-      } catch {
-        // vanished between listing and stat
-      }
-      if (bytes > maxBytes) {
-        return { ok: false, reason: `${first ? "files" : "untracked files"} exceed ${Math.round(maxBytes / 1024 / 1024)} MB` };
-      }
-    }
-
-    await addAll(opts.workdir, env, t, extra);
+    const staged = await stageWorkTree(shadow, opts.workdir, limits, opts.excludeDirs);
+    if (!staged.ok) return staged;
     const late = opts.isLate?.() === true;
+    const { env, first } = staged;
     const tree = (await run(["write-tree"], { cwd: opts.workdir, env, timeoutMs: t })).trim();
     const message = `codeoid checkpoint\n\nsession: ${opts.sessionId}\nturn: ${opts.turnId}\n`;
     const sha = (await run(["commit-tree", tree, "-F", "-"], { cwd: opts.workdir, env, timeoutMs: t, input: message })).trim();
@@ -360,6 +341,192 @@ export async function createCheckpoint(opts: {
     return { ok: false, reason: err instanceof Error ? err.message : String(err) };
   } finally {
     inFlight.delete(shadow);
+  }
+}
+
+/**
+ * Stage the work tree into the shadow index — bounded by the limits — so
+ * `write-tree` yields its snapshot. Caller holds the shadow's in-flight slot.
+ */
+async function stageWorkTree(
+  shadow: string,
+  workdir: string,
+  limits: CheckpointLimits,
+  excludeDirs: readonly string[] | undefined,
+): Promise<{ ok: true; env: Record<string, string>; first: boolean } | { ok: false; reason: string }> {
+  const t = limits.timeoutMs;
+  {
+    // A lock left by a snapshot killed mid-write (crash, forced shutdown).
+    // Ours are serialized by `inFlight`, so any lock here now is stale.
+    await rm(path.join(shadow, "index.lock"), { force: true });
+    const env = gitEnv({ GIT_DIR: shadow, GIT_WORK_TREE: workdir });
+    const extra = (excludeDirs ?? [])
+      .map((d) => path.relative(workdir, d))
+      .filter((rel) => rel && !rel.startsWith("..") && !path.isAbsolute(rel))
+      .map((rel) => `${rel.split(path.sep).join("/")}/**`);
+    const spec = pathspecs(extra);
+
+    // Bound the content to hash before hashing anything. With no shadow index
+    // yet (first snapshot, or a fork's copied history) every file is new.
+    const first = !existsSync(path.join(shadow, "index"));
+    const maxFiles = first ? limits.maxFirstSnapshotFiles : limits.maxUntrackedFiles;
+    const maxBytes = first ? limits.maxFirstSnapshotBytes : limits.maxUntrackedBytes;
+    const listed = await run(["ls-files", "--others", "--exclude-standard", "-z", ...spec], { cwd: workdir, env, timeoutMs: t });
+    const files = listed.split("\0").filter(Boolean);
+    if (files.length > maxFiles) {
+      return { ok: false, reason: `too many ${first ? "files" : "untracked files"} (${files.length} > ${maxFiles})` };
+    }
+    let bytes = 0;
+    for (const f of files) {
+      try {
+        const s = await stat(path.join(workdir, f));
+        if (s.isFile()) bytes += s.size;
+      } catch {
+        // vanished between listing and stat
+      }
+      if (bytes > maxBytes) {
+        return { ok: false, reason: `${first ? "files" : "untracked files"} exceed ${Math.round(maxBytes / 1024 / 1024)} MB` };
+      }
+    }
+
+    await addAll(workdir, env, t, extra);
+    return { ok: true, env, first };
+  }
+}
+
+/**
+ * The work tree's current content as a tree id in the session's shadow repo
+ * (same scope and exclusions as a snapshot), without recording a checkpoint
+ * — what "go back a turn" compares a snapshot against.
+ */
+export async function currentTree(opts: {
+  root: string;
+  workdir: string;
+  sessionId: string;
+  excludeDirs?: readonly string[];
+  limits?: Partial<CheckpointLimits>;
+}): Promise<{ ok: true; tree: string } | { ok: false; reason: string }> {
+  const limits = { ...DEFAULT_CHECKPOINT_LIMITS, ...opts.limits };
+  const shadow = shadowRepoPath(opts.root, opts.sessionId);
+  if (inFlight.has(shadow)) return { ok: false, reason: "a snapshot is still running" };
+  inFlight.add(shadow);
+  try {
+    await ensureShadow(shadow, limits.timeoutMs);
+    const staged = await stageWorkTree(shadow, opts.workdir, limits, opts.excludeDirs);
+    if (!staged.ok) return staged;
+    const tree = (await run(["write-tree"], { cwd: opts.workdir, env: staged.env, timeoutMs: limits.timeoutMs })).trim();
+    return { ok: true, tree };
+  } catch (err) {
+    return { ok: false, reason: err instanceof Error ? err.message : String(err) };
+  } finally {
+    inFlight.delete(shadow);
+  }
+}
+
+/** One path's change between two snapshots. */
+export interface TreeChange {
+  /** A = only in `to`; D = only in `from`; M = content or mode differs; T = type differs. */
+  status: "A" | "D" | "M" | "T";
+  path: string;
+}
+
+/** What differs between two trees/commits of a session's shadow repo. */
+export async function diffTrees(root: string, sessionId: string, from: string, to: string): Promise<TreeChange[]> {
+  const out = await shadowGit(root, sessionId, ["diff-tree", "-r", "-z", "--no-renames", "--name-status", from, to]);
+  const parts = out.split("\0").filter((p) => p.length > 0);
+  const changes: TreeChange[] = [];
+  for (let i = 0; i + 1 < parts.length; i += 2) {
+    const status = parts[i]![0] as TreeChange["status"];
+    if (status === "A" || status === "D" || status === "M" || status === "T") changes.push({ status, path: parts[i + 1]! });
+  }
+  return changes;
+}
+
+/**
+ * Put the work tree back from tree `from` (its current content, from
+ * {@link currentTree}) to snapshot `to`, in one git operation: a two-tree
+ * `read-tree -m -u` over a throwaway index. Git writes back changed and
+ * deleted files and removes created ones with its own safeguards: it never
+ * writes or unlinks through a symlinked parent, it refuses (changing
+ * nothing) if any file differs from `from` — something changed since the
+ * preview — and it never overwrites an untracked file. Ignored and excluded
+ * files were never in either tree, so they are never touched.
+ *
+ * `keep` lists paths that must stay as they are in `from` (protected
+ * directories, a deleted file whose path is now taken by an ignored one):
+ * the target is `to` with those entries taken from `from`.
+ */
+export async function restoreTree(opts: {
+  root: string;
+  workdir: string;
+  sessionId: string;
+  from: string;
+  to: string;
+  keep?: readonly string[];
+}): Promise<void> {
+  const shadow = shadowRepoPath(opts.root, opts.sessionId);
+  if (inFlight.has(shadow)) throw new Error("a snapshot is still running — try again");
+  inFlight.add(shadow);
+  const tmpIndex = path.join(shadow, `index.restore-${process.pid}-${Date.now()}`);
+  const t = DEFAULT_CHECKPOINT_LIMITS.timeoutMs * 2;
+  try {
+    const env = gitEnv({ GIT_DIR: shadow, GIT_WORK_TREE: opts.workdir, GIT_INDEX_FILE: tmpIndex });
+    let target = opts.to;
+    if (opts.keep && opts.keep.length > 0) target = await treeKeeping(shadow, opts.to, opts.from, opts.keep, t);
+    // Start from the shadow index — {@link currentTree} just staged `from`
+    // into it, so its stat cache spares a full re-hash on a big tree — then
+    // make it exactly `from` (a one-tree merge keeps the cached stats).
+    try {
+      await copyFile(path.join(shadow, "index"), tmpIndex);
+      await run(["read-tree", "-m", opts.from], { cwd: opts.workdir, env, timeoutMs: t });
+    } catch {
+      await rm(tmpIndex, { force: true }).catch(() => {});
+      await run(["read-tree", opts.from], { cwd: opts.workdir, env, timeoutMs: t });
+    }
+    // Stat-refresh so read-tree can verify the work tree still matches `from`.
+    await run(["update-index", "--refresh"], { cwd: opts.workdir, env, timeoutMs: t }).catch(() => {});
+    try {
+      await run(["read-tree", "-m", "-u", opts.from, target], { cwd: opts.workdir, env, timeoutMs: t });
+    } catch (err) {
+      const stderr = String((err as { stderr?: unknown }).stderr ?? "").trim();
+      if (/not uptodate|would be overwritten/.test(stderr)) {
+        throw new RestoreConflictError(`files changed since the preview, nothing was restored (${stderr.split("\n")[0]})`);
+      }
+      throw err;
+    }
+  } finally {
+    inFlight.delete(shadow);
+    await rm(tmpIndex, { force: true }).catch(() => {});
+    await rm(`${tmpIndex}.lock`, { force: true }).catch(() => {});
+  }
+}
+
+/** The files changed under the restore between preview and apply. Nothing was written. */
+export class RestoreConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RestoreConflictError";
+  }
+}
+
+/** Tree `to`, with each path in `keep` as it is in `from` (or absent when `from` lacks it). */
+async function treeKeeping(shadow: string, to: string, from: string, keep: readonly string[], timeoutMs: number): Promise<string> {
+  const tmp = path.join(shadow, `index.keep-${process.pid}-${Date.now()}`);
+  const env = gitEnv({ GIT_DIR: shadow, GIT_INDEX_FILE: tmp, GIT_LITERAL_PATHSPECS: "1" });
+  try {
+    await run(["read-tree", to], { cwd: shadow, env, timeoutMs });
+    const listed = await run(["ls-tree", "-r", "-z", "--full-tree", from, "--", ...keep], { cwd: shadow, env, timeoutMs });
+    const present = new Map<string, string>(); // path → "mode sha"
+    for (const entry of listed.split("\0").filter(Boolean)) {
+      const tab = entry.indexOf("\t");
+      const [mode, , sha] = entry.slice(0, tab).split(" ");
+      present.set(entry.slice(tab + 1), `${mode} ${sha}`);
+    }
+    const lines = keep.map((p) => (present.has(p) ? `${present.get(p)}\t${p}` : `0 ${"0".repeat(40)}\t${p}`)).join("\0");
+    await run(["update-index", "-z", "--index-info"], { cwd: shadow, env, timeoutMs, input: `${lines}\0` });
+    return (await run(["write-tree"], { cwd: shadow, env, timeoutMs })).trim();
+  } finally {
+    await rm(tmp, { force: true }).catch(() => {});
   }
 }
 
@@ -508,6 +675,79 @@ export async function deleteCheckpoints(root: string, sessionId: string): Promis
     await rm(shadowRepoPath(root, sessionId), { recursive: true, force: true });
   } catch {
     // best-effort
+  }
+}
+
+/** {@link shadowGit} with literal pathspecs (a file named `*` is that file). */
+export function shadowGitLiteral(root: string, sessionId: string, args: string[]): Promise<string> {
+  const shadow = shadowRepoPath(root, sessionId);
+  return run(args, {
+    cwd: shadow,
+    env: gitEnv({ GIT_DIR: shadow, GIT_LITERAL_PATHSPECS: "1" }),
+    timeoutMs: DEFAULT_CHECKPOINT_LIMITS.timeoutMs,
+  });
+}
+
+/**
+ * Which of `paths` are ignored under the `.gitignore` files of snapshot
+ * `sha` (#355) — files it couldn't have held because they were ignored then,
+ * so their absence from it says nothing about whether they were created
+ * since. The snapshot's ignore files are materialized in a scratch directory
+ * and asked with `check-ignore --no-index`; nothing in the workdir is read.
+ */
+export async function ignoredUnderTree(root: string, sessionId: string, sha: string, paths: readonly string[]): Promise<string[]> {
+  if (paths.length === 0) return [];
+  const shadow = shadowRepoPath(root, sessionId);
+  const scratch = await mkdtemp(path.join(tmpdir(), "codeoid-ign-"));
+  const t = DEFAULT_CHECKPOINT_LIMITS.timeoutMs;
+  try {
+    const listed = await run(["ls-tree", "-r", "-z", "--name-only", sha], {
+      cwd: shadow,
+      env: gitEnv({ GIT_DIR: shadow }),
+      timeoutMs: t,
+    });
+    const ignoreFiles = listed.split("\0").filter((p) => p === ".gitignore" || p.endsWith("/.gitignore"));
+    // One process for every ignore file: `cat-file --batch` answers
+    // "<oid> blob <size>\n<content>\n" per request line.
+    if (ignoreFiles.length > 0) {
+      const raw = await new Promise<Buffer>((resolve, reject) => {
+        const child = execFile(
+          "git",
+          [...SAFE_FLAGS, "cat-file", "--batch"],
+          { cwd: shadow, env: gitEnv({ GIT_DIR: shadow }), timeout: t, maxBuffer: 64 * 1024 * 1024, encoding: "buffer" },
+          (err, stdout) => (err ? reject(err) : resolve(stdout as Buffer)),
+        );
+        child.stdin?.end(`${ignoreFiles.map((rel) => `${sha}:${rel}`).join("\n")}\n`);
+      });
+      let at = 0;
+      for (const rel of ignoreFiles) {
+        const nl = raw.indexOf(0x0a, at);
+        const header = raw.subarray(at, nl).toString("utf8").split(" ");
+        const size = Number(header[2]);
+        if (header[1] !== "blob" || !Number.isFinite(size)) break;
+        const body = raw.subarray(nl + 1, nl + 1 + size);
+        at = nl + 1 + size + 1;
+        const dest = path.join(scratch, rel);
+        await mkdir(path.dirname(dest), { recursive: true });
+        await writeFile(dest, body);
+      }
+    }
+    await run(["init", "-q", scratch], { cwd: scratch, env: gitEnv({}), timeoutMs: t });
+    let out = "";
+    try {
+      out = await run(["check-ignore", "--no-index", "-z", "--stdin"], {
+        cwd: scratch,
+        env: gitEnv({ GIT_DIR: path.join(scratch, ".git"), GIT_WORK_TREE: scratch }),
+        timeoutMs: t,
+        input: `${paths.join("\0")}\0`,
+      });
+    } catch (err) {
+      // exit 1 = none ignored
+      out = String((err as { stdout?: unknown }).stdout ?? "");
+    }
+    return out.split("\0").filter(Boolean);
+  } finally {
+    await rm(scratch, { recursive: true, force: true }).catch(() => {});
   }
 }
 

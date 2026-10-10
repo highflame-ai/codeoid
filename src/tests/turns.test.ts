@@ -227,14 +227,14 @@ describe("session.turns + checkpoints", () => {
     await sendAndSettle(m, id, "hello");
     const r = await turnsOf(m, id);
     expect(r.checkpointsSupported).toBe(false);
-    expect((await listCheckpoints(ckptRoot(), id)).size).toBe(0);
+    expect([...(await listCheckpoints(ckptRoot(), id)).keys()].filter((k) => !k.endsWith("-end")).length).toBe(0);
   });
 
   it("deletes the session's snapshots when it is destroyed", async () => {
     const m = newManager();
     const id = await create(m);
     await sendAndSettle(m, id, "hello");
-    expect((await listCheckpoints(ckptRoot(), id)).size).toBe(1);
+    expect([...(await listCheckpoints(ckptRoot(), id)).keys()].filter((k) => !k.endsWith("-end")).length).toBe(1);
     const r = await m.handle({ type: "session.destroy", id: "d", sessionId: id }, AUTH, { id: "cli", auth: AUTH, send: () => {} });
     expect(r.type).toBe("response.ok");
     expect(existsSync(shadowRepoPath(ckptRoot(), id))).toBe(false);
@@ -431,7 +431,7 @@ describe("turn attribution across mid-turn messages, rotation and forks", () => 
     await expect(sending).rejects.toBeInstanceOf(SendStoppedError);
     const t = await turnsOf(m, id);
     expect(t.turns.map((x) => x.preview)).toEqual(["real"]);
-    expect((await listCheckpoints(ckptRoot(), id)).size).toBe(1);
+    expect([...(await listCheckpoints(ckptRoot(), id)).keys()].filter((k) => !k.endsWith("-end")).length).toBe(1);
   });
 });
 

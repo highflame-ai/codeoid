@@ -196,6 +196,29 @@ export class TuiWsClient {
     return this.#request({ type: "session.rotate", id: randomUUID(), sessionId });
   }
 
+  /** A session's turns, oldest first (#354). */
+  turns(sessionId: string): Promise<DaemonMessage> {
+    return this.#request({ type: "session.turns", id: randomUUID(), sessionId });
+  }
+
+  /** Go back to before `turnId` (#355). */
+  rewind(
+    sessionId: string,
+    turnId: string,
+    opts: { restoreFiles: boolean; dryRun: boolean; force: boolean; planId?: string },
+  ): Promise<DaemonMessage> {
+    return this.#request({
+      type: "session.rewind",
+      id: randomUUID(),
+      sessionId,
+      turnId,
+      ...(opts.restoreFiles ? { restoreFiles: true } : {}),
+      ...(opts.dryRun ? { dryRun: true } : {}),
+      ...(opts.force ? { force: true } : {}),
+      ...(opts.planId ? { planId: opts.planId } : {}),
+    });
+  }
+
   search(
     query: string,
     workdir?: string,
