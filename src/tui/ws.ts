@@ -205,7 +205,7 @@ export class TuiWsClient {
   rewind(
     sessionId: string,
     turnId: string,
-    opts: { restoreFiles: boolean; dryRun: boolean; force: boolean },
+    opts: { restoreFiles: boolean; dryRun: boolean; force: boolean; planId?: string },
   ): Promise<DaemonMessage> {
     return this.#request({
       type: "session.rewind",
@@ -215,6 +215,7 @@ export class TuiWsClient {
       ...(opts.restoreFiles ? { restoreFiles: true } : {}),
       ...(opts.dryRun ? { dryRun: true } : {}),
       ...(opts.force ? { force: true } : {}),
+      ...(opts.planId ? { planId: opts.planId } : {}),
     });
   }
 

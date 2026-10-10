@@ -13,7 +13,8 @@ vi.mock("../state/connection", () => ({
   getClient: () => ({ request: (msg: Record<string, unknown>) => clientRequest(msg) }),
 }));
 const setDraftMock = vi.hoisted(() => vi.fn());
-vi.mock("../state/prompt-drafts", () => ({ setDraft: setDraftMock }));
+const draftHolder = vi.hoisted(() => ({ value: "" }));
+vi.mock("../state/prompt-drafts", () => ({ setDraft: setDraftMock, getDraft: () => draftHolder.value }));
 
 import RewindModal, { openRewind, openUndoLast } from "./RewindModal";
 
@@ -23,6 +24,7 @@ const plan = (over: Record<string, unknown> = {}) => ({
   sessionId: "s",
   turnId: "t2",
   dryRun: true,
+  planId: "plan-1",
   removedTurns: 2,
   restoredPrompt: "oops, the wrong prompt",
   irreversible: [{ tool: "Bash", detail: "git push origin main" }],
@@ -67,7 +69,35 @@ describe("RewindModal", () => {
     expect(r.getByText(/will be overwritten/)).toBeTruthy();
     fireEvent.click(r.getByRole("button", { name: "Go back and overwrite my edits" }));
     await waitFor(() => expect(clientRequest).toHaveBeenCalledTimes(2));
-    expect(clientRequest.mock.calls[1]![0]).toMatchObject({ restoreFiles: true, force: true });
+    expect(clientRequest.mock.calls[1]![0]).toMatchObject({ restoreFiles: true, force: true, planId: "plan-1" });
+  });
+
+  it("if the session changed since the preview, shows the fresh preview instead of going ahead", async () => {
+    let calls = 0;
+    clientRequest.mockImplementation(async (msg) => {
+      calls++;
+      if (!msg.dryRun) return plan({ dryRun: true, refused: "the session changed since the preview — review it again." });
+      return calls === 1 ? plan() : plan({ planId: "plan-2", files: { restore: ["a.txt", "b.txt"], remove: [], conflicts: [], applied: false } });
+    });
+    const r = render(() => <RewindModal />);
+    openRewind("s", "t2");
+    await waitFor(() => r.getByText(/oops/));
+    fireEvent.click(r.getByRole("checkbox"));
+    fireEvent.click(r.getByRole("button", { name: "Go back" }));
+    await waitFor(() => r.getByText(/changed since the preview/));
+    expect(r.getByText("b.txt")).toBeTruthy();
+    expect(setDraftMock).not.toHaveBeenCalled();
+  });
+
+  it("puts the prompt above a half-typed draft rather than over it", async () => {
+    draftHolder.value = "something I was typing";
+    clientRequest.mockImplementation(async (msg) => (msg.dryRun ? plan() : plan({ dryRun: false })));
+    const r = render(() => <RewindModal />);
+    openRewind("s", "t2");
+    await waitFor(() => r.getByText(/oops/));
+    fireEvent.click(r.getByRole("button", { name: "Go back" }));
+    await waitFor(() => expect(setDraftMock).toHaveBeenCalledWith("s", "oops, the wrong prompt\n\nsomething I was typing"));
+    draftHolder.value = "";
   });
 
   it("says when files can't be restored, and keeps the checkbox off", async () => {

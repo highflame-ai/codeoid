@@ -164,6 +164,9 @@ export class PiProvider implements SessionProvider {
   }
 
   resetToNewSession(newBackingId: string): void {
+    // A fresh backing session starts from nothing: a seed queued for the
+    // previous one (a backend switch, a rewind) must not ride along (#355).
+    this.#pendingHistorySeed = null;
     this.#backingSessionId = newBackingId;
     // A live process starts a fresh pi session; the real session file is
     // re-captured (and persisted) on the next turn's get_state.

@@ -704,6 +704,9 @@ export function App({ config }: Props) {
     });
   };
 
+  /** The last `/undo files` preview, confirmed by `/undo files yes|force` (#355). */
+  const undoPreviewRef = useRef<{ sessionId: string; turnId: string; planId: string } | null>(null);
+
   /** A local, never-sent notice in the session's scrollback. */
   const printLocalInfo = (sessionId: string, content: string) => {
     dispatch({
@@ -878,14 +881,33 @@ export function App({ config }: Props) {
         }
         const sessionId = focusedSession.info.id;
         void (async () => {
-          const list = await client.turns(sessionId);
-          if (list.type !== "session.turns.result") throw new Error("could not list turns");
-          const last = list.turns.at(-1);
-          if (!last) throw new Error("nothing to undo");
-          const res = await client.rewind(sessionId, last.turnId, req);
+          // Restoring files confirms exactly the previewed turn and plan
+          // (the daemon refuses if anything changed); without a preview,
+          // preview and confirm that plan in one go.
+          let target = undoPreviewRef.current?.sessionId === sessionId ? undoPreviewRef.current : null;
+          undoPreviewRef.current = null;
+          const latest = async () => {
+            const list = await client.turns(sessionId);
+            if (list.type !== "session.turns.result") throw new Error("could not list turns");
+            const last = list.turns.at(-1);
+            if (!last) throw new Error("nothing to undo");
+            return last.turnId;
+          };
+          if (req.restoreFiles && !req.dryRun && !target) {
+            const turnId = await latest();
+            const pre = await client.rewind(sessionId, turnId, { restoreFiles: true, dryRun: true, force: false });
+            if (pre.type !== "session.rewind.result") throw new Error(pre.type === "response.error" ? pre.error : "undo failed");
+            target = { sessionId, turnId, planId: pre.planId };
+          }
+          const turnId = req.restoreFiles && !req.dryRun ? target!.turnId : await latest();
+          const res = await client.rewind(sessionId, turnId, {
+            ...req,
+            ...(req.restoreFiles && !req.dryRun ? { planId: target!.planId } : {}),
+          });
           if (res.type !== "session.rewind.result") {
             throw new Error(res.type === "response.error" ? res.error : "undo failed");
           }
+          if (req.dryRun) undoPreviewRef.current = { sessionId, turnId, planId: res.planId };
           printLocalInfo(sessionId, formatRewind(res));
           if (!res.dryRun && !res.refused && res.restoredPrompt) {
             dispatch({ type: "input.set", value: res.restoredPrompt });

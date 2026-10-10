@@ -58,6 +58,8 @@ import type {
   SessionWorktree,
 } from "../protocol/types.js";
 import { dirname, join } from "node:path";
+import { createHash } from "node:crypto";
+import { lstat } from "node:fs/promises";
 import { removeForkWorktree } from "./git-worktree.js";
 import {
   copyCheckpoints,
@@ -67,8 +69,10 @@ import {
   deleteCheckpoints,
   diffTrees,
   endSnapshotId,
+  ignoredUnderTree,
   listCheckpoints,
   restoreTree,
+  shadowGitLiteral,
 } from "./checkpoints.js";
 import { applyRewinds, REWIND_EVENT, type TurnIndexEntry } from "./transcript.js";
 import type { RewindFiles, RewindIrreversible, TurnSummary } from "../protocol/types.js";
@@ -438,15 +442,34 @@ export interface RewindOutcome {
   filesUnavailable?: string;
   /** Set when nothing was changed because going back would lose hand edits. */
   refused?: string;
-  /** Internal: the snapshot and the changes to apply. */
+  /** Identifies exactly this plan: a real run given it refuses if anything changed. */
+  planId: string;
+  /** Internal: the snapshot, the current tree, the changes to apply, paths left alone. */
   checkpointSha?: string;
+  currentTreeSha?: string;
   fileChanges?: import("./checkpoints.js").TreeChange[];
+  keepPaths?: string[];
+}
+
+/** A short, stable id for a rewind plan. */
+function planHash(parts: readonly string[]): string {
+  return createHash("sha256").update(parts.join("\0")).digest("hex").slice(0, 24);
+}
+
+/** Whether `rel` exists in `workdir` (any file type, links not followed). */
+async function existsOnDisk(workdir: string, rel: string): Promise<boolean> {
+  try {
+    await lstat(join(workdir, rel));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** A rewind that can't proceed (unknown turn, a turn that wouldn't stop). */
 export class RewindError extends Error {
   constructor(
-    readonly code: "not_found" | "busy",
+    readonly code: "not_found" | "busy" | "restore_failed",
     message: string,
   ) {
     super(message);
@@ -475,8 +498,8 @@ export function irreversibleEffects(turns: readonly CanonicalTurn[]): RewindIrre
       const tool = tc.originalName ?? tc.name;
       if (tc.name.startsWith("mcp__") || tool.startsWith("mcp__")) {
         out.push({ tool, detail: shorten(JSON.stringify(tc.input)) });
-      } else if (tc.name === "run_shell") {
-        const cmd = typeof tc.input.command === "string" ? tc.input.command : "";
+      } else if (isShellTool(tc.name, tool)) {
+        const cmd = shellCommandOf(tc.input);
         if (OUTSIDE_EFFECT_COMMAND.test(cmd)) out.push({ tool, detail: shorten(cmd) });
       }
     }
@@ -484,8 +507,32 @@ export function irreversibleEffects(turns: readonly CanonicalTurn[]): RewindIrre
   return out;
 }
 
+/** Shell tools under every backend's name (normalized or raw: Bash, bash, run_shell_command, shell, exec_command…). */
+const SHELL_TOOL_NAMES = new Set(["run_shell", "bash", "shell", "run_shell_command", "exec_command", "local_shell", "terminal", "exec"]);
+
+function isShellTool(name: string, original: string): boolean {
+  return SHELL_TOOL_NAMES.has(name.toLowerCase()) || SHELL_TOOL_NAMES.has(original.toLowerCase());
+}
+
+/** The command a shell tool ran, whichever field shape the backend used. */
+function shellCommandOf(input: Record<string, unknown>): string {
+  for (const k of ["command", "cmd", "script"]) {
+    const v = input[k];
+    if (typeof v === "string") return v;
+    if (Array.isArray(v)) return v.map(String).join(" ");
+  }
+  return "";
+}
+
+/** Secret-looking values never reach the list (auth headers, tokens, keys). */
+function redactSecrets(s: string): string {
+  return s
+    .replace(/(authorization|x-api-key|api[-_]?key|token|secret|password|passwd)(["']?\s*[:=]\s*["']?|\s+)(bearer\s+)?[^\s"',}]+/gi, "$1$2$3«redacted»")
+    .replace(/\b(sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[abpr]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|zid_sk_[A-Za-z0-9_-]+)\b/g, "«redacted»");
+}
+
 function shorten(s: string): string {
-  const one = s.replace(/\s+/g, " ").trim();
+  const one = redactSecrets(s).replace(/\s+/g, " ").trim();
   return one.length > 160 ? `${one.slice(0, 159)}…` : one;
 }
 
@@ -609,6 +656,10 @@ export class Session {
   #checkpointChain: Promise<unknown> = Promise.resolve();
   /** The turn whose end-of-turn snapshot has been taken (#355). */
   #endSnapshotTurn: string | null = null;
+  /** The backend was reset and holds no conversation yet (see TranscriptMeta.backingFresh). */
+  #backingFresh = false;
+  /** A rewind is in progress: nothing may wake the agent meanwhile. */
+  #rewinding = false;
   /**
    * Recently-processed `session.send.clientMsgId`s (`send.idempotency`) —
    * insertion-ordered for FIFO eviction. Bounds the window in which an
@@ -2271,6 +2322,7 @@ export class Session {
 
     this.#currentTurnId = turnId;
     this.#indexTurn(turnId, "prompt", text, turnAt);
+    this.#markBackingFresh(false);
     this.#accumulator.pushUserTurn(effectivePrompt, turnId, { prompt: text, at: turnAt });
     const run = this.#provider.runTurn({
       history: this.#accumulator.history,
@@ -2615,6 +2667,8 @@ export class Session {
     // interrupt) would inject a duplicate turn beside the backend's own.
     if (this.#provider.continuesAfterBackgroundWork && !opts.fallback) return;
     if (this.#destroyed) return;
+    // Mid-rewind: these reports belong to turns being taken back (#355).
+    if (this.#rewinding) return;
     if (this.#deliveringBackgroundReports) return;
     if (this.#pendingBackgroundReports.length === 0) return;
     // Between turns only. A background agent's pending approval (status
@@ -5447,13 +5501,19 @@ export class Session {
    * reset and re-seeded from what's kept — the same path a backend switch
    * uses — so every current and future provider forgets the removed turns,
    * restart or not. With `restoreFiles`, the working directory goes back to
-   * that turn's starting snapshot; files changed by hand since the agent's
-   * last turn are reported as conflicts and only overwritten with `force`.
-   * A running turn (or a send still preparing one) is stopped first.
-   * Serialized with sends. A dry run changes nothing and stops nothing.
+   * that turn's starting snapshot; files edited by hand during the removed
+   * turns (or when that can't be told) are reported as conflicts and only
+   * overwritten with `force`. `planId` (from a dry run) makes the real run
+   * refuse if anything changed since that preview. A running turn and
+   * background agents are stopped first. Serialized with sends; a dry run
+   * changes nothing and stops nothing.
    */
-  rewind(turnId: string, opts: { restoreFiles?: boolean; dryRun?: boolean; force?: boolean }, sender: AuthContext): Promise<RewindOutcome> {
-    if (opts.dryRun) return this.#planRewind(turnId, opts.restoreFiles === true);
+  rewind(
+    turnId: string,
+    opts: { restoreFiles?: boolean; dryRun?: boolean; force?: boolean; planId?: string },
+    sender: AuthContext,
+  ): Promise<RewindOutcome> {
+    if (opts.dryRun) return this.#serializedCheckpointOp(() => this.#planRewind(turnId, opts.restoreFiles === true));
     const job = this.#sendChain.catch(() => undefined).then(() => this.#rewindInner(turnId, opts, sender));
     this.#sendChain = job.then(
       () => undefined,
@@ -5462,28 +5522,50 @@ export class Session {
     return job;
   }
 
+  /** True while anything is running that a rewind must stop first. */
+  get rewindNeedsStop(): boolean {
+    return (
+      this.#activeRun !== null ||
+      isActiveStatus(this.#status) ||
+      this.#status === "waiting_approval" ||
+      this.#backgroundWorkLive()
+    );
+  }
+
+  /** Run `fn` on the snapshot queue, so it never races a snapshot (they share an index). */
+  #serializedCheckpointOp<T>(fn: () => Promise<T>): Promise<T> {
+    const job = this.#checkpointChain.then(fn);
+    this.#checkpointChain = job.catch(() => undefined);
+    return job;
+  }
+
   /** What going back to before `turnId` would remove, restore and not undo. */
   async #planRewind(turnId: string, restoreFiles: boolean): Promise<RewindOutcome> {
     const pos = this.#turnIndex.findIndex((e) => e.turnId === turnId);
     if (pos === -1) throw new RewindError("not_found", "That turn isn't in this session (or is older than its turn list).");
-    const removed = new Set(this.#turnIndex.slice(pos).map((e) => e.turnId));
+    const removedIds = this.#turnIndex.slice(pos).map((e) => e.turnId);
+    const removed = new Set(removedIds);
     const history = await this.fullCanonicalHistory();
     let cut = history.findIndex((t) => t.turnId !== undefined && removed.has(t.turnId));
     if (cut === -1) cut = history.length;
     const removedCanon = history.slice(cut);
     const restoredPrompt = await this.#promptOf(turnId, removedCanon);
     const plan: RewindOutcome = {
-      removedTurnIds: [...removed],
+      removedTurnIds: removedIds,
       keptHistory: history.slice(0, cut),
       restoredPrompt,
       irreversible: irreversibleEffects(removedCanon),
+      planId: "",
     };
-    if (!restoreFiles) return plan;
-    if (!this.#checkpointsEnabled()) return { ...plan, filesUnavailable: "workspace snapshots are turned off (session.checkpoints.enabled)" };
-    await Promise.allSettled([...this.#pendingCheckpoints]);
+    if (!restoreFiles) return { ...plan, planId: planHash([turnId, ...removedIds]) };
+    if (!this.#checkpointsEnabled()) {
+      return { ...plan, planId: planHash([turnId, ...removedIds]), filesUnavailable: "workspace snapshots are turned off (session.checkpoints.enabled)" };
+    }
     const records = await listCheckpoints(this.#checkpointRoot, this.id);
     const start = records.get(turnId);
-    if (!start) return { ...plan, filesUnavailable: "there is no snapshot of the files from when that turn started" };
+    if (!start) {
+      return { ...plan, planId: planHash([turnId, ...removedIds]), filesUnavailable: "there is no snapshot of the files from when that turn started" };
+    }
     const now = await currentTree({
       root: this.#checkpointRoot,
       workdir: this.workdir,
@@ -5491,54 +5573,139 @@ export class Session {
       excludeDirs: this.#protectedDirs(),
       limits: this.#checkpointLimits(),
     });
-    if (!now.ok) return { ...plan, filesUnavailable: `the current files couldn't be read: ${now.reason}` };
+    if (!now.ok) return { ...plan, planId: planHash([turnId, ...removedIds]), filesUnavailable: `the current files couldn't be read: ${now.reason}` };
     const changes = await diffTrees(this.#checkpointRoot, this.id, start.sha, now.tree);
-    // Hand edits: what differs from the files the agent's last turn ended with.
-    const lastTurn = this.#turnIndex.at(-1)?.turnId;
-    const end = lastTurn ? records.get(endSnapshotId(lastTurn)) : undefined;
-    const handEdited = end ? new Set((await diffTrees(this.#checkpointRoot, this.id, end.sha, now.tree)).map((c) => c.path)) : new Set<string>();
+
+    // Never delete a file the snapshot didn't hold because it was IGNORED
+    // then (a removed turn changed .gitignore): we can't know it was created
+    // since. Never write over a path now held by an ignored/excluded file.
+    const created = changes.filter((c) => c.status === "A").map((c) => c.path);
+    const keep = new Set(await ignoredUnderTree(this.#checkpointRoot, this.id, start.sha, created));
+    for (const c of changes) {
+      if (c.status !== "A" && (await existsOnDisk(this.workdir, c.path)) && !(await this.#inTree(now.tree, c.path))) keep.add(c.path);
+    }
+    const effective = changes.filter((c) => !keep.has(c.path));
+
+    // Hand edits: every gap between the removed turns (one's end → the next's
+    // start), and the last end → now. A missing snapshot means we can't tell
+    // the agent's edits from the person's: treat them all as the person's.
+    let unverified = false;
+    const handEdited = new Set<string>();
+    const gaps: Array<[string | undefined, string | undefined]> = [];
+    for (let k = pos; k < this.#turnIndex.length; k++) {
+      const end = records.get(endSnapshotId(this.#turnIndex[k]!.turnId))?.sha;
+      const next = k + 1 < this.#turnIndex.length ? records.get(this.#turnIndex[k + 1]!.turnId)?.sha : now.tree;
+      gaps.push([end, next]);
+    }
+    for (const [a, b] of gaps) {
+      if (!a || !b) {
+        unverified = true;
+        continue;
+      }
+      for (const c of await diffTrees(this.#checkpointRoot, this.id, a, b)) handEdited.add(c.path);
+    }
+    const conflicts = effective.filter((c) => unverified || handEdited.has(c.path)).map((c) => c.path);
     return {
       ...plan,
-      fileChanges: changes,
+      planId: planHash([turnId, ...removedIds, start.sha, now.tree, ...conflicts.sort()]),
+      fileChanges: effective,
       checkpointSha: start.sha,
+      currentTreeSha: now.tree,
+      keepPaths: [...keep],
       files: {
-        restore: changes.filter((c) => c.status !== "A").map((c) => c.path),
-        remove: changes.filter((c) => c.status === "A").map((c) => c.path),
-        conflicts: changes.filter((c) => handEdited.has(c.path)).map((c) => c.path),
+        restore: effective.filter((c) => c.status !== "A").map((c) => c.path),
+        remove: effective.filter((c) => c.status === "A").map((c) => c.path),
+        conflicts,
+        ...(unverified && conflicts.length > 0 ? { unverified: true } : {}),
         ...(start.late ? { late: true } : {}),
         applied: false,
       },
     };
   }
 
-  async #rewindInner(turnId: string, opts: { restoreFiles?: boolean; force?: boolean }, sender: AuthContext): Promise<RewindOutcome> {
-    if (this.#destroyed) throw new RewindError("not_found", "Session is gone");
-    // Stop whatever is running: the turn, a send preparing one, background
-    // agents (they belong to the context being taken back).
-    if (isActiveStatus(this.#status) || this.preparingTurn || this.#backgroundWorkLive()) {
-      await this.interrupt(sender);
-      for (let i = 0; i < 200 && isActiveStatus(this.#status); i++) await new Promise((r) => setTimeout(r, 50));
-      if (isActiveStatus(this.#status)) throw new RewindError("busy", "The running turn didn't stop — try again.");
+  async #inTree(tree: string, rel: string): Promise<boolean> {
+    try {
+      const out = await shadowGitLiteral(this.#checkpointRoot, this.id, ["ls-tree", "--full-tree", "--name-only", tree, "--", rel]);
+      return out.trim().length > 0;
+    } catch {
+      return false;
     }
-    const plan = await this.#planRewind(turnId, opts.restoreFiles === true);
+  }
+
+  async #rewindInner(
+    turnId: string,
+    opts: { restoreFiles?: boolean; force?: boolean; planId?: string },
+    sender: AuthContext,
+  ): Promise<RewindOutcome> {
+    if (this.#destroyed) throw new RewindError("not_found", "Session is gone");
+    this.#rewinding = true;
+    try {
+      return await this.#rewindStopped(turnId, opts, sender);
+    } finally {
+      this.#rewinding = false;
+    }
+  }
+
+  async #rewindStopped(
+    turnId: string,
+    opts: { restoreFiles?: boolean; force?: boolean; planId?: string },
+    sender: AuthContext,
+  ): Promise<RewindOutcome> {
+    // Stop whatever runs: the turn (approvals included) and background agents
+    // — they belong to the context being taken back. Then tear the backend
+    // down, so a cooperative cancel can't finish a write after the restore.
+    const wasBusy = this.rewindNeedsStop;
+    if (wasBusy) await this.interrupt(sender);
+    await this.#teardownProvider();
+    // Reports of background work from the removed turns must not wake the
+    // fresh agent about work it was told to forget.
+    this.#pendingBackgroundReports = [];
+    if (this.#backgroundWakeFallback) {
+      clearTimeout(this.#backgroundWakeFallback);
+      this.#backgroundWakeFallback = null;
+    }
+    // Let the stopped turn's end snapshot land: it is the hand-edit baseline.
+    this.#snapshotTurnEnd();
+    const plan = await this.#serializedCheckpointOp(() => this.#planRewind(turnId, opts.restoreFiles === true));
+    const stoppedNote = wasBusy ? "The running turn was stopped; nothing else changed." : "Nothing changed.";
+    if (opts.planId && opts.planId !== plan.planId) {
+      this.#auditRewind(sender, turnId, plan, "refused: changed since preview", opts.force);
+      return { ...plan, refused: `the session changed since the preview — review it again. ${stoppedNote}` };
+    }
     if (plan.files && plan.files.conflicts.length > 0 && !opts.force) {
-      return { ...plan, refused: `${plan.files.conflicts.length} file(s) were changed by hand since the agent's last turn; going back would overwrite them` };
+      this.#auditRewind(sender, turnId, plan, "refused: conflicts", opts.force);
+      return {
+        ...plan,
+        refused: plan.files.unverified
+          ? `the agent's edits can't be told apart from yours for ${plan.files.conflicts.length} file(s); going back would overwrite them. ${stoppedNote}`
+          : `${plan.files.conflicts.length} file(s) were changed by hand during the turns being taken back; going back would overwrite them. ${stoppedNote}`,
+      };
     }
 
-    // Files first: if restoring fails, nothing else has changed.
-    if (plan.files && plan.fileChanges && plan.checkpointSha && plan.fileChanges.length > 0) {
-      await restoreTree({
-        root: this.#checkpointRoot,
-        workdir: this.workdir,
-        sessionId: this.id,
-        sha: plan.checkpointSha,
-        changes: plan.fileChanges,
-      });
+    // Files first: if restoring fails, nothing else has changed (the restore
+    // is one git operation that verifies the tree before writing).
+    if (plan.files && plan.checkpointSha && plan.currentTreeSha && plan.fileChanges && plan.fileChanges.length > 0) {
+      const protectedHit = plan.fileChanges.find((c) => this.#isProtectedPath(c.path));
+      if (protectedHit) throw new RewindError("restore_failed", `refusing to restore a path in codeoid's own data: ${protectedHit.path}`);
+      try {
+        await this.#serializedCheckpointOp(() =>
+          restoreTree({
+            root: this.#checkpointRoot,
+            workdir: this.workdir,
+            sessionId: this.id,
+            from: plan.currentTreeSha!,
+            to: plan.checkpointSha!,
+            ...(plan.keepPaths && plan.keepPaths.length > 0 ? { keep: plan.keepPaths } : {}),
+          }),
+        );
+      } catch (err) {
+        this.#auditRewind(sender, turnId, plan, `failed: ${err instanceof Error ? err.message : String(err)}`, opts.force);
+        throw new RewindError("restore_failed", `The files couldn't be restored: ${err instanceof Error ? err.message : String(err)}. ${stoppedNote}`);
+      }
     }
     if (plan.files) plan.files = { ...plan.files, applied: true };
 
     // The conversation: a fresh backend, re-seeded from what's kept.
-    await this.#teardownProvider();
     this.#accumulator.seed(plan.keptHistory);
     const pos = this.#turnIndex.findIndex((e) => e.turnId === turnId);
     this.#turnIndex = this.#turnIndex.slice(0, pos);
@@ -5555,6 +5722,9 @@ export class Session {
     }
     this.#justRotated = false;
     if (plan.keptHistory.length > 0) await this.#seedProviderFromHistory();
+    // Until the next prompt, the backend holds nothing: a restart before then
+    // must re-seed from the kept history rather than resume an empty backend.
+    this.#markBackingFresh(true);
 
     // What everyone sees: a durable marker hides the taken-back rows (on
     // replay, restart and paging alike), then every client gets a fresh view.
@@ -5582,15 +5752,51 @@ export class Session {
     for (const m of rows) this.#scrollback.push(m);
     this.#resumeKey = randomUUID(); // stale incremental cursors must re-sync
     for (const client of [...this.#clients.values()]) this.#replay(client);
+    this.#auditRewind(sender, turnId, plan, plan.files?.applied ? "files restored" : "conversation only", opts.force);
+    this.#setStatus("idle");
+    this.#broadcastInfoUpdate();
+    return plan;
+  }
+
+  #markBackingFresh(fresh: boolean): void {
+    if (this.#backingFresh === fresh) return;
+    this.#backingFresh = fresh;
+    this.#saveMetaNow();
+  }
+
+  /**
+   * On resume of a session whose backend was reset and never used since
+   * (#355): the backend has nothing to resume, and the seed that would have
+   * carried the conversation lived only in memory. Start it fresh and
+   * re-seed it from the restored canonical history.
+   */
+  async reseedFreshBacking(): Promise<void> {
+    this.#backingFresh = true;
+    this.#provider.setHasQueried(false);
+    if (this.#accumulator.history.length > 0) await this.#seedProviderFromHistory();
+  }
+
+  #auditRewind(sender: AuthContext, turnId: string, plan: RewindOutcome, outcome: string, force?: boolean): void {
     this.#store.audit(
       sender.sub,
       "session.rewind",
       this.id,
-      `turn=${turnId} removed=${plan.removedTurnIds.length} files=${plan.files?.applied ? "restored" : "kept"}`,
+      `turn=${turnId} removed=${plan.removedTurnIds.length} outcome=${outcome}${force ? " force" : ""}${
+        plan.files ? ` restore=${plan.files.restore.length} remove=${plan.files.remove.length} conflicts=${plan.files.conflicts.length}` : ""
+      }`,
     );
-    this.#setStatus("idle");
-    this.#broadcastInfoUpdate();
-    return plan;
+  }
+
+  /**
+   * A workdir-relative path inside one of codeoid's own data directories
+   * that lies WITHIN the workdir (the snapshot excludes exactly those; a data
+   * directory above the workdir contains it and protects nothing here).
+   */
+  #isProtectedPath(rel: string): boolean {
+    const abs = join(this.workdir, rel);
+    return this.#protectedDirs()
+      .filter((d) => d.startsWith(`${this.workdir}/`))
+      .some((d) => abs === d || abs.startsWith(`${d}/`));
   }
 
   /** The prompt that started `turnId`: from the history, else its transcript row. */
@@ -5853,6 +6059,7 @@ export class Session {
       projectId: this.projectId,
       role: this.role,
       providerId: this.#provider.id,
+      ...(this.#backingFresh ? { backingFresh: true } : {}),
       forkedFrom: this.forkedFrom,
       worktree: this.worktree,
       // MUST be written here too, not only at create: #writeMetaAtomic

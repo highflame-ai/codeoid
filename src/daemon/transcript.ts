@@ -165,6 +165,12 @@ export interface TranscriptMeta {
   role?: "conductor" | "worker";
   /** Provider id backing the session; absent = claude (pre-upgrade metas). */
   providerId?: string;
+  /**
+   * The backend was reset (a rewind) and has not run a turn since, so it
+   * holds no conversation: on resume, re-seed it from the canonical history
+   * instead of resuming an empty backing session (#355).
+   */
+  backingFresh?: boolean;
   /** Fork lineage (session.fork). Absent = not a fork. */
   forkedFrom?: { sessionId: string; name: string; atTurn: number };
   /** Git worktree backing workdir (fork isolation / bind). Absent = shared. */
@@ -823,7 +829,8 @@ export function applyRewinds<T extends { message: DaemonMessage }>(rows: T[]): T
   let out: T[] = [];
   for (const row of rows) {
     const m = row.message as Partial<SessionMessage>;
-    if (m.type === "session.message" && m.metadata?.event === REWIND_EVENT) {
+    // Only codeoid's own notice counts — never a row some other identity wrote.
+    if (m.type === "session.message" && m.metadata?.event === REWIND_EVENT && m.identity?.sub === "system:codeoid") {
       const from = m.metadata.fromMessageId;
       const at = typeof from === "string" ? out.findIndex((r) => (r.message as Partial<SessionMessage>).messageId === from) : -1;
       if (at !== -1) {

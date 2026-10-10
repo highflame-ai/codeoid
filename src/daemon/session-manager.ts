@@ -815,6 +815,7 @@ mcpHub: this.#mcpHub,
             persistIndex: !index && history.some((t) => t.turnId),
             partial: canonical?.partial ?? false,
           });
+          if (meta.backingFresh) await session.reseedFreshBacking();
         } catch (err) {
           console.error(
             `[codeoid/resume] canonical history restore failed for ${meta.sessionId} (session resumes without it): ${err instanceof Error ? err.message : String(err)}`,
@@ -5279,10 +5280,27 @@ mcpHub: this.#mcpHub,
     if (session.role) {
       return { type: "response.error", requestId: msg.id, error: `Cannot go back a turn in a ${session.role} session`, code: "invalid_request" };
     }
+    if (msg.dryRun !== true) {
+      // Writing files back (and deleting files created since) bypasses the
+      // approval gate every agent write goes through: same trust as
+      // approving a write.
+      if (msg.restoreFiles === true && !hasScope(auth.scopes as string[], SCOPES.SESSION_APPROVE)) {
+        return { type: "response.error", requestId: msg.id, error: "Missing scope: session:approve (needed to restore files)", code: "forbidden" };
+      }
+      // Stopping a running turn or background agents is an interrupt.
+      if (session.rewindNeedsStop && !hasScope(auth.scopes as string[], SCOPES.SESSION_INTERRUPT)) {
+        return { type: "response.error", requestId: msg.id, error: "Missing scope: session:interrupt (the session is busy)", code: "forbidden" };
+      }
+    }
     try {
       const r = await session.rewind(
         msg.turnId,
-        { restoreFiles: msg.restoreFiles === true, dryRun: msg.dryRun === true, force: msg.force === true },
+        {
+          restoreFiles: msg.restoreFiles === true,
+          dryRun: msg.dryRun === true,
+          force: msg.force === true,
+          ...(msg.planId ? { planId: msg.planId } : {}),
+        },
         auth,
       );
       return {
@@ -5291,6 +5309,7 @@ mcpHub: this.#mcpHub,
         sessionId: session.id,
         turnId: msg.turnId,
         dryRun: msg.dryRun === true || r.refused !== undefined,
+        planId: r.planId,
         removedTurns: r.removedTurnIds.length,
         restoredPrompt: r.restoredPrompt,
         irreversible: r.irreversible,
@@ -5304,7 +5323,7 @@ mcpHub: this.#mcpHub,
           type: "response.error",
           requestId: msg.id,
           error: err.message,
-          code: err.code === "busy" ? "invalid_request" : "not_found",
+          code: err.code === "not_found" ? "not_found" : "invalid_request",
         };
       }
       throw err;

@@ -556,6 +556,7 @@ export const sessionRewindSchema = z.object({
   restoreFiles: z.boolean().optional(),
   dryRun: z.boolean().optional(),
   force: z.boolean().optional(),
+  planId: z.string().min(1).max(64).optional(),
 });
 
 export const skillGrantSchema = z.object({

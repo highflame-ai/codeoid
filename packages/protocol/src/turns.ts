@@ -73,6 +73,11 @@ export interface SessionRewindMsg {
   restoreFiles?: boolean;
   dryRun?: boolean;
   force?: boolean;
+  /**
+   * The `planId` of the dry run being confirmed: the real run refuses (and
+   * changes nothing) if anything changed since that preview.
+   */
+  planId?: string;
 }
 
 /** Something a taken-back turn did that going back can't undo. */
@@ -95,6 +100,11 @@ export interface RewindFiles {
   conflicts: string[];
   /** The snapshot was still being taken when that turn's agent started. */
   late?: boolean;
+  /**
+   * The agent's edits couldn't be told apart from hand edits (a snapshot is
+   * missing), so every file that would change is counted as a conflict.
+   */
+  unverified?: boolean;
   /** True once the files were actually put back (never on a dry run). */
   applied: boolean;
 }
@@ -105,6 +115,8 @@ export interface SessionRewindResultMsg {
   sessionId: string;
   turnId: string;
   dryRun: boolean;
+  /** Identifies exactly this plan; send it back with the real run. */
+  planId: string;
   /** How many turns were (or would be) taken back. */
   removedTurns: number;
   /** The prompt of the turn taken back — to edit and send again. */

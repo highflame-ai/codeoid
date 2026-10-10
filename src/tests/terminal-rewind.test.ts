@@ -11,6 +11,7 @@ const base: SessionRewindResultMsg = {
   turnId: "t",
   dryRun: false,
   removedTurns: 1,
+  planId: "p",
   restoredPrompt: "oops",
   irreversible: [],
 };

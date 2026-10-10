@@ -193,6 +193,9 @@ export class MockSessionProvider implements SessionProvider {
   resetToNewSession(newBackingId: string): void {
     this.#backingSessionId = newBackingId;
     this.#hasQueried = false;
+    // Models the warm providers: a seed queued for the old backing session
+    // is dropped with it (#355).
+    this.seededHistory = null;
   }
 
   setHasQueried(value: boolean): void {

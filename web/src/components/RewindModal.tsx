@@ -11,7 +11,7 @@
 import { Component, For, Show, createEffect, createSignal, onCleanup, onMount } from "solid-js";
 
 import { getClient, newRequestId } from "../state/connection";
-import { setDraft } from "../state/prompt-drafts";
+import { getDraft, setDraft } from "../state/prompt-drafts";
 import type { SessionRewindResultMsg, SessionTurnsResultMsg } from "../protocol/types";
 
 interface Target {
@@ -46,7 +46,10 @@ export async function openUndoLast(sessionId: string): Promise<boolean> {
 }
 
 /** Ask the daemon to (dry-)run a rewind. */
-async function rewindRequest(t: Target, opts: { restoreFiles: boolean; dryRun: boolean; force?: boolean }): Promise<SessionRewindResultMsg> {
+async function rewindRequest(
+  t: Target,
+  opts: { restoreFiles: boolean; dryRun: boolean; force?: boolean; planId?: string },
+): Promise<SessionRewindResultMsg> {
   const id = newRequestId();
   return getClient().request<SessionRewindResultMsg>(
     {
@@ -57,6 +60,7 @@ async function rewindRequest(t: Target, opts: { restoreFiles: boolean; dryRun: b
       ...(opts.restoreFiles ? { restoreFiles: true } : {}),
       ...(opts.dryRun ? { dryRun: true } : {}),
       ...(opts.force ? { force: true } : {}),
+      ...(opts.planId ? { planId: opts.planId } : {}),
     },
     {
       waitForResult: (m) => (m.type === "session.rewind.result" && m.requestId === id ? m : undefined),
@@ -130,19 +134,26 @@ const RewindModal: Component = () => {
     setBusy(true);
     setError(null);
     try {
+      // Restoring files confirms exactly the previewed plan (and the
+      // conflicts shown in it): the daemon refuses if anything changed.
       const res = await rewindRequest(t, {
         restoreFiles: restoreFiles(),
         dryRun: false,
         force: conflicts().length > 0,
+        ...(restoreFiles() ? { planId: plan()?.planId } : {}),
       });
       if (res.refused) {
-        setPlan(res);
+        // Show what it would do NOW, so the person decides on current facts.
+        const fresh = await rewindRequest(t, { restoreFiles: true, dryRun: true }).catch(() => res);
+        setPlan(fresh);
         setError(res.refused);
         setBusy(false);
         return;
       }
-      // The taken-back prompt goes back into the composer, to edit and resend.
-      setDraft(t.sessionId, res.restoredPrompt);
+      // The taken-back prompt goes back into the composer, to edit and
+      // resend — above anything already half-typed there, never over it.
+      const draft = getDraft(t.sessionId).trim();
+      setDraft(t.sessionId, draft ? `${res.restoredPrompt}\n\n${draft}` : res.restoredPrompt);
       window.dispatchEvent(new CustomEvent("codeoid:prompt-draft-changed", { detail: { sessionId: t.sessionId } }));
       window.dispatchEvent(new CustomEvent("codeoid:focus-prompt"));
       close();
@@ -208,7 +219,11 @@ const RewindModal: Component = () => {
                       </Show>
                       <FileList label="restored" files={f().restore} />
                       <FileList label="removed (created since)" files={f().remove} />
-                      <FileList label="edited by you since the agent's last turn — will be overwritten" files={f().conflicts} tone="danger" />
+                      <FileList
+                        label={f().unverified ? "can't tell your edits from the agent's — will be overwritten" : "edited by you during these turns — will be overwritten"}
+                        files={f().conflicts}
+                        tone="danger"
+                      />
                       <Show when={f().late}>
                         <p class="text-[11px] text-fg-faint">
                           This snapshot finished after the agent had started, so it may already include the agent's first edits.
