@@ -50,6 +50,12 @@ describe("formatRewind", () => {
     expect(formatRewind({ ...base, dryRun: true, files: { restore: [], remove: [], conflicts: [], applied: false } })).toContain("/undo files yes");
   });
 
+  it("a preview being confirmed in the same step doesn't tell you to confirm it", () => {
+    const out = formatRewind({ ...base, dryRun: true }, { hint: false });
+    expect(out).not.toContain("/undo files");
+    expect(out).not.toContain("back in the prompt"); // nothing was taken back yet
+  });
+
   it("a refusal says nothing changed", () => {
     expect(formatRewind({ ...base, dryRun: true, refused: "2 file(s) were changed by hand" })).toStartWith("Nothing changed");
   });

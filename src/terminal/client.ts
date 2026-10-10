@@ -611,7 +611,7 @@ export class TerminalClient {
    * Go back a turn (#355) and print what happened. Returns the taken-back
    * prompt when it was really taken back (not a preview or a refusal).
    */
-  async #undo(sessionId: string, args: string[]): Promise<string | null> {
+  async #undo(sessionId: string, args: string[], opts: { confirming?: boolean } = {}): Promise<string | null> {
     const req = parseUndoArgs(args);
     if ("error" in req) {
       console.log(req.error);
@@ -627,7 +627,7 @@ export class TerminalClient {
     } else if (req.restoreFiles && !req.dryRun) {
       // No preview to confirm (e.g. one-shot `codeoid undo … files yes`):
       // preview now and confirm exactly that plan in the same breath.
-      if ((await this.#undo(sessionId, ["files"])) === null && !this.#undoPreview) return null;
+      if ((await this.#undo(sessionId, ["files"], { confirming: true })) === null && !this.#undoPreview) return null;
       const fresh = this.#undoPreview as { sessionId: string; turnId: string; planId: string } | null;
       if (!fresh) return null;
       ({ turnId, planId } = fresh);
@@ -660,7 +660,7 @@ export class TerminalClient {
       return null;
     }
     if (req.dryRun) this.#undoPreview = { sessionId, turnId, planId: res.planId };
-    console.log(S(formatRewind(res)));
+    console.log(S(formatRewind(res, { hint: !opts.confirming })));
     return !res.dryRun && !res.refused ? res.restoredPrompt : null;
   }
 

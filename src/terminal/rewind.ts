@@ -31,7 +31,7 @@ export function parseUndoArgs(args: readonly string[]): UndoRequest | { error: s
 }
 
 /** A plain-text account of what going back did, or would do. */
-export function formatRewind(r: SessionRewindResultMsg): string {
+export function formatRewind(r: SessionRewindResultMsg, opts: { hint?: boolean } = {}): string {
   const lines: string[] = [];
   const turns = r.removedTurns === 1 ? "1 turn" : `${r.removedTurns} turns`;
   if (r.refused) {
@@ -62,11 +62,13 @@ export function formatRewind(r: SessionRewindResultMsg): string {
   }
   if (r.dryRun) {
     const conflicts = r.files?.conflicts.length ?? 0;
-    lines.push(
-      conflicts > 0
-        ? `${conflicts} file(s) were edited by you since the agent's last turn. Type /undo files force to go back and overwrite them, or /undo to take back the conversation only.`
-        : "Type /undo files yes to go back and restore the files, or /undo to take back the conversation only.",
-    );
+    if (opts.hint !== false) {
+      lines.push(
+        conflicts > 0
+          ? `${conflicts} file(s) were edited by you since the agent's last turn. Type /undo files force to go back and overwrite them, or /undo to take back the conversation only.`
+          : "Type /undo files yes to go back and restore the files, or /undo to take back the conversation only.",
+      );
+    }
   } else if (!r.refused && r.restoredPrompt) {
     lines.push("Your message is back in the prompt to edit and resend.");
   }
