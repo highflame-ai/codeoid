@@ -200,6 +200,26 @@ async function runTurn(threadId: string, prompt: string): Promise<void> {
       params: { item: { id: "item-auto-1", type: "commandExecution", command: "ls -la", aggregatedOutput: "file-a\nfile-b", status: "completed" } },
     });
     send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: "Listed files." } } });
+  } else if (prompt.includes("mcp-two")) {
+    // Two calls to ONE server in flight; the elicitation is for the FIRST
+    // (codex names only the server — tool via message, args via _meta) (#368).
+    send({ method: "item/started", params: { item: { id: "item-gh-1", type: "mcpToolCall", server: "github", tool: "delete_repo", arguments: { repo: "x" } } } });
+    send({ method: "item/started", params: { item: { id: "item-gh-2", type: "mcpToolCall", server: "github", tool: "get_issue", arguments: { n: 7 } } } });
+    const named = !prompt.includes("unnamed");
+    const decision = await serverRequest("mcpServer/elicitation/request", {
+      threadId,
+      turnId: "turn-1",
+      serverName: "github",
+      mode: "form",
+      ...(named
+        ? { _meta: { codex_approval_kind: "mcp_tool_call", tool_params: { repo: "x" } }, message: 'Allow the github MCP server to run tool "delete_repo"?' }
+        : { message: "Allow the github MCP server to run a tool?" }),
+      requestedSchema: { type: "object", properties: {} },
+    });
+    if (decision.action === "accept") {
+      send({ method: "item/completed", params: { item: { id: "item-gh-1", type: "mcpToolCall", server: "github", tool: "delete_repo", arguments: { repo: "x" }, aggregatedOutput: "deleted", status: "completed" } } });
+    }
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `gh:${String(decision.action)}` } } });
   } else if (prompt.includes("mcp-nostart")) {
     // Defensive path: an elicitation arrives with NO preceding item/started
     // (so the provider can't correlate the tool from the item). It must still

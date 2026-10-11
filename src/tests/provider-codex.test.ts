@@ -422,6 +422,48 @@ describe("CodexProvider over fake-codex", () => {
     expect(seen[0]?.input.network).toEqual({ host: "example.com", protocol: "https" });
   });
 
+  it("C5 (#368): two calls to one server — the approval shows the call codex named, and pairs its result", async () => {
+    const p = makeProvider();
+    const seen: Array<{ name: string; input: Record<string, unknown>; toolId: string }> = [];
+    const events = await collect(
+      p.runTurn(
+        turnOpts("mcp-two please", {
+          canUseTool: async (toolId, _a, name, input) => {
+            seen.push({ name, input, toolId });
+            return { behavior: "allow" as const };
+          },
+        }),
+      ),
+    );
+    await p.teardown();
+    expect(seen).toEqual([{ name: "mcp__github__delete_repo", input: { repo: "x" }, toolId: "item-gh-1" }]);
+    const done = events.find((e) => e.type === "tool_complete" && (e as { sdkToolUseId?: string }).sdkToolUseId === "item-gh-1") as
+      | { output: string }
+      | undefined;
+    expect(done?.output).toBe("deleted");
+  });
+
+  it("C5b (#368): two DIFFERENT calls to one server and codex doesn't say which — declined without asking", async () => {
+    const p = makeProvider();
+    let asked = false;
+    const events = await collect(
+      p.runTurn(
+        turnOpts("mcp-two unnamed please", {
+          canUseTool: async () => {
+            asked = true;
+            return { behavior: "allow" as const };
+          },
+        }),
+      ),
+    );
+    await p.teardown();
+    expect(asked).toBe(false);
+    expect(events.some((e) => e.type === "text_done" && (e as { content?: string }).content === "gh:decline")).toBe(true);
+    const complete = events.find((e) => e.type === "tool_complete") as { success: boolean; output: string } | undefined;
+    expect(complete?.success).toBe(false);
+    expect(complete?.output).toContain("different calls to github");
+  });
+
   it("C3d (#369): a permissions request is answered with a grant — the requested profile, or nothing", async () => {
     for (const allow of [true, false]) {
       const p = makeProvider();
