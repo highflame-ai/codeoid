@@ -849,7 +849,6 @@ function tomlInlineTable(map: Record<string, string>): string {
   return `{ ${entries.join(", ")} }`;
 }
 
-/** Map an approval request to a codeoid tool name + input. */
 /**
  * codex's reply to an `item/*` approval request, in the shape its app-server
  * protocol requires (#369). Command and file-change approvals take
@@ -866,6 +865,7 @@ function approvalReply(method: string, params: Record<string, unknown>, allow: b
   return { decision: allow ? "accept" : "decline" };
 }
 
+/** Map an approval request to a codeoid tool name + input. */
 function approvalToTool(
   method: string,
   params: Record<string, unknown>,
