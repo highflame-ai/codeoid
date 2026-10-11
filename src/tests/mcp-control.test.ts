@@ -585,6 +585,37 @@ describe("edge cases", () => {
     expect(r.text).toContain("timeout: the daemon did not answer session.list");
   });
 
+  it("a send that times out says it may still be delivered, and to retry only with the same key", async () => {
+    const host: ControlHost = {
+      handle: (msg) =>
+        msg.type === "session.send"
+          ? new Promise<DaemonMessage>(() => {})
+          : Promise.resolve({ type: "session.list.result", requestId: msg.id, sessions: [{ id: "s", name: "s", status: "idle" } as SessionInfo] } as DaemonMessage),
+      disconnectClient: () => {},
+      audit: () => {},
+    };
+    const ep = new ControlMcpHttp({ verifier, host, config: controlConfig(), callDeadlineMs: 50 });
+    const r = await call(ep, "tok-owner", "send_message", { session: "s", text: "x", wait: true });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("send_unconfirmed");
+    expect(r.text).toContain("same idempotencyKey");
+  });
+
+  it("a whole tool is bounded, not just each daemon call inside it", async () => {
+    // Every call answers quickly, but the session never settles and the
+    // wait would run to its own limit: the tool deadline cuts it first.
+    const host: ControlHost = {
+      handle: async (msg) =>
+        ({ type: "session.list.result", requestId: msg.id, sessions: [{ id: "s", name: "s", status: "thinking" } as SessionInfo] }) as DaemonMessage,
+      disconnectClient: () => {},
+      audit: () => {},
+    };
+    const ep = new ControlMcpHttp({ verifier, host, config: controlConfig(), toolDeadlineMs: 80, sleep: (ms) => new Promise((r) => setTimeout(r, Math.min(ms, 10))) });
+    const r = await call(ep, "tok-owner", "wait_for_session", { session: "s", timeoutSeconds: 20 });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("wait_for_session did not finish within");
+  });
+
   it("an internal throw becomes an isError result, not a 500", async () => {
     const host: ControlHost = {
       handle: async () => {

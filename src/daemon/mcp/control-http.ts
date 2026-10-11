@@ -106,6 +106,8 @@ export interface ControlMcpOptions {
   sleep?: (ms: number) => Promise<void>;
   /** Bound on a single daemon call (default maxWaitSeconds + 30 s). Tests only. */
   callDeadlineMs?: number;
+  /** Bound on a whole tool call (default maxWaitSeconds + 60 s). Tests only. */
+  toolDeadlineMs?: number;
 }
 
 /** A tool failure the caller should see as `isError: true` text, not a crash. */
@@ -648,6 +650,14 @@ function buildTools(config: McpControlConfig, sleep: (ms: number) => Promise<voi
           );
         } catch (err) {
           slot?.();
+          // A send that timed out may still be delivered — say so, rather
+          // than an error a caller would read as "nothing happened" and retry.
+          if (err instanceof ToolError && err.code === "timeout") {
+            throw new ToolError(
+              "the send was not confirmed in time and may still be delivered — retry only with the same idempotencyKey",
+              "send_unconfirmed",
+            );
+          }
           throw err;
         }
         const duplicate = res.type === "response.ok" && (res.data as { duplicate?: boolean } | undefined)?.duplicate === true;
@@ -749,9 +759,12 @@ export class ControlMcpHttp {
   readonly #waits = new Map<string, number>();
   /** Upper bound on any single daemon call made for a tool. */
   readonly #callDeadlineMs: number;
+  /** Upper bound on a whole tool call (its wait plus the calls around it). */
+  readonly #toolDeadlineMs: number;
 
   constructor(opts: ControlMcpOptions) {
     this.#callDeadlineMs = opts.callDeadlineMs ?? (opts.config.maxWaitSeconds + 30) * 1000;
+    this.#toolDeadlineMs = opts.toolDeadlineMs ?? (opts.config.maxWaitSeconds + 60) * 1000;
     this.#verifier = opts.verifier;
     this.#host = opts.host;
     this.#config = opts.config;
@@ -988,12 +1001,23 @@ export class ControlMcpHttp {
       const issue = parsed.error.issues[0];
       return result(`Invalid arguments: ${issue ? `${issue.path.join(".") || "(root)"}: ${issue.message}` : "invalid"}`, true, "invalid_request");
     }
+    // One bound for the whole tool, on top of the per-call deadline: a tool is
+    // several daemon calls (resolve, send, a wait, a page read), and with the
+    // connection's idle timeout lifted, their sum is what holds the socket.
+    let toolTimer: ReturnType<typeof setTimeout> | undefined;
+    const toolDeadline = new Promise<never>((_, reject) => {
+      toolTimer = setTimeout(
+        () => reject(new ToolError(`${tool.name} did not finish within ${this.#toolDeadlineMs / 1000}s`, "timeout")),
+        this.#toolDeadlineMs,
+      );
+    });
     try {
-      return result(await tool.run(parsed.data, ctx), false);
+      return result(await Promise.race([tool.run(parsed.data, ctx), toolDeadline]), false);
     } catch (err) {
       if (err instanceof ToolError) return result(`${err.code}: ${err.message}`, true, err.code);
       return result(`internal: ${err instanceof Error ? err.message : String(err)}`, true, "internal");
     } finally {
+      clearTimeout(toolTimer);
       this.#host.disconnectClient(clientId);
     }
   }

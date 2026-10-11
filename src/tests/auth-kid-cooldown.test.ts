@@ -46,6 +46,7 @@ function harness(initial: string[]) {
     sdkCalls,
     reads: () => reads,
     rotate: (kid: string) => published.add(kid),
+    retire: (kid: string) => published.delete(kid),
     advance: (ms: number) => {
       now += ms;
     },
@@ -88,6 +89,33 @@ describe("ZeroIdVerifier — forged-kid bound", () => {
       );
     }
     expect(verified).toBe(true);
+  });
+
+  it("a key the issuer retires stops being trusted — forged tokens naming it are gated again", async () => {
+    // Round-4 finding: a once-verified kid skipped the gate forever, so after
+    // rotation each forged token naming the old, public kid cost a refetch.
+    const h = harness(["k1"]);
+    expect(await h.v.verify(jwt("k1"))).toEqual(CTX);
+    h.retire("k1");
+    h.rotate("k2");
+    await expect(h.v.verify(jwt("k1", "forged-0"))).rejects.toThrow("No matching JWKS key"); // SDK says so once
+    const before = h.sdkCalls.length;
+    for (let i = 1; i <= 50; i++) await expect(h.v.verify(jwt("k1", `forged-${i}`))).rejects.toThrow("unknown key");
+    expect(h.sdkCalls.length).toBe(before); // none reached the SDK
+    // The new key is admitted at the next key-list read (one window).
+    h.advance(UNKNOWN_KID_COOLDOWN_MS);
+    expect(await h.v.verify(jwt("k2"))).toEqual(CTX);
+  });
+
+  it("a fresh key list also prunes trusted keys it no longer contains", async () => {
+    const h = harness(["k1"]);
+    expect(await h.v.verify(jwt("k1"))).toEqual(CTX);
+    h.retire("k1");
+    h.advance(UNKNOWN_KID_COOLDOWN_MS);
+    await expect(h.v.verify(jwt("other"))).rejects.toThrow("unknown key"); // triggers a fresh read
+    const before = h.sdkCalls.length;
+    await expect(h.v.verify(jwt("k1", "forged"))).rejects.toThrow("unknown key");
+    expect(h.sdkCalls.length).toBe(before);
   });
 
   it("concurrent unknown kids share one in-flight issuer read", async () => {

@@ -49,6 +49,15 @@ describe("PipelineStore", () => {
     expect(store.activeSessionIds("other", "proj")).toEqual(["s-other"]);
   });
 
+  test("activeSessionIds skips a corrupt row instead of failing the whole tenant", () => {
+    const db = new Database(":memory:");
+    const store = new PipelineStore(db);
+    store.save(mk("good", { status: "running", sessionId: "s-good" }));
+    store.save(mk("bad", { status: "running", sessionId: "s-bad" }));
+    db.prepare("UPDATE pipelines SET state_json = '{not json' WHERE id = 'bad'").run();
+    expect(store.activeSessionIds("acct", "proj")).toEqual(["s-good"]);
+  });
+
   test("listByTenant filters by tenant and orders newest first", () => {
     const store = new PipelineStore(new Database(":memory:"));
     store.save(mk("a", { createdAt: 1 }));

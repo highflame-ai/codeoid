@@ -215,7 +215,8 @@ export class ZeroIdVerifier implements TokenVerifier {
     this.#verify = deps.verify ?? verifyToken;
     // The SAME URL the SDK fetches (it always derives it from baseUrl and
     // ignores `jwksUrl`), so the inventory describes the keys it will use.
-    const jwksUrl = `${config.baseUrl.replace(/\/+$/, "")}/.well-known/jwks.json`;
+    // Same trailing-slash handling as the SDK's client (one slash stripped).
+    const jwksUrl = `${config.baseUrl.replace(/\/$/, "")}/.well-known/jwks.json`;
     this.#fetchKids = deps.fetchKids ?? (() => fetchJwksKids(jwksUrl));
     this.#now = deps.now ?? Date.now;
   }
@@ -234,7 +235,19 @@ export class ZeroIdVerifier implements TokenVerifier {
     if (ref.kind === "kid" && !this.#knownKids.has(ref.kid) && !(await this.#publishes(ref.kid))) {
       throw new Error("Token signed by an unknown key");
     }
-    const ctx = await this.#verify(token, this.#config);
+    let ctx: AuthContext;
+    try {
+      ctx = await this.#verify(token, this.#config);
+    } catch (err) {
+      // A key we trusted that the issuer no longer publishes (rotated out):
+      // forget it, or forged tokens naming that public, retired `kid` would
+      // skip the gate and cost the SDK a JWKS refetch each, forever.
+      if (ref.kind === "kid" && err instanceof Error && /no matching jwks key/i.test(err.message)) {
+        this.#knownKids.delete(ref.kid);
+        this.#published.delete(ref.kid);
+      }
+      throw err;
+    }
     if (ref.kind === "kid") this.#knownKids.add(ref.kid);
     return ctx;
   }
@@ -249,6 +262,8 @@ export class ZeroIdVerifier implements TokenVerifier {
         this.#publishedAt = this.#now();
         try {
           this.#published = await this.#fetchKids();
+          // Trust only keys the issuer still publishes.
+          for (const kid of this.#knownKids) if (!this.#published.has(kid)) this.#knownKids.delete(kid);
         } catch {
           // Keep the last inventory; an unreachable issuer would fail the SDK
           // path anyway. Retry sooner than a full window, though: right after
