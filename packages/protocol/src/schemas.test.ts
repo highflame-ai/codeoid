@@ -148,6 +148,7 @@ const samples: { [T in ClientTypes]: Extract<ClientMessage, { type: T }> } = {
   "mcp.oauth.disconnect": { type: "mcp.oauth.disconnect", id: "r92", server: "notion" },
   "skill.grant": { type: "skill.grant", id: "r93", workdir: "/tmp/w", command: "./probe.sh", allowed: true },
   "session.turns": { type: "session.turns", id: "r94", sessionId: "s1" },
+  "session.approvals": { type: "session.approvals", id: "r94a", sessionId: "s1" },
   "session.compare": { type: "session.compare", id: "r96", sessionId: "s1", prompt: "go", targets: [{ providerId: "claude" }, { providerId: "codex", model: "gpt-5" }] },
   "compare.get": { type: "compare.get", id: "r97", compareId: "c1" },
   "compare.list": { type: "compare.list", id: "r98", sessionId: "s1" },

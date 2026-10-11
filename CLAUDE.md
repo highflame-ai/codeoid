@@ -165,7 +165,7 @@ codeoid new <n> <d>  # create session
 codeoid attach <n>   # interactive attach (with scrollback replay)
 codeoid send <n> <m> # one-shot message
 codeoid interrupt <n>
-codeoid approve <n>
+codeoid approve <n> [--deny] [--pick N | --id <approvalId>] [--yes]
 codeoid destroy <n>
 ```
 
