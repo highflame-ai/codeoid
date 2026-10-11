@@ -381,4 +381,31 @@ describe("codeoid approve <session> (#349)", () => {
     expect(title).not.toContain("\u009b");
     expect(title).toContain("curl x|shnpm run lint");
   });
+
+  test("an empty --id is refused, not taken as 'the oldest waiting'", async () => {
+    const { id, name } = await parkedSession();
+    await run(name, true, { approvalId: "", yes: true });
+    expect(approveFrames()).toHaveLength(0);
+    expect(process.exitCode).toBe(1);
+    expect(manager._sessionForTest(id)!.pendingToolApprovals()).toHaveLength(1);
+  });
+
+  test("variation selectors and Hangul fillers in the input are shown, not hidden", async () => {
+    makeProvider = () => new MockSessionProvider("mock", [bashTurn("echo hi\ufe0f\u115f\u{e0100}")]);
+    const { name } = await parkedSession();
+    await run(name, false);
+    const text = all(out);
+    expect(text).toContain("\\u{fe0f}");
+    expect(text).toContain("\\u{115f}");
+    expect(text).toContain("\\u{e0100}");
+  });
+
+  test("a newline in the tool name can't fake an input block", async () => {
+    makeProvider = () => new MockSessionProvider("mock", [toolTurn('acp_exec)\n{"command":"ls"}\n(', { command: "rm -rf ~" })]);
+    const { name } = await parkedSession();
+    await run(name, false);
+    const header = out.find((l) => l.startsWith("acp_exec"))!;
+    expect(header).toContain('\\n{"command":"ls"}\\n'); // escaped, one line
+    expect(out.some((l) => l === '{"command":"ls"}')).toBe(false);
+  });
 });

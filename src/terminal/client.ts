@@ -43,11 +43,11 @@ const S = (s: string | undefined): string => sanitizeTerminalOutput(s ?? "");
 /** Stricter than S for text a decision rests on: no carriage returns, colours
  *  or links that could restyle or overwrite it. And no C1 controls (U+0080–009F,
  *  the 8-bit CSI/OSC many terminals act on), bidi or other invisible format
- *  characters, which can change what the line appears to say — those are shown
- *  as visible `\u{…}` escapes rather than dropped, so the text can't silently
- *  read as something shorter (#349). */
-const INVISIBLE =
-  /[\u0080-\u009f\u00ad\u061c\u180e\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u2069\u3164\ufeff]|[\u{e0000}-\u{e007f}]/gu;
+ *  characters (Unicode default-ignorables and format controls), which can hide
+ *  or reorder what the line appears to say — those are shown as visible `\u{…}`
+ *  escapes rather than dropped, so the text can't silently read as something
+ *  shorter (#349). */
+const INVISIBLE = /[\p{Default_Ignorable_Code_Point}\p{Cf}\u0080-\u009f]/gu;
 const plainText = (s: string): string =>
   S(s)
     .replace(/\r/g, "")
@@ -55,6 +55,9 @@ const plainText = (s: string): string =>
     .replace(/\x1b\]8;[^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
     .replace(/\x1b/g, "")
     .replace(INVISIBLE, (c) => `\\u{${c.codePointAt(0)!.toString(16)}}`);
+/** plainText for a field that must stay ONE line (a tool name, an id, a
+ *  title): a newline in it could print a fake block above the real one. */
+const oneLine = (s: string): string => plainText(s).replace(/\n/g, "\\n");
 
 /** Most of a pending tool call's input `codeoid approve` prints before asking. */
 const APPROVE_SHOW_MAX = 8_000;
@@ -945,18 +948,18 @@ export class TerminalClient {
       process.exitCode = 1;
       return;
     }
-    const dialog = opts.approvalId ? undefined : list.sessions.find((s) => s.id === sessionId)?.pendingDialog;
+    const dialog = opts.approvalId !== undefined ? undefined : list.sessions.find((s) => s.id === sessionId)?.pendingDialog;
     if (dialog) {
       if (dialog.method !== "confirm") {
         fail(
-          `The session is waiting on a question, not a yes/no: ${plainText(dialog.title)}`,
+          `The session is waiting on a question, not a yes/no: ${oneLine(dialog.title)}`,
           `  Answer it with: codeoid attach ${sessionIdOrName}`,
         );
         return;
       }
       // Show exactly what is being answered — the title names the command,
       // the message says what it does.
-      console.log(plainText(dialog.title));
+      console.log(oneLine(dialog.title));
       if (dialog.message) console.log(plainText(dialog.message));
       if (!(await this.#confirmApproval(approved, opts.yes === true))) return;
       const resp = await this.#request({
@@ -990,11 +993,11 @@ export class TerminalClient {
     }
     let pending: (typeof all)[number] | undefined;
     let n: number;
-    if (opts.approvalId) {
+    if (opts.approvalId !== undefined) {
       n = all.findIndex((a) => a.approvalId === opts.approvalId) + 1;
       pending = all[n - 1];
       if (!pending) {
-        fail(`No tool call ${plainText(opts.approvalId)} is waiting in that session.`);
+        fail(`No tool call ${oneLine(opts.approvalId)} is waiting in that session.`);
         return;
       }
     } else {
@@ -1008,7 +1011,7 @@ export class TerminalClient {
     // Show exactly what would run — the full input — as plain text the agent
     // can't restyle or overwrite.
     if (all.length > 1) console.log(`${all.length} tool calls are waiting; this is [${n}] (pick another with --pick N):`);
-    console.log(`${plainText(pending.toolName)}  (${plainText(pending.approvalId)})`);
+    console.log(`${oneLine(pending.toolName)}  (${oneLine(pending.approvalId)})`);
     const shown = plainText(pending.input === undefined ? "" : JSON.stringify(pending.input, null, 2) ?? "");
     const cut = shown.length > APPROVE_SHOW_MAX;
     console.log(cut ? shown.slice(0, APPROVE_SHOW_MAX) : shown);

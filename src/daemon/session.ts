@@ -959,7 +959,7 @@ export class Session {
     (result: { approved: boolean; updatedInput?: Record<string, unknown> }) => void
   >();
   /**
-   * What each parked approval will actually run: the tool name and the input
+   * What each parked approval was asked about: the tool name and the input
    * canUseTool received (after hook rewrite), keyed by approvalId — served by
    * `session.approvals` (#349). Read from HERE, not the announced tool
    * message: a backend that ties a gate to its announcement by tool name alone

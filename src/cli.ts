@@ -747,7 +747,12 @@ program
       console.error("--pick takes a number (1 = the oldest waiting)");
       process.exit(1);
     }
-    if (pick !== undefined && opts.id) {
+    if (opts.id !== undefined && opts.id.trim() === "") {
+      // An unset $ID in a script must not fall back to "the oldest waiting".
+      console.error("--id needs an approval id");
+      process.exit(1);
+    }
+    if (pick !== undefined && opts.id !== undefined) {
       console.error("--pick and --id both choose the call — give one");
       process.exit(1);
     }
@@ -756,7 +761,7 @@ program
     await client.connect();
     await client.approveSession(session, !opts.deny, {
       ...(pick !== undefined ? { pick } : {}),
-      ...(opts.id ? { approvalId: opts.id } : {}),
+      ...(opts.id !== undefined ? { approvalId: opts.id } : {}),
       ...(opts.yes ? { yes: true } : {}),
     });
     client.disconnect();
