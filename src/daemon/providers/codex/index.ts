@@ -278,6 +278,9 @@ export class CodexProvider implements SessionProvider {
   #modelContextWindow: number | null = null;
   /** item id → {name, input} for items already announced via tool_start. */
   #announcedItems = new Map<string, { name: string; input: Record<string, unknown> }>();
+  /** Items codeoid's gate declined: their card is already cancelled, so codex's
+   *  own `declined` completion for them must not overwrite it (#369). */
+  #declinedItems = new Set<string>();
   /**
    * serverName → the most-recent mcpToolCall item awaiting its approval
    * elicitation. codex gates an MCP tool call with `mcpServer/elicitation/request`,
@@ -435,6 +438,7 @@ export class CodexProvider implements SessionProvider {
     this.#turnStartedAt = Date.now();
     this.#turnModel = opts.model ?? "codex";
     this.#announcedItems.clear();
+    this.#declinedItems.clear();
     this.#lastTokenUsage = null;
     // Per turn, like the usage beside it. This provider instance outlives a
     // `/model` switch or a pipeline overrideModel, so a turn interrupted before
@@ -660,11 +664,20 @@ export class CodexProvider implements SessionProvider {
               approvalId: `codex-auto-${itemId}`,
             });
           }
+          // Only `completed` succeeded: codex also reports `declined` (the
+          // approval was refused or failed) and `failed` — neither ran (#369).
+          const status = String(item.status ?? "completed");
+          if (this.#declinedItems.delete(itemId) && status === "declined") {
+            // codeoid declined it — the card already says so (cancelled).
+            this.#announcedItems.delete(itemId);
+            break;
+          }
+          const output = extractItemOutput(item);
           this.#push({
             type: "tool_complete",
             sdkToolUseId: itemId,
-            output: extractItemOutput(item),
-            success: (item.status ?? "completed") !== "failed",
+            output: output || (status === "declined" ? "Declined — not run." : output),
+            success: status === "completed",
           });
           this.#announcedItems.delete(itemId);
         }
@@ -730,7 +743,7 @@ export class CodexProvider implements SessionProvider {
       case "item/permissions/requestApproval": {
         const canUseTool = this.#canUseTool;
         // Fail closed: an approval with no gate wired is denied, never run.
-        if (!canUseTool) return { decision: "denied" };
+        if (!canUseTool) return approvalReply(method, params, false);
         const itemId = String(params.itemId ?? params.approvalId ?? randomUUID());
         const { name, input } = approvalToTool(method, params);
         this.#announcedItems.set(itemId, { name, input });
@@ -743,7 +756,8 @@ export class CodexProvider implements SessionProvider {
           approvalId: `codex-${itemId}`,
         });
         const verdict = await canUseTool(itemId, `codex-${itemId}`, name, input);
-        return { decision: verdict.behavior === "allow" ? "approved" : "denied" };
+        if (verdict.behavior !== "allow") this.#declinedItems.add(itemId);
+        return approvalReply(method, params, verdict.behavior === "allow");
       }
       case "mcpServer/elicitation/request": {
         // codex gates EVERY MCP tool call behind an MCP elicitation when the
@@ -836,6 +850,22 @@ function tomlInlineTable(map: Record<string, string>): string {
 }
 
 /** Map an approval request to a codeoid tool name + input. */
+/**
+ * codex's reply to an `item/*` approval request, in the shape its app-server
+ * protocol requires (#369). Command and file-change approvals take
+ * `{decision: "accept" | "decline"}` — the legacy `"approved"` / `"denied"`
+ * (ReviewDecision, from the old execCommandApproval) is REJECTED by codex as
+ * "approval request failed", so every approved call failed. A permissions
+ * request is answered with a GRANT: the requested profile to allow it for
+ * this turn, an empty one to refuse it.
+ */
+function approvalReply(method: string, params: Record<string, unknown>, allow: boolean): Record<string, unknown> {
+  if (method === "item/permissions/requestApproval") {
+    return allow ? { permissions: params.permissions ?? {}, scope: "turn" } : { permissions: {} };
+  }
+  return { decision: allow ? "accept" : "decline" };
+}
+
 function approvalToTool(
   method: string,
   params: Record<string, unknown>,

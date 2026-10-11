@@ -22,7 +22,7 @@
  * can't slip through offline again.
  */
 
-import { sandboxPolicyError } from "./fake-codex-validate.js";
+import { approvalReplyError, sandboxPolicyError } from "./fake-codex-validate.js";
 
 const enc = new TextEncoder();
 function send(obj: unknown): void {
@@ -74,7 +74,16 @@ async function runTurn(threadId: string, prompt: string): Promise<void> {
       cwd: "/tmp",
       reason: "cleanup",
     });
-    if (decision.decision === "approved") {
+    // Like the real codex: a reply outside the schema fails the approval, and
+    // the agent sees a rejection — the item is declined, never run (#369).
+    const replyError = approvalReplyError("item/commandExecution/requestApproval", decision);
+    if (replyError) {
+      send({
+        method: "item/completed",
+        params: { item: { id: "item-cmd-1", type: "commandExecution", command: "rm -rf /tmp/scratch", aggregatedOutput: replyError, status: "declined" } },
+      });
+      send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `Rejected: ${replyError}` } } });
+    } else if (decision.decision === "accept") {
       send({
         method: "item/completed",
         params: {
@@ -84,9 +93,48 @@ async function runTurn(threadId: string, prompt: string): Promise<void> {
       send({ method: "item/agentMessage/delta", params: { delta: "Cleaned up." } });
       send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: "Cleaned up." } } });
     } else {
+      send({
+        method: "item/completed",
+        params: { item: { id: "item-cmd-1", type: "commandExecution", command: "rm -rf /tmp/scratch", aggregatedOutput: "", status: "declined" } },
+      });
       send({ method: "item/agentMessage/delta", params: { delta: "Approval denied; skipping." } });
       send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: "Approval denied; skipping." } } });
     }
+  } else if (prompt.includes("file-change")) {
+    const reply = await serverRequest("item/fileChange/requestApproval", {
+      threadId,
+      turnId: "turn-1",
+      itemId: "item-fc-1",
+      changes: [{ path: "a.txt", kind: "update" }],
+    });
+    const err = approvalReplyError("item/fileChange/requestApproval", reply);
+    const ran = !err && reply.decision === "accept";
+    send({
+      method: "item/completed",
+      params: { item: { id: "item-fc-1", type: "fileChange", changes: [{ path: "a.txt", kind: "update" }], status: ran ? "completed" : "declined" } },
+    });
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: err ? `Rejected: ${err}` : ran ? "Edited." : "Skipped." } } });
+  } else if (prompt.includes("permissions")) {
+    const requested = { network: { enabled: true } };
+    const reply = await serverRequest("item/permissions/requestApproval", {
+      threadId,
+      turnId: "turn-1",
+      itemId: "item-perm-1",
+      cwd: "/tmp",
+      permissions: requested,
+      startedAtMs: 0,
+    });
+    const err = approvalReplyError("item/permissions/requestApproval", reply);
+    const granted = err ? "invalid" : JSON.stringify(reply.permissions) === JSON.stringify(requested) ? "granted" : "refused";
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `permissions:${granted}` } } });
+  } else if (prompt.includes("codex-declines")) {
+    // codex declined an item on its own (e.g. its own policy, or an approval
+    // round-trip that failed) — no request reached the client.
+    send({
+      method: "item/completed",
+      params: { item: { id: "item-self-1", type: "commandExecution", command: "curl x", aggregatedOutput: "", status: "declined" } },
+    });
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: "Could not run it." } } });
   } else if (prompt.includes("auto-tool")) {
     // codex ran a trusted read without asking — only item/completed arrives.
     send({
@@ -210,7 +258,7 @@ async function handle(frame: Record<string, unknown>): Promise<void> {
       resolve(
         error
           ? { __error: error.message ?? "error" }
-          : ((frame.result ?? { decision: "denied" }) as Record<string, unknown>),
+          : ((frame.result ?? {}) as Record<string, unknown>),
       );
     }
     return;

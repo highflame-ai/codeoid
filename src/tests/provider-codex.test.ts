@@ -178,8 +178,57 @@ describe("CodexProvider over fake-codex", () => {
     );
     await p.teardown();
 
+    // codex then reports the refused item as `declined`; codeoid's gate already
+    // cancelled the card, so no tool_complete may overwrite it (#369).
     expect(events.some((e) => e.type === "tool_complete")).toBe(false);
     expect(events.some((e) => e.type === "text_done" && e.content === "Approval denied; skipping.")).toBe(true);
+  });
+
+  it("C3b (#369): replies use codex's v2 decision words — an approved command actually runs", async () => {
+    // The fake codex validates replies like the real one: the legacy
+    // "approved"/"denied" would fail the approval and decline the item.
+    const p = makeProvider();
+    const events = await collect(p.runTurn(turnOpts("please use-tool", { canUseTool: async () => ({ behavior: "allow" as const }) })));
+    await p.teardown();
+    const complete = events.find((e) => e.type === "tool_complete") as { success: boolean; output: string } | undefined;
+    expect(complete).toMatchObject({ success: true, output: "removed" });
+    expect(events.some((e) => e.type === "text_done" && String((e as { content?: string }).content).startsWith("Rejected"))).toBe(false);
+  });
+
+  it("C3e (#369): an item codex declines on its own is a failed tool, never a success", async () => {
+    // Not codeoid's decision, so the completion must land — as a failure.
+    const p = makeProvider();
+    const events = await collect(p.runTurn(turnOpts("codex-declines please")));
+    await p.teardown();
+    const complete = events.find((e) => e.type === "tool_complete") as { success: boolean; output: string } | undefined;
+    expect(complete?.success).toBe(false);
+    expect(complete?.output).toContain("Declined");
+  });
+
+  it("C3c (#369): file-change approvals accept/decline in codex's shape", async () => {
+    for (const allow of [true, false]) {
+      const p = makeProvider();
+      const events = await collect(
+        p.runTurn(turnOpts("file-change please", { canUseTool: async () => (allow ? { behavior: "allow" as const } : { behavior: "deny" as const }) })),
+      );
+      await p.teardown();
+      expect(events.some((e) => e.type === "text_done" && (e as { content?: string }).content === (allow ? "Edited." : "Skipped."))).toBe(true);
+      const complete = events.find((e) => e.type === "tool_complete") as { success: boolean } | undefined;
+      if (allow) expect(complete?.success).toBe(true);
+      else expect(complete).toBeUndefined(); // declined by codeoid: card already cancelled
+    }
+  });
+
+  it("C3d (#369): a permissions request is answered with a grant — the requested profile, or nothing", async () => {
+    for (const allow of [true, false]) {
+      const p = makeProvider();
+      const events = await collect(
+        p.runTurn(turnOpts("permissions please", { canUseTool: async () => (allow ? { behavior: "allow" as const } : { behavior: "deny" as const }) })),
+      );
+      await p.teardown();
+      const want = allow ? "permissions:granted" : "permissions:refused";
+      expect(events.some((e) => e.type === "text_done" && (e as { content?: string }).content === want)).toBe(true);
+    }
   });
 
   it("C4: non-gated item is recorded retrospectively as start+complete", async () => {
