@@ -21,6 +21,7 @@ import { z } from "zod";
 import type { AuthConfig } from "./daemon/auth.js";
 import type { OAuthConfig } from "./daemon/oauth.js";
 import {
+  isLoopbackHost,
   LOCAL_TOKEN_ENV,
   localTokenFilename,
   readLocalTokenFile,
@@ -102,14 +103,24 @@ export function resolveLocalToken(
   return readLocalTokenFile(getLocalTokenPath(port));
 }
 
-/** True when `url` names this machine (127.0.0.0/8, ::1, or localhost). */
+/**
+ * True when `url` names this machine. Reuses the daemon's own `isLoopbackHost`
+ * (one definition of loopback for the bind guard and the client), plus the two
+ * forms a client URL can carry that a bind address doesn't: `0.0.0.0`, which a
+ * client reaches as this host, and the IPv4-mapped loopback the URL parser
+ * normalizes to hex (`[::ffff:7f00:1]`).
+ */
 export function isLoopbackUrl(url: string): boolean {
+  let host: string;
   try {
-    const host = new URL(url).hostname.replace(/^\[|\]$/g, "");
-    return host === "localhost" || host === "::1" || /^127\.\d+\.\d+\.\d+$/.test(host);
+    host = new URL(url).hostname;
   } catch {
     return false;
   }
+  const bare = host.replace(/^\[|\]$/g, "").toLowerCase();
+  if (bare === "0.0.0.0") return true;
+  if (/^::ffff:7f[0-9a-f]{2}:[0-9a-f]{1,4}$/.test(bare)) return true;
+  return isLoopbackHost(host);
 }
 
 /**

@@ -9,7 +9,7 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { jwtKid, UNKNOWN_KID_COOLDOWN_MS, ZeroIdVerifier } from "../daemon/auth.js";
+import { FAILED_FETCH_RETRY_MS, jwtKeyRef, jwtKid, UNKNOWN_KID_COOLDOWN_MS, ZeroIdVerifier } from "../daemon/auth.js";
 import type { AuthContext } from "../protocol/types.js";
 
 const CTX: AuthContext = { sub: "u", scopes: [], delegationDepth: 0, accountId: "a", projectId: "p" };
@@ -96,6 +96,30 @@ describe("ZeroIdVerifier — forged-kid bound", () => {
     expect(h.reads()).toBe(1);
   });
 
+  it("after a failed read, the issuer is retried within a second, not a full window", async () => {
+    let now = 0;
+    let up = false;
+    let reads = 0;
+    const v = new ZeroIdVerifier(
+      { baseUrl: "http://zeroid.test" },
+      {
+        now: () => now,
+        fetchKids: async () => {
+          reads++;
+          if (!up) throw new Error("ECONNREFUSED");
+          return new Set(["k1"]);
+        },
+        verify: async () => CTX,
+      },
+    );
+    await expect(v.verify(jwt("k1"))).rejects.toThrow("unknown key"); // boot during an outage
+    up = true;
+    now += FAILED_FETCH_RETRY_MS;
+    expect(await v.verify(jwt("k1"))).toEqual(CTX);
+    expect(reads).toBe(2);
+    expect(FAILED_FETCH_RETRY_MS).toBeLessThan(UNKNOWN_KID_COOLDOWN_MS);
+  });
+
   it("an unreachable issuer leaves unknown kids refused and the next window retries", async () => {
     let reads = 0;
     const v = new ZeroIdVerifier(
@@ -117,6 +141,38 @@ describe("ZeroIdVerifier — forged-kid bound", () => {
     const h = harness([]);
     expect(await h.v.verify(jwt(undefined))).toEqual(CTX);
     expect(h.reads()).toBe(0);
+  });
+
+  it("headers the SDK would still refetch for, but the gate can't read, are refused outright", async () => {
+    // Round-3 finding: our parser and the SDK's disagreed, so these skipped
+    // the gate while the SDK refetched JWKS for each one.
+    const raw = (headerJson: string, bom = false) =>
+      `${Buffer.concat([bom ? Buffer.from([0xef, 0xbb, 0xbf]) : Buffer.alloc(0), Buffer.from(headerJson)]).toString("base64url")}.e30.sig`;
+    const h = harness(["k1"]);
+    const variants = [
+      raw('{"alg":"RS256","kid":1}'),
+      raw('{"alg":"RS256","kid":true}'),
+      raw('{"alg":"RS256","kid":[0]}'),
+      raw('{"alg":"RS256","kid":{}}'),
+      raw('{"alg":"RS256","kid":"z","kid":5}'),
+      raw('{"alg":"RS256","k\\u0069d":7}'),
+      raw("not json"),
+      raw("[1,2]"),
+    ];
+    for (const t of variants) await expect(h.v.verify(t)).rejects.toThrow("Malformed token header");
+    expect(h.sdkCalls).toEqual([]);
+    expect(h.reads()).toBe(0);
+    // A BOM is stripped exactly as the SDK strips it — so its kid IS gated.
+    for (let i = 0; i < 10; i++) await expect(h.v.verify(raw(`{"alg":"RS256","kid":"bom-${i}"}`, true))).rejects.toThrow("unknown key");
+    expect(h.reads()).toBe(1);
+    expect(h.sdkCalls).toEqual([]);
+  });
+
+  it("an empty or falsy kid is 'none' — the SDK selects by alg and never refetches", () => {
+    const raw = (j: string) => `${Buffer.from(j).toString("base64url")}.e30.sig`;
+    for (const j of ['{"alg":"RS256","kid":""}', '{"alg":"RS256","kid":null}', '{"alg":"RS256","kid":0}', '{"alg":"RS256"}']) {
+      expect(jwtKeyRef(raw(j))).toEqual({ kind: "none" });
+    }
   });
 
   it("jwtKid reads the header, and tolerates garbage", () => {

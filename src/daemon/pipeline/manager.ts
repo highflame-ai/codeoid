@@ -206,6 +206,11 @@ export class PipelineManager {
     return this.#store.listByTenant(accountId, projectId);
   }
 
+  /** Session ids this tenant's live (non-terminal) runs are driving. */
+  activeSessionIds(accountId: string, projectId: string): string[] {
+    return this.#store.activeSessionIds(accountId, projectId);
+  }
+
   /** Drive the pipeline until it is terminal or halted, persisting each step. */
   advance(id: string): Promise<PipelineState> {
     return this.#serialize(id, async () => cloneState(await this.#advanceInner(id)));

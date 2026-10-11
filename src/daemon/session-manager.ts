@@ -137,7 +137,7 @@ import type {
   SettingPatch,
 } from "../protocol/types.js";
 import type { Scope } from "../protocol/scopes.js";
-import { isTerminal, type PipelineState } from "./pipeline/interface.js";
+import type { PipelineState } from "./pipeline/interface.js";
 import { blockingOf, openFindings, renderLedger } from "./pipeline/findings.js";
 
 /** Per-phase autonomous turn budget for a pipeline run. A phase runs the model
@@ -5420,11 +5420,7 @@ mcpHub: this.#mcpHub,
    * resume as plain ones) and clears itself when the run ends.
    */
   #pipelineDrivenSessionIds(accountId: string, projectId: string): Set<string> {
-    const ids = new Set<string>();
-    for (const p of this.#pipelines?.list(accountId, projectId) ?? []) {
-      if (p.sessionId && !isTerminal(p.status)) ids.add(p.sessionId);
-    }
-    return ids;
+    return new Set(this.#pipelines?.activeSessionIds(accountId, projectId) ?? []);
   }
 
   #attach(

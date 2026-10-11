@@ -573,6 +573,18 @@ describe("edge cases", () => {
     expect(r.text).toContain("timeoutSeconds");
   });
 
+  it("a daemon call that never settles is cut off, so a lifted socket can't be held forever", async () => {
+    const host: ControlHost = {
+      handle: () => new Promise<DaemonMessage>(() => {}), // a hung backend
+      disconnectClient: () => {},
+      audit: () => {},
+    };
+    const ep = new ControlMcpHttp({ verifier, host, config: controlConfig(), callDeadlineMs: 50 });
+    const r = await call(ep, "tok-owner", "list_sessions");
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("timeout: the daemon did not answer session.list");
+  });
+
   it("an internal throw becomes an isError result, not a 500", async () => {
     const host: ControlHost = {
       handle: async () => {
@@ -610,7 +622,13 @@ describe("long waits survive the HTTP server's idle timeout", () => {
     const server = Bun.serve({
       port: 0,
       idleTimeout: 1,
-      fetch: (req, srv) => ep.handle(req, { disableIdleTimeout: () => srv.timeout(req, 0) }),
+      fetch: (req, srv) =>
+        ep.handle(req, {
+          liftIdleTimeout: () => {
+            srv.timeout(req, 0);
+            return () => srv.timeout(req, 1);
+          },
+        }),
     });
     const res = await fetch(`http://127.0.0.1:${server.port}${CONTROL_MCP_PATH}`, {
       method: "POST",
@@ -631,7 +649,13 @@ describe("long waits survive the HTTP server's idle timeout", () => {
   it("the idle timeout is lifted only for an authenticated tool call, after its body is read", async () => {
     const ep = endpoint();
     let lifted = 0;
-    const opts = { disableIdleTimeout: () => void lifted++ };
+    let restored = 0;
+    const opts = {
+      liftIdleTimeout: () => {
+        lifted++;
+        return () => void restored++;
+      },
+    };
     const send = (body: unknown, token?: string) =>
       ep.handle(
         new Request(`http://127.0.0.1${CONTROL_MCP_PATH}`, {
@@ -649,7 +673,65 @@ describe("long waits survive the HTTP server's idle timeout", () => {
     expect(lifted).toBe(0);
     await send(toolCall, "tok-owner");
     expect(lifted).toBe(1);
+    expect(restored).toBe(1);
+    // Restored even when the tool throws.
+    await send({ jsonrpc: "2.0", id: 9, method: "tools/call", params: { name: "get_session", arguments: { session: "nope" } } }, "tok-owner");
+    expect([lifted, restored]).toEqual([2, 2]);
   });
+
+  it("after a long tool call, the connection idles out again — the lift does not stick to the socket", async () => {
+    // Bun scopes server.timeout to the keep-alive socket; a lift left at 0
+    // would let one valid call hold the connection, and a half-sent request
+    // on it, open forever. Raw socket so keep-alive is real.
+    const { connect } = await import("node:net");
+    const busyUntil = Date.now() + 5_000;
+    const host: ControlHost = {
+      handle: async (msg) =>
+        msg.type === "session.list"
+          ? ({
+              type: "session.list.result",
+              requestId: msg.id,
+              sessions: [{ id: "s", name: "s", status: Date.now() < busyUntil ? "thinking" : "idle" } as SessionInfo],
+            } as DaemonMessage)
+          : ({ type: "response.ok", requestId: msg.id } as DaemonMessage),
+      disconnectClient: () => {},
+      audit: () => {},
+    };
+    const ep = new ControlMcpHttp({ verifier, host, config: controlConfig() });
+    const server = Bun.serve({
+      port: 0,
+      idleTimeout: 1,
+      fetch: (req, srv) =>
+        ep.handle(req, {
+          liftIdleTimeout: () => {
+            srv.timeout(req, 0);
+            return () => srv.timeout(req, 1);
+          },
+        }),
+    });
+    const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "wait_for_session", arguments: { session: "s", timeoutSeconds: 10 } } });
+    const outcome = await new Promise<string>((resolve) => {
+      let responded = false;
+      const sock = connect(server.port as number, "127.0.0.1", () => {
+        sock.write(
+          `POST ${CONTROL_MCP_PATH} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer tok-owner\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
+        );
+      });
+      sock.on("data", () => {
+        if (!responded) {
+          responded = true;
+          sock.write("GET / HTTP/1.1\r\nHo"); // half a request, then silence
+        }
+      });
+      sock.on("close", () => resolve(responded ? "closed" : "closed-before-response"));
+      setTimeout(() => {
+        resolve(responded ? "still-open" : "no-response");
+        sock.destroy();
+      }, 14_000);
+    });
+    server.stop(true);
+    expect(outcome).toBe("closed");
+  }, 20_000);
 });
 
 describe("audit round 1 fixes", () => {

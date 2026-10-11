@@ -663,6 +663,15 @@ describe("resolveLocalToken — client-side local-mode discovery", () => {
     expect(resolveLocalToken("ws://10.1.2.3:7400", {})).toBeNull();
     expect(resolveLocalToken("ws://localhost:7400", {})).not.toBeNull();
     expect(resolveLocalToken("ws://[::1]:7400", {})).not.toBeNull();
+    // Client-side forms that still mean this machine.
+    expect(resolveLocalToken("ws://0.0.0.0:7400", {})).not.toBeNull();
+    expect(resolveLocalToken("ws://[::ffff:127.0.0.1]:7400", {})).not.toBeNull();
+    expect(resolveLocalToken("ws://localhost.localdomain:7400", {})).not.toBeNull();
+    expect(resolveLocalToken("ws://127.0.1.1:7400", {})).not.toBeNull();
+    // ...and look-alikes that don't.
+    for (const u of ["ws://127.0.0.1.evil.com:7400", "ws://127.0.0.1@evil.com:7400", "ws://localhost.evil.com:7400"]) {
+      expect(resolveLocalToken(u, {})).toBeNull();
+    }
     // An explicit pin is the operator's own decision (e.g. --local-allow-remote).
     expect(resolveLocalToken("ws://10.1.2.3:7400", { CODEOID_LOCAL_TOKEN: "codeoid_local_pinned" })).toBe("codeoid_local_pinned");
   });

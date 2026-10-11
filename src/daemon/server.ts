@@ -97,6 +97,9 @@ type SocketData = {
 // The /oauth2/token proxy is unauthenticated (pre-auth exchange), so cap body
 // size, restrict content types, and rate-limit per source IP so it can't be
 // abused as an anonymizing amplifier against the ZeroID issuer.
+/** Connection idle timeout (Bun.serve `idleTimeout`, seconds). */
+const IDLE_TIMEOUT_SECONDS = 10;
+
 const PROXY_RATE_MAX = 30;
 const PROXY_RATE_WINDOW_MS = 60_000;
 const PROXY_BODY_MAX_BYTES = 8 * 1024;
@@ -548,6 +551,9 @@ export class DaemonServer {
     this.#bunServer = Bun.serve({
       port: this.#config.port,
       hostname: this.#config.host,
+      // Bun's own default, made explicit so `/mcp/control` can restore exactly
+      // this after lifting it for a long wait (see ControlMcpHttp.handle).
+      idleTimeout: IDLE_TIMEOUT_SECONDS,
 
       async fetch(req, server) {
         const url = new URL(req.url);
@@ -591,7 +597,12 @@ export class DaemonServer {
         // every other client gets. Off by default: not mounted = 404, so a
         // probe cannot even tell it exists.
         if (url.pathname === CONTROL_MCP_PATH && self.#controlMcp) {
-          return self.#controlMcp.handle(req, { disableIdleTimeout: () => server.timeout(req, 0) });
+          return self.#controlMcp.handle(req, {
+            liftIdleTimeout: () => {
+              server.timeout(req, 0);
+              return () => server.timeout(req, IDLE_TIMEOUT_SECONDS);
+            },
+          });
         }
 
         // The provider's redirect after an MCP server sign-in. Unauthenticated

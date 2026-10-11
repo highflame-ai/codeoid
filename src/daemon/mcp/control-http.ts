@@ -104,6 +104,8 @@ export interface ControlMcpOptions {
   config: McpControlConfig;
   /** Injectable for tests. */
   sleep?: (ms: number) => Promise<void>;
+  /** Bound on a single daemon call (default maxWaitSeconds + 30 s). Tests only. */
+  callDeadlineMs?: number;
 }
 
 /** A tool failure the caller should see as `isError: true` text, not a crash. */
@@ -745,7 +747,11 @@ export class ControlMcpHttp {
   readonly #tools: ToolDef[];
   /** Live waits per subject (see MAX_WAITS_PER_SUBJECT). */
   readonly #waits = new Map<string, number>();
+  /** Upper bound on any single daemon call made for a tool. */
+  readonly #callDeadlineMs: number;
+
   constructor(opts: ControlMcpOptions) {
+    this.#callDeadlineMs = opts.callDeadlineMs ?? (opts.config.maxWaitSeconds + 30) * 1000;
     this.#verifier = opts.verifier;
     this.#host = opts.host;
     this.#config = opts.config;
@@ -770,15 +776,16 @@ export class ControlMcpHttp {
   /**
    * Bun.serve fetch handler for {@link CONTROL_MCP_PATH}.
    *
-   * `disableIdleTimeout` lifts Bun's idle timeout for this one request. A tool
+   * `liftIdleTimeout` lifts Bun's idle timeout for this one request. A tool
    * call that waits on an agent's turn is legitimately pending for minutes,
    * while Bun.serve's `idleTimeout` is 10 s and its per-request
    * `server.timeout` is silently capped near 255 s (measured on 1.3.13: a
    * 300 s setting cut a 270 s hold at 256 s) — below `maxWaitSeconds`' 600 s
    * ceiling. So the timeout is disabled rather than raised: the handler bounds
-   * itself (every wait ends by `maxWaitSeconds`), and it is applied only after
+   * itself (every wait ends by `maxWaitSeconds`), it is applied only after
    * authentication and after the whole body has arrived, so a slow-trickled
-   * body still meets the normal idle timeout.
+   * body still meets the normal idle timeout, and it is restored before the
+   * response, since Bun scopes it to the connection, not the request.
    *
    * There is no per-address throttle on failed authentication here: on a
    * loopback daemon every caller shares one address, so a throttle let any
@@ -788,7 +795,10 @@ export class ControlMcpHttp {
    */
   async handle(
     req: Request,
-    opts: { disableIdleTimeout?: () => void } = {},
+    opts: {
+      /** Lift the connection's idle timeout for this call; returns the restore. */
+      liftIdleTimeout?: () => () => void;
+    } = {},
   ): Promise<Response> {
     // DNS-rebinding guard (MCP Streamable HTTP §security): a browser page on
     // another origin must not reach a loopback daemon. Agents send no Origin.
@@ -844,9 +854,18 @@ export class ControlMcpHttp {
       return Response.json(rpcErr(null, -32600, "Invalid Request: one JSON-RPC message per POST"), { status: 400 });
     }
 
-    // Only a tool call can wait, and it ends itself by maxWaitSeconds.
-    if ((body as JsonRpcMessage).method === "tools/call") opts.disableIdleTimeout?.();
-    const res = await this.#dispatch(body as JsonRpcMessage, auth, req.signal);
+    // Only a tool call can wait, and it ends itself by maxWaitSeconds. The
+    // lift is restored before the response goes out: Bun applies a request's
+    // timeout to its whole keep-alive SOCKET, so leaving it at 0 would let any
+    // caller who made one valid call hold that connection open forever — and
+    // a half-sent next request on it would never time out (measured).
+    const restore = (body as JsonRpcMessage).method === "tools/call" ? opts.liftIdleTimeout?.() : undefined;
+    let res: JsonRpcResponse | null;
+    try {
+      res = await this.#dispatch(body as JsonRpcMessage, auth, req.signal);
+    } finally {
+      restore?.();
+    }
     if (!res) return new Response(null, { status: 202 });
     return Response.json(res);
   }
@@ -916,7 +935,22 @@ export class ControlMcpHttp {
         // A sink: this endpoint never attaches, so nothing should stream to
         // it — but if a handler does send, drop it rather than throw.
         const client: AttachedClient = { id: clientId, auth, send: () => {}, capabilities: [CAPABILITIES.SCROLLBACK_PAGING] };
-        return this.#host.handle(parsed.value, auth, client);
+        // The connection's idle timeout is lifted during a tool call, so a
+        // handler that never settles (a backend hung starting or tearing down)
+        // would hold the socket forever. Bound every daemon call; the work
+        // itself carries on in the daemon, the caller just stops waiting.
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const deadline = new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new ToolError(`the daemon did not answer ${partial.type} within ${this.#callDeadlineMs / 1000}s`, "timeout")),
+            this.#callDeadlineMs,
+          );
+        });
+        try {
+          return await Promise.race([this.#host.handle(parsed.value, auth, client), deadline]);
+        } finally {
+          clearTimeout(timer);
+        }
       },
     };
 

@@ -37,6 +37,18 @@ describe("PipelineStore", () => {
     expect(store.get("a")?.cursor).toBe(1);
   });
 
+  test("activeSessionIds: only the tenant's non-terminal runs, only real session ids", () => {
+    const store = new PipelineStore(new Database(":memory:"));
+    store.save(mk("draft", { status: "draft", sessionId: "s-draft" }));
+    store.save(mk("running", { status: "running", sessionId: "s-running" }));
+    store.save(mk("halted", { status: "halted", sessionId: "s-halted" }));
+    for (const st of ["merged", "done", "failed", "abandoned"] as const) store.save(mk(st, { status: st, sessionId: `s-${st}` }));
+    store.save(mk("no-session", { status: "running" }));
+    store.save(mk("other-tenant", { status: "running", sessionId: "s-other", accountId: "other" }));
+    expect(store.activeSessionIds("acct", "proj").sort()).toEqual(["s-draft", "s-halted", "s-running"]);
+    expect(store.activeSessionIds("other", "proj")).toEqual(["s-other"]);
+  });
+
   test("listByTenant filters by tenant and orders newest first", () => {
     const store = new PipelineStore(new Database(":memory:"));
     store.save(mk("a", { createdAt: 1 }));

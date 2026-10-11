@@ -98,6 +98,14 @@ describe("mcp headers", () => {
     expect(String(z.seen[0]!.body.scope).split(" ")).toEqual([...MCP_SCOPE_PRESETS.operate!]);
   });
 
+  it("says so when an explicitly pinned local token is going to a remote host", async () => {
+    process.env.CODEOID_LOCAL_TOKEN = "local-tok";
+    const out = await mcpHeaders({ ...BASE, daemonUrl: "wss://codeoid.example.com" }, "observe");
+    expect(out.warnings.some((w) => w.includes("not this machine"))).toBe(true);
+    const local = await mcpHeaders({ ...BASE }, "observe");
+    expect(local.warnings.some((w) => w.includes("not this machine"))).toBe(false);
+  });
+
   it("warns (on stderr, not in the JSON) that a local token cannot be narrowed", async () => {
     process.env.CODEOID_LOCAL_TOKEN = "local-tok";
     const out = await mcpHeaders({ ...BASE }, "observe");

@@ -20,7 +20,11 @@ import type { AuthMode, TokenVerifier } from "./verifier.js";
 export interface AuthConfig {
   /** ZeroID base URL, e.g. "http://localhost:8899" */
   baseUrl: string;
-  /** ZeroID JWKS URL — derived from baseUrl if not set */
+  /**
+   * Unused: the ZeroID SDK always verifies against
+   * `${baseUrl}/.well-known/jwks.json`, and so does ZeroIdVerifier's key-id
+   * inventory, so the two can never disagree. Kept for config compatibility.
+   */
   jwksUrl?: string;
   /** Expected issuer claim */
   issuer?: string;
@@ -106,17 +110,53 @@ function identityToAuthContext(identity: VerifiedIdentity): AuthContext {
 /** Minimum spacing between the verifier's own reads of the issuer's key ids. */
 export const UNKNOWN_KID_COOLDOWN_MS = 10_000;
 const JWKS_FETCH_TIMEOUT_MS = 5_000;
+/** After a FAILED inventory read, the next one may happen this soon. */
+export const FAILED_FETCH_RETRY_MS = 1_000;
 
-/** The `kid` a JWT's header names, or undefined (absent, or not a JWT). */
-export function jwtKid(token: string): string | undefined {
-  const header = token.split(".")[0];
-  if (!header) return undefined;
+/**
+ * Decode a JWT segment EXACTLY as the ZeroID SDK does (base64url → atob →
+ * TextDecoder). It has to be the same decoder, not merely an equivalent one:
+ * the gate below is only sound if it sees the header the SDK will see. Node's
+ * `Buffer` base64url + utf8 keeps a leading BOM that TextDecoder strips, so a
+ * BOM-prefixed header parsed as garbage here and as a valid `kid` there.
+ */
+function decodeLikeSdk(segment: string): string {
+  const padded = segment.replace(/-/g, "+").replace(/_/g, "/");
+  const binary = atob(padded + "=".repeat((4 - (padded.length % 4)) % 4));
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
+}
+
+/**
+ * What a JWT header says about its signing key, as the SDK will read it:
+ * - `none` — no truthy `kid`; the SDK selects by `alg` and never refetches;
+ * - a string `kid` — the SDK refetches its JWKS when it hasn't cached it;
+ * - `invalid` — undecodable, or a truthy `kid` that is not a non-empty string.
+ *   The SDK would still refetch for a truthy non-string (`kid: 1`), so these
+ *   are refused outright rather than let past the gate.
+ */
+export type JwtKeyRef = { kind: "none" } | { kind: "kid"; kid: string } | { kind: "invalid" };
+
+export function jwtKeyRef(token: string): JwtKeyRef {
+  const segment = token.split(".")[0];
+  if (!segment) return { kind: "invalid" };
+  let header: unknown;
   try {
-    const kid = (JSON.parse(Buffer.from(header, "base64url").toString("utf8")) as { kid?: unknown }).kid;
-    return typeof kid === "string" && kid.length > 0 ? kid : undefined;
+    header = JSON.parse(decodeLikeSdk(segment));
   } catch {
-    return undefined;
+    return { kind: "invalid" };
   }
+  if (header === null || typeof header !== "object" || Array.isArray(header)) return { kind: "invalid" };
+  const kid = (header as { kid?: unknown }).kid;
+  if (!kid) return { kind: "none" }; // absent, "", 0, false, null — the SDK's `kid ?` is falsy too
+  return typeof kid === "string" ? { kind: "kid", kid } : { kind: "invalid" };
+}
+
+/** The `kid` a JWT's header names, or undefined. */
+export function jwtKid(token: string): string | undefined {
+  const ref = jwtKeyRef(token);
+  return ref.kind === "kid" ? ref.kid : undefined;
 }
 
 /** The key ids an issuer publishes at its JWKS endpoint. */
@@ -173,7 +213,9 @@ export class ZeroIdVerifier implements TokenVerifier {
   ) {
     this.#config = config;
     this.#verify = deps.verify ?? verifyToken;
-    const jwksUrl = config.jwksUrl ?? `${config.baseUrl}/.well-known/jwks.json`;
+    // The SAME URL the SDK fetches (it always derives it from baseUrl and
+    // ignores `jwksUrl`), so the inventory describes the keys it will use.
+    const jwksUrl = `${config.baseUrl.replace(/\/+$/, "")}/.well-known/jwks.json`;
     this.#fetchKids = deps.fetchKids ?? (() => fetchJwksKids(jwksUrl));
     this.#now = deps.now ?? Date.now;
   }
@@ -184,12 +226,16 @@ export class ZeroIdVerifier implements TokenVerifier {
   }
 
   async verify(token: string): Promise<AuthContext> {
-    const kid = jwtKid(token);
-    if (kid !== undefined && !this.#knownKids.has(kid) && !(await this.#publishes(kid))) {
+    const ref = jwtKeyRef(token);
+    // Fail closed on anything the gate can't reason about: an undecodable
+    // header, or a truthy `kid` that isn't a string (which the SDK would
+    // still refetch for — `kid: 1` bypassed an earlier version of this gate).
+    if (ref.kind === "invalid") throw new Error("Malformed token header");
+    if (ref.kind === "kid" && !this.#knownKids.has(ref.kid) && !(await this.#publishes(ref.kid))) {
       throw new Error("Token signed by an unknown key");
     }
     const ctx = await this.#verify(token, this.#config);
-    if (kid !== undefined) this.#knownKids.add(kid);
+    if (ref.kind === "kid") this.#knownKids.add(ref.kid);
     return ctx;
   }
 
@@ -205,7 +251,10 @@ export class ZeroIdVerifier implements TokenVerifier {
           this.#published = await this.#fetchKids();
         } catch {
           // Keep the last inventory; an unreachable issuer would fail the SDK
-          // path anyway, and the next window retries.
+          // path anyway. Retry sooner than a full window, though: right after
+          // boot nothing is known yet, and one blip must not refuse every
+          // client for 10 s once ZeroID is back.
+          this.#publishedAt = this.#now() - UNKNOWN_KID_COOLDOWN_MS + FAILED_FETCH_RETRY_MS;
         } finally {
           this.#refreshing = null;
         }

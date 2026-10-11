@@ -9,7 +9,7 @@
  * long-lived mount without pasting a token anywhere.
  */
 
-import type { CodeoidConfig } from "../config.js";
+import { isLoopbackUrl, type CodeoidConfig } from "../config.js";
 import { acquireToken, controlUrl, isPreset, resolveMcpScopes, type AcquiredToken } from "./token.js";
 
 export interface HeadersResult {
@@ -31,6 +31,11 @@ export async function mcpHeaders(
     warnings.push(
       "codeoid: local-mode token — it carries every scope; --scopes cannot narrow it. Use a ZeroID key for an attenuated token.",
     );
+    if (!isLoopbackUrl(config.daemonUrl)) {
+      // Only an explicit CODEOID_LOCAL_TOKEN reaches here for a remote URL
+      // (the token FILE is loopback-only) — say where it is going.
+      warnings.push(`codeoid: this all-scopes token is for ${config.daemonUrl}, which is not this machine.`);
+    }
   } else if (t.source === "configured") {
     warnings.push("codeoid: using the configured token as-is — --scopes applies only when exchanging a zid_sk_ key.");
   }
