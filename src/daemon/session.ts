@@ -4303,10 +4303,11 @@ export class Session {
   }
 
   #makeCanUseToolFn(sender: AuthContext): ToolApprovalFn {
+    // The backend this gate is handed to — the one that will ASK. Captured
+    // here, not at call time, so the rewrite check below refers to it even if
+    // the session's provider has changed by the time a call arrives.
+    const provider = this.#provider;
     return async (toolId, approvalId, toolName, inputObj, signal) => {
-      // The backend that ASKED — captured before any await, so a rewrite check
-      // below refers to it even if the session's provider changes meanwhile.
-      const provider = this.#provider;
       // Yield once so the tool_start event is processed by the event consumer
       // (creating the SessionMessage) before hooks run or the approval
       // decision is returned.
