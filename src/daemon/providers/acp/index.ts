@@ -79,6 +79,11 @@ export interface GeminiAcpProviderInit {
 }
 
 export class GeminiAcpProvider implements SessionProvider {
+  /**
+   * An ACP permission reply only selects an option — the Gemini CLI runs the
+   * input it proposed, so a rewrite can't apply (#367).
+   */
+  readonly appliesToolInputRewrite = false;
   readonly id = "gemini-cli";
   readonly displayName = "Gemini CLI (Google)";
 

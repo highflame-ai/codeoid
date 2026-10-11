@@ -236,6 +236,11 @@ export function describeCodexError(params: Record<string, unknown>): string {
 }
 
 export class CodexProvider implements SessionProvider {
+  /**
+   * codex's approval replies carry only a decision (`approved` / `accept`) —
+   * codex runs the input IT proposed, so a rewrite can't apply (#367).
+   */
+  readonly appliesToolInputRewrite = false;
   readonly id = "codex";
   readonly displayName = "Codex (OpenAI)";
 
@@ -278,6 +283,27 @@ export class CodexProvider implements SessionProvider {
   #modelContextWindow: number | null = null;
   /** item id → {name, input} for items already announced via tool_start. */
   #announcedItems = new Map<string, { name: string; input: Record<string, unknown> }>();
+  /** Items codeoid's gate declined: their card is already cancelled, so codex's
+   *  own `declined` completion for them must not overwrite it (#369). */
+  #declinedItems = new Set<string>();
+  /**
+   * What each command / file-change item will DO, from its `item/started`
+   * notification, keyed by item id. codex 0.154's approval requests don't
+   * carry the diff (and may omit the command) — this is the only place the
+   * approver's view of the change can come from (#369).
+   */
+  #startedItems = new Map<string, Record<string, unknown>>();
+  /** Approved sibling callbacks (`${itemId}:${approvalId}`) still open, by parent
+   *  item id. codex completes only the PARENT, so its completion closes them. */
+  #openSubApprovals = new Map<string, Set<string>>();
+  /** Parent items codex has completed this turn — a sibling approval answered
+   *  after its parent finished must not report as run (#369). */
+  #completedParents = new Set<string>();
+  /** Items with an approval being decided, and those whose patch changed
+   *  meanwhile: the approver saw the earlier diff, so the yes doesn't cover the
+   *  new one — declined instead (#369). */
+  #approvalsInFlight = new Map<string, number>();
+  #patchChangedInFlight = new Set<string>();
   /**
    * serverName → the most-recent mcpToolCall item awaiting its approval
    * elicitation. codex gates an MCP tool call with `mcpServer/elicitation/request`,
@@ -285,7 +311,10 @@ export class CodexProvider implements SessionProvider {
    * that fires just before it carries both, so we correlate here to build the
    * canonical `mcp__<server>__<tool>` name the approval gate + isSafeTool key off.
    */
-  #pendingMcpCalls = new Map<string, { itemId: string; tool: string; input: Record<string, unknown> }>();
+  /** MCP calls codex started and may elicit approval for, oldest first, by
+   *  server. A LIST: two calls to one server can be in flight at once, and the
+   *  elicitation names only the server (#368). */
+  #pendingMcpCalls = new Map<string, Array<{ itemId: string; tool: string; input: Record<string, unknown> }>>();
 
   constructor(init: CodexProviderInit) {
     this.#sessionId = init.sessionId;
@@ -435,6 +464,13 @@ export class CodexProvider implements SessionProvider {
     this.#turnStartedAt = Date.now();
     this.#turnModel = opts.model ?? "codex";
     this.#announcedItems.clear();
+    this.#declinedItems.clear();
+    this.#startedItems.clear();
+    this.#pendingMcpCalls.clear();
+    this.#openSubApprovals.clear();
+    this.#completedParents.clear();
+    this.#approvalsInFlight.clear();
+    this.#patchChangedInFlight.clear();
     this.#lastTokenUsage = null;
     // Per turn, like the usage beside it. This provider instance outlives a
     // `/model` switch or a pipeline overrideModel, so a turn interrupted before
@@ -490,6 +526,7 @@ export class CodexProvider implements SessionProvider {
   }
 
   async teardown(): Promise<void> {
+    this.#pendingMcpCalls.clear();
     this.#turnQueue?.close();
     this.#turnQueue = null;
     this.#proc?.kill();
@@ -598,6 +635,66 @@ export class CodexProvider implements SessionProvider {
     }
   }
 
+  /**
+   * Which MCP call an elicitation is about (#368). codex names only the SERVER;
+   * its message names the tool and `_meta.tool_params` carries the arguments.
+   * When the elicitation says both, that IS what will run and is what's shown —
+   * correlation only picks the started item to pair the result with. When it
+   * doesn't, use the one matching call; several DIFFERENT candidates are
+   * ambiguous and declined rather than guessed.
+   */
+  #resolveElicitedCall(
+    serverName: string,
+    params: Record<string, unknown>,
+  ): { tool: string; input: Record<string, unknown>; itemId: string; unshowable?: string } {
+    const eTool = mcpToolFromMessage(params.message, serverName);
+    const eArgs = elicitedToolParams(params);
+    const list = this.#pendingMcpCalls.get(serverName) ?? [];
+    const matches = list.filter(
+      (c) => (eTool === null || c.tool === eTool) && (eArgs === undefined || Bun.deepEquals(c.input, eArgs)),
+    );
+    // Unique per request — never the turn id, which every request in a turn
+    // shares: two approvals on one id would let one answer settle the other.
+    const synthetic = `mcp-${randomUUID()}`;
+    const take = (c: (typeof list)[number]) => {
+      list.splice(list.indexOf(c), 1);
+      if (list.length === 0) this.#pendingMcpCalls.delete(serverName);
+      return c;
+    };
+    if (eTool !== null && eArgs !== undefined) {
+      const c = matches[0] ? take(matches[0]) : undefined;
+      return { tool: eTool, input: eArgs, itemId: c?.itemId ?? synthetic };
+    }
+    const first = matches[0];
+    if (first && matches.every((c) => c.tool === first.tool && Bun.deepEquals(c.input, first.input))) {
+      // One candidate, or several identical ones — the same call either way.
+      const c = take(first);
+      return { tool: c.tool, input: c.input, itemId: c.itemId };
+    }
+    if (matches.length > 1) {
+      return {
+        tool: eTool ?? "tool",
+        input: eArgs ?? {},
+        itemId: synthetic,
+        unshowable: `${matches.length} different calls to ${serverName} are waiting and codex didn't say which this is`,
+      };
+    }
+    return {
+      tool: eTool ?? "tool",
+      input: eArgs ?? {},
+      itemId: synthetic,
+      unshowable: `codex didn't say which ${serverName} call this is, or with what arguments`,
+    };
+  }
+
+  #dropPendingMcpCall(serverName: string, itemId: string): void {
+    const list = this.#pendingMcpCalls.get(serverName);
+    if (!list) return;
+    const i = list.findIndex((c) => c.itemId === itemId);
+    if (i >= 0) list.splice(i, 1);
+    if (list.length === 0) this.#pendingMcpCalls.delete(serverName);
+  }
+
   #push(event: ProviderEvent): void {
     const queue = this.#turnQueue;
     if (!queue || queue.closed) return;
@@ -626,12 +723,30 @@ export class CodexProvider implements SessionProvider {
         // that follows an mcpToolCall — stash the tool + args here so the
         // elicitation handler can build the canonical `mcp__server__tool` name.
         const item = params.item as Record<string, unknown> | undefined;
+        if (item && ((item.type as string) === "commandExecution" || (item.type as string) === "fileChange")) {
+          this.#startedItems.set(String(item.id ?? ""), item);
+        }
         if (item && (item.type as string) === "mcpToolCall") {
-          this.#pendingMcpCalls.set(String(item.server ?? ""), {
+          const server = String(item.server ?? "");
+          const list = this.#pendingMcpCalls.get(server) ?? [];
+          list.push({
             itemId: String(item.id ?? ""),
             tool: String(item.tool ?? "tool"),
             input: (item.arguments as Record<string, unknown>) ?? {},
           });
+          this.#pendingMcpCalls.set(server, list);
+        }
+        break;
+      }
+      case "item/fileChange/patchUpdated": {
+        // codex can stream a patch (apply_patch_streaming_events): item/started
+        // may carry none or part of it. The approver must see the latest — a
+        // fresh object, never a mutation of what an approval may have read.
+        const itemId = String(params.itemId ?? "");
+        const started = this.#startedItems.get(itemId);
+        if (started && started.type === "fileChange" && Array.isArray(params.changes)) {
+          this.#startedItems.set(itemId, { ...started, changes: params.changes });
+          if (this.#approvalsInFlight.has(itemId)) this.#patchChangedInFlight.add(itemId);
         }
         break;
       }
@@ -640,7 +755,18 @@ export class CodexProvider implements SessionProvider {
         if (!item) break;
         const itemType = item.type as string;
         const itemId = String(item.id ?? "");
-        if (itemType === "mcpToolCall") this.#pendingMcpCalls.delete(String(item.server ?? ""));
+        if (itemType === "mcpToolCall") this.#dropPendingMcpCall(String(item.server ?? ""), itemId);
+        this.#startedItems.delete(itemId);
+        this.#completedParents.add(itemId);
+        const subs = this.#openSubApprovals.get(itemId);
+        if (subs) {
+          this.#openSubApprovals.delete(itemId);
+          const ok = String(item.status ?? "completed") === "completed";
+          for (const subId of subs) {
+            this.#push({ type: "tool_complete", sdkToolUseId: subId, output: ok ? "Ran as part of the parent command." : `Parent command ${String(item.status)}.`, success: ok });
+            this.#announcedItems.delete(subId);
+          }
+        }
         if (itemType === "agentMessage") {
           const text = (item.text ?? item.content ?? "") as string;
           this.#push({ type: "text_done", content: typeof text === "string" ? text : "" });
@@ -660,11 +786,20 @@ export class CodexProvider implements SessionProvider {
               approvalId: `codex-auto-${itemId}`,
             });
           }
+          // Only `completed` succeeded: codex also reports `declined` (the
+          // approval was refused or failed) and `failed` — neither ran (#369).
+          const status = String(item.status ?? "completed");
+          if (this.#declinedItems.delete(itemId) && status === "declined") {
+            // codeoid declined it — the card already says so (cancelled).
+            this.#announcedItems.delete(itemId);
+            break;
+          }
+          const output = extractItemOutput(item);
           this.#push({
             type: "tool_complete",
             sdkToolUseId: itemId,
-            output: extractItemOutput(item),
-            success: (item.status ?? "completed") !== "failed",
+            output: output || (status === "declined" ? "Declined — not run." : output),
+            success: status === "completed",
           });
           this.#announcedItems.delete(itemId);
         }
@@ -730,9 +865,16 @@ export class CodexProvider implements SessionProvider {
       case "item/permissions/requestApproval": {
         const canUseTool = this.#canUseTool;
         // Fail closed: an approval with no gate wired is denied, never run.
-        if (!canUseTool) return { decision: "denied" };
-        const itemId = String(params.itemId ?? params.approvalId ?? randomUUID());
-        const { name, input } = approvalToTool(method, params);
+        if (!canUseTool) return approvalReply(method, params, false);
+        const hasItem = typeof params.itemId === "string" && params.itemId !== "";
+        const hasCallback = typeof params.approvalId === "string" && params.approvalId !== "";
+        const parentId = String(hasItem ? params.itemId : (params.approvalId ?? randomUUID()));
+        // Several callbacks can share one item (zsh-exec-bridge subcommands,
+        // stdin writes): codex then sets a per-callback approvalId. Key by both
+        // so two pending approvals never collide on one codeoid id (#369).
+        const itemId = hasItem && hasCallback ? `${parentId}:${String(params.approvalId)}` : parentId;
+        const lateSibling = itemId !== parentId && this.#completedParents.has(parentId);
+        const { name, input, unshowable } = approvalToTool(method, params, this.#startedItems.get(parentId));
         this.#announcedItems.set(itemId, { name, input });
         this.#push({
           type: "tool_start",
@@ -742,8 +884,54 @@ export class CodexProvider implements SessionProvider {
           input,
           approvalId: `codex-${itemId}`,
         });
-        const verdict = await canUseTool(itemId, `codex-${itemId}`, name, input);
-        return { decision: verdict.behavior === "allow" ? "approved" : "denied" };
+        const refusal = lateSibling ? "its parent command had already finished" : unshowable;
+        if (refusal) {
+          // Never ask for a yes on something the approver can't see (or that
+          // can no longer run) — the approval takes effect. Declined, with the
+          // reason on the card.
+          this.#push({ type: "tool_complete", sdkToolUseId: itemId, output: `Declined — ${refusal}`, success: false, declinedByBackend: true });
+          this.#announcedItems.delete(itemId);
+          this.#declinedItems.add(itemId);
+          return approvalReply(method, params, false);
+        }
+        // Counted, not flagged: concurrent approvals on one item each see a
+        // change that lands while they're being decided.
+        this.#approvalsInFlight.set(parentId, (this.#approvalsInFlight.get(parentId) ?? 0) + 1);
+        let verdict: Awaited<ReturnType<typeof canUseTool>>;
+        let patchChanged = false;
+        try {
+          verdict = await canUseTool(itemId, `codex-${itemId}`, name, input);
+        } finally {
+          const left = (this.#approvalsInFlight.get(parentId) ?? 1) - 1;
+          patchChanged = this.#patchChangedInFlight.has(parentId);
+          if (left > 0) this.#approvalsInFlight.set(parentId, left);
+          else {
+            this.#approvalsInFlight.delete(parentId);
+            this.#patchChangedInFlight.delete(parentId);
+          }
+        }
+        const parentDone = itemId !== parentId && this.#completedParents.has(parentId);
+        if (verdict.behavior === "allow" && (patchChanged || parentDone)) {
+          // The yes was for what was SHOWN: a patch that changed while it was
+          // being decided, or a parent that finished meanwhile, isn't covered.
+          this.#push({
+            type: "tool_complete",
+            sdkToolUseId: itemId,
+            output: patchChanged ? "Declined — the change was updated after it was shown." : "Declined — its parent command had already finished.",
+            success: false,
+            declinedByBackend: true,
+          });
+          this.#announcedItems.delete(itemId);
+          this.#declinedItems.add(itemId);
+          return approvalReply(method, params, false);
+        }
+        if (verdict.behavior !== "allow") this.#declinedItems.add(itemId);
+        else if (itemId !== parentId) {
+          const open = this.#openSubApprovals.get(parentId) ?? new Set<string>();
+          open.add(itemId);
+          this.#openSubApprovals.set(parentId, open);
+        }
+        return approvalReply(method, params, verdict.behavior === "allow");
       }
       case "mcpServer/elicitation/request": {
         // codex gates EVERY MCP tool call behind an MCP elicitation when the
@@ -761,11 +949,30 @@ export class CodexProvider implements SessionProvider {
         // Fail closed: an approval with no gate wired is declined, never run.
         if (!canUseTool) return { action: "decline" };
         const serverName = String(params.serverName ?? "");
-        const pending = this.#pendingMcpCalls.get(serverName);
-        this.#pendingMcpCalls.delete(serverName);
-        const tool = pending?.tool ?? mcpToolFromMessage(params.message) ?? "tool";
-        const input = pending?.input ?? metaToolParams(params);
-        const itemId = pending?.itemId ?? String(params.turnId ?? randomUUID());
+        // The same method carries an MCP server's OWN questions (a form, an
+        // OAuth url) — only codex's tool-call approval is a tool approval.
+        // Anything else is shown for what it is and declined: answering it as
+        // a tool call would accept a url nobody saw (#368).
+        const meta = params._meta as Record<string, unknown> | undefined;
+        const isToolApproval = (params.mode === undefined || params.mode === "form") && meta?.codex_approval_kind === "mcp_tool_call";
+        if (!isToolApproval) {
+          const askId = `mcp-ask-${randomUUID()}`;
+          const shown: Record<string, unknown> = {
+            ...(typeof params.message === "string" ? { message: params.message } : {}),
+            ...(typeof params.url === "string" ? { url: params.url } : {}),
+            ...(params.mode !== undefined ? { mode: params.mode } : {}),
+          };
+          this.#push({ type: "tool_start", toolId: askId, sdkToolUseId: askId, name: `mcp__${serverName}__elicitation`, input: shown, approvalId: `codex-${askId}` });
+          this.#push({
+            type: "tool_complete",
+            sdkToolUseId: askId,
+            output: `Declined — ${serverName} asked a question of its own; answering MCP server questions isn't supported on codex yet`,
+            success: false,
+            declinedByBackend: true,
+          });
+          return { action: "decline" };
+        }
+        const { tool, input, itemId, unshowable } = this.#resolveElicitedCall(serverName, params);
         const name = `mcp__${serverName}__${tool}`;
         // Announce so scrollback shows the real tool; keyed by the mcpToolCall
         // itemId so the item/completed handler pairs the tool_complete instead
@@ -780,7 +987,15 @@ export class CodexProvider implements SessionProvider {
           input,
           approvalId: `codex-${itemId}`,
         });
+        if (unshowable) {
+          // Never ask for a yes on a call we can't pin down (#368).
+          this.#push({ type: "tool_complete", sdkToolUseId: itemId, output: `Declined — ${unshowable}`, success: false, declinedByBackend: true });
+          this.#announcedItems.delete(itemId);
+          this.#declinedItems.add(itemId);
+          return { action: "decline" };
+        }
         const verdict = await canUseTool(itemId, `codex-${itemId}`, name, input);
+        if (verdict.behavior !== "allow") this.#declinedItems.add(itemId);
         return verdict.behavior === "allow" ? { action: "accept", content: {} } : { action: "decline" };
       }
       case "item/tool/requestUserInput": {
@@ -815,17 +1030,26 @@ export class CodexProvider implements SessionProvider {
 
 /** Recover the MCP tool name from the elicitation `message` when the preceding
  *  item/started wasn't observed (defensive): `…run tool "recall"?` → `recall`. */
-function mcpToolFromMessage(message: unknown): string | null {
+/**
+ * The tool an approval elicitation names: codex's template is
+ * `Allow the <server> MCP server to run tool "<tool>"?`. Matched as a whole
+ * and anchored at the end, so a tool name containing a quote is read in full
+ * rather than cut at its first `"` (#368).
+ */
+function mcpToolFromMessage(message: unknown, serverName?: string): string | null {
   if (typeof message !== "string") return null;
-  const m = message.match(/run tool "([^"]+)"/);
-  return m ? m[1] : null;
+  const m = message.match(/^Allow the (.+) MCP server to run tool "(.+)"\?$/s);
+  if (m) return serverName === undefined || m[1] === serverName ? (m[2] ?? null) : null;
+  const loose = message.match(/run tool "(.+)"\?\s*$/s);
+  return loose ? (loose[1] ?? null) : null;
 }
 
-/** Fallback tool arguments from the elicitation `_meta.tool_params`. */
-function metaToolParams(params: Record<string, unknown>): Record<string, unknown> {
+/** The tool arguments an elicitation carries (`_meta.tool_params`), or
+ *  undefined when it carries none — distinct from "no arguments" (`{}`). */
+function elicitedToolParams(params: Record<string, unknown>): Record<string, unknown> | undefined {
   const meta = params._meta as Record<string, unknown> | undefined;
   const tp = meta?.tool_params;
-  return tp && typeof tp === "object" ? (tp as Record<string, unknown>) : {};
+  return tp && typeof tp === "object" && !Array.isArray(tp) ? (tp as Record<string, unknown>) : undefined;
 }
 
 /** Render an env map as a TOML inline table (`{ KEY = "val", … }`) for a codex
@@ -835,30 +1059,82 @@ function tomlInlineTable(map: Record<string, string>): string {
   return `{ ${entries.join(", ")} }`;
 }
 
-/** Map an approval request to a codeoid tool name + input. */
+/**
+ * codex's reply to an `item/*` approval request, in the shape its app-server
+ * protocol requires (#369). Command and file-change approvals take
+ * `{decision: "accept" | "decline"}` — the legacy `"approved"` / `"denied"`
+ * (ReviewDecision, from the old execCommandApproval) is REJECTED by codex as
+ * "approval request failed", so every approved call failed. A permissions
+ * request is answered with a GRANT: the requested profile to allow it for
+ * this turn, an empty one to refuse it.
+ */
+function approvalReply(method: string, params: Record<string, unknown>, allow: boolean): Record<string, unknown> {
+  if (method === "item/permissions/requestApproval") {
+    return allow ? { permissions: params.permissions ?? {}, scope: "turn" } : { permissions: {} };
+  }
+  return { decision: allow ? "accept" : "decline" };
+}
+
+/**
+ * Map an approval request to a codeoid tool name + input — what the approver
+ * sees. codex 0.154's requests omit the file diff (and may omit the command),
+ * so both come from the item's `item/started` (#369). `unshowable` is set when
+ * the request would grant something the approver can't be shown; the caller
+ * declines it without asking.
+ */
 function approvalToTool(
   method: string,
   params: Record<string, unknown>,
-): { name: string; input: Record<string, unknown> } {
+  started?: Record<string, unknown>,
+): { name: string; input: Record<string, unknown>; unshowable?: string } {
   if (method === "item/commandExecution/requestApproval") {
-    return {
-      name: "Bash",
-      input: {
-        command: String(params.command ?? params.parsedCmd ?? ""),
-        ...(params.cwd ? { cwd: params.cwd } : {}),
-        ...(params.reason ? { reason: params.reason } : {}),
-      },
+    const kind = String(params.kind ?? "command");
+    // A sibling callback (approvalId set) asks about its OWN subcommand: the
+    // parent's command would show the wrong thing, so never fall back to it.
+    const isSub = typeof params.approvalId === "string" && params.approvalId !== "" && typeof params.itemId === "string" && params.itemId !== "";
+    const command = String(params.command ?? (isSub ? "" : (started?.command ?? "")));
+    const network = params.networkApprovalContext as Record<string, unknown> | null | undefined;
+    const input: Record<string, unknown> = {
+      command,
+      ...(params.cwd ?? started?.cwd ? { cwd: params.cwd ?? started?.cwd } : {}),
+      ...(kind !== "command" ? { kind } : {}),
+      ...(network ? { network } : {}),
+      ...(params.reason ? { reason: params.reason } : {}),
     };
+    if (kind === "writeStdin") {
+      return { name: "Bash", input, unshowable: "codex asked to write to a running terminal, and the input isn't in the request" };
+    }
+    if (kind !== "command") {
+      // A kind this version doesn't know — don't present it as a plain command.
+      return { name: "Bash", input, unshowable: `codex asked for an approval of an unknown kind (${kind})` };
+    }
+    // A network grant must name its host. With a command it stays `Bash` — the
+    // command is what runs, and Bash `tool_call` hooks must keep seeing it —
+    // the host shown alongside. Alone it is its own tool, so Bash hooks and
+    // Bash auto-approval don't treat open egress as a shell command.
+    if (network && (typeof network.host !== "string" || network.host === "")) {
+      return { name: command ? "Bash" : "codex_network_access", input, unshowable: "codex asked for network access without naming the host" };
+    }
+    if (!command && network) return { name: "codex_network_access", input };
+    if (!command) return { name: "Bash", input, unshowable: "codex didn't say what the command is" };
+    return { name: "Bash", input };
   }
   if (method === "item/fileChange/requestApproval") {
-    return {
-      name: "codex_file_change",
-      input: {
-        ...(params.changes !== undefined ? { changes: params.changes } : {}),
-        ...(params.grantRoot !== undefined ? { grantRoot: params.grantRoot } : {}),
-        ...(params.reason ? { reason: params.reason } : {}),
-      },
+    const changes = started?.changes;
+    const input: Record<string, unknown> = {
+      ...(changes !== undefined ? { changes } : {}),
+      ...(params.grantRoot ? { grantRoot: params.grantRoot } : {}),
+      ...(params.reason ? { reason: params.reason } : {}),
     };
+    if (!Array.isArray(changes) || changes.length === 0) {
+      return { name: "codex_file_change", input, unshowable: "codex didn't show the change it wants to make" };
+    }
+    if (params.grantRoot) {
+      // [UNSTABLE] per codex: asks to allow writes under a root for the rest of
+      // the session — an accept could grant far more than the change shown.
+      return { name: "codex_file_change", input, unshowable: `codex also asked for session-wide write access under ${String(params.grantRoot)}` };
+    }
+    return { name: "codex_file_change", input };
   }
   return { name: "codex_permissions", input: { ...params } };
 }
