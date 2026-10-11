@@ -219,6 +219,86 @@ describe("CodexProvider over fake-codex", () => {
     }
   });
 
+  it("C3f (#369): the file-change approval shows the diff from item/started", async () => {
+    const p = makeProvider();
+    const gated: Array<Record<string, unknown>> = [];
+    await collect(
+      p.runTurn(
+        turnOpts("file-change please", {
+          canUseTool: async (_t, _a, _n, input) => {
+            gated.push(input);
+            return { behavior: "allow" as const };
+          },
+        }),
+      ),
+    );
+    await p.teardown();
+    expect(gated).toEqual([{ changes: [{ path: "a.txt", kind: "update", diff: "-old\n+new\n" }] }]);
+  });
+
+  for (const [label, prompt, reason] of [
+    ["no diff to show", "file-change nodiff please", "didn't show the change"],
+    ["a session-wide grantRoot", "file-change grantroot please", "session-wide write access"],
+  ] as const) {
+    it(`C3g (#369): a file change with ${label} is declined without asking`, async () => {
+      const p = makeProvider();
+      let asked = false;
+      const events = await collect(
+        p.runTurn(
+          turnOpts(prompt, {
+            canUseTool: async () => {
+              asked = true;
+              return { behavior: "allow" as const };
+            },
+          }),
+        ),
+      );
+      await p.teardown();
+      expect(asked).toBe(false);
+      expect(events.some((e) => e.type === "text_done" && (e as { content?: string }).content === "Skipped.")).toBe(true);
+      const complete = events.find((e) => e.type === "tool_complete") as { success: boolean; output: string } | undefined;
+      expect(complete?.success).toBe(false);
+      expect(complete?.output).toContain(reason);
+    });
+  }
+
+  it("C3h (#369): a stdin write (input not in the request) is declined without asking", async () => {
+    const p = makeProvider();
+    let asked = false;
+    const events = await collect(
+      p.runTurn(
+        turnOpts("write-stdin please", {
+          canUseTool: async () => {
+            asked = true;
+            return { behavior: "allow" as const };
+          },
+        }),
+      ),
+    );
+    await p.teardown();
+    expect(asked).toBe(false);
+    expect(events.some((e) => e.type === "text_done" && (e as { content?: string }).content === "stdin:decline")).toBe(true);
+  });
+
+  it("C3i (#369): sibling approvals on one item get distinct ids and are answered independently", async () => {
+    const p = makeProvider();
+    const ids: string[] = [];
+    const events = await collect(
+      p.runTurn(
+        turnOpts("subcommands please", {
+          canUseTool: async (_t, approvalId, _n, input) => {
+            ids.push(approvalId);
+            return String(input.command).startsWith("rm") ? { behavior: "deny" as const } : { behavior: "allow" as const };
+          },
+        }),
+      ),
+    );
+    await p.teardown();
+    expect(new Set(ids).size).toBe(2);
+    expect(ids.sort()).toEqual(["codex-item-zsh-1:sub-a", "codex-item-zsh-1:sub-b"]);
+    expect(events.some((e) => e.type === "text_done" && (e as { content?: string }).content === "subs:accept,decline")).toBe(true);
+  });
+
   it("C3d (#369): a permissions request is answered with a grant — the requested profile, or nothing", async () => {
     for (const allow of [true, false]) {
       const p = makeProvider();

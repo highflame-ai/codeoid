@@ -4960,7 +4960,12 @@ export class Session {
           }
           this.#toolUseIdToMessageId.delete(event.sdkToolUseId);
         }
-        if (this.#status === "tool_running") this.#setTurnStatus("thinking");
+        // Also leave waiting_approval when nothing is parked: a backend can
+        // announce a call and settle it itself, never asking (#369) — the
+        // session must not keep showing "waiting approval" for it.
+        if (this.#status === "tool_running" || (this.#status === "waiting_approval" && this.#pendingApprovals.size === 0)) {
+          this.#setTurnStatus("thinking");
+        }
         break;
       }
 

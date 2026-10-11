@@ -66,6 +66,8 @@ async function runTurn(threadId: string, prompt: string): Promise<void> {
   send({ method: "turn/started", params: { turn: { id: "turn-1" } } });
 
   if (prompt.includes("use-tool")) {
+    // Real codex announces the item first, then asks.
+    send({ method: "item/started", params: { item: { id: "item-cmd-1", type: "commandExecution", command: "rm -rf /tmp/scratch", cwd: "/tmp", status: "inProgress" } } });
     const decision = await serverRequest("item/commandExecution/requestApproval", {
       threadId,
       turnId: "turn-1",
@@ -101,17 +103,22 @@ async function runTurn(threadId: string, prompt: string): Promise<void> {
       send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: "Approval denied; skipping." } } });
     }
   } else if (prompt.includes("file-change")) {
+    // codex 0.154: the diff rides item/started; the approval request has none.
+    const changes = [{ path: "a.txt", kind: "update", diff: "-old\n+new\n" }];
+    const announce = !prompt.includes("nodiff");
+    if (announce) send({ method: "item/started", params: { item: { id: "item-fc-1", type: "fileChange", changes, status: "inProgress" } } });
     const reply = await serverRequest("item/fileChange/requestApproval", {
       threadId,
       turnId: "turn-1",
       itemId: "item-fc-1",
-      changes: [{ path: "a.txt", kind: "update" }],
+      startedAtMs: 0,
+      ...(prompt.includes("grantroot") ? { grantRoot: "/" } : {}),
     });
     const err = approvalReplyError("item/fileChange/requestApproval", reply);
     const ran = !err && reply.decision === "accept";
     send({
       method: "item/completed",
-      params: { item: { id: "item-fc-1", type: "fileChange", changes: [{ path: "a.txt", kind: "update" }], status: ran ? "completed" : "declined" } },
+      params: { item: { id: "item-fc-1", type: "fileChange", changes, status: ran ? "completed" : "declined" } },
     });
     send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: err ? `Rejected: ${err}` : ran ? "Edited." : "Skipped." } } });
   } else if (prompt.includes("permissions")) {
@@ -127,6 +134,20 @@ async function runTurn(threadId: string, prompt: string): Promise<void> {
     const err = approvalReplyError("item/permissions/requestApproval", reply);
     const granted = err ? "invalid" : JSON.stringify(reply.permissions) === JSON.stringify(requested) ? "granted" : "refused";
     send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `permissions:${granted}` } } });
+  } else if (prompt.includes("write-stdin")) {
+    send({ method: "item/started", params: { item: { id: "item-term-1", type: "commandExecution", command: "python", status: "inProgress" } } });
+    const reply = await serverRequest("item/commandExecution/requestApproval", {
+      threadId, turnId: "turn-1", itemId: "item-term-1", startedAtMs: 0, kind: "writeStdin", command: null,
+    });
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `stdin:${String(reply.decision)}` } } });
+  } else if (prompt.includes("subcommands")) {
+    // Two zsh-exec-bridge callbacks for ONE parent item, pending at once.
+    send({ method: "item/started", params: { item: { id: "item-zsh-1", type: "commandExecution", command: "make", status: "inProgress" } } });
+    const [a, b] = await Promise.all([
+      serverRequest("item/commandExecution/requestApproval", { threadId, turnId: "turn-1", itemId: "item-zsh-1", approvalId: "sub-a", command: "cc a.c", startedAtMs: 0 }),
+      serverRequest("item/commandExecution/requestApproval", { threadId, turnId: "turn-1", itemId: "item-zsh-1", approvalId: "sub-b", command: "rm -rf out", startedAtMs: 0 }),
+    ]);
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `subs:${String(a.decision)},${String(b.decision)}` } } });
   } else if (prompt.includes("codex-declines")) {
     // codex declined an item on its own (e.g. its own policy, or an approval
     // round-trip that failed) — no request reached the client.

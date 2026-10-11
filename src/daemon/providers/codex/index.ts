@@ -282,6 +282,13 @@ export class CodexProvider implements SessionProvider {
    *  own `declined` completion for them must not overwrite it (#369). */
   #declinedItems = new Set<string>();
   /**
+   * What each command / file-change item will DO, from its `item/started`
+   * notification, keyed by item id. codex 0.154's approval requests don't
+   * carry the diff (and may omit the command) — this is the only place the
+   * approver's view of the change can come from (#369).
+   */
+  #startedItems = new Map<string, Record<string, unknown>>();
+  /**
    * serverName → the most-recent mcpToolCall item awaiting its approval
    * elicitation. codex gates an MCP tool call with `mcpServer/elicitation/request`,
    * which names the SERVER but not the tool; the `item/started` (mcpToolCall)
@@ -439,6 +446,7 @@ export class CodexProvider implements SessionProvider {
     this.#turnModel = opts.model ?? "codex";
     this.#announcedItems.clear();
     this.#declinedItems.clear();
+    this.#startedItems.clear();
     this.#lastTokenUsage = null;
     // Per turn, like the usage beside it. This provider instance outlives a
     // `/model` switch or a pipeline overrideModel, so a turn interrupted before
@@ -630,6 +638,9 @@ export class CodexProvider implements SessionProvider {
         // that follows an mcpToolCall — stash the tool + args here so the
         // elicitation handler can build the canonical `mcp__server__tool` name.
         const item = params.item as Record<string, unknown> | undefined;
+        if (item && ((item.type as string) === "commandExecution" || (item.type as string) === "fileChange")) {
+          this.#startedItems.set(String(item.id ?? ""), item);
+        }
         if (item && (item.type as string) === "mcpToolCall") {
           this.#pendingMcpCalls.set(String(item.server ?? ""), {
             itemId: String(item.id ?? ""),
@@ -645,6 +656,7 @@ export class CodexProvider implements SessionProvider {
         const itemType = item.type as string;
         const itemId = String(item.id ?? "");
         if (itemType === "mcpToolCall") this.#pendingMcpCalls.delete(String(item.server ?? ""));
+        this.#startedItems.delete(itemId);
         if (itemType === "agentMessage") {
           const text = (item.text ?? item.content ?? "") as string;
           this.#push({ type: "text_done", content: typeof text === "string" ? text : "" });
@@ -744,8 +756,12 @@ export class CodexProvider implements SessionProvider {
         const canUseTool = this.#canUseTool;
         // Fail closed: an approval with no gate wired is denied, never run.
         if (!canUseTool) return approvalReply(method, params, false);
-        const itemId = String(params.itemId ?? params.approvalId ?? randomUUID());
-        const { name, input } = approvalToTool(method, params);
+        const parentId = String(params.itemId ?? params.approvalId ?? randomUUID());
+        // Several callbacks can share one item (zsh-exec-bridge subcommands,
+        // stdin writes): codex then sets a per-callback approvalId. Key by both
+        // so two pending approvals never collide on one codeoid id (#369).
+        const itemId = typeof params.approvalId === "string" && params.approvalId ? `${parentId}:${params.approvalId}` : parentId;
+        const { name, input, unshowable } = approvalToTool(method, params, this.#startedItems.get(parentId));
         this.#announcedItems.set(itemId, { name, input });
         this.#push({
           type: "tool_start",
@@ -755,6 +771,14 @@ export class CodexProvider implements SessionProvider {
           input,
           approvalId: `codex-${itemId}`,
         });
+        if (unshowable) {
+          // Never ask for a yes on something the approver can't see — the
+          // approval now takes effect. Declined, with the reason on the card.
+          this.#push({ type: "tool_complete", sdkToolUseId: itemId, output: `Declined — ${unshowable}`, success: false });
+          this.#announcedItems.delete(itemId);
+          this.#declinedItems.add(itemId);
+          return approvalReply(method, params, false);
+        }
         const verdict = await canUseTool(itemId, `codex-${itemId}`, name, input);
         if (verdict.behavior !== "allow") this.#declinedItems.add(itemId);
         return approvalReply(method, params, verdict.behavior === "allow");
@@ -865,30 +889,51 @@ function approvalReply(method: string, params: Record<string, unknown>, allow: b
   return { decision: allow ? "accept" : "decline" };
 }
 
-/** Map an approval request to a codeoid tool name + input. */
+/**
+ * Map an approval request to a codeoid tool name + input — what the approver
+ * sees. codex 0.154's requests omit the file diff (and may omit the command),
+ * so both come from the item's `item/started` (#369). `unshowable` is set when
+ * the request would grant something the approver can't be shown; the caller
+ * declines it without asking.
+ */
 function approvalToTool(
   method: string,
   params: Record<string, unknown>,
-): { name: string; input: Record<string, unknown> } {
+  started?: Record<string, unknown>,
+): { name: string; input: Record<string, unknown>; unshowable?: string } {
   if (method === "item/commandExecution/requestApproval") {
-    return {
-      name: "Bash",
-      input: {
-        command: String(params.command ?? params.parsedCmd ?? ""),
-        ...(params.cwd ? { cwd: params.cwd } : {}),
-        ...(params.reason ? { reason: params.reason } : {}),
-      },
+    const kind = String(params.kind ?? "command");
+    const command = String(params.command ?? started?.command ?? "");
+    const network = params.networkApprovalContext as Record<string, unknown> | null | undefined;
+    const input: Record<string, unknown> = {
+      command,
+      ...(params.cwd ?? started?.cwd ? { cwd: params.cwd ?? started?.cwd } : {}),
+      ...(kind !== "command" ? { kind } : {}),
+      ...(network ? { network } : {}),
+      ...(params.reason ? { reason: params.reason } : {}),
     };
+    if (kind === "writeStdin") {
+      return { name: "Bash", input, unshowable: "codex asked to write to a running terminal, and the input isn't in the request" };
+    }
+    if (!command && !network) return { name: "Bash", input, unshowable: "codex didn't say what the command is" };
+    return { name: "Bash", input };
   }
   if (method === "item/fileChange/requestApproval") {
-    return {
-      name: "codex_file_change",
-      input: {
-        ...(params.changes !== undefined ? { changes: params.changes } : {}),
-        ...(params.grantRoot !== undefined ? { grantRoot: params.grantRoot } : {}),
-        ...(params.reason ? { reason: params.reason } : {}),
-      },
+    const changes = started?.changes;
+    const input: Record<string, unknown> = {
+      ...(changes !== undefined ? { changes } : {}),
+      ...(params.grantRoot ? { grantRoot: params.grantRoot } : {}),
+      ...(params.reason ? { reason: params.reason } : {}),
     };
+    if (!Array.isArray(changes) || changes.length === 0) {
+      return { name: "codex_file_change", input, unshowable: "codex didn't show the change it wants to make" };
+    }
+    if (params.grantRoot) {
+      // [UNSTABLE] per codex: asks to allow writes under a root for the rest of
+      // the session — an accept could grant far more than the change shown.
+      return { name: "codex_file_change", input, unshowable: `codex also asked for session-wide write access under ${String(params.grantRoot)}` };
+    }
+    return { name: "codex_file_change", input };
   }
   return { name: "codex_permissions", input: { ...params } };
 }
