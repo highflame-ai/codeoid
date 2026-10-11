@@ -185,6 +185,8 @@ export const MAX_CARRYOVER_EVENTS = 100;
 // ── ClaudeProvider ────────────────────────────────────────────────────────────
 
 export class ClaudeProvider implements SessionProvider {
+  /** The Agent SDK runs the permission result's `updatedInput` (see AgentProvider.appliesToolInputRewrite). */
+  readonly appliesToolInputRewrite = true;
   readonly id = "claude";
   /** The CLI runs the main agent itself when background work settles (#adoptTurn). */
   readonly continuesAfterBackgroundWork = true;

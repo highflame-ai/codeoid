@@ -75,6 +75,9 @@ It runs before codeoid's approval gate, so:
 - A hook **block** short-circuits — the user is never prompted, the autonomous turn budget is never spent, and an info message explains which hook blocked and why.
 - A block wins even for auto-approved safe tools (Read/Grep/Glob) — the gate is uniform.
 - A hook **mutation** replaces the tool input before the approval prompt renders, so the user approves what will actually run. An info message records the mutation.
+- A mutation applies only on a backend that runs the rewritten input: claude, pi, openai, gemini, and llama.cpp.
+  codex, the Gemini CLI, and qwen answer an approval with yes or no and run the input they proposed, so on those a rewritten call is **refused** (audited as `session.hook_rewrite_refused`) rather than shown and then run as originally proposed.
+  To change what such a backend runs, block the call and let the agent retry.
 
 This matches pi's `tool_call` extension semantics.
 

@@ -9,11 +9,12 @@
  * is parked. Only calls actually waiting are listed — never a leftover
  * `waiting_confirmation` row in the scrollback from a past run.
  *
- * Known limits, inherited from the backends (tracked separately): codex and
- * the Gemini CLI (ACP) answer an approval with yes/no only and run their own
- * input, so a hook REWRITE shown here does not apply on them; and codex ties
- * an MCP elicitation to its call by server name, so with two calls in flight
- * to one server the input shown can be the other call's.
+ * A hook REWRITE is listed only on backends that run the rewritten input;
+ * on one that runs its own input (codex, the Gemini CLI, qwen) the call is
+ * refused before it parks, so it never appears here (#367). Known limit
+ * (tracked in #368): codex ties an MCP elicitation to its call by server
+ * name, so with two calls in flight to one server the input shown can be the
+ * other call's.
  */
 
 // ── Messages (client → daemon) ────────────────────────────────────────────────

@@ -75,7 +75,8 @@ async function runPrompt(message: string): Promise<void> {
       decision = {};
     }
     if (decision.behavior === "allow") {
-      const effective = { ...input, ...(decision.updatedInput ?? {}) };
+      // Mirrors the real bridge: updatedInput REPLACES the input (codeoid#367).
+      const effective = decision.updatedInput ?? input;
       emit({ type: "tool_execution_start", toolCallId, toolName: "bash", args: effective });
       emit({
         type: "tool_execution_end",

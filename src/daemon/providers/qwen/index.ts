@@ -88,6 +88,12 @@ export interface QwenProviderInit {
 }
 
 export class QwenProvider implements SessionProvider {
+  /**
+   * qwen-code's SDK path assigns `updatedInput` to `request.args` but executes
+   * the invocation it built from the ORIGINAL args before asking (it never
+   * rebuilds it), so a rewrite does not apply (#367).
+   */
+  readonly appliesToolInputRewrite = false;
   readonly id = "qwen";
   readonly displayName = "Qwen Code (Alibaba)";
 
