@@ -1,8 +1,11 @@
 # Loop engineering in codeoid
 
-Status: proposal, not implemented.  
-Date: 2026-10-11.  
-Code baseline inspected: `528b819` (includes llama.cpp support, PR #365).  
+Status: proposal, not implemented.
+
+Date: 2026-10-11.
+
+Code baseline inspected: `528b819` (includes llama.cpp support, PR #365).
+
 Scope: research synthesis, architecture, product behavior, and implementation sequence.
 
 Implementation tracking: [#376](https://github.com/highflame-ai/codeoid/issues/376).
