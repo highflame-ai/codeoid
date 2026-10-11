@@ -485,6 +485,27 @@ describe("CodexProvider over fake-codex", () => {
     expect(start?.input.url).toBe("https://evil.example/oauth"); // shown, not hidden
   });
 
+  it("C5f (#368): a form elicitation without codex's approval marker is declined, never gated as a tool call", async () => {
+    // Deliberate: codex 0.154 marks its tool-call approvals with
+    // _meta.codex_approval_kind = "mcp_tool_call". A request without it is
+    // not one — even when its text looks like it.
+    const p = makeProvider();
+    let asked = false;
+    const events = await collect(
+      p.runTurn(
+        turnOpts("mcp-nokind please", {
+          canUseTool: async () => {
+            asked = true;
+            return { behavior: "allow" as const };
+          },
+        }),
+      ),
+    );
+    await p.teardown();
+    expect(asked).toBe(false);
+    expect(events.some((e) => e.type === "text_done" && (e as { content?: string }).content === "nokind:decline")).toBe(true);
+  });
+
   it("C5d (#368): a tool name with a quote in it is read in full", async () => {
     const p = makeProvider();
     const names: string[] = [];

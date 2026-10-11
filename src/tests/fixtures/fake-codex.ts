@@ -220,6 +220,16 @@ async function runTurn(threadId: string, prompt: string): Promise<void> {
       send({ method: "item/completed", params: { item: { id: "item-gh-1", type: "mcpToolCall", server: "github", tool: "delete_repo", arguments: { repo: "x" }, aggregatedOutput: "deleted", status: "completed" } } });
     }
     send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `gh:${String(decision.action)}` } } });
+  } else if (prompt.includes("mcp-nokind")) {
+    // A form elicitation WITHOUT codex's approval marker (an older/different
+    // codex, or the server's own form): not a tool approval.
+    send({ method: "item/started", params: { item: { id: "item-mem-9", type: "mcpToolCall", server: "codeoid_memory", tool: "recall", arguments: { query: "q" } } } });
+    const decision = await serverRequest("mcpServer/elicitation/request", {
+      threadId, turnId: "turn-1", serverName: "codeoid_memory", mode: "form",
+      message: 'Allow the codeoid_memory MCP server to run tool "recall"?',
+      requestedSchema: { type: "object", properties: {} },
+    });
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `nokind:${String(decision.action)}` } } });
   } else if (prompt.includes("mcp-server-asks")) {
     // The server's OWN question (OAuth url) while a call to it is pending.
     send({ method: "item/started", params: { item: { id: "item-gh-9", type: "mcpToolCall", server: "github", tool: "get_issue", arguments: { n: 1 } } } });
