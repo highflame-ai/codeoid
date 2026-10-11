@@ -291,6 +291,14 @@ export class CodexProvider implements SessionProvider {
   /** Approved sibling callbacks (`${itemId}:${approvalId}`) still open, by parent
    *  item id. codex completes only the PARENT, so its completion closes them. */
   #openSubApprovals = new Map<string, Set<string>>();
+  /** Parent items codex has completed this turn — a sibling approval answered
+   *  after its parent finished must not report as run (#369). */
+  #completedParents = new Set<string>();
+  /** Items with an approval being decided, and those whose patch changed
+   *  meanwhile: the approver saw the earlier diff, so the yes doesn't cover the
+   *  new one — declined instead (#369). */
+  #approvalsInFlight = new Set<string>();
+  #patchChangedInFlight = new Set<string>();
   /**
    * serverName → the most-recent mcpToolCall item awaiting its approval
    * elicitation. codex gates an MCP tool call with `mcpServer/elicitation/request`,
@@ -451,6 +459,9 @@ export class CodexProvider implements SessionProvider {
     this.#declinedItems.clear();
     this.#startedItems.clear();
     this.#openSubApprovals.clear();
+    this.#completedParents.clear();
+    this.#approvalsInFlight.clear();
+    this.#patchChangedInFlight.clear();
     this.#lastTokenUsage = null;
     // Per turn, like the usage beside it. This provider instance outlives a
     // `/model` switch or a pipeline overrideModel, so a turn interrupted before
@@ -660,8 +671,9 @@ export class CodexProvider implements SessionProvider {
         // fresh object, never a mutation of what an approval may have read.
         const itemId = String(params.itemId ?? "");
         const started = this.#startedItems.get(itemId);
-        if (started && Array.isArray(params.changes)) {
+        if (started && started.type === "fileChange" && Array.isArray(params.changes)) {
           this.#startedItems.set(itemId, { ...started, changes: params.changes });
+          if (this.#approvalsInFlight.has(itemId)) this.#patchChangedInFlight.add(itemId);
         }
         break;
       }
@@ -672,6 +684,7 @@ export class CodexProvider implements SessionProvider {
         const itemId = String(item.id ?? "");
         if (itemType === "mcpToolCall") this.#pendingMcpCalls.delete(String(item.server ?? ""));
         this.#startedItems.delete(itemId);
+        this.#completedParents.add(itemId);
         const subs = this.#openSubApprovals.get(itemId);
         if (subs) {
           this.#openSubApprovals.delete(itemId);
@@ -780,11 +793,17 @@ export class CodexProvider implements SessionProvider {
         const canUseTool = this.#canUseTool;
         // Fail closed: an approval with no gate wired is denied, never run.
         if (!canUseTool) return approvalReply(method, params, false);
-        const parentId = String(params.itemId ?? params.approvalId ?? randomUUID());
+        const hasItem = typeof params.itemId === "string" && params.itemId !== "";
+        const hasCallback = typeof params.approvalId === "string" && params.approvalId !== "";
+        const parentId = String(hasItem ? params.itemId : (params.approvalId ?? randomUUID()));
         // Several callbacks can share one item (zsh-exec-bridge subcommands,
         // stdin writes): codex then sets a per-callback approvalId. Key by both
         // so two pending approvals never collide on one codeoid id (#369).
-        const itemId = typeof params.approvalId === "string" && params.approvalId ? `${parentId}:${params.approvalId}` : parentId;
+        const itemId = hasItem && hasCallback ? `${parentId}:${String(params.approvalId)}` : parentId;
+        if (itemId !== parentId && this.#completedParents.has(parentId)) {
+          // Its parent already finished — nothing this approval could still run.
+          return approvalReply(method, params, false);
+        }
         const { name, input, unshowable } = approvalToTool(method, params, this.#startedItems.get(parentId));
         this.#announcedItems.set(itemId, { name, input });
         this.#push({
@@ -803,7 +822,28 @@ export class CodexProvider implements SessionProvider {
           this.#declinedItems.add(itemId);
           return approvalReply(method, params, false);
         }
-        const verdict = await canUseTool(itemId, `codex-${itemId}`, name, input);
+        this.#approvalsInFlight.add(parentId);
+        let verdict: Awaited<ReturnType<typeof canUseTool>>;
+        try {
+          verdict = await canUseTool(itemId, `codex-${itemId}`, name, input);
+        } finally {
+          this.#approvalsInFlight.delete(parentId);
+        }
+        const patchChanged = this.#patchChangedInFlight.delete(parentId);
+        const parentDone = itemId !== parentId && this.#completedParents.has(parentId);
+        if (verdict.behavior === "allow" && (patchChanged || parentDone)) {
+          // The yes was for what was SHOWN: a patch that changed while it was
+          // being decided, or a parent that finished meanwhile, isn't covered.
+          this.#push({
+            type: "tool_complete",
+            sdkToolUseId: itemId,
+            output: patchChanged ? "Declined — the change was updated after it was shown." : "Declined — its parent command had already finished.",
+            success: false,
+          });
+          this.#announcedItems.delete(itemId);
+          this.#declinedItems.add(itemId);
+          return approvalReply(method, params, false);
+        }
         if (verdict.behavior !== "allow") this.#declinedItems.add(itemId);
         else if (itemId !== parentId) {
           const open = this.#openSubApprovals.get(parentId) ?? new Set<string>();
@@ -934,7 +974,7 @@ function approvalToTool(
     const kind = String(params.kind ?? "command");
     // A sibling callback (approvalId set) asks about its OWN subcommand: the
     // parent's command would show the wrong thing, so never fall back to it.
-    const isSub = typeof params.approvalId === "string" && params.approvalId !== "";
+    const isSub = typeof params.approvalId === "string" && params.approvalId !== "" && typeof params.itemId === "string" && params.itemId !== "";
     const command = String(params.command ?? (isSub ? "" : (started?.command ?? "")));
     const network = params.networkApprovalContext as Record<string, unknown> | null | undefined;
     const input: Record<string, unknown> = {
@@ -951,9 +991,14 @@ function approvalToTool(
       // A kind this version doesn't know — don't present it as a plain command.
       return { name: "Bash", input, unshowable: `codex asked for an approval of an unknown kind (${kind})` };
     }
-    // Network access with no command is not a shell command: its own name, so
-    // Bash hooks and Bash auto-approval don't apply to it.
-    if (!command && network) return { name: "codex_network_access", input };
+    // A network grant — alone or alongside a command — is its own tool, so Bash
+    // hooks and Bash auto-approval never cover it. It must name its host.
+    if (network) {
+      if (typeof network.host !== "string" || network.host === "") {
+        return { name: "codex_network_access", input, unshowable: "codex asked for network access without naming the host" };
+      }
+      return { name: "codex_network_access", input };
+    }
     if (!command) return { name: "Bash", input, unshowable: "codex didn't say what the command is" };
     return { name: "Bash", input };
   }

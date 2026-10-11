@@ -78,4 +78,28 @@ describe("a tool call the backend settles itself (#369)", () => {
     expect(session.approve("codex-t1", true, AUTH)).toBe("stale");
     await session.destroy(AUTH);
   });
+
+  test("audited even when the card showed it as auto-approved, if it didn't run", async () => {
+    const events: ProviderEvent[] = [
+      { type: "tool_start", toolId: "t2", sdkToolUseId: "t2", name: "Bash", input: { command: "ls" }, approvalId: "codex-t2" } as ProviderEvent,
+      { type: "tool_complete", sdkToolUseId: "t2", output: "Declined — unknown kind", success: false } as ProviderEvent,
+    ];
+    const provider = new MockSessionProvider("mock", [events], { stall: true });
+    provider.ungatedToolIds.add("t2");
+    const session = makeSession(provider);
+    session.setMode("autonomous"); // the card reads "executing", not waiting
+    await session.send("go", AUTH);
+    const db = () => new Database(join(tmp, "codeoid.db"), { readonly: true });
+    await until(() => {
+      const d = db();
+      const n = (d.query("SELECT count(*) AS n FROM audit_log WHERE action = 'session.backend_settled'").get() as { n: number }).n;
+      d.close();
+      return n === 1;
+    });
+    const d = db();
+    const row = d.query("SELECT detail FROM audit_log WHERE action = 'session.backend_settled'").get() as { detail: string };
+    d.close();
+    expect(row.detail).toContain("success=false");
+    await session.destroy(AUTH);
+  });
 });

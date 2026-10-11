@@ -4923,18 +4923,22 @@ export class Session {
         // click must not buffer an "early" decision for a dead id — and audit
         // it, so every decision on a call is attributed.
         if (msgId) {
+          // Audited when it was asking for approval, or didn't run — not for
+          // every call a backend ran on its own (a memory recall), which would
+          // only be noise.
           const wasWaiting = this.#toolCallMessages.get(msgId)?.tool?.state.phase === "waiting_confirmation";
           for (const [aid, mid] of this.#approvalIdToMessageId) {
             if (mid !== msgId || this.#pendingApprovals.has(aid)) continue;
             this.#approvalIdToMessageId.delete(aid);
-            if (wasWaiting) {
-              this.#store.audit(
-                SYSTEM_IDENTITY.sub,
-                "session.backend_settled",
-                this.id,
-                `tool=${hookToolName ?? "unknown"} approvalId=${aid} provider=${this.#provider.id}`,
-              );
-            }
+            this.#earlyApprovals.delete(aid);
+            this.#approvalPatchKeys.delete(aid);
+            if (!wasWaiting && event.success) continue;
+            this.#store.audit(
+              SYSTEM_IDENTITY.sub,
+              "session.backend_settled",
+              this.id,
+              `tool=${hookToolName ?? "unknown"} approvalId=${aid} provider=${this.#provider.id} success=${event.success}`,
+            );
           }
         }
         let output = event.output;

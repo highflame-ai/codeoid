@@ -344,6 +344,66 @@ describe("CodexProvider over fake-codex", () => {
     });
   }
 
+  it("C3m (#369): a patch that changes while being decided is declined, even on a yes", async () => {
+    const p = makeProvider();
+    const events = await collect(
+      p.runTurn(
+        turnOpts("file-change midupdate please", {
+          // The approver takes a moment — the update lands meanwhile.
+          canUseTool: async () => {
+            await new Promise((r) => setTimeout(r, 100));
+            return { behavior: "allow" as const };
+          },
+        }),
+      ),
+    );
+    await p.teardown();
+    expect(events.some((e) => e.type === "text_done" && (e as { content?: string }).content === "Skipped.")).toBe(true);
+    const complete = events.find((e) => e.type === "tool_complete") as { success: boolean; output: string } | undefined;
+    expect(complete?.success).toBe(false);
+    expect(complete?.output).toContain("updated after it was shown");
+  });
+
+  for (const [label, prompt, want] of [
+    ["a sibling approval whose parent already finished", "late-sibling please", "late:decline"],
+    ["a network grant that doesn't name its host", "net-nohost please", "nethost:decline"],
+  ] as const) {
+    it(`C3n (#369): ${label} is declined without asking`, async () => {
+      const p = makeProvider();
+      let asked = false;
+      const events = await collect(
+        p.runTurn(
+          turnOpts(prompt, {
+            canUseTool: async () => {
+              asked = true;
+              return { behavior: "allow" as const };
+            },
+          }),
+        ),
+      );
+      await p.teardown();
+      expect(asked).toBe(false);
+      expect(events.some((e) => e.type === "text_done" && (e as { content?: string }).content === want)).toBe(true);
+    });
+  }
+
+  it("C3o (#369): a network grant alongside a command is still codex_network_access, never Bash", async () => {
+    const p = makeProvider();
+    const seen: string[] = [];
+    await collect(
+      p.runTurn(
+        turnOpts("net-with-cmd please", {
+          canUseTool: async (_t, _a, name) => {
+            seen.push(name);
+            return { behavior: "deny" as const };
+          },
+        }),
+      ),
+    );
+    await p.teardown();
+    expect(seen).toEqual(["codex_network_access"]);
+  });
+
   it("C3l (#369): network access with no command is its own tool, not Bash", async () => {
     const p = makeProvider();
     const seen: Array<{ name: string; input: Record<string, unknown> }> = [];

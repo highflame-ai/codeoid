@@ -56,6 +56,15 @@ describe("roleDeniesTool", () => {
     expect(roleDeniesTool(noNet, "WebFetch")).toMatch(/network/);
     expect(roleDeniesTool(noNet, "Write")).toBeNull();
   });
+
+  test("codex's file change is a write; its network grant opens egress (#369)", () => {
+    expect(roleDeniesTool(reviewer, "codex_file_change")).toMatch(/read-only/);
+    // network:'read-only' covers read-only fetches, not open egress
+    expect(roleDeniesTool(implementer, "codex_network_access")).toMatch(/egress/);
+    expect(roleDeniesTool(noNet, "codex_network_access")).toMatch(/network/);
+    const fullNet: ToolRole = { write: true, network: true, envelope: "all" };
+    expect(roleDeniesTool(fullNet, "codex_network_access")).toBeNull();
+  });
 });
 
 describe("roleEnforcement (per-backend)", () => {

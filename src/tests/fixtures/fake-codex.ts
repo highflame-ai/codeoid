@@ -111,13 +111,20 @@ async function runTurn(threadId: string, prompt: string): Promise<void> {
       send({ method: "item/started", params: { item: { id: "item-fc-1", type: "fileChange", changes: [], status: "inProgress" } } });
       send({ method: "item/fileChange/patchUpdated", params: { threadId, turnId: "turn-1", itemId: "item-fc-1", changes } });
     } else if (announce) send({ method: "item/started", params: { item: { id: "item-fc-1", type: "fileChange", changes, status: "inProgress" } } });
-    const reply = await serverRequest("item/fileChange/requestApproval", {
+    const pendingReply = serverRequest("item/fileChange/requestApproval", {
       threadId,
       turnId: "turn-1",
       itemId: "item-fc-1",
       startedAtMs: 0,
       ...(prompt.includes("grantroot") ? { grantRoot: "/" } : {}),
     });
+    if (prompt.includes("midupdate")) {
+      // The patch changes while the approval is being DECIDED (after the
+      // request reached the client, before its reply).
+      await new Promise((r) => setTimeout(r, 20));
+      send({ method: "item/fileChange/patchUpdated", params: { threadId, turnId: "turn-1", itemId: "item-fc-1", changes: [{ path: "b.txt", kind: "update", diff: "+surprise\n" }] } });
+    }
+    const reply = await pendingReply;
     const err = approvalReplyError("item/fileChange/requestApproval", reply);
     const ran = !err && reply.decision === "accept";
     send({
@@ -157,6 +164,19 @@ async function runTurn(threadId: string, prompt: string): Promise<void> {
     send({ method: "item/started", params: { item: { id: "item-zsh-2", type: "commandExecution", command: "make", status: "inProgress" } } });
     const r = await serverRequest("item/commandExecution/requestApproval", { threadId, turnId: "turn-1", itemId: "item-zsh-2", approvalId: "sub-x", command: null, startedAtMs: 0 });
     send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `sub:${String(r.decision)}` } } });
+  } else if (prompt.includes("late-sibling")) {
+    send({ method: "item/started", params: { item: { id: "item-zsh-3", type: "commandExecution", command: "make", status: "inProgress" } } });
+    send({ method: "item/completed", params: { item: { id: "item-zsh-3", type: "commandExecution", command: "make", status: "completed" } } });
+    const r = await serverRequest("item/commandExecution/requestApproval", { threadId, turnId: "turn-1", itemId: "item-zsh-3", approvalId: "sub-late", command: "rm x", startedAtMs: 0 });
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `late:${String(r.decision)}` } } });
+  } else if (prompt.includes("net-nohost")) {
+    const r = await serverRequest("item/commandExecution/requestApproval", { threadId, turnId: "turn-1", itemId: "item-n-2", command: null, startedAtMs: 0, networkApprovalContext: {} });
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `nethost:${String(r.decision)}` } } });
+  } else if (prompt.includes("net-with-cmd")) {
+    const r = await serverRequest("item/commandExecution/requestApproval", {
+      threadId, turnId: "turn-1", itemId: "item-n-3", command: "curl example.com", startedAtMs: 0, networkApprovalContext: { host: "example.com", protocol: "https" },
+    });
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `netcmd:${String(r.decision)}` } } });
   } else if (prompt.includes("odd-kind")) {
     const r = await serverRequest("item/commandExecution/requestApproval", { threadId, turnId: "turn-1", itemId: "item-k-1", kind: "somethingNew", command: "ls", startedAtMs: 0 });
     send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `kind:${String(r.decision)}` } } });
