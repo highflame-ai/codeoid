@@ -17,6 +17,8 @@
  * lib/sanitize-url) precisely because these live here.
  */
 
+import { ALL_SCOPES_STRING } from "@highflame/codeoid-protocol";
+
 export const STORAGE_KEY_API_KEY = "codeoid.apiKey";
 export const STORAGE_KEY_TOKEN = "codeoid.token";
 // The rotating refresh token (ZeroID `zid_rt_`) handed off by an embedding host
@@ -48,32 +50,22 @@ export interface ResolveOptions {
   signal?: AbortSignal;
 }
 
-/** Default scope request for the web UI — every codeoid verb it sends. */
-export const DEFAULT_WEB_SCOPES = [
-  "session:list",
-  "session:create",
-  "session:attach",
-  "session:watch",
-  "session:send",
-  "session:interrupt",
-  "session:approve",
-  "session:destroy",
-  // Conductor scopes — delegated owner → conductor when the web UI opens the
-  // conductor session. Harmless on non-conductor use.
-  "session:read",
-  "session:dispatch",
-  "fs:read",
-  // Pipeline / pack management — the /packs Pack Browser lists packs
-  // (pipeline:read) and adds registries / installs / trusts / selects them
-  // (pipeline:manage, owner-tier). Without these the browser renders but every
-  // verb is rejected "Missing scope: pipeline:read".
-  "pipeline:read",
-  "pipeline:manage",
-  // Pipeline RUNS — the /pipeline runner creates + advances + aborts
-  // (pipeline:create) and answers / revises halts (pipeline:answer).
-  "pipeline:create",
-  "pipeline:answer",
-].join(" ");
+/**
+ * Default scope request for the web UI: every scope the daemon can enforce.
+ *
+ * DERIVED from the protocol's `ALL_SCOPES`, never hand-listed. A hand-written
+ * list here fell behind when `settings:*` and `fleet:read` were added, so a
+ * web session signed in with an API key got a token that could not open the
+ * Settings screen ("Missing scope: settings:read") or the fleet board — and no
+ * re-login could fix it, because the daemon enforces the minted scopes
+ * verbatim. The CLI had the same bug and the same fix (`cli.ts`
+ * CODEOID_LOGIN_SCOPES); `src/tests/login-scope-drift.test.ts` guards both.
+ *
+ * Owner-tier on purpose: the web UI drives every verb (settings, packs,
+ * pipelines, destroy). Narrower access is expressed by exchanging a token
+ * DOWN (watcher / conductor paths), not by under-minting this one.
+ */
+export const DEFAULT_WEB_SCOPES = ALL_SCOPES_STRING;
 
 export interface ResolvedAuth {
   /** Bearer token to use against the daemon. */
