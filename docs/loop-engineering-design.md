@@ -22,6 +22,24 @@ Do not create a standalone orchestrator yet. The valuable integration is with co
 
 The ambition is to lead on verified outcomes per unit of cost and human attention. This research does not establish that the proposed design outperforms every existing implementation. That claim requires comparative measurements.
 
+### Where codeoid can lead, not just match
+
+Reliability alone reaches parity: bounded check-and-repair already exists in Aider, Bugbot autofix, and Goose recipes.
+Leadership comes from combining that reliability with five things codeoid is unusually placed to do, each built into the first loops rather than deferred:
+
+1. **Backend escalation and candidate selection.**
+   Codeoid drives many backends behind one session model, and `session.compare` (#364) already forks one prompt to several of them in separate worktrees.
+   A loop can escalate a stalled attempt to a different backend, or run matched candidates on several backends and keep the one whose evidence is strongest — selection by verification, not by a human reading diffs.
+2. **Event-driven loops from the start.**
+   Most loops in real repositories are event-triggered, chiefly around pull requests and CI.
+   "Repair this failing CI check" and "address this review comment" are the first triggers, not a late phase.
+3. **Hidden checks as a contract feature.**
+   A run can carry acceptance checks the worker never sees and whose output it never receives, so passing the visible checks is not enough to finish.
+4. **A legitimate way to say "cannot satisfy".**
+   The worker can end an attempt by reporting that the objective conflicts with its checks or constraints, with evidence, instead of being pushed toward the checker.
+5. **Learning across runs.**
+   Failure fingerprints, rejected approaches, and recipe outcomes persist per repository and inform later runs, as advice that never counts as evidence.
+
 ## 2. What the research establishes
 
 Direct prompting remains useful for defining intent, making decisions, and correcting misunderstandings. Loop engineering automates repeated delegation and feedback. It does not eliminate the need for good task definitions or engineering judgment.
@@ -92,10 +110,32 @@ A user describes the outcome and selects a recipe. Codeoid resolves a concrete c
 
 The first recipe is **repair**: reproduce a named failing check, make a bounded change, and verify both the target behavior and required regressions. A previously green baseline with no reproduced failure must be reported as such, not credited as a repair.
 
+Repair ships with two entry points: started by hand, and started by an authorized event — a failing CI check on a branch the user owns, or a review comment addressed to codeoid on such a pull request.
+Each event creates its own bounded run; the event text is task data, never authority (see §10).
+
+### Contract fields
+
+The contract is the single place a run's rules live.
+Every field below is fixed when the run starts and changes only through a contract revision (§6).
+
+| Field | Meaning |
+| --- | --- |
+| `objective` | The outcome in the user's words, plus the resolved scope. |
+| `checks.visible` | Checks the worker is told about; their bounded output is returned to it as diagnostics. |
+| `checks.hidden` | Checks the worker is never told about and never sees output from. Completion requires them to pass. Their result is reported to the worker only as "not yet accepted". |
+| `protected` | Paths and inputs the worker must not change: the acceptance suite, its launchers, fixtures, and configuration (§7). |
+| `workers` | The permitted backends and models, in escalation order, with any candidate fan-out (§8). |
+| `permissions` | The tool and approval profile attempts run under (§6). |
+| `limits` | Attempts, time, concurrency, deadline, and spend where enforceable (§8). |
+| `delivery` | Local branch by default; push, PR, or comment only when authorized. |
+
+Hidden checks are not secret from the user; they are listed in the contract and the evidence report.
+A recipe may require them, and a repair started from a failing check uses the wider regression suite as its hidden set by default.
+
 Later recipes:
 
 - **Implement:** fulfill a finite requirements checklist and produce a reviewable branch.
-- **Maintain:** react to an authorized repository event or schedule, creating a separate bounded run per unit of work.
+- **Maintain:** react to an authorized schedule, creating a separate bounded run per unit of work. (Event-driven repair is part of the first recipe above.)
 - **Optimize:** improve a measured objective while preserving correctness and resource constraints.
 - **Investigate:** produce an evidence-backed report; explicitly use human acceptance where correctness is not mechanically decidable.
 
@@ -133,6 +173,16 @@ flowchart TD
 The **controller** is a deterministic state machine. It owns lifecycle transitions, authorization checks, aggregate budgets, and acceptance decisions. It can ask an agent to plan or diagnose, but an agent response cannot directly mark a run verified, increase its budget, or change its acceptance criteria.
 
 The **worker** owns a bounded attempt. It receives the objective, scope, current candidate, unresolved findings, and selected evidence. Its completion signal means `ready_for_verification`. Tool use, prose confidence, a checklist tick, or an exit code from the agent process is insufficient for acceptance.
+
+An attempt ends in one of three worker-declared outcomes, reported through a structured tool rather than parsed prose:
+
+- `ready_for_verification` — the worker believes the candidate meets the objective;
+- `cannot_satisfy` — the objective, a visible check, or a protected constraint conflict, with the specific conflict and supporting evidence;
+- `needs_input` — a decision only the user can make.
+
+`cannot_satisfy` is a first-class, non-penalized outcome.
+The controller verifies the claim where it can (for example, by re-running the cited check on the unmodified base), then moves the run to `blocked` with the conflict as its reason, or continues if the claim does not hold.
+The worker is told up front that this outcome exists and that modifying protected inputs is never an acceptable route to a pass.
 
 The **verifier runner** executes checks against a frozen candidate. It records results itself and returns structured evidence. Code review by another model can contribute findings; it does not turn a missing deterministic result into a pass.
 
@@ -179,6 +229,16 @@ Fencing database writes does not stop an old worker editing files. Before replac
 
 Exactly-once arbitrary external actions are not promised. For PR creation or similar effects, persist intent first, use a stable identifier where supported, and reconcile remote state after a crash. An uncertain external result must be investigated before retrying. The controller's state can be replayed; model responses and outside services cannot be deterministically replayed.
 
+### Approvals inside an attempt
+
+Today an unattended session parks at `waiting_approval` once its autonomous tool budget is spent, and fleet send tools never auto-approve.
+A loop must not stall silently on either.
+
+- The contract's `permissions` profile is applied to every worker session: which tools auto-approve, the per-attempt tool budget, and what always requires a person.
+- An approval request outside that profile moves the run to `waiting` with the request as its dependency, notifies through the attention inbox and push, and stops the attempt clock.
+- Exhausting the per-attempt tool budget ends the attempt as `budget_exhausted` for that attempt and returns control to the controller, rather than leaving the session parked.
+- A loop never widens its own permissions; a broader profile is a contract revision approved by the user.
+
 ### Pause and cancel
 
 Cancellation must bypass any promise chain waiting for the worker. Persist cancellation intent, revoke new dispatch, send abort to the worker and verifier processes, and wait for acknowledgement. Escalate termination only for processes owned by this run. Show `cancelling` operational progress until they stop; do not advertise a stopped run while uncontrolled work continues.
@@ -203,6 +263,21 @@ New tests and legitimate test updates are allowed as deliverables. They do not s
 
 Worktree-only mode can detect protected-file changes and bind evidence to snapshots, but must be labelled as weaker isolation. An advisory provider permission cannot be presented as an enforced read-only reviewer. Strict unattended recipes require enforceable boundaries; unsupported configurations must fail preflight or use supervised operation.
 
+### What the worker is told
+
+Feedback is designed, not dumped.
+The worker should learn what is wrong with the code, not how the checker can be satisfied.
+
+| Source | Returned to the worker |
+| --- | --- |
+| Visible check failure | Bounded, deduplicated diagnostics: failing test names, assertion messages, the first relevant stack frames, compiler errors. |
+| Hidden check failure | Only that the candidate is not yet accepted, plus the visible criteria it relates to. No names, output, or counts. |
+| Integrity violation | That a protected input changed and the attempt was rejected; the change is reverted. No detail of how the violation was detected. |
+| Reviewer findings | The finding text and ID, through the existing findings contract. |
+| Infrastructure error | That verification could not run, and whether the attempt counts against the budget. |
+
+Repeated integrity violations within a run stop it as `blocked` with the violations listed for the user.
+
 ### Acceptance authority
 
 The controller completes a run only when every mandatory criterion passes on the selected candidate under the current contract, required findings are resolved, owned work has stopped, and delivery obligations are satisfied. Record the limitations of the evidence in the final report.
@@ -221,7 +296,7 @@ Track model input/output/cache tokens separately, reported or estimated cost, ve
 | Local process runtime | Enforced by supervisor deadlines, subject to bounded termination latency |
 | Token or dollar accounting from end-of-turn reports | Stops later attempts; cannot cap unseen in-flight spend |
 | Streaming usage with cancellation | Earlier stopping, still subject to reporting delay and remote cancellation behavior |
-| Provider-side request/spend limits | Stronger bounds where the provider exposes and honors them |
+| Provider-side request/spend limits | Stronger bounds where the provider exposes and honors them — for example the Claude Agent SDK's `maxBudgetUsd`, which codeoid does not set today and should set per attempt from the remaining run budget |
 
 Reserve budget for admitted concurrent work and final verification. Do not promise a hard dollar ceiling for a subscription CLI or remote agent whose individual requests codeoid cannot bound. Expose per-provider capabilities: usage granularity, request limits, cancellation acknowledgement, managed children, permission enforcement, and recovery support.
 
@@ -232,6 +307,29 @@ A stopped run always retains the best verified candidate and unresolved work. Ex
 Measure progress using criterion results, resolved findings, validated artifacts, or objective improvement. Changed files and tool calls are diagnostic signals, not proof of progress.
 
 Fingerprint failures and candidate snapshots. Repeated identical failures, A/B oscillation, no material evidence change, or repeated infrastructure errors should trigger a bounded response: revise the hypothesis, refresh context, choose another permitted model, or stop with a blocker. Do not mandate monotonic improvement at every internal edit; a repair may require intermediate broken states.
+
+Oscillation is detected exactly, not heuristically: every candidate is a checkpoint tree, so a candidate whose tree digest matches an earlier one in the run is a revisit.
+
+### Escalation ladder
+
+A stall triggers the next rung of the contract's `workers` ladder, each rung consuming the same run budget:
+
+1. **Fresh context, same worker** — a new session seeded with the continuation packet (§9) instead of the accumulated conversation.
+2. **Stronger model, same backend** — where the contract permits one.
+3. **Different backend** — the next permitted provider, starting from the incumbent candidate and the continuation packet. A different backend brings different tools and failure habits, which is the point; it is still verified by the same checks.
+4. **Stop with a blocker** — summarizing the attempts, their fingerprints, and what remains, routed to the attention inbox.
+
+The ladder is data in the contract, so a recipe can be measured with and without each rung.
+
+### Candidates across backends
+
+For a hard attempt, a recipe may run `n` matched candidates instead of one, using the `session.compare` machinery (#364): each candidate is a fork in its own worktree, on its own backend or model, from the same starting tree and continuation packet.
+Selection is by evidence, in order: all mandatory visible checks pass; hidden checks pass; fewer and smaller changes outside the objective's scope; lower cost.
+A candidate that passes nothing is never selected by default; ties go to the user.
+The losing candidates are kept for inspection until the run ends.
+
+Candidates spend from one budget, so `n` is bounded by the remaining limits, and the comparison report shows what each candidate cost.
+Whether candidates beat sequential attempts at equal spend is a measurement for §13, not an assumption.
 
 For optimization, preserve an incumbent and promote candidates only when correctness constraints hold and the declared metric improves under comparable conditions. Repeat noisy measurements; use a practical improvement threshold and hold-out checks where appropriate. Preserve rejected candidates for inspection rather than resetting the user's branch.
 
@@ -247,6 +345,18 @@ Start with one writer. Introduce parallel workers only for independent work with
 
 Different models for implementation and review are an experiment worth supporting through current role bindings. Model diversity does not guarantee independent errors or replace executable verification.
 
+### Learning across runs
+
+Each finished run leaves a structured record per repository: the objective, failure fingerprints it hit, approaches that were rejected and why, which ladder rung resolved it, and what it cost.
+A new run in the same repository receives the relevant entries in its continuation packet — for example, "the last two repairs of this test both failed by patching the fixture; the cause was in the serializer."
+
+The rules that keep this honest:
+
+- learned entries are advice, labelled as such, and never count as evidence;
+- they are scoped to the tenant and repository that produced them;
+- entries age out, and an entry contradicted by a later verified run is dropped;
+- per-recipe outcome statistics (verified-completion rate, cost, rung reached) are reported to the user, so recipe changes are judged on recorded results rather than impressions.
+
 ## 10. Packs, pipelines, and triggers
 
 Keep existing pipeline behavior as the default. Introduce a versioned boundary policy with explicit modes such as `human` and `verified`. A verified boundary may advance only with qualifying evidence and no mandatory approval outstanding. Do not implement this by automatically invoking today's human override method: that method can deliberately approve a failed deterministic gate.
@@ -255,7 +365,7 @@ Legacy `skill` or `self` gates, and file-existence probes by themselves, are ins
 
 A recipe selects workflow, roles, checks, context policy, and stopping policy. It cannot grant itself more permissions or increase the user's budget. Validate unsupported policy combinations before any worker starts.
 
-Schedules and repository events arrive later as adapters that create ordinary runs. Authenticate event sources; treat issue text, logs, and comments as task data rather than authority. Deduplicate by trigger ID and relevant repository revision, coalesce bursts, bound queue depth, and prevent the loop's own changes from creating an unbounded trigger cycle. Sleeping until a relevant event should consume no model calls.
+Repository events (a failing CI check, a review comment addressed to codeoid) arrive with the first repair recipe; schedules follow in milestone D. Both are adapters that create ordinary runs. Authenticate event sources; treat issue text, logs, and comments as task data rather than authority. Deduplicate by trigger ID and relevant repository revision, coalesce bursts, bound queue depth, and prevent the loop's own changes from creating an unbounded trigger cycle. Sleeping until a relevant event should consume no model calls.
 
 ## 11. Operator experience
 
@@ -271,23 +381,35 @@ Provide pause, resume, cancel, inspect evidence, attach, and revise-contract act
 
 Extend gate execution with structured results, bounded logs, timeout/cancellation records, and snapshot identity. Preserve the existing gate verdict API for legacy callers. Define provider capability reporting and an evidence schema before adding auto-advance.
 
+Run the sandbox spike here, not later: the strongest integrity claim in §7 depends on it, and the choice (container, user namespace, or a separate checkout with a read-only evaluator mount) shapes the evidence schema.
+
 Exit criterion: existing pipeline behavior remains compatible, and a failing command supplies actionable, revision-bound evidence that survives restart.
 
-### B. One bounded repair loop
+### B. One bounded repair loop, with its differentiators
 
 Add run/attempt/event persistence and a controller wired to the dispatcher. Use one worker, an owned worktree, pinned checks, finite attempts/runtime, and local branch delivery. Add out-of-band cancellation, restart reconciliation, evidence inspection, and distinct terminal reasons. Expose a minimal CLI and existing fleet integration.
 
-Exit criterion: a real failing regression can be reproduced, repaired, independently checked, interrupted, resumed, and inspected across at least two provider adapters. No automatic PR creation is necessary to demonstrate the core.
+In the same milestone:
 
-### C. Pipeline and pack integration
+- the contract fields of §4, including hidden checks and protected inputs;
+- the three worker outcomes, including `cannot_satisfy` (§5), and the feedback policy (§7);
+- the approval profile and its `waiting` behavior (§6);
+- the escalation ladder through a different backend (§8);
+- the CI-failure and review-comment triggers for repair (§4, §10), delivering to a branch, with a PR comment only when authorized.
 
+Exit criterion: a real failing regression can be reproduced, repaired, independently checked, interrupted, resumed, and inspected across at least two provider adapters; a stalled run escalates to a second backend; a run started from a failing CI check finishes with revision-bound evidence; and a worker that reports `cannot_satisfy` on a contradictory task ends `blocked` instead of altering the checks.
+
+### C. Candidates, pipelines, and learning
+
+Add matched candidates across backends through `session.compare`, with evidence-based selection (§8).
 Add explicit verified boundaries, reuse findings repair, aggregate reviewer usage, and expose recipe selection and contract controls in the UI. Keep every legacy pack on human boundaries unless explicitly migrated. Add a capability matrix for local and hosted backends.
+Add the per-repository run record and its use in continuation packets (§9).
 
-Exit criterion: automated transitions cannot bypass a required human decision, a failing mandatory check, or an unsupported execution guarantee.
+Exit criterion: automated transitions cannot bypass a required human decision, a failing mandatory check, or an unsupported execution guarantee; and candidate selection is measured against sequential attempts at equal spend.
 
-### D. Recurring work and optimization
+### D. Schedules and optimization
 
-Add authenticated triggers, deduplication, bounded queues, effect reconciliation, optimization incumbents, and controlled parallel candidates. Treat unattended execution as opt-in. Evaluate each recipe before recommending default activation.
+Add scheduled triggers, bounded queues, effect reconciliation for remote delivery, and optimization incumbents. Treat unattended execution as opt-in. Evaluate each recipe before recommending default activation.
 
 Do not start with a general workflow canvas, autonomous recipe rewriting, unlimited fleets, or a new orchestration language. The first delivery should make one useful loop dependable end to end.
 
@@ -311,6 +433,13 @@ Required runtime scenarios:
 - Concurrent user edits and another run's files are preserved during candidate promotion or cleanup.
 - Cross-tenant run IDs and artifact references cannot be read or controlled.
 - An old pack runs unchanged with the existing human boundary behavior.
+- A candidate passes every visible check and fails a hidden one; the run does not complete, and the worker receives no hidden-check detail.
+- A task whose visible check contradicts its objective; the worker reports `cannot_satisfy` and the run ends `blocked` with the conflict, checks unmodified.
+- A stalled run escalates to a second backend, starting from the incumbent tree, within the same budget.
+- Candidates across backends: the one with full evidence is selected over a cheaper one that fails a mandatory check.
+- An attempt hits an approval outside its profile; the run waits and notifies, and the attempt clock stops.
+- A CI-failure trigger fires twice for the same commit; one run is created.
+- A learned entry contradicts current evidence; the evidence wins and the entry is dropped.
 
 For the first outcome study, use roughly a dozen bounded repository tasks covering repairs, small implementations, and performance work, plus blocked and flaky-environment cases. Compare a normal codeoid session, the existing findings workflow, a simple bounded repeat loop, and the proposed controller under matched provider/model and resource limits. Repeat stochastic runs and retain failures.
 
@@ -318,9 +447,21 @@ Measure independently accepted task success, false-completion rate, total tokens
 
 Add external harness comparisons only where the same task, model, tools, and budget can be made comparable. The earlier Kenning retrieval result is not evidence for this controller. Default-on automation requires demonstrated benefit on the relevant recipe and backend, not a broad marketing claim.
 
+### What "best" has to mean
+
+A claim to lead is earned on four measurements, each at matched model and spend:
+
+1. **Verified completion per dollar** on the task suite, against Claude Code `/goal`, Codex `/goal`, and a Ralph-style loop driving the same model.
+2. **False-completion rate** — runs that report success but fail the hidden outcome tests. This is where evidence-bound acceptance should separate most clearly from transcript-judged goals.
+3. **Integrity under pressure** — a subset of tasks whose visible checks contradict their objective; the share of runs that end `cannot_satisfy` or `blocked` instead of altering checks.
+4. **The value of codeoid's own levers** — the escalation ladder, cross-backend candidates, and learned run records, each measured with and without at equal spend.
+
+Publish the task suite, the matched settings, and the losses alongside the wins.
+
 ## 14. Decisions and remaining design work
 
 Recommended decisions: daemon-owned lifecycle; existing dispatcher for execution; evidence collected outside the worker; stable run identity across sessions; explicit capability limits; human pipeline boundaries preserved by default; packs for recipes; one repair workflow first.
+That first workflow ships with hidden checks, a `cannot_satisfy` outcome, a designed feedback policy, cross-backend escalation, and CI and review-comment triggers; candidate selection and learned run records follow in the next milestone.
 
 Implementation still needs to settle the sandbox mechanism on supported operating systems, provider cancellation guarantees, artifact retention defaults, the exact store migration, and which acceptance inputs a recipe must pin. These require focused implementation spikes, not another broad market survey.
 
