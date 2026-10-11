@@ -178,8 +178,382 @@ describe("CodexProvider over fake-codex", () => {
     );
     await p.teardown();
 
+    // codex then reports the refused item as `declined`; codeoid's gate already
+    // cancelled the card, so no tool_complete may overwrite it (#369).
     expect(events.some((e) => e.type === "tool_complete")).toBe(false);
     expect(events.some((e) => e.type === "text_done" && e.content === "Approval denied; skipping.")).toBe(true);
+  });
+
+  it("C3b (#369): replies use codex's v2 decision words — an approved command actually runs", async () => {
+    // The fake codex validates replies like the real one: the legacy
+    // "approved"/"denied" would fail the approval and decline the item.
+    const p = makeProvider();
+    const events = await collect(p.runTurn(turnOpts("please use-tool", { canUseTool: async () => ({ behavior: "allow" as const }) })));
+    await p.teardown();
+    const complete = events.find((e) => e.type === "tool_complete") as { success: boolean; output: string } | undefined;
+    expect(complete).toMatchObject({ success: true, output: "removed" });
+    expect(events.some((e) => e.type === "text_done" && String((e as { content?: string }).content).startsWith("Rejected"))).toBe(false);
+  });
+
+  it("C3e (#369): an item codex declines on its own is a failed tool, never a success", async () => {
+    // Not codeoid's decision, so the completion must land — as a failure.
+    const p = makeProvider();
+    const events = await collect(p.runTurn(turnOpts("codex-declines please")));
+    await p.teardown();
+    const complete = events.find((e) => e.type === "tool_complete") as { success: boolean; output: string } | undefined;
+    expect(complete?.success).toBe(false);
+    expect(complete?.output).toContain("Declined");
+  });
+
+  it("C3c (#369): file-change approvals accept/decline in codex's shape", async () => {
+    for (const allow of [true, false]) {
+      const p = makeProvider();
+      const events = await collect(
+        p.runTurn(turnOpts("file-change please", { canUseTool: async () => (allow ? { behavior: "allow" as const } : { behavior: "deny" as const }) })),
+      );
+      await p.teardown();
+      expect(events.some((e) => e.type === "text_done" && (e as { content?: string }).content === (allow ? "Edited." : "Skipped."))).toBe(true);
+      const complete = events.find((e) => e.type === "tool_complete") as { success: boolean } | undefined;
+      if (allow) expect(complete?.success).toBe(true);
+      else expect(complete).toBeUndefined(); // declined by codeoid: card already cancelled
+    }
+  });
+
+  it("C3f (#369): the file-change approval shows the diff from item/started", async () => {
+    const p = makeProvider();
+    const gated: Array<Record<string, unknown>> = [];
+    await collect(
+      p.runTurn(
+        turnOpts("file-change please", {
+          canUseTool: async (_t, _a, _n, input) => {
+            gated.push(input);
+            return { behavior: "allow" as const };
+          },
+        }),
+      ),
+    );
+    await p.teardown();
+    expect(gated).toEqual([{ changes: [{ path: "a.txt", kind: "update", diff: "-old\n+new\n" }] }]);
+  });
+
+  for (const [label, prompt, reason] of [
+    ["no diff to show", "file-change nodiff please", "didn't show the change"],
+    ["a session-wide grantRoot", "file-change grantroot please", "session-wide write access"],
+  ] as const) {
+    it(`C3g (#369): a file change with ${label} is declined without asking`, async () => {
+      const p = makeProvider();
+      let asked = false;
+      const events = await collect(
+        p.runTurn(
+          turnOpts(prompt, {
+            canUseTool: async () => {
+              asked = true;
+              return { behavior: "allow" as const };
+            },
+          }),
+        ),
+      );
+      await p.teardown();
+      expect(asked).toBe(false);
+      expect(events.some((e) => e.type === "text_done" && (e as { content?: string }).content === "Skipped.")).toBe(true);
+      const complete = events.find((e) => e.type === "tool_complete") as { success: boolean; output: string } | undefined;
+      expect(complete?.success).toBe(false);
+      expect(complete?.output).toContain(reason);
+    });
+  }
+
+  it("C3h (#369): a stdin write (input not in the request) is declined without asking", async () => {
+    const p = makeProvider();
+    let asked = false;
+    const events = await collect(
+      p.runTurn(
+        turnOpts("write-stdin please", {
+          canUseTool: async () => {
+            asked = true;
+            return { behavior: "allow" as const };
+          },
+        }),
+      ),
+    );
+    await p.teardown();
+    expect(asked).toBe(false);
+    expect(events.some((e) => e.type === "text_done" && (e as { content?: string }).content === "stdin:decline")).toBe(true);
+  });
+
+  it("C3i (#369): sibling approvals on one item get distinct ids and are answered independently", async () => {
+    const p = makeProvider();
+    const ids: string[] = [];
+    const events = await collect(
+      p.runTurn(
+        turnOpts("subcommands please", {
+          canUseTool: async (_t, approvalId, _n, input) => {
+            ids.push(approvalId);
+            return String(input.command).startsWith("rm") ? { behavior: "deny" as const } : { behavior: "allow" as const };
+          },
+        }),
+      ),
+    );
+    await p.teardown();
+    expect(new Set(ids).size).toBe(2);
+    expect(ids.sort()).toEqual(["codex-item-zsh-1:sub-a", "codex-item-zsh-1:sub-b"]);
+    expect(events.some((e) => e.type === "text_done" && (e as { content?: string }).content === "subs:accept,decline")).toBe(true);
+    // codex completes only the PARENT; the approved sub-card must close with it.
+    const subDone = events.find((e) => e.type === "tool_complete" && (e as { sdkToolUseId?: string }).sdkToolUseId === "item-zsh-1:sub-a") as
+      | { success: boolean }
+      | undefined;
+    expect(subDone?.success).toBe(true);
+  });
+
+  it("C3j (#369): a streamed patch — the approval shows the latest diff, not the empty start", async () => {
+    const p = makeProvider();
+    const gated: Array<Record<string, unknown>> = [];
+    await collect(
+      p.runTurn(
+        turnOpts("file-change streamed please", {
+          canUseTool: async (_t, _a, _n, input) => {
+            gated.push(input);
+            return { behavior: "allow" as const };
+          },
+        }),
+      ),
+    );
+    await p.teardown();
+    expect(gated).toEqual([{ changes: [{ path: "a.txt", kind: "update", diff: "-old\n+new\n" }] }]);
+  });
+
+  for (const [label, prompt, want] of [
+    ["a subcommand with no command never shows the parent's", "sub-nocommand please", "sub:decline"],
+    ["an unknown approval kind", "odd-kind please", "kind:decline"],
+  ] as const) {
+    it(`C3k (#369): ${label} is declined without asking`, async () => {
+      const p = makeProvider();
+      let asked = false;
+      const events = await collect(
+        p.runTurn(
+          turnOpts(prompt, {
+            canUseTool: async () => {
+              asked = true;
+              return { behavior: "allow" as const };
+            },
+          }),
+        ),
+      );
+      await p.teardown();
+      expect(asked).toBe(false);
+      expect(events.some((e) => e.type === "text_done" && (e as { content?: string }).content === want)).toBe(true);
+    });
+  }
+
+  it("C3m (#369): a patch that changes while being decided is declined, even on a yes", async () => {
+    const p = makeProvider();
+    const events = await collect(
+      p.runTurn(
+        turnOpts("file-change midupdate please", {
+          // The approver takes a moment — the update lands meanwhile.
+          canUseTool: async () => {
+            await new Promise((r) => setTimeout(r, 100));
+            return { behavior: "allow" as const };
+          },
+        }),
+      ),
+    );
+    await p.teardown();
+    expect(events.some((e) => e.type === "text_done" && (e as { content?: string }).content === "Skipped.")).toBe(true);
+    const complete = events.find((e) => e.type === "tool_complete") as { success: boolean; output: string } | undefined;
+    expect(complete?.success).toBe(false);
+    expect(complete?.output).toContain("updated after it was shown");
+  });
+
+  for (const [label, prompt, want] of [
+    ["a sibling approval whose parent already finished", "late-sibling please", "late:decline"],
+    ["a network grant that doesn't name its host", "net-nohost please", "nethost:decline"],
+  ] as const) {
+    it(`C3n (#369): ${label} is declined without asking`, async () => {
+      const p = makeProvider();
+      let asked = false;
+      const events = await collect(
+        p.runTurn(
+          turnOpts(prompt, {
+            canUseTool: async () => {
+              asked = true;
+              return { behavior: "allow" as const };
+            },
+          }),
+        ),
+      );
+      await p.teardown();
+      expect(asked).toBe(false);
+      expect(events.some((e) => e.type === "text_done" && (e as { content?: string }).content === want)).toBe(true);
+    });
+  }
+
+  it("C3o (#369): a network grant alongside a command stays Bash (its hooks apply), host shown", async () => {
+    const p = makeProvider();
+    const seen: string[] = [];
+    await collect(
+      p.runTurn(
+        turnOpts("net-with-cmd please", {
+          canUseTool: async (_t, _a, name, input) => {
+            seen.push(`${name} ${JSON.stringify(input.network)}`);
+            return { behavior: "deny" as const };
+          },
+        }),
+      ),
+    );
+    await p.teardown();
+    expect(seen).toEqual(['Bash {"host":"example.com","protocol":"https"}']);
+  });
+
+  it("C3l (#369): network access with no command is its own tool, not Bash", async () => {
+    const p = makeProvider();
+    const seen: Array<{ name: string; input: Record<string, unknown> }> = [];
+    await collect(
+      p.runTurn(
+        turnOpts("net-only please", {
+          canUseTool: async (_t, _a, name, input) => {
+            seen.push({ name, input });
+            return { behavior: "deny" as const };
+          },
+        }),
+      ),
+    );
+    await p.teardown();
+    expect(seen[0]?.name).toBe("codex_network_access");
+    expect(seen[0]?.input.network).toEqual({ host: "example.com", protocol: "https" });
+  });
+
+  it("C5 (#368): two calls to one server — the approval shows the call codex named, and pairs its result", async () => {
+    const p = makeProvider();
+    const seen: Array<{ name: string; input: Record<string, unknown>; toolId: string }> = [];
+    const events = await collect(
+      p.runTurn(
+        turnOpts("mcp-two please", {
+          canUseTool: async (toolId, _a, name, input) => {
+            seen.push({ name, input, toolId });
+            return { behavior: "allow" as const };
+          },
+        }),
+      ),
+    );
+    await p.teardown();
+    expect(seen).toEqual([{ name: "mcp__github__delete_repo", input: { repo: "x" }, toolId: "item-gh-1" }]);
+    const done = events.find((e) => e.type === "tool_complete" && (e as { sdkToolUseId?: string }).sdkToolUseId === "item-gh-1") as
+      | { output: string }
+      | undefined;
+    expect(done?.output).toBe("deleted");
+  });
+
+  it("C5b (#368): two DIFFERENT calls to one server and codex doesn't say which — declined without asking", async () => {
+    const p = makeProvider();
+    let asked = false;
+    const events = await collect(
+      p.runTurn(
+        turnOpts("mcp-two unnamed please", {
+          canUseTool: async () => {
+            asked = true;
+            return { behavior: "allow" as const };
+          },
+        }),
+      ),
+    );
+    await p.teardown();
+    expect(asked).toBe(false);
+    expect(events.some((e) => e.type === "text_done" && (e as { content?: string }).content === "gh:decline")).toBe(true);
+    const complete = events.find((e) => e.type === "tool_complete") as { success: boolean; output: string } | undefined;
+    expect(complete?.success).toBe(false);
+    expect(complete?.output).toContain("different calls to github");
+  });
+
+  it("C5c (#368): an MCP server's own question (url) is shown and declined — never accepted as a tool call", async () => {
+    const p = makeProvider();
+    let asked = false;
+    const events = await collect(
+      p.runTurn(
+        turnOpts("mcp-server-asks please", {
+          canUseTool: async () => {
+            asked = true;
+            return { behavior: "allow" as const };
+          },
+        }),
+      ),
+    );
+    await p.teardown();
+    expect(asked).toBe(false);
+    expect(events.some((e) => e.type === "text_done" && (e as { content?: string }).content === "ask:decline")).toBe(true);
+    const start = events.find((e) => e.type === "tool_start") as { name: string; input: Record<string, unknown> } | undefined;
+    expect(start?.name).toBe("mcp__github__elicitation");
+    expect(start?.input.url).toBe("https://evil.example/oauth"); // shown, not hidden
+  });
+
+  it("C5f (#368): a form elicitation without codex's approval marker is declined, never gated as a tool call", async () => {
+    // Deliberate: codex 0.154 marks its tool-call approvals with
+    // _meta.codex_approval_kind = "mcp_tool_call". A request without it is
+    // not one — even when its text looks like it.
+    const p = makeProvider();
+    let asked = false;
+    const events = await collect(
+      p.runTurn(
+        turnOpts("mcp-nokind please", {
+          canUseTool: async () => {
+            asked = true;
+            return { behavior: "allow" as const };
+          },
+        }),
+      ),
+    );
+    await p.teardown();
+    expect(asked).toBe(false);
+    expect(events.some((e) => e.type === "text_done" && (e as { content?: string }).content === "nokind:decline")).toBe(true);
+  });
+
+  it("C5d (#368): a tool name with a quote in it is read in full", async () => {
+    const p = makeProvider();
+    const names: string[] = [];
+    await collect(
+      p.runTurn(
+        turnOpts("mcp-quoted please", {
+          canUseTool: async (_t, _a, name) => {
+            names.push(name);
+            return { behavior: "deny" as const };
+          },
+        }),
+      ),
+    );
+    await p.teardown();
+    expect(names).toEqual(['mcp__srv__safe" then "rm']);
+  });
+
+  it("C5e (#368): approvals that can't be paired to a started call get distinct ids", async () => {
+    const p = makeProvider();
+    const ids: string[] = [];
+    for (const prompt of ["mcp-nostart please", "mcp-nostart again"]) {
+      await collect(
+        p.runTurn(
+          turnOpts(prompt, {
+            canUseTool: async (_t, approvalId) => {
+              ids.push(approvalId);
+              return { behavior: "deny" as const };
+            },
+          }),
+        ),
+      );
+    }
+    await p.teardown();
+    expect(ids).toHaveLength(2);
+    expect(ids[0]).not.toBe(ids[1]);
+    expect(ids.every((id) => !id.includes("turn-1"))).toBe(true);
+  });
+
+  it("C3d (#369): a permissions request is answered with a grant — the requested profile, or nothing", async () => {
+    for (const allow of [true, false]) {
+      const p = makeProvider();
+      const events = await collect(
+        p.runTurn(turnOpts("permissions please", { canUseTool: async () => (allow ? { behavior: "allow" as const } : { behavior: "deny" as const }) })),
+      );
+      await p.teardown();
+      const want = allow ? "permissions:granted" : "permissions:refused";
+      expect(events.some((e) => e.type === "text_done" && (e as { content?: string }).content === want)).toBe(true);
+    }
   });
 
   it("C4: non-gated item is recorded retrospectively as start+complete", async () => {

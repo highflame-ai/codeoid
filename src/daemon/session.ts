@@ -4303,6 +4303,10 @@ export class Session {
   }
 
   #makeCanUseToolFn(sender: AuthContext): ToolApprovalFn {
+    // The backend this gate is handed to — the one that will ASK. Captured
+    // here, not at call time, so the rewrite check below refers to it even if
+    // the session's provider has changed by the time a call arrives.
+    const provider = this.#provider;
     return async (toolId, approvalId, toolName, inputObj, signal) => {
       // Yield once so the tool_start event is processed by the event consumer
       // (creating the SessionMessage) before hooks run or the approval
@@ -4348,7 +4352,42 @@ export class Session {
           this.#broadcastRaw(infoMsg);
           return { behavior: "deny" as const, message: `Blocked by hook "${hookName}": ${reason}` };
         }
-        if (hookResult.updatedInput) {
+        // A "rewrite" identical to the input is no rewrite: what runs is
+        // exactly what is shown, on every backend.
+        if (hookResult.updatedInput && !Bun.deepEquals(hookResult.updatedInput, inputObj)) {
+          // A backend that only hears yes/no runs the input IT proposed: the
+          // rewrite would be shown (and approved) while the original runs.
+          // Refuse instead (#367) — before the rewrite reaches any display.
+          if (!provider.appliesToolInputRewrite) {
+            const hooks = hookResult.mutatedBy.map((n) => `"${n}"`).join(", ");
+            const reason = `${provider.id} can't run a rewritten input, so the call was refused rather than run as originally proposed`;
+            this.#approvalPatchKeys.delete(approvalId);
+            this.#resolveToolCallMessage(approvalId, {
+              phase: "cancelled",
+              reason: "denied",
+              message: `Hook ${hooks} rewrote ${toolName}: ${reason}`,
+            });
+            this.#store.audit(
+              sender.sub,
+              "session.hook_rewrite_refused",
+              this.id,
+              `tool=${toolName} provider=${provider.id} hooks=${hookResult.mutatedBy.join(",")}`,
+            );
+            const infoMsg = this.#makeMessage(
+              "info",
+              `🪝 Hook ${hooks} rewrote ${toolName}, but ${reason}`,
+              SYSTEM_IDENTITY,
+              undefined,
+              undefined,
+              { event: "hook.rewrite_refused", hooks: hookResult.mutatedBy, tool: toolName, provider: provider.id },
+            );
+            this.#persistAndBuffer(infoMsg);
+            this.#broadcastRaw(infoMsg);
+            return {
+              behavior: "deny" as const,
+              message: `Blocked: hook ${hooks} rewrote this ${toolName} call and this backend can't run the rewritten input`,
+            };
+          }
           effectiveInput = hookResult.updatedInput;
           this.#applyHookInputMutation(approvalId, effectiveInput);
           const infoMsg = this.#makeMessage(
@@ -4418,6 +4457,28 @@ export class Session {
         this.#approvalInputs.delete(approvalId);
       }
       const { approved, updatedInput } = decision;
+
+      // The approver's answers (a form patch) would be dropped by a backend
+      // that runs its own input — don't run the call without them (#367).
+      // Decided BEFORE the call is marked running or audited as approved.
+      const patchableKeys = this.#approvalPatchKeys.get(approvalId);
+      this.#approvalPatchKeys.delete(approvalId);
+      const sanitizedPatch = approved ? sanitizeApprovalPatch(toolName, updatedInput, patchableKeys) : null;
+      if (sanitizedPatch && !provider.appliesToolInputRewrite) {
+        if (this.#turnActive()) this.#setStatus("thinking");
+        else this.#settleBetweenTurns();
+        this.#resolveToolCallMessage(approvalId, {
+          phase: "cancelled",
+          reason: "denied",
+          message: `${provider.id} can't apply the answers given to ${toolName}`,
+        });
+        this.#store.audit(sender.sub, "session.patch_refused", this.id, `tool=${toolName} provider=${provider.id}`);
+        return {
+          behavior: "deny" as const,
+          message: `Blocked: this backend can't apply the answers given to ${toolName}`,
+        };
+      }
+
       if (this.#turnActive()) this.#setStatus(approved ? "tool_running" : "thinking");
       else this.#settleBetweenTurns();
 
@@ -4431,11 +4492,8 @@ export class Session {
           : { phase: "cancelled", reason: "denied" },
       );
 
-      const patchableKeys = this.#approvalPatchKeys.get(approvalId);
-      this.#approvalPatchKeys.delete(approvalId);
       if (approved) {
         this.#store.audit(sender.sub, "session.approve", this.id, `tool=${toolName} approvalId=${approvalId}`);
-        const sanitizedPatch = sanitizeApprovalPatch(toolName, updatedInput, patchableKeys);
         const merged: Record<string, unknown> = sanitizedPatch ? { ...effectiveInput, ...sanitizedPatch } : effectiveInput;
         return { behavior: "allow" as const, updatedInput: merged };
       }
@@ -4917,6 +4975,30 @@ export class Session {
         // and what a switched-to backend later sees (redaction use case).
         const msgId = this.#toolUseIdToMessageId.get(event.sdkToolUseId);
         const hookToolName = msgId ? this.#toolCallMessages.get(msgId)?.tool?.name : undefined;
+        // A call announced as needing approval that completes without ever
+        // reaching the gate: the backend settled it itself (codex declining an
+        // approval it can't show, #369). Drop its approval mapping — a late
+        // click must not buffer an "early" decision for a dead id — and audit
+        // it, so every decision on a call is attributed.
+        if (msgId) {
+          // Audited when it was asking for approval, or the backend says it
+          // refused the call itself — not for every call a backend ran (or
+          // failed) on its own, which would only be noise.
+          const wasWaiting = this.#toolCallMessages.get(msgId)?.tool?.state.phase === "waiting_confirmation";
+          for (const [aid, mid] of this.#approvalIdToMessageId) {
+            if (mid !== msgId || this.#pendingApprovals.has(aid)) continue;
+            this.#approvalIdToMessageId.delete(aid);
+            this.#earlyApprovals.delete(aid);
+            this.#approvalPatchKeys.delete(aid);
+            if (!wasWaiting && !event.declinedByBackend) continue;
+            this.#store.audit(
+              SYSTEM_IDENTITY.sub,
+              "session.backend_settled",
+              this.id,
+              `tool=${hookToolName ?? "unknown"} approvalId=${aid} provider=${this.#provider.id} success=${event.success}`,
+            );
+          }
+        }
         let output = event.output;
         if (this.#hookBus?.hasHooks("tool_result", hookToolName)) {
           const patched = await this.#hookBus.dispatchToolResult(this.#hookContext(), {
@@ -4960,7 +5042,15 @@ export class Session {
           }
           this.#toolUseIdToMessageId.delete(event.sdkToolUseId);
         }
-        if (this.#status === "tool_running") this.#setTurnStatus("thinking");
+        // Also leave waiting_approval when nothing is parked: a backend can
+        // announce a call and settle it itself, never asking (#369) — the
+        // session must not keep showing "waiting approval" for it.
+        if (
+          this.#status === "tool_running" ||
+          (this.#status === "waiting_approval" && this.#pendingApprovals.size === 0 && this.#pendingUiRequests.size === 0)
+        ) {
+          this.#setTurnStatus("thinking");
+        }
         break;
       }
 

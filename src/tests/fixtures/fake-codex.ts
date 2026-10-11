@@ -22,7 +22,7 @@
  * can't slip through offline again.
  */
 
-import { sandboxPolicyError } from "./fake-codex-validate.js";
+import { approvalReplyError, sandboxPolicyError } from "./fake-codex-validate.js";
 
 const enc = new TextEncoder();
 function send(obj: unknown): void {
@@ -66,6 +66,8 @@ async function runTurn(threadId: string, prompt: string): Promise<void> {
   send({ method: "turn/started", params: { turn: { id: "turn-1" } } });
 
   if (prompt.includes("use-tool")) {
+    // Real codex announces the item first, then asks.
+    send({ method: "item/started", params: { item: { id: "item-cmd-1", type: "commandExecution", command: "rm -rf /tmp/scratch", cwd: "/tmp", status: "inProgress" } } });
     const decision = await serverRequest("item/commandExecution/requestApproval", {
       threadId,
       turnId: "turn-1",
@@ -74,7 +76,16 @@ async function runTurn(threadId: string, prompt: string): Promise<void> {
       cwd: "/tmp",
       reason: "cleanup",
     });
-    if (decision.decision === "approved") {
+    // Like the real codex: a reply outside the schema fails the approval, and
+    // the agent sees a rejection — the item is declined, never run (#369).
+    const replyError = approvalReplyError("item/commandExecution/requestApproval", decision);
+    if (replyError) {
+      send({
+        method: "item/completed",
+        params: { item: { id: "item-cmd-1", type: "commandExecution", command: "rm -rf /tmp/scratch", aggregatedOutput: replyError, status: "declined" } },
+      });
+      send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `Rejected: ${replyError}` } } });
+    } else if (decision.decision === "accept") {
       send({
         method: "item/completed",
         params: {
@@ -84,9 +95,104 @@ async function runTurn(threadId: string, prompt: string): Promise<void> {
       send({ method: "item/agentMessage/delta", params: { delta: "Cleaned up." } });
       send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: "Cleaned up." } } });
     } else {
+      send({
+        method: "item/completed",
+        params: { item: { id: "item-cmd-1", type: "commandExecution", command: "rm -rf /tmp/scratch", aggregatedOutput: "", status: "declined" } },
+      });
       send({ method: "item/agentMessage/delta", params: { delta: "Approval denied; skipping." } });
       send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: "Approval denied; skipping." } } });
     }
+  } else if (prompt.includes("file-change")) {
+    // codex 0.154: the diff rides item/started; the approval request has none.
+    const changes = [{ path: "a.txt", kind: "update", diff: "-old\n+new\n" }];
+    const announce = !prompt.includes("nodiff");
+    if (prompt.includes("streamed")) {
+      // apply_patch_streaming_events: started with nothing, the patch follows.
+      send({ method: "item/started", params: { item: { id: "item-fc-1", type: "fileChange", changes: [], status: "inProgress" } } });
+      send({ method: "item/fileChange/patchUpdated", params: { threadId, turnId: "turn-1", itemId: "item-fc-1", changes } });
+    } else if (announce) send({ method: "item/started", params: { item: { id: "item-fc-1", type: "fileChange", changes, status: "inProgress" } } });
+    const pendingReply = serverRequest("item/fileChange/requestApproval", {
+      threadId,
+      turnId: "turn-1",
+      itemId: "item-fc-1",
+      startedAtMs: 0,
+      ...(prompt.includes("grantroot") ? { grantRoot: "/" } : {}),
+    });
+    if (prompt.includes("midupdate")) {
+      // The patch changes while the approval is being DECIDED (after the
+      // request reached the client, before its reply).
+      await new Promise((r) => setTimeout(r, 20));
+      send({ method: "item/fileChange/patchUpdated", params: { threadId, turnId: "turn-1", itemId: "item-fc-1", changes: [{ path: "b.txt", kind: "update", diff: "+surprise\n" }] } });
+    }
+    const reply = await pendingReply;
+    const err = approvalReplyError("item/fileChange/requestApproval", reply);
+    const ran = !err && reply.decision === "accept";
+    send({
+      method: "item/completed",
+      params: { item: { id: "item-fc-1", type: "fileChange", changes, status: ran ? "completed" : "declined" } },
+    });
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: err ? `Rejected: ${err}` : ran ? "Edited." : "Skipped." } } });
+  } else if (prompt.includes("permissions")) {
+    const requested = { network: { enabled: true } };
+    const reply = await serverRequest("item/permissions/requestApproval", {
+      threadId,
+      turnId: "turn-1",
+      itemId: "item-perm-1",
+      cwd: "/tmp",
+      permissions: requested,
+      startedAtMs: 0,
+    });
+    const err = approvalReplyError("item/permissions/requestApproval", reply);
+    const granted = err ? "invalid" : JSON.stringify(reply.permissions) === JSON.stringify(requested) ? "granted" : "refused";
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `permissions:${granted}` } } });
+  } else if (prompt.includes("write-stdin")) {
+    send({ method: "item/started", params: { item: { id: "item-term-1", type: "commandExecution", command: "python", status: "inProgress" } } });
+    const reply = await serverRequest("item/commandExecution/requestApproval", {
+      threadId, turnId: "turn-1", itemId: "item-term-1", startedAtMs: 0, kind: "writeStdin", command: null,
+    });
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `stdin:${String(reply.decision)}` } } });
+  } else if (prompt.includes("subcommands")) {
+    // Two zsh-exec-bridge callbacks for ONE parent item, pending at once.
+    send({ method: "item/started", params: { item: { id: "item-zsh-1", type: "commandExecution", command: "make", status: "inProgress" } } });
+    const [a, b] = await Promise.all([
+      serverRequest("item/commandExecution/requestApproval", { threadId, turnId: "turn-1", itemId: "item-zsh-1", approvalId: "sub-a", command: "cc a.c", startedAtMs: 0 }),
+      serverRequest("item/commandExecution/requestApproval", { threadId, turnId: "turn-1", itemId: "item-zsh-1", approvalId: "sub-b", command: "rm -rf out", startedAtMs: 0 }),
+    ]);
+    send({ method: "item/completed", params: { item: { id: "item-zsh-1", type: "commandExecution", command: "make", aggregatedOutput: "built", status: "completed" } } });
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `subs:${String(a.decision)},${String(b.decision)}` } } });
+  } else if (prompt.includes("sub-nocommand")) {
+    send({ method: "item/started", params: { item: { id: "item-zsh-2", type: "commandExecution", command: "make", status: "inProgress" } } });
+    const r = await serverRequest("item/commandExecution/requestApproval", { threadId, turnId: "turn-1", itemId: "item-zsh-2", approvalId: "sub-x", command: null, startedAtMs: 0 });
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `sub:${String(r.decision)}` } } });
+  } else if (prompt.includes("late-sibling")) {
+    send({ method: "item/started", params: { item: { id: "item-zsh-3", type: "commandExecution", command: "make", status: "inProgress" } } });
+    send({ method: "item/completed", params: { item: { id: "item-zsh-3", type: "commandExecution", command: "make", status: "completed" } } });
+    const r = await serverRequest("item/commandExecution/requestApproval", { threadId, turnId: "turn-1", itemId: "item-zsh-3", approvalId: "sub-late", command: "rm x", startedAtMs: 0 });
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `late:${String(r.decision)}` } } });
+  } else if (prompt.includes("net-nohost")) {
+    const r = await serverRequest("item/commandExecution/requestApproval", { threadId, turnId: "turn-1", itemId: "item-n-2", command: null, startedAtMs: 0, networkApprovalContext: {} });
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `nethost:${String(r.decision)}` } } });
+  } else if (prompt.includes("net-with-cmd")) {
+    const r = await serverRequest("item/commandExecution/requestApproval", {
+      threadId, turnId: "turn-1", itemId: "item-n-3", command: "curl example.com", startedAtMs: 0, networkApprovalContext: { host: "example.com", protocol: "https" },
+    });
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `netcmd:${String(r.decision)}` } } });
+  } else if (prompt.includes("odd-kind")) {
+    const r = await serverRequest("item/commandExecution/requestApproval", { threadId, turnId: "turn-1", itemId: "item-k-1", kind: "somethingNew", command: "ls", startedAtMs: 0 });
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `kind:${String(r.decision)}` } } });
+  } else if (prompt.includes("net-only")) {
+    const r = await serverRequest("item/commandExecution/requestApproval", {
+      threadId, turnId: "turn-1", itemId: "item-n-1", command: null, startedAtMs: 0, networkApprovalContext: { host: "example.com", protocol: "https" },
+    });
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `net:${String(r.decision)}` } } });
+  } else if (prompt.includes("codex-declines")) {
+    // codex declined an item on its own (e.g. its own policy, or an approval
+    // round-trip that failed) — no request reached the client.
+    send({
+      method: "item/completed",
+      params: { item: { id: "item-self-1", type: "commandExecution", command: "curl x", aggregatedOutput: "", status: "declined" } },
+    });
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: "Could not run it." } } });
   } else if (prompt.includes("auto-tool")) {
     // codex ran a trusted read without asking — only item/completed arrives.
     send({
@@ -94,6 +200,52 @@ async function runTurn(threadId: string, prompt: string): Promise<void> {
       params: { item: { id: "item-auto-1", type: "commandExecution", command: "ls -la", aggregatedOutput: "file-a\nfile-b", status: "completed" } },
     });
     send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: "Listed files." } } });
+  } else if (prompt.includes("mcp-two")) {
+    // Two calls to ONE server in flight; the elicitation is for the FIRST
+    // (codex names only the server — tool via message, args via _meta) (#368).
+    send({ method: "item/started", params: { item: { id: "item-gh-1", type: "mcpToolCall", server: "github", tool: "delete_repo", arguments: { repo: "x" } } } });
+    send({ method: "item/started", params: { item: { id: "item-gh-2", type: "mcpToolCall", server: "github", tool: "get_issue", arguments: { n: 7 } } } });
+    const named = !prompt.includes("unnamed");
+    const decision = await serverRequest("mcpServer/elicitation/request", {
+      threadId,
+      turnId: "turn-1",
+      serverName: "github",
+      mode: "form",
+      ...(named
+        ? { _meta: { codex_approval_kind: "mcp_tool_call", tool_params: { repo: "x" } }, message: 'Allow the github MCP server to run tool "delete_repo"?' }
+        : { _meta: { codex_approval_kind: "mcp_tool_call" }, message: "Allow the github MCP server to run a tool?" }),
+      requestedSchema: { type: "object", properties: {} },
+    });
+    if (decision.action === "accept") {
+      send({ method: "item/completed", params: { item: { id: "item-gh-1", type: "mcpToolCall", server: "github", tool: "delete_repo", arguments: { repo: "x" }, aggregatedOutput: "deleted", status: "completed" } } });
+    }
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `gh:${String(decision.action)}` } } });
+  } else if (prompt.includes("mcp-nokind")) {
+    // A form elicitation WITHOUT codex's approval marker (an older/different
+    // codex, or the server's own form): not a tool approval.
+    send({ method: "item/started", params: { item: { id: "item-mem-9", type: "mcpToolCall", server: "codeoid_memory", tool: "recall", arguments: { query: "q" } } } });
+    const decision = await serverRequest("mcpServer/elicitation/request", {
+      threadId, turnId: "turn-1", serverName: "codeoid_memory", mode: "form",
+      message: 'Allow the codeoid_memory MCP server to run tool "recall"?',
+      requestedSchema: { type: "object", properties: {} },
+    });
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `nokind:${String(decision.action)}` } } });
+  } else if (prompt.includes("mcp-server-asks")) {
+    // The server's OWN question (OAuth url) while a call to it is pending.
+    send({ method: "item/started", params: { item: { id: "item-gh-9", type: "mcpToolCall", server: "github", tool: "get_issue", arguments: { n: 1 } } } });
+    const decision = await serverRequest("mcpServer/elicitation/request", {
+      threadId, turnId: "turn-1", serverName: "github", mode: "url", elicitationId: "e1",
+      message: "Sign in to continue", url: "https://evil.example/oauth",
+    });
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `ask:${String(decision.action)}` } } });
+  } else if (prompt.includes("mcp-quoted")) {
+    const decision = await serverRequest("mcpServer/elicitation/request", {
+      threadId, turnId: "turn-1", serverName: "srv", mode: "form",
+      _meta: { codex_approval_kind: "mcp_tool_call", tool_params: { a: 1 } },
+      message: 'Allow the srv MCP server to run tool "safe" then "rm"?',
+      requestedSchema: { type: "object", properties: {} },
+    });
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `quoted:${String(decision.action)}` } } });
   } else if (prompt.includes("mcp-nostart")) {
     // Defensive path: an elicitation arrives with NO preceding item/started
     // (so the provider can't correlate the tool from the item). It must still
@@ -210,7 +362,7 @@ async function handle(frame: Record<string, unknown>): Promise<void> {
       resolve(
         error
           ? { __error: error.message ?? "error" }
-          : ((frame.result ?? { decision: "denied" }) as Record<string, unknown>),
+          : ((frame.result ?? {}) as Record<string, unknown>),
       );
     }
     return;

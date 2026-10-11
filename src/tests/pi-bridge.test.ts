@@ -49,3 +49,58 @@ describe("pi bridge source", () => {
     expect(buildBridgeSource(false, [])).not.toContain(MCP_TOOL_TITLE);
   });
 });
+
+describe("pi bridge tool_call gate — runtime (#367)", () => {
+  /** Load the REAL generated bridge with a stub `pi`, and return its tool_call handler. */
+  async function loadToolCallHandler(): Promise<(event: Record<string, unknown>, ctx: unknown) => Promise<unknown>> {
+    const { mkdtempSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "pi-bridge-rt-"));
+    const path = join(dir, "bridge.mjs");
+    writeFileSync(path, buildBridgeSource(false));
+    const mod = (await import(path)) as { default: (pi: unknown) => void };
+    const handlers: Record<string, (e: Record<string, unknown>, c: unknown) => Promise<unknown>> = {};
+    mod.default({
+      on: (evt: string, fn: (e: Record<string, unknown>, c: unknown) => Promise<unknown>) => {
+        handlers[evt] = fn;
+      },
+    });
+    return handlers.tool_call!;
+  }
+  const ctxAnswering = (decision: unknown) => ({ hasUI: true, ui: { input: async () => JSON.stringify(decision) } });
+
+  test("updatedInput REPLACES pi's input — a key the rewrite drops is dropped from what runs", async () => {
+    const handler = await loadToolCallHandler();
+    const event: { toolCallId: string; toolName: string; input: Record<string, unknown> } = {
+      toolCallId: "c1",
+      toolName: "bash",
+      input: { command: "rm -rf ~/x", force: true },
+    };
+    const verdict = await handler(event, ctxAnswering({ behavior: "allow", updatedInput: { command: "echo SAFE" } }));
+    expect(verdict).toBeUndefined(); // allowed
+    expect(event.input).toEqual({ command: "echo SAFE" });
+  });
+
+  test("prototype-named keys are handled as plain keys", async () => {
+    const handler = await loadToolCallHandler();
+    const event: { toolCallId: string; toolName: string; input: Record<string, unknown> } = {
+      toolCallId: "c3",
+      toolName: "bash",
+      input: { command: "x", constructor: "dropped-by-rewrite" },
+    };
+    const updated = JSON.parse('{"command":"y","__proto__":{"polluted":true}}');
+    await handler(event, ctxAnswering({ behavior: "allow", updatedInput: updated }));
+    expect(Object.keys(event.input)).toEqual(["command"]);
+    expect(event.input.command).toBe("y");
+    expect((event.input as { polluted?: unknown }).polluted).toBeUndefined();
+  });
+
+  test("no updatedInput leaves the input as proposed; deny blocks", async () => {
+    const handler = await loadToolCallHandler();
+    const event = { toolCallId: "c2", toolName: "bash", input: { command: "ls" } };
+    expect(await handler(event, ctxAnswering({ behavior: "allow" }))).toBeUndefined();
+    expect(event.input).toEqual({ command: "ls" });
+    expect(await handler(event, ctxAnswering({ behavior: "deny", message: "no" }))).toMatchObject({ block: true });
+  });
+});

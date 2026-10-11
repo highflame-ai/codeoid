@@ -219,7 +219,15 @@ export type ProviderEvent =
       patchableKeys?: string[];
     }
   /** Fired when a tool result is available (from the provider's user message). */
-  | { type: "tool_complete"; sdkToolUseId: string; output: string; success: boolean }
+  | {
+      type: "tool_complete";
+      sdkToolUseId: string;
+      output: string;
+      success: boolean;
+      /** The backend refused this call itself, never asking codeoid's gate
+       *  (codex declining an approval it can't show, #369) — audited. */
+      declinedByBackend?: boolean;
+    }
   | { type: "subagent_start"; agentId: string; agentType: string }
   | { type: "subagent_stop"; agentId: string }
   | { type: "mcp_init"; servers: Record<string, string>; tools: Record<string, string[]> }
@@ -491,6 +499,16 @@ export interface AgentProvider {
    * true only after its tool mount is confirmed.
    */
   readonly supportsMemoryTools?: boolean;
+  /**
+   * True when the backend runs the `updatedInput` an `allow` verdict carries —
+   * a hook's rewrite of a tool call, or an approver's form answers — instead
+   * of the input it proposed. Absent = false: a backend that only hears
+   * yes/no runs its OWN input, and showing a rewrite it then ignores would
+   * have the user approve one thing while another runs. Session refuses such
+   * a call instead (#367). Declare it only after confirming the backend
+   * applies the new input to what it actually executes.
+   */
+  readonly appliesToolInputRewrite?: boolean;
   dispose(): Promise<void>;
 }
 
