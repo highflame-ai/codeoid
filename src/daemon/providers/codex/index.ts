@@ -306,7 +306,10 @@ export class CodexProvider implements SessionProvider {
    * that fires just before it carries both, so we correlate here to build the
    * canonical `mcp__<server>__<tool>` name the approval gate + isSafeTool key off.
    */
-  #pendingMcpCalls = new Map<string, { itemId: string; tool: string; input: Record<string, unknown> }>();
+  /** MCP calls codex started and may elicit approval for, oldest first, by
+   *  server. A LIST: two calls to one server can be in flight at once, and the
+   *  elicitation names only the server (#368). */
+  #pendingMcpCalls = new Map<string, Array<{ itemId: string; tool: string; input: Record<string, unknown> }>>();
 
   constructor(init: CodexProviderInit) {
     this.#sessionId = init.sessionId;
@@ -458,6 +461,7 @@ export class CodexProvider implements SessionProvider {
     this.#announcedItems.clear();
     this.#declinedItems.clear();
     this.#startedItems.clear();
+    this.#pendingMcpCalls.clear();
     this.#openSubApprovals.clear();
     this.#completedParents.clear();
     this.#approvalsInFlight.clear();
@@ -517,6 +521,7 @@ export class CodexProvider implements SessionProvider {
   }
 
   async teardown(): Promise<void> {
+    this.#pendingMcpCalls.clear();
     this.#turnQueue?.close();
     this.#turnQueue = null;
     this.#proc?.kill();
@@ -625,6 +630,66 @@ export class CodexProvider implements SessionProvider {
     }
   }
 
+  /**
+   * Which MCP call an elicitation is about (#368). codex names only the SERVER;
+   * its message names the tool and `_meta.tool_params` carries the arguments.
+   * When the elicitation says both, that IS what will run and is what's shown —
+   * correlation only picks the started item to pair the result with. When it
+   * doesn't, use the one matching call; several DIFFERENT candidates are
+   * ambiguous and declined rather than guessed.
+   */
+  #resolveElicitedCall(
+    serverName: string,
+    params: Record<string, unknown>,
+  ): { tool: string; input: Record<string, unknown>; itemId: string; unshowable?: string } {
+    const eTool = mcpToolFromMessage(params.message, serverName);
+    const eArgs = elicitedToolParams(params);
+    const list = this.#pendingMcpCalls.get(serverName) ?? [];
+    const matches = list.filter(
+      (c) => (eTool === null || c.tool === eTool) && (eArgs === undefined || Bun.deepEquals(c.input, eArgs)),
+    );
+    // Unique per request — never the turn id, which every request in a turn
+    // shares: two approvals on one id would let one answer settle the other.
+    const synthetic = `mcp-${randomUUID()}`;
+    const take = (c: (typeof list)[number]) => {
+      list.splice(list.indexOf(c), 1);
+      if (list.length === 0) this.#pendingMcpCalls.delete(serverName);
+      return c;
+    };
+    if (eTool !== null && eArgs !== undefined) {
+      const c = matches[0] ? take(matches[0]) : undefined;
+      return { tool: eTool, input: eArgs, itemId: c?.itemId ?? synthetic };
+    }
+    const first = matches[0];
+    if (first && matches.every((c) => c.tool === first.tool && Bun.deepEquals(c.input, first.input))) {
+      // One candidate, or several identical ones — the same call either way.
+      const c = take(first);
+      return { tool: c.tool, input: c.input, itemId: c.itemId };
+    }
+    if (matches.length > 1) {
+      return {
+        tool: eTool ?? "tool",
+        input: eArgs ?? {},
+        itemId: synthetic,
+        unshowable: `${matches.length} different calls to ${serverName} are waiting and codex didn't say which this is`,
+      };
+    }
+    return {
+      tool: eTool ?? "tool",
+      input: eArgs ?? {},
+      itemId: synthetic,
+      unshowable: `codex didn't say which ${serverName} call this is, or with what arguments`,
+    };
+  }
+
+  #dropPendingMcpCall(serverName: string, itemId: string): void {
+    const list = this.#pendingMcpCalls.get(serverName);
+    if (!list) return;
+    const i = list.findIndex((c) => c.itemId === itemId);
+    if (i >= 0) list.splice(i, 1);
+    if (list.length === 0) this.#pendingMcpCalls.delete(serverName);
+  }
+
   #push(event: ProviderEvent): void {
     const queue = this.#turnQueue;
     if (!queue || queue.closed) return;
@@ -657,11 +722,14 @@ export class CodexProvider implements SessionProvider {
           this.#startedItems.set(String(item.id ?? ""), item);
         }
         if (item && (item.type as string) === "mcpToolCall") {
-          this.#pendingMcpCalls.set(String(item.server ?? ""), {
+          const server = String(item.server ?? "");
+          const list = this.#pendingMcpCalls.get(server) ?? [];
+          list.push({
             itemId: String(item.id ?? ""),
             tool: String(item.tool ?? "tool"),
             input: (item.arguments as Record<string, unknown>) ?? {},
           });
+          this.#pendingMcpCalls.set(server, list);
         }
         break;
       }
@@ -682,7 +750,7 @@ export class CodexProvider implements SessionProvider {
         if (!item) break;
         const itemType = item.type as string;
         const itemId = String(item.id ?? "");
-        if (itemType === "mcpToolCall") this.#pendingMcpCalls.delete(String(item.server ?? ""));
+        if (itemType === "mcpToolCall") this.#dropPendingMcpCall(String(item.server ?? ""), itemId);
         this.#startedItems.delete(itemId);
         this.#completedParents.add(itemId);
         const subs = this.#openSubApprovals.get(itemId);
@@ -876,11 +944,30 @@ export class CodexProvider implements SessionProvider {
         // Fail closed: an approval with no gate wired is declined, never run.
         if (!canUseTool) return { action: "decline" };
         const serverName = String(params.serverName ?? "");
-        const pending = this.#pendingMcpCalls.get(serverName);
-        this.#pendingMcpCalls.delete(serverName);
-        const tool = pending?.tool ?? mcpToolFromMessage(params.message) ?? "tool";
-        const input = pending?.input ?? metaToolParams(params);
-        const itemId = pending?.itemId ?? String(params.turnId ?? randomUUID());
+        // The same method carries an MCP server's OWN questions (a form, an
+        // OAuth url) — only codex's tool-call approval is a tool approval.
+        // Anything else is shown for what it is and declined: answering it as
+        // a tool call would accept a url nobody saw (#368).
+        const meta = params._meta as Record<string, unknown> | undefined;
+        const isToolApproval = (params.mode === undefined || params.mode === "form") && meta?.codex_approval_kind === "mcp_tool_call";
+        if (!isToolApproval) {
+          const askId = `mcp-ask-${randomUUID()}`;
+          const shown: Record<string, unknown> = {
+            ...(typeof params.message === "string" ? { message: params.message } : {}),
+            ...(typeof params.url === "string" ? { url: params.url } : {}),
+            ...(params.mode !== undefined ? { mode: params.mode } : {}),
+          };
+          this.#push({ type: "tool_start", toolId: askId, sdkToolUseId: askId, name: `mcp__${serverName}__elicitation`, input: shown, approvalId: `codex-${askId}` });
+          this.#push({
+            type: "tool_complete",
+            sdkToolUseId: askId,
+            output: `Declined — ${serverName} asked a question of its own; answering MCP server questions isn't supported on codex yet`,
+            success: false,
+            declinedByBackend: true,
+          });
+          return { action: "decline" };
+        }
+        const { tool, input, itemId, unshowable } = this.#resolveElicitedCall(serverName, params);
         const name = `mcp__${serverName}__${tool}`;
         // Announce so scrollback shows the real tool; keyed by the mcpToolCall
         // itemId so the item/completed handler pairs the tool_complete instead
@@ -895,7 +982,15 @@ export class CodexProvider implements SessionProvider {
           input,
           approvalId: `codex-${itemId}`,
         });
+        if (unshowable) {
+          // Never ask for a yes on a call we can't pin down (#368).
+          this.#push({ type: "tool_complete", sdkToolUseId: itemId, output: `Declined — ${unshowable}`, success: false, declinedByBackend: true });
+          this.#announcedItems.delete(itemId);
+          this.#declinedItems.add(itemId);
+          return { action: "decline" };
+        }
         const verdict = await canUseTool(itemId, `codex-${itemId}`, name, input);
+        if (verdict.behavior !== "allow") this.#declinedItems.add(itemId);
         return verdict.behavior === "allow" ? { action: "accept", content: {} } : { action: "decline" };
       }
       case "item/tool/requestUserInput": {
@@ -930,17 +1025,26 @@ export class CodexProvider implements SessionProvider {
 
 /** Recover the MCP tool name from the elicitation `message` when the preceding
  *  item/started wasn't observed (defensive): `…run tool "recall"?` → `recall`. */
-function mcpToolFromMessage(message: unknown): string | null {
+/**
+ * The tool an approval elicitation names: codex's template is
+ * `Allow the <server> MCP server to run tool "<tool>"?`. Matched as a whole
+ * and anchored at the end, so a tool name containing a quote is read in full
+ * rather than cut at its first `"` (#368).
+ */
+function mcpToolFromMessage(message: unknown, serverName?: string): string | null {
   if (typeof message !== "string") return null;
-  const m = message.match(/run tool "([^"]+)"/);
-  return m ? m[1] : null;
+  const m = message.match(/^Allow the (.+) MCP server to run tool "(.+)"\?$/s);
+  if (m) return serverName === undefined || m[1] === serverName ? (m[2] ?? null) : null;
+  const loose = message.match(/run tool "(.+)"\?\s*$/s);
+  return loose ? (loose[1] ?? null) : null;
 }
 
-/** Fallback tool arguments from the elicitation `_meta.tool_params`. */
-function metaToolParams(params: Record<string, unknown>): Record<string, unknown> {
+/** The tool arguments an elicitation carries (`_meta.tool_params`), or
+ *  undefined when it carries none — distinct from "no arguments" (`{}`). */
+function elicitedToolParams(params: Record<string, unknown>): Record<string, unknown> | undefined {
   const meta = params._meta as Record<string, unknown> | undefined;
   const tp = meta?.tool_params;
-  return tp && typeof tp === "object" ? (tp as Record<string, unknown>) : {};
+  return tp && typeof tp === "object" && !Array.isArray(tp) ? (tp as Record<string, unknown>) : undefined;
 }
 
 /** Render an env map as a TOML inline table (`{ KEY = "val", … }`) for a codex

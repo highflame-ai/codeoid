@@ -422,6 +422,128 @@ describe("CodexProvider over fake-codex", () => {
     expect(seen[0]?.input.network).toEqual({ host: "example.com", protocol: "https" });
   });
 
+  it("C5 (#368): two calls to one server — the approval shows the call codex named, and pairs its result", async () => {
+    const p = makeProvider();
+    const seen: Array<{ name: string; input: Record<string, unknown>; toolId: string }> = [];
+    const events = await collect(
+      p.runTurn(
+        turnOpts("mcp-two please", {
+          canUseTool: async (toolId, _a, name, input) => {
+            seen.push({ name, input, toolId });
+            return { behavior: "allow" as const };
+          },
+        }),
+      ),
+    );
+    await p.teardown();
+    expect(seen).toEqual([{ name: "mcp__github__delete_repo", input: { repo: "x" }, toolId: "item-gh-1" }]);
+    const done = events.find((e) => e.type === "tool_complete" && (e as { sdkToolUseId?: string }).sdkToolUseId === "item-gh-1") as
+      | { output: string }
+      | undefined;
+    expect(done?.output).toBe("deleted");
+  });
+
+  it("C5b (#368): two DIFFERENT calls to one server and codex doesn't say which — declined without asking", async () => {
+    const p = makeProvider();
+    let asked = false;
+    const events = await collect(
+      p.runTurn(
+        turnOpts("mcp-two unnamed please", {
+          canUseTool: async () => {
+            asked = true;
+            return { behavior: "allow" as const };
+          },
+        }),
+      ),
+    );
+    await p.teardown();
+    expect(asked).toBe(false);
+    expect(events.some((e) => e.type === "text_done" && (e as { content?: string }).content === "gh:decline")).toBe(true);
+    const complete = events.find((e) => e.type === "tool_complete") as { success: boolean; output: string } | undefined;
+    expect(complete?.success).toBe(false);
+    expect(complete?.output).toContain("different calls to github");
+  });
+
+  it("C5c (#368): an MCP server's own question (url) is shown and declined — never accepted as a tool call", async () => {
+    const p = makeProvider();
+    let asked = false;
+    const events = await collect(
+      p.runTurn(
+        turnOpts("mcp-server-asks please", {
+          canUseTool: async () => {
+            asked = true;
+            return { behavior: "allow" as const };
+          },
+        }),
+      ),
+    );
+    await p.teardown();
+    expect(asked).toBe(false);
+    expect(events.some((e) => e.type === "text_done" && (e as { content?: string }).content === "ask:decline")).toBe(true);
+    const start = events.find((e) => e.type === "tool_start") as { name: string; input: Record<string, unknown> } | undefined;
+    expect(start?.name).toBe("mcp__github__elicitation");
+    expect(start?.input.url).toBe("https://evil.example/oauth"); // shown, not hidden
+  });
+
+  it("C5f (#368): a form elicitation without codex's approval marker is declined, never gated as a tool call", async () => {
+    // Deliberate: codex 0.154 marks its tool-call approvals with
+    // _meta.codex_approval_kind = "mcp_tool_call". A request without it is
+    // not one — even when its text looks like it.
+    const p = makeProvider();
+    let asked = false;
+    const events = await collect(
+      p.runTurn(
+        turnOpts("mcp-nokind please", {
+          canUseTool: async () => {
+            asked = true;
+            return { behavior: "allow" as const };
+          },
+        }),
+      ),
+    );
+    await p.teardown();
+    expect(asked).toBe(false);
+    expect(events.some((e) => e.type === "text_done" && (e as { content?: string }).content === "nokind:decline")).toBe(true);
+  });
+
+  it("C5d (#368): a tool name with a quote in it is read in full", async () => {
+    const p = makeProvider();
+    const names: string[] = [];
+    await collect(
+      p.runTurn(
+        turnOpts("mcp-quoted please", {
+          canUseTool: async (_t, _a, name) => {
+            names.push(name);
+            return { behavior: "deny" as const };
+          },
+        }),
+      ),
+    );
+    await p.teardown();
+    expect(names).toEqual(['mcp__srv__safe" then "rm']);
+  });
+
+  it("C5e (#368): approvals that can't be paired to a started call get distinct ids", async () => {
+    const p = makeProvider();
+    const ids: string[] = [];
+    for (const prompt of ["mcp-nostart please", "mcp-nostart again"]) {
+      await collect(
+        p.runTurn(
+          turnOpts(prompt, {
+            canUseTool: async (_t, approvalId) => {
+              ids.push(approvalId);
+              return { behavior: "deny" as const };
+            },
+          }),
+        ),
+      );
+    }
+    await p.teardown();
+    expect(ids).toHaveLength(2);
+    expect(ids[0]).not.toBe(ids[1]);
+    expect(ids.every((id) => !id.includes("turn-1"))).toBe(true);
+  });
+
   it("C3d (#369): a permissions request is answered with a grant — the requested profile, or nothing", async () => {
     for (const allow of [true, false]) {
       const p = makeProvider();

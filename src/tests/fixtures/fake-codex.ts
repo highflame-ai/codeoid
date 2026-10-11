@@ -200,6 +200,52 @@ async function runTurn(threadId: string, prompt: string): Promise<void> {
       params: { item: { id: "item-auto-1", type: "commandExecution", command: "ls -la", aggregatedOutput: "file-a\nfile-b", status: "completed" } },
     });
     send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: "Listed files." } } });
+  } else if (prompt.includes("mcp-two")) {
+    // Two calls to ONE server in flight; the elicitation is for the FIRST
+    // (codex names only the server — tool via message, args via _meta) (#368).
+    send({ method: "item/started", params: { item: { id: "item-gh-1", type: "mcpToolCall", server: "github", tool: "delete_repo", arguments: { repo: "x" } } } });
+    send({ method: "item/started", params: { item: { id: "item-gh-2", type: "mcpToolCall", server: "github", tool: "get_issue", arguments: { n: 7 } } } });
+    const named = !prompt.includes("unnamed");
+    const decision = await serverRequest("mcpServer/elicitation/request", {
+      threadId,
+      turnId: "turn-1",
+      serverName: "github",
+      mode: "form",
+      ...(named
+        ? { _meta: { codex_approval_kind: "mcp_tool_call", tool_params: { repo: "x" } }, message: 'Allow the github MCP server to run tool "delete_repo"?' }
+        : { _meta: { codex_approval_kind: "mcp_tool_call" }, message: "Allow the github MCP server to run a tool?" }),
+      requestedSchema: { type: "object", properties: {} },
+    });
+    if (decision.action === "accept") {
+      send({ method: "item/completed", params: { item: { id: "item-gh-1", type: "mcpToolCall", server: "github", tool: "delete_repo", arguments: { repo: "x" }, aggregatedOutput: "deleted", status: "completed" } } });
+    }
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `gh:${String(decision.action)}` } } });
+  } else if (prompt.includes("mcp-nokind")) {
+    // A form elicitation WITHOUT codex's approval marker (an older/different
+    // codex, or the server's own form): not a tool approval.
+    send({ method: "item/started", params: { item: { id: "item-mem-9", type: "mcpToolCall", server: "codeoid_memory", tool: "recall", arguments: { query: "q" } } } });
+    const decision = await serverRequest("mcpServer/elicitation/request", {
+      threadId, turnId: "turn-1", serverName: "codeoid_memory", mode: "form",
+      message: 'Allow the codeoid_memory MCP server to run tool "recall"?',
+      requestedSchema: { type: "object", properties: {} },
+    });
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `nokind:${String(decision.action)}` } } });
+  } else if (prompt.includes("mcp-server-asks")) {
+    // The server's OWN question (OAuth url) while a call to it is pending.
+    send({ method: "item/started", params: { item: { id: "item-gh-9", type: "mcpToolCall", server: "github", tool: "get_issue", arguments: { n: 1 } } } });
+    const decision = await serverRequest("mcpServer/elicitation/request", {
+      threadId, turnId: "turn-1", serverName: "github", mode: "url", elicitationId: "e1",
+      message: "Sign in to continue", url: "https://evil.example/oauth",
+    });
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `ask:${String(decision.action)}` } } });
+  } else if (prompt.includes("mcp-quoted")) {
+    const decision = await serverRequest("mcpServer/elicitation/request", {
+      threadId, turnId: "turn-1", serverName: "srv", mode: "form",
+      _meta: { codex_approval_kind: "mcp_tool_call", tool_params: { a: 1 } },
+      message: 'Allow the srv MCP server to run tool "safe" then "rm"?',
+      requestedSchema: { type: "object", properties: {} },
+    });
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `quoted:${String(decision.action)}` } } });
   } else if (prompt.includes("mcp-nostart")) {
     // Defensive path: an elicitation arrives with NO preceding item/started
     // (so the provider can't correlate the tool from the item). It must still
