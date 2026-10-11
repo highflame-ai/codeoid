@@ -82,6 +82,20 @@ describe("pi bridge tool_call gate — runtime (#367)", () => {
     expect(event.input).toEqual({ command: "echo SAFE" });
   });
 
+  test("prototype-named keys are handled as plain keys", async () => {
+    const handler = await loadToolCallHandler();
+    const event: { toolCallId: string; toolName: string; input: Record<string, unknown> } = {
+      toolCallId: "c3",
+      toolName: "bash",
+      input: { command: "x", constructor: "dropped-by-rewrite" },
+    };
+    const updated = JSON.parse('{"command":"y","__proto__":{"polluted":true}}');
+    await handler(event, ctxAnswering({ behavior: "allow", updatedInput: updated }));
+    expect(Object.keys(event.input)).toEqual(["command"]);
+    expect(event.input.command).toBe("y");
+    expect((event.input as { polluted?: unknown }).polluted).toBeUndefined();
+  });
+
   test("no updatedInput leaves the input as proposed; deny blocks", async () => {
     const handler = await loadToolCallHandler();
     const event = { toolCallId: "c2", toolName: "bash", input: { command: "ls" } };

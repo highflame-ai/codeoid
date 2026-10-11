@@ -613,6 +613,8 @@ describe("hook rewrite on a backend that can't apply it (#367)", () => {
     ]);
     provider.appliesToolInputRewrite = false;
     const session = makeSession(provider, undefined, { mode: "interactive" });
+    const { client, received } = makeClient();
+    session.attach(client);
     await session.send("ask", TEST_AUTH);
     for (let i = 0; i < 200 && session.pendingToolApprovals().length === 0; i++) await new Promise((r) => setTimeout(r, 10));
     expect(session.pendingToolApprovals()).toHaveLength(1);
@@ -622,6 +624,34 @@ describe("hook rewrite on a backend that can't apply it (#367)", () => {
 
     expect(provider.canUseToolResults[0]?.behavior).toBe("deny");
     expect(provider.canUseToolResults[0]?.message).toContain("answers");
-    expect(auditActions()).toContain("session.patch_refused");
+    const actions = auditActions();
+    expect(actions).toContain("session.patch_refused");
+    // The user's answer is audited (they did approve); the GATE never records
+    // the call as approved-and-running.
+    const db = new Database(join(tmp, "codeoid.db"), { readonly: true });
+    const gateApproved = db
+      .query("SELECT count(*) AS n FROM audit_log WHERE action = 'session.approve' AND detail LIKE 'tool=%'")
+      .get() as { n: number };
+    db.close();
+    expect(gateApproved.n).toBe(0);
+    // The card ends cancelled — never left showing an approved, running call.
+    const phases = received
+      .filter((m) => m.type === "session.message.delta" && m.toolStateUpdate)
+      .map((m) => (m.type === "session.message.delta" ? (m.toolStateUpdate as { phase?: string }).phase : undefined));
+    expect(phases).not.toContain("executing");
+    expect(phases.at(-1)).toBe("cancelled");
+  });
+
+  it("a hook that returns the input unchanged is not a rewrite — allowed even on such a backend", async () => {
+    const hooks = new HookBus([
+      commandEntry(`printf '{"updatedInput":{"command":"rm -rf /tmp/x"}}'`, { name: "echoer", matcher: "^Bash$" }),
+    ]);
+    const provider = new MockSessionProvider("mock-session", [bashToolTurn()]);
+    provider.appliesToolInputRewrite = false;
+    const session = makeSession(provider, hooks, { mode: "autonomous" });
+    await session.send("run it", TEST_AUTH);
+    await waitForIdle(session);
+    expect(provider.canUseToolResults[0]?.behavior).toBe("allow");
+    expect(auditActions()).not.toContain("session.hook_rewrite_refused");
   });
 });

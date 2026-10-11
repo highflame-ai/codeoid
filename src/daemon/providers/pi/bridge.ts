@@ -82,9 +82,10 @@ const BRIDGE_BASE_BODY = `  // Readiness handshake: PiProvider fails a turn clos
       // updatedInput is the WHOLE input (codeoid#367) — replace, don't merge:
       // a rewrite that drops a key must drop it from what runs too.
       for (const key of Object.keys(event.input)) {
-        if (!(key in decision.updatedInput)) delete event.input[key];
+        if (!Object.prototype.hasOwnProperty.call(decision.updatedInput, key)) delete event.input[key];
       }
       for (const key of Object.keys(decision.updatedInput)) {
+        if (key === "__proto__") continue; // never re-point event.input's prototype
         event.input[key] = decision.updatedInput[key];
       }
     }
