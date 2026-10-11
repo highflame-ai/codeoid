@@ -245,6 +245,11 @@ export class ZeroIdVerifier implements TokenVerifier {
       if (ref.kind === "kid" && err instanceof Error && /no matching jwks key/i.test(err.message)) {
         this.#knownKids.delete(ref.kid);
         this.#published.delete(ref.kid);
+        // The SDK's refetch can miss a key the issuer DOES publish (it joined
+        // a fetch in flight from before a rotation, or hit a stale replica).
+        // Re-read the key list soon rather than refusing that key for a full
+        // window — still at most one read per FAILED_FETCH_RETRY_MS.
+        this.#publishedAt = Math.min(this.#publishedAt, this.#now() - UNKNOWN_KID_COOLDOWN_MS + FAILED_FETCH_RETRY_MS);
       }
       throw err;
     }

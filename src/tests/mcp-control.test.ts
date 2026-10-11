@@ -601,19 +601,42 @@ describe("edge cases", () => {
     expect(r.text).toContain("same idempotencyKey");
   });
 
-  it("a whole tool is bounded, not just each daemon call inside it", async () => {
-    // Every call answers quickly, but the session never settles and the
-    // wait would run to its own limit: the tool deadline cuts it first.
+  it("near the whole-tool deadline, a delivered send still answers sent:true — the wait winds down first", async () => {
     const host: ControlHost = {
       handle: async (msg) =>
-        ({ type: "session.list.result", requestId: msg.id, sessions: [{ id: "s", name: "s", status: "thinking" } as SessionInfo] }) as DaemonMessage,
+        msg.type === "session.list"
+          ? ({ type: "session.list.result", requestId: msg.id, sessions: [{ id: "s", name: "s", status: "thinking" } as SessionInfo] } as DaemonMessage)
+          : ({ type: "response.ok", requestId: msg.id } as DaemonMessage),
       disconnectClient: () => {},
       audit: () => {},
     };
-    const ep = new ControlMcpHttp({ verifier, host, config: controlConfig(), toolDeadlineMs: 80, sleep: (ms) => new Promise((r) => setTimeout(r, Math.min(ms, 10))) });
-    const r = await call(ep, "tok-owner", "wait_for_session", { session: "s", timeoutSeconds: 20 });
+    // Wind-down fires 5 s before the deadline, so with a 5.2 s deadline the
+    // wait is told to stop at ~0.2 s and the hard cut never lands.
+    const ep = new ControlMcpHttp({ verifier, host, config: controlConfig(), toolDeadlineMs: 5_200, sleep: (ms) => new Promise((r) => setTimeout(r, Math.min(ms, 20))) });
+    const r = await call(ep, "tok-owner", "send_message", { session: "s", text: "x", wait: true, timeoutSeconds: 20 });
+    expect(r.isError).toBe(false);
+    expect(r.data).toMatchObject({ sent: true, outcome: "still_working" });
+  });
+
+  it("a whole tool is bounded, not just each daemon call inside it", async () => {
+    // Each daemon call is under its own deadline, but together they run past
+    // the tool's — and a transcript read doesn't watch the wind-down signal,
+    // so the hard cut is what ends it.
+    const host: ControlHost = {
+      handle: async (msg) => {
+        if (msg.type === "session.list") {
+          return { type: "session.list.result", requestId: msg.id, sessions: [{ id: "s", name: "s", status: "idle" } as SessionInfo] } as DaemonMessage;
+        }
+        await new Promise((r) => setTimeout(r, 200));
+        return { type: "scrollback.page.result", requestId: msg.id, sessionId: "s", messages: [], hasMore: false, source: "buffer" } as unknown as DaemonMessage;
+      },
+      disconnectClient: () => {},
+      audit: () => {},
+    };
+    const ep = new ControlMcpHttp({ verifier, host, config: controlConfig(), callDeadlineMs: 1_000, toolDeadlineMs: 80 });
+    const r = await call(ep, "tok-owner", "read_transcript", { session: "s" });
     expect(r.isError).toBe(true);
-    expect(r.text).toContain("wait_for_session did not finish within");
+    expect(r.text).toContain("read_transcript did not finish within");
   });
 
   it("an internal throw becomes an isError result, not a 500", async () => {

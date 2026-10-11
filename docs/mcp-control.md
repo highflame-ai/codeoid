@@ -96,6 +96,7 @@ A typical CI step: `create_session`, then `send_message` with `wait: true`, then
 - `wait_failed`: the prompt was delivered, but waiting for it failed (`error` says why). Do not resend; follow up with `wait_for_session`.
 
 Once the prompt has been delivered, `send_message` always reports `sent: true`, even if waiting fails afterwards, so a retry never delivers it twice.
+If the daemon does not confirm the send in time, the tool fails with `send_unconfirmed`: the prompt may still be delivered, so retry only with the same `idempotencyKey`.
 
 Each caller may hold 16 waits at once; past that, poll `get_session` instead.
 

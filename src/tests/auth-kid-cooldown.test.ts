@@ -107,6 +107,57 @@ describe("ZeroIdVerifier — forged-kid bound", () => {
     expect(await h.v.verify(jwt("k2"))).toEqual(CTX);
   });
 
+  it("an SDK miss on a key the issuer still publishes (stale replica) heals within a second, not a window", async () => {
+    let now = 0;
+    let sdkStale = true; // the SDK's refetch misses k2 once; the issuer publishes it
+    let reads = 0;
+    const v = new ZeroIdVerifier(
+      { baseUrl: "http://zeroid.test" },
+      {
+        now: () => now,
+        fetchKids: async () => {
+          reads++;
+          return new Set(["k2"]);
+        },
+        verify: async () => {
+          if (sdkStale) {
+            sdkStale = false;
+            throw new Error("No matching JWKS key found for this token");
+          }
+          return CTX;
+        },
+      },
+    );
+    await expect(v.verify(jwt("k2"))).rejects.toThrow("No matching JWKS key");
+    now += FAILED_FETCH_RETRY_MS;
+    expect(await v.verify(jwt("k2"))).toEqual(CTX); // re-read after 1 s, not refused for 10
+    expect(reads).toBe(2);
+  });
+
+  it("reads the key list from the same URL the SDK verifies against", async () => {
+    // The SDK strips ONE trailing slash from baseUrl; with `//` the two must
+    // still agree, or the gate's inventory describes the wrong key set.
+    const seen: string[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      seen.push(String(url));
+      return new Response(JSON.stringify({ keys: [] }), { status: 200 });
+    }) as typeof fetch;
+    try {
+      for (const base of ["http://zeroid.test", "http://zeroid.test/", "http://zeroid.test//"]) {
+        const v = new ZeroIdVerifier({ baseUrl: base }, { verify: async () => CTX });
+        await v.verify(jwt("k")).catch(() => {});
+      }
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    expect(seen).toEqual([
+      "http://zeroid.test/.well-known/jwks.json",
+      "http://zeroid.test/.well-known/jwks.json",
+      "http://zeroid.test//.well-known/jwks.json", // as the SDK: `//` → one slash stripped
+    ]);
+  });
+
   it("a fresh key list also prunes trusted keys it no longer contains", async () => {
     const h = harness(["k1"]);
     expect(await h.v.verify(jwt("k1"))).toEqual(CTX);

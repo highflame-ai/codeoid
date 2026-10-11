@@ -89,6 +89,8 @@ const WAIT_POLL_MS = 500;
  * against abuse.
  */
 export const MAX_WAITS_PER_SUBJECT = 16;
+/** How long before the whole-tool deadline a tool is told to wind down. */
+const TOOL_WIND_DOWN_MS = 5_000;
 
 /** What the endpoint needs from the daemon — narrow on purpose, so the
  *  unit tests can stand it up without a SessionManager. */
@@ -924,9 +926,10 @@ export class ControlMcpHttp {
     const name = typeof params.name === "string" ? params.name.slice(0, 64) : "";
     const tool = this.#tools.find((t) => t.name === name);
     const clientId = `mcp-control:${randomUUID()}`;
+    const toolAbort = new AbortController();
     const ctx: CallContext = {
       auth,
-      signal,
+      signal: AbortSignal.any([signal, toolAbort.signal]),
       admitWait: () => {
         const live = this.#waits.get(auth.sub) ?? 0;
         if (live >= MAX_WAITS_PER_SUBJECT) {
@@ -1004,6 +1007,11 @@ export class ControlMcpHttp {
     // One bound for the whole tool, on top of the per-call deadline: a tool is
     // several daemon calls (resolve, send, a wait, a page read), and with the
     // connection's idle timeout lifted, their sum is what holds the socket.
+    // Shortly before the hard cut, signal the tool to wind down: a wait loop
+    // sees the abort on its next poll and returns `still_working`, so a
+    // `send_message` whose prompt was delivered still answers `sent: true`
+    // rather than being cut into a bare timeout error.
+    const windDown = setTimeout(() => toolAbort.abort(), Math.max(0, this.#toolDeadlineMs - TOOL_WIND_DOWN_MS));
     let toolTimer: ReturnType<typeof setTimeout> | undefined;
     const toolDeadline = new Promise<never>((_, reject) => {
       toolTimer = setTimeout(
@@ -1018,6 +1026,7 @@ export class ControlMcpHttp {
       return result(`internal: ${err instanceof Error ? err.message : String(err)}`, true, "internal");
     } finally {
       clearTimeout(toolTimer);
+      clearTimeout(windDown);
       this.#host.disconnectClient(clientId);
     }
   }
