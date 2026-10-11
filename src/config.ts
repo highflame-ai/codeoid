@@ -545,6 +545,49 @@ const DispatchSchema = z
   });
 
 /**
+ * Outward control-plane MCP endpoint (`/mcp/control`, docs/mcp-control.md):
+ * lets an EXTERNAL agent (Claude Code, Cursor, a CI job) drive codeoid
+ * sessions over MCP Streamable HTTP.
+ *
+ * Default OFF, and even when on, read-only unless `allowActions` — the
+ * fleet.ts READ/SEND split applied to an outside caller. Every call still
+ * authorizes through the same ZeroID verifier and per-message scope checks
+ * as a WebSocket client; this block only narrows what is reachable.
+ */
+const McpControlSchema = z
+  .object({
+    /** Mount `/mcp/control` at all. Off = the path 404s. */
+    enabled: z.boolean().default(false),
+    /**
+     * Expose the send-class tools (create / send / interrupt / destroy).
+     * Off = observe only (list, status, transcript, usage).
+     */
+    allowActions: z.boolean().default(false),
+    /**
+     * Accept only delegated agent tokens (delegation depth >= 1), so every
+     * external caller is its own principal in the ZeroID delegation tree —
+     * attributable, attenuated, and revocable on its own — rather than
+     * borrowing a human's token.
+     */
+    requireDelegated: z.boolean().default(false),
+    /**
+     * Browser origins allowed to call the endpoint. Empty (default) = any
+     * request carrying an `Origin` header is refused, which closes DNS
+     * rebinding; MCP clients that are not browsers send no Origin.
+     */
+    allowedOrigins: z.array(z.string()).default([]),
+    /** Upper bound for `wait_for_session`, in seconds. */
+    maxWaitSeconds: z.number().int().min(1).max(600).default(120),
+  })
+  .default({
+    enabled: false,
+    allowActions: false,
+    requireDelegated: false,
+    allowedOrigins: [],
+    maxWaitSeconds: 120,
+  });
+
+/**
  * Collaborative-session bounds (docs/collaborative-session-design.md §11 P3).
  *
  * `MAX_COLLABORATION_CHILDREN` already caps ONE goal at 12. Nothing capped the
@@ -983,6 +1026,7 @@ const RootSchema = z.object({
   session: SessionSchema,
   conductor: ConductorSchema,
   dispatch: DispatchSchema,
+  mcpControl: McpControlSchema,
   collaboration: CollaborationSchema,
   rateLimit: RateLimitSchema,
   pipeline: PipelineSchema,
@@ -1019,6 +1063,9 @@ type ParsedConfig = z.infer<typeof RootSchema>;
  * Flattened, path-resolved config consumed by the daemon + client. Shape is
  * append-only — add new fields here, don't rename existing ones.
  */
+/** Parsed `mcpControl` block (see McpControlSchema). */
+export type McpControlConfig = z.infer<typeof McpControlSchema>;
+
 export interface CodeoidConfig {
   /** Daemon WebSocket URL. */
   daemonUrl: string;
@@ -1164,6 +1211,11 @@ export interface CodeoidConfig {
     maxSessionsPerUser: number;
     maxCreationsPerHour: number;
   };
+  /**
+   * Outward control-plane MCP endpoint (see McpControlSchema). Optional in the
+   * type so hand-built test configs stay minimal; absent = disabled.
+   */
+  mcpControl?: McpControlConfig;
   dispatch?: {
     enabled: boolean;
     tickMs: number;
@@ -1346,6 +1398,10 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   // without touching config.json. Other dispatch knobs are file-config only,
   // matching the conductor block's convention.
   { env: "CODEOID_DISPATCH_ENABLED", path: "dispatch.enabled", kind: "boolean" },
+  // Control-plane MCP switches — per-invocation, e.g. a CI runner that turns
+  // the endpoint on for one job. The rest of the block is file-config only.
+  { env: "CODEOID_MCP_CONTROL_ENABLED", path: "mcpControl.enabled", kind: "boolean" },
+  { env: "CODEOID_MCP_CONTROL_ACTIONS", path: "mcpControl.allowActions", kind: "boolean" },
   { env: "CODEOID_MAX_SESSIONS_PER_USER", path: "rateLimit.maxSessionsPerUser", kind: "int" },
   { env: "CODEOID_MAX_SESSIONS_PER_HOUR", path: "rateLimit.maxCreationsPerHour", kind: "int" },
   // Pipeline enable/kill switch — turn the SDLC pipeline on/off per-invocation
@@ -1576,6 +1632,7 @@ export function loadConfig(opts: LoadOptions = {}): CodeoidConfig {
     session: parsed.session,
     conductor: parsed.conductor,
     dispatch: parsed.dispatch,
+    mcpControl: parsed.mcpControl,
     collaboration: parsed.collaboration,
     rateLimit: parsed.rateLimit,
     pipeline: parsed.pipeline,

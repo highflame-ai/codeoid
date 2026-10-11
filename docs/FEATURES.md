@@ -372,6 +372,13 @@ Append-only. The advisory lands after the reusable request prefix and invalidate
 
 > The **Model Experience** / **KV Cache effect** headings are a convention borrowed from DeepSeek Harness (see [prior-art-deepseek-harness.md](./prior-art-deepseek-harness.md) §4.9). Any feature that changes what the model sees should state both: what reaches the model, and whether it invalidates the prompt prefix. For a harness, prefix stability *is* cost.
 
+### Driven by other agents (MCP)
+
+Claude Code, Cursor, or a CI job can drive codeoid over MCP at `/mcp/control`: list sessions, read their transcripts and usage, and (when allowed) create and prompt them, then wait for the reply.
+Every call goes through the same token check, scope check, and tenancy check as a WebSocket client, and is audited under the caller's identity.
+There is no approve tool, so what the session's agent then does still needs its owner's approval.
+`codeoid mcp config` prints a ready entry for `.mcp.json`. Off by default — see [mcp-control.md](mcp-control.md).
+
 ### Web UI
 
 Mobile-first SolidJS SPA at `http://localhost:7400/ui/`. Also works as a Telegram Mini App:

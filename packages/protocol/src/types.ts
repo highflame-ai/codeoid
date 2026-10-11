@@ -339,6 +339,13 @@ export interface SessionInfo {
     message?: string;
     options?: string[];
   };
+  /**
+   * A prompt has been accepted but its turn has not started yet (hooks, the
+   * turn checkpoint, identity registration are still running). The session can
+   * read `idle` in this window, so a caller waiting for a reply must treat
+   * `turnQueued` as work. Absent = nothing queued (and on older daemons).
+   */
+  turnQueued?: true;
   /** Remaining turns budget for autonomous mode (undefined = unbounded, 0 = exhausted). */
   turnsRemaining?: number;
   /** Files pinned to the session — prepended to every turn's prompt. */
@@ -1233,8 +1240,14 @@ export interface SessionCreateMsg extends BaseClientMsg {
 export interface ScrollbackPageMsg extends BaseClientMsg {
   type: "scrollback.page";
   sessionId: string;
-  /** The OLDEST messageId the client currently holds — pages end before it. */
-  beforeMessageId: string;
+  /**
+   * The OLDEST messageId the client currently holds — pages end before it.
+   * Absent = the NEWEST page: the latest history that fits the budget. Lets a
+   * client that never attached (one-shot CLI, the `/mcp/control` endpoint)
+   * read a session's recent transcript, then page older with the oldest id it
+   * got back.
+   */
+  beforeMessageId?: string;
   /** Soft byte budget for the page (defaults ~256 KiB, daemon-clamped). */
   maxBytes?: number;
 }
@@ -2725,7 +2738,8 @@ export interface SessionInfoUpdateMsg {
  * which degrades gracefully rather than crashing.
  */
 /** Answer to `scrollback.page` — a window of history strictly OLDER than the
- * requested anchor, oldest→newest. Clients PREPEND (upsert by messageId). */
+ * requested anchor (or the newest window when no anchor was sent),
+ * oldest→newest. Clients PREPEND (upsert by messageId). */
 export interface ScrollbackPageResultMsg {
   type: "scrollback.page.result";
   requestId: string;

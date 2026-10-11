@@ -167,7 +167,15 @@ codeoid send <n> <m> # one-shot message
 codeoid interrupt <n>
 codeoid approve <n> [--deny] [--pick N | --id <approvalId>] [--yes]
 codeoid destroy <n>
+codeoid mcp config [--scopes observe|operate|full]  # MCP client entry for /mcp/control
+codeoid mcp headers [--scopes …]                    # fresh bearer header (an MCP headersHelper)
 ```
+
+`/mcp/control` (off by default, `mcpControl.*`) lets external agents drive
+sessions over MCP. Every tool call is an ordinary `ClientMessage` run through
+`SessionManager.handle`, so it shares the WebSocket path's verifier, scopes,
+tenancy, and audit. Keep authorization in `handle`; the endpoint may only
+narrow what is reachable, never grant. See docs/mcp-control.md.
 
 ## Config
 

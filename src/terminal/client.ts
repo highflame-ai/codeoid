@@ -6,7 +6,6 @@
 
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
-import { resolveLocalToken } from "../config.js";
 import type { CodeoidConfig } from "../config.js";
 import { PIPELINE_INPUT_REQUEST_PREFIX, PROTOCOL_VERSION } from "../protocol/types.js";
 import type {
@@ -19,7 +18,7 @@ import type {
   SessionInfo,
   SessionApproveOutcome,
 } from "../protocol/types.js";
-import { ALL_SCOPES_STRING } from "../protocol/scopes.js";
+import { acquireToken, TokenError } from "./token.js";
 import { sanitizeTerminalOutput } from "../tui/ansi/codes.js";
 import { formatPackList, formatPackShow } from "./pack-format.js";
 import { formatPipeline, haltedRequestId } from "./pipeline-format.js";
@@ -1265,59 +1264,17 @@ export class TerminalClient {
   }
 
   async #getToken(): Promise<string> {
-    // Local mode first: a token published for THIS daemon's port means a
-    // `--local` daemon is listening there right now, which is a stronger signal
-    // about what it will accept than a durable apiKey in config.json (see
-    // resolveLocalToken). Zero setup — this is what makes `codeoid start
-    // --local` + `codeoid tui` work with no copy-paste.
-    const localToken = resolveLocalToken(this.#config.daemonUrl);
-    if (localToken) return localToken;
-
-    const token = this.#config.apiKey;
-    if (!token) {
-      console.error("No API key configured.\n");
-      console.error("  Set CODEOID_API_KEY environment variable");
-      console.error("  Or add apiKey to ~/.codeoid/config.json");
-      console.error("  Or run: codeoid login");
-      console.error("  Or, to try codeoid with no account at all: codeoid start --local\n");
+    // Local mode first, then the API key (exchanged at ZeroID) — see
+    // acquireToken. A missing or rejected credential ends the command with the
+    // operator-facing explanation rather than a stack trace.
+    try {
+      return (await acquireToken(this.#config)).token;
+    } catch (err) {
+      if (!(err instanceof TokenError)) throw err;
+      for (const line of err.lines) console.error(line);
+      console.error("");
       process.exit(1);
     }
-
-    if (token.startsWith("zid_sk_")) {
-      let resp: Response;
-      try {
-        resp = await fetch(`${this.#config.zeroidUrl}/oauth2/token`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            grant_type: "api_key",
-            api_key: token,
-            scope: ALL_SCOPES_STRING,
-          }),
-        });
-      } catch (err) {
-        console.error(`Cannot reach ZeroID at ${this.#config.zeroidUrl}`);
-        console.error(`  Is ZeroID running? Try: curl ${this.#config.zeroidUrl}/health\n`);
-        process.exit(1);
-      }
-
-      if (!resp.ok) {
-        const body = await resp.json().catch(() => ({})) as { error?: string; error_description?: string };
-        if (resp.status === 400 || resp.status === 401) {
-          console.error("Authentication failed — API key is invalid or expired.\n");
-          if (body.error_description) console.error(`  ${body.error_description}`);
-          console.error("  Re-register your agent in ZeroID or check CODEOID_API_KEY\n");
-        } else {
-          console.error(`Token exchange failed (${resp.status}): ${body.error_description ?? body.error ?? "unknown"}`);
-        }
-        process.exit(1);
-      }
-
-      const data = (await resp.json()) as { access_token: string };
-      return data.access_token;
-    }
-
-    return token;
   }
 
   #formatStatus(status: string): string {
