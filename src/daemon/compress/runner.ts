@@ -19,6 +19,7 @@ import type {
 } from "./types.js";
 import type { CompressionRegistry } from "./registry.js";
 import { formatHint } from "./hint.js";
+import { writeSpill } from "./spill.js";
 
 /** Hard cap on raw bytes buffered before truncation. 10 MiB. */
 export const MAX_RAW_BYTES = 10 * 1024 * 1024;
@@ -36,6 +37,11 @@ export interface RunOptions {
    * Default false — piping is risky to rewrite without breaking semantics.
    */
   compressPipes: boolean;
+  /**
+   * Where to spill the raw output of a compressed command so memory can keep
+   * it (spill.ts). Absent = no spill; the hint then says the raw is gone.
+   */
+  spillDir?: string;
 }
 
 /**
@@ -108,7 +114,10 @@ export async function runCompressed(opts: RunOptions): Promise<CompressionOutcom
     };
   }
 
-  const hint = result.hint ?? formatHint(result, opts.command);
+  const rawId = opts.spillDir ? writeSpill(rawText, opts.spillDir) : null;
+  const hint = result.hint
+    ? withRawRef(result.hint, rawId)
+    : formatHint(result, opts.command, rawId);
   const finalText = hint ? `${result.compressed}\n\n${hint}` : result.compressed;
   const finalBytes = Buffer.byteLength(finalText, "utf8");
 
@@ -124,6 +133,13 @@ export async function runCompressed(opts: RunOptions): Promise<CompressionOutcom
 }
 
 // ── Internals ────────────────────────────────────────────────────────────
+
+/** Add the spill reference to a rule's own hint line, inside its brackets, so
+ *  the daemon can find the raw output (spill.ts matches the trailing hint). */
+function withRawRef(hint: string, rawId: string | null): string {
+  if (!rawId || !hint.endsWith("]")) return hint;
+  return `${hint.slice(0, -1)}; full output in memory (raw=${rawId})]`;
+}
 
 interface CapturedStream {
   text: string;

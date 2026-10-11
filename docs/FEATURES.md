@@ -116,11 +116,16 @@ Claude
 
 ### Cross-session memory
 
-Codeoid records every tool call, result, and reasoning block as an **episode** — stored verbatim, never summarized, retrievable via hybrid search. Claude gains three tools:
+Codeoid records every tool call, result, and reasoning block as an **episode** — stored verbatim, never summarized or truncated, retrievable via hybrid search. Every backend gets four tools:
 
 - `recall(query)` — semantic + keyword search across all prior sessions in this workspace
-- `recall_file(path)` — check if a file was read recently; skip the re-read if cached
+- `recall_file(path)` — past episodes that touched a file
 - `timeline(limit)` — chronological list of recent activity across sessions
+- `get_episode(id)` — the full verbatim content of one episode, paged for long ones
+
+**Nothing is cut.** A tool result of any size is kept whole, zstd-compressed (a 10 MiB build log stores in about 5 ms at ~5% of its size). What gets full-text indexed and embedded is a bounded view of it — the head, the tail, and the error/warning lines from the middle — so a huge output never stalls the daemon while SQLite indexes it. When [output compression](#context-reduction-stack) shortens a command's output for the agent, memory stores the uncompressed original.
+
+**Semantic recall** embeds each episode in up to 8 windows (`memory.embeddings.maxWindows`), placed on the head, the tail and diagnostic lines, and scores an episode by its best window — so a failure deep in a long log is findable by meaning. Embedding runs on a worker thread, off the daemon's event loop. Turn it off with `memory.embeddings.enabled: false` (`CODEOID_MEMORY_EMBEDDINGS=0`): the model is never downloaded or loaded, and recall runs on full-text search alone.
 
 Memory is **workspace-scoped via `git rev-parse --git-common-dir`**, so all [git worktrees](#parallel-sessions--git-worktrees) of the same repo share one workspace — feature branches inherit the main line's knowledge.
 
@@ -271,7 +276,7 @@ A homegrown RTK-style compressor that routes Bash tool invocations through a dae
 - `PreToolUse` hook rewrites `Bash({ command: "git diff HEAD~5" })` → `Bash({ command: "bun …/wrapper.ts --b64 …" })`
 - Wrapper runs the real command, captures stdout, applies declarative rules (`git-diff` collapses long unchanged context, `git-status` elides huge untracked-files lists, `test-runner` drops passing-test noise, `ls`/`cat`/`find`/`grep` summarize by extension/dir/file), 60–90% reduction on shell-heavy turns
 - Stderr **never** compressed (error fidelity matters)
-- Raw output lives in our verbatim memory store — Claude can `recall(query)` to retrieve the original bytes if the compressed version dropped something it needs
+- Raw output lives in our verbatim memory store — the wrapper spills it to a private file named in the hint line (`raw=<id>`), and the daemon stores it in the episode in place of the compressed text, so `recall` + `get_episode` return the original bytes
 
 Rule format is declarative TypeScript:
 

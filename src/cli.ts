@@ -123,6 +123,7 @@ program
               dbPath: config.memory.dbPath,
               model: config.memory.model,
               modelCacheDir: config.memory.modelCacheDir,
+              embeddings: config.memory.embeddings,
             }
           : undefined,
         // Forward the full config so session-level features (compress, etc.)

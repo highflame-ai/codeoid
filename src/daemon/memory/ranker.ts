@@ -34,6 +34,10 @@ export const DEFAULT_WEIGHTS: RankerWeights = {
 
 export interface RankInputs {
   queryVector: Float32Array | null;
+  /** Best per-window cosine per episode, from the candidate scan. Takes
+   *  precedence over the episode's window-0 embedding: a long episode's
+   *  match can sit in any of its windows. */
+  vectorScores?: Map<string, number>;
   ftsHits: Map<string, number>; // episode id → raw bm25 score (lower = more relevant)
   queryFilePaths: string[];
   now: number; // unix ms
@@ -49,7 +53,7 @@ export function rank(
   inputs: RankInputs,
 ): RecallHit[] {
   const weights = inputs.weights ?? DEFAULT_WEIGHTS;
-  const { queryVector, ftsHits, queryFilePaths, now } = inputs;
+  const { queryVector, vectorScores, ftsHits, queryFilePaths, now } = inputs;
 
   // Normalize FTS bm25 scores. sqlite's bm25() returns negative values where
   // more negative = more relevant. Flip sign and min-max normalize to [0,1].
@@ -61,8 +65,13 @@ export function rank(
   const hits: RecallHit[] = [];
 
   for (const ep of candidates) {
+    const windowBest = vectorScores?.get(ep.id);
     const vectorScore =
-      queryVector && ep.embedding ? Math.max(0, cosine(queryVector, ep.embedding)) : 0;
+      windowBest !== undefined
+        ? Math.max(0, windowBest)
+        : queryVector && ep.embedding
+          ? Math.max(0, cosine(queryVector, ep.embedding))
+          : 0;
 
     const rawBm25 = ftsHits.get(ep.id);
     const ftsScore =

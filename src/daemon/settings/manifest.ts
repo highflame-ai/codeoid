@@ -184,6 +184,18 @@ const memory: SettingsTab = {
           placeholder: "Xenova/bge-small-en-v1.5",
           advanced: true,
         }),
+        cfg("memory.embeddings.enabled", "Semantic recall", "Embed episodes so recall matches by meaning, not just keywords. Off skips the model entirely and recall runs on full-text search alone.", {
+          kind: "boolean",
+          envVar: "CODEOID_MEMORY_EMBEDDINGS",
+          default: true,
+        }),
+        cfg("memory.embeddings.maxWindows", "Embedding windows per episode", "How many ~1600-character slices of a long episode get embedded. More finds matches deeper in long tool output, at about 45 ms of background CPU each.", {
+          kind: "int",
+          default: 8,
+          min: 1,
+          max: 64,
+          advanced: true,
+        }),
         cfg("memory.modelCacheDir", "Model cache dir", "Where embedding weights are cached.", {
           envVar: "CODEOID_MEMORY_CACHE_DIR",
           default: "models",

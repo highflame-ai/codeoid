@@ -98,6 +98,9 @@ CODEOID_MEMORY_DB_PATH=~/.codeoid/memory.db
 CODEOID_MEMORY_MODEL=Xenova/bge-small-en-v1.5   # HF model id
 CODEOID_MEMORY_CACHE_DIR=~/.codeoid/models
 CODEOID_MEMORY_CLUSTERS=0               # k-means topic clusters in workspace index
+CODEOID_MEMORY_EMBEDDINGS=1             # semantic recall; 0 = keyword-only, model never loaded
+                                        #   (memory.embeddings.maxWindows, default 8, in config.json:
+                                        #   embedding slices per long episode)
 
 # Workspace index (always-in-context memory pointer)
 CODEOID_WORKSPACE_INDEX=1               # auto-injected into system prompt
