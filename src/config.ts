@@ -488,6 +488,14 @@ const AuthSchemaFields = z
 const OAuthSchemaFields = z
   .object({
     clientId: z.string().optional(),
+    /**
+     * client_id codeoid authenticates as at ZeroID for the id_token exchange.
+     * ZeroID only lets the relying party an ID token was issued to redeem it
+     * (aud/azp), so this must be the client the IdP issued the ID token to.
+     * Defaults to GOOGLE_CLIENT_ID. Its secret comes from
+     * CODEOID_ZEROID_CLIENT_SECRET (env only, never config.json).
+     */
+    zeroidClientId: z.string().optional(),
   })
   .default({});
 
@@ -1312,6 +1320,7 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   { env: "ZEROID_ISSUER", path: "auth.issuer", kind: "string" },
   { env: "ZEROID_AUDIENCE", path: "auth.audience", kind: "string" },
   { env: "CODEOID_OAUTH_CLIENT_ID", path: "oauth.clientId", kind: "string" },
+  { env: "CODEOID_ZEROID_CLIENT_ID", path: "oauth.zeroidClientId", kind: "string" },
   { env: "ZEROID_ACCOUNT_ID", path: "agentIdentity.accountId", kind: "string" },
   { env: "ZEROID_PROJECT_ID", path: "agentIdentity.projectId", kind: "string" },
   { env: "ZEROID_REGISTRAR_KEY", path: "agentIdentity.registrarKey", kind: "string" },
@@ -1487,6 +1496,8 @@ export function loadConfig(opts: LoadOptions = {}): CodeoidConfig {
     ? {
         zeroidTokenEndpoint: `${resolvedZeroidUrl}/oauth2/token`,
         clientId: parsed.oauth.clientId ?? "codeoid",
+        zeroidClientId: parsed.oauth.zeroidClientId ?? googleClientId,
+        zeroidClientSecret: env.CODEOID_ZEROID_CLIENT_SECRET || undefined,
         googleClientId,
         googleClientSecret,
         accountId: parsed.agentIdentity.accountId,

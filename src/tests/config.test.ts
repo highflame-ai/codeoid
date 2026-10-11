@@ -151,6 +151,29 @@ describe("loadConfig — registrar key + tenant", () => {
   });
 });
 
+describe("loadConfig — ZeroID client for the id_token exchange", () => {
+  it("defaults to the Google client id, the client the ID token is issued to", () => {
+    const c = loadConfig({ configPath, env: { GOOGLE_CLIENT_ID: "gid", GOOGLE_CLIENT_SECRET: "gsec" } });
+    expect(c.oauth?.zeroidClientId).toBe("gid");
+    expect(c.oauth?.zeroidClientSecret).toBeUndefined();
+    expect(c.oauth?.clientId).toBe("codeoid");
+  });
+
+  it("takes an explicit client id and the secret from env", () => {
+    const c = loadConfig({
+      configPath,
+      env: {
+        GOOGLE_CLIENT_ID: "gid",
+        GOOGLE_CLIENT_SECRET: "gsec",
+        CODEOID_ZEROID_CLIENT_ID: "zeroid-client",
+        CODEOID_ZEROID_CLIENT_SECRET: "zsec",
+      },
+    });
+    expect(c.oauth?.zeroidClientId).toBe("zeroid-client");
+    expect(c.oauth?.zeroidClientSecret).toBe("zsec");
+  });
+});
+
 describe("loadConfig — env precedence", () => {
   it("env overrides file on every field type", () => {
     writeConfig({

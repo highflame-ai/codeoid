@@ -258,6 +258,14 @@ export class DaemonServer {
       });
       this.#oauthHandler = new OAuthHandler(config.oauth, idp);
       console.log(`[codeoid] auth provider: ${idp.name}`);
+      if (!config.oauth.zeroidClientSecret) {
+        // ZeroID v1.12+ refuses an id_token exchange from an unauthenticated
+        // client. Warn rather than fail so codeoid still starts against an
+        // older ZeroID that does not require it.
+        console.warn(
+          `[codeoid] CODEOID_ZEROID_CLIENT_SECRET is not set: ZeroID v1.12+ will refuse Google sign-in (register a confidential client "${config.oauth.zeroidClientId}" at ZeroID and set its secret)`,
+        );
+      }
     } else if (config.oauth) {
       console.warn("[codeoid] local mode: Google OAuth sign-in disabled (it needs ZeroID)");
     }
