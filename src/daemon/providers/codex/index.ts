@@ -461,6 +461,7 @@ export class CodexProvider implements SessionProvider {
     this.#announcedItems.clear();
     this.#declinedItems.clear();
     this.#startedItems.clear();
+    this.#pendingMcpCalls.clear();
     this.#openSubApprovals.clear();
     this.#completedParents.clear();
     this.#approvalsInFlight.clear();
@@ -520,6 +521,7 @@ export class CodexProvider implements SessionProvider {
   }
 
   async teardown(): Promise<void> {
+    this.#pendingMcpCalls.clear();
     this.#turnQueue?.close();
     this.#turnQueue = null;
     this.#proc?.kill();
@@ -640,13 +642,15 @@ export class CodexProvider implements SessionProvider {
     serverName: string,
     params: Record<string, unknown>,
   ): { tool: string; input: Record<string, unknown>; itemId: string; unshowable?: string } {
-    const eTool = mcpToolFromMessage(params.message);
+    const eTool = mcpToolFromMessage(params.message, serverName);
     const eArgs = elicitedToolParams(params);
     const list = this.#pendingMcpCalls.get(serverName) ?? [];
     const matches = list.filter(
       (c) => (eTool === null || c.tool === eTool) && (eArgs === undefined || Bun.deepEquals(c.input, eArgs)),
     );
-    const synthetic = String(params.turnId ?? randomUUID());
+    // Unique per request — never the turn id, which every request in a turn
+    // shares: two approvals on one id would let one answer settle the other.
+    const synthetic = `mcp-${randomUUID()}`;
     const take = (c: (typeof list)[number]) => {
       list.splice(list.indexOf(c), 1);
       if (list.length === 0) this.#pendingMcpCalls.delete(serverName);
@@ -940,6 +944,29 @@ export class CodexProvider implements SessionProvider {
         // Fail closed: an approval with no gate wired is declined, never run.
         if (!canUseTool) return { action: "decline" };
         const serverName = String(params.serverName ?? "");
+        // The same method carries an MCP server's OWN questions (a form, an
+        // OAuth url) — only codex's tool-call approval is a tool approval.
+        // Anything else is shown for what it is and declined: answering it as
+        // a tool call would accept a url nobody saw (#368).
+        const meta = params._meta as Record<string, unknown> | undefined;
+        const isToolApproval = (params.mode === undefined || params.mode === "form") && meta?.codex_approval_kind === "mcp_tool_call";
+        if (!isToolApproval) {
+          const askId = `mcp-ask-${randomUUID()}`;
+          const shown: Record<string, unknown> = {
+            ...(typeof params.message === "string" ? { message: params.message } : {}),
+            ...(typeof params.url === "string" ? { url: params.url } : {}),
+            ...(params.mode !== undefined ? { mode: params.mode } : {}),
+          };
+          this.#push({ type: "tool_start", toolId: askId, sdkToolUseId: askId, name: `mcp__${serverName}__elicitation`, input: shown, approvalId: `codex-${askId}` });
+          this.#push({
+            type: "tool_complete",
+            sdkToolUseId: askId,
+            output: `Declined — ${serverName} asked a question of its own; answering MCP server questions isn't supported on codex yet`,
+            success: false,
+            declinedByBackend: true,
+          });
+          return { action: "decline" };
+        }
         const { tool, input, itemId, unshowable } = this.#resolveElicitedCall(serverName, params);
         const name = `mcp__${serverName}__${tool}`;
         // Announce so scrollback shows the real tool; keyed by the mcpToolCall
@@ -998,10 +1025,18 @@ export class CodexProvider implements SessionProvider {
 
 /** Recover the MCP tool name from the elicitation `message` when the preceding
  *  item/started wasn't observed (defensive): `…run tool "recall"?` → `recall`. */
-function mcpToolFromMessage(message: unknown): string | null {
+/**
+ * The tool an approval elicitation names: codex's template is
+ * `Allow the <server> MCP server to run tool "<tool>"?`. Matched as a whole
+ * and anchored at the end, so a tool name containing a quote is read in full
+ * rather than cut at its first `"` (#368).
+ */
+function mcpToolFromMessage(message: unknown, serverName?: string): string | null {
   if (typeof message !== "string") return null;
-  const m = message.match(/run tool "([^"]+)"/);
-  return m ? m[1] : null;
+  const m = message.match(/^Allow the (.+) MCP server to run tool "(.+)"\?$/s);
+  if (m) return serverName === undefined || m[1] === serverName ? (m[2] ?? null) : null;
+  const loose = message.match(/run tool "(.+)"\?\s*$/s);
+  return loose ? (loose[1] ?? null) : null;
 }
 
 /** The tool arguments an elicitation carries (`_meta.tool_params`), or

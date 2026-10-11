@@ -464,6 +464,65 @@ describe("CodexProvider over fake-codex", () => {
     expect(complete?.output).toContain("different calls to github");
   });
 
+  it("C5c (#368): an MCP server's own question (url) is shown and declined — never accepted as a tool call", async () => {
+    const p = makeProvider();
+    let asked = false;
+    const events = await collect(
+      p.runTurn(
+        turnOpts("mcp-server-asks please", {
+          canUseTool: async () => {
+            asked = true;
+            return { behavior: "allow" as const };
+          },
+        }),
+      ),
+    );
+    await p.teardown();
+    expect(asked).toBe(false);
+    expect(events.some((e) => e.type === "text_done" && (e as { content?: string }).content === "ask:decline")).toBe(true);
+    const start = events.find((e) => e.type === "tool_start") as { name: string; input: Record<string, unknown> } | undefined;
+    expect(start?.name).toBe("mcp__github__elicitation");
+    expect(start?.input.url).toBe("https://evil.example/oauth"); // shown, not hidden
+  });
+
+  it("C5d (#368): a tool name with a quote in it is read in full", async () => {
+    const p = makeProvider();
+    const names: string[] = [];
+    await collect(
+      p.runTurn(
+        turnOpts("mcp-quoted please", {
+          canUseTool: async (_t, _a, name) => {
+            names.push(name);
+            return { behavior: "deny" as const };
+          },
+        }),
+      ),
+    );
+    await p.teardown();
+    expect(names).toEqual(['mcp__srv__safe" then "rm']);
+  });
+
+  it("C5e (#368): approvals that can't be paired to a started call get distinct ids", async () => {
+    const p = makeProvider();
+    const ids: string[] = [];
+    for (const prompt of ["mcp-nostart please", "mcp-nostart again"]) {
+      await collect(
+        p.runTurn(
+          turnOpts(prompt, {
+            canUseTool: async (_t, approvalId) => {
+              ids.push(approvalId);
+              return { behavior: "deny" as const };
+            },
+          }),
+        ),
+      );
+    }
+    await p.teardown();
+    expect(ids).toHaveLength(2);
+    expect(ids[0]).not.toBe(ids[1]);
+    expect(ids.every((id) => !id.includes("turn-1"))).toBe(true);
+  });
+
   it("C3d (#369): a permissions request is answered with a grant — the requested profile, or nothing", async () => {
     for (const allow of [true, false]) {
       const p = makeProvider();
