@@ -391,13 +391,15 @@ describe("codeoid approve <session> (#349)", () => {
   });
 
   test("variation selectors and Hangul fillers in the input are shown, not hidden", async () => {
-    makeProvider = () => new MockSessionProvider("mock", [bashTurn("echo hi\ufe0f\u115f\u{e0100}")]);
+    makeProvider = () => new MockSessionProvider("mock", [bashTurn("echo hi\ufe0f\u115f\u{e0100}\u2028\u2029")]);
     const { name } = await parkedSession();
     await run(name, false);
     const text = all(out);
     expect(text).toContain("\\u{fe0f}");
     expect(text).toContain("\\u{115f}");
     expect(text).toContain("\\u{e0100}");
+    expect(text).toContain("\\u{2028}");
+    expect(text).toContain("\\u{2029}");
   });
 
   test("a newline in the tool name can't fake an input block", async () => {

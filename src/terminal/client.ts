@@ -43,11 +43,12 @@ const S = (s: string | undefined): string => sanitizeTerminalOutput(s ?? "");
 /** Stricter than S for text a decision rests on: no carriage returns, colours
  *  or links that could restyle or overwrite it. And no C1 controls (U+0080–009F,
  *  the 8-bit CSI/OSC many terminals act on), bidi or other invisible format
- *  characters (Unicode default-ignorables and format controls), which can hide
+ *  characters (Unicode default-ignorables, format controls, and the U+2028 /
+ *  U+2029 line/paragraph separators most terminals draw as nothing), which can hide
  *  or reorder what the line appears to say — those are shown as visible `\u{…}`
  *  escapes rather than dropped, so the text can't silently read as something
  *  shorter (#349). */
-const INVISIBLE = /[\p{Default_Ignorable_Code_Point}\p{Cf}\u0080-\u009f]/gu;
+const INVISIBLE = /[\p{Default_Ignorable_Code_Point}\p{Cf}\p{Zl}\p{Zp}\u0080-\u009f]/gu;
 const plainText = (s: string): string =>
   S(s)
     .replace(/\r/g, "")
