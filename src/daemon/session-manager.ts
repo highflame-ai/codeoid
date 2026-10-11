@@ -1159,6 +1159,8 @@ mcpHub: this.#mcpHub,
         return this.#backendLoginSubmit(msg, auth);
       case "backend.login.cancel":
         return this.#backendLoginCancel(msg, auth);
+      case "session.approvals":
+        return this.#sessionApprovals(msg, auth);
       case "session.turns":
         return this.#sessionTurns(msg, auth);
       case "session.rewind":
@@ -5426,6 +5428,28 @@ mcpHub: this.#mcpHub,
     return { type: "response.ok", requestId: msg.id, data: session.toInfo() };
   }
 
+  /**
+   * What a session's tool calls are parked on (#349), with the exact input
+   * each would run — the one-shot `codeoid approve` reads this instead of
+   * attaching. Same read authority as attach: a parked call's input is
+   * session content (a Bash command, a Write body).
+   */
+  #sessionApprovals(
+    msg: Extract<ClientMessage, { type: "session.approvals" }>,
+    auth: AuthContext,
+  ): DaemonMessage {
+    const scope = hasScope(auth.scopes as string[], SCOPES.SESSION_ATTACH)
+      || hasScope(auth.scopes as string[], SCOPES.SESSION_WATCH);
+    if (!scope) {
+      return { type: "response.error", requestId: msg.id, error: "Missing scope: session:attach or session:watch", code: "forbidden" };
+    }
+    const session = this.#getOwnedSession(msg.sessionId, auth);
+    if (!session) {
+      return { type: "response.error", requestId: msg.id, error: "Session not found", code: "not_found" };
+    }
+    return { type: "session.approvals.result", requestId: msg.id, sessionId: session.id, approvals: session.pendingToolApprovals() };
+  }
+
   /** A session's turns (#354) — same read authority as attach. */
   async #sessionTurns(
     msg: Extract<ClientMessage, { type: "session.turns" }>,
@@ -6269,8 +6293,10 @@ mcpHub: this.#mcpHub,
       return { type: "response.error", requestId: msg.id, error: "Session not found", code: "not_found" };
     }
 
-    session.approve(msg.approvalId, msg.approved, auth, msg.updatedInput);
-    return { type: "response.ok", requestId: msg.id };
+    // Still `response.ok` for a stale id — the web ApprovalBar sends one to
+    // dismiss a leftover prompt — but say so, for callers that report it.
+    const outcome = session.approve(msg.approvalId, msg.approved, auth, msg.updatedInput);
+    return { type: "response.ok", requestId: msg.id, data: { outcome } };
   }
 
   #uiResponse(

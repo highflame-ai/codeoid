@@ -426,6 +426,8 @@ codeoid attach <session>                             # Readline streaming attach
 codeoid send <session> <message...>                  # One-shot send
 codeoid interrupt <session>                          # Interrupt
 codeoid approve <session> [--deny]                   # Show a pending tool call in full, confirm, approve / deny
+  --pick <n> | --id <approvalId>                     #   which call, when several wait (--id is stable, for scripts)
+  --yes                                              #   skip the confirm prompt (required off a terminal)
   --pick <n>  --yes                                  #   which one when several wait; skip the confirm
 codeoid destroy <session>                            # Destroy
 codeoid turns <session>                              # List turns, numbered (for --at N)

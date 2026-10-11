@@ -549,6 +549,12 @@ export const sessionTurnsSchema = z.object({
   sessionId: sessionIdField,
 });
 
+export const sessionApprovalsSchema = z.object({
+  ...base,
+  type: z.literal("session.approvals"),
+  sessionId: sessionIdField,
+});
+
 export const sessionRewindSchema = z.object({
   ...base,
   type: z.literal("session.rewind"),
@@ -817,6 +823,7 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   backendLoginCancelSchema,
   skillGrantSchema,
   sessionTurnsSchema,
+  sessionApprovalsSchema,
   sessionRewindSchema,
   sessionCompareSchema,
   compareGetSchema,

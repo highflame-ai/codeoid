@@ -77,6 +77,7 @@ import {
 } from "./checkpoints.js";
 import { applyRewinds, REWIND_EVENT, type TurnIndexEntry } from "./transcript.js";
 import type { RewindFiles, RewindIrreversible, TurnSummary } from "../protocol/types.js";
+import type { PendingToolApproval, SessionApproveOutcome } from "../protocol/types.js";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
@@ -957,6 +958,15 @@ export class Session {
     string,
     (result: { approved: boolean; updatedInput?: Record<string, unknown> }) => void
   >();
+  /**
+   * What each parked approval will actually run: the tool name and the input
+   * canUseTool received (after hook rewrite), keyed by approvalId — served by
+   * `session.approvals` (#349). Read from HERE, not the announced tool
+   * message: a backend that ties a gate to its announcement by tool name alone
+   * (qwen) could otherwise show one call while another is parked. Set just
+   * before parking, cleared when the wait returns.
+   */
+  #approvalInputs = new Map<string, { toolName: string; input: unknown }>();
   /**
    * Decisions that arrived BEFORE canUseTool registered its resolver. The
    * event consumer broadcasts the waiting_confirmation tool message (and the
@@ -2940,12 +2950,31 @@ export class Session {
     if (this.#status !== "error") this.#setStatus(this.#pendingApprovals.size > 0 ? "waiting_approval" : "idle");
   }
 
+  /**
+   * The tool calls this session is parked on, oldest first, each with the
+   * exact input that runs if approved (#349). Only ids canUseTool is really
+   * waiting on — never a leftover `waiting_confirmation` row in scrollback.
+   */
+  pendingToolApprovals(): PendingToolApproval[] {
+    const out: PendingToolApproval[] = [];
+    for (const approvalId of this.#pendingApprovals.keys()) {
+      const gated = this.#approvalInputs.get(approvalId);
+      if (gated) out.push({ approvalId, toolName: gated.toolName, input: gated.input });
+    }
+    return out;
+  }
+
+  /**
+   * Settle a tool approval by its id, and say what happened, so a caller that
+   * reports the outcome (the one-shot CLI, #349) can tell an answer that took
+   * effect from one that arrived too late.
+   */
   approve(
     approvalId: string,
     approved: boolean,
     sender: AuthContext,
     updatedInput?: Record<string, unknown>,
-  ): void {
+  ): SessionApproveOutcome {
     const resolve = this.#pendingApprovals.get(approvalId);
     if (!resolve) {
       // SECURITY: do NOT fall back to "resolve the first pending" any
@@ -2967,7 +2996,7 @@ export class Session {
           this.id,
           `approvalId=${approvalId} (early)`,
         );
-        return;
+        return "early";
       }
 
       // No live approval matches. Most likely a stale tool_call left
@@ -2976,12 +3005,13 @@ export class Session {
       // scrollback, find the matching tool_call by approvalId, and
       // flip it to cancelled so the ApprovalBar dismisses.
       this.#dismissStaleApproval(approvalId, sender);
-      return;
+      return "stale";
     }
 
     this.#store.audit(sender.sub, approved ? "session.approve" : "session.deny", this.id, `approvalId=${approvalId}`);
     resolve({ approved, updatedInput });
     this.#pendingApprovals.delete(approvalId);
+    return "settled";
   }
 
   #dismissStaleApproval(approvalId: string, sender: AuthContext): void {
@@ -4380,7 +4410,14 @@ export class Session {
       // with or without a turn: it is what renders the approval bar.
       this.#setStatus("waiting_approval");
       this.#withdrawOnAbort(approvalId, signal);
-      const { approved, updatedInput } = await this.#waitForApproval(approvalId);
+      this.#approvalInputs.set(approvalId, { toolName, input: effectiveInput });
+      let decision: { approved: boolean; updatedInput?: Record<string, unknown> };
+      try {
+        decision = await this.#waitForApproval(approvalId);
+      } finally {
+        this.#approvalInputs.delete(approvalId);
+      }
+      const { approved, updatedInput } = decision;
       if (this.#turnActive()) this.#setStatus(approved ? "tool_running" : "thinking");
       else this.#settleBetweenTurns();
 

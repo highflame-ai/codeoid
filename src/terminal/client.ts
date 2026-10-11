@@ -17,6 +17,7 @@ import type {
   DaemonMessage,
   PipelineWire,
   SessionInfo,
+  SessionApproveOutcome,
 } from "../protocol/types.js";
 import { ALL_SCOPES_STRING } from "../protocol/scopes.js";
 import { sanitizeTerminalOutput } from "../tui/ansi/codes.js";
@@ -39,13 +40,24 @@ const RESET = "\x1b[0m";
 /** Strip terminal-control escapes from an untrusted field before it reaches
  *  the TTY (OSC 52 clipboard, cursor moves, DCS, etc. — see #91/#92). */
 const S = (s: string | undefined): string => sanitizeTerminalOutput(s ?? "");
-/** Stricter than S for text a decision rests on: no carriage returns, colours or links that could restyle or overwrite it. */
+/** Stricter than S for text a decision rests on: no carriage returns, colours
+ *  or links that could restyle or overwrite it. And no C1 controls (U+0080–009F,
+ *  the 8-bit CSI/OSC many terminals act on), bidi or other invisible format
+ *  characters, which can change what the line appears to say — those are shown
+ *  as visible `\u{…}` escapes rather than dropped, so the text can't silently
+ *  read as something shorter (#349). */
+const INVISIBLE =
+  /[\u0080-\u009f\u00ad\u061c\u180e\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u2069\u3164\ufeff]|[\u{e0000}-\u{e007f}]/gu;
 const plainText = (s: string): string =>
   S(s)
     .replace(/\r/g, "")
     .replace(/\x1b\[[0-9;:]*m/g, "")
     .replace(/\x1b\]8;[^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
-    .replace(/\x1b/g, "");
+    .replace(/\x1b/g, "")
+    .replace(INVISIBLE, (c) => `\\u{${c.codePointAt(0)!.toString(16)}}`);
+
+/** Most of a pending tool call's input `codeoid approve` prints before asking. */
+const APPROVE_SHOW_MAX = 8_000;
 
 /** Streaming/approval bookkeeping carried across messages by the attach loop. */
 export interface StreamRenderState {
@@ -908,25 +920,45 @@ export class TerminalClient {
     }
   }
 
-  async approveSession(sessionIdOrName: string, approved: boolean, opts: { pick?: number; yes?: boolean } = {}): Promise<void> {
+  async approveSession(
+    sessionIdOrName: string,
+    approved: boolean,
+    opts: { pick?: number; approvalId?: string; yes?: boolean } = {},
+  ): Promise<void> {
+    // Every way this can fail to answer exits non-zero — scripts gate on it.
+    const fail = (...lines: string[]) => {
+      for (const l of lines) console.error(l);
+      process.exitCode = 1;
+    };
     const sessionId = await this.#resolveSession(sessionIdOrName);
-    if (!sessionId) return;
+    if (!sessionId) {
+      process.exitCode = 1;
+      return;
+    }
 
     // A pending yes/no dialog (e.g. a skill-command approval, #348) is answered
-    // by its real request id, from the session's info.
+    // by its real request id, from the session's info — unless a specific
+    // tool call was named.
     const list = await this.#request({ type: "session.list", id: randomUUID() });
-    const dialog =
-      list.type === "session.list.result" ? list.sessions.find((s) => s.id === sessionId)?.pendingDialog : undefined;
+    if (list.type !== "session.list.result") {
+      this.#printError(list);
+      process.exitCode = 1;
+      return;
+    }
+    const dialog = opts.approvalId ? undefined : list.sessions.find((s) => s.id === sessionId)?.pendingDialog;
     if (dialog) {
       if (dialog.method !== "confirm") {
-        console.error(`The session is waiting on a question, not a yes/no: ${S(dialog.title)}`);
-        console.error(`  Answer it with: codeoid attach ${sessionIdOrName}`);
+        fail(
+          `The session is waiting on a question, not a yes/no: ${plainText(dialog.title)}`,
+          `  Answer it with: codeoid attach ${sessionIdOrName}`,
+        );
         return;
       }
       // Show exactly what is being answered — the title names the command,
       // the message says what it does.
-      console.log(S(dialog.title));
-      if (dialog.message) console.log(S(dialog.message));
+      console.log(plainText(dialog.title));
+      if (dialog.message) console.log(plainText(dialog.message));
+      if (!(await this.#confirmApproval(approved, opts.yes === true))) return;
       const resp = await this.#request({
         type: "session.ui_response",
         id: randomUUID(),
@@ -935,41 +967,64 @@ export class TerminalClient {
         confirmed: approved,
       });
       if (resp.type === "response.ok") console.log(approved ? "Approved." : "Denied.");
-      else this.#printError(resp);
+      else {
+        this.#printError(resp);
+        process.exitCode = 1;
+      }
       return;
     }
 
     // A tool approval is answered by its own id (the daemon never guesses
-    // "the first pending" — see Session#approve): read it off the session.
-    const all = await this.#pendingToolApprovals(sessionId);
+    // "the first pending" — see Session#approve). The daemon lists only calls
+    // really waiting, each with the exact input it would run (#349).
+    const listed = await this.#request({ type: "session.approvals", id: randomUUID(), sessionId });
+    if (listed.type !== "session.approvals.result") {
+      this.#printError(listed);
+      process.exitCode = 1;
+      return;
+    }
+    const all = listed.approvals;
     if (all.length === 0) {
-      console.log("Nothing in that session is waiting for an approval.");
+      fail("Nothing in that session is waiting for an approval.");
       return;
     }
-    const n = opts.pick ?? 1;
-    const pending = all[n - 1];
-    if (!pending) {
-      console.log(`There are ${all.length} waiting; pick one of 1–${all.length}.`);
-      return;
+    let pending: (typeof all)[number] | undefined;
+    let n: number;
+    if (opts.approvalId) {
+      n = all.findIndex((a) => a.approvalId === opts.approvalId) + 1;
+      pending = all[n - 1];
+      if (!pending) {
+        fail(`No tool call ${plainText(opts.approvalId)} is waiting in that session.`);
+        return;
+      }
+    } else {
+      n = opts.pick ?? 1;
+      pending = all[n - 1];
+      if (!pending) {
+        fail(`There are ${all.length} waiting; pick one of 1–${all.length}.`);
+        return;
+      }
     }
-    // Show exactly what would run — the full input, not just its key names —
-    // as plain text the agent can't restyle or overwrite.
+    // Show exactly what would run — the full input — as plain text the agent
+    // can't restyle or overwrite.
     if (all.length > 1) console.log(`${all.length} tool calls are waiting; this is [${n}] (pick another with --pick N):`);
-    console.log(`${plainText(pending.name)}`);
-    console.log(plainText(pending.input === undefined ? (pending.description ?? "") : JSON.stringify(pending.input, null, 2)).slice(0, 8_000));
-    if (approved && !opts.yes) {
-      if (!process.stdin.isTTY) {
-        console.log("Not approved: pass --yes to approve without a terminal to confirm in.");
-        return;
-      }
-      const rl = createInterface({ input: process.stdin, output: process.stdout });
-      const answer = await new Promise<string>((r) => rl.question("Approve this? [y/N] ", r));
-      rl.close();
-      if (!/^y(es)?$/i.test(answer.trim())) {
-        console.log("Not approved.");
+    console.log(`${plainText(pending.toolName)}  (${plainText(pending.approvalId)})`);
+    const shown = plainText(pending.input === undefined ? "" : JSON.stringify(pending.input, null, 2) ?? "");
+    const cut = shown.length > APPROVE_SHOW_MAX;
+    console.log(cut ? shown.slice(0, APPROVE_SHOW_MAX) : shown);
+    if (cut) {
+      // Never ask for a yes over input the user can't see in full.
+      console.log(`… (${shown.length - APPROVE_SHOW_MAX} more characters not shown)`);
+      if (approved && !opts.yes) {
+        fail(
+          "Not approved: the input is too long to show in full.",
+          `  Review it with: codeoid attach ${sessionIdOrName}`,
+          "  Or approve it as shown with --yes.",
+        );
         return;
       }
     }
+    if (!(await this.#confirmApproval(approved, opts.yes === true))) return;
     const resp = await this.#request({
       type: "session.approve",
       id: randomUUID(),
@@ -978,11 +1033,40 @@ export class TerminalClient {
       approved,
     });
 
-    if (resp.type === "response.ok") {
-      console.log(approved ? "Approved." : "Denied.");
-    } else {
+    if (resp.type !== "response.ok") {
       this.#printError(resp);
+      process.exitCode = 1;
+      return;
     }
+    // Answered elsewhere, or withdrawn, between the read and the answer.
+    if ((resp.data as { outcome?: SessionApproveOutcome } | undefined)?.outcome === "stale") {
+      fail("That tool call was already answered or withdrawn — nothing was decided.");
+      return;
+    }
+    console.log(approved ? "Approved." : "Denied.");
+  }
+
+  /**
+   * Ask before approving. Off a terminal, require --yes. Denying never asks —
+   * it is the safe answer. EOF (Ctrl-D) is "no", not a hang on the open socket.
+   */
+  async #confirmApproval(approved: boolean, yes: boolean): Promise<boolean> {
+    if (!approved || yes) return true;
+    if (!process.stdin.isTTY) {
+      console.error("Not approved: pass --yes to approve without a terminal to confirm in.");
+      process.exitCode = 1;
+      return false;
+    }
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const answer = await new Promise<string>((resolve) => {
+      rl.once("close", () => resolve(""));
+      rl.question("Approve this? [y/N] ", resolve);
+    });
+    rl.close();
+    if (/^y(es)?$/i.test(answer.trim())) return true;
+    console.error("Not approved.");
+    process.exitCode = 1;
+    return false;
   }
 
   /** Pre-approve (or deny) a skill-declared command for a workdir (#348). */
@@ -1144,61 +1228,6 @@ export class TerminalClient {
       });
     }
     console.log(`${kind} sent — watch: codeoid pipeline status ${id}`);
-  }
-
-  /**
-   * The oldest tool call still waiting for a decision in a session, from its
-   * scrollback (attach, read the replay, detach) — what an attached client
-   * would show as the question.
-   */
-  async #pendingToolApprovals(sessionId: string): Promise<Array<{ approvalId: string; name: string; description?: string; input?: unknown }>> {
-    type Row = {
-      type?: string;
-      role?: string;
-      messageId?: string;
-      content?: string;
-      tool?: { name?: string; input?: unknown; state?: { phase?: string; approvalId?: string; description?: string; input?: unknown } };
-    };
-    const rows: Row[] = [];
-    let done!: () => void;
-    const replayed = new Promise<void>((r) => {
-      done = r;
-    });
-    const prev = this.#streamHandler;
-    this.#streamHandler = (msg) => {
-      const m = msg as { type: string; sessionId?: string; messages?: Row[]; seq?: number; final?: boolean };
-      if (m.type !== "scrollback.replay" || m.sessionId !== sessionId) return;
-      rows.push(...(m.messages ?? []));
-      if (m.seq === undefined || m.final) done();
-    };
-    try {
-      const attached = await this.#request({ type: "session.attach", id: randomUUID(), sessionId });
-      if (attached.type === "response.error") {
-        this.#printError(attached);
-        return [];
-      }
-      await Promise.race([replayed, new Promise((r) => setTimeout(r, 3_000))]);
-    } finally {
-      this.#streamHandler = prev;
-      await this.#request({ type: "session.detach", id: randomUUID(), sessionId }).catch(() => undefined);
-    }
-    // Latest state per tool call; those still waiting, oldest first.
-    const latest = new Map<string, Row>();
-    for (const r of rows) if (r.role === "tool_call" && r.messageId) latest.set(r.messageId, r);
-    const out: Array<{ approvalId: string; name: string; description?: string; input?: unknown }> = [];
-    for (const r of latest.values()) {
-      const st = r.tool?.state;
-      if (st?.phase === "waiting_confirmation" && st.approvalId) {
-        const input = st.input ?? r.tool?.input;
-        out.push({
-          approvalId: st.approvalId,
-          name: r.tool?.name ?? r.content ?? "tool",
-          ...(st.description ? { description: st.description } : {}),
-          ...(input !== undefined ? { input } : {}),
-        });
-      }
-    }
-    return out;
   }
 
   #request(msg: ClientMessage): Promise<DaemonMessage> {

@@ -739,17 +739,26 @@ program
   .description("Approve a pending permission request or yes/no question")
   .option("--deny", "Deny instead of approve")
   .option("--pick <n>", "which waiting tool call, when several are (1 = the oldest)")
+  .option("--id <approvalId>", "which waiting tool call, by the id shown — stable, unlike --pick, for scripts")
   .option("--yes", "approve without asking to confirm (needed without a terminal)")
-  .action(async (session: string, opts: { deny?: boolean; pick?: string; yes?: boolean }) => {
+  .action(async (session: string, opts: { deny?: boolean; pick?: string; id?: string; yes?: boolean }) => {
     const pick = opts.pick !== undefined ? Number(opts.pick) : undefined;
     if (pick !== undefined && (!Number.isInteger(pick) || pick < 1)) {
       console.error("--pick takes a number (1 = the oldest waiting)");
       process.exit(1);
     }
+    if (pick !== undefined && opts.id) {
+      console.error("--pick and --id both choose the call — give one");
+      process.exit(1);
+    }
     const config = loadConfig();
     const client = new TerminalClient(config);
     await client.connect();
-    await client.approveSession(session, !opts.deny, { ...(pick !== undefined ? { pick } : {}), ...(opts.yes ? { yes: true } : {}) });
+    await client.approveSession(session, !opts.deny, {
+      ...(pick !== undefined ? { pick } : {}),
+      ...(opts.id ? { approvalId: opts.id } : {}),
+      ...(opts.yes ? { yes: true } : {}),
+    });
     client.disconnect();
   });
 
