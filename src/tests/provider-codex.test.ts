@@ -387,21 +387,21 @@ describe("CodexProvider over fake-codex", () => {
     });
   }
 
-  it("C3o (#369): a network grant alongside a command is still codex_network_access, never Bash", async () => {
+  it("C3o (#369): a network grant alongside a command stays Bash (its hooks apply), host shown", async () => {
     const p = makeProvider();
     const seen: string[] = [];
     await collect(
       p.runTurn(
         turnOpts("net-with-cmd please", {
-          canUseTool: async (_t, _a, name) => {
-            seen.push(name);
+          canUseTool: async (_t, _a, name, input) => {
+            seen.push(`${name} ${JSON.stringify(input.network)}`);
             return { behavior: "deny" as const };
           },
         }),
       ),
     );
     await p.teardown();
-    expect(seen).toEqual(["codex_network_access"]);
+    expect(seen).toEqual(['Bash {"host":"example.com","protocol":"https"}']);
   });
 
   it("C3l (#369): network access with no command is its own tool, not Bash", async () => {

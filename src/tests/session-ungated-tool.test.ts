@@ -79,10 +79,10 @@ describe("a tool call the backend settles itself (#369)", () => {
     await session.destroy(AUTH);
   });
 
-  test("audited even when the card showed it as auto-approved, if it didn't run", async () => {
+  test("audited even when the card showed it as auto-approved, if the backend declined it", async () => {
     const events: ProviderEvent[] = [
       { type: "tool_start", toolId: "t2", sdkToolUseId: "t2", name: "Bash", input: { command: "ls" }, approvalId: "codex-t2" } as ProviderEvent,
-      { type: "tool_complete", sdkToolUseId: "t2", output: "Declined — unknown kind", success: false } as ProviderEvent,
+      { type: "tool_complete", sdkToolUseId: "t2", output: "Declined — unknown kind", success: false, declinedByBackend: true } as ProviderEvent,
     ];
     const provider = new MockSessionProvider("mock", [events], { stall: true });
     provider.ungatedToolIds.add("t2");
@@ -100,6 +100,24 @@ describe("a tool call the backend settles itself (#369)", () => {
     const row = d.query("SELECT detail FROM audit_log WHERE action = 'session.backend_settled'").get() as { detail: string };
     d.close();
     expect(row.detail).toContain("success=false");
+    await session.destroy(AUTH);
+  });
+
+  test("a call that merely failed on its own is not audited as settled", async () => {
+    const events: ProviderEvent[] = [
+      { type: "tool_start", toolId: "t3", sdkToolUseId: "t3", name: "Read", input: { file_path: "/nope" }, approvalId: "auto-t3" } as ProviderEvent,
+      { type: "tool_complete", sdkToolUseId: "t3", output: "ENOENT", success: false } as ProviderEvent,
+    ];
+    const provider = new MockSessionProvider("mock", [events], { stall: true });
+    provider.ungatedToolIds.add("t3");
+    const session = makeSession(provider);
+    session.setMode("autonomous");
+    await session.send("read", AUTH);
+    await new Promise((r) => setTimeout(r, 300));
+    const d = new Database(join(tmp, "codeoid.db"), { readonly: true });
+    const n = (d.query("SELECT count(*) AS n FROM audit_log WHERE action = 'session.backend_settled'").get() as { n: number }).n;
+    d.close();
+    expect(n).toBe(0);
     await session.destroy(AUTH);
   });
 });

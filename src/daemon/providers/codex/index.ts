@@ -297,7 +297,7 @@ export class CodexProvider implements SessionProvider {
   /** Items with an approval being decided, and those whose patch changed
    *  meanwhile: the approver saw the earlier diff, so the yes doesn't cover the
    *  new one — declined instead (#369). */
-  #approvalsInFlight = new Set<string>();
+  #approvalsInFlight = new Map<string, number>();
   #patchChangedInFlight = new Set<string>();
   /**
    * serverName → the most-recent mcpToolCall item awaiting its approval
@@ -800,10 +800,7 @@ export class CodexProvider implements SessionProvider {
         // stdin writes): codex then sets a per-callback approvalId. Key by both
         // so two pending approvals never collide on one codeoid id (#369).
         const itemId = hasItem && hasCallback ? `${parentId}:${String(params.approvalId)}` : parentId;
-        if (itemId !== parentId && this.#completedParents.has(parentId)) {
-          // Its parent already finished — nothing this approval could still run.
-          return approvalReply(method, params, false);
-        }
+        const lateSibling = itemId !== parentId && this.#completedParents.has(parentId);
         const { name, input, unshowable } = approvalToTool(method, params, this.#startedItems.get(parentId));
         this.#announcedItems.set(itemId, { name, input });
         this.#push({
@@ -814,22 +811,32 @@ export class CodexProvider implements SessionProvider {
           input,
           approvalId: `codex-${itemId}`,
         });
-        if (unshowable) {
-          // Never ask for a yes on something the approver can't see — the
-          // approval now takes effect. Declined, with the reason on the card.
-          this.#push({ type: "tool_complete", sdkToolUseId: itemId, output: `Declined — ${unshowable}`, success: false });
+        const refusal = lateSibling ? "its parent command had already finished" : unshowable;
+        if (refusal) {
+          // Never ask for a yes on something the approver can't see (or that
+          // can no longer run) — the approval takes effect. Declined, with the
+          // reason on the card.
+          this.#push({ type: "tool_complete", sdkToolUseId: itemId, output: `Declined — ${refusal}`, success: false, declinedByBackend: true });
           this.#announcedItems.delete(itemId);
           this.#declinedItems.add(itemId);
           return approvalReply(method, params, false);
         }
-        this.#approvalsInFlight.add(parentId);
+        // Counted, not flagged: concurrent approvals on one item each see a
+        // change that lands while they're being decided.
+        this.#approvalsInFlight.set(parentId, (this.#approvalsInFlight.get(parentId) ?? 0) + 1);
         let verdict: Awaited<ReturnType<typeof canUseTool>>;
+        let patchChanged = false;
         try {
           verdict = await canUseTool(itemId, `codex-${itemId}`, name, input);
         } finally {
-          this.#approvalsInFlight.delete(parentId);
+          const left = (this.#approvalsInFlight.get(parentId) ?? 1) - 1;
+          patchChanged = this.#patchChangedInFlight.has(parentId);
+          if (left > 0) this.#approvalsInFlight.set(parentId, left);
+          else {
+            this.#approvalsInFlight.delete(parentId);
+            this.#patchChangedInFlight.delete(parentId);
+          }
         }
-        const patchChanged = this.#patchChangedInFlight.delete(parentId);
         const parentDone = itemId !== parentId && this.#completedParents.has(parentId);
         if (verdict.behavior === "allow" && (patchChanged || parentDone)) {
           // The yes was for what was SHOWN: a patch that changed while it was
@@ -839,6 +846,7 @@ export class CodexProvider implements SessionProvider {
             sdkToolUseId: itemId,
             output: patchChanged ? "Declined — the change was updated after it was shown." : "Declined — its parent command had already finished.",
             success: false,
+            declinedByBackend: true,
           });
           this.#announcedItems.delete(itemId);
           this.#declinedItems.add(itemId);
@@ -991,14 +999,14 @@ function approvalToTool(
       // A kind this version doesn't know — don't present it as a plain command.
       return { name: "Bash", input, unshowable: `codex asked for an approval of an unknown kind (${kind})` };
     }
-    // A network grant — alone or alongside a command — is its own tool, so Bash
-    // hooks and Bash auto-approval never cover it. It must name its host.
-    if (network) {
-      if (typeof network.host !== "string" || network.host === "") {
-        return { name: "codex_network_access", input, unshowable: "codex asked for network access without naming the host" };
-      }
-      return { name: "codex_network_access", input };
+    // A network grant must name its host. With a command it stays `Bash` — the
+    // command is what runs, and Bash `tool_call` hooks must keep seeing it —
+    // the host shown alongside. Alone it is its own tool, so Bash hooks and
+    // Bash auto-approval don't treat open egress as a shell command.
+    if (network && (typeof network.host !== "string" || network.host === "")) {
+      return { name: command ? "Bash" : "codex_network_access", input, unshowable: "codex asked for network access without naming the host" };
     }
+    if (!command && network) return { name: "codex_network_access", input };
     if (!command) return { name: "Bash", input, unshowable: "codex didn't say what the command is" };
     return { name: "Bash", input };
   }
