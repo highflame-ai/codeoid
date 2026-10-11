@@ -38,6 +38,8 @@ import type { CanonicalTurn, HistorySeedResult } from "../canonical.js";
 export { mockResult } from "./index.js";
 
 export class MockSessionProvider implements SessionProvider {
+  /** Tests flip this to model a backend that can't apply a rewrite (#367). */
+  appliesToolInputRewrite = true;
   readonly id: string;
   readonly displayName: string;
 

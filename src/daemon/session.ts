@@ -4349,6 +4349,39 @@ export class Session {
           return { behavior: "deny" as const, message: `Blocked by hook "${hookName}": ${reason}` };
         }
         if (hookResult.updatedInput) {
+          // A backend that only hears yes/no runs the input IT proposed: the
+          // rewrite would be shown (and approved) while the original runs.
+          // Refuse instead (#367) — before the rewrite reaches any display.
+          if (!this.#provider.appliesToolInputRewrite) {
+            const hooks = hookResult.mutatedBy.map((n) => `"${n}"`).join(", ");
+            const reason = `${this.#provider.id} can't run a rewritten input, so the call was refused rather than run as originally proposed`;
+            this.#approvalPatchKeys.delete(approvalId);
+            this.#resolveToolCallMessage(approvalId, {
+              phase: "cancelled",
+              reason: "denied",
+              message: `Hook ${hooks} rewrote ${toolName}: ${reason}`,
+            });
+            this.#store.audit(
+              sender.sub,
+              "session.hook_rewrite_refused",
+              this.id,
+              `tool=${toolName} provider=${this.#provider.id} hooks=${hookResult.mutatedBy.join(",")}`,
+            );
+            const infoMsg = this.#makeMessage(
+              "info",
+              `🪝 Hook ${hooks} rewrote ${toolName}, but ${reason}`,
+              SYSTEM_IDENTITY,
+              undefined,
+              undefined,
+              { event: "hook.rewrite_refused", hooks: hookResult.mutatedBy, tool: toolName, provider: this.#provider.id },
+            );
+            this.#persistAndBuffer(infoMsg);
+            this.#broadcastRaw(infoMsg);
+            return {
+              behavior: "deny" as const,
+              message: `Blocked: hook ${hooks} rewrote this ${toolName} call and this backend can't run the rewritten input`,
+            };
+          }
           effectiveInput = hookResult.updatedInput;
           this.#applyHookInputMutation(approvalId, effectiveInput);
           const infoMsg = this.#makeMessage(
@@ -4436,6 +4469,20 @@ export class Session {
       if (approved) {
         this.#store.audit(sender.sub, "session.approve", this.id, `tool=${toolName} approvalId=${approvalId}`);
         const sanitizedPatch = sanitizeApprovalPatch(toolName, updatedInput, patchableKeys);
+        if (sanitizedPatch && !this.#provider.appliesToolInputRewrite) {
+          // The approver's answers (a form patch) would be dropped by a backend
+          // that runs its own input — don't run the call without them (#367).
+          this.#resolveToolCallMessage(approvalId, {
+            phase: "cancelled",
+            reason: "denied",
+            message: `${this.#provider.id} can't apply the answers given to ${toolName}`,
+          });
+          this.#store.audit(sender.sub, "session.patch_refused", this.id, `tool=${toolName} provider=${this.#provider.id}`);
+          return {
+            behavior: "deny" as const,
+            message: `Blocked: this backend can't apply the answers given to ${toolName}`,
+          };
+        }
         const merged: Record<string, unknown> = sanitizedPatch ? { ...effectiveInput, ...sanitizedPatch } : effectiveInput;
         return { behavior: "allow" as const, updatedInput: merged };
       }

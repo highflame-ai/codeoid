@@ -67,6 +67,8 @@ export interface GeminiProviderInit {
 }
 
 export class GeminiProvider implements AgentProvider {
+  /** tool-loop runs `verdict.updatedInput ?? args` (see AgentProvider.appliesToolInputRewrite). */
+  readonly appliesToolInputRewrite = true;
   readonly id = "gemini";
   readonly displayName = "Gemini (Google)";
 

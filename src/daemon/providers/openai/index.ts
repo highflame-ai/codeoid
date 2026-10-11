@@ -101,6 +101,8 @@ const OPENAI_FALLBACK_MODELS: ModelInfo[] = [
 ];
 
 export class OpenAIProvider implements AgentProvider {
+  /** tool-loop runs `verdict.updatedInput ?? args` (see AgentProvider.appliesToolInputRewrite). */
+  readonly appliesToolInputRewrite = true;
   readonly id: string;
   readonly displayName: string;
 

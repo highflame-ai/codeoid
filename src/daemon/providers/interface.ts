@@ -491,6 +491,16 @@ export interface AgentProvider {
    * true only after its tool mount is confirmed.
    */
   readonly supportsMemoryTools?: boolean;
+  /**
+   * True when the backend runs the `updatedInput` an `allow` verdict carries —
+   * a hook's rewrite of a tool call, or an approver's form answers — instead
+   * of the input it proposed. Absent = false: a backend that only hears
+   * yes/no runs its OWN input, and showing a rewrite it then ignores would
+   * have the user approve one thing while another runs. Session refuses such
+   * a call instead (#367). Declare it only after confirming the backend
+   * applies the new input to what it actually executes.
+   */
+  readonly appliesToolInputRewrite?: boolean;
   dispose(): Promise<void>;
 }
 

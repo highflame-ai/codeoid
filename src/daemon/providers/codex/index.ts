@@ -236,6 +236,11 @@ export function describeCodexError(params: Record<string, unknown>): string {
 }
 
 export class CodexProvider implements SessionProvider {
+  /**
+   * codex's approval replies carry only a decision (`approved` / `accept`) —
+   * codex runs the input IT proposed, so a rewrite can't apply (#367).
+   */
+  readonly appliesToolInputRewrite = false;
   readonly id = "codex";
   readonly displayName = "Codex (OpenAI)";
 

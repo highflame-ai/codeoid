@@ -90,6 +90,8 @@ const EMPTY_STATS: PiSessionStats = {
 };
 
 export class PiProvider implements SessionProvider {
+  /** The bridge replaces pi's live tool input with `updatedInput` (see AgentProvider.appliesToolInputRewrite). */
+  readonly appliesToolInputRewrite = true;
   readonly id = "pi";
   readonly displayName = "pi (pi.dev)";
 
