@@ -288,6 +288,9 @@ export class CodexProvider implements SessionProvider {
    * approver's view of the change can come from (#369).
    */
   #startedItems = new Map<string, Record<string, unknown>>();
+  /** Approved sibling callbacks (`${itemId}:${approvalId}`) still open, by parent
+   *  item id. codex completes only the PARENT, so its completion closes them. */
+  #openSubApprovals = new Map<string, Set<string>>();
   /**
    * serverName → the most-recent mcpToolCall item awaiting its approval
    * elicitation. codex gates an MCP tool call with `mcpServer/elicitation/request`,
@@ -447,6 +450,7 @@ export class CodexProvider implements SessionProvider {
     this.#announcedItems.clear();
     this.#declinedItems.clear();
     this.#startedItems.clear();
+    this.#openSubApprovals.clear();
     this.#lastTokenUsage = null;
     // Per turn, like the usage beside it. This provider instance outlives a
     // `/model` switch or a pipeline overrideModel, so a turn interrupted before
@@ -650,6 +654,17 @@ export class CodexProvider implements SessionProvider {
         }
         break;
       }
+      case "item/fileChange/patchUpdated": {
+        // codex can stream a patch (apply_patch_streaming_events): item/started
+        // may carry none or part of it. The approver must see the latest — a
+        // fresh object, never a mutation of what an approval may have read.
+        const itemId = String(params.itemId ?? "");
+        const started = this.#startedItems.get(itemId);
+        if (started && Array.isArray(params.changes)) {
+          this.#startedItems.set(itemId, { ...started, changes: params.changes });
+        }
+        break;
+      }
       case "item/completed": {
         const item = params.item as Record<string, unknown> | undefined;
         if (!item) break;
@@ -657,6 +672,15 @@ export class CodexProvider implements SessionProvider {
         const itemId = String(item.id ?? "");
         if (itemType === "mcpToolCall") this.#pendingMcpCalls.delete(String(item.server ?? ""));
         this.#startedItems.delete(itemId);
+        const subs = this.#openSubApprovals.get(itemId);
+        if (subs) {
+          this.#openSubApprovals.delete(itemId);
+          const ok = String(item.status ?? "completed") === "completed";
+          for (const subId of subs) {
+            this.#push({ type: "tool_complete", sdkToolUseId: subId, output: ok ? "Ran as part of the parent command." : `Parent command ${String(item.status)}.`, success: ok });
+            this.#announcedItems.delete(subId);
+          }
+        }
         if (itemType === "agentMessage") {
           const text = (item.text ?? item.content ?? "") as string;
           this.#push({ type: "text_done", content: typeof text === "string" ? text : "" });
@@ -781,6 +805,11 @@ export class CodexProvider implements SessionProvider {
         }
         const verdict = await canUseTool(itemId, `codex-${itemId}`, name, input);
         if (verdict.behavior !== "allow") this.#declinedItems.add(itemId);
+        else if (itemId !== parentId) {
+          const open = this.#openSubApprovals.get(parentId) ?? new Set<string>();
+          open.add(itemId);
+          this.#openSubApprovals.set(parentId, open);
+        }
         return approvalReply(method, params, verdict.behavior === "allow");
       }
       case "mcpServer/elicitation/request": {
@@ -903,7 +932,10 @@ function approvalToTool(
 ): { name: string; input: Record<string, unknown>; unshowable?: string } {
   if (method === "item/commandExecution/requestApproval") {
     const kind = String(params.kind ?? "command");
-    const command = String(params.command ?? started?.command ?? "");
+    // A sibling callback (approvalId set) asks about its OWN subcommand: the
+    // parent's command would show the wrong thing, so never fall back to it.
+    const isSub = typeof params.approvalId === "string" && params.approvalId !== "";
+    const command = String(params.command ?? (isSub ? "" : (started?.command ?? "")));
     const network = params.networkApprovalContext as Record<string, unknown> | null | undefined;
     const input: Record<string, unknown> = {
       command,
@@ -915,7 +947,14 @@ function approvalToTool(
     if (kind === "writeStdin") {
       return { name: "Bash", input, unshowable: "codex asked to write to a running terminal, and the input isn't in the request" };
     }
-    if (!command && !network) return { name: "Bash", input, unshowable: "codex didn't say what the command is" };
+    if (kind !== "command") {
+      // A kind this version doesn't know — don't present it as a plain command.
+      return { name: "Bash", input, unshowable: `codex asked for an approval of an unknown kind (${kind})` };
+    }
+    // Network access with no command is not a shell command: its own name, so
+    // Bash hooks and Bash auto-approval don't apply to it.
+    if (!command && network) return { name: "codex_network_access", input };
+    if (!command) return { name: "Bash", input, unshowable: "codex didn't say what the command is" };
     return { name: "Bash", input };
   }
   if (method === "item/fileChange/requestApproval") {

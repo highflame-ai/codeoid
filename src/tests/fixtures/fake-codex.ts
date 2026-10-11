@@ -106,7 +106,11 @@ async function runTurn(threadId: string, prompt: string): Promise<void> {
     // codex 0.154: the diff rides item/started; the approval request has none.
     const changes = [{ path: "a.txt", kind: "update", diff: "-old\n+new\n" }];
     const announce = !prompt.includes("nodiff");
-    if (announce) send({ method: "item/started", params: { item: { id: "item-fc-1", type: "fileChange", changes, status: "inProgress" } } });
+    if (prompt.includes("streamed")) {
+      // apply_patch_streaming_events: started with nothing, the patch follows.
+      send({ method: "item/started", params: { item: { id: "item-fc-1", type: "fileChange", changes: [], status: "inProgress" } } });
+      send({ method: "item/fileChange/patchUpdated", params: { threadId, turnId: "turn-1", itemId: "item-fc-1", changes } });
+    } else if (announce) send({ method: "item/started", params: { item: { id: "item-fc-1", type: "fileChange", changes, status: "inProgress" } } });
     const reply = await serverRequest("item/fileChange/requestApproval", {
       threadId,
       turnId: "turn-1",
@@ -147,7 +151,20 @@ async function runTurn(threadId: string, prompt: string): Promise<void> {
       serverRequest("item/commandExecution/requestApproval", { threadId, turnId: "turn-1", itemId: "item-zsh-1", approvalId: "sub-a", command: "cc a.c", startedAtMs: 0 }),
       serverRequest("item/commandExecution/requestApproval", { threadId, turnId: "turn-1", itemId: "item-zsh-1", approvalId: "sub-b", command: "rm -rf out", startedAtMs: 0 }),
     ]);
+    send({ method: "item/completed", params: { item: { id: "item-zsh-1", type: "commandExecution", command: "make", aggregatedOutput: "built", status: "completed" } } });
     send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `subs:${String(a.decision)},${String(b.decision)}` } } });
+  } else if (prompt.includes("sub-nocommand")) {
+    send({ method: "item/started", params: { item: { id: "item-zsh-2", type: "commandExecution", command: "make", status: "inProgress" } } });
+    const r = await serverRequest("item/commandExecution/requestApproval", { threadId, turnId: "turn-1", itemId: "item-zsh-2", approvalId: "sub-x", command: null, startedAtMs: 0 });
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `sub:${String(r.decision)}` } } });
+  } else if (prompt.includes("odd-kind")) {
+    const r = await serverRequest("item/commandExecution/requestApproval", { threadId, turnId: "turn-1", itemId: "item-k-1", kind: "somethingNew", command: "ls", startedAtMs: 0 });
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `kind:${String(r.decision)}` } } });
+  } else if (prompt.includes("net-only")) {
+    const r = await serverRequest("item/commandExecution/requestApproval", {
+      threadId, turnId: "turn-1", itemId: "item-n-1", command: null, startedAtMs: 0, networkApprovalContext: { host: "example.com", protocol: "https" },
+    });
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: `net:${String(r.decision)}` } } });
   } else if (prompt.includes("codex-declines")) {
     // codex declined an item on its own (e.g. its own policy, or an approval
     // round-trip that failed) — no request reached the client.

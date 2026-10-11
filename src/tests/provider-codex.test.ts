@@ -297,6 +297,69 @@ describe("CodexProvider over fake-codex", () => {
     expect(new Set(ids).size).toBe(2);
     expect(ids.sort()).toEqual(["codex-item-zsh-1:sub-a", "codex-item-zsh-1:sub-b"]);
     expect(events.some((e) => e.type === "text_done" && (e as { content?: string }).content === "subs:accept,decline")).toBe(true);
+    // codex completes only the PARENT; the approved sub-card must close with it.
+    const subDone = events.find((e) => e.type === "tool_complete" && (e as { sdkToolUseId?: string }).sdkToolUseId === "item-zsh-1:sub-a") as
+      | { success: boolean }
+      | undefined;
+    expect(subDone?.success).toBe(true);
+  });
+
+  it("C3j (#369): a streamed patch — the approval shows the latest diff, not the empty start", async () => {
+    const p = makeProvider();
+    const gated: Array<Record<string, unknown>> = [];
+    await collect(
+      p.runTurn(
+        turnOpts("file-change streamed please", {
+          canUseTool: async (_t, _a, _n, input) => {
+            gated.push(input);
+            return { behavior: "allow" as const };
+          },
+        }),
+      ),
+    );
+    await p.teardown();
+    expect(gated).toEqual([{ changes: [{ path: "a.txt", kind: "update", diff: "-old\n+new\n" }] }]);
+  });
+
+  for (const [label, prompt, want] of [
+    ["a subcommand with no command never shows the parent's", "sub-nocommand please", "sub:decline"],
+    ["an unknown approval kind", "odd-kind please", "kind:decline"],
+  ] as const) {
+    it(`C3k (#369): ${label} is declined without asking`, async () => {
+      const p = makeProvider();
+      let asked = false;
+      const events = await collect(
+        p.runTurn(
+          turnOpts(prompt, {
+            canUseTool: async () => {
+              asked = true;
+              return { behavior: "allow" as const };
+            },
+          }),
+        ),
+      );
+      await p.teardown();
+      expect(asked).toBe(false);
+      expect(events.some((e) => e.type === "text_done" && (e as { content?: string }).content === want)).toBe(true);
+    });
+  }
+
+  it("C3l (#369): network access with no command is its own tool, not Bash", async () => {
+    const p = makeProvider();
+    const seen: Array<{ name: string; input: Record<string, unknown> }> = [];
+    await collect(
+      p.runTurn(
+        turnOpts("net-only please", {
+          canUseTool: async (_t, _a, name, input) => {
+            seen.push({ name, input });
+            return { behavior: "deny" as const };
+          },
+        }),
+      ),
+    );
+    await p.teardown();
+    expect(seen[0]?.name).toBe("codex_network_access");
+    expect(seen[0]?.input.network).toEqual({ host: "example.com", protocol: "https" });
   });
 
   it("C3d (#369): a permissions request is answered with a grant — the requested profile, or nothing", async () => {

@@ -11,6 +11,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Database } from "bun:sqlite";
 import { Session } from "../daemon/session.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
 import type { ProviderEvent } from "../daemon/providers/interface.js";
@@ -68,6 +69,13 @@ describe("a tool call the backend settles itself (#369)", () => {
     await until(() => provider.canUseToolResults.length === 0 && session.status !== "waiting_approval" && session.status !== "idle");
     expect(session.status).toBe("thinking");
     expect(session.pendingToolApprovals()).toEqual([]);
+    // Attributed in the audit log, and a late click is "stale" — never buffered
+    // as an early decision for a dead id.
+    const db = new Database(join(tmp, "codeoid.db"), { readonly: true });
+    const rows = db.query("SELECT action FROM audit_log WHERE action = 'session.backend_settled'").all();
+    db.close();
+    expect(rows).toHaveLength(1);
+    expect(session.approve("codex-t1", true, AUTH)).toBe("stale");
     await session.destroy(AUTH);
   });
 });

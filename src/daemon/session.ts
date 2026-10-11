@@ -4917,6 +4917,26 @@ export class Session {
         // and what a switched-to backend later sees (redaction use case).
         const msgId = this.#toolUseIdToMessageId.get(event.sdkToolUseId);
         const hookToolName = msgId ? this.#toolCallMessages.get(msgId)?.tool?.name : undefined;
+        // A call announced as needing approval that completes without ever
+        // reaching the gate: the backend settled it itself (codex declining an
+        // approval it can't show, #369). Drop its approval mapping — a late
+        // click must not buffer an "early" decision for a dead id — and audit
+        // it, so every decision on a call is attributed.
+        if (msgId) {
+          const wasWaiting = this.#toolCallMessages.get(msgId)?.tool?.state.phase === "waiting_confirmation";
+          for (const [aid, mid] of this.#approvalIdToMessageId) {
+            if (mid !== msgId || this.#pendingApprovals.has(aid)) continue;
+            this.#approvalIdToMessageId.delete(aid);
+            if (wasWaiting) {
+              this.#store.audit(
+                SYSTEM_IDENTITY.sub,
+                "session.backend_settled",
+                this.id,
+                `tool=${hookToolName ?? "unknown"} approvalId=${aid} provider=${this.#provider.id}`,
+              );
+            }
+          }
+        }
         let output = event.output;
         if (this.#hookBus?.hasHooks("tool_result", hookToolName)) {
           const patched = await this.#hookBus.dispatchToolResult(this.#hookContext(), {
@@ -4963,7 +4983,10 @@ export class Session {
         // Also leave waiting_approval when nothing is parked: a backend can
         // announce a call and settle it itself, never asking (#369) — the
         // session must not keep showing "waiting approval" for it.
-        if (this.#status === "tool_running" || (this.#status === "waiting_approval" && this.#pendingApprovals.size === 0)) {
+        if (
+          this.#status === "tool_running" ||
+          (this.#status === "waiting_approval" && this.#pendingApprovals.size === 0 && this.#pendingUiRequests.size === 0)
+        ) {
           this.#setTurnStatus("thinking");
         }
         break;
