@@ -113,11 +113,16 @@ export function isElicitationTool(name: string): boolean {
  *  a hard sandbox — a determined agent could still mutate files via Bash
  *  (`>`, tee, sed -i, git apply). The role's system-prompt contract instructs
  *  the model not to; a true sandbox (Shield/OS fence) is a later slice. */
-const WRITE_TOOLS = new Set<string>(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
+const WRITE_TOOLS = new Set<string>(["Write", "Edit", "MultiEdit", "NotebookEdit", "codex_file_change"]);
 
 /** Built-in network tools. A role with `network:false` may not use these;
  *  `read-only` and `true` allow them (both built-ins are read-only fetches). */
 const NETWORK_TOOLS = new Set<string>(["WebFetch", "WebSearch"]);
+
+/** Network grants that open egress rather than fetch read-only — codex's
+ *  managed-network approval (#369). Only a role with `network: true` may use
+ *  them; `read-only` does not cover open egress. */
+const OPEN_NETWORK_TOOLS = new Set<string>(["codex_network_access"]);
 
 export function isWriteTool(name: string): boolean {
   return WRITE_TOOLS.has(name);
@@ -148,6 +153,9 @@ export function roleDeniesTool(role: ToolRole, toolName: string): string | null 
   }
   if (role.network === false && isNetworkTool(toolName)) {
     return `capability role forbids network access (network: false) — "${toolName}" is not permitted`;
+  }
+  if (role.network !== true && role.network !== undefined && OPEN_NETWORK_TOOLS.has(toolName)) {
+    return `capability role limits network access (network: ${String(role.network)}) — "${toolName}" opens egress and is not permitted`;
   }
   return null;
 }

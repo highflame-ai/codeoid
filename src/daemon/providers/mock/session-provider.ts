@@ -40,6 +40,12 @@ export { mockResult } from "./index.js";
 export class MockSessionProvider implements SessionProvider {
   /** Tests flip this to model a backend that can't apply a rewrite (#367). */
   appliesToolInputRewrite = true;
+  /**
+   * Tool ids announced WITHOUT going through canUseTool — how a backend
+   * reports a call it settled itself (codex declining an unshowable approval,
+   * #369). Tests add ids here.
+   */
+  readonly ungatedToolIds = new Set<string>();
   readonly id: string;
   readonly displayName: string;
 
@@ -299,7 +305,7 @@ export class MockSessionProvider implements SessionProvider {
         break; // queue was closed by interrupt()
       }
 
-      if (event.type === "tool_start") {
+      if (event.type === "tool_start" && !this.ungatedToolIds.has(event.toolId)) {
         // Use setTimeout(0) to flush ALL pending microtasks — this ensures
         // Session's #handleProviderEvent fully processes tool_start (registering
         // the approvalId in #approvalIdToMessageId) before we call canUseTool.

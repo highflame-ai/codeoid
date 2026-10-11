@@ -11,10 +11,9 @@
  *
  * A hook REWRITE is listed only on backends that run the rewritten input;
  * on one that runs its own input (codex, the Gemini CLI, qwen) the call is
- * refused before it parks, so it never appears here (#367). Known limit
- * (tracked in #368): codex ties an MCP elicitation to its call by server
- * name, so with two calls in flight to one server the input shown can be the
- * other call's.
+ * refused before it parks, so it never appears here (#367). A codex MCP
+ * approval names only the server; it is tied to its call by the tool and
+ * arguments codex reports, and declined when that is ambiguous (#368).
  */
 
 // ── Messages (client → daemon) ────────────────────────────────────────────────
