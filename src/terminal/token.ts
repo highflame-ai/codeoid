@@ -9,7 +9,7 @@
  */
 
 import { resolveLocalToken, type CodeoidConfig } from "../config.js";
-import { CONTROL_MCP_PATH } from "../daemon/mcp/control-http.js";
+import { CONTROL_MCP_PATH } from "../daemon/mcp/control-path.js";
 import { ALL_SCOPES_STRING, SCOPES, type Scope } from "../protocol/scopes.js";
 
 /** Why no token could be had — `lines` are the operator-facing explanation. */
@@ -94,10 +94,14 @@ export const MCP_SCOPE_PRESETS: Record<string, readonly Scope[]> = {
   ],
 };
 
+/** Own-property check, so `constructor` or `__proto__` is never a "preset". */
+export function isPreset(spec: string): boolean {
+  return Object.hasOwn(MCP_SCOPE_PRESETS, spec);
+}
+
 /** A preset name, or a comma/space-separated scope list, as a scope string. */
 export function resolveMcpScopes(spec: string): string {
-  const preset = MCP_SCOPE_PRESETS[spec];
-  if (preset) return preset.join(" ");
+  if (isPreset(spec)) return MCP_SCOPE_PRESETS[spec]!.join(" ");
   const known = new Set<string>(Object.values(SCOPES));
   const parts = spec.split(/[\s,]+/).filter(Boolean);
   const unknown = parts.filter((p) => !known.has(p));
@@ -118,4 +122,11 @@ export function controlUrl(daemonUrl: string): string {
   u.search = "";
   u.hash = "";
   return u.toString();
+}
+
+/** True when the URL would carry the bearer token in cleartext off this machine. */
+export function cleartextOffHost(url: string): boolean {
+  const u = new URL(url);
+  if (u.protocol !== "http:") return false;
+  return !["127.0.0.1", "localhost", "[::1]", "::1"].includes(u.hostname);
 }

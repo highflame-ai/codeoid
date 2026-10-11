@@ -90,8 +90,11 @@ A typical CI step: `create_session`, then `send_message` with `wait: true`, then
 
 - `idle`: the turn finished; `reply` holds what the agent said.
 - `waiting_approval` or `waiting_dialog`: the agent wants to do something its owner has to approve. The caller cannot approve it; tell a person.
-- `error`: the turn failed; `read_transcript` shows why.
+- `error`: the turn failed; `notices` carries the system messages that explain why.
 - `still_working`: the wait timed out; call `wait_for_session` again.
+- `destroyed`: the session was destroyed while you waited.
+
+Each caller may hold 16 waits at once; past that, poll `get_session` instead.
 
 ## Security model
 
@@ -100,8 +103,9 @@ This endpoint can start agents and prompt them, so it gets no shortcuts.
 - **Same authentication.** The bearer token is verified on every request by the same verifier the WebSocket handshake uses: a ZeroID JWT, or the local-mode token. There is no separate key. The token is read only from the `Authorization` header, never from the URL.
 - **Same authorization.** Each tool becomes an ordinary protocol message, checked by the protocol schema and handled by the same function that enforces scopes and tenancy for every WebSocket client. A token that cannot create a session over WebSocket cannot create one here.
 - **Driving is not authorizing.** There is no approve tool. A session prompted through this endpoint still parks every guarded tool call (a shell command, a file write) on its owner's approval, exactly as if the prompt had been typed.
-- **Dispatcher sessions are off limits for actions.** The conductor and its workers are run by codeoid's dispatcher; this endpoint can read them but not prompt, interrupt, or destroy them.
+- **Dispatcher and collaborative sessions are off limits for actions.** The conductor, its workers, and a collaborative goal's orchestrator and role children are steered by codeoid itself; this endpoint can read them but not prompt, interrupt, or destroy them. Because that check needs the target's role, every act tool also requires `session:list`; all three presets include it.
 - **Plain sessions only.** `create_session` accepts a name, workdir, backend, and model, and nothing else: no roles, collaborations, or packs.
+- **Failed authentication is throttled.** After 20 failed attempts in a minute from one address, the endpoint answers 429 for the rest of that minute without verifying anything. A forged token cannot make the daemon fetch the issuer's keys in a loop.
 - **Every call is attributed.** Each call writes an `mcp.control.call` audit row under the caller's subject, with the delegating principal for an agent token and the outcome, alongside the rows the ordinary path writes (`session.send`, `session.create`, …). A prompt sent by an agent appears in the transcript as that agent's message.
 
 ### Known limits
@@ -109,3 +113,4 @@ This endpoint can start agents and prompt them, so it gets no shortcuts.
 - Revocation takes effect when the token is next verified, which is every request, but a revoked ZeroID token that has not expired is still accepted until expiry, as it is on a WebSocket connection.
 - `requireDelegated` needs tokens minted by delegation (RFC 8693). `codeoid mcp headers` exchanges the configured API key, so the caller's identity is the key's identity. A handshake in which each external agent exchanges its own credential for a codeoid-scoped delegated token is the next step.
 - Responses are single JSON documents, so there is no progress stream; long work is followed with `wait_for_session`.
+- `read_transcript` with a `before` cursor that is not in the session's memory scans its on-disk transcript (bounded at 64 MB and 5 seconds), as the WebSocket `scrollback.page` does. A caller can repeat that scan; throttling it is a follow-up.

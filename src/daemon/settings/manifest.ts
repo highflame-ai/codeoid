@@ -344,6 +344,9 @@ const fleet: SettingsTab = {
           default: false,
         }),
         cfg("mcpControl.maxWaitSeconds", "Max wait (s)", "Upper bound for `wait_for_session`.", { kind: "int", min: 1, max: 600, default: 120, advanced: true }),
+        // mcpControl.allowedOrigins is file-config only on purpose: it is the
+        // DNS-rebinding guard, and widening it from a browser settings page is
+        // exactly the vector it closes.
       ],
     },
   ],

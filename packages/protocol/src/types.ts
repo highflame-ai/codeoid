@@ -1245,7 +1245,9 @@ export interface ScrollbackPageMsg extends BaseClientMsg {
    * Absent = the NEWEST page: the latest history that fits the budget. Lets a
    * client that never attached (one-shot CLI, the `/mcp/control` endpoint)
    * read a session's recent transcript, then page older with the oldest id it
-   * got back.
+   * got back. Daemons from before this field became optional reject the
+   * anchor-less form as `invalid_request`; a client talking to an unknown
+   * daemon should be ready to fall back to attaching.
    */
   beforeMessageId?: string;
   /** Soft byte budget for the page (defaults ~256 KiB, daemon-clamped). */

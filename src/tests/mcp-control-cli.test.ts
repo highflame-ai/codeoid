@@ -9,7 +9,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { acquireToken, controlUrl, MCP_SCOPE_PRESETS, resolveMcpScopes, TokenError } from "../terminal/token.js";
+import { acquireToken, cleartextOffHost, controlUrl, MCP_SCOPE_PRESETS, resolveMcpScopes, TokenError } from "../terminal/token.js";
 import { mcpConfig, mcpHeaders } from "../terminal/mcp-control-cli.js";
 import { SCOPES } from "../protocol/scopes.js";
 
@@ -120,6 +120,20 @@ describe("mcp config", () => {
       mcpServers: Record<string, { headersHelper: string }>;
     };
     expect(cfg.mcpServers.c!.headersHelper).toBe("codeoid mcp headers --scopes session:list,session:send");
+  });
+
+  it("never treats an inherited property name as a preset", () => {
+    for (const name of ["constructor", "__proto__", "toString"]) {
+      expect(() => resolveMcpScopes(name)).toThrow(TokenError);
+      expect(() => mcpConfig(BASE, { name: "c", scopes: name })).toThrow(TokenError);
+    }
+  });
+
+  it("flags only an off-host plain-http URL as cleartext", () => {
+    expect(cleartextOffHost("http://127.0.0.1:7400/mcp/control")).toBe(false);
+    expect(cleartextOffHost("http://localhost:7400/mcp/control")).toBe(false);
+    expect(cleartextOffHost("https://codeoid.example/mcp/control")).toBe(false);
+    expect(cleartextOffHost("http://10.0.0.5:7400/mcp/control")).toBe(true);
   });
 
   it("refuses anything that could smuggle shell syntax into the helper", () => {

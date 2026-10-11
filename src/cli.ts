@@ -38,7 +38,7 @@ import { CAPABILITIES, type CollaborationConfig } from "./protocol/types.js";
 import { ALL_SCOPES_STRING } from "./protocol/scopes.js";
 import { TerminalClient } from "./terminal/client.js";
 import { mcpConfig, mcpHeaders } from "./terminal/mcp-control-cli.js";
-import { MCP_SCOPE_PRESETS, TokenError } from "./terminal/token.js";
+import { cleartextOffHost, controlUrl, MCP_SCOPE_PRESETS, TokenError } from "./terminal/token.js";
 import { parseTargets } from "./terminal/compare.js";
 import {
   getConfigDir,
@@ -809,7 +809,13 @@ mcp
   .option("--name <name>", "server name in the client", "codeoid")
   .action((opts: { scopes: string; name: string }) => {
     try {
-      console.log(JSON.stringify(mcpConfig(loadConfig(), opts), null, 2));
+      const config = loadConfig();
+      console.log(JSON.stringify(mcpConfig(config, opts), null, 2));
+      if (cleartextOffHost(controlUrl(config.daemonUrl))) {
+        console.error(
+          "\nWarning: this URL is plain http to another host — the bearer token would cross the network unencrypted. Put the daemon behind TLS (wss://) first.",
+        );
+      }
     } catch (err) {
       if (err instanceof TokenError) {
         for (const line of err.lines) console.error(line);

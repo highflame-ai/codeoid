@@ -591,7 +591,10 @@ export class DaemonServer {
         // every other client gets. Off by default: not mounted = 404, so a
         // probe cannot even tell it exists.
         if (url.pathname === CONTROL_MCP_PATH && self.#controlMcp) {
-          return self.#controlMcp.handle(req);
+          return self.#controlMcp.handle(req, {
+            extendTimeout: (seconds) => server.timeout(req, seconds),
+            clientIp: server.requestIP(req)?.address,
+          });
         }
 
         // The provider's redirect after an MCP server sign-in. Unauthenticated

@@ -58,8 +58,9 @@ import {
   type JsonRpcResponse,
 } from "./jsonrpc-http.js";
 
-/** Path the endpoint is mounted at on the daemon's HTTP server. */
-export const CONTROL_MCP_PATH = "/mcp/control";
+import { CONTROL_MCP_PATH } from "./control-path.js";
+
+export { CONTROL_MCP_PATH };
 
 const SERVER_INFO = { name: "codeoid", version: "0.1.0" } as const;
 
@@ -81,6 +82,15 @@ const MESSAGE_CONTENT_MAX = 8_000;
 const TRANSCRIPT_DEFAULT_BYTES = 64 * 1024;
 const TRANSCRIPT_MAX_BYTES = 256 * 1024;
 const WAIT_POLL_MS = 500;
+/**
+ * Concurrent waits one subject may hold. Each wait polls the session list
+ * twice a second, so without a bound one token could pin the event loop with
+ * a few hundred parallel calls. Generous for real use (a CI fan-out), small
+ * against abuse.
+ */
+export const MAX_WAITS_PER_SUBJECT = 16;
+/** Request-timeout headroom past `maxWaitSeconds`, for the work around a wait. */
+export const WAIT_HEADROOM_SECONDS = 30;
 
 /** What the endpoint needs from the daemon — narrow on purpose, so the
  *  unit tests can stand it up without a SessionManager. */
@@ -111,6 +121,8 @@ class ToolError extends Error {
 interface CallContext {
   auth: AuthContext;
   signal: AbortSignal;
+  /** Admit one wait for this subject, or throw rate_limited; returns the release. */
+  admitWait(): () => void;
   /** Run one ClientMessage through SessionManager.handle (schema-validated). */
   call(msg: Record<string, unknown>): Promise<DaemonMessage>;
   /** The session the call ended up acting on — recorded in the audit row. */
@@ -253,9 +265,23 @@ async function sessionInfo(ctx: CallContext, ref: string): Promise<SessionInfo> 
 async function actionTarget(ctx: CallContext, ref: string): Promise<string> {
   const found = await resolveSession(ctx, ref);
   ctx.sessionId = found.id;
-  if ("role" in found && found.role) {
+  // Fail closed: without session:list the target's role is unknowable, and
+  // acting blind would let a send-only token prompt the conductor or destroy
+  // a dispatcher's worker — the very thing this check exists to refuse.
+  if (!("status" in found)) {
+    throw new ToolError("acting through this endpoint also needs session:list, to verify the target session", "forbidden");
+  }
+  if (found.role) {
     throw new ToolError(
       `"${found.name}" is a ${found.role} session — it is driven by codeoid's own dispatcher, not over this endpoint`,
+      "forbidden",
+    );
+  }
+  // A collaborative goal's orchestrator spawns and steers role children:
+  // prompting it is dispatch by proxy, which v1 leaves out.
+  if (found.collaboration || found.collaborationRole) {
+    throw new ToolError(
+      `"${found.name}" is part of a collaborative session — drive it from codeoid itself, not over this endpoint`,
       "forbidden",
     );
   }
@@ -281,18 +307,32 @@ async function newestPage(
   return { messages: res.messages, hasMore: res.hasMore };
 }
 
+type WaitResult = { info: SessionInfo; settled: boolean } | { gone: true };
+
 async function waitUntilSettled(
   ctx: CallContext,
   sessionId: string,
   timeoutMs: number,
   sleep: (ms: number) => Promise<void>,
-): Promise<{ info: SessionInfo; settled: boolean }> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const info = await sessionInfo(ctx, sessionId);
-    if (settled(info)) return { info, settled: true };
-    if (Date.now() >= deadline || ctx.signal.aborted) return { info, settled: false };
-    await sleep(Math.min(WAIT_POLL_MS, Math.max(0, deadline - Date.now())));
+): Promise<WaitResult> {
+  const release = ctx.admitWait();
+  try {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      let info: SessionInfo;
+      try {
+        info = await sessionInfo(ctx, sessionId);
+      } catch (err) {
+        // Destroyed while we waited (by its owner, or another caller).
+        if (err instanceof ToolError && err.code === "not_found") return { gone: true };
+        throw err;
+      }
+      if (settled(info)) return { info, settled: true };
+      if (Date.now() >= deadline || ctx.signal.aborted) return { info, settled: false };
+      await sleep(Math.min(WAIT_POLL_MS, Math.max(0, deadline - Date.now())));
+    }
+  } finally {
+    release();
   }
 }
 
@@ -302,7 +342,7 @@ async function waitUntilSettled(
  * the prompt has scrolled out of the newest page, the page's assistant tail is
  * returned instead.
  */
-function replyTo(messages: SessionMessage[], sub: string): Record<string, unknown>[] {
+function replyTo(messages: SessionMessage[], sub: string): { reply: Record<string, unknown>[]; notices: Record<string, unknown>[] } {
   let start = 0;
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i]!;
@@ -311,7 +351,13 @@ function replyTo(messages: SessionMessage[], sub: string): Record<string, unknow
       break;
     }
   }
-  return messages.slice(start).filter((m) => m.role === "assistant").map(shapeMessage);
+  const after = messages.slice(start);
+  return {
+    reply: after.filter((m) => m.role === "assistant").map(shapeMessage),
+    // System rows are where a failed send, a turn error, or an interrupt is
+    // explained — without them an `error` outcome arrives with no reason.
+    notices: after.filter((m) => m.role === "system").map(shapeMessage),
+  };
 }
 
 function outcomeOf(info: SessionInfo, isSettled: boolean): string {
@@ -477,8 +523,9 @@ function buildTools(config: McpControlConfig, sleep: (ms: number) => Promise<voi
       async run(args, ctx) {
         const first = await sessionInfo(ctx, args.session as string);
         const timeoutMs = ((args.timeoutSeconds as number | undefined) ?? defaultWaitMs / 1000) * 1000;
-        const { info, settled: done } = await waitUntilSettled(ctx, first.id, timeoutMs, sleep);
-        return { outcome: outcomeOf(info, done), session: summarize(info) };
+        const waited = await waitUntilSettled(ctx, first.id, timeoutMs, sleep);
+        if ("gone" in waited) return { outcome: "destroyed" };
+        return { outcome: outcomeOf(waited.info, waited.settled), session: summarize(waited.info) };
       },
     },
     {
@@ -566,16 +613,19 @@ function buildTools(config: McpControlConfig, sleep: (ms: number) => Promise<voi
         if (!args.wait) return { sent: true, ...(duplicate ? { duplicate: true } : {}) };
 
         const timeoutMs = ((args.timeoutSeconds as number | undefined) ?? defaultWaitMs / 1000) * 1000;
-        const { info, settled: done } = await waitUntilSettled(ctx, id, timeoutMs, sleep);
+        const waited = await waitUntilSettled(ctx, id, timeoutMs, sleep);
+        if ("gone" in waited) return { sent: true, ...(duplicate ? { duplicate: true } : {}), outcome: "destroyed" };
         const out: Record<string, unknown> = {
           sent: true,
           ...(duplicate ? { duplicate: true } : {}),
-          outcome: outcomeOf(info, done),
-          session: summarize(info),
+          outcome: outcomeOf(waited.info, waited.settled),
+          session: summarize(waited.info),
         };
-        if (done && canRead(ctx.auth)) {
+        if (waited.settled && canRead(ctx.auth)) {
           const page = await newestPage(ctx, id, TRANSCRIPT_DEFAULT_BYTES);
-          out.reply = replyTo(page.messages, ctx.auth.sub);
+          const { reply, notices } = replyTo(page.messages, ctx.auth.sub);
+          out.reply = reply;
+          if (notices.length > 0) out.notices = notices;
         }
         return out;
       },
@@ -611,6 +661,33 @@ function buildTools(config: McpControlConfig, sleep: (ms: number) => Promise<voi
 
 // ── Endpoint ─────────────────────────────────────────────────────────────────
 
+/**
+ * The request body as text, or null once it passes `max` bytes. Streamed, so a
+ * chunked body with no Content-Length is cut off at the cap instead of being
+ * buffered whole before the size check.
+ */
+async function readCapped(req: Request, max: number): Promise<string | null> {
+  if (!req.body) return "";
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > max) {
+      await reader.cancel().catch(() => {});
+      return null;
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+/** Failed authentications allowed per client address per minute. */
+export const AUTH_FAILURES_PER_MINUTE = 20;
+const AUTH_FAILURE_WINDOW_MS = 60_000;
+
 function jsonError(status: number, error: string, extra: Record<string, string> = {}): Response {
   return new Response(JSON.stringify({ error }), {
     status,
@@ -623,6 +700,28 @@ export class ControlMcpHttp {
   readonly #host: ControlHost;
   readonly #config: McpControlConfig;
   readonly #tools: ToolDef[];
+  /** Live waits per subject (see MAX_WAITS_PER_SUBJECT). */
+  readonly #waits = new Map<string, number>();
+  /** Recent failed-auth timestamps per client address. */
+  readonly #authFailures = new Map<string, number[]>();
+
+  #authAttemptAllowed(ip: string): boolean {
+    const now = Date.now();
+    // Sweep dead entries so a scan from many addresses can't grow the map.
+    for (const [k, hits] of this.#authFailures) {
+      const newest = hits[hits.length - 1];
+      if (newest === undefined || now - newest >= AUTH_FAILURE_WINDOW_MS) this.#authFailures.delete(k);
+    }
+    const recent = (this.#authFailures.get(ip) ?? []).filter((t) => now - t < AUTH_FAILURE_WINDOW_MS);
+    if (recent.length > 0) this.#authFailures.set(ip, recent);
+    return recent.length < AUTH_FAILURES_PER_MINUTE;
+  }
+
+  #recordAuthFailure(ip: string): void {
+    const hits = this.#authFailures.get(ip) ?? [];
+    hits.push(Date.now());
+    this.#authFailures.set(ip, hits);
+  }
 
   constructor(opts: ControlMcpOptions) {
     this.#verifier = opts.verifier;
@@ -646,8 +745,22 @@ export class ControlMcpHttp {
     return this.#reachable(t) && t.anyScope.some((x) => hasScope(s, x));
   }
 
-  /** Bun.serve fetch handler for {@link CONTROL_MCP_PATH}. */
-  async handle(req: Request): Promise<Response> {
+  /**
+   * Bun.serve fetch handler for {@link CONTROL_MCP_PATH}.
+   *
+   * `extendTimeout` sets this one request's timeout explicitly. A tool call
+   * that waits on an agent's turn is legitimately pending for minutes, while
+   * Bun.serve's `idleTimeout` is 10 s. Today Bun applies that timer to GETs
+   * but not to POSTs with a body (measured on 1.3.13), which is all MCP sends,
+   * so waits already survive — this states the bound we rely on instead of
+   * depending on that, and caps it at the operator's wait limit.
+   */
+  async handle(
+    req: Request,
+    opts: { extendTimeout?: (seconds: number) => void; clientIp?: string } = {},
+  ): Promise<Response> {
+    const { extendTimeout } = opts;
+    const ip = opts.clientIp ?? "unknown";
     // DNS-rebinding guard (MCP Streamable HTTP §security): a browser page on
     // another origin must not reach a loopback daemon. Agents send no Origin.
     const origin = req.headers.get("origin");
@@ -663,7 +776,20 @@ export class ControlMcpHttp {
     // sessions; a query string ends up in proxy and shell history.
     const authz = req.headers.get("authorization");
     const token = authz && /^bearer\s+/i.test(authz) ? authz.replace(/^bearer\s+/i, "").trim() : "";
-    if (!token) return jsonError(401, "unauthorized", { "WWW-Authenticate": "Bearer" });
+    // Pre-auth throttle. Verifying a forged JWT with an unknown `kid` makes
+    // the verifier refetch the issuer's JWKS, so unthrottled garbage tokens
+    // would turn this endpoint into a fetch amplifier against ZeroID. Only
+    // FAILED attempts count toward the limit; once an address hits it, all of
+    // its requests wait out the window (at most a minute) — on a loopback
+    // daemon that is every local caller, but reaching it already takes local
+    // access.
+    if (!this.#authAttemptAllowed(ip)) {
+      return jsonError(429, "too many failed authentications", { "Retry-After": "60" });
+    }
+    if (!token) {
+      this.#recordAuthFailure(ip);
+      return jsonError(401, "unauthorized", { "WWW-Authenticate": "Bearer" });
+    }
 
     let auth: AuthContext;
     try {
@@ -671,9 +797,11 @@ export class ControlMcpHttp {
     } catch {
       // Fail closed, and don't echo why — the reason helps an attacker more
       // than a legitimate caller, who can check the token with `codeoid login`.
+      this.#recordAuthFailure(ip);
       return jsonError(401, "unauthorized", { "WWW-Authenticate": 'Bearer error="invalid_token"' });
     }
     if (typeof auth.exp === "number" && auth.exp > 0 && auth.exp <= Math.floor(Date.now() / 1000)) {
+      this.#recordAuthFailure(ip);
       return jsonError(401, "unauthorized", { "WWW-Authenticate": 'Bearer error="invalid_token"' });
     }
     if (this.#config.requireDelegated && auth.delegationDepth < 1) {
@@ -683,13 +811,13 @@ export class ControlMcpHttp {
 
     const declared = Number(req.headers.get("content-length") ?? "0");
     if (declared > MAX_BODY_BYTES) return jsonError(413, "request too large");
-    let raw: string;
+    let raw: string | null;
     try {
-      raw = await req.text();
+      raw = await readCapped(req, MAX_BODY_BYTES);
     } catch {
       return Response.json(rpcErr(null, -32700, "Parse error"), { status: 400 });
     }
-    if (Buffer.byteLength(raw, "utf8") > MAX_BODY_BYTES) return jsonError(413, "request too large");
+    if (raw === null) return jsonError(413, "request too large");
     let body: unknown;
     try {
       body = JSON.parse(raw);
@@ -702,6 +830,9 @@ export class ControlMcpHttp {
       return Response.json(rpcErr(null, -32600, "Invalid Request: one JSON-RPC message per POST"), { status: 400 });
     }
 
+    // Only a tool call can wait; give it the operator's cap plus headroom for
+    // the reply read that follows the wait.
+    if ((body as JsonRpcMessage).method === "tools/call") extendTimeout?.(this.#config.maxWaitSeconds + WAIT_HEADROOM_SECONDS);
     const res = await this.#dispatch(body as JsonRpcMessage, auth, req.signal);
     if (!res) return new Response(null, { status: 202 });
     return Response.json(res);
@@ -751,6 +882,21 @@ export class ControlMcpHttp {
     const ctx: CallContext = {
       auth,
       signal,
+      admitWait: () => {
+        const live = this.#waits.get(auth.sub) ?? 0;
+        if (live >= MAX_WAITS_PER_SUBJECT) {
+          throw new ToolError(`too many concurrent waits (${MAX_WAITS_PER_SUBJECT}) for this caller — poll get_session instead`, "rate_limited");
+        }
+        this.#waits.set(auth.sub, live + 1);
+        let released = false;
+        return () => {
+          if (released) return;
+          released = true;
+          const n = (this.#waits.get(auth.sub) ?? 1) - 1;
+          if (n <= 0) this.#waits.delete(auth.sub);
+          else this.#waits.set(auth.sub, n);
+        };
+      },
       call: async (partial) => {
         const parsed = parseClientMessage({ ...partial, id: randomUUID() });
         if (!parsed.ok) throw new ToolError(parsed.error, "invalid_request");
@@ -767,7 +913,9 @@ export class ControlMcpHttp {
         "mcp.control.call",
         ctx.sessionId,
         [
-          `tool=${name || "?"}`,
+          // Only a known tool name ever reaches the row — the caller's raw
+          // `name` could carry spaces or newlines and forge other fields.
+          `tool=${tool ? tool.name : "unknown"}`,
           `outcome=${isError ? `error:${code ?? "error"}` : "ok"}`,
           ...(auth.delegatedBy ? [`delegatedBy=${auth.delegatedBy}`] : []),
         ].join(" "),
@@ -780,7 +928,7 @@ export class ControlMcpHttp {
       };
     };
 
-    if (!tool) return result(`Unknown tool: ${name || String(params.name)}`, true, "unknown_tool");
+    if (!tool) return result(`Unknown tool: ${JSON.stringify(name)}`, true, "unknown_tool");
     if (!this.#reachable(tool)) {
       return result(
         `${tool.name} is disabled: this daemon allows observation only (set mcpControl.allowActions to enable it)`,

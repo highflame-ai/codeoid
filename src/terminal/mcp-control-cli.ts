@@ -10,7 +10,7 @@
  */
 
 import type { CodeoidConfig } from "../config.js";
-import { acquireToken, controlUrl, MCP_SCOPE_PRESETS, resolveMcpScopes, type AcquiredToken } from "./token.js";
+import { acquireToken, controlUrl, isPreset, resolveMcpScopes, type AcquiredToken } from "./token.js";
 
 export interface HeadersResult {
   /** The single JSON line for stdout. */
@@ -46,7 +46,7 @@ export function mcpConfig(
   config: Pick<CodeoidConfig, "daemonUrl">,
   opts: { name: string; scopes: string },
 ): Record<string, unknown> {
-  const scopeArg = MCP_SCOPE_PRESETS[opts.scopes] ? opts.scopes : resolveMcpScopes(opts.scopes).split(" ").join(",");
+  const scopeArg = isPreset(opts.scopes) ? opts.scopes : resolveMcpScopes(opts.scopes).split(" ").join(",");
   if (!/^[a-z:,]+$/.test(scopeArg)) throw new Error(`unexpected scope argument: ${scopeArg}`);
   if (!/^[A-Za-z0-9_-]{1,64}$/.test(opts.name)) {
     throw new Error("--name must be 1-64 letters, digits, '-' or '_'");

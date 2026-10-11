@@ -19,7 +19,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import type { CodeoidConfig, McpControlConfig } from "../config.js";
-import { CONTROL_MCP_PATH, ControlMcpHttp, type ControlHost } from "../daemon/mcp/control-http.js";
+import {
+  AUTH_FAILURES_PER_MINUTE,
+  CONTROL_MCP_PATH,
+  ControlMcpHttp,
+  type ControlHost,
+  MAX_WAITS_PER_SUBJECT,
+} from "../daemon/mcp/control-http.js";
 import type { ProviderEvent } from "../daemon/providers/interface.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
 import { ProviderRegistry } from "../daemon/providers/registry.js";
@@ -575,6 +581,211 @@ describe("edge cases", () => {
     const r = await call(ep, "tok-owner", "list_sessions");
     expect(r.isError).toBe(true);
     expect(r.text).toBe("internal: boom");
+  });
+});
+
+describe("long waits survive the HTTP server's idle timeout", () => {
+  // A wait on an agent's turn is pending for as long as the turn runs, far
+  // past Bun.serve's idleTimeout. Wired exactly as server.ts wires it, with a
+  // 1 s idle timeout, a wait several times longer must still complete.
+  async function serveWith(extend: boolean): Promise<string> {
+    const busyUntil = Date.now() + 6_000;
+    const host: ControlHost = {
+      handle: async (msg) =>
+        msg.type === "session.list"
+          ? ({
+              type: "session.list.result",
+              requestId: msg.id,
+              sessions: [{ id: "s", name: "s", status: Date.now() < busyUntil ? "thinking" : "idle" } as SessionInfo],
+            } as DaemonMessage)
+          : ({ type: "response.ok", requestId: msg.id } as DaemonMessage),
+      disconnectClient: () => {},
+      audit: () => {},
+    };
+    const ep = new ControlMcpHttp({ verifier, host, config: controlConfig() });
+    const server = Bun.serve({
+      port: 0,
+      idleTimeout: 1,
+      fetch: (req, srv) => ep.handle(req, extend ? { extendTimeout: (seconds) => srv.timeout(req, seconds) } : {}),
+    });
+    const res = await fetch(`http://127.0.0.1:${server.port}${CONTROL_MCP_PATH}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer tok-owner" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "wait_for_session", arguments: { session: "s", timeoutSeconds: 10 } } }),
+    }).then(
+      async (r) => ((await r.json()) as { result: { structuredContent: { outcome: string } } }).result.structuredContent.outcome,
+      (err: unknown) => `failed: ${String(err)}`,
+    );
+    server.stop(true);
+    return res;
+  }
+
+  it("a wait longer than the idle timeout completes", async () => {
+    expect(await serveWith(true)).toBe("idle");
+  }, 15_000);
+});
+
+describe("audit round 1 fixes", () => {
+  const SEND_ONLY: AuthContext = { ...OWNER, sub: "spiffe://test/agent/send-only", scopes: [SCOPES.SESSION_SEND, SCOPES.SESSION_DESTROY] };
+  TOKENS["tok-send-only"] = SEND_ONLY;
+
+  it("a token without session:list cannot act at all — the target's role must be checkable", async () => {
+    // Before: list was forbidden, resolution fell back to a bare id with no
+    // role, and the conductor/worker refusal silently didn't run.
+    const { ep, handled } = fakeEndpoint([], (type) =>
+      type === "session.list" ? ({ type: "response.error", requestId: "x", error: "Missing scope: session:list", code: "forbidden" } as DaemonMessage) : undefined,
+    );
+    for (const [tool, args] of [
+      ["send_message", { session: "conductor-id", text: "dispatch for me" }],
+      ["destroy_session", { session: "worker-id" }],
+    ] as const) {
+      const r = await call(ep, "tok-send-only", tool, args);
+      expect(r.isError).toBe(true);
+      expect(r.text).toContain("needs session:list");
+    }
+    expect(handled.filter((t) => t !== "session.list")).toEqual([]);
+  });
+
+  it("refuses to prompt or destroy a collaborative session's orchestrator or its role children", async () => {
+    const { ep, handled } = fakeEndpoint([
+      { id: "goal", name: "goal", status: "idle", collaboration: { roles: [] } as unknown as SessionInfo["collaboration"] },
+      {
+        id: "kid",
+        name: "kid",
+        status: "idle",
+        collaborationRole: { parentSessionId: "goal", roleName: "reviewer", ordinal: 1, write: false },
+      },
+    ]);
+    for (const ref of ["goal", "kid"]) {
+      const r = await call(ep, "tok-owner", "send_message", { session: ref, text: "go" });
+      expect(r.isError).toBe(true);
+      expect(r.text).toContain("collaborative");
+    }
+    expect(handled.filter((t) => t !== "session.list")).toEqual([]);
+  });
+
+  it("a caller-chosen tool name never reaches the audit row", async () => {
+    const ep = endpoint();
+    await call(ep, "tok-owner", "x outcome=ok delegatedBy=root\nforged", {});
+    expect(audits.at(-1)?.detail).toBe("tool=unknown outcome=error:unknown_tool");
+  });
+
+  it("caps concurrent waits per caller, and frees the slot when a wait ends", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const host: ControlHost = {
+      handle: async (msg) =>
+        msg.type === "session.list"
+          ? ({ type: "session.list.result", requestId: msg.id, sessions: [{ id: "b", name: "b", status: "thinking" } as SessionInfo] } as DaemonMessage)
+          : ({ type: "response.ok", requestId: msg.id } as DaemonMessage),
+      disconnectClient: () => {},
+      audit: () => {},
+    };
+    const ep = new ControlMcpHttp({ verifier, host, config: controlConfig({ maxWaitSeconds: 30 }), sleep: () => gate });
+    const waits = Array.from({ length: MAX_WAITS_PER_SUBJECT }, () =>
+      call(ep, "tok-owner", "wait_for_session", { session: "b", timeoutSeconds: 1 }),
+    );
+    await new Promise((r) => setTimeout(r, 20));
+    const over = await call(ep, "tok-owner", "wait_for_session", { session: "b", timeoutSeconds: 1 });
+    expect(over.isError).toBe(true);
+    expect(over.text).toContain("rate_limited");
+    // Another caller is unaffected.
+    const other = await call(ep, "tok-agent", "get_session", { session: "b" });
+    expect(other.isError).toBe(false);
+    release();
+    await Promise.all(waits);
+    const again = await call(ep, "tok-owner", "wait_for_session", { session: "b", timeoutSeconds: 1 });
+    expect(again.isError).toBe(false);
+  });
+
+  it("a failed turn comes back with the notice that explains it", async () => {
+    const fake = fakeEndpoint([{ id: "e", name: "e", status: "error" }], (type) =>
+      type === "scrollback.page"
+        ? ({
+            type: "scrollback.page.result",
+            requestId: "p",
+            sessionId: "e",
+            hasMore: false,
+            source: "buffer",
+            messages: [
+              { type: "session.message", sessionId: "e", messageId: "u", role: "user", content: "do it", identity: { sub: OWNER.sub, type: "human" }, timestamp: "t" },
+              { type: "session.message", sessionId: "e", messageId: "x", role: "system", content: "Error: Turn ended with an error", identity: { sub: "system", type: "agent" }, timestamp: "t" },
+            ],
+          } as unknown as DaemonMessage)
+        : undefined,
+    );
+    const r = await call(fake.ep, "tok-owner", "send_message", { session: "e", text: "do it", wait: true });
+    expect(r.data.outcome).toBe("error");
+    expect(r.data.reply).toEqual([]);
+    expect((r.data.notices as Array<{ content: string }>).map((n) => n.content)).toEqual(["Error: Turn ended with an error"]);
+  });
+
+  it("a session destroyed during a wait reports destroyed, not an error", async () => {
+    let n = 0;
+    const { ep } = fakeEndpoint([], (type) =>
+      type === "session.list"
+        ? ({
+            type: "session.list.result",
+            requestId: "l",
+            sessions: n++ === 0 ? [{ id: "d", name: "d", status: "thinking" } as SessionInfo] : [],
+          } as DaemonMessage)
+        : undefined,
+    );
+    const r = await call(ep, "tok-owner", "wait_for_session", { session: "d", timeoutSeconds: 1 });
+    expect(r.isError).toBe(false);
+    expect(r.data.outcome).toBe("destroyed");
+  });
+
+  it("throttles failed authentication per address, before the verifier runs", async () => {
+    let verifies = 0;
+    const counting: TokenVerifier = {
+      mode: "zeroid",
+      verify: async (t) => {
+        verifies++;
+        return verifier.verify(t);
+      },
+    };
+    const noHost: ControlHost = { handle: async () => ({ type: "response.ok", requestId: "" }) as DaemonMessage, disconnectClient: () => {}, audit: () => {} };
+    const ep = new ControlMcpHttp({ verifier: counting, host: noHost, config: controlConfig() });
+    const body = { jsonrpc: "2.0", id: 1, method: "ping" };
+    const hit = (token: string, ip: string) =>
+      ep.handle(
+        new Request(`http://127.0.0.1${CONTROL_MCP_PATH}`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        }),
+        { clientIp: ip },
+      );
+    for (let i = 0; i < AUTH_FAILURES_PER_MINUTE; i++) expect((await hit("forged", "10.0.0.9")).status).toBe(401);
+    const blocked = await hit("forged", "10.0.0.9");
+    expect(blocked.status).toBe(429);
+    expect(verifies).toBe(AUTH_FAILURES_PER_MINUTE); // the 21st never reached the verifier
+    // A different address is unaffected.
+    expect((await hit("tok-owner", "10.0.0.10")).status).toBe(200);
+  });
+
+  it("caps a chunked body with no Content-Length while streaming it", async () => {
+    const big = new TextEncoder().encode("x".repeat(1024 * 1024));
+    let sent = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(ctrl) {
+        if (sent > 10) return ctrl.close();
+        sent++;
+        ctrl.enqueue(big);
+      },
+    });
+    const res = await endpoint().handle(
+      new Request(`http://127.0.0.1${CONTROL_MCP_PATH}`, {
+        method: "POST",
+        headers: { Authorization: "Bearer tok-owner" },
+        body: stream,
+        duplex: "half",
+      } as RequestInit),
+    );
+    expect(res.status).toBe(413);
   });
 });
 
