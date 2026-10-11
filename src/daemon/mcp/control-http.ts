@@ -89,8 +89,6 @@ const WAIT_POLL_MS = 500;
  * against abuse.
  */
 export const MAX_WAITS_PER_SUBJECT = 16;
-/** Request-timeout headroom past `maxWaitSeconds`, for the work around a wait. */
-export const WAIT_HEADROOM_SECONDS = 30;
 
 /** What the endpoint needs from the daemon — narrow on purpose, so the
  *  unit tests can stand it up without a SessionManager. */
@@ -251,8 +249,10 @@ async function resolveSession(ctx: CallContext, ref: string): Promise<SessionInf
 /** Resolve, record for audit, and return the full info (or throw not_found). */
 async function sessionInfo(ctx: CallContext, ref: string): Promise<SessionInfo> {
   const found = await resolveSession(ctx, ref);
-  ctx.sessionId = found.id;
   if (!("status" in found)) throw new ToolError("Missing scope: session:list", "forbidden");
+  // Only a session that was actually found goes in the audit row — never the
+  // caller's raw reference.
+  ctx.sessionId = found.id;
   return found;
 }
 
@@ -264,7 +264,6 @@ async function sessionInfo(ctx: CallContext, ref: string): Promise<SessionInfo> 
  */
 async function actionTarget(ctx: CallContext, ref: string): Promise<string> {
   const found = await resolveSession(ctx, ref);
-  ctx.sessionId = found.id;
   // Fail closed: without session:list the target's role is unknowable, and
   // acting blind would let a send-only token prompt the conductor or destroy
   // a dispatcher's worker — the very thing this check exists to refuse.
@@ -285,6 +284,14 @@ async function actionTarget(ctx: CallContext, ref: string): Promise<string> {
       "forbidden",
     );
   }
+  // Anything else steering it (a live pipeline run injecting its phases).
+  if (found.managedBy) {
+    throw new ToolError(
+      `"${found.name}" is being driven by a ${found.managedBy} run — wait for it to finish, or act on the ${found.managedBy} itself`,
+      "forbidden",
+    );
+  }
+  ctx.sessionId = found.id;
   return found.id;
 }
 
@@ -314,8 +321,11 @@ async function waitUntilSettled(
   sessionId: string,
   timeoutMs: number,
   sleep: (ms: number) => Promise<void>,
+  /** A slot already admitted by the caller (send_message admits before it
+   *  sends); otherwise one is admitted here. Released either way. */
+  admitted?: () => void,
 ): Promise<WaitResult> {
-  const release = ctx.admitWait();
+  const release = admitted ?? ctx.admitWait();
   try {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
@@ -342,16 +352,33 @@ async function waitUntilSettled(
  * the prompt has scrolled out of the newest page, the page's assistant tail is
  * returned instead.
  */
-function replyTo(messages: SessionMessage[], sub: string): { reply: Record<string, unknown>[]; notices: Record<string, unknown>[] } {
-  let start = 0;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i]!;
-    if (m.role === "user" && m.identity?.sub === sub) {
-      start = i + 1;
+function replyTo(
+  messages: SessionMessage[],
+  sub: string,
+  text: string,
+): { reply: Record<string, unknown>[]; notices: Record<string, unknown>[] } {
+  // Anchor on THIS prompt — the newest user message from this caller with this
+  // text — so another prompt from the same identity (a person at the TUI in
+  // local mode, a second call) doesn't capture the reply. Falls back to the
+  // caller's newest prompt when the text isn't found verbatim.
+  const mine = (m: SessionMessage) => m.role === "user" && m.identity?.sub === sub;
+  let start = -1;
+  for (let i = messages.length - 1; i >= 0 && start < 0; i--) {
+    if (mine(messages[i]!) && messages[i]!.content === text) start = i + 1;
+  }
+  for (let i = messages.length - 1; i >= 0 && start < 0; i--) {
+    if (mine(messages[i]!)) start = i + 1;
+  }
+  if (start < 0) start = 0;
+  // ...and stops at the next prompt, whoever sent it.
+  let end = messages.length;
+  for (let i = start; i < messages.length; i++) {
+    if (messages[i]!.role === "user") {
+      end = i;
       break;
     }
   }
-  const after = messages.slice(start);
+  const after = messages.slice(start, end);
   return {
     reply: after.filter((m) => m.role === "assistant").map(shapeMessage),
     // System rows are where a failed send, a turn error, or an interrupt is
@@ -466,13 +493,15 @@ function buildTools(config: McpControlConfig, sleep: (ms: number) => Promise<voi
         .strict(),
       async run(args, ctx) {
         const found = await resolveSession(ctx, args.session as string);
-        ctx.sessionId = found.id;
         const page = await newestPage(
           ctx,
           found.id,
           (args.maxBytes as number | undefined) ?? TRANSCRIPT_DEFAULT_BYTES,
           args.before as string | undefined,
         );
+        // Recorded only after the read succeeded: a bare id the caller could
+        // not list is otherwise just caller text.
+        ctx.sessionId = found.id;
         const roles = args.roles as string[] | undefined;
         return {
           messages: page.messages.filter((m) => !roles || roles.includes(m.role)).map(shapeMessage),
@@ -601,33 +630,51 @@ function buildTools(config: McpControlConfig, sleep: (ms: number) => Promise<voi
         .strict(),
       async run(args, ctx) {
         const id = await actionTarget(ctx, args.session as string);
-        const res = expectOk(
-          await ctx.call({
-            type: "session.send",
-            sessionId: id,
-            text: args.text,
-            ...(args.idempotencyKey ? { clientMsgId: args.idempotencyKey } : {}),
-          }),
-        );
-        const duplicate = res.type === "response.ok" && (res.data as { duplicate?: boolean } | undefined)?.duplicate === true;
-        if (!args.wait) return { sent: true, ...(duplicate ? { duplicate: true } : {}) };
-
-        const timeoutMs = ((args.timeoutSeconds as number | undefined) ?? defaultWaitMs / 1000) * 1000;
-        const waited = await waitUntilSettled(ctx, id, timeoutMs, sleep);
-        if ("gone" in waited) return { sent: true, ...(duplicate ? { duplicate: true } : {}), outcome: "destroyed" };
-        const out: Record<string, unknown> = {
-          sent: true,
-          ...(duplicate ? { duplicate: true } : {}),
-          outcome: outcomeOf(waited.info, waited.settled),
-          session: summarize(waited.info),
-        };
-        if (waited.settled && canRead(ctx.auth)) {
-          const page = await newestPage(ctx, id, TRANSCRIPT_DEFAULT_BYTES);
-          const { reply, notices } = replyTo(page.messages, ctx.auth.sub);
-          out.reply = reply;
-          if (notices.length > 0) out.notices = notices;
+        // Claim the wait slot BEFORE sending: refusing the wait after the
+        // prompt went out would report an error for a send that happened, and
+        // a retry would deliver the prompt twice.
+        const slot = args.wait ? ctx.admitWait() : undefined;
+        let res: DaemonMessage;
+        try {
+          res = expectOk(
+            await ctx.call({
+              type: "session.send",
+              sessionId: id,
+              text: args.text,
+              ...(args.idempotencyKey ? { clientMsgId: args.idempotencyKey } : {}),
+            }),
+          );
+        } catch (err) {
+          slot?.();
+          throw err;
         }
-        return out;
+        const duplicate = res.type === "response.ok" && (res.data as { duplicate?: boolean } | undefined)?.duplicate === true;
+        if (!slot) return { sent: true, ...(duplicate ? { duplicate: true } : {}) };
+
+        // From here the prompt HAS been delivered: whatever goes wrong while
+        // waiting is reported alongside `sent: true`, never as a tool error —
+        // a caller that retries an error would deliver the prompt twice.
+        const sent = { sent: true, ...(duplicate ? { duplicate: true } : {}) };
+        try {
+          const timeoutMs = ((args.timeoutSeconds as number | undefined) ?? defaultWaitMs / 1000) * 1000;
+          const waited = await waitUntilSettled(ctx, id, timeoutMs, sleep, slot);
+          if ("gone" in waited) return { ...sent, outcome: "destroyed" };
+          const out: Record<string, unknown> = {
+            ...sent,
+            outcome: outcomeOf(waited.info, waited.settled),
+            session: summarize(waited.info),
+          };
+          if (waited.settled && canRead(ctx.auth)) {
+            const page = await newestPage(ctx, id, TRANSCRIPT_DEFAULT_BYTES);
+            const { reply, notices } = replyTo(page.messages, ctx.auth.sub, args.text as string);
+            out.reply = reply;
+            if (notices.length > 0) out.notices = notices;
+          }
+          return out;
+        } catch (err) {
+          const why = err instanceof ToolError ? `${err.code}: ${err.message}` : String(err);
+          return { ...sent, outcome: "wait_failed", error: why };
+        }
       },
     },
     {
@@ -684,10 +731,6 @@ async function readCapped(req: Request, max: number): Promise<string | null> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-/** Failed authentications allowed per client address per minute. */
-export const AUTH_FAILURES_PER_MINUTE = 20;
-const AUTH_FAILURE_WINDOW_MS = 60_000;
-
 function jsonError(status: number, error: string, extra: Record<string, string> = {}): Response {
   return new Response(JSON.stringify({ error }), {
     status,
@@ -702,27 +745,6 @@ export class ControlMcpHttp {
   readonly #tools: ToolDef[];
   /** Live waits per subject (see MAX_WAITS_PER_SUBJECT). */
   readonly #waits = new Map<string, number>();
-  /** Recent failed-auth timestamps per client address. */
-  readonly #authFailures = new Map<string, number[]>();
-
-  #authAttemptAllowed(ip: string): boolean {
-    const now = Date.now();
-    // Sweep dead entries so a scan from many addresses can't grow the map.
-    for (const [k, hits] of this.#authFailures) {
-      const newest = hits[hits.length - 1];
-      if (newest === undefined || now - newest >= AUTH_FAILURE_WINDOW_MS) this.#authFailures.delete(k);
-    }
-    const recent = (this.#authFailures.get(ip) ?? []).filter((t) => now - t < AUTH_FAILURE_WINDOW_MS);
-    if (recent.length > 0) this.#authFailures.set(ip, recent);
-    return recent.length < AUTH_FAILURES_PER_MINUTE;
-  }
-
-  #recordAuthFailure(ip: string): void {
-    const hits = this.#authFailures.get(ip) ?? [];
-    hits.push(Date.now());
-    this.#authFailures.set(ip, hits);
-  }
-
   constructor(opts: ControlMcpOptions) {
     this.#verifier = opts.verifier;
     this.#host = opts.host;
@@ -748,19 +770,26 @@ export class ControlMcpHttp {
   /**
    * Bun.serve fetch handler for {@link CONTROL_MCP_PATH}.
    *
-   * `extendTimeout` sets this one request's timeout explicitly. A tool call
-   * that waits on an agent's turn is legitimately pending for minutes, while
-   * Bun.serve's `idleTimeout` is 10 s. Today Bun applies that timer to GETs
-   * but not to POSTs with a body (measured on 1.3.13), which is all MCP sends,
-   * so waits already survive — this states the bound we rely on instead of
-   * depending on that, and caps it at the operator's wait limit.
+   * `disableIdleTimeout` lifts Bun's idle timeout for this one request. A tool
+   * call that waits on an agent's turn is legitimately pending for minutes,
+   * while Bun.serve's `idleTimeout` is 10 s and its per-request
+   * `server.timeout` is silently capped near 255 s (measured on 1.3.13: a
+   * 300 s setting cut a 270 s hold at 256 s) — below `maxWaitSeconds`' 600 s
+   * ceiling. So the timeout is disabled rather than raised: the handler bounds
+   * itself (every wait ends by `maxWaitSeconds`), and it is applied only after
+   * authentication and after the whole body has arrived, so a slow-trickled
+   * body still meets the normal idle timeout.
+   *
+   * There is no per-address throttle on failed authentication here: on a
+   * loopback daemon every caller shares one address, so a throttle let any
+   * local process lock out every valid caller, and it never covered the
+   * WebSocket handshake anyway. Verification cost is bounded in the verifier
+   * instead (see auth.ts — unknown-`kid` cooldown), for both transports.
    */
   async handle(
     req: Request,
-    opts: { extendTimeout?: (seconds: number) => void; clientIp?: string } = {},
+    opts: { disableIdleTimeout?: () => void } = {},
   ): Promise<Response> {
-    const { extendTimeout } = opts;
-    const ip = opts.clientIp ?? "unknown";
     // DNS-rebinding guard (MCP Streamable HTTP §security): a browser page on
     // another origin must not reach a loopback daemon. Agents send no Origin.
     const origin = req.headers.get("origin");
@@ -776,20 +805,7 @@ export class ControlMcpHttp {
     // sessions; a query string ends up in proxy and shell history.
     const authz = req.headers.get("authorization");
     const token = authz && /^bearer\s+/i.test(authz) ? authz.replace(/^bearer\s+/i, "").trim() : "";
-    // Pre-auth throttle. Verifying a forged JWT with an unknown `kid` makes
-    // the verifier refetch the issuer's JWKS, so unthrottled garbage tokens
-    // would turn this endpoint into a fetch amplifier against ZeroID. Only
-    // FAILED attempts count toward the limit; once an address hits it, all of
-    // its requests wait out the window (at most a minute) — on a loopback
-    // daemon that is every local caller, but reaching it already takes local
-    // access.
-    if (!this.#authAttemptAllowed(ip)) {
-      return jsonError(429, "too many failed authentications", { "Retry-After": "60" });
-    }
-    if (!token) {
-      this.#recordAuthFailure(ip);
-      return jsonError(401, "unauthorized", { "WWW-Authenticate": "Bearer" });
-    }
+    if (!token) return jsonError(401, "unauthorized", { "WWW-Authenticate": "Bearer" });
 
     let auth: AuthContext;
     try {
@@ -797,11 +813,9 @@ export class ControlMcpHttp {
     } catch {
       // Fail closed, and don't echo why — the reason helps an attacker more
       // than a legitimate caller, who can check the token with `codeoid login`.
-      this.#recordAuthFailure(ip);
       return jsonError(401, "unauthorized", { "WWW-Authenticate": 'Bearer error="invalid_token"' });
     }
     if (typeof auth.exp === "number" && auth.exp > 0 && auth.exp <= Math.floor(Date.now() / 1000)) {
-      this.#recordAuthFailure(ip);
       return jsonError(401, "unauthorized", { "WWW-Authenticate": 'Bearer error="invalid_token"' });
     }
     if (this.#config.requireDelegated && auth.delegationDepth < 1) {
@@ -830,9 +844,8 @@ export class ControlMcpHttp {
       return Response.json(rpcErr(null, -32600, "Invalid Request: one JSON-RPC message per POST"), { status: 400 });
     }
 
-    // Only a tool call can wait; give it the operator's cap plus headroom for
-    // the reply read that follows the wait.
-    if ((body as JsonRpcMessage).method === "tools/call") extendTimeout?.(this.#config.maxWaitSeconds + WAIT_HEADROOM_SECONDS);
+    // Only a tool call can wait, and it ends itself by maxWaitSeconds.
+    if ((body as JsonRpcMessage).method === "tools/call") opts.disableIdleTimeout?.();
     const res = await this.#dispatch(body as JsonRpcMessage, auth, req.signal);
     if (!res) return new Response(null, { status: 202 });
     return Response.json(res);

@@ -340,6 +340,15 @@ export interface SessionInfo {
     options?: string[];
   };
   /**
+   * Something other than its owner is steering this session right now — today
+   * a live SDLC pipeline run (`"pipeline"`), which injects each phase as a turn.
+   * Absent once the run reaches a terminal state, after which it is an ordinary
+   * session again. Outside drivers (`/mcp/control`) read such a session but do
+   * not prompt, interrupt, or destroy it; a future orchestrator that owns
+   * sessions should set this too, so that refusal covers it without new code.
+   */
+  managedBy?: "pipeline";
+  /**
    * A prompt has been accepted but its turn has not started yet (hooks, the
    * turn checkpoint, identity registration are still running). The session can
    * read `idle` in this window, so a caller waiting for a reply must treat

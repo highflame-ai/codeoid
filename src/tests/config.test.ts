@@ -655,6 +655,18 @@ describe("resolveLocalToken — client-side local-mode discovery", () => {
     expect(resolveLocalToken(URL_A, {})).toBe(token);
   });
 
+  it("never hands this machine's token file to a daemon URL on another host", () => {
+    // The file is keyed by port, so a remote URL on the same port used to
+    // pick it up — and `codeoid mcp headers` would ship it to that host.
+    writeLocalTokenFile(getLocalTokenPath(7400), mintLocalToken());
+    expect(resolveLocalToken("wss://codeoid.example.com:7400", {})).toBeNull();
+    expect(resolveLocalToken("ws://10.1.2.3:7400", {})).toBeNull();
+    expect(resolveLocalToken("ws://localhost:7400", {})).not.toBeNull();
+    expect(resolveLocalToken("ws://[::1]:7400", {})).not.toBeNull();
+    // An explicit pin is the operator's own decision (e.g. --local-allow-remote).
+    expect(resolveLocalToken("ws://10.1.2.3:7400", { CODEOID_LOCAL_TOKEN: "codeoid_local_pinned" })).toBe("codeoid_local_pinned");
+  });
+
   it("prefers CODEOID_LOCAL_TOKEN over the published file", () => {
     writeLocalTokenFile(getLocalTokenPath(7400), mintLocalToken());
     expect(resolveLocalToken(URL_A, { CODEOID_LOCAL_TOKEN: "codeoid_local_pinned" })).toBe(

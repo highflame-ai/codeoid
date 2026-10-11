@@ -8,7 +8,7 @@
  * otherwise (an operator who already holds a JWT).
  */
 
-import { resolveLocalToken, type CodeoidConfig } from "../config.js";
+import { isLoopbackUrl, resolveLocalToken, type CodeoidConfig } from "../config.js";
 import { CONTROL_MCP_PATH } from "../daemon/mcp/control-path.js";
 import { ALL_SCOPES_STRING, SCOPES, type Scope } from "../protocol/scopes.js";
 
@@ -126,7 +126,5 @@ export function controlUrl(daemonUrl: string): string {
 
 /** True when the URL would carry the bearer token in cleartext off this machine. */
 export function cleartextOffHost(url: string): boolean {
-  const u = new URL(url);
-  if (u.protocol !== "http:") return false;
-  return !["127.0.0.1", "localhost", "[::1]", "::1"].includes(u.hostname);
+  return new URL(url).protocol === "http:" && !isLoopbackUrl(url);
 }

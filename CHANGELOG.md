@@ -22,16 +22,27 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   tool call on its owner's approval. Every call is audited as
   `mcp.control.call` under the caller, with its delegator.
   `mcpControl.requireDelegated` accepts only delegated agent tokens.
+  Sessions codeoid itself is steering (the conductor and its workers,
+  collaborations, a live pipeline run's session) are read-only from outside.
 
   `codeoid mcp config` prints a ready `.mcp.json` entry whose `headersHelper`
   (`codeoid mcp headers`) mints a fresh, scope-narrowed token on each connect —
   observe-only by default. Guide: [docs/mcp-control.md](docs/mcp-control.md).
+
+- **Forged tokens can no longer make the daemon refetch ZeroID's keys in a
+  loop.** A token naming an unseen signing key is checked against the key ids
+  the issuer publishes, re-read at most once every 10 seconds, before it
+  reaches the SDK (which refetched the key set for every unknown `kid`). This
+  covers the WebSocket handshake as well as `/mcp/control`; tokens signed by a
+  known key are never slowed.
 
 - **Protocol (additive):** `scrollback.page` without `beforeMessageId` returns
   the newest page, so a client that never attached can read recent history.
   Daemons from before this change reject the anchor-less form. And
   `SessionInfo.turnQueued` marks a prompt that was accepted but whose turn has
   not started — the window in which a session still reads `idle`.
+  `SessionInfo.managedBy: "pipeline"` marks a session a live pipeline run is
+  driving.
 
 - **Sign in with Claude, instead of pasting an API key.** Settings → Claude now
   has a two-step sign-in: codeoid runs `claude setup-token` for you, shows the

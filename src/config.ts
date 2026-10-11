@@ -92,9 +92,24 @@ export function resolveLocalToken(
 ): string | null {
   const fromEnv = env[LOCAL_TOKEN_ENV];
   if (fromEnv && fromEnv.length > 0) return fromEnv;
+  // The token FILE belongs to a daemon on THIS machine. The file is keyed by
+  // port only, so without this check a `daemonUrl` naming another host on the
+  // same port would be handed this machine's all-scopes local token — and
+  // `codeoid mcp headers` would put it in a third-party client's config.
+  if (!isLoopbackUrl(daemonUrl)) return null;
   const port = daemonPortFromUrl(daemonUrl);
   if (!port) return null;
   return readLocalTokenFile(getLocalTokenPath(port));
+}
+
+/** True when `url` names this machine (127.0.0.0/8, ::1, or localhost). */
+export function isLoopbackUrl(url: string): boolean {
+  try {
+    const host = new URL(url).hostname.replace(/^\[|\]$/g, "");
+    return host === "localhost" || host === "::1" || /^127\.\d+\.\d+\.\d+$/.test(host);
+  } catch {
+    return false;
+  }
 }
 
 /**

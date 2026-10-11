@@ -792,8 +792,12 @@ mcp
   .option("--scopes <spec>", `scope preset (${Object.keys(MCP_SCOPE_PRESETS).join(" | ")}) or a comma-separated list`, "observe")
   .action(async (opts: { scopes: string }) => {
     try {
-      const out = await mcpHeaders(loadConfig(), opts.scopes);
+      const config = loadConfig();
+      const out = await mcpHeaders(config, opts.scopes);
       for (const w of out.warnings) console.error(w);
+      if (cleartextOffHost(controlUrl(config.daemonUrl))) {
+        console.error("codeoid: warning — the daemon URL is plain http to another host; this token would cross the network unencrypted.");
+      }
       process.stdout.write(`${out.stdout}\n`);
     } catch (err) {
       if (!(err instanceof TokenError)) throw err;

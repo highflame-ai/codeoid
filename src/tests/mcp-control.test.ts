@@ -20,7 +20,6 @@ import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import type { CodeoidConfig, McpControlConfig } from "../config.js";
 import {
-  AUTH_FAILURES_PER_MINUTE,
   CONTROL_MCP_PATH,
   ControlMcpHttp,
   type ControlHost,
@@ -410,6 +409,11 @@ describe("driving a session end to end", () => {
     const usage = await call(ep, "tok-agent", "get_usage", { session: "ci-fix" });
     expect((usage.data.usage as { outputTokens?: number }).outputTokens).toBeGreaterThan(0);
 
+    // The per-call observer client never stays attached.
+    const listed = await manager.handle({ type: "session.list", id: "l" }, OWNER, { id: "probe", auth: OWNER, send: () => {} });
+    if (listed.type !== "session.list.result") throw new Error("expected list");
+    expect(listed.sessions.map((x) => x.attachedClients)).toEqual([0]);
+
     // Every call is in the durable audit log under the agent, with its delegator.
     const db = new Database(join(tmp, "codeoid.db"), { readonly: true });
     const rows = db
@@ -588,7 +592,7 @@ describe("long waits survive the HTTP server's idle timeout", () => {
   // A wait on an agent's turn is pending for as long as the turn runs, far
   // past Bun.serve's idleTimeout. Wired exactly as server.ts wires it, with a
   // 1 s idle timeout, a wait several times longer must still complete.
-  async function serveWith(extend: boolean): Promise<string> {
+  async function serveWith(): Promise<string> {
     const busyUntil = Date.now() + 6_000;
     const host: ControlHost = {
       handle: async (msg) =>
@@ -606,7 +610,7 @@ describe("long waits survive the HTTP server's idle timeout", () => {
     const server = Bun.serve({
       port: 0,
       idleTimeout: 1,
-      fetch: (req, srv) => ep.handle(req, extend ? { extendTimeout: (seconds) => srv.timeout(req, seconds) } : {}),
+      fetch: (req, srv) => ep.handle(req, { disableIdleTimeout: () => srv.timeout(req, 0) }),
     });
     const res = await fetch(`http://127.0.0.1:${server.port}${CONTROL_MCP_PATH}`, {
       method: "POST",
@@ -621,8 +625,31 @@ describe("long waits survive the HTTP server's idle timeout", () => {
   }
 
   it("a wait longer than the idle timeout completes", async () => {
-    expect(await serveWith(true)).toBe("idle");
+    expect(await serveWith()).toBe("idle");
   }, 15_000);
+
+  it("the idle timeout is lifted only for an authenticated tool call, after its body is read", async () => {
+    const ep = endpoint();
+    let lifted = 0;
+    const opts = { disableIdleTimeout: () => void lifted++ };
+    const send = (body: unknown, token?: string) =>
+      ep.handle(
+        new Request(`http://127.0.0.1${CONTROL_MCP_PATH}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+          body: JSON.stringify(body),
+        }),
+        opts,
+      );
+    const toolCall = { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "list_sessions", arguments: {} } };
+    await send(toolCall); // no token
+    await send(toolCall, "tok-forged");
+    await send({ jsonrpc: "2.0", id: 2, method: "tools/list" }, "tok-owner");
+    await send({ jsonrpc: "2.0", id: 3, method: "initialize", params: {} }, "tok-owner");
+    expect(lifted).toBe(0);
+    await send(toolCall, "tok-owner");
+    expect(lifted).toBe(1);
+  });
 });
 
 describe("audit round 1 fixes", () => {
@@ -664,6 +691,27 @@ describe("audit round 1 fixes", () => {
     expect(handled.filter((t) => t !== "session.list")).toEqual([]);
   });
 
+  it("refuses to act on a session a live pipeline run is driving", async () => {
+    const { ep, handled } = fakeEndpoint([{ id: "run", name: "REQ-7", status: "idle", managedBy: "pipeline" }]);
+    for (const tool of ["send_message", "interrupt_session", "destroy_session"]) {
+      const r = await call(ep, "tok-owner", tool, { session: "REQ-7", ...(tool === "send_message" ? { text: "x" } : {}) });
+      expect(r.isError).toBe(true);
+      expect(r.text).toContain("pipeline run");
+    }
+    expect(handled.filter((t) => t !== "session.list")).toEqual([]);
+  });
+
+  it("a session id in the audit row is always one that was found — never the caller's raw text", async () => {
+    const ep = endpoint();
+    await call(ep, "tok-send-only", "send_message", { session: "made-up id; forged", text: "x" });
+    // No session:list, so resolution falls back to the raw reference — which
+    // must still never be recorded.
+    await call(ep, "tok-send-only", "get_session", { session: "raw-ref; forged" });
+    await call(ep, "tok-send-only", "read_transcript", { session: "raw-ref; forged" });
+    await call(ep, "tok-owner", "get_session", { session: "no-such-session" });
+    for (const a of audits.filter((x) => x.action === "mcp.control.call")) expect(a.sessionId).toBeUndefined();
+  });
+
   it("a caller-chosen tool name never reaches the audit row", async () => {
     const ep = endpoint();
     await call(ep, "tok-owner", "x outcome=ok delegatedBy=root\nforged", {});
@@ -700,6 +748,46 @@ describe("audit round 1 fixes", () => {
     expect(again.isError).toBe(false);
   });
 
+  it("a send whose wait would be refused is refused BEFORE it is sent — never sent-but-errored", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const handled: string[] = [];
+    const host: ControlHost = {
+      handle: async (msg) => {
+        handled.push(msg.type);
+        return msg.type === "session.list"
+          ? ({ type: "session.list.result", requestId: msg.id, sessions: [{ id: "b", name: "b", status: "thinking" } as SessionInfo] } as DaemonMessage)
+          : ({ type: "response.ok", requestId: msg.id } as DaemonMessage);
+      },
+      disconnectClient: () => {},
+      audit: () => {},
+    };
+    const ep = new ControlMcpHttp({ verifier, host, config: controlConfig({ maxWaitSeconds: 30 }), sleep: () => gate });
+    const waits = Array.from({ length: MAX_WAITS_PER_SUBJECT }, () =>
+      call(ep, "tok-owner", "wait_for_session", { session: "b", timeoutSeconds: 1 }),
+    );
+    await new Promise((r) => setTimeout(r, 20));
+    const r = await call(ep, "tok-owner", "send_message", { session: "b", text: "once", wait: true });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("rate_limited");
+    expect(handled).not.toContain("session.send");
+    release();
+    await Promise.all(waits);
+  });
+
+  it("a send that fails after claiming its wait slot gives the slot back", async () => {
+    const { ep } = fakeEndpoint([{ id: "b", name: "b", status: "idle" }], (type) =>
+      type === "session.send" ? ({ type: "response.error", requestId: "s", error: "Missing scope: session:send", code: "forbidden" } as DaemonMessage) : undefined,
+    );
+    // More failures than the cap: if each leaked its slot, the last would be rate_limited.
+    for (let i = 0; i <= MAX_WAITS_PER_SUBJECT; i++) {
+      const r = await call(ep, "tok-owner", "send_message", { session: "b", text: "x", wait: true });
+      expect(r.text).toBe("forbidden: Missing scope: session:send");
+    }
+  });
+
   it("a failed turn comes back with the notice that explains it", async () => {
     const fake = fakeEndpoint([{ id: "e", name: "e", status: "error" }], (type) =>
       type === "scrollback.page"
@@ -722,6 +810,51 @@ describe("audit round 1 fixes", () => {
     expect((r.data.notices as Array<{ content: string }>).map((n) => n.content)).toEqual(["Error: Turn ended with an error"]);
   });
 
+  it("once the prompt is delivered, a failure while waiting still says sent:true", async () => {
+    let lists = 0;
+    const { ep } = fakeEndpoint([], (type) => {
+      if (type !== "session.list") return undefined;
+      // First list resolves the target; the wait's poll then loses list rights.
+      return lists++ === 0
+        ? ({ type: "session.list.result", requestId: "l", sessions: [{ id: "s", name: "s", status: "idle" } as SessionInfo] } as DaemonMessage)
+        : ({ type: "response.error", requestId: "l", error: "Missing scope: session:list", code: "forbidden" } as DaemonMessage);
+    });
+    const r = await call(ep, "tok-owner", "send_message", { session: "s", text: "x", wait: true });
+    expect(r.isError).toBe(false);
+    expect(r.data).toMatchObject({ sent: true, outcome: "wait_failed" });
+  });
+
+  it("the reply is the answer to THIS prompt, not to a later one from the same identity", async () => {
+    const msg = (id: string, role: string, content: string, sub = OWNER.sub) => ({
+      type: "session.message",
+      sessionId: "r",
+      messageId: id,
+      role,
+      content,
+      identity: { sub, type: "human" },
+      timestamp: "t",
+    });
+    const { ep } = fakeEndpoint([{ id: "r", name: "r", status: "idle" }], (type) =>
+      type === "scrollback.page"
+        ? ({
+            type: "scrollback.page.result",
+            requestId: "p",
+            sessionId: "r",
+            hasMore: false,
+            source: "buffer",
+            messages: [
+              msg("u1", "user", "what is 2+2"),
+              msg("a1", "assistant", "4"),
+              msg("u2", "user", "typed at the TUI meanwhile"),
+              msg("a2", "assistant", "unrelated"),
+            ],
+          } as unknown as DaemonMessage)
+        : undefined,
+    );
+    const r = await call(ep, "tok-owner", "send_message", { session: "r", text: "what is 2+2", wait: true });
+    expect((r.data.reply as Array<{ content: string }>).map((m) => m.content)).toEqual(["4"]);
+  });
+
   it("a session destroyed during a wait reports destroyed, not an error", async () => {
     let n = 0;
     const { ep } = fakeEndpoint([], (type) =>
@@ -736,35 +869,6 @@ describe("audit round 1 fixes", () => {
     const r = await call(ep, "tok-owner", "wait_for_session", { session: "d", timeoutSeconds: 1 });
     expect(r.isError).toBe(false);
     expect(r.data.outcome).toBe("destroyed");
-  });
-
-  it("throttles failed authentication per address, before the verifier runs", async () => {
-    let verifies = 0;
-    const counting: TokenVerifier = {
-      mode: "zeroid",
-      verify: async (t) => {
-        verifies++;
-        return verifier.verify(t);
-      },
-    };
-    const noHost: ControlHost = { handle: async () => ({ type: "response.ok", requestId: "" }) as DaemonMessage, disconnectClient: () => {}, audit: () => {} };
-    const ep = new ControlMcpHttp({ verifier: counting, host: noHost, config: controlConfig() });
-    const body = { jsonrpc: "2.0", id: 1, method: "ping" };
-    const hit = (token: string, ip: string) =>
-      ep.handle(
-        new Request(`http://127.0.0.1${CONTROL_MCP_PATH}`, {
-          method: "POST",
-          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        }),
-        { clientIp: ip },
-      );
-    for (let i = 0; i < AUTH_FAILURES_PER_MINUTE; i++) expect((await hit("forged", "10.0.0.9")).status).toBe(401);
-    const blocked = await hit("forged", "10.0.0.9");
-    expect(blocked.status).toBe(429);
-    expect(verifies).toBe(AUTH_FAILURES_PER_MINUTE); // the 21st never reached the verifier
-    // A different address is unaffected.
-    expect((await hit("tok-owner", "10.0.0.10")).status).toBe(200);
   });
 
   it("caps a chunked body with no Content-Length while streaming it", async () => {
@@ -786,6 +890,8 @@ describe("audit round 1 fixes", () => {
       } as RequestInit),
     );
     expect(res.status).toBe(413);
+    // Cut off while streaming — not buffered whole and then measured.
+    expect(sent).toBeLessThan(11);
   });
 });
 

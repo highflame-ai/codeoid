@@ -93,6 +93,9 @@ A typical CI step: `create_session`, then `send_message` with `wait: true`, then
 - `error`: the turn failed; `notices` carries the system messages that explain why.
 - `still_working`: the wait timed out; call `wait_for_session` again.
 - `destroyed`: the session was destroyed while you waited.
+- `wait_failed`: the prompt was delivered, but waiting for it failed (`error` says why). Do not resend; follow up with `wait_for_session`.
+
+Once the prompt has been delivered, `send_message` always reports `sent: true`, even if waiting fails afterwards, so a retry never delivers it twice.
 
 Each caller may hold 16 waits at once; past that, poll `get_session` instead.
 
@@ -103,9 +106,9 @@ This endpoint can start agents and prompt them, so it gets no shortcuts.
 - **Same authentication.** The bearer token is verified on every request by the same verifier the WebSocket handshake uses: a ZeroID JWT, or the local-mode token. There is no separate key. The token is read only from the `Authorization` header, never from the URL.
 - **Same authorization.** Each tool becomes an ordinary protocol message, checked by the protocol schema and handled by the same function that enforces scopes and tenancy for every WebSocket client. A token that cannot create a session over WebSocket cannot create one here.
 - **Driving is not authorizing.** There is no approve tool. A session prompted through this endpoint still parks every guarded tool call (a shell command, a file write) on its owner's approval, exactly as if the prompt had been typed.
-- **Dispatcher and collaborative sessions are off limits for actions.** The conductor, its workers, and a collaborative goal's orchestrator and role children are steered by codeoid itself; this endpoint can read them but not prompt, interrupt, or destroy them. Because that check needs the target's role, every act tool also requires `session:list`; all three presets include it.
+- **Sessions something else is steering are off limits for actions.** The conductor, its workers, a collaborative goal's orchestrator and role children, and a session a live SDLC pipeline run is driving are steered by codeoid itself; this endpoint can read them but not prompt, interrupt, or destroy them. A pipeline's session becomes an ordinary session again once its run finishes. Because that check needs the target's role, every act tool also requires `session:list`; all three presets include it.
 - **Plain sessions only.** `create_session` accepts a name, workdir, backend, and model, and nothing else: no roles, collaborations, or packs.
-- **Failed authentication is throttled.** After 20 failed attempts in a minute from one address, the endpoint answers 429 for the rest of that minute without verifying anything. A forged token cannot make the daemon fetch the issuer's keys in a loop.
+- **Forged tokens are cheap to refuse.** A token naming a signing key the daemon has not seen is checked against the list of key ids the issuer publishes, which the daemon re-reads at most once every 10 seconds; a key the issuer does not publish is refused without contacting it again. So a flood of forged tokens costs at most one read of the issuer's keys per 10 seconds, over this endpoint or the WebSocket handshake, and a token signed by a known key is never slowed.
 - **Every call is attributed.** Each call writes an `mcp.control.call` audit row under the caller's subject, with the delegating principal for an agent token and the outcome, alongside the rows the ordinary path writes (`session.send`, `session.create`, …). A prompt sent by an agent appears in the transcript as that agent's message.
 
 ### Known limits
