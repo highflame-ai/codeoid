@@ -1839,3 +1839,25 @@ describe("T10 – send during waiting_approval", () => {
     await session.interrupt(TEST_AUTH);
   });
 });
+
+describe("toInfo().turnQueued — a prompt accepted but not yet started is work", () => {
+  it("is set from the moment send() returns until the turn starts, and cleared after", async () => {
+    const provider = new MockSessionProvider("claude", [
+      [
+        { type: "text_done", content: "done" },
+        { type: "turn_done", result: mockResult({ providerId: "claude" }) },
+      ],
+    ]);
+    const session = makeSession(provider);
+    expect(session.toInfo().turnQueued).toBeUndefined();
+
+    const sending = session.send("hello", TEST_AUTH);
+    // The status still reads idle here — which is exactly why a caller
+    // waiting for the reply (/mcp/control wait) needs this flag.
+    expect(session.toInfo().status).toBe("idle");
+    expect(session.toInfo().turnQueued).toBe(true);
+
+    await sending;
+    expect(session.toInfo().turnQueued).toBeUndefined();
+  });
+});

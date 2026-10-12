@@ -20,7 +20,11 @@ import type { AuthMode, TokenVerifier } from "./verifier.js";
 export interface AuthConfig {
   /** ZeroID base URL, e.g. "http://localhost:8899" */
   baseUrl: string;
-  /** ZeroID JWKS URL — derived from baseUrl if not set */
+  /**
+   * Unused: the ZeroID SDK always verifies against
+   * `${baseUrl}/.well-known/jwks.json`, and so does ZeroIdVerifier's key-id
+   * inventory, so the two can never disagree. Kept for config compatibility.
+   */
   jwksUrl?: string;
   /** Expected issuer claim */
   issuer?: string;
@@ -103,22 +107,118 @@ function identityToAuthContext(identity: VerifiedIdentity): AuthContext {
   };
 }
 
+/** Minimum spacing between the verifier's own reads of the issuer's key ids. */
+export const UNKNOWN_KID_COOLDOWN_MS = 10_000;
+const JWKS_FETCH_TIMEOUT_MS = 5_000;
+/** After a FAILED inventory read, the next one may happen this soon. */
+export const FAILED_FETCH_RETRY_MS = 1_000;
+
+/**
+ * Decode a JWT segment EXACTLY as the ZeroID SDK does (base64url → atob →
+ * TextDecoder). It has to be the same decoder, not merely an equivalent one:
+ * the gate below is only sound if it sees the header the SDK will see. Node's
+ * `Buffer` base64url + utf8 keeps a leading BOM that TextDecoder strips, so a
+ * BOM-prefixed header parsed as garbage here and as a valid `kid` there.
+ */
+function decodeLikeSdk(segment: string): string {
+  const padded = segment.replace(/-/g, "+").replace(/_/g, "/");
+  const binary = atob(padded + "=".repeat((4 - (padded.length % 4)) % 4));
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
+}
+
+/**
+ * What a JWT header says about its signing key, as the SDK will read it:
+ * - `none` — no truthy `kid`; the SDK selects by `alg` and never refetches;
+ * - a string `kid` — the SDK refetches its JWKS when it hasn't cached it;
+ * - `invalid` — undecodable, or a truthy `kid` that is not a non-empty string.
+ *   The SDK would still refetch for a truthy non-string (`kid: 1`), so these
+ *   are refused outright rather than let past the gate.
+ */
+export type JwtKeyRef = { kind: "none" } | { kind: "kid"; kid: string } | { kind: "invalid" };
+
+export function jwtKeyRef(token: string): JwtKeyRef {
+  const segment = token.split(".")[0];
+  if (!segment) return { kind: "invalid" };
+  let header: unknown;
+  try {
+    header = JSON.parse(decodeLikeSdk(segment));
+  } catch {
+    return { kind: "invalid" };
+  }
+  if (header === null || typeof header !== "object" || Array.isArray(header)) return { kind: "invalid" };
+  const kid = (header as { kid?: unknown }).kid;
+  if (!kid) return { kind: "none" }; // absent, "", 0, false, null — the SDK's `kid ?` is falsy too
+  return typeof kid === "string" ? { kind: "kid", kid } : { kind: "invalid" };
+}
+
+/** The `kid` a JWT's header names, or undefined. */
+export function jwtKid(token: string): string | undefined {
+  const ref = jwtKeyRef(token);
+  return ref.kind === "kid" ? ref.kid : undefined;
+}
+
+/** The key ids an issuer publishes at its JWKS endpoint. */
+async function fetchJwksKids(url: string): Promise<Set<string>> {
+  const res = await fetch(url, { signal: AbortSignal.timeout(JWKS_FETCH_TIMEOUT_MS) });
+  if (!res.ok) throw new Error(`JWKS ${res.status}`);
+  const body = (await res.json()) as { keys?: Array<{ kid?: unknown }> };
+  return new Set((body.keys ?? []).map((k) => k.kid).filter((k): k is string => typeof k === "string"));
+}
+
 /**
  * The primary path as a `TokenVerifier`.
  *
- * Deliberately behaviour-free: it holds the `AuthConfig` and delegates to
- * `verifyToken` above, unchanged. Every guarantee of the ZeroID path —
- * signature verification, issuer pinning, audience checks, mandatory `exp`,
- * mandatory tenancy claims — lives in that function and is reached identically
- * whether the caller went through this class or called it directly.
+ * Every guarantee of the ZeroID path — signature verification, issuer
+ * pinning, audience checks, mandatory `exp`, mandatory tenancy claims — lives
+ * in `verifyToken` above and is reached identically through this class.
+ *
+ * The one thing this class adds is a bound on what verifying a FORGED token
+ * costs. The SDK refetches the issuer's JWKS whenever a token names a `kid` it
+ * has not cached, so a stream of tokens with random `kid`s — over the
+ * WebSocket handshake or `/mcp/control`, both unauthenticated — would turn the
+ * daemon into a fetch loop against ZeroID.
+ *
+ * So a token naming a `kid` this verifier has not seen is checked first
+ * against an inventory of the key ids the issuer publishes, refreshed at most
+ * once per cooldown. A `kid` the issuer does not publish is refused without
+ * reaching the SDK. Keys that have verified before skip all of this. A newly
+ * rotated key cannot be starved: the inventory refresh is spaced by time, not
+ * reset by failures, so the new key is in it within one cooldown however many
+ * forged tokens arrive meanwhile — at most one issuer read per window.
  */
 export class ZeroIdVerifier implements TokenVerifier {
   readonly mode: AuthMode = "zeroid";
 
   readonly #config: AuthConfig;
+  readonly #verify: (token: string, config: AuthConfig) => Promise<AuthContext>;
+  readonly #fetchKids: () => Promise<Set<string>>;
+  readonly #now: () => number;
+  /** Signing keys that have verified a token — never gated. */
+  readonly #knownKids = new Set<string>();
+  /** Key ids the issuer published at the last inventory read. */
+  #published = new Set<string>();
+  #publishedAt = Number.NEGATIVE_INFINITY;
+  #refreshing: Promise<void> | null = null;
 
-  constructor(config: AuthConfig) {
+  constructor(
+    config: AuthConfig,
+    /** Test seams only. */
+    deps: {
+      verify?: (token: string, config: AuthConfig) => Promise<AuthContext>;
+      fetchKids?: () => Promise<Set<string>>;
+      now?: () => number;
+    } = {},
+  ) {
     this.#config = config;
+    this.#verify = deps.verify ?? verifyToken;
+    // The SAME URL the SDK fetches (it always derives it from baseUrl and
+    // ignores `jwksUrl`), so the inventory describes the keys it will use.
+    // Same trailing-slash handling as the SDK's client (one slash stripped).
+    const jwksUrl = `${config.baseUrl.replace(/\/$/, "")}/.well-known/jwks.json`;
+    this.#fetchKids = deps.fetchKids ?? (() => fetchJwksKids(jwksUrl));
+    this.#now = deps.now ?? Date.now;
   }
 
   /** The issuer this verifier trusts — used for operator-facing logging. */
@@ -126,8 +226,62 @@ export class ZeroIdVerifier implements TokenVerifier {
     return this.#config.issuer ?? this.#config.baseUrl;
   }
 
-  verify(token: string): Promise<AuthContext> {
-    return verifyToken(token, this.#config);
+  async verify(token: string): Promise<AuthContext> {
+    const ref = jwtKeyRef(token);
+    // Fail closed on anything the gate can't reason about: an undecodable
+    // header, or a truthy `kid` that isn't a string (which the SDK would
+    // still refetch for — `kid: 1` bypassed an earlier version of this gate).
+    if (ref.kind === "invalid") throw new Error("Malformed token header");
+    if (ref.kind === "kid" && !this.#knownKids.has(ref.kid) && !(await this.#publishes(ref.kid))) {
+      throw new Error("Token signed by an unknown key");
+    }
+    let ctx: AuthContext;
+    try {
+      ctx = await this.#verify(token, this.#config);
+    } catch (err) {
+      // A key we trusted that the issuer no longer publishes (rotated out):
+      // forget it, or forged tokens naming that public, retired `kid` would
+      // skip the gate and cost the SDK a JWKS refetch each, forever.
+      if (ref.kind === "kid" && err instanceof Error && /no matching jwks key/i.test(err.message)) {
+        this.#knownKids.delete(ref.kid);
+        this.#published.delete(ref.kid);
+        // The SDK's refetch can miss a key the issuer DOES publish (it joined
+        // a fetch in flight from before a rotation, or hit a stale replica).
+        // Re-read the key list soon rather than refusing that key for a full
+        // window — still at most one read per FAILED_FETCH_RETRY_MS.
+        this.#publishedAt = Math.min(this.#publishedAt, this.#now() - UNKNOWN_KID_COOLDOWN_MS + FAILED_FETCH_RETRY_MS);
+      }
+      throw err;
+    }
+    if (ref.kind === "kid") this.#knownKids.add(ref.kid);
+    return ctx;
+  }
+
+  /** Whether the issuer publishes `kid`, reading its key ids at most once per cooldown. */
+  async #publishes(kid: string): Promise<boolean> {
+    if (this.#published.has(kid)) return true;
+    if (this.#now() - this.#publishedAt >= UNKNOWN_KID_COOLDOWN_MS) {
+      this.#refreshing ??= (async () => {
+        // Stamp before the read so a slow or failing issuer is not hammered
+        // by the requests that arrive while it is in flight.
+        this.#publishedAt = this.#now();
+        try {
+          this.#published = await this.#fetchKids();
+          // Trust only keys the issuer still publishes.
+          for (const kid of this.#knownKids) if (!this.#published.has(kid)) this.#knownKids.delete(kid);
+        } catch {
+          // Keep the last inventory; an unreachable issuer would fail the SDK
+          // path anyway. Retry sooner than a full window, though: right after
+          // boot nothing is known yet, and one blip must not refuse every
+          // client for 10 s once ZeroID is back.
+          this.#publishedAt = this.#now() - UNKNOWN_KID_COOLDOWN_MS + FAILED_FETCH_RETRY_MS;
+        } finally {
+          this.#refreshing = null;
+        }
+      })();
+    }
+    if (this.#refreshing) await this.#refreshing;
+    return this.#published.has(kid);
   }
 }
 

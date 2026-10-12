@@ -37,6 +37,8 @@ import {
 import { CAPABILITIES, type CollaborationConfig } from "./protocol/types.js";
 import { ALL_SCOPES_STRING } from "./protocol/scopes.js";
 import { TerminalClient } from "./terminal/client.js";
+import { mcpConfig, mcpHeaders } from "./terminal/mcp-control-cli.js";
+import { cleartextOffHost, controlUrl, MCP_SCOPE_PRESETS, TokenError } from "./terminal/token.js";
 import { parseTargets } from "./terminal/compare.js";
 import {
   getConfigDir,
@@ -777,6 +779,59 @@ program
     await client.connect();
     await client.destroySession(session);
     client.disconnect();
+  });
+
+// ── Outward control plane (/mcp/control — docs/mcp-control.md) ─────────────
+
+const mcp = program
+  .command("mcp")
+  .description("Let external agents (Claude Code, Cursor, CI) drive codeoid over MCP (docs/mcp-control.md)");
+
+mcp
+  .command("headers")
+  .description("Print a fresh Authorization header as JSON — an MCP client's headersHelper")
+  .option("--scopes <spec>", `scope preset (${Object.keys(MCP_SCOPE_PRESETS).join(" | ")}) or a comma-separated list`, "observe")
+  .action(async (opts: { scopes: string }) => {
+    try {
+      const config = loadConfig();
+      const out = await mcpHeaders(config, opts.scopes);
+      for (const w of out.warnings) console.error(w);
+      if (cleartextOffHost(controlUrl(config.daemonUrl))) {
+        console.error("codeoid: warning — the daemon URL is plain http to another host; this token would cross the network unencrypted.");
+      }
+      process.stdout.write(`${out.stdout}\n`);
+    } catch (err) {
+      if (!(err instanceof TokenError)) throw err;
+      for (const line of err.lines) console.error(line);
+      process.exit(1);
+    }
+  });
+
+mcp
+  .command("config")
+  .description("Print an MCP client config entry (Claude Code .mcp.json shape) for this daemon")
+  .option("--scopes <spec>", `scope preset (${Object.keys(MCP_SCOPE_PRESETS).join(" | ")}) or a comma-separated list`, "observe")
+  .option("--name <name>", "server name in the client", "codeoid")
+  .action((opts: { scopes: string; name: string }) => {
+    try {
+      const config = loadConfig();
+      console.log(JSON.stringify(mcpConfig(config, opts), null, 2));
+      if (cleartextOffHost(controlUrl(config.daemonUrl))) {
+        console.error(
+          "\nWarning: this URL is plain http to another host — the bearer token would cross the network unencrypted. Put the daemon behind TLS (wss://) first.",
+        );
+      }
+    } catch (err) {
+      if (err instanceof TokenError) {
+        for (const line of err.lines) console.error(line);
+      } else {
+        console.error(err instanceof Error ? err.message : String(err));
+      }
+      process.exit(1);
+    }
+    console.error(
+      "\nThe daemon must have the endpoint on: set mcpControl.enabled (and mcpControl.allowActions to let the client create/send) in ~/.codeoid/config.json, then restart.",
+    );
   });
 
 // ── Packs (dynamic pack loading — docs/pack-loading.md) ─────────────────────
