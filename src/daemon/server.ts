@@ -33,6 +33,7 @@ import {
   type MemoryEngine,
 } from "./memory/index.js";
 import { BLACKBOARD_MCP_PATH } from "./blackboard/mcp-http.js";
+import { CONTROL_MCP_PATH, ControlMcpHttp } from "./mcp/control-http.js";
 import { McpRegistry } from "./mcp/registry.js";
 import { McpHub } from "./mcp/hub.js";
 import { MCP_OAUTH_CALLBACK_PATH, McpOAuth, mcpOAuthBindingCookieName } from "./mcp/oauth.js";
@@ -43,7 +44,7 @@ import {
   createRegistry,
 } from "./compress/index.js";
 import { createHookBus } from "./hooks/bus.js";
-import type { CodeoidConfig } from "../config.js";
+import type { CodeoidConfig, McpControlConfig } from "../config.js";
 import { CAPABILITIES, PROTOCOL_VERSION, type AuthContext, type DaemonMessage } from "../protocol/types.js";
 import { parseAuthMsg, parseClientMessage } from "@highflame/codeoid-protocol/schemas";
 import type { AttachedClient } from "./session.js";
@@ -96,6 +97,9 @@ type SocketData = {
 // The /oauth2/token proxy is unauthenticated (pre-auth exchange), so cap body
 // size, restrict content types, and rate-limit per source IP so it can't be
 // abused as an anonymizing amplifier against the ZeroID issuer.
+/** Connection idle timeout (Bun.serve `idleTimeout`, seconds). */
+const IDLE_TIMEOUT_SECONDS = 10;
+
 const PROXY_RATE_MAX = 30;
 const PROXY_RATE_WINDOW_MS = 60_000;
 const PROXY_BODY_MAX_BYTES = 8 * 1024;
@@ -180,6 +184,11 @@ export interface DaemonConfig {
    * subsystem (Layer B) can consult toggles and rule exclusions.
    */
   fullConfig?: CodeoidConfig;
+  /**
+   * Outward control-plane MCP endpoint (`/mcp/control`, docs/mcp-control.md).
+   * Absent or `enabled: false` = not mounted (the path 404s).
+   */
+  mcpControl?: McpControlConfig;
 }
 
 interface AuthenticatedSocket {
@@ -208,6 +217,8 @@ export class DaemonServer {
   #oauthHandler: OAuthHandler | null = null;
   /** The one function that turns a bearer token into an AuthContext. */
   #verifier: TokenVerifier;
+  /** `/mcp/control` — null unless `mcpControl.enabled`. */
+  #controlMcp: ControlMcpHttp | null = null;
 
   constructor(config: DaemonConfig) {
     this.#config = config;
@@ -329,6 +340,24 @@ export class DaemonServer {
         daemonId: `${this.#config.host}:${this.#config.port}`,
       },
     );
+
+    const control = config.mcpControl ?? config.fullConfig?.mcpControl;
+    if (control?.enabled) {
+      const manager = this.#manager;
+      const store = this.#store;
+      this.#controlMcp = new ControlMcpHttp({
+        verifier: this.#verifier,
+        config: control,
+        host: {
+          handle: (msg, auth, client) => manager.handle(msg, auth, client),
+          disconnectClient: (id) => manager.disconnectClient(id),
+          audit: (sub, action, sessionId, detail) => store.audit(sub, action, sessionId, detail),
+        },
+      });
+      console.log(
+        `[codeoid] mcp control: ${CONTROL_MCP_PATH} enabled (${control.allowActions ? "observe + act" : "observe only"}${control.requireDelegated ? ", agent tokens only" : ""})`,
+      );
+    }
 
     // Default first and labelled: with session.defaultProvider set, which
     // backend unqualified sessions land on is worth seeing at boot.
@@ -530,6 +559,9 @@ export class DaemonServer {
     this.#bunServer = Bun.serve({
       port: this.#config.port,
       hostname: this.#config.host,
+      // Bun's own default, made explicit so `/mcp/control` can restore exactly
+      // this after lifting it for a long wait (see ControlMcpHttp.handle).
+      idleTimeout: IDLE_TIMEOUT_SECONDS,
 
       async fetch(req, server) {
         const url = new URL(req.url);
@@ -565,6 +597,20 @@ export class DaemonServer {
         // request 401s anyway.
         if (url.pathname === BLACKBOARD_MCP_PATH) {
           return self.#manager.blackboardMcp.handle(req);
+        }
+
+        // Outward control plane (#251). Authorizes with the SAME verifier as
+        // the WebSocket handshake and runs every tool through
+        // SessionManager.handle, so scopes, tenancy, and audit are the ones
+        // every other client gets. Off by default: not mounted = 404, so a
+        // probe cannot even tell it exists.
+        if (url.pathname === CONTROL_MCP_PATH && self.#controlMcp) {
+          return self.#controlMcp.handle(req, {
+            liftIdleTimeout: () => {
+              server.timeout(req, 0);
+              return () => server.timeout(req, IDLE_TIMEOUT_SECONDS);
+            },
+          });
         }
 
         // The provider's redirect after an MCP server sign-in. Unauthenticated

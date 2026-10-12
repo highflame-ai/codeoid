@@ -390,6 +390,34 @@ describe("loadConfig — collaboration.maxLiveChildren", () => {
   });
 });
 
+describe("loadConfig — mcpControl", () => {
+  it("is off and observe-only by default", () => {
+    const c = loadConfig({ configPath, env: {} });
+    expect(c.mcpControl).toEqual({
+      enabled: false,
+      allowActions: false,
+      requireDelegated: false,
+      allowedOrigins: [],
+      maxWaitSeconds: 120,
+    });
+  });
+
+  it("reads the file block, and the env switches override it", () => {
+    writeConfig({ mcpControl: { enabled: true, requireDelegated: true, allowedOrigins: ["https://ui.example"] } });
+    const fromFile = loadConfig({ configPath, env: {} });
+    expect(fromFile.mcpControl).toMatchObject({ enabled: true, allowActions: false, requireDelegated: true, allowedOrigins: ["https://ui.example"] });
+    const env = loadConfig({ configPath, env: { CODEOID_MCP_CONTROL_ENABLED: "false", CODEOID_MCP_CONTROL_ACTIONS: "true" } });
+    expect(env.mcpControl).toMatchObject({ enabled: false, allowActions: true });
+  });
+
+  it("loud-fails on a wait cap outside 1..600 seconds", () => {
+    for (const n of [0, 601]) {
+      writeConfig({ mcpControl: { maxWaitSeconds: n } });
+      expect(() => loadConfig({ configPath, env: {} })).toThrow(/Invalid config/);
+    }
+  });
+});
+
 describe("resolveZeroidUrl", () => {
   it("maps known preset names to their URLs", () => {
     expect(resolveZeroidUrl("highflame")).toBe("https://auth.highflame.ai");
@@ -648,6 +676,27 @@ describe("resolveLocalToken — client-side local-mode discovery", () => {
     const token = mintLocalToken();
     writeLocalTokenFile(getLocalTokenPath(7400), token);
     expect(resolveLocalToken(URL_A, {})).toBe(token);
+  });
+
+  it("never hands this machine's token file to a daemon URL on another host", () => {
+    // The file is keyed by port, so a remote URL on the same port used to
+    // pick it up — and `codeoid mcp headers` would ship it to that host.
+    writeLocalTokenFile(getLocalTokenPath(7400), mintLocalToken());
+    expect(resolveLocalToken("wss://codeoid.example.com:7400", {})).toBeNull();
+    expect(resolveLocalToken("ws://10.1.2.3:7400", {})).toBeNull();
+    expect(resolveLocalToken("ws://localhost:7400", {})).not.toBeNull();
+    expect(resolveLocalToken("ws://[::1]:7400", {})).not.toBeNull();
+    // Client-side forms that still mean this machine.
+    expect(resolveLocalToken("ws://0.0.0.0:7400", {})).not.toBeNull();
+    expect(resolveLocalToken("ws://[::ffff:127.0.0.1]:7400", {})).not.toBeNull();
+    expect(resolveLocalToken("ws://localhost.localdomain:7400", {})).not.toBeNull();
+    expect(resolveLocalToken("ws://127.0.1.1:7400", {})).not.toBeNull();
+    // ...and look-alikes that don't.
+    for (const u of ["ws://127.0.0.1.evil.com:7400", "ws://127.0.0.1@evil.com:7400", "ws://localhost.evil.com:7400"]) {
+      expect(resolveLocalToken(u, {})).toBeNull();
+    }
+    // An explicit pin is the operator's own decision (e.g. --local-allow-remote).
+    expect(resolveLocalToken("ws://10.1.2.3:7400", { CODEOID_LOCAL_TOKEN: "codeoid_local_pinned" })).toBe("codeoid_local_pinned");
   });
 
   it("prefers CODEOID_LOCAL_TOKEN over the published file", () => {

@@ -324,6 +324,31 @@ const fleet: SettingsTab = {
         cfg("dispatch.retryBaseMs", "Retry backoff base (ms)", "Base backoff for retryable failures — doubles per attempt.", { kind: "int", min: 0, default: 15000, advanced: true }),
       ],
     },
+    {
+      id: "mcp-control",
+      title: "External control (MCP)",
+      description: "Let outside agents (Claude Code, Cursor, CI) drive sessions through `/mcp/control`. Every call is scope-checked and audited under the caller's identity.",
+      fields: [
+        cfg("mcpControl.enabled", "Enable control endpoint", "Mount `/mcp/control`. Off by default.", {
+          kind: "boolean",
+          envVar: "CODEOID_MCP_CONTROL_ENABLED",
+          default: false,
+        }),
+        cfg("mcpControl.allowActions", "Allow actions", "Expose create / send / interrupt / destroy. Off = observe only.", {
+          kind: "boolean",
+          envVar: "CODEOID_MCP_CONTROL_ACTIONS",
+          default: false,
+        }),
+        cfg("mcpControl.requireDelegated", "Require agent identity", "Accept only delegated agent tokens, so each caller is its own revocable principal.", {
+          kind: "boolean",
+          default: false,
+        }),
+        cfg("mcpControl.maxWaitSeconds", "Max wait (s)", "Upper bound for `wait_for_session`.", { kind: "int", min: 1, max: 600, default: 120, advanced: true }),
+        // mcpControl.allowedOrigins is file-config only on purpose: it is the
+        // DNS-rebinding guard, and widening it from a browser settings page is
+        // exactly the vector it closes.
+      ],
+    },
   ],
 };
 

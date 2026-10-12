@@ -385,4 +385,47 @@ describe("SessionManager scrollback.page", () => {
     );
     expect(foreign).toMatchObject({ type: "response.error", code: "not_found" });
   });
+
+  it("with no anchor, serves the NEWEST page, and its oldest id pages on back", async () => {
+    // A caller that never attached (the /mcp/control endpoint, a one-shot
+    // CLI) holds no message to anchor on.
+    const manager = makeManager();
+    const c = client(TEST_AUTH);
+    const created = (await manager.handle(
+      { type: "session.create", id: "n1", name: "newest", workdir: tmp },
+      TEST_AUTH,
+      c,
+    )) as { data: { id: string } };
+    const sessionId = created.data.id;
+    const session = manager.findByName("newest", TEST_AUTH)!;
+    session.restoreScrollback(Array.from({ length: 6 }, (_, i) => msg(`m${i}`, `c${i}`, sessionId)));
+    const one = JSON.stringify(msg("m0", "c0", sessionId)).length;
+
+    const newest = (await manager.handle(
+      { type: "scrollback.page", id: "n2", sessionId, maxBytes: one * 2 + 10 },
+      TEST_AUTH,
+      c,
+    )) as ScrollbackPageResultMsg;
+    // A newest SUFFIX of the history, smaller than all of it.
+    const ids = newest.messages.map((m) => m.messageId);
+    const all = ["m0", "m1", "m2", "m3", "m4", "m5"];
+    expect(ids.length).toBeGreaterThan(0);
+    expect(ids.length).toBeLessThan(all.length);
+    expect(ids).toEqual(all.slice(all.length - ids.length));
+    expect(newest.hasMore).toBe(true);
+
+    // Its oldest id pages back to exactly the rest — no gap, no overlap.
+    const older = (await manager.handle(
+      { type: "scrollback.page", id: "n3", sessionId, beforeMessageId: ids[0]!, maxBytes: 1024 * 1024 },
+      TEST_AUTH,
+      c,
+    )) as ScrollbackPageResultMsg;
+    expect([...older.messages.map((m) => m.messageId), ...ids]).toEqual(all);
+
+    // Same scope + tenancy gate as an anchored page.
+    const noScope = await manager.handle({ type: "scrollback.page", id: "n4", sessionId }, { ...TEST_AUTH, scopes: [] }, c);
+    expect(noScope).toMatchObject({ type: "response.error", code: "forbidden" });
+    const foreign = await manager.handle({ type: "scrollback.page", id: "n5", sessionId }, { ...TEST_AUTH, accountId: "other-acc" }, c);
+    expect(foreign).toMatchObject({ type: "response.error", code: "not_found" });
+  });
 });
