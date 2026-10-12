@@ -277,7 +277,7 @@ function printLocalModeBanner(o: {
  * ZeroID upgrading could fix.
  *
  * `ALL_SCOPES` is the single source of truth (`ALL_SCOPES_STRING` is the same
- * join, already used by the terminal + TUI clients). `scopes.drift.test.ts`
+ * join, already used by the terminal + TUI clients). `login-scope-drift.test.ts`
  * fails if a future scope is added and this silently falls behind again.
  *
  * Note this is an OWNER-tier token: it includes `settings:write` and

@@ -56,3 +56,17 @@ describe("login scope set", () => {
     }
   });
 });
+
+/**
+ * The web UI mints its own token from an API key with its own scope request.
+ * It was a hand-written list that never gained `settings:*` / `fleet:read`, so
+ * the web Settings screen failed with "Missing scope: settings:read" even
+ * after the CLI list was fixed.
+ */
+describe("web UI scope set", () => {
+  const web = readFileSync(join(import.meta.dir, "..", "..", "web", "src", "lib", "auth.ts"), "utf8");
+
+  test("is derived from ALL_SCOPES, not hand-listed", () => {
+    expect(web).toContain("export const DEFAULT_WEB_SCOPES = ALL_SCOPES_STRING;");
+  });
+});
