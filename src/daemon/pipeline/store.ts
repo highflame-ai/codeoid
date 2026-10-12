@@ -94,6 +94,26 @@ export class PipelineStore {
     return rows.map(parseRow).filter((s): s is PipelineState => s !== undefined);
   }
 
+  /**
+   * Session ids that a tenant's non-terminal runs drive. Answered in SQL —
+   * status-filtered and `json_extract`ed — because it runs on every
+   * `session.list` (SessionInfo.managedBy), and parsing every run the tenant
+   * ever had, finished ones included, cost ~10 ms a call at 100 runs.
+   */
+  activeSessionIds(accountId: string, projectId: string): string[] {
+    const placeholders = ACTIVE_STATUSES.map(() => "?").join(", ");
+    const rows = this.#db
+      .prepare(
+        // json_valid guard: one corrupt row must not fail every session.list
+        // for the tenant (json_extract throws on malformed JSON); parseRow
+        // skips bad rows on the other read paths for the same reason.
+        `SELECT CASE WHEN json_valid(state_json) THEN json_extract(state_json, '$.sessionId') END AS sid FROM pipelines
+         WHERE account_id = ? AND project_id = ? AND status IN (${placeholders})`,
+      )
+      .all(accountId, projectId, ...ACTIVE_STATUSES) as Array<{ sid: unknown }>;
+    return rows.map((r) => r.sid).filter((v): v is string => typeof v === "string" && v.length > 0);
+  }
+
   /** Non-terminal pipelines — the set a fresh daemon rehydrates on boot. A
    *  positive `status IN (…)` (vs `NOT IN`) so idx_pipelines_status is usable;
    *  placeholders derived from ACTIVE_STATUSES so the set stays single-sourced. */

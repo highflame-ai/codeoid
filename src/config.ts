@@ -21,6 +21,7 @@ import { z } from "zod";
 import type { AuthConfig } from "./daemon/auth.js";
 import type { OAuthConfig } from "./daemon/oauth.js";
 import {
+  isLoopbackHost,
   LOCAL_TOKEN_ENV,
   localTokenFilename,
   readLocalTokenFile,
@@ -92,9 +93,34 @@ export function resolveLocalToken(
 ): string | null {
   const fromEnv = env[LOCAL_TOKEN_ENV];
   if (fromEnv && fromEnv.length > 0) return fromEnv;
+  // The token FILE belongs to a daemon on THIS machine. The file is keyed by
+  // port only, so without this check a `daemonUrl` naming another host on the
+  // same port would be handed this machine's all-scopes local token — and
+  // `codeoid mcp headers` would put it in a third-party client's config.
+  if (!isLoopbackUrl(daemonUrl)) return null;
   const port = daemonPortFromUrl(daemonUrl);
   if (!port) return null;
   return readLocalTokenFile(getLocalTokenPath(port));
+}
+
+/**
+ * True when `url` names this machine. Reuses the daemon's own `isLoopbackHost`
+ * (one definition of loopback for the bind guard and the client), plus the two
+ * forms a client URL can carry that a bind address doesn't: `0.0.0.0`, which a
+ * client reaches as this host, and the IPv4-mapped loopback the URL parser
+ * normalizes to hex (`[::ffff:7f00:1]`).
+ */
+export function isLoopbackUrl(url: string): boolean {
+  let host: string;
+  try {
+    host = new URL(url).hostname;
+  } catch {
+    return false;
+  }
+  const bare = host.replace(/^\[|\]$/g, "").toLowerCase();
+  if (bare === "0.0.0.0") return true;
+  if (/^::ffff:7f[0-9a-f]{2}:[0-9a-f]{1,4}$/.test(bare)) return true;
+  return isLoopbackHost(host);
 }
 
 /**
@@ -545,6 +571,49 @@ const DispatchSchema = z
   });
 
 /**
+ * Outward control-plane MCP endpoint (`/mcp/control`, docs/mcp-control.md):
+ * lets an EXTERNAL agent (Claude Code, Cursor, a CI job) drive codeoid
+ * sessions over MCP Streamable HTTP.
+ *
+ * Default OFF, and even when on, read-only unless `allowActions` — the
+ * fleet.ts READ/SEND split applied to an outside caller. Every call still
+ * authorizes through the same ZeroID verifier and per-message scope checks
+ * as a WebSocket client; this block only narrows what is reachable.
+ */
+const McpControlSchema = z
+  .object({
+    /** Mount `/mcp/control` at all. Off = the path 404s. */
+    enabled: z.boolean().default(false),
+    /**
+     * Expose the send-class tools (create / send / interrupt / destroy).
+     * Off = observe only (list, status, transcript, usage).
+     */
+    allowActions: z.boolean().default(false),
+    /**
+     * Accept only delegated agent tokens (delegation depth >= 1), so every
+     * external caller is its own principal in the ZeroID delegation tree —
+     * attributable, attenuated, and revocable on its own — rather than
+     * borrowing a human's token.
+     */
+    requireDelegated: z.boolean().default(false),
+    /**
+     * Browser origins allowed to call the endpoint. Empty (default) = any
+     * request carrying an `Origin` header is refused, which closes DNS
+     * rebinding; MCP clients that are not browsers send no Origin.
+     */
+    allowedOrigins: z.array(z.string()).default([]),
+    /** Upper bound for `wait_for_session`, in seconds. */
+    maxWaitSeconds: z.number().int().min(1).max(600).default(120),
+  })
+  .default({
+    enabled: false,
+    allowActions: false,
+    requireDelegated: false,
+    allowedOrigins: [],
+    maxWaitSeconds: 120,
+  });
+
+/**
  * Collaborative-session bounds (docs/collaborative-session-design.md §11 P3).
  *
  * `MAX_COLLABORATION_CHILDREN` already caps ONE goal at 12. Nothing capped the
@@ -983,6 +1052,7 @@ const RootSchema = z.object({
   session: SessionSchema,
   conductor: ConductorSchema,
   dispatch: DispatchSchema,
+  mcpControl: McpControlSchema,
   collaboration: CollaborationSchema,
   rateLimit: RateLimitSchema,
   pipeline: PipelineSchema,
@@ -1019,6 +1089,9 @@ type ParsedConfig = z.infer<typeof RootSchema>;
  * Flattened, path-resolved config consumed by the daemon + client. Shape is
  * append-only — add new fields here, don't rename existing ones.
  */
+/** Parsed `mcpControl` block (see McpControlSchema). */
+export type McpControlConfig = z.infer<typeof McpControlSchema>;
+
 export interface CodeoidConfig {
   /** Daemon WebSocket URL. */
   daemonUrl: string;
@@ -1164,6 +1237,11 @@ export interface CodeoidConfig {
     maxSessionsPerUser: number;
     maxCreationsPerHour: number;
   };
+  /**
+   * Outward control-plane MCP endpoint (see McpControlSchema). Optional in the
+   * type so hand-built test configs stay minimal; absent = disabled.
+   */
+  mcpControl?: McpControlConfig;
   dispatch?: {
     enabled: boolean;
     tickMs: number;
@@ -1346,6 +1424,10 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   // without touching config.json. Other dispatch knobs are file-config only,
   // matching the conductor block's convention.
   { env: "CODEOID_DISPATCH_ENABLED", path: "dispatch.enabled", kind: "boolean" },
+  // Control-plane MCP switches — per-invocation, e.g. a CI runner that turns
+  // the endpoint on for one job. The rest of the block is file-config only.
+  { env: "CODEOID_MCP_CONTROL_ENABLED", path: "mcpControl.enabled", kind: "boolean" },
+  { env: "CODEOID_MCP_CONTROL_ACTIONS", path: "mcpControl.allowActions", kind: "boolean" },
   { env: "CODEOID_MAX_SESSIONS_PER_USER", path: "rateLimit.maxSessionsPerUser", kind: "int" },
   { env: "CODEOID_MAX_SESSIONS_PER_HOUR", path: "rateLimit.maxCreationsPerHour", kind: "int" },
   // Pipeline enable/kill switch — turn the SDLC pipeline on/off per-invocation
@@ -1576,6 +1658,7 @@ export function loadConfig(opts: LoadOptions = {}): CodeoidConfig {
     session: parsed.session,
     conductor: parsed.conductor,
     dispatch: parsed.dispatch,
+    mcpControl: parsed.mcpControl,
     collaboration: parsed.collaboration,
     rateLimit: parsed.rateLimit,
     pipeline: parsed.pipeline,

@@ -117,6 +117,34 @@ describe("pipeline.* handlers", () => {
     expect(aborted.status).toBe("abandoned");
   });
 
+  test("a live run marks its bound session managedBy=pipeline, and the mark clears when the run ends", async () => {
+    const managed = async (): Promise<Array<{ name: string; managedBy?: string }>> => {
+      const r = await manager.handle({ type: "session.list", id: "l" }, AUTH, CLIENT);
+      if (r.type !== "session.list.result") throw new Error("expected list");
+      return r.sessions.map((x) => ({ name: x.name, managedBy: x.managedBy }));
+    };
+    const created = snapshot(
+      await manager.handle(
+        {
+          type: "pipeline.create",
+          id: "1",
+          name: "RUN-M",
+          phases: [{ id: "one", kind: "noop", gate: "manual" }],
+          workdir: join(tmp, "repo"),
+        },
+        AUTH,
+        CLIENT,
+      ),
+    );
+    expect(await managed()).toContainEqual({ name: "RUN-M", managedBy: "pipeline" });
+    // Another tenant's list never sees it, marked or not.
+    const other = await manager.handle({ type: "session.list", id: "o" }, { ...AUTH, accountId: "other" }, CLIENT);
+    expect(other.type === "session.list.result" && other.sessions.length).toBe(0);
+
+    await manager.handle({ type: "pipeline.abort", id: "4", pipelineId: created.id }, AUTH, CLIENT);
+    expect(await managed()).toContainEqual({ name: "RUN-M", managedBy: undefined });
+  });
+
   test("advance + halt→answer→resume round-trip over the wire", async () => {
     const created = snapshot(
       await manager.handle(

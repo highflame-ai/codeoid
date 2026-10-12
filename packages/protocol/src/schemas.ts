@@ -315,7 +315,8 @@ export const scrollbackPageSchema = z.object({
   ...base,
   type: z.literal("scrollback.page"),
   sessionId: sessionIdField,
-  beforeMessageId: z.string().min(1).max(LIMITS.ID_MAX),
+  /** Absent = the NEWEST page (the session's latest history). */
+  beforeMessageId: z.string().min(1).max(LIMITS.ID_MAX).optional(),
   maxBytes: z.number().int().min(1).optional(),
 });
 

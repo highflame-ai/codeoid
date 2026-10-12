@@ -5392,6 +5392,7 @@ mcpHub: this.#mcpHub,
     }
 
     const sessions: SessionInfo[] = [];
+    const piloted = this.#pipelineDrivenSessionIds(auth.accountId, auth.projectId);
     for (const session of this.#sessions.values()) {
       // Tenancy filter — never enumerate sessions belonging to a
       // different account/project. Same shape as #getOwnedSession.
@@ -5402,10 +5403,24 @@ mcpHub: this.#mcpHub,
         continue;
       }
       const info = session.toInfo();
-      sessions.push({ ...info, attachedClients: session.attachedClientCount });
+      sessions.push({
+        ...info,
+        attachedClients: session.attachedClientCount,
+        ...(piloted.has(session.id) ? { managedBy: "pipeline" as const } : {}),
+      });
     }
 
     return { type: "session.list.result", requestId: msg.id, sessions };
+  }
+
+  /**
+   * Sessions a live (non-terminal) pipeline run is driving in this tenant —
+   * `SessionInfo.managedBy`. Read from the pipeline store rather than flagged on
+   * the Session, so it survives a daemon restart (pipelines rehydrate; sessions
+   * resume as plain ones) and clears itself when the run ends.
+   */
+  #pipelineDrivenSessionIds(accountId: string, projectId: string): Set<string> {
+    return new Set(this.#pipelines?.activeSessionIds(accountId, projectId) ?? []);
   }
 
   #attach(
