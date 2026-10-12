@@ -92,6 +92,10 @@ CODEOID_DEFAULT_PROVIDER=claude         # backend for sessions created without -
                                         #   daemon at startup. Resumed sessions and the conductor
                                         #   keep their own backend.
 
+# Outward control plane (/mcp/control) — see docs/mcp-control.md. Off by default.
+CODEOID_MCP_CONTROL_ENABLED=false       # mount the endpoint
+CODEOID_MCP_CONTROL_ACTIONS=false       # also allow create / send / interrupt / destroy
+
 # Memory
 CODEOID_MEMORY=1                        # default: on; set to 0 to disable
 CODEOID_MEMORY_DB_PATH=~/.codeoid/memory.db

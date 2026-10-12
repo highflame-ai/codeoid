@@ -167,7 +167,15 @@ codeoid send <n> <m> # one-shot message
 codeoid interrupt <n>
 codeoid approve <n> [--deny] [--pick N | --id <approvalId>] [--yes]
 codeoid destroy <n>
+codeoid mcp config [--scopes observe|operate|full]  # MCP client entry for /mcp/control
+codeoid mcp headers [--scopes …]                    # fresh bearer header (an MCP headersHelper)
 ```
+
+`/mcp/control` (off by default, `mcpControl.*`) lets external agents drive
+sessions over MCP. Every tool call is an ordinary `ClientMessage` run through
+`SessionManager.handle`, so it shares the WebSocket path's verifier, scopes,
+tenancy, and audit. Keep authorization in `handle`; the endpoint may only
+narrow what is reachable, never grant. See docs/mcp-control.md.
 
 ## Config
 
@@ -178,6 +186,8 @@ ZEROID_URL=highflame                 # issuer: preset (highflame | highflame-dev
 ZEROID_ISSUER=                       # override the expected `iss` claim (default: resolved ZEROID_URL)
 TELEGRAM_BOT_TOKEN=...              # Optional: enables Telegram frontend
 TELEGRAM_ALLOWED_USER_IDS=123,456   # Required with bot token
+CODEOID_MCP_CONTROL_ENABLED=false   # mount /mcp/control (docs/mcp-control.md)
+CODEOID_MCP_CONTROL_ACTIONS=false   # also allow create / send / interrupt / destroy there
 
 # Claude auth: uses your existing `claude login` session (Pro/Max subscription).
 # No ANTHROPIC_API_KEY needed if you're logged in via Claude Code CLI.

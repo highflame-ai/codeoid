@@ -1735,12 +1735,26 @@ export class Session {
    * it was export-only. The transcript scan is byte- and deadline-bounded
    * so one page request can't wedge on a multi-GB file; an anchor beyond
    * the scan window ends paging with `hasMore: false`.
+   *
+   * No anchor = the NEWEST page: the latest history within the budget, for a
+   * caller that never attached and so holds no messages yet (`/mcp/control`).
    */
   async pageScrollback(
-    beforeMessageId: string,
+    beforeMessageId: string | undefined,
     maxBytes?: number,
   ): Promise<{ messages: SessionMessage[]; hasMore: boolean; source: "buffer" | "transcript" }> {
     const budget = Math.min(Math.max(1, maxBytes ?? PAGE_DEFAULT_BYTES), PAGE_MAX_BYTES);
+
+    if (beforeMessageId === undefined) {
+      const tail = this.#scrollback.readTailChunked(budget, budget);
+      return {
+        messages: tail.chunks.flat() as SessionMessage[],
+        // Older history exists when the buffer still holds some, or when
+        // anything was ever evicted to disk — page it with the oldest id.
+        hasMore: tail.hasMore || this.#scrollback.partialHistory,
+        source: "buffer",
+      };
+    }
 
     const fromBuffer = this.#scrollback.readPageBefore(beforeMessageId, budget);
     if (fromBuffer && fromBuffer.messages.length > 0) {
@@ -3440,6 +3454,7 @@ export class Session {
         ? { profile: this.#pack.roleName ? `${this.#pack.id} (${this.#pack.roleName})` : this.#pack.id }
         : {}),
       ...this.#pendingDialogInfo(),
+      ...(this.preparingTurn ? { turnQueued: true as const } : {}),
     };
   }
 

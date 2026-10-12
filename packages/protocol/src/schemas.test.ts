@@ -344,6 +344,18 @@ describe("session.import — inline source requires a bundle", () => {
 
 // ── 3. Forward-compat + rejection behaviour ───────────────────────────────────
 
+describe("scrollback.page — the anchor is optional", () => {
+  test("no beforeMessageId = the newest page (a caller that never attached)", () => {
+    const r = parseClientMessage({ type: "scrollback.page", id: "p1", sessionId: "s1" });
+    expect(r.ok).toBe(true);
+    if (r.ok && r.value.type === "scrollback.page") expect(r.value.beforeMessageId).toBeUndefined();
+  });
+
+  test("an empty anchor is still rejected — absent and empty are different requests", () => {
+    expect(parseClientMessage({ type: "scrollback.page", id: "p2", sessionId: "s1", beforeMessageId: "" }).ok).toBe(false);
+  });
+});
+
 describe("forward-compat", () => {
   test("unknown FIELDS on a known message are stripped, not rejected", () => {
     const result = parseClientMessage({
