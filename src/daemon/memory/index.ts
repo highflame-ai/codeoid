@@ -38,7 +38,7 @@ export {
   type MemoryToolDef,
   type MemoryToolContext,
 } from "./tools.js";
-export { DEFAULT_EMBEDDING_MODEL, createEmbedder } from "./embedder.js";
+export { DEFAULT_EMBEDDING_MODEL, createEmbedder, WorkerEmbedder } from "./embedder.js";
 export { buildWorkspaceIndex, MAX_INDEX_BYTES } from "./index-builder.js";
 export { IndexScheduler } from "./index-scheduler.js";
 export {
@@ -69,11 +69,20 @@ export interface MemoryConfig {
   dbPath: string;
   /** Embedder config — model name, cache dir. */
   embedder?: EmbedderConfig;
+  /** Compute embeddings at all (default true). False = keyword-only recall. */
+  embeddingsEnabled?: boolean;
+  /** Embedding windows per episode (default 8). */
+  maxEmbedWindows?: number;
 }
 
 /** Build a ready-to-use MemoryEngine. Caller must call `engine.init()` before first use. */
 export async function createMemory(config: MemoryConfig): Promise<MemoryEngine> {
   const store = new SqliteEpisodeStore(config.dbPath);
   const embedder = await createEmbedder(config.embedder);
-  return new MemoryEngine({ store, embedder });
+  return new MemoryEngine({
+    store,
+    embedder,
+    embeddingsEnabled: config.embeddingsEnabled,
+    maxEmbedWindows: config.maxEmbedWindows,
+  });
 }

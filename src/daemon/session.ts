@@ -112,6 +112,7 @@ import type { Attachment } from "../protocol/types.js";
 import { resolveAttachments } from "./attachments.js";
 import type { CodeoidConfig } from "../config.js";
 import type { CompressionRegistry } from "./compress/index.js";
+import { defaultSpillDir } from "./compress/spill.js";
 import { PRIMARY_CHAIN, RepeatToolGuard } from "./guard/index.js";
 import {
   CLAUDE_PROVIDER_ID,
@@ -1187,6 +1188,7 @@ export class Session {
           workspaceId: this.#workspaceId,
           sessionId: this.id,
           createdBy: opts.auth.sub,
+          spillDir: defaultSpillDir(),
         },
         (episode) => {
           try {

@@ -326,6 +326,29 @@ export class SqliteEpisodeStore {
 
       CREATE INDEX IF NOT EXISTS idx_file_reads_recent
         ON file_reads(workspace_id, file_path, read_at DESC);
+
+      -- The full verbatim body of an episode whose content column holds only a
+      -- bounded index view (see lossless.ts). zstd-compressed.
+      CREATE TABLE IF NOT EXISTS episode_payloads (
+        episode_id  TEXT PRIMARY KEY REFERENCES episodes(id) ON DELETE CASCADE,
+        encoding    TEXT NOT NULL,
+        chars       INTEGER NOT NULL,
+        data        BLOB NOT NULL
+      );
+
+      -- Embedding windows past the first (window 0 lives in episodes.embedding,
+      -- which clustering and older readers use). An episode's vector score is
+      -- its best window.
+      CREATE TABLE IF NOT EXISTS episode_vectors (
+        episode_id    TEXT NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+        workspace_id  TEXT NOT NULL,
+        window        INTEGER NOT NULL,
+        embedding     BLOB NOT NULL,
+        PRIMARY KEY (episode_id, window)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_episode_vectors_workspace
+        ON episode_vectors(workspace_id);
     `);
 
     // Idempotent migration: add primary_max_call_input_tokens column to
@@ -348,7 +371,12 @@ export class SqliteEpisodeStore {
 
   // ── Writes ────────────────────────────────────────────────────────────
 
-  insert(episode: Omit<Episode, "id"> & { id?: string }): Episode {
+  /**
+   * Persist an episode. `fullContent`, when given and longer than `content`,
+   * is the verbatim body that `content` is an index view of; it is kept,
+   * compressed, in `episode_payloads` and returned by getFullContent().
+   */
+  insert(episode: Omit<Episode, "id"> & { id?: string; fullContent?: string }): Episode {
     const id = episode.id ?? randomUUID();
     const embeddingBuf = episode.embedding
       ? new Uint8Array(episode.embedding.buffer, episode.embedding.byteOffset, episode.embedding.byteLength)
@@ -377,14 +405,52 @@ export class SqliteEpisodeStore {
         episode.createdBy,
       );
 
+    if (episode.fullContent !== undefined && episode.fullContent !== episode.content) {
+      this.#db
+        .prepare(
+          "INSERT OR REPLACE INTO episode_payloads (episode_id, encoding, chars, data) VALUES (?, 'zstd', ?, ?)",
+        )
+        .run(id, episode.fullContent.length, Bun.zstdCompressSync(Buffer.from(episode.fullContent, "utf8"), { level: 3 }));
+    }
+
     // An insert that already carries an embedding extends the matrix for
     // its workspace; append to the cached copy rather than dropping it (a
     // drop would force a full O(N) BLOB reload on the next recall).
     if (episode.embedding) {
-      this.#upsertCachedVector(episode.workspaceId, id, episode.embedding);
+      this.#upsertCachedVector(episode.workspaceId, id, 0, episode.embedding);
     }
 
-    return { ...episode, id };
+    const { fullContent: _full, ...saved } = episode;
+    return { ...saved, id };
+  }
+
+  /** The verbatim body of an episode: its payload when the content column
+   *  holds an index view, else the content itself. Null when absent. */
+  getFullContent(id: string): string | null {
+    const row = this.#db
+      .prepare(
+        `SELECT e.content AS content, p.encoding AS encoding, p.data AS data
+         FROM episodes e LEFT JOIN episode_payloads p ON p.episode_id = e.id
+         WHERE e.id = ?`,
+      )
+      .get(id) as { content: string; encoding: string | null; data: Uint8Array | null } | undefined;
+    if (!row) return null;
+    if (!row.data) return row.content;
+    if (row.encoding !== "zstd") throw new Error(`episode ${id}: unknown payload encoding ${row.encoding}`);
+    return Buffer.from(Bun.zstdDecompressSync(row.data)).toString("utf8");
+  }
+
+  /** Stored size of the memory database's episode data, for diagnostics. */
+  storageStats(): { episodes: number; indexedChars: number; payloads: number; payloadChars: number; payloadBytes: number } {
+    const e = this.#db
+      .prepare("SELECT COUNT(*) AS n, COALESCE(SUM(LENGTH(content)), 0) AS chars FROM episodes")
+      .get() as { n: number; chars: number };
+    const p = this.#db
+      .prepare(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(chars), 0) AS chars, COALESCE(SUM(LENGTH(data)), 0) AS bytes FROM episode_payloads",
+      )
+      .get() as { n: number; chars: number; bytes: number };
+    return { episodes: e.n, indexedChars: e.chars, payloads: p.n, payloadChars: p.chars, payloadBytes: p.bytes };
   }
 
   /**
@@ -483,26 +549,52 @@ export class SqliteEpisodeStore {
     // Embed batches fire continuously during active work — clearing the cache
     // here would force the next recall into a full O(N) BLOB reload. Both the
     // id and the vector are known, so extend the cached matrix in place.
-    this.#upsertCachedVector(workspaceId, episodeId, embedding);
+    this.#upsertCachedVector(workspaceId, episodeId, 0, embedding);
+  }
+
+  /**
+   * Store every embedding window of an episode: window 0 in the episodes row,
+   * the rest in `episode_vectors`. Replaces any windows stored before.
+   */
+  setWindowEmbeddings(
+    episodeId: string,
+    vectors: Float32Array[],
+    model: string,
+    workspaceId: string,
+  ): void {
+    if (vectors.length === 0) return;
+    this.setEmbedding(episodeId, vectors[0]!, model, workspaceId);
+    const del = this.#db.prepare("DELETE FROM episode_vectors WHERE episode_id = ?");
+    del.run(episodeId);
+    const ins = this.#db.prepare(
+      "INSERT INTO episode_vectors (episode_id, workspace_id, window, embedding) VALUES (?, ?, ?, ?)",
+    );
+    for (let w = 1; w < vectors.length; w++) {
+      const v = vectors[w]!;
+      ins.run(episodeId, workspaceId, w, new Uint8Array(v.buffer, v.byteOffset, v.byteLength));
+      this.#upsertCachedVector(workspaceId, episodeId, w, v);
+    }
   }
 
   /** Append (or replace, for a re-embed) one row of a workspace's cached
    * vector matrix. No-op when the matrix hasn't been built yet — the next
    * loadVectorMatrix() reads the row from SQLite along with everything else.
    * The vector is copied so the cache can't diverge from the persisted BLOB
-   * if the caller mutates its array afterwards. */
-  #upsertCachedVector(workspaceId: string, id: string, vector: Float32Array): void {
+   * if the caller mutates its array afterwards. Rows are keyed per
+   * (episode, window); `ids` repeats an episode id once per window. */
+  #upsertCachedVector(workspaceId: string, id: string, window: number, vector: Float32Array): void {
     const cached = this.#vectorCache.get(workspaceId);
     if (!cached) return;
     const copy = new Float32Array(vector);
-    const existing = cached.indexById.get(id);
+    const key = vectorRowKey(id, window);
+    const existing = cached.indexById.get(key);
     if (existing !== undefined) {
       const delta = copy.byteLength - cached.vectors[existing]!.byteLength;
       cached.vectors[existing] = copy;
       cached.sizeBytes += delta;
       this.#vectorCacheBytes += delta;
     } else {
-      cached.indexById.set(id, cached.ids.length);
+      cached.indexById.set(key, cached.ids.length);
       cached.ids.push(id);
       cached.vectors.push(copy);
       cached.sizeBytes += copy.byteLength;
@@ -1047,7 +1139,9 @@ export class SqliteEpisodeStore {
     return rows;
   }
 
-  /** Build or return the cached (rowid → embedding) matrix for a workspace.
+  /** Build or return the cached embedding matrix for a workspace: one row per
+   * embedding window, `ids[i]` naming the episode row i belongs to (so an
+   * episode id repeats once per window; score an episode by its best row).
    * Built from SQLite at most once per workspace; writes keep it in sync
    * incrementally (see #upsertCachedVector), so recall never pays a full
    * reload after the first query. */
@@ -1062,17 +1156,20 @@ export class SqliteEpisodeStore {
 
     const rows = this.#db
       .prepare(
-        `SELECT id, embedding FROM episodes
-         WHERE workspace_id = ? AND embedding IS NOT NULL`,
+        `SELECT id, 0 AS window, embedding FROM episodes
+           WHERE workspace_id = ? AND embedding IS NOT NULL
+         UNION ALL
+         SELECT episode_id AS id, window, embedding FROM episode_vectors
+           WHERE workspace_id = ?`,
       )
-      .all(workspaceId) as Array<{ id: string; embedding: Uint8Array }>;
+      .all(workspaceId, workspaceId) as Array<{ id: string; window: number; embedding: Uint8Array }>;
 
     const ids: string[] = [];
     const vectors: Float32Array[] = [];
     const indexById = new Map<string, number>();
     let sizeBytes = 0;
     for (const row of rows) {
-      indexById.set(row.id, ids.length);
+      indexById.set(vectorRowKey(row.id, row.window), ids.length);
       ids.push(row.id);
       const v = uint8ToFloat32(row.embedding);
       sizeBytes += v.byteLength;
@@ -1218,6 +1315,11 @@ export class SqliteEpisodeStore {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
+
+/** Cache key for one embedding row: an episode's window. */
+function vectorRowKey(id: string, window: number): string {
+  return window === 0 ? id : `${id}#${window}`;
+}
 
 function uint8ToFloat32(buf: Uint8Array): Float32Array {
   // Copy into a fresh backing buffer — the SQLite-returned Uint8Array may not
