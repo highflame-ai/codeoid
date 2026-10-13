@@ -23,6 +23,7 @@
 
 import { loadConfig } from "../../config.js";
 import { createRegistry, runCompressed } from "./index.js";
+import { defaultSpillDir } from "./spill.js";
 
 function die(message: string, exitCode = 2): never {
   process.stderr.write(`[codeoid-wrapper] ${message}\n`);
@@ -92,6 +93,9 @@ async function main(): Promise<void> {
       registry,
       minBytes: config.compress.minBytes,
       compressPipes: config.compress.compressPipes,
+      // Memory is where the raw output goes; with memory off there's no
+      // reader for a spill file, so don't leave one behind.
+      spillDir: config.memory?.enabled ? defaultSpillDir() : undefined,
     });
 
     if (outcome.stderr.length > 0) process.stderr.write(outcome.stderr);

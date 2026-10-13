@@ -151,13 +151,35 @@ export function memoryToolDefs(): MemoryToolDef[] {
   const getEpisode: MemoryToolDef = {
     name: "get_episode",
     description:
-      "Fetch one episode by its episode_id (from recall or timeline output) and return its full verbatim content. This is how you page an exact past turn or tool result back into context.",
+      "Fetch one episode by its episode_id (from recall or timeline output) and return its full verbatim content — nothing is truncated in storage. This is how you page an exact past turn or tool result back into context. Long episodes come back a page at a time: pass `offset` to read further.",
     zodShape: {
       episode_id: z.string().describe("The episode_id from a recall or timeline result"),
+      offset: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe("Character offset into the content to start from (default 0)"),
+      max_chars: z
+        .number()
+        .int()
+        .min(1000)
+        .max(GET_EPISODE_MAX_PAGE)
+        .optional()
+        .describe(`Characters to return (default ${GET_EPISODE_DEFAULT_PAGE}, max ${GET_EPISODE_MAX_PAGE})`),
     },
     jsonSchema: {
       type: "object",
-      properties: { episode_id: { type: "string", description: "The episode_id from recall/timeline output" } },
+      properties: {
+        episode_id: { type: "string", description: "The episode_id from recall/timeline output" },
+        offset: { type: "integer", minimum: 0, description: "Character offset into the content to start from (default 0)" },
+        max_chars: {
+          type: "integer",
+          minimum: 1000,
+          maximum: GET_EPISODE_MAX_PAGE,
+          description: `Characters to return (default ${GET_EPISODE_DEFAULT_PAGE}, max ${GET_EPISODE_MAX_PAGE})`,
+        },
+      },
       required: ["episode_id"],
       additionalProperties: false,
     },
@@ -165,7 +187,10 @@ export function memoryToolDefs(): MemoryToolDef[] {
       const id = String(args.episode_id ?? "");
       const ep = ctx.engine.getEpisodeScoped(id, ctx.workspaceId);
       if (!ep) return `Episode ${id} not found in this workspace.`;
-      return formatEpisode(ep, ctx.sessionId);
+      const full = ctx.engine.getFullContentScoped(id, ctx.workspaceId) ?? ep.content;
+      const offset = clampInt(args.offset, 0, Number.MAX_SAFE_INTEGER, 0);
+      const maxChars = clampInt(args.max_chars, 1000, GET_EPISODE_MAX_PAGE, GET_EPISODE_DEFAULT_PAGE);
+      return formatEpisode({ ...ep, content: full }, ctx.sessionId, { offset, maxChars });
     },
   };
 
@@ -240,15 +265,31 @@ export function formatTimeline(episodes: Episode[], currentSessionId: string, of
   return header + lines.join("\n");
 }
 
-export function formatEpisode(ep: Episode, currentSessionId: string): string {
+/** get_episode page size: default, and the most one call may ask for. */
+export const GET_EPISODE_DEFAULT_PAGE = 64 * 1024;
+export const GET_EPISODE_MAX_PAGE = 256 * 1024;
+
+export function formatEpisode(
+  ep: Episode,
+  currentSessionId: string,
+  page: { offset?: number; maxChars?: number } = {},
+): string {
   const label = ep.sessionId === currentSessionId ? "current session" : "a prior session";
+  const total = ep.content.length;
+  const offset = Math.min(Math.max(0, page.offset ?? 0), total);
+  const end = Math.min(total, offset + (page.maxChars ?? GET_EPISODE_DEFAULT_PAGE));
+  const paged = offset > 0 || end < total;
   return [
     `### ${ep.summary} — ${label}`,
     `- when: ${new Date(ep.createdAt).toISOString()}`,
     `- kind: ${ep.kind}${ep.toolName ? ` (${ep.toolName})` : ""}`,
     `- episode_id: ${ep.id}`,
     ...(ep.filePaths.length > 0 ? [`- files: ${ep.filePaths.join(", ")}`] : []),
+    ...(paged ? [`- showing: chars ${offset}–${end} of ${total}`] : []),
     "",
-    ep.content,
+    ep.content.slice(offset, end),
+    ...(end < total
+      ? ["", `…[${total - end} more chars — call get_episode with episode_id "${ep.id}" and offset ${end} to continue]`]
+      : []),
   ].join("\n");
 }

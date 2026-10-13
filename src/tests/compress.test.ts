@@ -187,11 +187,12 @@ describe("formatHint", () => {
         ruleName: "generic-head-tail",
       },
       "git diff HEAD~5",
+      "0e9c5b8a-1111-4222-8333-444455556666",
     );
     expect(hint.startsWith(HINT_PREFIX)).toBe(true);
     expect(hint).toContain("90%");
     expect(hint).toContain("generic-head-tail");
-    expect(hint).toContain('recall("git diff HEAD~5")');
+    expect(hint).toContain('recall("git diff HEAD~5", include_current_session=true)');
   });
 
   it("shortens long commands", () => {

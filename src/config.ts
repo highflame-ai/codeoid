@@ -297,18 +297,34 @@ const MemoryClustersSchema = z
   })
   .default({ enabled: false });
 
+const MemoryEmbeddingsSchema = z
+  .object({
+    /**
+     * Compute embeddings for semantic recall. Off = keyword-only recall: the
+     * model is never downloaded or loaded and no episode is embedded. Storage
+     * and full-text search are unaffected.
+     */
+    enabled: z.boolean().default(true),
+    /** Embedding windows per episode — more covers long episodes better, at
+     *  ~45 ms of worker-thread CPU each. */
+    maxWindows: z.number().int().min(1).max(64).default(8),
+  })
+  .default({ enabled: true, maxWindows: 8 });
+
 const MemorySchema = z
   .object({
     enabled: z.boolean().default(true),
     dbPath: z.string().default("memory.db"),
     model: z.string().optional(),
     modelCacheDir: z.string().default("models"),
+    embeddings: MemoryEmbeddingsSchema,
     clusters: MemoryClustersSchema,
   })
   .default({
     enabled: true,
     dbPath: "memory.db",
     modelCacheDir: "models",
+    embeddings: { enabled: true, maxWindows: 8 },
     clusters: { enabled: false },
   });
 
@@ -1133,6 +1149,7 @@ export interface CodeoidConfig {
     dbPath: string;
     model?: string;
     modelCacheDir?: string;
+    embeddings: { enabled: boolean; maxWindows: number };
     clusters: { enabled: boolean };
   };
   /** Workspace memory index — always-in-context pointer to verbatim episodes. */
@@ -1399,6 +1416,7 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   { env: "CODEOID_MEMORY_MODEL", path: "memory.model", kind: "string" },
   { env: "CODEOID_MEMORY_CACHE_DIR", path: "memory.modelCacheDir", kind: "string" },
   { env: "CODEOID_MEMORY_CLUSTERS", path: "memory.clusters.enabled", kind: "boolean" },
+  { env: "CODEOID_MEMORY_EMBEDDINGS", path: "memory.embeddings.enabled", kind: "boolean" },
   { env: "CODEOID_WORKSPACE_INDEX", path: "workspaceIndex.enabled", kind: "boolean" },
   { env: "CODEOID_WORKSPACE_INDEX_EPISODE_THRESHOLD", path: "workspaceIndex.episodeThreshold", kind: "int" },
   { env: "CODEOID_WORKSPACE_INDEX_TIME_MS", path: "workspaceIndex.timeThresholdMs", kind: "int" },
@@ -1647,6 +1665,7 @@ export function loadConfig(opts: LoadOptions = {}): CodeoidConfig {
       dbPath: memoryDbPath,
       model: parsed.memory.model,
       modelCacheDir: memoryCacheDir,
+      embeddings: parsed.memory.embeddings,
       clusters: parsed.memory.clusters,
     },
     workspaceIndex: parsed.workspaceIndex,

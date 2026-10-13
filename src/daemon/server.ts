@@ -32,6 +32,7 @@ import {
   MEMORY_MCP_PATH,
   type MemoryEngine,
 } from "./memory/index.js";
+import { defaultSpillDir, pruneSpill } from "./compress/spill.js";
 import { BLACKBOARD_MCP_PATH } from "./blackboard/mcp-http.js";
 import { CONTROL_MCP_PATH, ControlMcpHttp } from "./mcp/control-http.js";
 import { McpRegistry } from "./mcp/registry.js";
@@ -178,6 +179,8 @@ export interface DaemonConfig {
     model?: string;
     /** Weight cache directory (default: ~/.codeoid/models). */
     modelCacheDir?: string;
+    /** Embedding toggle + windows per episode (default: on, 8). */
+    embeddings?: { enabled: boolean; maxWindows: number };
   };
   /**
    * Full parsed CodeoidConfig — wired through to Session so the compression
@@ -446,6 +449,8 @@ export class DaemonServer {
             model: this.#config.memory.model,
             cacheDir: this.#config.memory.modelCacheDir,
           },
+          embeddingsEnabled: this.#config.memory.embeddings?.enabled,
+          maxEmbedWindows: this.#config.memory.embeddings?.maxWindows,
         });
         await this.#memory.init();
         this.#manager.setMemory(this.#memory);
@@ -460,6 +465,10 @@ export class DaemonServer {
         console.log(
           `[codeoid] memory enabled — episodes -> ${this.#config.memory.dbPath}`,
         );
+        // Raw outputs spilled by compressed commands whose tool call never
+        // became an episode (the session died first). A day is far longer
+        // than any tool call.
+        pruneSpill(defaultSpillDir(), 24 * 60 * 60 * 1000);
         // One-time: re-key episodes written under the old path-only workspace
         // ids to the tenant-scoped ids, so memory from before the upgrade stays
         // recallable. Gate on needsWorkspaceMigration() so the session-table
