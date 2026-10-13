@@ -582,10 +582,9 @@ describe("EpisodeChunker", () => {
     expect(emitted[1]!.kind).toBe("user_turn");
   });
 
-  it("caps persisted tool output — a 10 MB build log must not enter the episode row", () => {
-    // The episode insert (and its FTS tokenization) runs on the shared
-    // event path; an uncapped multi-MB output stalls every attached client
-    // and grows the retention-less episodes DB without bound.
+  it("keeps tool output whole — truncation is no longer the chunker's job", () => {
+    // MemoryEngine.ingest splits a large body into a stored payload and a
+    // bounded index view; the chunker hands it everything.
     const emitted: Array<{ content: string }> = [];
     const chunker = new EpisodeChunker(
       {
@@ -612,9 +611,7 @@ describe("EpisodeChunker", () => {
     chunker.onTurnEnd();
 
     const toolEpisode = emitted[0]!;
-    // Mirrors the transcript layer's 64 KiB persist cap (+ small headers).
-    expect(toolEpisode.content.length).toBeLessThan(70 * 1024);
-    expect(toolEpisode.content).toContain("…truncated for memory…");
+    expect(toolEpisode.content).toContain(hugeOutput);
   });
 });
 

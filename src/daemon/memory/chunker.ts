@@ -14,15 +14,16 @@
 
 import type { SessionMessage } from "../../protocol/types.js";
 import type { Episode } from "./types.js";
-
-/** Ceiling on tool output persisted into a memory episode — mirrors the
- * transcript layer's 64 KiB persist cap (transcript.ts). */
-const EPISODE_OUTPUT_CAP_CHARS = 64 * 1024;
+import { takeSpill } from "../compress/spill.js";
 
 export interface ChunkerContext {
   workspaceId: string;
   sessionId: string;
   createdBy: string;
+  /** Where compressed commands spill their raw output (compress/spill.ts).
+   *  When set, a tool result naming a spill file is stored with the raw
+   *  output in place of the compressed text the agent saw. */
+  spillDir?: string;
 }
 
 /** Paths seen in a tool input — used for path-overlap ranking. */
@@ -184,16 +185,14 @@ export class EpisodeChunker {
     if (tc.priorAssistantText) parts.push(`# Reasoning\n${tc.priorAssistantText}`);
     parts.push(`# Tool: ${tc.toolName}`);
     parts.push(`## Input\n${safeStringify(tc.input)}`);
-    // Cap what memory persists, mirroring the transcript layer's cap: the
-    // insert (and its FTS tokenization) runs on the shared event path, so
-    // an uncapped 10 MB build log would stall every attached client while
-    // SQLite chews it — and the episodes DB has no retention story yet.
-    if (output) {
-      const capped =
-        output.length > EPISODE_OUTPUT_CAP_CHARS
-          ? `${output.slice(0, EPISODE_OUTPUT_CAP_CHARS)}\n…truncated for memory…`
-          : output;
-      parts.push(`## Result\n${capped}`);
+    // The whole output, verbatim. MemoryEngine.ingest keeps it in full and
+    // indexes a bounded view, so a huge build log costs storage, not a stall.
+    // A compressed command's raw output replaces the compressed text here.
+    const raw = output && this.#ctx.spillDir ? takeSpill(output, this.#ctx.spillDir) : null;
+    if (raw !== null) {
+      parts.push(`## Result (uncompressed — the agent saw a compressed version)\n${raw}`);
+    } else if (output) {
+      parts.push(`## Result\n${output}`);
     }
 
     const content = parts.join("\n\n");

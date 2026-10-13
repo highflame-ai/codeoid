@@ -13,6 +13,7 @@ export { CompressionRegistry, extractLeadingTokens } from "./registry.js";
 export { runCompressed, hasShellPipe, MAX_RAW_BYTES } from "./runner.js";
 export { rewriteBashToolInput, resolveWrapperPath } from "./prehook.js";
 export { formatHint, HINT_PREFIX } from "./hint.js";
+export { defaultSpillDir, pruneSpill, takeSpill, writeSpill } from "./spill.js";
 export {
   BUILTIN_RULES,
   genericTruncateRule,

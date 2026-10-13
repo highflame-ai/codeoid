@@ -16,6 +16,7 @@ import { normalize } from "./embedder.js";
 import type { SqliteEpisodeStore } from "./store.js";
 import { DEFAULT_WEIGHTS, rank, type RankerWeights } from "./ranker.js";
 import type { Reranker } from "./reranker.js";
+import { embedWindows, indexView } from "./lossless.js";
 import type {
   Episode,
   EpisodeKind,
@@ -62,7 +63,15 @@ export interface MemoryEngineOptions {
   ftsCandidateK?: number;
   /** Top-K vector neighbors to consider during recall. Default 24. */
   vectorCandidateK?: number;
+  /** Compute embeddings at all. False = keyword-only recall: the embedder is
+   *  never loaded and no episode is embedded. Default true. */
+  embeddingsEnabled?: boolean;
+  /** Embedding windows per episode (see lossless.ts embedWindows). Default 8. */
+  maxEmbedWindows?: number;
 }
+
+/** Texts per embedder call: windows from several episodes share a batch. */
+const EMBED_BATCH_TEXTS = 32;
 
 export class MemoryEngine {
   #store: SqliteEpisodeStore;
@@ -71,6 +80,8 @@ export class MemoryEngine {
   #weights: RankerWeights;
   #ftsK: number;
   #vectorK: number;
+  #embeddingsEnabled: boolean;
+  #maxEmbedWindows: number;
 
   /** FIFO queue of episode IDs awaiting embedding. */
   #embedQueue: string[] = [];
@@ -91,22 +102,33 @@ export class MemoryEngine {
     this.#weights = opts.weights ?? DEFAULT_WEIGHTS;
     this.#ftsK = opts.ftsCandidateK ?? 24;
     this.#vectorK = opts.vectorCandidateK ?? 24;
+    this.#embeddingsEnabled = opts.embeddingsEnabled ?? true;
+    this.#maxEmbedWindows = Math.max(1, Math.floor(opts.maxEmbedWindows ?? 8));
+  }
+
+  /** Whether semantic (vector) recall is live. */
+  get embeddingsReady(): boolean {
+    return this.#embedderReady;
   }
 
   async init(): Promise<void> {
     // Degrade, don't die: an embedder init failure must NOT take down the
     // whole engine (which would also disable FTS recall + usage persistence).
     // Run FTS-only and let recall's vector branch no-op on a null queryVector.
-    try {
-      await this.#embedder.init();
-      this.#embedderReady = true;
-    } catch (err) {
-      this.#embedderReady = false;
-      console.error(
-        `[codeoid/memory] embedder init failed — running in FTS-only mode (no semantic recall): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
+    if (!this.#embeddingsEnabled) {
+      console.log("[codeoid/memory] embeddings disabled (memory.embeddings.enabled=false) — keyword-only recall");
+    } else {
+      try {
+        await this.#embedder.init();
+        this.#embedderReady = true;
+      } catch (err) {
+        this.#embedderReady = false;
+        console.error(
+          `[codeoid/memory] embedder init failed — running in FTS-only mode (no semantic recall): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
     }
 
     if (this.#reranker) {
@@ -162,13 +184,28 @@ export class MemoryEngine {
     return this.#store;
   }
 
-  /** Persist an episode and schedule it for embedding. */
+  /**
+   * Persist an episode and schedule it for embedding. Nothing is truncated:
+   * the full body is kept verbatim, and only a bounded view of it is
+   * full-text indexed and embedded (lossless.ts explains the split).
+   */
   ingest(episode: Omit<Episode, "id">): Episode {
-    const saved = this.#store.insert(episode);
-    this.#embedQueue.push(saved.id);
-    // Kick the worker non-blockingly.
-    void this.#pumpEmbedQueue();
+    const view = indexView(episode.content);
+    const saved = this.#store.insert(
+      view === episode.content ? episode : { ...episode, content: view, fullContent: episode.content },
+    );
+    if (this.#embedderReady) {
+      this.#embedQueue.push(saved.id);
+      // Kick the worker non-blockingly.
+      void this.#pumpEmbedQueue();
+    }
     return saved;
+  }
+
+  /** The verbatim body of an episode in `workspaceId` — not just its index view. */
+  getFullContentScoped(id: string, workspaceId: string): string | null {
+    if (!this.#store.getEpisodeInWorkspace(id, workspaceId)) return null;
+    return this.#store.getFullContent(id);
   }
 
   /** Flush pending embeddings. Call before a recall query if you need freshness. */
@@ -200,20 +237,9 @@ export class MemoryEngine {
     const ftsHits = new Map<string, number>(ftsRows.map((r) => [r.id, r.bm25]));
 
     // Vector candidates: brute-force cosine over all embedded episodes in workspace.
-    const vectorIds: string[] = [];
-    if (queryVector) {
-      const { ids, vectors } = this.#store.loadVectorMatrix(q.workspaceId);
-      const scored: Array<{ id: string; score: number }> = [];
-      for (let i = 0; i < vectors.length; i++) {
-        let sum = 0;
-        const v = vectors[i]!;
-        if (v.length !== queryVector.length) continue;
-        for (let j = 0; j < v.length; j++) sum += v[j]! * queryVector[j]!;
-        scored.push({ id: ids[i]!, score: sum });
-      }
-      scored.sort((a, b) => b.score - a.score);
-      for (const s of scored.slice(0, this.#vectorK)) vectorIds.push(s.id);
-    }
+    const vectorScores = new Map<string, number>();
+    if (queryVector) bestWindowScores(this.#store.loadVectorMatrix(q.workspaceId), queryVector, vectorScores);
+    const vectorIds = topIds(vectorScores, this.#vectorK);
 
     // Union candidates.
     const candidateIds = [...new Set([...ftsHits.keys(), ...vectorIds])];
@@ -222,6 +248,7 @@ export class MemoryEngine {
     const episodes = this.#store.filter(candidateIds, q);
     const hits = rank(episodes, {
       queryVector,
+      vectorScores,
       ftsHits,
       queryFilePaths: q.filePaths ?? [],
       now,
@@ -262,22 +289,13 @@ export class MemoryEngine {
     const ftsHits = new Map<string, number>(ftsRows.map((r) => [r.id, r.bm25]));
 
     // Global vector candidates: cosine over every workspace's (in-sync) matrix.
-    const vectorIds: string[] = [];
+    const vectorScores = new Map<string, number>();
     if (queryVector) {
-      const scored: Array<{ id: string; score: number }> = [];
       for (const ws of this.#store.listWorkspaceIds()) {
-        const { ids, vectors } = this.#store.loadVectorMatrix(ws);
-        for (let i = 0; i < vectors.length; i++) {
-          const v = vectors[i]!;
-          if (v.length !== queryVector.length) continue;
-          let sum = 0;
-          for (let j = 0; j < v.length; j++) sum += v[j]! * queryVector[j]!;
-          scored.push({ id: ids[i]!, score: sum });
-        }
+        bestWindowScores(this.#store.loadVectorMatrix(ws), queryVector, vectorScores);
       }
-      scored.sort((a, b) => b.score - a.score);
-      for (const s of scored.slice(0, candidateK)) vectorIds.push(s.id);
     }
+    const vectorIds = topIds(vectorScores, candidateK);
 
     const candidateIds = [...new Set([...ftsHits.keys(), ...vectorIds])];
     if (candidateIds.length === 0) return [];
@@ -285,6 +303,7 @@ export class MemoryEngine {
     const episodes = this.#store.episodesByIds(candidateIds);
     const hits = rank(episodes, {
       queryVector,
+      vectorScores,
       ftsHits,
       queryFilePaths: q.filePaths ?? [],
       now,
@@ -477,30 +496,43 @@ export class MemoryEngine {
     this.#embedRunning = true;
     try {
       while (this.#embedQueue.length > 0) {
-        // Drain up to 8 at a time to amortize model-call overhead.
-        const batchIds = this.#embedQueue.splice(0, 8);
-        const episodes = batchIds
-          .map((id) => this.#store.getEpisode(id))
-          .filter((e): e is Episode => e !== null && !e.embedding);
+        // Fill one embedder call with whole episodes' windows (at least one
+        // episode, however many windows it has) to amortize call overhead.
+        const batchIds: string[] = [];
+        const episodes: Episode[] = [];
+        const windows: string[][] = [];
+        let textCount = 0;
+        while (this.#embedQueue.length > 0 && (episodes.length === 0 || textCount < EMBED_BATCH_TEXTS)) {
+          const id = this.#embedQueue[0]!;
+          const ep = this.#store.getEpisode(id);
+          if (ep && !ep.embedding) {
+            const w = embedWindows(ep.summary, ep.content, this.#maxEmbedWindows);
+            if (episodes.length > 0 && textCount + w.length > EMBED_BATCH_TEXTS) break;
+            episodes.push(ep);
+            windows.push(w);
+            textCount += w.length;
+          }
+          batchIds.push(this.#embedQueue.shift()!);
+        }
         if (episodes.length === 0) continue;
 
-        const texts = episodes.map((e) => embedText(e));
         try {
-          const vectors = await this.#embedder.embed(texts);
-          // Commit the whole batch in one transaction: one WAL fsync + one
-          // FTS-trigger pass instead of up to 8.
+          const vectors = await this.#embedder.embed(windows.flat());
+          // Commit the whole batch in one transaction: one WAL fsync instead
+          // of one per episode.
           this.#store.transaction(() => {
+            let at = 0;
             for (let i = 0; i < episodes.length; i++) {
-              const v = vectors[i];
-              if (v) {
-                normalize(v);
-                this.#store.setEmbedding(
-                  episodes[i]!.id,
-                  v,
-                  this.#embedder.modelName,
-                  episodes[i]!.workspaceId,
-                );
-              }
+              const own = vectors.slice(at, at + windows[i]!.length);
+              at += windows[i]!.length;
+              if (own.length === 0 || own.some((v) => !v)) continue;
+              for (const v of own) normalize(v);
+              this.#store.setWindowEmbeddings(
+                episodes[i]!.id,
+                own,
+                this.#embedder.modelName,
+                episodes[i]!.workspaceId,
+              );
             }
           });
         } catch (err) {
@@ -518,11 +550,31 @@ export class MemoryEngine {
   }
 }
 
-/** Build the input string the embedder sees — summary gets weight by being first. */
-function embedText(ep: Episode): string {
-  // Cap at ~6000 chars to stay inside model context (BGE is 512 tokens).
-  const body = ep.content.length > 6000 ? ep.content.slice(0, 6000) : ep.content;
-  return `${ep.summary}\n\n${body}`;
+/** Fold one workspace's matrix into `best`: per episode, the highest cosine
+ *  over its embedding windows. */
+function bestWindowScores(
+  matrix: { ids: string[]; vectors: Float32Array[] },
+  queryVector: Float32Array,
+  best: Map<string, number>,
+): void {
+  const { ids, vectors } = matrix;
+  for (let i = 0; i < vectors.length; i++) {
+    const v = vectors[i]!;
+    if (v.length !== queryVector.length) continue;
+    let sum = 0;
+    for (let j = 0; j < v.length; j++) sum += v[j]! * queryVector[j]!;
+    const id = ids[i]!;
+    const prev = best.get(id);
+    if (prev === undefined || sum > prev) best.set(id, sum);
+  }
+}
+
+/** The `k` highest-scoring ids. */
+function topIds(scores: Map<string, number>, k: number): string[] {
+  return [...scores.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, k)
+    .map(([id]) => id);
 }
 
 /**

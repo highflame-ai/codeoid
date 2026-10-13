@@ -14,12 +14,15 @@ export const HINT_PREFIX = "[codeoid:";
 
 /**
  * Build the default hint. Rules can override via CompressionResult.hint.
- * Format:
- *   [codeoid: compressed <PCT>% via <rule>; memory has the raw output — call recall("<cmd>") if you need it]
+ * Format, when the raw output was spilled for memory (see spill.ts):
+ *   [codeoid: compressed <PCT>% via <rule>; full output in memory (raw=<id>) — recall("<cmd>", include_current_session=true), then get_episode]
+ * and without a spill (it couldn't be written), an honest statement that the
+ * raw output is gone.
  */
 export function formatHint(
   result: CompressionResult,
   command: string,
+  rawId?: string | null,
 ): string {
   const compressedBytes = Buffer.byteLength(result.compressed, "utf8");
   const pct = result.originalBytes > 0
@@ -28,7 +31,10 @@ export function formatHint(
       )
     : 0;
   const shortCmd = shortenCommand(command);
-  return `${HINT_PREFIX} compressed ${pct}% via ${result.ruleName}; memory has the raw output — call recall("${shortCmd}") for it]`;
+  if (!rawId) {
+    return `${HINT_PREFIX} compressed ${pct}% via ${result.ruleName}; the uncompressed output was not kept — rerun "${shortCmd}" if you need it]`;
+  }
+  return `${HINT_PREFIX} compressed ${pct}% via ${result.ruleName}; full output in memory (raw=${rawId}) — recall("${shortCmd}", include_current_session=true), then get_episode]`;
 }
 
 /** Trim a command to a safe length for embedding in the hint line. */
