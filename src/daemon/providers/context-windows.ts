@@ -97,30 +97,54 @@ export function targetContextWindow(
 export const SEED_WINDOW_FRACTION = 0.7;
 
 /**
- * Conservative chars-per-token for sizing the seed. Rendered seeds carry code
- * and JSON, which tokenize denser than prose, so we UNDER-estimate (fewer
- * chars per token → smaller char budget → safe against overflow).
+ * Conservative chars-per-token for sizing the seed. Rendered seeds are mostly
+ * code, JSON and tool output, which tokenize far denser than prose: a real
+ * 2.36M-char fork seed came to ~1.05M tokens (~2.25 chars/token). The old 3.5
+ * sized that seed for a 1M window and overflowed it. UNDER-estimate — fewer
+ * chars per token → smaller char budget → safe against overflow.
  */
-export const SEED_CHARS_PER_TOKEN = 3.5;
+export const SEED_CHARS_PER_TOKEN = 2;
+
+/** Operator tuning for {@link seedBudgetChars} (config `session.seed*`). */
+export interface SeedBudgetOptions {
+  /** Hard cap in chars; 0/undefined = computed from the window. */
+  capChars?: number;
+  charsPerToken?: number;
+  windowFraction?: number;
+}
 
 /**
  * Character budget for a history seed targeting (provider, model). This is the
  * `maxChars` handed to renderHistorySeed — sized to the target window so a
  * fork only truncates when the conversation genuinely won't fit.
  *
- * `CODEOID_SEED_BUDGET_CHARS` overrides the computed budget with a hard cap
- * (any positive integer). Operators use it to bound the transcript seed
- * regardless of the target window (e.g. to keep first-turn cost predictable on
- * a huge-context model); it also lets the resume-beyond-budget eval force
- * truncation with a small history instead of ~490k chars.
+ * A hard cap — `CODEOID_SEED_BUDGET_CHARS` read at call time, else
+ * `opts.capChars` (config `session.seedBudgetChars`) — replaces the computed
+ * budget. Operators use it to bound the transcript seed regardless of the
+ * target window (e.g. to keep first-turn cost predictable on a huge-context
+ * model); it also lets the resume-beyond-budget eval force truncation with a
+ * small history instead of ~490k chars.
  */
 export function seedBudgetChars(
   providerId: string,
   model?: string | null,
   reported?: number,
+  opts: SeedBudgetOptions = {},
 ): number {
   const override = Number(process.env.CODEOID_SEED_BUDGET_CHARS);
   if (Number.isFinite(override) && override > 0) return Math.floor(override);
+  if (opts.capChars !== undefined && opts.capChars > 0) return Math.floor(opts.capChars);
   const window = targetContextWindow(providerId, model, reported);
-  return Math.floor(window * SEED_WINDOW_FRACTION * SEED_CHARS_PER_TOKEN);
+  const fraction = opts.windowFraction ?? SEED_WINDOW_FRACTION;
+  const charsPerToken = opts.charsPerToken ?? SEED_CHARS_PER_TOKEN;
+  return Math.floor(window * fraction * charsPerToken);
+}
+
+/**
+ * True when a turn failed because the request exceeded the model's context
+ * window. Matches the Claude CLI's "Prompt is too long · the request is …"
+ * and the API's `prompt is too long: N tokens > M maximum`.
+ */
+export function isPromptTooLongError(message: string | undefined | null): boolean {
+  return message != null && /prompt is too long/i.test(message);
 }
