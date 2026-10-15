@@ -14,7 +14,7 @@ import {
   type CanonicalTurn,
   type HistorySeedResult,
 } from "./providers/canonical.js";
-import { targetContextWindow, seedBudgetChars } from "./providers/context-windows.js";
+import { targetContextWindow, seedBudgetChars, isPromptTooLongError } from "./providers/context-windows.js";
 import { CONDUCTOR_SYSTEM_PROMPT_APPEND, isFleetSendTool } from "./fleet.js";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import {
@@ -84,6 +84,12 @@ import { promisify } from "node:util";
 const execFileP = promisify(execFile);
 /** Max wall-clock for a fork.setup command (deps install can be slow). */
 const FORK_SETUP_TIMEOUT_MS = 600_000;
+/**
+ * How many times a history seed that overflowed the window is re-rendered at
+ * half the previous budget and retried (1/2, 1/4, 1/8 of the original) before
+ * the overflow is surfaced as an error.
+ */
+const SEED_OVERFLOW_MAX_RETRIES = 3;
 import {
   authToIdentity,
   CAPABILITIES,
@@ -831,6 +837,26 @@ export class Session {
   // prompt so the agent knows what it was working on. Captured inside
   // rotate() from the most recent user_turn episode.
   #lastUserTurnBeforeRotate: string | null = null;
+  /**
+   * A transcript seed waiting to ride the provider's next first prompt (fork /
+   * backend switch). Kept until a turn succeeds so an overflowing seed can be
+   * re-rendered smaller: `historyLength` is the canonical history it was cut
+   * from (later turns are the failed attempt), `budgetChars` what it was sized
+   * to. `prompt`/`sender`/`turn` are filled in when the first turn starts; a
+   * retry reruns that same turn.
+   */
+  #pendingSeed: {
+    historyLength: number;
+    budgetChars: number;
+    attempts: number;
+    prompt?: string;
+    sender?: AuthContext;
+    turn?: { id: string; text: string; at: string };
+  } | null = null;
+  /** Set by a turn_done whose seed overflowed; the consumer's exit retries it. */
+  #seedOverflowRetry = false;
+  /** The last turn failed with "prompt too long" — /rotate then skips its min-turns guard. */
+  #promptTooLong = false;
   // Execution mode + turn budget (autonomous mode only).
   // Default `guarded` (≈ Claude Code's default): read-only tools (Read/Grep/Glob
   // + memory) auto-approve, while Write/Edit/Bash and other mutations prompt.
@@ -2417,6 +2443,13 @@ export class Session {
     this.#currentTurnId = turnId;
     this.#indexTurn(turnId, "prompt", text, turnAt);
     this.#markBackingFresh(false);
+    // This turn carries the pending history seed — remember what it asked, so
+    // an overflow can be retried with a smaller seed without a re-send.
+    if (this.#pendingSeed && this.#pendingSeed.prompt === undefined) {
+      this.#pendingSeed.prompt = effectivePrompt;
+      this.#pendingSeed.sender = sender;
+      this.#pendingSeed.turn = { id: turnId, text, at: turnAt };
+    }
     this.#accumulator.pushUserTurn(effectivePrompt, turnId, { prompt: text, at: turnAt });
     const run = this.#provider.runTurn({
       history: this.#accumulator.history,
@@ -3121,8 +3154,20 @@ export class Session {
    * by contract: a throw degrades to an unseeded start, never a wedge.
    * Returns whether a seed was actually applied.
    */
-  async #seedProviderFromHistory(): Promise<boolean> {
-    if (this.#accumulator.history.length === 0) return false;
+  async #seedProviderFromHistory(retry?: { historyLength: number; budgetChars: number; attempts: number }): Promise<boolean> {
+    const history = retry
+      ? this.#accumulator.history.slice(0, retry.historyLength)
+      : this.#accumulator.history;
+    this.#pendingSeed = null;
+    if (history.length === 0) return false;
+    const s = this.#config?.session;
+    const budgetChars =
+      retry?.budgetChars ??
+      seedBudgetChars(this.#provider.id, this.#model, this.#knownWindow(this.#provider.id), {
+        capChars: s?.seedBudgetChars,
+        charsPerToken: s?.seedCharsPerToken,
+        windowFraction: s?.seedWindowFraction,
+      });
     // Delegate to the active context strategy (default `transcript` = the
     // legacy rendered-history seed; `vws` = compact session map + on-demand
     // paging, which falls back to transcript for backends without the recall
@@ -3130,13 +3175,19 @@ export class Session {
     try {
       const outcome = await this.#contextStrategy.seed({
         provider: this.#provider,
-        history: this.#accumulator.history,
+        history,
         memoryEnabled: this.#memory != null && process.env.CODEOID_MEMORY !== "0",
-        seedBudgetChars: seedBudgetChars(this.#provider.id, this.#model, this.#knownWindow(this.#provider.id)),
+        seedBudgetChars: budgetChars,
         buildSessionMap: () => this.#buildSessionMapAnchor(),
       });
       if (outcome.truncation && outcome.truncation.omittedTurns > 0) {
         this.#surfaceSeedTruncation(outcome.truncation);
+      }
+      // Only a transcript seed a warm backend actually stashed (it returns the
+      // render result; stateless backends no-op) scales with the budget, so
+      // only it can be retried smaller if the first prompt overflows.
+      if (outcome.applied && outcome.via === "transcript" && outcome.truncation) {
+        this.#pendingSeed = { historyLength: history.length, budgetChars, attempts: retry?.attempts ?? 0 };
       }
       return outcome.applied;
     } catch (err) {
@@ -3145,6 +3196,96 @@ export class Session {
       );
       return false;
     }
+  }
+
+  /**
+   * Retry a first turn whose history seed overflowed the model's window: start
+   * a fresh backing session (the failed one holds the oversized prompt, so
+   * resuming it fails forever), re-render the seed at half the budget from the
+   * same history, and re-run the user's prompt — without re-posting it.
+   * Queued on the send chain so it can't interleave with a user send.
+   */
+  #scheduleSeedOverflowRetry(): void {
+    const seed = this.#pendingSeed;
+    if (seed?.prompt === undefined || !seed.sender) return;
+    const { prompt, sender, turn } = seed;
+    const next = this.#sendChain
+      .catch(() => undefined)
+      .then(async () => {
+        // A send, switch or fork re-seed got here first — it owns the session now.
+        if (this.#destroyed || this.#pendingSeed !== seed || this.#activeRun) return;
+        await this.#teardownProvider();
+        const newBackingId = randomUUID();
+        this.#provider.resetToNewSession(newBackingId);
+        try {
+          this.#store.setClaudeCodeSessionId(this.id, newBackingId);
+        } catch (e) {
+          console.error(
+            `[codeoid/session ${this.id}] failed to persist seed-retry backing id: ${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
+        // Drop the failed attempt (its prompt + the overflow reply) from the
+        // canonical history; the retry re-adds the prompt below.
+        this.#accumulator.seed(this.#accumulator.history.slice(0, seed.historyLength));
+        const budgetChars = Math.floor(seed.budgetChars / 2);
+        const attempt = seed.attempts + 1;
+        const note = this.#makeMessage(
+          "info",
+          `⚠️ The carried-over history (~${Math.round(seed.budgetChars / 1000)}k chars) didn't fit the model's context window. ` +
+            `Retrying with a smaller history (~${Math.round(budgetChars / 1000)}k chars) — attempt ${attempt} of ${SEED_OVERFLOW_MAX_RETRIES}.`,
+          SYSTEM_IDENTITY,
+          undefined,
+          undefined,
+          { event: "history.seed_overflow", budgetChars, previousBudgetChars: seed.budgetChars, attempt },
+        );
+        this.#persistAndBuffer(note);
+        this.#broadcastRaw(note);
+        console.error(
+          `[codeoid/session ${this.id}] seed overflowed at ${seed.budgetChars} chars; retrying at ${budgetChars} (attempt ${attempt})`,
+        );
+        await this.#seedProviderFromHistory({ historyLength: seed.historyLength, budgetChars, attempts: attempt });
+        if (this.#pendingSeed) {
+          this.#pendingSeed.prompt = prompt;
+          this.#pendingSeed.sender = sender;
+          this.#pendingSeed.turn = turn;
+        }
+        this.#promptTooLong = false;
+        this.#turnInterrupted = false;
+        this.#lastTurnError = null;
+        this.#currentSender = sender;
+        // Same turn, second attempt: keep its id (already indexed) so its
+        // reply is attributed to the prompt the user sent.
+        if (turn) this.#currentTurnId = turn.id;
+        this.#accumulator.pushUserTurn(prompt, turn?.id, turn ? { prompt: turn.text, at: turn.at } : undefined);
+        const run = this.#provider.runTurn({
+          history: this.#accumulator.history,
+          userMessage: prompt,
+          model: this.#model ?? undefined,
+          fallbackModel: this.#fallbackModel ?? undefined,
+          workdir: this.workdir,
+          systemPromptAppend: this.#composePromptAppend(),
+          canUseTool: this.#makeCanUseToolFn(sender),
+          requestUserInput: (req) => this.requestUserInput(req),
+          sender,
+          mode: this.#mode,
+          subagents: this.#pack?.subagents,
+          pluginDirs: this.#packPluginDirs(),
+        });
+        this.#activeRun = run;
+        this.#eventConsumerTask = this.#consumeEvents(run, sender);
+        this.#setStatus("thinking");
+        this.#onTurnStarted();
+        this.#broadcastInfoUpdate();
+      });
+    this.#sendChain = next.then(
+      () => undefined,
+      (err) => {
+        console.error(
+          `[codeoid/session ${this.id}] seed-overflow retry failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        this.reportSendFailure(err);
+      },
+    );
   }
 
   /**
@@ -3334,6 +3475,14 @@ export class Session {
       // The size hint (the transcript line's byte length, when the caller
       // loaded from disk) spares scrollback a re-serialization per message.
       this.#scrollback.push(reconcileResumedMessage(msg), sizeHints?.[i]);
+    }
+    // A session that overflowed its window before the restart is still wedged
+    // after it: keep /rotate available (see manualRotate).
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msg = messages[i]!;
+      if (msg.type !== "session.message" || msg.role !== "assistant") continue;
+      this.#promptTooLong = isPromptTooLongError(msg.content);
+      break;
     }
     // A session with prior scrollback already exists in Claude Code's own
     // persistent session store — next send() must use `resume`, not re-create.
@@ -3858,10 +4007,13 @@ export class Session {
   /**
    * Public entry for `/rotate` slash command — a user-initiated rotation.
    * Still respects the min-turns guard so a fresh session can't rotate to
-   * itself on turn 1.
+   * itself on turn 1 — except when the last turn overflowed the context
+   * window (or the session is stuck in error, which survives a restart):
+   * then rotating is the only way forward, however few turns there are.
    */
   async manualRotate(sender: AuthContext): Promise<boolean> {
-    if (this.#usage.numTurns < (this.#config?.autoRotate.minTurnsBeforeRotate ?? 3)) {
+    const stuck = this.#promptTooLong || this.#status === "error";
+    if (!stuck && this.#usage.numTurns < (this.#config?.autoRotate.minTurnsBeforeRotate ?? 3)) {
       const infoMsg = this.#makeMessage(
         "info",
         `Cannot rotate: session has only ${this.#usage.numTurns} turn(s) so far — min is ${this.#config?.autoRotate.minTurnsBeforeRotate ?? 3}.`,
@@ -4749,6 +4901,12 @@ export class Session {
         // reach the (between-turns-only) delivery gate.
         this.#maybeDeliverBackgroundReports();
       }
+      // A seeded first prompt overflowed the window (see turn_done): retry it
+      // smaller now that this run is fully unwound.
+      if (this.#seedOverflowRetry) {
+        this.#seedOverflowRetry = false;
+        this.#scheduleSeedOverflowRetry();
+      }
     }
   }
 
@@ -5194,13 +5352,36 @@ export class Session {
         });
         if (event.result.isError) {
           const errText = event.result.errorMessage ?? "Turn ended with an error";
+          // The CLI reports an overflow as the turn's assistant text and ends
+          // with a generic error, so check both — the text only if THIS turn
+          // committed it (the last turn would otherwise be our user prompt).
+          const h = this.#accumulator.history;
+          const last = h[h.length - 1];
+          const tooLong =
+            isPromptTooLongError(errText) ||
+            (last?.role === "assistant" && isPromptTooLongError(last.content));
+          this.#promptTooLong = tooLong;
+          const seed = this.#pendingSeed;
+          if (tooLong && seed?.prompt !== undefined && seed.attempts < SEED_OVERFLOW_MAX_RETRIES) {
+            // The seeded first prompt overflowed the window. Nothing ran — the
+            // request was rejected before the model saw it — so retrying with
+            // a smaller seed is safe. #consumeEvents' exit performs it.
+            this.#seedOverflowRetry = true;
+            break;
+          }
           this.#lastTurnError = errText;
-          const errorMsg = this.#makeMessage("system", `Error: ${errText}`, SYSTEM_IDENTITY, undefined, undefined, { event: "agent_error" });
+          const hint = tooLong
+            ? " — this session's context no longer fits the model. Send /rotate to continue in a fresh context (memory recall keeps the history reachable)."
+            : "";
+          const errorMsg = this.#makeMessage("system", `Error: ${errText}${hint}`, SYSTEM_IDENTITY, undefined, undefined, { event: "agent_error" });
           this.#persistAndBuffer(errorMsg);
           this.#broadcastRaw(errorMsg);
           this.#setStatus("error");
-        } else if (this.#status !== "error") {
-          this.#setStatus("idle");
+        } else {
+          // The seed made it into a successful turn — it's spent.
+          this.#pendingSeed = null;
+          this.#promptTooLong = false;
+          if (this.#status !== "error") this.#setStatus("idle");
         }
         break;
       }
