@@ -41,6 +41,8 @@ one-way door, and how clients discover the token.
 | `settings:read` | Read the settings manifest + current (non-secret) configuration |
 | `settings:write` | Write daemon configuration (`config.json` + `.env`), including secrets |
 
+[Routines](routines.md) have no scope of their own: holding them takes `session:create` + `session:send`, pre-approving work (autonomous, or a check command) also takes `session:approve`, and a delegated token can't change them.
+
 Share a read-only token with a teammate via ZeroID:
 
 ```bash
@@ -95,6 +97,10 @@ CODEOID_DEFAULT_PROVIDER=claude         # backend for sessions created without -
 # Outward control plane (/mcp/control) — see docs/mcp-control.md. Off by default.
 CODEOID_MCP_CONTROL_ENABLED=false       # mount the endpoint
 CODEOID_MCP_CONTROL_ACTIONS=false       # also allow create / send / interrupt / destroy
+
+# Routines (scheduled and triggered agent runs) — see docs/routines.md. On by default.
+CODEOID_ROUTINES_ENABLED=true           # run the scheduler and accept routine commands
+CODEOID_ROUTINES_MAX_CONCURRENT=2       # routine runs executing at once, across all routines
 
 # Memory
 CODEOID_MEMORY=1                        # default: on; set to 0 to disable

@@ -35,6 +35,7 @@ import {
 import { defaultSpillDir, pruneSpill } from "./compress/spill.js";
 import { BLACKBOARD_MCP_PATH } from "./blackboard/mcp-http.js";
 import { CONTROL_MCP_PATH, ControlMcpHttp } from "./mcp/control-http.js";
+import { handleRoutineFire, matchFirePath } from "./routines/http.js";
 import { McpRegistry } from "./mcp/registry.js";
 import { McpHub } from "./mcp/hub.js";
 import { MCP_OAUTH_CALLBACK_PATH, McpOAuth, mcpOAuthBindingCookieName } from "./mcp/oauth.js";
@@ -376,6 +377,9 @@ export class DaemonServer {
     // LIFO: registered after sessions → stops BEFORE the drain, so the
     // dispatcher can't claim new work or inject events into draining sessions.
     this.#shutdown.register("dispatcher", () => this.#manager.stopDispatcher());
+    // Registered after the dispatcher, so (LIFO) it stops scheduling before
+    // the session drain interrupts any run in flight.
+    this.#shutdown.register("routines", () => this.#manager.stopRoutines());
     this.#shutdown.register("websockets", () => {
       for (const { ws } of this.#sockets.values()) {
         ws.close(1001, "Server shutting down");
@@ -552,6 +556,8 @@ export class DaemonServer {
     // Re-drive any SDLC pipelines interrupted mid-run before the restart
     // (no-op when the pipeline feature is disabled).
     this.#manager.startPipelines();
+    // After resume: boot recovery closes runs a previous process left in flight.
+    this.#manager.startRoutines();
 
     // Start Bun HTTP + WebSocket server
     const self = this;
@@ -605,6 +611,15 @@ export class DaemonServer {
         // SessionManager.handle, so scopes, tenancy, and audit are the ones
         // every other client gets. Off by default: not mounted = 404, so a
         // probe cannot even tell it exists.
+        // A routine's API trigger (docs/routines.md): its own bearer token,
+        // one routine per token. 404 like any unknown path when routines are off.
+        const routineId = matchFirePath(url.pathname);
+        if (routineId && self.#manager.routines) {
+          return handleRoutineFire(req, routineId, self.#manager.routines, {
+            clientIp: server.requestIP(req)?.address,
+          });
+        }
+
         if (url.pathname === CONTROL_MCP_PATH && self.#controlMcp) {
           return self.#controlMcp.handle(req, {
             liftIdleTimeout: () => {

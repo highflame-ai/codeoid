@@ -353,6 +353,29 @@ const fleet: SettingsTab = {
       ],
     },
     {
+      id: "routines",
+      title: "Routines",
+      description: "Scheduled and triggered agent runs (docs/routines.md). Each routine carries its own schedule, budgets, and approval posture; these are the daemon-wide limits.",
+      fields: [
+        cfg("routines.enabled", "Enable routines", "Run routines on their schedules and triggers. Off pauses every routine without deleting any.", {
+          kind: "boolean",
+          envVar: "CODEOID_ROUTINES_ENABLED",
+          default: true,
+        }),
+        cfg("routines.maxConcurrentRuns", "Max concurrent runs", "Routine runs executing at once; the rest wait their turn.", {
+          kind: "int",
+          min: 1,
+          max: 50,
+          envVar: "CODEOID_ROUTINES_MAX_CONCURRENT",
+          default: 2,
+        }),
+        cfg("routines.minIntervalSeconds", "Minimum interval (s)", "Floor for how often any routine may fire.", { kind: "int", min: 60, max: 86400, default: 60, advanced: true }),
+        cfg("routines.apiFiresPerHour", "API fires per hour", "Fires accepted per routine per hour on its API endpoint.", { kind: "int", min: 1, max: 10000, default: 30, advanced: true }),
+        cfg("routines.missedGraceSeconds", "Missed-fire grace (s)", "A fire later than this (the daemon was down) is missed; the routine's catch-up setting decides what happens.", { kind: "int", min: 10, max: 86400, default: 120, advanced: true }),
+        cfg("routines.tickMs", "Scheduler tick (ms)", "How often the scheduler checks for due routines.", { kind: "int", min: 250, max: 60000, default: 1000, advanced: true }),
+      ],
+    },
+    {
       id: "mcp-control",
       title: "External control (MCP)",
       description: "Let outside agents (Claude Code, Cursor, CI) drive sessions through `/mcp/control`. Every call is scope-checked and audited under the caller's identity.",

@@ -355,8 +355,19 @@ export class CanonicalHistoryAccumulator {
     { id: string; name: string; originalName?: string; input: Record<string, unknown>; output?: string; success?: boolean }
   >();
 
+  /**
+   * The last assistant text block since the latest user turn: the agent's
+   * final message, without the narration that came before its tool calls.
+   * In-memory only (null after a restore, or when this turn wrote no text).
+   */
+  #lastTextBlock: string | null = null;
+
   get history(): readonly CanonicalTurn[] {
     return this.#history;
+  }
+
+  get lastTextBlock(): string | null {
+    return this.#lastTextBlock;
   }
 
   /** Append a user turn. Call once per runTurn() before feeding events. */
@@ -374,6 +385,7 @@ export class CanonicalHistoryAccumulator {
       ...(extra?.background ? { background: true } : {}),
     };
     this.#currentTurnId = turnId;
+    this.#lastTextBlock = null;
     this.#history.push(turn);
     this.#emit({ op: "append", turn });
   }
@@ -404,6 +416,7 @@ export class CanonicalHistoryAccumulator {
         this.#currentText = this.#currentText
           ? `${this.#currentText}\n\n${event.content}`
           : event.content;
+        if (event.content.trim()) this.#lastTextBlock = event.content;
         break;
 
       case "thinking_delta":
@@ -474,6 +487,7 @@ export class CanonicalHistoryAccumulator {
   #clear(): void {
     this.#history = [];
     this.#currentTurnId = undefined;
+    this.#lastTextBlock = null;
     this.#currentText = "";
     this.#currentThinking = "";
     this.#currentTools.clear();

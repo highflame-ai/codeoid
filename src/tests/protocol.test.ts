@@ -468,6 +468,18 @@ describe("DaemonMessage routing", () => {
           return `compare:${msg.compare.targets.length}`;
         case "compare.list.result":
           return `compares:${msg.compares.length}`;
+        case "routine.snapshot":
+          return `routine:${msg.routine.name}`;
+        case "routine.list.result":
+          return `routines:${msg.routines.length}`;
+        case "routine.run.result":
+          return `routine.run:${msg.run.status}`;
+        case "routine.runs.result":
+          return `routine.runs:${msg.runs.length}`;
+        case "routine.token.result":
+          return `routine.token:${msg.routineId}`;
+        case "routine.preview.result":
+          return `routine.preview:${msg.fires.length}`;
         case "mcp.oauth.begin.result":
           return `mcp.oauth.begin:${msg.status}`;
         case "mcp.oauth.complete.result":

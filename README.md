@@ -237,6 +237,7 @@ You're orchestrating AI coding agents. Codeoid solves the things Claude Code's s
 - **Mid-turn streaming input (VSCode parity)** — Send a follow-up message while Claude is already responding. Priority semantics (`now` / `next` / `later`) let you interrupt-and-re-integrate or gracefully queue for the next turn.
 - **Production-grade token instrumentation** — Per-turn input/output/cache/cost persisted to SQLite. Live StatusBar shows cumulative + Δ this-turn + cache hit rate + current context occupancy + queue depth + rotation count.
 - **Autonomous runs with a budget** — Flip a session to autonomous mode; it auto-approves safe operations until a write/exec budget is spent, then hands control back.
+- **Routines that cost nothing when there's nothing to do** — Schedule an agent (`codeoid routine add … --every 15m`) behind a cheap shell check: no output, no model call. Runs are real sessions with guarded approvals, spend ceilings, and a failure auto-pause. [Guide →](docs/routines.md)
 - **Device handoff** — Start a session on your laptop, attach from your phone. Scrollback replays. Same conversation.
 - **Identity-grade audit** — Every tool call stamped with the SPIFFE URI of the agent that made it. Sub-agents get their own attenuated identities. Delegation chain traceable top to bottom.
 - **Multi-frontend** — same session accessible from terminal TUI, browser, or Telegram bot. Share read-only tokens with a teammate.
@@ -369,6 +370,10 @@ Full detail — keybindings, slash commands, ranking weights, rotation threshold
 - **[Mid-turn streaming input](docs/FEATURES.md#mid-turn-streaming-input-vscode-parity)** — send a follow-up while Claude is still responding; `now` / `next` / `later` priority.
 - **[Attachments](docs/FEATURES.md#attachments)** — `@file` mentions, one-shot `/context`, and persistent `/pin`; drag-drop in the web UI.
 
+**Automation**
+
+- **[Routines](docs/routines.md)** — agents that run on a schedule, from an API call, or on demand, on your own machine and any backend. A shell *check* gates each run, so a routine with nothing to do costs nothing; an agent with nothing to report stays `[SILENT]`. Spend, time and tool budgets are enforced by the daemon, and every run is a session you can open from your phone and approve.
+
 **Identity & resilience**
 
 - **[Cryptographic identity per agent + sub-agent](docs/FEATURES.md#identity-chain)** — ZeroID SPIFFE/WIMSE URIs stamped on every tool call; `/who` prints the full delegation chain, and revoking the parent kills it. (ZeroID posture only — [local mode](docs/local-mode.md) trades this away by design.)
@@ -435,6 +440,8 @@ codeoid fork <session> [--at N] [--backend id]       # Fork (after prompt N, wit
 codeoid undo <session> [files [yes|force]]           # Take back the last message
 codeoid compare run <session> --with claude,codex <prompt...>  # Same prompt on 2–4 backends, side by side
 codeoid compare show|ls|keep …                       #   results; keep one [--discard-others]
+codeoid routine add <name> --prompt … [--cron|--every|--at] [--check <cmd>]  # scheduled / triggered agent runs
+codeoid routine ls | show | runs | run [--wait] | edit | pause | resume | rm | cancel <runId> | token | preview
 ```
 
 ## Development

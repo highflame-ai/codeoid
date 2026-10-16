@@ -43,7 +43,7 @@ import { rewriteBashToolInput } from "../../compress/index.js";
 import type { CodeoidConfig } from "../../../config.js";
 import type { AuthContext } from "../../../protocol/types.js";
 import type { SessionProvider, ModelInfo, NormalizedTurnResult, ProviderEvent, SessionScopedEvent, TurnOpts, TurnRun, CatalogEntry, UiResponse } from "../interface.js";
-import { isBackgroundLifecycleEvent } from "../interface.js";
+import { BUDGET_STOP_MESSAGE, isBackgroundLifecycleEvent } from "../interface.js";
 import { isUngrantableSkillCommand, redactCommand } from "../../skill-command.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
 import { buildSubprocessEnv, withGatewayCredential } from "../env.js";
@@ -661,6 +661,7 @@ export class ClaudeProvider implements SessionProvider {
         thinking: { type: "adaptive" as const, display: "summarized" as const },
         ...(opts.model ? { model: opts.model } : {}),
         ...(opts.fallbackModel ? { fallbackModel: opts.fallbackModel } : {}),
+        ...(opts.maxBudgetUsd !== undefined ? { maxBudgetUsd: opts.maxBudgetUsd } : {}),
         stderr: (data: string) => {
           process.stderr.write(`[claude-subprocess ${sessionId.slice(0, 8)}] ${data}`);
         },
@@ -1444,7 +1445,12 @@ export function translateSDKMessage(
           // Preserve `undefined` when the SDK didn't report — only force true.
           isError: zeroTurn ? true : r.is_error,
           errorMessage:
-            zeroTurnError ?? (r.subtype !== "success" && r.result ? r.result : undefined),
+            zeroTurnError ??
+            (r.subtype === "error_max_budget_usd"
+              ? BUDGET_STOP_MESSAGE
+              : r.subtype !== "success" && r.result
+                ? r.result
+                : undefined),
         };
         emit({ type: "turn_done", result: normalized });
         // Stay warm — keep the queue open for the next turn.

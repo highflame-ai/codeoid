@@ -18,7 +18,8 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { program } from "commander";
+import { randomUUID } from "node:crypto";
+import { type Command, program } from "commander";
 // Single source of truth for the CLI version — bun inlines this JSON at build,
 // so `codeoid --version` always matches the published package (no hand-synced
 // string to drift). release-smoke asserts these two stay equal.
@@ -34,12 +35,27 @@ import {
   mintLocalToken,
   removeLocalTokenFile,
 } from "./daemon/local-auth.js";
-import { CAPABILITIES, type CollaborationConfig } from "./protocol/types.js";
+import {
+  CAPABILITIES,
+  type CollaborationConfig,
+  type RoutineScheduleWire,
+  type RoutineSpecWire,
+  routineFirePath,
+} from "./protocol/types.js";
 import { ALL_SCOPES_STRING } from "./protocol/scopes.js";
 import { TerminalClient } from "./terminal/client.js";
 import { mcpConfig, mcpHeaders } from "./terminal/mcp-control-cli.js";
 import { cleartextOffHost, controlUrl, MCP_SCOPE_PRESETS, TokenError } from "./terminal/token.js";
 import { parseTargets } from "./terminal/compare.js";
+import {
+  formatRoutine,
+  formatRoutineList,
+  formatRun,
+  type RoutineFlags,
+  relativeTime,
+  scheduleFromFlags,
+  specFromFlags,
+} from "./terminal/routine-format.js";
 import {
   getConfigDir,
   getLocalTokenPath,
@@ -846,6 +862,244 @@ async function withClient(fn: (c: TerminalClient) => Promise<void>): Promise<voi
     client.disconnect();
   }
 }
+
+// ── Routines (docs/routines.md) ─────────────────────────────────────────────
+
+/** Options shared by `routine add` and `routine edit`. */
+function routineSpecOptions(cmd: Command, mode: "add" | "edit"): Command {
+  cmd
+    .option("-w, --workdir <dir>", mode === "add" ? "directory the agent works in (default: here)" : "directory the agent works in")
+    .option("-p, --prompt <text>", "what the agent should do — may use {{check}}, {{payload}}, {{last_summary}}, {{trigger}}, {{now}}, {{routine}}")
+    .option("--prompt-file <path>", "read the prompt from a file")
+    .option("--cron <expr>", 'run on a cron schedule, e.g. "0 9 * * 1-5"')
+    .option("--tz <zone>", "IANA timezone for --cron (default: this machine's)")
+    .option("--every <interval>", "run every interval, e.g. 15m, 2h, 1d")
+    .option("--at <time>", "run once, at ISO 8601 with a zone (Z or +08:00)")
+    .option("--check <command>", "pre-run gate: no output = nothing to do (no agent, no cost)")
+    .option("--check-timeout <s>", "check timeout in seconds (default 60)")
+    .option("--provider <id>", "backend: claude, codex, gemini, qwen, …")
+    .option("--model <name>", "model for the backend")
+    .option("--guarded", "every non-read tool waits for your approval")
+    .option("--autonomous", "tools auto-approve within --tool-budget (default)")
+    .option("--tool-budget <n>", "autonomous tool calls per run (default 50)")
+    .option("--max-minutes <n>", "wall-clock limit per run (default 15)")
+    .option("--max-cost <usd>", "spend ceiling per run")
+    .option("--daily-cost <usd>", "spend ceiling per day (UTC)")
+    .option("--persistent", "reuse one session across runs (keeps the conversation)")
+    .option("--fresh", "a new session per run (default)")
+    .option("--worktree", "run in a fresh git worktree each time")
+    .option("--overlap <policy>", "if a run is still going: skip (default) or queue")
+    .option("--catch-up", "after downtime, run once for a missed fire")
+    .option("--jitter <s>", "spread the start by up to this many seconds")
+    .option("--notify <policy>", "on_change (default), always, or never")
+    .option("--keep <n>", "run sessions to keep (default 5)")
+    .option("--api", "enable the routine's API trigger (prints its token once)")
+    .option("--failure-pause <n>", "pause after N consecutive failures (default 3, 0 = never)");
+  if (mode === "edit") {
+    cmd
+      .option("--no-schedule", "remove the schedule (run on demand only)")
+      .option("--no-check", "remove the check")
+      .option("--no-worktree", "stop using a worktree")
+      .option("--no-catch-up", "don't catch up missed fires")
+      .option("--no-api", "turn the API trigger off (revokes its token)");
+  }
+  return cmd;
+}
+
+/** Print an API token once, with how to call it. */
+function printRoutineToken(token: string, routineId: string): void {
+  const base = loadConfig().daemonUrl.replace(/^ws/, "http").replace(/\/+$/, "");
+  console.log(`\n  API token (shown once — store it now):\n    ${token}`);
+  console.log(`\n  Fire it:\n    curl -X POST ${base}${routineFirePath(routineId)} \\\n      -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \\\n      -d '{"text": "optional payload for {{payload}}"}'\n`);
+}
+
+const routine = program
+  .command("routine")
+  .description("Scheduled and triggered agent runs, with budgets and a check-first gate (docs/routines.md)");
+
+routineSpecOptions(routine.command("add <name>").description("Create a routine"), "add").action((name: string, f: RoutineFlags) =>
+  withClient(async (c) => {
+    let spec: ReturnType<typeof specFromFlags>;
+    try {
+      spec = specFromFlags(name, f, "add");
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exitCode = 1;
+      return;
+    }
+    const res = await c.request({ type: "routine.create", id: randomUUID(), spec: spec as RoutineSpecWire });
+    if (res.type !== "routine.snapshot") return c.printError(res);
+    console.log(formatRoutine(res.routine).join("\n"));
+    if (res.apiToken) printRoutineToken(res.apiToken, res.routine.id);
+  }),
+);
+
+routineSpecOptions(routine.command("edit <name>").description("Change a routine (only the flags you pass)"), "edit").action(
+  (name: string, f: RoutineFlags) =>
+    withClient(async (c) => {
+      let spec: ReturnType<typeof specFromFlags>;
+      try {
+        spec = specFromFlags(name, f, "edit");
+      } catch (err) {
+        console.error(err instanceof Error ? err.message : String(err));
+        process.exitCode = 1;
+        return;
+      }
+      const res = await c.request({ type: "routine.update", id: randomUUID(), routine: name, spec: spec as never });
+      if (res.type !== "routine.snapshot") return c.printError(res);
+      console.log(formatRoutine(res.routine).join("\n"));
+      if (res.apiToken) printRoutineToken(res.apiToken, res.routine.id);
+    }),
+);
+
+routine
+  .command("ls")
+  .description("List routines")
+  .action(() =>
+    withClient(async (c) => {
+      const res = await c.request({ type: "routine.list", id: randomUUID() });
+      if (res.type !== "routine.list.result") return c.printError(res);
+      console.log(formatRoutineList(res.routines).join("\n"));
+    }),
+  );
+
+routine
+  .command("show <name>")
+  .description("A routine's configuration and recent runs")
+  .option("--runs <n>", "recent runs to show", "5")
+  .action((name: string, o: { runs: string }) =>
+    withClient(async (c) => {
+      const res = await c.request({ type: "routine.get", id: randomUUID(), routine: name, runs: Number(o.runs) });
+      if (res.type !== "routine.snapshot") return c.printError(res);
+      console.log(formatRoutine(res.routine, res.runs).join("\n"));
+    }),
+  );
+
+routine
+  .command("runs <name>")
+  .description("Run history, newest first")
+  .option("--limit <n>", "how many", "20")
+  .action((name: string, o: { limit: string }) =>
+    withClient(async (c) => {
+      const res = await c.request({ type: "routine.runs", id: randomUUID(), routine: name, limit: Number(o.limit) });
+      if (res.type !== "routine.runs.result") return c.printError(res);
+      if (res.runs.length === 0) console.log("No runs yet.");
+      for (const run of res.runs) console.log(formatRun(run).join("\n"));
+    }),
+  );
+
+routine
+  .command("run <name>")
+  .description("Run a routine now")
+  .option("--payload <text>", "text for the prompt's {{payload}}")
+  .option("--wait", "wait for the run to finish and print its outcome")
+  .action((name: string, o: { payload?: string; wait?: boolean }) =>
+    withClient(async (c) => {
+      const res = await c.request({ type: "routine.run", id: randomUUID(), routine: name, ...(o.payload ? { payload: o.payload } : {}) });
+      if (res.type !== "routine.run.result") return c.printError(res);
+      const runId = res.run.id;
+      if (!o.wait || ["skipped", "cancelled"].includes(res.run.status)) {
+        console.log(formatRun(res.run).join("\n"));
+        return;
+      }
+      process.stderr.write(`run ${runId.slice(0, 8)} started — waiting`);
+      for (;;) {
+        await new Promise((r) => setTimeout(r, 2_000));
+        // By id, so a busy routine's newer runs can't push this one out of view.
+        const got = await c.request({ type: "routine.runs", id: randomUUID(), routine: res.run.routineId, runId });
+        if (got.type !== "routine.runs.result") return c.printError(got);
+        const run = got.runs[0];
+        if (!run) {
+          process.stderr.write("\n");
+          console.error(`run ${runId.slice(0, 8)} is gone (the routine was deleted, or its history trimmed)`);
+          process.exitCode = 1;
+          return;
+        }
+        if (!["queued", "checking", "running"].includes(run.status)) {
+          process.stderr.write("\n");
+          console.log(formatRun(run).join("\n"));
+          if (["failed", "timed_out", "over_budget"].includes(run.status)) process.exitCode = 1;
+          return;
+        }
+        process.stderr.write(".");
+      }
+    }),
+  );
+
+for (const [verb, enabled] of [["pause", false], ["resume", true]] as const) {
+  routine
+    .command(`${verb} <name>`)
+    .description(enabled ? "Resume a paused routine" : "Pause a routine (nothing is deleted)")
+    .action((name: string) =>
+      withClient(async (c) => {
+        const res = await c.request({ type: "routine.update", id: randomUUID(), routine: name, enabled });
+        if (res.type !== "routine.snapshot") return c.printError(res);
+        console.log(formatRoutineList([res.routine]).slice(1).join("\n"));
+      }),
+    );
+}
+
+routine
+  .command("rm <name>")
+  .description("Delete a routine and its run history")
+  .action((name: string) =>
+    withClient(async (c) => {
+      const res = await c.request({ type: "routine.delete", id: randomUUID(), routine: name });
+      if (res.type !== "response.ok") return c.printError(res);
+      console.log(`Deleted routine ${name}.`);
+    }),
+  );
+
+routine
+  .command("cancel <runId>")
+  .description("Cancel a queued or running run")
+  .action((runId: string) =>
+    withClient(async (c) => {
+      const res = await c.request({ type: "routine.cancel_run", id: randomUUID(), runId });
+      if (res.type !== "response.ok") return c.printError(res);
+      console.log(`Cancelled run ${runId}.`);
+    }),
+  );
+
+routine
+  .command("token <name>")
+  .description("Mint a new API token (the old one stops working)")
+  .action((name: string) =>
+    withClient(async (c) => {
+      const res = await c.request({ type: "routine.token", id: randomUUID(), routine: name });
+      if (res.type !== "routine.token.result") return c.printError(res);
+      printRoutineToken(res.apiToken, res.routineId);
+    }),
+  );
+
+routine
+  .command("preview")
+  .description("Check a schedule and show its next fire times")
+  .option("--cron <expr>", "cron expression")
+  .option("--tz <zone>", "IANA timezone for --cron")
+  .option("--every <interval>", "interval, e.g. 15m")
+  .option("--at <time>", "ISO 8601 with a zone (Z or +08:00)")
+  .option("--count <n>", "how many fires", "5")
+  .action((o: RoutineFlags & { count: string }) =>
+    withClient(async (c) => {
+      let schedule: RoutineScheduleWire | null | undefined;
+      try {
+        schedule = scheduleFromFlags(o);
+      } catch (err) {
+        console.error(err instanceof Error ? err.message : String(err));
+        process.exitCode = 1;
+        return;
+      }
+      if (!schedule) {
+        console.error("give a schedule: --cron, --every, or --at");
+        process.exitCode = 1;
+        return;
+      }
+      const res = await c.request({ type: "routine.preview", id: randomUUID(), schedule, count: Number(o.count) });
+      if (res.type !== "routine.preview.result") return c.printError(res);
+      for (const f of res.fires) console.log(`  ${f}  (${relativeTime(f)})`);
+    }),
+  );
 
 const pack = program.command("pack").description("Manage SDLC packs + registries (docs/pack-loading.md)");
 

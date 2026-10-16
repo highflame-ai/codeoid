@@ -377,6 +377,15 @@ Append-only. The advisory lands after the reusable request prefix and invalidate
 
 > The **Model Experience** / **KV Cache effect** headings are a convention borrowed from DeepSeek Harness (see [prior-art-deepseek-harness.md](./prior-art-deepseek-harness.md) §4.9). Any feature that changes what the model sees should state both: what reaches the model, and whether it invalidates the prompt prefix. For a harness, prefix stability *is* cost.
 
+### Routines
+
+Saved agent tasks that run on a cron or interval schedule, when something calls their API, or on demand: `codeoid routine add ci-watch --every 15m --check '…' --prompt '…'`.
+A *check* (a shell command) runs first; if it prints nothing, the run ends `silent` with no agent started and nothing spent.
+An agent that finds nothing worth reporting replies `[SILENT]` and you hear nothing.
+Every run is a normal session you can open, approve, continue or fork from any frontend, bounded by guarded approvals (or, when autonomous, a tool budget), a time limit, per-run and per-day spend ceilings, and an auto-pause after repeated failures.
+Each routine can carry its own revocable API token for monitors and deploy scripts, and the `routine_end` hook carries each outcome to Slack or a pager.
+Full guide: [routines.md](routines.md).
+
 ### Driven by other agents (MCP)
 
 Claude Code, Cursor, or a CI job can drive codeoid over MCP at `/mcp/control`: list sessions, read their transcripts and usage, and (when allowed) create and prompt them, then wait for the reply.

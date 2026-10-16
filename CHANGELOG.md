@@ -8,6 +8,39 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Routines: agents that run on their own** (#54). `codeoid routine add`
+  saves an agent task that runs on a cron or interval schedule (IANA
+  timezones, phase-anchored intervals, 60-second floor), once at a set time, from
+  its own API endpoint (`POST /routines/<id>/fire` with a per-routine,
+  revocable, rate-limited token), or on demand. A *check* command runs first:
+  no output means nothing to do, and the run ends `silent` with no agent
+  started and nothing spent. An agent that finds nothing worth reporting
+  replies `[SILENT]`. The prompt can use `{{check}}`, `{{payload}}` and
+  `{{last_summary}}`, inserted as delimited data the agent is told not to
+  follow.
+
+  Every run is an ordinary session you can open, approve, continue or fork.
+  The daemon enforces the limits: guarded approvals or an autonomous tool
+  budget, a wall-clock limit, per-run and per-day spend ceilings (a hard stop
+  on Claude via the Agent SDK's `maxBudgetUsd`), skip-or-queue overlap,
+  catch-up after downtime, and an auto-pause after repeated failures. A run
+  that parks on an approval ends `needs_attention` and keeps tracking its
+  spend after you approve. Fresh runs can each get their own git worktree.
+
+  A routine is its owner's alone: teammates in the tenant can't see or touch
+  it. No new scope: routines take `session:create` + `session:send`, plus
+  `session:approve` for an autonomous routine or one with a check, and
+  delegated tokens (teammates' share tokens, agents) can't change them. Check commands run with a
+  scrubbed environment, never the daemon's secrets. Runs are
+  attributed to `routine:<name>` under their owner in transcripts and the
+  audit log. Outcomes reach your devices as a content-blind push (`notify`
+  policy) and every run fires the new `routine_end` hook. Config:
+  `routines.*`, `CODEOID_ROUTINES_ENABLED`, `CODEOID_ROUTINES_MAX_CONCURRENT`.
+  Guide: [docs/routines.md](docs/routines.md).
+
+- **Protocol (additive):** `routine.*` client messages and results,
+  `SessionInfo.managedBy: "routine"`, and push kind `"routine"`.
+
 - **Other agents can drive codeoid over MCP** (`/mcp/control`, #251). Claude
   Code, Cursor, or a CI job mounts one URL and can list sessions, read their
   transcripts and usage, wait on them, and — when the operator sets

@@ -36,6 +36,24 @@ import type { SessionRewindMsg, SessionRewindResultMsg, SessionTurnsMsg, Session
 import type { SessionApprovalsMsg, SessionApprovalsResultMsg } from "./approvals.js";
 import type { CompareGetMsg, CompareKeepMsg, CompareListMsg, CompareListResultMsg, CompareStateMsg, SessionCompareMsg } from "./compare.js";
 import type {
+  RoutineCancelRunMsg,
+  RoutineCreateMsg,
+  RoutineDeleteMsg,
+  RoutineGetMsg,
+  RoutineListMsg,
+  RoutineListResultMsg,
+  RoutinePreviewMsg,
+  RoutinePreviewResultMsg,
+  RoutineRunMsg,
+  RoutineRunResultMsg,
+  RoutineRunsMsg,
+  RoutineRunsResultMsg,
+  RoutineSnapshotMsg,
+  RoutineTokenMsg,
+  RoutineTokenResultMsg,
+  RoutineUpdateMsg,
+} from "./routines.js";
+import type {
   McpOAuthBeginMsg,
   McpOAuthCompleteMsg,
   McpOAuthDisconnectMsg,
@@ -340,14 +358,15 @@ export interface SessionInfo {
     options?: string[];
   };
   /**
-   * Something other than its owner is steering this session right now — today
-   * a live SDLC pipeline run (`"pipeline"`), which injects each phase as a turn.
+   * Something other than its owner is steering this session right now — a live
+   * SDLC pipeline run (`"pipeline"`), which injects each phase as a turn, or a
+   * routine run in flight (`"routine"`, docs/routines.md).
    * Absent once the run reaches a terminal state, after which it is an ordinary
    * session again. Outside drivers (`/mcp/control`) read such a session but do
    * not prompt, interrupt, or destroy it; a future orchestrator that owns
    * sessions should set this too, so that refusal covers it without new code.
    */
-  managedBy?: "pipeline";
+  managedBy?: "pipeline" | "routine";
   /**
    * A prompt has been accepted but its turn has not started yet (hooks, the
    * turn checkpoint, identity registration are still running). The session can
@@ -1049,6 +1068,16 @@ export type ClientMessage =
   | CompareGetMsg
   | CompareListMsg
   | CompareKeepMsg
+  | RoutineCreateMsg
+  | RoutineUpdateMsg
+  | RoutineDeleteMsg
+  | RoutineListMsg
+  | RoutineGetMsg
+  | RoutineRunMsg
+  | RoutineCancelRunMsg
+  | RoutineRunsMsg
+  | RoutineTokenMsg
+  | RoutinePreviewMsg
   | McpOAuthBeginMsg
   | McpOAuthCompleteMsg
   | McpOAuthDisconnectMsg
@@ -2626,6 +2655,12 @@ export type DaemonMessage =
   | SessionRewindResultMsg
   | CompareStateMsg
   | CompareListResultMsg
+  | RoutineSnapshotMsg
+  | RoutineListResultMsg
+  | RoutineRunResultMsg
+  | RoutineRunsResultMsg
+  | RoutineTokenResultMsg
+  | RoutinePreviewResultMsg
   | McpOAuthBeginResultMsg
   | McpOAuthCompleteResultMsg
   | McpOAuthDisconnectResultMsg

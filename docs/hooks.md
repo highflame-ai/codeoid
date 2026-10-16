@@ -64,6 +64,7 @@ Hooks are declared in `~/.codeoid/config.json`. No plugin loading, no JS API —
 | `session_end` | Session destroyed | observe |
 | `provider_switched` | Backend switched mid-session (`from`, `to`, `seeded`) | observe |
 | `rotated` | Backing context rotated (`reason`, `rotationCount`) | observe |
+| `routine_end` | A [routine](routines.md) run reached an outcome — every run, whatever its notify policy (`routine`, `run`, `paused`, `notify`). The run carries its summary, check output and payload, for every tenant's routines on this daemon | observe |
 
 Every payload also carries `sessionId`, `sessionName`, `workdir`, and `providerId`.
 
