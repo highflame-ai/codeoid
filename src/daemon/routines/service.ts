@@ -95,7 +95,9 @@ export const LIMITS = {
   PROMPT_MAX: 20_000,
   CHECK_COMMAND_MAX: 4_000,
   CHECK_TIMEOUT_MAX_S: 600,
-  CHECK_OUTPUT_MAX: 16_000,
+  // A check is how a routine hands the agent its work (an issue list, a log
+  // tail), so it gets room: ~16k tokens.
+  CHECK_OUTPUT_MAX: 64_000,
   PAYLOAD_MAX: 16_000,
   SUMMARY_MAX: 4_000,
   TOOL_BUDGET_MAX: 1_000,
@@ -277,7 +279,8 @@ export async function runCheck(
         },
         text() {
           const t = Buffer.concat(chunks).toString("utf8");
-          return total > LIMITS.CHECK_OUTPUT_MAX ? clip(t, LIMITS.CHECK_OUTPUT_MAX) : t;
+          if (total <= LIMITS.CHECK_OUTPUT_MAX) return t;
+          return `${t.slice(0, LIMITS.CHECK_OUTPUT_MAX)}\n…[output truncated: ${total} bytes, the first ${LIMITS.CHECK_OUTPUT_MAX} kept]`;
         },
       };
     };

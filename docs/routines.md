@@ -89,7 +89,7 @@ The check is the cheapest part of a routine and usually the most useful.
 It runs with `/bin/sh -c` in the workdir before any agent starts:
 
 - **Exit 0 and no output:** the run ends as `silent`. No agent, no cost.
-- **Exit 0 with output:** the agent starts, and the output reaches it as `{{check}}`.
+- **Exit 0 with output:** the agent starts, and the output reaches it as `{{check}}` (up to 64 KB; anything past that is cut, and the agent is told so).
 - **Non-zero exit or timeout:** the run `failed`, with the check's output kept for you to read. A timed-out check is killed along with everything it started.
 
 The check sees `CODEOID_ROUTINE`, `CODEOID_ROUTINE_ID`, `CODEOID_ROUTINE_TRIGGER` and `CODEOID_ROUTINE_LAST_RUN_AT`, so it can ask "anything new since the last run?":

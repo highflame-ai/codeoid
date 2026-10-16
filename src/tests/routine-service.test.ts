@@ -278,6 +278,16 @@ describe("the check gate", () => {
     expect(s.prompts[0]!.text).toContain("routine=nightly trigger=manual");
   });
 
+  it("a huge check output is cut at the cap, and the agent is told how much there was", async () => {
+    const { routine } = create({ check: { command: "head -c 100000 /dev/zero | tr '\\0' x", timeoutSeconds: 10 } });
+    svc.fire(routine, "manual", null, "owner");
+    await settle();
+    const text = [...host.sessions.values()][0]!.prompts[0]!.text;
+    expect(text).toContain("x".repeat(64_000));
+    expect(text).not.toContain("x".repeat(64_001));
+    expect(text).toContain("[output truncated: 100000 bytes, the first 64000 kept]");
+  });
+
   it("a check that hangs is killed at its timeout, children and all", async () => {
     const pidFile = join(mkdtempSync(join(tmpdir(), "rt-chk-")), "pid");
     const { routine } = create({ check: { command: `sleep 30 & echo $! > ${pidFile}; wait`, timeoutSeconds: 1 } });
