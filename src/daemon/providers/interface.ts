@@ -218,6 +218,11 @@ export interface NormalizedTurnResult {
 export interface NativeTurnRef {
   backingId: string;
   ref: string;
+  /**
+   * The working directory the backing session ran in, when the backend files
+   * sessions by it (Claude): a fork looks the source up there and nowhere else.
+   */
+  dir?: string;
 }
 
 /** What a session asks a provider when it hands it an existing conversation. */
@@ -292,6 +297,8 @@ export type ProviderEvent =
       /** The backend refused this call itself, never asking codeoid's gate
        *  (codex declining an approval it can't show, #369) — audited. */
       declinedByBackend?: boolean;
+      /** A tool_result hook replaced `output`: the backend's own record still holds the original. */
+      redacted?: boolean;
     }
   | { type: "subagent_start"; agentId: string; agentType: string }
   | { type: "subagent_stop"; agentId: string }

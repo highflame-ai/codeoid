@@ -31,6 +31,8 @@ The conversation is handed over in the backend's own form wherever the backend a
 
 Reasoning never crosses vendors (Claude's is signed, OpenAI's encrypted), and history that doesn't fit the target's window loses its oldest turns, with a notice.
 The session says which way it went (`↪ … continues its own conversation`, `↪ … was given … as its own history`, or `↪ … carried as a text transcript`), and if a native path fails it falls back to the transcript and says so.
+Two cases always use codeoid's own record rather than the backend's: history that a `tool_result` [hook](hooks.md) redacted (a native fork would copy the backend's unredacted log), and turns rebuilt from a displayed transcript such as an imported session (they aren't the model's own words, so they stay quoted).
+Like every Claude session codeoid runs, a session it writes or forks for Claude lives under `CLAUDE_CONFIG_DIR` (default `~/.claude/projects/`), owner-only, and is subject to Claude Code's own `cleanupPeriodDays`.
 `session.nativeContinuation: false` (or `CODEOID_NATIVE_CONTINUATION=false`) keeps everything on the transcript.
 
 Memory, identity, attachments, the multi-frontend clients, and device handoff are all provider-agnostic. A few features lean on Claude Code internals and so apply only to the `claude` harness: backing-session [auto-rotation](#context-reduction-stack), Claude Code slash-command [pass-through](#terminal-client), and `.claude/commands` workspace commands.

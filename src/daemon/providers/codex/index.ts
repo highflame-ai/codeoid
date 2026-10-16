@@ -438,9 +438,11 @@ export class CodexProvider implements SessionProvider {
       const why = err instanceof Error ? err.message : String(err);
       console.error(`[codex-provider ${this.#sessionId.slice(0, 8)}] native ${pending.kind} failed, using the transcript: ${why}`);
       this.#pendingHistorySeed = pending.fallback;
+      // The cause stays in the daemon log: backend errors name rollout paths
+      // and thread ids, and every attached client (watchers too) sees this.
       this.#push({
         type: "custom_message",
-        content: `⚠️ Codex couldn't take this conversation as its own history (${why.slice(0, 200)}), so it continues from a text transcript of it instead.`,
+        content: "⚠️ Codex couldn't take this conversation as its own history, so it continues from a text transcript of it instead.",
         metadata: { event: "history.native_fallback", providerId: this.id },
       });
       return null;

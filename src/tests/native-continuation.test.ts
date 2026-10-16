@@ -164,6 +164,14 @@ describe("Claude records where each turn ends in its own session", () => {
     expect((events.filter((e) => e.type === "turn_done")[1] as { result: NormalizedTurnResult }).result.nativeRef).toBeUndefined();
   });
 
+  it("names the project dir the session is filed under, so a fork looks only there", () => {
+    const events: ProviderEvent[] = [];
+    const state: TranslateState = { lastLocalCommandStderr: null, primaryModel: "m", cwd: "/work/repo" };
+    translateSDKMessage({ type: "assistant", uuid: "a1", parent_tool_use_id: null, message: { content: [] } } as never, (e) => events.push(e), "claude", state);
+    translateSDKMessage({ type: "result", subtype: "success", session_id: "b", num_turns: 1, usage: {} } as never, (e) => events.push(e), "claude", state);
+    expect((events.find((e) => e.type === "turn_done") as { result: NormalizedTurnResult }).result.nativeRef).toEqual({ backingId: "b", ref: "a1", dir: "/work/repo" });
+  });
+
   it("is stamped on the canonical turn, so forks and restarts can find it", () => {
     const acc = new CanonicalHistoryAccumulator();
     acc.pushUserTurn("go", "turn-1");
@@ -218,6 +226,11 @@ describe("ClaudeProvider.continueNatively", () => {
     const r = await p.continueNatively({ history, forkFrom: { backingId: "parent-b", ref: "uuid-9" }, maxChars: 1e6, workdir: "/w" });
     expect(r).toEqual({ via: "fork", backingId: "forked-1" });
     expect(s.calls).toEqual(["fork parent-b uuid-9"]);
+    // With the source's dir, the lookup is pinned there.
+    let seen: unknown;
+    const pinned = provider(sdk({ forkSession: async (_id, o) => ((seen = o), { sessionId: "f2" }) }));
+    await pinned.continueNatively({ history, forkFrom: { backingId: "parent-b", ref: "uuid-9", dir: "/src/repo" }, maxChars: 1e6, workdir: "/w" });
+    expect(seen).toEqual({ upToMessageId: "uuid-9", dir: "/src/repo" });
     expect(p.backingSessionId).toBe("forked-1");
     expect(p.hasQueried).toBe(true); // resume, not create
   });
@@ -316,6 +329,8 @@ describe("CodexProvider.continueNatively", () => {
     const notice = events.find((e) => e.type === "custom_message") as { content: string; metadata: { event: string } } | undefined;
     expect(notice?.metadata.event).toBe("history.native_fallback");
     expect(notice?.content).toContain("text transcript");
+    // Backend errors name rollout paths and thread ids: they stay in the daemon log.
+    expect(notice?.content).not.toContain("gone-thread");
     expect(text(events)).toContain("<conversation-history>");
     expect(text(events)).toContain("remember PELICAN");
     expect(p.backingSessionId).toBe("codex-thread-1");
@@ -365,7 +380,7 @@ describe("Session: native first, transcript as the fallback", () => {
       id,
       displayName: id,
       create: () => {
-        const p = new MockSessionProvider(id, [say("a1", id, { backingId: `${id}-b1`, ref: "end-1" }), say("a2", id, { backingId: `${id}-b1`, ref: "end-2" }), say("a3", id)]);
+        const p = new MockSessionProvider(id, [say("a1", id, { backingId: `${id}-b1`, ref: "00000000-0000-0000-0000-0000000000e1" }), say("a2", id, { backingId: `${id}-b1`, ref: "00000000-0000-0000-0000-0000000000e2" }), say("a3", id)]);
         // Like a real warm backend (claude, codex, pi), report the transcript it stashed.
         p.seedResultOverride = { text: "<conversation-history>…", totalTurns: 0, keptTurns: 0, omittedTurns: 0, newestTurnSliced: false };
         if (nativeAnswer) {
@@ -429,7 +444,7 @@ describe("Session: native first, transcript as the fallback", () => {
     await send(m, id, "two");
     const info = await fork(m, id);
     const req = made.at(-1)!.nativeRequests[0]!;
-    expect(req.forkFrom).toEqual({ backingId: "claude-b1", ref: "end-2" });
+    expect(req.forkFrom).toEqual({ backingId: "claude-b1", ref: "00000000-0000-0000-0000-0000000000e2" });
     expect(req.history.map((t) => t.content)).toEqual(["one", "a1", "two", "a2"]);
     expect(store.getClaudeCodeSessionId(info.id)).toBe("native-backing");
     // It holds the conversation already, so a restart resumes it rather than re-seeding.
@@ -438,6 +453,44 @@ describe("Session: native first, transcript as the fallback", () => {
     expect(notes(m, info.id).some((n) => n.includes("continues its own conversation"))).toBe(true);
     // No transcript was stashed alongside.
     expect(made.at(-1)!.seededHistory).toBeNull();
+  });
+
+  it("never forks natively past a hook's redaction — the backend's record still has the original", async () => {
+    nativeAnswer = (req) => ({ via: req.forkFrom ? "fork" : "history", backingId: "nb" });
+    const m = manager();
+    const id = await newSession(m);
+    await send(m, id, "one");
+    const s = m._sessionForTest(id)!;
+    const h = s.canonicalHistory as CanonicalTurn[];
+    const last = h.at(-1) as Extract<CanonicalTurn, { role: "assistant" }>;
+    last.toolCalls = [{ id: "t", name: "run_shell", input: {}, output: "[redacted]", success: true, redacted: true }];
+    await fork(m, id);
+    const req = made.at(-1)!.nativeRequests[0]!;
+    expect(req.forkFrom).toBeUndefined(); // rebuilt from codeoid's redacted record instead
+    expect(req.history.at(-1)).toMatchObject({ role: "assistant" });
+  });
+
+  it("turns rebuilt from a displayed transcript stay a transcript — never native history in the assistant's voice", async () => {
+    nativeAnswer = () => ({ via: "history", backingId: "nb" });
+    const m = manager();
+    const id = await newSession(m);
+    await send(m, id, "one");
+    const last = m._sessionForTest(id)!.canonicalHistory.at(-1) as Extract<CanonicalTurn, { role: "assistant" }>;
+    last.restored = true;
+    await fork(m, id);
+    expect(made.at(-1)!.nativeRequests).toEqual([]);
+    expect(made.at(-1)!.seededHistory).not.toBeNull();
+  });
+
+  it("a malformed native point is not acted on", async () => {
+    nativeAnswer = (req) => ({ via: req.forkFrom ? "fork" : "history", backingId: "nb" });
+    const m = manager();
+    const id = await newSession(m);
+    await send(m, id, "one");
+    const last = m._sessionForTest(id)!.canonicalHistory.at(-1) as Extract<CanonicalTurn, { role: "assistant" }>;
+    last.native = { backingId: "../../etc", ref: "x" };
+    await fork(m, id);
+    expect(made.at(-1)!.nativeRequests[0]!.forkFrom).toBeUndefined();
   });
 
   it("a fork onto another backend asks for native history — no fork point to borrow", async () => {
@@ -496,7 +549,7 @@ describe("Session: native first, transcript as the fallback", () => {
     const second = s.turnIndex[1]!.turnId;
     await s.rewind(second, { restoreFiles: false }, AUTH);
     const req = made.at(-1)!.nativeRequests.at(-1)!;
-    expect(req.forkFrom).toEqual({ backingId: "claude-b1", ref: "end-1" });
+    expect(req.forkFrom).toEqual({ backingId: "claude-b1", ref: "00000000-0000-0000-0000-0000000000e1" });
     expect(store.getClaudeCodeSessionId(id)).toBe("rewound-backing");
   });
 });

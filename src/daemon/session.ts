@@ -3259,8 +3259,20 @@ export class Session {
     if (this.#config?.session?.nativeContinuation === false) return null;
     const provider = this.#provider;
     if (!provider.continueNatively) return null;
+    // Turns rebuilt from a displayed transcript (an import, a pre-canonical
+    // session) aren't the model's own words: they stay a quoted transcript,
+    // never native history in the assistant's voice.
+    if (history.some((t) => t.role === "assistant" && t.restored)) return null;
     const last = history.at(-1);
-    const forkFrom = last?.role === "assistant" && last.providerId === provider.id ? last.native : undefined;
+    const forkFrom =
+      last?.role === "assistant" &&
+      last.providerId === provider.id &&
+      isNativeRef(last.native) &&
+      // A fork copies the backend's own record, which still holds what a
+      // tool_result hook redacted from codeoid's: rebuild from codeoid's instead.
+      !history.some((t) => t.role === "assistant" && t.toolCalls?.some((tc) => tc.redacted))
+        ? last.native
+        : undefined;
     let result: NativeContinuationResult | null;
     try {
       result = await provider.continueNatively({ history, ...(forkFrom ? { forkFrom } : {}), maxChars, workdir: this.workdir });
@@ -5287,7 +5299,7 @@ export class Session {
           });
           if (patched.updatedOutput !== undefined) output = patched.updatedOutput;
         }
-        this.#accumulator.handleEvent(output === event.output ? event : { ...event, output });
+        this.#accumulator.handleEvent(output === event.output ? event : { ...event, output, redacted: true });
         if (msgId) {
           const toolMsg = this.#toolCallMessages.get(msgId);
           if (toolMsg?.tool) {
@@ -6888,4 +6900,12 @@ function sanitizeApprovalPatch(
   // Every other tool: no client-side patch is meaningful at approval
   // time. The user reviewed the original input; that's what runs.
   return undefined;
+}
+
+/** A recorded native point codeoid will act on: two plain ids, nothing else. */
+function isNativeRef(ref: unknown): ref is NonNullable<Extract<CanonicalTurn, { role: "assistant" }>["native"]> {
+  if (!ref || typeof ref !== "object") return false;
+  const r = ref as Record<string, unknown>;
+  const id = (v: unknown) => typeof v === "string" && /^[A-Za-z0-9-]{8,128}$/.test(v);
+  return id(r.backingId) && id(r.ref) && (r.dir === undefined || (typeof r.dir === "string" && r.dir.startsWith("/")));
 }

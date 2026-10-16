@@ -152,11 +152,18 @@ export async function writeClaudeSession(
   opts: { sessionId: string; cwd: string; configDir?: string },
 ): Promise<string> {
   const dir = join(opts.configDir ?? claudeConfigDir(), "projects", claudeProjectDirName(opts.cwd));
-  mkdirSync(dir, { recursive: true });
+  // Owner-only when we create it: project dir names reveal workdir paths.
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
   const path = join(dir, `${opts.sessionId}.jsonl`);
   const tmp = `${path}.${process.pid}.tmp`;
-  await writeFile(tmp, `${entries.map((e) => JSON.stringify(e)).join("\n")}\n`, { mode: 0o600 });
-  await rename(tmp, path);
+  try {
+    // `wx`: never through a file someone placed there.
+    await writeFile(tmp, `${entries.map((e) => JSON.stringify(e)).join("\n")}\n`, { mode: 0o600, flag: "wx" });
+    await rename(tmp, path);
+  } catch (err) {
+    await rm(tmp, { force: true }).catch(() => {});
+    throw err;
+  }
   return path;
 }
 

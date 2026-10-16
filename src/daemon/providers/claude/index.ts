@@ -115,7 +115,7 @@ export function packPluginsOption(dirs?: readonly string[]): { plugins?: { type:
 
 /** The SDK's session-file functions native continuation uses; injectable for tests. */
 export interface ClaudeNativeSdk {
-  forkSession(sessionId: string, opts: { upToMessageId: string }): Promise<{ sessionId: string }>;
+  forkSession(sessionId: string, opts: { upToMessageId: string; dir?: string }): Promise<{ sessionId: string }>;
   getSessionMessages(sessionId: string, opts: { dir: string }): Promise<ReadonlyArray<{ uuid: string }>>;
 }
 
@@ -479,7 +479,12 @@ export class ClaudeProvider implements SessionProvider {
     const tag = `[claude-provider ${this.#init.sessionId.slice(0, 8)}]`;
     if (req.forkFrom) {
       try {
-        const { sessionId } = await sdk.forkSession(req.forkFrom.backingId, { upToMessageId: req.forkFrom.ref });
+        // With the source's project dir, the SDK looks there only, never across
+        // every project on the machine.
+        const { sessionId } = await sdk.forkSession(req.forkFrom.backingId, {
+          upToMessageId: req.forkFrom.ref,
+          ...(req.forkFrom.dir ? { dir: req.forkFrom.dir } : {}),
+        });
         this.#adoptBacking(sessionId);
         return { via: "fork", backingId: sessionId };
       } catch (err) {
@@ -682,6 +687,7 @@ export class ClaudeProvider implements SessionProvider {
     const mcpServers = Object.keys(merged).length > 0 ? merged : undefined;
 
     // skillAllowRules computed above (used in the rebuild guard).
+    this.#translateState.cwd = opts.workdir;
     this.#query = query({
       prompt: this.#inputQueue,
       options: {
@@ -1359,6 +1365,8 @@ export interface TranslateState {
    * ends in Claude's own session, so a fork can be cut there (#387).
    */
   lastChainUuid?: string | null;
+  /** The cwd the query runs in — where Claude files the session (#387). */
+  cwd?: string;
 }
 
 /**
@@ -1537,7 +1545,9 @@ export function translateSDKMessage(
                 ? r.result
                 : undefined),
           // A zero-turn run left nothing in the session to fork at.
-          ...(sessionId && chainEnd && !zeroTurn ? { nativeRef: { backingId: sessionId, ref: chainEnd } } : {}),
+          ...(sessionId && chainEnd && !zeroTurn
+            ? { nativeRef: { backingId: sessionId, ref: chainEnd, ...(state.cwd ? { dir: state.cwd } : {}) } }
+            : {}),
         };
         emit({ type: "turn_done", result: normalized });
         // Stay warm — keep the queue open for the next turn.

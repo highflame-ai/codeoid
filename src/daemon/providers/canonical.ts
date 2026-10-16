@@ -43,6 +43,12 @@ export interface CanonicalToolCall {
   success: boolean;
   /** Original provider name before normalization ("Read", "Bash"). */
   originalName?: string;
+  /**
+   * A tool_result hook replaced the output (redaction): `output` is what
+   * codeoid keeps, and the backend's own record still holds the original — so
+   * a native fork, which copies that record, must not be used (#387).
+   */
+  redacted?: boolean;
 }
 
 export type CanonicalTurn =
@@ -82,6 +88,13 @@ export type CanonicalTurn =
        * or rewind to here can continue that conversation natively.
        */
       native?: NativeTurnRef;
+      /**
+       * Rebuilt from a displayed transcript (an imported bundle, or a session
+       * from before the canonical log), not recorded from the backend: its
+       * text and tool calls aren't trusted to be the model's own, so they are
+       * never replayed to a backend in the assistant's voice (#387).
+       */
+      restored?: boolean;
     };
 
 // ── Tool name normalization ───────────────────────────────────────────────────
@@ -357,7 +370,7 @@ export class CanonicalHistoryAccumulator {
   #currentThinking = "";
   #currentTools = new Map<
     string, // sdkToolUseId
-    { id: string; name: string; originalName?: string; input: Record<string, unknown>; output?: string; success?: boolean }
+    { id: string; name: string; originalName?: string; input: Record<string, unknown>; output?: string; success?: boolean; redacted?: boolean }
   >();
 
   /**
@@ -442,6 +455,7 @@ export class CanonicalHistoryAccumulator {
         if (partial) {
           partial.output = limitToolOutput(partial.name, event.output);
           partial.success = event.success;
+          if (event.redacted) partial.redacted = true;
         }
         break;
       }
