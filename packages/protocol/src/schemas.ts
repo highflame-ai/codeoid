@@ -596,7 +596,7 @@ export const sessionCompareSchema = z.object({
 
 const routineRef = z.string().min(1).max(LIMITS.ID_MAX);
 const routineScheduleSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("cron"), expr: z.string().min(1).max(256), timezone: z.string().min(1).max(64) }),
+  z.object({ kind: z.literal("cron"), expr: z.string().min(1).max(256), timezone: z.string().min(1).max(64).optional() }),
   z.object({ kind: z.literal("every"), seconds: z.number().int().positive() }),
   z.object({ kind: z.literal("once"), at: z.string().min(1).max(64) }),
 ]);
@@ -682,6 +682,7 @@ export const routineRunsSchema = z.object({
   routine: routineRef,
   limit: z.number().int().min(1).max(200).optional(),
   before: z.string().min(1).max(64).optional(),
+  runId: z.string().min(1).max(64).optional(),
 });
 export const routineTokenSchema = z.object({ ...base, type: z.literal("routine.token"), routine: routineRef });
 export const routinePreviewSchema = z.object({

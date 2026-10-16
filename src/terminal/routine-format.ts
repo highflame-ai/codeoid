@@ -5,7 +5,11 @@
 
 import { readFileSync } from "node:fs";
 import type { RoutineRunWire, RoutineScheduleWire, RoutineSpecWire, RoutineWire } from "../protocol/types.js";
-import { hostTimezone, parseInterval } from "../daemon/routines/schedule.js";
+import { isAbsolute, resolve } from "node:path";
+import { parseInterval } from "../daemon/routines/schedule.js";
+
+/** A relative path means relative to where the command was typed, not the daemon's cwd. `~` is the daemon's to expand. */
+const absWorkdir = (p: string): string => (isAbsolute(p) || p.startsWith("~") ? p : resolve(p));
 
 /** Flags shared by `routine add` and `routine edit` (commander's camelCased options). */
 export interface RoutineFlags {
@@ -56,7 +60,8 @@ export function scheduleFromFlags(f: RoutineFlags): RoutineScheduleWire | null |
     if (given > 0) throw new RoutineFlagError("--no-schedule can't be combined with a schedule");
     return null;
   }
-  if (f.cron !== undefined) return { kind: "cron", expr: f.cron, timezone: f.tz ?? hostTimezone() };
+  // No --tz: the daemon decides — its own zone on add, the routine's current one on edit.
+  if (f.cron !== undefined) return { kind: "cron", expr: f.cron, ...(f.tz !== undefined ? { timezone: f.tz } : {}) };
   if (f.tz !== undefined) throw new RoutineFlagError("--tz applies to --cron");
   if (f.every !== undefined) {
     try {
@@ -91,9 +96,9 @@ export function specFromFlags(
   }
   if (mode === "add") {
     if (out.prompt === undefined) throw new RoutineFlagError("a prompt is required: --prompt \"…\" or --prompt-file <path>");
-    out.workdir = f.workdir ?? process.cwd();
+    out.workdir = absWorkdir(f.workdir ?? ".");
   } else if (f.workdir !== undefined) {
-    out.workdir = f.workdir;
+    out.workdir = absWorkdir(f.workdir);
   }
   const schedule = scheduleFromFlags(f);
   if (schedule !== undefined) out.schedule = schedule;

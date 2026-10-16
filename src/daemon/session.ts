@@ -1493,12 +1493,16 @@ export class Session {
     return null;
   }
   /**
-   * The agent's final message of the most recent turn — like `claude -p`'s
-   * result, without the narration between tool calls. Falls back to the
-   * whole turn's text when that block isn't known (after a restore).
+   * The agent's final message in the most recent turn — like `claude -p`'s
+   * result, without the narration between tool calls. Null when the newest
+   * turn is not the agent's, or it wrote nothing: never an older turn's reply.
+   * Falls back to the whole turn's text when the last block isn't known (after
+   * a restore).
    */
   get lastAssistantMessage(): string | null {
-    return this.#accumulator.lastTextBlock ?? this.lastAssistantText;
+    const last = this.#accumulator.history.at(-1);
+    if (!last || last.role !== "assistant") return null;
+    return this.#accumulator.lastTextBlock ?? (last.content || null);
   }
   /** Number of turns (user + assistant) in the canonical history. */
   get historyLength(): number { return this.#accumulator.history.length; }

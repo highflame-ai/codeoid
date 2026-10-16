@@ -78,6 +78,8 @@ function cronFor(expr: string, timezone: string): Cron {
   }
 }
 
+const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,9})?)?(Z|[+-]\d{2}:?\d{2})$/i;
+
 /** Validate and normalise a schedule; throws ScheduleError with a useful message. */
 export function validateSchedule(
   s: RoutineSchedule,
@@ -112,8 +114,13 @@ export function validateSchedule(
       return { kind: "every", seconds: s.seconds };
     }
     case "once": {
-      const at = new Date(s.at);
-      if (Number.isNaN(at.getTime())) throw new ScheduleError(`"${s.at}" is not a timestamp — use ISO 8601, e.g. 2026-11-02T09:00:00+08:00`);
+      // ISO 8601 with an explicit zone only: `new Date()` would also take
+      // "10/20" (the year 2001) or a zone-less time read in the daemon's zone.
+      const at = ISO_INSTANT.test(s.at.trim()) ? new Date(s.at.trim()) : new Date(Number.NaN);
+      if (Number.isNaN(at.getTime())) {
+        throw new ScheduleError(`"${s.at}" is not an ISO 8601 time with a zone — e.g. 2026-11-02T09:00:00+08:00 or 2026-11-02T01:00:00Z`);
+      }
+      if (at.getTime() <= (opts.now ?? new Date()).getTime()) throw new ScheduleError(`${at.toISOString()} is in the past`);
       return { kind: "once", at: at.toISOString() };
     }
   }

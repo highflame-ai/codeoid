@@ -27,9 +27,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that parks on an approval ends `needs_attention` and keeps tracking its
   spend after you approve. Fresh runs can each get their own git worktree.
 
-  Routines need the new owner-tier `routine:manage` scope (not in the operator
-  share preset) plus `session:create` and `session:send`; an autonomous
-  routine, or one with a check, also needs `session:approve`. Runs are
+  A routine is its owner's alone: teammates in the tenant can't see or touch
+  it. Every routine command needs the new owner-tier `routine:manage` scope
+  (not in the operator share preset); changes also need `session:create` and
+  `session:send`, plus `session:approve` for an autonomous routine or one with
+  a check, and are refused to delegated tokens. Check commands run with a
+  scrubbed environment, never the daemon's secrets. Runs are
   attributed to `routine:<name>` under their owner in transcripts and the
   audit log. Outcomes reach your devices as a content-blind push (`notify`
   policy) and every run fires the new `routine_end` hook. Config:

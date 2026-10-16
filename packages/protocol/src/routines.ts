@@ -3,12 +3,20 @@
  * API call, or on demand — unattended, inside budgets the owner sets.
  *
  * Scopes:
- *   - reading (`routine.list`, `routine.get`, `routine.runs`, `routine.preview`): `session:list`;
+ *   - `routine.preview` (no routine involved): `session:list`;
+ *   - reading routines and runs (`routine.list`, `routine.get`, `routine.runs`):
+ *     `routine:manage` — prompts, check commands, check output and payloads
+ *     are not for read-only share tokens;
  *   - changing anything (create, update, delete, run, cancel, token): `routine:manage`,
  *     plus `session:create` and `session:send` — a routine creates and prompts
  *     sessions on its owner's behalf, so it can never grant more than they hold.
  *     An autonomous routine, or one with a check command, also needs
- *     `session:approve`: it pre-approves tool use and host commands.
+ *     `session:approve`: it pre-approves tool use and host commands. A
+ *     delegated token (an agent acting for someone) cannot change routines:
+ *     a routine is standing authority, and delegation is meant to be narrow.
+ *
+ * A routine is its owner's alone: another user in the same tenant sees no
+ * routine of theirs, by id or by name.
  *
  * Every request names its routine by id or by name (`routine`).
  */
@@ -16,7 +24,8 @@
 // ── Shapes ────────────────────────────────────────────────────────────────────
 
 export type RoutineScheduleWire =
-  | { kind: "cron"; expr: string; timezone: string }
+  /** `timezone` is IANA; omitted on input, the daemon's zone (or, on edit, the routine's current one). Always set on output. */
+  | { kind: "cron"; expr: string; timezone?: string }
   | { kind: "every"; seconds: number }
   | { kind: "once"; at: string };
 
@@ -169,6 +178,8 @@ export interface RoutineRunsMsg {
   routine: string;
   limit?: number;
   before?: string;
+  /** Just this run (empty when it is not one of this routine's). */
+  runId?: string;
 }
 
 /** Mint a new API token (the old one stops working immediately). */

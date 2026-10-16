@@ -63,9 +63,10 @@ describe("specFromFlags", () => {
     }
   });
 
-  it("cron without --tz uses this machine's zone", () => {
-    const s = scheduleFromFlags({ cron: "0 9 * * *" });
-    expect(s && s.kind === "cron" && s.timezone.length > 0).toBe(true);
+  it("cron without --tz leaves the zone to the daemon, and a relative workdir is made absolute here", () => {
+    expect(scheduleFromFlags({ cron: "0 9 * * *" })).toEqual({ kind: "cron", expr: "0 9 * * *" });
+    expect(specFromFlags("x", { workdir: "sub/dir" }, "edit")).toEqual({ workdir: join(process.cwd(), "sub/dir") });
+    expect(specFromFlags("x", { workdir: "~/repo" }, "edit")).toEqual({ workdir: "~/repo" });
   });
 });
 

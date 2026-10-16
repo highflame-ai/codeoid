@@ -84,11 +84,15 @@ describe("interval schedules", () => {
 
 describe("one-off schedules", () => {
   it("fires once, then is exhausted", () => {
-    const s = validateSchedule({ kind: "once", at: "2026-11-02T09:00:00+08:00" });
+    const s = validateSchedule({ kind: "once", at: "2026-11-02T09:00:00+08:00" }, { now: new Date("2026-10-16T00:00:00Z") });
     expect(s).toEqual({ kind: "once", at: "2026-11-02T01:00:00.000Z" });
     expect(iso(nextFireAfter(s, new Date("2026-10-16T00:00:00Z")))).toBe("2026-11-02T01:00:00.000Z");
     expect(nextFireAfter(s, new Date("2026-11-02T01:00:00Z"))).toBeNull();
-    expect(() => validateSchedule({ kind: "once", at: "next tuesday" })).toThrow("not a timestamp");
+    expect(() => validateSchedule({ kind: "once", at: "next tuesday" })).toThrow("not an ISO 8601 time with a zone");
+    // Date() would read these as 2001-10-20 and as daemon-local time; neither is what anyone meant.
+    expect(() => validateSchedule({ kind: "once", at: "10/20" })).toThrow("not an ISO 8601 time with a zone");
+    expect(() => validateSchedule({ kind: "once", at: "2026-11-02T09:00:00" })).toThrow("not an ISO 8601 time with a zone");
+    expect(() => validateSchedule({ kind: "once", at: "2026-10-01T00:00:00Z" }, { now: new Date("2026-10-16T00:00:00Z") })).toThrow("in the past");
   });
 });
 

@@ -1005,10 +1005,17 @@ routine
       process.stderr.write(`run ${runId.slice(0, 8)} started — waiting`);
       for (;;) {
         await new Promise((r) => setTimeout(r, 2_000));
-        const got = await c.request({ type: "routine.get", id: randomUUID(), routine: name, runs: 20 });
-        if (got.type !== "routine.snapshot") return c.printError(got);
-        const run = got.runs?.find((r) => r.id === runId);
-        if (run && !["queued", "checking", "running"].includes(run.status)) {
+        // By id, so a busy routine's newer runs can't push this one out of view.
+        const got = await c.request({ type: "routine.runs", id: randomUUID(), routine: res.run.routineId, runId });
+        if (got.type !== "routine.runs.result") return c.printError(got);
+        const run = got.runs[0];
+        if (!run) {
+          process.stderr.write("\n");
+          console.error(`run ${runId.slice(0, 8)} is gone (the routine was deleted, or its history trimmed)`);
+          process.exitCode = 1;
+          return;
+        }
+        if (!["queued", "checking", "running"].includes(run.status)) {
           process.stderr.write("\n");
           console.log(formatRun(run).join("\n"));
           if (["failed", "timed_out", "over_budget"].includes(run.status)) process.exitCode = 1;

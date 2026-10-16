@@ -168,7 +168,7 @@ describe("routine lifecycle through the protocol", () => {
 
     // Audit names the routine as the actor of its run.
     const audits = store.database.query("SELECT subject, action FROM audit_log WHERE action LIKE 'routine.%' ORDER BY id").all() as Array<{ subject: string; action: string }>;
-    expect(audits.map((a) => a.action)).toEqual(["routine.create", "routine.fire", "routine.run.queued", "routine.run.finished"]);
+    expect(audits.map((a) => a.action)).toEqual(["routine.create", "routine.fire", "routine.run.queued", "routine.run.started", "routine.run.finished"]);
     expect(audits.at(-1)!.subject).toBe(`routine:${created.routine.id}`);
   });
 
@@ -264,10 +264,46 @@ describe("authority", () => {
     expect(up).toMatchObject({ type: "response.error", code: "forbidden" });
   });
 
-  it("a watcher can read routines but not fire them", async () => {
+  it("a read-only token can't read routines (prompts, checks, payloads) or fire them", async () => {
     await create({});
-    expect((await call({ type: "routine.list" }, WATCHER)).type).toBe("routine.list.result");
-    expect(await call({ type: "routine.run", routine: "triage" }, WATCHER)).toMatchObject({ code: "forbidden" });
+    for (const msg of [{ type: "routine.list" }, { type: "routine.get", routine: "triage" }, { type: "routine.runs", routine: "triage" }, { type: "routine.run", routine: "triage" }]) {
+      expect(await call(msg, WATCHER)).toMatchObject({ code: "forbidden", error: "Missing scope: routine:manage" });
+    }
+    // A schedule preview reveals nothing, so session:list is enough.
+    expect((await call({ type: "routine.preview", schedule: { kind: "every", seconds: 900 } }, WATCHER)).type).toBe("routine.preview.result");
+  });
+
+  it("a routine is its owner's: a teammate in the same tenant can't see, change, fire, or re-token it", async () => {
+    const { routine } = await create({ api: true });
+    const fired = (await call({ type: "routine.run", routine: "triage" })) as RoutineRunResultMsg;
+    await settled();
+    const TEAMMATE: AuthContext = { ...OWNER, sub: "spiffe://t/user/teammate" };
+    const list = await call({ type: "routine.list" }, TEAMMATE);
+    expect(list.type === "routine.list.result" && list.routines).toEqual([]);
+    for (const ref of ["triage", routine.id]) {
+      for (const msg of [
+        { type: "routine.get", routine: ref },
+        { type: "routine.update", routine: ref, spec: { prompt: "something else" } },
+        { type: "routine.run", routine: ref },
+        { type: "routine.token", routine: ref },
+        { type: "routine.delete", routine: ref },
+      ]) {
+        expect(await call(msg, TEAMMATE)).toMatchObject({ code: "not_found" });
+      }
+    }
+    expect(await call({ type: "routine.cancel_run", runId: fired.run.id }, TEAMMATE)).toMatchObject({ code: "not_found" });
+    // ...and their own routine of the same name is theirs alone.
+    expect((await create({}, TEAMMATE)).routine.ownerSub).toBe(TEAMMATE.sub);
+  });
+
+  it("a delegated token can read routines but not create or change them", async () => {
+    await create({});
+    const AGENT: AuthContext = { ...OWNER, delegationDepth: 1, delegatedBy: OWNER.sub };
+    expect((await call({ type: "routine.list" }, AGENT)).type).toBe("routine.list.result");
+    const made = await call({ type: "routine.create", spec: { name: "y", prompt: "p", workdir: repo } }, AGENT);
+    expect(made).toMatchObject({ code: "forbidden" });
+    expect(made.type === "response.error" && made.error).toContain("delegated");
+    expect(await call({ type: "routine.update", routine: "triage", enabled: false }, AGENT)).toMatchObject({ code: "forbidden" });
   });
 
   it("another tenant can't see, read, fire, or cancel anything — by name or by id", async () => {

@@ -7,9 +7,10 @@
  *
  * The one piece of concurrency logic lives here, in `claimFire`: a scheduled
  * fire is claimed by a compare-and-set on `next_fire_at`. Only the caller that
- * moves it from the value it read wins, so two ticks — two timers in one
- * daemon, or two daemons sharing a database — can never both start the same
- * fire. That is the "tick lock", without a lock file to go stale.
+ * moves it from the value it read wins, so two overlapping ticks can never
+ * both start the same fire. That is the "tick lock", without a lock file to
+ * go stale. It covers claiming only: starting queued runs and boot recovery
+ * assume one daemon per database, which is how codeoid runs.
  */
 
 import { Database } from "bun:sqlite";
@@ -100,8 +101,11 @@ export class RoutineStore {
         created_at             INTEGER NOT NULL,
         updated_at             INTEGER NOT NULL
       );
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_routines_tenant_name
-        ON routines(account_id, project_id, name);
+      -- Names are unique per owner: a routine is its owner's alone, so a
+      -- teammate's choice of name must neither collide nor be revealed.
+      DROP INDEX IF EXISTS idx_routines_tenant_name;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_routines_owner_name
+        ON routines(account_id, project_id, owner_sub, name);
       CREATE INDEX IF NOT EXISTS idx_routines_due
         ON routines(enabled, next_fire_at);
 
@@ -165,7 +169,7 @@ export class RoutineStore {
   /** Replace the spec (and the schedule state that depends on it). */
   updateRoutine(
     id: string,
-    patch: { spec: RoutineSpec; enabled: boolean; pausedReason: string | null; nextFireAt: number | null; anchorAt: number },
+    patch: { spec: RoutineSpec; enabled: boolean; pausedReason: string | null; nextFireAt: number | null; anchorAt: number; resetStreak: boolean },
     now: number,
   ): void {
     this.#db
@@ -181,8 +185,8 @@ export class RoutineStore {
         patch.pausedReason,
         patch.nextFireAt,
         patch.anchorAt,
-        // Re-enabling resets the failure streak; otherwise it is kept.
-        patch.enabled && patch.pausedReason === null ? 1 : 0,
+        // Only resuming resets the failure streak; an edit keeps it.
+        patch.resetStreak ? 1 : 0,
         now,
         id,
       );
@@ -197,18 +201,18 @@ export class RoutineStore {
     return row ? toRoutine(row) : undefined;
   }
 
-  getRoutineByName(accountId: string, projectId: string, name: string): RoutineRow | undefined {
+  getRoutineByName(accountId: string, projectId: string, ownerSub: string, name: string): RoutineRow | undefined {
     const row = this.#db
-      .prepare("SELECT * FROM routines WHERE account_id = ? AND project_id = ? AND name = ?")
-      .get(accountId, projectId, name) as RoutineDbRow | null;
+      .prepare("SELECT * FROM routines WHERE account_id = ? AND project_id = ? AND owner_sub = ? AND name = ?")
+      .get(accountId, projectId, ownerSub, name) as RoutineDbRow | null;
     return row ? toRoutine(row) : undefined;
   }
 
-  listRoutines(accountId: string, projectId: string): RoutineRow[] {
+  listRoutines(accountId: string, projectId: string, ownerSub: string): RoutineRow[] {
     return (
       this.#db
-        .prepare("SELECT * FROM routines WHERE account_id = ? AND project_id = ? ORDER BY name")
-        .all(accountId, projectId) as RoutineDbRow[]
+        .prepare("SELECT * FROM routines WHERE account_id = ? AND project_id = ? AND owner_sub = ? ORDER BY name")
+        .all(accountId, projectId, ownerSub) as RoutineDbRow[]
     ).map(toRoutine);
   }
 
@@ -370,15 +374,42 @@ export class RoutineStore {
   }
 
   /** Session ids of finished runs, newest first — retention picks from here. */
-  finishedRunSessions(routineId: string): Array<{ runId: string; sessionId: string }> {
+  /** The newest `limit` finished runs that had a session, newest first. */
+  finishedRunSessions(routineId: string, limit: number): Array<{ runId: string; sessionId: string }> {
     const ph = ACTIVE_RUN_STATUSES.map(() => "?").join(", ");
     return this.#db
       .prepare(
         `SELECT id AS runId, session_id AS sessionId FROM routine_runs
          WHERE routine_id = ? AND session_id IS NOT NULL AND status NOT IN (${ph})
-         ORDER BY created_at DESC, rowid DESC`,
+         ORDER BY created_at DESC, rowid DESC LIMIT ?`,
       )
-      .all(routineId, ...ACTIVE_RUN_STATUSES) as Array<{ runId: string; sessionId: string }>;
+      .all(routineId, ...ACTIVE_RUN_STATUSES, limit) as Array<{ runId: string; sessionId: string }>;
+  }
+
+  /**
+   * When the last run that dealt with its input started: the newest
+   * `succeeded` or `silent` run. A check asking "anything new since?" must not
+   * skip what a failed, cancelled or parked run found and left undone.
+   */
+  lastHandledStart(routineId: string): number | null {
+    const row = this.#db
+      .prepare(
+        "SELECT started_at AS t FROM routine_runs WHERE routine_id = ? AND status IN ('succeeded', 'silent') AND started_at IS NOT NULL ORDER BY created_at DESC, rowid DESC LIMIT 1",
+      )
+      .get(routineId) as { t: number } | null;
+    return row?.t ?? null;
+  }
+
+  /** Keep a routine's newest `keep` finished runs; delete the rest. */
+  trimRuns(routineId: string, keep: number): void {
+    const ph = ACTIVE_RUN_STATUSES.map(() => "?").join(", ");
+    this.#db
+      .prepare(
+        `DELETE FROM routine_runs WHERE routine_id = ? AND status NOT IN (${ph}) AND rowid NOT IN (
+           SELECT rowid FROM routine_runs WHERE routine_id = ? AND status NOT IN (${ph})
+           ORDER BY created_at DESC, rowid DESC LIMIT ?)`,
+      )
+      .run(routineId, ...ACTIVE_RUN_STATUSES, routineId, ...ACTIVE_RUN_STATUSES, keep);
   }
 
   /** The last run that produced a summary — feeds {{last_summary}}. */
@@ -404,9 +435,13 @@ export class RoutineStore {
     this.#db.prepare("DELETE FROM routine_runs WHERE routine_id = ?").run(routineId);
   }
 
-  /** Mark every in-flight run as interrupted — boot recovery after a crash or restart. */
+  /**
+   * Boot recovery: runs that were checking or running belong to a process that
+   * is gone, so they are closed as interrupted. Queued runs never started and
+   * stay queued — an API fire answered 202 still runs after a restart.
+   */
   interruptActiveRuns(now: number, reason: string): RunRow[] {
-    const active = this.activeRuns();
+    const active = this.activeRuns().filter((r) => r.status !== "queued");
     for (const r of active) this.updateRun(r.id, { status: "interrupted", endedAt: now, reason });
     return active;
   }

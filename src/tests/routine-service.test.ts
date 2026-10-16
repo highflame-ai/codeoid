@@ -5,7 +5,7 @@
  */
 
 import { beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AuthContext } from "../protocol/types.js";
@@ -44,6 +44,7 @@ interface FakeSession {
   armed: Array<{ approvals: string; budget: number }>;
   unattended: number;
   parkPolls?: number;
+  lastRole: "user" | "assistant" | null;
 }
 
 class FakeHost implements RoutineHost {
@@ -59,7 +60,7 @@ class FakeHost implements RoutineHost {
     this.sessions.set(id, {
       id,
       opts,
-      info: { status: "idle", turnQueued: false, waitingOn: null, costUsd: 0, inputTokens: 0, outputTokens: 0 },
+      info: { status: "idle", turnQueued: false, waitingOn: null, costUsd: 0, inputTokens: 0, outputTokens: 0, attachedClients: 0, historyLength: 0 },
       prompts: [],
       text: null,
       error: null,
@@ -67,6 +68,7 @@ class FakeHost implements RoutineHost {
       destroyed: false,
       armed: [],
       unattended: 0,
+      lastRole: null,
     });
     return id;
   }
@@ -80,11 +82,22 @@ class FakeHost implements RoutineHost {
   async send(id: string, text: string, sender: AuthContext): Promise<void> {
     const s = this.sessions.get(id)!;
     s.prompts.push({ text, sender });
+    s.info = { ...s.info, historyLength: s.info.historyLength + 1 };
+    s.lastRole = "user";
     const sc = this.script;
     switch (sc.kind) {
       case "reply":
-        s.info = { ...s.info, status: "idle", costUsd: s.info.costUsd + (sc.cost ?? 0.01), inputTokens: s.info.inputTokens + 100, outputTokens: s.info.outputTokens + 20 };
-        s.text = sc.text;
+        s.info = {
+          ...s.info,
+          status: "idle",
+          costUsd: s.info.costUsd + (sc.cost ?? 0.01),
+          inputTokens: s.info.inputTokens + 100,
+          outputTokens: s.info.outputTokens + 20,
+          historyLength: s.info.historyLength + 1,
+        };
+        s.lastRole = "assistant";
+        // An empty reply is a turn that wrote no text (tools only).
+        s.text = sc.text || null;
         s.error = null;
         break;
       case "park":
@@ -114,9 +127,10 @@ class FakeHost implements RoutineHost {
     }
     return s.info;
   }
-  result(id: string) {
+  result(id: string, sinceHistory: number) {
     const s = this.sessions.get(id)!;
-    return { text: s.text, error: s.error };
+    const answered = s.info.historyLength > sinceHistory && s.lastRole === "assistant";
+    return { text: answered ? s.text : null, error: s.error };
   }
   beginUnattended(id: string): () => void {
     const s = this.sessions.get(id)!;
@@ -147,7 +161,8 @@ class FakeHost implements RoutineHost {
     return ["claude", "codex"];
   }
   normalizeWorkdir(p: string): string | null {
-    return p === WORKDIR || p === "~/repo" ? WORKDIR : null;
+    if (p === "~/repo") return WORKDIR;
+    return existsSync(p) ? p : null;
   }
 }
 
@@ -350,7 +365,8 @@ describe("run outcomes", () => {
     s.info = { ...s.info, status: "thinking", waitingOn: null, costUsd: 0.2 };
     svc.onSessionStatus(s.id);
     expect(store.getRun(run!.id)!.costUsd).toBe(0.2);
-    s.info = { ...s.info, status: "idle", costUsd: 0.3, inputTokens: 900 };
+    s.info = { ...s.info, status: "idle", costUsd: 0.3, inputTokens: 900, historyLength: s.info.historyLength + 1 };
+    s.lastRole = "assistant";
     s.text = "Cleaned build/ and rebuilt.";
     svc.onSessionStatus(s.id);
     expect(store.getRun(run!.id)).toMatchObject({ status: "needs_attention", costUsd: 0.3, inputTokens: 900, summary: "Cleaned build/ and rebuilt." });
@@ -549,6 +565,212 @@ describe("policies", () => {
     expect(host.notified.map((n) => [n.routine.spec.name, n.run.status])).toEqual([["loud", "silent"]]);
     // Hooks are automation, not alerts: they see every run whatever the policy.
     expect(host.finished.map((n) => [n.routine.spec.name, n.push])).toEqual([["quiet", false], ["loud", true]]);
+  });
+});
+
+describe("sessions that outlive their runs", () => {
+  it("a persistent session that is parked or in use gets no new prompt — the fire stands down", async () => {
+    const { routine } = create({ session: "persistent", approvals: "guarded" });
+    host.script = { kind: "park", waitingOn: "waiting for approval to run Bash" };
+    svc.fire(routine, "manual", null, "owner");
+    await settle();
+    const s = [...host.sessions.values()][0]!;
+    // Parked on the owner: the next fire must not stack a prompt into that turn.
+    svc.fire(store.getRoutine(routine.id)!, "manual", null, "owner");
+    await settle();
+    expect(store.listRuns(routine.id, { limit: 1 })[0]).toMatchObject({ status: "skipped", reason: "the routine's session is busy or waiting on you" });
+    expect(s.prompts).toHaveLength(1);
+    // Someone is mid-turn in it: same.
+    s.info = { ...s.info, status: "thinking", waitingOn: null };
+    svc.onSessionStatus(s.id);
+    svc.fire(store.getRoutine(routine.id)!, "manual", null, "owner");
+    await settle();
+    expect(s.prompts).toHaveLength(1);
+    // Idle again: the routine uses it.
+    s.info = { ...s.info, status: "idle" };
+    svc.onSessionStatus(s.id);
+    host.script = { kind: "reply", text: "done" };
+    svc.fire(store.getRoutine(routine.id)!, "manual", null, "owner");
+    await settle();
+    expect(s.prompts).toHaveLength(2);
+  });
+
+  it("a turn that writes no text never inherits the previous run's reply", async () => {
+    const { routine } = create({ session: "persistent" });
+    host.script = { kind: "reply", text: "[SILENT]" };
+    svc.fire(routine, "manual", null, "owner");
+    await settle();
+    host.script = { kind: "reply", text: "" };
+    svc.fire(store.getRoutine(routine.id)!, "manual", null, "owner");
+    await settle();
+    // Not "silent" on the strength of the last run's [SILENT], and no stale summary.
+    expect(store.listRuns(routine.id, { limit: 1 })[0]).toMatchObject({ status: "succeeded", summary: null });
+  });
+
+  it("retention never destroys a session someone is attached to, or one still working", async () => {
+    const { routine } = create({ keepSessions: 1 });
+    for (let i = 0; i < 3; i++) {
+      svc.fire(store.getRoutine(routine.id)!, "manual", null, "owner");
+      await settle();
+    }
+    const [s1, s2] = [...host.sessions.values()];
+    expect(s1!.destroyed && s2!.destroyed).toBe(true);
+    // Now one with a reader, one the owner continued.
+    s1!.destroyed = false;
+    s2!.destroyed = false;
+    s1!.info = { ...s1!.info, attachedClients: 1 };
+    s2!.info = { ...s2!.info, status: "thinking" };
+    svc.fire(store.getRoutine(routine.id)!, "manual", null, "owner");
+    await settle();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(s1!.destroyed).toBe(false);
+    expect(s2!.destroyed).toBe(false);
+  });
+});
+
+describe("lifecycle edges", () => {
+  it("CODEOID_ROUTINE_SINCE is when the last run that finished its work started — not a failed one", async () => {
+    const { routine } = create({ check: { command: 'echo "since=$CODEOID_ROUTINE_SINCE"', timeoutSeconds: 10 } });
+    svc.fire(routine, "manual", null, "owner");
+    await settle();
+    const ok = store.listRuns(routine.id, { limit: 1 })[0]!;
+    clock += 60_000;
+    host.script = { kind: "error", error: "boom" };
+    svc.fire(store.getRoutine(routine.id)!, "manual", null, "owner");
+    await settle();
+    clock += 60_000;
+    host.script = { kind: "reply", text: "ok" };
+    svc.fire(store.getRoutine(routine.id)!, "manual", null, "owner");
+    await settle();
+    const prompts = [...host.sessions.values()].map((s) => s.prompts[0]!.text);
+    expect(prompts[0]).toContain("since=\n");
+    // The failed run found something and didn't deal with it: the window still starts at the good run.
+    expect(prompts[2]).toContain(`since=${new Date(ok.startedAt!).toISOString()}`);
+  });
+
+  it("the check runs without the daemon's secrets", async () => {
+    process.env.CODEOID_API_KEY = "zid_sk_leak";
+    process.env.TELEGRAM_BOT_TOKEN = "123:leak";
+    try {
+      const { routine } = create({ check: { command: "env", timeoutSeconds: 10 } });
+      svc.fire(routine, "manual", null, "owner");
+      await settle();
+      const text = [...host.sessions.values()][0]!.prompts[0]!.text;
+      expect(text).toContain("CODEOID_ROUTINE=nightly");
+      expect(text).not.toContain("leak");
+    } finally {
+      delete process.env.CODEOID_API_KEY;
+      delete process.env.TELEGRAM_BOT_TOKEN;
+    }
+  });
+
+  it("cancelling a run stops its check at once", async () => {
+    const { routine } = create({ check: { command: "sleep 30", timeoutSeconds: 60 } });
+    const run = svc.fire(routine, "manual", null, "owner");
+    for (let i = 0; i < 100 && store.getRun(run.id)!.status !== "checking"; i++) await new Promise((r) => setTimeout(r, 5));
+    const t0 = Date.now();
+    expect(svc.cancelRun(store.getRun(run.id)!, "owner")).toBe(true);
+    for (let i = 0; i < 200 && store.activeRuns().length > 0; i++) await new Promise((r) => setTimeout(r, 5));
+    expect(store.getRun(run.id)).toMatchObject({ status: "cancelled", reason: "cancelled by owner" });
+    expect(Date.now() - t0).toBeLessThan(2_000);
+    expect(host.audits).toContain("owner routine.run.cancel");
+  });
+
+  it("a daemon stop ends in-flight runs as interrupted, and leaves queued ones to run after restart", async () => {
+    const a = create({ name: "a" }).routine;
+    const b = create({ name: "b" }).routine;
+    const c = create({ name: "c" }).routine;
+    host.script = { kind: "hang" };
+    svc.fire(a, "manual", null, "owner");
+    svc.fire(b, "manual", null, "owner");
+    const queued = svc.fire(c, "manual", null, "owner"); // two slots: this one waits
+    await new Promise((r) => setTimeout(r, 0));
+    svc.stop();
+    for (let i = 0; i < 200 && store.activeRuns().some((r) => r.status === "running"); i++) await new Promise((r) => setTimeout(r, 0));
+    expect(store.listRuns(a.id, { limit: 1 })[0]).toMatchObject({ status: "interrupted" });
+    expect(store.getRun(queued.id)!.status).toBe("queued");
+    // A boot leaves it queued too, and it runs.
+    host.script = { kind: "reply", text: "done" };
+    const next = makeService();
+    next.start();
+    expect(store.getRun(queued.id)!.status).toBe("queued");
+    svc = next;
+    await svc.tick();
+    await settle();
+    next.stop();
+    expect(store.getRun(queued.id)!.status).toBe("succeeded");
+  });
+
+  it("hooks hear about runs that never started: a skip, a cancelled queued run, a boot interruption", async () => {
+    const { routine } = create({ overlap: "skip" });
+    host.script = { kind: "hang" };
+    svc.fire(routine, "manual", null, "owner");
+    svc.fire(store.getRoutine(routine.id)!, "manual", null, "owner");
+    await new Promise((r) => setTimeout(r, 0));
+    expect(host.finished.map((e) => [e.run.status, e.push])).toEqual([["skipped", false]]);
+  });
+
+  it("pause and resume work even when the workdir is gone; only resuming resets the failure streak", () => {
+    const dir = mkdtempSync(join(tmpdir(), "rt-gone-"));
+    const { routine } = create({ workdir: dir, failurePauseAfter: 5 });
+    store.recordOutcome(routine.id, { at: clock, failed: true });
+    store.recordOutcome(routine.id, { at: clock, failed: true });
+    // An unrelated edit keeps the streak.
+    svc.update(store.getRoutine(routine.id)!, { spec: { maxMinutes: 20 } }, "owner");
+    expect(store.getRoutine(routine.id)!.consecutiveFailures).toBe(2);
+    rmSync(dir, { recursive: true, force: true });
+    svc.update(store.getRoutine(routine.id)!, { enabled: false }, "owner");
+    expect(store.getRoutine(routine.id)!.consecutiveFailures).toBe(2);
+    svc.update(store.getRoutine(routine.id)!, { enabled: true }, "owner");
+    expect(store.getRoutine(routine.id)).toMatchObject({ enabled: true, consecutiveFailures: 0 });
+    // An edit that touches the spec does re-check it.
+    expect(() => svc.update(store.getRoutine(routine.id)!, { spec: { maxMinutes: 30 } }, "owner")).toThrow("workdir not found");
+  });
+
+  it("a routine paused while its run waited doesn't start it — unless the owner ran it by hand", async () => {
+    const { routine } = create({ overlap: "queue" });
+    host.script = { kind: "hang" };
+    const first = svc.fire(routine, "manual", null, "owner");
+    const behind = svc.fire(store.getRoutine(routine.id)!, "api", null, "owner");
+    const byHand = create({ name: "byhand" }).routine;
+    svc.update(store.getRoutine(routine.id)!, { enabled: false }, "owner");
+    svc.update(byHand, { enabled: false }, "owner");
+    const manual = svc.fire(store.getRoutine(byHand.id)!, "manual", null, "owner");
+    host.script = { kind: "reply", text: "ok" };
+    await new Promise((r) => setTimeout(r, 0));
+    svc.cancelRun(store.getRun(first.id)!, "owner");
+    await settle();
+    expect(store.getRun(behind.id)).toMatchObject({ status: "skipped", reason: "the routine was paused before this run started" });
+    expect(store.getRun(manual.id)!.status).toBe("succeeded");
+  });
+
+  it("one routine whose stored schedule broke doesn't stop the others firing", async () => {
+    const bad = create({ name: "bad", schedule: { kind: "every", seconds: 3600 } }).routine;
+    const good = create({ name: "good", schedule: { kind: "every", seconds: 3600 } }).routine;
+    // As if an ICU update dropped the zone it was saved with.
+    store.updateRoutine(
+      bad.id,
+      {
+        spec: { ...bad.spec, schedule: { kind: "cron", expr: "0 9 * * *", timezone: "Gone/Zone" } },
+        enabled: true,
+        pausedReason: null,
+        nextFireAt: bad.nextFireAt,
+        anchorAt: bad.anchorAt,
+        resetStreak: false,
+      },
+      clock,
+    );
+    clock = (good.nextFireAt as number) + 1;
+    await svc.tick();
+    await settle();
+    expect(store.listRuns(good.id, { limit: 1 })[0]!.status).toBe("succeeded");
+  });
+
+  it("run history is trimmed to the newest runs", () => {
+    const { routine } = create({});
+    for (let i = 0; i < 510; i++) svc.fire(store.getRoutine(routine.id)!, "manual", "x".repeat(10), "owner");
+    // Synchronous fires overlap-skip; each skip is a finished run.
+    expect(store.countRuns(routine.id, "manual", 0)).toBeLessThanOrEqual(501);
   });
 });
 

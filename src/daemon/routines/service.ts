@@ -30,6 +30,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import type { AuthContext } from "../../protocol/types.js";
+import { buildSubprocessEnv } from "../providers/env.js";
 import { BUDGET_STOP_MESSAGE } from "../providers/interface.js";
 import {
   jitterMs as jitterFor,
@@ -37,6 +38,7 @@ import {
   previewFires,
   validateSchedule,
   ScheduleError,
+  hostTimezone,
   type RoutineSchedule,
 } from "./schedule.js";
 import { hashToken, type RoutineStore } from "./store.js";
@@ -100,6 +102,8 @@ export const LIMITS = {
   CHECK_OUTPUT_MAX: 64_000,
   PAYLOAD_MAX: 16_000,
   SUMMARY_MAX: 4_000,
+  /** Finished runs kept per routine; older history is deleted. */
+  RUN_HISTORY: 500,
   TOOL_BUDGET_MAX: 1_000,
   MAX_MINUTES_MAX: 24 * 60,
   KEEP_SESSIONS_MAX: 100,
@@ -117,6 +121,10 @@ export interface RunSessionInfo {
   costUsd: number;
   inputTokens: number;
   outputTokens: number;
+  /** Clients attached right now — a person may be reading or typing. */
+  attachedClients: number;
+  /** Canonical history length; marks where a run's own turn begins. */
+  historyLength: number;
 }
 
 export interface CreateRunSessionOpts {
@@ -152,14 +160,17 @@ export interface RoutineHost {
   armSession(sessionId: string, approvals: RoutineSpec["approvals"], toolBudget: number): void;
   send(sessionId: string, text: string, sender: AuthContext): Promise<void>;
   info(sessionId: string): RunSessionInfo | null;
-  /** The agent's last reply, and the error that ended the last turn, if any. */
-  result(sessionId: string): { text: string | null; error: string | null };
+  /**
+   * The agent's final message — only if it answered after `sinceHistory`
+   * (so a turn that wrote nothing never inherits an older reply) — and the
+   * error that ended the last turn, if any.
+   */
+  result(sessionId: string, sinceHistory: number): { text: string | null; error: string | null };
   /** Mark the session as running unattended (provider dialogs don't park); returns the release. */
   beginUnattended(sessionId: string): () => void;
   interrupt(sessionId: string): Promise<void>;
   destroy(sessionId: string): Promise<void>;
-  /** The owner should hear about this run (push / hooks). Best effort. */
-  /** A run reached a terminal status. */
+  /** A run reached a terminal status: push per `event.push`, hooks always. Best effort. */
   runFinished(event: RoutineRunEvent): void;
   audit(subject: string, action: string, sessionId: string | undefined, detail: string): void;
   hasProvider(id: string): boolean;
@@ -254,14 +265,17 @@ export function buildPrompt(args: {
  */
 export async function runCheck(
   command: string,
-  opts: { cwd: string; timeoutSeconds: number; env: Record<string, string> },
+  opts: { cwd: string; timeoutSeconds: number; env: Record<string, string>; signal?: AbortSignal },
 ): Promise<{ code: number; stdout: string; stderr: string; timedOut: boolean }> {
   return new Promise((resolve) => {
     let child: ChildProcess;
     try {
       child = spawn("/bin/sh", ["-c", command], {
         cwd: opts.cwd,
-        env: { ...process.env, ...opts.env },
+        // A built environment, never the daemon's own: it holds the ZeroID key
+        // and bot tokens, and a check is often a script in the workdir that an
+        // autonomous agent can edit (GHSA-38vh, as for hooks and backends).
+        env: { ...checkEnv(), ...opts.env },
         stdio: ["ignore", "pipe", "pipe"],
         detached: true,
       });
@@ -296,15 +310,22 @@ export async function runCheck(
       clearTimeout(timer);
       resolve({ code: timedOut ? 124 : code, stdout: out.text(), stderr: err.text(), timedOut });
     };
-    const timer = setTimeout(() => {
-      timedOut = true;
+    const killGroup = () => {
       try {
         // Negative pid: the process group the detached shell leads.
         if (child.pid) process.kill(-child.pid, "SIGKILL");
       } catch {}
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killGroup();
       // Don't wait for pipes a surviving grandchild might still hold.
       done(124);
     }, opts.timeoutSeconds * 1000);
+    opts.signal?.addEventListener("abort", () => {
+      killGroup();
+      done(130);
+    }, { once: true });
     child.on("error", (e) => {
       err.push(Buffer.from(e.message));
       done(127);
@@ -313,16 +334,40 @@ export async function runCheck(
   });
 }
 
+/**
+ * The check's environment: the shared safe basics, plus what tools commonly
+ * need to find their own config (`gh`, `kubectl`) — never codeoid's secrets.
+ * More names pass with `CODEOID_AGENT_ENV_ALLOW`, as for every subprocess.
+ */
+function checkEnv(): Record<string, string> {
+  return buildSubprocessEnv({ prefixes: ["XDG_"], exact: ["GH_CONFIG_DIR", "GH_HOST", "KUBECONFIG"] });
+}
+
 // ── Spec validation ──────────────────────────────────────────────────────────
 
+/** A schedule as it arrives: a cron may leave its timezone to the daemon. */
+export type RoutineScheduleInput = RoutineSchedule | { kind: "cron"; expr: string; timezone?: string };
+
 /** A spec as it arrives over the wire: name/prompt/workdir required, everything else defaulted. */
-export type RoutineSpecInput = Omit<Partial<RoutineSpec>, "check"> &
+export type RoutineSpecInput = Omit<Partial<RoutineSpec>, "check" | "schedule"> &
   Pick<RoutineSpec, "name" | "prompt" | "workdir"> & {
     /** `timeoutSeconds` defaults to 60. */
     check?: { command: string; timeoutSeconds?: number };
+    schedule?: RoutineScheduleInput;
   };
 
+/** Fill a cron's missing timezone with the daemon's — where it fires. */
+function withZone(s: RoutineScheduleInput): RoutineSchedule {
+  return s.kind === "cron" && !s.timezone ? { ...s, timezone: hostTimezone() } : (s as RoutineSchedule);
+}
+
 const NAME_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+
+/** Statuses that are a run's real outcome — they move "last run" and the failure streak. */
+const OUTCOME_RUN_STATUSES: readonly RunStatus[] = ["succeeded", "silent", "needs_attention", "failed", "timed_out", "over_budget"];
+
+/** How many rows past the keep count a prune pass re-examines. */
+const PRUNE_WINDOW = 20;
 
 // ── The service ──────────────────────────────────────────────────────────────
 
@@ -333,6 +378,10 @@ interface LiveRun {
   /** Wakes the wait loop early (a status change, a cancel). */
   wake: () => void;
   cancelled: string | null;
+  /** Set with `cancelled` when the daemon is stopping: the run ends interrupted, not cancelled. */
+  interrupted: boolean;
+  /** Kills a running check. */
+  abort: AbortController;
 }
 
 export class RoutineService {
@@ -351,7 +400,7 @@ export class RoutineService {
    * agent finish later; its spend and reply still belong to that run (and to
    * the daily cap), so they are folded in when the session settles.
    */
-  readonly #parked = new Map<string, { runId: string; base: Pick<RunRow, "costUsd" | "inputTokens" | "outputTokens"> }>();
+  readonly #parked = new Map<string, { runId: string; base: Pick<RunRow, "costUsd" | "inputTokens" | "outputTokens">; history: number }>();
   #stopped = false;
 
   constructor(
@@ -385,6 +434,7 @@ export class RoutineService {
     const orphaned = this.#store.interruptActiveRuns(this.#now(), "the daemon stopped while this run was in flight");
     for (const r of orphaned) {
       this.#host.audit(`routine:${r.routineId}`, "routine.run.interrupted", r.sessionId ?? undefined, `run=${r.id}`);
+      this.#announce(r.routineId, r.id);
     }
     this.#timer = setInterval(() => void this.tick(), this.config.tickMs);
   }
@@ -395,7 +445,9 @@ export class RoutineService {
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = null;
     for (const live of this.#live.values()) {
-      live.cancelled = "the daemon is shutting down";
+      live.cancelled = "the daemon stopped while this run was in flight";
+      live.interrupted = true;
+      live.abort.abort();
       live.wake();
     }
   }
@@ -406,7 +458,15 @@ export class RoutineService {
     this.#ticking = true;
     try {
       const now = this.#now();
-      for (const r of this.#store.listDue(now)) this.#fireScheduled(r, now);
+      for (const r of this.#store.listDue(now)) {
+        // One routine whose stored schedule can no longer be evaluated must
+        // not starve every routine due after it.
+        try {
+          this.#fireScheduled(r, now);
+        } catch (err) {
+          console.error(`[codeoid/routines] routine ${r.id} could not fire: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
       this.#drainQueue();
     } catch (err) {
       console.error(`[codeoid/routines] tick failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -447,7 +507,9 @@ export class RoutineService {
   #admit(r: RoutineRow, trigger: RunTrigger, opts: { scheduledFor: number | null; payload: string | null }): RunRow {
     const active = this.#store.activeRuns(r.id);
     if (active.length > 0) {
-      const queued = active.some((a) => a.status === "queued");
+      // A run already started still reads "queued" until its session exists;
+      // only one that hasn't started is waiting behind.
+      const queued = active.some((a) => a.status === "queued" && !this.#live.has(a.id));
       if (r.spec.overlap === "skip" || queued) {
         return this.#recordSkip(
           r,
@@ -508,7 +570,17 @@ export class RoutineService {
     };
     this.#store.insertRun(run);
     this.#host.audit(`routine:${r.id}`, "routine.run.skipped", undefined, `run=${run.id} trigger=${trigger} reason=${reason}`);
+    this.#announce(r.id, run.id);
+    this.#store.trimRuns(r.id, LIMITS.RUN_HISTORY);
     return run;
+  }
+
+  /** Tell hooks (and, per policy, the owner) that a run ended outside #execute. */
+  #announce(routineId: string, runId: string): void {
+    const routine = this.#store.getRoutine(routineId);
+    const run = this.#store.getRun(runId);
+    if (!routine || !run) return;
+    this.#host.runFinished({ routine, run, paused: false, push: this.#shouldNotify(routine.spec.notify, run.status, false) });
   }
 
   /** Start queued runs, oldest first, while slots are free. */
@@ -522,9 +594,24 @@ export class RoutineService {
         this.#store.setRunStatus(run.id, "cancelled", { endedAt: this.#now(), reason: "the routine was deleted" });
         continue;
       }
+      // A routine paused while this run waited (an auto-pause, say) doesn't
+      // start it. A manual run is the owner asking explicitly, so it still runs.
+      if (!routine.enabled && run.trigger !== "manual") {
+        this.#store.setRunStatus(run.id, "skipped", { endedAt: this.#now(), reason: "the routine was paused before this run started" });
+        this.#announce(routine.id, run.id);
+        continue;
+      }
       // One in flight per routine: a queued run waits for its predecessor.
       if ([...this.#live.values()].some((l) => l.routineId === routine.id)) continue;
-      const live: LiveRun = { runId: run.id, routineId: routine.id, sessionId: null, wake: () => {}, cancelled: null };
+      const live: LiveRun = {
+        runId: run.id,
+        routineId: routine.id,
+        sessionId: null,
+        wake: () => {},
+        cancelled: null,
+        interrupted: false,
+        abort: new AbortController(),
+      };
       this.#live.set(run.id, live);
       void this.#execute(routine, run, live).finally(() => {
         this.#live.delete(run.id);
@@ -544,7 +631,12 @@ export class RoutineService {
       const endedAt = this.#now();
       this.#store.setRunStatus(run.id, status, { ...extra, endedAt });
       const failed = FAILURE_RUN_STATUSES.includes(status);
-      const streak = this.#store.recordOutcome(routine.id, { at: endedAt, failed });
+      // A run that never got to do its work (skipped, cancelled, interrupted)
+      // is not an outcome: it neither breaks a failure streak nor moves
+      // "last run".
+      const streak = OUTCOME_RUN_STATUSES.includes(status)
+        ? this.#store.recordOutcome(routine.id, { at: endedAt, failed })
+        : routine.consecutiveFailures;
       let paused = false;
       if (failed && spec.failurePauseAfter > 0 && streak >= spec.failurePauseAfter) {
         this.#store.setPaused(routine.id, `paused after ${streak} consecutive failed runs`, endedAt);
@@ -556,8 +648,12 @@ export class RoutineService {
       // A routine deleted mid-run has nobody left to tell.
       const current = this.#store.getRoutine(routine.id);
       if (current) this.#host.runFinished({ routine: current, run: final, paused, push: this.#shouldNotify(spec.notify, status, paused) });
+      this.#store.trimRuns(routine.id, LIMITS.RUN_HISTORY);
       return final;
     };
+    /** A cancel and a daemon stop both end the run; only one is the owner's doing. */
+    const stopped = (extra: Partial<RunRow> = {}): RunRow =>
+      finish(live.interrupted ? "interrupted" : "cancelled", { reason: live.cancelled, ...extra });
 
     try {
       // Daily spend cap — checked at start, not at admission, so a queued run
@@ -580,6 +676,7 @@ export class RoutineService {
 
       // 1. The check gate.
       let checkOutput: string | null = null;
+      const since = this.#store.lastHandledStart(routine.id);
       if (spec.check) {
         this.#store.setRunStatus(run.id, "checking", { startedAt });
         const res = await runCheck(spec.check.command, {
@@ -589,11 +686,12 @@ export class RoutineService {
             CODEOID_ROUTINE: spec.name,
             CODEOID_ROUTINE_ID: routine.id,
             CODEOID_ROUTINE_TRIGGER: run.trigger,
-            CODEOID_ROUTINE_LAST_RUN_AT: routine.lastRunAt ? new Date(routine.lastRunAt).toISOString() : "",
+            CODEOID_ROUTINE_SINCE: since !== null ? new Date(since).toISOString() : "",
           },
+          signal: live.abort.signal,
         });
         if (live.cancelled) {
-          finish("cancelled", { reason: live.cancelled });
+          stopped();
           return;
         }
         if (res.code !== 0) {
@@ -613,8 +711,18 @@ export class RoutineService {
       const sender = this.#ownerAuth(routine, 1);
       let sessionId: string | null = null;
       if (spec.session === "persistent" && routine.persistentSessionId) {
-        if (this.#host.sessionAlive(routine.persistentSessionId, routine.accountId, routine.projectId)) {
-          sessionId = routine.persistentSessionId;
+        const kept = routine.persistentSessionId;
+        if (this.#host.sessionAlive(kept, routine.accountId, routine.projectId)) {
+          // The routine's own conversation, but a person may be in it, or an
+          // earlier run may still be waiting on them there. A prompt sent now
+          // would join their turn, so this fire stands down instead.
+          const k = this.#host.info(kept);
+          const busy = !k || this.#parked.has(kept) || k.waitingOn !== null || k.turnQueued || (k.status !== "idle" && k.status !== "error");
+          if (busy) {
+            finish("skipped", { reason: "the routine's session is busy or waiting on you", sessionId: kept });
+            return;
+          }
+          sessionId = kept;
           this.#host.armSession(sessionId, spec.approvals, spec.toolBudget);
         }
       }
@@ -638,9 +746,10 @@ export class RoutineService {
       }
       live.sessionId = sessionId;
       this.#bySession.set(sessionId, live);
+      this.#host.audit(subject, "routine.run.started", sessionId, `run=${run.id}`);
       this.#store.setRunStatus(run.id, "running", { startedAt: run.startedAt ?? startedAt, sessionId, checkOutput: checkOutput && clip(checkOutput, 4_000) });
       if (live.cancelled) {
-        finish("cancelled", { reason: live.cancelled });
+        stopped();
         return;
       }
 
@@ -648,6 +757,7 @@ export class RoutineService {
       const baseCost = before?.costUsd ?? 0;
       const baseIn = before?.inputTokens ?? 0;
       const baseOut = before?.outputTokens ?? 0;
+      const baseHistory = before?.historyLength ?? 0;
       const usage = (): Pick<RunRow, "costUsd" | "inputTokens" | "outputTokens"> => {
         const i = this.#host.info(sessionId as string);
         return {
@@ -684,7 +794,7 @@ export class RoutineService {
         for (;;) {
           if (live.cancelled) {
             await this.#host.interrupt(sessionId).catch(() => {});
-            finish("cancelled", { reason: live.cancelled, ...usage() });
+            stopped(usage());
             return;
           }
           const info = this.#host.info(sessionId);
@@ -704,11 +814,11 @@ export class RoutineService {
             // Left parked on purpose: the owner can approve and the work goes
             // on. The run ends here; the deadline no longer applies to it.
             finish("needs_attention", { reason: info.waitingOn ?? "waiting for an approval", ...spent });
-            this.#parked.set(sessionId, { runId: run.id, base: { costUsd: baseCost, inputTokens: baseIn, outputTokens: baseOut } });
+            this.#parked.set(sessionId, { runId: run.id, base: { costUsd: baseCost, inputTokens: baseIn, outputTokens: baseOut }, history: baseHistory });
             return;
           }
           if ((info.status === "idle" || info.status === "error") && !info.turnQueued) {
-            const res = this.#host.result(sessionId);
+            const res = this.#host.result(sessionId, baseHistory);
             const summary = res.text ? clip(res.text.trim(), LIMITS.SUMMARY_MAX) : null;
             if (res.error === BUDGET_STOP_MESSAGE) {
               // The backend stopped itself at the native ceiling we handed it.
@@ -724,7 +834,7 @@ export class RoutineService {
           }
           if (this.#now() >= deadline) {
             await this.#host.interrupt(sessionId).catch(() => {});
-            const res = this.#host.result(sessionId);
+            const res = this.#host.result(sessionId, baseHistory);
             finish("timed_out", {
               reason: `ran past its ${spec.maxMinutes}-minute limit and was stopped`,
               summary: res.text ? clip(res.text.trim(), LIMITS.SUMMARY_MAX) : null,
@@ -767,7 +877,7 @@ export class RoutineService {
       // The owner answered and the agent finished: the run keeps its status
       // (it did need attention) but now carries what the agent went on to do.
       this.#parked.delete(sessionId);
-      const text = this.#host.result(sessionId).text?.trim();
+      const text = this.#host.result(sessionId, parked.history).text?.trim();
       this.#store.updateRun(parked.runId, { ...usage, ...(text && !isSilentReply(text) ? { summary: clip(text, LIMITS.SUMMARY_MAX) } : {}) });
     } else {
       this.#store.updateRun(parked.runId, usage);
@@ -791,15 +901,22 @@ export class RoutineService {
     }
   }
 
-  /** Destroy run sessions past the routine's keep count (fresh sessions only; never a parked one). */
+  /**
+   * Destroy run sessions past the routine's keep count (fresh sessions only).
+   * Never one in use: parked on the owner, still working, or with someone
+   * attached — a kept run session is an ordinary session people continue.
+   */
   async #prune(routineId: string): Promise<void> {
     const routine = this.#store.getRoutine(routineId);
     if (!routine || routine.spec.session !== "fresh") return;
-    const finished = this.#store.finishedRunSessions(routineId);
+    // Each pass clears everything past the keep count, so only the newest few
+    // rows past it can still hold a live session; older ones were handled.
+    const finished = this.#store.finishedRunSessions(routineId, routine.spec.keepSessions + PRUNE_WINDOW);
     for (const { sessionId } of finished.slice(routine.spec.keepSessions)) {
       const info = this.#host.info(sessionId);
       if (!info) continue;
-      if (info.status === "waiting_approval" || info.waitingOn) continue;
+      if (this.#parked.has(sessionId) || info.waitingOn || info.attachedClients > 0) continue;
+      if ((info.status !== "idle" && info.status !== "error") || info.turnQueued) continue;
       await this.#host.destroy(sessionId).catch(() => {});
     }
   }
@@ -820,8 +937,13 @@ export class RoutineService {
 
   // ── Management API (called by SessionManager handlers) ────────────────────
 
-  /** Validate and fill a spec. Throws RoutineError("invalid_request"). */
-  normalizeSpec(input: RoutineSpecInput): RoutineSpec {
+  /**
+   * Validate and fill a spec. Throws RoutineError("invalid_request").
+   * `keptSchedule`: the schedule is unchanged from a saved routine, so it is
+   * not re-judged against today's clock and minimum interval (a one-off that
+   * already fired must not block an unrelated edit).
+   */
+  normalizeSpec(input: RoutineSpecInput, opts: { keptSchedule?: boolean } = {}): RoutineSpec {
     const bad = (m: string): never => {
       throw new RoutineError(m, "invalid_request");
     };
@@ -836,9 +958,11 @@ export class RoutineService {
       bad(`unknown provider "${input.provider}" — available: ${this.#host.providerIds().join(", ")}`);
     }
     let schedule: RoutineSchedule | undefined;
-    if (input.schedule) {
+    if (input.schedule && opts.keptSchedule) {
+      schedule = withZone(input.schedule);
+    } else if (input.schedule) {
       try {
-        schedule = validateSchedule(input.schedule, { minIntervalSeconds: this.config.minIntervalSeconds, now: new Date(this.#now()) });
+        schedule = validateSchedule(withZone(input.schedule), { minIntervalSeconds: this.config.minIntervalSeconds, now: new Date(this.#now()) });
       } catch (err) {
         bad(err instanceof ScheduleError ? err.message : String(err));
       }
@@ -899,7 +1023,7 @@ export class RoutineService {
   /** Create a routine. Returns it, plus the API token once when `api` is on. */
   create(owner: RoutineOwner, input: RoutineSpecInput): { routine: RoutineRow; apiToken: string | null } {
     const spec = this.normalizeSpec(input);
-    if (this.#store.getRoutineByName(owner.accountId, owner.projectId, spec.name)) {
+    if (this.#store.getRoutineByName(owner.accountId, owner.projectId, owner.sub, spec.name)) {
       throw new RoutineError(`a routine named "${spec.name}" already exists`, "conflict");
     }
     const now = this.#now();
@@ -933,19 +1057,30 @@ export class RoutineService {
    */
   update(
     r: RoutineRow,
-    patch: { spec?: Partial<RoutineSpec> & { schedule?: RoutineSchedule | null; check?: RoutineSpec["check"] | null }; enabled?: boolean },
+    patch: { spec?: Omit<Partial<RoutineSpec>, "schedule" | "check"> & { schedule?: RoutineScheduleInput | null; check?: RoutineSpec["check"] | null }; enabled?: boolean },
     actor: string,
   ): { routine: RoutineRow; apiToken: string | null } {
     const now = this.#now();
-    const merged: RoutineSpecInput = { ...r.spec, ...(patch.spec ?? {}) } as RoutineSpecInput;
-    // `null` clears an optional block.
-    if (patch.spec && "schedule" in patch.spec && patch.spec.schedule === null) delete merged.schedule;
-    if (patch.spec && "check" in patch.spec && patch.spec.check === null) delete merged.check;
-    for (const k of ["maxCostUsd", "dailyCostUsd", "provider", "model"] as const) {
-      if (patch.spec && k in patch.spec && (patch.spec as Record<string, unknown>)[k] === null) delete merged[k];
+    let spec = r.spec;
+    // Pause and resume touch nothing else, so they never fail on a spec the
+    // world has moved under (a deleted workdir, a backend turned off).
+    if (patch.spec) {
+      const merged: RoutineSpecInput = { ...r.spec, ...patch.spec } as RoutineSpecInput;
+      // `null` clears an optional block.
+      if ("schedule" in patch.spec && patch.spec.schedule === null) delete merged.schedule;
+      if ("check" in patch.spec && patch.spec.check === null) delete merged.check;
+      for (const k of ["maxCostUsd", "dailyCostUsd", "provider", "model"] as const) {
+        if (k in patch.spec && (patch.spec as Record<string, unknown>)[k] === null) delete merged[k];
+      }
+      // A cron without a timezone keeps the one it had.
+      const s = merged.schedule;
+      if (s?.kind === "cron" && !s.timezone && r.spec.schedule?.kind === "cron") {
+        merged.schedule = { ...s, timezone: r.spec.schedule.timezone };
+      }
+      const keptSchedule = JSON.stringify(merged.schedule ?? null) === JSON.stringify(r.spec.schedule ?? null);
+      spec = this.normalizeSpec(merged, { keptSchedule });
     }
-    const spec = this.normalizeSpec(merged);
-    if (spec.name !== r.spec.name && this.#store.getRoutineByName(r.accountId, r.projectId, spec.name)) {
+    if (spec.name !== r.spec.name && this.#store.getRoutineByName(r.accountId, r.projectId, r.ownerSub, spec.name)) {
       throw new RoutineError(`a routine named "${spec.name}" already exists`, "conflict");
     }
     const enabled = patch.enabled ?? r.enabled;
@@ -958,7 +1093,7 @@ export class RoutineService {
     else if (scheduleChanged || reEnabled || nextFireAt === null || spec.jitterSeconds !== r.spec.jitterSeconds) {
       nextFireAt = this.#nextFire(base, spec.schedule, new Date(now));
     }
-    this.#store.updateRoutine(r.id, { spec, enabled, pausedReason: enabled ? null : r.pausedReason, nextFireAt, anchorAt }, now);
+    this.#store.updateRoutine(r.id, { spec, enabled, pausedReason: enabled ? null : r.pausedReason, nextFireAt, anchorAt, resetStreak: reEnabled }, now);
     let apiToken: string | null = null;
     if (spec.api && !this.#store.hasApiToken(r.id)) {
       apiToken = newApiToken(r.id);
@@ -966,7 +1101,19 @@ export class RoutineService {
     } else if (!spec.api && this.#store.hasApiToken(r.id)) {
       this.#store.setApiTokenHash(r.id, null, now);
     }
-    this.#host.audit(actor, "routine.update", undefined, `routine=${r.id} enabled=${enabled}`);
+    // Name what changed, with old → new for what decides how runs behave.
+    const changed = (Object.keys(spec) as Array<keyof RoutineSpec>).filter((k) => JSON.stringify(spec[k]) !== JSON.stringify(r.spec[k]));
+    for (const k of Object.keys(r.spec) as Array<keyof RoutineSpec>) if (!(k in spec) && !changed.includes(k)) changed.push(k);
+    const shown = (["approvals", "workdir", "provider", "api"] as const)
+      .filter((k) => changed.includes(k))
+      .map((k) => `${k}:${String(r.spec[k] ?? "-")}->${String(spec[k] ?? "-")}`);
+    if (changed.includes("check")) shown.push(`check:${JSON.stringify(r.spec.check?.command ?? null)}->${JSON.stringify(spec.check?.command ?? null)}`);
+    this.#host.audit(
+      actor,
+      "routine.update",
+      undefined,
+      `routine=${r.id} enabled=${r.enabled}->${enabled} changed=${changed.join(",") || "-"}${shown.length ? ` ${shown.join(" ")}` : ""}`,
+    );
     return { routine: this.#store.getRoutine(r.id) as RoutineRow, apiToken };
   }
 
@@ -983,6 +1130,7 @@ export class RoutineService {
     for (const live of this.#live.values()) {
       if (live.routineId === r.id) {
         live.cancelled = "the routine was deleted";
+        live.abort.abort();
         live.wake();
       }
     }
@@ -1016,21 +1164,23 @@ export class RoutineService {
     const live = this.#live.get(run.id);
     if (live) {
       live.cancelled = `cancelled by ${actor}`;
+      live.abort.abort();
       live.wake();
-      return true;
-    }
-    if (run.status === "queued") {
+    } else if (run.status === "queued") {
       this.#store.setRunStatus(run.id, "cancelled", { endedAt: this.#now(), reason: `cancelled by ${actor}` });
-      return true;
+      this.#announce(run.routineId, run.id);
+    } else {
+      return false;
     }
-    return false;
+    this.#host.audit(actor, "routine.run.cancel", run.sessionId ?? undefined, `routine=${run.routineId} run=${run.id}`);
+    return true;
   }
 
   /** Next fire times for a schedule, without saving anything — previews and validation. */
-  preview(schedule: RoutineSchedule, n: number): string[] {
+  preview(schedule: RoutineScheduleInput, n: number): string[] {
     let s: RoutineSchedule;
     try {
-      s = validateSchedule(schedule, { minIntervalSeconds: this.config.minIntervalSeconds, now: new Date(this.#now()) });
+      s = validateSchedule(withZone(schedule), { minIntervalSeconds: this.config.minIntervalSeconds, now: new Date(this.#now()) });
     } catch (err) {
       throw new RoutineError(err instanceof ScheduleError ? err.message : String(err), "invalid_request");
     }

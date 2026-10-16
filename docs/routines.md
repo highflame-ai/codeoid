@@ -67,10 +67,11 @@ Leave it off and the routine runs autonomously within a tool-call budget (50 by 
 ```bash
 --cron "0 9 * * 1-5" --tz Europe/London   # standard 5-field cron, in an IANA timezone
 --every 15m                               # 90s, 15m, 1h30m, 2d, …
---at 2026-10-20T07:00:00Z                 # once; the routine is unscheduled afterwards
+--at 2026-10-20T07:00:00Z                 # once, ISO 8601 with a zone; unscheduled afterwards
 ```
 
-Cron without `--tz` uses the daemon machine's zone, and daylight-saving changes are handled the way the zone defines them.
+Cron without `--tz` uses the daemon machine's zone (on `edit`, the routine keeps the zone it had), and daylight-saving changes are handled the way the zone defines them.
+A one-off `--at` must be a future ISO 8601 time with an explicit zone (`Z` or `+08:00`), so it can't be misread.
 `--every` fires stay on their original phase: a 15-minute routine created at 10:07 fires at :07, :22, :37 and :52, however long each run takes.
 The shortest allowed interval is 60 seconds (`routines.minIntervalSeconds`), and a cron pattern that never matches, or fires more often than that, is rejected when you save it.
 
@@ -92,11 +93,18 @@ It runs with `/bin/sh -c` in the workdir before any agent starts:
 - **Exit 0 with output:** the agent starts, and the output reaches it as `{{check}}` (up to 64 KB; anything past that is cut, and the agent is told so).
 - **Non-zero exit or timeout:** the run `failed`, with the check's output kept for you to read. A timed-out check is killed along with everything it started.
 
-The check sees `CODEOID_ROUTINE`, `CODEOID_ROUTINE_ID`, `CODEOID_ROUTINE_TRIGGER` and `CODEOID_ROUTINE_LAST_RUN_AT`, so it can ask "anything new since the last run?":
+The check sees `CODEOID_ROUTINE`, `CODEOID_ROUTINE_ID`, `CODEOID_ROUTINE_TRIGGER` and `CODEOID_ROUTINE_SINCE`, so it can ask "anything new?":
 
 ```bash
---check 'gh issue list --search "created:>${CODEOID_ROUTINE_LAST_RUN_AT:-1970-01-01}" --json number,title --jq ".[]"'
+--check 'gh issue list --search "created:>=${CODEOID_ROUTINE_SINCE:-1970-01-01}" --json number,title --jq ".[]"'
 ```
+
+`CODEOID_ROUTINE_SINCE` is when the last run that dealt with its input (one that `succeeded` or was `silent`) *started*, and empty before the first.
+So nothing created while that run was working falls in a gap, and whatever a failed, cancelled or still-parked run found comes round again rather than being lost.
+
+The check does not get the daemon's environment, which holds codeoid's own secrets.
+It gets the basics (`PATH`, `HOME`, locale, proxy settings), the `XDG_*` directories, and `GH_CONFIG_DIR`, `GH_HOST` and `KUBECONFIG`, so tools find their own logins.
+Pass anything else it needs by name with `CODEOID_AGENT_ENV_ALLOW=NAME1,NAME2`, the same switch the agent backends use.
 
 Good checks are cheap and print nothing when all is well: `git status --porcelain`, `gh pr list --search "review-requested:@me"`, `curl -fsS …/health || echo down`.
 
@@ -130,12 +138,17 @@ So a routine that asks "is anything wrong?" stays quiet on the days when nothing
 | `failed` | The check failed, the agent errored, or the session went away. Counts toward the failure pause. |
 | `timed_out` | It ran past `--max-minutes` and was interrupted. Counts toward the failure pause. |
 | `over_budget` | It crossed `--max-cost` and was stopped. Counts toward the failure pause. |
-| `skipped` | It didn't run: the last run was still going (`--overlap skip`), the daily spend cap was reached, or the fire was missed during downtime. |
+| `skipped` | It didn't run: the last run was still going (`--overlap skip`), a persistent routine's session was busy or waiting on you, the daily spend cap was reached, the routine was paused before it started, or the fire was missed during downtime. |
 | `cancelled` | You cancelled it (`codeoid routine cancel <runId>`). |
 | `interrupted` | The daemon stopped while it was in flight. |
 
 A `needs_attention` run keeps tracking its session after it ends.
 When you approve and the agent finishes, the run's cost and summary are updated, so the spend counts toward the daily cap and the history shows what was actually done.
+From the moment it parks, the run's `--max-minutes` and codeoid's in-flight spend check no longer apply: the work goes on because you approved it, as in any session.
+
+The summary is the agent's final message, not the commentary it wrote between tool calls.
+Each routine keeps its newest 500 runs.
+Retention (`--keep`) removes old run sessions, but never one that is parked on you, still working, or that someone has open.
 
 ## Triggers
 
@@ -167,8 +180,9 @@ With the default `on_change` policy, codeoid pushes a notification to your regis
 `always` includes those; `never` turns pushes off.
 An auto-pause after repeated failures always notifies, unless the policy is `never`.
 The push carries no content: it says a routine has something for you and opens the run's session.
+A push needs a session to open, so a run that never started an agent (a failed check, a skip, or the auto-pause a failing check causes) reaches you through the hook and `codeoid routine ls` instead.
 
-For automation, the `routine_end` [hook](hooks.md) fires after **every** run, whatever the notify policy.
+For automation, the `routine_end` [hook](hooks.md) fires after **every** run, whatever the notify policy, including runs that were skipped or never started.
 Its payload carries the routine, the full run (status, reason, summary, cost, tokens, session id), whether this run paused the routine, and `notify`: whether the policy would push for it.
 That is the place to post to Slack, open a ticket, or page someone:
 
@@ -196,15 +210,23 @@ A routine runs an agent with nobody watching, on a machine that holds your code 
 
 ### Who can do what
 
-Routines are owner-level.
-Reading them (`ls`, `show`, `runs`, `preview`) needs `session:list`.
-Creating, changing, firing and deleting them needs the `routine:manage` scope **and** `session:create` and `session:send`, because a routine creates sessions and prompts them.
+A routine belongs to the person who created it, inside the tenant (account and project) they created it in.
+Nobody else sees it, by name or by id: a teammate in the same tenant can't read, change, fire, re-token or delete it, and can use the same name for a routine of their own.
+That matters because a routine's runs act as its owner.
+
+Every routine command needs the `routine:manage` scope, reading included: a routine's prompt, check command, check output and payloads are not for read-only share tokens.
+Only `routine preview`, which saves nothing, needs just `session:list`.
+Creating, changing, firing and deleting also need `session:create` and `session:send`, because a routine creates sessions and prompts them.
 A routine that is autonomous, or that has a check, also needs `session:approve`: an autonomous run approves its own tool calls, and a check is a shell command that runs on the daemon's host without asking anyone, so only someone who could approve that command interactively may save it.
+A delegated token (an agent acting for someone) can list routines but not create or change them: a routine is standing authority, and delegation is meant to be narrow.
 `routine:manage` is not in the operator share-token preset, so a teammate you share a session with cannot schedule work on your machine.
 
-Routines belong to the tenant (account and project) they were created in.
-Runs execute as the routine's owner; in the transcript and the audit log their messages are attributed to `routine:<name>`, delegated by that owner, so you can always tell your typing from the routine's.
-Every create, change, fire, run start, run outcome and auto-pause is in the audit log.
+**A routine outlives the token that created it.**
+Scopes are checked when a routine is created or changed, not on every run, so revoking the owner's token or narrowing their scopes does not stop a routine they already saved, and an API token never expires on its own.
+To stop one, pause or delete it, revoke its API token with `--no-api`, or turn routines off for the daemon with `routines.enabled: false`.
+
+Runs act as the routine's owner; in the transcript their messages are attributed to `routine:<name>`, delegated by that owner, so you can always tell your typing from the routine's.
+The audit log records each create, change (naming the fields that changed, with old and new values for approvals, workdir, provider, the check and the API trigger), fire, run queued, started, cancelled and finished, and auto-pause; a run's own events are recorded under `routine:<id>`.
 
 The API endpoint authenticates with the routine's own token, not a ZeroID JWT.
 Tokens are stored as SHA-256 hashes and compared in constant time.
@@ -284,5 +306,7 @@ As of October 2026, from each product's public documentation; — means we found
 - **The scheduler lives in the daemon.** No daemon, no fires; missed fires are skipped or caught up once, as configured.
 - **No event triggers yet.** GitHub, Slack and similar sources are planned; until then, point their webhooks at a small relay that calls the API trigger, or poll from a check.
 - **CLI only for now.** The web UI shows a routine's run sessions (marked as routine-managed) but has no routine screen yet.
+- **The qwen backend runs read-only shell commands without asking**, even in a guarded routine (a property of qwen-code itself, described under "Qwen backend" in the repository's CLAUDE.md), so an unattended qwen routine fed outside text can read any file the daemon user can. Prefer another backend for routines that take an API payload or read untrusted input.
+- **A kept run session keeps the run's spend ceiling.** If you continue a fresh run's session yourself on Claude, its turns stop at that run's `--max-cost`; start a new session for open-ended work.
 - **The hard spend cap is Claude-only, and fresh-session-only.** Other backends, and persistent sessions, report spend when a turn ends, and a run is usually one turn, so there `--max-cost` marks the run `over_budget` (and counts toward the failure pause) rather than stopping it part-way. Backends on a subscription may report no cost at all. On those, `--max-minutes` and `--tool-budget` are the limits that actually bound a run.
 - **Account-wide connectors can add noise.** On the Claude backend, a run inherits your Claude account's connectors; if one needs signing in, the agent may mention it in its summary.

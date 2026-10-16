@@ -4668,12 +4668,23 @@ mcpHub: this.#mcpHub,
     const svc = this.#routines;
     if (!svc) return err("routines are disabled on this daemon (routines.enabled)", "invalid_request");
     const scopes = auth.scopes as string[];
-    const reads = msg.type === "routine.list" || msg.type === "routine.get" || msg.type === "routine.runs" || msg.type === "routine.preview";
-    if (reads) {
+    if (msg.type === "routine.preview") {
       if (!hasScope(scopes, SCOPES.SESSION_LIST)) return err("Missing scope: session:list", "forbidden");
     } else {
-      for (const sc of [SCOPES.ROUTINE_MANAGE, SCOPES.SESSION_CREATE, SCOPES.SESSION_SEND] as const) {
-        if (!hasScope(scopes, sc)) return err(`Missing scope: ${sc}`, "forbidden");
+      // Prompts, check commands, check output and payloads are not for
+      // read-only share tokens, so even reading needs routine:manage.
+      if (!hasScope(scopes, SCOPES.ROUTINE_MANAGE)) return err("Missing scope: routine:manage", "forbidden");
+      const reads = msg.type === "routine.list" || msg.type === "routine.get" || msg.type === "routine.runs";
+      if (!reads) {
+        for (const sc of [SCOPES.SESSION_CREATE, SCOPES.SESSION_SEND] as const) {
+          if (!hasScope(scopes, sc)) return err(`Missing scope: ${sc}`, "forbidden");
+        }
+        // A routine is standing authority that outlives the token that made
+        // it; a delegated token (an agent acting for someone) is meant to be
+        // narrow and short-lived, so it may not create or steer one.
+        if ((auth.delegationDepth ?? 0) > 0) {
+          return err("a delegated token cannot change routines — use the owner's own credential", "forbidden");
+        }
       }
     }
     /** Autonomy or a host command needs the approval scope as well. */
@@ -4682,10 +4693,15 @@ mcpHub: this.#mcpHub,
       const check = spec && "check" in spec ? spec.check : current?.spec.check;
       return (approvals ?? "autonomous") === "autonomous" || !!check;
     };
+    // A routine is its owner's alone: its runs act as them, so nobody else in
+    // the tenant may read, steer, fire, or delete it. Others get "not found".
+    const mine = (r: RoutineRow | null | undefined): r is RoutineRow =>
+      !!r && r.accountId === auth.accountId && r.projectId === auth.projectId && r.ownerSub === auth.sub;
     const resolve = (ref: string): RoutineRow | undefined => {
       const byId = svc.store.getRoutine(ref);
-      if (byId && byId.accountId === auth.accountId && byId.projectId === auth.projectId) return byId;
-      return svc.store.getRoutineByName(auth.accountId, auth.projectId, ref);
+      if (mine(byId)) return byId;
+      const byName = svc.store.getRoutineByName(auth.accountId, auth.projectId, auth.sub, ref);
+      return mine(byName) ? byName : undefined;
     };
     const wire = (r: RoutineRow) =>
       toRoutineWire(r, {
@@ -4700,7 +4716,7 @@ mcpHub: this.#mcpHub,
           return {
             type: "routine.list.result",
             requestId: msg.id,
-            routines: svc.store.listRoutines(auth.accountId, auth.projectId).map(wire),
+            routines: svc.store.listRoutines(auth.accountId, auth.projectId, auth.sub).map(wire),
           };
         case "routine.preview":
           return { type: "routine.preview.result", requestId: msg.id, fires: svc.preview(msg.schedule, msg.count ?? 5) };
@@ -4718,7 +4734,7 @@ mcpHub: this.#mcpHub,
       // Everything below names one routine (or one run).
       if (msg.type === "routine.cancel_run") {
         const run = svc.store.getRun(msg.runId);
-        if (!run || run.accountId !== auth.accountId || run.projectId !== auth.projectId) return err("Run not found", "not_found");
+        if (!run || !mine(svc.store.getRoutine(run.routineId))) return err("Run not found", "not_found");
         if (!svc.cancelRun(run, actor)) return err(`run is already ${run.status}`, "invalid_request");
         return { type: "response.ok", requestId: msg.id };
       }
@@ -4733,6 +4749,11 @@ mcpHub: this.#mcpHub,
             runs: svc.store.listRuns(r.id, { limit: msg.runs ?? 10 }).map(toRunWire),
           };
         case "routine.runs": {
+          if (msg.runId !== undefined) {
+            const one = svc.store.getRun(msg.runId);
+            const runs = one && one.routineId === r.id ? [toRunWire(one)] : [];
+            return { type: "routine.runs.result", requestId: msg.id, routineId: r.id, runs, hasMore: false };
+          }
           const before = msg.before !== undefined ? Date.parse(msg.before) : undefined;
           if (before !== undefined && Number.isNaN(before)) return err(`before is not a timestamp: ${msg.before}`, "invalid_request");
           const limit = msg.limit ?? 20;
@@ -4803,7 +4824,8 @@ mcpHub: this.#mcpHub,
           worktree = { path: wt.path, branch: wt.branch, createdByCodeoid: true };
         }
         const session = new Session({
-          name: o.name,
+          // The conductor's name is reserved for the singleton.
+          name: o.name === this.#conductorName() ? `${o.name}-routine` : o.name,
           workdir,
           ...(worktree ? { worktree } : {}),
           providerId: o.provider,
@@ -4859,11 +4881,15 @@ mcpHub: this.#mcpHub,
           // a run reports everything the model read.
           inputTokens: (i.usage?.inputTokens ?? 0) + (i.usage?.cacheReadTokens ?? 0) + (i.usage?.cacheCreationTokens ?? 0),
           outputTokens: i.usage?.outputTokens ?? 0,
+          attachedClients: s.attachedClientCount,
+          historyLength: s.historyLength,
         };
       },
-      result: (id) => {
+      result: (id, sinceHistory) => {
         const s = this.#sessions.get(id);
-        return { text: s?.lastAssistantMessage ?? null, error: s?.lastTurnError ?? null };
+        if (!s) return { text: null, error: null };
+        const answered = s.historyLength > sinceHistory && s.lastTurnRole === "assistant";
+        return { text: answered ? s.lastAssistantMessage : null, error: s.lastTurnError };
       },
       beginUnattended: (id) => this.#sessions.get(id)?.beginUnattended() ?? (() => {}),
       interrupt: async (id) => {
