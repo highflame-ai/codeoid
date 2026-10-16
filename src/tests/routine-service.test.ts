@@ -5,8 +5,9 @@
  */
 
 import { beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { AuthContext } from "../protocol/types.js";
 import {
   buildPrompt,
@@ -201,6 +202,13 @@ describe("scheduling", () => {
     expect(store.getRoutine(routine.id)!.nextFireAt).toBe((routine.nextFireAt as number) + 3_600_000);
   });
 
+  it("a claim succeeds once per planned fire — the tick lock", () => {
+    const { routine } = create({ schedule: { kind: "every", seconds: 3600 } });
+    const planned = routine.nextFireAt as number;
+    expect(store.claimFire(routine.id, planned, planned + 3_600_000, clock)).toBe(true);
+    expect(store.claimFire(routine.id, planned, planned + 3_600_000, clock)).toBe(false);
+  });
+
   it("a missed fire is skipped by default, and run once with catchUp", async () => {
     const a = create({ name: "a", schedule: { kind: "every", seconds: 3600 } }).routine;
     const b = create({ name: "b", schedule: { kind: "every", seconds: 3600 }, catchUp: true }).routine;
@@ -270,13 +278,26 @@ describe("the check gate", () => {
     expect(s.prompts[0]!.text).toContain("routine=nightly trigger=manual");
   });
 
-  it("a check that hangs is killed at its timeout", async () => {
-    const { routine } = create({ check: { command: "sleep 5", timeoutSeconds: 1 } });
+  it("a check that hangs is killed at its timeout, children and all", async () => {
+    const pidFile = join(mkdtempSync(join(tmpdir(), "rt-chk-")), "pid");
+    const { routine } = create({ check: { command: `sleep 30 & echo $! > ${pidFile}; wait`, timeoutSeconds: 1 } });
     svc.fire(routine, "manual", null, "owner");
     for (let i = 0; i < 400 && store.activeRuns().length > 0; i++) await new Promise((r) => setTimeout(r, 10));
     const [run] = store.listRuns(routine.id, { limit: 1 });
     expect(run!.status).toBe("failed");
     expect(run!.reason).toBe("check timed out after 1s");
+    // Killing only the shell would orphan the `sleep` it started.
+    const pid = Number(readFileSync(pidFile, "utf8"));
+    let alive = true;
+    for (let i = 0; i < 50 && alive; i++) {
+      try {
+        process.kill(pid, 0);
+        await new Promise((r) => setTimeout(r, 10));
+      } catch {
+        alive = false;
+      }
+    }
+    expect(alive).toBe(false);
   });
 });
 
