@@ -9,8 +9,8 @@
  * which routines exist.
  *
  * The body is the payload: JSON `{ "text": "…" }`, or any text body. It
- * reaches the agent only as delimited data in its prompt ({{payload}}), never
- * as instructions, and only when the routine's prompt is written to use it.
+ * reaches the agent only as delimited data in its prompt ({{payload}}, or
+ * appended when the prompt doesn't place it), never as instructions.
  */
 
 import { RoutineError, type RoutineService } from "./service.js";

@@ -487,6 +487,7 @@ export class CanonicalHistoryAccumulator {
   #clear(): void {
     this.#history = [];
     this.#currentTurnId = undefined;
+    this.#lastTextBlock = null;
     this.#currentText = "";
     this.#currentThinking = "";
     this.#currentTools.clear();

@@ -105,6 +105,7 @@ So nothing created while that run was working falls in a gap, and whatever a fai
 The check does not get the daemon's environment, which holds codeoid's own secrets.
 It gets the basics (`PATH`, `HOME`, locale, proxy settings), the `XDG_*` directories, and `GH_CONFIG_DIR`, `GH_HOST` and `KUBECONFIG`, so tools find their own logins.
 Pass anything else it needs by name with `CODEOID_AGENT_ENV_ALLOW=NAME1,NAME2`, the same switch the agent backends use.
+This keeps secrets out of the check's environment, not out of reach: the check runs as the daemon's user, which can read the daemon's own process environment, as the agent backends can.
 
 Good checks are cheap and print nothing when all is well: `git status --porcelain`, `gh pr list --search "review-requested:@me"`, `curl -fsS …/health || echo down`.
 
@@ -210,14 +211,19 @@ A routine runs an agent with nobody watching, on a machine that holds your code 
 
 ### Who can do what
 
-A routine belongs to the person who created it, inside the tenant (account and project) they created it in.
-Nobody else sees it, by name or by id: a teammate in the same tenant can't read, change, fire, re-token or delete it, and can use the same name for a routine of their own.
+A routine belongs to the identity that created it, inside the tenant (account and project) it was created in.
+Nobody else sees the routine itself, by name or by id: a teammate in the same tenant can't read, change, fire, re-token or delete it, and can use the same name for a routine of their own.
 That matters because a routine's runs act as its owner.
 
-Every routine command needs the `routine:manage` scope, reading included: a routine's prompt, check command, check output and payloads are not for read-only share tokens.
+**Its runs are ordinary sessions.**
+Like any session you start, a run's session is visible to your tenant under codeoid's usual session scopes: someone holding `session:watch` can read its transcript, which includes the prompt with the check output and payload, and someone holding `session:send` can prompt it.
+So don't put in a check's output, or a payload, what your tenant's watchers shouldn't read.
+Autonomy belongs to the run, not the session: when a run ends, its session is set back to guarded, so whoever prompts it afterwards gets no pre-approved tool calls.
+
+Every routine command needs the `routine:manage` scope, reading included: a routine's definition and run history are not for read-only share tokens.
 Only `routine preview`, which saves nothing, needs just `session:list`.
 Creating, changing, firing and deleting also need `session:create` and `session:send`, because a routine creates sessions and prompts them.
-A routine that is autonomous, or that has a check, also needs `session:approve`: an autonomous run approves its own tool calls, and a check is a shell command that runs on the daemon's host without asking anyone, so only someone who could approve that command interactively may save it.
+A routine that is autonomous, or that has a check, also needs `session:approve` to save, run by hand, or re-token: an autonomous run approves its own tool calls, and a check is a shell command that runs on the daemon's host without asking anyone, so only someone who could approve that command interactively may set it going.
 A delegated token (an agent acting for someone) can list routines but not create or change them: a routine is standing authority, and delegation is meant to be narrow.
 `routine:manage` is not in the operator share-token preset, so a teammate you share a session with cannot schedule work on your machine.
 
@@ -225,8 +231,14 @@ A delegated token (an agent acting for someone) can list routines but not create
 Scopes are checked when a routine is created or changed, not on every run, so revoking the owner's token or narrowing their scopes does not stop a routine they already saved, and an API token never expires on its own.
 To stop one, pause or delete it, revoke its API token with `--no-api`, or turn routines off for the daemon with `routines.enabled: false`.
 
+**Ownership follows the credential's identity.**
+On the ZeroID path a routine's owner is the identity in the token that created it, which for a `codeoid login` key is that key's agent identity.
+A different key, or the web UI's sign-in, is a different identity and won't see those routines.
+If you retire the identity a routine belongs to, stop the routine first; afterwards only `routines.enabled: false` reaches it.
+
 Runs act as the routine's owner; in the transcript their messages are attributed to `routine:<name>`, delegated by that owner, so you can always tell your typing from the routine's.
-The audit log records each create, change (naming the fields that changed, with old and new values for approvals, workdir, provider, the check and the API trigger), fire, run queued, started, cancelled and finished, and auto-pause; a run's own events are recorded under `routine:<id>`.
+The audit log records each create, change (naming the fields that changed, with old and new values for approvals, workdir, provider and the API trigger), fire, run queued, started, cancelled and finished, and auto-pause; a run's own events are recorded under `routine:<id>`.
+A check command is recorded by digest and length, never its text, so a secret in it doesn't outlive the edit that removed it; better still, keep secrets out of check commands and pass them by name with `CODEOID_AGENT_ENV_ALLOW`.
 
 The API endpoint authenticates with the routine's own token, not a ZeroID JWT.
 Tokens are stored as SHA-256 hashes and compared in constant time.
@@ -306,7 +318,8 @@ As of October 2026, from each product's public documentation; — means we found
 - **The scheduler lives in the daemon.** No daemon, no fires; missed fires are skipped or caught up once, as configured.
 - **No event triggers yet.** GitHub, Slack and similar sources are planned; until then, point their webhooks at a small relay that calls the API trigger, or poll from a check.
 - **CLI only for now.** The web UI shows a routine's run sessions (marked as routine-managed) but has no routine screen yet.
-- **The qwen backend runs read-only shell commands without asking**, even in a guarded routine (a property of qwen-code itself, described under "Qwen backend" in the repository's CLAUDE.md), so an unattended qwen routine fed outside text can read any file the daemon user can. Prefer another backend for routines that take an API payload or read untrusted input.
+- **The qwen backend runs read-only shell commands without asking**, even in a guarded routine (a property of qwen-code itself, described under "Qwen backend" in the repository's CLAUDE.md), so an unattended qwen routine fed outside text could be steered to read any file the daemon user can. codeoid refuses an API trigger on a qwen routine; a qwen routine whose check reads untrusted text (issues, emails) carries the same risk, so prefer another backend there.
+- **Routines are tied to the identity that made them** (see [Who can do what](#who-can-do-what)): another key or the web UI's sign-in won't see them, and Studio's embedded sign-in doesn't carry `routine:manage` yet.
 - **A kept run session keeps the run's spend ceiling.** If you continue a fresh run's session yourself on Claude, its turns stop at that run's `--max-cost`; start a new session for open-ended work.
 - **The hard spend cap is Claude-only, and fresh-session-only.** Other backends, and persistent sessions, report spend when a turn ends, and a run is usually one turn, so there `--max-cost` marks the run `over_budget` (and counts toward the failure pause) rather than stopping it part-way. Backends on a subscription may report no cost at all. On those, `--max-minutes` and `--tool-budget` are the limits that actually bound a run.
 - **Account-wide connectors can add noise.** On the Claude backend, a run inherits your Claude account's connectors; if one needs signing in, the agent may mention it in its summary.

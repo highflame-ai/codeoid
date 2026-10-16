@@ -374,7 +374,6 @@ export class RoutineStore {
   }
 
   /** Session ids of finished runs, newest first — retention picks from here. */
-  /** The newest `limit` finished runs that had a session, newest first. */
   finishedRunSessions(routineId: string, limit: number): Array<{ runId: string; sessionId: string }> {
     const ph = ACTIVE_RUN_STATUSES.map(() => "?").join(", ");
     return this.#db
@@ -400,16 +399,28 @@ export class RoutineStore {
     return row?.t ?? null;
   }
 
-  /** Keep a routine's newest `keep` finished runs; delete the rest. */
-  trimRuns(routineId: string, keep: number): void {
+  /**
+   * Keep a routine's newest `keep` finished runs; delete older ones — except
+   * what later runs still read: anything since `keepSince` (today's spend,
+   * which the daily cap sums), the newest summary ({{last_summary}}), and the
+   * newest handled run (CODEOID_ROUTINE_SINCE).
+   */
+  trimRuns(routineId: string, keep: number, keepSince: number): void {
     const ph = ACTIVE_RUN_STATUSES.map(() => "?").join(", ");
     this.#db
       .prepare(
-        `DELETE FROM routine_runs WHERE routine_id = ? AND status NOT IN (${ph}) AND rowid NOT IN (
-           SELECT rowid FROM routine_runs WHERE routine_id = ? AND status NOT IN (${ph})
-           ORDER BY created_at DESC, rowid DESC LIMIT ?)`,
+        `DELETE FROM routine_runs WHERE routine_id = ? AND status NOT IN (${ph}) AND created_at < ?
+           AND rowid NOT IN (
+             SELECT rowid FROM routine_runs WHERE routine_id = ? AND status NOT IN (${ph})
+             ORDER BY created_at DESC, rowid DESC LIMIT ?)
+           AND rowid NOT IN (
+             SELECT rowid FROM routine_runs WHERE routine_id = ? AND status = 'succeeded' AND summary IS NOT NULL
+             ORDER BY created_at DESC, rowid DESC LIMIT 1)
+           AND rowid NOT IN (
+             SELECT rowid FROM routine_runs WHERE routine_id = ? AND status IN ('succeeded', 'silent') AND started_at IS NOT NULL
+             ORDER BY created_at DESC, rowid DESC LIMIT 1)`,
       )
-      .run(routineId, ...ACTIVE_RUN_STATUSES, routineId, ...ACTIVE_RUN_STATUSES, keep);
+      .run(routineId, ...ACTIVE_RUN_STATUSES, keepSince, routineId, ...ACTIVE_RUN_STATUSES, keep, routineId, routineId);
   }
 
   /** The last run that produced a summary — feeds {{last_summary}}. */

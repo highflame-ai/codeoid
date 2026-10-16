@@ -4781,10 +4781,18 @@ mcpHub: this.#mcpHub,
           await svc.delete(r, actor);
           return { type: "response.ok", requestId: msg.id };
         case "routine.run": {
+          // Firing an autonomous routine, or one with a check, starts
+          // pre-approved work; it needs what saving it needed.
+          if (needsApprove(undefined, r) && !hasScope(scopes, SCOPES.SESSION_APPROVE)) {
+            return err("Missing scope: session:approve (this routine pre-approves work)", "forbidden");
+          }
           const run = svc.fire(r, "manual", msg.payload ?? null, actor);
           return { type: "routine.run.result", requestId: msg.id, run: toRunWire(run) };
         }
         case "routine.token": {
+          if (needsApprove(undefined, r) && !hasScope(scopes, SCOPES.SESSION_APPROVE)) {
+            return err("Missing scope: session:approve (this routine pre-approves work)", "forbidden");
+          }
           const apiToken = svc.rotateToken(r, actor);
           return {
             type: "routine.token.result",
@@ -4882,13 +4890,13 @@ mcpHub: this.#mcpHub,
           inputTokens: (i.usage?.inputTokens ?? 0) + (i.usage?.cacheReadTokens ?? 0) + (i.usage?.cacheCreationTokens ?? 0),
           outputTokens: i.usage?.outputTokens ?? 0,
           attachedClients: s.attachedClientCount,
-          historyLength: s.historyLength,
+          lastTurnId: s.lastTurnId,
         };
       },
-      result: (id, sinceHistory) => {
+      result: (id, sinceTurnId) => {
         const s = this.#sessions.get(id);
         if (!s) return { text: null, error: null };
-        const answered = s.historyLength > sinceHistory && s.lastTurnRole === "assistant";
+        const answered = s.lastTurnRole === "assistant" && s.lastTurnId !== null && s.lastTurnId !== sinceTurnId;
         return { text: answered ? s.lastAssistantMessage : null, error: s.lastTurnError };
       },
       beginUnattended: (id) => this.#sessions.get(id)?.beginUnattended() ?? (() => {}),

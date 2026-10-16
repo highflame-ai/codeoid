@@ -28,7 +28,7 @@
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { AuthContext } from "../../protocol/types.js";
 import { buildSubprocessEnv } from "../providers/env.js";
 import { BUDGET_STOP_MESSAGE } from "../providers/interface.js";
@@ -123,8 +123,12 @@ export interface RunSessionInfo {
   outputTokens: number;
   /** Clients attached right now — a person may be reading or typing. */
   attachedClients: number;
-  /** Canonical history length; marks where a run's own turn begins. */
-  historyLength: number;
+  /**
+   * turnId of the newest turn in the conversation. Recorded before a run's
+   * prompt, it tells the run's own reply from an older one — unlike a history
+   * length, which context rotation can shrink mid-run.
+   */
+  lastTurnId: string | null;
 }
 
 export interface CreateRunSessionOpts {
@@ -161,11 +165,11 @@ export interface RoutineHost {
   send(sessionId: string, text: string, sender: AuthContext): Promise<void>;
   info(sessionId: string): RunSessionInfo | null;
   /**
-   * The agent's final message — only if it answered after `sinceHistory`
-   * (so a turn that wrote nothing never inherits an older reply) — and the
-   * error that ended the last turn, if any.
+   * The agent's final message — only if the newest turn is the agent's and
+   * is not the turn `sinceTurnId` names (so a turn that wrote nothing never
+   * inherits an older reply) — and the error that ended the last turn, if any.
    */
-  result(sessionId: string, sinceHistory: number): { text: string | null; error: string | null };
+  result(sessionId: string, sinceTurnId: string | null): { text: string | null; error: string | null };
   /** Mark the session as running unattended (provider dialogs don't park); returns the release. */
   beginUnattended(sessionId: string): () => void;
   interrupt(sessionId: string): Promise<void>;
@@ -304,10 +308,18 @@ export async function runCheck(
     child.stderr?.on("data", (b: Buffer) => err.push(b));
     let timedOut = false;
     let settled = false;
+    const onAbort = () => {
+      // Only a check still running: once it settled, its pid may belong to
+      // someone else.
+      if (settled) return;
+      killGroup();
+      done(130);
+    };
     const done = (code: number) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      opts.signal?.removeEventListener("abort", onAbort);
       resolve({ code: timedOut ? 124 : code, stdout: out.text(), stderr: err.text(), timedOut });
     };
     const killGroup = () => {
@@ -322,10 +334,8 @@ export async function runCheck(
       // Don't wait for pipes a surviving grandchild might still hold.
       done(124);
     }, opts.timeoutSeconds * 1000);
-    opts.signal?.addEventListener("abort", () => {
-      killGroup();
-      done(130);
-    }, { once: true });
+    if (opts.signal?.aborted) onAbort();
+    else opts.signal?.addEventListener("abort", onAbort, { once: true });
     child.on("error", (e) => {
       err.push(Buffer.from(e.message));
       done(127);
@@ -356,6 +366,23 @@ export type RoutineSpecInput = Omit<Partial<RoutineSpec>, "check" | "schedule"> 
     schedule?: RoutineScheduleInput;
   };
 
+/**
+ * How the audit log names a check command: a digest and a length, never the
+ * text. A command can carry a secret (`curl -H "Authorization: …"`), and the
+ * audit log is append-only — it would outlive the edit that removed it.
+ */
+function commandDigest(command: string | undefined): string {
+  if (!command) return "none";
+  return `sha256:${createHash("sha256").update(command).digest("hex").slice(0, 16)}/${command.length}`;
+}
+
+/** Midnight UTC of the day `ms` falls in — the daily spend cap's window. */
+function utcDayStart(ms: number): number {
+  const d = new Date(ms);
+  d.setUTCHours(0, 0, 0, 0);
+  return d.getTime();
+}
+
 /** Fill a cron's missing timezone with the daemon's — where it fires. */
 function withZone(s: RoutineScheduleInput): RoutineSchedule {
   return s.kind === "cron" && !s.timezone ? { ...s, timezone: hostTimezone() } : (s as RoutineSchedule);
@@ -366,8 +393,6 @@ const NAME_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 /** Statuses that are a run's real outcome — they move "last run" and the failure streak. */
 const OUTCOME_RUN_STATUSES: readonly RunStatus[] = ["succeeded", "silent", "needs_attention", "failed", "timed_out", "over_budget"];
 
-/** How many rows past the keep count a prune pass re-examines. */
-const PRUNE_WINDOW = 20;
 
 // ── The service ──────────────────────────────────────────────────────────────
 
@@ -400,7 +425,7 @@ export class RoutineService {
    * agent finish later; its spend and reply still belong to that run (and to
    * the daily cap), so they are folded in when the session settles.
    */
-  readonly #parked = new Map<string, { runId: string; base: Pick<RunRow, "costUsd" | "inputTokens" | "outputTokens">; history: number }>();
+  readonly #parked = new Map<string, { runId: string; base: Pick<RunRow, "costUsd" | "inputTokens" | "outputTokens">; turn: string | null }>();
   #stopped = false;
 
   constructor(
@@ -464,7 +489,11 @@ export class RoutineService {
         try {
           this.#fireScheduled(r, now);
         } catch (err) {
-          console.error(`[codeoid/routines] routine ${r.id} could not fire: ${err instanceof Error ? err.message : String(err)}`);
+          // Pause it rather than retry every tick forever; the owner sees why.
+          const why = `its schedule can no longer be evaluated: ${err instanceof Error ? err.message : String(err)}`;
+          console.error(`[codeoid/routines] routine ${r.id} paused: ${why}`);
+          this.#store.setPaused(r.id, why, now);
+          this.#host.audit(`routine:${r.id}`, "routine.paused", undefined, why.slice(0, 200));
         }
       }
       this.#drainQueue();
@@ -571,7 +600,7 @@ export class RoutineService {
     this.#store.insertRun(run);
     this.#host.audit(`routine:${r.id}`, "routine.run.skipped", undefined, `run=${run.id} trigger=${trigger} reason=${reason}`);
     this.#announce(r.id, run.id);
-    this.#store.trimRuns(r.id, LIMITS.RUN_HISTORY);
+    this.#store.trimRuns(r.id, LIMITS.RUN_HISTORY, utcDayStart(this.#now()));
     return run;
   }
 
@@ -646,9 +675,13 @@ export class RoutineService {
       const final = this.#store.getRun(run.id) ?? { ...run, ...extra, status, endedAt };
       this.#host.audit(subject, "routine.run.finished", final.sessionId ?? undefined, `run=${run.id} status=${status} cost=${final.costUsd.toFixed(4)}`);
       // A routine deleted mid-run has nobody left to tell.
+      // Autonomy is the run's, not the session's: once the run is over, a
+      // kept or persistent session must not keep auto-approving for whoever
+      // prompts it next. A parked run is handed back when it settles.
+      if (live.sessionId && status !== "needs_attention") this.#host.armSession(live.sessionId, "guarded", 0);
       const current = this.#store.getRoutine(routine.id);
       if (current) this.#host.runFinished({ routine: current, run: final, paused, push: this.#shouldNotify(spec.notify, status, paused) });
-      this.#store.trimRuns(routine.id, LIMITS.RUN_HISTORY);
+      this.#store.trimRuns(routine.id, LIMITS.RUN_HISTORY, utcDayStart(endedAt));
       return final;
     };
     /** A cancel and a daemon stop both end the run; only one is the owner's doing. */
@@ -719,7 +752,9 @@ export class RoutineService {
           const k = this.#host.info(kept);
           const busy = !k || this.#parked.has(kept) || k.waitingOn !== null || k.turnQueued || (k.status !== "idle" && k.status !== "error");
           if (busy) {
-            finish("skipped", { reason: "the routine's session is busy or waiting on you", sessionId: kept });
+            // No session on the row: the owner was already told about the park,
+            // and this skip is no reason to point them at it again.
+            finish("skipped", { reason: "the routine's session is busy or waiting on you" });
             return;
           }
           sessionId = kept;
@@ -757,7 +792,7 @@ export class RoutineService {
       const baseCost = before?.costUsd ?? 0;
       const baseIn = before?.inputTokens ?? 0;
       const baseOut = before?.outputTokens ?? 0;
-      const baseHistory = before?.historyLength ?? 0;
+      const baseTurn = before?.lastTurnId ?? null;
       const usage = (): Pick<RunRow, "costUsd" | "inputTokens" | "outputTokens"> => {
         const i = this.#host.info(sessionId as string);
         return {
@@ -814,11 +849,11 @@ export class RoutineService {
             // Left parked on purpose: the owner can approve and the work goes
             // on. The run ends here; the deadline no longer applies to it.
             finish("needs_attention", { reason: info.waitingOn ?? "waiting for an approval", ...spent });
-            this.#parked.set(sessionId, { runId: run.id, base: { costUsd: baseCost, inputTokens: baseIn, outputTokens: baseOut }, history: baseHistory });
+            this.#parked.set(sessionId, { runId: run.id, base: { costUsd: baseCost, inputTokens: baseIn, outputTokens: baseOut }, turn: baseTurn });
             return;
           }
           if ((info.status === "idle" || info.status === "error") && !info.turnQueued) {
-            const res = this.#host.result(sessionId, baseHistory);
+            const res = this.#host.result(sessionId, baseTurn);
             const summary = res.text ? clip(res.text.trim(), LIMITS.SUMMARY_MAX) : null;
             if (res.error === BUDGET_STOP_MESSAGE) {
               // The backend stopped itself at the native ceiling we handed it.
@@ -834,7 +869,7 @@ export class RoutineService {
           }
           if (this.#now() >= deadline) {
             await this.#host.interrupt(sessionId).catch(() => {});
-            const res = this.#host.result(sessionId, baseHistory);
+            const res = this.#host.result(sessionId, baseTurn);
             finish("timed_out", {
               reason: `ran past its ${spec.maxMinutes}-minute limit and was stopped`,
               summary: res.text ? clip(res.text.trim(), LIMITS.SUMMARY_MAX) : null,
@@ -877,7 +912,8 @@ export class RoutineService {
       // The owner answered and the agent finished: the run keeps its status
       // (it did need attention) but now carries what the agent went on to do.
       this.#parked.delete(sessionId);
-      const text = this.#host.result(sessionId, parked.history).text?.trim();
+      this.#host.armSession(sessionId, "guarded", 0);
+      const text = this.#host.result(sessionId, parked.turn).text?.trim();
       this.#store.updateRun(parked.runId, { ...usage, ...(text && !isSilentReply(text) ? { summary: clip(text, LIMITS.SUMMARY_MAX) } : {}) });
     } else {
       this.#store.updateRun(parked.runId, usage);
@@ -909,10 +945,13 @@ export class RoutineService {
   async #prune(routineId: string): Promise<void> {
     const routine = this.#store.getRoutine(routineId);
     if (!routine || routine.spec.session !== "fresh") return;
-    // Each pass clears everything past the keep count, so only the newest few
-    // rows past it can still hold a live session; older ones were handled.
-    const finished = this.#store.finishedRunSessions(routineId, routine.spec.keepSessions + PRUNE_WINDOW);
+    // Every row that still names a session (history is capped, so this is
+    // bounded): one skipped because someone had it open is looked at again.
+    const finished = this.#store.finishedRunSessions(routineId, LIMITS.RUN_HISTORY);
     for (const { sessionId } of finished.slice(routine.spec.keepSessions)) {
+      // A session the routine kept as persistent before switching to fresh is
+      // still its conversation, not a run's leftover.
+      if (sessionId === routine.persistentSessionId) continue;
       const info = this.#host.info(sessionId);
       if (!info) continue;
       if (this.#parked.has(sessionId) || info.waitingOn || info.attachedClients > 0) continue;
@@ -1017,6 +1056,10 @@ export class RoutineService {
       failurePauseAfter: int(input.failurePauseAfter, SPEC_DEFAULTS.failurePauseAfter, 0, 100, "failurePauseAfter"),
     };
     if (spec.worktree && spec.session === "persistent") bad("worktree isolation is per run, so it needs session: fresh");
+    // qwen-code runs shell commands it judges read-only without asking, even
+    // when guarded, so a routine fed by outside callers could be steered to
+    // read any file the daemon can. Refused rather than documented away.
+    if (spec.api && spec.provider === "qwen") bad("the qwen backend can't take an API trigger: it runs read-only shell commands without approval");
     return spec;
   }
 
@@ -1047,7 +1090,12 @@ export class RoutineService {
     draft.nextFireAt = spec.schedule ? this.#nextFire(draft, spec.schedule, new Date(now)) : null;
     const apiToken = spec.api ? newApiToken(id) : null;
     this.#store.insertRoutine(draft, apiToken ? hashToken(apiToken) : null);
-    this.#host.audit(owner.sub, "routine.create", undefined, `routine=${id} name=${spec.name}`);
+    this.#host.audit(
+      owner.sub,
+      "routine.create",
+      undefined,
+      `routine=${id} name=${spec.name} approvals=${spec.approvals} workdir=${spec.workdir} provider=${spec.provider ?? "-"} api=${spec.api} check=${commandDigest(spec.check?.command)}`,
+    );
     return { routine: this.#store.getRoutine(id) as RoutineRow, apiToken };
   }
 
@@ -1107,7 +1155,7 @@ export class RoutineService {
     const shown = (["approvals", "workdir", "provider", "api"] as const)
       .filter((k) => changed.includes(k))
       .map((k) => `${k}:${String(r.spec[k] ?? "-")}->${String(spec[k] ?? "-")}`);
-    if (changed.includes("check")) shown.push(`check:${JSON.stringify(r.spec.check?.command ?? null)}->${JSON.stringify(spec.check?.command ?? null)}`);
+    if (changed.includes("check")) shown.push(`check:${commandDigest(r.spec.check?.command)}->${commandDigest(spec.check?.command)}`);
     this.#host.audit(
       actor,
       "routine.update",

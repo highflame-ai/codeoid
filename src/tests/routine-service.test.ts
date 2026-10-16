@@ -53,14 +53,16 @@ class FakeHost implements RoutineHost {
   notified: RoutineRunEvent[] = [];
   finished: RoutineRunEvent[] = [];
   audits: string[] = [];
+  auditDetails: string[] = [];
   #n = 0;
+  #turns = 0;
 
   async createSession(opts: CreateRunSessionOpts): Promise<string> {
     const id = `s${++this.#n}`;
     this.sessions.set(id, {
       id,
       opts,
-      info: { status: "idle", turnQueued: false, waitingOn: null, costUsd: 0, inputTokens: 0, outputTokens: 0, attachedClients: 0, historyLength: 0 },
+      info: { status: "idle", turnQueued: false, waitingOn: null, costUsd: 0, inputTokens: 0, outputTokens: 0, attachedClients: 0, lastTurnId: null },
       prompts: [],
       text: null,
       error: null,
@@ -82,7 +84,8 @@ class FakeHost implements RoutineHost {
   async send(id: string, text: string, sender: AuthContext): Promise<void> {
     const s = this.sessions.get(id)!;
     s.prompts.push({ text, sender });
-    s.info = { ...s.info, historyLength: s.info.historyLength + 1 };
+    // The prompt opens a new turn; the reply carries the same turnId.
+    s.info = { ...s.info, lastTurnId: `t${++this.#turns}` };
     s.lastRole = "user";
     const sc = this.script;
     switch (sc.kind) {
@@ -93,7 +96,6 @@ class FakeHost implements RoutineHost {
           costUsd: s.info.costUsd + (sc.cost ?? 0.01),
           inputTokens: s.info.inputTokens + 100,
           outputTokens: s.info.outputTokens + 20,
-          historyLength: s.info.historyLength + 1,
         };
         s.lastRole = "assistant";
         // An empty reply is a turn that wrote no text (tools only).
@@ -127,9 +129,9 @@ class FakeHost implements RoutineHost {
     }
     return s.info;
   }
-  result(id: string, sinceHistory: number) {
+  result(id: string, sinceTurnId: string | null) {
     const s = this.sessions.get(id)!;
-    const answered = s.info.historyLength > sinceHistory && s.lastRole === "assistant";
+    const answered = s.lastRole === "assistant" && s.info.lastTurnId !== sinceTurnId;
     return { text: answered ? s.text : null, error: s.error };
   }
   beginUnattended(id: string): () => void {
@@ -151,8 +153,9 @@ class FakeHost implements RoutineHost {
     this.finished.push(e);
     if (e.push) this.notified.push(e);
   }
-  audit(subject: string, action: string): void {
+  audit(subject: string, action: string, _sessionId: string | undefined, detail: string): void {
     this.audits.push(`${subject} ${action}`);
+    this.auditDetails.push(detail);
   }
   hasProvider(id: string): boolean {
     return ["claude", "codex"].includes(id);
@@ -365,7 +368,7 @@ describe("run outcomes", () => {
     s.info = { ...s.info, status: "thinking", waitingOn: null, costUsd: 0.2 };
     svc.onSessionStatus(s.id);
     expect(store.getRun(run!.id)!.costUsd).toBe(0.2);
-    s.info = { ...s.info, status: "idle", costUsd: 0.3, inputTokens: 900, historyLength: s.info.historyLength + 1 };
+    s.info = { ...s.info, status: "idle", costUsd: 0.3, inputTokens: 900 };
     s.lastRole = "assistant";
     s.text = "Cleaned build/ and rebuilt.";
     svc.onSessionStatus(s.id);
@@ -521,7 +524,12 @@ describe("policies", () => {
     expect(host.sessions.size).toBe(1);
     const s = [...host.sessions.values()][0]!;
     expect(s.prompts).toHaveLength(2);
-    expect(s.armed).toEqual([{ approvals: "guarded", budget: 7 }]);
+    // Armed for the second run; handed back guarded after each run.
+    expect(s.armed).toEqual([
+      { approvals: "guarded", budget: 0 },
+      { approvals: "guarded", budget: 7 },
+      { approvals: "guarded", budget: 0 },
+    ]);
     // If its session is gone, the next run makes a new one.
     s.destroyed = true;
     svc.fire(store.getRoutine(routine.id)!, "manual", null, "owner");
@@ -625,6 +633,44 @@ describe("sessions that outlive their runs", () => {
     await new Promise((r) => setTimeout(r, 0));
     expect(s1!.destroyed).toBe(false);
     expect(s2!.destroyed).toBe(false);
+  });
+});
+
+describe("authority left behind", () => {
+  it("an autonomous run's session is handed back guarded when the run ends", async () => {
+    const { routine } = create({ approvals: "autonomous", toolBudget: 30 });
+    svc.fire(routine, "manual", null, "owner");
+    await settle();
+    const s = [...host.sessions.values()][0]!;
+    expect(s.opts.approvals).toBe("autonomous");
+    expect(s.armed.at(-1)).toEqual({ approvals: "guarded", budget: 0 });
+  });
+
+  it("a parked run's session is handed back guarded once the owner's approval lets it finish", async () => {
+    const { routine } = create({});
+    host.script = { kind: "park", waitingOn: "waiting for approval to run Bash" };
+    svc.fire(routine, "manual", null, "owner");
+    await settle();
+    const s = [...host.sessions.values()][0]!;
+    expect(s.armed).toEqual([]);
+    s.info = { ...s.info, status: "idle", waitingOn: null };
+    svc.onSessionStatus(s.id);
+    expect(s.armed).toEqual([{ approvals: "guarded", budget: 0 }]);
+  });
+
+  it("the audit log names a check by digest, never by its text", () => {
+    const { routine } = create({ check: { command: 'curl -H "Authorization: token ghp_secret" x', timeoutSeconds: 10 } });
+    svc.update(routine, { spec: { check: { command: "true", timeoutSeconds: 10 } } }, "owner");
+    const details = host.auditDetails.join("\n");
+    expect(details).not.toContain("ghp_secret");
+    expect(details).toMatch(/check=sha256:[0-9a-f]{16}\/\d+/);
+    expect(details).toMatch(/changed=check check:sha256:[0-9a-f]{16}\/\d+->sha256:/);
+  });
+
+  it("qwen can't take an API trigger", () => {
+    expect(() => create({ provider: "codex", api: true })).not.toThrow();
+    host.hasProvider = () => true;
+    expect(() => create({ name: "q", provider: "qwen", api: true })).toThrow("qwen backend can't take an API trigger");
   });
 });
 
@@ -764,13 +810,31 @@ describe("lifecycle edges", () => {
     await svc.tick();
     await settle();
     expect(store.listRuns(good.id, { limit: 1 })[0]!.status).toBe("succeeded");
+    // ...and the broken one is paused with the reason, not retried every tick.
+    expect(store.getRoutine(bad.id)).toMatchObject({ enabled: false });
+    expect(store.getRoutine(bad.id)!.pausedReason).toContain("can no longer be evaluated");
   });
 
-  it("run history is trimmed to the newest runs", () => {
+  it("run history is trimmed to the newest runs — never today's, and never what later runs read", async () => {
     const { routine } = create({});
-    for (let i = 0; i < 510; i++) svc.fire(store.getRoutine(routine.id)!, "manual", "x".repeat(10), "owner");
-    // Synchronous fires overlap-skip; each skip is a finished run.
-    expect(store.countRuns(routine.id, "manual", 0)).toBeLessThanOrEqual(501);
+    host.script = { kind: "reply", text: "Coverage 81%." };
+    svc.fire(routine, "manual", null, "owner");
+    await settle();
+    // A long run, and 510 fires skipped behind it, all today.
+    host.script = { kind: "hang" };
+    const long = svc.fire(store.getRoutine(routine.id)!, "manual", null, "owner");
+    for (let i = 0; i < 510; i++) svc.fire(store.getRoutine(routine.id)!, "manual", null, "owner");
+    // Today's spend is what the daily cap sums: nothing from today goes.
+    expect(store.countRuns(routine.id, "manual", 0)).toBe(512);
+    svc.cancelRun(store.getRun(long.id)!, "owner");
+    await settle();
+    // Two days on, the next run trims — but keeps the summary {{last_summary}} reads.
+    clock += 2 * 86_400_000;
+    host.script = { kind: "reply", text: "" };
+    svc.fire(store.getRoutine(routine.id)!, "manual", null, "owner");
+    await settle();
+    expect(store.countRuns(routine.id, "manual", 0)).toBe(501);
+    expect(store.lastSummary(routine.id)).toBe("Coverage 81%.");
   });
 });
 

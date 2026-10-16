@@ -1504,6 +1504,10 @@ export class Session {
     if (!last || last.role !== "assistant") return null;
     return this.#accumulator.lastTextBlock ?? (last.content || null);
   }
+  /** turnId of the newest turn in the canonical history (null before any, or when unstamped). */
+  get lastTurnId(): string | null {
+    return this.#accumulator.history.at(-1)?.turnId ?? null;
+  }
   /** Number of turns (user + assistant) in the canonical history. */
   get historyLength(): number { return this.#accumulator.history.length; }
   /**

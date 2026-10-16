@@ -264,6 +264,17 @@ describe("authority", () => {
     expect(up).toMatchObject({ type: "response.error", code: "forbidden" });
   });
 
+  it("firing or re-tokening a routine that pre-approves work needs session:approve too", async () => {
+    // The same person, through a narrower credential.
+    const owner: AuthContext = { ...OWNER, sub: NO_APPROVE.sub };
+    await create({ api: true }, owner);
+    for (const msg of [{ type: "routine.run", routine: "triage" }, { type: "routine.token", routine: "triage" }]) {
+      const res = await call(msg, NO_APPROVE);
+      expect(res).toMatchObject({ code: "forbidden" });
+      expect(res.type === "response.error" && res.error).toContain("session:approve");
+    }
+  });
+
   it("a read-only token can't read routines (prompts, checks, payloads) or fire them", async () => {
     await create({});
     for (const msg of [{ type: "routine.list" }, { type: "routine.get", routine: "triage" }, { type: "routine.runs", routine: "triage" }, { type: "routine.run", routine: "triage" }]) {
