@@ -709,6 +709,32 @@ describe("decodeStderrEntities", () => {
  * (anthropics/claude-code#80223) — this recovers whatever produced the zero
  * turn, because it keys on `num_turns` rather than on any cause.
  */
+describe("ClaudeProvider – backing-session recovery can't loop (#387)", () => {
+  beforeEach(() => { sdkMessages = []; sdkThrowError = null; capturedQueryOpts = null; sdkGate = null; });
+
+  it("recovers once; if the backing it then resumes is missing too, the turn fails instead of recovering again", async () => {
+    const provider = makeProvider();
+    provider.setHasQueried(true); // a resumed backing
+    sdkThrowError = new Error("No conversation found with session ID: gone-1");
+    let recoveries = 0;
+    let retry: Promise<ProviderEvent[]> | null = null;
+    provider.onRecoveryNeeded = (content) => {
+      recoveries += 1;
+      // What the session does: reset, adopt a resumable backing (native
+      // continuation), and run the prompt again — which also fails.
+      provider.resetToNewSession("adopted-2");
+      provider.setHasQueried(true);
+      retry = collectTurnEvents(provider, content);
+    };
+    await collectTurnEvents(provider);
+    for (let i = 0; i < 100 && !retry; i++) await Bun.sleep(5);
+    const events = await retry!;
+    await Bun.sleep(20);
+    expect(recoveries).toBe(1);
+    expect(events.some((e) => e.type === "error" && String((e as { message: string }).message).includes("No conversation found"))).toBe(true);
+  });
+});
+
 describe("ClaudeProvider – unexplained zero-turn re-send", () => {
   beforeEach(() => { sdkMessages = []; sdkThrowError = null; capturedQueryOpts = null; sdkGate = null; });
 

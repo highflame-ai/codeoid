@@ -2515,6 +2515,9 @@ export class Session {
       this.#pendingSeed.turn = { id: turnId, text, at: turnAt };
     }
     this.#accumulator.pushUserTurn(effectivePrompt, turnId, { prompt: text, at: turnAt });
+    // A redaction flagged by a turn that never reached turn_done (interrupted,
+    // errored, switched away) belongs to that turn's backing, not this one.
+    this.#turnRedacted = false;
     const run = this.#provider.runTurn({
       ...(this.#maxBudgetUsd !== undefined ? { maxBudgetUsd: this.#maxBudgetUsd } : {}),
       history: this.#accumulator.history,
@@ -3382,7 +3385,8 @@ export class Session {
   #noteRedactedBacking(backingId: string): void {
     if (this.#redactedBackings.has(backingId)) return;
     this.#redactedBackings.add(backingId);
-    this.#saveMetaNow();
+    // A late tool result must not recreate a destroyed session's meta.
+    if (!this.#destroyed) this.#saveMetaNow();
   }
 
   /** Backings this session knows hold redacted output (persisted in meta; a fork inherits them). */

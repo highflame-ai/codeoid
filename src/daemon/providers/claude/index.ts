@@ -322,7 +322,9 @@ export class ClaudeProvider implements SessionProvider {
     this.#hasQueried = false;
     // A turn anchor belongs to the session it was seen in.
     this.#translateState.lastChainUuid = null;
-    this.#backingRecoveryAttempted = false;
+    // NOT #backingRecoveryAttempted: recovery itself resets the backing (and
+    // may adopt a native one) before retrying, and must not re-arm on the way.
+    // It clears once a turn on the new backing succeeds (#emit).
     this.#zeroTurnRecoveryAttempted = false;
     this.#lastPushedContent = null;
   }
@@ -519,11 +521,7 @@ export class ClaudeProvider implements SessionProvider {
 
   /** Make `id` this provider's backing session, resumed (not created) on the next turn. */
   #adoptBacking(id: string): void {
-    // Adopting a backing during recovery must not re-arm recovery: if this
-    // one can't be resumed either, the turn fails rather than looping.
-    const recovering = this.#backingRecoveryAttempted;
     this.resetToNewSession(id);
-    this.#backingRecoveryAttempted = recovering;
     this.#hasQueried = true;
   }
 
@@ -1003,6 +1001,8 @@ export class ClaudeProvider implements SessionProvider {
 
   /** Push a ProviderEvent to the active per-turn queue. */
   #emit(event: ProviderEvent): void {
+    // A backing that just completed a turn is resumable: recovery may arm again.
+    if (event.type === "turn_done" && !event.result.isError) this.#backingRecoveryAttempted = false;
     const queue = this.#currentTurnQueue;
     if (queue) {
       try {
