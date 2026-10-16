@@ -4,16 +4,16 @@
  *
  * Scopes:
  *   - `routine.preview` (no routine involved): `session:list`;
- *   - reading routines and runs (`routine.list`, `routine.get`, `routine.runs`):
- *     `routine:manage` — prompts, check commands, check output and payloads
- *     are not for read-only share tokens;
- *   - changing anything (create, update, delete, run, cancel, token): `routine:manage`,
- *     plus `session:create` and `session:send` — a routine creates and prompts
- *     sessions on its owner's behalf, so it can never grant more than they hold.
- *     An autonomous routine, or one with a check command, also needs
- *     `session:approve`: it pre-approves tool use and host commands. A
- *     delegated token (an agent acting for someone) cannot change routines:
- *     a routine is standing authority, and delegation is meant to be narrow.
+ *   - everything else: `session:create` + `session:send` — a routine creates
+ *     and prompts sessions on its owner's behalf, so only someone who could do
+ *     that may hold one, and read-only watchers can't read its prompt, check,
+ *     check output or payloads. There is no routine scope of its own;
+ *   - changing anything (create, update, delete, run, cancel, token) is
+ *     refused to a delegated token (a teammate's share token, an agent): a
+ *     routine is standing authority, and delegation is meant to be narrow;
+ *   - saving, firing, re-tokening or resuming a routine that is autonomous or
+ *     has a check command also needs `session:approve`: it pre-approves tool
+ *     use and host commands. Pausing never does.
  *
  * A routine is its owner's alone: another user in the same tenant sees no
  * routine of theirs, by id or by name.

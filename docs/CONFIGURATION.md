@@ -38,9 +38,10 @@ one-way door, and how clients discover the token.
 | `session:read` | Read-only fleet visibility (conductor): list / find / summarize sessions |
 | `session:dispatch` | Send-class fleet routing (conductor): direct / interrupt / spawn on the owner's behalf |
 | `fs:read` | Read files + list directories under a session's workdir |
-| `routine:manage` | Read, create, change, fire and delete your own [routines](routines.md). Owner-tier: not in the operator share preset. Changes also need `session:create` + `session:send`, and `session:approve` for an autonomous routine or one with a check |
 | `settings:read` | Read the settings manifest + current (non-secret) configuration |
 | `settings:write` | Write daemon configuration (`config.json` + `.env`), including secrets |
+
+[Routines](routines.md) have no scope of their own: holding them takes `session:create` + `session:send`, pre-approving work (autonomous, or a check command) also takes `session:approve`, and a delegated token can't change them.
 
 Share a read-only token with a teammate via ZeroID:
 

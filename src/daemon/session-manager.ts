@@ -4649,11 +4649,12 @@ mcpHub: this.#mcpHub,
    * One entry point for routine.*: availability, scopes, and tenancy are
    * decided here once, then each verb runs against RoutineService.
    *
-   * Every verb but preview needs routine:manage (preview needs session:list):
-   * a routine's definition and history are not for read-only share tokens.
-   * Changing anything also needs session:create + session:send — a routine
-   * creates and prompts sessions on its owner's behalf, so it may never act
-   * beyond what they hold — and is refused to delegated tokens. Saving,
+   * No scope of its own. Every verb but preview needs session:create +
+   * session:send — a routine creates and prompts sessions on its owner's
+   * behalf, so only someone who could do that themselves may hold one, and
+   * read-only watchers can't read its definition or history. Changing anything
+   * is refused to delegated tokens (teammates' share tokens, agents): a
+   * routine is standing authority that outlives them. Saving,
    * firing, re-tokening or resuming a routine that pre-approves (autonomous)
    * or runs host commands (a check) also needs session:approve; pausing never
    * does. A routine is its owner's alone: anyone else gets not-found.
@@ -4674,14 +4675,14 @@ mcpHub: this.#mcpHub,
     if (msg.type === "routine.preview") {
       if (!hasScope(scopes, SCOPES.SESSION_LIST)) return err("Missing scope: session:list", "forbidden");
     } else {
-      // Prompts, check commands, check output and payloads are not for
-      // read-only share tokens, so even reading needs routine:manage.
-      if (!hasScope(scopes, SCOPES.ROUTINE_MANAGE)) return err("Missing scope: routine:manage", "forbidden");
+      // A routine creates and prompts sessions, so holding one takes what
+      // doing that takes. Its prompt, check, check output and payloads are
+      // therefore out of a read-only watcher's reach, reading included.
+      for (const sc of [SCOPES.SESSION_CREATE, SCOPES.SESSION_SEND] as const) {
+        if (!hasScope(scopes, sc)) return err(`Missing scope: ${sc}`, "forbidden");
+      }
       const reads = msg.type === "routine.list" || msg.type === "routine.get" || msg.type === "routine.runs";
       if (!reads) {
-        for (const sc of [SCOPES.SESSION_CREATE, SCOPES.SESSION_SEND] as const) {
-          if (!hasScope(scopes, sc)) return err(`Missing scope: ${sc}`, "forbidden");
-        }
         // A routine is standing authority that outlives the token that made
         // it; a delegated token (an agent acting for someone) is meant to be
         // narrow and short-lived, so it may not create or steer one.

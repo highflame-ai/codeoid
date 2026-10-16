@@ -28,10 +28,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   spend after you approve. Fresh runs can each get their own git worktree.
 
   A routine is its owner's alone: teammates in the tenant can't see or touch
-  it. Every routine command needs the new owner-tier `routine:manage` scope
-  (not in the operator share preset); changes also need `session:create` and
-  `session:send`, plus `session:approve` for an autonomous routine or one with
-  a check, and are refused to delegated tokens. Check commands run with a
+  it. No new scope: routines take `session:create` + `session:send`, plus
+  `session:approve` for an autonomous routine or one with a check, and
+  delegated tokens (teammates' share tokens, agents) can't change them. Check commands run with a
   scrubbed environment, never the daemon's secrets. Runs are
   attributed to `routine:<name>` under their owner in transcripts and the
   audit log. Outcomes reach your devices as a content-blind push (`notify`
@@ -40,8 +39,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Guide: [docs/routines.md](docs/routines.md).
 
 - **Protocol (additive):** `routine.*` client messages and results,
-  `SessionInfo.managedBy: "routine"`, push kind `"routine"`, and the
-  `routine:manage` scope.
+  `SessionInfo.managedBy: "routine"`, and push kind `"routine"`.
 
 - **Other agents can drive codeoid over MCP** (`/mcp/control`, #251). Claude
   Code, Cursor, or a CI job mounts one URL and can list sessions, read their

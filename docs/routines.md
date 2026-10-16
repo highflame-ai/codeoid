@@ -225,12 +225,12 @@ Two consequences of runs being ordinary sessions are worth knowing when your ten
 - While an autonomous run is going, a message from anyone holding `session:send` joins it and is auto-approved like the run's own work, as it would be in any autonomous session.
 - In a persistent autonomous routine, anything said in its session between runs becomes context for the next autonomous run. Don't make a routine both `--persistent` and autonomous where send-only tokens can reach it; use `--fresh`, or `--guarded`.
 
-Every routine command needs the `routine:manage` scope, reading included: a routine's definition and run history are not for read-only share tokens.
+Routines have no scope of their own; they use the ones you already hold.
+A routine creates sessions and prompts them, so every routine command needs `session:create` and `session:send`, reading included: a routine's definition and run history are not for read-only watchers.
 Only `routine preview`, which saves nothing, needs just `session:list`.
-Creating, changing, firing and deleting also need `session:create` and `session:send`, because a routine creates sessions and prompts them.
 A routine that is autonomous, or that has a check, also needs `session:approve` to save, run by hand, re-token or resume (pausing never does: it is a safety stop): an autonomous run approves its own tool calls, and a check is a shell command that runs on the daemon's host without asking anyone, so only someone who could approve that command interactively may set it going.
-A delegated token (an agent acting for someone) can list routines but not create or change them: a routine is standing authority, and delegation is meant to be narrow.
-`routine:manage` is not in the operator share-token preset, so a teammate you share a session with cannot schedule work on your machine.
+A delegated token can list routines but not create, change, fire or delete them: a routine is standing authority, and delegation is meant to be narrow.
+That covers a teammate's share token (it arrives delegated, whatever scopes it carries) and an agent acting for someone, so a teammate you share a session with cannot schedule work on your machine.
 
 **A routine outlives the token that created it.**
 Scopes are checked when a routine is created or changed, not on every run, so revoking the owner's token or narrowing their scopes does not stop a routine they already saved, and an API token never expires on its own.
@@ -324,7 +324,7 @@ As of October 2026, from each product's public documentation; — means we found
 - **No event triggers yet.** GitHub, Slack and similar sources are planned; until then, point their webhooks at a small relay that calls the API trigger, or poll from a check.
 - **CLI only for now.** The web UI shows a routine's run sessions (marked as routine-managed) but has no routine screen yet.
 - **The qwen backend runs read-only shell commands without asking**, even in a guarded routine (a property of qwen-code itself, described under "Qwen backend" in the repository's CLAUDE.md), so an unattended qwen routine fed outside text could be steered to read any file the daemon user can. codeoid refuses an API trigger on a routine that runs on qwen, whether named or as the daemon's default backend, and fails an API run if the default has since become qwen; a qwen routine whose check reads untrusted text (issues, emails) carries the same risk, so prefer another backend there.
-- **Routines are tied to the identity that made them** (see [Who can do what](#who-can-do-what)): another key or the web UI's sign-in won't see them, and Studio's embedded sign-in doesn't carry `routine:manage` yet.
+- **Routines are tied to the identity that made them** (see [Who can do what](#who-can-do-what)): another key or the web UI's sign-in won't see them.
 - **A kept run session keeps the run's spend ceiling.** If you continue a fresh run's session yourself on Claude, its turns stop at that run's `--max-cost`; start a new session for open-ended work.
 - **The hard spend cap is Claude-only, and fresh-session-only.** Other backends, and persistent sessions, report spend when a turn ends, and a run is usually one turn, so there `--max-cost` marks the run `over_budget` (and counts toward the failure pause) rather than stopping it part-way. Backends on a subscription may report no cost at all. On those, `--max-minutes` and `--tool-budget` are the limits that actually bound a run.
 - **Account-wide connectors.** On the Claude backend, a run inherits your Claude account's connectors. The run's instructions tell the agent to leave unneeded ones out of its summary, but it is a model following an instruction, not a filter.

@@ -38,7 +38,7 @@ const OTHER: AuthContext = { ...OWNER, sub: "spiffe://t/user/other", accountId: 
 const NO_APPROVE: AuthContext = {
   ...OWNER,
   sub: "spiffe://t/user/limited",
-  scopes: [SCOPES.SESSION_LIST, SCOPES.SESSION_CREATE, SCOPES.SESSION_SEND, SCOPES.ROUTINE_MANAGE],
+  scopes: [SCOPES.SESSION_LIST, SCOPES.SESSION_CREATE, SCOPES.SESSION_SEND],
 };
 
 const reply = (text: string, cost = 0.05): ProviderEvent[] => [
@@ -246,9 +246,15 @@ describe("routine lifecycle through the protocol", () => {
 });
 
 describe("authority", () => {
-  it("routine:manage is owner-tier: an operator token cannot create routines", async () => {
-    const res = await call({ type: "routine.create", spec: { name: "x", prompt: "p", workdir: repo } }, OPERATOR);
-    expect(res).toMatchObject({ type: "response.error", code: "forbidden", error: "Missing scope: routine:manage" });
+  it("no scope of its own: anyone who can create and prompt sessions can keep routines", async () => {
+    // The operator preset can, as the operator themselves...
+    const own: AuthContext = { ...OPERATOR, delegationDepth: 0 };
+    expect((await create({}, own)).routine.ownerSub).toBe(OPERATOR.sub);
+    // ...but a teammate's share token arrives delegated, and can't set up standing authority.
+    const shared: AuthContext = { ...OPERATOR, delegationDepth: 1, delegatedBy: OWNER.sub };
+    const res = await call({ type: "routine.create", spec: { name: "x", prompt: "p", workdir: repo } }, shared);
+    expect(res).toMatchObject({ type: "response.error", code: "forbidden" });
+    expect(res.type === "response.error" && res.error).toContain("delegated");
   });
 
   it("pre-approving work needs session:approve — autonomous, or a check command", async () => {
@@ -281,7 +287,7 @@ describe("authority", () => {
   it("a read-only token can't read routines (prompts, checks, payloads) or fire them", async () => {
     await create({});
     for (const msg of [{ type: "routine.list" }, { type: "routine.get", routine: "triage" }, { type: "routine.runs", routine: "triage" }, { type: "routine.run", routine: "triage" }]) {
-      expect(await call(msg, WATCHER)).toMatchObject({ code: "forbidden", error: "Missing scope: routine:manage" });
+      expect(await call(msg, WATCHER)).toMatchObject({ code: "forbidden", error: "Missing scope: session:create" });
     }
     // A schedule preview reveals nothing, so session:list is enough.
     expect((await call({ type: "routine.preview", schedule: { kind: "every", seconds: 900 } }, WATCHER)).type).toBe("routine.preview.result");

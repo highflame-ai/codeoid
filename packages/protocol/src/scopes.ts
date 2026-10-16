@@ -63,14 +63,6 @@ export const SCOPES = {
    * settings:write.
    */
   PIPELINE_MANAGE: "pipeline:manage",
-  /**
-   * Read, create, change, delete, and fire your own routines (docs/routines.md) — saved
-   * agent jobs that run later, unattended, on the owner's behalf. Owner-tier
-   * (kept out of OPERATOR_SCOPES): a routine is STANDING authority to run
-   * agents and host commands with nobody watching, a different thing from
-   * acting in a session now.
-   */
-  ROUTINE_MANAGE: "routine:manage",
 } as const;
 
 export type Scope = (typeof SCOPES)[keyof typeof SCOPES];
