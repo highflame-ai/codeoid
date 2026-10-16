@@ -147,6 +147,11 @@ import { blockingOf, openFindings, renderLedger } from "./pipeline/findings.js";
  *  user watches + can interrupt — nothing hangs headless. */
 const PIPELINE_PHASE_MAX_TURNS = 200;
 import { randomUUID } from "node:crypto";
+import { RoutineError, RoutineService, type RoutineHost } from "./routines/service.js";
+import { RoutineStore } from "./routines/store.js";
+import type { RoutineRow } from "./routines/types.js";
+import { toRoutineWire, toRunWire } from "./routines/wire.js";
+import { routineFirePath } from "../protocol/types.js";
 import {
   createForkWorktree,
   currentBranch,
@@ -407,6 +412,8 @@ export class SessionManager {
   #pushService: PushService;
   /** SDLC pipeline manager — undefined when the pipeline is disabled (default). */
   #pipelines?: PipelineManager;
+  /** Routines (docs/routines.md); undefined when `routines.enabled` is off. */
+  #routines?: RoutineService;
   /** Pack curation surface (registries + install/trust/select) — always present,
    *  so packs can be managed even before the pipeline runtime is enabled. */
   #packs: PackService;
@@ -422,6 +429,7 @@ export class SessionManager {
   /** Stable observer identity — every Session reports status transitions here. */
   #statusObserver = (sessionId: string, status: SessionInfo["status"]): void => {
     this.#dispatcher.onSessionStatus(sessionId, status);
+    this.#routines?.onSessionStatus(sessionId);
     // Content-blind push: a session that just blocked on approval alerts its
     // owner's registered devices off-LAN. Fire-and-forget — a push hiccup must
     // never touch the status path (the emit itself only ever sees an opaque
@@ -522,6 +530,11 @@ export class SessionManager {
       runner: new SessionPhaseRunner(() => this),
       db: store.database,
     });
+    // Routines share the daemon DB. Built only when enabled, so the kill
+    // switch leaves every routine in place but nothing fires.
+    if (opts?.config?.routines?.enabled ?? true) {
+      this.#routines = new RoutineService(new RoutineStore(store.database), this.#makeRoutineHost(), opts?.config?.routines ?? {});
+    }
     // Pack curation surface (docs/pack-loading.md) — always constructed (cheap:
     // no DB / runner). Reads the boot pack config; each mutation persists to
     // config.json AND (if the pipeline is enabled) registers into the manager.
@@ -618,6 +631,21 @@ export class SessionManager {
   /** Supported backends that couldn't activate at startup (diagnostics). */
   unavailableProviders(): Array<{ id: string; hint: string }> {
     return this.#providers.unavailableEntries();
+  }
+
+  /** Routines service, or undefined when routines are disabled. */
+  get routines(): RoutineService | undefined {
+    return this.#routines;
+  }
+
+  /** Start the routine scheduler. Call AFTER resumeSessions: boot recovery
+   *  closes runs left in flight, whose sessions resume as ordinary ones. */
+  startRoutines(): void {
+    this.#routines?.start();
+  }
+
+  stopRoutines(): void {
+    this.#routines?.stop();
   }
 
   /** Start the dispatcher loop. Call AFTER resumeSessions so surviving
@@ -1183,6 +1211,17 @@ mcpHub: this.#mcpHub,
         return this.#mcpOAuthDisconnect(msg, auth);
       case "usage.daily":
         return this.#usageDaily(msg, auth);
+      case "routine.create":
+      case "routine.update":
+      case "routine.delete":
+      case "routine.list":
+      case "routine.get":
+      case "routine.run":
+      case "routine.cancel_run":
+      case "routine.runs":
+      case "routine.token":
+      case "routine.preview":
+        return this.#routineHandle(msg, auth);
       case "pipeline.create":
         return this.#pipelineCreate(msg, auth);
       case "pipeline.list":
@@ -4604,6 +4643,268 @@ mcpHub: this.#mcpHub,
     ].join("\n");
   }
 
+  // ── Routines (docs/routines.md) ─────────────────────────────────────────
+
+  /**
+   * One entry point for routine.*: availability, scopes, and tenancy are
+   * decided here once, then each verb runs against RoutineService.
+   *
+   * Reading needs session:list. Changing anything needs routine:manage AND
+   * session:create + session:send — a routine creates and prompts sessions on
+   * its owner's behalf, so it may never act beyond what they hold. A routine
+   * that pre-approves (autonomous) or runs host commands (a check) also needs
+   * session:approve, the scope that grants auto-approval on a live session.
+   */
+  async #routineHandle(
+    msg: Extract<ClientMessage, { type: `routine.${string}` }>,
+    auth: AuthContext,
+  ): Promise<DaemonMessage> {
+    const err = (error: string, code: "forbidden" | "not_found" | "invalid_request" | "rate_limited" | "internal"): DaemonMessage => ({
+      type: "response.error",
+      requestId: msg.id,
+      error,
+      code,
+    });
+    const svc = this.#routines;
+    if (!svc) return err("routines are disabled on this daemon (routines.enabled)", "invalid_request");
+    const scopes = auth.scopes as string[];
+    const reads = msg.type === "routine.list" || msg.type === "routine.get" || msg.type === "routine.runs" || msg.type === "routine.preview";
+    if (reads) {
+      if (!hasScope(scopes, SCOPES.SESSION_LIST)) return err("Missing scope: session:list", "forbidden");
+    } else {
+      for (const sc of [SCOPES.ROUTINE_MANAGE, SCOPES.SESSION_CREATE, SCOPES.SESSION_SEND] as const) {
+        if (!hasScope(scopes, sc)) return err(`Missing scope: ${sc}`, "forbidden");
+      }
+    }
+    /** Autonomy or a host command needs the approval scope as well. */
+    const needsApprove = (spec: { approvals?: string | null; check?: unknown } | undefined, current?: RoutineRow): boolean => {
+      const approvals = spec?.approvals !== undefined ? spec.approvals : current?.spec.approvals;
+      const check = spec && "check" in spec ? spec.check : current?.spec.check;
+      return (approvals ?? "autonomous") === "autonomous" || !!check;
+    };
+    const resolve = (ref: string): RoutineRow | undefined => {
+      const byId = svc.store.getRoutine(ref);
+      if (byId && byId.accountId === auth.accountId && byId.projectId === auth.projectId) return byId;
+      return svc.store.getRoutineByName(auth.accountId, auth.projectId, ref);
+    };
+    const wire = (r: RoutineRow) =>
+      toRoutineWire(r, {
+        upcoming: svc.upcoming(r, 3),
+        lastRun: svc.store.listRuns(r.id, { limit: 1 })[0],
+        apiTokenSet: svc.store.hasApiToken(r.id),
+      });
+    const actor = auth.sub;
+    try {
+      switch (msg.type) {
+        case "routine.list":
+          return {
+            type: "routine.list.result",
+            requestId: msg.id,
+            routines: svc.store.listRoutines(auth.accountId, auth.projectId).map(wire),
+          };
+        case "routine.preview":
+          return { type: "routine.preview.result", requestId: msg.id, fires: svc.preview(msg.schedule, msg.count ?? 5) };
+        case "routine.create": {
+          if (needsApprove(msg.spec) && !hasScope(scopes, SCOPES.SESSION_APPROVE)) {
+            return err("Missing scope: session:approve (an autonomous routine, or one with a check command, pre-approves work)", "forbidden");
+          }
+          const { routine, apiToken } = svc.create(
+            { sub: auth.sub, name: auth.name, accountId: auth.accountId, projectId: auth.projectId },
+            msg.spec,
+          );
+          return { type: "routine.snapshot", requestId: msg.id, routine: wire(routine), ...(apiToken ? { apiToken } : {}) };
+        }
+      }
+      // Everything below names one routine (or one run).
+      if (msg.type === "routine.cancel_run") {
+        const run = svc.store.getRun(msg.runId);
+        if (!run || run.accountId !== auth.accountId || run.projectId !== auth.projectId) return err("Run not found", "not_found");
+        if (!svc.cancelRun(run, actor)) return err(`run is already ${run.status}`, "invalid_request");
+        return { type: "response.ok", requestId: msg.id };
+      }
+      const r = resolve(msg.routine);
+      if (!r) return err(`Routine not found: ${msg.routine}`, "not_found");
+      switch (msg.type) {
+        case "routine.get":
+          return {
+            type: "routine.snapshot",
+            requestId: msg.id,
+            routine: wire(r),
+            runs: svc.store.listRuns(r.id, { limit: msg.runs ?? 10 }).map(toRunWire),
+          };
+        case "routine.runs": {
+          const before = msg.before !== undefined ? Date.parse(msg.before) : undefined;
+          if (before !== undefined && Number.isNaN(before)) return err(`before is not a timestamp: ${msg.before}`, "invalid_request");
+          const limit = msg.limit ?? 20;
+          const runs = svc.store.listRuns(r.id, { limit: limit + 1, before });
+          return {
+            type: "routine.runs.result",
+            requestId: msg.id,
+            routineId: r.id,
+            runs: runs.slice(0, limit).map(toRunWire),
+            hasMore: runs.length > limit,
+          };
+        }
+        case "routine.update": {
+          if (needsApprove(msg.spec as { approvals?: string | null; check?: unknown } | undefined, r) && !hasScope(scopes, SCOPES.SESSION_APPROVE)) {
+            return err("Missing scope: session:approve (an autonomous routine, or one with a check command, pre-approves work)", "forbidden");
+          }
+          const { routine, apiToken } = svc.update(
+            r,
+            { ...(msg.spec ? { spec: msg.spec as Parameters<RoutineService["update"]>[1]["spec"] } : {}), ...(msg.enabled !== undefined ? { enabled: msg.enabled } : {}) },
+            actor,
+          );
+          return { type: "routine.snapshot", requestId: msg.id, routine: wire(routine), ...(apiToken ? { apiToken } : {}) };
+        }
+        case "routine.delete":
+          await svc.delete(r, actor);
+          return { type: "response.ok", requestId: msg.id };
+        case "routine.run": {
+          const run = svc.fire(r, "manual", msg.payload ?? null, actor);
+          return { type: "routine.run.result", requestId: msg.id, run: toRunWire(run) };
+        }
+        case "routine.token": {
+          const apiToken = svc.rotateToken(r, actor);
+          return {
+            type: "routine.token.result",
+            requestId: msg.id,
+            routineId: r.id,
+            apiToken,
+            endpointPath: routineFirePath(r.id),
+          };
+        }
+      }
+      return err("Unknown routine message", "invalid_request");
+    } catch (e) {
+      if (e instanceof RoutineError) {
+        return err(e.message, e.code === "conflict" ? "invalid_request" : e.code);
+      }
+      return err(e instanceof Error ? e.message : String(e), "internal");
+    }
+  }
+
+  /** The routine engine's window onto sessions (RoutineHost). */
+  #makeRoutineHost(): RoutineHost {
+    const systemAuth = (accountId: string, projectId: string): AuthContext => ({
+      sub: "system:routines",
+      scopes: [],
+      delegationDepth: 0,
+      accountId,
+      projectId,
+    });
+    return {
+      createSession: async (o) => {
+        let workdir = o.workdir;
+        let worktree: SessionWorktree | undefined;
+        if (o.worktree) {
+          if (!(await isGitRepo(o.workdir))) throw new Error(`worktree isolation needs a git repository: ${o.workdir}`);
+          const wt = await createForkWorktree({ workdir: o.workdir, label: o.label, shortId: randomUUID().slice(0, 8) });
+          workdir = normalizeWorkdir(wt.workdir) ?? wt.path;
+          worktree = { path: wt.path, branch: wt.branch, createdByCodeoid: true };
+        }
+        const session = new Session({
+          name: o.name,
+          workdir,
+          ...(worktree ? { worktree } : {}),
+          providerId: o.provider,
+          defaultModel: o.model,
+          initialMode: o.approvals === "autonomous" ? { mode: "autonomous", maxTurns: o.toolBudget } : { mode: "guarded" },
+          ...(o.maxCostUsd !== undefined ? { maxBudgetUsd: o.maxCostUsd } : {}),
+          auth: o.ownerAuth,
+          store: this.#store,
+          transcriptStore: this.#transcriptStore,
+          providers: this.#providers,
+          hooks: this.#hooks,
+          identityManager: this.#identityManager,
+          memory: this.#memory,
+          memoryMcp: this.#memoryMcp,
+          mcpRegistry: this.#mcpRegistry,
+          mcpHub: this.#mcpHub,
+          config: this.#config,
+          compressionRegistry: this.#compressionRegistry,
+          _testProvider: this.#testProviderFactory?.(),
+          onStatusChange: this.#statusObserver,
+          ...this.#modelHooks,
+        });
+        this.#sessions.set(session.id, session);
+        return session.id;
+      },
+      sessionAlive: (id, accountId, projectId) => {
+        const s = this.#sessions.get(id);
+        return !!s && s.accountId === accountId && s.projectId === projectId;
+      },
+      armSession: (id, approvals, toolBudget) => {
+        this.#sessions.get(id)?.setMode(approvals === "autonomous" ? "autonomous" : "guarded", toolBudget);
+      },
+      send: async (id, text, sender) => {
+        const s = this.#sessions.get(id);
+        if (!s) throw new Error("session not found");
+        await s.send(text, sender);
+      },
+      info: (id) => {
+        const s = this.#sessions.get(id);
+        if (!s) return null;
+        const i = s.toInfo();
+        const parked = i.status === "waiting_approval" ? s.pendingToolApprovals()[0] : undefined;
+        return {
+          status: i.status,
+          turnQueued: i.turnQueued === true,
+          waitingOn: i.pendingDialog
+            ? `waiting on a question: ${i.pendingDialog.title}`
+            : parked
+              ? `waiting for approval to run ${parked.toolName}`
+              : null,
+          costUsd: i.usage?.totalCostUsd ?? 0,
+          inputTokens: i.usage?.inputTokens ?? 0,
+          outputTokens: i.usage?.outputTokens ?? 0,
+        };
+      },
+      result: (id) => {
+        const s = this.#sessions.get(id);
+        return { text: s?.lastAssistantText ?? null, error: s?.lastTurnError ?? null };
+      },
+      beginUnattended: (id) => this.#sessions.get(id)?.beginUnattended() ?? (() => {}),
+      interrupt: async (id) => {
+        const s = this.#sessions.get(id);
+        if (s) await s.interrupt(systemAuth(s.accountId, s.projectId));
+      },
+      destroy: async (id) => {
+        const s = this.#sessions.get(id);
+        if (!s) return;
+        await s.destroy(systemAuth(s.accountId, s.projectId));
+        this.#forgetComparesOf(id);
+        this.#forgetCompareBranch(id);
+        this.#sessions.delete(id);
+      },
+      notify: (e) => {
+        const r = e.routine;
+        const sessionId = e.run.sessionId;
+        // Content-blind push needs a session to open; a run that never
+        // started an agent reaches the owner through hooks and its history.
+        if (sessionId && this.#pushService.enabled) {
+          void this.#pushService
+            .notifyRoutine(sessionId, { sub: r.ownerSub, accountId: r.accountId, projectId: r.projectId })
+            .catch((err) => console.error("[codeoid/push] routine notify failed:", err));
+        }
+        const s = sessionId ? this.#sessions.get(sessionId) : undefined;
+        this.#hooks?.emit(
+          "routine_end",
+          {
+            sessionId: sessionId ?? "",
+            sessionName: s?.name ?? r.spec.name,
+            workdir: s?.workdir ?? r.spec.workdir,
+            providerId: s?.toInfo().providerId ?? r.spec.provider ?? "",
+          },
+          { routine: { id: r.id, name: r.spec.name, paused: !r.enabled, pausedReason: r.pausedReason }, run: toRunWire(e.run), paused: e.paused },
+        );
+      },
+      audit: (subject, action, sessionId, detail) => this.#store.audit(subject, action, sessionId, detail),
+      hasProvider: (id) => this.#providers.has(id),
+      providerIds: () => this.#providers.ids(),
+      normalizeWorkdir: (p) => normalizeWorkdir(p),
+    };
+  }
+
   #makeDispatcherHost(): DispatcherHost {
     return {
       sendToSession: async (task: DispatchTaskRow): Promise<void> => {
@@ -5393,6 +5694,7 @@ mcpHub: this.#mcpHub,
 
     const sessions: SessionInfo[] = [];
     const piloted = this.#pipelineDrivenSessionIds(auth.accountId, auth.projectId);
+    const routineRuns = new Set(this.#routines?.activeRunSessionIds(auth.accountId, auth.projectId) ?? []);
     for (const session of this.#sessions.values()) {
       // Tenancy filter — never enumerate sessions belonging to a
       // different account/project. Same shape as #getOwnedSession.
@@ -5406,7 +5708,11 @@ mcpHub: this.#mcpHub,
       sessions.push({
         ...info,
         attachedClients: session.attachedClientCount,
-        ...(piloted.has(session.id) ? { managedBy: "pipeline" as const } : {}),
+        ...(piloted.has(session.id)
+          ? { managedBy: "pipeline" as const }
+          : routineRuns.has(session.id)
+            ? { managedBy: "routine" as const }
+            : {}),
       });
     }
 

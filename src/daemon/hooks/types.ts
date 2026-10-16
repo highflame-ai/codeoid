@@ -42,6 +42,12 @@ export const HOOK_EVENTS = [
   "provider_switched",
   /** Backing context rotated. Observe-only. */
   "rotated",
+  /**
+   * A routine run finished (docs/routines.md). Observe-only. Carries the
+   * routine, the run's outcome, summary, and cost — route it to Slack or a
+   * pager with a `webhook` hook. Fires per the routine's `notify` policy.
+   */
+  "routine_end",
 ] as const;
 
 export type HookEvent = (typeof HOOK_EVENTS)[number];

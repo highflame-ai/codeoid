@@ -13,6 +13,7 @@
  * Best-effort: logs and swallows failures so a push outage can never wedge the
  * status-change path that fires it.
  */
+import { alertBody } from "../../push-core/types.js";
 import type { PushNotification, PushTarget, PushTransport } from "./types.js";
 
 const EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send";
@@ -30,7 +31,7 @@ export class ExpoPushTransport implements PushTransport {
     const messages = targets.map((t) => ({
       to: t.token,
       title: "codeoid",
-      body: "A session needs your approval",
+      body: alertBody(note.kind),
       // Content-blind: opaque ids only. The app fetches real context over its
       // authenticated socket after the user taps.
       data: { sessionId: note.sessionId, kind: note.kind },

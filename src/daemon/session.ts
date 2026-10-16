@@ -408,6 +408,11 @@ export interface SessionCreateOptions {
    */
   initialMode?: { mode: SessionMode; maxTurns?: number };
   /**
+   * Native spend ceiling for this session's backend query (TurnOpts.maxBudgetUsd).
+   * Routines set it on a fresh run session, whose query lifetime is the run.
+   */
+  maxBudgetUsd?: number;
+  /**
    * Shape of a dispatch-spawned worker ("ship" | "scout"). Selects the
    * shape-capped LEAF identity profile (registerWorker) instead of the
    * standard session-agent registration: scouts hold no tools:write, and no
@@ -935,6 +940,8 @@ export class Session {
   #unattended = 0;
   /** errorMessage of the most recent turn if it ended in an error; cleared when a turn starts. */
   #lastTurnError: string | null = null;
+  /** See SessionCreateOptions.maxBudgetUsd. */
+  #maxBudgetUsd: number | undefined;
 
   #subagents = new Map<
     string,
@@ -1075,6 +1082,7 @@ export class Session {
     this.#onStatusChange = opts.onStatusChange;
     this.#workerShape = opts.workerShape;
     this.#collaborationCost = opts.collaborationCost;
+    this.#maxBudgetUsd = opts.maxBudgetUsd;
     if (opts.initialMode) {
       this.#mode = opts.initialMode.mode;
       this.#turnsRemaining =
@@ -2382,6 +2390,7 @@ export class Session {
         // Do NOT pushUserTurn(content) here — the original send() already
         // pushed it before runTurn(). Pushing again duplicates the user turn.
         const recoveryRun = this.#provider.runTurn({
+          ...(this.#maxBudgetUsd !== undefined ? { maxBudgetUsd: this.#maxBudgetUsd } : {}),
           history: this.#accumulator.history,
           userMessage: content,
           model: this.#model ?? undefined,
@@ -2452,6 +2461,7 @@ export class Session {
     }
     this.#accumulator.pushUserTurn(effectivePrompt, turnId, { prompt: text, at: turnAt });
     const run = this.#provider.runTurn({
+          ...(this.#maxBudgetUsd !== undefined ? { maxBudgetUsd: this.#maxBudgetUsd } : {}),
       history: this.#accumulator.history,
       userMessage: effectivePrompt,
       model: this.#model ?? undefined,
@@ -3258,6 +3268,7 @@ export class Session {
         if (turn) this.#currentTurnId = turn.id;
         this.#accumulator.pushUserTurn(prompt, turn?.id, turn ? { prompt: turn.text, at: turn.at } : undefined);
         const run = this.#provider.runTurn({
+          ...(this.#maxBudgetUsd !== undefined ? { maxBudgetUsd: this.#maxBudgetUsd } : {}),
           history: this.#accumulator.history,
           userMessage: prompt,
           model: this.#model ?? undefined,

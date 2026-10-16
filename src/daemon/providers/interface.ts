@@ -95,6 +95,13 @@ export interface UiResponse {
 /** Raise a dialog and await the user's answer. Implemented by Session. */
 export type UiRequestFn = (req: UiRequest) => Promise<UiResponse>;
 
+/**
+ * The turn error a backend reports when it stopped itself at its native spend
+ * ceiling (`TurnOpts.maxBudgetUsd`). One constant, so a caller (routines) can
+ * tell "over budget" from any other failure without parsing vendor text.
+ */
+export const BUDGET_STOP_MESSAGE = "Stopped at the spend ceiling for this run (maxBudgetUsd).";
+
 export interface TurnOpts {
   /**
    * Full canonical history up to and including the current user turn.
@@ -131,6 +138,15 @@ export interface TurnOpts {
    * carries the mode. Absent = treat as `guarded`.
    */
   mode?: SessionMode;
+  /**
+   * Spend ceiling (USD) for the backend's own query loop, for backends that
+   * can enforce one natively (Claude: the SDK's `maxBudgetUsd`, which counts
+   * spend since its query started). Set only on sessions whose query lifetime
+   * IS the budget's scope — a routine's fresh run session. Absent = no cap.
+   * Backends without native enforcement ignore it; the daemon still checks
+   * spend between turns.
+   */
+  maxBudgetUsd?: number;
   /**
    * Subagents contributed by an ambient-activated pack (docs/pack-loading.md).
    * The Claude backend maps these to the SDK's programmatic `agents` option so

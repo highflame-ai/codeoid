@@ -15,8 +15,8 @@ import {
 } from "../protocol/scopes.js";
 
 describe("SCOPES constants", () => {
-  test("all 18 scopes are defined", () => {
-    expect(Object.keys(SCOPES)).toHaveLength(18);
+  test("all 19 scopes are defined", () => {
+    expect(Object.keys(SCOPES)).toHaveLength(19);
     expect(SCOPES.SESSION_CREATE).toBe("session:create");
     expect(SCOPES.SESSION_ATTACH).toBe("session:attach");
     expect(SCOPES.SESSION_WATCH).toBe("session:watch");
@@ -35,10 +35,11 @@ describe("SCOPES constants", () => {
     expect(SCOPES.PIPELINE_READ).toBe("pipeline:read");
     expect(SCOPES.PIPELINE_ANSWER).toBe("pipeline:answer");
     expect(SCOPES.PIPELINE_MANAGE).toBe("pipeline:manage");
+    expect(SCOPES.ROUTINE_MANAGE).toBe("routine:manage");
   });
 
-  test("ALL_SCOPES contains all 18", () => {
-    expect(ALL_SCOPES).toHaveLength(18);
+  test("ALL_SCOPES contains all 19", () => {
+    expect(ALL_SCOPES).toHaveLength(19);
     for (const scope of Object.values(SCOPES)) {
       expect(ALL_SCOPES).toContain(scope);
     }
@@ -46,7 +47,7 @@ describe("SCOPES constants", () => {
 
   test("ALL_SCOPES_STRING is space-delimited", () => {
     const parts = ALL_SCOPES_STRING.split(" ");
-    expect(parts).toHaveLength(18);
+    expect(parts).toHaveLength(19);
     for (const scope of ALL_SCOPES) {
       expect(parts).toContain(scope);
     }
@@ -100,6 +101,8 @@ describe("OPERATOR_SCOPES", () => {
     expect(OPERATOR_SCOPES).toContain(SCOPES.PIPELINE_CREATE);
     expect(OPERATOR_SCOPES).toContain(SCOPES.PIPELINE_READ);
     expect(OPERATOR_SCOPES).not.toContain(SCOPES.PIPELINE_MANAGE);
+    // Standing authority to run agents unattended is owner-tier.
+    expect(OPERATOR_SCOPES).not.toContain(SCOPES.ROUTINE_MANAGE);
   });
 });
 

@@ -604,6 +604,35 @@ const DispatchSchema = z
   });
 
 /**
+ * Routines (docs/routines.md): scheduled and triggered agent runs. On by
+ * default — the engine does nothing until a routine exists, and every routine
+ * is created explicitly by its owner. The kill switch stops every routine at
+ * once without deleting any.
+ */
+const RoutinesSchema = z
+  .object({
+    enabled: z.boolean().default(true),
+    /** Scheduler cadence (ms). Fires land within about this of their time. */
+    tickMs: z.number().int().min(250).max(60_000).default(1_000),
+    /** Runs executing at once across all routines; the rest wait queued. */
+    maxConcurrentRuns: z.number().int().min(1).max(50).default(2),
+    /** Floor for `every` intervals and cron frequency, in seconds. */
+    minIntervalSeconds: z.number().int().min(60).max(86_400).default(60),
+    /** API fires accepted per routine per hour. */
+    apiFiresPerHour: z.number().int().min(1).max(10_000).default(30),
+    /** A scheduled fire later than this (the daemon was down) counts as missed. */
+    missedGraceSeconds: z.number().int().min(10).max(86_400).default(120),
+  })
+  .default({
+    enabled: true,
+    tickMs: 1_000,
+    maxConcurrentRuns: 2,
+    minIntervalSeconds: 60,
+    apiFiresPerHour: 30,
+    missedGraceSeconds: 120,
+  });
+
+/**
  * Outward control-plane MCP endpoint (`/mcp/control`, docs/mcp-control.md):
  * lets an EXTERNAL agent (Claude Code, Cursor, a CI job) drive codeoid
  * sessions over MCP Streamable HTTP.
@@ -1086,6 +1115,7 @@ const RootSchema = z.object({
   conductor: ConductorSchema,
   dispatch: DispatchSchema,
   mcpControl: McpControlSchema,
+  routines: RoutinesSchema,
   collaboration: CollaborationSchema,
   rateLimit: RateLimitSchema,
   pipeline: PipelineSchema,
@@ -1122,6 +1152,9 @@ type ParsedConfig = z.infer<typeof RootSchema>;
  * Flattened, path-resolved config consumed by the daemon + client. Shape is
  * append-only — add new fields here, don't rename existing ones.
  */
+/** Parsed `routines` block (see RoutinesSchema). */
+export type RoutinesConfigBlock = z.infer<typeof RoutinesSchema>;
+
 /** Parsed `mcpControl` block (see McpControlSchema). */
 export type McpControlConfig = z.infer<typeof McpControlSchema>;
 
@@ -1282,6 +1315,11 @@ export interface CodeoidConfig {
    * type so hand-built test configs stay minimal; absent = disabled.
    */
   mcpControl?: McpControlConfig;
+  /**
+   * Routines (see RoutinesSchema). Optional in the type so hand-built test
+   * configs stay minimal; absent = the defaults (enabled).
+   */
+  routines?: RoutinesConfigBlock;
   dispatch?: {
     enabled: boolean;
     tickMs: number;
@@ -1468,6 +1506,10 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   // Control-plane MCP switches — per-invocation, e.g. a CI runner that turns
   // the endpoint on for one job. The rest of the block is file-config only.
   { env: "CODEOID_MCP_CONTROL_ENABLED", path: "mcpControl.enabled", kind: "boolean" },
+  // Routines kill switch — stop every routine for one run of the daemon
+  // without touching config.json (nothing is deleted). Other knobs: file only.
+  { env: "CODEOID_ROUTINES_ENABLED", path: "routines.enabled", kind: "boolean" },
+  { env: "CODEOID_ROUTINES_MAX_CONCURRENT", path: "routines.maxConcurrentRuns", kind: "int" },
   { env: "CODEOID_MCP_CONTROL_ACTIONS", path: "mcpControl.allowActions", kind: "boolean" },
   { env: "CODEOID_MAX_SESSIONS_PER_USER", path: "rateLimit.maxSessionsPerUser", kind: "int" },
   { env: "CODEOID_MAX_SESSIONS_PER_HOUR", path: "rateLimit.maxCreationsPerHour", kind: "int" },
@@ -1704,6 +1746,7 @@ export function loadConfig(opts: LoadOptions = {}): CodeoidConfig {
     conductor: parsed.conductor,
     dispatch: parsed.dispatch,
     mcpControl: parsed.mcpControl,
+    routines: parsed.routines,
     collaboration: parsed.collaboration,
     rateLimit: parsed.rateLimit,
     pipeline: parsed.pipeline,

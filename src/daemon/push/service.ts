@@ -83,6 +83,15 @@ export class PushService {
    * status-change path either.
    */
   async notifyApproval(sessionId: string, owner: SessionOwner): Promise<void> {
+    await this.#notify(sessionId, owner, "approval");
+  }
+
+  /** A routine run finished with something for its owner to look at. */
+  async notifyRoutine(sessionId: string, owner: SessionOwner): Promise<void> {
+    await this.#notify(sessionId, owner, "routine");
+  }
+
+  async #notify(sessionId: string, owner: SessionOwner, kind: PushNotification["kind"]): Promise<void> {
     if (!this.enabled) return;
     let targets: Array<{ token: string; platform: "ios" | "android" }>;
     try {
@@ -92,7 +101,7 @@ export class PushService {
       return;
     }
     if (targets.length === 0) return;
-    const note: PushNotification = { sessionId, kind: "approval" };
+    const note: PushNotification = { sessionId, kind };
     await this.transport.send(targets, note);
   }
 }

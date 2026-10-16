@@ -590,6 +590,107 @@ export const sessionCompareSchema = z.object({
   afterTurnId: z.string().min(1).max(128).optional(),
 });
 
+// ── Routines (docs/routines.md) ───────────────────────────────────────────────
+// Shape and bounds only; the daemon's RoutineService validates semantics
+// (cron syntax, timezones, workdir, provider, ranges) with specific messages.
+
+const routineRef = z.string().min(1).max(LIMITS.ID_MAX);
+const routineScheduleSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("cron"), expr: z.string().min(1).max(256), timezone: z.string().min(1).max(64) }),
+  z.object({ kind: z.literal("every"), seconds: z.number().int().positive() }),
+  z.object({ kind: z.literal("once"), at: z.string().min(1).max(64) }),
+]);
+const routineSpecFields = {
+  name: z.string().min(1).max(LIMITS.NAME_MAX),
+  prompt: z.string().min(1).max(20_000),
+  workdir: pathField.min(1),
+  provider: z.string().min(1).max(64),
+  model: z.string().min(1).max(LIMITS.MODEL_MAX),
+  schedule: routineScheduleSchema,
+  check: z.object({ command: z.string().min(1).max(4_000), timeoutSeconds: z.number().int().positive().optional() }),
+  approvals: z.enum(["autonomous", "guarded"]),
+  toolBudget: z.number().int(),
+  maxMinutes: z.number().int(),
+  maxCostUsd: z.number(),
+  dailyCostUsd: z.number(),
+  session: z.enum(["fresh", "persistent"]),
+  worktree: z.boolean(),
+  overlap: z.enum(["skip", "queue"]),
+  catchUp: z.boolean(),
+  jitterSeconds: z.number().int(),
+  notify: z.enum(["on_change", "always", "never"]),
+  keepSessions: z.number().int(),
+  api: z.boolean(),
+  failurePauseAfter: z.number().int(),
+};
+const routineSpecSchema = z.object({
+  name: routineSpecFields.name,
+  prompt: routineSpecFields.prompt,
+  workdir: routineSpecFields.workdir,
+  provider: routineSpecFields.provider.optional(),
+  model: routineSpecFields.model.optional(),
+  schedule: routineSpecFields.schedule.optional(),
+  check: routineSpecFields.check.optional(),
+  approvals: routineSpecFields.approvals.optional(),
+  toolBudget: routineSpecFields.toolBudget.optional(),
+  maxMinutes: routineSpecFields.maxMinutes.optional(),
+  maxCostUsd: routineSpecFields.maxCostUsd.optional(),
+  dailyCostUsd: routineSpecFields.dailyCostUsd.optional(),
+  session: routineSpecFields.session.optional(),
+  worktree: routineSpecFields.worktree.optional(),
+  overlap: routineSpecFields.overlap.optional(),
+  catchUp: routineSpecFields.catchUp.optional(),
+  jitterSeconds: routineSpecFields.jitterSeconds.optional(),
+  notify: routineSpecFields.notify.optional(),
+  keepSessions: routineSpecFields.keepSessions.optional(),
+  api: routineSpecFields.api.optional(),
+  failurePauseAfter: routineSpecFields.failurePauseAfter.optional(),
+});
+/** An update: every field optional, and `null` clears an optional one. */
+const routinePatchSchema = z.object(
+  Object.fromEntries(Object.entries(routineSpecFields).map(([k, v]) => [k, v.nullable().optional()])) as {
+    [K in keyof typeof routineSpecFields]: z.ZodOptional<z.ZodNullable<(typeof routineSpecFields)[K]>>;
+  },
+);
+
+export const routineCreateSchema = z.object({ ...base, type: z.literal("routine.create"), spec: routineSpecSchema });
+export const routineUpdateSchema = z.object({
+  ...base,
+  type: z.literal("routine.update"),
+  routine: routineRef,
+  spec: routinePatchSchema.optional(),
+  enabled: z.boolean().optional(),
+});
+export const routineDeleteSchema = z.object({ ...base, type: z.literal("routine.delete"), routine: routineRef });
+export const routineListSchema = z.object({ ...base, type: z.literal("routine.list") });
+export const routineGetSchema = z.object({
+  ...base,
+  type: z.literal("routine.get"),
+  routine: routineRef,
+  runs: z.number().int().min(0).max(100).optional(),
+});
+export const routineRunSchema = z.object({
+  ...base,
+  type: z.literal("routine.run"),
+  routine: routineRef,
+  payload: z.string().max(16_000).optional(),
+});
+export const routineCancelRunSchema = z.object({ ...base, type: z.literal("routine.cancel_run"), runId: idField });
+export const routineRunsSchema = z.object({
+  ...base,
+  type: z.literal("routine.runs"),
+  routine: routineRef,
+  limit: z.number().int().min(1).max(200).optional(),
+  before: z.string().min(1).max(64).optional(),
+});
+export const routineTokenSchema = z.object({ ...base, type: z.literal("routine.token"), routine: routineRef });
+export const routinePreviewSchema = z.object({
+  ...base,
+  type: z.literal("routine.preview"),
+  schedule: routineScheduleSchema,
+  count: z.number().int().min(1).max(20).optional(),
+});
+
 export const compareGetSchema = z.object({ ...base, type: z.literal("compare.get"), compareId: z.string().min(1).max(128) });
 export const compareListSchema = z.object({ ...base, type: z.literal("compare.list"), sessionId: sessionIdField });
 export const compareKeepSchema = z.object({
@@ -828,6 +929,16 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   sessionRewindSchema,
   sessionCompareSchema,
   compareGetSchema,
+  routineCreateSchema,
+  routineUpdateSchema,
+  routineDeleteSchema,
+  routineListSchema,
+  routineGetSchema,
+  routineRunSchema,
+  routineCancelRunSchema,
+  routineRunsSchema,
+  routineTokenSchema,
+  routinePreviewSchema,
   compareListSchema,
   compareKeepSchema,
   mcpOAuthBeginSchema,

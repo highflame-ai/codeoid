@@ -27,8 +27,13 @@ export interface PushTarget {
 export interface PushNotification {
   /** Opaque session id the user should open. */
   sessionId: string;
-  /** What happened. Only "approval" today (a session is blocked awaiting approval). */
-  kind: "approval";
+  /**
+   * What happened: `approval` — a session is blocked awaiting approval;
+   * `routine` — a routine run finished with something to look at (the session
+   * id is the run's session). Content-blind either way: no routine name,
+   * outcome, or summary leaves the daemon.
+   */
+  kind: "approval" | "routine";
 }
 
 /**

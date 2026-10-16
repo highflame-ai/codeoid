@@ -1233,6 +1233,16 @@ export class TerminalClient {
     console.log(`${kind} sent — watch: codeoid pipeline status ${id}`);
   }
 
+  /** One request/response round trip — for command groups that format their own output. */
+  request(msg: ClientMessage): Promise<DaemonMessage> {
+    return this.#request(msg);
+  }
+
+  /** Print a `response.error` (or an unexpected reply) the way every command does. */
+  printError(resp: DaemonMessage): void {
+    this.#printError(resp);
+  }
+
   #request(msg: ClientMessage): Promise<DaemonMessage> {
     return new Promise((resolve, reject) => {
       if (!this.#ws || this.#ws.readyState !== WebSocket.OPEN) {
