@@ -164,7 +164,7 @@ describe("routine lifecycle through the protocol", () => {
     // The routine_end hook carried the outcome (to Slack, a pager, …).
     for (let i = 0; i < 50 && !existsSync(hookFile); i++) await new Promise((r) => setTimeout(r, 20));
     const hook = JSON.parse(readFileSync(hookFile, "utf8"));
-    expect(hook).toMatchObject({ event: "routine_end", routine: { name: "triage" }, run: { status: "succeeded", summary: "Found 2 stale PRs: #12, #15." } });
+    expect(hook).toMatchObject({ event: "routine_end", routine: { name: "triage" }, run: { status: "succeeded", summary: "Found 2 stale PRs: #12, #15." }, notify: true });
 
     // Audit names the routine as the actor of its run.
     const audits = store.database.query("SELECT subject, action FROM audit_log WHERE action LIKE 'routine.%' ORDER BY id").all() as Array<{ subject: string; action: string }>;

@@ -138,6 +138,8 @@ export interface RoutineRunEvent {
   run: RunRow;
   /** True when the routine was auto-paused by this run's outcome. */
   paused: boolean;
+  /** Whether the routine's notify policy wants the owner told (push). Hooks see every run. */
+  push: boolean;
 }
 
 export interface RoutineHost {
@@ -155,7 +157,8 @@ export interface RoutineHost {
   interrupt(sessionId: string): Promise<void>;
   destroy(sessionId: string): Promise<void>;
   /** The owner should hear about this run (push / hooks). Best effort. */
-  notify(event: RoutineRunEvent): void;
+  /** A run reached a terminal status. */
+  runFinished(event: RoutineRunEvent): void;
   audit(subject: string, action: string, sessionId: string | undefined, detail: string): void;
   hasProvider(id: string): boolean;
   providerIds(): string[];
@@ -340,6 +343,12 @@ export class RoutineService {
   readonly #live = new Map<string, LiveRun>();
   /** sessionId → the live run waiting on it. */
   readonly #bySession = new Map<string, LiveRun>();
+  /**
+   * Runs that ended needs_attention, by session. The owner may approve and the
+   * agent finish later; its spend and reply still belong to that run (and to
+   * the daily cap), so they are folded in when the session settles.
+   */
+  readonly #parked = new Map<string, { runId: string; base: Pick<RunRow, "costUsd" | "inputTokens" | "outputTokens"> }>();
   #stopped = false;
 
   constructor(
@@ -543,9 +552,7 @@ export class RoutineService {
       this.#host.audit(subject, "routine.run.finished", final.sessionId ?? undefined, `run=${run.id} status=${status} cost=${final.costUsd.toFixed(4)}`);
       // A routine deleted mid-run has nobody left to tell.
       const current = this.#store.getRoutine(routine.id);
-      if (current && this.#shouldNotify(spec.notify, status, paused)) {
-        this.#host.notify({ routine: current, run: final, paused });
-      }
+      if (current) this.#host.runFinished({ routine: current, run: final, paused, push: this.#shouldNotify(spec.notify, status, paused) });
       return final;
     };
 
@@ -694,6 +701,7 @@ export class RoutineService {
             // Left parked on purpose: the owner can approve and the work goes
             // on. The run ends here; the deadline no longer applies to it.
             finish("needs_attention", { reason: info.waitingOn ?? "waiting for an approval", ...spent });
+            this.#parked.set(sessionId, { runId: run.id, base: { costUsd: baseCost, inputTokens: baseIn, outputTokens: baseOut } });
             return;
           }
           if ((info.status === "idle" || info.status === "error") && !info.turnQueued) {
@@ -739,6 +747,28 @@ export class RoutineService {
   /** Session status changed — wake the run waiting on it, if any. */
   onSessionStatus(sessionId: string): void {
     this.#bySession.get(sessionId)?.wake();
+    const parked = this.#parked.get(sessionId);
+    if (!parked) return;
+    const info = this.#host.info(sessionId);
+    if (!info) {
+      this.#parked.delete(sessionId);
+      return;
+    }
+    const { base } = parked;
+    const usage = {
+      costUsd: Math.max(0, info.costUsd - base.costUsd),
+      inputTokens: Math.max(0, info.inputTokens - base.inputTokens),
+      outputTokens: Math.max(0, info.outputTokens - base.outputTokens),
+    };
+    if ((info.status === "idle" || info.status === "error") && !info.turnQueued) {
+      // The owner answered and the agent finished: the run keeps its status
+      // (it did need attention) but now carries what the agent went on to do.
+      this.#parked.delete(sessionId);
+      const text = this.#host.result(sessionId).text?.trim();
+      this.#store.updateRun(parked.runId, { ...usage, ...(text && !isSilentReply(text) ? { summary: clip(text, LIMITS.SUMMARY_MAX) } : {}) });
+    } else {
+      this.#store.updateRun(parked.runId, usage);
+    }
   }
 
   /** Session ids of runs in flight in this tenant (SessionInfo.managedBy). */

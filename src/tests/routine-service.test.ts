@@ -49,6 +49,7 @@ class FakeHost implements RoutineHost {
   sessions = new Map<string, FakeSession>();
   script: Script = { kind: "reply", text: "all good" };
   notified: RoutineRunEvent[] = [];
+  finished: RoutineRunEvent[] = [];
   audits: string[] = [];
   #n = 0;
 
@@ -131,8 +132,9 @@ class FakeHost implements RoutineHost {
   async destroy(id: string): Promise<void> {
     this.sessions.get(id)!.destroyed = true;
   }
-  notify(e: RoutineRunEvent): void {
-    this.notified.push(e);
+  runFinished(e: RoutineRunEvent): void {
+    this.finished.push(e);
+    if (e.push) this.notified.push(e);
   }
   audit(subject: string, action: string): void {
     this.audits.push(`${subject} ${action}`);
@@ -312,6 +314,18 @@ describe("run outcomes", () => {
     const s = [...host.sessions.values()][0]!;
     expect(s.interrupted).toBe(false);
     expect(host.notified.map((n) => n.run.status)).toEqual(["needs_attention"]);
+
+    // The owner approves and the agent finishes: that spend and reply are still this run's.
+    s.info = { ...s.info, status: "thinking", waitingOn: null, costUsd: 0.2 };
+    svc.onSessionStatus(s.id);
+    expect(store.getRun(run!.id)!.costUsd).toBe(0.2);
+    s.info = { ...s.info, status: "idle", costUsd: 0.3, inputTokens: 900 };
+    s.text = "Cleaned build/ and rebuilt.";
+    svc.onSessionStatus(s.id);
+    expect(store.getRun(run!.id)).toMatchObject({ status: "needs_attention", costUsd: 0.3, inputTokens: 900, summary: "Cleaned build/ and rebuilt." });
+    s.info = { ...s.info, costUsd: 9 };
+    svc.onSessionStatus(s.id);
+    expect(store.getRun(run!.id)!.costUsd).toBe(0.3); // settled: later turns are not this run's
   });
 
   it("names what a park waits on even when the gate registers it a moment after the status flips", async () => {
@@ -502,6 +516,8 @@ describe("policies", () => {
     svc.fire(loud, "manual", null, "owner");
     await settle();
     expect(host.notified.map((n) => [n.routine.spec.name, n.run.status])).toEqual([["loud", "silent"]]);
+    // Hooks are automation, not alerts: they see every run whatever the policy.
+    expect(host.finished.map((n) => [n.routine.spec.name, n.push])).toEqual([["quiet", false], ["loud", true]]);
   });
 });
 

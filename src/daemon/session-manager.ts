@@ -4855,7 +4855,9 @@ mcpHub: this.#mcpHub,
               ? `waiting for approval to run ${parked.toolName}`
               : null,
           costUsd: i.usage?.totalCostUsd ?? 0,
-          inputTokens: i.usage?.inputTokens ?? 0,
+          // usage.inputTokens is uncached input only (Anthropic semantics);
+          // a run reports everything the model read.
+          inputTokens: (i.usage?.inputTokens ?? 0) + (i.usage?.cacheReadTokens ?? 0) + (i.usage?.cacheCreationTokens ?? 0),
           outputTokens: i.usage?.outputTokens ?? 0,
         };
       },
@@ -4876,12 +4878,12 @@ mcpHub: this.#mcpHub,
         this.#forgetCompareBranch(id);
         this.#sessions.delete(id);
       },
-      notify: (e) => {
+      runFinished: (e) => {
         const r = e.routine;
         const sessionId = e.run.sessionId;
         // Content-blind push needs a session to open; a run that never
         // started an agent reaches the owner through hooks and its history.
-        if (sessionId && this.#pushService.enabled) {
+        if (e.push && sessionId && this.#pushService.enabled) {
           void this.#pushService
             .notifyRoutine(sessionId, { sub: r.ownerSub, accountId: r.accountId, projectId: r.projectId })
             .catch((err) => console.error("[codeoid/push] routine notify failed:", err));
@@ -4895,7 +4897,7 @@ mcpHub: this.#mcpHub,
             workdir: s?.workdir ?? r.spec.workdir,
             providerId: s?.toInfo().providerId ?? r.spec.provider ?? "",
           },
-          { routine: { id: r.id, name: r.spec.name, paused: !r.enabled, pausedReason: r.pausedReason }, run: toRunWire(e.run), paused: e.paused },
+          { routine: { id: r.id, name: r.spec.name, paused: !r.enabled, pausedReason: r.pausedReason }, run: toRunWire(e.run), paused: e.paused, notify: e.push },
         );
       },
       audit: (subject, action, sessionId, detail) => this.#store.audit(subject, action, sessionId, detail),
