@@ -374,15 +374,15 @@ export class RoutineStore {
   }
 
   /** Session ids of finished runs, newest first — retention picks from here. */
-  finishedRunSessions(routineId: string, limit: number): Array<{ runId: string; sessionId: string }> {
+  finishedRunSessions(routineId: string): Array<{ runId: string; sessionId: string }> {
     const ph = ACTIVE_RUN_STATUSES.map(() => "?").join(", ");
     return this.#db
       .prepare(
         `SELECT id AS runId, session_id AS sessionId FROM routine_runs
          WHERE routine_id = ? AND session_id IS NOT NULL AND status NOT IN (${ph})
-         ORDER BY created_at DESC, rowid DESC LIMIT ?`,
+         ORDER BY created_at DESC, rowid DESC`,
       )
-      .all(routineId, ...ACTIVE_RUN_STATUSES, limit) as Array<{ runId: string; sessionId: string }>;
+      .all(routineId, ...ACTIVE_RUN_STATUSES) as Array<{ runId: string; sessionId: string }>;
   }
 
   /**

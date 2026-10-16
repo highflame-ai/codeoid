@@ -45,6 +45,8 @@ interface FakeSession {
   unattended: number;
   parkPolls?: number;
   lastRole: "user" | "assistant" | null;
+  mode: string;
+  disarmed: number;
 }
 
 class FakeHost implements RoutineHost {
@@ -54,6 +56,7 @@ class FakeHost implements RoutineHost {
   finished: RoutineRunEvent[] = [];
   audits: string[] = [];
   auditDetails: string[] = [];
+  defaultProvider = "claude";
   #n = 0;
   #turns = 0;
 
@@ -71,6 +74,8 @@ class FakeHost implements RoutineHost {
       armed: [],
       unattended: 0,
       lastRole: null,
+      mode: opts.approvals,
+      disarmed: 0,
     });
     return id;
   }
@@ -78,8 +83,20 @@ class FakeHost implements RoutineHost {
     const s = this.sessions.get(id);
     return !!s && !s.destroyed;
   }
+  disarm(id: string): void {
+    const s = this.sessions.get(id);
+    if (s && s.mode === "autonomous") {
+      s.mode = "guarded";
+      s.disarmed++;
+    }
+  }
+  defaultProviderId(): string {
+    return this.defaultProvider;
+  }
   armSession(id: string, approvals: string, budget: number): void {
-    this.sessions.get(id)?.armed.push({ approvals, budget });
+    const s = this.sessions.get(id);
+    if (s) s.mode = approvals;
+    s?.armed.push({ approvals, budget });
   }
   async send(id: string, text: string, sender: AuthContext): Promise<void> {
     const s = this.sessions.get(id)!;
@@ -131,7 +148,7 @@ class FakeHost implements RoutineHost {
   }
   result(id: string, sinceTurnId: string | null) {
     const s = this.sessions.get(id)!;
-    const answered = s.lastRole === "assistant" && s.info.lastTurnId !== sinceTurnId;
+    const answered = s.lastRole === "assistant" && s.info.lastTurnId !== null && s.info.lastTurnId !== sinceTurnId;
     return { text: answered ? s.text : null, error: s.error };
   }
   beginUnattended(id: string): () => void {
@@ -524,12 +541,7 @@ describe("policies", () => {
     expect(host.sessions.size).toBe(1);
     const s = [...host.sessions.values()][0]!;
     expect(s.prompts).toHaveLength(2);
-    // Armed for the second run; handed back guarded after each run.
-    expect(s.armed).toEqual([
-      { approvals: "guarded", budget: 0 },
-      { approvals: "guarded", budget: 7 },
-      { approvals: "guarded", budget: 0 },
-    ]);
+    expect(s.armed).toEqual([{ approvals: "guarded", budget: 7 }]);
     // If its session is gone, the next run makes a new one.
     s.destroyed = true;
     svc.fire(store.getRoutine(routine.id)!, "manual", null, "owner");
@@ -643,19 +655,22 @@ describe("authority left behind", () => {
     await settle();
     const s = [...host.sessions.values()][0]!;
     expect(s.opts.approvals).toBe("autonomous");
-    expect(s.armed.at(-1)).toEqual({ approvals: "guarded", budget: 0 });
+    expect(s.mode).toBe("guarded");
   });
 
-  it("a parked run's session is handed back guarded once the owner's approval lets it finish", async () => {
+  it("a run that parks on the owner is disarmed at once — what runs after their answer is guarded", async () => {
     const { routine } = create({});
     host.script = { kind: "park", waitingOn: "waiting for approval to run Bash" };
     svc.fire(routine, "manual", null, "owner");
     await settle();
-    const s = [...host.sessions.values()][0]!;
-    expect(s.armed).toEqual([]);
-    s.info = { ...s.info, status: "idle", waitingOn: null };
-    svc.onSessionStatus(s.id);
-    expect(s.armed).toEqual([{ approvals: "guarded", budget: 0 }]);
+    expect([...host.sessions.values()][0]!.mode).toBe("guarded");
+  });
+
+  it("a mode the owner chose for a guarded routine's session is left alone", async () => {
+    const { routine } = create({ approvals: "guarded" });
+    svc.fire(routine, "manual", null, "owner");
+    await settle();
+    expect([...host.sessions.values()][0]!.disarmed).toBe(0);
   });
 
   it("the audit log names a check by digest, never by its text", () => {
@@ -667,10 +682,17 @@ describe("authority left behind", () => {
     expect(details).toMatch(/changed=check check:sha256:[0-9a-f]{16}\/\d+->sha256:/);
   });
 
-  it("qwen can't take an API trigger", () => {
+  it("qwen can't take an API trigger — named, or as the default backend, then or later", async () => {
     expect(() => create({ provider: "codex", api: true })).not.toThrow();
     host.hasProvider = () => true;
     expect(() => create({ name: "q", provider: "qwen", api: true })).toThrow("qwen backend can't take an API trigger");
+    const { routine } = create({ name: "later", api: true });
+    host.defaultProvider = "qwen";
+    expect(() => create({ name: "now", api: true })).toThrow("qwen backend can't take an API trigger");
+    svc.fire(store.getRoutine(routine.id)!, "api", "hi", "routine-token");
+    await settle();
+    expect(store.listRuns(routine.id, { limit: 1 })[0]).toMatchObject({ status: "failed" });
+    expect(host.sessions.size).toBe(0);
   });
 });
 

@@ -162,6 +162,10 @@ export interface RoutineHost {
   sessionAlive(sessionId: string, accountId: string, projectId: string): boolean;
   /** Re-arm approvals/budget on a reused (persistent) session. */
   armSession(sessionId: string, approvals: RoutineSpec["approvals"], toolBudget: number): void;
+  /** Step a session down from autonomous to guarded; any other mode is left as it is. */
+  disarm(sessionId: string): void;
+  /** The backend a session gets when none is named. */
+  defaultProviderId(): string;
   send(sessionId: string, text: string, sender: AuthContext): Promise<void>;
   info(sessionId: string): RunSessionInfo | null;
   /**
@@ -485,16 +489,11 @@ export class RoutineService {
     try {
       const now = this.#now();
       for (const r of this.#store.listDue(now)) {
-        // One routine whose stored schedule can no longer be evaluated must
-        // not starve every routine due after it.
+        // One routine's failure must not starve every routine due after it.
         try {
           this.#fireScheduled(r, now);
         } catch (err) {
-          // Pause it rather than retry every tick forever; the owner sees why.
-          const why = `its schedule can no longer be evaluated: ${err instanceof Error ? err.message : String(err)}`;
-          console.error(`[codeoid/routines] routine ${r.id} paused: ${why}`);
-          this.#store.setPaused(r.id, why, now);
-          this.#host.audit(`routine:${r.id}`, "routine.paused", undefined, why.slice(0, 200));
+          console.error(`[codeoid/routines] routine ${r.id} could not fire: ${err instanceof Error ? err.message : String(err)}`);
         }
       }
       this.#drainQueue();
@@ -509,7 +508,17 @@ export class RoutineService {
     const schedule = r.spec.schedule;
     const due = r.nextFireAt;
     if (!schedule || due === null) return;
-    const next = this.#nextFire(r, schedule, new Date(Math.max(now, due)));
+    let next: number | null;
+    try {
+      next = this.#nextFire(r, schedule, new Date(Math.max(now, due)));
+    } catch (err) {
+      // A stored schedule that can no longer be evaluated (a timezone the
+      // runtime dropped): pause rather than fail every tick; the owner sees why.
+      const why = `its schedule can no longer be evaluated: ${err instanceof Error ? err.message : String(err)}`;
+      this.#store.setPaused(r.id, why, now);
+      this.#host.audit(`routine:${r.id}`, "routine.paused", undefined, why.slice(0, 200));
+      return;
+    }
     // Claim first: only the caller that moves next_fire_at runs this fire.
     if (!this.#store.claimFire(r.id, due, next, now)) return;
     const late = now - due > this.config.missedGraceSeconds * 1000;
@@ -658,6 +667,15 @@ export class RoutineService {
     const startedAt = this.#now();
     const subject = `routine:${routine.id}`;
     const finish = (status: RunStatus, extra: Partial<RunRow>): RunRow => {
+      // Autonomy is the run's, not the session's: from the moment the run ends
+      // — or parks on the owner — a kept or persistent session must not
+      // auto-approve for whoever prompts it next. First, so no later failure
+      // can skip it.
+      if (live.sessionId) {
+        try {
+          this.#host.disarm(live.sessionId);
+        } catch {}
+      }
       const endedAt = this.#now();
       this.#store.setRunStatus(run.id, status, { ...extra, endedAt });
       const failed = FAILURE_RUN_STATUSES.includes(status);
@@ -676,10 +694,6 @@ export class RoutineService {
       const final = this.#store.getRun(run.id) ?? { ...run, ...extra, status, endedAt };
       this.#host.audit(subject, "routine.run.finished", final.sessionId ?? undefined, `run=${run.id} status=${status} cost=${final.costUsd.toFixed(4)}`);
       // A routine deleted mid-run has nobody left to tell.
-      // Autonomy is the run's, not the session's: once the run is over, a
-      // kept or persistent session must not keep auto-approving for whoever
-      // prompts it next. A parked run is handed back when it settles.
-      if (live.sessionId && status !== "needs_attention") this.#host.armSession(live.sessionId, "guarded", 0);
       const current = this.#store.getRoutine(routine.id);
       if (current) this.#host.runFinished({ routine: current, run: final, paused, push: this.#shouldNotify(spec.notify, status, paused) });
       this.#store.trimRuns(routine.id, LIMITS.RUN_HISTORY, utcDayStart(endedAt));
@@ -702,6 +716,11 @@ export class RoutineService {
         }
       }
 
+      // The default backend may have changed to qwen since this was saved.
+      if (run.trigger === "api" && (spec.provider ?? this.#host.defaultProviderId()) === "qwen") {
+        finish("failed", { reason: "the qwen backend can't run an API-triggered routine: it runs read-only shell commands without approval" });
+        return;
+      }
       const workdir = this.#host.normalizeWorkdir(spec.workdir);
       if (!workdir) {
         finish("failed", { reason: `workdir is not usable: ${spec.workdir}` });
@@ -778,6 +797,7 @@ export class RoutineService {
           ...(spec.session === "fresh" && spec.maxCostUsd !== undefined ? { maxCostUsd: spec.maxCostUsd } : {}),
           label: spec.name,
         });
+        live.sessionId = sessionId;
         if (spec.session === "persistent") this.#store.setPersistentSession(routine.id, sessionId);
       }
       live.sessionId = sessionId;
@@ -913,7 +933,6 @@ export class RoutineService {
       // The owner answered and the agent finished: the run keeps its status
       // (it did need attention) but now carries what the agent went on to do.
       this.#parked.delete(sessionId);
-      this.#host.armSession(sessionId, "guarded", 0);
       const text = this.#host.result(sessionId, parked.turn).text?.trim();
       this.#store.updateRun(parked.runId, { ...usage, ...(text && !isSilentReply(text) ? { summary: clip(text, LIMITS.SUMMARY_MAX) } : {}) });
     } else {
@@ -946,9 +965,9 @@ export class RoutineService {
   async #prune(routineId: string): Promise<void> {
     const routine = this.#store.getRoutine(routineId);
     if (!routine || routine.spec.session !== "fresh") return;
-    // Every row that still names a session (history is capped, so this is
-    // bounded): one skipped because someone had it open is looked at again.
-    const finished = this.#store.finishedRunSessions(routineId, LIMITS.RUN_HISTORY);
+    // Every row that still names a session: one skipped because someone had
+    // it open is looked at again on the next pass.
+    const finished = this.#store.finishedRunSessions(routineId);
     for (const { sessionId } of finished.slice(routine.spec.keepSessions)) {
       // A session the routine kept as persistent before switching to fresh is
       // still its conversation, not a run's leftover.
@@ -1060,7 +1079,7 @@ export class RoutineService {
     // qwen-code runs shell commands it judges read-only without asking, even
     // when guarded, so a routine fed by outside callers could be steered to
     // read any file the daemon can. Refused rather than documented away.
-    if (spec.api && spec.provider === "qwen") bad("the qwen backend can't take an API trigger: it runs read-only shell commands without approval");
+    if (spec.api && (spec.provider ?? this.#host.defaultProviderId()) === "qwen") bad("the qwen backend can't take an API trigger: it runs read-only shell commands without approval");
     return spec;
   }
 
@@ -1140,7 +1159,14 @@ export class RoutineService {
     let nextFireAt = r.nextFireAt;
     if (!spec.schedule) nextFireAt = null;
     else if (scheduleChanged || reEnabled || nextFireAt === null || spec.jitterSeconds !== r.spec.jitterSeconds) {
-      nextFireAt = this.#nextFire(base, spec.schedule, new Date(now));
+      try {
+        nextFireAt = this.#nextFire(base, spec.schedule, new Date(now));
+      } catch (err) {
+        throw new RoutineError(
+          `this routine's schedule can no longer be evaluated (${err instanceof Error ? err.message : String(err)}) — give it a new one`,
+          "invalid_request",
+        );
+      }
     }
     this.#store.updateRoutine(r.id, { spec, enabled, pausedReason: enabled ? null : r.pausedReason, nextFireAt, anchorAt, resetStreak: reEnabled }, now);
     let apiToken: string | null = null;

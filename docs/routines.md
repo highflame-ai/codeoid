@@ -218,12 +218,17 @@ That matters because a routine's runs act as its owner.
 **Its runs are ordinary sessions.**
 Like any session you start, a run's session is visible to your tenant under codeoid's usual session scopes: someone holding `session:watch` can read its transcript, which includes the prompt with the check output and payload, and someone holding `session:send` can prompt it.
 So don't put in a check's output, or a payload, what your tenant's watchers shouldn't read.
-Autonomy belongs to the run, not the session: when a run ends, its session is set back to guarded, so whoever prompts it afterwards gets no pre-approved tool calls.
+Autonomy belongs to the run, not the session: the moment a run ends or stops to wait on you, its session steps down from autonomous to guarded, so what runs after your answer, and whoever prompts the session later, gets no pre-approved tool calls.
+
+Two consequences of runs being ordinary sessions are worth knowing when your tenant includes tokens that can send but not approve (an MCP `operate` token, say):
+
+- While an autonomous run is going, a message from anyone holding `session:send` joins it and is auto-approved like the run's own work, as it would be in any autonomous session.
+- In a persistent autonomous routine, anything said in its session between runs becomes context for the next autonomous run. Don't make a routine both `--persistent` and autonomous where send-only tokens can reach it; use `--fresh`, or `--guarded`.
 
 Every routine command needs the `routine:manage` scope, reading included: a routine's definition and run history are not for read-only share tokens.
 Only `routine preview`, which saves nothing, needs just `session:list`.
 Creating, changing, firing and deleting also need `session:create` and `session:send`, because a routine creates sessions and prompts them.
-A routine that is autonomous, or that has a check, also needs `session:approve` to save, run by hand, or re-token: an autonomous run approves its own tool calls, and a check is a shell command that runs on the daemon's host without asking anyone, so only someone who could approve that command interactively may set it going.
+A routine that is autonomous, or that has a check, also needs `session:approve` to save, run by hand, re-token or resume (pausing never does: it is a safety stop): an autonomous run approves its own tool calls, and a check is a shell command that runs on the daemon's host without asking anyone, so only someone who could approve that command interactively may set it going.
 A delegated token (an agent acting for someone) can list routines but not create or change them: a routine is standing authority, and delegation is meant to be narrow.
 `routine:manage` is not in the operator share-token preset, so a teammate you share a session with cannot schedule work on your machine.
 
@@ -318,7 +323,7 @@ As of October 2026, from each product's public documentation; — means we found
 - **The scheduler lives in the daemon.** No daemon, no fires; missed fires are skipped or caught up once, as configured.
 - **No event triggers yet.** GitHub, Slack and similar sources are planned; until then, point their webhooks at a small relay that calls the API trigger, or poll from a check.
 - **CLI only for now.** The web UI shows a routine's run sessions (marked as routine-managed) but has no routine screen yet.
-- **The qwen backend runs read-only shell commands without asking**, even in a guarded routine (a property of qwen-code itself, described under "Qwen backend" in the repository's CLAUDE.md), so an unattended qwen routine fed outside text could be steered to read any file the daemon user can. codeoid refuses an API trigger on a qwen routine; a qwen routine whose check reads untrusted text (issues, emails) carries the same risk, so prefer another backend there.
+- **The qwen backend runs read-only shell commands without asking**, even in a guarded routine (a property of qwen-code itself, described under "Qwen backend" in the repository's CLAUDE.md), so an unattended qwen routine fed outside text could be steered to read any file the daemon user can. codeoid refuses an API trigger on a routine that runs on qwen, whether named or as the daemon's default backend, and fails an API run if the default has since become qwen; a qwen routine whose check reads untrusted text (issues, emails) carries the same risk, so prefer another backend there.
 - **Routines are tied to the identity that made them** (see [Who can do what](#who-can-do-what)): another key or the web UI's sign-in won't see them, and Studio's embedded sign-in doesn't carry `routine:manage` yet.
 - **A kept run session keeps the run's spend ceiling.** If you continue a fresh run's session yourself on Claude, its turns stop at that run's `--max-cost`; start a new session for open-ended work.
 - **The hard spend cap is Claude-only, and fresh-session-only.** Other backends, and persistent sessions, report spend when a turn ends, and a run is usually one turn, so there `--max-cost` marks the run `over_budget` (and counts toward the failure pause) rather than stopping it part-way. Backends on a subscription may report no cost at all. On those, `--max-minutes` and `--tool-budget` are the limits that actually bound a run.

@@ -273,6 +273,9 @@ describe("authority", () => {
       expect(res).toMatchObject({ code: "forbidden" });
       expect(res.type === "response.error" && res.error).toContain("session:approve");
     }
+    // ...but pausing is a safety stop any managing credential may pull.
+    expect(await call({ type: "routine.update", routine: "triage", enabled: false }, NO_APPROVE)).toMatchObject({ type: "routine.snapshot" });
+    expect(await call({ type: "routine.update", routine: "triage", enabled: true }, NO_APPROVE)).toMatchObject({ code: "forbidden" });
   });
 
   it("a read-only token can't read routines (prompts, checks, payloads) or fire them", async () => {

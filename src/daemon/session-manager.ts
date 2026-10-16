@@ -4767,7 +4767,10 @@ mcpHub: this.#mcpHub,
           };
         }
         case "routine.update": {
-          if (needsApprove(msg.spec as { approvals?: string | null; check?: unknown } | undefined, r) && !hasScope(scopes, SCOPES.SESSION_APPROVE)) {
+          // Pausing is a safety stop: any credential that can manage the
+          // routine may pull it, whatever the routine pre-approves.
+          const pauseOnly = msg.spec === undefined && msg.enabled === false;
+          if (!pauseOnly && needsApprove(msg.spec as { approvals?: string | null; check?: unknown } | undefined, r) && !hasScope(scopes, SCOPES.SESSION_APPROVE)) {
             return err("Missing scope: session:approve (an autonomous routine, or one with a check command, pre-approves work)", "forbidden");
           }
           const { routine, apiToken } = svc.update(
@@ -4863,6 +4866,11 @@ mcpHub: this.#mcpHub,
         const s = this.#sessions.get(id);
         return !!s && s.accountId === accountId && s.projectId === projectId;
       },
+      disarm: (id) => {
+        const s = this.#sessions.get(id);
+        if (s?.mode === "autonomous") s.setMode("guarded");
+      },
+      defaultProviderId: () => this.#providers.defaultId,
       armSession: (id, approvals, toolBudget) => {
         this.#sessions.get(id)?.setMode(approvals === "autonomous" ? "autonomous" : "guarded", toolBudget);
       },
