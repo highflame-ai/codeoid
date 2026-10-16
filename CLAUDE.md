@@ -9,11 +9,10 @@ codeoid start
   ├── Bun.serve() — HTTP + WebSocket server
   ├── ShutdownManager — cleanup registry, signal handlers, 30s grace period
   ├── SessionManager — rate limiting, session resume, scope enforcement
-  │   ├── ProviderRegistry — pluggable backends (claude default; openai, gemini, codex, pi, gemini-cli, qwen)
+  │   ├── ProviderRegistry — pluggable backends (claude default; openai, gemini, codex, pi, gemini-cli, qwen, llamacpp)
   │   └── Session × N — each drives one provider backend (Claude Agent SDK by default)
   │       ├── ScrollbackBuffer — circular ring, replayed on device handoff
   │       ├── TranscriptStore — JSONL persistence, survives daemon restart
-  │       ├── RetryManager — exponential backoff, fallback model
   │       └── AgentIdentityManager — ZeroID identities for agents + sub-agents
   ├── Web UI frontend (SolidJS, served at /ui, also Telegram Mini App)
   └── Telegram frontend (embedded, direct SessionManager access)
@@ -55,19 +54,18 @@ src/
 │   ├── providers/                # Pluggable agent backends behind one SessionProvider interface
 │   │   ├── registry.ts           #   ProviderRegistry + createDefaultProviderRegistry()
 │   │   ├── interface.ts          #   SessionProvider contract
-│   │   └── claude|openai|gemini|codex|pi|acp|qwen/  # one dir per backend (acp = Gemini CLI)
+│   │   └── claude|openai|gemini|codex|pi|acp|qwen|llamacpp/  # one dir per backend (acp = Gemini CLI)
 │   ├── store.ts                  # bun:sqlite — sessions + audit_log tables
 │   ├── auth.ts                   # ZeroID JWT verification via @highflame/sdk
 │   ├── agent-identity.ts         # ZeroID identities for coding agents + sub-agents
 │   ├── scrollback.ts             # Circular ring buffer for device handoff replay
 │   ├── transcript.ts             # JSONL persistence for session resume
-│   ├── retry.ts                  # Exponential backoff, fallback model, error categories
 │   ├── rate-limit.ts             # Per-user session creation + concurrency limits
 │   ├── shutdown.ts               # Cleanup registry, signal handlers, grace period
 │   └── index.ts
-├── protocol/
+├── protocol/                     # re-export shims for @highflame/codeoid-protocol (packages/protocol)
 │   ├── types.ts                  # Client<->Daemon message protocol
-│   ├── scopes.ts                 # 8 permission scopes
+│   ├── scopes.ts                 # 17 permission scopes (source: packages/protocol/src/scopes.ts)
 │   └── index.ts
 ├── frontends/
 │   ├── types.ts                  # Frontend plugin interface
@@ -81,7 +79,7 @@ src/
 ## Tech Stack
 
 - **Runtime**: Bun (native WebSocket, bun:sqlite, Bun.serve())
-- **Agent backends**: pluggable via `ProviderRegistry` — Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`, default), plus OpenAI, Gemini, Codex, pi, the Gemini CLI, and Qwen Code (`@qwen-code/sdk`)
+- **Agent backends**: pluggable via `ProviderRegistry` — Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`, default), plus OpenAI, Gemini, Codex, pi, the Gemini CLI, Qwen Code (`@qwen-code/sdk`), and llama.cpp (`llamacpp`, opt-in)
 - **Auth**: ZeroID via `@highflame/sdk` (local JWKS verification)
 - **Telegram**: Grammy
 - **CLI**: Commander
@@ -93,7 +91,8 @@ No native addon dependencies. Single `bun build` produces a 1.1MB bundle.
 
 ### Sessions
 A session = one agent backend (the Claude Agent SDK by default; also Codex,
-Gemini, OpenAI, pi, the Gemini CLI, or Qwen Code) working in one directory.
+Gemini, OpenAI, pi, the Gemini CLI, Qwen Code, or a local llama.cpp server)
+working in one directory.
 Sessions are named, persistent, and daemon-owned. Multiple clients can
 attach/detach simultaneously from any frontend.
 
@@ -103,6 +102,11 @@ Every connection requires a ZeroID JWT. Scopes are enforced per-message:
 - `session:list` — discovery
 - `session:attach` / `session:watch` — connect to sessions
 - `session:send` / `session:interrupt` / `session:approve` — interact
+- `session:read` / `session:dispatch` — conductor fleet visibility + routing (agent identity)
+- `fleet:read` — subscribe a client to the fleet board
+- `fs:read` — read files under a session's workdir
+- `settings:read` / `settings:write` — daemon configuration
+- `pipeline:create` / `pipeline:read` / `pipeline:answer` / `pipeline:manage` — SDLC pipelines + packs
 
 Delegation: users can share scoped tokens (e.g. read-only watcher) with teammates.
 Revocation: kill a token -> immediately lose access.
@@ -124,7 +128,7 @@ All of it is backend-agnostic: nothing depends on a provider's native session.
 
 ### Device Handoff
 Sessions live in the daemon. Clients are stateless.
-- **Scrollback buffer**: circular ring (500 entries / 1MB) replayed on attach
+- **Scrollback buffer**: circular ring (5000 entries / 20MB) replayed on attach
 - **Transcript persistence**: JSONL per session, user prompts written before API call
 - **Session resume**: on daemon restart, meta files scanned, sessions rebuilt, scrollback restored
 
@@ -132,10 +136,10 @@ Detach from terminal -> attach from Telegram -> same session, same context, scro
 
 ### Production Resilience
 
-**Retry with fallback**: exponential backoff with jitter, error categorization
-(429 rate limit, 529 capacity, 5xx server, auth, connection). Capacity errors
-fall back to a secondary model after 3 attempts. Unattended sessions retry
-indefinitely with up to 5-minute backoff.
+**Retry with fallback**: `session.fallbackModel` (`CODEOID_FALLBACK_MODEL`) is
+handed to the Claude Agent SDK's `fallbackModel` option, so a 429 or 529
+retries the turn on that model instead of failing it. There is no daemon-side
+retry manager.
 
 **Graceful shutdown**: cleanup registry runs in LIFO order on SIGTERM/SIGINT/SIGHUP.
 Sessions drained (in-flight work interrupted), store flushed, WebSockets closed,
@@ -161,7 +165,7 @@ bun run lint         # biome check
 
 codeoid start        # daemon + all frontends
 codeoid ls           # list sessions
-codeoid new <n> <d>  # create session
+codeoid new <n> [d]  # create session (workdir required unless --worktree)
 codeoid attach <n>   # interactive attach (with scrollback replay)
 codeoid send <n> <m> # one-shot message
 codeoid interrupt <n>
