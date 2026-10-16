@@ -223,6 +223,13 @@ export interface NativeTurnRef {
    * sessions by it (Claude): a fork looks the source up there and nowhere else.
    */
   dir?: string;
+  /**
+   * Some tool output in this backing session was redacted by a tool_result
+   * hook: the backend's own record holds the original, so this point must not
+   * be forked natively. Stamped by the session on every later turn of the
+   * backing, so it survives history that no longer shows the redacted call.
+   */
+  redacted?: boolean;
 }
 
 /** What a session asks a provider when it hands it an existing conversation. */
@@ -237,6 +244,12 @@ export interface NativeContinuationRequest {
   forkFrom?: NativeTurnRef;
   /** Char budget for history the provider builds itself (sized to the target window). */
   maxChars: number;
+  /**
+   * False when the history holds turns rebuilt from a displayed transcript:
+   * the provider may fork, but must not build native history from them —
+   * resolve null instead (the session uses the transcript).
+   */
+  allowHistory?: boolean;
   /** Where the continued session runs. */
   workdir: string;
 }

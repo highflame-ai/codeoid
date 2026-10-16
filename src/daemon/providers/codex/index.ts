@@ -403,6 +403,7 @@ export class CodexProvider implements SessionProvider {
       this.#pendingNative = { kind: "fork", threadId: req.forkFrom.backingId, turnId: req.forkFrom.ref, fallback };
       return { via: "fork" };
     }
+    if (req.allowHistory === false) return null;
     const { items, truncation } = toResponsesItems(req.history, { maxChars: req.maxChars });
     if (items.length === 0) return null;
     this.#pendingNative = { kind: "inject", items, fallback };

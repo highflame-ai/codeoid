@@ -498,7 +498,7 @@ export class ClaudeProvider implements SessionProvider {
         console.error(`${tag} native fork of ${req.forkFrom.backingId.slice(0, 8)} failed, building history instead: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
-    if (req.history.length === 0) return null;
+    if (req.history.length === 0 || req.allowHistory === false) return null;
     const id = randomUUID();
     const { entries, truncation } = toClaudeSessionEntries(req.history, { sessionId: id, cwd: req.workdir, maxChars: req.maxChars });
     if (entries.length === 0) return null;
@@ -519,7 +519,11 @@ export class ClaudeProvider implements SessionProvider {
 
   /** Make `id` this provider's backing session, resumed (not created) on the next turn. */
   #adoptBacking(id: string): void {
+    // Adopting a backing during recovery must not re-arm recovery: if this
+    // one can't be resumed either, the turn fails rather than looping.
+    const recovering = this.#backingRecoveryAttempted;
     this.resetToNewSession(id);
+    this.#backingRecoveryAttempted = recovering;
     this.#hasQueried = true;
   }
 

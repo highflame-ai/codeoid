@@ -11,6 +11,7 @@
 
 import {
   CanonicalHistoryAccumulator,
+  canonicalTurnChars,
   type CanonicalTurn,
   type HistorySeedResult,
 } from "./providers/canonical.js";
@@ -752,6 +753,14 @@ export class Session {
    * resumable backing session before this session has ever sent.
    */
   #identityOnNextSend = false;
+  /**
+   * Backing sessions holding output a tool_result hook redacted from codeoid's
+   * record: no native fork of them, ever (#387). Rebuilt from the history's
+   * stamps whenever history is loaded, so it holds across restarts.
+   */
+  readonly #redactedBackings = new Set<string>();
+  /** A tool_result hook redacted output in the turn now running. */
+  #turnRedacted = false;
   /** Context size (tokens) the source of the next fork was last running at — see #continueNatively. */
   #forkSourceContextTokens = 0;
   /** A rewind is in progress: nothing may wake the agent meanwhile. */
@@ -2422,7 +2431,17 @@ export class Session {
         // silently dropped everything but the prompt.
         const history = this.#accumulator.history;
         const before = history.at(-1)?.role === "user" ? history.length - 1 : history.length;
-        if (before > 0) await this.#seedProviderFromHistory(undefined, { upTo: before });
+        if (before > 0) {
+          await this.#seedProviderFromHistory(undefined, { upTo: before });
+          // A transcript seed rides THIS prompt: record it, so an overflow
+          // retries it here rather than leaving the seed for a later send.
+          const asked = history[before];
+          if (this.#pendingSeed && this.#pendingSeed.prompt === undefined && asked?.role === "user" && this.#currentTurnId) {
+            this.#pendingSeed.prompt = content;
+            this.#pendingSeed.sender = recoverySender;
+            this.#pendingSeed.turn = { id: this.#currentTurnId, text: asked.prompt ?? asked.content, at: asked.at ?? new Date().toISOString() };
+          }
+        }
         // Do NOT pushUserTurn(content) here — the original send() already
         // pushed it before runTurn(). Pushing again duplicates the user turn.
         const recoveryRun = this.#provider.runTurn({
@@ -3276,25 +3295,29 @@ export class Session {
     const provider = this.#provider;
     if (!provider.continueNatively) return null;
     // Turns rebuilt from a displayed transcript (an import, a pre-canonical
-    // session) aren't the model's own words: they stay a quoted transcript,
-    // never native history in the assistant's voice.
-    if (history.some((t) => t.role === "assistant" && t.restored)) return null;
+    // session) aren't the model's own words: they are never BUILT into native
+    // history in the assistant's voice. A fork is still fine — it copies the
+    // backend's own record, not the rebuilt text.
+    const allowHistory = !history.some((t) => t.role === "assistant" && t.restored);
     const last = history.at(-1);
     const forkFrom =
       last?.role === "assistant" &&
       last.providerId === provider.id &&
       isNativeRef(last.native) &&
+      !last.native.redacted &&
+      !this.#redactedBackings.has(last.native.backingId) &&
       // A fork copies the backend's own record, which still holds what a
       // tool_result hook redacted from codeoid's: rebuild from codeoid's instead.
       !history.some((t) => t.role === "assistant" && t.toolCalls?.some((tc) => tc.redacted)) &&
       // A fork carries the source's whole context: when that was already near
       // the target's window, build history (budgeted, oldest dropped) instead.
-      this.#forkFits()
+      this.#forkFits(history)
         ? last.native
         : undefined;
+    if (!forkFrom && !allowHistory) return null;
     let result: NativeContinuationResult | null;
     try {
-      result = await provider.continueNatively({ history, ...(forkFrom ? { forkFrom } : {}), maxChars, workdir: this.workdir });
+      result = await provider.continueNatively({ history, ...(forkFrom ? { forkFrom } : {}), maxChars, workdir: this.workdir, allowHistory });
     } catch (err) {
       console.error(`[codeoid/session ${this.id}] native continuation on ${provider.id} failed, using the transcript: ${err instanceof Error ? err.message : String(err)}`);
       return null;
@@ -3318,9 +3341,14 @@ export class Session {
    * the size the source was last running at (a fork's parent, or this session
    * before a rewind or restart). Unknown counts as fitting.
    */
-  #forkFits(): boolean {
-    const tokens = this.#forkSourceContextTokens || this.#usage.lastTurnInputTokens || 0;
-    if (tokens <= 0) return true;
+  #forkFits(history: readonly CanonicalTurn[]): boolean {
+    // The size the source last ran at; unknown (no usage on record) falls back
+    // to an estimate from the history itself, at the seed's chars-per-token.
+    const known = this.#forkSourceContextTokens || this.#usage.lastTurnInputTokens || 0;
+    const tokens =
+      known > 0
+        ? known
+        : history.reduce((n, t) => n + canonicalTurnChars(t), 0) / (this.#config?.session?.seedCharsPerToken ?? 2);
     const window = targetContextWindow(this.#provider.id, this.#model, this.#knownWindow(this.#provider.id));
     return tokens <= window * 0.85;
   }
@@ -3328,6 +3356,43 @@ export class Session {
   /** How full the context was on this session's last turn (tokens) — what a fork of it starts at. */
   get lastContextTokens(): number {
     return this.#usage.lastTurnInputTokens ?? 0;
+  }
+
+  /** Mark a turn's native point as redacted when its backing holds redacted output. */
+  #stampRedaction<E extends Extract<ProviderEvent, { type: "turn_done" }>>(event: E): E {
+    const ref = event.result.nativeRef;
+    // The turn's own point names the backing that recorded the original.
+    // A turn that errored has no point of its own, but its backing still
+    // recorded the original: the provider's current backing is that one.
+    if (this.#turnRedacted) this.#noteRedactedBacking(ref?.backingId ?? this.#provider.backingSessionId);
+    this.#turnRedacted = false;
+    if (!ref || ref.redacted || !this.#redactedBackings.has(ref.backingId)) return event;
+    return { ...event, result: { ...event.result, nativeRef: { ...ref, redacted: true } } };
+  }
+
+  /** Learn which backings hold redacted output from a history being loaded or adopted. */
+  #learnRedactedBackings(history: readonly CanonicalTurn[]): void {
+    for (const t of history) {
+      if (t.role !== "assistant" || !t.native) continue;
+      if (t.native.redacted || t.toolCalls?.some((tc) => tc.redacted)) this.#redactedBackings.add(t.native.backingId);
+    }
+  }
+
+  /** Remember a backing holds redacted output, durably. */
+  #noteRedactedBacking(backingId: string): void {
+    if (this.#redactedBackings.has(backingId)) return;
+    this.#redactedBackings.add(backingId);
+    this.#saveMetaNow();
+  }
+
+  /** Backings this session knows hold redacted output (persisted in meta; a fork inherits them). */
+  get redactedBackings(): readonly string[] {
+    return [...this.#redactedBackings];
+  }
+
+  /** Restore the persisted set on resume (before any reseed). */
+  adoptRedactedBackings(ids: readonly string[]): void {
+    for (const id of ids) this.#redactedBackings.add(id);
   }
 
   /** Say how a fork or switch carried the conversation to this backend. */
@@ -3562,10 +3627,12 @@ export class Session {
      *  "shares the parent's workdir — no isolation" warning). */
     note?: string,
     /** The parent's last context size, so a native fork isn't tried when it wouldn't fit. */
-    opts: { parentContextTokens?: number } = {},
+    opts: { parentContextTokens?: number; redactedBackings?: readonly string[] } = {},
   ): Promise<void> {
     this.#forkSourceContextTokens = opts.parentContextTokens ?? 0;
     this.#accumulator.seed(history);
+    this.#learnRedactedBackings(history);
+    this.adoptRedactedBackings(opts.redactedBackings ?? []);
     // Replay the parent's transcript into the fork for visibility (reusing
     // restoreScrollback's frozen-tool reconciliation), but DON'T let its
     // "prior scrollback ⇒ setHasQueried(true)" fire: a fork's backend is
@@ -4986,7 +5053,7 @@ export class Session {
         if (event.type === "turn_done" && this.#pendingMidTurnCount > 0) {
           this.#pendingMidTurnCount--;
           // Record history / cost for the interrupted partial turn.
-          this.#accumulator.handleEvent(event);
+          this.#accumulator.handleEvent(this.#stampRedaction(event));
           this.#recordTurnFromResult(event.result);
           // Flush per-turn accumulators so the continuation turn starts clean.
           // Same boundary, same reasoning as turn exit: the partial turn's
@@ -5342,6 +5409,10 @@ export class Session {
           });
           if (patched.updatedOutput !== undefined) output = patched.updatedOutput;
         }
+        if (output !== event.output) {
+          this.#turnRedacted = true;
+          this.#noteRedactedBacking(this.#provider.backingSessionId);
+        }
         this.#accumulator.handleEvent(output === event.output ? event : { ...event, output, redacted: true });
         if (msgId) {
           const toolMsg = this.#toolCallMessages.get(msgId);
@@ -5500,7 +5571,7 @@ export class Session {
       }
 
       case "turn_done": {
-        this.#accumulator.handleEvent(event);
+        this.#accumulator.handleEvent(this.#stampRedaction(event));
         this.#recordTurnFromResult(event.result);
         // No sweep here: a terminal turn_done breaks #consumeEvents, whose
         // finally reconciles sub-agents alongside tools. Sweeping here too would
@@ -6651,6 +6722,7 @@ export class Session {
   ): void {
     if (opts.persistHistory) this.#accumulator.seed(history);
     else this.#accumulator.restore(history);
+    this.#learnRedactedBackings(history);
     this.#turnIndex = index.map((e) => ({ ...e }));
     if (opts.persistIndex) void this.#transcriptStore.replaceTurnIndex(this.id, this.#turnIndex);
     this.#canonicalPartial = opts.partial;
@@ -6869,6 +6941,7 @@ export class Session {
       role: this.role,
       providerId: this.#provider.id,
       ...(this.#backingFresh ? { backingFresh: true } : {}),
+      ...(this.#redactedBackings.size > 0 ? { redactedBackings: [...this.#redactedBackings] } : {}),
       forkedFrom: this.forkedFrom,
       worktree: this.worktree,
       // MUST be written here too, not only at create: #writeMetaAtomic

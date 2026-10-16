@@ -21,6 +21,7 @@ import { claudeProjectDirName, toClaudeSessionEntries, type ClaudeSessionEntry }
 import { CodexProvider } from "../daemon/providers/codex/index.js";
 import { toResponsesItems } from "../daemon/providers/codex/native-history.js";
 import type { NormalizedTurnResult, ProviderEvent, TurnOpts, TurnRun } from "../daemon/providers/interface.js";
+import { HookBus } from "../daemon/hooks/bus.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
 import { ProviderRegistry } from "../daemon/providers/registry.js";
 import { SessionManager } from "../daemon/session-manager.js";
@@ -286,6 +287,13 @@ describe("ClaudeProvider.continueNatively", () => {
     expect(p.hasQueried).toBe(true);
   });
 
+  it("told not to build history (restored turns), a failed fork resolves null rather than building it", async () => {
+    const s = sdk({ forkSession: async () => Promise.reject(new Error("gone")) });
+    const p = provider(s);
+    expect(await p.continueNatively({ history, forkFrom: { backingId: "parent-b", ref: "uuid-9" }, maxChars: 1e6, workdir: "/w", allowHistory: false })).toBeNull();
+    expect(s.calls.some((c) => c.startsWith("read "))).toBe(false);
+  });
+
   it("a session the SDK can't read back exactly is removed, and the transcript is used instead", async () => {
     const s = sdk({ getSessionMessages: async () => [{ uuid: "only-one" }] });
     const p = provider(s);
@@ -414,6 +422,9 @@ describe("Session: native first, transcript as the fallback", () => {
   let identity: { registered: string[] } | undefined;
   /** Input tokens each scripted turn reports (the context size a fork of it starts at). */
   let turnInputTokens = 1;
+  /** Replaces the scripted turns of every new provider, when set. */
+  let script: ProviderEvent[][] | undefined;
+  let hooks: HookBus | undefined;
 
   function manager(session: Record<string, unknown> = {}): SessionManager {
     const factory = (id: string) => ({
@@ -422,7 +433,10 @@ describe("Session: native first, transcript as the fallback", () => {
       create: () => {
         const big = (events: ProviderEvent[]) =>
           events.map((e) => (e.type === "turn_done" ? { ...e, result: { ...e.result, inputTokens: turnInputTokens } } : e)) as ProviderEvent[];
-        const p = new MockSessionProvider(id, [big(say("a1", id, { backingId: `${id}-b1`, ref: "00000000-0000-0000-0000-0000000000e1" })), big(say("a2", id, { backingId: `${id}-b1`, ref: "00000000-0000-0000-0000-0000000000e2" })), say("a3", id), say("a4", id)]);
+        const p = new MockSessionProvider(
+          id,
+          script ?? [big(say("a1", id, { backingId: `${id}-b1`, ref: "00000000-0000-0000-0000-0000000000e1" })), big(say("a2", id, { backingId: `${id}-b1`, ref: "00000000-0000-0000-0000-0000000000e2" })), say("a3", id), say("a4", id)],
+        );
         // Like a real warm backend (claude, codex, pi), report the transcript it stashed.
         p.seedResultOverride = { text: "<conversation-history>…", totalTurns: 0, keptTurns: 0, omittedTurns: 0, newestTurnSliced: false };
         if (nativeAnswer) {
@@ -446,7 +460,7 @@ describe("Session: native first, transcript as the fallback", () => {
           getGatewayCredential: () => undefined,
         } as never)
       : undefined;
-    const m = new SessionManager(store, transcript, im, undefined, undefined, { config: mkConfig(session), providers: registry });
+    const m = new SessionManager(store, transcript, im, undefined, undefined, { config: mkConfig(session), providers: registry, ...(hooks ? { hooks } : {}) });
     managers.push(m);
     return m;
   }
@@ -460,6 +474,8 @@ describe("Session: native first, transcript as the fallback", () => {
     nativeAnswer = undefined;
     identity = undefined;
     turnInputTokens = 1;
+    script = undefined;
+    hooks = undefined;
   });
   afterEach(async () => {
     for (const m of managers) await m.drain(2_000).catch(() => {});
@@ -526,16 +542,75 @@ describe("Session: native first, transcript as the fallback", () => {
     expect(req.history.at(-1)).toMatchObject({ role: "assistant" });
   });
 
+  it("once a hook redacts output in a backing, every later turn of it is marked — no native fork, even where the redacted call isn't in view", async () => {
+    hooks = new HookBus([{ event: "tool_result", type: "command", command: `printf '{"updatedOutput":"[REDACTED]"}'` }]);
+    const ref = (n: number) => ({ backingId: "claude-b1", ref: `00000000-0000-0000-0000-00000000000${n}` });
+    script = [
+      [
+        { type: "tool_start", toolId: "t1", sdkToolUseId: "su1", name: "Bash", input: { command: "cat .env" }, approvalId: "ap1" } as ProviderEvent,
+        { type: "tool_complete", sdkToolUseId: "su1", output: "API_KEY=hunter2", success: true } as ProviderEvent,
+        ...say("read it", "claude", ref(1)),
+      ],
+      say("later", "claude", ref(2)),
+    ];
+    nativeAnswer = (req) => ({ via: req.forkFrom ? "fork" : "history", backingId: "nb" });
+    const m = manager();
+    const id = await newSession(m);
+    await m.handle({ type: "session.set_mode", id: "md", sessionId: id, mode: "autonomous", maxTurns: 10 } as never, AUTH, CLIENT);
+    await send(m, id, "one");
+    await send(m, id, "two");
+    const h = m._sessionForTest(id)!.canonicalHistory;
+    const first = h[1] as Extract<CanonicalTurn, { role: "assistant" }>;
+    expect(first.toolCalls?.[0]).toMatchObject({ output: "[REDACTED]", redacted: true });
+    // The later turn has no redacted call of its own, but its backing does.
+    expect((h.at(-1) as Extract<CanonicalTurn, { role: "assistant" }>).native).toMatchObject({ ...ref(2), redacted: true });
+    // Durable the moment it happened: in the meta a restart reads.
+    const meta = JSON.parse(readFileSync(transcript.metaPath(id), "utf8")) as { redactedBackings?: string[] };
+    expect(meta.redactedBackings).toContain("claude-b1");
+    const forked = await fork(m, id);
+    expect(made.at(-1)!.nativeRequests[0]!.forkFrom).toBeUndefined();
+    // ...and the fork inherits it, so its own rewinds can't fork that backing either.
+    expect(m._sessionForTest(forked.id)!.redactedBackings).toContain("claude-b1");
+
+    // A restart that loads only the newest turns still knows — and keeps
+    // marking that backing's new turns, though nothing in them was redacted.
+    script = undefined;
+    hooks = undefined;
+    const m2 = manager();
+    const id2 = await newSession(m2);
+    const s2 = m2._sessionForTest(id2)!;
+    s2.restoreTurns([user("two"), assistant("later", { native: { ...ref(2), redacted: true } })], [], { persistHistory: true, persistIndex: false, partial: true });
+    await send(m2, id2, "three");
+    expect((s2.canonicalHistory.at(-1) as Extract<CanonicalTurn, { role: "assistant" }>).native).toMatchObject({ backingId: "claude-b1", redacted: true });
+    await fork(m2, id2);
+    expect(made.at(-1)!.nativeRequests[0]!.forkFrom).toBeUndefined();
+  });
+
   it("turns rebuilt from a displayed transcript stay a transcript — never native history in the assistant's voice", async () => {
     nativeAnswer = () => ({ via: "history", backingId: "nb" });
     const m = manager();
     const id = await newSession(m);
     await send(m, id, "one");
     const last = m._sessionForTest(id)!.canonicalHistory.at(-1) as Extract<CanonicalTurn, { role: "assistant" }>;
-    last.restored = true;
+    last.restored = true; // rebuilt turns never carry a native point
+    delete last.native;
     await fork(m, id);
     expect(made.at(-1)!.nativeRequests).toEqual([]);
     expect(made.at(-1)!.seededHistory).not.toBeNull();
+  });
+
+  it("an imported session with a real turn since may still fork natively — but is never rebuilt as native history", async () => {
+    nativeAnswer = (req) => (req.forkFrom ? { via: "fork", backingId: "nb" } : null);
+    const m = manager();
+    const id = await newSession(m);
+    await send(m, id, "one");
+    await send(m, id, "two");
+    const first = m._sessionForTest(id)!.canonicalHistory[1] as Extract<CanonicalTurn, { role: "assistant" }>;
+    first.restored = true;
+    await fork(m, id);
+    const req = made.at(-1)!.nativeRequests[0]!;
+    expect(req.forkFrom).toBeDefined(); // the backend's own record, not the rebuilt text
+    expect(req.allowHistory).toBe(false);
   });
 
   it("a malformed native point is not acted on", async () => {
