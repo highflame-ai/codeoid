@@ -116,7 +116,7 @@ export function packPluginsOption(dirs?: readonly string[]): { plugins?: { type:
 /** The SDK's session-file functions native continuation uses; injectable for tests. */
 export interface ClaudeNativeSdk {
   forkSession(sessionId: string, opts: { upToMessageId: string; dir?: string }): Promise<{ sessionId: string }>;
-  getSessionMessages(sessionId: string, opts: { dir: string }): Promise<ReadonlyArray<{ uuid: string }>>;
+  getSessionMessages(sessionId: string, opts?: { dir?: string }): Promise<ReadonlyArray<{ uuid: string }>>;
 }
 
 export interface ClaudeProviderInit {
@@ -320,6 +320,8 @@ export class ClaudeProvider implements SessionProvider {
     this.#pendingHistorySeed = null;
     this.#claudeCodeSessionId = newBackingId;
     this.#hasQueried = false;
+    // A turn anchor belongs to the session it was seen in.
+    this.#translateState.lastChainUuid = null;
     this.#backingRecoveryAttempted = false;
     this.#zeroTurnRecoveryAttempted = false;
     this.#lastPushedContent = null;
@@ -485,6 +487,10 @@ export class ClaudeProvider implements SessionProvider {
           upToMessageId: req.forkFrom.ref,
           ...(req.forkFrom.dir ? { dir: req.forkFrom.dir } : {}),
         });
+        // Read it back the way the CLI will look for it (any project dir):
+        // adopting a session resume can't find would lose the conversation.
+        const read = await sdk.getSessionMessages(sessionId);
+        if (read.length === 0) throw new Error(`the forked session ${sessionId.slice(0, 8)} reads back empty`);
         this.#adoptBacking(sessionId);
         return { via: "fork", backingId: sessionId };
       } catch (err) {
@@ -688,6 +694,9 @@ export class ClaudeProvider implements SessionProvider {
 
     // skillAllowRules computed above (used in the rebuild guard).
     this.#translateState.cwd = opts.workdir;
+    // A rebuilt loop starts a new stream; an anchor from the old one (a turn
+    // that ended without a result) must not be paired with the next result.
+    this.#translateState.lastChainUuid = null;
     this.#query = query({
       prompt: this.#inputQueue,
       options: {
@@ -1544,8 +1553,10 @@ export function translateSDKMessage(
               : r.subtype !== "success" && r.result
                 ? r.result
                 : undefined),
-          // A zero-turn run left nothing in the session to fork at.
-          ...(sessionId && chainEnd && !zeroTurn
+          // Only a turn that completed is a point to fork at: an errored one
+          // (a context overflow) would carry the failure into the fork, and an
+          // interrupted one can end mid tool call.
+          ...(sessionId && chainEnd && !zeroTurn && r.subtype === "success" && !r.is_error
             ? { nativeRef: { backingId: sessionId, ref: chainEnd, ...(state.cwd ? { dir: state.cwd } : {}) } }
             : {}),
         };

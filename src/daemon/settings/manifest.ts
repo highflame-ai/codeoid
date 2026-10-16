@@ -278,6 +278,12 @@ const memory: SettingsTab = {
           default: 0.7,
           advanced: true,
         }),
+        cfg("session.nativeContinuation", "Continue natively", "On a fork, backend switch or rewind, hand Claude and Codex the conversation in their own form — their own fork, or native history — instead of a text transcript. The transcript is still the fallback.", {
+          kind: "boolean",
+          envVar: "CODEOID_NATIVE_CONTINUATION",
+          default: true,
+          advanced: true,
+        }),
       ],
     },
     {

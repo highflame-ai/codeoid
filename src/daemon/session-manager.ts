@@ -3755,7 +3755,7 @@ mcpHub: this.#mcpHub,
       // what sizes the fork's history to the real window instead of the 200k
       // floor — forks never carry a model id, so the cache alone can't key it.
       fork.inheritObservedLimits(parent);
-      await fork.primeFromFork(history, transcriptRows, sizeHints, workdirNote);
+      await fork.primeFromFork(history, transcriptRows, sizeHints, workdirNote, { parentContextTokens: parent.lastContextTokens });
       // The inherited turns keep their ids, list entries and file snapshots
       // (#354) — and the snapshots survive the parent being destroyed.
       // Only turns the fork's history actually contains: the parent may have

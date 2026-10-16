@@ -746,6 +746,14 @@ export class Session {
    * a restart resumes it instead of re-seeding.
    */
   #nativeBackingReady = false;
+  /**
+   * Register the agent identity on the next send even though the backend
+   * already counts as having queried: a native continuation adopts a
+   * resumable backing session before this session has ever sent.
+   */
+  #identityOnNextSend = false;
+  /** Context size (tokens) the source of the next fork was last running at — see #continueNatively. */
+  #forkSourceContextTokens = 0;
   /** A rewind is in progress: nothing may wake the agent meanwhile. */
   #rewinding = false;
   /**
@@ -2409,6 +2417,12 @@ export class Session {
             `[codeoid/session ${this.id}] failed to persist recovered backing id: ${e instanceof Error ? e.message : String(e)}`,
           );
         }
+        // The new session starts empty: hand it the conversation before this
+        // prompt (natively where the backend can take it) — before, recovery
+        // silently dropped everything but the prompt.
+        const history = this.#accumulator.history;
+        const before = history.at(-1)?.role === "user" ? history.length - 1 : history.length;
+        if (before > 0) await this.#seedProviderFromHistory(undefined, { upTo: before });
         // Do NOT pushUserTurn(content) here — the original send() already
         // pushed it before runTurn(). Pushing again duplicates the user turn.
         const recoveryRun = this.#provider.runTurn({
@@ -3189,11 +3203,13 @@ export class Session {
   async #seedProviderFromHistory(
     retry?: { historyLength: number; budgetChars: number; attempts: number },
     /** Tell the session's clients which way the conversation was carried (fork, switch). */
-    opts: { announce?: boolean } = {},
+    opts: { announce?: boolean; upTo?: number } = {},
   ): Promise<boolean> {
     const history = retry
       ? this.#accumulator.history.slice(0, retry.historyLength)
-      : this.#accumulator.history;
+      : opts.upTo !== undefined
+        ? this.#accumulator.history.slice(0, opts.upTo)
+        : this.#accumulator.history;
     this.#pendingSeed = null;
     this.#nativeBackingReady = false;
     if (history.length === 0) return false;
@@ -3270,7 +3286,10 @@ export class Session {
       isNativeRef(last.native) &&
       // A fork copies the backend's own record, which still holds what a
       // tool_result hook redacted from codeoid's: rebuild from codeoid's instead.
-      !history.some((t) => t.role === "assistant" && t.toolCalls?.some((tc) => tc.redacted))
+      !history.some((t) => t.role === "assistant" && t.toolCalls?.some((tc) => tc.redacted)) &&
+      // A fork carries the source's whole context: when that was already near
+      // the target's window, build history (budgeted, oldest dropped) instead.
+      this.#forkFits()
         ? last.native
         : undefined;
     let result: NativeContinuationResult | null;
@@ -3282,6 +3301,7 @@ export class Session {
     }
     if (!result) return null;
     if (result.backingId) {
+      this.#identityOnNextSend = true;
       try {
         this.#store.setClaudeCodeSessionId(this.id, result.backingId);
       } catch (err) {
@@ -3291,6 +3311,23 @@ export class Session {
     }
     if (result.truncation && result.truncation.omittedTurns > 0) this.#surfaceSeedTruncation(result.truncation);
     return result;
+  }
+
+  /**
+   * Whether a native fork's context fits this backend's window, judged from
+   * the size the source was last running at (a fork's parent, or this session
+   * before a rewind or restart). Unknown counts as fitting.
+   */
+  #forkFits(): boolean {
+    const tokens = this.#forkSourceContextTokens || this.#usage.lastTurnInputTokens || 0;
+    if (tokens <= 0) return true;
+    const window = targetContextWindow(this.#provider.id, this.#model, this.#knownWindow(this.#provider.id));
+    return tokens <= window * 0.85;
+  }
+
+  /** How full the context was on this session's last turn (tokens) — what a fork of it starts at. */
+  get lastContextTokens(): number {
+    return this.#usage.lastTurnInputTokens ?? 0;
   }
 
   /** Say how a fork or switch carried the conversation to this backend. */
@@ -3524,7 +3561,10 @@ export class Session {
     /** Optional system note to surface in the fork's scrollback (e.g. a
      *  "shares the parent's workdir — no isolation" warning). */
     note?: string,
+    /** The parent's last context size, so a native fork isn't tried when it wouldn't fit. */
+    opts: { parentContextTokens?: number } = {},
   ): Promise<void> {
+    this.#forkSourceContextTokens = opts.parentContextTokens ?? 0;
     this.#accumulator.seed(history);
     // Replay the parent's transcript into the fork for visibility (reusing
     // restoreScrollback's frozen-tool reconciliation), but DON'T let its
@@ -3550,6 +3590,7 @@ export class Session {
       });
     }
     await this.#seedProviderFromHistory(undefined, { announce: true });
+    this.#forkSourceContextTokens = 0; // the parent's size judged this seed only
     // Brand-new backend: if the daemon restarts before the fork's first
     // prompt, resume must re-seed it, not try to resume nothing — unless the
     // backend already holds the conversation natively.
@@ -4563,7 +4604,9 @@ export class Session {
 
   async #ensureAgentIdentity(sender: AuthContext): Promise<void> {
     const im = this.#identityManager;
-    if (im && !this.#provider.hasQueried && this.#agentIdentity.sub.startsWith("agent:")) {
+    const firstSend = !this.#provider.hasQueried || this.#identityOnNextSend;
+    this.#identityOnNextSend = false;
+    if (im && firstSend && this.#agentIdentity.sub.startsWith("agent:")) {
       try {
         // Dispatch-spawned workers get a shape-capped LEAF identity created
         // under the conductor's lineage; everything else registers the
@@ -6480,6 +6523,7 @@ export class Session {
       console.error(`[codeoid/session ${this.id}] failed to persist rewind backing id: ${err instanceof Error ? err.message : String(err)}`);
     }
     this.#justRotated = false;
+    this.#nativeBackingReady = false;
     if (plan_.keptHistory.length > 0) await this.#seedProviderFromHistory();
     // Until the next prompt, the backend holds nothing: a restart before then
     // must re-seed from the kept history rather than resume an empty backend —

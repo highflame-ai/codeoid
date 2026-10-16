@@ -107,10 +107,13 @@ describe("canonical history as a Claude session", () => {
     expect(entries[0]!.type).toBe("user");
   });
 
-  it("files the session where Claude Code would: every non-alphanumeric becomes '-'", () => {
+  it("files the session exactly where Claude Code would, long paths included", () => {
     expect(claudeProjectDirName("/tmp/spikeB-zI29Li")).toBe("-tmp-spikeB-zI29Li");
+    // The SDK: over 200 chars → the first 200, "-", then |31-hash| in base 36.
     const deep = `/${"a".repeat(300)}`;
-    expect(claudeProjectDirName(deep).length).toBeLessThanOrEqual(200);
+    let h = 0;
+    for (const ch of deep) h = ((h << 5) - h + ch.charCodeAt(0)) | 0;
+    expect(claudeProjectDirName(deep)).toBe(`-${"a".repeat(199)}-${Math.abs(h).toString(36)}`);
   });
 });
 
@@ -164,6 +167,20 @@ describe("Claude records where each turn ends in its own session", () => {
     expect((events.filter((e) => e.type === "turn_done")[1] as { result: NormalizedTurnResult }).result.nativeRef).toBeUndefined();
   });
 
+  it("an errored or budget-stopped turn is no point to fork at", () => {
+    for (const result of [
+      { subtype: "error_during_execution", is_error: true },
+      { subtype: "success", is_error: true, result: "Prompt is too long" },
+      { subtype: "error_max_budget_usd" },
+    ]) {
+      const events: ProviderEvent[] = [];
+      const state: TranslateState = { lastLocalCommandStderr: null, primaryModel: "m" };
+      translateSDKMessage({ type: "assistant", uuid: "a1", parent_tool_use_id: null, message: { content: [] } } as never, (e) => events.push(e), "claude", state);
+      translateSDKMessage({ type: "result", session_id: "b", num_turns: 1, usage: {}, ...result } as never, (e) => events.push(e), "claude", state);
+      expect((events.find((e) => e.type === "turn_done") as { result: NormalizedTurnResult }).result.nativeRef).toBeUndefined();
+    }
+  });
+
   it("names the project dir the session is filed under, so a fork looks only there", () => {
     const events: ProviderEvent[] = [];
     const state: TranslateState = { lastLocalCommandStderr: null, primaryModel: "m", cwd: "/work/repo" };
@@ -209,7 +226,9 @@ describe("ClaudeProvider.continueNatively", () => {
         return { sessionId: "forked-1" };
       },
       getSessionMessages: async (id, opts) => {
-        calls.push(`read ${id} ${opts.dir}`);
+        calls.push(`read ${id}${opts?.dir ? ` ${opts.dir}` : ""}`);
+        // No dir: the fork read-back. The forked session exists.
+        if (!opts?.dir) return id === "forked-1" || id === "f2" ? [{ uuid: "x" }] : [];
         const file = join(configDir, "projects", claudeProjectDirName(opts.dir), `${id}.jsonl`);
         return readFileSync(file, "utf8").trim().split("\n").map((l) => JSON.parse(l) as { uuid: string });
       },
@@ -225,14 +244,31 @@ describe("ClaudeProvider.continueNatively", () => {
     const p = provider(s);
     const r = await p.continueNatively({ history, forkFrom: { backingId: "parent-b", ref: "uuid-9" }, maxChars: 1e6, workdir: "/w" });
     expect(r).toEqual({ via: "fork", backingId: "forked-1" });
-    expect(s.calls).toEqual(["fork parent-b uuid-9"]);
+    expect(s.calls).toEqual(["fork parent-b uuid-9", "read forked-1"]);
     // With the source's dir, the lookup is pinned there.
     let seen: unknown;
-    const pinned = provider(sdk({ forkSession: async (_id, o) => ((seen = o), { sessionId: "f2" }) }));
+    const pinned = provider(
+      sdk({
+        forkSession: async (_id, o) => {
+          seen = o;
+          return { sessionId: "f2" };
+        },
+      }),
+    );
     await pinned.continueNatively({ history, forkFrom: { backingId: "parent-b", ref: "uuid-9", dir: "/src/repo" }, maxChars: 1e6, workdir: "/w" });
     expect(seen).toEqual({ upToMessageId: "uuid-9", dir: "/src/repo" });
     expect(p.backingSessionId).toBe("forked-1");
     expect(p.hasQueried).toBe(true); // resume, not create
+  });
+
+  it("a fork that reads back empty is not adopted — history is built instead", async () => {
+    const s = sdk({ forkSession: async () => ({ sessionId: "ghost" }) });
+    const p = provider(s);
+    const workdir = join(configDir, "work-ghost");
+    mkdirSync(workdir);
+    const r = await p.continueNatively({ history, forkFrom: { backingId: "parent-b", ref: "uuid-9" }, maxChars: 1e6, workdir });
+    expect(r?.via).toBe("history");
+    expect(p.backingSessionId).not.toBe("ghost");
   });
 
   it("when the fork source is gone, builds the session from history instead — and verifies it with the SDK's reader", async () => {
@@ -375,12 +411,18 @@ describe("Session: native first, transcript as the fallback", () => {
       conductor: { enabled: false, name: "conductor", provider: "claude" },
     }) as CodeoidConfig;
 
+  let identity: { registered: string[] } | undefined;
+  /** Input tokens each scripted turn reports (the context size a fork of it starts at). */
+  let turnInputTokens = 1;
+
   function manager(session: Record<string, unknown> = {}): SessionManager {
     const factory = (id: string) => ({
       id,
       displayName: id,
       create: () => {
-        const p = new MockSessionProvider(id, [say("a1", id, { backingId: `${id}-b1`, ref: "00000000-0000-0000-0000-0000000000e1" }), say("a2", id, { backingId: `${id}-b1`, ref: "00000000-0000-0000-0000-0000000000e2" }), say("a3", id)]);
+        const big = (events: ProviderEvent[]) =>
+          events.map((e) => (e.type === "turn_done" ? { ...e, result: { ...e.result, inputTokens: turnInputTokens } } : e)) as ProviderEvent[];
+        const p = new MockSessionProvider(id, [big(say("a1", id, { backingId: `${id}-b1`, ref: "00000000-0000-0000-0000-0000000000e1" })), big(say("a2", id, { backingId: `${id}-b1`, ref: "00000000-0000-0000-0000-0000000000e2" })), say("a3", id), say("a4", id)]);
         // Like a real warm backend (claude, codex, pi), report the transcript it stashed.
         p.seedResultOverride = { text: "<conversation-history>…", totalTurns: 0, keptTurns: 0, omittedTurns: 0, newestTurnSliced: false };
         if (nativeAnswer) {
@@ -394,7 +436,17 @@ describe("Session: native first, transcript as the fallback", () => {
     const registry = new ProviderRegistry("claude");
     registry.register(factory("claude"));
     registry.register(factory("codex"));
-    const m = new SessionManager(store, transcript, undefined, undefined, undefined, { config: mkConfig(session), providers: registry });
+    const im = identity
+      ? ({
+          registerSessionAgent: async (sessionId: string) => {
+            identity!.registered.push(sessionId);
+            return { wimseUri: `spiffe://test/agent/${sessionId}` };
+          },
+          deactivateSessionAgent: async () => {},
+          getGatewayCredential: () => undefined,
+        } as never)
+      : undefined;
+    const m = new SessionManager(store, transcript, im, undefined, undefined, { config: mkConfig(session), providers: registry });
     managers.push(m);
     return m;
   }
@@ -406,6 +458,8 @@ describe("Session: native first, transcript as the fallback", () => {
     managers = [];
     made = [];
     nativeAnswer = undefined;
+    identity = undefined;
+    turnInputTokens = 1;
   });
   afterEach(async () => {
     for (const m of managers) await m.drain(2_000).catch(() => {});
@@ -414,7 +468,9 @@ describe("Session: native first, transcript as the fallback", () => {
   });
 
   async function newSession(m: SessionManager): Promise<string> {
-    const r = await m.handle({ type: "session.create", id: "c", name: `n-${Math.random()}`, workdir: tmp }, AUTH, CLIENT);
+    const workdir = join(tmp, "work");
+    mkdirSync(workdir, { recursive: true });
+    const r = await m.handle({ type: "session.create", id: "c", name: `n-${Math.random()}`, workdir }, AUTH, CLIENT);
     if (r.type !== "response.ok") throw new Error(JSON.stringify(r));
     return (r.data as { id: string }).id;
   }
@@ -491,6 +547,41 @@ describe("Session: native first, transcript as the fallback", () => {
     last.native = { backingId: "../../etc", ref: "x" };
     await fork(m, id);
     expect(made.at(-1)!.nativeRequests[0]!.forkFrom).toBeUndefined();
+  });
+
+  it("a natively continued fork still registers its own agent identity on its first send", async () => {
+    identity = { registered: [] };
+    nativeAnswer = (req) => ({ via: req.forkFrom ? "fork" : "history", backingId: "native-backing" });
+    const m = manager();
+    const id = await newSession(m);
+    await send(m, id, "one");
+    const info = await fork(m, id);
+    expect(made.at(-1)!.hasQueried).toBe(true); // resumes the adopted session...
+    await send(m, info.id, "two");
+    expect(identity.registered).toEqual([id, info.id]); // ...and is still its own agent
+  });
+
+  it("doesn't fork natively when the parent's context was already near the target's window", async () => {
+    turnInputTokens = 50_000_000; // far past any window: the fork would overflow at once
+    nativeAnswer = (req) => ({ via: req.forkFrom ? "fork" : "history", backingId: "nb" });
+    const m = manager();
+    const id = await newSession(m);
+    await send(m, id, "one");
+    await fork(m, id);
+    const req = made.at(-1)!.nativeRequests[0]!;
+    expect(req.forkFrom).toBeUndefined(); // budgeted history instead
+  });
+
+  it("when Claude can't find its session, recovery hands the new one the conversation", async () => {
+    nativeAnswer = () => ({ via: "history", backingId: "recovered" });
+    const m = manager();
+    const id = await newSession(m);
+    await send(m, id, "one");
+    await send(m, id, "two");
+    const p = made.at(-1)!;
+    p.onRecoveryNeeded!("two");
+    for (let i = 0; i < 100 && p.nativeRequests.length === 0; i++) await Bun.sleep(10);
+    expect(p.nativeRequests[0]!.history.map((t) => t.content)).toEqual(["one", "a1", "two", "a2"]);
   });
 
   it("a fork onto another backend asks for native history — no fork point to borrow", async () => {

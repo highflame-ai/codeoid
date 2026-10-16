@@ -131,18 +131,21 @@ export function claudeConfigDir(env: Record<string, string | undefined> = proces
 }
 
 /**
- * The project directory Claude Code files a cwd's sessions under: every
- * character outside [a-zA-Z0-9] becomes "-". Resume finds a session in any
- * project directory, so this only keeps the file where the CLI would put it.
+ * The project directory Claude Code files a cwd's sessions under, exactly as
+ * the SDK names it: every character outside [a-zA-Z0-9] becomes "-", and a
+ * name over 200 characters is cut to 200 plus "-" and a base-36 hash of the
+ * path (the SDK's 32-bit string hash). Must match, or the SDK's reader can't
+ * find the file and every long-path session falls back to the transcript.
  */
 export function claudeProjectDirName(cwd: string): string {
   const name = cwd.replace(/[^a-zA-Z0-9]/g, "-");
-  return name.length <= 200 ? name : `${name.slice(0, 180)}-${djb2(cwd).toString(36)}`;
+  return name.length <= 200 ? name : `${name.slice(0, 200)}-${Math.abs(stringHash(cwd)).toString(36)}`;
 }
 
-function djb2(s: string): number {
-  let h = 5381;
-  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
+/** `h = 31·h + c`, wrapped to int32 — the SDK's hash. */
+function stringHash(s: string): number {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0;
   return h;
 }
 

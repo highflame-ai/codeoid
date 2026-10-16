@@ -426,7 +426,13 @@ export class CodexProvider implements SessionProvider {
     };
     try {
       if (pending.kind === "fork") {
-        const forked = (await this.#proc.request("thread/fork", { threadId: pending.threadId, lastTurnId: pending.turnId, ...config })) as { thread?: { id?: string } };
+        const forked = (await this.#proc.request("thread/fork", {
+          threadId: pending.threadId,
+          lastTurnId: pending.turnId,
+          // Don't stream the whole thread back over stdio; only its id is used.
+          excludeTurns: true,
+          ...config,
+        })) as { thread?: { id?: string } };
         if (!forked.thread?.id) throw new Error("thread/fork returned no thread id");
         return forked.thread.id;
       }
@@ -716,6 +722,9 @@ export class CodexProvider implements SessionProvider {
    * quietly started an empty thread.)
    */
   #adoptThread(id: string): void {
+    // Torn down while the reply was in flight (a backend switch): this thread
+    // is no longer the session's, and must not overwrite its backing id.
+    if (!this.#proc) return;
     this.#threadId = id;
     if (this.#backingSessionId === id) return;
     this.#backingSessionId = id;
@@ -926,7 +935,10 @@ export class CodexProvider implements SessionProvider {
             : {}),
           stopReason: (turn?.status as string | undefined) ?? undefined,
           // Where this turn ends in the thread, for a native fork there (#387).
-          ...(this.#threadId && typeof turn?.id === "string" ? { nativeRef: { backingId: this.#threadId, ref: turn.id } } : {}),
+          // Only a completed turn: a failed one would carry the failure over.
+          ...(this.#threadId && typeof turn?.id === "string" && turn.status === "completed"
+            ? { nativeRef: { backingId: this.#threadId, ref: turn.id } }
+            : {}),
         };
         this.#push({ type: "turn_done", result });
         this.#turnQueue?.close();
