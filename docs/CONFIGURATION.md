@@ -143,6 +143,13 @@ ANTHROPIC_API_KEY=sk-ant-...            # if set, clusters get LLM-quality label
 GOOGLE_CLIENT_ID=...                    # Google IdP client id
 GOOGLE_CLIENT_SECRET=...                # Google IdP client secret
 CODEOID_OAUTH_CLIENT_ID=codeoid          # optional: OAuth client id (default "codeoid")
+# The Google ID token is exchanged at ZeroID for a ZeroID token. ZeroID v1.12+
+# only accepts that exchange from an authenticated client the ID token was
+# issued to, so register a confidential client at ZeroID whose client_id is
+# GOOGLE_CLIENT_ID (token_endpoint_auth_method client_secret_post, with the
+# Google issuer configured for that audience) and set its secret here.
+CODEOID_ZEROID_CLIENT_ID=...             # optional: defaults to GOOGLE_CLIENT_ID
+CODEOID_ZEROID_CLIENT_SECRET=...         # env only; required by ZeroID v1.12+
 
 # Telegram frontend
 TELEGRAM_BOT_TOKEN=...
