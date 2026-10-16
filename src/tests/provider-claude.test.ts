@@ -696,19 +696,6 @@ describe("decodeStderrEntities", () => {
   });
 });
 
-// Park-and-retry: a blocked skill command must NOT fail the turn (that killed the
-// pipeline — #233). It parks the turn (approval_pending), and on approval the
-// loop rebuilds with the grant and retries the SAME prompt in place.
-/**
- * The UNEXPLAINED zero-turn: `num_turns: 0` with no `<local-command-stderr>`
- * naming a cause. The prompt was consumed and the model never ran, so before
- * this the prompt was simply lost and the user retyped it.
- *
- * Distinct from #233 (a blocked skill command, which HAS a stderr cause and
- * parks for approval) and from the upstream reporting defect
- * (anthropics/claude-code#80223) — this recovers whatever produced the zero
- * turn, because it keys on `num_turns` rather than on any cause.
- */
 describe("ClaudeProvider – backing-session recovery can't loop (#387)", () => {
   beforeEach(() => { sdkMessages = []; sdkThrowError = null; capturedQueryOpts = null; sdkGate = null; });
 
@@ -733,8 +720,48 @@ describe("ClaudeProvider – backing-session recovery can't loop (#387)", () => 
     expect(recoveries).toBe(1);
     expect(events.some((e) => e.type === "error" && String((e as { message: string }).message).includes("No conversation found"))).toBe(true);
   });
+
+  it("re-arms once a turn on the new backing succeeds: a later missing backing recovers again", async () => {
+    const provider = makeProvider();
+    provider.setHasQueried(true);
+    sdkThrowError = new Error("No conversation found with session ID: gone-1");
+    let recoveries = 0;
+    let retry: Promise<ProviderEvent[]> | null = null;
+    provider.onRecoveryNeeded = (content) => {
+      recoveries += 1;
+      provider.resetToNewSession(`adopted-${recoveries}`);
+      provider.setHasQueried(true);
+      // The first recovery's retry succeeds; afterwards the backing goes missing again.
+      if (recoveries === 1) {
+        sdkThrowError = null;
+        sdkMessages = [{ type: "result", subtype: "success", num_turns: 1, result: "ok", modelUsage: {} }];
+      }
+      retry = collectTurnEvents(provider, content);
+    };
+    await collectTurnEvents(provider);
+    for (let i = 0; i < 100 && !retry; i++) await Bun.sleep(5);
+    expect((await retry!).some((e) => e.type === "turn_done")).toBe(true);
+    retry = null;
+    sdkThrowError = new Error("No conversation found with session ID: adopted-1");
+    await collectTurnEvents(provider, "later");
+    for (let i = 0; i < 100 && !retry; i++) await Bun.sleep(5);
+    expect(recoveries).toBe(2);
+  });
 });
 
+// Park-and-retry: a blocked skill command must NOT fail the turn (that killed the
+// pipeline — #233). It parks the turn (approval_pending), and on approval the
+// loop rebuilds with the grant and retries the SAME prompt in place.
+/**
+ * The UNEXPLAINED zero-turn: `num_turns: 0` with no `<local-command-stderr>`
+ * naming a cause. The prompt was consumed and the model never ran, so before
+ * this the prompt was simply lost and the user retyped it.
+ *
+ * Distinct from #233 (a blocked skill command, which HAS a stderr cause and
+ * parks for approval) and from the upstream reporting defect
+ * (anthropics/claude-code#80223) — this recovers whatever produced the zero
+ * turn, because it keys on `num_turns` rather than on any cause.
+ */
 describe("ClaudeProvider – unexplained zero-turn re-send", () => {
   beforeEach(() => { sdkMessages = []; sdkThrowError = null; capturedQueryOpts = null; sdkGate = null; });
 
