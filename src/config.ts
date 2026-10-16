@@ -432,12 +432,29 @@ const SessionSchema = z
         waitMs: z.number().int().min(0).optional(),
       })
       .optional(),
+    /**
+     * History seeding on fork / backend switch: the parent's conversation is
+     * rendered as a transcript and prepended to the new backend's first
+     * prompt. Its size is `window × seedWindowFraction × seedCharsPerToken`
+     * characters unless `seedBudgetChars` caps it outright (0 = computed).
+     *
+     * seedCharsPerToken is the knob that matters: code, JSON and tool output
+     * tokenize at ~2.2 chars/token, so a prose-like 3.5 overflowed a 1M
+     * window by ~90k tokens. Lower it if seeded forks still hit "Prompt is
+     * too long"; a seed that does overflow is retried at half size anyway.
+     */
+    seedBudgetChars: z.number().int().min(0).default(0),
+    seedCharsPerToken: z.number().positive().default(2),
+    seedWindowFraction: z.number().gt(0).lt(1).default(0.7),
   })
   .default({
     turnStallTimeoutMs: 300_000,
     mcpToolTimeoutMs: 120_000,
     attachTailBytes: 512 * 1024,
     resumeMaxSessions: 200,
+    seedBudgetChars: 0,
+    seedCharsPerToken: 2,
+    seedWindowFraction: 0.7,
   })
   // Enforce the "SDK signals first" contract across BOTH fields — not just the
   // defaults. An env override / config file could otherwise set the MCP timeout
@@ -1227,6 +1244,12 @@ export interface CodeoidConfig {
       maxUntrackedBytes?: number;
       waitMs?: number;
     };
+    /** Hard cap (chars) on the history seed a fork / backend switch prepends to the first prompt. 0 or omitted = computed from the target window. */
+    seedBudgetChars?: number;
+    /** Chars-per-token used to size the history seed against the target window. Defaults to 2 when omitted. */
+    seedCharsPerToken?: number;
+    /** Fraction (0..1) of the target window the history seed may fill. Defaults to 0.7 when omitted. */
+    seedWindowFraction?: number;
   };
   /**
    * The per-tenant conductor session (fleet supervisor). Optional in the
@@ -1478,6 +1501,9 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   { env: "CODEOID_TURN_STALL_TIMEOUT_MS", path: "session.turnStallTimeoutMs", kind: "int" },
   { env: "CODEOID_MCP_TOOL_TIMEOUT_MS", path: "session.mcpToolTimeoutMs", kind: "int" },
   { env: "CODEOID_RESUME_MAX_SESSIONS", path: "session.resumeMaxSessions", kind: "int" },
+  { env: "CODEOID_SEED_BUDGET_CHARS", path: "session.seedBudgetChars", kind: "int" },
+  { env: "CODEOID_SEED_CHARS_PER_TOKEN", path: "session.seedCharsPerToken", kind: "float" },
+  { env: "CODEOID_SEED_WINDOW_FRACTION", path: "session.seedWindowFraction", kind: "float" },
   // Embed-SSO trusted framing origins (comma-separated). Each is an exact
   // origin (scheme://host[:port]) permitted to frame the web UI and hand it a
   // credential via the URL hash. Empty ⇒ hash handoff disabled (safe default).
