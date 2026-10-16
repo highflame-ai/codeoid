@@ -65,7 +65,7 @@ src/
 │   └── index.ts
 ├── protocol/                     # re-export shims for @highflame/codeoid-protocol (packages/protocol)
 │   ├── types.ts                  # Client<->Daemon message protocol
-│   ├── scopes.ts                 # 17 permission scopes (source: packages/protocol/src/scopes.ts)
+│   ├── scopes.ts                 # 18 permission scopes (source: packages/protocol/src/scopes.ts)
 │   └── index.ts
 ├── frontends/
 │   ├── types.ts                  # Frontend plugin interface
