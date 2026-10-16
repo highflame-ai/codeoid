@@ -91,7 +91,7 @@ It runs with `/bin/sh -c` in the workdir before any agent starts:
 
 - **Exit 0 and no output:** the run ends as `silent`. No agent, no cost.
 - **Exit 0 with output:** the agent starts, and the output reaches it as `{{check}}` (up to 64 KB; anything past that is cut, and the agent is told so).
-- **Non-zero exit or timeout:** the run `failed`, with the check's output kept for you to read. A timed-out check is killed along with everything it started.
+- **Non-zero exit or timeout:** the run `failed`, with the first 4,000 characters of the check's output kept for you to read. A timed-out check is killed along with everything it started.
 
 The check sees `CODEOID_ROUTINE`, `CODEOID_ROUTINE_ID`, `CODEOID_ROUTINE_TRIGGER` and `CODEOID_ROUTINE_SINCE`, so it can ask "anything new?":
 
@@ -135,11 +135,11 @@ So a routine that asks "is anything wrong?" stays quiet on the days when nothing
 | --- | --- |
 | `succeeded` | The agent finished and reported something. Its summary is the run's headline. |
 | `silent` | Nothing to do: the check printed nothing, or the agent replied `[SILENT]`. |
-| `needs_attention` | The agent is waiting on you: an approval, or a question it asked. The session stays parked so you can answer it. |
+| `needs_attention` | The agent is waiting on you for a tool approval (including one an exhausted tool budget raised). The session stays parked so you can answer it. |
 | `failed` | The check failed, the agent errored, or the session went away. Counts toward the failure pause. |
 | `timed_out` | It ran past `--max-minutes` and was interrupted. Counts toward the failure pause. |
 | `over_budget` | It crossed `--max-cost` and was stopped. Counts toward the failure pause. |
-| `skipped` | It didn't run: the last run was still going (`--overlap skip`), a persistent routine's session was busy or waiting on you, the daily spend cap was reached, the routine was paused before it started, or the fire was missed during downtime. |
+| `skipped` | It didn't run: the last run was still going (`--overlap skip`), a run was already queued behind it (`--overlap queue`), a persistent routine's session was busy or waiting on you, the daily spend cap was reached, the routine was paused before it started, or the fire was missed during downtime. |
 | `cancelled` | You cancelled it (`codeoid routine cancel <runId>`). |
 | `interrupted` | The daemon stopped while it was in flight. |
 
@@ -148,7 +148,7 @@ When you approve and the agent finishes, the run's cost and summary are updated,
 From the moment it parks, the run's `--max-minutes` and codeoid's in-flight spend check no longer apply: the work goes on because you approved it, as in any session.
 
 The summary is the agent's final message, not the commentary it wrote between tool calls.
-Each routine keeps its newest 500 runs.
+Each routine keeps its newest 500 runs, plus every run from today (the daily cap sums them) and the runs later runs read (the last summary, the last run that dealt with its input).
 Retention (`--keep`) removes old run sessions, but never one that is parked on you, still working, or that someone has open.
 
 ## Triggers
@@ -203,7 +203,7 @@ A routine runs an agent with nobody watching, on a machine that holds your code 
 
 - **Approvals.** A guarded routine parks every non-read tool call on your approval, exactly like an interactive session. An autonomous one runs within a tool-call budget and reverts to guarded when it is spent. Either way nobody answers the agent's questions for it: a question it asks in an unattended run is answered as cancelled, and it carries on without one.
 - **Time.** Past `--max-minutes` the agent is interrupted.
-- **Money.** On the Claude backend, `--max-cost` is handed to the agent itself, which stops at the ceiling; it is metered per model response, so a run can overshoot by the cost of the response that crossed it. codeoid also checks the run's spend whenever the session reports it, and stops and records `over_budget` past the ceiling. `--daily-cost` is checked before each run starts, against everything the routine's runs spent that UTC day.
+- **Money.** On the Claude backend, a fresh run's `--max-cost` is handed to the agent itself, which stops at the ceiling; it is metered per model response, so a run can overshoot by the cost of the response that crossed it. codeoid also checks the run's spend whenever the session reports it, and stops and records `over_budget` past the ceiling. `--daily-cost` is checked before each run starts, against everything the routine's runs spent that UTC day.
 - **Failure.** After three failed runs in a row (`--failure-pause`) the routine pauses itself and tells you. `resume` clears the streak.
 - **Concurrency.** At most two runs execute at once across all routines (`routines.maxConcurrentRuns`), and a routine never runs twice in parallel.
 - **Isolation.** `--worktree` runs each fresh session in its own git worktree, so an autonomous run never edits your checkout.
@@ -242,14 +242,14 @@ A different key, or the web UI's sign-in, is a different identity and won't see 
 If you retire the identity a routine belongs to, stop the routine first; afterwards only `routines.enabled: false` reaches it.
 
 Runs act as the routine's owner; in the transcript their messages are attributed to `routine:<name>`, delegated by that owner, so you can always tell your typing from the routine's.
-The audit log records each create, change (naming the fields that changed, with old and new values for approvals, workdir, provider and the API trigger), fire, run queued, started, cancelled and finished, and auto-pause; a run's own events are recorded under `routine:<id>`.
+The audit log records each create, change (naming the fields that changed, with old and new values for approvals, workdir, provider and the API trigger), delete, token rotation, fire, run queued, skipped, started, cancelled and finished, and auto-pause; a run's own events are recorded under `routine:<id>`.
 A check command is recorded by digest and length, never its text, so a secret in it doesn't outlive the edit that removed it; better still, keep secrets out of check commands and pass them by name with `CODEOID_AGENT_ENV_ALLOW`.
 
 The API endpoint authenticates with the routine's own token, not a ZeroID JWT.
 Tokens are stored as SHA-256 hashes and compared in constant time.
 An unknown routine, a routine with its API off, and a wrong token all get the same `401`, so the endpoint never reveals which routines exist.
 Requests that carry a browser `Origin` header are refused, so a web page can't fire a routine on a loopback daemon.
-Bodies are capped at 64 KB.
+Request bodies are capped at 64 KB, and the payload itself at 16,000 characters (the same limit as `routine run --payload`); a longer one gets `400`. A paused routine answers `409`.
 
 ## Configuration
 

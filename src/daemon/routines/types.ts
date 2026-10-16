@@ -15,7 +15,7 @@ export type NotifyPolicy = "on_change" | "always" | "never";
 /** Everything the owner configures. Stored as JSON; validated on every write. */
 export interface RoutineSpec {
   name: string;
-  /** The prompt. May reference {{check}}, {{payload}}, {{last_summary}}, {{trigger}}, {{now}}. */
+  /** The prompt. May reference {{check}}, {{payload}}, {{last_summary}}, {{trigger}}, {{now}}, {{routine}}. */
   prompt: string;
   workdir: string;
   provider?: string;
@@ -34,7 +34,7 @@ export interface RoutineSpec {
   toolBudget: number;
   /** Wall-clock limit per run; the run is interrupted at the deadline. */
   maxMinutes: number;
-  /** Per-run spend ceiling (USD). Enforced by the SDK where the backend supports it, and by the daemon between turns everywhere. */
+  /** Per-run spend ceiling (USD). A hard stop on Claude for fresh sessions (the SDK's maxBudgetUsd); everywhere, the daemon checks the spend the session reports while the run waits. */
   maxCostUsd?: number;
   /** Per-routine spend ceiling per UTC day (USD). Further fires that day are skipped. */
   dailyCostUsd?: number;
@@ -65,7 +65,7 @@ export type RunStatus =
   | "succeeded"
   /** Nothing to report: the check found nothing, or the agent answered [SILENT]. */
   | "silent"
-  /** Parked on something only the owner can decide (an approval, a dialog, an exhausted tool budget). */
+  /** Parked on a tool approval only the owner can give (including one an exhausted tool budget raised). */
   | "needs_attention"
   | "failed"
   | "timed_out"

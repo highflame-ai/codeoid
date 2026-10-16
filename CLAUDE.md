@@ -170,7 +170,7 @@ codeoid destroy <n>
 codeoid mcp config [--scopes observe|operate|full]  # MCP client entry for /mcp/control
 codeoid mcp headers [--scopes …]                    # fresh bearer header (an MCP headersHelper)
 codeoid routine add <name> --prompt … [--cron|--every|--at] [--check <cmd>]  # scheduled agent runs
-codeoid routine ls | show | runs | run [--wait] | edit | pause | resume | rm | token | preview
+codeoid routine ls | show | runs | run [--wait] | edit | pause | resume | rm | cancel <runId> | token | preview
 ```
 
 `/mcp/control` (off by default, `mcpControl.*`) lets external agents drive
@@ -183,8 +183,9 @@ Routines (`src/daemon/routines/`, docs/routines.md) run sessions on a schedule
 or an API call. `RoutineService` owns the scheduler and runs; it reaches
 sessions only through the `RoutineHost` seam that `SessionManager` implements,
 and every routine.* message is authorized in `SessionManager.#routineHandle`
-(`routine:manage` + session:create + session:send, plus session:approve for an
-autonomous routine or one with a check). The fire claim is a compare-and-set on
+(owner-only; `routine:manage` for everything but preview; changes also need
+session:create + session:send, plus session:approve for an autonomous routine
+or one with a check, and are refused to delegated tokens). The fire claim is a compare-and-set on
 `next_fire_at`, which is the only scheduler lock.
 
 ## Config

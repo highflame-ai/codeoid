@@ -10,7 +10,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Routines: agents that run on their own** (#54). `codeoid routine add`
   saves an agent task that runs on a cron or interval schedule (IANA
-  timezones, phase-anchored intervals, 60-second floor), once at a time, from
+  timezones, phase-anchored intervals, 60-second floor), once at a set time, from
   its own API endpoint (`POST /routines/<id>/fire` with a per-routine,
   revocable, rate-limited token), or on demand. A *check* command runs first:
   no output means nothing to do, and the run ends `silent` with no agent

@@ -64,7 +64,7 @@ export const SCOPES = {
    */
   PIPELINE_MANAGE: "pipeline:manage",
   /**
-   * Create, change, delete, and fire routines (docs/routines.md) — saved
+   * Read, create, change, delete, and fire your own routines (docs/routines.md) — saved
    * agent jobs that run later, unattended, on the owner's behalf. Owner-tier
    * (kept out of OPERATOR_SCOPES): a routine is STANDING authority to run
    * agents and host commands with nobody watching, a different thing from

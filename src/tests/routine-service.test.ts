@@ -890,7 +890,7 @@ describe("management", () => {
     expect(routine.spec.workdir).toBe(WORKDIR);
   });
 
-  it("names are unique per tenant", () => {
+  it("names are unique per owner, and free in another tenant", () => {
     create();
     expect(() => create()).toThrow("already exists");
     // Another tenant may reuse it.

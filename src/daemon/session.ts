@@ -2477,7 +2477,7 @@ export class Session {
     }
     this.#accumulator.pushUserTurn(effectivePrompt, turnId, { prompt: text, at: turnAt });
     const run = this.#provider.runTurn({
-          ...(this.#maxBudgetUsd !== undefined ? { maxBudgetUsd: this.#maxBudgetUsd } : {}),
+      ...(this.#maxBudgetUsd !== undefined ? { maxBudgetUsd: this.#maxBudgetUsd } : {}),
       history: this.#accumulator.history,
       userMessage: effectivePrompt,
       model: this.#model ?? undefined,

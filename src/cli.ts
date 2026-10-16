@@ -869,12 +869,12 @@ async function withClient(fn: (c: TerminalClient) => Promise<void>): Promise<voi
 function routineSpecOptions(cmd: Command, mode: "add" | "edit"): Command {
   cmd
     .option("-w, --workdir <dir>", mode === "add" ? "directory the agent works in (default: here)" : "directory the agent works in")
-    .option("-p, --prompt <text>", "what the agent should do — may use {{check}}, {{payload}}, {{last_summary}}")
+    .option("-p, --prompt <text>", "what the agent should do — may use {{check}}, {{payload}}, {{last_summary}}, {{trigger}}, {{now}}, {{routine}}")
     .option("--prompt-file <path>", "read the prompt from a file")
     .option("--cron <expr>", 'run on a cron schedule, e.g. "0 9 * * 1-5"')
     .option("--tz <zone>", "IANA timezone for --cron (default: this machine's)")
     .option("--every <interval>", "run every interval, e.g. 15m, 2h, 1d")
-    .option("--at <time>", "run once at an ISO timestamp")
+    .option("--at <time>", "run once, at ISO 8601 with a zone (Z or +08:00)")
     .option("--check <command>", "pre-run gate: no output = nothing to do (no agent, no cost)")
     .option("--check-timeout <s>", "check timeout in seconds (default 60)")
     .option("--provider <id>", "backend: claude, codex, gemini, qwen, …")
@@ -1078,7 +1078,7 @@ routine
   .option("--cron <expr>", "cron expression")
   .option("--tz <zone>", "IANA timezone for --cron")
   .option("--every <interval>", "interval, e.g. 15m")
-  .option("--at <time>", "ISO timestamp")
+  .option("--at <time>", "ISO 8601 with a zone (Z or +08:00)")
   .option("--count <n>", "how many fires", "5")
   .action((o: RoutineFlags & { count: string }) =>
     withClient(async (c) => {

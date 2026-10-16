@@ -4649,11 +4649,14 @@ mcpHub: this.#mcpHub,
    * One entry point for routine.*: availability, scopes, and tenancy are
    * decided here once, then each verb runs against RoutineService.
    *
-   * Reading needs session:list. Changing anything needs routine:manage AND
-   * session:create + session:send — a routine creates and prompts sessions on
-   * its owner's behalf, so it may never act beyond what they hold. A routine
-   * that pre-approves (autonomous) or runs host commands (a check) also needs
-   * session:approve, the scope that grants auto-approval on a live session.
+   * Every verb but preview needs routine:manage (preview needs session:list):
+   * a routine's definition and history are not for read-only share tokens.
+   * Changing anything also needs session:create + session:send — a routine
+   * creates and prompts sessions on its owner's behalf, so it may never act
+   * beyond what they hold — and is refused to delegated tokens. Saving,
+   * firing, re-tokening or resuming a routine that pre-approves (autonomous)
+   * or runs host commands (a check) also needs session:approve; pausing never
+   * does. A routine is its owner's alone: anyone else gets not-found.
    */
   async #routineHandle(
     msg: Extract<ClientMessage, { type: `routine.${string}` }>,

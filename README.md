@@ -441,7 +441,7 @@ codeoid undo <session> [files [yes|force]]           # Take back the last messag
 codeoid compare run <session> --with claude,codex <prompt...>  # Same prompt on 2–4 backends, side by side
 codeoid compare show|ls|keep …                       #   results; keep one [--discard-others]
 codeoid routine add <name> --prompt … [--cron|--every|--at] [--check <cmd>]  # scheduled / triggered agent runs
-codeoid routine ls | show | runs | run [--wait] | edit | pause | resume | rm | token | preview
+codeoid routine ls | show | runs | run [--wait] | edit | pause | resume | rm | cancel <runId> | token | preview
 ```
 
 ## Development

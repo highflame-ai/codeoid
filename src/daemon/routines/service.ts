@@ -398,7 +398,6 @@ const NAME_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 /** Statuses that are a run's real outcome — they move "last run" and the failure streak. */
 const OUTCOME_RUN_STATUSES: readonly RunStatus[] = ["succeeded", "silent", "needs_attention", "failed", "timed_out", "over_budget"];
 
-
 // ── The service ──────────────────────────────────────────────────────────────
 
 interface LiveRun {
@@ -707,9 +706,7 @@ export class RoutineService {
       // Daily spend cap — checked at start, not at admission, so a queued run
       // sees the spend of the runs that went before it.
       if (spec.dailyCostUsd !== undefined) {
-        const dayStart = new Date(startedAt);
-        dayStart.setUTCHours(0, 0, 0, 0);
-        const spent = this.#store.costSince(routine.id, dayStart.getTime());
+        const spent = this.#store.costSince(routine.id, utcDayStart(startedAt));
         if (spent >= spec.dailyCostUsd) {
           finish("skipped", { reason: `daily spend cap reached ($${spent.toFixed(2)} of $${spec.dailyCostUsd.toFixed(2)} today, UTC)` });
           return;
@@ -797,6 +794,7 @@ export class RoutineService {
           ...(spec.session === "fresh" && spec.maxCostUsd !== undefined ? { maxCostUsd: spec.maxCostUsd } : {}),
           label: spec.name,
         });
+        // Before any store write, so a failure still finds the session to disarm.
         live.sessionId = sessionId;
         if (spec.session === "persistent") this.#store.setPersistentSession(routine.id, sessionId);
       }
