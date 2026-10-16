@@ -21,6 +21,7 @@ import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-
 import {
   type ProviderEvent,
   type NativeContinuationResult,
+  type NativeTurnRef,
   type NormalizedTurnResult,
   type TurnRun,
   type ToolApprovalFn,
@@ -763,6 +764,8 @@ export class Session {
   #turnRedacted = false;
   /** Context size (tokens) the source of the next fork was last running at — see #continueNatively. */
   #forkSourceContextTokens = 0;
+  /** How the last seed carried the conversation, for a notice posted after it (a switch). */
+  #lastContinuation: { via: "fork" | "history" | "transcript"; messages: number } | null = null;
   /** A rewind is in progress: nothing may wake the agent meanwhile. */
   #rewinding = false;
   /**
@@ -1461,7 +1464,7 @@ export class Session {
     // Offer the canonical history to the incoming provider. Best-effort by
     // contract: a seed failure degrades to an unseeded switch, never a
     // wedged session.
-    const seeded = await this.#seedProviderFromHistory(undefined, { announce: true });
+    const seeded = await this.#seedProviderFromHistory();
     // Until the first prompt, a backend that took a transcript (or will build
     // its thread lazily) holds nothing: a restart must re-seed, not resume.
     if (this.#accumulator.history.length > 0) this.#markBackingFresh(!this.#nativeBackingReady);
@@ -1482,6 +1485,8 @@ export class Session {
     );
     this.#persistAndBuffer(infoMsg);
     this.#broadcastRaw(infoMsg);
+    // After the switch line, so the two read in order.
+    if (this.#lastContinuation) this.#announceContinuation(this.#lastContinuation.via, this.#lastContinuation.messages);
     // Writes the new providerId into the transcript meta (restart resume)
     // and refreshes every client's SessionInfo.
     this.#persistStatus();
@@ -3215,16 +3220,22 @@ export class Session {
   }
 
   /**
-   * Offer the accumulated canonical history to the current provider —
-   * shared by `switchProvider` and `session.fork`. Stateless backends no-op
-   * (they consume TurnOpts.history every turn); warm backends (claude, pi,
-   * codex) prepend a rendered transcript to their first prompt. Best-effort
-   * by contract: a throw degrades to an unseeded start, never a wedge.
-   * Returns whether a seed was actually applied.
+   * Hand the canonical history to the current provider, which starts from
+   * nothing: a backend switch, a fork, a rewind, Claude's backing recovery,
+   * and a restart of a backend left fresh. Native first (#387) — Claude and
+   * Codex fork their own conversation or take native history — then the
+   * context strategy: stateless backends no-op (they read TurnOpts.history
+   * every turn), warm ones get a transcript in their first prompt.
+   * Best-effort by contract: a throw degrades to an unseeded start, never a
+   * wedge. Returns whether anything was applied.
    */
   async #seedProviderFromHistory(
     retry?: { historyLength: number; budgetChars: number; attempts: number },
-    /** Tell the session's clients which way the conversation was carried (fork, switch). */
+    /**
+     * `announce`: tell the session's clients which way the conversation was
+     * carried (fork, switch). `upTo`: seed only the first N turns (recovery,
+     * where the last turn is the prompt about to be re-run).
+     */
     opts: { announce?: boolean; upTo?: number } = {},
   ): Promise<boolean> {
     const history = retry
@@ -3234,6 +3245,7 @@ export class Session {
         : this.#accumulator.history;
     this.#pendingSeed = null;
     this.#nativeBackingReady = false;
+    this.#lastContinuation = null;
     if (history.length === 0) return false;
     const s = this.#config?.session;
     const budgetChars =
@@ -3248,6 +3260,7 @@ export class Session {
     if (!retry) {
       const native = await this.#continueNatively(history, budgetChars);
       if (native) {
+        this.#lastContinuation = { via: native.via, messages: history.length };
         if (opts.announce) this.#announceContinuation(native.via, history.length);
         return true;
       }
@@ -3274,6 +3287,7 @@ export class Session {
         this.#pendingSeed = { historyLength: history.length, budgetChars, attempts: retry?.attempts ?? 0 };
         // Only a warm backend that actually took the transcript: a stateless
         // one already reads the whole history natively every turn.
+        this.#lastContinuation = { via: "transcript", messages: history.length };
         if (opts.announce) this.#announceContinuation("transcript", history.length);
       }
       return outcome.applied;
@@ -3353,7 +3367,7 @@ export class Session {
         ? known
         : history.reduce((n, t) => n + canonicalTurnChars(t), 0) / (this.#config?.session?.seedCharsPerToken ?? 2);
     const window = targetContextWindow(this.#provider.id, this.#model, this.#knownWindow(this.#provider.id));
-    return tokens <= window * 0.85;
+    return tokens <= window * FORK_FIT_FRACTION;
   }
 
   /** How full the context was on this session's last turn (tokens) — what a fork of it starts at. */
@@ -3402,12 +3416,13 @@ export class Session {
   /** Say how a fork or switch carried the conversation to this backend. */
   #announceContinuation(via: "fork" | "history" | "transcript", turns: number): void {
     const p = this.#provider.id;
+    const n = `${turns} message${turns === 1 ? "" : "s"}`;
     const text =
       via === "fork"
         ? `↪ ${p} continues its own conversation from this point: nothing was converted or cut.`
         : via === "history"
-          ? `↪ The conversation (${turns} turn${turns === 1 ? "" : "s"}) was given to ${p} as its own history, tool calls included. Reasoning from another backend isn't carried.`
-          : `↪ ${p} can't take the conversation in its own form, so it was carried as a text transcript of ${turns} turn${turns === 1 ? "" : "s"}.`;
+          ? `↪ The conversation (${n}) was given to ${p} as its own history, tool calls included. Reasoning from another backend isn't carried.`
+          : `↪ The conversation (${n}) was carried to ${p} as a text transcript.`;
     const msg = this.#makeMessage("info", text, SYSTEM_IDENTITY, undefined, undefined, {
       event: "history.continuation",
       via,
@@ -7023,8 +7038,14 @@ function sanitizeApprovalPatch(
   return undefined;
 }
 
+/**
+ * How full the source's context may be for a native fork onto a backend: a
+ * fork carries all of it, and the turn about to run needs room on top.
+ */
+const FORK_FIT_FRACTION = 0.85;
+
 /** A recorded native point codeoid will act on: two plain ids, nothing else. */
-function isNativeRef(ref: unknown): ref is NonNullable<Extract<CanonicalTurn, { role: "assistant" }>["native"]> {
+function isNativeRef(ref: unknown): ref is NativeTurnRef {
   if (!ref || typeof ref !== "object") return false;
   const r = ref as Record<string, unknown>;
   const id = (v: unknown) => typeof v === "string" && /^[A-Za-z0-9-]{8,128}$/.test(v);

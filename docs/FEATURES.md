@@ -19,7 +19,7 @@ Pick a harness when you create a session — the New Session modal in the web UI
 
 #### How a fork, switch or rewind carries the conversation
 
-The files come back exactly: a fork gets a git worktree at the turn's checkpoint.
+Files are the checkpoint's business: a fork in its own worktree starts from the turn's checkpoint, and a rewind can restore files too.
 The conversation is handed over in the backend's own form wherever the backend allows it, and as a text transcript only where it doesn't:
 
 | Going to | Same backend (fork, rewind) | From another backend (fork, switch) |
@@ -31,9 +31,10 @@ The conversation is handed over in the backend's own form wherever the backend a
 
 Reasoning never crosses vendors (Claude's is signed, OpenAI's encrypted).
 History codeoid builds that doesn't fit the target's window loses its oldest turns, with a notice; a native fork isn't used when the source was already running near the target's window, nor from a turn that ended in an error, so a fork is the way out of an overflowed session rather than a copy of it.
-The session says which way it went (`↪ … continues its own conversation`, `↪ … was given … as its own history`, or `↪ … carried as a text transcript`), and if a native path fails it falls back to the transcript and says so.
-Two cases always use codeoid's own record rather than the backend's: history that a `tool_result` [hook](hooks.md) redacted (a native fork would copy the backend's unredacted log), and turns rebuilt from a displayed transcript such as an imported session (they aren't the model's own words, so they stay quoted).
-Like every Claude session codeoid runs, a session it writes or forks for Claude lives under `CLAUDE_CONFIG_DIR` (default `~/.claude/projects/`), owner-only, and is subject to Claude Code's own `cleanupPeriodDays`.
+On a fork or switch the session says which way it went (`↪ … continues its own conversation`, `↪ … was given … as its own history`, or `↪ … carried as a text transcript`), and if a native path fails it falls back to the transcript and says so.
+History a `tool_result` [hook](hooks.md) redacted is never forked natively — a fork would copy the backend's unredacted log — so codeoid's redacted record is used instead.
+Turns rebuilt from a displayed transcript, such as an imported session, are never built into native history (they aren't the model's own words, so they stay quoted); a native fork from a real turn after them is still used.
+Like every Claude session codeoid runs, a session it writes or forks for Claude lives under `projects/` in `CLAUDE_CONFIG_DIR` (default `~/.claude`), and is subject to Claude Code's own `cleanupPeriodDays`.
 `session.nativeContinuation: false` (or `CODEOID_NATIVE_CONTINUATION=false`) keeps everything on the transcript.
 Native continuation is tried before the `CODEOID_CONTEXT_STRATEGY` seed (`transcript` or `vws`), which still applies to every backend it doesn't cover.
 

@@ -597,7 +597,7 @@ function toolCallToSeedText(tc: CanonicalToolCall): string {
  * the FALLBACK: a backend that can take the conversation in its own form does
  * so through `continueNatively` (#387) — Claude and Codex fork their own
  * conversation, or take native history codeoid builds — and this transcript
- * is used only where that isn't available (pi, the Gemini CLI) or fails.
+ * is used only where that isn't available (pi, the Gemini CLI, qwen) or fails.
  * Oldest turns are dropped first when the budget is exceeded (recent context
  * matters most), with an elision note.
  *

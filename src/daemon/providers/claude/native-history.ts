@@ -126,7 +126,7 @@ export function toClaudeSessionEntries(
 }
 
 /** Claude Code's config dir, as the backend subprocess will see it. */
-export function claudeConfigDir(env: Record<string, string | undefined> = process.env): string {
+function claudeConfigDir(env: Record<string, string | undefined> = process.env): string {
   return env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
 }
 

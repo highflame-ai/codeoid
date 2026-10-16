@@ -34,8 +34,11 @@
  *   - `item/tool/requestUserInput` → requestUserInput (session.ui_request)
  *   - text/reasoning deltas stream; command/fileChange/mcp items surface
  *     as tool records; usage from turn/completed
- *   - seedFromHistory prepends renderHistorySeed to the first prompt (the
- *     warm-backend ceiling; codex threads only resume codex's own state)
+ *   - continueNatively (#387): the thread is created by `thread/fork` at a
+ *     recorded turn (same backend) or `thread/start` + `thread/inject_items`
+ *     (native history from another backend); thread ids are persisted
+ *   - seedFromHistory prepends renderHistorySeed to the first prompt — the
+ *     fallback when the native path is off or fails
  *
  * Non-gated items (codex ran something its policy considers trusted, e.g.
  * read-only commands) are recorded retrospectively at item/completed as a
@@ -187,6 +190,17 @@ function codexPolicies(mode?: SessionMode): { approvalPolicy: string; sandboxMod
  * SandboxPolicyDeserialize` at turn/start. Shapes verified live against
  * @openai/codex@0.144.1 `generate-ts` + a real turn.
  */
+/** What a new thread (started or forked) is created with: cwd, policies, the turn's instructions. */
+function threadConfig(opts: TurnOpts): Record<string, unknown> {
+  const { approvalPolicy, sandboxMode } = codexPolicies(opts.mode);
+  return {
+    cwd: opts.workdir,
+    approvalPolicy,
+    sandboxPolicy: sandboxPolicyWire(sandboxMode, opts.workdir),
+    ...(opts.systemPromptAppend ? { developerInstructions: opts.systemPromptAppend } : {}),
+  };
+}
+
 function sandboxPolicyWire(mode: SandboxMode, workdir: string): Record<string, unknown> {
   switch (mode) {
     case "read-only":
@@ -418,13 +432,7 @@ export class CodexProvider implements SessionProvider {
     const pending = this.#pendingNative;
     this.#pendingNative = null;
     if (!pending || !this.#proc) return null;
-    const { approvalPolicy, sandboxMode } = codexPolicies(opts.mode);
-    const config = {
-      cwd: opts.workdir,
-      approvalPolicy,
-      sandboxPolicy: sandboxPolicyWire(sandboxMode, opts.workdir),
-      ...(opts.systemPromptAppend ? { developerInstructions: opts.systemPromptAppend } : {}),
-    };
+    const config = threadConfig(opts);
     try {
       if (pending.kind === "fork") {
         const forked = (await this.#proc.request("thread/fork", {
@@ -679,20 +687,19 @@ export class CodexProvider implements SessionProvider {
       this.#proc.notify("initialized");
     }
 
-    // A native continuation (#387) creates the thread itself.
     if (this.#pendingNative) {
+      // A native continuation (#387) creates the thread itself; if it fails,
+      // a fresh thread below takes the transcript instead.
       const native = await this.#applyPendingNative(opts);
       if (native) {
         this.#adoptThread(native);
         await this.#reportModelsOnce();
         return;
       }
-    }
-
-    // Resume the prior thread when the backing id looks like one codex
-    // minted; otherwise (first run: backing id is the codeoid session id)
-    // start fresh. Resume failure degrades to a fresh thread — never wedge.
-    else if (this.#backingSessionId !== this.#sessionId) {
+    } else if (this.#backingSessionId !== this.#sessionId) {
+      // Resume the prior thread when the backing id looks like one codex
+      // minted; otherwise (first run: backing id is the codeoid session id)
+      // start fresh. Resume failure degrades to a fresh thread — never wedge.
       try {
         const resumed = (await this.#proc.request("thread/resume", {
           threadId: this.#backingSessionId,
@@ -705,13 +712,7 @@ export class CodexProvider implements SessionProvider {
         /* fall through to thread/start */
       }
     }
-    const { approvalPolicy, sandboxMode } = codexPolicies(opts.mode);
-    const started = (await this.#proc.request("thread/start", {
-      cwd: opts.workdir,
-      approvalPolicy,
-      sandboxPolicy: sandboxPolicyWire(sandboxMode, opts.workdir),
-      ...(opts.systemPromptAppend ? { developerInstructions: opts.systemPromptAppend } : {}),
-    })) as { thread?: { id?: string } };
+    const started = (await this.#proc.request("thread/start", threadConfig(opts))) as { thread?: { id?: string } };
     if (!started.thread?.id) throw new Error("codex thread/start returned no thread id");
     this.#adoptThread(started.thread.id);
     await this.#reportModelsOnce();

@@ -678,7 +678,7 @@ describe("Session: native first, transcript as the fallback", () => {
       await send(m, id, "one");
       const info = await fork(m, id);
       expect(made.at(-1)!.seededHistory?.map((t) => t.content)).toEqual(["one", "a1"]);
-      expect(notes(m, info.id).some((n) => n.includes("carried as a text transcript"))).toBe(true);
+      expect(notes(m, info.id).some((n) => n.includes("as a text transcript"))).toBe(true);
     }
   });
 
@@ -700,6 +700,9 @@ describe("Session: native first, transcript as the fallback", () => {
     const r = await m.handle({ type: "session.set_provider", id: "p", sessionId: id, providerId: "codex" } as never, AUTH, CLIENT);
     expect(r.type).toBe("response.ok");
     expect(made.at(-1)!.nativeRequests).toHaveLength(1);
+    // The switch line first, then how the conversation went over.
+    const said = notes(m, id);
+    expect(said.findIndex((n) => n.startsWith("Backend switched"))).toBeLessThan(said.findIndex((n) => n.includes("given to codex")));
     await Bun.sleep(20);
     const meta = JSON.parse(readFileSync(transcript.metaPath(id), "utf8")) as { backingFresh?: boolean };
     expect(meta.backingFresh).toBe(true);

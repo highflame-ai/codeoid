@@ -21,7 +21,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     SDK's own reader before use, or Codex history items through
     `thread/inject_items`.
 
-  The transcript remains the fallback, for pi, the Gemini CLI, and any native
+  The transcript remains the fallback, for pi, the Gemini CLI, qwen, and any native
   path that fails. The session says which way it went, and
   `session.nativeContinuation` / `CODEOID_NATIVE_CONTINUATION` turns this off.
   Each turn now records where it ends in the backend's own conversation
@@ -169,6 +169,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   saves the id the moment it adopts a thread. A backend switch now also marks
   the new backend fresh until its first prompt, so a restart in between
   re-seeds it instead of resuming nothing.
+
+- **Claude's "No conversation found" recovery keeps the conversation.** When
+  a backing session can't be resumed, recovery used to start a blank session
+  and re-send only the latest prompt. It now hands the new session the
+  conversation before that prompt (natively where it can), and can't loop if
+  the new backing is missing too.
 
 - **The context window is no longer guessed from the model id.**
   codeoid inferred every window from a substring table over model ids, and that table was wrong the moment a model shipped: `claude-opus-5-5` inferred to the 200k fallback while every turn result stated 1,000,000.
