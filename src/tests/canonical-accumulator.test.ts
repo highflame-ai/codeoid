@@ -54,3 +54,20 @@ describe("CanonicalHistoryAccumulator — content-free turn_done", () => {
     expect(acc.history).toHaveLength(1); // only the user turn survives
   });
 });
+
+describe("CanonicalHistoryAccumulator — the final message", () => {
+  test("lastTextBlock is the turn's last text, without the narration before it", () => {
+    const acc = new CanonicalHistoryAccumulator();
+    acc.pushUserTurn("audit the docs");
+    acc.handleEvent(textDone("Checking the config first."));
+    acc.handleEvent(textDone("Fixed six things:\n- a\n- b"));
+    acc.handleEvent(turnDone());
+    expect(acc.lastTextBlock).toBe("Fixed six things:\n- a\n- b");
+    // The history keeps every block.
+    const last = acc.history.at(-1)!;
+    if (last.role === "assistant") expect(last.content).toContain("Checking the config first.");
+    // A new prompt forgets it, so a turn that writes nothing can't inherit the last one's.
+    acc.pushUserTurn("again");
+    expect(acc.lastTextBlock).toBeNull();
+  });
+});

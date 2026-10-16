@@ -4863,7 +4863,7 @@ mcpHub: this.#mcpHub,
       },
       result: (id) => {
         const s = this.#sessions.get(id);
-        return { text: s?.lastAssistantText ?? null, error: s?.lastTurnError ?? null };
+        return { text: s?.lastAssistantMessage ?? null, error: s?.lastTurnError ?? null };
       },
       beginUnattended: (id) => this.#sessions.get(id)?.beginUnattended() ?? (() => {}),
       interrupt: async (id) => {

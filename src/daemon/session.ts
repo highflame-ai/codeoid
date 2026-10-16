@@ -1492,6 +1492,14 @@ export class Session {
     }
     return null;
   }
+  /**
+   * The agent's final message of the most recent turn — like `claude -p`'s
+   * result, without the narration between tool calls. Falls back to the
+   * whole turn's text when that block isn't known (after a restore).
+   */
+  get lastAssistantMessage(): string | null {
+    return this.#accumulator.lastTextBlock ?? this.lastAssistantText;
+  }
   /** Number of turns (user + assistant) in the canonical history. */
   get historyLength(): number { return this.#accumulator.history.length; }
   /**
