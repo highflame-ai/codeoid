@@ -19,6 +19,7 @@ import { CONDUCTOR_SYSTEM_PROMPT_APPEND, isFleetSendTool } from "./fleet.js";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import {
   type ProviderEvent,
+  type NativeContinuationResult,
   type NormalizedTurnResult,
   type TurnRun,
   type ToolApprovalFn,
@@ -739,6 +740,12 @@ export class Session {
   #endSnapshotTurn: string | null = null;
   /** The backend was reset and holds no conversation yet (see TranscriptMeta.backingFresh). */
   #backingFresh = false;
+  /**
+   * The last history seed left the backend holding the conversation already
+   * (a native fork or written native history, #387) — so it isn't "fresh":
+   * a restart resumes it instead of re-seeding.
+   */
+  #nativeBackingReady = false;
   /** A rewind is in progress: nothing may wake the agent meanwhile. */
   #rewinding = false;
   /**
@@ -1437,7 +1444,10 @@ export class Session {
     // Offer the canonical history to the incoming provider. Best-effort by
     // contract: a seed failure degrades to an unseeded switch, never a
     // wedged session.
-    const seeded = await this.#seedProviderFromHistory();
+    const seeded = await this.#seedProviderFromHistory(undefined, { announce: true });
+    // Until the first prompt, a backend that took a transcript (or will build
+    // its thread lazily) holds nothing: a restart must re-seed, not resume.
+    if (this.#accumulator.history.length > 0) this.#markBackingFresh(!this.#nativeBackingReady);
 
     this.#store.audit(
       sender.sub,
@@ -1447,11 +1457,7 @@ export class Session {
     );
     const infoMsg = this.#makeMessage(
       "info",
-      `Backend switched: ${previous} → ${requested}.${
-        seeded
-          ? " The conversation so far is carried over as a transcript."
-          : ""
-      } Model reset to the ${requested} default.`,
+      `Backend switched: ${previous} → ${requested}. Model reset to the ${requested} default.`,
       SYSTEM_IDENTITY,
       undefined,
       undefined,
@@ -3180,11 +3186,16 @@ export class Session {
    * by contract: a throw degrades to an unseeded start, never a wedge.
    * Returns whether a seed was actually applied.
    */
-  async #seedProviderFromHistory(retry?: { historyLength: number; budgetChars: number; attempts: number }): Promise<boolean> {
+  async #seedProviderFromHistory(
+    retry?: { historyLength: number; budgetChars: number; attempts: number },
+    /** Tell the session's clients which way the conversation was carried (fork, switch). */
+    opts: { announce?: boolean } = {},
+  ): Promise<boolean> {
     const history = retry
       ? this.#accumulator.history.slice(0, retry.historyLength)
       : this.#accumulator.history;
     this.#pendingSeed = null;
+    this.#nativeBackingReady = false;
     if (history.length === 0) return false;
     const s = this.#config?.session;
     const budgetChars =
@@ -3194,6 +3205,15 @@ export class Session {
         charsPerToken: s?.seedCharsPerToken,
         windowFraction: s?.seedWindowFraction,
       });
+    // The backend's own form first (#387). An overflow retry stays on the
+    // transcript: that is what overflowed, and what shrinks.
+    if (!retry) {
+      const native = await this.#continueNatively(history, budgetChars);
+      if (native) {
+        if (opts.announce) this.#announceContinuation(native.via, history.length);
+        return true;
+      }
+    }
     // Delegate to the active context strategy (default `transcript` = the
     // legacy rendered-history seed; `vws` = compact session map + on-demand
     // paging, which falls back to transcript for backends without the recall
@@ -3214,6 +3234,9 @@ export class Session {
       // only it can be retried smaller if the first prompt overflows.
       if (outcome.applied && outcome.via === "transcript" && outcome.truncation) {
         this.#pendingSeed = { historyLength: history.length, budgetChars, attempts: retry?.attempts ?? 0 };
+        // Only a warm backend that actually took the transcript: a stateless
+        // one already reads the whole history natively every turn.
+        if (opts.announce) this.#announceContinuation("transcript", history.length);
       }
       return outcome.applied;
     } catch (err) {
@@ -3222,6 +3245,59 @@ export class Session {
       );
       return false;
     }
+  }
+
+  /**
+   * Hand the history to the backend in its own form (#387), when it can take
+   * it and native continuation is on. The last turn's recorded native point
+   * lets a same-backend fork, rewind or reseed fork the backend's own
+   * conversation; otherwise the backend builds native history from the
+   * canonical turns. Null means "use the transcript": not supported, refused,
+   * or failed — failures are logged, never thrown.
+   */
+  async #continueNatively(history: readonly CanonicalTurn[], maxChars: number): Promise<NativeContinuationResult | null> {
+    if (this.#config?.session?.nativeContinuation === false) return null;
+    const provider = this.#provider;
+    if (!provider.continueNatively) return null;
+    const last = history.at(-1);
+    const forkFrom = last?.role === "assistant" && last.providerId === provider.id ? last.native : undefined;
+    let result: NativeContinuationResult | null;
+    try {
+      result = await provider.continueNatively({ history, ...(forkFrom ? { forkFrom } : {}), maxChars, workdir: this.workdir });
+    } catch (err) {
+      console.error(`[codeoid/session ${this.id}] native continuation on ${provider.id} failed, using the transcript: ${err instanceof Error ? err.message : String(err)}`);
+      return null;
+    }
+    if (!result) return null;
+    if (result.backingId) {
+      try {
+        this.#store.setClaudeCodeSessionId(this.id, result.backingId);
+      } catch (err) {
+        console.error(`[codeoid/session ${this.id}] failed to persist native backing id: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      this.#nativeBackingReady = true;
+    }
+    if (result.truncation && result.truncation.omittedTurns > 0) this.#surfaceSeedTruncation(result.truncation);
+    return result;
+  }
+
+  /** Say how a fork or switch carried the conversation to this backend. */
+  #announceContinuation(via: "fork" | "history" | "transcript", turns: number): void {
+    const p = this.#provider.id;
+    const text =
+      via === "fork"
+        ? `↪ ${p} continues its own conversation from this point: nothing was converted or cut.`
+        : via === "history"
+          ? `↪ The conversation (${turns} turn${turns === 1 ? "" : "s"}) was given to ${p} as its own history, tool calls included. Reasoning from another backend isn't carried.`
+          : `↪ ${p} can't take the conversation in its own form, so it was carried as a text transcript of ${turns} turn${turns === 1 ? "" : "s"}.`;
+    const msg = this.#makeMessage("info", text, SYSTEM_IDENTITY, undefined, undefined, {
+      event: "history.continuation",
+      via,
+      provider: p,
+      turns,
+    });
+    this.#persistAndBuffer(msg);
+    this.#broadcastRaw(msg);
   }
 
   /**
@@ -3461,10 +3537,11 @@ export class Session {
         );
       });
     }
-    await this.#seedProviderFromHistory();
+    await this.#seedProviderFromHistory(undefined, { announce: true });
     // Brand-new backend: if the daemon restarts before the fork's first
-    // prompt, resume must re-seed it, not try to resume nothing.
-    if (history.length > 0) this.#markBackingFresh(true);
+    // prompt, resume must re-seed it, not try to resume nothing — unless the
+    // backend already holds the conversation natively.
+    if (history.length > 0) this.#markBackingFresh(!this.#nativeBackingReady);
     if (note) {
       const msg = this.#makeMessage("info", note, SYSTEM_IDENTITY, undefined, undefined, {
         event: "fork.workdir",
@@ -6393,8 +6470,9 @@ export class Session {
     this.#justRotated = false;
     if (plan_.keptHistory.length > 0) await this.#seedProviderFromHistory();
     // Until the next prompt, the backend holds nothing: a restart before then
-    // must re-seed from the kept history rather than resume an empty backend.
-    this.#markBackingFresh(true);
+    // must re-seed from the kept history rather than resume an empty backend —
+    // unless it was forked natively, and so already holds what was kept.
+    this.#markBackingFresh(!this.#nativeBackingReady);
 
     // What everyone sees: a durable marker hides the taken-back rows (on
     // replay, restart and paging alike), then every client gets a fresh view.
@@ -6444,6 +6522,7 @@ export class Session {
     this.#backingFresh = true;
     this.#provider.setHasQueried(false);
     if (this.#accumulator.history.length > 0) await this.#seedProviderFromHistory();
+    if (this.#nativeBackingReady) this.#markBackingFresh(false);
   }
 
   #auditRewind(sender: AuthContext, turnId: string, plan: RewindOutcome, outcome: string, force?: boolean): void {

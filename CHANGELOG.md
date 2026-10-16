@@ -8,6 +8,25 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Forks, backend switches and rewinds continue the conversation natively on
+  Claude and Codex** (#387). Until now a fork onto Claude, Codex or pi got a
+  text transcript in its first prompt, with each tool's input and output cut
+  to 2,000 characters and reasoning dropped, even when the fork stayed on the
+  same backend. Now:
+  - On the same backend, the backend forks its own conversation at the turn,
+    so nothing is converted or cut and reasoning is kept. Claude uses the
+    Agent SDK's `forkSession`; Codex uses `thread/fork`.
+  - From another backend, codeoid hands the target native history: a Claude
+    session file with real `tool_use`/`tool_result` blocks, verified with the
+    SDK's own reader before use, or Codex history items through
+    `thread/inject_items`.
+
+  The transcript remains the fallback, for pi, the Gemini CLI, and any native
+  path that fails. The session says which way it went, and
+  `session.nativeContinuation` / `CODEOID_NATIVE_CONTINUATION` turns this off.
+  Each turn now records where it ends in the backend's own conversation
+  (`NormalizedTurnResult.nativeRef`, stamped on the canonical turn).
+
 - **Routines: agents that run on their own** (#54). `codeoid routine add`
   saves an agent task that runs on a cron or interval schedule (IANA
   timezones, phase-anchored intervals, 60-second floor), once at a set time, from
@@ -143,6 +162,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   require a pack; an explicit-`phases` plan cannot declare one.
 
 ### Fixed
+
+- **Codex sessions keep their conversation across a daemon restart.** The
+  Codex provider never saved the thread id it created, so after any restart it
+  tried to resume a stale id and silently started an empty thread. It now
+  saves the id the moment it adopts a thread. A backend switch now also marks
+  the new backend fresh until its first prompt, so a restart in between
+  re-seeds it instead of resuming nothing.
 
 - **The context window is no longer guessed from the model id.**
   codeoid inferred every window from a substring table over model ids, and that table was wrong the moment a model shipped: `claude-opus-5-5` inferred to the 200k fallback while every turn result stated 1,000,000.

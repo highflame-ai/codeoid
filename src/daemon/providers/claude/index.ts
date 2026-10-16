@@ -12,6 +12,8 @@
 
 import type { McpTenant } from "../../mcp/oauth.js";
 import {
+  forkSession,
+  getSessionMessages,
   query,
   type Query,
   type SDKMessage,
@@ -42,7 +44,20 @@ import { FLEET_TOOL_NAMES } from "../../fleet.js";
 import { rewriteBashToolInput } from "../../compress/index.js";
 import type { CodeoidConfig } from "../../../config.js";
 import type { AuthContext } from "../../../protocol/types.js";
-import type { SessionProvider, ModelInfo, NormalizedTurnResult, ProviderEvent, SessionScopedEvent, TurnOpts, TurnRun, CatalogEntry, UiResponse } from "../interface.js";
+import type {
+  SessionProvider,
+  ModelInfo,
+  NativeContinuationRequest,
+  NativeContinuationResult,
+  NormalizedTurnResult,
+  ProviderEvent,
+  SessionScopedEvent,
+  TurnOpts,
+  TurnRun,
+  CatalogEntry,
+  UiResponse,
+} from "../interface.js";
+import { removeClaudeSession, toClaudeSessionEntries, writeClaudeSession } from "./native-history.js";
 import { BUDGET_STOP_MESSAGE, isBackgroundLifecycleEvent } from "../interface.js";
 import { isUngrantableSkillCommand, redactCommand } from "../../skill-command.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
@@ -98,9 +113,17 @@ export function packPluginsOption(dirs?: readonly string[]): { plugins?: { type:
 
 // ── Initialisation options ────────────────────────────────────────────────────
 
+/** The SDK's session-file functions native continuation uses; injectable for tests. */
+export interface ClaudeNativeSdk {
+  forkSession(sessionId: string, opts: { upToMessageId: string }): Promise<{ sessionId: string }>;
+  getSessionMessages(sessionId: string, opts: { dir: string }): Promise<ReadonlyArray<{ uuid: string }>>;
+}
+
 export interface ClaudeProviderInit {
   /** codeoid session id — used as the initial backing id and for audit/logging. */
   sessionId: string;
+  /** Test seam for native continuation (#387); defaults to the real SDK. */
+  nativeSdk?: ClaudeNativeSdk;
   /** Persisted backing id from Store, or the session id itself on first run. */
   initialBackingId: string;
   /** Tenant-scoped memory workspace id (computed once by Session). Used to bind
@@ -438,6 +461,55 @@ export class ClaudeProvider implements SessionProvider {
    */
   seedText(block: string): void {
     this.#pendingHistorySeed = block.length > 0 ? block : null;
+  }
+
+  /**
+   * Continue a conversation natively (#387). Same backend with a recorded
+   * fork point: fork Claude's own session there — nothing is lost, reasoning
+   * included. Otherwise: write codeoid's history as a Claude session and
+   * resume it, so tool calls arrive as real tool_use/tool_result blocks.
+   *
+   * A written session is read back with the SDK's own reader before it is
+   * used; anything short of an exact read-back is removed and reported as
+   * null, so the session falls back to the transcript seed rather than
+   * resuming something Claude may misread.
+   */
+  async continueNatively(req: NativeContinuationRequest): Promise<NativeContinuationResult | null> {
+    const sdk = this.#init.nativeSdk ?? { forkSession, getSessionMessages };
+    const tag = `[claude-provider ${this.#init.sessionId.slice(0, 8)}]`;
+    if (req.forkFrom) {
+      try {
+        const { sessionId } = await sdk.forkSession(req.forkFrom.backingId, { upToMessageId: req.forkFrom.ref });
+        this.#adoptBacking(sessionId);
+        return { via: "fork", backingId: sessionId };
+      } catch (err) {
+        // The source session may be gone (cleaned up, another machine): build it instead.
+        console.error(`${tag} native fork of ${req.forkFrom.backingId.slice(0, 8)} failed, building history instead: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (req.history.length === 0) return null;
+    const id = randomUUID();
+    const { entries, truncation } = toClaudeSessionEntries(req.history, { sessionId: id, cwd: req.workdir, maxChars: req.maxChars });
+    if (entries.length === 0) return null;
+    const path = await writeClaudeSession(entries, { sessionId: id, cwd: req.workdir });
+    try {
+      const read = await sdk.getSessionMessages(id, { dir: req.workdir });
+      if (read.length !== entries.length || read.at(-1)?.uuid !== entries.at(-1)!.uuid) {
+        throw new Error(`the SDK read back ${read.length} of ${entries.length} entries`);
+      }
+    } catch (err) {
+      await removeClaudeSession(path).catch(() => {});
+      console.error(`${tag} native history didn't verify, using the transcript: ${err instanceof Error ? err.message : String(err)}`);
+      return null;
+    }
+    this.#adoptBacking(id);
+    return { via: "history", backingId: id, ...(truncation.omittedTurns > 0 || truncation.newestTurnSliced ? { truncation } : {}) };
+  }
+
+  /** Make `id` this provider's backing session, resumed (not created) on the next turn. */
+  #adoptBacking(id: string): void {
+    this.resetToNewSession(id);
+    this.#hasQueried = true;
   }
 
   /**
@@ -1281,6 +1353,12 @@ export interface TranslateState {
    * place. The SDK already says which model is primary; ask it instead.
    */
   primaryModel: string | null;
+  /**
+   * The uuid of the last main-conversation entry (assistant message or tool
+   * result, not a subagent's, not a replay) seen this turn: where the turn
+   * ends in Claude's own session, so a fork can be cut there (#387).
+   */
+  lastChainUuid?: string | null;
 }
 
 /**
@@ -1299,6 +1377,10 @@ export function translateSDKMessage(
    *  reader and would drop them unread. */
   emitSession?: (event: SessionScopedEvent) => void,
 ): void {
+    if (msg.type === "assistant" || msg.type === "user") {
+      const m = msg as { uuid?: string; parent_tool_use_id?: string | null; isReplay?: boolean };
+      if (m.uuid && !m.parent_tool_use_id && !m.isReplay) state.lastChainUuid = m.uuid;
+    }
     switch (msg.type) {
       case "assistant": {
         // Per-call LLM usage — split primary vs subagent for accurate ctx tracking.
@@ -1431,6 +1513,9 @@ export function translateSDKMessage(
             }`
           : undefined;
         state.lastLocalCommandStderr = null;
+        const sessionId = (msg as { session_id?: string }).session_id;
+        const chainEnd = state.lastChainUuid;
+        state.lastChainUuid = null;
         const normalized: NormalizedTurnResult = {
           providerId,
           model,
@@ -1451,6 +1536,8 @@ export function translateSDKMessage(
               : r.subtype !== "success" && r.result
                 ? r.result
                 : undefined),
+          // A zero-turn run left nothing in the session to fork at.
+          ...(sessionId && chainEnd && !zeroTurn ? { nativeRef: { backingId: sessionId, ref: chainEnd } } : {}),
         };
         emit({ type: "turn_done", result: normalized });
         // Stay warm — keep the queue open for the next turn.
