@@ -38,6 +38,7 @@ one-way door, and how clients discover the token.
 | `session:read` | Read-only fleet visibility (conductor): list / find / summarize sessions |
 | `session:dispatch` | Send-class fleet routing (conductor): direct / interrupt / spawn on the owner's behalf |
 | `fs:read` | Read files + list directories under a session's workdir |
+| `routine:manage` | Create, change, fire and delete [routines](routines.md). Owner-tier: not in the operator share preset. Also needs `session:create` + `session:send`, and `session:approve` for an autonomous routine or one with a check |
 | `settings:read` | Read the settings manifest + current (non-secret) configuration |
 | `settings:write` | Write daemon configuration (`config.json` + `.env`), including secrets |
 
@@ -95,6 +96,10 @@ CODEOID_DEFAULT_PROVIDER=claude         # backend for sessions created without -
 # Outward control plane (/mcp/control) — see docs/mcp-control.md. Off by default.
 CODEOID_MCP_CONTROL_ENABLED=false       # mount the endpoint
 CODEOID_MCP_CONTROL_ACTIONS=false       # also allow create / send / interrupt / destroy
+
+# Routines (scheduled and triggered agent runs) — see docs/routines.md. On by default.
+CODEOID_ROUTINES_ENABLED=true           # run the scheduler and accept routine commands
+CODEOID_ROUTINES_MAX_CONCURRENT=2       # routine runs executing at once, across all routines
 
 # Memory
 CODEOID_MEMORY=1                        # default: on; set to 0 to disable

@@ -169,6 +169,8 @@ codeoid approve <n> [--deny] [--pick N | --id <approvalId>] [--yes]
 codeoid destroy <n>
 codeoid mcp config [--scopes observe|operate|full]  # MCP client entry for /mcp/control
 codeoid mcp headers [--scopes …]                    # fresh bearer header (an MCP headersHelper)
+codeoid routine add <name> --prompt … [--cron|--every|--at] [--check <cmd>]  # scheduled agent runs
+codeoid routine ls | show | runs | run [--wait] | edit | pause | resume | rm | token | preview
 ```
 
 `/mcp/control` (off by default, `mcpControl.*`) lets external agents drive
@@ -176,6 +178,14 @@ sessions over MCP. Every tool call is an ordinary `ClientMessage` run through
 `SessionManager.handle`, so it shares the WebSocket path's verifier, scopes,
 tenancy, and audit. Keep authorization in `handle`; the endpoint may only
 narrow what is reachable, never grant. See docs/mcp-control.md.
+
+Routines (`src/daemon/routines/`, docs/routines.md) run sessions on a schedule
+or an API call. `RoutineService` owns the scheduler and runs; it reaches
+sessions only through the `RoutineHost` seam that `SessionManager` implements,
+and every routine.* message is authorized in `SessionManager.#routineHandle`
+(`routine:manage` + session:create + session:send, plus session:approve for an
+autonomous routine or one with a check). The fire claim is a compare-and-set on
+`next_fire_at`, which is the only scheduler lock.
 
 ## Config
 
@@ -188,6 +198,7 @@ TELEGRAM_BOT_TOKEN=...              # Optional: enables Telegram frontend
 TELEGRAM_ALLOWED_USER_IDS=123,456   # Required with bot token
 CODEOID_MCP_CONTROL_ENABLED=false   # mount /mcp/control (docs/mcp-control.md)
 CODEOID_MCP_CONTROL_ACTIONS=false   # also allow create / send / interrupt / destroy there
+CODEOID_ROUTINES_ENABLED=true       # scheduler + routine commands (docs/routines.md)
 
 # Claude auth: uses your existing `claude login` session (Pro/Max subscription).
 # No ANTHROPIC_API_KEY needed if you're logged in via Claude Code CLI.
