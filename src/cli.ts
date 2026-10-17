@@ -801,7 +801,7 @@ program
 
 const mcp = program
   .command("mcp")
-  .description("MCP: let external agents drive codeoid over MCP (docs/mcp-control.md), and manage a session's MCP servers");
+  .description("Let external agents drive codeoid over MCP (docs/mcp-control.md), and manage a session's MCP servers");
 
 mcp
   .command("headers")
@@ -852,7 +852,7 @@ mcp
 
 mcp
   .command("reconnect <session> <server>")
-  .description("Redial one of a session's MCP servers — e.g. one that failed when the session started and has since been fixed")
+  .description("Redial one of a session's MCP servers that's down — e.g. one that failed when the session started and has since been fixed")
   .action((session: string, server: string) => withClient((c) => c.mcpReconnect(session, server)));
 
 // ── Packs (dynamic pack loading — docs/pack-loading.md) ─────────────────────

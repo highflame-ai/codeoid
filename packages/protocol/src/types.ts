@@ -1608,7 +1608,8 @@ export interface SessionSetProviderMsg extends BaseClientMsg {
  * Redial one of the MCP servers the session's BACKEND mounts (#389) — e.g. a
  * server that failed when the session started and has since been fixed.
  * `response.ok` data is {@link McpReconnectResult}. Rejected when the backend
- * can't reconnect servers. Requires `session:send`.
+ * can't reconnect servers, the server isn't one it reports down, or a redial
+ * of it was just asked for. Requires `session:send`.
  */
 export interface SessionMcpReconnectMsg extends BaseClientMsg {
   type: "session.mcp_reconnect";

@@ -307,8 +307,9 @@ export function dispatchSlash(cmd: SlashCommand, ctx: SlashContext): void {
       // Success posts "reconnected" into the session itself; say what didn't work.
       ctx
         .request(msg)
-        .then((data) => {
-          const r = data as McpReconnectResult | undefined;
+        .then((resp) => {
+          // `request` resolves with the whole `response.ok`; the result is its data.
+          const r = (resp as { data?: McpReconnectResult } | undefined)?.data;
           if (!r || r.status === "connected") return;
           ctx.report?.(r.deferred ? `${r.server} connects when the next turn starts.` : (r.error ?? `${r.server} is ${r.status}.`));
         })

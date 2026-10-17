@@ -519,7 +519,7 @@ export interface AgentProvider {
   /**
    * Redial one of the MCP servers the backend itself mounts (#389) and report
    * its state afterwards. Resolves null when the backend has no live
-   * connection to ask (between sessions of its process) — it dials its
+   * connection to ask (no live query: before its first turn, or after a teardown) — it dials its
    * servers when the next turn starts anyway. Never throws for a failed
    * reconnect: that's a result with `status` and `error`.
    */

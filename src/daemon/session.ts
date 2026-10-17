@@ -1075,12 +1075,12 @@ export class Session {
   readonly #mcpBack = new Set<string>();
   /** Servers a report has called down and none has since called connected (through `pending`). */
   readonly #mcpWasDown = new Set<string>();
-  /** A manual redial in flight per server (single-flight), and when each was last asked for. */
+  /** The redial in flight per server (manual or pre-turn; single-flight), and when each server was last redialed on request. */
   readonly #mcpInFlight = new Map<string, Promise<BackendMcpServerState | null>>();
   readonly #mcpManualAt = new Map<string, number>();
   /** Who has joined each in-flight redial — each caller joins one at most once. */
   readonly #mcpJoiners = new WeakMap<Promise<BackendMcpServerState | null>, Set<string>>();
-  /** Bumped by every mcp_init: a redial that started before one must not overwrite it. */
+  /** Bumped by every mcp_init and by teardown / backend switch: a redial that started before one must not overwrite it. */
   #mcpGeneration = 0;
 
   constructor(opts: SessionCreateOptions) {
@@ -1547,16 +1547,16 @@ export class Session {
   }
   get attachedClientCount(): number { return this.#clients.size; }
 
+  /** Whether this session's current backend can redial its MCP servers. */
+  get canReconnectMcp(): boolean {
+    return typeof this.#provider.reconnectMcpServer === "function";
+  }
   /**
    * Snapshot of the SDK-reported MCP state for this session, captured
    * from the most recent `system/init` event. `claude.config` merges this
    * over the static config we read from disk so the drawer can show live
    * connection status + the actual tools available to the agent.
    */
-  /** Whether this session's current backend can redial its MCP servers. */
-  get canReconnectMcp(): boolean {
-    return typeof this.#provider.reconnectMcpServer === "function";
-  }
   get sdkMcpSnapshot(): { status: Map<string, string>; tools: Map<string, string[]> } {
     return { status: this.#sdkMcpStatus, tools: this.#sdkMcpTools };
   }
@@ -1627,10 +1627,11 @@ export class Session {
 
   /**
    * Redial one server and wait up to `timeoutMs` for the outcome. The redial
-   * itself is shared: whoever asks while one is in flight (the person, or the
-   * pre-turn heal) waits on that one, and it stays in flight until the
-   * backend answers — a caller giving up doesn't free the server for another
-   * dial. Every caller is audited as themselves.
+   * itself is shared: whoever asks while one is in flight waits on that one
+   * (a person may join the pre-turn redial; the pre-turn redial skips a
+   * server already being redialed), and it stays in flight until the backend
+   * answers — a caller giving up doesn't free the server for another dial.
+   * Every caller is audited as themselves.
    */
   async #dialMcp(name: string, timeoutMs: number, who: string, action: string): Promise<McpReconnectResult> {
     const audit = (what: string) => this.#store.audit(who, action, this.id, `server=${JSON.stringify(name)} ${what}`);
@@ -2646,16 +2647,16 @@ export class Session {
     // A message that meant to join a running turn whose run turned out to be
     // stalled (recovered above) starts a turn of its own instead.
     if (turnId === previousTurnId) turnId = randomUUID();
+    // Redial any backend MCP server that's down, so this turn can use a
+    // server fixed since it failed (#389) — bounded, and backed off.
+    await this.#healMcpServers();
     // Snapshot the files this turn starts from, at the last moment before the
     // agent can touch them — what "go back to before this message" restores.
     // Bounded wait; a snapshot still running when the turn starts is `late`.
-    // First, redial any backend MCP server that's down, so this turn can use
-    // a server fixed since it failed (#389) — bounded, and backed off.
-    await this.#healMcpServers();
     await this.#checkpointTurn(turnId);
     this.#throwIfStoppedBeforeStart(stopGen);
     // The backend may have started a turn on its own while this send awaited
-    // (hooks, identity, the snapshot) — checked AFTER every await, so nothing
+    // (hooks, identity, the MCP redials, the snapshot) — checked AFTER every await, so nothing
     // can start in between — join it rather than start a second turn over it,
     // whose runTurn would close the adopted queue mid-reply. Joining means
     // the adopted turn's id, not the one minted for this prompt.

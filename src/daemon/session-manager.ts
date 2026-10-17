@@ -1551,7 +1551,7 @@ mcpHub: this.#mcpHub,
         };
       });
       // Servers the backend runs that no config file here declares — the
-      // claude.ai connectors, plugins' servers — so they can be seen and
+      // claude.ai connectors, plugins' servers, codeoid's own — so they can be seen and
       // reconnected too.
       const declared = new Set(mcpServers.map((s) => s.name));
       for (const [name, liveStatus] of live.status) {

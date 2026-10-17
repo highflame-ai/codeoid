@@ -760,6 +760,7 @@ export class TerminalClient {
     const resp = await this.#request({ type: "session.mcp_reconnect", id: randomUUID(), sessionId, server });
     if (resp.type !== "response.ok") {
       this.#printError(resp);
+      process.exitCode = 1;
       return;
     }
     const r = resp.data as McpReconnectResult;
