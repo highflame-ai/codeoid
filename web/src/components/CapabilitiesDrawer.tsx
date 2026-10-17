@@ -353,8 +353,7 @@ const McpAdopt: Component<{ server: string; url: string | null; path: string; pr
   const mine = () => st().server === props.server;
   const run = async () => {
     // Daemon-wide and lasting: say so before doing it — and, for a project's
-    // own file, first, that the project chose this address. The host is
-    // shown as the browser resolves it (punycode), not as the file spells it.
+    // own file, first, that the project chose this address.
     // The full address, as the browser resolves it: plain ASCII (punycode
     // host, the rest percent-encoded), so the path that tells two servers on
     // one host apart is there too.

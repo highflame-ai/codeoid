@@ -1753,12 +1753,6 @@ describe("ClaudeProvider – runTurn with mocked SDK", () => {
   });
 });
 
-// ── #153: warm loop vs per-turn systemPromptAppend ────────────────────────────
-//
-// The SDK fixes the system prompt at query() construction. The warm
-// keep-alive loop therefore must be REBUILT when a turn arrives with a
-// different systemPromptAppend (before_turn hook output, refreshed memory
-// index) — and must keep full warm-reuse when the append is unchanged.
 describe("ClaudeProvider – OAuth registry servers (#390)", () => {
   let openGate: () => void = () => {};
   beforeEach(() => {
@@ -1781,6 +1775,41 @@ describe("ClaudeProvider – OAuth registry servers (#390)", () => {
     // By URL, not by name: another server called "notes" elsewhere is not codeoid's.
     expect(Object.keys(withoutServers(user, ["https://notes.example.com/mcp", "https://tracker.example.com/mcp"]))).toEqual(["other", "local"]);
     expect(withoutServers(user, [])).toBe(user);
+  });
+
+  it("never mounts codeoid's copy over the user's own server of that name; drops the user's copy at codeoid's URL", async () => {
+    const { McpServerSchema } = await import("../config.js");
+    const { McpRegistry } = await import("../daemon/mcp/registry.js");
+    const provider = new ClaudeProvider({
+      sessionId: "test-session",
+      initialBackingId: "test-backing",
+      workspaceId: "ws_test",
+      tenant: { accountId: "acc", projectId: "proj" },
+      mcpRegistry: new McpRegistry(
+        {
+          github: McpServerSchema.parse({ url: "https://attacker.example/mcp", oauth: true }),
+          notes: McpServerSchema.parse({ url: "https://notes.example.com/mcp", oauth: true }),
+        },
+        { memoryEnabled: false },
+      ),
+      mcpHub: { signedIn: () => true, credentialStamp: () => "1" } as never,
+      // This workdir's own config: its own github elsewhere, and the CLI's copy of notes.
+      userMcpServers: () =>
+        ({ github: { type: "http", url: "https://api.githubcopilot.com/mcp" }, notes: { type: "http", url: "https://notes.example.com/mcp" } }) as never,
+      store: {
+        audit: () => {},
+        getClaudeCodeSessionId: () => null,
+        setClaudeCodeSessionId: () => {},
+        getSkillCommandGrants: () => new Map<string, boolean>(),
+        setSkillCommandGrant: () => {},
+      } as never,
+    });
+    provider.runTurn({ history: [], userMessage: "t1", workdir: "/tmp", canUseTool: async () => ({ behavior: "allow" as const }) });
+    const servers = (capturedQueryOpts?.options as { mcpServers?: Record<string, { type?: string; url?: string }> }).mcpServers!;
+    expect(servers.github).toMatchObject({ type: "http", url: "https://api.githubcopilot.com/mcp" }); // theirs stays
+    expect(servers.notes).toMatchObject({ type: "sdk" }); // codeoid's, the CLI's copy (same URL) dropped
+    openGate();
+    await provider.teardown();
   });
 
   it("mounts codeoid's copy once signed in, denies the CLI's, and rebuilds on a sign-in change", async () => {
@@ -1838,6 +1867,12 @@ describe("ClaudeProvider – OAuth registry servers (#390)", () => {
   });
 });
 
+// ── #153: warm loop vs per-turn systemPromptAppend ────────────────────────────
+//
+// The SDK fixes the system prompt at query() construction. The warm
+// keep-alive loop therefore must be REBUILT when a turn arrives with a
+// different systemPromptAppend (before_turn hook output, refreshed memory
+// index) — and must keep full warm-reuse when the append is unchanged.
 describe("ClaudeProvider – systemPromptAppend loop rebuild (#153)", () => {
   let openGate: () => void = () => {};
   beforeEach(() => {

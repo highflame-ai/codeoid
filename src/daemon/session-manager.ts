@@ -2384,7 +2384,7 @@ mcpHub: this.#mcpHub,
     }
     // Any client held for the old entry (a plain copy imported from ~/.claude.json).
     this.#mcpHub?.drop(spec.name);
-    audit(`adopted host=${new URL(can.url).host}`);
+    audit(`adopted url=${JSON.stringify(new URL(can.url).href)}${fromRepoFile(found) ? " projectFile=true" : ""}`);
     return reply(false);
   }
 

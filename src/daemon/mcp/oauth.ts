@@ -44,13 +44,6 @@ export interface McpCredentialSource {
   credentialStamp?(spec: McpServerSpec, tenant: McpTenant): string | undefined;
 }
 
-/** Whether a request is a refresh-token grant at a token endpoint. */
-function isRefreshRequest(init: RequestInit | undefined): boolean {
-  const body = init?.body;
-  const text = typeof body === "string" ? body : body instanceof URLSearchParams ? body.toString() : "";
-  return /(^|&)grant_type=refresh_token(&|$)/.test(text);
-}
-
 /** Thrown to the model/UI when a server has no usable credential. */
 export class McpSignInRequired extends Error {
   constructor(readonly server: string) {
@@ -286,36 +279,19 @@ export class McpOAuth implements McpCredentialSource {
       binding: "",
       expiresAt: this.#now(),
     };
-    // auth() answers "REDIRECT" both when the refresh token is dead and when
-    // the refresh merely failed (a network error, a 5xx — it moves on to a
-    // new authorization either way). Only the token endpoint's own verdict
-    // tells them apart: watch for it.
-    let refused = false;
-    const fetchFn: FetchLike = async (url, init) => {
-      const resp = await this.#fetch(url, init);
-      if (isRefreshRequest(init) && (resp.status === 400 || resp.status === 401)) {
-        const body = await resp.clone().json().catch(() => ({}) as Record<string, unknown>);
-        if ((body as { error?: unknown }).error === "invalid_grant") refused = true;
-      }
-      return resp;
-    };
+    // When the authorization server refuses the refresh (invalid_grant, or
+    // invalid_client), auth() itself has the provider forget the tokens
+    // (invalidateCredentials), so the server reads as signed out. A refresh
+    // that merely failed (network, 5xx) changes nothing stored: auth() moves
+    // on to a new authorization, which isn't followed here — and the tokens
+    // are kept for the next try.
     try {
       const result = await auth(this.#provider(spec, oauth, tenant, scratch), {
         serverUrl: urlOf(spec),
         scope: scopeOf(oauth),
-        fetchFn,
+        fetchFn: this.#fetch,
       });
-      if (result !== "AUTHORIZED") {
-        // Refused (invalid_grant): only a new interactive sign-in helps —
-        // forget the dead tokens, so the server reads as signed out (Settings
-        // offers Connect) rather than signed in and failing. Anything else
-        // is not a verdict on the token: keep it for the next try.
-        if (refused) {
-          this.#store.clearMcpOAuth(tenant, serverOf(spec), "tokens");
-          this.#rejected.delete(keyOf(spec.name, tenant));
-        }
-        return undefined;
-      }
+      if (result !== "AUTHORIZED") return undefined;
     } catch (err) {
       // A network error, not a verdict on the token: keep it for the next try.
       console.error(`[codeoid] mcp oauth: refreshing ${spec.name} failed: ${err instanceof Error ? err.message : String(err)}`);

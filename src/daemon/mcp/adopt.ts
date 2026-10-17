@@ -32,11 +32,6 @@ export async function claudeMcpServers(workdir: string | null): Promise<ClaudeCo
   return workdir ? snapshot.mcpServers : snapshot.mcpServers.filter((s) => s.scope === "global");
 }
 
-/** Every server of that name in Claude's config. The same name can mean two servers. */
-export async function findClaudeMcpServers(name: string, workdir: string | null): Promise<ClaudeConfigMcpServer[]> {
-  return (await claudeMcpServers(workdir)).filter((s) => s.name === name);
-}
-
 /**
  * Why adopting `chosen` would be refused, or null — the one rule the adopt
  * handler, the drawer's offer and the reconnect hint all apply, so neither
@@ -65,8 +60,12 @@ export function adoptionRefusal(
   }
   // A project's own server can't take a name the user's own config gives
   // another address: it would stand in for theirs in every session.
-  if (fromRepoFile(chosen) && all.some((o) => o.name === chosen.name && !fromRepoFile(o) && o.url !== can.url)) {
-    return `this project's ${chosen.name} would replace your own server of that name, at another address`;
+  // Compared loosely (case, "-" vs "_"): a look-alike would sit beside
+  // theirs with near-identical tools.
+  const loose = (n: string) => n.toLowerCase().replace(/-/g, "_");
+  const own = all.find((o) => loose(o.name) === loose(chosen.name) && !fromRepoFile(o) && o.url !== can.url);
+  if (fromRepoFile(chosen) && own) {
+    return `this project's ${chosen.name} would stand in for your own ${own.name}, at another address`;
   }
   return registryConflict(registry, chosen.name, can.url);
 }
@@ -144,10 +143,10 @@ export function adoptability(server: ClaudeConfigMcpServer): { ok: true; url: st
   if (!server.url) {
     return { ok: false, reason: `${server.name} runs a local command; only a remote (HTTP) MCP server signs in with OAuth` };
   }
-  // Authorized by a header already (a bearer, an API key): adopting would drop
-  // it for a sign-in the server may not offer.
-  if ((server.headerKeys ?? []).some((h) => /^(authorization|x-api-key|api-key)$/i.test(h))) {
-    return { ok: false, reason: `${server.name} is authorized by a header in Claude's config, not an OAuth sign-in` };
+  // Configured with headers (a bearer, an API key, a token under any name):
+  // adopting drops them, for a sign-in the server may not offer.
+  if ((server.headerKeys ?? []).length > 0) {
+    return { ok: false, reason: `${server.name} is configured with headers in Claude's config (often its authorization), which adopting would drop` };
   }
   if (server.type === "sse") {
     return { ok: false, reason: `${server.name} uses the older SSE transport, which codeoid's MCP client doesn't speak` };

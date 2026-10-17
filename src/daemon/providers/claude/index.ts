@@ -157,6 +157,9 @@ export interface ClaudeProviderInit {
   /** The daemon-owned MCP client — what an OAuth registry server is called
    *  through, as the session's tenant (#390). */
   mcpHub?: McpHub;
+  /** Test seam: the user's own Claude-config servers for a workdir (default:
+   *  read from ~/.claude.json). */
+  userMcpServers?: (workdir: string) => Record<string, McpServerConfig>;
   config?: CodeoidConfig;
   compressionRegistry?: CompressionRegistry;
   /** Called once per session with the live model catalog. */
@@ -663,16 +666,27 @@ export class ClaudeProvider implements SessionProvider {
     // the turn. Not applied to the in-process servers. Kept below the session
     // stall watchdog so the SDK signals first.
     const mcpToolTimeoutMs = init.config?.session.mcpToolTimeoutMs ?? 120_000;
+    // A server codeoid now signs in to is codeoid's (mounted below), not the CLI's.
+    const userServers = withoutServers((init.userMcpServers ?? loadUserMcpServers)(opts.workdir), oauthMcp.deniedUrls);
+    // ...but never in place of the user's own server of that name at another
+    // address — in this workdir's config, which adopting (from another
+    // workdir, perhaps) couldn't see. Theirs stays; codeoid's isn't mounted here.
+    const mounts = oauthMcp.mounts();
+    for (const name of Object.keys(mounts)) {
+      if (name in userServers) {
+        console.error(`[claude-provider ${init.sessionId.slice(0, 8)}] not mounting codeoid's ${name}: this workdir's own Claude config has a ${name} at another address`);
+        delete mounts[name];
+      }
+    }
     return {
-      // A server codeoid now signs in to is codeoid's (mounted below), not the CLI's.
-      ...withMcpToolTimeout(withoutServers(loadUserMcpServers(opts.workdir), oauthMcp.deniedUrls), mcpToolTimeoutMs),
+      ...withMcpToolTimeout(userServers, mcpToolTimeoutMs),
       // Registry servers — mounted natively on the SDK (claude owns its client);
       // tool calls surface as `mcp__<server>__<tool>` and gate via canUseTool.
       ...withMcpToolTimeout(registryServersForClaude(init.mcpRegistry), mcpToolTimeoutMs),
       // Registry OAuth servers the tenant has signed in to — in-process, in
       // front of the daemon-owned client, which holds the token (#390). The
       // hub applies its own per-call timeout.
-      ...oauthMcp.mounts(),
+      ...mounts,
       ...(init.memory
         ? {
             codeoid_memory: buildMemoryMcpServer(init.memory, {
@@ -728,10 +742,11 @@ export class ClaudeProvider implements SessionProvider {
       }
       // Per-turn contributions the SDK fixes at query construction changed, so
       // the warm loop would silently use the stale value — rebuild instead.
-      // Three triggers: the system-prompt append (before_turn hooks, memory
+      // Four triggers: the system-prompt append (before_turn hooks, memory
       // workspace-index refresh — #153), the skill-command grants (a just-
-      // approved command must reach allowedTools on the retry — #233), and the
-      // session-scoped skill plugins (a pack activation applied or swapped). The
+      // approved command must reach allowedTools on the retry — #233), the
+      // session-scoped skill plugins (a pack activation applied or swapped),
+      // and the OAuth MCP servers (adopted, signed in or out — #390). The
       // fresh query RESUMES the same backing session, so no context is lost.
       // console.log, not error: an expected control-flow event.
       const reason =

@@ -56,7 +56,7 @@ beforeEach(() => {
     join(home, ".claude.json"),
     JSON.stringify({
       mcpServers: {
-        notes: { type: "http", url: "https://notes.example.com/mcp", headers: { "X-Team": "t1" } },
+        notes: { type: "http", url: "https://notes.example.com/mcp" },
         legacy: { type: "sse", url: "https://legacy.example.com/sse" },
         local: { command: "node", args: ["server.js"] },
       },
@@ -128,7 +128,6 @@ describe("mcp.adopt", () => {
     const m = manager();
     const r = (await adopt(m, "notes")) as McpAdoptResultMsg;
     expect(r).toMatchObject({ type: "mcp.adopt.result", server: "notes", alreadyAdopted: false });
-    // Headers are not carried over: the token authorizes an OAuth server.
     expect(configJson().mcpServers.notes).toEqual({ url: "https://notes.example.com/mcp", oauth: true, trust: "prompt" });
     const spec = registry.get("notes")!;
     expect(isOAuthServer(spec)).toBe(true);
@@ -229,7 +228,7 @@ describe("mcp.adopt", () => {
       ["plain", "https"],
       ["creds", "carries credentials"],
       ["wild", "wildcard"],
-      ["keyed", "authorized by a header"],
+      ["keyed", "configured with headers"],
       ["self", "this daemon's own endpoints"],
       ["envref", "reference"],
       ["spoof", "control or non-ASCII"],
@@ -257,7 +256,7 @@ describe("mcp.adopt", () => {
     // Each outcome, as who asked, with the file the URL came from.
     expect(auditRows()).toEqual([
       { subject: "user:a", detail: 'server="notes" outcome=forbidden' },
-      { subject: "user:a", detail: `server="notes" outcome=adopted host=notes.example.com source=${JSON.stringify(join(home, ".claude.json"))}` },
+      { subject: "user:a", detail: `server="notes" outcome=adopted url="https://notes.example.com/mcp" source=${JSON.stringify(join(home, ".claude.json"))}` },
       { subject: "user:a", detail: `server="legacy" outcome=refused source=${JSON.stringify(join(home, ".claude.json"))}` },
     ]);
   });
@@ -311,7 +310,7 @@ describe("a repo's file and the user's own config naming the same server", () =>
     // The project's own "linear" can't replace the user's, even with its URL named.
     expect(await adopt(m, "linear", auth(WRITE), sid, "https://attacker.example/mcp")).toMatchObject({
       type: "response.error",
-      error: expect.stringContaining("would replace your own server"),
+      error: expect.stringContaining("would stand in for your own linear"),
     });
     expect(await adopt(m, "linear", auth(WRITE), sid, "https://mcp.linear.app/mcp")).toMatchObject({ type: "mcp.adopt.result" });
     expect(configJson().mcpServers.linear).toMatchObject({ url: "https://mcp.linear.app/mcp" });
@@ -329,7 +328,7 @@ describe("a repo's header-less copy of the user's header-authorized server", () 
     const sid = await sessionIn(m, work);
     expect(await adopt(m, "foo", auth(WRITE), sid, "https://foo.example.com/mcp")).toMatchObject({
       type: "response.error",
-      error: expect.stringContaining("authorized by a header"),
+      error: expect.stringContaining("configured with headers"),
     });
   });
 });
