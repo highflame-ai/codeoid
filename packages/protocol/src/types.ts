@@ -1041,6 +1041,7 @@ export type ClientMessage =
   | SessionSearchMsg
   | SessionSetModelMsg
   | SessionSetProviderMsg
+  | SessionMcpReconnectMsg
   | SessionForkMsg
   | ScrollbackPageMsg
   | SessionRenameMsg
@@ -1604,6 +1605,33 @@ export interface SessionSetProviderMsg extends BaseClientMsg {
 }
 
 /**
+ * Redial one of the MCP servers the session's BACKEND mounts (#389) — e.g. a
+ * server that failed when the session started and has since been fixed.
+ * `response.ok` data is {@link McpReconnectResult}. Rejected when the backend
+ * can't reconnect servers, the server isn't one it reports down, or a redial
+ * of it was just asked for. Requires `session:send`.
+ */
+export interface SessionMcpReconnectMsg extends BaseClientMsg {
+  type: "session.mcp_reconnect";
+  sessionId: string;
+  /** The server's name as the backend reports it (the capabilities drawer's MCP list). */
+  server: string;
+}
+
+/** `response.ok` data for `session.mcp_reconnect`. */
+export interface McpReconnectResult {
+  server: string;
+  /** The backend's view after the attempt: connected, failed, needs-auth, pending, disabled. */
+  status: string;
+  /** Tools the server now offers (full `mcp__<server>__<tool>` names). */
+  tools: string[];
+  /** Why it isn't connected, when it isn't. */
+  error?: string;
+  /** The backend isn't running between turns: it connects its servers when the next turn starts. */
+  deferred?: boolean;
+}
+
+/**
  * Switch the model (and optionally fallback) for a session. Accepts
  * aliases (`opus`/`sonnet`/`haiku`) or full Anthropic model ids. Takes
  * effect on the next send — the current streamInput loop is torn down so
@@ -1888,6 +1916,12 @@ export interface ClaudeConfigMcpServer {
    * data yet.
    */
   liveTools?: string[];
+  /**
+   * True for a server the backend reported that no config file codeoid reads
+   * declares (a claude.ai connector, a plugin's server, one codeoid mounts):
+   * `path`, `command` and `url` are empty for it.
+   */
+  liveOnly?: true;
 }
 
 export interface ClaudeConfigHook {
@@ -1978,6 +2012,8 @@ export interface ClaudeConfigResultMsg {
   skills: ClaudeConfigSkill[];
   mcpServers: ClaudeConfigMcpServer[];
   hooks: ClaudeConfigHook[];
+  /** Whether this session's backend can redial its MCP servers (`session.mcp_reconnect`). */
+  mcpReconnect?: boolean;
 }
 
 /** One member of a dispatch group, as a client sees it. */

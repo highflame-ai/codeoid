@@ -34,6 +34,10 @@ let sdkGate: Promise<void> | null = null;
 /** When true, the mock query's interrupt() rejects — forcing the provider's
  *  hard-abort fallback. */
 let sdkInterruptThrows = false;
+/** MCP server states the mock query reports, and the reconnect calls it saw (#389). */
+let mcpStatuses: Array<Record<string, unknown>> = [];
+let mcpReconnects: string[] = [];
+let mcpReconnectError: Error | null = null;
 
 function makeMockQuery() {
   const err = sdkThrowError;
@@ -55,6 +59,11 @@ function makeMockQuery() {
       if (sdkInterruptThrows) throw new Error("interrupt unsupported");
     },
     supportedModels: async () => [{ value: "claude-opus-4", displayName: "Claude Opus 4" }],
+    reconnectMcpServer: async (name: string) => {
+      mcpReconnects.push(name);
+      if (mcpReconnectError) throw mcpReconnectError;
+    },
+    mcpServerStatus: async () => mcpStatuses,
   };
 }
 
@@ -89,6 +98,7 @@ import {
   skillSandboxDirs,
   packPluginsOption,
   pluginSkillDirs,
+  mcpToolPrefix,
 } from "../daemon/providers/claude/index.js";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -762,6 +772,70 @@ describe("ClaudeProvider – backing-session recovery can't loop (#387)", () => 
  * (anthropics/claude-code#80223) — this recovers whatever produced the zero
  * turn, because it keys on `num_turns` rather than on any cause.
  */
+describe("ClaudeProvider – reconnecting an MCP server (#389)", () => {
+  beforeEach(() => {
+    sdkMessages = [];
+    sdkThrowError = null;
+    sdkGate = null;
+    mcpStatuses = [];
+    mcpReconnects = [];
+    mcpReconnectError = null;
+  });
+
+  /** Start a turn and hold the loop open, so the provider has a live query. */
+  async function live(provider: ClaudeProvider): Promise<() => Promise<void>> {
+    let release!: () => void;
+    sdkGate = new Promise<void>((r) => {
+      release = r;
+    });
+    const events = collectTurnEvents(provider);
+    for (let i = 0; i < 50 && queryCallCount === 0; i++) await Bun.sleep(5);
+    await Bun.sleep(10);
+    return async () => {
+      release();
+      await events;
+    };
+  }
+
+  it("with no live query there is nothing to redial: the next turn dials its servers", async () => {
+    expect(await makeProvider().reconnectMcpServer("slack")).toBeNull();
+  });
+
+  it("redials through the live query and reports the server's new state, tools as full names", async () => {
+    const p = makeProvider();
+    const done = await live(p);
+    mcpStatuses = [{ name: "slack", status: "connected", tools: [{ name: "send_message" }, { name: "search" }] }];
+    expect(await p.reconnectMcpServer("slack")).toEqual({ status: "connected", tools: ["mcp__slack__send_message", "mcp__slack__search"] });
+    expect(mcpReconnects).toEqual(["slack"]);
+    await done();
+  });
+
+  it("a failed redial is a result, not a throw — with the backend's reason", async () => {
+    const p = makeProvider();
+    const done = await live(p);
+    mcpReconnectError = new Error("SyntaxError dialing https://gateway/mcp/x/slack");
+    mcpStatuses = [{ name: "slack", status: "failed" }];
+    expect(await p.reconnectMcpServer("slack")).toEqual({ status: "failed", tools: [], error: "SyntaxError dialing https://gateway/mcp/x/slack" });
+    mcpReconnectError = null;
+    mcpStatuses = [];
+    expect((await p.reconnectMcpServer("nope"))?.error).toContain('no MCP server named "nope"');
+    await done();
+  });
+
+  it("tool names carry the server's name as the CLI normalises it", async () => {
+    const p = makeProvider();
+    const done = await live(p);
+    mcpStatuses = [{ name: "claude.ai Google Drive", status: "connected", tools: [{ name: "search" }] }];
+    expect((await p.reconnectMcpServer("claude.ai Google Drive"))?.tools).toEqual(["mcp__claude_ai_Google_Drive__search"]);
+    // Whether it's a connector is the backend's word, not the name's.
+    expect((await p.reconnectMcpServer("claude.ai Google Drive"))?.connector).toBeUndefined();
+    mcpStatuses = [{ name: "Drive", status: "needs-auth", source: "claudeai" } as never];
+    expect((await p.reconnectMcpServer("Drive"))?.connector).toBe(true);
+    mcpStatuses = [];
+    await done();
+  });
+});
+
 describe("ClaudeProvider – unexplained zero-turn re-send", () => {
   beforeEach(() => { sdkMessages = []; sdkThrowError = null; capturedQueryOpts = null; sdkGate = null; });
 
@@ -1156,6 +1230,45 @@ describe("translateSDKMessage – system", () => {
       servers: { my_server: "connected" },
       tools: { my_server: ["mcp__my_server__read", "mcp__my_server__write"] },
     });
+  });
+
+  it("keys tools by the server's own name, not the CLI's normalised one (#389)", () => {
+    const events = collectEmits({
+      type: "system",
+      subtype: "init",
+      mcp_servers: [
+        { name: "claude.ai Google Drive", status: "connected" },
+        { name: "my.server", status: "connected" },
+      ],
+      tools: ["mcp__claude_ai_Google_Drive__search", "mcp__my_server__read"],
+    });
+    expect(events[0]).toMatchObject({
+      tools: { "claude.ai Google Drive": ["mcp__claude_ai_Google_Drive__search"], "my.server": ["mcp__my_server__read"] },
+    });
+  });
+
+  it("tools of servers that normalise alike go to neither; a longer name wins its own (#389)", () => {
+    const events = collectEmits({
+      type: "system",
+      subtype: "init",
+      mcp_servers: [
+        { name: "a.b", status: "connected" },
+        { name: "a_b", status: "connected" },
+        { name: "x", status: "connected" },
+        { name: "x__y", status: "connected" },
+      ],
+      tools: ["mcp__a_b__t", "mcp__x__one", "mcp__x__y__two"],
+    });
+    expect(events[0]).toMatchObject({ tools: { "a.b": [], a_b: [], x: ["mcp__x__one"], x__y: ["mcp__x__y__two"] } });
+  });
+
+  it("names MCP tools' server part the way the CLI does", () => {
+    expect(mcpToolPrefix("slack")).toBe("slack");
+    expect(mcpToolPrefix("my.server v2")).toBe("my_server_v2");
+    expect(mcpToolPrefix("a -- b")).toBe("a_--_b");
+    // claude.ai connectors also collapse runs of _ and trim the ends.
+    expect(mcpToolPrefix("claude.ai Google Drive")).toBe("claude_ai_Google_Drive");
+    expect(mcpToolPrefix("claude.ai  Foo (beta)")).toBe("claude_ai_Foo_beta");
   });
 
   it("emits api_retry for api_retry subtype", () => {

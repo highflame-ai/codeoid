@@ -13,12 +13,14 @@ import {
   Match,
   Show,
   Switch,
+  createEffect,
   createSignal,
   onCleanup,
   onMount,
+  untrack,
 } from "solid-js";
 
-import { claudeConfig, fetchClaudeConfig } from "../state/claude-config";
+import { claudeConfig, fetchClaudeConfig, reconnectMcpServer } from "../state/claude-config";
 import { focusedSessionId } from "../state/sessions";
 import { relativeTime } from "../lib/format";
 import type {
@@ -126,7 +128,7 @@ const CapabilitiesDrawer: Component = () => {
                 <SkillsList items={claudeConfig().skills} />
               </Match>
               <Match when={activeTab() === "mcp"}>
-                <McpList items={claudeConfig().mcpServers} />
+                <McpList items={claudeConfig().mcpServers} sessionId={claudeConfig().mcpReconnect ? claudeConfig().sessionId : null} />
               </Match>
               <Match when={activeTab() === "hooks"}>
                 <HooksList items={claudeConfig().hooks} />
@@ -285,7 +287,76 @@ const SkillsList: Component<{ items: ClaudeConfigSkill[] }> = (props) => (
   </Show>
 );
 
-const McpList: Component<{ items: ClaudeConfigMcpServer[] }> = (props) => (
+/**
+ * Reconnect state per session and server, outside the rows: the refresh that
+ * follows a reconnect rebuilds the list, and the outcome must survive it.
+ */
+const [mcpReconnecting, setMcpReconnecting] = createSignal<ReadonlySet<string>>(new Set());
+const [mcpNotes, setMcpNotes] = createSignal<Readonly<Record<string, string>>>({});
+const mcpKey = (sessionId: string, server: string) => `${sessionId}\u0000${server}`;
+
+/** Redial a server the backend reports as down (#389); the outcome shows inline. */
+const McpReconnect: Component<{ sessionId: string; server: string }> = (props) => {
+  const key = () => mcpKey(props.sessionId, props.server);
+  const busy = () => mcpReconnecting().has(key());
+  const setNote = (k: string, note: string | null) =>
+    setMcpNotes((prev) => {
+      const next = { ...prev };
+      if (note === null) delete next[k];
+      else next[k] = note;
+      return next;
+    });
+  const run = async () => {
+    const k = key();
+    setMcpReconnecting((prev) => new Set(prev).add(k));
+    setNote(k, null);
+    try {
+      const r = await reconnectMcpServer(props.sessionId, props.server);
+      if (r.status !== "connected") setNote(k, r.deferred ? "Connects when the next turn starts." : (r.error ?? `Still ${r.status}.`));
+    } catch (err) {
+      setNote(k, err instanceof Error ? err.message : String(err));
+    } finally {
+      setMcpReconnecting((prev) => {
+        const next = new Set(prev);
+        next.delete(k);
+        return next;
+      });
+    }
+  };
+  return (
+    <>
+      <button
+        type="button"
+        class="ml-auto rounded border border-border px-2 py-0.5 text-[11px] text-fg-muted hover:text-fg disabled:opacity-50"
+        disabled={busy()}
+        onClick={() => void run()}
+      >
+        {busy() ? "Reconnecting…" : "Reconnect"}
+      </button>
+      <Show when={mcpNotes()[key()]}>
+        <div class="mt-1 basis-full text-[11px] text-fg-muted">{mcpNotes()[key()]}</div>
+      </Show>
+    </>
+  );
+};
+
+/** Only a server the backend reports as down can be redialed. */
+const canReconnect = (status: string | undefined) => status === "failed" || status === "needs-auth";
+
+const McpList: Component<{ items: ClaudeConfigMcpServer[]; sessionId: string | null }> = (props) => {
+  // A reconnect's note is about that outage: a fresh look at the list (the
+  // drawer opening, or the MCP tab being shown) starts without old ones, and a server no longer down drops its own.
+  onMount(() => setMcpNotes({}));
+  createEffect(() => {
+    const sid = props.sessionId;
+    if (!sid) return;
+    const down = new Set(props.items.filter((m) => canReconnect(m.liveStatus)).map((m) => mcpKey(sid, m.name)));
+    const notes = untrack(mcpNotes);
+    const stale = Object.keys(notes).filter((k) => k.startsWith(`${sid}\u0000`) && !down.has(k));
+    if (stale.length === 0) return;
+    setMcpNotes(Object.fromEntries(Object.entries(notes).filter(([k]) => !stale.includes(k))));
+  });
+  return (
   <Show
     when={props.items.length > 0}
     fallback={
@@ -296,17 +367,32 @@ const McpList: Component<{ items: ClaudeConfigMcpServer[] }> = (props) => (
       <For each={props.items}>
         {(m) => (
           <li class="rounded border border-border bg-bg/40 p-3">
-            <div class="flex items-center gap-2">
+            <div class="flex flex-wrap items-center gap-2">
               <span class="font-mono text-[13px] font-semibold text-fg">
                 {m.name}
               </span>
-              <ScopeBadge scope={m.scope} />
+              <Show
+                when={!m.liveOnly}
+                fallback={
+                  <span
+                    class="rounded border border-border bg-bg px-1 py-0.5 font-mono text-[10px] uppercase tracking-wider text-fg-muted"
+                    title="Run by the backend (a claude.ai connector, a plugin, codeoid), not declared in a config file here"
+                  >
+                    live
+                  </span>
+                }
+              >
+                <ScopeBadge scope={m.scope} />
+              </Show>
               <Show when={m.type}>
                 <span class="rounded border border-border px-1 py-0.5 font-mono text-[10px] uppercase tracking-wider text-fg-faint">
                   {m.type}
                 </span>
               </Show>
               <McpStatusBadge status={m.liveStatus} toolCount={m.liveTools?.length} />
+              <Show when={props.sessionId && canReconnect(m.liveStatus)}>
+                <McpReconnect sessionId={props.sessionId!} server={m.name} />
+              </Show>
             </div>
             <Show when={m.command}>
               <div class="mt-1 break-all font-mono text-[11px] text-fg-muted">
@@ -347,13 +433,16 @@ const McpList: Component<{ items: ClaudeConfigMcpServer[] }> = (props) => (
                 no tools exposed this session
               </div>
             </Show>
-            <PathRow path={m.path} />
+            <Show when={m.path}>
+              <PathRow path={m.path} />
+            </Show>
           </li>
         )}
       </For>
     </ul>
   </Show>
-);
+  );
+};
 
 const McpStatusBadge: Component<{ status?: string; toolCount?: number }> = (props) => (
   <Show when={props.status !== undefined}>

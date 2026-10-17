@@ -174,6 +174,7 @@ codeoid approve <n> [--deny] [--pick N | --id <approvalId>] [--yes]
 codeoid destroy <n>
 codeoid mcp config [--scopes observe|operate|full]  # MCP client entry for /mcp/control
 codeoid mcp headers [--scopes …]                    # fresh bearer header (an MCP headersHelper)
+codeoid mcp reconnect <session> <server>            # redial a backend MCP server that's down (#389)
 codeoid routine add <name> --prompt … [--cron|--every|--at] [--check <cmd>]  # scheduled agent runs
 codeoid routine ls | show | runs | run [--wait] | edit | pause | resume | rm | cancel <runId> | token | preview
 ```

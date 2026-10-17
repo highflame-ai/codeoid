@@ -100,6 +100,30 @@ describe("dispatchSlash", () => {
     expect(c.sent[0]).toMatchObject({ type: "session.create", workdir: "." });
   });
 
+  it("/mcp reconnect reports what didn't work, from the response's data", async () => {
+    const reported: string[] = [];
+    const answer = (data: Record<string, unknown>) => ({ type: "response.ok", requestId: "req-1", data });
+    for (const [data, expected] of [
+      [{ server: "slack", status: "failed", tools: [], error: "boom" }, ["boom"]],
+      [{ server: "slack", status: "failed", tools: [], deferred: true }, ["slack connects when the next turn starts."]],
+      [{ server: "slack", status: "needs-auth", tools: [] }, ["slack is needs-auth."]],
+      [{ server: "slack", status: "connected", tools: ["mcp__slack__x"] }, []], // the session says it's back
+    ] as const) {
+      reported.length = 0;
+      const sent: unknown[] = [];
+      dispatchSlash(
+        { kind: "mcp-reconnect", server: "slack" },
+        { ...ctx(), request: async (m) => {
+            sent.push(m);
+            return answer(data);
+          }, report: (msg) => void reported.push(msg) },
+      );
+      await Bun.sleep(0);
+      expect(sent[0]).toEqual({ type: "session.mcp_reconnect", id: "req-1", sessionId: "s1", server: "slack" });
+      expect(reported).toEqual([...expected]);
+    }
+  });
+
   it("/rename emits session.rename", () => {
     const c = ctx();
     dispatchSlash({ kind: "rename", name: "renamed" }, c);
@@ -207,6 +231,10 @@ describe("dispatchSlash", () => {
     expect(parseSlash("/skills")).toEqual({ kind: "capabilities", tab: "skills" });
     expect(parseSlash("/skill")).toEqual({ kind: "capabilities", tab: "skills" });
     expect(parseSlash("/mcp")).toEqual({ kind: "capabilities", tab: "mcp" });
+    // #389: redial one of the backend's servers; without a name it's just the list.
+    expect(parseSlash("/mcp reconnect slack")).toEqual({ kind: "mcp-reconnect", server: "slack" });
+    expect(parseSlash("/mcp reconnect")).toEqual({ kind: "capabilities", tab: "mcp" });
+    expect(parseSlash("/mcp reconnect claude.ai Gmail")).toEqual({ kind: "mcp-reconnect", server: "claude.ai Gmail" });
     expect(parseSlash("/hooks")).toEqual({ kind: "capabilities", tab: "hooks" });
     expect(parseSlash("/hook")).toEqual({ kind: "capabilities", tab: "hooks" });
   });

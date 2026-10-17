@@ -163,6 +163,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **An MCP server that failed when a session started no longer stays failed for the whole session** (#389).
+  A Claude session redials its backend's MCP servers on demand (the capabilities drawer's Reconnect button, `/mcp reconnect <server>` in the web UI and TUI, `codeoid mcp reconnect`, or the new `session.mcp_reconnect` message, which needs `session:send`).
+  Before each turn it also retries any that are failed or waiting on a sign-in, with backoff.
+  A server that comes back is announced, and the next prompt tells the model, which otherwise trusts the start-up report that it failed.
+  The drawer now also lists servers no config file declares (claude.ai connectors, plugins' servers, codeoid's own).
+
 - **Codex sessions keep their conversation across a daemon restart.** The
   Codex provider never saved the thread id it created, so after any restart it
   tried to resume a stale id and silently started an empty thread. It now

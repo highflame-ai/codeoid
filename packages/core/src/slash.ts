@@ -18,6 +18,7 @@ import type {
   ClientMessage,
   SessionInfo,
   SessionMode,
+  McpReconnectResult,
 } from "@highflame/codeoid-protocol";
 
 export type SlashCommand =
@@ -34,6 +35,7 @@ export type SlashCommand =
   | { kind: "clear" }
   | { kind: "who" }
   | { kind: "capabilities"; tab: "agents" | "skills" | "mcp" | "hooks" }
+  | { kind: "mcp-reconnect"; server: string }
   | { kind: "settings" }
   | { kind: "packs" }
   | { kind: "pipeline"; goal?: string }
@@ -132,6 +134,8 @@ export function parseSlash(raw: string, opts?: ParseSlashOptions): SlashCommand 
     case "skill":
       return { kind: "capabilities", tab: "skills" };
     case "mcp":
+      // `/mcp reconnect <server>` redials one of the backend's servers (#389).
+      if (rest[0] === "reconnect" && rest[1]) return { kind: "mcp-reconnect", server: rest.slice(1).join(" ") };
       return { kind: "capabilities", tab: "mcp" };
     case "hooks":
     case "hook":
@@ -294,6 +298,24 @@ export function dispatchSlash(cmd: SlashCommand, ctx: SlashContext): void {
     case "capabilities":
       ctx.showCapabilities?.(cmd.tab);
       return;
+    case "mcp-reconnect": {
+      const msg: ClientMessage = { type: "session.mcp_reconnect", id: ctx.newRequestId(), sessionId: ctx.sessionId, server: cmd.server };
+      if (!ctx.request) {
+        ctx.send(msg);
+        return;
+      }
+      // Success posts "reconnected" into the session itself; say what didn't work.
+      ctx
+        .request(msg)
+        .then((resp) => {
+          // `request` resolves with the whole `response.ok`; the result is its data.
+          const r = (resp as { data?: McpReconnectResult } | undefined)?.data;
+          if (!r || r.status === "connected") return;
+          ctx.report?.(r.deferred ? `${r.server} connects when the next turn starts.` : (r.error ?? `${r.server} is ${r.status}.`));
+        })
+        .catch((e) => ctx.report?.(e instanceof Error ? e.message : String(e)));
+      return;
+    }
     case "settings":
       ctx.showSettings?.();
       return;

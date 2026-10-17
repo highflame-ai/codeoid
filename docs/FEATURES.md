@@ -407,6 +407,23 @@ Every run is a normal session you can open, approve, continue or fork from any f
 Each routine can carry its own revocable API token for monitors and deploy scripts, and the `routine_end` hook carries each outcome to Slack or a pager.
 Full guide: [routines.md](routines.md).
 
+### When an MCP server is down
+
+A backend connects its MCP servers when its session starts.
+A server that fails then (a credential that had expired, a server that wasn't up yet) used to stay unusable for the whole session; now it is redialed:
+
+- **On demand:** the Reconnect button next to a down server in the capabilities drawer, `/mcp reconnect <server>` in the web UI or TUI, or `codeoid mcp reconnect <session> <server>`.
+- **By itself:** before each turn, a server the backend reports as failed or needing sign-in is retried, waiting longer after each miss (30 seconds up to 15 minutes), so fixing a credential is enough.
+
+Only a server the backend itself reported as down can be redialed, and one redial of a server runs at a time: asking while one is in flight joins it.
+The drawer lists every server the backend runs, including ones no config file here declares (claude.ai connectors, plugins' servers, codeoid's own), marked `live`.
+
+When a server comes back, however it came back, the session says so, and the next prompt tells the model too: it was told at start that the server had failed, and would otherwise believe that over trying.
+The note goes to that backend only: the session's own history keeps the prompt as typed, so a fork or a backend switch isn't handed a stale report.
+Redialing can't run a sign-in: a server that needs one says so.
+A claude.ai connector is signed in from claude.ai's connector settings; any other server in Claude's own config, from an interactive Claude Code session (`/mcp` there).
+This covers Claude sessions, which mount their own servers, codeoid's registry servers included; only codeoid's built-in servers and its OAuth registry servers are dialed by the daemon.
+
 ### Driven by other agents (MCP)
 
 Claude Code, Cursor, or a CI job can drive codeoid over MCP at `/mcp/control`: list sessions, read their transcripts and usage, and (when allowed) create and prompt them, then wait for the reply.

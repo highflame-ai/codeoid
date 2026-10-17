@@ -94,6 +94,7 @@ const samples: { [T in ClientTypes]: Extract<ClientMessage, { type: T }> } = {
   "session.rotate": { type: "session.rotate", id: "r13", sessionId: "s1" },
   "session.search": { type: "session.search", id: "r14", query: "auth bug", scope: "all", limit: 5 },
   "session.set_model": { type: "session.set_model", id: "r15", sessionId: "s1", model: "opus", fallbackModel: null },
+  "session.mcp_reconnect": { type: "session.mcp_reconnect", id: "r28m", sessionId: "s1", server: "slack" },
   "session.set_provider": {
     type: "session.set_provider",
     id: "r28",

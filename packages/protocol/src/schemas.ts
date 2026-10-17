@@ -279,6 +279,14 @@ export const sessionSearchSchema = z.object({
   limit: z.number().int().min(1).max(100).optional(),
 });
 
+export const sessionMcpReconnectSchema = z.object({
+  ...base,
+  type: z.literal("session.mcp_reconnect"),
+  sessionId: sessionIdField,
+  // Server names as backends report them, e.g. "slack", "claude.ai Gmail".
+  server: z.string().regex(/^[\w .:()-]{1,128}$/),
+});
+
 export const sessionSetProviderSchema = z.object({
   ...base,
   type: z.literal("session.set_provider"),
@@ -905,6 +913,7 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   sessionSearchSchema,
   sessionSetModelSchema,
   sessionSetProviderSchema,
+  sessionMcpReconnectSchema,
   sessionForkSchema,
   scrollbackPageSchema,
   sessionRenameSchema,
