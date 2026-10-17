@@ -9,7 +9,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -17,7 +17,9 @@ import {
   CLAUDE_CREDENTIAL_ENV,
   ClaudeAccountError,
   ClaudeAccountStore,
+  isClaudeCredentialVar,
 } from "../daemon/claude-accounts.js";
+import { BackendLoginBroker, CLAUDE_LOGIN_FLOW } from "../daemon/auth/backend-login.js";
 import { SessionManager } from "../daemon/session-manager.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
 import { Store } from "../daemon/store.js";
@@ -64,6 +66,59 @@ describe("ClaudeAccountStore", () => {
     ).toThrow(/line break/);
     expect(() => store.upsert({ name: "k", kind: "api-key", token: "line1\nline2" })).toThrow(/single/);
     expect(() => store.upsert({ name: "k", kind: "subscription", token: "t", baseUrl: "https://x.example" })).toThrow(/no base URL/);
+  });
+
+  test("rejects control characters, and credentials or a query in a gateway URL", () => {
+    const store = storeAt();
+    // A NUL would make the spawn throw with the token in the error text.
+    expect(() => store.upsert({ name: "k", kind: "api-key", token: "sk\u0000x" })).toThrow(/control/);
+    expect(() =>
+      store.upsert({ name: "g", kind: "gateway", token: "t", baseUrl: "https://g.example", headers: { "x-a": "1\u0000" } }),
+    ).toThrow(/control/);
+    for (const baseUrl of ["https://user:pw@g.example", "https://g.example/?key=secret", "https://g.example/#frag"]) {
+      expect(() => store.upsert({ name: "g", kind: "gateway", token: "t", baseUrl })).toThrow(/credentials, a query/);
+    }
+    expect(() => store.upsert({ name: "k", kind: "bogus" as "api-key", token: "t" })).toThrow(/unknown account kind/);
+  });
+
+  test("a corrupt store fails closed; an invalid hand-edited entry is ignored, never applied", () => {
+    const path = join(dir, "claude-accounts.json");
+    writeFileSync(path, "{not json");
+    expect(() => storeAt().list()).toThrow(ClaudeAccountError);
+    writeFileSync(
+      path,
+      JSON.stringify({
+        version: 1,
+        accounts: [
+          { name: "ok", kind: "api-key", token: "k", createdAt: "", updatedAt: "" },
+          { name: "weird", kind: "carrier-pigeon", token: "k", createdAt: "", updatedAt: "" },
+        ],
+      }),
+    );
+    expect(storeAt().list().map((a) => a.name)).toEqual(["ok"]);
+    expect(() => storeAt().resolve("weird")).toThrow(/no longer exists/);
+  });
+
+  test("a literal \"default\" pins the built-in account whatever the daemon default is", () => {
+    const store = storeAt();
+    store.upsert({ name: "work", kind: "subscription", token: "sk-ant-oat01-WORK" });
+    store.setDefault("work");
+    expect(store.resolve(null)?.name).toBe("work"); // follows
+    expect(store.resolve("default")).toBeNull(); // pinned to the daemon's own environment
+  });
+
+  test("named accounts are refused behind the Highflame gateway (they would route around it)", () => {
+    const store = storeAt();
+    store.upsert({ name: "work", kind: "subscription", token: "sk-ant-oat01-WORK" });
+    const saved = process.env.ANTHROPIC_CUSTOM_HEADERS;
+    process.env.ANTHROPIC_CUSTOM_HEADERS = "x-highflame-apikey: hf_sk_sandbox";
+    try {
+      expect(() => store.resolve("work")).toThrow(/Highflame gateway/);
+      expect(store.resolve("default")).toBeNull(); // the gateway's own credential still works
+    } finally {
+      if (saved === undefined) delete process.env.ANTHROPIC_CUSTOM_HEADERS;
+      else process.env.ANTHROPIC_CUSTOM_HEADERS = saved;
+    }
   });
 
   test("default handling: built-in until set; removing the default account clears it", () => {
@@ -113,6 +168,39 @@ describe("applyAccountEnv", () => {
     expect(env.ANTHROPIC_API_KEY).toBe("sk-ant-api-X");
     expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
     expect(env.CLAUDE_CODE_USE_BEDROCK).toBeUndefined();
+  });
+
+  test("strips every credential / provider family, not just a fixed list; keeps model settings", () => {
+    const daemonEnv = {
+      PATH: "/usr/bin",
+      ANTHROPIC_MODEL: "claude-opus-5-5",
+      ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-sonnet-5",
+      CLAUDE_CODE_USE_ANTHROPIC_AWS: "1",
+      CLAUDE_CODE_USE_MANTLE: "1",
+      ANTHROPIC_FOUNDRY_AUTH_TOKEN: "f",
+      ANTHROPIC_AWS_API_KEY: "a",
+      ANTHROPIC_IDENTITY_TOKEN_FILE: "/tmp/t",
+      CLAUDE_CODE_GATEWAY_TOKEN: "g",
+      CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR: "3",
+      CLAUDE_CODE_OAUTH_REFRESH_TOKEN: "r",
+      CLAUDE_CODE_SESSION_ACCESS_TOKEN: "s",
+      CLAUDE_CODE_SKIP_MANTLE_AUTH: "1",
+      ANTHROPIC_SOMETHING_NEW: "x",
+    };
+    const env = applyAccountEnv(daemonEnv, { name: "s", kind: "subscription", token: "sk-ant-oat01-X", createdAt: "", updatedAt: "" });
+    expect(Object.keys(env).sort()).toEqual(
+      ["ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_MODEL", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", "PATH"].sort(),
+    );
+    expect(isClaudeCredentialVar("ANTHROPIC_MODEL")).toBe(false);
+    expect(isClaudeCredentialVar("CLAUDE_CODE_USE_VERTEX")).toBe(true);
+  });
+
+  test("asks the CLI to scrub its credential from the agent's shell; an unknown kind throws", () => {
+    const env = applyAccountEnv(base, { name: "k", kind: "api-key", token: "sk-ant-api-X", createdAt: "", updatedAt: "" });
+    expect(env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB).toBe("1");
+    expect(() =>
+      applyAccountEnv(base, { name: "x", kind: "bogus" as "api-key", token: "t", createdAt: "", updatedAt: "" }),
+    ).toThrow(/unknown kind/);
   });
 
   test("gateway: base URL, token and headers; nothing else", () => {
@@ -225,6 +313,26 @@ describe("daemon surface", () => {
     expect(bad).toMatchObject({ type: "response.error", code: "invalid_request" });
   });
 
+  test("putting a session on a NAMED account needs settings:write; following or pinning default does not", async () => {
+    accounts.upsert({ name: "work", kind: "subscription", token: "sk-ant-oat01-W" });
+    const s = (await create("s-scope")).data!;
+    const collaborator = {
+      ...AUTH,
+      scopes: ["session:create", "session:send", "session:list", "session:attach"] as AuthContext["scopes"],
+    };
+    const named = await handle({ type: "session.set_claude_account", id: "n", sessionId: s.id, account: "work" }, collaborator);
+    expect(named).toMatchObject({ type: "response.error", code: "forbidden" });
+    const pinDefault = await handle({ type: "session.set_claude_account", id: "d", sessionId: s.id, account: "default" }, collaborator);
+    expect((pinDefault as { data?: SessionInfo }).data).toMatchObject({ claudeAccount: "default", effectiveClaudeAccount: "default" });
+    const follow = await handle({ type: "session.set_claude_account", id: "f", sessionId: s.id, account: null }, collaborator);
+    expect(follow.type).toBe("response.ok");
+    const createdNamed = await handle(
+      { type: "session.create", id: "cn", name: "s-named", workdir: dir, claudeAccount: "work" },
+      collaborator,
+    );
+    expect(createdNamed).toMatchObject({ type: "response.error", code: "forbidden" });
+  });
+
   test("a session whose account was removed refuses to send — it never falls back", async () => {
     accounts.upsert({ name: "work", kind: "subscription", token: "sk-ant-oat01-W" });
     const s = (await create("s-gone", "work")).data!;
@@ -232,5 +340,58 @@ describe("daemon surface", () => {
     const sent = await handle({ type: "session.send", id: "snd", sessionId: s.id, text: "hi" });
     expect(sent).toMatchObject({ type: "response.error", code: "invalid_request" });
     expect(String((sent as { error?: string }).error)).toContain("no longer exists");
+  });
+});
+
+describe("named-account login through the daemon", () => {
+  const AUTH: AuthContext = {
+    sub: "user:accounts",
+    scopes: [...ALL_SCOPES] as AuthContext["scopes"],
+    delegationDepth: 0,
+    accountId: "acc",
+    projectId: "proj",
+  };
+  const URL_ = "https://claude.com/cai/oauth/authorize?code=true&client_id=x&state=s";
+  const TOKEN = `sk-ant-oat01-${"N".repeat(80)}`;
+
+  test("a malformed code keeps the attempt open, and the retry is stored as the account — never as the daemon's own login", async () => {
+    const cmd = join(dir, "login.sh");
+    writeFileSync(cmd, `#!/usr/bin/env bash\nprintf '%s\\n' "${URL_}"\nread -r code\necho "Your token: ${TOKEN}"\n`, "utf8");
+    chmodSync(cmd, 0o755);
+    const broker = new BackendLoginBroker({ claude: { ...CLAUDE_LOGIN_FLOW, resolve: () => ({ file: cmd, args: [] }) } });
+    const store = new Store(join(dir, "codeoid.db"));
+    const transcript = new TranscriptStore(join(dir, "transcripts"));
+    const accounts = storeAt();
+    // Any .env write would land here, not in the real config dir.
+    const savedXdg = process.env.XDG_CONFIG_HOME;
+    process.env.XDG_CONFIG_HOME = join(dir, "xdg");
+    const manager = new SessionManager(store, transcript, undefined, undefined, undefined, {
+      _testProviderFactory: () => new MockSessionProvider("claude", []),
+      claudeAccounts: accounts,
+      _testBackendLogin: broker,
+    });
+    const handle = (msg: Parameters<SessionManager["handle"]>[0]) =>
+      manager.handle(msg, AUTH, { id: "c", auth: AUTH, send: () => {} }) as Promise<DaemonMessage & Record<string, unknown>>;
+    try {
+      const started = (await handle({ type: "backend.login.start", id: "s", backend: "claude", account: "company-max" })) as unknown as {
+        login: { loginId: string };
+      };
+      const loginId = started.login.loginId;
+      const bad = await handle({ type: "backend.login.submit", id: "b", loginId, code: "a\nb" });
+      expect(bad).toMatchObject({ ok: false });
+      expect(broker.isOpen(loginId)).toBe(true);
+      const good = await handle({ type: "backend.login.submit", id: "g", loginId, code: "real-code" });
+      expect(good).toMatchObject({ ok: true });
+      expect(accounts.get("company-max")?.token).toBe(TOKEN);
+      expect(existsSync(join(dir, "xdg", "codeoid", ".env"))).toBe(false);
+    } finally {
+      broker.dispose();
+      if (savedXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = savedXdg;
+      try {
+        await transcript.flush();
+      } catch {}
+      store.close();
+    }
   });
 });

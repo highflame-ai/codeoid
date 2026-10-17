@@ -14,7 +14,8 @@
  *      the parsed config, not env vars, so we can mock cleanly in tests.
  */
 
-import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, chmodSync } from "node:fs";
+import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, chmodSync, rmSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { join, isAbsolute, resolve, dirname } from "node:path";
 import { homedir } from "node:os";
 import { z } from "zod";
@@ -1870,14 +1871,23 @@ export function validateConfigObject(
  */
 export function atomicWrite(path: string, contents: string, mode: number): void {
   mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.tmp`;
-  writeFileSync(tmp, contents, { encoding: "utf8", mode });
+  // A fresh name created exclusively (`wx`): a leftover or planted `.tmp` —
+  // possibly world-readable, possibly a symlink — is never written through,
+  // and two concurrent writers never share one. `mode` applies at creation, so
+  // a secret is never on disk with wider permissions, even briefly.
+  const tmp = `${path}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  writeFileSync(tmp, contents, { encoding: "utf8", mode, flag: "wx" });
   try {
     chmodSync(tmp, mode);
   } catch {
     /* best-effort on platforms without POSIX perms */
   }
-  renameSync(tmp, path);
+  try {
+    renameSync(tmp, path);
+  } catch (err) {
+    rmSync(tmp, { force: true });
+    throw err;
+  }
 }
 
 /** Read `config.json` as a raw object (empty object if absent). Throws if the

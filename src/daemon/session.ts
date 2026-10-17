@@ -1379,7 +1379,10 @@ export class Session {
     });
   }
 
-  /** This session's own Claude account choice; null = it follows the daemon default. */
+  /**
+   * This session's own Claude account choice; null = it follows the daemon
+   * default. A literal `default` pins the built-in account.
+   */
   get claudeAccount(): string | null {
     return this.#claudeAccount;
   }
@@ -1404,11 +1407,33 @@ export class Session {
     if (account !== null && account !== CLAUDE_DEFAULT_ACCOUNT && !this.#claudeAccounts?.has(account)) {
       throw new ClaudeAccountError(`no Claude account named ${JSON.stringify(account)}`);
     }
-    const from = this.#claudeAccount ?? "(default)";
+    const from = this.#claudeAccount ?? "(follow-default)";
     this.#claudeAccount = account;
-    this.#store.audit(sender.sub, "session.claude_account", this.id, `from=${from} to=${account ?? "(default)"}`);
+    this.#store.audit(sender.sub, "session.claude_account", this.id, `from=${from} to=${account ?? "(follow-default)"}`);
     this.#saveMetaNow();
     this.#broadcastInfoUpdate();
+    this.releaseIdleClaudeQuery();
+  }
+
+  /**
+   * Stop this session's Claude query if it is idle, so a warm CLI process does
+   * not keep running on a credential that was just switched away from,
+   * replaced or removed (it would still answer background work on it). The
+   * next turn starts a fresh process on the current account and resumes the
+   * same conversation. A busy session keeps its process — the running turn
+   * finishes on the credential it started with, and the next turn rebuilds.
+   */
+  releaseIdleClaudeQuery(): void {
+    if (this.#provider.id !== "claude") return;
+    this.#sendChain = this.#sendChain
+      .catch(() => {})
+      .then(async () => {
+        if (this.#provider.id !== "claude" || this.#switchBusyReason() || this.#backgroundTasks.size > 0) return;
+        await this.#teardownProvider();
+      })
+      .catch((e) => {
+        console.error(`[codeoid/session ${this.id}] releasing the idle Claude query failed: ${e instanceof Error ? e.message : String(e)}`);
+      });
   }
 
   /** Re-announce this session's info — its effective Claude account moved with the daemon default. */

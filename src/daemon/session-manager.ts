@@ -28,7 +28,7 @@ import { hasScope, SCOPES } from "../protocol/scopes.js";
 import { applyPatches, getManifest, getSnapshot, previewPatches } from "./settings/store.js";
 import { canonicalFromTranscript, turnIndexFromHistory } from "./canonical-restore.js";
 import { BackendLoginBroker, BackendLoginError, redact } from "./auth/backend-login.js";
-import { ClaudeAccountError, ClaudeAccountStore, validateAccountName } from "./claude-accounts.js";
+import { ClaudeAccountError, ClaudeAccountStore, isNamedClaudeAccount, validateAccountName } from "./claude-accounts.js";
 import { RateLimiter } from "./rate-limit.js";
 import type { TranscriptMeta, TranscriptStore } from "./transcript.js";
 import {
@@ -377,7 +377,7 @@ export class SessionManager {
   #mcpOAuth?: McpOAuth;
   /** In-flight interactive backend sign-ins. Daemon-wide, and at most one per
    *  backend — two live logins would race to write the same credential. */
-  readonly #backendLogin = new BackendLoginBroker();
+  readonly #backendLogin: BackendLoginBroker;
   /** Claude accounts (claude-accounts.ts) — shared by every session. */
   #claudeAccounts!: ClaudeAccountStore;
   /** Logins started for a NAMED Claude account: loginId → account name. */
@@ -507,6 +507,8 @@ export class SessionManager {
       _testProviderFactory?: () => SessionProvider;
       /** Claude account store (claude-accounts.ts). Default: `<configDir>/claude-accounts.json`. */
       claudeAccounts?: ClaudeAccountStore;
+      /** Test-only: a login broker driving a fake login command. */
+      _testBackendLogin?: BackendLoginBroker;
     },
   ) {
     this.#store = store;
@@ -521,6 +523,7 @@ export class SessionManager {
     this.#hooks = opts?.hooks;
     this.#testProviderFactory = opts?._testProviderFactory;
     this.#claudeAccounts = opts?.claudeAccounts ?? new ClaudeAccountStore();
+    this.#backendLogin = opts?._testBackendLogin ?? new BackendLoginBroker();
     this.#dispatcher = new Dispatcher(store, this.#makeDispatcherHost(), {
       ...opts?.config?.dispatch,
       daemonId: opts?.daemonId,
@@ -2072,6 +2075,8 @@ mcpHub: this.#mcpHub,
       // replace the machine's own `claude login`.
       if (msg.account !== undefined) validateAccountName(msg.account);
       const login = await this.#backendLogin.start(msg.backend, { isolated: msg.account !== undefined });
+      // A new attempt supersedes any other for this backend: forget theirs.
+      for (const id of [...this.#accountLogins.keys()]) if (!this.#backendLogin.isOpen(id)) this.#accountLogins.delete(id);
       if (msg.account !== undefined) this.#accountLogins.set(login.loginId, msg.account);
       this.#store.audit(
         auth.sub,
@@ -2109,8 +2114,15 @@ mcpHub: this.#mcpHub,
       const outcome = await this.#backendLogin.submit(msg.loginId, msg.code);
       let error = outcome.error;
       const accountName = this.#accountLogins.get(msg.loginId);
-      this.#accountLogins.delete(msg.loginId);
-      if (accountName !== undefined) {
+      // Forget the mapping only once the attempt is over: a code refused before
+      // it reached the command (malformed) leaves the attempt open, and a
+      // retry must still be stored as the named account.
+      if (!this.#backendLogin.isOpen(msg.loginId)) this.#accountLogins.delete(msg.loginId);
+      if (outcome.isolated && accountName === undefined) {
+        // A named-account login whose name we no longer know. Its credential
+        // must never become the daemon's own login: drop it.
+        if (outcome.ok) error = "Signed in, but the account this sign-in was for is no longer known. Start again.";
+      } else if (accountName !== undefined) {
         // A named account keeps ONLY the token the command printed: it ran
         // against a throwaway config dir, so there is no on-disk fallback.
         if (outcome.ok && outcome.secret?.key === "CLAUDE_CODE_OAUTH_TOKEN") {
@@ -2212,11 +2224,15 @@ mcpHub: this.#mcpHub,
     }
     // Never the token — only that an account was set and what kind.
     this.#store.audit(auth.sub, "claude.accounts.set", "", `name=${msg.name} kind=${msg.kind}`);
+    // A replaced token: idle processes still hold the old one.
+    this.#releaseClaudeSessionsOn(msg.name);
     return this.#claudeAccountsResult(msg.id);
   }
 
   #claudeAccountsRemove(msg: Extract<ClientMessage, { type: "claude.accounts.remove" }>, auth: AuthContext): DaemonMessage {
     if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return this.#loginForbidden(msg.id);
+    // Before removing: afterwards a follower of it no longer resolves to it.
+    this.#releaseClaudeSessionsOn(msg.name);
     if (!this.#claudeAccounts.remove(msg.name)) {
       return { type: "response.error", requestId: msg.id, error: `no Claude account named "${msg.name}"`, code: "not_found" };
     }
@@ -2236,6 +2252,7 @@ mcpHub: this.#mcpHub,
     } catch (err) {
       return this.#claudeAccountsError(msg.id, err);
     }
+    for (const session of this.#sessions.values()) if (session.claudeAccount === null) session.releaseIdleClaudeQuery();
     this.#store.audit(auth.sub, "claude.accounts.set_default", "", `name=${msg.name}`);
     // Every session following the default runs on it from its next turn.
     this.#announceClaudeSessions();
@@ -2249,7 +2266,22 @@ mcpHub: this.#mcpHub,
     }
   }
 
-  /** Choose a session's Claude account (null = follow the default). `session:send`. */
+  /** Stop idle Claude queries running on `name` (chosen, or followed as the daemon default). */
+  #releaseClaudeSessionsOn(name: string): void {
+    const daemonDefault = this.#claudeAccounts.getDefault();
+    for (const session of this.#sessions.values()) {
+      const choice = session.claudeAccount;
+      if (choice === name || (choice === null && daemonDefault === name)) session.releaseIdleClaudeQuery();
+    }
+  }
+
+  /**
+   * Choose a session's Claude account: null follows the daemon default, a
+   * literal `default` pins the built-in account. `session:send`, plus
+   * `settings:write` for a NAMED account — that picks whose credential the
+   * agent runs on (and bills), which is the account owner's decision, not
+   * every collaborator's.
+   */
   #sessionSetClaudeAccount(
     msg: Extract<ClientMessage, { type: "session.set_claude_account" }>,
     auth: AuthContext,
@@ -2257,10 +2289,18 @@ mcpHub: this.#mcpHub,
     if (!hasScope(auth.scopes as string[], SCOPES.SESSION_SEND)) {
       return { type: "response.error", requestId: msg.id, error: "Missing scope: session:send", code: "forbidden" };
     }
+    if (isNamedClaudeAccount(msg.account) && !hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) {
+      return {
+        type: "response.error",
+        requestId: msg.id,
+        error: "Missing scope: settings:write (needed to put a session on a named Claude account)",
+        code: "forbidden",
+      };
+    }
     const session = this.#getOwnedSession(msg.sessionId, auth);
     if (!session) return { type: "response.error", requestId: msg.id, error: "Session not found", code: "not_found" };
     try {
-      session.setClaudeAccount(msg.account === "default" ? null : msg.account, auth);
+      session.setClaudeAccount(msg.account, auth);
     } catch (err) {
       return this.#claudeAccountsError(msg.id, err);
     }
@@ -2886,6 +2926,14 @@ mcpHub: this.#mcpHub,
     }
     // Fail closed on an unknown Claude account — creating the session on some
     // other credential would bill the wrong account.
+    if (isNamedClaudeAccount(msg.claudeAccount) && !hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) {
+      return {
+        type: "response.error",
+        requestId: msg.id,
+        error: "Missing scope: settings:write (needed to put a session on a named Claude account)",
+        code: "forbidden",
+      };
+    }
     if (msg.claudeAccount && !this.#claudeAccounts.has(msg.claudeAccount)) {
       return {
         type: "response.error",
@@ -3172,7 +3220,7 @@ mcpHub: this.#mcpHub,
       transcriptStore: this.#transcriptStore,
       providers: this.#providers,
       claudeAccounts: this.#claudeAccounts,
-      claudeAccount: msg.claudeAccount && msg.claudeAccount !== "default" ? msg.claudeAccount : null,
+      claudeAccount: msg.claudeAccount || null,
       hooks: this.#hooks,
       // Derived above for a collaborative session; otherwise msg.providerId.
       providerId,

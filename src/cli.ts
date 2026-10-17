@@ -515,15 +515,21 @@ account
   .command("add-gateway <name>")
   .description("Add an Anthropic-compatible gateway account (its token is read from a prompt or stdin, never the command line)")
   .requiredOption("--base-url <url>", "the gateway's base URL (https)")
-  .option("--header <header>", 'extra request header, repeatable: "Name: value" (e.g. a workspace header)', (v: string, prev: string[] = []) => [...prev, v], [] as string[])
+  .option("--header <header>", 'extra request header, repeatable: "Name" (value asked for without echo — keeps it out of shell history and ps) or "Name: value" for a non-secret one', (v: string, prev: string[] = []) => [...prev, v], [] as string[])
   .action(async (name: string, o: { baseUrl: string; header: string[] }) => {
-    let headers: Record<string, string>;
+    let parsed: ReturnType<typeof parseHeaderFlags>;
     try {
-      headers = parseHeaderFlags(o.header ?? []);
+      parsed = parseHeaderFlags(o.header ?? []);
     } catch (err) {
       console.error((err as Error).message);
       process.exit(1);
     }
+    if (parsed.ask.length > 0 && !process.stdin.isTTY) {
+      console.error('A header value can only be asked for on a terminal; with piped input, pipe the token and pass "Name: value".');
+      process.exit(1);
+    }
+    const headers = parsed.headers;
+    for (const h of parsed.ask) headers[h] = (await readSecret(`Value for header ${h}: `)).trim();
     const token = (await readSecret("Gateway token: ")).trim();
     await accountRequest((id) => ({
       type: "claude.accounts.set",
@@ -556,9 +562,16 @@ account
   .action((name: string) => accountRequest((id) => ({ type: "claude.accounts.set_default", id, name })));
 
 account
-  .command("use <session> <name>")
-  .description('Switch a session to account <name> from its next turn, keeping the conversation ("default" = follow the daemon default)')
-  .action(async (session: string, name: string) => {
+  .command("use <session> [name]")
+  .description(
+    'Switch a session to account <name> from its next turn, keeping the conversation ("default" = your own login, whatever the daemon default is; --follow-default = track the daemon default)',
+  )
+  .option("--follow-default", "follow the daemon default instead of pinning an account (omit <name>)")
+  .action(async (session: string, name: string | undefined, o: { followDefault?: boolean }) => {
+    if ((name === undefined) === !o.followDefault) {
+      console.error("Give an account name, or --follow-default — not both.");
+      process.exit(1);
+    }
     const config = loadConfig();
     const client = new TerminalClient(config);
     await client.connect();
@@ -571,7 +584,7 @@ account
       type: "session.set_claude_account",
       id: randomUUID(),
       sessionId,
-      account: name === "default" ? null : name,
+      account: o.followDefault ? null : (name as string),
     });
     client.disconnect();
     if (resp.type === "response.error") {
@@ -579,7 +592,9 @@ account
       process.exit(1);
     }
     const info = (resp as { data?: SessionInfo }).data;
-    console.log(`Session "${session}" runs on Claude account "${info?.effectiveClaudeAccount ?? name}" from its next turn.`);
+    console.log(
+      `Session "${session}" runs on Claude account "${info?.effectiveClaudeAccount ?? name}"${o.followDefault ? " (following the daemon default)" : ""} from its next turn.`,
+    );
   });
 
 program

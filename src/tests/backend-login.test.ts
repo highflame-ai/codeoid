@@ -16,7 +16,7 @@
  */
 
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -367,10 +367,23 @@ echo "Your token: ${TOKEN}"
 
       const outcome = await broker.submit(login.loginId, "any-code");
       expect(outcome.secret).toEqual({ key: "CLAUDE_CODE_OAUTH_TOKEN", value: TOKEN });
+      // Marked, so the daemon never writes it where its own login lives.
+      expect(outcome.isolated).toBe(true);
       expect(existsSync(configDir!)).toBe(false); // cleaned up with the attempt
     } finally {
       if (saved === undefined) delete process.env.ANTHROPIC_API_KEY;
       else process.env.ANTHROPIC_API_KEY = saved;
     }
+  });
+
+  test("a stale isolated dir a crashed daemon left behind is swept; a fresh one is not", () => {
+    const stale = mkdtempSync(join(tmpdir(), "codeoid-claude-login-"));
+    const fresh = mkdtempSync(join(tmpdir(), "codeoid-claude-login-"));
+    const old = new Date(Date.now() - 60 * 60_000);
+    utimesSync(stale, old, old);
+    newBroker();
+    expect(existsSync(stale)).toBe(false);
+    expect(existsSync(fresh)).toBe(true);
+    rmSync(fresh, { recursive: true, force: true });
   });
 });

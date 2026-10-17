@@ -31,14 +31,21 @@ export function formatClaudeAccounts(accounts: readonly ClaudeAccountInfo[], def
   return lines.join("\n");
 }
 
-/** Parse a repeatable `--header "Name: value"` flag. Throws on a malformed one. */
-export function parseHeaderFlags(flags: readonly string[]): Record<string, string> {
-  const out: Record<string, string> = {};
+/**
+ * Parse a repeatable `--header` flag: `"Name: value"`, or a bare `Name` whose
+ * value is then asked for without echo — a workspace key on the command line
+ * would land in shell history and in `ps` for every local user. Throws on a
+ * malformed one.
+ */
+export function parseHeaderFlags(flags: readonly string[]): { headers: Record<string, string>; ask: string[] } {
+  const headers: Record<string, string> = {};
+  const ask: string[] = [];
   for (const f of flags) {
     const sep = f.indexOf(":");
-    const name = sep > 0 ? f.slice(0, sep).trim() : "";
-    if (!name) throw new Error(`--header takes "Name: value", got ${JSON.stringify(f)}`);
-    out[name] = f.slice(sep + 1).trim();
+    const name = (sep >= 0 ? f.slice(0, sep) : f).trim();
+    if (!name) throw new Error(`--header takes "Name: value" or "Name", got ${JSON.stringify(f)}`);
+    if (sep < 0) ask.push(name);
+    else headers[name] = f.slice(sep + 1).trim();
   }
-  return out;
+  return { headers, ask };
 }

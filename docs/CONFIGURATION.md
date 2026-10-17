@@ -217,12 +217,14 @@ Each session runs on one of them, two sessions can run on two accounts at once, 
 
 ```bash
 codeoid account login company-max        # sign a subscription in as "company-max" (claude setup-token)
-codeoid account add-gateway gw-team-a --base-url https://gateway.example.com --header "x-workspace: team-a"
+codeoid account add-gateway gw-team-a --base-url https://gateway.example.com --header x-workspace   # value asked for, never on argv
 codeoid account add-token personal-max   # paste a token you already have (sk-ant-oat01-…); --api-key for an API key
 codeoid account ls                       # names and kinds — never a token
 codeoid account default company-max      # what every session that hasn't chosen its own runs on
 codeoid new review ~/code/app --account gw-team-a
 codeoid account use review personal-max  # switch a running session, keeping the conversation
+codeoid account use review default       # pin it to your own login
+codeoid account use review --follow-default  # track the daemon default again
 codeoid account rm gw-team-a
 ```
 
@@ -235,9 +237,12 @@ The first turn after a switch re-reads the whole context at full price, because 
 **The built-in `default` account** is the daemon's own environment: your `claude login`, or `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` in `~/.codeoid/.env`.
 It is what every session uses until you name another default.
 A session that follows the default moves with it on its next turn; a session that chose its own account (`--account`, `account use`) stays on it.
+Choosing `default` explicitly pins a session to the built-in account, so it stays on your own login even when the daemon default is another account; `account use <session> --follow-default` makes it follow the daemon default again.
 
 **A session never silently changes account.**
-Applying an account removes every competing Claude credential variable before setting its own, so a stray `ANTHROPIC_API_KEY` can't take over a subscription session.
+Applying an account removes every competing Claude credential or provider variable before setting its own (all of `ANTHROPIC_*` except model settings, every `CLAUDE_CODE_USE_*` provider switch, token file descriptors, and the like), so a stray `ANTHROPIC_API_KEY` can't take over a subscription session.
+It also sets `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`, so the agent's shell commands, hooks and MCP servers don't inherit the account's token.
+Switching a session's account, or replacing or removing the account it runs on, stops the session's Claude process if it is idle, so no process keeps running on the old credential.
 A session whose account was removed refuses to run until you switch it, rather than falling back to another credential.
 One thing this cannot override is an `apiKeyHelper` in your Claude settings file, since that is configuration of the shared config directory rather than environment.
 
@@ -247,4 +252,7 @@ It runs `claude setup-token` against a throwaway config directory and keeps only
 **Where it is stored.**
 Accounts live in `~/.codeoid/claude-accounts.json`, mode 0600.
 Tokens are never sent to a client: listing accounts shows names, kinds, and a gateway's URL and header names only.
-Managing accounts needs `settings:write` (listing needs `settings:read`); switching a session needs `session:send`.
+Managing accounts needs `settings:write` (listing needs `settings:read`).
+Putting a session on a named account, at creation or later, needs `settings:write` as well, since it decides whose credential the agent runs on; following the default or pinning `default` needs only `session:send`.
+
+**Behind the Highflame gateway** (a Forge sandbox, where the daemon's environment carries an `x-highflame-apikey` header), named accounts are refused: they would route requests around the gateway's guardrails and audit.

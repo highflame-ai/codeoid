@@ -46,36 +46,88 @@ export interface ResolvedClaudeAccount {
 }
 
 /**
- * Every variable through which the Claude CLI can pick up a credential or an
- * alternative backend. Applying an account REMOVES all of them first and then
- * sets only its own: adding a token while, say, an `ANTHROPIC_API_KEY` from the
- * daemon's environment is still present would let the CLI's own precedence
- * pick the other credential, and the session would silently run (and bill) on
- * the wrong account.
- *
- * Not coverable from here: an `apiKeyHelper` in the user's Claude settings
- * file. That is configuration of the shared config dir, not environment.
+ * Explicit credential / backend-selection variables the Claude CLI reads. Kept
+ * for the isolated login and as documentation; stripping an account's
+ * environment does NOT rely on this list alone (see `stripClaudeCredentials`).
  */
 export const CLAUDE_CREDENTIAL_ENV = [
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
   "CLAUDE_CODE_OAUTH_TOKEN",
+  "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+  "CLAUDE_CODE_SESSION_ACCESS_TOKEN",
+  "CLAUDE_CODE_GATEWAY_TOKEN",
+  "CLAUDE_CODE_API_BASE_URL",
   "ANTHROPIC_BASE_URL",
   "ANTHROPIC_CUSTOM_HEADERS",
-  "CLAUDE_CODE_USE_BEDROCK",
-  "CLAUDE_CODE_USE_VERTEX",
-  "CLAUDE_CODE_USE_FOUNDRY",
-  "ANTHROPIC_BEDROCK_BASE_URL",
-  "ANTHROPIC_VERTEX_BASE_URL",
-  "ANTHROPIC_VERTEX_PROJECT_ID",
-  "ANTHROPIC_FOUNDRY_API_KEY",
-  "ANTHROPIC_FOUNDRY_BASE_URL",
-  "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
-  "CLAUDE_CODE_SKIP_VERTEX_AUTH",
-  "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
 ] as const;
 
+/**
+ * `ANTHROPIC_*` variables that are NOT about who you are or where requests go
+ * — model selection and tuning — and so survive an account being applied.
+ * Everything else in that namespace is removed.
+ */
+const ANTHROPIC_KEEP = new Set([
+  "ANTHROPIC_MODEL",
+  "ANTHROPIC_SMALL_FAST_MODEL",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+  "ANTHROPIC_BETAS",
+  "ANTHROPIC_LOG",
+]);
+
+/**
+ * Is `name` a variable through which the Claude CLI can pick up a credential
+ * or a different backend? An ALLOWLIST for the `ANTHROPIC_*` namespace plus
+ * the CLI's own credential/provider families, rather than a denylist to chase
+ * — the CLI keeps adding providers (Bedrock, Vertex, Foundry, Anthropic on
+ * AWS / Google Cloud, Mantle, gateway, identity federation, token file
+ * descriptors) and any one left behind lets the CLI's precedence pick a
+ * credential nobody chose for this session.
+ *
+ * Not coverable from here: an `apiKeyHelper` (or `env`) in a Claude settings
+ * file — that is configuration of the shared config dir / the workdir, not
+ * process environment.
+ */
+export function isClaudeCredentialVar(name: string): boolean {
+  if (name.startsWith("ANTHROPIC_")) return !ANTHROPIC_KEEP.has(name);
+  if ((CLAUDE_CREDENTIAL_ENV as readonly string[]).includes(name)) return true;
+  return (
+    name.startsWith("CLAUDE_CODE_USE_") ||
+    /^CLAUDE_CODE_SKIP_[A-Z_]+_AUTH$/.test(name) ||
+    name.endsWith("_FILE_DESCRIPTOR") ||
+    name.startsWith("CLAUDE_CODE_OAUTH_") ||
+    name.startsWith("CLAUDE_CODE_GATEWAY_") ||
+    name === "CLAUDE_CONFIG_DIR_CREDENTIALS"
+  );
+}
+
+/** `env` without any Claude credential or backend-selection variable. Pure. */
+export function stripClaudeCredentials(env: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(env)) if (!isClaudeCredentialVar(k)) out[k] = v;
+  return out;
+}
+
+/**
+ * Is the daemon itself running behind the Highflame gateway (a Forge
+ * sandbox)? Its launch environment then routes every Claude call through the
+ * gateway (`x-highflame-apikey`), and Shield guardrails + audit live there. A
+ * named account replaces the credential AND the base URL, so it would route
+ * around the gateway entirely: named accounts are refused there.
+ */
+/** A stored account's name — not "follow the default" (null/absent) and not the built-in `default`. */
+export function isNamedClaudeAccount(choice: string | null | undefined): choice is string {
+  return typeof choice === "string" && choice !== "" && choice !== CLAUDE_DEFAULT_ACCOUNT;
+}
+
+export function isGatewayLaunch(env: Record<string, string | undefined>): boolean {
+  return /^\s*x-highflame-apikey\s*:/im.test(env.ANTHROPIC_CUSTOM_HEADERS ?? "");
+}
+
 const NAME_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
+const CONTROL_CHARS = /[\x00-\x1f\x7f]/;
 /** RFC 7230 token characters — a header name can't carry a separator or a newline. */
 const HEADER_NAME_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,256}$/;
 
@@ -99,8 +151,13 @@ export function validateAccountInput(input: {
   headers?: Record<string, string>;
 }): void {
   validateAccountName(input.name);
-  if (!input.token || /[\r\n]/.test(input.token)) {
-    throw new ClaudeAccountError("the token must be a single non-empty line");
+  if (!["subscription", "gateway", "api-key"].includes(input.kind)) {
+    throw new ClaudeAccountError(`unknown account kind ${JSON.stringify(input.kind)}`);
+  }
+  // Any control character (CR/LF, NUL, …): a NUL makes the spawn throw with
+  // the whole token in the error text; a line break would inject headers.
+  if (!input.token || CONTROL_CHARS.test(input.token)) {
+    throw new ClaudeAccountError("the token must be a single non-empty line with no control characters");
   }
   if (input.kind === "gateway") {
     if (!input.baseUrl) throw new ClaudeAccountError("a gateway account needs its base URL");
@@ -109,6 +166,10 @@ export function validateAccountInput(input: {
       url = new URL(input.baseUrl);
     } catch {
       throw new ClaudeAccountError("the gateway base URL isn't a valid URL");
+    }
+    // The URL is shown to anyone who can list accounts: no credentials in it.
+    if (url.username || url.password || url.search || url.hash) {
+      throw new ClaudeAccountError("the gateway base URL must not carry credentials, a query string or a fragment — put a key in the token or a header");
     }
     const loopback = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]";
     if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) {
@@ -124,7 +185,7 @@ export function validateAccountInput(input: {
   for (const [k, v] of Object.entries(input.headers ?? {})) {
     if (!HEADER_NAME_RE.test(k)) throw new ClaudeAccountError(`invalid header name: ${JSON.stringify(k)}`);
     // A CR/LF in a value would inject further headers into every request.
-    if (/[\r\n]/.test(v)) throw new ClaudeAccountError(`header ${k} has a line break in its value`);
+    if (CONTROL_CHARS.test(v)) throw new ClaudeAccountError(`header ${k} has a line break or control character in its value`);
   }
 }
 
@@ -145,8 +206,11 @@ export function toAccountInfo(a: StoredClaudeAccount): ClaudeAccountInfo {
  * variable removed, then this account's set. Pure.
  */
 export function applyAccountEnv(env: Record<string, string>, account: StoredClaudeAccount): Record<string, string> {
-  const out: Record<string, string> = { ...env };
-  for (const k of CLAUDE_CREDENTIAL_ENV) delete out[k];
+  const out = stripClaudeCredentials(env);
+  // The CLI scrubs its own credentials from what its Bash tool, hooks and
+  // stdio MCP servers inherit only when asked to. A named account's token must
+  // not be one `printenv` away from the agent's shell.
+  out.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB = "1";
   switch (account.kind) {
     case "subscription":
       out.CLAUDE_CODE_OAUTH_TOKEN = account.token;
@@ -161,6 +225,10 @@ export function applyAccountEnv(env: Record<string, string>, account: StoredClau
       if (headers.length > 0) out.ANTHROPIC_CUSTOM_HEADERS = headers.map(([k, v]) => `${k}: ${v}`).join("\n");
       break;
     }
+    default:
+      // Never "strip everything and set nothing": the CLI would fall back to
+      // the stored login, a credential nobody chose for this session.
+      throw new ClaudeAccountError(`account "${account.name}" has an unknown kind`);
   }
   return out;
 }
@@ -186,10 +254,30 @@ export class ClaudeAccountStore {
       this.#data = { version: 1, accounts: [] };
       return this.#data;
     }
-    const parsed = JSON.parse(readFileSync(this.#path, "utf8")) as Partial<StoreFile>;
+    let parsed: Partial<StoreFile>;
+    try {
+      parsed = JSON.parse(readFileSync(this.#path, "utf8")) as Partial<StoreFile>;
+    } catch (err) {
+      // Fail closed — the default may name an account we can no longer read —
+      // but say exactly what to fix.
+      throw new ClaudeAccountError(
+        `${this.#path} is not readable JSON (${err instanceof Error ? err.message : String(err)}) — fix or remove it`,
+      );
+    }
+    // Validate each entry as if it were being added: a hand-edited entry with
+    // an unknown kind or a bad token must not be applied.
+    const accounts = (Array.isArray(parsed.accounts) ? parsed.accounts : []).filter((a): a is StoredClaudeAccount => {
+      try {
+        validateAccountInput(a as StoredClaudeAccount);
+        return true;
+      } catch (err) {
+        console.error(`[codeoid] ignoring invalid Claude account in ${this.#path}: ${err instanceof Error ? err.message : String(err)}`);
+        return false;
+      }
+    });
     this.#data = {
       version: 1,
-      accounts: Array.isArray(parsed.accounts) ? parsed.accounts : [],
+      accounts,
       ...(typeof parsed.defaultAccount === "string" ? { defaultAccount: parsed.defaultAccount } : {}),
     };
     return this.#data;
@@ -256,13 +344,21 @@ export class ClaudeAccountStore {
 
   /**
    * Resolve the account a session runs on: its own choice, else the daemon
-   * default. `null` = the built-in account (the daemon's own environment).
+   * default. Returns `null` for the built-in account (the daemon's own
+   * environment).
    * A choice naming an account that no longer exists THROWS — falling back to
    * another account would run the session on a credential nobody picked.
    */
   resolve(sessionChoice: string | null): ResolvedClaudeAccount | null {
+    // `null` follows the daemon default; a literal "default" PINS the built-in
+    // account (the daemon's own environment) whatever the default is.
     const name = sessionChoice ?? this.getDefault();
     if (name === CLAUDE_DEFAULT_ACCOUNT) return null;
+    if (isGatewayLaunch(process.env)) {
+      throw new ClaudeAccountError(
+        `Claude accounts are disabled behind the Highflame gateway — "${name}" would route around it. This session runs on the gateway's credential.`,
+      );
+    }
     const account = this.get(name);
     if (!account) {
       throw new ClaudeAccountError(
