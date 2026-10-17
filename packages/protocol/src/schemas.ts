@@ -283,7 +283,8 @@ export const sessionMcpReconnectSchema = z.object({
   ...base,
   type: z.literal("session.mcp_reconnect"),
   sessionId: sessionIdField,
-  server: z.string().min(1).max(128),
+  // Server names as backends report them, e.g. "slack", "claude.ai Gmail".
+  server: z.string().regex(/^[\w .:()-]{1,128}$/),
 });
 
 export const sessionSetProviderSchema = z.object({

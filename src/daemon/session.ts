@@ -19,6 +19,7 @@ import { CONDUCTOR_SYSTEM_PROMPT_APPEND, isFleetSendTool } from "./fleet.js";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import {
   type ProviderEvent,
+  type BackendMcpServerState,
   type NormalizedTurnResult,
   type TurnRun,
   type ToolApprovalFn,
@@ -1072,6 +1073,11 @@ export class Session {
   readonly #mcpRetry = new Map<string, { at: number; waitMs: number }>();
   /** Backend MCP servers that came back since the last turn started — the next prompt says so. */
   readonly #mcpBack = new Set<string>();
+  /** A manual redial in flight per server (single-flight), and when each was last asked for. */
+  readonly #mcpInFlight = new Map<string, Promise<McpReconnectResult>>();
+  readonly #mcpManualAt = new Map<string, number>();
+  /** Bumped by every mcp_init: a redial that started before one must not overwrite it. */
+  #mcpGeneration = 0;
 
   constructor(opts: SessionCreateOptions) {
     this.id = opts.existingId ?? randomUUID();
@@ -1550,43 +1556,68 @@ export class Session {
    * The result is the backend's view afterwards; the session's MCP status and
    * the drawer follow it.
    */
-  async reconnectMcpServer(name: string, sender: AuthContext): Promise<McpReconnectResult | { unsupported: string }> {
+  async reconnectMcpServer(name: string, sender: AuthContext): Promise<McpReconnectResult | { unsupported: string } | { refused: string }> {
     const provider = this.#provider;
     if (!provider.reconnectMcpServer) return { unsupported: `the ${provider.id} backend can't reconnect its MCP servers` };
-    const state = await provider.reconnectMcpServer(name);
-    this.#store.audit(sender.sub, "session.mcp_reconnect", this.id, `server=${name} status=${state?.status ?? "deferred"}`);
-    if (!state) {
-      return { server: name, status: this.#sdkMcpStatus.get(name) ?? "pending", tools: this.#sdkMcpTools.get(name) ?? [], deferred: true };
-    }
-    this.#applyMcpState(name, state);
-    return { server: name, status: state.status, tools: state.tools, ...(state.error ? { error: mcpErrorFor(name, state) } : {}) };
+    // Only a server this backend reported, and only one that's down: never a
+    // name the CLI might connect that the user hasn't (a disabled server, an
+    // unapproved repo server), and never codeoid's own.
+    const status = this.#sdkMcpStatus.get(name);
+    if (status === undefined) return { refused: `this session's backend has no MCP server named ${JSON.stringify(name)}` };
+    if (status !== "failed" && status !== "needs-auth") return { refused: `${name} is ${status}, not down` };
+    // One redial per server at a time, and not again within a few seconds.
+    const inFlight = this.#mcpInFlight.get(name);
+    if (inFlight) return inFlight;
+    const last = this.#mcpManualAt.get(name) ?? 0;
+    if (Date.now() - last < MCP_MANUAL_COOLDOWN_MS) return { refused: `${name} was just redialed — try again in a few seconds` };
+    this.#mcpManualAt.set(name, Date.now());
+    const attempt = (async (): Promise<McpReconnectResult> => {
+      this.#store.audit(sender.sub, "session.mcp_reconnect", this.id, `server=${JSON.stringify(name)} attempt`);
+      const generation = this.#mcpGeneration;
+      let state: BackendMcpServerState | null;
+      try {
+        state = await withTimeout(provider.reconnectMcpServer!(name), MCP_MANUAL_TIMEOUT_MS);
+      } catch (err) {
+        this.#store.audit(sender.sub, "session.mcp_reconnect", this.id, `server=${JSON.stringify(name)} outcome=timeout`);
+        return { server: name, status, tools: this.#sdkMcpTools.get(name) ?? [], error: cleanMcpError(err instanceof Error ? err.message : String(err)) };
+      }
+      this.#store.audit(sender.sub, "session.mcp_reconnect", this.id, `server=${JSON.stringify(name)} outcome=${state?.status ?? "deferred"}`);
+      if (!state) return { server: name, status, tools: this.#sdkMcpTools.get(name) ?? [], deferred: true };
+      if (generation === this.#mcpGeneration) this.#applyMcpState(name, state);
+      return { server: name, status: state.status, tools: state.tools, ...(state.error || state.status !== "connected" ? { error: mcpErrorFor(name, state) } : {}) };
+    })().finally(() => this.#mcpInFlight.delete(name));
+    this.#mcpInFlight.set(name, attempt);
+    return attempt;
   }
 
   /**
    * Before a turn, redial backend MCP servers that are down (failed, or
    * waiting on a sign-in that may have happened elsewhere since). Each server
    * is retried with a doubling wait (30s → 15m), so a server that stays down
-   * costs one bounded attempt now and then, not one per turn.
+   * costs one bounded attempt now and then, not one per turn. Due servers are
+   * redialed together, under one time cap, so a turn waits at most that long.
    */
   async #healMcpServers(): Promise<void> {
     const provider = this.#provider;
     if (!provider.reconnectMcpServer || !provider.hasQueried) return;
     const now = Date.now();
-    const due = [...this.#sdkMcpStatus].filter(
-      ([name, status]) => (status === "failed" || status === "needs-auth") && (this.#mcpRetry.get(name)?.at ?? 0) <= now,
+    const due = [...this.#sdkMcpStatus]
+      .filter(([name, status]) => (status === "failed" || status === "needs-auth") && (this.#mcpRetry.get(name)?.at ?? 0) <= now)
+      .map(([name]) => name)
+      .filter((name) => !this.#mcpInFlight.has(name));
+    if (due.length === 0) return;
+    const generation = this.#mcpGeneration;
+    await Promise.allSettled(
+      due.map(async (name) => {
+        const prev = this.#mcpRetry.get(name);
+        const waitMs = Math.min((prev?.waitMs ?? MCP_RETRY_FIRST_MS / 2) * 2, MCP_RETRY_MAX_MS);
+        this.#mcpRetry.set(name, { at: now + waitMs, waitMs });
+        this.#store.audit(SYSTEM_IDENTITY.sub, "session.mcp_heal", this.id, `server=${JSON.stringify(name)}`);
+        const state = await withTimeout(provider.reconnectMcpServer!(name), MCP_RECONNECT_TIMEOUT_MS);
+        // A timed-out or superseded attempt changes nothing; the next waits longer.
+        if (state && generation === this.#mcpGeneration) this.#applyMcpState(name, state);
+      }),
     );
-    for (const [name] of due) {
-      const prev = this.#mcpRetry.get(name);
-      const waitMs = Math.min((prev?.waitMs ?? MCP_RETRY_FIRST_MS / 2) * 2, MCP_RETRY_MAX_MS);
-      this.#mcpRetry.set(name, { at: now + waitMs, waitMs });
-      let state: Awaited<ReturnType<NonNullable<SessionProvider["reconnectMcpServer"]>>>;
-      try {
-        state = await withTimeout(provider.reconnectMcpServer(name), MCP_RECONNECT_TIMEOUT_MS);
-      } catch {
-        continue; // timed out: the next attempt waits longer
-      }
-      if (state) this.#applyMcpState(name, state);
-    }
   }
 
   /** Take the backend's word for a server's state; announce it coming back. */
@@ -1612,9 +1643,10 @@ export class Session {
 
   /** A one-line note for the next prompt naming servers that came back, once. */
   #takeMcpBackNote(): string {
-    if (this.#mcpBack.size === 0) return "";
-    const names = [...this.#mcpBack].join(", ");
+    // Names go into the prompt: only plain ones (a repo's .mcp.json names its servers).
+    const names = [...this.#mcpBack].filter((n) => SAFE_MCP_NAME.test(n)).join(", ");
     this.#mcpBack.clear();
+    if (!names) return "";
     return `<system-reminder>These MCP servers reconnected since this session started and their tools are available now: ${names}. Any earlier report that they failed is out of date.</system-reminder>\n\n`;
   }
 
@@ -5381,6 +5413,7 @@ export class Session {
       }
 
       case "mcp_init": {
+        this.#mcpGeneration++;
         this.#sdkMcpStatus.clear();
         this.#sdkMcpTools.clear();
         for (const [name, status] of Object.entries(event.servers)) {
@@ -6899,8 +6932,25 @@ function sanitizeApprovalPatch(
 /** First automatic redial wait for a down MCP server; doubles per miss, up to the max (#389). */
 const MCP_RETRY_FIRST_MS = 30_000;
 const MCP_RETRY_MAX_MS = 15 * 60_000;
-/** How long a turn waits on one automatic redial before starting without it. */
+/** How long a turn waits on its automatic redials (together) before starting without them. */
 const MCP_RECONNECT_TIMEOUT_MS = 8_000;
+/** A redial someone asked for: how long to wait on it, and how soon the same server may be asked again. */
+const MCP_MANUAL_TIMEOUT_MS = 20_000;
+const MCP_MANUAL_COOLDOWN_MS = 3_000;
+/** Server names that may appear in a prompt note. */
+const SAFE_MCP_NAME = /^[\w .:()-]{1,128}$/;
+
+/**
+ * A backend's MCP error, fit to hand back: no control characters, query
+ * strings and long token-like path segments redacted, bounded.
+ */
+function cleanMcpError(raw: string): string {
+  const s = raw
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/(https?:\/\/[^\s?#]+)\?[^\s]*/g, "$1?…")
+    .replace(/\/([A-Za-z0-9_-]{24,})(?=[/\s]|$)/g, "/…");
+  return s.length > 300 ? `${s.slice(0, 300)}…` : s;
+}
 
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -6917,5 +6967,5 @@ function mcpErrorFor(name: string, state: { status: string; error?: string }): s
   if (state.status === "needs-auth") {
     return `${name} needs a sign-in, which only an interactive Claude Code session can run: sign in with /mcp there, then reconnect it here.`;
   }
-  return state.error ?? `${name} is ${state.status}`;
+  return state.error ? cleanMcpError(state.error) : `${name} is ${state.status}`;
 }

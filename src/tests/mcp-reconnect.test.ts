@@ -156,6 +156,54 @@ describe("session.mcp_reconnect", () => {
   });
 });
 
+describe("what may be redialed, and how often", () => {
+  it("only a server this backend reported, and only one that's down", async () => {
+    answer = () => ({ status: "connected", tools: [] });
+    const m = manager();
+    const id = await sessionAfterFirstTurn(m);
+    const ask = (server: string) => m.handle({ type: "session.mcp_reconnect", id: "r", sessionId: id, server } as never, AUTH, CLIENT);
+    expect(await ask("codeoid_memory")).toMatchObject({ type: "response.error", code: "invalid_request" });
+    expect(await ask("github")).toMatchObject({ type: "response.error", error: "github is connected, not down" });
+    expect(await ask("bad</system-reminder>name")).toMatchObject({ type: "response.error" }); // not even parsed
+    expect(provider.mcpReconnects).toEqual([]);
+  });
+
+  it("concurrent asks share one redial, and the same server can't be asked again at once", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const m = manager();
+    const id = await sessionAfterFirstTurn(m);
+    provider.reconnectMcpServer = async (name) => {
+      provider.mcpReconnects.push(name);
+      await gate;
+      return { status: "failed", tools: [], error: "still down" };
+    };
+    const first = reconnect(m, id);
+    const second = reconnect(m, id);
+    release();
+    await Promise.all([first, second]);
+    expect(provider.mcpReconnects).toEqual(["slack"]);
+    expect(await reconnect(m, id)).toMatchObject({ type: "response.error", error: expect.stringContaining("just redialed") });
+  });
+
+  it("an error handed back is bounded and doesn't carry tokens in URLs", async () => {
+    answer = () => ({
+      status: "failed",
+      tools: [],
+      error: `401 from https://gw.example/mcp/acct_${"a".repeat(32)}/slack?token=sekrit\u0007 ${"x".repeat(500)}`,
+    });
+    const m = manager();
+    const id = await sessionAfterFirstTurn(m);
+    const r = (await reconnect(m, id)) as { data: McpReconnectResult };
+    expect(r.data.error).not.toContain("sekrit");
+    expect(r.data.error).not.toContain("a".repeat(32));
+    expect(r.data.error).not.toContain("\u0007");
+    expect(r.data.error!.length).toBeLessThanOrEqual(301);
+  });
+});
+
 describe("healing before a turn", () => {
   it("a server that failed at start is redialed before the next turn, so the turn can use it", async () => {
     answer = () => ({ status: "connected", tools: ["mcp__slack__search"] });

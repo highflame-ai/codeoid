@@ -135,7 +135,7 @@ export function parseSlash(raw: string, opts?: ParseSlashOptions): SlashCommand 
       return { kind: "capabilities", tab: "skills" };
     case "mcp":
       // `/mcp reconnect <server>` redials one of the backend's servers (#389).
-      if (rest[0] === "reconnect" && rest[1]) return { kind: "mcp-reconnect", server: rest[1] };
+      if (rest[0] === "reconnect" && rest[1]) return { kind: "mcp-reconnect", server: rest.slice(1).join(" ") };
       return { kind: "capabilities", tab: "mcp" };
     case "hooks":
     case "hook":

@@ -6835,6 +6835,9 @@ mcpHub: this.#mcpHub,
     if ("unsupported" in result) {
       return { type: "response.error", requestId: msg.id, error: result.unsupported, code: "invalid_request" };
     }
+    if ("refused" in result) {
+      return { type: "response.error", requestId: msg.id, error: result.refused, code: "invalid_request" };
+    }
     return { type: "response.ok", requestId: msg.id, data: result };
   }
 
