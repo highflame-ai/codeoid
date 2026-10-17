@@ -104,6 +104,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, realpathSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryEngine } from "../daemon/memory/engine.js";
+import { applyAccountEnv, type ResolvedClaudeAccount, type StoredClaudeAccount } from "../daemon/claude-accounts.js";
 import { SqliteEpisodeStore } from "../daemon/memory/store.js";
 import { MEMORY_TOOL_NAMES } from "../daemon/memory/index.js";
 import type { Embedder } from "../daemon/memory/embedder.js";
@@ -1859,6 +1860,111 @@ describe("ClaudeProvider – systemPromptAppend loop rebuild (#153)", () => {
     const options = capturedQueryOpts?.options as { resume?: string } | undefined;
     expect(options?.resume).toBe("test-backing");
     await shutdown(provider);
+  });
+});
+
+// ── Claude accounts: per-session credential, switch = rebuild + resume ───────
+
+describe("ClaudeProvider – Claude accounts", () => {
+  let openGate: () => void = () => {};
+  beforeEach(() => {
+    sdkMessages = [];
+    sdkThrowError = null;
+    capturedQueryOpts = null;
+    queryCallCount = 0;
+    sdkGate = new Promise<void>((r) => {
+      openGate = r;
+    });
+  });
+
+  /** A provider whose account is whatever `current` holds at query time. */
+  function makeAccountProvider(current: { account: ResolvedClaudeAccount | null }): ClaudeProvider {
+    return new ClaudeProvider({
+      sessionId: "acct-session",
+      initialBackingId: "acct-backing",
+      workspaceId: "ws_test",
+      store: {
+        audit: () => {},
+        getClaudeCodeSessionId: () => null,
+        setClaudeCodeSessionId: () => {},
+        getSkillCommandGrants: () => new Map<string, boolean>(),
+        setSkillCommandGrant: () => {},
+      } as never,
+      resolveAccount: () => current.account,
+    });
+  }
+  function account(a: Omit<StoredClaudeAccount, "createdAt" | "updatedAt">): ResolvedClaudeAccount {
+    const stored = { ...a, createdAt: "t", updatedAt: "t" };
+    return { name: a.name, fingerprint: `${a.name}:${a.token}`, apply: (env) => applyAccountEnv(env, stored) };
+  }
+  const turnOn = (provider: ClaudeProvider, msg: string) =>
+    provider.runTurn({ history: [], userMessage: msg, workdir: "/tmp", canUseTool: async () => ({ behavior: "allow" as const }) });
+  const envOf = () => (capturedQueryOpts?.options as { env?: Record<string, string> } | undefined)?.env ?? {};
+
+  it("starts the subprocess on the session's account, with every competing credential removed", async () => {
+    const saved = { key: process.env.ANTHROPIC_API_KEY, url: process.env.ANTHROPIC_BASE_URL };
+    process.env.ANTHROPIC_API_KEY = "daemon-key-would-win";
+    process.env.ANTHROPIC_BASE_URL = "https://daemon.example";
+    try {
+      const current = { account: account({ name: "work", kind: "subscription", token: "sk-ant-oat01-WORK" }) };
+      const provider = makeAccountProvider(current);
+      turnOn(provider, "t1");
+      const env = envOf();
+      expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe("sk-ant-oat01-WORK");
+      expect(env.ANTHROPIC_API_KEY).toBeUndefined(); // would otherwise outrank the token
+      expect(env.ANTHROPIC_BASE_URL).toBeUndefined();
+      openGate();
+      await provider.teardown();
+    } finally {
+      if (saved.key === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = saved.key;
+      if (saved.url === undefined) delete process.env.ANTHROPIC_BASE_URL;
+      else process.env.ANTHROPIC_BASE_URL = saved.url;
+    }
+  });
+
+  it("a gateway account sets the base URL, its token and headers", async () => {
+    const current = {
+      account: account({ name: "gw", kind: "gateway", token: "gw-token", baseUrl: "https://gw.example", headers: { "x-workspace": "ws-7" } }),
+    };
+    const provider = makeAccountProvider(current);
+    turnOn(provider, "t1");
+    const env = envOf();
+    expect(env.ANTHROPIC_BASE_URL).toBe("https://gw.example");
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe("gw-token");
+    expect(env.ANTHROPIC_CUSTOM_HEADERS).toBe("x-workspace: ws-7");
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+    openGate();
+    await provider.teardown();
+  });
+
+  it("switching the account rebuilds the query on the new credential and RESUMES the same session", async () => {
+    const current: { account: ResolvedClaudeAccount | null } = { account: null };
+    const provider = makeAccountProvider(current);
+    turnOn(provider, "t1");
+    expect(queryCallCount).toBe(1);
+    provider.setHasQueried(true);
+    turnOn(provider, "t2"); // same account: the warm loop is reused
+    expect(queryCallCount).toBe(1);
+
+    current.account = account({ name: "work", kind: "subscription", token: "sk-ant-oat01-WORK" });
+    turnOn(provider, "t3");
+    expect(queryCallCount).toBe(2);
+    const options = capturedQueryOpts?.options as { resume?: string; env?: Record<string, string> } | undefined;
+    expect(options?.resume).toBe("acct-backing"); // same conversation
+    expect(options?.env?.CLAUDE_CODE_OAUTH_TOKEN).toBe("sk-ant-oat01-WORK");
+
+    current.account = account({ name: "work", kind: "subscription", token: "sk-ant-oat01-RENEWED" });
+    turnOn(provider, "t4"); // a re-login (new token) is a change too
+    expect(queryCallCount).toBe(3);
+    expect(envOf().CLAUDE_CODE_OAUTH_TOKEN).toBe("sk-ant-oat01-RENEWED");
+
+    current.account = null; // back to the daemon's own environment
+    turnOn(provider, "t5");
+    expect(queryCallCount).toBe(4);
+    expect(envOf().CLAUDE_CODE_OAUTH_TOKEN).toBe(process.env.CLAUDE_CODE_OAUTH_TOKEN as string);
+    openGate();
+    await provider.teardown();
   });
 });
 

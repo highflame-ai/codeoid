@@ -32,6 +32,10 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import type { LoginBackend, PendingBackendLogin } from "../../protocol/types.js";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { CLAUDE_CREDENTIAL_ENV } from "../claude-accounts.js";
 import { buildSubprocessEnv } from "../providers/env.js";
 
 /** Longest we hold a started attempt open before killing it. */
@@ -176,6 +180,8 @@ interface Attempt {
   exitCode: number | null;
   /** Woken on every chunk of output and on exit, so waiters can re-test. */
   wake: (() => void)[];
+  /** Throwaway Claude config dir an isolated login ran against — removed on dispose. */
+  isolatedDir?: string;
 }
 
 export interface LoginOutcome {
@@ -209,7 +215,15 @@ export class BackendLoginBroker {
    * reloads the page must not be locked out by their own abandoned attempt, and
    * two live logins for one backend would race to write the same credential.
    */
-  async start(backend: LoginBackend): Promise<PendingBackendLogin> {
+  /**
+   * `isolated`: run the command against a THROWAWAY Claude config dir with no
+   * inherited credential variables. `claude setup-token` also writes the
+   * config dir's stored login, so a login for a second, named account
+   * (claude-accounts.ts) must never touch the machine's own: it would replace
+   * the personal sign-in every unaccounted session runs on. Only the token the
+   * command prints is kept; the dir is deleted when the attempt ends.
+   */
+  async start(backend: LoginBackend, opts: { isolated?: boolean } = {}): Promise<PendingBackendLogin> {
     const flow = this.#flows[backend];
     if (!flow) throw new BackendLoginError(`No interactive login for backend '${backend}'.`);
 
@@ -223,7 +237,8 @@ export class BackendLoginBroker {
     const superseded = this.#byBackend.get(backend);
     if (superseded) this.cancel(superseded);
 
-    const child = spawnUnderPty(resolved.file, resolved.args);
+    const isolatedDir = opts.isolated ? mkdtempSync(join(tmpdir(), "codeoid-claude-login-")) : undefined;
+    const child = spawnUnderPty(resolved.file, resolved.args, isolatedDir);
     const loginId = randomUUID();
     const attempt: Attempt = {
       loginId,
@@ -238,6 +253,7 @@ export class BackendLoginBroker {
       exited: false,
       exitCode: null,
       wake: [],
+      ...(isolatedDir ? { isolatedDir } : {}),
     };
     // `unref` so a forgotten attempt cannot hold the process open at shutdown.
     attempt.ttlTimer.unref?.();
@@ -417,6 +433,10 @@ export class BackendLoginBroker {
     // Drop the transcript: it is the one place a credential sits in memory
     // longer than the exchange needs it.
     attempt.transcript = "";
+    if (attempt.isolatedDir) {
+      rmSync(attempt.isolatedDir, { recursive: true, force: true });
+      attempt.isolatedDir = undefined;
+    }
   }
 }
 
@@ -435,9 +455,16 @@ export class BackendLoginBroker {
  * would orphan the command it wrapped, which for a login command means an
  * abandoned OAuth attempt still holding a pty.
  */
-function spawnUnderPty(file: string, args: string[]): ChildProcess {
+function spawnUnderPty(file: string, args: string[], isolatedConfigDir?: string): ChildProcess {
+  const inherited = buildSubprocessEnv({ prefixes: ["ANTHROPIC_", "CLAUDE_", "LC_"] });
+  if (isolatedConfigDir) {
+    // A named-account login: nothing of the daemon's own credential may reach
+    // it, and it writes into its own config dir only.
+    for (const k of CLAUDE_CREDENTIAL_ENV) delete inherited[k];
+    inherited.CLAUDE_CONFIG_DIR = isolatedConfigDir;
+  }
   const env = {
-    ...buildSubprocessEnv({ prefixes: ["ANTHROPIC_", "CLAUDE_", "LC_"] }),
+    ...inherited,
     // A login command tries to open a browser. On the machine a daemon runs on
     // that is at best useless and at worst a browser nobody asked for on
     // someone's desktop — the user opens the URL we return, on their own

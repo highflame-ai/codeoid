@@ -16,7 +16,7 @@
  */
 
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -339,3 +339,38 @@ async function waitUntil(cond: () => boolean, timeoutMs: number): Promise<void> 
     await new Promise((r) => setTimeout(r, 50));
   }
 }
+
+describe("isolated login (a named Claude account)", () => {
+  test("runs against a throwaway config dir with no inherited credential, and removes it afterwards", async () => {
+    const seen = join(dir, "isolated-seen");
+    const cmd = join(dir, "isolated-login.sh");
+    writeFileSync(
+      cmd,
+      `#!/usr/bin/env bash
+printf '%s|%s\\n' "\${CLAUDE_CONFIG_DIR:-unset}" "\${ANTHROPIC_API_KEY:-none}" > "${seen}"
+printf '%s\\n' "${URL_}"
+read -r code
+echo "Your token: ${TOKEN}"
+`,
+      "utf8",
+    );
+    chmodSync(cmd, 0o755);
+    const saved = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "daemon-key-must-not-leak";
+    try {
+      const broker = newBroker(fakeFlow({ resolve: () => ({ file: cmd, args: [] }) }));
+      const login = await broker.start("claude", { isolated: true });
+      const [configDir, apiKey] = readFileSync(seen, "utf8").trim().split("|");
+      expect(configDir).toContain("codeoid-claude-login-"); // never ~/.claude
+      expect(apiKey).toBe("none");
+      expect(existsSync(configDir!)).toBe(true);
+
+      const outcome = await broker.submit(login.loginId, "any-code");
+      expect(outcome.secret).toEqual({ key: "CLAUDE_CODE_OAUTH_TOKEN", value: TOKEN });
+      expect(existsSync(configDir!)).toBe(false); // cleaned up with the attempt
+    } finally {
+      if (saved === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = saved;
+    }
+  });
+});

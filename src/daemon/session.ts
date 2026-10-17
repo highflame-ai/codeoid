@@ -9,6 +9,8 @@
  *   - Scrollback stores merged SessionMessage (not deltas)
  */
 
+import { ClaudeAccountError, type ClaudeAccountStore } from "./claude-accounts.js";
+import { CLAUDE_DEFAULT_ACCOUNT } from "../protocol/types.js";
 import {
   CanonicalHistoryAccumulator,
   canonicalTurnChars,
@@ -267,6 +269,10 @@ export interface SessionCreateOptions {
   name: string;
   workdir: string;
   auth: AuthContext;
+  /** The daemon's Claude account store (claude-accounts.ts). Absent = the daemon's own environment, always. */
+  claudeAccounts?: ClaudeAccountStore;
+  /** The Claude account this session chose; absent/null = follow the daemon default. Restored on resume. */
+  claudeAccount?: string | null;
   store: Store;
   transcriptStore: TranscriptStore;
   identityManager?: AgentIdentityManager;
@@ -681,6 +687,9 @@ export class Session {
 
   // Provider (re-)construction inputs — see switchProvider().
   #providersRegistry?: ProviderRegistry;
+  #claudeAccounts?: ClaudeAccountStore;
+  /** This session's own Claude account choice; null = follow the daemon default. */
+  #claudeAccount: string | null = null;
   #fleet?: McpSdkServerConfigWithInstance;
   #compressionRegistry?: CompressionRegistry;
   #onModels?: SessionCreateOptions["onModels"];
@@ -1162,6 +1171,8 @@ export class Session {
     // Retained for provider (re-)construction — switchProvider() rebuilds
     // the backend long after the constructor options are gone.
     this.#providersRegistry = opts.providers;
+    this.#claudeAccounts = opts.claudeAccounts;
+    this.#claudeAccount = opts.claudeAccount ?? null;
     this.#fleet = opts.fleet;
     this.#compressionRegistry = opts.compressionRegistry;
     this.#onModels = opts.onModels;
@@ -1299,6 +1310,7 @@ export class Session {
         projectId: opts.auth.projectId,
         role: this.role,
         providerId: this.#provider.id,
+        ...(this.#claudeAccount ? { claudeAccount: this.#claudeAccount } : {}),
         forkedFrom: this.forkedFrom,
         worktree: this.worktree,
         collaboration: this.collaboration,
@@ -1362,7 +1374,52 @@ export class Session {
       // Tag model reports with the factory's id (known before construction),
       // so the manager caches catalogs per-provider.
       onModels: (m) => this.#onModels?.(factory.id, m),
+      // Read per query (not captured), so a switch reaches the next turn.
+      resolveClaudeAccount: () => this.#claudeAccounts?.resolve(this.#claudeAccount) ?? null,
     });
+  }
+
+  /** This session's own Claude account choice; null = it follows the daemon default. */
+  get claudeAccount(): string | null {
+    return this.#claudeAccount;
+  }
+
+  /**
+   * The Claude account this session runs on next — its own choice, else the
+   * daemon default, else `default`. Throws ClaudeAccountError when the account
+   * it would use no longer exists (never falls back to another credential).
+   */
+  effectiveClaudeAccount(): string {
+    return this.#claudeAccounts?.resolve(this.#claudeAccount)?.name ?? CLAUDE_DEFAULT_ACCOUNT;
+  }
+
+  /**
+   * Choose the Claude account this session runs on; null = follow the daemon
+   * default. Takes effect on the next turn: the Claude provider sees a new
+   * account fingerprint, rebuilds its query with the new credential, and
+   * RESUMES the same backing session — the conversation carries on. Safe while
+   * a turn runs (the running turn keeps its credential).
+   */
+  setClaudeAccount(account: string | null, sender: AuthContext): void {
+    if (account !== null && account !== CLAUDE_DEFAULT_ACCOUNT && !this.#claudeAccounts?.has(account)) {
+      throw new ClaudeAccountError(`no Claude account named ${JSON.stringify(account)}`);
+    }
+    const from = this.#claudeAccount ?? "(default)";
+    this.#claudeAccount = account;
+    this.#store.audit(sender.sub, "session.claude_account", this.id, `from=${from} to=${account ?? "(default)"}`);
+    this.#saveMetaNow();
+    this.#broadcastInfoUpdate();
+  }
+
+  /** Re-announce this session's info — its effective Claude account moved with the daemon default. */
+  announceInfo(): void {
+    this.#broadcastInfoUpdate();
+  }
+
+  /** Refuse to start a Claude turn on an account that no longer exists. */
+  #assertClaudeAccount(): void {
+    if (this.#provider.id !== "claude" || !this.#claudeAccounts) return;
+    this.#claudeAccounts.resolve(this.#claudeAccount); // throws ClaudeAccountError
   }
 
   /**
@@ -2327,6 +2384,9 @@ export class Session {
     attachments?: readonly Attachment[],
     priority?: "now" | "next" | "later",
   ): Promise<void> {
+    // Before anything is recorded: a session whose Claude account was removed
+    // must not quietly run on some other credential.
+    this.#assertClaudeAccount();
     // Funnel through the chain. The next send awaits the previous
     // send's full settle (success or thrown). Errors propagate to the
     // caller of THIS send only — the chain itself absorbs them so a
@@ -4022,6 +4082,17 @@ export class Session {
     return this.#currentTurnId;
   }
 
+  #claudeAccountInfo(): Pick<SessionInfo, "claudeAccount" | "effectiveClaudeAccount"> {
+    if (this.#provider.id !== "claude") return {};
+    let effective: string;
+    try {
+      effective = this.effectiveClaudeAccount();
+    } catch {
+      effective = `${this.#claudeAccount ?? "?"} (missing)`;
+    }
+    return { ...(this.#claudeAccount ? { claudeAccount: this.#claudeAccount } : {}), effectiveClaudeAccount: effective };
+  }
+
   toInfo(): SessionInfo {
     return {
       id: this.id,
@@ -4034,6 +4105,7 @@ export class Session {
       attachedClients: this.#clients.size,
       role: this.role,
       providerId: this.#provider.id,
+      ...this.#claudeAccountInfo(),
       mode: this.#mode,
       turnsRemaining: this.#turnsRemaining,
       pinnedFiles: [...this.#pinnedFiles],
@@ -7178,6 +7250,8 @@ export class Session {
       projectId: this.projectId,
       role: this.role,
       providerId: this.#provider.id,
+      // In BOTH meta writes: each overwrites the whole file (see below).
+      ...(this.#claudeAccount ? { claudeAccount: this.#claudeAccount } : {}),
       ...(this.#backingFresh ? { backingFresh: true } : {}),
       ...(this.#redactedBackings.size > 0 ? { redactedBackings: [...this.#redactedBackings] } : {}),
       forkedFrom: this.forkedFrom,

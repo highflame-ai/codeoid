@@ -209,3 +209,42 @@ The sign-in requires the `settings:write` scope, because it writes to the same
 `.env` that scope already governs. It takes effect for **new sessions** — a
 running session keeps the environment it started with. Only Claude is wired
 today; the mechanism is per-backend and the others follow.
+
+## Several Claude accounts
+
+One daemon can hold several Claude credentials: a personal Pro/Max subscription, a company one, and a company gateway token per workspace.
+Each session runs on one of them, two sessions can run on two accounts at once, and a session can be switched to another account mid-conversation.
+
+```bash
+codeoid account login company-max        # sign a subscription in as "company-max" (claude setup-token)
+codeoid account add-gateway gw-team-a --base-url https://gateway.example.com --header "x-workspace: team-a"
+codeoid account add-token personal-max   # paste a token you already have (sk-ant-oat01-…); --api-key for an API key
+codeoid account ls                       # names and kinds — never a token
+codeoid account default company-max      # what every session that hasn't chosen its own runs on
+codeoid new review ~/code/app --account gw-team-a
+codeoid account use review personal-max  # switch a running session, keeping the conversation
+codeoid account rm gw-team-a
+```
+
+**How a switch keeps the conversation.**
+An account is only the credential a session's Claude subprocess starts with.
+Claude keeps its session history as local files in one config directory, shared by every account, so a switched session restarts its Claude query with the new credential and resumes the same Claude session.
+The switch takes effect on the session's next turn; a turn already running finishes on the old account.
+The first turn after a switch re-reads the whole context at full price, because prompt caching is per organization, and it counts against the new account's limits.
+
+**The built-in `default` account** is the daemon's own environment: your `claude login`, or `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` in `~/.codeoid/.env`.
+It is what every session uses until you name another default.
+A session that follows the default moves with it on its next turn; a session that chose its own account (`--account`, `account use`) stays on it.
+
+**A session never silently changes account.**
+Applying an account removes every competing Claude credential variable before setting its own, so a stray `ANTHROPIC_API_KEY` can't take over a subscription session.
+A session whose account was removed refuses to run until you switch it, rather than falling back to another credential.
+One thing this cannot override is an `apiKeyHelper` in your Claude settings file, since that is configuration of the shared config directory rather than environment.
+
+**`codeoid account login` never touches your own `claude login`.**
+It runs `claude setup-token` against a throwaway config directory and keeps only the token it prints, so signing a second account in can't replace the personal sign-in your other sessions use.
+
+**Where it is stored.**
+Accounts live in `~/.codeoid/claude-accounts.json`, mode 0600.
+Tokens are never sent to a client: listing accounts shows names, kinds, and a gateway's URL and header names only.
+Managing accounts needs `settings:write` (listing needs `settings:read`); switching a session needs `session:send`.

@@ -171,6 +171,7 @@ codeoid attach <n>   # interactive attach (with scrollback replay)
 codeoid send <n> <m> # one-shot message
 codeoid interrupt <n>
 codeoid approve <n> [--deny] [--pick N | --id <approvalId>] [--yes]
+codeoid account ls|login <name>|add-gateway|add-token|default <name>|use <session> <name>|rm <name>  # several Claude accounts (docs/CONFIGURATION.md)
 codeoid destroy <n>
 codeoid mcp config [--scopes observe|operate|full]  # MCP client entry for /mcp/control
 codeoid mcp headers [--scopes …]                    # fresh bearer header (an MCP headersHelper)
