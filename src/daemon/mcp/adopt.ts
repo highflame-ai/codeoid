@@ -25,12 +25,50 @@ import { readClaudeConfig } from "../claude-config.js";
 import { isReservedMcpName, type McpRegistry } from "./registry.js";
 import { mcpToolPrefix } from "./types.js";
 
-/** Every server of that name in Claude's config: the global ones, plus the
- *  workdir's for a session's workdir. The same name can mean two servers. */
-export async function findClaudeMcpServers(name: string, workdir: string | null): Promise<ClaudeConfigMcpServer[]> {
+/** Every server in Claude's config: the global ones, plus the workdir's for a
+ *  session's workdir. */
+export async function claudeMcpServers(workdir: string | null): Promise<ClaudeConfigMcpServer[]> {
   const snapshot = await readClaudeConfig(workdir ?? os.homedir());
-  const all = workdir ? snapshot.mcpServers : snapshot.mcpServers.filter((s) => s.scope === "global");
-  return all.filter((s) => s.name === name);
+  return workdir ? snapshot.mcpServers : snapshot.mcpServers.filter((s) => s.scope === "global");
+}
+
+/** Every server of that name in Claude's config. The same name can mean two servers. */
+export async function findClaudeMcpServers(name: string, workdir: string | null): Promise<ClaudeConfigMcpServer[]> {
+  return (await claudeMcpServers(workdir)).filter((s) => s.name === name);
+}
+
+/**
+ * Why adopting `chosen` would be refused, or null — the one rule the adopt
+ * handler, the drawer's offer and the reconnect hint all apply, so neither
+ * of the last two suggests what the first refuses. `all` is every entry in
+ * Claude's config the caller can see (adopting denies the CLI's copy at that
+ * URL whatever it's called there).
+ */
+export function adoptionRefusal(
+  chosen: ClaudeConfigMcpServer,
+  all: readonly ClaudeConfigMcpServer[],
+  registry: McpRegistry,
+  daemonOrigins: readonly string[],
+): string | null {
+  const named = adoptableName(chosen.name);
+  if (!named.ok) return named.reason;
+  const can = adoptability(chosen);
+  if (!can.ok) return can.reason;
+  if (isDaemonEndpoint(can.url, daemonOrigins)) return `${chosen.name} is one of this daemon's own endpoints`;
+  // Every entry at that address, whatever its name, must be adoptable: a
+  // repo's header-less copy mustn't stand in for the user's own
+  // header-authorized server (which would be denied along with it).
+  for (const other of all) {
+    if (other === chosen || other.url !== can.url) continue;
+    const ok = adoptability(other);
+    if (!ok.ok) return ok.reason;
+  }
+  // A project's own server can't take a name the user's own config gives
+  // another address: it would stand in for theirs in every session.
+  if (fromRepoFile(chosen) && all.some((o) => o.name === chosen.name && !fromRepoFile(o) && o.url !== can.url)) {
+    return `this project's ${chosen.name} would replace your own server of that name, at another address`;
+  }
+  return registryConflict(registry, chosen.name, can.url);
 }
 
 /**
@@ -41,9 +79,12 @@ export async function findClaudeMcpServers(name: string, workdir: string | null)
  * so such a server is adopted only when the caller names its URL: consent to
  * that address, which adopting makes daemon-wide.
  */
-export function fromRepoFile(server: ClaudeConfigMcpServer, home: string = os.homedir()): boolean {
+export function fromRepoFile(server: ClaudeConfigMcpServer): boolean {
   if (server.scope !== "workdir") return false;
-  return path.resolve(server.path) !== path.join(home, ".claude.json");
+  // readClaudeConfig reads one file of that name — the user's own
+  // ~/.claude.json (its projects[workdir] entries); every file a repo
+  // controls has another (.mcp.json, .claude/settings*.json).
+  return path.basename(server.path) !== ".claude.json";
 }
 
 /**
@@ -61,9 +102,17 @@ export function adoptableName(name: string): { ok: true } | { ok: false; reason:
 
 const LOOPBACK = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
-/** Any spelling of this machine: localhost, 127.0.0.0/8, ::1, ::ffff:127.x. */
+/** Any spelling of this machine: localhost (and *.localhost), 127.0.0.0/8,
+ *  0.0.0.0, ::1, ::, ::ffff:127.x. */
 function isLoopbackHost(host: string): boolean {
-  return LOOPBACK.has(host) || host === "localhost." || /^127\./.test(host) || /^\[::ffff:(127\.|7f)/i.test(host);
+  return (
+    LOOPBACK.has(host) ||
+    host === "0.0.0.0" ||
+    host === "[::]" ||
+    /(^|\.)localhost\.?$/i.test(host) ||
+    /^127\./.test(host) ||
+    /^\[::ffff:(127\.|7f)/i.test(host)
+  );
 }
 
 /**
@@ -108,8 +157,10 @@ export function adoptability(server: ClaudeConfigMcpServer): { ok: true; url: st
   }
   // The URL is shown for consent and stored as is: the parser would quietly
   // drop a newline or tab, which could carry text into the prompt.
-  if (/[\s\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2066-\u2069\ufeff]/.test(server.url)) {
-    return { ok: false, reason: `${server.name}'s URL contains spaces or control characters` };
+  // ASCII only (an international domain in its punycode form): anything
+  // else is either invisible or rewritten by the parser.
+  if (/[\s\u0000-\u001f\u007f-\uffff]/.test(server.url)) {
+    return { ok: false, reason: `${server.name}'s URL contains spaces, control or non-ASCII characters (write an international domain in its xn-- form)` };
   }
   let url: URL;
   try {

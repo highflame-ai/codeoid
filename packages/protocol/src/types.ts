@@ -1933,6 +1933,9 @@ export interface ClaudeConfigMcpServer {
   /** codeoid has adopted it: its registry signs in to this URL, and Claude
    *  sessions use that copy rather than the CLI's. */
   adopted?: true;
+  /** From a file the workdir's project controls (a `.mcp.json`, its
+   *  `.claude/` settings): the project chose its address. */
+  projectFile?: true;
 }
 
 export interface ClaudeConfigHook {

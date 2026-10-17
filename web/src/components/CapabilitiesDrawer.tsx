@@ -355,13 +355,16 @@ const McpAdopt: Component<{ server: string; url: string | null; path: string; pr
     // Daemon-wide and lasting: say so before doing it — and, for a project's
     // own file, first, that the project chose this address. The host is
     // shown as the browser resolves it (punycode), not as the file spells it.
-    let host = props.url ?? "";
+    // The full address, as the browser resolves it: plain ASCII (punycode
+    // host, the rest percent-encoded), so the path that tells two servers on
+    // one host apart is there too.
+    let address = props.url ?? "";
     try {
-      host = new URL(props.url ?? "").host;
+      address = new URL(props.url ?? "").href;
     } catch {}
     const origin = props.projectFile ? `This project's own ${props.path} chose this server's address. Adopt it only if you trust that address.\n\n` : "";
     const ok = window.confirm(
-      `${origin}codeoid will sign in to ${props.server} at ${host} itself, and every codeoid session will use it from now on, instead of the Claude CLI's own copy.\n\nContinue?`,
+      `${origin}codeoid will sign in to ${props.server} at ${address} itself, and every codeoid session will use it from now on, instead of the Claude CLI's own copy.\n\nContinue?`,
     );
     if (!ok) return;
     const sid = claudeConfig().sessionId;
@@ -455,7 +458,7 @@ const McpList: Component<{ items: ClaudeConfigMcpServer[]; sessionId: string | n
                 <McpReconnect sessionId={props.sessionId!} server={m.name} />
               </Show>
               <Show when={m.adoptable}>
-                <McpAdopt server={m.name} url={m.url} path={m.path} projectFile={m.scope === "workdir" && !m.path.endsWith("/.claude.json")} />
+                <McpAdopt server={m.name} url={m.url} path={m.path} projectFile={m.projectFile === true} />
               </Show>
               <Show when={m.adopted}>
                 <span

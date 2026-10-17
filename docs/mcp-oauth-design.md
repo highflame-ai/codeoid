@@ -98,11 +98,12 @@ A baked-in token cannot work for native backends: an access token lives about an
 **Claude (#390)** takes them in-process: for each OAuth registry server the tenant has signed in to, the provider mounts an SDK server under the server's own name (so tools stay `mcp__<server>__<tool>`) whose `tools/list` and `tools/call` go to `McpHub` with the session's tenant (`providers/claude/oauth-bridge.ts`).
 The token stays in the daemon, refresh and the `401` retry are the hub's, and nothing listens on a port.
 The CLI must not also connect its own copy (from `~/.claude.json` or a `.mcp.json`): a same-name mount alone doesn't stop it (measured: the CLI still dials its copy), so the provider passes every OAuth server's URL in the flag settings' `deniedMcpServers`, and leaves those servers out of the user servers it passes in.
-The denylist is fixed at query construction, so adopting a server rebuilds the query on the next turn; signing in or out only changes which in-process servers are mounted, which the provider applies to the running query with `setMcpServers` (codeoid's servers only), queuing the turn's message behind it — no restart, so the session's background work survives.
+The denylist and the mounts are fixed at query construction, so adopting a server, or signing in to or out of one, rebuilds the query on the next turn (it resumes the same conversation; the CLI's background work ends with the old process, as for any rebuild).
+A live `setMcpServers` swap was tried and dropped: an interrupt while a turn's message waited behind it could not reliably stop that turn, and sign-in changes are rare.
 A session never redials the CLI's copy of a server at a URL codeoid owns (decided by URL, by the provider, which sees the copy's config).
 A server the hub can't list (signed out, a revoked token, down, a timeout) makes the in-process server's `tools/list` fail, so the CLI reports it failed rather than connected with no tools.
-`setMcpServers` keeps a server it already has under a name, so one whose sign-in changed (signed out and back in, say after a revoked token) is also reconnected; the sign-in stamp that tells this is a per-tenant counter bumped by sign-ins and sign-outs, not by refreshes.
-A refresh the token endpoint refuses (`invalid_grant`) forgets the tokens, so the server reads as signed out; a refresh that merely fails (network, 5xx) keeps them for the next try.
+The rebuild key includes a per-tenant sign-in counter (bumped by sign-ins and sign-outs, not refreshes), so signing out and back in between two turns — say after a revoked token — still gets a fresh connection.
+When the authorization server refuses a refresh (`invalid_grant`, or `invalid_client`, which ends the client's registration too), the tokens are forgotten, so the server reads as signed out; a refresh that merely fails (network, 5xx, `temporarily_unavailable`) keeps them for the next try.
 
 The proxy below is the planned way to close the gap for the other native backends; nothing else in this design depends on it.
 

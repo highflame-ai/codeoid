@@ -53,17 +53,18 @@ describe("oauthServersForClaude", () => {
     // not codexOnly (not for claude), not plain (not OAuth: the CLI mounts that one)
   });
 
-  it("a sign-in changes what's mounted, not what the query is built with; adopting changes both", () => {
+  it("changes its fingerprint on a sign-in, a re-sign-in or an adoption — not on a repeat look", () => {
     const signed = new Set<string>();
     const reg = registry();
-    const a = oauthServersForClaude(reg, fakeHub(signed), SCOPE);
-    expect(oauthServersForClaude(reg, fakeHub(signed), SCOPE)).toMatchObject({ fingerprint: a.fingerprint, mountFingerprint: a.mountFingerprint });
+    const a = oauthServersForClaude(reg, fakeHub(signed), SCOPE).fingerprint;
+    expect(oauthServersForClaude(reg, fakeHub(signed), SCOPE).fingerprint).toBe(a);
     signed.add("tracker");
-    const b = oauthServersForClaude(reg, fakeHub(signed), SCOPE);
-    expect(b.fingerprint).toBe(a.fingerprint); // no rebuild for a sign-in
-    expect(b.mountFingerprint).not.toBe(a.mountFingerprint); // a live update instead
+    const b = oauthServersForClaude(reg, fakeHub(signed), SCOPE).fingerprint;
+    expect(b).not.toBe(a);
+    const resigned = { ...fakeHub(signed), credentialStamp: () => "stamp-2" } as unknown as McpHub;
+    expect(oauthServersForClaude(reg, resigned, SCOPE).fingerprint).not.toBe(b);
     reg.upsert("another", McpServerSchema.parse({ url: "https://another.example.com/mcp", oauth: true }));
-    expect(oauthServersForClaude(reg, fakeHub(signed), SCOPE).fingerprint).not.toBe(a.fingerprint); // a new denylist: rebuild
+    expect(oauthServersForClaude(reg, fakeHub(signed), SCOPE).fingerprint).not.toBe(b);
   });
 
   it("with no hub or registry, mounts nothing and denies nothing", () => {

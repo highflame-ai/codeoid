@@ -16,6 +16,8 @@ import { MockSessionProvider } from "../daemon/providers/mock/session-provider.j
 import { ProviderRegistry } from "../daemon/providers/registry.js";
 import { SessionManager } from "../daemon/session-manager.js";
 import { MCP_TIMINGS, cleanMcpError } from "../daemon/session.js";
+import { McpHub } from "../daemon/mcp/hub.js";
+import { McpRegistry } from "../daemon/mcp/registry.js";
 import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
 import { ALL_SCOPES, WATCHER_SCOPES } from "../protocol/scopes.js";
@@ -181,6 +183,7 @@ describe("session.mcp_reconnect", () => {
     writeFileSync(join(tmp, "work", ".mcp.json"), JSON.stringify({ mcpServers: { slack: { type: "http", url: "https://slack.example.com/mcp" } } }));
     answer = () => ({ status: "needs-auth", tools: [] });
     const m = manager();
+    m.setMcp(new McpRegistry({}, { memoryEnabled: false }), new McpHub({})); // a daemon that can adopt
     const id = await sessionAfterFirstTurn(m);
     const r = (await reconnect(m, id)) as { data: McpReconnectResult };
     expect(r.data.error).toContain('"Sign in with codeoid"');
@@ -194,6 +197,7 @@ describe("session.mcp_reconnect", () => {
     writeFileSync(join(tmp, "work", ".mcp.json"), JSON.stringify({ mcpServers: { slack: { type: "http", url: "https://slack.example.com/mcp" } } }));
     answer = () => ({ status: "needs-auth", tools: [] });
     const m = manager();
+    m.setMcp(new McpRegistry({}, { memoryEnabled: false }), new McpHub({})); // a daemon that can adopt
     const id = await sessionAfterFirstTurn(m);
     const operator: AuthContext = { ...AUTH, scopes: AUTH.scopes.filter((sc) => sc !== "settings:write") };
     const r = (await reconnect(m, id, operator)) as { data: McpReconnectResult };

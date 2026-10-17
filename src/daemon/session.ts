@@ -119,7 +119,7 @@ import {
 import { isElicitationTool, isSafeTool, roleDeniesTool } from "./providers/tool-safety.js";
 import type { PackActivation } from "./pipeline/index.js";
 import type { McpRegistry } from "./mcp/registry.js";
-import { adoptability, adoptableName, findClaudeMcpServers, fromRepoFile, registryConflict, shellArg } from "./mcp/adopt.js";
+import { adoptableName, adoptionRefusal, claudeMcpServers, fromRepoFile, shellArg } from "./mcp/adopt.js";
 import type { McpHub } from "./mcp/hub.js";
 import type { Attachment } from "../protocol/types.js";
 import { resolveAttachments } from "./attachments.js";
@@ -1722,11 +1722,11 @@ export class Session {
   async #adoptHint(name: string): Promise<{ command: string; note?: string } | null> {
     if (!adoptableName(name).ok) return null;
     const registry = this.#mcpRegistry;
-    const can = (await findClaudeMcpServers(name, this.workdir).catch(() => [])).filter((c) => {
-      const ok = adoptability(c);
-      // What adopt would refuse isn't suggested.
-      return ok.ok && !(registry && registryConflict(registry, name, ok.url));
-    });
+    if (!registry) return null;
+    const all = await claudeMcpServers(this.workdir).catch(() => []);
+    // What adopt would refuse isn't suggested (the daemon's own endpoints
+    // excepted: the session doesn't know them, and adopt still refuses them).
+    const can = all.filter((c) => c.name === name && !adoptionRefusal(c, all, registry, []));
     if (can.length === 0) return null;
     // Quoted to run as shown (a session's name is free text).
     const session = `--session=${shellArg(this.name)}`;
@@ -1739,7 +1739,7 @@ export class Session {
     if (fromRepoFile(one)) {
       return {
         command: `codeoid mcp adopt ${name} ${session} --url=${shellArg(one.url!)}`,
-        note: `Its address (${new URL(one.url!).host}) was chosen by this project's ${basename(one.path)}: adopt it only if you trust it.`,
+        note: `Its address (${new URL(one.url!).href}) was chosen by this project's ${basename(one.path)}: adopt it only if you trust it.`,
       };
     }
     return { command: `codeoid mcp adopt ${name} ${session}` };

@@ -434,10 +434,10 @@ In codeoid's registry (`"oauth": true`) codeoid signs in itself, from any fronte
 - **Web:** "Sign in with codeoid" next to a server that needs a sign-in, in the capabilities drawer, adopts it after a confirmation and starts the sign-in.
 - **CLI:** `codeoid mcp adopt <server> [--session <s>] [--url <url>]`, then `codeoid mcp signin <server>`. `--session` also looks in that session's workdir (a `.mcp.json`, project servers); `--url` says which server is meant when two share the name, and is required for a project's own server. The sign-in prints an address to open, and finishes from the address the browser lands on, pasted back (or `--callback-url`).
 
-A server that needs a sign-in points at adopting it, with the command that finds it, in its reconnect answer.
+A server that needs a sign-in points at adopting it (for someone who may adopt), with the command that finds it, in its reconnect answer.
 Once adopted, Claude sessions use codeoid's copy from their next turn: it is mounted in-process in front of codeoid's own MCP client, so the token never reaches the agent, and the CLI is told not to connect its own copy (by URL), so the server isn't connected twice.
-Signing in or out later changes a running session's servers in place from its next turn, without restarting its backend.
-A token that can no longer be refreshed is forgotten, so the server reads as signed out and offers a new sign-in.
+Signing in or out later applies to a running session from its next turn (its backend restarts and resumes the same conversation).
+A token the server refuses to renew is forgotten, so the server reads as signed out and offers a new sign-in; a renewal that merely fails (the server unreachable) keeps it.
 codeoid never reads or writes the Claude CLI's credentials.
 
 What can be adopted, and why:

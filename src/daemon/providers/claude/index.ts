@@ -241,26 +241,11 @@ export class ClaudeProvider implements SessionProvider {
    * SDK fixes `plugins` at query construction, and a pipeline run swaps the pack
    * activation between phases, so a changed set forces a rebuild too. */
   #builtPluginDirs = "";
-  /** The registry OAuth servers (and which are signed in) the LIVE query loop
-   * was built with: adopting one, or signing in to or out of it, changes what
-   * the query must mount and deny, which the SDK fixes at construction (#390). */
+  /** The registry OAuth servers (and which are signed in, with which sign-in)
+   * the LIVE query loop was built with: adopting one, or signing in to or out
+   * of it, changes what the query must mount and deny, which the SDK fixes at
+   * construction — the next turn rebuilds it (#390). */
   #builtOAuthMcp = "";
-  /** Which of those the LIVE query mounts (the tenant signed in to). A change is
-   * applied to the warm query with setMcpServers — no rebuild, so a sign-in
-   * doesn't kill the session's background work. */
-  #builtOAuthMounts = "";
-  /** A change to the live query's MCP servers still being applied; pushes wait behind it. */
-  #mcpUpdating: Promise<void> | null = null;
-  /** Messages waiting behind it, and the epoch they belong to: an interrupt,
-   *  rebuild or teardown moves the epoch on, and a held message from an older
-   *  one is dropped instead of starting a turn nobody wants any more. */
-  #heldPushes = 0;
-  #pushEpoch = 0;
-  /** An interrupt came while the turn's message was held: interrupt again
-   *  once it's delivered (the epoch it applies to; -1 = none). */
-  #interruptHeldEpoch = -1;
-  /** The sign-in stamp each mounted OAuth server was connected with. */
-  #builtOAuthStamps: Record<string, string> = {};
   /** Last TurnOpts — the retry after a skill approval rebuilds the loop with
    * these, then re-pushes #lastPushedContent into the SAME turn queue (#233). */
   #lastTurnOpts: TurnOpts | null = null;
@@ -433,9 +418,6 @@ export class ClaudeProvider implements SessionProvider {
     return {
       events: turnQueue,
       interrupt: async () => {
-        // The turn's prompt may still be waiting behind an MCP server change:
-        // stop it as soon as it's delivered, too.
-        if (this.#heldPushes > 0) this.#interruptHeldEpoch = this.#pushEpoch;
         const q = this.#query;
         if (q) {
           try {
@@ -631,7 +613,6 @@ export class ClaudeProvider implements SessionProvider {
   }
 
   async teardown(): Promise<void> {
-    this.#dropHeldPushes();
     this.#inputQueue?.close();
     this.#abortController?.abort();
     if (this.#consumerTask) {
@@ -664,42 +645,18 @@ export class ClaudeProvider implements SessionProvider {
       shouldQuery,
     };
     this.#lastPushedContent = content;
-    const queue = this.#inputQueue;
-    const push = () => {
-      try {
-        if (!queue.closed) queue.push(msg);
-      } catch (err) {
-        console.error(`[claude-provider] push failed: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    };
-    // A message must find the servers it was sent with: behind a pending
-    // change to them, in order.
-    if (this.#mcpUpdating) {
-      const epoch = this.#pushEpoch;
-      this.#heldPushes += 1;
-      this.#afterMcpUpdate(() => {
-        if (epoch !== this.#pushEpoch) return;
-        this.#heldPushes -= 1;
-        push();
-        // Stopped while it waited: it starts and is stopped at once, so the
-        // turn ends the usual way (recorded as interrupted, seed and all).
-        if (this.#interruptHeldEpoch === epoch) {
-          this.#interruptHeldEpoch = -1;
-          void this.#query?.interrupt().catch(() => {});
-        }
-      });
-    } else push();
+    try {
+      this.#inputQueue.push(msg);
+    } catch (err) {
+      console.error(`[claude-provider] push failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   /**
    * Every MCP server the query gets. Built-ins go last, so nothing configured
    * or adopted can take their names (some of their tools are pre-approved).
    */
-  #mcpServerSet(
-    opts: TurnOpts,
-    oauthMcp: ReturnType<typeof oauthServersForClaude>,
-    { userServers = true }: { userServers?: boolean } = {},
-  ): Record<string, McpServerConfig> {
+  #mcpServerSet(opts: TurnOpts, oauthMcp: ReturnType<typeof oauthServersForClaude>): Record<string, McpServerConfig> {
     const init = this.#init;
     // Apply a per-call wall-clock timeout to the external (user) servers so a
     // hung MCP tool call surfaces as an SDK error instead of silently wedging
@@ -708,7 +665,7 @@ export class ClaudeProvider implements SessionProvider {
     const mcpToolTimeoutMs = init.config?.session.mcpToolTimeoutMs ?? 120_000;
     return {
       // A server codeoid now signs in to is codeoid's (mounted below), not the CLI's.
-      ...(userServers ? withMcpToolTimeout(withoutServers(loadUserMcpServers(opts.workdir), oauthMcp.deniedUrls), mcpToolTimeoutMs) : {}),
+      ...withMcpToolTimeout(withoutServers(loadUserMcpServers(opts.workdir), oauthMcp.deniedUrls), mcpToolTimeoutMs),
       // Registry servers — mounted natively on the SDK (claude owns its client);
       // tool calls surface as `mcp__<server>__<tool>` and gate via canUseTool.
       ...withMcpToolTimeout(registryServersForClaude(init.mcpRegistry), mcpToolTimeoutMs),
@@ -734,67 +691,6 @@ export class ClaudeProvider implements SessionProvider {
       // orchestrator's mount is attached after its Session exists.
       ...blackboardServerEntry(init.blackboardMcp?.()),
     };
-  }
-
-  /** Swap the warm query's MCP servers for the current set — a sign-in or
-   *  sign-out to an OAuth server (#390) — without restarting the CLI. */
-  #applyMcpServers(opts: TurnOpts, oauthMcp: ReturnType<typeof oauthServersForClaude>): void {
-    const q = this.#query;
-    if (!q) return;
-    this.#builtOAuthMounts = oauthMcp.mountFingerprint;
-    const tag = `[claude-provider ${this.#init.sessionId.slice(0, 8)}]`;
-    console.log(`${tag} OAuth MCP sign-ins changed — updating the live query's servers`);
-    // codeoid's servers only. setMcpServers replaces only the servers an
-    // earlier call named — those passed at construction aren't in that set
-    // until named (measured), so leaving the user's own out leaves them as
-    // they are. Re-sending one with an unchanged config reuses its process.
-    const servers = this.#mcpServerSet(opts, oauthMcp, { userServers: false });
-    // setMcpServers keeps a server it already has under that name: one whose
-    // sign-in changed (signed out and back in, say after a revoked token)
-    // keeps its old, failed connection unless it's reconnected.
-    const resigned = Object.keys(oauthMcp.stamps).filter((n) => n in this.#builtOAuthStamps && this.#builtOAuthStamps[n] !== oauthMcp.stamps[n]);
-    this.#builtOAuthStamps = oauthMcp.stamps;
-    const generation = this.#loopGeneration;
-    // Started in turn, after any earlier change: two overlapping calls could
-    // land out of order (a sign-out, then a sign-in, ending signed out).
-    this.#afterMcpUpdate(() =>
-      withTimeout(
-        q.setMcpServers(servers).then(async (r) => {
-          if (r.added.length > 0 || r.removed.length > 0) console.log(`${tag} MCP servers added [${r.added.join(", ")}] removed [${r.removed.join(", ")}]`);
-          for (const [name, error] of Object.entries(r.errors)) console.error(`${tag} MCP server ${name} didn't connect: ${error}`);
-          for (const name of resigned) await q.reconnectMcpServer(name).catch(() => {});
-        }),
-        MCP_SET_TIMEOUT_MS,
-      ).catch((err: unknown) => {
-        // The next turn retries — unless this query has since been replaced,
-        // whose own build has the current set.
-        if (generation === this.#loopGeneration) {
-          this.#builtOAuthMounts = "";
-          this.#builtOAuthStamps = {};
-        }
-        console.error(`${tag} updating the MCP servers failed: ${err instanceof Error ? err.message : String(err)}`);
-      }),
-    );
-  }
-
-  /** Forget messages held behind an MCP change (a rebuild, teardown): they
-   *  were for the query going away. A change still in flight stays the tail
-   *  later ones and pushes wait behind, so nothing overlaps it. */
-  #dropHeldPushes(): void {
-    this.#pushEpoch += 1;
-    this.#heldPushes = 0;
-    this.#interruptHeldEpoch = -1;
-  }
-
-  /** Run `step` after any pending MCP update (and what queued behind it), in order. */
-  #afterMcpUpdate(step: () => unknown): void {
-    const next: Promise<void> = (this.#mcpUpdating ?? Promise.resolve()).then(async () => {
-      await step();
-    });
-    this.#mcpUpdating = next;
-    void next.then(() => {
-      if (this.#mcpUpdating === next) this.#mcpUpdating = null;
-    });
   }
 
   #ensureQueryLoop(opts: TurnOpts): void {
@@ -828,7 +724,6 @@ export class ClaudeProvider implements SessionProvider {
         this.#builtPluginDirs === desiredPlugins &&
         this.#builtOAuthMcp === oauthMcp.fingerprint
       ) {
-        if (this.#builtOAuthMounts !== oauthMcp.mountFingerprint) this.#applyMcpServers(opts, oauthMcp);
         return;
       }
       // Per-turn contributions the SDK fixes at query construction changed, so
@@ -869,10 +764,6 @@ export class ClaudeProvider implements SessionProvider {
     this.#builtSkillAllowRules = desiredGrants;
     this.#builtPluginDirs = desiredPlugins;
     this.#builtOAuthMcp = oauthMcp.fingerprint;
-    this.#builtOAuthMounts = oauthMcp.mountFingerprint;
-    this.#builtOAuthStamps = oauthMcp.stamps;
-    // Messages held behind a change to the old query went with it.
-    this.#dropHeldPushes();
     this.#loopGeneration += 1;
     const myGeneration = this.#loopGeneration;
 
@@ -2124,19 +2015,6 @@ export function registryServersForClaude(registry: McpRegistry | undefined): Rec
     }
   }
   return out;
-}
-
-/** How long a turn waits for its query's MCP servers to change before going on. */
-const MCP_SET_TIMEOUT_MS = 10_000;
-
-function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  return Promise.race([
-    p.finally(() => clearTimeout(timer)),
-    new Promise<T>((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
-    }),
-  ]);
 }
 
 /** User servers minus those codeoid owns now — by URL: a server of the same

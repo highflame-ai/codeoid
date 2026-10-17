@@ -26,7 +26,7 @@ import type { Store } from "./store.js";
 import { createPushTransport, PushService } from "./push/index.js";
 import { hasScope, SCOPES } from "../protocol/scopes.js";
 import { applyPatches, getManifest, getSnapshot, previewPatches, readMcpServerEntry, writeMcpServerEntry } from "./settings/store.js";
-import { adoptability, adoptableName, adoptedEntry, findClaudeMcpServers, fromRepoFile, isDaemonEndpoint, isSameAdoption, registryConflict } from "./mcp/adopt.js";
+import { adoptability, adoptableName, adoptedEntry, adoptionRefusal, claudeMcpServers, fromRepoFile, isSameAdoption } from "./mcp/adopt.js";
 import { canonicalFromTranscript, turnIndexFromHistory } from "./canonical-restore.js";
 import { BackendLoginBroker, BackendLoginError, redact } from "./auth/backend-login.js";
 import { RateLimiter } from "./rate-limit.js";
@@ -1559,9 +1559,10 @@ mcpHub: this.#mcpHub,
           ...s,
           ...(liveStatus !== undefined ? { liveStatus } : {}),
           ...(liveTools !== undefined ? { liveTools } : {}),
+          ...(fromRepoFile(s) ? { projectFile: true as const } : {}),
           ...(adopted
             ? { adopted: true as const }
-            : urlsByName.get(s.name)!.size === 1 && this.#offerAdoption(s, liveStatus, auth)
+            : urlsByName.get(s.name)!.size === 1 && this.#offerAdoption(s, snapshot.mcpServers, liveStatus, auth)
               ? { adoptable: true as const }
               : {}),
         };
@@ -2275,13 +2276,11 @@ mcpHub: this.#mcpHub,
    * isn't offered a sign-in it may not support. A repo's own file's server
    * only once Claude has reported it (approved it).
    */
-  #offerAdoption(s: ClaudeConfigMcpServer, liveStatus: string | undefined, auth: AuthContext): boolean {
+  #offerAdoption(s: ClaudeConfigMcpServer, all: readonly ClaudeConfigMcpServer[], liveStatus: string | undefined, auth: AuthContext): boolean {
     // Only to someone adopt would accept, and only what adopt would take.
     if (!this.#mcpOAuth || !this.#mcpRegistry || s.liveOnly) return false;
     if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE) || auth.delegationDepth > 0) return false;
-    const can = adoptability(s);
-    if (!adoptableName(s.name).ok || !can.ok || registryConflict(this.#mcpRegistry, s.name, can.url)) return false;
-    if (isDaemonEndpoint(can.url, this.#daemonOrigins())) return false;
+    if (adoptionRefusal(s, all, this.#mcpRegistry, this.#daemonOrigins())) return false;
     // A sign-in that the CLI can't run — not any failure: a server that's
     // merely down would only lose its working copy everywhere.
     return liveStatus === "needs-auth";
@@ -2327,7 +2326,8 @@ mcpHub: this.#mcpHub,
     if (!named.ok) return fail("refused", named.reason);
 
     // Which entry: the one at the URL the caller was shown, else the only one.
-    const candidates = await findClaudeMcpServers(name, workdir);
+    const all = await claudeMcpServers(workdir);
+    const candidates = all.filter((c) => c.name === name);
     const atUrl = msg.url !== undefined ? candidates.filter((c) => c.url === msg.url) : candidates;
     if (atUrl.length === 0) {
       return fail(
@@ -2345,20 +2345,13 @@ mcpHub: this.#mcpHub,
     source = found.path;
     const can = adoptability(found);
     if (!can.ok) return fail("refused", can.reason);
-    if (isDaemonEndpoint(can.url, this.#daemonOrigins())) return fail("refused", `${name} is one of this daemon's own endpoints`);
-    // Every entry at that address must be adoptable: a repo's header-less
-    // copy mustn't stand in for the user's own header-authorized server.
-    const otherwise = atUrl.map(adoptability).find((r) => !r.ok);
-    if (otherwise && !otherwise.ok) return fail("refused", otherwise.reason);
+    const refusal = adoptionRefusal(found, all, registry, this.#daemonOrigins());
+    if (refusal) return fail("refused", refusal);
     // A repo's file can name any address (and the CLI connects it unasked):
     // adopted only when the caller names the URL — consent to that address.
     if (fromRepoFile(found) && msg.url === undefined) {
       return fail("unconfirmed", `${name} comes from this project's own files, which chose its address; to adopt it, name that URL (${can.url})`);
     }
-    // Never replace another server: an entry of this name at another URL,
-    // however it got there, or one whose tools would share these names.
-    const conflict = registryConflict(registry, name, can.url);
-    if (conflict) return fail("conflict", conflict);
     const reply = (alreadyAdopted: boolean): DaemonMessage => ({
       type: "mcp.adopt.result",
       requestId: msg.id,

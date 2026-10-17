@@ -38,11 +38,6 @@ let sdkInterruptThrows = false;
 let mcpStatuses: Array<Record<string, unknown>> = [];
 let mcpReconnects: string[] = [];
 let mcpReconnectError: Error | null = null;
-let mcpServerSets: Array<Record<string, unknown>> = [];
-/** When set, setMcpServers waits for it (a slow swap) / fails with it. */
-let mcpSetGate: Promise<void> | null = null;
-let mcpSetError: Error | null = null;
-let interruptCalls = 0;
 
 function makeMockQuery() {
   const err = sdkThrowError;
@@ -61,7 +56,6 @@ function makeMockQuery() {
       };
     },
     interrupt: async () => {
-      interruptCalls += 1;
       if (sdkInterruptThrows) throw new Error("interrupt unsupported");
     },
     supportedModels: async () => [{ value: "claude-opus-4", displayName: "Claude Opus 4" }],
@@ -70,12 +64,6 @@ function makeMockQuery() {
       if (mcpReconnectError) throw mcpReconnectError;
     },
     mcpServerStatus: async () => mcpStatuses,
-    setMcpServers: async (servers: Record<string, unknown>) => {
-      mcpServerSets.push(servers);
-      if (mcpSetGate) await mcpSetGate;
-      if (mcpSetError) throw mcpSetError;
-      return { added: Object.keys(servers), removed: [], errors: {} };
-    },
   };
 }
 
@@ -1795,12 +1783,13 @@ describe("ClaudeProvider – OAuth registry servers (#390)", () => {
     expect(withoutServers(user, [])).toBe(user);
   });
 
-  it("mounts codeoid's copy once signed in — live, no rebuild — and denies the CLI's", async () => {
+  it("mounts codeoid's copy once signed in, denies the CLI's, and rebuilds on a sign-in change", async () => {
     const { McpServerSchema } = await import("../config.js");
     const { McpRegistry } = await import("../daemon/mcp/registry.js");
     const registry = new McpRegistry({ notes: McpServerSchema.parse({ url: "https://notes.example.com/mcp", oauth: true }) }, { memoryEnabled: false });
     let signedIn = false;
-    const hub = { signedIn: () => signedIn, credentialStamp: () => (signedIn ? "s1" : undefined) } as never;
+    let stamp = "1";
+    const hub = { signedIn: () => signedIn, credentialStamp: () => (signedIn ? stamp : undefined) } as never;
     const provider = new ClaudeProvider({
       sessionId: "test-session",
       initialBackingId: "test-backing",
@@ -1833,140 +1822,19 @@ describe("ClaudeProvider – OAuth registry servers (#390)", () => {
     expect(queryCallCount).toBe(1); // nothing changed: warm
 
     signedIn = true;
-    mcpServerSets = [];
     turn("t3");
-    await Bun.sleep(5);
-    expect(queryCallCount).toBe(1); // a sign-in doesn't restart the CLI (its background work survives)...
-    expect(mcpServerSets).toHaveLength(1); // ...the live query's servers are swapped instead
-    expect(mcpServerSets[0]!.notes).toMatchObject({ type: "sdk" });
+    expect(queryCallCount).toBe(2); // the sign-in rebuilt it (same conversation, resumed)
+    expect(options().mcpServers?.notes).toMatchObject({ type: "sdk" });
     turn("t4");
-    await Bun.sleep(5);
-    expect(mcpServerSets).toHaveLength(1); // nothing changed since
+    expect(queryCallCount).toBe(2); // nothing changed: warm
+    // Signed out and back in between turns (say after a revoked token): a
+    // fresh connection, though "signed in" reads the same either side.
+    stamp = "2";
+    turn("t5");
+    expect(queryCallCount).toBe(3);
 
     openGate();
     await provider.teardown();
-  });
-});
-
-describe("ClaudeProvider – swapping a live query's MCP servers (#390)", () => {
-  let openGate: () => void = () => {};
-  let signedIn = false;
-  let stamp = "1";
-  beforeEach(() => {
-    sdkMessages = [];
-    sdkThrowError = null;
-    capturedQueryOpts = null;
-    queryCallCount = 0;
-    mcpServerSets = [];
-    mcpSetGate = null;
-    mcpSetError = null;
-    signedIn = false;
-    stamp = "1";
-    interruptCalls = 0;
-    mcpReconnects.length = 0;
-    sdkGate = new Promise<void>((r) => {
-      openGate = r;
-    });
-  });
-
-  async function provider(): Promise<ClaudeProvider> {
-    const { McpServerSchema } = await import("../config.js");
-    const { McpRegistry } = await import("../daemon/mcp/registry.js");
-    return new ClaudeProvider({
-      sessionId: "test-session",
-      initialBackingId: "test-backing",
-      workspaceId: "ws_test",
-      tenant: { accountId: "acc", projectId: "proj" },
-      mcpRegistry: new McpRegistry({ notes: McpServerSchema.parse({ url: "https://notes.example.com/mcp", oauth: true }) }, { memoryEnabled: false }),
-      mcpHub: { signedIn: () => signedIn, credentialStamp: () => (signedIn ? stamp : undefined) } as never,
-      store: {
-        audit: () => {},
-        getClaudeCodeSessionId: () => null,
-        setClaudeCodeSessionId: () => {},
-        getSkillCommandGrants: () => new Map<string, boolean>(),
-        setSkillCommandGrant: () => {},
-      } as never,
-    });
-  }
-  const turn = (p: ClaudeProvider, msg: string) =>
-    p.runTurn({ history: [], userMessage: msg, workdir: "/tmp", canUseTool: async () => ({ behavior: "allow" as const }) });
-  const delivered = () => (capturedQueryOpts?.prompt as { size: number }).size;
-  const settle = () => Bun.sleep(5);
-
-  it("a turn's message waits for the swap, then goes — in order", async () => {
-    const p = await provider();
-    turn(p, "t1");
-    expect(delivered()).toBe(1);
-    let release!: () => void;
-    mcpSetGate = new Promise((r) => {
-      release = r;
-    });
-    signedIn = true;
-    turn(p, "t2");
-    await settle();
-    expect(mcpServerSets).toHaveLength(1);
-    expect(delivered()).toBe(1); // held: the CLI must see the new servers first
-    release();
-    await settle();
-    expect(delivered()).toBe(2);
-    expect(queryCallCount).toBe(1);
-    openGate();
-    await p.teardown();
-  });
-
-  it("an interrupt while the message is held stops it as soon as it's delivered", async () => {
-    const p = await provider();
-    turn(p, "t1");
-    let release!: () => void;
-    mcpSetGate = new Promise((r) => {
-      release = r;
-    });
-    signedIn = true;
-    const run = turn(p, "t2");
-    await settle();
-    await run.interrupt();
-    expect(interruptCalls).toBe(1); // whatever the CLI is running now
-    release();
-    await settle();
-    // Delivered and stopped at once: the turn ends the usual way (as
-    // interrupted, its seed handled), not with a made-up result.
-    expect(delivered()).toBe(2);
-    expect(interruptCalls).toBe(2);
-    openGate();
-    await p.teardown();
-  });
-
-  it("a server signed in to again is reconnected — the swap alone keeps its old connection", async () => {
-    const p = await provider();
-    signedIn = true;
-    turn(p, "t1"); // mounted with sign-in 1
-    stamp = "2"; // signed out and back in between turns
-    turn(p, "t2");
-    await settle();
-    expect(mcpServerSets).toHaveLength(1);
-    expect(mcpReconnects).toEqual(["notes"]);
-    turn(p, "t3");
-    await settle();
-    expect(mcpReconnects).toEqual(["notes"]); // once
-    openGate();
-    await p.teardown();
-  });
-
-  it("a swap that fails is tried again on the next turn", async () => {
-    const p = await provider();
-    turn(p, "t1");
-    mcpSetError = new Error("boom");
-    signedIn = true;
-    turn(p, "t2");
-    await settle();
-    expect(mcpServerSets).toHaveLength(1);
-    mcpSetError = null;
-    turn(p, "t3");
-    await settle();
-    expect(mcpServerSets).toHaveLength(2); // retried, though nothing changed since
-    expect(mcpServerSets[1]!.notes).toMatchObject({ type: "sdk" });
-    openGate();
-    await p.teardown();
   });
 });
 

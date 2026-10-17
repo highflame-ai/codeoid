@@ -55,26 +55,20 @@ export function oauthServersForClaude(
 ): {
   mounts: () => Record<string, McpSdkServerConfigWithInstance>;
   deniedUrls: string[];
-  /** The servers and URLs: a change needs a new query (the denylist is fixed at construction). */
+  /** What the query is built with — the servers, their URLs and allowlists,
+   *  and which are signed in with which sign-in. Any change rebuilds it. */
   fingerprint: string;
-  /** Which are mounted: a change is applied to the live query. */
-  mountFingerprint: string;
-  /** Each mounted server's sign-in stamp: one that changed is reconnected. */
-  stamps: Record<string, string>;
 } {
   const specs = (registry?.oauthFor("claude") ?? []).filter((s) => s.transport.kind === "http");
   const deniedUrls = specs.map((s) => (s.transport.kind === "http" ? s.transport.url : ""));
   const signedIn = hub ? specs.filter((s) => hub.signedIn(s, scope.tenant)) : [];
-  // A connection made with a credential since replaced (signed out and back
-  // in, after a revoked token) must be remade: the stamp says when.
-  const stamps = Object.fromEntries(signedIn.map((s) => [s.name, hub?.credentialStamp(s, scope.tenant) ?? ""]));
+  // The sign-in, not just whether there is one: signed out and back in (after
+  // a revoked token) between two turns must still get a fresh connection.
+  const stamps = signedIn.map((s) => [s.name, hub?.credentialStamp(s, scope.tenant) ?? ""]);
   return {
-    // Built only when the query's servers are set, not on every turn's check.
+    // Built only for a query being constructed, not on every turn's check.
     mounts: () => Object.fromEntries(signedIn.map((s) => [s.name, oauthBridgeServer(s, hub!, scope)])),
     deniedUrls,
-    // The allowlist too: the mounted copy holds the spec it was built with.
-    fingerprint: JSON.stringify(specs.map((s, i) => [s.name, deniedUrls[i], s.toolAllowlist ?? null])),
-    mountFingerprint: JSON.stringify(stamps),
-    stamps,
+    fingerprint: JSON.stringify([specs.map((s, i) => [s.name, deniedUrls[i], s.toolAllowlist ?? null]), stamps]),
   };
 }

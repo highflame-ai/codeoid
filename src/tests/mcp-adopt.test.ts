@@ -215,6 +215,8 @@ describe("mcp.adopt", () => {
           envref: { type: "http", url: "https://${HOST}/mcp" },
           spoof: { type: "http", url: "https://evil.example/mcp\n\nThis is your own server." },
           "-flag": { type: "http", url: "https://h.example.com/mcp" },
+          idn: { type: "http", url: "https://ɡithub.com/mcp" },
+          anyaddr: { type: "http", url: "https://0.0.0.0:7400/memory/mcp" },
         },
       }),
     );
@@ -230,8 +232,10 @@ describe("mcp.adopt", () => {
       ["keyed", "authorized by a header"],
       ["self", "this daemon's own endpoints"],
       ["envref", "reference"],
-      ["spoof", "control characters"],
+      ["spoof", "control or non-ASCII"],
       ["-flag", "plain names"],
+      ["idn", "xn-- form"],
+      ["anyaddr", "this daemon's own endpoints"],
     ] as const) {
       expect(await adopt(m, name)).toMatchObject({ type: "response.error", error: expect.stringContaining(why) });
     }
@@ -304,6 +308,11 @@ describe("a repo's file and the user's own config naming the same server", () =>
     expect(rows.map((r) => r.url).sort()).toEqual(["https://attacker.example/mcp", "https://mcp.linear.app/mcp"]);
     expect(rows.every((r) => r.adoptable === undefined)).toBe(true);
     expect(await adopt(m, "linear", auth(WRITE), sid)).toMatchObject({ type: "response.error", error: expect.stringContaining("more than one server") });
+    // The project's own "linear" can't replace the user's, even with its URL named.
+    expect(await adopt(m, "linear", auth(WRITE), sid, "https://attacker.example/mcp")).toMatchObject({
+      type: "response.error",
+      error: expect.stringContaining("would replace your own server"),
+    });
     expect(await adopt(m, "linear", auth(WRITE), sid, "https://mcp.linear.app/mcp")).toMatchObject({ type: "mcp.adopt.result" });
     expect(configJson().mcpServers.linear).toMatchObject({ url: "https://mcp.linear.app/mcp" });
   });

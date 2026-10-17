@@ -12,9 +12,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   A remote OAuth server in Claude's own config (`~/.claude.json`, a `.mcp.json`) could only be signed in to through `/mcp` in a Claude Code terminal, so in a codeoid session it just reported "needs authentication".
   codeoid can now adopt it: "Sign in with codeoid" in the capabilities drawer, or `codeoid mcp adopt <server>` and `codeoid mcp signin <server>`, puts the same URL in codeoid's registry and runs codeoid's own sign-in, from any frontend.
   Claude sessions then use codeoid's copy, mounted in-process in front of the daemon's MCP client so the token never reaches the agent, and the CLI is told not to connect its own.
-  OAuth registry servers now reach Claude at all, not only the daemon-run backends; a server that needs sign-in points at adopting it, with the command that finds it.
+  OAuth registry servers now reach Claude at all, not only the daemon-run backends; a server that needs sign-in points at adopting it (for someone who may), with the command that finds it.
   Adopting is daemon-wide, so it is confirmed and bounded: plain names only (never one of codeoid's own), `https` URLs without credentials or wildcards, never over another server, a project's own server only with its URL named (`--url`), `settings:write` on a token's own, every attempt audited.
-  Signing in or out changes a running session's servers without restarting it; `codeoid mcp signin --callback-url` finishes a sign-in without a terminal.
+  Signing in or out applies to running sessions from their next turn; a refresh the server refuses signs the server out (Settings offers Connect), one that merely fails keeps the sign-in; `codeoid mcp signin --callback-url` finishes a sign-in without a terminal.
   codeoid never reads or writes the Claude CLI's credentials.
 
 - **Forks, backend switches and rewinds continue the conversation natively on
