@@ -102,6 +102,9 @@ CODEOID_MCP_CONTROL_ACTIONS=false       # also allow create / send / interrupt /
 CODEOID_ROUTINES_ENABLED=true           # run the scheduler and accept routine commands
 CODEOID_ROUTINES_MAX_CONCURRENT=2       # routine runs executing at once, across all routines
 
+# Forks, backend switches and rewinds (docs/FEATURES.md#how-a-fork-switch-or-rewind-carries-the-conversation)
+CODEOID_NATIVE_CONTINUATION=true        # hand Claude/Codex the conversation in their own form; false = text transcript
+
 # Memory
 CODEOID_MEMORY=1                        # default: on; set to 0 to disable
 CODEOID_MEMORY_DB_PATH=~/.codeoid/memory.db

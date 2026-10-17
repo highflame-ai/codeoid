@@ -200,6 +200,73 @@ export interface NormalizedTurnResult {
   stopReason?: string;
   isError?: boolean;
   errorMessage?: string;
+  /**
+   * Where this turn ends in the backend's OWN record of the conversation, for
+   * a backend that can later fork or resume from that point natively (#387).
+   * Stamped on the canonical turn, so a fork, rewind or restart can continue
+   * the backend's own conversation instead of a rendered transcript.
+   */
+  nativeRef?: NativeTurnRef;
+}
+
+/**
+ * A point in a backend's native conversation: the backing session/thread and
+ * the backend's id for the last entry of a turn in it (a Claude transcript
+ * entry uuid, a Codex turn id). Opaque to everything but the provider that
+ * minted it.
+ */
+export interface NativeTurnRef {
+  backingId: string;
+  ref: string;
+  /**
+   * The working directory the backing session ran in, when the backend files
+   * sessions by it (Claude): a fork looks the source up there and nowhere else.
+   */
+  dir?: string;
+  /**
+   * Some tool output in this backing session was redacted by a tool_result
+   * hook: the backend's own record holds the original, so this point must not
+   * be forked natively. Stamped by the session on every later turn of the
+   * backing, so it survives history that no longer shows the redacted call.
+   */
+  redacted?: boolean;
+}
+
+/** What a session asks a provider when it hands it an existing conversation. */
+export interface NativeContinuationRequest {
+  /** The conversation to continue, oldest first. */
+  history: readonly CanonicalTurn[];
+  /**
+   * Set when the history's last turn ran on THIS backend and it recorded where
+   * that turn ends: the provider may fork its own conversation there, which
+   * loses nothing (reasoning included).
+   */
+  forkFrom?: NativeTurnRef;
+  /** Char budget for history the provider builds itself (sized to the target window). */
+  maxChars: number;
+  /**
+   * False when the history holds turns rebuilt from a displayed transcript:
+   * the provider may fork, but must not build native history from them —
+   * resolve null instead (the session uses the transcript).
+   */
+  allowHistory?: boolean;
+  /** Where the continued session runs. */
+  workdir: string;
+}
+
+/** A native continuation that took. */
+export interface NativeContinuationResult {
+  /** `fork`: the backend's own conversation, forked. `history`: native history codeoid built. */
+  via: "fork" | "history";
+  /**
+   * The backend's new backing session/thread id, when it exists already: the
+   * session persists it and treats the backend as holding the conversation.
+   * Absent for a backend that builds it on its first turn (Codex needs that
+   * turn's instructions); until then a restart re-runs the continuation.
+   */
+  backingId?: string;
+  /** Set when building the history dropped older turns to fit the budget. */
+  truncation?: HistorySeedResult;
 }
 
 // ── Provider event stream ─────────────────────────────────────────────────────
@@ -243,6 +310,8 @@ export type ProviderEvent =
       /** The backend refused this call itself, never asking codeoid's gate
        *  (codex declining an approval it can't show, #369) — audited. */
       declinedByBackend?: boolean;
+      /** A tool_result hook replaced `output`: the backend's own record still holds the original. */
+      redacted?: boolean;
     }
   | { type: "subagent_start"; agentId: string; agentType: string }
   | { type: "subagent_stop"; agentId: string }
@@ -506,6 +575,15 @@ export interface AgentProvider {
    * full history natively every turn).
    */
   seedText?(block: string): void;
+  /**
+   * Hand this (fresh) backend an existing conversation in its OWN native form,
+   * instead of a transcript in the first prompt (#387): fork its own
+   * conversation at `forkFrom` when given, else build native history from
+   * `history`. Resolves null when the backend can't, and the session falls
+   * back to the transcript seed; a throw is treated the same. On success the
+   * backend's backing id is `result.backingId` and its next turn resumes it.
+   */
+  continueNatively?(req: NativeContinuationRequest): Promise<NativeContinuationResult | null>;
   /**
    * True when codeoid's memory recall tools (recall/recall_file/timeline/
    * get_episode) are mounted for this provider+session, so the model can page

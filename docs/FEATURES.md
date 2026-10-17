@@ -17,6 +17,27 @@ A session's *harness* (the agent backend it drives) is chosen when the session i
 
 Pick a harness when you create a session — the New Session modal in the web UI or TUI shows the choice whenever more than one backend is registered — or **fork across backends**: fork a Claude session onto Codex and it resumes with the parent's full conversation, so one backend can pick up exactly where another left off. A backend that isn't authenticated or installed simply doesn't appear as an option (no cryptic first-turn 401s).
 
+#### How a fork, switch or rewind carries the conversation
+
+Files are the checkpoint's business: a fork in its own worktree starts from the turn's checkpoint, and a rewind can restore files too.
+The conversation is handed over in the backend's own form wherever the backend allows it, and as a text transcript only where it doesn't:
+
+| Going to | Same backend (fork, rewind) | From another backend (fork, switch) |
+| --- | --- | --- |
+| `claude` | Claude forks its own session at that turn: nothing converted or cut, reasoning included | codeoid writes the conversation as a Claude session, real tool calls and results, and checks it with the SDK's own reader before using it |
+| `codex` | Codex forks its own thread through that turn | codeoid injects the conversation into a new thread as Codex's own history items |
+| `openai`, `gemini`, `llamacpp` | the full history, natively, every turn | the full history, natively, every turn |
+| `pi`, `gemini-cli`, `qwen` | a text transcript in the first prompt | a text transcript in the first prompt |
+
+Reasoning never crosses vendors (Claude's is signed, OpenAI's encrypted).
+History codeoid builds that doesn't fit the target's window loses its oldest turns, with a notice; a native fork isn't used when the source was already running near the target's window, nor from a turn that ended in an error, so a fork is the way out of an overflowed session rather than a copy of it.
+On a fork or switch the session says which way it went (`↪ … continues its own conversation`, `↪ … was given … as its own history`, or `↪ … carried as a text transcript`), and if a native path fails it falls back to the transcript and says so.
+History a `tool_result` [hook](hooks.md) redacted is never forked natively — a fork would copy the backend's unredacted log — so codeoid's redacted record is used instead.
+Turns rebuilt from a displayed transcript, such as an imported session, are never built into native history (they aren't the model's own words, so they stay quoted); a native fork from a real turn after them is still used.
+Like every Claude session codeoid runs, a session it writes or forks for Claude lives under `projects/` in `CLAUDE_CONFIG_DIR` (default `~/.claude`), and is subject to Claude Code's own `cleanupPeriodDays`.
+`session.nativeContinuation: false` (or `CODEOID_NATIVE_CONTINUATION=false`) keeps everything on the transcript.
+Native continuation is tried before the `CODEOID_CONTEXT_STRATEGY` seed (`transcript` or `vws`), which still applies to every backend it doesn't cover.
+
 Memory, identity, attachments, the multi-frontend clients, and device handoff are all provider-agnostic. A few features lean on Claude Code internals and so apply only to the `claude` harness: backing-session [auto-rotation](#context-reduction-stack), Claude Code slash-command [pass-through](#terminal-client), and `.claude/commands` workspace commands.
 
 ### Terminal client

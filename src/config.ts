@@ -446,6 +446,13 @@ const SessionSchema = z
     seedBudgetChars: z.number().int().min(0).default(0),
     seedCharsPerToken: z.number().positive().default(2),
     seedWindowFraction: z.number().gt(0).lt(1).default(0.7),
+    /**
+     * Hand the conversation to backends that can take it in their own form
+     * (#387) — Claude and Codex fork their own conversation at the turn, or
+     * take native history codeoid builds — instead of the transcript above.
+     * The transcript is still the fallback. Off = transcript everywhere.
+     */
+    nativeContinuation: z.boolean().default(true),
   })
   .default({
     turnStallTimeoutMs: 300_000,
@@ -455,6 +462,7 @@ const SessionSchema = z
     seedBudgetChars: 0,
     seedCharsPerToken: 2,
     seedWindowFraction: 0.7,
+    nativeContinuation: true,
   })
   // Enforce the "SDK signals first" contract across BOTH fields — not just the
   // defaults. An env override / config file could otherwise set the MCP timeout
@@ -1275,6 +1283,8 @@ export interface CodeoidConfig {
     seedCharsPerToken?: number;
     /** Fraction (0..1) of the target window the history seed may fill. Defaults to 0.7 when omitted. */
     seedWindowFraction?: number;
+    /** Continue forks / switches / rewinds in the backend's own conversation where it can (#387). Default true. */
+    nativeContinuation?: boolean;
   };
   /**
    * The per-tenant conductor session (fleet supervisor). Optional in the
@@ -1537,6 +1547,7 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   { env: "CODEOID_SEED_BUDGET_CHARS", path: "session.seedBudgetChars", kind: "int" },
   { env: "CODEOID_SEED_CHARS_PER_TOKEN", path: "session.seedCharsPerToken", kind: "float" },
   { env: "CODEOID_SEED_WINDOW_FRACTION", path: "session.seedWindowFraction", kind: "float" },
+  { env: "CODEOID_NATIVE_CONTINUATION", path: "session.nativeContinuation", kind: "boolean" },
   // Embed-SSO trusted framing origins (comma-separated). Each is an exact
   // origin (scheme://host[:port]) permitted to frame the web UI and hand it a
   // credential via the URL hash. Empty ⇒ hash handoff disabled (safe default).
