@@ -344,7 +344,9 @@ const McpReconnect: Component<{ sessionId: string; server: string }> = (props) =
 const canReconnect = (status: string | undefined) => status === "failed" || status === "needs-auth";
 
 const McpList: Component<{ items: ClaudeConfigMcpServer[]; sessionId: string | null }> = (props) => {
-  // A reconnect's note is about that outage: once the server isn't down, drop it.
+  // A reconnect's note is about that outage: a fresh look at the list (the
+  // drawer opening) starts without old ones, and a server no longer down drops its own.
+  onMount(() => setMcpNotes({}));
   createEffect(() => {
     const sid = props.sessionId;
     if (!sid) return;

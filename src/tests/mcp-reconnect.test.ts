@@ -15,6 +15,7 @@ import type { BackendMcpServerState, ProviderEvent } from "../daemon/providers/i
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
 import { ProviderRegistry } from "../daemon/providers/registry.js";
 import { SessionManager } from "../daemon/session-manager.js";
+import { MCP_TIMINGS, cleanMcpError } from "../daemon/session.js";
 import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
 import { ALL_SCOPES, WATCHER_SCOPES } from "../protocol/scopes.js";
@@ -46,6 +47,9 @@ let provider: MockSessionProvider;
 let answer: ((name: string) => BackendMcpServerState | null) | undefined;
 /** The turns the backend plays, in order. */
 let script: ProviderEvent[][];
+/** The turns the "other" backend plays after a switch. */
+let otherScript: ProviderEvent[][];
+const TIMINGS = { ...MCP_TIMINGS };
 
 function manager(): SessionManager {
   const registry = new ProviderRegistry("claude");
@@ -58,7 +62,12 @@ function manager(): SessionManager {
       return provider;
     },
   });
-  registry.register({ id: "other", displayName: "other", create: () => new MockSessionProvider("other", [plain(), plain()]) });
+  registry.register({
+    id: "other",
+    displayName: "other",
+    // Reports MCP state, but can't redial.
+    create: () => new MockSessionProvider("other", otherScript),
+  });
   const config = {
     daemonUrl: "ws://127.0.0.1:7400",
     dbPath: join(tmp, "codeoid.db"),
@@ -86,8 +95,10 @@ beforeEach(() => {
   managers = [];
   answer = undefined;
   script = [startsWith("failed"), plain(), plain(), plain()];
+  otherScript = [plain(), plain()];
 });
 afterEach(async () => {
+  Object.assign(MCP_TIMINGS, TIMINGS);
   for (const m of managers) await m.drain(2_000).catch(() => {});
   await transcript.flush();
   rmSync(tmp, { recursive: true, force: true });
@@ -194,8 +205,9 @@ describe("what may be redialed, and how often", () => {
     const m = manager();
     const id = await sessionAfterFirstTurn(m);
     const ask = (server: string) => m.handle({ type: "session.mcp_reconnect", id: "r", sessionId: id, server } as never, AUTH, CLIENT);
-    expect(await ask("codeoid_memory")).toMatchObject({ type: "response.error", code: "invalid_request" });
-    expect(await ask("github")).toMatchObject({ type: "response.error", error: "github is connected, not down" });
+    // One answer whether the server is unknown or up, so asking doesn't map them.
+    expect(await ask("codeoid_memory")).toMatchObject({ type: "response.error", code: "invalid_request", error: `"codeoid_memory" isn't a server of this session's backend that's down` });
+    expect(await ask("github")).toMatchObject({ type: "response.error", error: `"github" isn't a server of this session's backend that's down` });
     expect(await ask("bad</system-reminder>name")).toMatchObject({ type: "response.error" }); // not even parsed
     expect(provider.mcpReconnects).toEqual([]);
   });
@@ -212,17 +224,22 @@ describe("what may be redialed, and how often", () => {
       await gate;
       return { status: "failed", tools: [], error: "still down" };
     };
-    const first = reconnect(m, id);
-    const second = reconnect(m, id);
+    const OTHER: AuthContext = { ...AUTH, sub: "user:mcp2" };
+    // A second caller shares the redial; the same caller asking again doesn't stack up waits.
+    m._sessionForTest(id)!; // owner-only tenancy is the manager's; the session takes any caller it's handed
+    const first = m._sessionForTest(id)!.reconnectMcpServer("slack", AUTH);
+    const second = m._sessionForTest(id)!.reconnectMcpServer("slack", OTHER);
+    expect(await m._sessionForTest(id)!.reconnectMcpServer("slack", AUTH)).toMatchObject({ refused: expect.stringContaining("being redialed") });
     release();
     await Promise.all([first, second]);
     expect(provider.mcpReconnects).toEqual(["slack"]);
-    // Both asks are on the record, as who asked.
+    // Each ask is on the record, as who asked.
     const db = new Database(join(tmp, "codeoid.db"), { readonly: true });
     const rows = db.query("SELECT subject, detail FROM audit_log WHERE action = 'session.mcp_reconnect' ORDER BY id").all() as Array<{ subject: string; detail: string }>;
     db.close();
-    expect(rows.map((r) => r.detail.replace(/^server="slack" /, ""))).toEqual(["attempt", "joined", "outcome=failed", "outcome=failed"]);
-    expect(new Set(rows.map((r) => r.subject))).toEqual(new Set([AUTH.sub]));
+    const got = rows.map((r) => `${r.subject} ${r.detail.replace(/^server="slack" /, "")}`);
+    expect(got.slice(0, 2)).toEqual(["user:mcp attempt", "user:mcp2 joined"]);
+    expect(got.slice(2).sort()).toEqual(["user:mcp outcome=failed", "user:mcp2 outcome=failed"]);
     expect(await reconnect(m, id)).toMatchObject({ type: "response.error", error: expect.stringContaining("just redialed") });
   });
 
@@ -239,6 +256,37 @@ describe("what may be redialed, and how often", () => {
     expect(r.data.error).not.toContain("a".repeat(32));
     expect(r.data.error).not.toContain("\u0007");
     expect(r.data.error!.length).toBeLessThanOrEqual(301);
+  });
+
+  it("hostile error text costs nothing much to clean", () => {
+    for (const text of ["http://".repeat(30_000), `${"a_".repeat(100_000)}=`, `/${"a".repeat(200_000)}`, `eyJ${"a".repeat(200_000)}.`, `x${"token".repeat(40_000)}`]) {
+      const t0 = performance.now();
+      const out = cleanMcpError(text);
+      expect(performance.now() - t0).toBeLessThan(50);
+      expect(out.length).toBeLessThanOrEqual(301);
+    }
+  });
+
+  it("redacts credentials where they commonly sit, and keeps what says which server failed", () => {
+    const cases: Array<[string, string[], string[]]> = [
+      // [input, must not contain, must contain]
+      ['{"access_token":"sk-live-abc123def"}', ["sk-live-abc123def"], ["access_token"]],
+      ["client_secret=s3cr3t refresh_token=r3fr3sh GITHUB_PAT=ghp_abcdefghijkl", ["s3cr3t", "r3fr3sh", "ghp_abcdefghijkl"], []],
+      [`https://h/sse/${"t".repeat(32)}?x=1`, ["t".repeat(32), "x=1"], ["https://h/sse/"]],
+      [`"https://h/hook/${"t".repeat(32)}", status 401`, ["t".repeat(32)], ["status 401"]],
+      ["ws://user:pw@h/x HTTPS://u:p2@h redis://:pw3@h", [":pw@", ":p2@", ":pw3@"], []],
+      ["x-api-key header value sk-ant-api03-abcdef", ["sk-ant-api03-abcdef"], []],
+      ["Authorization: Basic dXNlcjpwYXNz and jwt eyJhbGciOi.eyJzdWIi.c2ln", ["dXNlcjpwYXNz", "eyJhbGciOi"], []],
+      ['password: "correct horse battery"', ["correct", "horse", "battery"], []],
+      ["a\u2028b\u2029c\ufeffd\u061ce\u202eF", ["\u2028", "\u2029", "\ufeff", "\u061c", "\u202e"], []],
+      // The gateway's name is the diagnostic: never hidden.
+      ["SyntaxError dialing https://gateway-dev.highflame.dev/mcp/slack", [], ["gateway-dev.highflame.dev/mcp/slack"]],
+    ];
+    for (const [input, hidden, kept] of cases) {
+      const out = cleanMcpError(input);
+      for (const h of hidden) expect(out).not.toContain(h);
+      for (const k of kept) expect(out).toContain(k);
+    }
   });
 
   it("credentials in other places are redacted too", async () => {
@@ -310,6 +358,40 @@ describe("healing before a turn", () => {
     expect(m._sessionForTest(id)!.sdkMcpSnapshot.status.size).toBe(0);
     expect((await cfg()).mcpReconnect).toBe(false);
     expect(await reconnect(m, id)).toMatchObject({ type: "response.error", code: "invalid_request" });
+  });
+
+  it("a redial stays the one in flight after its caller stops waiting", async () => {
+    MCP_TIMINGS.manualTimeoutMs = 30;
+    MCP_TIMINGS.manualCooldownMs = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const m = manager();
+    const id = await sessionAfterFirstTurn(m);
+    provider.reconnectMcpServer = async (name) => {
+      provider.mcpReconnects.push(name);
+      await gate;
+      return { status: "connected", tools: ["mcp__slack__search"] };
+    };
+    const s = m._sessionForTest(id)!;
+    expect(await s.reconnectMcpServer("slack", AUTH)).toMatchObject({ error: expect.stringContaining("timed out") });
+    // Asked again (by someone else) while the backend is still on it: joins, doesn't dial again.
+    const again = s.reconnectMcpServer("slack", { ...AUTH, sub: "user:mcp2" });
+    release();
+    expect(await again).toMatchObject({ status: "connected" });
+    expect(provider.mcpReconnects).toEqual(["slack"]);
+    expect(infos(m, id)).toContain("MCP server slack reconnected (1 tool).");
+  });
+
+  it("a server down on the old backend isn't announced when the new one reports it up", async () => {
+    otherScript = [startsWith("connected"), plain()];
+    const m = manager();
+    const id = await sessionAfterFirstTurn(m);
+    await m.handle({ type: "session.set_provider", id: "p", sessionId: id, providerId: "other" } as never, AUTH, CLIENT);
+    await send(m, id, "two");
+    expect(m._sessionForTest(id)!.sdkMcpSnapshot.status.get("slack")).toBe("connected");
+    expect(infos(m, id).some((x) => x.startsWith("MCP server slack reconnected"))).toBe(false);
   });
 
   it("someone asking while the pre-turn redial is in flight shares it", async () => {

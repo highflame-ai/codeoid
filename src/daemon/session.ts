@@ -1078,6 +1078,8 @@ export class Session {
   /** A manual redial in flight per server (single-flight), and when each was last asked for. */
   readonly #mcpInFlight = new Map<string, Promise<BackendMcpServerState | null>>();
   readonly #mcpManualAt = new Map<string, number>();
+  /** Who has joined each in-flight redial — each caller joins one at most once. */
+  readonly #mcpJoiners = new WeakMap<Promise<BackendMcpServerState | null>, Set<string>>();
   /** Bumped by every mcp_init: a redial that started before one must not overwrite it. */
   #mcpGeneration = 0;
 
@@ -1565,21 +1567,36 @@ export class Session {
    */
   async reconnectMcpServer(name: string, sender: AuthContext): Promise<McpReconnectResult | { unsupported: string } | { refused: string }> {
     const provider = this.#provider;
-    if (!provider.reconnectMcpServer) return { unsupported: `the ${provider.id} backend can't reconnect its MCP servers` };
-    // Only a server this backend reported, and only one that's down: never a
-    // name the CLI might connect that the user hasn't (a disabled server, an
-    // unapproved repo server), and never codeoid's own.
+    const refuse = (outcome: string, why: string) => {
+      this.#store.audit(sender.sub, "session.mcp_reconnect", this.id, `server=${JSON.stringify(name)} outcome=${outcome}`);
+      return { refused: why };
+    };
+    if (!provider.reconnectMcpServer) {
+      this.#store.audit(sender.sub, "session.mcp_reconnect", this.id, `server=${JSON.stringify(name)} outcome=unsupported`);
+      return { unsupported: `the ${provider.id} backend can't reconnect its MCP servers` };
+    }
+    // Only a server this backend reported as down: never a name the CLI might
+    // connect that the user hasn't (a disabled server, an unapproved repo
+    // server), and never one that's up (codeoid's own in-process servers are
+    // never down). One answer for both, so asking doesn't map the servers.
     const status = this.#sdkMcpStatus.get(name);
-    if (status === undefined) return { refused: `this session's backend has no MCP server named ${JSON.stringify(name)}` };
-    if (status !== "failed" && status !== "needs-auth") return { refused: `${name} is ${status}, not down` };
-    // One redial per server at a time (an automatic one included), and not
-    // again within a few seconds.
-    if (!this.#mcpInFlight.has(name)) {
+    if (status !== "failed" && status !== "needs-auth") {
+      return refuse("refused", `${JSON.stringify(name)} isn't a server of this session's backend that's down`);
+    }
+    // One redial per server at a time (an automatic one included), joined
+    // once per caller, and not started again within a few seconds.
+    const dial = this.#mcpInFlight.get(name);
+    if (dial) {
+      const joined = this.#mcpJoiners.get(dial) ?? new Set<string>();
+      if (joined.has(sender.sub)) return { refused: `${name} is being redialed — its result is on its way` };
+      joined.add(sender.sub);
+      this.#mcpJoiners.set(dial, joined);
+    } else {
       const last = this.#mcpManualAt.get(name) ?? 0;
-      if (Date.now() - last < MCP_MANUAL_COOLDOWN_MS) return { refused: `${name} was just redialed — try again in a few seconds` };
+      if (Date.now() - last < MCP_TIMINGS.manualCooldownMs) return refuse("cooldown", `${name} was just redialed — try again in a few seconds`);
       this.#mcpManualAt.set(name, Date.now());
     }
-    return this.#dialMcp(name, MCP_MANUAL_TIMEOUT_MS, sender.sub, "session.mcp_reconnect");
+    return this.#dialMcp(name, MCP_TIMINGS.manualTimeoutMs, sender.sub, "session.mcp_reconnect");
   }
 
   /**
@@ -1601,9 +1618,9 @@ export class Session {
     await Promise.allSettled(
       due.map((name) => {
         const prev = this.#mcpRetry.get(name);
-        const waitMs = Math.min((prev?.waitMs ?? MCP_RETRY_FIRST_MS / 2) * 2, MCP_RETRY_MAX_MS);
+        const waitMs = Math.min((prev?.waitMs ?? MCP_TIMINGS.retryFirstMs / 2) * 2, MCP_TIMINGS.retryMaxMs);
         this.#mcpRetry.set(name, { at: now + waitMs, waitMs });
-        return this.#dialMcp(name, MCP_RECONNECT_TIMEOUT_MS, SYSTEM_IDENTITY.sub, "session.mcp_heal");
+        return this.#dialMcp(name, MCP_TIMINGS.healTimeoutMs, SYSTEM_IDENTITY.sub, "session.mcp_heal");
       }),
     );
   }
@@ -1622,6 +1639,7 @@ export class Session {
     else {
       audit("attempt");
       dial = this.#startMcpDial(name);
+      this.#mcpJoiners.set(dial, new Set([who]));
     }
     const status = this.#sdkMcpStatus.get(name) ?? "failed";
     let state: BackendMcpServerState | null;
@@ -1643,7 +1661,7 @@ export class Session {
     const provider = this.#provider;
     const generation = this.#mcpGeneration;
     // A backend that never answers mustn't hold the server forever.
-    const dial = withTimeout(provider.reconnectMcpServer!(name), MCP_DIAL_CEILING_MS).then((state) => {
+    const dial = withTimeout(provider.reconnectMcpServer!(name), MCP_TIMINGS.dialCeilingMs).then((state) => {
       // A report taken since (a new backend process, a new turn) is newer than this.
       if (state && generation === this.#mcpGeneration && provider === this.#provider) this.#applyMcpState(name, state);
       return state;
@@ -1701,10 +1719,11 @@ export class Session {
    * backend switch nothing it reported applies any more.
    */
   #resetMcpState(opts: { backendChanged: boolean }): void {
+    // A redial still answering for the old process is out of date either way.
+    this.#mcpGeneration++;
     this.#mcpRetry.clear();
     this.#mcpManualAt.clear();
     if (!opts.backendChanged) return;
-    this.#mcpGeneration++;
     this.#sdkMcpStatus.clear();
     this.#sdkMcpTools.clear();
     this.#mcpBack.clear();
@@ -7008,30 +7027,60 @@ function sanitizeApprovalPatch(
   return undefined;
 }
 
-/** First automatic redial wait for a down MCP server; doubles per miss, up to the max (#389). */
-const MCP_RETRY_FIRST_MS = 30_000;
-const MCP_RETRY_MAX_MS = 15 * 60_000;
-/** How long a turn waits on its automatic redials (together) before starting without them. */
-const MCP_RECONNECT_TIMEOUT_MS = 8_000;
-/** A redial someone asked for: how long to wait on it, and how soon the same server may be asked again. */
-const MCP_MANUAL_TIMEOUT_MS = 20_000;
-const MCP_MANUAL_COOLDOWN_MS = 3_000;
-/** However long a backend takes, a redial stops holding its server after this. */
-const MCP_DIAL_CEILING_MS = 120_000;
-/** Server names that may appear in a prompt note. */
-const SAFE_MCP_NAME = /^[\w .:()-]{1,128}$/;
+/**
+ * MCP redial timings (#389). Mutable only so tests can shorten them; the
+ * daemon never changes them.
+ */
+export const MCP_TIMINGS = {
+  /** First automatic redial wait for a down server; doubles per miss, up to the max. */
+  retryFirstMs: 30_000,
+  retryMaxMs: 15 * 60_000,
+  /** How long a turn waits on its automatic redials (together) before starting without them. */
+  healTimeoutMs: 8_000,
+  /** A redial someone asked for: how long to wait on it, and how soon the same server may be asked again. */
+  manualTimeoutMs: 20_000,
+  manualCooldownMs: 3_000,
+  /** However long a backend takes, a redial stops holding its server after this. */
+  dialCeilingMs: 120_000,
+};
 
 /**
- * A backend's MCP error, fit to hand back: no control characters, query
- * strings and long token-like path segments redacted, bounded.
+ * Server names that may appear in a prompt note: plain identifiers, or a
+ * claude.ai connector's "claude.ai <words>". No other punctuation, so a name
+ * can't read as an instruction.
  */
-function cleanMcpError(raw: string): string {
+const SAFE_MCP_NAME = /^(?:[\w.-]{1,64}|claude\.ai [\w .-]{1,54})$/;
+
+/** Longest backend error text cleaned at all: every pattern below runs on at most this much. */
+const MCP_ERROR_SCAN_CHARS = 2_000;
+
+/**
+ * A backend's MCP error, fit to hand back: no control or direction-changing
+ * characters, credentials redacted wherever they commonly sit (URL userinfo,
+ * query strings and fragments, token-like path segments, JWTs, auth schemes,
+ * key=value / "key": "value" pairs, well-known key prefixes), bounded. The
+ * text comes from the server, so it's cut before any pattern runs.
+ */
+export function cleanMcpError(raw: string): string {
   const s = raw
-    .replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]+/g, " ")
-    .replace(/(https?:\/\/)[^/@\s]+@/g, "$1…@")
-    .replace(/(https?:\/\/[^\s?#]+)[?#][^\s]*/g, "$1?…")
-    .replace(/\b(bearer|token|api[_-]?key|key|secret|password)([=:\s]+)\S+/gi, "$1$2…")
-    .replace(/\/([A-Za-z0-9_.-]{24,})(?=[/\s]|$)/g, "/…");
+    .slice(0, MCP_ERROR_SCAN_CHARS)
+    .replace(/[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]+/g, " ")
+    // scheme://user:pass@ — any scheme
+    .replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^/@\s]*@/gi, "$1…@")
+    // JWTs, anywhere
+    .replace(/\beyJ[\w-]+\.[\w-]+(?:\.[\w-]*)?/g, "…")
+    // Authorization schemes
+    .replace(/\b(bearer|basic|token)\s+[^\s"',;)]+/gi, "$1 …")
+    // key=value, key: value, "key": "value" — the key may carry a prefix (access_token, client_secret, x-api-key)
+    .replace(
+      /(^|[^a-z0-9])([\w-]*(?:token|secret|password|passwd|pwd|api[_-]?key|apikey|key|pat|auth|credentials?))(["']?\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s"',;)}]+)/gi,
+      "$1$2$3…",
+    )
+    // well-known key formats
+    .replace(/\b(?:sk-[\w-]{8,}|sk_[a-z]+_\w{8,}|gh[pousr]_\w{8,}|github_pat_\w{8,}|xox[abprs]-[\w-]{8,}|AKIA[0-9A-Z]{16}|AIza[\w-]{20,})/g, "…")
+    // long token-like path segments, then query strings and fragments
+    .replace(/(?<![/:])\/[A-Za-z0-9_.~-]{24,}(?=[/\s?#"'),;]|$)/g, "/…")
+    .replace(/(\b[a-z][a-z0-9+.-]*:\/\/[^\s?#"']+)[?#][^\s"'),;]*/gi, "$1?…");
   return s.length > 300 ? `${s.slice(0, 300)}…` : s;
 }
 
