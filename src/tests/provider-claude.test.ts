@@ -774,6 +774,10 @@ describe("ClaudeProvider – reconnecting an MCP server (#389)", () => {
     const done = await live(p);
     mcpStatuses = [{ name: "claude.ai Google Drive", status: "connected", tools: [{ name: "search" }] }];
     expect((await p.reconnectMcpServer("claude.ai Google Drive"))?.tools).toEqual(["mcp__claude_ai_Google_Drive__search"]);
+    // Whether it's a connector is the backend's word, not the name's.
+    expect((await p.reconnectMcpServer("claude.ai Google Drive"))?.connector).toBeUndefined();
+    mcpStatuses = [{ name: "Drive", status: "needs-auth", source: "claudeai" } as never];
+    expect((await p.reconnectMcpServer("Drive"))?.connector).toBe(true);
     mcpStatuses = [];
     await done();
   });
@@ -1188,6 +1192,21 @@ describe("translateSDKMessage – system", () => {
     expect(events[0]).toMatchObject({
       tools: { "claude.ai Google Drive": ["mcp__claude_ai_Google_Drive__search"], "my.server": ["mcp__my_server__read"] },
     });
+  });
+
+  it("tools of servers that normalise alike go to neither; a longer name wins its own (#389)", () => {
+    const events = collectEmits({
+      type: "system",
+      subtype: "init",
+      mcp_servers: [
+        { name: "a.b", status: "connected" },
+        { name: "a_b", status: "connected" },
+        { name: "x", status: "connected" },
+        { name: "x__y", status: "connected" },
+      ],
+      tools: ["mcp__a_b__t", "mcp__x__one", "mcp__x__y__two"],
+    });
+    expect(events[0]).toMatchObject({ tools: { "a.b": [], a_b: [], x: ["mcp__x__one"], x__y: ["mcp__x__y__two"] } });
   });
 
   it("names MCP tools' server part the way the CLI does", () => {

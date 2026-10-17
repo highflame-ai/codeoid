@@ -5,6 +5,7 @@
  * drawer's button) and, before a turn, by itself — with backoff.
  */
 
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -149,11 +150,20 @@ describe("session.mcp_reconnect", () => {
 
   it("a claude.ai connector's sign-in is pointed at claude.ai, not the CLI", async () => {
     script = [startsWith("connected", { "claude.ai Google Drive": "needs-auth" }), plain()];
-    answer = () => ({ status: "needs-auth", tools: [] });
+    answer = () => ({ status: "needs-auth", tools: [], connector: true });
     const m = manager();
     const id = await sessionAfterFirstTurn(m);
     const r = (await m.handle({ type: "session.mcp_reconnect", id: "r", sessionId: id, server: "claude.ai Google Drive" } as never, AUTH, CLIENT)) as { data: McpReconnectResult };
     expect(r.data.error).toContain("claude.ai connector settings");
+  });
+
+  it("a server only named like a connector gets the CLI's sign-in guidance", async () => {
+    script = [startsWith("connected", { "claude.ai Gmail": "needs-auth" }), plain()];
+    answer = () => ({ status: "needs-auth", tools: [] }); // the backend doesn't say it's a connector
+    const m = manager();
+    const id = await sessionAfterFirstTurn(m);
+    const r = (await m.handle({ type: "session.mcp_reconnect", id: "r", sessionId: id, server: "claude.ai Gmail" } as never, AUTH, CLIENT)) as { data: McpReconnectResult };
+    expect(r.data.error).toContain("interactive Claude Code session");
   });
 
   it("the drawer lists servers the backend runs that no config file declares", async () => {
@@ -206,6 +216,12 @@ describe("what may be redialed, and how often", () => {
     release();
     await Promise.all([first, second]);
     expect(provider.mcpReconnects).toEqual(["slack"]);
+    // Both asks are on the record, as who asked.
+    const db = new Database(join(tmp, "codeoid.db"), { readonly: true });
+    const rows = db.query("SELECT subject, detail FROM audit_log WHERE action = 'session.mcp_reconnect' ORDER BY id").all() as Array<{ subject: string; detail: string }>;
+    db.close();
+    expect(rows.map((r) => r.detail.replace(/^server="slack" /, ""))).toEqual(["attempt", "joined", "outcome=failed", "outcome=failed"]);
+    expect(new Set(rows.map((r) => r.subject))).toEqual(new Set([AUTH.sub]));
     expect(await reconnect(m, id)).toMatchObject({ type: "response.error", error: expect.stringContaining("just redialed") });
   });
 
@@ -223,6 +239,19 @@ describe("what may be redialed, and how often", () => {
     expect(r.data.error).not.toContain("\u0007");
     expect(r.data.error!.length).toBeLessThanOrEqual(301);
   });
+
+  it("credentials in other places are redacted too", async () => {
+    const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2lnbmF0dXJlLXZhbHVlLWhlcmU";
+    answer = () => ({
+      status: "failed",
+      tools: [],
+      error: `at https://bob:hunter2@gw/mcp#access_token=frag1 /v/${jwt} Bearer tok-abc api_key=k-xyz \u202Eevil`,
+    });
+    const m = manager();
+    const id = await sessionAfterFirstTurn(m);
+    const { error } = ((await reconnect(m, id)) as { data: McpReconnectResult }).data;
+    for (const leak of ["hunter2", "frag1", jwt, "tok-abc", "k-xyz", "\u202E"]) expect(error).not.toContain(leak);
+  });
 });
 
 describe("healing before a turn", () => {
@@ -234,7 +263,7 @@ describe("healing before a turn", () => {
     expect(provider.mcpReconnects).toEqual(["slack"]); // github was connected: left alone
     expect(m._sessionForTest(id)!.sdkMcpSnapshot.status.get("slack")).toBe("connected");
     // The model was told at start that slack failed; this turn's prompt corrects it, once.
-    expect(provider.capturedOpts.at(-1)!.userMessage).toContain("reconnected since this session started and their tools are available now: slack");
+    expect(provider.capturedOpts.at(-1)!.userMessage).toContain('their tools are available now: "slack"');
     expect(provider.capturedOpts.at(-1)!.userMessage).toEndWith("two");
     await send(m, id, "three");
     expect(provider.mcpReconnects).toEqual(["slack"]); // connected now: not again
@@ -251,7 +280,9 @@ describe("healing before a turn", () => {
     await send(m, id, "two");
     expect(infos(m, id)).toContain("MCP server slack reconnected (1 tool).");
     await send(m, id, "three");
-    expect(provider.capturedOpts.at(-1)!.userMessage).toContain("their tools are available now: slack");
+    expect(provider.capturedOpts.at(-1)!.userMessage).toContain('their tools are available now: "slack"');
+    // The note is about this backend's start-up report: history keeps what was typed.
+    expect(JSON.stringify(m._sessionForTest(id)!.canonicalHistory)).not.toContain("reconnected since");
     await send(m, id, "four");
     expect(provider.capturedOpts.at(-1)!.userMessage).toBe("four");
   });

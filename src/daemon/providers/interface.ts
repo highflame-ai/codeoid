@@ -208,6 +208,8 @@ export interface BackendMcpServerState {
   /** Full tool names (`mcp__<server>__<tool>`), matching the `mcp_init` event. */
   tools: string[];
   error?: string;
+  /** A claude.ai connector, by the backend's own account (signed in on claude.ai, not by the CLI). */
+  connector?: boolean;
 }
 
 // ── Provider event stream ─────────────────────────────────────────────────────

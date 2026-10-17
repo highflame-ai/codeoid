@@ -398,7 +398,7 @@ Only a server the backend itself reported as down can be redialed, and one redia
 The drawer lists every server the backend runs, including ones no config file here declares (claude.ai connectors, plugins' servers), marked `live`.
 
 When a server comes back, however it came back, the session says so, and the next prompt tells the model too: it was told at start that the server had failed, and would otherwise believe that over trying.
-That note is part of the prompt, so it stays in the session's history.
+The note goes to that backend only: the session's own history keeps the prompt as typed, so a fork or a backend switch isn't handed a stale report.
 Redialing can't run a sign-in: a server that needs one says so.
 A claude.ai connector is signed in from claude.ai's connector settings; any other server in Claude's own config, from an interactive Claude Code session (`/mcp` there).
 This covers Claude sessions, whose backend mounts its own servers; servers in codeoid's MCP registry are dialed by the daemon.

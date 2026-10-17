@@ -458,10 +458,13 @@ export class ClaudeProvider implements SessionProvider {
       const s = (await q.mcpServerStatus()).find((x) => x.name === name);
       if (!s) return { status: "failed", tools: [], error: failure ?? `this session has no MCP server named "${name}"` };
       const error = s.error ?? (s.status === "connected" ? undefined : failure);
+      // The backend's account of where the server came from, not its name.
+      const connector = s.source === "claudeai" || s.scope === "claudeai" || s.config?.type === "claudeai-proxy";
       return {
         status: s.status,
         tools: (s.tools ?? []).map((t) => `mcp__${mcpToolPrefix(name)}__${t.name}`),
         ...(error ? { error } : {}),
+        ...(connector ? { connector: true } : {}),
       };
     } catch (err) {
       return { status: "failed", tools: [], error: failure ?? (err instanceof Error ? err.message : String(err)) };
@@ -1500,20 +1503,31 @@ export function translateSDKMessage(
           const servers: Record<string, string> = {};
           const tools: Record<string, string[]> = {};
           // Tool names carry the server's name as the CLI normalises it; key
-          // them by the server's own name, as `servers` is.
-          const byPrefix = new Map<string, string>();
+          // them by the server's own name, as `servers` is. Two servers that
+          // normalise alike can't be told apart: neither gets the tools.
+          const byPrefix = new Map<string, string | null>();
           for (const s of init.mcp_servers ?? []) {
             servers[s.name] = s.status;
             tools[s.name] = [];
-            byPrefix.set(mcpToolPrefix(s.name), s.name);
+            const prefix = mcpToolPrefix(s.name);
+            byPrefix.set(prefix, byPrefix.has(prefix) ? null : s.name);
           }
+          // Longest first, so a server named `a__b` wins its tools over one named `a`.
+          const prefixes = [...byPrefix.keys()].sort((a, b) => b.length - a.length);
           for (const t of init.tools ?? []) {
             if (!t.startsWith("mcp__")) continue;
             const rest = t.slice("mcp__".length);
-            const sep = rest.indexOf("__");
-            if (sep <= 0) continue;
-            const prefix = rest.slice(0, sep);
-            const server = byPrefix.get(prefix) ?? prefix;
+            const known = prefixes.find((p) => rest.startsWith(`${p}__`));
+            let server: string;
+            if (known !== undefined) {
+              const owner = byPrefix.get(known);
+              if (owner === null || owner === undefined) continue;
+              server = owner;
+            } else {
+              const sep = rest.indexOf("__");
+              if (sep <= 0) continue;
+              server = rest.slice(0, sep);
+            }
             tools[server] ??= [];
             tools[server].push(t);
           }
