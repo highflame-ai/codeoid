@@ -1588,7 +1588,7 @@ export class Session {
     const dial = this.#mcpInFlight.get(name);
     if (dial) {
       const joined = this.#mcpJoiners.get(dial) ?? new Set<string>();
-      if (joined.has(sender.sub)) return { refused: `${name} is being redialed — its result is on its way` };
+      if (joined.has(sender.sub)) return refuse("rejoin", `${name} is already being redialed for you — the session says so when it's back`);
       joined.add(sender.sub);
       this.#mcpJoiners.set(dial, joined);
     } else {
@@ -1721,6 +1721,8 @@ export class Session {
   #resetMcpState(opts: { backendChanged: boolean }): void {
     // A redial still answering for the old process is out of date either way.
     this.#mcpGeneration++;
+    // ...and doesn't hold its server: the next ask starts a fresh dial.
+    this.#mcpInFlight.clear();
     this.#mcpRetry.clear();
     this.#mcpManualAt.clear();
     if (!opts.backendChanged) return;
@@ -7045,11 +7047,12 @@ export const MCP_TIMINGS = {
 };
 
 /**
- * Server names that may appear in a prompt note: plain identifiers, or a
- * claude.ai connector's "claude.ai <words>". No other punctuation, so a name
- * can't read as an instruction.
+ * Server names that may appear in a prompt note: plain identifiers, a
+ * claude.ai connector's "claude.ai <words>", or a plugin's
+ * "plugin:<plugin>:<server>". No other punctuation, so a name can't read as
+ * an instruction.
  */
-const SAFE_MCP_NAME = /^(?:[\w.-]{1,64}|claude\.ai [\w .-]{1,54})$/;
+const SAFE_MCP_NAME = /^(?:[\w.-]{1,64}|claude\.ai [\w .-]{1,54}|plugin:[\w.-]{1,40}:[\w.-]{1,40})$/;
 
 /** Longest backend error text cleaned at all: every pattern below runs on at most this much. */
 const MCP_ERROR_SCAN_CHARS = 2_000;
@@ -7064,23 +7067,35 @@ const MCP_ERROR_SCAN_CHARS = 2_000;
 export function cleanMcpError(raw: string): string {
   const s = raw
     .slice(0, MCP_ERROR_SCAN_CHARS)
-    .replace(/[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]+/g, " ")
-    // scheme://user:pass@ — any scheme
-    .replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^/@\s]*@/gi, "$1…@")
-    // JWTs, anywhere
+    // Invisible characters go (so they can't split a token past the rules
+    // below); control characters become spaces.
+    .replace(/[\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]+/g, "")
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ")
+    // scheme://user:pass@ — any scheme, a password with a raw @ included
+    .replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^/\s]*@/gi, "$1…@")
+    // PEM blocks, JWTs
+    .replace(/-----BEGIN [A-Z ]+-----[\s\S]*?(?:-----END [A-Z ]+-----|$)/g, "…")
     .replace(/\beyJ[\w-]+\.[\w-]+(?:\.[\w-]*)?/g, "…")
     // Authorization schemes
-    .replace(/\b(bearer|basic|token)\s+[^\s"',;)]+/gi, "$1 …")
-    // key=value, key: value, "key": "value" — the key may carry a prefix (access_token, client_secret, x-api-key)
+    .replace(/\b(digest)\s+[^\r\n]*/gi, "$1 …")
+    .replace(/\b(bearer|basic|token)[\s:=]+[^\s"',;)]+/gi, "$1 …")
+    // key=value, key: value, "key": "value", "key" => {…} — the key may carry a prefix (access_token, client_secret, x-api-key)
     .replace(
-      /(^|[^a-z0-9])([\w-]*(?:token|secret|password|passwd|pwd|api[_-]?key|apikey|key|pat|auth|credentials?))(["']?\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s"',;)}]+)/gi,
+      /(^|[^a-z0-9])([\w-]*(?:token|secret|password|passwd|pwd|api[_-]?key|apikey|key|pat|auth|credentials?|sig|signature|session(?:_?id)?|cookie|code))(["']?\s*(?:=>|[=:]|%3[dD])\s*)("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[{[][^}\]]{0,200}[}\]]?|[^\s"',;)}]+)/gi,
       "$1$2$3…",
     )
-    // well-known key formats
-    .replace(/\b(?:sk-[\w-]{8,}|sk_[a-z]+_\w{8,}|gh[pousr]_\w{8,}|github_pat_\w{8,}|xox[abprs]-[\w-]{8,}|AKIA[0-9A-Z]{16}|AIza[\w-]{20,})/g, "…")
+    // well-known key formats (codeoid's own ZeroID keys first)
+    .replace(
+      /\b(?:zid_sk_\w{8,}|hf_(?:sk_)?\w{8,}|sk-[\w-]{8,}|sk_[a-z]+_\w{8,}|gh[pousr]_\w{8,}|github_pat_\w{8,}|glpat-[\w-]{16,}|npm_\w{30,}|xox[abprs]-[\w-]{8,}|AKIA[0-9A-Z]{16}|AIza[\w-]{20,})/g,
+      "…",
+    )
     // long token-like path segments, then query strings and fragments
-    .replace(/(?<![/:])\/[A-Za-z0-9_.~-]{24,}(?=[/\s?#"'),;]|$)/g, "/…")
-    .replace(/(\b[a-z][a-z0-9+.-]*:\/\/[^\s?#"']+)[?#][^\s"'),;]*/gi, "$1?…");
+    .replace(/(?<![/:])\/[A-Za-z0-9_.~+%-]{24,}(?=[/\s?#"'),;\]>:]|$)/g, "/…")
+    .replace(/(\b[a-z][a-z0-9+.-]*:\/\/[^\s?#"']+)[?#][^\s"'),;\]>]*/gi, "$1?…")
+    // Backstop for whatever the rules above don't know: a long run of token
+    // characters mixing letters and digits is a credential more often than a
+    // diagnostic. Hostnames (dotted) and words are left alone.
+    .replace(/[A-Za-z0-9+=_-]{20,}/g, (run) => (/[A-Za-z]/.test(run) && /\d/.test(run) ? "…" : run));
   return s.length > 300 ? `${s.slice(0, 300)}…` : s;
 }
 

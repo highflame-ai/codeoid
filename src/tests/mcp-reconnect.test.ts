@@ -238,8 +238,8 @@ describe("what may be redialed, and how often", () => {
     const rows = db.query("SELECT subject, detail FROM audit_log WHERE action = 'session.mcp_reconnect' ORDER BY id").all() as Array<{ subject: string; detail: string }>;
     db.close();
     const got = rows.map((r) => `${r.subject} ${r.detail.replace(/^server="slack" /, "")}`);
-    expect(got.slice(0, 2)).toEqual(["user:mcp attempt", "user:mcp2 joined"]);
-    expect(got.slice(2).sort()).toEqual(["user:mcp outcome=failed", "user:mcp2 outcome=failed"]);
+    expect(got.slice(0, 3)).toEqual(["user:mcp attempt", "user:mcp2 joined", "user:mcp outcome=rejoin"]);
+    expect(got.slice(3).sort()).toEqual(["user:mcp outcome=failed", "user:mcp2 outcome=failed"]);
     expect(await reconnect(m, id)).toMatchObject({ type: "response.error", error: expect.stringContaining("just redialed") });
   });
 
@@ -279,9 +279,20 @@ describe("what may be redialed, and how often", () => {
       ["Authorization: Basic dXNlcjpwYXNz and jwt eyJhbGciOi.eyJzdWIi.c2ln", ["dXNlcjpwYXNz", "eyJhbGciOi"], []],
       ['password: "correct horse battery"', ["correct", "horse", "battery"], []],
       ["a\u2028b\u2029c\ufeffd\u061ce\u202eF", ["\u2028", "\u2029", "\ufeff", "\u061c", "\u202e"], []],
+      ["mongodb+srv://u:p@SECRET@h/db", ["SECRET"], ["@h/db"]],
+      ['{"client_secret":{"value":"S3CRET"}} {"credentials":["S3CRET2"]}', ["S3CRET"], []],
+      ["Bearer: tokA1 Bearer=tokB2", ["tokA1", "tokB2"], []],
+      ["key zid_sk_abcdef123456 hf_abcdefgh12345 glpat-abcdefghijklmnop1234", ["zid_sk_abcdef123456", "hf_abcdefgh12345", "glpat-abcdefghijklmnop"], []],
+      [`see <https://h/x/${"T".repeat(30)}> and https://h/y/AAAAAAAAAAAA+BBBBBBBBBBBBBB]`, ["T".repeat(30), "AAAAAAAAAAAA+BBBB"], []],
+      ["Cookie: session_id=abc123; sig=deadbeef42 code=4/0AbCd", ["abc123", "deadbeef42", "4/0AbCd"], []],
+      ["eyJ\u200bhbGciOi.eyJzdWIi.c2ln", ["hbGciOi"], []],
+      ["-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\n-----END RSA PRIVATE KEY-----", ["MIIEpAIBAAKCAQEA"], []],
+      // Unknown formats: a long run mixing letters and digits.
+      ["upstream said f00dbabe1234567890abcdefXYZ is invalid", ["f00dbabe1234567890abcdefXYZ"], ["is invalid"]],
       // The gateway's name is the diagnostic: never hidden.
       ["SyntaxError dialing https://gateway-dev.highflame.dev/mcp/slack", [], ["gateway-dev.highflame.dev/mcp/slack"]],
     ];
+    // A plugin's server keeps its name in the prompt note (checked below via the note test's filter).
     for (const [input, hidden, kept] of cases) {
       const out = cleanMcpError(input);
       for (const h of hidden) expect(out).not.toContain(h);

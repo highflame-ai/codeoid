@@ -753,11 +753,6 @@ export class TerminalClient {
     }
   }
 
-  /**
-   * `codeoid compare run` (#357): fork one branch per target, send each the
-   * prompt, and (unless `wait` is false) wait for all of them, then print them
-   * side by side, numbered for `compare keep`.
-   */
   /** `codeoid mcp reconnect` — redial one of the session backend's MCP servers (#389). */
   async mcpReconnect(sessionIdOrName: string, server: string): Promise<void> {
     const sessionId = await this.#resolveSession(sessionIdOrName);
@@ -776,6 +771,11 @@ export class TerminalClient {
     }
   }
 
+  /**
+   * `codeoid compare run` (#357): fork one branch per target, send each the
+   * prompt, and (unless `wait` is false) wait for all of them, then print them
+   * side by side, numbered for `compare keep`.
+   */
   async compareRun(
     sessionIdOrName: string,
     targets: CompareTargetSpec[],
