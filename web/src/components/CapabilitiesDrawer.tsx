@@ -13,9 +13,11 @@ import {
   Match,
   Show,
   Switch,
+  createEffect,
   createSignal,
   onCleanup,
   onMount,
+  untrack,
 } from "solid-js";
 
 import { claudeConfig, fetchClaudeConfig, reconnectMcpServer } from "../state/claude-config";
@@ -126,7 +128,7 @@ const CapabilitiesDrawer: Component = () => {
                 <SkillsList items={claudeConfig().skills} />
               </Match>
               <Match when={activeTab() === "mcp"}>
-                <McpList items={claudeConfig().mcpServers} sessionId={claudeConfig().sessionId} />
+                <McpList items={claudeConfig().mcpServers} sessionId={claudeConfig().mcpReconnect ? claudeConfig().sessionId : null} />
               </Match>
               <Match when={activeTab() === "hooks"}>
                 <HooksList items={claudeConfig().hooks} />
@@ -341,7 +343,18 @@ const McpReconnect: Component<{ sessionId: string; server: string }> = (props) =
 /** Only a server the backend reports as down can be redialed. */
 const canReconnect = (status: string | undefined) => status === "failed" || status === "needs-auth";
 
-const McpList: Component<{ items: ClaudeConfigMcpServer[]; sessionId: string | null }> = (props) => (
+const McpList: Component<{ items: ClaudeConfigMcpServer[]; sessionId: string | null }> = (props) => {
+  // A reconnect's note is about that outage: once the server isn't down, drop it.
+  createEffect(() => {
+    const sid = props.sessionId;
+    if (!sid) return;
+    const down = new Set(props.items.filter((m) => canReconnect(m.liveStatus)).map((m) => mcpKey(sid, m.name)));
+    const notes = untrack(mcpNotes);
+    const stale = Object.keys(notes).filter((k) => k.startsWith(`${sid}\u0000`) && !down.has(k));
+    if (stale.length === 0) return;
+    setMcpNotes(Object.fromEntries(Object.entries(notes).filter(([k]) => !stale.includes(k))));
+  });
+  return (
   <Show
     when={props.items.length > 0}
     fallback={
@@ -426,7 +439,8 @@ const McpList: Component<{ items: ClaudeConfigMcpServer[]; sessionId: string | n
       </For>
     </ul>
   </Show>
-);
+  );
+};
 
 const McpStatusBadge: Component<{ status?: string; toolCount?: number }> = (props) => (
   <Show when={props.status !== undefined}>

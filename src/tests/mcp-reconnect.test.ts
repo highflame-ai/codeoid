@@ -58,6 +58,7 @@ function manager(): SessionManager {
       return provider;
     },
   });
+  registry.register({ id: "other", displayName: "other", create: () => new MockSessionProvider("other", [plain(), plain()]) });
   const config = {
     daemonUrl: "ws://127.0.0.1:7400",
     dbPath: join(tmp, "codeoid.db"),
@@ -285,6 +286,30 @@ describe("healing before a turn", () => {
     expect(JSON.stringify(m._sessionForTest(id)!.canonicalHistory)).not.toContain("reconnected since");
     await send(m, id, "four");
     expect(provider.capturedOpts.at(-1)!.userMessage).toBe("four");
+  });
+
+  it("a server the backend retries itself (failed → pending → connected) is still announced", async () => {
+    script = [startsWith("failed"), startsWith("pending"), startsWith("connected"), plain(), plain()];
+    const m = manager();
+    const id = await sessionAfterFirstTurn(m);
+    await send(m, id, "two");
+    expect(infos(m, id).some((x) => x.startsWith("MCP server slack reconnected"))).toBe(false);
+    await send(m, id, "three");
+    expect(infos(m, id)).toContain("MCP server slack reconnected (1 tool).");
+    await send(m, id, "four");
+    expect(provider.capturedOpts.at(-1)!.userMessage).toContain('their tools are available now: "slack"');
+  });
+
+  it("switching backend drops what the old one reported; the drawer says the new one can't redial", async () => {
+    answer = () => ({ status: "connected", tools: [] });
+    const m = manager();
+    const id = await sessionAfterFirstTurn(m);
+    const cfg = async () => (await m.handle({ type: "claude.config", id: "c", sessionId: id } as never, AUTH, CLIENT)) as { mcpReconnect?: boolean };
+    expect((await cfg()).mcpReconnect).toBe(true);
+    expect(await m.handle({ type: "session.set_provider", id: "p", sessionId: id, providerId: "other" } as never, AUTH, CLIENT)).toMatchObject({ type: "response.ok" });
+    expect(m._sessionForTest(id)!.sdkMcpSnapshot.status.size).toBe(0);
+    expect((await cfg()).mcpReconnect).toBe(false);
+    expect(await reconnect(m, id)).toMatchObject({ type: "response.error", code: "invalid_request" });
   });
 
   it("someone asking while the pre-turn redial is in flight shares it", async () => {

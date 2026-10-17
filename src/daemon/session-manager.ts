@@ -1578,6 +1578,7 @@ mcpHub: this.#mcpHub,
         skills: snapshot.skills,
         mcpServers,
         hooks: snapshot.hooks,
+        mcpReconnect: session.canReconnectMcp,
       };
     } catch (err) {
       return {

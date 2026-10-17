@@ -1073,6 +1073,8 @@ export class Session {
   readonly #mcpRetry = new Map<string, { at: number; waitMs: number }>();
   /** Backend MCP servers that came back since the last turn started — the next prompt says so. */
   readonly #mcpBack = new Set<string>();
+  /** Servers a report has called down and none has since called connected (through `pending`). */
+  readonly #mcpWasDown = new Set<string>();
   /** A manual redial in flight per server (single-flight), and when each was last asked for. */
   readonly #mcpInFlight = new Map<string, Promise<BackendMcpServerState | null>>();
   readonly #mcpManualAt = new Map<string, number>();
@@ -1549,6 +1551,10 @@ export class Session {
    * over the static config we read from disk so the drawer can show live
    * connection status + the actual tools available to the agent.
    */
+  /** Whether this session's current backend can redial its MCP servers. */
+  get canReconnectMcp(): boolean {
+    return typeof this.#provider.reconnectMcpServer === "function";
+  }
   get sdkMcpSnapshot(): { status: Map<string, string>; tools: Map<string, string[]> } {
     return { status: this.#sdkMcpStatus, tools: this.#sdkMcpTools };
   }
@@ -1652,10 +1658,21 @@ export class Session {
 
   /** Take the backend's word for a server's state; announce it coming back. */
   #applyMcpState(name: string, state: { status: string; tools: string[] }): void {
-    const before = this.#sdkMcpStatus.get(name);
     this.#sdkMcpStatus.set(name, state.status);
     this.#sdkMcpTools.set(name, state.tools);
-    if (state.status === "connected" && before !== "connected") this.#announceMcpBack(name, state.tools.length);
+    this.#noteMcpStatus(name, state.status);
+  }
+
+  /**
+   * Follow one server's reported state: remember it went down, and announce
+   * it once it's connected again — however many reports (`pending` while the
+   * backend retries it) came between.
+   */
+  #noteMcpStatus(name: string, status: string): void {
+    if (status === "failed" || status === "needs-auth") this.#mcpWasDown.add(name);
+    else if (status === "connected" && this.#mcpWasDown.delete(name)) {
+      this.#announceMcpBack(name, this.#sdkMcpTools.get(name)?.length ?? 0);
+    }
   }
 
   /**
@@ -1691,6 +1708,7 @@ export class Session {
     this.#sdkMcpStatus.clear();
     this.#sdkMcpTools.clear();
     this.#mcpBack.clear();
+    this.#mcpWasDown.clear();
   }
 
   /** A one-line note for the next prompt naming servers that came back, once. */
@@ -5473,7 +5491,6 @@ export class Session {
 
       case "mcp_init": {
         this.#mcpGeneration++;
-        const before = new Map(this.#sdkMcpStatus);
         this.#sdkMcpStatus.clear();
         this.#sdkMcpTools.clear();
         for (const [name, status] of Object.entries(event.servers)) {
@@ -5494,13 +5511,8 @@ export class Session {
           this.#persistAndBuffer(infoMsg);
           this.#broadcastRaw(infoMsg);
         }
-        // Down at the last report, up now — however it came back.
-        for (const [name, status] of this.#sdkMcpStatus) {
-          const was = before.get(name);
-          if (status === "connected" && (was === "failed" || was === "needs-auth")) {
-            this.#announceMcpBack(name, this.#sdkMcpTools.get(name)?.length ?? 0);
-          }
-        }
+        // Down at some earlier report, up now — however it came back.
+        for (const [name, status] of this.#sdkMcpStatus) this.#noteMcpStatus(name, status);
         break;
       }
 

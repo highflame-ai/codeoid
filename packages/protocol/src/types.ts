@@ -2011,6 +2011,8 @@ export interface ClaudeConfigResultMsg {
   skills: ClaudeConfigSkill[];
   mcpServers: ClaudeConfigMcpServer[];
   hooks: ClaudeConfigHook[];
+  /** Whether this session's backend can redial its MCP servers (`session.mcp_reconnect`). */
+  mcpReconnect?: boolean;
 }
 
 /** One member of a dispatch group, as a client sees it. */

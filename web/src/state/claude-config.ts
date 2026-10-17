@@ -24,6 +24,8 @@ interface State {
   skills: ClaudeConfigSkill[];
   mcpServers: ClaudeConfigMcpServer[];
   hooks: ClaudeConfigHook[];
+  /** The backend can redial its MCP servers. */
+  mcpReconnect: boolean;
   error: string | null;
   fetchedAt: number;
 }
@@ -36,6 +38,7 @@ const EMPTY: State = {
   skills: [],
   mcpServers: [],
   hooks: [],
+  mcpReconnect: false,
   error: null,
   fetchedAt: 0,
 };
@@ -78,6 +81,7 @@ export async function fetchClaudeConfig(sessionId: string): Promise<void> {
         skills: result.skills,
         mcpServers: result.mcpServers,
         hooks: result.hooks,
+        mcpReconnect: result.mcpReconnect === true,
         error: null,
         fetchedAt: Date.now(),
       });
@@ -103,7 +107,8 @@ export function resetClaudeConfig(): void {
  */
 export async function reconnectMcpServer(sessionId: string, server: string): Promise<McpReconnectResult> {
   const ok = await getClient().request({ type: "session.mcp_reconnect", id: newRequestId(), sessionId, server }, { timeoutMs: 30_000 });
-  // The drawer's statuses follow; a failed refresh isn't a failed reconnect.
-  await fetchClaudeConfig(sessionId).catch(() => {});
+  // The drawer's statuses follow — unless it has moved on to another
+  // session meanwhile. A failed refresh isn't a failed reconnect.
+  if (inflightForSession === sessionId) await fetchClaudeConfig(sessionId).catch(() => {});
   return ok.data as McpReconnectResult;
 }
