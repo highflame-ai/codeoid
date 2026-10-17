@@ -43,7 +43,8 @@ import { resolveEnvMap } from "../../mcp/types.js";
 import type { CompressionRegistry } from "../../compress/index.js";
 import { FLEET_TOOL_NAMES } from "../../fleet.js";
 import { rewriteBashToolInput } from "../../compress/index.js";
-import type { CodeoidConfig } from "../../../config.js";
+import { type CodeoidConfig, getConfigDir } from "../../../config.js";
+import { secretPathVerdict } from "../../secret-paths.js";
 import type { AuthContext } from "../../../protocol/types.js";
 import type {
   BackendMcpServerState,
@@ -858,6 +859,31 @@ export class ClaudeProvider implements SessionProvider {
           PreToolUse: [{
             hooks: [async (rawInput) => {
               const input = rawInput as PreToolUseHookInput;
+              // The secret-path rule (secret-paths.ts) is enforced HERE too,
+              // not only in Session's canUseTool gate: the CLI allows some calls
+              // itself without asking canUseTool (reads inside the workdir in
+              // default mode, `permissions.allow` rules, pre-approved tools), and
+              // this hook sees every call whatever its permission outcome. `ask`
+              // hands the call to canUseTool, where the owner decides.
+              const secret = secretPathVerdict(input.tool_name, input.tool_input, {
+                workdir: opts.workdir,
+                configDir: getConfigDir(),
+              });
+              if (secret) {
+                if (secret.action === "deny") {
+                  init.store.audit(this.#currentSender?.sub ?? "unknown", "session.secret_path_deny", sessionId, `tool=${input.tool_name}`);
+                }
+                return {
+                  hookSpecificOutput: {
+                    hookEventName: "PreToolUse" as const,
+                    permissionDecision: secret.action,
+                    permissionDecisionReason:
+                      secret.action === "deny"
+                        ? `${secret.path} holds credentials — agents can't read it. Manage it through codeoid instead.`
+                        : `${secret.path} contains credential files — this search needs the owner's approval.`,
+                  },
+                };
+              }
               // Stand in for canUseTool on the tools the SDK pre-approved.
               // Those never reach the gate, and the gate is the only place this
               // provider emits tool_start — so without this every memory recall

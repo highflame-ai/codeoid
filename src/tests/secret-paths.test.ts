@@ -25,11 +25,11 @@ afterEach(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
-const verdict = (input: unknown) => secretPathVerdict(input, { workdir, configDir });
+const verdict = (input: unknown, tool = "Read") => secretPathVerdict(tool, input, { workdir, configDir });
 
 describe("secretPathVerdict", () => {
   test("denies the credential files, on every backend's input key", () => {
-    for (const name of ["claude-accounts.json", "config.json", ".env", "local-token-7400", "claude-accounts.json.123.ab.tmp"]) {
+    for (const name of ["claude-accounts.json", "config.json", ".env", "local-token-7400", "claude-accounts.json.123.ab.tmp", "codeoid.db", "codeoid.db-wal"]) {
       expect(verdict({ file_path: join(configDir, name) })?.action).toBe("deny");
     }
     expect(verdict({ absolute_path: join(configDir, ".env") })?.action).toBe("deny"); // gemini / qwen read_file
@@ -42,6 +42,19 @@ describe("secretPathVerdict", () => {
     expect(verdict({ file_path: "innocent.json" })?.action).toBe("deny");
   });
 
+  test("denies the agent CLIs' stored logins, a running login's dir, and an MCP move/copy source", () => {
+    const saved = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = join(root, "home", ".claude");
+    try {
+      expect(verdict({ file_path: join(root, "home", ".claude", ".credentials.json") })?.action).toBe("deny");
+    } finally {
+      if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = saved;
+    }
+    expect(verdict({ file_path: join(tmpdir(), "codeoid-claude-login-abc", ".credentials.json") })?.action).toBe("deny");
+    expect(verdict({ source: join(configDir, ".env"), destination: join(workdir, "x") }, "move_file")?.action).toBe("deny");
+  });
+
   test("denies a process environment or memory", () => {
     for (const p of ["/proc/self/environ", "/proc/1234/environ", "/proc/self/mem", "/proc/self/fd/3", "/proc/self/task/9/environ"]) {
       expect(verdict({ file_path: p })?.action).toBe("deny");
@@ -49,16 +62,21 @@ describe("secretPathVerdict", () => {
   });
 
   test("asks — never auto-runs — a search rooted above the credential files", () => {
-    expect(verdict({ pattern: "sk-ant", path: join(root, "home") })?.action).toBe("ask");
-    expect(verdict({ pattern: "sk-ant", path: configDir })?.action).toBe("ask");
-    expect(verdict({ pattern: `${configDir}/*.json` })?.action).toBe("ask");
-    expect(verdict({ pattern: "*", path: "/proc" })?.action).toBe("ask");
+    expect(verdict({ pattern: "sk-ant", path: join(root, "home") }, "Grep")?.action).toBe("ask");
+    expect(verdict({ pattern: "sk-ant", path: configDir }, "Grep")?.action).toBe("ask");
+    expect(verdict({ pattern: `${configDir}/*.json` }, "Glob")?.action).toBe("ask");
+    expect(verdict({ pattern: "*", path: "/proc" }, "Glob")?.action).toBe("ask");
+    // No root = the workdir: a session whose workdir holds the config dir asks too.
+    expect(secretPathVerdict("Grep", { pattern: "sk-ant-" }, { workdir: join(root, "home"), configDir })?.action).toBe("ask");
   });
 
   test("leaves everything else alone — including the rest of the config dir", () => {
     expect(verdict({ file_path: join(workdir, "src", "index.ts") })).toBeNull();
-    expect(verdict({ pattern: "TODO", path: workdir })).toBeNull();
-    expect(verdict({ pattern: "**/*.ts" })).toBeNull();
+    expect(verdict({ pattern: "TODO", path: workdir }, "Grep")).toBeNull();
+    expect(verdict({ pattern: "TODO" }, "Grep")).toBeNull(); // the workdir, which holds no secrets
+    expect(verdict({ pattern: "**/*.ts" }, "Glob")).toBeNull();
+    // Grep's pattern is a regex, not a path: searching code for the string is fine.
+    expect(verdict({ pattern: "/proc/self/environ", path: "src" }, "Grep")).toBeNull();
     expect(verdict({ file_path: join(configDir, "packs", "skills", "SKILL.md") })).toBeNull();
     expect(verdict({ file_path: join(configDir, "transcripts", "x.jsonl") })).toBeNull();
     expect(verdict({ file_path: "/proc/cpuinfo" })).toBeNull();

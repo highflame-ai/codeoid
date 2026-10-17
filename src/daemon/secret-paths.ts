@@ -1,40 +1,63 @@
 /**
- * Paths no agent tool call may touch unasked: the daemon's own credential files
- * and a process's environment / memory.
+ * Paths no agent tool call may touch unasked: the daemon's own credential
+ * files, the agent CLIs' stored logins, and a process's environment / memory.
  *
  * WHY. `Read`, `Grep` and `Glob` run unprompted in guarded and autonomous mode
- * (tool-safety.ts), with no path limit. The daemon's credentials live in files
- * owned by the same user the agent runs as — `.env`, `config.json` (the ZeroID
- * key), `claude-accounts.json` (every stored Claude subscription, gateway and
- * API-key token), the local-mode token — so a prompt-injected "read
- * ~/.codeoid/claude-accounts.json" would hand all of them over without anyone
- * seeing a prompt. `/proc/<pid>/environ` is the same leak one hop removed: the
- * backend's own process carries its credential in its environment, and a file
- * tool runs INSIDE that process (subprocess env scrubbing never covers it).
+ * (tool-safety.ts), with no path limit. The credentials live in files owned by
+ * the same user the agent runs as — codeoid's `.env`, `config.json` (the
+ * ZeroID key), `claude-accounts.json` (every stored Claude subscription,
+ * gateway and API-key token), `codeoid.db` (MCP OAuth tokens), the local-mode
+ * token, and each CLI's own login (`~/.claude/.credentials.json`, …) — so a
+ * prompt-injected "read ~/.codeoid/claude-accounts.json" would hand them over
+ * without anyone seeing a prompt. `/proc/<pid>/environ` is the same leak one
+ * hop removed: the backend's process carries its credential in its
+ * environment, and a file tool runs INSIDE that process.
  *
  * WHAT. A call that names one of those files directly is refused, in every
- * mode — there is no legitimate reason for an agent to read them, and the
- * owner manages them through codeoid itself. A search rooted ABOVE one (a
- * `Grep` over the home directory) is not refused — it is usually innocent —
+ * mode — there is no legitimate reason for an agent to read them; the owner
+ * manages them through codeoid or the CLI itself. A search rooted ABOVE one
+ * (a `Grep` over the home directory) is not refused — it is usually innocent —
  * but never runs unprompted: the owner sees it and decides.
  *
+ * LIMITS. Only file and search tools are judged: a shell command line can't be
+ * parsed reliably. Whether a shell `cat` prompts depends on the backend and
+ * mode — guarded mode asks on Claude and the Gemini CLI, but Codex's
+ * `untrusted` policy and qwen run commands they consider read-only without
+ * asking, and autonomous mode runs every command. And code the workdir itself
+ * runs (a project's Claude hooks, MCP servers) runs with the daemon user's
+ * full rights; nothing here contains it. See docs/CONFIGURATION.md.
+ *
  * Backend-neutral: the path is read from whichever input key the backend's
- * file tools use. Shell commands are out of reach here (a command line can't
- * be parsed reliably); in guarded mode they prompt anyway.
+ * file tools use.
  */
 
 import { existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 export type SecretPathVerdict = { action: "deny" | "ask"; path: string } | null;
 
 /** Input keys backends use for a file or search root. */
-const PATH_KEYS = ["file_path", "filePath", "path", "absolute_path", "notebook_path", "dir_path", "directory"] as const;
+const PATH_KEYS = [
+  "file_path",
+  "filePath",
+  "path",
+  "absolute_path",
+  "notebook_path",
+  "dir_path",
+  "directory",
+  "source",
+  "destination",
+] as const;
 /** Input keys holding a list of paths. */
-const PATH_LIST_KEYS = ["paths", "file_paths", "absolute_paths"] as const;
+const PATH_LIST_KEYS = ["paths", "file_paths", "absolute_paths", "include"] as const;
 
-/** Files in the config dir that hold credentials. */
+/** Tools whose `pattern` is a path glob (not a regex) and whose absent root means the workdir. */
+const GLOB_TOOLS = new Set(["Glob", "glob"]);
+/** Search tools: an absent root means the workdir. */
+const SEARCH_TOOLS = new Set(["Glob", "glob", "Grep", "grep", "grep_search", "search_file_content", "LS", "list_directory"]);
+
+/** Files in codeoid's config dir that hold credentials. */
 function isSecretConfigFile(name: string): boolean {
   return (
     name === "claude-accounts.json" ||
@@ -43,12 +66,34 @@ function isSecretConfigFile(name: string): boolean {
     name.startsWith("config.json.") ||
     name === ".env" ||
     name.startsWith(".env.") ||
-    name.startsWith("local-token")
+    name.startsWith("local-token") ||
+    name === "codeoid.db" ||
+    name.startsWith("codeoid.db-") // -wal / -shm hold recent rows in plain text
   );
+}
+
+/** The agent CLIs' own stored logins. */
+function cliCredentialFiles(): string[] {
+  const home = homedir();
+  const claudeDir = process.env.CLAUDE_CONFIG_DIR || join(home, ".claude");
+  return [
+    join(claudeDir, ".credentials.json"),
+    join(home, ".codex", "auth.json"),
+    join(home, ".qwen", "oauth_creds.json"),
+    join(home, ".gemini", "oauth_creds.json"),
+  ];
 }
 
 /** `/proc/<pid>/environ`, `/proc/self/mem`, `/proc/<pid>/task/<tid>/fd/3`, … */
 const PROC_SECRET = /^\/proc\/[^/]+(?:\/task\/[^/]+)?\/(?:environ|mem|fd|fdinfo|map_files)(?:\/|$)/;
+/** `/proc`, `/proc/<pid>`, `/proc/<pid>/task[/<tid>]` — roots a search would recurse into the above from. */
+const PROC_ROOT = /^\/proc(?:\/(?:\d+|self|thread-self)(?:\/task(?:\/\d+)?)?)?$/;
+/** A named-account login's throwaway Claude config dir (auth/backend-login.ts). */
+const LOGIN_DIR = /(?:^|\/)codeoid-claude-login-[^/]*(?:\/|$)/;
+
+/** Case-insensitive filesystems (macOS default): `~/.CODEOID/Config.json` opens the same file. */
+const FOLD = process.platform === "darwin" || process.platform === "win32";
+const norm = (p: string) => (FOLD ? p.toLowerCase() : p);
 
 function expand(p: string, workdir: string): string {
   const home = p === "~" || p.startsWith("~/") ? `${homedir()}${p.slice(1)}` : p;
@@ -65,11 +110,11 @@ function real(p: string): string {
 }
 
 function within(child: string, parent: string): boolean {
-  const rel = relative(parent, child);
+  const rel = relative(norm(parent), norm(child));
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
-function candidatePaths(input: unknown): string[] {
+function candidatePaths(toolName: string, input: unknown): string[] {
   if (!input || typeof input !== "object") return [];
   const obj = input as Record<string, unknown>;
   const out: string[] = [];
@@ -78,33 +123,44 @@ function candidatePaths(input: unknown): string[] {
     const v = obj[k];
     if (Array.isArray(v)) for (const p of v) if (typeof p === "string" && p) out.push(p);
   }
-  // A Glob pattern can be absolute (`/home/u/.codeoid/*.json`): judge its
-  // literal prefix, up to the first wildcard.
-  if (typeof obj.pattern === "string" && (isAbsolute(obj.pattern) || obj.pattern.startsWith("~"))) {
+  // A glob's pattern can be absolute (`/home/u/.codeoid/*.json`): judge its
+  // literal prefix, up to the first wildcard. Only for glob tools — Grep's
+  // `pattern` is a regex, and searching code for "/proc/self/environ" is fine.
+  if (GLOB_TOOLS.has(toolName) && typeof obj.pattern === "string" && (isAbsolute(obj.pattern) || obj.pattern.startsWith("~"))) {
     const literal = obj.pattern.split(/[*?[{]/, 1)[0] ?? "";
     if (literal) out.push(literal.endsWith("/") ? literal.slice(0, -1) || "/" : literal);
   }
+  // A search with no root searches the workdir.
+  if (out.length === 0 && SEARCH_TOOLS.has(toolName)) out.push(".");
   return out;
 }
 
 /**
- * The verdict for one tool call's input: `deny` when it names a secret file,
- * `ask` when it searches a directory that contains one, null otherwise.
+ * The verdict for one tool call: `deny` when it names a secret file, `ask`
+ * when it searches a directory that contains one, null otherwise.
  */
-export function secretPathVerdict(input: unknown, opts: { workdir: string; configDir: string }): SecretPathVerdict {
+export function secretPathVerdict(
+  toolName: string,
+  input: unknown,
+  opts: { workdir: string; configDir: string },
+): SecretPathVerdict {
   const configDir = real(resolve(opts.configDir));
+  const secretFiles = [
+    ...cliCredentialFiles().map((f) => real(f)),
+  ];
+  const secretDirs = [configDir, ...secretFiles.map((f) => dirname(f))];
   let verdict: SecretPathVerdict = null;
-  for (const raw of candidatePaths(input)) {
+  for (const raw of candidatePaths(toolName, input)) {
     const literal = expand(raw, opts.workdir);
     const p = real(literal);
     // Both forms: `/proc/self/fd/3` resolves to whatever the fd points at.
     if (PROC_SECRET.test(literal) || PROC_SECRET.test(p)) return { action: "deny", path: raw };
-    if (dirname(p) === configDir && isSecretConfigFile(basename(p))) return { action: "deny", path: raw };
-    // A root that CONTAINS the config dir (the dir itself, home, /) reaches
-    // the files above by recursion; so does `/proc` itself.
-    if (within(configDir, p) || /^\/proc(?:\/(?:\d+|self|thread-self)(?:\/task(?:\/\d+)?)?)?$/.test(p)) {
-      verdict ??= { action: "ask", path: raw };
-    }
+    if (norm(dirname(p)) === norm(configDir) && isSecretConfigFile(norm(basename(p)))) return { action: "deny", path: raw };
+    if (secretFiles.some((f) => norm(f) === norm(p))) return { action: "deny", path: raw };
+    if (LOGIN_DIR.test(p)) return { action: "deny", path: raw };
+    // A root that CONTAINS one of them (the dir itself, home, /) reaches it
+    // by recursion; so does `/proc` itself.
+    if (secretDirs.some((d) => within(d, p)) || PROC_ROOT.test(p)) verdict ??= { action: "ask", path: raw };
   }
   return verdict;
 }

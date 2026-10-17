@@ -258,9 +258,15 @@ It decides whose credential the agent runs on, which account is billed, and wher
 The account list is daemon-wide, not per tenant: like the rest of `settings:write`, it belongs to whoever runs the daemon.
 
 **Agents can't read the stored tokens.**
-Agent file tools are refused on codeoid's credential files (`claude-accounts.json`, `config.json`, `.env`, the local-mode token) and on any process's `/proc/<pid>/environ` or memory, in every mode.
-A search rooted above them, such as a `Grep` over your home directory, is never auto-approved and waits for you instead.
-A shell command can't be checked this way; in guarded mode it asks first anyway.
+Agent file tools are refused on codeoid's credential files (`claude-accounts.json`, `config.json`, `.env`, `codeoid.db`, the local-mode token), on each agent CLI's own stored login (`~/.claude/.credentials.json`, `~/.codex/auth.json`, `~/.qwen/oauth_creds.json`, `~/.gemini/oauth_creds.json`), and on any process's `/proc/<pid>/environ` or memory, in every mode.
+On Claude this is enforced in a `PreToolUse` hook as well as the approval gate, so it also holds for reads the CLI would allow by itself.
+A search rooted above those files, such as a `Grep` over your home directory, is never auto-approved and waits for you instead.
+
+What this does not cover:
+
+- Shell commands can't be checked this way. In guarded mode Claude and the Gemini CLI ask before running one, but Codex's guarded policy and qwen run commands they consider read-only (like `cat`) without asking, and autonomous mode runs every command.
+- Code the workdir itself runs (a project's Claude hooks, `statusLine`, MCP servers) runs as your user and can read any of these files. Only open workdirs you trust, the same as running a repo's build scripts.
+
 To keep a Claude session's credential out of the environment its shell commands, hooks and MCP servers inherit, set `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` in `~/.codeoid/.env`.
 That is the Claude CLI's own switch: on Linux it needs bubblewrap and runs every shell command in a sandbox, so codeoid leaves the choice to you.
 

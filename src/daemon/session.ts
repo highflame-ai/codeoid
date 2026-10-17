@@ -5185,7 +5185,7 @@ export class Session {
       // Secret-path gate (secret-paths.ts), every mode: a call naming one of the
       // daemon's credential files or a process environment is refused; one
       // searching a directory that holds them is asked about, never auto-run.
-      const secret = secretPathVerdict(effectiveInput, { workdir: this.workdir, configDir: getConfigDir() });
+      const secret = secretPathVerdict(toolName, effectiveInput, { workdir: this.workdir, configDir: getConfigDir() });
       if (secret?.action === "deny") {
         const reason = `${secret.path} holds credentials — agents can't read it. Manage it through codeoid instead.`;
         this.#approvalPatchKeys.delete(approvalId);
@@ -5708,7 +5708,7 @@ export class Session {
         // twice per tool call (this handler runs in the same microtask batch
         // as canUseTool's synchronous section, always after it).
         const autoApprove =
-          secretPathVerdict(event.input, { workdir: this.workdir, configDir: getConfigDir() }) === null &&
+          secretPathVerdict(event.name, event.input, { workdir: this.workdir, configDir: getConfigDir() }) === null &&
           this.#peekAutoApprove(event.name);
         const toolMsg = this.#makeMessage(
           "tool_call",

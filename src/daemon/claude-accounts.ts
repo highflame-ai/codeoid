@@ -385,8 +385,30 @@ export class ClaudeAccountStore {
  * receive a named account's token with every request. A named account refuses
  * to run in such a workdir; the message names the file.
  *
+ * Deliberately NOT refused: a project's `hooks`, `statusLine`, MCP servers and
+ * `permissions.allow`. Those are code the repo runs as the daemon user, which
+ * can read any stored credential — the default account's included — so no
+ * per-account check contains them, and refusing them would lock named
+ * accounts out of most real repositories. Only open workdirs you trust
+ * (docs/CONFIGURATION.md).
+ *
  * Returns the offending file and key, or null.
  */
+/**
+ * Env keys that re-route or expose requests without running any code: a
+ * credential/base-URL variable, a proxy (with a CA bundle it can read the
+ * bearer token in flight), TLS trust, Node preloads, and turning off the
+ * CLI's subprocess scrub.
+ */
+const REDIRECTING_ENV = new Set([
+  "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy",
+  "NODE_EXTRA_CA_CERTS", "NODE_TLS_REJECT_UNAUTHORIZED", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_OPTIONS",
+  "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB",
+]);
+function redirectsCredential(key: string): boolean {
+  return isClaudeCredentialVar(key) || REDIRECTING_ENV.has(key);
+}
+
 export function projectCredentialOverride(workdir: string): { file: string; key: string } | null {
   const home = resolve(homedir());
   for (let dir = resolve(workdir); ; dir = dirname(dir)) {
@@ -407,7 +429,7 @@ export function projectCredentialOverride(workdir: string): { file: string; key:
         if (settings[key] !== undefined) return { file, key };
       }
       if (settings.env && typeof settings.env === "object") {
-        for (const key of Object.keys(settings.env)) if (isClaudeCredentialVar(key)) return { file, key: `env.${key}` };
+        for (const key of Object.keys(settings.env)) if (redirectsCredential(key)) return { file, key: `env.${key}` };
       }
     }
     if (dirname(dir) === dir) break;
