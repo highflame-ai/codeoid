@@ -13,7 +13,8 @@
 
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { atomicWrite, getConfigDir } from "../config.js";
 import {
   CLAUDE_DEFAULT_ACCOUNT,
@@ -99,6 +100,8 @@ export function isClaudeCredentialVar(name: string): boolean {
     name.endsWith("_FILE_DESCRIPTOR") ||
     name.startsWith("CLAUDE_CODE_OAUTH_") ||
     name.startsWith("CLAUDE_CODE_GATEWAY_") ||
+    // The daemon's mTLS identity must not be presented to an account's gateway.
+    name.startsWith("CLAUDE_CODE_CLIENT_") ||
     name === "CLAUDE_CONFIG_DIR_CREDENTIALS"
   );
 }
@@ -206,11 +209,12 @@ export function toAccountInfo(a: StoredClaudeAccount): ClaudeAccountInfo {
  * variable removed, then this account's set. Pure.
  */
 export function applyAccountEnv(env: Record<string, string>, account: StoredClaudeAccount): Record<string, string> {
+  // CLAUDE_CODE_SUBPROCESS_ENV_SCRUB is passed through, not forced: the CLI
+  // then keeps its credential out of what its Bash tool, hooks and stdio MCP
+  // servers inherit, but on Linux it also requires bubblewrap and sandboxes
+  // every shell command — too large a change to impose per account. Opt in
+  // daemon-wide in ~/.codeoid/.env (docs/CONFIGURATION.md).
   const out = stripClaudeCredentials(env);
-  // The CLI scrubs its own credentials from what its Bash tool, hooks and
-  // stdio MCP servers inherit only when asked to. A named account's token must
-  // not be one `printenv` away from the agent's shell.
-  out.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB = "1";
   switch (account.kind) {
     case "subscription":
       out.CLAUDE_CODE_OAUTH_TOKEN = account.token;
@@ -260,9 +264,8 @@ export class ClaudeAccountStore {
     } catch (err) {
       // Fail closed — the default may name an account we can no longer read —
       // but say exactly what to fix.
-      throw new ClaudeAccountError(
-        `${this.#path} is not readable JSON (${err instanceof Error ? err.message : String(err)}) — fix or remove it`,
-      );
+      // Not the parser's message: it can quote a slice of the file — a token.
+      throw new ClaudeAccountError(`${this.#path} is not valid JSON — fix or remove it`);
     }
     // Validate each entry as if it were being added: a hand-edited entry with
     // an unknown kind or a bad token must not be applied.
@@ -372,3 +375,43 @@ export class ClaudeAccountStore {
     };
   }
 }
+
+/**
+ * Does a project's Claude settings file redirect credentials? The CLI loads
+ * project settings (`<workdir>/.claude/settings.json`, `settings.local.json`,
+ * and those of each parent up to the home directory) and applies their `env`
+ * over the environment it was started with, and runs their `apiKeyHelper`. A
+ * cloned repo could therefore point `ANTHROPIC_BASE_URL` at its own host and
+ * receive a named account's token with every request. A named account refuses
+ * to run in such a workdir; the message names the file.
+ *
+ * Returns the offending file and key, or null.
+ */
+export function projectCredentialOverride(workdir: string): { file: string; key: string } | null {
+  const home = resolve(homedir());
+  for (let dir = resolve(workdir); ; dir = dirname(dir)) {
+    if (dir === home) break; // ~/.claude/settings.json is the user's own settings, not a project's
+    for (const name of ["settings.json", "settings.local.json"]) {
+      const file = join(dir, ".claude", name);
+      if (!existsSync(file)) continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(readFileSync(file, "utf8"));
+      } catch {
+        // Unreadable here means unreadable for the CLI too — nothing applied.
+        continue;
+      }
+      if (!parsed || typeof parsed !== "object") continue;
+      const settings = parsed as { env?: unknown; apiKeyHelper?: unknown; awsAuthRefresh?: unknown; awsCredentialExport?: unknown };
+      for (const key of ["apiKeyHelper", "awsAuthRefresh", "awsCredentialExport"] as const) {
+        if (settings[key] !== undefined) return { file, key };
+      }
+      if (settings.env && typeof settings.env === "object") {
+        for (const key of Object.keys(settings.env)) if (isClaudeCredentialVar(key)) return { file, key: `env.${key}` };
+      }
+    }
+    if (dirname(dir) === dir) break;
+  }
+  return null;
+}
+

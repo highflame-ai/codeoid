@@ -241,7 +241,7 @@ Choosing `default` explicitly pins a session to the built-in account, so it stay
 
 **A session never silently changes account.**
 Applying an account removes every competing Claude credential or provider variable before setting its own (all of `ANTHROPIC_*` except model settings, every `CLAUDE_CODE_USE_*` provider switch, token file descriptors, and the like), so a stray `ANTHROPIC_API_KEY` can't take over a subscription session.
-It also sets `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`, so the agent's shell commands, hooks and MCP servers don't inherit the account's token.
+A named account also refuses to run in a workdir whose own Claude settings (`.claude/settings.json` or `settings.local.json`, in the workdir or a parent below your home directory) set a credential variable such as `ANTHROPIC_BASE_URL`, or an `apiKeyHelper`, since a cloned repo could otherwise send the account's token to a host of its choosing.
 Switching a session's account, or replacing or removing the account it runs on, stops the session's Claude process if it is idle, so no process keeps running on the old credential.
 A session whose account was removed refuses to run until you switch it, rather than falling back to another credential.
 One thing this cannot override is an `apiKeyHelper` in your Claude settings file, since that is configuration of the shared config directory rather than environment.
@@ -253,6 +253,15 @@ It runs `claude setup-token` against a throwaway config directory and keeps only
 Accounts live in `~/.codeoid/claude-accounts.json`, mode 0600.
 Tokens are never sent to a client: listing accounts shows names, kinds, and a gateway's URL and header names only.
 Managing accounts needs `settings:write` (listing needs `settings:read`).
-Putting a session on a named account, at creation or later, needs `settings:write` as well, since it decides whose credential the agent runs on; following the default or pinning `default` needs only `session:send`.
+Choosing a session's account needs `settings:write` too, whichever way: creating a session with `--account`, `account use` (including back to `default`), and forking or comparing a session that has an account of its own.
+It decides whose credential the agent runs on, which account is billed, and where the conversation is sent.
+The account list is daemon-wide, not per tenant: like the rest of `settings:write`, it belongs to whoever runs the daemon.
+
+**Agents can't read the stored tokens.**
+Agent file tools are refused on codeoid's credential files (`claude-accounts.json`, `config.json`, `.env`, the local-mode token) and on any process's `/proc/<pid>/environ` or memory, in every mode.
+A search rooted above them, such as a `Grep` over your home directory, is never auto-approved and waits for you instead.
+A shell command can't be checked this way; in guarded mode it asks first anyway.
+To keep a Claude session's credential out of the environment its shell commands, hooks and MCP servers inherit, set `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` in `~/.codeoid/.env`.
+That is the Claude CLI's own switch: on Linux it needs bubblewrap and runs every shell command in a sandbox, so codeoid leaves the choice to you.
 
 **Behind the Highflame gateway** (a Forge sandbox, where the daemon's environment carries an `x-highflame-apikey` header), named accounts are refused: they would route requests around the gateway's guardrails and audit.

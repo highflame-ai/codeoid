@@ -28,7 +28,7 @@ import { hasScope, SCOPES } from "../protocol/scopes.js";
 import { applyPatches, getManifest, getSnapshot, previewPatches } from "./settings/store.js";
 import { canonicalFromTranscript, turnIndexFromHistory } from "./canonical-restore.js";
 import { BackendLoginBroker, BackendLoginError, redact } from "./auth/backend-login.js";
-import { ClaudeAccountError, ClaudeAccountStore, isNamedClaudeAccount, validateAccountName } from "./claude-accounts.js";
+import { ClaudeAccountError, ClaudeAccountStore, validateAccountName } from "./claude-accounts.js";
 import { RateLimiter } from "./rate-limit.js";
 import type { TranscriptMeta, TranscriptStore } from "./transcript.js";
 import {
@@ -2128,6 +2128,8 @@ mcpHub: this.#mcpHub,
         if (outcome.ok && outcome.secret?.key === "CLAUDE_CODE_OAUTH_TOKEN") {
           try {
             this.#claudeAccounts.upsert({ name: accountName, kind: "subscription", token: outcome.secret.value });
+            // A re-login replaced the token: idle processes still hold the old one.
+            this.#releaseClaudeSessionsOn(accountName);
           } catch (err) {
             error = `Signed in, but the account could not be saved: ${err instanceof Error ? err.message : String(err)}`;
           }
@@ -2146,7 +2148,7 @@ mcpHub: this.#mcpHub,
       }
       const ok = outcome.ok && error === undefined;
       // Never the code, never the credential — only that an exchange happened.
-      this.#store.audit(auth.sub, "backend.login.submit", "", `ok=${ok}`);
+      this.#store.audit(auth.sub, "backend.login.submit", "", `ok=${ok}${accountName !== undefined ? ` account=${accountName}` : ""}`);
       return {
         type: "backend.login.submit.result",
         requestId: msg.id,
@@ -2277,23 +2279,21 @@ mcpHub: this.#mcpHub,
 
   /**
    * Choose a session's Claude account: null follows the daemon default, a
-   * literal `default` pins the built-in account. `session:send`, plus
-   * `settings:write` for a NAMED account — that picks whose credential the
-   * agent runs on (and bills), which is the account owner's decision, not
-   * every collaborator's.
+   * literal `default` pins the built-in account. `settings:write`, every
+   * case — it picks whose credential the agent runs on and bills, and where
+   * the conversation is sent (a switch resumes it on the new account). Moving
+   * a session OFF a company account onto a personal login is as much that
+   * decision as moving it on.
    */
   #sessionSetClaudeAccount(
     msg: Extract<ClientMessage, { type: "session.set_claude_account" }>,
     auth: AuthContext,
   ): DaemonMessage {
-    if (!hasScope(auth.scopes as string[], SCOPES.SESSION_SEND)) {
-      return { type: "response.error", requestId: msg.id, error: "Missing scope: session:send", code: "forbidden" };
-    }
-    if (isNamedClaudeAccount(msg.account) && !hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) {
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) {
       return {
         type: "response.error",
         requestId: msg.id,
-        error: "Missing scope: settings:write (needed to put a session on a named Claude account)",
+        error: "Missing scope: settings:write (needed to choose a session's Claude account)",
         code: "forbidden",
       };
     }
@@ -2926,11 +2926,11 @@ mcpHub: this.#mcpHub,
     }
     // Fail closed on an unknown Claude account — creating the session on some
     // other credential would bill the wrong account.
-    if (isNamedClaudeAccount(msg.claudeAccount) && !hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) {
+    if (msg.claudeAccount && !hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) {
       return {
         type: "response.error",
         requestId: msg.id,
-        error: "Missing scope: settings:write (needed to put a session on a named Claude account)",
+        error: "Missing scope: settings:write (needed to choose a session's Claude account)",
         code: "forbidden",
       };
     }
@@ -3721,6 +3721,17 @@ mcpHub: this.#mcpHub,
       return { type: "response.error", requestId: msg.id, error: "Session not found", code: "not_found" };
     }
     // Forking THE conductor would mint a second fleet supervisor — refuse.
+    // The fork keeps running on the parent's Claude account, and choosing what
+    // a session runs on (and bills) is `settings:write` — a fork or a compare
+    // must not be a way around that.
+    if (parent.claudeAccount !== null && !hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) {
+      return {
+        type: "response.error",
+        requestId: msg.id,
+        error: `This session runs on Claude account "${parent.claudeAccount}"; forking it needs settings:write`,
+        code: "forbidden",
+      };
+    }
     if (parent.role) {
       return { type: "response.error", requestId: msg.id, error: `Cannot fork a ${parent.role} session`, code: "invalid_request" };
     }
@@ -6536,11 +6547,12 @@ mcpHub: this.#mcpHub,
     if (msg.clientMsgId !== undefined && session.markClientMsgSeen(msg.clientMsgId)) {
       return { type: "response.ok", requestId: msg.id, data: { duplicate: true } };
     }
-    // Tell the sender directly when the session's Claude account is gone —
-    // session.send would refuse too, but only as a message in the stream.
+    // Tell the sender directly when the session's Claude account can't be
+    // used (gone, or redirectable by the workdir's settings) — session.send
+    // would refuse too, but only as a message in the stream.
     if (session.toInfo().providerId === "claude") {
       try {
-        session.effectiveClaudeAccount();
+        session.assertClaudeAccountUsable();
       } catch (err) {
         return this.#claudeAccountsError(msg.id, err);
       }

@@ -253,7 +253,13 @@ export class BackendLoginBroker {
     if (superseded) this.cancel(superseded);
 
     const isolatedDir = opts.isolated ? mkdtempSync(join(tmpdir(), ISOLATED_DIR_PREFIX)) : undefined;
-    const child = spawnUnderPty(resolved.file, resolved.args, isolatedDir);
+    let child: ChildProcess;
+    try {
+      child = spawnUnderPty(resolved.file, resolved.args, isolatedDir);
+    } catch (err) {
+      if (isolatedDir) rmSync(isolatedDir, { recursive: true, force: true });
+      throw err;
+    }
     const loginId = randomUUID();
     const attempt: Attempt = {
       loginId,

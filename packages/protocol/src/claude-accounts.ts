@@ -94,8 +94,11 @@ export interface ClaudeAccountsSetDefaultMsg {
 
 /**
  * Choose the account a session runs on, from its next turn; `null` follows
- * the daemon default. The session's conversation is resumed, not restarted.
- * Scope: `session:send`.
+ * the daemon default, a literal `default` pins the built-in account. The
+ * session's conversation is resumed, not restarted. Scope: `settings:write` —
+ * it decides whose credential the agent runs on, bills, and is sent the
+ * conversation. (So does `claudeAccount` on `session.create`, and forking a
+ * session that has an account of its own.)
  */
 export interface SessionSetClaudeAccountMsg {
   type: "session.set_claude_account";
