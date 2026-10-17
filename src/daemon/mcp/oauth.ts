@@ -11,7 +11,7 @@
  * Credentials are per tenant (account, project) and never leave the daemon.
  */
 
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { auth, type OAuthClientProvider, type OAuthDiscoveryState } from "@modelcontextprotocol/sdk/client/auth.js";
 import type {
   OAuthClientInformationMixed,
@@ -38,6 +38,9 @@ export interface McpCredentialSource {
   rejected(spec: McpServerSpec, tenant: McpTenant, token: string): void;
   /** Whether the tenant holds a credential worth trying, without a network call. */
   signedIn?(spec: McpServerSpec, tenant: McpTenant): boolean;
+  /** A stamp that changes whenever that credential does (a sign-in, a refresh):
+   *  a holder of a connection made with the old one knows to remake it. */
+  credentialStamp?(spec: McpServerSpec, tenant: McpTenant): string | undefined;
 }
 
 /** Thrown to the model/UI when a server has no usable credential. */
@@ -241,6 +244,13 @@ export class McpOAuth implements McpCredentialSource {
     return this.status(spec, tenant) === "connected";
   }
 
+  credentialStamp(spec: McpServerSpec, tenant: McpTenant): string | undefined {
+    if (!this.signedIn(spec, tenant)) return undefined;
+    const tokens = this.#tokens(spec, tenant);
+    // A digest, never the token: the stamp is compared, logged-adjacent state.
+    return createHash("sha256").update(tokens?.refresh_token ?? tokens?.access_token ?? "").digest("hex").slice(0, 16);
+  }
+
   /** Forget the tenant's tokens for a server (its client registration stays). */
   disconnect(spec: McpServerSpec, tenant: McpTenant): void {
     this.#store.clearMcpOAuth(tenant, serverOf(spec), "tokens");
@@ -266,8 +276,16 @@ export class McpOAuth implements McpCredentialSource {
         scope: scopeOf(oauth),
         fetchFn: this.#fetch,
       });
-      if (result !== "AUTHORIZED") return undefined;
+      if (result !== "AUTHORIZED") {
+        // The refresh token was refused: only a new interactive sign-in helps.
+        // Forget the dead tokens, so the server reads as signed out (Settings
+        // offers Connect) rather than signed in and failing.
+        this.#store.clearMcpOAuth(tenant, serverOf(spec), "tokens");
+        this.#rejected.delete(keyOf(spec.name, tenant));
+        return undefined;
+      }
     } catch (err) {
+      // A network error, not a verdict on the token: keep it for the next try.
       console.error(`[codeoid] mcp oauth: refreshing ${spec.name} failed: ${err instanceof Error ? err.message : String(err)}`);
       return undefined;
     }

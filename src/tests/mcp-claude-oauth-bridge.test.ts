@@ -31,6 +31,7 @@ function registry(): McpRegistry {
 function fakeHub(signedIn: Set<string>, calls: Array<{ server: string; tool: string; args: unknown; scope: McpCallScope }> = []): McpHub {
   return {
     signedIn: (spec: McpServerSpec) => signedIn.has(spec.name),
+    credentialStamp: (spec: McpServerSpec) => (signedIn.has(spec.name) ? `stamp-${spec.name}` : undefined),
     listToolsOrThrow: async (spec: McpServerSpec) => {
       if (spec.name === "broken") throw new Error("broken needs sign-in — connect it in Settings (MCP servers)");
       return [{ name: "search", description: `search ${spec.name}`, inputSchema: { type: "object", properties: { q: { type: "string" } }, required: ["q"] } }];

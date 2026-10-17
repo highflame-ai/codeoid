@@ -22,7 +22,8 @@ import path from "node:path";
 import { McpServerSchema, type RawMcpServerConfig } from "../../config.js";
 import type { ClaudeConfigMcpServer } from "../../protocol/types.js";
 import { readClaudeConfig } from "../claude-config.js";
-import { isReservedMcpName } from "./registry.js";
+import { isReservedMcpName, type McpRegistry } from "./registry.js";
+import { mcpToolPrefix } from "./types.js";
 
 /** Every server of that name in Claude's config: the global ones, plus the
  *  workdir's for a session's workdir. The same name can mean two servers. */
@@ -35,9 +36,10 @@ export async function findClaudeMcpServers(name: string, workdir: string | null)
 /**
  * Whether the entry comes from a file the workdir's repo controls (a
  * `.mcp.json`, the project's `.claude/` settings) rather than from the user's
- * own config (`~/.claude.json`, `~/.claude/`). A cloned repo can put anything
- * there, so such a server is adopted only once Claude itself has approved and
- * connected it — and adopting makes it daemon-wide.
+ * own config (`~/.claude.json`, `~/.claude/`). A cloned repo can name any URL
+ * there — and a codeoid session's CLI connects it without asking (measured) —
+ * so such a server is adopted only when the caller names its URL: consent to
+ * that address, which adopting makes daemon-wide.
  */
 export function fromRepoFile(server: ClaudeConfigMcpServer, home: string = os.homedir()): boolean {
   if (server.scope !== "workdir") return false;
@@ -58,6 +60,19 @@ export function adoptableName(name: string): { ok: true } | { ok: false; reason:
 }
 
 const LOOPBACK = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+/** Whether a URL points at one of `ports` on this machine — the daemon's own
+ *  endpoints (its blackboard and memory servers live there): adopting one
+ *  would put codeoid's own server on the CLI's denylist. */
+export function isDaemonEndpoint(url: string, ports: readonly string[]): boolean {
+  try {
+    const u = new URL(url);
+    const port = u.port || (u.protocol === "https:" ? "443" : "80");
+    return LOOPBACK.has(u.hostname) && ports.includes(port);
+  } catch {
+    return false;
+  }
+}
 
 /** Whether codeoid can adopt this server, and if not, why — said to the user. */
 export function adoptability(server: ClaudeConfigMcpServer): { ok: true; url: string } | { ok: false; reason: string } {
@@ -89,9 +104,30 @@ export function adoptability(server: ClaudeConfigMcpServer): { ok: true; url: st
     return { ok: false, reason: `${server.name}'s URL carries credentials; an adopted server is signed in to by codeoid` };
   }
   // The URL is also what the CLI's own copy is denied by, as a pattern: a
-  // wildcard would deny every server it matches.
-  if (server.url.includes("*")) return { ok: false, reason: `${server.name}'s URL contains a wildcard` };
+  // wildcard would deny every server it matches, and the CLI expands ${VAR}
+  // in it, which codeoid's own copy wouldn't.
+  if (/[*${}]/.test(server.url)) return { ok: false, reason: `${server.name}'s URL contains a wildcard or a \${…} reference` };
   return { ok: true, url: server.url };
+}
+
+/**
+ * Why adopting `name` at `url` would collide with a server codeoid already
+ * has, or null: an entry of that name at another address (however it got
+ * there), or another whose tools would get the same names.
+ */
+export function registryConflict(registry: McpRegistry, name: string, url: string): string | null {
+  const existing = registry.get(name);
+  if (existing && !(existing.transport.kind === "http" && existing.transport.url === url)) {
+    return `codeoid already has a server named ${JSON.stringify(name)} at another address; change or remove it in codeoid's config first`;
+  }
+  const clash = registry.list().find((s) => s.name !== name && mcpToolPrefix(s.name) === mcpToolPrefix(name));
+  if (clash) return `${JSON.stringify(name)} and codeoid's ${JSON.stringify(clash.name)} would give their tools the same names`;
+  return null;
+}
+
+/** One argument for a shell command line shown to the user, quoted so it runs as shown. */
+export function shellArg(value: string): string {
+  return /^[A-Za-z0-9_.:/@+=-]+$/.test(value) && !value.startsWith("-") ? value : `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 /** The registry entry an adopted server gets: the same URL, signed in by codeoid. */

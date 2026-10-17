@@ -184,7 +184,8 @@ describe("session.mcp_reconnect", () => {
     const id = await sessionAfterFirstTurn(m);
     const r = (await reconnect(m, id)) as { data: McpReconnectResult };
     expect(r.data.error).toContain('"Sign in with codeoid"');
-    expect(r.data.error).toContain(`codeoid mcp adopt slack --session ${m._sessionForTest(id)!.name}`);
+    // A project's own server: the session to find it in, and its address named (consent to it).
+    expect(r.data.error).toContain(`codeoid mcp adopt slack --session=${m._sessionForTest(id)!.name} --url=https://slack.example.com/mcp`);
     expect(r.data.error).toContain("interactive Claude Code session"); // still offered
   });
 

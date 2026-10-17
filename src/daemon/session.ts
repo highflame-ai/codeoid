@@ -118,7 +118,7 @@ import {
 import { isElicitationTool, isSafeTool, roleDeniesTool } from "./providers/tool-safety.js";
 import type { PackActivation } from "./pipeline/index.js";
 import type { McpRegistry } from "./mcp/registry.js";
-import { adoptability, adoptableName, findClaudeMcpServers } from "./mcp/adopt.js";
+import { adoptability, adoptableName, findClaudeMcpServers, fromRepoFile, registryConflict, shellArg } from "./mcp/adopt.js";
 import type { McpHub } from "./mcp/hub.js";
 import type { Attachment } from "../protocol/types.js";
 import { resolveAttachments } from "./attachments.js";
@@ -1718,13 +1718,20 @@ export class Session {
    */
   async #adoptHint(name: string): Promise<string | null> {
     if (!adoptableName(name).ok) return null;
-    const can = (await findClaudeMcpServers(name, this.workdir).catch(() => [])).filter((c) => adoptability(c).ok);
+    const registry = this.#mcpRegistry;
+    const can = (await findClaudeMcpServers(name, this.workdir).catch(() => [])).filter((c) => {
+      const ok = adoptability(c);
+      // What adopt would refuse isn't suggested.
+      return ok.ok && !(registry && registryConflict(registry, name, ok.url));
+    });
     if (can.length === 0) return null;
-    const session = /^[\w.-]+$/.test(this.name) ? this.name : JSON.stringify(this.name);
-    if (new Set(can.map((c) => c.url)).size > 1) {
-      return `codeoid mcp adopt ${name} --session ${session} --url <the one to use>`;
-    }
-    return can[0]!.scope === "workdir" ? `codeoid mcp adopt ${name} --session ${session}` : `codeoid mcp adopt ${name}`;
+    // Quoted to run as shown (a session's name is free text).
+    const session = `--session=${shellArg(this.name)}`;
+    if (new Set(can.map((c) => c.url)).size > 1) return `codeoid mcp adopt ${name} ${session} --url <the one to use>`;
+    const one = can[0]!;
+    if (one.scope !== "workdir") return `codeoid mcp adopt ${name}`;
+    // A project's own server: its address is named, as consent to it.
+    return fromRepoFile(one) ? `codeoid mcp adopt ${name} ${session} --url=${shellArg(one.url!)}` : `codeoid mcp adopt ${name} ${session}`;
   }
 
   /** Take the backend's word for a server's state; announce it coming back. */

@@ -93,18 +93,7 @@ export class McpHub {
    *  that fails to list returns [] (its tools are hidden, not presented-and-broken).
    *  An OAuth server lists with the tenant's credential, so `scope` must carry it. */
   async listTools(spec: McpServerSpec, scope?: McpCallScope): Promise<McpToolDef[]> {
-    try {
-      const client = this.#clientFor(spec, scope?.tenant);
-      const all = await client.listTools();
-      const tools = spec.toolAllowlist ? all.filter((t) => spec.toolAllowlist?.includes(t.name)) : all;
-      this.#status.set(clientKey(spec, scope?.tenant), { tools: tools.map((t) => t.name) });
-      return tools;
-    } catch (e) {
-      // Not having signed in is not a fault of the server.
-      if (!(e instanceof McpSignInRequired)) this.#status.set(clientKey(spec, scope?.tenant), { tools: [], error: errMsg(e) });
-      this.#drop(clientKey(spec, scope?.tenant));
-      return [];
-    }
+    return this.listToolsOrThrow(spec, scope).catch(() => []);
   }
 
   /**
@@ -122,7 +111,10 @@ export class McpHub {
       this.#status.set(key, { tools: tools.map((t) => t.name) });
       return tools;
     } catch (e) {
-      if (!(e instanceof McpSignInRequired)) this.#status.set(key, { tools: [], error: errMsg(e) });
+      // Not having signed in is not a fault of the server: no health to
+      // record — and the tool list from before is gone with the credential.
+      if (e instanceof McpSignInRequired) this.#status.delete(key);
+      else this.#status.set(key, { tools: [], error: errMsg(e) });
       this.#drop(key);
       throw e;
     }
@@ -178,6 +170,14 @@ export class McpHub {
     if (!isOAuthServer(spec)) return true;
     if (!tenant || !this.#credentials?.signedIn) return false;
     return this.#credentials.signedIn(spec, tenant);
+  }
+
+  /** Changes whenever the tenant's credential for an OAuth server does; "" for
+   *  a server without OAuth, undefined when not signed in. */
+  credentialStamp(spec: McpServerSpec, tenant: McpTenant | undefined): string | undefined {
+    if (!isOAuthServer(spec)) return "";
+    if (!tenant) return undefined;
+    return this.#credentials?.credentialStamp?.(spec, tenant);
   }
 
   /** Whether a live client is currently held for this server (for `tenant`,

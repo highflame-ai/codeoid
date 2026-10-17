@@ -159,14 +159,14 @@ describe("mcp.adopt", () => {
     expect(await adopt(m, "tracker")).toMatchObject({ type: "response.error", code: "not_found" });
   });
 
-  it("a session workdir's .mcp.json server: only for the session's tenant, only once Claude approved it", async () => {
+  it("a session workdir's .mcp.json server: only for the session's tenant, only with its URL named", async () => {
     const m = manager();
     const sid = await sessionIn(m, work);
     expect(await adopt(m, "tracker", { ...auth(WRITE, "user:other"), accountId: "acc-2" }, sid)).toMatchObject({ code: "not_found" });
-    // A repo's file can name anything: not until Claude has connected (approved) it.
-    expect(await adopt(m, "tracker", auth(WRITE), sid)).toMatchObject({ type: "response.error", error: expect.stringContaining("approve it in Claude first") });
-    m._sessionForTest(sid)!.sdkMcpSnapshot.status.set("tracker", "needs-auth");
-    expect(await adopt(m, "tracker", auth(WRITE), sid)).toMatchObject({ type: "mcp.adopt.result", server: "tracker" });
+    // A repo's file chose that address (and the CLI connects it unasked): it
+    // takes the caller naming it — consent to that address.
+    expect(await adopt(m, "tracker", auth(WRITE), sid)).toMatchObject({ type: "response.error", error: expect.stringContaining("name that URL") });
+    expect(await adopt(m, "tracker", auth(WRITE), sid, "https://tracker.example.com/mcp")).toMatchObject({ type: "mcp.adopt.result", server: "tracker" });
     expect(configJson().mcpServers.tracker).toMatchObject({ url: "https://tracker.example.com/mcp", oauth: true });
   });
 
@@ -179,7 +179,6 @@ describe("mcp.adopt", () => {
     writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { github: { type: "http", url: "https://evil.example/mcp" } } }));
     const m = manager();
     const sid = await sessionIn(m, work);
-    m._sessionForTest(sid)!.sdkMcpSnapshot.status.set("github", "needs-auth");
     expect(await adopt(m, "github", auth(WRITE), sid)).toMatchObject({ type: "response.error", error: expect.stringContaining("more than one server") });
     expect(await adopt(m, "github", auth(WRITE), sid, "https://nope.example/mcp")).toMatchObject({ code: "not_found" });
     expect(await adopt(m, "github", auth(WRITE), sid, "https://api.githubcopilot.com/mcp")).toMatchObject({ type: "mcp.adopt.result" });
@@ -212,6 +211,8 @@ describe("mcp.adopt", () => {
           wild: { type: "http", url: "https://*.example.com/*" },
           keyed: { type: "http", url: "https://g.example.com/mcp", headers: { Authorization: "Bearer x" } },
           local: { type: "http", url: "http://127.0.0.1:9000/mcp" },
+          self: { type: "http", url: "http://127.0.0.1:7400/memory/mcp" },
+          envref: { type: "http", url: "https://${HOST}/mcp" },
         },
       }),
     );
@@ -225,6 +226,8 @@ describe("mcp.adopt", () => {
       ["creds", "carries credentials"],
       ["wild", "wildcard"],
       ["keyed", "authorized by a header"],
+      ["self", "this daemon's own endpoints"],
+      ["envref", "reference"],
     ] as const) {
       expect(await adopt(m, name)).toMatchObject({ type: "response.error", error: expect.stringContaining(why) });
     }
@@ -245,6 +248,7 @@ describe("mcp.adopt", () => {
     await adopt(m, "legacy");
     // Each outcome, as who asked, with the file the URL came from.
     expect(auditRows()).toEqual([
+      { subject: "user:a", detail: 'server="notes" outcome=forbidden' },
       { subject: "user:a", detail: `server="notes" outcome=adopted host=notes.example.com source=${JSON.stringify(join(home, ".claude.json"))}` },
       { subject: "user:a", detail: `server="legacy" outcome=refused source=${JSON.stringify(join(home, ".claude.json"))}` },
     ]);
@@ -258,23 +262,46 @@ describe("the capabilities drawer's view", () => {
     const view = async () =>
       ((await m.handle({ type: "claude.config", id: "v", sessionId: sid }, auth(WRITE), client)) as { mcpServers: ClaudeConfigMcpServer[] }).mcpServers;
     const byName = (list: ClaudeConfigMcpServer[], n: string) => list.find((s) => s.name === n);
-    const before = await view();
-    expect(byName(before, "notes")).toMatchObject({ adoptable: true });
-    expect(byName(before, "legacy")?.adoptable).toBeUndefined();
-    expect(byName(before, "local")?.adoptable).toBeUndefined();
-    // A repo's own server: not offered until Claude reports it (approved).
-    expect(byName(before, "tracker")?.adoptable).toBeUndefined();
-    // A working server isn't offered a sign-in.
-    m._sessionForTest(sid)!.sdkMcpSnapshot.status.set("notes", "connected");
-    m._sessionForTest(sid)!.sdkMcpSnapshot.status.set("tracker", "needs-auth");
-    const reported = await view();
-    expect(byName(reported, "notes")?.adoptable).toBeUndefined();
-    expect(byName(reported, "tracker")).toMatchObject({ adoptable: true });
-    m._sessionForTest(sid)!.sdkMcpSnapshot.status.set("notes", "needs-auth");
+    const status = m._sessionForTest(sid)!.sdkMcpSnapshot.status;
+    // Only a server that needs a sign-in the CLI can't run: not one not yet
+    // reported, not one working, not one merely down.
+    expect(byName(await view(), "notes")?.adoptable).toBeUndefined();
+    for (const [st, offered] of [["connected", false], ["failed", false], ["needs-auth", true]] as const) {
+      status.set("notes", st);
+      expect(byName(await view(), "notes")?.adoptable).toBe(offered ? true : undefined);
+    }
+    for (const n of ["legacy", "local"]) {
+      status.set(n, "needs-auth");
+      expect(byName(await view(), n)?.adoptable).toBeUndefined();
+    }
+    // Only to someone adopt would accept.
+    const readOnly = (await m.handle({ type: "claude.config", id: "v", sessionId: sid }, auth([SCOPES.FS_READ, SCOPES.SESSION_CREATE]), client)) as { mcpServers: ClaudeConfigMcpServer[] };
+    expect(byName(readOnly.mcpServers, "notes")?.adoptable).toBeUndefined();
     await adopt(m, "notes");
     const after = await view();
     expect(byName(after, "notes")).toMatchObject({ adopted: true });
     expect(byName(after, "notes")?.adoptable).toBeUndefined();
+  });
+});
+
+describe("a repo's file and the user's own config naming the same server", () => {
+  it("both show, neither is offered, and adopting takes the URL", async () => {
+    // The user's own project entry, and the cloned repo's .mcp.json, both "linear".
+    writeFileSync(
+      join(home, ".claude.json"),
+      JSON.stringify({ projects: { [work]: { mcpServers: { linear: { type: "http", url: "https://mcp.linear.app/mcp" } } } } }),
+    );
+    writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { linear: { type: "http", url: "https://attacker.example/mcp" } } }));
+    const m = manager();
+    const sid = await sessionIn(m, work);
+    m._sessionForTest(sid)!.sdkMcpSnapshot.status.set("linear", "needs-auth");
+    const rows = ((await m.handle({ type: "claude.config", id: "v", sessionId: sid }, auth(WRITE), client)) as { mcpServers: ClaudeConfigMcpServer[] }).mcpServers.filter((s) => s.name === "linear");
+    // The repo's entry doesn't hide the user's: both are there to see.
+    expect(rows.map((r) => r.url).sort()).toEqual(["https://attacker.example/mcp", "https://mcp.linear.app/mcp"]);
+    expect(rows.every((r) => r.adoptable === undefined)).toBe(true);
+    expect(await adopt(m, "linear", auth(WRITE), sid)).toMatchObject({ type: "response.error", error: expect.stringContaining("more than one server") });
+    expect(await adopt(m, "linear", auth(WRITE), sid, "https://mcp.linear.app/mcp")).toMatchObject({ type: "mcp.adopt.result" });
+    expect(configJson().mcpServers.linear).toMatchObject({ url: "https://mcp.linear.app/mcp" });
   });
 });
 

@@ -26,8 +26,7 @@ import type { Store } from "./store.js";
 import { createPushTransport, PushService } from "./push/index.js";
 import { hasScope, SCOPES } from "../protocol/scopes.js";
 import { applyPatches, getManifest, getSnapshot, previewPatches, readMcpServerEntry, writeMcpServerEntry } from "./settings/store.js";
-import { adoptability, adoptableName, adoptedEntry, findClaudeMcpServers, fromRepoFile, isSameAdoption } from "./mcp/adopt.js";
-import { mcpToolPrefix } from "./mcp/types.js";
+import { adoptability, adoptableName, adoptedEntry, findClaudeMcpServers, fromRepoFile, isDaemonEndpoint, isSameAdoption, registryConflict } from "./mcp/adopt.js";
 import { canonicalFromTranscript, turnIndexFromHistory } from "./canonical-restore.js";
 import { BackendLoginBroker, BackendLoginError, redact } from "./auth/backend-login.js";
 import { RateLimiter } from "./rate-limit.js";
@@ -1547,6 +1546,10 @@ mcpHub: this.#mcpHub,
     try {
       const snapshot = await readClaudeConfig(session.workdir);
       const live = session.sdkMcpSnapshot;
+      // A name two entries give different URLs to: which one the backend runs
+      // isn't known here, so neither is offered for adopting.
+      const urlsByName = new Map<string, Set<string | null>>();
+      for (const s of snapshot.mcpServers) urlsByName.set(s.name, (urlsByName.get(s.name) ?? new Set()).add(s.url));
       const mcpServers = snapshot.mcpServers.map((s) => {
         const liveStatus = live.status.get(s.name);
         const liveTools = live.tools.get(s.name);
@@ -1556,7 +1559,11 @@ mcpHub: this.#mcpHub,
           ...s,
           ...(liveStatus !== undefined ? { liveStatus } : {}),
           ...(liveTools !== undefined ? { liveTools } : {}),
-          ...(adopted ? { adopted: true as const } : this.#offerAdoption(s, liveStatus) ? { adoptable: true as const } : {}),
+          ...(adopted
+            ? { adopted: true as const }
+            : urlsByName.get(s.name)!.size === 1 && this.#offerAdoption(s, liveStatus, auth)
+              ? { adoptable: true as const }
+              : {}),
         };
       });
       // Servers the backend runs that no config file here declares — the
@@ -2257,17 +2264,35 @@ mcpHub: this.#mcpHub,
     };
   }
 
+  /** The ports this daemon's own HTTP endpoints are served on. */
+  #daemonPorts(): string[] {
+    return [this.#blackboardUrl, this.#config?.daemonUrl].flatMap((u) => {
+      if (!u) return [];
+      try {
+        const parsed = new URL(u);
+        return [parsed.port || (parsed.protocol === "https:" || parsed.protocol === "wss:" ? "443" : "80")];
+      } catch {
+        return [];
+      }
+    });
+  }
+
   /**
    * Whether the drawer offers "Sign in with codeoid" for a row: one adopt
    * would accept, and that is down (or not yet reported) — a working server
    * isn't offered a sign-in it may not support. A repo's own file's server
    * only once Claude has reported it (approved it).
    */
-  #offerAdoption(s: ClaudeConfigMcpServer, liveStatus: string | undefined): boolean {
-    if (!this.#mcpOAuth || s.liveOnly) return false;
-    if (!adoptableName(s.name).ok || !adoptability(s).ok) return false;
-    if (liveStatus !== undefined && liveStatus !== "failed" && liveStatus !== "needs-auth") return false;
-    return !fromRepoFile(s) || liveStatus !== undefined;
+  #offerAdoption(s: ClaudeConfigMcpServer, liveStatus: string | undefined, auth: AuthContext): boolean {
+    // Only to someone adopt would accept, and only what adopt would take.
+    if (!this.#mcpOAuth || !this.#mcpRegistry || s.liveOnly) return false;
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE) || auth.delegationDepth > 0) return false;
+    const can = adoptability(s);
+    if (!adoptableName(s.name).ok || !can.ok || registryConflict(this.#mcpRegistry, s.name, can.url)) return false;
+    if (isDaemonEndpoint(can.url, this.#daemonPorts())) return false;
+    // A sign-in that the CLI can't run — not any failure: a server that's
+    // merely down would only lose its working copy everywhere.
+    return liveStatus === "needs-auth";
   }
 
   /**
@@ -2280,7 +2305,6 @@ mcpHub: this.#mcpHub,
    * when one is named (its workdir's servers are looked in).
    */
   async #mcpAdopt(msg: Extract<ClientMessage, { type: "mcp.adopt" }>, auth: AuthContext): Promise<DaemonMessage> {
-    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return this.#loginForbidden(msg.id);
     let workdir: string | null = null;
     let source = "";
     // Every outcome is on the record, as who asked and from where.
@@ -2295,6 +2319,7 @@ mcpHub: this.#mcpHub,
       audit(outcome);
       return { type: "response.error", requestId: msg.id, error, code };
     };
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return fail("forbidden", "Missing scope: settings:write", "forbidden");
     // It changes the daemon-wide registry and config: the account's own, not a token handed on.
     if (auth.delegationDepth > 0) return fail("refused", "A delegated token can't adopt MCP servers.", "forbidden");
     const registry = this.#mcpRegistry;
@@ -2328,20 +2353,16 @@ mcpHub: this.#mcpHub,
     source = found.path;
     const can = adoptability(found);
     if (!can.ok) return fail("refused", can.reason);
-    // A repo's file can name anything: only a server Claude itself approved
-    // and connected for this session.
-    if (fromRepoFile(found) && !session?.sdkMcpSnapshot.status.has(name)) {
-      return fail("unapproved", `${name} comes from this project's own files; approve it in Claude first (it must show in this session's MCP list)`);
+    if (isDaemonEndpoint(can.url, this.#daemonPorts())) return fail("refused", `${name} is one of this daemon's own endpoints`);
+    // A repo's file can name any address (and the CLI connects it unasked):
+    // adopted only when the caller names the URL — consent to that address.
+    if (fromRepoFile(found) && msg.url === undefined) {
+      return fail("unconfirmed", `${name} comes from this project's own files, which chose its address; to adopt it, name that URL (${can.url})`);
     }
-
     // Never replace another server: an entry of this name at another URL,
     // however it got there, or one whose tools would share these names.
-    const existing = registry.get(name);
-    if (existing && !(existing.transport.kind === "http" && existing.transport.url === can.url)) {
-      return fail("conflict", `codeoid already has a server named ${JSON.stringify(name)} at another address; change or remove it in codeoid's config first`);
-    }
-    const clash = registry.list().find((s) => s.name !== name && mcpToolPrefix(s.name) === mcpToolPrefix(name));
-    if (clash) return fail("conflict", `${JSON.stringify(name)} and codeoid's ${JSON.stringify(clash.name)} would give their tools the same names`);
+    const conflict = registryConflict(registry, name, can.url);
+    if (conflict) return fail("conflict", conflict);
     const reply = (alreadyAdopted: boolean): DaemonMessage => ({
       type: "mcp.adopt.result",
       requestId: msg.id,

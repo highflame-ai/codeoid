@@ -252,7 +252,26 @@ describe("using the credential", () => {
     await connect(oauth, s);
     fake.revokeRefreshTokens();
     now += 600_000;
+    expect(oauth.status(s, TENANT)).toBe("connected"); // a refresh token, not yet tried
     expect(await oauth.accessToken(s, TENANT)).toBeUndefined();
+    // The dead tokens are forgotten: it reads as signed out (Settings offers
+    // Connect), not signed in and failing (#390).
+    expect(oauth.status(s, TENANT)).toBe("disconnected");
+    expect(oauth.credentialStamp(s, TENANT)).toBeUndefined();
+  });
+
+  it("stamps the credential, and a new sign-in changes the stamp (#390)", async () => {
+    fake = new FakeOAuthMcp();
+    const oauth = engine();
+    const s = spec();
+    expect(oauth.credentialStamp(s, TENANT)).toBeUndefined();
+    await connect(oauth, s);
+    const first = oauth.credentialStamp(s, TENANT)!;
+    expect(first).toMatch(/^[0-9a-f]{16}$/); // a digest, never the token
+    expect(oauth.credentialStamp(s, TENANT)).toBe(first);
+    oauth.disconnect(s, TENANT);
+    await connect(oauth, s);
+    expect(oauth.credentialStamp(s, TENANT)).not.toBe(first);
   });
 
   it("forgets the tokens on disconnect", async () => {

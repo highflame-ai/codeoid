@@ -348,13 +348,15 @@ const McpReconnect: Component<{ sessionId: string; server: string }> = (props) =
  * then start codeoid's sign-in. Shown on a remote server codeoid could adopt —
  * one the Claude CLI could only sign in to from an interactive terminal.
  */
-const McpAdopt: Component<{ server: string; url: string | null }> = (props) => {
+const McpAdopt: Component<{ server: string; url: string | null; path: string; projectFile: boolean }> = (props) => {
   const st = () => mcpOAuthState();
   const mine = () => st().server === props.server;
   const run = async () => {
-    // Daemon-wide and lasting: say so before doing it.
+    // Daemon-wide and lasting: say so before doing it — and, for a project's
+    // own file, that the project chose this address.
+    const origin = props.projectFile ? `\n\nThis server comes from this project's own ${props.path}, which chose its address. Adopt it only if you trust that address.` : "";
     const ok = window.confirm(
-      `codeoid will sign in to ${props.server} (${props.url ?? "this server"}) itself, and every codeoid session will use it from now on, instead of the Claude CLI's own copy. Continue?`,
+      `codeoid will sign in to ${props.server} at ${props.url ?? "this server"} itself, and every codeoid session will use it from now on, instead of the Claude CLI's own copy.${origin}\n\nContinue?`,
     );
     if (!ok) return;
     const sid = claudeConfig().sessionId;
@@ -448,7 +450,7 @@ const McpList: Component<{ items: ClaudeConfigMcpServer[]; sessionId: string | n
                 <McpReconnect sessionId={props.sessionId!} server={m.name} />
               </Show>
               <Show when={m.adoptable}>
-                <McpAdopt server={m.name} url={m.url} />
+                <McpAdopt server={m.name} url={m.url} path={m.path} projectFile={m.scope === "workdir" && !m.path.endsWith("/.claude.json")} />
               </Show>
               <Show when={m.adopted}>
                 <span

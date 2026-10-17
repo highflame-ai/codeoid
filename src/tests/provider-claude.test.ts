@@ -39,6 +39,9 @@ let mcpStatuses: Array<Record<string, unknown>> = [];
 let mcpReconnects: string[] = [];
 let mcpReconnectError: Error | null = null;
 let mcpServerSets: Array<Record<string, unknown>> = [];
+/** When set, setMcpServers waits for it (a slow swap) / fails with it. */
+let mcpSetGate: Promise<void> | null = null;
+let mcpSetError: Error | null = null;
 
 function makeMockQuery() {
   const err = sdkThrowError;
@@ -67,6 +70,8 @@ function makeMockQuery() {
     mcpServerStatus: async () => mcpStatuses,
     setMcpServers: async (servers: Record<string, unknown>) => {
       mcpServerSets.push(servers);
+      if (mcpSetGate) await mcpSetGate;
+      if (mcpSetError) throw mcpSetError;
       return { added: Object.keys(servers), removed: [], errors: {} };
     },
   };
@@ -1793,7 +1798,7 @@ describe("ClaudeProvider – OAuth registry servers (#390)", () => {
     const { McpRegistry } = await import("../daemon/mcp/registry.js");
     const registry = new McpRegistry({ notes: McpServerSchema.parse({ url: "https://notes.example.com/mcp", oauth: true }) }, { memoryEnabled: false });
     let signedIn = false;
-    const hub = { signedIn: () => signedIn } as never;
+    const hub = { signedIn: () => signedIn, credentialStamp: () => (signedIn ? "s1" : undefined) } as never;
     const provider = new ClaudeProvider({
       sessionId: "test-session",
       initialBackingId: "test-backing",
@@ -1828,15 +1833,120 @@ describe("ClaudeProvider – OAuth registry servers (#390)", () => {
     signedIn = true;
     mcpServerSets = [];
     turn("t3");
+    await Bun.sleep(5);
     expect(queryCallCount).toBe(1); // a sign-in doesn't restart the CLI (its background work survives)...
     expect(mcpServerSets).toHaveLength(1); // ...the live query's servers are swapped instead
     expect(mcpServerSets[0]!.notes).toMatchObject({ type: "sdk" });
-    // codeoid's own servers stay, last, whatever was adopted.
     turn("t4");
+    await Bun.sleep(5);
     expect(mcpServerSets).toHaveLength(1); // nothing changed since
 
     openGate();
     await provider.teardown();
+  });
+});
+
+describe("ClaudeProvider – swapping a live query's MCP servers (#390)", () => {
+  let openGate: () => void = () => {};
+  let signedIn = false;
+  beforeEach(() => {
+    sdkMessages = [];
+    sdkThrowError = null;
+    capturedQueryOpts = null;
+    queryCallCount = 0;
+    mcpServerSets = [];
+    mcpSetGate = null;
+    mcpSetError = null;
+    signedIn = false;
+    sdkGate = new Promise<void>((r) => {
+      openGate = r;
+    });
+  });
+
+  async function provider(): Promise<ClaudeProvider> {
+    const { McpServerSchema } = await import("../config.js");
+    const { McpRegistry } = await import("../daemon/mcp/registry.js");
+    return new ClaudeProvider({
+      sessionId: "test-session",
+      initialBackingId: "test-backing",
+      workspaceId: "ws_test",
+      tenant: { accountId: "acc", projectId: "proj" },
+      mcpRegistry: new McpRegistry({ notes: McpServerSchema.parse({ url: "https://notes.example.com/mcp", oauth: true }) }, { memoryEnabled: false }),
+      mcpHub: { signedIn: () => signedIn, credentialStamp: () => (signedIn ? "s1" : undefined) } as never,
+      store: {
+        audit: () => {},
+        getClaudeCodeSessionId: () => null,
+        setClaudeCodeSessionId: () => {},
+        getSkillCommandGrants: () => new Map<string, boolean>(),
+        setSkillCommandGrant: () => {},
+      } as never,
+    });
+  }
+  const turn = (p: ClaudeProvider, msg: string) =>
+    p.runTurn({ history: [], userMessage: msg, workdir: "/tmp", canUseTool: async () => ({ behavior: "allow" as const }) });
+  const delivered = () => (capturedQueryOpts?.prompt as { size: number }).size;
+  const settle = () => Bun.sleep(5);
+
+  it("a turn's message waits for the swap, then goes — in order", async () => {
+    const p = await provider();
+    turn(p, "t1");
+    expect(delivered()).toBe(1);
+    let release!: () => void;
+    mcpSetGate = new Promise((r) => {
+      release = r;
+    });
+    signedIn = true;
+    turn(p, "t2");
+    await settle();
+    expect(mcpServerSets).toHaveLength(1);
+    expect(delivered()).toBe(1); // held: the CLI must see the new servers first
+    release();
+    await settle();
+    expect(delivered()).toBe(2);
+    expect(queryCallCount).toBe(1);
+    openGate();
+    await p.teardown();
+  });
+
+  it("an interrupt while the message is held drops it and ends the turn", async () => {
+    const p = await provider();
+    turn(p, "t1");
+    let release!: () => void;
+    mcpSetGate = new Promise((r) => {
+      release = r;
+    });
+    signedIn = true;
+    const run = turn(p, "t2");
+    await settle();
+    await run.interrupt();
+    const events: ProviderEvent[] = [];
+    for await (const e of run.events) {
+      events.push(e);
+      if (e.type === "turn_done") break;
+    }
+    expect(events.at(-1)).toMatchObject({ type: "turn_done", result: { stopReason: "interrupted" } });
+    release();
+    await settle();
+    expect(delivered()).toBe(1); // the held prompt never reached the CLI
+    openGate();
+    await p.teardown();
+  });
+
+  it("a swap that fails is tried again on the next turn", async () => {
+    const p = await provider();
+    turn(p, "t1");
+    mcpSetError = new Error("boom");
+    signedIn = true;
+    turn(p, "t2");
+    await settle();
+    expect(mcpServerSets).toHaveLength(1);
+    mcpSetError = null;
+    turn(p, "t3");
+    await settle();
+    expect(mcpServerSets).toHaveLength(2); // retried, though nothing changed since
+    expect(mcpServerSets[1]!.notes).toMatchObject({ type: "sdk" });
+    openGate();
+    await p.teardown();
   });
 });
 

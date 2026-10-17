@@ -82,8 +82,6 @@ export function canonicalToolName(server: string, tool: string): string {
   return `mcp__${server}__${tool}`;
 }
 
-/** True when `spec` should be delivered by codeoid owning the client (Model B
- *  + the default for Model A), vs synced into the backend's native config. */
 /**
  * The server part of an MCP tool name (`mcp__<this>__<tool>`), as the Claude
  * CLI derives it from the server's name: anything outside [A-Za-z0-9_-]
@@ -120,6 +118,8 @@ export const OAUTH_UNSUPPORTED_BACKENDS: readonly string[] = NATIVE_MOUNT_BACKEN
   (b) => !OAUTH_BRIDGED_BACKENDS.includes(b),
 );
 
+/** True when `spec` should be delivered by codeoid owning the client (Model B
+ *  + the default for Model A), vs synced into the backend's native config. */
 export function isProxied(spec: McpServerSpec): boolean {
   return !spec.native;
 }
