@@ -55,6 +55,12 @@ export interface McpAdoptMsg {
   server: string;
   /** A session whose workdir's servers to look in, beside the global ones. */
   sessionId?: string;
+  /**
+   * The URL the caller was shown for it. Two entries can share a name (a
+   * global one and a repo's); this says which is meant, and a mismatch is
+   * refused. Without it, a name that means two URLs is refused.
+   */
+  url?: string;
 }
 
 // ── Messages (daemon → client) ────────────────────────────────────────────────

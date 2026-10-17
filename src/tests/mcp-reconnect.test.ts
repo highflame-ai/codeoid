@@ -7,7 +7,7 @@
 
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CodeoidConfig } from "../config.js";
@@ -16,9 +16,6 @@ import { MockSessionProvider } from "../daemon/providers/mock/session-provider.j
 import { ProviderRegistry } from "../daemon/providers/registry.js";
 import { SessionManager } from "../daemon/session-manager.js";
 import { MCP_TIMINGS, cleanMcpError } from "../daemon/session.js";
-import { McpServerSchema } from "../config.js";
-import { McpHub } from "../daemon/mcp/hub.js";
-import { McpRegistry } from "../daemon/mcp/registry.js";
 import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
 import { ALL_SCOPES, WATCHER_SCOPES } from "../protocol/scopes.js";
@@ -90,9 +87,14 @@ function manager(): SessionManager {
   return m;
 }
 
+let prevHome: string | undefined;
 beforeEach(() => {
   tmp = mkdtempSync(join(tmpdir(), "codeoid-mcp-reconnect-"));
   mkdirSync(join(tmp, "work"));
+  // Claude's config is read for sign-in hints: not this machine's.
+  mkdirSync(join(tmp, "home"));
+  prevHome = process.env.HOME;
+  process.env.HOME = join(tmp, "home");
   store = new Store(join(tmp, "codeoid.db"));
   transcript = new TranscriptStore(join(tmp, "transcripts"));
   managers = [];
@@ -102,6 +104,8 @@ beforeEach(() => {
 });
 afterEach(async () => {
   Object.assign(MCP_TIMINGS, TIMINGS);
+  if (prevHome === undefined) delete process.env.HOME;
+  else process.env.HOME = prevHome;
   for (const m of managers) await m.drain(2_000).catch(() => {});
   await transcript.flush();
   rmSync(tmp, { recursive: true, force: true });
@@ -172,14 +176,24 @@ describe("session.mcp_reconnect", () => {
     expect(r.data.error).toContain("claude.ai connector settings");
   });
 
-  it("a remote server from the user's own config is pointed at codeoid's sign-in first (#390)", async () => {
-    answer = () => ({ status: "needs-auth", tools: [], adoptable: true });
+  it("a remote server in Claude's config is pointed at codeoid's sign-in first, with the command that finds it (#390)", async () => {
+    // The project's own server: the command must name the session to find it.
+    writeFileSync(join(tmp, "work", ".mcp.json"), JSON.stringify({ mcpServers: { slack: { type: "http", url: "https://slack.example.com/mcp" } } }));
+    answer = () => ({ status: "needs-auth", tools: [] });
     const m = manager();
     const id = await sessionAfterFirstTurn(m);
     const r = (await reconnect(m, id)) as { data: McpReconnectResult };
     expect(r.data.error).toContain('"Sign in with codeoid"');
-    expect(r.data.error).toContain("codeoid mcp adopt slack");
+    expect(r.data.error).toContain(`codeoid mcp adopt slack --session ${m._sessionForTest(id)!.name}`);
     expect(r.data.error).toContain("interactive Claude Code session"); // still offered
+  });
+
+  it("a server Claude's config has no remote entry for gets the CLI's sign-in guidance only", async () => {
+    answer = () => ({ status: "needs-auth", tools: [] });
+    const m = manager();
+    const id = await sessionAfterFirstTurn(m);
+    const r = (await reconnect(m, id)) as { data: McpReconnectResult };
+    expect(r.data.error).not.toContain("codeoid mcp adopt");
   });
 
   it("a server only named like a connector gets the CLI's sign-in guidance", async () => {
@@ -282,16 +296,16 @@ describe("healing before a turn", () => {
     expect(note).not.toContain("evil");
   });
 
-  it("a server adopted by codeoid since is not redialed through the CLI's own copy (#390)", async () => {
-    answer = () => ({ status: "connected", tools: [] });
+  it("the CLI's own copy of a server codeoid signs in to now is left as it was (#390)", async () => {
+    // The backend says the copy it runs is at a URL codeoid owns: it didn't redial it.
+    answer = () => ({ status: "needs-auth", tools: [], codeoidOwned: true });
     const m = manager();
-    // codeoid owns slack now (adopted): the next query mounts codeoid's copy.
-    m.setMcp(new McpRegistry({ slack: McpServerSchema.parse({ url: "https://slack.example.com/mcp", oauth: true }) }, { memoryEnabled: false }), new McpHub({}));
     const id = await sessionAfterFirstTurn(m);
-    await send(m, id, "two");
-    expect(provider.mcpReconnects).toEqual([]); // the pre-turn redial left it alone
-    expect(await reconnect(m, id)).toMatchObject({ type: "response.error", error: expect.stringContaining("codeoid signs in to slack now") });
-    expect(provider.mcpReconnects).toEqual([]);
+    const r = (await reconnect(m, id)) as { data: McpReconnectResult };
+    expect(r.data.error).toContain("codeoid signs in to slack now");
+    // Not taken as the server's state, and nothing announced.
+    expect(m._sessionForTest(id)!.sdkMcpSnapshot.status.get("slack")).toBe("failed");
+    expect(infos(m, id).some((x) => x.includes("reconnected"))).toBe(false);
   });
 
   it("a server that stays down is retried with a wait, not before every turn", async () => {

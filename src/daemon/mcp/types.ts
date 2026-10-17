@@ -84,6 +84,18 @@ export function canonicalToolName(server: string, tool: string): string {
 
 /** True when `spec` should be delivered by codeoid owning the client (Model B
  *  + the default for Model A), vs synced into the backend's native config. */
+/**
+ * The server part of an MCP tool name (`mcp__<this>__<tool>`), as the Claude
+ * CLI derives it from the server's name: anything outside [A-Za-z0-9_-]
+ * becomes `_`, and for a claude.ai connector runs of `_` collapse and the
+ * ends are trimmed (CLI 2.1.281). Two names that map to the same prefix give
+ * their tools the same names — so a reserved name is reserved in this form.
+ */
+export function mcpToolPrefix(name: string): string {
+  const t = name.replace(/[^a-zA-Z0-9_-]/g, "_");
+  return name.startsWith("claude.ai ") ? t.replace(/_+/g, "_").replace(/^_|_$/g, "") : t;
+}
+
 /** True when a server is configured for OAuth. */
 export function isOAuthServer(spec: McpServerSpec): boolean {
   return spec.transport.kind === "http" && spec.transport.oauth !== undefined;

@@ -92,7 +92,7 @@ export class McpOAuthUnbound extends Error {
   constructor() {
     super(
       "This browser did not start this sign-in, so it was not completed here. " +
-        "To finish it, copy this page's address into codeoid: Settings → MCP Servers → Finish.",
+        "To finish it, copy this page's address into codeoid: Settings → MCP Servers → Finish, or paste it into `codeoid mcp signin`.",
     );
     this.name = "McpOAuthUnbound";
   }

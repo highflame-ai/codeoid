@@ -107,6 +107,27 @@ export class McpHub {
     }
   }
 
+  /**
+   * List a server's tools, or throw why not (not signed in, a revoked token,
+   * a server down, a timeout) — for a caller that reports the failure itself,
+   * like Claude's in-process mount (#390), where an empty list would read as a
+   * healthy server with no tools. Timed like a call.
+   */
+  async listToolsOrThrow(spec: McpServerSpec, scope?: McpCallScope): Promise<McpToolDef[]> {
+    const key = clientKey(spec, scope?.tenant);
+    try {
+      const client = this.#clientFor(spec, scope?.tenant);
+      const all = await withTimeout(client.listTools(), this.#timeoutMs, `${spec.name}/tools/list`);
+      const tools = spec.toolAllowlist ? all.filter((t) => spec.toolAllowlist?.includes(t.name)) : all;
+      this.#status.set(key, { tools: tools.map((t) => t.name) });
+      return tools;
+    } catch (e) {
+      if (!(e instanceof McpSignInRequired)) this.#status.set(key, { tools: [], error: errMsg(e) });
+      this.#drop(key);
+      throw e;
+    }
+  }
+
   /** Call one tool. Enforces the allowlist and a per-call timeout; a failure
    *  (throw, timeout, isError) comes back as `{isError:true}` so the caller can
    *  feed it to the model instead of wedging the turn. */

@@ -31,9 +31,10 @@ function registry(): McpRegistry {
 function fakeHub(signedIn: Set<string>, calls: Array<{ server: string; tool: string; args: unknown; scope: McpCallScope }> = []): McpHub {
   return {
     signedIn: (spec: McpServerSpec) => signedIn.has(spec.name),
-    listTools: async (spec: McpServerSpec) => [
-      { name: "search", description: `search ${spec.name}`, inputSchema: { type: "object", properties: { q: { type: "string" } }, required: ["q"] } },
-    ],
+    listToolsOrThrow: async (spec: McpServerSpec) => {
+      if (spec.name === "broken") throw new Error("broken needs sign-in — connect it in Settings (MCP servers)");
+      return [{ name: "search", description: `search ${spec.name}`, inputSchema: { type: "object", properties: { q: { type: "string" } }, required: ["q"] } }];
+    },
     callTool: async (spec: McpServerSpec, tool: string, args: Record<string, unknown>, scope: McpCallScope) => {
       calls.push({ server: spec.name, tool, args, scope });
       return { text: `${spec.name}/${tool}: ${JSON.stringify(args)}`, isError: false };
@@ -48,20 +49,24 @@ describe("oauthServersForClaude", () => {
     expect(got.mounts().notes).toMatchObject({ type: "sdk", name: "notes" });
     // tracker isn't signed in: not mounted, but the CLI still mustn't connect its own copy.
     expect(got.deniedUrls).toEqual(["https://notes.example.com/mcp", "https://tracker.example.com/mcp"]);
-    expect(got.names).toEqual(["notes", "tracker"]); // not codexOnly, not plain
+    // not codexOnly (not for claude), not plain (not OAuth: the CLI mounts that one)
   });
 
-  it("changes its fingerprint on a sign-in, not on a repeat look", () => {
+  it("a sign-in changes what's mounted, not what the query is built with; adopting changes both", () => {
     const signed = new Set<string>();
     const reg = registry();
-    const a = oauthServersForClaude(reg, fakeHub(signed), SCOPE).fingerprint;
-    expect(oauthServersForClaude(reg, fakeHub(signed), SCOPE).fingerprint).toBe(a);
+    const a = oauthServersForClaude(reg, fakeHub(signed), SCOPE);
+    expect(oauthServersForClaude(reg, fakeHub(signed), SCOPE)).toMatchObject({ fingerprint: a.fingerprint, mountFingerprint: a.mountFingerprint });
     signed.add("tracker");
-    expect(oauthServersForClaude(reg, fakeHub(signed), SCOPE).fingerprint).not.toBe(a);
+    const b = oauthServersForClaude(reg, fakeHub(signed), SCOPE);
+    expect(b.fingerprint).toBe(a.fingerprint); // no rebuild for a sign-in
+    expect(b.mountFingerprint).not.toBe(a.mountFingerprint); // a live update instead
+    reg.upsert("another", McpServerSchema.parse({ url: "https://another.example.com/mcp", oauth: true }));
+    expect(oauthServersForClaude(reg, fakeHub(signed), SCOPE).fingerprint).not.toBe(a.fingerprint); // a new denylist: rebuild
   });
 
   it("with no hub or registry, mounts nothing and denies nothing", () => {
-    expect(oauthServersForClaude(undefined, undefined, SCOPE)).toMatchObject({ deniedUrls: [], names: [] });
+    expect(oauthServersForClaude(undefined, undefined, SCOPE)).toMatchObject({ deniedUrls: [] });
     expect(Object.keys(oauthServersForClaude(registry(), undefined, SCOPE).mounts())).toEqual([]);
   });
 });
@@ -82,6 +87,17 @@ describe("the in-process bridge", () => {
     const r = await client.callTool({ name: "search", arguments: { q: "roadmap" } });
     expect(r).toMatchObject({ content: [{ type: "text", text: 'notes/search: {"q":"roadmap"}' }], isError: false });
     expect(calls).toEqual([{ server: "notes", tool: "search", args: { q: "roadmap" }, scope: SCOPE }]);
+    await client.close();
+  });
+
+  it("a server it can't list (signed out, revoked, down) is an error, not a healthy server with no tools", async () => {
+    const spec = { ...registry().get("notes")!, name: "broken" };
+    const bridge = oauthBridgeServer(spec, fakeHub(new Set(["broken"])), SCOPE);
+    const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+    await bridge.instance.connect(serverSide);
+    const client = new Client({ name: "t", version: "1" });
+    await client.connect(clientSide);
+    await expect(client.listTools()).rejects.toThrow("needs sign-in");
     await client.close();
   });
 });

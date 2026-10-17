@@ -98,8 +98,9 @@ A baked-in token cannot work for native backends: an access token lives about an
 **Claude (#390)** takes them in-process: for each OAuth registry server the tenant has signed in to, the provider mounts an SDK server under the server's own name (so tools stay `mcp__<server>__<tool>`) whose `tools/list` and `tools/call` go to `McpHub` with the session's tenant (`providers/claude/oauth-bridge.ts`).
 The token stays in the daemon, refresh and the `401` retry are the hub's, and nothing listens on a port.
 The CLI must not also connect its own copy (from `~/.claude.json` or a `.mcp.json`): a same-name mount alone doesn't stop it (measured: the CLI still dials its copy), so the provider passes every OAuth server's URL in the flag settings' `deniedMcpServers`, and leaves those servers out of the user servers it passes in.
-The set (servers, and which are signed in) is part of the query's rebuild guard, so adopting or signing in takes effect on the next turn.
-A session never redials the CLI's copy of a server codeoid owns.
+The denylist is fixed at query construction, so adopting a server rebuilds the query on the next turn; signing in or out only changes which in-process servers are mounted, which the provider applies to the running query with `setMcpServers` (codeoid's servers only), queuing the turn's message behind it — no restart, so the session's background work survives.
+A session never redials the CLI's copy of a server at a URL codeoid owns (decided by URL, by the provider, which sees the copy's config).
+A server the hub can't list (signed out, a revoked token, down, a timeout) makes the in-process server's `tools/list` fail, so the CLI reports it failed rather than connected with no tools.
 
 The proxy below is the planned way to close the gap for the other native backends; nothing else in this design depends on it.
 

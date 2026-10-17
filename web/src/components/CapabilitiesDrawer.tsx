@@ -348,12 +348,17 @@ const McpReconnect: Component<{ sessionId: string; server: string }> = (props) =
  * then start codeoid's sign-in. Shown on a remote server codeoid could adopt —
  * one the Claude CLI could only sign in to from an interactive terminal.
  */
-const McpAdopt: Component<{ server: string }> = (props) => {
+const McpAdopt: Component<{ server: string; url: string | null }> = (props) => {
   const st = () => mcpOAuthState();
   const mine = () => st().server === props.server;
   const run = async () => {
+    // Daemon-wide and lasting: say so before doing it.
+    const ok = window.confirm(
+      `codeoid will sign in to ${props.server} (${props.url ?? "this server"}) itself, and every codeoid session will use it from now on, instead of the Claude CLI's own copy. Continue?`,
+    );
+    if (!ok) return;
     const sid = claudeConfig().sessionId;
-    await adoptAndSignIn(props.server, sid);
+    await adoptAndSignIn(props.server, sid, props.url);
     // The row turns into codeoid's copy, with its sign-in controls.
     if (sid) await fetchClaudeConfig(sid).catch(() => {});
   };
@@ -377,10 +382,11 @@ const McpAdopt: Component<{ server: string }> = (props) => {
 
 /** Sign-in controls for a server codeoid has adopted: its settings row's own. */
 const AdoptedSignIn: Component<{ server: string }> = (props) => {
-  onMount(() => {
-    if (!settingsState().snapshot) void fetchSettings();
-  });
   const status = () => settingsState().snapshot?.mcpServers?.find((s) => s.name === props.server && s.oauth);
+  // Adopted elsewhere (the CLI, another tab) since settings were read: read them again.
+  onMount(() => {
+    if (!status()) void fetchSettings(true);
+  });
   return (
     <Show when={status()}>
       {(s) => <McpOAuthControls server={s()} />}
@@ -442,7 +448,7 @@ const McpList: Component<{ items: ClaudeConfigMcpServer[]; sessionId: string | n
                 <McpReconnect sessionId={props.sessionId!} server={m.name} />
               </Show>
               <Show when={m.adoptable}>
-                <McpAdopt server={m.name} />
+                <McpAdopt server={m.name} url={m.url} />
               </Show>
               <Show when={m.adopted}>
                 <span

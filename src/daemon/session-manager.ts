@@ -26,7 +26,8 @@ import type { Store } from "./store.js";
 import { createPushTransport, PushService } from "./push/index.js";
 import { hasScope, SCOPES } from "../protocol/scopes.js";
 import { applyPatches, getManifest, getSnapshot, previewPatches, readMcpServerEntry, writeMcpServerEntry } from "./settings/store.js";
-import { adoptability, adoptedEntry, findClaudeMcpServer, isSameAdoption } from "./mcp/adopt.js";
+import { adoptability, adoptableName, adoptedEntry, findClaudeMcpServers, fromRepoFile, isSameAdoption } from "./mcp/adopt.js";
+import { mcpToolPrefix } from "./mcp/types.js";
 import { canonicalFromTranscript, turnIndexFromHistory } from "./canonical-restore.js";
 import { BackendLoginBroker, BackendLoginError, redact } from "./auth/backend-login.js";
 import { RateLimiter } from "./rate-limit.js";
@@ -120,6 +121,7 @@ import type { CompressionRegistry } from "./compress/index.js";
 import { ORCHESTRATOR_ROLE } from "../protocol/types.js";
 import type {
   AuthContext,
+  ClaudeConfigMcpServer,
   ClientMessage,
   CollaborationConfig,
   CollaborationCost,
@@ -1554,7 +1556,7 @@ mcpHub: this.#mcpHub,
           ...s,
           ...(liveStatus !== undefined ? { liveStatus } : {}),
           ...(liveTools !== undefined ? { liveTools } : {}),
-          ...(adopted ? { adopted: true as const } : this.#mcpOAuth && adoptability(s).ok ? { adoptable: true as const } : {}),
+          ...(adopted ? { adopted: true as const } : this.#offerAdoption(s, liveStatus) ? { adoptable: true as const } : {}),
         };
       });
       // Servers the backend runs that no config file here declares — the
@@ -2256,6 +2258,19 @@ mcpHub: this.#mcpHub,
   }
 
   /**
+   * Whether the drawer offers "Sign in with codeoid" for a row: one adopt
+   * would accept, and that is down (or not yet reported) — a working server
+   * isn't offered a sign-in it may not support. A repo's own file's server
+   * only once Claude has reported it (approved it).
+   */
+  #offerAdoption(s: ClaudeConfigMcpServer, liveStatus: string | undefined): boolean {
+    if (!this.#mcpOAuth || s.liveOnly) return false;
+    if (!adoptableName(s.name).ok || !adoptability(s).ok) return false;
+    if (liveStatus !== undefined && liveStatus !== "failed" && liveStatus !== "needs-auth") return false;
+    return !fromRepoFile(s) || liveStatus !== undefined;
+  }
+
+  /**
    * Adopt a remote server from Claude's own config into codeoid's registry
    * (#390): the same URL with codeoid's OAuth sign-in, written to config.json
    * and live in the registry at once — every session, provider and the hub
@@ -2266,54 +2281,100 @@ mcpHub: this.#mcpHub,
    */
   async #mcpAdopt(msg: Extract<ClientMessage, { type: "mcp.adopt" }>, auth: AuthContext): Promise<DaemonMessage> {
     if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return this.#loginForbidden(msg.id);
-    const fail = (error: string, code: "invalid_request" | "not_found" | "internal" = "invalid_request"): DaemonMessage => ({
-      type: "response.error",
-      requestId: msg.id,
-      error,
-      code,
-    });
-    const registry = this.#mcpRegistry;
-    if (!registry || !this.#mcpOAuth) return fail("OAuth for MCP servers is not available on this daemon.", "internal");
     let workdir: string | null = null;
+    let source = "";
+    // Every outcome is on the record, as who asked and from where.
+    const audit = (outcome: string) =>
+      this.#store.audit(
+        auth.sub,
+        "mcp.adopt",
+        msg.sessionId ?? "",
+        `server=${JSON.stringify(msg.server)} outcome=${outcome}${workdir ? ` workdir=${JSON.stringify(workdir)}` : ""}${source ? ` source=${JSON.stringify(source)}` : ""}`,
+      );
+    const fail = (outcome: string, error: string, code: "invalid_request" | "not_found" | "forbidden" | "internal" = "invalid_request"): DaemonMessage => {
+      audit(outcome);
+      return { type: "response.error", requestId: msg.id, error, code };
+    };
+    // It changes the daemon-wide registry and config: the account's own, not a token handed on.
+    if (auth.delegationDepth > 0) return fail("refused", "A delegated token can't adopt MCP servers.", "forbidden");
+    const registry = this.#mcpRegistry;
+    if (!registry || !this.#mcpOAuth) return fail("unavailable", "OAuth for MCP servers is not available on this daemon.", "internal");
+    let session: Session | null = null;
     if (msg.sessionId !== undefined) {
-      const session = this.#getOwnedSession(msg.sessionId, auth);
-      if (!session) return fail("Session not found", "not_found");
+      session = this.#getOwnedSession(msg.sessionId, auth);
+      if (!session) return fail("not_found", "Session not found", "not_found");
       workdir = session.workdir;
     }
-    const found = await findClaudeMcpServer(msg.server, workdir);
-    if (!found) return fail(`Claude's config has no MCP server named ${JSON.stringify(msg.server)}`, "not_found");
+    const name = msg.server;
+    const named = adoptableName(name);
+    if (!named.ok) return fail("refused", named.reason);
+
+    // Which entry: the one at the URL the caller was shown, else the only one.
+    const candidates = await findClaudeMcpServers(name, workdir);
+    const atUrl = msg.url !== undefined ? candidates.filter((c) => c.url === msg.url) : candidates;
+    if (atUrl.length === 0) {
+      return fail(
+        "not_found",
+        msg.url !== undefined
+          ? `Claude's config has no MCP server ${JSON.stringify(name)} at that URL`
+          : `Claude's config has no MCP server named ${JSON.stringify(name)}${workdir ? "" : " (for a project's server, name its session)"}`,
+        "not_found",
+      );
+    }
+    if (new Set(atUrl.map((c) => c.url)).size > 1) {
+      return fail("ambiguous", `${JSON.stringify(name)} names more than one server in Claude's config (${atUrl.map((c) => c.url ?? c.command).join(", ")}); say which URL`);
+    }
+    const found = atUrl[0]!;
+    source = found.path;
     const can = adoptability(found);
-    if (!can.ok) return fail(can.reason);
+    if (!can.ok) return fail("refused", can.reason);
+    // A repo's file can name anything: only a server Claude itself approved
+    // and connected for this session.
+    if (fromRepoFile(found) && !session?.sdkMcpSnapshot.status.has(name)) {
+      return fail("unapproved", `${name} comes from this project's own files; approve it in Claude first (it must show in this session's MCP list)`);
+    }
+
+    // Never replace another server: an entry of this name at another URL,
+    // however it got there, or one whose tools would share these names.
+    const existing = registry.get(name);
+    if (existing && !(existing.transport.kind === "http" && existing.transport.url === can.url)) {
+      return fail("conflict", `codeoid already has a server named ${JSON.stringify(name)} at another address; change or remove it in codeoid's config first`);
+    }
+    const clash = registry.list().find((s) => s.name !== name && mcpToolPrefix(s.name) === mcpToolPrefix(name));
+    if (clash) return fail("conflict", `${JSON.stringify(name)} and codeoid's ${JSON.stringify(clash.name)} would give their tools the same names`);
     const reply = (alreadyAdopted: boolean): DaemonMessage => ({
       type: "mcp.adopt.result",
       requestId: msg.id,
-      server: msg.server,
+      server: name,
       alreadyAdopted,
       snapshot: { ...getSnapshot(), mcpServers: this.#mcpServerStatuses(auth) },
     });
-    let existing: Record<string, unknown> | undefined;
+    let configured: Record<string, unknown> | undefined;
     try {
-      existing = readMcpServerEntry(msg.server);
+      configured = readMcpServerEntry(name);
     } catch (err) {
-      return fail(`config.json is not valid JSON: ${redact(err instanceof Error ? err.message : String(err))}`, "internal");
+      return fail("error", `config.json is not valid JSON: ${redact(err instanceof Error ? err.message : String(err))}`, "internal");
     }
-    if (existing) {
-      if (isSameAdoption(existing, can.url)) return reply(true);
+    if (configured) {
+      if (isSameAdoption(configured, can.url)) {
+        audit("already");
+        return reply(true);
+      }
       // A server the user configured for codeoid by hand is theirs to change.
-      return fail(`codeoid's config already has a server named ${JSON.stringify(msg.server)}; change or remove it there first`);
+      return fail("conflict", `codeoid's config already has a server named ${JSON.stringify(name)}; change or remove it there first`);
     }
     const { entry, raw } = adoptedEntry(can.url);
     let spec: McpServerSpec;
     try {
-      const written = writeMcpServerEntry(msg.server, entry);
-      if (!written.ok) return fail(written.error);
-      spec = registry.upsert(msg.server, raw);
+      const written = writeMcpServerEntry(name, entry);
+      if (!written.ok) return fail("error", written.error);
+      spec = registry.upsert(name, raw);
     } catch (err) {
-      return fail(redact(err instanceof Error ? err.message : String(err)));
+      return fail("error", redact(err instanceof Error ? err.message : String(err)));
     }
     // Any client held for the old entry (a plain copy imported from ~/.claude.json).
     this.#mcpHub?.drop(spec.name);
-    this.#store.audit(auth.sub, "mcp.adopt", msg.sessionId ?? "", `server=${JSON.stringify(msg.server)} host=${new URL(can.url).host} from=${found.scope}`);
+    audit(`adopted host=${new URL(can.url).host}`);
     return reply(false);
   }
 

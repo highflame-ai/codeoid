@@ -11,11 +11,19 @@
 
 import type { RawMcpServerConfig } from "../../config.js";
 import { MEMORY_MCP_SERVER_NAME } from "../memory/mcp-http.js";
-import { isOAuthServer, type McpServerSpec, type McpTransport } from "./types.js";
+import { isOAuthServer, mcpToolPrefix, type McpServerSpec, type McpTransport } from "./types.js";
 
 /** Names codeoid owns internally — a user entry using one is ignored (the
- *  built-in wins) rather than silently shadowing an internal server. */
-const RESERVED_NAMES = new Set<string>([MEMORY_MCP_SERVER_NAME, "codeoid_fleet"]);
+ *  built-in wins) rather than silently shadowing an internal server. Compared
+ *  in the form tool names use (`mcpToolPrefix`): `codeoid.memory` would give
+ *  its tools the built-in's names, some of which are pre-approved. The
+ *  blackboard is mounted by name for collaboration children (#245). */
+const RESERVED_PREFIXES = new Set<string>([MEMORY_MCP_SERVER_NAME, "codeoid_fleet", "codeoid_blackboard"].map(mcpToolPrefix));
+
+/** Whether `name` is, or reads in tool names as, one of codeoid's built-in servers. */
+export function isReservedMcpName(name: string): boolean {
+  return RESERVED_PREFIXES.has(mcpToolPrefix(name));
+}
 
 export interface McpRegistryOptions {
   /** When true, inject the built-in `codeoid_memory` entry (in-process). */
@@ -41,7 +49,7 @@ export class McpRegistry {
       });
     }
     for (const [name, raw] of Object.entries(servers ?? {})) {
-      if (RESERVED_NAMES.has(name)) {
+      if (isReservedMcpName(name)) {
         this.#warnings.push(`mcp: ignoring reserved server name "${name}" (codeoid built-in)`);
         continue;
       }
@@ -76,7 +84,7 @@ export class McpRegistry {
    * refused, as at start.
    */
   upsert(name: string, raw: RawMcpServerConfig): McpServerSpec {
-    if (RESERVED_NAMES.has(name)) throw new Error(`"${name}" is a codeoid built-in server name`);
+    if (isReservedMcpName(name)) throw new Error(`"${name}" is a codeoid built-in server name`);
     const spec = normalizeSpec(name, raw);
     this.#specs.set(name, spec);
     return spec;

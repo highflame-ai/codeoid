@@ -777,13 +777,13 @@ export class TerminalClient {
    * into codeoid's registry, signed in by codeoid. With a session, its
    * workdir's servers (a `.mcp.json`, project entries) are looked in too.
    */
-  async mcpAdopt(server: string, sessionIdOrName?: string): Promise<void> {
+  async mcpAdopt(server: string, sessionIdOrName?: string, url?: string): Promise<void> {
     let sessionId: string | undefined;
     if (sessionIdOrName !== undefined) {
       sessionId = (await this.#resolveSession(sessionIdOrName)) ?? undefined;
       if (!sessionId) return;
     }
-    const resp = await this.#request({ type: "mcp.adopt", id: randomUUID(), server, ...(sessionId ? { sessionId } : {}) });
+    const resp = await this.#request({ type: "mcp.adopt", id: randomUUID(), server, ...(sessionId ? { sessionId } : {}), ...(url ? { url } : {}) });
     if (resp.type !== "mcp.adopt.result") {
       this.#printError(resp);
       process.exitCode = 1;
@@ -798,11 +798,16 @@ export class TerminalClient {
 
   /**
    * `codeoid mcp signin` (#390): sign in to an OAuth server in codeoid's
-   * registry. Prints the address to open; the browser's redirect finishes it
-   * on the daemon when it can reach it, and otherwise the address it landed on
-   * is pasted back here.
+   * registry. Prints the address to open; after the sign-in the browser lands
+   * on the daemon's page, whose address is pasted back here — the daemon
+   * finishes a sign-in on its own only for the browser the web UI started it
+   * from. `callbackUrl` finishes one started earlier, without a terminal.
    */
-  async mcpSignin(server: string): Promise<void> {
+  async mcpSignin(server: string, callbackUrl?: string): Promise<void> {
+    if (callbackUrl) {
+      await this.#finishMcpSignin(callbackUrl);
+      return;
+    }
     // Discovery and client registration are a few round trips to the provider.
     const begun = await this.#request({ type: "mcp.oauth.begin", id: randomUUID(), server }, 45_000);
     if (begun.type !== "mcp.oauth.begin.result") {
@@ -815,24 +820,27 @@ export class TerminalClient {
       return;
     }
     console.log(`Open this address to sign in to ${S(server)}:\n\n  ${begun.url}\n`);
+    console.log("After signing in, the browser lands on a codeoid page; copy that page's address.");
     if (!process.stdin.isTTY) {
-      console.log("Then paste the address the browser lands on into `codeoid mcp signin` from a terminal, if the page doesn't say it's done.");
+      console.log(`Then finish with: codeoid mcp signin ${S(server)} --callback-url '<that address>'`);
       return;
     }
     const rl = createInterface({ input: process.stdin, output: process.stdout });
     const pasted = await new Promise<string>((resolve) => {
       rl.once("close", () => resolve(""));
-      rl.question("If the page doesn't say it's done, paste the address it landed on (or press Enter): ", resolve);
+      rl.question("Paste it here: ", resolve);
     });
     rl.close();
-    const callbackUrl = pasted.trim();
-    if (!callbackUrl) {
-      const now = await this.#request({ type: "settings.get", id: randomUUID() });
-      const done = now.type === "settings.get.result" && now.snapshot.mcpServers?.find((s) => s.name === server)?.oauth?.status === "connected";
-      console.log(done ? `${S(server)} is signed in.` : `${S(server)} isn't signed in yet.`);
-      if (!done) process.exitCode = 1;
+    if (!pasted.trim()) {
+      console.error(`Not signed in. Finish later with: codeoid mcp signin ${S(server)} --callback-url '<that address>'`);
+      process.exitCode = 1;
       return;
     }
+    await this.#finishMcpSignin(pasted.trim());
+  }
+
+  /** Finish a sign-in from the address its browser landed on (the tenant that began it only). */
+  async #finishMcpSignin(callbackUrl: string): Promise<void> {
     const finished = await this.#request({ type: "mcp.oauth.complete", id: randomUUID(), callbackUrl }, 45_000);
     if (finished.type !== "mcp.oauth.complete.result") {
       this.#printError(finished);

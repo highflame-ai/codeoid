@@ -23,11 +23,14 @@ import type { McpServerSpec } from "../../mcp/types.js";
 /** One OAuth server as an in-process server forwarding to the hub. */
 export function oauthBridgeServer(spec: McpServerSpec, hub: McpHub, scope: McpCallScope): McpSdkServerConfigWithInstance {
   const server = new McpServer({ name: spec.name, version: "1.0.0" }, { capabilities: { tools: {} } });
+  // A failure is an error, not an empty list: the CLI then reports the server
+  // failed (with why — "needs sign-in", a revoked token), instead of connected
+  // with no tools.
   server.server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: (await hub.listTools(spec, scope)).map((t) => ({
+    tools: (await hub.listToolsOrThrow(spec, scope)).map((t) => ({
       name: t.name,
       description: t.description,
-      inputSchema: { type: "object", ...t.inputSchema } as { type: "object"; [k: string]: unknown },
+      inputSchema: { ...t.inputSchema, type: "object" } as { type: "object"; [k: string]: unknown },
     })),
   }));
   server.server.setRequestHandler(CallToolRequestSchema, async (req) => {
@@ -49,18 +52,22 @@ export function oauthServersForClaude(
   registry: McpRegistry | undefined,
   hub: McpHub | undefined,
   scope: McpCallScope,
-): { mounts: () => Record<string, McpSdkServerConfigWithInstance>; deniedUrls: string[]; names: string[]; fingerprint: string } {
+): {
+  mounts: () => Record<string, McpSdkServerConfigWithInstance>;
+  deniedUrls: string[];
+  /** The servers and URLs: a change needs a new query (the denylist is fixed at construction). */
+  fingerprint: string;
+  /** Which are mounted: a change is applied to the live query. */
+  mountFingerprint: string;
+} {
   const specs = (registry?.oauthFor("claude") ?? []).filter((s) => s.transport.kind === "http");
   const deniedUrls = specs.map((s) => (s.transport.kind === "http" ? s.transport.url : ""));
   const signedIn = hub ? specs.filter((s) => hub.signedIn(s, scope.tenant)) : [];
-  // What the query was built with: a server adopted, removed, signed in to or
-  // out of means the next turn must rebuild it.
-  const fingerprint = JSON.stringify([specs.map((s, i) => [s.name, deniedUrls[i]]), signedIn.map((s) => s.name)]);
   return {
-    // Built only for a query being constructed, not on every turn's check.
+    // Built only when the query's servers are set, not on every turn's check.
     mounts: () => Object.fromEntries(signedIn.map((s) => [s.name, oauthBridgeServer(s, hub!, scope)])),
     deniedUrls,
-    names: specs.map((s) => s.name),
-    fingerprint,
+    fingerprint: JSON.stringify(specs.map((s, i) => [s.name, deniedUrls[i]])),
+    mountFingerprint: JSON.stringify(signedIn.map((s) => s.name)),
   };
 }

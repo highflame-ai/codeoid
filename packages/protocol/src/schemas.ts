@@ -533,6 +533,7 @@ export const mcpAdoptSchema = z.object({
   type: z.literal("mcp.adopt"),
   server: mcpServerNameField,
   sessionId: sessionIdField.optional(),
+  url: z.string().max(2048).optional(),
 });
 
 // ── Skill command pre-approval (#348) ─────────────────────────────────────────

@@ -38,6 +38,7 @@ let sdkInterruptThrows = false;
 let mcpStatuses: Array<Record<string, unknown>> = [];
 let mcpReconnects: string[] = [];
 let mcpReconnectError: Error | null = null;
+let mcpServerSets: Array<Record<string, unknown>> = [];
 
 function makeMockQuery() {
   const err = sdkThrowError;
@@ -64,6 +65,10 @@ function makeMockQuery() {
       if (mcpReconnectError) throw mcpReconnectError;
     },
     mcpServerStatus: async () => mcpStatuses,
+    setMcpServers: async (servers: Record<string, unknown>) => {
+      mcpServerSets.push(servers);
+      return { added: Object.keys(servers), removed: [], errors: {} };
+    },
   };
 }
 
@@ -820,6 +825,36 @@ describe("ClaudeProvider – reconnecting an MCP server (#389)", () => {
     mcpReconnectError = null;
     mcpStatuses = [];
     expect((await p.reconnectMcpServer("nope"))?.error).toContain('no MCP server named "nope"');
+    await done();
+  });
+
+  it("doesn't redial the CLI's own copy of a server codeoid signs in to now (#390)", async () => {
+    const { McpServerSchema } = await import("../config.js");
+    const { McpRegistry } = await import("../daemon/mcp/registry.js");
+    const p = new ClaudeProvider({
+      sessionId: "test-session",
+      initialBackingId: "test-backing",
+      workspaceId: "ws_test",
+      mcpRegistry: new McpRegistry({ notes: McpServerSchema.parse({ url: "https://notes.example.com/mcp", oauth: true }) }, { memoryEnabled: false }),
+      store: {
+        audit: () => {},
+        getClaudeCodeSessionId: () => null,
+        setClaudeCodeSessionId: () => {},
+        getSkillCommandGrants: () => new Map<string, boolean>(),
+        setSkillCommandGrant: () => {},
+      } as never,
+    });
+    const done = await live(p);
+    mcpReconnects.length = 0;
+    // The query was built before it was adopted: the CLI still runs its copy, at that URL.
+    mcpStatuses = [{ name: "notes", status: "needs-auth", config: { type: "http", url: "https://notes.example.com/mcp" } }];
+    expect(await p.reconnectMcpServer("notes")).toEqual({ status: "needs-auth", tools: [], codeoidOwned: true });
+    expect(mcpReconnects).toEqual([]);
+    // Another server of the same name, at another URL, is not codeoid's: redialed as usual.
+    mcpStatuses = [{ name: "notes", status: "needs-auth", config: { type: "http", url: "https://elsewhere.example.com/mcp" } }];
+    expect((await p.reconnectMcpServer("notes"))?.codeoidOwned).toBeUndefined();
+    expect(mcpReconnects).toEqual(["notes"]);
+    mcpStatuses = [];
     await done();
   });
 
@@ -1741,18 +1776,19 @@ describe("ClaudeProvider – OAuth registry servers (#390)", () => {
     });
   });
 
-  it("leaves a server codeoid owns out of the user servers it passes, by name or by URL", () => {
+  it("leaves a server codeoid owns out of the user servers it passes, by URL", () => {
     const user = {
       notes: { type: "http", url: "https://notes.example.com/mcp" },
       renamed: { type: "http", url: "https://tracker.example.com/mcp" },
       other: { type: "http", url: "https://other.example.com/mcp" },
       local: { command: "node", args: [] },
     } as never;
-    expect(Object.keys(withoutServers(user, ["notes"], ["https://notes.example.com/mcp", "https://tracker.example.com/mcp"]))).toEqual(["other", "local"]);
-    expect(withoutServers(user, [], [])).toBe(user);
+    // By URL, not by name: another server called "notes" elsewhere is not codeoid's.
+    expect(Object.keys(withoutServers(user, ["https://notes.example.com/mcp", "https://tracker.example.com/mcp"]))).toEqual(["other", "local"]);
+    expect(withoutServers(user, [])).toBe(user);
   });
 
-  it("mounts codeoid's copy once signed in, denies the CLI's, and rebuilds when that changes", async () => {
+  it("mounts codeoid's copy once signed in — live, no rebuild — and denies the CLI's", async () => {
     const { McpServerSchema } = await import("../config.js");
     const { McpRegistry } = await import("../daemon/mcp/registry.js");
     const registry = new McpRegistry({ notes: McpServerSchema.parse({ url: "https://notes.example.com/mcp", oauth: true }) }, { memoryEnabled: false });
@@ -1790,9 +1826,14 @@ describe("ClaudeProvider – OAuth registry servers (#390)", () => {
     expect(queryCallCount).toBe(1); // nothing changed: warm
 
     signedIn = true;
+    mcpServerSets = [];
     turn("t3");
-    expect(queryCallCount).toBe(2); // the sign-in rebuilt it
-    expect(options().mcpServers?.notes).toMatchObject({ type: "sdk" });
+    expect(queryCallCount).toBe(1); // a sign-in doesn't restart the CLI (its background work survives)...
+    expect(mcpServerSets).toHaveLength(1); // ...the live query's servers are swapped instead
+    expect(mcpServerSets[0]!.notes).toMatchObject({ type: "sdk" });
+    // codeoid's own servers stay, last, whatever was adopted.
+    turn("t4");
+    expect(mcpServerSets).toHaveLength(1); // nothing changed since
 
     openGate();
     await provider.teardown();

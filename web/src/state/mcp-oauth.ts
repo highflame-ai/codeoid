@@ -52,12 +52,13 @@ export function dismissMcpOAuth(): void {
  * start codeoid's sign-in for it — one step for the user. `sessionId` lets the
  * daemon find a server from that session's workdir too.
  */
-export async function adoptAndSignIn(server: string, sessionId: string | null): Promise<void> {
+export async function adoptAndSignIn(server: string, sessionId: string | null, url: string | null): Promise<void> {
   setState({ server, phase: "starting", url: null, error: null });
   try {
     const id = newRequestId();
     const res = await getClient().request<McpAdoptResultMsg>(
-      { type: "mcp.adopt", id, server, ...(sessionId ? { sessionId } : {}) },
+      // The URL shown: two entries can share a name, and this says which.
+      { type: "mcp.adopt", id, server, ...(sessionId ? { sessionId } : {}), ...(url ? { url } : {}) },
       { waitForResult: (m) => (m.type === "mcp.adopt.result" && m.requestId === id ? m : undefined) },
     );
     applySnapshot(res.snapshot);

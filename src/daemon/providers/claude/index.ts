@@ -40,6 +40,7 @@ import { BLACKBOARD_MCP_SERVER_NAME } from "../../blackboard/mcp-http.js";
 import type { McpHub } from "../../mcp/hub.js";
 import type { McpRegistry } from "../../mcp/registry.js";
 import { oauthServersForClaude } from "./oauth-bridge.js";
+import { mcpToolPrefix } from "../../mcp/types.js";
 import { resolveEnvMap } from "../../mcp/types.js";
 import type { CompressionRegistry } from "../../compress/index.js";
 import { FLEET_TOOL_NAMES } from "../../fleet.js";
@@ -244,6 +245,12 @@ export class ClaudeProvider implements SessionProvider {
    * was built with: adopting one, or signing in to or out of it, changes what
    * the query must mount and deny, which the SDK fixes at construction (#390). */
   #builtOAuthMcp = "";
+  /** Which of those the LIVE query mounts (the tenant signed in to). A change is
+   * applied to the warm query with setMcpServers — no rebuild, so a sign-in
+   * doesn't kill the session's background work. */
+  #builtOAuthMounts = "";
+  /** A change to the live query's MCP servers still being applied; pushes wait behind it. */
+  #mcpUpdating: Promise<void> | null = null;
   /** Last TurnOpts — the retry after a skill approval rebuilds the loop with
    * these, then re-pushes #lastPushedContent into the SAME turn queue (#233). */
   #lastTurnOpts: TurnOpts | null = null;
@@ -485,6 +492,21 @@ export class ClaudeProvider implements SessionProvider {
   async reconnectMcpServer(name: string): Promise<BackendMcpServerState | null> {
     const q = this.#query;
     if (!q) return null;
+    // A server codeoid signs in to now (#390), at the URL this query still
+    // connects as the CLI's own copy (built before it was adopted): redialing
+    // that copy would only hit its sign-in again. The next query mounts
+    // codeoid's copy instead. Decided by URL — the same name elsewhere is not
+    // codeoid's.
+    const owned = new Set(
+      (this.#init.mcpRegistry?.oauthFor("claude") ?? []).flatMap((s) => (s.transport.kind === "http" ? [s.transport.url] : [])),
+    );
+    if (owned.size > 0) {
+      const current = await q.mcpServerStatus().then((all) => all.find((x) => x.name === name), () => undefined);
+      const url = (current?.config as { url?: unknown } | undefined)?.url;
+      if (current && typeof url === "string" && owned.has(url)) {
+        return { status: current.status, tools: [], codeoidOwned: true };
+      }
+    }
     let failure: string | undefined;
     try {
       await q.reconnectMcpServer(name);
@@ -497,15 +519,11 @@ export class ClaudeProvider implements SessionProvider {
       const error = s.error ?? (s.status === "connected" ? undefined : failure);
       // The backend's account of where the server came from, not its name.
       const connector = s.source === "claudeai" || s.scope === "claudeai" || s.config?.type === "claudeai-proxy";
-      // A remote server the user configured (not a plugin's, not one codeoid
-      // passed in): codeoid could take over its sign-in (#390).
-      const adoptable = !connector && s.source !== "plugin" && s.source !== "sdk" && s.scope !== "dynamic" && s.config?.type === "http";
       return {
         status: s.status,
         tools: (s.tools ?? []).map((t) => `mcp__${mcpToolPrefix(name)}__${t.name}`),
         ...(error ? { error } : {}),
         ...(connector ? { connector: true } : {}),
-        ...(adoptable ? { adoptable: true } : {}),
       };
     } catch (err) {
       return { status: "failed", tools: [], error: failure ?? (err instanceof Error ? err.message : String(err)) };
@@ -632,11 +650,100 @@ export class ClaudeProvider implements SessionProvider {
       shouldQuery,
     };
     this.#lastPushedContent = content;
-    try {
-      this.#inputQueue.push(msg);
-    } catch (err) {
-      console.error(`[claude-provider] push failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
+    const queue = this.#inputQueue;
+    const push = () => {
+      try {
+        if (!queue.closed) queue.push(msg);
+      } catch (err) {
+        console.error(`[claude-provider] push failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    };
+    // A message must find the servers it was sent with: behind a pending
+    // change to them, in order.
+    if (this.#mcpUpdating) this.#afterMcpUpdate(push);
+    else push();
+  }
+
+  /**
+   * Every MCP server the query gets. Built-ins go last, so nothing configured
+   * or adopted can take their names (some of their tools are pre-approved).
+   */
+  #mcpServerSet(
+    opts: TurnOpts,
+    oauthMcp: ReturnType<typeof oauthServersForClaude>,
+    { userServers = true }: { userServers?: boolean } = {},
+  ): Record<string, McpServerConfig> {
+    const init = this.#init;
+    // Apply a per-call wall-clock timeout to the external (user) servers so a
+    // hung MCP tool call surfaces as an SDK error instead of silently wedging
+    // the turn. Not applied to the in-process servers. Kept below the session
+    // stall watchdog so the SDK signals first.
+    const mcpToolTimeoutMs = init.config?.session.mcpToolTimeoutMs ?? 120_000;
+    return {
+      // A server codeoid now signs in to is codeoid's (mounted below), not the CLI's.
+      ...(userServers ? withMcpToolTimeout(withoutServers(loadUserMcpServers(opts.workdir), oauthMcp.deniedUrls), mcpToolTimeoutMs) : {}),
+      // Registry servers — mounted natively on the SDK (claude owns its client);
+      // tool calls surface as `mcp__<server>__<tool>` and gate via canUseTool.
+      ...withMcpToolTimeout(registryServersForClaude(init.mcpRegistry), mcpToolTimeoutMs),
+      // Registry OAuth servers the tenant has signed in to — in-process, in
+      // front of the daemon-owned client, which holds the token (#390). The
+      // hub applies its own per-call timeout.
+      ...oauthMcp.mounts(),
+      ...(init.memory
+        ? {
+            codeoid_memory: buildMemoryMcpServer(init.memory, {
+              workspaceId: init.workspaceId,
+              sessionId: init.sessionId,
+            }),
+          }
+        : {}),
+      // Conductor sessions only — the read-only fleet view (P3). In-process,
+      // so the external-server timeout doesn't apply.
+      ...(init.fleet ? { codeoid_fleet: init.fleet } : {}),
+      // Collaboration children only — the role-scoped goal blackboard. Mounted
+      // over HTTP rather than in-process precisely so the SAME surface works on
+      // gemini/codex; claude deliberately gets no privileged path here (#245).
+      // Resolved per query build, not captured at construction — the
+      // orchestrator's mount is attached after its Session exists.
+      ...blackboardServerEntry(init.blackboardMcp?.()),
+    };
+  }
+
+  /** Swap the warm query's MCP servers for the current set — a sign-in or
+   *  sign-out to an OAuth server (#390) — without restarting the CLI. */
+  #applyMcpServers(opts: TurnOpts, oauthMcp: ReturnType<typeof oauthServersForClaude>): void {
+    const q = this.#query;
+    if (!q) return;
+    this.#builtOAuthMounts = oauthMcp.mountFingerprint;
+    const tag = `[claude-provider ${this.#init.sessionId.slice(0, 8)}]`;
+    console.log(`${tag} OAuth MCP sign-ins changed — updating the live query's servers`);
+    // codeoid's servers only: the user's own (~/.claude.json) are the CLI's
+    // config servers, which it loads itself. (Registry servers imported from
+    // that file share their names with the CLI's copies; the first swap
+    // re-registers those under the same names — a reconnect, once, not a
+    // second copy: the CLI keys servers by name.)
+    const update = withTimeout(q.setMcpServers(this.#mcpServerSet(opts, oauthMcp, { userServers: false })), MCP_SET_TIMEOUT_MS)
+      .then((r) => {
+        if (r.added.length > 0 || r.removed.length > 0) console.log(`${tag} MCP servers added [${r.added.join(", ")}] removed [${r.removed.join(", ")}]`);
+        for (const [name, error] of Object.entries(r.errors)) console.error(`${tag} MCP server ${name} didn't connect: ${error}`);
+      })
+      .catch((err: unknown) => {
+        // The next change retries; a rebuild would also pick the set up.
+        this.#builtOAuthMounts = "";
+        console.error(`${tag} updating the MCP servers failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    this.#afterMcpUpdate(() => update);
+  }
+
+  /** Run `step` after any pending MCP update (and what queued behind it), in order. */
+  #afterMcpUpdate(step: () => unknown): void {
+    const next: Promise<void> = (this.#mcpUpdating ?? Promise.resolve()).then(async () => {
+      await step();
+    });
+    this.#mcpUpdating = next;
+    void next.then(() => {
+      if (this.#mcpUpdating === next) this.#mcpUpdating = null;
+    });
   }
 
   #ensureQueryLoop(opts: TurnOpts): void {
@@ -670,6 +777,7 @@ export class ClaudeProvider implements SessionProvider {
         this.#builtPluginDirs === desiredPlugins &&
         this.#builtOAuthMcp === oauthMcp.fingerprint
       ) {
+        if (this.#builtOAuthMounts !== oauthMcp.mountFingerprint) this.#applyMcpServers(opts, oauthMcp);
         return;
       }
       // Per-turn contributions the SDK fixes at query construction changed, so
@@ -710,6 +818,7 @@ export class ClaudeProvider implements SessionProvider {
     this.#builtSkillAllowRules = desiredGrants;
     this.#builtPluginDirs = desiredPlugins;
     this.#builtOAuthMcp = oauthMcp.fingerprint;
+    this.#builtOAuthMounts = oauthMcp.mountFingerprint;
     this.#loopGeneration += 1;
     const myGeneration = this.#loopGeneration;
 
@@ -717,40 +826,7 @@ export class ClaudeProvider implements SessionProvider {
       ? { resume: this.#claudeCodeSessionId }
       : { sessionId: this.#claudeCodeSessionId };
 
-    // Merge user MCP servers with codeoid's in-process memory server.
-    // Apply a per-call wall-clock timeout to the external (user) servers so a
-    // hung MCP tool call surfaces as an SDK error instead of silently wedging
-    // the turn. Not applied to the in-process memory server. Kept below the
-    // session stall watchdog so the SDK signals first.
-    const mcpToolTimeoutMs = init.config?.session.mcpToolTimeoutMs ?? 120_000;
-    const merged: Record<string, McpServerConfig> = {
-      // A server codeoid now signs in to is codeoid's (mounted below), not the CLI's.
-      ...withMcpToolTimeout(withoutServers(loadUserMcpServers(opts.workdir), oauthMcp.names, oauthMcp.deniedUrls), mcpToolTimeoutMs),
-      ...(init.memory
-        ? {
-            codeoid_memory: buildMemoryMcpServer(init.memory, {
-              workspaceId: init.workspaceId,
-              sessionId,
-            }),
-          }
-        : {}),
-      // Conductor sessions only — the read-only fleet view (P3). In-process,
-      // so the external-server timeout doesn't apply.
-      ...(init.fleet ? { codeoid_fleet: init.fleet } : {}),
-      // Collaboration children only — the role-scoped goal blackboard. Mounted
-      // over HTTP rather than in-process precisely so the SAME surface works on
-      // gemini/codex; claude deliberately gets no privileged path here (#245).
-      // Resolved per query build, not captured at construction — the
-      // orchestrator's mount is attached after its Session exists.
-      ...blackboardServerEntry(init.blackboardMcp?.()),
-      // Registry servers — mounted natively on the SDK (claude owns its client);
-      // tool calls surface as `mcp__<server>__<tool>` and gate via canUseTool.
-      ...withMcpToolTimeout(registryServersForClaude(init.mcpRegistry), mcpToolTimeoutMs),
-      // Registry OAuth servers the tenant has signed in to — in-process, in
-      // front of the daemon-owned client, which holds the token (#390). The
-      // hub applies its own per-call timeout.
-      ...oauthMcp.mounts(),
-    };
+    const merged = this.#mcpServerSet(opts, oauthMcp);
     const mcpServers = Object.keys(merged).length > 0 ? merged : undefined;
 
     // skillAllowRules computed above (used in the rebuild guard).
@@ -1996,13 +2072,27 @@ export function registryServersForClaude(registry: McpRegistry | undefined): Rec
   return out;
 }
 
-/** User servers minus those codeoid owns now, by name or by URL. */
-export function withoutServers(servers: Record<string, McpServerConfig>, names: readonly string[], urls: readonly string[]): Record<string, McpServerConfig> {
-  if (names.length === 0 && urls.length === 0) return servers;
+/** How long a turn waits for its query's MCP servers to change before going on. */
+const MCP_SET_TIMEOUT_MS = 10_000;
+
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    p.finally(() => clearTimeout(timer)),
+    new Promise<T>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
+    }),
+  ]);
+}
+
+/** User servers minus those codeoid owns now — by URL: a server of the same
+ *  name elsewhere (another workdir's, at another URL) is not codeoid's. */
+export function withoutServers(servers: Record<string, McpServerConfig>, urls: readonly string[]): Record<string, McpServerConfig> {
+  if (urls.length === 0) return servers;
   return Object.fromEntries(
-    Object.entries(servers).filter(([name, cfg]) => {
+    Object.entries(servers).filter(([, cfg]) => {
       const url = (cfg as { url?: unknown }).url;
-      return !names.includes(name) && !(typeof url === "string" && urls.includes(url));
+      return !(typeof url === "string" && urls.includes(url));
     }),
   );
 }
@@ -2103,13 +2193,4 @@ export function extractToolResultText(content: unknown): string {
   return parts.join("\n");
 }
 
-/**
- * The server part of an MCP tool name (`mcp__<this>__<tool>`), as the Claude
- * CLI derives it from the server's name: anything outside [A-Za-z0-9_-]
- * becomes `_`, and for a claude.ai connector runs of `_` collapse and the
- * ends are trimmed (CLI 2.1.281).
- */
-export function mcpToolPrefix(name: string): string {
-  const t = name.replace(/[^a-zA-Z0-9_-]/g, "_");
-  return name.startsWith("claude.ai ") ? t.replace(/_+/g, "_").replace(/^_|_$/g, "") : t;
-}
+export { mcpToolPrefix };

@@ -118,7 +118,7 @@ import {
 import { isElicitationTool, isSafeTool, roleDeniesTool } from "./providers/tool-safety.js";
 import type { PackActivation } from "./pipeline/index.js";
 import type { McpRegistry } from "./mcp/registry.js";
-import { isOAuthServer, OAUTH_BRIDGED_BACKENDS } from "./mcp/types.js";
+import { adoptability, adoptableName, findClaudeMcpServers } from "./mcp/adopt.js";
 import type { McpHub } from "./mcp/hub.js";
 import type { Attachment } from "../protocol/types.js";
 import { resolveAttachments } from "./attachments.js";
@@ -1612,12 +1612,6 @@ export class Session {
     if (status !== "failed" && status !== "needs-auth") {
       return refuse("refused", `${JSON.stringify(name)} isn't a server of this session's backend that's down`);
     }
-    // Adopted since it was reported (#390): the backend's next query mounts
-    // codeoid's copy instead, and redialing the CLI's own would only hit its
-    // sign-in again.
-    if (this.#codeoidOwnsMcp(name)) {
-      return refuse("adopted", `codeoid signs in to ${name} now; this session uses codeoid's copy from its next turn`);
-    }
     // One redial per server at a time (an automatic one included), joined
     // once per caller, and not started again within a few seconds.
     const dial = this.#mcpInFlight.get(name);
@@ -1648,7 +1642,7 @@ export class Session {
     const due = [...this.#sdkMcpStatus]
       .filter(([name, status]) => (status === "failed" || status === "needs-auth") && (this.#mcpRetry.get(name)?.at ?? 0) <= now)
       .map(([name]) => name)
-      .filter((name) => !this.#mcpInFlight.has(name) && !this.#codeoidOwnsMcp(name));
+      .filter((name) => !this.#mcpInFlight.has(name));
     if (due.length === 0) return;
     await Promise.allSettled(
       due.map((name) => {
@@ -1687,9 +1681,15 @@ export class Session {
       audit("outcome=timeout");
       return { server: name, status, tools: this.#sdkMcpTools.get(name) ?? [], error: cleanMcpError(err instanceof Error ? err.message : String(err)) };
     }
+    if (state?.codeoidOwned) {
+      audit("outcome=codeoid-owned");
+      return { server: name, status, tools: [], error: `codeoid signs in to ${name} now; this session uses codeoid's copy from its next turn` };
+    }
     audit(`outcome=${state?.status ?? "deferred"}`);
     if (!state) return { server: name, status, tools: this.#sdkMcpTools.get(name) ?? [], deferred: true };
-    return { server: name, status: state.status, tools: state.tools, ...(state.error || state.status !== "connected" ? { error: mcpErrorFor(name, state) } : {}) };
+    // Only someone asking gets told how to fix a sign-in; the pre-turn redial's answer goes nowhere.
+    const adopt = state.status === "needs-auth" && !state.connector && action === "session.mcp_reconnect" ? await this.#adoptHint(name) : null;
+    return { server: name, status: state.status, tools: state.tools, ...(state.error || state.status !== "connected" ? { error: mcpErrorFor(name, state, adopt) } : {}) };
   }
 
   /** The one backend redial of a server; its outcome is applied once, when the backend answers. */
@@ -1698,8 +1698,9 @@ export class Session {
     const generation = this.#mcpGeneration;
     // A backend that never answers mustn't hold the server forever.
     const dial = withTimeout(provider.reconnectMcpServer!(name), MCP_TIMINGS.dialCeilingMs).then((state) => {
-      // A report taken since (a new backend process, a new turn) is newer than this.
-      if (state && generation === this.#mcpGeneration && provider === this.#provider) this.#applyMcpState(name, state);
+      // A report taken since (a new backend process, a new turn) is newer than
+      // this; and a copy codeoid owns now reports nothing worth keeping.
+      if (state && !state.codeoidOwned && generation === this.#mcpGeneration && provider === this.#provider) this.#applyMcpState(name, state);
       return state;
     });
     const clear = () => {
@@ -1711,14 +1712,19 @@ export class Session {
   }
 
   /**
-   * Whether codeoid serves this server to the current backend itself — an
-   * OAuth registry server (one adopted from Claude's config, #390) on a backend
-   * that reaches those through codeoid. A status the backend reported for that
-   * name is about the CLI's own copy, which is no longer the one used.
+   * How codeoid could take over a server's sign-in (#390): the adopt command
+   * for the one remote server Claude's config has under this name, with
+   * `--session` when it's this workdir's. Null when there's none to adopt.
    */
-  #codeoidOwnsMcp(name: string): boolean {
-    const spec = this.#mcpRegistry?.get(name);
-    return spec !== undefined && isOAuthServer(spec) && OAUTH_BRIDGED_BACKENDS.includes(this.#provider.id);
+  async #adoptHint(name: string): Promise<string | null> {
+    if (!adoptableName(name).ok) return null;
+    const can = (await findClaudeMcpServers(name, this.workdir).catch(() => [])).filter((c) => adoptability(c).ok);
+    if (can.length === 0) return null;
+    const session = /^[\w.-]+$/.test(this.name) ? this.name : JSON.stringify(this.name);
+    if (new Set(can.map((c) => c.url)).size > 1) {
+      return `codeoid mcp adopt ${name} --session ${session} --url <the one to use>`;
+    }
+    return can[0]!.scope === "workdir" ? `codeoid mcp adopt ${name} --session ${session}` : `codeoid mcp adopt ${name}`;
   }
 
   /** Take the backend's word for a server's state; announce it coming back. */
@@ -7356,7 +7362,7 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
 }
 
 /** What to tell someone whose reconnect didn't connect — sign-in needs say where it can be done. */
-function mcpErrorFor(name: string, state: { status: string; error?: string; connector?: boolean; adoptable?: boolean }): string {
+function mcpErrorFor(name: string, state: { status: string; error?: string; connector?: boolean }, adopt: string | null = null): string {
   if (state.status === "needs-auth") {
     // claude.ai connectors are signed in on claude.ai, not by the CLI. The
     // backend says which servers are; a name alone could claim to be one.
@@ -7365,8 +7371,8 @@ function mcpErrorFor(name: string, state: { status: string; error?: string; conn
     }
     // A server codeoid can take over: say so first — it works from here, on
     // any device, and serves every backend that reaches OAuth servers (#390).
-    if (state.adoptable) {
-      return `${name} needs a sign-in. Have codeoid sign in to it: "Sign in with codeoid" in the capabilities drawer, or \`codeoid mcp adopt ${name}\` then \`codeoid mcp signin ${name}\`. Or sign in with /mcp in an interactive Claude Code session, then reconnect it here.`;
+    if (adopt) {
+      return `${name} needs a sign-in. Have codeoid sign in to it: "Sign in with codeoid" in the capabilities drawer, or \`${adopt}\` then \`codeoid mcp signin ${name}\`. Or sign in with /mcp in an interactive Claude Code session, then reconnect it here.`;
     }
     return `${name} needs a sign-in, which only an interactive Claude Code session can run: sign in with /mcp there, then reconnect it here.`;
   }

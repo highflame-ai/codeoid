@@ -18,23 +18,56 @@
  */
 
 import os from "node:os";
+import path from "node:path";
 import { McpServerSchema, type RawMcpServerConfig } from "../../config.js";
 import type { ClaudeConfigMcpServer } from "../../protocol/types.js";
 import { readClaudeConfig } from "../claude-config.js";
+import { isReservedMcpName } from "./registry.js";
 
-/** Find a server by name in Claude's config: the workdir's and the global ones
- *  for a session's workdir, else the global ones only. */
-export async function findClaudeMcpServer(name: string, workdir: string | null): Promise<ClaudeConfigMcpServer | undefined> {
+/** Every server of that name in Claude's config: the global ones, plus the
+ *  workdir's for a session's workdir. The same name can mean two servers. */
+export async function findClaudeMcpServers(name: string, workdir: string | null): Promise<ClaudeConfigMcpServer[]> {
   const snapshot = await readClaudeConfig(workdir ?? os.homedir());
   const all = workdir ? snapshot.mcpServers : snapshot.mcpServers.filter((s) => s.scope === "global");
-  // A workdir entry overrides a global one of the same name, as in the CLI.
-  return all.find((s) => s.name === name && s.scope === "workdir") ?? all.find((s) => s.name === name);
+  return all.filter((s) => s.name === name);
 }
+
+/**
+ * Whether the entry comes from a file the workdir's repo controls (a
+ * `.mcp.json`, the project's `.claude/` settings) rather than from the user's
+ * own config (`~/.claude.json`, `~/.claude/`). A cloned repo can put anything
+ * there, so such a server is adopted only once Claude itself has approved and
+ * connected it — and adopting makes it daemon-wide.
+ */
+export function fromRepoFile(server: ClaudeConfigMcpServer, home: string = os.homedir()): boolean {
+  if (server.scope !== "workdir") return false;
+  return path.resolve(server.path) !== path.join(home, ".claude.json");
+}
+
+/**
+ * Whether a name may be adopted as is. Adopted names stay plain: no
+ * characters the CLI rewrites in tool names, no `__` (the tool-name
+ * separator), never one of codeoid's built-ins in any spelling.
+ */
+export function adoptableName(name: string): { ok: true } | { ok: false; reason: string } {
+  if (isReservedMcpName(name)) return { ok: false, reason: `${name} is the name of a codeoid built-in server` };
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(name) || name.includes("__")) {
+    return { ok: false, reason: `codeoid adopts servers with plain names (letters, digits, - and _, no "__"); rename ${JSON.stringify(name)} in Claude's config first` };
+  }
+  return { ok: true };
+}
+
+const LOOPBACK = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 /** Whether codeoid can adopt this server, and if not, why — said to the user. */
 export function adoptability(server: ClaudeConfigMcpServer): { ok: true; url: string } | { ok: false; reason: string } {
   if (!server.url) {
     return { ok: false, reason: `${server.name} runs a local command; only a remote (HTTP) MCP server signs in with OAuth` };
+  }
+  // Authorized by a header already (a bearer, an API key): adopting would drop
+  // it for a sign-in the server may not offer.
+  if ((server.headerKeys ?? []).some((h) => /^(authorization|x-api-key|api-key)$/i.test(h))) {
+    return { ok: false, reason: `${server.name} is authorized by a header in Claude's config, not an OAuth sign-in` };
   }
   if (server.type === "sse") {
     return { ok: false, reason: `${server.name} uses the older SSE transport, which codeoid's MCP client doesn't speak` };
@@ -48,9 +81,16 @@ export function adoptability(server: ClaudeConfigMcpServer): { ok: true; url: st
   } catch {
     return { ok: false, reason: `${server.name}'s URL isn't one codeoid can read` };
   }
-  if (url.protocol !== "https:" && url.protocol !== "http:") {
-    return { ok: false, reason: `${server.name}'s URL isn't an http(s) one` };
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && LOOPBACK.has(url.hostname))) {
+    // A token codeoid holds must not travel in the clear.
+    return { ok: false, reason: `${server.name}'s URL isn't an https one (plain http is only for this machine)` };
   }
+  if (url.username || url.password) {
+    return { ok: false, reason: `${server.name}'s URL carries credentials; an adopted server is signed in to by codeoid` };
+  }
+  // The URL is also what the CLI's own copy is denied by, as a pattern: a
+  // wildcard would deny every server it matches.
+  if (server.url.includes("*")) return { ok: false, reason: `${server.name}'s URL contains a wildcard` };
   return { ok: true, url: server.url };
 }
 
