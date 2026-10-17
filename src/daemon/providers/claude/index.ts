@@ -40,8 +40,7 @@ import { BLACKBOARD_MCP_SERVER_NAME } from "../../blackboard/mcp-http.js";
 import type { McpHub } from "../../mcp/hub.js";
 import type { McpRegistry } from "../../mcp/registry.js";
 import { oauthServersForClaude } from "./oauth-bridge.js";
-import { mcpToolPrefix } from "../../mcp/types.js";
-import { resolveEnvMap } from "../../mcp/types.js";
+import { mcpToolPrefix, resolveEnvMap } from "../../mcp/types.js";
 import type { CompressionRegistry } from "../../compress/index.js";
 import { FLEET_TOOL_NAMES } from "../../fleet.js";
 import { rewriteBashToolInput } from "../../compress/index.js";
@@ -672,9 +671,13 @@ export class ClaudeProvider implements SessionProvider {
     // address — in this workdir's config, which adopting (from another
     // workdir, perhaps) couldn't see. Theirs stays; codeoid's isn't mounted here.
     const mounts = oauthMcp.mounts();
+    // Compared as adopting compares (case, "-" vs "_"): a look-alike of their
+    // own server would sit beside it with near-identical tools.
+    const loose = (n: string) => n.toLowerCase().replace(/-/g, "_");
+    const own = new Set(Object.keys(userServers).map(loose));
     for (const name of Object.keys(mounts)) {
-      if (name in userServers) {
-        console.error(`[claude-provider ${init.sessionId.slice(0, 8)}] not mounting codeoid's ${name}: this workdir's own Claude config has a ${name} at another address`);
+      if (own.has(loose(name))) {
+        console.error(`[claude-provider ${init.sessionId.slice(0, 8)}] not mounting codeoid's ${name}: this workdir's own Claude config has a server of that name at another address`);
         delete mounts[name];
       }
     }
@@ -2140,4 +2143,3 @@ export function extractToolResultText(content: unknown): string {
   return parts.join("\n");
 }
 
-export { mcpToolPrefix };

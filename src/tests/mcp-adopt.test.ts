@@ -257,7 +257,7 @@ describe("mcp.adopt", () => {
     expect(auditRows()).toEqual([
       { subject: "user:a", detail: 'server="notes" outcome=forbidden' },
       { subject: "user:a", detail: `server="notes" outcome=adopted url="https://notes.example.com/mcp" source=${JSON.stringify(join(home, ".claude.json"))}` },
-      { subject: "user:a", detail: `server="legacy" outcome=refused source=${JSON.stringify(join(home, ".claude.json"))}` },
+      { subject: "user:a", detail: `server="legacy" outcome=refused url="https://legacy.example.com/sse" source=${JSON.stringify(join(home, ".claude.json"))}` },
     ]);
   });
 });

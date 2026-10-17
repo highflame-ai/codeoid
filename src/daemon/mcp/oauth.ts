@@ -293,7 +293,9 @@ export class McpOAuth implements McpCredentialSource {
       });
       if (result !== "AUTHORIZED") return undefined;
     } catch (err) {
-      // A network error, not a verdict on the token: keep it for the next try.
+      // Anything else auth() throws (discovery unreachable,
+      // temporarily_unavailable, …) is no verdict on the token either: keep
+      // it for the next try.
       console.error(`[codeoid] mcp oauth: refreshing ${spec.name} failed: ${err instanceof Error ? err.message : String(err)}`);
       return undefined;
     }

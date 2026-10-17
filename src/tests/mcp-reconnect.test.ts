@@ -193,6 +193,18 @@ describe("session.mcp_reconnect", () => {
     expect(r.data.error).toContain("interactive Claude Code session"); // still offered
   });
 
+  it("names the URL when another entry of that name would make adopt ambiguous", async () => {
+    // The user's own project entry (http), and the repo's stdio one of the same name.
+    writeFileSync(join(tmp, "home", ".claude.json"), JSON.stringify({ projects: { [join(tmp, "work")]: { mcpServers: { slack: { type: "http", url: "https://slack.example.com/mcp" } } } } }));
+    writeFileSync(join(tmp, "work", ".mcp.json"), JSON.stringify({ mcpServers: { slack: { command: "node", args: ["s.js"] } } }));
+    answer = () => ({ status: "needs-auth", tools: [] });
+    const m = manager();
+    m.setMcp(new McpRegistry({}, { memoryEnabled: false }), new McpHub({}));
+    const id = await sessionAfterFirstTurn(m);
+    const r = (await reconnect(m, id)) as { data: McpReconnectResult };
+    expect(r.data.error).toContain("--url=https://slack.example.com/mcp");
+  });
+
   it("someone who couldn't adopt isn't pointed at adopting", async () => {
     writeFileSync(join(tmp, "work", ".mcp.json"), JSON.stringify({ mcpServers: { slack: { type: "http", url: "https://slack.example.com/mcp" } } }));
     answer = () => ({ status: "needs-auth", tools: [] });
@@ -208,6 +220,7 @@ describe("session.mcp_reconnect", () => {
   it("a server Claude's config has no remote entry for gets the CLI's sign-in guidance only", async () => {
     answer = () => ({ status: "needs-auth", tools: [] });
     const m = manager();
+    m.setMcp(new McpRegistry({}, { memoryEnabled: false }), new McpHub({})); // adopting is possible: just not this one
     const id = await sessionAfterFirstTurn(m);
     const r = (await reconnect(m, id)) as { data: McpReconnectResult };
     expect(r.data.error).not.toContain("codeoid mcp adopt");

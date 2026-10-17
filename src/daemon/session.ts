@@ -1726,7 +1726,8 @@ export class Session {
     const all = await claudeMcpServers(this.workdir).catch(() => []);
     // What adopt would refuse isn't suggested (the daemon's own endpoints
     // excepted: the session doesn't know them, and adopt still refuses them).
-    const can = all.filter((c) => c.name === name && !adoptionRefusal(c, all, registry, []));
+    const named = all.filter((c) => c.name === name);
+    const can = named.filter((c) => !adoptionRefusal(c, all, registry, []));
     if (can.length === 0) return null;
     // Quoted to run as shown (a session's name is free text).
     const session = `--session=${shellArg(this.name)}`;
@@ -1734,6 +1735,9 @@ export class Session {
       return { command: `codeoid mcp adopt ${name} ${session} --url <the one to use>`, note: `Claude's config has more than one server named ${name}.` };
     }
     const one = can[0]!;
+    // Adopt counts every entry of the name: another (even one it would refuse)
+    // makes it ambiguous, so the URL is named.
+    if (new Set(named.map((c) => c.url)).size > 1) return { command: `codeoid mcp adopt ${name} ${session} --url=${shellArg(one.url!)}` };
     if (one.scope !== "workdir") return { command: `codeoid mcp adopt ${name}` };
     // A project's own server: naming its address is the consent — so say who chose it.
     if (fromRepoFile(one)) {

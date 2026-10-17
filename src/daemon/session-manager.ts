@@ -2271,10 +2271,10 @@ mcpHub: this.#mcpHub,
   }
 
   /**
-   * Whether the drawer offers "Sign in with codeoid" for a row: one adopt
-   * would accept, and that is down (or not yet reported) — a working server
-   * isn't offered a sign-in it may not support. A repo's own file's server
-   * only once Claude has reported it (approved it).
+   * Whether the drawer offers "Sign in with codeoid" for a row: only to a
+   * caller adopt would accept, only for what adopt would take, and only when
+   * the backend reports `needs-auth` (a sign-in the CLI can't run). A server
+   * that's merely down, or not yet reported, isn't offered.
    */
   #offerAdoption(s: ClaudeConfigMcpServer, all: readonly ClaudeConfigMcpServer[], liveStatus: string | undefined, auth: AuthContext): boolean {
     // Only to someone adopt would accept, and only what adopt would take.
@@ -2298,13 +2298,14 @@ mcpHub: this.#mcpHub,
   async #mcpAdopt(msg: Extract<ClientMessage, { type: "mcp.adopt" }>, auth: AuthContext): Promise<DaemonMessage> {
     let workdir: string | null = null;
     let source = "";
+    let url = "";
     // Every outcome is on the record, as who asked and from where.
     const audit = (outcome: string) =>
       this.#store.audit(
         auth.sub,
         "mcp.adopt",
         msg.sessionId ?? "",
-        `server=${JSON.stringify(msg.server)} outcome=${outcome}${workdir ? ` workdir=${JSON.stringify(workdir)}` : ""}${source ? ` source=${JSON.stringify(source)}` : ""}`,
+        `server=${JSON.stringify(msg.server)} outcome=${outcome}${url ? ` url=${JSON.stringify(url)}` : ""}${workdir ? ` workdir=${JSON.stringify(workdir)}` : ""}${source ? ` source=${JSON.stringify(source)}` : ""}`,
       );
     const fail = (outcome: string, error: string, code: "invalid_request" | "not_found" | "forbidden" | "internal" = "invalid_request"): DaemonMessage => {
       audit(outcome);
@@ -2343,6 +2344,7 @@ mcpHub: this.#mcpHub,
     }
     const found = atUrl[0]!;
     source = found.path;
+    url = found.url ?? "";
     const can = adoptability(found);
     if (!can.ok) return fail("refused", can.reason);
     const refusal = adoptionRefusal(found, all, registry, this.#daemonOrigins());
@@ -2384,7 +2386,8 @@ mcpHub: this.#mcpHub,
     }
     // Any client held for the old entry (a plain copy imported from ~/.claude.json).
     this.#mcpHub?.drop(spec.name);
-    audit(`adopted url=${JSON.stringify(new URL(can.url).href)}${fromRepoFile(found) ? " projectFile=true" : ""}`);
+    url = new URL(can.url).href;
+    audit(`adopted${fromRepoFile(found) ? " projectFile=true" : ""}`);
     return reply(false);
   }
 

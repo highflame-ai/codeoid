@@ -363,7 +363,7 @@ const McpAdopt: Component<{ server: string; url: string | null; path: string; pr
     } catch {}
     const origin = props.projectFile ? `This project's own ${props.path} chose this server's address. Adopt it only if you trust that address.\n\n` : "";
     const ok = window.confirm(
-      `${origin}codeoid will sign in to ${props.server} at ${address} itself, and every codeoid session will use it from now on, instead of the Claude CLI's own copy.\n\nContinue?`,
+      `${origin}codeoid will sign in to ${props.server} at ${address} itself. On this whole daemon, Claude sessions stop using the Claude CLI's own copy of it; each account's sessions get codeoid's copy once that account signs in.\n\nContinue?`,
     );
     if (!ok) return;
     const sid = claudeConfig().sessionId;

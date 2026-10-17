@@ -148,7 +148,7 @@ export const McpOAuthControls: Component<{ server: McpServerStatus }> = (props) 
 
       <Show when={oauth().unsupportedBackends.length > 0}>
         <p class="mt-1.5 text-[11px] text-fg-faint">
-          Not reachable from {oauth().unsupportedBackends.join(", ")} yet; every other backend gets it.
+          Not reachable from {oauth().unsupportedBackends.join(", ")} yet.
         </p>
       </Show>
     </div>

@@ -435,7 +435,7 @@ In codeoid's registry (`"oauth": true`) codeoid signs in itself, from any fronte
 - **CLI:** `codeoid mcp adopt <server> [--session <s>] [--url <url>]`, then `codeoid mcp signin <server>`. `--session` also looks in that session's workdir (a `.mcp.json`, project servers); `--url` says which server is meant when two share the name, and is required for a project's own server. The sign-in prints an address to open, and finishes from the address the browser lands on, pasted back (or `--callback-url`).
 
 A server that needs a sign-in points at adopting it (for someone who may adopt), with the command that finds it, in its reconnect answer.
-Once adopted, Claude sessions use codeoid's copy from their next turn: it is mounted in-process in front of codeoid's own MCP client, so the token never reaches the agent, and the CLI is told not to connect its own copy (by URL), so the server isn't connected twice.
+Once adopted and signed in, Claude sessions use codeoid's copy from their next turn (until then, the CLI's copy is only denied): it is mounted in-process in front of codeoid's own MCP client, so the token never reaches the agent, and the CLI is told not to connect its own copy (by URL), so the server isn't connected twice.
 Signing in or out later applies to a running session from its next turn: its backend restarts and resumes the same conversation (background work running in the old backend process ends with it).
 A token the server refuses to renew is forgotten, so the server reads as signed out and offers a new sign-in; a renewal that merely fails (the server unreachable) keeps it.
 codeoid never reads or writes the Claude CLI's credentials.
@@ -443,7 +443,7 @@ codeoid never reads or writes the Claude CLI's credentials.
 What can be adopted, and why:
 
 - **Remote streamable-HTTP servers** at an ASCII `https` URL (plain `http` only on this machine; an international domain in its `xn--` form), with no credentials or wildcard in the URL, and no headers in Claude's config (they're often its authorization, and adopting would drop them): codeoid holds the token.
-- **A plain name** (letters, digits, `-`, `_`), never one of codeoid's own servers in any spelling.
+- **A plain name** (letters, digits, `-`, `_`; no `__`, not starting with `-`), never one of codeoid's own servers in any spelling.
 - **A project's own server** (from a repo's `.mcp.json` or `.claude/` settings) only with its URL named: the repo chose that address, and a codeoid session's Claude connects it without asking, so naming it is the consent. The drawer names it in its confirmation.
 - **Never over another server:** not over a codeoid entry of the same name at another URL, nor one whose tools would get the same names; and a project's server never stands in for your own server of that name (or a look-alike) at another address, in any workdir — where your own config has one, codeoid's copy isn't mounted there.
 - **Every entry at that address adoptable:** adopting denies the CLI's copy at that URL whatever it's called, so an entry there that can't be adopted (authorized by headers, say) blocks it.

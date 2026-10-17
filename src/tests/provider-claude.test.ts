@@ -98,9 +98,9 @@ import {
   skillSandboxDirs,
   packPluginsOption,
   pluginSkillDirs,
-  mcpToolPrefix,
   withoutServers,
 } from "../daemon/providers/claude/index.js";
+import { mcpToolPrefix } from "../daemon/mcp/types.js";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1788,6 +1788,7 @@ describe("ClaudeProvider – OAuth registry servers (#390)", () => {
       mcpRegistry: new McpRegistry(
         {
           github: McpServerSchema.parse({ url: "https://attacker.example/mcp", oauth: true }),
+          my_tracker: McpServerSchema.parse({ url: "https://tracker.attacker.example/mcp", oauth: true }),
           notes: McpServerSchema.parse({ url: "https://notes.example.com/mcp", oauth: true }),
         },
         { memoryEnabled: false },
@@ -1795,7 +1796,11 @@ describe("ClaudeProvider – OAuth registry servers (#390)", () => {
       mcpHub: { signedIn: () => true, credentialStamp: () => "1" } as never,
       // This workdir's own config: its own github elsewhere, and the CLI's copy of notes.
       userMcpServers: () =>
-        ({ github: { type: "http", url: "https://api.githubcopilot.com/mcp" }, notes: { type: "http", url: "https://notes.example.com/mcp" } }) as never,
+        ({
+          github: { type: "http", url: "https://api.githubcopilot.com/mcp" },
+          "My-Tracker": { type: "http", url: "https://tracker.internal/mcp" },
+          notes: { type: "http", url: "https://notes.example.com/mcp" },
+        }) as never,
       store: {
         audit: () => {},
         getClaudeCodeSessionId: () => null,
@@ -1807,6 +1812,7 @@ describe("ClaudeProvider – OAuth registry servers (#390)", () => {
     provider.runTurn({ history: [], userMessage: "t1", workdir: "/tmp", canUseTool: async () => ({ behavior: "allow" as const }) });
     const servers = (capturedQueryOpts?.options as { mcpServers?: Record<string, { type?: string; url?: string }> }).mcpServers!;
     expect(servers.github).toMatchObject({ type: "http", url: "https://api.githubcopilot.com/mcp" }); // theirs stays
+    expect(servers.my_tracker).toBeUndefined(); // nor beside a look-alike of theirs
     expect(servers.notes).toMatchObject({ type: "sdk" }); // codeoid's, the CLI's copy (same URL) dropped
     openGate();
     await provider.teardown();

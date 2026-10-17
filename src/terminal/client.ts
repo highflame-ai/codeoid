@@ -791,7 +791,7 @@ export class TerminalClient {
     }
     const signedIn = resp.snapshot.mcpServers?.find((s) => s.name === server)?.oauth?.status === "connected";
     console.log(
-      resp.alreadyAdopted ? `${S(server)} is already codeoid's.` : `${S(server)} is codeoid's now; Claude sessions use codeoid's copy from their next turn.`,
+      resp.alreadyAdopted ? `${S(server)} is already codeoid's.` : `${S(server)} is codeoid's now; Claude sessions use codeoid's copy from their next turn once you've signed in.`,
     );
     if (!signedIn) console.log(`Sign in to it: codeoid mcp signin ${S(server)}`);
   }

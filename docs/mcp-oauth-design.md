@@ -103,7 +103,7 @@ A live `setMcpServers` swap was tried and dropped: an interrupt while a turn's m
 A session never redials the CLI's copy of a server at a URL codeoid owns (decided by URL, by the provider, which sees the copy's config).
 A server the hub can't list (signed out, a revoked token, down, a timeout) makes the in-process server's `tools/list` fail, so the CLI reports it failed rather than connected with no tools.
 The rebuild key includes a per-tenant sign-in counter (bumped by sign-ins and sign-outs, not refreshes), so signing out and back in between two turns — say after a revoked token — still gets a fresh connection.
-When the authorization server refuses a refresh (`invalid_grant`, or `invalid_client`, which ends the client's registration too), the tokens are forgotten, so the server reads as signed out; a refresh that merely fails (network, 5xx, `temporarily_unavailable`) keeps them for the next try.
+When the authorization server refuses a refresh (`invalid_grant`, or `invalid_client` / `unauthorized_client`, which end the client's registration too), the tokens are forgotten, so the server reads as signed out; a refresh that merely fails (network, 5xx, `temporarily_unavailable`) keeps them for the next try.
 
 The proxy below is the planned way to close the gap for the other native backends; nothing else in this design depends on it.
 
@@ -147,7 +147,7 @@ Nothing in §1–§6 assumes Highflame.
 2. OAuth engine on the SDK's `auth()`: begin, complete, access token with refresh, status, disconnect.
 3. Callback route and the `mcp.oauth.*` protocol.
 4. `McpHub` HTTP client uses the engine; tenant flows into the call scope.
-5. Native mounters (claude, codex, gemini-cli, qwen) skip OAuth servers; Settings says so.
+5. Native mounters (claude, codex, gemini-cli, qwen) skip OAuth servers; Settings says so (claude reaches them since step 7).
 6. Settings: connect / disconnect / paste fallback, status per tenant.
 7. Claude: in-process mounts in front of the hub, and adopting a server from Claude's config (`mcp.adopt`, #390).
 8. Later: the proxy, so the other native backends mount OAuth servers too.
