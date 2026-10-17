@@ -460,7 +460,7 @@ export class ClaudeProvider implements SessionProvider {
       const error = s.error ?? (s.status === "connected" ? undefined : failure);
       return {
         status: s.status,
-        tools: (s.tools ?? []).map((t) => `mcp__${name}__${t.name}`),
+        tools: (s.tools ?? []).map((t) => `mcp__${mcpToolPrefix(name)}__${t.name}`),
         ...(error ? { error } : {}),
       };
     } catch (err) {
@@ -1499,16 +1499,21 @@ export function translateSDKMessage(
           if (init.model) state.primaryModel = init.model;
           const servers: Record<string, string> = {};
           const tools: Record<string, string[]> = {};
+          // Tool names carry the server's name as the CLI normalises it; key
+          // them by the server's own name, as `servers` is.
+          const byPrefix = new Map<string, string>();
           for (const s of init.mcp_servers ?? []) {
             servers[s.name] = s.status;
             tools[s.name] = [];
+            byPrefix.set(mcpToolPrefix(s.name), s.name);
           }
           for (const t of init.tools ?? []) {
             if (!t.startsWith("mcp__")) continue;
             const rest = t.slice("mcp__".length);
             const sep = rest.indexOf("__");
             if (sep <= 0) continue;
-            const server = rest.slice(0, sep);
+            const prefix = rest.slice(0, sep);
+            const server = byPrefix.get(prefix) ?? prefix;
             tools[server] ??= [];
             tools[server].push(t);
           }
@@ -1925,4 +1930,15 @@ export function extractToolResultText(content: unknown): string {
     }
   }
   return parts.join("\n");
+}
+
+/**
+ * The server part of an MCP tool name (`mcp__<this>__<tool>`), as the Claude
+ * CLI derives it from the server's name: anything outside [A-Za-z0-9_-]
+ * becomes `_`, and for a claude.ai connector runs of `_` collapse and the
+ * ends are trimmed (CLI 2.1.281).
+ */
+export function mcpToolPrefix(name: string): string {
+  const t = name.replace(/[^a-zA-Z0-9_-]/g, "_");
+  return name.startsWith("claude.ai ") ? t.replace(/_+/g, "_").replace(/^_|_$/g, "") : t;
 }

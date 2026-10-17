@@ -151,7 +151,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `session.mcp_reconnect` message, which needs `session:send`) and, before
   each turn, retries any that are failed or waiting on a sign-in, with
   backoff. A server that comes back is announced, and the next prompt tells
-  the model, which otherwise trusts the start-up report that it failed.
+  the model, which otherwise trusts the start-up report that it failed. The
+  drawer now also lists servers no config file declares (claude.ai
+  connectors, plugins' servers).
 
 - **The context window is no longer guessed from the model id.**
   codeoid inferred every window from a substring table over model ids, and that table was wrong the moment a model shipped: `claude-opus-5-5` inferred to the 200k fallback while every turn result stated 1,000,000.

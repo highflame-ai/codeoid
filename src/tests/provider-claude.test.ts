@@ -98,6 +98,7 @@ import {
   skillSandboxDirs,
   packPluginsOption,
   pluginSkillDirs,
+  mcpToolPrefix,
 } from "../daemon/providers/claude/index.js";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -767,6 +768,15 @@ describe("ClaudeProvider – reconnecting an MCP server (#389)", () => {
     expect((await p.reconnectMcpServer("nope"))?.error).toContain('no MCP server named "nope"');
     await done();
   });
+
+  it("tool names carry the server's name as the CLI normalises it", async () => {
+    const p = makeProvider();
+    const done = await live(p);
+    mcpStatuses = [{ name: "claude.ai Google Drive", status: "connected", tools: [{ name: "search" }] }];
+    expect((await p.reconnectMcpServer("claude.ai Google Drive"))?.tools).toEqual(["mcp__claude_ai_Google_Drive__search"]);
+    mcpStatuses = [];
+    await done();
+  });
 });
 
 describe("ClaudeProvider – unexplained zero-turn re-send", () => {
@@ -1163,6 +1173,30 @@ describe("translateSDKMessage – system", () => {
       servers: { my_server: "connected" },
       tools: { my_server: ["mcp__my_server__read", "mcp__my_server__write"] },
     });
+  });
+
+  it("keys tools by the server's own name, not the CLI's normalised one (#389)", () => {
+    const events = collectEmits({
+      type: "system",
+      subtype: "init",
+      mcp_servers: [
+        { name: "claude.ai Google Drive", status: "connected" },
+        { name: "my.server", status: "connected" },
+      ],
+      tools: ["mcp__claude_ai_Google_Drive__search", "mcp__my_server__read"],
+    });
+    expect(events[0]).toMatchObject({
+      tools: { "claude.ai Google Drive": ["mcp__claude_ai_Google_Drive__search"], "my.server": ["mcp__my_server__read"] },
+    });
+  });
+
+  it("names MCP tools' server part the way the CLI does", () => {
+    expect(mcpToolPrefix("slack")).toBe("slack");
+    expect(mcpToolPrefix("my.server v2")).toBe("my_server_v2");
+    expect(mcpToolPrefix("a -- b")).toBe("a_--_b");
+    // claude.ai connectors also collapse runs of _ and trim the ends.
+    expect(mcpToolPrefix("claude.ai Google Drive")).toBe("claude_ai_Google_Drive");
+    expect(mcpToolPrefix("claude.ai  Foo (beta)")).toBe("claude_ai_Foo_beta");
   });
 
   it("emits api_retry for api_retry subtype", () => {

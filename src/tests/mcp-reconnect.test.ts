@@ -29,8 +29,8 @@ const done = (): ProviderEvent =>
     result: { providerId: "claude", model: "mock", inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheCreationTokens: 0, totalCostUsd: 0, durationMs: 1 },
   }) as ProviderEvent;
 /** A turn that starts the backend with `slack` in the given state. */
-const startsWith = (slack: string): ProviderEvent[] => [
-  { type: "mcp_init", servers: { slack, github: "connected" }, tools: { github: ["mcp__github__search"] } } as ProviderEvent,
+const startsWith = (slack: string, extra: Record<string, string> = {}): ProviderEvent[] => [
+  { type: "mcp_init", servers: { slack, github: "connected", ...extra }, tools: { github: ["mcp__github__search"], ...(slack === "connected" ? { slack: ["mcp__slack__search"] } : {}) } } as ProviderEvent,
   { type: "text_done", content: "ok" } as ProviderEvent,
   done(),
 ];
@@ -43,6 +43,8 @@ let managers: SessionManager[];
 let provider: MockSessionProvider;
 /** How the backend answers a redial; undefined = it can't redial at all. */
 let answer: ((name: string) => BackendMcpServerState | null) | undefined;
+/** The turns the backend plays, in order. */
+let script: ProviderEvent[][];
 
 function manager(): SessionManager {
   const registry = new ProviderRegistry("claude");
@@ -50,7 +52,7 @@ function manager(): SessionManager {
     id: "claude",
     displayName: "claude",
     create: () => {
-      provider = new MockSessionProvider("claude", [startsWith("failed"), plain(), plain(), plain()]);
+      provider = new MockSessionProvider("claude", script);
       if (answer) provider.scriptMcp(answer);
       return provider;
     },
@@ -81,6 +83,7 @@ beforeEach(() => {
   transcript = new TranscriptStore(join(tmp, "transcripts"));
   managers = [];
   answer = undefined;
+  script = [startsWith("failed"), plain(), plain(), plain()];
 });
 afterEach(async () => {
   for (const m of managers) await m.drain(2_000).catch(() => {});
@@ -142,6 +145,24 @@ describe("session.mcp_reconnect", () => {
     const m = manager();
     const id = await sessionAfterFirstTurn(m);
     expect(await reconnect(m, id)).toMatchObject({ type: "response.ok", data: { server: "slack", deferred: true } });
+  });
+
+  it("a claude.ai connector's sign-in is pointed at claude.ai, not the CLI", async () => {
+    script = [startsWith("connected", { "claude.ai Google Drive": "needs-auth" }), plain()];
+    answer = () => ({ status: "needs-auth", tools: [] });
+    const m = manager();
+    const id = await sessionAfterFirstTurn(m);
+    const r = (await m.handle({ type: "session.mcp_reconnect", id: "r", sessionId: id, server: "claude.ai Google Drive" } as never, AUTH, CLIENT)) as { data: McpReconnectResult };
+    expect(r.data.error).toContain("claude.ai connector settings");
+  });
+
+  it("the drawer lists servers the backend runs that no config file declares", async () => {
+    const name = `claude.ai Live ${Math.random().toString(36).slice(2, 8)}`;
+    script = [startsWith("connected", { [name]: "failed" }), plain()];
+    const m = manager();
+    const id = await sessionAfterFirstTurn(m);
+    const r = (await m.handle({ type: "claude.config", id: "c", sessionId: id } as never, AUTH, CLIENT)) as { mcpServers: Array<{ name: string; liveStatus?: string; liveOnly?: true; path: string }> };
+    expect(r.mcpServers.find((s) => s.name === name)).toMatchObject({ liveStatus: "failed", liveOnly: true, path: "" });
   });
 
   it("a backend that can't redial says so; a read-only token can't ask", async () => {
@@ -220,6 +241,42 @@ describe("healing before a turn", () => {
     expect(provider.capturedOpts.at(-1)!.userMessage).toBe("three");
     // ...and what the person typed is still what the turn list shows.
     expect(m._sessionForTest(id)!.turnIndex.map((t) => t.preview)).toEqual(["one", "two", "three"]);
+  });
+
+  it("a server the backend's own next report shows back is announced and noted, without a redial", async () => {
+    // No redial at all (answer undefined): the backend reconnected it itself.
+    script = [startsWith("failed"), startsWith("connected"), plain(), plain()];
+    const m = manager();
+    const id = await sessionAfterFirstTurn(m);
+    await send(m, id, "two");
+    expect(infos(m, id)).toContain("MCP server slack reconnected (1 tool).");
+    await send(m, id, "three");
+    expect(provider.capturedOpts.at(-1)!.userMessage).toContain("their tools are available now: slack");
+    await send(m, id, "four");
+    expect(provider.capturedOpts.at(-1)!.userMessage).toBe("four");
+  });
+
+  it("someone asking while the pre-turn redial is in flight shares it", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const m = manager();
+    const id = await sessionAfterFirstTurn(m);
+    provider.reconnectMcpServer = async (name) => {
+      provider.mcpReconnects.push(name);
+      await gate;
+      return { status: "connected", tools: ["mcp__slack__search"] };
+    };
+    const s = m._sessionForTest(id)!;
+    const turn = s.send("two", AUTH);
+    for (let i = 0; i < 200 && provider.mcpReconnects.length === 0; i++) await Bun.sleep(5);
+    const asked = reconnect(m, id);
+    release();
+    const [r] = await Promise.all([asked, turn]);
+    for (let i = 0; i < 300 && s.status !== "idle"; i++) await Bun.sleep(10);
+    expect(provider.mcpReconnects).toEqual(["slack"]);
+    expect(r).toMatchObject({ type: "response.ok", data: { status: "connected" } });
   });
 
   it("a server that stays down is retried with a wait, not before every turn", async () => {

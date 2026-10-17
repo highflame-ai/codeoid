@@ -103,6 +103,7 @@ export function resetClaudeConfig(): void {
  */
 export async function reconnectMcpServer(sessionId: string, server: string): Promise<McpReconnectResult> {
   const ok = await getClient().request({ type: "session.mcp_reconnect", id: newRequestId(), sessionId, server }, { timeoutMs: 30_000 });
-  await fetchClaudeConfig(sessionId);
+  // The drawer's statuses follow; a failed refresh isn't a failed reconnect.
+  await fetchClaudeConfig(sessionId).catch(() => {});
   return ok.data as McpReconnectResult;
 }

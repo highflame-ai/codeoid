@@ -1915,6 +1915,12 @@ export interface ClaudeConfigMcpServer {
    * data yet.
    */
   liveTools?: string[];
+  /**
+   * True for a server the backend reported that no config file codeoid reads
+   * declares (a claude.ai connector, a plugin's server, one codeoid mounts):
+   * `path`, `command` and `url` are empty for it.
+   */
+  liveOnly?: true;
 }
 
 export interface ClaudeConfigHook {

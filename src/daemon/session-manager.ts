@@ -1550,6 +1550,26 @@ mcpHub: this.#mcpHub,
           ...(liveTools !== undefined ? { liveTools } : {}),
         };
       });
+      // Servers the backend runs that no config file here declares — the
+      // claude.ai connectors, plugins' servers — so they can be seen and
+      // reconnected too.
+      const declared = new Set(mcpServers.map((s) => s.name));
+      for (const [name, liveStatus] of live.status) {
+        if (declared.has(name)) continue;
+        mcpServers.push({
+          name,
+          scope: "global",
+          path: "",
+          command: null,
+          args: [],
+          envKeys: [],
+          url: null,
+          type: null,
+          liveStatus,
+          liveTools: live.tools.get(name) ?? [],
+          liveOnly: true,
+        });
+      }
       return {
         type: "claude.config.result",
         requestId: msg.id,

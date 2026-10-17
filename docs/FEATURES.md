@@ -394,8 +394,13 @@ A server that fails then (a credential that had expired, a server that wasn't up
 - **On demand:** the Reconnect button next to a down server in the capabilities drawer, `/mcp reconnect <server>` in the web UI or TUI, or `codeoid mcp reconnect <session> <server>`.
 - **By itself:** before each turn, a server the backend reports as failed or needing sign-in is retried, waiting longer after each miss (30 seconds up to 15 minutes), so fixing a credential is enough.
 
-When a server comes back, the session says so, and the next prompt tells the model too: it was told at start that the server had failed, and would otherwise believe that over trying.
-Redialing can't run a sign-in: a server that needs one says so, and for a server in Claude's own config that sign-in happens in an interactive Claude Code session (`/mcp` there).
+Only a server the backend itself reported as down can be redialed, and one redial of a server runs at a time: asking while one is in flight joins it.
+The drawer lists every server the backend runs, including ones no config file here declares (claude.ai connectors, plugins' servers), marked `live`.
+
+When a server comes back, however it came back, the session says so, and the next prompt tells the model too: it was told at start that the server had failed, and would otherwise believe that over trying.
+That note is part of the prompt, so it stays in the session's history.
+Redialing can't run a sign-in: a server that needs one says so.
+A claude.ai connector is signed in from claude.ai's connector settings; any other server in Claude's own config, from an interactive Claude Code session (`/mcp` there).
 This covers Claude sessions, whose backend mounts its own servers; servers in codeoid's MCP registry are dialed by the daemon.
 
 ### Driven by other agents (MCP)

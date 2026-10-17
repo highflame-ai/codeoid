@@ -1443,6 +1443,7 @@ export class Session {
     }
 
     this.#provider = this.#createProvider(requested);
+    this.#resetMcpState({ backendChanged: true });
     this.#provider.onSessionEvent = (e) => this.#onSessionScopedEvent(e);
 
     // Offer the canonical history to the incoming provider. Best-effort by
@@ -1565,29 +1566,14 @@ export class Session {
     const status = this.#sdkMcpStatus.get(name);
     if (status === undefined) return { refused: `this session's backend has no MCP server named ${JSON.stringify(name)}` };
     if (status !== "failed" && status !== "needs-auth") return { refused: `${name} is ${status}, not down` };
-    // One redial per server at a time, and not again within a few seconds.
+    // One redial per server at a time (an automatic one included), and not
+    // again within a few seconds.
     const inFlight = this.#mcpInFlight.get(name);
     if (inFlight) return inFlight;
     const last = this.#mcpManualAt.get(name) ?? 0;
     if (Date.now() - last < MCP_MANUAL_COOLDOWN_MS) return { refused: `${name} was just redialed — try again in a few seconds` };
     this.#mcpManualAt.set(name, Date.now());
-    const attempt = (async (): Promise<McpReconnectResult> => {
-      this.#store.audit(sender.sub, "session.mcp_reconnect", this.id, `server=${JSON.stringify(name)} attempt`);
-      const generation = this.#mcpGeneration;
-      let state: BackendMcpServerState | null;
-      try {
-        state = await withTimeout(provider.reconnectMcpServer!(name), MCP_MANUAL_TIMEOUT_MS);
-      } catch (err) {
-        this.#store.audit(sender.sub, "session.mcp_reconnect", this.id, `server=${JSON.stringify(name)} outcome=timeout`);
-        return { server: name, status, tools: this.#sdkMcpTools.get(name) ?? [], error: cleanMcpError(err instanceof Error ? err.message : String(err)) };
-      }
-      this.#store.audit(sender.sub, "session.mcp_reconnect", this.id, `server=${JSON.stringify(name)} outcome=${state?.status ?? "deferred"}`);
-      if (!state) return { server: name, status, tools: this.#sdkMcpTools.get(name) ?? [], deferred: true };
-      if (generation === this.#mcpGeneration) this.#applyMcpState(name, state);
-      return { server: name, status: state.status, tools: state.tools, ...(state.error || state.status !== "connected" ? { error: mcpErrorFor(name, state) } : {}) };
-    })().finally(() => this.#mcpInFlight.delete(name));
-    this.#mcpInFlight.set(name, attempt);
-    return attempt;
+    return this.#dialMcp(name, MCP_MANUAL_TIMEOUT_MS, sender.sub, "session.mcp_reconnect");
   }
 
   /**
@@ -1606,18 +1592,46 @@ export class Session {
       .map(([name]) => name)
       .filter((name) => !this.#mcpInFlight.has(name));
     if (due.length === 0) return;
-    const generation = this.#mcpGeneration;
     await Promise.allSettled(
-      due.map(async (name) => {
+      due.map((name) => {
         const prev = this.#mcpRetry.get(name);
         const waitMs = Math.min((prev?.waitMs ?? MCP_RETRY_FIRST_MS / 2) * 2, MCP_RETRY_MAX_MS);
         this.#mcpRetry.set(name, { at: now + waitMs, waitMs });
-        this.#store.audit(SYSTEM_IDENTITY.sub, "session.mcp_heal", this.id, `server=${JSON.stringify(name)}`);
-        const state = await withTimeout(provider.reconnectMcpServer!(name), MCP_RECONNECT_TIMEOUT_MS);
-        // A timed-out or superseded attempt changes nothing; the next waits longer.
-        if (state && generation === this.#mcpGeneration) this.#applyMcpState(name, state);
+        return this.#dialMcp(name, MCP_RECONNECT_TIMEOUT_MS, SYSTEM_IDENTITY.sub, "session.mcp_heal");
       }),
     );
+  }
+
+  /**
+   * One redial of one server, shared: whoever asks while it's in flight (the
+   * person, or the pre-turn heal) gets the same attempt. Audited both ways.
+   */
+  #dialMcp(name: string, timeoutMs: number, who: string, action: string): Promise<McpReconnectResult> {
+    const provider = this.#provider;
+    const status = this.#sdkMcpStatus.get(name) ?? "failed";
+    const audit = (what: string) => this.#store.audit(who, action, this.id, `server=${JSON.stringify(name)} ${what}`);
+    const attempt = (async (): Promise<McpReconnectResult> => {
+      audit("attempt");
+      const generation = this.#mcpGeneration;
+      let state: BackendMcpServerState | null;
+      try {
+        state = await withTimeout(provider.reconnectMcpServer!(name), timeoutMs);
+      } catch (err) {
+        // The backend may still finish it: the next status report (mcp_init)
+        // then shows it connected, and that announces it.
+        audit("outcome=timeout");
+        return { server: name, status, tools: this.#sdkMcpTools.get(name) ?? [], error: cleanMcpError(err instanceof Error ? err.message : String(err)) };
+      }
+      audit(`outcome=${state?.status ?? "deferred"}`);
+      if (!state) return { server: name, status, tools: this.#sdkMcpTools.get(name) ?? [], deferred: true };
+      // A report taken since (a new backend process, a new turn) is newer than this.
+      if (generation === this.#mcpGeneration && provider === this.#provider) this.#applyMcpState(name, state);
+      return { server: name, status: state.status, tools: state.tools, ...(state.error || state.status !== "connected" ? { error: mcpErrorFor(name, state) } : {}) };
+    })().finally(() => {
+      if (this.#mcpInFlight.get(name) === attempt) this.#mcpInFlight.delete(name);
+    });
+    this.#mcpInFlight.set(name, attempt);
+    return attempt;
   }
 
   /** Take the backend's word for a server's state; announce it coming back. */
@@ -1625,20 +1639,42 @@ export class Session {
     const before = this.#sdkMcpStatus.get(name);
     this.#sdkMcpStatus.set(name, state.status);
     this.#sdkMcpTools.set(name, state.tools);
-    if (state.status !== "connected") return;
+    if (state.status === "connected" && before !== "connected") this.#announceMcpBack(name, state.tools.length);
+  }
+
+  /**
+   * A server that was down is connected: say so in the session, and tell the
+   * model on its next prompt (it was told at start that the server failed).
+   * Whatever brought it back — a redial, or the backend's own next report.
+   */
+  #announceMcpBack(name: string, toolCount: number): void {
     this.#mcpRetry.delete(name);
-    if (before === "connected") return;
     this.#mcpBack.add(name);
     const msg = this.#makeMessage(
       "info",
-      `MCP server ${name} reconnected (${state.tools.length} tool${state.tools.length === 1 ? "" : "s"}).`,
+      `MCP server ${name} reconnected (${toolCount} tool${toolCount === 1 ? "" : "s"}).`,
       SYSTEM_IDENTITY,
       undefined,
       undefined,
-      { event: "mcp.reconnected", server: name, tools: state.tools.length },
+      { event: "mcp.reconnected", server: name, tools: toolCount },
     );
     this.#persistAndBuffer(msg);
     this.#broadcastRaw(msg);
+  }
+
+  /**
+   * The backend process is gone (teardown) or replaced by another backend: a
+   * new one dials every server itself, so redial waits start over. On a
+   * backend switch nothing it reported applies any more.
+   */
+  #resetMcpState(opts: { backendChanged: boolean }): void {
+    this.#mcpRetry.clear();
+    this.#mcpManualAt.clear();
+    if (!opts.backendChanged) return;
+    this.#mcpGeneration++;
+    this.#sdkMcpStatus.clear();
+    this.#sdkMcpTools.clear();
+    this.#mcpBack.clear();
   }
 
   /** A one-line note for the next prompt naming servers that came back, once. */
@@ -3034,6 +3070,7 @@ export class Session {
     this.#activeRun = null;
     this.#eventConsumerTask = null;
     await this.#provider.teardown();
+    this.#resetMcpState({ backendChanged: false });
     try { await taskToAwait; } catch { /* consumer handles its own errors */ }
     // teardown() aborts the SDK query, so any sub-agent still in flight will
     // never get its SubagentStop hook. This is the setModel / rotate /
@@ -5414,6 +5451,7 @@ export class Session {
 
       case "mcp_init": {
         this.#mcpGeneration++;
+        const before = new Map(this.#sdkMcpStatus);
         this.#sdkMcpStatus.clear();
         this.#sdkMcpTools.clear();
         for (const [name, status] of Object.entries(event.servers)) {
@@ -5433,6 +5471,13 @@ export class Session {
           });
           this.#persistAndBuffer(infoMsg);
           this.#broadcastRaw(infoMsg);
+        }
+        // Down at the last report, up now — however it came back.
+        for (const [name, status] of this.#sdkMcpStatus) {
+          const was = before.get(name);
+          if (status === "connected" && (was === "failed" || was === "needs-auth")) {
+            this.#announceMcpBack(name, this.#sdkMcpTools.get(name)?.length ?? 0);
+          }
         }
         break;
       }
@@ -6965,6 +7010,10 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
 /** What to tell someone whose reconnect didn't connect — sign-in needs say where it can be done. */
 function mcpErrorFor(name: string, state: { status: string; error?: string }): string {
   if (state.status === "needs-auth") {
+    // claude.ai connectors are signed in on claude.ai, not by the CLI.
+    if (name.startsWith("claude.ai ")) {
+      return `${name} needs a sign-in: connect it in your claude.ai connector settings, then reconnect it here.`;
+    }
     return `${name} needs a sign-in, which only an interactive Claude Code session can run: sign in with /mcp there, then reconnect it here.`;
   }
   return state.error ? cleanMcpError(state.error) : `${name} is ${state.status}`;

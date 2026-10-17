@@ -208,6 +208,11 @@ export class TuiWsClient {
     });
   }
 
+  /** Redial one of the session backend's MCP servers that's down (#389). */
+  mcpReconnect(sessionId: string, server: string): Promise<DaemonMessage> {
+    return this.#request({ type: "session.mcp_reconnect", id: randomUUID(), sessionId, server });
+  }
+
   /** A session's turns, oldest first (#354). */
   turns(sessionId: string): Promise<DaemonMessage> {
     return this.#request({ type: "session.turns", id: randomUUID(), sessionId });

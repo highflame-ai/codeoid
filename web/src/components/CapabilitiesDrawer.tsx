@@ -126,7 +126,7 @@ const CapabilitiesDrawer: Component = () => {
                 <SkillsList items={claudeConfig().skills} />
               </Match>
               <Match when={activeTab() === "mcp"}>
-                <McpList items={claudeConfig().mcpServers} sessionId={focusedSessionId()} />
+                <McpList items={claudeConfig().mcpServers} sessionId={claudeConfig().sessionId} />
               </Match>
               <Match when={activeTab() === "hooks"}>
                 <HooksList items={claudeConfig().hooks} />
@@ -285,20 +285,40 @@ const SkillsList: Component<{ items: ClaudeConfigSkill[] }> = (props) => (
   </Show>
 );
 
+/**
+ * Reconnect state per session and server, outside the rows: the refresh that
+ * follows a reconnect rebuilds the list, and the outcome must survive it.
+ */
+const [mcpReconnecting, setMcpReconnecting] = createSignal<ReadonlySet<string>>(new Set());
+const [mcpNotes, setMcpNotes] = createSignal<Readonly<Record<string, string>>>({});
+const mcpKey = (sessionId: string, server: string) => `${sessionId}\u0000${server}`;
+
 /** Redial a server the backend reports as down (#389); the outcome shows inline. */
 const McpReconnect: Component<{ sessionId: string; server: string }> = (props) => {
-  const [busy, setBusy] = createSignal(false);
-  const [note, setNote] = createSignal<string | null>(null);
+  const key = () => mcpKey(props.sessionId, props.server);
+  const busy = () => mcpReconnecting().has(key());
+  const setNote = (k: string, note: string | null) =>
+    setMcpNotes((prev) => {
+      const next = { ...prev };
+      if (note === null) delete next[k];
+      else next[k] = note;
+      return next;
+    });
   const run = async () => {
-    setBusy(true);
-    setNote(null);
+    const k = key();
+    setMcpReconnecting((prev) => new Set(prev).add(k));
+    setNote(k, null);
     try {
       const r = await reconnectMcpServer(props.sessionId, props.server);
-      if (r.status !== "connected") setNote(r.deferred ? "Connects when the next turn starts." : (r.error ?? `Still ${r.status}.`));
+      if (r.status !== "connected") setNote(k, r.deferred ? "Connects when the next turn starts." : (r.error ?? `Still ${r.status}.`));
     } catch (err) {
-      setNote(err instanceof Error ? err.message : String(err));
+      setNote(k, err instanceof Error ? err.message : String(err));
     } finally {
-      setBusy(false);
+      setMcpReconnecting((prev) => {
+        const next = new Set(prev);
+        next.delete(k);
+        return next;
+      });
     }
   };
   return (
@@ -311,12 +331,15 @@ const McpReconnect: Component<{ sessionId: string; server: string }> = (props) =
       >
         {busy() ? "Reconnecting…" : "Reconnect"}
       </button>
-      <Show when={note()}>
-        <div class="mt-1 basis-full text-[11px] text-fg-muted">{note()}</div>
+      <Show when={mcpNotes()[key()]}>
+        <div class="mt-1 basis-full text-[11px] text-fg-muted">{mcpNotes()[key()]}</div>
       </Show>
     </>
   );
 };
+
+/** Only a server the backend reports as down can be redialed. */
+const canReconnect = (status: string | undefined) => status === "failed" || status === "needs-auth";
 
 const McpList: Component<{ items: ClaudeConfigMcpServer[]; sessionId: string | null }> = (props) => (
   <Show
@@ -333,14 +356,26 @@ const McpList: Component<{ items: ClaudeConfigMcpServer[]; sessionId: string | n
               <span class="font-mono text-[13px] font-semibold text-fg">
                 {m.name}
               </span>
-              <ScopeBadge scope={m.scope} />
+              <Show
+                when={!m.liveOnly}
+                fallback={
+                  <span
+                    class="rounded border border-border bg-bg px-1 py-0.5 font-mono text-[10px] uppercase tracking-wider text-fg-muted"
+                    title="Run by the backend (a claude.ai connector, a plugin, codeoid), not declared in a config file here"
+                  >
+                    live
+                  </span>
+                }
+              >
+                <ScopeBadge scope={m.scope} />
+              </Show>
               <Show when={m.type}>
                 <span class="rounded border border-border px-1 py-0.5 font-mono text-[10px] uppercase tracking-wider text-fg-faint">
                   {m.type}
                 </span>
               </Show>
               <McpStatusBadge status={m.liveStatus} toolCount={m.liveTools?.length} />
-              <Show when={props.sessionId && m.liveStatus !== undefined && m.liveStatus !== "connected" && m.liveStatus !== "disabled"}>
+              <Show when={props.sessionId && canReconnect(m.liveStatus)}>
                 <McpReconnect sessionId={props.sessionId!} server={m.name} />
               </Show>
             </div>
@@ -383,7 +418,9 @@ const McpList: Component<{ items: ClaudeConfigMcpServer[]; sessionId: string | n
                 no tools exposed this session
               </div>
             </Show>
-            <PathRow path={m.path} />
+            <Show when={m.path}>
+              <PathRow path={m.path} />
+            </Show>
           </li>
         )}
       </For>

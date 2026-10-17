@@ -18,7 +18,7 @@ import {
   loadWorkspaceCommands,
   type WorkspaceCommand,
 } from "./workspace-commands.js";
-import type { Attachment } from "../protocol/types.js";
+import type { Attachment, McpReconnectResult } from "../protocol/types.js";
 import { parseDialogAnswer } from "../terminal/dialog.js";
 import { formatRewind, parseForkArgs, parseUndoArgs } from "../terminal/rewind.js";
 import { formatCompare, parseCompareArgs } from "../terminal/compare.js";
@@ -1035,6 +1035,32 @@ export function App({ config }: Props) {
             dispatch({ type: "cursor.set", position: clean.length });
           }
         })().catch((err: Error) => dispatch({ type: "error", message: err.message }));
+        return;
+      }
+      case "/mcp": {
+        // /mcp reconnect <server> (#389). Anything else is Claude Code's own
+        // /mcp, which codeoid doesn't run: say so rather than send it as a prompt.
+        if (!client || !focusedSession) return;
+        const server = args.slice(1).join(" ").trim();
+        if (args[0] !== "reconnect" || !server) {
+          dispatch({ type: "error", message: "usage: /mcp reconnect <server>" });
+          return;
+        }
+        const sessionId = focusedSession.info.id;
+        void client
+          .mcpReconnect(sessionId, server)
+          .then((resp) => {
+            if (resp.type === "response.error") {
+              dispatch({ type: "error", message: resp.error });
+              return;
+            }
+            if (resp.type !== "response.ok") return;
+            const r = resp.data as McpReconnectResult;
+            // A connect is announced in the session itself; only say what didn't work.
+            if (r.deferred) printLocalInfo(sessionId, `${server}: the backend isn't running; it connects its servers when the next turn starts.`);
+            else if (r.status !== "connected") printLocalInfo(sessionId, `${server}: ${r.status}${r.error ? ` — ${r.error}` : ""}`);
+          })
+          .catch((err: Error) => dispatch({ type: "error", message: err.message }));
         return;
       }
       case "/rotate": {
