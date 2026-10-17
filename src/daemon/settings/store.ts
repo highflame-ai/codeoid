@@ -212,6 +212,42 @@ export function previewPatches(
   return { raw, env };
 }
 
+// ── MCP server entries (#390) ───────────────────────────────────────────────
+
+/**
+ * The `mcpServers` entry of that name in config.json, if any — what the user
+ * (or an earlier adopt) wrote, not what the registry holds at runtime.
+ */
+export function readMcpServerEntry(name: string): Record<string, unknown> | undefined {
+  const servers = readRawConfig().mcpServers;
+  if (!servers || typeof servers !== "object" || Array.isArray(servers)) return undefined;
+  const entry = (servers as Record<string, unknown>)[name];
+  return entry && typeof entry === "object" && !Array.isArray(entry) ? (entry as Record<string, unknown>) : undefined;
+}
+
+/**
+ * Write one `mcpServers` entry to config.json: merged onto the raw file, the
+ * whole config validated, then written atomically (0600) — nothing is written
+ * if it doesn't validate. Keyed by name directly, not through a dotted path, so
+ * a name with a dot ("my.server") stays one key.
+ */
+export function writeMcpServerEntry(name: string, entry: Record<string, unknown>): { ok: true } | { ok: false; error: string } {
+  let raw: Record<string, unknown>;
+  try {
+    raw = readRawConfig();
+  } catch (err) {
+    return { ok: false, error: `config.json is not valid JSON: ${errMsg(err)}` };
+  }
+  const servers = raw.mcpServers;
+  const next = servers && typeof servers === "object" && !Array.isArray(servers) ? { ...(servers as Record<string, unknown>) } : {};
+  next[name] = entry;
+  raw.mcpServers = next;
+  const validation = validateConfigObject(raw);
+  if (!validation.ok) return { ok: false, error: validation.issues.map((i) => i.message).join("; ") };
+  writeConfigJson(raw);
+  return { ok: true };
+}
+
 // ── config.json IO ──────────────────────────────────────────────────────────
 
 function readRawConfig(): Record<string, unknown> {

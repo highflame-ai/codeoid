@@ -277,6 +277,10 @@ export interface BackendMcpServerState {
   error?: string;
   /** A claude.ai connector, by the backend's own account (signed in on claude.ai, not by the CLI). */
   connector?: boolean;
+  /** The backend still runs its own copy of a server codeoid signs in to now
+   *  (adopted since the query started, #390): not redialed — the next query
+   *  uses codeoid's copy. */
+  codeoidOwned?: boolean;
 }
 
 // ── Provider event stream ─────────────────────────────────────────────────────

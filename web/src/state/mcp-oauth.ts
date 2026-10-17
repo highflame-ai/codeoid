@@ -15,6 +15,7 @@ import { createSignal } from "solid-js";
 import { getClient, newRequestId } from "./connection";
 import { applySnapshot, fetchSettings } from "./settings";
 import type {
+  McpAdoptResultMsg,
   McpOAuthBeginResultMsg,
   McpOAuthCompleteResultMsg,
   McpOAuthDisconnectResultMsg,
@@ -44,6 +45,28 @@ export function _resetMcpOAuthForTest(): void {
 
 export function dismissMcpOAuth(): void {
   setState(EMPTY);
+}
+
+/**
+ * Adopt a server from Claude's own config into codeoid's registry (#390), then
+ * start codeoid's sign-in for it — one step for the user. `sessionId` lets the
+ * daemon find a server from that session's workdir too.
+ */
+export async function adoptAndSignIn(server: string, sessionId: string | null, url: string | null): Promise<void> {
+  setState({ server, phase: "starting", url: null, error: null });
+  try {
+    const id = newRequestId();
+    const res = await getClient().request<McpAdoptResultMsg>(
+      // The URL shown: two entries can share a name, and this says which.
+      { type: "mcp.adopt", id, server, ...(sessionId ? { sessionId } : {}), ...(url ? { url } : {}) },
+      { waitForResult: (m) => (m.type === "mcp.adopt.result" && m.requestId === id ? m : undefined) },
+    );
+    applySnapshot(res.snapshot);
+  } catch (err) {
+    setState({ server, phase: "idle", url: null, error: errText(err) });
+    return;
+  }
+  await beginMcpOAuth(server);
 }
 
 /** Start connecting a server; resolves once there is a URL to open (or none needed). */

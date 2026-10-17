@@ -36,6 +36,12 @@ export interface McpCredentialSource {
   accessToken(spec: McpServerSpec, tenant: McpTenant): Promise<string | undefined>;
   /** The server rejected `token` (401): the next accessToken() refreshes it. */
   rejected(spec: McpServerSpec, tenant: McpTenant, token: string): void;
+  /** Whether the tenant holds a credential worth trying, without a network call. */
+  signedIn?(spec: McpServerSpec, tenant: McpTenant): boolean;
+  /** A stamp that changes with each sign-in (not a refresh — the same
+   *  credential, renewed): a holder of a connection made before knows to
+   *  remake it. */
+  credentialStamp?(spec: McpServerSpec, tenant: McpTenant): string | undefined;
 }
 
 /** Thrown to the model/UI when a server has no usable credential. */
@@ -90,7 +96,7 @@ export class McpOAuthUnbound extends Error {
   constructor() {
     super(
       "This browser did not start this sign-in, so it was not completed here. " +
-        "To finish it, copy this page's address into codeoid: Settings → MCP Servers → Finish.",
+        "To finish it, copy this page's address into codeoid: Settings → MCP Servers → Finish, or paste it into `codeoid mcp signin`.",
     );
     this.name = "McpOAuthUnbound";
   }
@@ -119,6 +125,9 @@ export class McpOAuth implements McpCredentialSource {
   readonly #refreshing = new Map<string, Promise<string | undefined>>();
   /** Tokens a server rejected: refreshed on next use even if not yet expired. */
   readonly #rejected = new Map<string, string>();
+  /** Bumped by each sign-in and sign-out, per (tenant, server): the stamp a
+   *  holder of a connection compares. Not by a refresh — same credential. */
+  readonly #signIns = new Map<string, number>();
 
   constructor(opts: McpOAuthOptions) {
     this.#store = opts.store;
@@ -206,6 +215,7 @@ export class McpOAuth implements McpCredentialSource {
     });
     if (result !== "AUTHORIZED") throw new Error(`Sign-in to ${pending.server} did not complete.`);
     this.#rejected.delete(keyOf(spec.name, pending.tenant));
+    this.#bumpSignIn(spec.name, pending.tenant);
     return { server: pending.server, tenant: pending.tenant };
   }
 
@@ -235,8 +245,23 @@ export class McpOAuth implements McpCredentialSource {
     return this.#expired(spec, tenant, tokens) ? "disconnected" : "connected";
   }
 
+  signedIn(spec: McpServerSpec, tenant: McpTenant): boolean {
+    return this.status(spec, tenant) === "connected";
+  }
+
+  credentialStamp(spec: McpServerSpec, tenant: McpTenant): string | undefined {
+    if (!this.signedIn(spec, tenant)) return undefined;
+    return String(this.#signIns.get(keyOf(spec.name, tenant)) ?? 0);
+  }
+
+  #bumpSignIn(server: string, tenant: McpTenant): void {
+    const key = keyOf(server, tenant);
+    this.#signIns.set(key, (this.#signIns.get(key) ?? 0) + 1);
+  }
+
   /** Forget the tenant's tokens for a server (its client registration stays). */
   disconnect(spec: McpServerSpec, tenant: McpTenant): void {
+    this.#bumpSignIn(spec.name, tenant);
     this.#store.clearMcpOAuth(tenant, serverOf(spec), "tokens");
     this.#rejected.delete(keyOf(spec.name, tenant));
   }
@@ -254,6 +279,12 @@ export class McpOAuth implements McpCredentialSource {
       binding: "",
       expiresAt: this.#now(),
     };
+    // When the authorization server refuses the refresh (invalid_grant, or
+    // invalid_client), auth() itself has the provider forget the tokens
+    // (invalidateCredentials), so the server reads as signed out. A refresh
+    // that merely failed (network, 5xx) changes nothing stored: auth() moves
+    // on to a new authorization, which isn't followed here — and the tokens
+    // are kept for the next try.
     try {
       const result = await auth(this.#provider(spec, oauth, tenant, scratch), {
         serverUrl: urlOf(spec),
@@ -262,6 +293,9 @@ export class McpOAuth implements McpCredentialSource {
       });
       if (result !== "AUTHORIZED") return undefined;
     } catch (err) {
+      // Anything else auth() throws (discovery unreachable,
+      // temporarily_unavailable, …) is no verdict on the token either: keep
+      // it for the next try.
       console.error(`[codeoid] mcp oauth: refreshing ${spec.name} failed: ${err instanceof Error ? err.message : String(err)}`);
       return undefined;
     }

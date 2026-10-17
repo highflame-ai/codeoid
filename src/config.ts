@@ -902,7 +902,7 @@ export function resolveQwenBaseUrl(value: string | undefined): string | undefine
  * `url` (streamable-HTTP). `codeoid_memory` is a built-in entry and is NOT
  * declarable here.
  */
-const McpServerSchema = z
+export const McpServerSchema = z
   .object({
     // ── transport (inferred) ──
     /** stdio: launch this command. Mutually exclusive with `url`. */

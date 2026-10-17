@@ -62,7 +62,7 @@ import type {
   SessionWorktree,
   McpReconnectResult,
 } from "../protocol/types.js";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { lstat, readdir } from "node:fs/promises";
@@ -82,6 +82,7 @@ import {
 } from "./checkpoints.js";
 import { applyRewinds, REWIND_EVENT, type TurnIndexEntry } from "./transcript.js";
 import type { RewindFiles, RewindIrreversible, TurnSummary } from "../protocol/types.js";
+import { hasScope, SCOPES } from "../protocol/scopes.js";
 import type { PendingToolApproval, SessionApproveOutcome } from "../protocol/types.js";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -118,6 +119,7 @@ import {
 import { isElicitationTool, isSafeTool, roleDeniesTool } from "./providers/tool-safety.js";
 import type { PackActivation } from "./pipeline/index.js";
 import type { McpRegistry } from "./mcp/registry.js";
+import { adoptableName, adoptionRefusal, claudeMcpServers, fromRepoFile, shellArg } from "./mcp/adopt.js";
 import type { McpHub } from "./mcp/hub.js";
 import type { Attachment } from "../protocol/types.js";
 import { resolveAttachments } from "./attachments.js";
@@ -1624,7 +1626,7 @@ export class Session {
       if (Date.now() - last < MCP_TIMINGS.manualCooldownMs) return refuse("cooldown", `${name} was just redialed — try again in a few seconds`);
       this.#mcpManualAt.set(name, Date.now());
     }
-    return this.#dialMcp(name, MCP_TIMINGS.manualTimeoutMs, sender.sub, "session.mcp_reconnect");
+    return this.#dialMcp(name, MCP_TIMINGS.manualTimeoutMs, sender.sub, "session.mcp_reconnect", sender);
   }
 
   /**
@@ -1661,7 +1663,7 @@ export class Session {
    * answers — a caller giving up doesn't free the server for another dial.
    * Every caller is audited as themselves.
    */
-  async #dialMcp(name: string, timeoutMs: number, who: string, action: string): Promise<McpReconnectResult> {
+  async #dialMcp(name: string, timeoutMs: number, who: string, action: string, asker?: AuthContext): Promise<McpReconnectResult> {
     const audit = (what: string) => this.#store.audit(who, action, this.id, `server=${JSON.stringify(name)} ${what}`);
     let dial = this.#mcpInFlight.get(name);
     if (dial) audit("joined");
@@ -1680,9 +1682,17 @@ export class Session {
       audit("outcome=timeout");
       return { server: name, status, tools: this.#sdkMcpTools.get(name) ?? [], error: cleanMcpError(err instanceof Error ? err.message : String(err)) };
     }
+    if (state?.codeoidOwned) {
+      audit("outcome=codeoid-owned");
+      return { server: name, status, tools: [], error: `codeoid signs in to ${name} now; this session uses codeoid's copy from its next turn` };
+    }
     audit(`outcome=${state?.status ?? "deferred"}`);
     if (!state) return { server: name, status, tools: this.#sdkMcpTools.get(name) ?? [], deferred: true };
-    return { server: name, status: state.status, tools: state.tools, ...(state.error || state.status !== "connected" ? { error: mcpErrorFor(name, state) } : {}) };
+    // Only someone asking gets told how to fix a sign-in; the pre-turn redial's answer goes nowhere.
+    // ...and only someone who could adopt it is pointed at adopting it.
+    const canAdopt = asker !== undefined && hasScope(asker.scopes as string[], SCOPES.SETTINGS_WRITE) && asker.delegationDepth === 0;
+    const adopt = state.status === "needs-auth" && !state.connector && canAdopt ? await this.#adoptHint(name) : null;
+    return { server: name, status: state.status, tools: state.tools, ...(state.error || state.status !== "connected" ? { error: mcpErrorFor(name, state, adopt) } : {}) };
   }
 
   /** The one backend redial of a server; its outcome is applied once, when the backend answers. */
@@ -1691,8 +1701,9 @@ export class Session {
     const generation = this.#mcpGeneration;
     // A backend that never answers mustn't hold the server forever.
     const dial = withTimeout(provider.reconnectMcpServer!(name), MCP_TIMINGS.dialCeilingMs).then((state) => {
-      // A report taken since (a new backend process, a new turn) is newer than this.
-      if (state && generation === this.#mcpGeneration && provider === this.#provider) this.#applyMcpState(name, state);
+      // A report taken since (a new backend process, a new turn) is newer than
+      // this; and a copy codeoid owns now reports nothing worth keeping.
+      if (state && !state.codeoidOwned && generation === this.#mcpGeneration && provider === this.#provider) this.#applyMcpState(name, state);
       return state;
     });
     const clear = () => {
@@ -1701,6 +1712,41 @@ export class Session {
     dial.then(clear, clear);
     this.#mcpInFlight.set(name, dial);
     return dial;
+  }
+
+  /**
+   * How codeoid could take over a server's sign-in (#390): the adopt command
+   * for the one remote server Claude's config has under this name, with
+   * `--session` when it's this workdir's. Null when there's none to adopt.
+   */
+  async #adoptHint(name: string): Promise<{ command: string; note?: string } | null> {
+    if (!adoptableName(name).ok) return null;
+    const registry = this.#mcpRegistry;
+    if (!registry) return null;
+    const all = await claudeMcpServers(this.workdir).catch(() => []);
+    // What adopt would refuse isn't suggested (the daemon's own endpoints
+    // excepted: the session doesn't know them, and adopt still refuses them).
+    const named = all.filter((c) => c.name === name);
+    const can = named.filter((c) => !adoptionRefusal(c, all, registry, []));
+    if (can.length === 0) return null;
+    // Quoted to run as shown (a session's name is free text).
+    const session = `--session=${shellArg(this.name)}`;
+    if (new Set(can.map((c) => c.url)).size > 1) {
+      return { command: `codeoid mcp adopt ${name} ${session} --url <the one to use>`, note: `Claude's config has more than one server named ${name}.` };
+    }
+    const one = can[0]!;
+    // Adopt counts every entry of the name: another (even one it would refuse)
+    // makes it ambiguous, so the URL is named.
+    if (new Set(named.map((c) => c.url)).size > 1) return { command: `codeoid mcp adopt ${name} ${session} --url=${shellArg(one.url!)}` };
+    if (one.scope !== "workdir") return { command: `codeoid mcp adopt ${name}` };
+    // A project's own server: naming its address is the consent — so say who chose it.
+    if (fromRepoFile(one)) {
+      return {
+        command: `codeoid mcp adopt ${name} ${session} --url=${shellArg(one.url!)}`,
+        note: `Its address (${new URL(one.url!).href}) was chosen by this project's ${basename(one.path)}: adopt it only if you trust it.`,
+      };
+    }
+    return { command: `codeoid mcp adopt ${name} ${session}` };
   }
 
   /** Take the backend's word for a server's state; announce it coming back. */
@@ -7338,12 +7384,17 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
 }
 
 /** What to tell someone whose reconnect didn't connect — sign-in needs say where it can be done. */
-function mcpErrorFor(name: string, state: { status: string; error?: string; connector?: boolean }): string {
+function mcpErrorFor(name: string, state: { status: string; error?: string; connector?: boolean }, adopt: { command: string; note?: string } | null = null): string {
   if (state.status === "needs-auth") {
     // claude.ai connectors are signed in on claude.ai, not by the CLI. The
     // backend says which servers are; a name alone could claim to be one.
     if (state.connector) {
       return `${name} needs a sign-in: connect it in your claude.ai connector settings, then reconnect it here.`;
+    }
+    // A server codeoid can take over: say so first — it works from here, on
+    // any device, and serves every backend that reaches OAuth servers (#390).
+    if (adopt) {
+      return `${name} needs a sign-in. Have codeoid sign in to it: "Sign in with codeoid" in the capabilities drawer, or \`${adopt.command}\` then \`codeoid mcp signin ${name}\`.${adopt.note ? ` ${adopt.note}` : ""} Or sign in with /mcp in an interactive Claude Code session, then reconnect it here.`;
     }
     return `${name} needs a sign-in, which only an interactive Claude Code session can run: sign in with /mcp there, then reconnect it here.`;
   }

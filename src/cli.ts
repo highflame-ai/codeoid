@@ -851,6 +851,19 @@ mcp
   });
 
 mcp
+  .command("adopt <server>")
+  .description("Have codeoid sign in to a remote MCP server from Claude's own config, instead of an interactive Claude Code session (#390)")
+  .option("--session <session>", "also look in this session's workdir (a .mcp.json, project servers)")
+  .option("--url <url>", "the server's URL: required for a project's own server (its address was chosen by the project — naming it is your consent), and when two servers share the name")
+  .action((server: string, opts: { session?: string; url?: string }) => withClient((c) => c.mcpAdopt(server, opts.session, opts.url)));
+
+mcp
+  .command("signin <server>")
+  .description("Sign in to an OAuth MCP server in codeoid's registry (one you adopted, or configured with oauth)")
+  .option("--callback-url <url>", "finish a sign-in from the address the browser landed on")
+  .action((server: string, opts: { callbackUrl?: string }) => withClient((c) => c.mcpSignin(server, opts.callbackUrl)));
+
+mcp
   .command("reconnect <session> <server>")
   .description("Redial one of a session's MCP servers that's down — e.g. one that failed when the session started and has since been fixed")
   .action((session: string, server: string) => withClient((c) => c.mcpReconnect(session, server)));

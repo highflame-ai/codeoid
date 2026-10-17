@@ -443,6 +443,8 @@ codeoid compare show|ls|keep …                       #   results; keep one [--
 codeoid routine add <name> --prompt … [--cron|--every|--at] [--check <cmd>]  # scheduled / triggered agent runs
 codeoid routine ls | show | runs | run [--wait] | edit | pause | resume | rm | cancel <runId> | token | preview
 codeoid mcp reconnect <session> <server>             # redial a session's MCP server that's down
+codeoid mcp adopt <server> [--session <s>] [--url <u>]  # have codeoid sign in to a server from Claude's config
+codeoid mcp signin <server> [--callback-url <u>]        # sign in to an OAuth server in codeoid's registry
 ```
 
 ## Development
