@@ -8,6 +8,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Sign in to an MCP server from codeoid instead of an interactive Claude Code session** (#390).
+  A remote OAuth server in Claude's own config (`~/.claude.json`, a `.mcp.json`) could only be signed in to through `/mcp` in a Claude Code terminal, so in a codeoid session it just reported "needs authentication".
+  codeoid can now adopt it: "Sign in with codeoid" in the capabilities drawer, or `codeoid mcp adopt <server>` and `codeoid mcp signin <server>`, puts the same URL in codeoid's registry and runs codeoid's own sign-in, from any frontend.
+  Claude sessions then use codeoid's copy, mounted in-process in front of the daemon's MCP client so the token never reaches the agent, and the CLI is told not to connect its own.
+  OAuth registry servers now reach Claude at all, not only the daemon-run backends; a server that needs sign-in points at adopting it.
+  codeoid never reads or writes the Claude CLI's credentials.
+
 - **Forks, backend switches and rewinds continue the conversation natively on
   Claude and Codex** (#387). Until now a fork onto Claude, Codex or pi got a
   text transcript in its first prompt, with each tool's input and output cut

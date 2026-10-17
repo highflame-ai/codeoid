@@ -16,6 +16,9 @@ import { MockSessionProvider } from "../daemon/providers/mock/session-provider.j
 import { ProviderRegistry } from "../daemon/providers/registry.js";
 import { SessionManager } from "../daemon/session-manager.js";
 import { MCP_TIMINGS, cleanMcpError } from "../daemon/session.js";
+import { McpServerSchema } from "../config.js";
+import { McpHub } from "../daemon/mcp/hub.js";
+import { McpRegistry } from "../daemon/mcp/registry.js";
 import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
 import { ALL_SCOPES, WATCHER_SCOPES } from "../protocol/scopes.js";
@@ -169,6 +172,16 @@ describe("session.mcp_reconnect", () => {
     expect(r.data.error).toContain("claude.ai connector settings");
   });
 
+  it("a remote server from the user's own config is pointed at codeoid's sign-in first (#390)", async () => {
+    answer = () => ({ status: "needs-auth", tools: [], adoptable: true });
+    const m = manager();
+    const id = await sessionAfterFirstTurn(m);
+    const r = (await reconnect(m, id)) as { data: McpReconnectResult };
+    expect(r.data.error).toContain('"Sign in with codeoid"');
+    expect(r.data.error).toContain("codeoid mcp adopt slack");
+    expect(r.data.error).toContain("interactive Claude Code session"); // still offered
+  });
+
   it("a server only named like a connector gets the CLI's sign-in guidance", async () => {
     script = [startsWith("connected", { "claude.ai Gmail": "needs-auth" }), plain()];
     answer = () => ({ status: "needs-auth", tools: [] }); // the backend doesn't say it's a connector
@@ -267,6 +280,18 @@ describe("healing before a turn", () => {
     const note = provider.capturedOpts.at(-1)!.userMessage as string;
     expect(note).toContain('"plugin:foo:bar"');
     expect(note).not.toContain("evil");
+  });
+
+  it("a server adopted by codeoid since is not redialed through the CLI's own copy (#390)", async () => {
+    answer = () => ({ status: "connected", tools: [] });
+    const m = manager();
+    // codeoid owns slack now (adopted): the next query mounts codeoid's copy.
+    m.setMcp(new McpRegistry({ slack: McpServerSchema.parse({ url: "https://slack.example.com/mcp", oauth: true }) }, { memoryEnabled: false }), new McpHub({}));
+    const id = await sessionAfterFirstTurn(m);
+    await send(m, id, "two");
+    expect(provider.mcpReconnects).toEqual([]); // the pre-turn redial left it alone
+    expect(await reconnect(m, id)).toMatchObject({ type: "response.error", error: expect.stringContaining("codeoid signs in to slack now") });
+    expect(provider.mcpReconnects).toEqual([]);
   });
 
   it("a server that stays down is retried with a wait, not before every turn", async () => {

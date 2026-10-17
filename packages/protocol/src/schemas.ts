@@ -528,6 +528,13 @@ export const mcpOAuthDisconnectSchema = z.object({
   server: mcpServerNameField,
 });
 
+export const mcpAdoptSchema = z.object({
+  ...base,
+  type: z.literal("mcp.adopt"),
+  server: mcpServerNameField,
+  sessionId: sessionIdField.optional(),
+});
+
 // ── Skill command pre-approval (#348) ─────────────────────────────────────────
 
 /** As the daemon's isUngrantableSkillCommand: `Bash(<cmd>)` must survive the
@@ -954,6 +961,7 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   mcpOAuthBeginSchema,
   mcpOAuthCompleteSchema,
   mcpOAuthDisconnectSchema,
+  mcpAdoptSchema,
   usageDailySchema,
   pipelineCreateSchema,
   pipelineListSchema,

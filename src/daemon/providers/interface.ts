@@ -277,6 +277,9 @@ export interface BackendMcpServerState {
   error?: string;
   /** A claude.ai connector, by the backend's own account (signed in on claude.ai, not by the CLI). */
   connector?: boolean;
+  /** A remote HTTP server from the user's own config, by the backend's account:
+   *  one codeoid could adopt and sign in to itself (#390). */
+  adoptable?: boolean;
 }
 
 // ── Provider event stream ─────────────────────────────────────────────────────

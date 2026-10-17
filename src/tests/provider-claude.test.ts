@@ -99,6 +99,7 @@ import {
   packPluginsOption,
   pluginSkillDirs,
   mcpToolPrefix,
+  withoutServers,
 } from "../daemon/providers/claude/index.js";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1728,6 +1729,76 @@ describe("ClaudeProvider – runTurn with mocked SDK", () => {
 // keep-alive loop therefore must be REBUILT when a turn arrives with a
 // different systemPromptAppend (before_turn hook output, refreshed memory
 // index) — and must keep full warm-reuse when the append is unchanged.
+describe("ClaudeProvider – OAuth registry servers (#390)", () => {
+  let openGate: () => void = () => {};
+  beforeEach(() => {
+    sdkMessages = [];
+    sdkThrowError = null;
+    capturedQueryOpts = null;
+    queryCallCount = 0;
+    sdkGate = new Promise<void>((r) => {
+      openGate = r;
+    });
+  });
+
+  it("leaves a server codeoid owns out of the user servers it passes, by name or by URL", () => {
+    const user = {
+      notes: { type: "http", url: "https://notes.example.com/mcp" },
+      renamed: { type: "http", url: "https://tracker.example.com/mcp" },
+      other: { type: "http", url: "https://other.example.com/mcp" },
+      local: { command: "node", args: [] },
+    } as never;
+    expect(Object.keys(withoutServers(user, ["notes"], ["https://notes.example.com/mcp", "https://tracker.example.com/mcp"]))).toEqual(["other", "local"]);
+    expect(withoutServers(user, [], [])).toBe(user);
+  });
+
+  it("mounts codeoid's copy once signed in, denies the CLI's, and rebuilds when that changes", async () => {
+    const { McpServerSchema } = await import("../config.js");
+    const { McpRegistry } = await import("../daemon/mcp/registry.js");
+    const registry = new McpRegistry({ notes: McpServerSchema.parse({ url: "https://notes.example.com/mcp", oauth: true }) }, { memoryEnabled: false });
+    let signedIn = false;
+    const hub = { signedIn: () => signedIn } as never;
+    const provider = new ClaudeProvider({
+      sessionId: "test-session",
+      initialBackingId: "test-backing",
+      workspaceId: "ws_test",
+      tenant: { accountId: "acc", projectId: "proj" },
+      mcpRegistry: registry,
+      mcpHub: hub,
+      store: {
+        audit: () => {},
+        getClaudeCodeSessionId: () => null,
+        setClaudeCodeSessionId: () => {},
+        getSkillCommandGrants: () => new Map<string, boolean>(),
+        setSkillCommandGrant: () => {},
+      } as never,
+    });
+    const turn = (msg: string) =>
+      provider.runTurn({ history: [], userMessage: msg, workdir: "/tmp", canUseTool: async () => ({ behavior: "allow" as const }) });
+    const options = () =>
+      capturedQueryOpts?.options as {
+        mcpServers?: Record<string, { type?: string; url?: string }>;
+        settings?: { deniedMcpServers?: Array<{ serverUrl?: string }> };
+      };
+
+    // Adopted, not signed in yet: no mount, but the CLI's own copy is denied.
+    turn("t1");
+    expect(options().settings?.deniedMcpServers).toEqual([{ serverUrl: "https://notes.example.com/mcp" }]);
+    expect(options().mcpServers?.notes).toBeUndefined();
+
+    turn("t2");
+    expect(queryCallCount).toBe(1); // nothing changed: warm
+
+    signedIn = true;
+    turn("t3");
+    expect(queryCallCount).toBe(2); // the sign-in rebuilt it
+    expect(options().mcpServers?.notes).toMatchObject({ type: "sdk" });
+
+    openGate();
+    await provider.teardown();
+  });
+});
+
 describe("ClaudeProvider – systemPromptAppend loop rebuild (#153)", () => {
   let openGate: () => void = () => {};
   beforeEach(() => {

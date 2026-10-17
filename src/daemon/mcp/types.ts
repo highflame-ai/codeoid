@@ -92,10 +92,21 @@ export function isOAuthServer(spec: McpServerSpec): boolean {
 /**
  * Backends that mount registry servers natively (their own MCP client, headers
  * fixed at start). They cannot carry a refreshing OAuth token, so they do not
- * mount OAuth servers; those reach only the daemon-owned client for now
- * (docs/mcp-oauth-design.md §5).
+ * mount OAuth servers natively (docs/mcp-oauth-design.md §5).
  */
 export const NATIVE_MOUNT_BACKENDS: readonly string[] = ["claude", "codex", "gemini-cli", "qwen"];
+
+/**
+ * Native-mount backends that still get OAuth servers, through an in-process
+ * server in front of the daemon-owned client (#390): codeoid holds and
+ * refreshes the token, the backend never sees it.
+ */
+export const OAUTH_BRIDGED_BACKENDS: readonly string[] = ["claude"];
+
+/** Backends an OAuth server does not reach at all yet. */
+export const OAUTH_UNSUPPORTED_BACKENDS: readonly string[] = NATIVE_MOUNT_BACKENDS.filter(
+  (b) => !OAUTH_BRIDGED_BACKENDS.includes(b),
+);
 
 export function isProxied(spec: McpServerSpec): boolean {
   return !spec.native;

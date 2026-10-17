@@ -37,7 +37,9 @@ import {
   type MemoryEngine,
 } from "../../memory/index.js";
 import { BLACKBOARD_MCP_SERVER_NAME } from "../../blackboard/mcp-http.js";
+import type { McpHub } from "../../mcp/hub.js";
 import type { McpRegistry } from "../../mcp/registry.js";
+import { oauthServersForClaude } from "./oauth-bridge.js";
 import { resolveEnvMap } from "../../mcp/types.js";
 import type { CompressionRegistry } from "../../compress/index.js";
 import { FLEET_TOOL_NAMES } from "../../fleet.js";
@@ -151,6 +153,9 @@ export interface ClaudeProviderInit {
   /** Cross-backend MCP registry — external servers are mounted natively on the
    *  SDK (claude owns its own MCP client); approval flows through canUseTool. */
   mcpRegistry?: McpRegistry;
+  /** The daemon-owned MCP client — what an OAuth registry server is called
+   *  through, as the session's tenant (#390). */
+  mcpHub?: McpHub;
   config?: CodeoidConfig;
   compressionRegistry?: CompressionRegistry;
   /** Called once per session with the live model catalog. */
@@ -235,6 +240,10 @@ export class ClaudeProvider implements SessionProvider {
    * SDK fixes `plugins` at query construction, and a pipeline run swaps the pack
    * activation between phases, so a changed set forces a rebuild too. */
   #builtPluginDirs = "";
+  /** The registry OAuth servers (and which are signed in) the LIVE query loop
+   * was built with: adopting one, or signing in to or out of it, changes what
+   * the query must mount and deny, which the SDK fixes at construction (#390). */
+  #builtOAuthMcp = "";
   /** Last TurnOpts — the retry after a skill approval rebuilds the loop with
    * these, then re-pushes #lastPushedContent into the SAME turn queue (#233). */
   #lastTurnOpts: TurnOpts | null = null;
@@ -488,11 +497,15 @@ export class ClaudeProvider implements SessionProvider {
       const error = s.error ?? (s.status === "connected" ? undefined : failure);
       // The backend's account of where the server came from, not its name.
       const connector = s.source === "claudeai" || s.scope === "claudeai" || s.config?.type === "claudeai-proxy";
+      // A remote server the user configured (not a plugin's, not one codeoid
+      // passed in): codeoid could take over its sign-in (#390).
+      const adoptable = !connector && s.source !== "plugin" && s.source !== "sdk" && s.scope !== "dynamic" && s.config?.type === "http";
       return {
         status: s.status,
         tools: (s.tools ?? []).map((t) => `mcp__${mcpToolPrefix(name)}__${t.name}`),
         ...(error ? { error } : {}),
         ...(connector ? { connector: true } : {}),
+        ...(adoptable ? { adoptable: true } : {}),
       };
     } catch (err) {
       return { status: "failed", tools: [], error: failure ?? (err instanceof Error ? err.message : String(err)) };
@@ -631,6 +644,11 @@ export class ClaudeProvider implements SessionProvider {
     const skillAllowRules = this.#resolveSkillGrants(opts);
     const desiredGrants = skillAllowRules.join("\n");
     const desiredPlugins = (opts.pluginDirs ?? []).join("\n");
+    const oauthMcp = oauthServersForClaude(this.#init.mcpRegistry, this.#init.mcpHub, {
+      workspaceId: this.#init.workspaceId,
+      sessionId: this.#init.sessionId,
+      tenant: this.#init.tenant,
+    });
 
     // Exact tool names we hand the SDK as pre-approved. Kept as its own list
     // (rather than inlined into `allowedTools`) because the PreToolUse hook has
@@ -649,7 +667,8 @@ export class ClaudeProvider implements SessionProvider {
       if (
         this.#builtSystemPromptAppend === desiredAppend &&
         this.#builtSkillAllowRules === desiredGrants &&
-        this.#builtPluginDirs === desiredPlugins
+        this.#builtPluginDirs === desiredPlugins &&
+        this.#builtOAuthMcp === oauthMcp.fingerprint
       ) {
         return;
       }
@@ -666,7 +685,9 @@ export class ClaudeProvider implements SessionProvider {
           ? `systemPromptAppend changed (${this.#builtSystemPromptAppend.length}B → ${desiredAppend.length}B)`
           : this.#builtSkillAllowRules !== desiredGrants
             ? "skill-command grants changed"
-            : "session-scoped skill plugins changed";
+            : this.#builtPluginDirs !== desiredPlugins
+              ? "session-scoped skill plugins changed"
+              : "OAuth MCP servers changed";
       console.log(
         `[claude-provider ${this.#init.sessionId.slice(0, 8)}] ${reason} — rebuilding query loop`,
       );
@@ -688,6 +709,7 @@ export class ClaudeProvider implements SessionProvider {
     this.#builtSystemPromptAppend = desiredAppend;
     this.#builtSkillAllowRules = desiredGrants;
     this.#builtPluginDirs = desiredPlugins;
+    this.#builtOAuthMcp = oauthMcp.fingerprint;
     this.#loopGeneration += 1;
     const myGeneration = this.#loopGeneration;
 
@@ -702,7 +724,8 @@ export class ClaudeProvider implements SessionProvider {
     // session stall watchdog so the SDK signals first.
     const mcpToolTimeoutMs = init.config?.session.mcpToolTimeoutMs ?? 120_000;
     const merged: Record<string, McpServerConfig> = {
-      ...withMcpToolTimeout(loadUserMcpServers(opts.workdir), mcpToolTimeoutMs),
+      // A server codeoid now signs in to is codeoid's (mounted below), not the CLI's.
+      ...withMcpToolTimeout(withoutServers(loadUserMcpServers(opts.workdir), oauthMcp.names, oauthMcp.deniedUrls), mcpToolTimeoutMs),
       ...(init.memory
         ? {
             codeoid_memory: buildMemoryMcpServer(init.memory, {
@@ -723,6 +746,10 @@ export class ClaudeProvider implements SessionProvider {
       // Registry servers — mounted natively on the SDK (claude owns its client);
       // tool calls surface as `mcp__<server>__<tool>` and gate via canUseTool.
       ...withMcpToolTimeout(registryServersForClaude(init.mcpRegistry), mcpToolTimeoutMs),
+      // Registry OAuth servers the tenant has signed in to — in-process, in
+      // front of the daemon-owned client, which holds the token (#390). The
+      // hub applies its own per-call timeout.
+      ...oauthMcp.mounts(),
     };
     const mcpServers = Object.keys(merged).length > 0 ? merged : undefined;
 
@@ -819,6 +846,12 @@ export class ClaudeProvider implements SessionProvider {
         // mode this also surfaces the user's own skills, which is the intended
         // behaviour.
         settingSources: ["project", "user"],
+        // The CLI must not connect its own copy of a server codeoid signs in
+        // to (from ~/.claude.json, a .mcp.json): the flag-settings denylist,
+        // by URL, keeps it from dialing it at all (#390).
+        ...(oauthMcp.deniedUrls.length > 0
+          ? { settings: { deniedMcpServers: oauthMcp.deniedUrls.map((serverUrl) => ({ serverUrl })) } }
+          : {}),
         skills: "all",
         // Permission to RUN a skill's command is not permission to READ the
         // files it touches — the two gates are independent and fail in that
@@ -1961,6 +1994,17 @@ export function registryServersForClaude(registry: McpRegistry | undefined): Rec
     }
   }
   return out;
+}
+
+/** User servers minus those codeoid owns now, by name or by URL. */
+export function withoutServers(servers: Record<string, McpServerConfig>, names: readonly string[], urls: readonly string[]): Record<string, McpServerConfig> {
+  if (names.length === 0 && urls.length === 0) return servers;
+  return Object.fromEntries(
+    Object.entries(servers).filter(([name, cfg]) => {
+      const url = (cfg as { url?: unknown }).url;
+      return !names.includes(name) && !(typeof url === "string" && urls.includes(url));
+    }),
+  );
 }
 
 function loadUserMcpServers(workdir: string): Record<string, McpServerConfig> {

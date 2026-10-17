@@ -420,9 +420,27 @@ The drawer lists every server the backend runs, including ones no config file he
 
 When a server comes back, however it came back, the session says so, and the next prompt tells the model too: it was told at start that the server had failed, and would otherwise believe that over trying.
 The note goes to that backend only: the session's own history keeps the prompt as typed, so a fork or a backend switch isn't handed a stale report.
-Redialing can't run a sign-in: a server that needs one says so.
-A claude.ai connector is signed in from claude.ai's connector settings; any other server in Claude's own config, from an interactive Claude Code session (`/mcp` there).
+Redialing can't run a sign-in: a server that needs one says so, and where it can be done (see below).
 This covers Claude sessions, which mount their own servers, codeoid's registry servers included; only codeoid's built-in servers and its OAuth registry servers are dialed by the daemon.
+
+### Signing in to an MCP server from codeoid
+
+A remote MCP server that signs in with OAuth (Slack or GitHub through a gateway, Notion, most SaaS servers) can live in Claude's own config or in codeoid's registry.
+In Claude's config the Claude CLI owns the sign-in, and it can only run it in an interactive terminal: a codeoid session drives Claude without one, so the server just reports that it needs authentication.
+In codeoid's registry (`"oauth": true`) codeoid signs in itself, from any frontend, phone included, and holds and refreshes the token.
+
+**Adopting** moves a server from the first to the second: the same URL, in codeoid's registry, signed in by codeoid.
+
+- **Web:** "Sign in with codeoid" next to the server in the capabilities drawer adopts it and starts the sign-in in one step.
+- **CLI:** `codeoid mcp adopt <server> [--session <s>]`, then `codeoid mcp signin <server>`; `--session` also looks in that session's workdir (a `.mcp.json`, project servers).
+
+A server that needs a sign-in points at adopting it, in its reconnect answer.
+Once adopted, Claude sessions use codeoid's copy from their next turn: it is mounted in-process in front of codeoid's own MCP client, so the token never reaches the agent, and the CLI is told not to connect its own copy (by URL), so the server isn't connected twice.
+codeoid never reads or writes the Claude CLI's credentials.
+Only remote streamable-HTTP servers can be adopted (not SSE ones, not local commands), and their headers are not carried over: an OAuth server is authorized by its token.
+An adopted server is in codeoid's registry for every session, as any registry server is.
+A claude.ai connector is signed in from claude.ai's connector settings instead.
+OAuth servers reach the daemon-run backends and Claude; Codex, the Gemini CLI and Qwen don't get them yet.
 
 ### Driven by other agents (MCP)
 

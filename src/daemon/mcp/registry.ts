@@ -69,6 +69,25 @@ export class McpRegistry {
     );
   }
 
+  /**
+   * Add or replace a user server while the daemon runs — a server adopted from
+   * Claude's config (#390). Everything that holds this registry (sessions,
+   * providers, the hub) reads the new entry from here; a reserved name is
+   * refused, as at start.
+   */
+  upsert(name: string, raw: RawMcpServerConfig): McpServerSpec {
+    if (RESERVED_NAMES.has(name)) throw new Error(`"${name}" is a codeoid built-in server name`);
+    const spec = normalizeSpec(name, raw);
+    this.#specs.set(name, spec);
+    return spec;
+  }
+
+  /** Enabled OAuth servers for `backendId`: what codeoid signs in to and calls
+   *  itself, for a backend that reaches them through codeoid. */
+  oauthFor(backendId: string): McpServerSpec[] {
+    return this.forBackend(backendId).filter((s) => !s.builtin && isOAuthServer(s));
+  }
+
   /** External servers a native-mount backend mounts itself. OAuth servers are
    *  left out: a header baked in at start cannot follow a token that expires
    *  and refreshes, and would put the user's token in the agent's process. */

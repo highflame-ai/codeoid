@@ -36,6 +36,8 @@ export interface McpCredentialSource {
   accessToken(spec: McpServerSpec, tenant: McpTenant): Promise<string | undefined>;
   /** The server rejected `token` (401): the next accessToken() refreshes it. */
   rejected(spec: McpServerSpec, tenant: McpTenant, token: string): void;
+  /** Whether the tenant holds a credential worth trying, without a network call. */
+  signedIn?(spec: McpServerSpec, tenant: McpTenant): boolean;
 }
 
 /** Thrown to the model/UI when a server has no usable credential. */
@@ -233,6 +235,10 @@ export class McpOAuth implements McpCredentialSource {
     if (!tokens) return "disconnected";
     if (tokens.refresh_token) return "connected";
     return this.#expired(spec, tenant, tokens) ? "disconnected" : "connected";
+  }
+
+  signedIn(spec: McpServerSpec, tenant: McpTenant): boolean {
+    return this.status(spec, tenant) === "connected";
   }
 
   /** Forget the tenant's tokens for a server (its client registration stays). */

@@ -147,6 +147,18 @@ export class McpHub {
     return this.#status.get(tenantKey(name, tenant));
   }
 
+  /**
+   * Whether calls to this server can be made as `tenant` now: always for a
+   * server without OAuth; for an OAuth one, only once the tenant has signed in
+   * (a stored credential, no network call). Lets a backend that lists a
+   * server's tools up front leave out one that would only fail.
+   */
+  signedIn(spec: McpServerSpec, tenant: McpTenant | undefined): boolean {
+    if (!isOAuthServer(spec)) return true;
+    if (!tenant || !this.#credentials?.signedIn) return false;
+    return this.#credentials.signedIn(spec, tenant);
+  }
+
   /** Whether a live client is currently held for this server (for `tenant`,
    *  for an OAuth server). */
   hasClient(name: string, tenant?: McpTenant): boolean {

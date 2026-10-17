@@ -88,12 +88,20 @@ Backends mount MCP servers two ways (see `provider-mcp-registry-design.md` §3):
 | Backends | Today | For an OAuth server |
 | --- | --- | --- |
 | openai, gemini, pi | daemon-owned client (`McpHub`) | `HttpMcpClient` asks the credential source for a token per request; one client per (server, tenant) |
-| claude, codex, gemini-cli, qwen | native mount, header baked at start | **not mounted yet** (`McpRegistry.forNativeMount`); planned: a daemon proxy |
+| claude | native mount, header baked at start | an in-process server per OAuth server, in front of `McpHub` as the session's tenant (#390); the CLI's own copy of the URL is denied |
+| codex, gemini-cli, qwen | native mount, header baked at start | **not mounted yet** (`McpRegistry.forNativeMount`); planned: a daemon proxy |
 
 A baked-in token cannot work for native backends: an access token lives about an hour, a warm Claude loop lives for hours, and a token in the backend's config is readable by the agent subprocess.
 
-**Status.** The first release leaves OAuth servers off the native backends rather than bake in a token, and Settings names the backends a server does not reach yet.
-The proxy below is the planned way to close that gap; nothing else in this design depends on it.
+**Status.** OAuth servers are not baked into any native backend's config, and Settings names the backends a server does not reach yet.
+
+**Claude (#390)** takes them in-process: for each OAuth registry server the tenant has signed in to, the provider mounts an SDK server under the server's own name (so tools stay `mcp__<server>__<tool>`) whose `tools/list` and `tools/call` go to `McpHub` with the session's tenant (`providers/claude/oauth-bridge.ts`).
+The token stays in the daemon, refresh and the `401` retry are the hub's, and nothing listens on a port.
+The CLI must not also connect its own copy (from `~/.claude.json` or a `.mcp.json`): a same-name mount alone doesn't stop it (measured: the CLI still dials its copy), so the provider passes every OAuth server's URL in the flag settings' `deniedMcpServers`, and leaves those servers out of the user servers it passes in.
+The set (servers, and which are signed in) is part of the query's rebuild guard, so adopting or signing in takes effect on the next turn.
+A session never redials the CLI's copy of a server codeoid owns.
+
+The proxy below is the planned way to close the gap for the other native backends; nothing else in this design depends on it.
 
 **The proxy (planned)** (`/mcp/proxy/<server>`, loopback) is a transparent streamable-HTTP forwarder.
 Each session's provider mints an opaque proxy token bound to (account, project, session) — the memory endpoint's pattern — and mounts `{url: proxy, Authorization: Bearer <proxy token>}`.
@@ -137,7 +145,8 @@ Nothing in §1–§6 assumes Highflame.
 4. `McpHub` HTTP client uses the engine; tenant flows into the call scope.
 5. Native mounters (claude, codex, gemini-cli, qwen) skip OAuth servers; Settings says so.
 6. Settings: connect / disconnect / paste fallback, status per tenant.
-7. Later: the proxy, so native backends mount OAuth servers too.
+7. Claude: in-process mounts in front of the hub, and adopting a server from Claude's config (`mcp.adopt`, #390).
+8. Later: the proxy, so the other native backends mount OAuth servers too.
 
 ## 9. Testing
 

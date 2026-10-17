@@ -118,6 +118,7 @@ import {
 import { isElicitationTool, isSafeTool, roleDeniesTool } from "./providers/tool-safety.js";
 import type { PackActivation } from "./pipeline/index.js";
 import type { McpRegistry } from "./mcp/registry.js";
+import { isOAuthServer, OAUTH_BRIDGED_BACKENDS } from "./mcp/types.js";
 import type { McpHub } from "./mcp/hub.js";
 import type { Attachment } from "../protocol/types.js";
 import { resolveAttachments } from "./attachments.js";
@@ -1611,6 +1612,12 @@ export class Session {
     if (status !== "failed" && status !== "needs-auth") {
       return refuse("refused", `${JSON.stringify(name)} isn't a server of this session's backend that's down`);
     }
+    // Adopted since it was reported (#390): the backend's next query mounts
+    // codeoid's copy instead, and redialing the CLI's own would only hit its
+    // sign-in again.
+    if (this.#codeoidOwnsMcp(name)) {
+      return refuse("adopted", `codeoid signs in to ${name} now; this session uses codeoid's copy from its next turn`);
+    }
     // One redial per server at a time (an automatic one included), joined
     // once per caller, and not started again within a few seconds.
     const dial = this.#mcpInFlight.get(name);
@@ -1641,7 +1648,7 @@ export class Session {
     const due = [...this.#sdkMcpStatus]
       .filter(([name, status]) => (status === "failed" || status === "needs-auth") && (this.#mcpRetry.get(name)?.at ?? 0) <= now)
       .map(([name]) => name)
-      .filter((name) => !this.#mcpInFlight.has(name));
+      .filter((name) => !this.#mcpInFlight.has(name) && !this.#codeoidOwnsMcp(name));
     if (due.length === 0) return;
     await Promise.allSettled(
       due.map((name) => {
@@ -1701,6 +1708,17 @@ export class Session {
     dial.then(clear, clear);
     this.#mcpInFlight.set(name, dial);
     return dial;
+  }
+
+  /**
+   * Whether codeoid serves this server to the current backend itself — an
+   * OAuth registry server (one adopted from Claude's config, #390) on a backend
+   * that reaches those through codeoid. A status the backend reported for that
+   * name is about the CLI's own copy, which is no longer the one used.
+   */
+  #codeoidOwnsMcp(name: string): boolean {
+    const spec = this.#mcpRegistry?.get(name);
+    return spec !== undefined && isOAuthServer(spec) && OAUTH_BRIDGED_BACKENDS.includes(this.#provider.id);
   }
 
   /** Take the backend's word for a server's state; announce it coming back. */
@@ -7338,12 +7356,17 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
 }
 
 /** What to tell someone whose reconnect didn't connect — sign-in needs say where it can be done. */
-function mcpErrorFor(name: string, state: { status: string; error?: string; connector?: boolean }): string {
+function mcpErrorFor(name: string, state: { status: string; error?: string; connector?: boolean; adoptable?: boolean }): string {
   if (state.status === "needs-auth") {
     // claude.ai connectors are signed in on claude.ai, not by the CLI. The
     // backend says which servers are; a name alone could claim to be one.
     if (state.connector) {
       return `${name} needs a sign-in: connect it in your claude.ai connector settings, then reconnect it here.`;
+    }
+    // A server codeoid can take over: say so first — it works from here, on
+    // any device, and serves every backend that reaches OAuth servers (#390).
+    if (state.adoptable) {
+      return `${name} needs a sign-in. Have codeoid sign in to it: "Sign in with codeoid" in the capabilities drawer, or \`codeoid mcp adopt ${name}\` then \`codeoid mcp signin ${name}\`. Or sign in with /mcp in an interactive Claude Code session, then reconnect it here.`;
     }
     return `${name} needs a sign-in, which only an interactive Claude Code session can run: sign in with /mcp there, then reconnect it here.`;
   }

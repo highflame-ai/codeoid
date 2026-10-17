@@ -416,7 +416,7 @@ describe("mcp.oauth.* through the session manager", () => {
     };
     expect(statusOf(before.snapshot, "notes")?.oauth).toEqual({
       status: "disconnected",
-      unsupportedBackends: ["claude", "codex", "gemini-cli", "qwen"],
+      unsupportedBackends: ["codex", "gemini-cli", "qwen"], // claude reaches it through codeoid (#390)
     });
     expect(statusOf(before.snapshot, "plain")?.oauth).toBeUndefined();
 

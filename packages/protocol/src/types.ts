@@ -54,6 +54,8 @@ import type {
   RoutineUpdateMsg,
 } from "./routines.js";
 import type {
+  McpAdoptMsg,
+  McpAdoptResultMsg,
   McpOAuthBeginMsg,
   McpOAuthCompleteMsg,
   McpOAuthDisconnectMsg,
@@ -1082,6 +1084,7 @@ export type ClientMessage =
   | McpOAuthBeginMsg
   | McpOAuthCompleteMsg
   | McpOAuthDisconnectMsg
+  | McpAdoptMsg
   | UsageDailyMsg
   | PipelineCreateMsg
   | PipelineListMsg
@@ -1922,6 +1925,14 @@ export interface ClaudeConfigMcpServer {
    * `path`, `command` and `url` are empty for it.
    */
   liveOnly?: true;
+  /**
+   * codeoid can adopt this server (#390): a remote HTTP one in Claude's
+   * config, which codeoid would then sign in to (`mcp.adopt`).
+   */
+  adoptable?: true;
+  /** codeoid has adopted it: its registry signs in to this URL, and Claude
+   *  sessions use that copy rather than the CLI's. */
+  adopted?: true;
 }
 
 export interface ClaudeConfigHook {
@@ -2700,6 +2711,7 @@ export type DaemonMessage =
   | McpOAuthBeginResultMsg
   | McpOAuthCompleteResultMsg
   | McpOAuthDisconnectResultMsg
+  | McpAdoptResultMsg
   | PipelineSnapshotMsg
   | PipelineListResultMsg
   | PackListResultMsg

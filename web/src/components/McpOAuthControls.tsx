@@ -148,8 +148,7 @@ export const McpOAuthControls: Component<{ server: McpServerStatus }> = (props) 
 
       <Show when={oauth().unsupportedBackends.length > 0}>
         <p class="mt-1.5 text-[11px] text-fg-faint">
-          Available on the daemon-run backends only for now — not mounted on{" "}
-          {oauth().unsupportedBackends.join(", ")}.
+          Not reachable from {oauth().unsupportedBackends.join(", ")} yet; every other backend gets it.
         </p>
       </Show>
     </div>
