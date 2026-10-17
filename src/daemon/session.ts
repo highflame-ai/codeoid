@@ -56,6 +56,7 @@ import type {
   ProviderCommand,
   ToolState,
   SessionWorktree,
+  McpReconnectResult,
 } from "../protocol/types.js";
 import { dirname, join } from "node:path";
 import { createHash } from "node:crypto";
@@ -1067,6 +1068,10 @@ export class Session {
   // ~/.claude.json). Empty until the first turn starts.
   #sdkMcpStatus = new Map<string, string>();
   #sdkMcpTools = new Map<string, string[]>();
+  /** When each down backend MCP server may next be redialed automatically, and the wait after that (#389). */
+  readonly #mcpRetry = new Map<string, { at: number; waitMs: number }>();
+  /** Backend MCP servers that came back since the last turn started — the next prompt says so. */
+  readonly #mcpBack = new Set<string>();
 
   constructor(opts: SessionCreateOptions) {
     this.id = opts.existingId ?? randomUUID();
@@ -1540,6 +1545,79 @@ export class Session {
   get sdkMcpSnapshot(): { status: Map<string, string>; tools: Map<string, string[]> } {
     return { status: this.#sdkMcpStatus, tools: this.#sdkMcpTools };
   }
+  /**
+   * Redial one of the backend's MCP servers now (#389): `session.mcp_reconnect`.
+   * The result is the backend's view afterwards; the session's MCP status and
+   * the drawer follow it.
+   */
+  async reconnectMcpServer(name: string, sender: AuthContext): Promise<McpReconnectResult | { unsupported: string }> {
+    const provider = this.#provider;
+    if (!provider.reconnectMcpServer) return { unsupported: `the ${provider.id} backend can't reconnect its MCP servers` };
+    const state = await provider.reconnectMcpServer(name);
+    this.#store.audit(sender.sub, "session.mcp_reconnect", this.id, `server=${name} status=${state?.status ?? "deferred"}`);
+    if (!state) {
+      return { server: name, status: this.#sdkMcpStatus.get(name) ?? "pending", tools: this.#sdkMcpTools.get(name) ?? [], deferred: true };
+    }
+    this.#applyMcpState(name, state);
+    return { server: name, status: state.status, tools: state.tools, ...(state.error ? { error: mcpErrorFor(name, state) } : {}) };
+  }
+
+  /**
+   * Before a turn, redial backend MCP servers that are down (failed, or
+   * waiting on a sign-in that may have happened elsewhere since). Each server
+   * is retried with a doubling wait (30s → 15m), so a server that stays down
+   * costs one bounded attempt now and then, not one per turn.
+   */
+  async #healMcpServers(): Promise<void> {
+    const provider = this.#provider;
+    if (!provider.reconnectMcpServer || !provider.hasQueried) return;
+    const now = Date.now();
+    const due = [...this.#sdkMcpStatus].filter(
+      ([name, status]) => (status === "failed" || status === "needs-auth") && (this.#mcpRetry.get(name)?.at ?? 0) <= now,
+    );
+    for (const [name] of due) {
+      const prev = this.#mcpRetry.get(name);
+      const waitMs = Math.min((prev?.waitMs ?? MCP_RETRY_FIRST_MS / 2) * 2, MCP_RETRY_MAX_MS);
+      this.#mcpRetry.set(name, { at: now + waitMs, waitMs });
+      let state: Awaited<ReturnType<NonNullable<SessionProvider["reconnectMcpServer"]>>>;
+      try {
+        state = await withTimeout(provider.reconnectMcpServer(name), MCP_RECONNECT_TIMEOUT_MS);
+      } catch {
+        continue; // timed out: the next attempt waits longer
+      }
+      if (state) this.#applyMcpState(name, state);
+    }
+  }
+
+  /** Take the backend's word for a server's state; announce it coming back. */
+  #applyMcpState(name: string, state: { status: string; tools: string[] }): void {
+    const before = this.#sdkMcpStatus.get(name);
+    this.#sdkMcpStatus.set(name, state.status);
+    this.#sdkMcpTools.set(name, state.tools);
+    if (state.status !== "connected") return;
+    this.#mcpRetry.delete(name);
+    if (before === "connected") return;
+    this.#mcpBack.add(name);
+    const msg = this.#makeMessage(
+      "info",
+      `MCP server ${name} reconnected (${state.tools.length} tool${state.tools.length === 1 ? "" : "s"}).`,
+      SYSTEM_IDENTITY,
+      undefined,
+      undefined,
+      { event: "mcp.reconnected", server: name, tools: state.tools.length },
+    );
+    this.#persistAndBuffer(msg);
+    this.#broadcastRaw(msg);
+  }
+
+  /** A one-line note for the next prompt naming servers that came back, once. */
+  #takeMcpBackNote(): string {
+    if (this.#mcpBack.size === 0) return "";
+    const names = [...this.#mcpBack].join(", ");
+    this.#mcpBack.clear();
+    return `<system-reminder>These MCP servers reconnected since this session started and their tools are available now: ${names}. Any earlier report that they failed is out of date.</system-reminder>\n\n`;
+  }
+
   get agentUri(): string | undefined { return this.#agentIdentity.sub; }
   get mode(): SessionMode { return this.#mode; }
   get turnsRemaining(): number | undefined { return this.#turnsRemaining; }
@@ -2444,6 +2522,9 @@ export class Session {
     // Snapshot the files this turn starts from, at the last moment before the
     // agent can touch them — what "go back to before this message" restores.
     // Bounded wait; a snapshot still running when the turn starts is `late`.
+    // First, redial any backend MCP server that's down, so this turn can use
+    // a server fixed since it failed (#389) — bounded, and backed off.
+    await this.#healMcpServers();
     await this.#checkpointTurn(turnId);
     this.#throwIfStoppedBeforeStart(stopGen);
     // The backend may have started a turn on its own while this send awaited
@@ -2468,18 +2549,22 @@ export class Session {
     this.#currentTurnId = turnId;
     this.#indexTurn(turnId, "prompt", text, turnAt);
     this.#markBackingFresh(false);
+    // Servers that came back since the last turn: say so in this prompt. The
+    // backend told the model they had failed when it started, and the model
+    // believes that over trying a tool it was told is gone (#389).
+    const turnPrompt = `${this.#takeMcpBackNote()}${effectivePrompt}`;
     // This turn carries the pending history seed — remember what it asked, so
     // an overflow can be retried with a smaller seed without a re-send.
     if (this.#pendingSeed && this.#pendingSeed.prompt === undefined) {
-      this.#pendingSeed.prompt = effectivePrompt;
+      this.#pendingSeed.prompt = turnPrompt;
       this.#pendingSeed.sender = sender;
       this.#pendingSeed.turn = { id: turnId, text, at: turnAt };
     }
-    this.#accumulator.pushUserTurn(effectivePrompt, turnId, { prompt: text, at: turnAt });
+    this.#accumulator.pushUserTurn(turnPrompt, turnId, { prompt: text, at: turnAt });
     const run = this.#provider.runTurn({
       ...(this.#maxBudgetUsd !== undefined ? { maxBudgetUsd: this.#maxBudgetUsd } : {}),
       history: this.#accumulator.history,
-      userMessage: effectivePrompt,
+      userMessage: turnPrompt,
       model: this.#model ?? undefined,
       fallbackModel: this.#fallbackModel ?? undefined,
       workdir: this.workdir,
@@ -6809,4 +6894,28 @@ function sanitizeApprovalPatch(
   // Every other tool: no client-side patch is meaningful at approval
   // time. The user reviewed the original input; that's what runs.
   return undefined;
+}
+
+/** First automatic redial wait for a down MCP server; doubles per miss, up to the max (#389). */
+const MCP_RETRY_FIRST_MS = 30_000;
+const MCP_RETRY_MAX_MS = 15 * 60_000;
+/** How long a turn waits on one automatic redial before starting without it. */
+const MCP_RECONNECT_TIMEOUT_MS = 8_000;
+
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    p.finally(() => clearTimeout(timer)),
+    new Promise<T>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
+    }),
+  ]);
+}
+
+/** What to tell someone whose reconnect didn't connect — sign-in needs say where it can be done. */
+function mcpErrorFor(name: string, state: { status: string; error?: string }): string {
+  if (state.status === "needs-auth") {
+    return `${name} needs a sign-in, which only an interactive Claude Code session can run: sign in with /mcp there, then reconnect it here.`;
+  }
+  return state.error ?? `${name} is ${state.status}`;
 }

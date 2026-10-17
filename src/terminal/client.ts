@@ -11,6 +11,7 @@ import { PIPELINE_INPUT_REQUEST_PREFIX, PROTOCOL_VERSION } from "../protocol/typ
 import type {
   ClientMessage,
   CollaborationConfig,
+  McpReconnectResult,
   CompareState,
   CompareTargetSpec,
   DaemonMessage,
@@ -757,6 +758,24 @@ export class TerminalClient {
    * prompt, and (unless `wait` is false) wait for all of them, then print them
    * side by side, numbered for `compare keep`.
    */
+  /** `codeoid mcp reconnect` — redial one of the session backend's MCP servers (#389). */
+  async mcpReconnect(sessionIdOrName: string, server: string): Promise<void> {
+    const sessionId = await this.#resolveSession(sessionIdOrName);
+    if (!sessionId) return;
+    const resp = await this.#request({ type: "session.mcp_reconnect", id: randomUUID(), sessionId, server });
+    if (resp.type !== "response.ok") {
+      this.#printError(resp);
+      return;
+    }
+    const r = resp.data as McpReconnectResult;
+    if (r.status === "connected") console.log(`${server}: connected (${r.tools.length} tool${r.tools.length === 1 ? "" : "s"}).`);
+    else if (r.deferred) console.log(`${server}: the backend isn't running; it connects its servers when the next turn starts.`);
+    else {
+      console.log(`${server}: ${r.status}${r.error ? ` — ${r.error}` : ""}`);
+      process.exitCode = 1;
+    }
+  }
+
   async compareRun(
     sessionIdOrName: string,
     targets: CompareTargetSpec[],

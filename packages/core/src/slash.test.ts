@@ -207,6 +207,9 @@ describe("dispatchSlash", () => {
     expect(parseSlash("/skills")).toEqual({ kind: "capabilities", tab: "skills" });
     expect(parseSlash("/skill")).toEqual({ kind: "capabilities", tab: "skills" });
     expect(parseSlash("/mcp")).toEqual({ kind: "capabilities", tab: "mcp" });
+    // #389: redial one of the backend's servers; without a name it's just the list.
+    expect(parseSlash("/mcp reconnect slack")).toEqual({ kind: "mcp-reconnect", server: "slack" });
+    expect(parseSlash("/mcp reconnect")).toEqual({ kind: "capabilities", tab: "mcp" });
     expect(parseSlash("/hooks")).toEqual({ kind: "capabilities", tab: "hooks" });
     expect(parseSlash("/hook")).toEqual({ kind: "capabilities", tab: "hooks" });
   });

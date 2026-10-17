@@ -1147,6 +1147,8 @@ mcpHub: this.#mcpHub,
         return this.#setModel(msg, auth);
       case "session.set_provider":
         return this.#setProvider(msg, auth);
+      case "session.mcp_reconnect":
+        return this.#mcpReconnect(msg, auth);
       case "session.fork":
         return this.#fork(msg, auth);
       case "session.rename":
@@ -6811,6 +6813,29 @@ mcpHub: this.#mcpHub,
       requestId: msg.id,
       data: { providerId: result.providerId },
     };
+  }
+
+  /**
+   * Redial one of the session backend's MCP servers (#389). It changes no
+   * configuration — the server, its config and its credentials are the
+   * backend's — so it needs what acting in the session needs: session:send.
+   */
+  async #mcpReconnect(
+    msg: Extract<ClientMessage, { type: "session.mcp_reconnect" }>,
+    auth: AuthContext,
+  ): Promise<DaemonMessage> {
+    if (!hasScope(auth.scopes as string[], SCOPES.SESSION_SEND)) {
+      return { type: "response.error", requestId: msg.id, error: "Missing scope: session:send", code: "forbidden" };
+    }
+    const session = this.#getOwnedSession(msg.sessionId, auth);
+    if (!session) {
+      return { type: "response.error", requestId: msg.id, error: "Session not found", code: "not_found" };
+    }
+    const result = await session.reconnectMcpServer(msg.server, auth);
+    if ("unsupported" in result) {
+      return { type: "response.error", requestId: msg.id, error: result.unsupported, code: "invalid_request" };
+    }
+    return { type: "response.ok", requestId: msg.id, data: result };
   }
 
   #rename(

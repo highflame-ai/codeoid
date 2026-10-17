@@ -1041,6 +1041,7 @@ export type ClientMessage =
   | SessionSearchMsg
   | SessionSetModelMsg
   | SessionSetProviderMsg
+  | SessionMcpReconnectMsg
   | SessionForkMsg
   | ScrollbackPageMsg
   | SessionRenameMsg
@@ -1601,6 +1602,32 @@ export interface SessionSetProviderMsg extends BaseClientMsg {
   sessionId: string;
   /** One of the ids from `AuthOkMsg.providers`. */
   providerId: string;
+}
+
+/**
+ * Redial one of the MCP servers the session's BACKEND mounts (#389) — e.g. a
+ * server that failed when the session started and has since been fixed.
+ * `response.ok` data is {@link McpReconnectResult}. Rejected when the backend
+ * can't reconnect servers. Requires `session:send`.
+ */
+export interface SessionMcpReconnectMsg extends BaseClientMsg {
+  type: "session.mcp_reconnect";
+  sessionId: string;
+  /** The server's name as the backend reports it (the capabilities drawer's MCP list). */
+  server: string;
+}
+
+/** `response.ok` data for `session.mcp_reconnect`. */
+export interface McpReconnectResult {
+  server: string;
+  /** The backend's view after the attempt: connected, failed, needs-auth, pending, disabled. */
+  status: string;
+  /** Tools the server now offers (full `mcp__<server>__<tool>` names). */
+  tools: string[];
+  /** Why it isn't connected, when it isn't. */
+  error?: string;
+  /** The backend isn't running between turns: it connects its servers when the next turn starts. */
+  deferred?: boolean;
 }
 
 /**

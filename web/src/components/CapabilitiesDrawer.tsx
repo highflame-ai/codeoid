@@ -18,7 +18,7 @@ import {
   onMount,
 } from "solid-js";
 
-import { claudeConfig, fetchClaudeConfig } from "../state/claude-config";
+import { claudeConfig, fetchClaudeConfig, reconnectMcpServer } from "../state/claude-config";
 import { focusedSessionId } from "../state/sessions";
 import { relativeTime } from "../lib/format";
 import type {
@@ -126,7 +126,7 @@ const CapabilitiesDrawer: Component = () => {
                 <SkillsList items={claudeConfig().skills} />
               </Match>
               <Match when={activeTab() === "mcp"}>
-                <McpList items={claudeConfig().mcpServers} />
+                <McpList items={claudeConfig().mcpServers} sessionId={focusedSessionId()} />
               </Match>
               <Match when={activeTab() === "hooks"}>
                 <HooksList items={claudeConfig().hooks} />
@@ -285,7 +285,40 @@ const SkillsList: Component<{ items: ClaudeConfigSkill[] }> = (props) => (
   </Show>
 );
 
-const McpList: Component<{ items: ClaudeConfigMcpServer[] }> = (props) => (
+/** Redial a server the backend reports as down (#389); the outcome shows inline. */
+const McpReconnect: Component<{ sessionId: string; server: string }> = (props) => {
+  const [busy, setBusy] = createSignal(false);
+  const [note, setNote] = createSignal<string | null>(null);
+  const run = async () => {
+    setBusy(true);
+    setNote(null);
+    try {
+      const r = await reconnectMcpServer(props.sessionId, props.server);
+      if (r.status !== "connected") setNote(r.deferred ? "Connects when the next turn starts." : (r.error ?? `Still ${r.status}.`));
+    } catch (err) {
+      setNote(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <>
+      <button
+        type="button"
+        class="ml-auto rounded border border-border px-2 py-0.5 text-[11px] text-fg-muted hover:text-fg disabled:opacity-50"
+        disabled={busy()}
+        onClick={() => void run()}
+      >
+        {busy() ? "Reconnecting…" : "Reconnect"}
+      </button>
+      <Show when={note()}>
+        <div class="mt-1 basis-full text-[11px] text-fg-muted">{note()}</div>
+      </Show>
+    </>
+  );
+};
+
+const McpList: Component<{ items: ClaudeConfigMcpServer[]; sessionId: string | null }> = (props) => (
   <Show
     when={props.items.length > 0}
     fallback={
@@ -296,7 +329,7 @@ const McpList: Component<{ items: ClaudeConfigMcpServer[] }> = (props) => (
       <For each={props.items}>
         {(m) => (
           <li class="rounded border border-border bg-bg/40 p-3">
-            <div class="flex items-center gap-2">
+            <div class="flex flex-wrap items-center gap-2">
               <span class="font-mono text-[13px] font-semibold text-fg">
                 {m.name}
               </span>
@@ -307,6 +340,9 @@ const McpList: Component<{ items: ClaudeConfigMcpServer[] }> = (props) => (
                 </span>
               </Show>
               <McpStatusBadge status={m.liveStatus} toolCount={m.liveTools?.length} />
+              <Show when={props.sessionId && m.liveStatus !== undefined && m.liveStatus !== "connected" && m.liveStatus !== "disabled"}>
+                <McpReconnect sessionId={props.sessionId!} server={m.name} />
+              </Show>
             </div>
             <Show when={m.command}>
               <div class="mt-1 break-all font-mono text-[11px] text-fg-muted">

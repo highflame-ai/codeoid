@@ -386,6 +386,18 @@ Every run is a normal session you can open, approve, continue or fork from any f
 Each routine can carry its own revocable API token for monitors and deploy scripts, and the `routine_end` hook carries each outcome to Slack or a pager.
 Full guide: [routines.md](routines.md).
 
+### When an MCP server is down
+
+A backend connects its MCP servers when its session starts.
+A server that fails then (a credential that had expired, a server that wasn't up yet) used to stay unusable for the whole session; now it is redialed:
+
+- **On demand:** the Reconnect button next to a down server in the capabilities drawer, `/mcp reconnect <server>` in the web UI or TUI, or `codeoid mcp reconnect <session> <server>`.
+- **By itself:** before each turn, a server the backend reports as failed or needing sign-in is retried, waiting longer after each miss (30 seconds up to 15 minutes), so fixing a credential is enough.
+
+When a server comes back, the session says so, and the next prompt tells the model too: it was told at start that the server had failed, and would otherwise believe that over trying.
+Redialing can't run a sign-in: a server that needs one says so, and for a server in Claude's own config that sign-in happens in an interactive Claude Code session (`/mcp` there).
+This covers Claude sessions, whose backend mounts its own servers; servers in codeoid's MCP registry are dialed by the daemon.
+
 ### Driven by other agents (MCP)
 
 Claude Code, Cursor, or a CI job can drive codeoid over MCP at `/mcp/control`: list sessions, read their transcripts and usage, and (when allowed) create and prompt them, then wait for the reply.

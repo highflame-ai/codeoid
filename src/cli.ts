@@ -801,7 +801,7 @@ program
 
 const mcp = program
   .command("mcp")
-  .description("Let external agents (Claude Code, Cursor, CI) drive codeoid over MCP (docs/mcp-control.md)");
+  .description("MCP: let external agents drive codeoid over MCP (docs/mcp-control.md), and manage a session's MCP servers");
 
 mcp
   .command("headers")
@@ -849,6 +849,11 @@ mcp
       "\nThe daemon must have the endpoint on: set mcpControl.enabled (and mcpControl.allowActions to let the client create/send) in ~/.codeoid/config.json, then restart.",
     );
   });
+
+mcp
+  .command("reconnect <session> <server>")
+  .description("Redial one of a session's MCP servers — e.g. one that failed when the session started and has since been fixed")
+  .action((session: string, server: string) => withClient((c) => c.mcpReconnect(session, server)));
 
 // ── Packs (dynamic pack loading — docs/pack-loading.md) ─────────────────────
 

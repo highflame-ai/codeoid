@@ -13,6 +13,7 @@ import type {
   ClaudeConfigMcpServer,
   ClaudeConfigResultMsg,
   ClaudeConfigSkill,
+  McpReconnectResult,
 } from "../protocol/types";
 
 interface State {
@@ -94,4 +95,14 @@ export async function fetchClaudeConfig(sessionId: string): Promise<void> {
 export function resetClaudeConfig(): void {
   inflightForSession = null;
   setState(EMPTY);
+}
+
+/**
+ * Redial one of the session backend's MCP servers (#389), then refresh the
+ * snapshot so the drawer shows the backend's new answer.
+ */
+export async function reconnectMcpServer(sessionId: string, server: string): Promise<McpReconnectResult> {
+  const ok = await getClient().request({ type: "session.mcp_reconnect", id: newRequestId(), sessionId, server }, { timeoutMs: 30_000 });
+  await fetchClaudeConfig(sessionId);
+  return ok.data as McpReconnectResult;
 }

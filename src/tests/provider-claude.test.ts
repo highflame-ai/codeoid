@@ -34,6 +34,10 @@ let sdkGate: Promise<void> | null = null;
 /** When true, the mock query's interrupt() rejects — forcing the provider's
  *  hard-abort fallback. */
 let sdkInterruptThrows = false;
+/** MCP server states the mock query reports, and the reconnect calls it saw (#389). */
+let mcpStatuses: Array<Record<string, unknown>> = [];
+let mcpReconnects: string[] = [];
+let mcpReconnectError: Error | null = null;
 
 function makeMockQuery() {
   const err = sdkThrowError;
@@ -55,6 +59,11 @@ function makeMockQuery() {
       if (sdkInterruptThrows) throw new Error("interrupt unsupported");
     },
     supportedModels: async () => [{ value: "claude-opus-4", displayName: "Claude Opus 4" }],
+    reconnectMcpServer: async (name: string) => {
+      mcpReconnects.push(name);
+      if (mcpReconnectError) throw mcpReconnectError;
+    },
+    mcpServerStatus: async () => mcpStatuses,
   };
 }
 
@@ -709,6 +718,57 @@ describe("decodeStderrEntities", () => {
  * (anthropics/claude-code#80223) — this recovers whatever produced the zero
  * turn, because it keys on `num_turns` rather than on any cause.
  */
+describe("ClaudeProvider – reconnecting an MCP server (#389)", () => {
+  beforeEach(() => {
+    sdkMessages = [];
+    sdkThrowError = null;
+    sdkGate = null;
+    mcpStatuses = [];
+    mcpReconnects = [];
+    mcpReconnectError = null;
+  });
+
+  /** Start a turn and hold the loop open, so the provider has a live query. */
+  async function live(provider: ClaudeProvider): Promise<() => Promise<void>> {
+    let release!: () => void;
+    sdkGate = new Promise<void>((r) => {
+      release = r;
+    });
+    const events = collectTurnEvents(provider);
+    for (let i = 0; i < 50 && queryCallCount === 0; i++) await Bun.sleep(5);
+    await Bun.sleep(10);
+    return async () => {
+      release();
+      await events;
+    };
+  }
+
+  it("with no live query there is nothing to redial: the next turn dials its servers", async () => {
+    expect(await makeProvider().reconnectMcpServer("slack")).toBeNull();
+  });
+
+  it("redials through the live query and reports the server's new state, tools as full names", async () => {
+    const p = makeProvider();
+    const done = await live(p);
+    mcpStatuses = [{ name: "slack", status: "connected", tools: [{ name: "send_message" }, { name: "search" }] }];
+    expect(await p.reconnectMcpServer("slack")).toEqual({ status: "connected", tools: ["mcp__slack__send_message", "mcp__slack__search"] });
+    expect(mcpReconnects).toEqual(["slack"]);
+    await done();
+  });
+
+  it("a failed redial is a result, not a throw — with the backend's reason", async () => {
+    const p = makeProvider();
+    const done = await live(p);
+    mcpReconnectError = new Error("SyntaxError dialing https://gateway/mcp/x/slack");
+    mcpStatuses = [{ name: "slack", status: "failed" }];
+    expect(await p.reconnectMcpServer("slack")).toEqual({ status: "failed", tools: [], error: "SyntaxError dialing https://gateway/mcp/x/slack" });
+    mcpReconnectError = null;
+    mcpStatuses = [];
+    expect((await p.reconnectMcpServer("nope"))?.error).toContain('no MCP server named "nope"');
+    await done();
+  });
+});
+
 describe("ClaudeProvider – unexplained zero-turn re-send", () => {
   beforeEach(() => { sdkMessages = []; sdkThrowError = null; capturedQueryOpts = null; sdkGate = null; });
 

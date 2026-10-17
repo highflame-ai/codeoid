@@ -202,6 +202,14 @@ export interface NormalizedTurnResult {
   errorMessage?: string;
 }
 
+/** One backend-mounted MCP server's state, as the backend reports it. */
+export interface BackendMcpServerState {
+  status: string;
+  /** Full tool names (`mcp__<server>__<tool>`), matching the `mcp_init` event. */
+  tools: string[];
+  error?: string;
+}
+
 // ── Provider event stream ─────────────────────────────────────────────────────
 
 /** Normalized event emitted by any provider. Session maps these to SessionMessages.
@@ -506,6 +514,14 @@ export interface AgentProvider {
    * full history natively every turn).
    */
   seedText?(block: string): void;
+  /**
+   * Redial one of the MCP servers the backend itself mounts (#389) and report
+   * its state afterwards. Resolves null when the backend has no live
+   * connection to ask (between sessions of its process) — it dials its
+   * servers when the next turn starts anyway. Never throws for a failed
+   * reconnect: that's a result with `status` and `error`.
+   */
+  reconnectMcpServer?(name: string): Promise<BackendMcpServerState | null>;
   /**
    * True when codeoid's memory recall tools (recall/recall_file/timeline/
    * get_episode) are mounted for this provider+session, so the model can page

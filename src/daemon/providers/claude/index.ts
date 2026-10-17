@@ -42,7 +42,7 @@ import { FLEET_TOOL_NAMES } from "../../fleet.js";
 import { rewriteBashToolInput } from "../../compress/index.js";
 import type { CodeoidConfig } from "../../../config.js";
 import type { AuthContext } from "../../../protocol/types.js";
-import type { SessionProvider, ModelInfo, NormalizedTurnResult, ProviderEvent, SessionScopedEvent, TurnOpts, TurnRun, CatalogEntry, UiResponse } from "../interface.js";
+import type { BackendMcpServerState, SessionProvider, ModelInfo, NormalizedTurnResult, ProviderEvent, SessionScopedEvent, TurnOpts, TurnRun, CatalogEntry, UiResponse } from "../interface.js";
 import { BUDGET_STOP_MESSAGE, isBackgroundLifecycleEvent } from "../interface.js";
 import { isUngrantableSkillCommand, redactCommand } from "../../skill-command.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
@@ -438,6 +438,34 @@ export class ClaudeProvider implements SessionProvider {
    */
   seedText(block: string): void {
     this.#pendingHistorySeed = block.length > 0 ? block : null;
+  }
+
+  /**
+   * Redial an MCP server through the live query (#389). The CLI connects its
+   * servers once, when the query starts; one that failed then stays failed
+   * until this is called (or the loop is rebuilt).
+   */
+  async reconnectMcpServer(name: string): Promise<BackendMcpServerState | null> {
+    const q = this.#query;
+    if (!q) return null;
+    let failure: string | undefined;
+    try {
+      await q.reconnectMcpServer(name);
+    } catch (err) {
+      failure = err instanceof Error ? err.message : String(err);
+    }
+    try {
+      const s = (await q.mcpServerStatus()).find((x) => x.name === name);
+      if (!s) return { status: "failed", tools: [], error: failure ?? `this session has no MCP server named "${name}"` };
+      const error = s.error ?? (s.status === "connected" ? undefined : failure);
+      return {
+        status: s.status,
+        tools: (s.tools ?? []).map((t) => `mcp__${name}__${t.name}`),
+        ...(error ? { error } : {}),
+      };
+    } catch (err) {
+      return { status: "failed", tools: [], error: failure ?? (err instanceof Error ? err.message : String(err)) };
+    }
   }
 
   /**

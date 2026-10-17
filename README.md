@@ -442,6 +442,7 @@ codeoid compare run <session> --with claude,codex <prompt...>  # Same prompt on 
 codeoid compare show|ls|keep …                       #   results; keep one [--discard-others]
 codeoid routine add <name> --prompt … [--cron|--every|--at] [--check <cmd>]  # scheduled / triggered agent runs
 codeoid routine ls | show | runs | run [--wait] | edit | pause | resume | rm | cancel <runId> | token | preview
+codeoid mcp reconnect <session> <server>             # redial a session's MCP server that's down
 ```
 
 ## Development

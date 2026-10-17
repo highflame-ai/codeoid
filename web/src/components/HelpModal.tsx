@@ -42,6 +42,7 @@ const COMMANDS: readonly CommandDoc[] = [
   { usage: "/agents", desc: "Show subagents available to this session" },
   { usage: "/skills", desc: "Show skills available to this session" },
   { usage: "/mcp", desc: "Show MCP servers + their commands" },
+  { usage: "/mcp reconnect <server>", desc: "Redial an MCP server that's down (e.g. fixed since the session started)" },
   { usage: "/hooks", desc: "Show configured hooks" },
   { usage: "/who", desc: "Show the connected ZeroID identity" },
   { usage: "/settings", desc: "Open the settings drawer" },
