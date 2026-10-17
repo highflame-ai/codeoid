@@ -34,8 +34,11 @@
  *   - `item/tool/requestUserInput` → requestUserInput (session.ui_request)
  *   - text/reasoning deltas stream; command/fileChange/mcp items surface
  *     as tool records; usage from turn/completed
- *   - seedFromHistory prepends renderHistorySeed to the first prompt (the
- *     warm-backend ceiling; codex threads only resume codex's own state)
+ *   - continueNatively (#387): the thread is created by `thread/fork` at a
+ *     recorded turn (same backend) or `thread/start` + `thread/inject_items`
+ *     (native history from another backend); thread ids are persisted
+ *   - seedFromHistory prepends renderHistorySeed to the first prompt — the
+ *     fallback when the native path is off or fails
  *
  * Non-gated items (codex ran something its policy considers trusted, e.g.
  * read-only commands) are recorded retrospectively at item/completed as a
@@ -49,6 +52,8 @@ import { AsyncQueue } from "../../async-queue.js";
 import type { Store } from "../../store.js";
 import type {
   ModelInfo,
+  NativeContinuationRequest,
+  NativeContinuationResult,
   NormalizedTurnResult,
   ProviderEvent,
   SessionProvider,
@@ -59,6 +64,7 @@ import type {
   CatalogEntry,
 } from "../interface.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
+import { type ResponsesItem, toResponsesItems } from "./native-history.js";
 import { buildCodexEnv } from "../env.js";
 import { CodexRpcProcess } from "./rpc.js";
 import type { SessionMode } from "../../../protocol/types.js";
@@ -184,6 +190,17 @@ function codexPolicies(mode?: SessionMode): { approvalPolicy: string; sandboxMod
  * SandboxPolicyDeserialize` at turn/start. Shapes verified live against
  * @openai/codex@0.144.1 `generate-ts` + a real turn.
  */
+/** What a new thread (started or forked) is created with: cwd, policies, the turn's instructions. */
+function threadConfig(opts: TurnOpts): Record<string, unknown> {
+  const { approvalPolicy, sandboxMode } = codexPolicies(opts.mode);
+  return {
+    cwd: opts.workdir,
+    approvalPolicy,
+    sandboxPolicy: sandboxPolicyWire(sandboxMode, opts.workdir),
+    ...(opts.systemPromptAppend ? { developerInstructions: opts.systemPromptAppend } : {}),
+  };
+}
+
 function sandboxPolicyWire(mode: SandboxMode, workdir: string): Record<string, unknown> {
   switch (mode) {
     case "read-only":
@@ -264,6 +281,14 @@ export class CodexProvider implements SessionProvider {
   #hasQueried = false;
   #modelsReported = false;
   #pendingHistorySeed: string | null = null;
+  readonly #store: Store;
+  /**
+   * A native continuation to apply when the thread is first created (#387):
+   * fork the backend's own thread at a turn, or start one and inject history.
+   * Deferred to the first turn because the thread takes that turn's
+   * instructions. `fallback` is the transcript seed used if it fails.
+   */
+  #pendingNative: { kind: "fork"; threadId: string; turnId: string; fallback: string | null } | { kind: "inject"; items: ResponsesItem[]; fallback: string | null } | null = null;
 
   // Per-turn wiring.
   #turnQueue: AsyncQueue<ProviderEvent> | null = null;
@@ -317,6 +342,7 @@ export class CodexProvider implements SessionProvider {
   #pendingMcpCalls = new Map<string, Array<{ itemId: string; tool: string; input: Record<string, unknown> }>>();
 
   constructor(init: CodexProviderInit) {
+    this.#store = init.store;
     this.#sessionId = init.sessionId;
     this.#backingSessionId = init.initialBackingId;
     this.#command = init.command;
@@ -352,6 +378,7 @@ export class CodexProvider implements SessionProvider {
     // A fresh backing session starts from nothing: a seed queued for the
     // previous one (a backend switch, a rewind) must not ride along (#355).
     this.#pendingHistorySeed = null;
+    this.#pendingNative = null;
     this.#backingSessionId = newBackingId;
     this.#threadId = null;
     this.#hasQueried = false;
@@ -374,6 +401,67 @@ export class CodexProvider implements SessionProvider {
    */
   seedText(block: string): void {
     this.#pendingHistorySeed = block.length > 0 ? block : null;
+  }
+
+  /**
+   * Continue a conversation natively (#387): fork this backend's own thread
+   * at the recorded turn when there is one, else inject codeoid's history as
+   * Responses items into a fresh thread. Applied when the thread is created
+   * on the first turn (it takes that turn's instructions); if it fails then,
+   * the turn says so and falls back to the transcript seed rendered here.
+   */
+  async continueNatively(req: NativeContinuationRequest): Promise<NativeContinuationResult | null> {
+    const fallback = renderHistorySeed(req.history, { maxChars: req.maxChars }).text || null;
+    this.#pendingHistorySeed = null;
+    if (req.forkFrom) {
+      this.#pendingNative = { kind: "fork", threadId: req.forkFrom.backingId, turnId: req.forkFrom.ref, fallback };
+      return { via: "fork" };
+    }
+    if (req.allowHistory === false) return null;
+    const { items, truncation } = toResponsesItems(req.history, { maxChars: req.maxChars });
+    if (items.length === 0) return null;
+    this.#pendingNative = { kind: "inject", items, fallback };
+    return { via: "history", ...(truncation.omittedTurns > 0 || truncation.newestTurnSliced ? { truncation } : {}) };
+  }
+
+  /**
+   * Create the thread a pending native continuation asks for. Returns its id,
+   * or null after falling back to the transcript (and telling the turn why).
+   */
+  async #applyPendingNative(opts: TurnOpts): Promise<string | null> {
+    const pending = this.#pendingNative;
+    this.#pendingNative = null;
+    if (!pending || !this.#proc) return null;
+    const config = threadConfig(opts);
+    try {
+      if (pending.kind === "fork") {
+        const forked = (await this.#proc.request("thread/fork", {
+          threadId: pending.threadId,
+          lastTurnId: pending.turnId,
+          // Don't stream the whole thread back over stdio; only its id is used.
+          excludeTurns: true,
+          ...config,
+        })) as { thread?: { id?: string } };
+        if (!forked.thread?.id) throw new Error("thread/fork returned no thread id");
+        return forked.thread.id;
+      }
+      const started = (await this.#proc.request("thread/start", config)) as { thread?: { id?: string } };
+      if (!started.thread?.id) throw new Error("thread/start returned no thread id");
+      await this.#proc.request("thread/inject_items", { threadId: started.thread.id, items: pending.items });
+      return started.thread.id;
+    } catch (err) {
+      const why = err instanceof Error ? err.message : String(err);
+      console.error(`[codex-provider ${this.#sessionId.slice(0, 8)}] native ${pending.kind} failed, using the transcript: ${why}`);
+      this.#pendingHistorySeed = pending.fallback;
+      // The cause stays in the daemon log: backend errors name rollout paths
+      // and thread ids, and every attached client (watchers too) sees this.
+      this.#push({
+        type: "custom_message",
+        content: "⚠️ Codex couldn't take this conversation as its own history, so it continues from a text transcript of it instead.",
+        metadata: { event: "history.native_fallback", providerId: this.id },
+      });
+      return null;
+    }
   }
 
   /**
@@ -599,10 +687,19 @@ export class CodexProvider implements SessionProvider {
       this.#proc.notify("initialized");
     }
 
-    // Resume the prior thread when the backing id looks like one codex
-    // minted; otherwise (first run: backing id is the codeoid session id)
-    // start fresh. Resume failure degrades to a fresh thread — never wedge.
-    if (this.#backingSessionId !== this.#sessionId) {
+    if (this.#pendingNative) {
+      // A native continuation (#387) creates the thread itself; if it fails,
+      // a fresh thread below takes the transcript instead.
+      const native = await this.#applyPendingNative(opts);
+      if (native) {
+        this.#adoptThread(native);
+        await this.#reportModelsOnce();
+        return;
+      }
+    } else if (this.#backingSessionId !== this.#sessionId) {
+      // Resume the prior thread when the backing id looks like one codex
+      // minted; otherwise (first run: backing id is the codeoid session id)
+      // start fresh. Resume failure degrades to a fresh thread — never wedge.
       try {
         const resumed = (await this.#proc.request("thread/resume", {
           threadId: this.#backingSessionId,
@@ -615,23 +712,38 @@ export class CodexProvider implements SessionProvider {
         /* fall through to thread/start */
       }
     }
-    const { approvalPolicy, sandboxMode } = codexPolicies(opts.mode);
-    const started = (await this.#proc.request("thread/start", {
-      cwd: opts.workdir,
-      approvalPolicy,
-      sandboxPolicy: sandboxPolicyWire(sandboxMode, opts.workdir),
-      ...(opts.systemPromptAppend ? { developerInstructions: opts.systemPromptAppend } : {}),
-    })) as { thread?: { id?: string } };
+    const started = (await this.#proc.request("thread/start", threadConfig(opts))) as { thread?: { id?: string } };
     if (!started.thread?.id) throw new Error("codex thread/start returned no thread id");
-    this.#threadId = started.thread.id;
-    this.#backingSessionId = started.thread.id;
+    this.#adoptThread(started.thread.id);
+    await this.#reportModelsOnce();
+  }
 
-    if (!this.#modelsReported && this.#onModels) {
-      const models = await this.listModels();
-      if (models.length > 0) {
-        this.#modelsReported = true;
-        this.#onModels(models.map((m) => ({ value: m.id, displayName: m.displayName, description: m.description })));
-      }
+  /**
+   * Make `id` the session's thread, and remember it: a restart resumes the
+   * thread only if its id was saved. (It wasn't, before #387 — every restart
+   * quietly started an empty thread.)
+   */
+  #adoptThread(id: string): void {
+    // Torn down while the reply was in flight (a backend switch): this thread
+    // is no longer the session's, and must not overwrite its backing id.
+    if (!this.#proc) return;
+    this.#threadId = id;
+    if (this.#backingSessionId === id) return;
+    this.#backingSessionId = id;
+    try {
+      // The column predates multi-provider naming: "the backend's session id".
+      this.#store.setClaudeCodeSessionId(this.#sessionId, id);
+    } catch (err) {
+      console.error(`[codex-provider ${this.#sessionId.slice(0, 8)}] failed to persist thread id: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  async #reportModelsOnce(): Promise<void> {
+    if (this.#modelsReported || !this.#onModels) return;
+    const models = await this.listModels();
+    if (models.length > 0) {
+      this.#modelsReported = true;
+      this.#onModels(models.map((m) => ({ value: m.id, displayName: m.displayName, description: m.description })));
     }
   }
 
@@ -824,6 +936,11 @@ export class CodexProvider implements SessionProvider {
             ? { contextWindow: this.#modelContextWindow }
             : {}),
           stopReason: (turn?.status as string | undefined) ?? undefined,
+          // Where this turn ends in the thread, for a native fork there (#387).
+          // Only a completed turn: a failed one would carry the failure over.
+          ...(this.#threadId && typeof turn?.id === "string" && turn.status === "completed"
+            ? { nativeRef: { backingId: this.#threadId, ref: turn.id } }
+            : {}),
         };
         this.#push({ type: "turn_done", result });
         this.#turnQueue?.close();

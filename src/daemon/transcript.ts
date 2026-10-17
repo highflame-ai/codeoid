@@ -171,6 +171,12 @@ export interface TranscriptMeta {
    * instead of resuming an empty backing session (#355).
    */
   backingFresh?: boolean;
+  /**
+   * Backing sessions that hold tool output a tool_result hook redacted from
+   * codeoid's record: never forked natively (#387). Persisted the moment a
+   * redaction happens, so a crash before the turn ends can't forget it.
+   */
+  redactedBackings?: string[];
   /** Fork lineage (session.fork). Absent = not a fork. */
   forkedFrom?: { sessionId: string; name: string; atTurn: number };
   /** Git worktree backing workdir (fork isolation / bind). Absent = shared. */

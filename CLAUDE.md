@@ -124,7 +124,8 @@ Every prompt, and everything the agent does in reply, belongs to one turn with a
 A message sent mid-turn joins the running turn.
 At the start of each turn the working directory is snapshotted into a daemon-owned shadow git repo (`<transcriptDir>/checkpoints/<session>.git`, self-contained, never the user's repo; secrets and dependency dirs excluded; works without git).
 The backend-neutral canonical history is persisted per session (`<id>.canonical.jsonl`) so forks, backend switches and stateless backends keep the conversation across a daemon restart.
-All of it is backend-agnostic: nothing depends on a provider's native session.
+It is the source of truth, and it doesn't depend on a provider's native session.
+What a backend is handed on a fork, switch or rewind is chosen by `Session.#seedProviderFromHistory` (#387): `continueNatively` first — Claude and Codex fork their own conversation at the turn's recorded `native` point (stamped on each canonical assistant turn from `NormalizedTurnResult.nativeRef`), or take native history built from the canonical turns — then the transcript seed as the fallback.
 
 ### Device Handoff
 Sessions live in the daemon. Clients are stateless.

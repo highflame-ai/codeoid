@@ -512,6 +512,8 @@ describe("canonicalFromTranscript", () => {
         toolCalls: [{ id: "tu1", name: "read_file", originalName: "Read", input: { file_path: "a.txt" }, output: "v0", success: true }],
         providerId: "codex",
         model: "unknown",
+        // Rebuilt from what was shown, not recorded from the backend (#387).
+        restored: true,
       },
       {
         role: "user",
@@ -520,7 +522,7 @@ describe("canonicalFromTranscript", () => {
         at: "2026-01-01T00:00:00Z",
         background: true,
       },
-      { role: "assistant", content: "background result", turnId: "T2", providerId: "codex", model: "unknown" },
+      { role: "assistant", content: "background result", turnId: "T2", providerId: "codex", model: "unknown", restored: true },
     ]);
   });
 });

@@ -78,6 +78,7 @@ The bridge announces itself on session start; **if it fails to load, turns fail 
 `/provider pi` (or `session.set_provider`) swaps a live session's backend while keeping the session id, scrollback, transcript, and identity.
 The conversation so far is carried into the incoming backend as a structured-text transcript — tool calls rendered as structured blocks (name, input JSON, fenced output), oldest turns dropped first past ~24k chars.
 Stateless backends (gemini, openai) go further: they replay the history in their native function-call structure on every request.
-Warm backends (claude, pi) stay a faithful transcript, **not** a native continuation — neither the Claude Agent SDK nor pi RPC accepts synthesized native-history injection, so prompt-cache state and extension state don't cross.
+Claude and Codex continue natively — their own fork on the same backend, native history from another (see [how a fork, switch or rewind carries the conversation](FEATURES.md#how-a-fork-switch-or-rewind-carries-the-conversation)).
+pi stays a faithful transcript, **not** a native continuation: its RPC has no history-import or fork entry point, so prompt-cache state and extension state don't cross.
 Switching resets the model to the new backend's default, and mid-turn switches are rejected — interrupt first.
 `/provider claude` brings the session back the same way.
