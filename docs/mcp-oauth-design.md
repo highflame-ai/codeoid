@@ -101,6 +101,8 @@ The CLI must not also connect its own copy (from `~/.claude.json` or a `.mcp.jso
 The denylist is fixed at query construction, so adopting a server rebuilds the query on the next turn; signing in or out only changes which in-process servers are mounted, which the provider applies to the running query with `setMcpServers` (codeoid's servers only), queuing the turn's message behind it — no restart, so the session's background work survives.
 A session never redials the CLI's copy of a server at a URL codeoid owns (decided by URL, by the provider, which sees the copy's config).
 A server the hub can't list (signed out, a revoked token, down, a timeout) makes the in-process server's `tools/list` fail, so the CLI reports it failed rather than connected with no tools.
+`setMcpServers` keeps a server it already has under a name, so one whose sign-in changed (signed out and back in, say after a revoked token) is also reconnected; the sign-in stamp that tells this is a per-tenant counter bumped by sign-ins and sign-outs, not by refreshes.
+A refresh the token endpoint refuses (`invalid_grant`) forgets the tokens, so the server reads as signed out; a refresh that merely fails (network, 5xx) keeps them for the next try.
 
 The proxy below is the planned way to close the gap for the other native backends; nothing else in this design depends on it.
 

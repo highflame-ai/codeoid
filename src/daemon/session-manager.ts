@@ -2264,17 +2264,9 @@ mcpHub: this.#mcpHub,
     };
   }
 
-  /** The ports this daemon's own HTTP endpoints are served on. */
-  #daemonPorts(): string[] {
-    return [this.#blackboardUrl, this.#config?.daemonUrl].flatMap((u) => {
-      if (!u) return [];
-      try {
-        const parsed = new URL(u);
-        return [parsed.port || (parsed.protocol === "https:" || parsed.protocol === "wss:" ? "443" : "80")];
-      } catch {
-        return [];
-      }
-    });
+  /** The origins this daemon's own HTTP endpoints are reached at. */
+  #daemonOrigins(): string[] {
+    return [this.#blackboardUrl, this.#config?.daemonUrl, this.#config?.mcpOAuth?.redirectBaseUrl].filter((u): u is string => Boolean(u));
   }
 
   /**
@@ -2289,7 +2281,7 @@ mcpHub: this.#mcpHub,
     if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE) || auth.delegationDepth > 0) return false;
     const can = adoptability(s);
     if (!adoptableName(s.name).ok || !can.ok || registryConflict(this.#mcpRegistry, s.name, can.url)) return false;
-    if (isDaemonEndpoint(can.url, this.#daemonPorts())) return false;
+    if (isDaemonEndpoint(can.url, this.#daemonOrigins())) return false;
     // A sign-in that the CLI can't run — not any failure: a server that's
     // merely down would only lose its working copy everywhere.
     return liveStatus === "needs-auth";
@@ -2353,7 +2345,11 @@ mcpHub: this.#mcpHub,
     source = found.path;
     const can = adoptability(found);
     if (!can.ok) return fail("refused", can.reason);
-    if (isDaemonEndpoint(can.url, this.#daemonPorts())) return fail("refused", `${name} is one of this daemon's own endpoints`);
+    if (isDaemonEndpoint(can.url, this.#daemonOrigins())) return fail("refused", `${name} is one of this daemon's own endpoints`);
+    // Every entry at that address must be adoptable: a repo's header-less
+    // copy mustn't stand in for the user's own header-authorized server.
+    const otherwise = atUrl.map(adoptability).find((r) => !r.ok);
+    if (otherwise && !otherwise.ok) return fail("refused", otherwise.reason);
     // A repo's file can name any address (and the CLI connects it unasked):
     // adopted only when the caller names the URL — consent to that address.
     if (fromRepoFile(found) && msg.url === undefined) {

@@ -256,6 +256,11 @@ export class ClaudeProvider implements SessionProvider {
    *  one is dropped instead of starting a turn nobody wants any more. */
   #heldPushes = 0;
   #pushEpoch = 0;
+  /** An interrupt came while the turn's message was held: interrupt again
+   *  once it's delivered (the epoch it applies to; -1 = none). */
+  #interruptHeldEpoch = -1;
+  /** The sign-in stamp each mounted OAuth server was connected with. */
+  #builtOAuthStamps: Record<string, string> = {};
   /** Last TurnOpts — the retry after a skill approval rebuilds the loop with
    * these, then re-pushes #lastPushedContent into the SAME turn queue (#233). */
   #lastTurnOpts: TurnOpts | null = null;
@@ -428,27 +433,9 @@ export class ClaudeProvider implements SessionProvider {
     return {
       events: turnQueue,
       interrupt: async () => {
-        // The turn's prompt is still waiting behind an MCP server change: it
-        // hasn't reached the CLI, so there's nothing there to stop — drop it
-        // and end the turn here.
-        if (this.#heldPushes > 0) {
-          this.#dropHeldPushes();
-          this.#emit({
-            type: "turn_done",
-            result: {
-              providerId: this.id,
-              model: "unknown",
-              inputTokens: 0,
-              outputTokens: 0,
-              cacheReadTokens: 0,
-              cacheCreationTokens: 0,
-              totalCostUsd: 0,
-              durationMs: 0,
-              stopReason: "interrupted",
-            },
-          });
-          return;
-        }
+        // The turn's prompt may still be waiting behind an MCP server change:
+        // stop it as soon as it's delivered, too.
+        if (this.#heldPushes > 0) this.#interruptHeldEpoch = this.#pushEpoch;
         const q = this.#query;
         if (q) {
           try {
@@ -694,6 +681,12 @@ export class ClaudeProvider implements SessionProvider {
         if (epoch !== this.#pushEpoch) return;
         this.#heldPushes -= 1;
         push();
+        // Stopped while it waited: it starts and is stopped at once, so the
+        // turn ends the usual way (recorded as interrupted, seed and all).
+        if (this.#interruptHeldEpoch === epoch) {
+          this.#interruptHeldEpoch = -1;
+          void this.#query?.interrupt().catch(() => {});
+        }
       });
     } else push();
   }
@@ -756,27 +749,41 @@ export class ClaudeProvider implements SessionProvider {
     // until named (measured), so leaving the user's own out leaves them as
     // they are. Re-sending one with an unchanged config reuses its process.
     const servers = this.#mcpServerSet(opts, oauthMcp, { userServers: false });
+    // setMcpServers keeps a server it already has under that name: one whose
+    // sign-in changed (signed out and back in, say after a revoked token)
+    // keeps its old, failed connection unless it's reconnected.
+    const resigned = Object.keys(oauthMcp.stamps).filter((n) => n in this.#builtOAuthStamps && this.#builtOAuthStamps[n] !== oauthMcp.stamps[n]);
+    this.#builtOAuthStamps = oauthMcp.stamps;
+    const generation = this.#loopGeneration;
     // Started in turn, after any earlier change: two overlapping calls could
     // land out of order (a sign-out, then a sign-in, ending signed out).
     this.#afterMcpUpdate(() =>
-      withTimeout(q.setMcpServers(servers), MCP_SET_TIMEOUT_MS)
-        .then((r) => {
+      withTimeout(
+        q.setMcpServers(servers).then(async (r) => {
           if (r.added.length > 0 || r.removed.length > 0) console.log(`${tag} MCP servers added [${r.added.join(", ")}] removed [${r.removed.join(", ")}]`);
           for (const [name, error] of Object.entries(r.errors)) console.error(`${tag} MCP server ${name} didn't connect: ${error}`);
-        })
-        .catch((err: unknown) => {
-          // The next turn retries; a rebuild would also pick the set up.
-          this.#builtOAuthMounts = "";
-          console.error(`${tag} updating the MCP servers failed: ${err instanceof Error ? err.message : String(err)}`);
+          for (const name of resigned) await q.reconnectMcpServer(name).catch(() => {});
         }),
+        MCP_SET_TIMEOUT_MS,
+      ).catch((err: unknown) => {
+        // The next turn retries — unless this query has since been replaced,
+        // whose own build has the current set.
+        if (generation === this.#loopGeneration) {
+          this.#builtOAuthMounts = "";
+          this.#builtOAuthStamps = {};
+        }
+        console.error(`${tag} updating the MCP servers failed: ${err instanceof Error ? err.message : String(err)}`);
+      }),
     );
   }
 
-  /** Forget messages held behind an MCP change, and the change itself (an interrupt, rebuild, teardown). */
+  /** Forget messages held behind an MCP change (a rebuild, teardown): they
+   *  were for the query going away. A change still in flight stays the tail
+   *  later ones and pushes wait behind, so nothing overlaps it. */
   #dropHeldPushes(): void {
     this.#pushEpoch += 1;
     this.#heldPushes = 0;
-    this.#mcpUpdating = null;
+    this.#interruptHeldEpoch = -1;
   }
 
   /** Run `step` after any pending MCP update (and what queued behind it), in order. */
@@ -863,7 +870,8 @@ export class ClaudeProvider implements SessionProvider {
     this.#builtPluginDirs = desiredPlugins;
     this.#builtOAuthMcp = oauthMcp.fingerprint;
     this.#builtOAuthMounts = oauthMcp.mountFingerprint;
-    // A change pending on the old query, and messages held behind it, went with it.
+    this.#builtOAuthStamps = oauthMcp.stamps;
+    // Messages held behind a change to the old query went with it.
     this.#dropHeldPushes();
     this.#loopGeneration += 1;
     const myGeneration = this.#loopGeneration;

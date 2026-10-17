@@ -11,7 +11,7 @@
  * Credentials are per tenant (account, project) and never leave the daemon.
  */
 
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { auth, type OAuthClientProvider, type OAuthDiscoveryState } from "@modelcontextprotocol/sdk/client/auth.js";
 import type {
   OAuthClientInformationMixed,
@@ -38,9 +38,17 @@ export interface McpCredentialSource {
   rejected(spec: McpServerSpec, tenant: McpTenant, token: string): void;
   /** Whether the tenant holds a credential worth trying, without a network call. */
   signedIn?(spec: McpServerSpec, tenant: McpTenant): boolean;
-  /** A stamp that changes whenever that credential does (a sign-in, a refresh):
-   *  a holder of a connection made with the old one knows to remake it. */
+  /** A stamp that changes with each sign-in (not a refresh — the same
+   *  credential, renewed): a holder of a connection made before knows to
+   *  remake it. */
   credentialStamp?(spec: McpServerSpec, tenant: McpTenant): string | undefined;
+}
+
+/** Whether a request is a refresh-token grant at a token endpoint. */
+function isRefreshRequest(init: RequestInit | undefined): boolean {
+  const body = init?.body;
+  const text = typeof body === "string" ? body : body instanceof URLSearchParams ? body.toString() : "";
+  return /(^|&)grant_type=refresh_token(&|$)/.test(text);
 }
 
 /** Thrown to the model/UI when a server has no usable credential. */
@@ -124,6 +132,9 @@ export class McpOAuth implements McpCredentialSource {
   readonly #refreshing = new Map<string, Promise<string | undefined>>();
   /** Tokens a server rejected: refreshed on next use even if not yet expired. */
   readonly #rejected = new Map<string, string>();
+  /** Bumped by each sign-in and sign-out, per (tenant, server): the stamp a
+   *  holder of a connection compares. Not by a refresh — same credential. */
+  readonly #signIns = new Map<string, number>();
 
   constructor(opts: McpOAuthOptions) {
     this.#store = opts.store;
@@ -211,6 +222,7 @@ export class McpOAuth implements McpCredentialSource {
     });
     if (result !== "AUTHORIZED") throw new Error(`Sign-in to ${pending.server} did not complete.`);
     this.#rejected.delete(keyOf(spec.name, pending.tenant));
+    this.#bumpSignIn(spec.name, pending.tenant);
     return { server: pending.server, tenant: pending.tenant };
   }
 
@@ -246,13 +258,17 @@ export class McpOAuth implements McpCredentialSource {
 
   credentialStamp(spec: McpServerSpec, tenant: McpTenant): string | undefined {
     if (!this.signedIn(spec, tenant)) return undefined;
-    const tokens = this.#tokens(spec, tenant);
-    // A digest, never the token: the stamp is compared, logged-adjacent state.
-    return createHash("sha256").update(tokens?.refresh_token ?? tokens?.access_token ?? "").digest("hex").slice(0, 16);
+    return String(this.#signIns.get(keyOf(spec.name, tenant)) ?? 0);
+  }
+
+  #bumpSignIn(server: string, tenant: McpTenant): void {
+    const key = keyOf(server, tenant);
+    this.#signIns.set(key, (this.#signIns.get(key) ?? 0) + 1);
   }
 
   /** Forget the tenant's tokens for a server (its client registration stays). */
   disconnect(spec: McpServerSpec, tenant: McpTenant): void {
+    this.#bumpSignIn(spec.name, tenant);
     this.#store.clearMcpOAuth(tenant, serverOf(spec), "tokens");
     this.#rejected.delete(keyOf(spec.name, tenant));
   }
@@ -270,18 +286,34 @@ export class McpOAuth implements McpCredentialSource {
       binding: "",
       expiresAt: this.#now(),
     };
+    // auth() answers "REDIRECT" both when the refresh token is dead and when
+    // the refresh merely failed (a network error, a 5xx — it moves on to a
+    // new authorization either way). Only the token endpoint's own verdict
+    // tells them apart: watch for it.
+    let refused = false;
+    const fetchFn: FetchLike = async (url, init) => {
+      const resp = await this.#fetch(url, init);
+      if (isRefreshRequest(init) && (resp.status === 400 || resp.status === 401)) {
+        const body = await resp.clone().json().catch(() => ({}) as Record<string, unknown>);
+        if ((body as { error?: unknown }).error === "invalid_grant") refused = true;
+      }
+      return resp;
+    };
     try {
       const result = await auth(this.#provider(spec, oauth, tenant, scratch), {
         serverUrl: urlOf(spec),
         scope: scopeOf(oauth),
-        fetchFn: this.#fetch,
+        fetchFn,
       });
       if (result !== "AUTHORIZED") {
-        // The refresh token was refused: only a new interactive sign-in helps.
-        // Forget the dead tokens, so the server reads as signed out (Settings
-        // offers Connect) rather than signed in and failing.
-        this.#store.clearMcpOAuth(tenant, serverOf(spec), "tokens");
-        this.#rejected.delete(keyOf(spec.name, tenant));
+        // Refused (invalid_grant): only a new interactive sign-in helps —
+        // forget the dead tokens, so the server reads as signed out (Settings
+        // offers Connect) rather than signed in and failing. Anything else
+        // is not a verdict on the token: keep it for the next try.
+        if (refused) {
+          this.#store.clearMcpOAuth(tenant, serverOf(spec), "tokens");
+          this.#rejected.delete(keyOf(spec.name, tenant));
+        }
         return undefined;
       }
     } catch (err) {

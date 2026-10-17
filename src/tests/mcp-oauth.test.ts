@@ -260,18 +260,55 @@ describe("using the credential", () => {
     expect(oauth.credentialStamp(s, TENANT)).toBeUndefined();
   });
 
-  it("stamps the credential, and a new sign-in changes the stamp (#390)", async () => {
-    fake = new FakeOAuthMcp();
+  it("keeps the tokens through an outage at the token endpoint — that's no verdict on them (#390)", async () => {
+    fake = new FakeOAuthMcp({ expiresIn: 600 });
+    const oauth = engine();
+    const s = spec();
+    await connect(oauth, s);
+    now += 600_000;
+    fake.tokenOutage = 503;
+    expect(await oauth.accessToken(s, TENANT)).toBeUndefined();
+    expect(oauth.status(s, TENANT)).toBe("connected"); // still signed in
+    fake.tokenOutage = null;
+    expect(await oauth.accessToken(s, TENANT)).toBeTruthy(); // and the next try refreshes
+  });
+
+  it("keeps the tokens when the token endpoint can't be reached", async () => {
+    fake = new FakeOAuthMcp({ expiresIn: 600 });
+    let down = false;
+    const oauth = new McpOAuth({
+      store,
+      redirectBaseUrl: () => REDIRECT_BASE,
+      env: {},
+      now: () => now,
+      fetchFn: (url, init) => (down && String(url).endsWith("/token") ? Promise.reject(new TypeError("fetch failed")) : fetch(url, init)),
+    });
+    const s = spec();
+    await connect(oauth, s);
+    now += 600_000;
+    down = true;
+    expect(await oauth.accessToken(s, TENANT)).toBeUndefined();
+    expect(oauth.status(s, TENANT)).toBe("connected");
+  });
+
+  it("stamps a sign-in: a new one changes the stamp, a refresh doesn't (#390)", async () => {
+    fake = new FakeOAuthMcp({ expiresIn: 600 });
     const oauth = engine();
     const s = spec();
     expect(oauth.credentialStamp(s, TENANT)).toBeUndefined();
     await connect(oauth, s);
     const first = oauth.credentialStamp(s, TENANT)!;
-    expect(first).toMatch(/^[0-9a-f]{16}$/); // a digest, never the token
+    expect(first).toBeTruthy();
+    // A refresh (rotating the refresh token) is the same sign-in.
+    now += 600_000;
+    expect(await oauth.accessToken(s, TENANT)).toBeTruthy();
+    expect(fake.stats.refreshes).toBe(1);
     expect(oauth.credentialStamp(s, TENANT)).toBe(first);
     oauth.disconnect(s, TENANT);
+    expect(oauth.credentialStamp(s, TENANT)).toBeUndefined();
     await connect(oauth, s);
     expect(oauth.credentialStamp(s, TENANT)).not.toBe(first);
+    expect(oauth.credentialStamp(s, OTHER)).toBeUndefined(); // per tenant
   });
 
   it("forgets the tokens on disconnect", async () => {

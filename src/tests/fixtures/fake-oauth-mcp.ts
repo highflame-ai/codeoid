@@ -35,6 +35,8 @@ export class FakeOAuthMcp {
   readonly mcpUrl: string;
   /** Counters tests assert on. */
   readonly stats = { registrations: 0, codeExchanges: 0, refreshes: 0, mcpCalls: 0, unauthorized: 0 };
+  /** When set, the token endpoint answers with this HTTP status (an outage) instead. */
+  tokenOutage: number | null = null;
   /** Every MCP request: who sent it, whether its token was valid, and the JSON-RPC method. */
   readonly mcpLog: Array<{ userAgent: string; authorized: boolean; method: string }> = [];
   /** The last /authorize query, for asserting PKCE / resource / scope. */
@@ -135,6 +137,7 @@ export class FakeOAuthMcp {
   }
 
   async #token(req: Request): Promise<Response> {
+    if (this.tokenOutage !== null) return new Response("<html>upstream unavailable</html>", { status: this.tokenOutage, headers: { "content-type": "text/html" } });
     const form = new URLSearchParams(await req.text());
     const grant = form.get("grant_type");
     if (grant === "authorization_code") {

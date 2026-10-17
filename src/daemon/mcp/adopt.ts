@@ -53,7 +53,7 @@ export function fromRepoFile(server: ClaudeConfigMcpServer, home: string = os.ho
  */
 export function adoptableName(name: string): { ok: true } | { ok: false; reason: string } {
   if (isReservedMcpName(name)) return { ok: false, reason: `${name} is the name of a codeoid built-in server` };
-  if (!/^[A-Za-z0-9_-]{1,64}$/.test(name) || name.includes("__")) {
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(name) || name.includes("__") || name.startsWith("-")) {
     return { ok: false, reason: `codeoid adopts servers with plain names (letters, digits, - and _, no "__"); rename ${JSON.stringify(name)} in Claude's config first` };
   }
   return { ok: true };
@@ -61,17 +61,33 @@ export function adoptableName(name: string): { ok: true } | { ok: false; reason:
 
 const LOOPBACK = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
-/** Whether a URL points at one of `ports` on this machine — the daemon's own
- *  endpoints (its blackboard and memory servers live there): adopting one
- *  would put codeoid's own server on the CLI's denylist. */
-export function isDaemonEndpoint(url: string, ports: readonly string[]): boolean {
+/** Any spelling of this machine: localhost, 127.0.0.0/8, ::1, ::ffff:127.x. */
+function isLoopbackHost(host: string): boolean {
+  return LOOPBACK.has(host) || host === "localhost." || /^127\./.test(host) || /^\[::ffff:(127\.|7f)/i.test(host);
+}
+
+/**
+ * Whether a URL points at this daemon's own endpoints (its blackboard and
+ * memory servers live there): adopting one would put codeoid's own server on
+ * the CLI's denylist. `origins` are the daemon's (its own URL, and any front
+ * end a client reaches it by); a loopback URL on one of their ports counts.
+ */
+export function isDaemonEndpoint(url: string, origins: readonly string[]): boolean {
+  let u: URL;
   try {
-    const u = new URL(url);
-    const port = u.port || (u.protocol === "https:" ? "443" : "80");
-    return LOOPBACK.has(u.hostname) && ports.includes(port);
+    u = new URL(url);
   } catch {
     return false;
   }
+  const portOf = (x: URL) => x.port || (x.protocol === "https:" || x.protocol === "wss:" ? "443" : "80");
+  return origins.some((o) => {
+    try {
+      const d = new URL(o);
+      return d.host === u.host || (isLoopbackHost(u.hostname) && portOf(d) === portOf(u));
+    } catch {
+      return false;
+    }
+  });
 }
 
 /** Whether codeoid can adopt this server, and if not, why — said to the user. */
@@ -89,6 +105,11 @@ export function adoptability(server: ClaudeConfigMcpServer): { ok: true; url: st
   }
   if (server.type !== null && server.type !== "http") {
     return { ok: false, reason: `${server.name} is a "${server.type}" server, not a remote HTTP one` };
+  }
+  // The URL is shown for consent and stored as is: the parser would quietly
+  // drop a newline or tab, which could carry text into the prompt.
+  if (/[\s\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2066-\u2069\ufeff]/.test(server.url)) {
+    return { ok: false, reason: `${server.name}'s URL contains spaces or control characters` };
   }
   let url: URL;
   try {

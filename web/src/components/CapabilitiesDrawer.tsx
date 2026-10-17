@@ -353,10 +353,15 @@ const McpAdopt: Component<{ server: string; url: string | null; path: string; pr
   const mine = () => st().server === props.server;
   const run = async () => {
     // Daemon-wide and lasting: say so before doing it — and, for a project's
-    // own file, that the project chose this address.
-    const origin = props.projectFile ? `\n\nThis server comes from this project's own ${props.path}, which chose its address. Adopt it only if you trust that address.` : "";
+    // own file, first, that the project chose this address. The host is
+    // shown as the browser resolves it (punycode), not as the file spells it.
+    let host = props.url ?? "";
+    try {
+      host = new URL(props.url ?? "").host;
+    } catch {}
+    const origin = props.projectFile ? `This project's own ${props.path} chose this server's address. Adopt it only if you trust that address.\n\n` : "";
     const ok = window.confirm(
-      `codeoid will sign in to ${props.server} at ${props.url ?? "this server"} itself, and every codeoid session will use it from now on, instead of the Claude CLI's own copy.${origin}\n\nContinue?`,
+      `${origin}codeoid will sign in to ${props.server} at ${host} itself, and every codeoid session will use it from now on, instead of the Claude CLI's own copy.\n\nContinue?`,
     );
     if (!ok) return;
     const sid = claudeConfig().sessionId;

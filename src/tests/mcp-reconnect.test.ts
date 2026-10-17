@@ -186,7 +186,19 @@ describe("session.mcp_reconnect", () => {
     expect(r.data.error).toContain('"Sign in with codeoid"');
     // A project's own server: the session to find it in, and its address named (consent to it).
     expect(r.data.error).toContain(`codeoid mcp adopt slack --session=${m._sessionForTest(id)!.name} --url=https://slack.example.com/mcp`);
+    expect(r.data.error).toContain("chosen by this project's .mcp.json"); // who chose the address it names
     expect(r.data.error).toContain("interactive Claude Code session"); // still offered
+  });
+
+  it("someone who couldn't adopt isn't pointed at adopting", async () => {
+    writeFileSync(join(tmp, "work", ".mcp.json"), JSON.stringify({ mcpServers: { slack: { type: "http", url: "https://slack.example.com/mcp" } } }));
+    answer = () => ({ status: "needs-auth", tools: [] });
+    const m = manager();
+    const id = await sessionAfterFirstTurn(m);
+    const operator: AuthContext = { ...AUTH, scopes: AUTH.scopes.filter((sc) => sc !== "settings:write") };
+    const r = (await reconnect(m, id, operator)) as { data: McpReconnectResult };
+    expect(r.data.error).not.toContain("codeoid mcp adopt");
+    expect(r.data.error).toContain("interactive Claude Code session");
   });
 
   it("a server Claude's config has no remote entry for gets the CLI's sign-in guidance only", async () => {

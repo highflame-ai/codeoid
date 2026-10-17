@@ -854,7 +854,7 @@ mcp
   .command("adopt <server>")
   .description("Have codeoid sign in to a remote MCP server from Claude's own config, instead of an interactive Claude Code session (#390)")
   .option("--session <session>", "also look in this session's workdir (a .mcp.json, project servers)")
-  .option("--url <url>", "the server's URL, when Claude's config has two servers of this name")
+  .option("--url <url>", "the server's URL: required for a project's own server (its address was chosen by the project — naming it is your consent), and when two servers share the name")
   .action((server: string, opts: { session?: string; url?: string }) => withClient((c) => c.mcpAdopt(server, opts.session, opts.url)));
 
 mcp

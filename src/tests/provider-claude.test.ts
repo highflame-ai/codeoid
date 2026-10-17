@@ -42,6 +42,7 @@ let mcpServerSets: Array<Record<string, unknown>> = [];
 /** When set, setMcpServers waits for it (a slow swap) / fails with it. */
 let mcpSetGate: Promise<void> | null = null;
 let mcpSetError: Error | null = null;
+let interruptCalls = 0;
 
 function makeMockQuery() {
   const err = sdkThrowError;
@@ -60,6 +61,7 @@ function makeMockQuery() {
       };
     },
     interrupt: async () => {
+      interruptCalls += 1;
       if (sdkInterruptThrows) throw new Error("interrupt unsupported");
     },
     supportedModels: async () => [{ value: "claude-opus-4", displayName: "Claude Opus 4" }],
@@ -1849,6 +1851,7 @@ describe("ClaudeProvider – OAuth registry servers (#390)", () => {
 describe("ClaudeProvider – swapping a live query's MCP servers (#390)", () => {
   let openGate: () => void = () => {};
   let signedIn = false;
+  let stamp = "1";
   beforeEach(() => {
     sdkMessages = [];
     sdkThrowError = null;
@@ -1858,6 +1861,9 @@ describe("ClaudeProvider – swapping a live query's MCP servers (#390)", () => 
     mcpSetGate = null;
     mcpSetError = null;
     signedIn = false;
+    stamp = "1";
+    interruptCalls = 0;
+    mcpReconnects.length = 0;
     sdkGate = new Promise<void>((r) => {
       openGate = r;
     });
@@ -1872,7 +1878,7 @@ describe("ClaudeProvider – swapping a live query's MCP servers (#390)", () => 
       workspaceId: "ws_test",
       tenant: { accountId: "acc", projectId: "proj" },
       mcpRegistry: new McpRegistry({ notes: McpServerSchema.parse({ url: "https://notes.example.com/mcp", oauth: true }) }, { memoryEnabled: false }),
-      mcpHub: { signedIn: () => signedIn, credentialStamp: () => (signedIn ? "s1" : undefined) } as never,
+      mcpHub: { signedIn: () => signedIn, credentialStamp: () => (signedIn ? stamp : undefined) } as never,
       store: {
         audit: () => {},
         getClaudeCodeSessionId: () => null,
@@ -1908,7 +1914,7 @@ describe("ClaudeProvider – swapping a live query's MCP servers (#390)", () => 
     await p.teardown();
   });
 
-  it("an interrupt while the message is held drops it and ends the turn", async () => {
+  it("an interrupt while the message is held stops it as soon as it's delivered", async () => {
     const p = await provider();
     turn(p, "t1");
     let release!: () => void;
@@ -1919,15 +1925,29 @@ describe("ClaudeProvider – swapping a live query's MCP servers (#390)", () => 
     const run = turn(p, "t2");
     await settle();
     await run.interrupt();
-    const events: ProviderEvent[] = [];
-    for await (const e of run.events) {
-      events.push(e);
-      if (e.type === "turn_done") break;
-    }
-    expect(events.at(-1)).toMatchObject({ type: "turn_done", result: { stopReason: "interrupted" } });
+    expect(interruptCalls).toBe(1); // whatever the CLI is running now
     release();
     await settle();
-    expect(delivered()).toBe(1); // the held prompt never reached the CLI
+    // Delivered and stopped at once: the turn ends the usual way (as
+    // interrupted, its seed handled), not with a made-up result.
+    expect(delivered()).toBe(2);
+    expect(interruptCalls).toBe(2);
+    openGate();
+    await p.teardown();
+  });
+
+  it("a server signed in to again is reconnected — the swap alone keeps its old connection", async () => {
+    const p = await provider();
+    signedIn = true;
+    turn(p, "t1"); // mounted with sign-in 1
+    stamp = "2"; // signed out and back in between turns
+    turn(p, "t2");
+    await settle();
+    expect(mcpServerSets).toHaveLength(1);
+    expect(mcpReconnects).toEqual(["notes"]);
+    turn(p, "t3");
+    await settle();
+    expect(mcpReconnects).toEqual(["notes"]); // once
     openGate();
     await p.teardown();
   });

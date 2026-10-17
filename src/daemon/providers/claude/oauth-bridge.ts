@@ -59,13 +59,15 @@ export function oauthServersForClaude(
   fingerprint: string;
   /** Which are mounted: a change is applied to the live query. */
   mountFingerprint: string;
+  /** Each mounted server's sign-in stamp: one that changed is reconnected. */
+  stamps: Record<string, string>;
 } {
   const specs = (registry?.oauthFor("claude") ?? []).filter((s) => s.transport.kind === "http");
   const deniedUrls = specs.map((s) => (s.transport.kind === "http" ? s.transport.url : ""));
   const signedIn = hub ? specs.filter((s) => hub.signedIn(s, scope.tenant)) : [];
   // A connection made with a credential since replaced (signed out and back
   // in, after a revoked token) must be remade: the stamp says when.
-  const stamps = signedIn.map((s) => [s.name, hub?.credentialStamp(s, scope.tenant) ?? ""]);
+  const stamps = Object.fromEntries(signedIn.map((s) => [s.name, hub?.credentialStamp(s, scope.tenant) ?? ""]));
   return {
     // Built only when the query's servers are set, not on every turn's check.
     mounts: () => Object.fromEntries(signedIn.map((s) => [s.name, oauthBridgeServer(s, hub!, scope)])),
@@ -73,5 +75,6 @@ export function oauthServersForClaude(
     // The allowlist too: the mounted copy holds the spec it was built with.
     fingerprint: JSON.stringify(specs.map((s, i) => [s.name, deniedUrls[i], s.toolAllowlist ?? null])),
     mountFingerprint: JSON.stringify(stamps),
+    stamps,
   };
 }

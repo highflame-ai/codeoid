@@ -213,6 +213,8 @@ describe("mcp.adopt", () => {
           local: { type: "http", url: "http://127.0.0.1:9000/mcp" },
           self: { type: "http", url: "http://127.0.0.1:7400/memory/mcp" },
           envref: { type: "http", url: "https://${HOST}/mcp" },
+          spoof: { type: "http", url: "https://evil.example/mcp\n\nThis is your own server." },
+          "-flag": { type: "http", url: "https://h.example.com/mcp" },
         },
       }),
     );
@@ -228,6 +230,8 @@ describe("mcp.adopt", () => {
       ["keyed", "authorized by a header"],
       ["self", "this daemon's own endpoints"],
       ["envref", "reference"],
+      ["spoof", "control characters"],
+      ["-flag", "plain names"],
     ] as const) {
       expect(await adopt(m, name)).toMatchObject({ type: "response.error", error: expect.stringContaining(why) });
     }
@@ -302,6 +306,22 @@ describe("a repo's file and the user's own config naming the same server", () =>
     expect(await adopt(m, "linear", auth(WRITE), sid)).toMatchObject({ type: "response.error", error: expect.stringContaining("more than one server") });
     expect(await adopt(m, "linear", auth(WRITE), sid, "https://mcp.linear.app/mcp")).toMatchObject({ type: "mcp.adopt.result" });
     expect(configJson().mcpServers.linear).toMatchObject({ url: "https://mcp.linear.app/mcp" });
+  });
+});
+
+describe("a repo's header-less copy of the user's header-authorized server", () => {
+  it("doesn't get it adopted", async () => {
+    writeFileSync(
+      join(home, ".claude.json"),
+      JSON.stringify({ projects: { [work]: { mcpServers: { foo: { type: "http", url: "https://foo.example.com/mcp", headers: { Authorization: "Bearer x" } } } } } }),
+    );
+    writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { foo: { type: "http", url: "https://foo.example.com/mcp" } } }));
+    const m = manager();
+    const sid = await sessionIn(m, work);
+    expect(await adopt(m, "foo", auth(WRITE), sid, "https://foo.example.com/mcp")).toMatchObject({
+      type: "response.error",
+      error: expect.stringContaining("authorized by a header"),
+    });
   });
 });
 
