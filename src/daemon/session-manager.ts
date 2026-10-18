@@ -27,7 +27,7 @@ import { createPushTransport, PushService } from "./push/index.js";
 import { hasScope, SCOPES } from "../protocol/scopes.js";
 import { applyPatches, getManifest, getSnapshot, previewPatches, readMcpServerEntry, writeMcpServerEntry } from "./settings/store.js";
 import { adoptability, adoptableName, adoptedEntry, adoptionRefusal, claudeMcpServers, fromRepoFile, isSameAdoption } from "./mcp/adopt.js";
-import { redactMcpArgs, redactMcpUrl } from "./mcp/redact.js";
+import { redactMcpArgs, redactMcpUrl, redactSecretText } from "./mcp/redact.js";
 import { canonicalFromTranscript, turnIndexFromHistory } from "./canonical-restore.js";
 import { BackendLoginBroker, BackendLoginError, redact } from "./auth/backend-login.js";
 import { ClaudeAccountError, ClaudeAccountStore, validateAccountName } from "./claude-accounts.js";
@@ -1549,8 +1549,9 @@ mcpHub: this.#mcpHub,
     auth: AuthContext,
   ): Promise<DaemonMessage> {
     // Reuse fs:read since this only reads ~/.claude/ + workdir/.claude/ —
-    // strictly broader than session.workdir, but the data is descriptive
-    // (no secrets — env values are stripped, only key names returned).
+    // strictly broader than session.workdir, but the data is descriptive:
+    // env and header values are never read out, and MCP args, URLs and
+    // commands and hook commands are redacted (#394).
     if (!hasScope(auth.scopes as string[], SCOPES.FS_READ)) {
       return {
         type: "response.error",
@@ -1585,6 +1586,7 @@ mcpHub: this.#mcpHub,
           // What leaves the daemon carries no credential (#394): a Claude
           // config keeps them in args and URLs as often as in env and headers
           // (whose values are never read out).
+          command: s.command === null ? null : redactSecretText(s.command),
           args: redactMcpArgs(s.args),
           url: s.url === null ? null : redactMcpUrl(s.url),
           ...(liveStatus !== undefined ? { liveStatus } : {}),
@@ -1624,7 +1626,7 @@ mcpHub: this.#mcpHub,
         agents: snapshot.agents,
         skills: snapshot.skills,
         mcpServers,
-        hooks: snapshot.hooks,
+        hooks: snapshot.hooks.map((h) => ({ ...h, command: redactSecretText(h.command) })),
         mcpReconnect: session.canReconnectMcp,
       };
     } catch (err) {
@@ -1849,7 +1851,8 @@ mcpHub: this.#mcpHub,
         health,
         toolCount: status?.tools.length ?? 0,
         tools: status?.tools ?? [],
-        ...(status?.error ? { error: status.error } : {}),
+        // A transport error can quote the server's URL, token and all.
+        ...(status?.error ? { error: redactSecretText(status.error) } : {}),
         ...(isOAuthServer(spec) ? { oauth: this.#oauthStatus(spec, auth) } : {}),
       };
     });

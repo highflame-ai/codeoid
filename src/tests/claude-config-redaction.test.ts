@@ -13,7 +13,8 @@ import { join } from "node:path";
 import type { CodeoidConfig } from "../config.js";
 import { McpHub } from "../daemon/mcp/hub.js";
 import { McpOAuth } from "../daemon/mcp/oauth.js";
-import { redactMcpArgs, redactMcpUrl } from "../daemon/mcp/redact.js";
+import { redactMcpArgs, redactMcpUrl, redactSecretText } from "../daemon/mcp/redact.js";
+import { cleanMcpError } from "../daemon/session.js";
 import { McpRegistry } from "../daemon/mcp/registry.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
 import { ProviderRegistry } from "../daemon/providers/registry.js";
@@ -58,11 +59,29 @@ beforeEach(() => {
         gh: { command: "gh-mcp", args: ["--token=ghp_abcdefghijklmnop1234", "--verbose"] },
         notes: { type: "http", url: "https://notes.example.com/mcp?api_key=tok_9f8e7d6c5b4a3210fedcba98" },
         plain: { type: "http", url: "https://plain.example.com/mcp" },
+        dup: { type: "http", url: "https://dup.example.com/mcp?token=hunter2" },
       },
       projects: { [work]: { mcpServers: { wh: { type: "http", url: "https://hooks.example.com/mcp/tok_9f8e7d6c5b4a3210fedcba98/x" } } } },
     }),
   );
-  writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { cred: { type: "http", url: "https://ops:s3cr3tpass@ops.example.com/mcp" } } }));
+  writeFileSync(
+    join(work, ".mcp.json"),
+    JSON.stringify({
+      mcpServers: {
+        cred: { type: "http", url: "https://ops:s3cr3tpass@ops.example.com/mcp" },
+        repoq: { type: "http", url: "https://repo.example.com/mcp?key=s3cr3tpass" },
+        dup: { type: "http", url: "https://dup2.example.com/mcp?token=s3cr3tpass" },
+      },
+    }),
+  );
+  mkdirSync(join(home, ".claude"));
+  writeFileSync(
+    join(home, ".claude", "settings.json"),
+    JSON.stringify({
+      hooks: { Stop: [{ hooks: [{ type: "command", command: "curl -H 'Authorization: Bearer sk-live-0123456789abcdef' https://hooks.example.com/notify?token=hunter2" }] }] },
+      mcpServers: { envcmd: { command: "env API_KEY=ghp_abcdefghijklmnop1234 npx srv" } },
+    }),
+  );
   store = new Store(join(tmp, "codeoid.db"));
 });
 
@@ -110,9 +129,12 @@ async function rows(m: SessionManager): Promise<{ sid: string; servers: ClaudeCo
 const leaks = (text: string) => SECRETS.filter((s) => text.includes(s));
 
 describe("claude.config", () => {
-  it("returns no credential from a server's args or URL", async () => {
-    const { servers } = await rows(manager());
-    expect(leaks(JSON.stringify(servers))).toEqual([]);
+  it("returns no credential from a server's args, URL or command, nor from a hook's command", async () => {
+    const m = manager();
+    const created = (await m.handle({ type: "session.create", id: "c", name: "w", workdir: work }, auth(ALL), client)) as { data: { id: string } };
+    const whole = await m.handle({ type: "claude.config", id: "v", sessionId: created.data.id }, auth(ALL), client);
+    expect((whole as { hooks: unknown[] }).hooks.length).toBeGreaterThan(0);
+    expect(leaks(JSON.stringify(whole))).toEqual([]);
   });
 
   it("keeps what tells a server apart: command, flags, host and path", async () => {
@@ -155,6 +177,47 @@ describe("everything else that shows a server's address", () => {
   });
 });
 
+describe("adopt's refusals", () => {
+  it("name a URL without its credentials: the project's own server, and an ambiguous name", async () => {
+    const m = manager();
+    const { sid } = await rows(m);
+    const unconfirmed = (await m.handle({ type: "mcp.adopt", id: "a", server: "repoq", sessionId: sid }, auth(ALL), client)) as { error?: string };
+    expect(unconfirmed.error).toContain("name that URL (https://repo.example.com/mcp?…)");
+    const ambiguous = (await m.handle({ type: "mcp.adopt", id: "b", server: "dup", sessionId: sid }, auth(ALL), client)) as { error?: string };
+    expect(ambiguous.error).toContain("more than one server");
+    expect(leaks(JSON.stringify([unconfirmed, ambiguous]))).toEqual([]);
+  });
+});
+
+describe("the URL shown is the URL dialed", () => {
+  it("never shows a host the URL doesn't resolve to", () => {
+    // ?, # and \ end the host for the parser: "…@trusted.com" would be a lie.
+    for (const sneaky of ["https://evil.com?@trusted.com/mcp", "https://evil.com#@trusted.com/mcp", "https://evil.com\\@trusted.com/mcp"]) {
+      const shown = redactMcpUrl(sneaky);
+      expect(shown).toStartWith("https://evil.com/"); // the host it dials, and nothing before it
+      expect(new URL(shown).host).toBe("evil.com");
+    }
+    expect(redactMcpUrl("https://trusted.com@evil.com/mcp")).toBe("https://…@evil.com/mcp");
+  });
+
+  it("never hides the host, however token-like its labels", () => {
+    expect(redactMcpUrl("https://abc123def456ghi789jkl0.lambda-url.us-east-1.on.aws/mcp")).toBe("https://abc123def456ghi789jkl0.lambda-url.us-east-1.on.aws/mcp");
+    expect(redactMcpUrl("https://my-service-abc123xyz-uc.a.run.app/mcp?x=1")).toBe("https://my-service-abc123xyz-uc.a.run.app/mcp?…");
+  });
+});
+
+describe("bounded", () => {
+  it("hostile args, URLs and text cost little to clean", () => {
+    for (const text of ["a-".repeat(20_000), "akey_".repeat(8_000), `--${"x-".repeat(20_000)}token`, `https://h/${"a".repeat(100_000)}`]) {
+      const t0 = performance.now();
+      redactMcpArgs([text, text]);
+      redactMcpUrl(text);
+      redactSecretText(text);
+      expect(performance.now() - t0).toBeLessThan(200);
+    }
+  });
+});
+
 describe("redactMcpUrl / redactMcpArgs", () => {
   it("redacts each place a URL holds a credential, and leaves a clean one alone", () => {
     expect(redactMcpUrl("https://a.example.com/mcp")).toBe("https://a.example.com/mcp");
@@ -171,5 +234,26 @@ describe("redactMcpUrl / redactMcpArgs", () => {
     expect(redactMcpArgs(["redis://:pw@cache:6379"])[0]).not.toContain("pw@");
     expect(redactMcpArgs(["Bearer abcdef"])[0]).not.toContain("abcdef");
     expect(redactMcpArgs(["-y", "@scope/pkg@1.2.3", "/srv/data"])).toEqual(["-y", "@scope/pkg@1.2.3", "/srv/data"]);
+  });
+
+  it("knows a credential flag by its words, not by a substring", () => {
+    for (const flag of ["--pat", "--github-pat", "--pass", "--passphrase", "--sig", "--signature", "--private-key", "--access-token"]) {
+      expect(redactMcpArgs([flag, "X1"])).toEqual([flag, "…"]);
+    }
+    expect(redactMcpArgs(["--passphrase=X1"])).toEqual(["--passphrase=…"]);
+    for (const flag of ["--keyboard-layout", "--author", "--no-auth"]) {
+      expect(redactMcpArgs([flag, "plain"])).toEqual([flag, "plain"]);
+    }
+  });
+
+  it("hides a credential header's value, split or in one argument, and a value that starts with -", () => {
+    expect(redactMcpArgs(["--header", "Authorization", "x1y2z3"])).toEqual(["--header", "Authorization", "…"]);
+    expect(redactMcpArgs(["-H", "X-Api-Key: abc"])).toEqual(["-H", "X-Api-Key: …"]);
+    expect(redactMcpArgs(["--password", "-weird9Value"])).toEqual(["--password", "…"]);
+    expect(redactMcpArgs(["--token", "--verbose"])).toEqual(["--token", "--verbose"]); // that's another flag
+  });
+
+  it("keeps redacting basic= in error text (it moved to the key=value rule)", () => {
+    expect(cleanMcpError("auth failed: basic=dXNlcjpwYXNz")).not.toContain("dXNlcjpwYXNz");
   });
 });

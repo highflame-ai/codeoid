@@ -205,6 +205,17 @@ describe("session.mcp_reconnect", () => {
     expect(r.data.error).toContain("--url=https://slack.example.com/mcp");
   });
 
+  it("the hint's URL carries no credential (#394)", async () => {
+    writeFileSync(join(tmp, "work", ".mcp.json"), JSON.stringify({ mcpServers: { slack: { type: "http", url: "https://slack.example.com/mcp?token=hunter2" } } }));
+    answer = () => ({ status: "needs-auth", tools: [] });
+    const m = manager();
+    m.setMcp(new McpRegistry({}, { memoryEnabled: false }), new McpHub({}));
+    const id = await sessionAfterFirstTurn(m);
+    const r = (await reconnect(m, id)) as { data: McpReconnectResult };
+    expect(r.data.error).toContain("https://slack.example.com/mcp?…");
+    expect(r.data.error).not.toContain("hunter2");
+  });
+
   it("someone who couldn't adopt isn't pointed at adopting", async () => {
     writeFileSync(join(tmp, "work", ".mcp.json"), JSON.stringify({ mcpServers: { slack: { type: "http", url: "https://slack.example.com/mcp" } } }));
     answer = () => ({ status: "needs-auth", tools: [] });

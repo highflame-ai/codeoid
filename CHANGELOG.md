@@ -172,9 +172,10 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **The capabilities drawer no longer shows credentials from MCP servers' args and URLs** (#394).
-  Its MCP rows (`claude.config`) already left out env and header values, but returned each server's `args` and `url` verbatim, and a Claude config keeps secrets there just as often (`--api-key sk-…`, `--token=…`, `postgres://user:pass@…`, `?api_key=…`, a token in the path).
-  Those are now redacted with the rules codeoid uses for MCP error text, keeping the command, its flags, the host and the path's shape; so are the adopt hint, adopt's errors and its audit rows.
+- **The capabilities drawer no longer shows credentials from MCP servers or hooks** (#394).
+  Its `claude.config` response already left out env and header values, but returned MCP servers' `args`, `url` and `command`, and hook commands, verbatim, and a Claude config keeps secrets there just as often (`--api-key sk-…`, `--token=…`, `postgres://user:pass@…`, `?api_key=…`, a token in the path, `curl -H "Authorization: Bearer …"`).
+  Those are now redacted, keeping the command, its flags and the path's shape; a URL is shown from the URL parser's own reading, so the host is always the one it resolves to and is never hidden.
+  So are the adopt hint, adopt's errors and its audit rows, and transport errors in Settings' MCP list.
   Adopting from the drawer still works: it matches the URL as shown.
 
 - **An MCP server that failed when a session started no longer stays failed for the whole session** (#389).
