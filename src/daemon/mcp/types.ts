@@ -113,9 +113,15 @@ export const NATIVE_MOUNT_BACKENDS: readonly string[] = ["claude", "codex", "gem
  */
 export const OAUTH_BRIDGED_BACKENDS: readonly string[] = ["claude"];
 
-/** Backends an OAuth server does not reach at all yet. */
+/**
+ * Native-mount backends that get OAuth servers through the daemon's loopback
+ * relay (#396, mcp/proxy.ts), with a per-session proxy token.
+ */
+export const OAUTH_PROXIED_BACKENDS: readonly string[] = ["codex", "gemini-cli", "qwen"];
+
+/** Backends an OAuth server does not reach at all yet (none, since #396). */
 export const OAUTH_UNSUPPORTED_BACKENDS: readonly string[] = NATIVE_MOUNT_BACKENDS.filter(
-  (b) => !OAUTH_BRIDGED_BACKENDS.includes(b),
+  (b) => !OAUTH_BRIDGED_BACKENDS.includes(b) && !OAUTH_PROXIED_BACKENDS.includes(b),
 );
 
 /** True when `spec` should be delivered by codeoid owning the client (Model B

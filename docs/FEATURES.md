@@ -450,7 +450,8 @@ What can be adopted, and why:
 
 Adopting is daemon-wide and lasting: the server is in codeoid's registry for every session, as any registry server is. It needs `settings:write`, a token's own (not a delegated one), and every attempt is audited with the file the URL came from.
 A claude.ai connector is signed in from claude.ai's connector settings instead.
-OAuth servers reach the daemon-run backends and Claude; Codex, the Gemini CLI and Qwen don't get them yet.
+OAuth servers reach every backend: the daemon-run ones through codeoid's own MCP client, Claude through an in-process server in front of it, and Codex, the Gemini CLI and Qwen through a loopback relay on the daemon with a per-session token (#396).
+The server's token stays in the daemon either way; a backend never holds it.
 
 ### Driven by other agents (MCP)
 

@@ -317,7 +317,13 @@ async function runTurn(threadId: string, prompt: string): Promise<void> {
     // Surface the `-c mcp_servers.*` overrides + token env the provider spawned
     // us with, so the memory mount wiring can be asserted offline.
     const mcpArgs = process.argv.filter((a) => a.includes("mcp_servers"));
-    const text = JSON.stringify({ mcpArgs, token: process.env.CODEOID_MEMORY_TOKEN ?? null });
+    const text = JSON.stringify({
+      mcpArgs,
+      token: process.env.CODEOID_MEMORY_TOKEN ?? null,
+      proxyToken: process.env.CODEOID_MCP_PROXY_TOKEN ?? null,
+      shellEnvArgs: process.argv.filter((a) => a.startsWith("shell_environment_policy")),
+      argv: process.argv,
+    });
     send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text } } });
   } else if (prompt.includes("echo-native")) {
     send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: JSON.stringify(nativeCalls) } } });
