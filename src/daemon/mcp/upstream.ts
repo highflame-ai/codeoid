@@ -12,7 +12,8 @@
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import type { ClientCapabilities, Implementation } from "@modelcontextprotocol/sdk/types.js";
+import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { type ClientCapabilities, ErrorCode, type Implementation, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { McpSignInRequired } from "./oauth.js";
 import type { McpHttpTransport } from "./types.js";
 
@@ -61,11 +62,31 @@ export async function openUpstream(opts: UpstreamOptions): Promise<Client> {
   return client;
 }
 
-/** End the upstream session (an HTTP DELETE, where the server keeps one) and close. */
-export async function closeUpstream(client: Client): Promise<void> {
+/**
+ * Whether a failed request means the upstream session itself is gone — the
+ * connection closed, the server forgot the session (404), the network failed
+ * — rather than that one request failing (an error result, a timeout, a 5xx).
+ * Only then is a shared session dropped: the calls beside it go on otherwise.
+ */
+export function sessionGone(e: unknown): boolean {
+  if (e instanceof McpError) return e.code === ErrorCode.ConnectionClosed;
+  if (e instanceof StreamableHTTPError) return e.code === 404;
+  return e instanceof TypeError; // fetch failed: no connection
+}
+
+/** End the upstream session (an HTTP DELETE, where the server keeps one) and
+ *  close — within `timeoutMs`: a server that never answers can't hold it. */
+export async function closeUpstream(client: Client, timeoutMs = 3_000): Promise<void> {
   const transport = client.transport;
   if (transport instanceof StreamableHTTPClientTransport && transport.sessionId) {
-    await transport.terminateSession().catch(() => {});
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      transport.terminateSession().catch(() => {}),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, timeoutMs);
+      }),
+    ]);
+    clearTimeout(timer);
   }
   await client.close().catch(() => {});
 }

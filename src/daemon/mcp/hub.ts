@@ -30,7 +30,7 @@ import { ResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import { McpSignInRequired, type McpCredentialSource, type McpTenant } from "./oauth.js";
 import type { McpProxy } from "./proxy.js";
 import { cleanMcpError } from "./redact.js";
-import { closeUpstream, openUpstream, type UpstreamBearer, type UpstreamOptions } from "./upstream.js";
+import { closeUpstream, openUpstream, sessionGone, type UpstreamBearer, type UpstreamOptions } from "./upstream.js";
 
 /** A tool as codeoid surfaces it to a backend (bare name; the canonical
  *  `mcp__<server>__<tool>` form is applied by the mounters, not here). */
@@ -58,6 +58,10 @@ interface McpClient {
   listTools(): Promise<McpToolDef[]>;
   callTool(tool: string, args: Record<string, unknown>, scope: McpCallScope): Promise<McpCallResult>;
   close(): void;
+  /** Whether this failure leaves the client unusable (dropped, and remade on
+   *  next use). Absent: every failure does. A client shared by concurrent
+   *  calls says no to a failure that was one call's alone. */
+  brokenBy?(e: unknown): boolean;
 }
 
 export interface McpHubOptions {
@@ -121,7 +125,7 @@ export class McpHub {
       // record — and the tool list from before is gone with the credential.
       if (e instanceof McpSignInRequired) this.#status.delete(key);
       else this.#status.set(key, { tools: [], error: cleanMcpError(errMsg(e)) });
-      this.#drop(key);
+      this.#dropIfBroken(key, e);
       throw e;
     }
   }
@@ -147,7 +151,7 @@ export class McpHub {
     try {
       return await withTimeout(client.callTool(tool, args, scope), this.#timeoutMs, `${spec.name}/${tool}`);
     } catch (e) {
-      this.#drop(clientKey(spec, scope.tenant)); // reconnect on next use
+      this.#dropIfBroken(clientKey(spec, scope.tenant), e); // reconnect on next use
       if (e instanceof McpSignInRequired) return { text: e.message, isError: true };
       // codeoid has no OTEL; a failed external tool call is worth one daemon log
       // line (transport error / timeout) so a flaky server is diagnosable.
@@ -229,6 +233,11 @@ export class McpHub {
   /** Drop one tenant's client for a server (it signed out or back in). */
   dropTenant(name: string, tenant: McpTenant): void {
     this.#drop(tenantKey(name, tenant));
+  }
+
+  #dropIfBroken(key: string, e: unknown): void {
+    const c = this.#clients.get(key);
+    if (c && (c.brokenBy?.(e) ?? true)) this.#drop(key);
   }
 
   #drop(key: string): void {
@@ -401,6 +410,7 @@ class HttpMcpClient implements McpClient {
     const client = await this.#connect();
     const tools: McpToolDef[] = [];
     let cursor: string | undefined;
+    const seen = new Set<string>();
     // Read loosely, as before the SDK client: one tool with an odd schema
     // mustn't hide all of a server's tools (the SDK's listTools validates
     // every one strictly).
@@ -412,7 +422,10 @@ class HttpMcpClient implements McpClient {
       )) as { tools?: unknown; nextCursor?: unknown };
       if (Array.isArray(page.tools)) tools.push(...(page.tools as RawTool[]).filter((t) => typeof t?.name === "string").map(toToolDef));
       cursor = typeof page.nextCursor === "string" ? page.nextCursor : undefined;
-    } while (cursor && tools.length < MAX_TOOLS);
+      // A server repeating a cursor would page forever.
+      if (cursor !== undefined && seen.has(cursor)) break;
+      if (cursor !== undefined) seen.add(cursor);
+    } while (cursor && tools.length < MAX_TOOLS && seen.size < MAX_PAGES);
     return tools;
   }
 
@@ -429,12 +442,20 @@ class HttpMcpClient implements McpClient {
   close(): void {
     const client = this.#client;
     this.#client = null;
-    client?.then(closeUpstream, () => {});
+    client?.then((c) => closeUpstream(c), () => {});
+  }
+
+  /** One session serves every call to this server (for this tenant): only a
+   *  failure of the session itself ends it, never one call's error or timeout.
+   *  A sign-in needed again is the credential, not the session. */
+  brokenBy(e: unknown): boolean {
+    return !(e instanceof McpSignInRequired) && sessionGone(e);
   }
 }
 
-/** Pages of tools/list read at most up to this many tools. */
+/** Pages of tools/list read at most up to this many tools, or this many pages. */
 const MAX_TOOLS = 10_000;
+const MAX_PAGES = 100;
 
 // ── shared helpers ────────────────────────────────────────────────────────────
 

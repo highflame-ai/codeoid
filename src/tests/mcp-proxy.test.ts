@@ -18,7 +18,7 @@ import {
   ResultSchema as ResultSchemaLoose,
   CreateMessageRequestSchema,
   ElicitRequestSchema,
-  McpError,
+  type McpError,
   ToolListChangedNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import type { RawMcpServerConfig } from "../config.js";
@@ -61,6 +61,7 @@ function start(opts: { allow?: string[]; limits?: Partial<McpProxyLimits>; idleS
   registry = new McpRegistry(
     {
       notes: raw({ url: fake.mcpUrl, oauth: true, ...(opts.allow ? { tools: opts.allow } : {}) }),
+      notes2: raw({ url: fake.mcpUrl, oauth: true }),
       plain: raw({ url: "https://plain.example.com/mcp" }),
       claudeOnly: raw({ url: fake.mcpUrl, oauth: true, backends: ["claude"] }),
     },
@@ -177,7 +178,7 @@ describe("the relay carries the whole protocol", () => {
     start();
     await signIn(TENANT);
     const { token, servers } = mint();
-    expect(servers).toEqual(["notes"]); // codex's OAuth servers: not plain (mounted directly), not claudeOnly
+    expect(servers).toEqual(["notes", "notes2"]); // codex's OAuth servers: not plain (mounted directly), not claudeOnly
     const client = await backend(token);
     expect(client.getServerVersion()).toMatchObject({ name: "fake-oauth-mcp" });
     expect(client.getInstructions()).toBe("A fake server for tests.");
@@ -261,7 +262,7 @@ describe("the relay carries the whole protocol", () => {
 });
 
 describe("signing in and out", () => {
-  it("serves a tenant not signed in — tools that say to sign in, never a 401 — and picks up a sign-in live", async () => {
+  it("serves a tenant not signed in — no tools, calls that say to sign in, never a 401 — and picks up a sign-in live", async () => {
     start();
     const { token } = mint();
     // The raw exchange: initialize succeeds, with a session.
@@ -272,10 +273,12 @@ describe("signing in and out", () => {
     const client = await backend(token, {
       setup: (c) => c.setNotificationHandler(ToolListChangedNotificationSchema, async () => void changed++),
     });
-    const listed = await client.listTools().catch((e: unknown) => e);
-    expect(listed).toBeInstanceOf(McpError);
-    expect((listed as McpError).code).toBe(SIGN_IN_REQUIRED_CODE);
-    expect((listed as McpError).message).toContain("notes needs sign-in");
+    // No tools rather than an error (a backend may give up on a server whose first
+    // listing fails); the server's instructions, and any call, say why.
+    expect((await client.listTools()).tools).toEqual([]);
+    expect(client.getInstructions()).toContain("notes needs sign-in");
+    const read = await client.request({ method: "resources/list", params: {} }, ResultSchemaLoose).catch((e: unknown) => e);
+    expect((read as McpError).code).toBe(SIGN_IN_REQUIRED_CODE);
     expect(await client.callTool({ name: "whoami", arguments: {} })).toMatchObject({
       isError: true,
       content: [{ text: expect.stringContaining("needs sign-in") }],
@@ -353,9 +356,9 @@ describe("who can use the relay", () => {
     start();
     const { token } = mint(TENANT, "codex");
     for (const server of ["plain", "claudeOnly", "nope"]) expect((await post(server, token, INIT)).status).toBe(404);
-    // gemini-cli's token, the same: notes only.
-    expect(mint(TENANT, "gemini-cli").servers).toEqual(["notes"]);
-    expect(mint(TENANT, "claude").servers).toEqual(["notes", "claudeOnly"]);
+    // gemini-cli's token, the same.
+    expect(mint(TENANT, "gemini-cli").servers).toEqual(["notes", "notes2"]);
+    expect(mint(TENANT, "claude").servers).toEqual(["notes", "notes2", "claudeOnly"]);
   });
 
   it("serves only this host, and not a web page: a remote peer, a foreign Host or Origin is refused", async () => {
@@ -399,7 +402,7 @@ describe("who can use the relay", () => {
   });
 
   it("bounds sessions per token — the least recently used makes room — and request size", async () => {
-    start({ limits: { sessionsPerToken: 2, maxBodyBytes: 4_096 } });
+    start({ limits: { sessionsPerServer: 2, maxBodyBytes: 4_096 } });
     await signIn(TENANT);
     const { token } = mint();
     const first = (await post("notes", token, INIT)).headers.get("mcp-session-id")!;
@@ -438,7 +441,10 @@ describe("a provider's lease", () => {
     await signIn(TENANT);
     const lease = new McpProxyLease(proxy, { tenant: TENANT, sessionId: "s1", backendId: "qwen" });
     const first = lease.renew()!;
-    expect(first.servers).toEqual([{ name: "notes", url: proxy.url("notes") }]);
+    expect(first.servers).toEqual([
+      { name: "notes", url: proxy.url("notes") },
+      { name: "notes2", url: proxy.url("notes2") },
+    ]);
     const second = lease.renew()!;
     expect((await post("notes", first.token, INIT)).status).toBe(403); // the earlier one is revoked
     expect((await post("notes", second.token, INIT)).status).toBe(200);
@@ -453,7 +459,8 @@ describe("codex's shell environment", () => {
   it("excludes codeoid's token variables from the commands codex runs, keeping the user's own excludes", () => {
     const at = (toml: string | null) =>
       codexShellEnvExcludeArgs({ HOME: "/h" }, () => {
-        if (toml === null) throw new Error("ENOENT");
+        if (toml === null) throw Object.assign(new Error("no such file"), { code: "ENOENT" });
+        if (toml === "EACCES") throw Object.assign(new Error("permission denied"), { code: "EACCES" });
         return toml;
       });
     expect(at(null)).toEqual(["-c", 'shell_environment_policy.exclude=["CODEOID_*_TOKEN"]']);
@@ -464,6 +471,7 @@ describe("codex's shell environment", () => {
     // Unreadable here: the user's list can't be kept, so nothing is overridden.
     expect(at("not = [valid")).toBeNull();
     expect(at("d = 1979-05-27T07:32:00Z\n")).toBeNull();
+    expect(at("EACCES")).toBeNull(); // there, but unreadable: same
     expect(codexKeySafe("notes")).toBe(true);
     expect(codexKeySafe("claude.ai Slack")).toBe(false);
     expect(codexKeySafe('x.url="http://evil" #')).toBe(false);
@@ -502,7 +510,7 @@ describe("round-1 findings stay fixed", () => {
   });
 
   it("an initialize the transport would refuse opens nothing upstream", async () => {
-    start({ limits: { sessionsPerToken: 1 } });
+    start({ limits: { sessionsPerServer: 1 } });
     await signIn(TENANT);
     const { token } = mint();
     for (let i = 0; i < 3; i++) expect((await post("notes", token, INIT, { Accept: "application/json" })).status).toBe(406);
@@ -550,8 +558,7 @@ describe("round-1 findings stay fixed", () => {
       isError: true,
       content: [{ text: expect.stringContaining("needs sign-in") }],
     });
-    const listed = await client.listTools().catch((e: unknown) => e);
-    expect((listed as McpError).code).toBe(SIGN_IN_REQUIRED_CODE);
+    expect((await client.listTools()).tools).toEqual([]);
     expect(hub.statusFor("notes", TENANT)).toBeUndefined();
   });
 
@@ -585,5 +592,84 @@ describe("round-1 findings stay fixed", () => {
     expect(names).toContain("whoami");
     expect(await hub.callTool(notes(), "structured", {}, scope)).toEqual({ text: "not structured", isError: false });
     hub.closeAll();
+  });
+});
+
+describe("round-2 findings stay fixed", () => {
+  it("the hub: one call's failure doesn't cut the calls beside it", async () => {
+    start();
+    await signIn(TENANT);
+    const scope = { workspaceId: "w", sessionId: "s", tenant: TENANT };
+    await hub.listTools(notes(), scope);
+    const long = hub.callTool(notes(), "sleep", { ms: 400 }, scope);
+    await Bun.sleep(50);
+    fake.failNextCall = { tool: "whoami", status: 500 };
+    expect(await hub.callTool(notes(), "whoami", {}, { ...scope, sessionId: "s2" })).toMatchObject({ isError: true });
+    expect(await long).toEqual({ text: "slept", isError: false });
+    hub.closeAll();
+  });
+
+  it("the relay: one call's transient failure doesn't cut the calls beside it", async () => {
+    start();
+    await signIn(TENANT);
+    const client = await backend(mint().token);
+    await client.listTools();
+    const long = client.callTool({ name: "sleep", arguments: { ms: 400 } });
+    await Bun.sleep(50);
+    fake.failNextCall = { tool: "whoami", status: 502 };
+    expect(await client.callTool({ name: "whoami", arguments: {} })).toMatchObject({ isError: true });
+    expect(await long).toMatchObject({ content: [{ text: "slept" }] });
+  });
+
+  it("a server that never ends its session can't hold a revoke, or shutdown", async () => {
+    start();
+    await signIn(TENANT);
+    const { token } = mint();
+    const client = await backend(token);
+    await client.listTools();
+    fake.deleteDelayMs = 60_000;
+    // Shutdown: closing the relay waits at most a bounded time for the DELETE.
+    const t0 = Date.now();
+    await proxy.closeAll();
+    expect(Date.now() - t0).toBeLessThan(4_000);
+    expect((await post("notes", token, INIT)).status).toBe(403);
+    // A revoke closes the backend's side at once, whatever the server does.
+    const again = mint();
+    const c2 = await backend(again.token);
+    await c2.listTools();
+    proxy.revoke(again.token);
+    expect(proxy.relayCount).toBe(0);
+  }, 15_000);
+
+  it("the session cap is per server — a backend with many servers keeps them all — and never evicts a busy session", async () => {
+    start({ limits: { sessionsPerServer: 1 } });
+    await signIn(TENANT);
+    const { token } = mint();
+    const a = await backend(token, { server: "notes" });
+    const b = await backend(token, { server: "notes2" });
+    expect(proxy.relayCount).toBe(2);
+    expect(await a.callTool({ name: "whoami", arguments: {} })).toMatchObject({ content: [{ text: "you are user-1" }] });
+    // notes2 is its own server (its own sign-in): its session answers too.
+    expect(await b.callTool({ name: "whoami", arguments: {} })).toMatchObject({ content: [{ text: expect.stringContaining("notes2 needs sign-in") }] });
+    expect(proxy.relayCount).toBe(2);
+    // notes' only session is busy: a new one for notes is refused, not let in by cutting the call.
+    const long = a.callTool({ name: "sleep", arguments: { ms: 400 } });
+    await Bun.sleep(50);
+    expect((await post("notes", token, INIT)).status).toBe(429);
+    expect(await long).toMatchObject({ content: [{ text: "slept" }] });
+  });
+
+  it("bounds the requests one token holds open", async () => {
+    start({ limits: { requestsPerToken: 2 } });
+    await signIn(TENANT);
+    const { token } = mint();
+    const client = await backend(token);
+    await client.listTools();
+    await Bun.sleep(50); // the client's notification stream counts as one
+    const long = client.callTool({ name: "sleep", arguments: { ms: 400 } });
+    await Bun.sleep(50);
+    expect((await post("notes", token, INIT)).status).toBe(429);
+    await long;
+    await until(() => true);
   });
 });

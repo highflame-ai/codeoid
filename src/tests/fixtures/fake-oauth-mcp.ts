@@ -86,6 +86,8 @@ export class FakeOAuthMcp {
   cancelled = 0;
   /** Hold each session DELETE this long (a slow server ending a session). */
   deleteDelayMs = 0;
+  /** Answer the next tools/call for this tool with this HTTP status (a transient failure). */
+  failNextCall: { tool: string; status: number } | null = null;
   #subjectSeq = 0;
 
   constructor(opts: FakeOAuthMcpOptions = {}) {
@@ -234,6 +236,14 @@ export class FakeOAuthMcp {
     }
     this.lastMcpHeaders = req.headers;
     this.stats.mcpCalls++;
+    if (this.failNextCall && method === "tools/call") {
+      const body = (await req.clone().json().catch(() => ({}))) as { params?: { name?: string } };
+      if (body.params?.name === this.failNextCall.tool) {
+        const status = this.failNextCall.status;
+        this.failNextCall = null;
+        return new Response("upstream hiccup", { status });
+      }
+    }
     return this.#protocol(req, who);
   }
 

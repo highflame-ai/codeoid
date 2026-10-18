@@ -701,8 +701,10 @@ export class CodexProvider implements SessionProvider {
       const shellEnv = codexShellEnvExcludeArgs();
       // Without the exclude, the proxy token would reach the commands codex runs.
       const oauth = shellEnv ? this.#proxyMcpSpawn() : { args: [], env: {} };
-      if (!shellEnv && this.#mcpRegistry?.oauthFor(this.id).length) {
-        console.warn("[codeoid] codex: ~/.codex/config.toml couldn't be read here, so OAuth MCP servers aren't mounted (their token would reach the agent's shell)");
+      if (!shellEnv) {
+        console.warn(
+          "[codeoid] codex: its config.toml couldn't be read here, so codeoid can't add its token variables to shell_environment_policy.exclude — OAuth MCP servers aren't mounted, and codeoid's memory/blackboard tokens rely on Codex's default excludes",
+        );
       }
       this.#proc = new CodexRpcProcess({
         command: this.#command,

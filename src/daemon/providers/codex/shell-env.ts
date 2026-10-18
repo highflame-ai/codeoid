@@ -5,9 +5,12 @@
  * the proxy, memory and blackboard tokens), and every command it runs
  * inherits its environment unless `shell_environment_policy` drops a
  * variable. Its default excludes (names containing KEY, SECRET or TOKEN)
- * would — but a user can turn those off. So codeoid always names its own
- * token variables in `exclude`. `-c` replaces the whole list, so the user's
- * own entries are read from their config and passed back with it.
+ * would — but a user can turn those off. So codeoid names its own token
+ * variables in `exclude` whenever it can read the user's config: `-c`
+ * replaces the whole list, so the user's own entries are read from their
+ * config and passed back with it. When it can't, it overrides nothing (the
+ * proxy token isn't given to Codex then; the memory and blackboard tokens
+ * rest on Codex's default excludes, and the daemon says so).
  */
 
 import { readFileSync } from "node:fs";
@@ -31,8 +34,11 @@ export function codexShellEnvExcludeArgs(
   let text: string;
   try {
     text = read(join(home, "config.toml"));
-  } catch {
-    text = ""; // no config: nothing of the user's to keep
+  } catch (e) {
+    // No config: nothing of the user's to keep. Any other failure (no
+    // permission, say) is a config we can't read — same as one we can't parse.
+    if ((e as { code?: string }).code !== "ENOENT") return null;
+    text = "";
   }
   let user: string[] = [];
   try {

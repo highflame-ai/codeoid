@@ -117,8 +117,8 @@ A relay keeps all of that at the MCP layer and still carries the whole protocol:
 
 - **Initialization.** On the backend's `initialize`, the relay connects upstream announcing the backend's own client capabilities, then answers with the upstream server's protocol version, capabilities, server info and instructions. Each hop negotiates its version with the SDK.
 - **Requests, both ways.** The client→server methods MCP defines (`tools/*`, `resources/*`, `prompts/*`, `completion/complete`, `logging/setLevel`) are forwarded through the SDK's `fallbackRequestHandler`; any other method is refused without reaching the server, so a method MCP adds later is opened deliberately. `initialize` and `ping` are answered by the relay itself. Server→client requests (`sampling/createMessage`, `elicitation/create`, `roots/list`) are forwarded to the backend — on the stream of the call that made them — and are possible only because the upstream saw the backend's own capabilities. The server's `_meta` on them is dropped: a backend may read markers there as its own (Codex marks its tool approvals that way).
-- **Notifications, both ways.** Progress, cancellation, `*/list_changed`, `resources/updated` and log messages are relayed; a cancelled request is cancelled upstream; a backend that disconnects cancels its in-flight upstream requests.
-- **Policy at the relay.** A server with a `toolAllowlist` is only those tools here: `tools/list` is filtered, any other `tools/call` is refused, and its resources, prompts and completions are neither advertised nor forwarded. Each request has the session's MCP timeout, which also bounds a server's question to the backend made during it; a request body is capped.
+- **Notifications, both ways.** Progress, cancellation, `*/list_changed`, `resources/updated`, `elicitation/complete` and log messages are relayed (the methods MCP defines, the server's `_meta` dropped as on requests); a cancelled request is cancelled upstream; a backend that disconnects cancels its in-flight upstream requests.
+- **Policy at the relay.** A server with a `toolAllowlist` is only those tools here: `tools/list` is filtered, any other `tools/call` is refused, its resources, prompts and completions are neither advertised nor forwarded, and it can ask the backend something only during one of its calls. Each request has the session's MCP timeout (renewed by progress, up to four times it in all), which also bounds a server's question to the backend made during it; a request body is capped.
 
 Tool calls keep the one approval gate: the backend asks codeoid before each call, as for any other MCP server it mounts.
 The relay adds no second prompt.
@@ -152,7 +152,8 @@ A tunnel on the same host that rewrites `Host` to a loopback name (one way to re
 Once a request is authenticated the daemon's idle-connection cut is lifted for it: a call may stay quiet as long as its tool runs.
 
 **Sign-in, live.**
-A server the tenant hasn't signed in to (or whose credential is lost mid-session, a refresh refused) still initializes, so the backend doesn't mark it failed or start an OAuth flow of its own; a tool call answers with an error result the model reads ("<server> needs sign-in — connect it in Settings"), anything else with a JSON-RPC error saying the same — never an HTTP `401`.
+A server the tenant hasn't signed in to (or whose credential is lost mid-session, a refresh refused) still initializes, so the backend doesn't mark it failed or start an OAuth flow of its own.
+It lists no tools (an error there may make a backend give up on the server for good, and miss the tools a sign-in brings), its instructions say it needs sign-in, a tool call answers with an error result the model reads ("<server> needs sign-in — connect it in Settings"), and anything else with JSON-RPC error `-32011` saying the same — never an HTTP `401`.
 When the tenant signs in, the relay connects upstream on the next request and sends `notifications/tools/list_changed`, so a running Codex, Gemini CLI or Qwen session gets the tools without a restart.
 A session started before the sign-in advertised only tools, so the server's resources and prompts reach it once the backend starts a new session.
 Signing out closes the upstream sessions for that (tenant, server), and the next request gets the sign-in error.
@@ -162,10 +163,12 @@ The registry's servers split cleanly: `forNativeMount` (not OAuth) is mounted by
 A server adopted from Claude's config (#390) is an OAuth registry entry, so it goes through the relay like any other; these backends don't read Claude's config, so there is no CLI copy to deny.
 
 **Limits.**
-At most 8 relay sessions per proxy token: a new one past that closes the least recently used (whose backend re-initializes if it returns), so a backend that opens a session per thread never locks itself out.
-An `initialize` is checked in full (method, protocol version, `Accept`, `Content-Type`) before anything opens upstream, and a request body is capped at 4 MB as it streams in.
-An upstream session idle for 10 minutes — with no request in flight — is closed and reopened on the next request; the backend's own session stays, so an idle agent doesn't see its server go away.
-Everything closes with the token: when the backend is rebuilt or torn down, or the session ends.
+At most 8 relay sessions per proxy token for each server: a new one past that closes the least recently used that isn't mid-call (whose backend re-initializes if it returns), so a backend that opens a session per thread never locks itself out, and a call is never cut to make room.
+At most 32 requests open per token, streams included.
+An `initialize` is checked in full (its schema, `Accept`, `Content-Type`) before anything opens upstream or any session makes room, and a request body is capped at 4 MB as it streams in; the daemon's idle-connection cut is lifted only once the body is in.
+An upstream session idle for 10 minutes — no request in flight, no resource subscription held — is closed and reopened on the next request; the backend's own session stays, so an idle agent doesn't see its server go away.
+Only a session that is itself gone (connection closed, the server forgot it, the network down) is dropped after a failed request; any other failure is that request's alone, and the calls beside it go on. The hub holds its shared sessions to the same rule.
+Everything closes with the token: when the backend is rebuilt or torn down, or the session ends — the backend's side first, and the server's session with a bounded wait for its `DELETE`.
 
 **Observability.**
 The relay records per-tenant status (tools, last error) where the hub does, so Settings shows one status for a server whichever path used it, and logs errors through `cleanMcpError`.
