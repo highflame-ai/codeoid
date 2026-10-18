@@ -172,6 +172,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The capabilities drawer no longer shows credentials from MCP servers' args and URLs** (#394).
+  Its MCP rows (`claude.config`) already left out env and header values, but returned each server's `args` and `url` verbatim, and a Claude config keeps secrets there just as often (`--api-key sk-…`, `--token=…`, `postgres://user:pass@…`, `?api_key=…`, a token in the path).
+  Those are now redacted with the rules codeoid uses for MCP error text, keeping the command, its flags, the host and the path's shape; so are the adopt hint, adopt's errors and its audit rows.
+  Adopting from the drawer still works: it matches the URL as shown.
+
 - **An MCP server that failed when a session started no longer stays failed for the whole session** (#389).
   A Claude session redials its backend's MCP servers on demand (the capabilities drawer's Reconnect button, `/mcp reconnect <server>` in the web UI and TUI, `codeoid mcp reconnect`, or the new `session.mcp_reconnect` message, which needs `session:send`).
   Before each turn it also retries any that are failed or waiting on a sign-in, with backoff.

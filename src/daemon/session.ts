@@ -122,6 +122,7 @@ import { isElicitationTool, isSafeTool, roleDeniesTool } from "./providers/tool-
 import type { PackActivation } from "./pipeline/index.js";
 import type { McpRegistry } from "./mcp/registry.js";
 import { adoptableName, adoptionRefusal, claudeMcpServers, fromRepoFile, shellArg } from "./mcp/adopt.js";
+import { redactMcpUrl, redactSecretText } from "./mcp/redact.js";
 import type { McpHub } from "./mcp/hub.js";
 import type { Attachment } from "../protocol/types.js";
 import { resolveAttachments } from "./attachments.js";
@@ -1842,13 +1843,14 @@ export class Session {
     const one = can[0]!;
     // Adopt counts every entry of the name: another (even one it would refuse)
     // makes it ambiguous, so the URL is named.
-    if (new Set(named.map((c) => c.url)).size > 1) return { command: `codeoid mcp adopt ${name} ${session} --url=${shellArg(one.url!)}` };
+    // The URL as shown (its credentials hidden): adopt matches that form too.
+    if (new Set(named.map((c) => c.url)).size > 1) return { command: `codeoid mcp adopt ${name} ${session} --url=${shellArg(redactMcpUrl(one.url!))}` };
     if (one.scope !== "workdir") return { command: `codeoid mcp adopt ${name}` };
     // A project's own server: naming its address is the consent — so say who chose it.
     if (fromRepoFile(one)) {
       return {
-        command: `codeoid mcp adopt ${name} ${session} --url=${shellArg(one.url!)}`,
-        note: `Its address (${new URL(one.url!).href}) was chosen by this project's ${basename(one.path)}: adopt it only if you trust it.`,
+        command: `codeoid mcp adopt ${name} ${session} --url=${shellArg(redactMcpUrl(one.url!))}`,
+        note: `Its address (${redactMcpUrl(new URL(one.url!).href)}) was chosen by this project's ${basename(one.path)}: adopt it only if you trust it.`,
       };
     }
     return { command: `codeoid mcp adopt ${name} ${session}` };
@@ -7489,37 +7491,14 @@ const MCP_ERROR_SCAN_CHARS = 2_000;
  * text comes from the server, so it's cut before any pattern runs.
  */
 export function cleanMcpError(raw: string): string {
-  const s = raw
-    .slice(0, MCP_ERROR_SCAN_CHARS)
-    // Invisible characters go (so they can't split a token past the rules
-    // below); control characters become spaces.
-    .replace(/[\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]+/g, "")
-    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ")
-    // scheme://user:pass@ — any scheme, a password with a raw @ included
-    .replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^/\s]*@/gi, "$1…@")
-    // PEM blocks, JWTs
-    .replace(/-----BEGIN [A-Z ]+-----[\s\S]*?(?:-----END [A-Z ]+-----|$)/g, "…")
-    .replace(/\beyJ[\w-]+\.[\w-]+(?:\.[\w-]*)?/g, "…")
-    // Authorization schemes
-    .replace(/\b(digest)\s+[^\r\n]*/gi, "$1 …")
-    .replace(/\b(bearer|basic|token)[\s:=]+[^\s"',;)]+/gi, "$1 …")
-    // key=value, key: value, "key": "value", "key" => {…} — the key may carry a prefix (access_token, client_secret, x-api-key)
-    .replace(
-      /(^|[^a-z0-9])([\w-]*(?:token|secret|password|passwd|pwd|api[_-]?key|apikey|key|pat|auth|credentials?|sig|signature|session(?:_?id)?|cookie|code))(["']?\s*(?:=>|[=:]|%3[dD])\s*)("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[{[][^}\]]{0,200}[}\]]?|[^\s"',;)}]+)/gi,
-      "$1$2$3…",
-    )
-    // well-known key formats (codeoid's own ZeroID keys first)
-    .replace(
-      /\b(?:zid_sk_\w{8,}|hf_(?:sk_)?\w{8,}|sk-[\w-]{8,}|sk_[a-z]+_\w{8,}|gh[pousr]_\w{8,}|github_pat_\w{8,}|glpat-[\w-]{16,}|npm_\w{30,}|xox[abprs]-[\w-]{8,}|AKIA[0-9A-Z]{16}|AIza[\w-]{20,})/g,
-      "…",
-    )
-    // long token-like path segments, then query strings and fragments
-    .replace(/(?<![/:])\/[A-Za-z0-9_.~+%-]{24,}(?=[/\s?#"'),;\]>:]|$)/g, "/…")
-    .replace(/(\b[a-z][a-z0-9+.-]*:\/\/[^\s?#"']+)[?#][^\s"'),;\]>]*/gi, "$1?…")
-    // Backstop for whatever the rules above don't know: a long run of token
-    // characters mixing letters and digits is a credential more often than a
-    // diagnostic. Hostnames (dotted) and words are left alone.
-    .replace(/[A-Za-z0-9+=_-]{20,}/g, (run) => (/[A-Za-z]/.test(run) && /\d/.test(run) ? "…" : run));
+  const s = redactSecretText(
+    raw
+      .slice(0, MCP_ERROR_SCAN_CHARS)
+      // Invisible characters go (so they can't split a token past the rules
+      // in redactSecretText); control characters become spaces.
+      .replace(/[\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]+/g, "")
+      .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " "),
+  );
   return s.length > 300 ? `${s.slice(0, 300)}…` : s;
 }
 
