@@ -32,6 +32,10 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import type { LoginBackend, PendingBackendLogin } from "../../protocol/types.js";
+import { mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { stripClaudeCredentials } from "../claude-accounts.js";
 import { buildSubprocessEnv } from "../providers/env.js";
 
 /** Longest we hold a started attempt open before killing it. */
@@ -176,6 +180,8 @@ interface Attempt {
   exitCode: number | null;
   /** Woken on every chunk of output and on exit, so waiters can re-test. */
   wake: (() => void)[];
+  /** Throwaway Claude config dir an isolated login ran against — removed on dispose. */
+  isolatedDir?: string;
 }
 
 export interface LoginOutcome {
@@ -184,7 +190,16 @@ export interface LoginOutcome {
   secret?: { key: string; value: string };
   /** Redacted, user-safe. Present on failure. */
   error?: string;
+  /**
+   * The attempt ran against a throwaway config dir for a NAMED account. Its
+   * credential belongs to that account only and must never be written where
+   * the daemon's own login lives (`~/.codeoid/.env`).
+   */
+  isolated?: boolean;
 }
+
+/** Prefix of the throwaway config dirs isolated logins run against. */
+const ISOLATED_DIR_PREFIX = "codeoid-claude-login-";
 
 /**
  * Holds at most one in-flight login per backend.
@@ -200,6 +215,12 @@ export class BackendLoginBroker {
 
   constructor(flows: Record<string, LoginFlow> = FLOWS) {
     this.#flows = flows;
+    sweepStaleIsolatedDirs();
+  }
+
+  /** Is this attempt still open (a code can still be submitted to it)? */
+  isOpen(loginId: string): boolean {
+    return this.#byId.has(loginId);
   }
 
   /**
@@ -209,7 +230,15 @@ export class BackendLoginBroker {
    * reloads the page must not be locked out by their own abandoned attempt, and
    * two live logins for one backend would race to write the same credential.
    */
-  async start(backend: LoginBackend): Promise<PendingBackendLogin> {
+  /**
+   * `isolated`: run the command against a THROWAWAY Claude config dir with no
+   * inherited credential variables. `claude setup-token` also writes the
+   * config dir's stored login, so a login for a second, named account
+   * (claude-accounts.ts) must never touch the machine's own: it would replace
+   * the personal sign-in every unaccounted session runs on. Only the token the
+   * command prints is kept; the dir is deleted when the attempt ends.
+   */
+  async start(backend: LoginBackend, opts: { isolated?: boolean } = {}): Promise<PendingBackendLogin> {
     const flow = this.#flows[backend];
     if (!flow) throw new BackendLoginError(`No interactive login for backend '${backend}'.`);
 
@@ -223,7 +252,14 @@ export class BackendLoginBroker {
     const superseded = this.#byBackend.get(backend);
     if (superseded) this.cancel(superseded);
 
-    const child = spawnUnderPty(resolved.file, resolved.args);
+    const isolatedDir = opts.isolated ? mkdtempSync(join(tmpdir(), ISOLATED_DIR_PREFIX)) : undefined;
+    let child: ChildProcess;
+    try {
+      child = spawnUnderPty(resolved.file, resolved.args, isolatedDir);
+    } catch (err) {
+      if (isolatedDir) rmSync(isolatedDir, { recursive: true, force: true });
+      throw err;
+    }
     const loginId = randomUUID();
     const attempt: Attempt = {
       loginId,
@@ -238,6 +274,7 @@ export class BackendLoginBroker {
       exited: false,
       exitCode: null,
       wake: [],
+      ...(isolatedDir ? { isolatedDir } : {}),
     };
     // `unref` so a forgotten attempt cannot hold the process open at shutdown.
     attempt.ttlTimer.unref?.();
@@ -298,12 +335,21 @@ export class BackendLoginBroker {
   /**
    * Hand the vendor's code to the waiting command and wait for the exchange.
    *
-   * Terminal either way — the attempt is disposed before returning, so a
-   * rejected code means starting again rather than retrying into a process
-   * whose state we can no longer describe.
+   * Terminal once the code reached the command — the attempt is disposed
+   * before returning, so a rejected code means starting again rather than
+   * retrying into a process whose state we can no longer describe. A code
+   * refused before it was sent (malformed) leaves the attempt open: check
+   * `isOpen`.
    */
   async submit(loginId: string, code: string): Promise<LoginOutcome> {
     const attempt = this.#byId.get(loginId);
+    if (!attempt) return this.#exchange(loginId, attempt, code);
+    const isolated = attempt.isolatedDir !== undefined;
+    const outcome = await this.#exchange(loginId, attempt, code);
+    return isolated ? { ...outcome, isolated: true } : outcome;
+  }
+
+  async #exchange(loginId: string, attempt: Attempt | undefined, code: string): Promise<LoginOutcome> {
     if (!attempt) {
       return { ok: false, error: "That sign-in attempt is no longer open. Start again." };
     }
@@ -417,6 +463,41 @@ export class BackendLoginBroker {
     // Drop the transcript: it is the one place a credential sits in memory
     // longer than the exchange needs it.
     attempt.transcript = "";
+    if (attempt.isolatedDir) {
+      const dir = attempt.isolatedDir;
+      attempt.isolatedDir = undefined;
+      const remove = () => rmSync(dir, { recursive: true, force: true });
+      remove();
+      // The command may still be writing as it dies (the kill is a signal, not
+      // a wait): remove again once it has actually gone.
+      if (attempt.child.exitCode === null && attempt.child.signalCode === null) attempt.child.once("exit", remove);
+    }
+  }
+}
+
+/**
+ * Remove isolated login dirs a previous daemon left behind (it crashed or was
+ * killed mid-login): each can hold a full Claude credential. Only dirs older
+ * than an attempt can live, so a concurrently running daemon's live attempt is
+ * never touched.
+ */
+function sweepStaleIsolatedDirs(): void {
+  const root = tmpdir();
+  let names: string[];
+  try {
+    names = readdirSync(root);
+  } catch {
+    return;
+  }
+  const cutoff = Date.now() - ATTEMPT_TTL_MS;
+  for (const name of names) {
+    if (!name.startsWith(ISOLATED_DIR_PREFIX)) continue;
+    const dir = join(root, name);
+    try {
+      if (statSync(dir).mtimeMs < cutoff) rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // Gone already, or not ours to remove.
+    }
   }
 }
 
@@ -435,9 +516,17 @@ export class BackendLoginBroker {
  * would orphan the command it wrapped, which for a login command means an
  * abandoned OAuth attempt still holding a pty.
  */
-function spawnUnderPty(file: string, args: string[]): ChildProcess {
+function spawnUnderPty(file: string, args: string[], isolatedConfigDir?: string): ChildProcess {
+  const inherited = buildSubprocessEnv({ prefixes: ["ANTHROPIC_", "CLAUDE_", "LC_"] });
+  if (isolatedConfigDir) {
+    // A named-account login: nothing of the daemon's own credential may reach
+    // it, and it writes into its own config dir only.
+    const stripped = stripClaudeCredentials(inherited);
+    for (const k of Object.keys(inherited)) if (!(k in stripped)) delete inherited[k];
+    inherited.CLAUDE_CONFIG_DIR = isolatedConfigDir;
+  }
   const env = {
-    ...buildSubprocessEnv({ prefixes: ["ANTHROPIC_", "CLAUDE_", "LC_"] }),
+    ...inherited,
     // A login command tries to open a browser. On the machine a daemon runs on
     // that is at best useless and at worst a browser nobody asked for on
     // someone's desktop — the user opens the URL we return, on their own

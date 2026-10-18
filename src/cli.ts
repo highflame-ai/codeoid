@@ -44,6 +44,8 @@ import {
 } from "./protocol/types.js";
 import { ALL_SCOPES_STRING } from "./protocol/scopes.js";
 import { TerminalClient } from "./terminal/client.js";
+import { formatClaudeAccounts, parseHeaderFlags } from "./terminal/claude-accounts.js";
+import type { ClientMessage, DaemonMessage, SessionInfo } from "./protocol/types.js";
 import { mcpConfig, mcpHeaders } from "./terminal/mcp-control-cli.js";
 import { cleartextOffHost, controlUrl, MCP_SCOPE_PRESETS, TokenError } from "./terminal/token.js";
 import { parseTargets } from "./terminal/compare.js";
@@ -456,6 +458,145 @@ program
     client.disconnect();
   });
 
+// ── Claude accounts (several subscriptions / gateways — claude-accounts.ts) ──
+
+const account = program
+  .command("account")
+  .description("Claude accounts: several subscriptions or gateway tokens, a default, and a per-session choice");
+
+/** Run one account request against the daemon and print the result. */
+async function accountRequest(build: (id: string) => ClientMessage, onOk?: (resp: DaemonMessage) => void): Promise<void> {
+  const config = loadConfig();
+  const client = new TerminalClient(config);
+  await client.connect();
+  const resp = await client.request(build(randomUUID()));
+  client.disconnect();
+  if (resp.type === "response.error") {
+    console.error(`Error: ${resp.error}`);
+    process.exitCode = 1;
+    return;
+  }
+  if (resp.type === "claude.accounts.result") console.log(formatClaudeAccounts(resp.accounts, resp.defaultAccount));
+  onOk?.(resp);
+}
+
+account
+  .command("ls")
+  .description("List Claude accounts and the daemon default")
+  .action(() => accountRequest((id) => ({ type: "claude.accounts.list", id })));
+
+account
+  .command("login <name>")
+  .description("Sign a Claude Pro/Max subscription in as account <name> (runs claude setup-token; never touches your own claude login)")
+  .action(async (name: string) => {
+    const config = loadConfig();
+    const client = new TerminalClient(config);
+    await client.connect();
+    const started = await client.request({ type: "backend.login.start", id: randomUUID(), backend: "claude", account: name });
+    if (started.type !== "backend.login.start.result") {
+      client.disconnect();
+      console.error(`Error: ${started.type === "response.error" ? started.error : started.type}`);
+      process.exit(1);
+    }
+    console.log(`\nOpen this URL in a browser signed in to the account you want as "${name}":\n\n  ${started.login.verificationUrl}\n`);
+    console.log(started.login.codeHint);
+    const code = await readSecret("Code: ");
+    const done = await client.request({ type: "backend.login.submit", id: randomUUID(), loginId: started.login.loginId, code });
+    client.disconnect();
+    if (done.type === "backend.login.submit.result" && done.ok) {
+      console.log(`Signed in. Claude account "${name}" is ready — use it with: codeoid account use <session> ${name}`);
+    } else {
+      console.error(`Error: ${done.type === "backend.login.submit.result" ? (done.error ?? "sign-in failed") : done.type === "response.error" ? done.error : done.type}`);
+      process.exit(1);
+    }
+  });
+
+account
+  .command("add-gateway <name>")
+  .description("Add an Anthropic-compatible gateway account (its token is read from a prompt or stdin, never the command line)")
+  .requiredOption("--base-url <url>", "the gateway's base URL (https)")
+  .option("--header <header>", 'extra request header, repeatable: "Name" (value asked for without echo — keeps it out of shell history and ps) or "Name: value" for a non-secret one', (v: string, prev: string[] = []) => [...prev, v], [] as string[])
+  .action(async (name: string, o: { baseUrl: string; header: string[] }) => {
+    let parsed: ReturnType<typeof parseHeaderFlags>;
+    try {
+      parsed = parseHeaderFlags(o.header ?? []);
+    } catch (err) {
+      console.error((err as Error).message);
+      process.exit(1);
+    }
+    if (parsed.ask.length > 0 && !process.stdin.isTTY) {
+      console.error('A header value can only be asked for on a terminal; with piped input, pipe the token and pass "Name: value".');
+      process.exit(1);
+    }
+    const headers = parsed.headers;
+    for (const h of parsed.ask) headers[h] = (await readSecret(`Value for header ${h}: `)).trim();
+    const token = (await readSecret("Gateway token: ")).trim();
+    await accountRequest((id) => ({
+      type: "claude.accounts.set",
+      id,
+      name,
+      kind: "gateway",
+      token,
+      baseUrl: o.baseUrl,
+      ...(Object.keys(headers).length > 0 ? { headers } : {}),
+    }));
+  });
+
+account
+  .command("add-token <name>")
+  .description("Add an account from a token you already have: a subscription token (sk-ant-oat01-…, from claude setup-token) or, with --api-key, an Anthropic API key. Read from a prompt or stdin.")
+  .option("--api-key", "the token is an Anthropic API key, not a subscription token")
+  .action(async (name: string, o: { apiKey?: boolean }) => {
+    const token = (await readSecret(o.apiKey ? "Anthropic API key: " : "Subscription token (sk-ant-oat01-…): ")).trim();
+    await accountRequest((id) => ({ type: "claude.accounts.set", id, name, kind: o.apiKey ? "api-key" : "subscription", token }));
+  });
+
+account
+  .command("rm <name>")
+  .description("Remove a Claude account (sessions on it refuse to run until switched)")
+  .action((name: string) => accountRequest((id) => ({ type: "claude.accounts.remove", id, name })));
+
+account
+  .command("default <name>")
+  .description('Set the daemon default account — every session that hasn\'t chosen its own switches on its next turn ("default" = the daemon\'s own environment)')
+  .action((name: string) => accountRequest((id) => ({ type: "claude.accounts.set_default", id, name })));
+
+account
+  .command("use <session> [name]")
+  .description(
+    'Switch a session to account <name> from its next turn, keeping the conversation ("default" = your own login, whatever the daemon default is; --follow-default = track the daemon default)',
+  )
+  .option("--follow-default", "follow the daemon default instead of pinning an account (omit <name>)")
+  .action(async (session: string, name: string | undefined, o: { followDefault?: boolean }) => {
+    if ((name === undefined) === !o.followDefault) {
+      console.error("Give an account name, or --follow-default — not both.");
+      process.exit(1);
+    }
+    const config = loadConfig();
+    const client = new TerminalClient(config);
+    await client.connect();
+    const sessionId = await client.resolveSessionId(session);
+    if (!sessionId) {
+      client.disconnect();
+      process.exit(1);
+    }
+    const resp = await client.request({
+      type: "session.set_claude_account",
+      id: randomUUID(),
+      sessionId,
+      account: o.followDefault ? null : (name as string),
+    });
+    client.disconnect();
+    if (resp.type === "response.error") {
+      console.error(`Error: ${resp.error}`);
+      process.exit(1);
+    }
+    const info = (resp as { data?: SessionInfo }).data;
+    console.log(
+      `Session "${session}" runs on Claude account "${info?.effectiveClaudeAccount ?? name}"${o.followDefault ? " (following the daemon default)" : ""} from its next turn.`,
+    );
+  });
+
 program
   .command("new <name> [workdir]")
   .description("Create a new agent session. With --worktree, auto-spawns a git worktree.")
@@ -474,6 +615,10 @@ program
   .option(
     "--provider <id>",
     "Agent backend for this session (claude | codex | gemini-cli | pi | openai | gemini). Default: the daemon's default.",
+  )
+  .option(
+    "--account <name>",
+    "Claude account to run this session on (see `codeoid account ls`). Default: the daemon default account.",
   )
   .option(
     "--model <id>",
@@ -506,6 +651,7 @@ program
         repo?: string;
         worktreeDir?: string;
         provider?: string;
+        account?: string;
         model?: string;
         pack?: string;
         packRole?: string;
@@ -561,6 +707,7 @@ program
       await client.createSession(name, resolvedWorkdir, {
         providerId: opts.provider,
         model: opts.model,
+        claudeAccount: opts.account,
         pack: opts.pack,
         packRole: opts.packRole,
         collaboration,

@@ -73,6 +73,13 @@ export interface BackendLoginStartMsg {
   type: "backend.login.start";
   id: string;
   backend: LoginBackend;
+  /**
+   * Store the resulting credential as this named Claude account
+   * (claude-accounts.ts) instead of the daemon's single default token. The
+   * login runs against a throwaway Claude config dir so it can never replace
+   * the machine's own `claude login`.
+   */
+  account?: string;
 }
 
 /**
