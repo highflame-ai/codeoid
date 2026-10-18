@@ -107,7 +107,7 @@ async function readClaudeJson(
   workdir: string,
 ): Promise<{ mcpServers: ClaudeConfigMcpServer[] }> {
   const filePath = path.join(home, ".claude.json");
-  const content = await safeReadFile(filePath);
+  const content = await safeReadFile(filePath, MAX_CLAUDE_JSON_BYTES);
   if (content == null) return { mcpServers: [] };
   let parsed: unknown;
   try {
@@ -406,10 +406,13 @@ async function safeReaddir(
 /** Largest config file read: one bigger is no one's hand-written config, and
  *  a repo's file shouldn't cost the daemon seconds to describe. */
 const MAX_CONFIG_BYTES = 1_000_000;
+/** ~/.claude.json is the user's own and also holds Claude Code's per-project
+ *  history, so it can run to megabytes: a ceiling, not the repo-file cap. */
+const MAX_CLAUDE_JSON_BYTES = 64_000_000;
 
-async function safeReadFile(p: string): Promise<string | null> {
+async function safeReadFile(p: string, maxBytes = MAX_CONFIG_BYTES): Promise<string | null> {
   try {
-    if ((await fs.stat(p)).size > MAX_CONFIG_BYTES) return null;
+    if ((await fs.stat(p)).size > maxBytes) return null;
     return await fs.readFile(p, "utf-8");
   } catch {
     return null;

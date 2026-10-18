@@ -255,6 +255,12 @@ describe("bounded", () => {
     writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { huge: { command: "x", args: ["y".repeat(1_100_000)] } } }));
     const { servers } = await rows(manager());
     expect(servers.find((s) => s.name === "huge")).toBeUndefined();
+    // ...but the user's own ~/.claude.json (which also holds Claude Code's
+    // history) is read however big it has grown.
+    const own = JSON.parse(readFileSync(join(home, ".claude.json"), "utf8")) as Record<string, unknown>;
+    writeFileSync(join(home, ".claude.json"), JSON.stringify({ ...own, history: "h".repeat(2_000_000) }));
+    const again = await rows(manager());
+    expect(again.servers.find((s) => s.name === "notes")).toBeDefined();
   });
 
   it("hostile args, URLs and text cost little to clean — at the limit and past it", () => {
