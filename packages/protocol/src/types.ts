@@ -1969,6 +1969,10 @@ export interface ClaudeConfigMcpServer {
    * config, which codeoid would then sign in to (`mcp.adopt`).
    */
   adoptable?: true;
+  /** codeoid could adopt it, but only by its full URL (#394): a project's
+   *  server whose URL has parts hidden here. Adopt it from the CLI with
+   *  `--url`, copied from the file at `path`. */
+  adoptByFullUrl?: true;
   /** codeoid has adopted it: its registry signs in to this URL, and Claude
    *  sessions use that copy rather than the CLI's. */
   adopted?: true;

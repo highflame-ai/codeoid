@@ -1604,8 +1604,11 @@ mcpHub: this.#mcpHub,
           ...(fromRepoFile(s) ? { projectFile: true as const } : {}),
           ...(adopted
             ? { adopted: true as const }
-            : urlsByName.get(s.name)!.size === 1 && this.#offerAdoption(s, snapshot.mcpServers, liveStatus, auth)
-              ? { adoptable: true as const }
+            : urlsByName.get(s.name)!.size === 1
+              ? (() => {
+                  const offer = this.#offerAdoption(s, snapshot.mcpServers, liveStatus, auth);
+                  return offer === "drawer" ? { adoptable: true as const } : offer === "full-url" ? { adoptByFullUrl: true as const } : {};
+                })()
               : {}),
         };
       });
@@ -2486,18 +2489,22 @@ mcpHub: this.#mcpHub,
    * the backend reports `needs-auth` (a sign-in the CLI can't run). A server
    * that's merely down, or not yet reported, isn't offered.
    */
-  #offerAdoption(s: ClaudeConfigMcpServer, all: readonly ClaudeConfigMcpServer[], liveStatus: string | undefined, auth: AuthContext): boolean {
+  #offerAdoption(
+    s: ClaudeConfigMcpServer,
+    all: readonly ClaudeConfigMcpServer[],
+    liveStatus: string | undefined,
+    auth: AuthContext,
+  ): "drawer" | "full-url" | null {
     // Only to someone adopt would accept, and only what adopt would take.
-    if (!this.#mcpOAuth || !this.#mcpRegistry || s.liveOnly) return false;
+    if (!this.#mcpOAuth || !this.#mcpRegistry || s.liveOnly) return null;
     // A sign-in that the CLI can't run — not any failure: a server that's
-    // merely down would only lose its working copy everywhere. Checked
-    // first: adoptionRefusal scans every entry, and a repo's file can hold
-    // thousands.
-    if (liveStatus !== "needs-auth") return false;
-    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE) || auth.delegationDepth > 0) return false;
-    // The drawer has only the URL as shown, which can't adopt this one.
-    if (fullUrlRequired(s)) return false;
-    return !adoptionRefusal(s, all, this.#mcpRegistry, this.#daemonOrigins());
+    // merely down would only lose its working copy everywhere.
+    if (liveStatus !== "needs-auth") return null;
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE) || auth.delegationDepth > 0) return null;
+    if (adoptionRefusal(s, all, this.#mcpRegistry, this.#daemonOrigins())) return null;
+    // The drawer has only the URL as shown, which can't adopt a project's
+    // URL with parts hidden: that one is adopted by its full URL, from the file.
+    return fullUrlRequired(s) ? "full-url" : "drawer";
   }
 
   /**

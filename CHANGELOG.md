@@ -177,9 +177,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Commands and args are no longer sent at all: a server shows its program's name and how many args it has, a hook its program's name (`curl …`), and the drawer points at the file for the full text.
   A URL is shown from the URL parser's own reading, so the host is always the one it resolves to and is never hidden; userinfo, the query, the fragment and any path segment that isn't a plain word (an id, a key, `;key=value`) are hidden.
   The adopt hint, adopt's errors and its audit rows, transport errors in Settings' MCP list, and MCP tool-call errors in the daemon log and the transcript are redacted too; hook matchers, env and header key names are bounded and redacted.
-  A settings or `.mcp.json` file over 1 MB is shown as one "(file too large)" row instead of being read, since the CLI still loads it; `~/.claude.json`, which also holds Claude Code's history, is read however big it grows.
-  Adopting from the drawer still works: it matches the URL as shown, except for a project's server whose URL has parts hidden, which is adopted only by its full URL (consent to `https://host/…/mcp` isn't consent to the tenant a repo put behind the `…`).
-  The drawer's adopt check now runs only for servers that need a sign-in, so a repo file of thousands of servers no longer stalls the daemon when it opens.
+  A settings or `.mcp.json` file over 1 MB is shown as one "(file too large)" row instead of being read, since the CLI still loads it; `~/.claude.json`, which also holds Claude Code's history, is read up to 64 MB.
+  Adopting from the drawer still works: it matches the URL as shown, except for a project's server whose URL has parts hidden, which is adopted only by its full URL (consent to `https://host/…/mcp` isn't consent to the tenant a repo put behind the `…`); the drawer says so and how.
+  The drawer's adopt check runs only for servers that need a sign-in, against an index built once per look, so a repo file of thousands of servers no longer stalls the daemon when it opens.
 
 - **An MCP server that failed when a session started no longer stays failed for the whole session** (#389).
   A Claude session redials its backend's MCP servers on demand (the capabilities drawer's Reconnect button, `/mcp reconnect <server>` in the web UI and TUI, `codeoid mcp reconnect`, or the new `session.mcp_reconnect` message, which needs `session:send`).

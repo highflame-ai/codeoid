@@ -468,6 +468,12 @@ const McpList: Component<{ items: ClaudeConfigMcpServer[]; sessionId: string | n
             <Show when={m.adopted}>
               <AdoptedSignIn server={m.name} />
             </Show>
+            <Show when={m.adoptByFullUrl}>
+              <div class="mt-1 text-[11px] text-fg-muted">
+                To sign in with codeoid, adopt it by its full URL, copied from this project's file (parts of it are hidden here):{" "}
+                <code class="font-mono">codeoid mcp adopt {m.name} --session &lt;this session&gt; --url &lt;full URL&gt;</code>
+              </div>
+            </Show>
             <Show when={m.note}>
               <div class="mt-1 text-[11px] text-fg-muted">{m.note}</div>
             </Show>
