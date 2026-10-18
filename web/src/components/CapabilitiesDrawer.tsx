@@ -21,6 +21,9 @@ import {
 } from "solid-js";
 
 import { claudeConfig, fetchClaudeConfig, reconnectMcpServer } from "../state/claude-config";
+import { adoptAndSignIn, mcpOAuthState } from "../state/mcp-oauth";
+import { fetchSettings, settingsState } from "../state/settings";
+import { McpOAuthControls } from "./McpOAuthControls";
 import { focusedSessionId } from "../state/sessions";
 import { relativeTime } from "../lib/format";
 import type {
@@ -340,6 +343,66 @@ const McpReconnect: Component<{ sessionId: string; server: string }> = (props) =
   );
 };
 
+/**
+ * Hand a server's sign-in to codeoid (#390): adopt it from Claude's config,
+ * then start codeoid's sign-in. Shown on a remote server codeoid could adopt —
+ * one the Claude CLI could only sign in to from an interactive terminal.
+ */
+const McpAdopt: Component<{ server: string; url: string | null; path: string; projectFile: boolean }> = (props) => {
+  const st = () => mcpOAuthState();
+  const mine = () => st().server === props.server;
+  const run = async () => {
+    // Daemon-wide and lasting: say so before doing it — and, for a project's
+    // own file, first, that the project chose this address.
+    // The full address, as the browser resolves it: plain ASCII (punycode
+    // host, the rest percent-encoded), so the path that tells two servers on
+    // one host apart is there too.
+    let address = props.url ?? "";
+    try {
+      address = new URL(props.url ?? "").href;
+    } catch {}
+    const origin = props.projectFile ? `This project's own ${props.path} chose this server's address. Adopt it only if you trust that address.\n\n` : "";
+    const ok = window.confirm(
+      `${origin}codeoid will sign in to ${props.server} at ${address} itself. On this whole daemon, Claude sessions stop using the Claude CLI's own copy of it; each account's sessions get codeoid's copy once that account signs in.\n\nContinue?`,
+    );
+    if (!ok) return;
+    const sid = claudeConfig().sessionId;
+    await adoptAndSignIn(props.server, sid, props.url);
+    // The row turns into codeoid's copy, with its sign-in controls.
+    if (sid) await fetchClaudeConfig(sid).catch(() => {});
+  };
+  return (
+    <>
+      <button
+        type="button"
+        class="rounded border border-accent/40 px-2 py-0.5 text-[11px] text-accent hover:bg-accent/10 disabled:opacity-50"
+        title="codeoid signs in to this server itself and serves it to this session's backend — no interactive Claude Code session needed"
+        disabled={mine() && st().phase === "starting"}
+        onClick={() => void run()}
+      >
+        {mine() && st().phase === "starting" ? "Adopting…" : "Sign in with codeoid"}
+      </button>
+      <Show when={mine() && st().error}>
+        <div class="mt-1 basis-full text-[11px] text-danger">{st().error}</div>
+      </Show>
+    </>
+  );
+};
+
+/** Sign-in controls for a server codeoid has adopted: its settings row's own. */
+const AdoptedSignIn: Component<{ server: string }> = (props) => {
+  const status = () => settingsState().snapshot?.mcpServers?.find((s) => s.name === props.server && s.oauth);
+  // Adopted elsewhere (the CLI, another tab) since settings were read: read them again.
+  onMount(() => {
+    if (!status()) void fetchSettings(true);
+  });
+  return (
+    <Show when={status()}>
+      {(s) => <McpOAuthControls server={s()} />}
+    </Show>
+  );
+};
+
 /** Only a server the backend reports as down can be redialed. */
 const canReconnect = (status: string | undefined) => status === "failed" || status === "needs-auth";
 
@@ -393,7 +456,21 @@ const McpList: Component<{ items: ClaudeConfigMcpServer[]; sessionId: string | n
               <Show when={props.sessionId && canReconnect(m.liveStatus)}>
                 <McpReconnect sessionId={props.sessionId!} server={m.name} />
               </Show>
+              <Show when={m.adoptable}>
+                <McpAdopt server={m.name} url={m.url} path={m.path} projectFile={m.projectFile === true} />
+              </Show>
+              <Show when={m.adopted}>
+                <span
+                  class="rounded border border-border px-1 py-0.5 font-mono text-[10px] uppercase tracking-wider text-fg-muted"
+                  title="codeoid signs in to this server; Claude sessions use codeoid's copy, not the Claude CLI's"
+                >
+                  codeoid
+                </span>
+              </Show>
             </div>
+            <Show when={m.adopted}>
+              <AdoptedSignIn server={m.name} />
+            </Show>
             <Show when={m.command}>
               <div class="mt-1 break-all font-mono text-[11px] text-fg-muted">
                 {m.command} {m.args.join(" ")}

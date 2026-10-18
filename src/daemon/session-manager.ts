@@ -25,7 +25,8 @@ import type { HookBus } from "./hooks/bus.js";
 import type { Store } from "./store.js";
 import { createPushTransport, PushService } from "./push/index.js";
 import { hasScope, SCOPES } from "../protocol/scopes.js";
-import { applyPatches, getManifest, getSnapshot, previewPatches } from "./settings/store.js";
+import { applyPatches, getManifest, getSnapshot, previewPatches, readMcpServerEntry, writeMcpServerEntry } from "./settings/store.js";
+import { adoptability, adoptableName, adoptedEntry, adoptionRefusal, claudeMcpServers, fromRepoFile, isSameAdoption } from "./mcp/adopt.js";
 import { canonicalFromTranscript, turnIndexFromHistory } from "./canonical-restore.js";
 import { BackendLoginBroker, BackendLoginError, redact } from "./auth/backend-login.js";
 import { ClaudeAccountError, ClaudeAccountStore, validateAccountName } from "./claude-accounts.js";
@@ -114,12 +115,13 @@ import type { McpRegistry } from "./mcp/registry.js";
 import { redactCommand } from "./skill-command.js";
 import type { McpHub } from "./mcp/hub.js";
 import { mcpOAuthBindingCookieName, type McpOAuth, type McpOAuthProof, type McpTenant } from "./mcp/oauth.js";
-import { isOAuthServer, type McpServerSpec, NATIVE_MOUNT_BACKENDS } from "./mcp/types.js";
+import { isOAuthServer, type McpServerSpec, OAUTH_UNSUPPORTED_BACKENDS } from "./mcp/types.js";
 import { type CodeoidConfig, DEFAULT_PROVIDER_ENV, loadConfig, mutateConfigFile, validateConfigObject } from "../config.js";
 import type { CompressionRegistry } from "./compress/index.js";
 import { ORCHESTRATOR_ROLE } from "../protocol/types.js";
 import type {
   AuthContext,
+  ClaudeConfigMcpServer,
   ClientMessage,
   CollaborationConfig,
   CollaborationCost,
@@ -1235,6 +1237,8 @@ mcpHub: this.#mcpHub,
         return this.#mcpOAuthComplete(msg, auth);
       case "mcp.oauth.disconnect":
         return this.#mcpOAuthDisconnect(msg, auth);
+      case "mcp.adopt":
+        return this.#mcpAdopt(msg, auth);
       case "usage.daily":
         return this.#usageDaily(msg, auth);
       case "routine.create":
@@ -1566,13 +1570,25 @@ mcpHub: this.#mcpHub,
     try {
       const snapshot = await readClaudeConfig(session.workdir);
       const live = session.sdkMcpSnapshot;
+      // A name two entries give different URLs to: which one the backend runs
+      // isn't known here, so neither is offered for adopting.
+      const urlsByName = new Map<string, Set<string | null>>();
+      for (const s of snapshot.mcpServers) urlsByName.set(s.name, (urlsByName.get(s.name) ?? new Set()).add(s.url));
       const mcpServers = snapshot.mcpServers.map((s) => {
         const liveStatus = live.status.get(s.name);
         const liveTools = live.tools.get(s.name);
+        const spec = this.#mcpRegistry?.get(s.name);
+        const adopted = spec !== undefined && isOAuthServer(spec) && spec.transport.kind === "http" && spec.transport.url === s.url;
         return {
           ...s,
           ...(liveStatus !== undefined ? { liveStatus } : {}),
           ...(liveTools !== undefined ? { liveTools } : {}),
+          ...(fromRepoFile(s) ? { projectFile: true as const } : {}),
+          ...(adopted
+            ? { adopted: true as const }
+            : urlsByName.get(s.name)!.size === 1 && this.#offerAdoption(s, snapshot.mcpServers, liveStatus, auth)
+              ? { adoptable: true as const }
+              : {}),
         };
       });
       // Servers the backend runs that no config file here declares — the
@@ -1836,7 +1852,7 @@ mcpHub: this.#mcpHub,
   #oauthStatus(spec: McpServerSpec, auth: AuthContext): NonNullable<McpServerStatus["oauth"]> {
     return {
       status: this.#mcpOAuth?.status(spec, tenantOf(auth)) ?? "disconnected",
-      unsupportedBackends: NATIVE_MOUNT_BACKENDS.filter(
+      unsupportedBackends: OAUTH_UNSUPPORTED_BACKENDS.filter(
         (b) => spec.backends === undefined || spec.backends.includes(b),
       ),
     };
@@ -2432,6 +2448,132 @@ mcpHub: this.#mcpHub,
       requestId: msg.id,
       snapshot: { ...getSnapshot(), mcpServers: this.#mcpServerStatuses(auth) },
     };
+  }
+
+  /** The origins this daemon's own HTTP endpoints are reached at. */
+  #daemonOrigins(): string[] {
+    return [this.#blackboardUrl, this.#config?.daemonUrl, this.#config?.mcpOAuth?.redirectBaseUrl].filter((u): u is string => Boolean(u));
+  }
+
+  /**
+   * Whether the drawer offers "Sign in with codeoid" for a row: only to a
+   * caller adopt would accept, only for what adopt would take, and only when
+   * the backend reports `needs-auth` (a sign-in the CLI can't run). A server
+   * that's merely down, or not yet reported, isn't offered.
+   */
+  #offerAdoption(s: ClaudeConfigMcpServer, all: readonly ClaudeConfigMcpServer[], liveStatus: string | undefined, auth: AuthContext): boolean {
+    // Only to someone adopt would accept, and only what adopt would take.
+    if (!this.#mcpOAuth || !this.#mcpRegistry || s.liveOnly) return false;
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE) || auth.delegationDepth > 0) return false;
+    if (adoptionRefusal(s, all, this.#mcpRegistry, this.#daemonOrigins())) return false;
+    // A sign-in that the CLI can't run — not any failure: a server that's
+    // merely down would only lose its working copy everywhere.
+    return liveStatus === "needs-auth";
+  }
+
+  /**
+   * Adopt a remote server from Claude's own config into codeoid's registry
+   * (#390): the same URL with codeoid's OAuth sign-in, written to config.json
+   * and live in the registry at once — every session, provider and the hub
+   * read it from there; a Claude session rebuilds its query on its next turn
+   * to mount codeoid's copy and deny the CLI's. The URL comes from Claude's
+   * config, never from the client. `settings:write`, plus an owned session
+   * when one is named (its workdir's servers are looked in).
+   */
+  async #mcpAdopt(msg: Extract<ClientMessage, { type: "mcp.adopt" }>, auth: AuthContext): Promise<DaemonMessage> {
+    let workdir: string | null = null;
+    let source = "";
+    let url = "";
+    // Every outcome is on the record, as who asked and from where.
+    const audit = (outcome: string) =>
+      this.#store.audit(
+        auth.sub,
+        "mcp.adopt",
+        msg.sessionId ?? "",
+        `server=${JSON.stringify(msg.server)} outcome=${outcome}${url ? ` url=${JSON.stringify(url)}` : ""}${workdir ? ` workdir=${JSON.stringify(workdir)}` : ""}${source ? ` source=${JSON.stringify(source)}` : ""}`,
+      );
+    const fail = (outcome: string, error: string, code: "invalid_request" | "not_found" | "forbidden" | "internal" = "invalid_request"): DaemonMessage => {
+      audit(outcome);
+      return { type: "response.error", requestId: msg.id, error, code };
+    };
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return fail("forbidden", "Missing scope: settings:write", "forbidden");
+    // It changes the daemon-wide registry and config: the account's own, not a token handed on.
+    if (auth.delegationDepth > 0) return fail("refused", "A delegated token can't adopt MCP servers.", "forbidden");
+    const registry = this.#mcpRegistry;
+    if (!registry || !this.#mcpOAuth) return fail("unavailable", "OAuth for MCP servers is not available on this daemon.", "internal");
+    let session: Session | null = null;
+    if (msg.sessionId !== undefined) {
+      session = this.#getOwnedSession(msg.sessionId, auth);
+      if (!session) return fail("not_found", "Session not found", "not_found");
+      workdir = session.workdir;
+    }
+    const name = msg.server;
+    const named = adoptableName(name);
+    if (!named.ok) return fail("refused", named.reason);
+
+    // Which entry: the one at the URL the caller was shown, else the only one.
+    const all = await claudeMcpServers(workdir);
+    const candidates = all.filter((c) => c.name === name);
+    const atUrl = msg.url !== undefined ? candidates.filter((c) => c.url === msg.url) : candidates;
+    if (atUrl.length === 0) {
+      return fail(
+        "not_found",
+        msg.url !== undefined
+          ? `Claude's config has no MCP server ${JSON.stringify(name)} at that URL`
+          : `Claude's config has no MCP server named ${JSON.stringify(name)}${workdir ? "" : " (for a project's server, name its session)"}`,
+        "not_found",
+      );
+    }
+    if (new Set(atUrl.map((c) => c.url)).size > 1) {
+      return fail("ambiguous", `${JSON.stringify(name)} names more than one server in Claude's config (${atUrl.map((c) => c.url ?? c.command).join(", ")}); say which URL`);
+    }
+    const found = atUrl[0]!;
+    source = found.path;
+    url = found.url ?? "";
+    const can = adoptability(found);
+    if (!can.ok) return fail("refused", can.reason);
+    const refusal = adoptionRefusal(found, all, registry, this.#daemonOrigins());
+    if (refusal) return fail("refused", refusal);
+    // A repo's file can name any address (and the CLI connects it unasked):
+    // adopted only when the caller names the URL — consent to that address.
+    if (fromRepoFile(found) && msg.url === undefined) {
+      return fail("unconfirmed", `${name} comes from this project's own files, which chose its address; to adopt it, name that URL (${can.url})`);
+    }
+    const reply = (alreadyAdopted: boolean): DaemonMessage => ({
+      type: "mcp.adopt.result",
+      requestId: msg.id,
+      server: name,
+      alreadyAdopted,
+      snapshot: { ...getSnapshot(), mcpServers: this.#mcpServerStatuses(auth) },
+    });
+    let configured: Record<string, unknown> | undefined;
+    try {
+      configured = readMcpServerEntry(name);
+    } catch (err) {
+      return fail("error", `config.json is not valid JSON: ${redact(err instanceof Error ? err.message : String(err))}`, "internal");
+    }
+    if (configured) {
+      if (isSameAdoption(configured, can.url)) {
+        audit("already");
+        return reply(true);
+      }
+      // A server the user configured for codeoid by hand is theirs to change.
+      return fail("conflict", `codeoid's config already has a server named ${JSON.stringify(name)}; change or remove it there first`);
+    }
+    const { entry, raw } = adoptedEntry(can.url);
+    let spec: McpServerSpec;
+    try {
+      const written = writeMcpServerEntry(name, entry);
+      if (!written.ok) return fail("error", written.error);
+      spec = registry.upsert(name, raw);
+    } catch (err) {
+      return fail("error", redact(err instanceof Error ? err.message : String(err)));
+    }
+    // Any client held for the old entry (a plain copy imported from ~/.claude.json).
+    this.#mcpHub?.drop(spec.name);
+    url = new URL(can.url).href;
+    audit(`adopted${fromRepoFile(found) ? " projectFile=true" : ""}`);
+    return reply(false);
   }
 
   /**

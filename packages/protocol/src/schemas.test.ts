@@ -147,6 +147,7 @@ const samples: { [T in ClientTypes]: Extract<ClientMessage, { type: T }> } = {
     callbackUrl: "http://127.0.0.1:7400/mcp/oauth/callback?code=c&state=s",
   },
   "mcp.oauth.disconnect": { type: "mcp.oauth.disconnect", id: "r92", server: "notion" },
+  "mcp.adopt": { type: "mcp.adopt", id: "r93", server: "notion", sessionId: "s1" },
   "skill.grant": { type: "skill.grant", id: "r93", workdir: "/tmp/w", command: "./probe.sh", allowed: true },
   "session.turns": { type: "session.turns", id: "r94", sessionId: "s1" },
   "session.approvals": { type: "session.approvals", id: "r94a", sessionId: "s1" },

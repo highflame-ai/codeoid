@@ -488,6 +488,8 @@ describe("DaemonMessage routing", () => {
           return `mcp.oauth.complete:${msg.server}`;
         case "mcp.oauth.disconnect.result":
           return "mcp.oauth.disconnect";
+        case "mcp.adopt.result":
+          return `mcp.adopt:${msg.server}`;
         case "pipeline.snapshot":
           return `pipeline:${msg.pipeline.id}`;
         case "pipeline.list.result":

@@ -780,6 +780,84 @@ export class TerminalClient {
   }
 
   /**
+   * `codeoid mcp adopt` (#390): put a remote server from Claude's own config
+   * into codeoid's registry, signed in by codeoid. With a session, its
+   * workdir's servers (a `.mcp.json`, project entries) are looked in too.
+   */
+  async mcpAdopt(server: string, sessionIdOrName?: string, url?: string): Promise<void> {
+    let sessionId: string | undefined;
+    if (sessionIdOrName !== undefined) {
+      sessionId = (await this.#resolveSession(sessionIdOrName)) ?? undefined;
+      if (!sessionId) return;
+    }
+    const resp = await this.#request({ type: "mcp.adopt", id: randomUUID(), server, ...(sessionId ? { sessionId } : {}), ...(url ? { url } : {}) });
+    if (resp.type !== "mcp.adopt.result") {
+      this.#printError(resp);
+      process.exitCode = 1;
+      return;
+    }
+    const signedIn = resp.snapshot.mcpServers?.find((s) => s.name === server)?.oauth?.status === "connected";
+    console.log(
+      resp.alreadyAdopted ? `${S(server)} is already codeoid's.` : `${S(server)} is codeoid's now; Claude sessions use codeoid's copy from their next turn once you've signed in.`,
+    );
+    if (!signedIn) console.log(`Sign in to it: codeoid mcp signin ${S(server)}`);
+  }
+
+  /**
+   * `codeoid mcp signin` (#390): sign in to an OAuth server in codeoid's
+   * registry. Prints the address to open; after the sign-in the browser lands
+   * on the daemon's page, whose address is pasted back here — the daemon
+   * finishes a sign-in on its own only for the browser the web UI started it
+   * from. `callbackUrl` finishes one started earlier, without a terminal.
+   */
+  async mcpSignin(server: string, callbackUrl?: string): Promise<void> {
+    if (callbackUrl) {
+      await this.#finishMcpSignin(callbackUrl);
+      return;
+    }
+    // Discovery and client registration are a few round trips to the provider.
+    const begun = await this.#request({ type: "mcp.oauth.begin", id: randomUUID(), server }, 45_000);
+    if (begun.type !== "mcp.oauth.begin.result") {
+      this.#printError(begun);
+      process.exitCode = 1;
+      return;
+    }
+    if (begun.status === "connected" || !begun.url) {
+      console.log(`${S(server)} is signed in.`);
+      return;
+    }
+    console.log(`Open this address to sign in to ${S(server)}:\n\n  ${begun.url}\n`);
+    console.log("After signing in, the browser lands on a codeoid page; copy that page's address.");
+    if (!process.stdin.isTTY) {
+      console.log(`Then finish with: codeoid mcp signin ${S(server)} --callback-url '<that address>'`);
+      return;
+    }
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const pasted = await new Promise<string>((resolve) => {
+      rl.once("close", () => resolve(""));
+      rl.question("Paste it here: ", resolve);
+    });
+    rl.close();
+    if (!pasted.trim()) {
+      console.error(`Not signed in. Finish later with: codeoid mcp signin ${S(server)} --callback-url '<that address>'`);
+      process.exitCode = 1;
+      return;
+    }
+    await this.#finishMcpSignin(pasted.trim());
+  }
+
+  /** Finish a sign-in from the address its browser landed on (the tenant that began it only). */
+  async #finishMcpSignin(callbackUrl: string): Promise<void> {
+    const finished = await this.#request({ type: "mcp.oauth.complete", id: randomUUID(), callbackUrl }, 45_000);
+    if (finished.type !== "mcp.oauth.complete.result") {
+      this.#printError(finished);
+      process.exitCode = 1;
+      return;
+    }
+    console.log(`${S(finished.server)} is signed in.`);
+  }
+
+  /**
    * `codeoid compare run` (#357): fork one branch per target, send each the
    * prompt, and (unless `wait` is false) wait for all of them, then print them
    * side by side, numbered for `compare keep`.
@@ -1275,7 +1353,7 @@ export class TerminalClient {
     this.#printError(resp);
   }
 
-  #request(msg: ClientMessage): Promise<DaemonMessage> {
+  #request(msg: ClientMessage, timeoutMs = 30_000): Promise<DaemonMessage> {
     return new Promise((resolve, reject) => {
       if (!this.#ws || this.#ws.readyState !== WebSocket.OPEN) {
         reject(new Error("Not connected"));
@@ -1285,7 +1363,7 @@ export class TerminalClient {
       const timeout = setTimeout(() => {
         this.#pending.delete(msg.id);
         reject(new Error("Request timeout"));
-      }, 30_000);
+      }, timeoutMs);
 
       this.#pending.set(msg.id, (resp) => {
         clearTimeout(timeout);

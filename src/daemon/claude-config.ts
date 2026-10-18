@@ -83,9 +83,11 @@ export async function readClaudeConfig(workdir: string): Promise<ClaudeConfigSna
 
   const agents = dedupByPath(agentsLists.flat());
   const skills = dedupByPath(skillsLists.flat());
+  // The same name in two files is two entries, both shown: a repo's file must
+  // not hide the user's own entry of that name (it could stand in for it).
   const mcpServers = dedupBy(
     [...settingsLists.flatMap((s) => s.mcpServers), ...claudeJson.mcpServers],
-    (m) => `${m.scope}:${m.name}`,
+    (m) => `${m.scope}:${m.name}:${m.path}`,
   );
   const hooks = settingsLists.flatMap((s) => s.hooks);
 

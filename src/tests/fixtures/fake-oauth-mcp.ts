@@ -35,6 +35,10 @@ export class FakeOAuthMcp {
   readonly mcpUrl: string;
   /** Counters tests assert on. */
   readonly stats = { registrations: 0, codeExchanges: 0, refreshes: 0, mcpCalls: 0, unauthorized: 0 };
+  /** When set, the token endpoint answers with this HTTP status (an outage) instead. */
+  tokenOutage: number | null = null;
+  /** Every MCP request: who sent it, whether its token was valid, and the JSON-RPC method. */
+  readonly mcpLog: Array<{ userAgent: string; authorized: boolean; method: string }> = [];
   /** The last /authorize query, for asserting PKCE / resource / scope. */
   lastAuthorize: URLSearchParams | undefined;
   /** Headers of the last authorized MCP request. */
@@ -133,6 +137,7 @@ export class FakeOAuthMcp {
   }
 
   async #token(req: Request): Promise<Response> {
+    if (this.tokenOutage !== null) return new Response("<html>upstream unavailable</html>", { status: this.tokenOutage, headers: { "content-type": "text/html" } });
     const form = new URLSearchParams(await req.text());
     const grant = form.get("grant_type");
     if (grant === "authorization_code") {
@@ -175,6 +180,12 @@ export class FakeOAuthMcp {
     const auth = req.headers.get("authorization") ?? "";
     const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
     const who = this.#access.get(token);
+    const method = await req
+      .clone()
+      .json()
+      .then((b) => (b as { method?: string }).method ?? "?")
+      .catch(() => req.method);
+    this.mcpLog.push({ userAgent: req.headers.get("user-agent") ?? "", authorized: Boolean(who), method });
     if (!who) {
       this.stats.unauthorized++;
       return new Response("unauthorized", {

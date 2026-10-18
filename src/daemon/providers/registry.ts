@@ -237,6 +237,7 @@ export function createDefaultProviderRegistry(
         fleet: init.fleet,
         blackboardMcp: init.blackboardMcp,
         mcpRegistry: init.mcpRegistry,
+        mcpHub: init.mcpHub,
         config: init.config,
         compressionRegistry: init.compressionRegistry,
         onModels: init.onModels,

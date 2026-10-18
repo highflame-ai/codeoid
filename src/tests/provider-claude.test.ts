@@ -98,8 +98,9 @@ import {
   skillSandboxDirs,
   packPluginsOption,
   pluginSkillDirs,
-  mcpToolPrefix,
+  withoutServers,
 } from "../daemon/providers/claude/index.js";
+import { mcpToolPrefix } from "../daemon/mcp/types.js";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -820,6 +821,36 @@ describe("ClaudeProvider – reconnecting an MCP server (#389)", () => {
     mcpReconnectError = null;
     mcpStatuses = [];
     expect((await p.reconnectMcpServer("nope"))?.error).toContain('no MCP server named "nope"');
+    await done();
+  });
+
+  it("doesn't redial the CLI's own copy of a server codeoid signs in to now (#390)", async () => {
+    const { McpServerSchema } = await import("../config.js");
+    const { McpRegistry } = await import("../daemon/mcp/registry.js");
+    const p = new ClaudeProvider({
+      sessionId: "test-session",
+      initialBackingId: "test-backing",
+      workspaceId: "ws_test",
+      mcpRegistry: new McpRegistry({ notes: McpServerSchema.parse({ url: "https://notes.example.com/mcp", oauth: true }) }, { memoryEnabled: false }),
+      store: {
+        audit: () => {},
+        getClaudeCodeSessionId: () => null,
+        setClaudeCodeSessionId: () => {},
+        getSkillCommandGrants: () => new Map<string, boolean>(),
+        setSkillCommandGrant: () => {},
+      } as never,
+    });
+    const done = await live(p);
+    mcpReconnects.length = 0;
+    // The query was built before it was adopted: the CLI still runs its copy, at that URL.
+    mcpStatuses = [{ name: "notes", status: "needs-auth", config: { type: "http", url: "https://notes.example.com/mcp" } }];
+    expect(await p.reconnectMcpServer("notes")).toEqual({ status: "needs-auth", tools: [], codeoidOwned: true });
+    expect(mcpReconnects).toEqual([]);
+    // Another server of the same name, at another URL, is not codeoid's: redialed as usual.
+    mcpStatuses = [{ name: "notes", status: "needs-auth", config: { type: "http", url: "https://elsewhere.example.com/mcp" } }];
+    expect((await p.reconnectMcpServer("notes"))?.codeoidOwned).toBeUndefined();
+    expect(mcpReconnects).toEqual(["notes"]);
+    mcpStatuses = [];
     await done();
   });
 
@@ -1720,6 +1751,126 @@ describe("ClaudeProvider – runTurn with mocked SDK", () => {
     // If hooks were invoked, events were emitted into the turn queue
     // (may or may not be in events depending on timing — just verify no throw)
     expect(true).toBe(true);
+  });
+});
+
+describe("ClaudeProvider – OAuth registry servers (#390)", () => {
+  let openGate: () => void = () => {};
+  beforeEach(() => {
+    sdkMessages = [];
+    sdkThrowError = null;
+    capturedQueryOpts = null;
+    queryCallCount = 0;
+    sdkGate = new Promise<void>((r) => {
+      openGate = r;
+    });
+  });
+
+  it("leaves a server codeoid owns out of the user servers it passes, by URL", () => {
+    const user = {
+      notes: { type: "http", url: "https://notes.example.com/mcp" },
+      renamed: { type: "http", url: "https://tracker.example.com/mcp" },
+      other: { type: "http", url: "https://other.example.com/mcp" },
+      local: { command: "node", args: [] },
+    } as never;
+    // By URL, not by name: another server called "notes" elsewhere is not codeoid's.
+    expect(Object.keys(withoutServers(user, ["https://notes.example.com/mcp", "https://tracker.example.com/mcp"]))).toEqual(["other", "local"]);
+    expect(withoutServers(user, [])).toBe(user);
+  });
+
+  it("never mounts codeoid's copy over the user's own server of that name; drops the user's copy at codeoid's URL", async () => {
+    const { McpServerSchema } = await import("../config.js");
+    const { McpRegistry } = await import("../daemon/mcp/registry.js");
+    const provider = new ClaudeProvider({
+      sessionId: "test-session",
+      initialBackingId: "test-backing",
+      workspaceId: "ws_test",
+      tenant: { accountId: "acc", projectId: "proj" },
+      mcpRegistry: new McpRegistry(
+        {
+          github: McpServerSchema.parse({ url: "https://attacker.example/mcp", oauth: true }),
+          my_tracker: McpServerSchema.parse({ url: "https://tracker.attacker.example/mcp", oauth: true }),
+          notes: McpServerSchema.parse({ url: "https://notes.example.com/mcp", oauth: true }),
+        },
+        { memoryEnabled: false },
+      ),
+      mcpHub: { signedIn: () => true, credentialStamp: () => "1" } as never,
+      // This workdir's own config: its own github elsewhere, and the CLI's copy of notes.
+      userMcpServers: () =>
+        ({
+          github: { type: "http", url: "https://api.githubcopilot.com/mcp" },
+          "My-Tracker": { type: "http", url: "https://tracker.internal/mcp" },
+          notes: { type: "http", url: "https://notes.example.com/mcp" },
+        }) as never,
+      store: {
+        audit: () => {},
+        getClaudeCodeSessionId: () => null,
+        setClaudeCodeSessionId: () => {},
+        getSkillCommandGrants: () => new Map<string, boolean>(),
+        setSkillCommandGrant: () => {},
+      } as never,
+    });
+    provider.runTurn({ history: [], userMessage: "t1", workdir: "/tmp", canUseTool: async () => ({ behavior: "allow" as const }) });
+    const servers = (capturedQueryOpts?.options as { mcpServers?: Record<string, { type?: string; url?: string }> }).mcpServers!;
+    expect(servers.github).toMatchObject({ type: "http", url: "https://api.githubcopilot.com/mcp" }); // theirs stays
+    expect(servers.my_tracker).toBeUndefined(); // nor beside a look-alike of theirs
+    expect(servers.notes).toMatchObject({ type: "sdk" }); // codeoid's, the CLI's copy (same URL) dropped
+    openGate();
+    await provider.teardown();
+  });
+
+  it("mounts codeoid's copy once signed in, denies the CLI's, and rebuilds on a sign-in change", async () => {
+    const { McpServerSchema } = await import("../config.js");
+    const { McpRegistry } = await import("../daemon/mcp/registry.js");
+    const registry = new McpRegistry({ notes: McpServerSchema.parse({ url: "https://notes.example.com/mcp", oauth: true }) }, { memoryEnabled: false });
+    let signedIn = false;
+    let stamp = "1";
+    const hub = { signedIn: () => signedIn, credentialStamp: () => (signedIn ? stamp : undefined) } as never;
+    const provider = new ClaudeProvider({
+      sessionId: "test-session",
+      initialBackingId: "test-backing",
+      workspaceId: "ws_test",
+      tenant: { accountId: "acc", projectId: "proj" },
+      mcpRegistry: registry,
+      mcpHub: hub,
+      store: {
+        audit: () => {},
+        getClaudeCodeSessionId: () => null,
+        setClaudeCodeSessionId: () => {},
+        getSkillCommandGrants: () => new Map<string, boolean>(),
+        setSkillCommandGrant: () => {},
+      } as never,
+    });
+    const turn = (msg: string) =>
+      provider.runTurn({ history: [], userMessage: msg, workdir: "/tmp", canUseTool: async () => ({ behavior: "allow" as const }) });
+    const options = () =>
+      capturedQueryOpts?.options as {
+        mcpServers?: Record<string, { type?: string; url?: string }>;
+        settings?: { deniedMcpServers?: Array<{ serverUrl?: string }> };
+      };
+
+    // Adopted, not signed in yet: no mount, but the CLI's own copy is denied.
+    turn("t1");
+    expect(options().settings?.deniedMcpServers).toEqual([{ serverUrl: "https://notes.example.com/mcp" }]);
+    expect(options().mcpServers?.notes).toBeUndefined();
+
+    turn("t2");
+    expect(queryCallCount).toBe(1); // nothing changed: warm
+
+    signedIn = true;
+    turn("t3");
+    expect(queryCallCount).toBe(2); // the sign-in rebuilt it (same conversation, resumed)
+    expect(options().mcpServers?.notes).toMatchObject({ type: "sdk" });
+    turn("t4");
+    expect(queryCallCount).toBe(2); // nothing changed: warm
+    // Signed out and back in between turns (say after a revoked token): a
+    // fresh connection, though "signed in" reads the same either side.
+    stamp = "2";
+    turn("t5");
+    expect(queryCallCount).toBe(3);
+
+    openGate();
+    await provider.teardown();
   });
 });
 

@@ -93,17 +93,30 @@ export class McpHub {
    *  that fails to list returns [] (its tools are hidden, not presented-and-broken).
    *  An OAuth server lists with the tenant's credential, so `scope` must carry it. */
   async listTools(spec: McpServerSpec, scope?: McpCallScope): Promise<McpToolDef[]> {
+    return this.listToolsOrThrow(spec, scope).catch(() => []);
+  }
+
+  /**
+   * List a server's tools, or throw why not (not signed in, a revoked token,
+   * a server down, a timeout) — for a caller that reports the failure itself,
+   * like Claude's in-process mount (#390), where an empty list would read as a
+   * healthy server with no tools. Timed like a call.
+   */
+  async listToolsOrThrow(spec: McpServerSpec, scope?: McpCallScope): Promise<McpToolDef[]> {
+    const key = clientKey(spec, scope?.tenant);
     try {
       const client = this.#clientFor(spec, scope?.tenant);
-      const all = await client.listTools();
+      const all = await withTimeout(client.listTools(), this.#timeoutMs, `${spec.name}/tools/list`);
       const tools = spec.toolAllowlist ? all.filter((t) => spec.toolAllowlist?.includes(t.name)) : all;
-      this.#status.set(clientKey(spec, scope?.tenant), { tools: tools.map((t) => t.name) });
+      this.#status.set(key, { tools: tools.map((t) => t.name) });
       return tools;
     } catch (e) {
-      // Not having signed in is not a fault of the server.
-      if (!(e instanceof McpSignInRequired)) this.#status.set(clientKey(spec, scope?.tenant), { tools: [], error: errMsg(e) });
-      this.#drop(clientKey(spec, scope?.tenant));
-      return [];
+      // Not having signed in is not a fault of the server: no health to
+      // record — and the tool list from before is gone with the credential.
+      if (e instanceof McpSignInRequired) this.#status.delete(key);
+      else this.#status.set(key, { tools: [], error: errMsg(e) });
+      this.#drop(key);
+      throw e;
     }
   }
 
@@ -145,6 +158,26 @@ export class McpHub {
    *  pass `tenant` for one; another tenant's errors and tools are not shown. */
   statusFor(name: string, tenant?: McpTenant): { tools: string[]; error?: string } | undefined {
     return this.#status.get(tenantKey(name, tenant));
+  }
+
+  /**
+   * Whether calls to this server can be made as `tenant` now: always for a
+   * server without OAuth; for an OAuth one, only once the tenant has signed in
+   * (a stored credential, no network call). Lets a backend that lists a
+   * server's tools up front leave out one that would only fail.
+   */
+  signedIn(spec: McpServerSpec, tenant: McpTenant | undefined): boolean {
+    if (!isOAuthServer(spec)) return true;
+    if (!tenant || !this.#credentials?.signedIn) return false;
+    return this.#credentials.signedIn(spec, tenant);
+  }
+
+  /** Changes whenever the tenant's credential for an OAuth server does; "" for
+   *  a server without OAuth, undefined when not signed in. */
+  credentialStamp(spec: McpServerSpec, tenant: McpTenant | undefined): string | undefined {
+    if (!isOAuthServer(spec)) return "";
+    if (!tenant) return undefined;
+    return this.#credentials?.credentialStamp?.(spec, tenant);
   }
 
   /** Whether a live client is currently held for this server (for `tenant`,

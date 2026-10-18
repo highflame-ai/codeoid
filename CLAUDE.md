@@ -176,6 +176,8 @@ codeoid destroy <n>
 codeoid mcp config [--scopes observe|operate|full]  # MCP client entry for /mcp/control
 codeoid mcp headers [--scopes …]                    # fresh bearer header (an MCP headersHelper)
 codeoid mcp reconnect <session> <server>            # redial a backend MCP server that's down (#389)
+codeoid mcp adopt <server> [--session <s>] [--url <u>]  # codeoid signs in to a server from Claude's config (#390)
+codeoid mcp signin <server> [--callback-url <u>]        # sign in to an OAuth registry server
 codeoid routine add <name> --prompt … [--cron|--every|--at] [--check <cmd>]  # scheduled agent runs
 codeoid routine ls | show | runs | run [--wait] | edit | pause | resume | rm | cancel <runId> | token | preview
 ```
