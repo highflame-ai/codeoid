@@ -391,7 +391,7 @@ describe("GeminiAcpProvider — VWS memory mount (#178 Phase 2)", () => {
     const token = notes.headers.find((h) => h.name === "Authorization")!.value.replace(/^Bearer /, "");
     const ask = () =>
       proxy.handle(new Request(proxy.url("notes"), { method: "POST", headers: { Authorization: `Bearer ${token}`, Host: "127.0.0.1:7400" }, body: "{}" }), true);
-    expect((await ask()).status).toBe(400); // a live token
+    expect((await ask()).status).not.toBe(403); // a live token
     await p.teardown();
     expect((await ask()).status).toBe(403); // revoked with the backend
   });

@@ -116,9 +116,9 @@ A byte forwarder would have to re-implement, outside the protocol, what the toke
 A relay keeps all of that at the MCP layer and still carries the whole protocol:
 
 - **Initialization.** On the backend's `initialize`, the relay connects upstream announcing the backend's own client capabilities, then answers with the upstream server's protocol version, capabilities, server info and instructions. Each hop negotiates its version with the SDK.
-- **Every request, both ways.** Client→server requests (`tools/*`, `resources/*`, `prompts/*`, `completion/complete`, `logging/setLevel`, `ping`, and methods added later) are forwarded generically through the SDK's `fallbackRequestHandler`. Server→client requests (`sampling/createMessage`, `elicitation/create`, `roots/list`) are forwarded to the backend, and are possible only because the upstream saw the backend's own capabilities.
+- **Requests, both ways.** The client→server methods MCP defines (`tools/*`, `resources/*`, `prompts/*`, `completion/complete`, `logging/setLevel`) are forwarded through the SDK's `fallbackRequestHandler`; any other method is refused without reaching the server, so a method MCP adds later is opened deliberately. `initialize` and `ping` are answered by the relay itself. Server→client requests (`sampling/createMessage`, `elicitation/create`, `roots/list`) are forwarded to the backend — on the stream of the call that made them — and are possible only because the upstream saw the backend's own capabilities. The server's `_meta` on them is dropped: a backend may read markers there as its own (Codex marks its tool approvals that way).
 - **Notifications, both ways.** Progress, cancellation, `*/list_changed`, `resources/updated` and log messages are relayed; a cancelled request is cancelled upstream; a backend that disconnects cancels its in-flight upstream requests.
-- **Policy at the relay.** The server's `toolAllowlist` filters `tools/list` and refuses any other `tools/call`; each request has the session's MCP timeout; a request body is capped.
+- **Policy at the relay.** A server with a `toolAllowlist` is only those tools here: `tools/list` is filtered, any other `tools/call` is refused, and its resources, prompts and completions are neither advertised nor forwarded. Each request has the session's MCP timeout, which also bounds a server's question to the backend made during it; a request body is capped.
 
 Tool calls keep the one approval gate: the backend asks codeoid before each call, as for any other MCP server it mounts.
 The relay adds no second prompt.
@@ -142,14 +142,19 @@ It must not reach the agent's shell:
 - the Gemini CLI and Qwen get it as a header in their MCP config, which their SDKs pass in-process;
 - Codex reads it through `bearer_token_env_var`, and the provider adds that variable to Codex's `shell_environment_policy.exclude`, so commands Codex runs don't inherit it (never on argv, which any local process can read).
 
-A command that reads the backend's own process memory or config can still find it; that already needs an approved shell call, and the token works only on the loopback relay, for that session's servers, until the backend is rebuilt.
+If the user's Codex config can't be read here (to keep their own excludes), OAuth servers aren't mounted on Codex rather than risk the token reaching its commands.
+A command can still read the backend's own process: Codex's environment through `/proc/<pid>/environ` (readable by the same user, and `cat` or `grep` may need no approval there), the Gemini CLI's or Qwen's memory with more effort.
+That's the limit of keeping it from a process the agent's commands run beside; what bounds it is the token's reach — the loopback relay, that session's servers, until the backend is rebuilt — and that using it needs a network call, which is approved like any other.
 
 **Reachability.**
-The relay answers only loopback peers, even when the daemon binds wide, and refuses a request whose `Origin` or `Host` isn't loopback (the SDK's DNS-rebinding protection), so a web page can't drive it.
+The relay answers only loopback peers, even when the daemon binds wide, and refuses a request whose `Origin` or `Host` isn't loopback, so a web page can't drive it (DNS rebinding included).
+A tunnel on the same host that rewrites `Host` to a loopback name (one way to reach a daemon for the Telegram Mini App) makes remote requests look local; then the 256-bit token alone guards the relay.
+Once a request is authenticated the daemon's idle-connection cut is lifted for it: a call may stay quiet as long as its tool runs.
 
 **Sign-in, live.**
-A server the tenant hasn't signed in to (or whose token was refused) still initializes, so the backend doesn't mark it failed or start an OAuth flow of its own; `tools/list` and every call return a JSON-RPC error the model can read ("<server> needs sign-in — connect it in Settings"), never an HTTP `401`.
+A server the tenant hasn't signed in to (or whose credential is lost mid-session, a refresh refused) still initializes, so the backend doesn't mark it failed or start an OAuth flow of its own; a tool call answers with an error result the model reads ("<server> needs sign-in — connect it in Settings"), anything else with a JSON-RPC error saying the same — never an HTTP `401`.
 When the tenant signs in, the relay connects upstream on the next request and sends `notifications/tools/list_changed`, so a running Codex, Gemini CLI or Qwen session gets the tools without a restart.
+A session started before the sign-in advertised only tools, so the server's resources and prompts reach it once the backend starts a new session.
 Signing out closes the upstream sessions for that (tenant, server), and the next request gets the sign-in error.
 
 **One copy per backend.**
@@ -157,8 +162,9 @@ The registry's servers split cleanly: `forNativeMount` (not OAuth) is mounted by
 A server adopted from Claude's config (#390) is an OAuth registry entry, so it goes through the relay like any other; these backends don't read Claude's config, so there is no CLI copy to deny.
 
 **Limits.**
-At most 8 relay sessions per proxy token and a 4 MB cap on a request body.
-An upstream session idle for 10 minutes is closed and reopened on the next request; the backend's own session stays, so an idle agent doesn't see its server go away.
+At most 8 relay sessions per proxy token: a new one past that closes the least recently used (whose backend re-initializes if it returns), so a backend that opens a session per thread never locks itself out.
+An `initialize` is checked in full (method, protocol version, `Accept`, `Content-Type`) before anything opens upstream, and a request body is capped at 4 MB as it streams in.
+An upstream session idle for 10 minutes — with no request in flight — is closed and reopened on the next request; the backend's own session stays, so an idle agent doesn't see its server go away.
 Everything closes with the token: when the backend is rebuilt or torn down, or the session ends.
 
 **Observability.**

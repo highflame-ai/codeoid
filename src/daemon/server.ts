@@ -628,7 +628,11 @@ export class DaemonServer {
         if (url.pathname.startsWith(MCP_PROXY_PATH_PREFIX)) {
           const proxy = self.#mcpProxy;
           if (!proxy) return new Response("not found", { status: 404 });
-          return proxy.handle(req, isLoopbackAddress(server.requestIP(req)?.address));
+          return proxy.handle(req, isLoopbackAddress(server.requestIP(req)?.address), {
+            // A relayed call may stay quiet as long as its tool runs (or a
+            // person answers the server): not the daemon's 10 s idle cut.
+            liftIdleTimeout: () => server.timeout(req, 0),
+          });
         }
 
         // Outward control plane (#251). Authorizes with the SAME verifier as

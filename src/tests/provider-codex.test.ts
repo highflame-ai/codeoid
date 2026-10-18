@@ -1043,7 +1043,7 @@ describe("CodexProvider over fake-codex", () => {
       new Request(proxy.url("notes"), { method: "POST", headers: { Authorization: `Bearer ${seen.proxyToken}`, Host: "127.0.0.1:7400" }, body: "{}" }),
       true,
     );
-    expect(live.status).toBe(400); // known token (not 403); the body just isn't an initialize
+    expect(live.status).not.toBe(403); // a known token: refused only for what it sent
     await p.teardown();
     const revoked = await proxy.handle(
       new Request(proxy.url("notes"), { method: "POST", headers: { Authorization: `Bearer ${seen.proxyToken}`, Host: "127.0.0.1:7400" }, body: "{}" }),

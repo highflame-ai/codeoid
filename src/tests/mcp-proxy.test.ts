@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import {
+  ResultSchema as ResultSchemaLoose,
   CreateMessageRequestSchema,
   ElicitRequestSchema,
   McpError,
@@ -33,9 +34,10 @@ import {
 } from "../daemon/mcp/proxy.js";
 import { McpRegistry } from "../daemon/mcp/registry.js";
 import type { McpServerSpec } from "../daemon/mcp/types.js";
-import { codexShellEnvExcludeArgs } from "../daemon/providers/codex/shell-env.js";
+import { codexKeySafe, codexShellEnvExcludeArgs } from "../daemon/providers/codex/shell-env.js";
 import { Store } from "../daemon/store.js";
 import { FAKE_TOOL_NAMES, FakeOAuthMcp } from "./fixtures/fake-oauth-mcp.js";
+import { ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 
 const TENANT: McpTenant = { accountId: "acc-1", projectId: "proj-1" };
 const OTHER: McpTenant = { accountId: "acc-2", projectId: "proj-2" };
@@ -55,7 +57,7 @@ const clients: Client[] = [];
 const raw = (p: Partial<RawMcpServerConfig>): RawMcpServerConfig =>
   ({ args: [], env: {}, headers: {}, trust: "prompt", scope: "session", enabled: true, native: false, ...p }) as RawMcpServerConfig;
 
-function start(opts: { allow?: string[]; limits?: Partial<McpProxyLimits> } = {}): void {
+function start(opts: { allow?: string[]; limits?: Partial<McpProxyLimits>; idleSeconds?: number; timeoutMs?: number } = {}): void {
   registry = new McpRegistry(
     {
       notes: raw({ url: fake.mcpUrl, oauth: true, ...(opts.allow ? { tools: opts.allow } : {}) }),
@@ -68,11 +70,15 @@ function start(opts: { allow?: string[]; limits?: Partial<McpProxyLimits> } = {}
   daemon = Bun.serve({
     port: 0,
     hostname: "127.0.0.1",
+    // The daemon's idle-connection cut (10 s there).
+    idleTimeout: opts.idleSeconds ?? 10,
     // The daemon's route, as server.ts mounts it.
     fetch: (req, server) => {
       const url = new URL(req.url);
       if (!url.pathname.startsWith(MCP_PROXY_PATH_PREFIX)) return new Response("not found", { status: 404 });
-      return proxy.handle(req, peerIsLoopback && isLoopbackAddress(server.requestIP(req)?.address));
+      return proxy.handle(req, peerIsLoopback && isLoopbackAddress(server.requestIP(req)?.address), {
+        liftIdleTimeout: () => server.timeout(req, 0),
+      });
     },
   });
   proxy = new McpProxy({
@@ -81,7 +87,7 @@ function start(opts: { allow?: string[]; limits?: Partial<McpProxyLimits> } = {}
     hub,
     baseUrl: () => `http://127.0.0.1:${daemon.port}`,
     env: {},
-    requestTimeoutMs: 5_000,
+    requestTimeoutMs: opts.timeoutMs ?? 5_000,
     limits: opts.limits,
   });
   hub.proxy = proxy;
@@ -207,11 +213,15 @@ describe("the relay carries the whole protocol", () => {
 
   it("carries the server's own requests to the backend: elicitation and sampling, during the call that made them", async () => {
     start();
+    const elicitMeta: unknown[] = [];
     await signIn(TENANT);
     const client = await backend(mint().token, {
       capabilities: { elicitation: {}, sampling: {} },
       setup: (c) => {
-        c.setRequestHandler(ElicitRequestSchema, async () => ({ action: "accept", content: { ok: true } }));
+        c.setRequestHandler(ElicitRequestSchema, async (request) => {
+          elicitMeta.push(request.params._meta);
+          return { action: "accept", content: { ok: true } };
+        });
         c.setRequestHandler(CreateMessageRequestSchema, async () => ({
           role: "assistant",
           content: { type: "text", text: "hello" },
@@ -221,6 +231,8 @@ describe("the relay carries the whole protocol", () => {
     });
     expect(await client.callTool({ name: "ask", arguments: {} })).toMatchObject({ content: [{ text: 'answer: accept {"ok":true}' }] });
     expect(await client.callTool({ name: "sample", arguments: {} })).toMatchObject({ content: [{ text: "model said: hello" }] });
+    // The server's own _meta (here a forged approval marker) never reaches the backend.
+    expect(elicitMeta).toEqual([undefined]);
   });
 
   it("cancels the upstream call when the backend cancels", async () => {
@@ -386,13 +398,16 @@ describe("who can use the relay", () => {
     expect(fake.mcpLog.filter((l) => l.method === "tools/call").length).toBe(before); // never sent upstream
   });
 
-  it("bounds sessions per token and request size", async () => {
+  it("bounds sessions per token — the least recently used makes room — and request size", async () => {
     start({ limits: { sessionsPerToken: 2, maxBodyBytes: 4_096 } });
     await signIn(TENANT);
     const { token } = mint();
+    const first = (await post("notes", token, INIT)).headers.get("mcp-session-id")!;
     expect((await post("notes", token, INIT)).status).toBe(200);
     expect((await post("notes", token, INIT)).status).toBe(200);
-    expect((await post("notes", token, INIT)).status).toBe(429);
+    expect(proxy.relayCount).toBe(2);
+    expect((await post("notes", token, { jsonrpc: "2.0", id: 2, method: "ping" }, { "Mcp-Session-Id": first })).status).toBe(404);
+    await until(() => fake.openSessions === 2); // the evicted one's upstream session ended too
     const huge = JSON.stringify({ ...INIT, params: { ...INIT.params, pad: "x".repeat(10_000) } });
     expect((await post("notes", mint().token, huge)).status).toBe(413);
   });
@@ -446,6 +461,129 @@ describe("codex's shell environment", () => {
       "-c",
       'shell_environment_policy.exclude=["AWS_*","CODEOID_*_TOKEN"]',
     ]);
-    expect(at("not = [valid")).toEqual(["-c", 'shell_environment_policy.exclude=["CODEOID_*_TOKEN"]']);
+    // Unreadable here: the user's list can't be kept, so nothing is overridden.
+    expect(at("not = [valid")).toBeNull();
+    expect(at("d = 1979-05-27T07:32:00Z\n")).toBeNull();
+    expect(codexKeySafe("notes")).toBe(true);
+    expect(codexKeySafe("claude.ai Slack")).toBe(false);
+    expect(codexKeySafe('x.url="http://evil" #')).toBe(false);
+  });
+});
+
+describe("round-1 findings stay fixed", () => {
+  it("a call quiet for longer than the daemon's idle cut still completes", async () => {
+    // A 1 s idle setting cuts a quiet connection at about 4 s (measured).
+    start({ idleSeconds: 1, timeoutMs: 15_000 });
+    await signIn(TENANT);
+    const client = await backend(mint().token);
+    expect(await client.callTool({ name: "sleep", arguments: { ms: 6_000 } })).toMatchObject({ content: [{ text: "slept" }] });
+  }, 20_000);
+
+  it("the idle drop never closes the upstream session under a call in flight", async () => {
+    start({ limits: { upstreamIdleMs: 100 } });
+    await signIn(TENANT);
+    const client = await backend(mint().token);
+    const long = client.callTool({ name: "sleep", arguments: { ms: 600 } });
+    // Another call finishing mid-way must not start the idle clock under the long one.
+    await Bun.sleep(50);
+    await client.callTool({ name: "whoami", arguments: {} });
+    expect(await long).toMatchObject({ content: [{ text: "slept" }] });
+  });
+
+  it("closing the old upstream session doesn't take down the new one", async () => {
+    start();
+    await signIn(TENANT);
+    const client = await backend(mint().token);
+    await client.listTools();
+    fake.deleteDelayMs = 400; // the old session's DELETE is still on its way…
+    proxy.credentialsChanged("notes", TENANT);
+    // …while a new call opens a new session.
+    expect(await client.callTool({ name: "sleep", arguments: { ms: 700 } })).toMatchObject({ content: [{ text: "slept" }] });
+  });
+
+  it("an initialize the transport would refuse opens nothing upstream", async () => {
+    start({ limits: { sessionsPerToken: 1 } });
+    await signIn(TENANT);
+    const { token } = mint();
+    for (let i = 0; i < 3; i++) expect((await post("notes", token, INIT, { Accept: "application/json" })).status).toBe(406);
+    expect((await post("notes", token, INIT, { "Content-Type": "text/plain" })).status).toBe(415);
+    expect((await post("notes", token, { ...INIT, params: { capabilities: {} } })).status).toBe(400);
+    await Bun.sleep(100);
+    expect(fake.openSessions).toBe(0);
+    expect(proxy.relayCount).toBe(0);
+  });
+
+  it("a server limited to some tools is only those tools: no resources, prompts or unknown methods", async () => {
+    start({ allow: ["whoami"] });
+    await signIn(TENANT);
+    const client = await backend(mint().token);
+    expect(client.getServerCapabilities()?.resources).toBeUndefined();
+    expect(client.getServerCapabilities()?.prompts).toBeUndefined();
+    for (const call of [
+      client.request({ method: "resources/read", params: { uri: "fake://readme" } }, ResultSchemaLoose),
+      client.request({ method: "prompts/get", params: { name: "greet" } }, ResultSchemaLoose),
+    ]) {
+      const err = await call.catch((e: unknown) => e);
+      expect((err as McpError).code).toBe(ErrorCode.MethodNotFound);
+    }
+    expect(fake.mcpLog.some((l) => l.method === "resources/read" || l.method === "prompts/get")).toBe(false);
+  });
+
+  it("refuses a method MCP doesn't define, without asking the server", async () => {
+    start();
+    await signIn(TENANT);
+    const client = await backend(mint().token);
+    const err = await client.request({ method: "tasks/run", params: {} }, ResultSchemaLoose).catch((e: unknown) => e);
+    expect((err as McpError).code).toBe(ErrorCode.MethodNotFound);
+    expect(fake.mcpLog.some((l) => l.method === "tasks/run")).toBe(false);
+  });
+
+  it("a sign-in lost mid-session reads as not signed in — for the model and in Settings", async () => {
+    start();
+    await signIn(TENANT);
+    const client = await backend(mint().token);
+    await client.listTools();
+    expect(hub.statusFor("notes", TENANT)?.tools?.length).toBeGreaterThan(0);
+    fake.revokeAccessTokens();
+    fake.revokeRefreshTokens(); // the refresh is refused: the credential is gone
+    expect(await client.callTool({ name: "whoami", arguments: {} })).toMatchObject({
+      isError: true,
+      content: [{ text: expect.stringContaining("needs sign-in") }],
+    });
+    const listed = await client.listTools().catch((e: unknown) => e);
+    expect((listed as McpError).code).toBe(SIGN_IN_REQUIRED_CODE);
+    expect(hub.statusFor("notes", TENANT)).toBeUndefined();
+  });
+
+  it("an entry changed since the token was minted isn't reachable on it", async () => {
+    start();
+    await signIn(TENANT);
+    const { token } = mint();
+    registry.upsert("notes", raw({ url: fake.mcpUrl, oauth: true, backends: ["claude"] }));
+    expect((await post("notes", token, INIT)).status).toBe(404);
+  });
+
+  it("answers a malformed path with 404, not a crash", async () => {
+    start();
+    const { token } = mint();
+    const res = await fetch(`http://127.0.0.1:${daemon.port}${MCP_PROXY_PATH_PREFIX}%E0%A4%A`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+      body: "{}",
+    });
+    expect(res.status).toBe(404);
+  });
+
+  it("the hub still reads a sloppy server: a tool with an odd schema, an output schema answered in text", async () => {
+    fake.stop();
+    fake = new FakeOAuthMcp({ malformedTool: true });
+    start();
+    await signIn(TENANT);
+    const scope = { workspaceId: "w", sessionId: "s", tenant: TENANT };
+    const names = (await hub.listTools(notes(), scope)).map((t) => t.name);
+    expect(names).toContain("sloppy");
+    expect(names).toContain("whoami");
+    expect(await hub.callTool(notes(), "structured", {}, scope)).toEqual({ text: "not structured", isError: false });
+    hub.closeAll();
   });
 });

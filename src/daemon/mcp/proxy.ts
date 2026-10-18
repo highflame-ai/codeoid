@@ -188,23 +188,34 @@ export class McpProxy implements McpProxyMount {
   /**
    * One HTTP request to `/mcp/proxy/<server>`. `loopbackPeer` is whether the
    * connection came from this host; the relay serves nothing else.
+   * `liftIdleTimeout` turns off the daemon's idle-connection timeout for this
+   * request once it is authenticated: a relayed call may stay quiet for as
+   * long as the tool takes, or as a person takes to answer the server.
    */
-  async handle(req: Request, loopbackPeer: boolean): Promise<Response> {
+  async handle(req: Request, loopbackPeer: boolean, opts: { liftIdleTimeout?: () => void } = {}): Promise<Response> {
     // Loopback only, and not from a web page: a page can reach 127.0.0.1, but
     // it can't make its Host or Origin a loopback name (DNS rebinding).
     if (!loopbackPeer || !loopbackHost(req.headers.get("host")) || !loopbackOrigin(req.headers.get("origin"))) {
       return rpcError(403, ErrorCode.InvalidRequest, "forbidden");
     }
-    const url = new URL(req.url);
-    const server = decodeURIComponent(url.pathname.slice(MCP_PROXY_PATH_PREFIX.length));
+    let server: string;
+    try {
+      server = decodeURIComponent(new URL(req.url).pathname.slice(MCP_PROXY_PATH_PREFIX.length));
+    } catch {
+      return rpcError(404, ErrorCode.InvalidRequest, "no such MCP server here");
+    }
     // Never a 401: a 401 with WWW-Authenticate would start the backend's own
     // OAuth flow inside the agent process.
-    const auth = req.headers.get("authorization") ?? "";
-    const token = /^Bearer\s+(\S+)$/i.exec(auth)?.[1];
+    const token = /^Bearer\s+(\S+)$/i.exec(req.headers.get("authorization") ?? "")?.[1];
     const record = token ? this.#tokens.get(hashOf(token)) : undefined;
     if (!record) return rpcError(403, ErrorCode.InvalidRequest, "unknown or revoked proxy token");
-    const spec = record.servers.has(server) ? this.#registry.get(server) : undefined;
-    if (!spec || spec.transport.kind !== "http") return rpcError(404, ErrorCode.InvalidRequest, `no MCP server "${server}" here`);
+    // Bound at mint AND still the backend's OAuth server now: an entry edited
+    // or re-scoped since isn't reachable on an old token.
+    const spec = record.servers.has(server)
+      ? this.#registry.oauthFor(record.binding.backendId).find((s) => s.name === server && s.transport.kind === "http")
+      : undefined;
+    if (!spec) return rpcError(404, ErrorCode.InvalidRequest, `no MCP server "${server}" here`);
+    opts.liftIdleTimeout?.();
 
     const sessionId = req.headers.get("mcp-session-id");
     if (sessionId) {
@@ -215,16 +226,30 @@ export class McpProxy implements McpProxyMount {
       return body instanceof Response ? body : relay.handle(req, body);
     }
 
-    // No session yet: only an initialize starts one.
+    // No session yet: only an initialize starts one — checked in full before
+    // anything is opened upstream as the tenant.
     if (req.method !== "POST") return rpcError(400, ErrorCode.InvalidRequest, "no session: initialize first");
+    const accept = req.headers.get("accept") ?? "";
+    if (!accept.includes("application/json") || !accept.includes("text/event-stream")) {
+      return rpcError(406, ErrorCode.InvalidRequest, "Accept must allow application/json and text/event-stream");
+    }
+    if (!(req.headers.get("content-type") ?? "").includes("application/json")) {
+      return rpcError(415, ErrorCode.InvalidRequest, "Content-Type must be application/json");
+    }
     const body = await readBody(req, this.#limits.maxBodyBytes);
     if (body instanceof Response) return body;
-    const init = body as { method?: unknown; params?: { capabilities?: unknown; clientInfo?: unknown } };
-    if (Array.isArray(body) || init.method !== "initialize") {
+    const init = body as { method?: unknown; params?: { protocolVersion?: unknown; capabilities?: unknown; clientInfo?: unknown } };
+    if (Array.isArray(body) || init.method !== "initialize" || typeof init.params?.protocolVersion !== "string") {
       return rpcError(400, ErrorCode.InvalidRequest, "no session: initialize first");
     }
+    // At the cap, the least recently used session makes room (its backend
+    // re-initializes if it comes back): a backend that opens a session per
+    // thread never locks itself out, and a token still holds a bounded number.
     if (record.relays.size + record.starting >= this.#limits.sessionsPerToken) {
-      return rpcError(429, ErrorCode.InvalidRequest, "too many MCP sessions for this token");
+      const lru = [...record.relays.entries()].sort((a, b) => a[1].lastUsed - b[1].lastUsed)[0];
+      if (!lru) return rpcError(429, ErrorCode.InvalidRequest, "too many MCP sessions starting for this token");
+      record.relays.delete(lru[0]);
+      void lru[1].close();
     }
     record.starting++;
     let relay: Relay;
@@ -249,7 +274,11 @@ export class McpProxy implements McpProxyMount {
     } finally {
       record.starting--;
     }
-    return relay.handle(req, body);
+    const res = await relay.handle(req, body);
+    // The transport refused the initialize after all: no session, so nothing
+    // may stay open upstream.
+    if (!relay.sessionId) void relay.close();
+    return res;
   }
 }
 
@@ -272,16 +301,42 @@ interface RelayInit {
 type DownstreamExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
 
 /** The backend request an upstream message belongs to, carried through the
- *  async work it starts, so a server→client request made during a tool call
- *  goes back on that call's stream. */
+ *  async work it starts, so a server→client request or notification made
+ *  during a tool call goes back on that call's stream. */
 const relatedRequest = new AsyncLocalStorage<string | number>();
+
+/** What the backend may ask of the server (initialize and ping are answered here). */
+const FORWARDED_METHODS = new Set([
+  "tools/list",
+  "tools/call",
+  "resources/list",
+  "resources/templates/list",
+  "resources/read",
+  "resources/subscribe",
+  "resources/unsubscribe",
+  "prompts/list",
+  "prompts/get",
+  "completion/complete",
+  "logging/setLevel",
+]);
+
+/** Methods outside tools: a server limited to some of its tools has none of them here. */
+const BEYOND_TOOLS = /^(resources|prompts|completion)\//;
+
+/** What the server may ask of the backend. */
+const SERVER_REQUESTS = new Set(["sampling/createMessage", "elicitation/create", "roots/list", "ping"]);
 
 class Relay {
   readonly server: string;
+  /** When the backend last used this session (for eviction at the cap). */
+  lastUsed = Date.now();
   readonly #init: RelayInit;
   readonly #transport: WebStandardStreamableHTTPServerTransport;
   #downstream!: Server;
+  /** The upstream session: connecting, or connected. */
   #upstream: Promise<Client> | null = null;
+  /** Requests being forwarded now; the idle drop waits for none. */
+  #inflight = 0;
   #idle: ReturnType<typeof setTimeout> | null = null;
   #closed = false;
 
@@ -298,6 +353,10 @@ class Relay {
     };
   }
 
+  get sessionId(): string | undefined {
+    return this.#transport.sessionId;
+  }
+
   /**
    * Open the upstream session first, announcing the backend's own
    * capabilities, so the backend is answered with the real server's
@@ -309,11 +368,18 @@ class Relay {
     const relay = new Relay(init);
     let upstream: Client | null = null;
     try {
-      upstream = await relay.#connectUpstream();
+      upstream = await relay.#ensureUpstream();
     } catch (e) {
-      if (!(e instanceof McpSignInRequired)) relay.#note({ error: cleanMcpError(errMsg(e)) });
+      if (e instanceof McpSignInRequired) relay.#note({ signedOut: true });
+      else relay.#note({ error: cleanMcpError(errMsg(e)) });
     }
-    const caps: ServerCapabilities = upstream?.getServerCapabilities() ?? { tools: {} };
+    const caps: ServerCapabilities = { ...(upstream?.getServerCapabilities() ?? {}) };
+    // A server limited to some tools is only those tools here.
+    if (init.spec.toolAllowlist) {
+      delete caps.resources;
+      delete caps.prompts;
+      delete caps.completions;
+    }
     relay.#downstream = new Server(upstream?.getServerVersion() ?? { name: init.spec.name, version: "0" }, {
       // Tools always announce list changes: a sign-in mid-session changes them.
       capabilities: { ...caps, tools: { ...caps.tools, listChanged: true } },
@@ -321,20 +387,19 @@ class Relay {
     });
     relay.#wireDownstream();
     await relay.#downstream.connect(relay.#transport);
+    relay.#armIdle();
     return relay;
   }
 
   async handle(req: Request, parsedBody?: unknown): Promise<Response> {
-    this.#touch();
+    this.lastUsed = Date.now();
     return this.#transport.handleRequest(req, parsedBody === undefined ? undefined : { parsedBody });
   }
 
   /** Drop the upstream session; the next request opens a new one. Tells the
    *  backend its tools may have changed (a sign-in, a sign-out). */
   async resetUpstream(): Promise<void> {
-    const old = this.#upstream;
-    this.#upstream = null;
-    if (old) await old.then(closeUpstream, () => {});
+    await this.#dropUpstream(this.#upstream);
     await this.#downstream.sendToolListChanged().catch(() => {});
   }
 
@@ -342,9 +407,7 @@ class Relay {
     if (this.#closed) return;
     this.#closed = true;
     if (this.#idle) clearTimeout(this.#idle);
-    const old = this.#upstream;
-    this.#upstream = null;
-    if (old) await old.then(closeUpstream, () => {});
+    await this.#dropUpstream(this.#upstream);
     await this.#transport.close().catch(() => {});
   }
 
@@ -365,23 +428,21 @@ class Relay {
     const { spec } = this.#init;
     const allow = spec.toolAllowlist;
     const params = request.params as Record<string, unknown> | undefined;
+    if (!FORWARDED_METHODS.has(request.method) || (allow && BEYOND_TOOLS.test(request.method))) {
+      throw new McpError(ErrorCode.MethodNotFound, `${request.method} is not available for ${spec.name} here`);
+    }
     if (request.method === "tools/call" && allow && !allow.includes(String(params?.name))) {
       return { content: [{ type: "text", text: `Tool "${String(params?.name)}" is not in the allowlist for server "${spec.name}".` }], isError: true };
     }
-    let up: Client;
+    this.#inflight++;
+    if (this.#idle) clearTimeout(this.#idle);
+    let up: Client | undefined;
     try {
       up = await this.#ensureUpstream();
-    } catch (e) {
-      const message = e instanceof McpSignInRequired ? e.message : `${spec.name} unavailable: ${cleanMcpError(errMsg(e))}`;
-      // A tool call's error the model reads as the call's result; anything
-      // else as a JSON-RPC error — never an HTTP 401.
-      if (request.method === "tools/call") return { content: [{ type: "text", text: message }], isError: true };
-      throw new McpError(e instanceof McpSignInRequired ? SIGN_IN_REQUIRED_CODE : ErrorCode.InternalError, message);
-    }
-    const progressToken = (params?._meta as { progressToken?: string | number } | undefined)?.progressToken;
-    try {
+      const progressToken = (params?._meta as { progressToken?: string | number } | undefined)?.progressToken;
+      const client = up;
       const result = await relatedRequest.run(extra.requestId, () =>
-        up.request({ method: request.method, params }, ResultSchema, {
+        client.request({ method: request.method, params }, ResultSchema, {
           signal: extra.signal,
           timeout: this.#init.timeoutMs,
           resetTimeoutOnProgress: true,
@@ -395,24 +456,37 @@ class Relay {
             : {}),
         }),
       );
-      if (request.method === "tools/list") return this.#listed(result);
+      if (request.method === "tools/list") return this.#listed(result, params?.cursor !== undefined);
       return result;
     } catch (e) {
+      if (e instanceof McpSignInRequired) {
+        // Not signed in, or the credential was lost mid-session (a refused
+        // refresh): what the backend reads, and Settings shows, is the same.
+        this.#note({ signedOut: true });
+        if (up) void this.#dropUpstream(this.#upstream, up);
+        if (request.method === "tools/call") return { content: [{ type: "text", text: e.message }], isError: true };
+        throw new McpError(SIGN_IN_REQUIRED_CODE, e.message);
+      }
       if (e instanceof McpError) throw e;
-      // The upstream session is gone (server restarted, network): reopen next time.
-      void this.#dropUpstream();
+      // The upstream session is gone (server restarted, network): reopen next
+      // time — the session this request used, not a newer one.
+      if (up) void this.#dropUpstream(this.#upstream, up);
       const message = cleanMcpError(errMsg(e));
       this.#note({ error: message });
+      if (request.method === "tools/call") return { content: [{ type: "text", text: `${spec.name} unavailable: ${message}` }], isError: true };
       throw new McpError(ErrorCode.InternalError, `${spec.name}: ${message}`);
+    } finally {
+      this.#inflight--;
+      this.#armIdle();
     }
   }
 
-  /** tools/list, filtered to the allowlist, and noted as the tenant's status. */
-  #listed(result: Result): Result {
+  /** tools/list, filtered to the allowlist; a complete listing is noted as the tenant's status. */
+  #listed(result: Result, paged: boolean): Result {
     const allow = this.#init.spec.toolAllowlist;
     const tools = Array.isArray(result.tools) ? (result.tools as Array<{ name?: unknown }>) : [];
     const shown = allow ? tools.filter((t) => allow.includes(String(t.name))) : tools;
-    if (!result.nextCursor) this.#note({ tools: shown.map((t) => String(t.name)) });
+    if (!paged && !result.nextCursor) this.#note({ tools: shown.map((t) => String(t.name)) });
     return { ...result, tools: shown };
   }
 
@@ -420,14 +494,11 @@ class Relay {
 
   #ensureUpstream(): Promise<Client> {
     if (this.#closed) return Promise.reject(new Error("relay closed"));
-    return this.#upstream ?? this.#connectUpstream();
-  }
-
-  #connectUpstream(): Promise<Client> {
+    if (this.#upstream) return this.#upstream;
     const { spec, binding, credentials, env, clientCapabilities, clientInfo } = this.#init;
     if (spec.transport.kind !== "http") return Promise.reject(new Error(`${spec.name} is not an HTTP server`));
     if (!credentials) return Promise.reject(new McpSignInRequired(spec.name));
-    const connecting = openUpstream({
+    const connecting: Promise<Client> = openUpstream({
       name: spec.name,
       transport: spec.transport,
       env,
@@ -440,7 +511,7 @@ class Relay {
       capabilities: clientCapabilities,
       timeoutMs: this.#init.timeoutMs,
     }).then((client) => {
-      this.#wireUpstream(client);
+      this.#wireUpstream(client, connecting);
       return client;
     });
     this.#upstream = connecting;
@@ -450,36 +521,60 @@ class Relay {
     return connecting;
   }
 
-  #wireUpstream(up: Client): void {
+  #wireUpstream(up: Client, mine: Promise<Client>): void {
     up.fallbackRequestHandler = async (request, extra) => {
+      if (!SERVER_REQUESTS.has(request.method)) {
+        throw new McpError(ErrorCode.MethodNotFound, `${request.method} is not relayed`);
+      }
+      // The server's own _meta isn't passed on: a backend may read markers
+      // there as its own (Codex marks its tool approvals that way).
+      const { _meta, ...params } = (request.params ?? {}) as Record<string, unknown>;
+      void _meta;
       const related = relatedRequest.getStore();
-      return this.#downstream.request({ method: request.method, params: request.params } as ServerRequest, ResultSchema, {
+      return this.#downstream.request({ method: request.method, params } as ServerRequest, ResultSchema, {
         signal: extra.signal,
         timeout: this.#init.limits.serverRequestTimeoutMs,
         ...(related !== undefined ? { relatedRequestId: related } : {}),
       });
     };
     up.fallbackNotificationHandler = async (notification) => {
-      await this.#downstream.notification(notification as ServerNotification).catch(() => {});
+      const related = relatedRequest.getStore();
+      await this.#downstream
+        .notification(notification as ServerNotification, related !== undefined ? { relatedRequestId: related } : undefined)
+        .catch(() => {});
     };
-    up.onclose = () => {
-      if (this.#upstream) void this.#dropUpstream();
-    };
+    // Only this session closing drops it — never a newer one opened since.
+    up.onclose = () => void this.#dropUpstream(mine, up);
   }
 
-  async #dropUpstream(): Promise<void> {
-    const old = this.#upstream;
-    this.#upstream = null;
-    if (old) await old.then(closeUpstream, () => {});
+  /**
+   * Close an upstream session and forget it, if it is still the current one
+   * (`which`). `client` is the session itself when known; a session still
+   * connecting is closed once it connects.
+   */
+  async #dropUpstream(which: Promise<Client> | null, client?: Client): Promise<void> {
+    if (!which) return;
+    if (this.#upstream === which) this.#upstream = null;
+    const up = client ?? (await which.catch(() => null));
+    if (up) {
+      up.onclose = undefined;
+      await closeUpstream(up);
+    }
   }
 
-  #touch(): void {
+  /** Close the upstream session once nothing has used it for a while (it
+   *  reopens on the next request); never while a request is in flight. */
+  #armIdle(): void {
     if (this.#idle) clearTimeout(this.#idle);
-    this.#idle = setTimeout(() => void this.#dropUpstream(), this.#init.limits.upstreamIdleMs);
+    this.#idle = null;
+    if (this.#closed || this.#inflight > 0) return;
+    this.#idle = setTimeout(() => {
+      if (this.#inflight === 0) void this.#dropUpstream(this.#upstream);
+    }, this.#init.limits.upstreamIdleMs);
     this.#idle.unref?.();
   }
 
-  #note(status: { tools?: string[]; error?: string }): void {
+  #note(status: { tools?: string[]; error?: string; signedOut?: boolean }): void {
     this.#init.hub?.noteStatus(this.#init.spec, this.#init.binding.tenant, status);
   }
 }
@@ -520,10 +615,24 @@ function loopbackOrigin(origin: string | null): boolean {
 async function readBody(req: Request, max: number): Promise<unknown | Response> {
   const declared = Number(req.headers.get("content-length") ?? "0");
   if (declared > max) return rpcError(413, ErrorCode.InvalidRequest, "request too large");
-  const buf = await req.arrayBuffer();
-  if (buf.byteLength > max) return rpcError(413, ErrorCode.InvalidRequest, "request too large");
+  // Read as it arrives, and stop at the cap: a chunked body has no length to check first.
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  const reader = req.body?.getReader();
+  if (reader) {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > max) {
+        await reader.cancel().catch(() => {});
+        return rpcError(413, ErrorCode.InvalidRequest, "request too large");
+      }
+      chunks.push(value);
+    }
+  }
   try {
-    return JSON.parse(new TextDecoder().decode(buf));
+    return JSON.parse(new TextDecoder().decode(Buffer.concat(chunks)));
   } catch {
     return rpcError(400, ErrorCode.ParseError, "parse error");
   }

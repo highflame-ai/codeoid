@@ -17,19 +17,38 @@ import { join } from "node:path";
 /** Every per-session token variable codeoid gives Codex. */
 export const CODEOID_TOKEN_ENV_GLOB = "CODEOID_*_TOKEN";
 
+/**
+ * The `-c` override, or null when the user's config can't be read here (a
+ * TOML feature Bun's parser lacks, say): then their own list can't be kept,
+ * and replacing it would hand the agent variables they excluded — so nothing
+ * is overridden, and the caller mounts nothing that needs it.
+ */
 export function codexShellEnvExcludeArgs(
   env: Record<string, string | undefined> = process.env,
   read: (path: string) => string = (p) => readFileSync(p, "utf8"),
-): string[] {
+): string[] | null {
   const home = env.CODEX_HOME || join(env.HOME || homedir(), ".codex");
+  let text: string;
+  try {
+    text = read(join(home, "config.toml"));
+  } catch {
+    text = ""; // no config: nothing of the user's to keep
+  }
   let user: string[] = [];
   try {
-    const cfg = Bun.TOML.parse(read(join(home, "config.toml"))) as { shell_environment_policy?: { exclude?: unknown } };
+    const cfg = Bun.TOML.parse(text) as { shell_environment_policy?: { exclude?: unknown } };
     const exclude = cfg.shell_environment_policy?.exclude;
     if (Array.isArray(exclude)) user = exclude.filter((x): x is string => typeof x === "string");
   } catch {
-    // No config (or one Codex itself would reject): nothing of the user's to keep.
+    return null;
   }
   const list = user.includes(CODEOID_TOKEN_ENV_GLOB) ? user : [...user, CODEOID_TOKEN_ENV_GLOB];
   return ["-c", `shell_environment_policy.exclude=${JSON.stringify(list)}`];
+}
+
+/** A server name usable as a `-c mcp_servers.<name>` key segment: Codex splits
+ *  the key on dots, so a name with one (or a space, a quote) would land
+ *  somewhere else in its config. */
+export function codexKeySafe(name: string): boolean {
+  return /^[A-Za-z0-9_-]{1,64}$/.test(name);
 }

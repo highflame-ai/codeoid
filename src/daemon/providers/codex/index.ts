@@ -75,7 +75,7 @@ import {
 } from "../../blackboard/mcp-http.js";
 import type { McpRegistry } from "../../mcp/registry.js";
 import { MCP_PROXY_TOKEN_ENV, McpProxyLease, type McpProxyMount } from "../../mcp/proxy.js";
-import { codexShellEnvExcludeArgs } from "./shell-env.js";
+import { codexKeySafe, codexShellEnvExcludeArgs } from "./shell-env.js";
 import { resolveEnvMap } from "../../mcp/types.js";
 
 /** codex `tokenUsage.last` / `.total` shape (thread/tokenUsage/updated). */
@@ -536,6 +536,10 @@ export class CodexProvider implements SessionProvider {
     const args: string[] = [];
     const env: Record<string, string> = {};
     for (const spec of reg.forNativeMount(this.id)) {
+      if (!codexKeySafe(spec.name)) {
+        console.warn(`[codeoid] codex: MCP server "${spec.name}" isn't mounted — codex can't take that name as a config key`);
+        continue;
+      }
       const key = `mcp_servers.${spec.name}`;
       const t = spec.transport;
       if (t.kind === "stdio") {
@@ -567,6 +571,7 @@ export class CodexProvider implements SessionProvider {
     if (!lease) return { args: [], env: {} };
     const args: string[] = [];
     for (const server of lease.servers) {
+      if (!codexKeySafe(server.name)) continue;
       const key = `mcp_servers.${server.name}`;
       args.push("-c", `${key}.url=${JSON.stringify(server.url)}`);
       args.push("-c", `${key}.bearer_token_env_var=${JSON.stringify(MCP_PROXY_TOKEN_ENV)}`);
@@ -693,11 +698,16 @@ export class CodexProvider implements SessionProvider {
       const mcp = this.#memoryMcpSpawn();
       const bb = this.#blackboardMcpSpawn();
       const reg = this.#registryMcpArgs();
-      const oauth = this.#proxyMcpSpawn();
+      const shellEnv = codexShellEnvExcludeArgs();
+      // Without the exclude, the proxy token would reach the commands codex runs.
+      const oauth = shellEnv ? this.#proxyMcpSpawn() : { args: [], env: {} };
+      if (!shellEnv && this.#mcpRegistry?.oauthFor(this.id).length) {
+        console.warn("[codeoid] codex: ~/.codex/config.toml couldn't be read here, so OAuth MCP servers aren't mounted (their token would reach the agent's shell)");
+      }
       this.#proc = new CodexRpcProcess({
         command: this.#command,
         argsPrefix: this.#argsPrefix,
-        args: [...mcp.args, ...bb.args, ...reg.args, ...oauth.args, ...codexShellEnvExcludeArgs()],
+        args: [...mcp.args, ...bb.args, ...reg.args, ...oauth.args, ...(shellEnv ?? [])],
         cwd: opts.workdir,
         env: { ...buildCodexEnv(), ...mcp.env, ...bb.env, ...reg.env, ...oauth.env },
         onNotification: (method, params) => this.#onNotification(method, params),

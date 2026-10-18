@@ -26,6 +26,7 @@ import type { MemoryEngine } from "../memory/engine.js";
 import { isOAuthServer, resolveEnvMap } from "./types.js";
 import type { McpServerSpec, McpStdioTransport } from "./types.js";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { ResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import { McpSignInRequired, type McpCredentialSource, type McpTenant } from "./oauth.js";
 import type { McpProxy } from "./proxy.js";
 import { cleanMcpError } from "./redact.js";
@@ -193,9 +194,11 @@ export class McpHub {
    * Settings shows one status per server whichever path used it: its tools
    * after a listing, or the last error (keeping the tools known before).
    */
-  noteStatus(spec: McpServerSpec, tenant: McpTenant | undefined, status: { tools?: string[]; error?: string }): void {
+  noteStatus(spec: McpServerSpec, tenant: McpTenant | undefined, status: { tools?: string[]; error?: string; signedOut?: boolean }): void {
     const key = clientKey(spec, tenant);
-    if (status.tools) this.#status.set(key, { tools: status.tools });
+    // Not signed in is no fault of the server: no health, and no tools from before.
+    if (status.signedOut) this.#status.delete(key);
+    else if (status.tools) this.#status.set(key, { tools: status.tools });
     else this.#status.set(key, { tools: this.#status.get(key)?.tools ?? [], ...(status.error ? { error: status.error } : {}) });
   }
 
@@ -398,17 +401,28 @@ class HttpMcpClient implements McpClient {
     const client = await this.#connect();
     const tools: McpToolDef[] = [];
     let cursor: string | undefined;
+    // Read loosely, as before the SDK client: one tool with an odd schema
+    // mustn't hide all of a server's tools (the SDK's listTools validates
+    // every one strictly).
     do {
-      const page = await client.listTools(cursor ? { cursor } : undefined, { timeout: this.#timeoutMs });
-      tools.push(...page.tools.map(toToolDef));
-      cursor = page.nextCursor;
+      const page = (await client.request(
+        { method: "tools/list", params: cursor ? { cursor } : {} },
+        ResultSchema,
+        { timeout: this.#timeoutMs },
+      )) as { tools?: unknown; nextCursor?: unknown };
+      if (Array.isArray(page.tools)) tools.push(...(page.tools as RawTool[]).filter((t) => typeof t?.name === "string").map(toToolDef));
+      cursor = typeof page.nextCursor === "string" ? page.nextCursor : undefined;
     } while (cursor && tools.length < MAX_TOOLS);
     return tools;
   }
 
   async callTool(tool: string, args: Record<string, unknown>): Promise<McpCallResult> {
     const client = await this.#connect();
-    const res = await client.callTool({ name: tool, arguments: args }, undefined, { timeout: this.#timeoutMs });
+    // Loosely too: the SDK's callTool also enforces a declared outputSchema,
+    // which the hub (text results) never did.
+    const res = await client.request({ method: "tools/call", params: { name: tool, arguments: args } }, ResultSchema, {
+      timeout: this.#timeoutMs,
+    });
     return normalizeCallResult(res as RawCallResult);
   }
 
