@@ -7489,8 +7489,6 @@ export const MCP_TIMINGS = {
  */
 const SAFE_MCP_NAME = /^(?:[\w.-]{1,64}|claude\.ai [\w .-]{1,54}|plugin:[\w.-]{1,40}:[\w.-]{1,40})$/;
 
-export { cleanMcpError };
-
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   return Promise.race([

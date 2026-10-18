@@ -79,7 +79,9 @@ export function redactSecretText(text: string): string {
  * server, so it's cut before any pattern runs.
  */
 export function cleanMcpError(raw: string): string {
-  const s = redactSecretText(raw.slice(0, SCAN_CHARS));
+  // Newlines and tabs too: this text lands in log lines, where a server's
+  // "\n[codeoid] …" would forge one.
+  const s = redactSecretText(raw.slice(0, SCAN_CHARS).replace(/[\u0000-\u001f\u007f-\u009f]+/g, " "));
   return s.length > 300 ? `${s.slice(0, 300)}…` : s;
 }
 
@@ -99,7 +101,7 @@ export const MAX_SHOWN_KEYS = 50;
 /**
  * A path segment that reads as a credential or an account id: a UUID, a
  * long hex string, a run of 16+ letters and digits mixing both, or a known
- * key format. Not one that's just long — `my-company-mcp-server-v2` stays.
+ * key format. (plainWord is the stricter test what's shown passes.)
  */
 function secretSegment(seg: string): boolean {
   if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(seg) || /^[0-9a-f]{32,}$/i.test(seg)) return true;
@@ -111,18 +113,32 @@ function secretSegment(seg: string): boolean {
  * A server's URL as shown, built from the URL parser's own reading: the
  * scheme and host exactly as the URL resolves (never redacted — the user may
  * be consenting to that address, and a "…@" or a hidden label could make one
- * host read as another), userinfo dropped to "…@", token-like path segments
- * hidden, any query or fragment as "?…" / "#…". Not parseable: the text rules.
+ * host read as another), userinfo dropped to "…@", every path segment that
+ * isn't a plain word hidden, any query or fragment as "?…" / "#…". Not
+ * parseable: the text rules.
  */
 export function redactMcpUrl(url: string): string {
-  if (url.length > URL_CHARS) return "…";
+  return readUrl(url).shown;
+}
+
+/**
+ * Whether redactMcpUrl hides any part of this URL — not merely writes it as
+ * the parser normalizes it (`https://h` → `https://h/`, an uppercase host).
+ */
+export function urlHasHiddenParts(url: string): boolean {
+  return readUrl(url).hidden;
+}
+
+function readUrl(url: string): { shown: string; hidden: boolean } {
+  if (url.length > URL_CHARS) return { shown: "…", hidden: true };
   let u: URL;
   try {
     u = new URL(url);
   } catch {
-    return redactSecretText(url);
+    const shown = redactSecretText(url);
+    return { shown, hidden: shown !== url };
   }
-  const userinfo = u.username || u.password ? "…@" : "";
+  let hidden = Boolean(u.username || u.password || u.search || u.hash);
   // The host is always shown, however long the rest; a path too long to
   // scan is shown as "/…".
   const path =
@@ -132,22 +148,26 @@ export function redactMcpUrl(url: string): string {
           .split("/")
           .map((seg) => (seg && !plainWord(seg, 24) ? "…" : seg))
           .join("/");
-  return `${u.protocol}//${userinfo}${u.host}${path}${u.search ? "?…" : ""}${u.hash ? "#…" : ""}`;
+  if (path !== u.pathname) hidden = true;
+  const shown = `${u.protocol}//${u.username || u.password ? "…@" : ""}${u.host}${path}${u.search ? "?…" : ""}${u.hash ? "#…" : ""}`;
+  return { shown, hidden };
 }
 
 /**
  * A word shown as is (a URL path segment, a program's name): what reads as a
- * name, not as an id or a key — plain characters, at most `max` of them, at
- * most four digits, no camelCase run (`aB3dEfG`), nothing secretSegment
+ * name, not as an id or a key — plain characters (an `@org` or `~user` too),
+ * at most `max` of them, at most four digits, no camelCase run (`aB3dEfG`), nothing secretSegment
  * flags. "mcp", "v2", "my-company-mcp", "python3.11" pass; a dashed or
  * base64url key, a long number, `;key=value` don't. (A short all-letters
  * token can't be told from a word; nothing this short is a credential's
  * usual shape.)
  */
 function plainWord(word: string, max: number): boolean {
-  if (word.length > max || !/^[A-Za-z0-9][\w.+-]*$/.test(word)) return false;
+  if (word.length > max || !/^[@~]?[A-Za-z0-9][\w.+-]*$/.test(word)) return false;
   if ((word.match(/\d/g) ?? []).length > 4) return false;
   if (/[a-z][A-Z].*[a-z][A-Z]/.test(word)) return false;
+  // A run of 16+ letters with no break is a key more often than a word.
+  if (/[A-Za-z]{16,}/.test(word)) return false;
   return !secretSegment(word);
 }
 
@@ -164,6 +184,9 @@ function shownName(base: string): string {
  */
 export function serverProgram(command: string): string {
   const path = command.slice(-SCAN_CHARS).trim().replace(/^["']+|["']+$/g, "");
+  // A whole shell line written as the command (flags, assignments): its last
+  // "/"-part could be a flag's value.
+  if (/\s[-=]|=/.test(path)) return "(command)";
   return shownName(path.split(/[\\/]/).pop() ?? "");
 }
 

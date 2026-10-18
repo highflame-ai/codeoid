@@ -11,10 +11,10 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CodeoidConfig } from "../config.js";
+import { adoptionRefusal } from "../daemon/mcp/adopt.js";
 import { McpHub } from "../daemon/mcp/hub.js";
 import { McpOAuth } from "../daemon/mcp/oauth.js";
-import { commandSummary, programName, redactMcpUrl, redactSecretText, serverProgram } from "../daemon/mcp/redact.js";
-import { cleanMcpError } from "../daemon/session.js";
+import { cleanMcpError, commandSummary, programName, redactMcpUrl, redactSecretText, serverProgram } from "../daemon/mcp/redact.js";
 import { McpRegistry } from "../daemon/mcp/registry.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
 import { ProviderRegistry } from "../daemon/providers/registry.js";
@@ -200,8 +200,8 @@ describe("two entries that read the same once hidden", () => {
     const r = (await m.handle({ type: "mcp.adopt", id: "a", server: "twin", sessionId: sid, url: "https://t.example.com/mcp?…" }, auth(ALL), client)) as { error?: string };
     // The project's entry reads the same as the user's own: its shown URL
     // picks neither, and says the full one is needed.
-    expect(r.error).toContain("parts hidden here");
-    expect(r.error).toContain("pass the full URL");
+    expect(r.error).toContain("are hidden here");
+    expect(r.error).toContain("name its full URL");
     expect(leaks(r.error!)).toEqual([]);
     // The real URL, typed from the user's own config, picks it.
     expect(await m.handle({ type: "mcp.adopt", id: "b", server: "twin", sessionId: sid, url: "https://t.example.com/mcp?k=hunter2" }, auth(ALL), client)).toMatchObject({ type: "mcp.adopt.result" });
@@ -215,11 +215,18 @@ describe("adopt's refusals", () => {
     const { sid } = await rows(m);
     const shownUrl = "https://mcp.vendor.example/…/mcp";
     const byShown = (await m.handle({ type: "mcp.adopt", id: "a", server: "vendor", sessionId: sid, url: shownUrl }, auth(ALL), client)) as { error?: string };
-    expect(byShown.error).toContain("pass the full URL");
+    expect(byShown.error).toContain("name its full URL");
     const unnamed = (await m.handle({ type: "mcp.adopt", id: "b", server: "vendor", sessionId: sid }, auth(ALL), client)) as { error?: string };
     expect(unnamed.error).toContain("name its full URL");
     const full = "https://mcp.vendor.example/123e4567-e89b-12d3-a456-426614174000/mcp";
     expect(await m.handle({ type: "mcp.adopt", id: "c", server: "vendor", sessionId: sid, url: full }, auth(ALL), client)).toMatchObject({ type: "mcp.adopt.result" });
+  });
+
+  it("a project's URL that's only written differently (no trailing slash, a capital) is adopted as shown", async () => {
+    writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { stripe: { type: "http", url: "https://MCP.stripe.example" } } }));
+    const m = manager();
+    const { sid } = await rows(m);
+    expect(await m.handle({ type: "mcp.adopt", id: "a", server: "stripe", sessionId: sid, url: "https://mcp.stripe.example/" }, auth(ALL), client)).toMatchObject({ type: "mcp.adopt.result" });
   });
 
   it("name a URL without its credentials: the project's own server, and an ambiguous name", async () => {
@@ -259,6 +266,7 @@ describe("the URL shown is the URL dialed", () => {
       ["https://m.example.com/key/correcthorsebatterystaple/", "https://m.example.com/key/…/"],
       ["https://m.example.com/u/1234567890123456789/", "https://m.example.com/u/…/"],
       ["https://m.example.com/api/v2/mcp", "https://m.example.com/api/v2/mcp"],
+      ["https://server.smithery.ai/@smithery-ai/github/mcp", "https://server.smithery.ai/@smithery-ai/github/mcp"],
     ]) {
       expect(redactMcpUrl(url!)).toBe(shown!);
     }
@@ -274,7 +282,7 @@ describe("the URL shown is the URL dialed", () => {
     expect(r).toMatchObject({ type: "response.error" }); // "…" is not a URL anyone was shown
     // The shown form is no consent to a project's hidden path...
     const shown = (await m.handle({ type: "mcp.adopt", id: "b", server: "longurl", sessionId: sid, url: "https://evil.example/…" }, auth(ALL), client)) as { error?: string };
-    expect(shown.error).toContain("pass the full URL");
+    expect(shown.error).toContain("name its full URL");
     // ...and the full one is refused as too long to read.
     const named = (await m.handle({ type: "mcp.adopt", id: "c", server: "longurl", sessionId: sid, url: long }, auth(ALL), client)) as { error?: string };
     expect(named.error).toContain("unusually long");
@@ -332,6 +340,23 @@ describe("bounded", () => {
     expect(matcher).not.toContain("hunter2secret");
   });
 
+  it("checking every entry of thousands for adoption is linear — even when all of them need a sign-in", () => {
+    const all: ClaudeConfigMcpServer[] = Array.from({ length: 15_000 }, (_, i) => ({
+      name: `s${i}`,
+      scope: "workdir",
+      path: join(work, ".mcp.json"),
+      command: null,
+      args: [],
+      envKeys: [],
+      url: `https://h${i}.example.com/mcp`,
+      type: "http",
+    }));
+    const registry = new McpRegistry({}, { memoryEnabled: false });
+    const t0 = performance.now();
+    for (const s of all) adoptionRefusal(s, all, registry, []);
+    expect(performance.now() - t0).toBeLessThan(2_000);
+  });
+
   it("hostile URLs and text cost little to clean — at the limit and past it", () => {
     const near = (unit: string) => unit.repeat(Math.floor(1_999 / unit.length));
     const hostile = [near("a-"), near("akey_"), near("token="), near("a://"), near("-"), `https://h/${near("a/b")}`];
@@ -372,6 +397,10 @@ describe("redactMcpUrl / programName / error text", () => {
     expect(serverProgram("/opt/ghp_0123456789abcdefABCDEF/bin")).toBe("bin");
     expect(serverProgram("ghp_0123456789abcdefABCDEF")).toBe("(command)");
     expect(serverProgram("Xk9_2abQ7rT1pLm3")).toBe("(command)");
+    expect(serverProgram("tool --password=a/hunter")).toBe("(command)"); // a shell line, not a path
+    expect(redactMcpUrl("https://m.example.com/qwhxkzjfmtpvlrbnzzyxwq/mcp")).toBe("https://m.example.com/…/mcp");
+    // an error's newlines can't forge a log line
+    expect(cleanMcpError("a\nb\t[codeoid] forged")).toBe("a b [codeoid] forged");
     // a URL run as a hook isn't a program, and its last segment may be its key
     expect(programName("https://hooks.slack.com/services/T0001/B0001/abcdefghijklmnopqrstuvwx")).toBe("(command)");
   });

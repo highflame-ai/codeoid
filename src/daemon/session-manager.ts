@@ -10,8 +10,8 @@
 
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join, resolve, sep } from "node:path";
-import { cleanMcpError, type ForkPoint, RewindError, SendStoppedError, Session, type AttachedClient, type WindowScope } from "./session.js";
+import { join, resolve, sep } from "node:path";
+import { type ForkPoint, RewindError, SendStoppedError, Session, type AttachedClient, type WindowScope } from "./session.js";
 import { sweepCheckpoints } from "./checkpoints.js";
 import type { CompareRunRow } from "./store.js";
 import { type CompareState, type CompareTargetState, type ErrorCode, LIMITS } from "../protocol/types.js";
@@ -27,7 +27,7 @@ import { createPushTransport, PushService } from "./push/index.js";
 import { hasScope, SCOPES } from "../protocol/scopes.js";
 import { applyPatches, getManifest, getSnapshot, previewPatches, readMcpServerEntry, writeMcpServerEntry } from "./settings/store.js";
 import { adoptability, adoptableName, adoptedEntry, adoptionRefusal, claudeMcpServers, fromRepoFile, fullUrlRequired, isSameAdoption } from "./mcp/adopt.js";
-import { commandSummary, MAX_SHOWN_KEYS, redactMcpUrl, serverProgram, shownLabel } from "./mcp/redact.js";
+import { cleanMcpError, commandSummary, MAX_SHOWN_KEYS, redactMcpUrl, serverProgram, shownLabel } from "./mcp/redact.js";
 import { canonicalFromTranscript, turnIndexFromHistory } from "./canonical-restore.js";
 import { BackendLoginBroker, BackendLoginError, redact } from "./auth/backend-login.js";
 import { ClaudeAccountError, ClaudeAccountStore, validateAccountName } from "./claude-accounts.js";
@@ -1592,7 +1592,10 @@ mcpHub: this.#mcpHub,
           args: [],
           argCount: s.args.length,
           url: s.url === null ? null : redactMcpUrl(s.url),
-          // Everything else read from the file is a short label, bounded.
+          // Everything else read from the file is a short label, bounded. (A
+          // name is an address, so it's cut, not redacted: one that long is
+          // never adoptable anyway.)
+          name: s.name.length > 128 ? `${s.name.slice(0, 128)}…` : s.name,
           type: s.type === null ? null : shownLabel(s.type, 40),
           envKeys: s.envKeys.slice(0, MAX_SHOWN_KEYS).map((k) => shownLabel(k)),
           ...(s.headerKeys ? { headerKeys: s.headerKeys.slice(0, MAX_SHOWN_KEYS).map((k) => shownLabel(k)) } : {}),
@@ -2555,9 +2558,11 @@ mcpHub: this.#mcpHub,
     const hiddenRepo =
       msg.url === undefined ? undefined : candidates.find((c) => fullUrlRequired(c) && c.url !== msg.url && redactMcpUrl(c.url!) === msg.url);
     if (hiddenRepo) {
+      source = hiddenRepo.path;
+      url = msg.url!;
       return fail(
         "unconfirmed",
-        `this project's ${basename(hiddenRepo.path)} gives ${JSON.stringify(name)} an address with parts hidden here (${msg.url}); adopting it is consent to all of it, so pass the full URL, from ${hiddenRepo.path}`,
+        `${name} comes from this project's own files, and parts of its address are hidden here (${msg.url}); adopting it is consent to all of it, so name its full URL, from ${hiddenRepo.path}`,
       );
     }
     if (atUrl.length === 0) {

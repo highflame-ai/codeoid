@@ -15,7 +15,8 @@ import type { BackendMcpServerState, ProviderEvent } from "../daemon/providers/i
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
 import { ProviderRegistry } from "../daemon/providers/registry.js";
 import { SessionManager } from "../daemon/session-manager.js";
-import { MCP_TIMINGS, cleanMcpError } from "../daemon/session.js";
+import { cleanMcpError } from "../daemon/mcp/redact.js";
+import { MCP_TIMINGS } from "../daemon/session.js";
 import { McpHub } from "../daemon/mcp/hub.js";
 import { McpRegistry } from "../daemon/mcp/registry.js";
 import { Store } from "../daemon/store.js";

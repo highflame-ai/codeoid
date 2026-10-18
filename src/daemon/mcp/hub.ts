@@ -115,7 +115,7 @@ export class McpHub {
       // Not having signed in is not a fault of the server: no health to
       // record — and the tool list from before is gone with the credential.
       if (e instanceof McpSignInRequired) this.#status.delete(key);
-      else this.#status.set(key, { tools: [], error: errMsg(e) });
+      else this.#status.set(key, { tools: [], error: cleanMcpError(errMsg(e)) });
       this.#drop(key);
       throw e;
     }
@@ -137,7 +137,7 @@ export class McpHub {
     try {
       client = this.#clientFor(spec, scope.tenant);
     } catch (e) {
-      return { text: `mcp: ${spec.name} unavailable: ${errMsg(e)}`, isError: true };
+      return { text: `mcp: ${spec.name} unavailable: ${cleanMcpError(errMsg(e))}`, isError: true };
     }
     try {
       return await withTimeout(client.callTool(tool, args, scope), this.#timeoutMs, `${spec.name}/${tool}`);
