@@ -10,7 +10,7 @@
 
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { basename, join, resolve, sep } from "node:path";
 import { cleanMcpError, type ForkPoint, RewindError, SendStoppedError, Session, type AttachedClient, type WindowScope } from "./session.js";
 import { sweepCheckpoints } from "./checkpoints.js";
 import type { CompareRunRow } from "./store.js";
@@ -26,8 +26,8 @@ import type { Store } from "./store.js";
 import { createPushTransport, PushService } from "./push/index.js";
 import { hasScope, SCOPES } from "../protocol/scopes.js";
 import { applyPatches, getManifest, getSnapshot, previewPatches, readMcpServerEntry, writeMcpServerEntry } from "./settings/store.js";
-import { adoptability, adoptableName, adoptedEntry, adoptionRefusal, claudeMcpServers, fromRepoFile, isSameAdoption } from "./mcp/adopt.js";
-import { commandSummary, programName, redactMcpUrl } from "./mcp/redact.js";
+import { adoptability, adoptableName, adoptedEntry, adoptionRefusal, claudeMcpServers, fromRepoFile, fullUrlRequired, isSameAdoption } from "./mcp/adopt.js";
+import { commandSummary, MAX_SHOWN_KEYS, redactMcpUrl, serverProgram, shownLabel } from "./mcp/redact.js";
 import { canonicalFromTranscript, turnIndexFromHistory } from "./canonical-restore.js";
 import { BackendLoginBroker, BackendLoginError, redact } from "./auth/backend-login.js";
 import { ClaudeAccountError, ClaudeAccountStore, validateAccountName } from "./claude-accounts.js";
@@ -1588,10 +1588,14 @@ mcpHub: this.#mcpHub,
           // config keeps them in commands, args and URLs as often as in env
           // and headers (whose values are never read out). So: the program's
           // name and how many args — not their text — and the URL's shape.
-          command: s.command === null ? null : programName(s.command),
+          command: s.command === null ? null : serverProgram(s.command),
           args: [],
           argCount: s.args.length,
           url: s.url === null ? null : redactMcpUrl(s.url),
+          // Everything else read from the file is a short label, bounded.
+          type: s.type === null ? null : shownLabel(s.type, 40),
+          envKeys: s.envKeys.slice(0, MAX_SHOWN_KEYS).map((k) => shownLabel(k)),
+          ...(s.headerKeys ? { headerKeys: s.headerKeys.slice(0, MAX_SHOWN_KEYS).map((k) => shownLabel(k)) } : {}),
           ...(liveStatus !== undefined ? { liveStatus } : {}),
           ...(liveTools !== undefined ? { liveTools } : {}),
           ...(fromRepoFile(s) ? { projectFile: true as const } : {}),
@@ -1629,7 +1633,13 @@ mcpHub: this.#mcpHub,
         agents: snapshot.agents,
         skills: snapshot.skills,
         mcpServers,
-        hooks: snapshot.hooks.map((h) => ({ ...h, command: commandSummary(h.command) })),
+        hooks: snapshot.hooks.map((h) => ({
+          ...h,
+          event: shownLabel(h.event),
+          matcher: h.matcher === null ? null : shownLabel(h.matcher, 200),
+          kind: shownLabel(h.kind, 40),
+          command: commandSummary(h.command),
+        })),
         mcpReconnect: session.canReconnectMcp,
       };
     } catch (err) {
@@ -2476,11 +2486,15 @@ mcpHub: this.#mcpHub,
   #offerAdoption(s: ClaudeConfigMcpServer, all: readonly ClaudeConfigMcpServer[], liveStatus: string | undefined, auth: AuthContext): boolean {
     // Only to someone adopt would accept, and only what adopt would take.
     if (!this.#mcpOAuth || !this.#mcpRegistry || s.liveOnly) return false;
-    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE) || auth.delegationDepth > 0) return false;
-    if (adoptionRefusal(s, all, this.#mcpRegistry, this.#daemonOrigins())) return false;
     // A sign-in that the CLI can't run — not any failure: a server that's
-    // merely down would only lose its working copy everywhere.
-    return liveStatus === "needs-auth";
+    // merely down would only lose its working copy everywhere. Checked
+    // first: adoptionRefusal scans every entry, and a repo's file can hold
+    // thousands.
+    if (liveStatus !== "needs-auth") return false;
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE) || auth.delegationDepth > 0) return false;
+    // The drawer has only the URL as shown, which can't adopt this one.
+    if (fullUrlRequired(s)) return false;
+    return !adoptionRefusal(s, all, this.#mcpRegistry, this.#daemonOrigins());
   }
 
   /**
@@ -2527,12 +2541,25 @@ mcpHub: this.#mcpHub,
     const all = await claudeMcpServers(workdir);
     const candidates = all.filter((c) => c.name === name);
     // The URL the caller was shown is the redacted one (#394); one typed from
-    // their own config is the real one. Either picks the entry.
+    // their own config is the real one. Either picks the entry — but a
+    // project's URL with parts hidden only by its full text, the consent.
     // ("…" alone is never a URL anyone was shown a host for.)
     const atUrl =
       msg.url !== undefined
-        ? candidates.filter((c) => c.url === msg.url || (c.url !== null && msg.url !== "…" && redactMcpUrl(c.url) === msg.url))
+        ? candidates.filter(
+            (c) => c.url === msg.url || (c.url !== null && msg.url !== "…" && !fullUrlRequired(c) && redactMcpUrl(c.url) === msg.url),
+          )
         : candidates;
+    // The shown form of a project's URL with parts hidden picks nothing — and
+    // says why, rather than quietly picking another entry that reads the same.
+    const hiddenRepo =
+      msg.url === undefined ? undefined : candidates.find((c) => fullUrlRequired(c) && c.url !== msg.url && redactMcpUrl(c.url!) === msg.url);
+    if (hiddenRepo) {
+      return fail(
+        "unconfirmed",
+        `this project's ${basename(hiddenRepo.path)} gives ${JSON.stringify(name)} an address with parts hidden here (${msg.url}); adopting it is consent to all of it, so pass the full URL, from ${hiddenRepo.path}`,
+      );
+    }
     if (atUrl.length === 0) {
       return fail(
         "not_found",
@@ -2543,10 +2570,11 @@ mcpHub: this.#mcpHub,
       );
     }
     if (new Set(atUrl.map((c) => c.url)).size > 1) {
-      const shown = atUrl.map((c) => (c.url ? redactMcpUrl(c.url) : programName(c.command ?? "")));
-      // Two that read the same once their credentials are hidden: only the
-      // full URL, from the file itself, tells them apart.
-      const sameShown = new Set(shown).size < shown.length;
+      const shown = atUrl.map((c) => (c.url ? redactMcpUrl(c.url) : serverProgram(c.command ?? "")));
+      // Two URLs that read the same once their credentials are hidden: only
+      // the full URL, from the file itself, tells them apart.
+      const shownUrls = atUrl.flatMap((c) => (c.url ? [redactMcpUrl(c.url)] : []));
+      const sameShown = new Set(shownUrls).size < shownUrls.length;
       return fail(
         "ambiguous",
         sameShown
@@ -2564,7 +2592,12 @@ mcpHub: this.#mcpHub,
     // A repo's file can name any address (and the CLI connects it unasked):
     // adopted only when the caller names the URL — consent to that address.
     if (fromRepoFile(found) && msg.url === undefined) {
-      return fail("unconfirmed", `${name} comes from this project's own files, which chose its address; to adopt it, name that URL (${redactMcpUrl(can.url)})`);
+      return fail(
+        "unconfirmed",
+        fullUrlRequired(found)
+          ? `${name} comes from this project's own files, which chose its address; to adopt it, name its full URL, from ${found.path} (shown here as ${redactMcpUrl(can.url)})`
+          : `${name} comes from this project's own files, which chose its address; to adopt it, name that URL (${redactMcpUrl(can.url)})`,
+      );
     }
     const reply = (alreadyAdopted: boolean): DaemonMessage => ({
       type: "mcp.adopt.result",

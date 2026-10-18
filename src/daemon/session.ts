@@ -121,8 +121,8 @@ import {
 import { isElicitationTool, isSafeTool, roleDeniesTool } from "./providers/tool-safety.js";
 import type { PackActivation } from "./pipeline/index.js";
 import type { McpRegistry } from "./mcp/registry.js";
-import { adoptableName, adoptionRefusal, claudeMcpServers, fromRepoFile, shellArg } from "./mcp/adopt.js";
-import { redactMcpUrl, redactSecretText } from "./mcp/redact.js";
+import { adoptableName, adoptionRefusal, claudeMcpServers, fromRepoFile, fullUrlRequired, shellArg } from "./mcp/adopt.js";
+import { cleanMcpError, redactMcpUrl } from "./mcp/redact.js";
 import type { McpHub } from "./mcp/hub.js";
 import type { Attachment } from "../protocol/types.js";
 import { resolveAttachments } from "./attachments.js";
@@ -1848,14 +1848,17 @@ export class Session {
       // Another entry reading the same once hidden can't be told apart by
       // the shown URL: the full one, from the file, is needed.
       const twin = named.some((c) => c.url !== one.url && c.url && redactMcpUrl(c.url) === redactMcpUrl(one.url!));
-      if (twin) return { command: `codeoid mcp adopt ${name} ${session} --url <the full URL from ${basename(one.path)}>` };
+      if (twin || fullUrlRequired(one)) return { command: `codeoid mcp adopt ${name} ${session} --url <the full URL from ${basename(one.path)}>` };
       return { command: `codeoid mcp adopt ${name} ${session} --url=${shellArg(redactMcpUrl(one.url!))}` };
     }
     if (one.scope !== "workdir") return { command: `codeoid mcp adopt ${name}` };
     // A project's own server: naming its address is the consent — so say who chose it.
     if (fromRepoFile(one)) {
       return {
-        command: `codeoid mcp adopt ${name} ${session} --url=${shellArg(redactMcpUrl(one.url!))}`,
+        // Hidden parts are the repo's to name, so the consent is to the full URL.
+        command: fullUrlRequired(one)
+          ? `codeoid mcp adopt ${name} ${session} --url <the full URL from ${basename(one.path)}>`
+          : `codeoid mcp adopt ${name} ${session} --url=${shellArg(redactMcpUrl(one.url!))}`,
         note: `Its address (${redactMcpUrl(new URL(one.url!).href)}) was chosen by this project's ${basename(one.path)}: adopt it only if you trust it.`,
       };
     }
@@ -7486,27 +7489,7 @@ export const MCP_TIMINGS = {
  */
 const SAFE_MCP_NAME = /^(?:[\w.-]{1,64}|claude\.ai [\w .-]{1,54}|plugin:[\w.-]{1,40}:[\w.-]{1,40})$/;
 
-/** Longest backend error text cleaned at all: every pattern below runs on at most this much. */
-const MCP_ERROR_SCAN_CHARS = 2_000;
-
-/**
- * A backend's MCP error, fit to hand back: no control or direction-changing
- * characters, credentials redacted wherever they commonly sit (URL userinfo,
- * query strings and fragments, token-like path segments, JWTs, auth schemes,
- * key=value / "key": "value" pairs, well-known key prefixes), bounded. The
- * text comes from the server, so it's cut before any pattern runs.
- */
-export function cleanMcpError(raw: string): string {
-  const s = redactSecretText(
-    raw
-      .slice(0, MCP_ERROR_SCAN_CHARS)
-      // Invisible characters go (so they can't split a token past the rules
-      // in redactSecretText); control characters become spaces.
-      .replace(/[\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]+/g, "")
-      .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " "),
-  );
-  return s.length > 300 ? `${s.slice(0, 300)}…` : s;
-}
+export { cleanMcpError };
 
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;

@@ -1920,9 +1920,10 @@ export interface ClaudeConfigMcpServer {
    * (`~/.claude.json`, `settings.json`, `.mcp.json`, …). */
   path: string;
   /**
-   * stdio command, when present. In `claude.config` it's the program's name
-   * only (`npx`, `node`) — commands and args hold credentials as often as env
-   * does (#394); the full text is in the file at `path`.
+   * stdio command, when present. In `claude.config` it's the program's file
+   * name only (`npx`, `node`), or "(command)" when that name isn't plain or
+   * reads as a credential — commands and args hold credentials as often as
+   * env does (#394); the full text is in the file at `path`.
    */
   command: string | null;
   /** Empty in `claude.config` (see `argCount`); daemon-internal readers get the args. */

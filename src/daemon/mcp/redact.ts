@@ -73,6 +73,30 @@ export function redactSecretText(text: string): string {
 }
 
 /**
+ * A backend's MCP error, fit to hand back or log: no control or
+ * direction-changing characters, credentials redacted wherever they commonly
+ * sit (redactSecretText), at most 300 characters. The text comes from the
+ * server, so it's cut before any pattern runs.
+ */
+export function cleanMcpError(raw: string): string {
+  const s = redactSecretText(raw.slice(0, SCAN_CHARS));
+  return s.length > 300 ? `${s.slice(0, 300)}…` : s;
+}
+
+/**
+ * A short label read from a config file (a hook's matcher or event, an env
+ * or header key, a server's type): credentials redacted, at most `max`
+ * characters — a repo can't ship a megabyte of matcher to every client.
+ */
+export function shownLabel(text: string, max = 120): string {
+  const s = redactSecretText(text.slice(0, max + 1));
+  return s.length > max ? `${s.slice(0, max)}…` : s;
+}
+
+/** At most this many env or header key names are shown per server. */
+export const MAX_SHOWN_KEYS = 50;
+
+/**
  * A path segment that reads as a credential or an account id: a UUID, a
  * long hex string, a run of 16+ letters and digits mixing both, or a known
  * key format. Not one that's just long — `my-company-mcp-server-v2` stays.
@@ -106,24 +130,60 @@ export function redactMcpUrl(url: string): string {
       ? "/…"
       : u.pathname
           .split("/")
-          .map((seg) => (seg && secretSegment(seg) ? "…" : seg))
+          .map((seg) => (seg && !plainWord(seg, 24) ? "…" : seg))
           .join("/");
   return `${u.protocol}//${userinfo}${u.host}${path}${u.search ? "?…" : ""}${u.hash ? "#…" : ""}`;
 }
 
 /**
- * The program a command runs, by its name only: env assignments before it
- * skipped, quotes and directories dropped (`/usr/bin/node` → `node`,
- * `"C:\Program Files\srv.exe"` → `srv.exe`). A name that isn't a plain file
- * name, or reads as a credential, is "(command)".
+ * A word shown as is (a URL path segment, a program's name): what reads as a
+ * name, not as an id or a key — plain characters, at most `max` of them, at
+ * most four digits, no camelCase run (`aB3dEfG`), nothing secretSegment
+ * flags. "mcp", "v2", "my-company-mcp", "python3.11" pass; a dashed or
+ * base64url key, a long number, `;key=value` don't. (A short all-letters
+ * token can't be told from a word; nothing this short is a credential's
+ * usual shape.)
+ */
+function plainWord(word: string, max: number): boolean {
+  if (word.length > max || !/^[A-Za-z0-9][\w.+-]*$/.test(word)) return false;
+  if ((word.match(/\d/g) ?? []).length > 4) return false;
+  if (/[a-z][A-Z].*[a-z][A-Z]/.test(word)) return false;
+  return !secretSegment(word);
+}
+
+/** A program's file name as shown: a plain word, else "(command)". */
+function shownName(base: string): string {
+  return plainWord(base, 40) ? base : "(command)";
+}
+
+/**
+ * A stdio server's program, by its file name: the CLI runs `command` as an
+ * executable path, not a shell line, so the whole of it is the path
+ * (`C:\Program Files\nodejs\npx.cmd` → `npx.cmd`). "(command)" when that
+ * name isn't plain or reads as a credential.
+ */
+export function serverProgram(command: string): string {
+  const path = command.slice(-SCAN_CHARS).trim().replace(/^["']+|["']+$/g, "");
+  return shownName(path.split(/[\\/]/).pop() ?? "");
+}
+
+/**
+ * The program a shell command line runs (a hook's), by its name only: env
+ * assignments before it skipped, quotes and directories dropped
+ * (`/usr/bin/node` → `node`, `"C:\Program Files\srv.exe"` → `srv.exe`).
+ * "(command)" when it isn't a plain name, reads as a credential, or the
+ * line is shaped past what's read here (an escaped or quoted env value).
  */
 export function programName(command: string): string {
-  // \S and \s don't overlap, so this is one linear pass.
-  const rest = command.slice(0, SCAN_CHARS).trimStart().replace(/^(?:[A-Za-z_]\w*=\S*\s+)*/, "");
+  // An env value is skipped only if it's plain — a quote or an escape in one
+  // leaves that word first, and it's no plain name. \s and the value's
+  // characters don't overlap, so this is one linear pass.
+  const rest = command.slice(0, SCAN_CHARS).trimStart().replace(/^(?:[A-Za-z_]\w*=[^\s\\"']*\s+)*/, "");
   const quoted = /^(["'])(.*?)\1/.exec(rest);
   const first = quoted ? quoted[2] : (rest.split(/\s/)[0] ?? "");
-  const base = first.split(/[\\/]/).pop() ?? "";
-  return /^[\w.+-]{1,64}$/.test(base) && redactSecretText(base) === base ? base : "(command)";
+  // A URL isn't a program, and its last segment may be its key.
+  if (first.includes("://")) return "(command)";
+  return shownName(first.split(/[\\/]/).pop() ?? "");
 }
 
 /** A hook's command as shown: its program, and "…" for the rest. */

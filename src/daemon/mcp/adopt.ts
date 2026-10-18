@@ -22,6 +22,7 @@ import path from "node:path";
 import { McpServerSchema, type RawMcpServerConfig } from "../../config.js";
 import type { ClaudeConfigMcpServer } from "../../protocol/types.js";
 import { readClaudeConfig } from "../claude-config.js";
+import { redactMcpUrl } from "./redact.js";
 import { isReservedMcpName, type McpRegistry } from "./registry.js";
 import { mcpToolPrefix } from "./types.js";
 
@@ -84,6 +85,17 @@ export function fromRepoFile(server: ClaudeConfigMcpServer): boolean {
   // ~/.claude.json (its projects[workdir] entries); every file a repo
   // controls has another (.mcp.json, .claude/settings*.json).
   return path.basename(server.path) !== ".claude.json";
+}
+
+/**
+ * Whether adopting this entry takes its full URL, not the one shown (#394):
+ * a project's server whose URL has parts hidden. Naming a repo's URL is the
+ * consent to it, and consent to "https://host/…/mcp" isn't consent to the
+ * tenant or query a repo put behind the "…". (The user's own URLs match as
+ * shown: what's hidden there is their own credential.)
+ */
+export function fullUrlRequired(server: ClaudeConfigMcpServer): boolean {
+  return fromRepoFile(server) && server.url !== null && redactMcpUrl(server.url) !== server.url;
 }
 
 /**

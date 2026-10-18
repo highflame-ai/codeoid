@@ -13,7 +13,7 @@ import { join } from "node:path";
 import type { CodeoidConfig } from "../config.js";
 import { McpHub } from "../daemon/mcp/hub.js";
 import { McpOAuth } from "../daemon/mcp/oauth.js";
-import { commandSummary, programName, redactMcpUrl, redactSecretText } from "../daemon/mcp/redact.js";
+import { commandSummary, programName, redactMcpUrl, redactSecretText, serverProgram } from "../daemon/mcp/redact.js";
 import { cleanMcpError } from "../daemon/session.js";
 import { McpRegistry } from "../daemon/mcp/registry.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
@@ -150,7 +150,8 @@ describe("claude.config", () => {
     const by = (n: string) => r.mcpServers.find((s) => s.name === n)!;
     expect(by("db")).toMatchObject({ command: "npx", args: [], argCount: 5 });
     expect(by("gh")).toMatchObject({ command: "gh-mcp", args: [], argCount: 2 });
-    expect(by("envcmd").command).toBe("env"); // env assignments are the program's args here
+    // `command` is an executable path, not a shell line: a whole line there isn't a plain name
+    expect(by("envcmd").command).toBe("(command)");
     expect(by("notes").url).toBe("https://notes.example.com/mcp?…");
     expect(by("plain").url).toBe("https://plain.example.com/mcp"); // nothing to hide: as written
     expect(by("cred").url).toBe("https://…@ops.example.com/mcp");
@@ -197,7 +198,9 @@ describe("two entries that read the same once hidden", () => {
     const m = manager();
     const { sid } = await rows(m);
     const r = (await m.handle({ type: "mcp.adopt", id: "a", server: "twin", sessionId: sid, url: "https://t.example.com/mcp?…" }, auth(ALL), client)) as { error?: string };
-    expect(r.error).toContain("differ only in parts hidden here");
+    // The project's entry reads the same as the user's own: its shown URL
+    // picks neither, and says the full one is needed.
+    expect(r.error).toContain("parts hidden here");
     expect(r.error).toContain("pass the full URL");
     expect(leaks(r.error!)).toEqual([]);
     // The real URL, typed from the user's own config, picks it.
@@ -206,11 +209,25 @@ describe("two entries that read the same once hidden", () => {
 });
 
 describe("adopt's refusals", () => {
+  it("a project's URL with parts hidden is adopted only by its full text, which the drawer doesn't offer", async () => {
+    writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { vendor: { type: "http", url: "https://mcp.vendor.example/123e4567-e89b-12d3-a456-426614174000/mcp" } } }));
+    const m = manager();
+    const { sid } = await rows(m);
+    const shownUrl = "https://mcp.vendor.example/…/mcp";
+    const byShown = (await m.handle({ type: "mcp.adopt", id: "a", server: "vendor", sessionId: sid, url: shownUrl }, auth(ALL), client)) as { error?: string };
+    expect(byShown.error).toContain("pass the full URL");
+    const unnamed = (await m.handle({ type: "mcp.adopt", id: "b", server: "vendor", sessionId: sid }, auth(ALL), client)) as { error?: string };
+    expect(unnamed.error).toContain("name its full URL");
+    const full = "https://mcp.vendor.example/123e4567-e89b-12d3-a456-426614174000/mcp";
+    expect(await m.handle({ type: "mcp.adopt", id: "c", server: "vendor", sessionId: sid, url: full }, auth(ALL), client)).toMatchObject({ type: "mcp.adopt.result" });
+  });
+
   it("name a URL without its credentials: the project's own server, and an ambiguous name", async () => {
     const m = manager();
     const { sid } = await rows(m);
     const unconfirmed = (await m.handle({ type: "mcp.adopt", id: "a", server: "repoq", sessionId: sid }, auth(ALL), client)) as { error?: string };
-    expect(unconfirmed.error).toContain("name that URL (https://repo.example.com/mcp?…)");
+    expect(unconfirmed.error).toContain("name its full URL, from ");
+    expect(unconfirmed.error).toContain("(shown here as https://repo.example.com/mcp?…)");
     const ambiguous = (await m.handle({ type: "mcp.adopt", id: "b", server: "dup", sessionId: sid }, auth(ALL), client)) as { error?: string };
     expect(ambiguous.error).toContain("more than one server");
     expect(leaks(JSON.stringify([unconfirmed, ambiguous]))).toEqual([]);
@@ -232,6 +249,19 @@ describe("the URL shown is the URL dialed", () => {
     expect(redactMcpUrl("https://h.example.com/org/my-company-mcp-server-v2/mcp")).toBe("https://h.example.com/org/my-company-mcp-server-v2/mcp");
     expect(redactMcpUrl("https://h.example.com/a/123e4567-e89b-12d3-a456-426614174000/mcp")).toBe("https://h.example.com/a/…/mcp");
     expect(redactMcpUrl("https://h.example.com/a/tok_9f8e7d6c5b4a3210fedcba98/mcp")).toBe("https://h.example.com/a/…/mcp");
+    // dashed and base64url keys, key=value in a segment, long ids and words
+    for (const [url, shown] of [
+      ["https://m.example.com/s/Xk9-2abQ-7rT1-pLm3-Zz8w/mcp", "https://m.example.com/s/…/mcp"],
+      ["https://m.example.com/aB3dEf_9hIjK-Lm2nOp4qR_sTu5vWx/mcp", "https://m.example.com/…/mcp"],
+      ["https://m.example.com/aBcdEfGh/mcp", "https://m.example.com/…/mcp"],
+      ["https://m.example.com/mcp;api_key=s3cr3t", "https://m.example.com/…"],
+      ["https://m.example.com/;token=Abc123Def456/mcp", "https://m.example.com/…/mcp"],
+      ["https://m.example.com/key/correcthorsebatterystaple/", "https://m.example.com/key/…/"],
+      ["https://m.example.com/u/1234567890123456789/", "https://m.example.com/u/…/"],
+      ["https://m.example.com/api/v2/mcp", "https://m.example.com/api/v2/mcp"],
+    ]) {
+      expect(redactMcpUrl(url!)).toBe(shown!);
+    }
   });
 
   it("shows the host of a URL however long the rest; adopt refuses one too long to read", async () => {
@@ -242,7 +272,11 @@ describe("the URL shown is the URL dialed", () => {
     const { sid } = await rows(m);
     const r = (await m.handle({ type: "mcp.adopt", id: "a", server: "longurl", sessionId: sid, url: "…" }, auth(ALL), client)) as { error?: string };
     expect(r).toMatchObject({ type: "response.error" }); // "…" is not a URL anyone was shown
-    const named = (await m.handle({ type: "mcp.adopt", id: "b", server: "longurl", sessionId: sid, url: "https://evil.example/…" }, auth(ALL), client)) as { error?: string };
+    // The shown form is no consent to a project's hidden path...
+    const shown = (await m.handle({ type: "mcp.adopt", id: "b", server: "longurl", sessionId: sid, url: "https://evil.example/…" }, auth(ALL), client)) as { error?: string };
+    expect(shown.error).toContain("pass the full URL");
+    // ...and the full one is refused as too long to read.
+    const named = (await m.handle({ type: "mcp.adopt", id: "c", server: "longurl", sessionId: sid, url: long }, auth(ALL), client)) as { error?: string };
     expect(named.error).toContain("unusually long");
   });
 
@@ -276,6 +310,28 @@ describe("bounded", () => {
     expect(again.servers.find((s) => s.name === "notes")).toBeDefined();
   });
 
+  it("a repo file of thousands of servers, or a megabyte of matcher, costs little and ships little", async () => {
+    const many = Object.fromEntries(Array.from({ length: 15_000 }, (_, i) => [`s${i}`, { type: "http", url: `https://h${i}.example.com/mcp` }]));
+    writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: many }));
+    mkdirSync(join(work, ".claude"), { recursive: true });
+    writeFileSync(
+      join(work, ".claude", "settings.json"),
+      JSON.stringify({ hooks: { PreToolUse: [{ matcher: `Bash|token=hunter2secret|${"m".repeat(500_000)}`, hooks: [{ type: "command", command: "x" }] }] } }),
+    );
+    const m = manager();
+    const created = (await m.handle({ type: "session.create", id: "c", name: "w", workdir: work }, auth(ALL), client)) as { data: { id: string } };
+    const t0 = performance.now();
+    const r = (await m.handle({ type: "claude.config", id: "v", sessionId: created.data.id }, auth(ALL), client)) as {
+      mcpServers: ClaudeConfigMcpServer[];
+      hooks: Array<{ matcher: string | null }>;
+    };
+    expect(performance.now() - t0).toBeLessThan(3_000);
+    expect(r.mcpServers.length).toBeGreaterThan(15_000);
+    const matcher = r.hooks.find((h) => h.matcher?.startsWith("Bash"))!.matcher!;
+    expect(matcher.length).toBeLessThanOrEqual(201);
+    expect(matcher).not.toContain("hunter2secret");
+  });
+
   it("hostile URLs and text cost little to clean — at the limit and past it", () => {
     const near = (unit: string) => unit.repeat(Math.floor(1_999 / unit.length));
     const hostile = [near("a-"), near("akey_"), near("token="), near("a://"), near("-"), `https://h/${near("a/b")}`];
@@ -305,6 +361,19 @@ describe("redactMcpUrl / programName / error text", () => {
     expect(programName("sk-live-0123456789abcdef --x")).toBe("(command)");
     expect(commandSummary("curl -H 'Authorization: Bearer x' https://h")).toBe("curl …");
     expect(commandSummary("notify")).toBe("notify");
+    // a quoted or escaped env value isn't skipped past — nor shown
+    expect(programName("TOKEN=abc\\ hunter2pass curl x")).toBe("(command)");
+    expect(programName('TOKEN="abc hunter2pass" curl x')).toBe("(command)");
+    // long real names stay; a credential-shaped one doesn't
+    expect(programName("mcp-server-postgres2024 --x")).toBe("mcp-server-postgres2024");
+    // a server's command is a path, spaces and all
+    expect(serverProgram("C:\\Program Files\\nodejs\\npx.cmd")).toBe("npx.cmd");
+    expect(serverProgram("/Users/Jane Doe/.local/bin/uvx")).toBe("uvx");
+    expect(serverProgram("/opt/ghp_0123456789abcdefABCDEF/bin")).toBe("bin");
+    expect(serverProgram("ghp_0123456789abcdefABCDEF")).toBe("(command)");
+    expect(serverProgram("Xk9_2abQ7rT1pLm3")).toBe("(command)");
+    // a URL run as a hook isn't a program, and its last segment may be its key
+    expect(programName("https://hooks.slack.com/services/T0001/B0001/abcdefghijklmnopqrstuvwx")).toBe("(command)");
   });
 
   it("keeps redacting basic= in error text (it moved to the key=value rule)", () => {
