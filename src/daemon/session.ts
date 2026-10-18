@@ -9,6 +9,8 @@
  *   - Scrollback stores merged SessionMessage (not deltas)
  */
 
+import { ClaudeAccountError, type ClaudeAccountStore, projectCredentialOverride } from "./claude-accounts.js";
+import { CLAUDE_DEFAULT_ACCOUNT } from "../protocol/types.js";
 import {
   CanonicalHistoryAccumulator,
   canonicalTurnChars,
@@ -123,7 +125,8 @@ import { adoptableName, adoptionRefusal, claudeMcpServers, fromRepoFile, shellAr
 import type { McpHub } from "./mcp/hub.js";
 import type { Attachment } from "../protocol/types.js";
 import { resolveAttachments } from "./attachments.js";
-import type { CodeoidConfig } from "../config.js";
+import { type CodeoidConfig, getConfigDir } from "../config.js";
+import { secretPathVerdict } from "./secret-paths.js";
 import type { CompressionRegistry } from "./compress/index.js";
 import { defaultSpillDir } from "./compress/spill.js";
 import { PRIMARY_CHAIN, RepeatToolGuard } from "./guard/index.js";
@@ -269,6 +272,10 @@ export interface SessionCreateOptions {
   name: string;
   workdir: string;
   auth: AuthContext;
+  /** The daemon's Claude account store (claude-accounts.ts). Absent = the daemon's own environment, always. */
+  claudeAccounts?: ClaudeAccountStore;
+  /** The Claude account this session chose; absent/null = follow the daemon default. Restored on resume. */
+  claudeAccount?: string | null;
   store: Store;
   transcriptStore: TranscriptStore;
   identityManager?: AgentIdentityManager;
@@ -683,6 +690,11 @@ export class Session {
 
   // Provider (re-)construction inputs — see switchProvider().
   #providersRegistry?: ProviderRegistry;
+  #claudeAccounts?: ClaudeAccountStore;
+  /** This session's own Claude account choice; null = follow the daemon default. */
+  #claudeAccount: string | null = null;
+  /** An account change arrived while busy: release the Claude query once idle. */
+  #releaseClaudeWhenIdle = false;
   #fleet?: McpSdkServerConfigWithInstance;
   #compressionRegistry?: CompressionRegistry;
   #onModels?: SessionCreateOptions["onModels"];
@@ -1164,6 +1176,8 @@ export class Session {
     // Retained for provider (re-)construction — switchProvider() rebuilds
     // the backend long after the constructor options are gone.
     this.#providersRegistry = opts.providers;
+    this.#claudeAccounts = opts.claudeAccounts;
+    this.#claudeAccount = opts.claudeAccount ?? null;
     this.#fleet = opts.fleet;
     this.#compressionRegistry = opts.compressionRegistry;
     this.#onModels = opts.onModels;
@@ -1301,6 +1315,7 @@ export class Session {
         projectId: opts.auth.projectId,
         role: this.role,
         providerId: this.#provider.id,
+        ...(this.#claudeAccount ? { claudeAccount: this.#claudeAccount } : {}),
         forkedFrom: this.forkedFrom,
         worktree: this.worktree,
         collaboration: this.collaboration,
@@ -1364,7 +1379,97 @@ export class Session {
       // Tag model reports with the factory's id (known before construction),
       // so the manager caches catalogs per-provider.
       onModels: (m) => this.#onModels?.(factory.id, m),
+      // Read per query (not captured), so a switch reaches the next turn.
+      resolveClaudeAccount: () => this.#claudeAccounts?.resolve(this.#claudeAccount) ?? null,
     });
+  }
+
+  /**
+   * This session's own Claude account choice; null = it follows the daemon
+   * default. A literal `default` pins the built-in account.
+   */
+  get claudeAccount(): string | null {
+    return this.#claudeAccount;
+  }
+
+  /**
+   * The Claude account this session runs on next — its own choice, else the
+   * daemon default, else `default`. Throws ClaudeAccountError when the account
+   * it would use no longer exists (never falls back to another credential).
+   */
+  effectiveClaudeAccount(): string {
+    return this.#claudeAccounts?.resolve(this.#claudeAccount)?.name ?? CLAUDE_DEFAULT_ACCOUNT;
+  }
+
+  /**
+   * Choose the Claude account this session runs on; null = follow the daemon
+   * default. Takes effect on the next turn: the Claude provider sees a new
+   * account fingerprint, rebuilds its query with the new credential, and
+   * RESUMES the same backing session — the conversation carries on. Safe while
+   * a turn runs (the running turn keeps its credential).
+   */
+  setClaudeAccount(account: string | null, sender: AuthContext): void {
+    if (account !== null && account !== CLAUDE_DEFAULT_ACCOUNT && !this.#claudeAccounts?.has(account)) {
+      throw new ClaudeAccountError(`no Claude account named ${JSON.stringify(account)}`);
+    }
+    const from = this.#claudeAccount ?? "(follow-default)";
+    this.#claudeAccount = account;
+    this.#store.audit(sender.sub, "session.claude_account", this.id, `from=${from} to=${account ?? "(follow-default)"}`);
+    this.#saveMetaNow();
+    this.#broadcastInfoUpdate();
+    this.releaseIdleClaudeQuery();
+  }
+
+  /**
+   * Stop this session's Claude query if it is idle, so a warm CLI process does
+   * not keep running on a credential that was just switched away from,
+   * replaced or removed (it would still answer background work on it). The
+   * next turn starts a fresh process on the current account and resumes the
+   * same conversation. A busy session keeps its process — the running turn
+   * finishes on the credential it started with, and the next turn rebuilds.
+   */
+  releaseIdleClaudeQuery(): void {
+    if (this.#provider.id !== "claude") return;
+    this.#sendChain = this.#sendChain
+      .catch(() => {})
+      .then(async () => {
+        if (this.#provider.id !== "claude") return;
+        if (this.#switchBusyReason() || this.#backgroundTasks.size > 0) {
+          // Busy: release once the turn and its background work are done, so
+          // background work can't carry on indefinitely on a removed account.
+          this.#releaseClaudeWhenIdle = true;
+          return;
+        }
+        this.#releaseClaudeWhenIdle = false;
+        await this.#teardownProvider();
+      })
+      .catch((e) => {
+        console.error(`[codeoid/session ${this.id}] releasing the idle Claude query failed: ${e instanceof Error ? e.message : String(e)}`);
+      });
+  }
+
+  /** Re-announce this session's info — its effective Claude account moved with the daemon default. */
+  announceInfo(): void {
+    this.#broadcastInfoUpdate();
+  }
+
+  /**
+   * Refuse to start a Claude turn on an account that no longer exists, or
+   * whose credential the workdir's settings would redirect. Throws
+   * ClaudeAccountError.
+   */
+  assertClaudeAccountUsable(): void {
+    if (this.#provider.id !== "claude" || !this.#claudeAccounts) return;
+    const account = this.#claudeAccounts.resolve(this.#claudeAccount); // throws ClaudeAccountError
+    if (!account) return;
+    // A named account's token must not be redirectable by the workdir's own
+    // Claude settings (claude-accounts.ts projectCredentialOverride).
+    const override = projectCredentialOverride(this.workdir);
+    if (override) {
+      throw new ClaudeAccountError(
+        `${override.file} sets ${override.key}, which would redirect Claude account "${account.name}"'s credential — remove it, or run this session on the default account`,
+      );
+    }
   }
 
   /**
@@ -2373,6 +2478,9 @@ export class Session {
     attachments?: readonly Attachment[],
     priority?: "now" | "next" | "later",
   ): Promise<void> {
+    // Before anything is recorded: a session whose Claude account was removed
+    // must not quietly run on some other credential.
+    this.assertClaudeAccountUsable();
     // Funnel through the chain. The next send awaits the previous
     // send's full settle (success or thrown). Errors propagate to the
     // caller of THIS send only — the chain itself absorbs them so a
@@ -4068,6 +4176,17 @@ export class Session {
     return this.#currentTurnId;
   }
 
+  #claudeAccountInfo(): Pick<SessionInfo, "claudeAccount" | "effectiveClaudeAccount"> {
+    if (this.#provider.id !== "claude") return {};
+    let effective: string;
+    try {
+      effective = this.effectiveClaudeAccount();
+    } catch {
+      effective = `${this.#claudeAccount ?? "?"} (missing)`;
+    }
+    return { ...(this.#claudeAccount ? { claudeAccount: this.#claudeAccount } : {}), effectiveClaudeAccount: effective };
+  }
+
   toInfo(): SessionInfo {
     return {
       id: this.id,
@@ -4080,6 +4199,7 @@ export class Session {
       attachedClients: this.#clients.size,
       role: this.role,
       providerId: this.#provider.id,
+      ...this.#claudeAccountInfo(),
       mode: this.#mode,
       turnsRemaining: this.#turnsRemaining,
       pinnedFiles: [...this.#pinnedFiles],
@@ -5108,7 +5228,29 @@ export class Session {
         }
       }
 
-      const autoApprove = this.#shouldAutoApprove(toolName);
+      // Secret-path gate (secret-paths.ts), every mode: a call naming one of the
+      // daemon's credential files or a process environment is refused; one
+      // searching a directory that holds them is asked about, never auto-run.
+      const secret = secretPathVerdict(toolName, effectiveInput, { workdir: this.workdir, configDir: getConfigDir() });
+      if (secret?.action === "deny") {
+        const reason = `${secret.path} holds credentials — agents can't read it. Manage it through codeoid instead.`;
+        this.#approvalPatchKeys.delete(approvalId);
+        this.#resolveToolCallMessage(approvalId, { phase: "cancelled", reason: "denied", message: reason });
+        this.#store.audit(sender.sub, "session.secret_path_deny", this.id, `tool=${toolName}`);
+        const infoMsg = this.#makeMessage(
+          "info",
+          `🔒 Blocked ${toolName}: ${reason}`,
+          SYSTEM_IDENTITY,
+          undefined,
+          undefined,
+          { event: "secret_path.denied", tool: toolName },
+        );
+        this.#persistAndBuffer(infoMsg);
+        this.#broadcastRaw(infoMsg);
+        return { behavior: "deny" as const, message: reason };
+      }
+
+      const autoApprove = secret?.action !== "ask" && this.#shouldAutoApprove(toolName);
 
       if (autoApprove) {
         this.#approvalIdToMessageId.delete(approvalId); // clean up — no manual approval will reference this
@@ -5611,7 +5753,9 @@ export class Session {
         // #shouldAutoApprove. Using #shouldAutoApprove here would decrement
         // twice per tool call (this handler runs in the same microtask batch
         // as canUseTool's synchronous section, always after it).
-        const autoApprove = this.#peekAutoApprove(event.name);
+        const autoApprove =
+          secretPathVerdict(event.name, event.input, { workdir: this.workdir, configDir: getConfigDir() }) === null &&
+          this.#peekAutoApprove(event.name);
         const toolMsg = this.#makeMessage(
           "tool_call",
           `${event.name}(${Object.keys(event.input).join(", ")})`,
@@ -6061,6 +6205,7 @@ export class Session {
     this.#reconcileWork("background tasks drained", { keepBackground: false });
     this.#denyPendingApprovals({ keepBackground: false });
     this.#settleBetweenTurns();
+    if (this.#releaseClaudeWhenIdle) this.releaseIdleClaudeQuery();
   }
 
   /** The provider reports background work still running. */
@@ -7121,6 +7266,9 @@ export class Session {
     // for clients or for resume — skip the persistence AND the broadcast.
     if (status === this.#status) return;
     this.#status = status;
+    if (status === "idle" && this.#releaseClaudeWhenIdle && this.#backgroundTasks.size === 0) {
+      this.releaseIdleClaudeQuery();
+    }
 
     // Turn exit with settled background work queued mid-turn: wake now. Runs
     // AFTER the flip so #maybeDeliverBackgroundReports sees status === "idle";
@@ -7224,6 +7372,8 @@ export class Session {
       projectId: this.projectId,
       role: this.role,
       providerId: this.#provider.id,
+      // In BOTH meta writes: each overwrites the whole file (see below).
+      ...(this.#claudeAccount ? { claudeAccount: this.#claudeAccount } : {}),
       ...(this.#backingFresh ? { backingFresh: true } : {}),
       ...(this.#redactedBackings.size > 0 ? { redactedBackings: [...this.#redactedBackings] } : {}),
       forkedFrom: this.forkedFrom,

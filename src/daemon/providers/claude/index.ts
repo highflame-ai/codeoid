@@ -10,6 +10,7 @@
  * SessionMessage state.  ProviderEvents are the interface between the two.
  */
 
+import type { ResolvedClaudeAccount } from "../../claude-accounts.js";
 import type { McpTenant } from "../../mcp/oauth.js";
 import {
   forkSession,
@@ -44,7 +45,8 @@ import { mcpToolPrefix, resolveEnvMap } from "../../mcp/types.js";
 import type { CompressionRegistry } from "../../compress/index.js";
 import { FLEET_TOOL_NAMES } from "../../fleet.js";
 import { rewriteBashToolInput } from "../../compress/index.js";
-import type { CodeoidConfig } from "../../../config.js";
+import { type CodeoidConfig, getConfigDir } from "../../../config.js";
+import { secretPathVerdict } from "../../secret-paths.js";
 import type { AuthContext } from "../../../protocol/types.js";
 import type {
   BackendMcpServerState,
@@ -123,6 +125,13 @@ export interface ClaudeNativeSdk {
 }
 
 export interface ClaudeProviderInit {
+  /**
+   * The Claude account this session runs on, resolved per query
+   * (claude-accounts.ts). `null` = the daemon's own environment. Read each
+   * time the query loop is (re)built; a changed fingerprint rebuilds it, so a
+   * switch takes effect on the next turn and RESUMES the same backing session.
+   */
+  resolveAccount?: () => ResolvedClaudeAccount | null;
   /** codeoid session id — used as the initial backing id and for audit/logging. */
   sessionId: string;
   /** Test seam for native continuation (#387); defaults to the real SDK. */
@@ -248,6 +257,8 @@ export class ClaudeProvider implements SessionProvider {
    * of it, changes what the query must mount and deny, which the SDK fixes at
    * construction — the next turn rebuilds it (#390). */
   #builtOAuthMcp = "";
+  /** Fingerprint of the Claude account the live query loop was started with ("" = daemon env). */
+  #builtAccount = "";
   /** Last TurnOpts — the retry after a skill approval rebuilds the loop with
    * these, then re-pushes #lastPushedContent into the SAME turn queue (#233). */
   #lastTurnOpts: TurnOpts | null = null;
@@ -720,6 +731,8 @@ export class ClaudeProvider implements SessionProvider {
       sessionId: this.#init.sessionId,
       tenant: this.#init.tenant,
     });
+    const account = this.#init.resolveAccount?.() ?? null;
+    const desiredAccount = account ? `${account.name}:${account.fingerprint}` : "";
 
     // Exact tool names we hand the SDK as pre-approved. Kept as its own list
     // (rather than inlined into `allowedTools`) because the PreToolUse hook has
@@ -739,17 +752,19 @@ export class ClaudeProvider implements SessionProvider {
         this.#builtSystemPromptAppend === desiredAppend &&
         this.#builtSkillAllowRules === desiredGrants &&
         this.#builtPluginDirs === desiredPlugins &&
-        this.#builtOAuthMcp === oauthMcp.fingerprint
+        this.#builtOAuthMcp === oauthMcp.fingerprint &&
+        this.#builtAccount === desiredAccount
       ) {
         return;
       }
       // Per-turn contributions the SDK fixes at query construction changed, so
       // the warm loop would silently use the stale value — rebuild instead.
-      // Four triggers: the system-prompt append (before_turn hooks, memory
+      // Five triggers: the system-prompt append (before_turn hooks, memory
       // workspace-index refresh — #153), the skill-command grants (a just-
       // approved command must reach allowedTools on the retry — #233), the
       // session-scoped skill plugins (a pack activation applied or swapped),
-      // and the OAuth MCP servers (adopted, signed in or out — #390). The
+      // the OAuth MCP servers (adopted, signed in or out — #390), and the
+      // Claude account (switched mid-conversation — #392). The
       // fresh query RESUMES the same backing session, so no context is lost.
       // console.log, not error: an expected control-flow event.
       const reason =
@@ -759,7 +774,9 @@ export class ClaudeProvider implements SessionProvider {
             ? "skill-command grants changed"
             : this.#builtPluginDirs !== desiredPlugins
               ? "session-scoped skill plugins changed"
-              : "OAuth MCP servers changed";
+              : this.#builtOAuthMcp !== oauthMcp.fingerprint
+                ? "OAuth MCP servers changed"
+                : `Claude account changed (now ${account?.name ?? "default"})`;
       console.log(
         `[claude-provider ${this.#init.sessionId.slice(0, 8)}] ${reason} — rebuilding query loop`,
       );
@@ -782,6 +799,7 @@ export class ClaudeProvider implements SessionProvider {
     this.#builtSkillAllowRules = desiredGrants;
     this.#builtPluginDirs = desiredPlugins;
     this.#builtOAuthMcp = oauthMcp.fingerprint;
+    this.#builtAccount = desiredAccount;
     this.#loopGeneration += 1;
     const myGeneration = this.#loopGeneration;
 
@@ -812,9 +830,17 @@ export class ClaudeProvider implements SessionProvider {
         // not exist when this provider is built — and reading it too early
         // would silently leave every call on the badge, which is the bug
         // (forge#111) rather than a partial fix for it.
-        env: buildAgentEnv(process.env, {
-          gatewayCredential: init.identityManager?.getGatewayCredential(init.sessionId),
-        }),
+        //
+        // A chosen Claude account REPLACES the credential entirely (every
+        // competing credential variable removed, its own set — see
+        // applyAccountEnv). The forge gateway re-point applies only to the
+        // daemon's own environment: a named account carries the user's own
+        // gateway token, which must never be swapped for an agent identity.
+        env: account
+          ? account.apply(buildAgentEnv(process.env))
+          : buildAgentEnv(process.env, {
+              gatewayCredential: init.identityManager?.getGatewayCredential(init.sessionId),
+            }),
         allowedTools: [
           // Every EXACT TOOL NAME here is auto-approved by the SDK BEFORE
           // canUseTool is consulted, so it never reaches our gate — the SDK
@@ -906,6 +932,31 @@ export class ClaudeProvider implements SessionProvider {
           PreToolUse: [{
             hooks: [async (rawInput) => {
               const input = rawInput as PreToolUseHookInput;
+              // The secret-path rule (secret-paths.ts) is enforced HERE too,
+              // not only in Session's canUseTool gate: the CLI allows some calls
+              // itself without asking canUseTool (reads inside the workdir in
+              // default mode, `permissions.allow` rules, pre-approved tools), and
+              // this hook sees every call whatever its permission outcome. `ask`
+              // hands the call to canUseTool, where the owner decides.
+              const secret = secretPathVerdict(input.tool_name, input.tool_input, {
+                workdir: opts.workdir,
+                configDir: getConfigDir(),
+              });
+              if (secret) {
+                if (secret.action === "deny") {
+                  init.store.audit(this.#currentSender?.sub ?? "unknown", "session.secret_path_deny", sessionId, `tool=${input.tool_name}`);
+                }
+                return {
+                  hookSpecificOutput: {
+                    hookEventName: "PreToolUse" as const,
+                    permissionDecision: secret.action,
+                    permissionDecisionReason:
+                      secret.action === "deny"
+                        ? `${secret.path} holds credentials — agents can't read it. Manage it through codeoid instead.`
+                        : `${secret.path} contains credential files — this search needs the owner's approval.`,
+                  },
+                };
+              }
               // Stand in for canUseTool on the tools the SDK pre-approved.
               // Those never reach the gate, and the gate is the only place this
               // provider emits tool_start — so without this every memory recall

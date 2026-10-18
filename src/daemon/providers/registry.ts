@@ -12,6 +12,7 @@
  * in Session/SessionManager changes.
  */
 
+import type { ResolvedClaudeAccount } from "../claude-accounts.js";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import type { Store } from "../store.js";
 import type { AgentIdentityManager } from "../agent-identity.js";
@@ -72,6 +73,8 @@ export interface ProviderSessionInit {
   compressionRegistry?: CompressionRegistry;
   /** Live model-catalog report, already tagged with the factory's id by Session. */
   onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
+  /** The session's Claude account, resolved per query — Claude backend only (claude-accounts.ts). */
+  resolveClaudeAccount?: () => ResolvedClaudeAccount | null;
 }
 
 export interface ProviderFactory {
@@ -238,6 +241,7 @@ export function createDefaultProviderRegistry(
         config: init.config,
         compressionRegistry: init.compressionRegistry,
         onModels: init.onModels,
+        resolveAccount: init.resolveClaudeAccount,
       }),
   });
   // Stateless API backends: usable only with their key in the environment

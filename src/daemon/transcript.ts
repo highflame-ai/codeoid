@@ -165,6 +165,8 @@ export interface TranscriptMeta {
   role?: "conductor" | "worker";
   /** Provider id backing the session; absent = claude (pre-upgrade metas). */
   providerId?: string;
+  /** The session's own Claude account choice (claude-accounts.ts); absent = follow the daemon default. */
+  claudeAccount?: string;
   /**
    * The backend was reset (a rewind) and has not run a turn since, so it
    * holds no conversation: on resume, re-seed it from the canonical history

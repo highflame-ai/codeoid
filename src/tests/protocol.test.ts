@@ -462,6 +462,8 @@ describe("DaemonMessage routing", () => {
           return `turns:${msg.turns.length}`;
         case "session.approvals.result":
           return `approvals:${msg.approvals.length}`;
+        case "claude.accounts.result":
+          return `claude-accounts:${msg.accounts.length}`;
         case "session.rewind.result":
           return `rewind:${msg.removedTurns}`;
         case "compare.state":

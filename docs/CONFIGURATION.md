@@ -209,3 +209,65 @@ The sign-in requires the `settings:write` scope, because it writes to the same
 `.env` that scope already governs. It takes effect for **new sessions** — a
 running session keeps the environment it started with. Only Claude is wired
 today; the mechanism is per-backend and the others follow.
+
+## Several Claude accounts
+
+One daemon can hold several Claude credentials: a personal Pro/Max subscription, a company one, and a company gateway token per workspace.
+Each session runs on one of them, two sessions can run on two accounts at once, and a session can be switched to another account mid-conversation.
+
+```bash
+codeoid account login company-max        # sign a subscription in as "company-max" (claude setup-token)
+codeoid account add-gateway gw-team-a --base-url https://gateway.example.com --header x-workspace   # value asked for, never on argv
+codeoid account add-token personal-max   # paste a token you already have (sk-ant-oat01-…); --api-key for an API key
+codeoid account ls                       # names and kinds — never a token
+codeoid account default company-max      # what every session that hasn't chosen its own runs on
+codeoid new review ~/code/app --account gw-team-a
+codeoid account use review personal-max  # switch a running session, keeping the conversation
+codeoid account use review default       # pin it to your own login
+codeoid account use review --follow-default  # track the daemon default again
+codeoid account rm gw-team-a
+```
+
+**How a switch keeps the conversation.**
+An account is only the credential a session's Claude subprocess starts with.
+Claude keeps its session history as local files in one config directory, shared by every account, so a switched session restarts its Claude query with the new credential and resumes the same Claude session.
+The switch takes effect on the session's next turn; a turn already running finishes on the old account.
+The first turn after a switch re-reads the whole context at full price, because prompt caching is per organization, and it counts against the new account's limits.
+
+**The built-in `default` account** is the daemon's own environment: your `claude login`, or `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` in `~/.codeoid/.env`.
+It is what every session uses until you name another default.
+A session that follows the default moves with it on its next turn; a session that chose its own account (`--account`, `account use`) stays on it.
+Choosing `default` explicitly pins a session to the built-in account, so it stays on your own login even when the daemon default is another account; `account use <session> --follow-default` makes it follow the daemon default again.
+
+**A session never silently changes account.**
+Applying an account removes every competing Claude credential or provider variable before setting its own (all of `ANTHROPIC_*` except model settings, every `CLAUDE_CODE_USE_*` provider switch, token file descriptors, and the like), so a stray `ANTHROPIC_API_KEY` can't take over a subscription session.
+A named account also refuses to run in a workdir whose own Claude settings (`.claude/settings.json` or `settings.local.json`, in the workdir or a parent below your home directory) set a credential variable such as `ANTHROPIC_BASE_URL`, or an `apiKeyHelper`, since a cloned repo could otherwise send the account's token to a host of its choosing.
+Switching a session's account, or replacing or removing the account it runs on, stops the session's Claude process if it is idle, so no process keeps running on the old credential.
+A session whose account was removed refuses to run until you switch it, rather than falling back to another credential.
+One thing this cannot override is an `apiKeyHelper` in your Claude settings file, since that is configuration of the shared config directory rather than environment.
+
+**`codeoid account login` never touches your own `claude login`.**
+It runs `claude setup-token` against a throwaway config directory and keeps only the token it prints, so signing a second account in can't replace the personal sign-in your other sessions use.
+
+**Where it is stored.**
+Accounts live in `~/.codeoid/claude-accounts.json`, mode 0600.
+Tokens are never sent to a client: listing accounts shows names, kinds, and a gateway's URL and header names only.
+Managing accounts needs `settings:write` (listing needs `settings:read`).
+Choosing a session's account needs `settings:write` too, whichever way: creating a session with `--account`, `account use` (including back to `default`), and forking or comparing a session that has an account of its own.
+It decides whose credential the agent runs on, which account is billed, and where the conversation is sent.
+The account list is daemon-wide, not per tenant: like the rest of `settings:write`, it belongs to whoever runs the daemon.
+
+**Agents can't read the stored tokens.**
+Agent file tools are refused on codeoid's credential files (`claude-accounts.json`, `config.json`, `.env`, `codeoid.db`, the local-mode token), on each agent CLI's own stored login (`~/.claude/.credentials.json`, `~/.codex/auth.json`, `~/.qwen/oauth_creds.json`, `~/.gemini/oauth_creds.json`), and on any process's `/proc/<pid>/environ` or memory, in every mode.
+On Claude this is enforced in a `PreToolUse` hook as well as the approval gate, so it also holds for reads the CLI would allow by itself.
+A search rooted above those files, such as a `Grep` over your home directory, is never auto-approved and waits for you instead.
+
+What this does not cover:
+
+- Shell commands can't be checked this way. In guarded mode Claude and the Gemini CLI ask before running one, but Codex's guarded policy and qwen run commands they consider read-only (like `cat`) without asking, and autonomous mode runs every command.
+- Code the workdir itself runs (a project's Claude hooks, `statusLine`, MCP servers) runs as your user and can read any of these files. Only open workdirs you trust, the same as running a repo's build scripts.
+
+To keep a Claude session's credential out of the environment its shell commands, hooks and MCP servers inherit, set `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` in `~/.codeoid/.env`.
+That is the Claude CLI's own switch: on Linux it needs bubblewrap and runs every shell command in a sandbox, so codeoid leaves the choice to you.
+
+**Behind the Highflame gateway** (a Forge sandbox, where the daemon's environment carries an `x-highflame-apikey` header), named accounts are refused: they would route requests around the gateway's guardrails and audit.

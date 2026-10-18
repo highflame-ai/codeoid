@@ -108,6 +108,7 @@ export const sessionCreateSchema = z.object({
    * schema opaquely rejecting the whole create.
    */
   providerId: z.string().min(1).max(64).optional(),
+  claudeAccount: z.string().min(1).max(64).optional(),
   /**
    * Collaborative session config (docs/collaborative-session-design.md §9).
    *
@@ -486,10 +487,47 @@ export const settingsSetSchema = z.object({
  */
 const loginBackendField = z.enum(["claude"]);
 
+const claudeAccountNameField = z.string().min(1).max(64);
+
 export const backendLoginStartSchema = z.object({
   ...base,
   type: z.literal("backend.login.start"),
   backend: loginBackendField,
+  account: claudeAccountNameField.optional(),
+});
+
+export const claudeAccountsListSchema = z.object({
+  ...base,
+  type: z.literal("claude.accounts.list"),
+});
+
+export const claudeAccountsSetSchema = z.object({
+  ...base,
+  type: z.literal("claude.accounts.set"),
+  name: claudeAccountNameField,
+  kind: z.enum(["subscription", "gateway", "api-key"]),
+  token: z.string().min(1).max(8192),
+  baseUrl: z.string().min(1).max(2048).optional(),
+  headers: z.record(z.string().min(1).max(256), z.string().max(8192)).optional(),
+});
+
+export const claudeAccountsRemoveSchema = z.object({
+  ...base,
+  type: z.literal("claude.accounts.remove"),
+  name: claudeAccountNameField,
+});
+
+export const claudeAccountsSetDefaultSchema = z.object({
+  ...base,
+  type: z.literal("claude.accounts.set_default"),
+  name: claudeAccountNameField,
+});
+
+export const sessionSetClaudeAccountSchema = z.object({
+  ...base,
+  type: z.literal("session.set_claude_account"),
+  sessionId: sessionIdField,
+  account: claudeAccountNameField.nullable(),
 });
 
 export const backendLoginSubmitSchema = z.object({
@@ -944,6 +982,11 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   skillGrantSchema,
   sessionTurnsSchema,
   sessionApprovalsSchema,
+  claudeAccountsListSchema,
+  claudeAccountsSetSchema,
+  claudeAccountsRemoveSchema,
+  claudeAccountsSetDefaultSchema,
+  sessionSetClaudeAccountSchema,
   sessionRewindSchema,
   sessionCompareSchema,
   compareGetSchema,

@@ -34,6 +34,14 @@ import type {
 import type { SkillGrantMsg, SkillGrantResultMsg } from "./skill-grant.js";
 import type { SessionRewindMsg, SessionRewindResultMsg, SessionTurnsMsg, SessionTurnsResultMsg } from "./turns.js";
 import type { SessionApprovalsMsg, SessionApprovalsResultMsg } from "./approvals.js";
+import type {
+  ClaudeAccountsListMsg,
+  ClaudeAccountsRemoveMsg,
+  ClaudeAccountsResultMsg,
+  ClaudeAccountsSetDefaultMsg,
+  ClaudeAccountsSetMsg,
+  SessionSetClaudeAccountMsg,
+} from "./claude-accounts.js";
 import type { CompareGetMsg, CompareKeepMsg, CompareListMsg, CompareListResultMsg, CompareStateMsg, SessionCompareMsg } from "./compare.js";
 import type {
   RoutineCancelRunMsg,
@@ -340,6 +348,16 @@ export interface SessionInfo {
   role?: "conductor" | "worker";
   /** Id of the provider backing this session (e.g. "claude", "gemini"). */
   providerId?: string;
+  /**
+   * Claude sessions: the account this session chose (claude-accounts.ts).
+   * Absent = it follows the daemon default.
+   */
+  claudeAccount?: string;
+  /**
+   * Claude sessions: the account it actually runs on — its own choice, else
+   * the daemon default, else `default` (the daemon's own environment).
+   */
+  effectiveClaudeAccount?: string;
   /** Current execution mode (default "interactive"). */
   mode?: SessionMode;
   /** Active SDLC pipeline phase id when this session backs a phase. Absent = not a pipeline session. */
@@ -1066,6 +1084,11 @@ export type ClientMessage =
   | SkillGrantMsg
   | SessionTurnsMsg
   | SessionApprovalsMsg
+  | ClaudeAccountsListMsg
+  | ClaudeAccountsSetMsg
+  | ClaudeAccountsRemoveMsg
+  | ClaudeAccountsSetDefaultMsg
+  | SessionSetClaudeAccountMsg
   | SessionRewindMsg
   | SessionCompareMsg
   | CompareGetMsg
@@ -1227,6 +1250,11 @@ export interface SessionCreateMsg extends BaseClientMsg {
    * the daemon default.
    */
   providerId?: string;
+  /**
+   * Claude account to run this session on (claude-accounts.ts). Absent =
+   * follow the daemon default. Unknown names are rejected.
+   */
+  claudeAccount?: string;
   /**
    * Model for this session (docs/role-model-binding.md §6.2). Validated
    * provider-aware at create (a Claude alias on a non-Claude backend is
@@ -2702,6 +2730,7 @@ export type DaemonMessage =
   | SkillGrantResultMsg
   | SessionTurnsResultMsg
   | SessionApprovalsResultMsg
+  | ClaudeAccountsResultMsg
   | SessionRewindResultMsg
   | CompareStateMsg
   | CompareListResultMsg

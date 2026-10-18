@@ -350,6 +350,11 @@ export class TerminalClient {
         const status = this.#formatStatus(s.status);
         console.log(`  ${s.name.padEnd(20)} ${status.padEnd(20)} ${s.workdir}`);
         console.log(`  ${"".padEnd(20)} id: ${s.id}  clients: ${s.attachedClients}`);
+        if (s.effectiveClaudeAccount) {
+          // Which Claude account it bills, and whether that is its own choice.
+          const own = s.claudeAccount ? "" : " (daemon default)";
+          console.log(`  ${"".padEnd(20)} claude account: ${S(s.effectiveClaudeAccount)}${own}`);
+        }
         if (s.pendingDialog) {
           // What it is waiting on, and how to answer it from here (#348).
           const how =
@@ -426,6 +431,7 @@ export class TerminalClient {
       packRole?: string;
       providerId?: string;
       model?: string;
+      claudeAccount?: string;
       collaboration?: CollaborationConfig;
     } = {},
   ): Promise<void> {
@@ -439,6 +445,7 @@ export class TerminalClient {
       // a claude session.
       ...(opts.providerId ? { providerId: opts.providerId } : {}),
       ...(opts.model ? { model: opts.model } : {}),
+      ...(opts.claudeAccount ? { claudeAccount: opts.claudeAccount } : {}),
       ...(opts.pack ? { pack: opts.pack } : {}),
       ...(opts.packRole ? { packRole: opts.packRole } : {}),
       ...(opts.collaboration ? { collaboration: opts.collaboration } : {}),
@@ -1332,6 +1339,11 @@ export class TerminalClient {
   }
 
   /** One request/response round trip — for command groups that format their own output. */
+  /** Resolve a session name or id to its id; prints why and returns null when it can't. */
+  resolveSessionId(nameOrId: string): Promise<string | null> {
+    return this.#resolveSession(nameOrId);
+  }
+
   request(msg: ClientMessage): Promise<DaemonMessage> {
     return this.#request(msg);
   }
