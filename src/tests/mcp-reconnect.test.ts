@@ -216,6 +216,17 @@ describe("session.mcp_reconnect", () => {
     expect(r.data.error).not.toContain("hunter2");
   });
 
+  it("asks for the full URL when another entry reads the same once hidden", async () => {
+    writeFileSync(join(tmp, "home", ".claude.json"), JSON.stringify({ projects: { [join(tmp, "work")]: { mcpServers: { slack: { type: "http", url: "https://slack.example.com/mcp?k=one" } } } } }));
+    writeFileSync(join(tmp, "work", ".mcp.json"), JSON.stringify({ mcpServers: { slack: { type: "http", url: "https://slack.example.com/mcp?k=two" } } }));
+    answer = () => ({ status: "needs-auth", tools: [] });
+    const m = manager();
+    m.setMcp(new McpRegistry({}, { memoryEnabled: false }), new McpHub({}));
+    const id = await sessionAfterFirstTurn(m);
+    const r = (await reconnect(m, id)) as { data: McpReconnectResult };
+    expect(r.data.error).toContain("--url <the full URL from");
+  });
+
   it("someone who couldn't adopt isn't pointed at adopting", async () => {
     writeFileSync(join(tmp, "work", ".mcp.json"), JSON.stringify({ mcpServers: { slack: { type: "http", url: "https://slack.example.com/mcp" } } }));
     answer = () => ({ status: "needs-auth", tools: [] });

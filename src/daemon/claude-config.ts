@@ -403,8 +403,13 @@ async function safeReaddir(
   }
 }
 
+/** Largest config file read: one bigger is no one's hand-written config, and
+ *  a repo's file shouldn't cost the daemon seconds to describe. */
+const MAX_CONFIG_BYTES = 1_000_000;
+
 async function safeReadFile(p: string): Promise<string | null> {
   try {
+    if ((await fs.stat(p)).size > MAX_CONFIG_BYTES) return null;
     return await fs.readFile(p, "utf-8");
   } catch {
     return null;

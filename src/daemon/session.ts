@@ -1844,7 +1844,13 @@ export class Session {
     // Adopt counts every entry of the name: another (even one it would refuse)
     // makes it ambiguous, so the URL is named.
     // The URL as shown (its credentials hidden): adopt matches that form too.
-    if (new Set(named.map((c) => c.url)).size > 1) return { command: `codeoid mcp adopt ${name} ${session} --url=${shellArg(redactMcpUrl(one.url!))}` };
+    if (new Set(named.map((c) => c.url)).size > 1) {
+      // Another entry reading the same once hidden can't be told apart by
+      // the shown URL: the full one, from the file, is needed.
+      const twin = named.some((c) => c.url !== one.url && c.url && redactMcpUrl(c.url) === redactMcpUrl(one.url!));
+      if (twin) return { command: `codeoid mcp adopt ${name} ${session} --url <the full URL from ${basename(one.path)}>` };
+      return { command: `codeoid mcp adopt ${name} ${session} --url=${shellArg(redactMcpUrl(one.url!))}` };
+    }
     if (one.scope !== "workdir") return { command: `codeoid mcp adopt ${name}` };
     // A project's own server: naming its address is the consent — so say who chose it.
     if (fromRepoFile(one)) {

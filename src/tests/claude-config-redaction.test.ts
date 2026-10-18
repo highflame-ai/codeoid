@@ -13,7 +13,7 @@ import { join } from "node:path";
 import type { CodeoidConfig } from "../config.js";
 import { McpHub } from "../daemon/mcp/hub.js";
 import { McpOAuth } from "../daemon/mcp/oauth.js";
-import { redactMcpArgs, redactMcpUrl, redactSecretText } from "../daemon/mcp/redact.js";
+import { redactMcpArgs, redactMcpUrl, redactSecretText, redactShellCommand } from "../daemon/mcp/redact.js";
 import { cleanMcpError } from "../daemon/session.js";
 import { McpRegistry } from "../daemon/mcp/registry.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
@@ -78,7 +78,10 @@ beforeEach(() => {
   writeFileSync(
     join(home, ".claude", "settings.json"),
     JSON.stringify({
-      hooks: { Stop: [{ hooks: [{ type: "command", command: "curl -H 'Authorization: Bearer sk-live-0123456789abcdef' https://hooks.example.com/notify?token=hunter2" }] }] },
+      hooks: {
+        Stop: [{ hooks: [{ type: "command", command: "curl -H 'Authorization: Bearer sk-live-0123456789abcdef' https://hooks.example.com/notify?token=hunter2" }] }],
+        Notification: [{ hooks: [{ type: "command", command: "node notify.js --api-key s3cr3tpass && curl -u admin:hunter2 https://n.example.com" }] }],
+      },
       mcpServers: { envcmd: { command: "env API_KEY=ghp_abcdefghijklmnop1234 npx srv" } },
     }),
   );
@@ -177,6 +180,26 @@ describe("everything else that shows a server's address", () => {
   });
 });
 
+describe("two entries that read the same once hidden", () => {
+  it("adopt says so and asks for the full URL; the hint doesn't offer the shown one", async () => {
+    writeFileSync(
+      join(home, ".claude.json"),
+      JSON.stringify({
+        projects: { [work]: { mcpServers: { twin: { type: "http", url: "https://t.example.com/mcp?k=hunter2" } } } },
+      }),
+    );
+    writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { twin: { type: "http", url: "https://t.example.com/mcp?k=s3cr3tpass" } } }));
+    const m = manager();
+    const { sid } = await rows(m);
+    const r = (await m.handle({ type: "mcp.adopt", id: "a", server: "twin", sessionId: sid, url: "https://t.example.com/mcp?…" }, auth(ALL), client)) as { error?: string };
+    expect(r.error).toContain("differ only in parts hidden here");
+    expect(r.error).toContain("pass the full URL");
+    expect(leaks(r.error!)).toEqual([]);
+    // The real URL, typed from the user's own config, picks it.
+    expect(await m.handle({ type: "mcp.adopt", id: "b", server: "twin", sessionId: sid, url: "https://t.example.com/mcp?k=hunter2" }, auth(ALL), client)).toMatchObject({ type: "mcp.adopt.result" });
+  });
+});
+
 describe("adopt's refusals", () => {
   it("name a URL without its credentials: the project's own server, and an ambiguous name", async () => {
     const m = manager();
@@ -200,6 +223,24 @@ describe("the URL shown is the URL dialed", () => {
     expect(redactMcpUrl("https://trusted.com@evil.com/mcp")).toBe("https://…@evil.com/mcp");
   });
 
+  it("hides a path segment that reads as a token or an id, not one that's just long", () => {
+    expect(redactMcpUrl("https://h.example.com/org/my-company-mcp-server-v2/mcp")).toBe("https://h.example.com/org/my-company-mcp-server-v2/mcp");
+    expect(redactMcpUrl("https://h.example.com/a/123e4567-e89b-12d3-a456-426614174000/mcp")).toBe("https://h.example.com/a/…/mcp");
+    expect(redactMcpUrl("https://h.example.com/a/tok_9f8e7d6c5b4a3210fedcba98/mcp")).toBe("https://h.example.com/a/…/mcp");
+  });
+
+  it("shows the host of a URL however long the rest; adopt refuses one too long to read", async () => {
+    const long = `https://evil.example/${"a".repeat(2_100)}`;
+    expect(redactMcpUrl(long)).toBe("https://evil.example/…");
+    writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { longurl: { type: "http", url: long } } }));
+    const m = manager();
+    const { sid } = await rows(m);
+    const r = (await m.handle({ type: "mcp.adopt", id: "a", server: "longurl", sessionId: sid, url: "…" }, auth(ALL), client)) as { error?: string };
+    expect(r).toMatchObject({ type: "response.error" }); // "…" is not a URL anyone was shown
+    const named = (await m.handle({ type: "mcp.adopt", id: "b", server: "longurl", sessionId: sid, url: "https://evil.example/…" }, auth(ALL), client)) as { error?: string };
+    expect(named.error).toContain("unusually long");
+  });
+
   it("never hides the host, however token-like its labels", () => {
     expect(redactMcpUrl("https://abc123def456ghi789jkl0.lambda-url.us-east-1.on.aws/mcp")).toBe("https://abc123def456ghi789jkl0.lambda-url.us-east-1.on.aws/mcp");
     expect(redactMcpUrl("https://my-service-abc123xyz-uc.a.run.app/mcp?x=1")).toBe("https://my-service-abc123xyz-uc.a.run.app/mcp?…");
@@ -207,12 +248,24 @@ describe("the URL shown is the URL dialed", () => {
 });
 
 describe("bounded", () => {
-  it("hostile args, URLs and text cost little to clean", () => {
-    for (const text of ["a-".repeat(20_000), "akey_".repeat(8_000), `--${"x-".repeat(20_000)}token`, `https://h/${"a".repeat(100_000)}`]) {
+  it("shows at most 64 args a server has, and reads no config file over 1 MB", async () => {
+    const many = Array.from({ length: 200 }, (_, i) => `arg${i}`);
+    expect(redactMcpArgs(many)).toHaveLength(65);
+    expect(redactMcpArgs(many).at(-1)).toBe("…");
+    writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { huge: { command: "x", args: ["y".repeat(1_100_000)] } } }));
+    const { servers } = await rows(manager());
+    expect(servers.find((s) => s.name === "huge")).toBeUndefined();
+  });
+
+  it("hostile args, URLs and text cost little to clean — at the limit and past it", () => {
+    const near = (unit: string) => unit.repeat(Math.floor(1_999 / unit.length));
+    const hostile = [near("a-"), near("akey_"), near("token="), near("a://"), near("-"), `https://h/${near("a/b")}`, `--${near("x-")}`];
+    for (const text of [...hostile, "a-".repeat(20_000), `https://h/${"a".repeat(100_000)}`]) {
       const t0 = performance.now();
       redactMcpArgs([text, text]);
       redactMcpUrl(text);
       redactSecretText(text);
+      redactShellCommand(text);
       expect(performance.now() - t0).toBeLessThan(200);
     }
   });
@@ -236,6 +289,27 @@ describe("redactMcpUrl / redactMcpArgs", () => {
     expect(redactMcpArgs(["-y", "@scope/pkg@1.2.3", "/srv/data"])).toEqual(["-y", "@scope/pkg@1.2.3", "/srv/data"]);
   });
 
+  it("reads camelCase flags as words; a flag naming where a credential is keeps its value", () => {
+    for (const flag of ["--apiToken", "--authToken", "--githubToken", "--slackBotToken", "--dbPassword", "--clientSecret"]) {
+      expect(redactMcpArgs([flag, "abc"])).toEqual([flag, "…"]);
+    }
+    for (const flag of ["--authtoken", "--apitoken", "--secretkey", "--refreshToken", "--session-id", "--auth-header"]) {
+      expect(redactMcpArgs([flag, "abc"])).toEqual([flag, "…"]);
+    }
+    for (const flag of ["--key-file", "--auth-type", "--session-name", "--cookie-jar", "--private-key-path"]) {
+      expect(redactMcpArgs([flag, "plain"])).toEqual([flag, "plain"]);
+    }
+  });
+
+  it("redacts a command line as its arguments are: flag values, user:password, headers", () => {
+    expect(redactShellCommand("node notify.js --api-key hunter2")).toBe("node notify.js --api-key …");
+    expect(redactShellCommand("curl -u admin:hunter2 https://x.example.com")).toBe("curl -u admin:… https://x.example.com/");
+    expect(redactShellCommand(`curl -H "Authorization: Bearer abc" https://x.example.com/n`)).toBe("curl -H 'Authorization: …' https://x.example.com/n");
+    // A command inside a quoted word (sh -c "…") is redacted as one.
+    expect(redactShellCommand(`bash -c "notify --password hunter2"`)).toBe("bash -c 'notify --password …'");
+    expect(redactShellCommand("npx -y @scope/srv --port 8080")).toBe("npx -y @scope/srv --port 8080");
+  });
+
   it("knows a credential flag by its words, not by a substring", () => {
     for (const flag of ["--pat", "--github-pat", "--pass", "--passphrase", "--sig", "--signature", "--private-key", "--access-token"]) {
       expect(redactMcpArgs([flag, "X1"])).toEqual([flag, "…"]);
@@ -248,6 +322,8 @@ describe("redactMcpUrl / redactMcpArgs", () => {
 
   it("hides a credential header's value, split or in one argument, and a value that starts with -", () => {
     expect(redactMcpArgs(["--header", "Authorization", "x1y2z3"])).toEqual(["--header", "Authorization", "…"]);
+    expect(redactMcpArgs(["--header", "X-Auth", "x1y2z3"])).toEqual(["--header", "X-Auth", "…"]);
+    expect(redactMcpArgs(["--header", "Authorization:", "x1y2z3"])).toEqual(["--header", "Authorization:", "…"]);
     expect(redactMcpArgs(["-H", "X-Api-Key: abc"])).toEqual(["-H", "X-Api-Key: …"]);
     expect(redactMcpArgs(["--password", "-weird9Value"])).toEqual(["--password", "…"]);
     expect(redactMcpArgs(["--token", "--verbose"])).toEqual(["--token", "--verbose"]); // that's another flag

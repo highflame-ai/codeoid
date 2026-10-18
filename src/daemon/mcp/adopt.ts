@@ -156,6 +156,9 @@ export function adoptability(server: ClaudeConfigMcpServer): { ok: true; url: st
   }
   // The URL is shown for consent and stored as is: the parser would quietly
   // drop a newline or tab, which could carry text into the prompt.
+  // Long enough that it couldn't be shown in full: refused, rather than
+  // asking for consent to an address the user can't read.
+  if (server.url.length > 2048) return { ok: false, reason: `${server.name}'s URL is unusually long (over 2048 characters)` };
   // ASCII only (an international domain in its punycode form): anything
   // else is either invisible or rewritten by the parser.
   if (/[\s\u0000-\u001f\u007f-\uffff]/.test(server.url)) {

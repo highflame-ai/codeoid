@@ -11,7 +11,7 @@
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, sep } from "node:path";
-import { type ForkPoint, RewindError, SendStoppedError, Session, type AttachedClient, type WindowScope } from "./session.js";
+import { cleanMcpError, type ForkPoint, RewindError, SendStoppedError, Session, type AttachedClient, type WindowScope } from "./session.js";
 import { sweepCheckpoints } from "./checkpoints.js";
 import type { CompareRunRow } from "./store.js";
 import { type CompareState, type CompareTargetState, type ErrorCode, LIMITS } from "../protocol/types.js";
@@ -27,7 +27,7 @@ import { createPushTransport, PushService } from "./push/index.js";
 import { hasScope, SCOPES } from "../protocol/scopes.js";
 import { applyPatches, getManifest, getSnapshot, previewPatches, readMcpServerEntry, writeMcpServerEntry } from "./settings/store.js";
 import { adoptability, adoptableName, adoptedEntry, adoptionRefusal, claudeMcpServers, fromRepoFile, isSameAdoption } from "./mcp/adopt.js";
-import { redactMcpArgs, redactMcpUrl, redactSecretText } from "./mcp/redact.js";
+import { redactMcpArgs, redactMcpUrl, redactShellCommand } from "./mcp/redact.js";
 import { canonicalFromTranscript, turnIndexFromHistory } from "./canonical-restore.js";
 import { BackendLoginBroker, BackendLoginError, redact } from "./auth/backend-login.js";
 import { ClaudeAccountError, ClaudeAccountStore, validateAccountName } from "./claude-accounts.js";
@@ -1586,7 +1586,7 @@ mcpHub: this.#mcpHub,
           // What leaves the daemon carries no credential (#394): a Claude
           // config keeps them in args and URLs as often as in env and headers
           // (whose values are never read out).
-          command: s.command === null ? null : redactSecretText(s.command),
+          command: s.command === null ? null : redactShellCommand(s.command),
           args: redactMcpArgs(s.args),
           url: s.url === null ? null : redactMcpUrl(s.url),
           ...(liveStatus !== undefined ? { liveStatus } : {}),
@@ -1626,7 +1626,7 @@ mcpHub: this.#mcpHub,
         agents: snapshot.agents,
         skills: snapshot.skills,
         mcpServers,
-        hooks: snapshot.hooks.map((h) => ({ ...h, command: redactSecretText(h.command) })),
+        hooks: snapshot.hooks.map((h) => ({ ...h, command: redactShellCommand(h.command) })),
         mcpReconnect: session.canReconnectMcp,
       };
     } catch (err) {
@@ -1852,7 +1852,7 @@ mcpHub: this.#mcpHub,
         toolCount: status?.tools.length ?? 0,
         tools: status?.tools ?? [],
         // A transport error can quote the server's URL, token and all.
-        ...(status?.error ? { error: redactSecretText(status.error) } : {}),
+        ...(status?.error ? { error: cleanMcpError(status.error) } : {}),
         ...(isOAuthServer(spec) ? { oauth: this.#oauthStatus(spec, auth) } : {}),
       };
     });
@@ -2525,7 +2525,11 @@ mcpHub: this.#mcpHub,
     const candidates = all.filter((c) => c.name === name);
     // The URL the caller was shown is the redacted one (#394); one typed from
     // their own config is the real one. Either picks the entry.
-    const atUrl = msg.url !== undefined ? candidates.filter((c) => c.url === msg.url || (c.url !== null && redactMcpUrl(c.url) === msg.url)) : candidates;
+    // ("…" alone is never a URL anyone was shown a host for.)
+    const atUrl =
+      msg.url !== undefined
+        ? candidates.filter((c) => c.url === msg.url || (c.url !== null && msg.url !== "…" && redactMcpUrl(c.url) === msg.url))
+        : candidates;
     if (atUrl.length === 0) {
       return fail(
         "not_found",
@@ -2536,9 +2540,15 @@ mcpHub: this.#mcpHub,
       );
     }
     if (new Set(atUrl.map((c) => c.url)).size > 1) {
+      const shown = atUrl.map((c) => (c.url ? redactMcpUrl(c.url) : redactShellCommand(c.command ?? "")));
+      // Two that read the same once their credentials are hidden: only the
+      // full URL, from the file itself, tells them apart.
+      const sameShown = new Set(shown).size < shown.length;
       return fail(
         "ambiguous",
-        `${JSON.stringify(name)} names more than one server in Claude's config (${atUrl.map((c) => (c.url ? redactMcpUrl(c.url) : c.command)).join(", ")}); say which URL`,
+        sameShown
+          ? `${JSON.stringify(name)} names servers that differ only in parts hidden here (${[...new Set(shown)].join(", ")}); pass the full URL, from ${[...new Set(atUrl.map((c) => c.path))].join(" or ")}`
+          : `${JSON.stringify(name)} names more than one server in Claude's config (${shown.join(", ")}); say which URL`,
       );
     }
     const found = atUrl[0]!;
