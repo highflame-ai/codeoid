@@ -1,16 +1,17 @@
 /**
- * Credentials out of anything codeoid shows about an MCP server or a hook
- * (#394): a Claude config keeps them in a server's args, URL and command, and
- * in hook commands, as often as in env and headers (whose values are never
- * read out at all). The same rules clean a backend's MCP error text.
+ * What codeoid shows about an MCP server or a hook from a Claude config
+ * (#394), and how backend MCP error text is cleaned.
  *
- * What identifies a server stays: the command and its flags, the host (never
- * redacted — it's the address the user is shown and may consent to), the
- * path's shape. What's hidden becomes "…".
+ * A config keeps credentials in a server's args, URL and command, and in hook
+ * commands, as often as in env and headers. Redacting them out of arbitrary
+ * shell text never closed (flags, quoting, `sh -c` bodies, heredocs…), so
+ * commands and args aren't shown at all: a server shows its program's name
+ * and how many args it has, a hook its program's name, and a URL its scheme,
+ * host and the shape of its path. The file a row came from is shown; the
+ * full text is there.
  *
- * Every input is bounded before a pattern runs: args and URLs come from files
- * a cloned repo controls (a `.mcp.json`), and these run on the daemon's event
- * loop.
+ * Every input is bounded before a pattern runs: it comes from files a cloned
+ * repo controls, and these run on the daemon's event loop.
  */
 
 /** Longest text any rule here scans; past it, the rest is cut. */
@@ -111,147 +112,23 @@ export function redactMcpUrl(url: string): string {
 }
 
 /**
- * A flag naming a credential, by its words: `--api-key`, `--github-pat`,
- * `--client-secret`, `--apiToken`. Not `--no-auth` (a switch), nor one naming
- * where a credential is, rather than what it is (`--key-file`, `--auth-type`).
+ * The program a command runs, by its name only: env assignments before it
+ * skipped, quotes and directories dropped (`/usr/bin/node` → `node`,
+ * `"C:\Program Files\srv.exe"` → `srv.exe`). A name that isn't a plain file
+ * name, or reads as a credential, is "(command)".
  */
-function secretFlag(arg: string): boolean {
-  const m = /^--?([A-Za-z][\w.-]*)$/.exec(arg);
-  return m !== null && secretName(m[1]!);
+export function programName(command: string): string {
+  // \S and \s don't overlap, so this is one linear pass.
+  const rest = command.slice(0, SCAN_CHARS).trimStart().replace(/^(?:[A-Za-z_]\w*=\S*\s+)*/, "");
+  const quoted = /^(["'])(.*?)\1/.exec(rest);
+  const first = quoted ? quoted[2] : (rest.split(/\s/)[0] ?? "");
+  const base = first.split(/[\\/]/).pop() ?? "";
+  return /^[\w.+-]{1,64}$/.test(base) && redactSecretText(base) === base ? base : "(command)";
 }
 
-/**
- * A name (a flag's, without its dashes; an env variable's) that names a
- * credential — by its words, camelCase split like kebab-case. Not a switch
- * (`no-…`), nor a name for where a credential is or how it's used
- * (`key-file`, `auth-method`, `token-limit`).
- */
-function secretName(name: string): boolean {
-  const words = name.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase().split(/[-_.]/);
-  // A switch (no-auth), or a limit (max-tokens, min-token).
-  if (/^(?:no|max|min|num)$/.test(words[0]!)) return false;
-  if (/^(?:file|path|dir|name|type|jar|mode|chain|store|ring|url|host|port|env|method|limit|version|stdin|count|max|min|size|length)$/.test(words.at(-1)!)) {
-    return false;
-  }
-  // Run together: authtoken, secretkey, apitoken — "key" only after a word
-  // that makes it one (monkey and hotkey aren't).
-  if (words.some((w) => /(?:token|secret|password|passwd|creds?)$/.test(w) || /^(?:api|auth|secret|access|private|pass|signing|encryption|master|client|session)key$/.test(w))) {
-    return true;
-  }
-  const joined = words.join("_");
-  return new RegExp(`(^|_)(?:${SECRET_WORDS})(_|$)`).test(joined) || /(^|_)(?:access|private|client)_?(?:token|key|secret)(_|$)/.test(joined);
-}
-
-/** A header whose value is a credential. */
-const SECRET_HEADER = new RegExp(`^(?:authorization|proxy-authorization|set-cookie|[\\w-]*(?:${SECRET_WORDS})[\\w-]*):?$`, "i");
-
-/** A user:password pair: curl's -u / --user takes one. */
-const USER_FLAG = /^(?:-u|--user|--proxy-user)$/;
-
-
-/**
- * A shell command line as shown (a hook's, a server's): split into words
- * (honouring quotes), each redacted as an argument is, and joined back —
- * so `--api-key VALUE` in a command hides VALUE as it would in args. A
- * quoted word that is itself a command (`sh -c "…"`) is redacted as one.
- * Past the scan limit, the rest is "…".
- */
-export function redactShellCommand(command: string): string {
-  const cut = command.length > SCAN_CHARS;
-  const text = cut ? command.slice(0, SCAN_CHARS) : command;
-  // Shell words: a word is any run of unquoted characters, escapes and
-  // quoted strings — so --password="correct horse" is one word, as it runs.
-  const words: string[] = [];
-  const re = /(?:[^\s"'\\]|\\.|"(?:[^"\\]|\\.)*"|'[^']*')+/g;
-  for (let m = re.exec(text); m; m = re.exec(text)) words.push(unquote(m[0]));
-  const redacted = redactMcpArgs(words);
-  // Decided on the word as written, not on what the argument rules made of
-  // it: a body with anything else in it redacted is still a command.
-  const shown = redacted.map((w, i) =>
-    w !== "…" && /\s/.test(words[i]!) && !isKeyValue(words[i]!) && !isHeaderArg(words[i]!) ? redactShellCommand(words[i]!) : w,
-  );
-  // Single-quote a word that's empty or has spaces, quotes or shell syntax, so the line reads as it would run.
-  const line = shown.map((w) => (w !== "" && /^[^\s'"\\$`]*$/.test(w) ? w : `'${w.replace(/'/g, "'\\''")}'`)).join(" ");
-  return cut ? `${line} …` : line;
-}
-
-/** A shell word's value: quotes removed, escapes resolved. */
-function unquote(word: string): string {
-  return word.replace(/\\(.)|"((?:[^"\\]|\\.)*)"|'([^']*)'/g, (_m, esc: string | undefined, dq: string | undefined, sq: string | undefined) =>
-    esc !== undefined ? esc : dq !== undefined ? dq.replace(/\\(.)/g, "$1") : (sq ?? ""),
-  );
-}
-
-/** A whole argument that is one "Header: value" (curl's -H), whatever the header. */
-function isHeaderArg(arg: string): boolean {
-  return /^[\w-]+\s*:\s/.test(arg);
-}
-
-/** A whole argument that is one KEY=value (an env assignment, --flag=value). */
-function isKeyValue(arg: string): boolean {
-  return /^-{0,2}[A-Za-z_][\w.-]{0,60}=/.test(arg);
-}
-
-/** Most args shown per server; the rest are one "…". */
-const MAX_ARGS = 64;
-
-/** `--user=admin:pw`, `-uadmin:pw`: a user:password pair in the same argument. */
-const USER_INLINE = /^(-u|--user=|--proxy-user=)([^:\s]*):.+$/;
-
-/**
- * A server's args as shown: a credential flag's value (the next argument, or
- * after "="), a credential header's value (`-H Authorization <value>`, or
- * "Authorization: <value>" in one argument), a user:password pair, and
- * credentials inside any argument, hidden. Whitespace inside an argument
- * reads as a plain space, so one can't pass for several.
- */
-export function redactMcpArgs(allArgs: readonly string[]): string[] {
-  const args = allArgs.length > MAX_ARGS ? allArgs.slice(0, MAX_ARGS) : allArgs;
-  const out: string[] = [];
-  let nextIsSecret = false;
-  let prev = "";
-  for (const raw of args) {
-    const arg = raw.length > SCAN_CHARS ? "…" : raw.replace(/[\t\n\r\v\f]+/g, " ");
-    // A credential flag's value is hidden, whatever it looks like — a value
-    // starting with "-" included.
-    if (nextIsSecret) {
-      out.push("…");
-      nextIsSecret = false;
-      prev = arg;
-      continue;
-    }
-    // -u user:password, as the next argument or in the same one.
-    if (USER_FLAG.test(prev) && arg.includes(":")) {
-      out.push(`${arg.slice(0, arg.indexOf(":"))}:…`);
-      prev = arg;
-      continue;
-    }
-    const inlineUser = USER_INLINE.exec(arg);
-    if (inlineUser) {
-      out.push(`${inlineUser[1]}${inlineUser[2]}:…`);
-      prev = arg;
-      continue;
-    }
-    // --flag=value and KEY=value (an env assignment): the name decides, as
-    // for --flag value, and the whole value is hidden, spaces and all.
-    const eq = arg.indexOf("=");
-    if (isKeyValue(arg) && secretName(arg.slice(0, eq).replace(/^-+/, ""))) {
-      out.push(`${arg.slice(0, eq)}=…`);
-      prev = arg;
-      continue;
-    }
-    // -H Authorization <value>: the header's name, then its value.
-    const headerName = (prev === "-H" || prev === "--header") && SECRET_HEADER.test(arg);
-    nextIsSecret = secretFlag(arg) || headerName;
-    // "Authorization: <value>" in one argument.
-    const oneArgHeader = /^([\w-]+)\s*:\s*(.+)$/.exec(arg);
-    if (oneArgHeader && SECRET_HEADER.test(oneArgHeader[1]!)) out.push(`${oneArgHeader[1]}: …`);
-    else if (nextIsSecret) out.push(arg);
-    // A URL argument is shown as a URL is: from the parser, host intact.
-    else if (/^https?:\/\//i.test(arg)) out.push(redactMcpUrl(arg));
-    else out.push(redactSecretText(arg));
-    prev = arg;
-  }
-  if (allArgs.length > MAX_ARGS) out.push("…");
-  return out;
+/** A hook's command as shown: its program, and "…" for the rest. */
+export function commandSummary(command: string): string {
+  if (!command.trim()) return "";
+  const program = programName(command);
+  return /\s/.test(command.trim()) ? `${program} …` : program;
 }

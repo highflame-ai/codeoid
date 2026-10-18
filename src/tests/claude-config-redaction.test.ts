@@ -13,7 +13,7 @@ import { join } from "node:path";
 import type { CodeoidConfig } from "../config.js";
 import { McpHub } from "../daemon/mcp/hub.js";
 import { McpOAuth } from "../daemon/mcp/oauth.js";
-import { redactMcpArgs, redactMcpUrl, redactSecretText, redactShellCommand } from "../daemon/mcp/redact.js";
+import { commandSummary, programName, redactMcpUrl, redactSecretText } from "../daemon/mcp/redact.js";
 import { cleanMcpError } from "../daemon/session.js";
 import { McpRegistry } from "../daemon/mcp/registry.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
@@ -140,16 +140,21 @@ describe("claude.config", () => {
     expect(leaks(JSON.stringify(whole))).toEqual([]);
   });
 
-  it("keeps what tells a server apart: command, flags, host and path", async () => {
-    const { servers } = await rows(manager());
-    const by = (n: string) => servers.find((s) => s.name === n)!;
-    expect(by("db").command).toBe("npx");
-    expect(by("db").args.slice(0, 3)).toEqual(["-y", "pg-mcp", "--api-key"]);
-    expect(by("db").args[4]).toContain("db.internal:5432/app");
-    expect(by("gh").args).toEqual(["--token=…", "--verbose"]);
-    expect(by("notes").url).toStartWith("https://notes.example.com/mcp");
-    expect(by("plain").url).toBe("https://plain.example.com/mcp"); // nothing to hide: unchanged
-    expect(by("cred").url).toContain("ops.example.com/mcp");
+  it("shows a server's program and how many args, a hook's program, a URL's host and path shape — not their text", async () => {
+    const m = manager();
+    const created = (await m.handle({ type: "session.create", id: "c", name: "w", workdir: work }, auth(ALL), client)) as { data: { id: string } };
+    const r = (await m.handle({ type: "claude.config", id: "v", sessionId: created.data.id }, auth(ALL), client)) as {
+      mcpServers: ClaudeConfigMcpServer[];
+      hooks: Array<{ event: string; command: string }>;
+    };
+    const by = (n: string) => r.mcpServers.find((s) => s.name === n)!;
+    expect(by("db")).toMatchObject({ command: "npx", args: [], argCount: 5 });
+    expect(by("gh")).toMatchObject({ command: "gh-mcp", args: [], argCount: 2 });
+    expect(by("envcmd").command).toBe("env"); // env assignments are the program's args here
+    expect(by("notes").url).toBe("https://notes.example.com/mcp?…");
+    expect(by("plain").url).toBe("https://plain.example.com/mcp"); // nothing to hide: as written
+    expect(by("cred").url).toBe("https://…@ops.example.com/mcp");
+    expect(r.hooks.map((h) => h.command).sort()).toEqual(["curl …", "node …"]);
   });
 });
 
@@ -248,17 +253,21 @@ describe("the URL shown is the URL dialed", () => {
 });
 
 describe("bounded", () => {
-  it("shows at most 64 args a server has, and reads no config file over 1 MB", async () => {
-    const many = Array.from({ length: 200 }, (_, i) => `arg${i}`);
-    expect(redactMcpArgs(many)).toHaveLength(65);
-    expect(redactMcpArgs(many).at(-1)).toBe("…");
+  it("reads no repo config file over 1 MB — and says so — but reads the user's own however big", async () => {
     writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { huge: { command: "x", args: ["y".repeat(1_100_000)] } } }));
     const { servers } = await rows(manager());
     expect(servers.find((s) => s.name === "huge")).toBeUndefined();
     // ...but it isn't invisible: the CLI still loads it, so the drawer says so.
     const marker = servers.find((s) => s.name === "(file too large)")!;
-    expect(marker).toMatchObject({ path: join(work, ".mcp.json"), command: expect.stringContaining("too large to describe") });
+    expect(marker).toMatchObject({ path: join(work, ".mcp.json"), command: null, note: expect.stringContaining("too large to describe") });
     expect(marker.adoptable).toBeUndefined();
+    // A settings file's hooks get the same marker, its text the daemon's own.
+    mkdirSync(join(work, ".claude"), { recursive: true });
+    writeFileSync(join(work, ".claude", "settings.json"), JSON.stringify({ hooks: {}, pad: "p".repeat(1_100_000) }));
+    const m = manager();
+    const sid = ((await m.handle({ type: "session.create", id: "c", name: "w2", workdir: work }, auth(ALL), client)) as { data: { id: string } }).data.id;
+    const r = (await m.handle({ type: "claude.config", id: "v", sessionId: sid }, auth(ALL), client)) as { hooks: Array<{ event: string; command: string; note?: string }> };
+    expect(r.hooks.find((h) => h.event === "(file too large)")).toMatchObject({ command: "", note: expect.stringContaining("settings.json is too large") });
     // ...but the user's own ~/.claude.json (which also holds Claude Code's
     // history) is read however big it has grown.
     const own = JSON.parse(readFileSync(join(home, ".claude.json"), "utf8")) as Record<string, unknown>;
@@ -267,21 +276,20 @@ describe("bounded", () => {
     expect(again.servers.find((s) => s.name === "notes")).toBeDefined();
   });
 
-  it("hostile args, URLs and text cost little to clean — at the limit and past it", () => {
+  it("hostile URLs and text cost little to clean — at the limit and past it", () => {
     const near = (unit: string) => unit.repeat(Math.floor(1_999 / unit.length));
-    const hostile = [near("a-"), near("akey_"), near("token="), near("a://"), near("-"), `https://h/${near("a/b")}`, `--${near("x-")}`];
+    const hostile = [near("a-"), near("akey_"), near("token="), near("a://"), near("-"), `https://h/${near("a/b")}`];
     for (const text of [...hostile, "a-".repeat(20_000), `https://h/${"a".repeat(100_000)}`]) {
       const t0 = performance.now();
-      redactMcpArgs([text, text]);
       redactMcpUrl(text);
       redactSecretText(text);
-      redactShellCommand(text);
+      programName(text);
       expect(performance.now() - t0).toBeLessThan(200);
     }
   });
 });
 
-describe("redactMcpUrl / redactMcpArgs", () => {
+describe("redactMcpUrl / programName / error text", () => {
   it("redacts each place a URL holds a credential, and leaves a clean one alone", () => {
     expect(redactMcpUrl("https://a.example.com/mcp")).toBe("https://a.example.com/mcp");
     expect(redactMcpUrl("https://u:pw@a.example.com/mcp")).not.toContain("pw");
@@ -290,82 +298,13 @@ describe("redactMcpUrl / redactMcpArgs", () => {
     expect(redactMcpUrl("https://a.example.com/v1/0123456789abcdef0123456789/mcp")).not.toContain("0123456789abcdef0123456789");
   });
 
-  it("redacts a flag's value, in the next argument or after =, and secrets inside an argument", () => {
-    expect(redactMcpArgs(["--api-key", "k-1", "--port", "80"])).toEqual(["--api-key", "…", "--port", "80"]);
-    expect(redactMcpArgs(["--client-secret=abc", "-p", "x"])).toEqual(["--client-secret=…", "-p", "x"]);
-    expect(redactMcpArgs(["API_TOKEN=xyz", "plain"])).toEqual(["API_TOKEN=…", "plain"]);
-    expect(redactMcpArgs(["redis://:pw@cache:6379"])[0]).not.toContain("pw@");
-    expect(redactMcpArgs(["Bearer abcdef"])[0]).not.toContain("abcdef");
-    expect(redactMcpArgs(["-y", "@scope/pkg@1.2.3", "/srv/data"])).toEqual(["-y", "@scope/pkg@1.2.3", "/srv/data"]);
-  });
-
-  it("reads camelCase flags as words; a flag naming where a credential is keeps its value", () => {
-    for (const flag of ["--apiToken", "--authToken", "--githubToken", "--slackBotToken", "--dbPassword", "--clientSecret"]) {
-      expect(redactMcpArgs([flag, "abc"])).toEqual([flag, "…"]);
-    }
-    for (const flag of ["--authtoken", "--apitoken", "--secretkey", "--refreshToken", "--session-id", "--auth-header"]) {
-      expect(redactMcpArgs([flag, "abc"])).toEqual([flag, "…"]);
-    }
-    for (const flag of ["--key-file", "--auth-type", "--session-name", "--cookie-jar", "--private-key-path"]) {
-      expect(redactMcpArgs([flag, "plain"])).toEqual([flag, "plain"]);
-    }
-  });
-
-  it("redacts a command line as its arguments are: flag values, user:password, headers", () => {
-    expect(redactShellCommand("node notify.js --api-key hunter2")).toBe("node notify.js --api-key …");
-    expect(redactShellCommand("curl -u admin:hunter2 https://x.example.com")).toBe("curl -u admin:… https://x.example.com/");
-    expect(redactShellCommand(`curl -H "Authorization: Bearer abc" https://x.example.com/n`)).toBe("curl -H 'Authorization: …' https://x.example.com/n");
-    // A command inside a quoted word (sh -c "…") is redacted as one.
-    expect(redactShellCommand(`bash -c "notify --password hunter2"`)).toBe("bash -c 'notify --password …'");
-    expect(redactShellCommand("npx -y @scope/srv --port 8080")).toBe("npx -y @scope/srv --port 8080");
-  });
-
-  it("reads a command's words as the shell does: quotes mid-word, sh -c bodies, empty strings", () => {
-    expect(redactShellCommand(`cmd --password="correct horse battery staple"`)).toBe("cmd --password=…");
-    expect(redactShellCommand(`PASSWORD='correct horse' run`)).toBe("PASSWORD=… run");
-    expect(redactShellCommand(`docker run -e "TOKEN=hunter two" img`)).toBe("docker run -e TOKEN=… img");
-    // A body is redacted as a command even when something else in it already was.
-    expect(redactShellCommand(`bash -c "TOKEN=abc node x --password hunter2"`)).not.toContain("hunter2");
-    expect(redactShellCommand(`bash -c "curl https://h.example.com/x?y=1 --api-key hunter2"`)).not.toContain("hunter2");
-    expect(redactShellCommand(`sh -c "sh -c 'srv --password x9 https://h/?q'"`)).not.toContain("x9");
-    expect(redactShellCommand(`echo "" ''`)).toBe("echo '' ''");
-  });
-
-  it("hides --flag=value and KEY=value by the name, whole values, user:password in one argument", () => {
-    expect(redactMcpArgs(["--token-value=sesame", "--accessKeyId=abcdefgh", "DB_PW=x", "--password=correct horse"])).toEqual([
-      "--token-value=…",
-      "--accessKeyId=…",
-      "DB_PW=…",
-      "--password=…",
-    ]);
-    expect(redactMcpArgs(["--user=admin:hunter2", "-uadmin:hunter2"])).toEqual(["--user=admin:…", "-uadmin:…"]);
-    expect(redactMcpArgs(["a\tb\nINJECTED"])).toEqual(["a b INJECTED"]);
-  });
-
-  it("leaves flags alone that only sound like credentials", () => {
-    for (const flag of ["--monkey", "--hotkey", "--token-limit", "--max-token", "--auth-method", "--password-stdin", "--api-key-env", "--signature-version"]) {
-      expect(redactMcpArgs([flag, "plain"])).toEqual([flag, "plain"]);
-    }
-  });
-
-  it("knows a credential flag by its words, not by a substring", () => {
-    for (const flag of ["--pat", "--github-pat", "--pass", "--passphrase", "--sig", "--signature", "--private-key", "--access-token"]) {
-      expect(redactMcpArgs([flag, "X1"])).toEqual([flag, "…"]);
-    }
-    expect(redactMcpArgs(["--passphrase=X1"])).toEqual(["--passphrase=…"]);
-    for (const flag of ["--keyboard-layout", "--author", "--no-auth"]) {
-      expect(redactMcpArgs([flag, "plain"])).toEqual([flag, "plain"]);
-    }
-  });
-
-  it("hides a credential header's value, split or in one argument, and a value that starts with -", () => {
-    expect(redactMcpArgs(["--header", "Authorization", "x1y2z3"])).toEqual(["--header", "Authorization", "…"]);
-    expect(redactMcpArgs(["--header", "X-Auth", "x1y2z3"])).toEqual(["--header", "X-Auth", "…"]);
-    expect(redactMcpArgs(["--header", "Authorization:", "x1y2z3"])).toEqual(["--header", "Authorization:", "…"]);
-    expect(redactMcpArgs(["-H", "X-Api-Key: abc"])).toEqual(["-H", "X-Api-Key: …"]);
-    expect(redactMcpArgs(["--password", "-weird9Value"])).toEqual(["--password", "…"]);
-    // A credential flag's value is hidden whatever it looks like — even one that reads as a flag.
-    expect(redactMcpArgs(["--token", "--verbose"])).toEqual(["--token", "…"]);
+  it("names a command's program only: env assignments skipped, directories dropped, nothing that reads as a secret", () => {
+    expect(programName("npx -y pg-mcp --api-key sk-live-0123456789abcdef")).toBe("npx");
+    expect(programName("API_KEY=x NODE_ENV=prod /usr/local/bin/node srv.js")).toBe("node");
+    expect(programName(`"C:\\Program Files\\srv.exe" --token t`)).toBe("srv.exe");
+    expect(programName("sk-live-0123456789abcdef --x")).toBe("(command)");
+    expect(commandSummary("curl -H 'Authorization: Bearer x' https://h")).toBe("curl …");
+    expect(commandSummary("notify")).toBe("notify");
   });
 
   it("keeps redacting basic= in error text (it moved to the key=value rule)", () => {

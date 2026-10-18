@@ -27,7 +27,7 @@ import { createPushTransport, PushService } from "./push/index.js";
 import { hasScope, SCOPES } from "../protocol/scopes.js";
 import { applyPatches, getManifest, getSnapshot, previewPatches, readMcpServerEntry, writeMcpServerEntry } from "./settings/store.js";
 import { adoptability, adoptableName, adoptedEntry, adoptionRefusal, claudeMcpServers, fromRepoFile, isSameAdoption } from "./mcp/adopt.js";
-import { redactMcpArgs, redactMcpUrl, redactShellCommand } from "./mcp/redact.js";
+import { commandSummary, programName, redactMcpUrl } from "./mcp/redact.js";
 import { canonicalFromTranscript, turnIndexFromHistory } from "./canonical-restore.js";
 import { BackendLoginBroker, BackendLoginError, redact } from "./auth/backend-login.js";
 import { ClaudeAccountError, ClaudeAccountStore, validateAccountName } from "./claude-accounts.js";
@@ -1550,8 +1550,9 @@ mcpHub: this.#mcpHub,
   ): Promise<DaemonMessage> {
     // Reuse fs:read since this only reads ~/.claude/ + workdir/.claude/ —
     // strictly broader than session.workdir, but the data is descriptive:
-    // env and header values are never read out, and MCP args, URLs and
-    // commands and hook commands are redacted (#394).
+    // env and header values are never read out, MCP and hook commands are
+    // shown by their program's name, args by their count, and URLs by host
+    // and path shape (#394).
     if (!hasScope(auth.scopes as string[], SCOPES.FS_READ)) {
       return {
         type: "response.error",
@@ -1576,7 +1577,7 @@ mcpHub: this.#mcpHub,
       // isn't known here, so neither is offered for adopting.
       const urlsByName = new Map<string, Set<string | null>>();
       for (const s of snapshot.mcpServers) urlsByName.set(s.name, (urlsByName.get(s.name) ?? new Set()).add(s.url));
-      const mcpServers = snapshot.mcpServers.map((s) => {
+      const mcpServers: ClaudeConfigMcpServer[] = snapshot.mcpServers.map((s): ClaudeConfigMcpServer => {
         const liveStatus = live.status.get(s.name);
         const liveTools = live.tools.get(s.name);
         const spec = this.#mcpRegistry?.get(s.name);
@@ -1584,10 +1585,12 @@ mcpHub: this.#mcpHub,
         return {
           ...s,
           // What leaves the daemon carries no credential (#394): a Claude
-          // config keeps them in args and URLs as often as in env and headers
-          // (whose values are never read out).
-          command: s.command === null ? null : redactShellCommand(s.command),
-          args: redactMcpArgs(s.args),
+          // config keeps them in commands, args and URLs as often as in env
+          // and headers (whose values are never read out). So: the program's
+          // name and how many args — not their text — and the URL's shape.
+          command: s.command === null ? null : programName(s.command),
+          args: [],
+          argCount: s.args.length,
           url: s.url === null ? null : redactMcpUrl(s.url),
           ...(liveStatus !== undefined ? { liveStatus } : {}),
           ...(liveTools !== undefined ? { liveTools } : {}),
@@ -1626,7 +1629,7 @@ mcpHub: this.#mcpHub,
         agents: snapshot.agents,
         skills: snapshot.skills,
         mcpServers,
-        hooks: snapshot.hooks.map((h) => ({ ...h, command: redactShellCommand(h.command) })),
+        hooks: snapshot.hooks.map((h) => ({ ...h, command: commandSummary(h.command) })),
         mcpReconnect: session.canReconnectMcp,
       };
     } catch (err) {
@@ -2540,7 +2543,7 @@ mcpHub: this.#mcpHub,
       );
     }
     if (new Set(atUrl.map((c) => c.url)).size > 1) {
-      const shown = atUrl.map((c) => (c.url ? redactMcpUrl(c.url) : redactShellCommand(c.command ?? "")));
+      const shown = atUrl.map((c) => (c.url ? redactMcpUrl(c.url) : programName(c.command ?? "")));
       // Two that read the same once their credentials are hidden: only the
       // full URL, from the file itself, tells them apart.
       const sameShown = new Set(shown).size < shown.length;

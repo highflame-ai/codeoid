@@ -1919,9 +1919,19 @@ export interface ClaudeConfigMcpServer {
   /** Absolute path to the source file that declared it
    * (`~/.claude.json`, `settings.json`, `.mcp.json`, …). */
   path: string;
-  /** stdio command, when present. */
+  /**
+   * stdio command, when present. In `claude.config` it's the program's name
+   * only (`npx`, `node`) — commands and args hold credentials as often as env
+   * does (#394); the full text is in the file at `path`.
+   */
   command: string | null;
+  /** Empty in `claude.config` (see `argCount`); daemon-internal readers get the args. */
   args: string[];
+  /** How many args the command has (`claude.config`; the args themselves aren't sent). */
+  argCount?: number;
+  /** Set by the daemon, never read from a file: why this row stands in for a
+   *  file's servers (e.g. the file is too large to describe). */
+  note?: string;
   /** Just the keys of the `env` block (values are secrets, never returned). */
   envKeys: string[];
   /** http URL for non-stdio servers. */
@@ -1976,8 +1986,12 @@ export interface ClaudeConfigHook {
   matcher: string | null;
   /** Hook kind ("command" today; future-proof). */
   kind: string;
-  /** The shell command to run. */
+  /** The shell command to run. In `claude.config`, its program's name only
+   *  ("curl …"): the full command is in the file at `path` (#394). */
   command: string;
+  /** Set by the daemon, never read from a file: why this row stands in for a
+   *  file's hooks (e.g. the file is too large to describe). */
+  note?: string;
 }
 
 export interface ClaudeConfigSnapshot {

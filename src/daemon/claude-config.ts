@@ -289,8 +289,8 @@ async function readSettings(
   if (size !== null && size > MAX_CONFIG_BYTES) {
     const note = `${path.basename(filePath)} is too large to describe here (${(size / 1_000_000).toFixed(1)} MB); the Claude CLI still loads it`;
     return {
-      mcpServers: [{ name: "(file too large)", scope, path: filePath, command: note, args: [], envKeys: [], url: null, type: null }],
-      hooks: [{ event: "(file too large)", scope, path: filePath, matcher: null, kind: "note", command: note }],
+      mcpServers: [{ name: "(file too large)", scope, path: filePath, command: null, args: [], envKeys: [], url: null, type: null, note }],
+      hooks: [{ event: "(file too large)", scope, path: filePath, matcher: null, kind: "note", command: "", note }],
     };
   }
   const content = await safeReadFile(filePath);

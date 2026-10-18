@@ -468,9 +468,18 @@ const McpList: Component<{ items: ClaudeConfigMcpServer[]; sessionId: string | n
             <Show when={m.adopted}>
               <AdoptedSignIn server={m.name} />
             </Show>
+            <Show when={m.note}>
+              <div class="mt-1 text-[11px] text-fg-muted">{m.note}</div>
+            </Show>
             <Show when={m.command}>
               <div class="mt-1 break-all font-mono text-[11px] text-fg-muted">
-                {m.command} {m.args.join(" ")}
+                {m.command}
+                <Show when={(m.argCount ?? 0) > 0}>
+                  {" "}
+                  <span class="text-fg-faint">
+                    ({m.argCount} arg{m.argCount === 1 ? "" : "s"} — see the file)
+                  </span>
+                </Show>
               </div>
             </Show>
             <Show when={m.url}>
@@ -568,9 +577,16 @@ const HooksList: Component<{ items: ClaudeConfigHook[] }> = (props) => (
                 </span>
               </Show>
             </div>
-            <pre class="mt-1 overflow-x-auto rounded border border-border bg-bg-active/40 p-2 font-mono text-[11px] text-fg">
-              {h.command}
-            </pre>
+            <Show
+              when={h.note}
+              fallback={
+                <pre class="mt-1 overflow-x-auto rounded border border-border bg-bg-active/40 p-2 font-mono text-[11px] text-fg">
+                  {h.command}
+                </pre>
+              }
+            >
+              <div class="mt-1 text-[11px] text-fg-muted">{h.note}</div>
+            </Show>
             <PathRow path={h.path} />
           </li>
         )}
