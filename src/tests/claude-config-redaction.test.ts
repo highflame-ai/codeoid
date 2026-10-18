@@ -255,6 +255,10 @@ describe("bounded", () => {
     writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { huge: { command: "x", args: ["y".repeat(1_100_000)] } } }));
     const { servers } = await rows(manager());
     expect(servers.find((s) => s.name === "huge")).toBeUndefined();
+    // ...but it isn't invisible: the CLI still loads it, so the drawer says so.
+    const marker = servers.find((s) => s.name === "(file too large)")!;
+    expect(marker).toMatchObject({ path: join(work, ".mcp.json"), command: expect.stringContaining("too large to describe") });
+    expect(marker.adoptable).toBeUndefined();
     // ...but the user's own ~/.claude.json (which also holds Claude Code's
     // history) is read however big it has grown.
     const own = JSON.parse(readFileSync(join(home, ".claude.json"), "utf8")) as Record<string, unknown>;
@@ -316,6 +320,34 @@ describe("redactMcpUrl / redactMcpArgs", () => {
     expect(redactShellCommand("npx -y @scope/srv --port 8080")).toBe("npx -y @scope/srv --port 8080");
   });
 
+  it("reads a command's words as the shell does: quotes mid-word, sh -c bodies, empty strings", () => {
+    expect(redactShellCommand(`cmd --password="correct horse battery staple"`)).toBe("cmd --password=…");
+    expect(redactShellCommand(`PASSWORD='correct horse' run`)).toBe("PASSWORD=… run");
+    expect(redactShellCommand(`docker run -e "TOKEN=hunter two" img`)).toBe("docker run -e TOKEN=… img");
+    // A body is redacted as a command even when something else in it already was.
+    expect(redactShellCommand(`bash -c "TOKEN=abc node x --password hunter2"`)).not.toContain("hunter2");
+    expect(redactShellCommand(`bash -c "curl https://h.example.com/x?y=1 --api-key hunter2"`)).not.toContain("hunter2");
+    expect(redactShellCommand(`sh -c "sh -c 'srv --password x9 https://h/?q'"`)).not.toContain("x9");
+    expect(redactShellCommand(`echo "" ''`)).toBe("echo '' ''");
+  });
+
+  it("hides --flag=value and KEY=value by the name, whole values, user:password in one argument", () => {
+    expect(redactMcpArgs(["--token-value=sesame", "--accessKeyId=abcdefgh", "DB_PW=x", "--password=correct horse"])).toEqual([
+      "--token-value=…",
+      "--accessKeyId=…",
+      "DB_PW=…",
+      "--password=…",
+    ]);
+    expect(redactMcpArgs(["--user=admin:hunter2", "-uadmin:hunter2"])).toEqual(["--user=admin:…", "-uadmin:…"]);
+    expect(redactMcpArgs(["a\tb\nINJECTED"])).toEqual(["a b INJECTED"]);
+  });
+
+  it("leaves flags alone that only sound like credentials", () => {
+    for (const flag of ["--monkey", "--hotkey", "--token-limit", "--max-token", "--auth-method", "--password-stdin", "--api-key-env", "--signature-version"]) {
+      expect(redactMcpArgs([flag, "plain"])).toEqual([flag, "plain"]);
+    }
+  });
+
   it("knows a credential flag by its words, not by a substring", () => {
     for (const flag of ["--pat", "--github-pat", "--pass", "--passphrase", "--sig", "--signature", "--private-key", "--access-token"]) {
       expect(redactMcpArgs([flag, "X1"])).toEqual([flag, "…"]);
@@ -332,7 +364,8 @@ describe("redactMcpUrl / redactMcpArgs", () => {
     expect(redactMcpArgs(["--header", "Authorization:", "x1y2z3"])).toEqual(["--header", "Authorization:", "…"]);
     expect(redactMcpArgs(["-H", "X-Api-Key: abc"])).toEqual(["-H", "X-Api-Key: …"]);
     expect(redactMcpArgs(["--password", "-weird9Value"])).toEqual(["--password", "…"]);
-    expect(redactMcpArgs(["--token", "--verbose"])).toEqual(["--token", "--verbose"]); // that's another flag
+    // A credential flag's value is hidden whatever it looks like — even one that reads as a flag.
+    expect(redactMcpArgs(["--token", "--verbose"])).toEqual(["--token", "…"]);
   });
 
   it("keeps redacting basic= in error text (it moved to the key=value rule)", () => {
