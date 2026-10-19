@@ -669,7 +669,7 @@ describe("round-2 findings stay fixed", () => {
     const long = client.callTool({ name: "sleep", arguments: { ms: 300 } });
     await Bun.sleep(50);
     const refused = await client.callTool({ name: "whoami", arguments: {} }).catch((e: unknown) => e);
-    expect(String(refused)).toContain("too many calls open");
+    expect(String(refused)).toContain("too many calls running");
     await long;
     expect(await client.callTool({ name: "whoami", arguments: {} })).toMatchObject({ content: [{ text: "you are user-1" }] });
   });
@@ -732,9 +732,10 @@ describe("round-3 findings stay fixed", () => {
     start();
     await signIn(TENANT);
     const client = await backend(mint().token);
-    const tools = (await client.listTools()).tools.map((t) => t.name);
-    expect(tools).toContain("whoami");
-    expect(tools).not.toContain("sloppy"); // left out, not passed on to break the listing
+    const listed = (await client.listTools()).tools;
+    expect(listed.map((t) => t.name)).toContain("whoami");
+    // Set right, not passed on to break the listing — nor hidden.
+    expect(listed.find((t) => t.name === "sloppy")?.inputSchema).toMatchObject({ type: "object" });
     expect(await client.callTool({ name: "whoami", arguments: {} })).toMatchObject({ content: [{ text: "you are user-1" }] });
   });
 
@@ -750,5 +751,52 @@ describe("round-3 findings stay fixed", () => {
     expect([streak.failed(), streak.failed()]).toEqual([false, false]);
     streak.succeeded();
     expect([streak.failed(), streak.failed(), streak.failed()]).toEqual([false, false, true]);
+  });
+});
+
+describe("round-4 findings stay fixed", () => {
+  it("a call the backend abandons is cancelled upstream, and holds its slot until it ends", async () => {
+    start({ limits: { requestsPerToken: 1 } });
+    await signIn(TENANT);
+    const { token } = mint();
+    const sid = (await post("notes", token, INIT)).headers.get("mcp-session-id")!;
+    await post("notes", token, { jsonrpc: "2.0", method: "notifications/initialized" }, { "Mcp-Session-Id": sid, "MCP-Protocol-Version": "2025-06-18" });
+    for (let i = 0; i < 10; i++) {
+      const gaveUp = new AbortController();
+      const call = fetch(proxy.url("notes"), {
+        method: "POST",
+        signal: gaveUp.signal,
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+          "Mcp-Session-Id": sid,
+          "MCP-Protocol-Version": "2025-06-18",
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 100 + i, method: "tools/call", params: { name: "slow", arguments: {} } }),
+      }).then((r) => r.text()).catch(() => null);
+      await Bun.sleep(60);
+      gaveUp.abort();
+      await call;
+    }
+    await until(() => fake.slowRunning === 0);
+    expect(fake.slowMax).toBe(1); // never more than the bound at once
+    expect(fake.cancelled).toBeGreaterThan(0); // each abandoned call was cancelled upstream
+  });
+
+  it("cancels don't count as a failing session: the calls beside them go on", async () => {
+    start();
+    await signIn(TENANT);
+    const client = await backend(mint().token);
+    await client.listTools();
+    const long = client.callTool({ name: "sleep", arguments: { ms: 900 } });
+    for (let i = 0; i < 3; i++) {
+      const abort = new AbortController();
+      const call = client.callTool({ name: "slow", arguments: {} }, undefined, { signal: abort.signal });
+      await Bun.sleep(60);
+      abort.abort();
+      await call.catch(() => {});
+    }
+    expect(await long).toMatchObject({ content: [{ text: "slept" }] });
   });
 });

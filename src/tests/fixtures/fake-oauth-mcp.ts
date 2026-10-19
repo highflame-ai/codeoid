@@ -84,6 +84,9 @@ export class FakeOAuthMcp {
   readonly #sessions = new Map<string, { transport: WebStandardStreamableHTTPServerTransport; server: Server }>();
   /** Calls to the `slow` tool that ended by cancellation. */
   cancelled = 0;
+  /** `slow` calls running now, and the most there ever were at once. */
+  slowRunning = 0;
+  slowMax = 0;
   /** Hold each session DELETE this long (a slow server ending a session). */
   deleteDelayMs = 0;
   /** Hold each initialize this long (a slow server to connect to). */
@@ -346,7 +349,10 @@ export class FakeOAuthMcp {
         case "structured":
           return text("not structured");
         case "slow":
+          this.slowRunning++;
+          this.slowMax = Math.max(this.slowMax, this.slowRunning);
           await new Promise<void>((resolve) => extra.signal.addEventListener("abort", () => resolve()));
+          this.slowRunning--;
           this.cancelled++;
           return text("cancelled");
         default:

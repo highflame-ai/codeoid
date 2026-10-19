@@ -82,8 +82,8 @@ export interface McpProxyLimits {
   /** Relay sessions one token may hold for one server (a backend opens one per
    *  server, and may open more — per thread, say). */
   sessionsPerServer: number;
-  /** Calls (POSTs) one token may have open at once. A session's notification
-   *  stream isn't one: the session cap bounds those. */
+  /** Calls one token may have running upstream at once — each counted until it
+   *  settles, whether or not the backend still waits for it. */
   requestsPerToken: number;
   /** Sessions one token may start per minute. */
   initializesPerMinute: number;
@@ -119,8 +119,8 @@ interface TokenRecord {
   relays: Map<string, Relay>;
   /** Relays started but not yet given a session id, per server. */
   starting: Map<string, number>;
-  /** Calls open now (bounded by `requestsPerToken`). */
-  open: number;
+  /** Calls running upstream now (bounded by `requestsPerToken`). */
+  calls: number;
   /** When its recent sessions started (bounded by `initializesPerMinute`). */
   initializes: number[];
 }
@@ -156,7 +156,7 @@ export class McpProxy implements McpProxyMount {
       .filter((s) => s.transport.kind === "http")
       .map((s) => s.name);
     const token = randomBytes(32).toString("base64url");
-    this.#tokens.set(hashOf(token), { binding, servers: new Set(servers), relays: new Map(), starting: new Map(), open: 0, initializes: [] });
+    this.#tokens.set(hashOf(token), { binding, servers: new Set(servers), relays: new Map(), starting: new Map(), calls: 0, initializes: [] });
     return { token, servers };
   }
 
@@ -233,37 +233,22 @@ export class McpProxy implements McpProxyMount {
       ? this.#registry.oauthFor(record.binding.backendId).find((s) => s.name === server && s.transport.kind === "http")
       : undefined;
     if (!spec) return rpcError(404, ErrorCode.InvalidRequest, `no MCP server "${server}" here`);
-    // Calls are counted; a session's notification stream (GET) and its end
-    // (DELETE) aren't — the session cap bounds those, and a backend must
-    // always be able to close what it opened.
-    if (req.method !== "POST") return this.#route(req, record, spec, server, token!, opts);
-    if (record.open >= this.#limits.requestsPerToken) {
-      return rpcError(429, ErrorCode.InvalidRequest, "too many calls open for this token");
-    }
-    record.open++;
-    // Counted until the response — its stream included — ends, or the backend
-    // gives up on it (a response never read is never cancelled by Bun).
-    let released = false;
-    const release = () => {
-      if (!released) {
-        released = true;
-        record.open--;
-      }
+    return this.#route(req, record, spec, server, token!, opts);
+  }
+
+  /** The token's call slots: taken when a call starts upstream, given back when it settles. */
+  #slots(record: TokenRecord): CallSlots {
+    const limit = this.#limits.requestsPerToken;
+    return {
+      acquire: () => {
+        if (record.calls >= limit) return false;
+        record.calls++;
+        return true;
+      },
+      release: () => {
+        record.calls = Math.max(0, record.calls - 1);
+      },
     };
-    req.signal.addEventListener("abort", release, { once: true });
-    try {
-      const res = await this.#route(req, record, spec, server, token!, opts);
-      if (req.signal.aborted) {
-        // Gone before the answer: nothing will read it.
-        await res.body?.cancel().catch(() => {});
-        release();
-        return res;
-      }
-      return trackBody(res, release);
-    } catch (e) {
-      release();
-      throw e;
-    }
   }
 
   async #route(
@@ -289,7 +274,10 @@ export class McpProxy implements McpProxyMount {
       if (Array.isArray(body)) return rpcError(400, ErrorCode.InvalidRequest, "batches aren't accepted");
       // Only once the body is in: a body trickled in never outlives the idle cut.
       opts.liftIdleTimeout?.();
-      return relay.handle(req, body);
+      // The calls this POST makes run with its abort signal (a backend giving
+      // up cancels them upstream) and take a slot of the token's for as long
+      // as they run — not for as long as the HTTP request lasts.
+      return httpRequest.run({ signal: req.signal, slots: this.#slots(record) }, () => relay.handle(req, body));
     }
 
     // No session yet: only an initialize starts one — checked in full before
@@ -312,7 +300,6 @@ export class McpProxy implements McpProxyMount {
     if (record.initializes.length >= this.#limits.initializesPerMinute) {
       return rpcError(429, ErrorCode.InvalidRequest, "too many new MCP sessions for this token; try again shortly");
     }
-    record.initializes.push(now);
     opts.liftIdleTimeout?.();
     // At the cap for this server, the least recently used session not busy
     // makes room (its backend re-initializes if it comes back): a backend
@@ -325,6 +312,8 @@ export class McpProxy implements McpProxyMount {
       record.relays.delete(lru[0]);
       void lru[1].close();
     }
+    // Counted once it is going ahead (a refused one spends nothing).
+    record.initializes.push(now);
     record.starting.set(server, (record.starting.get(server) ?? 0) + 1);
     let relay: Relay;
     try {
@@ -376,6 +365,15 @@ interface RelayInit {
 }
 
 type DownstreamExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
+
+interface CallSlots {
+  acquire(): boolean;
+  release(): void;
+}
+
+/** The HTTP request a backend's call arrived on: its abort signal, and the
+ *  token's call slots. Carried into the request handler the SDK runs for it. */
+const httpRequest = new AsyncLocalStorage<{ signal: AbortSignal; slots: CallSlots }>();
 
 /** The backend request an upstream message belongs to, carried through the
  *  async work it starts, so a server→client request or notification made
@@ -546,6 +544,13 @@ class Relay {
     if (request.method === "tools/call" && allow && !allow.includes(String(params?.name))) {
       return { content: [{ type: "text", text: `Tool "${String(params?.name)}" is not in the allowlist for server "${spec.name}".` }], isError: true };
     }
+    // The HTTP request this call came on: its abort cancels the call, and the
+    // token's slot is held until the call settles, however long that is.
+    const http = httpRequest.getStore();
+    if (http && !http.slots.acquire()) {
+      throw new McpError(ErrorCode.InvalidRequest, "too many calls running for this token; try again when one finishes");
+    }
+    const signal = http ? AbortSignal.any([extra.signal, http.signal]) : extra.signal;
     this.#inflight++;
     if (this.#idle) clearTimeout(this.#idle);
     let which: Promise<Client> | null = null;
@@ -557,7 +562,7 @@ class Relay {
       const client = up;
       const result = await relatedRequest.run(extra.requestId, () =>
         client.request({ method: request.method, params }, ResultSchema, {
-          signal: extra.signal,
+          signal,
           timeout: this.#init.timeoutMs,
           resetTimeoutOnProgress: true,
           maxTotalTimeout: this.#init.timeoutMs * MAX_CALL_TIMEOUTS,
@@ -596,7 +601,7 @@ class Relay {
       // The session itself is gone (closed, or the server forgot it): reopen
       // next time — the session this request used, never a newer one. Any
       // other failure is this request's alone; the calls beside it go on.
-      if (which && this.#upstream === which && (sessionGone(e) || (sessionTrouble(e) && this.#streak.failed()))) void this.#dropUpstream(which, up);
+      if (which && this.#upstream === which && (sessionGone(e) || (!signal.aborted && sessionTrouble(e) && this.#streak.failed()))) void this.#dropUpstream(which, up);
       else if (which && sessionGone(e)) void this.#dropUpstream(which, up);
       if (e instanceof McpError) throw e;
       const message = cleanMcpError(errMsg(e));
@@ -605,6 +610,7 @@ class Relay {
       throw new McpError(ErrorCode.InternalError, `${spec.name}: ${message}`);
     } finally {
       this.#inflight--;
+      http?.slots.release();
       this.#armIdle();
     }
   }
@@ -612,10 +618,14 @@ class Relay {
   /** tools/list, filtered to the allowlist; a complete listing is noted as the tenant's status. */
   #listed(result: Result, paged: boolean): Result {
     const allow = this.#init.spec.toolAllowlist;
-    // Entries that aren't valid tools are left out: a backend's client may
-    // reject a whole listing for one of them, hiding every other tool.
+    // A backend's client may reject a whole listing for one malformed tool,
+    // hiding every other: each tool is passed as the server gave it if valid,
+    // else with what's invalid set right, and left out only if unusable.
     const tools = Array.isArray(result.tools)
-      ? (result.tools as unknown[]).filter((t): t is { name: string } => ToolSchema.safeParse(t).success)
+      ? (result.tools as unknown[]).flatMap((t) => {
+          const fixed = usableTool(t);
+          return fixed ? [fixed] : [];
+        })
       : [];
     const shown = allow ? tools.filter((t) => allow.includes(String(t.name))) : tools;
     if (!paged && !result.nextCursor) this.#note({ tools: shown.map((t) => String(t.name)) });
@@ -736,32 +746,35 @@ class Relay {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-/** `res`, calling `done` once its body has been read to the end or cancelled (or at once, with none). */
-function trackBody(res: Response, done: () => void): Response {
-  if (!res.body) {
-    done();
-    return res;
+/**
+ * A tool fit for a strict client: as given when valid; otherwise its name and
+ * description, its input schema made an object schema (as given, or empty if
+ * even that won't pass), and the optional fields that are valid. Null when
+ * it has no usable name.
+ */
+function usableTool(t: unknown): { name: string } | null {
+  if (ToolSchema.safeParse(t).success) return t as { name: string };
+  if (typeof t !== "object" || t === null) return null;
+  const raw = t as Record<string, unknown>;
+  if (typeof raw.name !== "string" || raw.name.length === 0) return null;
+  const given = typeof raw.inputSchema === "object" && raw.inputSchema !== null ? (raw.inputSchema as Record<string, unknown>) : {};
+  const base = {
+    name: raw.name,
+    ...(typeof raw.description === "string" ? { description: raw.description } : {}),
+    ...(typeof raw.title === "string" ? { title: raw.title } : {}),
+  };
+  for (const inputSchema of [{ ...given, type: "object" }, { type: "object" }]) {
+    const candidate = { ...base, inputSchema };
+    if (!ToolSchema.safeParse(candidate).success) continue;
+    // What else passes on its own is kept (annotations, outputSchema, …).
+    for (const key of ["annotations", "outputSchema", "icons", "_meta", "execution"]) {
+      if (raw[key] == null) continue;
+      const withKey = { ...candidate, [key]: raw[key] };
+      if (ToolSchema.safeParse(withKey).success) Object.assign(candidate, { [key]: raw[key] });
+    }
+    return candidate;
   }
-  const reader = res.body.getReader();
-  const body = new ReadableStream<Uint8Array>({
-    async pull(controller) {
-      try {
-        const { done: end, value } = await reader.read();
-        if (end) {
-          done();
-          controller.close();
-        } else controller.enqueue(value);
-      } catch (e) {
-        done();
-        controller.error(e);
-      }
-    },
-    cancel(reason) {
-      done();
-      return reader.cancel(reason);
-    },
-  });
-  return new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers });
+  return null;
 }
 
 function hashOf(token: string): string {
