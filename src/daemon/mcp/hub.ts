@@ -272,6 +272,26 @@ export class McpHub {
     return this.#clients.has(tenantKey(name, tenant));
   }
 
+  /**
+   * What Settings shows for a registry server, as `viewer` sees it: its own
+   * client — or, for one of Claude's global servers, which sessions reach
+   * through their own snapshot of it (#395), what the viewer's sessions'
+   * clients of that name have seen.
+   */
+  observed(spec: McpServerSpec, viewer: McpTenant): { status: { tools: string[]; error?: string } | undefined; connected: boolean } {
+    const tenant = isOAuthServer(spec) ? viewer : undefined;
+    const own = { status: this.statusFor(spec.name, tenant), connected: this.hasClient(spec.name, tenant) };
+    if (own.status || own.connected || spec.origin !== "claude-global") return own;
+    const prefix = `${spec.name}\u0001`;
+    const suffix = tenantKey("", viewer);
+    const mine = (key: string) => key.startsWith(prefix) && key.endsWith(suffix);
+    const statuses = [...this.#status].filter(([k]) => mine(k)).map(([, v]) => v);
+    return {
+      status: statuses.find((st) => !st.error) ?? statuses[0],
+      connected: [...this.#clients.keys()].some(mine),
+    };
+  }
+
   /** Tear down every client (daemon stop / registry reload). */
   closeAll(): void {
     for (const [, c] of this.#clients) c.close();

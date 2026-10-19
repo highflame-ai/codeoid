@@ -25,14 +25,20 @@ This page says where each kind of server comes from, which backends it reaches, 
 - **A project's servers** are the repo's choice: a cloned repo can name any command or URL.
   Claude Code asks before it connects them, and codeoid asks for the other backends: they reach them once approved — in Claude Code, or in codeoid (the drawer's **Review & approve**, or `codeoid mcp approve <session> <server> --yes <fingerprint>`, which prints the entry and its fingerprint first).
   - Approving a command-based (stdio) server lets it run on this machine as the user the daemon runs as, with that user's files and network: approve only what you'd run yourself.
-  - Claude Code's approval is by name, as Claude Code stores it: an edit to an entry Claude Code approved stays approved.
+  - Claude Code's approval is by name, as Claude Code stores it: an edit to an entry Claude Code approved stays approved (and with "approve all project servers", so does a new entry).
+    So with Claude Code's approval, being able to edit the repo's `.mcp.json` — or a script an approved entry runs — is being able to run a command as the daemon's user, outside any backend's sandbox, from the next session's first turn or the next refresh.
+    Keep that in mind before approving a project's servers in Claude Code for a repo an agent works in unsandboxed edit modes, or prefer codeoid's approval, which a changed entry loses.
+    Every project server applied to a session is in the audit log (`mcp.workdir_server_applied`, with its fingerprint and whose approval).
     It is read only from your own `~/.claude.json` (its `enabledMcpjsonServers`, `disabledMcpjsonServers` and `enableAllProjectMcpServers` for that directory) — never from a file inside the repo directory, such as `.claude/settings.local.json`: anything there could be the repo (or a build script, or the agent) approving its own servers.
     An approval Claude Code stored in the repo directory is made once more in codeoid.
   - codeoid's approval is of exactly the entry you were shown: if the repo changes it — before you click or afterwards — it needs approving again.
-    It covers the entry's command, arguments, environment, URL and headers, shown in full before you approve — an environment or header value that refers to a variable (`${GITHUB_TOKEN}`) is shown as the reference, and resolves from the daemon's environment when the server starts; not the code a command runs, so a server started from a script in the repo (`node ./mcp/server.js`) runs whatever that script is when it starts.
+    It covers the entry's command, arguments, environment, URL and headers, shown before you approve exactly as the repo wrote them (nothing hidden or shortened; characters that wouldn't show, such as bidi overrides or zero-width spaces, are escaped as `\u{…}`).
+    An environment or header value that refers to a variable (`${GITHUB_TOKEN}`) is shown as the reference, and resolves from the daemon's environment when the server starts.
+    It doesn't cover the code a command runs: a server started from a script in the repo (`node ./mcp/server.js`) runs whatever that script is when it starts.
   - Approving in codeoid also covers a server you denied in Claude Code: the two approvals are separate.
 - **Claude** always loads its own copies of Claude's servers (the Claude CLI reads its config itself); codeoid adds the rest of the registry.
-- **Qwen** reads a project's `.mcp.json` itself and asks about each of its servers by its own approval, not codeoid's (measured: codeoid's copy of the same name is overridden by Qwen's own), so on Qwen every name the `.mcp.json` declares is left to Qwen.
+- **Qwen** reads a project's `.mcp.json` itself, under its own rules rather than codeoid's approval (measured: codeoid's copy of the same name is overridden by Qwen's own), so on Qwen every name the `.mcp.json` declares is left to Qwen.
+  Since those tools may be the repo's server, a `readonly` trust you gave a server of that name doesn't make them run without asking — on Qwen or on Claude, which reads the file too.
   Your own servers of other names still reach Qwen through codeoid.
 
 A project's server runs in the project's directory, as each backend that reads it runs it.
@@ -66,3 +72,7 @@ Asked while a turn, an approval or background work is running, it's applied befo
 Opening the drawer only looks; it applies nothing.
 
 Agents' file tools ask before they read or write `~/.claude.json`, in every mode: it holds servers' tokens, and Claude Code's approvals of project servers live there.
+Shell commands aren't covered by that: in a mode where shell commands run without asking, an agent can edit it (or codeoid's database), and so approve servers — as it can do anything else the daemon's user can.
+
+Approving, reviewing and refreshing act on a session of your account and project, as every session action does; approving needs `settings:write` on a token of your own (not a delegated one), refreshing needs `session:send`.
+There's no command yet to withdraw a codeoid approval; until there is, editing the entry in `.mcp.json` (any change to it) makes it need approving again.

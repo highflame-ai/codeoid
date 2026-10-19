@@ -215,3 +215,15 @@ export function commandSummary(command: string): string {
   const program = programName(command);
   return /\s/.test(command.trim()) ? `${program} …` : program;
 }
+
+/**
+ * Text shown for someone to approve (#395): exactly as written, nothing
+ * hidden or cut — only what wouldn't show is made visible: control, format
+ * (bidi overrides, zero-width) and separator characters become `\u{…}`, and a
+ * backslash is doubled so that can't be faked.
+ */
+export function visibleVerbatim(text: string): string {
+  return text.replace(/[\\\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Co}\p{Cn}]|(?![ ])\p{Zs}/gu, (c) =>
+    c === "\\" ? "\\\\" : `\\u{${c.codePointAt(0)!.toString(16)}}`,
+  );
+}

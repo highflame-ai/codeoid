@@ -83,6 +83,8 @@ export class SessionMcpView implements McpServerView {
   #layer: McpServerSpec[] = [];
   /** The global servers applied (this session's snapshot); null: the registry's own. */
   #globals: McpServerSpec[] | null = null;
+  /** The names the project's .mcp.json declared when applied: left to a backend that reads it itself. */
+  #mcpJsonNames: ReadonlySet<string> = new Set();
   #fingerprint = "";
   #loaded = false;
 
@@ -101,9 +103,9 @@ export class SessionMcpView implements McpServerView {
     return this.#fingerprint;
   }
 
-  /** This session's own servers in use: their hub clients are its to let go. */
+  /** This session's own servers in use, once each: their hub clients are its to let go. */
   ownSpecs(): McpServerSpec[] {
-    return [...this.#layer, ...(this.#globals ?? [])];
+    return [...new Map([...this.#layer, ...(this.#globals ?? [])].map((s) => [keyOf(s), s])).values()];
   }
 
   /** Read Claude's config (global and workdir) and apply it. */
@@ -112,10 +114,12 @@ export class SessionMcpView implements McpServerView {
     const before = new Map(this.ownSpecs().map((s) => [keyOf(s), s]));
     const globals = this.#readGlobals ? this.#globalSpecs(this.#readGlobals) : this.#globals;
     const layer = this.#resolve(this.#read, globals);
-    const fingerprint = fingerprintOfApplied(layer, globals);
+    const mcpJsonNames = mcpJsonNamesOf(this.#read);
+    const fingerprint = fingerprintOfApplied(layer, globals, mcpJsonNames);
     const changed = this.#loaded && fingerprint !== this.#fingerprint;
     this.#layer = layer;
     this.#globals = globals;
+    this.#mcpJsonNames = mcpJsonNames;
     this.#fingerprint = fingerprint;
     this.#loaded = true;
     const after = new Map(this.ownSpecs().map((s) => [keyOf(s), s]));
@@ -131,7 +135,7 @@ export class SessionMcpView implements McpServerView {
     if (!this.#loaded) return false;
     await this.#readAll();
     const globals = this.#readGlobals ? this.#globalSpecs(this.#readGlobals) : this.#globals;
-    return fingerprintOfApplied(this.#resolve(this.#read, globals), globals) !== this.#fingerprint;
+    return fingerprintOfApplied(this.#resolve(this.#read, globals), globals, mcpJsonNamesOf(this.#read)) !== this.#fingerprint;
   }
 
   /** Read Claude's config for the drawer before the view is applied (applies nothing). */
@@ -151,10 +155,11 @@ export class SessionMcpView implements McpServerView {
     const wouldLayer = this.#resolve(this.#read, freshGlobals, approvals);
     const appliedLayer = this.#loaded ? this.#layer : wouldLayer;
     const appliedGlobals = this.#loaded ? this.#globals : freshGlobals;
-    const applied = new Map(appliedLayer.map((s) => [keyOf(s), s]));
-    const would = new Set(wouldLayer.map(keyOf));
-    const merged = new Map(this.#mergedWith(undefined, appliedLayer, appliedGlobals).map((s) => [s.name, s]));
-    const mcpJsonNames = new Set(this.#read.filter((w) => isMcpJson(w.path)).map((w) => w.name));
+    const entryKey = (s: McpServerSpec) => `${s.name}\u0000${s.variant ?? ""}`; // a workdir entry: its name and fingerprint
+    const applied = new Map(appliedLayer.map((s) => [entryKey(s), s]));
+    const would = new Set(wouldLayer.map(entryKey));
+    const mcpJsonNames = this.#loaded ? this.#mcpJsonNames : mcpJsonNamesOf(this.#read);
+    const merged = new Map(this.#mergedWith(undefined, appliedLayer, appliedGlobals, mcpJsonNames).map((s) => [s.name, s]));
     const readByBackend = (name: string) =>
       backendId !== undefined && backendId !== "claude" && READS_MCP_JSON.has(backendId) && mcpJsonNames.has(name);
     return {
@@ -211,6 +216,18 @@ export class SessionMcpView implements McpServerView {
     return urls.size === 1 ? [...urls][0] : undefined;
   }
 
+  /** Whose approval let a project's server apply: Claude Code's, or codeoid's (for the audit). */
+  repoConsent(spec: McpServerSpec): "claude" | "codeoid" | undefined {
+    if (spec.origin !== "claude-repo") return undefined;
+    const w = this.#read.find((r) => r.origin === "claude-repo" && r.name === spec.name && r.fingerprint === spec.variant);
+    return w?.claudeApproval === "approved" ? "claude" : "codeoid";
+  }
+
+  /** A name the project's .mcp.json declared, on a backend that loads that file itself: its tools may be the repo's. */
+  leftToBackend(name: string, backendId: string): boolean {
+    return READS_MCP_JSON.has(backendId) && this.#mcpJsonNames.has(name);
+  }
+
   // ── McpServerView ──
 
   list(): McpServerSpec[] {
@@ -259,7 +276,7 @@ export class SessionMcpView implements McpServerView {
   }
 
   #merged(backendId: string | undefined): McpServerSpec[] {
-    return this.#mergedWith(backendId, this.#layer, this.#globals);
+    return this.#mergedWith(backendId, this.#layer, this.#globals, this.#mcpJsonNames);
   }
 
   /**
@@ -267,12 +284,17 @@ export class SessionMcpView implements McpServerView {
    * applied. On Claude the workdir layer isn't (the CLI loads its own); on a
    * backend that reads the project's .mcp.json, nothing of a name declared there is.
    */
-  #mergedWith(backendId: string | undefined, layer: readonly McpServerSpec[], globals: readonly McpServerSpec[] | null): McpServerSpec[] {
+  #mergedWith(
+    backendId: string | undefined,
+    layer: readonly McpServerSpec[],
+    globals: readonly McpServerSpec[] | null,
+    declared: ReadonlySet<string>,
+  ): McpServerSpec[] {
     const byName = new Map<string, McpServerSpec>();
     for (const s of this.#base.list()) if (!(globals && s.origin === "claude-global")) byName.set(s.name, s);
     for (const g of globals ?? []) if (!byName.has(g.name)) byName.set(g.name, g);
     if (backendId !== "claude") {
-      const mcpJsonNames = backendId && READS_MCP_JSON.has(backendId) ? new Set(this.#read.filter((w) => isMcpJson(w.path)).map((w) => w.name)) : null;
+      const mcpJsonNames = backendId && READS_MCP_JSON.has(backendId) ? declared : null;
       for (const spec of layer) {
         if (mcpJsonNames?.has(spec.name)) continue;
         const existing = byName.get(spec.name);
@@ -322,8 +344,15 @@ export class SessionMcpView implements McpServerView {
   }
 }
 
+/** A session's own server, as the hub keys its client (with the workdir and tenant). */
+export function mcpSpecKey(spec: McpServerSpec): string {
+  return keyOf(spec);
+}
+
 function keyOf(spec: McpServerSpec): string {
-  return `${spec.name}\u0000${spec.variant ?? ""}`;
+  // As the hub keys its client (hub.ts clientKey): a stdio server's workdir too.
+  const cwd = spec.transport.kind === "stdio" ? (spec.transport.cwd ?? "") : "";
+  return `${spec.name}\u0000${spec.variant ?? ""}\u0000${cwd}`;
 }
 
 function isMcpJson(file: string): boolean {
@@ -331,7 +360,11 @@ function isMcpJson(file: string): boolean {
 }
 
 /** What's applied — the workdir layer and the global snapshot — as one comparable value. */
-function fingerprintOfApplied(layer: readonly McpServerSpec[], globals: readonly McpServerSpec[] | null): string {
+function fingerprintOfApplied(layer: readonly McpServerSpec[], globals: readonly McpServerSpec[] | null, mcpJsonNames: ReadonlySet<string>): string {
   const part = (specs: readonly McpServerSpec[]) => specs.map(keyOf).sort().join("\u0001");
-  return `${part(layer)}\u0002${globals ? part(globals) : "-"}`;
+  return `${part(layer)}\u0002${globals ? part(globals) : "-"}\u0002${[...mcpJsonNames].sort().join("\u0001")}`;
+}
+
+function mcpJsonNamesOf(read: readonly WorkdirServer[]): ReadonlySet<string> {
+  return new Set(read.filter((w) => isMcpJson(w.path)).map((w) => w.name));
 }

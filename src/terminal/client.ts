@@ -792,11 +792,12 @@ export class TerminalClient {
     if (!opts.yes) {
       // The repo wrote these: no terminal control sequences reach the screen.
       const clean = sanitizeTerminalOutput;
-      console.log(clean(`${p.server}, from ${p.path} — once approved, every backend in this directory runs it, with the daemon user's files and network:`));
-      if (p.command) console.log(clean(`  command: ${[p.command, ...p.args].join(" ")}`));
+      console.log(clean(`${p.server}, from ${p.shownPath} — once approved, every backend in this directory runs it, with the daemon user's files and network:`));
+      if (p.commandLine) console.log(clean(`  command: ${p.commandLine}`));
       if (p.url) console.log(clean(`  url: ${p.url}`));
       for (const [k, v] of Object.entries(p.env)) console.log(clean(`  env ${k}=${v}`));
       for (const [k, v] of Object.entries(p.headers)) console.log(clean(`  header ${k}: ${v}`));
+      console.log("  (shown exactly as the repo wrote it; characters that wouldn't show are escaped as \\u{…})");
       console.log("  (${VAR} references resolve from the daemon's environment when it starts)");
       console.log(`To approve exactly this entry: codeoid mcp approve ${sessionIdOrName} ${p.server} --path ${JSON.stringify(p.path)} --yes ${p.fingerprint}`);
       return;

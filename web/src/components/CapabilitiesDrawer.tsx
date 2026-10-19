@@ -498,10 +498,10 @@ const McpReach: Component<{ server: ClaudeConfigMcpServer; sessionId: string | n
         {(p) => (
           <div class="mt-1 rounded border border-accent/40 bg-bg-active/40 p-2 text-[11px] text-fg">
             <div class="mb-1 text-fg-muted">
-              This project's entry, from {p().path} — once approved, every backend in this workdir runs it, with the daemon user's files and network:
+              This project's entry, from {p().shownPath} — once approved, every backend in this workdir runs it, with the daemon user's files and network:
             </div>
-            <Show when={p().command}>
-              <pre class="overflow-x-auto whitespace-pre-wrap break-all font-mono">{[p().command, ...p().args].join(" ")}</pre>
+            <Show when={p().commandLine}>
+              <pre class="overflow-x-auto whitespace-pre-wrap break-all font-mono">{p().commandLine}</pre>
             </Show>
             <Show when={p().url}>
               <pre class="overflow-x-auto break-all font-mono">url: {p().url}</pre>
@@ -531,7 +531,7 @@ const McpReach: Component<{ server: ClaudeConfigMcpServer; sessionId: string | n
               <button type="button" onClick={() => setPreview(null)} class="text-[10px] text-fg-muted hover:text-fg">
                 Cancel
               </button>
-              <span class="text-fg-faint">Literal values are masked (…); ${"{VAR}"} references are what it asks for.</span>
+              <span class="text-fg-faint">Shown exactly as the repo wrote it; characters that wouldn't show are escaped as \u{"{…}"}. ${"{VAR}"} references resolve from the daemon's environment.</span>
             </div>
           </div>
         )}

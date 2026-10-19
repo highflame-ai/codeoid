@@ -59,8 +59,9 @@ function homedir(): string {
 
 /**
  * Every server the workdir adds, before consent or precedence is applied —
- * or null when `~/.claude.json` is there but can't be read now (mid-rewrite
- * by Claude Code, too big): that's no news, not "everything was removed".
+ * or null when `~/.claude.json` or the project's `.mcp.json` is there but
+ * can't be read now (mid-rewrite, mid-checkout, too big): that's no news, not
+ * "everything was removed".
  */
 export async function readWorkdirServers(workdir: string, home: string = homedir()): Promise<WorkdirServer[] | null> {
   const claudeJsonPath = path.join(home, ".claude.json");
@@ -69,7 +70,9 @@ export async function readWorkdirServers(workdir: string, home: string = homedir
   const claudeJson = asObject(read);
   const project = asObject(asObject(claudeJson?.projects)?.[workdir]);
   const mcpJsonPath = path.join(workdir, ".mcp.json");
-  const mcpJson = asObject(await readInside(workdir, mcpJsonPath));
+  const repoRead = await readInside(workdir, mcpJsonPath);
+  if (repoRead === UNREADABLE) return null; // mid-checkout or mid-edit: no news either
+  const mcpJson = asObject(repoRead);
 
   const enabled = new Set(strings(project?.enabledMcpjsonServers));
   const disabled = new Set(strings(project?.disabledMcpjsonServers));
@@ -130,10 +133,15 @@ export function fingerprintOf(raw: RawMcpServerConfig): string {
 /** `~/.claude.json` exists but couldn't be read (as opposed to absent: no servers). */
 const UNREADABLE = Symbol("unreadable");
 
-/** A repo's server can't ask, by reference, for the daemon's own secrets. */
+/** A repo's server can't ask, by reference, for the daemon's own secrets —
+ *  nor build one by nesting (`${CODEO${CODEOID_X}ID_API_KEY}`): stripped until none is left. */
 function withoutDaemonSecrets(raw: RawMcpServerConfig): RawMcpServerConfig {
-  const strip = (o: Record<string, string> | undefined) =>
-    o && Object.fromEntries(Object.entries(o).map(([k, v]) => [k, v.replace(DAEMON_SECRET_VAR, "")]));
+  const stripAll = (value: string): string => {
+    let v = value;
+    for (let prev = ""; prev !== v; ) [prev, v] = [v, v.replace(DAEMON_SECRET_VAR, "")];
+    return v;
+  };
+  const strip = (o: Record<string, string> | undefined) => o && Object.fromEntries(Object.entries(o).map(([k, v]) => [k, stripAll(v)]));
   return { ...raw, ...(raw.env ? { env: strip(raw.env)! } : {}), ...(raw.headers ? { headers: strip(raw.headers)! } : {}) };
 }
 
@@ -162,14 +170,22 @@ async function readClaudeJson(file: string): Promise<unknown> {
   }
 }
 
-/** A file in the workdir, only if it resolves inside it (no symlink out of it). */
+/** A file in the workdir, only if it resolves inside it (no symlink out of it):
+ *  null when there's none, UNREADABLE when it's there but can't be read now. */
 async function readInside(workdir: string, file: string): Promise<unknown> {
+  let real: string;
+  let root: string;
   try {
-    const [root, real] = await Promise.all([realpath(workdir), realpath(file)]);
-    if (real !== root && !real.startsWith(root + path.sep)) return null;
-    return await readBounded(real, MAX_REPO_FILE_BYTES);
+    [root, real] = await Promise.all([realpath(workdir), realpath(file)]);
   } catch {
-    return null;
+    return null; // absent (or a dangling link): no servers
+  }
+  if (real !== root && !real.startsWith(root + path.sep)) return null;
+  try {
+    const value = await readBounded(real, MAX_REPO_FILE_BYTES);
+    return value === null ? UNREADABLE : value;
+  } catch {
+    return UNREADABLE;
   }
 }
 

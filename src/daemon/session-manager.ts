@@ -26,9 +26,9 @@ import type { Store } from "./store.js";
 import { createPushTransport, PushService } from "./push/index.js";
 import { hasScope, SCOPES } from "../protocol/scopes.js";
 import { applyPatches, getManifest, getSnapshot, previewPatches, readMcpServerEntry, writeMcpServerEntry } from "./settings/store.js";
-import { adoptability, adoptableName, adoptedEntry, adoptionRefusal, claudeMcpServers, fromRepoFile, fullUrlRequired, isSameAdoption } from "./mcp/adopt.js";
+import { adoptability, adoptableName, adoptedEntry, adoptionRefusal, claudeMcpServers, fromRepoFile, fullUrlRequired, isSameAdoption, shellArg } from "./mcp/adopt.js";
 import { readWorkdirServers } from "./mcp/workdir-servers.js";
-import { cleanMcpError, commandSummary, MAX_SHOWN_KEYS, redactMcpUrl, redactSecretText, serverProgram, shownLabel } from "./mcp/redact.js";
+import { cleanMcpError, commandSummary, MAX_SHOWN_KEYS, redactMcpUrl, serverProgram, shownLabel, visibleVerbatim } from "./mcp/redact.js";
 import { canonicalFromTranscript, turnIndexFromHistory } from "./canonical-restore.js";
 import { BackendLoginBroker, BackendLoginError, redact } from "./auth/backend-login.js";
 import { ClaudeAccountError, ClaudeAccountStore, validateAccountName } from "./claude-accounts.js";
@@ -1871,10 +1871,9 @@ mcpHub: this.#mcpHub,
     const hub = this.#mcpHub;
     if (!reg || !hub) return [];
     return reg.list().map((spec) => {
-      // An OAuth server runs as the viewer's tenant: show only that.
-      const tenant = isOAuthServer(spec) ? tenantOf(auth) : undefined;
-      const status = hub.statusFor(spec.name, tenant);
-      const connected = hub.hasClient(spec.name, tenant);
+      // An OAuth server runs as the viewer's tenant, and a session's own
+      // snapshot of a global one (#395) is its tenant's: show only those.
+      const { status, connected } = hub.observed(spec, tenantOf(auth));
       const health: McpServerStatus["health"] = !spec.enabled
         ? "disabled"
         : status?.error
@@ -7383,17 +7382,19 @@ mcpHub: this.#mcpHub,
     if (repo.length === 0) return fail(`This project declares no MCP server ${JSON.stringify(msg.server)}`, "not_found");
     if (repo.length > 1) return fail(`${JSON.stringify(msg.server)} is declared in ${repo.map((w) => w.path).join(" and ")}; say which file`);
     const w = repo[0]!;
-    // Everything the entry sets is the repo's choice, and what's approved —
-    // `NODE_OPTIONS=--require ./x` matters — so it's shown as written, `${VAR}`
-    // references included; only token-shaped text is hidden (a secret committed to the repo).
-    const shown = (o: Record<string, string> | undefined) => Object.fromEntries(Object.entries(o ?? {}).map(([k, v]) => [k, redactSecretText(v)]));
+    // Everything here is the repo's choice and is what gets approved, so it's
+    // shown exactly — a secret committed to the repo isn't the approver's to
+    // be kept from. Only what wouldn't show (bidi, zero-width, controls) is escaped.
+    const shown = (o: Record<string, string> | undefined) => Object.fromEntries(Object.entries(o ?? {}).map(([k, v]) => [visibleVerbatim(k), visibleVerbatim(v)]));
     const preview: McpApprovePreview = {
       server: w.name,
-      path: w.path,
+      path: w.path, // sent back to name the entry: as is (clients escape it to show)
       fingerprint: w.fingerprint,
-      command: w.raw.command ?? null,
-      args: (w.raw.args ?? []).map(redactSecretText),
-      url: w.raw.url ? redactMcpUrl(w.raw.url) : null,
+      shownPath: visibleVerbatim(w.path),
+      commandLine: w.raw.command === undefined ? null : [w.raw.command, ...(w.raw.args ?? [])].map((a) => shellArg(visibleVerbatim(a))).join(" "),
+      command: w.raw.command === undefined ? null : visibleVerbatim(w.raw.command),
+      args: (w.raw.args ?? []).map(visibleVerbatim),
+      url: w.raw.url === undefined ? null : visibleVerbatim(w.raw.url),
       env: shown(w.raw.env),
       headers: shown(w.raw.headers),
     };

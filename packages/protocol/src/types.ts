@@ -1713,7 +1713,16 @@ export interface McpApprovePreview {
   command: string | null;
   args: string[];
   url: string | null;
-  /** Each env var as written (`${VAR}` references kept), token-shaped text hidden. */
+  /**
+   * Every value below is shown exactly as the repo wrote it — nothing hidden
+   * or cut; only characters that wouldn't show (bidi, zero-width, controls)
+   * are escaped as `\u{…}`, and a backslash doubled.
+   */
+  /** The command line, each part shell-quoted so it reads as it runs. */
+  commandLine: string | null;
+  /** `path`, escaped for showing. */
+  shownPath: string;
+  /** Each env var as written (`${VAR}` references kept). */
   env: Record<string, string>;
   /** Each header, likewise. */
   headers: Record<string, string>;

@@ -96,7 +96,9 @@ function homeProtectedRoots(): string[] {
   const home = os.homedir();
   _homeRootsCache = [
     path.join(home, ".claude"), // Claude Code credentials
-    path.join(home, ".claude.json"), // MCP servers' tokens, and project MCP approvals (#395)
+    // MCP servers' tokens, and project MCP approvals (#395) — found as the
+    // MCP reader finds it (workdir-servers.ts): HOME first.
+    path.join(process.env.HOME ?? home, ".claude.json"),
     path.join(home, ".aws"),
     path.join(home, ".ssh"),
     path.join(home, ".gnupg"),

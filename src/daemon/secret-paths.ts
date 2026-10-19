@@ -155,7 +155,8 @@ export function secretPathVerdict(
     ...cliCredentialFiles().map((f) => real(f)),
   ];
   const secretDirs = [configDir, ...secretFiles.map((f) => dirname(f))];
-  const claudeJson = real(join(homedir(), ".claude.json"));
+  // Found as the MCP reader finds it (workdir-servers.ts): HOME first.
+  const claudeJson = real(join(process.env.HOME ?? homedir(), ".claude.json"));
   let verdict: SecretPathVerdict = null;
   for (const raw of candidatePaths(toolName, input)) {
     const literal = expand(raw, opts.workdir);

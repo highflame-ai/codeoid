@@ -177,7 +177,7 @@ codeoid mcp config [--scopes observe|operate|full]  # MCP client entry for /mcp/
 codeoid mcp headers [--scopes …]                    # fresh bearer header (an MCP headersHelper)
 codeoid mcp reconnect <session> <server>            # redial a backend MCP server that's down (#389)
 codeoid mcp refresh <session>                       # apply MCP servers changed in Claude's config (#395)
-codeoid mcp approve <session> <server> [--path <f>] # approve a project's MCP server for every backend (#395)
+codeoid mcp approve <session> <server> [--path <f>] [--yes <fingerprint>]  # review, then approve a project's MCP server for every backend (#395)
 codeoid mcp adopt <server> [--session <s>] [--url <u>]  # codeoid signs in to a server from Claude's config (#390)
 codeoid mcp signin <server> [--callback-url <u>]        # sign in to an OAuth registry server
 codeoid routine add <name> --prompt … [--cron|--every|--at] [--check <cmd>]  # scheduled agent runs
