@@ -34,7 +34,7 @@ import type { McpHub } from "./hub.js";
 import type { McpTenant } from "./oauth.js";
 import { isReservedMcpName, normalizeSpec, type McpRegistry, type McpServerView } from "./registry.js";
 import { isOAuthServer, type McpServerSpec } from "./types.js";
-import { fingerprintOf as entryFingerprint, readGlobalServers, readWorkdirServers, type WorkdirServer } from "./workdir-servers.js";
+import { fingerprintOf as entryFingerprint, readGlobalServers, readWorkdirServers, type WorkdirRead, type WorkdirServer } from "./workdir-servers.js";
 
 /** Why a server reaches only Claude (or this session's backend's own copy), when it does. */
 export type WorkdirReach =
@@ -50,7 +50,7 @@ export interface SessionMcpViewOptions {
   /** codeoid-side approvals of repo servers ("server\0fingerprint"). */
   approvals: () => ReadonlySet<string>;
   /** Injected for tests (null: can't be read just now). */
-  read?: (workdir: string) => Promise<WorkdirServer[] | null>;
+  read?: (workdir: string) => Promise<WorkdirRead | WorkdirServer[] | null>;
   /** Injected for tests: the user's global Claude servers (null: can't be read just now). */
   readGlobal?: () => Promise<Record<string, RawMcpServerConfig> | null>;
 }
@@ -83,6 +83,8 @@ export class SessionMcpView implements McpServerView {
   #layer: McpServerSpec[] = [];
   /** The global servers applied (this session's snapshot); null: the registry's own. */
   #globals: McpServerSpec[] | null = null;
+  /** The project's .mcp.json couldn't be read, last time: which names it declares is unknown. */
+  #repoUnreadable = false;
   /** The names the project's .mcp.json declared when applied: left to a backend that reads it itself. */
   #mcpJsonNames: ReadonlySet<string> = new Set();
   #fingerprint = "";
@@ -217,15 +219,16 @@ export class SessionMcpView implements McpServerView {
   }
 
   /** Whose approval let a project's server apply: Claude Code's, or codeoid's (for the audit). */
-  repoConsent(spec: McpServerSpec): "claude" | "codeoid" | undefined {
+  repoConsent(spec: McpServerSpec): "claude" | "codeoid" | "unknown" | undefined {
     if (spec.origin !== "claude-repo") return undefined;
     const w = this.#read.find((r) => r.origin === "claude-repo" && r.name === spec.name && r.fingerprint === spec.variant);
-    return w?.claudeApproval === "approved" ? "claude" : "codeoid";
+    if (!w) return "unknown";
+    return w.claudeApproval === "approved" ? "claude" : "codeoid";
   }
 
   /** A name the project's .mcp.json declared, on a backend that loads that file itself: its tools may be the repo's. */
   leftToBackend(name: string, backendId: string): boolean {
-    return READS_MCP_JSON.has(backendId) && this.#mcpJsonNames.has(name);
+    return READS_MCP_JSON.has(backendId) && (this.#repoUnreadable || this.#mcpJsonNames.has(name));
   }
 
   // ── McpServerView ──
@@ -260,7 +263,12 @@ export class SessionMcpView implements McpServerView {
       (this.#opts.read ?? readWorkdirServers)(this.#opts.workdir),
       this.#opts.readGlobal ? this.#opts.readGlobal() : readGlobalServers(),
     ]);
-    if (read) this.#read = read;
+    if (read) {
+      const { servers, repoUnreadable } = Array.isArray(read) ? { servers: read, repoUnreadable: false } : read;
+      // A .mcp.json that can't be read: the project's servers stay as last known.
+      this.#read = repoUnreadable ? [...servers, ...this.#read.filter((w) => w.origin === "claude-repo")] : servers;
+      this.#repoUnreadable = repoUnreadable;
+    }
     if (global) this.#readGlobals = global;
   }
 
@@ -350,9 +358,9 @@ export function mcpSpecKey(spec: McpServerSpec): string {
 }
 
 function keyOf(spec: McpServerSpec): string {
-  // As the hub keys its client (hub.ts clientKey): a stdio server's workdir too.
+  // As the hub keys its client (hub.ts clientKey): a stdio server's workdir, and where it came from, too.
   const cwd = spec.transport.kind === "stdio" ? (spec.transport.cwd ?? "") : "";
-  return `${spec.name}\u0000${spec.variant ?? ""}\u0000${cwd}`;
+  return `${spec.name}\u0000${spec.variant ?? ""}\u0000${cwd}\u0000${spec.origin ?? ""}`;
 }
 
 function isMcpJson(file: string): boolean {

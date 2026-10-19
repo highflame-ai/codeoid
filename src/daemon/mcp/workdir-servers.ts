@@ -20,6 +20,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { readFileSync, statSync } from "node:fs";
 import { open, realpath, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -51,6 +52,15 @@ export interface WorkdirServer {
   fingerprint: string;
 }
 
+/** A workdir's servers as read now. */
+export interface WorkdirRead {
+  servers: WorkdirServer[];
+  /** The project's .mcp.json is there but couldn't be read (mid-edit, not
+   *  JSON, too big): its servers aren't in `servers` — what was known of them
+   *  stands, and nothing can be said about which names it declares. */
+  repoUnreadable: boolean;
+}
+
 /** The user's home as the rest of the daemon reads it (claude-config.ts):
  *  `os.homedir()` caches at process start, so HOME is read first. */
 function homedir(): string {
@@ -59,11 +69,12 @@ function homedir(): string {
 
 /**
  * Every server the workdir adds, before consent or precedence is applied —
- * or null when `~/.claude.json` or the project's `.mcp.json` is there but
- * can't be read now (mid-rewrite, mid-checkout, too big): that's no news, not
- * "everything was removed".
+ * or null when `~/.claude.json` is there but can't be read now (mid-rewrite
+ * by Claude Code, too big): that's no news, not "everything was removed". A
+ * project .mcp.json that can't be read leaves the user's own servers read,
+ * and says so (`repoUnreadable`).
  */
-export async function readWorkdirServers(workdir: string, home: string = homedir()): Promise<WorkdirServer[] | null> {
+export async function readWorkdirServers(workdir: string, home: string = homedir()): Promise<WorkdirRead | null> {
   const claudeJsonPath = path.join(home, ".claude.json");
   const read = await readClaudeJson(claudeJsonPath);
   if (read === UNREADABLE) return null;
@@ -71,8 +82,7 @@ export async function readWorkdirServers(workdir: string, home: string = homedir
   const project = asObject(asObject(claudeJson?.projects)?.[workdir]);
   const mcpJsonPath = path.join(workdir, ".mcp.json");
   const repoRead = await readInside(workdir, mcpJsonPath);
-  if (repoRead === UNREADABLE) return null; // mid-checkout or mid-edit: no news either
-  const mcpJson = asObject(repoRead);
+  const mcpJson = repoRead === UNREADABLE ? null : asObject(repoRead);
 
   const enabled = new Set(strings(project?.enabledMcpjsonServers));
   const disabled = new Set(strings(project?.disabledMcpjsonServers));
@@ -99,7 +109,7 @@ export async function readWorkdirServers(workdir: string, home: string = homedir
   };
   add(project?.mcpServers, "claude-local", claudeJsonPath);
   add(mcpJson?.mcpServers, "claude-repo", mcpJsonPath);
-  return out;
+  return { servers: out, repoUnreadable: repoRead === UNREADABLE };
 }
 
 /** The user's global servers from `~/.claude.json` (cached by size and mtime),
@@ -211,4 +221,51 @@ function asObject(x: unknown): Record<string, unknown> | null {
 
 function strings(x: unknown): string[] {
   return Array.isArray(x) ? x.filter((v): v is string => typeof v === "string") : [];
+}
+
+/**
+ * The project files each backend reads MCP servers from itself, beside
+ * codeoid's mount: a tool from a name declared there may be the repo's
+ * server, whatever codeoid's entry of that name is trusted with.
+ */
+const PROJECT_MCP_FILES: Record<string, readonly string[]> = {
+  claude: [".mcp.json"],
+  qwen: [".mcp.json", path.join(".qwen", "settings.json")],
+  "gemini-cli": [path.join(".gemini", "settings.json")],
+};
+
+const declaredCache = new Map<string, { mtimeMs: number; size: number; names: ReadonlySet<string> | null }>();
+
+/**
+ * The server names `backendId`'s own project files in `workdir` declare, as
+ * they are now (cached by size and mtime) — or null when one is there but
+ * can't be read, so nothing can be ruled out.
+ */
+export function projectDeclaredNames(workdir: string, backendId: string): ReadonlySet<string> | null {
+  const out = new Set<string>();
+  for (const rel of PROJECT_MCP_FILES[backendId] ?? []) {
+    const file = path.join(workdir, rel);
+    let st: ReturnType<typeof statSync>;
+    try {
+      st = statSync(file);
+    } catch {
+      continue; // absent
+    }
+    const hit = declaredCache.get(file);
+    let names: ReadonlySet<string> | null;
+    if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) {
+      names = hit.names;
+    } else {
+      names = null;
+      try {
+        if (st.isFile() && st.size <= MAX_REPO_FILE_BYTES) {
+          names = new Set(Object.keys(asObject(asObject(JSON.parse(readFileSync(file, "utf8")))?.mcpServers) ?? {}));
+        }
+      } catch {}
+      declaredCache.set(file, { mtimeMs: st.mtimeMs, size: st.size, names });
+    }
+    if (!names) return null;
+    for (const n of names) out.add(n);
+  }
+  return out;
 }

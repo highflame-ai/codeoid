@@ -282,8 +282,9 @@ export class McpHub {
     const tenant = isOAuthServer(spec) ? viewer : undefined;
     const own = { status: this.statusFor(spec.name, tenant), connected: this.hasClient(spec.name, tenant) };
     if (own.status || own.connected || spec.origin !== "claude-global") return own;
+    // A session's snapshot of this global server — not a workdir server of the same name.
     const prefix = `${spec.name}\u0001`;
-    const suffix = tenantKey("", viewer);
+    const suffix = tenantKey("\u0001claude-global", viewer);
     const mine = (key: string) => key.startsWith(prefix) && key.endsWith(suffix);
     const statuses = [...this.#status].filter(([k]) => mine(k)).map(([, v]) => v);
     return {
@@ -557,7 +558,7 @@ function clientKey(spec: McpServerSpec, tenant: McpTenant | undefined): string {
   // a session never reaches another's process.
   if (spec.variant) {
     const cwd = spec.transport.kind === "stdio" ? (spec.transport.cwd ?? "") : "";
-    return tenantKey(`${spec.name}\u0001${spec.variant}\u0001${cwd}`, tenant);
+    return tenantKey(`${spec.name}\u0001${spec.variant}\u0001${cwd}\u0001${spec.origin ?? ""}`, tenant);
   }
   return tenantKey(spec.name, isOAuthServer(spec) ? tenant : undefined);
 }

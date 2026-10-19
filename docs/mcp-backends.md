@@ -32,8 +32,9 @@ This page says where each kind of server comes from, which backends it reaches, 
     It is read only from your own `~/.claude.json` (its `enabledMcpjsonServers`, `disabledMcpjsonServers` and `enableAllProjectMcpServers` for that directory) — never from a file inside the repo directory, such as `.claude/settings.local.json`: anything there could be the repo (or a build script, or the agent) approving its own servers.
     An approval Claude Code stored in the repo directory is made once more in codeoid.
   - codeoid's approval is of exactly the entry you were shown: if the repo changes it — before you click or afterwards — it needs approving again.
-    It covers the entry's command, arguments, environment, URL and headers, shown before you approve exactly as the repo wrote them (nothing hidden or shortened; characters that wouldn't show, such as bidi overrides or zero-width spaces, are escaped as `\u{…}`).
-    An environment or header value that refers to a variable (`${GITHUB_TOKEN}`) is shown as the reference, and resolves from the daemon's environment when the server starts.
+    It covers the entry's command, arguments, environment, URL and headers, shown before you approve exactly as they'll run (nothing hidden or shortened; each value quoted, on its own line; characters that wouldn't show — bidi overrides, zero-width spaces, Hangul fillers, combining marks — escaped as `\u{…}`, a run of spaces counted, and a non-ASCII host also shown in punycode).
+    An environment value that is exactly a variable reference (`${GITHUB_TOKEN}`) is shown as the reference, and resolves from the daemon's environment when the server starts; a header value is sent as written.
+    A reference to codeoid's own secrets is removed before it's shown, as it is before it runs.
     It doesn't cover the code a command runs: a server started from a script in the repo (`node ./mcp/server.js`) runs whatever that script is when it starts.
   - Approving in codeoid also covers a server you denied in Claude Code: the two approvals are separate.
 - **Claude** always loads its own copies of Claude's servers (the Claude CLI reads its config itself); codeoid adds the rest of the registry.
@@ -43,6 +44,7 @@ This page says where each kind of server comes from, which backends it reaches, 
 
 A project's server runs in the project's directory, as each backend that reads it runs it.
 It can't ask, through a `${VAR}` reference in its environment, for codeoid's own secrets (`CODEOID_*`, `ZEROID_*`, `TELEGRAM_*`); other references resolve from the daemon's environment, as Claude Code resolves them from yours.
+(A codeoid variable you pass to agents with `CODEOID_AGENT_ENV_ALLOW` is in the Claude CLI's and Qwen's environment, and they resolve references in `.mcp.json` themselves.)
 Its name must be plain (letters, digits, `.`, `_`, `-`; no `__`, not starting with `mcp__`), so its tools can't pass for another server's.
 
 The capabilities drawer says, for each of Claude's servers, whether it reaches the session's other backends, and if not, why.

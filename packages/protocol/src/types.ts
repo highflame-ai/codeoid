@@ -1718,11 +1718,18 @@ export interface McpApprovePreview {
    * or cut; only characters that wouldn't show (bidi, zero-width, controls)
    * are escaped as `\u{…}`, and a backslash doubled.
    */
+  /**
+   * The whole entry as it's to be shown, one item per line — every value
+   * quoted, a run of spaces counted (`\u{20}×400`), a URL's host also in
+   * punycode when it isn't plain ASCII — so no layout can hide any of it.
+   * Clients show these lines as they are.
+   */
+  lines: string[];
   /** The command line, each part shell-quoted so it reads as it runs. */
   commandLine: string | null;
   /** `path`, escaped for showing. */
   shownPath: string;
-  /** Each env var as written (`${VAR}` references kept). */
+  /** Each env var as written (`${VAR}` references kept; a reference to codeoid's own secrets already removed, as it runs). */
   env: Record<string, string>;
   /** Each header, likewise. */
   headers: Record<string, string>;

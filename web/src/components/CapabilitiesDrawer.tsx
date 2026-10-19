@@ -497,21 +497,10 @@ const McpReach: Component<{ server: ClaudeConfigMcpServer; sessionId: string | n
       <Show when={preview()}>
         {(p) => (
           <div class="mt-1 rounded border border-accent/40 bg-bg-active/40 p-2 text-[11px] text-fg">
-            <div class="mb-1 text-fg-muted">
+            <div class="mb-1 whitespace-pre-wrap break-all text-fg-muted">
               This project's entry, from {p().shownPath} — once approved, every backend in this workdir runs it, with the daemon user's files and network:
             </div>
-            <Show when={p().commandLine}>
-              <pre class="overflow-x-auto whitespace-pre-wrap break-all font-mono">{p().commandLine}</pre>
-            </Show>
-            <Show when={p().url}>
-              <pre class="overflow-x-auto break-all font-mono">url: {p().url}</pre>
-            </Show>
-            <Show when={Object.keys(p().env).length > 0}>
-              <pre class="overflow-x-auto break-all font-mono">env: {Object.entries(p().env).map(([k, v]) => `${k}=${v}`).join("  ")}</pre>
-            </Show>
-            <Show when={Object.keys(p().headers).length > 0}>
-              <pre class="overflow-x-auto break-all font-mono">headers: {Object.entries(p().headers).map(([k, v]) => `${k}: ${v}`).join("  ")}</pre>
-            </Show>
+            <pre class="whitespace-pre-wrap break-all font-mono">{p().lines.join("\n")}</pre>
             <div class="mt-1 flex items-center gap-2">
               <button
                 type="button"
@@ -531,7 +520,7 @@ const McpReach: Component<{ server: ClaudeConfigMcpServer; sessionId: string | n
               <button type="button" onClick={() => setPreview(null)} class="text-[10px] text-fg-muted hover:text-fg">
                 Cancel
               </button>
-              <span class="text-fg-faint">Shown exactly as the repo wrote it; characters that wouldn't show are escaped as \u{"{…}"}. ${"{VAR}"} references resolve from the daemon's environment.</span>
+              <span class="text-fg-faint">Shown exactly as it runs; characters that wouldn't show are escaped as \u{"{…}"}, and a run of spaces counted. An env value that is exactly ${"{VAR}"} resolves from the daemon's environment; header values are sent as written.</span>
             </div>
           </div>
         )}

@@ -28,7 +28,7 @@ import { hasScope, SCOPES } from "../protocol/scopes.js";
 import { applyPatches, getManifest, getSnapshot, previewPatches, readMcpServerEntry, writeMcpServerEntry } from "./settings/store.js";
 import { adoptability, adoptableName, adoptedEntry, adoptionRefusal, claudeMcpServers, fromRepoFile, fullUrlRequired, isSameAdoption, shellArg } from "./mcp/adopt.js";
 import { readWorkdirServers } from "./mcp/workdir-servers.js";
-import { cleanMcpError, commandSummary, MAX_SHOWN_KEYS, redactMcpUrl, serverProgram, shownLabel, visibleVerbatim } from "./mcp/redact.js";
+import { cleanMcpError, commandSummary, MAX_SHOWN_KEYS, quotedVisible, redactMcpUrl, serverProgram, shownLabel, visibleCompact, visibleVerbatim } from "./mcp/redact.js";
 import { canonicalFromTranscript, turnIndexFromHistory } from "./canonical-restore.js";
 import { BackendLoginBroker, BackendLoginError, redact } from "./auth/backend-login.js";
 import { ClaudeAccountError, ClaudeAccountStore, validateAccountName } from "./claude-accounts.js";
@@ -7358,8 +7358,8 @@ mcpHub: this.#mcpHub,
 
   /**
    * What approving a project's MCP server would approve, in full (#395): the
-   * one deciding sees the command, every argument, the URL, and each env and
-   * header reference — literal values masked. Same rights as approving.
+   * one deciding sees the command, every argument, the URL, and each env var
+   * and header, exactly as they'll run — nothing masked or cut. Same rights as approving.
    */
   async #mcpApprovePreview(
     msg: Extract<ClientMessage, { type: "mcp.approve.preview" }>,
@@ -7378,7 +7378,8 @@ mcpHub: this.#mcpHub,
     if (!session) return fail("Session not found", "not_found");
     const read = await readWorkdirServers(session.workdir);
     if (!read) return fail("Claude's config can't be read just now (it may be mid-write) — try again");
-    const repo = read.filter((w) => w.origin === "claude-repo" && w.name === msg.server && (msg.path === undefined || w.path === msg.path));
+    if (read.repoUnreadable) return fail("The project's .mcp.json can't be read just now (mid-edit, not JSON, or too big) — try again once it can");
+    const repo = read.servers.filter((w) => w.origin === "claude-repo" && w.name === msg.server && (msg.path === undefined || w.path === msg.path));
     if (repo.length === 0) return fail(`This project declares no MCP server ${JSON.stringify(msg.server)}`, "not_found");
     if (repo.length > 1) return fail(`${JSON.stringify(msg.server)} is declared in ${repo.map((w) => w.path).join(" and ")}; say which file`);
     const w = repo[0]!;
@@ -7386,12 +7387,33 @@ mcpHub: this.#mcpHub,
     // shown exactly — a secret committed to the repo isn't the approver's to
     // be kept from. Only what wouldn't show (bidi, zero-width, controls) is escaped.
     const shown = (o: Record<string, string> | undefined) => Object.fromEntries(Object.entries(o ?? {}).map(([k, v]) => [visibleVerbatim(k), visibleVerbatim(v)]));
+    const commandLine = w.raw.command === undefined ? null : [w.raw.command, ...(w.raw.args ?? [])].map((a) => shellArg(visibleCompact(a))).join(" ");
+    const lines: string[] = [];
+    if (commandLine !== null) lines.push(`command: ${commandLine}`);
+    if (w.raw.url !== undefined) {
+      let host = "";
+      try {
+        host = new URL(w.raw.url).host;
+      } catch {}
+      // A look-alike host (Cyrillic "Ь" for "b") reads plainly in punycode.
+      const plain = /^[\x21-\x7e]+$/.test(w.raw.url);
+      lines.push(`url: ${quotedVisible(w.raw.url)}${host && !plain ? ` (host: ${host})` : ""}`);
+    }
+    const block = (label: string, o: Record<string, string> | undefined, sep: string) => {
+      const entries = Object.entries(o ?? {});
+      if (entries.length === 0) return;
+      lines.push(`${label} (${entries.length}):`);
+      for (const [k, v] of entries) lines.push(`  ${quotedVisible(k)}${sep}${quotedVisible(v)}`);
+    };
+    block("env", w.raw.env, " = ");
+    block("headers", w.raw.headers, ": ");
     const preview: McpApprovePreview = {
+      lines,
       server: w.name,
       path: w.path, // sent back to name the entry: as is (clients escape it to show)
       fingerprint: w.fingerprint,
       shownPath: visibleVerbatim(w.path),
-      commandLine: w.raw.command === undefined ? null : [w.raw.command, ...(w.raw.args ?? [])].map((a) => shellArg(visibleVerbatim(a))).join(" "),
+      commandLine,
       command: w.raw.command === undefined ? null : visibleVerbatim(w.raw.command),
       args: (w.raw.args ?? []).map(visibleVerbatim),
       url: w.raw.url === undefined ? null : visibleVerbatim(w.raw.url),
@@ -7424,7 +7446,8 @@ mcpHub: this.#mcpHub,
     if (!session) return fail("Session not found", "not_found");
     const read = await readWorkdirServers(session.workdir);
     if (!read) return fail("Claude's config can't be read just now (it may be mid-write) — try again");
-    const repo = read.filter(
+    if (read.repoUnreadable) return fail("The project's .mcp.json can't be read just now (mid-edit, not JSON, or too big) — try again once it can");
+    const repo = read.servers.filter(
       (w) => w.origin === "claude-repo" && w.name === msg.server && (msg.path === undefined || w.path === msg.path),
     );
     if (repo.length === 0) return fail(`This project declares no MCP server ${JSON.stringify(msg.server)}`, "not_found");

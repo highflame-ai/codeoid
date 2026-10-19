@@ -219,11 +219,22 @@ export function commandSummary(command: string): string {
 /**
  * Text shown for someone to approve (#395): exactly as written, nothing
  * hidden or cut — only what wouldn't show is made visible: control, format
- * (bidi overrides, zero-width) and separator characters become `\u{…}`, and a
- * backslash is doubled so that can't be faked.
+ * (bidi overrides, zero-width), separator, default-ignorable (Hangul fillers,
+ * variation selectors), combining and lone-surrogate characters become
+ * `\u{…}`, and a backslash is doubled so that can't be faked.
  */
 export function visibleVerbatim(text: string): string {
-  return text.replace(/[\\\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Co}\p{Cn}]|(?![ ])\p{Zs}/gu, (c) =>
+  return text.replace(/[\\\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Co}\p{Cn}\p{Cs}\p{M}\p{Default_Ignorable_Code_Point}\u2800]|(?![ ])\p{Zs}/gu, (c) =>
     c === "\\" ? "\\\\" : `\\u{${c.codePointAt(0)!.toString(16)}}`,
   );
+}
+
+/** {@link visibleVerbatim}, with a run of spaces counted (`\u{20}×400`) so padding can't push the rest out of view. */
+export function visibleCompact(text: string): string {
+  return visibleVerbatim(text).replace(/ {3,}/g, (run) => `\\u{20}×${run.length}`);
+}
+
+/** A value shown quoted, so its ends — and where it stops — are plain. */
+export function quotedVisible(text: string): string {
+  return `"${visibleCompact(text).replace(/"/g, '\\"')}"`;
 }

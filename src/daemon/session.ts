@@ -122,6 +122,7 @@ import { isElicitationTool, isSafeTool, roleDeniesTool } from "./providers/tool-
 import type { PackActivation } from "./pipeline/index.js";
 import { McpRegistry } from "./mcp/registry.js";
 import { mcpSpecKey, SessionMcpView, type WorkdirReach } from "./mcp/session-view.js";
+import { projectDeclaredNames } from "./mcp/workdir-servers.js";
 import type { McpTenant } from "./mcp/oauth.js";
 import type { McpServerSpec } from "./mcp/types.js";
 
@@ -844,8 +845,7 @@ export class Session {
   /** A refresh asked for while the backend was busy: applied before the next turn. */
   #mcpRefreshPending = false;
   /** What the backend was built with (the view's fingerprint); undefined
-   *  when the next backend built takes whatever is applied (before its first
-   *  turn, and after any teardown). */
+   *  before its first turn ("" when that turn ran without the view loaded). */
   #mcpBuiltWith: string | undefined;
   /** This session's own servers whose hub clients it holds (keyed as the view keys them). */
   readonly #mcpRetained = new Map<string, McpServerSpec>();
@@ -1937,7 +1937,6 @@ export class Session {
           result = { changed: await this.mcpStale(), deferred: true };
           return;
         }
-        const wasLoaded = view.loaded;
         await this.#loadMcp();
         // Work that started while the files were read is left alone too.
         if (this.#mcpBusy()) {
@@ -1945,7 +1944,8 @@ export class Session {
           result = { changed: this.#mcpRebuildDue(), deferred: true };
           return;
         }
-        result = { changed: wasLoaded && (await this.#rebuildForMcp()), deferred: false };
+        // A first read that failed left the backend built without the view: this one rebuilds it too.
+        result = { changed: await this.#rebuildForMcp(), deferred: false };
       });
     // A failed refresh is the caller's to hear about, not the next send's.
     this.#sendChain = run.catch(() => {});
@@ -1974,9 +1974,10 @@ export class Session {
       if (this.#mcpToRelease.has(key)) this.#mcpToRelease.delete(key); // back in use: still held
       else this.#mcpHub?.retain(spec, this.#mcpTenant());
       this.#mcpRetained.set(key, spec);
-      // A project's server now runs for this session's backends: on the record, with whose approval.
+      // A project's server now runs for this session's backend: on the record,
+      // with whose approval (not on Claude, which runs its own copy).
       const consent = this.#mcpView!.repoConsent(spec);
-      if (consent) {
+      if (consent && this.#mcpView!.forBackend(this.providerId).some((s) => mcpSpecKey(s) === key)) {
         this.#store.audit(this.createdBy, "mcp.workdir_server_applied", this.id, `server=${JSON.stringify(spec.name)} fingerprint=${spec.variant} approvedIn=${consent}`);
       }
     }
@@ -2013,8 +2014,7 @@ export class Session {
       return false;
     }
     if (view.fingerprint === this.#mcpBuiltWith) return false;
-    await this.#teardownProvider(); // clears #mcpBuiltWith, and lets go of what was removed
-    this.#mcpBuiltWith = view.fingerprint;
+    await this.#teardownProvider(); // records what's applied, and lets go of what was removed
     if (RESEED_AFTER_TEARDOWN.has(this.#provider.id) && this.#accumulator.history.length > 0) {
       await this.#seedProviderFromHistory();
     }
@@ -3533,9 +3533,12 @@ export class Session {
     this.#eventConsumerTask = null;
     await this.#provider.teardown();
     this.#resetMcpState({ backendChanged: false });
-    // The next backend is built with what's applied now (#395); nothing still
-    // running can call a server the session stopped using.
-    this.#mcpBuiltWith = undefined;
+    // The next backend is built with what's applied now (#395) — and may be
+    // built straight away (a seed-overflow retry), before any pending refresh
+    // is applied: so that's what it's built with, and a refresh loaded later
+    // still rebuilds it. Nothing still running can call a server the session
+    // stopped using.
+    if (this.#mcpView?.loaded) this.#mcpBuiltWith = this.#mcpView.fingerprint;
     this.#releaseMcp();
     try { await taskToAwait; } catch { /* consumer handles its own errors */ }
     // teardown() aborts the SDK query, so any sub-agent still in flight will
@@ -5230,11 +5233,16 @@ export class Session {
   #isReadonlyMcpTool(toolName: string): boolean {
     if (!toolName.startsWith("mcp__")) return false;
     // In a session's view, only what this backend mounts — never a name the
-    // project's .mcp.json declares on a backend that loads that file itself:
-    // those tools may be the repo's server, not the one trusted (#395).
+    // project declares in a file the backend loads itself (.mcp.json,
+    // .qwen/ or .gemini/settings.json): those tools may be the repo's server,
+    // not the one trusted (#395).
+    // The backend's project files are read as they are now: a backend rebuilt
+    // since the view was applied reads them afresh. One that can't be read
+    // rules nothing out.
     const view = this.#mcpView;
+    const declared = projectDeclaredNames(this.workdir, this.providerId);
     const specs = view
-      ? view.forBackend(this.providerId).filter((spec) => !view.leftToBackend(spec.name, this.providerId))
+      ? view.forBackend(this.providerId).filter((spec) => declared !== null && !declared.has(spec.name) && !view.leftToBackend(spec.name, this.providerId))
       : (this.#mcpRegistry?.list() ?? []);
     for (const spec of specs) {
       if (spec.trust === "readonly" && toolName.startsWith(`mcp__${spec.name}__`)) return true;
