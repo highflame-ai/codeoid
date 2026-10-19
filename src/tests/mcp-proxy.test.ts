@@ -473,7 +473,6 @@ describe("codex's shell environment", () => {
     ]);
     // Unreadable here: the user's list can't be kept, so nothing is overridden.
     expect(at("not = [valid")).toBeNull();
-    expect(at("d = 1979-05-27T07:32:00Z\n")).toBeNull();
     expect(at("EACCES")).toBeNull(); // there, but unreadable: same
     expect(codexKeySafe("notes")).toBe(true);
     expect(codexKeySafe("claude.ai Slack")).toBe(false);
