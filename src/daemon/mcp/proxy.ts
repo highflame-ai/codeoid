@@ -547,10 +547,14 @@ class Relay {
     // The HTTP request this call came on: its abort cancels the call, and the
     // token's slot is held until the call settles, however long that is.
     const http = httpRequest.getStore();
-    if (http && !http.slots.acquire()) {
+    // Every forwarded call arrives within its POST's context (the SDK
+    // dispatches synchronously); one that somehow doesn't is refused, never
+    // run unbounded.
+    if (!http) throw new McpError(ErrorCode.InternalError, `${spec.name}: request context lost`);
+    if (!http.slots.acquire()) {
       throw new McpError(ErrorCode.InvalidRequest, "too many calls running for this token; try again when one finishes");
     }
-    const signal = http ? AbortSignal.any([extra.signal, http.signal]) : extra.signal;
+    const signal = AbortSignal.any([extra.signal, http.signal]);
     this.#inflight++;
     if (this.#idle) clearTimeout(this.#idle);
     let which: Promise<Client> | null = null;
@@ -605,14 +609,49 @@ class Relay {
       else if (which && sessionGone(e)) void this.#dropUpstream(which, up);
       if (e instanceof McpError) throw e;
       const message = cleanMcpError(errMsg(e));
-      this.#note({ error: message });
+      // A call the backend cancelled is no fault of the server's.
+      if (!signal.aborted) this.#note({ error: message });
       if (request.method === "tools/call") return { content: [{ type: "text", text: `${spec.name} unavailable: ${message}` }], isError: true };
       throw new McpError(ErrorCode.InternalError, `${spec.name}: ${message}`);
     } finally {
       this.#inflight--;
-      http?.slots.release();
+      // A cancelled call is cancelled upstream, but a server may run it to the
+      // end anyway (MCP only asks it to stop): its slot stays taken for the
+      // call's own timeout, or until its upstream session ends — so cancelling
+      // can't run more calls at once than the bound.
+      if (signal.aborted && which) this.#holdSlot(http.slots, which);
+      else http.slots.release();
       this.#armIdle();
     }
+  }
+
+  /** Slots held for cancelled calls, per upstream session: given back when it ends. */
+  readonly #heldSlots = new Map<Promise<Client>, Set<() => void>>();
+
+  #holdSlot(slots: CallSlots, which: Promise<Client>): void {
+    let held = this.#heldSlots.get(which);
+    if (!held) {
+      held = new Set();
+      this.#heldSlots.set(which, held);
+    }
+    const set = held;
+    const give = () => {
+      clearTimeout(timer);
+      if (set.delete(give)) slots.release();
+    };
+    const timer = setTimeout(give, this.#init.timeoutMs);
+    timer.unref?.();
+    set.add(give);
+    // A session already gone holds nothing.
+    if (this.#upstream !== which || this.#closed) this.#giveBack(which);
+  }
+
+  /** The calls an upstream session ran end with it: their held slots are given back. */
+  #giveBack(which: Promise<Client>): void {
+    const held = this.#heldSlots.get(which);
+    if (!held) return;
+    this.#heldSlots.delete(which);
+    for (const give of [...held]) give();
   }
 
   /** tools/list, filtered to the allowlist; a complete listing is noted as the tenant's status. */
@@ -709,6 +748,7 @@ class Relay {
   async #dropUpstream(which: Promise<Client> | null, client?: Client): Promise<void> {
     if (!which) return;
     if (this.#upstream === which) this.#forget();
+    this.#giveBack(which);
     const end = (up: Client) => {
       up.onclose = undefined;
       return closeUpstream(up, CLOSE_TIMEOUT_MS);
@@ -752,18 +792,30 @@ class Relay {
  * even that won't pass), and the optional fields that are valid. Null when
  * it has no usable name.
  */
-function usableTool(t: unknown): { name: string } | null {
+export function usableTool(t: unknown): { name: string } | null {
   if (ToolSchema.safeParse(t).success) return t as { name: string };
   if (typeof t !== "object" || t === null) return null;
   const raw = t as Record<string, unknown>;
   if (typeof raw.name !== "string" || raw.name.length === 0) return null;
-  const given = typeof raw.inputSchema === "object" && raw.inputSchema !== null ? (raw.inputSchema as Record<string, unknown>) : {};
+  const given =
+    typeof raw.inputSchema === "object" && raw.inputSchema !== null && !Array.isArray(raw.inputSchema)
+      ? (raw.inputSchema as Record<string, unknown>)
+      : {};
+  // Least repair first: the schema as given, then without what most often
+  // breaks it (`required`), then just its properties, then empty.
+  const { required: _required, ...withoutRequired } = given;
+  void _required;
   const base = {
     name: raw.name,
     ...(typeof raw.description === "string" ? { description: raw.description } : {}),
     ...(typeof raw.title === "string" ? { title: raw.title } : {}),
   };
-  for (const inputSchema of [{ ...given, type: "object" }, { type: "object" }]) {
+  for (const inputSchema of [
+    { ...given, type: "object" },
+    { ...withoutRequired, type: "object" },
+    { type: "object", ...(typeof given.properties === "object" && given.properties !== null ? { properties: given.properties } : {}) },
+    { type: "object" },
+  ]) {
     const candidate = { ...base, inputSchema };
     if (!ToolSchema.safeParse(candidate).success) continue;
     // What else passes on its own is kept (annotations, outputSchema, …).

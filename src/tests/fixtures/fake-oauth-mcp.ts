@@ -87,6 +87,9 @@ export class FakeOAuthMcp {
   /** `slow` calls running now, and the most there ever were at once. */
   slowRunning = 0;
   slowMax = 0;
+  /** `sleep` calls (which ignore cancellation) running now, and the most at once. */
+  sleepRunning = 0;
+  sleepMax = 0;
   /** Hold each session DELETE this long (a slow server ending a session). */
   deleteDelayMs = 0;
   /** Hold each initialize this long (a slow server to connect to). */
@@ -344,7 +347,10 @@ export class FakeOAuthMcp {
           return text(`model said: ${reply.content.type === "text" ? reply.content.text : "?"}`);
         }
         case "sleep":
+          this.sleepRunning++;
+          this.sleepMax = Math.max(this.sleepMax, this.sleepRunning);
           await Bun.sleep(Number(args.ms ?? 0));
+          this.sleepRunning--;
           return text("slept");
         case "structured":
           return text("not structured");

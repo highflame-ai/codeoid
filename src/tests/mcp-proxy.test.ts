@@ -31,6 +31,7 @@ import {
   McpProxyLease,
   type McpProxyLimits,
   SIGN_IN_REQUIRED_CODE,
+  usableTool,
 } from "../daemon/mcp/proxy.js";
 import { McpRegistry } from "../daemon/mcp/registry.js";
 import { FailureStreak, sessionGone, sessionTrouble } from "../daemon/mcp/upstream.js";
@@ -798,5 +799,69 @@ describe("round-4 findings stay fixed", () => {
       await call.catch(() => {});
     }
     expect(await long).toMatchObject({ content: [{ text: "slept" }] });
+  });
+});
+
+describe("verification-round findings stay fixed", () => {
+  it("cancelling a call a server runs to the end anyway doesn't free its slot early", async () => {
+    start({ limits: { requestsPerToken: 1 }, timeoutMs: 2_000 });
+    await signIn(TENANT);
+    const { token } = mint();
+    const sid = (await post("notes", token, INIT)).headers.get("mcp-session-id")!;
+    await post("notes", token, { jsonrpc: "2.0", method: "notifications/initialized" }, { "Mcp-Session-Id": sid, "MCP-Protocol-Version": "2025-06-18" });
+    for (let i = 0; i < 8; i++) {
+      const gaveUp = new AbortController();
+      const call = fetch(proxy.url("notes"), {
+        method: "POST",
+        signal: gaveUp.signal,
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+          "Mcp-Session-Id": sid,
+          "MCP-Protocol-Version": "2025-06-18",
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 200 + i, method: "tools/call", params: { name: "sleep", arguments: { ms: 1_000 } } }),
+      }).then((r) => r.text()).catch(() => null);
+      await Bun.sleep(40);
+      gaveUp.abort();
+      await call;
+    }
+    await until(() => fake.sleepRunning === 0, 5_000);
+    expect(fake.sleepMax).toBe(1); // the server ignored every cancel, and still only one ran at once
+    // A cancelled call's slot comes back after the call's own timeout.
+    await Bun.sleep(2_100);
+    const client = await backend(token);
+    expect(await client.callTool({ name: "whoami", arguments: {} })).toMatchObject({ content: [{ text: "you are user-1" }] });
+  }, 15_000);
+
+  it("an abandoned call doesn't mark the server as failing in Settings", async () => {
+    start();
+    await signIn(TENANT);
+    const client = await backend(mint().token);
+    await client.listTools();
+    const abort = new AbortController();
+    const call = client.callTool({ name: "slow", arguments: {} }, undefined, { signal: abort.signal });
+    await Bun.sleep(60);
+    abort.abort();
+    await call.catch(() => {});
+    await Bun.sleep(50);
+    expect(hub.statusFor("notes", TENANT)?.error).toBeUndefined();
+  });
+});
+
+describe("a malformed tool is repaired as little as possible", () => {
+  it("keeps its properties when only `required` is wrong; an array schema becomes empty; no name, no tool", () => {
+    const props = { q: { type: "string" } };
+    expect(usableTool({ name: "a", inputSchema: { type: "object", properties: props, required: "q" } })).toMatchObject({
+      name: "a",
+      inputSchema: { type: "object", properties: props },
+    });
+    expect(usableTool({ name: "b", inputSchema: [1, 2] }) as unknown).toEqual({ name: "b", inputSchema: { type: "object" } });
+    expect(usableTool({ name: "c", inputSchema: {}, description: null }) as unknown).toEqual({ name: "c", inputSchema: { type: "object" } });
+    const valid = { name: "d", inputSchema: { type: "object" }, annotations: { readOnlyHint: true } };
+    expect(usableTool(valid)).toBe(valid); // a valid tool passes untouched
+    expect(usableTool({ inputSchema: { type: "object" } })).toBeNull();
+    expect(usableTool("nope")).toBeNull();
   });
 });

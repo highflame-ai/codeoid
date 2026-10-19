@@ -164,7 +164,9 @@ A server adopted from Claude's config (#390) is an OAuth registry entry, so it g
 
 **Limits.**
 At most 8 relay sessions per proxy token for each server: a new one past that closes the least recently used that isn't mid-call (whose backend re-initializes if it returns), so a backend that opens a session per thread never locks itself out, and a call is never cut to make room.
-At most 32 calls running upstream per token, each counted until it settles upstream — a call the backend abandons is cancelled, and counted until the cancel lands — and one JSON-RPC message per POST (no batches); a session's notification stream and its `DELETE` aren't calls, so a backend can always close what it opened.
+At most 32 calls running upstream per token, and one JSON-RPC message per POST (no batches).
+A call the backend cancels or abandons is cancelled upstream; since a server may run it to the end anyway (MCP only asks it to stop), its slot stays taken for the call's own timeout, or until its upstream session ends — so cancelling can't run more calls at once than the bound.
+A call that arrives without its POST's context is refused rather than run unbounded; a session's notification stream and its `DELETE` aren't calls, so a backend can always close what it opened.
 At most 30 new sessions per token per minute.
 An `initialize` is checked in full (its schema, `Accept`, `Content-Type`) before anything opens upstream or any session makes room, and a request body is capped at 4 MB as it streams in; the daemon's idle-connection cut is lifted only once the body is in.
 An upstream session idle for 10 minutes — no request in flight, no resource subscription held on it — is closed and reopened on the next request; the backend's own session stays, so an idle agent doesn't see its server go away.
