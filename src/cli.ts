@@ -1024,8 +1024,8 @@ mcp
   .command("approve <session> <server>")
   .description("Approve a project's MCP server (from its .mcp.json or project settings) for every backend in the session's workdir")
   .option("--path <file>", "the file it's declared in, when more than one declares it")
-  .option("--yes", "approve the entry shown (without it, the entry is only shown)")
-  .action((session: string, server: string, opts: { path?: string; yes?: boolean }) => withClient((c) => c.mcpApprove(session, server, opts)));
+  .option("--yes <fingerprint>", "approve the entry you reviewed (its fingerprint, as the review printed it); without it, the entry is only shown")
+  .action((session: string, server: string, opts: { path?: string; yes?: string }) => withClient((c) => c.mcpApprove(session, server, opts)));
 
 // ── Packs (dynamic pack loading — docs/pack-loading.md) ─────────────────────
 

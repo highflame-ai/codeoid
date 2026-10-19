@@ -21,15 +21,18 @@ This page says where each kind of server comes from, which backends it reaches, 
 - **codeoid's config, adopted servers, and Claude's global config** are in the daemon-wide registry: every backend in every session gets them.
 - **Claude's local scope** is your own choice for one directory: every backend in a session there gets it.
   On a daemon shared by several accounts, it's the daemon user's file, so it counts for every account's sessions in that directory, as the global config does.
+  codeoid's approvals of a project's servers, though, are each account's own.
 - **A project's servers** are the repo's choice: a cloned repo can name any command or URL.
-  Claude Code asks before it connects them, and codeoid asks for the other backends: they reach them once approved — in Claude Code, or in codeoid (the drawer's **Approve**, or `codeoid mcp approve <session> <server> --yes`).
-  - Claude Code's approval is read only from your own `~/.claude.json` (its `enabledMcpjsonServers`, `disabledMcpjsonServers` and `enableAllProjectMcpServers` for that directory) — never from a file inside the repo directory, such as `.claude/settings.local.json`: anything there could be the repo (or a build script, or the agent) approving its own servers.
+  Claude Code asks before it connects them, and codeoid asks for the other backends: they reach them once approved — in Claude Code, or in codeoid (the drawer's **Review & approve**, or `codeoid mcp approve <session> <server> --yes <fingerprint>`, which prints the entry and its fingerprint first).
+  - Approving a command-based (stdio) server lets it run on this machine as the user the daemon runs as, with that user's files and network: approve only what you'd run yourself.
+  - Claude Code's approval is by name, as Claude Code stores it: an edit to an entry Claude Code approved stays approved.
+    It is read only from your own `~/.claude.json` (its `enabledMcpjsonServers`, `disabledMcpjsonServers` and `enableAllProjectMcpServers` for that directory) — never from a file inside the repo directory, such as `.claude/settings.local.json`: anything there could be the repo (or a build script, or the agent) approving its own servers.
     An approval Claude Code stored in the repo directory is made once more in codeoid.
   - codeoid's approval is of exactly the entry you were shown: if the repo changes it — before you click or afterwards — it needs approving again.
-    It covers the entry's command, arguments, environment, URL and headers; not the code a command runs, so a server started from a script in the repo (`node ./mcp/server.js`) runs whatever that script is when it starts.
+    It covers the entry's command, arguments, environment, URL and headers, shown in full before you approve — an environment or header value that refers to a variable (`${GITHUB_TOKEN}`) is shown as the reference, and resolves from the daemon's environment when the server starts; not the code a command runs, so a server started from a script in the repo (`node ./mcp/server.js`) runs whatever that script is when it starts.
   - Approving in codeoid also covers a server you denied in Claude Code: the two approvals are separate.
 - **Claude** always loads its own copies of Claude's servers (the Claude CLI reads its config itself); codeoid adds the rest of the registry.
-- **Qwen** reads a project's `.mcp.json` itself, under its own folder trust (measured: codeoid's copy of the same name is overridden by Qwen's own), so on Qwen every name the `.mcp.json` declares follows Qwen's trust settings rather than codeoid's approval.
+- **Qwen** reads a project's `.mcp.json` itself and asks about each of its servers by its own approval, not codeoid's (measured: codeoid's copy of the same name is overridden by Qwen's own), so on Qwen every name the `.mcp.json` declares is left to Qwen.
   Your own servers of other names still reach Qwen through codeoid.
 
 A project's server runs in the project's directory, as each backend that reads it runs it.
@@ -61,3 +64,5 @@ A change to Claude's config afterwards — a `claude mcp add` (any scope), an ed
 Refreshing restarts the session's backend, which picks the conversation back up (the Gemini CLI, which can't resume its own session, is handed the conversation again).
 Asked while a turn, an approval or background work is running, it's applied before the next turn instead: a refresh never cuts work short.
 Opening the drawer only looks; it applies nothing.
+
+Agents' file tools ask before they read or write `~/.claude.json`, in every mode: it holds servers' tokens, and Claude Code's approvals of project servers live there.

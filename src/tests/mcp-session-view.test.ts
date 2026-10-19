@@ -7,18 +7,18 @@
  * sign-in held back (per tenant) from the backends that would only get 401s.
  */
 
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, setSystemTime } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CodeoidConfig, RawMcpServerConfig } from "../config.js";
 import { McpHub } from "../daemon/mcp/hub.js";
 import { importClaudeMcpServers } from "../daemon/mcp/import-claude.js";
 import { McpOAuth } from "../daemon/mcp/oauth.js";
-import { McpRegistry } from "../daemon/mcp/registry.js";
+import { McpRegistry, normalizeSpec } from "../daemon/mcp/registry.js";
 import { SessionMcpView } from "../daemon/mcp/session-view.js";
-import { fingerprintOf, readWorkdirServers, type WorkdirServer } from "../daemon/mcp/workdir-servers.js";
+import { fingerprintOf, readGlobalServers, readWorkdirServers, type WorkdirServer } from "../daemon/mcp/workdir-servers.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
 import type { ProviderEvent } from "../daemon/providers/interface.js";
 import { ProviderRegistry } from "../daemon/providers/registry.js";
@@ -26,7 +26,7 @@ import { SessionManager } from "../daemon/session-manager.js";
 import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
 import { SCOPES } from "../protocol/scopes.js";
-import type { AuthContext, ClaudeConfigMcpServer } from "../protocol/types.js";
+import type { AuthContext, ClaudeConfigMcpServer, McpApprovePreview } from "../protocol/types.js";
 
 let tmp: string;
 let home: string;
@@ -45,6 +45,7 @@ afterEach(() => {
 });
 
 const TENANT = { accountId: "a", projectId: "p" };
+const FIXTURE = join(import.meta.dir, "fixtures", "fake-mcp-stdio.ts");
 const OTHER = { accountId: "b", projectId: "q" };
 
 const raw = (p: Partial<RawMcpServerConfig>): RawMcpServerConfig =>
@@ -58,7 +59,7 @@ describe("reading a workdir's servers", () => {
   it("the user's own count; a repo's carries Claude's approval from the user's ~/.claude.json", async () => {
     claudeJson({ [work]: { mcpServers: { mine: { command: "my-mcp" } }, enabledMcpjsonServers: ["ok"], disabledMcpjsonServers: ["no"] } });
     writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { ok: { command: "a" }, no: { command: "b" }, unasked: { command: "c" } } }));
-    const read = await readWorkdirServers(work, home);
+    const read = (await readWorkdirServers(work, home))!;
     const by = (n: string) => read.find((w) => w.name === n)!;
     expect(by("mine")).toMatchObject({ origin: "claude-local", claudeApproval: "approved" });
     expect(by("ok")).toMatchObject({ origin: "claude-repo", claudeApproval: "approved" });
@@ -69,7 +70,7 @@ describe("reading a workdir's servers", () => {
   it("enableAllProjectMcpServers approves the project's servers, but not one denied", async () => {
     claudeJson({ [work]: { enableAllProjectMcpServers: true, disabledMcpjsonServers: ["no"] } });
     writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { a: { command: "a" }, no: { command: "b" } } }));
-    const read = await readWorkdirServers(work, home);
+    const read = (await readWorkdirServers(work, home))!;
     expect(read.find((w) => w.name === "a")?.claudeApproval).toBe("approved");
     expect(read.find((w) => w.name === "no")?.claudeApproval).toBe("denied");
   });
@@ -79,7 +80,7 @@ describe("reading a workdir's servers", () => {
     mkdirSync(join(work, "cfg"));
     writeFileSync(join(work, "cfg", "settings.local.json"), JSON.stringify({ enableAllProjectMcpServers: true, enabledMcpjsonServers: ["a"] }));
     symlinkSync(join(work, "cfg"), join(work, ".claude"));
-    expect((await readWorkdirServers(work, home)).find((w) => w.name === "a")?.claudeApproval).toBe("unset");
+    expect((await readWorkdirServers(work, home))!.find((w) => w.name === "a")?.claudeApproval).toBe("unset");
   });
 
   it("takes no servers from settings files (Claude Code doesn't), nor a .mcp.json that resolves outside the workdir", async () => {
@@ -102,9 +103,23 @@ describe("reading a workdir's servers", () => {
         },
       }),
     );
-    const read = await readWorkdirServers(work, home);
+    const read = (await readWorkdirServers(work, home))!;
     expect(read.map((w) => w.name)).toEqual(["ok"]);
     expect(read[0]!.raw.env).toEqual({ KEY: "", HOME_DIR: "${HOME}", T: "xy" });
+  });
+
+  it("a ~/.claude.json that can't be read just now is no news — never \"everything was removed\"", async () => {
+    writeFileSync(join(home, ".claude.json"), '{"projects": {"'); // Claude Code mid-rewrite
+    expect(await readWorkdirServers(work, home)).toBeNull();
+    expect(await readGlobalServers(home)).toBeNull();
+    rmSync(join(home, ".claude.json"));
+    expect(await readWorkdirServers(work, home)).toEqual([]); // absent: no servers
+    expect(await readGlobalServers(home)).toEqual({});
+  });
+
+  it("strips references to codeoid's secrets whatever their case", async () => {
+    writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { ok: { url: "https://x/mcp", headers: { A: "Bearer ${codeoid_api_key}", B: "${ZeroId_Token}" } } } }));
+    expect((await readWorkdirServers(work, home))![0]!.raw.headers).toEqual({ A: "Bearer ", B: "" });
   });
 
   it("an edit to an entry is a new fingerprint", () => {
@@ -225,7 +240,7 @@ describe("a session's view", () => {
     const v = view(new McpRegistry({}, { memoryEnabled: false }), [team, twin, mine, sameName]);
     await v.load();
     expect(v.forNativeMount("codex").map((s) => s.name).sort()).toEqual(["mine", "team", "twin"]);
-    expect(v.forNativeMount("qwen").map((s) => s.name).sort()).toEqual(["mine", "twin"]);
+    expect(v.forNativeMount("qwen").map((s) => s.name).sort()).toEqual(["twin"]) // "mine" is a name the .mcp.json declares: Qwen loads its own;
     expect(v.reachOf("team", "/w/.mcp.json", "qwen")).toEqual({ reach: "claude-only", why: "read-by-backend" });
     expect(v.reachOf("team", "/w/.mcp.json", "codex")).toEqual({ reach: "all" });
     // Qwen's own copy of a .mcp.json name wins over the user's same-named one: said so.
@@ -246,24 +261,65 @@ describe("a session's view", () => {
     expect(v.forNativeMount("codex").map((s) => s.name)).toEqual(["new"]);
   });
 
-  it("a refresh picks up the user's global Claude servers too — never touching codeoid's own entries", async () => {
+  it("a refresh picks up the user's global Claude servers for that session alone — never touching codeoid's own entries", async () => {
     const reg = new McpRegistry({ a: raw({ command: "a" }), mine: raw({ command: "codeoid-own" }) }, { memoryEnabled: false, imported: new Set(["a"]) });
     let global: Record<string, RawMcpServerConfig> = { a: raw({ command: "a" }) };
     const v = view(reg, [], { global: () => global });
+    const other = view(reg, [], { global: () => global });
     await v.load();
+    await other.load();
     expect(await v.stale()).toBe(false);
     global = { a: raw({ command: "a2" }), b: raw({ command: "b" }), mine: raw({ command: "from-claude" }) };
     expect(await v.stale()).toBe(true);
-    expect((await v.load()).changed).toBe(true);
-    const cmd = (name: string) => {
-      const t = reg.get(name)?.transport;
+    const change = await v.load();
+    expect(change.changed).toBe(true);
+    expect(change.added.map((s) => s.name).sort()).toEqual(["a", "b"]); // the new "a" is a new client
+    expect(change.removed.map((s) => s.name)).toEqual(["a"]);
+    const cmd = (from: SessionMcpView | McpRegistry, name: string) => {
+      const t = from.get(name)?.transport;
       return t?.kind === "stdio" ? t.command : undefined;
     };
-    expect([cmd("a"), cmd("b"), cmd("mine")]).toEqual(["a2", "b", "codeoid-own"]);
+    expect([cmd(v, "a"), cmd(v, "b"), cmd(v, "mine")]).toEqual(["a2", "b", "codeoid-own"]);
     expect(await v.stale()).toBe(false); // a name codeoid owns doesn't read as a pending change
+    // Another session, and the daemon-wide registry, keep what they had until they refresh.
+    expect([cmd(other, "a"), cmd(other, "b")]).toEqual(["a", undefined]);
+    expect([cmd(reg, "a"), cmd(reg, "b")]).toEqual(["a", undefined]);
     global = { b: raw({ command: "b" }) };
     await v.load();
-    expect(reg.get("a")).toBeUndefined();
+    expect(v.get("a")).toBeUndefined();
+    expect(cmd(other, "a")).toBe("a");
+  });
+
+  it("keeps what it last read when Claude's config can't be read just now", async () => {
+    let read: WorkdirServer[] | null = [entry("mine", "claude-local", raw({ command: "m" }))];
+    let global: Record<string, RawMcpServerConfig> | null = { g: raw({ command: "g" }) };
+    const v = new SessionMcpView(new McpRegistry({}, { memoryEnabled: false }), null, {
+      workdir: "/w",
+      tenant: TENANT,
+      approvals: () => new Set(),
+      read: async () => read,
+      readGlobal: async () => global,
+    });
+    await v.load();
+    read = null;
+    global = null;
+    expect(await v.stale()).toBe(false);
+    expect((await v.load()).changed).toBe(false);
+    expect(v.forNativeMount("codex").map((s) => s.name).sort()).toEqual(["g", "mine"]);
+  });
+
+  it("a sign-in mark lapses after ten minutes, and the server is tried again", () => {
+    const hub = new McpHub({});
+    try {
+      setSystemTime(new Date("2026-10-01T00:00:00Z"));
+      hub.markNeedsSignIn("https://r.example.com/mcp", TENANT);
+      setSystemTime(new Date("2026-10-01T00:09:59Z"));
+      expect(hub.needsSignIn("https://r.example.com/mcp", TENANT)).toBe(true);
+      setSystemTime(new Date("2026-10-01T00:10:01Z"));
+      expect(hub.needsSignIn("https://r.example.com/mcp", TENANT)).toBe(false);
+    } finally {
+      setSystemTime();
+    }
   });
 });
 
@@ -274,6 +330,26 @@ describe("the hub and workdir servers", () => {
     await a.load();
     expect(a.forNativeMount("codex")[0]!.transport).toMatchObject({ cwd: "/w" });
     expect(reg.get("db")).toBeUndefined();
+  });
+
+  it("runs a workdir stdio server in that workdir, and closes it only when the last session using it lets go", async () => {
+    const hub = new McpHub({});
+    const spec = { ...normalizeSpec("db", raw({ command: process.execPath, args: [FIXTURE], env: { FAKE_MCP_WHERE: "1" } })), origin: "claude-local" as const, variant: "v1" };
+    spec.transport = { ...spec.transport, cwd: work } as typeof spec.transport;
+    const scope = { workspaceId: "w", sessionId: "s", tenant: TENANT };
+    const where = async () => JSON.parse((await hub.callTool(spec, "where", {}, scope)).text) as { pid: number; cwd: string };
+    try {
+      hub.retain(spec, TENANT); // session 1
+      hub.retain(spec, TENANT); // session 2
+      const first = await where();
+      expect(first.cwd).toBe(realpathSync(work));
+      hub.release(spec, TENANT); // session 1 goes
+      expect((await where()).pid).toBe(first.pid); // session 2's client is still the same process
+      hub.release(spec, TENANT); // the last one goes
+      expect((await where()).pid).not.toBe(first.pid);
+    } finally {
+      hub.closeAll();
+    }
   });
 
   it("marks a server that answers the MCP sign-in challenge — for that tenant, and not one given credentials of its own", async () => {
@@ -349,13 +425,13 @@ describe("approve and refresh, through the session manager", () => {
     } catch {}
   });
 
-  function manager(make?: () => MockSessionProvider, onProvider?: (p: MockSessionProvider) => void): SessionManager {
-    const providers = new ProviderRegistry("claude");
+  function manager(make?: () => MockSessionProvider, onProvider?: (p: MockSessionProvider) => void, providerId = "claude"): SessionManager {
+    const providers = new ProviderRegistry(providerId);
     providers.register({
-      id: "claude",
-      displayName: "claude",
+      id: providerId,
+      displayName: providerId,
       create: () => {
-        const p = make ? make() : new MockSessionProvider("claude", []);
+        const p = make ? make() : new MockSessionProvider(providerId, []);
         onProvider?.(p);
         return p;
       },
@@ -475,6 +551,68 @@ describe("approve and refresh, through the session manager", () => {
       data: { changed: true, deferred: true },
     });
     expect(providers[0]!.teardownCount).toBe(0);
+  });
+
+  it("a refresh deferred by a running turn is applied before the next one", async () => {
+    const providers: MockSessionProvider[] = [];
+    const m = manager(() => new MockSessionProvider("claude", [[{ type: "text_delta", content: "working…" } as ProviderEvent]], { stall: true }), (p) => providers.push(p));
+    const sid = await session(m);
+    await m.handle({ type: "session.mcp_refresh", id: "r0", sessionId: sid }, auth(ALL), client);
+    const s = m._sessionForTest(sid)!;
+    await s.send("work", auth(ALL));
+    for (let i = 0; i < 100 && s.status === "idle"; i++) await Bun.sleep(5);
+    claudeJson({ [work]: { mcpServers: { added: { command: "new-mcp" } } } });
+    expect(await m.handle({ type: "session.mcp_refresh", id: "r", sessionId: sid }, auth(ALL), client)).toMatchObject({ data: { deferred: true } });
+    await s.interrupt(auth(ALL));
+    for (let i = 0; i < 100 && s.status !== "idle"; i++) await Bun.sleep(5);
+    expect(providers[0]!.teardownCount).toBe(0); // the turn ending applies nothing by itself
+    await s.send("next", auth(ALL));
+    for (let i = 0; i < 100 && providers[0]!.teardownCount === 0; i++) await Bun.sleep(5);
+    expect(providers[0]!.teardownCount).toBe(1); // applied before the next turn ran
+    expect((await rows(m, sid)).stale).toBe(false);
+  });
+
+  it("the Gemini CLI, which can't resume its own session, is handed the conversation again after a refresh", async () => {
+    const providers: MockSessionProvider[] = [];
+    const m = manager(
+      () => new MockSessionProvider("gemini-cli", [[{ type: "text_delta", content: "hello back" } as ProviderEvent, { type: "turn_done", result: { costUsd: 0, durationMs: 1, numTurns: 1, usage: { inputTokens: 1, outputTokens: 1 } } } as unknown as ProviderEvent]]),
+      (p) => providers.push(p),
+      "gemini-cli",
+    );
+    const sid = await session(m);
+    const s = m._sessionForTest(sid)!;
+    await s.send("hello", auth(ALL));
+    for (let i = 0; i < 200 && (s.status !== "idle" || providers.length === 0); i++) await Bun.sleep(5);
+    await Bun.sleep(20);
+    claudeJson({ [work]: { mcpServers: { added: { command: "new-mcp" } } } });
+    expect(await m.handle({ type: "session.mcp_refresh", id: "r", sessionId: sid }, auth(ALL), client)).toMatchObject({ data: { changed: true, deferred: false } });
+    expect(providers[0]!.teardownCount).toBe(1);
+    expect(providers[0]!.seededHistory?.length ?? 0).toBeGreaterThan(0); // after the teardown cleared it
+  });
+
+  it("the approval preview shows the entry as the repo wrote it — references kept, a committed token hidden — to the owner alone", async () => {
+    writeFileSync(
+      join(work, ".mcp.json"),
+      JSON.stringify({
+        mcpServers: {
+          team: { command: "node", args: ["./mcp.js"], env: { NODE_OPTIONS: "--require ./x.js", GH: "${GITHUB_TOKEN}", KEY: "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8" } },
+        },
+      }),
+    );
+    const m = manager();
+    const sid = await session(m);
+    const preview = (a = auth(ALL)) => m.handle({ type: "mcp.approve.preview", id: "p", sessionId: sid, server: "team" }, a, client);
+    const r = (await preview()) as { type: string; data: McpApprovePreview };
+    expect(r.type).toBe("response.ok");
+    expect(r.data).toMatchObject({ server: "team", command: "node", args: ["./mcp.js"], path: join(work, ".mcp.json") });
+    expect(r.data.env.NODE_OPTIONS).toBe("--require ./x.js");
+    expect(r.data.env.GH).toBe("${GITHUB_TOKEN}");
+    expect(r.data.env.KEY).not.toContain("ghp_A1b2C3d4");
+    expect(r.data.fingerprint).toBe((await rows(m, sid)).servers.find((s) => s.name === "team")!.fingerprint!);
+    expect(await preview(auth([SCOPES.SESSION_SEND]))).toMatchObject({ code: "forbidden" });
+    expect(await preview(auth(ALL, 1))).toMatchObject({ code: "forbidden" });
+    expect(await preview({ ...auth(ALL), accountId: "acc-2" })).toMatchObject({ code: "not_found" });
+    expect(await m.handle({ type: "mcp.approve.preview", id: "p", sessionId: sid, server: "nope" }, auth(ALL), client)).toMatchObject({ code: "not_found" });
   });
 
   it("opening the drawer applies nothing", async () => {

@@ -14,6 +14,7 @@ import type {
   ClaudeConfigResultMsg,
   ClaudeConfigSkill,
   McpReconnectResult,
+  McpApprovePreview,
   McpRefreshResult,
 } from "../protocol/types";
 
@@ -109,6 +110,12 @@ export async function refreshMcpServers(sessionId: string): Promise<McpRefreshRe
   const ok = await getClient().request({ type: "session.mcp_refresh", id: newRequestId(), sessionId }, { timeoutMs: 30_000 });
   if (inflightForSession === sessionId) await fetchClaudeConfig(sessionId).catch(() => {});
   return ok.data as McpRefreshResult;
+}
+
+/** What approving a project's MCP server would approve, in full (#395). */
+export async function previewMcpApproval(sessionId: string, server: string, path: string): Promise<McpApprovePreview> {
+  const ok = await getClient().request({ type: "mcp.approve.preview", id: newRequestId(), sessionId, server, path }, { timeoutMs: 15_000 });
+  return ok.data as McpApprovePreview;
 }
 
 /** Approve a project's MCP server for every backend in the session's workdir (#395). */

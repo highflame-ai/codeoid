@@ -8,26 +8,33 @@
  *   from the user's `~/.claude.json`) or in codeoid (the drawer's Approve,
  *   bound to that exact entry).
  * - codeoid's own entries (config, adopted, built-in) win over a workdir one
- *   of the same name; the user's own workdir entry wins over one imported
- *   from Claude's global config (as Claude itself orders them); a repo's
- *   never stands in for anything of the same (or a look-alike) name.
+ *   of the same name; the user's own workdir entry wins over one from Claude's
+ *   global config (as Claude itself orders them); a repo's never stands in
+ *   for anything of the same (or a look-alike) name.
  * - On Claude the workdir ones aren't added: the Claude CLI loads its own.
- *   Qwen Code reads a project's `.mcp.json` itself too (under its own
- *   folder trust, measured): those aren't added on Qwen either — a copy of
- *   the same name would only collide with Qwen's own.
+ *   Qwen Code reads a project's `.mcp.json` itself too (measured): any name
+ *   that file declares is left to Qwen's own copy on Qwen.
  * - A plain HTTP server found to want an OAuth sign-in is held back from the
  *   backends that would only get 401s from it (for this session's tenant).
  *
- * What's applied changes only on `load()` — the session's start, or a refresh
- * the user asks for (a backend restart is the cost of applying a change).
- * `stale()` and the drawer's reach read the files without applying anything.
+ * The user's global Claude servers are a snapshot of this session's too: the
+ * registry holds what the daemon imported at start, and a session's refresh
+ * re-reads them for that session alone — another session's servers change
+ * only when it refreshes.
+ *
+ * What's applied changes only on `load()` — the session's first turn, or a
+ * refresh the user asks for (a backend restart is the cost of applying a
+ * change). `stale()` and the drawer's reach read the files without applying
+ * anything. A file that can't be read just now (Claude Code mid-rewrite) is
+ * no change, never "everything was removed".
  */
 
+import type { RawMcpServerConfig } from "../../config.js";
 import type { McpHub } from "./hub.js";
 import type { McpTenant } from "./oauth.js";
 import { isReservedMcpName, normalizeSpec, type McpRegistry, type McpServerView } from "./registry.js";
 import { isOAuthServer, type McpServerSpec } from "./types.js";
-import { readGlobalServers, readWorkdirServers, type WorkdirServer } from "./workdir-servers.js";
+import { fingerprintOf as entryFingerprint, readGlobalServers, readWorkdirServers, type WorkdirServer } from "./workdir-servers.js";
 
 /** Why a server reaches only Claude (or this session's backend's own copy), when it does. */
 export type WorkdirReach =
@@ -42,16 +49,17 @@ export interface SessionMcpViewOptions {
   tenant: McpTenant;
   /** codeoid-side approvals of repo servers ("server\0fingerprint"). */
   approvals: () => ReadonlySet<string>;
-  /** Injected for tests. */
-  read?: (workdir: string) => Promise<WorkdirServer[]>;
-  /** Injected for tests: the user's global Claude servers (null: leave the registry's as they are). */
-  readGlobal?: () => Promise<Record<string, import("../../config.js").RawMcpServerConfig> | null>;
+  /** Injected for tests (null: can't be read just now). */
+  read?: (workdir: string) => Promise<WorkdirServer[] | null>;
+  /** Injected for tests: the user's global Claude servers (null: can't be read just now). */
+  readGlobal?: () => Promise<Record<string, RawMcpServerConfig> | null>;
 }
 
 /** What changed when a view was applied. */
 export interface ViewChange {
   changed: boolean;
-  /** Workdir servers no longer applied: their clients can go. */
+  /** This session's own servers (workdir ones, its global snapshot) it now uses, and no longer does. */
+  added: McpServerSpec[];
   removed: McpServerSpec[];
 }
 
@@ -59,6 +67,7 @@ export interface ViewChange {
 export interface ReachSnapshot {
   reachOf(name: string, path: string): WorkdirReach | undefined;
   reachOfGlobal(name: string, url: string | null, command: string | null): WorkdirReach;
+  /** A project's entry's fingerprint (what an approval binds to). */
   fingerprintOf(name: string, path: string): string | undefined;
 }
 
@@ -68,12 +77,12 @@ export class SessionMcpView implements McpServerView {
   readonly #opts: SessionMcpViewOptions;
   /** Every server the workdir declared, as last read (applied or not). */
   #read: WorkdirServer[] = [];
-  /** The ones applied to this session's backends. */
+  /** The user's global servers as last read (applied or not); null until read. */
+  #readGlobals: Record<string, RawMcpServerConfig> | null = null;
+  /** The workdir servers applied to this session's backends. */
   #layer: McpServerSpec[] = [];
-  /** Names a `.mcp.json` declares (applied or not): a backend that reads it has its own. */
-  #mcpJsonNames = new Set<string>();
-  /** The applied ones declared in a `.mcp.json`, by name and fingerprint. */
-  #fromMcpJson = new Set<string>();
+  /** The global servers applied (this session's snapshot); null: the registry's own. */
+  #globals: McpServerSpec[] | null = null;
   #fingerprint = "";
   #loaded = false;
 
@@ -87,54 +96,73 @@ export class SessionMcpView implements McpServerView {
     return this.#loaded;
   }
 
+  /** What's applied, as one comparable value. */
+  get fingerprint(): string {
+    return this.#fingerprint;
+  }
+
+  /** This session's own servers in use: their hub clients are its to let go. */
+  ownSpecs(): McpServerSpec[] {
+    return [...this.#layer, ...(this.#globals ?? [])];
+  }
+
   /** Read Claude's config (global and workdir) and apply it. */
   async load(): Promise<ViewChange> {
-    const [read, global] = await Promise.all([this.#readWorkdir(), this.#readGlobal()]);
-    // The user's global servers, as they are now (the daemon-wide registry's
-    // imported entries; a change there is the user's own config).
-    const globalsChanged = global ? this.#base.syncImported(global).length > 0 : false;
-    const layer = this.#resolve(read);
-    const fingerprint = this.#fingerprintOf(layer);
-    const changed = this.#loaded && (globalsChanged || fingerprint !== this.#fingerprint);
-    const kept = new Set(layer.map(keyOf));
-    const removed = this.#layer.filter((s) => !kept.has(keyOf(s)));
-    this.#apply(read, layer);
+    await this.#readAll();
+    const before = new Map(this.ownSpecs().map((s) => [keyOf(s), s]));
+    const globals = this.#readGlobals ? this.#globalSpecs(this.#readGlobals) : this.#globals;
+    const layer = this.#resolve(this.#read, globals);
+    const fingerprint = fingerprintOfApplied(layer, globals);
+    const changed = this.#loaded && fingerprint !== this.#fingerprint;
+    this.#layer = layer;
+    this.#globals = globals;
     this.#fingerprint = fingerprint;
     this.#loaded = true;
-    return { changed, removed };
+    const after = new Map(this.ownSpecs().map((s) => [keyOf(s), s]));
+    return {
+      changed,
+      added: [...after].filter(([k]) => !before.has(k)).map(([, s]) => s),
+      removed: [...before].filter(([k]) => !after.has(k)).map(([, s]) => s),
+    };
   }
 
   /** Whether loading again would change what's applied — without applying anything. */
   async stale(): Promise<boolean> {
     if (!this.#loaded) return false;
-    const [read, global] = await Promise.all([this.#readWorkdir(), this.#readGlobal()]);
-    this.#read = read; // for the drawer's reach; nothing applied
-    this.#mcpJsonNames = new Set(read.filter((w) => isMcpJson(w.path)).map((w) => w.name));
-    if (global && globalFingerprint(global, this.#base) !== this.#base.importedFingerprint()) return true;
-    return this.#fingerprintOf(this.#resolve(read)) !== this.#fingerprint;
+    await this.#readAll();
+    const globals = this.#readGlobals ? this.#globalSpecs(this.#readGlobals) : this.#globals;
+    return fingerprintOfApplied(this.#resolve(this.#read, globals), globals) !== this.#fingerprint;
   }
 
-  /** Read the workdir's servers for the drawer before the view is applied (applies nothing). */
+  /** Read Claude's config for the drawer before the view is applied (applies nothing). */
   async peek(): Promise<void> {
-    if (this.#loaded) return;
-    this.#read = await this.#readWorkdir();
-    this.#mcpJsonNames = new Set(this.#read.filter((w) => isMcpJson(w.path)).map((w) => w.name));
+    if (!this.#loaded) await this.#readAll();
   }
 
   /**
-   * The drawer's answers for every row at once (#395): what applies, what
-   * would, and how each server reaches `backendId` — indexed once, so a row
-   * costs a lookup however many servers a config holds.
+   * The drawer's answers for every row at once: what applies (or, before the
+   * first turn, will), what would on a refresh, and how each server reaches
+   * `backendId` — indexed once, so a row costs a lookup however many servers.
    */
   snapshot(backendId?: string): ReachSnapshot {
+    const approvals = this.#opts.approvals();
     const byEntry = new Map(this.#read.map((w) => [`${w.name}\u0000${w.path}`, w]));
-    const appliedNow = this.#loaded ? this.#layer : this.#resolve(this.#read);
-    const applied = new Map(appliedNow.map((s) => [`${s.name}\u0000${s.variant ?? ""}`, s]));
-    const would = new Set(this.#resolve(this.#read).map((s) => `${s.name}\u0000${s.variant ?? ""}`));
-    const merged = new Map(this.#merged(undefined).map((s) => [s.name, s]));
-    const readByBackend = (name: string) => this.#readByBackend(name, backendId);
+    const freshGlobals = this.#readGlobals ? this.#globalSpecs(this.#readGlobals) : this.#globals;
+    const wouldLayer = this.#resolve(this.#read, freshGlobals, approvals);
+    const appliedLayer = this.#loaded ? this.#layer : wouldLayer;
+    const appliedGlobals = this.#loaded ? this.#globals : freshGlobals;
+    const applied = new Map(appliedLayer.map((s) => [keyOf(s), s]));
+    const would = new Set(wouldLayer.map(keyOf));
+    const merged = new Map(this.#mergedWith(undefined, appliedLayer, appliedGlobals).map((s) => [s.name, s]));
+    const mcpJsonNames = new Set(this.#read.filter((w) => isMcpJson(w.path)).map((w) => w.name));
+    const readByBackend = (name: string) =>
+      backendId !== undefined && backendId !== "claude" && READS_MCP_JSON.has(backendId) && mcpJsonNames.has(name);
     return {
-      fingerprintOf: (name, path) => byEntry.get(`${name}\u0000${path}`)?.fingerprint,
+      fingerprintOf: (name, path) => {
+        const w = byEntry.get(`${name}\u0000${path}`);
+        // Only a project's entry is ever approved; the user's own carry no fingerprint out.
+        return w?.origin === "claude-repo" ? w.fingerprint : undefined;
+      },
       reachOf: (name, path) => {
         const entry = byEntry.get(`${name}\u0000${path}`);
         if (!entry) return undefined;
@@ -142,7 +170,7 @@ export class SessionMcpView implements McpServerView {
         if (readByBackend(name)) return { reach: "claude-only", why: "read-by-backend" };
         const spec = applied.get(`${name}\u0000${entry.fingerprint}`);
         if (spec) return this.#heldBack(spec) ? { reach: "claude-only", why: "needs-sign-in" } : { reach: "all" };
-        if (!this.#consented(entry)) return { reach: "claude-only", why: "needs-approval" };
+        if (!this.#consented(entry, approvals)) return { reach: "claude-only", why: "needs-approval" };
         return { reach: "claude-only", why: would.has(`${name}\u0000${entry.fingerprint}`) ? "needs-refresh" : "shadowed" };
       },
       reachOfGlobal: (name, url, command) => {
@@ -152,15 +180,14 @@ export class SessionMcpView implements McpServerView {
         const same =
           spec?.origin === "claude-global" &&
           (spec.transport.kind === "http" ? spec.transport.url === url : spec.transport.kind === "stdio" && spec.transport.command === command);
-        if (!spec || !same) return { reach: "claude-only", why: "shadowed" };
+        if (!spec || !same) {
+          // Not applied: a refresh would, if it's in the fresh read and nothing else wins.
+          const fresh = freshGlobals?.find((s) => s.name === name);
+          return { reach: "claude-only", why: fresh && !merged.has(name) ? "needs-refresh" : "shadowed" };
+        }
         return this.#heldBack(spec) ? { reach: "claude-only", why: "needs-sign-in" } : { reach: "all" };
       },
     };
-  }
-
-  /** The workdir servers applied now (their hub clients go with the session). */
-  workdirSpecs(): readonly McpServerSpec[] {
-    return this.#layer;
   }
 
   /** How far a workdir server (by name and file) reaches on `backendId` (the session's). */
@@ -178,6 +205,8 @@ export class SessionMcpView implements McpServerView {
     const urls = new Set<string>();
     const base = this.#base.get(name);
     if (base?.transport.kind === "http") urls.add(base.transport.url);
+    const g = this.#readGlobals?.[name];
+    if (g?.url) urls.add(g.url);
     for (const w of this.#read) if (w.name === name && w.raw.url) urls.add(w.raw.url);
     return urls.size === 1 ? [...urls][0] : undefined;
   }
@@ -208,36 +237,47 @@ export class SessionMcpView implements McpServerView {
 
   // ── internals ──
 
-  #readWorkdir(): Promise<WorkdirServer[]> {
-    return (this.#opts.read ?? readWorkdirServers)(this.#opts.workdir);
+  /** Read both; a file that can't be read just now leaves the last read as it was. */
+  async #readAll(): Promise<void> {
+    const [read, global] = await Promise.all([
+      (this.#opts.read ?? readWorkdirServers)(this.#opts.workdir),
+      this.#opts.readGlobal ? this.#opts.readGlobal() : readGlobalServers(),
+    ]);
+    if (read) this.#read = read;
+    if (global) this.#readGlobals = global;
   }
 
-  #readGlobal(): Promise<Record<string, import("../../config.js").RawMcpServerConfig> | null> {
-    return this.#opts.readGlobal ? this.#opts.readGlobal() : readGlobalServers();
+  /** The user's global servers as this session's specs: codeoid's own names and reserved ones excluded. */
+  #globalSpecs(global: Record<string, RawMcpServerConfig>): McpServerSpec[] {
+    const out: McpServerSpec[] = [];
+    for (const [name, raw] of Object.entries(global)) {
+      const existing = this.#base.get(name);
+      if (isReservedMcpName(name) || (existing && existing.origin !== "claude-global")) continue;
+      out.push({ ...normalizeSpec(name, raw), origin: "claude-global", variant: entryFingerprint(raw) });
+    }
+    return out;
   }
 
-  #apply(read: WorkdirServer[], layer: McpServerSpec[]): void {
-    this.#read = read;
-    this.#layer = layer;
-    this.#mcpJsonNames = new Set(read.filter((w) => isMcpJson(w.path)).map((w) => w.name));
-    this.#fromMcpJson = new Set(read.filter((w) => isMcpJson(w.path)).map((w) => `${w.name}\u0000${w.fingerprint}`));
-  }
-
-  /** A backend that reads the project's `.mcp.json` itself uses its own copy of any name declared there. */
-  #readByBackend(name: string, backendId: string | undefined): boolean {
-    return backendId !== undefined && backendId !== "claude" && READS_MCP_JSON.has(backendId) && this.#mcpJsonNames.has(name);
-  }
-
-  /** The registry with the workdir layer applied (not on Claude, which loads its own). */
   #merged(backendId: string | undefined): McpServerSpec[] {
-    const byName = new Map(this.#base.list().map((s) => [s.name, s]));
+    return this.#mergedWith(backendId, this.#layer, this.#globals);
+  }
+
+  /**
+   * The registry with this session's global snapshot and workdir layer
+   * applied. On Claude the workdir layer isn't (the CLI loads its own); on a
+   * backend that reads the project's .mcp.json, nothing of a name declared there is.
+   */
+  #mergedWith(backendId: string | undefined, layer: readonly McpServerSpec[], globals: readonly McpServerSpec[] | null): McpServerSpec[] {
+    const byName = new Map<string, McpServerSpec>();
+    for (const s of this.#base.list()) if (!(globals && s.origin === "claude-global")) byName.set(s.name, s);
+    for (const g of globals ?? []) if (!byName.has(g.name)) byName.set(g.name, g);
     if (backendId !== "claude") {
-      for (const spec of this.#layer) {
-        // A backend that reads the project's .mcp.json itself has its own copy.
-        if (backendId && READS_MCP_JSON.has(backendId) && this.#fromMcpJson.has(`${spec.name}\u0000${spec.variant ?? ""}`)) continue;
+      const mcpJsonNames = backendId && READS_MCP_JSON.has(backendId) ? new Set(this.#read.filter((w) => isMcpJson(w.path)).map((w) => w.name)) : null;
+      for (const spec of layer) {
+        if (mcpJsonNames?.has(spec.name)) continue;
         const existing = byName.get(spec.name);
-        // Only an import from Claude's global config gives way — to the
-        // user's own workdir entry. A repo's never displaces anything.
+        // Only an entry from Claude's global config gives way — to the user's
+        // own workdir entry. A repo's never displaces anything.
         if (existing && !(existing.origin === "claude-global" && spec.origin === "claude-local")) continue;
         byName.set(spec.name, spec);
       }
@@ -246,18 +286,20 @@ export class SessionMcpView implements McpServerView {
   }
 
   /** The workdir servers that apply, by consent and precedence. */
-  #resolve(read: readonly WorkdirServer[]): McpServerSpec[] {
+  #resolve(read: readonly WorkdirServer[], globals: readonly McpServerSpec[] | null, approvals = this.#opts.approvals()): McpServerSpec[] {
     const loose = (n: string) => n.toLowerCase().replace(/-/g, "_");
-    const taken = new Map(this.#base.list().map((s) => [loose(s.name), s]));
+    const taken = new Map<string, McpServerSpec>();
+    for (const s of this.#base.list()) if (!(globals && s.origin === "claude-global")) taken.set(loose(s.name), s);
+    for (const g of globals ?? []) if (!taken.has(loose(g.name))) taken.set(loose(g.name), g);
     const out: McpServerSpec[] = [];
     // The user's own first: a repo's of the same name never stands in for them.
     const ordered = [...read].sort((a, b) => (a.origin === b.origin ? 0 : a.origin === "claude-local" ? -1 : 1));
     for (const w of ordered) {
-      if (isReservedMcpName(w.name) || !this.#consented(w)) continue;
+      if (isReservedMcpName(w.name) || !this.#consented(w, approvals)) continue;
       const existing = taken.get(loose(w.name));
       if (existing) {
-        const userOverImport = w.origin === "claude-local" && existing.origin === "claude-global" && existing.name === w.name;
-        if (!userOverImport) continue;
+        const userOverGlobal = w.origin === "claude-local" && existing.origin === "claude-global" && existing.name === w.name;
+        if (!userOverGlobal) continue;
       }
       const base = normalizeSpec(w.name, w.raw);
       // A stdio server runs in its workdir, as every backend that reads it runs it.
@@ -269,23 +311,14 @@ export class SessionMcpView implements McpServerView {
     return out;
   }
 
-  #consented(w: WorkdirServer): boolean {
+  #consented(w: WorkdirServer, approvals: ReadonlySet<string>): boolean {
     if (w.origin === "claude-local") return true;
-    return w.claudeApproval === "approved" || this.#opts.approvals().has(`${w.name}\u0000${w.fingerprint}`);
+    return w.claudeApproval === "approved" || approvals.has(`${w.name}\u0000${w.fingerprint}`);
   }
 
   /** A plain HTTP server that has asked this tenant for an OAuth sign-in. */
   #heldBack(spec: McpServerSpec): boolean {
     return spec.transport.kind === "http" && !isOAuthServer(spec) && (this.#hub?.needsSignIn(spec.transport.url, this.#opts.tenant) ?? false);
-  }
-
-  /** What's applied: the workdir layer and the imported global entries. */
-  #fingerprintOf(layer: readonly McpServerSpec[]): string {
-    const local = layer
-      .map((s) => `${s.name}\u0000${s.variant ?? ""}`)
-      .sort()
-      .join("\u0001");
-    return `${local}\u0002${this.#base.importedFingerprint()}`;
   }
 }
 
@@ -297,15 +330,8 @@ function isMcpJson(file: string): boolean {
   return file.endsWith("/.mcp.json") || file.endsWith("\\.mcp.json");
 }
 
-/** The fingerprint `McpRegistry.importedFingerprint()` would give for these entries. */
-function globalFingerprint(servers: Record<string, import("../../config.js").RawMcpServerConfig>, base: McpRegistry): string {
-  return Object.entries(servers)
-    // As syncImported would take them: not reserved, not one of codeoid's own entries.
-    .filter(([name]) => {
-      const existing = base.get(name);
-      return !isReservedMcpName(name) && (!existing || existing.origin === "claude-global");
-    })
-    .map(([name, raw]) => `${name}\u0000${JSON.stringify({ ...normalizeSpec(name, raw), origin: "claude-global" }.transport)}`)
-    .sort()
-    .join("\u0001");
+/** What's applied — the workdir layer and the global snapshot — as one comparable value. */
+function fingerprintOfApplied(layer: readonly McpServerSpec[], globals: readonly McpServerSpec[] | null): string {
+  const part = (specs: readonly McpServerSpec[]) => specs.map(keyOf).sort().join("\u0001");
+  return `${part(layer)}\u0002${globals ? part(globals) : "-"}`;
 }

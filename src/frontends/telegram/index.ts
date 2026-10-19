@@ -19,7 +19,7 @@
 import { Bot, type Context, InlineKeyboard } from "grammy";
 import { autoRetry } from "@grammyjs/auto-retry";
 import { randomUUID } from "node:crypto";
-import { formatCollaborationCost } from "@highflame/codeoid-core";
+import { formatCollaborationCost, mcpRefreshSummary } from "@highflame/codeoid-core";
 import { getManifest, getSnapshot } from "../../daemon/settings/store.js";
 import { ALL_SCOPES_STRING } from "../../protocol/scopes.js";
 import type { Frontend, FrontendContext } from "../types.js";
@@ -1013,13 +1013,7 @@ export class TelegramFrontend implements Frontend {
       return;
     }
     const r = resp.data as { changed: boolean; deferred: boolean };
-    await ctx.reply(
-      !r.changed
-        ? "MCP servers are up to date."
-        : r.deferred
-          ? "MCP servers changed: applied when this turn ends."
-          : "MCP servers changed: the backend restarts with them on the next turn.",
-    );
+    await ctx.reply(mcpRefreshSummary(r));
   }
 
   async #handleCapabilities(

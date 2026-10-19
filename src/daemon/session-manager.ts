@@ -28,7 +28,7 @@ import { hasScope, SCOPES } from "../protocol/scopes.js";
 import { applyPatches, getManifest, getSnapshot, previewPatches, readMcpServerEntry, writeMcpServerEntry } from "./settings/store.js";
 import { adoptability, adoptableName, adoptedEntry, adoptionRefusal, claudeMcpServers, fromRepoFile, fullUrlRequired, isSameAdoption } from "./mcp/adopt.js";
 import { readWorkdirServers } from "./mcp/workdir-servers.js";
-import { cleanMcpError, commandSummary, MAX_SHOWN_KEYS, redactMcpUrl, serverProgram, shownLabel } from "./mcp/redact.js";
+import { cleanMcpError, commandSummary, MAX_SHOWN_KEYS, redactMcpUrl, redactSecretText, serverProgram, shownLabel } from "./mcp/redact.js";
 import { canonicalFromTranscript, turnIndexFromHistory } from "./canonical-restore.js";
 import { BackendLoginBroker, BackendLoginError, redact } from "./auth/backend-login.js";
 import { ClaudeAccountError, ClaudeAccountStore, validateAccountName } from "./claude-accounts.js";
@@ -124,6 +124,7 @@ import { ORCHESTRATOR_ROLE } from "../protocol/types.js";
 import type {
   AuthContext,
   ClaudeConfigMcpServer,
+  McpApprovePreview,
   ClientMessage,
   CollaborationConfig,
   CollaborationCost,
@@ -1171,6 +1172,8 @@ mcpHub: this.#mcpHub,
         return this.#mcpRefresh(msg, auth);
       case "mcp.approve":
         return this.#mcpApprove(msg, auth);
+      case "mcp.approve.preview":
+        return this.#mcpApprovePreview(msg, auth);
       case "session.fork":
         return this.#fork(msg, auth);
       case "session.rename":
@@ -1577,8 +1580,11 @@ mcpHub: this.#mcpHub,
     }
     try {
       const snapshot = await readClaudeConfig(session.workdir);
-      // Read for the drawer only: what a session applies changes on its first turn or a refresh.
+      // Read for the drawer only — what a session applies changes on its first
+      // turn or a refresh. Freshly, before the rows: a row and its fingerprint
+      // are of the files as they are now.
       await session.peekMcpView();
+      const mcpStale = await session.mcpStale();
       const reachOf = session.mcpReachSnapshot();
       const live = session.sdkMcpSnapshot;
       // A name two entries give different URLs to: which one the backend runs
@@ -1663,7 +1669,7 @@ mcpHub: this.#mcpHub,
           command: commandSummary(h.command),
         })),
         mcpReconnect: session.canReconnectMcp,
-        ...((await session.mcpStale()) ? { mcpStale: true } : {}),
+        ...(mcpStale ? { mcpStale: true } : {}),
       };
     } catch (err) {
       return {
@@ -7352,6 +7358,49 @@ mcpHub: this.#mcpHub,
   }
 
   /**
+   * What approving a project's MCP server would approve, in full (#395): the
+   * one deciding sees the command, every argument, the URL, and each env and
+   * header reference — literal values masked. Same rights as approving.
+   */
+  async #mcpApprovePreview(
+    msg: Extract<ClientMessage, { type: "mcp.approve.preview" }>,
+    auth: AuthContext,
+  ): Promise<DaemonMessage> {
+    const fail = (error: string, code: "invalid_request" | "not_found" | "forbidden" = "invalid_request"): DaemonMessage => ({
+      type: "response.error",
+      requestId: msg.id,
+      error,
+      code,
+    });
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE) || auth.delegationDepth > 0) {
+      return fail("Reviewing a project's MCP server for approval needs settings:write, on a token of your own", "forbidden");
+    }
+    const session = this.#getOwnedSession(msg.sessionId, auth);
+    if (!session) return fail("Session not found", "not_found");
+    const read = await readWorkdirServers(session.workdir);
+    if (!read) return fail("Claude's config can't be read just now (it may be mid-write) — try again");
+    const repo = read.filter((w) => w.origin === "claude-repo" && w.name === msg.server && (msg.path === undefined || w.path === msg.path));
+    if (repo.length === 0) return fail(`This project declares no MCP server ${JSON.stringify(msg.server)}`, "not_found");
+    if (repo.length > 1) return fail(`${JSON.stringify(msg.server)} is declared in ${repo.map((w) => w.path).join(" and ")}; say which file`);
+    const w = repo[0]!;
+    // Everything the entry sets is the repo's choice, and what's approved —
+    // `NODE_OPTIONS=--require ./x` matters — so it's shown as written, `${VAR}`
+    // references included; only token-shaped text is hidden (a secret committed to the repo).
+    const shown = (o: Record<string, string> | undefined) => Object.fromEntries(Object.entries(o ?? {}).map(([k, v]) => [k, redactSecretText(v)]));
+    const preview: McpApprovePreview = {
+      server: w.name,
+      path: w.path,
+      fingerprint: w.fingerprint,
+      command: w.raw.command ?? null,
+      args: (w.raw.args ?? []).map(redactSecretText),
+      url: w.raw.url ? redactMcpUrl(w.raw.url) : null,
+      env: shown(w.raw.env),
+      headers: shown(w.raw.headers),
+    };
+    return { type: "response.ok", requestId: msg.id, data: preview };
+  }
+
+  /**
    * Approve a repo's MCP server — this exact entry — for every backend in the
    * session's workdir (#395). Consent to what a repo chose, so: the caller's
    * own session, `settings:write`, never a delegated token, audited with the
@@ -7372,7 +7421,9 @@ mcpHub: this.#mcpHub,
     }
     const session = this.#getOwnedSession(msg.sessionId, auth);
     if (!session) return fail("Session not found", "not_found");
-    const repo = (await readWorkdirServers(session.workdir)).filter(
+    const read = await readWorkdirServers(session.workdir);
+    if (!read) return fail("Claude's config can't be read just now (it may be mid-write) — try again");
+    const repo = read.filter(
       (w) => w.origin === "claude-repo" && w.name === msg.server && (msg.path === undefined || w.path === msg.path),
     );
     if (repo.length === 0) return fail(`This project declares no MCP server ${JSON.stringify(msg.server)}`, "not_found");

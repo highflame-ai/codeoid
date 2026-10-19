@@ -839,8 +839,10 @@ export class Session {
   #mcpRegistry?: McpRegistry;
   /** The registry as this session sees it, with its workdir's servers (#395). */
   #mcpView?: SessionMcpView;
-  /** A refresh asked for during a turn: applied before the next one. */
+  /** A refresh asked for while the backend was busy: applied before the next turn. */
   #mcpRefreshPending = false;
+  /** What the backend was built with (the view's fingerprint); undefined before its first turn. */
+  #mcpBuiltWith: string | undefined;
   #mcpHub?: McpHub;
   #chunker?: EpisodeChunker;
   // Counts mid-turn messages in flight. When the SDK interrupts the current
@@ -1886,29 +1888,32 @@ export class Session {
 
   /** Take the backend's word for a server's state; announce it coming back. */
   /**
-   * Make sure the session's MCP view is read (before its first turn) and that
-   * a refresh asked for earlier is applied once nothing is running: a change
-   * rebuilds the backend, which picks the conversation back up.
+   * Before a turn: read the session's MCP servers if they haven't been, and
+   * apply a refresh asked for while the backend was busy — rebuilding the
+   * backend when what it was built with differs from what's applied now.
    */
   async #applyMcpView(): Promise<void> {
     const view = this.#mcpView;
-    if (!view) return;
-    if (!view.loaded) {
-      await view.load().catch((e) => console.error(`[codeoid/session ${this.id}] reading the session's MCP servers failed: ${e instanceof Error ? e.message : String(e)}`));
+    if (!view || this.#mcpBusy()) return;
+    if (!view.loaded || this.#mcpRefreshPending) {
       this.#mcpRefreshPending = false;
-      return;
+      try {
+        await this.#loadMcp();
+      } catch (e) {
+        console.error(`[codeoid/session ${this.id}] reading the session's MCP servers failed: ${e instanceof Error ? e.message : String(e)}`);
+        // The backend is built without them: a later read that succeeds rebuilds it.
+        if (!view.loaded) this.#mcpBuiltWith ??= "";
+      }
     }
-    if (!this.#mcpRefreshPending || this.#mcpBusy()) return;
-    this.#mcpRefreshPending = false;
-    await this.#applyMcpChange();
+    await this.#rebuildForMcp();
   }
 
   /**
    * Re-read the session's MCP servers from Claude's config and apply any
    * change (#395): the backend is rebuilt and picks the conversation back up.
-   * Serialized with sends; while a turn or background work runs, applied
-   * before the next turn instead (a refresh never cuts work short). Never
-   * done on its own — a config edit shouldn't restart a working backend unasked.
+   * Serialized with sends; while a turn, an approval or background work runs,
+   * applied before the next turn instead (a refresh never cuts work short).
+   * Never done on its own — a config edit shouldn't restart a working backend unasked.
    */
   async refreshMcp(): Promise<{ changed: boolean; deferred: boolean }> {
     const view = this.#mcpView;
@@ -1917,16 +1922,20 @@ export class Session {
     this.#sendChain = this.#sendChain
       .catch(() => {})
       .then(async () => {
-        if (!view.loaded) {
-          await view.load();
-          return;
-        }
         if (this.#mcpBusy()) {
           this.#mcpRefreshPending = true;
           result = { changed: await view.stale(), deferred: true };
           return;
         }
-        result = { changed: await this.#applyMcpChange(), deferred: false };
+        const wasLoaded = view.loaded;
+        await this.#loadMcp();
+        // Work that started while the files were read is left alone too.
+        if (this.#mcpBusy()) {
+          this.#mcpRefreshPending = true;
+          result = { changed: this.#mcpBuiltWith !== undefined && view.fingerprint !== this.#mcpBuiltWith, deferred: true };
+          return;
+        }
+        result = { changed: wasLoaded && (await this.#rebuildForMcp()), deferred: false };
       });
     await this.#sendChain;
     return result;
@@ -1937,16 +1946,30 @@ export class Session {
     return this.#activeRun !== null || this.#switchBusyReason() !== null || this.#backgroundTasks.size > 0;
   }
 
-  /** Apply the view; when it changed, rebuild the backend. Whether it changed. */
-  async #applyMcpChange(): Promise<boolean> {
-    const view = this.#mcpView!;
-    const { changed, removed } = await view.load();
+  /** Read and apply the view; this session's own servers' hub clients follow it. */
+  async #loadMcp(): Promise<void> {
+    const { added, removed } = await this.#mcpView!.load();
     const tenant = { accountId: this.accountId, projectId: this.projectId };
-    for (const spec of removed) this.#mcpHub?.dropSpec(spec, tenant);
-    if (!changed) return false;
+    for (const spec of added) this.#mcpHub?.retain(spec, tenant);
+    for (const spec of removed) this.#mcpHub?.release(spec, tenant);
+  }
+
+  /**
+   * Rebuild the backend if what it was built with isn't what's applied: it
+   * picks the conversation back up (Claude, Codex and Qwen resume their own;
+   * the Gemini CLI, which starts a new ACP session, is handed the history).
+   * Whether it was rebuilt. The first time, nothing was built yet: just noted.
+   */
+  async #rebuildForMcp(): Promise<boolean> {
+    const view = this.#mcpView;
+    if (!view?.loaded) return false;
+    if (this.#mcpBuiltWith === undefined) {
+      this.#mcpBuiltWith = view.fingerprint;
+      return false;
+    }
+    if (view.fingerprint === this.#mcpBuiltWith) return false;
+    this.#mcpBuiltWith = view.fingerprint;
     await this.#teardownProvider();
-    // Claude, Codex and Qwen resume their own conversation; the Gemini CLI
-    // starts a new ACP session, so it's handed the history again.
     if (RESEED_AFTER_TEARDOWN.has(this.#provider.id) && this.#accumulator.history.length > 0) {
       await this.#seedProviderFromHistory();
     }
@@ -3666,9 +3689,9 @@ export class Session {
 
   async destroy(sender: AuthContext, opts: { deleteBranch?: boolean } = {}): Promise<void> {
     this.#destroyed = true;
-    // This session's workdir servers' clients in the hub go with it.
-    for (const spec of this.#mcpView?.workdirSpecs() ?? []) {
-      this.#mcpHub?.dropSpec(spec, { accountId: this.accountId, projectId: this.projectId });
+    // This session's own servers' clients in the hub: let go (the last user closes them).
+    for (const spec of this.#mcpView?.ownSpecs() ?? []) {
+      this.#mcpHub?.release(spec, { accountId: this.accountId, projectId: this.projectId });
     }
     // Cancel any pending debounced status persist — a write firing after the
     // deletes below would resurrect the meta file for a destroyed session,

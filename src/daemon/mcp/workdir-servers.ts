@@ -37,7 +37,7 @@ const WORKDIR_SERVER_NAME = /^(?!mcp__)(?!.*__)[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/
 
 /** Daemon env a repo's server may not ask for by `${VAR}` reference: codeoid's
  *  own secrets (the same prefixes kept from every agent subprocess). */
-const DAEMON_SECRET_VAR = /\$\{(CODEOID_|ZEROID_|TELEGRAM_)[A-Za-z0-9_]*\}/g;
+const DAEMON_SECRET_VAR = /\$\{(CODEOID_|ZEROID_|TELEGRAM_)[A-Za-z0-9_]*\}/gi;
 
 export interface WorkdirServer {
   name: string;
@@ -57,10 +57,16 @@ function homedir(): string {
   return process.env.HOME ?? process.env.USERPROFILE ?? os.homedir();
 }
 
-/** Every server the workdir adds, before consent or precedence is applied. */
-export async function readWorkdirServers(workdir: string, home: string = homedir()): Promise<WorkdirServer[]> {
+/**
+ * Every server the workdir adds, before consent or precedence is applied —
+ * or null when `~/.claude.json` is there but can't be read now (mid-rewrite
+ * by Claude Code, too big): that's no news, not "everything was removed".
+ */
+export async function readWorkdirServers(workdir: string, home: string = homedir()): Promise<WorkdirServer[] | null> {
   const claudeJsonPath = path.join(home, ".claude.json");
-  const claudeJson = asObject(await readClaudeJson(claudeJsonPath));
+  const read = await readClaudeJson(claudeJsonPath);
+  if (read === UNREADABLE) return null;
+  const claudeJson = asObject(read);
   const project = asObject(asObject(claudeJson?.projects)?.[workdir]);
   const mcpJsonPath = path.join(workdir, ".mcp.json");
   const mcpJson = asObject(await readInside(workdir, mcpJsonPath));
@@ -93,9 +99,12 @@ export async function readWorkdirServers(workdir: string, home: string = homedir
   return out;
 }
 
-/** The user's global servers from `~/.claude.json` (cached by size and mtime), as the boot import maps them. */
-export async function readGlobalServers(home: string = homedir()): Promise<Record<string, RawMcpServerConfig>> {
-  const block = asObject(asObject(await readClaudeJson(path.join(home, ".claude.json")))?.mcpServers);
+/** The user's global servers from `~/.claude.json` (cached by size and mtime),
+ *  as the boot import maps them — or null when the file is there but can't be read now. */
+export async function readGlobalServers(home: string = homedir()): Promise<Record<string, RawMcpServerConfig> | null> {
+  const read = await readClaudeJson(path.join(home, ".claude.json"));
+  if (read === UNREADABLE) return null;
+  const block = asObject(asObject(read)?.mcpServers);
   const out: Record<string, RawMcpServerConfig> = {};
   for (const [name, def] of Object.entries(block ?? {})) {
     if (name.startsWith("_")) continue;
@@ -118,6 +127,9 @@ export function fingerprintOf(raw: RawMcpServerConfig): string {
   return createHash("sha256").update(canon).digest("hex").slice(0, 32);
 }
 
+/** `~/.claude.json` exists but couldn't be read (as opposed to absent: no servers). */
+const UNREADABLE = Symbol("unreadable");
+
 /** A repo's server can't ask, by reference, for the daemon's own secrets. */
 function withoutDaemonSecrets(raw: RawMcpServerConfig): RawMcpServerConfig {
   const strip = (o: Record<string, string> | undefined) =>
@@ -130,17 +142,23 @@ function withoutDaemonSecrets(raw: RawMcpServerConfig): RawMcpServerConfig {
 let claudeJsonCache: { file: string; mtimeMs: number; size: number; value: unknown } | null = null;
 
 async function readClaudeJson(file: string): Promise<unknown> {
+  let s: Awaited<ReturnType<typeof stat>>;
   try {
-    const s = await stat(file);
-    if (!s.isFile() || s.size > MAX_CLAUDE_JSON_BYTES) return null;
+    s = await stat(file);
+  } catch {
+    return null; // absent: no servers
+  }
+  try {
+    if (!s.isFile() || s.size > MAX_CLAUDE_JSON_BYTES) return UNREADABLE;
     if (claudeJsonCache && claudeJsonCache.file === file && claudeJsonCache.mtimeMs === s.mtimeMs && claudeJsonCache.size === s.size) {
       return claudeJsonCache.value;
     }
     const value = await readBounded(file, MAX_CLAUDE_JSON_BYTES);
+    if (value === null) return UNREADABLE; // a partial write, or not JSON
     claudeJsonCache = { file, mtimeMs: s.mtimeMs, size: s.size, value };
     return value;
   } catch {
-    return null;
+    return UNREADABLE;
   }
 }
 

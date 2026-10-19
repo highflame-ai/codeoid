@@ -1064,6 +1064,7 @@ export type ClientMessage =
   | SessionMcpReconnectMsg
   | SessionMcpRefreshMsg
   | McpApproveMsg
+  | McpApprovePreviewMsg
   | SessionForkMsg
   | ScrollbackPageMsg
   | SessionRenameMsg
@@ -1686,6 +1687,36 @@ export interface McpApproveMsg extends BaseClientMsg {
   path?: string;
   /** The entry's fingerprint as `claude.config` showed it: an entry changed since isn't approved. */
   fingerprint: string;
+}
+
+/**
+ * What approving a project's MCP server would approve (#395): the entry in
+ * full — its command and every argument, its URL, its environment and header
+ * names with each `${VAR}` reference shown and every literal value masked —
+ * and the fingerprint `mcp.approve` must quote. The same rights as
+ * `mcp.approve` (it shows what a repo committed, to the one who'd consent).
+ * `response.ok` data is {@link McpApprovePreview}.
+ */
+export interface McpApprovePreviewMsg extends BaseClientMsg {
+  type: "mcp.approve.preview";
+  sessionId: string;
+  server: string;
+  /** The file it's declared in, when the name is in more than one. */
+  path?: string;
+}
+
+/** `response.ok` data for `mcp.approve.preview`. */
+export interface McpApprovePreview {
+  server: string;
+  path: string;
+  fingerprint: string;
+  command: string | null;
+  args: string[];
+  url: string | null;
+  /** Each env var as written (`${VAR}` references kept), token-shaped text hidden. */
+  env: Record<string, string>;
+  /** Each header, likewise. */
+  headers: Record<string, string>;
 }
 
 /** `response.ok` data for `session.mcp_reconnect`. */

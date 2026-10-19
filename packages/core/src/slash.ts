@@ -332,11 +332,7 @@ export function dispatchSlash(cmd: SlashCommand, ctx: SlashContext): void {
           const r = (resp as { data?: McpRefreshResult } | undefined)?.data;
           if (!r) return;
           ctx.report?.(
-            !r.changed
-              ? "MCP servers are up to date."
-              : r.deferred
-                ? "MCP servers changed: applied when this turn ends."
-                : "MCP servers changed: the backend restarts with them on the next turn.",
+            mcpRefreshSummary(r),
           );
         })
         .catch((e) => ctx.report?.(e instanceof Error ? e.message : String(e)));
@@ -379,4 +375,12 @@ export function dispatchSlash(cmd: SlashCommand, ctx: SlashContext): void {
       return;
     }
   }
+}
+
+/** What `/mcp refresh` did, in words every frontend shows the same (#395). */
+export function mcpRefreshSummary(r: McpRefreshResult): string {
+  if (!r.changed) return "MCP servers are up to date.";
+  return r.deferred
+    ? "MCP servers changed: work is running, so they're applied before the next turn."
+    : "MCP servers changed: the backend was stopped and starts with them on your next message.";
 }

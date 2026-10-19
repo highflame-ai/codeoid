@@ -19,6 +19,7 @@ import {
   type WorkspaceCommand,
 } from "./workspace-commands.js";
 import type { Attachment, McpReconnectResult, McpRefreshResult } from "../protocol/types.js";
+import { mcpRefreshSummary } from "@highflame/codeoid-core";
 import { parseDialogAnswer } from "../terminal/dialog.js";
 import { formatRewind, parseForkArgs, parseUndoArgs } from "../terminal/rewind.js";
 import { formatCompare, parseCompareArgs } from "../terminal/compare.js";
@@ -1053,10 +1054,7 @@ export function App({ config }: Props) {
               }
               if (resp.type !== "response.ok") return;
               const r = resp.data as McpRefreshResult;
-              printLocalInfo(
-                sid,
-                !r.changed ? "MCP servers are up to date." : r.deferred ? "MCP servers changed: applied when this turn ends." : "MCP servers changed: the backend restarts with them on the next turn.",
-              );
+              printLocalInfo(sid, mcpRefreshSummary(r));
             })
             .catch((err: Error) => dispatch({ type: "error", message: err.message }));
           return;

@@ -303,6 +303,14 @@ export const mcpApproveSchema = z.object({
   fingerprint: z.string().regex(/^[0-9a-f]{32}$/),
 });
 
+export const mcpApprovePreviewSchema = z.object({
+  ...base,
+  type: z.literal("mcp.approve.preview"),
+  sessionId: sessionIdField,
+  server: z.string().regex(/^[\w .:()-]{1,128}$/),
+  path: z.string().max(4096).optional(),
+});
+
 export const sessionSetProviderSchema = z.object({
   ...base,
   type: z.literal("session.set_provider"),
@@ -977,6 +985,7 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   sessionMcpReconnectSchema,
   sessionMcpRefreshSchema,
   mcpApproveSchema,
+  mcpApprovePreviewSchema,
   sessionForkSchema,
   scrollbackPageSchema,
   sessionRenameSchema,

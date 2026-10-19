@@ -109,40 +109,6 @@ export class McpRegistry implements McpServerView {
     return spec;
   }
 
-  /**
-   * Bring the entries imported from Claude's global config up to date (#395):
-   * add, change or remove only those — codeoid's own entries (its config,
-   * adopted servers, built-ins) are never touched. The names that changed.
-   */
-  syncImported(servers: Record<string, RawMcpServerConfig>): string[] {
-    const changed: string[] = [];
-    for (const [name, raw] of Object.entries(servers)) {
-      if (isReservedMcpName(name)) continue;
-      const existing = this.#specs.get(name);
-      if (existing && existing.origin !== "claude-global") continue;
-      const spec: McpServerSpec = { ...normalizeSpec(name, raw), origin: "claude-global" };
-      if (existing && JSON.stringify(existing) === JSON.stringify(spec)) continue;
-      this.#specs.set(name, spec);
-      changed.push(name);
-    }
-    for (const [name, spec] of this.#specs) {
-      if (spec.origin === "claude-global" && !(name in servers)) {
-        this.#specs.delete(name);
-        changed.push(name);
-      }
-    }
-    return changed;
-  }
-
-  /** A fingerprint of the imported entries, to tell whether a new import differs. */
-  importedFingerprint(): string {
-    return this.list()
-      .filter((s) => s.origin === "claude-global")
-      .map((s) => `${s.name}\u0000${JSON.stringify(s.transport)}`)
-      .sort()
-      .join("\u0001");
-  }
-
   /** Enabled OAuth servers for `backendId`: what codeoid signs in to and calls
    *  itself, for a backend that reaches them through codeoid. */
   oauthFor(backendId: string): McpServerSpec[] {

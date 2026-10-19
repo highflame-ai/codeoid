@@ -20,7 +20,7 @@ import {
   untrack,
 } from "solid-js";
 
-import { approveMcpServer, claudeConfig, fetchClaudeConfig, reconnectMcpServer, refreshMcpServers } from "../state/claude-config";
+import { approveMcpServer, claudeConfig, fetchClaudeConfig, previewMcpApproval, reconnectMcpServer, refreshMcpServers } from "../state/claude-config";
 import { adoptAndSignIn, mcpOAuthState } from "../state/mcp-oauth";
 import { fetchSettings, settingsState } from "../state/settings";
 import { McpOAuthControls } from "./McpOAuthControls";
@@ -32,6 +32,7 @@ import type {
   ClaudeConfigMcpServer,
   ClaudeConfigScope,
   ClaudeConfigSkill,
+  McpApprovePreview,
 } from "../protocol/types";
 
 type Tab = "agents" | "skills" | "mcp" | "hooks";
@@ -445,6 +446,7 @@ const McpStaleBanner: Component<{ sessionId: string }> = (props) => {
 const McpReach: Component<{ server: ClaudeConfigMcpServer; sessionId: string | null }> = (props) => {
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
+  const [preview, setPreview] = createSignal<McpApprovePreview | null>(null);
   const reach = () => props.server.otherBackends;
   const why = () => {
     const r = reach();
@@ -470,27 +472,70 @@ const McpReach: Component<{ server: ClaudeConfigMcpServer; sessionId: string | n
         <Show when={reach()?.reach === "all"} fallback={<span>{why()}</span>}>
           <span>On every backend in this session.</span>
         </Show>
-        <Show when={reach()?.reach === "claude-only" && (reach() as { why: string }).why === "needs-approval" && props.sessionId && props.server.fingerprint}>
+        <Show when={reach()?.reach === "claude-only" && (reach() as { why: string }).why === "needs-approval" && props.sessionId && !preview()}>
           <button
             type="button"
             disabled={busy()}
             onClick={() => {
               setBusy(true);
               setError(null);
-              approveMcpServer(props.sessionId!, props.server.name, props.server.path, props.server.fingerprint!)
+              previewMcpApproval(props.sessionId!, props.server.name, props.server.path)
+                .then(setPreview)
                 .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
                 .finally(() => setBusy(false));
             }}
             class="rounded border border-border px-1.5 py-0.5 text-[10px] text-fg hover:border-accent/40 disabled:opacity-50"
-            title={`Approve this entry, from ${props.server.path}, for every backend in this workdir (an edit to it needs approval again)`}
+            title="See exactly what this project's entry runs, then approve it for every backend in this workdir"
           >
-            {busy() ? "Approving…" : "Approve"}
+            {busy() ? "Loading…" : "Review & approve"}
           </button>
         </Show>
         <Show when={error()}>
           <span class="text-danger">{error()}</span>
         </Show>
       </div>
+      <Show when={preview()}>
+        {(p) => (
+          <div class="mt-1 rounded border border-accent/40 bg-bg-active/40 p-2 text-[11px] text-fg">
+            <div class="mb-1 text-fg-muted">
+              This project's entry, from {p().path} — once approved, every backend in this workdir runs it, with the daemon user's files and network:
+            </div>
+            <Show when={p().command}>
+              <pre class="overflow-x-auto whitespace-pre-wrap break-all font-mono">{[p().command, ...p().args].join(" ")}</pre>
+            </Show>
+            <Show when={p().url}>
+              <pre class="overflow-x-auto break-all font-mono">url: {p().url}</pre>
+            </Show>
+            <Show when={Object.keys(p().env).length > 0}>
+              <pre class="overflow-x-auto break-all font-mono">env: {Object.entries(p().env).map(([k, v]) => `${k}=${v}`).join("  ")}</pre>
+            </Show>
+            <Show when={Object.keys(p().headers).length > 0}>
+              <pre class="overflow-x-auto break-all font-mono">headers: {Object.entries(p().headers).map(([k, v]) => `${k}: ${v}`).join("  ")}</pre>
+            </Show>
+            <div class="mt-1 flex items-center gap-2">
+              <button
+                type="button"
+                disabled={busy()}
+                onClick={() => {
+                  setBusy(true);
+                  setError(null);
+                  approveMcpServer(props.sessionId!, p().server, p().path, p().fingerprint)
+                    .then(() => setPreview(null))
+                    .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
+                    .finally(() => setBusy(false));
+                }}
+                class="rounded border border-accent/60 px-2 py-0.5 text-[10px] text-fg hover:bg-accent/10 disabled:opacity-50"
+              >
+                {busy() ? "Approving…" : "Approve this entry"}
+              </button>
+              <button type="button" onClick={() => setPreview(null)} class="text-[10px] text-fg-muted hover:text-fg">
+                Cancel
+              </button>
+              <span class="text-fg-faint">Literal values are masked (…); ${"{VAR}"} references are what it asks for.</span>
+            </div>
+          </div>
+        )}
+      </Show>
     </Show>
   );
 };

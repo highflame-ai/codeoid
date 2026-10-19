@@ -13,6 +13,12 @@
  * hop removed: the backend's process carries its credential in its
  * environment, and a file tool runs INSIDE that process.
  *
+ * `~/.claude.json` is asked about, in every mode, rather than refused: it holds
+ * MCP servers' literal tokens, and it is where the user's approvals of a
+ * project's MCP servers live (#395) — an unprompted write could approve a
+ * repo's servers for every backend, or add a global server for every
+ * session. But editing it is a thing a user may want an agent to do.
+ *
  * WHAT. A call that names one of those files directly is refused, in every
  * mode — there is no legitimate reason for an agent to read them; the owner
  * manages them through codeoid or the CLI itself. A search rooted ABOVE one
@@ -149,6 +155,7 @@ export function secretPathVerdict(
     ...cliCredentialFiles().map((f) => real(f)),
   ];
   const secretDirs = [configDir, ...secretFiles.map((f) => dirname(f))];
+  const claudeJson = real(join(homedir(), ".claude.json"));
   let verdict: SecretPathVerdict = null;
   for (const raw of candidatePaths(toolName, input)) {
     const literal = expand(raw, opts.workdir);
@@ -158,6 +165,7 @@ export function secretPathVerdict(
     if (norm(dirname(p)) === norm(configDir) && isSecretConfigFile(norm(basename(p)))) return { action: "deny", path: raw };
     if (secretFiles.some((f) => norm(f) === norm(p))) return { action: "deny", path: raw };
     if (LOGIN_DIR.test(p)) return { action: "deny", path: raw };
+    if (norm(p) === norm(claudeJson)) verdict = { action: "ask", path: raw };
     // A root that CONTAINS one of them (the dir itself, home, /) reaches it
     // by recursion; so does `/proc` itself.
     if (secretDirs.some((d) => within(d, p)) || PROC_ROOT.test(p)) verdict ??= { action: "ask", path: raw };

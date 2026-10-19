@@ -6,12 +6,14 @@
 
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
+import { mcpRefreshSummary } from "@highflame/codeoid-core";
 import type { CodeoidConfig } from "../config.js";
 import { PIPELINE_INPUT_REQUEST_PREFIX, PROTOCOL_VERSION } from "../protocol/types.js";
 import type {
   ClientMessage,
   CollaborationConfig,
   McpReconnectResult,
+  McpApprovePreview,
   McpRefreshResult,
   CompareState,
   CompareTargetSpec,
@@ -772,38 +774,40 @@ export class TerminalClient {
       return;
     }
     const r = resp.data as McpRefreshResult;
-    console.log(
-      !r.changed
-        ? "MCP servers are up to date."
-        : r.deferred
-          ? "MCP servers changed: applied when the running turn ends."
-          : "MCP servers changed: the backend restarts with them on the next turn.",
-    );
+    console.log(mcpRefreshSummary(r));
   }
 
   /** `codeoid mcp approve` — approve a project's MCP server for every backend in the workdir (#395). */
-  async mcpApprove(sessionIdOrName: string, server: string, opts: { path?: string; yes?: boolean } = {}): Promise<void> {
+  async mcpApprove(sessionIdOrName: string, server: string, opts: { path?: string; yes?: string } = {}): Promise<void> {
     const sessionId = await this.#resolveSession(sessionIdOrName);
     if (!sessionId) return;
-    // Approve what was looked at: show the entry, and bind the approval to it.
-    const cfg = (await this.#request({ type: "claude.config", id: randomUUID(), sessionId })) as DaemonMessage & {
-      mcpServers?: Array<{ name: string; path: string; scope: string; command: string | null; argCount?: number; envKeys: string[]; url: string | null; fingerprint?: string }>;
-    };
-    const rows = (cfg.mcpServers ?? []).filter((m) => m.name === server && m.scope === "workdir" && m.fingerprint && (!opts.path || m.path === opts.path));
-    if (rows.length !== 1) {
-      console.error(rows.length === 0 ? `This project declares no MCP server ${JSON.stringify(server)}.` : `${JSON.stringify(server)} is in ${rows.map((r) => r.path).join(" and ")} — pass --path.`);
+    // Review first: the entry in full, and the fingerprint an approval binds to.
+    const pv = await this.#request({ type: "mcp.approve.preview", id: randomUUID(), sessionId, server, ...(opts.path ? { path: opts.path } : {}) });
+    if (pv.type !== "response.ok") {
+      this.#printError(pv);
       process.exitCode = 1;
       return;
     }
-    const row = rows[0]!;
-    console.log(`${row.name}, from ${row.path}:`);
-    console.log(row.url ? `  url: ${row.url}` : `  runs: ${row.command ?? "?"} with ${row.argCount ?? 0} arg(s)${row.envKeys.length ? `, env ${row.envKeys.join(", ")}` : ""}`);
-    console.log("  Review the full entry in that file: once approved, every backend in this directory runs it.");
+    const p = pv.data as McpApprovePreview;
     if (!opts.yes) {
-      console.log("Re-run with --yes to approve exactly this entry.");
+      // The repo wrote these: no terminal control sequences reach the screen.
+      const clean = sanitizeTerminalOutput;
+      console.log(clean(`${p.server}, from ${p.path} — once approved, every backend in this directory runs it, with the daemon user's files and network:`));
+      if (p.command) console.log(clean(`  command: ${[p.command, ...p.args].join(" ")}`));
+      if (p.url) console.log(clean(`  url: ${p.url}`));
+      for (const [k, v] of Object.entries(p.env)) console.log(clean(`  env ${k}=${v}`));
+      for (const [k, v] of Object.entries(p.headers)) console.log(clean(`  header ${k}: ${v}`));
+      console.log("  (${VAR} references resolve from the daemon's environment when it starts)");
+      console.log(`To approve exactly this entry: codeoid mcp approve ${sessionIdOrName} ${p.server} --path ${JSON.stringify(p.path)} --yes ${p.fingerprint}`);
       return;
     }
-    const resp = await this.#request({ type: "mcp.approve", id: randomUUID(), sessionId, server, path: row.path, fingerprint: row.fingerprint! });
+    // The entry reviewed, not whatever is in the file now.
+    if (opts.yes !== p.fingerprint) {
+      console.error(`${p.server} changed since that review (now ${p.fingerprint}) — review it again.`);
+      process.exitCode = 1;
+      return;
+    }
+    const resp = await this.#request({ type: "mcp.approve", id: randomUUID(), sessionId, server, path: p.path, fingerprint: opts.yes });
     if (resp.type !== "response.ok") {
       this.#printError(resp);
       process.exitCode = 1;

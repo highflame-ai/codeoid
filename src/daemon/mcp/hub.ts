@@ -239,9 +239,26 @@ export class McpHub {
     if (tenant) this.#wantsSignIn.set(signInKey(url, tenant), Date.now() + SIGN_IN_HOLD_MS);
   }
 
-  /** Close one server's client (a workdir server no longer in a session's view). */
-  dropSpec(spec: McpServerSpec, tenant: McpTenant | undefined): void {
-    this.#drop(clientKey(spec, tenant));
+  /** Sessions using each session-specific server (a workdir one, or a session's
+   *  snapshot of a global one): its client closes when the last lets go. */
+  readonly #users = new Map<string, number>();
+
+  /** A session now uses this server. */
+  retain(spec: McpServerSpec, tenant: McpTenant | undefined): void {
+    const key = clientKey(spec, tenant);
+    this.#users.set(key, (this.#users.get(key) ?? 0) + 1);
+  }
+
+  /** A session no longer uses this server: the last to let go closes its client. */
+  release(spec: McpServerSpec, tenant: McpTenant | undefined): void {
+    const key = clientKey(spec, tenant);
+    const n = (this.#users.get(key) ?? 0) - 1;
+    if (n > 0) {
+      this.#users.set(key, n);
+      return;
+    }
+    this.#users.delete(key);
+    this.#drop(key);
   }
 
   /** How native backends that own their MCP clients reach this daemon's OAuth
