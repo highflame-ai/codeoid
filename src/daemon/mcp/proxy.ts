@@ -399,7 +399,8 @@ const FORWARDED_METHODS = new Set([
 const BEYOND_TOOLS = /^(resources|prompts|completion)\//;
 
 /** What the server may ask of the backend. */
-const SERVER_REQUESTS = new Set(["sampling/createMessage", "elicitation/create", "roots/list", "ping"]);
+/** (A server's ping the SDK client answers itself.) */
+const SERVER_REQUESTS = new Set(["sampling/createMessage", "elicitation/create", "roots/list"]);
 
 /** What the server may tell the backend (progress and cancellation the SDK relays itself). */
 const SERVER_NOTIFICATIONS = new Set([
@@ -709,7 +710,7 @@ class Relay {
         throw new McpError(ErrorCode.MethodNotFound, `${request.method} is not relayed`);
       }
       // A server limited to some tools asks the backend things only during one of them.
-      if (this.#init.spec.toolAllowlist && related === undefined && request.method !== "ping") {
+      if (this.#init.spec.toolAllowlist && related === undefined) {
         throw new McpError(ErrorCode.MethodNotFound, `${request.method} is only relayed during a call`);
       }
       // The server's own _meta isn't passed on: a backend may read markers

@@ -165,7 +165,8 @@ A server adopted from Claude's config (#390) is an OAuth registry entry, so it g
 **Limits.**
 At most 8 relay sessions per proxy token for each server: a new one past that closes the least recently used that isn't mid-call (whose backend re-initializes if it returns), so a backend that opens a session per thread never locks itself out, and a call is never cut to make room.
 At most 32 calls running upstream per token, and one JSON-RPC message per POST (no batches).
-A call the backend cancels or abandons is cancelled upstream; since a server may run it to the end anyway (MCP only asks it to stop), its slot stays taken for the call's own timeout, or until its upstream session ends — so cancelling can't run more calls at once than the bound.
+A call the backend cancels or abandons is cancelled upstream; since a server may run it to the end anyway (MCP only asks it to stop), its slot stays taken for the call's own timeout, or until its upstream session ends.
+So the bound counts what the relay waits on, and holds a cancelled call's place for a while; it can't see work a server keeps doing past a timeout, or after its session is closed, and a backend that restarts sessions (30 a minute) frees held places sooner. What bounds those is the server's own handling of cancellation and closed sessions.
 A call that arrives without its POST's context is refused rather than run unbounded; a session's notification stream and its `DELETE` aren't calls, so a backend can always close what it opened.
 At most 30 new sessions per token per minute.
 An `initialize` is checked in full (its schema, `Accept`, `Content-Type`) before anything opens upstream or any session makes room, and a request body is capped at 4 MB as it streams in; the daemon's idle-connection cut is lifted only once the body is in.
@@ -175,7 +176,7 @@ A listing's tool that a strict client would reject is set right (its input schem
 Everything closes with the token: when the backend is rebuilt or torn down, or the session ends — the backend's side first, and the server's session with a bounded wait for its `DELETE`.
 
 **Observability.**
-The relay records per-tenant status (tools, last error) where the hub does, so Settings shows one status for a server whichever path used it, and logs errors through `cleanMcpError`.
+The relay records per-tenant status (tools, last error, cleaned by `cleanMcpError`) where the hub does, so Settings shows one status for a server whichever path used it.
 Minting and revoking a proxy token is not audited (it is the daemon's own bookkeeping); every tool call is already audited by the approval gate.
 
 **Not covered.**

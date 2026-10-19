@@ -1018,12 +1018,6 @@ export function unionCatalogs(
   return [...byId.values()];
 }
 
-/**
- * Registry servers for the qwen backend, as SDK MCP configs — a native mount,
- * since qwen-code owns its own MCP client. `${VAR}` env refs and
- * `bearerTokenEnv` resolve against the daemon env here so secrets never live
- * in config; tool calls still gate through canUseTool.
- */
 /** The registry's OAuth servers as qwen MCP configs, through the relay (#396). */
 export function proxiedServersForQwen(lease: McpProxyLease): Record<string, unknown> {
   const proxied = lease.renew();
@@ -1033,6 +1027,12 @@ export function proxiedServersForQwen(lease: McpProxyLease): Record<string, unkn
   );
 }
 
+/**
+ * Registry servers for the qwen backend, as SDK MCP configs — a native mount,
+ * since qwen-code owns its own MCP client. `${VAR}` env refs and
+ * `bearerTokenEnv` resolve against the daemon env here so secrets never live
+ * in config; tool calls still gate through canUseTool.
+ */
 export function registryServersForQwen(
   registry: McpRegistry | undefined,
 ): Record<string, unknown> {

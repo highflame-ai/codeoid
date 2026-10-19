@@ -571,7 +571,10 @@ export class CodexProvider implements SessionProvider {
     if (!lease) return { args: [], env: {} };
     const args: string[] = [];
     for (const server of lease.servers) {
-      if (!codexKeySafe(server.name)) continue;
+      if (!codexKeySafe(server.name)) {
+        console.warn(`[codeoid] codex: MCP server "${server.name}" isn't mounted — codex can't take that name as a config key`);
+        continue;
+      }
       const key = `mcp_servers.${server.name}`;
       args.push("-c", `${key}.url=${JSON.stringify(server.url)}`);
       args.push("-c", `${key}.bearer_token_env_var=${JSON.stringify(MCP_PROXY_TOKEN_ENV)}`);
