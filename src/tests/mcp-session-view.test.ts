@@ -199,6 +199,19 @@ describe("a session's view", () => {
     expect(v.reachOfGlobal("remote", "https://r.example.com/mcp", null)).toEqual({ reach: "claude-only", why: "needs-sign-in" });
   });
 
+  it("a project's .mcp.json server is left to a backend that reads it itself (Claude, Qwen); its settings-file ones aren't", async () => {
+    const fromMcpJson = entry("team", "claude-repo", raw({ command: "team" }), "approved");
+    const fromSettings = { ...entry("set", "claude-repo", raw({ command: "set" }), "approved"), path: "/w/.claude/settings.json" };
+    // "twin" is the user's own, with the very same config as the project's "team".
+    const twin = entry("twin", "claude-local", raw({ command: "team" }));
+    const v = view(new McpRegistry({}, { memoryEnabled: false }), [fromMcpJson, fromSettings, entry("mine", "claude-local", raw({ command: "m" })), twin]);
+    await v.load();
+    expect(v.forNativeMount("codex").map((s) => s.name).sort()).toEqual(["mine", "set", "team", "twin"]);
+    expect(v.forNativeMount("qwen").map((s) => s.name).sort()).toEqual(["mine", "set", "twin"]); // Qwen has its own copy of "team" only
+    expect(v.reachOf("team", "/w/.mcp.json", "qwen")).toEqual({ reach: "claude-only", why: "read-by-backend" });
+    expect(v.reachOf("team", "/w/.mcp.json", "codex")).toEqual({ reach: "all" });
+  });
+
   it("nothing changes until it's read again: stale says so, load applies", async () => {
     const read: WorkdirServer[] = [];
     const v = view(new McpRegistry({}, { memoryEnabled: false }), read);

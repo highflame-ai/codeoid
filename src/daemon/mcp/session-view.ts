@@ -12,6 +12,9 @@
  *   from Claude's global config (as Claude itself orders them); a repo's
  *   never stands in for anything of the same (or a look-alike) name.
  * - On Claude the workdir ones aren't added: the Claude CLI loads its own.
+ *   Qwen Code reads a project's `.mcp.json` itself too (under its own
+ *   folder trust, measured): those aren't added on Qwen either — a copy of
+ *   the same name would only collide with Qwen's own.
  * - A plain HTTP server found to want an OAuth sign-in is held back from the
  *   backends that would only get 401s from it, until it's adopted.
  *
@@ -28,7 +31,10 @@ import { readWorkdirServers, type WorkdirServer } from "./workdir-servers.js";
 /** Why a workdir server reaches only Claude, when it does. */
 export type WorkdirReach =
   | { reach: "all" }
-  | { reach: "claude-only"; why: "needs-approval" | "needs-refresh" | "shadowed" | "needs-sign-in" | "reserved-name" };
+  | { reach: "claude-only"; why: "needs-approval" | "needs-refresh" | "shadowed" | "needs-sign-in" | "reserved-name" | "read-by-backend" };
+
+/** Backends that read a project's `.mcp.json` themselves, under their own consent. */
+const READS_MCP_JSON = new Set(["claude", "qwen"]);
 
 export interface SessionMcpViewOptions {
   workdir: string;
@@ -47,6 +53,9 @@ export class SessionMcpView implements McpServerView {
   #read: WorkdirServer[] = [];
   /** The ones applied to this session's backends. */
   #layer: McpServerSpec[] = [];
+  /** The applied ones declared in a `.mcp.json`, by name and fingerprint (two
+   *  entries may share a config under different names). */
+  #fromMcpJson = new Set<string>();
   #fingerprint = "";
   #loaded = false;
 
@@ -68,6 +77,7 @@ export class SessionMcpView implements McpServerView {
     const changed = this.#loaded && fingerprint !== this.#fingerprint;
     this.#read = read;
     this.#layer = layer;
+    this.#fromMcpJson = new Set(read.filter((w) => isMcpJson(w.path)).map((w) => `${w.name}\u0000${w.fingerprint}`));
     this.#fingerprint = fingerprint;
     this.#loaded = true;
     return changed;
@@ -80,10 +90,14 @@ export class SessionMcpView implements McpServerView {
     return fingerprintOf(this.#resolve(read)) !== this.#fingerprint;
   }
 
-  /** How far a workdir server (by name and file) reaches, as last read. */
-  reachOf(name: string, path: string): WorkdirReach | undefined {
+  /** How far a workdir server (by name and file) reaches, as last read — on
+   *  `backendId` (the session's), when it's one that reads the file itself. */
+  reachOf(name: string, path: string, backendId?: string): WorkdirReach | undefined {
     const entry = this.#read.find((w) => w.name === name && w.path === path);
     if (!entry) return undefined;
+    if (backendId && backendId !== "claude" && READS_MCP_JSON.has(backendId) && isMcpJson(entry.path)) {
+      return { reach: "claude-only", why: "read-by-backend" };
+    }
     if (isReservedMcpName(name)) return { reach: "claude-only", why: "reserved-name" };
     const applied = this.#layer.find((s) => s.name === name && s.variant === entry.fingerprint);
     if (applied) return this.#heldBack(applied) ? { reach: "claude-only", why: "needs-sign-in" } : { reach: "all" };
@@ -146,6 +160,8 @@ export class SessionMcpView implements McpServerView {
     const byName = new Map(this.#base.list().map((s) => [s.name, s]));
     if (backendId !== "claude") {
       for (const spec of this.#layer) {
+        // A backend that reads the project's .mcp.json itself has its own copy.
+        if (backendId && READS_MCP_JSON.has(backendId) && this.#fromMcpJson.has(`${spec.name}\u0000${spec.variant ?? ""}`)) continue;
         const existing = byName.get(spec.name);
         // Only an import from Claude's global config gives way — to the
         // user's own workdir entry. A repo's never displaces anything.
@@ -186,6 +202,10 @@ export class SessionMcpView implements McpServerView {
   #heldBack(spec: McpServerSpec): boolean {
     return spec.transport.kind === "http" && !isOAuthServer(spec) && (this.#hub?.needsSignIn(spec.transport.url) ?? false);
   }
+}
+
+function isMcpJson(file: string): boolean {
+  return file.endsWith("/.mcp.json") || file.endsWith("\\.mcp.json");
 }
 
 function fingerprintOf(layer: readonly McpServerSpec[]): string {

@@ -460,6 +460,8 @@ const McpReach: Component<{ server: ClaudeConfigMcpServer; sessionId: string | n
         return "Claude only — it wants a sign-in; adopt it (Sign in with codeoid) to use it on every backend.";
       case "reserved-name":
         return "Claude only — its name is one of codeoid's own.";
+      case "read-by-backend":
+        return "This session's backend reads the project's .mcp.json itself — its own trust settings decide (e.g. Qwen's folder trust).";
     }
   };
   return (

@@ -2018,7 +2018,7 @@ export interface ClaudeConfigMcpServer {
    */
   otherBackends?:
     | { reach: "all" }
-    | { reach: "claude-only"; why: "needs-approval" | "needs-refresh" | "shadowed" | "needs-sign-in" | "reserved-name" };
+    | { reach: "claude-only"; why: "needs-approval" | "needs-refresh" | "shadowed" | "needs-sign-in" | "reserved-name" | "read-by-backend" };
   /** codeoid has adopted it: its registry signs in to this URL, and Claude
    *  sessions use that copy rather than the CLI's. */
   adopted?: true;

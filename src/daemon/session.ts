@@ -1936,7 +1936,9 @@ export class Session {
   mcpReach(server: { name: string; scope: string; path: string; url: string | null; command: string | null }): WorkdirReach | undefined {
     const view = this.#mcpView;
     if (!view) return undefined;
-    return server.scope === "workdir" ? view.reachOf(server.name, server.path) : view.reachOfGlobal(server.name, server.url, server.command);
+    return server.scope === "workdir"
+      ? view.reachOf(server.name, server.path, this.providerId)
+      : view.reachOfGlobal(server.name, server.url, server.command);
   }
 
   #applyMcpState(name: string, state: { status: string; tools: string[] }): void {

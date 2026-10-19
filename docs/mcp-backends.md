@@ -23,6 +23,7 @@ This page says where each kind of server comes from, which backends it reaches, 
   codeoid's approval is for that exact entry: if the repo edits it, it needs approving again.
   Claude Code's approvals are read from `~/.claude.json` and from the project's `.claude/settings.local.json` — that file only when git says it isn't part of the repo, since a repo that committed one could otherwise approve its own servers.
 - **Claude** always loads its own copies of Claude's servers (the Claude CLI reads its config itself); codeoid adds the rest of the registry.
+- **Qwen** reads a project's `.mcp.json` itself, under its own folder trust (measured: codeoid's copy of the same name is overridden by Qwen's own), so on Qwen those follow Qwen's trust settings rather than codeoid's approval; your own servers, and a project's from its settings files, still reach it through codeoid.
 
 The capabilities drawer says, for each of Claude's servers, whether it reaches the session's other backends, and if not, why.
 
