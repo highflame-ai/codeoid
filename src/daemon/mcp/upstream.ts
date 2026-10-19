@@ -71,7 +71,49 @@ export async function openUpstream(opts: UpstreamOptions): Promise<Client> {
 export function sessionGone(e: unknown): boolean {
   if (e instanceof McpError) return e.code === ErrorCode.ConnectionClosed;
   if (e instanceof StreamableHTTPError) return e.code === 404;
-  return e instanceof TypeError; // fetch failed: no connection
+  // No connection to the server: Bun's fetch fails with an error carrying a
+  // code (never a TypeError, which here would be a bug in codeoid's own code).
+  const code = (e as { code?: unknown } | null)?.code;
+  return typeof code === "string" && NETWORK_CODES.has(code);
+}
+
+const NETWORK_CODES = new Set([
+  "ConnectionRefused",
+  "ConnectionClosed",
+  "FailedToOpenSocket",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EPIPE",
+  "ETIMEDOUT",
+  "ENOTFOUND",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+]);
+
+/** Whether a failure says something about the session (a timeout, a transport
+ * error) rather than being the server's own answer (a JSON-RPC error): only
+ * those make up a streak. */
+export function sessionTrouble(e: unknown): boolean {
+  return e instanceof McpError ? e.code === ErrorCode.RequestTimeout : true;
+}
+
+/**
+ * Consecutive failures on one session — timeouts included — with no success
+ * between: past a few, the session is given up as stuck (a server that forgot
+ * it without saying 404, one that accepts calls and never answers) even
+ * though no single failure said so.
+ */
+export class FailureStreak {
+  #count = 0;
+  constructor(readonly limit = 3) {}
+  /** Note a failure; true once the streak reaches the limit. */
+  failed(): boolean {
+    this.#count++;
+    return this.#count >= this.limit;
+  }
+  succeeded(): void {
+    this.#count = 0;
+  }
 }
 
 /** End the upstream session (an HTTP DELETE, where the server keeps one) and

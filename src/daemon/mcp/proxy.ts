@@ -28,6 +28,7 @@ import {
   type Result,
   ResultSchema,
   type ServerCapabilities,
+  ToolSchema,
   type ServerNotification,
   type ServerRequest,
 } from "@modelcontextprotocol/sdk/types.js";
@@ -37,7 +38,7 @@ import { McpSignInRequired, type McpCredentialSource, type McpTenant } from "./o
 import { cleanMcpError } from "./redact.js";
 import type { McpRegistry } from "./registry.js";
 import type { McpServerSpec } from "./types.js";
-import { closeUpstream, openUpstream, sessionGone } from "./upstream.js";
+import { closeUpstream, FailureStreak, openUpstream, sessionGone, sessionTrouble } from "./upstream.js";
 
 export const MCP_PROXY_PATH_PREFIX = "/mcp/proxy/";
 
@@ -81,8 +82,11 @@ export interface McpProxyLimits {
   /** Relay sessions one token may hold for one server (a backend opens one per
    *  server, and may open more — per thread, say). */
   sessionsPerServer: number;
-  /** Requests one token may have open at once (streams included). */
+  /** Calls (POSTs) one token may have open at once. A session's notification
+   *  stream isn't one: the session cap bounds those. */
   requestsPerToken: number;
+  /** Sessions one token may start per minute. */
+  initializesPerMinute: number;
   /** An upstream session unused this long is closed (and reopened on use). */
   upstreamIdleMs: number;
   /** Largest request body accepted. */
@@ -92,6 +96,7 @@ export interface McpProxyLimits {
 const DEFAULT_LIMITS: McpProxyLimits = {
   sessionsPerServer: 8,
   requestsPerToken: 32,
+  initializesPerMinute: 30,
   upstreamIdleMs: 10 * 60_000,
   maxBodyBytes: 4 * 1024 * 1024,
 };
@@ -114,8 +119,10 @@ interface TokenRecord {
   relays: Map<string, Relay>;
   /** Relays started but not yet given a session id, per server. */
   starting: Map<string, number>;
-  /** Requests open now (bounded by `requestsPerToken`). */
+  /** Calls open now (bounded by `requestsPerToken`). */
   open: number;
+  /** When its recent sessions started (bounded by `initializesPerMinute`). */
+  initializes: number[];
 }
 
 export class McpProxy implements McpProxyMount {
@@ -149,7 +156,7 @@ export class McpProxy implements McpProxyMount {
       .filter((s) => s.transport.kind === "http")
       .map((s) => s.name);
     const token = randomBytes(32).toString("base64url");
-    this.#tokens.set(hashOf(token), { binding, servers: new Set(servers), relays: new Map(), starting: new Map(), open: 0 });
+    this.#tokens.set(hashOf(token), { binding, servers: new Set(servers), relays: new Map(), starting: new Map(), open: 0, initializes: [] });
     return { token, servers };
   }
 
@@ -226,11 +233,16 @@ export class McpProxy implements McpProxyMount {
       ? this.#registry.oauthFor(record.binding.backendId).find((s) => s.name === server && s.transport.kind === "http")
       : undefined;
     if (!spec) return rpcError(404, ErrorCode.InvalidRequest, `no MCP server "${server}" here`);
+    // Calls are counted; a session's notification stream (GET) and its end
+    // (DELETE) aren't — the session cap bounds those, and a backend must
+    // always be able to close what it opened.
+    if (req.method !== "POST") return this.#route(req, record, spec, server, token!, opts);
     if (record.open >= this.#limits.requestsPerToken) {
-      return rpcError(429, ErrorCode.InvalidRequest, "too many requests open for this token");
+      return rpcError(429, ErrorCode.InvalidRequest, "too many calls open for this token");
     }
     record.open++;
-    // Counted until the response — a stream included — ends.
+    // Counted until the response — its stream included — ends, or the backend
+    // gives up on it (a response never read is never cancelled by Bun).
     let released = false;
     const release = () => {
       if (!released) {
@@ -238,8 +250,15 @@ export class McpProxy implements McpProxyMount {
         record.open--;
       }
     };
+    req.signal.addEventListener("abort", release, { once: true });
     try {
       const res = await this.#route(req, record, spec, server, token!, opts);
+      if (req.signal.aborted) {
+        // Gone before the answer: nothing will read it.
+        await res.body?.cancel().catch(() => {});
+        release();
+        return res;
+      }
       return trackBody(res, release);
     } catch (e) {
       release();
@@ -265,6 +284,9 @@ export class McpProxy implements McpProxyMount {
       }
       const body = await readBody(req, this.#limits.maxBodyBytes);
       if (body instanceof Response) return body;
+      // One message per POST: MCP (2025-06-18 on) has no batches, and a batch
+      // would carry any number of calls past the per-token bound.
+      if (Array.isArray(body)) return rpcError(400, ErrorCode.InvalidRequest, "batches aren't accepted");
       // Only once the body is in: a body trickled in never outlives the idle cut.
       opts.liftIdleTimeout?.();
       return relay.handle(req, body);
@@ -284,6 +306,13 @@ export class McpProxy implements McpProxyMount {
     if (body instanceof Response) return body;
     const init = InitializeRequestSchema.safeParse(body);
     if (Array.isArray(body) || !init.success) return rpcError(400, ErrorCode.InvalidRequest, "no session: initialize first");
+    // Each new session opens one upstream (and may close another): bounded in rate too.
+    const now = Date.now();
+    record.initializes = record.initializes.filter((t) => now - t < 60_000);
+    if (record.initializes.length >= this.#limits.initializesPerMinute) {
+      return rpcError(429, ErrorCode.InvalidRequest, "too many new MCP sessions for this token; try again shortly");
+    }
+    record.initializes.push(now);
     opts.liftIdleTimeout?.();
     // At the cap for this server, the least recently used session not busy
     // makes room (its backend re-initializes if it comes back): a backend
@@ -320,9 +349,12 @@ export class McpProxy implements McpProxyMount {
       record.starting.set(server, (record.starting.get(server) ?? 1) - 1);
     }
     const res = await relay.handle(req, body);
-    // The transport refused the initialize after all: no session, so nothing
-    // may stay open upstream.
-    if (!relay.sessionId) void relay.close();
+    // The transport refused the initialize after all, or the backend gave up
+    // waiting: no session it will use, so nothing may stay open upstream.
+    if (!relay.sessionId || req.signal.aborted) {
+      if (relay.sessionId) record.relays.delete(relay.sessionId);
+      void relay.close();
+    }
     return res;
   }
 }
@@ -395,8 +427,11 @@ class Relay {
   #upstream: Promise<Client> | null = null;
   /** Requests being forwarded now; the idle drop waits for none. */
   #inflight = 0;
-  /** Live resource subscriptions: the upstream session holds them, so it isn't idle-dropped. */
-  #subscriptions = 0;
+  /** Resources the backend subscribed to on the current upstream session, which
+   *  holds them: it isn't idle-dropped while there are any. A new session starts with none. */
+  #subscriptions = new Set<string>();
+  /** Failures in a row on the current upstream session. */
+  #streak = new FailureStreak();
   #idle: ReturnType<typeof setTimeout> | null = null;
   #closed = false;
 
@@ -471,8 +506,7 @@ class Relay {
    *  backend its tools may have changed (a sign-in, a sign-out). */
   async resetUpstream(): Promise<void> {
     const old = this.#upstream;
-    this.#upstream = null;
-    this.#subscriptions = 0;
+    this.#forget();
     await this.#downstream.sendToolListChanged().catch(() => {});
     await this.#dropUpstream(old);
   }
@@ -483,7 +517,7 @@ class Relay {
     this.#closed = true;
     if (this.#idle) clearTimeout(this.#idle);
     const old = this.#upstream;
-    this.#upstream = null;
+    this.#forget();
     await this.#transport.close().catch(() => {});
     await this.#dropUpstream(old);
   }
@@ -537,8 +571,13 @@ class Relay {
             : {}),
         }),
       );
-      if (request.method === "resources/subscribe") this.#subscriptions++;
-      if (request.method === "resources/unsubscribe") this.#subscriptions = Math.max(0, this.#subscriptions - 1);
+      // Only on the session that is still current: one replaced meanwhile took its subscriptions with it.
+      if (this.#upstream === which) {
+        this.#streak.succeeded();
+        const uri = String(params?.uri ?? "");
+        if (request.method === "resources/subscribe") this.#subscriptions.add(uri);
+        if (request.method === "resources/unsubscribe") this.#subscriptions.delete(uri);
+      }
       if (request.method === "tools/list") return this.#listed(result, params?.cursor !== undefined);
       return result;
     } catch (e) {
@@ -557,7 +596,8 @@ class Relay {
       // The session itself is gone (closed, or the server forgot it): reopen
       // next time — the session this request used, never a newer one. Any
       // other failure is this request's alone; the calls beside it go on.
-      if (which && sessionGone(e)) void this.#dropUpstream(which, up);
+      if (which && this.#upstream === which && (sessionGone(e) || (sessionTrouble(e) && this.#streak.failed()))) void this.#dropUpstream(which, up);
+      else if (which && sessionGone(e)) void this.#dropUpstream(which, up);
       if (e instanceof McpError) throw e;
       const message = cleanMcpError(errMsg(e));
       this.#note({ error: message });
@@ -572,7 +612,11 @@ class Relay {
   /** tools/list, filtered to the allowlist; a complete listing is noted as the tenant's status. */
   #listed(result: Result, paged: boolean): Result {
     const allow = this.#init.spec.toolAllowlist;
-    const tools = Array.isArray(result.tools) ? (result.tools as Array<{ name?: unknown }>) : [];
+    // Entries that aren't valid tools are left out: a backend's client may
+    // reject a whole listing for one of them, hiding every other tool.
+    const tools = Array.isArray(result.tools)
+      ? (result.tools as unknown[]).filter((t): t is { name: string } => ToolSchema.safeParse(t).success)
+      : [];
     const shown = allow ? tools.filter((t) => allow.includes(String(t.name))) : tools;
     if (!paged && !result.nextCursor) this.#note({ tools: shown.map((t) => String(t.name)) });
     return { ...result, tools: shown };
@@ -654,12 +698,23 @@ class Relay {
    */
   async #dropUpstream(which: Promise<Client> | null, client?: Client): Promise<void> {
     if (!which) return;
-    if (this.#upstream === which) this.#upstream = null;
-    const up = client ?? (await which.catch(() => null));
-    if (up) {
+    if (this.#upstream === which) this.#forget();
+    const end = (up: Client) => {
       up.onclose = undefined;
-      await closeUpstream(up, CLOSE_TIMEOUT_MS);
-    }
+      return closeUpstream(up, CLOSE_TIMEOUT_MS);
+    };
+    if (client) return end(client);
+    // Still connecting: closed once it connects, in the background — a close
+    // waits a bounded time, never a whole connect timeout.
+    const later = which.then(end, () => {});
+    await Promise.race([later, new Promise<void>((resolve) => setTimeout(resolve, CLOSE_TIMEOUT_MS).unref?.())]);
+  }
+
+  /** The current upstream session is no longer this relay's: what it held goes with it. */
+  #forget(): void {
+    this.#upstream = null;
+    this.#subscriptions = new Set();
+    this.#streak = new FailureStreak();
   }
 
   /** Close the upstream session once nothing has used it for a while (it
@@ -669,7 +724,7 @@ class Relay {
     this.#idle = null;
     if (this.#closed || this.#inflight > 0) return;
     this.#idle = setTimeout(() => {
-      if (this.#inflight === 0 && this.#subscriptions === 0) void this.#dropUpstream(this.#upstream);
+      if (this.#inflight === 0 && this.#subscriptions.size === 0) void this.#dropUpstream(this.#upstream);
     }, this.#init.limits.upstreamIdleMs);
     this.#idle.unref?.();
   }

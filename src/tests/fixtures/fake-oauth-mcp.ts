@@ -86,6 +86,8 @@ export class FakeOAuthMcp {
   cancelled = 0;
   /** Hold each session DELETE this long (a slow server ending a session). */
   deleteDelayMs = 0;
+  /** Hold each initialize this long (a slow server to connect to). */
+  initializeDelayMs = 0;
   /** Answer the next tools/call for this tool with this HTTP status (a transient failure). */
   failNextCall: { tool: string; status: number } | null = null;
   #subjectSeq = 0;
@@ -256,6 +258,7 @@ export class FakeOAuthMcp {
   async #protocol(req: Request, who: { clientId: string; subject: string }): Promise<Response> {
     const sessionId = req.headers.get("mcp-session-id");
     if (req.method === "DELETE" && this.deleteDelayMs > 0) await Bun.sleep(this.deleteDelayMs);
+    if (!sessionId && req.method === "POST" && this.initializeDelayMs > 0) await Bun.sleep(this.initializeDelayMs);
     const authInfo = { token: "", clientId: who.clientId, scopes: ["mcp:read"], extra: { subject: who.subject } };
     if (sessionId) {
       const live = this.#sessions.get(sessionId);

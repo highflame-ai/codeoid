@@ -13,7 +13,7 @@ import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { StreamableHTTPClientTransport, StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import {
   ResultSchema as ResultSchemaLoose,
   CreateMessageRequestSchema,
@@ -33,6 +33,8 @@ import {
   SIGN_IN_REQUIRED_CODE,
 } from "../daemon/mcp/proxy.js";
 import { McpRegistry } from "../daemon/mcp/registry.js";
+import { FailureStreak, sessionGone, sessionTrouble } from "../daemon/mcp/upstream.js";
+import { McpError as McpErrorClass } from "@modelcontextprotocol/sdk/types.js";
 import type { McpServerSpec } from "../daemon/mcp/types.js";
 import { codexKeySafe, codexShellEnvExcludeArgs } from "../daemon/providers/codex/shell-env.js";
 import { Store } from "../daemon/store.js";
@@ -659,17 +661,94 @@ describe("round-2 findings stay fixed", () => {
     expect(await long).toMatchObject({ content: [{ text: "slept" }] });
   });
 
-  it("bounds the requests one token holds open", async () => {
-    start({ limits: { requestsPerToken: 2 } });
+  it("bounds the calls one token holds open — and frees each when it ends", async () => {
+    start({ limits: { requestsPerToken: 1 } });
+    await signIn(TENANT);
+    const client = await backend(mint().token);
+    await client.listTools(); // its notification stream stays open: not a call
+    const long = client.callTool({ name: "sleep", arguments: { ms: 300 } });
+    await Bun.sleep(50);
+    const refused = await client.callTool({ name: "whoami", arguments: {} }).catch((e: unknown) => e);
+    expect(String(refused)).toContain("too many calls open");
+    await long;
+    expect(await client.callTool({ name: "whoami", arguments: {} })).toMatchObject({ content: [{ text: "you are user-1" }] });
+  });
+});
+
+describe("round-3 findings stay fixed", () => {
+  it("a call the backend gives up on frees its place, and its half-started session", async () => {
+    start({ limits: { requestsPerToken: 1 } });
     await signIn(TENANT);
     const { token } = mint();
-    const client = await backend(token);
-    await client.listTools();
-    await Bun.sleep(50); // the client's notification stream counts as one
-    const long = client.callTool({ name: "sleep", arguments: { ms: 400 } });
+    fake.initializeDelayMs = 300;
+    const gaveUp = new AbortController();
+    const abandoned = fetch(proxy.url("notes"), {
+      method: "POST",
+      signal: gaveUp.signal,
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+      body: JSON.stringify(INIT),
+    }).catch(() => null);
     await Bun.sleep(50);
+    gaveUp.abort();
+    await abandoned;
+    await Bun.sleep(400); // the relay finishes starting, finds nobody waiting
+    fake.initializeDelayMs = 0;
+    expect((await post("notes", token, INIT)).status).toBe(200);
+    await until(() => proxy.relayCount === 1 && fake.openSessions === 1);
+  });
+
+  it("refuses a batch on a session: one message per POST", async () => {
+    start();
+    await signIn(TENANT);
+    const { token } = mint();
+    const sid = (await post("notes", token, INIT)).headers.get("mcp-session-id")!;
+    const calls = Array.from({ length: 5 }, (_, i) => ({ jsonrpc: "2.0", id: i + 2, method: "tools/call", params: { name: "whoami", arguments: {} } }));
+    expect((await post("notes", token, calls, { "Mcp-Session-Id": sid, "MCP-Protocol-Version": "2025-06-18" })).status).toBe(400);
+    expect(fake.mcpLog.some((l) => l.method === "tools/call")).toBe(false);
+  });
+
+  it("bounds how fast one token starts sessions", async () => {
+    start({ limits: { initializesPerMinute: 2 } });
+    await signIn(TENANT);
+    const { token } = mint();
+    expect((await post("notes", token, INIT)).status).toBe(200);
+    expect((await post("notes", token, INIT)).status).toBe(200);
     expect((await post("notes", token, INIT)).status).toBe(429);
-    await long;
-    await until(() => true);
+  });
+
+  it("a session holding a subscription isn't idle-dropped; one without is", async () => {
+    start({ limits: { upstreamIdleMs: 80 } });
+    await signIn(TENANT);
+    const client = await backend(mint().token);
+    await client.request({ method: "resources/subscribe", params: { uri: "fake://readme" } }, ResultSchemaLoose).catch(() => {});
+    await Bun.sleep(300);
+    // The fake doesn't implement subscribe, so the subscription isn't held: dropped.
+    await until(() => fake.openSessions === 0);
+  });
+
+  it("the relay reads a malformed listing without breaking the session", async () => {
+    fake.stop();
+    fake = new FakeOAuthMcp({ malformedTool: true });
+    start();
+    await signIn(TENANT);
+    const client = await backend(mint().token);
+    const tools = (await client.listTools()).tools.map((t) => t.name);
+    expect(tools).toContain("whoami");
+    expect(tools).not.toContain("sloppy"); // left out, not passed on to break the listing
+    expect(await client.callTool({ name: "whoami", arguments: {} })).toMatchObject({ content: [{ text: "you are user-1" }] });
+  });
+
+  it("tells a gone session from one call's failure", () => {
+    expect(sessionGone(new McpErrorClass(ErrorCode.ConnectionClosed, "closed"))).toBe(true);
+    expect(sessionGone(new StreamableHTTPError(404, "gone"))).toBe(true);
+    expect(sessionGone(Object.assign(new Error("Unable to connect"), { code: "ConnectionRefused" }))).toBe(true);
+    expect(sessionGone(new StreamableHTTPError(502, "hiccup"))).toBe(false);
+    expect(sessionGone(new TypeError("cannot read properties of undefined"))).toBe(false); // our own bug, not the session
+    expect(sessionTrouble(new McpErrorClass(ErrorCode.RequestTimeout, "timeout"))).toBe(true);
+    expect(sessionTrouble(new McpErrorClass(ErrorCode.InvalidParams, "bad args"))).toBe(false);
+    const streak = new FailureStreak(3);
+    expect([streak.failed(), streak.failed()]).toEqual([false, false]);
+    streak.succeeded();
+    expect([streak.failed(), streak.failed(), streak.failed()]).toEqual([false, false, true]);
   });
 });

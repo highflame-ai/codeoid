@@ -30,7 +30,7 @@ import { ResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import { McpSignInRequired, type McpCredentialSource, type McpTenant } from "./oauth.js";
 import type { McpProxy } from "./proxy.js";
 import { cleanMcpError } from "./redact.js";
-import { closeUpstream, openUpstream, sessionGone, type UpstreamBearer, type UpstreamOptions } from "./upstream.js";
+import { closeUpstream, FailureStreak, openUpstream, sessionGone, sessionTrouble, type UpstreamBearer, type UpstreamOptions } from "./upstream.js";
 
 /** A tool as codeoid surfaces it to a backend (bare name; the canonical
  *  `mcp__<server>__<tool>` form is applied by the mounters, not here). */
@@ -114,8 +114,9 @@ export class McpHub {
    */
   async listToolsOrThrow(spec: McpServerSpec, scope?: McpCallScope): Promise<McpToolDef[]> {
     const key = clientKey(spec, scope?.tenant);
+    let client: McpClient | undefined;
     try {
-      const client = this.#clientFor(spec, scope?.tenant);
+      client = this.#clientFor(spec, scope?.tenant);
       const all = await withTimeout(client.listTools(), this.#timeoutMs, `${spec.name}/tools/list`);
       const tools = spec.toolAllowlist ? all.filter((t) => spec.toolAllowlist?.includes(t.name)) : all;
       this.#status.set(key, { tools: tools.map((t) => t.name) });
@@ -125,7 +126,7 @@ export class McpHub {
       // record — and the tool list from before is gone with the credential.
       if (e instanceof McpSignInRequired) this.#status.delete(key);
       else this.#status.set(key, { tools: [], error: cleanMcpError(errMsg(e)) });
-      this.#dropIfBroken(key, e);
+      if (client) this.#dropIfBroken(key, e, client);
       throw e;
     }
   }
@@ -151,7 +152,7 @@ export class McpHub {
     try {
       return await withTimeout(client.callTool(tool, args, scope), this.#timeoutMs, `${spec.name}/${tool}`);
     } catch (e) {
-      this.#dropIfBroken(clientKey(spec, scope.tenant), e); // reconnect on next use
+      this.#dropIfBroken(clientKey(spec, scope.tenant), e, client); // reconnect on next use
       if (e instanceof McpSignInRequired) return { text: e.message, isError: true };
       // codeoid has no OTEL; a failed external tool call is worth one daemon log
       // line (transport error / timeout) so a flaky server is diagnosable.
@@ -235,9 +236,10 @@ export class McpHub {
     this.#drop(tenantKey(name, tenant));
   }
 
-  #dropIfBroken(key: string, e: unknown): void {
-    const c = this.#clients.get(key);
-    if (c && (c.brokenBy?.(e) ?? true)) this.#drop(key);
+  /** Drop `client` if this failure broke it — and only if it is still the
+   *  one held: a newer client, opened since, isn't the one that failed. */
+  #dropIfBroken(key: string, e: unknown, client: McpClient): void {
+    if (this.#clients.get(key) === client && (client.brokenBy?.(e) ?? true)) this.#drop(key);
   }
 
   #drop(key: string): void {
@@ -394,6 +396,8 @@ class HttpMcpClient implements McpClient {
     this.#timeoutMs = timeoutMs;
   }
 
+  readonly #streak = new FailureStreak();
+
   #connect(): Promise<Client> {
     if (!this.#client) {
       const connecting = openUpstream({ ...this.#opts, timeoutMs: this.#timeoutMs });
@@ -420,12 +424,15 @@ class HttpMcpClient implements McpClient {
         ResultSchema,
         { timeout: this.#timeoutMs },
       )) as { tools?: unknown; nextCursor?: unknown };
-      if (Array.isArray(page.tools)) tools.push(...(page.tools as RawTool[]).filter((t) => typeof t?.name === "string").map(toToolDef));
+      if (Array.isArray(page.tools)) {
+        tools.push(...(page.tools as RawTool[]).filter((t) => typeof t === "object" && t !== null && typeof t.name === "string").map(toToolDef));
+      }
       cursor = typeof page.nextCursor === "string" ? page.nextCursor : undefined;
       // A server repeating a cursor would page forever.
       if (cursor !== undefined && seen.has(cursor)) break;
       if (cursor !== undefined) seen.add(cursor);
     } while (cursor && tools.length < MAX_TOOLS && seen.size < MAX_PAGES);
+    this.#streak.succeeded();
     return tools;
   }
 
@@ -436,6 +443,7 @@ class HttpMcpClient implements McpClient {
     const res = await client.request({ method: "tools/call", params: { name: tool, arguments: args } }, ResultSchema, {
       timeout: this.#timeoutMs,
     });
+    this.#streak.succeeded();
     return normalizeCallResult(res as RawCallResult);
   }
 
@@ -449,7 +457,8 @@ class HttpMcpClient implements McpClient {
    *  failure of the session itself ends it, never one call's error or timeout.
    *  A sign-in needed again is the credential, not the session. */
   brokenBy(e: unknown): boolean {
-    return !(e instanceof McpSignInRequired) && sessionGone(e);
+    if (e instanceof McpSignInRequired) return false;
+    return sessionGone(e) || (sessionTrouble(e) && this.#streak.failed());
   }
 }
 
@@ -499,11 +508,14 @@ function toToolDef(t: RawTool): McpToolDef {
 
 /** Flatten an MCP tool result's content blocks into text. */
 function normalizeCallResult(res: RawCallResult): McpCallResult {
-  const text = (res.content ?? [])
-    .filter((c) => c.type === "text" || c.type === undefined)
+  // Tolerant of a server's malformed result: a throw here would read as a
+  // broken session and cut the calls beside this one.
+  const content = Array.isArray(res?.content) ? res.content : [];
+  const text = content
+    .filter((c) => typeof c === "object" && c !== null && (c.type === "text" || c.type === undefined))
     .map((c) => (typeof c.text === "string" ? c.text : ""))
     .join("");
-  return { text, isError: res.isError === true };
+  return { text, isError: res?.isError === true };
 }
 
 function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {

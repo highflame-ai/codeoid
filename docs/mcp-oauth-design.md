@@ -164,10 +164,12 @@ A server adopted from Claude's config (#390) is an OAuth registry entry, so it g
 
 **Limits.**
 At most 8 relay sessions per proxy token for each server: a new one past that closes the least recently used that isn't mid-call (whose backend re-initializes if it returns), so a backend that opens a session per thread never locks itself out, and a call is never cut to make room.
-At most 32 requests open per token, streams included.
+At most 32 calls (POSTs) open per token, each freed when its answer ends or the backend gives up on it, and one JSON-RPC message per POST (no batches); a session's notification stream and its `DELETE` aren't counted, so a backend can always close what it opened.
+At most 30 new sessions per token per minute.
 An `initialize` is checked in full (its schema, `Accept`, `Content-Type`) before anything opens upstream or any session makes room, and a request body is capped at 4 MB as it streams in; the daemon's idle-connection cut is lifted only once the body is in.
-An upstream session idle for 10 minutes — no request in flight, no resource subscription held — is closed and reopened on the next request; the backend's own session stays, so an idle agent doesn't see its server go away.
-Only a session that is itself gone (connection closed, the server forgot it, the network down) is dropped after a failed request; any other failure is that request's alone, and the calls beside it go on. The hub holds its shared sessions to the same rule.
+An upstream session idle for 10 minutes — no request in flight, no resource subscription held on it — is closed and reopened on the next request; the backend's own session stays, so an idle agent doesn't see its server go away.
+Only a session that is itself gone (connection closed, the server forgot it, no connection to the server) is dropped after a failed request, or one that has failed three times running with timeouts or transport errors (stuck without saying so); any other failure is that request's alone, and the calls beside it go on. The hub holds its shared sessions to the same rule, and drops only the session that failed, never a newer one.
+A listing's entries that aren't valid tools are left out, so one malformed tool can't make a backend reject the rest.
 Everything closes with the token: when the backend is rebuilt or torn down, or the session ends — the backend's side first, and the server's session with a bounded wait for its `DELETE`.
 
 **Observability.**
