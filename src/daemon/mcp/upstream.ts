@@ -46,6 +46,18 @@ export interface UpstreamOptions {
 export const UPSTREAM_CLIENT_INFO: Implementation = { name: "codeoid", version: "1.0" };
 
 /**
+ * A server configured without OAuth answered with the MCP authorization
+ * challenge (401 + `WWW-Authenticate: Bearer …`): it wants a sign-in codeoid
+ * isn't doing for it — adopting it (#390) would (#395).
+ */
+export class McpServerWantsSignIn extends Error {
+  constructor(readonly server: string) {
+    super(`${server} wants an OAuth sign-in — adopt it ("Sign in with codeoid" in the capabilities drawer) to use it on every backend`);
+    this.name = "McpServerWantsSignIn";
+  }
+}
+
+/**
  * Connect to `opts.transport.url` and complete the MCP handshake. Throws
  * {@link McpSignInRequired} when an OAuth server has no usable token for the
  * tenant (none stored, or refused and not refreshable).
@@ -159,7 +171,14 @@ export function upstreamFetch(opts: UpstreamOptions): typeof fetch {
     return token;
   };
   const wrapped = async (url: string | URL | Request, init?: RequestInit): Promise<Response> => {
-    if (!oauth) return send(url, init, undefined);
+    if (!oauth) {
+      const resp = await send(url, init, undefined);
+      if (resp.status === 401 && /^\s*Bearer\b/i.test(resp.headers.get("www-authenticate") ?? "")) {
+        await resp.body?.cancel().catch(() => {});
+        throw new McpServerWantsSignIn(name);
+      }
+      return resp;
+    }
     const token = await bearer();
     const resp = await send(url, init, token);
     if (resp.status !== 401) return resp;

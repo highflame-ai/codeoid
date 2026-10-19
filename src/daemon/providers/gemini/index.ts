@@ -44,7 +44,7 @@ import {
   memoryToolsAsGemini,
 } from "../tool-loop.js";
 import { SessionMcpTools } from "../../mcp/tool-source.js";
-import type { McpRegistry } from "../../mcp/registry.js";
+import type { McpServerView } from "../../mcp/registry.js";
 import type { McpHub } from "../../mcp/hub.js";
 
 export interface GeminiProviderInit {
@@ -62,7 +62,7 @@ export interface GeminiProviderInit {
   sessionId?: string;
   /** Cross-backend MCP registry + daemon-owned client — external servers reach
    *  this backend (which has no MCP client) through the hub. */
-  mcpRegistry?: McpRegistry;
+  mcpRegistry?: McpServerView;
   mcpHub?: McpHub;
 }
 
@@ -78,7 +78,7 @@ export class GeminiProvider implements AgentProvider {
   #workspaceId: string;
   #tenant: McpTenant | undefined;
   #sessionId: string;
-  #mcpRegistry: McpRegistry | null;
+  #mcpRegistry: McpServerView | null;
   #mcpHub: McpHub | null;
 
   constructor(init: GeminiProviderInit = {}) {

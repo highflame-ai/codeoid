@@ -288,6 +288,20 @@ export const sessionMcpReconnectSchema = z.object({
   server: z.string().regex(/^[\w .:()-]{1,128}$/),
 });
 
+export const sessionMcpRefreshSchema = z.object({
+  ...base,
+  type: z.literal("session.mcp_refresh"),
+  sessionId: sessionIdField,
+});
+
+export const mcpApproveSchema = z.object({
+  ...base,
+  type: z.literal("mcp.approve"),
+  sessionId: sessionIdField,
+  server: z.string().regex(/^[\w .:()-]{1,128}$/),
+  path: z.string().max(4096).optional(),
+});
+
 export const sessionSetProviderSchema = z.object({
   ...base,
   type: z.literal("session.set_provider"),
@@ -960,6 +974,8 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   sessionSetModelSchema,
   sessionSetProviderSchema,
   sessionMcpReconnectSchema,
+  sessionMcpRefreshSchema,
+  mcpApproveSchema,
   sessionForkSchema,
   scrollbackPageSchema,
   sessionRenameSchema,

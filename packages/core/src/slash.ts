@@ -19,6 +19,7 @@ import type {
   SessionInfo,
   SessionMode,
   McpReconnectResult,
+  McpRefreshResult,
 } from "@highflame/codeoid-protocol";
 
 export type SlashCommand =
@@ -36,6 +37,7 @@ export type SlashCommand =
   | { kind: "who" }
   | { kind: "capabilities"; tab: "agents" | "skills" | "mcp" | "hooks" }
   | { kind: "mcp-reconnect"; server: string }
+  | { kind: "mcp-refresh" }
   | { kind: "settings" }
   | { kind: "packs" }
   | { kind: "pipeline"; goal?: string }
@@ -136,6 +138,8 @@ export function parseSlash(raw: string, opts?: ParseSlashOptions): SlashCommand 
     case "mcp":
       // `/mcp reconnect <server>` redials one of the backend's servers (#389).
       if (rest[0] === "reconnect" && rest[1]) return { kind: "mcp-reconnect", server: rest.slice(1).join(" ") };
+      // `/mcp refresh` applies Claude's current MCP config to the session (#395).
+      if (rest[0] === "refresh") return { kind: "mcp-refresh" };
       return { kind: "capabilities", tab: "mcp" };
     case "hooks":
     case "hook":
@@ -312,6 +316,28 @@ export function dispatchSlash(cmd: SlashCommand, ctx: SlashContext): void {
           const r = (resp as { data?: McpReconnectResult } | undefined)?.data;
           if (!r || r.status === "connected") return;
           ctx.report?.(r.deferred ? `${r.server} connects when the next turn starts.` : (r.error ?? `${r.server} is ${r.status}.`));
+        })
+        .catch((e) => ctx.report?.(e instanceof Error ? e.message : String(e)));
+      return;
+    }
+    case "mcp-refresh": {
+      const msg: ClientMessage = { type: "session.mcp_refresh", id: ctx.newRequestId(), sessionId: ctx.sessionId };
+      if (!ctx.request) {
+        ctx.send(msg);
+        return;
+      }
+      ctx
+        .request(msg)
+        .then((resp) => {
+          const r = (resp as { data?: McpRefreshResult } | undefined)?.data;
+          if (!r) return;
+          ctx.report?.(
+            !r.changed
+              ? "MCP servers are up to date."
+              : r.deferred
+                ? "MCP servers changed: applied when this turn ends."
+                : "MCP servers changed: the backend restarts with them on the next turn.",
+          );
         })
         .catch((e) => ctx.report?.(e instanceof Error ? e.message : String(e)));
       return;

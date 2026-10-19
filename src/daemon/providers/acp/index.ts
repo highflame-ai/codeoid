@@ -42,7 +42,7 @@ import { buildGeminiCliEnv } from "../env.js";
 import { StdioJsonRpcProcess } from "../jsonrpc-stdio.js";
 import { MEMORY_MCP_SERVER_NAME, type MemoryMcpMount } from "../../memory/mcp-http.js";
 import { BLACKBOARD_MCP_SERVER_NAME } from "../../blackboard/mcp-http.js";
-import type { McpRegistry } from "../../mcp/registry.js";
+import type { McpServerView } from "../../mcp/registry.js";
 import { McpProxyLease, type McpProxyMount } from "../../mcp/proxy.js";
 import { resolveEnvMap } from "../../mcp/types.js";
 
@@ -78,7 +78,7 @@ export interface GeminiAcpProviderInit {
 
   /** Cross-backend MCP registry — external servers mount on session/new
    *  (gemini-cli owns its client); approval flows through canUseTool. */
-  mcpRegistry?: McpRegistry;
+  mcpRegistry?: McpServerView;
   onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
 }
 
@@ -101,7 +101,7 @@ export class GeminiAcpProvider implements SessionProvider {
   #memoryMcp: MemoryMcpMount | null;
   /** Role-scoped blackboard mount; token minted+revoked by the SessionManager. */
   readonly #blackboardMcp: (() => { url: string; token: string } | undefined) | null;
-  #mcpRegistry: McpRegistry | null;
+  #mcpRegistry: McpServerView | null;
   /** Live scoped token for the mounted memory endpoint; revoked on teardown. */
   #memoryToken: string | null = null;
 

@@ -73,6 +73,18 @@ export interface McpServerSpec {
   native: boolean;
   /** Built-in (codeoid_memory) — not user-declarable; always readonly+session. */
   builtin: boolean;
+  /**
+   * Where the entry comes from (#395), when not codeoid's own config:
+   * `claude-global` — imported from `~/.claude.json` at the daemon level;
+   * `claude-local` — the session's workdir in the user's own `~/.claude.json`;
+   * `claude-repo` — the workdir's `.mcp.json` or project settings (the repo's
+   * choice, reaching other backends only once approved).
+   * The workdir ones live only in a session's view, never the registry.
+   */
+  origin?: "claude-global" | "claude-local" | "claude-repo";
+  /** For a workdir entry: a fingerprint of its config, so two workdirs'
+   *  same-named servers are different clients (and a repo's edit is a new entry). */
+  variant?: string;
 }
 
 /** The one namespaced tool name used across ALL backends, so isSafeTool /

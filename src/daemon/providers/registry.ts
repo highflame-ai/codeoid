@@ -18,7 +18,7 @@ import type { Store } from "../store.js";
 import type { AgentIdentityManager } from "../agent-identity.js";
 import type { MemoryEngine } from "../memory/index.js";
 import type { MemoryMcpMount } from "../memory/mcp-http.js";
-import type { McpRegistry } from "../mcp/registry.js";
+import type { McpServerView } from "../mcp/registry.js";
 import type { McpHub } from "../mcp/hub.js";
 import type { McpTenant } from "../mcp/oauth.js";
 import type { CompressionRegistry } from "../compress/index.js";
@@ -63,7 +63,7 @@ export interface ProviderSessionInit {
    *  inits for why it is a getter and not a value. */
   blackboardMcp?: () => { url: string; token: string } | undefined;
   /** Cross-backend MCP registry — the servers to mount on this session's backend. */
-  mcpRegistry?: McpRegistry;
+  mcpRegistry?: McpServerView;
   /** Daemon-owned MCP client pool backing the registry (Model-B backends execute
    *  external tool calls through it; Model-A backends mount servers natively). */
   mcpHub?: McpHub;

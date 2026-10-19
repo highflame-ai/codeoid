@@ -39,7 +39,7 @@ import {
 } from "../../memory/index.js";
 import { BLACKBOARD_MCP_SERVER_NAME } from "../../blackboard/mcp-http.js";
 import type { McpHub } from "../../mcp/hub.js";
-import type { McpRegistry } from "../../mcp/registry.js";
+import type { McpServerView } from "../../mcp/registry.js";
 import { oauthServersForClaude } from "./oauth-bridge.js";
 import { mcpToolPrefix, resolveEnvMap } from "../../mcp/types.js";
 import type { CompressionRegistry } from "../../compress/index.js";
@@ -161,7 +161,7 @@ export interface ClaudeProviderInit {
   blackboardMcp?: () => { url: string; token: string } | undefined;
   /** Cross-backend MCP registry — external servers are mounted natively on the
    *  SDK (claude owns its own MCP client); approval flows through canUseTool. */
-  mcpRegistry?: McpRegistry;
+  mcpRegistry?: McpServerView;
   /** The daemon-owned MCP client — what an OAuth registry server is called
    *  through, as the session's tenant (#390). */
   mcpHub?: McpHub;
@@ -2063,7 +2063,7 @@ function shellQuote(value: string): string {
  *  McpServerConfigs — a native mount, since claude's SDK owns its MCP client.
  *  `${VAR}` env refs and a `bearerTokenEnv` are resolved against the daemon env
  *  here so secrets never live in config; tool calls gate via canUseTool. */
-export function registryServersForClaude(registry: McpRegistry | undefined): Record<string, McpServerConfig> {
+export function registryServersForClaude(registry: McpServerView | undefined): Record<string, McpServerConfig> {
   if (!registry) return {};
   const out: Record<string, McpServerConfig> = {};
   for (const spec of registry.forNativeMount("claude")) {

@@ -279,7 +279,8 @@ export class TelegramFrontend implements Frontend {
     // Capabilities discovery — mirror the web /agents /skills /mcp /hooks.
     this.#bot.command("agents", (ctx) => this.#handleCapabilities(ctx, "agents"));
     this.#bot.command("skills", (ctx) => this.#handleCapabilities(ctx, "skills"));
-    this.#bot.command("mcp", (ctx) => this.#handleCapabilities(ctx, "mcp"));
+    // `/mcp refresh` applies Claude's current MCP config to the attached session (#395).
+    this.#bot.command("mcp", (ctx) => (/^\s*refresh\b/i.test(String(ctx.match ?? "")) ? this.#handleMcpRefresh(ctx) : this.#handleCapabilities(ctx, "mcp")));
     this.#bot.command("hooks", (ctx) => this.#handleCapabilities(ctx, "hooks"));
 
     // Inline-keyboard taps (tool approvals + AskUserQuestion answers).
@@ -994,6 +995,31 @@ export class TelegramFrontend implements Frontend {
     } else {
       await ctx.reply(`Settings summary is long — see ${snapshot.configPath}`);
     }
+  }
+
+  async #handleMcpRefresh(ctx: Context): Promise<void> {
+    const state = this.#requireAuth(ctx);
+    if (!state || !state.attachedSessionId) {
+      await ctx.reply("Not attached. Use /attach <name>.");
+      return;
+    }
+    const resp = await this.#manager.handle(
+      { type: "session.mcp_refresh", id: randomUUID(), sessionId: state.attachedSessionId },
+      state.auth!,
+      this.#makeClient(state, ctx),
+    );
+    if (resp.type !== "response.ok") {
+      await ctx.reply(resp.type === "response.error" ? resp.error : "Refresh failed.");
+      return;
+    }
+    const r = resp.data as { changed: boolean; deferred: boolean };
+    await ctx.reply(
+      !r.changed
+        ? "MCP servers are up to date."
+        : r.deferred
+          ? "MCP servers changed: applied when this turn ends."
+          : "MCP servers changed: the backend restarts with them on the next turn.",
+    );
   }
 
   async #handleCapabilities(

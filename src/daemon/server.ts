@@ -518,8 +518,10 @@ export class DaemonServer {
     const mcpServers = { ...imported, ...(this.#config.fullConfig?.mcpServers ?? {}) };
     const importedCount = Object.keys(imported).length;
     if (importedCount > 0) console.log(`[codeoid] mcp: imported ${importedCount} server(s) from ~/.claude.json`);
+    const explicit = new Set(Object.keys(this.#config.fullConfig?.mcpServers ?? {}));
     this.#mcpRegistry = new McpRegistry(mcpServers, {
       memoryEnabled: this.#memory != null,
+      imported: new Set(Object.keys(imported).filter((n) => !explicit.has(n))),
     });
     // OAuth for remote servers is codeoid's own — no Highflame dependency. The
     // redirect is the daemon's loopback unless an externally reachable base is

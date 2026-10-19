@@ -120,7 +120,8 @@ import {
 } from "./memory/index.js";
 import { isElicitationTool, isSafeTool, roleDeniesTool } from "./providers/tool-safety.js";
 import type { PackActivation } from "./pipeline/index.js";
-import type { McpRegistry } from "./mcp/registry.js";
+import { McpRegistry } from "./mcp/registry.js";
+import { SessionMcpView, type WorkdirReach } from "./mcp/session-view.js";
 import { adoptableName, adoptionRefusal, claudeMcpServers, fromRepoFile, fullUrlRequired, shellArg } from "./mcp/adopt.js";
 import { cleanMcpError, redactMcpUrl } from "./mcp/redact.js";
 import type { McpHub } from "./mcp/hub.js";
@@ -833,6 +834,10 @@ export class Session {
   #memory?: MemoryEngine;
   #memoryMcp?: MemoryMcpMount;
   #mcpRegistry?: McpRegistry;
+  /** The registry as this session sees it, with its workdir's servers (#395). */
+  #mcpView?: SessionMcpView;
+  /** A refresh asked for during a turn: applied before the next one. */
+  #mcpRefreshPending = false;
   #mcpHub?: McpHub;
   #chunker?: EpisodeChunker;
   // Counts mid-turn messages in flight. When the SDK interrupts the current
@@ -1173,6 +1178,17 @@ export class Session {
     this.#memoryMcp = opts.memoryMcp;
     this.#mcpRegistry = opts.mcpRegistry;
     this.#mcpHub = opts.mcpHub;
+    // This session's view of its MCP servers: the registry plus its own
+    // workdir's Claude servers (#395). Read before the first turn, and again
+    // only when asked to refresh.
+    if (opts.mcpRegistry instanceof McpRegistry) {
+      const scope = { accountId: this.accountId, projectId: this.projectId, workdir: this.workdir };
+      this.#mcpView = new SessionMcpView(opts.mcpRegistry, opts.mcpHub ?? null, {
+        workdir: this.workdir,
+        tenant: { accountId: this.accountId, projectId: this.projectId },
+        approvals: () => this.#store.workdirMcpApprovals(scope),
+      });
+    }
     this.#config = opts.config;
     // Retained for provider (re-)construction — switchProvider() rebuilds
     // the backend long after the constructor options are gone.
@@ -1372,7 +1388,7 @@ export class Session {
       // A getter, so a mount attached after construction still reaches the
       // provider when it next builds its server list.
       blackboardMcp: () => this.#blackboardMcp,
-      mcpRegistry: this.#mcpRegistry,
+      mcpRegistry: this.#mcpView ?? this.#mcpRegistry,
       mcpHub: this.#mcpHub,
       fleet: this.#fleet,
       config: this.#config,
@@ -1866,7 +1882,70 @@ export class Session {
   }
 
   /** Take the backend's word for a server's state; announce it coming back. */
+  /**
+   * Make sure the session's MCP view is read (before its first turn) and that
+   * a refresh asked for mid-turn is applied: a change rebuilds the backend,
+   * which resumes the same conversation with the new servers.
+   */
+  async #applyMcpView(): Promise<void> {
+    const view = this.#mcpView;
+    if (!view) return;
+    if (!view.loaded) {
+      await view.load().catch((e) => console.error(`[codeoid/session ${this.id}] reading the workdir's MCP servers failed: ${e instanceof Error ? e.message : String(e)}`));
+      this.#mcpRefreshPending = false;
+      return;
+    }
+    if (!this.#mcpRefreshPending) return;
+    this.#mcpRefreshPending = false;
+    if (await view.load()) await this.#teardownProvider();
+  }
+
+  /**
+   * Re-read the workdir's MCP servers and apply any change (#395): the
+   * backend is rebuilt and resumes the conversation. During a turn, applied
+   * before the next one. Never done on its own — a config edit shouldn't
+   * restart a working backend unasked.
+   */
+  async refreshMcp(): Promise<{ changed: boolean; deferred: boolean }> {
+    const view = this.#mcpView;
+    if (!view) return { changed: false, deferred: false };
+    if (!view.loaded) {
+      await view.load();
+      return { changed: false, deferred: false };
+    }
+    if (this.#activeRun !== null) {
+      this.#mcpRefreshPending = true;
+      return { changed: await view.stale(), deferred: true };
+    }
+    const changed = await view.load();
+    if (changed) await this.#teardownProvider();
+    return { changed, deferred: false };
+  }
+
+  /** Read the session's MCP view if it hasn't been yet (before a first turn, that's applying it). */
+  async ensureMcpView(): Promise<void> {
+    if (this.#mcpView && !this.#mcpView.loaded) await this.#mcpView.load();
+  }
+
+  /** Whether the workdir's MCP servers changed since this session applied them. */
+  async mcpStale(): Promise<boolean> {
+    return (await this.#mcpView?.stale()) ?? false;
+  }
+
+  /** How far a server from Claude's config reaches in this session (#395). */
+  mcpReach(server: { name: string; scope: string; path: string; url: string | null; command: string | null }): WorkdirReach | undefined {
+    const view = this.#mcpView;
+    if (!view) return undefined;
+    return server.scope === "workdir" ? view.reachOf(server.name, server.path) : view.reachOfGlobal(server.name, server.url, server.command);
+  }
+
   #applyMcpState(name: string, state: { status: string; tools: string[] }): void {
+    // A server Claude found wanting a sign-in is held back from the backends
+    // that would only get 401s from it, until it's adopted (#395).
+    if (state.status === "needs-auth") {
+      const url = this.#mcpView?.urlOf(name);
+      if (url) this.#mcpHub?.markNeedsSignIn(url);
+    }
     this.#sdkMcpStatus.set(name, state.status);
     this.#sdkMcpTools.set(name, state.tools);
     this.#noteMcpStatus(name, state.status);
@@ -2903,6 +2982,7 @@ export class Session {
     // A redaction flagged by a turn that never reached turn_done (interrupted,
     // errored, switched away) belongs to that turn's backing, not this one.
     this.#turnRedacted = false;
+    await this.#applyMcpView();
     const run = this.#provider.runTurn({
       ...(this.#maxBudgetUsd !== undefined ? { maxBudgetUsd: this.#maxBudgetUsd } : {}),
       history: this.#accumulator.history,
@@ -5032,7 +5112,7 @@ export class Session {
    *  declared `trust: readonly` — auto-approved on every backend, like the
    *  built-in memory tools. */
   #isReadonlyMcpTool(toolName: string): boolean {
-    const reg = this.#mcpRegistry;
+    const reg = this.#mcpView ?? this.#mcpRegistry;
     if (!reg || !toolName.startsWith("mcp__")) return false;
     for (const spec of reg.list()) {
       if (spec.trust === "readonly" && toolName.startsWith(`mcp__${spec.name}__`)) return true;

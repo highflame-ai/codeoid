@@ -8,6 +8,14 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **An MCP server added through Claude reaches every backend in that directory** (#395).
+  codeoid imported only Claude's global servers, once at start; a `claude mcp add` (local scope), a project's `.mcp.json` or its settings stayed Claude-only.
+  Now each session sees, on every backend, its directory's servers too: your own always, a project's once approved (in Claude Code, or with the drawer's Approve / `codeoid mcp approve`, bound to that exact entry).
+  Changes apply when you ask: the drawer shows "MCP servers changed", and **Refresh MCP servers** (`/mcp refresh`, `codeoid mcp refresh`) restarts the backend, which resumes the conversation.
+  A server that wants an OAuth sign-in is held back from the backends that would only get 401s, and the drawer says to adopt it.
+  Servers in `~/.claude/settings.json` are imported too.
+  docs/mcp-backends.md says which server reaches which backend, and why.
+
 - **Codex, the Gemini CLI and Qwen use OAuth MCP servers** (#396).
   An OAuth server in codeoid's registry (`"oauth": true`, or one adopted from Claude's config) used to reach only the daemon-run backends and Claude; Settings said "Not reachable from codex, gemini-cli, qwen yet".
   These backends now mount it through a loopback relay on the daemon, with a token that belongs to the session and ends with it.

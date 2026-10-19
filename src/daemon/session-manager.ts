@@ -27,6 +27,7 @@ import { createPushTransport, PushService } from "./push/index.js";
 import { hasScope, SCOPES } from "../protocol/scopes.js";
 import { applyPatches, getManifest, getSnapshot, previewPatches, readMcpServerEntry, writeMcpServerEntry } from "./settings/store.js";
 import { adoptability, adoptableName, adoptedEntry, adoptionRefusal, claudeMcpServers, fromRepoFile, fullUrlRequired, isSameAdoption } from "./mcp/adopt.js";
+import { readWorkdirServers } from "./mcp/workdir-servers.js";
 import { cleanMcpError, commandSummary, MAX_SHOWN_KEYS, redactMcpUrl, serverProgram, shownLabel } from "./mcp/redact.js";
 import { canonicalFromTranscript, turnIndexFromHistory } from "./canonical-restore.js";
 import { BackendLoginBroker, BackendLoginError, redact } from "./auth/backend-login.js";
@@ -1166,6 +1167,10 @@ mcpHub: this.#mcpHub,
         return this.#setProvider(msg, auth);
       case "session.mcp_reconnect":
         return this.#mcpReconnect(msg, auth);
+      case "session.mcp_refresh":
+        return this.#mcpRefresh(msg, auth);
+      case "mcp.approve":
+        return this.#mcpApprove(msg, auth);
       case "session.fork":
         return this.#fork(msg, auth);
       case "session.rename":
@@ -1572,6 +1577,7 @@ mcpHub: this.#mcpHub,
     }
     try {
       const snapshot = await readClaudeConfig(session.workdir);
+      await session.ensureMcpView();
       const live = session.sdkMcpSnapshot;
       // A name two entries give different URLs to: which one the backend runs
       // isn't known here, so neither is offered for adopting.
@@ -1592,6 +1598,11 @@ mcpHub: this.#mcpHub,
           args: [],
           argCount: s.args.length,
           url: s.url === null ? null : redactMcpUrl(s.url),
+          // Whether it reaches this session's other backends too, and why not (#395).
+          ...(() => {
+            const reach = adopted ? ({ reach: "all" } as const) : session.mcpReach(s);
+            return reach ? { otherBackends: reach } : {};
+          })(),
           // Everything else read from the file is a short label, bounded. (A
           // name is an address, so it's cut, not redacted: one that long is
           // never adoptable anyway.)
@@ -1647,6 +1658,7 @@ mcpHub: this.#mcpHub,
           command: commandSummary(h.command),
         })),
         mcpReconnect: session.canReconnectMcp,
+        ...((await session.mcpStale()) ? { mcpStale: true } : {}),
       };
     } catch (err) {
       return {
@@ -7315,6 +7327,62 @@ mcpHub: this.#mcpHub,
       return { type: "response.error", requestId: msg.id, error: result.refused, code: "invalid_request" };
     }
     return { type: "response.ok", requestId: msg.id, data: result };
+  }
+
+  /** Re-read the session's MCP servers and apply any change (#395). `session:send`. */
+  async #mcpRefresh(
+    msg: Extract<ClientMessage, { type: "session.mcp_refresh" }>,
+    auth: AuthContext,
+  ): Promise<DaemonMessage> {
+    if (!hasScope(auth.scopes as string[], SCOPES.SESSION_SEND)) {
+      return { type: "response.error", requestId: msg.id, error: "Missing scope: session:send", code: "forbidden" };
+    }
+    const session = this.#getOwnedSession(msg.sessionId, auth);
+    if (!session) {
+      return { type: "response.error", requestId: msg.id, error: "Session not found", code: "not_found" };
+    }
+    const result = await session.refreshMcp();
+    this.#store.audit(auth.sub, "session.mcp_refresh", session.id, `changed=${result.changed} deferred=${result.deferred}`);
+    return { type: "response.ok", requestId: msg.id, data: result };
+  }
+
+  /**
+   * Approve a repo's MCP server — this exact entry — for every backend in the
+   * session's workdir (#395). Consent to what a repo chose, so: the caller's
+   * own session, `settings:write`, never a delegated token, audited with the
+   * file it came from. Applies on a refresh.
+   */
+  async #mcpApprove(
+    msg: Extract<ClientMessage, { type: "mcp.approve" }>,
+    auth: AuthContext,
+  ): Promise<DaemonMessage> {
+    const fail = (error: string, code: "invalid_request" | "not_found" | "forbidden" = "invalid_request"): DaemonMessage => ({
+      type: "response.error",
+      requestId: msg.id,
+      error,
+      code,
+    });
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE) || auth.delegationDepth > 0) {
+      return fail("Approving a project's MCP server needs settings:write, on a token of your own", "forbidden");
+    }
+    const session = this.#getOwnedSession(msg.sessionId, auth);
+    if (!session) return fail("Session not found", "not_found");
+    const repo = (await readWorkdirServers(session.workdir)).filter(
+      (w) => w.origin === "claude-repo" && w.name === msg.server && (msg.path === undefined || w.path === msg.path),
+    );
+    if (repo.length === 0) return fail(`This project declares no MCP server ${JSON.stringify(msg.server)}`, "not_found");
+    if (new Set(repo.map((w) => w.fingerprint)).size > 1) {
+      return fail(`${JSON.stringify(msg.server)} is declared differently in ${repo.map((w) => w.path).join(" and ")}; say which file`);
+    }
+    const entry = repo[0]!;
+    this.#store.approveWorkdirMcpServer(
+      { accountId: auth.accountId, projectId: auth.projectId, workdir: session.workdir },
+      entry.name,
+      entry.fingerprint,
+      auth.sub,
+    );
+    this.#store.audit(auth.sub, "mcp.approve", session.id, `server=${JSON.stringify(entry.name)} source=${JSON.stringify(entry.path)}`);
+    return { type: "response.ok", requestId: msg.id, data: { server: entry.name, path: entry.path } };
   }
 
   #rename(

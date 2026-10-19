@@ -14,6 +14,7 @@ import type {
   ClaudeConfigResultMsg,
   ClaudeConfigSkill,
   McpReconnectResult,
+  McpRefreshResult,
 } from "../protocol/types";
 
 interface State {
@@ -26,6 +27,8 @@ interface State {
   hooks: ClaudeConfigHook[];
   /** The backend can redial its MCP servers. */
   mcpReconnect: boolean;
+  /** Claude's config changed since the session applied it: a refresh would apply it (#395). */
+  mcpStale: boolean;
   error: string | null;
   fetchedAt: number;
 }
@@ -39,6 +42,7 @@ const EMPTY: State = {
   mcpServers: [],
   hooks: [],
   mcpReconnect: false,
+  mcpStale: false,
   error: null,
   fetchedAt: 0,
 };
@@ -82,6 +86,7 @@ export async function fetchClaudeConfig(sessionId: string): Promise<void> {
         mcpServers: result.mcpServers,
         hooks: result.hooks,
         mcpReconnect: result.mcpReconnect === true,
+        mcpStale: result.mcpStale === true,
         error: null,
         fetchedAt: Date.now(),
       });
@@ -94,6 +99,22 @@ export async function fetchClaudeConfig(sessionId: string): Promise<void> {
       error: err instanceof Error ? err.message : String(err),
     }));
   }
+}
+
+/**
+ * Apply Claude's current MCP config to the session (#395): its backend is
+ * rebuilt and resumes the conversation. Then refresh the snapshot.
+ */
+export async function refreshMcpServers(sessionId: string): Promise<McpRefreshResult> {
+  const ok = await getClient().request({ type: "session.mcp_refresh", id: newRequestId(), sessionId }, { timeoutMs: 30_000 });
+  if (inflightForSession === sessionId) await fetchClaudeConfig(sessionId).catch(() => {});
+  return ok.data as McpRefreshResult;
+}
+
+/** Approve a project's MCP server for every backend in the session's workdir (#395). */
+export async function approveMcpServer(sessionId: string, server: string, path: string): Promise<void> {
+  await getClient().request({ type: "mcp.approve", id: newRequestId(), sessionId, server, path }, { timeoutMs: 15_000 });
+  if (inflightForSession === sessionId) await fetchClaudeConfig(sessionId).catch(() => {});
 }
 
 export function resetClaudeConfig(): void {

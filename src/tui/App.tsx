@@ -18,7 +18,7 @@ import {
   loadWorkspaceCommands,
   type WorkspaceCommand,
 } from "./workspace-commands.js";
-import type { Attachment, McpReconnectResult } from "../protocol/types.js";
+import type { Attachment, McpReconnectResult, McpRefreshResult } from "../protocol/types.js";
 import { parseDialogAnswer } from "../terminal/dialog.js";
 import { formatRewind, parseForkArgs, parseUndoArgs } from "../terminal/rewind.js";
 import { formatCompare, parseCompareArgs } from "../terminal/compare.js";
@@ -1041,9 +1041,29 @@ export function App({ config }: Props) {
         // /mcp reconnect <server> (#389). Anything else is Claude Code's own
         // /mcp, which codeoid doesn't run: say so rather than send it as a prompt.
         if (!client || !focusedSession) return;
+        // /mcp refresh (#395): apply Claude's current MCP config to the session.
+        if (args[0] === "refresh") {
+          const sid = focusedSession.info.id;
+          void client
+            .mcpRefresh(sid)
+            .then((resp) => {
+              if (resp.type === "response.error") {
+                dispatch({ type: "error", message: resp.error });
+                return;
+              }
+              if (resp.type !== "response.ok") return;
+              const r = resp.data as McpRefreshResult;
+              printLocalInfo(
+                sid,
+                !r.changed ? "MCP servers are up to date." : r.deferred ? "MCP servers changed: applied when this turn ends." : "MCP servers changed: the backend restarts with them on the next turn.",
+              );
+            })
+            .catch((err: Error) => dispatch({ type: "error", message: err.message }));
+          return;
+        }
         const server = args.slice(1).join(" ").trim();
         if (args[0] !== "reconnect" || !server) {
-          dispatch({ type: "error", message: "usage: /mcp reconnect <server>" });
+          dispatch({ type: "error", message: "usage: /mcp reconnect <server> | /mcp refresh" });
           return;
         }
         const sessionId = focusedSession.info.id;

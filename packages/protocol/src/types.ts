@@ -1062,6 +1062,8 @@ export type ClientMessage =
   | SessionSetModelMsg
   | SessionSetProviderMsg
   | SessionMcpReconnectMsg
+  | SessionMcpRefreshMsg
+  | McpApproveMsg
   | SessionForkMsg
   | ScrollbackPageMsg
   | SessionRenameMsg
@@ -1649,6 +1651,41 @@ export interface SessionMcpReconnectMsg extends BaseClientMsg {
   server: string;
 }
 
+/**
+ * Re-read the session's MCP servers from Claude's config (its workdir's, and
+ * approvals since) and apply any change (#395): the backend is rebuilt and
+ * resumes the conversation. Nothing changes on its own — `claude.config`
+ * says when a refresh would (`mcpStale`). During a turn, applied before the
+ * next one. `response.ok` data is {@link McpRefreshResult}. Requires `session:send`.
+ */
+export interface SessionMcpRefreshMsg extends BaseClientMsg {
+  type: "session.mcp_refresh";
+  sessionId: string;
+}
+
+/** `response.ok` data for `session.mcp_refresh`. */
+export interface McpRefreshResult {
+  /** The servers changed (the backend is rebuilt, or will be before the next turn). */
+  changed: boolean;
+  /** A turn is running: applied before the next one. */
+  deferred: boolean;
+}
+
+/**
+ * Approve a repo's MCP server (a workdir's `.mcp.json` or project settings)
+ * for every backend in that workdir (#395) — this exact entry: a repo that
+ * edits it needs approval again. Takes effect on a refresh. Approving in
+ * Claude Code works too. Requires `settings:write` (not a delegated token),
+ * and the session must be the caller's.
+ */
+export interface McpApproveMsg extends BaseClientMsg {
+  type: "mcp.approve";
+  sessionId: string;
+  server: string;
+  /** The file it's declared in, when the name is in more than one. */
+  path?: string;
+}
+
 /** `response.ok` data for `session.mcp_reconnect`. */
 export interface McpReconnectResult {
   server: string;
@@ -1973,6 +2010,15 @@ export interface ClaudeConfigMcpServer {
    *  server whose URL has parts hidden here. Adopt it from the CLI with
    *  `--url`, copied from the file at `path`. */
   adoptByFullUrl?: true;
+  /**
+   * For a server from Claude's config: whether it reaches this session's
+   * other backends too (#395), and if not, why — it needs approval (a repo's
+   * server), another of that name wins, it wants a sign-in (adopt it), or its
+   * name is codeoid's own.
+   */
+  otherBackends?:
+    | { reach: "all" }
+    | { reach: "claude-only"; why: "needs-approval" | "needs-refresh" | "shadowed" | "needs-sign-in" | "reserved-name" };
   /** codeoid has adopted it: its registry signs in to this URL, and Claude
    *  sessions use that copy rather than the CLI's. */
   adopted?: true;
@@ -2075,6 +2121,8 @@ export interface ClaudeConfigResultMsg {
   hooks: ClaudeConfigHook[];
   /** Whether this session's backend can redial its MCP servers (`session.mcp_reconnect`). */
   mcpReconnect?: boolean;
+  /** Claude's config changed since this session applied it: `session.mcp_refresh` would apply it (#395). */
+  mcpStale?: boolean;
 }
 
 /** One member of a dispatch group, as a client sees it. */

@@ -30,7 +30,7 @@ import { ResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import { McpSignInRequired, type McpCredentialSource, type McpTenant } from "./oauth.js";
 import type { McpProxy } from "./proxy.js";
 import { cleanMcpError } from "./redact.js";
-import { closeUpstream, FailureStreak, openUpstream, sessionGone, sessionTrouble, type UpstreamBearer, type UpstreamOptions } from "./upstream.js";
+import { closeUpstream, FailureStreak, McpServerWantsSignIn, openUpstream, sessionGone, sessionTrouble, type UpstreamBearer, type UpstreamOptions } from "./upstream.js";
 
 /** A tool as codeoid surfaces it to a backend (bare name; the canonical
  *  `mcp__<server>__<tool>` form is applied by the mounters, not here). */
@@ -120,8 +120,11 @@ export class McpHub {
       const all = await withTimeout(client.listTools(), this.#timeoutMs, `${spec.name}/tools/list`);
       const tools = spec.toolAllowlist ? all.filter((t) => spec.toolAllowlist?.includes(t.name)) : all;
       this.#status.set(key, { tools: tools.map((t) => t.name) });
+      // It answers without a sign-in now: no longer held back.
+      if (spec.transport.kind === "http") this.#wantsSignIn.delete(spec.transport.url);
       return tools;
     } catch (e) {
+      if (e instanceof McpServerWantsSignIn && spec.transport.kind === "http") this.#wantsSignIn.add(spec.transport.url);
       // Not having signed in is not a fault of the server: no health to
       // record — and the tool list from before is gone with the credential.
       if (e instanceof McpSignInRequired) this.#status.delete(key);
@@ -152,6 +155,11 @@ export class McpHub {
     try {
       return await withTimeout(client.callTool(tool, args, scope), this.#timeoutMs, `${spec.name}/${tool}`);
     } catch (e) {
+      if (e instanceof McpServerWantsSignIn && spec.transport.kind === "http") {
+        this.#wantsSignIn.add(spec.transport.url);
+        this.#dropIfBroken(clientKey(spec, scope.tenant), e, client);
+        return { text: e.message, isError: true };
+      }
       this.#dropIfBroken(clientKey(spec, scope.tenant), e, client); // reconnect on next use
       if (e instanceof McpSignInRequired) return { text: e.message, isError: true };
       // codeoid has no OTEL; a failed external tool call is worth one daemon log
@@ -207,6 +215,20 @@ export class McpHub {
     else this.#status.set(key, { tools: this.#status.get(key)?.tools ?? [], ...(status.error ? { error: status.error } : {}) });
   }
 
+  /** URLs of plain HTTP servers that answered with an OAuth challenge (#395):
+   *  held back from backends that would only get 401s, until adopted. */
+  readonly #wantsSignIn = new Set<string>();
+
+  /** Whether a plain HTTP server at `url` has asked for an OAuth sign-in. */
+  needsSignIn(url: string): boolean {
+    return this.#wantsSignIn.has(url);
+  }
+
+  /** Note that the server at `url` asked for a sign-in (here, or as Claude saw it). */
+  markNeedsSignIn(url: string): void {
+    this.#wantsSignIn.add(url);
+  }
+
   /** How native backends that own their MCP clients reach this daemon's OAuth
    *  servers (Codex, the Gemini CLI, Qwen — mcp/proxy.ts); unset when the
    *  daemon serves no relay. */
@@ -227,7 +249,7 @@ export class McpHub {
   /** Drop one server's clients — every tenant's (registry edit / removal). */
   drop(name: string): void {
     for (const key of [...this.#clients.keys()]) {
-      if (key === name || key.startsWith(`${name}\u0000`)) this.#drop(key);
+      if (key === name || key.startsWith(`${name}\u0000`) || key.startsWith(`${name}\u0001`)) this.#drop(key);
     }
   }
 
@@ -478,7 +500,10 @@ export function upstreamBearer(credentials: McpCredentialSource, spec: McpServer
 
 /** A server's client-pool key: per tenant for an OAuth server. */
 function clientKey(spec: McpServerSpec, tenant: McpTenant | undefined): string {
-  return tenantKey(spec.name, isOAuthServer(spec) ? tenant : undefined);
+  // A workdir's server (#395) is keyed by its config too: two workdirs' "db"
+  // are different servers, and a session's never reaches another's client.
+  const name = spec.variant ? `${spec.name}\u0001${spec.variant}` : spec.name;
+  return tenantKey(name, isOAuthServer(spec) ? tenant : undefined);
 }
 
 function tenantKey(name: string, tenant: McpTenant | undefined): string {

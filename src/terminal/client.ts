@@ -12,6 +12,7 @@ import type {
   ClientMessage,
   CollaborationConfig,
   McpReconnectResult,
+  McpRefreshResult,
   CompareState,
   CompareTargetSpec,
   DaemonMessage,
@@ -758,6 +759,39 @@ export class TerminalClient {
       const snap = t.checkpoint ? "" : list.checkpointsSupported ? "  [no snapshot]" : "";
       console.log(`${String(t.index).padStart(3)}. ${S(t.preview)}${tag}${snap}`);
     }
+  }
+
+  /** `codeoid mcp refresh` — apply Claude's current MCP config to a session (#395). */
+  async mcpRefresh(sessionIdOrName: string): Promise<void> {
+    const sessionId = await this.#resolveSession(sessionIdOrName);
+    if (!sessionId) return;
+    const resp = await this.#request({ type: "session.mcp_refresh", id: randomUUID(), sessionId });
+    if (resp.type !== "response.ok") {
+      this.#printError(resp);
+      process.exitCode = 1;
+      return;
+    }
+    const r = resp.data as McpRefreshResult;
+    console.log(
+      !r.changed
+        ? "MCP servers are up to date."
+        : r.deferred
+          ? "MCP servers changed: applied when the running turn ends."
+          : "MCP servers changed: the backend restarts with them on the next turn.",
+    );
+  }
+
+  /** `codeoid mcp approve` — approve a project's MCP server for every backend in the workdir (#395). */
+  async mcpApprove(sessionIdOrName: string, server: string, path?: string): Promise<void> {
+    const sessionId = await this.#resolveSession(sessionIdOrName);
+    if (!sessionId) return;
+    const resp = await this.#request({ type: "mcp.approve", id: randomUUID(), sessionId, server, ...(path ? { path } : {}) });
+    if (resp.type !== "response.ok") {
+      this.#printError(resp);
+      process.exitCode = 1;
+      return;
+    }
+    console.log(`${server}: approved for every backend in this workdir — run \`codeoid mcp refresh ${sessionIdOrName}\` to use it now.`);
   }
 
   /** `codeoid mcp reconnect` — redial one of the session backend's MCP servers (#389). */
