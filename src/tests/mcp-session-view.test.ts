@@ -89,6 +89,17 @@ describe("reading a workdir's servers", () => {
     expect((await readWorkdirServers(work, home)).find((w) => w.name === "a")?.claudeApproval).toBe("unset");
   });
 
+  it("asking git runs nothing a repo's own .git/config names", async () => {
+    mkdirSync(join(work, ".claude"));
+    writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { a: { command: "a" } } }));
+    writeFileSync(join(work, ".claude", "settings.local.json"), JSON.stringify({ enabledMcpjsonServers: ["a"] }));
+    git(work, "init", "-q");
+    const marker = join(tmp, "fsmonitor-ran");
+    git(work, "config", "core.fsmonitor", `touch ${marker}`);
+    await readWorkdirServers(work, home);
+    expect(await Bun.file(marker).exists()).toBe(false);
+  });
+
   it("a repo's shared settings.json can't approve its own servers", async () => {
     mkdirSync(join(work, ".claude"));
     writeFileSync(join(work, ".claude", "settings.json"), JSON.stringify({ enabledMcpjsonServers: ["a"], mcpServers: { a: { command: "a" } } }));

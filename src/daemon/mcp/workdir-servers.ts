@@ -106,13 +106,17 @@ export function fingerprintOf(raw: RawMcpServerConfig): string {
   return createHash("sha256").update(canon).digest("hex").slice(0, 32);
 }
 
+/** git run in a directory a repo controls: nothing in its `.git/config` may
+ *  run a command (an fsmonitor hook, a hooks path) on the daemon's behalf. */
+const SAFE_GIT = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"];
+
 /** Whether git reports `rel` as not tracked in the repo at `workdir`. False
  *  when it can't tell (not a repo, no git): then it isn't trusted as the user's. */
 async function untrackedInGit(workdir: string, rel: string): Promise<boolean> {
   try {
-    const inRepo = Bun.spawn(["git", "-C", workdir, "rev-parse", "--is-inside-work-tree"], { stdout: "ignore", stderr: "ignore" });
+    const inRepo = Bun.spawn(["git", ...SAFE_GIT, "-C", workdir, "rev-parse", "--is-inside-work-tree"], { stdout: "ignore", stderr: "ignore" });
     if ((await withTimeout(inRepo.exited, 2_000, inRepo)) !== 0) return false;
-    const tracked = Bun.spawn(["git", "-C", workdir, "ls-files", "--error-unmatch", "--", rel], { stdout: "ignore", stderr: "ignore" });
+    const tracked = Bun.spawn(["git", ...SAFE_GIT, "-C", workdir, "ls-files", "--error-unmatch", "--", rel], { stdout: "ignore", stderr: "ignore" });
     // Exactly 1 is "not tracked"; anything else (tracked, a timeout, an error) isn't trusted.
     return (await withTimeout(tracked.exited, 2_000, tracked)) === 1;
   } catch {
