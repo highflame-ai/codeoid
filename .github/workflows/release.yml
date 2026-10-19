@@ -89,7 +89,8 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          # Pinned (bump .bun-version on purpose): `latest` changes under us.
+          bun-version-file: .bun-version
 
       - name: Setup Node (npm publish + provenance)
         uses: actions/setup-node@v4

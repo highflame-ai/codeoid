@@ -28,7 +28,8 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          # Pinned (bump .bun-version on purpose): `latest` changes under us.
+          bun-version-file: .bun-version
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -79,7 +80,8 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          # Pinned (bump .bun-version on purpose): `latest` changes under us.
+          bun-version-file: .bun-version
 
       # Web consumes @codeoid/core + @codeoid/protocol via file: deps. When
       # bun installs those as symlinks, module resolution runs from the REAL
