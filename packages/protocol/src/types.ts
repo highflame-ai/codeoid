@@ -1720,8 +1720,8 @@ export interface McpApprovePreview {
    */
   /**
    * The whole entry as it's to be shown, one item per line — every value
-   * quoted, a run of spaces counted (`\u{20}×400`), a URL's host also in
-   * punycode when it isn't plain ASCII — so no layout can hide any of it.
+   * quoted, a run of spaces counted (`\u{20}×{400}`), a URL's host as the
+   * URL parser reads it (punycode for a look-alike) — so no layout can hide any of it.
    * Clients show these lines as they are.
    */
   lines: string[];

@@ -7391,13 +7391,14 @@ mcpHub: this.#mcpHub,
     const lines: string[] = [];
     if (commandLine !== null) lines.push(`command: ${commandLine}`);
     if (w.raw.url !== undefined) {
-      let host = "";
+      // The host it dials, as the URL parser reads it — a look-alike
+      // (Cyrillic "Ь"), userinfo (`api.github.com@evil.example`) or an
+      // encoded dot can't pass for another.
+      let host = "(not a valid URL)";
       try {
         host = new URL(w.raw.url).host;
       } catch {}
-      // A look-alike host (Cyrillic "Ь" for "b") reads plainly in punycode.
-      const plain = /^[\x21-\x7e]+$/.test(w.raw.url);
-      lines.push(`url: ${quotedVisible(w.raw.url)}${host && !plain ? ` (host: ${host})` : ""}`);
+      lines.push(`url: ${quotedVisible(w.raw.url)} (host: ${quotedVisible(host)})`);
     }
     const block = (label: string, o: Record<string, string> | undefined, sep: string) => {
       const entries = Object.entries(o ?? {});

@@ -83,7 +83,8 @@ export class SessionMcpView implements McpServerView {
   #layer: McpServerSpec[] = [];
   /** The global servers applied (this session's snapshot); null: the registry's own. */
   #globals: McpServerSpec[] | null = null;
-  /** The project's .mcp.json couldn't be read, last time: which names it declares is unknown. */
+  /** The project's .mcp.json couldn't be read, last read / when applied: which names it declares is unknown. */
+  #readRepoUnreadable = false;
   #repoUnreadable = false;
   /** The names the project's .mcp.json declared when applied: left to a backend that reads it itself. */
   #mcpJsonNames: ReadonlySet<string> = new Set();
@@ -122,6 +123,7 @@ export class SessionMcpView implements McpServerView {
     this.#layer = layer;
     this.#globals = globals;
     this.#mcpJsonNames = mcpJsonNames;
+    this.#repoUnreadable = this.#readRepoUnreadable;
     this.#fingerprint = fingerprint;
     this.#loaded = true;
     const after = new Map(this.ownSpecs().map((s) => [keyOf(s), s]));
@@ -264,10 +266,16 @@ export class SessionMcpView implements McpServerView {
       this.#opts.readGlobal ? this.#opts.readGlobal() : readGlobalServers(),
     ]);
     if (read) {
-      const { servers, repoUnreadable } = Array.isArray(read) ? { servers: read, repoUnreadable: false } : read;
-      // A .mcp.json that can't be read: the project's servers stay as last known.
-      this.#read = repoUnreadable ? [...servers, ...this.#read.filter((w) => w.origin === "claude-repo")] : servers;
-      this.#repoUnreadable = repoUnreadable;
+      const { servers, repoUnreadable, claudeApprovalOf } = Array.isArray(read)
+        ? { servers: read, repoUnreadable: false, claudeApprovalOf: undefined }
+        : read;
+      // A .mcp.json that can't be read: the project's servers stay as last
+      // known — under Claude Code's approval as it is now (revoking it still counts).
+      const kept = this.#read
+        .filter((w) => w.origin === "claude-repo")
+        .map((w) => (claudeApprovalOf ? { ...w, claudeApproval: claudeApprovalOf(w.name) } : w));
+      this.#read = repoUnreadable ? [...servers, ...kept] : servers;
+      this.#readRepoUnreadable = repoUnreadable;
     }
     if (global) this.#readGlobals = global;
   }

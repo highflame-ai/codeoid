@@ -9,7 +9,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, setSystemTime } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CodeoidConfig, RawMcpServerConfig } from "../config.js";
@@ -18,7 +18,7 @@ import { importClaudeMcpServers } from "../daemon/mcp/import-claude.js";
 import { McpOAuth } from "../daemon/mcp/oauth.js";
 import { McpRegistry, normalizeSpec } from "../daemon/mcp/registry.js";
 import { mcpSpecKey, SessionMcpView } from "../daemon/mcp/session-view.js";
-import { fingerprintOf, projectDeclaredNames, readGlobalServers, readWorkdirServers, type WorkdirServer } from "../daemon/mcp/workdir-servers.js";
+import { fingerprintOf, projectDeclaredNames, readGlobalServers, readWorkdirServers, type WorkdirRead, type WorkdirServer } from "../daemon/mcp/workdir-servers.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
 import type { ProviderEvent } from "../daemon/providers/interface.js";
 import { ProviderRegistry } from "../daemon/providers/registry.js";
@@ -135,7 +135,7 @@ describe("reading a workdir's servers", () => {
     expect(read.repoUnreadable).toBe(true);
     expect(read.servers.map((w) => w.name)).toEqual(["mine"]);
     rmSync(join(work, ".mcp.json"));
-    expect(await readWorkdirServers(work, home)).toEqual({ servers: [expect.objectContaining({ name: "mine" })], repoUnreadable: false });
+    expect(await readWorkdirServers(work, home)).toMatchObject({ servers: [expect.objectContaining({ name: "mine" })], repoUnreadable: false });
   });
 
   it("an edit to an entry is a new fingerprint", () => {
@@ -332,7 +332,9 @@ describe("a session's view", () => {
 
   it("a .mcp.json that can't be read keeps the project's servers as they were, and takes the user's own afresh", async () => {
     const repo = entry("team", "claude-repo", raw({ command: "t" }), "approved");
-    let read: { servers: WorkdirServer[]; repoUnreadable: boolean } = { servers: [repo, entry("mine", "claude-local", raw({ command: "m" }))], repoUnreadable: false };
+    let claudeSays: WorkdirServer["claudeApproval"] = "approved";
+    const claudeApprovalOf = () => claudeSays;
+    let read: WorkdirRead = { servers: [repo, entry("mine", "claude-local", raw({ command: "m" }))], repoUnreadable: false, claudeApprovalOf };
     const v = new SessionMcpView(new McpRegistry({}, { memoryEnabled: false }), null, {
       workdir: "/w",
       tenant: TENANT,
@@ -341,11 +343,55 @@ describe("a session's view", () => {
       readGlobal: async () => null,
     });
     await v.load();
-    read = { servers: [entry("mine2", "claude-local", raw({ command: "m2" }))], repoUnreadable: true };
+    read = { servers: [entry("mine2", "claude-local", raw({ command: "m2" }))], repoUnreadable: true, claudeApprovalOf };
+    expect(v.leftToBackend("anything", "qwen")).toBe(false); // not until it's applied
     await v.load();
     expect(v.forNativeMount("codex").map((s) => s.name).sort()).toEqual(["mine2", "team"]);
     expect(v.leftToBackend("anything", "qwen")).toBe(true); // which names it declares is unknown
     expect(v.leftToBackend("anything", "codex")).toBe(false);
+    claudeSays = "denied"; // withdrawn in Claude Code while the file still can't be read
+    expect((await v.load()).changed).toBe(true);
+    expect(v.forNativeMount("codex").map((s) => s.name)).toEqual(["mine2"]);
+  });
+
+  it("Claude's project servers are read from the workdir and every directory above it; Codex's project config rules nothing out", () => {
+    const sub = join(work, "packages", "api");
+    mkdirSync(sub, { recursive: true });
+    writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { root: {} } }));
+    writeFileSync(join(sub, ".mcp.json"), JSON.stringify({ mcpServers: { leaf: {} } }));
+    expect(projectDeclaredNames(sub, "claude")).toEqual(new Set(["root", "leaf"]));
+    expect(projectDeclaredNames(sub, "qwen")).toEqual(new Set(["leaf"])); // Qwen reads its cwd's only
+    expect(projectDeclaredNames(sub, "codex")).toEqual(new Set());
+    mkdirSync(join(work, ".codex"));
+    writeFileSync(join(work, ".codex", "config.toml"), "[mcp_servers.github]\ncommand = 'x'\n");
+    expect(projectDeclaredNames(sub, "codex")).toBeNull();
+  });
+
+  it("an edit that keeps a project file's size and puts its mtime back is still seen", async () => {
+    const file = join(work, ".mcp.json");
+    const later = () => setSystemTime(new Date(Date.now() + 10_000)); // past the window a recent change is re-read in
+    try {
+      writeFileSync(file, JSON.stringify({ mcpServers: { aaaa: {} } }));
+      utimesSync(file, 1_000_000, 1_000_000); // a whole-second mtime, so it can be put back exactly
+      later();
+      expect(projectDeclaredNames(work, "qwen")).toEqual(new Set(["aaaa"])); // cached
+      setSystemTime();
+      await Bun.sleep(30); // a later tick of the kernel's coarse file clock, as a real edit would be
+      writeFileSync(file, JSON.stringify({ mcpServers: { bbbb: {} } }));
+      utimesSync(file, 1_000_000, 1_000_000);
+      expect(statSync(file).mtimeMs).toBe(1_000_000_000);
+      later(); // the cache would be trusted now: only the change time tells
+      expect(projectDeclaredNames(work, "qwen")).toEqual(new Set(["bbbb"]));
+      // A read taken while the file was just changed isn't kept: an edit in the same tick can't hide behind it.
+      setSystemTime();
+      writeFileSync(file, JSON.stringify({ mcpServers: { cccc: {} } }));
+      expect(projectDeclaredNames(work, "qwen")).toEqual(new Set(["cccc"]));
+      writeFileSync(file, JSON.stringify({ mcpServers: { dddd: {} } })); // same size, quite possibly the same tick
+      later();
+      expect(projectDeclaredNames(work, "qwen")).toEqual(new Set(["dddd"]));
+    } finally {
+      setSystemTime();
+    }
   });
 
   it("which names a backend's own project files declare, read as they are now — unknown when one can't be read", () => {
@@ -356,6 +402,9 @@ describe("a session's view", () => {
     expect(projectDeclaredNames(work, "qwen")).toEqual(new Set(["a"]));
     expect(projectDeclaredNames(work, "gemini-cli")).toEqual(new Set(["g"]));
     expect(projectDeclaredNames(work, "codex")).toEqual(new Set());
+    // The CLIs' settings files are JSONC: comments and trailing commas read fine.
+    writeFileSync(join(work, ".gemini", "settings.json"), '{ // ours\n "mcpServers": { "g": {}, /* x */ "h": {"url": "http://a//b"}, },\n}');
+    expect(projectDeclaredNames(work, "gemini-cli")).toEqual(new Set(["g", "h"]));
     writeFileSync(join(work, ".mcp.json"), '{"mcpServers": {"a": {}, "b": ');
     expect(projectDeclaredNames(work, "qwen")).toBeNull();
   });
@@ -522,6 +571,8 @@ describe("approve and refresh, through the session manager", () => {
         return p;
       },
     });
+    // A second backend to switch to.
+    if (providerId !== "codex") providers.register({ id: "codex", displayName: "codex", create: () => new MockSessionProvider("codex", []) });
     const config = {
       daemonUrl: "ws://127.0.0.1:7400",
       dbPath: join(tmp, "codeoid.db"),
@@ -555,6 +606,28 @@ describe("approve and refresh, through the session manager", () => {
   const approve = (m: SessionManager, sid: string, row: ClaudeConfigMcpServer, a = auth(ALL)) =>
     m.handle({ type: "mcp.approve", id: "a", sessionId: sid, server: row.name, path: row.path, fingerprint: row.fingerprint! }, a, client);
 
+  it("a project server is on the record once codeoid runs it — after a switch from Claude (which runs its own) too", async () => {
+    writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { team: { command: "team-mcp" } } }));
+    claudeJson({ [work]: { enabledMcpjsonServers: ["team"] } });
+    const m = manager();
+    const sid = await session(m);
+    const s = m._sessionForTest(sid)!;
+    const applied = () => {
+      const db = new Database(join(tmp, "codeoid.db"), { readonly: true });
+      const r = db.query("SELECT detail FROM audit_log WHERE action = 'mcp.workdir_server_applied'").all() as Array<{ detail: string }>;
+      db.close();
+      return r.map((a) => a.detail);
+    };
+    await s.send("hi", auth(ALL));
+    for (let i = 0; i < 100 && s.status !== "idle"; i++) await Bun.sleep(5);
+    expect(applied()).toEqual([]); // on Claude, Claude runs it
+    const switcher = auth([...ALL, SCOPES.SESSION_APPROVE]);
+    expect(await m.handle({ type: "session.set_provider", id: "sp", sessionId: sid, providerId: "codex" }, switcher, client)).toMatchObject({ type: "response.ok" });
+    await s.send("again", auth(ALL));
+    for (let i = 0; i < 100 && applied().length === 0; i++) await Bun.sleep(5);
+    expect(applied()).toEqual([expect.stringMatching(/^server="team" fingerprint=[0-9a-f]{32} approvedIn=claude backend=codex$/)]);
+  });
+
   it("the drawer says how far each server reaches; approving what it showed takes it everywhere", async () => {
     claudeJson({ [work]: { mcpServers: { mine: { command: "my-mcp" } } } });
     writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { team: { command: "team-mcp" } } }));
@@ -580,7 +653,7 @@ describe("approve and refresh, through the session manager", () => {
     const db2 = new Database(join(tmp, "codeoid.db"), { readonly: true });
     const applied = db2.query("SELECT detail FROM audit_log WHERE action = 'mcp.workdir_server_applied'").all() as Array<{ detail: string }>;
     db2.close();
-    expect(applied.map((a) => a.detail)).toEqual([`server="team" fingerprint=${team.fingerprint} approvedIn=codeoid`]);
+    expect(applied.map((a) => a.detail)).toEqual([`server="team" fingerprint=${team.fingerprint} approvedIn=codeoid backend=codex`]);
   });
 
   it("approves only the entry that was shown: one changed since is refused", async () => {
@@ -737,8 +810,8 @@ describe("approve and refresh, through the session manager", () => {
     expect(await m.handle({ type: "mcp.approve.preview", id: "p", sessionId: sid, server: "nope" }, auth(ALL), client)).toMatchObject({ code: "not_found" });
   });
 
-  const declarations = {
-    none: () => {},
+  const declarations: Record<string, () => unknown> = {
+    none: () => undefined,
     ".mcp.json": () => {
       writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { github: { command: "repo-github" } } }));
       claudeJson({ [work]: { enabledMcpjsonServers: ["github"] } });
@@ -748,14 +821,23 @@ describe("approve and refresh, through the session manager", () => {
       writeFileSync(join(work, ".qwen", "settings.json"), JSON.stringify({ mcpServers: { github: { command: "repo-github" } } }));
     },
     "an unreadable .mcp.json": () => writeFileSync(join(work, ".mcp.json"), `{"mcpServers": {"github": {"command": "x"}}${" ".repeat(10)}`),
+    "a name whose tools start like github's (github__x)": () => {
+      writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { github__x: { command: "x" } } }));
+      return "mcp__github__x__search"; // the repo's tool, named as github's would start
+    },
+    "a name the CLI maps onto github's (GitHub)": () => writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { GitHub: { command: "x" } } })),
+    ".qwen/settings.json with comments": () => {
+      mkdirSync(join(work, ".qwen"));
+      writeFileSync(join(work, ".qwen", "settings.json"), `{ // the team's\n "mcpServers": { "github": { "command": "x" }, },\n}`);
+    },
   };
   for (const [what, setUp] of Object.entries(declarations)) {
     const declared = what !== "none";
     it(`a readonly trust ${declared ? `doesn't reach a name Qwen may load from the project (${what})` : "auto-approves its tools on Qwen"}`, async () => {
-      setUp();
+      const toolName = (setUp() as string | undefined) ?? "mcp__github__delete_repo";
       const registry = new McpRegistry({ github: raw({ command: "gh-mcp", trust: "readonly" }) }, { memoryEnabled: false });
       const providers: MockSessionProvider[] = [];
-      const tool = { type: "tool_start", toolId: "t1", sdkToolUseId: "s1", name: "mcp__github__delete_repo", input: {}, approvalId: "a1" } as ProviderEvent;
+      const tool = { type: "tool_start", toolId: "t1", sdkToolUseId: "s1", name: toolName, input: {}, approvalId: "a1" } as ProviderEvent;
       const m = manager(() => new MockSessionProvider("qwen", [[tool]], { stall: true }), (p) => providers.push(p), "qwen", registry);
       const sid = await session(m);
       await m._sessionForTest(sid)!.send("go", auth(ALL));
@@ -779,11 +861,24 @@ describe("approve and refresh, through the session manager", () => {
     const sid = await session(m);
     const r = (await m.handle({ type: "mcp.approve.preview", id: "p", sessionId: sid, server: "team" }, auth(ALL), client)) as { data: McpApprovePreview };
     expect(r.data.lines).toEqual([
-      'url: "https://api.githuЬ.com/mcp" (host: api.xn--githu-10e.com)',
+      'url: "https://api.githuЬ.com/mcp" (host: "api.xn--githu-10e.com")',
       "headers (2):",
-      '  "A": "x\\u{20}×400y"',
+      '  "A": "x\\u{20}×{400}y"',
       '  "B": "a\\u{3164}b"',
     ]);
+  });
+
+  it("a readonly trust doesn't reach a project name the CLI turns into the trusted one's tool prefix (my.db → mcp__my_db__)", async () => {
+    writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { "my.db": { command: "repo-db" } } }));
+    const registry = new McpRegistry({ my_db: raw({ command: "db-mcp", trust: "readonly" }) }, { memoryEnabled: false });
+    const providers: MockSessionProvider[] = [];
+    const tool = { type: "tool_start", toolId: "t1", sdkToolUseId: "s1", name: "mcp__my_db__drop", input: {}, approvalId: "a1" } as ProviderEvent;
+    const m = manager(() => new MockSessionProvider("qwen", [[tool]], { stall: true }), (p) => providers.push(p), "qwen", registry);
+    const sid = await session(m);
+    await m._sessionForTest(sid)!.send("go", auth(ALL));
+    for (let i = 0; i < 200 && m._sessionForTest(sid)!.status !== "waiting_approval" && !providers[0]?.canUseToolResults.length; i++) await Bun.sleep(5);
+    expect(providers[0]!.canUseToolResults).toEqual([]);
+    expect(m._sessionForTest(sid)!.status).toBe("waiting_approval");
   });
 
   it("opening the drawer applies nothing", async () => {

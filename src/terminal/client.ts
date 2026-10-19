@@ -796,7 +796,7 @@ export class TerminalClient {
       for (const line of p.lines) console.log(clean(`  ${line}`));
       console.log("  (shown exactly as it runs; characters that wouldn't show are escaped as \\u{…}, and a run of spaces counted)");
       console.log("  (an env value that is exactly ${VAR} resolves from the daemon's environment when it starts; header values are sent as written)");
-      console.log(`To approve exactly this entry: codeoid mcp approve ${sessionIdOrName} ${p.server} --path ${clean(JSON.stringify(p.path))} --yes ${p.fingerprint}`);
+      console.log(`To approve exactly this entry: codeoid mcp approve ${sessionIdOrName} ${p.server} --path ${clean(`'${p.path.replace(/'/g, "'\\''")}'`)} --yes ${p.fingerprint}`);
       return;
     }
     // The entry reviewed, not whatever is in the file now.

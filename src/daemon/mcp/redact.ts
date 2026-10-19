@@ -229,9 +229,9 @@ export function visibleVerbatim(text: string): string {
   );
 }
 
-/** {@link visibleVerbatim}, with a run of spaces counted (`\u{20}×400`) so padding can't push the rest out of view. */
+/** {@link visibleVerbatim}, with a run of spaces counted (`\u{20}×{400}`) so padding can't push the rest out of view. */
 export function visibleCompact(text: string): string {
-  return visibleVerbatim(text).replace(/ {3,}/g, (run) => `\\u{20}×${run.length}`);
+  return visibleVerbatim(text).replace(/ {3,}/g, (run) => `\\u{20}×{${run.length}}`);
 }
 
 /** A value shown quoted, so its ends — and where it stops — are plain. */

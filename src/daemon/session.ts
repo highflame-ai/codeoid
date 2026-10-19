@@ -124,7 +124,7 @@ import { McpRegistry } from "./mcp/registry.js";
 import { mcpSpecKey, SessionMcpView, type WorkdirReach } from "./mcp/session-view.js";
 import { projectDeclaredNames } from "./mcp/workdir-servers.js";
 import type { McpTenant } from "./mcp/oauth.js";
-import type { McpServerSpec } from "./mcp/types.js";
+import { mcpToolPrefix, type McpServerSpec } from "./mcp/types.js";
 
 /** Backends that start a new conversation after a teardown, so are handed the history again (the Gemini CLI: a new ACP session, no resume). */
 const RESEED_AFTER_TEARDOWN = new Set(["gemini-cli"]);
@@ -849,6 +849,10 @@ export class Session {
   #mcpBuiltWith: string | undefined;
   /** This session's own servers whose hub clients it holds (keyed as the view keys them). */
   readonly #mcpRetained = new Map<string, McpServerSpec>();
+  /** Server names the backend's own project files declared since it was built (`#isReadonlyMcpTool`). */
+  readonly #mcpProjectNames = new Set<string>();
+  /** Project servers already audited as run, per backend (`#auditRepoServers`). */
+  readonly #mcpAudited = new Set<string>();
   /** Ones it no longer uses, let go once the backend that may still be calling them is rebuilt. */
   readonly #mcpToRelease = new Map<string, McpServerSpec>();
   #mcpHub?: McpHub;
@@ -1915,6 +1919,8 @@ export class Session {
     }
     if (this.#destroyed) return;
     await this.#rebuildForMcp();
+    this.#auditRepoServers(); // a backend switched to, or a sign-in hold that lapsed
+    this.#noteProjectMcpNames(); // what the backend may load for this turn
   }
 
   /**
@@ -1974,12 +1980,6 @@ export class Session {
       if (this.#mcpToRelease.has(key)) this.#mcpToRelease.delete(key); // back in use: still held
       else this.#mcpHub?.retain(spec, this.#mcpTenant());
       this.#mcpRetained.set(key, spec);
-      // A project's server now runs for this session's backend: on the record,
-      // with whose approval (not on Claude, which runs its own copy).
-      const consent = this.#mcpView!.repoConsent(spec);
-      if (consent && this.#mcpView!.forBackend(this.providerId).some((s) => mcpSpecKey(s) === key)) {
-        this.#store.audit(this.createdBy, "mcp.workdir_server_applied", this.id, `server=${JSON.stringify(spec.name)} fingerprint=${spec.variant} approvedIn=${consent}`);
-      }
     }
     for (const [key, spec] of this.#mcpRetained) {
       if (now.has(key)) continue;
@@ -1987,6 +1987,30 @@ export class Session {
       this.#mcpToRelease.set(key, spec);
     }
     if (this.#mcpBuiltWith === undefined || !this.#mcpRebuildDue()) this.#releaseMcp();
+    this.#auditRepoServers();
+  }
+
+  /**
+   * Each project server codeoid runs for this session's backend goes on the
+   * record once per backend, with whose approval — when it's first mounted:
+   * on a load, after a switch to a backend that runs it, or once a sign-in
+   * hold lapses (Claude runs its own copy, so not there).
+   */
+  #auditRepoServers(): void {
+    const view = this.#mcpView;
+    if (!view?.loaded) return;
+    for (const spec of view.forBackend(this.providerId)) {
+      const consent = view.repoConsent(spec);
+      const key = `${this.providerId}\u0000${mcpSpecKey(spec)}`;
+      if (!consent || this.#mcpAudited.has(key)) continue;
+      this.#mcpAudited.add(key);
+      this.#store.audit(
+        this.createdBy,
+        "mcp.workdir_server_applied",
+        this.id,
+        `server=${JSON.stringify(spec.name)} fingerprint=${spec.variant} approvedIn=${consent} backend=${this.providerId}`,
+      );
+    }
   }
 
   /** Let go of the servers this session stopped using (its backend no longer can reach them). */
@@ -3540,6 +3564,7 @@ export class Session {
     // stopped using.
     if (this.#mcpView?.loaded) this.#mcpBuiltWith = this.#mcpView.fingerprint;
     this.#releaseMcp();
+    this.#mcpProjectNames.clear(); // the next backend reads its project files afresh
     try { await taskToAwait; } catch { /* consumer handles its own errors */ }
     // teardown() aborts the SDK query, so any sub-agent still in flight will
     // never get its SubagentStop hook. This is the setModel / rotate /
@@ -5232,22 +5257,41 @@ export class Session {
    *  built-in memory tools. */
   #isReadonlyMcpTool(toolName: string): boolean {
     if (!toolName.startsWith("mcp__")) return false;
-    // In a session's view, only what this backend mounts — never a name the
-    // project declares in a file the backend loads itself (.mcp.json,
-    // .qwen/ or .gemini/settings.json): those tools may be the repo's server,
-    // not the one trusted (#395).
-    // The backend's project files are read as they are now: a backend rebuilt
-    // since the view was applied reads them afresh. One that can't be read
-    // rules nothing out.
     const view = this.#mcpView;
-    const declared = projectDeclaredNames(this.workdir, this.providerId);
-    const specs = view
-      ? view.forBackend(this.providerId).filter((spec) => declared !== null && !declared.has(spec.name) && !view.leftToBackend(spec.name, this.providerId))
-      : (this.#mcpRegistry?.list() ?? []);
-    for (const spec of specs) {
+    if (!view) {
+      for (const spec of this.#mcpRegistry?.list() ?? []) {
+        if (spec.trust === "readonly" && toolName.startsWith(`mcp__${spec.name}__`)) return true;
+      }
+      return false;
+    }
+    // A backend that loads project files itself (.mcp.json, .qwen/ or
+    // .gemini/settings.json, .codex/config.toml) may be running the repo's
+    // server under a tool name like a trusted one's: its tools never get a
+    // readonly trust (#395). Matched by tool name, as the backend makes it —
+    // so `github__x` (tools `mcp__github__x__…`) or `my.db` (`mcp__my_db__…`)
+    // can't pass for `github` or `my_db`. Names from every check since the
+    // backend was built count (it may hold one since edited out); a file that
+    // can't be read rules nothing out.
+    if (!this.#noteProjectMcpNames()) return false;
+    const lower = toolName.toLowerCase();
+    for (const name of this.#mcpProjectNames) {
+      for (const prefix of new Set([name, mcpToolPrefix(name), name.replace(/[^a-zA-Z0-9_.-]/g, "_")])) {
+        if (lower.startsWith(`mcp__${prefix.toLowerCase()}__`)) return false;
+      }
+    }
+    for (const spec of view.forBackend(this.providerId)) {
+      if (view.leftToBackend(spec.name, this.providerId)) continue;
       if (spec.trust === "readonly" && toolName.startsWith(`mcp__${spec.name}__`)) return true;
     }
     return false;
+  }
+
+  /** Add what the backend's project files declare now to what it may have loaded; false when one can't be read. */
+  #noteProjectMcpNames(): boolean {
+    const declared = projectDeclaredNames(this.workdir, this.providerId);
+    if (declared === null) return false;
+    for (const n of declared) this.#mcpProjectNames.add(n);
+    return true;
   }
 
   // ── Internals ─────────────────────────────────────────────────────────

@@ -500,7 +500,10 @@ const McpReach: Component<{ server: ClaudeConfigMcpServer; sessionId: string | n
             <div class="mb-1 whitespace-pre-wrap break-all text-fg-muted">
               This project's entry, from {p().shownPath} — once approved, every backend in this workdir runs it, with the daemon user's files and network:
             </div>
-            <pre class="whitespace-pre-wrap break-all font-mono">{p().lines.join("\n")}</pre>
+            {/* A line each, isolated left-to-right: right-to-left letters can't reorder one into another. */}
+            <pre class="whitespace-pre-wrap break-all font-mono">
+              <For each={p().lines}>{(line) => <div dir="ltr" style={{ "unicode-bidi": "isolate" }}>{line}</div>}</For>
+            </pre>
             <div class="mt-1 flex items-center gap-2">
               <button
                 type="button"

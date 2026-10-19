@@ -59,6 +59,8 @@ export interface WorkdirRead {
    *  JSON, too big): its servers aren't in `servers` — what was known of them
    *  stands, and nothing can be said about which names it declares. */
   repoUnreadable: boolean;
+  /** Claude Code's approval of a project server by name, as `~/.claude.json` says now. */
+  claudeApprovalOf(name: string): WorkdirServer["claudeApproval"];
 }
 
 /** The user's home as the rest of the daemon reads it (claude-config.ts):
@@ -109,7 +111,7 @@ export async function readWorkdirServers(workdir: string, home: string = homedir
   };
   add(project?.mcpServers, "claude-local", claudeJsonPath);
   add(mcpJson?.mcpServers, "claude-repo", mcpJsonPath);
-  return { servers: out, repoUnreadable: repoRead === UNREADABLE };
+  return { servers: out, repoUnreadable: repoRead === UNREADABLE, claudeApprovalOf: approval };
 }
 
 /** The user's global servers from `~/.claude.json` (cached by size and mtime),
@@ -225,47 +227,102 @@ function strings(x: unknown): string[] {
 
 /**
  * The project files each backend reads MCP servers from itself, beside
- * codeoid's mount: a tool from a name declared there may be the repo's
- * server, whatever codeoid's entry of that name is trusted with.
+ * codeoid's mount: a tool from a server declared there may be the repo's,
+ * whatever codeoid's entry of a like name is trusted with. Claude Code merges
+ * `.mcp.json` from the workdir and every directory above it (but `/`);
+ * Qwen reads the workdir's `.mcp.json` and `.qwen/settings.json`; the Gemini
+ * CLI its `.gemini/settings.json`. Codex can take servers from a project's
+ * `.codex/config.toml` (TOML, not read here): one anywhere up the tree means
+ * nothing can be ruled out.
  */
-const PROJECT_MCP_FILES: Record<string, readonly string[]> = {
-  claude: [".mcp.json"],
-  qwen: [".mcp.json", path.join(".qwen", "settings.json")],
-  "gemini-cli": [path.join(".gemini", "settings.json")],
-};
+function projectMcpFiles(workdir: string, backendId: string): { json: string[]; opaque: string[] } {
+  const up: string[] = [];
+  for (let d = path.resolve(workdir); d !== path.dirname(d); d = path.dirname(d)) up.push(d);
+  switch (backendId) {
+    case "claude":
+      return { json: up.map((d) => path.join(d, ".mcp.json")), opaque: [] };
+    case "qwen":
+      return { json: [path.join(workdir, ".mcp.json"), path.join(workdir, ".qwen", "settings.json")], opaque: [] };
+    case "gemini-cli":
+      return { json: [path.join(workdir, ".gemini", "settings.json")], opaque: [] };
+    case "codex":
+      return { json: [], opaque: up.map((d) => path.join(d, ".codex", "config.toml")) };
+    default:
+      return { json: [], opaque: [] };
+  }
+}
 
-const declaredCache = new Map<string, { mtimeMs: number; size: number; names: ReadonlySet<string> | null }>();
+/** A file changed this recently isn't trusted to its cache: file times are coarse. */
+const RACY_MS = 2000;
+
+/** By the file's identity and change time too: an agent can set mtime back, not ctime. */
+const declaredCache = new Map<string, { stamp: string; names: ReadonlySet<string> | null }>();
 
 /**
- * The server names `backendId`'s own project files in `workdir` declare, as
- * they are now (cached by size and mtime) — or null when one is there but
- * can't be read, so nothing can be ruled out.
+ * The server names `backendId`'s own project files for `workdir` declare, as
+ * they are now (cached per file by identity, size and times) — or null when
+ * one is there but can't be read, so nothing can be ruled out.
  */
 export function projectDeclaredNames(workdir: string, backendId: string): ReadonlySet<string> | null {
+  const { json, opaque } = projectMcpFiles(workdir, backendId);
+  for (const file of opaque) {
+    try {
+      statSync(file);
+      return null; // there, and not read here
+    } catch {}
+  }
   const out = new Set<string>();
-  for (const rel of PROJECT_MCP_FILES[backendId] ?? []) {
-    const file = path.join(workdir, rel);
+  for (const file of json) {
     let st: ReturnType<typeof statSync>;
     try {
       st = statSync(file);
     } catch {
       continue; // absent
     }
+    const stamp = `${st.dev}:${st.ino}:${st.size}:${st.mtimeMs}:${st.ctimeMs}`;
     const hit = declaredCache.get(file);
     let names: ReadonlySet<string> | null;
-    if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) {
+    if (hit && hit.stamp === stamp) {
       names = hit.names;
     } else {
       names = null;
       try {
         if (st.isFile() && st.size <= MAX_REPO_FILE_BYTES) {
-          names = new Set(Object.keys(asObject(asObject(JSON.parse(readFileSync(file, "utf8")))?.mcpServers) ?? {}));
+          // The CLIs' settings files allow comments (JSONC).
+          const text = readFileSync(file, "utf8");
+          names = new Set(Object.keys(asObject(asObject(JSON.parse(withoutJsonComments(text)))?.mcpServers) ?? {}));
         }
       } catch {}
-      declaredCache.set(file, { mtimeMs: st.mtimeMs, size: st.size, names });
+      // A file changed within the clock's grain could change again with the
+      // same times (as git treats a "racy" entry): what was read of it then isn't kept.
+      if (Date.now() - Math.max(st.mtimeMs, st.ctimeMs) > RACY_MS) declaredCache.set(file, { stamp, names });
+      else declaredCache.delete(file);
     }
     if (!names) return null;
     for (const n of names) out.add(n);
   }
   return out;
+}
+
+/** JSON with `//` and `/* *\/` comments (and trailing commas) made plain JSON; strings left alone. */
+function withoutJsonComments(text: string): string {
+  let out = "";
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]!;
+    if (c === '"') {
+      let j = i + 1;
+      while (j < text.length && text[j] !== '"') j += text[j] === "\\" ? 2 : 1;
+      out += text.slice(i, j + 1);
+      i = j;
+    } else if (c === "/" && text[i + 1] === "/") {
+      while (i < text.length && text[i] !== "\n") i++;
+      out += "\n";
+    } else if (c === "/" && text[i + 1] === "*") {
+      const end = text.indexOf("*/", i + 2);
+      i = end < 0 ? text.length : end + 1;
+    } else {
+      out += c;
+    }
+  }
+  return out.replace(/,(\s*[}\]])/g, "$1");
 }

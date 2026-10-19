@@ -39,7 +39,6 @@ This page says where each kind of server comes from, which backends it reaches, 
   - Approving in codeoid also covers a server you denied in Claude Code: the two approvals are separate.
 - **Claude** always loads its own copies of Claude's servers (the Claude CLI reads its config itself); codeoid adds the rest of the registry.
 - **Qwen** reads a project's `.mcp.json` itself, under its own rules rather than codeoid's approval (measured: codeoid's copy of the same name is overridden by Qwen's own), so on Qwen every name the `.mcp.json` declares is left to Qwen.
-  Since those tools may be the repo's server, a `readonly` trust you gave a server of that name doesn't make them run without asking — on Qwen or on Claude, which reads the file too.
   Your own servers of other names still reach Qwen through codeoid.
 
 A project's server runs in the project's directory, as each backend that reads it runs it.
@@ -48,6 +47,13 @@ It can't ask, through a `${VAR}` reference in its environment, for codeoid's own
 Its name must be plain (letters, digits, `.`, `_`, `-`; no `__`, not starting with `mcp__`), so its tools can't pass for another server's.
 
 The capabilities drawer says, for each of Claude's servers, whether it reaches the session's other backends, and if not, why.
+
+## A `readonly` trust and a project's own servers
+
+Claude Code, Qwen, the Gemini CLI and Codex can load MCP servers from project files themselves: Claude Code `.mcp.json` from the workdir and every directory above it, Qwen the workdir's `.mcp.json` and `.qwen/settings.json`, the Gemini CLI `.gemini/settings.json`, Codex a project's `.codex/config.toml`.
+A tool from one of those may be the repo's server under a name like one you trust, so on those backends a `readonly` trust never auto-approves a tool whose name starts the way such a server's tools do — matched as the CLI names tools (`my.db` gives `mcp__my_db__…`; `github__x` gives `mcp__github__x__…`).
+Names seen since the backend started count, even once edited out of the file.
+If one of those files can't be read (or, for Codex, exists at all — codeoid doesn't read its TOML), no tool on that backend is treated as readonly: each asks.
 
 ## When two entries share a name
 
