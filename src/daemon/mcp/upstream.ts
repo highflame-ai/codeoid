@@ -173,7 +173,12 @@ export function upstreamFetch(opts: UpstreamOptions): typeof fetch {
   const wrapped = async (url: string | URL | Request, init?: RequestInit): Promise<Response> => {
     if (!oauth) {
       const resp = await send(url, init, undefined);
-      if (resp.status === 401 && /^\s*Bearer\b/i.test(resp.headers.get("www-authenticate") ?? "")) {
+      // The MCP sign-in challenge (a resource-metadata pointer), to a server
+      // given no credentials of its own: a 401 for a static token that expired
+      // is that token's problem, not a sign-in to adopt.
+      const challenge = resp.headers.get("www-authenticate") ?? "";
+      const credentialed = transport.bearerTokenEnv !== undefined || Object.keys(transport.headers ?? {}).some((k) => k.toLowerCase() === "authorization");
+      if (resp.status === 401 && !credentialed && /^\s*Bearer\b/i.test(challenge) && /resource_metadata\s*=/i.test(challenge)) {
         await resp.body?.cancel().catch(() => {});
         throw new McpServerWantsSignIn(name);
       }

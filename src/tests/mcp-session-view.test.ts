@@ -1,24 +1,26 @@
 /**
  * A session's view of its MCP servers (#395): the daemon-wide registry plus
  * its own workdir's Claude servers — the user's own always, a repo's once
- * approved (in Claude or codeoid) — with codeoid's own entries winning, the
- * Claude CLI left to load its own copies, and a server that wants an OAuth
- * sign-in held back from the backends that would only get 401s from it.
+ * approved (in Claude's own ~/.claude.json, or in codeoid for that exact
+ * entry) — with codeoid's own entries winning, the backends that read a
+ * project's .mcp.json themselves left to it, and a server that wants an OAuth
+ * sign-in held back (per tenant) from the backends that would only get 401s.
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CodeoidConfig, RawMcpServerConfig } from "../config.js";
 import { McpHub } from "../daemon/mcp/hub.js";
+import { importClaudeMcpServers } from "../daemon/mcp/import-claude.js";
 import { McpOAuth } from "../daemon/mcp/oauth.js";
 import { McpRegistry } from "../daemon/mcp/registry.js";
 import { SessionMcpView } from "../daemon/mcp/session-view.js";
 import { fingerprintOf, readWorkdirServers, type WorkdirServer } from "../daemon/mcp/workdir-servers.js";
-import { importClaudeMcpServers } from "../daemon/mcp/import-claude.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
+import type { ProviderEvent } from "../daemon/providers/interface.js";
 import { ProviderRegistry } from "../daemon/providers/registry.js";
 import { SessionManager } from "../daemon/session-manager.js";
 import { Store } from "../daemon/store.js";
@@ -42,6 +44,9 @@ afterEach(() => {
   rmSync(tmp, { recursive: true, force: true });
 });
 
+const TENANT = { accountId: "a", projectId: "p" };
+const OTHER = { accountId: "b", projectId: "q" };
+
 const raw = (p: Partial<RawMcpServerConfig>): RawMcpServerConfig =>
   ({ args: [], env: {}, headers: {}, trust: "prompt", scope: "workspace", enabled: true, native: false, ...p }) as RawMcpServerConfig;
 
@@ -49,13 +54,8 @@ function claudeJson(projects: Record<string, unknown>, top: Record<string, unkno
   writeFileSync(join(home, ".claude.json"), JSON.stringify({ mcpServers: top, projects }));
 }
 
-function git(dir: string, ...args: string[]): void {
-  const r = Bun.spawnSync(["git", "-C", dir, ...args], { stdout: "ignore", stderr: "ignore", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" } });
-  if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")} failed`);
-}
-
 describe("reading a workdir's servers", () => {
-  it("the user's own count; a repo's carries Claude's approval of it", async () => {
+  it("the user's own count; a repo's carries Claude's approval from the user's ~/.claude.json", async () => {
     claudeJson({ [work]: { mcpServers: { mine: { command: "my-mcp" } }, enabledMcpjsonServers: ["ok"], disabledMcpjsonServers: ["no"] } });
     writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { ok: { command: "a" }, no: { command: "b" }, unasked: { command: "c" } } }));
     const read = await readWorkdirServers(work, home);
@@ -74,36 +74,37 @@ describe("reading a workdir's servers", () => {
     expect(read.find((w) => w.name === "no")?.claudeApproval).toBe("denied");
   });
 
-  it("trusts approvals in the project's settings.local.json only when git says it isn't the repo's", async () => {
-    mkdirSync(join(work, ".claude"));
+  it("no file in the workdir can approve the repo's servers — however it got there", async () => {
     writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { a: { command: "a" } } }));
-    writeFileSync(join(work, ".claude", "settings.local.json"), JSON.stringify({ enabledMcpjsonServers: ["a"] }));
-    // Not a git repo: can't tell whose it is — not trusted.
-    expect((await readWorkdirServers(work, home)).find((w) => w.name === "a")?.claudeApproval).toBe("unset");
-    git(work, "init", "-q");
-    // Untracked (as Claude Code leaves it): the user's.
-    expect((await readWorkdirServers(work, home)).find((w) => w.name === "a")?.claudeApproval).toBe("approved");
-    // Committed by the repo: the repo approving its own servers — not trusted.
-    git(work, "add", "-f", ".claude/settings.local.json");
-    git(work, "commit", "-q", "-m", "x");
+    mkdirSync(join(work, "cfg"));
+    writeFileSync(join(work, "cfg", "settings.local.json"), JSON.stringify({ enableAllProjectMcpServers: true, enabledMcpjsonServers: ["a"] }));
+    symlinkSync(join(work, "cfg"), join(work, ".claude"));
     expect((await readWorkdirServers(work, home)).find((w) => w.name === "a")?.claudeApproval).toBe("unset");
   });
 
-  it("asking git runs nothing a repo's own .git/config names", async () => {
+  it("takes no servers from settings files (Claude Code doesn't), nor a .mcp.json that resolves outside the workdir", async () => {
     mkdirSync(join(work, ".claude"));
-    writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { a: { command: "a" } } }));
-    writeFileSync(join(work, ".claude", "settings.local.json"), JSON.stringify({ enabledMcpjsonServers: ["a"] }));
-    git(work, "init", "-q");
-    const marker = join(tmp, "fsmonitor-ran");
-    git(work, "config", "core.fsmonitor", `touch ${marker}`);
-    await readWorkdirServers(work, home);
-    expect(await Bun.file(marker).exists()).toBe(false);
+    writeFileSync(join(work, ".claude", "settings.json"), JSON.stringify({ mcpServers: { s: { command: "s" } } }));
+    writeFileSync(join(tmp, "elsewhere.json"), JSON.stringify({ mcpServers: { out: { command: "out" } } }));
+    symlinkSync(join(tmp, "elsewhere.json"), join(work, ".mcp.json"));
+    expect(await readWorkdirServers(work, home)).toEqual([]);
   });
 
-  it("a repo's shared settings.json can't approve its own servers", async () => {
-    mkdirSync(join(work, ".claude"));
-    writeFileSync(join(work, ".claude", "settings.json"), JSON.stringify({ enabledMcpjsonServers: ["a"], mcpServers: { a: { command: "a" } } }));
-    expect((await readWorkdirServers(work, home)).find((w) => w.name === "a")?.claudeApproval).toBe("unset");
+  it("skips names that could pass for another server's tools, and strips references to codeoid's own secrets", async () => {
+    writeFileSync(
+      join(work, ".mcp.json"),
+      JSON.stringify({
+        mcpServers: {
+          gh__x: { command: "a" },
+          mcp__codeoid_memory: { command: "a" },
+          "gіthub": { command: "a" }, // a Cyrillic і
+          ok: { command: "a", env: { KEY: "${CODEOID_API_KEY}", HOME_DIR: "${HOME}", T: "x${TELEGRAM_BOT_TOKEN}y" } },
+        },
+      }),
+    );
+    const read = await readWorkdirServers(work, home);
+    expect(read.map((w) => w.name)).toEqual(["ok"]);
+    expect(read[0]!.raw.env).toEqual({ KEY: "", HOME_DIR: "${HOME}", T: "xy" });
   });
 
   it("an edit to an entry is a new fingerprint", () => {
@@ -111,23 +112,26 @@ describe("reading a workdir's servers", () => {
     expect(fingerprintOf(raw({ command: "a", env: { X: "1", Y: "2" } }))).toBe(fingerprintOf(raw({ command: "a", env: { Y: "2", X: "1" } })));
   });
 
-  it("the daemon-wide import includes the user's settings files, the first file winning", () => {
+  it("the daemon-wide import is ~/.claude.json's global block only", () => {
     claudeJson({}, { a: { command: "from-claude-json" } });
     mkdirSync(join(home, ".claude"));
-    writeFileSync(join(home, ".claude", "settings.json"), JSON.stringify({ mcpServers: { a: { command: "later" }, b: { command: "b" } } }));
-    const imported = importClaudeMcpServers(home);
-    expect(imported.a?.command).toBe("from-claude-json");
-    expect(imported.b?.command).toBe("b");
+    writeFileSync(join(home, ".claude", "settings.json"), JSON.stringify({ mcpServers: { b: { command: "b" } } }));
+    expect(Object.keys(importClaudeMcpServers(home))).toEqual(["a"]);
   });
 });
 
-/** A view over `registry` with these workdir servers read. */
-function view(registry: McpRegistry, read: WorkdirServer[], opts: { hub?: McpHub; approvals?: Set<string> } = {}): SessionMcpView {
+/** A view over `registry` with these workdir servers read (and no global re-read unless given). */
+function view(
+  registry: McpRegistry,
+  read: WorkdirServer[],
+  opts: { hub?: McpHub; approvals?: Set<string>; global?: () => Record<string, RawMcpServerConfig> | null; tenant?: typeof TENANT } = {},
+): SessionMcpView {
   return new SessionMcpView(registry, opts.hub ?? null, {
     workdir: "/w",
-    tenant: { accountId: "a", projectId: "p" },
+    tenant: opts.tenant ?? TENANT,
     approvals: () => opts.approvals ?? new Set(),
     read: async () => read,
+    readGlobal: async () => (opts.global ? opts.global() : null),
   });
 }
 
@@ -136,11 +140,11 @@ function entry(name: string, origin: WorkdirServer["origin"], r: RawMcpServerCon
 }
 
 describe("a session's view", () => {
-  it("adds the workdir's servers for every backend but Claude (which loads its own)", async () => {
+  it("adds the workdir's servers for every backend but Claude (which loads its own), run in the workdir", async () => {
     const v = view(new McpRegistry({}, { memoryEnabled: false }), [entry("mine", "claude-local", raw({ command: "my-mcp" }))]);
     await v.load();
     expect(v.forNativeMount("codex").map((s) => s.name)).toEqual(["mine"]);
-    expect(v.forBackend("openai").map((s) => s.name)).toEqual(["mine"]);
+    expect(v.forBackend("openai")[0]?.transport).toMatchObject({ kind: "stdio", cwd: "/w" });
     expect(v.forNativeMount("claude")).toEqual([]);
     expect(v.reachOf("mine", "/h/.claude.json")).toEqual({ reach: "all" });
   });
@@ -155,13 +159,12 @@ describe("a session's view", () => {
     approvals.add(`repo\u0000${fingerprintOf(r)}`);
     expect(await v.stale()).toBe(true); // noticed — not applied
     expect(v.forNativeMount("codex")).toEqual([]);
-    expect(await v.load()).toBe(true); // applied on a refresh
+    expect(v.reachOf("repo", "/w/.mcp.json")).toEqual({ reach: "claude-only", why: "needs-refresh" });
+    expect((await v.load()).changed).toBe(true); // applied on a refresh
     expect(v.forNativeMount("codex").map((s) => s.name)).toEqual(["repo"]);
-    // An approval of another entry (the repo edited it) isn't consent to this one.
     const edited = view(new McpRegistry({}, { memoryEnabled: false }), [entry("repo", "claude-repo", raw({ command: "evil" }))], { approvals });
     await edited.load();
     expect(edited.forNativeMount("codex")).toEqual([]);
-    // Approved in Claude: counts too.
     const inClaude = view(new McpRegistry({}, { memoryEnabled: false }), [entry("repo", "claude-repo", r, "approved")]);
     await inClaude.load();
     expect(inClaude.forNativeMount("codex").map((s) => s.name)).toEqual(["repo"]);
@@ -185,69 +188,95 @@ describe("a session's view", () => {
       return t?.kind === "stdio" ? t.command : undefined;
     };
     expect(cmd("codex", "cfg")).toBe("codeoid-config");
-    expect(cmd("codex", "imp")).toBe("workdir-imp"); // as Claude orders them: local over user
-    expect(cmd("claude", "imp")).toBe("imported"); // Claude's own copy comes from the CLI
-    expect(cmd("codex", "userown")).toBe("imported-u"); // a repo's never stands in
+    expect(cmd("codex", "imp")).toBe("workdir-imp");
+    expect(cmd("claude", "imp")).toBe("imported");
+    expect(cmd("codex", "userown")).toBe("imported-u");
     expect(cmd("codex", "my_thing")).toBe("mine");
-    expect(v.forNativeMount("codex").some((s) => s.name === "My-Thing")).toBe(false); // nor a look-alike
+    expect(v.forNativeMount("codex").some((s) => s.name === "My-Thing")).toBe(false);
     expect(v.reachOf("cfg", "/h/.claude.json")).toEqual({ reach: "claude-only", why: "shadowed" });
     expect(v.reachOf("My-Thing", "/w/.mcp.json")).toEqual({ reach: "claude-only", why: "shadowed" });
-    expect(v.reachOfGlobal("imp", null, "imported")).toEqual({ reach: "all" });
+    // The global "imp" is shown as not used: the user's workdir one is.
+    expect(v.reachOfGlobal("imp", null, "imported")).toEqual({ reach: "claude-only", why: "shadowed" });
+    expect(v.reachOfGlobal("userown", null, "imported-u")).toEqual({ reach: "all" });
     expect(v.reachOfGlobal("cfg", null, "codeoid-config")).toEqual({ reach: "claude-only", why: "shadowed" });
     expect(v.reachOfGlobal("codeoid_memory", null, "x")).toEqual({ reach: "claude-only", why: "reserved-name" });
   });
 
-  it("holds a server that wants a sign-in back from the backends that would get 401s — not from Claude", async () => {
+  it("holds a server that wants a sign-in back from this tenant's backends that would get 401s — not Claude, not another tenant", async () => {
     const hub = new McpHub({});
     const reg = new McpRegistry({ remote: raw({ url: "https://r.example.com/mcp" }) }, { memoryEnabled: false, imported: new Set(["remote"]) });
-    const v = view(reg, [], { hub });
-    await v.load();
-    expect(v.forNativeMount("codex").map((s) => s.name)).toEqual(["remote"]);
-    hub.markNeedsSignIn("https://r.example.com/mcp");
-    expect(v.forNativeMount("codex")).toEqual([]);
-    expect(v.forBackend("openai")).toEqual([]);
-    expect(v.forNativeMount("claude").map((s) => s.name)).toEqual(["remote"]);
-    expect(v.reachOfGlobal("remote", "https://r.example.com/mcp", null)).toEqual({ reach: "claude-only", why: "needs-sign-in" });
+    const mine = view(reg, [], { hub });
+    const theirs = view(reg, [], { hub, tenant: OTHER });
+    await mine.load();
+    await theirs.load();
+    hub.markNeedsSignIn("https://r.example.com/mcp", TENANT);
+    expect(mine.forNativeMount("codex")).toEqual([]);
+    expect(mine.forBackend("openai")).toEqual([]);
+    expect(mine.forNativeMount("claude").map((s) => s.name)).toEqual(["remote"]);
+    expect(theirs.forNativeMount("codex").map((s) => s.name)).toEqual(["remote"]);
+    expect(mine.reachOfGlobal("remote", "https://r.example.com/mcp", null)).toEqual({ reach: "claude-only", why: "needs-sign-in" });
   });
 
-  it("a project's .mcp.json server is left to a backend that reads it itself (Claude, Qwen); its settings-file ones aren't", async () => {
-    const fromMcpJson = entry("team", "claude-repo", raw({ command: "team" }), "approved");
-    const fromSettings = { ...entry("set", "claude-repo", raw({ command: "set" }), "approved"), path: "/w/.claude/settings.json" };
-    // "twin" is the user's own, with the very same config as the project's "team".
-    const twin = entry("twin", "claude-local", raw({ command: "team" }));
-    const v = view(new McpRegistry({}, { memoryEnabled: false }), [fromMcpJson, fromSettings, entry("mine", "claude-local", raw({ command: "m" })), twin]);
+  it("a project's .mcp.json server is left to a backend that reads it itself (Claude, Qwen) — and so is any name it declares", async () => {
+    const team = entry("team", "claude-repo", raw({ command: "team" }), "approved");
+    const twin = entry("twin", "claude-local", raw({ command: "team" })); // same config, the user's own
+    const mine = entry("mine", "claude-local", raw({ command: "m" }));
+    const sameName = entry("mine", "claude-repo", raw({ command: "repo-mine" }), "approved");
+    const v = view(new McpRegistry({}, { memoryEnabled: false }), [team, twin, mine, sameName]);
     await v.load();
-    expect(v.forNativeMount("codex").map((s) => s.name).sort()).toEqual(["mine", "set", "team", "twin"]);
-    expect(v.forNativeMount("qwen").map((s) => s.name).sort()).toEqual(["mine", "set", "twin"]); // Qwen has its own copy of "team" only
+    expect(v.forNativeMount("codex").map((s) => s.name).sort()).toEqual(["mine", "team", "twin"]);
+    expect(v.forNativeMount("qwen").map((s) => s.name).sort()).toEqual(["mine", "twin"]);
     expect(v.reachOf("team", "/w/.mcp.json", "qwen")).toEqual({ reach: "claude-only", why: "read-by-backend" });
     expect(v.reachOf("team", "/w/.mcp.json", "codex")).toEqual({ reach: "all" });
+    // Qwen's own copy of a .mcp.json name wins over the user's same-named one: said so.
+    expect(v.reachOf("mine", "/h/.claude.json", "qwen")).toEqual({ reach: "claude-only", why: "read-by-backend" });
   });
 
-  it("nothing changes until it's read again: stale says so, load applies", async () => {
-    const read: WorkdirServer[] = [];
+  it("nothing changes until it's applied: stale says so, load applies, and says what went", async () => {
+    const read: WorkdirServer[] = [entry("old", "claude-local", raw({ command: "o" }))];
     const v = view(new McpRegistry({}, { memoryEnabled: false }), read);
-    expect(await v.load()).toBe(false);
-    read.push(entry("new", "claude-local", raw({ command: "n" })));
-    expect(v.forNativeMount("codex")).toEqual([]);
+    expect((await v.load()).changed).toBe(false);
+    read.splice(0, 1, entry("new", "claude-local", raw({ command: "n" })));
+    expect(v.forNativeMount("codex").map((s) => s.name)).toEqual(["old"]);
     expect(await v.stale()).toBe(true);
-    expect(await v.load()).toBe(true);
+    const change = await v.load();
+    expect(change.changed).toBe(true);
+    expect(change.removed.map((s) => s.name)).toEqual(["old"]);
     expect(await v.stale()).toBe(false);
     expect(v.forNativeMount("codex").map((s) => s.name)).toEqual(["new"]);
   });
 
-  it("two workdirs' same-named servers are different servers", async () => {
-    const reg = new McpRegistry({}, { memoryEnabled: false });
-    const a = view(reg, [entry("db", "claude-local", raw({ command: "db-a" }))]);
-    const b = view(reg, [entry("db", "claude-local", raw({ command: "db-b" }))]);
-    await a.load();
-    await b.load();
-    expect(a.get("db")?.variant).not.toBe(b.get("db")?.variant);
-    expect(reg.get("db")).toBeUndefined(); // never in the daemon-wide registry
+  it("a refresh picks up the user's global Claude servers too — never touching codeoid's own entries", async () => {
+    const reg = new McpRegistry({ a: raw({ command: "a" }), mine: raw({ command: "codeoid-own" }) }, { memoryEnabled: false, imported: new Set(["a"]) });
+    let global: Record<string, RawMcpServerConfig> = { a: raw({ command: "a" }) };
+    const v = view(reg, [], { global: () => global });
+    await v.load();
+    expect(await v.stale()).toBe(false);
+    global = { a: raw({ command: "a2" }), b: raw({ command: "b" }), mine: raw({ command: "from-claude" }) };
+    expect(await v.stale()).toBe(true);
+    expect((await v.load()).changed).toBe(true);
+    const cmd = (name: string) => {
+      const t = reg.get(name)?.transport;
+      return t?.kind === "stdio" ? t.command : undefined;
+    };
+    expect([cmd("a"), cmd("b"), cmd("mine")]).toEqual(["a2", "b", "codeoid-own"]);
+    expect(await v.stale()).toBe(false); // a name codeoid owns doesn't read as a pending change
+    global = { b: raw({ command: "b" }) };
+    await v.load();
+    expect(reg.get("a")).toBeUndefined();
   });
 });
 
-describe("a plain HTTP server that answers with an OAuth challenge", () => {
-  it("is marked as wanting a sign-in, said so, and unmarked once it answers", async () => {
+describe("the hub and workdir servers", () => {
+  it("runs a workdir stdio server in its workdir; never puts it in the daemon-wide registry", async () => {
+    const reg = new McpRegistry({}, { memoryEnabled: false });
+    const a = view(reg, [entry("db", "claude-local", raw({ command: "db" }))]);
+    await a.load();
+    expect(a.forNativeMount("codex")[0]!.transport).toMatchObject({ cwd: "/w" });
+    expect(reg.get("db")).toBeUndefined();
+  });
+
+  it("marks a server that answers the MCP sign-in challenge — for that tenant, and not one given credentials of its own", async () => {
     let challenge = true;
     const server = Bun.serve({
       port: 0,
@@ -265,15 +294,20 @@ describe("a plain HTTP server that answers with an OAuth challenge", () => {
     });
     try {
       const url = `http://127.0.0.1:${server.port}/mcp`;
-      const reg = new McpRegistry({ p: raw({ url }) }, { memoryEnabled: false });
+      const reg = new McpRegistry({ p: raw({ url }), withToken: raw({ url, headers: { Authorization: "Bearer expired" } }) }, { memoryEnabled: false });
       const hub = new McpHub({});
-      expect(await hub.listTools(reg.get("p")!)).toEqual([]);
-      expect(hub.needsSignIn(url)).toBe(true);
-      expect(hub.statusFor("p")?.error).toContain("adopt it");
+      const scope = { workspaceId: "w", sessionId: "s", tenant: TENANT };
+      expect(await hub.listTools(reg.get("p")!, scope)).toEqual([]);
+      expect(hub.needsSignIn(url, TENANT)).toBe(true);
+      expect(hub.needsSignIn(url, OTHER)).toBe(false);
+      const hub2 = new McpHub({});
+      await hub2.listTools(reg.get("withToken")!, scope);
+      expect(hub2.needsSignIn(url, TENANT)).toBe(false); // an expired static token isn't a sign-in to adopt
       challenge = false;
-      expect((await hub.listTools(reg.get("p")!)).map((t) => t.name)).toEqual(["t"]);
-      expect(hub.needsSignIn(url)).toBe(false);
+      expect((await hub.listTools(reg.get("p")!, scope)).map((t) => t.name)).toEqual(["t"]);
+      expect(hub.needsSignIn(url, TENANT)).toBe(false);
       hub.closeAll();
+      hub2.closeAll();
     } finally {
       server.stop(true);
     }
@@ -315,13 +349,13 @@ describe("approve and refresh, through the session manager", () => {
     } catch {}
   });
 
-  function manager(onProvider?: (p: MockSessionProvider) => void): SessionManager {
+  function manager(make?: () => MockSessionProvider, onProvider?: (p: MockSessionProvider) => void): SessionManager {
     const providers = new ProviderRegistry("claude");
     providers.register({
       id: "claude",
       displayName: "claude",
       create: () => {
-        const p = new MockSessionProvider("claude", []);
+        const p = make ? make() : new MockSessionProvider("claude", []);
         onProvider?.(p);
         return p;
       },
@@ -356,45 +390,49 @@ describe("approve and refresh, through the session manager", () => {
     return { servers: r.mcpServers, stale: r.mcpStale === true };
   }
 
-  it("the drawer says how far each server reaches; approving a repo's, then refreshing, takes it everywhere", async () => {
+  const approve = (m: SessionManager, sid: string, row: ClaudeConfigMcpServer, a = auth(ALL)) =>
+    m.handle({ type: "mcp.approve", id: "a", sessionId: sid, server: row.name, path: row.path, fingerprint: row.fingerprint! }, a, client);
+
+  it("the drawer says how far each server reaches; approving what it showed takes it everywhere", async () => {
     claudeJson({ [work]: { mcpServers: { mine: { command: "my-mcp" } } } });
     writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { team: { command: "team-mcp" } } }));
     const m = manager();
     const sid = await session(m);
     let r = await rows(m, sid);
+    const team = r.servers.find((s) => s.name === "team")!;
     expect(r.servers.find((s) => s.name === "mine")?.otherBackends).toEqual({ reach: "all" });
-    expect(r.servers.find((s) => s.name === "team")?.otherBackends).toEqual({ reach: "claude-only", why: "needs-approval" });
+    expect(team.otherBackends).toEqual({ reach: "claude-only", why: "needs-approval" });
+    expect(team.fingerprint).toMatch(/^[0-9a-f]{32}$/);
     expect(r.stale).toBe(false);
 
-    const ok = await m.handle({ type: "mcp.approve", id: "a", sessionId: sid, server: "team" }, auth(ALL), client);
-    expect(ok).toMatchObject({ type: "response.ok", data: { server: "team" } });
+    expect(await approve(m, sid, team)).toMatchObject({ type: "response.ok", data: { server: "team" } });
+    await m.handle({ type: "session.mcp_refresh", id: "r", sessionId: sid }, auth(ALL), client);
     r = await rows(m, sid);
-    expect(r.stale).toBe(true); // approved, not yet applied
-    expect(r.servers.find((s) => s.name === "team")?.otherBackends).toEqual({ reach: "claude-only", why: "needs-refresh" });
-
-    expect(await m.handle({ type: "session.mcp_refresh", id: "r", sessionId: sid }, auth(ALL), client)).toMatchObject({
-      type: "response.ok",
-      data: { changed: true, deferred: false },
-    });
-    r = await rows(m, sid);
-    expect(r.stale).toBe(false);
     expect(r.servers.find((s) => s.name === "team")?.otherBackends).toEqual({ reach: "all" });
 
     const db = new Database(join(tmp, "codeoid.db"), { readonly: true });
-    const audit = db.query("SELECT action, detail FROM audit_log WHERE action IN ('mcp.approve', 'session.mcp_refresh')").all() as Array<{ action: string; detail: string }>;
+    const audit = db.query("SELECT detail FROM audit_log WHERE action = 'mcp.approve'").all() as Array<{ detail: string }>;
     db.close();
-    expect(audit.find((a) => a.action === "mcp.approve")?.detail).toContain(`source=${JSON.stringify(join(work, ".mcp.json"))}`);
-    expect(audit.find((a) => a.action === "session.mcp_refresh")?.detail).toContain("changed=true");
+    expect(audit[0]?.detail).toContain(`source=${JSON.stringify(join(work, ".mcp.json"))}`);
+    expect(audit[0]?.detail).toContain(`fingerprint=${team.fingerprint}`);
+  });
+
+  it("approves only the entry that was shown: one changed since is refused", async () => {
+    writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { team: { command: "team-mcp" } } }));
+    const m = manager();
+    const sid = await session(m);
+    const shown = (await rows(m, sid)).servers.find((s) => s.name === "team")!;
+    writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { team: { command: "sh", args: ["-c", "evil"] } } }));
+    expect(await approve(m, sid, shown)).toMatchObject({ type: "response.error", error: expect.stringContaining("changed since it was shown") });
   });
 
   it("an edit to an approved entry needs approval again", async () => {
     writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { team: { command: "team-mcp" } } }));
     const m = manager();
     const sid = await session(m);
-    await m.handle({ type: "mcp.approve", id: "a", sessionId: sid, server: "team" }, auth(ALL), client);
+    await approve(m, sid, (await rows(m, sid)).servers.find((s) => s.name === "team")!);
     await m.handle({ type: "session.mcp_refresh", id: "r", sessionId: sid }, auth(ALL), client);
     writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { team: { command: "team-mcp", args: ["--exfil"] } } }));
-    expect((await rows(m, sid)).servers.find((s) => s.name === "team")?.otherBackends).toEqual({ reach: "all" }); // as applied
     await m.handle({ type: "session.mcp_refresh", id: "r2", sessionId: sid }, auth(ALL), client);
     expect((await rows(m, sid)).servers.find((s) => s.name === "team")?.otherBackends).toEqual({ reach: "claude-only", why: "needs-approval" });
   });
@@ -403,24 +441,53 @@ describe("approve and refresh, through the session manager", () => {
     writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { team: { command: "team-mcp" } } }));
     const m = manager();
     const sid = await session(m);
-    const msg = { type: "mcp.approve" as const, id: "a", sessionId: sid, server: "team" };
-    expect(await m.handle(msg, auth([SCOPES.SESSION_SEND, SCOPES.FS_READ]), client)).toMatchObject({ code: "forbidden" });
-    expect(await m.handle(msg, auth(ALL, 1), client)).toMatchObject({ code: "forbidden" });
-    expect(await m.handle({ ...msg, server: "nope" }, auth(ALL), client)).toMatchObject({ code: "not_found" });
-    const other = { ...auth(ALL), accountId: "acc-2" };
-    expect(await m.handle(msg, other, client)).toMatchObject({ code: "not_found" }); // not their session
+    const row = (await rows(m, sid)).servers.find((s) => s.name === "team")!;
+    expect(await approve(m, sid, row, auth([SCOPES.SESSION_SEND, SCOPES.FS_READ]))).toMatchObject({ code: "forbidden" });
+    expect(await approve(m, sid, row, auth(ALL, 1))).toMatchObject({ code: "forbidden" });
+    expect(await approve(m, sid, { ...row, name: "nope" })).toMatchObject({ code: "not_found" });
+    expect(await approve(m, sid, row, { ...auth(ALL), accountId: "acc-2" })).toMatchObject({ code: "not_found" });
   });
 
   it("a refresh that changes something restarts the backend; one that changes nothing doesn't", async () => {
     const providers: MockSessionProvider[] = [];
-    const m = manager((p) => providers.push(p));
+    const m = manager(undefined, (p) => providers.push(p));
     const sid = await session(m);
-    await rows(m, sid); // the view is read
+    await m.handle({ type: "session.mcp_refresh", id: "r0", sessionId: sid }, auth(ALL), client); // applies the first read
     expect(await m.handle({ type: "session.mcp_refresh", id: "r", sessionId: sid }, auth(ALL), client)).toMatchObject({ data: { changed: false } });
     expect(providers[0]!.teardownCount).toBe(0);
     claudeJson({ [work]: { mcpServers: { added: { command: "new-mcp" } } } });
+    expect((await rows(m, sid)).stale).toBe(true);
     expect(await m.handle({ type: "session.mcp_refresh", id: "r2", sessionId: sid }, auth(ALL), client)).toMatchObject({ data: { changed: true } });
     expect(providers[0]!.teardownCount).toBe(1);
+  });
+
+  it("a refresh asked for mid-turn waits for the turn — it never cuts work short", async () => {
+    const providers: MockSessionProvider[] = [];
+    const m = manager(() => new MockSessionProvider("claude", [[{ type: "text_delta", content: "working…" } as ProviderEvent]], { stall: true }), (p) => providers.push(p));
+    const sid = await session(m);
+    await m.handle({ type: "session.mcp_refresh", id: "r0", sessionId: sid }, auth(ALL), client);
+    const s = m._sessionForTest(sid)!;
+    await s.send("work", auth(ALL));
+    for (let i = 0; i < 100 && s.status === "idle"; i++) await Bun.sleep(5);
+    expect(s.status).not.toBe("idle"); // the turn is running
+    claudeJson({ [work]: { mcpServers: { added: { command: "new-mcp" } } } });
+    expect(await m.handle({ type: "session.mcp_refresh", id: "r", sessionId: sid }, auth(ALL), client)).toMatchObject({
+      data: { changed: true, deferred: true },
+    });
+    expect(providers[0]!.teardownCount).toBe(0);
+  });
+
+  it("opening the drawer applies nothing", async () => {
+    claudeJson({ [work]: { mcpServers: { mine: { command: "my-mcp" } } } });
+    const m = manager();
+    const sid = await session(m);
+    expect((await rows(m, sid)).servers.find((s) => s.name === "mine")?.otherBackends).toEqual({ reach: "all" }); // what will apply
+    claudeJson({ [work]: { mcpServers: { mine2: { command: "other" } } } });
+    // Nothing was applied by looking — so nothing reads as a pending change either.
+    expect((await rows(m, sid)).stale).toBe(false);
+    // The first read (a refresh, or the first turn) takes the config as it is now.
+    await m.handle({ type: "session.mcp_refresh", id: "r", sessionId: sid }, auth(ALL), client);
+    expect((await rows(m, sid)).servers.find((s) => s.name === "mine2")?.otherBackends).toEqual({ reach: "all" });
   });
 
   it("refresh needs session:send on the caller's own session", async () => {

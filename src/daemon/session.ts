@@ -122,6 +122,9 @@ import { isElicitationTool, isSafeTool, roleDeniesTool } from "./providers/tool-
 import type { PackActivation } from "./pipeline/index.js";
 import { McpRegistry } from "./mcp/registry.js";
 import { SessionMcpView, type WorkdirReach } from "./mcp/session-view.js";
+
+/** Backends that start a new conversation after a teardown, so are handed the history again (the Gemini CLI: a new ACP session, no resume). */
+const RESEED_AFTER_TEARDOWN = new Set(["gemini-cli"]);
 import { adoptableName, adoptionRefusal, claudeMcpServers, fromRepoFile, fullUrlRequired, shellArg } from "./mcp/adopt.js";
 import { cleanMcpError, redactMcpUrl } from "./mcp/redact.js";
 import type { McpHub } from "./mcp/hub.js";
@@ -1884,69 +1887,101 @@ export class Session {
   /** Take the backend's word for a server's state; announce it coming back. */
   /**
    * Make sure the session's MCP view is read (before its first turn) and that
-   * a refresh asked for mid-turn is applied: a change rebuilds the backend,
-   * which resumes the same conversation with the new servers.
+   * a refresh asked for earlier is applied once nothing is running: a change
+   * rebuilds the backend, which picks the conversation back up.
    */
   async #applyMcpView(): Promise<void> {
     const view = this.#mcpView;
     if (!view) return;
     if (!view.loaded) {
-      await view.load().catch((e) => console.error(`[codeoid/session ${this.id}] reading the workdir's MCP servers failed: ${e instanceof Error ? e.message : String(e)}`));
+      await view.load().catch((e) => console.error(`[codeoid/session ${this.id}] reading the session's MCP servers failed: ${e instanceof Error ? e.message : String(e)}`));
       this.#mcpRefreshPending = false;
       return;
     }
-    if (!this.#mcpRefreshPending) return;
+    if (!this.#mcpRefreshPending || this.#mcpBusy()) return;
     this.#mcpRefreshPending = false;
-    if (await view.load()) await this.#teardownProvider();
+    await this.#applyMcpChange();
   }
 
   /**
-   * Re-read the workdir's MCP servers and apply any change (#395): the
-   * backend is rebuilt and resumes the conversation. During a turn, applied
-   * before the next one. Never done on its own — a config edit shouldn't
-   * restart a working backend unasked.
+   * Re-read the session's MCP servers from Claude's config and apply any
+   * change (#395): the backend is rebuilt and picks the conversation back up.
+   * Serialized with sends; while a turn or background work runs, applied
+   * before the next turn instead (a refresh never cuts work short). Never
+   * done on its own — a config edit shouldn't restart a working backend unasked.
    */
   async refreshMcp(): Promise<{ changed: boolean; deferred: boolean }> {
     const view = this.#mcpView;
     if (!view) return { changed: false, deferred: false };
-    if (!view.loaded) {
-      await view.load();
-      return { changed: false, deferred: false };
-    }
-    if (this.#activeRun !== null) {
-      this.#mcpRefreshPending = true;
-      return { changed: await view.stale(), deferred: true };
-    }
-    const changed = await view.load();
-    if (changed) await this.#teardownProvider();
-    return { changed, deferred: false };
+    let result: { changed: boolean; deferred: boolean } = { changed: false, deferred: false };
+    this.#sendChain = this.#sendChain
+      .catch(() => {})
+      .then(async () => {
+        if (!view.loaded) {
+          await view.load();
+          return;
+        }
+        if (this.#mcpBusy()) {
+          this.#mcpRefreshPending = true;
+          result = { changed: await view.stale(), deferred: true };
+          return;
+        }
+        result = { changed: await this.#applyMcpChange(), deferred: false };
+      });
+    await this.#sendChain;
+    return result;
   }
 
-  /** Read the session's MCP view if it hasn't been yet (before a first turn, that's applying it). */
-  async ensureMcpView(): Promise<void> {
-    if (this.#mcpView && !this.#mcpView.loaded) await this.#mcpView.load();
+  /** A turn, an approval or background work is running: the backend mustn't be rebuilt under it. */
+  #mcpBusy(): boolean {
+    return this.#activeRun !== null || this.#switchBusyReason() !== null || this.#backgroundTasks.size > 0;
   }
 
-  /** Whether the workdir's MCP servers changed since this session applied them. */
+  /** Apply the view; when it changed, rebuild the backend. Whether it changed. */
+  async #applyMcpChange(): Promise<boolean> {
+    const view = this.#mcpView!;
+    const { changed, removed } = await view.load();
+    const tenant = { accountId: this.accountId, projectId: this.projectId };
+    for (const spec of removed) this.#mcpHub?.dropSpec(spec, tenant);
+    if (!changed) return false;
+    await this.#teardownProvider();
+    // Claude, Codex and Qwen resume their own conversation; the Gemini CLI
+    // starts a new ACP session, so it's handed the history again.
+    if (RESEED_AFTER_TEARDOWN.has(this.#provider.id) && this.#accumulator.history.length > 0) {
+      await this.#seedProviderFromHistory();
+    }
+    return true;
+  }
+
+  /** Read the session's MCP servers for the drawer without applying anything. */
+  async peekMcpView(): Promise<void> {
+    await this.#mcpView?.peek();
+  }
+
+  /** Whether Claude's config changed since this session applied it. */
   async mcpStale(): Promise<boolean> {
     return (await this.#mcpView?.stale()) ?? false;
   }
 
-  /** How far a server from Claude's config reaches in this session (#395). */
-  mcpReach(server: { name: string; scope: string; path: string; url: string | null; command: string | null }): WorkdirReach | undefined {
-    const view = this.#mcpView;
-    if (!view) return undefined;
-    return server.scope === "workdir"
-      ? view.reachOf(server.name, server.path, this.providerId)
-      : view.reachOfGlobal(server.name, server.url, server.command);
+  /** How far each server from Claude's config reaches in this session (#395), and a workdir entry's fingerprint — for every row of the drawer at once. */
+  mcpReachSnapshot(): {
+    reach(server: { name: string; scope: string; path: string; url: string | null; command: string | null }): WorkdirReach | undefined;
+    fingerprint(name: string, path: string): string | undefined;
+  } {
+    const snap = this.#mcpView?.snapshot(this.providerId);
+    return {
+      reach: (s) => (!snap ? undefined : s.scope === "workdir" ? snap.reachOf(s.name, s.path) : snap.reachOfGlobal(s.name, s.url, s.command)),
+      fingerprint: (name, path) => snap?.fingerprintOf(name, path),
+    };
   }
 
   #applyMcpState(name: string, state: { status: string; tools: string[] }): void {
     // A server Claude found wanting a sign-in is held back from the backends
     // that would only get 401s from it, until it's adopted (#395).
+    // Only for a name every entry agrees on the URL of: the one Claude dialed.
     if (state.status === "needs-auth") {
-      const url = this.#mcpView?.urlOf(name);
-      if (url) this.#mcpHub?.markNeedsSignIn(url);
+      const url = this.#mcpView?.claudeUrlOf(name);
+      if (url) this.#mcpHub?.markNeedsSignIn(url, { accountId: this.accountId, projectId: this.projectId });
     }
     this.#sdkMcpStatus.set(name, state.status);
     this.#sdkMcpTools.set(name, state.tools);
@@ -2937,6 +2972,10 @@ export class Session {
     // A message that meant to join a running turn whose run turned out to be
     // stalled (recovered above) starts a turn of its own instead.
     if (turnId === previousTurnId) turnId = randomUUID();
+    // The session's MCP servers: read before its first turn, and a refresh
+    // asked for meanwhile applied (#395) — before the stop and adopted-turn
+    // checks below, which must come after every await.
+    await this.#applyMcpView();
     // Redial any backend MCP server that's down, so this turn can use a
     // server fixed since it failed (#389) — bounded, and backed off.
     await this.#healMcpServers();
@@ -2984,7 +3023,6 @@ export class Session {
     // A redaction flagged by a turn that never reached turn_done (interrupted,
     // errored, switched away) belongs to that turn's backing, not this one.
     this.#turnRedacted = false;
-    await this.#applyMcpView();
     const run = this.#provider.runTurn({
       ...(this.#maxBudgetUsd !== undefined ? { maxBudgetUsd: this.#maxBudgetUsd } : {}),
       history: this.#accumulator.history,
@@ -3628,6 +3666,10 @@ export class Session {
 
   async destroy(sender: AuthContext, opts: { deleteBranch?: boolean } = {}): Promise<void> {
     this.#destroyed = true;
+    // This session's workdir servers' clients in the hub go with it.
+    for (const spec of this.#mcpView?.workdirSpecs() ?? []) {
+      this.#mcpHub?.dropSpec(spec, { accountId: this.accountId, projectId: this.projectId });
+    }
     // Cancel any pending debounced status persist — a write firing after the
     // deletes below would resurrect the meta file for a destroyed session,
     // which restart resume would then pick up as a ghost.

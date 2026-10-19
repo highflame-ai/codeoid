@@ -300,6 +300,7 @@ export const mcpApproveSchema = z.object({
   sessionId: sessionIdField,
   server: z.string().regex(/^[\w .:()-]{1,128}$/),
   path: z.string().max(4096).optional(),
+  fingerprint: z.string().regex(/^[0-9a-f]{32}$/),
 });
 
 export const sessionSetProviderSchema = z.object({

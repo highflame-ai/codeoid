@@ -112,8 +112,8 @@ export async function refreshMcpServers(sessionId: string): Promise<McpRefreshRe
 }
 
 /** Approve a project's MCP server for every backend in the session's workdir (#395). */
-export async function approveMcpServer(sessionId: string, server: string, path: string): Promise<void> {
-  await getClient().request({ type: "mcp.approve", id: newRequestId(), sessionId, server, path }, { timeoutMs: 15_000 });
+export async function approveMcpServer(sessionId: string, server: string, path: string, fingerprint: string): Promise<void> {
+  await getClient().request({ type: "mcp.approve", id: newRequestId(), sessionId, server, path, fingerprint }, { timeoutMs: 15_000 });
   if (inflightForSession === sessionId) await fetchClaudeConfig(sessionId).catch(() => {});
 }
 

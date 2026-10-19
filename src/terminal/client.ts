@@ -782,10 +782,28 @@ export class TerminalClient {
   }
 
   /** `codeoid mcp approve` — approve a project's MCP server for every backend in the workdir (#395). */
-  async mcpApprove(sessionIdOrName: string, server: string, path?: string): Promise<void> {
+  async mcpApprove(sessionIdOrName: string, server: string, opts: { path?: string; yes?: boolean } = {}): Promise<void> {
     const sessionId = await this.#resolveSession(sessionIdOrName);
     if (!sessionId) return;
-    const resp = await this.#request({ type: "mcp.approve", id: randomUUID(), sessionId, server, ...(path ? { path } : {}) });
+    // Approve what was looked at: show the entry, and bind the approval to it.
+    const cfg = (await this.#request({ type: "claude.config", id: randomUUID(), sessionId })) as DaemonMessage & {
+      mcpServers?: Array<{ name: string; path: string; scope: string; command: string | null; argCount?: number; envKeys: string[]; url: string | null; fingerprint?: string }>;
+    };
+    const rows = (cfg.mcpServers ?? []).filter((m) => m.name === server && m.scope === "workdir" && m.fingerprint && (!opts.path || m.path === opts.path));
+    if (rows.length !== 1) {
+      console.error(rows.length === 0 ? `This project declares no MCP server ${JSON.stringify(server)}.` : `${JSON.stringify(server)} is in ${rows.map((r) => r.path).join(" and ")} — pass --path.`);
+      process.exitCode = 1;
+      return;
+    }
+    const row = rows[0]!;
+    console.log(`${row.name}, from ${row.path}:`);
+    console.log(row.url ? `  url: ${row.url}` : `  runs: ${row.command ?? "?"} with ${row.argCount ?? 0} arg(s)${row.envKeys.length ? `, env ${row.envKeys.join(", ")}` : ""}`);
+    console.log("  Review the full entry in that file: once approved, every backend in this directory runs it.");
+    if (!opts.yes) {
+      console.log("Re-run with --yes to approve exactly this entry.");
+      return;
+    }
+    const resp = await this.#request({ type: "mcp.approve", id: randomUUID(), sessionId, server, path: row.path, fingerprint: row.fingerprint! });
     if (resp.type !== "response.ok") {
       this.#printError(resp);
       process.exitCode = 1;

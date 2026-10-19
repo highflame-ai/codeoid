@@ -470,14 +470,14 @@ const McpReach: Component<{ server: ClaudeConfigMcpServer; sessionId: string | n
         <Show when={reach()?.reach === "all"} fallback={<span>{why()}</span>}>
           <span>On every backend in this session.</span>
         </Show>
-        <Show when={reach()?.reach === "claude-only" && (reach() as { why: string }).why === "needs-approval" && props.sessionId}>
+        <Show when={reach()?.reach === "claude-only" && (reach() as { why: string }).why === "needs-approval" && props.sessionId && props.server.fingerprint}>
           <button
             type="button"
             disabled={busy()}
             onClick={() => {
               setBusy(true);
               setError(null);
-              approveMcpServer(props.sessionId!, props.server.name, props.server.path)
+              approveMcpServer(props.sessionId!, props.server.name, props.server.path, props.server.fingerprint!)
                 .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
                 .finally(() => setBusy(false));
             }}

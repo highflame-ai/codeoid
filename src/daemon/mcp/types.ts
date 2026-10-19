@@ -24,6 +24,9 @@ export interface McpStdioTransport {
   /** Literal subprocess env. A `${VAR}` value is resolved from the daemon's own
    *  environment at mount time so secrets never live in the config file. */
   env: Record<string, string>;
+  /** Where it runs: a workdir server (#395) in its workdir, as Claude, Codex,
+   *  the Gemini CLI and Qwen run it; otherwise the daemon user's home. */
+  cwd?: string;
 }
 
 /** POST JSON-RPC to a streamable-HTTP endpoint. */

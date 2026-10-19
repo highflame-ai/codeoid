@@ -6,36 +6,38 @@
  * Read from where Claude Code keeps them:
  *  - the user's own `~/.claude.json` → `projects[<workdir>].mcpServers`
  *    (`claude mcp add`'s default, local scope) — the user's choice;
- *  - the workdir's `.mcp.json` and `.claude/settings{,.local}.json` — the
- *    repo's choice, so each carries Claude's own approval of it
- *    (`enabledMcpjsonServers` / `disabledMcpjsonServers` /
- *    `enableAllProjectMcpServers`), read from `~/.claude.json`'s project
- *    entry and from the project's `settings.local.json` — but that one only
- *    when git says it isn't part of the repo: Claude Code writes the user's
- *    approvals there, and a repo that committed its own could otherwise
- *    approve its own servers.
+ *  - the workdir's `.mcp.json` — the repo's choice, carrying Claude's own
+ *    approval of it (`enabledMcpjsonServers` / `disabledMcpjsonServers` /
+ *    `enableAllProjectMcpServers`), read ONLY from the user's own
+ *    `~/.claude.json` project entry. Never from a file in the workdir:
+ *    anything there — a committed `.claude/settings.local.json`, one behind a
+ *    symlink or a submodule, one the agent or a build script wrote — could be
+ *    the repo approving its own servers.
  *
- * Unlike the drawer's reader (claude-config.ts), values are kept — env,
- * headers — since a backend dials these. Nothing here leaves the daemon.
+ * (Claude Code takes no `mcpServers` from its settings files, so neither does
+ * this.) Unlike the drawer's reader (claude-config.ts), values are kept —
+ * env, headers — since a backend dials these; nothing here leaves the daemon.
  */
 
 import { createHash } from "node:crypto";
-import { readFile, stat } from "node:fs/promises";
+import { open, realpath, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { RawMcpServerConfig } from "../../config.js";
 import { mapEntry } from "./import-claude.js";
 
-/** The user's home as the rest of the daemon reads it (claude-config.ts):
- *  `os.homedir()` caches at process start, so HOME is read first. */
-function homedir(): string {
-  return process.env.HOME ?? process.env.USERPROFILE ?? os.homedir();
-}
-
 /** A repo's file read at most this big (as in claude-config.ts). */
 const MAX_REPO_FILE_BYTES = 1_000_000;
 /** The user's own `~/.claude.json`, which also holds Claude Code's history. */
 const MAX_CLAUDE_JSON_BYTES = 64_000_000;
+
+/** A workdir server's name: plain ASCII, no `__` and no `mcp__` start — so its
+ *  tools' names (`mcp__<name>__<tool>`) can't pass for another server's. */
+const WORKDIR_SERVER_NAME = /^(?!mcp__)(?!.*__)[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
+
+/** Daemon env a repo's server may not ask for by `${VAR}` reference: codeoid's
+ *  own secrets (the same prefixes kept from every agent subprocess). */
+const DAEMON_SECRET_VAR = /\$\{(CODEOID_|ZEROID_|TELEGRAM_)[A-Za-z0-9_]*\}/g;
 
 export interface WorkdirServer {
   name: string;
@@ -49,34 +51,33 @@ export interface WorkdirServer {
   fingerprint: string;
 }
 
+/** The user's home as the rest of the daemon reads it (claude-config.ts):
+ *  `os.homedir()` caches at process start, so HOME is read first. */
+function homedir(): string {
+  return process.env.HOME ?? process.env.USERPROFILE ?? os.homedir();
+}
+
 /** Every server the workdir adds, before consent or precedence is applied. */
 export async function readWorkdirServers(workdir: string, home: string = homedir()): Promise<WorkdirServer[]> {
   const claudeJsonPath = path.join(home, ".claude.json");
-  const claudeJson = asObject(await readJson(claudeJsonPath, MAX_CLAUDE_JSON_BYTES));
+  const claudeJson = asObject(await readClaudeJson(claudeJsonPath));
   const project = asObject(asObject(claudeJson?.projects)?.[workdir]);
-
-  const settingsPaths = [path.join(workdir, ".claude", "settings.json"), path.join(workdir, ".claude", "settings.local.json")];
-  const settings = await Promise.all(settingsPaths.map((p) => readJson(p, MAX_REPO_FILE_BYTES).then(asObject)));
   const mcpJsonPath = path.join(workdir, ".mcp.json");
-  const mcpJson = asObject(await readJson(mcpJsonPath, MAX_REPO_FILE_BYTES));
+  const mcpJson = asObject(await readInside(workdir, mcpJsonPath));
 
-  // Claude's approval of the repo's servers: the user's project entry, and the
-  // project's local settings when they are the user's (untracked), never the
-  // shared settings.json, which is the repo's own.
-  const localIsUsers = settings[1] !== null && (await untrackedInGit(workdir, ".claude/settings.local.json"));
-  const approvals = [project, localIsUsers ? settings[1] : null];
-  const enabled = new Set(approvals.flatMap((a) => strings(a?.enabledMcpjsonServers)));
-  const disabled = new Set(approvals.flatMap((a) => strings(a?.disabledMcpjsonServers)));
-  const enableAll = approvals.some((a) => a?.enableAllProjectMcpServers === true);
+  const enabled = new Set(strings(project?.enabledMcpjsonServers));
+  const disabled = new Set(strings(project?.disabledMcpjsonServers));
+  const enableAll = project?.enableAllProjectMcpServers === true;
   const approval = (name: string): WorkdirServer["claudeApproval"] =>
     disabled.has(name) ? "denied" : enabled.has(name) || enableAll ? "approved" : "unset";
 
   const out: WorkdirServer[] = [];
   const add = (block: unknown, origin: WorkdirServer["origin"], file: string) => {
     for (const [name, def] of Object.entries(asObject(block) ?? {})) {
-      if (name.startsWith("_")) continue;
-      const raw = mapEntry(def);
-      if (!raw) continue;
+      if (!WORKDIR_SERVER_NAME.test(name)) continue;
+      const mapped = mapEntry(def);
+      if (!mapped) continue;
+      const raw = origin === "claude-repo" ? withoutDaemonSecrets(mapped) : mapped;
       out.push({
         name,
         raw,
@@ -89,7 +90,18 @@ export async function readWorkdirServers(workdir: string, home: string = homedir
   };
   add(project?.mcpServers, "claude-local", claudeJsonPath);
   add(mcpJson?.mcpServers, "claude-repo", mcpJsonPath);
-  settings.forEach((s, i) => add(s?.mcpServers, "claude-repo", settingsPaths[i]!));
+  return out;
+}
+
+/** The user's global servers from `~/.claude.json` (cached by size and mtime), as the boot import maps them. */
+export async function readGlobalServers(home: string = homedir()): Promise<Record<string, RawMcpServerConfig>> {
+  const block = asObject(asObject(await readClaudeJson(path.join(home, ".claude.json")))?.mcpServers);
+  const out: Record<string, RawMcpServerConfig> = {};
+  for (const [name, def] of Object.entries(block ?? {})) {
+    if (name.startsWith("_")) continue;
+    const raw = mapEntry(def);
+    if (raw) out[name] = raw;
+  }
   return out;
 }
 
@@ -106,44 +118,56 @@ export function fingerprintOf(raw: RawMcpServerConfig): string {
   return createHash("sha256").update(canon).digest("hex").slice(0, 32);
 }
 
-/** git run in a directory a repo controls: nothing in its `.git/config` may
- *  run a command (an fsmonitor hook, a hooks path) on the daemon's behalf. */
-const SAFE_GIT = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"];
+/** A repo's server can't ask, by reference, for the daemon's own secrets. */
+function withoutDaemonSecrets(raw: RawMcpServerConfig): RawMcpServerConfig {
+  const strip = (o: Record<string, string> | undefined) =>
+    o && Object.fromEntries(Object.entries(o).map(([k, v]) => [k, v.replace(DAEMON_SECRET_VAR, "")]));
+  return { ...raw, ...(raw.env ? { env: strip(raw.env)! } : {}), ...(raw.headers ? { headers: strip(raw.headers)! } : {}) };
+}
 
-/** Whether git reports `rel` as not tracked in the repo at `workdir`. False
- *  when it can't tell (not a repo, no git): then it isn't trusted as the user's. */
-async function untrackedInGit(workdir: string, rel: string): Promise<boolean> {
+/** `~/.claude.json`, parsed once per change of its size or modification time
+ *  (it can be tens of MB, and the drawer asks often). */
+let claudeJsonCache: { file: string; mtimeMs: number; size: number; value: unknown } | null = null;
+
+async function readClaudeJson(file: string): Promise<unknown> {
   try {
-    const inRepo = Bun.spawn(["git", ...SAFE_GIT, "-C", workdir, "rev-parse", "--is-inside-work-tree"], { stdout: "ignore", stderr: "ignore" });
-    if ((await withTimeout(inRepo.exited, 2_000, inRepo)) !== 0) return false;
-    const tracked = Bun.spawn(["git", ...SAFE_GIT, "-C", workdir, "ls-files", "--error-unmatch", "--", rel], { stdout: "ignore", stderr: "ignore" });
-    // Exactly 1 is "not tracked"; anything else (tracked, a timeout, an error) isn't trusted.
-    return (await withTimeout(tracked.exited, 2_000, tracked)) === 1;
+    const s = await stat(file);
+    if (!s.isFile() || s.size > MAX_CLAUDE_JSON_BYTES) return null;
+    if (claudeJsonCache && claudeJsonCache.file === file && claudeJsonCache.mtimeMs === s.mtimeMs && claudeJsonCache.size === s.size) {
+      return claudeJsonCache.value;
+    }
+    const value = await readBounded(file, MAX_CLAUDE_JSON_BYTES);
+    claudeJsonCache = { file, mtimeMs: s.mtimeMs, size: s.size, value };
+    return value;
   } catch {
-    return false;
+    return null;
   }
 }
 
-function withTimeout(p: Promise<number>, ms: number, proc: { kill(): void }): Promise<number> {
-  return new Promise((resolve) => {
-    const t = setTimeout(() => {
-      proc.kill();
-      resolve(-1);
-    }, ms);
-    p.then((code) => {
-      clearTimeout(t);
-      resolve(code);
-    });
-  });
-}
-
-async function readJson(file: string, max: number): Promise<unknown> {
+/** A file in the workdir, only if it resolves inside it (no symlink out of it). */
+async function readInside(workdir: string, file: string): Promise<unknown> {
   try {
-    const s = await stat(file);
-    if (!s.isFile() || s.size > max) return null;
-    return JSON.parse(await readFile(file, "utf8"));
+    const [root, real] = await Promise.all([realpath(workdir), realpath(file)]);
+    if (real !== root && !real.startsWith(root + path.sep)) return null;
+    return await readBounded(real, MAX_REPO_FILE_BYTES);
   } catch {
     return null;
+  }
+}
+
+/** Read and parse at most `max` bytes, measured on the open file (it can't grow past the check). */
+async function readBounded(file: string, max: number): Promise<unknown> {
+  const fh = await open(file, "r");
+  try {
+    const s = await fh.stat();
+    if (!s.isFile() || s.size > max) return null;
+    const buf = Buffer.alloc(s.size);
+    const { bytesRead } = await fh.read(buf, 0, s.size, 0);
+    return JSON.parse(buf.subarray(0, bytesRead).toString("utf8"));
+  } catch {
+    return null;
+  } finally {
+    await fh.close();
   }
 }
 

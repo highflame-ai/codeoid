@@ -14,34 +14,36 @@
  */
 
 import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import os from "node:os";
 import { join } from "node:path";
 import type { RawMcpServerConfig } from "../../config.js";
 
-/** Best-effort read of the user's global MCP servers from Claude Code's config —
- *  `~/.claude.json`'s top-level `mcpServers`, then `~/.claude/settings.json`
- *  and `settings.local.json` (#395; the first file to name a server wins) —
+/** HOME first: `os.homedir()` caches at process start (claude-config.ts). */
+function homedir(): string {
+  return process.env.HOME ?? process.env.USERPROFILE ?? os.homedir();
+}
+
+/** Best-effort read of the user's global MCP servers — `~/.claude.json`'s
+ *  top-level `mcpServers` (Claude Code takes none from its settings files) —
  *  mapped to registry `RawMcpServerConfig`s. Never throws: a missing or
  *  malformed file, or an entry that is neither stdio nor http, is skipped. */
 export function importClaudeMcpServers(
   home: string = homedir(),
 ): Record<string, RawMcpServerConfig> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(join(home, ".claude.json"), "utf8"));
+  } catch {
+    return {};
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
+  const raw = (parsed as Record<string, unknown>).mcpServers;
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return {};
   const out: Record<string, RawMcpServerConfig> = {};
-  for (const file of [join(home, ".claude.json"), join(home, ".claude", "settings.json"), join(home, ".claude", "settings.local.json")]) {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(readFileSync(file, "utf8"));
-    } catch {
-      continue;
-    }
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) continue;
-    const raw = (parsed as Record<string, unknown>).mcpServers;
-    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) continue;
-    for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
-      if (name.startsWith("_") || name in out) continue;
-      const spec = mapEntry(value);
-      if (spec) out[name] = spec;
-    }
+  for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (name.startsWith("_")) continue;
+    const spec = mapEntry(value);
+    if (spec) out[name] = spec;
   }
   return out;
 }

@@ -1684,6 +1684,8 @@ export interface McpApproveMsg extends BaseClientMsg {
   server: string;
   /** The file it's declared in, when the name is in more than one. */
   path?: string;
+  /** The entry's fingerprint as `claude.config` showed it: an entry changed since isn't approved. */
+  fingerprint: string;
 }
 
 /** `response.ok` data for `session.mcp_reconnect`. */
@@ -2016,6 +2018,8 @@ export interface ClaudeConfigMcpServer {
    * server), another of that name wins, it wants a sign-in (adopt it), or its
    * name is codeoid's own.
    */
+  /** For a workdir server: its entry's fingerprint — what `mcp.approve` binds to. */
+  fingerprint?: string;
   otherBackends?:
     | { reach: "all" }
     | { reach: "claude-only"; why: "needs-approval" | "needs-refresh" | "shadowed" | "needs-sign-in" | "reserved-name" | "read-by-backend" };

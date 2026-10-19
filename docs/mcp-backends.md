@@ -10,20 +10,31 @@ This page says where each kind of server comes from, which backends it reaches, 
 | --- | --- | --- |
 | codeoid's config | `mcpServers` in `~/.codeoid/config.json` | every session |
 | An adopted server | "Sign in with codeoid" in the capabilities drawer (#390) | every session |
-| Claude's global config | `claude mcp add -s user`, top-level `mcpServers` in `~/.claude.json`, `~/.claude/settings.json` | every session |
-| Claude's local scope | `claude mcp add` (its default), `projects[<dir>].mcpServers` in `~/.claude.json` | sessions in that directory |
-| A project's servers | the repo's `.mcp.json`, `.claude/settings.json` | sessions in that directory, once approved |
+| Claude's global config | `claude mcp add -s user`: top-level `mcpServers` in `~/.claude.json` | every session |
+| Claude's local scope | `claude mcp add` (its default): `projects[<dir>].mcpServers` in `~/.claude.json` | sessions in that directory |
+| A project's servers | the repo's `.mcp.json` | sessions in that directory, once approved |
+
+(Claude Code takes no MCP servers from its `settings.json` files, so neither does codeoid.)
 
 ## Who reaches what
 
 - **codeoid's config, adopted servers, and Claude's global config** are in the daemon-wide registry: every backend in every session gets them.
-- **Claude's local scope** is the user's own choice for one directory: every backend in a session there gets it.
+- **Claude's local scope** is your own choice for one directory: every backend in a session there gets it.
+  On a daemon shared by several accounts, it's the daemon user's file, so it counts for every account's sessions in that directory, as the global config does.
 - **A project's servers** are the repo's choice: a cloned repo can name any command or URL.
-  Claude Code itself asks before it connects them, and so does codeoid for the other backends: they reach them once approved, either in Claude Code (its own approval of the project's servers), or in codeoid (the drawer's **Approve**, or `codeoid mcp approve <session> <server>`).
-  codeoid's approval is for that exact entry: if the repo edits it, it needs approving again.
-  Claude Code's approvals are read from `~/.claude.json` and from the project's `.claude/settings.local.json` — that file only when git says it isn't part of the repo, since a repo that committed one could otherwise approve its own servers.
+  Claude Code asks before it connects them, and codeoid asks for the other backends: they reach them once approved — in Claude Code, or in codeoid (the drawer's **Approve**, or `codeoid mcp approve <session> <server> --yes`).
+  - Claude Code's approval is read only from your own `~/.claude.json` (its `enabledMcpjsonServers`, `disabledMcpjsonServers` and `enableAllProjectMcpServers` for that directory) — never from a file inside the repo directory, such as `.claude/settings.local.json`: anything there could be the repo (or a build script, or the agent) approving its own servers.
+    An approval Claude Code stored in the repo directory is made once more in codeoid.
+  - codeoid's approval is of exactly the entry you were shown: if the repo changes it — before you click or afterwards — it needs approving again.
+    It covers the entry's command, arguments, environment, URL and headers; not the code a command runs, so a server started from a script in the repo (`node ./mcp/server.js`) runs whatever that script is when it starts.
+  - Approving in codeoid also covers a server you denied in Claude Code: the two approvals are separate.
 - **Claude** always loads its own copies of Claude's servers (the Claude CLI reads its config itself); codeoid adds the rest of the registry.
-- **Qwen** reads a project's `.mcp.json` itself, under its own folder trust (measured: codeoid's copy of the same name is overridden by Qwen's own), so on Qwen those follow Qwen's trust settings rather than codeoid's approval; your own servers, and a project's from its settings files, still reach it through codeoid.
+- **Qwen** reads a project's `.mcp.json` itself, under its own folder trust (measured: codeoid's copy of the same name is overridden by Qwen's own), so on Qwen every name the `.mcp.json` declares follows Qwen's trust settings rather than codeoid's approval.
+  Your own servers of other names still reach Qwen through codeoid.
+
+A project's server runs in the project's directory, as each backend that reads it runs it.
+It can't ask, through a `${VAR}` reference in its environment, for codeoid's own secrets (`CODEOID_*`, `ZEROID_*`, `TELEGRAM_*`); other references resolve from the daemon's environment, as Claude Code resolves them from yours.
+Its name must be plain (letters, digits, `.`, `_`, `-`; no `__`, not starting with `mcp__`), so its tools can't pass for another server's.
 
 The capabilities drawer says, for each of Claude's servers, whether it reaches the session's other backends, and if not, why.
 
@@ -32,19 +43,21 @@ The capabilities drawer says, for each of Claude's servers, whether it reaches t
 - codeoid's own entries (its config, adopted servers, its built-ins) win over Claude's.
 - Your local-scope entry wins over one from Claude's global config, as Claude Code orders them.
 - A project's server never stands in for anything of the same name, or a look-alike (`My-DB` beside `my_db`): it's left to Claude.
-- Two directories' servers of the same name are different servers: a session only ever reaches its own.
+- Two directories' servers are different servers, and so are two accounts': a session only ever reaches its own.
 
 ## Servers that need a sign-in
 
 A remote server that signs in with OAuth (Notion, Slack or GitHub through a gateway, most SaaS servers) works on every backend once codeoid signs in to it: adopt it ("Sign in with codeoid").
 Until then it's left to Claude, which signs in itself in an interactive Claude Code session.
-codeoid notices such a server when it answers with the OAuth challenge (a `401` asking for a bearer token), or when Claude reports it needs authentication; from then on the other backends don't mount it (they'd only get `401`s, or start a sign-in inside the agent), and the drawer says to adopt it.
+codeoid notices such a server when it answers a request carrying no credentials with the MCP sign-in challenge (a `401` pointing at its authorization metadata), or when Claude reports it needs authentication; for the next ten minutes (and after that, until it answers) that account's other backends don't mount it — they'd only get `401`s, or start a sign-in inside the agent — and the drawer says to adopt it.
+A server that refuses a token you configured yourself isn't held back: that token needs fixing, not an adoption.
 
 OAuth servers reach the backends that own their MCP clients (Codex, the Gemini CLI, Qwen) through a loopback relay, so the token stays in the daemon — see [mcp-oauth-design.md](mcp-oauth-design.md) §5.1.
 
 ## When a change takes effect
 
-A session reads its servers when it starts.
-A change to Claude's config afterwards — a `claude mcp add`, an edited `.mcp.json`, an approval — doesn't restart anything on its own: the drawer shows "MCP servers changed", and you apply it with **Refresh MCP servers**, `/mcp refresh` (web UI, TUI, Telegram) or `codeoid mcp refresh <session>`.
-Refreshing restarts the session's backend, which picks the conversation back up; asked during a turn, it's applied before the next one.
-A new session, or one resumed after a daemon restart, always starts with the current config.
+A session reads its servers before its first turn.
+A change to Claude's config afterwards — a `claude mcp add` (any scope), an edited `.mcp.json`, an approval — doesn't restart anything on its own: the drawer shows "MCP servers changed", and you apply it with **Refresh MCP servers**, `/mcp refresh` (web UI, TUI, Telegram) or `codeoid mcp refresh <session>`.
+Refreshing restarts the session's backend, which picks the conversation back up (the Gemini CLI, which can't resume its own session, is handed the conversation again).
+Asked while a turn, an approval or background work is running, it's applied before the next turn instead: a refresh never cuts work short.
+Opening the drawer only looks; it applies nothing.

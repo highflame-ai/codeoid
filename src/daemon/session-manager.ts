@@ -1577,7 +1577,9 @@ mcpHub: this.#mcpHub,
     }
     try {
       const snapshot = await readClaudeConfig(session.workdir);
-      await session.ensureMcpView();
+      // Read for the drawer only: what a session applies changes on its first turn or a refresh.
+      await session.peekMcpView();
+      const reachOf = session.mcpReachSnapshot();
       const live = session.sdkMcpSnapshot;
       // A name two entries give different URLs to: which one the backend runs
       // isn't known here, so neither is offered for adopting.
@@ -1600,8 +1602,11 @@ mcpHub: this.#mcpHub,
           url: s.url === null ? null : redactMcpUrl(s.url),
           // Whether it reaches this session's other backends too, and why not (#395).
           ...(() => {
-            const reach = adopted ? ({ reach: "all" } as const) : session.mcpReach(s);
-            return reach ? { otherBackends: reach } : {};
+            const reach = adopted ? ({ reach: "all" } as const) : reachOf.reach(s);
+            // A project's server carries the fingerprint of the entry shown, so an
+            // approval is of exactly what was looked at (the repo can't swap it).
+            const fp = s.scope === "workdir" ? reachOf.fingerprint(s.name, s.path) : undefined;
+            return { ...(reach ? { otherBackends: reach } : {}), ...(fp ? { fingerprint: fp } : {}) };
           })(),
           // Everything else read from the file is a short label, bounded. (A
           // name is an address, so it's cut, not redacted: one that long is
@@ -7371,17 +7376,22 @@ mcpHub: this.#mcpHub,
       (w) => w.origin === "claude-repo" && w.name === msg.server && (msg.path === undefined || w.path === msg.path),
     );
     if (repo.length === 0) return fail(`This project declares no MCP server ${JSON.stringify(msg.server)}`, "not_found");
-    if (new Set(repo.map((w) => w.fingerprint)).size > 1) {
-      return fail(`${JSON.stringify(msg.server)} is declared differently in ${repo.map((w) => w.path).join(" and ")}; say which file`);
-    }
-    const entry = repo[0]!;
+    // The entry approved is the one the caller looked at: a repo that changed
+    // it since (or a race to) gets nothing.
+    const entry = repo.find((w) => w.fingerprint === msg.fingerprint);
+    if (!entry) return fail(`${JSON.stringify(msg.server)} changed since it was shown — look at it again before approving`);
     this.#store.approveWorkdirMcpServer(
       { accountId: auth.accountId, projectId: auth.projectId, workdir: session.workdir },
       entry.name,
       entry.fingerprint,
       auth.sub,
     );
-    this.#store.audit(auth.sub, "mcp.approve", session.id, `server=${JSON.stringify(entry.name)} source=${JSON.stringify(entry.path)}`);
+    this.#store.audit(
+      auth.sub,
+      "mcp.approve",
+      session.id,
+      `server=${JSON.stringify(entry.name)} source=${JSON.stringify(entry.path)} fingerprint=${entry.fingerprint} program=${JSON.stringify(entry.raw.command ? serverProgram(entry.raw.command) : redactMcpUrl(entry.raw.url ?? ""))}`,
+    );
     return { type: "response.ok", requestId: msg.id, data: { server: entry.name, path: entry.path } };
   }
 
