@@ -11,6 +11,7 @@ import { TuiWsClient } from "./ws.js";
 import { Prompt } from "./components/Prompt.js";
 import { StatusBar } from "./components/StatusBar.js";
 import { Modal } from "./components/Modal.js";
+import type { NewSessionOptions } from "./components/NewSessionModal.js";
 import { filterCommands } from "./components/SlashHint.js";
 import { fuzzyMatch, scanWorkspaceFiles } from "./file-scanner.js";
 import {
@@ -1099,13 +1100,13 @@ export function App({ config }: Props) {
         return;
       }
       case "/model": {
+        if (!client || !focusedSession) return;
         // No args → interactive picker modal. With an arg → direct switch
         // (skip modal, trust the user knows the alias/id they want).
         if (args.length === 0) {
           dispatch({ type: "modal.open", modal: { kind: "model" } });
           return;
         }
-        if (!client || !focusedSession) return;
         const chosen = args[0]!;
         void client
           .setModel(focusedSession.info.id, chosen)
@@ -1117,6 +1118,22 @@ export function App({ config }: Props) {
           .catch((err: Error) =>
             dispatch({ type: "error", message: err.message }),
           );
+        return;
+      }
+      case "/provider":
+      case "/account": {
+        if (!client || !focusedSession) return;
+        if (cmd === "/account" && (focusedSession.info.providerId ?? "claude") !== "claude") {
+          dispatch({ type: "error", message: "Claude accounts apply to Claude sessions. Use /provider to switch backends." });
+          return;
+        }
+        if (args.length === 0) {
+          dispatch({ type: "modal.open", modal: { kind: cmd === "/provider" ? "provider" : "account" } });
+          return;
+        }
+        const value = args[0]!.toLowerCase();
+        const operation = cmd === "/provider" ? onSetProvider(value) : onSetAccount(value === "--follow-default" || value === "--follow" ? "" : value);
+        void operation.catch((cause: unknown) => dispatch({ type: "error", message: cause instanceof Error ? cause.message : String(cause) }));
         return;
       }
       default: {
@@ -1152,17 +1169,15 @@ export function App({ config }: Props) {
 
   // ── Modal handlers ─────────────────────────────────────────────────────
 
-  const onSubmitNewSession = (name: string, workdir: string) => {
+  const onSubmitNewSession = async (name: string, workdir: string, options: NewSessionOptions) => {
     const client = wsRef.current;
-    if (!client) return;
-    void client.createSession(name, workdir).then((resp) => {
-      if (resp.type === "response.ok" && resp.data) {
-        const info = resp.data as import("../protocol/types.js").SessionInfo;
-        dispatch({ type: "session.add", session: info });
-        dispatch({ type: "focus", sessionId: info.id });
-      }
-      dispatch({ type: "modal.close" });
-    });
+    if (!client) throw new Error("Not connected");
+    const resp = await client.createSession(name, workdir, options);
+    if (resp.type === "response.error") throw new Error(resp.error);
+    if (resp.type !== "response.ok" || !resp.data) throw new Error("Unexpected session creation response");
+    const info = resp.data as import("../protocol/types.js").SessionInfo;
+    dispatch({ type: "session.add", session: info });
+    dispatch({ type: "focus", sessionId: info.id });
   };
 
   const onSelectSession = (sessionId: string) => {
@@ -1212,11 +1227,25 @@ export function App({ config }: Props) {
    */
   const onSetModel = async (model: string): Promise<void> => {
     const client = wsRef.current;
-    if (!client || !focusedSession) return;
+    if (!client || !focusedSession) throw new Error("No connected session");
     const resp = await client.setModel(focusedSession.info.id, model);
     if (resp.type === "response.error") {
       throw new Error(resp.error);
     }
+  };
+
+  const onSetProvider = async (providerId: string): Promise<void> => {
+    const client = wsRef.current;
+    if (!client || !focusedSession) throw new Error("No connected session");
+    const response = await client.setProvider(focusedSession.info.id, providerId);
+    if (response.type === "response.error") throw new Error(response.error);
+  };
+
+  const onSetAccount = async (account: string): Promise<void> => {
+    const client = wsRef.current;
+    if (!client || !focusedSession) throw new Error("No connected session");
+    const response = await client.setClaudeAccount(focusedSession.info.id, account || null);
+    if (response.type === "response.error") throw new Error(response.error);
   };
 
   // ── Layout ─────────────────────────────────────────────────────────────
@@ -1283,6 +1312,9 @@ export function App({ config }: Props) {
       </Box>
       {state.modal && (
         <Modal
+          key={`${state.modal.kind}:${focusedSession?.info.id}`}
+          providers={state.providers}
+          client={wsRef.current}
           modal={state.modal}
           sessions={orderedSessions}
           focusedSession={focusedSession}
@@ -1292,6 +1324,8 @@ export function App({ config }: Props) {
           onCancel={onCancelModal}
           onSearch={onSearch}
           onSetModel={onSetModel}
+          onSetProvider={onSetProvider}
+          onSetAccount={onSetAccount}
         />
       )}
     </>

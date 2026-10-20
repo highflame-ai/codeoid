@@ -95,6 +95,12 @@ export function StatusBar({
         <>
           <Text dimColor>{"   │   "}</Text>
           <Text bold>{focused.info.name}</Text>
+          <Text dimColor>{` · ${focused.info.providerId ?? "claude"}`}</Text>
+          {(focused.info.providerId ?? "claude") === "claude" && (
+            <Text color={focused.info.effectiveClaudeAccount?.endsWith(" (missing)") ? "red" : "cyan"}>
+              {` · account: ${focused.info.effectiveClaudeAccount ?? focused.info.claudeAccount ?? "default"}${focused.info.claudeAccount === undefined ? " (following default)" : ""}`}
+            </Text>
+          )}
           <Text dimColor>{" @ "}</Text>
           <Text dimColor>{focused.info.workdir}</Text>
           <Text dimColor>{" · "}</Text>
@@ -348,4 +354,3 @@ function pickContextColor(inputTokens: number, contextWindow: number): string {
   if (r >= 0.5) return "yellow";
   return "green";
 }
-

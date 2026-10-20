@@ -11,8 +11,10 @@ import { randomUUID } from "node:crypto";
 import { PROTOCOL_VERSION } from "../protocol/types.js";
 import type {
   Attachment,
+  ClaudeAccountsResultMsg,
   ClientMessage,
   DaemonMessage,
+  ModelsListResultMsg,
   SessionMessage,
   ToolState,
 } from "../protocol/types.js";
@@ -114,8 +116,30 @@ export class TuiWsClient {
     return this.#request({ type: "session.list", id: randomUUID() });
   }
 
-  createSession(name: string, workdir: string): Promise<DaemonMessage> {
-    return this.#request({ type: "session.create", id: randomUUID(), name, workdir });
+  createSession(name: string, workdir: string, opts: { providerId?: string; claudeAccount?: string } = {}): Promise<DaemonMessage> {
+    return this.#request({ type: "session.create", id: randomUUID(), name, workdir, ...opts });
+  }
+
+  setProvider(sessionId: string, providerId: string): Promise<DaemonMessage> {
+    return this.#request({ type: "session.set_provider", id: randomUUID(), sessionId, providerId });
+  }
+
+  setClaudeAccount(sessionId: string, account: string | null): Promise<DaemonMessage> {
+    return this.#request({ type: "session.set_claude_account", id: randomUUID(), sessionId, account });
+  }
+
+  async listModels(provider: string): Promise<ModelsListResultMsg> {
+    const result = await this.#request({ type: "models.list", id: randomUUID(), provider });
+    if (result.type === "response.error") throw new Error(result.error);
+    if (result.type !== "models.list.result") throw new Error("Unexpected model list response");
+    return result;
+  }
+
+  async listClaudeAccounts(): Promise<ClaudeAccountsResultMsg> {
+    const result = await this.#request({ type: "claude.accounts.list", id: randomUUID() });
+    if (result.type === "response.error") throw new Error(result.error);
+    if (result.type !== "claude.accounts.result") throw new Error("Unexpected account list response");
+    return result;
   }
 
   attachSession(sessionId: string): Promise<DaemonMessage> {
@@ -501,12 +525,21 @@ export class TuiWsClient {
 
   #handleMessage(msg: DaemonMessage & { type: string; requestId?: string }): void {
     if (msg.type === "auth.ok") {
+      this.#dispatch({
+        type: "providers.set",
+        providers: msg.providerInfo ?? (msg.providers ?? ["claude"]).map((id, index) => ({
+          id, displayName: id, kind: id.startsWith("oai:") ? "endpoint" : "builtin", isDefault: index === 0,
+        })),
+      });
       this.#dispatch({ type: "connection.change", state: "connected" });
       this.#reconnectDelay = this.#reconnectDelayBase;
       this.#authReconnects = 0;
       this.#startHeartbeat();
       // Fetch session list on connect.
       void this.#refreshSessions();
+      void this.#request({ type: "providers.list", id: randomUUID() }).then((result) => {
+        if (result.type === "providers.result") this.#dispatch({ type: "providers.set", providers: result.providers });
+      }).catch(() => {});
       return;
     }
 
@@ -523,6 +556,9 @@ export class TuiWsClient {
 
     // Broadcast events — fan into the store.
     switch (msg.type) {
+      case "providers.changed":
+        this.#dispatch({ type: "providers.set", providers: msg.providers });
+        break;
       case "session.message": {
         const m = msg as SessionMessage;
         this.#dispatch({ type: "session.message", sessionId: m.sessionId, message: m });

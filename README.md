@@ -268,6 +268,25 @@ The daemon refuses to start if that backend is misspelled, disabled, or not inst
 Existing sessions keep the backend they were created on, and the conductor stays on `conductor.provider`.
 Set keys from the Settings screen (⚙ / `/settings`) or by editing `~/.codeoid/.env` — see [Configuration](docs/CONFIGURATION.md) for every variable.
 
+### OpenAI-compatible endpoints
+
+Add several local servers or hosted gateways; each becomes a backend named `oai:<name>` without restarting the daemon:
+
+```bash
+codeoid endpoint add gpu-box --base-url http://localhost:8000/v1 --model qwen3-coder:128k
+codeoid endpoint add gateway --base-url https://gateway.example.com/v1 --key
+codeoid endpoint test gpu-box
+codeoid new local-work . --provider oai:gpu-box
+```
+
+`--key` prompts for the credential without echo. Keys and custom header values are stored in `~/.codeoid/endpoints.json` with mode 0600; list responses expose only whether a key exists and the header names. Public URLs require HTTPS. Use `--flavor llamacpp` for llama-server's context-window discovery and strict tool schemas. Omit `--model` to use the server's `/models` catalog. `codeoid endpoint import-pi --file <path>` imports compatible `openai-completions` providers from pi's `models.json`; command-based secrets are not executed.
+
+Manage endpoints in the web Settings → OpenAI endpoints tab or with `codeoid endpoint ls|set|rm|test`. Edits apply on the next turn. Sessions on a removed endpoint report an error until you choose another backend.
+
+In `codeoid tui`, `/provider` opens the live backend picker and `/model` fetches the selected backend's model catalog. You can also enter `/provider oai:gpu-box` or `/model <id>` directly. `/new` (Ctrl-N) includes provider and Claude account choices: Tab changes fields, arrow keys change a choice, and Enter creates the session.
+
+For Claude sessions, `/account` opens the account picker. `/account <name>` pins a named credential, `/account default` pins the machine's own login, and `/account --follow-default` follows the daemon default. The status bar shows the effective account, including missing accounts. Configure accounts through the web Settings → Claude accounts tab or `codeoid account`; reading and changing accounts requires the corresponding settings scopes.
+
 > **Gemini needs an API key (or Vertex) — a consumer Google (AI Pro/Ultra) subscription can't be used with Codeoid.**
 > Both Gemini backends authenticate with `GEMINI_API_KEY` / `GOOGLE_API_KEY` (from [AI Studio](https://aistudio.google.com/apikey)) or Vertex.
 > The difference is capability: `gemini-cli` runs the full Gemini CLI over ACP (streaming + its own tools/MCP), while `gemini` is a lightweight in-daemon API client.
