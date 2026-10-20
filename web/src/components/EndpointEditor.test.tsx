@@ -64,6 +64,15 @@ describe("EndpointEditor", () => {
     await waitFor(() => expect(sent()[0]).toMatchObject({ apiKey: null }));
   });
 
+  it("clearing model and context overrides sends explicit nulls", async () => {
+    clientRequestMock.mockResolvedValue({ type: "endpoints.result", requestId: "r", endpoints: [STORED] });
+    const { getByText, getByDisplayValue } = render(() => <EndpointEditor existing={{ ...STORED, defaultModel: "local-default", contextWindow: 32768 }} onDone={() => {}} />);
+    fireEvent.input(getByDisplayValue("local-default"), { target: { value: "" } });
+    fireEvent.input(getByDisplayValue("32768"), { target: { value: "" } });
+    fireEvent.click(getByText("Save"));
+    await waitFor(() => expect(sent()[0]).toMatchObject({ defaultModel: null, contextWindow: null }));
+  });
+
   it("a new endpoint: validates the name, tests the draft, and adds it", async () => {
     clientRequestMock.mockImplementation(async (msg) =>
       msg.type === "endpoints.test"

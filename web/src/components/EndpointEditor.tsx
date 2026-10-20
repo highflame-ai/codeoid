@@ -137,8 +137,8 @@ export const EndpointEditor: Component<{ existing?: EndpointInfo; onDone: () => 
             ...(x ? { maxTokens: x } : {}),
           };
         }),
-        ...(defaultModel().trim() ? { defaultModel: defaultModel().trim() } : {}),
-        ...(ctx ? { contextWindow: ctx } : {}),
+        defaultModel: defaultModel().trim() || null,
+        contextWindow: ctx ?? null,
         mcpServers:
           mcpMode() === "all"
             ? "all"
