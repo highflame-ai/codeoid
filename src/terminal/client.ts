@@ -797,7 +797,7 @@ export class TerminalClient {
       console.log("  (shown exactly as it runs; characters that wouldn't show are escaped as \\u{…}, and a run of spaces counted)");
       console.log("  (an env value that is exactly ${VAR} resolves from the daemon's environment when it starts; header values are sent as written)");
       const q = (v: string) => clean(`'${v.replace(/'/g, "'\\''")}'`); // pasted back into a shell: quoted
-      console.log(`To approve exactly this entry: codeoid mcp approve ${q(sessionIdOrName)} ${q(p.server)} --path ${q(p.path)} --yes ${p.fingerprint}`);
+      console.log(`To approve exactly this entry: codeoid mcp approve --path ${q(p.path)} --yes ${p.fingerprint} -- ${q(sessionIdOrName)} ${q(p.server)}`);
       return;
     }
     // The entry reviewed, not whatever is in the file now.

@@ -228,6 +228,11 @@ export class SessionMcpView implements McpServerView {
     return w.claudeApproval === "approved" ? "claude" : "codeoid";
   }
 
+  /** A server of this name is the user's own or codeoid's — not one a project declared. */
+  isUsersOwn(name: string): boolean {
+    return this.list().some((s) => s.name === name && s.origin !== "claude-repo") || this.#read.some((w) => w.name === name && w.origin === "claude-local");
+  }
+
   /** A name the project's .mcp.json declared, on a backend that loads that file itself: its tools may be the repo's. */
   leftToBackend(name: string, backendId: string): boolean {
     return READS_MCP_JSON.has(backendId) && (this.#repoUnreadable || this.#mcpJsonNames.has(name));

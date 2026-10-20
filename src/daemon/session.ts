@@ -5274,8 +5274,8 @@ export class Session {
     // declare any server (or since the backend was built did, or can't be
     // read), no tool there gets a readonly trust: each asks (#395).
     if (!this.#noteProjectMcpNames() || this.#mcpProjectNames.size > 0) return false;
-    // Claude's own plugin and claude.ai connector tools: never a codeoid server's.
-    if (this.providerId === "claude" && /^mcp__(plugin_|claude_ai_)/.test(toolName)) return false;
+    // Claude's own plugin, claude.ai connector and IDE tools: never a codeoid server's.
+    if (this.providerId === "claude" && /^mcp__(plugin_|claude_ai_|ide__)/.test(toolName)) return false;
     for (const spec of view.forBackend(this.providerId)) {
       if (view.leftToBackend(spec.name, this.providerId)) continue;
       if (spec.trust === "readonly" && toolName.startsWith(`mcp__${spec.name}__`)) return true;
@@ -6192,6 +6192,9 @@ export class Session {
         for (const [name, status] of Object.entries(event.servers)) {
           this.#sdkMcpStatus.set(name, status);
           this.#sdkMcpTools.set(name, []);
+          // What the backend actually loaded beyond the user's own and codeoid's:
+          // a project's, wherever it was declared — no readonly trust while it runs (#395).
+          if (this.#mcpView && !this.#mcpView.isUsersOwn(name) && !name.startsWith("claude.ai ")) this.#mcpProjectNames.add(name);
         }
         for (const [server, tools] of Object.entries(event.tools)) {
           this.#sdkMcpTools.set(server, tools);

@@ -374,9 +374,40 @@ describe("a session's view", () => {
       else process.env.CODEX_HOME = saved;
     }
     expect(projectDeclaredNames(sub, "codex")).toBeNull(); // a project's: nothing ruled out
+    // A project's plugin marketplace (Codex reads it too): nothing ruled out.
+    rmSync(join(work, ".codex"), { recursive: true });
+    expect(projectDeclaredNames(sub, "codex")).toEqual(new Set());
+    mkdirSync(join(work, ".agents", "plugins"), { recursive: true });
+    expect(projectDeclaredNames(sub, "codex")).toBeNull();
+    rmSync(join(work, ".agents"), { recursive: true });
     // Read from where the CLI runs: a symlinked workdir's real parents.
     symlinkSync(sub, join(tmp, "link"));
     expect(projectDeclaredNames(join(tmp, "link"), "claude")).toEqual(new Set(["root", "leaf"]));
+    // ...and the parents of the path it was given (a CLI may walk that one).
+    mkdirSync(join(tmp, "logical"));
+    writeFileSync(join(tmp, "logical", ".mcp.json"), JSON.stringify({ mcpServers: { above: {} } }));
+    symlinkSync(sub, join(tmp, "logical", "link"));
+    expect(projectDeclaredNames(join(tmp, "logical", "link"), "claude")).toEqual(new Set(["root", "leaf", "above"]));
+  });
+
+  it("subagent definitions that declare servers of their own rule nothing out — the user's own agents aside", () => {
+    mkdirSync(join(work, ".claude", "agents", "team"), { recursive: true });
+    writeFileSync(join(work, ".claude", "agents", "team", "plain.md"), "---\nname: plain\n---\nDoes things.\n");
+    expect(projectDeclaredNames(work, "claude")).toEqual(new Set());
+    writeFileSync(join(work, ".claude", "agents", "team", "helper.md"), "---\nname: helper\nmcpServers:\n  github__x: { type: http, url: https://x/mcp }\n---\n");
+    expect(projectDeclaredNames(work, "claude")).toBeNull();
+    expect(projectDeclaredNames(join(work), "codex")).toEqual(new Set()); // not Codex's
+    const saved = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = join(work, ".claude"); // the same files, as the user's own agents
+    try {
+      expect(projectDeclaredNames(work, "claude")).toEqual(new Set());
+    } finally {
+      if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = saved;
+    }
+    mkdirSync(join(work, ".qwen", "agents"), { recursive: true });
+    writeFileSync(join(work, ".qwen", "agents", "a.md"), "---\nmcpServers:\n  github: {}\n---\n");
+    expect(projectDeclaredNames(work, "qwen")).toBeNull();
   });
 
   it("an edit that keeps a project file's size and puts its mtime back is still seen", async () => {
@@ -898,8 +929,21 @@ describe("approve and refresh, through the session manager", () => {
     expect(m._sessionForTest(sid)!.status).toBe("waiting_approval");
   });
 
-  for (const [name, expected] of [["db", "allow"], ["plugin_db", "ask"]] as const) {
-    it(`on Claude, a readonly trust ${expected === "allow" ? "works with no project servers about" : "never covers Claude's own plugin tools (plugin_…)"}`, async () => {
+  it("a server the backend reports loading that is neither the user's nor codeoid's turns readonly off, wherever it was declared", async () => {
+    const registry = new McpRegistry({ github: raw({ command: "gh-mcp", trust: "readonly" }) }, { memoryEnabled: false });
+    const providers: MockSessionProvider[] = [];
+    const init = { type: "mcp_init", servers: { github: "connected", sneaky: "connected" }, tools: {} } as ProviderEvent;
+    const tool = { type: "tool_start", toolId: "t1", sdkToolUseId: "s1", name: "mcp__github__read", input: {}, approvalId: "a1" } as ProviderEvent;
+    const m = manager(() => new MockSessionProvider("qwen", [[init, tool]], { stall: true }), (p) => providers.push(p), "qwen", registry);
+    const sid = await session(m);
+    await m._sessionForTest(sid)!.send("go", auth(ALL));
+    for (let i = 0; i < 200 && m._sessionForTest(sid)!.status !== "waiting_approval" && !providers[0]?.canUseToolResults.length; i++) await Bun.sleep(5);
+    expect(providers[0]!.canUseToolResults).toEqual([]);
+    expect(m._sessionForTest(sid)!.status).toBe("waiting_approval");
+  });
+
+  for (const [name, expected] of [["db", "allow"], ["plugin_db", "ask"], ["ide", "ask"]] as const) {
+    it(`on Claude, a readonly trust ${expected === "allow" ? "works with no project servers about" : `never covers Claude's own tools (${name}…)`}`, async () => {
       const registry = new McpRegistry({ [name]: raw({ command: "db-mcp", trust: "readonly" }) }, { memoryEnabled: false });
       const providers: MockSessionProvider[] = [];
       const tool = { type: "tool_start", toolId: "t1", sdkToolUseId: "s1", name: `mcp__${name}__query`, input: {}, approvalId: "a1" } as ProviderEvent;

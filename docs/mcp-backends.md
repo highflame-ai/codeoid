@@ -50,11 +50,19 @@ The capabilities drawer says, for each of Claude's servers, whether it reaches t
 
 ## A `readonly` trust and a project's own servers
 
-Claude Code, Qwen, the Gemini CLI and Codex can load MCP servers from project files themselves: Claude Code `.mcp.json` from the workdir and every directory above it, Qwen the workdir's `.mcp.json` and `.qwen/settings.json`, the Gemini CLI `.gemini/settings.json`, Codex a project's `.codex/config.toml`.
+Claude Code, Qwen, the Gemini CLI and Codex can load MCP servers a project declares, on their own:
+
+- Claude Code: `.mcp.json` in the workdir and every directory above it, and servers in subagent definitions (`.claude/agents/`) there;
+- Qwen: the workdir's `.mcp.json`, `.qwen/settings.json` and `.qwen/agents/`;
+- the Gemini CLI: `.gemini/settings.json` and `.gemini/agents/`;
+- Codex: a project's `.codex/` or `.agents/plugins/` (not read here, so its presence alone counts; your own `~/.codex` doesn't).
+
 A tool from one of those may be the repo's server under a name like one you trust — each CLI maps, merges and shortens server names into tool names its own way, so no name match can rule that out.
-So while those files declare any server (or have, since the backend started), a `readonly` trust auto-approves nothing on that backend: each tool asks.
-The same holds if one of those files can't be read (or, for Codex, exists at all — codeoid doesn't read its TOML; your own `~/.codex/config.toml` doesn't count).
-On Claude, its own plugin and claude.ai connector tools (`mcp__plugin_…`, `mcp__claude_ai_…`) are never treated as a codeoid server's.
+So while a project declares any server there (or has since the backend started), and whenever the backend reports loading a server that's neither yours nor codeoid's, a `readonly` trust auto-approves nothing on that backend: each tool asks.
+The same holds if one of those files can't be read.
+On Claude, its own plugin, claude.ai connector and IDE tools (`mcp__plugin_…`, `mcp__claude_ai_…`, `mcp__ide__…`) are never treated as a codeoid server's.
+
+This narrows a weakness older than this page: before, a `readonly` trust applied to any tool under the trusted name.
 
 ## When two entries share a name
 

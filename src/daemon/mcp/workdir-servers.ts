@@ -20,7 +20,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { readFileSync, realpathSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { open, realpath, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -235,30 +235,82 @@ function strings(x: unknown): string[] {
  * `.codex/config.toml` (TOML, not read here): one anywhere up the tree means
  * nothing can be ruled out.
  */
-function projectMcpFiles(workdir: string, backendId: string): { json: string[]; opaque: string[] } {
-  // From where the CLI runs: its cwd is the physical directory.
-  let start = path.resolve(workdir);
-  try {
-    start = realpathSync(start);
-  } catch {}
-  const up: string[] = [];
-  for (let d = start; d !== path.dirname(d); d = path.dirname(d)) up.push(d);
+function projectMcpFiles(workdir: string, backendId: string): { json: string[]; agents: string[]; opaque: string[] } {
+  // Every directory above the workdir, by its path as given and as it
+  // really is (a CLI may walk either): both, to rule out nothing.
+  const up = new Set<string>();
+  for (const start of [path.resolve(workdir), realOr(workdir)]) {
+    for (let d = start; d !== path.dirname(d); d = path.dirname(d)) up.add(d);
+  }
+  const dirs = [...up];
   switch (backendId) {
     case "claude":
-      return { json: up.map((d) => path.join(d, ".mcp.json")), opaque: [] };
+      // Subagent definitions can declare servers of their own in frontmatter.
+      // (The user's own agents, in Claude's config dir, aren't a project's.)
+      return {
+        json: dirs.map((d) => path.join(d, ".mcp.json")),
+        agents: dirs.map((d) => path.join(d, ".claude", "agents")).filter((a) => !isClaudeConfigAgents(a)),
+        opaque: [],
+      };
     case "qwen":
-      return { json: [path.join(workdir, ".mcp.json"), path.join(workdir, ".qwen", "settings.json")], opaque: [] };
+      return { json: [path.join(workdir, ".mcp.json"), path.join(workdir, ".qwen", "settings.json")], agents: [path.join(workdir, ".qwen", "agents")], opaque: [] };
     case "gemini-cli":
-      return { json: [path.join(workdir, ".gemini", "settings.json")], opaque: [] };
+      return { json: [path.join(workdir, ".gemini", "settings.json")], agents: [path.join(workdir, ".gemini", "agents")], opaque: [] };
     case "codex": {
-      // The user's own Codex config (CODEX_HOME, ~/.codex) isn't a project's.
-      const own = path.join(process.env.CODEX_HOME || path.join(homedir(), ".codex"), "config.toml");
-      return { json: [], opaque: up.map((d) => path.join(d, ".codex", "config.toml")).filter((f) => f !== own) };
+      // A project's Codex config, agent roles or plugin marketplace: not read
+      // here, so nothing can be ruled out. The user's own (CODEX_HOME, ~/.codex) isn't a project's.
+      const own = new Set([path.join(process.env.CODEX_HOME || path.join(homedir(), ".codex"))].flatMap((d) => [d, realOr(d)]));
+      return { json: [], agents: [], opaque: dirs.flatMap((d) => [path.join(d, ".codex"), path.join(d, ".agents", "plugins")]).filter((f) => !own.has(f) && !own.has(realOr(f))) };
     }
     default:
-      return { json: [], opaque: [] };
+      return { json: [], agents: [], opaque: [] };
   }
 }
+
+function isClaudeConfigAgents(dir: string): boolean {
+  const own = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(homedir(), ".claude"), "agents");
+  return dir === own || realOr(dir) === realOr(own);
+}
+
+function realOr(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return path.resolve(p);
+  }
+}
+
+/** Agent definition files under `dir` that name MCP servers (any mention counts: unparsed, nothing ruled out). */
+function agentsDeclareServers(dir: string): boolean {
+  let entries: string[];
+  try {
+    entries = readdirSync(dir, { recursive: true }) as string[];
+  } catch {
+    return false; // none
+  }
+  for (const rel of entries.slice(0, MAX_AGENT_FILES)) {
+    const file = path.join(dir, rel);
+    try {
+      const st = statSync(file);
+      if (!st.isFile()) continue;
+      const stamp = `${st.dev}:${st.ino}:${st.size}:${st.mtimeMs}:${st.ctimeMs}`;
+      const hit = agentCache.get(file);
+      let names: boolean;
+      if (hit && hit.stamp === stamp) names = hit.names;
+      else {
+        names = st.size > MAX_REPO_FILE_BYTES || /mcpServers|mcp_servers/i.test(readFileSync(file, "utf8"));
+        if (Date.now() - Math.max(st.mtimeMs, st.ctimeMs) > RACY_MS) agentCache.set(file, { stamp, names });
+      }
+      if (names) return true;
+    } catch {
+      return true; // there, and unreadable
+    }
+  }
+  return entries.length > MAX_AGENT_FILES;
+}
+
+const MAX_AGENT_FILES = 500;
+const agentCache = new Map<string, { stamp: string; names: boolean }>();
 
 /** A file changed this recently isn't trusted to its cache: file times are coarse. */
 const RACY_MS = 2000;
@@ -272,13 +324,14 @@ const declaredCache = new Map<string, { stamp: string; names: ReadonlySet<string
  * one is there but can't be read, so nothing can be ruled out.
  */
 export function projectDeclaredNames(workdir: string, backendId: string): ReadonlySet<string> | null {
-  const { json, opaque } = projectMcpFiles(workdir, backendId);
+  const { json, agents, opaque } = projectMcpFiles(workdir, backendId);
   for (const file of opaque) {
     try {
       statSync(file);
       return null; // there, and not read here
     } catch {}
   }
+  for (const dir of agents) if (agentsDeclareServers(dir)) return null;
   const out = new Set<string>();
   for (const file of json) {
     let st: ReturnType<typeof statSync>;
