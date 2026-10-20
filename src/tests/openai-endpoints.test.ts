@@ -54,11 +54,12 @@ beforeAll(() => {
       if (url.pathname === "/v1/chat/completions") {
         const model = String(body?.model);
         const chunk = (o: unknown) => `data: ${JSON.stringify(o)}\n\n`;
-        const sse =
-          chunk({ id: "c", object: "chat.completion.chunk", model, choices: [{ index: 0, delta: { role: "assistant", content: `hello from ${model}` } }] }) +
-          chunk({ id: "c", object: "chat.completion.chunk", model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }) +
-          chunk({ id: "c", object: "chat.completion.chunk", model, choices: [], usage: { prompt_tokens: 12, completion_tokens: 3 } }) +
-          "data: [DONE]\n\n";
+        const sse = [
+          chunk({ id: "c", object: "chat.completion.chunk", model, choices: [{ index: 0, delta: { role: "assistant", content: `hello from ${model}` } }] }),
+          chunk({ id: "c", object: "chat.completion.chunk", model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }),
+          chunk({ id: "c", object: "chat.completion.chunk", model, choices: [], usage: { prompt_tokens: 12, completion_tokens: 3 } }),
+          "data: [DONE]\n\n",
+        ].join("");
         return new Response(sse, { headers: { "content-type": "text/event-stream" } });
       }
       return new Response("not found", { status: 404 });
@@ -106,6 +107,18 @@ describe("EndpointStore", () => {
     const store = storeAt();
     store.upsert({ name: "local", baseUrl: "http://127.0.0.1:8080/v1", flavor: "llamacpp" });
     expect(store.list()[0]).toMatchObject({ flavor: "llamacpp", strictToolSchemas: true, mcpServers: [] });
+  });
+
+  test("rotating a key preserves model settings; explicit values clear overrides", () => {
+    const store = storeAt();
+    const baseUrl = "http://localhost:8000/v1";
+    store.upsert({ name: "box", baseUrl, displayName: "GPU box", defaultModel: "local-model", contextWindow: 32768, apiKey: "old-key" });
+    store.upsert({ name: "box", baseUrl, apiKey: "new-key" });
+    expect(store.get("box")).toMatchObject({ displayName: "GPU box", defaultModel: "local-model", contextWindow: 32768, apiKey: "new-key" });
+    store.upsert({ name: "box", baseUrl, displayName: "", defaultModel: null, contextWindow: null });
+    expect(store.get("box")?.displayName).toBeUndefined();
+    expect(store.get("box")?.defaultModel).toBeUndefined();
+    expect(store.get("box")?.contextWindow).toBeUndefined();
   });
 
   test("validates URLs: https for public hosts, http only for local and private ones", () => {

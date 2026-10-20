@@ -54,8 +54,8 @@ export interface EndpointInput {
   /** absent = keep the stored headers, present = replace them all. */
   headers?: Record<string, string>;
   models?: EndpointModel[];
-  defaultModel?: string;
-  contextWindow?: number;
+  defaultModel?: string | null;
+  contextWindow?: number | null;
   mcpServers?: "all" | string[];
   streamUsage?: boolean;
   strictToolSchemas?: boolean;
@@ -352,14 +352,14 @@ export class EndpointStore {
     const headers = input.headers === undefined ? existing?.headers : input.headers;
     const next = validateStoredEndpoint({
       name: input.name,
-      ...(input.displayName?.trim() ? { displayName: input.displayName.trim() } : {}),
+      displayName: input.displayName === undefined ? existing?.displayName : input.displayName.trim() || undefined,
       baseUrl: input.baseUrl,
       flavor,
       ...(apiKey !== undefined ? { apiKey } : {}),
       ...(headers && Object.keys(headers).length > 0 ? { headers } : {}),
       models: input.models ?? existing?.models ?? [],
-      ...(input.defaultModel ? { defaultModel: input.defaultModel } : {}),
-      ...(input.contextWindow ? { contextWindow: input.contextWindow } : {}),
+      defaultModel: input.defaultModel === undefined ? existing?.defaultModel : input.defaultModel ?? undefined,
+      contextWindow: input.contextWindow === undefined ? existing?.contextWindow : input.contextWindow ?? undefined,
       // Tool definitions ride in every prompt: a local server's small context
       // is better off without external servers unless asked for.
       mcpServers: input.mcpServers ?? existing?.mcpServers ?? (flavor === "llamacpp" ? [] : "all"),

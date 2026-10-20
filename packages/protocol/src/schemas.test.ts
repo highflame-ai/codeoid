@@ -38,6 +38,11 @@ test("every ClientMessage variant has a schema and vice versa (compile-time)", (
   expect(covered).toBe(true);
 });
 
+test("endpoint overrides can be explicitly removed without stripping nulls", () => {
+  const message: ClientMessage = { type: "endpoints.set", id: "clear", name: "box", baseUrl: "http://localhost:8000/v1", defaultModel: null, contextWindow: null };
+  expect(parseClientMessage(message)).toEqual({ ok: true, value: message });
+});
+
 // ── 2. Fidelity: one valid sample per variant, keyed so adding a variant
 //      without a sample is a compile error ─────────────────────────────────────
 

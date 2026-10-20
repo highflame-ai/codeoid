@@ -52,25 +52,23 @@ function streamFrom(chunks: CompletionChunk[]): AsyncIterable<CompletionChunk> {
 
 mock.module("openai", () => {
   return {
-    default: class OpenAI {
-      constructor(opts?: { baseURL?: string }) {
-        // These tests never set a base URL; a client aimed at one belongs to
-        // another file's local server — give it the real SDK.
-        if (opts?.baseURL) return new RealOpenAI(opts as ConstructorParameters<typeof RealOpenAI>[0]) as unknown as OpenAI;
-      }
-      chat = {
-        completions: {
-          create: async (body: Record<string, unknown>, _opts: unknown) => {
-            sentBodies.push(body);
-            if (roundScript) return streamFrom(roundScript.shift() ?? []);
-            return streamFrom([...streamChunks]);
+    default: function OpenAI(opts?: ConstructorParameters<typeof RealOpenAI>[0]) {
+      if (opts?.baseURL) return new RealOpenAI(opts);
+      return {
+        chat: {
+          completions: {
+            create: async (body: Record<string, unknown>, _opts: unknown) => {
+              sentBodies.push(body);
+              if (roundScript) return streamFrom(roundScript.shift() ?? []);
+              return streamFrom([...streamChunks]);
+            },
           },
         },
-      };
-      models = {
-        list: async () => {
-          if (modelsResult instanceof Error) throw modelsResult;
-          return { data: modelsResult };
+        models: {
+          list: async () => {
+            if (modelsResult instanceof Error) throw modelsResult;
+            return { data: modelsResult };
+          },
         },
       };
     },

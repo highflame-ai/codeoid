@@ -128,6 +128,8 @@ export interface EndpointsListMsg {
  * it, a string replaces it. `headers` absent keeps the stored headers; present
  * replaces them all (values included — they are never sent back, so an edit
  * re-enters them).
+ * Other omitted fields keep their stored values. An empty displayName removes
+ * the label; null defaultModel or contextWindow removes that override.
  */
 export interface EndpointsSetMsg {
   type: "endpoints.set";
@@ -139,8 +141,8 @@ export interface EndpointsSetMsg {
   apiKey?: string | null;
   headers?: Record<string, string>;
   models?: EndpointModel[];
-  defaultModel?: string;
-  contextWindow?: number;
+  defaultModel?: string | null;
+  contextWindow?: number | null;
   mcpServers?: "all" | string[];
   streamUsage?: boolean;
   strictToolSchemas?: boolean;
