@@ -12,7 +12,7 @@
  * silently doing nothing (or worse, desyncing the local store).
  */
 
-import { Component, For, Show, createEffect, createSignal, on, onCleanup } from "solid-js";
+import { Component, For, Show, createEffect, createSignal, on } from "solid-js";
 
 import {
   authIdentity,
@@ -36,6 +36,9 @@ import { openBlackboard } from "../state/blackboard";
 import { openExportModal } from "./SessionExportModal";
 import { openUndoLast } from "./RewindModal";
 import { openCompare } from "./CompareModal";
+import { providerIds, providerLabel } from "../state/providers";
+import { AccountPicker } from "./AccountPicker";
+import { useDismissable } from "../lib/dismissable";
 
 const MODE_OPTIONS: { value: SessionMode; label: string; hint: string }[] = [
   { value: "guarded", label: "guarded", hint: "Read/Grep/Glob auto; Write/Edit/Bash ask (default)" },
@@ -114,6 +117,9 @@ const SessionControls: Component = () => {
             provider={s().providerId}
           />
           <ProviderPicker sessionId={s().id} current={s().providerId} />
+          <Show when={(s().providerId ?? "claude") === "claude"}>
+            <AccountPicker sessionId={s().id} chosen={s().claudeAccount} effective={s().effectiveClaudeAccount} />
+          </Show>
           <ForkButton sessionId={s().id} current={s().providerId} />
           <ExportButton />
           <span class="ml-auto" />
@@ -303,31 +309,6 @@ const RotateButton: Component<{ sessionId: string }> = (props) => {
   );
 };
 
-/** Dismiss a dropdown on Escape or a pointer-down outside its root — the menus
- * previously closed only on `onMouseLeave`, which a keyboard/touch user can't
- * trigger, so the menu stayed open over the content. Call inside a component. */
-function useDismissable(
-  rootRef: () => HTMLElement | undefined,
-  isOpen: () => boolean,
-  close: () => void,
-): void {
-  createEffect(() => {
-    if (!isOpen()) return;
-    const onDown = (e: PointerEvent) => {
-      const el = rootRef();
-      if (el && !el.contains(e.target as Node)) close();
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") close();
-    };
-    document.addEventListener("pointerdown", onDown);
-    document.addEventListener("keydown", onKey);
-    onCleanup(() => {
-      document.removeEventListener("pointerdown", onDown);
-      document.removeEventListener("keydown", onKey);
-    });
-  });
-}
 
 const ModePicker: Component<{
   sessionId: string;
@@ -529,7 +510,7 @@ const ProviderPicker: Component<{
   const [error, setError] = createSignal<string | null>(null);
   let rootEl: HTMLDivElement | undefined;
   useDismissable(() => rootEl, open, () => setOpen(false));
-  const providers = () => authIdentity()?.providers ?? [];
+  const providers = providerIds;
   const current = () => props.current ?? providers()[0] ?? "claude";
   return (
     <Show when={providers().length > 1}>
@@ -543,7 +524,7 @@ const ProviderPicker: Component<{
           class="flex items-center gap-1 rounded border border-border bg-bg px-2 py-1 font-mono uppercase tracking-wider text-fg-muted hover:border-accent/40 hover:text-fg"
           title="Switch this session's backend (/provider <id>)"
         >
-          backend <span class="text-fg">{current()}</span> ▾
+          backend <span class="text-fg">{providerLabel(current())}</span> ▾
         </button>
         <Show when={open()}>
           <div class="absolute right-0 top-full z-30 mt-1 w-64 rounded border border-border bg-bg-elev shadow-xl">
@@ -574,7 +555,7 @@ const ProviderPicker: Component<{
                     id === current() ? "bg-bg-active text-fg" : "text-fg-muted"
                   }`}
                 >
-                  <span class="font-mono">{id}</span>
+                  <span class="font-mono" title={id}>{providerLabel(id)}</span>
                   <Show when={id === current()}>
                     <span class="text-accent">●</span>
                   </Show>
@@ -624,7 +605,7 @@ const ForkButton: Component<{
   const canFork = () => !(forkFromBase() && baseBranch().trim().length === 0);
   let rootEl: HTMLDivElement | undefined;
   useDismissable(() => rootEl, open, () => setOpen(false));
-  const providers = () => authIdentity()?.providers ?? [];
+  const providers = providerIds;
   // Backends OTHER than the current one — the "fork onto X" targets.
   const otherBackends = () => providers().filter((p) => p !== (props.current ?? providers()[0]));
 
@@ -727,7 +708,7 @@ const ForkButton: Component<{
             class="flex w-full items-center justify-between border-t border-border px-3 py-1.5 text-left text-[12px] text-fg-muted transition hover:bg-bg-hover disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
           >
             <span>fork (same backend)</span>
-            <span class="font-mono text-fg-faint">{props.current ?? providers()[0]}</span>
+            <span class="font-mono text-fg-faint">{providerLabel(props.current ?? providers()[0])}</span>
           </button>
           <Show when={otherBackends().length > 0}>
             <div class="border-t border-border px-3 py-1 text-[10px] uppercase tracking-wider text-fg-faint">
@@ -741,7 +722,7 @@ const ForkButton: Component<{
                   disabled={!canFork()}
                   class="flex w-full items-center px-3 py-1.5 text-left text-[12px] text-fg-muted transition hover:bg-bg-hover disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
                 >
-                  <span class="font-mono">{id}</span>
+                  <span class="font-mono" title={id}>{providerLabel(id)}</span>
                 </button>
               )}
             </For>

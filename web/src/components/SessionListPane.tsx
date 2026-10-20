@@ -43,6 +43,7 @@ import type { SessionInfo, SessionStatus } from "../protocol/types";
 import FileTree from "./files/FileTree";
 import { openNewSessionModal } from "./NewSessionModal";
 import AnalyticsPanel from "./AnalyticsPanel";
+import { providerLabel } from "../state/providers";
 
 /** Focus a session and, on mobile, close the off-canvas drawer. */
 function pickSession(id: string): void {
@@ -526,7 +527,7 @@ const SessionRow: Component<{
               class="rounded border border-accent/40 bg-accent/10 px-1 font-mono text-[10px] text-accent"
               title={`Backend: ${props.session.providerId}${props.session.model ? ` · model: ${props.session.model}` : ""}`}
             >
-              {props.session.providerId}
+              {providerLabel(props.session.providerId)}
             </span>
           </Show>
           {/* Ambient pack, from `profile` ("pack-id" or "pack-id (role)").

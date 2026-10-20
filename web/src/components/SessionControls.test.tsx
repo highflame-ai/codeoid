@@ -31,6 +31,7 @@ import {
   _resetSessionsForTest,
 } from "../state/sessions";
 import type { SessionInfo } from "../protocol/types";
+import { _resetProvidersForTest, ingestAuthProviders } from "../state/providers";
 
 function sess(providerId?: string, status: SessionInfo["status"] = "idle"): SessionInfo {
   return {
@@ -47,6 +48,8 @@ function sess(providerId?: string, status: SessionInfo["status"] = "idle"): Sess
 }
 
 function mockAuth(providers?: string[], capabilities?: string[]): void {
+  // The pickers read the providers store, which connection.ts feeds from auth.ok.
+  ingestAuthProviders(providers ? { providers } : {});
   authMock.mockReturnValue({
     type: "auth.ok",
     identity: { sub: "u", type: "human" },
@@ -59,6 +62,7 @@ function mockAuth(providers?: string[], capabilities?: string[]): void {
 afterEach(() => {
   cleanup();
   _resetSessionsForTest();
+  _resetProvidersForTest();
   fetchModelsMock.mockClear();
   refreshSessionsMock.mockClear();
   requestMock.mockReset();

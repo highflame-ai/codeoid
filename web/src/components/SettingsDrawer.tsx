@@ -38,6 +38,8 @@ import type {
   SettingState,
   SettingValue,
 } from "../protocol/types";
+import { ClaudeAccountsPanel } from "./ClaudeAccountsPanel";
+import { EndpointsPanel } from "./EndpointsPanel";
 
 /**
  * A backend tab whose id names a backend codeoid can sign in interactively.
@@ -50,6 +52,13 @@ function isLoginBackend(tabId: string): LoginBackend | null {
 
 const [openSignal, setOpenSignal] = createSignal(false);
 const [activeTab, setActiveTab] = createSignal<string>("");
+
+/** Tabs that render their own panel instead of manifest fields. */
+const SYNTHETIC_TABS = [
+  { id: "claude-accounts", icon: "⚿", title: "Claude accounts" },
+  { id: "endpoints", icon: "⇄", title: "OpenAI endpoints" },
+] as const;
+const isSyntheticTab = (id: string) => SYNTHETIC_TABS.some((t) => t.id === id);
 const [showAdvanced, setShowAdvanced] = createSignal(false);
 
 // Staged edits, keyed by field.key. A present key is a pending change; a `null`
@@ -180,6 +189,24 @@ const SettingsDrawer: Component = () => {
                   <span>MCP Servers</span>
                 </button>
               </Show>
+              {/* Synthetic tabs backed by their own messages, not the manifest:
+                  variable-length collections with write-only secrets. */}
+              <For each={SYNTHETIC_TABS}>
+                {(t) => (
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab(t.id)}
+                    class={`flex w-full items-center gap-2 border-l-2 px-3 py-1.5 text-left text-[13px] transition ${
+                      activeTab() === t.id
+                        ? "border-accent bg-bg-active/40 text-fg"
+                        : "border-transparent text-fg-muted hover:bg-bg-hover hover:text-fg"
+                    }`}
+                  >
+                    <span class="w-4 text-center">{t.icon}</span>
+                    <span>{t.title}</span>
+                  </button>
+                )}
+              </For>
             </nav>
 
             {/* Content */}
@@ -190,7 +217,13 @@ const SettingsDrawer: Component = () => {
               <Show when={activeTab() === "mcp"}>
                 <McpServersPanel servers={settingsState().snapshot?.mcpServers ?? []} />
               </Show>
-              <Show when={activeTab() !== "mcp" && tab()} keyed>
+              <Show when={activeTab() === "claude-accounts"}>
+                <ClaudeAccountsPanel />
+              </Show>
+              <Show when={activeTab() === "endpoints"}>
+                <EndpointsPanel />
+              </Show>
+              <Show when={activeTab() !== "mcp" && !isSyntheticTab(activeTab()) && tab()} keyed>
                 {(t) => (
                   <div>
                     <div class="mb-3 flex items-start justify-between gap-3">

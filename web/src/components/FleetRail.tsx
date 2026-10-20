@@ -25,6 +25,7 @@ import {
 } from "../lib/fleet-lanes";
 import { fleetBoard, subscribeFleet, taskSession, unsubscribeFleet } from "../state/fleet";
 import { focusSession } from "../state/sessions";
+import { providerLabel } from "../state/providers";
 
 /**
  * Semantic colours for the status vocabulary (§6). Deliberately separate from
@@ -291,7 +292,7 @@ const BackendSpendTable: Component<{ econ: FleetEconomics }> = (props) => (
         {(b) => (
           <li class="flex items-center gap-2 font-mono text-[10px]">
             <span class="w-20 shrink-0 truncate text-fg-muted" title={b.providerId}>
-              {b.providerId}
+              {providerLabel(b.providerId)}
             </span>
             {/* A share bar, not a percentage: the question is "which backend is
                 most of the bill", and a bar answers it without arithmetic. */}

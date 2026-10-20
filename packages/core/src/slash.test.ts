@@ -360,3 +360,18 @@ describe("/provider", () => {
     });
   });
 });
+
+describe("/account", () => {
+  it("parses a name, default, or --follow-default, and requires one", () => {
+    expect(parseSlash("/account Work-Max")).toEqual({ kind: "account", account: "work-max" });
+    expect(parseSlash("/account default")).toEqual({ kind: "account", account: "default" });
+    expect(parseSlash("/account --follow-default")).toEqual({ kind: "account", account: null });
+    expect(() => parseSlash("/account")).toThrow(/\/account <name>/);
+  });
+
+  it("dispatches session.set_claude_account", () => {
+    const c = ctx();
+    dispatchSlash({ kind: "account", account: null }, c);
+    expect(c.sent[0]).toMatchObject({ type: "session.set_claude_account", sessionId: c.sessionId, account: null });
+  });
+});
