@@ -7,6 +7,15 @@
 
 import { mock, describe, it, expect, beforeEach } from "bun:test";
 import type { ProviderEvent, TurnOpts, UiRequest } from "../daemon/providers/interface.js";
+import * as realOpenAIModule from "openai";
+
+/**
+ * The real SDK, captured (as a value, not a live binding) before the mock
+ * below replaces the module. `mock.module` is process-wide in bun:test, so
+ * without this every later test file that drives a REAL OpenAI-compatible
+ * server through the SDK (openai-endpoints.test.ts) would get this mock.
+ */
+const RealOpenAI = realOpenAIModule.default;
 
 // ── OpenAI mock ───────────────────────────────────────────────────────────────
 
@@ -44,6 +53,11 @@ function streamFrom(chunks: CompletionChunk[]): AsyncIterable<CompletionChunk> {
 mock.module("openai", () => {
   return {
     default: class OpenAI {
+      constructor(opts?: { baseURL?: string }) {
+        // These tests never set a base URL; a client aimed at one belongs to
+        // another file's local server — give it the real SDK.
+        if (opts?.baseURL) return new RealOpenAI(opts as ConstructorParameters<typeof RealOpenAI>[0]) as unknown as OpenAI;
+      }
       chat = {
         completions: {
           create: async (body: Record<string, unknown>, _opts: unknown) => {

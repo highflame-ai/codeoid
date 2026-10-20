@@ -4518,9 +4518,9 @@ export class Session {
   #knownWindow(providerId: string): number | undefined {
     const obs = this.#observedLimits;
     if (obs && obs.providerId === providerId) return obs.contextWindow;
-    const model = this.#model;
-    if (!model) return undefined;
-    return this.#modelWindow?.(this.#windowScope(), providerId, model);
+    // No model chosen: still ask — an endpoint knows its default model's
+    // window (the hook answers undefined for everything else).
+    return this.#modelWindow?.(this.#windowScope(), providerId, this.#model ?? "");
   }
 
   /**

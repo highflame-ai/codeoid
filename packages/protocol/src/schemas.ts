@@ -553,6 +553,59 @@ export const sessionSetClaudeAccountSchema = z.object({
   account: claudeAccountNameField.nullable(),
 });
 
+const endpointNameField = z.string().min(1).max(64);
+const endpointHeadersField = z.record(z.string().min(1).max(256), z.string().max(8192));
+const endpointModelField = z.object({
+  id: z.string().min(1).max(256),
+  name: z.string().min(1).max(256).optional(),
+  contextWindow: z.number().int().positive().optional(),
+  maxTokens: z.number().int().positive().optional(),
+});
+
+export const providersListSchema = z.object({
+  ...base,
+  type: z.literal("providers.list"),
+});
+
+export const endpointsListSchema = z.object({
+  ...base,
+  type: z.literal("endpoints.list"),
+});
+
+export const endpointsSetSchema = z.object({
+  ...base,
+  type: z.literal("endpoints.set"),
+  name: endpointNameField,
+  displayName: z.string().max(128).optional(),
+  baseUrl: z.string().min(1).max(2048),
+  flavor: z.enum(["openai", "llamacpp"]).optional(),
+  apiKey: z.string().max(8192).nullable().optional(),
+  headers: endpointHeadersField.optional(),
+  models: z.array(endpointModelField).max(500).optional(),
+  defaultModel: z.string().min(1).max(256).optional(),
+  contextWindow: z.number().int().positive().optional(),
+  mcpServers: z.union([z.literal("all"), z.array(z.string().min(1).max(128)).max(200)]).optional(),
+  streamUsage: z.boolean().optional(),
+  strictToolSchemas: z.boolean().optional(),
+  maxTokensField: z.enum(["max_tokens", "max_completion_tokens"]).optional(),
+});
+
+export const endpointsRemoveSchema = z.object({
+  ...base,
+  type: z.literal("endpoints.remove"),
+  name: endpointNameField,
+});
+
+export const endpointsTestSchema = z.object({
+  ...base,
+  type: z.literal("endpoints.test"),
+  name: endpointNameField.optional(),
+  baseUrl: z.string().min(1).max(2048).optional(),
+  flavor: z.enum(["openai", "llamacpp"]).optional(),
+  apiKey: z.string().max(8192).nullable().optional(),
+  headers: endpointHeadersField.optional(),
+});
+
 export const backendLoginSubmitSchema = z.object({
   ...base,
   type: z.literal("backend.login.submit"),
@@ -1013,6 +1066,11 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   claudeAccountsRemoveSchema,
   claudeAccountsSetDefaultSchema,
   sessionSetClaudeAccountSchema,
+  providersListSchema,
+  endpointsListSchema,
+  endpointsSetSchema,
+  endpointsRemoveSchema,
+  endpointsTestSchema,
   sessionRewindSchema,
   sessionCompareSchema,
   compareGetSchema,

@@ -18,6 +18,7 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { type Command, program } from "commander";
 // Single source of truth for the CLI version — bun inlines this JSON at build,
@@ -45,6 +46,7 @@ import {
 import { ALL_SCOPES_STRING } from "./protocol/scopes.js";
 import { TerminalClient } from "./terminal/client.js";
 import { formatClaudeAccounts, parseHeaderFlags } from "./terminal/claude-accounts.js";
+import { formatEndpoints, importPiModels, parseModelFlags, parseTokens } from "./terminal/endpoints.js";
 import type { ClientMessage, DaemonMessage, SessionInfo } from "./protocol/types.js";
 import { mcpConfig, mcpHeaders } from "./terminal/mcp-control-cli.js";
 import { cleartextOffHost, controlUrl, MCP_SCOPE_PRESETS, TokenError } from "./terminal/token.js";
@@ -595,6 +597,211 @@ account
     console.log(
       `Session "${session}" runs on Claude account "${info?.effectiveClaudeAccount ?? name}"${o.followDefault ? " (following the daemon default)" : ""} from its next turn.`,
     );
+  });
+
+// ── OpenAI-compatible endpoints (local LLMs, gateways — openai-endpoints.ts) ──
+
+const endpoint = program
+  .command("endpoint")
+  .description("OpenAI-compatible endpoints (llama.cpp, vLLM, Ollama, LM Studio, OpenRouter, gateways): each is a backend, oai:<name>");
+
+/** Run one endpoint request against the daemon; print the list it answers with. */
+async function endpointRequest(build: (id: string) => ClientMessage): Promise<DaemonMessage | undefined> {
+  const config = loadConfig();
+  const client = new TerminalClient(config);
+  await client.connect();
+  const resp = await client.request(build(randomUUID()));
+  client.disconnect();
+  if (resp.type === "response.error") {
+    console.error(`Error: ${resp.error}`);
+    process.exitCode = 1;
+    return undefined;
+  }
+  if (resp.type === "endpoints.result") console.log(formatEndpoints(resp.endpoints));
+  return resp;
+}
+
+function printTestResult(resp: DaemonMessage | undefined): void {
+  if (!resp || resp.type !== "endpoints.test.result") return;
+  if (!resp.ok) {
+    console.error(`✗ ${resp.error ?? "the endpoint did not answer"}`);
+    process.exitCode = 1;
+    return;
+  }
+  const models = resp.models ?? [];
+  console.log(`✓ answered in ${resp.latencyMs ?? "?"} ms — ${models.length} model${models.length === 1 ? "" : "s"}${resp.contextWindow ? `, context ${resp.contextWindow} tokens` : ""}`);
+  for (const m of models.slice(0, 30)) console.log(`    ${m}`);
+  if (models.length > 30) console.log(`    … and ${models.length - 30} more`);
+}
+
+const collect = (v: string, prev: string[] = []) => [...prev, v];
+
+endpoint
+  .command("ls")
+  .description("List endpoints (never a key or header value)")
+  .action(async () => {
+    await endpointRequest((id) => ({ type: "endpoints.list", id }));
+  });
+
+endpoint
+  .command("set <name>")
+  .alias("add")
+  .description("Add an endpoint, or change one. Fields you leave out keep their stored values; the key and header values are asked for without echo, never taken from the command line")
+  .requiredOption("--base-url <url>", "the OpenAI-compatible base URL, usually ending in /v1 (https, or http for localhost / a private network)")
+  .option("--display-name <label>", "label in pickers")
+  .option("--flavor <flavor>", "openai | llamacpp (llama-server: live context window from /props, strict tool schemas)")
+  .option("--model <id[:context[:maxTokens]]>", "a model it serves, repeatable (e.g. qwen3-coder:128k); none = whatever the server lists", collect, [] as string[])
+  .option("--default-model <id>", "the model new sessions use")
+  .option("--context <tokens>", "context window for models without their own (e.g. 32k)")
+  .option("--key", "set the API key (asked for without echo, or read from stdin)")
+  .option("--clear-key", "remove the stored API key")
+  .option("--header <header>", 'extra request header, repeatable: "Name" (value asked for without echo) or "Name: value" for a non-secret one; replaces all stored headers', collect, [] as string[])
+  .option("--mcp <servers>", "external MCP servers offered: all | none | name,name")
+  .option("--no-stream-usage", "don't send stream_options.include_usage (for servers that reject it)")
+  .option("--strict-tools", "make tool schemas strict (default for llamacpp)")
+  .option("--no-strict-tools", "send tool schemas unchanged")
+  .option("--max-tokens-field <field>", "max_tokens | max_completion_tokens")
+  .action(
+    async (
+      name: string,
+      o: {
+        baseUrl: string;
+        displayName?: string;
+        flavor?: string;
+        model: string[];
+        defaultModel?: string;
+        context?: string;
+        key?: boolean;
+        clearKey?: boolean;
+        header: string[];
+        mcp?: string;
+        streamUsage?: boolean;
+        strictTools?: boolean;
+        maxTokensField?: string;
+      },
+    ) => {
+      try {
+        if (o.key && o.clearKey) throw new Error("--key and --clear-key don't go together");
+        if (o.flavor !== undefined && o.flavor !== "openai" && o.flavor !== "llamacpp") throw new Error("--flavor is openai or llamacpp");
+        if (o.maxTokensField !== undefined && o.maxTokensField !== "max_tokens" && o.maxTokensField !== "max_completion_tokens") {
+          throw new Error("--max-tokens-field is max_tokens or max_completion_tokens");
+        }
+        const models = parseModelFlags(o.model ?? []);
+        const parsedHeaders = parseHeaderFlags(o.header ?? []);
+        if ((parsedHeaders.ask.length > 0 || o.key) && !process.stdin.isTTY && parsedHeaders.ask.length + (o.key ? 1 : 0) > 1) {
+          throw new Error('With piped input only one secret can be read (the key); pass non-secret headers as "Name: value".');
+        }
+        const headers = parsedHeaders.headers;
+        for (const h of parsedHeaders.ask) headers[h] = (await readSecret(`Value for header ${h}: `)).trim();
+        const apiKey = o.key ? (await readSecret("API key: ")).trim() : o.clearKey ? null : undefined;
+        if (o.key && !apiKey) throw new Error("no API key entered — use --clear-key to remove one");
+        const mcpServers =
+          o.mcp === undefined ? undefined : o.mcp === "all" ? ("all" as const) : o.mcp === "none" ? [] : o.mcp.split(",").map((x) => x.trim()).filter(Boolean);
+        await endpointRequest((id) => ({
+          type: "endpoints.set",
+          id,
+          name,
+          baseUrl: o.baseUrl,
+          ...(o.displayName !== undefined ? { displayName: o.displayName } : {}),
+          ...(o.flavor ? { flavor: o.flavor as "openai" | "llamacpp" } : {}),
+          ...(apiKey !== undefined ? { apiKey } : {}),
+          ...(o.header?.length ? { headers } : {}),
+          ...(models.length ? { models } : {}),
+          ...(o.defaultModel ? { defaultModel: o.defaultModel } : {}),
+          ...(o.context ? { contextWindow: parseTokens(o.context) } : {}),
+          ...(mcpServers !== undefined ? { mcpServers } : {}),
+          ...(o.streamUsage === false ? { streamUsage: false } : {}),
+          ...(o.strictTools !== undefined ? { strictToolSchemas: o.strictTools } : {}),
+          ...(o.maxTokensField ? { maxTokensField: o.maxTokensField as "max_tokens" | "max_completion_tokens" } : {}),
+        }));
+        if (!process.exitCode) console.log(`Use it with: codeoid new <session> <dir> --provider oai:${name}`);
+      } catch (err) {
+        console.error(`Error: ${(err as Error).message}`);
+        process.exitCode = 1;
+      }
+    },
+  );
+
+endpoint
+  .command("rm <name>")
+  .description("Remove an endpoint (sessions on it refuse to run until switched to another backend)")
+  .action(async (name: string) => {
+    await endpointRequest((id) => ({ type: "endpoints.remove", id, name }));
+  });
+
+endpoint
+  .command("test [name]")
+  .description("Check an endpoint answers and list its models — a stored one, or a draft with --base-url")
+  .option("--base-url <url>", "test this URL (with a stored endpoint's key and headers when <name> is given)")
+  .option("--key", "test with an API key (asked for without echo)")
+  .action(async (name: string | undefined, o: { baseUrl?: string; key?: boolean }) => {
+    if (!name && !o.baseUrl) {
+      console.error("Give an endpoint name, or --base-url.");
+      process.exitCode = 1;
+      return;
+    }
+    const apiKey = o.key ? (await readSecret("API key: ")).trim() : undefined;
+    printTestResult(
+      await endpointRequest((id) => ({
+        type: "endpoints.test",
+        id,
+        ...(name ? { name } : {}),
+        ...(o.baseUrl ? { baseUrl: o.baseUrl } : {}),
+        ...(apiKey ? { apiKey } : {}),
+      })),
+    );
+  });
+
+endpoint
+  .command("import-pi")
+  .description("Add the OpenAI-compatible providers from pi's models.json as endpoints ($VAR keys are resolved from this shell; !command keys are not run)")
+  .option("--file <path>", "models.json to read (default: $PI_CODING_AGENT_DIR/models.json, else ~/.pi/agent/models.json)")
+  .option("--replace", "overwrite endpoints that already exist with the same name")
+  .option("--dry-run", "show what would be imported, change nothing")
+  .action(async (o: { file?: string; replace?: boolean; dryRun?: boolean }) => {
+    const file = o.file ?? join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "models.json");
+    let json: unknown;
+    try {
+      json = JSON.parse(readFileSync(file, "utf8"));
+    } catch (err) {
+      console.error(`Error: can't read ${file}: ${(err as Error).message}`);
+      process.exitCode = 1;
+      return;
+    }
+    const { entries, skipped } = importPiModels(json, process.env);
+    for (const s of skipped) console.log(`  skip ${s.provider}: ${s.reason}`);
+    if (entries.length === 0) {
+      console.log(`No OpenAI-compatible providers in ${file}.`);
+      return;
+    }
+    const config = loadConfig();
+    const client = new TerminalClient(config);
+    await client.connect();
+    try {
+      const listed = await client.request({ type: "endpoints.list", id: randomUUID() });
+      const existing = new Set(listed.type === "endpoints.result" ? listed.endpoints.map((e) => e.name) : []);
+      for (const { endpoint: e, warnings } of entries) {
+        const label = `${e.name} → ${e.baseUrl} (${e.models?.length ?? 0} models)`;
+        if (existing.has(e.name) && !o.replace) {
+          console.log(`  keep ${label}: already exists (--replace to overwrite)`);
+          continue;
+        }
+        for (const w of warnings) console.log(`  ! ${e.name}: ${w}`);
+        if (o.dryRun) {
+          console.log(`  would add ${label}`);
+          continue;
+        }
+        const resp = await client.request({ type: "endpoints.set", id: randomUUID(), ...e });
+        if (resp.type === "response.error") {
+          console.error(`  ✗ ${e.name}: ${resp.error}`);
+          process.exitCode = 1;
+        } else {
+          console.log(`  ✓ ${label}`);
+        }
+      }
+    } finally {
+      client.disconnect();
+    }
   });
 
 program

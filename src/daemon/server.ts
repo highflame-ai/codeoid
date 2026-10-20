@@ -869,6 +869,7 @@ export class DaemonServer {
               // Registered backends, default first — feeds the new-session
               // provider picker (see AuthOkMsg.providers).
               providers: self.#manager.providerIds(),
+              providerInfo: self.#manager.providerInfo(),
               // Which issuer authenticated this connection. Clients render
               // "local" as a visible badge — degradation must never be silent.
               authMode: self.#verifier.mode,

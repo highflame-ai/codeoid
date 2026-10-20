@@ -7,5 +7,6 @@ export * from "./turns.js";
 export * from "./approvals.js";
 export * from "./compare.js";
 export * from "./claude-accounts.js";
+export * from "./endpoints.js";
 export * from "./mcp-oauth.js";
 export * from "./routines.js";

@@ -42,6 +42,18 @@ import {
 import { SessionMcpTools, type McpServerSource } from "../../mcp/tool-source.js";
 import type { McpHub } from "../../mcp/hub.js";
 
+/** A per-turn connection (see OpenAIProviderInit.connection). */
+export interface OpenAIConnection {
+  baseURL: string;
+  apiKey?: string;
+  headers?: Record<string, string>;
+  /** Changes when anything a request depends on changes. */
+  fingerprint: string;
+  /** Per-endpoint request shape, overriding the static options. */
+  streamUsage?: boolean;
+  maxTokensField?: "max_tokens" | "max_completion_tokens";
+}
+
 export interface OpenAIProviderInit {
   /**
    * Override the id/displayName this instance reports. Lets the same
@@ -57,8 +69,30 @@ export interface OpenAIProviderInit {
   apiKey?: string;
   /** Default model when TurnOpts.model is absent. */
   defaultModel?: string;
+  /**
+   * Resolve the default model at the start of each turn (when TurnOpts.model
+   * is absent), ahead of `defaultModel` — an endpoint's configured default can
+   * change while sessions run on it.
+   */
+  resolveDefaultModel?: () => Promise<string | undefined>;
   /** Override base URL (useful for Azure OpenAI or local proxies). */
   baseURL?: string;
+  /**
+   * Resolve the connection at the start of every turn, instead of the static
+   * `apiKey` / `baseURL` above — a user-defined endpoint (openai-endpoints.ts)
+   * whose key or URL can change, or which can be removed, while sessions run
+   * on it. The client is rebuilt when `fingerprint` changes; a throw fails the
+   * turn with its message.
+   */
+  connection?: () => OpenAIConnection;
+  /**
+   * Send `stream_options.include_usage` (default true). Some OpenAI-compatible
+   * servers reject the field outright.
+   */
+  streamUsage?: boolean;
+  /** Output-token cap for `model`, and the field the server expects it in. */
+  maxTokens?: (model: string) => number | undefined;
+  maxTokensField?: "max_tokens" | "max_completion_tokens";
   /** Memory engine — when present, the memory recall tools are offered as
    *  function tools so the model can page the verbatim store on demand. */
   memory?: MemoryEngine;
@@ -83,7 +117,7 @@ export interface OpenAIProviderInit {
    * reported on the turn result. Only a server that can say (llama-server's
    * `/props`) passes one; without it the daemon falls back to its tables.
    */
-  contextWindow?: () => Promise<number | undefined>;
+  contextWindow?: (model: string) => Promise<number | undefined>;
   /**
    * Rewrite the tool list before it is sent, for servers stricter than
    * OpenAI's about tool schemas (llama.cpp compiles them into a grammar).
@@ -106,8 +140,15 @@ export class OpenAIProvider implements AgentProvider {
   readonly id: string;
   readonly displayName: string;
 
-  #client: OpenAI;
+  #client: OpenAI | null = null;
+  #clientFingerprint: string | null = null;
+  #staticConnection: { baseURL?: string; apiKey?: string };
+  #connection: OpenAIProviderInit["connection"] | null;
+  #streamUsage: boolean;
+  #maxTokens: ((model: string) => number | undefined) | null;
+  #maxTokensField: "max_tokens" | "max_completion_tokens";
   #defaultModel: string;
+  #resolveDefaultModel: (() => Promise<string | undefined>) | null;
   #memory: MemoryEngine | null;
   #workspaceId: string;
   #tenant: McpTenant | undefined;
@@ -116,17 +157,22 @@ export class OpenAIProvider implements AgentProvider {
   #mcpHub: McpHub | null;
   #modelFilter: (id: string) => boolean;
   #fallbackModels: ModelInfo[];
-  #contextWindow: (() => Promise<number | undefined>) | null;
+  #contextWindow: ((model: string) => Promise<number | undefined>) | null;
   #toolsTransform: ((tools: OpenAIFunctionTool[]) => OpenAIFunctionTool[]) | null;
 
   constructor(init: OpenAIProviderInit = {}) {
     this.id = init.id ?? "openai";
     this.displayName = init.displayName ?? "GPT (OpenAI)";
-    this.#client = new OpenAI({
-      apiKey: init.apiKey ?? process.env.OPENAI_API_KEY ?? "missing",
+    this.#staticConnection = {
       ...(init.baseURL ? { baseURL: init.baseURL } : {}),
-    });
+      ...(init.apiKey ? { apiKey: init.apiKey } : {}),
+    };
+    this.#connection = init.connection ?? null;
+    this.#streamUsage = init.streamUsage ?? true;
+    this.#maxTokens = init.maxTokens ?? null;
+    this.#maxTokensField = init.maxTokensField ?? "max_tokens";
     this.#defaultModel = init.defaultModel ?? "gpt-4o";
+    this.#resolveDefaultModel = init.resolveDefaultModel ?? null;
     this.#memory = init.memory ?? null;
     this.#workspaceId = init.workspaceId ?? init.sessionId ?? "";
     this.#tenant = init.tenant;
@@ -137,6 +183,33 @@ export class OpenAIProvider implements AgentProvider {
     this.#fallbackModels = init.fallbackModels ?? OPENAI_FALLBACK_MODELS;
     this.#contextWindow = init.contextWindow ?? null;
     this.#toolsTransform = init.toolsTransform ?? null;
+  }
+
+  /**
+   * The client for this turn. With a `connection` resolver it is rebuilt
+   * whenever the endpoint's URL, key or headers changed since the last turn;
+   * otherwise it is built once from the static options.
+   */
+  #clientForTurn(): { client: OpenAI; conn: OpenAIConnection | null } {
+    if (!this.#connection) {
+      this.#client ??= new OpenAI({
+        apiKey: this.#staticConnection.apiKey ?? process.env.OPENAI_API_KEY ?? "missing",
+        ...(this.#staticConnection.baseURL ? { baseURL: this.#staticConnection.baseURL } : {}),
+      });
+      return { client: this.#client, conn: null };
+    }
+    const conn = this.#connection();
+    if (!this.#client || this.#clientFingerprint !== conn.fingerprint) {
+      this.#client = new OpenAI({
+        // A keyless local server still needs a non-empty key for the SDK;
+        // the header is ignored there.
+        apiKey: conn.apiKey ?? "not-needed",
+        baseURL: conn.baseURL,
+        ...(conn.headers && Object.keys(conn.headers).length > 0 ? { defaultHeaders: conn.headers } : {}),
+      });
+      this.#clientFingerprint = conn.fingerprint;
+    }
+    return { client: this.#client, conn };
   }
 
   /** The memory recall tools are offered whenever a memory engine is wired,
@@ -167,9 +240,14 @@ export class OpenAIProvider implements AgentProvider {
     ac: AbortController,
     startMs: number,
   ): Promise<void> {
-    const model = opts.model ?? this.#defaultModel;
+    let model = opts.model ?? this.#defaultModel;
 
     try {
+      if (!opts.model && this.#resolveDefaultModel) model = (await this.#resolveDefaultModel()) ?? this.#defaultModel;
+      const { client, conn } = this.#clientForTurn();
+      const maxTokens = this.#maxTokens?.(model);
+      const streamUsage = conn?.streamUsage ?? this.#streamUsage;
+      const maxTokensField = conn?.maxTokensField ?? this.#maxTokensField;
       const { chatHistory, userMessage } = splitForStateless(opts);
 
       // Build the messages array: system prompt + chat history + current user turn.
@@ -230,12 +308,13 @@ export class OpenAIProvider implements AgentProvider {
       // must answer. A no-memory turn runs exactly one round (tools undefined).
       for (let round = 0; ; round++) {
         const offerTools = tools && round < MAX_MEMORY_TOOL_ROUNDS;
-        const stream = await this.#client.chat.completions.create(
+        const stream = await client.chat.completions.create(
           {
             model,
             messages,
             stream: true,
-            stream_options: { include_usage: true },
+            ...(streamUsage ? { stream_options: { include_usage: true } } : {}),
+            ...(maxTokens ? { [maxTokensField]: maxTokens } : {}),
             ...(offerTools ? { tools } : {}),
           },
           { signal: ac.signal },
@@ -331,7 +410,7 @@ export class OpenAIProvider implements AgentProvider {
 
       // Best-effort: a window the server can't report leaves the daemon on its
       // tables, which is where it would have been anyway.
-      const contextWindow = await this.#contextWindow?.().catch(() => undefined);
+      const contextWindow = await this.#contextWindow?.(model).catch(() => undefined);
 
       queue.push({ type: "text_done", content: finalText });
 
@@ -363,7 +442,7 @@ export class OpenAIProvider implements AgentProvider {
 
   async listModels(): Promise<ModelInfo[]> {
     try {
-      const resp = await this.#client.models.list();
+      const resp = await this.#clientForTurn().client.models.list();
       return resp.data
         .filter((m) => this.#modelFilter(m.id))
         // A local server names its model by the file it loaded; the path is
