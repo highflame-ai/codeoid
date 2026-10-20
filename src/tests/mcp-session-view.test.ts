@@ -362,9 +362,21 @@ describe("a session's view", () => {
     expect(projectDeclaredNames(sub, "claude")).toEqual(new Set(["root", "leaf"]));
     expect(projectDeclaredNames(sub, "qwen")).toEqual(new Set(["leaf"])); // Qwen reads its cwd's only
     expect(projectDeclaredNames(sub, "codex")).toEqual(new Set());
-    mkdirSync(join(work, ".codex"));
-    writeFileSync(join(work, ".codex", "config.toml"), "[mcp_servers.github]\ncommand = 'x'\n");
-    expect(projectDeclaredNames(sub, "codex")).toBeNull();
+    // The user's own Codex config is not a project's, though it sits up the tree from their workdirs.
+    const saved = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = join(work, ".codex");
+    try {
+      mkdirSync(join(work, ".codex"));
+      writeFileSync(join(work, ".codex", "config.toml"), "[mcp_servers.github]\ncommand = 'x'\n");
+      expect(projectDeclaredNames(sub, "codex")).toEqual(new Set());
+    } finally {
+      if (saved === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = saved;
+    }
+    expect(projectDeclaredNames(sub, "codex")).toBeNull(); // a project's: nothing ruled out
+    // Read from where the CLI runs: a symlinked workdir's real parents.
+    symlinkSync(sub, join(tmp, "link"));
+    expect(projectDeclaredNames(join(tmp, "link"), "claude")).toEqual(new Set(["root", "leaf"]));
   });
 
   it("an edit that keeps a project file's size and puts its mtime back is still seen", async () => {
@@ -403,8 +415,10 @@ describe("a session's view", () => {
     expect(projectDeclaredNames(work, "gemini-cli")).toEqual(new Set(["g"]));
     expect(projectDeclaredNames(work, "codex")).toEqual(new Set());
     // The CLIs' settings files are JSONC: comments and trailing commas read fine.
-    writeFileSync(join(work, ".gemini", "settings.json"), '{ // ours\n "mcpServers": { "g": {}, /* x */ "h": {"url": "http://a//b"}, },\n}');
-    expect(projectDeclaredNames(work, "gemini-cli")).toEqual(new Set(["g", "h"]));
+    writeFileSync(join(work, ".gemini", "settings.json"), '{ // ours\n "mcpServers": { "g": {}, /* x */ "h,}": {"url": "http://a//b"} }\n}');
+    expect(projectDeclaredNames(work, "gemini-cli")).toEqual(new Set(["g", "h,}"])); // a string is never rewritten
+    writeFileSync(join(work, ".gemini", "settings.json"), '{ "mcpServers": { "g": {}, } }'); // a trailing comma: not JSON to the CLIs either
+    expect(projectDeclaredNames(work, "gemini-cli")).toBeNull();
     writeFileSync(join(work, ".mcp.json"), '{"mcpServers": {"a": {}, "b": ');
     expect(projectDeclaredNames(work, "qwen")).toBeNull();
   });
@@ -826,6 +840,9 @@ describe("approve and refresh, through the session manager", () => {
       return "mcp__github__x__search"; // the repo's tool, named as github's would start
     },
     "a name the CLI maps onto github's (GitHub)": () => writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { GitHub: { command: "x" } } })),
+    "a name a CLI may shorten or mangle into github's tools (any other name)": () =>
+      writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { [`github__${"z".repeat(30)}`]: { command: "x" } } })),
+    "a key whose ,} an over-eager parser would rewrite": () => writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { "gith,}ub": { command: "x" } } })),
     ".qwen/settings.json with comments": () => {
       mkdirSync(join(work, ".qwen"));
       writeFileSync(join(work, ".qwen", "settings.json"), `{ // the team's\n "mcpServers": { "github": { "command": "x" }, },\n}`);
@@ -880,6 +897,20 @@ describe("approve and refresh, through the session manager", () => {
     expect(providers[0]!.canUseToolResults).toEqual([]);
     expect(m._sessionForTest(sid)!.status).toBe("waiting_approval");
   });
+
+  for (const [name, expected] of [["db", "allow"], ["plugin_db", "ask"]] as const) {
+    it(`on Claude, a readonly trust ${expected === "allow" ? "works with no project servers about" : "never covers Claude's own plugin tools (plugin_…)"}`, async () => {
+      const registry = new McpRegistry({ [name]: raw({ command: "db-mcp", trust: "readonly" }) }, { memoryEnabled: false });
+      const providers: MockSessionProvider[] = [];
+      const tool = { type: "tool_start", toolId: "t1", sdkToolUseId: "s1", name: `mcp__${name}__query`, input: {}, approvalId: "a1" } as ProviderEvent;
+      const m = manager(() => new MockSessionProvider("claude", [[tool]], { stall: true }), (p) => providers.push(p), "claude", registry);
+      const sid = await session(m);
+      await m._sessionForTest(sid)!.send("go", auth(ALL));
+      for (let i = 0; i < 200 && m._sessionForTest(sid)!.status !== "waiting_approval" && !providers[0]?.canUseToolResults.length; i++) await Bun.sleep(5);
+      if (expected === "allow") expect(providers[0]!.canUseToolResults[0]?.behavior).toBe("allow");
+      else expect(m._sessionForTest(sid)!.status).toBe("waiting_approval");
+    });
+  }
 
   it("opening the drawer applies nothing", async () => {
     claudeJson({ [work]: { mcpServers: { mine: { command: "my-mcp" } } } });

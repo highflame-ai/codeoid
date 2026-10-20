@@ -51,9 +51,10 @@ The capabilities drawer says, for each of Claude's servers, whether it reaches t
 ## A `readonly` trust and a project's own servers
 
 Claude Code, Qwen, the Gemini CLI and Codex can load MCP servers from project files themselves: Claude Code `.mcp.json` from the workdir and every directory above it, Qwen the workdir's `.mcp.json` and `.qwen/settings.json`, the Gemini CLI `.gemini/settings.json`, Codex a project's `.codex/config.toml`.
-A tool from one of those may be the repo's server under a name like one you trust, so on those backends a `readonly` trust never auto-approves a tool whose name starts the way such a server's tools do — matched as the CLI names tools (`my.db` gives `mcp__my_db__…`; `github__x` gives `mcp__github__x__…`).
-Names seen since the backend started count, even once edited out of the file.
-If one of those files can't be read (or, for Codex, exists at all — codeoid doesn't read its TOML), no tool on that backend is treated as readonly: each asks.
+A tool from one of those may be the repo's server under a name like one you trust — each CLI maps, merges and shortens server names into tool names its own way, so no name match can rule that out.
+So while those files declare any server (or have, since the backend started), a `readonly` trust auto-approves nothing on that backend: each tool asks.
+The same holds if one of those files can't be read (or, for Codex, exists at all — codeoid doesn't read its TOML; your own `~/.codex/config.toml` doesn't count).
+On Claude, its own plugin and claude.ai connector tools (`mcp__plugin_…`, `mcp__claude_ai_…`) are never treated as a codeoid server's.
 
 ## When two entries share a name
 

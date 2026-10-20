@@ -20,7 +20,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import { open, realpath, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -236,8 +236,13 @@ function strings(x: unknown): string[] {
  * nothing can be ruled out.
  */
 function projectMcpFiles(workdir: string, backendId: string): { json: string[]; opaque: string[] } {
+  // From where the CLI runs: its cwd is the physical directory.
+  let start = path.resolve(workdir);
+  try {
+    start = realpathSync(start);
+  } catch {}
   const up: string[] = [];
-  for (let d = path.resolve(workdir); d !== path.dirname(d); d = path.dirname(d)) up.push(d);
+  for (let d = start; d !== path.dirname(d); d = path.dirname(d)) up.push(d);
   switch (backendId) {
     case "claude":
       return { json: up.map((d) => path.join(d, ".mcp.json")), opaque: [] };
@@ -245,8 +250,11 @@ function projectMcpFiles(workdir: string, backendId: string): { json: string[]; 
       return { json: [path.join(workdir, ".mcp.json"), path.join(workdir, ".qwen", "settings.json")], opaque: [] };
     case "gemini-cli":
       return { json: [path.join(workdir, ".gemini", "settings.json")], opaque: [] };
-    case "codex":
-      return { json: [], opaque: up.map((d) => path.join(d, ".codex", "config.toml")) };
+    case "codex": {
+      // The user's own Codex config (CODEX_HOME, ~/.codex) isn't a project's.
+      const own = path.join(process.env.CODEX_HOME || path.join(homedir(), ".codex"), "config.toml");
+      return { json: [], opaque: up.map((d) => path.join(d, ".codex", "config.toml")).filter((f) => f !== own) };
+    }
     default:
       return { json: [], opaque: [] };
   }
@@ -304,7 +312,8 @@ export function projectDeclaredNames(workdir: string, backendId: string): Readon
   return out;
 }
 
-/** JSON with `//` and `/* *\/` comments (and trailing commas) made plain JSON; strings left alone. */
+/** JSON with `//` and `/* *\/` comments made plain JSON; strings left alone. Trailing
+ *  commas aren't JSON to the CLIs either: such a file fails to parse (nothing ruled out). */
 function withoutJsonComments(text: string): string {
   let out = "";
   for (let i = 0; i < text.length; i++) {
@@ -324,5 +333,5 @@ function withoutJsonComments(text: string): string {
       out += c;
     }
   }
-  return out.replace(/,(\s*[}\]])/g, "$1");
+  return out;
 }

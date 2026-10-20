@@ -124,7 +124,7 @@ import { McpRegistry } from "./mcp/registry.js";
 import { mcpSpecKey, SessionMcpView, type WorkdirReach } from "./mcp/session-view.js";
 import { projectDeclaredNames } from "./mcp/workdir-servers.js";
 import type { McpTenant } from "./mcp/oauth.js";
-import { mcpToolPrefix, type McpServerSpec } from "./mcp/types.js";
+import type { McpServerSpec } from "./mcp/types.js";
 
 /** Backends that start a new conversation after a teardown, so are handed the history again (the Gemini CLI: a new ACP session, no resume). */
 const RESEED_AFTER_TEARDOWN = new Set(["gemini-cli"]);
@@ -1920,7 +1920,6 @@ export class Session {
     if (this.#destroyed) return;
     await this.#rebuildForMcp();
     this.#auditRepoServers(); // a backend switched to, or a sign-in hold that lapsed
-    this.#noteProjectMcpNames(); // what the backend may load for this turn
   }
 
   /**
@@ -2001,7 +2000,7 @@ export class Session {
     if (!view?.loaded) return;
     for (const spec of view.forBackend(this.providerId)) {
       const consent = view.repoConsent(spec);
-      const key = `${this.providerId}\u0000${mcpSpecKey(spec)}`;
+      const key = `${this.providerId}\u0000${mcpSpecKey(spec)}\u0000${consent}`; // a re-approval elsewhere is a new record
       if (!consent || this.#mcpAudited.has(key)) continue;
       this.#mcpAudited.add(key);
       this.#store.audit(
@@ -3028,6 +3027,7 @@ export class Session {
         }
         // Do NOT pushUserTurn(content) here — the original send() already
         // pushed it before runTurn(). Pushing again duplicates the user turn.
+        this.#noteProjectMcpNames(); // what this backend may load (readonly trust)
         const recoveryRun = this.#provider.runTurn({
           ...(this.#maxBudgetUsd !== undefined ? { maxBudgetUsd: this.#maxBudgetUsd } : {}),
           history: this.#accumulator.history,
@@ -3115,6 +3115,7 @@ export class Session {
     // A redaction flagged by a turn that never reached turn_done (interrupted,
     // errored, switched away) belongs to that turn's backing, not this one.
     this.#turnRedacted = false;
+    this.#noteProjectMcpNames(); // what this backend may load (readonly trust)
     const run = this.#provider.runTurn({
       ...(this.#maxBudgetUsd !== undefined ? { maxBudgetUsd: this.#maxBudgetUsd } : {}),
       history: this.#accumulator.history,
@@ -4097,6 +4098,7 @@ export class Session {
         // reply is attributed to the prompt the user sent.
         if (turn) this.#currentTurnId = turn.id;
         this.#accumulator.pushUserTurn(prompt, turn?.id, turn ? { prompt: turn.text, at: turn.at } : undefined);
+        this.#noteProjectMcpNames(); // what this backend may load (readonly trust)
         const run = this.#provider.runTurn({
           ...(this.#maxBudgetUsd !== undefined ? { maxBudgetUsd: this.#maxBudgetUsd } : {}),
           history: this.#accumulator.history,
@@ -5264,21 +5266,16 @@ export class Session {
       }
       return false;
     }
-    // A backend that loads project files itself (.mcp.json, .qwen/ or
-    // .gemini/settings.json, .codex/config.toml) may be running the repo's
-    // server under a tool name like a trusted one's: its tools never get a
-    // readonly trust (#395). Matched by tool name, as the backend makes it —
-    // so `github__x` (tools `mcp__github__x__…`) or `my.db` (`mcp__my_db__…`)
-    // can't pass for `github` or `my_db`. Names from every check since the
-    // backend was built count (it may hold one since edited out); a file that
-    // can't be read rules nothing out.
-    if (!this.#noteProjectMcpNames()) return false;
-    const lower = toolName.toLowerCase();
-    for (const name of this.#mcpProjectNames) {
-      for (const prefix of new Set([name, mcpToolPrefix(name), name.replace(/[^a-zA-Z0-9_.-]/g, "_")])) {
-        if (lower.startsWith(`mcp__${prefix.toLowerCase()}__`)) return false;
-      }
-    }
+    // A backend that loads project files itself (.mcp.json — Claude Code's
+    // from every directory above too —, .qwen/ or .gemini/settings.json, a
+    // project .codex/config.toml) may be running a repo's server whose tools
+    // are named like a trusted one's: a CLI maps, merges and shortens names
+    // its own way, so no name match can rule that out. While those files
+    // declare any server (or since the backend was built did, or can't be
+    // read), no tool there gets a readonly trust: each asks (#395).
+    if (!this.#noteProjectMcpNames() || this.#mcpProjectNames.size > 0) return false;
+    // Claude's own plugin and claude.ai connector tools: never a codeoid server's.
+    if (this.providerId === "claude" && /^mcp__(plugin_|claude_ai_)/.test(toolName)) return false;
     for (const spec of view.forBackend(this.providerId)) {
       if (view.leftToBackend(spec.name, this.providerId)) continue;
       if (spec.trust === "readonly" && toolName.startsWith(`mcp__${spec.name}__`)) return true;
