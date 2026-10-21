@@ -317,6 +317,8 @@ Applying an account removes the daemon's own credential variables for that backe
 A session whose account was removed refuses to run until you switch it.
 An endpoint account is tied to the server it was entered for: if the endpoint later points elsewhere, its accounts refuse to run until re-entered.
 A named Gemini CLI account refuses to run in a workdir whose `.env`, `.gemini/.env` or `.gemini/settings.json` (in the workdir or a parent below your home directory) would redirect its credential, naming the file.
+A named Qwen account does the same for `.qwen/settings.json` (a `modelProviders` entry, an auth type or base URL), `.qwen/.env` and `.env`, and runs in its own Qwen home whose settings are yours without provider entries, so neither a cloned repo nor your own provider list can send its key elsewhere.
+A backend's default account can't be removed until you set another default (`codeoid account default <name> --backend <id>`, or `default`), so the sessions following it never move to another credential.
 
 **Signing in never touches your own login.**
 `codeoid account login` runs the vendor's own command (`claude setup-token`, `codex login --device-auth`) against a staging directory, and only a completed sign-in becomes the account's.

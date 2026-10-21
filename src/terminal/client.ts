@@ -1403,8 +1403,8 @@ export class TerminalClient {
     return this.#resolveSession(nameOrId);
   }
 
-  request(msg: ClientMessage): Promise<DaemonMessage> {
-    return this.#request(msg);
+  request(msg: ClientMessage, timeoutMs?: number): Promise<DaemonMessage> {
+    return this.#request(msg, timeoutMs);
   }
 
   /** Print a `response.error` (or an unexpected reply) the way every command does. */

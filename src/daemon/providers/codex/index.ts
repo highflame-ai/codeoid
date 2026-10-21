@@ -727,7 +727,7 @@ export class CodexProvider implements SessionProvider {
         cwd: opts.workdir,
         // The account's own CODEX_HOME (an overlay sharing everything but its
         // auth.json), applied last so nothing re-adds a daemon key.
-        env: applyCodexAccount(
+        env: await applyCodexAccount(
           this.#resolveAccount?.() ?? null,
           { ...buildCodexEnv(), ...mcp.env, ...bb.env, ...reg.env, ...oauth.env },
           { command: this.#command, argsPrefix: this.#argsPrefix },
@@ -777,8 +777,13 @@ export class CodexProvider implements SessionProvider {
       }
       // The thread is gone (another account's home, a pruned rollout): a
       // fresh one must not start the conversation over — take the history.
-      console.warn(`[codex-provider ${this.#sessionId.slice(0, 8)}] couldn't resume thread ${this.#backingSessionId} — continuing from codeoid's history`);
-      this.onHistoryLost?.();
+      // Unless the session already queued what this thread gets (a switch,
+      // rewind or overflow retry chose a transcript or a session map, sized
+      // for the model): that is never overwritten.
+      if (this.#pendingHistorySeed === null) {
+        console.warn(`[codex-provider ${this.#sessionId.slice(0, 8)}] couldn't resume thread ${this.#backingSessionId} — continuing from codeoid's history`);
+        this.onHistoryLost?.();
+      }
     }
     const started = (await this.#proc.request("thread/start", threadConfig(opts))) as { thread?: { id?: string } };
     if (!started.thread?.id) throw new Error("codex thread/start returned no thread id");

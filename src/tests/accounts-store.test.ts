@@ -91,9 +91,10 @@ describe("AccountStore", () => {
     expect(store.resolve("openai", "default")).toBeNull(); // pinned built-in
     expect(() => store.resolve("openai", "gone")).toThrow(/no longer exists/);
     expect(() => store.setDefault("openai", "gone")).toThrow(AccountError);
-    // Removing the default clears it.
+    // The default can't be removed: its followers would move to the daemon's own credential.
+    expect(() => store.remove("openai", "team")).toThrow(/set another default/);
+    store.setDefault("openai", "default");
     expect(store.remove("openai", "team")).toBe(true);
-    expect(store.getDefault("openai")).toBe("default");
     expect(store.remove("openai", "team")).toBe(false);
   });
 

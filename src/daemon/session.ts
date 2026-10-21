@@ -11,7 +11,7 @@
 
 import { ClaudeAccountError, type ClaudeAccountStore, projectCredentialOverride } from "./claude-accounts.js";
 import { AccountError, type AccountStore, type ResolvedAccount } from "./accounts.js";
-import { geminiProjectOverride } from "./account-apply.js";
+import { geminiProjectOverride, qwenProjectOverride } from "./account-apply.js";
 import { backendHasAccounts, CLAUDE_DEFAULT_ACCOUNT, DEFAULT_ACCOUNT } from "../protocol/types.js";
 import {
   CanonicalHistoryAccumulator,
@@ -720,6 +720,12 @@ export class Session {
   #accountChoices: Record<string, string> = {};
   /** An account change arrived while busy: release the provider once idle. */
   #releaseProviderWhenIdle = false;
+  /**
+   * The credential the current backend was built on: its account's
+   * fingerprint, "" for the daemon's own, or "missing:<why>" — what
+   * `refreshAccount` compares against, so only a real change releases it.
+   */
+  #appliedAccount = "";
   #fleet?: McpSdkServerConfigWithInstance;
   #compressionRegistry?: CompressionRegistry;
   #onModels?: SessionCreateOptions["onModels"];
@@ -1291,6 +1297,7 @@ export class Session {
       null;
 
     this.#provider = opts._testProvider ?? this.#createProvider(opts.providerId);
+    this.#appliedAccount = this.#accountState(this.#provider.id);
     this.#provider.onSessionEvent = (e) => this.#onSessionScopedEvent(e);
 
     // Restore any pinned files the user had on this session before.
@@ -1439,6 +1446,34 @@ export class Session {
     });
   }
 
+  /** The credential `backend` would run on now, as a comparable string. Never throws. */
+  #accountState(backend: string): string {
+    try {
+      if (backend === "claude") {
+        const a = this.#claudeAccounts?.resolve(this.#accountChoices.claude ?? null) ?? null;
+        return a?.fingerprint ?? "";
+      }
+      return this.#resolveAccount(backend)?.fingerprint ?? "";
+    } catch (err) {
+      return `missing:${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
+
+  /**
+   * Re-check the account this session's backend runs on — after any change to
+   * the accounts (a default, a replaced or removed credential, a hand edit of
+   * accounts.json, this session's own choice). Only when the credential it
+   * would run on actually changed is the backend released, so the next turn
+   * starts on the new one; its info is re-announced either way.
+   */
+  refreshAccount(): void {
+    const now = this.#accountState(this.#provider.id);
+    const changed = now !== this.#appliedAccount;
+    this.#appliedAccount = now;
+    this.#broadcastInfoUpdate();
+    if (changed) this.releaseIdleProvider();
+  }
+
   /** The persisted account choices (the Claude one also under its #392 name, for a rolled-back daemon). */
   #accountMeta(): { accounts?: Record<string, string>; claudeAccount?: string } {
     const choices = this.#accountChoices;
@@ -1491,8 +1526,8 @@ export class Session {
     else this.#accountChoices[backend] = account;
     this.#store.audit(sender.sub, backend === "claude" ? "session.claude_account" : "session.account", this.id, `backend=${backend} from=${from} to=${account ?? "(follow-default)"}`);
     this.#saveMetaNow();
-    this.#broadcastInfoUpdate();
-    if (backend === this.#provider.id) this.releaseIdleProvider();
+    if (backend === this.#provider.id) this.refreshAccount();
+    else this.#broadcastInfoUpdate();
   }
 
   /**
@@ -1552,6 +1587,12 @@ export class Session {
         }
         this.#releaseProviderWhenIdle = false;
         await this.#teardownProvider();
+        // A backend that can't resume its own conversation (the Gemini CLI
+        // starts a new ACP session) is handed the history, as after an MCP
+        // rebuild — an account switch must never start the conversation over.
+        if (RESEED_AFTER_TEARDOWN.has(this.#provider.id) && this.#accumulator.history.length > 0) {
+          await this.#seedProviderFromHistory();
+        }
       })
       .catch((e) => {
         console.error(`[codeoid/session ${this.id}] releasing the idle ${backend} backend failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -1600,6 +1641,14 @@ export class Session {
     }
     const account = this.#resolveAccount(backend); // throws AccountError
     if (!account) return;
+    if (backend === "qwen") {
+      const override = qwenProjectOverride(this.workdir);
+      if (override) {
+        throw new AccountError(
+          `${override.file} sets ${override.key}, which would redirect qwen account "${account.name}"'s key — remove it, or run this session on the default account`,
+        );
+      }
+    }
     if (backend === "gemini-cli") {
       const override = geminiProjectOverride(this.workdir);
       if (override) {
@@ -1719,6 +1768,7 @@ export class Session {
     }
 
     this.#provider = this.#createProvider(requested);
+    this.#appliedAccount = this.#accountState(requested);
     this.#resetMcpState({ backendChanged: true });
     this.#provider.onSessionEvent = (e) => this.#onSessionScopedEvent(e);
 

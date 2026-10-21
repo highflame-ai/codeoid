@@ -517,7 +517,15 @@ account
     if (login.mode === "device") {
       console.log(`\nOpen this link in a browser and sign in to the account you want as "${name}":\n\n  ${login.verificationUrl}\n\nThen enter this code there:  ${login.userCode}\n`);
       console.log("Waiting for you to approve…");
-      done = await client.request({ type: "backend.login.wait", id: randomUUID(), loginId: login.loginId });
+      // As long as the attempt lives (minutes), not the usual 30s.
+      const waitMs = Math.max(60_000, login.expiresAt - Date.now() + 30_000);
+      try {
+        done = await client.request({ type: "backend.login.wait", id: randomUUID(), loginId: login.loginId }, waitMs);
+      } catch (err) {
+        client.disconnect();
+        console.error(`Error: ${(err as Error).message} — if you approved, the account appears in \`codeoid account ls --backend ${backend}\``);
+        process.exit(1);
+      }
     } else {
       console.log(`\nOpen this URL in a browser signed in to the account you want as "${name}":\n\n  ${login.verificationUrl}\n`);
       console.log(login.codeHint);

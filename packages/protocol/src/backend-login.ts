@@ -116,7 +116,9 @@ export interface BackendLoginSubmitMsg {
 
 /**
  * Wait for a `device` login to finish (the user approved on the vendor's
- * page) or fail. Terminal either way, like `submit`.
+ * page) or fail. Terminal either way, like `submit`. Safe to send again — a
+ * client that lost its connection while waiting re-sends it and gets the same
+ * outcome (for a while after it finished), never a second sign-in.
  */
 export interface BackendLoginWaitMsg {
   type: "backend.login.wait";
@@ -148,6 +150,12 @@ export interface BackendLoginSubmitResultMsg {
    * credential-shaped stripped. Absent when `ok`.
    */
   error?: string;
+  /**
+   * The attempt is still open: the code was refused before it reached the
+   * command (malformed), so a corrected code can be submitted to it. Any
+   * other failure ends the attempt — start again.
+   */
+  retryable?: boolean;
   /**
    * Settings AFTER the write, so the drawer reflects the new credential without
    * a second round trip. The stored secret shows as set; its value never moves.

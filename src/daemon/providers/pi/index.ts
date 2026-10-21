@@ -104,6 +104,7 @@ export class PiProvider implements SessionProvider {
   readonly displayName = "pi (pi.dev)";
 
   onRecoveryNeeded: ((content: string) => void) | undefined;
+  onHistoryLost: (() => void) | undefined;
 
   #sessionId: string;
   #backingSessionId: string;
@@ -343,8 +344,11 @@ export class PiProvider implements SessionProvider {
       });
       if (resp.success === false) {
         console.warn(
-          `[codeoid/pi ${this.#sessionId}] resume of ${this.#backingSessionId} failed — starting fresh`,
+          `[codeoid/pi ${this.#sessionId}] resume of ${this.#backingSessionId} failed — continuing from codeoid's history`,
         );
+        // A fresh pi session must not start the conversation over — unless
+        // the session already queued what it gets (a switch, a rewind).
+        if (this.#pendingHistorySeed === null) this.onHistoryLost?.();
       }
     }
 

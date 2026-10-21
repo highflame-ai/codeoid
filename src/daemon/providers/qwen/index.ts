@@ -57,6 +57,7 @@ import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from ".
 import { buildQwenEnv } from "../env.js";
 import type { LLMCallUsage } from "../../context-math.js";
 import type { ResolvedAccount } from "../../accounts.js";
+import { ensureQwenHome } from "../../account-apply.js";
 
 /** Where qwen-code persists a qwen.ai subscription login. */
 const QWEN_OAUTH_CREDS = join(homedir(), ".qwen", "oauth_creds.json");
@@ -424,7 +425,9 @@ export class QwenProvider implements SessionProvider {
         env: {
           ...buildQwenEnv(),
           // An account's key, and none of the daemon's (blanked: the SDK merges over process.env).
-          ...(account ? { OPENAI_API_KEY: account.account.token ?? "", DASHSCOPE_API_KEY: "" } : {}),
+          ...(account
+            ? { OPENAI_API_KEY: account.account.token ?? "", DASHSCOPE_API_KEY: "", QWEN_HOME: ensureQwenHome(account) }
+            : {}),
           ...(baseUrl ? { OPENAI_BASE_URL: baseUrl } : {}),
           ...(model ? { OPENAI_MODEL: model } : {}),
         },

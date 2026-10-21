@@ -288,7 +288,7 @@ describe("account homes", () => {
     expect(lstatSync(target).mode & 0o777).toBe(0o700);
   });
 
-  test("Codex: an API-key account signs in with codex's own command into its home; no daemon key reaches the child", () => {
+  test("Codex: an API-key account signs in with codex's own command into its home; no daemon key reaches the child", async () => {
     const codexHome = join(dir, "codex-default");
     mkdirSync(codexHome);
     writeFileSync(join(codexHome, "config.toml"), "");
@@ -301,24 +301,24 @@ describe("account homes", () => {
       const accounts = accountsAt();
       accounts.upsert({ backend: "codex", name: "work", kind: "api-key", token: "sk-work" });
       const resolved = accounts.resolve("codex", "work")!;
-      const env = applyCodexAccount(resolved, { PATH: process.env.PATH ?? "", OPENAI_API_KEY: "sk-daemon", CODEX_API_KEY: "x" }, { command: fake, argsPrefix: [] });
+      const env = await applyCodexAccount(resolved, { PATH: process.env.PATH ?? "", OPENAI_API_KEY: "sk-daemon", CODEX_API_KEY: "x" }, { command: fake, argsPrefix: [] });
       expect(env.CODEX_HOME).toBe(resolved.home);
       expect(env.OPENAI_API_KEY).toBeUndefined();
       expect(env.CODEX_API_KEY).toBeUndefined();
       expect(readFileSync(join(resolved.home, "auth.json"), "utf8")).toContain("sk-work");
       expect(readlinkSync(join(resolved.home, "config.toml"))).toBe(join(codexHome, "config.toml"));
       // Once per generation of the key.
-      applyCodexAccount(resolved, { PATH: process.env.PATH ?? "" }, { command: fake, argsPrefix: [] });
+      await applyCodexAccount(resolved, { PATH: process.env.PATH ?? "" }, { command: fake, argsPrefix: [] });
       runs = readFileSync(join(dir, "runs"), "utf8").trim().split("\n").length;
       expect(runs).toBe(1);
       accounts.upsert({ backend: "codex", name: "work", kind: "api-key", token: "sk-work-2", replace: true });
-      applyCodexAccount(accounts.resolve("codex", "work"), { PATH: process.env.PATH ?? "" }, { command: fake, argsPrefix: [] });
+      await applyCodexAccount(accounts.resolve("codex", "work"), { PATH: process.env.PATH ?? "" }, { command: fake, argsPrefix: [] });
       expect(readFileSync(join(resolved.home, "auth.json"), "utf8")).toContain("sk-work-2");
       // A ChatGPT account without its sign-in refuses.
       accounts.upsert({ backend: "codex", name: "chat", kind: "chatgpt-login" });
-      expect(() => applyCodexAccount(accounts.resolve("codex", "chat"), {}, { command: fake, argsPrefix: [] })).toThrow(/sign it in again/);
+      await expect(applyCodexAccount(accounts.resolve("codex", "chat"), {}, { command: fake, argsPrefix: [] })).rejects.toThrow(/sign it in again/);
       // No account: the daemon's own environment, untouched.
-      expect(applyCodexAccount(null, { OPENAI_API_KEY: "sk-daemon" }, { command: fake, argsPrefix: [] })).toEqual({ OPENAI_API_KEY: "sk-daemon" });
+      expect(await applyCodexAccount(null, { OPENAI_API_KEY: "sk-daemon" }, { command: fake, argsPrefix: [] })).toEqual({ OPENAI_API_KEY: "sk-daemon" });
     } finally {
       restore();
     }

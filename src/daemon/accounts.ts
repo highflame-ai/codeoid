@@ -121,6 +121,7 @@ function validateHeaders(headers: Record<string, string>): void {
     if (RESERVED_HEADERS.has(k.toLowerCase())) throw new AccountError(`header ${k} is set by codeoid and can't be overridden`);
     // A CR/LF in a value would inject further headers into every request.
     if (typeof v !== "string" || CONTROL_CHARS.test(v)) throw new AccountError(`header ${k} has a line break or control character in its value`);
+    if (!v) throw new AccountError(`header ${k} has no value`);
   }
 }
 
@@ -249,6 +250,8 @@ export class AccountStore {
   readonly #homesRoot: string;
   /** `claude-accounts.json`, imported as the `claude` backend when this store is new. */
   readonly #legacyClaudePath: string | null;
+  /** Written when the legacy file has been imported — it is never imported again. */
+  readonly #importMarker: string;
   #data: StoreFile | null = null;
   #mtimeMs: number | null = null;
   readonly #listeners = new Set<AccountsListener>();
@@ -258,6 +261,7 @@ export class AccountStore {
     this.#path = opts.path ?? join(dir, "accounts.json");
     this.#homesRoot = opts.homesRoot ?? join(dir, "accounts");
     this.#legacyClaudePath = opts.legacyClaudePath === undefined ? join(dir, "claude-accounts.json") : opts.legacyClaudePath;
+    this.#importMarker = `${this.#path}.claude-imported`;
   }
 
   /** Called after every change, with the backend it touched. */
@@ -279,7 +283,8 @@ export class AccountStore {
     if (this.#data && mtime === this.#mtimeMs) return this.#data;
     const reloaded = this.#data !== null;
     this.#data = mtime === -1 ? this.#imported() : this.#read();
-    this.#mtimeMs = mtime;
+    // Re-stat: an import has just written the file.
+    this.#mtimeMs = this.#fileMtime();
     if (reloaded) for (const backend of Object.keys(this.#data.backends)) this.#notify(backend);
     return this.#data;
   }
@@ -323,6 +328,9 @@ export class AccountStore {
   #imported(): StoreFile {
     const data: StoreFile = { version: 2, backends: {} };
     if (!this.#legacyClaudePath || !existsSync(this.#legacyClaudePath)) return data;
+    // Once only: a store that existed and was deleted ("fix or remove it")
+    // must not bring back accounts removed since the import.
+    if (existsSync(this.#importMarker)) return data;
     let parsed: { defaultAccount?: unknown; accounts?: unknown };
     try {
       parsed = JSON.parse(readFileSync(this.#legacyClaudePath, "utf8")) as typeof parsed;
@@ -339,13 +347,15 @@ export class AccountStore {
         console.error(`[codeoid] not importing invalid Claude account from ${this.#legacyClaudePath}: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
-    if (accounts.length === 0 && typeof parsed.defaultAccount !== "string") return data;
-    data.backends.claude = {
-      accounts,
-      ...(typeof parsed.defaultAccount === "string" ? { defaultAccount: parsed.defaultAccount } : {}),
-    };
-    // Persist now, so the import happens once.
+    if (accounts.length > 0 || typeof parsed.defaultAccount === "string") {
+      data.backends.claude = {
+        accounts,
+        ...(typeof parsed.defaultAccount === "string" ? { defaultAccount: parsed.defaultAccount } : {}),
+      };
+    }
+    // Persist now, and mark it done, so the import happens once.
     this.#write(data);
+    atomicWrite(this.#importMarker, `${new Date().toISOString()}\n`, 0o600);
     return data;
   }
 
@@ -441,11 +451,18 @@ export class AccountStore {
     return toAccountInfo(input.backend, next);
   }
 
-  /** Remove an account and its home. Clears the backend default if it was it. */
+  /**
+   * Remove an account and its home. The backend's default can't be removed:
+   * its followers would quietly fall back to the daemon's own credential —
+   * set another default first.
+   */
   remove(backend: string, name: string): boolean {
     const data = this.#load();
     const entry = data.backends[backend];
     if (!entry?.accounts.some((a) => a.name === name)) return false;
+    if (entry.defaultAccount === name) {
+      throw new AccountError(`"${name}" is the ${backend} default — set another default (or "default") first, so the sessions following it don't move to another credential`);
+    }
     const { defaultAccount, ...rest } = entry;
     this.#save(
       {

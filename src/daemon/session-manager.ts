@@ -14,7 +14,7 @@ import { dirname, join, resolve, sep } from "node:path";
 import { type ForkPoint, RewindError, SendStoppedError, Session, type AttachedClient, type WindowScope } from "./session.js";
 import { sweepCheckpoints } from "./checkpoints.js";
 import type { CompareRunRow } from "./store.js";
-import { type CompareState, type CompareTargetState, type ErrorCode, LIMITS, backendHasAccounts, DEFAULT_ACCOUNT, type AccountKind } from "../protocol/types.js";
+import { type CompareState, type CompareTargetState, type ErrorCode, LIMITS, backendHasAccounts, type AccountKind } from "../protocol/types.js";
 import { type CatalogEntry, isPlaceholderModel, type SessionProvider } from "./providers/interface.js";
 import {
   createDefaultProviderRegistry,
@@ -371,6 +371,9 @@ function resumeSortKey(m: { lastActivityAt?: string; createdAt?: string }): numb
   return Number.isFinite(n) ? n : 0;
 }
 
+/** How long a finished device sign-in's outcome is kept for a client that comes back for it. */
+const LOGIN_OUTCOME_TTL_MS = 10 * 60_000;
+
 export class SessionManager {
   #sessions = new Map<string, Session>();
   #store: Store;
@@ -404,6 +407,12 @@ export class SessionManager {
   readonly #providerSubscribers = new Map<string, AttachedClient>();
   /** Logins started for a NAMED Claude account: loginId → account name. */
   readonly #accountLogins = new Map<string, { backend: string; name: string; replace: boolean }>();
+  /**
+   * Device sign-ins being waited on, by login id, and kept a while after they
+   * finish: a client whose connection dropped mid-wait waits again and gets
+   * the same outcome — the credential is stored once.
+   */
+  readonly #loginWaits = new Map<string, Promise<{ ok: boolean; error?: string; pending?: { backend: string; name: string } }>>();
   /** Live model catalogs by provider id (via each backend's supportedModels
    *  equivalent), cached daemon-wide once any session of that provider
    *  initializes. Empty until then. */
@@ -568,6 +577,8 @@ export class SessionManager {
     // A keyed backend that gains accounts while the daemon runs becomes pickable.
     this.#accounts.onChange((backend) => {
       if (registerAccountBackends(this.#providers, this.#accounts)) this.#pushProviders();
+      // Every change — a handler, a sign-in, a hand edit — reaches the sessions on that backend.
+      this.#refreshSessionsOn(backend);
       this.#pushToProviderSubscribers({ type: "accounts.changed", backend });
     });
     this.#hooks = opts?.hooks;
@@ -2323,6 +2334,7 @@ mcpHub: this.#mcpHub,
         requestId: msg.id,
         ok,
         ...(error === undefined ? {} : { error }),
+        ...(!ok && this.#backendLogin.isOpen(msg.loginId) ? { retryable: true } : {}),
         snapshot: { ...getSnapshot(), mcpServers: this.#mcpServerStatuses(auth) },
       };
     } catch (err) {
@@ -2383,9 +2395,6 @@ mcpHub: this.#mcpHub,
           this.#accounts.upsert({ backend: pending.backend, name: pending.name, kind, replace: pending.replace });
           this.#writeAccountFiles(pending.backend, pending.name, outcome.files);
         }
-        // A re-login replaced the credential: idle processes still hold the old one.
-        this.#releaseSessionsOn(pending.backend, pending.name);
-        this.#announceSessionsOn(pending.backend);
       } catch (err) {
         return `Signed in, but the account could not be saved: ${err instanceof Error ? err.message : String(err)}`;
       }
@@ -2423,17 +2432,27 @@ mcpHub: this.#mcpHub,
   ): Promise<DaemonMessage> {
     if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return this.#loginForbidden(msg.id);
     try {
-      const outcome = await this.#backendLogin.wait(msg.loginId);
-      const pending = this.#accountLogins.get(msg.loginId);
-      this.#accountLogins.delete(msg.loginId);
-      const error = this.#storeLoginOutcome(outcome, pending);
-      const ok = outcome.ok && error === undefined;
-      this.#store.audit(auth.sub, "backend.login.wait", "", `ok=${ok}${pending ? ` backend=${pending.backend} account=${pending.name}` : ""}`);
+      let waiting = this.#loginWaits.get(msg.loginId);
+      if (!waiting) {
+        waiting = (async () => {
+          const outcome = await this.#backendLogin.wait(msg.loginId);
+          const pending = this.#accountLogins.get(msg.loginId);
+          this.#accountLogins.delete(msg.loginId);
+          const error = this.#storeLoginOutcome(outcome, pending);
+          this.#store.audit(auth.sub, "backend.login.wait", "", `ok=${outcome.ok && error === undefined}${pending ? ` backend=${pending.backend} account=${pending.name}` : ""}`);
+          return { ok: outcome.ok && error === undefined, ...(error === undefined ? {} : { error }) };
+        })();
+        this.#loginWaits.set(msg.loginId, waiting);
+        // Remembered for as long as a client could plausibly come back for it.
+        const forget = () => setTimeout(() => this.#loginWaits.delete(msg.loginId), LOGIN_OUTCOME_TTL_MS).unref?.();
+        waiting.then(forget, forget);
+      }
+      const result = await waiting;
       return {
         type: "backend.login.wait.result",
         requestId: msg.id,
-        ok,
-        ...(error === undefined ? {} : { error }),
+        ok: result.ok,
+        ...(result.error === undefined ? {} : { error: result.error }),
         snapshot: { ...getSnapshot(), mcpServers: this.#mcpServerStatuses(auth) },
       };
     } catch (err) {
@@ -2540,17 +2559,12 @@ mcpHub: this.#mcpHub,
     }
     // Never a secret — only what was set.
     this.#store.audit(auth.sub, "accounts.set", "", `backend=${msg.backend} name=${msg.name} kind=${msg.kind}${msg.replace ? " replace" : ""}`);
-    // A replaced credential: idle processes still hold the old one.
-    this.#releaseSessionsOn(msg.backend, msg.name);
-    this.#announceSessionsOn(msg.backend);
     return this.#accountsResult(msg.id);
   }
 
   #accountsRemove(msg: Extract<ClientMessage, { type: "accounts.remove" }>, auth: AuthContext): DaemonMessage {
     const refused = this.#accountsWriteRefusal(msg.id, auth);
     if (refused) return refused;
-    // Before removing: afterwards a follower of it no longer resolves to it.
-    this.#releaseSessionsOn(msg.backend, msg.name);
     let removed: boolean;
     try {
       removed = this.#accounts.remove(msg.backend, msg.name);
@@ -2561,8 +2575,6 @@ mcpHub: this.#mcpHub,
       return { type: "response.error", requestId: msg.id, error: `no ${msg.backend} account named "${msg.name}"`, code: "not_found" };
     }
     this.#store.audit(auth.sub, "accounts.remove", "", `backend=${msg.backend} name=${msg.name}`);
-    // Sessions on it now refuse to run until switched (never a silent fallback).
-    this.#announceSessionsOn(msg.backend);
     return this.#accountsResult(msg.id);
   }
 
@@ -2577,13 +2589,7 @@ mcpHub: this.#mcpHub,
     } catch (err) {
       return this.#accountsError(msg.id, err);
     }
-    // Every follower runs on it from its next turn.
-    for (const session of this.#sessions.values()) {
-      if (session.accountChoice(msg.backend) === null && session.toInfo().providerId === msg.backend) session.releaseIdleProvider();
-    }
-    this.#store.audit(auth.sub, "accounts.set_default", "", `backend=${msg.backend} name=${msg.name}`);
-    this.#announceSessionsOn(msg.backend);
-    return this.#accountsResult(msg.id);
+    this.#store.audit(auth.sub, "accounts.set_default", "", `backend=${msg.backend} name=${msg.name}`);    return this.#accountsResult(msg.id);
   }
 
   /** Choose a session's account for a backend (default: its current one). `settings:write`, undelegated. */
@@ -2600,25 +2606,15 @@ mcpHub: this.#mcpHub,
     return { type: "response.ok", requestId: msg.id, data: session.toInfo() };
   }
 
-  /** Re-announce the info of every session on `backend` — its effective account may have moved. */
-  #announceSessionsOn(backend: string): void {
+  /**
+   * Re-check every session on `backend` after its accounts changed — by any
+   * handler, a sign-in, or a hand edit of accounts.json (the store's change
+   * listener calls this). A session whose credential changed is released when
+   * idle; every one re-announces its effective account.
+   */
+  #refreshSessionsOn(backend: string): void {
     for (const session of this.#sessions.values()) {
-      if (session.toInfo().providerId === backend) session.announceInfo();
-    }
-  }
-
-  /** Release idle sessions on `backend` running on `name` (chosen, or followed as the default). */
-  #releaseSessionsOn(backend: string, name: string): void {
-    let backendDefault: string;
-    try {
-      backendDefault = this.#accounts.getDefault(backend);
-    } catch {
-      backendDefault = DEFAULT_ACCOUNT;
-    }
-    for (const session of this.#sessions.values()) {
-      if (session.toInfo().providerId !== backend) continue;
-      const choice = session.accountChoice(backend);
-      if (choice === name || (choice === null && backendDefault === name)) session.releaseIdleProvider();
+      if (session.toInfo().providerId === backend) session.refreshAccount();
     }
   }
 
@@ -2634,12 +2630,7 @@ mcpHub: this.#mcpHub,
   }
 
   #claudeAccountsError(requestId: string, err: unknown): DaemonMessage {
-    return {
-      type: "response.error",
-      requestId,
-      error: err instanceof Error ? err.message : String(err),
-      code: err instanceof ClaudeAccountError ? "invalid_request" : "internal",
-    };
+    return this.#accountsError(requestId, err);
   }
 
   /** Names, kinds and gateway URLs — never a token. `settings:read`. */
@@ -2652,7 +2643,8 @@ mcpHub: this.#mcpHub,
 
   /** Add or replace an account. `settings:write` — it decides what sessions bill. */
   #claudeAccountsSet(msg: Extract<ClientMessage, { type: "claude.accounts.set" }>, auth: AuthContext): DaemonMessage {
-    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return this.#loginForbidden(msg.id);
+    const refused = this.#accountsWriteRefusal(msg.id, auth);
+    if (refused) return refused;
     try {
       this.#claudeAccounts.upsert({
         name: msg.name,
@@ -2666,21 +2658,22 @@ mcpHub: this.#mcpHub,
     }
     // Never the token — only that an account was set and what kind.
     this.#store.audit(auth.sub, "claude.accounts.set", "", `name=${msg.name} kind=${msg.kind}`);
-    // A replaced token: idle processes still hold the old one.
-    this.#releaseClaudeSessionsOn(msg.name);
     return this.#claudeAccountsResult(msg.id);
   }
 
   #claudeAccountsRemove(msg: Extract<ClientMessage, { type: "claude.accounts.remove" }>, auth: AuthContext): DaemonMessage {
-    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return this.#loginForbidden(msg.id);
-    // Before removing: afterwards a follower of it no longer resolves to it.
-    this.#releaseClaudeSessionsOn(msg.name);
-    if (!this.#claudeAccounts.remove(msg.name)) {
+    const refused = this.#accountsWriteRefusal(msg.id, auth);
+    if (refused) return refused;
+    let removed: boolean;
+    try {
+      removed = this.#claudeAccounts.remove(msg.name);
+    } catch (err) {
+      return this.#claudeAccountsError(msg.id, err);
+    }
+    if (!removed) {
       return { type: "response.error", requestId: msg.id, error: `no Claude account named "${msg.name}"`, code: "not_found" };
     }
     this.#store.audit(auth.sub, "claude.accounts.remove", "", `name=${msg.name}`);
-    // Sessions on it now refuse to run until switched (never a silent fallback).
-    this.#announceClaudeSessions();
     return this.#claudeAccountsResult(msg.id);
   }
 
@@ -2688,27 +2681,15 @@ mcpHub: this.#mcpHub,
     msg: Extract<ClientMessage, { type: "claude.accounts.set_default" }>,
     auth: AuthContext,
   ): DaemonMessage {
-    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return this.#loginForbidden(msg.id);
+    const refused = this.#accountsWriteRefusal(msg.id, auth);
+    if (refused) return refused;
     try {
       this.#claudeAccounts.setDefault(msg.name);
     } catch (err) {
       return this.#claudeAccountsError(msg.id, err);
     }
-    for (const session of this.#sessions.values()) if (session.claudeAccount === null) session.releaseIdleClaudeQuery();
     this.#store.audit(auth.sub, "claude.accounts.set_default", "", `name=${msg.name}`);
-    // Every session following the default runs on it from its next turn.
-    this.#announceClaudeSessions();
     return this.#claudeAccountsResult(msg.id);
-  }
-
-  /** Re-announce every Claude session's info — its effective account may have moved. */
-  #announceClaudeSessions(): void {
-    this.#announceSessionsOn("claude");
-  }
-
-  /** Stop idle Claude queries running on `name` (chosen, or followed as the daemon default). */
-  #releaseClaudeSessionsOn(name: string): void {
-    this.#releaseSessionsOn("claude", name);
   }
 
   /**
@@ -2731,6 +2712,8 @@ mcpHub: this.#mcpHub,
         code: "forbidden",
       };
     }
+    const refused = this.#accountsWriteRefusal(msg.id, auth);
+    if (refused) return refused;
     const session = this.#getOwnedSession(msg.sessionId, auth);
     if (!session) return { type: "response.error", requestId: msg.id, error: "Session not found", code: "not_found" };
     try {
@@ -2860,6 +2843,13 @@ mcpHub: this.#mcpHub,
       return { type: "response.error", requestId: msg.id, error: `no endpoint named "${msg.name}"`, code: "not_found" };
     }
     this.#store.audit(auth.sub, "endpoints.remove", "", `name=${msg.name}`);
+    // Its accounts go with it: their keys were only ever for that server, and a
+    // later endpoint of the same name must not inherit them.
+    try {
+      this.#accounts.removeBackend(endpointProviderId(msg.name));
+    } catch (err) {
+      console.error(`[codeoid] couldn't remove the accounts of endpoint ${msg.name}: ${err instanceof Error ? err.message : String(err)}`);
+    }
     return this.#endpointsResult(msg.id);
   }
 
@@ -3924,11 +3914,15 @@ mcpHub: this.#mcpHub,
     // #392's spelling of the Claude one). Fail closed on an unknown account —
     // creating the session on some other credential would bill the wrong one.
     const landingBackend = providerId ?? this.#providers.defaultId;
+    if (msg.account && msg.claudeAccount && landingBackend === "claude" && msg.account !== msg.claudeAccount) {
+      return { type: "response.error", requestId: msg.id, error: "account and claudeAccount name different Claude accounts — send one", code: "invalid_request" };
+    }
     const createAccount = msg.account ?? (landingBackend === "claude" ? msg.claudeAccount : undefined);
+    if (createAccount || msg.claudeAccount) {
+      const refused = this.#accountsWriteRefusal(msg.id, auth);
+      if (refused) return refused;
+    }
     if (createAccount) {
-      if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) {
-        return { type: "response.error", requestId: msg.id, error: "Missing scope: settings:write (needed to choose a session's account)", code: "forbidden" };
-      }
       if (!backendHasAccounts(landingBackend) || !this.#accounts.has(landingBackend, createAccount)) {
         return {
           type: "response.error",
@@ -4402,6 +4396,9 @@ mcpHub: this.#mcpHub,
           transcriptStore: this.#transcriptStore,
           providers: this.#providers,
           claudeAccounts: this.#claudeAccounts,
+          // The collaboration runs on the accounts its lead was created on.
+          claudeAccount: parent.claudeAccount,
+          accountChoices: parent.accountChoices,
           hooks: this.#hooks,
           providerId: child.providerId,
           defaultModel: child.model,
@@ -4524,15 +4521,15 @@ mcpHub: this.#mcpHub,
     // a session runs on (and bills) is `settings:write` — a fork or a compare
     // must not be a way around that.
     const parentChoices = Object.entries(parent.accountChoices);
-    if (parentChoices.length > 0 && !hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) {
+    if (parentChoices.length > 0 && (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE) || auth.delegationDepth > 0)) {
       const [backend, name] = parentChoices[0]!;
       return {
         type: "response.error",
         requestId: msg.id,
         error:
           backend === "claude"
-            ? `This session runs on Claude account "${name}"; forking it needs settings:write`
-            : `This session runs on the ${backend} account "${name}"; forking it needs settings:write`,
+            ? `This session runs on Claude account "${name}"; forking it needs settings:write from an undelegated token`
+            : `This session runs on the ${backend} account "${name}"; forking it needs settings:write from an undelegated token`,
         code: "forbidden",
       };
     }

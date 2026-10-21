@@ -25,6 +25,7 @@ It changes nothing else a session runs with: the vendor's config, MCP servers, s
 - A change takes effect on the session's next turn.
   A running turn keeps the credential it started with.
 - A session whose chosen account was removed refuses to run and says so.
+  A backend's default account can't be removed until another default is set, so the sessions following it never fall back to the daemon's own credential.
   It never falls back to another credential: that would run, bill and send the conversation under an account nobody picked.
 
 ## Kinds
@@ -104,12 +105,15 @@ As for Claude accounts and endpoints: listing needs `settings:read`; adding, rem
 A cloned repository can try to redirect a named account's credential.
 Claude's `.claude/settings*.json` check is unchanged.
 The Gemini CLI reads `.env` and `.gemini/.env` from the workdir upward and `.gemini/settings.json`; a named Gemini CLI account refuses to run in a workdir whose project files set a credential, base URL, proxy variable or auth type, naming the file.
-Codex and pi project files are not checked: neither is known to redirect a credential from the workdir, and like every backend they run project code as the daemon user, which no per-account check contains.
+qwen-code loads a workspace `.qwen/settings.json` (folder trust is off by default) whose `modelProviders` entry wins over the base URL and key codeoid gives it, and `.qwen/.env` / `.env` upward; a named Qwen account refuses to run in a workdir that sets `modelProviders`, `providerProtocol`, `security.auth`, `model.baseUrl` or an `OPENAI_*` / `DASHSCOPE_*` / `QWEN_*` / proxy variable there.
+A Qwen account also runs in its own `QWEN_HOME` — an overlay whose `settings.json` is the user's without those keys — so the user's own provider entries can't route the account's key elsewhere either.
+Codex project config was checked against codex-cli 0.154 and can't redirect its auth; pi's project files are not checked (pi isn't verified here), and like every backend it runs project code as the daemon user, which no per-account check contains.
 
 ## Storage and migration
 
 `<configDir>/accounts.json` (0600, atomic, re-read when it changes on disk) holds every backend's accounts and default.
-On first start, `claude-accounts.json` is imported as the `claude` backend; the old file is left untouched.
+On first start, `claude-accounts.json` is imported as the `claude` backend, once (a marker records it, so deleting `accounts.json` later doesn't bring back accounts removed since); the old file is left untouched.
+Any change — through codeoid or by hand — re-checks the sessions on that backend, and a session whose credential changed is released when idle.
 Session meta stores `accounts: {<backend>: <choice>}`; an old `claudeAccount` is read as the `claude` entry.
 
 ## Not in scope

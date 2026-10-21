@@ -139,7 +139,7 @@ describe("ClaudeAccountStore", () => {
     }
   });
 
-  test("default handling: built-in until set; removing the default account clears it", () => {
+  test("default handling: built-in until set; the default account can't be removed from under its followers", () => {
     const store = storeAt();
     expect(store.getDefault()).toBe("default");
     expect(store.resolve(null)).toBeNull(); // the daemon's own environment
@@ -147,7 +147,9 @@ describe("ClaudeAccountStore", () => {
     store.setDefault("work");
     expect(store.resolve(null)?.name).toBe("work");
     expect(() => store.setDefault("nope")).toThrow(ClaudeAccountError);
-    store.remove("work");
+    expect(() => store.remove("work")).toThrow(/set another default/);
+    store.setDefault("default");
+    expect(store.remove("work")).toBe(true);
     expect(store.getDefault()).toBe("default");
   });
 
@@ -294,7 +296,10 @@ describe("daemon surface", () => {
     expect(JSON.stringify(set)).not.toContain("sk-ant-oat01-WIRE");
     const def = await handle({ type: "claude.accounts.set_default", id: "s2", name: "work" });
     expect(def).toMatchObject({ type: "claude.accounts.result", defaultAccount: "work" });
-    const rm = await handle({ type: "claude.accounts.remove", id: "s3", name: "work" });
+    const refused = await handle({ type: "claude.accounts.remove", id: "s3", name: "work" });
+    expect(refused).toMatchObject({ type: "response.error", code: "invalid_request", error: expect.stringContaining("set another default") });
+    await handle({ type: "claude.accounts.set_default", id: "s4", name: "default" });
+    const rm = await handle({ type: "claude.accounts.remove", id: "s5", name: "work" });
     expect(rm).toMatchObject({ type: "claude.accounts.result", defaultAccount: "default", accounts: [] });
   });
 

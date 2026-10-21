@@ -11,7 +11,7 @@
  * to another account resume the same conversation natively.
  */
 
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -112,7 +112,7 @@ export function defaultCodexHome(env: Record<string, string | undefined> = proce
 }
 
 const CODEX_OWN = ["auth.json"];
-/** Marker of which generation of an API-key account's auth.json was written. */
+/** Marker of which credential an API-key account's auth.json was written from (its fingerprint). */
 const GENERATION_MARKER = ".codeoid-account-generation";
 
 /**
@@ -120,28 +120,40 @@ const GENERATION_MARKER = ".codeoid-account-generation";
  * (`codex login --with-api-key`), once per generation of the key — the
  * vendor's format, never ours.
  */
-export function ensureCodexApiKeyLogin(
+export async function ensureCodexApiKeyLogin(
   account: ResolvedAccount,
   run: { command: string; argsPrefix: string[]; env: Record<string, string> },
-): void {
+): Promise<void> {
   const marker = join(account.home, GENERATION_MARKER);
-  const generation = String(account.account.generation);
+  // The fingerprint, not the generation: a hand-edited key changes it too.
+  const written = account.fingerprint;
   try {
-    if (readFileSync(marker, "utf8") === generation && existsSync(join(account.home, "auth.json"))) return;
+    if (readFileSync(marker, "utf8") === written && existsSync(join(account.home, "auth.json"))) return;
   } catch {
     // Not written yet.
   }
-  const r = spawnSync(run.command, [...run.argsPrefix, "login", "--with-api-key"], {
-    input: account.account.token ?? "",
-    env: { ...run.env, CODEX_HOME: account.home },
-    encoding: "utf8",
-    timeout: 30_000,
+  // Asynchronously: the daemon serves every other session meanwhile.
+  const status = await new Promise<number | string>((resolveExit) => {
+    const child = spawn(run.command, [...run.argsPrefix, "login", "--with-api-key"], {
+      env: { ...run.env, CODEX_HOME: account.home },
+      stdio: ["pipe", "ignore", "ignore"],
+    });
+    const timer = setTimeout(() => child.kill("SIGKILL"), 30_000);
+    child.on("error", () => {
+      clearTimeout(timer);
+      resolveExit("spawn failed");
+    });
+    child.on("exit", (code, signal) => {
+      clearTimeout(timer);
+      resolveExit(code ?? signal ?? "?");
+    });
+    child.stdin?.end(account.account.token ?? "");
   });
-  if (r.status !== 0 || !existsSync(join(account.home, "auth.json"))) {
+  if (status !== 0 || !existsSync(join(account.home, "auth.json"))) {
     // Never the output: the command echoes a masked key, and an error may not mask it.
-    throw new AccountError(`couldn't sign the codex account "${account.name}" in with its API key (codex login exited ${r.status ?? r.signal ?? "?"})`);
+    throw new AccountError(`couldn't sign the codex account "${account.name}" in with its API key (codex login exited ${status})`);
   }
-  writeFileSync(marker, generation, { mode: 0o600 });
+  writeFileSync(marker, written, { mode: 0o600 });
 }
 
 /**
@@ -150,15 +162,15 @@ export function ensureCodexApiKeyLogin(
  * auth.json is the credential, and a daemon key must neither override it nor
  * reach the agent's tools.
  */
-export function applyCodexAccount(
+export async function applyCodexAccount(
   account: ResolvedAccount | null,
   env: Record<string, string>,
   run: { command: string; argsPrefix: string[] },
-): Record<string, string> {
+): Promise<Record<string, string>> {
   if (!account) return env;
   ensureOverlayHome({ source: defaultCodexHome(), target: account.home, own: CODEX_OWN });
   const out = without(env, (k) => k === "OPENAI_API_KEY" || k === "CODEX_API_KEY" || k === "OPENAI_BASE_URL" || k === "CODEX_HOME");
-  if (account.kind === "api-key") ensureCodexApiKeyLogin(account, { ...run, env: out });
+  if (account.kind === "api-key") await ensureCodexApiKeyLogin(account, { ...run, env: out });
   else requireFile(account.home, "auth.json", "ChatGPT sign-in", account);
   out.CODEX_HOME = account.home;
   return out;
@@ -287,6 +299,97 @@ export function geminiProjectOverride(workdir: string): { file: string; key: str
       try {
         const parsed = JSON.parse(readFileSync(settings, "utf8")) as { security?: { auth?: unknown } };
         if (parsed?.security?.auth !== undefined) return { file: settings, key: "security.auth" };
+      } catch {
+        // Unreadable for the CLI too.
+      }
+    }
+    if (dirname(dir) === dir) break;
+  }
+  return null;
+}
+
+// ── Qwen ──────────────────────────────────────────────────────────────────────
+
+/** The vendor's default Qwen home (`QWEN_HOME`, else ~/.qwen). */
+export function defaultQwenHome(env: Record<string, string | undefined> = process.env): string {
+  return env.QWEN_HOME || join(env.HOME || homedir(), ".qwen");
+}
+
+/**
+ * Settings keys through which qwen-code picks a provider, base URL or key
+ * ahead of the environment codeoid gives it: a `modelProviders` entry for the
+ * session's model wins over OPENAI_BASE_URL / OPENAI_API_KEY.
+ */
+const QWEN_REDIRECTING_SETTINGS = ["modelProviders", "providerProtocol"] as const;
+
+/** The default settings.json without anything that could take an account's key elsewhere. */
+export function qwenAccountSettings(source: string | undefined): string {
+  let settings: Record<string, unknown> = {};
+  try {
+    const parsed = source ? JSON.parse(source) : {};
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) settings = { ...(parsed as Record<string, unknown>) };
+  } catch {
+    // Unreadable for the CLI too; start clean.
+  }
+  for (const k of QWEN_REDIRECTING_SETTINGS) delete settings[k];
+  const security = settings.security && typeof settings.security === "object" ? { ...(settings.security as Record<string, unknown>) } : undefined;
+  if (security) {
+    delete security.auth;
+    settings.security = security;
+  }
+  const model = settings.model && typeof settings.model === "object" ? { ...(settings.model as Record<string, unknown>) } : undefined;
+  if (model) {
+    delete model.baseUrl;
+    settings.model = model;
+  }
+  return `${JSON.stringify(settings, null, 2)}\n`;
+}
+
+/**
+ * An account's Qwen home (`QWEN_HOME`): an overlay of the default one whose
+ * settings.json can't redirect the account's key — so the user's own
+ * provider entries, which would win over the account's endpoint, don't apply
+ * — and without the daemon's own OAuth login. Session files stay shared.
+ */
+export function ensureQwenHome(account: Pick<ResolvedAccount, "home">): string {
+  ensureOverlayHome({
+    source: defaultQwenHome(),
+    target: account.home,
+    own: ["oauth_creds.json", "oauth_creds.lock"],
+    copies: { "settings.json": qwenAccountSettings },
+  });
+  return account.home;
+}
+
+/**
+ * Does a project file in `workdir` (or a parent below HOME) redirect a Qwen
+ * account's key? qwen-code loads `.qwen/settings.json` from the workspace
+ * (folder trust is off by default) and `.qwen/.env` / `.env` upward; a cloned
+ * repo's `modelProviders` entry would send the key — and the conversation —
+ * to the repo's server. Returns the file and key, or null.
+ */
+export function qwenProjectOverride(workdir: string): { file: string; key: string } | null {
+  const home = resolve(homedir());
+  const isQwenVar = (k: string) => /^(OPENAI|DASHSCOPE|QWEN|BAILIAN)_/.test(k) || REDIRECTING_ENV.has(k);
+  for (let dir = resolve(workdir); ; dir = dirname(dir)) {
+    if (dir === home) break;
+    for (const file of [join(dir, ".qwen", ".env"), join(dir, ".env")]) {
+      for (const key of envFileKeys(file)) if (isQwenVar(key)) return { file, key };
+    }
+    const settings = join(dir, ".qwen", "settings.json");
+    if (existsSync(settings)) {
+      try {
+        const parsed = JSON.parse(readFileSync(settings, "utf8")) as Record<string, unknown> & {
+          security?: { auth?: unknown };
+          model?: { baseUrl?: unknown };
+          env?: unknown;
+        };
+        for (const k of QWEN_REDIRECTING_SETTINGS) if (parsed?.[k] !== undefined) return { file: settings, key: k };
+        if (parsed?.security?.auth !== undefined) return { file: settings, key: "security.auth" };
+        if (parsed?.model?.baseUrl !== undefined) return { file: settings, key: "model.baseUrl" };
+        if (parsed?.env && typeof parsed.env === "object") {
+          for (const k of Object.keys(parsed.env)) if (isQwenVar(k)) return { file: settings, key: `env.${k}` };
+        }
       } catch {
         // Unreadable for the CLI too.
       }

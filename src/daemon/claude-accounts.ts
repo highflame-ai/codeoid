@@ -304,7 +304,13 @@ export class ClaudeAccountStore {
   resolve(sessionChoice: string | null): ResolvedClaudeAccount | null {
     // `null` follows the daemon default; a literal "default" PINS the built-in
     // account (the daemon's own environment) whatever the default is.
-    const name = sessionChoice ?? this.getDefault();
+    let name: string;
+    try {
+      name = sessionChoice ?? this.getDefault();
+    } catch (err) {
+      // An unreadable accounts file: say that, not "no longer exists".
+      throw new ClaudeAccountError(err instanceof Error ? err.message : String(err));
+    }
     if (name === CLAUDE_DEFAULT_ACCOUNT) return null;
     if (isGatewayLaunch(process.env)) {
       throw new ClaudeAccountError(
@@ -314,10 +320,13 @@ export class ClaudeAccountStore {
     let resolved: ReturnType<AccountStore["resolve"]>;
     try {
       resolved = this.store.resolve("claude", name);
-    } catch {
-      throw new ClaudeAccountError(
-        `Claude account "${name}" no longer exists — choose another for this session (codeoid account use <session> <account>)`,
-      );
+    } catch (err) {
+      if (this.store.get("claude", name) === undefined && !(err instanceof Error && /not valid JSON/.test(err.message))) {
+        throw new ClaudeAccountError(
+          `Claude account "${name}" no longer exists — choose another for this session (codeoid account use <session> <account>)`,
+        );
+      }
+      throw new ClaudeAccountError(err instanceof Error ? err.message : String(err));
     }
     const account = resolved!.account as StoredClaudeAccount;
     return {
