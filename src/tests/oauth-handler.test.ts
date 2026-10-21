@@ -24,6 +24,8 @@ import type { IdentityProvider, VerifiedUser } from "../daemon/identity-provider
 const BASE_CONFIG: OAuthConfig = {
   zeroidTokenEndpoint: "http://zeroid.test/oauth2/token",
   clientId: "codeoid",
+  zeroidClientId: "gid_xxx",
+  zeroidClientSecret: "zsecret_xxx",
   googleClientId: "gid_xxx",
   googleClientSecret: "gsecret_xxx",
   accountId: "acct_test",
@@ -218,10 +220,41 @@ describe("GET /auth/idp-callback — Google OAuth (ZeroID token exchange)", () =
     const body = new URLSearchParams(captured.body);
     expect(body.get("grant_type")).toBe("urn:ietf:params:oauth:grant-type:token-exchange");
     expect(body.get("subject_token_type")).toBe("urn:ietf:params:oauth:token-type:id_token");
-    expect(body.get("client_id")).toBe("codeoid");
+    // The exchange authenticates as the client the ID token was issued to
+    // (ZeroID D13), not as codeoid's own front-door client id.
+    expect(body.get("client_id")).toBe("gid_xxx");
+    expect(body.get("client_secret")).toBe("zsecret_xxx");
     expect(body.get("account_id")).toBe("acct_test");
     expect(body.get("project_id")).toBe("proj_test");
     expect(body.get("scope")).toBe("session:list"); // scope from /auth/authorize
+    handler.stop();
+  });
+
+  it("sends no client_secret when none is configured", async () => {
+    const handler = new OAuthHandler({ ...BASE_CONFIG, zeroidClientSecret: undefined }, new StubIdP());
+    const captured: { body?: string } = {};
+    (globalThis as { fetch: unknown }).fetch = async (_url: string, opts: RequestInit) => {
+      captured.body = opts.body as string;
+      return { ok: true, json: async () => ({ access_token: "tok" }), text: async () => "" };
+    };
+
+    const internalState = await authorize(handler);
+    await get(handler, `/auth/idp-callback?state=${internalState}&id_token=gid-tok`);
+
+    const body = new URLSearchParams(captured.body);
+    expect(body.get("client_id")).toBe("gid_xxx");
+    expect(body.has("client_secret")).toBe(false);
+    handler.stop();
+  });
+
+  it("names CODEOID_ZEROID_CLIENT_SECRET when ZeroID refuses an unauthenticated exchange", async () => {
+    const handler = new OAuthHandler({ ...BASE_CONFIG, zeroidClientSecret: undefined }, new StubIdP());
+    mockZeroIDFail(401, '{"error":"invalid_client"}');
+
+    const internalState = await authorize(handler);
+    const resp = await get(handler, `/auth/idp-callback?state=${internalState}&id_token=gid-tok`);
+    const location = decodeURIComponent(resp!.headers.get("Location")!);
+    expect(location).toContain("CODEOID_ZEROID_CLIENT_SECRET");
     handler.stop();
   });
 
