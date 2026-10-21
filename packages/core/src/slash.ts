@@ -7,6 +7,7 @@
  *   /rotate                  — rotate context (refresh skills/settings)
  *   /mode <i|g|x>            — interactive | guarded | autonomous
  *   /model <id|alias>        — switch model (opus / sonnet / haiku / full id)
+ *   /account <name|default|--follow-default> — switch the session's Claude account
  *   /help                    — surface help modal (TODO P6)
  *   /clear                   — clear prompt (handled by caller before dispatch)
  *
@@ -32,6 +33,7 @@ export type SlashCommand =
   | { kind: "model"; model: string; fallback?: string | null }
   | { kind: "model-picker" }
   | { kind: "provider"; providerId: string }
+  | { kind: "account"; account: string | null }
   | { kind: "help" }
   | { kind: "clear" }
   | { kind: "who" }
@@ -121,6 +123,14 @@ export function parseSlash(raw: string, opts?: ParseSlashOptions): SlashCommand 
       const providerId = rest[0]?.toLowerCase();
       if (!providerId) throw new Error("/provider <id> — e.g. /provider pi");
       return { kind: "provider", providerId };
+    }
+    case "account": {
+      // The focused Claude session's account (claude-accounts.ts): a name,
+      // `default` (pin your own login), or `--follow-default`.
+      const arg = rest[0];
+      if (!arg) throw new Error("/account <name> | default | --follow-default");
+      if (arg === "--follow-default" || arg === "--follow") return { kind: "account", account: null };
+      return { kind: "account", account: arg.toLowerCase() };
     }
     case "help":
       return { kind: "help" };
@@ -288,6 +298,14 @@ export function dispatchSlash(cmd: SlashCommand, ctx: SlashContext): void {
         id: ctx.newRequestId(),
         sessionId: ctx.sessionId,
         providerId: cmd.providerId,
+      });
+      return;
+    case "account":
+      fire({
+        type: "session.set_claude_account",
+        id: ctx.newRequestId(),
+        sessionId: ctx.sessionId,
+        account: cmd.account,
       });
       return;
     case "help":

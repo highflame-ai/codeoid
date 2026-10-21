@@ -22,12 +22,14 @@ import {
   onMount,
 } from "solid-js";
 
-import { authIdentity, newRequestId, refreshSessions, request } from "../state/connection";
+import { newRequestId, refreshSessions, request } from "../state/connection";
 import { fetchPacks, packsState } from "../state/packs";
 import { runPipeline } from "../state/pipelines";
 import { focusSession, mergeSession, sessionList } from "../state/sessions";
 import type { PackWire, SessionInfo } from "../protocol/types";
 import DirectoryPicker from "./files/DirectoryPicker";
+import { providerIds, providerLabel } from "../state/providers";
+import { claudeAccountsState, DEFAULT_ACCOUNT, fetchClaudeAccounts } from "../state/claude-accounts";
 
 /** The modal serves three flows from one dialog: a plain session, a governed
  *  pipeline run (docs/pipeline-run.md — adds a goal box + requires a pack), or
@@ -127,6 +129,9 @@ const NewSessionModal: Component = () => {
   const [pickerOpen, setPickerOpen] = createSignal(false);
   // "" = daemon default (first advertised provider).
   const [providerId, setProviderId] = createSignal("");
+  // Claude account: "" = follow the daemon default, "default" = pin your own
+  // login, else a named account (claude-accounts.ts).
+  const [claudeAccount, setClaudeAccount] = createSignal("");
   // Ambient pack activation (docs/pack-loading.md): "" = freestyle (no pack).
   const [packId, setPackId] = createSignal("");
   // Capability role declared by the chosen pack; "" = no role restriction.
@@ -180,7 +185,12 @@ const NewSessionModal: Component = () => {
 
   // Backends this daemon registered (auth.ok `providers`, default first).
   // Older daemons don't advertise — hide the picker, sessions stay claude.
-  const providers = createMemo<string[]>(() => authIdentity()?.providers ?? []);
+  const providers = createMemo<string[]>(() => providerIds());
+  // The backend the session will land on: the chosen one, else the default.
+  const effectiveProvider = () => providerId() || providers()[0] || "claude";
+  // Only Claude sessions have accounts, and only worth asking when there is
+  // more than the built-in one to choose from.
+  const showAccountPicker = () => effectiveProvider() === "claude" && claudeAccountsState().accounts.length > 0;
 
   // Installed packs from the daemon-canonical pack state. Empty when none are
   // installed OR when the fetch was rejected (e.g. the session token lacks
@@ -343,6 +353,8 @@ const NewSessionModal: Component = () => {
         // errors (it sets pack-state.error rather than rejecting), but guard
         // anyway so a rejected read can never break opening the modal.
         void fetchPacks().catch(() => {});
+        // Named Claude accounts, for the account picker (hidden without any).
+        void fetchClaudeAccounts(true).catch(() => {});
         requestAnimationFrame(() => nameRef?.focus());
       }
     }),
@@ -375,6 +387,7 @@ const NewSessionModal: Component = () => {
     setWorkdir("");
     setGoal("");
     setProviderId("");
+    setClaudeAccount("");
     setPackId("");
     setPackRole("");
     setRoles(defaultRoles());
@@ -505,6 +518,7 @@ const NewSessionModal: Component = () => {
         name: n,
         workdir: wd,
         ...(providerId() ? { providerId: providerId() } : {}),
+        ...(showAccountPicker() && claudeAccount() ? { claudeAccount: claudeAccount() } : {}),
         ...(packId() ? { pack: packId() } : {}),
         ...(packRole() ? { packRole: packRole() } : {}),
       });
@@ -859,13 +873,41 @@ const NewSessionModal: Component = () => {
                       }`}
                       disabled={busy()}
                     >
-                      {id}
+                      {providerLabel(id)}
                       {i() === 0 ? " (default)" : ""}
                     </button>
                   )}
                 </For>
               </div>
             </div>
+          </Show>
+
+          <Show when={mode() === "session" && showAccountPicker()}>
+            <label class="block space-y-1.5">
+              <span class="text-[11px] font-medium uppercase tracking-wider text-fg-faint">
+                Claude account
+              </span>
+              <select
+                value={claudeAccount()}
+                onChange={(e) => setClaudeAccount(e.currentTarget.value)}
+                disabled={busy()}
+                aria-label="Claude account"
+                class="w-full rounded border border-border bg-bg px-3 py-1.5 font-mono text-sm text-fg focus:border-accent focus:outline-none"
+              >
+                <option value="">Daemon default ({claudeAccountsState().defaultAccount})</option>
+                <option value={DEFAULT_ACCOUNT}>default — the daemon's own login</option>
+                <For each={claudeAccountsState().accounts}>
+                  {(a) => (
+                    <option value={a.name}>
+                      {a.name} — {a.kind === "api-key" ? "API key" : a.kind}
+                    </option>
+                  )}
+                </For>
+              </select>
+              <p class="text-[11px] text-fg-faint">
+                Which credential this session runs on and bills. You can switch it later without losing the conversation.
+              </p>
+            </label>
           </Show>
 
           {/* Pack. Session mode: OPTIONAL ambient activation (constitution +

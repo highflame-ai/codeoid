@@ -185,6 +185,8 @@ const App: Component = () => {
       // sticky Sessions/Files headers (that made Esc-to-interrupt permanently
       // dead on desktop).
       if (ev.key === "Escape") {
+        // Already used — e.g. it closed a session-bar dropdown (useDismissable).
+        if (ev.defaultPrevented) return;
         if (document.querySelector(".fixed.inset-0")) return;
         // The file viewer owns Esc too ("Close (Esc)") — on desktop it's a
         // grid pane, not a fixed overlay, so the selector above misses it

@@ -46,6 +46,7 @@ import NewSessionModal, {
   openPipelineModal,
 } from "./NewSessionModal";
 import { _resetSessionsForTest } from "../state/sessions";
+import { _resetProvidersForTest, ingestAuthProviders } from "../state/providers";
 
 /** Minimal installed PackWire for the modal's pack/role selectors. */
 function pack(p: Partial<PackWire> & Pick<PackWire, "id" | "name">): PackWire {
@@ -63,17 +64,21 @@ function pack(p: Partial<PackWire> & Pick<PackWire, "id" | "name">): PackWire {
 }
 
 function authOk(providers?: string[]) {
-  return {
+  const ok = {
     type: "auth.ok",
     identity: { sub: "u", type: "human" },
     scopes: [],
     ...(providers ? { providers } : {}),
   };
+  // The pickers read the providers store, which connection.ts feeds from auth.ok.
+  ingestAuthProviders(ok);
+  return ok;
 }
 
 afterEach(() => {
   cleanup();
   _resetSessionsForTest();
+  _resetProvidersForTest();
   requestMock.mockReset();
   authMock.mockReset();
   fetchPacksMock.mockClear();

@@ -8,9 +8,10 @@
 
 import { Component, For, Index, Show, createEffect, createSignal, on, onCleanup, onMount } from "solid-js";
 
-import { authIdentity, getClient, newRequestId, refreshSessions } from "../state/connection";
+import { getClient, newRequestId, refreshSessions } from "../state/connection";
 import { focusSession } from "../state/sessions";
 import type { CompareListResultMsg, CompareState, CompareStateMsg, CompareTargetState, DaemonMessage } from "../protocol/types";
+import { providerIds, providerLabel } from "../state/providers";
 
 interface Opening {
   sessionId: string;
@@ -57,7 +58,7 @@ const Column: Component<{
   <div class={`flex min-w-0 flex-1 flex-col gap-2 rounded border p-2 ${props.kept ? "border-success" : "border-border"} bg-bg`}>
     <div class="flex items-center gap-2">
       <span class="font-mono text-[12px] text-fg">
-        {props.t.providerId}
+        {providerLabel(props.t.providerId)}
         <Show when={props.t.model}>
           <span class="text-fg-faint">:{props.t.model}</span>
         </Show>
@@ -125,7 +126,7 @@ const CompareModal: Component = () => {
   const [error, setError] = createSignal<string | null>(null);
   let timer: ReturnType<typeof setInterval> | undefined;
 
-  const providers = () => authIdentity()?.providers ?? [];
+  const providers = providerIds;
   const stopPolling = () => {
     if (timer) clearInterval(timer);
     timer = undefined;
@@ -261,7 +262,7 @@ const CompareModal: Component = () => {
                               class="rounded border border-border bg-bg px-2 py-1 font-mono text-[12px] text-fg"
                               aria-label={`backend ${i + 1}`}
                             >
-                              <For each={providers()}>{(p) => <option value={p}>{p}</option>}</For>
+                              <For each={providers()}>{(p) => <option value={p}>{providerLabel(p)}</option>}</For>
                             </select>
                             <input
                               type="text"

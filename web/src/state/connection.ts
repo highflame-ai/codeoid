@@ -30,7 +30,7 @@ import type {
   SessionListResultMsg,
 } from "../protocol/types";
 
-import { ingestSessionList, mergeSession, setSessionStatus } from "./sessions";
+import { ingestSessionList, mergeFullSessionInfo, setSessionStatus } from "./sessions";
 import { noteAttachReplay } from "./attach";
 import {
   applyDelta,
@@ -41,6 +41,7 @@ import {
 import { noteLiveSeq, noteReplayFrame } from "./resume";
 import { addUiRequest, removeUiRequest } from "./ui-requests";
 import { ingestFleetDelta } from "./fleet";
+import { ingestAuthProviders, setProviders } from "./providers";
 
 // Resolve the daemon WebSocket URL:
 //   1. explicit VITE_CODEOID_URL build override, else
@@ -262,6 +263,12 @@ export async function bootstrap(opts: { apiKey?: string; token?: string } = {}):
       if (s.kind === "connected") {
         // Drain anything queued while the socket was down.
         flushPendingSends();
+        // The providers.changed subscription is per connection: renew it, and
+        // pick up any endpoint added or removed while we were away.
+        void subscribeProviders();
+        // Likewise the Claude account list, if anything has loaded it (dynamic
+        // import: claude-accounts imports this module).
+        void import("./claude-accounts").then((m) => m.refreshClaudeAccountsOnConnect()).catch(() => {});
         // Refresh session list so statuses are current after a reconnect —
         // otherwise a session that finished its turn while we were away stays
         // stuck showing "thinking". (The attach effect re-attaches in parallel
@@ -297,6 +304,8 @@ export async function bootstrap(opts: { apiKey?: string; token?: string } = {}):
 
     const ok = await client.connect();
     setAuth(ok);
+    ingestAuthProviders(ok);
+    void subscribeProviders();
 
     // Initial population.
     await refreshSessions().catch((err) => {
@@ -309,6 +318,27 @@ export async function bootstrap(opts: { apiKey?: string; token?: string } = {}):
     const msg = err instanceof Error ? err.message : String(err);
     setBootError(msg);
     throw err;
+  }
+}
+
+/**
+ * Ask for the backend list, which also subscribes this connection to
+ * `providers.changed` (endpoints added, changed or removed while we're
+ * connected). Best-effort: an older daemon doesn't know the message, and the
+ * `auth.ok` list stands.
+ */
+async function subscribeProviders(): Promise<void> {
+  const c = client;
+  if (!c) return;
+  const id = newRequestId();
+  try {
+    const res = await c.request<Extract<DaemonMessage, { type: "providers.result" }>>(
+      { type: "providers.list", id },
+      { waitForResult: (m) => (m.type === "providers.result" && m.requestId === id ? m : undefined), timeoutMs: 10_000 },
+    );
+    setProviders(res.providers);
+  } catch {
+    /* older daemon — keep the auth.ok list */
   }
 }
 
@@ -354,7 +384,10 @@ function routeBroadcast(msg: DaemonMessage): void {
       }
       return;
     case "session.info_update":
-      mergeSession(msg.session);
+      mergeFullSessionInfo(msg.session);
+      return;
+    case "providers.changed":
+      setProviders(msg.providers);
       return;
     case "session.status_change":
       setSessionStatus(msg.sessionId, msg.status);
@@ -382,6 +415,10 @@ function routeBroadcast(msg: DaemonMessage): void {
     // request path by subscribeFleet.
     case "fleet.snapshot.result":
     case "auth.ok":
+    case "providers.result":
+    case "claude.accounts.result":
+    case "endpoints.result":
+    case "endpoints.test.result":
     case "response.ok":
     case "response.error":
     case "session.search.result":
