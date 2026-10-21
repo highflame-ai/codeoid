@@ -353,10 +353,11 @@ export class TerminalClient {
         const status = this.#formatStatus(s.status);
         console.log(`  ${s.name.padEnd(20)} ${status.padEnd(20)} ${s.workdir}`);
         console.log(`  ${"".padEnd(20)} id: ${s.id}  clients: ${s.attachedClients}`);
-        if (s.effectiveClaudeAccount) {
-          // Which Claude account it bills, and whether that is its own choice.
-          const own = s.claudeAccount ? "" : " (daemon default)";
-          console.log(`  ${"".padEnd(20)} claude account: ${S(s.effectiveClaudeAccount)}${own}`);
+        const effective = s.effectiveAccount ?? s.effectiveClaudeAccount;
+        if (effective) {
+          // Which account it bills on its backend, and whether that is its own choice.
+          const own = (s.account ?? s.claudeAccount) ? "" : " (default)";
+          console.log(`  ${"".padEnd(20)} ${s.providerId ?? "claude"} account: ${S(effective)}${own}`);
         }
         if (s.pendingDialog) {
           // What it is waiting on, and how to answer it from here (#348).
@@ -435,6 +436,8 @@ export class TerminalClient {
       providerId?: string;
       model?: string;
       claudeAccount?: string;
+      /** Account for the backend the session lands on (accounts.ts). */
+      account?: string;
       collaboration?: CollaborationConfig;
     } = {},
   ): Promise<void> {
@@ -449,6 +452,7 @@ export class TerminalClient {
       ...(opts.providerId ? { providerId: opts.providerId } : {}),
       ...(opts.model ? { model: opts.model } : {}),
       ...(opts.claudeAccount ? { claudeAccount: opts.claudeAccount } : {}),
+      ...(opts.account ? { account: opts.account } : {}),
       ...(opts.pack ? { pack: opts.pack } : {}),
       ...(opts.packRole ? { packRole: opts.packRole } : {}),
       ...(opts.collaboration ? { collaboration: opts.collaboration } : {}),
