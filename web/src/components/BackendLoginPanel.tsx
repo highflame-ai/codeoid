@@ -27,8 +27,8 @@ import { settingsState } from "../state/settings";
 import type { LoginBackend } from "../protocol/types";
 
 /**
- * Backends whose own (daemon-wide) login this panel runs. Codex signs in only
- * as a named account (accounts.ts), never as the daemon's own login.
+ * Backends whose own (daemon-wide) login this panel runs. Codex and the Gemini
+ * CLI sign in only as named accounts (Settings → Accounts).
  */
 export type OwnLoginBackend = Extract<LoginBackend, "claude">;
 

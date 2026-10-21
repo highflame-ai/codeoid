@@ -47,6 +47,8 @@ import NewSessionModal, {
 } from "./NewSessionModal";
 import { _resetSessionsForTest } from "../state/sessions";
 import { _resetProvidersForTest, ingestAuthProviders } from "../state/providers";
+import { _resetAccountsForTest, _setAccountsForTest } from "../state/accounts";
+import { accountKindsFor } from "../protocol/types";
 
 /** Minimal installed PackWire for the modal's pack/role selectors. */
 function pack(p: Partial<PackWire> & Pick<PackWire, "id" | "name">): PackWire {
@@ -77,6 +79,7 @@ function authOk(providers?: string[]) {
 
 afterEach(() => {
   cleanup();
+  _resetAccountsForTest();
   _resetSessionsForTest();
   _resetProvidersForTest();
   requestMock.mockReset();
@@ -127,6 +130,56 @@ describe("NewSessionModal provider picker", () => {
         expect.objectContaining({ type: "session.create", providerId: "pi" }),
       ),
     );
+  });
+});
+
+describe("NewSessionModal account picker", () => {
+  const seed = () =>
+    _setAccountsForTest([
+      { backend: "claude", displayName: "Claude", defaultAccount: "default", accounts: [], kinds: accountKindsFor("claude") },
+      {
+        backend: "pi",
+        displayName: "pi",
+        defaultAccount: "default",
+        accounts: [{ backend: "pi", name: "team-keys", kind: "api-keys", envNames: ["OPENAI_API_KEY"], createdAt: "", updatedAt: "" }],
+        kinds: accountKindsFor("pi"),
+      },
+    ]);
+
+  it("asks for the account of the selected provider, not only Claude, and sends `account`", async () => {
+    authMock.mockReturnValue(authOk(["claude", "pi"]));
+    seed();
+    requestMock.mockResolvedValue({ id: "s-new", name: "n", workdir: "/w" });
+    const { getByText, getByPlaceholderText, getByLabelText, queryByLabelText } = render(() => <NewSessionModal />);
+    openNewSessionModal();
+    // Claude has no named accounts here: nothing to ask.
+    expect(queryByLabelText("Account")).toBeNull();
+    fireEvent.click(getByText("pi"));
+    const select = getByLabelText("Account") as HTMLSelectElement;
+    expect([...select.options].map((o) => o.value)).toEqual(["", "default", "team-keys"]);
+    fireEvent.change(select, { target: { value: "team-keys" } });
+    fireEvent.input(getByPlaceholderText("e.g. shield-refactor"), { target: { value: "pi-session" } });
+    fireEvent.click(getByText("create"));
+    await waitFor(() =>
+      expect(requestMock).toHaveBeenCalledWith(expect.objectContaining({ type: "session.create", providerId: "pi", account: "team-keys" })),
+    );
+    const sent = requestMock.mock.calls[0]![0] as Record<string, unknown>;
+    expect("claudeAccount" in sent).toBe(false);
+  });
+
+  it("a provider change drops the account chosen for the previous one", async () => {
+    authMock.mockReturnValue(authOk(["claude", "pi"]));
+    seed();
+    requestMock.mockResolvedValue({ id: "s-new", name: "n", workdir: "/w" });
+    const { getByText, getByPlaceholderText, getByLabelText } = render(() => <NewSessionModal />);
+    openNewSessionModal();
+    fireEvent.click(getByText("pi"));
+    fireEvent.change(getByLabelText("Account"), { target: { value: "team-keys" } });
+    fireEvent.click(getByText("claude (default)"));
+    fireEvent.input(getByPlaceholderText("e.g. shield-refactor"), { target: { value: "c" } });
+    fireEvent.click(getByText("create"));
+    await waitFor(() => expect(requestMock).toHaveBeenCalled());
+    expect("account" in (requestMock.mock.calls[0]![0] as Record<string, unknown>)).toBe(false);
   });
 });
 

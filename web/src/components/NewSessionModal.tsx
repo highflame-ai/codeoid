@@ -29,7 +29,7 @@ import { focusSession, mergeSession, sessionList } from "../state/sessions";
 import type { PackWire, SessionInfo } from "../protocol/types";
 import DirectoryPicker from "./files/DirectoryPicker";
 import { providerIds, providerLabel } from "../state/providers";
-import { claudeAccountsState, DEFAULT_ACCOUNT, fetchClaudeAccounts } from "../state/claude-accounts";
+import { accountDetail, backendAccounts, DEFAULT_ACCOUNT, fetchAccounts } from "../state/accounts";
 
 /** The modal serves three flows from one dialog: a plain session, a governed
  *  pipeline run (docs/pipeline-run.md — adds a goal box + requires a pack), or
@@ -129,9 +129,10 @@ const NewSessionModal: Component = () => {
   const [pickerOpen, setPickerOpen] = createSignal(false);
   // "" = daemon default (first advertised provider).
   const [providerId, setProviderId] = createSignal("");
-  // Claude account: "" = follow the daemon default, "default" = pin your own
-  // login, else a named account (claude-accounts.ts).
-  const [claudeAccount, setClaudeAccount] = createSignal("");
+  // Account for the backend the session lands on: "" = follow that backend's
+  // daemon default, "default" = pin the daemon's own login, else a named
+  // account (accounts.ts). Names are per backend, so a provider change resets it.
+  const [account, setAccount] = createSignal("");
   // Ambient pack activation (docs/pack-loading.md): "" = freestyle (no pack).
   const [packId, setPackId] = createSignal("");
   // Capability role declared by the chosen pack; "" = no role restriction.
@@ -188,9 +189,10 @@ const NewSessionModal: Component = () => {
   const providers = createMemo<string[]>(() => providerIds());
   // The backend the session will land on: the chosen one, else the default.
   const effectiveProvider = () => providerId() || providers()[0] || "claude";
-  // Only Claude sessions have accounts, and only worth asking when there is
-  // more than the built-in one to choose from.
-  const showAccountPicker = () => effectiveProvider() === "claude" && claudeAccountsState().accounts.length > 0;
+  // The landing backend's accounts — only worth asking when there is more
+  // than the built-in one to choose from.
+  const providerAccounts = () => backendAccounts(effectiveProvider());
+  const showAccountPicker = () => (providerAccounts()?.accounts.length ?? 0) > 0;
 
   // Installed packs from the daemon-canonical pack state. Empty when none are
   // installed OR when the fetch was rejected (e.g. the session token lacks
@@ -353,8 +355,8 @@ const NewSessionModal: Component = () => {
         // errors (it sets pack-state.error rather than rejecting), but guard
         // anyway so a rejected read can never break opening the modal.
         void fetchPacks().catch(() => {});
-        // Named Claude accounts, for the account picker (hidden without any).
-        void fetchClaudeAccounts(true).catch(() => {});
+        // Named accounts, for the account picker (hidden without any).
+        void fetchAccounts(true).catch(() => {});
         requestAnimationFrame(() => nameRef?.focus());
       }
     }),
@@ -387,7 +389,7 @@ const NewSessionModal: Component = () => {
     setWorkdir("");
     setGoal("");
     setProviderId("");
-    setClaudeAccount("");
+    setAccount("");
     setPackId("");
     setPackRole("");
     setRoles(defaultRoles());
@@ -518,7 +520,7 @@ const NewSessionModal: Component = () => {
         name: n,
         workdir: wd,
         ...(providerId() ? { providerId: providerId() } : {}),
-        ...(showAccountPicker() && claudeAccount() ? { claudeAccount: claudeAccount() } : {}),
+        ...(showAccountPicker() && account() ? { account: account() } : {}),
         ...(packId() ? { pack: packId() } : {}),
         ...(packRole() ? { packRole: packRole() } : {}),
       });
@@ -865,7 +867,11 @@ const NewSessionModal: Component = () => {
                       type="button"
                       role="radio"
                       aria-checked={providerId() === id || (!providerId() && i() === 0)}
-                      onClick={() => setProviderId(i() === 0 ? "" : id)}
+                      onClick={() => {
+                        const next = i() === 0 ? "" : id;
+                        if (next !== providerId()) setAccount("");
+                        setProviderId(next);
+                      }}
                       class={`rounded border px-2 py-0.5 font-mono text-[12px] transition ${
                         providerId() === id || (!providerId() && i() === 0)
                           ? "border-accent/60 bg-accent/10 text-accent"
@@ -885,21 +891,21 @@ const NewSessionModal: Component = () => {
           <Show when={mode() === "session" && showAccountPicker()}>
             <label class="block space-y-1.5">
               <span class="text-[11px] font-medium uppercase tracking-wider text-fg-faint">
-                Claude account
+                {providerLabel(effectiveProvider())} account
               </span>
               <select
-                value={claudeAccount()}
-                onChange={(e) => setClaudeAccount(e.currentTarget.value)}
+                value={account()}
+                onChange={(e) => setAccount(e.currentTarget.value)}
                 disabled={busy()}
-                aria-label="Claude account"
+                aria-label="Account"
                 class="w-full rounded border border-border bg-bg px-3 py-1.5 font-mono text-sm text-fg focus:border-accent focus:outline-none"
               >
-                <option value="">Daemon default ({claudeAccountsState().defaultAccount})</option>
+                <option value="">Daemon default ({providerAccounts()?.defaultAccount ?? DEFAULT_ACCOUNT})</option>
                 <option value={DEFAULT_ACCOUNT}>default — the daemon's own login</option>
-                <For each={claudeAccountsState().accounts}>
+                <For each={providerAccounts()?.accounts ?? []}>
                   {(a) => (
                     <option value={a.name}>
-                      {a.name} — {a.kind === "api-key" ? "API key" : a.kind}
+                      {a.name} — {accountDetail(a)}
                     </option>
                   )}
                 </For>

@@ -206,13 +206,20 @@ export function mergeSession(next: Partial<SessionInfo> & { id: string }): void 
 }
 
 /**
- * Merge a FULL SessionInfo (`session.info_update`, a set_claude_account
- * reply). An optional field it leaves out was unset, so the account fields
- * are cleared rather than left stale: the daemon omits `claudeAccount` once a
- * session follows the default again, and both once it moves off Claude.
+ * Merge a FULL SessionInfo (`session.info_update`, a set_account reply). An
+ * optional field it leaves out was unset, so the account fields are cleared
+ * rather than left stale: the daemon omits `account` once a session follows
+ * the default again, both once it moves to a backend without accounts, and
+ * the `claude*` pair once it moves off Claude.
  */
 export function mergeFullSessionInfo(info: SessionInfo): void {
-  mergeSession({ ...info, claudeAccount: info.claudeAccount, effectiveClaudeAccount: info.effectiveClaudeAccount });
+  mergeSession({
+    ...info,
+    account: info.account,
+    effectiveAccount: info.effectiveAccount,
+    claudeAccount: info.claudeAccount,
+    effectiveClaudeAccount: info.effectiveClaudeAccount,
+  });
 }
 
 function withoutProtoKeys<T extends object>(obj: T): T {

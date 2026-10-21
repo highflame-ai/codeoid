@@ -38,6 +38,7 @@ import { openUndoLast } from "./RewindModal";
 import { openCompare } from "./CompareModal";
 import { providerIds, providerLabel } from "../state/providers";
 import { AccountPicker } from "./AccountPicker";
+import { openAccountsSettings } from "./SettingsDrawer";
 import { useDismissable } from "../lib/dismissable";
 
 const MODE_OPTIONS: { value: SessionMode; label: string; hint: string }[] = [
@@ -117,9 +118,13 @@ const SessionControls: Component = () => {
             provider={s().providerId}
           />
           <ProviderPicker sessionId={s().id} current={s().providerId} />
-          <Show when={(s().providerId ?? "claude") === "claude"}>
-            <AccountPicker sessionId={s().id} chosen={s().claudeAccount} effective={s().effectiveClaudeAccount} />
-          </Show>
+          <AccountPicker
+            sessionId={s().id}
+            backend={s().providerId ?? "claude"}
+            chosen={s().account}
+            effective={s().effectiveAccount}
+            onManage={openAccountsSettings}
+          />
           <ForkButton sessionId={s().id} current={s().providerId} />
           <ExportButton />
           <span class="ml-auto" />
