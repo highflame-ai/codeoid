@@ -1,13 +1,16 @@
 import React, { useEffect, useRef, useState } from "react";
 import { Box, Text, useInput } from "ink";
 import TextInput from "ink-text-input";
+import { backendHasAccounts } from "../../protocol/types.js";
 import type { ProviderInfo } from "../../protocol/types.js";
 import type { TuiWsClient } from "../ws.js";
+import { accountChoices } from "../accounts.js";
 import type { BackendChoice } from "./BackendPicker.js";
 
 export interface NewSessionOptions {
   providerId?: string;
-  claudeAccount?: string;
+  /** The account for the backend the session lands on; absent = follow its default. */
+  account?: string;
 }
 
 interface Props {
@@ -17,13 +20,15 @@ interface Props {
   onCancel: () => void;
 }
 
+const FOLLOW_ONLY: BackendChoice[] = [{ value: "", label: "Follow daemon default" }];
+
 export function NewSessionModal({ providers, client, onSubmit, onCancel }: Props) {
   const [focused, setFocused] = useState("name");
   const [name, setName] = useState("");
   const [workdir, setWorkdir] = useState(process.cwd());
   const [providerId, setProviderId] = useState("");
   const [account, setAccount] = useState("");
-  const [accounts, setAccounts] = useState<BackendChoice[]>([{ value: "", label: "Follow daemon default" }]);
+  const [accounts, setAccounts] = useState<BackendChoice[]>(FOLLOW_ONLY);
   const [accountError, setAccountError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -32,33 +37,35 @@ export function NewSessionModal({ providers, client, onSubmit, onCancel }: Props
   // must not touch state or close whatever dialog has opened since.
   const mounted = useRef(true);
   useEffect(() => () => { mounted.current = false; }, []);
-  const effectiveProvider = providerId || providers[0]?.id || "claude";
-  const fields = ["name", "workdir", "provider", ...(effectiveProvider === "claude" ? ["account"] : [])];
+  // The daemon's default backend: the one it marks, else the first it lists.
+  const daemonDefault = providers.find((provider) => provider.isDefault) ?? providers[0];
+  const effectiveProvider = providerId || daemonDefault?.id || "claude";
+  const hasAccounts = backendHasAccounts(effectiveProvider);
+  const fields = ["name", "workdir", "provider", ...(hasAccounts ? ["account"] : [])];
   const providerChoices = [
-    { value: "", label: `Daemon default (${providers[0]?.displayName ?? "claude"})` },
+    { value: "", label: `Daemon default (${daemonDefault?.displayName ?? "claude"})` },
     ...providers.map((provider) => ({ value: provider.id, label: `${provider.displayName} (${provider.id})` })),
   ];
 
+  // Accounts belong to one backend: a different provider starts from its own
+  // list and its own default, never a name chosen for the previous one.
   useEffect(() => {
-    if (effectiveProvider !== "claude" || !client) return;
-    let cancelled = false;
+    setAccount("");
+    setAccounts(FOLLOW_ONLY);
     setAccountError(null);
-    void client.listClaudeAccounts().then((result) => {
-      if (cancelled) return;
-      setAccounts([
-        { value: "", label: `Follow daemon default (${result.defaultAccount})` },
-        { value: "default", label: "default — this machine's Claude login" },
-        ...result.accounts.filter((entry) => entry.name !== "default").map((entry) => ({ value: entry.name, label: entry.name })),
-      ]);
+    if (!hasAccounts || !client) return;
+    let cancelled = false;
+    void client.listAccounts(effectiveProvider).then((result) => {
+      if (!cancelled) setAccounts(accountChoices(result));
     }).catch((cause: unknown) => {
       if (!cancelled) setAccountError(cause instanceof Error ? cause.message : String(cause));
     });
     return () => { cancelled = true; };
-  }, [client, effectiveProvider]);
+  }, [client, effectiveProvider, hasAccounts]);
 
   useEffect(() => {
-    if (focused === "account" && effectiveProvider !== "claude") setFocused("provider");
-  }, [focused, effectiveProvider]);
+    if (focused === "account" && !hasAccounts) setFocused("provider");
+  }, [focused, hasAccounts]);
 
   const submit = async () => {
     if (submitting.current) return;
@@ -72,9 +79,11 @@ export function NewSessionModal({ providers, client, onSubmit, onCancel }: Props
     setBusy(true);
     setError(null);
     try {
+      // An account names the backend whose accounts were listed, so a daemon
+      // default changed since can't apply it to another backend.
+      const withAccount = hasAccounts && account !== "";
       await onSubmit(name.trim(), workdir.trim(), {
-        ...(providerId ? { providerId } : {}),
-        ...(effectiveProvider === "claude" && account ? { claudeAccount: account } : {}),
+        ...(withAccount ? { providerId: effectiveProvider, account } : providerId ? { providerId } : {}),
       });
       if (mounted.current) onCancel();
     } catch (cause) {
@@ -118,10 +127,10 @@ export function NewSessionModal({ providers, client, onSubmit, onCancel }: Props
       <Text color={focused === "provider" ? "cyan" : undefined}>
         {focused === "provider" ? "▸ " : "  "}provider: {providerChoices.find((choice) => choice.value === providerId)?.label ?? `${providerId} (removed)`}
       </Text>
-      {effectiveProvider === "claude" && <Text color={focused === "account" ? "cyan" : undefined}>
+      {hasAccounts && <Text color={focused === "account" ? "cyan" : undefined}>
         {focused === "account" ? "▸ " : "  "}account: {accounts.find((choice) => choice.value === account)?.label ?? `${account} (missing)`}
       </Text>}
-      {effectiveProvider === "claude" && accountError && <Text color="yellow">Account choices unavailable: {accountError}</Text>}
+      {hasAccounts && accountError && <Text color="yellow">Account choices unavailable: {accountError}</Text>}
       {error && <Text color="red">{error}</Text>}
       <Text dimColor>{busy ? "Creating… (Esc hides this; the session is still created)" : "Tab switches fields · ←→ chooses provider/account · Enter creates · Esc cancels"}</Text>
     </Box>

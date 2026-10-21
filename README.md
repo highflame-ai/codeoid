@@ -283,9 +283,10 @@ codeoid new local-work . --provider oai:gpu-box
 
 Manage endpoints in the web Settings → OpenAI endpoints tab or with `codeoid endpoint ls|set|rm|test`. Edits apply on the next turn. Sessions on a removed endpoint report an error until you choose another backend.
 
-In `codeoid tui`, `/provider` opens the live backend picker and `/model` fetches the selected backend's model catalog. You can also enter `/provider oai:gpu-box` or `/model <id>` directly. `/new` (Ctrl-N) includes provider and Claude account choices: Tab changes fields, arrow keys change a choice, and Enter creates the session.
-
-For Claude sessions, `/account` opens the account picker. `/account <name>` pins a named credential, `/account default` pins the machine's own login, and `/account --follow-default` follows the daemon default. The status bar shows the account when it matters: a pinned account, a daemon default other than the machine's own login, or an account that no longer exists. Configure accounts through the web Settings → Accounts tab or `codeoid account`; reading and changing accounts requires the corresponding settings scopes.
+In `codeoid tui`, `/provider` opens the live backend picker and `/model` fetches the selected backend's model catalog.
+You can also enter `/provider oai:gpu-box` or `/model <id>` directly.
+`/new` (Ctrl-N) includes provider and account choices: Tab changes fields, arrow keys change a choice, and Enter creates the session.
+The account field lists the accounts of the provider you selected, and appears only for a backend that takes accounts.
 
 > **Gemini needs an API key (or Vertex) — a consumer Google (AI Pro/Ultra) subscription can't be used with Codeoid.**
 > Both Gemini backends authenticate with `GEMINI_API_KEY` / `GOOGLE_API_KEY` (from [AI Studio](https://aistudio.google.com/apikey)) or Vertex.
@@ -344,6 +345,40 @@ An in-daemon backend that talks to the OpenAI API. Set `OPENAI_API_KEY=sk-…` i
 
 A lightweight in-daemon backend that talks to the Gemini API. Set `GOOGLE_API_KEY=…` (or `GEMINI_API_KEY`) in `~/.codeoid/.env`; it registers only when the key is present. For a fuller agent (streaming + tools) on the same key, use `gemini-cli` above.
 </details>
+
+### Accounts
+
+Every backend that takes credentials can hold several named accounts: Claude subscriptions, gateways and API keys, ChatGPT sign-ins or API keys for Codex, and API keys for the Gemini CLI, OpenAI, Gemini, Qwen, pi, llama.cpp and each `oai:<name>` endpoint.
+An account is only the credential, so a session switched to another account keeps its conversation.
+Each backend has a built-in `default` account (the daemon's own login or environment) and a daemon default that sessions follow unless they pin one.
+A change applies from the session's next turn.
+See [docs/backend-accounts-design.md](docs/backend-accounts-design.md) for what each backend accepts.
+
+```bash
+codeoid account ls [--backend <id>]                  # names and kinds per backend — never a key
+codeoid account login work --backend codex           # sign in (claude or codex); --replace to redo one
+codeoid account add-key team --backend qwen --base-url dashscope-intl   # key asked for without echo
+codeoid account add-key box-key --backend oai:gpu-box --header x-team --no-key
+codeoid account add-key keys --backend pi --key-var OPENROUTER_API_KEY
+codeoid account add-gateway gw --base-url https://gateway.example.com   # Claude only
+codeoid account add-token personal                   # Claude only: a token you already have (--api-key for a key)
+codeoid account default work --backend codex         # the backend's daemon default
+codeoid account use review work                      # switch a session, for the backend it is on now
+codeoid account use review --follow-default [--backend <id>]
+codeoid account rm work --backend codex
+codeoid new review ~/src/app --provider codex --account work   # start a session on an account
+```
+
+`--backend` defaults to `claude` for `login`, `rm` and `default`, and to the session's current backend for `use`.
+`codeoid new … --account <name>` creates a session on that account of the backend it starts on, and is refused if that backend has no such account.
+A backend's default account can't be removed until another default is set, so the sessions following it never move to another credential.
+A named Gemini CLI or Qwen account refuses to run in a workdir whose project files (a `.env`, or `.gemini/` or `.qwen/` settings) would redirect its key, and names the file; see [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for the files each one checks.
+In `codeoid tui`, `/account` opens the picker for the focused session's current backend: its named accounts, the built-in `default`, and following the daemon default.
+`/account <name>` pins a named account, `/account default` pins the built-in one, and `/account --follow-default` follows the daemon default.
+A backend without accounts refuses `/account` and says so.
+The status bar shows the account when it matters: a pinned account, a daemon default other than the built-in one, or an account that no longer exists, which is shown in red because the next turn will fail.
+Accounts for every backend can also be managed, and signed in, in the web Settings → Accounts tab.
+Listing accounts requires `settings:read`; adding, removing, signing in, setting a default and choosing a session's account require `settings:write` from an undelegated token.
 
 ## Architecture
 
@@ -446,6 +481,7 @@ codeoid new <name> [workdir]                         # Create session
   --repo <path>                                      #   worktree source (default: cwd)
   --worktree-dir <path>                              #   override target dir
   --provider <id>                                    #   pick a backend for this session
+  --account <name>                                   #   run it on that backend's account (default: the backend's default)
 codeoid attach <session>                             # Readline streaming attach
 codeoid send <session> <message...>                  # One-shot send
 codeoid interrupt <session>                          # Interrupt
@@ -461,6 +497,12 @@ codeoid compare run <session> --with claude,codex <prompt...>  # Same prompt on 
 codeoid compare show|ls|keep …                       #   results; keep one [--discard-others]
 codeoid routine add <name> --prompt … [--cron|--every|--at] [--check <cmd>]  # scheduled / triggered agent runs
 codeoid routine ls | show | runs | run [--wait] | edit | pause | resume | rm | cancel <runId> | token | preview
+codeoid account ls [--backend <id>]                  # Accounts for every backend (see Accounts above)
+codeoid account login <name> [--backend claude|codex] [--replace]
+codeoid account add-key <name> --backend <id> [--base-url <u>] [--header <h>] [--no-key] [--key-var <v>] [--replace]
+codeoid account add-gateway <name> --base-url <u> [--header <h>] | add-token <name> [--api-key]   # Claude
+codeoid account default|rm <name> [--backend <id>]
+codeoid account use <session> [name] [--backend <id>] [--follow-default]
 codeoid mcp reconnect <session> <server>             # redial a session's MCP server that's down
 codeoid mcp adopt <server> [--session <s>] [--url <u>]  # have codeoid sign in to a server from Claude's config
 codeoid mcp signin <server> [--callback-url <u>]        # sign in to an OAuth server in codeoid's registry

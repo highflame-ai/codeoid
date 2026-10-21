@@ -20,6 +20,7 @@ import {
   type WorkspaceCommand,
 } from "./workspace-commands.js";
 import type { Attachment, McpReconnectResult, McpRefreshResult } from "../protocol/types.js";
+import { backendHasAccounts } from "../protocol/types.js";
 import { mcpRefreshSummary } from "@highflame/codeoid-core";
 import type { TuiAction } from "./types.js";
 import { parseDialogAnswer } from "../terminal/dialog.js";
@@ -33,6 +34,9 @@ import {
   createScrollbackWriter,
   type ScrollbackWriter,
 } from "./ansi/scrollback-writer.js";
+
+/** `/account` arguments that follow the backend's daemon default instead of naming an account. */
+const FOLLOW_DEFAULT_FLAGS = new Set(["--follow-default", "--follow"]);
 
 interface Props {
   config: CodeoidConfig;
@@ -1117,14 +1121,25 @@ export function App({ config, createClient = (c, d) => new TuiWsClient(c, d) }: 
           return;
         }
         const sessionId = focusedSession.info.id;
-        if (cmd === "/account" && (focusedSession.info.providerId ?? "claude") !== "claude") {
-          dispatch({ type: "error", message: "Claude accounts apply to Claude sessions. Use /provider to switch backends." });
+        const backend = focusedSession.info.providerId ?? "claude";
+        if (cmd === "/account" && !backendHasAccounts(backend)) {
+          dispatch({ type: "error", message: `The ${backend} backend has no accounts. Use /provider to switch to one that does.` });
+          return;
+        }
+        // An account is always for the session's current backend; anything
+        // else (`--backend codex work`, two names) would otherwise be read
+        // as an account name.
+        if (cmd === "/account" && (args.length > 1 || (args[0]?.startsWith("-") && !FOLLOW_DEFAULT_FLAGS.has(args[0].toLowerCase())))) {
+          dispatch({ type: "error", message: "Usage: /account [<name> | default | --follow-default]" });
           return;
         }
         // No args → interactive picker for this session. With an arg →
         // direct switch (trust the user knows the id they want).
         if (args.length === 0) {
-          dispatch({ type: "modal.open", modal: { kind: cmd === "/model" ? "model" : cmd === "/provider" ? "provider" : "account", sessionId } });
+          dispatch({
+            type: "modal.open",
+            modal: cmd === "/account" ? { kind: "account", sessionId, backend } : { kind: cmd === "/model" ? "model" : "provider", sessionId },
+          });
           return;
         }
         const value = cmd === "/model" ? args[0]! : args[0]!.toLowerCase();
@@ -1132,7 +1147,7 @@ export function App({ config, createClient = (c, d) => new TuiWsClient(c, d) }: 
           ? onSetModel(sessionId, value)
           : cmd === "/provider"
             ? onSetProvider(sessionId, value)
-            : onSetAccount(sessionId, value === "--follow-default" || value === "--follow" ? "" : value);
+            : onSetAccount(sessionId, FOLLOW_DEFAULT_FLAGS.has(value) ? "" : value, backend);
         void operation.catch((cause: unknown) => dispatch({ type: "error", message: cause instanceof Error ? cause.message : String(cause) }));
         return;
       }
@@ -1243,12 +1258,21 @@ export function App({ config, createClient = (c, d) => new TuiWsClient(c, d) }: 
     if (response.type === "response.error") throw new Error(response.error);
   };
 
-  /** "" = follow the daemon default (sent as null). */
-  const onSetAccount = async (sessionId: string, account: string): Promise<void> => {
+  /**
+   * "" = follow `backend`'s daemon default (sent as null). The backend is the
+   * one the user saw when choosing, so a backend switch racing the choice
+   * can't move a name onto another backend's accounts.
+   */
+  const onSetAccount = async (sessionId: string, account: string, backend: string): Promise<void> => {
     const client = wsRef.current;
     if (!client) throw new Error("Not connected");
-    const response = await client.setClaudeAccount(sessionId, account || null);
-    if (response.type === "response.error") throw new Error(response.error);
+    const response = await client.setAccount(sessionId, account || null, backend);
+    if (response.type === "response.error") {
+      // The picker may have closed meanwhile (the session moved backend):
+      // say what happened to a pick nobody is looking at any more.
+      if (modalRef.current?.kind !== "account") dispatch({ type: "error", message: `${backend} account not changed: ${response.error}` });
+      throw new Error(response.error);
+    }
   };
 
   // ── Layout ─────────────────────────────────────────────────────────────

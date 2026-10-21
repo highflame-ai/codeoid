@@ -33,7 +33,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: "/search", description: "Search sessions (Ctrl-F) — keywords + semantic + recency; Tab toggles this workspace ↔ all" },
   { name: "/model", description: "Choose a model from this backend's catalog, or /model <id>" },
   { name: "/provider", description: "Choose a backend, or /provider <id> (including oai:<name>)" },
-  { name: "/account", description: "Choose a Claude account, or /account <name|default|--follow-default>" },
+  { name: "/account", description: "Choose this backend's account, or /account <name|default|--follow-default>" },
   { name: "/who", description: "Show the identity chain (user → agent → sub-agents)" },
   { name: "/help", description: "Show keybindings" },
 ];

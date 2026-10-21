@@ -29,6 +29,10 @@ const ok = { type: "response.ok", requestId: "r" } as unknown as DaemonMessage;
 class FakeClient {
   calls: Array<[string, ...unknown[]]> = [];
   reply: DaemonMessage = ok;
+  /** How long `setAccount` takes to answer, to hold a pick in flight. */
+  accountDelay = 0;
+  /** Backends whose accounts were listed (kept out of `calls`: dialogs list on open). */
+  listed: string[] = [];
   constructor(public dispatch: React.Dispatch<TuiAction>) {}
   async start() {}
   stop() {}
@@ -47,8 +51,18 @@ class FakeClient {
     return { type: "response.ok", requestId: "r", data: info("s9", name) } as unknown as DaemonMessage;
   }
   async send(sessionId: string, text: string) { this.calls.push(["send", sessionId, text]); return ok; }
-  async setClaudeAccount(sessionId: string, account: string | null) { this.calls.push(["setClaudeAccount", sessionId, account]); return this.reply; }
-  async listClaudeAccounts() { return { defaultAccount: "default", accounts: [] }; }
+  async setAccount(sessionId: string, account: string | null, backend?: string) {
+    this.calls.push(["setAccount", sessionId, account, backend]);
+    if (this.accountDelay) await Bun.sleep(this.accountDelay);
+    return this.reply;
+  }
+  async listAccounts(backend: string) {
+    this.listed.push(backend);
+    const accounts = backend === "codex"
+      ? [{ backend, name: "chatgpt-work", kind: "chatgpt-login" }, { backend, name: "team-key", kind: "api-key" }]
+      : [];
+    return { backend, displayName: backend === "codex" ? "Codex" : backend, defaultAccount: "default", accounts, kinds: [{ kind: "chatgpt-login", label: "ChatGPT sign-in" }] };
+  }
   async listModels() { return { live: true, models: [] }; }
 }
 
@@ -125,17 +139,83 @@ describe("TUI App — backend slash commands", () => {
 
   it("/account --follow-default clears the pin (sends null)", async () => {
     const ui = await mountApp();
-    await ui.sessions([info("s1", "alpha", { claudeAccount: "work" })]);
+    await ui.sessions([info("s1", "alpha", { claudeAccount: "work", account: "work" })]);
     await ui.run("/account --follow-default");
-    expect(ui.client().calls).toEqual([["setClaudeAccount", "s1", null]]);
+    expect(ui.client().calls).toEqual([["setAccount", "s1", null, "claude"]]);
   });
 
-  it("/account on a non-Claude session is refused with a visible error", async () => {
+  it("/account <name> on a Codex session pins that Codex account", async () => {
     const ui = await mountApp();
-    await ui.sessions([info("s1", "alpha", { providerId: "oai:box", effectiveClaudeAccount: undefined })]);
+    await ui.sessions([info("s1", "alpha", { providerId: "codex", effectiveClaudeAccount: undefined, effectiveAccount: "default" })]);
+    await ui.run("/account team-key");
+    expect(ui.client().calls).toEqual([["setAccount", "s1", "team-key", "codex"]]);
+  });
+
+  it("/account on a Codex session lists the Codex accounts and switches to the one picked", async () => {
+    const ui = await mountApp();
+    await ui.sessions([info("s1", "alpha", { providerId: "codex", effectiveClaudeAccount: undefined, effectiveAccount: "default" })]);
+    await ui.run("/account");
+    await waitFor(() => ui.frame().includes("chatgpt-work"), ui.frame);
+    expect(ui.frame()).toContain("Select account (codex) for alpha");
+    expect(ui.frame()).toContain("Follow daemon default (default)");
+    expect(ui.frame()).toContain("default — the daemon's own Codex login or key");
+    expect(ui.frame()).toContain("ChatGPT sign-in");
+    expect(ui.frame()).toContain("team-key");
+    expect(ui.client().listed).toEqual(["codex"]);
+    expect(ui.client().calls).toEqual([]);
+    // Follow default → default → chatgpt-work.
+    await ui.press("\u001b[B");
+    await ui.press("\u001b[B");
+    await ui.press("\r");
+    await waitFor(() => ui.client().calls.length === 1, ui.frame);
+    expect(ui.client().calls).toEqual([["setAccount", "s1", "chatgpt-work", "codex"]]);
+    await waitFor(() => !ui.frame().includes("Select account"), ui.frame);
+  });
+
+  it("/account <name> on an oai:* endpoint session pins that endpoint's account", async () => {
+    const ui = await mountApp();
+    await ui.sessions([info("s1", "alpha", { providerId: "oai:box", effectiveClaudeAccount: undefined, effectiveAccount: "default" })]);
+    await ui.run("/account box-key");
+    expect(ui.client().calls).toEqual([["setAccount", "s1", "box-key", "oai:box"]]);
+  });
+
+  it("/account --follow-default on a Codex session follows Codex's default", async () => {
+    const ui = await mountApp();
+    await ui.sessions([info("s1", "alpha", { providerId: "codex", effectiveClaudeAccount: undefined, account: "team-key", effectiveAccount: "team-key" })]);
+    await ui.run("/account --follow-default");
+    expect(ui.client().calls).toEqual([["setAccount", "s1", null, "codex"]]);
+  });
+
+  it("/account --follow is --follow-default; names are lower-cased; two names get the usage", async () => {
+    const ui = await mountApp();
+    await ui.sessions([info("s1", "alpha", { providerId: "codex", effectiveClaudeAccount: undefined, account: "team-key", effectiveAccount: "team-key" })]);
+    await ui.run("/account --follow");
+    await ui.run("/account Team-Key");
+    expect(ui.client().calls).toEqual([["setAccount", "s1", null, "codex"], ["setAccount", "s1", "team-key", "codex"]]);
+    await ui.run("/account a b");
+    await waitFor(() => ui.frame().includes("Usage: /account"), ui.frame);
+    expect(ui.client().calls).toHaveLength(2);
+  });
+
+  it("/account with an unknown flag is refused with the usage, not taken as a name", async () => {
+    const ui = await mountApp();
+    await ui.sessions([info("s1", "alpha", { providerId: "codex", effectiveClaudeAccount: undefined, effectiveAccount: "default" })]);
+    await ui.run("/account --backend codex work");
+    await waitFor(() => ui.frame().includes("Usage: /account [<name> | default | --follow-default]"), ui.frame);
+    expect(ui.client().calls).toEqual([]);
+  });
+
+  it("/account on a backend without accounts is refused with a visible error", async () => {
+    const ui = await mountApp();
+    await ui.sessions([info("s1", "alpha", { providerId: "mock", effectiveClaudeAccount: undefined })]);
     await ui.run("/account work");
     expect(ui.client().calls).toEqual([]);
-    expect(ui.frame()).toContain("Claude accounts apply to Claude sessions");
+    await waitFor(() => ui.frame().includes("The mock backend has no accounts"), ui.frame);
+    await ui.act({ type: "error", message: "" });
+    await ui.run("/account");
+    expect(ui.client().calls).toEqual([]);
+    expect(ui.client().listed).toEqual([]);
+    expect(ui.frame()).not.toContain("Select account");
   });
 
   it("a daemon refusal reaches the error display", async () => {
@@ -200,6 +280,44 @@ describe("TUI App — a dialog owns the keyboard", () => {
     await ui.press("\r");
     await Bun.sleep(50);
     expect(ui.client().calls.filter(([call]) => call === "send")).toEqual([]);
+  });
+});
+
+describe("TUI App — the account picker follows its session's backend", () => {
+  it("closes with a message when the session moves to another backend while it is open", async () => {
+    const ui = await mountApp();
+    await ui.sessions([info("s1", "alpha", { providerId: "codex", effectiveClaudeAccount: undefined, effectiveAccount: "default" })]);
+    await ui.run("/account");
+    await waitFor(() => ui.frame().includes("chatgpt-work"), ui.frame);
+    await ui.act({ type: "session.info", session: info("s1", "alpha", { providerId: "claude" }) });
+    await waitFor(() => ui.frame().includes("alpha switched to claude — reopen /account"), ui.frame);
+    expect(ui.frame()).not.toContain("Select account");
+    // It never quietly lists, or picks from, the new backend's accounts.
+    expect(ui.client().listed).toEqual(["codex"]);
+    await ui.press("\r");
+    await waitFor(() => !ui.frame().includes("reopen /account"), ui.frame);
+    expect(ui.client().calls).toEqual([]);
+  });
+
+  it("a pick in flight when the backend changes leaves no dialog stuck open", async () => {
+    const ui = await mountApp();
+    await ui.sessions([info("s1", "alpha", { providerId: "codex", effectiveClaudeAccount: undefined, effectiveAccount: "default" })]);
+    ui.client().accountDelay = 150;
+    await ui.run("/account");
+    await waitFor(() => ui.frame().includes("chatgpt-work"), ui.frame);
+    await ui.press("\u001b[B");
+    await ui.press("\u001b[B");
+    await ui.press("\r");
+    await waitFor(() => ui.frame().includes("Switching…"), ui.frame);
+    await ui.act({ type: "session.info", session: info("s1", "alpha", { providerId: "claude" }) });
+    await Bun.sleep(200);
+    // The pick went to the backend it was made for, and no picker for the
+    // new backend is left open behind it.
+    expect(ui.client().calls).toEqual([["setAccount", "s1", "chatgpt-work", "codex"]]);
+    expect(ui.frame()).not.toContain("Select account");
+    expect(ui.frame()).toContain("alpha switched to claude — reopen /account");
+    await ui.press("\u001b");
+    await waitFor(() => !ui.frame().includes("reopen /account"), ui.frame);
   });
 });
 

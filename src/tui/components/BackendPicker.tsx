@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { Box, Text, useInput } from "ink";
 import type { ProviderInfo } from "../../protocol/types.js";
 import type { TuiWsClient } from "../ws.js";
+import { accountChoices } from "../accounts.js";
 
 export interface BackendChoice {
   value: string;
@@ -52,15 +53,11 @@ export function BackendPicker({ kind, provider, sessionName, current, providers,
         })));
         setLive(result.live);
       } else {
-        const result = await client.listClaudeAccounts();
+        // The accounts of the backend this picker was opened on — a
+        // credential entered for one backend is never offered to another.
+        const result = await client.listAccounts(provider);
         if (cancelled) return;
-        setChoices([
-          { value: "", label: `Follow daemon default (${result.defaultAccount})` },
-          { value: "default", label: "default — this machine's Claude login" },
-          ...result.accounts.filter((account) => account.name !== "default").map((account) => ({
-            value: account.name, label: account.name, description: account.kind,
-          })),
-        ]);
+        setChoices(accountChoices(result));
       }
     };
     void load().catch((cause: unknown) => {
@@ -103,7 +100,7 @@ export function BackendPicker({ kind, provider, sessionName, current, providers,
 
   return (
     <Box flexDirection="column" borderStyle="double" borderColor="cyan" paddingX={1}>
-      <Text bold color="cyan">Select {kind}{kind === "model" ? ` (${provider})` : ""}{sessionName ? ` for ${sessionName}` : ""}</Text>
+      <Text bold color="cyan">Select {kind}{kind !== "provider" ? ` (${provider})` : ""}{sessionName ? ` for ${sessionName}` : ""}</Text>
       {loading ? <Text dimColor>Loading…</Text> : options.slice(start, start + 8).map((choice, offset) => (
         // A server may list an id twice: the position keeps keys unique.
         <Box key={`${start + offset}:${choice.value}`} flexDirection="column">

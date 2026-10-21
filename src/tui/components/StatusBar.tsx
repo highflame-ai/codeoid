@@ -53,7 +53,7 @@ export function StatusBar({
   cols,
 }: Props) {
   const usage = focused?.info.usage;
-  const account = focused ? claudeAccountLabel(focused.info) : null;
+  const account = focused ? accountLabel(focused.info) : null;
   // Background-activity summary: count sessions (other than focused) with
   // unread messages or pending approvals. Shown as a single compact pill
   // at the end of the bar — no per-session chrome.
@@ -112,6 +112,10 @@ export function StatusBar({
           >
             {focused.info.status}
           </Text>
+          {/* A MISSING account fails the next turn, so it comes right after
+              the status — ahead of the model and backend, whose ids can
+              be long enough to push it off a 100-column terminal. */}
+          {account?.missing && <Text color="red">{` · ⚠ ${account.label}`}</Text>}
           {workingSec !== null && (
             <Text color="yellow" dimColor>
               {` · ${formatDuration(workingSec)}`}
@@ -155,13 +159,11 @@ export function StatusBar({
             </>
           )}
           {/* The backend sits with the model (Claude is implied by its
-              model id), and a MISSING account too — it fails the next turn,
-              so it must never be truncated away behind usage. A working
-              account is a descriptor and goes at the end. */}
+              model id). A working account is a descriptor and goes at the
+              end, beside the workdir. */}
           {(focused.info.providerId ?? "claude") !== "claude" && (
             <Text dimColor>{` on ${focused.info.providerId}`}</Text>
           )}
-          {account?.missing && <Text color="red">{` · account: ${account.label}`}</Text>}
           {focused.info.pinnedFiles && focused.info.pinnedFiles.length > 0 && (
             <>
               <Text dimColor>{" · pinned: "}</Text>
@@ -274,19 +276,29 @@ export function StatusBar({
 }
 
 /**
- * The Claude account worth showing, or null. A session that follows the
- * daemon default and lands on the machine's own login is the common case and
+ * The account worth showing for the session's current backend, or null. A
+ * session that follows its backend's default and lands on the built-in
+ * `default` (the daemon's own login or environment) is the common case and
  * says nothing; a pinned account, a non-default daemon default, or a missing
- * account (which fails the next turn) is shown.
+ * account (which fails the next turn) is shown. A backend without accounts
+ * reports neither field and shows nothing. A missing label leads with what's
+ * wrong ("missing account: work", "missing default account: team"), so a
+ * narrow bar that cuts its end still says it.
  */
-function claudeAccountLabel(info: TuiSession["info"]): { label: string; missing: boolean } | null {
-  if ((info.providerId ?? "claude") !== "claude") return null;
-  const effective = info.effectiveClaudeAccount ?? info.claudeAccount ?? "default";
+function accountLabel(info: TuiSession["info"]): { label: string; missing: boolean } | null {
+  // On a Claude session the daemon also reports the same choice under the
+  // Claude-only `claudeAccount` / `effectiveClaudeAccount` names.
+  const claude = (info.providerId ?? "claude") === "claude";
+  const choice = info.account ?? (claude ? info.claudeAccount : undefined);
+  const reported = info.effectiveAccount ?? (claude ? info.effectiveClaudeAccount : undefined);
+  if (choice === undefined && reported === undefined) return null;
+  const effective = reported ?? choice ?? "default";
   const missing = effective.endsWith(" (missing)");
-  if (info.claudeAccount !== undefined) return { label: effective, missing };
-  if (effective === "default") return null;
   const name = missing ? effective.slice(0, -" (missing)".length) : effective;
-  return { label: `${name} (following default${missing ? ", missing" : ""})`, missing };
+  if (choice !== undefined) return missing ? { label: `missing account: ${name}`, missing } : { label: effective, missing };
+  if (effective === "default") return null;
+  if (missing) return { label: `missing default account: ${name}`, missing };
+  return { label: `${effective} (following default)`, missing };
 }
 
 /** "12s" / "1m 23s" / "1h 5m" — compact working-duration stamp. */
