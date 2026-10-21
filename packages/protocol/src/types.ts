@@ -30,7 +30,17 @@ import type {
   BackendLoginStartResultMsg,
   BackendLoginSubmitResultMsg,
   BackendLoginCancelResultMsg,
+  BackendLoginWaitMsg,
+  BackendLoginWaitResultMsg,
 } from "./backend-login.js";
+import type {
+  AccountsListMsg,
+  AccountsRemoveMsg,
+  AccountsResultMsg,
+  AccountsSetDefaultMsg,
+  AccountsSetMsg,
+  SessionSetAccountMsg,
+} from "./accounts.js";
 import type { SkillGrantMsg, SkillGrantResultMsg } from "./skill-grant.js";
 import type { SessionRewindMsg, SessionRewindResultMsg, SessionTurnsMsg, SessionTurnsResultMsg } from "./turns.js";
 import type { SessionApprovalsMsg, SessionApprovalsResultMsg } from "./approvals.js";
@@ -370,6 +380,17 @@ export interface SessionInfo {
    * the daemon default, else `default` (the daemon's own environment).
    */
   effectiveClaudeAccount?: string;
+  /**
+   * The account this session chose for its current backend (accounts.ts).
+   * Absent = it follows that backend's daemon default.
+   */
+  account?: string;
+  /**
+   * The account it actually runs on for its current backend — its choice,
+   * else the backend's daemon default, else `default`; `"<name> (missing)"`
+   * when that account can't be used. Absent for a backend without accounts.
+   */
+  effectiveAccount?: string;
   /** Current execution mode (default "interactive"). */
   mode?: SessionMode;
   /** Active SDLC pipeline phase id when this session backs a phase. Absent = not a pipeline session. */
@@ -1096,6 +1117,7 @@ export type ClientMessage =
   | BackendLoginStartMsg
   | BackendLoginSubmitMsg
   | BackendLoginCancelMsg
+  | BackendLoginWaitMsg
   | SkillGrantMsg
   | SessionTurnsMsg
   | SessionApprovalsMsg
@@ -1104,6 +1126,11 @@ export type ClientMessage =
   | ClaudeAccountsRemoveMsg
   | ClaudeAccountsSetDefaultMsg
   | SessionSetClaudeAccountMsg
+  | AccountsListMsg
+  | AccountsSetMsg
+  | AccountsRemoveMsg
+  | AccountsSetDefaultMsg
+  | SessionSetAccountMsg
   | ProvidersListMsg
   | EndpointsListMsg
   | EndpointsSetMsg
@@ -1275,6 +1302,12 @@ export interface SessionCreateMsg extends BaseClientMsg {
    * follow the daemon default. Unknown names are rejected.
    */
   claudeAccount?: string;
+  /**
+   * Account to run this session on for its backend (accounts.ts). Absent =
+   * follow that backend's daemon default. Unknown names are rejected. For
+   * Claude, `claudeAccount` is the older spelling of the same choice.
+   */
+  account?: string;
   /**
    * Model for this session (docs/role-model-binding.md §6.2). Validated
    * provider-aware at create (a Claude alias on a non-Claude backend is
@@ -2862,10 +2895,12 @@ export type DaemonMessage =
   | BackendLoginStartResultMsg
   | BackendLoginSubmitResultMsg
   | BackendLoginCancelResultMsg
+  | BackendLoginWaitResultMsg
   | SkillGrantResultMsg
   | SessionTurnsResultMsg
   | SessionApprovalsResultMsg
   | ClaudeAccountsResultMsg
+  | AccountsResultMsg
   | ProvidersResultMsg
   | ProvidersChangedMsg
   | EndpointsResultMsg

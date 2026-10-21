@@ -11,11 +11,10 @@
  * Tokens never leave this module except into a subprocess environment.
  */
 
-import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { atomicWrite, getConfigDir } from "../config.js";
+import { AccountError, AccountStore } from "./accounts.js";
 import {
   CLAUDE_DEFAULT_ACCOUNT,
   type ClaudeAccountInfo,
@@ -30,13 +29,9 @@ export interface StoredClaudeAccount {
   headers?: Record<string, string>;
   createdAt: string;
   updatedAt: string;
+  generation?: number;
 }
 
-interface StoreFile {
-  version: 1;
-  defaultAccount?: string;
-  accounts: StoredClaudeAccount[];
-}
 
 /** A session's account, resolved for one query: what to apply, and whether it changed. */
 export interface ResolvedClaudeAccount {
@@ -237,112 +232,66 @@ export function applyAccountEnv(env: Record<string, string>, account: StoredClau
   return out;
 }
 
-function fingerprintOf(a: StoredClaudeAccount): string {
-  return createHash("sha256")
-    .update(JSON.stringify([a.name, a.kind, a.token, a.baseUrl ?? "", Object.entries(a.headers ?? {}).sort()]))
-    .digest("hex")
-    .slice(0, 16);
-}
 
+/**
+ * The `claude` backend's accounts, in the shape #392's callers use. Backed by
+ * the store for every backend (accounts.ts); `claude-accounts.json` is only
+ * read once, to import it.
+ */
 export class ClaudeAccountStore {
-  readonly #path: string;
-  #data: StoreFile | null = null;
+  readonly store: AccountStore;
 
-  constructor(path: string = join(getConfigDir(), "claude-accounts.json")) {
-    this.#path = path;
-  }
-
-  #load(): StoreFile {
-    if (this.#data) return this.#data;
-    if (!existsSync(this.#path)) {
-      this.#data = { version: 1, accounts: [] };
-      return this.#data;
-    }
-    let parsed: Partial<StoreFile>;
-    try {
-      parsed = JSON.parse(readFileSync(this.#path, "utf8")) as Partial<StoreFile>;
-    } catch (err) {
-      // Fail closed — the default may name an account we can no longer read —
-      // but say exactly what to fix.
-      // Not the parser's message: it can quote a slice of the file — a token.
-      throw new ClaudeAccountError(`${this.#path} is not valid JSON — fix or remove it`);
-    }
-    // Validate each entry as if it were being added: a hand-edited entry with
-    // an unknown kind or a bad token must not be applied.
-    const accounts = (Array.isArray(parsed.accounts) ? parsed.accounts : []).filter((a): a is StoredClaudeAccount => {
-      try {
-        validateAccountInput(a as StoredClaudeAccount);
-        return true;
-      } catch (err) {
-        console.error(`[codeoid] ignoring invalid Claude account in ${this.#path}: ${err instanceof Error ? err.message : String(err)}`);
-        return false;
-      }
-    });
-    this.#data = {
-      version: 1,
-      accounts,
-      ...(typeof parsed.defaultAccount === "string" ? { defaultAccount: parsed.defaultAccount } : {}),
-    };
-    return this.#data;
-  }
-
-  #save(data: StoreFile): void {
-    atomicWrite(this.#path, `${JSON.stringify(data, null, 2)}\n`, 0o600);
-    this.#data = data;
+  /** `path`: a legacy `claude-accounts.json` to import from (tests); its sibling `accounts.json` is the store. */
+  constructor(storeOrLegacyPath?: AccountStore | string) {
+    this.store =
+      storeOrLegacyPath instanceof AccountStore
+        ? storeOrLegacyPath
+        : storeOrLegacyPath
+          ? new AccountStore({
+              path: join(dirname(storeOrLegacyPath), "accounts.json"),
+              homesRoot: join(dirname(storeOrLegacyPath), "accounts"),
+              legacyClaudePath: storeOrLegacyPath,
+            })
+          : new AccountStore();
   }
 
   list(): ClaudeAccountInfo[] {
-    return this.#load().accounts.map(toAccountInfo).sort((a, b) => a.name.localeCompare(b.name));
+    return this.store.list("claude").map(({ backend: _b, envNames: _e, ...a }) => a as ClaudeAccountInfo);
   }
 
   get(name: string): StoredClaudeAccount | undefined {
-    return this.#load().accounts.find((a) => a.name === name);
+    const a = this.store.get("claude", name);
+    return a ? (a as StoredClaudeAccount) : undefined;
   }
 
   has(name: string): boolean {
-    return name === CLAUDE_DEFAULT_ACCOUNT || this.get(name) !== undefined;
+    return this.store.has("claude", name);
   }
 
   /** The daemon default's name — `default` when none is set. */
   getDefault(): string {
-    return this.#load().defaultAccount ?? CLAUDE_DEFAULT_ACCOUNT;
+    return this.store.getDefault("claude");
   }
 
+  /** Add or replace (the #392 contract: `claude.accounts.set` always replaces). */
   upsert(input: { name: string; kind: ClaudeAccountKind; token: string; baseUrl?: string; headers?: Record<string, string> }): StoredClaudeAccount {
-    validateAccountInput(input);
-    const data = this.#load();
-    const now = new Date().toISOString();
-    const prev = data.accounts.find((a) => a.name === input.name);
-    const next: StoredClaudeAccount = {
-      name: input.name,
-      kind: input.kind,
-      token: input.token,
-      ...(input.baseUrl ? { baseUrl: input.baseUrl } : {}),
-      ...(input.headers && Object.keys(input.headers).length > 0 ? { headers: { ...input.headers } } : {}),
-      createdAt: prev?.createdAt ?? now,
-      updatedAt: now,
-    };
-    this.#save({ ...data, accounts: [...data.accounts.filter((a) => a.name !== input.name), next] });
-    return next;
+    try {
+      validateAccountInput(input);
+      this.store.upsert({ backend: "claude", ...input, replace: true });
+    } catch (err) {
+      throw err instanceof AccountError ? new ClaudeAccountError(err.message) : err;
+    }
+    return this.get(input.name)!;
   }
 
   /** Remove an account. Clears the default if it was the default. Returns whether it existed. */
   remove(name: string): boolean {
-    const data = this.#load();
-    if (!data.accounts.some((a) => a.name === name)) return false;
-    const { defaultAccount, ...rest } = data;
-    this.#save({
-      ...rest,
-      accounts: data.accounts.filter((a) => a.name !== name),
-      ...(defaultAccount && defaultAccount !== name ? { defaultAccount } : {}),
-    });
-    return true;
+    return this.store.remove("claude", name);
   }
 
   setDefault(name: string): void {
     if (!this.has(name)) throw new ClaudeAccountError(`no Claude account named ${JSON.stringify(name)}`);
-    const { defaultAccount: _old, ...rest } = this.#load();
-    this.#save(name === CLAUDE_DEFAULT_ACCOUNT ? rest : { ...rest, defaultAccount: name });
+    this.store.setDefault("claude", name);
   }
 
   /**
@@ -362,15 +311,18 @@ export class ClaudeAccountStore {
         `Claude accounts are disabled behind the Highflame gateway — "${name}" would route around it. This session runs on the gateway's credential.`,
       );
     }
-    const account = this.get(name);
-    if (!account) {
+    let resolved: ReturnType<AccountStore["resolve"]>;
+    try {
+      resolved = this.store.resolve("claude", name);
+    } catch {
       throw new ClaudeAccountError(
         `Claude account "${name}" no longer exists — choose another for this session (codeoid account use <session> <account>)`,
       );
     }
+    const account = resolved!.account as StoredClaudeAccount;
     return {
       name: account.name,
-      fingerprint: fingerprintOf(account),
+      fingerprint: resolved!.fingerprint,
       apply: (env) => applyAccountEnv(env, account),
     };
   }

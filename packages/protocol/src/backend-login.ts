@@ -42,10 +42,10 @@ import type { SettingsSnapshot } from "./settings.js";
  * without first asking the daemon whether it would work. Adding one is an entry
  * here plus a flow in the daemon's broker.
  */
-export type LoginBackend = "claude";
+export type LoginBackend = "claude" | "codex" | "gemini-cli";
 
 /** Runtime companion to {@link LoginBackend} — what a client renders a button for. */
-export const LOGIN_CAPABLE_BACKENDS: readonly LoginBackend[] = ["claude"] as const;
+export const LOGIN_CAPABLE_BACKENDS: readonly LoginBackend[] = ["claude", "codex", "gemini-cli"] as const;
 
 /** A login the daemon has started and is holding open, waiting for a code. */
 export interface PendingBackendLogin {
@@ -56,8 +56,17 @@ export interface PendingBackendLogin {
   verificationUrl: string;
   /** Epoch ms after which the daemon abandons the attempt and kills the command. */
   expiresAt: number;
-  /** One line naming what the user brings back — wording is vendor-specific. */
+  /** One line naming what the user does next — wording is vendor-specific. */
   codeHint: string;
+  /**
+   * `code` (default when absent): the vendor's page shows a code the user
+   * pastes back with `backend.login.submit`. `device`: the user enters
+   * {@link userCode} on the vendor's page and the login finishes on its own —
+   * the client calls `backend.login.wait`.
+   */
+  mode?: "code" | "device";
+  /** `device` only: the one-time code to enter on the vendor's page. Not a credential. */
+  userCode?: string;
 }
 
 // ── Messages (client → daemon) ────────────────────────────────────────────────
@@ -74,12 +83,14 @@ export interface BackendLoginStartMsg {
   id: string;
   backend: LoginBackend;
   /**
-   * Store the resulting credential as this named Claude account
-   * (claude-accounts.ts) instead of the daemon's single default token. The
-   * login runs against a throwaway Claude config dir so it can never replace
-   * the machine's own `claude login`.
+   * Store the resulting credential as this named account of `backend`
+   * (accounts.ts) instead of the daemon's own login. The login runs against a
+   * staging home so it can never replace the machine's own login. Required
+   * for every backend but `claude`.
    */
   account?: string;
+  /** Replace an existing account of that name (refused otherwise). */
+  replace?: boolean;
 }
 
 /**
@@ -94,6 +105,16 @@ export interface BackendLoginSubmitMsg {
   loginId: string;
   /** The code the vendor's callback page displayed. Never logged or echoed. */
   code: string;
+}
+
+/**
+ * Wait for a `device` login to finish (the user approved on the vendor's
+ * page) or fail. Terminal either way, like `submit`.
+ */
+export interface BackendLoginWaitMsg {
+  type: "backend.login.wait";
+  id: string;
+  loginId: string;
 }
 
 /** Abandon an in-flight attempt and kill the command. Idempotent. */
@@ -125,6 +146,11 @@ export interface BackendLoginSubmitResultMsg {
    * a second round trip. The stored secret shows as set; its value never moves.
    */
   snapshot: SettingsSnapshot;
+}
+
+/** Same outcome as a submit, for a `device` login. */
+export interface BackendLoginWaitResultMsg extends Omit<BackendLoginSubmitResultMsg, "type"> {
+  type: "backend.login.wait.result";
 }
 
 export interface BackendLoginCancelResultMsg {

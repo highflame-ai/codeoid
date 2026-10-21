@@ -109,6 +109,7 @@ export const sessionCreateSchema = z.object({
    */
   providerId: z.string().min(1).max(64).optional(),
   claudeAccount: z.string().min(1).max(64).optional(),
+  account: z.string().min(1).max(64).optional(),
   /**
    * Collaborative session config (docs/collaborative-session-design.md §9).
    *
@@ -508,7 +509,7 @@ export const settingsSetSchema = z.object({
  * it can name belongs in the validated surface rather than in a lookup that
  * happens to miss.
  */
-const loginBackendField = z.enum(["claude"]);
+const loginBackendField = z.enum(["claude", "codex", "gemini-cli"]);
 
 const claudeAccountNameField = z.string().min(1).max(64);
 
@@ -517,6 +518,56 @@ export const backendLoginStartSchema = z.object({
   type: z.literal("backend.login.start"),
   backend: loginBackendField,
   account: claudeAccountNameField.optional(),
+  replace: z.boolean().optional(),
+});
+
+/**
+ * A backend id an account belongs to. A bounded string, not an enum, so a
+ * frame for a backend this daemon lacks still parses and gets a specific
+ * error; the daemon checks it against the kinds it knows.
+ */
+const accountBackendField = z.string().min(1).max(64);
+const accountNameField = z.string().min(1).max(64);
+
+export const accountsListSchema = z.object({
+  ...base,
+  type: z.literal("accounts.list"),
+  backend: accountBackendField.optional(),
+});
+
+export const accountsSetSchema = z.object({
+  ...base,
+  type: z.literal("accounts.set"),
+  backend: accountBackendField,
+  name: accountNameField,
+  kind: z.enum(["subscription", "gateway", "api-key", "chatgpt-login", "google-login", "api-keys"]),
+  token: z.string().min(1).max(8192).optional(),
+  baseUrl: z.string().min(1).max(2048).optional(),
+  headers: z.record(z.string().min(1).max(256), z.string().max(8192)).optional(),
+  env: z.record(z.string().min(1).max(128), z.string().min(1).max(8192)).optional(),
+  replace: z.boolean().optional(),
+});
+
+export const accountsRemoveSchema = z.object({
+  ...base,
+  type: z.literal("accounts.remove"),
+  backend: accountBackendField,
+  name: accountNameField,
+});
+
+export const accountsSetDefaultSchema = z.object({
+  ...base,
+  type: z.literal("accounts.set_default"),
+  backend: accountBackendField,
+  name: accountNameField,
+});
+
+export const sessionSetAccountSchema = z.object({
+  ...base,
+  type: z.literal("session.set_account"),
+  sessionId: sessionIdField,
+  account: accountNameField.nullable(),
+  backend: accountBackendField.optional(),
 });
 
 export const claudeAccountsListSchema = z.object({
@@ -611,6 +662,12 @@ export const backendLoginSubmitSchema = z.object({
   type: z.literal("backend.login.submit"),
   loginId: z.string().min(1).max(128),
   code: z.string().min(1).max(LIMITS.LOGIN_CODE_MAX),
+});
+
+export const backendLoginWaitSchema = z.object({
+  ...base,
+  type: z.literal("backend.login.wait"),
+  loginId: z.string().min(1).max(128),
 });
 
 export const backendLoginCancelSchema = z.object({
@@ -1058,6 +1115,7 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   backendLoginStartSchema,
   backendLoginSubmitSchema,
   backendLoginCancelSchema,
+  backendLoginWaitSchema,
   skillGrantSchema,
   sessionTurnsSchema,
   sessionApprovalsSchema,
@@ -1066,6 +1124,11 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   claudeAccountsRemoveSchema,
   claudeAccountsSetDefaultSchema,
   sessionSetClaudeAccountSchema,
+  accountsListSchema,
+  accountsSetSchema,
+  accountsRemoveSchema,
+  accountsSetDefaultSchema,
+  sessionSetAccountSchema,
   providersListSchema,
   endpointsListSchema,
   endpointsSetSchema,

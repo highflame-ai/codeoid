@@ -43,7 +43,8 @@ describe("ClaudeAccountStore", () => {
     const store = storeAt();
     store.upsert({ name: "personal", kind: "subscription", token: "sk-ant-oat01-PERSONAL" });
     store.upsert({ name: "gw-a", kind: "gateway", token: "gw-secret", baseUrl: "https://gw.example", headers: { "x-workspace": "ws-a" } });
-    expect(statSync(join(dir, "claude-accounts.json")).mode & 0o777).toBe(0o600);
+    // Stored with every backend's accounts (accounts.ts), 0600.
+    expect(statSync(join(dir, "accounts.json")).mode & 0o777).toBe(0o600);
     const listed = JSON.stringify(store.list());
     expect(listed).not.toContain("sk-ant-oat01-PERSONAL");
     expect(listed).not.toContain("gw-secret");
@@ -85,7 +86,7 @@ describe("ClaudeAccountStore", () => {
   test("a corrupt store fails closed; an invalid hand-edited entry is ignored, never applied", () => {
     const path = join(dir, "claude-accounts.json");
     writeFileSync(path, "{not json");
-    expect(() => storeAt().list()).toThrow(ClaudeAccountError);
+    expect(() => storeAt().list()).toThrow(/not valid JSON/);
     writeFileSync(
       path,
       JSON.stringify({
@@ -98,6 +99,22 @@ describe("ClaudeAccountStore", () => {
     );
     expect(storeAt().list().map((a) => a.name)).toEqual(["ok"]);
     expect(() => storeAt().resolve("weird")).toThrow(/no longer exists/);
+  });
+
+  test("#392's claude-accounts.json is imported once, and left as it was", () => {
+    const legacy = join(dir, "claude-accounts.json");
+    const before = JSON.stringify({
+      version: 1,
+      defaultAccount: "work",
+      accounts: [{ name: "work", kind: "subscription", token: "sk-ant-oat01-WORK", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" }],
+    });
+    writeFileSync(legacy, before);
+    expect(storeAt().getDefault()).toBe("work");
+    expect(storeAt().resolve(null)?.name).toBe("work");
+    expect(readFileSync(legacy, "utf8")).toBe(before);
+    // Imported once: a later change to the old file is not re-read.
+    writeFileSync(legacy, JSON.stringify({ version: 1, accounts: [] }));
+    expect(storeAt().get("work")?.token).toBe("sk-ant-oat01-WORK");
   });
 
   test("a literal \"default\" pins the built-in account whatever the daemon default is", () => {
