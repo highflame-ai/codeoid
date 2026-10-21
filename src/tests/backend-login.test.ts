@@ -449,11 +449,13 @@ exit 1`,
   });
 });
 
-describe("script(1)'s stdin is a pipe, not a socket", () => {
-  test("a script that refuses a socket on stdin (BSD script on macOS) still prints the link and takes the code", async () => {
-    // Stand-in for macOS's BSD script: exactly its failure on a socket stdin,
-    // otherwise the real script. Bun hands a child a socketpair for "pipe"
-    // stdio, which is what broke sign-in on macOS.
+describe("script(1)'s stdin is an ordinary pipe — not a socket, not a named pipe", () => {
+  test.skipIf(process.platform !== "linux")("a script that refuses anything else (BSD script on macOS) still prints the link and takes the code", async () => {
+    // Stand-in for macOS's BSD script: its failure on any stdin but an
+    // ordinary pipe, otherwise the real script. Bun hands a child a
+    // socketpair for "pipe" stdio, which broke sign-in on macOS (#411); recent
+    // macOS refuses a named pipe the same way, which broke #411's fix. On
+    // Linux an ordinary pipe reads as "pipe:[…]" in /proc; a FIFO as its path.
     const realScript = Bun.which("script");
     expect(realScript).toBeTruthy();
     const bin = join(dir, "bsd-like-bin");
@@ -461,7 +463,7 @@ describe("script(1)'s stdin is a pipe, not a socket", () => {
     mkdirSync(bin, { recursive: true });
     writeFileSync(
       join(bin, "script"),
-      `#!/bin/sh\nif [ -S /dev/stdin ]; then echo "script: tcgetattr/ioctl: Operation not supported on socket" >&2; exit 1; fi\nexec "${realScript}" "$@"\n`,
+      `#!/bin/sh\ncase "$(readlink /proc/$$/fd/0)" in pipe:*) ;; *) echo "script: tcgetattr/ioctl: Operation not supported on socket" >&2; exit 1;; esac\nexec "${realScript}" "$@"\n`,
       "utf8",
     );
     chmodSync(join(bin, "script"), 0o755);
