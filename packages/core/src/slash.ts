@@ -19,6 +19,7 @@ import type {
   SessionInfo,
   SessionMode,
   McpReconnectResult,
+  McpRefreshResult,
 } from "@highflame/codeoid-protocol";
 
 export type SlashCommand =
@@ -36,6 +37,7 @@ export type SlashCommand =
   | { kind: "who" }
   | { kind: "capabilities"; tab: "agents" | "skills" | "mcp" | "hooks" }
   | { kind: "mcp-reconnect"; server: string }
+  | { kind: "mcp-refresh" }
   | { kind: "settings" }
   | { kind: "packs" }
   | { kind: "pipeline"; goal?: string }
@@ -136,6 +138,8 @@ export function parseSlash(raw: string, opts?: ParseSlashOptions): SlashCommand 
     case "mcp":
       // `/mcp reconnect <server>` redials one of the backend's servers (#389).
       if (rest[0] === "reconnect" && rest[1]) return { kind: "mcp-reconnect", server: rest.slice(1).join(" ") };
+      // `/mcp refresh` applies Claude's current MCP config to the session (#395).
+      if (rest[0] === "refresh") return { kind: "mcp-refresh" };
       return { kind: "capabilities", tab: "mcp" };
     case "hooks":
     case "hook":
@@ -316,6 +320,24 @@ export function dispatchSlash(cmd: SlashCommand, ctx: SlashContext): void {
         .catch((e) => ctx.report?.(e instanceof Error ? e.message : String(e)));
       return;
     }
+    case "mcp-refresh": {
+      const msg: ClientMessage = { type: "session.mcp_refresh", id: ctx.newRequestId(), sessionId: ctx.sessionId };
+      if (!ctx.request) {
+        ctx.send(msg);
+        return;
+      }
+      ctx
+        .request(msg)
+        .then((resp) => {
+          const r = (resp as { data?: McpRefreshResult } | undefined)?.data;
+          if (!r) return;
+          ctx.report?.(
+            mcpRefreshSummary(r),
+          );
+        })
+        .catch((e) => ctx.report?.(e instanceof Error ? e.message : String(e)));
+      return;
+    }
     case "settings":
       ctx.showSettings?.();
       return;
@@ -353,4 +375,12 @@ export function dispatchSlash(cmd: SlashCommand, ctx: SlashContext): void {
       return;
     }
   }
+}
+
+/** What `/mcp refresh` did, in words every frontend shows the same (#395). */
+export function mcpRefreshSummary(r: McpRefreshResult): string {
+  if (!r.changed) return "MCP servers are up to date.";
+  return r.deferred
+    ? "MCP servers changed: work is running, so they're applied before the next turn."
+    : "MCP servers changed: the backend was stopped and starts with them on your next message.";
 }

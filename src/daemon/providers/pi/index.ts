@@ -48,7 +48,7 @@ import {
 } from "./bridge.js";
 import { memoryToolDefs, type MemoryEngine, type MemoryToolContext } from "../../memory/index.js";
 import { SessionMcpTools } from "../../mcp/tool-source.js";
-import type { McpRegistry } from "../../mcp/registry.js";
+import type { McpServerView } from "../../mcp/registry.js";
 import type { McpHub } from "../../mcp/hub.js";
 import { PiRpcProcess, type PiFrame } from "./rpc.js";
 import { translatePiEvent } from "./translate.js";
@@ -72,7 +72,7 @@ export interface PiProviderInit {
   memory?: MemoryEngine;
   /** Cross-backend MCP registry + daemon-owned client — external servers reach
    *  pi (which has no MCP client) by registering bridge tools that proxy to the hub. */
-  mcpRegistry?: McpRegistry;
+  mcpRegistry?: McpServerView;
   mcpHub?: McpHub;
   onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
 }
@@ -106,7 +106,7 @@ export class PiProvider implements SessionProvider {
   #workspaceId: string;
   #tenant: McpTenant | undefined;
   #memory: MemoryEngine | null;
-  #mcpRegistry: McpRegistry | null;
+  #mcpRegistry: McpServerView | null;
   #mcpHub: McpHub | null;
 
   #proc: PiRpcProcess | null = null;

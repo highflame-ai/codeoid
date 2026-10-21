@@ -1015,6 +1015,18 @@ mcp
   .description("Redial one of a session's MCP servers that's down — e.g. one that failed when the session started and has since been fixed")
   .action((session: string, server: string) => withClient((c) => c.mcpReconnect(session, server)));
 
+mcp
+  .command("refresh <session>")
+  .description("Use MCP servers added or changed in Claude's config in a session (its backend restarts and resumes the conversation)")
+  .action((session: string) => withClient((c) => c.mcpRefresh(session)));
+
+mcp
+  .command("approve <session> <server>")
+  .description("Approve a project's MCP server (from its .mcp.json or project settings) for every backend in the session's workdir")
+  .option("--path <file>", "the file it's declared in, when more than one declares it")
+  .option("--yes <fingerprint>", "approve the entry you reviewed (its fingerprint, as the review printed it); without it, the entry is only shown")
+  .action((session: string, server: string, opts: { path?: string; yes?: string }) => withClient((c) => c.mcpApprove(session, server, opts)));
+
 // ── Packs (dynamic pack loading — docs/pack-loading.md) ─────────────────────
 
 /** Connect, run one pack command, disconnect. */

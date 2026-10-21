@@ -95,6 +95,9 @@ const samples: { [T in ClientTypes]: Extract<ClientMessage, { type: T }> } = {
   "session.search": { type: "session.search", id: "r14", query: "auth bug", scope: "all", limit: 5 },
   "session.set_model": { type: "session.set_model", id: "r15", sessionId: "s1", model: "opus", fallbackModel: null },
   "session.mcp_reconnect": { type: "session.mcp_reconnect", id: "r28m", sessionId: "s1", server: "slack" },
+  "session.mcp_refresh": { type: "session.mcp_refresh", id: "r28r", sessionId: "s1" },
+  "mcp.approve.preview": { type: "mcp.approve.preview", id: "r28p", sessionId: "s1", server: "db" },
+  "mcp.approve": { type: "mcp.approve", id: "r28a", sessionId: "s1", server: "db", path: "/w/.mcp.json", fingerprint: "0123456789abcdef0123456789abcdef" },
   "session.set_provider": {
     type: "session.set_provider",
     id: "r28",

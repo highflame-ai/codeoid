@@ -30,7 +30,7 @@ import { ResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import { McpSignInRequired, type McpCredentialSource, type McpTenant } from "./oauth.js";
 import type { McpProxy } from "./proxy.js";
 import { cleanMcpError } from "./redact.js";
-import { closeUpstream, FailureStreak, openUpstream, sessionGone, sessionTrouble, type UpstreamBearer, type UpstreamOptions } from "./upstream.js";
+import { closeUpstream, FailureStreak, McpServerWantsSignIn, openUpstream, sessionGone, sessionTrouble, type UpstreamBearer, type UpstreamOptions } from "./upstream.js";
 
 /** A tool as codeoid surfaces it to a backend (bare name; the canonical
  *  `mcp__<server>__<tool>` form is applied by the mounters, not here). */
@@ -120,8 +120,11 @@ export class McpHub {
       const all = await withTimeout(client.listTools(), this.#timeoutMs, `${spec.name}/tools/list`);
       const tools = spec.toolAllowlist ? all.filter((t) => spec.toolAllowlist?.includes(t.name)) : all;
       this.#status.set(key, { tools: tools.map((t) => t.name) });
+      // It answers without a sign-in now: no longer held back.
+      if (spec.transport.kind === "http" && scope?.tenant) this.#wantsSignIn.delete(signInKey(spec.transport.url, scope.tenant));
       return tools;
     } catch (e) {
+      if (e instanceof McpServerWantsSignIn && spec.transport.kind === "http") this.markNeedsSignIn(spec.transport.url, scope?.tenant);
       // Not having signed in is not a fault of the server: no health to
       // record — and the tool list from before is gone with the credential.
       if (e instanceof McpSignInRequired) this.#status.delete(key);
@@ -152,6 +155,11 @@ export class McpHub {
     try {
       return await withTimeout(client.callTool(tool, args, scope), this.#timeoutMs, `${spec.name}/${tool}`);
     } catch (e) {
+      if (e instanceof McpServerWantsSignIn && spec.transport.kind === "http") {
+        this.markNeedsSignIn(spec.transport.url, scope.tenant);
+        this.#dropIfBroken(clientKey(spec, scope.tenant), e, client);
+        return { text: e.message, isError: true };
+      }
       this.#dropIfBroken(clientKey(spec, scope.tenant), e, client); // reconnect on next use
       if (e instanceof McpSignInRequired) return { text: e.message, isError: true };
       // codeoid has no OTEL; a failed external tool call is worth one daemon log
@@ -207,6 +215,52 @@ export class McpHub {
     else this.#status.set(key, { tools: this.#status.get(key)?.tools ?? [], ...(status.error ? { error: status.error } : {}) });
   }
 
+  /**
+   * Plain HTTP servers that answered with the MCP sign-in challenge (#395), per
+   * tenant: held back from that tenant's backends that would only get 401s.
+   * A mark lasts ten minutes (then the server is tried again), and goes as
+   * soon as the server answers.
+   */
+  readonly #wantsSignIn = new Map<string, number>();
+
+  /** Whether the plain HTTP server at `url` has asked `tenant` for an OAuth sign-in. */
+  needsSignIn(url: string, tenant: McpTenant | undefined): boolean {
+    if (!tenant) return false;
+    const key = signInKey(url, tenant);
+    const until = this.#wantsSignIn.get(key);
+    if (until === undefined) return false;
+    if (until > Date.now()) return true;
+    this.#wantsSignIn.delete(key);
+    return false;
+  }
+
+  /** Note that the server at `url` asked `tenant` for a sign-in (here, or as Claude saw it). */
+  markNeedsSignIn(url: string, tenant: McpTenant | undefined): void {
+    if (tenant) this.#wantsSignIn.set(signInKey(url, tenant), Date.now() + SIGN_IN_HOLD_MS);
+  }
+
+  /** Sessions using each session-specific server (a workdir one, or a session's
+   *  snapshot of a global one): its client closes when the last lets go. */
+  readonly #users = new Map<string, number>();
+
+  /** A session now uses this server. */
+  retain(spec: McpServerSpec, tenant: McpTenant | undefined): void {
+    const key = clientKey(spec, tenant);
+    this.#users.set(key, (this.#users.get(key) ?? 0) + 1);
+  }
+
+  /** A session no longer uses this server: the last to let go closes its client. */
+  release(spec: McpServerSpec, tenant: McpTenant | undefined): void {
+    const key = clientKey(spec, tenant);
+    const n = (this.#users.get(key) ?? 0) - 1;
+    if (n > 0) {
+      this.#users.set(key, n);
+      return;
+    }
+    this.#users.delete(key);
+    this.#drop(key);
+  }
+
   /** How native backends that own their MCP clients reach this daemon's OAuth
    *  servers (Codex, the Gemini CLI, Qwen — mcp/proxy.ts); unset when the
    *  daemon serves no relay. */
@@ -218,6 +272,27 @@ export class McpHub {
     return this.#clients.has(tenantKey(name, tenant));
   }
 
+  /**
+   * What Settings shows for a registry server, as `viewer` sees it: its own
+   * client — or, for one of Claude's global servers, which sessions reach
+   * through their own snapshot of it (#395), what the viewer's sessions'
+   * clients of that name have seen.
+   */
+  observed(spec: McpServerSpec, viewer: McpTenant): { status: { tools: string[]; error?: string } | undefined; connected: boolean } {
+    const tenant = isOAuthServer(spec) ? viewer : undefined;
+    const own = { status: this.statusFor(spec.name, tenant), connected: this.hasClient(spec.name, tenant) };
+    if (own.status || own.connected || spec.origin !== "claude-global") return own;
+    // A session's snapshot of this global server — not a workdir server of the same name.
+    const prefix = `${spec.name}\u0001`;
+    const suffix = tenantKey("\u0001claude-global", viewer);
+    const mine = (key: string) => key.startsWith(prefix) && key.endsWith(suffix);
+    const statuses = [...this.#status].filter(([k]) => mine(k)).map(([, v]) => v);
+    return {
+      status: statuses.find((st) => !st.error) ?? statuses[0],
+      connected: [...this.#clients.keys()].some(mine),
+    };
+  }
+
   /** Tear down every client (daemon stop / registry reload). */
   closeAll(): void {
     for (const [, c] of this.#clients) c.close();
@@ -227,7 +302,7 @@ export class McpHub {
   /** Drop one server's clients — every tenant's (registry edit / removal). */
   drop(name: string): void {
     for (const key of [...this.#clients.keys()]) {
-      if (key === name || key.startsWith(`${name}\u0000`)) this.#drop(key);
+      if (key === name || key.startsWith(`${name}\u0000`) || key.startsWith(`${name}\u0001`)) this.#drop(key);
     }
   }
 
@@ -334,7 +409,7 @@ class StdioMcpClient implements McpClient {
       command: this.#transport.command,
       args: this.#transport.args,
       name: this.#name,
-      cwd: this.#env.HOME ?? process.cwd(),
+      cwd: this.#transport.cwd ?? this.#env.HOME ?? process.cwd(),
       env,
       onNotification: () => {}, // MCP servers may notify (progress/log) — ignored for now
       onServerRequest: async () => {
@@ -478,7 +553,20 @@ export function upstreamBearer(credentials: McpCredentialSource, spec: McpServer
 
 /** A server's client-pool key: per tenant for an OAuth server. */
 function clientKey(spec: McpServerSpec, tenant: McpTenant | undefined): string {
+  // A workdir's server (#395) is keyed by its config, its workdir and the
+  // tenant: two workdirs' "db" — or two tenants' — are different servers, and
+  // a session never reaches another's process.
+  if (spec.variant) {
+    const cwd = spec.transport.kind === "stdio" ? (spec.transport.cwd ?? "") : "";
+    return tenantKey(`${spec.name}\u0001${spec.variant}\u0001${cwd}\u0001${spec.origin ?? ""}`, tenant);
+  }
   return tenantKey(spec.name, isOAuthServer(spec) ? tenant : undefined);
+}
+
+const SIGN_IN_HOLD_MS = 10 * 60_000;
+
+function signInKey(url: string, tenant: McpTenant): string {
+  return `${tenant.accountId}\u0000${tenant.projectId}\u0000${url}`;
 }
 
 function tenantKey(name: string, tenant: McpTenant | undefined): string {

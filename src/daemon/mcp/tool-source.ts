@@ -14,10 +14,10 @@
  */
 
 import type { McpCallResult, McpCallScope, McpHub, McpToolDef } from "./hub.js";
-import type { McpRegistry } from "./registry.js";
+import type { McpServerView } from "./registry.js";
 
 /** The one thing a session's tool view needs from the registry. */
-export type McpServerSource = Pick<McpRegistry, "forBackend">;
+export type McpServerSource = Pick<McpServerView, "forBackend">;
 import { canonicalToolName, type McpServerSpec, type McpTrust } from "./types.js";
 
 /** One tool a backend should expose, already keyed by its canonical name. */

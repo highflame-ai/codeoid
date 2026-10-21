@@ -235,6 +235,7 @@ describe("dispatchSlash", () => {
     expect(parseSlash("/mcp reconnect slack")).toEqual({ kind: "mcp-reconnect", server: "slack" });
     expect(parseSlash("/mcp reconnect")).toEqual({ kind: "capabilities", tab: "mcp" });
     expect(parseSlash("/mcp reconnect claude.ai Gmail")).toEqual({ kind: "mcp-reconnect", server: "claude.ai Gmail" });
+    expect(parseSlash("/mcp refresh")).toEqual({ kind: "mcp-refresh" }); // #395
     expect(parseSlash("/hooks")).toEqual({ kind: "capabilities", tab: "hooks" });
     expect(parseSlash("/hook")).toEqual({ kind: "capabilities", tab: "hooks" });
   });

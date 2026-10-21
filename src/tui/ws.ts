@@ -208,6 +208,11 @@ export class TuiWsClient {
     });
   }
 
+  /** Apply Claude's current MCP config to a session (#395). */
+  mcpRefresh(sessionId: string): Promise<DaemonMessage> {
+    return this.#request({ type: "session.mcp_refresh", id: randomUUID(), sessionId });
+  }
+
   /** Redial one of the session backend's MCP servers that's down (#389). */
   mcpReconnect(sessionId: string, server: string): Promise<DaemonMessage> {
     return this.#request({ type: "session.mcp_reconnect", id: randomUUID(), sessionId, server });

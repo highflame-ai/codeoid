@@ -38,7 +38,7 @@ import { join } from "node:path";
 import { AsyncQueue } from "../../async-queue.js";
 import type { Store } from "../../store.js";
 import { buildMemoryMcpServer, MEMORY_TOOL_NAMES, type MemoryEngine } from "../../memory/index.js";
-import type { McpRegistry } from "../../mcp/registry.js";
+import type { McpServerView } from "../../mcp/registry.js";
 import { McpProxyLease, type McpProxyMount } from "../../mcp/proxy.js";
 import { resolveEnvMap } from "../../mcp/types.js";
 import { FLEET_TOOL_NAMES } from "../../fleet.js";
@@ -86,7 +86,7 @@ export interface QwenProviderInit {
    *  registry's OAuth servers without holding their tokens. */
   mcpProxy?: McpProxyMount;
   /** Cross-backend MCP registry — mounted natively (qwen owns its MCP client). */
-  mcpRegistry?: McpRegistry;
+  mcpRegistry?: McpServerView;
   config?: CodeoidConfig;
   onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
 }
@@ -1034,7 +1034,7 @@ export function proxiedServersForQwen(lease: McpProxyLease): Record<string, unkn
  * in config; tool calls still gate through canUseTool.
  */
 export function registryServersForQwen(
-  registry: McpRegistry | undefined,
+  registry: McpServerView | undefined,
 ): Record<string, unknown> {
   if (!registry) return {};
   const out: Record<string, unknown> = {};

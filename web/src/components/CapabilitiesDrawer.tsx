@@ -20,7 +20,7 @@ import {
   untrack,
 } from "solid-js";
 
-import { claudeConfig, fetchClaudeConfig, reconnectMcpServer } from "../state/claude-config";
+import { approveMcpServer, claudeConfig, fetchClaudeConfig, previewMcpApproval, reconnectMcpServer, refreshMcpServers } from "../state/claude-config";
 import { adoptAndSignIn, mcpOAuthState } from "../state/mcp-oauth";
 import { fetchSettings, settingsState } from "../state/settings";
 import { McpOAuthControls } from "./McpOAuthControls";
@@ -32,6 +32,7 @@ import type {
   ClaudeConfigMcpServer,
   ClaudeConfigScope,
   ClaudeConfigSkill,
+  McpApprovePreview,
 } from "../protocol/types";
 
 type Tab = "agents" | "skills" | "mcp" | "hooks";
@@ -131,7 +132,14 @@ const CapabilitiesDrawer: Component = () => {
                 <SkillsList items={claudeConfig().skills} />
               </Match>
               <Match when={activeTab() === "mcp"}>
-                <McpList items={claudeConfig().mcpServers} sessionId={claudeConfig().mcpReconnect ? claudeConfig().sessionId : null} />
+                <Show when={claudeConfig().mcpStale && claudeConfig().sessionId}>
+                  <McpStaleBanner sessionId={claudeConfig().sessionId!} />
+                </Show>
+                <McpList
+                  items={claudeConfig().mcpServers}
+                  sessionId={claudeConfig().mcpReconnect ? claudeConfig().sessionId : null}
+                  approveIn={claudeConfig().sessionId}
+                />
               </Match>
               <Match when={activeTab() === "hooks"}>
                 <HooksList items={claudeConfig().hooks} />
@@ -403,7 +411,128 @@ const AdoptedSignIn: Component<{ server: string }> = (props) => {
 /** Only a server the backend reports as down can be redialed. */
 const canReconnect = (status: string | undefined) => status === "failed" || status === "needs-auth";
 
-const McpList: Component<{ items: ClaudeConfigMcpServer[]; sessionId: string | null }> = (props) => {
+/**
+ * Claude's MCP config changed since the session applied it (#395): applying
+ * it rebuilds the backend (the conversation resumes), so it's the user's call.
+ */
+const McpStaleBanner: Component<{ sessionId: string }> = (props) => {
+  const [busy, setBusy] = createSignal(false);
+  const [error, setError] = createSignal<string | null>(null);
+  return (
+    <div class="mb-3 flex items-center gap-2 rounded border border-accent/40 bg-accent/5 px-3 py-2 text-[12px] text-fg">
+      <span class="flex-1">MCP servers changed in Claude's config. Refresh to use them in this session (its backend restarts and picks the conversation back up).</span>
+      <Show when={error()}>
+        <span class="text-[11px] text-danger">{error()}</span>
+      </Show>
+      <button
+        type="button"
+        disabled={busy()}
+        onClick={() => {
+          setBusy(true);
+          setError(null);
+          refreshMcpServers(props.sessionId)
+            .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
+            .finally(() => setBusy(false));
+        }}
+        class="rounded border border-accent/60 px-2 py-0.5 text-[11px] text-fg hover:bg-accent/10 disabled:opacity-50"
+      >
+        {busy() ? "Refreshing…" : "Refresh MCP servers"}
+      </button>
+    </div>
+  );
+};
+
+/** Whether a server from Claude's config reaches the session's other backends (#395), and why not. */
+const McpReach: Component<{ server: ClaudeConfigMcpServer; sessionId: string | null }> = (props) => {
+  const [busy, setBusy] = createSignal(false);
+  const [error, setError] = createSignal<string | null>(null);
+  const [preview, setPreview] = createSignal<McpApprovePreview | null>(null);
+  const reach = () => props.server.otherBackends;
+  const why = () => {
+    const r = reach();
+    if (!r || r.reach === "all") return "";
+    switch (r.why) {
+      case "needs-approval":
+        return "Claude only — this project chose it; approve it to use it on every backend.";
+      case "needs-refresh":
+        return "Approved — refresh MCP servers to use it on every backend.";
+      case "shadowed":
+        return "Claude only — another server of this name is used on the other backends.";
+      case "needs-sign-in":
+        return "Claude only — it wants a sign-in; adopt it (Sign in with codeoid) to use it on every backend.";
+      case "reserved-name":
+        return "Claude only — its name is one of codeoid's own.";
+      case "read-by-backend":
+        return "This session's backend reads the project's .mcp.json itself — its own trust settings decide (e.g. Qwen's folder trust).";
+    }
+  };
+  return (
+    <Show when={reach()}>
+      <div class="mt-1 flex items-center gap-2 text-[11px] text-fg-muted">
+        <Show when={reach()?.reach === "all"} fallback={<span>{why()}</span>}>
+          <span>On every backend in this session.</span>
+        </Show>
+        <Show when={reach()?.reach === "claude-only" && (reach() as { why: string }).why === "needs-approval" && props.sessionId && !preview()}>
+          <button
+            type="button"
+            disabled={busy()}
+            onClick={() => {
+              setBusy(true);
+              setError(null);
+              previewMcpApproval(props.sessionId!, props.server.name, props.server.path)
+                .then(setPreview)
+                .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
+                .finally(() => setBusy(false));
+            }}
+            class="rounded border border-border px-1.5 py-0.5 text-[10px] text-fg hover:border-accent/40 disabled:opacity-50"
+            title="See exactly what this project's entry runs, then approve it for every backend in this workdir"
+          >
+            {busy() ? "Loading…" : "Review & approve"}
+          </button>
+        </Show>
+        <Show when={error()}>
+          <span class="text-danger">{error()}</span>
+        </Show>
+      </div>
+      <Show when={preview()}>
+        {(p) => (
+          <div class="mt-1 rounded border border-accent/40 bg-bg-active/40 p-2 text-[11px] text-fg">
+            <div class="mb-1 whitespace-pre-wrap break-all text-fg-muted">
+              This project's entry, from {p().shownPath} — once approved, every backend in this workdir runs it, with the daemon user's files and network:
+            </div>
+            {/* A line each, isolated left-to-right: right-to-left letters can't reorder one into another. */}
+            <pre class="whitespace-pre-wrap break-all font-mono">
+              <For each={p().lines}>{(line) => <div dir="ltr" style={{ "unicode-bidi": "isolate" }}>{line}</div>}</For>
+            </pre>
+            <div class="mt-1 flex items-center gap-2">
+              <button
+                type="button"
+                disabled={busy()}
+                onClick={() => {
+                  setBusy(true);
+                  setError(null);
+                  approveMcpServer(props.sessionId!, p().server, p().path, p().fingerprint)
+                    .then(() => setPreview(null))
+                    .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
+                    .finally(() => setBusy(false));
+                }}
+                class="rounded border border-accent/60 px-2 py-0.5 text-[10px] text-fg hover:bg-accent/10 disabled:opacity-50"
+              >
+                {busy() ? "Approving…" : "Approve this entry"}
+              </button>
+              <button type="button" onClick={() => setPreview(null)} class="text-[10px] text-fg-muted hover:text-fg">
+                Cancel
+              </button>
+              <span class="text-fg-faint">Shown exactly as it runs; characters that wouldn't show are escaped as \u{"{…}"}, and a run of spaces counted. An env value that is exactly ${"{VAR}"} resolves from the daemon's environment; header values are sent as written.</span>
+            </div>
+          </div>
+        )}
+      </Show>
+    </Show>
+  );
+};
+
+const McpList: Component<{ items: ClaudeConfigMcpServer[]; sessionId: string | null; approveIn: string | null }> = (props) => {
   // A reconnect's note is about that outage: a fresh look at the list (the
   // drawer opening, or the MCP tab being shown) starts without old ones, and a server no longer down drops its own.
   onMount(() => setMcpNotes({}));
@@ -468,6 +597,7 @@ const McpList: Component<{ items: ClaudeConfigMcpServer[]; sessionId: string | n
             <Show when={m.adopted}>
               <AdoptedSignIn server={m.name} />
             </Show>
+            <McpReach server={m} sessionId={props.approveIn} />
             <Show when={m.adoptByFullUrl}>
               <div class="mt-1 text-[11px] text-fg-muted">
                 To sign in with codeoid, adopt it by its full URL, copied from this project's file (parts of it are hidden here):{" "}

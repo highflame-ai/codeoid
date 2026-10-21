@@ -407,6 +407,12 @@ Every run is a normal session you can open, approve, continue or fork from any f
 Each routine can carry its own revocable API token for monitors and deploy scripts, and the `routine_end` hook carries each outcome to Slack or a pager.
 Full guide: [routines.md](routines.md).
 
+### MCP servers on every backend
+
+An MCP server you add through Claude Code reaches every backend in the session, not just Claude: your global servers in every session, your local-scope ones (`claude mcp add`) in sessions in that directory, and a project's own (`.mcp.json`, project settings) once approved — in Claude Code, or with the drawer's **Approve** (`codeoid mcp approve`), which binds to that exact entry.
+The capabilities drawer says, for each, whether it reaches the other backends and why not; changes apply when you choose **Refresh MCP servers** (`/mcp refresh`, `codeoid mcp refresh`), which restarts the backend and resumes the conversation.
+Full rules: [mcp-backends.md](mcp-backends.md).
+
 ### When an MCP server is down
 
 A backend connects its MCP servers when its session starts.
