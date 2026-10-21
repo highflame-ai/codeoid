@@ -28,11 +28,22 @@
  * escapes this module.
  */
 
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import type { LoginBackend, PendingBackendLogin } from "../../protocol/types.js";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import {
+  closeSync,
+  constants as fsConstants,
+  createWriteStream,
+  existsSync,
+  mkdtempSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stripClaudeCredentials } from "../claude-accounts.js";
@@ -224,6 +235,8 @@ interface Attempt {
   backend: LoginBackend;
   flow: LoginFlow;
   child: ChildProcess;
+  /** What the user types reaches the command through here (see spawnUnderPty). */
+  input: PtyInput;
   transcript: string;
   /**
    * Characters discarded off the FRONT by {@link capTail}, so an offset taken
@@ -333,9 +346,10 @@ export class BackendLoginBroker {
 
     const isolatedDir = opts.isolated ? mkdtempSync(join(tmpdir(), ISOLATED_DIR_PREFIX)) : undefined;
     let child: ChildProcess;
+    let input: PtyInput;
     try {
       if (isolatedDir) flow.prepareHome?.(isolatedDir);
-      child = spawnUnderPty(resolved.file, resolved.args, flow, isolatedDir);
+      ({ child, input } = spawnUnderPty(resolved.file, resolved.args, flow, isolatedDir));
     } catch (err) {
       if (isolatedDir) rmSync(isolatedDir, { recursive: true, force: true });
       throw err;
@@ -346,6 +360,7 @@ export class BackendLoginBroker {
       backend,
       flow,
       child,
+      input,
       transcript: "",
       dropped: 0,
       verificationUrl: null,
@@ -520,7 +535,7 @@ export class BackendLoginBroker {
     // transcript (from the URL step) cannot be read as a rejection of THIS
     // code. Stream-absolute, so a mid-exchange trim cannot move it.
     const mark = attempt.dropped + attempt.transcript.length;
-    attempt.child.stdin?.write(`${trimmed}\r`);
+    attempt.input.write(`${trimmed}\r`);
 
     const sinceMark = () => attempt.transcript.slice(Math.max(0, mark - attempt.dropped));
 
@@ -615,6 +630,7 @@ export class BackendLoginBroker {
       this.#byBackend.delete(attempt.backend);
     }
     killTree(attempt.child);
+    attempt.input.close();
     // Anything still awaiting this attempt must not hang on a dead process.
     attempt.exited = true;
     drain(attempt);
@@ -673,8 +689,15 @@ function sweepStaleIsolatedDirs(): void {
  * `detached` puts the child in its own process group: killing `script` alone
  * would orphan the command it wrapped, which for a login command means an
  * abandoned OAuth attempt still holding a pty.
+ *
+ * `script`'s stdin is a named pipe, not the child's stdin. Bun (and Node)
+ * hand a child a socketpair for "pipe" stdio, and `script` asks its stdin
+ * for terminal attributes: on a pipe that fails with ENOTTY, which it
+ * expects, but on a socket with EOPNOTSUPP, which BSD script (macOS) and
+ * older util-linux treat as fatal — "tcgetattr/ioctl: Operation not supported
+ * on socket", and no sign-in link. A FIFO is a pipe on every platform.
  */
-function spawnUnderPty(file: string, args: string[], flow: LoginFlow, isolatedHome?: string): ChildProcess {
+function spawnUnderPty(file: string, args: string[], flow: LoginFlow, isolatedHome?: string): { child: ChildProcess; input: PtyInput } {
   let inherited = buildSubprocessEnv({ prefixes: flow.envPrefixes });
   if (isolatedHome) {
     // A named-account login: nothing of the daemon's own credential may reach
@@ -699,9 +722,70 @@ function spawnUnderPty(file: string, args: string[], flow: LoginFlow, isolatedHo
     process.platform === "darwin"
       ? ["-q", "/dev/null", file, ...args]
       : ["-q", "-e", "-c", shellQuote([file, ...args]), "/dev/null"];
-  // Run in the staging home: an interactive CLI (the Gemini CLI) must not
-  // load a project's files from the daemon's cwd while signing in.
-  return spawn("script", argv, { env, detached: true, stdio: ["pipe", "pipe", "pipe"], ...(isolatedHome ? { cwd: isolatedHome } : {}) });
+  const pipeDir = mkdtempSync(join(tmpdir(), INPUT_DIR_PREFIX));
+  const fifo = join(pipeDir, "in");
+  const made = spawnSync("mkfifo", ["-m", "600", fifo]);
+  if (made.status !== 0) {
+    rmSync(pipeDir, { recursive: true, force: true });
+    throw new BackendLoginError("couldn't create the sign-in command's input pipe (mkfifo failed)");
+  }
+  // `sh` opens the FIFO as script's stdin, then becomes script (exec): the
+  // exit status, signals and process group are script's, as before.
+  // Run in the staging home: an interactive CLI must not load a project's
+  // files from the daemon's cwd while signing in.
+  const child = spawn("/bin/sh", ["-c", 'f=$1; shift; exec script "$@" < "$f"', "sh", fifo, ...argv], {
+    env,
+    detached: true,
+    stdio: ["ignore", "pipe", "pipe"],
+    ...(isolatedHome ? { cwd: isolatedHome } : {}),
+  });
+  return { child, input: openPtyInput(fifo, pipeDir, child) };
+}
+
+/** The write side of a login command's input pipe. */
+interface PtyInput {
+  write(text: string): void;
+  close(): void;
+}
+
+/** Prefix of the private dirs holding a login command's input pipe. */
+const INPUT_DIR_PREFIX = "codeoid-login-input-";
+
+/**
+ * Open the FIFO for writing. The open completes once `sh` opens it for
+ * reading (immediately, as it starts); text written before then is queued.
+ * If the command dies before ever opening it, the pending open is released by
+ * opening the read side ourselves — it would otherwise hold a worker thread.
+ */
+function openPtyInput(fifo: string, dir: string, child: ChildProcess): PtyInput {
+  const stream = createWriteStream(fifo);
+  stream.on("error", () => {
+    // The reader is gone (the command exited); nothing more to deliver.
+  });
+  let closed = false;
+  const release = () => {
+    try {
+      closeSync(openSync(fifo, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK));
+    } catch {
+      // Already opened by the command, or gone.
+    }
+  };
+  child.once("exit", () => {
+    release();
+    stream.destroy();
+  });
+  return {
+    write(text) {
+      if (!closed) stream.write(text);
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      release();
+      stream.destroy();
+      rmSync(dir, { recursive: true, force: true });
+    },
+  };
 }
 
 /** POSIX single-quoting — the command path is ours, but it may contain spaces. */
