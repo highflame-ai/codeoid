@@ -739,20 +739,24 @@ endpoint
   .description("Check an endpoint answers and list its models — a stored one, or a draft with --base-url")
   .option("--base-url <url>", "test this URL (with a stored endpoint's key and headers when <name> is given and the URL is on the same server)")
   .option("--key", "test with an API key (asked for without echo)")
-  .action(async (name: string | undefined, o: { baseUrl?: string; key?: boolean }) => {
+  .option("--no-stored-key", "test without the stored API key")
+  .option("--no-stored-headers", "test without the stored headers")
+  .action(async (name: string | undefined, o: { baseUrl?: string; key?: boolean; storedKey?: boolean; storedHeaders?: boolean }) => {
     if (!name && !o.baseUrl) {
       console.error("Give an endpoint name, or --base-url.");
       process.exitCode = 1;
       return;
     }
-    const apiKey = o.key ? (await readSecret("API key: ")).trim() : undefined;
+    const apiKey = o.key ? (await readSecret("API key: ")).trim() : o.storedKey === false ? null : undefined;
     printTestResult(
       await endpointRequest((id) => ({
         type: "endpoints.test",
         id,
         ...(name ? { name } : {}),
         ...(o.baseUrl ? { baseUrl: o.baseUrl } : {}),
-        ...(apiKey ? { apiKey } : {}),
+        ...(apiKey !== undefined && apiKey !== "" ? { apiKey } : {}),
+        // Explicit, so a draft on another server can be tested (stored ones stay home).
+        ...(o.storedHeaders === false ? { headers: {} } : {}),
       })),
     );
   });

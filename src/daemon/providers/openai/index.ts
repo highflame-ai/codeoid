@@ -134,6 +134,19 @@ const OPENAI_FALLBACK_MODELS: ModelInfo[] = [
   { id: "o3-mini", displayName: "o3-mini" },
 ];
 
+/** Requests to an endpoint refuse redirects (they'd carry its headers along); say so plainly. */
+export const REDIRECT_HINT =
+  "redirected elsewhere — set the base URL to the final address (redirects aren't followed, so credentials stay with this server)";
+
+/** Is `err` — or what it wraps (the SDK's "Connection error.") — a refused redirect? */
+export function isRedirectRefusal(err: unknown): boolean {
+  let e = err as { code?: unknown; cause?: unknown } | undefined;
+  for (let depth = 0; e && depth < 4; depth++, e = e.cause as typeof e) {
+    if (e.code === "UnexpectedRedirect") return true;
+  }
+  return false;
+}
+
 export class OpenAIProvider implements AgentProvider {
   /** tool-loop runs `verdict.updatedInput ?? args` (see AgentProvider.appliesToolInputRewrite). */
   readonly appliesToolInputRewrite = true;
@@ -204,12 +217,18 @@ export class OpenAIProvider implements AgentProvider {
     }
     const conn = this.#connection();
     if (!this.#client || this.#clientFingerprint !== conn.fingerprint) {
+      // A keyless endpoint sends no Authorization at all (as /models does): the
+      // SDK needs a non-empty key, so its header is dropped (null removes it),
+      // unless the user set their own — a gateway may reject a bogus Bearer.
+      const ownAuth = Object.keys(conn.headers ?? {}).some((h) => h.toLowerCase() === "authorization");
+      const headers = { ...(conn.apiKey === undefined && !ownAuth ? { Authorization: null } : {}), ...conn.headers };
       this.#client = new OpenAI({
-        // A keyless local server still needs a non-empty key for the SDK;
-        // the header is ignored there.
         apiKey: conn.apiKey ?? "not-needed",
         baseURL: conn.baseURL,
-        ...(conn.headers && Object.keys(conn.headers).length > 0 ? { defaultHeaders: conn.headers } : {}),
+        // Never the daemon's OPENAI_ORG_ID / OPENAI_PROJECT_ID: this is someone else's server.
+        organization: null,
+        project: null,
+        ...(Object.keys(headers).length > 0 ? { defaultHeaders: headers } : {}),
         // A redirect would carry custom auth headers (x-api-key, api-key) to
         // wherever it points — fetch strips only Authorization cross-origin.
         fetchOptions: { redirect: "error" },
@@ -439,7 +458,7 @@ export class OpenAIProvider implements AgentProvider {
       if (!ac.signal.aborted) {
         queue.push({
           type: "error",
-          message: `${this.displayName}: ${err instanceof Error ? err.message : String(err)}`,
+          message: `${this.displayName}: ${isRedirectRefusal(err) ? `the server ${REDIRECT_HINT}` : err instanceof Error ? err.message : String(err)}`,
         });
       }
     } finally {

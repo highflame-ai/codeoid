@@ -22,7 +22,7 @@ import {
 import { endpointNameOf, endpointProviderId } from "../../../protocol/types.js";
 import type { ModelInfo } from "../interface.js";
 import { llamaCppTools, propsUrl } from "../llamacpp/index.js";
-import { OpenAIProvider } from "../openai/index.js";
+import { isRedirectRefusal, OpenAIProvider, REDIRECT_HINT } from "../openai/index.js";
 import type { ProviderFactory, ProviderRegistry, ProviderSessionInit } from "../registry.js";
 import { StatelessSessionProvider } from "../stateless.js";
 
@@ -57,7 +57,12 @@ export async function fetchEndpointModels(
       redirect: "error",
     });
   } catch (err) {
-    const reason = err instanceof Error && err.name === "TimeoutError" ? "timed out" : "could not connect";
+    const reason =
+      err instanceof Error && err.name === "TimeoutError"
+        ? "timed out"
+        : isRedirectRefusal(err)
+          ? REDIRECT_HINT
+          : "could not connect";
     throw new EndpointError(`${conn.baseURL}/models ${reason}`);
   }
   if (res.status === 401 || res.status === 403) throw new EndpointError(`the endpoint rejected the credentials (HTTP ${res.status})`);

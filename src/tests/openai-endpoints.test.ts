@@ -6,7 +6,7 @@
  */
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { draftConnection, EndpointError, EndpointStore, isPrivateHost } from "../daemon/openai-endpoints.js";
@@ -214,6 +214,45 @@ describe("EndpointStore", () => {
     }
     // Link-local is out: it's where cloud metadata services answer.
     for (const h of ["8.8.8.8", "172.32.0.1", "api.openai.com", "2001:4860::1", "169.254.169.254", "fe80::1"]) expect(isPrivateHost(h)).toBe(false);
+  });
+
+  test("cloud metadata services are refused by name, whatever the scheme", () => {
+    const store = storeAt();
+    for (const url of ["http://metadata.google.internal/v1", "https://metadata.google.internal./v1", "http://metadata/v1", "http://100.100.100.200/v1", "http://[fd00:ec2::254]/v1", "http://169.254.169.254/v1"]) {
+      expect(() => store.upsert({ name: "m", baseUrl: url })).toThrow(EndpointError);
+    }
+    expect(() => draftConnection({ baseUrl: "http://metadata.google.internal/v1", headers: { "Metadata-Flavor": "Google" } }, undefined)).toThrow(/metadata/);
+  });
+
+  test("a hand-edited name must be a string — `5` doesn't pass as \"5\"", () => {
+    writeFileSync(join(dir, "endpoints.json"), JSON.stringify({ version: 1, endpoints: [{ name: 5, baseUrl: "http://127.0.0.1:1/v1" }] }));
+    const store = storeAt();
+    expect(store.list()).toEqual([]);
+    store.upsert({ name: "5", baseUrl: "http://127.0.0.1:2/v1" });
+    expect(storeAt().list().map((e) => e.name)).toEqual(["5"]);
+  });
+
+  test("a hand edit while the daemon runs is picked up, not overwritten by the next save", () => {
+    const path = join(dir, "endpoints.json");
+    const store = storeAt();
+    let changes = 0;
+    store.onChange(() => changes++);
+    store.upsert({ name: "a", baseUrl: "http://127.0.0.1:1/v1" });
+    const onDisk = JSON.parse(readFileSync(path, "utf8")) as { endpoints: Array<Record<string, unknown>> };
+    onDisk.endpoints.push({ name: "hand", baseUrl: "http://127.0.0.1:3/v1" });
+    writeFileSync(path, JSON.stringify(onDisk));
+    // Make sure the edit's mtime differs from the save's, whatever the clock resolution.
+    const later = new Date(Date.now() + 5_000);
+    utimesSync(path, later, later);
+    expect(store.list().map((e) => e.name)).toEqual(["a", "hand"]);
+    expect(changes).toBe(2); // the save, then the reload
+    store.upsert({ name: "b", baseUrl: "http://127.0.0.1:2/v1" });
+    expect(storeAt().list().map((e) => e.name)).toEqual(["a", "b", "hand"]);
+    // A broken edit fails closed — and a save can't write over it.
+    writeFileSync(path, "{broken");
+    utimesSync(path, new Date(Date.now() + 10_000), new Date(Date.now() + 10_000));
+    expect(() => store.upsert({ name: "c", baseUrl: "http://127.0.0.1:4/v1" })).toThrow(/not valid JSON/);
+    expect(readFileSync(path, "utf8")).toBe("{broken");
   });
 
   test("re-labelling the default endpoint keeps the backends in sync", () => {
@@ -461,9 +500,47 @@ describe("daemon", () => {
     const created = (await handle({ type: "session.create", id: "c", name: "sr", workdir: dir, providerId: "oai:box" })) as { data?: SessionInfo };
     await handle({ type: "session.attach", id: "a", sessionId: created.data!.id });
     await handle({ type: "session.send", id: "m1", sessionId: created.data!.id, text: "hi" });
-    await waitFor(() => errors().length > 0 || pushed.some((m) => m.type === "session.status_change" && (m as { status?: string }).status === "error"));
+    await waitFor(() => errors().some((e) => e.includes("redirected elsewhere")));
     expect(seen.filter((r) => r.path === "/v1/chat/completions")).toHaveLength(0);
     expect(assistantTexts()).toEqual([]);
+    // /models says the same.
+    const tested = await handle({ type: "endpoints.test", id: "t", name: "box" });
+    expect(tested).toMatchObject({ ok: false, error: expect.stringContaining("redirected elsewhere") });
+  });
+
+  test("a keyless endpoint gets no Authorization, and never the daemon's OpenAI org or project", async () => {
+    const got: Array<Record<string, string>> = [];
+    const open = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch(req) {
+        got.push(Object.fromEntries(req.headers));
+        const chunk = (o: unknown) => `data: ${JSON.stringify(o)}\n\n`;
+        return new Response(
+          `${chunk({ id: "c", object: "chat.completion.chunk", model: "m", choices: [{ index: 0, delta: { role: "assistant", content: "hi" }, finish_reason: "stop" }] })}data: [DONE]\n\n`,
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      },
+    });
+    const saved = { org: process.env.OPENAI_ORG_ID, project: process.env.OPENAI_PROJECT_ID };
+    process.env.OPENAI_ORG_ID = "org-daemon-owner";
+    process.env.OPENAI_PROJECT_ID = "proj-daemon-owner";
+    try {
+      await handle({ type: "endpoints.set", id: "s", name: "open", baseUrl: `http://127.0.0.1:${open.port}/v1`, models: [{ id: "m" }] });
+      const created = (await handle({ type: "session.create", id: "c", name: "sk", workdir: dir, providerId: "oai:open" })) as { data?: SessionInfo };
+      await handle({ type: "session.attach", id: "a", sessionId: created.data!.id });
+      await handle({ type: "session.send", id: "m1", sessionId: created.data!.id, text: "hi" });
+      await waitFor(() => assistantTexts().length === 1);
+      expect(got[0]!.authorization).toBeUndefined();
+      expect(got[0]!["openai-organization"]).toBeUndefined();
+      expect(got[0]!["openai-project"]).toBeUndefined();
+    } finally {
+      if (saved.org === undefined) delete process.env.OPENAI_ORG_ID;
+      else process.env.OPENAI_ORG_ID = saved.org;
+      if (saved.project === undefined) delete process.env.OPENAI_PROJECT_ID;
+      else process.env.OPENAI_PROJECT_ID = saved.project;
+      open.stop(true);
+    }
   });
 
   test("the endpoint session.defaultProvider names can't be removed — the next start would fail", async () => {

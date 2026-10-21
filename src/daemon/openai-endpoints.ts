@@ -14,7 +14,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { isIP } from "node:net";
 import { join } from "node:path";
 import { atomicWrite, getConfigDir } from "../config.js";
@@ -94,7 +94,8 @@ const MAX_CONTEXT = 100_000_000;
 const MAX_MODELS = 500;
 
 export function validateEndpointName(name: string): void {
-  if (!NAME_RE.test(name)) {
+  // typeof first: RegExp.test coerces, so a hand-edited `name: 5` would pass as "5".
+  if (typeof name !== "string" || !NAME_RE.test(name)) {
     throw new EndpointError(
       `invalid endpoint name ${JSON.stringify(name)} — use 1–40 lowercase letters, digits and dashes, starting with a letter or digit`,
     );
@@ -102,12 +103,21 @@ export function validateEndpointName(name: string): void {
 }
 
 /**
+ * Cloud instance-metadata services reachable by name or by an address inside
+ * a range allowed below (GCP, Alibaba's 100.100.100.200 in 100.64/10, AWS's
+ * IPv6 endpoint). Link-local 169.254/16 is excluded by range.
+ */
+const METADATA_HOSTS = new Set(["metadata", "metadata.google.internal", "100.100.100.200", "fd00:ec2::254"]);
+
+const normalizeHost = (host: string): string => host.replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase();
+
+/**
  * Is `host` on the local machine or a private network? Only those may be
  * reached over plain http: the key rides every request, and on a public host
  * http would hand it to anyone on the path.
  */
 export function isPrivateHost(host: string): boolean {
-  const h = host.replace(/^\[|\]$/g, "").toLowerCase();
+  const h = normalizeHost(host);
   if (h === "localhost" || h.endsWith(".localhost")) return true;
   const ipVersion = isIP(h);
   if (ipVersion === 4) {
@@ -137,6 +147,10 @@ function validateBaseUrl(baseUrl: string): string {
   // Shown to anyone who can list endpoints: no credentials in it.
   if (url.username || url.password || url.search || url.hash) {
     throw new EndpointError("the base URL must not carry credentials, a query string or a fragment — put a key in the API key or a header");
+  }
+  // A test request carries the caller's headers (Metadata-Flavor: Google…).
+  if (METADATA_HOSTS.has(normalizeHost(url.hostname))) {
+    throw new EndpointError(`${url.hostname} is a cloud metadata service, not a model server`);
   }
   if (url.protocol === "http:" && !isPrivateHost(url.hostname)) {
     throw new EndpointError(`the base URL must be https for a public host (http is allowed for localhost and private networks): ${url.hostname}`);
@@ -329,17 +343,44 @@ export class EndpointStore {
     return () => this.#listeners.delete(listener);
   }
 
+  /** The file's mtime when last read or written; -1 = absent. */
+  #mtimeMs: number | null = null;
+
+  #fileMtime(): number {
+    try {
+      return statSync(this.#path).mtimeMs;
+    } catch {
+      return -1;
+    }
+  }
+
+  /**
+   * The store as on disk. Re-read when the file changed underneath (a hand
+   * edit while the daemon runs), so the next save never writes a stale copy
+   * over it; listeners are told, as for any other change.
+   */
   #load(): StoreFile {
-    if (this.#data) return this.#data;
-    if (!existsSync(this.#path)) {
-      this.#data = { version: 1, endpoints: [] };
-      return this.#data;
+    const mtime = this.#fileMtime();
+    if (this.#data && mtime === this.#mtimeMs) return this.#data;
+    const reloaded = this.#data !== null;
+    this.#data = this.#read(mtime);
+    this.#mtimeMs = mtime;
+    if (reloaded) this.#notify();
+    return this.#data;
+  }
+
+  #read(mtime: number): StoreFile {
+    if (mtime === -1) {
+      this.#invalid = [];
+      return { version: 1, endpoints: [] };
     }
     let parsed: Partial<StoreFile>;
     try {
       parsed = JSON.parse(readFileSync(this.#path, "utf8")) as Partial<StoreFile>;
     } catch {
       // Not the parser's message: it can quote a slice of the file — a key.
+      // Fails closed — and before any save, so a broken edit is never overwritten.
+      this.#data = null;
       throw new EndpointError(`${this.#path} is not valid JSON — fix or remove it`);
     }
     const endpoints: StoredEndpoint[] = [];
@@ -356,8 +397,7 @@ export class EndpointStore {
       }
     }
     this.#invalid = invalid;
-    this.#data = { version: 1, endpoints };
-    return this.#data;
+    return { version: 1, endpoints };
   }
 
   #save(data: StoreFile, replacing?: string): void {
@@ -365,6 +405,11 @@ export class EndpointStore {
     atomicWrite(this.#path, `${JSON.stringify({ version: 1, endpoints: [...data.endpoints, ...invalid] }, null, 2)}\n`, 0o600);
     this.#data = data;
     this.#invalid = invalid;
+    this.#mtimeMs = this.#fileMtime();
+    this.#notify();
+  }
+
+  #notify(): void {
     for (const l of this.#listeners) {
       try {
         l();
