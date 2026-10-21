@@ -35,8 +35,11 @@ export const DEFAULT_ACCOUNT = "default";
  * - `api-key`: the backend's API key (and, for an endpoint, optional headers).
  * - `chatgpt-login` (codex): a ChatGPT sign-in, kept in the account's own Codex home.
  * - `api-keys` (pi): a set of model-provider key variables pi reads.
+ * - `bedrock` (claude): Amazon Bedrock with a bearer token — AWS directly, or
+ *   a Bedrock-compatible endpoint — plus the model mappings and settings that
+ *   go with it.
  */
-export type AccountKind = "subscription" | "gateway" | "api-key" | "chatgpt-login" | "api-keys";
+export type AccountKind = "subscription" | "gateway" | "api-key" | "chatgpt-login" | "api-keys" | "bedrock";
 
 /** How a kind's credential is obtained when it isn't typed in. */
 export type AccountLoginMode =
@@ -57,8 +60,13 @@ export interface AccountKindInfo {
   baseUrl?: { label: string; required: boolean; presets?: Array<{ value: string; label: string }> };
   /** Extra request headers (values secret). */
   headers?: boolean;
-  /** Named key variables (values secret), from this allowlist. */
-  env?: { names: string[] };
+  /**
+   * Named variables, from this allowlist. `label`: what a form calls them
+   * (default "Keys"). `required`: at least one must be set (default true).
+   * `secret`: the names whose values are secrets (default: all); the rest are
+   * plain settings a form may show as text.
+   */
+  env?: { names: string[]; label?: string; required?: boolean; secret?: string[] };
   /** Obtained by a brokered sign-in (`backend.login.*`) instead of typed in. */
   login?: AccountLoginMode;
 }
@@ -96,6 +104,46 @@ const QWEN_PRESETS = [
   { value: "bailian-plan-intl", label: "Coding Plan key (sk-sp-…)" },
 ];
 
+/**
+ * Settings a Bedrock account may carry beside its token: the region, the
+ * Bedrock model IDs the Claude aliases map to (with their names, descriptions
+ * and capabilities), the region prefix and service tier, the context window,
+ * whether to skip AWS auth on an endpoint that wants it, and where telemetry
+ * goes. Nothing that selects another credential.
+ */
+export const BEDROCK_SETTINGS = [
+  "AWS_REGION",
+  "ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION",
+  "ANTHROPIC_BEDROCK_REGION_PREFIX",
+  "ANTHROPIC_BEDROCK_SERVICE_TIER",
+  "ANTHROPIC_MODEL",
+  "ANTHROPIC_SMALL_FAST_MODEL",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES",
+  "ANTHROPIC_DEFAULT_FABLE_MODEL",
+  "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME",
+  "ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION",
+  "ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES",
+  "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+  "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+  "CLAUDE_CODE_ENABLE_TELEMETRY",
+  "OTEL_METRICS_EXPORTER",
+  "OTEL_LOGS_EXPORTER",
+  "OTEL_EXPORTER_OTLP_PROTOCOL",
+  "OTEL_EXPORTER_OTLP_ENDPOINT",
+  "OTEL_EXPORTER_OTLP_HEADERS",
+] as const;
+
 /** Key variables a pi account may set — the model providers pi reads keys for. */
 export const PI_KEY_VARIABLES = [
   "ANTHROPIC_API_KEY",
@@ -127,6 +175,14 @@ const KINDS: Record<string, AccountKindInfo[]> = {
       headers: true,
     },
     { kind: "api-key", label: "Anthropic API key", token: { label: "API key", required: true } },
+    {
+      kind: "bedrock",
+      label: "Amazon Bedrock",
+      hint: "A Bedrock bearer token, for AWS directly or a Bedrock-compatible endpoint. Map the model aliases to the Bedrock model IDs it serves.",
+      token: { label: "Bedrock bearer token (AWS_BEARER_TOKEN_BEDROCK)", required: true },
+      baseUrl: { label: "Bedrock endpoint (blank = AWS)", required: false },
+      env: { names: [...BEDROCK_SETTINGS], label: "Settings", required: false, secret: ["OTEL_EXPORTER_OTLP_HEADERS"] },
+    },
   ],
   openai: [{ kind: "api-key", label: "OpenAI API key", token: { label: "API key", required: true } }],
   llamacpp: [{ kind: "api-key", label: "llama-server API key", token: { label: "API key", required: true } }],

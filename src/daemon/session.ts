@@ -9,7 +9,7 @@
  *   - Scrollback stores merged SessionMessage (not deltas)
  */
 
-import { ClaudeAccountError, type ClaudeAccountStore, projectCredentialOverride } from "./claude-accounts.js";
+import { ClaudeAccountError, type ClaudeAccountStore, projectCredentialOverride, userCredentialOverride } from "./claude-accounts.js";
 import { AccountError, type AccountStore, type ResolvedAccount } from "./accounts.js";
 import { geminiProjectOverride, qwenProjectOverride } from "./account-apply.js";
 import { backendHasAccounts, CLAUDE_DEFAULT_ACCOUNT, DEFAULT_ACCOUNT } from "../protocol/types.js";
@@ -661,6 +661,9 @@ export class SendStoppedError extends Error {
     this.name = "SendStoppedError";
   }
 }
+
+/** Claude's file tools that write. */
+const CLAUDE_FILE_WRITE_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
 
 export class Session {
   readonly id: string;
@@ -1610,6 +1613,24 @@ export class Session {
   }
 
   /**
+   * Is this a file-tool write to a Claude settings file (`.claude/settings.json`
+   * or `settings.local.json`, anywhere) while the session runs on a named
+   * Claude account? Shell commands can't be judged this way (see
+   * secret-paths.ts).
+   */
+  #writesClaudeSettingsOnNamedAccount(toolName: string, input: unknown): boolean {
+    if (this.#provider.id !== "claude" || !CLAUDE_FILE_WRITE_TOOLS.has(toolName) || !input || typeof input !== "object") return false;
+    const o = input as Record<string, unknown>;
+    const target = typeof o.file_path === "string" ? o.file_path : typeof o.notebook_path === "string" ? o.notebook_path : null;
+    if (!target || !/(^|[\\/])\.claude[\\/]settings(\.local)?\.json$/i.test(target)) return false;
+    try {
+      return this.#claudeAccounts?.resolve(this.#accountChoices.claude ?? null) != null;
+    } catch {
+      return true; // an account that can't be resolved won't run anyway; don't wave this through
+    }
+  }
+
+  /**
    * Refuse to start a Claude turn on an account that no longer exists, or
    * whose credential the workdir's settings would redirect. Throws
    * ClaudeAccountError.
@@ -1620,10 +1641,17 @@ export class Session {
     if (!account) return;
     // A named account's token must not be redirectable by the workdir's own
     // Claude settings (claude-accounts.ts projectCredentialOverride).
-    const override = projectCredentialOverride(this.workdir);
+    const override = projectCredentialOverride(this.workdir, account.kind);
     if (override) {
       throw new ClaudeAccountError(
         `${override.file} sets ${override.key}, which would redirect Claude account "${account.name}"'s credential — remove it, or run this session on the default account`,
+      );
+    }
+    // The user's own settings env applies over every session's environment.
+    const own = userCredentialOverride();
+    if (own) {
+      throw new ClaudeAccountError(
+        `${own.file} sets ${own.key}, which applies to every Claude session and would override account "${account.name}" — move that setup into an account (codeoid account add-bedrock --from-settings, add-gateway, add-token) and remove it from the file, or run this session on the default account`,
       );
     }
   }
@@ -5689,7 +5717,11 @@ export class Session {
         return { behavior: "deny" as const, message: reason };
       }
 
-      const autoApprove = secret?.action !== "ask" && this.#shouldAutoApprove(toolName);
+      // A write to a Claude settings file on a named account: the CLI reloads
+      // it mid-turn and applies its env, after the turn-start check
+      // (assertClaudeAccountUsable) — so it never runs unasked, in any mode.
+      const settingsWrite = this.#writesClaudeSettingsOnNamedAccount(toolName, effectiveInput);
+      const autoApprove = secret?.action !== "ask" && !settingsWrite && this.#shouldAutoApprove(toolName);
 
       if (autoApprove) {
         this.#approvalIdToMessageId.delete(approvalId); // clean up — no manual approval will reference this

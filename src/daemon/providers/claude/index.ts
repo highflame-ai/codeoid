@@ -872,8 +872,8 @@ export class ClaudeProvider implements SessionProvider {
         // anything for them. (The raw chain of thought is never exposed on any
         // model; this is a summary of it.)
         thinking: { type: "adaptive" as const, display: "summarized" as const },
-        ...(opts.model ? { model: opts.model } : {}),
-        ...(opts.fallbackModel ? { fallbackModel: opts.fallbackModel } : {}),
+        // An account may name models its own way (a Bedrock account's mappings).
+        ...modelOptions(opts.model, opts.fallbackModel, account),
         ...(opts.maxBudgetUsd !== undefined ? { maxBudgetUsd: opts.maxBudgetUsd } : {}),
         stderr: (data: string) => {
           process.stderr.write(`[claude-subprocess ${sessionId.slice(0, 8)}] ${data}`);
@@ -1076,8 +1076,10 @@ export class ClaudeProvider implements SessionProvider {
 
     this.#hasQueried = true;
 
-    // Fetch the live model catalog best-effort.
-    if (init.onModels) {
+    // Fetch the live model catalog best-effort. Not from a Bedrock account:
+    // its catalog lists that endpoint's ids, and the cache is every Claude
+    // session's, whatever its account.
+    if (init.onModels && account?.kind !== "bedrock") {
       void this.#query
         .supportedModels()
         .then((m) => init.onModels?.(m))
@@ -2167,6 +2169,22 @@ export function parseMcpServerConfig(value: unknown): McpServerConfig | null {
  *
  * Pure + exported for unit testing.
  */
+/**
+ * The model and fallback to hand the CLI, through the account's own naming.
+ * Two ids can name one model there (a Bedrock account maps a whole family to
+ * one alias), and the SDK refuses a fallback equal to the model — so then the
+ * fallback is dropped: it would be the same model anyway.
+ */
+export function modelOptions(
+  model: string | undefined,
+  fallbackModel: string | undefined,
+  account: { model(m: string): string } | null,
+): { model?: string; fallbackModel?: string } {
+  const m = model ? (account ? account.model(model) : model) : undefined;
+  const f = fallbackModel ? (account ? account.model(fallbackModel) : fallbackModel) : undefined;
+  return { ...(m ? { model: m } : {}), ...(f && f !== m ? { fallbackModel: f } : {}) };
+}
+
 export function buildAgentEnv(
   base: Record<string, string | undefined> = process.env,
   opts: { gatewayCredential?: string } = {},

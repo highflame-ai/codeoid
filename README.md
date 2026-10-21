@@ -500,7 +500,7 @@ codeoid routine ls | show | runs | run [--wait] | edit | pause | resume | rm | c
 codeoid account ls [--backend <id>]                  # Accounts for every backend (see Accounts above)
 codeoid account login <name> [--backend claude|codex] [--replace]
 codeoid account add-key <name> --backend <id> [--base-url <u>] [--header <h>] [--no-key] [--key-var <v>] [--replace]
-codeoid account add-gateway <name> --base-url <u> [--header <h>] | add-token <name> [--api-key]   # Claude
+codeoid account add-gateway <name> --base-url <u> [--header <h>] | add-token <name> [--api-key] | add-bedrock <name> [--base-url <u>] [--set NAME[=value]] [--from-settings <file>] [--replace]   # Claude
 codeoid account default|rm <name> [--backend <id>]
 codeoid account use <session> [name] [--backend <id>] [--follow-default]
 codeoid mcp reconnect <session> <server>             # redial a session's MCP server that's down

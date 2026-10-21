@@ -540,7 +540,7 @@ export const accountsSetSchema = z.object({
   type: z.literal("accounts.set"),
   backend: accountBackendField,
   name: accountNameField,
-  kind: z.enum(["subscription", "gateway", "api-key", "chatgpt-login", "api-keys"]),
+  kind: z.enum(["subscription", "gateway", "api-key", "chatgpt-login", "api-keys", "bedrock"]),
   token: z.string().min(1).max(8192).optional(),
   baseUrl: z.string().min(1).max(2048).optional(),
   headers: z.record(z.string().min(1).max(256), z.string().max(8192)).optional(),

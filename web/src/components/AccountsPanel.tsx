@@ -338,7 +338,7 @@ const AccountForm: Component<{ backend: string; kind: AccountKindInfo; onDone: (
     if (n) return n;
     if (k.token?.required && !token().trim()) return `${k.token.label} is required`;
     if (k.baseUrl?.required && !baseUrl()) return `${k.baseUrl.label} is required`;
-    if (namedKeys().some((v) => !v.value.trim())) return "every key needs a value";
+    if (namedKeys().some((v) => !v.value.trim())) return `every ${k.env?.label ? "setting" : "key"} needs a value`;
     // The daemon refuses a header with no value rather than send it blank.
     if (namedHeaders().some((h) => !h.value.trim())) return "every header needs a value";
     // A value typed into a nameless row would be dropped without a word.
@@ -445,7 +445,18 @@ const AccountForm: Component<{ backend: string; kind: AccountKindInfo; onDone: (
       <Show when={k.headers}>
         <HeadersEditor rows={headers()} onChange={setHeaders} />
       </Show>
-      <Show when={k.env}>{(spec) => <KeysEditor names={spec().names} rows={keys()} onChange={setKeys} />}</Show>
+      <Show when={k.env}>
+        {(spec) => (
+          <KeysEditor
+            names={spec().names}
+            title={spec().label ?? "Keys"}
+            optional={spec().required === false}
+            secret={spec().secret}
+            rows={keys()}
+            onChange={setKeys}
+          />
+        )}
+      </Show>
       <Show when={error()}>
         <div role="alert" class="text-[12px] text-danger">
           {error()}
@@ -467,25 +478,35 @@ const AccountForm: Component<{ backend: string; kind: AccountKindInfo; onDone: (
 };
 
 /**
- * Key variables from the kind's allowlist (pi's provider keys): a name picked
- * from the list — each at most once — and a secret value.
+ * Variables from the kind's allowlist (pi's provider keys, a Bedrock account's
+ * settings): a name picked from the list — each at most once — and a value,
+ * masked unless the kind says that name isn't a secret.
  */
 const KeysEditor: Component<{
   names: string[];
+  title: string;
+  optional: boolean;
+  /** Names whose values are secrets; absent = all of them. */
+  secret: string[] | undefined;
   rows: Array<{ name: string; value: string }>;
   onChange: (rows: Array<{ name: string; value: string }>) => void;
 }> = (props) => {
   const unused = () => props.names.filter((n) => !props.rows.some((r) => r.name === n));
+  const isSecret = (name: string) => !props.secret || props.secret.includes(name);
+  const noun = () => (props.title === "Keys" ? "key" : "setting");
   return (
     <div class="space-y-1">
-      <span class={label}>Keys</span>
+      <span class={label}>
+        {props.title}
+        {props.optional ? " (optional)" : ""}
+      </span>
       {/* <Index>, as in HeadersEditor: a keystroke must not rebuild the row and drop focus. */}
       <Index each={props.rows}>
         {(row, i) => (
           <div class="flex gap-2">
             <select
               class={input}
-              aria-label="Key variable"
+              aria-label={props.title === "Keys" ? "Key variable" : "Setting"}
               value={row().name}
               onChange={(e) => props.onChange(props.rows.map((r, j) => (j === i ? { ...r, name: e.currentTarget.value } : r)))}
             >
@@ -496,14 +517,15 @@ const KeysEditor: Component<{
             </select>
             <input
               class={input}
-              type="password"
+              type={isSecret(row().name) ? "password" : "text"}
               placeholder="value"
               aria-label={`${row().name} value`}
-              autocomplete="new-password"
+              autocomplete={isSecret(row().name) ? "new-password" : "off"}
+              spellcheck={false}
               value={row().value}
               onInput={(e) => props.onChange(props.rows.map((r, j) => (j === i ? { ...r, value: e.currentTarget.value } : r)))}
             />
-            <button type="button" class={button} onClick={() => props.onChange(props.rows.filter((_, j) => j !== i))} aria-label="Remove key">
+            <button type="button" class={button} onClick={() => props.onChange(props.rows.filter((_, j) => j !== i))} aria-label={`Remove ${noun()}`}>
               ✕
             </button>
           </div>
@@ -515,7 +537,7 @@ const KeysEditor: Component<{
         disabled={unused().length === 0}
         onClick={() => props.onChange([...props.rows, { name: unused()[0] ?? "", value: "" }])}
       >
-        + Key
+        + {noun() === "key" ? "Key" : "Setting"}
       </button>
     </div>
   );

@@ -184,13 +184,23 @@ export function validateAccount(backend: string, a: Omit<StoredAccount, "generat
     if (!info.env) throw new AccountError(`a ${backend} ${a.kind} account sets no key variables`);
     const allowed = new Set(info.env.names);
     const names = Object.keys(a.env);
-    if (names.length === 0) throw new AccountError("set at least one key");
+    if (names.length === 0 && info.env.required !== false) throw new AccountError("set at least one key");
     for (const [k, v] of Object.entries(a.env)) {
-      if (!allowed.has(k)) throw new AccountError(`${k} is not a key this backend reads — one of ${info.env.names.join(", ")}`);
+      const noun = info.env.label ? "setting" : "key";
+      if (!allowed.has(k)) throw new AccountError(`${k} is not a ${noun} this account takes — one of ${info.env.names.join(", ")}`);
       if (typeof v !== "string" || !v || CONTROL_CHARS.test(v)) throw new AccountError(`${k} must be a single non-empty line`);
     }
-  } else if (info.env) {
+  } else if (info.env && info.env.required !== false) {
     throw new AccountError("set at least one key");
+  }
+
+  // A Bedrock account's telemetry headers usually carry a key of their own:
+  // they go to the telemetry endpoint, so it gets the base URL's rules.
+  if (backend === "claude" && a.kind === "bedrock" && a.env?.OTEL_EXPORTER_OTLP_HEADERS) {
+    // Without an endpoint of its own they'd go to whichever one won: the
+    // exporter's plain-http default, or one in the user's Claude settings.
+    if (!a.env.OTEL_EXPORTER_OTLP_ENDPOINT) throw new AccountError("telemetry headers need the telemetry endpoint they're for (OTEL_EXPORTER_OTLP_ENDPOINT)");
+    validateSecretUrl(a.env.OTEL_EXPORTER_OTLP_ENDPOINT, "telemetry endpoint");
   }
 
   if (backend.startsWith("oai:")) {

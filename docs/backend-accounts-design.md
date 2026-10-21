@@ -37,6 +37,7 @@ What a backend accepts, and how it is applied.
 | `claude` | `subscription` | token (`sk-ant-oat01-…`) | `CLAUDE_CODE_OAUTH_TOKEN` (unchanged from #392) |
 | | `gateway` | token, base URL, headers | `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_CUSTOM_HEADERS` |
 | | `api-key` | token | `ANTHROPIC_API_KEY` |
+| | `bedrock` | token, optional endpoint, optional settings (region, model mappings, telemetry; `BEDROCK_SETTINGS`) | `CLAUDE_CODE_USE_BEDROCK=1` / `AWS_BEARER_TOKEN_BEDROCK` / `ANTHROPIC_BEDROCK_BASE_URL` and the settings, without the daemon's model settings; a first-party model ID of a mapped family is handed to the CLI as its alias, and a Bedrock session's model list is not cached as Claude's |
 | `openai`, `llamacpp` | `api-key` | token | the HTTP client's key, rebuilt per turn |
 | `oai:<name>` | `api-key` | token and/or headers, and the origin they were entered for | replaces the endpoint's own key and headers; refused if the endpoint has since moved to another origin |
 | `gemini` | `api-key` | token | the client's key, per turn |
@@ -104,7 +105,7 @@ As for Claude accounts and endpoints: listing needs `settings:read`; adding, rem
 ## Project overrides
 
 A cloned repository can try to redirect a named account's credential.
-Claude's `.claude/settings*.json` check is unchanged.
+Claude's `.claude/settings*.json` files are read as the CLI reads them (BOM, UTF-16) and refused when unparseable; a named Claude account refuses to run while the user's own `settings.json` sets a credential (its `env` applies to every session); an agent's write to a Claude settings file on a named account always asks; and the check also refuses, for a `bedrock` account only, every `AWS_*` variable but the region and every `OTEL_*` variable: a repo's own AWS config file (`AWS_CONFIG_FILE`) can carry an `endpoint_url` that receives the bearer token (verified against the bundled CLI), and the `OTEL_*` variables decide where telemetry and its key go.
 The Gemini CLI reads `.env` and `.gemini/.env` from the workdir upward and `.gemini/settings.json`; a named Gemini CLI account refuses to run in a workdir whose project files set a credential, base URL, proxy variable or auth type, naming the file.
 qwen-code loads a workspace `.qwen/settings.json` (folder trust is off by default) whose `modelProviders` entry wins over the base URL and key codeoid gives it, and `.qwen/.env` / `.env` upward; a named Qwen account refuses to run in a workdir that sets `modelProviders`, `providerProtocol`, `security.auth`, `model.baseUrl` or an `OPENAI_*` / `DASHSCOPE_*` / `QWEN_*` / proxy variable there.
 Project files are read the way the CLIs read them — `.env` with dotenv's grammar (`KEY=value` and `KEY: value`), settings.json with comments stripped — and a settings file codeoid can't parse is refused rather than skipped.
