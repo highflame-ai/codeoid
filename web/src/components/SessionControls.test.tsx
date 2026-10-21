@@ -87,6 +87,27 @@ describe("SessionControls mode dropdown dismissal", () => {
     expect(queryByText("interactive")).toBeNull();
   });
 
+  it("an Esc that closes the menu is marked handled, so it doesn't also interrupt the turn", () => {
+    ingestSessionList([sess(undefined, "thinking")]);
+    focusSession("s");
+    const { getByTitle, queryByText } = render(() => <SessionControls />);
+    // App's Esc-to-interrupt listens on window and skips a defaultPrevented Esc.
+    const seen: boolean[] = [];
+    const onWindowKey = (e: KeyboardEvent) => seen.push(e.defaultPrevented);
+    window.addEventListener("keydown", onWindowKey);
+    try {
+      const toggle = getByTitle("Cycle execution mode");
+      fireEvent.click(toggle);
+      fireEvent.keyDown(toggle, { key: "Escape" });
+      expect(queryByText("interactive")).toBeNull();
+      // With no menu open, Esc is left for App to interrupt with.
+      fireEvent.keyDown(toggle, { key: "Escape" });
+      expect(seen).toEqual([true, false]);
+    } finally {
+      window.removeEventListener("keydown", onWindowKey);
+    }
+  });
+
   it("closes on an outside pointer-down", () => {
     ingestSessionList([sess()]);
     focusSession("s");

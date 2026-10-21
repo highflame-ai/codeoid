@@ -7,15 +7,15 @@
  * never sends one back.
  */
 
-import { type Component, For, Show, createSignal, onMount } from "solid-js";
+import { type Component, For, Index, Show, createSignal, onMount } from "solid-js";
 
 import {
-  accountNameProblem,
   addGatewayAccount,
   addTokenAccount,
   claudeAccountsState,
   DEFAULT_ACCOUNT,
   fetchClaudeAccounts,
+  newAccountNameProblem,
   removeClaudeAccount,
   setDefaultClaudeAccount,
 } from "../state/claude-accounts";
@@ -203,7 +203,7 @@ const AddAccountForm: Component<{ kind: "gateway" | "token" | "api-key"; onDone:
   const [error, setError] = createSignal<string | null>(null);
 
   const problem = () => {
-    const n = accountNameProblem(name().trim());
+    const n = newAccountNameProblem(name().trim());
     if (n) return n;
     if (!token().trim()) return "a token is required";
     if (props.kind === "gateway" && !baseUrl().trim()) return "a base URL is required";
@@ -281,28 +281,29 @@ export const HeadersEditor: Component<{
 }> = (props) => (
   <div class="space-y-1">
     <span class={label}>Extra headers</span>
-    <For each={props.rows}>
+    {/* <Index>: each keystroke replaces the row object; <For> would rebuild the row and drop focus. */}
+    <Index each={props.rows}>
       {(row, i) => (
         <div class="flex gap-2">
           <input
             class={input}
             placeholder="x-workspace"
-            value={row.name}
-            onInput={(e) => props.onChange(props.rows.map((r, j) => (j === i() ? { ...r, name: e.currentTarget.value } : r)))}
+            value={row().name}
+            onInput={(e) => props.onChange(props.rows.map((r, j) => (j === i ? { ...r, name: e.currentTarget.value } : r)))}
           />
           <input
             class={input}
             type="password"
             placeholder="value"
-            value={row.value}
-            onInput={(e) => props.onChange(props.rows.map((r, j) => (j === i() ? { ...r, value: e.currentTarget.value } : r)))}
+            value={row().value}
+            onInput={(e) => props.onChange(props.rows.map((r, j) => (j === i ? { ...r, value: e.currentTarget.value } : r)))}
           />
-          <button type="button" class={button} onClick={() => props.onChange(props.rows.filter((_, j) => j !== i()))} aria-label="Remove header">
+          <button type="button" class={button} onClick={() => props.onChange(props.rows.filter((_, j) => j !== i))} aria-label="Remove header">
             ✕
           </button>
         </div>
       )}
-    </For>
+    </Index>
     <button type="button" class={button} onClick={() => props.onChange([...props.rows, { name: "", value: "" }])}>
       + Header
     </button>

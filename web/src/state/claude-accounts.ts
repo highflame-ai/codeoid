@@ -13,7 +13,7 @@
 import { createSignal } from "solid-js";
 
 import { getClient, newRequestId, request } from "./connection";
-import { mergeSession } from "./sessions";
+import { mergeFullSessionInfo } from "./sessions";
 import type {
   BackendLoginStartResultMsg,
   BackendLoginSubmitResultMsg,
@@ -44,6 +44,7 @@ export const claudeAccountsState = state;
 
 export function _resetClaudeAccountsForTest(): void {
   setState(EMPTY);
+  attempt++;
   setLogin(LOGIN_EMPTY);
 }
 
@@ -66,7 +67,8 @@ async function accountsCall(build: (id: string) => ClientMessage): Promise<void>
 
 /**
  * Fetch the list (settings:read). A token without the scope gets an error,
- * which the pickers treat as "no named accounts" — they stay hidden.
+ * which the pickers treat as "no named accounts" — they stay hidden. A failure
+ * leaves the list unloaded, so the next caller (or a reconnect) tries again.
  */
 export async function fetchClaudeAccounts(force = false): Promise<void> {
   if (state().loading || (state().loaded && !force)) return;
@@ -74,8 +76,18 @@ export async function fetchClaudeAccounts(force = false): Promise<void> {
   try {
     await accountsCall((id) => ({ type: "claude.accounts.list", id }));
   } catch (e) {
-    setState((s) => ({ ...s, loaded: true, loading: false, error: errText(e) }));
+    setState((s) => ({ ...s, loading: false, error: errText(e) }));
   }
+}
+
+/**
+ * On (re)connect: refetch a list someone has already asked for — accounts
+ * may have changed while we were away, and a fetch that failed with the
+ * socket deserves another try. Nothing asked yet = nothing to do.
+ */
+export function refreshClaudeAccountsOnConnect(): void {
+  const s = state();
+  if (s.loaded || s.error) void fetchClaudeAccounts(true);
 }
 
 export async function addGatewayAccount(input: {
@@ -115,7 +127,7 @@ export async function setDefaultClaudeAccount(name: string): Promise<void> {
 export async function setSessionClaudeAccount(sessionId: string, account: string | null): Promise<SessionInfo | undefined> {
   const res = await request({ type: "session.set_claude_account", id: newRequestId(), sessionId, account });
   const info = (res as { data?: SessionInfo }).data;
-  if (info) mergeSession({ ...info, claudeAccount: info.claudeAccount });
+  if (info) mergeFullSessionInfo(info);
   return info;
 }
 
@@ -127,6 +139,18 @@ export function accountNameProblem(name: string): string | null {
   return null;
 }
 
+/**
+ * `accountNameProblem`, plus: not a name already in the list. Setting an
+ * existing name replaces that whole account on the daemon, so adding one
+ * under a taken name would silently overwrite it.
+ */
+export function newAccountNameProblem(name: string): string | null {
+  const p = accountNameProblem(name);
+  if (p) return p;
+  if (state().accounts.some((a) => a.name === name)) return `an account named "${name}" already exists — remove it first to replace it`;
+  return null;
+}
+
 /** An effective-account label the daemon marks as missing (`<name> (missing)`). */
 export function isMissingAccount(effective: string | undefined): boolean {
   return !!effective && effective.endsWith(" (missing)");
@@ -134,7 +158,7 @@ export function isMissingAccount(effective: string | undefined): boolean {
 
 // ── Sign-in for a named subscription ─────────────────────────────────────────
 
-export type AccountLoginPhase = "idle" | "starting" | "awaiting_code" | "submitting" | "done";
+export type AccountLoginPhase = "idle" | "starting" | "awaiting_code" | "submitting";
 
 interface LoginState {
   account: string | null;
@@ -145,6 +169,11 @@ interface LoginState {
 
 const LOGIN_EMPTY: LoginState = { account: null, phase: "idle", login: null, error: null };
 const [login, setLogin] = createSignal<LoginState>(LOGIN_EMPTY);
+/**
+ * Bumped by every start, cancel and dismiss: a reply that lands after its
+ * attempt was abandoned (Cancel during "Starting…") must not bring it back.
+ */
+let attempt = 0;
 
 export const accountLoginState = login;
 
@@ -154,6 +183,7 @@ export const accountLoginState = login;
  * URL to show.
  */
 export async function startAccountLogin(name: string): Promise<void> {
+  const mine = ++attempt;
   setLogin({ account: name, phase: "starting", login: null, error: null });
   try {
     const id = newRequestId();
@@ -164,9 +194,14 @@ export async function startAccountLogin(name: string): Promise<void> {
         timeoutMs: 60_000,
       },
     );
+    if (mine !== attempt) {
+      // Cancelled while starting: the daemon's attempt is live, so end it.
+      void sendLoginCancel(res.login.loginId);
+      return;
+    }
     setLogin({ account: name, phase: "awaiting_code", login: res.login, error: null });
   } catch (e) {
-    setLogin({ account: name, phase: "idle", login: null, error: errText(e) });
+    if (mine === attempt) setLogin({ account: name, phase: "idle", login: null, error: errText(e) });
   }
 }
 
@@ -175,6 +210,7 @@ export async function submitAccountLoginCode(code: string): Promise<boolean> {
   const cur = login();
   if (!cur.login) return false;
   const loginId = cur.login.loginId;
+  const mine = attempt;
   setLogin((s) => ({ ...s, phase: "submitting", error: null }));
   try {
     const id = newRequestId();
@@ -185,28 +221,35 @@ export async function submitAccountLoginCode(code: string): Promise<boolean> {
         timeoutMs: 120_000,
       },
     );
+    if (mine !== attempt) return res.ok;
     if (!res.ok) {
       // A malformed code leaves the daemon's attempt open: let the user retry.
       setLogin((s) => ({ ...s, phase: "awaiting_code", error: res.error ?? "Sign-in failed." }));
       return false;
     }
-    setLogin((s) => ({ ...s, phase: "done", login: null, error: null }));
+    // Back to idle, so the next sign-in starts from a fresh form.
+    attempt++;
+    setLogin(LOGIN_EMPTY);
     await fetchClaudeAccounts(true);
     return true;
   } catch (e) {
-    setLogin((s) => ({ ...s, phase: "awaiting_code", error: errText(e) }));
+    if (mine === attempt) setLogin((s) => ({ ...s, phase: "awaiting_code", error: errText(e) }));
     return false;
   }
 }
 
 export async function cancelAccountLogin(): Promise<void> {
   const cur = login();
+  attempt++;
   setLogin(LOGIN_EMPTY);
-  if (!cur.login) return;
+  if (cur.login) await sendLoginCancel(cur.login.loginId);
+}
+
+async function sendLoginCancel(loginId: string): Promise<void> {
   try {
     const id = newRequestId();
     await getClient().request(
-      { type: "backend.login.cancel", id, loginId: cur.login.loginId },
+      { type: "backend.login.cancel", id, loginId },
       { waitForResult: (m) => (m.type === "backend.login.cancel.result" && m.requestId === id ? m : undefined) },
     );
   } catch {
@@ -215,5 +258,6 @@ export async function cancelAccountLogin(): Promise<void> {
 }
 
 export function dismissAccountLogin(): void {
+  attempt++;
   setLogin(LOGIN_EMPTY);
 }

@@ -30,7 +30,7 @@ import type {
   SessionListResultMsg,
 } from "../protocol/types";
 
-import { ingestSessionList, mergeSession, setSessionStatus } from "./sessions";
+import { ingestSessionList, mergeFullSessionInfo, setSessionStatus } from "./sessions";
 import { noteAttachReplay } from "./attach";
 import {
   applyDelta,
@@ -266,6 +266,9 @@ export async function bootstrap(opts: { apiKey?: string; token?: string } = {}):
         // The providers.changed subscription is per connection: renew it, and
         // pick up any endpoint added or removed while we were away.
         void subscribeProviders();
+        // Likewise the Claude account list, if anything has loaded it (dynamic
+        // import: claude-accounts imports this module).
+        void import("./claude-accounts").then((m) => m.refreshClaudeAccountsOnConnect()).catch(() => {});
         // Refresh session list so statuses are current after a reconnect —
         // otherwise a session that finished its turn while we were away stays
         // stuck showing "thinking". (The attach effect re-attaches in parallel
@@ -381,10 +384,7 @@ function routeBroadcast(msg: DaemonMessage): void {
       }
       return;
     case "session.info_update":
-      // A full SessionInfo: an optional field it leaves out was unset (the
-      // daemon omits `claudeAccount` once a session follows the default
-      // again), so clear it rather than keep the stale value.
-      mergeSession({ ...msg.session, claudeAccount: msg.session.claudeAccount });
+      mergeFullSessionInfo(msg.session);
       return;
     case "providers.changed":
       setProviders(msg.providers);

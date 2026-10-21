@@ -23,6 +23,7 @@ import ApprovalBar from "./transcript/ApprovalBar";
 import UiRequestBar from "./transcript/UiRequestBar";
 import PromptBox from "./prompt/PromptBox";
 import SessionControls from "./SessionControls";
+import { ClaudeAccountChip } from "./ClaudeAccountChip";
 import Transcript from "./transcript/Transcript";
 import FleetRail from "./FleetRail";
 import WorkerIndicator from "./transcript/WorkerIndicator";
@@ -117,19 +118,7 @@ const SessionHeader: Component = () => (
                 {s().model}
               </span>
             </Show>
-            {/* The Claude account, once it's anything but the built-in one. */}
-            <Show when={s().effectiveClaudeAccount && s().effectiveClaudeAccount !== "default"}>
-              <span
-                class={`rounded border px-1.5 py-0.5 font-mono text-[10px] tracking-wider ${
-                  s().effectiveClaudeAccount?.endsWith(" (missing)")
-                    ? "border-danger/50 bg-danger/10 text-danger"
-                    : "border-border bg-bg text-fg-muted"
-                }`}
-                title={s().claudeAccount ? "Claude account chosen for this session" : "Claude account (the daemon default)"}
-              >
-                ⚿ {s().effectiveClaudeAccount}
-              </span>
-            </Show>
+            <ClaudeAccountChip session={s()} />
             <span class="ml-auto font-mono text-[11px] text-fg-faint">
               created {relativeTime(s().createdAt, nowTick())}
             </span>

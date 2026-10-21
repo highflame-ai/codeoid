@@ -2,9 +2,11 @@
  * Add or edit one OpenAI-compatible endpoint. Secrets are write-only: when
  * editing, the stored key and headers are kept unless the user chooses to
  * replace or remove them (they are never shown, so a replacement is re-typed).
+ * Moving the base URL to another origin makes keeping them impossible: the
+ * daemon only sends stored credentials to the origin they were entered for.
  */
 
-import { type Component, For, Show, createSignal } from "solid-js";
+import { type Component, For, Index, Show, createSignal } from "solid-js";
 
 import type { EndpointFlavor, EndpointInfo, EndpointModel, EndpointsTestResultMsg } from "../protocol/types";
 import { endpointNameProblem, saveEndpoint, testEndpoint } from "../state/endpoints";
@@ -29,6 +31,15 @@ export function tokensOf(s: string): number | undefined {
   if (!t) return undefined;
   const m = /^(\d+)(k?)$/i.exec(t);
   return m ? Number(m[1]) * (m[2] ? 1000 : 1) : Number.NaN;
+}
+
+/** `scheme://host:port` of a URL; undefined when it doesn't parse (the daemon validates it). */
+function originOf(url: string): string | undefined {
+  try {
+    return new URL(url.trim()).origin;
+  } catch {
+    return undefined;
+  }
 }
 
 function rowsOf(models: EndpointModel[]): ModelRow[] {
@@ -68,11 +79,28 @@ export const EndpointEditor: Component<{ existing?: EndpointInfo; onDone: () => 
   const [error, setError] = createSignal<string | null>(null);
   const [test, setTest] = createSignal<EndpointsTestResultMsg | "running" | undefined>();
 
+  const storedHeaders = !!ex?.headerNames.length;
+  /** The edited base URL points at another origin than the stored one (an unparsable URL counts as unchanged). */
+  const originMoved = (): boolean => {
+    if (!ex) return false;
+    const was = originOf(ex.baseUrl);
+    const now = originOf(baseUrl());
+    return !!was && !!now && was !== now;
+  };
+  // Stored secrets can't follow a move to another origin, so "keep" isn't on
+  // offer there: the key reads as "replace" (type one, or remove it) and the
+  // headers as replaced (re-enter, or none). Derived, not written back, so
+  // moving the URL back restores the user's choice.
+  const effKeyMode = () => (keyMode() === "keep" && originMoved() ? "set" : keyMode());
+  const effReplaceHeaders = () => replaceHeaders() || (storedHeaders && originMoved());
+
   const problem = (): string | null => {
     const n = endpointNameProblem(name().trim());
     if (n) return n;
     if (!baseUrl().trim()) return "a base URL is required";
-    if (keyMode() === "set" && !apiKey().trim()) return "enter the key, or choose to keep / remove it";
+    if (effKeyMode() === "set" && !apiKey().trim()) {
+      return originMoved() ? "enter a key for the new server, or remove it" : "enter the key, or choose to keep / remove it";
+    }
     if (Number.isNaN(tokensOf(contextWindow()) ?? 0)) return "context window: a number of tokens, like 32768 or 32k";
     for (const m of models()) {
       if (!m.id.trim()) return "every model row needs an id";
@@ -89,10 +117,14 @@ export const EndpointEditor: Component<{ existing?: EndpointInfo; onDone: () => 
     return out;
   };
 
-  /** What the key / headers fields mean for a request: absent = keep stored. */
+  /**
+   * What the key / headers fields mean for a request: absent = keep stored.
+   * A blank "replace" key is left out too — save refuses it (problem()), and a
+   * test then runs with the stored key rather than with none.
+   */
   const secretFields = () => ({
-    ...(keyMode() === "set" ? { apiKey: apiKey().trim() } : keyMode() === "clear" ? { apiKey: null } : {}),
-    ...(replaceHeaders() ? { headers: headerMap() } : {}),
+    ...(effKeyMode() === "set" && apiKey().trim() ? { apiKey: apiKey().trim() } : effKeyMode() === "clear" ? { apiKey: null } : {}),
+    ...(effReplaceHeaders() ? { headers: headerMap() } : {}),
   });
 
   const runTest = async () => {
@@ -194,34 +226,43 @@ export const EndpointEditor: Component<{ existing?: EndpointInfo; onDone: () => 
         <span class={label}>API key</span>
         <div class="flex flex-wrap items-center gap-3 text-[12px] text-fg-muted">
           <Show when={ex?.hasApiKey}>
+            <Show when={!originMoved()}>
+              <label class="flex items-center gap-1">
+                <input type="radio" checked={effKeyMode() === "keep"} onChange={() => setKeyMode("keep")} /> keep stored key
+              </label>
+            </Show>
             <label class="flex items-center gap-1">
-              <input type="radio" checked={keyMode() === "keep"} onChange={() => setKeyMode("keep")} /> keep stored key
-            </label>
-            <label class="flex items-center gap-1">
-              <input type="radio" checked={keyMode() === "clear"} onChange={() => setKeyMode("clear")} /> remove it
+              <input type="radio" checked={effKeyMode() === "clear"} onChange={() => setKeyMode("clear")} /> remove it
             </label>
           </Show>
           <Show when={!ex?.hasApiKey}>
             <label class="flex items-center gap-1">
-              <input type="radio" checked={keyMode() === "none"} onChange={() => setKeyMode("none")} /> no key
+              <input type="radio" checked={effKeyMode() === "none"} onChange={() => setKeyMode("none")} /> no key
             </label>
           </Show>
           <label class="flex items-center gap-1">
-            <input type="radio" checked={keyMode() === "set"} onChange={() => setKeyMode("set")} /> {ex?.hasApiKey ? "replace" : "set a key"}
+            <input type="radio" checked={effKeyMode() === "set"} onChange={() => setKeyMode("set")} /> {ex?.hasApiKey ? "replace" : "set a key"}
           </label>
         </div>
-        <Show when={keyMode() === "set"}>
+        <Show when={effKeyMode() === "set"}>
           <input class={input} type="password" value={apiKey()} onInput={(e) => setApiKey(e.currentTarget.value)} autocomplete="off" placeholder="sk-…" />
         </Show>
       </div>
 
+      <Show when={originMoved() && (ex?.hasApiKey || storedHeaders)}>
+        <p class="text-[11px] text-fg-faint">
+          The base URL now points at a different server. Stored credentials are only sent to the origin they were entered for, so
+          enter the key and headers again for this one, or remove them.
+        </p>
+      </Show>
+
       <Show
-        when={replaceHeaders()}
+        when={effReplaceHeaders()}
         fallback={
           <div class="flex items-center gap-2 text-[12px] text-fg-muted">
-            <span>Headers: {ex?.headerNames.length ? ex.headerNames.join(", ") : "none"}</span>
+            <span>Headers: {storedHeaders ? ex?.headerNames.join(", ") : "none"}</span>
             <button type="button" class={button} onClick={() => setReplaceHeaders(true)}>
-              {ex?.headerNames.length ? "Replace headers" : "Add headers"}
+              {storedHeaders ? "Replace headers" : "Add headers"}
             </button>
           </div>
         }
@@ -229,8 +270,27 @@ export const EndpointEditor: Component<{ existing?: EndpointInfo; onDone: () => 
         <HeadersEditor
           rows={headers()}
           onChange={setHeaders}
-          hint={ex?.headerNames.length ? "Replaces all stored headers — re-enter any you want to keep." : undefined}
+          hint={
+            !storedHeaders
+              ? undefined
+              : headers().length
+                ? "Replaces all stored headers — re-enter any you want to keep."
+                : "No rows: saving removes all stored headers."
+          }
         />
+        {/* Back out of a replace — unless the origin moved, where keeping isn't possible. */}
+        <Show when={ex && !originMoved()}>
+          <button
+            type="button"
+            class={button}
+            onClick={() => {
+              setReplaceHeaders(false);
+              setHeaders([]);
+            }}
+          >
+            {storedHeaders ? "Keep stored headers" : "No headers"}
+          </button>
+        </Show>
       </Show>
 
       <div class="space-y-1">
@@ -247,22 +307,25 @@ export const EndpointEditor: Component<{ existing?: EndpointInfo; onDone: () => 
             </button>
           </div>
         </div>
-        <For each={models()}>
+        {/* <Index>, not <For>: a patch replaces the row object, and <For> (keyed
+            by identity) would rebuild the row on every keystroke — losing focus
+            and all but the first character typed. */}
+        <Index each={models()}>
           {(m, i) => {
-            const patch = (p: Partial<ModelRow>) => setModels(models().map((r, j) => (j === i() ? { ...r, ...p } : r)));
+            const patch = (p: Partial<ModelRow>) => setModels(models().map((r, j) => (j === i ? { ...r, ...p } : r)));
             return (
               <div class="grid grid-cols-[2fr_1.5fr_1fr_1fr_auto] gap-2">
-                <input class={input} placeholder="model id" value={m.id} onInput={(e) => patch({ id: e.currentTarget.value })} />
-                <input class={input} placeholder="label" value={m.name} onInput={(e) => patch({ name: e.currentTarget.value })} />
-                <input class={input} placeholder="context (128k)" value={m.contextWindow} onInput={(e) => patch({ contextWindow: e.currentTarget.value })} />
-                <input class={input} placeholder="max output" value={m.maxTokens} onInput={(e) => patch({ maxTokens: e.currentTarget.value })} />
-                <button type="button" class={button} aria-label="Remove model" onClick={() => setModels(models().filter((_, j) => j !== i()))}>
+                <input class={input} placeholder="model id" value={m().id} onInput={(e) => patch({ id: e.currentTarget.value })} />
+                <input class={input} placeholder="label" value={m().name} onInput={(e) => patch({ name: e.currentTarget.value })} />
+                <input class={input} placeholder="context (128k)" value={m().contextWindow} onInput={(e) => patch({ contextWindow: e.currentTarget.value })} />
+                <input class={input} placeholder="max output" value={m().maxTokens} onInput={(e) => patch({ maxTokens: e.currentTarget.value })} />
+                <button type="button" class={button} aria-label="Remove model" onClick={() => setModels(models().filter((_, j) => j !== i))}>
                   ✕
                 </button>
               </div>
             );
           }}
-        </For>
+        </Index>
       </div>
 
       <div class="grid grid-cols-2 gap-3">

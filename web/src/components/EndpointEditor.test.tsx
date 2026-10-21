@@ -41,14 +41,15 @@ describe("EndpointEditor", () => {
     clientRequestMock.mockResolvedValue({ type: "endpoints.result", requestId: "r", endpoints: [STORED] });
     const done = vi.fn();
     const { getByText, getByDisplayValue } = render(() => <EndpointEditor existing={STORED} onDone={done} />);
-    fireEvent.input(getByDisplayValue("http://gpu-box:8000/v1"), { target: { value: "http://gpu-box:8001/v1" } });
+    // Same origin, new path: the stored secrets stay put.
+    fireEvent.input(getByDisplayValue("http://gpu-box:8000/v1"), { target: { value: "http://gpu-box:8000/v2" } });
     fireEvent.click(getByText("Save"));
     await waitFor(() => expect(done).toHaveBeenCalled());
     const msg = sent()[0]!;
     expect(msg).toMatchObject({
       type: "endpoints.set",
       name: "box",
-      baseUrl: "http://gpu-box:8001/v1",
+      baseUrl: "http://gpu-box:8000/v2",
       models: [{ id: "qwen3-coder", contextWindow: 128000 }],
       mcpServers: "all",
     });
@@ -97,6 +98,98 @@ describe("EndpointEditor", () => {
     fireEvent.click(add);
     await waitFor(() => expect(done).toHaveBeenCalled());
     expect(sent()[1]).toMatchObject({ type: "endpoints.set", name: "ollama", models: [{ id: "a" }, { id: "b" }] });
+  });
+
+  it("typing into a model row keeps the same input, focused, with every character", () => {
+    const { getByText, getByPlaceholderText } = render(() => <EndpointEditor onDone={() => {}} />);
+    fireEvent.click(getByText("+ Model"));
+    const el = getByPlaceholderText("model id") as HTMLInputElement;
+    el.focus();
+    for (const ch of "qwen") {
+      el.value += ch;
+      fireEvent.input(el);
+    }
+    expect(el.isConnected).toBe(true);
+    expect(document.activeElement).toBe(el);
+    expect((getByPlaceholderText("model id") as HTMLInputElement).value).toBe("qwen");
+  });
+
+  it("typing into a header row keeps the same input and every character", () => {
+    const { getByText, getByPlaceholderText } = render(() => <EndpointEditor existing={STORED} onDone={() => {}} />);
+    fireEvent.click(getByText("Replace headers"));
+    fireEvent.click(getByText("+ Header"));
+    const el = getByPlaceholderText("x-workspace") as HTMLInputElement;
+    el.focus();
+    for (const ch of "x-team") {
+      el.value += ch;
+      fireEvent.input(el);
+    }
+    expect(el.isConnected).toBe(true);
+    expect(document.activeElement).toBe(el);
+    expect((getByPlaceholderText("x-workspace") as HTMLInputElement).value).toBe("x-team");
+  });
+
+  it("'Replace headers' can be backed out of — the stored headers are then left alone", async () => {
+    clientRequestMock.mockResolvedValue({ type: "endpoints.result", requestId: "r", endpoints: [STORED] });
+    const { getByText } = render(() => <EndpointEditor existing={STORED} onDone={() => {}} />);
+    fireEvent.click(getByText("Replace headers"));
+    getByText(/saving removes all stored headers/);
+    fireEvent.click(getByText("Keep stored headers"));
+    getByText("Replace headers");
+    fireEvent.click(getByText("Save"));
+    await waitFor(() => expect(sent()[0]).toMatchObject({ type: "endpoints.set" }));
+    expect("headers" in sent()[0]!).toBe(false);
+  });
+
+  it("replacing headers with no rows removes them all, explicitly", async () => {
+    clientRequestMock.mockResolvedValue({ type: "endpoints.result", requestId: "r", endpoints: [STORED] });
+    const { getByText } = render(() => <EndpointEditor existing={STORED} onDone={() => {}} />);
+    fireEvent.click(getByText("Replace headers"));
+    fireEvent.click(getByText("Save"));
+    await waitFor(() => expect(sent()[0]).toMatchObject({ type: "endpoints.set", headers: {} }));
+  });
+
+  it("a test with 'replace' chosen but no key typed uses the stored key (apiKey left out)", async () => {
+    clientRequestMock.mockResolvedValue({ type: "endpoints.test.result", requestId: "r", ok: true, models: [], latencyMs: 1 });
+    const { getByText, getByLabelText, findByText } = render(() => <EndpointEditor existing={STORED} onDone={() => {}} />);
+    fireEvent.click(getByLabelText(/replace/));
+    fireEvent.click(getByText("Test connection"));
+    await findByText(/answered in 1 ms/);
+    expect(sent()[0]).toMatchObject({ type: "endpoints.test", name: "box" });
+    expect("apiKey" in sent()[0]!).toBe(false);
+  });
+
+  it("moving the base URL to another origin can't keep the stored key or headers", async () => {
+    clientRequestMock.mockImplementation(async (msg) =>
+      msg.type === "endpoints.test"
+        ? { type: "endpoints.test.result", requestId: "r", ok: true, models: [], latencyMs: 1 }
+        : { type: "endpoints.result", requestId: "r", endpoints: [STORED] },
+    );
+    const { getByText, getByDisplayValue, getByLabelText, queryByLabelText, queryByText, findByText } = render(() => (
+      <EndpointEditor existing={STORED} onDone={() => {}} />
+    ));
+    const url = getByDisplayValue("http://gpu-box:8000/v1");
+    // A port change is a different origin.
+    fireEvent.input(url, { target: { value: "http://gpu-box:8001/v1" } });
+    getByText(/only sent to the origin they were entered for/);
+    expect(queryByLabelText(/keep stored key/)).toBeNull();
+    expect(queryByText("Keep stored headers")).toBeNull();
+    expect((getByText("Save") as HTMLButtonElement).disabled).toBe(true);
+
+    // Remove the key; the headers are already in replace mode (no rows → none).
+    fireEvent.click(getByLabelText(/remove it/));
+    fireEvent.click(getByText("Test connection"));
+    await findByText(/answered in 1 ms/);
+    expect(sent()[0]).toMatchObject({ type: "endpoints.test", baseUrl: "http://gpu-box:8001/v1", apiKey: null, headers: {} });
+    fireEvent.click(getByText("Save"));
+    await waitFor(() => expect(sent()[1]).toMatchObject({ type: "endpoints.set", apiKey: null, headers: {} }));
+
+    // Back to the stored origin (or an unparsable URL): keeping is on offer again.
+    fireEvent.input(url, { target: { value: "not a url" } });
+    expect(queryByText(/only sent to the origin/)).toBeNull();
+    fireEvent.input(url, { target: { value: "http://gpu-box:8000/other" } });
+    getByLabelText(/keep stored key/);
+    getByText("Replace headers");
   });
 
   it("shows the daemon's validation message on save", async () => {

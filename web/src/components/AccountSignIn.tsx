@@ -9,9 +9,9 @@ import { type Component, Show, createSignal } from "solid-js";
 
 import {
   accountLoginState,
-  accountNameProblem,
   cancelAccountLogin,
   dismissAccountLogin,
+  newAccountNameProblem,
   startAccountLogin,
   submitAccountLoginCode,
 } from "../state/claude-accounts";
@@ -26,6 +26,7 @@ export const AccountSignIn: Component<{ onDone: () => void }> = (props) => {
   const [name, setName] = createSignal("");
   const [code, setCode] = createSignal("");
   const st = accountLoginState;
+  const problem = () => newAccountNameProblem(name().trim());
 
   const close = () => {
     void cancelAccountLogin();
@@ -55,8 +56,8 @@ export const AccountSignIn: Component<{ onDone: () => void }> = (props) => {
           <button
             type="button"
             class={button}
-            disabled={!!accountNameProblem(name().trim()) || st().phase === "starting"}
-            title={accountNameProblem(name().trim()) ?? ""}
+            disabled={!!problem() || st().phase === "starting"}
+            title={problem() ?? ""}
             onClick={() => void startAccountLogin(name().trim())}
           >
             {st().phase === "starting" ? "Starting…" : "Get sign-in link"}
@@ -64,6 +65,9 @@ export const AccountSignIn: Component<{ onDone: () => void }> = (props) => {
           <button type="button" class={button} onClick={close}>
             Cancel
           </button>
+          <Show when={problem() && name()}>
+            <span class="self-center text-[11px] text-fg-faint">{problem()}</span>
+          </Show>
         </div>
       </Show>
 
