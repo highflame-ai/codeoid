@@ -18,7 +18,8 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { program } from "commander";
+import { randomUUID } from "node:crypto";
+import { type Command, program } from "commander";
 // Single source of truth for the CLI version — bun inlines this JSON at build,
 // so `codeoid --version` always matches the published package (no hand-synced
 // string to drift). release-smoke asserts these two stay equal.
@@ -34,12 +35,29 @@ import {
   mintLocalToken,
   removeLocalTokenFile,
 } from "./daemon/local-auth.js";
-import { CAPABILITIES, type CollaborationConfig } from "./protocol/types.js";
+import {
+  CAPABILITIES,
+  type CollaborationConfig,
+  type RoutineScheduleWire,
+  type RoutineSpecWire,
+  routineFirePath,
+} from "./protocol/types.js";
 import { ALL_SCOPES_STRING } from "./protocol/scopes.js";
 import { TerminalClient } from "./terminal/client.js";
+import { formatClaudeAccounts, parseHeaderFlags } from "./terminal/claude-accounts.js";
+import type { ClientMessage, DaemonMessage, SessionInfo } from "./protocol/types.js";
 import { mcpConfig, mcpHeaders } from "./terminal/mcp-control-cli.js";
 import { cleartextOffHost, controlUrl, MCP_SCOPE_PRESETS, TokenError } from "./terminal/token.js";
 import { parseTargets } from "./terminal/compare.js";
+import {
+  formatRoutine,
+  formatRoutineList,
+  formatRun,
+  type RoutineFlags,
+  relativeTime,
+  scheduleFromFlags,
+  specFromFlags,
+} from "./terminal/routine-format.js";
 import {
   getConfigDir,
   getLocalTokenPath,
@@ -440,6 +458,145 @@ program
     client.disconnect();
   });
 
+// ── Claude accounts (several subscriptions / gateways — claude-accounts.ts) ──
+
+const account = program
+  .command("account")
+  .description("Claude accounts: several subscriptions or gateway tokens, a default, and a per-session choice");
+
+/** Run one account request against the daemon and print the result. */
+async function accountRequest(build: (id: string) => ClientMessage, onOk?: (resp: DaemonMessage) => void): Promise<void> {
+  const config = loadConfig();
+  const client = new TerminalClient(config);
+  await client.connect();
+  const resp = await client.request(build(randomUUID()));
+  client.disconnect();
+  if (resp.type === "response.error") {
+    console.error(`Error: ${resp.error}`);
+    process.exitCode = 1;
+    return;
+  }
+  if (resp.type === "claude.accounts.result") console.log(formatClaudeAccounts(resp.accounts, resp.defaultAccount));
+  onOk?.(resp);
+}
+
+account
+  .command("ls")
+  .description("List Claude accounts and the daemon default")
+  .action(() => accountRequest((id) => ({ type: "claude.accounts.list", id })));
+
+account
+  .command("login <name>")
+  .description("Sign a Claude Pro/Max subscription in as account <name> (runs claude setup-token; never touches your own claude login)")
+  .action(async (name: string) => {
+    const config = loadConfig();
+    const client = new TerminalClient(config);
+    await client.connect();
+    const started = await client.request({ type: "backend.login.start", id: randomUUID(), backend: "claude", account: name });
+    if (started.type !== "backend.login.start.result") {
+      client.disconnect();
+      console.error(`Error: ${started.type === "response.error" ? started.error : started.type}`);
+      process.exit(1);
+    }
+    console.log(`\nOpen this URL in a browser signed in to the account you want as "${name}":\n\n  ${started.login.verificationUrl}\n`);
+    console.log(started.login.codeHint);
+    const code = await readSecret("Code: ");
+    const done = await client.request({ type: "backend.login.submit", id: randomUUID(), loginId: started.login.loginId, code });
+    client.disconnect();
+    if (done.type === "backend.login.submit.result" && done.ok) {
+      console.log(`Signed in. Claude account "${name}" is ready — use it with: codeoid account use <session> ${name}`);
+    } else {
+      console.error(`Error: ${done.type === "backend.login.submit.result" ? (done.error ?? "sign-in failed") : done.type === "response.error" ? done.error : done.type}`);
+      process.exit(1);
+    }
+  });
+
+account
+  .command("add-gateway <name>")
+  .description("Add an Anthropic-compatible gateway account (its token is read from a prompt or stdin, never the command line)")
+  .requiredOption("--base-url <url>", "the gateway's base URL (https)")
+  .option("--header <header>", 'extra request header, repeatable: "Name" (value asked for without echo — keeps it out of shell history and ps) or "Name: value" for a non-secret one', (v: string, prev: string[] = []) => [...prev, v], [] as string[])
+  .action(async (name: string, o: { baseUrl: string; header: string[] }) => {
+    let parsed: ReturnType<typeof parseHeaderFlags>;
+    try {
+      parsed = parseHeaderFlags(o.header ?? []);
+    } catch (err) {
+      console.error((err as Error).message);
+      process.exit(1);
+    }
+    if (parsed.ask.length > 0 && !process.stdin.isTTY) {
+      console.error('A header value can only be asked for on a terminal; with piped input, pipe the token and pass "Name: value".');
+      process.exit(1);
+    }
+    const headers = parsed.headers;
+    for (const h of parsed.ask) headers[h] = (await readSecret(`Value for header ${h}: `)).trim();
+    const token = (await readSecret("Gateway token: ")).trim();
+    await accountRequest((id) => ({
+      type: "claude.accounts.set",
+      id,
+      name,
+      kind: "gateway",
+      token,
+      baseUrl: o.baseUrl,
+      ...(Object.keys(headers).length > 0 ? { headers } : {}),
+    }));
+  });
+
+account
+  .command("add-token <name>")
+  .description("Add an account from a token you already have: a subscription token (sk-ant-oat01-…, from claude setup-token) or, with --api-key, an Anthropic API key. Read from a prompt or stdin.")
+  .option("--api-key", "the token is an Anthropic API key, not a subscription token")
+  .action(async (name: string, o: { apiKey?: boolean }) => {
+    const token = (await readSecret(o.apiKey ? "Anthropic API key: " : "Subscription token (sk-ant-oat01-…): ")).trim();
+    await accountRequest((id) => ({ type: "claude.accounts.set", id, name, kind: o.apiKey ? "api-key" : "subscription", token }));
+  });
+
+account
+  .command("rm <name>")
+  .description("Remove a Claude account (sessions on it refuse to run until switched)")
+  .action((name: string) => accountRequest((id) => ({ type: "claude.accounts.remove", id, name })));
+
+account
+  .command("default <name>")
+  .description('Set the daemon default account — every session that hasn\'t chosen its own switches on its next turn ("default" = the daemon\'s own environment)')
+  .action((name: string) => accountRequest((id) => ({ type: "claude.accounts.set_default", id, name })));
+
+account
+  .command("use <session> [name]")
+  .description(
+    'Switch a session to account <name> from its next turn, keeping the conversation ("default" = your own login, whatever the daemon default is; --follow-default = track the daemon default)',
+  )
+  .option("--follow-default", "follow the daemon default instead of pinning an account (omit <name>)")
+  .action(async (session: string, name: string | undefined, o: { followDefault?: boolean }) => {
+    if ((name === undefined) === !o.followDefault) {
+      console.error("Give an account name, or --follow-default — not both.");
+      process.exit(1);
+    }
+    const config = loadConfig();
+    const client = new TerminalClient(config);
+    await client.connect();
+    const sessionId = await client.resolveSessionId(session);
+    if (!sessionId) {
+      client.disconnect();
+      process.exit(1);
+    }
+    const resp = await client.request({
+      type: "session.set_claude_account",
+      id: randomUUID(),
+      sessionId,
+      account: o.followDefault ? null : (name as string),
+    });
+    client.disconnect();
+    if (resp.type === "response.error") {
+      console.error(`Error: ${resp.error}`);
+      process.exit(1);
+    }
+    const info = (resp as { data?: SessionInfo }).data;
+    console.log(
+      `Session "${session}" runs on Claude account "${info?.effectiveClaudeAccount ?? name}"${o.followDefault ? " (following the daemon default)" : ""} from its next turn.`,
+    );
+  });
+
 program
   .command("new <name> [workdir]")
   .description("Create a new agent session. With --worktree, auto-spawns a git worktree.")
@@ -458,6 +615,10 @@ program
   .option(
     "--provider <id>",
     "Agent backend for this session (claude | codex | gemini-cli | pi | openai | gemini). Default: the daemon's default.",
+  )
+  .option(
+    "--account <name>",
+    "Claude account to run this session on (see `codeoid account ls`). Default: the daemon default account.",
   )
   .option(
     "--model <id>",
@@ -490,6 +651,7 @@ program
         repo?: string;
         worktreeDir?: string;
         provider?: string;
+        account?: string;
         model?: string;
         pack?: string;
         packRole?: string;
@@ -545,6 +707,7 @@ program
       await client.createSession(name, resolvedWorkdir, {
         providerId: opts.provider,
         model: opts.model,
+        claudeAccount: opts.account,
         pack: opts.pack,
         packRole: opts.packRole,
         collaboration,
@@ -785,7 +948,7 @@ program
 
 const mcp = program
   .command("mcp")
-  .description("Let external agents (Claude Code, Cursor, CI) drive codeoid over MCP (docs/mcp-control.md)");
+  .description("Let external agents drive codeoid over MCP (docs/mcp-control.md), and manage a session's MCP servers");
 
 mcp
   .command("headers")
@@ -834,6 +997,36 @@ mcp
     );
   });
 
+mcp
+  .command("adopt <server>")
+  .description("Have codeoid sign in to a remote MCP server from Claude's own config, instead of an interactive Claude Code session (#390)")
+  .option("--session <session>", "also look in this session's workdir (a .mcp.json, project servers)")
+  .option("--url <url>", "the server's URL: required for a project's own server (its address was chosen by the project — naming it is your consent), and when two servers share the name")
+  .action((server: string, opts: { session?: string; url?: string }) => withClient((c) => c.mcpAdopt(server, opts.session, opts.url)));
+
+mcp
+  .command("signin <server>")
+  .description("Sign in to an OAuth MCP server in codeoid's registry (one you adopted, or configured with oauth)")
+  .option("--callback-url <url>", "finish a sign-in from the address the browser landed on")
+  .action((server: string, opts: { callbackUrl?: string }) => withClient((c) => c.mcpSignin(server, opts.callbackUrl)));
+
+mcp
+  .command("reconnect <session> <server>")
+  .description("Redial one of a session's MCP servers that's down — e.g. one that failed when the session started and has since been fixed")
+  .action((session: string, server: string) => withClient((c) => c.mcpReconnect(session, server)));
+
+mcp
+  .command("refresh <session>")
+  .description("Use MCP servers added or changed in Claude's config in a session (its backend restarts and resumes the conversation)")
+  .action((session: string) => withClient((c) => c.mcpRefresh(session)));
+
+mcp
+  .command("approve <session> <server>")
+  .description("Approve a project's MCP server (from its .mcp.json or project settings) for every backend in the session's workdir")
+  .option("--path <file>", "the file it's declared in, when more than one declares it")
+  .option("--yes <fingerprint>", "approve the entry you reviewed (its fingerprint, as the review printed it); without it, the entry is only shown")
+  .action((session: string, server: string, opts: { path?: string; yes?: string }) => withClient((c) => c.mcpApprove(session, server, opts)));
+
 // ── Packs (dynamic pack loading — docs/pack-loading.md) ─────────────────────
 
 /** Connect, run one pack command, disconnect. */
@@ -846,6 +1039,244 @@ async function withClient(fn: (c: TerminalClient) => Promise<void>): Promise<voi
     client.disconnect();
   }
 }
+
+// ── Routines (docs/routines.md) ─────────────────────────────────────────────
+
+/** Options shared by `routine add` and `routine edit`. */
+function routineSpecOptions(cmd: Command, mode: "add" | "edit"): Command {
+  cmd
+    .option("-w, --workdir <dir>", mode === "add" ? "directory the agent works in (default: here)" : "directory the agent works in")
+    .option("-p, --prompt <text>", "what the agent should do — may use {{check}}, {{payload}}, {{last_summary}}, {{trigger}}, {{now}}, {{routine}}")
+    .option("--prompt-file <path>", "read the prompt from a file")
+    .option("--cron <expr>", 'run on a cron schedule, e.g. "0 9 * * 1-5"')
+    .option("--tz <zone>", "IANA timezone for --cron (default: this machine's)")
+    .option("--every <interval>", "run every interval, e.g. 15m, 2h, 1d")
+    .option("--at <time>", "run once, at ISO 8601 with a zone (Z or +08:00)")
+    .option("--check <command>", "pre-run gate: no output = nothing to do (no agent, no cost)")
+    .option("--check-timeout <s>", "check timeout in seconds (default 60)")
+    .option("--provider <id>", "backend: claude, codex, gemini, qwen, …")
+    .option("--model <name>", "model for the backend")
+    .option("--guarded", "every non-read tool waits for your approval")
+    .option("--autonomous", "tools auto-approve within --tool-budget (default)")
+    .option("--tool-budget <n>", "autonomous tool calls per run (default 50)")
+    .option("--max-minutes <n>", "wall-clock limit per run (default 15)")
+    .option("--max-cost <usd>", "spend ceiling per run")
+    .option("--daily-cost <usd>", "spend ceiling per day (UTC)")
+    .option("--persistent", "reuse one session across runs (keeps the conversation)")
+    .option("--fresh", "a new session per run (default)")
+    .option("--worktree", "run in a fresh git worktree each time")
+    .option("--overlap <policy>", "if a run is still going: skip (default) or queue")
+    .option("--catch-up", "after downtime, run once for a missed fire")
+    .option("--jitter <s>", "spread the start by up to this many seconds")
+    .option("--notify <policy>", "on_change (default), always, or never")
+    .option("--keep <n>", "run sessions to keep (default 5)")
+    .option("--api", "enable the routine's API trigger (prints its token once)")
+    .option("--failure-pause <n>", "pause after N consecutive failures (default 3, 0 = never)");
+  if (mode === "edit") {
+    cmd
+      .option("--no-schedule", "remove the schedule (run on demand only)")
+      .option("--no-check", "remove the check")
+      .option("--no-worktree", "stop using a worktree")
+      .option("--no-catch-up", "don't catch up missed fires")
+      .option("--no-api", "turn the API trigger off (revokes its token)");
+  }
+  return cmd;
+}
+
+/** Print an API token once, with how to call it. */
+function printRoutineToken(token: string, routineId: string): void {
+  const base = loadConfig().daemonUrl.replace(/^ws/, "http").replace(/\/+$/, "");
+  console.log(`\n  API token (shown once — store it now):\n    ${token}`);
+  console.log(`\n  Fire it:\n    curl -X POST ${base}${routineFirePath(routineId)} \\\n      -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \\\n      -d '{"text": "optional payload for {{payload}}"}'\n`);
+}
+
+const routine = program
+  .command("routine")
+  .description("Scheduled and triggered agent runs, with budgets and a check-first gate (docs/routines.md)");
+
+routineSpecOptions(routine.command("add <name>").description("Create a routine"), "add").action((name: string, f: RoutineFlags) =>
+  withClient(async (c) => {
+    let spec: ReturnType<typeof specFromFlags>;
+    try {
+      spec = specFromFlags(name, f, "add");
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exitCode = 1;
+      return;
+    }
+    const res = await c.request({ type: "routine.create", id: randomUUID(), spec: spec as RoutineSpecWire });
+    if (res.type !== "routine.snapshot") return c.printError(res);
+    console.log(formatRoutine(res.routine).join("\n"));
+    if (res.apiToken) printRoutineToken(res.apiToken, res.routine.id);
+  }),
+);
+
+routineSpecOptions(routine.command("edit <name>").description("Change a routine (only the flags you pass)"), "edit").action(
+  (name: string, f: RoutineFlags) =>
+    withClient(async (c) => {
+      let spec: ReturnType<typeof specFromFlags>;
+      try {
+        spec = specFromFlags(name, f, "edit");
+      } catch (err) {
+        console.error(err instanceof Error ? err.message : String(err));
+        process.exitCode = 1;
+        return;
+      }
+      const res = await c.request({ type: "routine.update", id: randomUUID(), routine: name, spec: spec as never });
+      if (res.type !== "routine.snapshot") return c.printError(res);
+      console.log(formatRoutine(res.routine).join("\n"));
+      if (res.apiToken) printRoutineToken(res.apiToken, res.routine.id);
+    }),
+);
+
+routine
+  .command("ls")
+  .description("List routines")
+  .action(() =>
+    withClient(async (c) => {
+      const res = await c.request({ type: "routine.list", id: randomUUID() });
+      if (res.type !== "routine.list.result") return c.printError(res);
+      console.log(formatRoutineList(res.routines).join("\n"));
+    }),
+  );
+
+routine
+  .command("show <name>")
+  .description("A routine's configuration and recent runs")
+  .option("--runs <n>", "recent runs to show", "5")
+  .action((name: string, o: { runs: string }) =>
+    withClient(async (c) => {
+      const res = await c.request({ type: "routine.get", id: randomUUID(), routine: name, runs: Number(o.runs) });
+      if (res.type !== "routine.snapshot") return c.printError(res);
+      console.log(formatRoutine(res.routine, res.runs).join("\n"));
+    }),
+  );
+
+routine
+  .command("runs <name>")
+  .description("Run history, newest first")
+  .option("--limit <n>", "how many", "20")
+  .action((name: string, o: { limit: string }) =>
+    withClient(async (c) => {
+      const res = await c.request({ type: "routine.runs", id: randomUUID(), routine: name, limit: Number(o.limit) });
+      if (res.type !== "routine.runs.result") return c.printError(res);
+      if (res.runs.length === 0) console.log("No runs yet.");
+      for (const run of res.runs) console.log(formatRun(run).join("\n"));
+    }),
+  );
+
+routine
+  .command("run <name>")
+  .description("Run a routine now")
+  .option("--payload <text>", "text for the prompt's {{payload}}")
+  .option("--wait", "wait for the run to finish and print its outcome")
+  .action((name: string, o: { payload?: string; wait?: boolean }) =>
+    withClient(async (c) => {
+      const res = await c.request({ type: "routine.run", id: randomUUID(), routine: name, ...(o.payload ? { payload: o.payload } : {}) });
+      if (res.type !== "routine.run.result") return c.printError(res);
+      const runId = res.run.id;
+      if (!o.wait || ["skipped", "cancelled"].includes(res.run.status)) {
+        console.log(formatRun(res.run).join("\n"));
+        return;
+      }
+      process.stderr.write(`run ${runId.slice(0, 8)} started — waiting`);
+      for (;;) {
+        await new Promise((r) => setTimeout(r, 2_000));
+        // By id, so a busy routine's newer runs can't push this one out of view.
+        const got = await c.request({ type: "routine.runs", id: randomUUID(), routine: res.run.routineId, runId });
+        if (got.type !== "routine.runs.result") return c.printError(got);
+        const run = got.runs[0];
+        if (!run) {
+          process.stderr.write("\n");
+          console.error(`run ${runId.slice(0, 8)} is gone (the routine was deleted, or its history trimmed)`);
+          process.exitCode = 1;
+          return;
+        }
+        if (!["queued", "checking", "running"].includes(run.status)) {
+          process.stderr.write("\n");
+          console.log(formatRun(run).join("\n"));
+          if (["failed", "timed_out", "over_budget"].includes(run.status)) process.exitCode = 1;
+          return;
+        }
+        process.stderr.write(".");
+      }
+    }),
+  );
+
+for (const [verb, enabled] of [["pause", false], ["resume", true]] as const) {
+  routine
+    .command(`${verb} <name>`)
+    .description(enabled ? "Resume a paused routine" : "Pause a routine (nothing is deleted)")
+    .action((name: string) =>
+      withClient(async (c) => {
+        const res = await c.request({ type: "routine.update", id: randomUUID(), routine: name, enabled });
+        if (res.type !== "routine.snapshot") return c.printError(res);
+        console.log(formatRoutineList([res.routine]).slice(1).join("\n"));
+      }),
+    );
+}
+
+routine
+  .command("rm <name>")
+  .description("Delete a routine and its run history")
+  .action((name: string) =>
+    withClient(async (c) => {
+      const res = await c.request({ type: "routine.delete", id: randomUUID(), routine: name });
+      if (res.type !== "response.ok") return c.printError(res);
+      console.log(`Deleted routine ${name}.`);
+    }),
+  );
+
+routine
+  .command("cancel <runId>")
+  .description("Cancel a queued or running run")
+  .action((runId: string) =>
+    withClient(async (c) => {
+      const res = await c.request({ type: "routine.cancel_run", id: randomUUID(), runId });
+      if (res.type !== "response.ok") return c.printError(res);
+      console.log(`Cancelled run ${runId}.`);
+    }),
+  );
+
+routine
+  .command("token <name>")
+  .description("Mint a new API token (the old one stops working)")
+  .action((name: string) =>
+    withClient(async (c) => {
+      const res = await c.request({ type: "routine.token", id: randomUUID(), routine: name });
+      if (res.type !== "routine.token.result") return c.printError(res);
+      printRoutineToken(res.apiToken, res.routineId);
+    }),
+  );
+
+routine
+  .command("preview")
+  .description("Check a schedule and show its next fire times")
+  .option("--cron <expr>", "cron expression")
+  .option("--tz <zone>", "IANA timezone for --cron")
+  .option("--every <interval>", "interval, e.g. 15m")
+  .option("--at <time>", "ISO 8601 with a zone (Z or +08:00)")
+  .option("--count <n>", "how many fires", "5")
+  .action((o: RoutineFlags & { count: string }) =>
+    withClient(async (c) => {
+      let schedule: RoutineScheduleWire | null | undefined;
+      try {
+        schedule = scheduleFromFlags(o);
+      } catch (err) {
+        console.error(err instanceof Error ? err.message : String(err));
+        process.exitCode = 1;
+        return;
+      }
+      if (!schedule) {
+        console.error("give a schedule: --cron, --every, or --at");
+        process.exitCode = 1;
+        return;
+      }
+      const res = await c.request({ type: "routine.preview", id: randomUUID(), schedule, count: Number(o.count) });
+      if (res.type !== "routine.preview.result") return c.printError(res);
+      for (const f of res.fires) console.log(`  ${f}  (${relativeTime(f)})`);
+    }),
+  );
 
 const pack = program.command("pack").description("Manage SDLC packs + registries (docs/pack-loading.md)");
 

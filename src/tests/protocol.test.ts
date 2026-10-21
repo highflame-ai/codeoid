@@ -462,18 +462,34 @@ describe("DaemonMessage routing", () => {
           return `turns:${msg.turns.length}`;
         case "session.approvals.result":
           return `approvals:${msg.approvals.length}`;
+        case "claude.accounts.result":
+          return `claude-accounts:${msg.accounts.length}`;
         case "session.rewind.result":
           return `rewind:${msg.removedTurns}`;
         case "compare.state":
           return `compare:${msg.compare.targets.length}`;
         case "compare.list.result":
           return `compares:${msg.compares.length}`;
+        case "routine.snapshot":
+          return `routine:${msg.routine.name}`;
+        case "routine.list.result":
+          return `routines:${msg.routines.length}`;
+        case "routine.run.result":
+          return `routine.run:${msg.run.status}`;
+        case "routine.runs.result":
+          return `routine.runs:${msg.runs.length}`;
+        case "routine.token.result":
+          return `routine.token:${msg.routineId}`;
+        case "routine.preview.result":
+          return `routine.preview:${msg.fires.length}`;
         case "mcp.oauth.begin.result":
           return `mcp.oauth.begin:${msg.status}`;
         case "mcp.oauth.complete.result":
           return `mcp.oauth.complete:${msg.server}`;
         case "mcp.oauth.disconnect.result":
           return "mcp.oauth.disconnect";
+        case "mcp.adopt.result":
+          return `mcp.adopt:${msg.server}`;
         case "pipeline.snapshot":
           return `pipeline:${msg.pipeline.id}`;
         case "pipeline.list.result":

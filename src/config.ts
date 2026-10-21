@@ -14,7 +14,8 @@
  *      the parsed config, not env vars, so we can mock cleanly in tests.
  */
 
-import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, chmodSync } from "node:fs";
+import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, chmodSync, rmSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { join, isAbsolute, resolve, dirname } from "node:path";
 import { homedir } from "node:os";
 import { z } from "zod";
@@ -432,12 +433,37 @@ const SessionSchema = z
         waitMs: z.number().int().min(0).optional(),
       })
       .optional(),
+    /**
+     * History seeding on fork / backend switch: the parent's conversation is
+     * rendered as a transcript and prepended to the new backend's first
+     * prompt. Its size is `window × seedWindowFraction × seedCharsPerToken`
+     * characters unless `seedBudgetChars` caps it outright (0 = computed).
+     *
+     * seedCharsPerToken is the knob that matters: code, JSON and tool output
+     * tokenize at ~2.2 chars/token, so a prose-like 3.5 overflowed a 1M
+     * window by ~90k tokens. Lower it if seeded forks still hit "Prompt is
+     * too long"; a seed that does overflow is retried at half size anyway.
+     */
+    seedBudgetChars: z.number().int().min(0).default(0),
+    seedCharsPerToken: z.number().positive().default(2),
+    seedWindowFraction: z.number().gt(0).lt(1).default(0.7),
+    /**
+     * Hand the conversation to backends that can take it in their own form
+     * (#387) — Claude and Codex fork their own conversation at the turn, or
+     * take native history codeoid builds — instead of the transcript above.
+     * The transcript is still the fallback. Off = transcript everywhere.
+     */
+    nativeContinuation: z.boolean().default(true),
   })
   .default({
     turnStallTimeoutMs: 300_000,
     mcpToolTimeoutMs: 120_000,
     attachTailBytes: 512 * 1024,
     resumeMaxSessions: 200,
+    seedBudgetChars: 0,
+    seedCharsPerToken: 2,
+    seedWindowFraction: 0.7,
+    nativeContinuation: true,
   })
   // Enforce the "SDK signals first" contract across BOTH fields — not just the
   // defaults. An env override / config file could otherwise set the MCP timeout
@@ -584,6 +610,35 @@ const DispatchSchema = z
     maxConcurrentWorkers: 2,
     workerToolBudget: 50,
     retryBaseMs: 15_000,
+  });
+
+/**
+ * Routines (docs/routines.md): scheduled and triggered agent runs. On by
+ * default — the engine does nothing until a routine exists, and every routine
+ * is created explicitly by its owner. The kill switch stops every routine at
+ * once without deleting any.
+ */
+const RoutinesSchema = z
+  .object({
+    enabled: z.boolean().default(true),
+    /** Scheduler cadence (ms). Fires land within about this of their time. */
+    tickMs: z.number().int().min(250).max(60_000).default(1_000),
+    /** Runs executing at once across all routines; the rest wait queued. */
+    maxConcurrentRuns: z.number().int().min(1).max(50).default(2),
+    /** Floor for `every` intervals and cron frequency, in seconds. */
+    minIntervalSeconds: z.number().int().min(60).max(86_400).default(60),
+    /** API fires accepted per routine per hour. */
+    apiFiresPerHour: z.number().int().min(1).max(10_000).default(30),
+    /** A scheduled fire later than this (the daemon was down) counts as missed. */
+    missedGraceSeconds: z.number().int().min(10).max(86_400).default(120),
+  })
+  .default({
+    enabled: true,
+    tickMs: 1_000,
+    maxConcurrentRuns: 2,
+    minIntervalSeconds: 60,
+    apiFiresPerHour: 30,
+    missedGraceSeconds: 120,
   });
 
 /**
@@ -848,7 +903,7 @@ export function resolveQwenBaseUrl(value: string | undefined): string | undefine
  * `url` (streamable-HTTP). `codeoid_memory` is a built-in entry and is NOT
  * declarable here.
  */
-const McpServerSchema = z
+export const McpServerSchema = z
   .object({
     // ── transport (inferred) ──
     /** stdio: launch this command. Mutually exclusive with `url`. */
@@ -1069,6 +1124,7 @@ const RootSchema = z.object({
   conductor: ConductorSchema,
   dispatch: DispatchSchema,
   mcpControl: McpControlSchema,
+  routines: RoutinesSchema,
   collaboration: CollaborationSchema,
   rateLimit: RateLimitSchema,
   pipeline: PipelineSchema,
@@ -1105,6 +1161,9 @@ type ParsedConfig = z.infer<typeof RootSchema>;
  * Flattened, path-resolved config consumed by the daemon + client. Shape is
  * append-only — add new fields here, don't rename existing ones.
  */
+/** Parsed `routines` block (see RoutinesSchema). */
+export type RoutinesConfigBlock = z.infer<typeof RoutinesSchema>;
+
 /** Parsed `mcpControl` block (see McpControlSchema). */
 export type McpControlConfig = z.infer<typeof McpControlSchema>;
 
@@ -1219,6 +1278,14 @@ export interface CodeoidConfig {
       maxUntrackedBytes?: number;
       waitMs?: number;
     };
+    /** Hard cap (chars) on the history seed a fork / backend switch prepends to the first prompt. 0 or omitted = computed from the target window. */
+    seedBudgetChars?: number;
+    /** Chars-per-token used to size the history seed against the target window. Defaults to 2 when omitted. */
+    seedCharsPerToken?: number;
+    /** Fraction (0..1) of the target window the history seed may fill. Defaults to 0.7 when omitted. */
+    seedWindowFraction?: number;
+    /** Continue forks / switches / rewinds in the backend's own conversation where it can (#387). Default true. */
+    nativeContinuation?: boolean;
   };
   /**
    * The per-tenant conductor session (fleet supervisor). Optional in the
@@ -1259,6 +1326,11 @@ export interface CodeoidConfig {
    * type so hand-built test configs stay minimal; absent = disabled.
    */
   mcpControl?: McpControlConfig;
+  /**
+   * Routines (see RoutinesSchema). Optional in the type so hand-built test
+   * configs stay minimal; absent = the defaults (enabled).
+   */
+  routines?: RoutinesConfigBlock;
   dispatch?: {
     enabled: boolean;
     tickMs: number;
@@ -1445,6 +1517,10 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   // Control-plane MCP switches — per-invocation, e.g. a CI runner that turns
   // the endpoint on for one job. The rest of the block is file-config only.
   { env: "CODEOID_MCP_CONTROL_ENABLED", path: "mcpControl.enabled", kind: "boolean" },
+  // Routines kill switch — stop every routine for one run of the daemon
+  // without touching config.json (nothing is deleted). Other knobs: file only.
+  { env: "CODEOID_ROUTINES_ENABLED", path: "routines.enabled", kind: "boolean" },
+  { env: "CODEOID_ROUTINES_MAX_CONCURRENT", path: "routines.maxConcurrentRuns", kind: "int" },
   { env: "CODEOID_MCP_CONTROL_ACTIONS", path: "mcpControl.allowActions", kind: "boolean" },
   { env: "CODEOID_MAX_SESSIONS_PER_USER", path: "rateLimit.maxSessionsPerUser", kind: "int" },
   { env: "CODEOID_MAX_SESSIONS_PER_HOUR", path: "rateLimit.maxCreationsPerHour", kind: "int" },
@@ -1469,6 +1545,10 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   { env: "CODEOID_TURN_STALL_TIMEOUT_MS", path: "session.turnStallTimeoutMs", kind: "int" },
   { env: "CODEOID_MCP_TOOL_TIMEOUT_MS", path: "session.mcpToolTimeoutMs", kind: "int" },
   { env: "CODEOID_RESUME_MAX_SESSIONS", path: "session.resumeMaxSessions", kind: "int" },
+  { env: "CODEOID_SEED_BUDGET_CHARS", path: "session.seedBudgetChars", kind: "int" },
+  { env: "CODEOID_SEED_CHARS_PER_TOKEN", path: "session.seedCharsPerToken", kind: "float" },
+  { env: "CODEOID_SEED_WINDOW_FRACTION", path: "session.seedWindowFraction", kind: "float" },
+  { env: "CODEOID_NATIVE_CONTINUATION", path: "session.nativeContinuation", kind: "boolean" },
   // Embed-SSO trusted framing origins (comma-separated). Each is an exact
   // origin (scheme://host[:port]) permitted to frame the web UI and hand it a
   // credential via the URL hash. Empty ⇒ hash handoff disabled (safe default).
@@ -1678,6 +1758,7 @@ export function loadConfig(opts: LoadOptions = {}): CodeoidConfig {
     conductor: parsed.conductor,
     dispatch: parsed.dispatch,
     mcpControl: parsed.mcpControl,
+    routines: parsed.routines,
     collaboration: parsed.collaboration,
     rateLimit: parsed.rateLimit,
     pipeline: parsed.pipeline,
@@ -1790,14 +1871,23 @@ export function validateConfigObject(
  */
 export function atomicWrite(path: string, contents: string, mode: number): void {
   mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.tmp`;
-  writeFileSync(tmp, contents, { encoding: "utf8", mode });
+  // A fresh name created exclusively (`wx`): a leftover or planted `.tmp` —
+  // possibly world-readable, possibly a symlink — is never written through,
+  // and two concurrent writers never share one. `mode` applies at creation, so
+  // a secret is never on disk with wider permissions, even briefly.
+  const tmp = `${path}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  writeFileSync(tmp, contents, { encoding: "utf8", mode, flag: "wx" });
   try {
     chmodSync(tmp, mode);
   } catch {
     /* best-effort on platforms without POSIX perms */
   }
-  renameSync(tmp, path);
+  try {
+    renameSync(tmp, path);
+  } catch (err) {
+    rmSync(tmp, { force: true });
+    throw err;
+  }
 }
 
 /** Read `config.json` as a raw object (empty object if absent). Throws if the

@@ -12,8 +12,9 @@
  *   - in-process — codeoid_memory: tools run against the live engine, no socket;
  *   - stdio      — a local subprocess speaking JSON-RPC (reuses the shared
  *                  StdioJsonRpcProcess transport);
- *   - http       — streamable-HTTP: JSON-RPC over POST (single-JSON or a one-shot
- *                  SSE frame), bearer read from an env-var name, never argv.
+ *   - http       — streamable-HTTP through the official SDK client
+ *                  (mcp/upstream.ts, shared with the relay); a bearer read from
+ *                  an env-var name, never argv, or the tenant's OAuth token.
  *
  * Clients connect lazily on first use and are cached; a dead client is dropped
  * and recreated on the next call (simple reconnect — richer health/backoff is S6).
@@ -23,8 +24,13 @@ import { StdioJsonRpcProcess } from "../providers/jsonrpc-stdio.js";
 import { memoryToolDefs, type MemoryToolContext } from "../memory/tools.js";
 import type { MemoryEngine } from "../memory/engine.js";
 import { isOAuthServer, resolveEnvMap } from "./types.js";
-import type { McpHttpTransport, McpServerSpec, McpStdioTransport } from "./types.js";
+import type { McpServerSpec, McpStdioTransport } from "./types.js";
+import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { ResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import { McpSignInRequired, type McpCredentialSource, type McpTenant } from "./oauth.js";
+import type { McpProxy } from "./proxy.js";
+import { cleanMcpError } from "./redact.js";
+import { closeUpstream, FailureStreak, McpServerWantsSignIn, openUpstream, sessionGone, sessionTrouble, type UpstreamBearer, type UpstreamOptions } from "./upstream.js";
 
 /** A tool as codeoid surfaces it to a backend (bare name; the canonical
  *  `mcp__<server>__<tool>` form is applied by the mounters, not here). */
@@ -52,6 +58,10 @@ interface McpClient {
   listTools(): Promise<McpToolDef[]>;
   callTool(tool: string, args: Record<string, unknown>, scope: McpCallScope): Promise<McpCallResult>;
   close(): void;
+  /** Whether this failure leaves the client unusable (dropped, and remade on
+   *  next use). Absent: every failure does. A client shared by concurrent
+   *  calls says no to a failure that was one call's alone. */
+  brokenBy?(e: unknown): boolean;
 }
 
 export interface McpHubOptions {
@@ -93,17 +103,34 @@ export class McpHub {
    *  that fails to list returns [] (its tools are hidden, not presented-and-broken).
    *  An OAuth server lists with the tenant's credential, so `scope` must carry it. */
   async listTools(spec: McpServerSpec, scope?: McpCallScope): Promise<McpToolDef[]> {
+    return this.listToolsOrThrow(spec, scope).catch(() => []);
+  }
+
+  /**
+   * List a server's tools, or throw why not (not signed in, a revoked token,
+   * a server down, a timeout) — for a caller that reports the failure itself,
+   * like Claude's in-process mount (#390), where an empty list would read as a
+   * healthy server with no tools. Timed like a call.
+   */
+  async listToolsOrThrow(spec: McpServerSpec, scope?: McpCallScope): Promise<McpToolDef[]> {
+    const key = clientKey(spec, scope?.tenant);
+    let client: McpClient | undefined;
     try {
-      const client = this.#clientFor(spec, scope?.tenant);
-      const all = await client.listTools();
+      client = this.#clientFor(spec, scope?.tenant);
+      const all = await withTimeout(client.listTools(), this.#timeoutMs, `${spec.name}/tools/list`);
       const tools = spec.toolAllowlist ? all.filter((t) => spec.toolAllowlist?.includes(t.name)) : all;
-      this.#status.set(clientKey(spec, scope?.tenant), { tools: tools.map((t) => t.name) });
+      this.#status.set(key, { tools: tools.map((t) => t.name) });
+      // It answers without a sign-in now: no longer held back.
+      if (spec.transport.kind === "http" && scope?.tenant) this.#wantsSignIn.delete(signInKey(spec.transport.url, scope.tenant));
       return tools;
     } catch (e) {
-      // Not having signed in is not a fault of the server.
-      if (!(e instanceof McpSignInRequired)) this.#status.set(clientKey(spec, scope?.tenant), { tools: [], error: errMsg(e) });
-      this.#drop(clientKey(spec, scope?.tenant));
-      return [];
+      if (e instanceof McpServerWantsSignIn && spec.transport.kind === "http") this.markNeedsSignIn(spec.transport.url, scope?.tenant);
+      // Not having signed in is not a fault of the server: no health to
+      // record — and the tool list from before is gone with the credential.
+      if (e instanceof McpSignInRequired) this.#status.delete(key);
+      else this.#status.set(key, { tools: [], error: cleanMcpError(errMsg(e)) });
+      if (client) this.#dropIfBroken(key, e, client);
+      throw e;
     }
   }
 
@@ -123,19 +150,27 @@ export class McpHub {
     try {
       client = this.#clientFor(spec, scope.tenant);
     } catch (e) {
-      return { text: `mcp: ${spec.name} unavailable: ${errMsg(e)}`, isError: true };
+      return { text: `mcp: ${spec.name} unavailable: ${cleanMcpError(errMsg(e))}`, isError: true };
     }
     try {
       return await withTimeout(client.callTool(tool, args, scope), this.#timeoutMs, `${spec.name}/${tool}`);
     } catch (e) {
-      this.#drop(clientKey(spec, scope.tenant)); // reconnect on next use
+      if (e instanceof McpServerWantsSignIn && spec.transport.kind === "http") {
+        this.markNeedsSignIn(spec.transport.url, scope.tenant);
+        this.#dropIfBroken(clientKey(spec, scope.tenant), e, client);
+        return { text: e.message, isError: true };
+      }
+      this.#dropIfBroken(clientKey(spec, scope.tenant), e, client); // reconnect on next use
       if (e instanceof McpSignInRequired) return { text: e.message, isError: true };
       // codeoid has no OTEL; a failed external tool call is worth one daemon log
       // line (transport error / timeout) so a flaky server is diagnosable.
-      console.error(`[codeoid] mcp: ${spec.name}/${tool} failed: ${errMsg(e)}`);
+      // A transport error can quote the URL or a server's stderr: cleaned
+      // before it reaches the log, the model or the transcript.
+      const error = cleanMcpError(errMsg(e));
+      console.error(`[codeoid] mcp: ${spec.name}/${tool} failed: ${error}`);
       const key = clientKey(spec, scope.tenant);
-      this.#status.set(key, { tools: this.#status.get(key)?.tools ?? [], error: errMsg(e) });
-      return { text: `Error calling ${spec.name}/${tool}: ${errMsg(e)}`, isError: true };
+      this.#status.set(key, { tools: this.#status.get(key)?.tools ?? [], error });
+      return { text: `Error calling ${spec.name}/${tool}: ${error}`, isError: true };
     }
   }
 
@@ -147,10 +182,115 @@ export class McpHub {
     return this.#status.get(tenantKey(name, tenant));
   }
 
+  /**
+   * Whether calls to this server can be made as `tenant` now: always for a
+   * server without OAuth; for an OAuth one, only once the tenant has signed in
+   * (a stored credential, no network call). Lets a backend that lists a
+   * server's tools up front leave out one that would only fail.
+   */
+  signedIn(spec: McpServerSpec, tenant: McpTenant | undefined): boolean {
+    if (!isOAuthServer(spec)) return true;
+    if (!tenant || !this.#credentials?.signedIn) return false;
+    return this.#credentials.signedIn(spec, tenant);
+  }
+
+  /** Changes whenever the tenant's credential for an OAuth server does; "" for
+   *  a server without OAuth, undefined when not signed in. */
+  credentialStamp(spec: McpServerSpec, tenant: McpTenant | undefined): string | undefined {
+    if (!isOAuthServer(spec)) return "";
+    if (!tenant) return undefined;
+    return this.#credentials?.credentialStamp?.(spec, tenant);
+  }
+
+  /**
+   * Record what another path to a server observed (the relay, #396), so
+   * Settings shows one status per server whichever path used it: its tools
+   * after a listing, or the last error (keeping the tools known before).
+   */
+  noteStatus(spec: McpServerSpec, tenant: McpTenant | undefined, status: { tools?: string[]; error?: string; signedOut?: boolean }): void {
+    const key = clientKey(spec, tenant);
+    // Not signed in is no fault of the server: no health, and no tools from before.
+    if (status.signedOut) this.#status.delete(key);
+    else if (status.tools) this.#status.set(key, { tools: status.tools });
+    else this.#status.set(key, { tools: this.#status.get(key)?.tools ?? [], ...(status.error ? { error: status.error } : {}) });
+  }
+
+  /**
+   * Plain HTTP servers that answered with the MCP sign-in challenge (#395), per
+   * tenant: held back from that tenant's backends that would only get 401s.
+   * A mark lasts ten minutes (then the server is tried again), and goes as
+   * soon as the server answers.
+   */
+  readonly #wantsSignIn = new Map<string, number>();
+
+  /** Whether the plain HTTP server at `url` has asked `tenant` for an OAuth sign-in. */
+  needsSignIn(url: string, tenant: McpTenant | undefined): boolean {
+    if (!tenant) return false;
+    const key = signInKey(url, tenant);
+    const until = this.#wantsSignIn.get(key);
+    if (until === undefined) return false;
+    if (until > Date.now()) return true;
+    this.#wantsSignIn.delete(key);
+    return false;
+  }
+
+  /** Note that the server at `url` asked `tenant` for a sign-in (here, or as Claude saw it). */
+  markNeedsSignIn(url: string, tenant: McpTenant | undefined): void {
+    if (tenant) this.#wantsSignIn.set(signInKey(url, tenant), Date.now() + SIGN_IN_HOLD_MS);
+  }
+
+  /** Sessions using each session-specific server (a workdir one, or a session's
+   *  snapshot of a global one): its client closes when the last lets go. */
+  readonly #users = new Map<string, number>();
+
+  /** A session now uses this server. */
+  retain(spec: McpServerSpec, tenant: McpTenant | undefined): void {
+    const key = clientKey(spec, tenant);
+    this.#users.set(key, (this.#users.get(key) ?? 0) + 1);
+  }
+
+  /** A session no longer uses this server: the last to let go closes its client. */
+  release(spec: McpServerSpec, tenant: McpTenant | undefined): void {
+    const key = clientKey(spec, tenant);
+    const n = (this.#users.get(key) ?? 0) - 1;
+    if (n > 0) {
+      this.#users.set(key, n);
+      return;
+    }
+    this.#users.delete(key);
+    this.#drop(key);
+  }
+
+  /** How native backends that own their MCP clients reach this daemon's OAuth
+   *  servers (Codex, the Gemini CLI, Qwen — mcp/proxy.ts); unset when the
+   *  daemon serves no relay. */
+  proxy: McpProxy | null = null;
+
   /** Whether a live client is currently held for this server (for `tenant`,
    *  for an OAuth server). */
   hasClient(name: string, tenant?: McpTenant): boolean {
     return this.#clients.has(tenantKey(name, tenant));
+  }
+
+  /**
+   * What Settings shows for a registry server, as `viewer` sees it: its own
+   * client — or, for one of Claude's global servers, which sessions reach
+   * through their own snapshot of it (#395), what the viewer's sessions'
+   * clients of that name have seen.
+   */
+  observed(spec: McpServerSpec, viewer: McpTenant): { status: { tools: string[]; error?: string } | undefined; connected: boolean } {
+    const tenant = isOAuthServer(spec) ? viewer : undefined;
+    const own = { status: this.statusFor(spec.name, tenant), connected: this.hasClient(spec.name, tenant) };
+    if (own.status || own.connected || spec.origin !== "claude-global") return own;
+    // A session's snapshot of this global server — not a workdir server of the same name.
+    const prefix = `${spec.name}\u0001`;
+    const suffix = tenantKey("\u0001claude-global", viewer);
+    const mine = (key: string) => key.startsWith(prefix) && key.endsWith(suffix);
+    const statuses = [...this.#status].filter(([k]) => mine(k)).map(([, v]) => v);
+    return {
+      status: statuses.find((st) => !st.error) ?? statuses[0],
+      connected: [...this.#clients.keys()].some(mine),
+    };
   }
 
   /** Tear down every client (daemon stop / registry reload). */
@@ -162,13 +302,19 @@ export class McpHub {
   /** Drop one server's clients — every tenant's (registry edit / removal). */
   drop(name: string): void {
     for (const key of [...this.#clients.keys()]) {
-      if (key === name || key.startsWith(`${name}\u0000`)) this.#drop(key);
+      if (key === name || key.startsWith(`${name}\u0000`) || key.startsWith(`${name}\u0001`)) this.#drop(key);
     }
   }
 
   /** Drop one tenant's client for a server (it signed out or back in). */
   dropTenant(name: string, tenant: McpTenant): void {
     this.#drop(tenantKey(name, tenant));
+  }
+
+  /** Drop `client` if this failure broke it — and only if it is still the
+   *  one held: a newer client, opened since, isn't the one that failed. */
+  #dropIfBroken(key: string, e: unknown, client: McpClient): void {
+    if (this.#clients.get(key) === client && (client.brokenBy?.(e) ?? true)) this.#drop(key);
   }
 
   #drop(key: string): void {
@@ -199,13 +345,11 @@ export class McpHub {
       case "stdio":
         return new StdioMcpClient(spec.name, spec.transport, this.#env);
       case "http": {
-        if (!isOAuthServer(spec)) return new HttpMcpClient(spec.name, spec.transport, this.#env);
+        const base = { name: spec.name, transport: spec.transport, env: this.#env };
+        if (!isOAuthServer(spec)) return new HttpMcpClient(base, this.#timeoutMs);
         const credentials = this.#credentials;
         if (!credentials || !tenant) throw new McpSignInRequired(spec.name);
-        return new HttpMcpClient(spec.name, spec.transport, this.#env, {
-          token: () => credentials.accessToken(spec, tenant),
-          rejected: (token) => credentials.rejected(spec, tenant, token),
-        });
+        return new HttpMcpClient({ ...base, oauth: upstreamBearer(credentials, spec, tenant) }, this.#timeoutMs);
       }
     }
   }
@@ -265,7 +409,7 @@ class StdioMcpClient implements McpClient {
       command: this.#transport.command,
       args: this.#transport.args,
       name: this.#name,
-      cwd: this.#env.HOME ?? process.cwd(),
+      cwd: this.#transport.cwd ?? this.#env.HOME ?? process.cwd(),
       env,
       onNotification: () => {}, // MCP servers may notify (progress/log) — ignored for now
       onServerRequest: async () => {
@@ -316,122 +460,113 @@ class StdioMcpClient implements McpClient {
 
 // ── streamable-HTTP ──────────────────────────────────────────────────────────
 
+/** A remote server, through the daemon's one upstream client (mcp/upstream.ts). */
 class HttpMcpClient implements McpClient {
-  readonly #name: string;
-  readonly #transport: McpHttpTransport;
-  readonly #env: Record<string, string | undefined>;
-  #id = 0;
-  #sessionId: string | null = null;
-  #initialized: Promise<void> | null = null;
+  readonly #opts: UpstreamOptions;
+  readonly #timeoutMs: number;
+  #client: Promise<Client> | null = null;
 
-  readonly #oauth: OAuthBearer | undefined;
-
-  constructor(
-    name: string,
-    transport: McpHttpTransport,
-    env: Record<string, string | undefined>,
-    oauth?: OAuthBearer,
-  ) {
-    this.#name = name;
-    this.#transport = transport;
-    this.#env = env;
-    this.#oauth = oauth;
+  constructor(opts: UpstreamOptions, timeoutMs: number) {
+    this.#opts = opts;
+    this.#timeoutMs = timeoutMs;
   }
 
-  /** Headers for one request; `token` is the OAuth bearer, when there is one. */
-  #headers(token: string | undefined): Record<string, string> {
-    const h: Record<string, string> = {
-      "Content-Type": "application/json",
-      Accept: "application/json, text/event-stream",
-      ...this.#transport.headers,
-    };
-    if (token) {
-      h.Authorization = `Bearer ${token}`;
-    } else if (this.#transport.bearerTokenEnv) {
-      const envToken = this.#env[this.#transport.bearerTokenEnv];
-      if (envToken) h.Authorization = `Bearer ${envToken}`;
+  readonly #streak = new FailureStreak();
+
+  #connect(): Promise<Client> {
+    if (!this.#client) {
+      const connecting = openUpstream({ ...this.#opts, timeoutMs: this.#timeoutMs });
+      this.#client = connecting;
+      // A failed handshake isn't kept: the next call tries again.
+      connecting.catch(() => {
+        if (this.#client === connecting) this.#client = null;
+      });
     }
-    if (this.#sessionId) h["Mcp-Session-Id"] = this.#sessionId;
-    return h;
-  }
-
-  /** The OAuth bearer for the next request; throws when the tenant must sign in. */
-  async #token(): Promise<string | undefined> {
-    if (!this.#oauth) return undefined;
-    const token = await this.#oauth.token();
-    if (!token) throw new McpSignInRequired(this.#name);
-    return token;
-  }
-
-  /** POST once, and once more with a refreshed token if the server rejects it.
-   *  An OAuth request follows no redirect: the token is bound to this URL and
-   *  must not be replayed to wherever a redirect points. */
-  async #post(body: string): Promise<Response> {
-    const redirect = this.#oauth ? ("error" as const) : ("follow" as const);
-    const token = await this.#token();
-    const resp = await fetch(this.#transport.url, { method: "POST", headers: this.#headers(token), body, redirect });
-    if (resp.status !== 401 || !this.#oauth || !token) return resp;
-    this.#oauth.rejected(token);
-    const retry = await this.#token();
-    return fetch(this.#transport.url, { method: "POST", headers: this.#headers(retry), body, redirect });
-  }
-
-  async #rpc(method: string, params: Record<string, unknown>): Promise<unknown> {
-    const id = ++this.#id;
-    const resp = await this.#post(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
-    const sid = resp.headers.get("mcp-session-id");
-    if (sid) this.#sessionId = sid;
-    if (resp.status === 401 && this.#oauth) throw new McpSignInRequired(this.#name);
-    if (!resp.ok) throw new Error(`HTTP ${resp.status} from ${this.#name}`);
-    const frame = parseJsonRpc(await resp.text());
-    if (frame.error) throw new Error(frame.error.message ?? `${this.#name} JSON-RPC error`);
-    return frame.result;
-  }
-
-  async #handshake(): Promise<void> {
-    if (!this.#initialized) {
-      this.#initialized = (async () => {
-        await this.#rpc("initialize", {
-          protocolVersion: MCP_PROTOCOL_VERSION,
-          capabilities: {},
-          clientInfo: MCP_CLIENT_INFO,
-        });
-        // notifications/initialized is a notification (no id) → 202, no body.
-        await this.#post(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })).catch(() => {});
-      })();
-    }
-    return this.#initialized;
+    return this.#client;
   }
 
   async listTools(): Promise<McpToolDef[]> {
-    await this.#handshake();
-    const res = (await this.#rpc("tools/list", {})) as { tools?: RawTool[] };
-    return (res.tools ?? []).map(toToolDef);
+    const client = await this.#connect();
+    const tools: McpToolDef[] = [];
+    let cursor: string | undefined;
+    const seen = new Set<string>();
+    // Read loosely, as before the SDK client: one tool with an odd schema
+    // mustn't hide all of a server's tools (the SDK's listTools validates
+    // every one strictly).
+    do {
+      const page = (await client.request(
+        { method: "tools/list", params: cursor ? { cursor } : {} },
+        ResultSchema,
+        { timeout: this.#timeoutMs },
+      )) as { tools?: unknown; nextCursor?: unknown };
+      if (Array.isArray(page.tools)) {
+        tools.push(...(page.tools as RawTool[]).filter((t) => typeof t === "object" && t !== null && typeof t.name === "string").map(toToolDef));
+      }
+      cursor = typeof page.nextCursor === "string" ? page.nextCursor : undefined;
+      // A server repeating a cursor would page forever.
+      if (cursor !== undefined && seen.has(cursor)) break;
+      if (cursor !== undefined) seen.add(cursor);
+    } while (cursor && tools.length < MAX_TOOLS && seen.size < MAX_PAGES);
+    this.#streak.succeeded();
+    return tools;
   }
 
   async callTool(tool: string, args: Record<string, unknown>): Promise<McpCallResult> {
-    await this.#handshake();
-    const res = (await this.#rpc("tools/call", { name: tool, arguments: args })) as RawCallResult;
-    return normalizeCallResult(res);
+    const client = await this.#connect();
+    // Loosely too: the SDK's callTool also enforces a declared outputSchema,
+    // which the hub (text results) never did.
+    const res = await client.request({ method: "tools/call", params: { name: tool, arguments: args } }, ResultSchema, {
+      timeout: this.#timeoutMs,
+    });
+    this.#streak.succeeded();
+    return normalizeCallResult(res as RawCallResult);
   }
 
   close(): void {
-    this.#sessionId = null;
-    this.#initialized = null;
+    const client = this.#client;
+    this.#client = null;
+    client?.then((c) => closeUpstream(c), () => {});
+  }
+
+  /** One session serves every call to this server (for this tenant): only a
+   *  failure of the session itself ends it, never one call's error or timeout.
+   *  A sign-in needed again is the credential, not the session. */
+  brokenBy(e: unknown): boolean {
+    if (e instanceof McpSignInRequired) return false;
+    return sessionGone(e) || (sessionTrouble(e) && this.#streak.failed());
   }
 }
 
+/** Pages of tools/list read at most up to this many tools, or this many pages. */
+const MAX_TOOLS = 10_000;
+const MAX_PAGES = 100;
+
 // ── shared helpers ────────────────────────────────────────────────────────────
 
-/** How an HTTP client authenticates to an OAuth server. */
-interface OAuthBearer {
-  token(): Promise<string | undefined>;
-  rejected(token: string): void;
+/** The tenant's OAuth bearer for a server, from the credential source. */
+export function upstreamBearer(credentials: McpCredentialSource, spec: McpServerSpec, tenant: McpTenant): UpstreamBearer {
+  return {
+    token: () => credentials.accessToken(spec, tenant),
+    rejected: (token) => credentials.rejected(spec, tenant, token),
+  };
 }
 
 /** A server's client-pool key: per tenant for an OAuth server. */
 function clientKey(spec: McpServerSpec, tenant: McpTenant | undefined): string {
+  // A workdir's server (#395) is keyed by its config, its workdir and the
+  // tenant: two workdirs' "db" — or two tenants' — are different servers, and
+  // a session never reaches another's process.
+  if (spec.variant) {
+    const cwd = spec.transport.kind === "stdio" ? (spec.transport.cwd ?? "") : "";
+    return tenantKey(`${spec.name}\u0001${spec.variant}\u0001${cwd}\u0001${spec.origin ?? ""}`, tenant);
+  }
   return tenantKey(spec.name, isOAuthServer(spec) ? tenant : undefined);
+}
+
+const SIGN_IN_HOLD_MS = 10 * 60_000;
+
+function signInKey(url: string, tenant: McpTenant): string {
+  return `${tenant.accountId}\u0000${tenant.projectId}\u0000${url}`;
 }
 
 function tenantKey(name: string, tenant: McpTenant | undefined): string {
@@ -461,26 +596,14 @@ function toToolDef(t: RawTool): McpToolDef {
 
 /** Flatten an MCP tool result's content blocks into text. */
 function normalizeCallResult(res: RawCallResult): McpCallResult {
-  const text = (res.content ?? [])
-    .filter((c) => c.type === "text" || c.type === undefined)
+  // Tolerant of a server's malformed result: a throw here would read as a
+  // broken session and cut the calls beside this one.
+  const content = Array.isArray(res?.content) ? res.content : [];
+  const text = content
+    .filter((c) => typeof c === "object" && c !== null && (c.type === "text" || c.type === undefined))
     .map((c) => (typeof c.text === "string" ? c.text : ""))
     .join("");
-  return { text, isError: res.isError === true };
-}
-
-/** Parse a JSON-RPC response body — plain JSON, or a one-shot SSE `data:` frame
- *  (some streamable-HTTP servers answer with text/event-stream). */
-function parseJsonRpc(body: string): { result?: unknown; error?: { message?: string } } {
-  const trimmed = body.trim();
-  if (trimmed.startsWith("{") || trimmed.startsWith("[")) return JSON.parse(trimmed);
-  for (const line of trimmed.split("\n")) {
-    const l = line.trim();
-    if (l.startsWith("data:")) {
-      const payload = l.slice(5).trim();
-      if (payload && payload !== "[DONE]") return JSON.parse(payload);
-    }
-  }
-  throw new Error("unparseable MCP response");
+  return { text, isError: res?.isError === true };
 }
 
 function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {

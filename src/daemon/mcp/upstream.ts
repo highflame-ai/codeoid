@@ -1,0 +1,200 @@
+/**
+ * The one way the daemon opens a remote MCP server (docs/mcp-oauth-design.md
+ * §5.1): the official SDK client over streamable HTTP, with codeoid's
+ * headers, bearer and redirect policy.
+ *
+ * Two callers: the hub (tools only, for the daemon-run backends and Claude's
+ * in-process bridge) and the relay (the whole protocol, for Codex, the Gemini
+ * CLI and Qwen). Both get the same protocol handling (version negotiation,
+ * sessions, SSE, pagination) from the SDK, and the same credential handling
+ * from here.
+ */
+
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { type ClientCapabilities, ErrorCode, type Implementation, McpError } from "@modelcontextprotocol/sdk/types.js";
+import { McpSignInRequired } from "./oauth.js";
+import type { McpHttpTransport } from "./types.js";
+
+/** How an upstream request authenticates to an OAuth server. */
+export interface UpstreamBearer {
+  /** The tenant's access token, refreshed when due; undefined = sign in first. */
+  token(): Promise<string | undefined>;
+  /** The server refused this token: the next token() refreshes it. */
+  rejected(token: string): void;
+}
+
+export interface UpstreamOptions {
+  /** The server's registry name (for errors). */
+  name: string;
+  transport: McpHttpTransport;
+  /** Env `bearerTokenEnv` is read from. */
+  env: Record<string, string | undefined>;
+  /** Set for an OAuth server: the tenant's bearer. */
+  oauth?: UpstreamBearer;
+  /** Who the upstream server sees connecting (default: codeoid). */
+  clientInfo?: Implementation;
+  /** What the client declares it can do — the relay passes its backend's. */
+  capabilities?: ClientCapabilities;
+  /** Bound on the initialize handshake. */
+  timeoutMs?: number;
+  /** Injected for tests. */
+  fetchFn?: typeof fetch;
+}
+
+export const UPSTREAM_CLIENT_INFO: Implementation = { name: "codeoid", version: "1.0" };
+
+/**
+ * A server configured without OAuth answered with the MCP authorization
+ * challenge (401 + `WWW-Authenticate: Bearer …`): it wants a sign-in codeoid
+ * isn't doing for it — adopting it (#390) would (#395).
+ */
+export class McpServerWantsSignIn extends Error {
+  constructor(readonly server: string) {
+    super(`${server} wants an OAuth sign-in — adopt it ("Sign in with codeoid" in the capabilities drawer) to use it on every backend`);
+    this.name = "McpServerWantsSignIn";
+  }
+}
+
+/**
+ * Connect to `opts.transport.url` and complete the MCP handshake. Throws
+ * {@link McpSignInRequired} when an OAuth server has no usable token for the
+ * tenant (none stored, or refused and not refreshable).
+ */
+export async function openUpstream(opts: UpstreamOptions): Promise<Client> {
+  const client = new Client(opts.clientInfo ?? UPSTREAM_CLIENT_INFO, { capabilities: opts.capabilities ?? {} });
+  const transport = new StreamableHTTPClientTransport(new URL(opts.transport.url), { fetch: upstreamFetch(opts) });
+  try {
+    await client.connect(transport, opts.timeoutMs ? { timeout: opts.timeoutMs } : undefined);
+  } catch (e) {
+    await client.close().catch(() => {});
+    throw e;
+  }
+  return client;
+}
+
+/**
+ * Whether a failed request means the upstream session itself is gone — the
+ * connection closed, the server forgot the session (404), the network failed
+ * — rather than that one request failing (an error result, a timeout, a 5xx).
+ * Only then is a shared session dropped: the calls beside it go on otherwise.
+ */
+export function sessionGone(e: unknown): boolean {
+  if (e instanceof McpError) return e.code === ErrorCode.ConnectionClosed;
+  if (e instanceof StreamableHTTPError) return e.code === 404;
+  // No connection to the server: Bun's fetch fails with an error carrying a
+  // code (never a TypeError, which here would be a bug in codeoid's own code).
+  const code = (e as { code?: unknown } | null)?.code;
+  return typeof code === "string" && NETWORK_CODES.has(code);
+}
+
+const NETWORK_CODES = new Set([
+  "ConnectionRefused",
+  "ConnectionClosed",
+  "FailedToOpenSocket",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EPIPE",
+  "ETIMEDOUT",
+  "ENOTFOUND",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+]);
+
+/** Whether a failure says something about the session (a timeout, a transport
+ * error) rather than being the server's own answer (a JSON-RPC error): only
+ * those make up a streak. */
+export function sessionTrouble(e: unknown): boolean {
+  return e instanceof McpError ? e.code === ErrorCode.RequestTimeout : true;
+}
+
+/**
+ * Consecutive failures on one session — timeouts included — with no success
+ * between: past a few, the session is given up as stuck (a server that forgot
+ * it without saying 404, one that accepts calls and never answers) even
+ * though no single failure said so.
+ */
+export class FailureStreak {
+  #count = 0;
+  constructor(readonly limit = 3) {}
+  /** Note a failure; true once the streak reaches the limit. */
+  failed(): boolean {
+    this.#count++;
+    return this.#count >= this.limit;
+  }
+  succeeded(): void {
+    this.#count = 0;
+  }
+}
+
+/** End the upstream session (an HTTP DELETE, where the server keeps one) and
+ *  close — within `timeoutMs`: a server that never answers can't hold it. */
+export async function closeUpstream(client: Client, timeoutMs = 3_000): Promise<void> {
+  const transport = client.transport;
+  if (transport instanceof StreamableHTTPClientTransport && transport.sessionId) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      transport.terminateSession().catch(() => {}),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, timeoutMs);
+      }),
+    ]);
+    clearTimeout(timer);
+  }
+  await client.close().catch(() => {});
+}
+
+/**
+ * Every request the SDK transport makes, with codeoid's credentials: the
+ * server's configured headers, then the bearer — the tenant's OAuth token, or
+ * one read from `bearerTokenEnv`. An OAuth request follows no redirect (the
+ * token is bound to this URL and must not be replayed elsewhere) and, when
+ * the server rejects the token, is retried once with a refreshed one.
+ */
+export function upstreamFetch(opts: UpstreamOptions): typeof fetch {
+  const base = opts.fetchFn ?? fetch;
+  const { name, transport, env, oauth } = opts;
+  const send = (url: string | URL | Request, init: RequestInit | undefined, token: string | undefined): Promise<Response> => {
+    const headers = new Headers(init?.headers);
+    // What the SDK sets (session id, protocol version, accept) wins over config.
+    for (const [k, v] of Object.entries(transport.headers ?? {})) if (!headers.has(k)) headers.set(k, v);
+    if (token) headers.set("Authorization", `Bearer ${token}`);
+    else if (transport.bearerTokenEnv && env[transport.bearerTokenEnv]) {
+      headers.set("Authorization", `Bearer ${env[transport.bearerTokenEnv]}`);
+    }
+    return base(url, { ...init, headers, ...(oauth ? { redirect: "error" as const } : {}) });
+  };
+  const bearer = async (): Promise<string> => {
+    const token = await oauth!.token();
+    if (!token) throw new McpSignInRequired(name);
+    return token;
+  };
+  const wrapped = async (url: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    if (!oauth) {
+      const resp = await send(url, init, undefined);
+      // The MCP sign-in challenge (a resource-metadata pointer), to a server
+      // given no credentials of its own: a 401 for a static token that expired
+      // is that token's problem, not a sign-in to adopt.
+      const challenge = resp.headers.get("www-authenticate") ?? "";
+      const credentialed = transport.bearerTokenEnv !== undefined || Object.keys(transport.headers ?? {}).some((k) => k.toLowerCase() === "authorization");
+      if (resp.status === 401 && !credentialed && /^\s*Bearer\b/i.test(challenge) && /resource_metadata\s*=/i.test(challenge)) {
+        await resp.body?.cancel().catch(() => {});
+        throw new McpServerWantsSignIn(name);
+      }
+      return resp;
+    }
+    const token = await bearer();
+    const resp = await send(url, init, token);
+    if (resp.status !== 401) return resp;
+    await resp.body?.cancel().catch(() => {});
+    oauth.rejected(token);
+    const again = await send(url, init, await bearer());
+    if (again.status === 401) {
+      await again.body?.cancel().catch(() => {});
+      throw new McpSignInRequired(name);
+    }
+    return again;
+  };
+  return Object.assign(wrapped, { preconnect: base.preconnect }) as typeof fetch;
+}

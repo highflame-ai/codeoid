@@ -24,7 +24,10 @@
 
 import { AsyncQueue } from "../../async-queue.js";
 import type {
+  BackendMcpServerState,
   ModelInfo,
+  NativeContinuationRequest,
+  NativeContinuationResult,
   NormalizedTurnResult,
   ProviderEvent,
   SessionProvider,
@@ -112,6 +115,38 @@ export class MockSessionProvider implements SessionProvider {
   supportsMemoryTools = false;
   /** Blocks captured by seedText() — the compact session-map seed path. */
   readonly seededText: string[] = [];
+  /**
+   * MCP reconnect (#389), off unless a test installs it with scriptMcp(): the
+   * session redials backend servers through it. Calls are recorded.
+   */
+  reconnectMcpServer?: (name: string) => Promise<BackendMcpServerState | null>;
+  readonly mcpReconnects: string[] = [];
+  scriptMcp(answer: (name: string) => BackendMcpServerState | null): void {
+    this.reconnectMcpServer = async (name) => {
+      this.mcpReconnects.push(name);
+      return answer(name);
+    };
+  }
+
+  /**
+   * Native continuation (#387), off unless a test installs it: set this to a
+   * function and the session tries it before the transcript seed. Requests
+   * are recorded in `nativeRequests`; a returned `backingId` is adopted.
+   */
+  continueNatively?: (req: NativeContinuationRequest) => Promise<NativeContinuationResult | null>;
+  readonly nativeRequests: NativeContinuationRequest[] = [];
+  /** Install a scripted native continuation that records each request. */
+  scriptNative(answer: (req: NativeContinuationRequest) => NativeContinuationResult | null | Promise<NativeContinuationResult | null>): void {
+    this.continueNatively = async (req) => {
+      this.nativeRequests.push(req);
+      const r = await answer(req);
+      if (r?.backingId) {
+        this.#backingSessionId = r.backingId;
+        this.#hasQueried = true;
+      }
+      return r;
+    };
+  }
 
   /** When true, TurnRuns expose pushMidTurn (recorded in `midTurnPushes`). */
   #midTurn: boolean;

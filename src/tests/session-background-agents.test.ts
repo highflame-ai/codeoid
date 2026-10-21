@@ -631,6 +631,42 @@ describe("a self-continuing backend's wake", () => {
   });
 });
 
+describe("the secret-path gate (secret-paths.ts)", () => {
+  it("refuses a read of a credential file and never auto-runs a search above one, in guarded mode", async () => {
+    const saved = process.env.XDG_CONFIG_HOME;
+    process.env.XDG_CONFIG_HOME = join(tmp, "xdg");
+    try {
+      const { session, provider } = makeSession([[done()]], { continues: true });
+      session.attach(recordingClient());
+      await session.send("go", AUTH);
+      await waitFor(() => session.status === "idle");
+      const push = provider.startOwnTurn([text("continuing")]);
+      await waitFor(() => provider.boundGates.length === 1);
+      const gate = provider.boundGates[0]!;
+
+      const read = await gate.canUseTool(randomUUID(), randomUUID(), "Read", {
+        file_path: join(tmp, "xdg", "codeoid", "claude-accounts.json"),
+      });
+      expect(read.behavior).toBe("deny");
+      expect((await gate.canUseTool(randomUUID(), randomUUID(), "Read", { file_path: "/proc/self/environ" })).behavior).toBe("deny");
+      // An ordinary read still runs unprompted.
+      expect((await gate.canUseTool(randomUUID(), randomUUID(), "Read", { file_path: "x" })).behavior).toBe("allow");
+
+      // A search over the config dir's parent parks for the owner instead.
+      let decided: string | undefined;
+      void gate.canUseTool(randomUUID(), randomUUID(), "Grep", { pattern: "sk-ant", path: join(tmp, "xdg") }).then((r) => {
+        decided = r.behavior;
+      });
+      await waitFor(() => session.status === "waiting_approval");
+      expect(decided).toBeUndefined();
+      push(done());
+    } finally {
+      if (saved === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = saved;
+    }
+  });
+});
+
 describe("the wake body", () => {
   it("keeps a digest from forging task rows or closing the block", async () => {
     const { session, provider, fire } = makeSession([[done()], [done()]]);

@@ -25,9 +25,13 @@ import type { HookBus } from "./hooks/bus.js";
 import type { Store } from "./store.js";
 import { createPushTransport, PushService } from "./push/index.js";
 import { hasScope, SCOPES } from "../protocol/scopes.js";
-import { applyPatches, getManifest, getSnapshot, previewPatches } from "./settings/store.js";
+import { applyPatches, getManifest, getSnapshot, previewPatches, readMcpServerEntry, writeMcpServerEntry } from "./settings/store.js";
+import { adoptability, adoptableName, adoptedEntry, adoptionRefusal, claudeMcpServers, fromRepoFile, fullUrlRequired, isSameAdoption, shellArg } from "./mcp/adopt.js";
+import { readWorkdirServers } from "./mcp/workdir-servers.js";
+import { cleanMcpError, commandSummary, MAX_SHOWN_KEYS, quotedVisible, redactMcpUrl, serverProgram, shownLabel, visibleCompact, visibleVerbatim } from "./mcp/redact.js";
 import { canonicalFromTranscript, turnIndexFromHistory } from "./canonical-restore.js";
 import { BackendLoginBroker, BackendLoginError, redact } from "./auth/backend-login.js";
+import { ClaudeAccountError, ClaudeAccountStore, validateAccountName } from "./claude-accounts.js";
 import { RateLimiter } from "./rate-limit.js";
 import type { TranscriptMeta, TranscriptStore } from "./transcript.js";
 import {
@@ -113,12 +117,14 @@ import type { McpRegistry } from "./mcp/registry.js";
 import { redactCommand } from "./skill-command.js";
 import type { McpHub } from "./mcp/hub.js";
 import { mcpOAuthBindingCookieName, type McpOAuth, type McpOAuthProof, type McpTenant } from "./mcp/oauth.js";
-import { isOAuthServer, type McpServerSpec, NATIVE_MOUNT_BACKENDS } from "./mcp/types.js";
+import { isOAuthServer, type McpServerSpec, OAUTH_UNSUPPORTED_BACKENDS } from "./mcp/types.js";
 import { type CodeoidConfig, DEFAULT_PROVIDER_ENV, loadConfig, mutateConfigFile, validateConfigObject } from "../config.js";
 import type { CompressionRegistry } from "./compress/index.js";
 import { ORCHESTRATOR_ROLE } from "../protocol/types.js";
 import type {
   AuthContext,
+  ClaudeConfigMcpServer,
+  McpApprovePreview,
   ClientMessage,
   CollaborationConfig,
   CollaborationCost,
@@ -147,6 +153,11 @@ import { blockingOf, openFindings, renderLedger } from "./pipeline/findings.js";
  *  user watches + can interrupt — nothing hangs headless. */
 const PIPELINE_PHASE_MAX_TURNS = 200;
 import { randomUUID } from "node:crypto";
+import { RoutineError, RoutineService, type RoutineHost } from "./routines/service.js";
+import { RoutineStore } from "./routines/store.js";
+import type { RoutineRow } from "./routines/types.js";
+import { toRoutineWire, toRunWire } from "./routines/wire.js";
+import { routineFirePath } from "../protocol/types.js";
 import {
   createForkWorktree,
   currentBranch,
@@ -371,7 +382,11 @@ export class SessionManager {
   #mcpOAuth?: McpOAuth;
   /** In-flight interactive backend sign-ins. Daemon-wide, and at most one per
    *  backend — two live logins would race to write the same credential. */
-  readonly #backendLogin = new BackendLoginBroker();
+  readonly #backendLogin: BackendLoginBroker;
+  /** Claude accounts (claude-accounts.ts) — shared by every session. */
+  #claudeAccounts!: ClaudeAccountStore;
+  /** Logins started for a NAMED Claude account: loginId → account name. */
+  readonly #accountLogins = new Map<string, string>();
   /** Live model catalogs by provider id (via each backend's supportedModels
    *  equivalent), cached daemon-wide once any session of that provider
    *  initializes. Empty until then. */
@@ -407,6 +422,8 @@ export class SessionManager {
   #pushService: PushService;
   /** SDLC pipeline manager — undefined when the pipeline is disabled (default). */
   #pipelines?: PipelineManager;
+  /** Routines (docs/routines.md); undefined when `routines.enabled` is off. */
+  #routines?: RoutineService;
   /** Pack curation surface (registries + install/trust/select) — always present,
    *  so packs can be managed even before the pipeline runtime is enabled. */
   #packs: PackService;
@@ -422,6 +439,7 @@ export class SessionManager {
   /** Stable observer identity — every Session reports status transitions here. */
   #statusObserver = (sessionId: string, status: SessionInfo["status"]): void => {
     this.#dispatcher.onSessionStatus(sessionId, status);
+    this.#routines?.onSessionStatus(sessionId);
     // Content-blind push: a session that just blocked on approval alerts its
     // owner's registered devices off-LAN. Fire-and-forget — a push hiccup must
     // never touch the status path (the emit itself only ever sees an opaque
@@ -492,6 +510,10 @@ export class SessionManager {
        * subprocess. Mirrors SessionCreateOptions._testProvider.
        */
       _testProviderFactory?: () => SessionProvider;
+      /** Claude account store (claude-accounts.ts). Default: `<configDir>/claude-accounts.json`. */
+      claudeAccounts?: ClaudeAccountStore;
+      /** Test-only: a login broker driving a fake login command. */
+      _testBackendLogin?: BackendLoginBroker;
     },
   ) {
     this.#store = store;
@@ -505,6 +527,8 @@ export class SessionManager {
     this.#providers = opts?.providers ?? createDefaultProviderRegistry(opts?.config);
     this.#hooks = opts?.hooks;
     this.#testProviderFactory = opts?._testProviderFactory;
+    this.#claudeAccounts = opts?.claudeAccounts ?? new ClaudeAccountStore();
+    this.#backendLogin = opts?._testBackendLogin ?? new BackendLoginBroker();
     this.#dispatcher = new Dispatcher(store, this.#makeDispatcherHost(), {
       ...opts?.config?.dispatch,
       daemonId: opts?.daemonId,
@@ -522,6 +546,11 @@ export class SessionManager {
       runner: new SessionPhaseRunner(() => this),
       db: store.database,
     });
+    // Routines share the daemon DB. Built only when enabled, so the kill
+    // switch leaves every routine in place but nothing fires.
+    if (opts?.config?.routines?.enabled ?? true) {
+      this.#routines = new RoutineService(new RoutineStore(store.database), this.#makeRoutineHost(), opts?.config?.routines ?? {});
+    }
     // Pack curation surface (docs/pack-loading.md) — always constructed (cheap:
     // no DB / runner). Reads the boot pack config; each mutation persists to
     // config.json AND (if the pipeline is enabled) registers into the manager.
@@ -618,6 +647,21 @@ export class SessionManager {
   /** Supported backends that couldn't activate at startup (diagnostics). */
   unavailableProviders(): Array<{ id: string; hint: string }> {
     return this.#providers.unavailableEntries();
+  }
+
+  /** Routines service, or undefined when routines are disabled. */
+  get routines(): RoutineService | undefined {
+    return this.#routines;
+  }
+
+  /** Start the routine scheduler. Call AFTER resumeSessions: boot recovery
+   *  closes runs left in flight, whose sessions resume as ordinary ones. */
+  startRoutines(): void {
+    this.#routines?.start();
+  }
+
+  stopRoutines(): void {
+    this.#routines?.stop();
   }
 
   /** Start the dispatcher loop. Call AFTER resumeSessions so surviving
@@ -740,6 +784,8 @@ export class SessionManager {
           store: this.#store,
           transcriptStore: this.#transcriptStore,
           providers: this.#providers,
+          claudeAccounts: this.#claudeAccounts,
+          claudeAccount: meta.claudeAccount ?? null,
           hooks: this.#hooks,
           identityManager: this.#identityManager,
           existingId: meta.sessionId,
@@ -852,6 +898,7 @@ mcpHub: this.#mcpHub,
             persistIndex: !index && history.some((t) => t.turnId),
             partial: canonical?.partial ?? false,
           });
+          if (meta.redactedBackings) session.adoptRedactedBackings(meta.redactedBackings);
           if (meta.backingFresh) await session.reseedFreshBacking();
         } catch (err) {
           console.error(
@@ -1119,6 +1166,14 @@ mcpHub: this.#mcpHub,
         return this.#setModel(msg, auth);
       case "session.set_provider":
         return this.#setProvider(msg, auth);
+      case "session.mcp_reconnect":
+        return this.#mcpReconnect(msg, auth);
+      case "session.mcp_refresh":
+        return this.#mcpRefresh(msg, auth);
+      case "mcp.approve":
+        return this.#mcpApprove(msg, auth);
+      case "mcp.approve.preview":
+        return this.#mcpApprovePreview(msg, auth);
       case "session.fork":
         return this.#fork(msg, auth);
       case "session.rename":
@@ -1159,6 +1214,16 @@ mcpHub: this.#mcpHub,
         return this.#backendLoginSubmit(msg, auth);
       case "backend.login.cancel":
         return this.#backendLoginCancel(msg, auth);
+      case "claude.accounts.list":
+        return this.#claudeAccountsList(msg, auth);
+      case "claude.accounts.set":
+        return this.#claudeAccountsSet(msg, auth);
+      case "claude.accounts.remove":
+        return this.#claudeAccountsRemove(msg, auth);
+      case "claude.accounts.set_default":
+        return this.#claudeAccountsSetDefault(msg, auth);
+      case "session.set_claude_account":
+        return this.#sessionSetClaudeAccount(msg, auth);
       case "session.approvals":
         return this.#sessionApprovals(msg, auth);
       case "session.turns":
@@ -1181,8 +1246,21 @@ mcpHub: this.#mcpHub,
         return this.#mcpOAuthComplete(msg, auth);
       case "mcp.oauth.disconnect":
         return this.#mcpOAuthDisconnect(msg, auth);
+      case "mcp.adopt":
+        return this.#mcpAdopt(msg, auth);
       case "usage.daily":
         return this.#usageDaily(msg, auth);
+      case "routine.create":
+      case "routine.update":
+      case "routine.delete":
+      case "routine.list":
+      case "routine.get":
+      case "routine.run":
+      case "routine.cancel_run":
+      case "routine.runs":
+      case "routine.token":
+      case "routine.preview":
+        return this.#routineHandle(msg, auth);
       case "pipeline.create":
         return this.#pipelineCreate(msg, auth);
       case "pipeline.list":
@@ -1426,6 +1504,7 @@ mcpHub: this.#mcpHub,
               store: this.#store,
               transcriptStore: this.#transcriptStore,
               providers: this.#providers,
+              claudeAccounts: this.#claudeAccounts,
               hooks: this.#hooks,
               ...(this.#identityManager
                 ? { identityManager: this.#identityManager }
@@ -1478,8 +1557,10 @@ mcpHub: this.#mcpHub,
     auth: AuthContext,
   ): Promise<DaemonMessage> {
     // Reuse fs:read since this only reads ~/.claude/ + workdir/.claude/ —
-    // strictly broader than session.workdir, but the data is descriptive
-    // (no secrets — env values are stripped, only key names returned).
+    // strictly broader than session.workdir, but the data is descriptive:
+    // env and header values are never read out, MCP and hook commands are
+    // shown by their program's name, args by their count, and URLs by host
+    // and path shape (#394).
     if (!hasScope(auth.scopes as string[], SCOPES.FS_READ)) {
       return {
         type: "response.error",
@@ -1499,16 +1580,80 @@ mcpHub: this.#mcpHub,
     }
     try {
       const snapshot = await readClaudeConfig(session.workdir);
+      // Read for the drawer only — what a session applies changes on its first
+      // turn or a refresh. Freshly, before the rows: a row and its fingerprint
+      // are of the files as they are now.
+      await session.peekMcpView();
+      const mcpStale = await session.mcpStale();
+      const reachOf = session.mcpReachSnapshot();
       const live = session.sdkMcpSnapshot;
-      const mcpServers = snapshot.mcpServers.map((s) => {
+      // A name two entries give different URLs to: which one the backend runs
+      // isn't known here, so neither is offered for adopting.
+      const urlsByName = new Map<string, Set<string | null>>();
+      for (const s of snapshot.mcpServers) urlsByName.set(s.name, (urlsByName.get(s.name) ?? new Set()).add(s.url));
+      const mcpServers: ClaudeConfigMcpServer[] = snapshot.mcpServers.map((s): ClaudeConfigMcpServer => {
         const liveStatus = live.status.get(s.name);
         const liveTools = live.tools.get(s.name);
+        const spec = this.#mcpRegistry?.get(s.name);
+        const adopted = spec !== undefined && isOAuthServer(spec) && spec.transport.kind === "http" && spec.transport.url === s.url;
         return {
           ...s,
+          // What leaves the daemon carries no credential (#394): a Claude
+          // config keeps them in commands, args and URLs as often as in env
+          // and headers (whose values are never read out). So: the program's
+          // name and how many args — not their text — and the URL's shape.
+          command: s.command === null ? null : serverProgram(s.command),
+          args: [],
+          argCount: s.args.length,
+          url: s.url === null ? null : redactMcpUrl(s.url),
+          // Whether it reaches this session's other backends too, and why not (#395).
+          ...(() => {
+            const reach = adopted ? ({ reach: "all" } as const) : reachOf.reach(s);
+            // A project's server carries the fingerprint of the entry shown, so an
+            // approval is of exactly what was looked at (the repo can't swap it).
+            const fp = s.scope === "workdir" ? reachOf.fingerprint(s.name, s.path) : undefined;
+            return { ...(reach ? { otherBackends: reach } : {}), ...(fp ? { fingerprint: fp } : {}) };
+          })(),
+          // Everything else read from the file is a short label, bounded. (A
+          // name is an address, so it's cut, not redacted: one that long is
+          // never adoptable anyway.)
+          name: s.name.length > 128 ? `${s.name.slice(0, 128)}…` : s.name,
+          type: s.type === null ? null : shownLabel(s.type, 40),
+          envKeys: s.envKeys.slice(0, MAX_SHOWN_KEYS).map((k) => shownLabel(k)),
+          ...(s.headerKeys ? { headerKeys: s.headerKeys.slice(0, MAX_SHOWN_KEYS).map((k) => shownLabel(k)) } : {}),
           ...(liveStatus !== undefined ? { liveStatus } : {}),
           ...(liveTools !== undefined ? { liveTools } : {}),
+          ...(fromRepoFile(s) ? { projectFile: true as const } : {}),
+          ...(adopted
+            ? { adopted: true as const }
+            : urlsByName.get(s.name)!.size === 1
+              ? (() => {
+                  const offer = this.#offerAdoption(s, snapshot.mcpServers, liveStatus, auth);
+                  return offer === "drawer" ? { adoptable: true as const } : offer === "full-url" ? { adoptByFullUrl: true as const } : {};
+                })()
+              : {}),
         };
       });
+      // Servers the backend runs that no config file here declares — the
+      // claude.ai connectors, plugins' servers, codeoid's own — so they can be seen and
+      // reconnected too.
+      const declared = new Set(mcpServers.map((s) => s.name));
+      for (const [name, liveStatus] of live.status) {
+        if (declared.has(name)) continue;
+        mcpServers.push({
+          name,
+          scope: "global",
+          path: "",
+          command: null,
+          args: [],
+          envKeys: [],
+          url: null,
+          type: null,
+          liveStatus,
+          liveTools: live.tools.get(name) ?? [],
+          liveOnly: true,
+        });
+      }
       return {
         type: "claude.config.result",
         requestId: msg.id,
@@ -1516,7 +1661,15 @@ mcpHub: this.#mcpHub,
         agents: snapshot.agents,
         skills: snapshot.skills,
         mcpServers,
-        hooks: snapshot.hooks,
+        hooks: snapshot.hooks.map((h) => ({
+          ...h,
+          event: shownLabel(h.event),
+          matcher: h.matcher === null ? null : shownLabel(h.matcher, 200),
+          kind: shownLabel(h.kind, 40),
+          command: commandSummary(h.command),
+        })),
+        mcpReconnect: session.canReconnectMcp,
+        ...(mcpStale ? { mcpStale: true } : {}),
       };
     } catch (err) {
       return {
@@ -1718,10 +1871,9 @@ mcpHub: this.#mcpHub,
     const hub = this.#mcpHub;
     if (!reg || !hub) return [];
     return reg.list().map((spec) => {
-      // An OAuth server runs as the viewer's tenant: show only that.
-      const tenant = isOAuthServer(spec) ? tenantOf(auth) : undefined;
-      const status = hub.statusFor(spec.name, tenant);
-      const connected = hub.hasClient(spec.name, tenant);
+      // An OAuth server runs as the viewer's tenant, and a session's own
+      // snapshot of a global one (#395) is its tenant's: show only those.
+      const { status, connected } = hub.observed(spec, tenantOf(auth));
       const health: McpServerStatus["health"] = !spec.enabled
         ? "disabled"
         : status?.error
@@ -1740,7 +1892,8 @@ mcpHub: this.#mcpHub,
         health,
         toolCount: status?.tools.length ?? 0,
         tools: status?.tools ?? [],
-        ...(status?.error ? { error: status.error } : {}),
+        // A transport error can quote the server's URL, token and all.
+        ...(status?.error ? { error: cleanMcpError(status.error) } : {}),
         ...(isOAuthServer(spec) ? { oauth: this.#oauthStatus(spec, auth) } : {}),
       };
     });
@@ -1749,7 +1902,7 @@ mcpHub: this.#mcpHub,
   #oauthStatus(spec: McpServerSpec, auth: AuthContext): NonNullable<McpServerStatus["oauth"]> {
     return {
       status: this.#mcpOAuth?.status(spec, tenantOf(auth)) ?? "disconnected",
-      unsupportedBackends: NATIVE_MOUNT_BACKENDS.filter(
+      unsupportedBackends: OAUTH_UNSUPPORTED_BACKENDS.filter(
         (b) => spec.backends === undefined || spec.backends.includes(b),
       ),
     };
@@ -1983,8 +2136,20 @@ mcpHub: this.#mcpHub,
       return this.#loginForbidden(msg.id);
     }
     try {
-      const login = await this.#backendLogin.start(msg.backend);
-      this.#store.audit(auth.sub, "backend.login.start", "", `backend=${msg.backend}`);
+      // A login for a NAMED Claude account runs isolated (its own throwaway
+      // config dir) and its token is stored as that account — it must never
+      // replace the machine's own `claude login`.
+      if (msg.account !== undefined) validateAccountName(msg.account);
+      const login = await this.#backendLogin.start(msg.backend, { isolated: msg.account !== undefined });
+      // A new attempt supersedes any other for this backend: forget theirs.
+      for (const id of [...this.#accountLogins.keys()]) if (!this.#backendLogin.isOpen(id)) this.#accountLogins.delete(id);
+      if (msg.account !== undefined) this.#accountLogins.set(login.loginId, msg.account);
+      this.#store.audit(
+        auth.sub,
+        "backend.login.start",
+        "",
+        `backend=${msg.backend}${msg.account !== undefined ? ` account=${msg.account}` : ""}`,
+      );
       return { type: "backend.login.start.result", requestId: msg.id, login };
     } catch (err) {
       return {
@@ -1993,7 +2158,7 @@ mcpHub: this.#mcpHub,
         // The message is authored by the broker for display; redact anyway
         // rather than depend on every future flow's error being clean.
         error: redact(err instanceof Error ? err.message : String(err)),
-        code: err instanceof BackendLoginError ? "invalid_request" : "internal",
+        code: err instanceof BackendLoginError || err instanceof ClaudeAccountError ? "invalid_request" : "internal",
       };
     }
   }
@@ -2014,7 +2179,30 @@ mcpHub: this.#mcpHub,
     try {
       const outcome = await this.#backendLogin.submit(msg.loginId, msg.code);
       let error = outcome.error;
-      if (outcome.ok && outcome.secret) {
+      const accountName = this.#accountLogins.get(msg.loginId);
+      // Forget the mapping only once the attempt is over: a code refused before
+      // it reached the command (malformed) leaves the attempt open, and a
+      // retry must still be stored as the named account.
+      if (!this.#backendLogin.isOpen(msg.loginId)) this.#accountLogins.delete(msg.loginId);
+      if (outcome.isolated && accountName === undefined) {
+        // A named-account login whose name we no longer know. Its credential
+        // must never become the daemon's own login: drop it.
+        if (outcome.ok) error = "Signed in, but the account this sign-in was for is no longer known. Start again.";
+      } else if (accountName !== undefined) {
+        // A named account keeps ONLY the token the command printed: it ran
+        // against a throwaway config dir, so there is no on-disk fallback.
+        if (outcome.ok && outcome.secret?.key === "CLAUDE_CODE_OAUTH_TOKEN") {
+          try {
+            this.#claudeAccounts.upsert({ name: accountName, kind: "subscription", token: outcome.secret.value });
+            // A re-login replaced the token: idle processes still hold the old one.
+            this.#releaseClaudeSessionsOn(accountName);
+          } catch (err) {
+            error = `Signed in, but the account could not be saved: ${err instanceof Error ? err.message : String(err)}`;
+          }
+        } else if (outcome.ok) {
+          error = "Signed in, but claude setup-token didn't print a token to store for this account.";
+        }
+      } else if (outcome.ok && outcome.secret) {
         const written = applyPatches([{ key: outcome.secret.key, value: outcome.secret.value }]);
         if (!written.ok) {
           // Signed in with the vendor but could not persist it: report the
@@ -2026,7 +2214,7 @@ mcpHub: this.#mcpHub,
       }
       const ok = outcome.ok && error === undefined;
       // Never the code, never the credential — only that an exchange happened.
-      this.#store.audit(auth.sub, "backend.login.submit", "", `ok=${ok}`);
+      this.#store.audit(auth.sub, "backend.login.submit", "", `ok=${ok}${accountName !== undefined ? ` account=${accountName}` : ""}`);
       return {
         type: "backend.login.submit.result",
         requestId: msg.id,
@@ -2052,11 +2240,137 @@ mcpHub: this.#mcpHub,
     if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) {
       return this.#loginForbidden(msg.id);
     }
+    this.#accountLogins.delete(msg.loginId);
     return {
       type: "backend.login.cancel.result",
       requestId: msg.id,
       ok: this.#backendLogin.cancel(msg.loginId),
     };
+  }
+
+  // ── Claude accounts (claude-accounts.ts) ─────────────────────────────────
+
+  #claudeAccountsResult(requestId: string): DaemonMessage {
+    return {
+      type: "claude.accounts.result",
+      requestId,
+      accounts: this.#claudeAccounts.list(),
+      defaultAccount: this.#claudeAccounts.getDefault(),
+    };
+  }
+
+  #claudeAccountsError(requestId: string, err: unknown): DaemonMessage {
+    return {
+      type: "response.error",
+      requestId,
+      error: err instanceof Error ? err.message : String(err),
+      code: err instanceof ClaudeAccountError ? "invalid_request" : "internal",
+    };
+  }
+
+  /** Names, kinds and gateway URLs — never a token. `settings:read`. */
+  #claudeAccountsList(msg: Extract<ClientMessage, { type: "claude.accounts.list" }>, auth: AuthContext): DaemonMessage {
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_READ)) {
+      return { type: "response.error", requestId: msg.id, error: "Missing scope: settings:read", code: "forbidden" };
+    }
+    return this.#claudeAccountsResult(msg.id);
+  }
+
+  /** Add or replace an account. `settings:write` — it decides what sessions bill. */
+  #claudeAccountsSet(msg: Extract<ClientMessage, { type: "claude.accounts.set" }>, auth: AuthContext): DaemonMessage {
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return this.#loginForbidden(msg.id);
+    try {
+      this.#claudeAccounts.upsert({
+        name: msg.name,
+        kind: msg.kind,
+        token: msg.token,
+        ...(msg.baseUrl !== undefined ? { baseUrl: msg.baseUrl } : {}),
+        ...(msg.headers !== undefined ? { headers: msg.headers } : {}),
+      });
+    } catch (err) {
+      return this.#claudeAccountsError(msg.id, err);
+    }
+    // Never the token — only that an account was set and what kind.
+    this.#store.audit(auth.sub, "claude.accounts.set", "", `name=${msg.name} kind=${msg.kind}`);
+    // A replaced token: idle processes still hold the old one.
+    this.#releaseClaudeSessionsOn(msg.name);
+    return this.#claudeAccountsResult(msg.id);
+  }
+
+  #claudeAccountsRemove(msg: Extract<ClientMessage, { type: "claude.accounts.remove" }>, auth: AuthContext): DaemonMessage {
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return this.#loginForbidden(msg.id);
+    // Before removing: afterwards a follower of it no longer resolves to it.
+    this.#releaseClaudeSessionsOn(msg.name);
+    if (!this.#claudeAccounts.remove(msg.name)) {
+      return { type: "response.error", requestId: msg.id, error: `no Claude account named "${msg.name}"`, code: "not_found" };
+    }
+    this.#store.audit(auth.sub, "claude.accounts.remove", "", `name=${msg.name}`);
+    // Sessions on it now refuse to run until switched (never a silent fallback).
+    this.#announceClaudeSessions();
+    return this.#claudeAccountsResult(msg.id);
+  }
+
+  #claudeAccountsSetDefault(
+    msg: Extract<ClientMessage, { type: "claude.accounts.set_default" }>,
+    auth: AuthContext,
+  ): DaemonMessage {
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return this.#loginForbidden(msg.id);
+    try {
+      this.#claudeAccounts.setDefault(msg.name);
+    } catch (err) {
+      return this.#claudeAccountsError(msg.id, err);
+    }
+    for (const session of this.#sessions.values()) if (session.claudeAccount === null) session.releaseIdleClaudeQuery();
+    this.#store.audit(auth.sub, "claude.accounts.set_default", "", `name=${msg.name}`);
+    // Every session following the default runs on it from its next turn.
+    this.#announceClaudeSessions();
+    return this.#claudeAccountsResult(msg.id);
+  }
+
+  /** Re-announce every Claude session's info — its effective account may have moved. */
+  #announceClaudeSessions(): void {
+    for (const session of this.#sessions.values()) {
+      if (session.toInfo().providerId === "claude") session.announceInfo();
+    }
+  }
+
+  /** Stop idle Claude queries running on `name` (chosen, or followed as the daemon default). */
+  #releaseClaudeSessionsOn(name: string): void {
+    const daemonDefault = this.#claudeAccounts.getDefault();
+    for (const session of this.#sessions.values()) {
+      const choice = session.claudeAccount;
+      if (choice === name || (choice === null && daemonDefault === name)) session.releaseIdleClaudeQuery();
+    }
+  }
+
+  /**
+   * Choose a session's Claude account: null follows the daemon default, a
+   * literal `default` pins the built-in account. `settings:write`, every
+   * case — it picks whose credential the agent runs on and bills, and where
+   * the conversation is sent (a switch resumes it on the new account). Moving
+   * a session OFF a company account onto a personal login is as much that
+   * decision as moving it on.
+   */
+  #sessionSetClaudeAccount(
+    msg: Extract<ClientMessage, { type: "session.set_claude_account" }>,
+    auth: AuthContext,
+  ): DaemonMessage {
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) {
+      return {
+        type: "response.error",
+        requestId: msg.id,
+        error: "Missing scope: settings:write (needed to choose a session's Claude account)",
+        code: "forbidden",
+      };
+    }
+    const session = this.#getOwnedSession(msg.sessionId, auth);
+    if (!session) return { type: "response.error", requestId: msg.id, error: "Session not found", code: "not_found" };
+    try {
+      session.setClaudeAccount(msg.account, auth);
+    } catch (err) {
+      return this.#claudeAccountsError(msg.id, err);
+    }
+    return { type: "response.ok", requestId: msg.id, data: session.toInfo() };
   }
 
   /**
@@ -2178,12 +2492,184 @@ mcpHub: this.#mcpHub,
     const tenant = tenantOf(auth);
     target.oauth.disconnect(target.spec, tenant);
     this.#mcpHub?.dropTenant(msg.server, tenant);
+    this.#mcpHub?.proxy?.credentialsChanged(msg.server, tenant);
     this.#store.audit(auth.sub, "mcp.oauth.disconnect", "", `server=${msg.server}`);
     return {
       type: "mcp.oauth.disconnect.result",
       requestId: msg.id,
       snapshot: { ...getSnapshot(), mcpServers: this.#mcpServerStatuses(auth) },
     };
+  }
+
+  /** The origins this daemon's own HTTP endpoints are reached at. */
+  #daemonOrigins(): string[] {
+    return [this.#blackboardUrl, this.#config?.daemonUrl, this.#config?.mcpOAuth?.redirectBaseUrl].filter((u): u is string => Boolean(u));
+  }
+
+  /**
+   * Whether the drawer offers "Sign in with codeoid" for a row: only to a
+   * caller adopt would accept, only for what adopt would take, and only when
+   * the backend reports `needs-auth` (a sign-in the CLI can't run). A server
+   * that's merely down, or not yet reported, isn't offered.
+   */
+  #offerAdoption(
+    s: ClaudeConfigMcpServer,
+    all: readonly ClaudeConfigMcpServer[],
+    liveStatus: string | undefined,
+    auth: AuthContext,
+  ): "drawer" | "full-url" | null {
+    // Only to someone adopt would accept, and only what adopt would take.
+    if (!this.#mcpOAuth || !this.#mcpRegistry || s.liveOnly) return null;
+    // A sign-in that the CLI can't run — not any failure: a server that's
+    // merely down would only lose its working copy everywhere.
+    if (liveStatus !== "needs-auth") return null;
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE) || auth.delegationDepth > 0) return null;
+    if (adoptionRefusal(s, all, this.#mcpRegistry, this.#daemonOrigins())) return null;
+    // The drawer has only the URL as shown, which can't adopt a project's
+    // URL with parts hidden: that one is adopted by its full URL, from the file.
+    return fullUrlRequired(s) ? "full-url" : "drawer";
+  }
+
+  /**
+   * Adopt a remote server from Claude's own config into codeoid's registry
+   * (#390): the same URL with codeoid's OAuth sign-in, written to config.json
+   * and live in the registry at once — every session, provider and the hub
+   * read it from there; a Claude session rebuilds its query on its next turn
+   * to mount codeoid's copy and deny the CLI's. The URL comes from Claude's
+   * config, never from the client. `settings:write`, plus an owned session
+   * when one is named (its workdir's servers are looked in).
+   */
+  async #mcpAdopt(msg: Extract<ClientMessage, { type: "mcp.adopt" }>, auth: AuthContext): Promise<DaemonMessage> {
+    let workdir: string | null = null;
+    let source = "";
+    let url = "";
+    // Every outcome is on the record, as who asked and from where.
+    const audit = (outcome: string) =>
+      this.#store.audit(
+        auth.sub,
+        "mcp.adopt",
+        msg.sessionId ?? "",
+        `server=${JSON.stringify(msg.server)} outcome=${outcome}${url ? ` url=${JSON.stringify(url)}` : ""}${workdir ? ` workdir=${JSON.stringify(workdir)}` : ""}${source ? ` source=${JSON.stringify(source)}` : ""}`,
+      );
+    const fail = (outcome: string, error: string, code: "invalid_request" | "not_found" | "forbidden" | "internal" = "invalid_request"): DaemonMessage => {
+      audit(outcome);
+      return { type: "response.error", requestId: msg.id, error, code };
+    };
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return fail("forbidden", "Missing scope: settings:write", "forbidden");
+    // It changes the daemon-wide registry and config: the account's own, not a token handed on.
+    if (auth.delegationDepth > 0) return fail("refused", "A delegated token can't adopt MCP servers.", "forbidden");
+    const registry = this.#mcpRegistry;
+    if (!registry || !this.#mcpOAuth) return fail("unavailable", "OAuth for MCP servers is not available on this daemon.", "internal");
+    let session: Session | null = null;
+    if (msg.sessionId !== undefined) {
+      session = this.#getOwnedSession(msg.sessionId, auth);
+      if (!session) return fail("not_found", "Session not found", "not_found");
+      workdir = session.workdir;
+    }
+    const name = msg.server;
+    const named = adoptableName(name);
+    if (!named.ok) return fail("refused", named.reason);
+
+    // Which entry: the one at the URL the caller was shown, else the only one.
+    const all = await claudeMcpServers(workdir);
+    const candidates = all.filter((c) => c.name === name);
+    // The URL the caller was shown is the redacted one (#394); one typed from
+    // their own config is the real one. Either picks the entry — but a
+    // project's URL with parts hidden only by its full text, the consent.
+    // ("…" alone is never a URL anyone was shown a host for.)
+    const atUrl =
+      msg.url !== undefined
+        ? candidates.filter(
+            (c) => c.url === msg.url || (c.url !== null && msg.url !== "…" && !fullUrlRequired(c) && redactMcpUrl(c.url) === msg.url),
+          )
+        : candidates;
+    // The shown form of a project's URL with parts hidden picks nothing — and
+    // says why, rather than quietly picking another entry that reads the same.
+    const hiddenRepo =
+      msg.url === undefined ? undefined : candidates.find((c) => fullUrlRequired(c) && c.url !== msg.url && redactMcpUrl(c.url!) === msg.url);
+    if (hiddenRepo) {
+      source = hiddenRepo.path;
+      url = msg.url!;
+      return fail(
+        "unconfirmed",
+        `${name} comes from this project's own files, and parts of its address are hidden here (${msg.url}); adopting it is consent to all of it, so name its full URL, from ${hiddenRepo.path}`,
+      );
+    }
+    if (atUrl.length === 0) {
+      return fail(
+        "not_found",
+        msg.url !== undefined
+          ? `Claude's config has no MCP server ${JSON.stringify(name)} at that URL`
+          : `Claude's config has no MCP server named ${JSON.stringify(name)}${workdir ? "" : " (for a project's server, name its session)"}`,
+        "not_found",
+      );
+    }
+    if (new Set(atUrl.map((c) => c.url)).size > 1) {
+      const shown = atUrl.map((c) => (c.url ? redactMcpUrl(c.url) : serverProgram(c.command ?? "")));
+      // Two URLs that read the same once their credentials are hidden: only
+      // the full URL, from the file itself, tells them apart.
+      const shownUrls = atUrl.flatMap((c) => (c.url ? [redactMcpUrl(c.url)] : []));
+      const sameShown = new Set(shownUrls).size < shownUrls.length;
+      return fail(
+        "ambiguous",
+        sameShown
+          ? `${JSON.stringify(name)} names servers that differ only in parts hidden here (${[...new Set(shown)].join(", ")}); pass the full URL, from ${[...new Set(atUrl.map((c) => c.path))].join(" or ")}`
+          : `${JSON.stringify(name)} names more than one server in Claude's config (${shown.join(", ")}); say which URL`,
+      );
+    }
+    const found = atUrl[0]!;
+    source = found.path;
+    url = found.url ? redactMcpUrl(found.url) : "";
+    const can = adoptability(found);
+    if (!can.ok) return fail("refused", can.reason);
+    const refusal = adoptionRefusal(found, all, registry, this.#daemonOrigins());
+    if (refusal) return fail("refused", refusal);
+    // A repo's file can name any address (and the CLI connects it unasked):
+    // adopted only when the caller names the URL — consent to that address.
+    if (fromRepoFile(found) && msg.url === undefined) {
+      return fail(
+        "unconfirmed",
+        fullUrlRequired(found)
+          ? `${name} comes from this project's own files, which chose its address; to adopt it, name its full URL, from ${found.path} (shown here as ${redactMcpUrl(can.url)})`
+          : `${name} comes from this project's own files, which chose its address; to adopt it, name that URL (${redactMcpUrl(can.url)})`,
+      );
+    }
+    const reply = (alreadyAdopted: boolean): DaemonMessage => ({
+      type: "mcp.adopt.result",
+      requestId: msg.id,
+      server: name,
+      alreadyAdopted,
+      snapshot: { ...getSnapshot(), mcpServers: this.#mcpServerStatuses(auth) },
+    });
+    let configured: Record<string, unknown> | undefined;
+    try {
+      configured = readMcpServerEntry(name);
+    } catch (err) {
+      return fail("error", `config.json is not valid JSON: ${redact(err instanceof Error ? err.message : String(err))}`, "internal");
+    }
+    if (configured) {
+      if (isSameAdoption(configured, can.url)) {
+        audit("already");
+        return reply(true);
+      }
+      // A server the user configured for codeoid by hand is theirs to change.
+      return fail("conflict", `codeoid's config already has a server named ${JSON.stringify(name)}; change or remove it there first`);
+    }
+    const { entry, raw } = adoptedEntry(can.url);
+    let spec: McpServerSpec;
+    try {
+      const written = writeMcpServerEntry(name, entry);
+      if (!written.ok) return fail("error", written.error);
+      spec = registry.upsert(name, raw);
+    } catch (err) {
+      return fail("error", redact(err instanceof Error ? err.message : String(err)));
+    }
+    // Any client held for the old entry (a plain copy imported from ~/.claude.json).
+    this.#mcpHub?.drop(spec.name);
+    this.#mcpHub?.proxy?.serverChanged(spec.name);
+    url = redactMcpUrl(new URL(can.url).href);
+    audit(`adopted${fromRepoFile(found) ? " projectFile=true" : ""}`);
+    return reply(false);
   }
 
   /**
@@ -2200,6 +2686,7 @@ mcpHub: this.#mcpHub,
     if (!oauth) throw new Error("OAuth for MCP servers is not available on this daemon.");
     const done = await oauth.complete(input, proof, (name) => this.#mcpRegistry?.get(name));
     this.#mcpHub?.dropTenant(done.server, done.tenant);
+    this.#mcpHub?.proxy?.credentialsChanged(done.server, done.tenant);
     return done;
   }
 
@@ -2676,6 +3163,24 @@ mcpHub: this.#mcpHub,
         code: "invalid_request",
       };
     }
+    // Fail closed on an unknown Claude account — creating the session on some
+    // other credential would bill the wrong account.
+    if (msg.claudeAccount && !hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) {
+      return {
+        type: "response.error",
+        requestId: msg.id,
+        error: "Missing scope: settings:write (needed to choose a session's Claude account)",
+        code: "forbidden",
+      };
+    }
+    if (msg.claudeAccount && !this.#claudeAccounts.has(msg.claudeAccount)) {
+      return {
+        type: "response.error",
+        requestId: msg.id,
+        error: `Unknown Claude account "${msg.claudeAccount}" — see \`codeoid account ls\``,
+        code: "invalid_request",
+      };
+    }
 
     // Normalize + validate the workdir. A leading `~` must be expanded and a
     // missing directory rejected up front — otherwise the SDK fails opaquely
@@ -2953,6 +3458,8 @@ mcpHub: this.#mcpHub,
       store: this.#store,
       transcriptStore: this.#transcriptStore,
       providers: this.#providers,
+      claudeAccounts: this.#claudeAccounts,
+      claudeAccount: msg.claudeAccount || null,
       hooks: this.#hooks,
       // Derived above for a collaborative session; otherwise msg.providerId.
       providerId,
@@ -3334,6 +3841,7 @@ mcpHub: this.#mcpHub,
           store: this.#store,
           transcriptStore: this.#transcriptStore,
           providers: this.#providers,
+          claudeAccounts: this.#claudeAccounts,
           hooks: this.#hooks,
           providerId: child.providerId,
           defaultModel: child.model,
@@ -3452,6 +3960,17 @@ mcpHub: this.#mcpHub,
       return { type: "response.error", requestId: msg.id, error: "Session not found", code: "not_found" };
     }
     // Forking THE conductor would mint a second fleet supervisor — refuse.
+    // The fork keeps running on the parent's Claude account, and choosing what
+    // a session runs on (and bills) is `settings:write` — a fork or a compare
+    // must not be a way around that.
+    if (parent.claudeAccount !== null && !hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) {
+      return {
+        type: "response.error",
+        requestId: msg.id,
+        error: `This session runs on Claude account "${parent.claudeAccount}"; forking it needs settings:write`,
+        code: "forbidden",
+      };
+    }
     if (parent.role) {
       return { type: "response.error", requestId: msg.id, error: `Cannot fork a ${parent.role} session`, code: "invalid_request" };
     }
@@ -3677,6 +4196,9 @@ mcpHub: this.#mcpHub,
         store: this.#store,
         transcriptStore: this.#transcriptStore,
         providers: this.#providers,
+        claudeAccounts: this.#claudeAccounts,
+        // A fork continues the same conversation — on the same account.
+        claudeAccount: parent.claudeAccount,
         hooks: this.#hooks,
         providerId,
         forkedFrom: {
@@ -3716,7 +4238,10 @@ mcpHub: this.#mcpHub,
       // what sizes the fork's history to the real window instead of the 200k
       // floor — forks never carry a model id, so the cache alone can't key it.
       fork.inheritObservedLimits(parent);
-      await fork.primeFromFork(history, transcriptRows, sizeHints, workdirNote);
+      await fork.primeFromFork(history, transcriptRows, sizeHints, workdirNote, {
+        parentContextTokens: parent.lastContextTokens,
+        redactedBackings: parent.redactedBackings,
+      });
       // The inherited turns keep their ids, list entries and file snapshots
       // (#354) — and the snapshots survive the parent being destroyed.
       // Only turns the fork's history actually contains: the parent may have
@@ -3885,6 +4410,7 @@ mcpHub: this.#mcpHub,
       store: this.#store,
       transcriptStore: this.#transcriptStore,
       providers: this.#providers,
+      claudeAccounts: this.#claudeAccounts,
       hooks: this.#hooks,
       identityManager: this.#identityManager,
       memory: this.#memory,
@@ -4169,6 +4695,7 @@ mcpHub: this.#mcpHub,
       store: this.#store,
       transcriptStore: this.#transcriptStore,
       providers: this.#providers,
+      claudeAccounts: this.#claudeAccounts,
       hooks: this.#hooks,
       identityManager: this.#identityManager,
       memory: this.#memory,
@@ -4604,6 +5131,317 @@ mcpHub: this.#mcpHub,
     ].join("\n");
   }
 
+  // ── Routines (docs/routines.md) ─────────────────────────────────────────
+
+  /**
+   * One entry point for routine.*: availability, scopes, and tenancy are
+   * decided here once, then each verb runs against RoutineService.
+   *
+   * No scope of its own. Every verb but preview needs session:create +
+   * session:send — a routine creates and prompts sessions on its owner's
+   * behalf, so only someone who could do that themselves may hold one, and
+   * read-only watchers can't read its definition or history. Changing anything
+   * is refused to delegated tokens (teammates' share tokens, agents): a
+   * routine is standing authority that outlives them. Saving,
+   * firing, re-tokening or resuming a routine that pre-approves (autonomous)
+   * or runs host commands (a check) also needs session:approve; pausing never
+   * does. A routine is its owner's alone: anyone else gets not-found.
+   */
+  async #routineHandle(
+    msg: Extract<ClientMessage, { type: `routine.${string}` }>,
+    auth: AuthContext,
+  ): Promise<DaemonMessage> {
+    const err = (error: string, code: "forbidden" | "not_found" | "invalid_request" | "rate_limited" | "internal"): DaemonMessage => ({
+      type: "response.error",
+      requestId: msg.id,
+      error,
+      code,
+    });
+    const svc = this.#routines;
+    if (!svc) return err("routines are disabled on this daemon (routines.enabled)", "invalid_request");
+    const scopes = auth.scopes as string[];
+    if (msg.type === "routine.preview") {
+      if (!hasScope(scopes, SCOPES.SESSION_LIST)) return err("Missing scope: session:list", "forbidden");
+    } else {
+      // A routine creates and prompts sessions, so holding one takes what
+      // doing that takes. Its prompt, check, check output and payloads are
+      // therefore out of a read-only watcher's reach, reading included.
+      for (const sc of [SCOPES.SESSION_CREATE, SCOPES.SESSION_SEND] as const) {
+        if (!hasScope(scopes, sc)) return err(`Missing scope: ${sc}`, "forbidden");
+      }
+      const reads = msg.type === "routine.list" || msg.type === "routine.get" || msg.type === "routine.runs";
+      if (!reads) {
+        // A routine is standing authority that outlives the token that made
+        // it; a delegated token (an agent acting for someone) is meant to be
+        // narrow and short-lived, so it may not create or steer one.
+        if ((auth.delegationDepth ?? 0) > 0) {
+          return err("a delegated token cannot change routines — use the owner's own credential", "forbidden");
+        }
+      }
+    }
+    /** Autonomy or a host command needs the approval scope as well. */
+    const needsApprove = (spec: { approvals?: string | null; check?: unknown } | undefined, current?: RoutineRow): boolean => {
+      const approvals = spec?.approvals !== undefined ? spec.approvals : current?.spec.approvals;
+      const check = spec && "check" in spec ? spec.check : current?.spec.check;
+      return (approvals ?? "autonomous") === "autonomous" || !!check;
+    };
+    // A routine is its owner's alone: its runs act as them, so nobody else in
+    // the tenant may read, steer, fire, or delete it. Others get "not found".
+    const mine = (r: RoutineRow | null | undefined): r is RoutineRow =>
+      !!r && r.accountId === auth.accountId && r.projectId === auth.projectId && r.ownerSub === auth.sub;
+    const resolve = (ref: string): RoutineRow | undefined => {
+      const byId = svc.store.getRoutine(ref);
+      if (mine(byId)) return byId;
+      const byName = svc.store.getRoutineByName(auth.accountId, auth.projectId, auth.sub, ref);
+      return mine(byName) ? byName : undefined;
+    };
+    const wire = (r: RoutineRow) =>
+      toRoutineWire(r, {
+        upcoming: svc.upcoming(r, 3),
+        lastRun: svc.store.listRuns(r.id, { limit: 1 })[0],
+        apiTokenSet: svc.store.hasApiToken(r.id),
+      });
+    const actor = auth.sub;
+    try {
+      switch (msg.type) {
+        case "routine.list":
+          return {
+            type: "routine.list.result",
+            requestId: msg.id,
+            routines: svc.store.listRoutines(auth.accountId, auth.projectId, auth.sub).map(wire),
+          };
+        case "routine.preview":
+          return { type: "routine.preview.result", requestId: msg.id, fires: svc.preview(msg.schedule, msg.count ?? 5) };
+        case "routine.create": {
+          if (needsApprove(msg.spec) && !hasScope(scopes, SCOPES.SESSION_APPROVE)) {
+            return err("Missing scope: session:approve (an autonomous routine, or one with a check command, pre-approves work)", "forbidden");
+          }
+          const { routine, apiToken } = svc.create(
+            { sub: auth.sub, name: auth.name, accountId: auth.accountId, projectId: auth.projectId },
+            msg.spec,
+          );
+          return { type: "routine.snapshot", requestId: msg.id, routine: wire(routine), ...(apiToken ? { apiToken } : {}) };
+        }
+      }
+      // Everything below names one routine (or one run).
+      if (msg.type === "routine.cancel_run") {
+        const run = svc.store.getRun(msg.runId);
+        if (!run || !mine(svc.store.getRoutine(run.routineId))) return err("Run not found", "not_found");
+        if (!svc.cancelRun(run, actor)) return err(`run is already ${run.status}`, "invalid_request");
+        return { type: "response.ok", requestId: msg.id };
+      }
+      const r = resolve(msg.routine);
+      if (!r) return err(`Routine not found: ${msg.routine}`, "not_found");
+      switch (msg.type) {
+        case "routine.get":
+          return {
+            type: "routine.snapshot",
+            requestId: msg.id,
+            routine: wire(r),
+            runs: svc.store.listRuns(r.id, { limit: msg.runs ?? 10 }).map(toRunWire),
+          };
+        case "routine.runs": {
+          if (msg.runId !== undefined) {
+            const one = svc.store.getRun(msg.runId);
+            const runs = one && one.routineId === r.id ? [toRunWire(one)] : [];
+            return { type: "routine.runs.result", requestId: msg.id, routineId: r.id, runs, hasMore: false };
+          }
+          const before = msg.before !== undefined ? Date.parse(msg.before) : undefined;
+          if (before !== undefined && Number.isNaN(before)) return err(`before is not a timestamp: ${msg.before}`, "invalid_request");
+          const limit = msg.limit ?? 20;
+          const runs = svc.store.listRuns(r.id, { limit: limit + 1, before });
+          return {
+            type: "routine.runs.result",
+            requestId: msg.id,
+            routineId: r.id,
+            runs: runs.slice(0, limit).map(toRunWire),
+            hasMore: runs.length > limit,
+          };
+        }
+        case "routine.update": {
+          // Pausing is a safety stop: any credential that can manage the
+          // routine may pull it, whatever the routine pre-approves.
+          const pauseOnly = msg.spec === undefined && msg.enabled === false;
+          if (!pauseOnly && needsApprove(msg.spec as { approvals?: string | null; check?: unknown } | undefined, r) && !hasScope(scopes, SCOPES.SESSION_APPROVE)) {
+            return err("Missing scope: session:approve (an autonomous routine, or one with a check command, pre-approves work)", "forbidden");
+          }
+          const { routine, apiToken } = svc.update(
+            r,
+            { ...(msg.spec ? { spec: msg.spec as Parameters<RoutineService["update"]>[1]["spec"] } : {}), ...(msg.enabled !== undefined ? { enabled: msg.enabled } : {}) },
+            actor,
+          );
+          return { type: "routine.snapshot", requestId: msg.id, routine: wire(routine), ...(apiToken ? { apiToken } : {}) };
+        }
+        case "routine.delete":
+          await svc.delete(r, actor);
+          return { type: "response.ok", requestId: msg.id };
+        case "routine.run": {
+          // Firing an autonomous routine, or one with a check, starts
+          // pre-approved work; it needs what saving it needed.
+          if (needsApprove(undefined, r) && !hasScope(scopes, SCOPES.SESSION_APPROVE)) {
+            return err("Missing scope: session:approve (this routine pre-approves work)", "forbidden");
+          }
+          const run = svc.fire(r, "manual", msg.payload ?? null, actor);
+          return { type: "routine.run.result", requestId: msg.id, run: toRunWire(run) };
+        }
+        case "routine.token": {
+          if (needsApprove(undefined, r) && !hasScope(scopes, SCOPES.SESSION_APPROVE)) {
+            return err("Missing scope: session:approve (this routine pre-approves work)", "forbidden");
+          }
+          const apiToken = svc.rotateToken(r, actor);
+          return {
+            type: "routine.token.result",
+            requestId: msg.id,
+            routineId: r.id,
+            apiToken,
+            endpointPath: routineFirePath(r.id),
+          };
+        }
+      }
+      return err("Unknown routine message", "invalid_request");
+    } catch (e) {
+      if (e instanceof RoutineError) {
+        return err(e.message, e.code === "conflict" ? "invalid_request" : e.code);
+      }
+      return err(e instanceof Error ? e.message : String(e), "internal");
+    }
+  }
+
+  /** The routine engine's window onto sessions (RoutineHost). */
+  #makeRoutineHost(): RoutineHost {
+    const systemAuth = (accountId: string, projectId: string): AuthContext => ({
+      sub: "system:routines",
+      scopes: [],
+      delegationDepth: 0,
+      accountId,
+      projectId,
+    });
+    return {
+      createSession: async (o) => {
+        let workdir = o.workdir;
+        let worktree: SessionWorktree | undefined;
+        if (o.worktree) {
+          if (!(await isGitRepo(o.workdir))) throw new Error(`worktree isolation needs a git repository: ${o.workdir}`);
+          const wt = await createForkWorktree({ workdir: o.workdir, label: o.label, shortId: randomUUID().slice(0, 8) });
+          workdir = normalizeWorkdir(wt.workdir) ?? wt.path;
+          worktree = { path: wt.path, branch: wt.branch, createdByCodeoid: true };
+        }
+        const session = new Session({
+          // The conductor's name is reserved for the singleton.
+          name: o.name === this.#conductorName() ? `${o.name}-routine` : o.name,
+          workdir,
+          ...(worktree ? { worktree } : {}),
+          providerId: o.provider,
+          defaultModel: o.model,
+          initialMode: o.approvals === "autonomous" ? { mode: "autonomous", maxTurns: o.toolBudget } : { mode: "guarded" },
+          ...(o.maxCostUsd !== undefined ? { maxBudgetUsd: o.maxCostUsd } : {}),
+          auth: o.ownerAuth,
+          store: this.#store,
+          transcriptStore: this.#transcriptStore,
+          providers: this.#providers,
+          claudeAccounts: this.#claudeAccounts,
+          hooks: this.#hooks,
+          identityManager: this.#identityManager,
+          memory: this.#memory,
+          memoryMcp: this.#memoryMcp,
+          mcpRegistry: this.#mcpRegistry,
+          mcpHub: this.#mcpHub,
+          config: this.#config,
+          compressionRegistry: this.#compressionRegistry,
+          _testProvider: this.#testProviderFactory?.(),
+          onStatusChange: this.#statusObserver,
+          ...this.#modelHooks,
+        });
+        this.#sessions.set(session.id, session);
+        return session.id;
+      },
+      sessionAlive: (id, accountId, projectId) => {
+        const s = this.#sessions.get(id);
+        return !!s && s.accountId === accountId && s.projectId === projectId;
+      },
+      disarm: (id) => {
+        const s = this.#sessions.get(id);
+        if (s?.mode === "autonomous") s.setMode("guarded");
+      },
+      defaultProviderId: () => this.#providers.defaultId,
+      armSession: (id, approvals, toolBudget) => {
+        this.#sessions.get(id)?.setMode(approvals === "autonomous" ? "autonomous" : "guarded", toolBudget);
+      },
+      send: async (id, text, sender) => {
+        const s = this.#sessions.get(id);
+        if (!s) throw new Error("session not found");
+        await s.send(text, sender);
+      },
+      info: (id) => {
+        const s = this.#sessions.get(id);
+        if (!s) return null;
+        const i = s.toInfo();
+        const parked = i.status === "waiting_approval" ? s.pendingToolApprovals()[0] : undefined;
+        return {
+          status: i.status,
+          turnQueued: i.turnQueued === true,
+          waitingOn: i.pendingDialog
+            ? `waiting on a question: ${i.pendingDialog.title}`
+            : parked
+              ? `waiting for approval to run ${parked.toolName}`
+              : null,
+          costUsd: i.usage?.totalCostUsd ?? 0,
+          // usage.inputTokens is uncached input only (Anthropic semantics);
+          // a run reports everything the model read.
+          inputTokens: (i.usage?.inputTokens ?? 0) + (i.usage?.cacheReadTokens ?? 0) + (i.usage?.cacheCreationTokens ?? 0),
+          outputTokens: i.usage?.outputTokens ?? 0,
+          attachedClients: s.attachedClientCount,
+          lastTurnId: s.lastTurnId,
+        };
+      },
+      result: (id, sinceTurnId) => {
+        const s = this.#sessions.get(id);
+        if (!s) return { text: null, error: null };
+        const answered = s.lastTurnRole === "assistant" && s.lastTurnId !== null && s.lastTurnId !== sinceTurnId;
+        return { text: answered ? s.lastAssistantMessage : null, error: s.lastTurnError };
+      },
+      beginUnattended: (id) => this.#sessions.get(id)?.beginUnattended() ?? (() => {}),
+      interrupt: async (id) => {
+        const s = this.#sessions.get(id);
+        if (s) await s.interrupt(systemAuth(s.accountId, s.projectId));
+      },
+      destroy: async (id) => {
+        const s = this.#sessions.get(id);
+        if (!s) return;
+        await s.destroy(systemAuth(s.accountId, s.projectId));
+        this.#forgetComparesOf(id);
+        this.#forgetCompareBranch(id);
+        this.#sessions.delete(id);
+      },
+      runFinished: (e) => {
+        const r = e.routine;
+        const sessionId = e.run.sessionId;
+        // Content-blind push needs a session to open; a run that never
+        // started an agent reaches the owner through hooks and its history.
+        if (e.push && sessionId && this.#pushService.enabled) {
+          void this.#pushService
+            .notifyRoutine(sessionId, { sub: r.ownerSub, accountId: r.accountId, projectId: r.projectId })
+            .catch((err) => console.error("[codeoid/push] routine notify failed:", err));
+        }
+        const s = sessionId ? this.#sessions.get(sessionId) : undefined;
+        this.#hooks?.emit(
+          "routine_end",
+          {
+            sessionId: sessionId ?? "",
+            sessionName: s?.name ?? r.spec.name,
+            workdir: s?.workdir ?? r.spec.workdir,
+            providerId: s?.toInfo().providerId ?? r.spec.provider ?? "",
+          },
+          { routine: { id: r.id, name: r.spec.name, paused: !r.enabled, pausedReason: r.pausedReason }, run: toRunWire(e.run), paused: e.paused, notify: e.push },
+        );
+      },
+      audit: (subject, action, sessionId, detail) => this.#store.audit(subject, action, sessionId, detail),
+      hasProvider: (id) => this.#providers.has(id),
+      providerIds: () => this.#providers.ids(),
+      normalizeWorkdir: (p) => normalizeWorkdir(p),
+    };
+  }
+
   #makeDispatcherHost(): DispatcherHost {
     return {
       sendToSession: async (task: DispatchTaskRow): Promise<void> => {
@@ -4669,6 +5507,7 @@ mcpHub: this.#mcpHub,
           store: this.#store,
           transcriptStore: this.#transcriptStore,
           providers: this.#providers,
+          claudeAccounts: this.#claudeAccounts,
           hooks: this.#hooks,
           identityManager: this.#identityManager,
           memory: this.#memory,
@@ -5393,6 +6232,7 @@ mcpHub: this.#mcpHub,
 
     const sessions: SessionInfo[] = [];
     const piloted = this.#pipelineDrivenSessionIds(auth.accountId, auth.projectId);
+    const routineRuns = new Set(this.#routines?.activeRunSessionIds(auth.accountId, auth.projectId) ?? []);
     for (const session of this.#sessions.values()) {
       // Tenancy filter — never enumerate sessions belonging to a
       // different account/project. Same shape as #getOwnedSession.
@@ -5406,7 +6246,11 @@ mcpHub: this.#mcpHub,
       sessions.push({
         ...info,
         attachedClients: session.attachedClientCount,
-        ...(piloted.has(session.id) ? { managedBy: "pipeline" as const } : {}),
+        ...(piloted.has(session.id)
+          ? { managedBy: "pipeline" as const }
+          : routineRuns.has(session.id)
+            ? { managedBy: "routine" as const }
+            : {}),
       });
     }
 
@@ -5942,6 +6786,16 @@ mcpHub: this.#mcpHub,
     if (msg.clientMsgId !== undefined && session.markClientMsgSeen(msg.clientMsgId)) {
       return { type: "response.ok", requestId: msg.id, data: { duplicate: true } };
     }
+    // Tell the sender directly when the session's Claude account can't be
+    // used (gone, or redirectable by the workdir's settings) — session.send
+    // would refuse too, but only as a message in the stream.
+    if (session.toInfo().providerId === "claude") {
+      try {
+        session.assertClaudeAccountUsable();
+      } catch (err) {
+        return this.#claudeAccountsError(msg.id, err);
+      }
+    }
 
     // Fire and forget — output streams to attached clients. The user message
     // is persisted synchronously at the top of session.send() before any
@@ -6457,6 +7311,164 @@ mcpHub: this.#mcpHub,
       requestId: msg.id,
       data: { providerId: result.providerId },
     };
+  }
+
+  /**
+   * Redial one of the session backend's MCP servers (#389). It changes no
+   * configuration — the server, its config and its credentials are the
+   * backend's — so it needs what acting in the session needs: session:send.
+   */
+  async #mcpReconnect(
+    msg: Extract<ClientMessage, { type: "session.mcp_reconnect" }>,
+    auth: AuthContext,
+  ): Promise<DaemonMessage> {
+    if (!hasScope(auth.scopes as string[], SCOPES.SESSION_SEND)) {
+      return { type: "response.error", requestId: msg.id, error: "Missing scope: session:send", code: "forbidden" };
+    }
+    const session = this.#getOwnedSession(msg.sessionId, auth);
+    if (!session) {
+      return { type: "response.error", requestId: msg.id, error: "Session not found", code: "not_found" };
+    }
+    const result = await session.reconnectMcpServer(msg.server, auth);
+    if ("unsupported" in result) {
+      return { type: "response.error", requestId: msg.id, error: result.unsupported, code: "invalid_request" };
+    }
+    if ("refused" in result) {
+      return { type: "response.error", requestId: msg.id, error: result.refused, code: "invalid_request" };
+    }
+    return { type: "response.ok", requestId: msg.id, data: result };
+  }
+
+  /** Re-read the session's MCP servers and apply any change (#395). `session:send`. */
+  async #mcpRefresh(
+    msg: Extract<ClientMessage, { type: "session.mcp_refresh" }>,
+    auth: AuthContext,
+  ): Promise<DaemonMessage> {
+    if (!hasScope(auth.scopes as string[], SCOPES.SESSION_SEND)) {
+      return { type: "response.error", requestId: msg.id, error: "Missing scope: session:send", code: "forbidden" };
+    }
+    const session = this.#getOwnedSession(msg.sessionId, auth);
+    if (!session) {
+      return { type: "response.error", requestId: msg.id, error: "Session not found", code: "not_found" };
+    }
+    const result = await session.refreshMcp();
+    this.#store.audit(auth.sub, "session.mcp_refresh", session.id, `changed=${result.changed} deferred=${result.deferred}`);
+    return { type: "response.ok", requestId: msg.id, data: result };
+  }
+
+  /**
+   * What approving a project's MCP server would approve, in full (#395): the
+   * one deciding sees the command, every argument, the URL, and each env var
+   * and header, exactly as they'll run — nothing masked or cut. Same rights as approving.
+   */
+  async #mcpApprovePreview(
+    msg: Extract<ClientMessage, { type: "mcp.approve.preview" }>,
+    auth: AuthContext,
+  ): Promise<DaemonMessage> {
+    const fail = (error: string, code: "invalid_request" | "not_found" | "forbidden" = "invalid_request"): DaemonMessage => ({
+      type: "response.error",
+      requestId: msg.id,
+      error,
+      code,
+    });
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE) || auth.delegationDepth > 0) {
+      return fail("Reviewing a project's MCP server for approval needs settings:write, on a token of your own", "forbidden");
+    }
+    const session = this.#getOwnedSession(msg.sessionId, auth);
+    if (!session) return fail("Session not found", "not_found");
+    const read = await readWorkdirServers(session.workdir);
+    if (!read) return fail("Claude's config can't be read just now (it may be mid-write) — try again");
+    if (read.repoUnreadable) return fail("The project's .mcp.json can't be read just now (mid-edit, not JSON, or too big) — try again once it can");
+    const repo = read.servers.filter((w) => w.origin === "claude-repo" && w.name === msg.server && (msg.path === undefined || w.path === msg.path));
+    if (repo.length === 0) return fail(`This project declares no MCP server ${JSON.stringify(msg.server)}`, "not_found");
+    if (repo.length > 1) return fail(`${JSON.stringify(msg.server)} is declared in ${repo.map((w) => w.path).join(" and ")}; say which file`);
+    const w = repo[0]!;
+    // Everything here is the repo's choice and is what gets approved, so it's
+    // shown exactly — a secret committed to the repo isn't the approver's to
+    // be kept from. Only what wouldn't show (bidi, zero-width, controls) is escaped.
+    const shown = (o: Record<string, string> | undefined) => Object.fromEntries(Object.entries(o ?? {}).map(([k, v]) => [visibleVerbatim(k), visibleVerbatim(v)]));
+    const commandLine = w.raw.command === undefined ? null : [w.raw.command, ...(w.raw.args ?? [])].map((a) => shellArg(visibleCompact(a))).join(" ");
+    const lines: string[] = [];
+    if (commandLine !== null) lines.push(`command: ${commandLine}`);
+    if (w.raw.url !== undefined) {
+      // The host it dials, as the URL parser reads it — a look-alike
+      // (Cyrillic "Ь"), userinfo (`api.github.com@evil.example`) or an
+      // encoded dot can't pass for another.
+      let host = "(not a valid URL)";
+      try {
+        host = new URL(w.raw.url).host;
+      } catch {}
+      lines.push(`url: ${quotedVisible(w.raw.url)} (host: ${quotedVisible(host)})`);
+    }
+    const block = (label: string, o: Record<string, string> | undefined, sep: string) => {
+      const entries = Object.entries(o ?? {});
+      if (entries.length === 0) return;
+      lines.push(`${label} (${entries.length}):`);
+      for (const [k, v] of entries) lines.push(`  ${quotedVisible(k)}${sep}${quotedVisible(v)}`);
+    };
+    block("env", w.raw.env, " = ");
+    block("headers", w.raw.headers, ": ");
+    const preview: McpApprovePreview = {
+      lines,
+      server: w.name,
+      path: w.path, // sent back to name the entry: as is (clients escape it to show)
+      fingerprint: w.fingerprint,
+      shownPath: visibleVerbatim(w.path),
+      commandLine,
+      command: w.raw.command === undefined ? null : visibleVerbatim(w.raw.command),
+      args: (w.raw.args ?? []).map(visibleVerbatim),
+      url: w.raw.url === undefined ? null : visibleVerbatim(w.raw.url),
+      env: shown(w.raw.env),
+      headers: shown(w.raw.headers),
+    };
+    return { type: "response.ok", requestId: msg.id, data: preview };
+  }
+
+  /**
+   * Approve a repo's MCP server — this exact entry — for every backend in the
+   * session's workdir (#395). Consent to what a repo chose, so: the caller's
+   * own session, `settings:write`, never a delegated token, audited with the
+   * file it came from. Applies on a refresh.
+   */
+  async #mcpApprove(
+    msg: Extract<ClientMessage, { type: "mcp.approve" }>,
+    auth: AuthContext,
+  ): Promise<DaemonMessage> {
+    const fail = (error: string, code: "invalid_request" | "not_found" | "forbidden" = "invalid_request"): DaemonMessage => ({
+      type: "response.error",
+      requestId: msg.id,
+      error,
+      code,
+    });
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE) || auth.delegationDepth > 0) {
+      return fail("Approving a project's MCP server needs settings:write, on a token of your own", "forbidden");
+    }
+    const session = this.#getOwnedSession(msg.sessionId, auth);
+    if (!session) return fail("Session not found", "not_found");
+    const read = await readWorkdirServers(session.workdir);
+    if (!read) return fail("Claude's config can't be read just now (it may be mid-write) — try again");
+    if (read.repoUnreadable) return fail("The project's .mcp.json can't be read just now (mid-edit, not JSON, or too big) — try again once it can");
+    const repo = read.servers.filter(
+      (w) => w.origin === "claude-repo" && w.name === msg.server && (msg.path === undefined || w.path === msg.path),
+    );
+    if (repo.length === 0) return fail(`This project declares no MCP server ${JSON.stringify(msg.server)}`, "not_found");
+    // The entry approved is the one the caller looked at: a repo that changed
+    // it since (or a race to) gets nothing.
+    const entry = repo.find((w) => w.fingerprint === msg.fingerprint);
+    if (!entry) return fail(`${JSON.stringify(msg.server)} changed since it was shown — look at it again before approving`);
+    this.#store.approveWorkdirMcpServer(
+      { accountId: auth.accountId, projectId: auth.projectId, workdir: session.workdir },
+      entry.name,
+      entry.fingerprint,
+      auth.sub,
+    );
+    this.#store.audit(
+      auth.sub,
+      "mcp.approve",
+      session.id,
+      `server=${JSON.stringify(entry.name)} source=${JSON.stringify(entry.path)} fingerprint=${entry.fingerprint} program=${JSON.stringify(entry.raw.command ? serverProgram(entry.raw.command) : redactMcpUrl(entry.raw.url ?? ""))}`,
+    );
+    return { type: "response.ok", requestId: msg.id, data: { server: entry.name, path: entry.path } };
   }
 
   #rename(

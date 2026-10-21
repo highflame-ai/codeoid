@@ -23,7 +23,7 @@
  *     reconstructed.
  */
 
-import { type ProviderEvent, isSubagentEvent } from "./interface.js";
+import { type NativeTurnRef, type ProviderEvent, isSubagentEvent } from "./interface.js";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -43,6 +43,12 @@ export interface CanonicalToolCall {
   success: boolean;
   /** Original provider name before normalization ("Read", "Bash"). */
   originalName?: string;
+  /**
+   * A tool_result hook replaced the output (redaction): `output` is what
+   * codeoid keeps, and the backend's own record still holds the original — so
+   * a native fork, which copies that record, must not be used (#387).
+   */
+  redacted?: boolean;
 }
 
 export type CanonicalTurn =
@@ -77,6 +83,18 @@ export type CanonicalTurn =
       /** Which provider produced this turn. */
       providerId: string;
       model: string;
+      /**
+       * Where this turn ends in `providerId`'s own conversation (#387): a fork
+       * or rewind to here can continue that conversation natively.
+       */
+      native?: NativeTurnRef;
+      /**
+       * Rebuilt from a displayed transcript (an imported bundle, or a session
+       * from before the canonical log), not recorded from the backend: its
+       * text and tool calls aren't trusted to be the model's own, so they are
+       * never replayed to a backend in the assistant's voice (#387).
+       */
+      restored?: boolean;
     };
 
 // ── Tool name normalization ───────────────────────────────────────────────────
@@ -352,11 +370,22 @@ export class CanonicalHistoryAccumulator {
   #currentThinking = "";
   #currentTools = new Map<
     string, // sdkToolUseId
-    { id: string; name: string; originalName?: string; input: Record<string, unknown>; output?: string; success?: boolean }
+    { id: string; name: string; originalName?: string; input: Record<string, unknown>; output?: string; success?: boolean; redacted?: boolean }
   >();
+
+  /**
+   * The last assistant text block since the latest user turn: the agent's
+   * final message, without the narration that came before its tool calls.
+   * In-memory only (null after a restore, or when this turn wrote no text).
+   */
+  #lastTextBlock: string | null = null;
 
   get history(): readonly CanonicalTurn[] {
     return this.#history;
+  }
+
+  get lastTextBlock(): string | null {
+    return this.#lastTextBlock;
   }
 
   /** Append a user turn. Call once per runTurn() before feeding events. */
@@ -374,6 +403,7 @@ export class CanonicalHistoryAccumulator {
       ...(extra?.background ? { background: true } : {}),
     };
     this.#currentTurnId = turnId;
+    this.#lastTextBlock = null;
     this.#history.push(turn);
     this.#emit({ op: "append", turn });
   }
@@ -404,6 +434,7 @@ export class CanonicalHistoryAccumulator {
         this.#currentText = this.#currentText
           ? `${this.#currentText}\n\n${event.content}`
           : event.content;
+        if (event.content.trim()) this.#lastTextBlock = event.content;
         break;
 
       case "thinking_delta":
@@ -424,6 +455,7 @@ export class CanonicalHistoryAccumulator {
         if (partial) {
           partial.output = limitToolOutput(partial.name, event.output);
           partial.success = event.success;
+          if (event.redacted) partial.redacted = true;
         }
         break;
       }
@@ -451,6 +483,7 @@ export class CanonicalHistoryAccumulator {
             ...(this.#currentThinking ? { thinking: this.#currentThinking } : {}),
             providerId: event.result.providerId,
             model: event.result.model,
+            ...(event.result.nativeRef ? { native: event.result.nativeRef } : {}),
           };
           this.#history.push(turn);
           this.#emit({ op: "append", turn });
@@ -474,6 +507,7 @@ export class CanonicalHistoryAccumulator {
   #clear(): void {
     this.#history = [];
     this.#currentTurnId = undefined;
+    this.#lastTextBlock = null;
     this.#currentText = "";
     this.#currentThinking = "";
     this.#currentTools.clear();
@@ -559,11 +593,13 @@ function toolCallToSeedText(tc: CanonicalToolCall): string {
  *
  * Fidelity contract: this is a faithful TRANSCRIPT, not a native
  * continuation. Tool calls are rendered as structured text blocks (name,
- * JSON input, fenced output) rather than native tool_use structures —
- * neither the Claude Agent SDK nor pi's RPC accepts synthesized native
- * history injection, so a prompt-prefix transcript is the warm-backend
- * ceiling. Oldest turns are dropped first when the budget is exceeded
- * (recent context matters most), with an elision note.
+ * JSON input, fenced output) rather than native tool_use structures. It is
+ * the FALLBACK: a backend that can take the conversation in its own form does
+ * so through `continueNatively` (#387) — Claude and Codex fork their own
+ * conversation, or take native history codeoid builds — and this transcript
+ * is used only where that isn't available (pi, the Gemini CLI, qwen) or fails.
+ * Oldest turns are dropped first when the budget is exceeded (recent context
+ * matters most), with an elision note.
  *
  * `maxChars` should be sized to the TARGET model's context window by the
  * caller (see seedBudgetChars in context-windows.ts) so a fork only truncates
@@ -640,4 +676,75 @@ export function renderHistorySeed(
   ].join("\n");
 
   return { text, totalTurns: rendered.length, keptTurns, omittedTurns, newestTurnSliced };
+}
+
+/** Rough size of a turn as native history (text, tool inputs and outputs), for budgets. */
+export function canonicalTurnChars(turn: CanonicalTurn): number {
+  if (turn.role === "user") return turn.content.length;
+  let n = turn.content.length;
+  for (const tc of turn.toolCalls ?? []) n += JSON.stringify(tc.input).length + tc.output.length + tc.name.length + 64;
+  return n;
+}
+
+/**
+ * Keep the newest turns of `history` that fit `maxChars`, as measured by
+ * `size`, for a backend that takes the conversation as native history (#387).
+ * Whole turns are dropped oldest first; when the newest turn alone exceeds the
+ * budget, its tool inputs and outputs are cut to fit and it is kept. The
+ * result reports what was dropped, in the same shape a transcript seed does,
+ * so the session surfaces it the same way.
+ */
+export function fitTurnsToBudget(
+  history: readonly CanonicalTurn[],
+  maxChars: number,
+  size: (turn: CanonicalTurn) => number,
+): { turns: CanonicalTurn[]; truncation: HistorySeedResult } {
+  const kept: CanonicalTurn[] = [];
+  let used = 0;
+  let newestTurnSliced = false;
+  for (let i = history.length - 1; i >= 0; i--) {
+    let turn = history[i]!;
+    const n = size(turn);
+    if (used + n > maxChars) {
+      if (kept.length > 0) break;
+      turn = shrinkTurn(turn, maxChars);
+      newestTurnSliced = true;
+    }
+    kept.unshift(turn);
+    used += size(turn);
+  }
+  return {
+    turns: kept,
+    truncation: {
+      text: "",
+      totalTurns: history.length,
+      keptTurns: kept.length,
+      omittedTurns: history.length - kept.length,
+      newestTurnSliced,
+    },
+  };
+}
+
+/** One turn cut down to roughly `maxChars`: text and each tool payload get an equal share. */
+function shrinkTurn(turn: CanonicalTurn, maxChars: number): CanonicalTurn {
+  const cut = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}\n…truncated to fit the context window…` : s);
+  if (turn.role === "user") return { ...turn, content: cut(turn.content, maxChars) };
+  const parts = 1 + 2 * (turn.toolCalls?.length ?? 0);
+  const share = Math.max(200, Math.floor(maxChars / parts));
+  return {
+    ...turn,
+    content: cut(turn.content, share),
+    ...(turn.toolCalls
+      ? {
+          toolCalls: turn.toolCalls.map((tc) => {
+            const input = JSON.stringify(tc.input);
+            return {
+              ...tc,
+              input: input.length > share ? { truncated: cut(input, share) } : tc.input,
+              output: cut(tc.output, share),
+            };
+          }),
+        }
+      : {}),
+  };
 }

@@ -25,7 +25,7 @@ export interface Device {
 /** The content-blind payload — opaque ids only. */
 export interface PushMessage {
   sessionId: string;
-  kind: "approval";
+  kind: "approval" | "routine";
 }
 
 /** Apple Push Notification service credentials (token-based auth, a `.p8` key). */
@@ -69,3 +69,8 @@ export interface PushChannel {
 /** Content-blind alert copy, shared by both channels — no session content. */
 export const ALERT_TITLE = "codeoid";
 export const ALERT_BODY = "A session needs your approval";
+
+/** Generic, content-blind alert copy per kind — never a name, outcome, or summary. */
+export function alertBody(kind: PushMessage["kind"]): string {
+  return kind === "routine" ? "A routine has something for you" : ALERT_BODY;
+}

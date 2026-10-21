@@ -12,12 +12,13 @@
  * in Session/SessionManager changes.
  */
 
+import type { ResolvedClaudeAccount } from "../claude-accounts.js";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import type { Store } from "../store.js";
 import type { AgentIdentityManager } from "../agent-identity.js";
 import type { MemoryEngine } from "../memory/index.js";
 import type { MemoryMcpMount } from "../memory/mcp-http.js";
-import type { McpRegistry } from "../mcp/registry.js";
+import type { McpServerView } from "../mcp/registry.js";
 import type { McpHub } from "../mcp/hub.js";
 import type { McpTenant } from "../mcp/oauth.js";
 import type { CompressionRegistry } from "../compress/index.js";
@@ -62,7 +63,7 @@ export interface ProviderSessionInit {
    *  inits for why it is a getter and not a value. */
   blackboardMcp?: () => { url: string; token: string } | undefined;
   /** Cross-backend MCP registry — the servers to mount on this session's backend. */
-  mcpRegistry?: McpRegistry;
+  mcpRegistry?: McpServerView;
   /** Daemon-owned MCP client pool backing the registry (Model-B backends execute
    *  external tool calls through it; Model-A backends mount servers natively). */
   mcpHub?: McpHub;
@@ -72,6 +73,8 @@ export interface ProviderSessionInit {
   compressionRegistry?: CompressionRegistry;
   /** Live model-catalog report, already tagged with the factory's id by Session. */
   onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
+  /** The session's Claude account, resolved per query — Claude backend only (claude-accounts.ts). */
+  resolveClaudeAccount?: () => ResolvedClaudeAccount | null;
 }
 
 export interface ProviderFactory {
@@ -234,9 +237,11 @@ export function createDefaultProviderRegistry(
         fleet: init.fleet,
         blackboardMcp: init.blackboardMcp,
         mcpRegistry: init.mcpRegistry,
+        mcpHub: init.mcpHub,
         config: init.config,
         compressionRegistry: init.compressionRegistry,
         onModels: init.onModels,
+        resolveAccount: init.resolveClaudeAccount,
       }),
   });
   // Stateless API backends: usable only with their key in the environment
@@ -370,6 +375,7 @@ export function createDefaultProviderRegistry(
             workspaceId: init.workspaceId,
             tenant: init.tenant,
             memoryMcp: init.memoryMcp,
+            mcpProxy: init.mcpHub?.proxy ?? undefined,
             blackboardMcp: init.blackboardMcp,
             mcpRegistry: init.mcpRegistry,
             onModels: init.onModels,
@@ -401,6 +407,7 @@ export function createDefaultProviderRegistry(
             workspaceId: init.workspaceId,
             tenant: init.tenant,
             memoryMcp: init.memoryMcp,
+            mcpProxy: init.mcpHub?.proxy ?? undefined,
             blackboardMcp: init.blackboardMcp,
             mcpRegistry: init.mcpRegistry,
             onModels: init.onModels,
@@ -433,6 +440,7 @@ export function createDefaultProviderRegistry(
           store: init.store,
           memory: init.memory,
           fleet: init.fleet as { type: "sdk"; name: string; instance: unknown } | undefined,
+          mcpProxy: init.mcpHub?.proxy ?? undefined,
           mcpRegistry: init.mcpRegistry,
           config: init.config,
           onModels: init.onModels,

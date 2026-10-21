@@ -16,11 +16,12 @@ import { McpRegistry } from "../daemon/mcp/registry.js";
 import { SessionManager } from "../daemon/session-manager.js";
 import { TranscriptStore } from "../daemon/transcript.js";
 import { registryServersForClaude } from "../daemon/providers/claude/index.js";
-import { registryServersForQwen } from "../daemon/providers/qwen/index.js";
+import { proxiedServersForQwen, registryServersForQwen } from "../daemon/providers/qwen/index.js";
+import { McpProxy, McpProxyLease } from "../daemon/mcp/proxy.js";
 import { SCOPES } from "../protocol/scopes.js";
 import type { McpServerStatus } from "../protocol/types.js";
 import type { RawMcpServerConfig } from "../config.js";
-import { FakeOAuthMcp } from "./fixtures/fake-oauth-mcp.js";
+import { FAKE_TOOL_NAMES, FakeOAuthMcp } from "./fixtures/fake-oauth-mcp.js";
 
 const TENANT: McpTenant = { accountId: "acc-1", projectId: "proj-1" };
 const OTHER: McpTenant = { accountId: "acc-2", projectId: "proj-2" };
@@ -104,8 +105,13 @@ describe("connecting", () => {
     expect(token).toBeTruthy();
     const call = await fetch(fake.mcpUrl, {
       method: "POST",
-      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "whoami", arguments: {} } }),
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } },
+      }),
     });
     expect(call.status).toBe(200);
   });
@@ -252,7 +258,63 @@ describe("using the credential", () => {
     await connect(oauth, s);
     fake.revokeRefreshTokens();
     now += 600_000;
+    expect(oauth.status(s, TENANT)).toBe("connected"); // a refresh token, not yet tried
     expect(await oauth.accessToken(s, TENANT)).toBeUndefined();
+    // The dead tokens are forgotten: it reads as signed out (Settings offers
+    // Connect), not signed in and failing (#390).
+    expect(oauth.status(s, TENANT)).toBe("disconnected");
+    expect(oauth.credentialStamp(s, TENANT)).toBeUndefined();
+  });
+
+  it("keeps the tokens through an outage at the token endpoint — that's no verdict on them (#390)", async () => {
+    fake = new FakeOAuthMcp({ expiresIn: 600 });
+    const oauth = engine();
+    const s = spec();
+    await connect(oauth, s);
+    now += 600_000;
+    fake.tokenOutage = 503;
+    expect(await oauth.accessToken(s, TENANT)).toBeUndefined();
+    expect(oauth.status(s, TENANT)).toBe("connected"); // still signed in
+    fake.tokenOutage = null;
+    expect(await oauth.accessToken(s, TENANT)).toBeTruthy(); // and the next try refreshes
+  });
+
+  it("keeps the tokens when the token endpoint can't be reached", async () => {
+    fake = new FakeOAuthMcp({ expiresIn: 600 });
+    let down = false;
+    const oauth = new McpOAuth({
+      store,
+      redirectBaseUrl: () => REDIRECT_BASE,
+      env: {},
+      now: () => now,
+      fetchFn: (url, init) => (down && String(url).endsWith("/token") ? Promise.reject(new TypeError("fetch failed")) : fetch(url, init)),
+    });
+    const s = spec();
+    await connect(oauth, s);
+    now += 600_000;
+    down = true;
+    expect(await oauth.accessToken(s, TENANT)).toBeUndefined();
+    expect(oauth.status(s, TENANT)).toBe("connected");
+  });
+
+  it("stamps a sign-in: a new one changes the stamp, a refresh doesn't (#390)", async () => {
+    fake = new FakeOAuthMcp({ expiresIn: 600 });
+    const oauth = engine();
+    const s = spec();
+    expect(oauth.credentialStamp(s, TENANT)).toBeUndefined();
+    await connect(oauth, s);
+    const first = oauth.credentialStamp(s, TENANT)!;
+    expect(first).toBeTruthy();
+    // A refresh (rotating the refresh token) is the same sign-in.
+    now += 600_000;
+    expect(await oauth.accessToken(s, TENANT)).toBeTruthy();
+    expect(fake.stats.refreshes).toBe(1);
+    expect(oauth.credentialStamp(s, TENANT)).toBe(first);
+    oauth.disconnect(s, TENANT);
+    expect(oauth.credentialStamp(s, TENANT)).toBeUndefined();
+    await connect(oauth, s);
+    expect(oauth.credentialStamp(s, TENANT)).not.toBe(first);
+    expect(oauth.credentialStamp(s, OTHER)).toBeUndefined(); // per tenant
   });
 
   it("forgets the tokens on disconnect", async () => {
@@ -277,11 +339,12 @@ describe("the hub calls an OAuth server with the tenant's token", () => {
     const s = spec();
     await connect(oauth, s);
     const hub = new McpHub({ credentials: oauth });
-    expect((await hub.listTools(s, scope(TENANT))).map((t) => t.name)).toEqual(["whoami"]);
+    expect((await hub.listTools(s, scope(TENANT))).map((t) => t.name)).toEqual([...FAKE_TOOL_NAMES]);
     const res = await hub.callTool(s, "whoami", {}, scope(TENANT));
     expect(res).toEqual({ text: "you are user-1", isError: false });
     // The upstream session id the server issued is carried on later requests.
-    expect(fake.lastMcpHeaders?.get("mcp-session-id")).toBe("fake-session-1");
+    expect(fake.lastMcpHeaders?.get("mcp-session-id")).toMatch(/^[0-9a-f]{16}$/);
+    expect(fake.openSessions).toBe(1);
     hub.closeAll();
   });
 
@@ -347,6 +410,16 @@ describe("native-mount backends", () => {
     expect(reg.forNativeMount("gemini-cli").map((s) => s.name)).toEqual(["plain"]);
     // The daemon-owned client still sees it.
     expect(reg.forBackend("openai").map((s) => s.name)).toEqual(["notes", "plain"]);
+  });
+
+  it("qwen gets OAuth servers through the relay, with the proxy token as a header (#396)", () => {
+    const reg = new McpRegistry({ notes: raw({ url: "https://notes.example.com/mcp", oauth: true }) }, { memoryEnabled: false });
+    const proxy = new McpProxy({ registry: reg, credentials: null, baseUrl: () => "http://127.0.0.1:7400" });
+    const lease = new McpProxyLease(proxy, { tenant: TENANT, sessionId: "s1", backendId: "qwen" });
+    const servers = proxiedServersForQwen(lease) as Record<string, { httpUrl: string; headers: Record<string, string> }>;
+    expect(servers.notes?.httpUrl).toBe(proxy.url("notes"));
+    expect(servers.notes?.headers.Authorization).toMatch(/^Bearer \S{40,}$/);
+    expect(proxiedServersForQwen(new McpProxyLease(proxy, null))).toEqual({}); // no tenant, nothing mounted
   });
 });
 
@@ -416,7 +489,7 @@ describe("mcp.oauth.* through the session manager", () => {
     };
     expect(statusOf(before.snapshot, "notes")?.oauth).toEqual({
       status: "disconnected",
-      unsupportedBackends: ["claude", "codex", "gemini-cli", "qwen"],
+      unsupportedBackends: [], // claude through codeoid (#390), codex / gemini-cli / qwen through the relay (#396)
     });
     expect(statusOf(before.snapshot, "plain")?.oauth).toBeUndefined();
 
@@ -471,7 +544,7 @@ describe("mcp.oauth.* through the session manager", () => {
         }).snapshot,
         "notes",
       );
-    expect(await get(TENANT)).toMatchObject({ health: "connected", tools: ["whoami"] });
+    expect(await get(TENANT)).toMatchObject({ health: "connected", tools: [...FAKE_TOOL_NAMES] });
     expect(await get(OTHER)).toMatchObject({ health: "idle", tools: [] });
     hub.closeAll();
   });
@@ -548,7 +621,7 @@ describe("credential binding and limits", () => {
     await connect(oauth, s, TENANT);
     const hub = new McpHub({ credentials: oauth });
     await hub.listTools(s, { workspaceId: "w", sessionId: "s", tenant: TENANT });
-    expect(hub.statusFor("notes", TENANT)?.tools).toEqual(["whoami"]);
+    expect(hub.statusFor("notes", TENANT)?.tools).toEqual([...FAKE_TOOL_NAMES]);
     expect(hub.hasClient("notes", TENANT)).toBe(true);
     expect(hub.statusFor("notes", OTHER)).toBeUndefined();
     expect(hub.hasClient("notes", OTHER)).toBe(false);

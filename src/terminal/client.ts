@@ -6,11 +6,15 @@
 
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
+import { mcpRefreshSummary } from "@highflame/codeoid-core";
 import type { CodeoidConfig } from "../config.js";
 import { PIPELINE_INPUT_REQUEST_PREFIX, PROTOCOL_VERSION } from "../protocol/types.js";
 import type {
   ClientMessage,
   CollaborationConfig,
+  McpReconnectResult,
+  McpApprovePreview,
+  McpRefreshResult,
   CompareState,
   CompareTargetSpec,
   DaemonMessage,
@@ -349,6 +353,11 @@ export class TerminalClient {
         const status = this.#formatStatus(s.status);
         console.log(`  ${s.name.padEnd(20)} ${status.padEnd(20)} ${s.workdir}`);
         console.log(`  ${"".padEnd(20)} id: ${s.id}  clients: ${s.attachedClients}`);
+        if (s.effectiveClaudeAccount) {
+          // Which Claude account it bills, and whether that is its own choice.
+          const own = s.claudeAccount ? "" : " (daemon default)";
+          console.log(`  ${"".padEnd(20)} claude account: ${S(s.effectiveClaudeAccount)}${own}`);
+        }
         if (s.pendingDialog) {
           // What it is waiting on, and how to answer it from here (#348).
           const how =
@@ -425,6 +434,7 @@ export class TerminalClient {
       packRole?: string;
       providerId?: string;
       model?: string;
+      claudeAccount?: string;
       collaboration?: CollaborationConfig;
     } = {},
   ): Promise<void> {
@@ -438,6 +448,7 @@ export class TerminalClient {
       // a claude session.
       ...(opts.providerId ? { providerId: opts.providerId } : {}),
       ...(opts.model ? { model: opts.model } : {}),
+      ...(opts.claudeAccount ? { claudeAccount: opts.claudeAccount } : {}),
       ...(opts.pack ? { pack: opts.pack } : {}),
       ...(opts.packRole ? { packRole: opts.packRole } : {}),
       ...(opts.collaboration ? { collaboration: opts.collaboration } : {}),
@@ -750,6 +761,155 @@ export class TerminalClient {
       const snap = t.checkpoint ? "" : list.checkpointsSupported ? "  [no snapshot]" : "";
       console.log(`${String(t.index).padStart(3)}. ${S(t.preview)}${tag}${snap}`);
     }
+  }
+
+  /** `codeoid mcp refresh` — apply Claude's current MCP config to a session (#395). */
+  async mcpRefresh(sessionIdOrName: string): Promise<void> {
+    const sessionId = await this.#resolveSession(sessionIdOrName);
+    if (!sessionId) return;
+    const resp = await this.#request({ type: "session.mcp_refresh", id: randomUUID(), sessionId });
+    if (resp.type !== "response.ok") {
+      this.#printError(resp);
+      process.exitCode = 1;
+      return;
+    }
+    const r = resp.data as McpRefreshResult;
+    console.log(mcpRefreshSummary(r));
+  }
+
+  /** `codeoid mcp approve` — approve a project's MCP server for every backend in the workdir (#395). */
+  async mcpApprove(sessionIdOrName: string, server: string, opts: { path?: string; yes?: string } = {}): Promise<void> {
+    const sessionId = await this.#resolveSession(sessionIdOrName);
+    if (!sessionId) return;
+    // Review first: the entry in full, and the fingerprint an approval binds to.
+    const pv = await this.#request({ type: "mcp.approve.preview", id: randomUUID(), sessionId, server, ...(opts.path ? { path: opts.path } : {}) });
+    if (pv.type !== "response.ok") {
+      this.#printError(pv);
+      process.exitCode = 1;
+      return;
+    }
+    const p = pv.data as McpApprovePreview;
+    if (!opts.yes) {
+      // The repo wrote these: no terminal control sequences reach the screen.
+      const clean = sanitizeTerminalOutput;
+      console.log(clean(`${p.server}, from ${p.shownPath} — once approved, every backend in this directory runs it, with the daemon user's files and network:`));
+      for (const line of p.lines) console.log(clean(`  ${line}`));
+      console.log("  (shown exactly as it runs; characters that wouldn't show are escaped as \\u{…}, and a run of spaces counted)");
+      console.log("  (an env value that is exactly ${VAR} resolves from the daemon's environment when it starts; header values are sent as written)");
+      const q = (v: string) => clean(`'${v.replace(/'/g, "'\\''")}'`); // pasted back into a shell: quoted
+      console.log(`To approve exactly this entry: codeoid mcp approve --path ${q(p.path)} --yes ${p.fingerprint} -- ${q(sessionIdOrName)} ${q(p.server)}`);
+      return;
+    }
+    // The entry reviewed, not whatever is in the file now.
+    if (opts.yes !== p.fingerprint) {
+      console.error(`${p.server} changed since that review (now ${p.fingerprint}) — review it again.`);
+      process.exitCode = 1;
+      return;
+    }
+    const resp = await this.#request({ type: "mcp.approve", id: randomUUID(), sessionId, server, path: p.path, fingerprint: opts.yes });
+    if (resp.type !== "response.ok") {
+      this.#printError(resp);
+      process.exitCode = 1;
+      return;
+    }
+    console.log(`${server}: approved for every backend in this workdir — run \`codeoid mcp refresh ${sessionIdOrName}\` to use it now.`);
+  }
+
+  /** `codeoid mcp reconnect` — redial one of the session backend's MCP servers (#389). */
+  async mcpReconnect(sessionIdOrName: string, server: string): Promise<void> {
+    const sessionId = await this.#resolveSession(sessionIdOrName);
+    if (!sessionId) return;
+    const resp = await this.#request({ type: "session.mcp_reconnect", id: randomUUID(), sessionId, server });
+    if (resp.type !== "response.ok") {
+      this.#printError(resp);
+      process.exitCode = 1;
+      return;
+    }
+    const r = resp.data as McpReconnectResult;
+    if (r.status === "connected") console.log(`${server}: connected (${r.tools.length} tool${r.tools.length === 1 ? "" : "s"}).`);
+    else if (r.deferred) console.log(`${server}: the backend isn't running; it connects its servers when the next turn starts.`);
+    else {
+      console.log(`${server}: ${r.status}${r.error ? ` — ${r.error}` : ""}`);
+      process.exitCode = 1;
+    }
+  }
+
+  /**
+   * `codeoid mcp adopt` (#390): put a remote server from Claude's own config
+   * into codeoid's registry, signed in by codeoid. With a session, its
+   * workdir's servers (a `.mcp.json`, project entries) are looked in too.
+   */
+  async mcpAdopt(server: string, sessionIdOrName?: string, url?: string): Promise<void> {
+    let sessionId: string | undefined;
+    if (sessionIdOrName !== undefined) {
+      sessionId = (await this.#resolveSession(sessionIdOrName)) ?? undefined;
+      if (!sessionId) return;
+    }
+    const resp = await this.#request({ type: "mcp.adopt", id: randomUUID(), server, ...(sessionId ? { sessionId } : {}), ...(url ? { url } : {}) });
+    if (resp.type !== "mcp.adopt.result") {
+      this.#printError(resp);
+      process.exitCode = 1;
+      return;
+    }
+    const signedIn = resp.snapshot.mcpServers?.find((s) => s.name === server)?.oauth?.status === "connected";
+    console.log(
+      resp.alreadyAdopted ? `${S(server)} is already codeoid's.` : `${S(server)} is codeoid's now; Claude sessions use codeoid's copy from their next turn once you've signed in.`,
+    );
+    if (!signedIn) console.log(`Sign in to it: codeoid mcp signin ${S(server)}`);
+  }
+
+  /**
+   * `codeoid mcp signin` (#390): sign in to an OAuth server in codeoid's
+   * registry. Prints the address to open; after the sign-in the browser lands
+   * on the daemon's page, whose address is pasted back here — the daemon
+   * finishes a sign-in on its own only for the browser the web UI started it
+   * from. `callbackUrl` finishes one started earlier, without a terminal.
+   */
+  async mcpSignin(server: string, callbackUrl?: string): Promise<void> {
+    if (callbackUrl) {
+      await this.#finishMcpSignin(callbackUrl);
+      return;
+    }
+    // Discovery and client registration are a few round trips to the provider.
+    const begun = await this.#request({ type: "mcp.oauth.begin", id: randomUUID(), server }, 45_000);
+    if (begun.type !== "mcp.oauth.begin.result") {
+      this.#printError(begun);
+      process.exitCode = 1;
+      return;
+    }
+    if (begun.status === "connected" || !begun.url) {
+      console.log(`${S(server)} is signed in.`);
+      return;
+    }
+    console.log(`Open this address to sign in to ${S(server)}:\n\n  ${begun.url}\n`);
+    console.log("After signing in, the browser lands on a codeoid page; copy that page's address.");
+    if (!process.stdin.isTTY) {
+      console.log(`Then finish with: codeoid mcp signin ${S(server)} --callback-url '<that address>'`);
+      return;
+    }
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const pasted = await new Promise<string>((resolve) => {
+      rl.once("close", () => resolve(""));
+      rl.question("Paste it here: ", resolve);
+    });
+    rl.close();
+    if (!pasted.trim()) {
+      console.error(`Not signed in. Finish later with: codeoid mcp signin ${S(server)} --callback-url '<that address>'`);
+      process.exitCode = 1;
+      return;
+    }
+    await this.#finishMcpSignin(pasted.trim());
+  }
+
+  /** Finish a sign-in from the address its browser landed on (the tenant that began it only). */
+  async #finishMcpSignin(callbackUrl: string): Promise<void> {
+    const finished = await this.#request({ type: "mcp.oauth.complete", id: randomUUID(), callbackUrl }, 45_000);
+    if (finished.type !== "mcp.oauth.complete.result") {
+      this.#printError(finished);
+      process.exitCode = 1;
+      return;
+    }
+    console.log(`${S(finished.server)} is signed in.`);
   }
 
   /**
@@ -1233,7 +1393,22 @@ export class TerminalClient {
     console.log(`${kind} sent — watch: codeoid pipeline status ${id}`);
   }
 
-  #request(msg: ClientMessage): Promise<DaemonMessage> {
+  /** One request/response round trip — for command groups that format their own output. */
+  /** Resolve a session name or id to its id; prints why and returns null when it can't. */
+  resolveSessionId(nameOrId: string): Promise<string | null> {
+    return this.#resolveSession(nameOrId);
+  }
+
+  request(msg: ClientMessage): Promise<DaemonMessage> {
+    return this.#request(msg);
+  }
+
+  /** Print a `response.error` (or an unexpected reply) the way every command does. */
+  printError(resp: DaemonMessage): void {
+    this.#printError(resp);
+  }
+
+  #request(msg: ClientMessage, timeoutMs = 30_000): Promise<DaemonMessage> {
     return new Promise((resolve, reject) => {
       if (!this.#ws || this.#ws.readyState !== WebSocket.OPEN) {
         reject(new Error("Not connected"));
@@ -1243,7 +1418,7 @@ export class TerminalClient {
       const timeout = setTimeout(() => {
         this.#pending.delete(msg.id);
         reject(new Error("Request timeout"));
-      }, 30_000);
+      }, timeoutMs);
 
       this.#pending.set(msg.id, (resp) => {
         clearTimeout(timeout);

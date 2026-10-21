@@ -77,10 +77,10 @@ describe("McpOAuthControls", () => {
   it("offers Disconnect when signed in, and names the backends it cannot reach yet", () => {
     request.mockResolvedValueOnce({ type: "mcp.oauth.disconnect.result", requestId: "req-1", snapshot: { values: {}, secrets: {}, configPath: "", envPath: "" } });
     const { getByText, container } = render(() => (
-      <McpOAuthControls server={server("connected", ["claude", "codex"])} />
+      <McpOAuthControls server={server("connected", ["codex", "qwen"])} />
     ));
     expect(getByText("signed in")).toBeTruthy();
-    expect(container.textContent).toContain("not mounted on claude, codex");
+    expect(container.textContent).toContain("Not reachable from codex, qwen yet");
     fireEvent.click(getByText("Disconnect"));
     expect(request.mock.calls[0]?.[0]).toEqual({ type: "mcp.oauth.disconnect", id: "req-1", server: "notes" });
   });

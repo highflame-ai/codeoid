@@ -11,7 +11,7 @@
 import http2 from "node:http2";
 
 import { signEs256 } from "./jwt.js";
-import { ALERT_BODY, ALERT_TITLE, type ApnsCreds, type Device, type PushMessage, type PushChannel, type PushResult } from "./types.js";
+import { ALERT_TITLE, alertBody, type ApnsCreds, type Device, type PushMessage, type PushChannel, type PushResult } from "./types.js";
 
 const APNS_HOST_PROD = "https://api.push.apple.com";
 const APNS_HOST_SANDBOX = "https://api.sandbox.push.apple.com";
@@ -38,7 +38,7 @@ export function classifyApnsResponse(
 /** The content-blind APNs payload for an approval wake-up. */
 export function apnsPayload(msg: PushMessage): string {
   return JSON.stringify({
-    aps: { alert: { title: ALERT_TITLE, body: ALERT_BODY }, sound: "default" },
+    aps: { alert: { title: ALERT_TITLE, body: alertBody(msg.kind) }, sound: "default" },
     // Opaque routing data only — no session content.
     sessionId: msg.sessionId,
     kind: msg.kind,
