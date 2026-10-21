@@ -2632,7 +2632,9 @@ mcpHub: this.#mcpHub,
     return {
       type: "claude.accounts.result",
       requestId,
-      accounts: this.#claudeAccounts.list(),
+      // Not Bedrock: this message predates the kind, and its clients look a
+      // kind's label up without a fallback. `accounts.list` carries every kind.
+      accounts: this.#claudeAccounts.list().filter((a) => a.kind !== "bedrock"),
       defaultAccount: this.#claudeAccounts.getDefault(),
     };
   }

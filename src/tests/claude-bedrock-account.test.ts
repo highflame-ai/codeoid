@@ -91,6 +91,29 @@ describe("applyAccountEnv — bedrock", () => {
     expect(env.ANTHROPIC_MODEL).toBe("claude-opus-5-5");
   });
 
+  test("an operator-allowed AWS or telemetry setup of the daemon's never reaches a Bedrock account; its region does", () => {
+    const env = applyAccountEnv(
+      {
+        PATH: "/usr/bin",
+        AWS_ENDPOINT_URL: "https://daemon-aws.example.com",
+        AWS_ENDPOINT_URL_BEDROCK_RUNTIME: "https://daemon-aws.example.com",
+        AWS_CONFIG_FILE: "/etc/daemon-aws",
+        AWS_PROFILE: "p",
+        AWS_REGION: "eu-west-1",
+        OTEL_EXPORTER_OTLP_HEADERS: "x-key=daemon",
+        OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: "http://daemon-otel.example.com",
+      },
+      bedrock({ env: { OTEL_EXPORTER_OTLP_ENDPOINT: "https://otel.example.com" } }),
+    );
+    for (const k of ["AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "AWS_CONFIG_FILE", "AWS_PROFILE", "OTEL_EXPORTER_OTLP_HEADERS", "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"]) {
+      expect(env[k]).toBeUndefined();
+    }
+    expect(env.AWS_REGION).toBe("eu-west-1");
+    expect(env.OTEL_EXPORTER_OTLP_ENDPOINT).toBe("https://otel.example.com");
+    // Other kinds don't touch them.
+    expect(applyAccountEnv({ AWS_PROFILE: "p" }, { name: "s", kind: "subscription", token: "t", createdAt: "", updatedAt: "" }).AWS_PROFILE).toBe("p");
+  });
+
   test("the real path: the daemon's AWS and telemetry variables never reach the CLI", () => {
     const env = applyAccountEnv(
       buildAgentEnv({ PATH: "/usr/bin", HOME: "/home/u", AWS_ACCESS_KEY_ID: "AKIADAEMON", AWS_PROFILE: "p", AWS_REGION: "eu-west-1", OTEL_EXPORTER_OTLP_ENDPOINT: "https://daemon-otel.example.com" }),
@@ -257,6 +280,26 @@ describe("daemon surface", () => {
     expect(listed).not.toContain("otel-WIRE");
   });
 
+  test("the account a session resolves to carries its kind and model naming", () => {
+    accounts.upsert({ name: "br", kind: "bedrock", token: "t", env: { ANTHROPIC_DEFAULT_OPUS_MODEL: "team.opus" } });
+    accounts.upsert({ name: "sub", kind: "subscription", token: "t" });
+    const br = accounts.resolve("br")!;
+    expect(br.kind).toBe("bedrock");
+    expect(br.model("claude-opus-5-5")).toBe("opus");
+    const sub = accounts.resolve("sub")!;
+    expect(sub.kind).toBe("subscription");
+    expect(sub.model("claude-opus-5-5")).toBe("claude-opus-5-5");
+  });
+
+  test("the legacy claude.accounts list leaves Bedrock out (its clients don't know the kind); accounts.list has it", async () => {
+    accounts.upsert({ name: "br", kind: "bedrock", token: "t" });
+    accounts.upsert({ name: "sub", kind: "subscription", token: "t" });
+    const legacy = (await handle({ type: "claude.accounts.list", id: "l" })) as unknown as { accounts: Array<{ name: string }> };
+    expect(legacy.accounts.map((a) => a.name)).toEqual(["sub"]);
+    const all = (await handle({ type: "accounts.list", id: "a", backend: "claude" })) as unknown as { backends: Array<{ accounts: Array<{ name: string }> }> };
+    expect(all.backends[0]!.accounts.map((a) => a.name).sort()).toEqual(["br", "sub"]);
+  });
+
   test("a changed setting is a changed credential: sessions on the account pick it up", () => {
     accounts.upsert({ name: "br", kind: "bedrock", token: "t", env: { ANTHROPIC_DEFAULT_SONNET_MODEL: "a" } });
     const before = accounts.resolve("br")!.fingerprint;
@@ -305,6 +348,21 @@ describe("project settings that would redirect an account", () => {
   });
 });
 
+describe("terminal listing", () => {
+  test("a Bedrock account without an endpoint shows AWS", () => {
+    const listed = formatAccounts([
+      {
+        backend: "claude",
+        displayName: "Claude",
+        defaultAccount: "default",
+        kinds: accountKindsFor("claude"),
+        accounts: [{ backend: "claude", name: "aws", kind: "bedrock", createdAt: "", updatedAt: "" }],
+      },
+    ]);
+    expect(listed).toMatch(/aws\s+Amazon Bedrock\s+AWS/);
+  });
+});
+
 describe("CLI parsers", () => {
   test("--set: NAME=value, or a bare NAME asked for; only Bedrock settings", () => {
     expect(parseSettingFlags(["AWS_REGION=us-east-1", "OTEL_EXPORTER_OTLP_HEADERS", "ANTHROPIC_MODEL = opus "])).toEqual({
@@ -312,6 +370,8 @@ describe("CLI parsers", () => {
       ask: ["OTEL_EXPORTER_OTLP_HEADERS"],
     });
     expect(() => parseSettingFlags(["ANTHROPIC_API_KEY=x"])).toThrow(/--set/);
+    // A key is never taken from the command line.
+    expect(() => parseSettingFlags(["OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer x"])).toThrow(/asked for without echo/);
     // A mistyped name never echoes its value (it may be a key).
     expect(() => parseSettingFlags(["OTEL_EXPORTER_OTLP_HEADER=Authorization=Bearer s3cret"])).toThrow(/^(?!.*s3cret)/s);
     expect(() => parseSettingFlags(["=x"])).toThrow(/--set/);

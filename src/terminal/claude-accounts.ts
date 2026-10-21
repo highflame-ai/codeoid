@@ -3,7 +3,7 @@
  * Pure — no I/O — so it is testable.
  */
 
-import { BEDROCK_SETTINGS, type AccountInfo, type BackendAccountsInfo, type ClaudeAccountInfo } from "../protocol/types.js";
+import { accountKindsFor, BEDROCK_SETTINGS, type AccountInfo, type BackendAccountsInfo, type ClaudeAccountInfo } from "../protocol/types.js";
 
 const KIND_LABEL: Record<ClaudeAccountInfo["kind"], string> = {
   subscription: "subscription",
@@ -53,6 +53,9 @@ export function parseHeaderFlags(flags: readonly string[]): { headers: Record<st
   return { headers, ask };
 }
 
+/** Bedrock settings whose values are secrets (the kind descriptor's `secret`). */
+const BEDROCK_SECRET: readonly string[] = accountKindsFor("claude").find((k) => k.kind === "bedrock")?.env?.secret ?? [];
+
 /**
  * Parse a repeatable `--set` flag for a Bedrock account: `NAME=value`, or a
  * bare `NAME` whose value is then asked for without echo (a telemetry header
@@ -69,7 +72,10 @@ export function parseSettingFlags(flags: readonly string[]): { env: Record<strin
       throw new Error(`--set takes NAME=value or NAME, with NAME one of ${BEDROCK_SETTINGS.join(", ")}; got ${JSON.stringify(name)}`);
     }
     if (sep < 0) ask.push(name);
-    else env[name] = f.slice(sep + 1).trim();
+    else if (BEDROCK_SECRET.includes(name)) {
+      // On the command line it would land in shell history and `ps`.
+      throw new Error(`${name} holds a key: pass --set ${name} alone and it is asked for without echo`);
+    } else env[name] = f.slice(sep + 1).trim();
   }
   return { env, ask };
 }

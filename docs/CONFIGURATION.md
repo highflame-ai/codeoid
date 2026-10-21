@@ -230,14 +230,14 @@ codeoid account rm gw-team-a
 
 **Amazon Bedrock accounts.**
 A `bedrock` account runs Claude on Bedrock with a bearer token (`AWS_BEARER_TOKEN_BEDROCK`), either on AWS itself or on a Bedrock-compatible endpoint.
-It can carry the settings that belong with that token: the region, the Bedrock model IDs the `opus` / `sonnet` / `haiku` aliases map to, and telemetry.
+It can carry the settings that belong with that token: the region, the Bedrock model IDs the `opus` / `sonnet` / `haiku` / `fable` aliases map to, and telemetry.
 
 ```bash
 codeoid account add-bedrock aws --set AWS_REGION=us-east-1     # AWS itself; the token is asked for
 codeoid account add-bedrock team --base-url https://bedrock.example.com/v1 \
   --set ANTHROPIC_DEFAULT_SONNET_MODEL=us.anthropic.claude-sonnet-5 \
   --set CLAUDE_CODE_ENABLE_TELEMETRY=1 --set OTEL_EXPORTER_OTLP_ENDPOINT=https://otel.example.com \
-  --set OTEL_EXPORTER_OTLP_HEADERS                            # a bare name is asked for without echo
+  --set OTEL_EXPORTER_OTLP_HEADERS                            # asked for without echo; never on the command line
 codeoid account add-bedrock team --from-settings ~/.claude/settings.json --replace   # move an existing setup into an account
 ```
 
@@ -246,12 +246,15 @@ The settings an account takes are the region (`AWS_REGION`, `ANTHROPIC_SMALL_FAS
 The web form shows settings as typed, except `OTEL_EXPORTER_OTLP_HEADERS`, which usually carries a key and is masked; like a token, no setting's value is ever sent back to a client.
 Telemetry headers need a telemetry endpoint set beside them, which must be https (or localhost).
 Without mappings the Claude CLI uses its own Bedrock model IDs (a first-party ID such as `claude-sonnet-5` becomes `us.anthropic.claude-sonnet-5`); map the aliases when your endpoint serves different ones.
-A session's model is then sent by its family: with `ANTHROPIC_DEFAULT_OPUS_MODEL` set, a session on `opus` or any `claude-opus-*` ID (including `[1m]`) runs on the mapped ID.
+A session's model is then sent by its family: with `ANTHROPIC_DEFAULT_OPUS_MODEL` set, a session on `opus` or any `claude-opus-*` ID (including `[1m]`) runs on the mapped ID, and a fallback model in the same family is dropped, since it would be the same model.
+`/model` also takes a Bedrock model ID or inference-profile ARN directly (`us.anthropic.claude-…`, `arn:aws:bedrock:…`); a session switched back to another kind of account keeps that ID until you change it.
 The daemon's own `ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_*_MODEL` don't apply to a Bedrock account; only its own settings do.
-AWS keys and profiles in the daemon's environment are never passed to a Claude session, on any account.
+Nor do the daemon's AWS variables other than the region, or its `OTEL_*` variables, even when `CODEOID_AGENT_ENV_ALLOW` lets them through to agents: they could send the account's token or telemetry key elsewhere.
+codeoid's memory labeler calls the Anthropic API with the daemon's own key whatever account a session uses; leave memory off if no session content may leave your Bedrock setup.
 
 Claude Code applies the `env` block of your own `~/.claude/settings.json` over every session's environment, whatever its account.
-A Bedrock setup kept there therefore overrides every account, so move it into an account (`--from-settings` reads it) and remove it from that file.
+A named account of any kind therefore refuses to run while that file sets a credential or provider variable (a Bedrock setup, `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`, …) or an `apiKeyHelper`: move it into an account (`--from-settings` reads a Bedrock setup) and remove it from the file.
+Proxies, CA bundles, telemetry and model settings there are yours and are left alone.
 
 **How a switch keeps the conversation.**
 An account is only the credential a session's Claude subprocess starts with.
@@ -266,11 +269,12 @@ Choosing `default` explicitly pins a session to the built-in account, so it stay
 
 **A session never silently changes account.**
 Applying an account removes every competing Claude credential or provider variable before setting its own (all of `ANTHROPIC_*` except model settings, every `CLAUDE_CODE_USE_*` provider switch, token file descriptors, and the like), so a stray `ANTHROPIC_API_KEY` can't take over a subscription session.
-A named account also refuses to run in a workdir whose own Claude settings (`.claude/settings.json` or `settings.local.json`, in the workdir or a parent below your home directory) set a credential variable such as `ANTHROPIC_BASE_URL` or `ANTHROPIC_BEDROCK_BASE_URL`, or an `apiKeyHelper`, since a cloned repo could otherwise send the account's token to a host of its choosing.
+A named account also refuses to run in a workdir whose own Claude settings (`.claude/settings.json` or `settings.local.json`, in the workdir or a parent below your home directory) set a credential variable such as `ANTHROPIC_BASE_URL` or `ANTHROPIC_BEDROCK_BASE_URL`, or a credential helper (`apiKeyHelper`, `awsAuthRefresh`, `otelHeadersHelper`, …), since a cloned repo could otherwise send the account's token to a host of its choosing.
+Those files are read as the Claude CLI reads them (a byte-order mark or UTF-16 makes no difference), and one codeoid can't parse is refused rather than skipped.
+The CLI also re-reads them while a turn runs, so on a named account an agent's edit to a Claude settings file always waits for your approval, in every mode; a shell command that writes one can't be checked this way.
 A Bedrock account also refuses every `AWS_*` variable there but the region (a repo's own AWS config file can name an endpoint that receives the token) and every `OTEL_*` variable (where its telemetry, and the telemetry key, go and what they carry).
 Switching a session's account, or replacing or removing the account it runs on, stops the session's Claude process if it is idle, so no process keeps running on the old credential.
 A session whose account was removed refuses to run until you switch it, rather than falling back to another credential.
-One thing this cannot override is an `apiKeyHelper` in your Claude settings file, since that is configuration of the shared config directory rather than environment.
 
 **`codeoid account login` never touches your own `claude login`.**
 It runs `claude setup-token` against a throwaway config directory and keeps only the token it prints, so signing a second account in can't replace the personal sign-in your other sessions use.

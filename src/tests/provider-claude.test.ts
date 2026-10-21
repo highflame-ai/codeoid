@@ -99,6 +99,7 @@ import {
   packPluginsOption,
   pluginSkillDirs,
   withoutServers,
+  modelOptions,
 } from "../daemon/providers/claude/index.js";
 import { mcpToolPrefix } from "../daemon/mcp/types.js";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, realpathSync } from "node:fs";
@@ -2108,6 +2109,14 @@ describe("ClaudeProvider – Claude accounts", () => {
     expect(reported).toEqual([]);
     openGate();
     await provider.teardown();
+  });
+
+  it("a fallback that names the same model on the account is dropped (the SDK refuses it)", () => {
+    const br = account({ name: "br", kind: "bedrock", token: "t", env: { ANTHROPIC_DEFAULT_OPUS_MODEL: "team.opus" } });
+    expect(modelOptions("claude-opus-5-5", "claude-opus-4-8", br)).toEqual({ model: "opus" });
+    expect(modelOptions("claude-opus-5-5", "claude-sonnet-5", br)).toEqual({ model: "opus", fallbackModel: "claude-sonnet-5" });
+    expect(modelOptions(undefined, "claude-opus-4-8", br)).toEqual({ fallbackModel: "opus" });
+    expect(modelOptions("claude-opus-5-5", "claude-opus-4-8", null)).toEqual({ model: "claude-opus-5-5", fallbackModel: "claude-opus-4-8" });
   });
 
   it("other accounts report the catalog and pass models through", async () => {

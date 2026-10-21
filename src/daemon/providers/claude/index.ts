@@ -873,8 +873,7 @@ export class ClaudeProvider implements SessionProvider {
         // model; this is a summary of it.)
         thinking: { type: "adaptive" as const, display: "summarized" as const },
         // An account may name models its own way (a Bedrock account's mappings).
-        ...(opts.model ? { model: account ? account.model(opts.model) : opts.model } : {}),
-        ...(opts.fallbackModel ? { fallbackModel: account ? account.model(opts.fallbackModel) : opts.fallbackModel } : {}),
+        ...modelOptions(opts.model, opts.fallbackModel, account),
         ...(opts.maxBudgetUsd !== undefined ? { maxBudgetUsd: opts.maxBudgetUsd } : {}),
         stderr: (data: string) => {
           process.stderr.write(`[claude-subprocess ${sessionId.slice(0, 8)}] ${data}`);
@@ -2170,6 +2169,22 @@ export function parseMcpServerConfig(value: unknown): McpServerConfig | null {
  *
  * Pure + exported for unit testing.
  */
+/**
+ * The model and fallback to hand the CLI, through the account's own naming.
+ * Two ids can name one model there (a Bedrock account maps a whole family to
+ * one alias), and the SDK refuses a fallback equal to the model — so then the
+ * fallback is dropped: it would be the same model anyway.
+ */
+export function modelOptions(
+  model: string | undefined,
+  fallbackModel: string | undefined,
+  account: { model(m: string): string } | null,
+): { model?: string; fallbackModel?: string } {
+  const m = model ? (account ? account.model(model) : model) : undefined;
+  const f = fallbackModel ? (account ? account.model(fallbackModel) : fallbackModel) : undefined;
+  return { ...(m ? { model: m } : {}), ...(f && f !== m ? { fallbackModel: f } : {}) };
+}
+
 export function buildAgentEnv(
   base: Record<string, string | undefined> = process.env,
   opts: { gatewayCredential?: string } = {},

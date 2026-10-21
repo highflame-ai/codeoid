@@ -261,10 +261,15 @@ export function applyAccountEnv(env: Record<string, string>, account: StoredClau
     }
     case "bedrock":
       // The daemon's model settings name first-party ids; only the account's
-      // own mappings mean anything on its endpoint. (AWS keys and profiles
-      // never reach the CLI — buildAgentEnv doesn't pass them — and the
-      // bearer token would win over them anyway.)
+      // own mappings mean anything on its endpoint. Nor does the daemon's AWS
+      // or telemetry setup, if an operator lets it through to agents
+      // (CODEOID_AGENT_ENV_ALLOW): an AWS_ENDPOINT_URL or config file there
+      // would receive this account's token, and telemetry headers there would
+      // pair with this account's collector. The region is kept.
       for (const k of MODEL_SETTINGS) delete out[k];
+      for (const k of Object.keys(out)) {
+        if ((k.startsWith("AWS_") && k !== "AWS_REGION" && k !== "AWS_DEFAULT_REGION") || k.startsWith("OTEL_")) delete out[k];
+      }
       for (const [k, v] of Object.entries(account.env ?? {})) out[k] = v;
       out.CLAUDE_CODE_USE_BEDROCK = "1";
       out.AWS_BEARER_TOKEN_BEDROCK = account.token;
@@ -438,6 +443,36 @@ function redirectsCredential(key: string, kind: ClaudeAccountKind): boolean {
   return key.startsWith("OTEL_");
 }
 
+/** Settings keys the CLI runs as a command to obtain or refresh a credential (or its headers). */
+const HELPER_KEYS = ["apiKeyHelper", "awsAuthRefresh", "awsCredentialExport", "gcpAuthRefresh", "otelHeadersHelper", "proxyAuthHelper"] as const;
+
+/**
+ * A Claude settings file as the CLI reads it: a UTF-8 BOM stripped, UTF-16
+ * with a BOM decoded. Reading it any other way lets a file the CLI applies
+ * look unreadable here — a BOM was enough to hide a redirect from the check.
+ * `undefined` for an empty file; throws when it can't be parsed.
+ */
+export function readClaudeSettings(file: string): unknown {
+  const raw = readFileSync(file);
+  let text: string;
+  if (raw[0] === 0xff && raw[1] === 0xfe) text = raw.subarray(2).toString("utf16le");
+  else if (raw[0] === 0xfe && raw[1] === 0xff) text = Buffer.from(raw.subarray(2)).swap16().toString("utf16le");
+  else text = raw.toString("utf8").replace(/^\uFEFF/, "");
+  if (!text.trim()) return undefined;
+  return JSON.parse(text);
+}
+
+/** The first key in a parsed settings object that would redirect `kind`'s credential. */
+function overridingKey(parsed: unknown, helpers: readonly string[], isRedirect: (key: string) => boolean): string | null {
+  if (!parsed || typeof parsed !== "object") return null;
+  const settings = parsed as Record<string, unknown>;
+  for (const key of helpers) if (settings[key] !== undefined) return key;
+  if (settings.env && typeof settings.env === "object") {
+    for (const key of Object.keys(settings.env)) if (isRedirect(key)) return `env.${key}`;
+  }
+  return null;
+}
+
 export function projectCredentialOverride(workdir: string, kind: ClaudeAccountKind): { file: string; key: string } | null {
   const home = resolve(homedir());
   for (let dir = resolve(workdir); ; dir = dirname(dir)) {
@@ -447,22 +482,40 @@ export function projectCredentialOverride(workdir: string, kind: ClaudeAccountKi
       if (!existsSync(file)) continue;
       let parsed: unknown;
       try {
-        parsed = JSON.parse(readFileSync(file, "utf8"));
+        parsed = readClaudeSettings(file);
       } catch {
-        // Unreadable here means unreadable for the CLI too — nothing applied.
-        continue;
+        // Fail closed: a file the check can't read is one it can't vouch for,
+        // and the CLI's reader has accepted forms this one didn't.
+        return { file, key: "(a file codeoid can't parse — fix or remove it)" };
       }
-      if (!parsed || typeof parsed !== "object") continue;
-      const settings = parsed as { env?: unknown; apiKeyHelper?: unknown; awsAuthRefresh?: unknown; awsCredentialExport?: unknown };
-      for (const key of ["apiKeyHelper", "awsAuthRefresh", "awsCredentialExport"] as const) {
-        if (settings[key] !== undefined) return { file, key };
-      }
-      if (settings.env && typeof settings.env === "object") {
-        for (const key of Object.keys(settings.env)) if (redirectsCredential(key, kind)) return { file, key: `env.${key}` };
-      }
+      const key = overridingKey(parsed, HELPER_KEYS, (k) => redirectsCredential(k, kind));
+      if (key) return { file, key };
     }
     if (dirname(dir) === dir) break;
   }
   return null;
+}
+
+/**
+ * Does the user's own Claude settings file set a credential? Its `env`
+ * applies over every session's environment, so a credential there (a Bedrock
+ * setup, a base URL) runs a named account's session on that credential
+ * instead — or sends the account's token to its endpoint. A named account
+ * refuses to run until it is moved into an account. Proxies, CA bundles and
+ * telemetry there are the user's own setup and are left alone.
+ */
+export function userCredentialOverride(configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude")): { file: string; key: string } | null {
+  const file = join(configDir, "settings.json");
+  if (!existsSync(file)) return null;
+  let parsed: unknown;
+  try {
+    parsed = readClaudeSettings(file);
+  } catch {
+    return null; // the user's own file: the CLI reports it, nothing to vouch for
+  }
+  // apiKeyHelper outranks an account's key; the other helpers are the user's
+  // own cloud / proxy / telemetry setup.
+  const key = overridingKey(parsed, ["apiKeyHelper"], isClaudeCredentialVar);
+  return key ? { file, key } : null;
 }
 
