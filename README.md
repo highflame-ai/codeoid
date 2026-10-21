@@ -348,7 +348,7 @@ A lightweight in-daemon backend that talks to the Gemini API. Set `GOOGLE_API_KE
 
 ### Accounts
 
-Every backend that takes credentials can hold several named accounts: Claude subscriptions and gateways, ChatGPT sign-ins for Codex, Google sign-ins for the Gemini CLI, and API keys for OpenAI, Gemini, Qwen, pi, llama.cpp and each `oai:<name>` endpoint.
+Every backend that takes credentials can hold several named accounts: Claude subscriptions and gateways, ChatGPT sign-ins for Codex, and API keys for the Gemini CLI, OpenAI, Gemini, Qwen, pi, llama.cpp and each `oai:<name>` endpoint.
 An account is only the credential, so a session switched to another account keeps its conversation.
 Each backend has a built-in `default` account (the daemon's own login or environment) and a daemon default that sessions follow unless they pin one.
 A change applies from the session's next turn.
@@ -356,7 +356,7 @@ See [docs/backend-accounts-design.md](docs/backend-accounts-design.md) for what 
 
 ```bash
 codeoid account ls [--backend <id>]                  # names and kinds per backend — never a key
-codeoid account login work --backend codex           # sign in (claude, codex or gemini-cli); --replace to redo one
+codeoid account login work --backend codex           # sign in (claude or codex); --replace to redo one
 codeoid account add-key team --backend qwen --base-url dashscope-intl   # key asked for without echo
 codeoid account add-key box-key --backend oai:gpu-box --header x-team --no-key
 codeoid account add-key keys --backend pi --key-var OPENROUTER_API_KEY
@@ -373,7 +373,7 @@ In `codeoid tui`, `/account` opens the picker for the focused session's current 
 `/account <name>` pins a named account, `/account default` pins the built-in one, and `/account --follow-default` follows the daemon default.
 A backend without accounts refuses `/account` and says so.
 The status bar shows the account when it matters: a pinned account, a daemon default other than the built-in one, or an account that no longer exists, which is shown in red because the next turn will fail.
-Claude accounts can also be managed in the web Settings → Claude accounts tab.
+Accounts for every backend can also be managed, and signed in, in the web Settings → Accounts tab.
 Listing accounts requires `settings:read`; adding, removing, signing in, setting a default and choosing a session's account require `settings:write` from an undelegated token.
 
 ## Architecture
@@ -493,7 +493,7 @@ codeoid compare show|ls|keep …                       #   results; keep one [--
 codeoid routine add <name> --prompt … [--cron|--every|--at] [--check <cmd>]  # scheduled / triggered agent runs
 codeoid routine ls | show | runs | run [--wait] | edit | pause | resume | rm | cancel <runId> | token | preview
 codeoid account ls [--backend <id>]                  # Accounts for every backend (see Accounts above)
-codeoid account login <name> [--backend claude|codex|gemini-cli] [--replace]
+codeoid account login <name> [--backend claude|codex] [--replace]
 codeoid account add-key <name> --backend <id> [--base-url <u>] [--header <h>] [--no-key] [--key-var <v>] [--replace]
 codeoid account add-gateway <name> --base-url <u> [--header <h>] | add-token <name> [--api-key]   # Claude
 codeoid account default|rm <name> [--backend <id>]
