@@ -397,9 +397,9 @@ describe("AccountsPanel — device sign-in (Codex)", () => {
   });
 });
 
-describe("AccountsPanel — code sign-in (Gemini CLI)", () => {
-  it("starts the Gemini CLI sign-in for the name, takes the pasted code, and finishes", async () => {
-    const LOGIN = { loginId: "G1", verificationUrl: "https://accounts.google.com/o/oauth2/x", codeHint: "Paste the code.", mode: "code", expiresAt: 0 };
+describe("AccountsPanel — code sign-in (Claude subscription)", () => {
+  it("starts the Claude sign-in for the name, takes the pasted code, and finishes", async () => {
+    const LOGIN = { loginId: "C1", verificationUrl: "https://claude.com/cai/oauth/authorize?x=1", codeHint: "Paste the code.", mode: "code", expiresAt: 0 };
     clientRequestMock.mockImplementation(async (msg) => {
       if (msg.type === "backend.login.start") return { type: "backend.login.start.result", requestId: "r", login: LOGIN };
       if (msg.type === "backend.login.submit") return { type: "backend.login.submit.result", requestId: "r", ok: true };
@@ -407,35 +407,41 @@ describe("AccountsPanel — code sign-in (Gemini CLI)", () => {
     });
     const { getByRole, getByText, getByPlaceholderText, findByText, queryByTestId } = render(() => <AccountsPanel />);
     await findByText("work");
-    fireEvent.click(getByRole("tab", { name: /^Gemini CLI/ }));
-    fireEvent.click(getByText("+ Sign in: Google sign-in"));
+    fireEvent.click(getByRole("tab", { name: /^Claude/ }));
+    fireEvent.click(getByText("+ Sign in: Pro/Max subscription"));
     fireEvent.input(getByPlaceholderText("company-max"), { target: { value: "personal" } });
     fireEvent.click(getByText("Get sign-in link"));
     await findByText(LOGIN.verificationUrl);
     expect(queryByTestId("device-user-code")).toBeNull();
-    fireEvent.input(getByPlaceholderText("Paste the code"), { target: { value: "4/abc" } });
+    fireEvent.input(getByPlaceholderText("Paste the code"), { target: { value: "code#abc" } });
     fireEvent.click(getByText("Finish"));
-    await findByText("+ Sign in: Google sign-in");
-    expect(sent()).toContainEqual(expect.objectContaining({ type: "backend.login.start", backend: "gemini-cli", account: "personal" }));
-    expect(sent()).toContainEqual(expect.objectContaining({ type: "backend.login.submit", loginId: "G1", code: "4/abc" }));
+    await findByText("+ Sign in: Pro/Max subscription");
+    expect(sent()).toContainEqual(expect.objectContaining({ type: "backend.login.start", backend: "claude", account: "personal" }));
+    expect(sent()).toContainEqual(expect.objectContaining({ type: "backend.login.submit", loginId: "C1", code: "code#abc" }));
   });
 
   it("a taken name is signed in again only with replace: true", async () => {
-    const LOGIN = { loginId: "G2", verificationUrl: "https://accounts.google.com/o/oauth2/y", codeHint: "", mode: "code", expiresAt: 0 };
+    const LOGIN = { loginId: "C2", verificationUrl: "https://claude.com/cai/oauth/authorize?y=1", codeHint: "", mode: "code", expiresAt: 0 };
     clientRequestMock.mockImplementation(async (msg) => {
       if (msg.type === "backend.login.start") return { type: "backend.login.start.result", requestId: "r", login: LOGIN };
-      return result([claude([WORK]), backend("gemini-cli", "Gemini CLI", [{ name: "personal", kind: "google-login" }])]);
+      return result(ALL);
     });
     const { getByRole, getByText, getByPlaceholderText, findByText } = render(() => <AccountsPanel />);
     await findByText("work");
-    fireEvent.click(getByRole("tab", { name: /^Gemini CLI/ }));
-    fireEvent.click(getByText("+ Sign in: Google sign-in"));
-    fireEvent.input(getByPlaceholderText("company-max"), { target: { value: "personal" } });
+    fireEvent.click(getByRole("tab", { name: /^Claude/ }));
+    fireEvent.click(getByText("+ Sign in: Pro/Max subscription"));
+    fireEvent.input(getByPlaceholderText("company-max"), { target: { value: "work" } });
     fireEvent.click(getByRole("checkbox"));
     fireEvent.click(getByText("Get sign-in link"));
     await findByText(LOGIN.verificationUrl);
-    expect(sent()).toContainEqual(
-      expect.objectContaining({ type: "backend.login.start", backend: "gemini-cli", account: "personal", replace: true }),
-    );
+    expect(sent()).toContainEqual(expect.objectContaining({ type: "backend.login.start", backend: "claude", account: "work", replace: true }));
+  });
+
+  it("the Gemini CLI offers only API keys — no Google sign-in", async () => {
+    clientRequestMock.mockResolvedValue(result(ALL));
+    const { getByRole, findByText, queryByText } = render(() => <AccountsPanel />);
+    await findByText("work");
+    fireEvent.click(getByRole("tab", { name: /^Gemini CLI/ }));
+    expect(queryByText(/Sign in/)).toBeNull();
   });
 });

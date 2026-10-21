@@ -52,8 +52,8 @@ function isOwnLoginBackend(tabId: string): OwnLoginBackend | null {
 }
 
 /**
- * A backend that signs in only as a NAMED account (Codex, the Gemini CLI: the
- * daemon refuses a sign-in that would replace the machine's own login). Its
+ * A backend that signs in only as a NAMED account (Codex: the daemon refuses
+ * a sign-in that would replace the machine's own login). Its
  * tab points to Settings → Accounts instead of offering a sign-in that fails.
  */
 function signsInAsAccount(tabId: string): boolean {
