@@ -197,11 +197,17 @@ const NewSessionModal: Component = () => {
   // The landing backend can change under it without a click — the daemon's
   // default backend moves (providers.changed) — so follow the backend, not the
   // buttons.
-  createEffect(on(effectiveProvider, () => setAccount(""), { defer: true }));
-  // And a named account another client removed is no choice at all.
+  // A memo, so it changes only when the landing backend does: a refreshed
+  // providers list (a reconnect, another client's endpoint edit) is a new
+  // array with the same backend, and must not clear the chosen account.
+  const landing = createMemo(effectiveProvider);
+  createEffect(on(landing, () => setAccount(""), { defer: true }));
+  // And a named account another client removed is no choice at all — judged
+  // only against a loaded list, never one that's being fetched again.
   createEffect(() => {
     const a = account();
-    if (a && a !== DEFAULT_ACCOUNT && !providerAccounts()?.accounts.some((x) => x.name === a)) setAccount("");
+    const list = providerAccounts();
+    if (a && a !== DEFAULT_ACCOUNT && list && !list.accounts.some((x) => x.name === a)) setAccount("");
   });
 
   // Installed packs from the daemon-canonical pack state. Empty when none are
@@ -925,6 +931,11 @@ const NewSessionModal: Component = () => {
                   )}
                 </For>
               </select>
+              <Show when={account() && packRole()}>
+                <p class="text-[11px] text-warn">
+                  A chosen account keeps the session on {providerLabel(effectiveProvider())}, even if the {packRole()} role is bound to another backend.
+                </p>
+              </Show>
               <p class="text-[11px] text-fg-faint">
                 Which credential this session runs on and bills. You can switch it later without losing the conversation.
               </p>

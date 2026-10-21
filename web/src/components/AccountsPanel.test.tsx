@@ -507,6 +507,24 @@ describe("AccountsPanel — code sign-in (Claude subscription)", () => {
 });
 
 describe("AccountsPanel — form rules and accessibility", () => {
+  it("a header value needs a name, and a header can't be listed twice (any case)", async () => {
+    clientRequestMock.mockResolvedValue(result(ALL));
+    const view = render(() => <AccountsPanel />);
+    await view.findByText("work");
+    fireEvent.click(view.getByRole("tab", { name: /^local/ }));
+    fireEvent.click(view.getByText("+ Key and headers"));
+    fireEvent.input(view.getByPlaceholderText("company-max"), { target: { value: "alt" } });
+    fireEvent.click(view.getByText("+ Header"));
+    fireEvent.input(view.getByLabelText("Header 1 value"), { target: { value: "secret" } });
+    view.getByText("a header value needs a name");
+    fireEvent.input(view.getByLabelText("Header 1 name"), { target: { value: "X-Team" } });
+    fireEvent.click(view.getByText("+ Header"));
+    fireEvent.input(view.getByLabelText("Header 2 name"), { target: { value: "x-team" } });
+    fireEvent.input(view.getByLabelText("Header 2 value"), { target: { value: "other" } });
+    view.getByText("a header is listed twice");
+    expect((view.getByText("Add account") as HTMLButtonElement).disabled).toBe(true);
+  });
+
   it("a header with a name needs a value, as the daemon requires", async () => {
     clientRequestMock.mockResolvedValue(result(ALL));
     const view = render(() => <AccountsPanel />);

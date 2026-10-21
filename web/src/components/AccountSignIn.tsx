@@ -152,6 +152,7 @@ export const AccountSignIn: Component<{
                 class={input}
                 type="password"
                 placeholder="Paste the code"
+                aria-label="Sign-in code"
                 value={code()}
                 onInput={(e) => setCode(e.currentTarget.value)}
                 autocomplete="new-password"

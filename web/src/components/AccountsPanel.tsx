@@ -341,6 +341,11 @@ const AccountForm: Component<{ backend: string; kind: AccountKindInfo; onDone: (
     if (namedKeys().some((v) => !v.value.trim())) return "every key needs a value";
     // The daemon refuses a header with no value rather than send it blank.
     if (namedHeaders().some((h) => !h.value.trim())) return "every header needs a value";
+    // A value typed into a nameless row would be dropped without a word.
+    if (headers().some((h) => !h.name.trim() && h.value.trim())) return "a header value needs a name";
+    // HTTP header names are case-insensitive: two of them would be one header.
+    const lower = namedHeaders().map((h) => h.name.trim().toLowerCase());
+    if (new Set(lower).size !== lower.length) return "a header is listed twice";
     // A kind with no single required field (an endpoint's key-and/or-headers,
     // pi's key set) still has to carry something.
     if (!token().trim() && namedHeaders().length === 0 && namedKeys().length === 0) {

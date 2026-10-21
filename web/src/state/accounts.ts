@@ -324,6 +324,7 @@ export function resumeAccountLogin(): void {
  */
 export async function startAccountLogin(backend: LoginBackend, name: string, replace = false): Promise<boolean> {
   const mine = ++attempt;
+  codeSentBlind = false;
   resumeAccountLogin();
   setLogin({ ...LOGIN_EMPTY, backend, account: name, phase: "starting" });
   let pending: PendingBackendLogin;
@@ -370,8 +371,26 @@ async function finished(): Promise<void> {
  * daemon answers a repeat with the same outcome — so a dropped socket parks
  * the wait until it is back, and a timeout simply asks again.
  */
+/** A code was sent and the connection dropped before its answer: whether it arrived is unknown. */
+let codeSentBlind = false;
+
 async function waitAccountLogin(mine: number, pending: PendingBackendLogin): Promise<boolean> {
+  const tooLate = () => {
+    // Past the attempt and the daemon's memory of how it ended (a laptop that
+    // slept): asking again would only hear "no longer open". If it went
+    // through, the list shows it.
+    setLogin((s) => ({
+      ...s,
+      phase: "idle",
+      login: null,
+      reconnecting: false,
+      error: "Lost the connection during the sign-in. If you approved it, the account is listed; otherwise start again.",
+    }));
+    void fetchAccounts(true);
+    return false;
+  };
   for (;;) {
+    if (Date.now() > pending.expiresAt + OUTCOME_KEPT_MS) return tooLate();
     let res: BackendLoginWaitResultMsg;
     try {
       const id = newRequestId();
@@ -390,18 +409,7 @@ async function waitAccountLogin(mine: number, pending: PendingBackendLogin): Pro
         setLogin((s) => ({ ...s, phase: "idle", login: null, reconnecting: false, error: errText(e) }));
         return false;
       }
-      if (Date.now() > pending.expiresAt + OUTCOME_KEPT_MS) {
-        // Too late to learn how it ended. If it went through, the list shows it.
-        setLogin((s) => ({
-          ...s,
-          phase: "idle",
-          login: null,
-          reconnecting: false,
-          error: "Lost the connection during the sign-in. If you approved it, the account is listed; otherwise start again.",
-        }));
-        void fetchAccounts(true);
-        return false;
-      }
+      if (Date.now() > pending.expiresAt + OUTCOME_KEPT_MS) return tooLate();
       if (connectionStatus().kind !== "connected") {
         setLogin((s) => ({ ...s, reconnecting: true }));
         await new Promise<void>((wake) => (wakeParkedWait = wake));
@@ -437,8 +445,16 @@ export async function submitAccountLoginCode(code: string): Promise<boolean> {
       },
     );
     if (mine !== attempt) return res.ok;
+    const resent = codeSentBlind;
+    codeSentBlind = false;
     if (!res.ok) {
-      const error = res.error ?? "Sign-in failed.";
+      let error = res.error ?? "Sign-in failed.";
+      // The code went out before the connection dropped: that first exchange
+      // may have succeeded, which is why this one finds the attempt over.
+      if (resent && !res.retryable) {
+        error = `${error} If the first try went through before the connection dropped, the account is listed.`;
+        void fetchAccounts(true);
+      }
       // Only a code refused before it reached the command leaves the daemon's
       // attempt open; anything else ended it, so the form starts over.
       if (res.retryable) setLogin((s) => ({ ...s, phase: "awaiting_code", error }));
@@ -452,7 +468,10 @@ export async function submitAccountLoginCode(code: string): Promise<boolean> {
     // The connection failed: whether the code arrived is unknown, so keep the
     // attempt and let the user send it again — the daemon says if it's over.
     // A daemon refusal (an unknown or expired attempt) ends it.
-    if (isConnectionError(e)) setLogin((s) => ({ ...s, phase: "awaiting_code", error: errText(e) }));
+    if (isConnectionError(e)) {
+      codeSentBlind = true;
+      setLogin((s) => ({ ...s, phase: "awaiting_code", error: errText(e) }));
+    }
     else setLogin((s) => ({ ...s, phase: "idle", login: null, error: errText(e) }));
     return false;
   }
@@ -461,7 +480,15 @@ export async function submitAccountLoginCode(code: string): Promise<boolean> {
 export async function cancelAccountLogin(): Promise<void> {
   const cur = login();
   attempt++;
-  setLogin(LOGIN_EMPTY);
+  codeSentBlind = false;
+  // Offline, the cancel waits for the connection — by then an approval the
+  // user already gave may have finished, so don't promise it was undone.
+  const offline = cur.login !== null && connectionStatus().kind !== "connected";
+  setLogin(
+    offline
+      ? { ...LOGIN_EMPTY, error: "Not connected — the cancel is sent when the connection is back. If you'd already approved, the account may still be added." }
+      : LOGIN_EMPTY,
+  );
   resumeAccountLogin();
   if (cur.login) await sendLoginCancel(cur.login.loginId);
 }

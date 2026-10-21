@@ -165,6 +165,31 @@ describe("device sign-in across a dropped connection", () => {
     expect(waits()).toHaveLength(2);
   });
 
+  it("past expiry + the daemon's memory, a dropped wait gives up and points at the list", async () => {
+    const OLD = Date.now();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(OLD + 60_000 + 11 * 60_000);
+    const done = startWith(new Error("request r timed out"));
+    expect(await done).toBe(false);
+    expect(accountLoginState().error).toMatch(/If you approved it, the account is listed/);
+    vi.useRealTimers();
+  });
+
+  it("a wait woken past that deadline (a laptop that slept) gives up instead of asking again", async () => {
+    const OLD = Date.now();
+    conn.kind = "reconnecting";
+    const done = startWith(new Error("connection lost (x)"));
+    await vi.waitFor(() => expect(accountLoginState().reconnecting).toBe(true));
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(OLD + 60 * 60_000);
+    conn.kind = "connected";
+    resumeAccountLogin();
+    expect(await done).toBe(false);
+    vi.useRealTimers();
+    expect(waits()).toHaveLength(1);
+    expect(accountLoginState().error).toMatch(/If you approved it, the account is listed/);
+  });
+
   it("a daemon refusal is not a dropped connection: it ends the attempt", async () => {
     const done = startWith(new Error("unknown sign-in attempt"));
     expect(await done).toBe(false);

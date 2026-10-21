@@ -208,6 +208,17 @@ describe("NewSessionModal account picker", () => {
     );
   });
 
+  it("a refreshed providers list with the same default backend keeps the chosen account", async () => {
+    authMock.mockReturnValue(authOk(["claude", "pi"]));
+    withClaudeAccount();
+    const { getByLabelText } = render(() => <NewSessionModal />);
+    openNewSessionModal();
+    fireEvent.change(getByLabelText("Account"), { target: { value: "work" } });
+    // A reconnect (or another client's endpoint edit) re-sends the same list.
+    authOk(["claude", "pi"]);
+    expect((getByLabelText("Account") as HTMLSelectElement).value).toBe("work");
+  });
+
   it("an account another client removed is dropped, not sent", async () => {
     authMock.mockReturnValue(authOk(["claude", "pi"]));
     withClaudeAccount();

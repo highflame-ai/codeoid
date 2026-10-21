@@ -25,6 +25,7 @@ export const HeadersEditor: Component<{
           <input
             class={input}
             placeholder="x-workspace"
+            aria-label={`Header ${i + 1} name`}
             value={row().name}
             onInput={(e) => props.onChange(props.rows.map((r, j) => (j === i ? { ...r, name: e.currentTarget.value } : r)))}
           />
@@ -32,6 +33,7 @@ export const HeadersEditor: Component<{
             class={input}
             type="password"
             placeholder="value"
+            aria-label={`Header ${i + 1} value`}
             autocomplete="new-password"
             value={row().value}
             onInput={(e) => props.onChange(props.rows.map((r, j) => (j === i ? { ...r, value: e.currentTarget.value } : r)))}
