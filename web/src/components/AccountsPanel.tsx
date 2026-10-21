@@ -371,7 +371,7 @@ const AccountForm: Component<{ backend: string; kind: AccountKindInfo; onDone: (
         ...(k.token && token().trim() ? { token: token().trim() } : {}),
         ...(k.baseUrl && baseUrl() ? { baseUrl: baseUrl() } : {}),
         ...(k.headers ? { headers: hs } : {}),
-        ...(k.env && Object.keys(env).length > 0 ? { env } : {}),
+        ...(k.env ? { env } : {}),
         replace: replace(),
       });
       setToken("");

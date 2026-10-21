@@ -45,7 +45,7 @@ describe("AccountStore", () => {
     expect(() => store.upsert({ backend: "qwen", name: "a", kind: "api-key", token: "k" })).toThrow(/needs its endpoint/);
     expect(() => store.upsert({ backend: "qwen", name: "a", kind: "api-key", token: "k", baseUrl: "http://evil.example/v1" })).toThrow(/https/);
     expect(() => store.upsert({ backend: "qwen", name: "a", kind: "api-key", token: "k", baseUrl: "https://openrouter.ai/api/v1" })).not.toThrow();
-    expect(() => store.upsert({ backend: "pi", name: "p", kind: "api-keys", env: { AWS_SECRET_ACCESS_KEY: "x" } })).toThrow(/not a key this backend reads/);
+    expect(() => store.upsert({ backend: "pi", name: "p", kind: "api-keys", env: { AWS_SECRET_ACCESS_KEY: "x" } })).toThrow(/not a key this account takes/);
     expect(() => store.upsert({ backend: "pi", name: "p", kind: "api-keys", env: {} })).toThrow(/at least one key/);
     // A login kind is created by signing in, never typed in.
     expect(() => store.upsert({ backend: "codex", name: "c", kind: "chatgpt-login", token: "x" })).toThrow(/sign in/);

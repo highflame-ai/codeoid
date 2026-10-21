@@ -14,18 +14,20 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
   applyAccountEnv,
+  bedrockModel,
   ClaudeAccountError,
   ClaudeAccountStore,
   isClaudeCredentialVar,
   projectCredentialOverride,
   type StoredClaudeAccount,
 } from "../daemon/claude-accounts.js";
+import { buildAgentEnv } from "../daemon/providers/claude/index.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
 import { SessionManager } from "../daemon/session-manager.js";
 import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
 import { ALL_SCOPES } from "../protocol/scopes.js";
-import { accountKindsFor, type AuthContext, type DaemonMessage } from "../protocol/types.js";
+import { accountKindsFor, BEDROCK_SETTINGS, type AuthContext, type DaemonMessage } from "../protocol/types.js";
 import { bedrockFromSettings, formatAccounts, parseSettingFlags } from "../terminal/claude-accounts.js";
 
 let dir: string;
@@ -56,9 +58,8 @@ describe("applyAccountEnv — bedrock", () => {
     AWS_BEARER_TOKEN_BEDROCK: "daemon-bedrock-token",
     ANTHROPIC_BEDROCK_BASE_URL: "https://daemon-bedrock.example.com",
     CLAUDE_CODE_SKIP_BEDROCK_AUTH: "1",
-    AWS_ACCESS_KEY_ID: "AKIADAEMON",
-    AWS_SECRET_ACCESS_KEY: "daemon-secret",
-    AWS_PROFILE: "daemon-profile",
+    ANTHROPIC_MODEL: "claude-opus-5-5",
+    ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-sonnet-5",
   };
 
   test("selects Bedrock with the account's token, endpoint and settings; drops every other credential", () => {
@@ -80,10 +81,37 @@ describe("applyAccountEnv — bedrock", () => {
     expect(env.ANTHROPIC_API_KEY).toBeUndefined();
     expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
     expect(env.ANTHROPIC_BASE_URL).toBeUndefined();
-    // The bearer token wins over AWS keys and profiles in the CLI, so the
-    // daemon's stay for the agent's own tools.
-    expect(env.AWS_ACCESS_KEY_ID).toBe("AKIADAEMON");
-    expect(env.AWS_PROFILE).toBe("daemon-profile");
+    // The daemon's model settings name first-party ids: dropped, not mixed in.
+    expect(env.ANTHROPIC_MODEL).toBeUndefined();
+    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBeUndefined();
+  });
+
+  test("the daemon's model settings stay on other kinds", () => {
+    const env = applyAccountEnv(daemonEnv, { name: "s", kind: "subscription", token: "t", createdAt: "", updatedAt: "" });
+    expect(env.ANTHROPIC_MODEL).toBe("claude-opus-5-5");
+  });
+
+  test("the real path: the daemon's AWS and telemetry variables never reach the CLI", () => {
+    const env = applyAccountEnv(
+      buildAgentEnv({ PATH: "/usr/bin", HOME: "/home/u", AWS_ACCESS_KEY_ID: "AKIADAEMON", AWS_PROFILE: "p", AWS_REGION: "eu-west-1", OTEL_EXPORTER_OTLP_ENDPOINT: "https://daemon-otel.example.com" }),
+      bedrock(),
+    );
+    expect(env.AWS_ACCESS_KEY_ID).toBeUndefined();
+    expect(env.AWS_PROFILE).toBeUndefined();
+    expect(env.AWS_REGION).toBeUndefined();
+    expect(env.OTEL_EXPORTER_OTLP_ENDPOINT).toBeUndefined();
+    expect(env.AWS_BEARER_TOKEN_BEDROCK).toBe("br-token");
+  });
+
+  test("bedrockModel: a mapped family's first-party id becomes its alias; the rest pass through", () => {
+    const map = { ANTHROPIC_DEFAULT_OPUS_MODEL: "team.opus", ANTHROPIC_DEFAULT_FABLE_MODEL: "team.fable" };
+    expect(bedrockModel("claude-opus-5-5", map)).toBe("opus");
+    expect(bedrockModel("claude-opus-5-5[1m]", map)).toBe("opus[1m]");
+    expect(bedrockModel("claude-fable-5-1", map)).toBe("fable");
+    expect(bedrockModel("claude-sonnet-5", map)).toBe("claude-sonnet-5");
+    expect(bedrockModel("opus", map)).toBe("opus");
+    expect(bedrockModel("us.anthropic.claude-opus-5-5", map)).toBe("us.anthropic.claude-opus-5-5");
+    expect(bedrockModel("claude-opus-5-5", undefined)).toBe("claude-opus-5-5");
   });
 
   test("no endpoint means AWS itself — never the daemon's endpoint; no settings means none of the daemon's", () => {
@@ -122,8 +150,8 @@ describe("validation", () => {
 
   test("only Bedrock settings, single-line values; no headers; other kinds take no settings", () => {
     const store = storeAt();
-    expect(() => store.upsert({ name: "br", kind: "bedrock", token: "t", env: { ANTHROPIC_API_KEY: "x" } })).toThrow(/not a key/);
-    expect(() => store.upsert({ name: "br", kind: "bedrock", token: "t", env: { CLAUDE_CODE_USE_VERTEX: "1" } })).toThrow(/not a key/);
+    expect(() => store.upsert({ name: "br", kind: "bedrock", token: "t", env: { ANTHROPIC_API_KEY: "x" } })).toThrow(/not a setting/);
+    expect(() => store.upsert({ name: "br", kind: "bedrock", token: "t", env: { CLAUDE_CODE_USE_VERTEX: "1" } })).toThrow(/not a setting/);
     expect(() => store.upsert({ name: "br", kind: "bedrock", token: "t", env: { AWS_REGION: "us\nx" } })).toThrow(/single/);
     expect(() => store.upsert({ name: "br", kind: "bedrock", token: "t", headers: { "x-a": "1" } })).toThrow(/headers/);
     expect(() => store.upsert({ name: "k", kind: "api-key", token: "t", env: { AWS_REGION: "us-east-1" } })).toThrow(/no settings/);
@@ -135,6 +163,10 @@ describe("validation", () => {
     expect(() => store.upsert({ name: "br", kind: "bedrock", token: "t", env: env("http://otel.example.com") })).toThrow(/telemetry endpoint/);
     store.upsert({ name: "br", kind: "bedrock", token: "t", env: env("https://otel.example.com") });
     store.upsert({ name: "br2", kind: "bedrock", token: "t", env: env("http://localhost:4318") });
+    // Headers with no endpoint of their own would go to whichever one won.
+    expect(() => store.upsert({ name: "br4", kind: "bedrock", token: "t", env: { OTEL_EXPORTER_OTLP_HEADERS: "Authorization=Bearer x" } })).toThrow(
+      /need the telemetry endpoint/,
+    );
     // Without headers there's nothing to protect.
     store.upsert({ name: "br3", kind: "bedrock", token: "t", env: { OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel.example.com" } });
   });
@@ -146,6 +178,12 @@ describe("validation", () => {
     expect(k.env).toMatchObject({ label: "Settings", required: false, secret: ["OTEL_EXPORTER_OTLP_HEADERS"] });
     expect(k.env?.names).not.toContain("CLAUDE_CODE_USE_BEDROCK");
     expect(k.env?.names).not.toContain("AWS_BEARER_TOKEN_BEDROCK");
+    // Settings the CLI reads for Bedrock that a moved setup may carry.
+    for (const n of ["ANTHROPIC_BEDROCK_REGION_PREFIX", "ANTHROPIC_BEDROCK_SERVICE_TIER", "ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION", "ANTHROPIC_DEFAULT_FABLE_MODEL"]) {
+      expect(BEDROCK_SETTINGS as readonly string[]).toContain(n);
+    }
+    // Nothing that names another endpoint for the token.
+    expect(k.env?.names.some((n) => n.startsWith("AWS_ENDPOINT_URL") || n.includes("BASE_URL"))).toBe(false);
   });
 });
 
@@ -190,7 +228,11 @@ describe("daemon surface", () => {
       kind: "bedrock",
       token: "br-token-WIRE",
       baseUrl: "https://bedrock.example.com",
-      env: { AWS_REGION: "eu-west-1", OTEL_EXPORTER_OTLP_HEADERS: "Authorization=Bearer otel-WIRE" },
+      env: {
+        AWS_REGION: "eu-west-1",
+        OTEL_EXPORTER_OTLP_ENDPOINT: "https://otel.example.com",
+        OTEL_EXPORTER_OTLP_HEADERS: "Authorization=Bearer otel-WIRE",
+      },
     });
     expect(set.type).toBe("accounts.result");
     const wire = JSON.stringify(set);
@@ -203,7 +245,7 @@ describe("daemon surface", () => {
     expect(claude.accounts.find((a) => a.name === "br")).toMatchObject({
       kind: "bedrock",
       baseUrl: "https://bedrock.example.com",
-      envNames: ["AWS_REGION", "OTEL_EXPORTER_OTLP_HEADERS"],
+      envNames: ["AWS_REGION", "OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_HEADERS"],
     });
     // What a session on it runs with.
     const env = accounts.resolve("br")!.apply({ PATH: "/usr/bin" });
@@ -211,7 +253,7 @@ describe("daemon surface", () => {
     // The terminal list shows names only.
     const listed = formatAccounts((set as unknown as { backends: Parameters<typeof formatAccounts>[0] }).backends);
     expect(listed).toContain("Amazon Bedrock");
-    expect(listed).toContain("settings: AWS_REGION, OTEL_EXPORTER_OTLP_HEADERS");
+    expect(listed).toContain("settings: AWS_REGION, OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_HEADERS");
     expect(listed).not.toContain("otel-WIRE");
   });
 
@@ -223,7 +265,7 @@ describe("daemon surface", () => {
   });
 });
 
-describe("project settings that would redirect a Bedrock account", () => {
+describe("project settings that would redirect an account", () => {
   const settingsWith = (env: Record<string, string>) => {
     mkdirSync(join(dir, ".claude"), { recursive: true });
     writeFileSync(join(dir, ".claude", "settings.json"), JSON.stringify({ env }));
@@ -235,18 +277,31 @@ describe("project settings that would redirect a Bedrock account", () => {
     "AWS_ENDPOINT_URL",
     "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
     "AWS_CA_BUNDLE",
+    // A config or credentials file of the repo's own can carry an endpoint_url.
+    "AWS_CONFIG_FILE",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "AWS_PROFILE",
+    "AWS_DEFAULT_PROFILE",
+    "OTEL_LOG_USER_PROMPTS",
     "OTEL_EXPORTER_OTLP_ENDPOINT",
     "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
     "OTEL_EXPORTER_OTLP_HEADERS",
   ]) {
-    test(`refused: env.${key}`, () => {
+    test(`refused on a bedrock account: env.${key}`, () => {
       settingsWith({ [key]: "https://repo.example.com" });
-      expect(projectCredentialOverride(dir)?.key).toBe(`env.${key}`);
+      expect(projectCredentialOverride(dir, "bedrock")?.key).toBe(`env.${key}`);
     });
   }
+  test("telemetry and AWS endpoints don't lock other kinds out (they send nothing there)", () => {
+    settingsWith({ OTEL_EXPORTER_OTLP_ENDPOINT: "https://otel.example.com", AWS_ENDPOINT_URL: "https://aws.example.com", AWS_CA_BUNDLE: "/x.pem" });
+    for (const kind of ["subscription", "gateway", "api-key"] as const) expect(projectCredentialOverride(dir, kind)).toBeNull();
+    // A Bedrock credential variable is still one for every kind.
+    settingsWith({ AWS_BEARER_TOKEN_BEDROCK: "x" });
+    expect(projectCredentialOverride(dir, "subscription")?.key).toBe("env.AWS_BEARER_TOKEN_BEDROCK");
+  });
   test("allowed: region and model mappings", () => {
-    settingsWith({ AWS_REGION: "us-east-1", ANTHROPIC_DEFAULT_OPUS_MODEL: "us.anthropic.claude-opus-5-5" });
-    expect(projectCredentialOverride(dir)).toBeNull();
+    settingsWith({ AWS_REGION: "us-east-1", AWS_DEFAULT_REGION: "us-east-1", ANTHROPIC_DEFAULT_OPUS_MODEL: "us.anthropic.claude-opus-5-5" });
+    expect(projectCredentialOverride(dir, "bedrock")).toBeNull();
   });
 });
 
@@ -257,6 +312,8 @@ describe("CLI parsers", () => {
       ask: ["OTEL_EXPORTER_OTLP_HEADERS"],
     });
     expect(() => parseSettingFlags(["ANTHROPIC_API_KEY=x"])).toThrow(/--set/);
+    // A mistyped name never echoes its value (it may be a key).
+    expect(() => parseSettingFlags(["OTEL_EXPORTER_OTLP_HEADER=Authorization=Bearer s3cret"])).toThrow(/^(?!.*s3cret)/s);
     expect(() => parseSettingFlags(["=x"])).toThrow(/--set/);
   });
 
@@ -280,6 +337,9 @@ describe("CLI parsers", () => {
       ignored: ["DISABLE_TELEMETRY"],
     });
     expect(() => bedrockFromSettings({ env: { ANTHROPIC_MODEL: "opus" } })).toThrow(/doesn't set up Bedrock/);
+    expect(() => bedrockFromSettings({ env: { CLAUDE_CODE_USE_BEDROCK: "0", AWS_BEARER_TOKEN_BEDROCK: "t" } })).toThrow(/turns Bedrock off/);
+    // A non-string value is named, not silently dropped.
+    expect(bedrockFromSettings({ env: { AWS_BEARER_TOKEN_BEDROCK: "t", CLAUDE_CODE_ENABLE_TELEMETRY: 1 } }).ignored).toEqual(["CLAUDE_CODE_ENABLE_TELEMETRY"]);
     expect(() => bedrockFromSettings({})).toThrow(/no env block/);
   });
 });

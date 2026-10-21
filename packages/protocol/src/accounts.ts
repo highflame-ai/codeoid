@@ -106,20 +106,34 @@ const QWEN_PRESETS = [
 
 /**
  * Settings a Bedrock account may carry beside its token: the region, the
- * Bedrock model IDs the Claude aliases map to (and their display names), the
- * context window, whether to skip AWS auth on an endpoint that wants it, and
- * where telemetry goes. Nothing that selects another credential.
+ * Bedrock model IDs the Claude aliases map to (with their names, descriptions
+ * and capabilities), the region prefix and service tier, the context window,
+ * whether to skip AWS auth on an endpoint that wants it, and where telemetry
+ * goes. Nothing that selects another credential.
  */
 export const BEDROCK_SETTINGS = [
   "AWS_REGION",
+  "ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION",
+  "ANTHROPIC_BEDROCK_REGION_PREFIX",
+  "ANTHROPIC_BEDROCK_SERVICE_TIER",
   "ANTHROPIC_MODEL",
   "ANTHROPIC_SMALL_FAST_MODEL",
   "ANTHROPIC_DEFAULT_OPUS_MODEL",
   "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES",
   "ANTHROPIC_DEFAULT_SONNET_MODEL",
   "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES",
   "ANTHROPIC_DEFAULT_HAIKU_MODEL",
   "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES",
+  "ANTHROPIC_DEFAULT_FABLE_MODEL",
+  "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME",
+  "ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION",
+  "ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES",
   "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
   "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
   "CLAUDE_CODE_ENABLE_TELEMETRY",

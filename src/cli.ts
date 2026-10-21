@@ -17,7 +17,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { type Command, program } from "commander";
@@ -644,7 +644,16 @@ account
     try {
       let fromFile: ReturnType<typeof bedrockFromSettings> = { env: {}, ignored: [] };
       if (o.fromSettings) {
-        fromFile = bedrockFromSettings(JSON.parse(readFileSync(o.fromSettings, "utf8")));
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(readFileSync(o.fromSettings, "utf8"));
+        } catch (err) {
+          // Never the parser's message: it quotes the text around the error,
+          // which in this file is likely to be a token.
+          const code = (err as NodeJS.ErrnoException).code;
+          throw new Error(code ? `can't read ${o.fromSettings} (${code})` : `${o.fromSettings} isn't valid JSON`);
+        }
+        fromFile = bedrockFromSettings(parsed);
         if (fromFile.ignored.length > 0) console.error(`Not taken from ${o.fromSettings} (not Bedrock settings): ${fromFile.ignored.join(", ")}`);
       }
       const parsed = parseSettingFlags(o.set ?? []);
@@ -668,7 +677,8 @@ account
         ...(Object.keys(env).length > 0 ? { env } : {}),
         ...(o.replace ? { replace: true } : {}),
       }));
-      if (!process.exitCode && o.fromSettings) {
+      // Only the user's own settings file applies to every session.
+      if (!process.exitCode && o.fromSettings && resolve(o.fromSettings) === join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude"), "settings.json")) {
         console.log(`The same settings in ${o.fromSettings} still apply to every Claude session, whatever its account — remove them from its env block so only "${name}" uses Bedrock.`);
       }
     } catch (err) {

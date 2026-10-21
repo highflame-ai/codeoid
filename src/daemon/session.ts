@@ -1620,7 +1620,7 @@ export class Session {
     if (!account) return;
     // A named account's token must not be redirectable by the workdir's own
     // Claude settings (claude-accounts.ts projectCredentialOverride).
-    const override = projectCredentialOverride(this.workdir);
+    const override = projectCredentialOverride(this.workdir, account.kind);
     if (override) {
       throw new ClaudeAccountError(
         `${override.file} sets ${override.key}, which would redirect Claude account "${account.name}"'s credential — remove it, or run this session on the default account`,

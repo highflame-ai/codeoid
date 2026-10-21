@@ -65,7 +65,8 @@ export function parseSettingFlags(flags: readonly string[]): { env: Record<strin
     const sep = f.indexOf("=");
     const name = (sep >= 0 ? f.slice(0, sep) : f).trim();
     if (!(BEDROCK_SETTINGS as readonly string[]).includes(name)) {
-      throw new Error(`--set takes NAME=value or NAME, with NAME one of ${BEDROCK_SETTINGS.join(", ")}; got ${JSON.stringify(f)}`);
+      // The name only: the value may be a key.
+      throw new Error(`--set takes NAME=value or NAME, with NAME one of ${BEDROCK_SETTINGS.join(", ")}; got ${JSON.stringify(name)}`);
     }
     if (sep < 0) ask.push(name);
     else env[name] = f.slice(sep + 1).trim();
@@ -88,9 +89,19 @@ export function bedrockFromSettings(parsed: unknown): {
   const raw = parsed && typeof parsed === "object" ? (parsed as { env?: unknown }).env : undefined;
   if (!raw || typeof raw !== "object") throw new Error("the settings file has no env block");
   const out: { token?: string; baseUrl?: string; env: Record<string, string>; ignored: string[] } = { env: {}, ignored: [] };
+  const use = (raw as Record<string, unknown>).CLAUDE_CODE_USE_BEDROCK;
+  if (use !== undefined && !["1", "true", "yes", "on"].includes(String(use).trim().toLowerCase())) {
+    throw new Error("the settings file turns Bedrock off (CLAUDE_CODE_USE_BEDROCK)");
+  }
   for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
-    if (typeof v !== "string" || v === "") continue;
     if (k === "CLAUDE_CODE_USE_BEDROCK") continue; // what the account kind means
+    if (v === "" || v === null) continue;
+    // Claude Code reads env values as strings; a number or boolean here is a
+    // setting codeoid won't guess the text of — name it instead.
+    if (typeof v !== "string") {
+      out.ignored.push(k);
+      continue;
+    }
     if (k === "AWS_BEARER_TOKEN_BEDROCK") out.token = v;
     else if (k === "ANTHROPIC_BEDROCK_BASE_URL") out.baseUrl = v;
     else if ((BEDROCK_SETTINGS as readonly string[]).includes(k)) out.env[k] = v;

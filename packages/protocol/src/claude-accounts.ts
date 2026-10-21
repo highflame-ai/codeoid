@@ -19,7 +19,7 @@
  * organization.)
  *
  * SECRETS. Tokens are stored by the daemon (0600) and never sent to a client;
- * a client sees names, kinds, and a gateway's URL and header names only.
+ * a client sees names, kinds, and an account's URL and header names only.
  */
 
 // ── Shared types ─────────────────────────────────────────────────────────────
@@ -30,6 +30,9 @@
  * - `gateway`: an Anthropic-compatible gateway — a base URL plus its token
  *   (`ANTHROPIC_AUTH_TOKEN`), optionally extra headers (a workspace header).
  * - `api-key`: an Anthropic API key (`ANTHROPIC_API_KEY`).
+ * - `bedrock`: Amazon Bedrock — a bearer token (`AWS_BEARER_TOKEN_BEDROCK`), an
+ *   optional Bedrock-compatible endpoint, and settings. Listed here, but added
+ *   only through `accounts.set` (accounts.ts), which carries settings.
  */
 export type ClaudeAccountKind = "subscription" | "gateway" | "api-key" | "bedrock";
 
@@ -40,7 +43,7 @@ export const CLAUDE_DEFAULT_ACCOUNT = "default";
 export interface ClaudeAccountInfo {
   name: string;
   kind: ClaudeAccountKind;
-  /** Gateway only. */
+  /** A gateway's URL, or a Bedrock account's endpoint (none = AWS). */
   baseUrl?: string;
   /** Gateway only: names of the extra headers sent (values are secret). */
   headerNames?: string[];
@@ -66,7 +69,8 @@ export interface ClaudeAccountsSetMsg {
   type: "claude.accounts.set";
   id: string;
   name: string;
-  kind: ClaudeAccountKind;
+  /** Not `bedrock`: that kind is added with `accounts.set`. */
+  kind: Exclude<ClaudeAccountKind, "bedrock">;
   token: string;
   /** Required for `gateway`; rejected otherwise. */
   baseUrl?: string;

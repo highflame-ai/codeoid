@@ -872,8 +872,9 @@ export class ClaudeProvider implements SessionProvider {
         // anything for them. (The raw chain of thought is never exposed on any
         // model; this is a summary of it.)
         thinking: { type: "adaptive" as const, display: "summarized" as const },
-        ...(opts.model ? { model: opts.model } : {}),
-        ...(opts.fallbackModel ? { fallbackModel: opts.fallbackModel } : {}),
+        // An account may name models its own way (a Bedrock account's mappings).
+        ...(opts.model ? { model: account ? account.model(opts.model) : opts.model } : {}),
+        ...(opts.fallbackModel ? { fallbackModel: account ? account.model(opts.fallbackModel) : opts.fallbackModel } : {}),
         ...(opts.maxBudgetUsd !== undefined ? { maxBudgetUsd: opts.maxBudgetUsd } : {}),
         stderr: (data: string) => {
           process.stderr.write(`[claude-subprocess ${sessionId.slice(0, 8)}] ${data}`);
@@ -1076,8 +1077,10 @@ export class ClaudeProvider implements SessionProvider {
 
     this.#hasQueried = true;
 
-    // Fetch the live model catalog best-effort.
-    if (init.onModels) {
+    // Fetch the live model catalog best-effort. Not from a Bedrock account:
+    // its catalog lists that endpoint's ids, and the cache is every Claude
+    // session's, whatever its account.
+    if (init.onModels && account?.kind !== "bedrock") {
       void this.#query
         .supportedModels()
         .then((m) => init.onModels?.(m))

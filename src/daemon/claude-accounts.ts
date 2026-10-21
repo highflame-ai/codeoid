@@ -38,10 +38,36 @@ export interface StoredClaudeAccount {
 /** A session's account, resolved for one query: what to apply, and whether it changed. */
 export interface ResolvedClaudeAccount {
   name: string;
+  kind: ClaudeAccountKind;
   /** Changes whenever the credential does (a re-login, a new token) — never logged. */
   fingerprint: string;
   apply(env: Record<string, string>): Record<string, string>;
+  /** The model id to hand the CLI for codeoid's `model` on this account (see `bedrockModel`). */
+  model(model: string): string;
 }
+
+/**
+ * Model ids on a Bedrock account. codeoid stores a session's model as a
+ * first-party id (`opus` → `claude-opus-5-5`), but the Claude CLI applies an
+ * account's `ANTHROPIC_DEFAULT_<FAMILY>_MODEL` mapping only to the alias — a
+ * full id goes to the endpoint as `us.anthropic.<id>`. So a first-party id of
+ * a family the account maps is handed over as that family's alias (keeping a
+ * `[1m]` suffix); anything else as it is.
+ */
+export function bedrockModel(model: string, settings: Record<string, string> | undefined): string {
+  const m = /^claude-(opus|sonnet|haiku|fable)-[^[\]]+(\[[a-z0-9]+\])?$/.exec(model);
+  if (!m || !settings?.[`ANTHROPIC_DEFAULT_${m[1]!.toUpperCase()}_MODEL`]) return model;
+  return `${m[1]}${m[2] ?? ""}`;
+}
+
+/** The daemon's own model settings: first-party ids, meaningless to a Bedrock account. */
+const MODEL_SETTINGS = new Set([
+  "ANTHROPIC_MODEL",
+  "ANTHROPIC_SMALL_FAST_MODEL",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+]);
 
 /**
  * Explicit credential / backend-selection variables the Claude CLI reads. Kept
@@ -234,9 +260,11 @@ export function applyAccountEnv(env: Record<string, string>, account: StoredClau
       break;
     }
     case "bedrock":
-      // The bearer token wins over any AWS keys or profile in the daemon's
-      // environment (checked against the CLI), so those stay for the agent's
-      // own tools. The account's settings go on top of what the daemon has.
+      // The daemon's model settings name first-party ids; only the account's
+      // own mappings mean anything on its endpoint. (AWS keys and profiles
+      // never reach the CLI — buildAgentEnv doesn't pass them — and the
+      // bearer token would win over them anyway.)
+      for (const k of MODEL_SETTINGS) delete out[k];
       for (const [k, v] of Object.entries(account.env ?? {})) out[k] = v;
       out.CLAUDE_CODE_USE_BEDROCK = "1";
       out.AWS_BEARER_TOKEN_BEDROCK = account.token;
@@ -360,8 +388,10 @@ export class ClaudeAccountStore {
     const account = resolved!.account as StoredClaudeAccount;
     return {
       name: account.name,
+      kind: account.kind,
       fingerprint: resolved!.fingerprint,
       apply: (env) => applyAccountEnv(env, account),
+      model: (model) => (account.kind === "bedrock" ? bedrockModel(model, account.env) : model),
     };
   }
 }
@@ -393,20 +423,22 @@ export class ClaudeAccountStore {
 const REDIRECTING_ENV = new Set([
   "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy",
   "NODE_EXTRA_CA_CERTS", "NODE_TLS_REJECT_UNAUTHORIZED", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_OPTIONS",
-  "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", "AWS_CA_BUNDLE",
+  "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB",
 ]);
-function redirectsCredential(key: string): boolean {
-  return (
-    isClaudeCredentialVar(key) ||
-    REDIRECTING_ENV.has(key) ||
-    // Where a Bedrock account's token goes, and where its telemetry (and
-    // the telemetry headers' key) goes.
-    key.startsWith("AWS_ENDPOINT_URL") ||
-    key.startsWith("OTEL_EXPORTER_OTLP_")
-  );
+function redirectsCredential(key: string, kind: ClaudeAccountKind): boolean {
+  if (isClaudeCredentialVar(key) || REDIRECTING_ENV.has(key)) return true;
+  if (kind !== "bedrock") return false;
+  // The CLI's AWS SDK reads its whole configuration from AWS_* — a config or
+  // credentials file of the repo's own can carry an `endpoint_url` that gets
+  // the bearer token; a profile can pick one from the user's. Only the region
+  // is safe (the CLI validates it, so the host stays AWS's).
+  if (key.startsWith("AWS_")) return key !== "AWS_REGION" && key !== "AWS_DEFAULT_REGION";
+  // Where telemetry (and the telemetry headers' key) goes, and what content
+  // it carries to the account's collector.
+  return key.startsWith("OTEL_");
 }
 
-export function projectCredentialOverride(workdir: string): { file: string; key: string } | null {
+export function projectCredentialOverride(workdir: string, kind: ClaudeAccountKind): { file: string; key: string } | null {
   const home = resolve(homedir());
   for (let dir = resolve(workdir); ; dir = dirname(dir)) {
     if (dir === home) break; // ~/.claude/settings.json is the user's own settings, not a project's
@@ -426,7 +458,7 @@ export function projectCredentialOverride(workdir: string): { file: string; key:
         if (settings[key] !== undefined) return { file, key };
       }
       if (settings.env && typeof settings.env === "object") {
-        for (const key of Object.keys(settings.env)) if (redirectsCredential(key)) return { file, key: `env.${key}` };
+        for (const key of Object.keys(settings.env)) if (redirectsCredential(key, kind)) return { file, key: `env.${key}` };
       }
     }
     if (dirname(dir) === dir) break;
