@@ -53,6 +53,7 @@ export function StatusBar({
   cols,
 }: Props) {
   const usage = focused?.info.usage;
+  const account = focused ? claudeAccountLabel(focused.info) : null;
   // Background-activity summary: count sessions (other than focused) with
   // unread messages or pending approvals. Shown as a single compact pill
   // at the end of the bar — no per-session chrome.
@@ -95,8 +96,6 @@ export function StatusBar({
         <>
           <Text dimColor>{"   │   "}</Text>
           <Text bold>{focused.info.name}</Text>
-          <Text dimColor>{" @ "}</Text>
-          <Text dimColor>{focused.info.workdir}</Text>
           <Text dimColor>{" · "}</Text>
           <Text
             color={
@@ -155,6 +154,14 @@ export function StatusBar({
               </Text>
             </>
           )}
+          {/* The backend sits with the model (Claude is implied by its
+              model id), and a MISSING account too — it fails the next turn,
+              so it must never be truncated away behind usage. A working
+              account is a descriptor and goes at the end. */}
+          {(focused.info.providerId ?? "claude") !== "claude" && (
+            <Text dimColor>{` on ${focused.info.providerId}`}</Text>
+          )}
+          {account?.missing && <Text color="red">{` · account: ${account.label}`}</Text>}
           {focused.info.pinnedFiles && focused.info.pinnedFiles.length > 0 && (
             <>
               <Text dimColor>{" · pinned: "}</Text>
@@ -251,9 +258,35 @@ export function StatusBar({
           <Text color="red">⚠ {lastError}</Text>
         </>
       )}
+      {/* The workdir goes last: the line truncates at the terminal edge, and
+          a long path must never push the live status, cost, or error off
+          screen (the focus banner shows it in full). */}
+      {focused && (
+        <>
+          <Text dimColor>{"   │   "}</Text>
+          {account && !account.missing && <Text color="cyan">{`account: ${account.label} · `}</Text>}
+          <Text dimColor>{`@ ${focused.info.workdir}`}</Text>
+        </>
+      )}
       </Text>
     </Box>
   );
+}
+
+/**
+ * The Claude account worth showing, or null. A session that follows the
+ * daemon default and lands on the machine's own login is the common case and
+ * says nothing; a pinned account, a non-default daemon default, or a missing
+ * account (which fails the next turn) is shown.
+ */
+function claudeAccountLabel(info: TuiSession["info"]): { label: string; missing: boolean } | null {
+  if ((info.providerId ?? "claude") !== "claude") return null;
+  const effective = info.effectiveClaudeAccount ?? info.claudeAccount ?? "default";
+  const missing = effective.endsWith(" (missing)");
+  if (info.claudeAccount !== undefined) return { label: effective, missing };
+  if (effective === "default") return null;
+  const name = missing ? effective.slice(0, -" (missing)".length) : effective;
+  return { label: `${name} (following default${missing ? ", missing" : ""})`, missing };
 }
 
 /** "12s" / "1m 23s" / "1h 5m" — compact working-duration stamp. */
@@ -348,4 +381,3 @@ function pickContextColor(inputTokens: number, contextWindow: number): string {
   if (r >= 0.5) return "yellow";
   return "green";
 }
-

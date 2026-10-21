@@ -11,6 +11,7 @@ import { TuiWsClient } from "./ws.js";
 import { Prompt } from "./components/Prompt.js";
 import { StatusBar } from "./components/StatusBar.js";
 import { Modal } from "./components/Modal.js";
+import type { NewSessionOptions } from "./components/NewSessionModal.js";
 import { filterCommands } from "./components/SlashHint.js";
 import { fuzzyMatch, scanWorkspaceFiles } from "./file-scanner.js";
 import {
@@ -20,6 +21,7 @@ import {
 } from "./workspace-commands.js";
 import type { Attachment, McpReconnectResult, McpRefreshResult } from "../protocol/types.js";
 import { mcpRefreshSummary } from "@highflame/codeoid-core";
+import type { TuiAction } from "./types.js";
 import { parseDialogAnswer } from "../terminal/dialog.js";
 import { formatRewind, parseForkArgs, parseUndoArgs } from "../terminal/rewind.js";
 import { formatCompare, parseCompareArgs } from "../terminal/compare.js";
@@ -34,9 +36,11 @@ import {
 
 interface Props {
   config: CodeoidConfig;
+  /** Builds the daemon client. Tests inject a fake; production uses the default. */
+  createClient?: (config: CodeoidConfig, dispatch: React.Dispatch<TuiAction>) => TuiWsClient;
 }
 
-export function App({ config }: Props) {
+export function App({ config, createClient = (c, d) => new TuiWsClient(c, d) }: Props) {
   const { state, dispatch } = useTuiStore();
   const { exit } = useApp();
   const { stdout } = useStdout();
@@ -44,7 +48,7 @@ export function App({ config }: Props) {
 
   // Initialize WS client once.
   useEffect(() => {
-    const client = new TuiWsClient(config, dispatch);
+    const client = createClient(config, dispatch);
     wsRef.current = client;
     void client.start();
     return () => client.stop();
@@ -57,6 +61,9 @@ export function App({ config }: Props) {
   /** Per session, the comparison /compare last started or showed here (#357). */
   const lastCompareRef = useRef<Map<string, string>>(new Map());
   const prevConnectionRef = useRef(state.connection);
+  /** The open dialog as of the last render — for async results that must not act on a dialog the user closed. */
+  const modalRef = useRef(state.modal);
+  modalRef.current = state.modal;
   useEffect(() => {
     const client = wsRef.current;
     // The daemon drops all attachments when the socket closes (they're keyed
@@ -1098,25 +1105,35 @@ export function App({ config }: Props) {
         });
         return;
       }
-      case "/model": {
-        // No args → interactive picker modal. With an arg → direct switch
-        // (skip modal, trust the user knows the alias/id they want).
-        if (args.length === 0) {
-          dispatch({ type: "modal.open", modal: { kind: "model" } });
+      case "/model":
+      case "/provider":
+      case "/account": {
+        if (!focusedSession) {
+          dispatch({ type: "error", message: "No session focused" });
           return;
         }
-        if (!client || !focusedSession) return;
-        const chosen = args[0]!;
-        void client
-          .setModel(focusedSession.info.id, chosen)
-          .then((resp) => {
-            if (resp.type === "response.error") {
-              dispatch({ type: "error", message: resp.error });
-            }
-          })
-          .catch((err: Error) =>
-            dispatch({ type: "error", message: err.message }),
-          );
+        if (!client) {
+          dispatch({ type: "error", message: "Not connected" });
+          return;
+        }
+        const sessionId = focusedSession.info.id;
+        if (cmd === "/account" && (focusedSession.info.providerId ?? "claude") !== "claude") {
+          dispatch({ type: "error", message: "Claude accounts apply to Claude sessions. Use /provider to switch backends." });
+          return;
+        }
+        // No args → interactive picker for this session. With an arg →
+        // direct switch (trust the user knows the id they want).
+        if (args.length === 0) {
+          dispatch({ type: "modal.open", modal: { kind: cmd === "/model" ? "model" : cmd === "/provider" ? "provider" : "account", sessionId } });
+          return;
+        }
+        const value = cmd === "/model" ? args[0]! : args[0]!.toLowerCase();
+        const operation = cmd === "/model"
+          ? onSetModel(sessionId, value)
+          : cmd === "/provider"
+            ? onSetProvider(sessionId, value)
+            : onSetAccount(sessionId, value === "--follow-default" || value === "--follow" ? "" : value);
+        void operation.catch((cause: unknown) => dispatch({ type: "error", message: cause instanceof Error ? cause.message : String(cause) }));
         return;
       }
       default: {
@@ -1152,17 +1169,17 @@ export function App({ config }: Props) {
 
   // ── Modal handlers ─────────────────────────────────────────────────────
 
-  const onSubmitNewSession = (name: string, workdir: string) => {
+  const onSubmitNewSession = async (name: string, workdir: string, options: NewSessionOptions) => {
     const client = wsRef.current;
-    if (!client) return;
-    void client.createSession(name, workdir).then((resp) => {
-      if (resp.type === "response.ok" && resp.data) {
-        const info = resp.data as import("../protocol/types.js").SessionInfo;
-        dispatch({ type: "session.add", session: info });
-        dispatch({ type: "focus", sessionId: info.id });
-      }
-      dispatch({ type: "modal.close" });
-    });
+    if (!client) throw new Error("Not connected");
+    const resp = await client.createSession(name, workdir, options);
+    if (resp.type === "response.error") throw new Error(resp.error);
+    if (resp.type !== "response.ok" || !resp.data) throw new Error("Unexpected session creation response");
+    const info = resp.data as import("../protocol/types.js").SessionInfo;
+    dispatch({ type: "session.add", session: info });
+    // Esc'd while creating: the session still exists, but the user has moved
+    // on — don't yank focus (and their next Enter) over to it.
+    if (modalRef.current?.kind === "new-session") dispatch({ type: "focus", sessionId: info.id });
   };
 
   const onSelectSession = (sessionId: string) => {
@@ -1210,13 +1227,28 @@ export function App({ config }: Props) {
    * forward the user's choice. Surfaces server errors (unknown id) so
    * the modal can show them inline.
    */
-  const onSetModel = async (model: string): Promise<void> => {
+  const onSetModel = async (sessionId: string, model: string): Promise<void> => {
     const client = wsRef.current;
-    if (!client || !focusedSession) return;
-    const resp = await client.setModel(focusedSession.info.id, model);
+    if (!client) throw new Error("Not connected");
+    const resp = await client.setModel(sessionId, model);
     if (resp.type === "response.error") {
       throw new Error(resp.error);
     }
+  };
+
+  const onSetProvider = async (sessionId: string, providerId: string): Promise<void> => {
+    const client = wsRef.current;
+    if (!client) throw new Error("Not connected");
+    const response = await client.setProvider(sessionId, providerId);
+    if (response.type === "response.error") throw new Error(response.error);
+  };
+
+  /** "" = follow the daemon default (sent as null). */
+  const onSetAccount = async (sessionId: string, account: string): Promise<void> => {
+    const client = wsRef.current;
+    if (!client) throw new Error("Not connected");
+    const response = await client.setClaudeAccount(sessionId, account || null);
+    if (response.type === "response.error") throw new Error(response.error);
   };
 
   // ── Layout ─────────────────────────────────────────────────────────────
@@ -1273,6 +1305,7 @@ export function App({ config }: Props) {
           onHistoryCycle={(dir) => dispatch({ type: "history.cycle", direction: dir })}
           hint={promptHint}
           disabled={!focusedSession && !inSlashMode}
+          inputActive={!state.modal}
           slashSelectedIdx={slashIdx}
           fileHint={
             inMentionMode && mention
@@ -1283,6 +1316,11 @@ export function App({ config }: Props) {
       </Box>
       {state.modal && (
         <Modal
+          // Keyed by kind only: a focus change (sessions.set on connect or
+          // reconnect) must not remount an open dialog and wipe its input.
+          key={state.modal.kind}
+          providers={state.providers}
+          client={wsRef.current}
           modal={state.modal}
           sessions={orderedSessions}
           focusedSession={focusedSession}
@@ -1292,6 +1330,8 @@ export function App({ config }: Props) {
           onCancel={onCancelModal}
           onSearch={onSearch}
           onSetModel={onSetModel}
+          onSetProvider={onSetProvider}
+          onSetAccount={onSetAccount}
         />
       )}
     </>

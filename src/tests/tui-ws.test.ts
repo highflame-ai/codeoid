@@ -17,6 +17,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { TuiWsClient } from "../tui/ws.js";
 import type { CodeoidConfig } from "../config.js";
 import type { TuiAction } from "../tui/types.js";
+import type { ProviderInfo } from "../protocol/types.js";
 
 // ── Controllable mock WebSocket (assignable onX handlers, like Bun's) ────────
 
@@ -152,6 +153,83 @@ describe("TuiWsClient", () => {
 
     expect(ws.parsed[0]).toMatchObject({ token: "fresh-1" }); // auth frame first
     expect(lastConnState(actions)).toBe("connected");
+  });
+
+  it("loads provider labels, applies runtime changes, and resubscribes after reconnect", async () => {
+    const actions: TuiAction[] = [];
+    const client = makeClient(actions, { heartbeatMs: 0, reconnectDelayMs: 5 });
+    const socket = await connect(client);
+    const providers: ProviderInfo[] = [
+      { id: "claude", displayName: "Claude", kind: "builtin", isDefault: true },
+      { id: "oai:box", displayName: "GPU box", kind: "endpoint", isDefault: false },
+    ];
+    const request = socket.parsed.find((message) => message.type === "providers.list")!;
+    socket.recv({ type: "providers.result", requestId: request.id, providers });
+    await flush();
+    expect(actions.at(-1)).toEqual({ type: "providers.set", providers });
+    socket.recv({ type: "providers.changed", providers: providers.slice(0, 1) });
+    expect(actions.at(-1)).toEqual({ type: "providers.set", providers: providers.slice(0, 1) });
+    socket.close(1006, "dropped");
+    await sleep(30);
+    const reconnected = MockWS.last();
+    reconnected.open();
+    reconnected.recv({ ...AUTH_OK, providers: ["oai:box", "claude"], providerInfo: providers });
+    expect(reconnected.sentTypes).toContain("providers.list");
+    expect(actions.filter((action) => action.type === "providers.set").at(-1)).toEqual({ type: "providers.set", providers });
+  });
+
+  it("keeps legacy auth providers when the daemon does not support providers.list", async () => {
+    const actions: TuiAction[] = [];
+    const client = makeClient(actions, { heartbeatMs: 0 });
+    await client.start();
+    const socket = MockWS.last();
+    socket.open();
+    socket.recv({ ...AUTH_OK, providers: ["pi", "claude"] });
+    const request = socket.parsed.find((message) => message.type === "providers.list")!;
+    socket.recv({ type: "response.error", requestId: request.id, error: "Unknown message" });
+    await flush();
+    expect(actions.filter((action) => action.type === "providers.set").at(-1)).toEqual({
+      type: "providers.set",
+      providers: [
+        { id: "pi", displayName: "pi", kind: "builtin", isDefault: true },
+        { id: "claude", displayName: "claude", kind: "builtin", isDefault: false },
+      ],
+    });
+    expect(actions.some((action) => action.type === "error")).toBe(false);
+  });
+
+  it("requests the selected backend's models and propagates account permission errors", async () => {
+    const client = makeClient([], { heartbeatMs: 0 });
+    const socket = await connect(client);
+    const models = client.listModels("oai:box");
+    const modelRequest = socket.parsed.at(-1)!;
+    expect(modelRequest).toMatchObject({ type: "models.list", provider: "oai:box" });
+    const catalog = { type: "models.list.result" as const, requestId: String(modelRequest.id), provider: "oai:box", live: true, models: [{ value: "local-model", displayName: "Local model" }] };
+    socket.recv(catalog);
+    expect(await models).toEqual(catalog);
+    const accounts = client.listClaudeAccounts();
+    socket.recv({ type: "response.error", requestId: socket.parsed.at(-1)!.id, error: "Missing scope: settings:read", code: "forbidden" });
+    await expect(accounts).rejects.toThrow("Missing scope: settings:read");
+  });
+
+  it("sends per-session provider and account choices including follow-default null", async () => {
+    const client = makeClient([], { heartbeatMs: 0 });
+    const socket = await connect(client);
+    const operations: Array<[() => Promise<unknown>, Record<string, unknown>]> = [
+      [() => client.createSession("work", "/repo", { providerId: "claude", claudeAccount: "work" }), { type: "session.create", name: "work", workdir: "/repo", providerId: "claude", claudeAccount: "work" }],
+      [() => client.createSession("local", "/repo", { providerId: "oai:box" }), { type: "session.create", providerId: "oai:box" }],
+      [() => client.setProvider("session", "oai:box"), { type: "session.set_provider", sessionId: "session", providerId: "oai:box" }],
+      [() => client.setClaudeAccount("session", "default"), { type: "session.set_claude_account", sessionId: "session", account: "default" }],
+      [() => client.setClaudeAccount("session", null), { type: "session.set_claude_account", sessionId: "session", account: null }],
+    ];
+    for (const [operation, expected] of operations) {
+      const pending = operation();
+      const request = socket.parsed.at(-1)!;
+      expect(request).toMatchObject(expected);
+      if (request.providerId === "oai:box") expect(request).not.toHaveProperty("claudeAccount");
+      socket.recv({ type: "response.ok", requestId: request.id });
+      await pending;
+    }
   });
 
   it("recovers from a 4003 'Token expired' close by reconnecting with a fresh token", async () => {

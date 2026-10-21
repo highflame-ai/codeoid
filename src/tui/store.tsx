@@ -44,6 +44,7 @@ function isActiveToolCall(msg: SessionMessage): boolean {
 }
 
 const initialState: TuiState = {
+  providers: [],
   sessions: new Map(),
   order: [],
   focused: null,
@@ -70,6 +71,8 @@ function blankSession(info: TuiSession["info"]): TuiSession {
 
 function reducer(state: TuiState, action: TuiAction): TuiState {
   switch (action.type) {
+    case "providers.set":
+      return { ...state, providers: action.providers };
     case "connection.change":
       return { ...state, connection: action.state };
 
