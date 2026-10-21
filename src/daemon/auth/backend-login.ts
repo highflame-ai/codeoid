@@ -32,14 +32,12 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import type { LoginBackend, PendingBackendLogin } from "../../protocol/types.js";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stripClaudeCredentials } from "../claude-accounts.js";
 import { buildSubprocessEnv } from "../providers/env.js";
 import { resolveCodexCommand } from "../providers/codex/resolve.js";
-import { resolveGeminiCliCommand } from "../providers/acp/resolve.js";
-import { geminiAccountSettings, isGeminiCredentialVar } from "../account-apply.js";
 
 /** Longest we hold a started attempt open before killing it. */
 const ATTEMPT_TTL_MS = 10 * 60_000;
@@ -206,44 +204,9 @@ export const CODEX_LOGIN_FLOW: LoginFlow = {
   isolatedOnly: true,
 };
 
-/**
- * The Gemini CLI's Google sign-in against the account's staging
- * GEMINI_CLI_HOME. There is no login subcommand: the interactive CLI, with
- * Google login selected in its settings and `NO_BROWSER=true`, prints the
- * consent link and asks for the code the page shows; on success it writes
- * `.gemini/oauth_creds.json` and carries on as a chat, so the sign-in is done
- * when that file appears. Verified headless (gemini-cli 0.50).
- */
-export const GEMINI_CLI_LOGIN_FLOW: LoginFlow = {
-  backend: "gemini-cli",
-  mode: "code",
-  resolve() {
-    const r = resolveGeminiCliCommand(undefined);
-    return r ? { file: r.command, args: [...r.argsPrefix] } : null;
-  },
-  urlPattern: /https:\/\/accounts\.google\.com\/o\/oauth2\/v2\/auth\?[A-Za-z0-9_=&%.~+-]+/g,
-  failurePattern: /Failed to (?:exchange|authenticate|login)|invalid_grant|Authorization code is required/i,
-  codeHint: "Approve in the browser, then paste the authorization code the page shows.",
-  extractSecret: () => null,
-  envPrefixes: ["GEMINI_", "GOOGLE_", "LC_"],
-  stripCredentials: (env) => {
-    const out: Record<string, string> = {};
-    for (const [k, v] of Object.entries(env)) if (!isGeminiCredentialVar(k)) out[k] = v;
-    return out;
-  },
-  homeEnv: (home) => ({ GEMINI_CLI_HOME: home, NO_BROWSER: "true" }),
-  prepareHome(home) {
-    mkdirSync(join(home, ".gemini"), { recursive: true, mode: 0o700 });
-    writeFileSync(join(home, ".gemini", "settings.json"), geminiAccountSettings(undefined, "oauth-personal"), { mode: 0o600 });
-  },
-  credentialFiles: [".gemini/oauth_creds.json", ".gemini/google_accounts.json"],
-  isolatedOnly: true,
-};
-
 const FLOWS: Record<LoginBackend, LoginFlow> = {
   claude: CLAUDE_LOGIN_FLOW,
   codex: CODEX_LOGIN_FLOW,
-  "gemini-cli": GEMINI_CLI_LOGIN_FLOW,
 };
 
 /** Anything credential-shaped, gone — applied to every string that leaves here. */

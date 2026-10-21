@@ -34,10 +34,9 @@ export const DEFAULT_ACCOUNT = "default";
  * - `gateway` (claude): an Anthropic-compatible gateway — base URL, token, headers.
  * - `api-key`: the backend's API key (and, for an endpoint, optional headers).
  * - `chatgpt-login` (codex): a ChatGPT sign-in, kept in the account's own Codex home.
- * - `google-login` (gemini-cli): a Google sign-in, kept in the account's own Gemini CLI home.
  * - `api-keys` (pi): a set of model-provider key variables pi reads.
  */
-export type AccountKind = "subscription" | "gateway" | "api-key" | "chatgpt-login" | "google-login" | "api-keys";
+export type AccountKind = "subscription" | "gateway" | "api-key" | "chatgpt-login" | "api-keys";
 
 /** How a kind's credential is obtained when it isn't typed in. */
 export type AccountLoginMode =
@@ -132,10 +131,9 @@ const KINDS: Record<string, AccountKindInfo[]> = {
   openai: [{ kind: "api-key", label: "OpenAI API key", token: { label: "API key", required: true } }],
   llamacpp: [{ kind: "api-key", label: "llama-server API key", token: { label: "API key", required: true } }],
   gemini: [{ kind: "api-key", label: "Gemini API key", token: { label: "API key", required: true } }],
-  "gemini-cli": [
-    { kind: "google-login", label: "Google sign-in", hint: "Signs in with Google into this account only.", login: "code" },
-    { kind: "api-key", label: "Gemini API key", token: { label: "API key", required: true } },
-  ],
+  // API keys only: a consumer Google (AI Pro/Ultra) subscription can't be
+  // used with codeoid (#192), so there is no Google sign-in kind.
+  "gemini-cli": [{ kind: "api-key", label: "Gemini API key", token: { label: "API key", required: true } }],
   codex: [
     {
       kind: "chatgpt-login",
@@ -200,7 +198,7 @@ export interface AccountsListMsg {
  * refused otherwise, so a typo can't silently move every session on that
  * account to another credential. Scope: `settings:write`, undelegated.
  *
- * Login kinds (`chatgpt-login`, `google-login`) come from `backend.login.start`
+ * A login kind (`chatgpt-login`) comes from `backend.login.start`
  * with `account`; a `subscription` may also be pasted as `token`.
  */
 export interface AccountsSetMsg {

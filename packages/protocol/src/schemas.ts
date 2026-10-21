@@ -509,7 +509,7 @@ export const settingsSetSchema = z.object({
  * it can name belongs in the validated surface rather than in a lookup that
  * happens to miss.
  */
-const loginBackendField = z.enum(["claude", "codex", "gemini-cli"]);
+const loginBackendField = z.enum(["claude", "codex"]);
 
 const claudeAccountNameField = z.string().min(1).max(64);
 
@@ -540,7 +540,7 @@ export const accountsSetSchema = z.object({
   type: z.literal("accounts.set"),
   backend: accountBackendField,
   name: accountNameField,
-  kind: z.enum(["subscription", "gateway", "api-key", "chatgpt-login", "google-login", "api-keys"]),
+  kind: z.enum(["subscription", "gateway", "api-key", "chatgpt-login", "api-keys"]),
   token: z.string().min(1).max(8192).optional(),
   baseUrl: z.string().min(1).max(2048).optional(),
   headers: z.record(z.string().min(1).max(256), z.string().max(8192)).optional(),

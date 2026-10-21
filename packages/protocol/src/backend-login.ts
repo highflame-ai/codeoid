@@ -42,17 +42,17 @@ import type { SettingsSnapshot } from "./settings.js";
  * without first asking the daemon whether it would work. Adding one is an entry
  * here plus a flow in the daemon's broker.
  */
-export type LoginBackend = "claude" | "codex" | "gemini-cli";
+export type LoginBackend = "claude" | "codex";
 
 /** Runtime companion to {@link LoginBackend} — what a client renders a button for. */
-export const LOGIN_CAPABLE_BACKENDS: readonly LoginBackend[] = ["claude", "codex", "gemini-cli"] as const;
+export const LOGIN_CAPABLE_BACKENDS: readonly LoginBackend[] = ["claude", "codex"] as const;
 
 /**
  * Backends whose sign-in only creates a NAMED account (accounts.ts) — there is
  * no daemon-wide login of theirs to replace. A client offers their sign-in
  * under Accounts, never as the daemon's own login.
  */
-export const LOGIN_ACCOUNT_ONLY_BACKENDS: readonly LoginBackend[] = ["codex", "gemini-cli"] as const;
+export const LOGIN_ACCOUNT_ONLY_BACKENDS: readonly LoginBackend[] = ["codex"] as const;
 
 /** A login the daemon has started and is holding open, waiting for a code. */
 export interface PendingBackendLogin {

@@ -4,7 +4,7 @@
  * docs/backend-accounts-design.md).
  *
  * Stored in `<configDir>/accounts.json`, 0600, written atomically, re-read
- * when it changes on disk. A login-kind account (a ChatGPT or Google sign-in)
+ * when it changes on disk. A login-kind account (a ChatGPT sign-in)
  * keeps its credential as the vendor's own files in the account's home,
  * `<configDir>/accounts/<backend>/<name>/` (0700); see account-homes.ts.
  *
@@ -95,7 +95,7 @@ const HEADER_NAME_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,256}$/;
 /** Headers the HTTP client owns; setting them would break or smuggle the request. */
 const RESERVED_HEADERS = new Set(["host", "content-length", "content-type", "transfer-encoding", "connection", "accept-encoding"]);
 /** Kinds whose credential is the vendor's files in the account home, written by a sign-in. */
-export const LOGIN_KINDS: ReadonlySet<AccountKind> = new Set(["chatgpt-login", "google-login"]);
+export const LOGIN_KINDS: ReadonlySet<AccountKind> = new Set(["chatgpt-login"]);
 
 export function validateAccountName(name: string): void {
   if (name === DEFAULT_ACCOUNT) {

@@ -39,8 +39,7 @@ What a backend accepts, and how it is applied.
 | `openai`, `llamacpp` | `api-key` | token | the HTTP client's key, rebuilt per turn |
 | `oai:<name>` | `api-key` | token and/or headers, and the origin they were entered for | replaces the endpoint's own key and headers; refused if the endpoint has since moved to another origin |
 | `gemini` | `api-key` | token | the client's key, per turn |
-| `gemini-cli` | `google-login` | files in the account's home | `GEMINI_CLI_HOME=<account home>` |
-| | `api-key` | token | `GEMINI_API_KEY`, in an account home that selects API-key auth |
+| `gemini-cli` | `api-key` | token | `GEMINI_API_KEY`, in an account home that selects API-key auth (a consumer Google subscription can't be used with codeoid, #192 — there is no Google sign-in kind) |
 | `codex` | `chatgpt-login` | files in the account's home | `CODEX_HOME=<account home>` |
 | | `api-key` | token, also written by `codex login --with-api-key` into the account home | `CODEX_HOME=<account home>` |
 | `qwen` | `api-key` | token, base URL (preset or URL) | `OPENAI_API_KEY` / base URL on the query (Qwen OAuth's free tier ended 2026-04-15; there is no login kind) |
@@ -54,8 +53,8 @@ Codex, the Gemini CLI and pi keep their login in a directory, not a variable.
 Each such account gets a home under `<configDir>/accounts/<backend>/<name>/` (0700) that is an *overlay* of the vendor's default home:
 
 - every entry of the default home is a symlink to the real one — config, MCP settings, skills, session files and the vendor's state databases — refreshed before each spawn so new entries appear;
-- except the vendor's credential files, which are the account's own (`auth.json` for Codex and pi; `oauth_creds.json`, `google_accounts.json` for the Gemini CLI);
-- and, for the Gemini CLI, `settings.json`, which is a copy of the default one with the auth type set to the account's kind (otherwise a default home that selects Google login would override an API-key account).
+- except the vendor's credential files, which are the account's own (`auth.json` for Codex and pi) — or, for the Gemini CLI, left out so the daemon's own Google login (`oauth_creds.json`, `google_accounts.json`) never reaches an API-key account;
+- and, for the Gemini CLI, `settings.json`, which is a copy of the default one selecting API-key auth (otherwise a default home that selects Google login would override an API-key account).
 
 Sharing everything but the credential is what lets a switched session resume natively: Codex's thread, pi's session file and Qwen's session live where every account can read them.
 A backend whose native resume fails after a switch falls back to codeoid's canonical history (`Session.#seedProviderFromHistory`), never to an empty conversation.
@@ -70,10 +69,8 @@ Removing an account deletes its home.
 |---|---|---|
 | `claude` | `claude setup-token` | `code`: open the link, paste the code |
 | `codex` | `codex login --device-auth` with `CODEX_HOME` | `device`: open the link, enter the one-time code shown in codeoid; finishes on its own |
-| `gemini-cli` | `gemini` with `GEMINI_CLI_HOME`, Google login selected, `NO_BROWSER=true` | `code` |
 
 A `device` login is finished with `backend.login.wait` instead of `submit`.
-The Gemini CLI has no login subcommand, so its sign-in runs the interactive CLI with Google login selected and is done when it writes `oauth_creds.json`.
 The attempt runs in a staging home; only a completed login is moved into the account's home, so a failed or cancelled attempt never replaces a working credential.
 
 ## Switching mechanics
@@ -96,7 +93,7 @@ New, generic messages; the `claude.accounts.*` and `session.set_claude_account` 
 - `session.set_account {sessionId, account, backend?}` (`backend` defaults to the session's current one).
 - `session.create {…, account?}`.
 - `SessionInfo.account` / `effectiveAccount` for the session's current backend (`"<name> (missing)"` when unusable).
-- `backend.login.start {backend, account, replace?}` for `claude`, `codex`, `gemini-cli`; `PendingBackendLogin` gains `mode` and, for `device`, `userCode`; `backend.login.wait {loginId}`.
+- `backend.login.start {backend, account, replace?}` for `claude` and `codex` (`LOGIN_ACCOUNT_ONLY_BACKENDS` lists those that sign in only as a named account); `PendingBackendLogin` gains `mode` and, for `device`, `userCode`; `backend.login.wait {loginId}`.
 
 ## Authorization
 

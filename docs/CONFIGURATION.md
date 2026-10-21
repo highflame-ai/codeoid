@@ -275,13 +275,13 @@ That is the Claude CLI's own switch: on Linux it needs bubblewrap and runs every
 
 ## Accounts for every backend
 
-Every backend can hold several accounts the same way: two ChatGPT sign-ins for Codex, a team and a personal key for Qwen, a second key for a local endpoint.
+Every backend can hold several accounts the same way: two ChatGPT sign-ins for Codex, a team and a personal key for Qwen or the Gemini CLI, a second key for a local endpoint.
 Each backend has its own default, and a session holds one choice per backend, so switching a session from Codex to Qwen and back keeps the account it had on each.
 The design is in [backend-accounts-design.md](backend-accounts-design.md).
 
 ```bash
 codeoid account login work --backend codex          # ChatGPT sign-in: open the link, enter the code shown
-codeoid account login personal --backend gemini-cli # Google sign-in: open the link, paste the code back
+codeoid account add-key personal --backend gemini-cli   # a Gemini API key, asked for without echo
 codeoid account add-key team --backend qwen --base-url bailian-plan-intl   # a Coding Plan key, asked for without echo
 codeoid account add-key team --backend openai
 codeoid account add-key team --backend pi --key-var OPENROUTER_API_KEY     # pi: one or more provider keys
@@ -298,7 +298,7 @@ What each backend's account is:
 | Backend | Kinds | How it is applied |
 |---|---|---|
 | `codex` | ChatGPT sign-in, API key | its own `CODEX_HOME` |
-| `gemini-cli` | Google sign-in, API key | its own `GEMINI_CLI_HOME` |
+| `gemini-cli` | API key | its own `GEMINI_CLI_HOME`, selecting API-key auth |
 | `openai`, `gemini`, `llamacpp` | API key | the request's key, every turn |
 | `qwen` | API key with its endpoint (a preset or a URL) | the key and base URL of the query |
 | `pi` | provider keys (`ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, …) | those variables, without pi's own stored logins |
@@ -319,7 +319,8 @@ An endpoint account is tied to the server it was entered for: if the endpoint la
 A named Gemini CLI account refuses to run in a workdir whose `.env`, `.gemini/.env` or `.gemini/settings.json` (in the workdir or a parent below your home directory) would redirect its credential, naming the file.
 
 **Signing in never touches your own login.**
-`codeoid account login` runs the vendor's own command (`codex login --device-auth`, the Gemini CLI's Google sign-in) against a staging directory, and only a completed sign-in becomes the account's.
+`codeoid account login` runs the vendor's own command (`claude setup-token`, `codex login --device-auth`) against a staging directory, and only a completed sign-in becomes the account's.
+A Gemini CLI account is an API key: a consumer Google (AI Pro/Ultra) subscription can't be used with codeoid, so there is no Google sign-in.
 An existing account is only replaced with `--replace`.
 
 **A key-only backend needs no key in the environment** once it has an account: OpenAI and Gemini appear as backends as soon as one is added.

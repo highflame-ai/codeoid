@@ -2379,7 +2379,7 @@ mcpHub: this.#mcpHub,
           this.#claudeAccounts.upsert({ name: pending.name, kind: "subscription", token: outcome.secret.value });
         } else {
           if (!outcome.files || Object.keys(outcome.files).length === 0) return `Signed in, but the ${pending.backend} sign-in left no credential to keep.`;
-          const kind: AccountKind = pending.backend === "codex" ? "chatgpt-login" : "google-login";
+          const kind: AccountKind = "chatgpt-login";
           this.#accounts.upsert({ backend: pending.backend, name: pending.name, kind, replace: pending.replace });
           this.#writeAccountFiles(pending.backend, pending.name, outcome.files);
         }

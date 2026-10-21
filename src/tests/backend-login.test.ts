@@ -24,7 +24,6 @@ import {
   BackendLoginError,
   CLAUDE_LOGIN_FLOW,
   CODEX_LOGIN_FLOW,
-  GEMINI_CLI_LOGIN_FLOW,
   type LoginFlow,
   redact,
 } from "../daemon/auth/backend-login.js";
@@ -390,7 +389,7 @@ echo "Your token: ${TOKEN}"
   });
 });
 
-describe("file-credential logins (Codex device code, Gemini CLI)", () => {
+describe("file-credential logins (Codex device code)", () => {
   const script = (name: string, body: string) => {
     const file = join(dir, name);
     writeFileSync(file, `#!/usr/bin/env bash\n${body}\n`, "utf8");
@@ -447,34 +446,5 @@ exit 1`,
     const outcome = await broker.wait(login.loginId);
     expect(outcome.ok).toBe(false);
     expect(outcome.error).toMatch(/Error logging in/);
-  });
-
-  test("a Gemini CLI sign-in selects Google login, takes the pasted code, and is done when its creds file appears", async () => {
-    const consent = "https://accounts.google.com/o/oauth2/v2/auth?redirect_uri=x&code_challenge=y&state=z&client_id=c";
-    const cmd = script(
-      "gemini-login.sh",
-      `grep -q oauth-personal "$GEMINI_CLI_HOME/.gemini/settings.json" || { echo "auth type not selected"; exit 3; }
-[ "$NO_BROWSER" = "true" ] || { echo "would open a browser"; exit 4; }
-echo "Please visit the following URL to authorize the application:"
-echo "${consent}"
-printf "Enter the authorization code: "
-read -r code
-[ "$code" = "4/good" ] || { echo "Failed to exchange authorization code"; sleep 30; }
-printf '{"refresh_token":"rt-secret"}' > "$GEMINI_CLI_HOME/.gemini/oauth_creds.json"
-# The CLI carries on as an interactive chat after signing in.
-sleep 60`,
-    );
-    const broker = newBroker({ "gemini-cli": { ...GEMINI_CLI_LOGIN_FLOW, resolve: () => ({ file: cmd, args: [] }) } });
-    const login = await broker.start("gemini-cli", { isolated: true });
-    expect(login.verificationUrl).toBe(consent);
-    expect(login.mode).toBe("code");
-    const outcome = await broker.submit(login.loginId, "4/good");
-    expect(outcome.ok).toBe(true);
-    expect(outcome.files?.[".gemini/oauth_creds.json"]).toContain("rt-secret");
-    // A rejected code is reported, and nothing is kept.
-    const again = await broker.start("gemini-cli", { isolated: true });
-    const bad = await broker.submit(again.loginId, "4/bad");
-    expect(bad.ok).toBe(false);
-    expect(bad.files).toBeUndefined();
   });
 });

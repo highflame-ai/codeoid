@@ -497,12 +497,12 @@ account
 account
   .command("login <name>")
   .description(
-    "Sign in as account <name>: a Claude Pro/Max subscription (claude setup-token), a ChatGPT account for codex (device code), or a Google account for gemini-cli. Never touches your own login.",
+    "Sign in as account <name>: a Claude Pro/Max subscription (claude setup-token), or a ChatGPT account for codex (device code). Never touches your own login.",
   )
-  .option(backendOption, "claude (default), codex, or gemini-cli")
+  .option(backendOption, "claude (default) or codex")
   .option("--replace", "replace an existing account of that name")
   .action(async (name: string, o: { backend?: string; replace?: boolean }) => {
-    const backend = (o.backend ?? "claude") as "claude" | "codex" | "gemini-cli";
+    const backend = (o.backend ?? "claude") as "claude" | "codex";
     const config = loadConfig();
     const client = new TerminalClient(config);
     await client.connect();

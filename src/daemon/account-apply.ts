@@ -173,11 +173,6 @@ export function defaultGeminiCliRoot(env: Record<string, string | undefined> = p
 
 const GEMINI_CLI_OWN = ["oauth_creds.json", "google_accounts.json"];
 
-/** The auth type the account's settings.json selects. */
-export function geminiAuthType(kind: ResolvedAccount["kind"]): string {
-  return kind === "google-login" ? "oauth-personal" : "gemini-api-key";
-}
-
 /** settings.json for an account: the default one, with its auth type set to the account's kind. */
 export function geminiAccountSettings(source: string | undefined, authType: string): string {
   let settings: Record<string, unknown> = {};
@@ -192,14 +187,18 @@ export function geminiAccountSettings(source: string | undefined, authType: stri
   return `${JSON.stringify({ ...settings, security: { ...security, auth: { ...auth, selectedType: authType } } }, null, 2)}\n`;
 }
 
-/** Make `account`'s Gemini CLI home (`<home>/.gemini`, an overlay). */
-export function ensureGeminiCliHome(account: Pick<ResolvedAccount, "home" | "kind">): void {
+/**
+ * Make `account`'s Gemini CLI home (`<home>/.gemini`, an overlay) — selecting
+ * API-key auth, so a default home that selects Google login can't override
+ * the account's key, and without the daemon's own Google login files.
+ */
+export function ensureGeminiCliHome(account: Pick<ResolvedAccount, "home">): void {
   mkdirSync(account.home, { recursive: true, mode: 0o700 });
   ensureOverlayHome({
     source: join(defaultGeminiCliRoot(), ".gemini"),
     target: join(account.home, ".gemini"),
     own: GEMINI_CLI_OWN,
-    copies: { "settings.json": (src) => geminiAccountSettings(src, geminiAuthType(account.kind)) },
+    copies: { "settings.json": (src) => geminiAccountSettings(src, "gemini-api-key") },
   });
 }
 
@@ -220,8 +219,7 @@ export function applyGeminiCliAccount(account: ResolvedAccount | null, env: Reco
   if (!account) return env;
   ensureGeminiCliHome(account);
   const out = without(env, isGeminiCredentialVar);
-  if (account.kind === "api-key") out.GEMINI_API_KEY = account.account.token ?? "";
-  else requireFile(join(account.home, ".gemini"), "oauth_creds.json", "Google sign-in", account);
+  out.GEMINI_API_KEY = account.account.token ?? "";
   out.GEMINI_CLI_HOME = account.home;
   return out;
 }

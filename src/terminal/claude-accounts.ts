@@ -55,7 +55,6 @@ const ANY_KIND_LABEL: Record<AccountInfo["kind"], string> = {
   gateway: "gateway",
   "api-key": "API key",
   "chatgpt-login": "ChatGPT sign-in",
-  "google-login": "Google sign-in",
   "api-keys": "provider keys",
 };
 

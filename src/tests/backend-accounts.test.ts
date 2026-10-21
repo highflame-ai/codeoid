@@ -324,7 +324,7 @@ describe("account homes", () => {
     }
   });
 
-  test("Gemini CLI: the account's home selects its auth type; an API key replaces every Google credential", () => {
+  test("Gemini CLI: the account's home selects API-key auth; its key replaces every Google credential", () => {
     const root = join(dir, "gemini-root");
     mkdirSync(join(root, ".gemini"), { recursive: true });
     writeFileSync(join(root, ".gemini", "settings.json"), JSON.stringify({ security: { auth: { selectedType: "oauth-personal" } }, mcpServers: { a: {} } }));
@@ -340,9 +340,10 @@ describe("account homes", () => {
       expect(env.GOOGLE_CLOUD_PROJECT).toBeUndefined();
       const settings = JSON.parse(readFileSync(join(resolved.home, ".gemini", "settings.json"), "utf8"));
       expect(settings).toMatchObject({ security: { auth: { selectedType: "gemini-api-key" } }, mcpServers: { a: {} } });
+      // The daemon's own Google login never reaches an API-key account.
       expect(existsSync(join(resolved.home, ".gemini", "oauth_creds.json"))).toBe(false);
-      accounts.upsert({ backend: "gemini-cli", name: "google", kind: "google-login" });
-      expect(() => applyGeminiCliAccount(accounts.resolve("gemini-cli", "google"), {})).toThrow(/sign it in again/);
+      // No Google sign-in kind: a consumer Google subscription can't be used (#192).
+      expect(() => accounts.upsert({ backend: "gemini-cli", name: "google", kind: "chatgpt-login" })).toThrow(/one of: api-key/);
     } finally {
       restore();
     }
