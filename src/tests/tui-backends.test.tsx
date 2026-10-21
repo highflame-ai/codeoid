@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { PassThrough } from "node:stream";
 import React from "react";
-import { render } from "ink";
+import { Box, render } from "ink";
 import type { ProviderInfo } from "../protocol/types.js";
 import { BackendPicker } from "../tui/components/BackendPicker.js";
 import { NewSessionModal } from "../tui/components/NewSessionModal.js";
@@ -122,5 +122,102 @@ describe("TUI backend dialogs", () => {
     expect(ui.frame()).toContain("Endpoint was removed");
     expect(ui.frame()).toContain("draft");
     expect(closed).toBe(false);
+  });
+  it("closes on Esc while a switch is in flight and ignores its late result", async () => {
+    let finish!: () => void;
+    let closes = 0;
+    const client = { listModels: async () => ({ live: true, models: [{ value: "m1", displayName: "Model one" }] }) } as unknown as TuiWsClient;
+    const ui = await mount(<BackendPicker kind="model" provider="claude" current="" providers={providers} client={client}
+      onPick={() => new Promise<void>((resolve) => { finish = resolve; })} onCancel={() => { closes++; }} />);
+    await waitFor(() => ui.frame().includes("Model one"));
+    await ui.press("\r");
+    expect(ui.frame()).toContain("Switching…");
+    await ui.press("\u001b");
+    expect(closes).toBe(1);
+    // The parent unmounts the closed picker; the switch then lands.
+    ui.rerender(<Box />);
+    finish();
+    await Bun.sleep(30);
+    expect(closes).toBe(1);
+  });
+
+  it("offers on-demand refresh only for an endpoint's cached catalog", async () => {
+    const client = { listModels: async () => ({ live: false, models: [{ value: "m1", displayName: "Model one" }] }) } as unknown as TuiWsClient;
+    const builtin = await mount(<BackendPicker kind="model" provider="codex" sessionName="feature-auth" current="" providers={providers} client={client}
+      onPick={async () => {}} onCancel={() => {}} />);
+    await waitFor(() => builtin.frame().includes("Model one"));
+    expect(builtin.frame()).toContain("for feature-auth");
+    expect(builtin.frame()).toContain("appears after this backend's next turn");
+    expect(builtin.frame()).not.toContain("press r to refresh");
+    const endpoint = await mount(<BackendPicker kind="model" provider="oai:box" current="" providers={providers} client={client}
+      onPick={async () => {}} onCancel={() => {}} />);
+    await waitFor(() => endpoint.frame().includes("Model one"));
+    expect(endpoint.frame()).toContain("press r to refresh");
+  });
+
+  it("says a name is required instead of ignoring Enter", async () => {
+    const submissions: unknown[] = [];
+    const ui = await mount(<NewSessionModal providers={providers} client={null} onCancel={() => {}}
+      onSubmit={async (name) => { submissions.push(name); }} />);
+    await ui.press("\t");
+    await ui.press("\r");
+    expect(ui.frame()).toContain("Name required");
+    expect(ui.frame()).toContain("▸ name:");
+    expect(submissions).toEqual([]);
+    await ui.press("x");
+    expect(ui.frame()).not.toContain("Name required");
+  });
+
+  it("closes the new-session dialog on Esc mid-create and ignores the late result", async () => {
+    let fail!: (cause: Error) => void;
+    let closes = 0;
+    const ui = await mount(<NewSessionModal providers={providers} client={null} onCancel={() => { closes++; }}
+      onSubmit={() => new Promise<void>((_resolve, reject) => { fail = reject; })} />);
+    await ui.press("draft");
+    await ui.press("\t");
+    await ui.press("\r");
+    expect(ui.frame()).toContain("Creating…");
+    await ui.press("\u001b");
+    expect(closes).toBe(1);
+    ui.rerender(<Box />);
+    fail(new Error("too late"));
+    await Bun.sleep(30);
+    expect(closes).toBe(1);
+  });
+
+  it("sends the chosen Claude account when Claude is the provider", async () => {
+    const submissions: unknown[] = [];
+    const client = { listClaudeAccounts: async () => ({ defaultAccount: "default", accounts: [{ name: "work", kind: "subscription" }] }) } as unknown as TuiWsClient;
+    const ui = await mount(<NewSessionModal providers={providers} client={client} onCancel={() => {}}
+      onSubmit={async (name, workdir, options) => { submissions.push({ name, workdir, ...options }); }} />);
+    await ui.press("claude-work");
+    await ui.press("\t");
+    await ui.press("\t");
+    await ui.press("\u001b[C");
+    expect(ui.frame()).toContain("provider: Claude (claude)");
+    await ui.press("\t");
+    await waitFor(() => ui.frame().includes("Follow daemon default (default)"));
+    await ui.press("\u001b[D");
+    expect(ui.frame()).toContain("account: work");
+    await ui.press("\r");
+    expect(submissions).toEqual([{ name: "claude-work", workdir: process.cwd(), providerId: "claude", claudeAccount: "work" }]);
+  });
+
+  it("marks a selected provider that disappears as removed and shows the daemon's refusal", async () => {
+    const props = {
+      client: null,
+      onCancel: () => {},
+      onSubmit: async () => { throw new Error("Unknown provider: oai:box"); },
+    };
+    const ui = await mount(<NewSessionModal {...props} providers={providers} />);
+    await ui.press("gpu");
+    await ui.press("\t");
+    await ui.press("\t");
+    await ui.press("\u001b[D");
+    expect(ui.frame()).toContain("GPU box");
+    ui.rerender(<NewSessionModal {...props} providers={providers.slice(0, 1)} />);
+    await waitFor(() => ui.frame().includes("oai:box (removed)"));
+    await ui.press("\r");
+    expect(ui.frame()).toContain("Unknown provider: oai:box");
   });
 });

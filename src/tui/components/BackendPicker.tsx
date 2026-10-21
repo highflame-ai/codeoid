@@ -12,6 +12,8 @@ export interface BackendChoice {
 interface Props {
   kind: "model" | "provider" | "account";
   provider: string;
+  /** Name of the session this picker changes, shown in the header. */
+  sessionName?: string;
   current: string;
   providers: ProviderInfo[];
   client: TuiWsClient | null;
@@ -19,7 +21,7 @@ interface Props {
   onCancel: () => void;
 }
 
-export function BackendPicker({ kind, provider, current, providers, client, onPick, onCancel }: Props) {
+export function BackendPicker({ kind, provider, sessionName, current, providers, client, onPick, onCancel }: Props) {
   const [choices, setChoices] = useState<BackendChoice[]>([]);
   const [loading, setLoading] = useState(kind !== "provider");
   const [busy, setBusy] = useState(false);
@@ -28,6 +30,10 @@ export function BackendPicker({ kind, provider, current, providers, client, onPi
   const [revision, setRevision] = useState(0);
   const [selected, setSelected] = useState(current);
   const submitting = useRef(false);
+  // Esc closes the picker even mid-switch; the switch's late result must not
+  // touch state or close whatever dialog has opened since.
+  const mounted = useRef(true);
+  useEffect(() => () => { mounted.current = false; }, []);
 
   useEffect(() => {
     if (kind === "provider") return;
@@ -72,8 +78,8 @@ export function BackendPicker({ kind, provider, current, providers, client, onPi
   const start = Math.max(0, Math.min(index - 3, options.length - 8));
 
   useInput((input, key) => {
-    if (submitting.current) return;
     if (key.escape) { onCancel(); return; }
+    if (submitting.current) return;
     if (input === "r" && !loading) { setRevision((value) => value + 1); return; }
     if (loading) return;
     if (key.upArrow || key.downArrow) {
@@ -84,15 +90,20 @@ export function BackendPicker({ kind, provider, current, providers, client, onPi
       submitting.current = true;
       setBusy(true);
       setError(null);
-      void onPick(options[index].value).then(onCancel).catch((cause: unknown) => {
-        setError(cause instanceof Error ? cause.message : String(cause));
-      }).finally(() => { submitting.current = false; setBusy(false); });
+      void onPick(options[index].value).then(() => {
+        if (mounted.current) onCancel();
+      }, (cause: unknown) => {
+        if (mounted.current) setError(cause instanceof Error ? cause.message : String(cause));
+      }).finally(() => {
+        submitting.current = false;
+        if (mounted.current) setBusy(false);
+      });
     }
   });
 
   return (
     <Box flexDirection="column" borderStyle="double" borderColor="cyan" paddingX={1}>
-      <Text bold color="cyan">Select {kind}{kind === "model" ? ` (${provider})` : ""}</Text>
+      <Text bold color="cyan">Select {kind}{kind === "model" ? ` (${provider})` : ""}{sessionName ? ` for ${sessionName}` : ""}</Text>
       {loading ? <Text dimColor>Loading…</Text> : options.slice(start, start + 8).map((choice, offset) => (
         <Box key={choice.value} flexDirection="column">
           <Text color={start + offset === index ? "cyan" : undefined}>
@@ -102,7 +113,11 @@ export function BackendPicker({ kind, provider, current, providers, client, onPi
         </Box>
       ))}
       {!loading && options.length === 0 && <Text dimColor>No choices available.{kind === "model" ? " Use /model <id> to enter a model directly." : ""}</Text>}
-      {!loading && kind === "model" && !live && <Text dimColor>Cached catalog — press r to refresh.</Text>}
+      {/* Only an endpoint can be asked for its live list on demand; a
+          built-in backend reports its full catalog from inside a turn. */}
+      {!loading && kind === "model" && !live && <Text dimColor>{provider.startsWith("oai:")
+        ? "Cached catalog — press r to refresh."
+        : "Saved catalog — the current list appears after this backend's next turn."}</Text>}
       {error && <Text color="red">{error}</Text>}
       <Text dimColor>{busy ? "Switching…" : "↑↓ navigate · Enter to select · r refresh · Esc cancel"}</Text>
     </Box>

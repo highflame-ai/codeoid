@@ -28,6 +28,10 @@ export function NewSessionModal({ providers, client, onSubmit, onCancel }: Props
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const submitting = useRef(false);
+  // Esc closes the dialog even while a create is in flight; its late result
+  // must not touch state or close whatever dialog has opened since.
+  const mounted = useRef(true);
+  useEffect(() => () => { mounted.current = false; }, []);
   const effectiveProvider = providerId || providers[0]?.id || "claude";
   const fields = ["name", "workdir", "provider", ...(effectiveProvider === "claude" ? ["account"] : [])];
   const providerChoices = [
@@ -57,7 +61,13 @@ export function NewSessionModal({ providers, client, onSubmit, onCancel }: Props
   }, [focused, effectiveProvider]);
 
   const submit = async () => {
-    if (submitting.current || !name.trim() || !workdir.trim()) return;
+    if (submitting.current) return;
+    const missing = !name.trim() ? "name" : !workdir.trim() ? "workdir" : null;
+    if (missing) {
+      setError(missing === "name" ? "Name required" : "Workdir required");
+      setFocused(missing);
+      return;
+    }
     submitting.current = true;
     setBusy(true);
     setError(null);
@@ -66,18 +76,18 @@ export function NewSessionModal({ providers, client, onSubmit, onCancel }: Props
         ...(providerId ? { providerId } : {}),
         ...(effectiveProvider === "claude" && account ? { claudeAccount: account } : {}),
       });
-      onCancel();
+      if (mounted.current) onCancel();
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      if (mounted.current) setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
       submitting.current = false;
-      setBusy(false);
+      if (mounted.current) setBusy(false);
     }
   };
 
   useInput((_input, key) => {
-    if (submitting.current) return;
     if (key.escape) { onCancel(); return; }
+    if (submitting.current) return;
     if (key.tab) {
       setFocused(fields[(fields.indexOf(focused) + (key.shift ? fields.length - 1 : 1)) % fields.length]!);
       return;
@@ -99,7 +109,7 @@ export function NewSessionModal({ providers, client, onSubmit, onCancel }: Props
       <Text bold color="cyan">New Session</Text>
       <Box>
         <Text color={focused === "name" ? "cyan" : undefined}>{focused === "name" ? "▸ " : "  "}name: </Text>
-        <TextInput focus={!busy && focused === "name"} value={name} onChange={setName} onSubmit={() => { if (name.trim()) setFocused("workdir"); }} />
+        <TextInput focus={!busy && focused === "name"} value={name} onChange={(value) => { setName(value); if (error === "Name required") setError(null); }} onSubmit={() => { if (name.trim()) setFocused("workdir"); else setError("Name required"); }} />
       </Box>
       <Box>
         <Text color={focused === "workdir" ? "cyan" : undefined}>{focused === "workdir" ? "▸ " : "  "}workdir: </Text>

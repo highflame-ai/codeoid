@@ -53,6 +53,7 @@ export function StatusBar({
   cols,
 }: Props) {
   const usage = focused?.info.usage;
+  const account = focused ? claudeAccountLabel(focused.info) : null;
   // Background-activity summary: count sessions (other than focused) with
   // unread messages or pending approvals. Shown as a single compact pill
   // at the end of the bar — no per-session chrome.
@@ -95,14 +96,6 @@ export function StatusBar({
         <>
           <Text dimColor>{"   │   "}</Text>
           <Text bold>{focused.info.name}</Text>
-          <Text dimColor>{` · ${focused.info.providerId ?? "claude"}`}</Text>
-          {(focused.info.providerId ?? "claude") === "claude" && (
-            <Text color={focused.info.effectiveClaudeAccount?.endsWith(" (missing)") ? "red" : "cyan"}>
-              {` · account: ${focused.info.effectiveClaudeAccount ?? focused.info.claudeAccount ?? "default"}${focused.info.claudeAccount === undefined ? " (following default)" : ""}`}
-            </Text>
-          )}
-          <Text dimColor>{" @ "}</Text>
-          <Text dimColor>{focused.info.workdir}</Text>
           <Text dimColor>{" · "}</Text>
           <Text
             color={
@@ -257,9 +250,37 @@ export function StatusBar({
           <Text color="red">⚠ {lastError}</Text>
         </>
       )}
+      {/* Static descriptors go last: the line truncates at the terminal
+          edge, and a long workdir must never push the live status, cost,
+          or error off screen. */}
+      {focused && (
+        <>
+          <Text dimColor>{`   │   ${focused.info.providerId ?? "claude"}`}</Text>
+          {account && (
+            <Text color={account.missing ? "red" : "cyan"}>{` · account: ${account.label}`}</Text>
+          )}
+          <Text dimColor>{` @ ${focused.info.workdir}`}</Text>
+        </>
+      )}
       </Text>
     </Box>
   );
+}
+
+/**
+ * The Claude account worth showing, or null. A session that follows the
+ * daemon default and lands on the machine's own login is the common case and
+ * says nothing; a pinned account, a non-default daemon default, or a missing
+ * account (which fails the next turn) is shown.
+ */
+function claudeAccountLabel(info: TuiSession["info"]): { label: string; missing: boolean } | null {
+  if ((info.providerId ?? "claude") !== "claude") return null;
+  const effective = info.effectiveClaudeAccount ?? info.claudeAccount ?? "default";
+  const missing = effective.endsWith(" (missing)");
+  if (info.claudeAccount !== undefined) return { label: effective, missing };
+  if (effective === "default") return null;
+  const name = missing ? effective.slice(0, -" (missing)".length) : effective;
+  return { label: `${name} (following default${missing ? ", missing" : ""})`, missing };
 }
 
 /** "12s" / "1m 23s" / "1h 5m" — compact working-duration stamp. */

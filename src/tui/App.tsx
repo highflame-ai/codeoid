@@ -21,6 +21,7 @@ import {
 } from "./workspace-commands.js";
 import type { Attachment, McpReconnectResult, McpRefreshResult } from "../protocol/types.js";
 import { mcpRefreshSummary } from "@highflame/codeoid-core";
+import type { TuiAction } from "./types.js";
 import { parseDialogAnswer } from "../terminal/dialog.js";
 import { formatRewind, parseForkArgs, parseUndoArgs } from "../terminal/rewind.js";
 import { formatCompare, parseCompareArgs } from "../terminal/compare.js";
@@ -35,9 +36,11 @@ import {
 
 interface Props {
   config: CodeoidConfig;
+  /** Builds the daemon client. Tests inject a fake; production uses the default. */
+  createClient?: (config: CodeoidConfig, dispatch: React.Dispatch<TuiAction>) => TuiWsClient;
 }
 
-export function App({ config }: Props) {
+export function App({ config, createClient = (c, d) => new TuiWsClient(c, d) }: Props) {
   const { state, dispatch } = useTuiStore();
   const { exit } = useApp();
   const { stdout } = useStdout();
@@ -45,7 +48,7 @@ export function App({ config }: Props) {
 
   // Initialize WS client once.
   useEffect(() => {
-    const client = new TuiWsClient(config, dispatch);
+    const client = createClient(config, dispatch);
     wsRef.current = client;
     void client.start();
     return () => client.stop();
@@ -1099,40 +1102,34 @@ export function App({ config }: Props) {
         });
         return;
       }
-      case "/model": {
-        if (!client || !focusedSession) return;
-        // No args → interactive picker modal. With an arg → direct switch
-        // (skip modal, trust the user knows the alias/id they want).
-        if (args.length === 0) {
-          dispatch({ type: "modal.open", modal: { kind: "model" } });
-          return;
-        }
-        const chosen = args[0]!;
-        void client
-          .setModel(focusedSession.info.id, chosen)
-          .then((resp) => {
-            if (resp.type === "response.error") {
-              dispatch({ type: "error", message: resp.error });
-            }
-          })
-          .catch((err: Error) =>
-            dispatch({ type: "error", message: err.message }),
-          );
-        return;
-      }
+      case "/model":
       case "/provider":
       case "/account": {
-        if (!client || !focusedSession) return;
+        if (!focusedSession) {
+          dispatch({ type: "error", message: "No session focused" });
+          return;
+        }
+        if (!client) {
+          dispatch({ type: "error", message: "Not connected" });
+          return;
+        }
+        const sessionId = focusedSession.info.id;
         if (cmd === "/account" && (focusedSession.info.providerId ?? "claude") !== "claude") {
           dispatch({ type: "error", message: "Claude accounts apply to Claude sessions. Use /provider to switch backends." });
           return;
         }
+        // No args → interactive picker for this session. With an arg →
+        // direct switch (trust the user knows the id they want).
         if (args.length === 0) {
-          dispatch({ type: "modal.open", modal: { kind: cmd === "/provider" ? "provider" : "account" } });
+          dispatch({ type: "modal.open", modal: { kind: cmd === "/model" ? "model" : cmd === "/provider" ? "provider" : "account", sessionId } });
           return;
         }
-        const value = args[0]!.toLowerCase();
-        const operation = cmd === "/provider" ? onSetProvider(value) : onSetAccount(value === "--follow-default" || value === "--follow" ? "" : value);
+        const value = cmd === "/model" ? args[0]! : args[0]!.toLowerCase();
+        const operation = cmd === "/model"
+          ? onSetModel(sessionId, value)
+          : cmd === "/provider"
+            ? onSetProvider(sessionId, value)
+            : onSetAccount(sessionId, value === "--follow-default" || value === "--follow" ? "" : value);
         void operation.catch((cause: unknown) => dispatch({ type: "error", message: cause instanceof Error ? cause.message : String(cause) }));
         return;
       }
@@ -1225,26 +1222,27 @@ export function App({ config }: Props) {
    * forward the user's choice. Surfaces server errors (unknown id) so
    * the modal can show them inline.
    */
-  const onSetModel = async (model: string): Promise<void> => {
+  const onSetModel = async (sessionId: string, model: string): Promise<void> => {
     const client = wsRef.current;
-    if (!client || !focusedSession) throw new Error("No connected session");
-    const resp = await client.setModel(focusedSession.info.id, model);
+    if (!client) throw new Error("Not connected");
+    const resp = await client.setModel(sessionId, model);
     if (resp.type === "response.error") {
       throw new Error(resp.error);
     }
   };
 
-  const onSetProvider = async (providerId: string): Promise<void> => {
+  const onSetProvider = async (sessionId: string, providerId: string): Promise<void> => {
     const client = wsRef.current;
-    if (!client || !focusedSession) throw new Error("No connected session");
-    const response = await client.setProvider(focusedSession.info.id, providerId);
+    if (!client) throw new Error("Not connected");
+    const response = await client.setProvider(sessionId, providerId);
     if (response.type === "response.error") throw new Error(response.error);
   };
 
-  const onSetAccount = async (account: string): Promise<void> => {
+  /** "" = follow the daemon default (sent as null). */
+  const onSetAccount = async (sessionId: string, account: string): Promise<void> => {
     const client = wsRef.current;
-    if (!client || !focusedSession) throw new Error("No connected session");
-    const response = await client.setClaudeAccount(focusedSession.info.id, account || null);
+    if (!client) throw new Error("Not connected");
+    const response = await client.setClaudeAccount(sessionId, account || null);
     if (response.type === "response.error") throw new Error(response.error);
   };
 
@@ -1312,7 +1310,9 @@ export function App({ config }: Props) {
       </Box>
       {state.modal && (
         <Modal
-          key={`${state.modal.kind}:${focusedSession?.info.id}`}
+          // Keyed by kind only: a focus change (sessions.set on connect or
+          // reconnect) must not remount an open dialog and wipe its input.
+          key={state.modal.kind}
           providers={state.providers}
           client={wsRef.current}
           modal={state.modal}

@@ -68,9 +68,11 @@ export type ModalState =
   | { kind: "confirm-destroy"; sessionId: string }
   | { kind: "help" }
   | { kind: "search"; query: string }
-  | { kind: "model" }
-  | { kind: "provider" }
-  | { kind: "account" };
+  /**
+   * Backend pickers carry the session they were opened for, so a focus
+   * change while one is open (reconnect, sessions.set) cannot retarget it.
+   */
+  | { kind: "model" | "provider" | "account"; sessionId: string };
 
 /** UI action type — reducer fan-in. */
 export type TuiAction =

@@ -27,15 +27,15 @@ interface Props {
   providers: ProviderInfo[];
   client: TuiWsClient | null;
   onSubmitNewSession: (name: string, workdir: string, options: NewSessionOptions) => Promise<void>;
-  onSetProvider: (providerId: string) => Promise<void>;
-  onSetAccount: (account: string) => Promise<void>;
+  onSetProvider: (sessionId: string, providerId: string) => Promise<void>;
+  onSetAccount: (sessionId: string, account: string) => Promise<void>;
   onSelectSession: (sessionId: string) => void;
   onConfirmDestroy: (sessionId: string) => void;
   onCancel: () => void;
   /** Run a full-text + semantic session search. Resolves to result hits. */
   onSearch?: (query: string, scope: SearchScope) => Promise<SessionSearchHit[]>;
-  /** Set the focused session's model. */
-  onSetModel?: (model: string) => Promise<void>;
+  /** Set a session's model. */
+  onSetModel?: (sessionId: string, model: string) => Promise<void>;
 }
 
 export function Modal(props: Props) {
@@ -80,19 +80,31 @@ export function Modal(props: Props) {
       );
     case "model":
     case "provider":
-    case "account":
+    case "account": {
+      // The session the picker was opened for, not whichever is focused now.
+      const { kind, sessionId } = props.modal;
+      const target = props.sessions.find((s) => s.info.id === sessionId);
+      if (!target) return <SessionGoneModal onCancel={props.onCancel} />;
+      const provider = target.info.providerId ?? "claude";
       return (
         <BackendPicker
-          key={`${props.modal.kind}:${props.focusedSession?.info.id}:${props.focusedSession?.info.providerId}`}
-          kind={props.modal.kind}
-          provider={props.focusedSession?.info.providerId ?? "claude"}
+          // A provider switch changes which catalog the model picker shows.
+          key={`${kind}:${provider}`}
+          kind={kind}
+          provider={provider}
+          sessionName={target.info.name}
           providers={props.providers}
           client={props.client}
-          current={props.modal.kind === "model" ? props.focusedSession?.info.model ?? "" : props.modal.kind === "provider" ? props.focusedSession?.info.providerId ?? "claude" : props.focusedSession?.info.claudeAccount ?? ""}
-          onPick={props.modal.kind === "model" ? async (value) => { await props.onSetModel?.(value); } : props.modal.kind === "provider" ? props.onSetProvider : props.onSetAccount}
+          current={kind === "model" ? target.info.model ?? "" : kind === "provider" ? provider : target.info.claudeAccount ?? ""}
+          onPick={async (value) => {
+            if (kind === "model") await props.onSetModel?.(sessionId, value);
+            else if (kind === "provider") await props.onSetProvider(sessionId, value);
+            else await props.onSetAccount(sessionId, value);
+          }}
           onCancel={props.onCancel}
         />
       );
+    }
   }
 }
 
@@ -145,6 +157,19 @@ function SwitchModal({
       <Box marginTop={1}>
         <Text dimColor>↑↓ to move · Enter to select · Esc to cancel</Text>
       </Box>
+    </Box>
+  );
+}
+
+/** A backend picker whose session was destroyed while it was open. */
+function SessionGoneModal({ onCancel }: { onCancel: () => void }) {
+  useInput((_input, key) => {
+    if (key.escape || key.return) onCancel();
+  });
+  return (
+    <Box flexDirection="column" borderStyle="double" borderColor="red" paddingX={1}>
+      <Text color="red">That session no longer exists.</Text>
+      <Text dimColor>Esc / Enter to close</Text>
     </Box>
   );
 }
