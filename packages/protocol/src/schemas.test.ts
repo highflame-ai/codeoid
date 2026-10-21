@@ -38,6 +38,11 @@ test("every ClientMessage variant has a schema and vice versa (compile-time)", (
   expect(covered).toBe(true);
 });
 
+test("endpoint overrides can be explicitly removed without stripping nulls", () => {
+  const message: ClientMessage = { type: "endpoints.set", id: "clear", name: "box", baseUrl: "http://localhost:8000/v1", defaultModel: null, contextWindow: null };
+  expect(parseClientMessage(message)).toEqual({ ok: true, value: message });
+});
+
 // ── 2. Fidelity: one valid sample per variant, keyed so adding a variant
 //      without a sample is a compile error ─────────────────────────────────────
 
@@ -158,6 +163,19 @@ const samples: { [T in ClientTypes]: Extract<ClientMessage, { type: T }> } = {
   "claude.accounts.set": { type: "claude.accounts.set", id: "ca2", name: "work", kind: "gateway", token: "t", baseUrl: "https://gw.example", headers: { "x-workspace": "w1" } },
   "claude.accounts.remove": { type: "claude.accounts.remove", id: "ca3", name: "work" },
   "claude.accounts.set_default": { type: "claude.accounts.set_default", id: "ca4", name: "work" },
+  "providers.list": { type: "providers.list", id: "pl1" },
+  "endpoints.list": { type: "endpoints.list", id: "ep1" },
+  "endpoints.set": {
+    type: "endpoints.set",
+    id: "ep2",
+    name: "vllm",
+    baseUrl: "http://gpu-box:8000/v1",
+    apiKey: null,
+    models: [{ id: "qwen3-coder", contextWindow: 131072 }],
+    mcpServers: ["github"],
+  },
+  "endpoints.remove": { type: "endpoints.remove", id: "ep3", name: "vllm" },
+  "endpoints.test": { type: "endpoints.test", id: "ep4", name: "vllm", baseUrl: "http://gpu-box:8001/v1" },
   "session.set_claude_account": { type: "session.set_claude_account", id: "ca5", sessionId: "s1", account: null },
   "session.compare": { type: "session.compare", id: "r96", sessionId: "s1", prompt: "go", targets: [{ providerId: "claude" }, { providerId: "codex", model: "gpt-5" }] },
   "compare.get": { type: "compare.get", id: "r97", compareId: "c1" },

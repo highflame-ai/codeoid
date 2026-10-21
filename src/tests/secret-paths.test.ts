@@ -29,7 +29,7 @@ const verdict = (input: unknown, tool = "Read") => secretPathVerdict(tool, input
 
 describe("secretPathVerdict", () => {
   test("denies the credential files, on every backend's input key", () => {
-    for (const name of ["claude-accounts.json", "config.json", ".env", "local-token-7400", "claude-accounts.json.123.ab.tmp", "codeoid.db", "codeoid.db-wal"]) {
+    for (const name of ["claude-accounts.json", "endpoints.json", "config.json", ".env", "local-token-7400", "claude-accounts.json.123.ab.tmp", "codeoid.db", "codeoid.db-wal"]) {
       expect(verdict({ file_path: join(configDir, name) })?.action).toBe("deny");
     }
     expect(verdict({ absolute_path: join(configDir, ".env") })?.action).toBe("deny"); // gemini / qwen read_file

@@ -37,6 +37,8 @@ import { GEMINI_CLI_INSTALL_HINT, resolveGeminiCliCommand } from "./acp/resolve.
 import { QwenProvider } from "./qwen/index.js";
 import { StatelessSessionProvider } from "./stateless.js";
 import { LLAMACPP_DISPLAY_NAME, LLAMACPP_PROVIDER_ID, createLlamaCppProvider } from "./llamacpp/index.js";
+import type { EndpointStore } from "../openai-endpoints.js";
+import { type EndpointCatalog, syncEndpointProviders } from "./endpoint/index.js";
 
 /**
  * Everything a factory may need to construct a provider for ONE session.
@@ -100,11 +102,48 @@ export class ProviderRegistry {
     this.defaultId = defaultId;
   }
 
+  /**
+   * Builds a factory for an id that is not registered but belongs to a family
+   * whose members come and go at runtime (user-defined endpoints, `oai:*`).
+   * Consulted by `resolve` only — `has` stays strict, so nothing new can be
+   * created on an id that isn't registered.
+   */
+  #prefixResolver: ((id: string) => ProviderFactory | undefined) | null = null;
+
   register(factory: ProviderFactory): void {
     if (this.#factories.has(factory.id)) {
       throw new Error(`Provider "${factory.id}" is already registered`);
     }
     this.#factories.set(factory.id, factory);
+  }
+
+  /**
+   * Remove a factory (a user-defined endpoint was removed). Sessions already
+   * built from it keep their provider instance; whether that instance still
+   * works is the factory's business (endpoint providers refuse to run).
+   */
+  unregister(id: string): boolean {
+    if (id === this.defaultId) throw new Error(`Provider "${id}" is the default and can't be removed`);
+    return this.#factories.delete(id);
+  }
+
+  /** Swap a registered factory for one with the same id (a re-labelled endpoint) — the default included. */
+  replace(factory: ProviderFactory): void {
+    if (!this.#factories.has(factory.id)) throw new Error(`Provider "${factory.id}" is not registered`);
+    this.#factories.set(factory.id, factory);
+  }
+
+  setPrefixResolver(resolver: (id: string) => ProviderFactory | undefined): void {
+    this.#prefixResolver = resolver;
+  }
+
+  /**
+   * Can a session that ran on `id` be rebuilt on it — registered now, or a
+   * member of a runtime family (a removed endpoint, which then refuses to
+   * run with its own message instead of the session being moved elsewhere)?
+   */
+  resolvable(id: string): boolean {
+    return this.#factories.has(id) || this.#prefixResolver?.(id) !== undefined;
   }
 
   has(id: string): boolean {
@@ -155,7 +194,7 @@ export class ProviderRegistry {
    */
   resolve(id: string | undefined, logContext: string): ProviderFactory {
     const requested = id ?? this.defaultId;
-    const factory = this.#factories.get(requested);
+    const factory = this.#factories.get(requested) ?? this.#prefixResolver?.(requested);
     if (factory) return factory;
     console.warn(
       `[codeoid/${logContext}] unknown provider "${requested}" — falling back to ${this.defaultId}`,
@@ -220,6 +259,8 @@ export function createDefaultProviderRegistry(
    *  settings path can dry-run the NEXT boot's registry without touching the
    *  live process env. */
   env: Record<string, string | undefined> = process.env,
+  /** User-defined endpoints to register (openai-endpoints.ts). */
+  endpoints?: { store: EndpointStore; catalog: EndpointCatalog },
 ): ProviderRegistry {
   const registry = new ProviderRegistry(config?.session?.defaultProvider ?? CLAUDE_PROVIDER_ID);
   registry.register({
@@ -446,6 +487,15 @@ export function createDefaultProviderRegistry(
           onModels: init.onModels,
         }),
     });
+  }
+  // User-defined OpenAI-compatible endpoints (`oai:<name>`) — registered
+  // before the default check, so one of them can be the default backend.
+  if (endpoints) {
+    try {
+      syncEndpointProviders(registry, endpoints.store, endpoints.catalog);
+    } catch (err) {
+      console.error(`[codeoid] could not load endpoints: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
   const problem = defaultProviderProblem(registry, registry.defaultId);
   if (problem) throw new DefaultProviderError(problem);

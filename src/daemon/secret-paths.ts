@@ -6,7 +6,8 @@
  * (tool-safety.ts), with no path limit. The credentials live in files owned by
  * the same user the agent runs as — codeoid's `.env`, `config.json` (the
  * ZeroID key), `claude-accounts.json` (every stored Claude subscription,
- * gateway and API-key token), `codeoid.db` (MCP OAuth tokens), the local-mode
+ * gateway and API-key token), `endpoints.json` (OpenAI-compatible endpoint
+ * keys), `codeoid.db` (MCP OAuth tokens), the local-mode
  * token, and each CLI's own login (`~/.claude/.credentials.json`, …) — so a
  * prompt-injected "read ~/.codeoid/claude-accounts.json" would hand them over
  * without anyone seeing a prompt. `/proc/<pid>/environ` is the same leak one
@@ -68,6 +69,8 @@ function isSecretConfigFile(name: string): boolean {
   return (
     name === "claude-accounts.json" ||
     name.startsWith("claude-accounts.json.") || // atomicWrite temp files
+    name === "endpoints.json" || // OpenAI-compatible endpoint keys
+    name.startsWith("endpoints.json.") ||
     name === "config.json" ||
     name.startsWith("config.json.") ||
     name === ".env" ||

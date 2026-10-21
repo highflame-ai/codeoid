@@ -4419,7 +4419,15 @@ export class Session {
     try {
       effective = this.effectiveClaudeAccount();
     } catch {
-      effective = `${this.#claudeAccount ?? "?"} (missing)`;
+      // Name the account the session can't run on — for a follower, the
+      // daemon default it follows. Clients key on the " (missing)" suffix.
+      let followed: string | undefined;
+      try {
+        followed = this.#claudeAccounts?.getDefault();
+      } catch {
+        // An unreadable accounts file — no name to show.
+      }
+      effective = `${this.#claudeAccount ?? followed ?? "?"} (missing)`;
     }
     return { ...(this.#claudeAccount ? { claudeAccount: this.#claudeAccount } : {}), effectiveClaudeAccount: effective };
   }
@@ -4518,9 +4526,9 @@ export class Session {
   #knownWindow(providerId: string): number | undefined {
     const obs = this.#observedLimits;
     if (obs && obs.providerId === providerId) return obs.contextWindow;
-    const model = this.#model;
-    if (!model) return undefined;
-    return this.#modelWindow?.(this.#windowScope(), providerId, model);
+    // No model chosen: still ask — an endpoint knows its default model's
+    // window (the hook answers undefined for everything else).
+    return this.#modelWindow?.(this.#windowScope(), providerId, this.#model ?? "");
   }
 
   /**

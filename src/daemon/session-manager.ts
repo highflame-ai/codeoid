@@ -32,6 +32,14 @@ import { cleanMcpError, commandSummary, MAX_SHOWN_KEYS, quotedVisible, redactMcp
 import { canonicalFromTranscript, turnIndexFromHistory } from "./canonical-restore.js";
 import { BackendLoginBroker, BackendLoginError, redact } from "./auth/backend-login.js";
 import { ClaudeAccountError, ClaudeAccountStore, validateAccountName } from "./claude-accounts.js";
+import { configuredContextWindow, draftConnection, EndpointError, EndpointStore } from "./openai-endpoints.js";
+import {
+  EndpointCatalog,
+  fetchEndpointModels,
+  fetchLlamaCppContext,
+  syncEndpointProviders,
+  watchEndpointProviders,
+} from "./providers/endpoint/index.js";
 import { RateLimiter } from "./rate-limit.js";
 import type { TranscriptMeta, TranscriptStore } from "./transcript.js";
 import {
@@ -120,7 +128,7 @@ import { mcpOAuthBindingCookieName, type McpOAuth, type McpOAuthProof, type McpT
 import { isOAuthServer, type McpServerSpec, OAUTH_UNSUPPORTED_BACKENDS } from "./mcp/types.js";
 import { type CodeoidConfig, DEFAULT_PROVIDER_ENV, loadConfig, mutateConfigFile, validateConfigObject } from "../config.js";
 import type { CompressionRegistry } from "./compress/index.js";
-import { ORCHESTRATOR_ROLE } from "../protocol/types.js";
+import { endpointNameOf, endpointProviderId, ORCHESTRATOR_ROLE, type ProviderInfo } from "../protocol/types.js";
 import type {
   AuthContext,
   ClaudeConfigMcpServer,
@@ -385,6 +393,11 @@ export class SessionManager {
   readonly #backendLogin: BackendLoginBroker;
   /** Claude accounts (claude-accounts.ts) — shared by every session. */
   #claudeAccounts!: ClaudeAccountStore;
+  #endpoints!: EndpointStore;
+  #endpointCatalog!: EndpointCatalog;
+  #endpointFetch!: typeof fetch;
+  /** Connections that asked for `providers.list` — they get `providers.changed`. */
+  readonly #providerSubscribers = new Map<string, AttachedClient>();
   /** Logins started for a NAMED Claude account: loginId → account name. */
   readonly #accountLogins = new Map<string, string>();
   /** Live model catalogs by provider id (via each backend's supportedModels
@@ -514,6 +527,10 @@ export class SessionManager {
       claudeAccounts?: ClaudeAccountStore;
       /** Test-only: a login broker driving a fake login command. */
       _testBackendLogin?: BackendLoginBroker;
+      /** OpenAI-compatible endpoint store (openai-endpoints.ts). Default: `<configDir>/endpoints.json`. */
+      endpoints?: EndpointStore;
+      /** Test-only: the `fetch` endpoint requests (model lists, tests) use. */
+      _testEndpointFetch?: typeof fetch;
     },
   ) {
     this.#store = store;
@@ -524,7 +541,21 @@ export class SessionManager {
     this.#memory = memory;
     this.#config = opts?.config;
     this.#compressionRegistry = opts?.compressionRegistry;
-    this.#providers = opts?.providers ?? createDefaultProviderRegistry(opts?.config);
+    this.#endpoints = opts?.endpoints ?? new EndpointStore();
+    this.#endpointFetch = opts?._testEndpointFetch ?? fetch;
+    this.#endpointCatalog = new EndpointCatalog(this.#endpoints, this.#endpointFetch);
+    const endpoints = { store: this.#endpoints, catalog: this.#endpointCatalog };
+    this.#providers = opts?.providers ?? createDefaultProviderRegistry(opts?.config, process.env, endpoints);
+    // An injected registry (tests) gets the endpoints too; startup's already has them.
+    // Like startup, an unreadable endpoints file costs the endpoints, not the daemon.
+    if (opts?.providers) {
+      try {
+        syncEndpointProviders(this.#providers, this.#endpoints, this.#endpointCatalog);
+      } catch (err) {
+        console.error(`[codeoid] could not load endpoint backends: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    watchEndpointProviders(this.#providers, this.#endpoints, this.#endpointCatalog, () => this.#pushProviders());
     this.#hooks = opts?.hooks;
     this.#testProviderFactory = opts?._testProviderFactory;
     this.#claudeAccounts = opts?.claudeAccounts ?? new ClaudeAccountStore();
@@ -642,6 +673,20 @@ export class SessionManager {
     const ids = this.#providers.ids();
     const def = this.#providers.defaultId;
     return [def, ...ids.filter((id) => id !== def)];
+  }
+
+  /** The same backends with display names and kinds, default first — `auth.ok` and `providers.list`. */
+  providerInfo(): ProviderInfo[] {
+    return this.providerIds().flatMap((id) => {
+      const f = this.#providers.get(id);
+      if (!f) return [];
+      return [{
+        id,
+        displayName: f.displayName,
+        kind: endpointNameOf(id) !== null ? ("endpoint" as const) : ("builtin" as const),
+        isDefault: id === this.#providers.defaultId,
+      }];
+    });
   }
 
   /** Supported backends that couldn't activate at startup (diagnostics). */
@@ -1198,6 +1243,16 @@ mcpHub: this.#mcpHub,
         return this.#fleetUnsubscribe(msg, client);
       case "models.list":
         return this.#modelsList(msg);
+      case "providers.list":
+        return this.#providersList(msg, client);
+      case "endpoints.list":
+        return this.#endpointsList(msg, auth);
+      case "endpoints.set":
+        return this.#endpointsSet(msg, auth);
+      case "endpoints.remove":
+        return this.#endpointsRemove(msg, auth);
+      case "endpoints.test":
+        return this.#endpointsTest(msg, auth);
       case "session.export":
         return this.#sessionExport(msg, auth);
       case "session.import":
@@ -1771,11 +1826,32 @@ mcpHub: this.#mcpHub,
    * which makes it a better answer than codeoid's model-id guess.
    */
   modelContextWindow(scope: WindowScope, providerId: string, model: string): number | undefined {
-    if (!model) return undefined;
+    const endpoint = endpointNameOf(providerId);
+    if (!model) {
+      // An endpoint session on its default model still has a configured window.
+      if (endpoint === null) return undefined;
+      const e = this.#safeEndpoint(endpoint);
+      return e ? configuredContextWindow(e, e.defaultModel ?? e.models[0]?.id) : undefined;
+    }
     const reported = this.#modelLimits.get(SessionManager.#limitsKey(scope, providerId, model));
     if (reported !== undefined) return reported;
+    if (endpoint !== null) {
+      // What the user configured for this endpoint — a local server's window
+      // is whatever it was started with, which no table can guess.
+      const e = this.#safeEndpoint(endpoint);
+      return e ? configuredContextWindow(e, model) : undefined;
+    }
     const published = this.#currentModels(providerId).models.find((m) => m.value === model)?.contextWindow;
     return typeof published === "number" && published > 0 ? published : undefined;
+  }
+
+  /** A stored endpoint, or undefined when it's gone or the store can't be read. */
+  #safeEndpoint(name: string) {
+    try {
+      return this.#endpoints.get(name);
+    } catch {
+      return undefined;
+    }
   }
 
   /** Warm #modelLimits from disk. Called once at construction. */
@@ -1841,11 +1917,27 @@ mcpHub: this.#mcpHub,
     return this.#persistedModelsCache.get(providerId) ?? null;
   }
 
-  #modelsList(
+  async #modelsList(
     msg: Extract<ClientMessage, { type: "models.list" }>,
-  ): DaemonMessage {
+  ): Promise<DaemonMessage> {
     // No provider = the catalog of the backend a new session would land on.
     const provider = msg.provider ?? this.#providers.defaultId;
+    const endpoint = endpointNameOf(provider);
+    if (endpoint !== null) {
+      // Configured models, else the server's own /models (briefly cached).
+      const { models, live } = await this.#endpointCatalog.models(endpoint);
+      return {
+        type: "models.list.result",
+        requestId: msg.id,
+        models: models.map((m) => ({
+          value: m.id,
+          displayName: m.displayName,
+          ...(m.contextWindow ? { contextWindow: m.contextWindow } : {}),
+        })),
+        live,
+        provider,
+      };
+    }
     const { models, live } = this.#currentModels(provider);
     return { type: "models.list.result", requestId: msg.id, models, live, provider };
   }
@@ -2007,7 +2099,9 @@ mcpHub: this.#mcpHub,
    */
   #resumeProviderId(persisted: string | undefined, sessionId: string): string {
     if (persisted === undefined) return CLAUDE_PROVIDER_ID;
-    if (this.#providers.has(persisted)) return persisted;
+    // A removed endpoint stays resolvable: the session resumes on it and
+    // refuses to run, telling the user why, instead of quietly moving to Claude.
+    if (this.#providers.resolvable(persisted)) return persisted;
     console.warn(
       `[codeoid/resume] session ${sessionId} ran on "${persisted}", which is not available now — resuming it on ${CLAUDE_PROVIDER_ID}`,
     );
@@ -2103,7 +2197,7 @@ mcpHub: this.#mcpHub,
     const id = config.session.defaultProvider;
     if (!id || id === CLAUDE_PROVIDER_ID) return undefined;
     try {
-      createDefaultProviderRegistry(config, next.env);
+      createDefaultProviderRegistry(config, next.env, { store: this.#endpoints, catalog: this.#endpointCatalog });
       return undefined;
     } catch (err) {
       if (err instanceof DefaultProviderError) return { kind: "provider", message: err.message };
@@ -2371,6 +2465,172 @@ mcpHub: this.#mcpHub,
       return this.#claudeAccountsError(msg.id, err);
     }
     return { type: "response.ok", requestId: msg.id, data: session.toInfo() };
+  }
+
+  // ── Providers + OpenAI-compatible endpoints (openai-endpoints.ts) ────────
+
+  /** The backend list, and a subscription to `providers.changed`. No scope beyond the connection. */
+  #providersList(msg: Extract<ClientMessage, { type: "providers.list" }>, client: AttachedClient): DaemonMessage {
+    this.#providerSubscribers.set(client.id, client);
+    return { type: "providers.result", requestId: msg.id, providers: this.providerInfo() };
+  }
+
+  #pushProviders(): void {
+    const msg: DaemonMessage = { type: "providers.changed", providers: this.providerInfo() };
+    for (const [id, client] of this.#providerSubscribers) {
+      try {
+        client.send(msg);
+      } catch {
+        this.#providerSubscribers.delete(id);
+      }
+    }
+  }
+
+  #endpointsResult(requestId: string): DaemonMessage {
+    return { type: "endpoints.result", requestId, endpoints: this.#endpoints.list() };
+  }
+
+  #endpointsError(requestId: string, err: unknown): DaemonMessage {
+    return {
+      type: "response.error",
+      requestId,
+      error: err instanceof Error ? err.message : String(err),
+      code: err instanceof EndpointError ? "invalid_request" : "internal",
+    };
+  }
+
+  /** Names, URLs, models — never a key or header value. `settings:read`. */
+  #endpointsList(msg: Extract<ClientMessage, { type: "endpoints.list" }>, auth: AuthContext): DaemonMessage {
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_READ)) {
+      return { type: "response.error", requestId: msg.id, error: "Missing scope: settings:read", code: "forbidden" };
+    }
+    try {
+      return this.#endpointsResult(msg.id);
+    } catch (err) {
+      return this.#endpointsError(msg.id, err);
+    }
+  }
+
+  /**
+   * Endpoint changes and tests need `settings:write` from an undelegated
+   * token: they decide where sessions send their code, and a test sends the
+   * stored key — a shared token must not do either.
+   */
+  #endpointsWriteRefusal(requestId: string, auth: AuthContext): DaemonMessage | undefined {
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return this.#loginForbidden(requestId);
+    if (auth.delegationDepth > 0) {
+      return { type: "response.error", requestId, error: "A delegated token can't change or test endpoints.", code: "forbidden" };
+    }
+    return undefined;
+  }
+
+  /**
+   * session.defaultProvider as the next start would read it (config file +
+   * env). It only takes effect on restart, so it can name an endpoint the
+   * live default doesn't. Undefined when the config can't be read.
+   */
+  #configuredDefaultProvider(): string | undefined {
+    try {
+      return loadConfig({ quiet: true }).session.defaultProvider || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Add or replace an endpoint. `settings:write` — it decides where sessions send their code. */
+  #endpointsSet(msg: Extract<ClientMessage, { type: "endpoints.set" }>, auth: AuthContext): DaemonMessage {
+    const refused = this.#endpointsWriteRefusal(msg.id, auth);
+    if (refused) return refused;
+    const existed = this.#endpoints.has(msg.name);
+    try {
+      const { type: _t, id: _i, ...input } = msg;
+      this.#endpoints.upsert(input);
+    } catch (err) {
+      return this.#endpointsError(msg.id, err);
+    }
+    // Never the key or header values — only what changed.
+    this.#store.audit(
+      auth.sub,
+      existed ? "endpoints.update" : "endpoints.add",
+      "",
+      `name=${msg.name} baseUrl=${this.#endpoints.get(msg.name)?.baseUrl ?? ""}`,
+    );
+    return this.#endpointsResult(msg.id);
+  }
+
+  #endpointsRemove(msg: Extract<ClientMessage, { type: "endpoints.remove" }>, auth: AuthContext): DaemonMessage {
+    const refused = this.#endpointsWriteRefusal(msg.id, auth);
+    if (refused) return refused;
+    // The live default, and the configured one a restart would boot with —
+    // removing that would stop the daemon from starting.
+    const id = endpointProviderId(msg.name);
+    if (id === this.#providers.defaultId || id === this.#configuredDefaultProvider()) {
+      return {
+        type: "response.error",
+        requestId: msg.id,
+        error: `"${msg.name}" is the daemon's default backend — change session.defaultProvider first`,
+        code: "invalid_request",
+      };
+    }
+    let removed: boolean;
+    try {
+      removed = this.#endpoints.remove(msg.name);
+    } catch (err) {
+      return this.#endpointsError(msg.id, err);
+    }
+    if (!removed) {
+      return { type: "response.error", requestId: msg.id, error: `no endpoint named "${msg.name}"`, code: "not_found" };
+    }
+    this.#store.audit(auth.sub, "endpoints.remove", "", `name=${msg.name}`);
+    return this.#endpointsResult(msg.id);
+  }
+
+  /**
+   * List an endpoint's models — a stored one, or a draft (falling back to the
+   * stored key / headers). `settings:write`: the daemon makes the request,
+   * possibly with a stored credential, to a URL the caller chose.
+   */
+  async #endpointsTest(msg: Extract<ClientMessage, { type: "endpoints.test" }>, auth: AuthContext): Promise<DaemonMessage> {
+    const refused = this.#endpointsWriteRefusal(msg.id, auth);
+    if (refused) return refused;
+    const fail = (error: string): DaemonMessage => ({ type: "endpoints.test.result", requestId: msg.id, ok: false, error });
+    let existing: ReturnType<EndpointStore["get"]>;
+    try {
+      existing = msg.name ? this.#endpoints.get(msg.name) : undefined;
+    } catch (err) {
+      return this.#endpointsError(msg.id, err);
+    }
+    if (msg.name && !existing && msg.baseUrl === undefined) return fail(`no endpoint named "${msg.name}"`);
+    let conn: ReturnType<typeof draftConnection>;
+    try {
+      conn = draftConnection(
+        {
+          ...(msg.baseUrl !== undefined ? { baseUrl: msg.baseUrl } : {}),
+          ...(msg.apiKey !== undefined ? { apiKey: msg.apiKey } : {}),
+          ...(msg.headers !== undefined ? { headers: msg.headers } : {}),
+        },
+        existing,
+      );
+    } catch (err) {
+      return fail(err instanceof Error ? err.message : String(err));
+    }
+    const started = Date.now();
+    try {
+      const models = await fetchEndpointModels(conn, this.#endpointFetch);
+      const flavor = msg.flavor ?? existing?.flavor ?? "openai";
+      const contextWindow =
+        flavor === "llamacpp" ? await fetchLlamaCppContext(conn, this.#endpointFetch).catch(() => undefined) : undefined;
+      return {
+        type: "endpoints.test.result",
+        requestId: msg.id,
+        ok: true,
+        models,
+        latencyMs: Date.now() - started,
+        ...(contextWindow ? { contextWindow } : {}),
+      };
+    } catch (err) {
+      return fail(err instanceof Error ? err.message : String(err));
+    }
   }
 
   /**
@@ -3055,6 +3315,7 @@ mcpHub: this.#mcpHub,
     // Also drop any fleet subscription — otherwise a dead socket keeps getting
     // deltas pushed at it for the life of the daemon.
     this.#fleetSubscribers.delete(clientId);
+    this.#providerSubscribers.delete(clientId);
   }
 
   /** Get a session by name within the caller's tenant (for Telegram convenience).

@@ -42,6 +42,18 @@ import type {
   ClaudeAccountsSetMsg,
   SessionSetClaudeAccountMsg,
 } from "./claude-accounts.js";
+import type {
+  EndpointsListMsg,
+  EndpointsRemoveMsg,
+  EndpointsResultMsg,
+  EndpointsSetMsg,
+  EndpointsTestMsg,
+  EndpointsTestResultMsg,
+  ProviderInfo,
+  ProvidersChangedMsg,
+  ProvidersListMsg,
+  ProvidersResultMsg,
+} from "./endpoints.js";
 import type { CompareGetMsg, CompareKeepMsg, CompareListMsg, CompareListResultMsg, CompareStateMsg, SessionCompareMsg } from "./compare.js";
 import type {
   RoutineCancelRunMsg,
@@ -1092,6 +1104,11 @@ export type ClientMessage =
   | ClaudeAccountsRemoveMsg
   | ClaudeAccountsSetDefaultMsg
   | SessionSetClaudeAccountMsg
+  | ProvidersListMsg
+  | EndpointsListMsg
+  | EndpointsSetMsg
+  | EndpointsRemoveMsg
+  | EndpointsTestMsg
   | SessionRewindMsg
   | SessionCompareMsg
   | CompareGetMsg
@@ -2849,6 +2866,10 @@ export type DaemonMessage =
   | SessionTurnsResultMsg
   | SessionApprovalsResultMsg
   | ClaudeAccountsResultMsg
+  | ProvidersResultMsg
+  | ProvidersChangedMsg
+  | EndpointsResultMsg
+  | EndpointsTestResultMsg
   | SessionRewindResultMsg
   | CompareStateMsg
   | CompareListResultMsg
@@ -2892,6 +2913,12 @@ export interface AuthOkMsg {
    * session creation (assume claude-only).
    */
   providers?: string[];
+  /**
+   * The same backends with display names and kinds (endpoints.ts), first =
+   * the default. Absent on older daemons — fall back to `providers`. For
+   * updates after connect, send `providers.list`.
+   */
+  providerInfo?: ProviderInfo[];
   /**
    * Which issuer authenticated this connection.
    *
