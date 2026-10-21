@@ -39,6 +39,7 @@ import { AsyncQueue } from "../../async-queue.js";
 import type { Store } from "../../store.js";
 import { buildMemoryMcpServer, MEMORY_TOOL_NAMES, type MemoryEngine } from "../../memory/index.js";
 import type { McpRegistry } from "../../mcp/registry.js";
+import { McpProxyLease, type McpProxyMount } from "../../mcp/proxy.js";
 import { resolveEnvMap } from "../../mcp/types.js";
 import { FLEET_TOOL_NAMES } from "../../fleet.js";
 import { resolveQwenBaseUrl, type CodeoidConfig } from "../../../config.js";
@@ -81,6 +82,9 @@ export interface QwenProviderInit {
   memory?: MemoryEngine;
   /** codeoid_fleet MCP server — conductor sessions only. */
   fleet?: { type: "sdk"; name: string; instance: unknown };
+  /** The daemon's OAuth MCP relay (#396): how this backend reaches the
+   *  registry's OAuth servers without holding their tokens. */
+  mcpProxy?: McpProxyMount;
   /** Cross-backend MCP registry — mounted natively (qwen owns its MCP client). */
   mcpRegistry?: McpRegistry;
   config?: CodeoidConfig;
@@ -133,7 +137,14 @@ export class QwenProvider implements SessionProvider {
   constructor(init: QwenProviderInit) {
     this.#backingId = coerceBackingId(init.initialBackingId, init.sessionId);
     this.#init = init;
+    this.#proxy = new McpProxyLease(
+      init.mcpProxy,
+      init.tenant ? { tenant: init.tenant, sessionId: init.sessionId, backendId: this.id } : null,
+    );
   }
+
+  /** This backend's proxy token for the registry's OAuth servers. */
+  readonly #proxy: McpProxyLease;
 
   // ── Public accessors ──────────────────────────────────────────────────────
 
@@ -300,6 +311,7 @@ export class QwenProvider implements SessionProvider {
     this.#consumerTask = null;
     this.#query = null;
     this.#abortController = null;
+    this.#proxy.revoke();
   }
 
   // ── Internal ──────────────────────────────────────────────────────────────
@@ -365,6 +377,10 @@ export class QwenProvider implements SessionProvider {
     // `{type:"sdk", name, instance}` shape, so the builder is reused as-is.
     const mcpServers: Record<string, unknown> = {
       ...registryServersForQwen(init.mcpRegistry),
+      // OAuth registry servers through the daemon's relay (#396), re-minted
+      // per query: the SDK hands this config to its CLI in-process (its
+      // initialize control message), not on argv or in the agent's env.
+      ...proxiedServersForQwen(this.#proxy),
       ...(init.memory
         ? {
             codeoid_memory: buildMemoryMcpServer(init.memory, {
@@ -1000,6 +1016,15 @@ export function unionCatalogs(
     byId.set(m.id, window !== undefined ? { ...winner, contextWindow: window } : winner);
   }
   return [...byId.values()];
+}
+
+/** The registry's OAuth servers as qwen MCP configs, through the relay (#396). */
+export function proxiedServersForQwen(lease: McpProxyLease): Record<string, unknown> {
+  const proxied = lease.renew();
+  if (!proxied) return {};
+  return Object.fromEntries(
+    proxied.servers.map((s) => [s.name, { httpUrl: s.url, headers: { Authorization: `Bearer ${proxied.token}` } }]),
+  );
 }
 
 /**

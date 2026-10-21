@@ -8,6 +8,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Codex, the Gemini CLI and Qwen use OAuth MCP servers** (#396).
+  An OAuth server in codeoid's registry (`"oauth": true`, or one adopted from Claude's config) used to reach only the daemon-run backends and Claude; Settings said "Not reachable from codex, gemini-cli, qwen yet".
+  These backends now mount it through a loopback relay on the daemon, with a token that belongs to the session and ends with it.
+  The server's own token stays in the daemon: the backend, its config, its argv and the agent's shell never see it.
+  The relay carries the whole MCP protocol (tools, resources, prompts, progress, cancellation, and the server's own requests, such as asking the user a question), and a sign-in mid-session reaches a running session without a restart.
+  The daemon's own MCP client now runs on the official MCP SDK for remote servers, shared with the relay.
+
 - **Sign in to an MCP server from codeoid instead of an interactive Claude Code session** (#390).
   A remote OAuth server in Claude's own config (`~/.claude.json`, a `.mcp.json`) could only be signed in to through `/mcp` in a Claude Code terminal, so in a codeoid session it just reported "needs authentication".
   codeoid can now adopt it: "Sign in with codeoid" in the capabilities drawer, or `codeoid mcp adopt <server>` and `codeoid mcp signin <server>`, puts the same URL in codeoid's registry and runs codeoid's own sign-in, from any frontend.

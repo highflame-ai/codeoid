@@ -74,6 +74,8 @@ import {
   BLACKBOARD_MCP_TOKEN_ENV,
 } from "../../blackboard/mcp-http.js";
 import type { McpRegistry } from "../../mcp/registry.js";
+import { MCP_PROXY_TOKEN_ENV, McpProxyLease, type McpProxyMount } from "../../mcp/proxy.js";
+import { codexKeySafe, codexShellEnvExcludeArgs } from "./shell-env.js";
 import { resolveEnvMap } from "../../mcp/types.js";
 
 /** codex `tokenUsage.last` / `.total` shape (thread/tokenUsage/updated). */
@@ -103,6 +105,9 @@ export interface CodexProviderInit {
    * codex can page the verbatim store on demand — the precondition for VWS.
    */
   memoryMcp?: MemoryMcpMount;
+  /** The daemon's OAuth MCP relay (#396): how this backend reaches the
+   *  registry's OAuth servers without holding their tokens. */
+  mcpProxy?: McpProxyMount;
   /**
    * Role-scoped goal-blackboard mount, resolved LAZILY.
    *
@@ -340,6 +345,8 @@ export class CodexProvider implements SessionProvider {
    *  server. A LIST: two calls to one server can be in flight at once, and the
    *  elicitation names only the server (#368). */
   #pendingMcpCalls = new Map<string, Array<{ itemId: string; tool: string; input: Record<string, unknown> }>>();
+  /** This backend's proxy token for the registry's OAuth servers. */
+  readonly #proxy: McpProxyLease;
 
   constructor(init: CodexProviderInit) {
     this.#store = init.store;
@@ -352,6 +359,10 @@ export class CodexProvider implements SessionProvider {
     this.#memoryMcp = init.memoryMcp ?? null;
     this.#blackboardMcp = init.blackboardMcp ?? null;
     this.#mcpRegistry = init.mcpRegistry ?? null;
+    this.#proxy = new McpProxyLease(
+      init.mcpProxy,
+      init.tenant ? { tenant: init.tenant, sessionId: init.sessionId, backendId: this.id } : null,
+    );
   }
 
   /**
@@ -525,6 +536,10 @@ export class CodexProvider implements SessionProvider {
     const args: string[] = [];
     const env: Record<string, string> = {};
     for (const spec of reg.forNativeMount(this.id)) {
+      if (!codexKeySafe(spec.name)) {
+        console.warn(`[codeoid] codex: MCP server "${spec.name}" isn't mounted — codex can't take that name as a config key`);
+        continue;
+      }
       const key = `mcp_servers.${spec.name}`;
       const t = spec.transport;
       if (t.kind === "stdio") {
@@ -542,6 +557,29 @@ export class CodexProvider implements SessionProvider {
       }
     }
     return { args, env };
+  }
+
+  /**
+   * The registry's OAuth servers, through the daemon's relay (#396): each
+   * server's relay URL, and the proxy token by env-var name — never on argv,
+   * where any local process could read it. Re-minted per app-server spawn
+   * (the previous token revoked), revoked on teardown. The commands codex
+   * runs don't inherit it (codexShellEnvExcludeArgs).
+   */
+  #proxyMcpSpawn(): { args: string[]; env: Record<string, string> } {
+    const lease = this.#proxy.renew();
+    if (!lease) return { args: [], env: {} };
+    const args: string[] = [];
+    for (const server of lease.servers) {
+      if (!codexKeySafe(server.name)) {
+        console.warn(`[codeoid] codex: MCP server "${server.name}" isn't mounted — codex can't take that name as a config key`);
+        continue;
+      }
+      const key = `mcp_servers.${server.name}`;
+      args.push("-c", `${key}.url=${JSON.stringify(server.url)}`);
+      args.push("-c", `${key}.bearer_token_env_var=${JSON.stringify(MCP_PROXY_TOKEN_ENV)}`);
+    }
+    return { args, env: { [MCP_PROXY_TOKEN_ENV]: lease.token } };
   }
 
   runTurn(opts: TurnOpts): TurnRun {
@@ -624,6 +662,7 @@ export class CodexProvider implements SessionProvider {
       this.#memoryMcp?.endpoint.revoke(this.#memoryToken);
       this.#memoryToken = null;
     }
+    this.#proxy.revoke();
   }
 
   // ── Internal ──────────────────────────────────────────────────────────
@@ -662,12 +701,20 @@ export class CodexProvider implements SessionProvider {
       const mcp = this.#memoryMcpSpawn();
       const bb = this.#blackboardMcpSpawn();
       const reg = this.#registryMcpArgs();
+      const shellEnv = codexShellEnvExcludeArgs();
+      // Without the exclude, the proxy token would reach the commands codex runs.
+      const oauth = shellEnv ? this.#proxyMcpSpawn() : { args: [], env: {} };
+      if (!shellEnv) {
+        console.warn(
+          "[codeoid] codex: its config.toml couldn't be read here, so codeoid can't add its token variables to shell_environment_policy.exclude — OAuth MCP servers aren't mounted, and codeoid's memory/blackboard tokens rely on Codex's default excludes",
+        );
+      }
       this.#proc = new CodexRpcProcess({
         command: this.#command,
         argsPrefix: this.#argsPrefix,
-        args: [...mcp.args, ...bb.args, ...reg.args],
+        args: [...mcp.args, ...bb.args, ...reg.args, ...oauth.args, ...(shellEnv ?? [])],
         cwd: opts.workdir,
-        env: { ...buildCodexEnv(), ...mcp.env, ...bb.env, ...reg.env },
+        env: { ...buildCodexEnv(), ...mcp.env, ...bb.env, ...reg.env, ...oauth.env },
         onNotification: (method, params) => this.#onNotification(method, params),
         onServerRequest: (method, params) => this.#onServerRequest(method, params),
         onExit: ({ code, signal, stderrTail }) => {

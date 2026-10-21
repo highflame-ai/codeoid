@@ -2470,6 +2470,7 @@ mcpHub: this.#mcpHub,
     const tenant = tenantOf(auth);
     target.oauth.disconnect(target.spec, tenant);
     this.#mcpHub?.dropTenant(msg.server, tenant);
+    this.#mcpHub?.proxy?.credentialsChanged(msg.server, tenant);
     this.#store.audit(auth.sub, "mcp.oauth.disconnect", "", `server=${msg.server}`);
     return {
       type: "mcp.oauth.disconnect.result",
@@ -2643,6 +2644,7 @@ mcpHub: this.#mcpHub,
     }
     // Any client held for the old entry (a plain copy imported from ~/.claude.json).
     this.#mcpHub?.drop(spec.name);
+    this.#mcpHub?.proxy?.serverChanged(spec.name);
     url = redactMcpUrl(new URL(can.url).href);
     audit(`adopted${fromRepoFile(found) ? " projectFile=true" : ""}`);
     return reply(false);
@@ -2662,6 +2664,7 @@ mcpHub: this.#mcpHub,
     if (!oauth) throw new Error("OAuth for MCP servers is not available on this daemon.");
     const done = await oauth.complete(input, proof, (name) => this.#mcpRegistry?.get(name));
     this.#mcpHub?.dropTenant(done.server, done.tenant);
+    this.#mcpHub?.proxy?.credentialsChanged(done.server, done.tenant);
     return done;
   }
 
