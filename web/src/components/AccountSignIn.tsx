@@ -7,6 +7,7 @@
 
 import { type Component, Show, createSignal } from "solid-js";
 
+import { ReplaceAccountConfirm } from "./ReplaceAccountConfirm";
 import {
   accountLoginState,
   cancelAccountLogin,
@@ -25,8 +26,9 @@ const button =
 export const AccountSignIn: Component<{ onDone: () => void }> = (props) => {
   const [name, setName] = createSignal("");
   const [code, setCode] = createSignal("");
+  const [replace, setReplace] = createSignal(false);
   const st = accountLoginState;
-  const problem = () => newAccountNameProblem(name().trim());
+  const problem = () => newAccountNameProblem(name().trim(), replace());
 
   const close = () => {
     void cancelAccountLogin();
@@ -43,11 +45,15 @@ export const AccountSignIn: Component<{ onDone: () => void }> = (props) => {
           <input
             class={input}
             value={name()}
-            onInput={(e) => setName(e.currentTarget.value)}
+            onInput={(e) => {
+              setName(e.currentTarget.value);
+              setReplace(false);
+            }}
             placeholder="company-max"
             autocomplete="off"
           />
         </label>
+        <ReplaceAccountConfirm name={name().trim()} checked={replace()} onChange={setReplace} />
         <p class="text-[11px] text-fg-faint">
           You'll get a link: open it in a browser signed in to the Claude account you want under this name. Your own claude login is
           not touched.

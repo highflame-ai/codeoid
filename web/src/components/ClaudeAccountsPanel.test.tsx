@@ -75,23 +75,37 @@ describe("ClaudeAccountsPanel", () => {
     }
   });
 
-  it("won't add an account under a name that's already taken (the daemon would replace it)", async () => {
+  it("a taken name replaces the account only after an explicit confirmation", async () => {
     clientRequestMock.mockResolvedValue(result([WORK]));
-    const { getByText, getByPlaceholderText, findByText, container } = render(() => <ClaudeAccountsPanel />);
+    const { getByText, getByPlaceholderText, getByRole, findByText, container } = render(() => <ClaudeAccountsPanel />);
     await findByText("work");
     fireEvent.click(getByText("+ API key"));
     fireEvent.input(getByPlaceholderText("company-max"), { target: { value: "work" } });
     fireEvent.input(container.querySelector<HTMLInputElement>('input[type="password"]')!, { target: { value: "sk-ant-x" } });
     expect((getByText("Add account") as HTMLButtonElement).disabled).toBe(true);
     getByText(/already exists/);
-    fireEvent.click(getByText("Cancel"));
+    expect(sent().some((m) => m.type === "claude.accounts.set")).toBe(false);
+    // Confirmed: it goes through (renewing a credential under its name).
+    fireEvent.click(getByRole("checkbox"));
+    expect((getByText("Add account") as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(getByText("Add account"));
+    await waitFor(() => expect(sent().some((m) => m.type === "claude.accounts.set" && m.name === "work")).toBe(true));
+  });
 
-    // The subscription sign-in refuses it too.
+  it("the subscription sign-in needs the same confirmation for a taken name", async () => {
+    clientRequestMock.mockResolvedValue(result([WORK]));
+    const { getByText, getByPlaceholderText, getByRole, findByText } = render(() => <ClaudeAccountsPanel />);
+    await findByText("work");
     fireEvent.click(getByText("+ Sign in a subscription"));
     fireEvent.input(getByPlaceholderText("company-max"), { target: { value: "work" } });
     expect((getByText("Get sign-in link") as HTMLButtonElement).disabled).toBe(true);
-    getByText(/already exists/);
-    expect(sent().some((m) => m.type === "claude.accounts.set" || m.type === "backend.login.start")).toBe(false);
+    fireEvent.click(getByRole("checkbox"));
+    expect((getByText("Get sign-in link") as HTMLButtonElement).disabled).toBe(false);
+    // Editing the name drops the confirmation.
+    fireEvent.input(getByPlaceholderText("company-max"), { target: { value: "wor" } });
+    fireEvent.input(getByPlaceholderText("company-max"), { target: { value: "work" } });
+    expect((getByText("Get sign-in link") as HTMLButtonElement).disabled).toBe(true);
+    expect(sent().some((m) => m.type === "backend.login.start")).toBe(false);
   });
 
   it("after a successful sign-in, a second one starts from a fresh form", async () => {

@@ -20,6 +20,7 @@ import {
   setDefaultClaudeAccount,
 } from "../state/claude-accounts";
 import { AccountSignIn } from "./AccountSignIn";
+import { ReplaceAccountConfirm } from "./ReplaceAccountConfirm";
 
 const label = "text-[11px] font-medium uppercase tracking-wider text-fg-faint";
 const input =
@@ -201,9 +202,10 @@ const AddAccountForm: Component<{ kind: "gateway" | "token" | "api-key"; onDone:
   const [headers, setHeaders] = createSignal<Array<{ name: string; value: string }>>([]);
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
+  const [replace, setReplace] = createSignal(false);
 
   const problem = () => {
-    const n = newAccountNameProblem(name().trim());
+    const n = newAccountNameProblem(name().trim(), replace());
     if (n) return n;
     if (!token().trim()) return "a token is required";
     if (props.kind === "gateway" && !baseUrl().trim()) return "a base URL is required";
@@ -240,8 +242,18 @@ const AddAccountForm: Component<{ kind: "gateway" | "token" | "api-key"; onDone:
       <div class="text-[13px] font-medium text-fg">{title()}</div>
       <label class="block space-y-1">
         <span class={label}>Name</span>
-        <input class={input} value={name()} onInput={(e) => setName(e.currentTarget.value)} placeholder="company-max" autocomplete="off" />
+        <input
+          class={input}
+          value={name()}
+          onInput={(e) => {
+            setName(e.currentTarget.value);
+            setReplace(false);
+          }}
+          placeholder="company-max"
+          autocomplete="off"
+        />
       </label>
+      <ReplaceAccountConfirm name={name().trim()} checked={replace()} onChange={setReplace} />
       <Show when={props.kind === "gateway"}>
         <label class="block space-y-1">
           <span class={label}>Base URL</span>

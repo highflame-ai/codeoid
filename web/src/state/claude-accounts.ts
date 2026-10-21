@@ -139,15 +139,20 @@ export function accountNameProblem(name: string): string | null {
   return null;
 }
 
+/** Is `name` an account already in the list? Adding under it replaces the whole account. */
+export function accountNameTaken(name: string): boolean {
+  return state().accounts.some((a) => a.name === name);
+}
+
 /**
- * `accountNameProblem`, plus: not a name already in the list. Setting an
- * existing name replaces that whole account on the daemon, so adding one
- * under a taken name would silently overwrite it.
+ * `accountNameProblem`, plus: a taken name needs `replace`. The daemon swaps
+ * the whole credential under that name, moving every session on it — right
+ * for renewing an expired sign-in, never as a silent side effect of a name.
  */
-export function newAccountNameProblem(name: string): string | null {
+export function newAccountNameProblem(name: string, replace = false): string | null {
   const p = accountNameProblem(name);
   if (p) return p;
-  if (state().accounts.some((a) => a.name === name)) return `an account named "${name}" already exists — remove it first to replace it`;
+  if (!replace && accountNameTaken(name)) return `an account named "${name}" already exists — tick "Replace" to overwrite it`;
   return null;
 }
 
