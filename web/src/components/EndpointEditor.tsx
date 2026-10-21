@@ -266,7 +266,7 @@ export const EndpointEditor: Component<{ existing?: EndpointInfo; onDone: () => 
           </label>
         </div>
         <Show when={effKeyMode() === "set"}>
-          <input class={input} type="password" value={apiKey()} onInput={(e) => setApiKey(e.currentTarget.value)} autocomplete="off" placeholder="sk-…" />
+          <input class={input} type="password" value={apiKey()} onInput={(e) => setApiKey(e.currentTarget.value)} autocomplete="new-password" placeholder="sk-…" />
         </Show>
       </div>
 
