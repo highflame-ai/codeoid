@@ -28,7 +28,7 @@ import { fetchSettings, saveSettings, settingsState } from "../state/settings";
 import { relativeTime } from "../lib/format";
 import { BackendLoginPanel } from "./BackendLoginPanel";
 import { McpOAuthControls } from "./McpOAuthControls";
-import { LOGIN_ACCOUNT_ONLY_BACKENDS, LOGIN_CAPABLE_BACKENDS } from "../protocol/types";
+import { LOGIN_ACCOUNT_ONLY_BACKENDS } from "../protocol/types";
 import type { OwnLoginBackend } from "./BackendLoginPanel";
 import type {
   LoginBackend,
@@ -39,18 +39,25 @@ import type {
   SettingState,
   SettingValue,
 } from "../protocol/types";
-import { ClaudeAccountsPanel } from "./ClaudeAccountsPanel";
+import { AccountsPanel, focusAccountsBackend } from "./AccountsPanel";
 import { EndpointsPanel } from "./EndpointsPanel";
 
 /**
- * A backend tab whose id names a backend codeoid can sign in interactively.
- * Returns the narrowed id (so the panel is typed) or `null` — every other tab
- * renders exactly as before.
+ * A backend tab whose id names a backend whose OWN (daemon-wide) login codeoid
+ * can run — Claude only. Returns the narrowed id (so the panel is typed) or
+ * `null` — every other tab renders exactly as before.
  */
-function isLoginBackend(tabId: string): OwnLoginBackend | null {
-  return LOGIN_CAPABLE_BACKENDS.includes(tabId as LoginBackend) && !LOGIN_ACCOUNT_ONLY_BACKENDS.includes(tabId as LoginBackend)
-    ? (tabId as OwnLoginBackend)
-    : null;
+function isOwnLoginBackend(tabId: string): OwnLoginBackend | null {
+  return tabId === "claude" ? tabId : null;
+}
+
+/**
+ * A backend that signs in only as a NAMED account (Codex: the daemon refuses
+ * a sign-in that would replace the machine's own login). Its
+ * tab points to Settings → Accounts instead of offering a sign-in that fails.
+ */
+function signsInAsAccount(tabId: string): boolean {
+  return LOGIN_ACCOUNT_ONLY_BACKENDS.includes(tabId as LoginBackend);
 }
 
 const [openSignal, setOpenSignal] = createSignal(false);
@@ -58,7 +65,7 @@ const [activeTab, setActiveTab] = createSignal<string>("");
 
 /** Tabs that render their own panel instead of manifest fields. */
 const SYNTHETIC_TABS = [
-  { id: "claude-accounts", icon: "⚿", title: "Claude accounts" },
+  { id: "accounts", icon: "⚿", title: "Accounts" },
   { id: "endpoints", icon: "⇄", title: "OpenAI endpoints" },
 ] as const;
 const isSyntheticTab = (id: string) => SYNTHETIC_TABS.some((t) => t.id === id);
@@ -72,6 +79,13 @@ const [dirty, setDirty] = createStore<Record<string, SettingValue>>({});
 export function openSettings(): void {
   setOpenSignal(true);
   void fetchSettings();
+}
+
+/** Open Settings → Accounts, showing `backend`'s accounts. */
+export function openAccountsSettings(backend: string): void {
+  focusAccountsBackend(backend);
+  setActiveTab("accounts");
+  openSettings();
 }
 
 export function closeSettings(): void {
@@ -220,8 +234,8 @@ const SettingsDrawer: Component = () => {
               <Show when={activeTab() === "mcp"}>
                 <McpServersPanel servers={settingsState().snapshot?.mcpServers ?? []} />
               </Show>
-              <Show when={activeTab() === "claude-accounts"}>
-                <ClaudeAccountsPanel />
+              <Show when={activeTab() === "accounts"}>
+                <AccountsPanel />
               </Show>
               <Show when={activeTab() === "endpoints"}>
                 <EndpointsPanel />
@@ -256,8 +270,25 @@ const SettingsDrawer: Component = () => {
                     {/* Signing in is the primary path for a backend that has
                         one, so it sits above the fields — a pasted key is the
                         fallback, not the default. */}
-                    <Show when={isLoginBackend(t.id)} keyed>
+                    <Show when={isOwnLoginBackend(t.id)} keyed>
                       {(backend) => <BackendLoginPanel backend={backend} />}
+                    </Show>
+                    <Show when={signsInAsAccount(t.id)}>
+                      <section class="mb-5 flex items-center justify-between gap-3 rounded border border-border bg-bg-subtle/40 p-3">
+                        <p class="text-[11px] text-fg-muted">
+                          Sign in with {t.title} as a named account — the daemon's own login is never replaced.
+                        </p>
+                        <button
+                          type="button"
+                          class="shrink-0 rounded border border-accent/40 px-2.5 py-1 text-[11px] text-accent hover:bg-accent/10"
+                          onClick={() => {
+                            focusAccountsBackend(t.id);
+                            setActiveTab("accounts");
+                          }}
+                        >
+                          Accounts…
+                        </button>
+                      </section>
                     </Show>
 
                     <For each={t.groups}>

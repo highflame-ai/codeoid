@@ -266,9 +266,16 @@ export async function bootstrap(opts: { apiKey?: string; token?: string } = {}):
         // The providers.changed subscription is per connection: renew it, and
         // pick up any endpoint added or removed while we were away.
         void subscribeProviders();
-        // Likewise the Claude account list, if anything has loaded it (dynamic
-        // import: claude-accounts imports this module).
-        void import("./claude-accounts").then((m) => m.refreshClaudeAccountsOnConnect()).catch(() => {});
+        // Likewise the account list, if anything has loaded it, and a device
+        // sign-in whose wait the drop cut off asks again (dynamic import:
+        // accounts imports this module). After the flush above, so a cancel
+        // queued while we were away reaches the daemon first.
+        void import("./accounts")
+          .then((m) => {
+            m.refreshAccounts();
+            m.resumeAccountLogin();
+          })
+          .catch(() => {});
         // Refresh session list so statuses are current after a reconnect —
         // otherwise a session that finished its turn while we were away stays
         // stuck showing "thinking". (The attach effect re-attaches in parallel
@@ -388,6 +395,12 @@ function routeBroadcast(msg: DaemonMessage): void {
       return;
     case "providers.changed":
       setProviders(msg.providers);
+      // An endpoint added or removed is a backend with accounts added or removed.
+      void import("./accounts").then((m) => m.refreshAccounts()).catch(() => {});
+      return;
+    case "accounts.changed":
+      // Another client, a sign-in, or a hand edit changed a backend's accounts.
+      void import("./accounts").then((m) => m.refreshAccounts()).catch(() => {});
       return;
     case "session.status_change":
       setSessionStatus(msg.sessionId, msg.status);
@@ -417,6 +430,7 @@ function routeBroadcast(msg: DaemonMessage): void {
     case "auth.ok":
     case "providers.result":
     case "claude.accounts.result":
+    case "accounts.result":
     case "endpoints.result":
     case "endpoints.test.result":
     case "response.ok":

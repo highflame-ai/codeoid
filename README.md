@@ -285,7 +285,7 @@ Manage endpoints in the web Settings → OpenAI endpoints tab or with `codeoid e
 
 In `codeoid tui`, `/provider` opens the live backend picker and `/model` fetches the selected backend's model catalog. You can also enter `/provider oai:gpu-box` or `/model <id>` directly. `/new` (Ctrl-N) includes provider and Claude account choices: Tab changes fields, arrow keys change a choice, and Enter creates the session.
 
-For Claude sessions, `/account` opens the account picker. `/account <name>` pins a named credential, `/account default` pins the machine's own login, and `/account --follow-default` follows the daemon default. The status bar shows the account when it matters: a pinned account, a daemon default other than the machine's own login, or an account that no longer exists. Configure accounts through the web Settings → Claude accounts tab or `codeoid account`; reading and changing accounts requires the corresponding settings scopes.
+For Claude sessions, `/account` opens the account picker. `/account <name>` pins a named credential, `/account default` pins the machine's own login, and `/account --follow-default` follows the daemon default. The status bar shows the account when it matters: a pinned account, a daemon default other than the machine's own login, or an account that no longer exists. Configure accounts through the web Settings → Accounts tab or `codeoid account`; reading and changing accounts requires the corresponding settings scopes.
 
 > **Gemini needs an API key (or Vertex) — a consumer Google (AI Pro/Ultra) subscription can't be used with Codeoid.**
 > Both Gemini backends authenticate with `GEMINI_API_KEY` / `GOOGLE_API_KEY` (from [AI Studio](https://aistudio.google.com/apikey)) or Vertex.

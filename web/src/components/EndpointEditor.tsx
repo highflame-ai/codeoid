@@ -10,7 +10,7 @@ import { type Component, For, Index, Show, createSignal, createUniqueId } from "
 
 import type { EndpointFlavor, EndpointInfo, EndpointModel, EndpointsTestResultMsg } from "../protocol/types";
 import { endpointNameProblem, endpointsState, saveEndpoint, testEndpoint } from "../state/endpoints";
-import { HeadersEditor } from "./ClaudeAccountsPanel";
+import { HeadersEditor } from "./HeadersEditor";
 
 const label = "text-[11px] font-medium uppercase tracking-wider text-fg-faint";
 const input =
@@ -266,7 +266,7 @@ export const EndpointEditor: Component<{ existing?: EndpointInfo; onDone: () => 
           </label>
         </div>
         <Show when={effKeyMode() === "set"}>
-          <input class={input} type="password" value={apiKey()} onInput={(e) => setApiKey(e.currentTarget.value)} autocomplete="off" placeholder="sk-…" />
+          <input class={input} type="password" value={apiKey()} onInput={(e) => setApiKey(e.currentTarget.value)} autocomplete="new-password" placeholder="sk-…" />
         </Show>
       </div>
 
