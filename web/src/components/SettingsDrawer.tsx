@@ -28,7 +28,8 @@ import { fetchSettings, saveSettings, settingsState } from "../state/settings";
 import { relativeTime } from "../lib/format";
 import { BackendLoginPanel } from "./BackendLoginPanel";
 import { McpOAuthControls } from "./McpOAuthControls";
-import { LOGIN_CAPABLE_BACKENDS } from "../protocol/types";
+import { LOGIN_ACCOUNT_ONLY_BACKENDS, LOGIN_CAPABLE_BACKENDS } from "../protocol/types";
+import type { OwnLoginBackend } from "./BackendLoginPanel";
 import type {
   LoginBackend,
   McpServerStatus,
@@ -46,8 +47,10 @@ import { EndpointsPanel } from "./EndpointsPanel";
  * Returns the narrowed id (so the panel is typed) or `null` — every other tab
  * renders exactly as before.
  */
-function isLoginBackend(tabId: string): LoginBackend | null {
-  return LOGIN_CAPABLE_BACKENDS.includes(tabId as LoginBackend) ? (tabId as LoginBackend) : null;
+function isLoginBackend(tabId: string): OwnLoginBackend | null {
+  return LOGIN_CAPABLE_BACKENDS.includes(tabId as LoginBackend) && !LOGIN_ACCOUNT_ONLY_BACKENDS.includes(tabId as LoginBackend)
+    ? (tabId as OwnLoginBackend)
+    : null;
 }
 
 const [openSignal, setOpenSignal] = createSignal(false);

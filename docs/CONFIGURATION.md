@@ -250,7 +250,8 @@ One thing this cannot override is an `apiKeyHelper` in your Claude settings file
 It runs `claude setup-token` against a throwaway config directory and keeps only the token it prints, so signing a second account in can't replace the personal sign-in your other sessions use.
 
 **Where it is stored.**
-Accounts live in `~/.codeoid/claude-accounts.json`, mode 0600.
+Accounts live in `~/.codeoid/accounts.json`, mode 0600, with every other backend's (below).
+A `claude-accounts.json` from an earlier version is imported on first start and left as it was.
 Tokens are never sent to a client: listing accounts shows names, kinds, and a gateway's URL and header names only.
 Managing accounts needs `settings:write` (listing needs `settings:read`).
 Choosing a session's account needs `settings:write` too, whichever way: creating a session with `--account`, `account use` (including back to `default`), and forking or comparing a session that has an account of its own.
@@ -258,7 +259,7 @@ It decides whose credential the agent runs on, which account is billed, and wher
 The account list is daemon-wide, not per tenant: like the rest of `settings:write`, it belongs to whoever runs the daemon.
 
 **Agents can't read the stored tokens.**
-Agent file tools are refused on codeoid's credential files (`claude-accounts.json`, `config.json`, `.env`, `codeoid.db`, the local-mode token), on each agent CLI's own stored login (`~/.claude/.credentials.json`, `~/.codex/auth.json`, `~/.qwen/oauth_creds.json`, `~/.gemini/oauth_creds.json`), and on any process's `/proc/<pid>/environ` or memory, in every mode.
+Agent file tools are refused on codeoid's credential files (`accounts.json`, `claude-accounts.json`, `endpoints.json`, `config.json`, `.env`, `codeoid.db`, the local-mode token), on every account's home under `~/.codeoid/accounts/`, on each agent CLI's own stored login (`~/.claude/.credentials.json`, Codex's `auth.json`, `~/.qwen/oauth_creds.json`, the Gemini CLI's `oauth_creds.json` and `google_accounts.json`, pi's `auth.json`), and on any process's `/proc/<pid>/environ` or memory, in every mode.
 On Claude this is enforced in a `PreToolUse` hook as well as the approval gate, so it also holds for reads the CLI would allow by itself.
 A search rooted above those files, such as a `Grep` over your home directory, is never auto-approved and waits for you instead.
 
@@ -271,3 +272,60 @@ To keep a Claude session's credential out of the environment its shell commands,
 That is the Claude CLI's own switch: on Linux it needs bubblewrap and runs every shell command in a sandbox, so codeoid leaves the choice to you.
 
 **Behind the Highflame gateway** (a Forge sandbox, where the daemon's environment carries an `x-highflame-apikey` header), named accounts are refused: they would route requests around the gateway's guardrails and audit.
+
+## Accounts for every backend
+
+Every backend can hold several accounts the same way: two ChatGPT sign-ins for Codex, a team and a personal key for Qwen or the Gemini CLI, a second key for a local endpoint.
+Each backend has its own default, and a session holds one choice per backend, so switching a session from Codex to Qwen and back keeps the account it had on each.
+The design is in [backend-accounts-design.md](backend-accounts-design.md).
+
+```bash
+codeoid account login work --backend codex          # ChatGPT sign-in: open the link, enter the code shown
+codeoid account add-key personal --backend gemini-cli   # a Gemini API key, asked for without echo
+codeoid account add-key team --backend qwen --base-url bailian-plan-intl   # a Coding Plan key, asked for without echo
+codeoid account add-key team --backend openai
+codeoid account add-key team --backend pi --key-var OPENROUTER_API_KEY     # pi: one or more provider keys
+codeoid account add-key staging --backend oai:gpu-box --header x-team      # another key or headers for an endpoint
+codeoid account ls                                  # every backend; --backend <id> for one
+codeoid account default work --backend codex
+codeoid account use review work                     # for the backend the session is on now
+codeoid account use review team --backend qwen      # takes effect when it is switched to qwen
+codeoid account rm work --backend codex
+```
+
+What each backend's account is:
+
+| Backend | Kinds | How it is applied |
+|---|---|---|
+| `codex` | ChatGPT sign-in, API key | its own `CODEX_HOME` |
+| `gemini-cli` | API key | its own `GEMINI_CLI_HOME`, selecting API-key auth |
+| `openai`, `gemini`, `llamacpp` | API key | the request's key, every turn |
+| `qwen` | API key with its endpoint (a preset or a URL) | the key and base URL of the query |
+| `pi` | provider keys (`ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, …) | those variables, without pi's own stored logins |
+| `oai:<endpoint>` | a key and/or headers | instead of the endpoint's own |
+
+The Qwen OAuth free tier ended on 2026-04-15, so a Qwen account is always a key.
+
+**How a switch keeps the conversation.**
+Codex, the Gemini CLI and pi keep their login in a directory.
+Each of their accounts gets a home under `~/.codeoid/accounts/<backend>/<name>/` in which every file of the vendor's own home is a link to the real one — config, MCP settings, skills, session history — except the login itself.
+A switched session therefore restarts the backend on the new credential and resumes the same conversation; one whose native resume fails continues from codeoid's own copy of the history.
+HTTP backends pick the new key up on the next request.
+
+**A session never silently changes account.**
+Applying an account removes the daemon's own credential variables for that backend first, so a stray `OPENAI_API_KEY` can't take over a ChatGPT session.
+A session whose account was removed refuses to run until you switch it.
+An endpoint account is tied to the server it was entered for: if the endpoint later points elsewhere, its accounts refuse to run until re-entered.
+A named Gemini CLI account refuses to run in a workdir whose `.env`, `.gemini/.env` or `.gemini/settings.json` (in the workdir or a parent below your home directory) would redirect its credential, naming the file.
+A named Qwen account does the same for `.qwen/settings.json` (a `modelProviders` entry, an auth type or base URL), `.qwen/.env` and `.env`, and runs in its own Qwen home whose settings are yours without provider entries, so neither a cloned repo nor your own provider list can send its key elsewhere.
+A backend's default account can't be removed until you set another default (`codeoid account default <name> --backend <id>`, or `default`), so the sessions following it never move to another credential.
+
+**Signing in never touches your own login.**
+`codeoid account login` runs the vendor's own command (`claude setup-token`, `codex login --device-auth`) against a staging directory, and only a completed sign-in becomes the account's.
+A Gemini CLI account is an API key: a consumer Google (AI Pro/Ultra) subscription can't be used with codeoid, so there is no Google sign-in.
+An existing account is only replaced with `--replace`.
+
+**A key-only backend needs no key in the environment** once it has an account: OpenAI and Gemini appear as backends as soon as one is added.
+A session following such a backend's built-in default still needs `OPENAI_API_KEY` / `GOOGLE_API_KEY`, and says so instead of failing with a 401.
+
+Managing accounts and choosing a session's account need `settings:write` from a token that wasn't delegated; listing needs `settings:read`.

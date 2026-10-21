@@ -26,16 +26,22 @@ import {
 import { settingsState } from "../state/settings";
 import type { LoginBackend } from "../protocol/types";
 
+/**
+ * Backends whose own (daemon-wide) login this panel runs. Codex signs in only
+ * as a named account (accounts.ts), never as the daemon's own login.
+ */
+export type OwnLoginBackend = Extract<LoginBackend, "claude">;
+
 /** Which secret a completed sign-in fills in, per backend. */
-const CREDENTIAL_KEY: Record<LoginBackend, string> = {
+const CREDENTIAL_KEY: Record<OwnLoginBackend, string> = {
   claude: "CLAUDE_CODE_OAUTH_TOKEN",
 };
 
-const LABEL: Record<LoginBackend, string> = {
+const LABEL: Record<OwnLoginBackend, string> = {
   claude: "Claude",
 };
 
-export const BackendLoginPanel: Component<{ backend: LoginBackend }> = (props) => {
+export const BackendLoginPanel: Component<{ backend: OwnLoginBackend }> = (props) => {
   const [code, setCode] = createSignal("");
   const st = () => backendLoginState();
   const mine = () => st().backend === props.backend;

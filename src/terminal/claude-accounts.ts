@@ -3,7 +3,7 @@
  * Pure — no I/O — so it is testable.
  */
 
-import type { ClaudeAccountInfo } from "../protocol/types.js";
+import type { AccountInfo, BackendAccountsInfo, ClaudeAccountInfo } from "../protocol/types.js";
 
 const KIND_LABEL: Record<ClaudeAccountInfo["kind"], string> = {
   subscription: "subscription",
@@ -48,4 +48,41 @@ export function parseHeaderFlags(flags: readonly string[]): { headers: Record<st
     else headers[name] = f.slice(sep + 1).trim();
   }
   return { headers, ask };
+}
+
+const ANY_KIND_LABEL: Record<AccountInfo["kind"], string> = {
+  subscription: "subscription",
+  gateway: "gateway",
+  "api-key": "API key",
+  "chatgpt-login": "ChatGPT sign-in",
+  "api-keys": "provider keys",
+};
+
+/** What the built-in `default` account is, per backend. */
+function builtInDetail(backend: string): string {
+  if (backend === "claude") return "the daemon's own environment / claude login";
+  if (backend.startsWith("oai:")) return "the endpoint's own key and headers";
+  return "the daemon's own environment / login";
+}
+
+/** Every backend's accounts (protocol: accounts.ts), defaults marked. */
+export function formatAccounts(backends: readonly BackendAccountsInfo[]): string {
+  const lines = [""];
+  for (const b of backends) {
+    const mark = (name: string) => (name === b.defaultAccount ? "*" : " ");
+    lines.push(`  ${b.displayName}${b.displayName === b.backend ? "" : ` (${b.backend})`} — * = default:`, "");
+    lines.push(`  ${mark("default")} ${"default".padEnd(22)} ${builtInDetail(b.backend)}`);
+    for (const a of b.accounts) {
+      const detail = [
+        a.baseUrl ?? "",
+        a.headerNames?.length ? `headers: ${a.headerNames.join(", ")}` : "",
+        a.envNames?.length ? `keys: ${a.envNames.join(", ")}` : "",
+      ]
+        .filter(Boolean)
+        .join("  ");
+      lines.push(`  ${mark(a.name)} ${a.name.padEnd(22)} ${ANY_KIND_LABEL[a.kind].padEnd(16)} ${detail}`.trimEnd());
+    }
+    lines.push("");
+  }
+  return lines.join("\n");
 }

@@ -45,6 +45,8 @@ import { BLACKBOARD_MCP_SERVER_NAME } from "../../blackboard/mcp-http.js";
 import type { McpServerView } from "../../mcp/registry.js";
 import { McpProxyLease, type McpProxyMount } from "../../mcp/proxy.js";
 import { resolveEnvMap } from "../../mcp/types.js";
+import type { ResolvedAccount } from "../../accounts.js";
+import { applyGeminiCliAccount } from "../../account-apply.js";
 
 export interface GeminiAcpProviderInit {
   sessionId: string;
@@ -79,6 +81,12 @@ export interface GeminiAcpProviderInit {
   /** Cross-backend MCP registry — external servers mount on session/new
    *  (gemini-cli owns its client); approval flows through canUseTool. */
   mcpRegistry?: McpServerView;
+  /**
+   * This session's account for the backend, resolved when the process is
+   * spawned (accounts.ts); null = the daemon's own login. Throws when the
+   * chosen account can't be used — the turn fails, never another credential.
+   */
+  resolveAccount?: () => ResolvedAccount | null;
   onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
 }
 
@@ -97,6 +105,7 @@ export class GeminiAcpProvider implements SessionProvider {
   #backingSessionId: string;
   #command: string;
   #argsPrefix: string[];
+  #resolveAccount: (() => ResolvedAccount | null) | null;
   #workspaceId: string;
   #memoryMcp: MemoryMcpMount | null;
   /** Role-scoped blackboard mount; token minted+revoked by the SessionManager. */
@@ -131,6 +140,7 @@ export class GeminiAcpProvider implements SessionProvider {
     this.#sessionId = init.sessionId;
     this.#backingSessionId = init.initialBackingId;
     this.#command = init.command;
+    this.#resolveAccount = init.resolveAccount ?? null;
     this.#argsPrefix = init.argsPrefix ?? [];
     this.#workspaceId = init.workspaceId ?? init.sessionId;
     this.#memoryMcp = init.memoryMcp ?? null;
@@ -299,7 +309,8 @@ export class GeminiAcpProvider implements SessionProvider {
         command: this.#command,
         args: [...this.#argsPrefix, "--acp"],
         cwd: opts.workdir,
-        env: buildGeminiCliEnv(),
+        // The account's own GEMINI_CLI_HOME (an overlay selecting its auth type).
+        env: applyGeminiCliAccount(this.#resolveAccount?.() ?? null, buildGeminiCliEnv()),
         onNotification: (method, params) => this.#onNotification(method, params),
         onServerRequest: (method, params) => this.#onServerRequest(method, params),
         onExit: ({ code, signal, stderrTail }) => {

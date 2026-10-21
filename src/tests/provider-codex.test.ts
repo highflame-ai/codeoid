@@ -611,6 +611,30 @@ describe("CodexProvider over fake-codex", () => {
     await p.teardown();
   });
 
+  it("C5g: a thread it can't resume starts fresh WITH the history, never empty", async () => {
+    const p = new CodexProvider({
+      sessionId: "sess-1",
+      initialBackingId: "missing-thread-from-another-home",
+      command: process.execPath,
+      argsPrefix: [FIXTURE],
+      store: { setClaudeCodeSessionId: () => {} } as unknown as Store,
+      workspaceId: "wsX",
+    });
+    let lost = 0;
+    p.onHistoryLost = () => {
+      lost++;
+      p.seedFromHistory([
+        { role: "user", content: "what's the plan?" },
+        { role: "assistant", content: "ship the accounts work", providerId: "codex", model: "gpt-5" },
+      ]);
+    };
+    const events = await collect(p.runTurn(turnOpts("echo-prompt")));
+    await p.teardown();
+    expect(lost).toBe(1);
+    const done = events.find((e) => e.type === "text_done");
+    expect(done?.type === "text_done" && done.content).toContain("ship the accounts work");
+  });
+
   it("C6: requestUserInput select question round-trips the picked option", async () => {
     const p = makeProvider();
     const asked: string[] = [];

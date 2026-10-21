@@ -10,16 +10,17 @@
 
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { type ForkPoint, RewindError, SendStoppedError, Session, type AttachedClient, type WindowScope } from "./session.js";
 import { sweepCheckpoints } from "./checkpoints.js";
 import type { CompareRunRow } from "./store.js";
-import { type CompareState, type CompareTargetState, type ErrorCode, LIMITS } from "../protocol/types.js";
+import { type CompareState, type CompareTargetState, type ErrorCode, LIMITS, backendHasAccounts, DEFAULT_ACCOUNT, type AccountKind } from "../protocol/types.js";
 import { type CatalogEntry, isPlaceholderModel, type SessionProvider } from "./providers/interface.js";
 import {
   createDefaultProviderRegistry,
   DefaultProviderError,
   type ProviderRegistry,
+  registerAccountBackends,
 } from "./providers/registry.js";
 import type { HookBus } from "./hooks/bus.js";
 import type { Store } from "./store.js";
@@ -30,8 +31,9 @@ import { adoptability, adoptableName, adoptedEntry, adoptionRefusal, claudeMcpSe
 import { readWorkdirServers } from "./mcp/workdir-servers.js";
 import { cleanMcpError, commandSummary, MAX_SHOWN_KEYS, quotedVisible, redactMcpUrl, serverProgram, shownLabel, visibleCompact, visibleVerbatim } from "./mcp/redact.js";
 import { canonicalFromTranscript, turnIndexFromHistory } from "./canonical-restore.js";
-import { BackendLoginBroker, BackendLoginError, redact } from "./auth/backend-login.js";
-import { ClaudeAccountError, ClaudeAccountStore, validateAccountName } from "./claude-accounts.js";
+import { BackendLoginBroker, BackendLoginError, type LoginOutcome, redact } from "./auth/backend-login.js";
+import { ClaudeAccountError, ClaudeAccountStore } from "./claude-accounts.js";
+import { AccountError, type AccountStore, LOGIN_KINDS, validateAccountName } from "./accounts.js";
 import { configuredContextWindow, draftConnection, EndpointError, EndpointStore } from "./openai-endpoints.js";
 import {
   EndpointCatalog,
@@ -126,7 +128,7 @@ import { redactCommand } from "./skill-command.js";
 import type { McpHub } from "./mcp/hub.js";
 import { mcpOAuthBindingCookieName, type McpOAuth, type McpOAuthProof, type McpTenant } from "./mcp/oauth.js";
 import { isOAuthServer, type McpServerSpec, OAUTH_UNSUPPORTED_BACKENDS } from "./mcp/types.js";
-import { type CodeoidConfig, DEFAULT_PROVIDER_ENV, loadConfig, mutateConfigFile, validateConfigObject } from "../config.js";
+import { atomicWrite, type CodeoidConfig, DEFAULT_PROVIDER_ENV, loadConfig, mutateConfigFile, validateConfigObject } from "../config.js";
 import type { CompressionRegistry } from "./compress/index.js";
 import { endpointNameOf, endpointProviderId, ORCHESTRATOR_ROLE, type ProviderInfo } from "../protocol/types.js";
 import type {
@@ -369,6 +371,9 @@ function resumeSortKey(m: { lastActivityAt?: string; createdAt?: string }): numb
   return Number.isFinite(n) ? n : 0;
 }
 
+/** How long a finished device sign-in's outcome is kept for a client that comes back for it. */
+const LOGIN_OUTCOME_TTL_MS = 10 * 60_000;
+
 export class SessionManager {
   #sessions = new Map<string, Session>();
   #store: Store;
@@ -393,13 +398,21 @@ export class SessionManager {
   readonly #backendLogin: BackendLoginBroker;
   /** Claude accounts (claude-accounts.ts) — shared by every session. */
   #claudeAccounts!: ClaudeAccountStore;
+  /** Every backend's accounts — the store behind #claudeAccounts. */
+  #accounts!: AccountStore;
   #endpoints!: EndpointStore;
   #endpointCatalog!: EndpointCatalog;
   #endpointFetch!: typeof fetch;
   /** Connections that asked for `providers.list` — they get `providers.changed`. */
   readonly #providerSubscribers = new Map<string, AttachedClient>();
   /** Logins started for a NAMED Claude account: loginId → account name. */
-  readonly #accountLogins = new Map<string, string>();
+  readonly #accountLogins = new Map<string, { backend: string; name: string; replace: boolean }>();
+  /**
+   * Device sign-ins being waited on, by login id, and kept a while after they
+   * finish: a client whose connection dropped mid-wait waits again and gets
+   * the same outcome — the credential is stored once.
+   */
+  readonly #loginWaits = new Map<string, Promise<{ ok: boolean; error?: string; pending?: { backend: string; name: string } }>>();
   /** Live model catalogs by provider id (via each backend's supportedModels
    *  equivalent), cached daemon-wide once any session of that provider
    *  initializes. Empty until then. */
@@ -523,8 +536,10 @@ export class SessionManager {
        * subprocess. Mirrors SessionCreateOptions._testProvider.
        */
       _testProviderFactory?: () => SessionProvider;
-      /** Claude account store (claude-accounts.ts). Default: `<configDir>/claude-accounts.json`. */
+      /** Claude account store (claude-accounts.ts) — the `claude` backend's view of `accounts`. */
       claudeAccounts?: ClaudeAccountStore;
+      /** Every backend's accounts (accounts.ts). Default: `<configDir>/accounts.json` (or the store behind `claudeAccounts`). */
+      accounts?: AccountStore;
       /** Test-only: a login broker driving a fake login command. */
       _testBackendLogin?: BackendLoginBroker;
       /** OpenAI-compatible endpoint store (openai-endpoints.ts). Default: `<configDir>/endpoints.json`. */
@@ -545,7 +560,10 @@ export class SessionManager {
     this.#endpointFetch = opts?._testEndpointFetch ?? fetch;
     this.#endpointCatalog = new EndpointCatalog(this.#endpoints, this.#endpointFetch);
     const endpoints = { store: this.#endpoints, catalog: this.#endpointCatalog };
-    this.#providers = opts?.providers ?? createDefaultProviderRegistry(opts?.config, process.env, endpoints);
+    // Before the registry: a keyed backend with named accounts is registered without an env key.
+    this.#claudeAccounts = opts?.claudeAccounts ?? new ClaudeAccountStore(opts?.accounts);
+    this.#accounts = this.#claudeAccounts.store;
+    this.#providers = opts?.providers ?? createDefaultProviderRegistry(opts?.config, process.env, endpoints, this.#accounts);
     // An injected registry (tests) gets the endpoints too; startup's already has them.
     // Like startup, an unreadable endpoints file costs the endpoints, not the daemon.
     if (opts?.providers) {
@@ -556,9 +574,15 @@ export class SessionManager {
       }
     }
     watchEndpointProviders(this.#providers, this.#endpoints, this.#endpointCatalog, () => this.#pushProviders());
+    // A keyed backend that gains accounts while the daemon runs becomes pickable.
+    this.#accounts.onChange((backend) => {
+      if (registerAccountBackends(this.#providers, this.#accounts)) this.#pushProviders();
+      // Every change — a handler, a sign-in, a hand edit — reaches the sessions on that backend.
+      this.#refreshSessionsOn(backend);
+      this.#pushToProviderSubscribers({ type: "accounts.changed", backend });
+    });
     this.#hooks = opts?.hooks;
     this.#testProviderFactory = opts?._testProviderFactory;
-    this.#claudeAccounts = opts?.claudeAccounts ?? new ClaudeAccountStore();
     this.#backendLogin = opts?._testBackendLogin ?? new BackendLoginBroker();
     this.#dispatcher = new Dispatcher(store, this.#makeDispatcherHost(), {
       ...opts?.config?.dispatch,
@@ -830,7 +854,9 @@ export class SessionManager {
           transcriptStore: this.#transcriptStore,
           providers: this.#providers,
           claudeAccounts: this.#claudeAccounts,
+          accounts: this.#accounts,
           claudeAccount: meta.claudeAccount ?? null,
+          ...(meta.accounts ? { accountChoices: meta.accounts } : {}),
           hooks: this.#hooks,
           identityManager: this.#identityManager,
           existingId: meta.sessionId,
@@ -1269,6 +1295,18 @@ mcpHub: this.#mcpHub,
         return this.#backendLoginSubmit(msg, auth);
       case "backend.login.cancel":
         return this.#backendLoginCancel(msg, auth);
+      case "backend.login.wait":
+        return this.#backendLoginWait(msg, auth);
+      case "accounts.list":
+        return this.#accountsList(msg, auth);
+      case "accounts.set":
+        return this.#accountsSet(msg, auth);
+      case "accounts.remove":
+        return this.#accountsRemove(msg, auth);
+      case "accounts.set_default":
+        return this.#accountsSetDefault(msg, auth);
+      case "session.set_account":
+        return this.#sessionSetAccount(msg, auth);
       case "claude.accounts.list":
         return this.#claudeAccountsList(msg, auth);
       case "claude.accounts.set":
@@ -2229,15 +2267,25 @@ mcpHub: this.#mcpHub,
     if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) {
       return this.#loginForbidden(msg.id);
     }
+    if (msg.account !== undefined && auth.delegationDepth > 0) {
+      return { type: "response.error", requestId: msg.id, error: "A delegated token can't sign accounts in.", code: "forbidden" };
+    }
     try {
-      // A login for a NAMED Claude account runs isolated (its own throwaway
-      // config dir) and its token is stored as that account — it must never
-      // replace the machine's own `claude login`.
-      if (msg.account !== undefined) validateAccountName(msg.account);
+      // A login for a NAMED account runs isolated (its own staging home) and
+      // its credential is stored as that account — it must never replace the
+      // machine's own login. An existing account is replaced only explicitly.
+      if (msg.account !== undefined) {
+        validateAccountName(msg.account);
+        if (this.#accounts.get(msg.backend, msg.account) && !msg.replace) {
+          throw new AccountError(`a ${msg.backend} account named "${msg.account}" already exists — replace it explicitly, or pick another name`);
+        }
+      }
       const login = await this.#backendLogin.start(msg.backend, { isolated: msg.account !== undefined });
       // A new attempt supersedes any other for this backend: forget theirs.
       for (const id of [...this.#accountLogins.keys()]) if (!this.#backendLogin.isOpen(id)) this.#accountLogins.delete(id);
-      if (msg.account !== undefined) this.#accountLogins.set(login.loginId, msg.account);
+      if (msg.account !== undefined) {
+        this.#accountLogins.set(login.loginId, { backend: msg.backend, name: msg.account, replace: msg.replace === true });
+      }
       this.#store.audit(
         auth.sub,
         "backend.login.start",
@@ -2252,7 +2300,7 @@ mcpHub: this.#mcpHub,
         // The message is authored by the broker for display; redact anyway
         // rather than depend on every future flow's error being clean.
         error: redact(err instanceof Error ? err.message : String(err)),
-        code: err instanceof BackendLoginError || err instanceof ClaudeAccountError ? "invalid_request" : "internal",
+        code: err instanceof BackendLoginError || err instanceof ClaudeAccountError || err instanceof AccountError ? "invalid_request" : "internal",
       };
     }
   }
@@ -2272,48 +2320,21 @@ mcpHub: this.#mcpHub,
     }
     try {
       const outcome = await this.#backendLogin.submit(msg.loginId, msg.code);
-      let error = outcome.error;
-      const accountName = this.#accountLogins.get(msg.loginId);
+      const pending = this.#accountLogins.get(msg.loginId);
       // Forget the mapping only once the attempt is over: a code refused before
       // it reached the command (malformed) leaves the attempt open, and a
       // retry must still be stored as the named account.
       if (!this.#backendLogin.isOpen(msg.loginId)) this.#accountLogins.delete(msg.loginId);
-      if (outcome.isolated && accountName === undefined) {
-        // A named-account login whose name we no longer know. Its credential
-        // must never become the daemon's own login: drop it.
-        if (outcome.ok) error = "Signed in, but the account this sign-in was for is no longer known. Start again.";
-      } else if (accountName !== undefined) {
-        // A named account keeps ONLY the token the command printed: it ran
-        // against a throwaway config dir, so there is no on-disk fallback.
-        if (outcome.ok && outcome.secret?.key === "CLAUDE_CODE_OAUTH_TOKEN") {
-          try {
-            this.#claudeAccounts.upsert({ name: accountName, kind: "subscription", token: outcome.secret.value });
-            // A re-login replaced the token: idle processes still hold the old one.
-            this.#releaseClaudeSessionsOn(accountName);
-          } catch (err) {
-            error = `Signed in, but the account could not be saved: ${err instanceof Error ? err.message : String(err)}`;
-          }
-        } else if (outcome.ok) {
-          error = "Signed in, but claude setup-token didn't print a token to store for this account.";
-        }
-      } else if (outcome.ok && outcome.secret) {
-        const written = applyPatches([{ key: outcome.secret.key, value: outcome.secret.value }]);
-        if (!written.ok) {
-          // Signed in with the vendor but could not persist it: report the
-          // failure rather than a success the next session will not honour.
-          error = `Signed in, but the credential could not be saved: ${
-            written.errors[0]?.message ?? "unknown error"
-          }`;
-        }
-      }
+      const error = this.#storeLoginOutcome(outcome, pending);
       const ok = outcome.ok && error === undefined;
       // Never the code, never the credential — only that an exchange happened.
-      this.#store.audit(auth.sub, "backend.login.submit", "", `ok=${ok}${accountName !== undefined ? ` account=${accountName}` : ""}`);
+      this.#store.audit(auth.sub, "backend.login.submit", "", `ok=${ok}${pending ? ` backend=${pending.backend} account=${pending.name}` : ""}`);
       return {
         type: "backend.login.submit.result",
         requestId: msg.id,
         ok,
         ...(error === undefined ? {} : { error }),
+        ...(!ok && this.#backendLogin.isOpen(msg.loginId) ? { retryable: true } : {}),
         snapshot: { ...getSnapshot(), mcpServers: this.#mcpServerStatuses(auth) },
       };
     } catch (err) {
@@ -2342,6 +2363,268 @@ mcpHub: this.#mcpHub,
     };
   }
 
+  /**
+   * Keep what a finished sign-in produced: as the named account it was for,
+   * or — for the daemon's own Claude login only — in `~/.codeoid/.env`.
+   * Returns the error to report, if any.
+   */
+  #storeLoginOutcome(
+    outcome: LoginOutcome,
+    pending: { backend: string; name: string; replace: boolean } | undefined,
+  ): string | undefined {
+    if (outcome.isolated && pending === undefined) {
+      // A named-account login whose name we no longer know. Its credential
+      // must never become the daemon's own login: drop it.
+      return outcome.ok ? "Signed in, but the account this sign-in was for is no longer known. Start again." : outcome.error;
+    }
+    if (!outcome.ok) return outcome.error;
+    if (pending !== undefined) {
+      try {
+        if (pending.backend === "claude") {
+          // A named Claude account keeps ONLY the token the command printed:
+          // it ran against a throwaway config dir, so there is no on-disk fallback.
+          if (outcome.secret?.key !== "CLAUDE_CODE_OAUTH_TOKEN") return "Signed in, but claude setup-token didn't print a token to store for this account.";
+          // Added meanwhile by someone else: replace it only if this sign-in said so.
+          if (!pending.replace && this.#accounts.get("claude", pending.name)) {
+            return `Signed in, but a claude account named "${pending.name}" was added meanwhile — sign in again to replace it`;
+          }
+          this.#claudeAccounts.upsert({ name: pending.name, kind: "subscription", token: outcome.secret.value });
+        } else {
+          if (!outcome.files || Object.keys(outcome.files).length === 0) return `Signed in, but the ${pending.backend} sign-in left no credential to keep.`;
+          const kind: AccountKind = "chatgpt-login";
+          this.#accounts.upsert({ backend: pending.backend, name: pending.name, kind, replace: pending.replace });
+          this.#writeAccountFiles(pending.backend, pending.name, outcome.files);
+        }
+      } catch (err) {
+        return `Signed in, but the account could not be saved: ${err instanceof Error ? err.message : String(err)}`;
+      }
+      return undefined;
+    }
+    if (outcome.secret) {
+      const written = applyPatches([{ key: outcome.secret.key, value: outcome.secret.value }]);
+      // Signed in with the vendor but could not persist it: report the
+      // failure rather than a success the next session will not honour.
+      if (!written.ok) return `Signed in, but the credential could not be saved: ${written.errors[0]?.message ?? "unknown error"}`;
+    }
+    return undefined;
+  }
+
+  /**
+   * Put a sign-in's credential files into the account's home (0700 dir, 0600
+   * files), replacing what was there — the vendor's own format, never parsed.
+   */
+  #writeAccountFiles(backend: string, name: string, files: Record<string, string>): void {
+    const home = this.#accounts.homeOf(backend, name);
+    // A file layout the CLI wrote under the staging home, mirrored here; a
+    // path that climbs out (it can't, the flows name fixed files) is refused.
+    for (const [rel, content] of Object.entries(files)) {
+      const target = join(home, rel);
+      if (!target.startsWith(`${home}/`)) throw new AccountError("a sign-in named a file outside its home");
+      mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
+      atomicWrite(target, content, 0o600);
+    }
+  }
+
+  /** Finish a `device` sign-in (Codex): wait for the user to approve on the vendor's page. */
+  async #backendLoginWait(
+    msg: Extract<ClientMessage, { type: "backend.login.wait" }>,
+    auth: AuthContext,
+  ): Promise<DaemonMessage> {
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return this.#loginForbidden(msg.id);
+    try {
+      let waiting = this.#loginWaits.get(msg.loginId);
+      if (!waiting) {
+        waiting = (async () => {
+          const outcome = await this.#backendLogin.wait(msg.loginId);
+          // Still open = this wasn't a device login (a code login answered
+          // "paste it instead"): its account mapping and outcome stay for submit.
+          if (this.#backendLogin.isOpen(msg.loginId)) {
+            this.#loginWaits.delete(msg.loginId);
+            return { ok: false, ...(outcome.error ? { error: outcome.error } : {}) };
+          }
+          const pending = this.#accountLogins.get(msg.loginId);
+          this.#accountLogins.delete(msg.loginId);
+          const error = this.#storeLoginOutcome(outcome, pending);
+          this.#store.audit(auth.sub, "backend.login.wait", "", `ok=${outcome.ok && error === undefined}${pending ? ` backend=${pending.backend} account=${pending.name}` : ""}`);
+          return { ok: outcome.ok && error === undefined, ...(error === undefined ? {} : { error }) };
+        })();
+        this.#loginWaits.set(msg.loginId, waiting);
+        // Remembered for as long as a client could plausibly come back for it.
+        const forget = () => setTimeout(() => this.#loginWaits.delete(msg.loginId), LOGIN_OUTCOME_TTL_MS).unref?.();
+        waiting.then(forget, forget);
+      }
+      const result = await waiting;
+      return {
+        type: "backend.login.wait.result",
+        requestId: msg.id,
+        ok: result.ok,
+        ...(result.error === undefined ? {} : { error: result.error }),
+        snapshot: { ...getSnapshot(), mcpServers: this.#mcpServerStatuses(auth) },
+      };
+    } catch (err) {
+      return { type: "response.error", requestId: msg.id, error: redact(err instanceof Error ? err.message : String(err)), code: "internal" };
+    }
+  }
+
+  // ── Accounts for every backend (accounts.ts) ─────────────────────────────
+
+  /**
+   * Account changes need `settings:write` from an undelegated token: they
+   * decide whose credential an agent runs on, who is billed, and who is sent
+   * the conversation.
+   */
+  #accountsWriteRefusal(requestId: string, auth: AuthContext): DaemonMessage | undefined {
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return this.#loginForbidden(requestId);
+    if (auth.delegationDepth > 0) {
+      return { type: "response.error", requestId, error: "A delegated token can't change accounts.", code: "forbidden" };
+    }
+    return undefined;
+  }
+
+  #accountsError(requestId: string, err: unknown): DaemonMessage {
+    return {
+      type: "response.error",
+      requestId,
+      error: err instanceof Error ? err.message : String(err),
+      code: err instanceof AccountError || err instanceof ClaudeAccountError ? "invalid_request" : "internal",
+    };
+  }
+
+  /** The backends to list: one, or every registered backend that takes accounts plus any holding accounts. */
+  #accountBackends(only?: string): string[] {
+    if (only !== undefined) return [only];
+    const ids = new Set(this.#providers.ids().filter(backendHasAccounts));
+    for (const b of this.#accounts.backendsWithData()) if (backendHasAccounts(b)) ids.add(b);
+    return [...ids];
+  }
+
+  #accountsResult(requestId: string, only?: string): DaemonMessage {
+    const names = new Map(this.providerInfo().map((p) => [p.id, p.displayName]));
+    return {
+      type: "accounts.result",
+      requestId,
+      backends: this.#accountBackends(only).map((b) => this.#accounts.summary(b, names.get(b) ?? b)),
+    };
+  }
+
+  /** Names, kinds, URLs, header/key names — never a secret. `settings:read`. */
+  #accountsList(msg: Extract<ClientMessage, { type: "accounts.list" }>, auth: AuthContext): DaemonMessage {
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_READ)) {
+      return { type: "response.error", requestId: msg.id, error: "Missing scope: settings:read", code: "forbidden" };
+    }
+    if (msg.backend !== undefined && !backendHasAccounts(msg.backend)) {
+      return { type: "response.error", requestId: msg.id, error: `the ${msg.backend} backend has no accounts`, code: "invalid_request" };
+    }
+    try {
+      return this.#accountsResult(msg.id, msg.backend);
+    } catch (err) {
+      return this.#accountsError(msg.id, err);
+    }
+  }
+
+  #accountsSet(msg: Extract<ClientMessage, { type: "accounts.set" }>, auth: AuthContext): DaemonMessage {
+    const refused = this.#accountsWriteRefusal(msg.id, auth);
+    if (refused) return refused;
+    try {
+      if (LOGIN_KINDS.has(msg.kind)) throw new AccountError(`a ${msg.kind} account is created by signing in (backend.login.start with the account's name)`);
+      if (msg.backend === "claude") {
+        // Claude's own validation (gateway URL rules) on top of the store's.
+        if (this.#accounts.get("claude", msg.name) && !msg.replace) {
+          throw new AccountError(`a claude account named "${msg.name}" already exists — replace it explicitly, or pick another name`);
+        }
+        this.#claudeAccounts.upsert({
+          name: msg.name,
+          kind: msg.kind as "subscription" | "gateway" | "api-key",
+          token: msg.token ?? "",
+          ...(msg.baseUrl !== undefined ? { baseUrl: msg.baseUrl } : {}),
+          ...(msg.headers !== undefined ? { headers: msg.headers } : {}),
+        });
+      } else {
+        // An endpoint account is bound to the server the endpoint has now.
+        let origin: string | undefined;
+        const endpoint = endpointNameOf(msg.backend);
+        if (endpoint !== null) {
+          const e = this.#endpoints.get(endpoint);
+          if (!e) throw new AccountError(`no endpoint named "${endpoint}"`);
+          origin = new URL(e.baseUrl).origin;
+        }
+        this.#accounts.upsert({
+          backend: msg.backend,
+          name: msg.name,
+          kind: msg.kind,
+          ...(msg.token !== undefined ? { token: msg.token } : {}),
+          ...(msg.baseUrl !== undefined ? { baseUrl: msg.baseUrl } : {}),
+          ...(msg.headers !== undefined ? { headers: msg.headers } : {}),
+          ...(msg.env !== undefined ? { env: msg.env } : {}),
+          ...(origin ? { origin } : {}),
+          ...(msg.replace ? { replace: true } : {}),
+        });
+      }
+    } catch (err) {
+      return this.#accountsError(msg.id, err);
+    }
+    // Never a secret — only what was set.
+    this.#store.audit(auth.sub, "accounts.set", "", `backend=${msg.backend} name=${msg.name} kind=${msg.kind}${msg.replace ? " replace" : ""}`);
+    return this.#accountsResult(msg.id);
+  }
+
+  #accountsRemove(msg: Extract<ClientMessage, { type: "accounts.remove" }>, auth: AuthContext): DaemonMessage {
+    const refused = this.#accountsWriteRefusal(msg.id, auth);
+    if (refused) return refused;
+    let removed: boolean;
+    try {
+      removed = this.#accounts.remove(msg.backend, msg.name);
+    } catch (err) {
+      return this.#accountsError(msg.id, err);
+    }
+    if (!removed) {
+      return { type: "response.error", requestId: msg.id, error: `no ${msg.backend} account named "${msg.name}"`, code: "not_found" };
+    }
+    this.#store.audit(auth.sub, "accounts.remove", "", `backend=${msg.backend} name=${msg.name}`);
+    return this.#accountsResult(msg.id);
+  }
+
+  #accountsSetDefault(msg: Extract<ClientMessage, { type: "accounts.set_default" }>, auth: AuthContext): DaemonMessage {
+    const refused = this.#accountsWriteRefusal(msg.id, auth);
+    if (refused) return refused;
+    if (!backendHasAccounts(msg.backend)) {
+      return { type: "response.error", requestId: msg.id, error: `the ${msg.backend} backend has no accounts`, code: "invalid_request" };
+    }
+    try {
+      this.#accounts.setDefault(msg.backend, msg.name);
+    } catch (err) {
+      return this.#accountsError(msg.id, err);
+    }
+    this.#store.audit(auth.sub, "accounts.set_default", "", `backend=${msg.backend} name=${msg.name}`);
+    return this.#accountsResult(msg.id);
+  }
+
+  /** Choose a session's account for a backend (default: its current one). `settings:write`, undelegated. */
+  #sessionSetAccount(msg: Extract<ClientMessage, { type: "session.set_account" }>, auth: AuthContext): DaemonMessage {
+    const refused = this.#accountsWriteRefusal(msg.id, auth);
+    if (refused) return refused;
+    const session = this.#getOwnedSession(msg.sessionId, auth);
+    if (!session) return { type: "response.error", requestId: msg.id, error: "Session not found", code: "not_found" };
+    try {
+      session.setAccount(msg.account, auth, msg.backend);
+    } catch (err) {
+      return this.#accountsError(msg.id, err);
+    }
+    return { type: "response.ok", requestId: msg.id, data: session.toInfo() };
+  }
+
+  /**
+   * Re-check every session on `backend` after its accounts changed — by any
+   * handler, a sign-in, or a hand edit of accounts.json (the store's change
+   * listener calls this). A session whose credential changed is released when
+   * idle; every one re-announces its effective account.
+   */
+  #refreshSessionsOn(backend: string): void {
+    for (const session of this.#sessions.values()) {
+      if (session.providerId === backend) session.refreshAccount();
+    }
+  }
+
   // ── Claude accounts (claude-accounts.ts) ─────────────────────────────────
 
   #claudeAccountsResult(requestId: string): DaemonMessage {
@@ -2354,12 +2637,7 @@ mcpHub: this.#mcpHub,
   }
 
   #claudeAccountsError(requestId: string, err: unknown): DaemonMessage {
-    return {
-      type: "response.error",
-      requestId,
-      error: err instanceof Error ? err.message : String(err),
-      code: err instanceof ClaudeAccountError ? "invalid_request" : "internal",
-    };
+    return this.#accountsError(requestId, err);
   }
 
   /** Names, kinds and gateway URLs — never a token. `settings:read`. */
@@ -2372,7 +2650,8 @@ mcpHub: this.#mcpHub,
 
   /** Add or replace an account. `settings:write` — it decides what sessions bill. */
   #claudeAccountsSet(msg: Extract<ClientMessage, { type: "claude.accounts.set" }>, auth: AuthContext): DaemonMessage {
-    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return this.#loginForbidden(msg.id);
+    const refused = this.#accountsWriteRefusal(msg.id, auth);
+    if (refused) return refused;
     try {
       this.#claudeAccounts.upsert({
         name: msg.name,
@@ -2386,21 +2665,22 @@ mcpHub: this.#mcpHub,
     }
     // Never the token — only that an account was set and what kind.
     this.#store.audit(auth.sub, "claude.accounts.set", "", `name=${msg.name} kind=${msg.kind}`);
-    // A replaced token: idle processes still hold the old one.
-    this.#releaseClaudeSessionsOn(msg.name);
     return this.#claudeAccountsResult(msg.id);
   }
 
   #claudeAccountsRemove(msg: Extract<ClientMessage, { type: "claude.accounts.remove" }>, auth: AuthContext): DaemonMessage {
-    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return this.#loginForbidden(msg.id);
-    // Before removing: afterwards a follower of it no longer resolves to it.
-    this.#releaseClaudeSessionsOn(msg.name);
-    if (!this.#claudeAccounts.remove(msg.name)) {
+    const refused = this.#accountsWriteRefusal(msg.id, auth);
+    if (refused) return refused;
+    let removed: boolean;
+    try {
+      removed = this.#claudeAccounts.remove(msg.name);
+    } catch (err) {
+      return this.#claudeAccountsError(msg.id, err);
+    }
+    if (!removed) {
       return { type: "response.error", requestId: msg.id, error: `no Claude account named "${msg.name}"`, code: "not_found" };
     }
     this.#store.audit(auth.sub, "claude.accounts.remove", "", `name=${msg.name}`);
-    // Sessions on it now refuse to run until switched (never a silent fallback).
-    this.#announceClaudeSessions();
     return this.#claudeAccountsResult(msg.id);
   }
 
@@ -2408,33 +2688,15 @@ mcpHub: this.#mcpHub,
     msg: Extract<ClientMessage, { type: "claude.accounts.set_default" }>,
     auth: AuthContext,
   ): DaemonMessage {
-    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return this.#loginForbidden(msg.id);
+    const refused = this.#accountsWriteRefusal(msg.id, auth);
+    if (refused) return refused;
     try {
       this.#claudeAccounts.setDefault(msg.name);
     } catch (err) {
       return this.#claudeAccountsError(msg.id, err);
     }
-    for (const session of this.#sessions.values()) if (session.claudeAccount === null) session.releaseIdleClaudeQuery();
     this.#store.audit(auth.sub, "claude.accounts.set_default", "", `name=${msg.name}`);
-    // Every session following the default runs on it from its next turn.
-    this.#announceClaudeSessions();
     return this.#claudeAccountsResult(msg.id);
-  }
-
-  /** Re-announce every Claude session's info — its effective account may have moved. */
-  #announceClaudeSessions(): void {
-    for (const session of this.#sessions.values()) {
-      if (session.toInfo().providerId === "claude") session.announceInfo();
-    }
-  }
-
-  /** Stop idle Claude queries running on `name` (chosen, or followed as the daemon default). */
-  #releaseClaudeSessionsOn(name: string): void {
-    const daemonDefault = this.#claudeAccounts.getDefault();
-    for (const session of this.#sessions.values()) {
-      const choice = session.claudeAccount;
-      if (choice === name || (choice === null && daemonDefault === name)) session.releaseIdleClaudeQuery();
-    }
   }
 
   /**
@@ -2457,6 +2719,8 @@ mcpHub: this.#mcpHub,
         code: "forbidden",
       };
     }
+    const refused = this.#accountsWriteRefusal(msg.id, auth);
+    if (refused) return refused;
     const session = this.#getOwnedSession(msg.sessionId, auth);
     if (!session) return { type: "response.error", requestId: msg.id, error: "Session not found", code: "not_found" };
     try {
@@ -2476,7 +2740,11 @@ mcpHub: this.#mcpHub,
   }
 
   #pushProviders(): void {
-    const msg: DaemonMessage = { type: "providers.changed", providers: this.providerInfo() };
+    this.#pushToProviderSubscribers({ type: "providers.changed", providers: this.providerInfo() });
+  }
+
+  /** Send to every client subscribed to the backend list (providers.list). */
+  #pushToProviderSubscribers(msg: DaemonMessage): void {
     for (const [id, client] of this.#providerSubscribers) {
       try {
         client.send(msg);
@@ -2582,6 +2850,13 @@ mcpHub: this.#mcpHub,
       return { type: "response.error", requestId: msg.id, error: `no endpoint named "${msg.name}"`, code: "not_found" };
     }
     this.#store.audit(auth.sub, "endpoints.remove", "", `name=${msg.name}`);
+    // Its accounts go with it: their keys were only ever for that server, and a
+    // later endpoint of the same name must not inherit them.
+    try {
+      this.#accounts.removeBackend(endpointProviderId(msg.name));
+    } catch (err) {
+      console.error(`[codeoid] couldn't remove the accounts of endpoint ${msg.name}: ${err instanceof Error ? err.message : String(err)}`);
+    }
     return this.#endpointsResult(msg.id);
   }
 
@@ -3642,6 +3917,29 @@ mcpHub: this.#mcpHub,
       }
     }
 
+    // An account for the backend the session lands on (`claudeAccount` is
+    // #392's spelling of the Claude one). Fail closed on an unknown account —
+    // creating the session on some other credential would bill the wrong one.
+    const landingBackend = providerId ?? this.#providers.defaultId;
+    if (msg.account && msg.claudeAccount && landingBackend === "claude" && msg.account !== msg.claudeAccount) {
+      return { type: "response.error", requestId: msg.id, error: "account and claudeAccount name different Claude accounts — send one", code: "invalid_request" };
+    }
+    const createAccount = msg.account ?? (landingBackend === "claude" ? msg.claudeAccount : undefined);
+    if (createAccount || msg.claudeAccount) {
+      const refused = this.#accountsWriteRefusal(msg.id, auth);
+      if (refused) return refused;
+    }
+    if (createAccount) {
+      if (!backendHasAccounts(landingBackend) || !this.#accounts.has(landingBackend, createAccount)) {
+        return {
+          type: "response.error",
+          requestId: msg.id,
+          error: `Unknown ${landingBackend} account "${createAccount}" — see \`codeoid account ls --backend ${landingBackend}\``,
+          code: "invalid_request",
+        };
+      }
+    }
+
     // Plan the role-children BEFORE creating anything, so a fan-out over the
     // ceiling rejects the request outright instead of leaving a half-built
     // collaboration behind.
@@ -3720,7 +4018,9 @@ mcpHub: this.#mcpHub,
       transcriptStore: this.#transcriptStore,
       providers: this.#providers,
       claudeAccounts: this.#claudeAccounts,
+      // The Claude choice also when the session lands elsewhere: it applies if it is switched to Claude.
       claudeAccount: msg.claudeAccount || null,
+      ...(createAccount ? { accountChoices: { [landingBackend]: createAccount } } : {}),
       hooks: this.#hooks,
       // Derived above for a collaborative session; otherwise msg.providerId.
       providerId,
@@ -4103,6 +4403,9 @@ mcpHub: this.#mcpHub,
           transcriptStore: this.#transcriptStore,
           providers: this.#providers,
           claudeAccounts: this.#claudeAccounts,
+          // The collaboration runs on the accounts its lead was created on.
+          claudeAccount: parent.claudeAccount,
+          accountChoices: parent.accountChoices,
           hooks: this.#hooks,
           providerId: child.providerId,
           defaultModel: child.model,
@@ -4224,11 +4527,17 @@ mcpHub: this.#mcpHub,
     // The fork keeps running on the parent's Claude account, and choosing what
     // a session runs on (and bills) is `settings:write` — a fork or a compare
     // must not be a way around that.
-    if (parent.claudeAccount !== null && !hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) {
+    // Named accounts only: a pin to the built-in `default` chooses no one's credential.
+    const parentChoices = Object.entries(parent.accountChoices).filter(([, name]) => name !== DEFAULT_ACCOUNT);
+    if (parentChoices.length > 0 && (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE) || auth.delegationDepth > 0)) {
+      const [backend, name] = parentChoices[0]!;
       return {
         type: "response.error",
         requestId: msg.id,
-        error: `This session runs on Claude account "${parent.claudeAccount}"; forking it needs settings:write`,
+        error:
+          backend === "claude"
+            ? `This session runs on Claude account "${name}"; forking it needs settings:write from an undelegated token`
+            : `This session runs on the ${backend} account "${name}"; forking it needs settings:write from an undelegated token`,
         code: "forbidden",
       };
     }
@@ -4458,8 +4767,9 @@ mcpHub: this.#mcpHub,
         transcriptStore: this.#transcriptStore,
         providers: this.#providers,
         claudeAccounts: this.#claudeAccounts,
-        // A fork continues the same conversation — on the same account.
+        // A fork continues the same conversation — on the same accounts.
         claudeAccount: parent.claudeAccount,
+        accountChoices: parent.accountChoices,
         hooks: this.#hooks,
         providerId,
         forkedFrom: {

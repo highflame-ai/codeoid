@@ -41,6 +41,7 @@
 import { existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { defaultCodexHome, defaultGeminiCliRoot, defaultPiAgentDir } from "./account-apply.js";
 
 export type SecretPathVerdict = { action: "deny" | "ask"; path: string } | null;
 
@@ -69,6 +70,8 @@ function isSecretConfigFile(name: string): boolean {
   return (
     name === "claude-accounts.json" ||
     name.startsWith("claude-accounts.json.") || // atomicWrite temp files
+    name === "accounts.json" || // every backend's accounts (accounts.ts)
+    name.startsWith("accounts.json.") ||
     name === "endpoints.json" || // OpenAI-compatible endpoint keys
     name.startsWith("endpoints.json.") ||
     name === "config.json" ||
@@ -88,8 +91,12 @@ function cliCredentialFiles(): string[] {
   return [
     join(claudeDir, ".credentials.json"),
     join(home, ".codex", "auth.json"),
-    join(home, ".qwen", "oauth_creds.json"),
-    join(home, ".gemini", "oauth_creds.json"),
+    join(defaultCodexHome(), "auth.json"),
+    join(process.env.QWEN_HOME || join(home, ".qwen"), "oauth_creds.json"),
+    join(defaultGeminiCliRoot(), ".gemini", "oauth_creds.json"),
+    join(defaultGeminiCliRoot(), ".gemini", "google_accounts.json"),
+    join(defaultGeminiCliRoot(), ".gemini", "gemini-credentials.json"),
+    join(defaultPiAgentDir(), "auth.json"),
   ];
 }
 
@@ -97,8 +104,8 @@ function cliCredentialFiles(): string[] {
 const PROC_SECRET = /^\/proc\/[^/]+(?:\/task\/[^/]+)?\/(?:environ|mem|fd|fdinfo|map_files)(?:\/|$)/;
 /** `/proc`, `/proc/<pid>`, `/proc/<pid>/task[/<tid>]` — roots a search would recurse into the above from. */
 const PROC_ROOT = /^\/proc(?:\/(?:\d+|self|thread-self)(?:\/task(?:\/\d+)?)?)?$/;
-/** A named-account login's throwaway Claude config dir (auth/backend-login.ts). */
-const LOGIN_DIR = /(?:^|\/)codeoid-claude-login-[^/]*(?:\/|$)/;
+/** A named-account login's staging home (auth/backend-login.ts), current and #392's prefix. */
+const LOGIN_DIR = /(?:^|\/)codeoid-(?:claude-)?login-[^/]*(?:\/|$)/;
 
 /** Case-insensitive filesystems (macOS default): `~/.CODEOID/Config.json` opens the same file. */
 const FOLD = process.platform === "darwin" || process.platform === "win32";
@@ -169,6 +176,10 @@ export function secretPathVerdict(
     if (norm(dirname(p)) === norm(configDir) && isSecretConfigFile(norm(basename(p)))) return { action: "deny", path: raw };
     if (secretFiles.some((f) => norm(f) === norm(p))) return { action: "deny", path: raw };
     if (LOGIN_DIR.test(p)) return { action: "deny", path: raw };
+    // An account's home (accounts.ts): its own files are its credential. The
+    // shared entries are symlinks, which `real` has already resolved to the
+    // vendor's default home — so anything still under here is account-owned.
+    if (norm(p).startsWith(`${norm(join(configDir, "accounts"))}/`)) return { action: "deny", path: raw };
     if (norm(p) === norm(claudeJson)) verdict = { action: "ask", path: raw };
     // A root that CONTAINS one of them (the dir itself, home, /) reaches it
     // by recursion; so does `/proc` itself.

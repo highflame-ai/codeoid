@@ -410,6 +410,10 @@ async function handle(frame: Record<string, unknown>): Promise<void> {
       break;
     }
     case "thread/resume":
+      // A thread this codex home doesn't have (another account's, a pruned rollout).
+      if (String(params.threadId ?? "").startsWith("missing-")) {
+        return void send({ id, error: { code: -32600, message: "thread not found" } });
+      }
       send({ id, result: { thread: { id: String(params.threadId ?? "codex-thread-1") } } });
       break;
     case "model/list":
