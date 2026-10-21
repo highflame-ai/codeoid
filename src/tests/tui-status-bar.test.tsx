@@ -51,6 +51,16 @@ describe("TUI StatusBar", () => {
     expect(out).toContain("$1.23");
   });
 
+  it("a missing account and the backend stay visible once the session has usage", () => {
+    const usage = { inputTokens: 91_000, outputTokens: 12_000, cacheReadTokens: 80_000, cacheCreationTokens: 4_000, totalCostUsd: 3.21, numTurns: 9, durationMs: 1000 };
+    const missing = (cols: number) => bar(session({ model: "claude-opus-4-8", claudeAccount: "gone", effectiveClaudeAccount: "gone (missing)", usage }), cols);
+    expect(missing(120)).toContain("account: gone (missing)");
+    expect(missing(100)).toContain("account: gone"); // narrower: the warning still beats usage
+    const endpoint = bar(session({ providerId: "oai:box", model: "qwen3-coder", usage }), 120);
+    expect(endpoint).toContain("on oai:box");
+    expect(endpoint).toContain("$3.21");
+  });
+
   it("shows a pinned account", () => {
     const out = bar(session({ claudeAccount: "work", effectiveClaudeAccount: "work" }), 300);
     expect(out).toContain("account: work");

@@ -123,7 +123,7 @@ export function NewSessionModal({ providers, client, onSubmit, onCancel }: Props
       </Text>}
       {effectiveProvider === "claude" && accountError && <Text color="yellow">Account choices unavailable: {accountError}</Text>}
       {error && <Text color="red">{error}</Text>}
-      <Text dimColor>{busy ? "Creating…" : "Tab switches fields · ←→ chooses provider/account · Enter creates · Esc cancels"}</Text>
+      <Text dimColor>{busy ? "Creating… (Esc hides this; the session is still created)" : "Tab switches fields · ←→ chooses provider/account · Enter creates · Esc cancels"}</Text>
     </Box>
   );
 }

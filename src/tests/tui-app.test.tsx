@@ -34,7 +34,19 @@ class FakeClient {
   stop() {}
   async attachSession() { return ok; }
   async setModel(sessionId: string, model: string) { this.calls.push(["setModel", sessionId, model]); return this.reply; }
-  async setProvider(sessionId: string, providerId: string) { this.calls.push(["setProvider", sessionId, providerId]); return this.reply; }
+  /** Like the daemon: a switch broadcasts the session's new info BEFORE the reply. */
+  async setProvider(sessionId: string, providerId: string) {
+    this.calls.push(["setProvider", sessionId, providerId]);
+    if (this.reply.type === "response.ok") this.dispatch({ type: "session.info", session: info(sessionId, "alpha", { providerId }) });
+    await Bun.sleep(20);
+    return this.reply;
+  }
+  async createSession(name: string) {
+    this.calls.push(["createSession", name]);
+    await Bun.sleep(150);
+    return { type: "response.ok", requestId: "r", data: info("s9", name) } as unknown as DaemonMessage;
+  }
+  async send(sessionId: string, text: string) { this.calls.push(["send", sessionId, text]); return ok; }
   async setClaudeAccount(sessionId: string, account: string | null) { this.calls.push(["setClaudeAccount", sessionId, account]); return this.reply; }
   async listClaudeAccounts() { return { defaultAccount: "default", accounts: [] }; }
   async listModels() { return { live: true, models: [] }; }
@@ -147,6 +159,65 @@ describe("TUI App — backend slash commands", () => {
       expect(ui.frame()).toContain("No session focused");
     }
     expect(ui.client().calls).toEqual([]);
+  });
+});
+
+describe("TUI App — a dialog owns the keyboard", () => {
+  it("a successful provider pick closes the picker, though the info update lands first", async () => {
+    const ui = await mountApp();
+    await ui.act({ type: "providers.set", providers: [
+      { id: "claude", displayName: "Claude", kind: "builtin", isDefault: true },
+      { id: "oai:box", displayName: "GPU box", kind: "endpoint", isDefault: false },
+    ] });
+    await ui.sessions([info("s1", "alpha")]);
+    await ui.run("/provider");
+    await waitFor(() => ui.frame().includes("Select provider for alpha"));
+    await ui.press("\u001b[B");
+    await ui.press("\r");
+    await waitFor(() => !ui.frame().includes("Select provider"), ui.frame);
+    expect(ui.client().calls).toEqual([["setProvider", "s1", "oai:box"]]);
+  });
+
+  it("arrows and Enter in a picker never recall or re-send prompt history", async () => {
+    const ui = await mountApp();
+    await ui.sessions([info("s1", "alpha")]);
+    await ui.run("hello world");
+    expect(ui.client().calls).toEqual([["send", "s1", "hello world"]]);
+    await ui.run("/provider");
+    await waitFor(() => ui.frame().includes("Select provider for alpha"));
+    await ui.press("\u001b[A");
+    await ui.press("\u001b[A");
+    await ui.press("\r");
+    await Bun.sleep(50);
+    expect(ui.client().calls.filter(([call]) => call === "send")).toHaveLength(1);
+  });
+
+  it("typing and Enter in the new-session dialog never reach the focused session", async () => {
+    const ui = await mountApp();
+    await ui.sessions([info("s1", "alpha")]);
+    await ui.press("\u000e"); // Ctrl-N
+    await ui.press("abc");
+    await ui.press("\r");
+    await Bun.sleep(50);
+    expect(ui.client().calls.filter(([call]) => call === "send")).toEqual([]);
+  });
+});
+
+describe("TUI App — Esc during a create", () => {
+  it("the session is still created, but focus stays where the user went", async () => {
+    const ui = await mountApp();
+    await ui.sessions([info("s1", "alpha")]);
+    await ui.press("\u000e"); // Ctrl-N
+    await ui.press("late");
+    await ui.press("\t");
+    await ui.press("/tmp");
+    await ui.press("\r");
+    await waitFor(() => ui.frame().includes("Creating…"), ui.frame);
+    await ui.press("\u001b");
+    await waitFor(() => !ui.frame().includes("New Session"), ui.frame);
+    await Bun.sleep(250);
+    expect(ui.client().calls).toEqual([["createSession", "late"]]);
+    expect(ui.frame()).toContain("alpha ·");
   });
 });
 

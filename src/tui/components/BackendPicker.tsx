@@ -105,7 +105,8 @@ export function BackendPicker({ kind, provider, sessionName, current, providers,
     <Box flexDirection="column" borderStyle="double" borderColor="cyan" paddingX={1}>
       <Text bold color="cyan">Select {kind}{kind === "model" ? ` (${provider})` : ""}{sessionName ? ` for ${sessionName}` : ""}</Text>
       {loading ? <Text dimColor>Loading…</Text> : options.slice(start, start + 8).map((choice, offset) => (
-        <Box key={choice.value} flexDirection="column">
+        // A server may list an id twice: the position keeps keys unique.
+        <Box key={`${start + offset}:${choice.value}`} flexDirection="column">
           <Text color={start + offset === index ? "cyan" : undefined}>
             {start + offset === index ? "▸ " : "  "}{choice.label}{choice.value === current ? " ●" : ""}
           </Text>
@@ -116,10 +117,11 @@ export function BackendPicker({ kind, provider, sessionName, current, providers,
       {/* Only an endpoint can be asked for its live list on demand; a
           built-in backend reports its full catalog from inside a turn. */}
       {!loading && kind === "model" && !live && <Text dimColor>{provider.startsWith("oai:")
-        ? "Cached catalog — press r to refresh."
+        // An endpoint's list is live unless its /models just failed.
+        ? "Couldn't reach the endpoint's /models — showing configured models; press r to retry."
         : "Saved catalog — the current list appears after this backend's next turn."}</Text>}
       {error && <Text color="red">{error}</Text>}
-      <Text dimColor>{busy ? "Switching…" : "↑↓ navigate · Enter to select · r refresh · Esc cancel"}</Text>
+      <Text dimColor>{busy ? "Switching… (Esc hides this; the switch still applies)" : "↑↓ navigate · Enter to select · r refresh · Esc cancel"}</Text>
     </Box>
   );
 }

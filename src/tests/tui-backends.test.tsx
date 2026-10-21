@@ -141,18 +141,18 @@ describe("TUI backend dialogs", () => {
     expect(closes).toBe(1);
   });
 
-  it("offers on-demand refresh only for an endpoint's cached catalog", async () => {
+  it("offers a retry only for an endpoint whose /models failed", async () => {
     const client = { listModels: async () => ({ live: false, models: [{ value: "m1", displayName: "Model one" }] }) } as unknown as TuiWsClient;
     const builtin = await mount(<BackendPicker kind="model" provider="codex" sessionName="feature-auth" current="" providers={providers} client={client}
       onPick={async () => {}} onCancel={() => {}} />);
     await waitFor(() => builtin.frame().includes("Model one"));
     expect(builtin.frame()).toContain("for feature-auth");
     expect(builtin.frame()).toContain("appears after this backend's next turn");
-    expect(builtin.frame()).not.toContain("press r to refresh");
+    expect(builtin.frame()).not.toContain("press r to retry");
     const endpoint = await mount(<BackendPicker kind="model" provider="oai:box" current="" providers={providers} client={client}
       onPick={async () => {}} onCancel={() => {}} />);
     await waitFor(() => endpoint.frame().includes("Model one"));
-    expect(endpoint.frame()).toContain("press r to refresh");
+    expect(endpoint.frame()).toContain("press r to retry");
   });
 
   it("says a name is required instead of ignoring Enter", async () => {

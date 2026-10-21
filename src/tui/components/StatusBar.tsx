@@ -154,6 +154,14 @@ export function StatusBar({
               </Text>
             </>
           )}
+          {/* The backend sits with the model (Claude is implied by its
+              model id), and a MISSING account too — it fails the next turn,
+              so it must never be truncated away behind usage. A working
+              account is a descriptor and goes at the end. */}
+          {(focused.info.providerId ?? "claude") !== "claude" && (
+            <Text dimColor>{` on ${focused.info.providerId}`}</Text>
+          )}
+          {account?.missing && <Text color="red">{` · account: ${account.label}`}</Text>}
           {focused.info.pinnedFiles && focused.info.pinnedFiles.length > 0 && (
             <>
               <Text dimColor>{" · pinned: "}</Text>
@@ -250,16 +258,14 @@ export function StatusBar({
           <Text color="red">⚠ {lastError}</Text>
         </>
       )}
-      {/* Static descriptors go last: the line truncates at the terminal
-          edge, and a long workdir must never push the live status, cost,
-          or error off screen. */}
+      {/* The workdir goes last: the line truncates at the terminal edge, and
+          a long path must never push the live status, cost, or error off
+          screen (the focus banner shows it in full). */}
       {focused && (
         <>
-          <Text dimColor>{`   │   ${focused.info.providerId ?? "claude"}`}</Text>
-          {account && (
-            <Text color={account.missing ? "red" : "cyan"}>{` · account: ${account.label}`}</Text>
-          )}
-          <Text dimColor>{` @ ${focused.info.workdir}`}</Text>
+          <Text dimColor>{"   │   "}</Text>
+          {account && !account.missing && <Text color="cyan">{`account: ${account.label} · `}</Text>}
+          <Text dimColor>{`@ ${focused.info.workdir}`}</Text>
         </>
       )}
       </Text>

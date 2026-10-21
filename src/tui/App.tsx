@@ -61,6 +61,9 @@ export function App({ config, createClient = (c, d) => new TuiWsClient(c, d) }: 
   /** Per session, the comparison /compare last started or showed here (#357). */
   const lastCompareRef = useRef<Map<string, string>>(new Map());
   const prevConnectionRef = useRef(state.connection);
+  /** The open dialog as of the last render — for async results that must not act on a dialog the user closed. */
+  const modalRef = useRef(state.modal);
+  modalRef.current = state.modal;
   useEffect(() => {
     const client = wsRef.current;
     // The daemon drops all attachments when the socket closes (they're keyed
@@ -1174,7 +1177,9 @@ export function App({ config, createClient = (c, d) => new TuiWsClient(c, d) }: 
     if (resp.type !== "response.ok" || !resp.data) throw new Error("Unexpected session creation response");
     const info = resp.data as import("../protocol/types.js").SessionInfo;
     dispatch({ type: "session.add", session: info });
-    dispatch({ type: "focus", sessionId: info.id });
+    // Esc'd while creating: the session still exists, but the user has moved
+    // on — don't yank focus (and their next Enter) over to it.
+    if (modalRef.current?.kind === "new-session") dispatch({ type: "focus", sessionId: info.id });
   };
 
   const onSelectSession = (sessionId: string) => {
@@ -1300,6 +1305,7 @@ export function App({ config, createClient = (c, d) => new TuiWsClient(c, d) }: 
           onHistoryCycle={(dir) => dispatch({ type: "history.cycle", direction: dir })}
           hint={promptHint}
           disabled={!focusedSession && !inSlashMode}
+          inputActive={!state.modal}
           slashSelectedIdx={slashIdx}
           fileHint={
             inMentionMode && mention

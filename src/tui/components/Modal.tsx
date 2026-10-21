@@ -88,8 +88,11 @@ export function Modal(props: Props) {
       const provider = target.info.providerId ?? "claude";
       return (
         <BackendPicker
-          // A provider switch changes which catalog the model picker shows.
-          key={`${kind}:${provider}`}
+          // A provider switch changes which catalog the MODEL picker shows. The
+          // provider picker must not remount on it: the daemon's info update
+          // arrives before the switch's reply, and a remount would drop the
+          // close that follows a successful pick.
+          key={kind === "model" ? `model:${provider}` : kind}
           kind={kind}
           provider={provider}
           sessionName={target.info.name}

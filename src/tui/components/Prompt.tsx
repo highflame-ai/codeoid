@@ -19,6 +19,11 @@ interface Props {
   onHistoryCycle: (direction: "prev" | "next") => void;
   hint?: string;
   disabled?: boolean;
+  /**
+   * False while a dialog owns the keyboard: the prompt stays on screen but
+   * takes no keys, or ↑/Enter in a picker would also recall and re-send history.
+   */
+  inputActive?: boolean;
   /** Selected index within the slash-command hint list. */
   slashSelectedIdx?: number;
   /** When set, render the @file mention overlay above the prompt. */
@@ -38,6 +43,7 @@ export function Prompt({
   onHistoryCycle,
   hint,
   disabled,
+  inputActive = true,
   slashSelectedIdx = 0,
   fileHint,
 }: Props) {
@@ -85,6 +91,7 @@ export function Prompt({
             onCursorChange={onCursorChange}
             history={[]}
             onHistoryCycle={onHistoryCycle}
+            disabled={!inputActive}
           />
         )}
       </Box>
