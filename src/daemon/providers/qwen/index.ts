@@ -57,7 +57,7 @@ import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from ".
 import { buildQwenEnv } from "../env.js";
 import type { LLMCallUsage } from "../../context-math.js";
 import type { ResolvedAccount } from "../../accounts.js";
-import { ensureQwenHome } from "../../account-apply.js";
+import { qwenAccountEnv } from "../../account-apply.js";
 
 /** Where qwen-code persists a qwen.ai subscription login. */
 const QWEN_OAUTH_CREDS = join(homedir(), ".qwen", "oauth_creds.json");
@@ -139,6 +139,10 @@ export class QwenProvider implements SessionProvider {
   /** Resolved gateway URL + credential path of the live loop — see #loadCatalog. */
   #currentBaseUrl: string | null = null;
   #currentAuthType: "openai" | "qwen-oauth" | null = null;
+  /** The key the running query was built with — the catalog asks with the same one, never the daemon's for an account's endpoint. */
+  #currentApiKey: string | null = null;
+  /** The running query is on a named account: its catalog isn't the backend's to publish. */
+  #onAccount = false;
   /** Guards backing-session recovery to one attempt — see the consumer's catch. */
   #backingRecoveryAttempted = false;
   /** Last content pushed to the CLI, replayed if recovery fires. */
@@ -276,7 +280,7 @@ export class QwenProvider implements SessionProvider {
     if (this.#currentAuthType !== "openai") return registry;
 
     const baseUrl = this.#currentBaseUrl ?? process.env.OPENAI_BASE_URL;
-    const apiKey = process.env.OPENAI_API_KEY;
+    const apiKey = this.#currentApiKey;
     if (!baseUrl || !apiKey) return registry;
 
     try {
@@ -414,6 +418,8 @@ export class QwenProvider implements SessionProvider {
     this.#currentModel = model ?? null;
     this.#currentBaseUrl = baseUrl ?? null;
     this.#currentAuthType = authType;
+    this.#currentApiKey = account ? (account.account.token ?? null) : (process.env.OPENAI_API_KEY ?? null);
+    this.#onAccount = account !== null;
 
     this.#query = query({
       prompt: this.#inputQueue,
@@ -425,9 +431,8 @@ export class QwenProvider implements SessionProvider {
         env: {
           ...buildQwenEnv(),
           // An account's key, and none of the daemon's (blanked: the SDK merges over process.env).
-          ...(account
-            ? { OPENAI_API_KEY: account.account.token ?? "", DASHSCOPE_API_KEY: "", QWEN_HOME: ensureQwenHome(account) }
-            : {}),
+          // An account: its key and its own home, and none of the daemon's keys.
+          ...(account ? qwenAccountEnv(account, buildQwenEnv()) : {}),
           ...(baseUrl ? { OPENAI_BASE_URL: baseUrl } : {}),
           ...(model ? { OPENAI_MODEL: model } : {}),
         },
@@ -489,7 +494,9 @@ export class QwenProvider implements SessionProvider {
 
     this.#hasQueried = true;
 
-    if (init.onModels) {
+    // Not for a named account: its endpoint and plan aren't every session's,
+    // and the catalog cache is per backend.
+    if (init.onModels && !this.#onAccount) {
       // Fired on every loop build, so a model added to the gateway shows up on
       // the next session rather than waiting for a daemon restart.
       void this.#loadCatalog()

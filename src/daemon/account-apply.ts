@@ -29,6 +29,13 @@ export interface OverlaySpec {
   own: readonly string[];
   /** Entries written as a transformed copy of the source's (or from nothing). */
   copies?: Record<string, (source: string | undefined) => string>;
+  /**
+   * Directories created in the SOURCE before linking — where the vendor keeps
+   * its conversations. Were the account to run first, the vendor would create
+   * them in the account home, private to it, and a switched session could
+   * never resume across accounts.
+   */
+  shared?: readonly string[];
 }
 
 /**
@@ -43,6 +50,7 @@ export function ensureOverlayHome(spec: OverlaySpec): void {
   const own = new Set(spec.own);
   const copies = spec.copies ?? {};
   const source = resolve(spec.source);
+  for (const dir of spec.shared ?? []) mkdirSync(join(source, dir), { recursive: true, mode: 0o700 });
   let entries: string[] = [];
   try {
     entries = readdirSync(source);
@@ -106,6 +114,18 @@ function requireFile(home: string, file: string, what: string, account: Resolved
 
 // ── Codex ─────────────────────────────────────────────────────────────────────
 
+/**
+ * Variables through which Codex can pick up an identity other than the
+ * account's auth.json (CODEX_ACCESS_TOKEN, CODEX_AUTH, OPENAI_API_KEY,
+ * OPENAI_IDENTITY_TOKEN_FILE, OPENAI_FEDERATION_RULE_ID, a base URL, another
+ * home…). An allowlist, like Claude's: every CODEX_* and OPENAI_* goes but a
+ * few that select nothing about who you are.
+ */
+const CODEX_KEEP = new Set(["CODEX_SANDBOX_NETWORK_DISABLED", "CODEX_RS_LOG", "OPENAI_LOG"]);
+export function isCodexCredentialVar(name: string): boolean {
+  return (name.startsWith("CODEX_") || name.startsWith("OPENAI_")) && !CODEX_KEEP.has(name);
+}
+
 /** The vendor's default Codex home. */
 export function defaultCodexHome(env: Record<string, string | undefined> = process.env): string {
   return env.CODEX_HOME || join(env.HOME || homedir(), ".codex");
@@ -120,7 +140,23 @@ const GENERATION_MARKER = ".codeoid-account-generation";
  * (`codex login --with-api-key`), once per generation of the key — the
  * vendor's format, never ours.
  */
-export async function ensureCodexApiKeyLogin(
+/** Logins in flight per account home — two sessions on one account start one `codex login`. */
+const codexLogins = new Map<string, Promise<void>>();
+
+export function ensureCodexApiKeyLogin(
+  account: ResolvedAccount,
+  run: { command: string; argsPrefix: string[]; env: Record<string, string> },
+): Promise<void> {
+  const key = `${account.home}\0${account.fingerprint}`;
+  let running = codexLogins.get(key);
+  if (!running) {
+    running = codexApiKeyLogin(account, run).finally(() => codexLogins.delete(key));
+    codexLogins.set(key, running);
+  }
+  return running;
+}
+
+async function codexApiKeyLogin(
   account: ResolvedAccount,
   run: { command: string; argsPrefix: string[]; env: Record<string, string> },
 ): Promise<void> {
@@ -168,8 +204,8 @@ export async function applyCodexAccount(
   run: { command: string; argsPrefix: string[] },
 ): Promise<Record<string, string>> {
   if (!account) return env;
-  ensureOverlayHome({ source: defaultCodexHome(), target: account.home, own: CODEX_OWN });
-  const out = without(env, (k) => k === "OPENAI_API_KEY" || k === "CODEX_API_KEY" || k === "OPENAI_BASE_URL" || k === "CODEX_HOME");
+  ensureOverlayHome({ source: defaultCodexHome(), target: account.home, own: CODEX_OWN, shared: ["sessions"] });
+  const out = without(env, isCodexCredentialVar);
   if (account.kind === "api-key") await ensureCodexApiKeyLogin(account, { ...run, env: out });
   else requireFile(account.home, "auth.json", "ChatGPT sign-in", account);
   out.CODEX_HOME = account.home;
@@ -183,7 +219,8 @@ export function defaultGeminiCliRoot(env: Record<string, string | undefined> = p
   return env.GEMINI_CLI_HOME || env.HOME || homedir();
 }
 
-const GEMINI_CLI_OWN = ["oauth_creds.json", "google_accounts.json"];
+/** The Gemini CLI's own Google login files — never linked into an API-key account's home. */
+const GEMINI_CLI_OWN = ["oauth_creds.json", "google_accounts.json", "gemini-credentials.json"];
 
 /** settings.json for an account: the default one, with its auth type set to the account's kind. */
 export function geminiAccountSettings(source: string | undefined, authType: string): string {
@@ -211,6 +248,7 @@ export function ensureGeminiCliHome(account: Pick<ResolvedAccount, "home">): voi
     target: join(account.home, ".gemini"),
     own: GEMINI_CLI_OWN,
     copies: { "settings.json": (src) => geminiAccountSettings(src, "gemini-api-key") },
+    shared: ["tmp"],
   });
 }
 
@@ -249,7 +287,7 @@ export function defaultPiAgentDir(env: Record<string, string | undefined> = proc
  */
 export function applyPiAccount(account: ResolvedAccount | null, env: Record<string, string>): Record<string, string> {
   if (!account) return env;
-  ensureOverlayHome({ source: defaultPiAgentDir(), target: account.home, own: ["auth.json"] });
+  ensureOverlayHome({ source: defaultPiAgentDir(), target: account.home, own: ["auth.json"], shared: ["sessions"] });
   const out = without(
     env,
     (k) => k.endsWith("_API_KEY") || k.endsWith("_API_TOKEN") || k === "PI_CODING_AGENT_DIR" || /^(ANTHROPIC|OPENAI|GOOGLE|GEMINI)_/.test(k),
@@ -267,14 +305,69 @@ const REDIRECTING_ENV = new Set([
   "NODE_EXTRA_CA_CERTS", "NODE_TLS_REJECT_UNAUTHORIZED", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_OPTIONS",
 ]);
 
-function envFileKeys(file: string): string[] {
+/**
+ * dotenv's own line grammar (dotenv `parse`, which the Gemini CLI and qwen-code
+ * vendor): `KEY=value` AND `KEY: value`, an optional `export`, quoted values
+ * that span lines. A narrower reading would miss keys the CLI applies.
+ */
+const DOTENV_LINE = /(?:^|^)\s*(?:export\s+)?([\w.-]+)(?:\s*=\s*?|:\s+?)(\s*'(?:\\'|[^'])*'|\s*"(?:\\"|[^"])*"|\s*`(?:\\`|[^`])*`|[^#\r\n]+)?\s*(?:#.*)?(?:$|$)/gm;
+
+/** The keys a `.env` file sets, read as dotenv reads them. */
+export function envFileKeys(file: string): string[] {
+  let text: string;
   try {
-    return readFileSync(file, "utf8")
-      .split("\n")
-      .map((l) => /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/.exec(l)?.[1])
-      .filter((k): k is string => k !== undefined);
+    text = readFileSync(file, "utf8");
   } catch {
     return [];
+  }
+  const keys: string[] = [];
+  for (const m of text.replace(/\r\n?/g, "\n").matchAll(DOTENV_LINE)) if (m[1]) keys.push(m[1]);
+  return keys;
+}
+
+/**
+ * Remove `//` and `/* *\/` comments outside strings — what the CLIs do
+ * (strip-json-comments) before parsing their settings.json.
+ */
+export function stripJsonComments(text: string): string {
+  let out = "";
+  let inString = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]!;
+    if (inString) {
+      out += c;
+      if (c === "\\") {
+        out += text[i + 1] ?? "";
+        i++;
+      } else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') {
+      inString = true;
+      out += c;
+    } else if (c === "/" && text[i + 1] === "/") {
+      while (i < text.length && text[i] !== "\n") i++;
+      out += "\n";
+    } else if (c === "/" && text[i + 1] === "*") {
+      i += 2;
+      while (i < text.length && !(text[i] === "*" && text[i + 1] === "/")) i++;
+      i++;
+    } else out += c;
+  }
+  return out;
+}
+
+/**
+ * A project settings.json as the CLI would read it. A file codeoid can't
+ * parse is treated as one that redirects (fail closed): the CLI's parser
+ * may well accept what this one doesn't.
+ */
+function readProjectSettings(file: string): Record<string, unknown> | "unreadable" {
+  try {
+    const parsed = JSON.parse(stripJsonComments(readFileSync(file, "utf8")).replace(/,(\s*[}\]])/g, "$1"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return "unreadable";
   }
 }
 
@@ -296,12 +389,9 @@ export function geminiProjectOverride(workdir: string): { file: string; key: str
     }
     const settings = join(dir, ".gemini", "settings.json");
     if (existsSync(settings)) {
-      try {
-        const parsed = JSON.parse(readFileSync(settings, "utf8")) as { security?: { auth?: unknown } };
-        if (parsed?.security?.auth !== undefined) return { file: settings, key: "security.auth" };
-      } catch {
-        // Unreadable for the CLI too.
-      }
+      const parsed = readProjectSettings(settings);
+      if (parsed === "unreadable") return { file: settings, key: "(unparseable — codeoid can't tell what it sets)" };
+      if ((parsed.security as { auth?: unknown } | undefined)?.auth !== undefined) return { file: settings, key: "security.auth" };
     }
     if (dirname(dir) === dir) break;
   }
@@ -323,6 +413,22 @@ export function defaultQwenHome(env: Record<string, string | undefined> = proces
 const QWEN_REDIRECTING_SETTINGS = ["modelProviders", "providerProtocol"] as const;
 
 /** The default settings.json without anything that could take an account's key elsewhere. */
+/**
+ * A Qwen account's environment additions over the allowlist: its key, and
+ * every other key, org or project the daemon has set to empty — the SDK merges
+ * over process.env, and an empty value reads as unset (with no .env in the
+ * account home to fill it back in).
+ */
+export function qwenAccountEnv(account: ResolvedAccount, base: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const k of Object.keys(base)) {
+    if (/_API_KEY$|_API_TOKEN$|^OPENAI_|^DASHSCOPE_|^BAILIAN_/.test(k) || (k.startsWith("QWEN_") && k !== "QWEN_HOME")) out[k] = "";
+  }
+  out.OPENAI_API_KEY = account.account.token ?? "";
+  out.QWEN_HOME = ensureQwenHome(account);
+  return out;
+}
+
 export function qwenAccountSettings(source: string | undefined): string {
   let settings: Record<string, unknown> = {};
   try {
@@ -355,8 +461,11 @@ export function ensureQwenHome(account: Pick<ResolvedAccount, "home">): string {
   ensureOverlayHome({
     source: defaultQwenHome(),
     target: account.home,
-    own: ["oauth_creds.json", "oauth_creds.lock"],
+    // Its .env too: qwen-code fills unset variables from it, which would
+    // bring the daemon's own DASHSCOPE / OPENAI keys back.
+    own: ["oauth_creds.json", "oauth_creds.lock", ".env"],
     copies: { "settings.json": qwenAccountSettings },
+    shared: ["projects"],
   });
   return account.home;
 }
@@ -378,20 +487,16 @@ export function qwenProjectOverride(workdir: string): { file: string; key: strin
     }
     const settings = join(dir, ".qwen", "settings.json");
     if (existsSync(settings)) {
-      try {
-        const parsed = JSON.parse(readFileSync(settings, "utf8")) as Record<string, unknown> & {
-          security?: { auth?: unknown };
-          model?: { baseUrl?: unknown };
-          env?: unknown;
-        };
-        for (const k of QWEN_REDIRECTING_SETTINGS) if (parsed?.[k] !== undefined) return { file: settings, key: k };
-        if (parsed?.security?.auth !== undefined) return { file: settings, key: "security.auth" };
-        if (parsed?.model?.baseUrl !== undefined) return { file: settings, key: "model.baseUrl" };
-        if (parsed?.env && typeof parsed.env === "object") {
-          for (const k of Object.keys(parsed.env)) if (isQwenVar(k)) return { file: settings, key: `env.${k}` };
-        }
-      } catch {
-        // Unreadable for the CLI too.
+      const raw = readProjectSettings(settings);
+      if (raw === "unreadable") return { file: settings, key: "(unparseable — codeoid can't tell what it sets)" };
+      const parsed = raw as Record<string, unknown> & { security?: { auth?: unknown }; model?: { baseUrl?: unknown }; env?: unknown };
+      for (const k of QWEN_REDIRECTING_SETTINGS) if (parsed[k] !== undefined) return { file: settings, key: k };
+      // A proxy sees the key in full on an http base URL.
+      if (parsed.proxy !== undefined) return { file: settings, key: "proxy" };
+      if (parsed.security?.auth !== undefined) return { file: settings, key: "security.auth" };
+      if (parsed.model?.baseUrl !== undefined) return { file: settings, key: "model.baseUrl" };
+      if (parsed.env && typeof parsed.env === "object") {
+        for (const k of Object.keys(parsed.env)) if (isQwenVar(k)) return { file: settings, key: `env.${k}` };
       }
     }
     if (dirname(dir) === dir) break;

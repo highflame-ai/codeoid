@@ -38,6 +38,7 @@ import { join } from "node:path";
 import { stripClaudeCredentials } from "../claude-accounts.js";
 import { buildSubprocessEnv } from "../providers/env.js";
 import { resolveCodexCommand } from "../providers/codex/resolve.js";
+import { isCodexCredentialVar } from "../account-apply.js";
 
 /** Longest we hold a started attempt open before killing it. */
 const ATTEMPT_TTL_MS = 10 * 60_000;
@@ -196,7 +197,7 @@ export const CODEX_LOGIN_FLOW: LoginFlow = {
   envPrefixes: ["CODEX_", "OPENAI_", "LC_"],
   stripCredentials: (env) => {
     const out: Record<string, string> = {};
-    for (const [k, v] of Object.entries(env)) if (!(k === "OPENAI_API_KEY" || k === "CODEX_API_KEY" || k === "CODEX_HOME")) out[k] = v;
+    for (const [k, v] of Object.entries(env)) if (!isCodexCredentialVar(k)) out[k] = v;
     return out;
   },
   homeEnv: (home) => ({ CODEX_HOME: home }),
@@ -417,6 +418,7 @@ export class BackendLoginBroker {
       backend,
       verificationUrl: attempt.verificationUrl,
       expiresAt: attempt.expiresAt,
+      expiresInMs: Math.max(0, attempt.expiresAt - Date.now()),
       codeHint: flow.codeHint,
       mode: flow.mode,
       ...(attempt.userCode ? { userCode: attempt.userCode } : {}),

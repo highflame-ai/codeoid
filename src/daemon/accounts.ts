@@ -12,8 +12,8 @@
  * environment; clients get `toAccountInfo`.
  */
 
-import { createHash } from "node:crypto";
-import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { atomicWrite, getConfigDir } from "../config.js";
 import {
@@ -81,6 +81,9 @@ export interface ResolvedAccount {
   /** The account's home dir (process backends; may not exist yet). */
   home: string;
 }
+
+/** How long a removed account's home is kept aside before it is deleted. */
+const TRASH_TTL_MS = 24 * 60 * 60_000;
 
 export class AccountError extends Error {
   override name = "AccountError";
@@ -254,6 +257,14 @@ export class AccountStore {
   readonly #importMarker: string;
   #data: StoreFile | null = null;
   #mtimeMs: number | null = null;
+  /** Backends in the last successful read; null before the first. */
+  #seenBackends: Set<string> | null = null;
+  /**
+   * The legacy claude-accounts.json couldn't be read at import: Claude
+   * accounts and its default are unknown, so Claude fails closed — and only
+   * Claude, never every backend.
+   */
+  #legacyUnreadable = false;
   readonly #listeners = new Set<AccountsListener>();
 
   constructor(opts: { path?: string; homesRoot?: string; legacyClaudePath?: string | null } = {}) {
@@ -262,6 +273,7 @@ export class AccountStore {
     this.#homesRoot = opts.homesRoot ?? join(dir, "accounts");
     this.#legacyClaudePath = opts.legacyClaudePath === undefined ? join(dir, "claude-accounts.json") : opts.legacyClaudePath;
     this.#importMarker = `${this.#path}.claude-imported`;
+    this.#sweepTrash();
   }
 
   /** Called after every change, with the backend it touched. */
@@ -281,11 +293,17 @@ export class AccountStore {
   #load(): StoreFile {
     const mtime = this.#fileMtime();
     if (this.#data && mtime === this.#mtimeMs) return this.#data;
-    const reloaded = this.#data !== null;
+    // The backends known before this read — kept across a failed parse, so a
+    // file that was broken and is now fixed still tells the sessions.
+    const before = this.#seenBackends;
     this.#data = mtime === -1 ? this.#imported() : this.#read();
     // Re-stat: an import has just written the file.
     this.#mtimeMs = this.#fileMtime();
-    if (reloaded) for (const backend of Object.keys(this.#data.backends)) this.#notify(backend);
+    const now = new Set(Object.keys(this.#data.backends));
+    this.#seenBackends = now;
+    // Every backend that was or is in the file: one deleted by hand (or the
+    // whole file) has sessions to tell as much as one that was edited.
+    if (before !== null) for (const backend of new Set([...before, ...now])) this.#notify(backend);
     return this.#data;
   }
 
@@ -297,7 +315,7 @@ export class AccountStore {
       // Fail closed (a default may name an account we can no longer read), and
       // not the parser's message: it can quote a slice of the file — a token.
       this.#data = null;
-      throw new AccountError(`${this.#path} is not valid JSON — fix or remove it`);
+      throw new AccountError(`${this.#path} is not valid JSON — fix it (removing it signs every session out of its named account)`);
     }
     const backends: Record<string, BackendEntry> = {};
     const raw = parsed.backends && typeof parsed.backends === "object" ? (parsed.backends as Record<string, Partial<BackendEntry>>) : {};
@@ -335,8 +353,12 @@ export class AccountStore {
     try {
       parsed = JSON.parse(readFileSync(this.#legacyClaudePath, "utf8")) as typeof parsed;
     } catch {
-      throw new AccountError(`${this.#legacyClaudePath} is not valid JSON — fix or remove it`);
+      // Nothing written and no marker: once the file is fixed, the next start imports it.
+      if (!this.#legacyUnreadable) console.error(`[codeoid] ${this.#legacyClaudePath} is not valid JSON — Claude accounts are unavailable until it's fixed`);
+      this.#legacyUnreadable = true;
+      return data;
     }
+    this.#legacyUnreadable = false;
     const accounts: StoredAccount[] = [];
     for (const a of Array.isArray(parsed.accounts) ? parsed.accounts : []) {
       try {
@@ -362,6 +384,7 @@ export class AccountStore {
   #write(data: StoreFile): void {
     atomicWrite(this.#path, `${JSON.stringify(data, null, 2)}\n`, 0o600);
     this.#data = data;
+    this.#seenBackends = new Set([...(this.#seenBackends ?? []), ...Object.keys(data.backends)]);
     this.#mtimeMs = this.#fileMtime();
   }
 
@@ -478,8 +501,41 @@ export class AccountStore {
       },
       backend,
     );
-    rmSync(this.homeOf(backend, name), { recursive: true, force: true });
+    this.#discardHome(backend, name);
     return true;
+  }
+
+  /**
+   * Move an account's home aside instead of deleting it: a busy session's
+   * process may still be running in it (its token refresh, its session file).
+   * Swept once old enough that no turn can still be using it.
+   */
+  #discardHome(backend: string, name: string): void {
+    const home = this.homeOf(backend, name);
+    if (!existsSync(home)) return;
+    const trash = join(this.#homesRoot, ".trash");
+    try {
+      mkdirSync(trash, { recursive: true, mode: 0o700 });
+      renameSync(home, join(trash, `${Date.now()}-${randomBytes(4).toString("hex")}`));
+    } catch {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }
+
+  /** Remove trashed homes older than a day. */
+  #sweepTrash(): void {
+    const trash = join(this.#homesRoot, ".trash");
+    let names: string[];
+    try {
+      names = readdirSync(trash);
+    } catch {
+      return;
+    }
+    const cutoff = Date.now() - TRASH_TTL_MS;
+    for (const n of names) {
+      const at = Number(n.split("-")[0]);
+      if (Number.isFinite(at) && at < cutoff) rmSync(join(trash, n), { recursive: true, force: true });
+    }
   }
 
   /** Remove every account of `backend` (an endpoint was removed). */
@@ -488,7 +544,7 @@ export class AccountStore {
     if (!data.backends[backend]) return;
     const { [backend]: gone, ...backends } = data.backends;
     this.#save({ ...data, backends }, backend);
-    for (const a of gone?.accounts ?? []) rmSync(this.homeOf(backend, a.name), { recursive: true, force: true });
+    for (const a of gone?.accounts ?? []) this.#discardHome(backend, a.name);
   }
 
   setDefault(backend: string, name: string): void {
@@ -506,6 +562,10 @@ export class AccountStore {
    * falling back would run the session on a credential nobody picked.
    */
   resolve(backend: string, choice: string | null): ResolvedAccount | null {
+    this.#load();
+    if (backend === "claude" && this.#legacyUnreadable && choice !== DEFAULT_ACCOUNT) {
+      throw new AccountError(`${this.#legacyClaudePath} is not valid JSON — fix it; Claude accounts are unavailable until then`);
+    }
     const name = choice ?? this.getDefault(backend);
     if (name === DEFAULT_ACCOUNT) return null;
     const account = this.get(backend, name);

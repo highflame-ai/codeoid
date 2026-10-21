@@ -95,6 +95,7 @@ function cliCredentialFiles(): string[] {
     join(process.env.QWEN_HOME || join(home, ".qwen"), "oauth_creds.json"),
     join(defaultGeminiCliRoot(), ".gemini", "oauth_creds.json"),
     join(defaultGeminiCliRoot(), ".gemini", "google_accounts.json"),
+    join(defaultGeminiCliRoot(), ".gemini", "gemini-credentials.json"),
     join(defaultPiAgentDir(), "auth.json"),
   ];
 }

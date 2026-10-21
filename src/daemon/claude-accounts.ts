@@ -284,7 +284,7 @@ export class ClaudeAccountStore {
     return this.get(input.name)!;
   }
 
-  /** Remove an account. Clears the default if it was the default. Returns whether it existed. */
+  /** Remove an account. Refused for the default account (set another first). Returns whether it existed. */
   remove(name: string): boolean {
     return this.store.remove("claude", name);
   }
@@ -306,6 +306,10 @@ export class ClaudeAccountStore {
     // account (the daemon's own environment) whatever the default is.
     let name: string;
     try {
+      // Through the store first: it fails closed when Claude's accounts can't
+      // be read (an unreadable legacy file), even for a session following a
+      // default that would otherwise read as the built-in one.
+      if (sessionChoice !== CLAUDE_DEFAULT_ACCOUNT) this.store.resolve("claude", sessionChoice);
       name = sessionChoice ?? this.getDefault();
     } catch (err) {
       // An unreadable accounts file: say that, not "no longer exists".

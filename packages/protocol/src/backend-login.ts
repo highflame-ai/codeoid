@@ -63,6 +63,12 @@ export interface PendingBackendLogin {
   verificationUrl: string;
   /** Epoch ms after which the daemon abandons the attempt and kills the command. */
   expiresAt: number;
+  /**
+   * The same deadline as a duration from when the daemon answered — what a
+   * client should time against, since its clock may not agree with the
+   * daemon's.
+   */
+  expiresInMs?: number;
   /** One line naming what the user does next — wording is vendor-specific. */
   codeHint: string;
   /**

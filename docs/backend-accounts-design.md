@@ -60,7 +60,8 @@ Each such account gets a home under `<configDir>/accounts/<backend>/<name>/` (07
 Sharing everything but the credential is what lets a switched session resume natively: Codex's thread, pi's session file and Qwen's session live where every account can read them.
 A backend whose native resume fails after a switch falls back to codeoid's canonical history (`Session.#seedProviderFromHistory`), never to an empty conversation.
 
-Removing an account deletes its home.
+Removing an account moves its home aside (a busy session's process may still be using it); it is deleted a day later.
+The directories a vendor keeps its conversations in (Codex `sessions/`, Qwen `projects/`, the Gemini CLI's `tmp/`, pi's `sessions/`) are created in the shared home before linking, so an account that runs first can't make them private to itself.
 
 ## Sign-in
 
@@ -106,6 +107,7 @@ A cloned repository can try to redirect a named account's credential.
 Claude's `.claude/settings*.json` check is unchanged.
 The Gemini CLI reads `.env` and `.gemini/.env` from the workdir upward and `.gemini/settings.json`; a named Gemini CLI account refuses to run in a workdir whose project files set a credential, base URL, proxy variable or auth type, naming the file.
 qwen-code loads a workspace `.qwen/settings.json` (folder trust is off by default) whose `modelProviders` entry wins over the base URL and key codeoid gives it, and `.qwen/.env` / `.env` upward; a named Qwen account refuses to run in a workdir that sets `modelProviders`, `providerProtocol`, `security.auth`, `model.baseUrl` or an `OPENAI_*` / `DASHSCOPE_*` / `QWEN_*` / proxy variable there.
+Project files are read the way the CLIs read them — `.env` with dotenv's grammar (`KEY=value` and `KEY: value`), settings.json with comments stripped — and a settings file codeoid can't parse is refused rather than skipped.
 A Qwen account also runs in its own `QWEN_HOME` — an overlay whose `settings.json` is the user's without those keys — so the user's own provider entries can't route the account's key elsewhere either.
 Codex project config was checked against codex-cli 0.154 and can't redirect its auth; pi's project files are not checked (pi isn't verified here), and like every backend it runs project code as the daemon user, which no per-account check contains.
 
@@ -117,6 +119,8 @@ Any change — through codeoid or by hand — re-checks the sessions on that bac
 Session meta stores `accounts: {<backend>: <choice>}`; an old `claudeAccount` is read as the `claude` entry.
 
 ## Not in scope
+
+- Sessions started by codeoid itself — dispatch workers, routines, pipelines, the conductor — follow each backend's default account, not the account of the session that started them; a collaboration's children do inherit their lead's.
 
 - Per-account model catalogs: the catalog is per backend, so accounts on different plans share one list.
 - Accounts behind the Highflame gateway launch remain refused for Claude (they would route around it); other backends are unaffected.

@@ -86,7 +86,10 @@ describe("ClaudeAccountStore", () => {
   test("a corrupt store fails closed; an invalid hand-edited entry is ignored, never applied", () => {
     const path = join(dir, "claude-accounts.json");
     writeFileSync(path, "{not json");
-    expect(() => storeAt().list()).toThrow(/not valid JSON/);
+    // Fails closed for Claude (not for every backend): no session runs on an
+    // account — or a default — that can't be read.
+    expect(() => storeAt().resolve(null)).toThrow(/not valid JSON/);
+    rmSync(join(dir, "accounts.json"), { force: true });
     writeFileSync(
       path,
       JSON.stringify({

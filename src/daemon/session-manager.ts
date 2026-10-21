@@ -14,7 +14,7 @@ import { dirname, join, resolve, sep } from "node:path";
 import { type ForkPoint, RewindError, SendStoppedError, Session, type AttachedClient, type WindowScope } from "./session.js";
 import { sweepCheckpoints } from "./checkpoints.js";
 import type { CompareRunRow } from "./store.js";
-import { type CompareState, type CompareTargetState, type ErrorCode, LIMITS, backendHasAccounts, type AccountKind } from "../protocol/types.js";
+import { type CompareState, type CompareTargetState, type ErrorCode, LIMITS, backendHasAccounts, DEFAULT_ACCOUNT, type AccountKind } from "../protocol/types.js";
 import { type CatalogEntry, isPlaceholderModel, type SessionProvider } from "./providers/interface.js";
 import {
   createDefaultProviderRegistry,
@@ -2436,6 +2436,12 @@ mcpHub: this.#mcpHub,
       if (!waiting) {
         waiting = (async () => {
           const outcome = await this.#backendLogin.wait(msg.loginId);
+          // Still open = this wasn't a device login (a code login answered
+          // "paste it instead"): its account mapping and outcome stay for submit.
+          if (this.#backendLogin.isOpen(msg.loginId)) {
+            this.#loginWaits.delete(msg.loginId);
+            return { ok: false, ...(outcome.error ? { error: outcome.error } : {}) };
+          }
           const pending = this.#accountLogins.get(msg.loginId);
           this.#accountLogins.delete(msg.loginId);
           const error = this.#storeLoginOutcome(outcome, pending);
@@ -2589,7 +2595,8 @@ mcpHub: this.#mcpHub,
     } catch (err) {
       return this.#accountsError(msg.id, err);
     }
-    this.#store.audit(auth.sub, "accounts.set_default", "", `backend=${msg.backend} name=${msg.name}`);    return this.#accountsResult(msg.id);
+    this.#store.audit(auth.sub, "accounts.set_default", "", `backend=${msg.backend} name=${msg.name}`);
+    return this.#accountsResult(msg.id);
   }
 
   /** Choose a session's account for a backend (default: its current one). `settings:write`, undelegated. */
@@ -2614,7 +2621,7 @@ mcpHub: this.#mcpHub,
    */
   #refreshSessionsOn(backend: string): void {
     for (const session of this.#sessions.values()) {
-      if (session.toInfo().providerId === backend) session.refreshAccount();
+      if (session.providerId === backend) session.refreshAccount();
     }
   }
 
@@ -4520,7 +4527,8 @@ mcpHub: this.#mcpHub,
     // The fork keeps running on the parent's Claude account, and choosing what
     // a session runs on (and bills) is `settings:write` — a fork or a compare
     // must not be a way around that.
-    const parentChoices = Object.entries(parent.accountChoices);
+    // Named accounts only: a pin to the built-in `default` chooses no one's credential.
+    const parentChoices = Object.entries(parent.accountChoices).filter(([, name]) => name !== DEFAULT_ACCOUNT);
     if (parentChoices.length > 0 && (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE) || auth.delegationDepth > 0)) {
       const [backend, name] = parentChoices[0]!;
       return {
