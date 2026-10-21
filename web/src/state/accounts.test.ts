@@ -168,8 +168,16 @@ describe("device sign-in across a dropped connection", () => {
   it("past expiry + the daemon's memory, a dropped wait gives up and points at the list", async () => {
     const OLD = Date.now();
     vi.useFakeTimers({ toFake: ["Date"] });
-    vi.setSystemTime(OLD + 60_000 + 11 * 60_000);
-    const done = startWith(new Error("request r timed out"));
+    clientRequestMock.mockImplementation(async (msg) => {
+      if (msg.type === "backend.login.start") return { type: "backend.login.start.result", requestId: "r", login: DEVICE };
+      if (msg.type === "backend.login.wait") {
+        // The wait outlives the attempt and the daemon's memory of it.
+        vi.setSystemTime(OLD + 60 * 60_000);
+        throw new Error("request r timed out");
+      }
+      return OK;
+    });
+    const done = startAccountLogin("codex", "team");
     expect(await done).toBe(false);
     expect(accountLoginState().error).toMatch(/If you approved it, the account is listed/);
     vi.useRealTimers();
@@ -188,6 +196,28 @@ describe("device sign-in across a dropped connection", () => {
     vi.useRealTimers();
     expect(waits()).toHaveLength(1);
     expect(accountLoginState().error).toMatch(/If you approved it, the account is listed/);
+  });
+
+  it("times against the daemon's duration, not its clock: a browser 20 minutes ahead keeps waiting", async () => {
+    const OLD = Date.now();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(OLD + 20 * 60_000);
+    // The daemon's absolute expiry is long past on this clock, but 10 minutes remain.
+    const answers: unknown[] = [new Error("request r timed out"), { type: "backend.login.wait.result", requestId: "r", ok: true }];
+    clientRequestMock.mockImplementation(async (msg) => {
+      if (msg.type === "backend.login.start") {
+        return { type: "backend.login.start.result", requestId: "r", login: { ...DEVICE, expiresAt: OLD + 60_000, expiresInMs: 10 * 60_000 } };
+      }
+      if (msg.type === "backend.login.wait") {
+        const next = answers.shift();
+        if (next instanceof Error) throw next;
+        return next;
+      }
+      return OK;
+    });
+    const done = startAccountLogin("codex", "team");
+    expect(await done).toBe(true);
+    vi.useRealTimers();
   });
 
   it("a daemon refusal is not a dropped connection: it ends the attempt", async () => {

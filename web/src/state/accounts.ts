@@ -375,6 +375,9 @@ async function finished(): Promise<void> {
 let codeSentBlind = false;
 
 async function waitAccountLogin(mine: number, pending: PendingBackendLogin): Promise<boolean> {
+  // On this browser's clock: the daemon's duration when it sends one (its
+  // absolute `expiresAt` is on the daemon's clock, which may disagree).
+  const expiresAt = Date.now() + (pending.expiresInMs ?? Math.max(pending.expiresAt - Date.now(), 0));
   const tooLate = () => {
     // Past the attempt and the daemon's memory of how it ended (a laptop that
     // slept): asking again would only hear "no longer open". If it went
@@ -390,7 +393,7 @@ async function waitAccountLogin(mine: number, pending: PendingBackendLogin): Pro
     return false;
   };
   for (;;) {
-    if (Date.now() > pending.expiresAt + OUTCOME_KEPT_MS) return tooLate();
+    if (Date.now() > expiresAt + OUTCOME_KEPT_MS) return tooLate();
     let res: BackendLoginWaitResultMsg;
     try {
       const id = newRequestId();
@@ -400,7 +403,7 @@ async function waitAccountLogin(mine: number, pending: PendingBackendLogin): Pro
           waitForResult: (m) => (m.type === "backend.login.wait.result" && m.requestId === id ? m : undefined),
           // The daemon answers by the attempt's expiry at the latest; a margin
           // for the command's clean exit and the round trip.
-          timeoutMs: Math.max(pending.expiresAt - Date.now(), 0) + 30_000,
+          timeoutMs: Math.max(expiresAt - Date.now(), 0) + 30_000,
         },
       );
     } catch (e) {
@@ -409,7 +412,7 @@ async function waitAccountLogin(mine: number, pending: PendingBackendLogin): Pro
         setLogin((s) => ({ ...s, phase: "idle", login: null, reconnecting: false, error: errText(e) }));
         return false;
       }
-      if (Date.now() > pending.expiresAt + OUTCOME_KEPT_MS) return tooLate();
+      if (Date.now() > expiresAt + OUTCOME_KEPT_MS) return tooLate();
       if (connectionStatus().kind !== "connected") {
         setLogin((s) => ({ ...s, reconnecting: true }));
         await new Promise<void>((wake) => (wakeParkedWait = wake));
