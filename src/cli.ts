@@ -45,7 +45,7 @@ import {
 } from "./protocol/types.js";
 import { ALL_SCOPES_STRING } from "./protocol/scopes.js";
 import { TerminalClient } from "./terminal/client.js";
-import { formatAccounts, formatClaudeAccounts, parseHeaderFlags } from "./terminal/claude-accounts.js";
+import { bedrockFromSettings, formatAccounts, formatClaudeAccounts, parseHeaderFlags, parseSettingFlags } from "./terminal/claude-accounts.js";
 import { formatEndpoints, importPiModels, parseModelFlags, parseTokens } from "./terminal/endpoints.js";
 import type { ClientMessage, DaemonMessage, SessionInfo } from "./protocol/types.js";
 import { mcpConfig, mcpHeaders } from "./terminal/mcp-control-cli.js";
@@ -624,6 +624,57 @@ account
       baseUrl: o.baseUrl,
       ...(Object.keys(headers).length > 0 ? { headers } : {}),
     }));
+  });
+
+account
+  .command("add-bedrock <name>")
+  .description(
+    "Claude: add an Amazon Bedrock account — a bearer token for AWS or a Bedrock-compatible endpoint, with its region, model mappings and telemetry settings. The token is read from a prompt or stdin, or --from-settings, never the command line.",
+  )
+  .option("--base-url <url>", "a Bedrock-compatible endpoint (https); omit for AWS itself")
+  .option(
+    "--set <setting>",
+    'a setting, repeatable: "NAME=value", or "NAME" to be asked for its value without echo (e.g. OTEL_EXPORTER_OTLP_HEADERS). Names: AWS_REGION, ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL[_NAME], ANTHROPIC_MODEL, CLAUDE_CODE_SKIP_BEDROCK_AUTH, CLAUDE_CODE_ENABLE_TELEMETRY, OTEL_*, …',
+    (v: string, prev: string[] = []) => [...prev, v],
+    [] as string[],
+  )
+  .option("--from-settings <file>", "take the token, endpoint and settings from a Claude settings file's env block (e.g. ~/.claude/settings.json); --base-url and --set override it")
+  .option("--replace", "replace an existing account of that name")
+  .action(async (name: string, o: { baseUrl?: string; set: string[]; fromSettings?: string; replace?: boolean }) => {
+    try {
+      let fromFile: ReturnType<typeof bedrockFromSettings> = { env: {}, ignored: [] };
+      if (o.fromSettings) {
+        fromFile = bedrockFromSettings(JSON.parse(readFileSync(o.fromSettings, "utf8")));
+        if (fromFile.ignored.length > 0) console.error(`Not taken from ${o.fromSettings} (not Bedrock settings): ${fromFile.ignored.join(", ")}`);
+      }
+      const parsed = parseSettingFlags(o.set ?? []);
+      const secretsAsked = parsed.ask.length + (fromFile.token ? 0 : 1);
+      if (secretsAsked > 1 && !process.stdin.isTTY) {
+        throw new Error('With piped input only the token can be read; pass the other settings as "NAME=value".');
+      }
+      const env = { ...fromFile.env, ...parsed.env };
+      for (const n of parsed.ask) env[n] = (await readSecret(`${n}: `)).trim();
+      const token = fromFile.token ?? (await readSecret("Bedrock bearer token: ")).trim();
+      if (!token) throw new Error("no token entered");
+      const baseUrl = o.baseUrl ?? fromFile.baseUrl;
+      await accountRequest((id) => ({
+        type: "accounts.set",
+        id,
+        backend: "claude",
+        name,
+        kind: "bedrock",
+        token,
+        ...(baseUrl ? { baseUrl } : {}),
+        ...(Object.keys(env).length > 0 ? { env } : {}),
+        ...(o.replace ? { replace: true } : {}),
+      }));
+      if (!process.exitCode && o.fromSettings) {
+        console.log(`The same settings in ${o.fromSettings} still apply to every Claude session, whatever its account — remove them from its env block so only "${name}" uses Bedrock.`);
+      }
+    } catch (err) {
+      console.error(`Error: ${(err as Error).message}`);
+      process.exitCode = 1;
+    }
   });
 
 account

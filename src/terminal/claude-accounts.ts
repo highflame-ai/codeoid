@@ -3,12 +3,13 @@
  * Pure — no I/O — so it is testable.
  */
 
-import type { AccountInfo, BackendAccountsInfo, ClaudeAccountInfo } from "../protocol/types.js";
+import { BEDROCK_SETTINGS, type AccountInfo, type BackendAccountsInfo, type ClaudeAccountInfo } from "../protocol/types.js";
 
 const KIND_LABEL: Record<ClaudeAccountInfo["kind"], string> = {
   subscription: "subscription",
   gateway: "gateway",
   "api-key": "API key",
+  bedrock: "Bedrock",
 };
 
 /** The account list, the default marked. The built-in `default` is always listed first. */
@@ -24,7 +25,9 @@ export function formatClaudeAccounts(accounts: readonly ClaudeAccountInfo[], def
     const detail =
       a.kind === "gateway"
         ? `${a.baseUrl ?? ""}${a.headerNames?.length ? ` (headers: ${a.headerNames.join(", ")})` : ""}`
-        : "";
+        : a.kind === "bedrock"
+          ? (a.baseUrl ?? "AWS")
+          : "";
     lines.push(`  ${mark(a.name)} ${a.name.padEnd(22)} ${KIND_LABEL[a.kind].padEnd(13)} ${detail}`.trimEnd());
   }
   lines.push("");
@@ -50,12 +53,62 @@ export function parseHeaderFlags(flags: readonly string[]): { headers: Record<st
   return { headers, ask };
 }
 
+/**
+ * Parse a repeatable `--set` flag for a Bedrock account: `NAME=value`, or a
+ * bare `NAME` whose value is then asked for without echo (a telemetry header
+ * usually carries a key). Throws on a name a Bedrock account doesn't take.
+ */
+export function parseSettingFlags(flags: readonly string[]): { env: Record<string, string>; ask: string[] } {
+  const env: Record<string, string> = {};
+  const ask: string[] = [];
+  for (const f of flags) {
+    const sep = f.indexOf("=");
+    const name = (sep >= 0 ? f.slice(0, sep) : f).trim();
+    if (!(BEDROCK_SETTINGS as readonly string[]).includes(name)) {
+      throw new Error(`--set takes NAME=value or NAME, with NAME one of ${BEDROCK_SETTINGS.join(", ")}; got ${JSON.stringify(f)}`);
+    }
+    if (sep < 0) ask.push(name);
+    else env[name] = f.slice(sep + 1).trim();
+  }
+  return { env, ask };
+}
+
+/**
+ * A Bedrock account from a Claude settings file's `env` block — the setup
+ * Claude Code reads from `~/.claude/settings.json`, moved into an account.
+ * `ignored` names what the account doesn't take (the caller says so).
+ * Throws when the file doesn't describe Bedrock.
+ */
+export function bedrockFromSettings(parsed: unknown): {
+  token?: string;
+  baseUrl?: string;
+  env: Record<string, string>;
+  ignored: string[];
+} {
+  const raw = parsed && typeof parsed === "object" ? (parsed as { env?: unknown }).env : undefined;
+  if (!raw || typeof raw !== "object") throw new Error("the settings file has no env block");
+  const out: { token?: string; baseUrl?: string; env: Record<string, string>; ignored: string[] } = { env: {}, ignored: [] };
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof v !== "string" || v === "") continue;
+    if (k === "CLAUDE_CODE_USE_BEDROCK") continue; // what the account kind means
+    if (k === "AWS_BEARER_TOKEN_BEDROCK") out.token = v;
+    else if (k === "ANTHROPIC_BEDROCK_BASE_URL") out.baseUrl = v;
+    else if ((BEDROCK_SETTINGS as readonly string[]).includes(k)) out.env[k] = v;
+    else out.ignored.push(k);
+  }
+  if (out.token === undefined && out.baseUrl === undefined && !Object.hasOwn(raw, "CLAUDE_CODE_USE_BEDROCK")) {
+    throw new Error("the settings file doesn't set up Bedrock (no CLAUDE_CODE_USE_BEDROCK, AWS_BEARER_TOKEN_BEDROCK or ANTHROPIC_BEDROCK_BASE_URL)");
+  }
+  return out;
+}
+
 const ANY_KIND_LABEL: Record<AccountInfo["kind"], string> = {
   subscription: "subscription",
   gateway: "gateway",
   "api-key": "API key",
   "chatgpt-login": "ChatGPT sign-in",
   "api-keys": "provider keys",
+  bedrock: "Amazon Bedrock",
 };
 
 /** What the built-in `default` account is, per backend. */
@@ -74,9 +127,9 @@ export function formatAccounts(backends: readonly BackendAccountsInfo[]): string
     lines.push(`  ${mark("default")} ${"default".padEnd(22)} ${builtInDetail(b.backend)}`);
     for (const a of b.accounts) {
       const detail = [
-        a.baseUrl ?? "",
+        a.baseUrl ?? (a.kind === "bedrock" ? "AWS" : ""),
         a.headerNames?.length ? `headers: ${a.headerNames.join(", ")}` : "",
-        a.envNames?.length ? `keys: ${a.envNames.join(", ")}` : "",
+        a.envNames?.length ? `${a.kind === "bedrock" ? "settings" : "keys"}: ${a.envNames.join(", ")}` : "",
       ]
         .filter(Boolean)
         .join("  ");

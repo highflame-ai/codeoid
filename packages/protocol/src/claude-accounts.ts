@@ -31,7 +31,7 @@
  *   (`ANTHROPIC_AUTH_TOKEN`), optionally extra headers (a workspace header).
  * - `api-key`: an Anthropic API key (`ANTHROPIC_API_KEY`).
  */
-export type ClaudeAccountKind = "subscription" | "gateway" | "api-key";
+export type ClaudeAccountKind = "subscription" | "gateway" | "api-key" | "bedrock";
 
 /** The built-in account: the daemon's own environment / `claude login`. Not stored, not removable. */
 export const CLAUDE_DEFAULT_ACCOUNT = "default";

@@ -27,6 +27,8 @@ export interface StoredClaudeAccount {
   token: string;
   baseUrl?: string;
   headers?: Record<string, string>;
+  /** `bedrock` only: settings from BEDROCK_SETTINGS (region, model mappings, telemetry). */
+  env?: Record<string, string>;
   createdAt: string;
   updatedAt: string;
   generation?: number;
@@ -90,6 +92,7 @@ export function isClaudeCredentialVar(name: string): boolean {
   if (name.startsWith("ANTHROPIC_")) return !ANTHROPIC_KEEP.has(name);
   if ((CLAUDE_CREDENTIAL_ENV as readonly string[]).includes(name)) return true;
   return (
+    name === "AWS_BEARER_TOKEN_BEDROCK" ||
     name.startsWith("CLAUDE_CODE_USE_") ||
     /^CLAUDE_CODE_SKIP_[A-Z_]+_AUTH$/.test(name) ||
     name.endsWith("_FILE_DESCRIPTOR") ||
@@ -147,9 +150,10 @@ export function validateAccountInput(input: {
   token: string;
   baseUrl?: string;
   headers?: Record<string, string>;
+  env?: Record<string, string>;
 }): void {
   validateAccountName(input.name);
-  if (!["subscription", "gateway", "api-key"].includes(input.kind)) {
+  if (!["subscription", "gateway", "api-key", "bedrock"].includes(input.kind)) {
     throw new ClaudeAccountError(`unknown account kind ${JSON.stringify(input.kind)}`);
   }
   // Any control character (CR/LF, NUL, …): a NUL makes the spawn throw with
@@ -157,28 +161,33 @@ export function validateAccountInput(input: {
   if (!input.token || CONTROL_CHARS.test(input.token)) {
     throw new ClaudeAccountError("the token must be a single non-empty line with no control characters");
   }
-  if (input.kind === "gateway") {
-    if (!input.baseUrl) throw new ClaudeAccountError("a gateway account needs its base URL");
+  if (input.kind === "gateway" && !input.baseUrl) throw new ClaudeAccountError("a gateway account needs its base URL");
+  if (input.baseUrl !== undefined) {
+    // A Bedrock endpoint is optional: without one the CLI goes to AWS.
+    if (input.kind !== "gateway" && input.kind !== "bedrock") throw new ClaudeAccountError(`a ${input.kind} account has no base URL`);
+    const what = input.kind === "gateway" ? "gateway base URL" : "Bedrock endpoint";
     let url: URL;
     try {
       url = new URL(input.baseUrl);
     } catch {
-      throw new ClaudeAccountError("the gateway base URL isn't a valid URL");
+      throw new ClaudeAccountError(`the ${what} isn't a valid URL`);
     }
     // The URL is shown to anyone who can list accounts: no credentials in it.
     if (url.username || url.password || url.search || url.hash) {
-      throw new ClaudeAccountError("the gateway base URL must not carry credentials, a query string or a fragment — put a key in the token or a header");
+      throw new ClaudeAccountError(`the ${what} must not carry credentials, a query string or a fragment — put a key in the token${input.kind === "gateway" ? " or a header" : ""}`);
     }
     const loopback = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]";
     if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) {
       // The token rides every request; plain http would send it in the clear.
-      throw new ClaudeAccountError("the gateway base URL must be https (http only for localhost)");
+      throw new ClaudeAccountError(`the ${what} must be https (http only for localhost)`);
     }
-  } else {
-    if (input.baseUrl) throw new ClaudeAccountError(`a ${input.kind} account has no base URL`);
-    if (input.headers && Object.keys(input.headers).length > 0) {
-      throw new ClaudeAccountError(`a ${input.kind} account has no extra headers`);
-    }
+  }
+  if (input.kind !== "gateway" && input.headers && Object.keys(input.headers).length > 0) {
+    throw new ClaudeAccountError(`a ${input.kind} account has no extra headers`);
+  }
+  // Which settings a Bedrock account takes is checked by the store.
+  if (input.kind !== "bedrock" && input.env !== undefined) {
+    throw new ClaudeAccountError(`a ${input.kind} account takes no settings`);
   }
   for (const [k, v] of Object.entries(input.headers ?? {})) {
     if (!HEADER_NAME_RE.test(k)) throw new ClaudeAccountError(`invalid header name: ${JSON.stringify(k)}`);
@@ -224,6 +233,15 @@ export function applyAccountEnv(env: Record<string, string>, account: StoredClau
       if (headers.length > 0) out.ANTHROPIC_CUSTOM_HEADERS = headers.map(([k, v]) => `${k}: ${v}`).join("\n");
       break;
     }
+    case "bedrock":
+      // The bearer token wins over any AWS keys or profile in the daemon's
+      // environment (checked against the CLI), so those stay for the agent's
+      // own tools. The account's settings go on top of what the daemon has.
+      for (const [k, v] of Object.entries(account.env ?? {})) out[k] = v;
+      out.CLAUDE_CODE_USE_BEDROCK = "1";
+      out.AWS_BEARER_TOKEN_BEDROCK = account.token;
+      if (account.baseUrl) out.ANTHROPIC_BEDROCK_BASE_URL = account.baseUrl;
+      break;
     default:
       // Never "strip everything and set nothing": the CLI would fall back to
       // the stored login, a credential nobody chose for this session.
@@ -274,7 +292,14 @@ export class ClaudeAccountStore {
   }
 
   /** Add or replace (the #392 contract: `claude.accounts.set` always replaces). */
-  upsert(input: { name: string; kind: ClaudeAccountKind; token: string; baseUrl?: string; headers?: Record<string, string> }): StoredClaudeAccount {
+  upsert(input: {
+    name: string;
+    kind: ClaudeAccountKind;
+    token: string;
+    baseUrl?: string;
+    headers?: Record<string, string>;
+    env?: Record<string, string>;
+  }): StoredClaudeAccount {
     try {
       validateAccountInput(input);
       this.store.upsert({ backend: "claude", ...input, replace: true });
@@ -368,10 +393,17 @@ export class ClaudeAccountStore {
 const REDIRECTING_ENV = new Set([
   "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy",
   "NODE_EXTRA_CA_CERTS", "NODE_TLS_REJECT_UNAUTHORIZED", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_OPTIONS",
-  "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB",
+  "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", "AWS_CA_BUNDLE",
 ]);
 function redirectsCredential(key: string): boolean {
-  return isClaudeCredentialVar(key) || REDIRECTING_ENV.has(key);
+  return (
+    isClaudeCredentialVar(key) ||
+    REDIRECTING_ENV.has(key) ||
+    // Where a Bedrock account's token goes, and where its telemetry (and
+    // the telemetry headers' key) goes.
+    key.startsWith("AWS_ENDPOINT_URL") ||
+    key.startsWith("OTEL_EXPORTER_OTLP_")
+  );
 }
 
 export function projectCredentialOverride(workdir: string): { file: string; key: string } | null {

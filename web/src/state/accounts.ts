@@ -235,13 +235,18 @@ export function kindLabel(backend: string, kind: AccountKind): string {
   return backendAccounts(backend)?.kinds.find((k) => k.kind === kind)?.label ?? kind;
 }
 
+/** What a kind calls its variables, lower-cased for a detail line ("keys" unless it says). */
+function envLabel(backend: string, kind: AccountKind): string {
+  return (backendAccounts(backend)?.kinds.find((k) => k.kind === kind)?.env?.label ?? "keys").toLowerCase();
+}
+
 /** One line of non-secret detail for an account: its kind, and the URL / header / key names it carries. */
 export function accountDetail(a: AccountInfo): string {
   return [
     kindLabel(a.backend, a.kind),
     a.baseUrl,
     a.headerNames?.length ? `headers: ${a.headerNames.join(", ")}` : undefined,
-    a.envNames?.length ? `keys: ${a.envNames.join(", ")}` : undefined,
+    a.envNames?.length ? `${envLabel(a.backend, a.kind)}: ${a.envNames.join(", ")}` : undefined,
   ]
     .filter(Boolean)
     .join(" · ");

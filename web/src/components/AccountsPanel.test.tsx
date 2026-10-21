@@ -311,6 +311,65 @@ describe("AccountsPanel — every backend, forms from the daemon's kinds", () =>
     expect(set).not.toHaveProperty("token");
   });
 
+  it("Claude Bedrock: token, optional endpoint, optional settings — plain text unless secret", async () => {
+    clientRequestMock.mockResolvedValue(result(ALL));
+    const { getByText, getByPlaceholderText, getByLabelText, getAllByLabelText, container, findByText } = render(() => <AccountsPanel />);
+    await findByText("work");
+    fireEvent.click(getByText("+ Amazon Bedrock"));
+    getByText("Settings (optional)");
+    fireEvent.input(getByPlaceholderText("company-max"), { target: { value: "br" } });
+    getByText("Bedrock bearer token (AWS_BEARER_TOKEN_BEDROCK) is required");
+    fireEvent.input(container.querySelector<HTMLInputElement>('input[type="password"]')!, { target: { value: "br-tok" } });
+    // Endpoint and settings are optional: this alone is a complete account.
+    expect((getByText("Add account") as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.input(getByLabelText("Bedrock endpoint (blank = AWS)"), { target: { value: "https://bedrock.example.com/v1" } });
+    fireEvent.click(getByText("+ Setting"));
+    fireEvent.click(getByText("+ Setting"));
+    const [region, headers] = getAllByLabelText("Setting") as HTMLSelectElement[];
+    expect(region!.value).toBe("AWS_REGION");
+    fireEvent.change(headers!, { target: { value: "OTEL_EXPORTER_OTLP_HEADERS" } });
+    // A setting is shown as typed; the telemetry headers (a key) are masked.
+    expect((getByLabelText("AWS_REGION value") as HTMLInputElement).type).toBe("text");
+    expect((getByLabelText("OTEL_EXPORTER_OTLP_HEADERS value") as HTMLInputElement).type).toBe("password");
+    fireEvent.input(getByLabelText("AWS_REGION value"), { target: { value: "us-east-1" } });
+    getByText("every setting needs a value");
+    fireEvent.input(getByLabelText("OTEL_EXPORTER_OTLP_HEADERS value"), { target: { value: "Authorization=Bearer x" } });
+    fireEvent.click(getByText("Add account"));
+    await waitFor(() =>
+      expect(sent()).toContainEqual(
+        expect.objectContaining({
+          type: "accounts.set",
+          backend: "claude",
+          name: "br",
+          kind: "bedrock",
+          token: "br-tok",
+          baseUrl: "https://bedrock.example.com/v1",
+          env: { AWS_REGION: "us-east-1", OTEL_EXPORTER_OTLP_HEADERS: "Authorization=Bearer x" },
+        }),
+      ),
+    );
+  });
+
+  it("Claude Bedrock without settings sends none", async () => {
+    clientRequestMock.mockResolvedValue(result(ALL));
+    const { getByText, getByPlaceholderText, container, findByText } = render(() => <AccountsPanel />);
+    await findByText("work");
+    fireEvent.click(getByText("+ Amazon Bedrock"));
+    fireEvent.input(getByPlaceholderText("company-max"), { target: { value: "aws" } });
+    fireEvent.input(container.querySelector<HTMLInputElement>('input[type="password"]')!, { target: { value: "t" } });
+    fireEvent.click(getByText("Add account"));
+    await waitFor(() => expect(sent()).toContainEqual(expect.objectContaining({ type: "accounts.set", kind: "bedrock", name: "aws" })));
+    const set = sent().find((m) => m.type === "accounts.set")!;
+    expect(set).not.toHaveProperty("env");
+    expect(set).not.toHaveProperty("baseUrl");
+  });
+
+  it("lists a Bedrock account's setting names, never values", async () => {
+    clientRequestMock.mockResolvedValue(result([claude([WORK, { name: "br", kind: "bedrock", envNames: ["AWS_REGION"] }])]));
+    const { findByText } = render(() => <AccountsPanel />);
+    await findByText("Amazon Bedrock · settings: AWS_REGION");
+  });
+
   it("an endpoint takes headers alone — its key is optional", async () => {
     clientRequestMock.mockResolvedValue(result(ALL));
     const { getByText, getByPlaceholderText } = await openBackend("local");

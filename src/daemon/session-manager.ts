@@ -14,7 +14,7 @@ import { dirname, join, resolve, sep } from "node:path";
 import { type ForkPoint, RewindError, SendStoppedError, Session, type AttachedClient, type WindowScope } from "./session.js";
 import { sweepCheckpoints } from "./checkpoints.js";
 import type { CompareRunRow } from "./store.js";
-import { type CompareState, type CompareTargetState, type ErrorCode, LIMITS, backendHasAccounts, DEFAULT_ACCOUNT, type AccountKind } from "../protocol/types.js";
+import { type CompareState, type CompareTargetState, type ErrorCode, LIMITS, backendHasAccounts, DEFAULT_ACCOUNT, type AccountKind, type ClaudeAccountKind } from "../protocol/types.js";
 import { type CatalogEntry, isPlaceholderModel, type SessionProvider } from "./providers/interface.js";
 import {
   createDefaultProviderRegistry,
@@ -2534,10 +2534,11 @@ mcpHub: this.#mcpHub,
         }
         this.#claudeAccounts.upsert({
           name: msg.name,
-          kind: msg.kind as "subscription" | "gateway" | "api-key",
+          kind: msg.kind as ClaudeAccountKind,
           token: msg.token ?? "",
           ...(msg.baseUrl !== undefined ? { baseUrl: msg.baseUrl } : {}),
           ...(msg.headers !== undefined ? { headers: msg.headers } : {}),
+          ...(msg.env !== undefined ? { env: msg.env } : {}),
         });
       } else {
         // An endpoint account is bound to the server the endpoint has now.
