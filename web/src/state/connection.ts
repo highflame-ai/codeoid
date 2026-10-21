@@ -391,6 +391,10 @@ function routeBroadcast(msg: DaemonMessage): void {
       // An endpoint added or removed is a backend with accounts added or removed.
       void import("./accounts").then((m) => m.refreshAccounts()).catch(() => {});
       return;
+    case "accounts.changed":
+      // Another client, a sign-in, or a hand edit changed a backend's accounts.
+      void import("./accounts").then((m) => m.refreshAccounts()).catch(() => {});
+      return;
     case "session.status_change":
       setSessionStatus(msg.sessionId, msg.status);
       return;

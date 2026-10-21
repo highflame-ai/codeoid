@@ -28,7 +28,7 @@ import { fetchSettings, saveSettings, settingsState } from "../state/settings";
 import { relativeTime } from "../lib/format";
 import { BackendLoginPanel } from "./BackendLoginPanel";
 import { McpOAuthControls } from "./McpOAuthControls";
-import { LOGIN_CAPABLE_BACKENDS } from "../protocol/types";
+import { LOGIN_ACCOUNT_ONLY_BACKENDS } from "../protocol/types";
 import type { OwnLoginBackend } from "./BackendLoginPanel";
 import type {
   LoginBackend,
@@ -57,7 +57,7 @@ function isOwnLoginBackend(tabId: string): OwnLoginBackend | null {
  * tab points to Settings → Accounts instead of offering a sign-in that fails.
  */
 function signsInAsAccount(tabId: string): boolean {
-  return LOGIN_CAPABLE_BACKENDS.includes(tabId as LoginBackend) && isOwnLoginBackend(tabId) === null;
+  return LOGIN_ACCOUNT_ONLY_BACKENDS.includes(tabId as LoginBackend);
 }
 
 const [openSignal, setOpenSignal] = createSignal(false);
