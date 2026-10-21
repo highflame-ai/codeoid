@@ -85,17 +85,22 @@ export function Modal(props: Props) {
       // The session the picker was opened for, not whichever is focused now.
       const { kind, sessionId } = props.modal;
       const target = props.sessions.find((s) => s.info.id === sessionId);
-      if (!target) return <SessionGoneModal onCancel={props.onCancel} />;
+      if (!target) return <SessionGoneModal message="That session no longer exists." onCancel={props.onCancel} />;
       const provider = target.info.providerId ?? "claude";
+      // The account picker lists, and applies, the accounts of the backend it
+      // was opened on. If the session has moved to another backend since, it
+      // closes and says so: re-targeting it quietly would offer the other
+      // backend's accounts, and drop the close a pick in flight is owed.
+      if (props.modal.kind === "account" && props.modal.backend !== provider) {
+        return <SessionGoneModal message={`${target.info.name} switched to ${provider} — reopen /account`} onCancel={props.onCancel} />;
+      }
       return (
         <BackendPicker
           // A provider switch changes which catalog the MODEL picker shows. The
           // provider picker must not remount on it: the daemon's info update
           // arrives before the switch's reply, and a remount would drop the
           // close that follows a successful pick.
-          // The account picker lists the accounts of the backend it was
-          // opened on, so it remounts with the backend too.
-          key={kind === "provider" ? kind : `${kind}:${provider}`}
+          key={kind === "model" ? `${kind}:${provider}` : kind}
           kind={kind}
           provider={provider}
           sessionName={target.info.name}
@@ -167,14 +172,17 @@ function SwitchModal({
   );
 }
 
-/** A backend picker whose session was destroyed while it was open. */
-function SessionGoneModal({ onCancel }: { onCancel: () => void }) {
+/**
+ * Replaces a backend picker whose target went away while it was open: the
+ * session was destroyed, or (for the account picker) moved to another backend.
+ */
+function SessionGoneModal({ message, onCancel }: { message: string; onCancel: () => void }) {
   useInput((_input, key) => {
     if (key.escape || key.return) onCancel();
   });
   return (
     <Box flexDirection="column" borderStyle="double" borderColor="red" paddingX={1}>
-      <Text color="red">That session no longer exists.</Text>
+      <Text color="red">{message}</Text>
       <Text dimColor>Esc / Enter to close</Text>
     </Box>
   );

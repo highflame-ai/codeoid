@@ -214,6 +214,36 @@ describe("TUI backend dialogs", () => {
     expect(submissions).toEqual([{ name: "claude-work", workdir: process.cwd(), providerId: "claude", account: "work" }]);
   });
 
+  it("names the backend whose accounts were listed when an account is chosen on the daemon default", async () => {
+    const submissions: unknown[] = [];
+    const requested: string[] = [];
+    const client = accountsClient({ claude: ["work"] }, "default", requested);
+    const ui = await mount(<NewSessionModal providers={providers} client={client} onCancel={() => {}}
+      onSubmit={async (name, workdir, options) => { submissions.push({ name, workdir, ...options }); }} />);
+    await ui.press("on-default");
+    await ui.press("\t");
+    await ui.press("\t");
+    expect(ui.frame()).toContain("provider: Daemon default (Claude)");
+    await ui.press("\t");
+    await waitFor(() => requested.includes("claude") && ui.frame().includes("Follow daemon default (default)"));
+    await ui.press("\u001b[D");
+    expect(ui.frame()).toContain("account: work");
+    await ui.press("\r");
+    // A daemon default changed (or a pack binding) between listing and
+    // creating can't move the Claude account onto another backend.
+    expect(submissions).toEqual([{ name: "on-default", workdir: process.cwd(), providerId: "claude", account: "work" }]);
+  });
+
+  it("leaves the backend to the daemon when no account is chosen", async () => {
+    const submissions: unknown[] = [];
+    const ui = await mount(<NewSessionModal providers={providers} client={accountsClient({ claude: ["work"] })} onCancel={() => {}}
+      onSubmit={async (name, workdir, options) => { submissions.push({ name, workdir, ...options }); }} />);
+    await ui.press("plain");
+    await ui.press("\r");
+    await ui.press("\r");
+    expect(submissions).toEqual([{ name: "plain", workdir: process.cwd() }]);
+  });
+
   it("offers the selected backend's own accounts and sends the one chosen for a Codex session", async () => {
     const submissions: unknown[] = [];
     const requested: string[] = [];

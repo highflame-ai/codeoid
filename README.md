@@ -366,9 +366,13 @@ codeoid account default work --backend codex         # the backend's daemon defa
 codeoid account use review work                      # switch a session, for the backend it is on now
 codeoid account use review --follow-default [--backend <id>]
 codeoid account rm work --backend codex
+codeoid new review ~/src/app --provider codex --account work   # start a session on an account
 ```
 
 `--backend` defaults to `claude` for `login`, `rm` and `default`, and to the session's current backend for `use`.
+`codeoid new … --account <name>` creates a session on that account of the backend it starts on, and is refused if that backend has no such account.
+A backend's default account can't be removed until another default is set, so the sessions following it never move to another credential.
+A named Gemini CLI or Qwen account refuses to run in a workdir whose project files (a `.env`, or `.gemini/` or `.qwen/` settings) would redirect its key, and names the file; see [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for the files each one checks.
 In `codeoid tui`, `/account` opens the picker for the focused session's current backend: its named accounts, the built-in `default`, and following the daemon default.
 `/account <name>` pins a named account, `/account default` pins the built-in one, and `/account --follow-default` follows the daemon default.
 A backend without accounts refuses `/account` and says so.
@@ -477,6 +481,7 @@ codeoid new <name> [workdir]                         # Create session
   --repo <path>                                      #   worktree source (default: cwd)
   --worktree-dir <path>                              #   override target dir
   --provider <id>                                    #   pick a backend for this session
+  --account <name>                                   #   run it on that backend's account (default: the backend's default)
 codeoid attach <session>                             # Readline streaming attach
 codeoid send <session> <message...>                  # One-shot send
 codeoid interrupt <session>                          # Interrupt

@@ -112,6 +112,10 @@ export function StatusBar({
           >
             {focused.info.status}
           </Text>
+          {/* A MISSING account fails the next turn, so it comes right after
+              the status — ahead of the model and backend, whose ids can
+              be long enough to push it off a 100-column terminal. */}
+          {account?.missing && <Text color="red">{` · ⚠ account: ${account.label}`}</Text>}
           {workingSec !== null && (
             <Text color="yellow" dimColor>
               {` · ${formatDuration(workingSec)}`}
@@ -155,13 +159,11 @@ export function StatusBar({
             </>
           )}
           {/* The backend sits with the model (Claude is implied by its
-              model id), and a MISSING account too — it fails the next turn,
-              so it must never be truncated away behind usage. A working
-              account is a descriptor and goes at the end. */}
+              model id). A working account is a descriptor and goes at the
+              end, beside the workdir. */}
           {(focused.info.providerId ?? "claude") !== "claude" && (
             <Text dimColor>{` on ${focused.info.providerId}`}</Text>
           )}
-          {account?.missing && <Text color="red">{` · account: ${account.label}`}</Text>}
           {focused.info.pinnedFiles && focused.info.pinnedFiles.length > 0 && (
             <>
               <Text dimColor>{" · pinned: "}</Text>
@@ -279,11 +281,13 @@ export function StatusBar({
  * `default` (the daemon's own login or environment) is the common case and
  * says nothing; a pinned account, a non-default daemon default, or a missing
  * account (which fails the next turn) is shown. A backend without accounts
- * reports neither field and shows nothing.
+ * reports neither field and shows nothing. A missing label is kept compact
+ * ("work (missing)", "team (default, missing)"): it is shown near the start
+ * of the bar.
  */
 function accountLabel(info: TuiSession["info"]): { label: string; missing: boolean } | null {
-  // `claudeAccount` / `effectiveClaudeAccount` are the older Claude-only
-  // spelling of the same fields, kept for a daemon that predates `account`.
+  // On a Claude session the daemon also reports the same choice under the
+  // Claude-only `claudeAccount` / `effectiveClaudeAccount` names.
   const claude = (info.providerId ?? "claude") === "claude";
   const choice = info.account ?? (claude ? info.claudeAccount : undefined);
   const reported = info.effectiveAccount ?? (claude ? info.effectiveClaudeAccount : undefined);
@@ -292,8 +296,8 @@ function accountLabel(info: TuiSession["info"]): { label: string; missing: boole
   const missing = effective.endsWith(" (missing)");
   if (choice !== undefined) return { label: effective, missing };
   if (effective === "default") return null;
-  const name = missing ? effective.slice(0, -" (missing)".length) : effective;
-  return { label: `${name} (following default${missing ? ", missing" : ""})`, missing };
+  if (missing) return { label: `${effective.slice(0, -" (missing)".length)} (default, missing)`, missing };
+  return { label: `${effective} (following default)`, missing };
 }
 
 /** "12s" / "1m 23s" / "1h 5m" — compact working-duration stamp. */

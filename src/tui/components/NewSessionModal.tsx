@@ -37,11 +37,13 @@ export function NewSessionModal({ providers, client, onSubmit, onCancel }: Props
   // must not touch state or close whatever dialog has opened since.
   const mounted = useRef(true);
   useEffect(() => () => { mounted.current = false; }, []);
-  const effectiveProvider = providerId || providers[0]?.id || "claude";
+  // The daemon's default backend: the one it marks, else the first it lists.
+  const daemonDefault = providers.find((provider) => provider.isDefault) ?? providers[0];
+  const effectiveProvider = providerId || daemonDefault?.id || "claude";
   const hasAccounts = backendHasAccounts(effectiveProvider);
   const fields = ["name", "workdir", "provider", ...(hasAccounts ? ["account"] : [])];
   const providerChoices = [
-    { value: "", label: `Daemon default (${providers[0]?.displayName ?? "claude"})` },
+    { value: "", label: `Daemon default (${daemonDefault?.displayName ?? "claude"})` },
     ...providers.map((provider) => ({ value: provider.id, label: `${provider.displayName} (${provider.id})` })),
   ];
 
@@ -77,9 +79,11 @@ export function NewSessionModal({ providers, client, onSubmit, onCancel }: Props
     setBusy(true);
     setError(null);
     try {
+      // An account names the backend whose accounts were listed, so a daemon
+      // default changed since can't apply it to another backend.
+      const withAccount = hasAccounts && account !== "";
       await onSubmit(name.trim(), workdir.trim(), {
-        ...(providerId ? { providerId } : {}),
-        ...(hasAccounts && account ? { account } : {}),
+        ...(withAccount ? { providerId: effectiveProvider, account } : providerId ? { providerId } : {}),
       });
       if (mounted.current) onCancel();
     } catch (cause) {

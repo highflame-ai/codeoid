@@ -35,6 +35,9 @@ import {
   type ScrollbackWriter,
 } from "./ansi/scrollback-writer.js";
 
+/** `/account` arguments that follow the backend's daemon default instead of naming an account. */
+const FOLLOW_DEFAULT_FLAGS = new Set(["--follow-default", "--follow"]);
+
 interface Props {
   config: CodeoidConfig;
   /** Builds the daemon client. Tests inject a fake; production uses the default. */
@@ -1123,10 +1126,20 @@ export function App({ config, createClient = (c, d) => new TuiWsClient(c, d) }: 
           dispatch({ type: "error", message: `The ${backend} backend has no accounts. Use /provider to switch to one that does.` });
           return;
         }
+        // An account is always for the session's current backend; anything
+        // else (`--backend codex work`, two names) would otherwise be read
+        // as an account name.
+        if (cmd === "/account" && (args.length > 1 || (args[0]?.startsWith("-") && !FOLLOW_DEFAULT_FLAGS.has(args[0].toLowerCase())))) {
+          dispatch({ type: "error", message: "Usage: /account [<name> | default | --follow-default]" });
+          return;
+        }
         // No args → interactive picker for this session. With an arg →
         // direct switch (trust the user knows the id they want).
         if (args.length === 0) {
-          dispatch({ type: "modal.open", modal: { kind: cmd === "/model" ? "model" : cmd === "/provider" ? "provider" : "account", sessionId } });
+          dispatch({
+            type: "modal.open",
+            modal: cmd === "/account" ? { kind: "account", sessionId, backend } : { kind: cmd === "/model" ? "model" : "provider", sessionId },
+          });
           return;
         }
         const value = cmd === "/model" ? args[0]! : args[0]!.toLowerCase();
@@ -1134,7 +1147,7 @@ export function App({ config, createClient = (c, d) => new TuiWsClient(c, d) }: 
           ? onSetModel(sessionId, value)
           : cmd === "/provider"
             ? onSetProvider(sessionId, value)
-            : onSetAccount(sessionId, value === "--follow-default" || value === "--follow" ? "" : value, backend);
+            : onSetAccount(sessionId, FOLLOW_DEFAULT_FLAGS.has(value) ? "" : value, backend);
         void operation.catch((cause: unknown) => dispatch({ type: "error", message: cause instanceof Error ? cause.message : String(cause) }));
         return;
       }

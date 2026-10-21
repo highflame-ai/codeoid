@@ -79,7 +79,7 @@ describe("TUI StatusBar", () => {
 
   it("always shows a missing account, pinned or followed", () => {
     expect(bar(session({ claudeAccount: "gone", effectiveClaudeAccount: "gone (missing)" }), 300)).toContain("account: gone (missing)");
-    expect(bar(session({ effectiveClaudeAccount: "? (missing)" }), 300)).toContain("(following default, missing)");
+    expect(bar(session({ effectiveClaudeAccount: "? (missing)" }), 300)).toContain("⚠ account: ? (default, missing)");
   });
 
   it("shows no account for a backend without accounts", () => {
@@ -97,7 +97,7 @@ describe("TUI StatusBar", () => {
   it("keeps a Codex session's missing account red next to the model, ahead of usage", () => {
     const usage = { inputTokens: 1000, outputTokens: 200, cacheReadTokens: 0, cacheCreationTokens: 0, totalCostUsd: 0.5, numTurns: 3, durationMs: 1000 };
     const out = bar(session({ providerId: "codex", model: "gpt-5.5-codex", account: "gone", effectiveAccount: "gone (missing)", usage }), 300);
-    expect(out).toContain("on codex · account: gone (missing)");
+    expect(out).toContain("idle · ⚠ account: gone (missing) · 12s · mode: interactive · gpt-5.5-codex on codex");
     expect(out.indexOf("account: gone (missing)")).toBeLessThan(out.indexOf("$"));
     expect(bar(session({ providerId: "codex", account: "gone", effectiveAccount: "gone (missing)", usage }), 110)).toContain("account: gone (missing)");
   });
@@ -105,7 +105,35 @@ describe("TUI StatusBar", () => {
   it("hides a Codex session following the default onto the built-in account, and names a non-default default", () => {
     expect(bar(session({ providerId: "codex", effectiveAccount: "default" }), 300)).not.toContain("account:");
     expect(bar(session({ providerId: "codex", effectiveAccount: "team" }), 300)).toContain("account: team (following default)");
-    expect(bar(session({ providerId: "oai:box", effectiveAccount: "box-key (missing)" }), 300)).toContain("account: box-key (following default, missing)");
+    expect(bar(session({ providerId: "oai:box", effectiveAccount: "box-key (missing)" }), 300)).toContain("⚠ account: box-key (default, missing)");
+  });
+
+  // ` on <provider>` and a long model id used to come first and push the
+  // warning off a 100–120 column terminal on every non-Claude session.
+  it("keeps a missing account visible at 100 and 120 columns behind a long model on any backend", () => {
+    const usage = { inputTokens: 91_000, outputTokens: 12_000, cacheReadTokens: 80_000, cacheCreationTokens: 4_000, totalCostUsd: 3.21, numTurns: 9, durationMs: 1000 };
+    const cases: Array<Partial<SessionInfo>> = [
+      { providerId: "codex", model: "gpt-5.5-codex-max-high-reasoning-2026-09-15", account: "work", effectiveAccount: "work (missing)" },
+      { providerId: "oai:gpu-box-in-the-basement", model: "qwen3-coder-480b-a35b-instruct-fp8-awq-gguf", account: "work", effectiveAccount: "work (missing)" },
+      { providerId: "claude", model: "claude-opus-4-8", account: "work", effectiveAccount: "work (missing)" },
+    ];
+    for (const extra of cases) {
+      for (const cols of [100, 120]) {
+        const out = bar(session({ status: "waiting_approval", ...extra, usage }), cols);
+        expect(out.split("\n")).toHaveLength(1);
+        expect(out).toContain("waiting_approval");
+        expect(out).toContain("⚠ account: work (missing)");
+      }
+    }
+  });
+
+  it("puts the missing-account warning right after the status, before the mode, model and backend", () => {
+    const out = bar(session({ providerId: "codex", model: "gpt-5.5-codex", account: "work", effectiveAccount: "work (missing)" }), 300);
+    expect(out).toContain("feature-auth · idle · ⚠ account: work (missing) · 12s · mode: interactive");
+    expect(out.indexOf("⚠ account: work (missing)")).toBeLessThan(out.indexOf("gpt-5.5-codex"));
+    expect(out.indexOf("⚠ account: work (missing)")).toBeLessThan(out.indexOf("on codex"));
+    // Shown once: not again as a descriptor beside the workdir.
+    expect(out.split("account:")).toHaveLength(2);
   });
 
   it("does not show Claude's account on a session that has moved to another backend", () => {
