@@ -9,8 +9,10 @@ vi.mock("../state/connection", () => ({
   getClient: () => ({ request: clientRequestMock }),
 }));
 
+import { Show, createSignal } from "solid-js";
+
 import { ClaudeAccountsPanel } from "./ClaudeAccountsPanel";
-import { _resetClaudeAccountsForTest } from "../state/claude-accounts";
+import { _resetClaudeAccountsForTest, accountLoginState } from "../state/claude-accounts";
 
 const result = (accounts: unknown[], defaultAccount = "default") => ({ type: "claude.accounts.result", requestId: "r", accounts, defaultAccount });
 const WORK = { name: "work", kind: "subscription", createdAt: "", updatedAt: "" };
@@ -123,10 +125,40 @@ describe("ClaudeAccountsPanel", () => {
     fireEvent.input(getByPlaceholderText("Paste the code"), { target: { value: "code-1" } });
     fireEvent.click(getByText("Finish"));
     await findByText("+ Sign in a subscription");
+    // Finishing unmounts the form; that's not an abandoned attempt.
+    expect(sent().some((m) => m.type === "backend.login.cancel")).toBe(false);
 
     fireEvent.click(getByText("+ Sign in a subscription"));
     expect(getByPlaceholderText("company-max")).toBeTruthy();
     expect(queryByText("Get sign-in link")).not.toBeNull();
+  });
+
+  it("closing Settings mid sign-in cancels the daemon's attempt; reopening starts fresh", async () => {
+    const LOGIN = { loginId: "L5", verificationUrl: "https://claude.ai/oauth/open", codeHint: "" };
+    clientRequestMock.mockImplementation(async (msg) => {
+      if (msg.type === "backend.login.start") return { type: "backend.login.start.result", requestId: "r", login: LOGIN };
+      if (msg.type === "backend.login.cancel") return { type: "backend.login.cancel.result", requestId: "r" };
+      return result([]);
+    });
+    const [open, setOpen] = createSignal(true);
+    const { getByText, getByPlaceholderText, findByText, queryByText } = render(() => (
+      <Show when={open()}>
+        <ClaudeAccountsPanel />
+      </Show>
+    ));
+    fireEvent.click(getByText("+ Sign in a subscription"));
+    fireEvent.input(getByPlaceholderText("company-max"), { target: { value: "team-max" } });
+    fireEvent.click(getByText("Get sign-in link"));
+    await findByText(LOGIN.verificationUrl);
+
+    setOpen(false);
+    await waitFor(() => expect(sent()).toContainEqual(expect.objectContaining({ type: "backend.login.cancel", loginId: "L5" })));
+    expect(accountLoginState().phase).toBe("idle");
+
+    setOpen(true);
+    fireEvent.click(getByText("+ Sign in a subscription"));
+    expect(queryByText(LOGIN.verificationUrl)).toBeNull();
+    getByText("Get sign-in link");
   });
 
   it("Cancel while the sign-in is starting drops the late link and cancels the daemon's attempt", async () => {

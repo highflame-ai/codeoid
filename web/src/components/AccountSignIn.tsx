@@ -5,7 +5,7 @@
  * name. The code the user pastes goes straight to the daemon.
  */
 
-import { type Component, Show, createSignal } from "solid-js";
+import { type Component, Show, createSignal, onCleanup } from "solid-js";
 
 import { ReplaceAccountConfirm } from "./ReplaceAccountConfirm";
 import {
@@ -35,6 +35,14 @@ export const AccountSignIn: Component<{ onDone: () => void }> = (props) => {
     dismissAccountLogin();
     props.onDone();
   };
+
+  // Closed some other way (the drawer, another tab of Settings): end the
+  // daemon's attempt too, or reopening would show its stale link. A finished
+  // sign-in is already back to idle, so it sends no cancel.
+  onCleanup(() => {
+    if (st().phase !== "idle") void cancelAccountLogin();
+    dismissAccountLogin();
+  });
 
   return (
     <div class="space-y-3">

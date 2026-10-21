@@ -44,6 +44,8 @@ export const claudeAccountsState = state;
 
 export function _resetClaudeAccountsForTest(): void {
   setState(EMPTY);
+  inflight = null;
+  refetch = null;
   attempt++;
   setLogin(LOGIN_EMPTY);
 }
@@ -65,19 +67,40 @@ async function accountsCall(build: (id: string) => ClientMessage): Promise<void>
   apply(res);
 }
 
+/** The list request in flight, and a forced refetch queued behind it. */
+let inflight: Promise<void> | null = null;
+let refetch: Promise<void> | null = null;
+
 /**
  * Fetch the list (settings:read). A token without the scope gets an error,
  * which the pickers treat as "no named accounts" — they stay hidden. A failure
  * leaves the list unloaded, so the next caller (or a reconnect) tries again.
+ *
+ * One request at a time. A plain fetch during a load waits for it; a forced
+ * one (after a sign-in, say) wants a list newer than the one in flight, so it
+ * runs once that settles — several forced calls share that one refetch.
  */
-export async function fetchClaudeAccounts(force = false): Promise<void> {
-  if (state().loading || (state().loaded && !force)) return;
-  setState((s) => ({ ...s, loading: true }));
-  try {
-    await accountsCall((id) => ({ type: "claude.accounts.list", id }));
-  } catch (e) {
-    setState((s) => ({ ...s, loading: false, error: errText(e) }));
+export function fetchClaudeAccounts(force = false): Promise<void> {
+  if (inflight) {
+    if (!force) return inflight;
+    refetch ??= inflight.then(() => {
+      refetch = null;
+      return fetchClaudeAccounts(true);
+    });
+    return refetch;
   }
+  if (state().loaded && !force) return Promise.resolve();
+  setState((s) => ({ ...s, loading: true }));
+  inflight = (async () => {
+    try {
+      await accountsCall((id) => ({ type: "claude.accounts.list", id }));
+    } catch (e) {
+      setState((s) => ({ ...s, loading: false, error: errText(e) }));
+    } finally {
+      inflight = null;
+    }
+  })();
+  return inflight;
 }
 
 /**

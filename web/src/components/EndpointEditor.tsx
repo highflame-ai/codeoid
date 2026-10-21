@@ -6,10 +6,10 @@
  * daemon only sends stored credentials to the origin they were entered for.
  */
 
-import { type Component, For, Index, Show, createSignal } from "solid-js";
+import { type Component, For, Index, Show, createSignal, createUniqueId } from "solid-js";
 
 import type { EndpointFlavor, EndpointInfo, EndpointModel, EndpointsTestResultMsg } from "../protocol/types";
-import { endpointNameProblem, saveEndpoint, testEndpoint } from "../state/endpoints";
+import { endpointNameProblem, endpointsState, saveEndpoint, testEndpoint } from "../state/endpoints";
 import { HeadersEditor } from "./ClaudeAccountsPanel";
 
 const label = "text-[11px] font-medium uppercase tracking-wider text-fg-faint";
@@ -68,16 +68,26 @@ export const EndpointEditor: Component<{ existing?: EndpointInfo; onDone: () => 
   const [models, setModels] = createSignal<ModelRow[]>(rowsOf(ex?.models ?? []));
   const [defaultModel, setDefaultModel] = createSignal(ex?.defaultModel ?? "");
   const [contextWindow, setContextWindow] = createSignal(ex?.contextWindow ? String(ex.contextWindow) : "");
-  const [mcpMode, setMcpMode] = createSignal<"all" | "none" | "list">(
-    !ex ? "all" : ex.mcpServers === "all" ? "all" : ex.mcpServers.length ? "list" : "none",
+  // Unset (a new endpoint the user hasn't chosen for) follows the flavor, as
+  // the daemon's default does: a local llama-server's small context can't
+  // carry every MCP server's tool definitions.
+  const [mcpMode, setMcpMode] = createSignal<"all" | "none" | "list" | undefined>(
+    !ex ? undefined : ex.mcpServers === "all" ? "all" : ex.mcpServers.length ? "list" : "none",
   );
+  const effMcpMode = () => mcpMode() ?? (flavor() === "llamacpp" ? "none" : "all");
   const [mcpList, setMcpList] = createSignal(ex && ex.mcpServers !== "all" ? ex.mcpServers.join(", ") : "");
   const [streamUsage, setStreamUsage] = createSignal(ex?.streamUsage ?? true);
-  const [strict, setStrict] = createSignal<boolean | undefined>(ex?.strictToolSchemas);
+  // Unset = the checkbox is untouched: keep the stored value while the flavor
+  // is the stored one, otherwise follow the flavor (llama-server 500s on a
+  // loose schema). Sent explicitly, since the daemon keeps the stored value on
+  // an edit.
+  const [strict, setStrict] = createSignal<boolean | undefined>();
+  const effStrict = () => strict() ?? (ex && flavor() === ex.flavor ? ex.strictToolSchemas : flavor() === "llamacpp");
   const [maxTokensField, setMaxTokensField] = createSignal(ex?.maxTokensField ?? "max_tokens");
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
   const [test, setTest] = createSignal<EndpointsTestResultMsg | "running" | undefined>();
+  const uid = createUniqueId();
 
   const storedHeaders = !!ex?.headerNames.length;
   /** The edited base URL points at another origin than the stored one (an unparsable URL counts as unchanged). */
@@ -97,6 +107,10 @@ export const EndpointEditor: Component<{ existing?: EndpointInfo; onDone: () => 
   const problem = (): string | null => {
     const n = endpointNameProblem(name().trim());
     if (n) return n;
+    // Saving under a taken name would edit that endpoint behind the user's back.
+    if (!ex && endpointsState().endpoints.some((e) => e.name === name().trim())) {
+      return `an endpoint named "${name().trim()}" already exists — edit it from the list instead`;
+    }
     if (!baseUrl().trim()) return "a base URL is required";
     if (effKeyMode() === "set" && !apiKey().trim()) {
       return originMoved() ? "enter a key for the new server, or remove it" : "enter the key, or choose to keep / remove it";
@@ -120,10 +134,15 @@ export const EndpointEditor: Component<{ existing?: EndpointInfo; onDone: () => 
   /**
    * What the key / headers fields mean for a request: absent = keep stored.
    * A blank "replace" key is left out too — save refuses it (problem()), and a
-   * test then runs with the stored key rather than with none.
+   * test then runs with the stored key rather than with none. "No key" is an
+   * explicit null, so nothing stored can ever be inherited.
    */
   const secretFields = () => ({
-    ...(effKeyMode() === "set" && apiKey().trim() ? { apiKey: apiKey().trim() } : effKeyMode() === "clear" ? { apiKey: null } : {}),
+    ...(effKeyMode() === "set" && apiKey().trim()
+      ? { apiKey: apiKey().trim() }
+      : effKeyMode() === "clear" || effKeyMode() === "none"
+        ? { apiKey: null }
+        : {}),
     ...(effReplaceHeaders() ? { headers: headerMap() } : {}),
   });
 
@@ -172,16 +191,16 @@ export const EndpointEditor: Component<{ existing?: EndpointInfo; onDone: () => 
         defaultModel: defaultModel().trim() || null,
         contextWindow: ctx ?? null,
         mcpServers:
-          mcpMode() === "all"
+          effMcpMode() === "all"
             ? "all"
-            : mcpMode() === "none"
+            : effMcpMode() === "none"
               ? []
               : mcpList()
                   .split(",")
                   .map((s) => s.trim())
                   .filter(Boolean),
         streamUsage: streamUsage(),
-        ...(strict() !== undefined ? { strictToolSchemas: strict() } : {}),
+        strictToolSchemas: effStrict(),
         maxTokensField: maxTokensField(),
       });
       setApiKey("");
@@ -223,25 +242,27 @@ export const EndpointEditor: Component<{ existing?: EndpointInfo; onDone: () => 
       </label>
 
       <div class="space-y-1">
-        <span class={label}>API key</span>
-        <div class="flex flex-wrap items-center gap-3 text-[12px] text-fg-muted">
+        <span class={label} id={`${uid}-key`}>
+          API key
+        </span>
+        <div role="radiogroup" aria-labelledby={`${uid}-key`} class="flex flex-wrap items-center gap-3 text-[12px] text-fg-muted">
           <Show when={ex?.hasApiKey}>
             <Show when={!originMoved()}>
               <label class="flex items-center gap-1">
-                <input type="radio" checked={effKeyMode() === "keep"} onChange={() => setKeyMode("keep")} /> keep stored key
+                <input type="radio" name={`${uid}-key`} checked={effKeyMode() === "keep"} onChange={() => setKeyMode("keep")} /> keep stored key
               </label>
             </Show>
             <label class="flex items-center gap-1">
-              <input type="radio" checked={effKeyMode() === "clear"} onChange={() => setKeyMode("clear")} /> remove it
+              <input type="radio" name={`${uid}-key`} checked={effKeyMode() === "clear"} onChange={() => setKeyMode("clear")} /> remove it
             </label>
           </Show>
           <Show when={!ex?.hasApiKey}>
             <label class="flex items-center gap-1">
-              <input type="radio" checked={effKeyMode() === "none"} onChange={() => setKeyMode("none")} /> no key
+              <input type="radio" name={`${uid}-key`} checked={effKeyMode() === "none"} onChange={() => setKeyMode("none")} /> no key
             </label>
           </Show>
           <label class="flex items-center gap-1">
-            <input type="radio" checked={effKeyMode() === "set"} onChange={() => setKeyMode("set")} /> {ex?.hasApiKey ? "replace" : "set a key"}
+            <input type="radio" name={`${uid}-key`} checked={effKeyMode() === "set"} onChange={() => setKeyMode("set")} /> {ex?.hasApiKey ? "replace" : "set a key"}
           </label>
         </div>
         <Show when={effKeyMode() === "set"}>
@@ -343,18 +364,21 @@ export const EndpointEditor: Component<{ existing?: EndpointInfo; onDone: () => 
       </div>
 
       <div class="space-y-1">
-        <span class={label}>External MCP servers offered</span>
-        <div class="flex flex-wrap items-center gap-3 text-[12px] text-fg-muted">
+        <span class={label} id={`${uid}-mcp`}>
+          External MCP servers offered
+        </span>
+        {/* onClick, not onChange: re-picking the checked default is a choice too, and must stick across a flavor change. */}
+        <div role="radiogroup" aria-labelledby={`${uid}-mcp`} class="flex flex-wrap items-center gap-3 text-[12px] text-fg-muted">
           <label class="flex items-center gap-1">
-            <input type="radio" checked={mcpMode() === "all"} onChange={() => setMcpMode("all")} /> all
+            <input type="radio" name={`${uid}-mcp`} checked={effMcpMode() === "all"} onClick={() => setMcpMode("all")} /> all
           </label>
           <label class="flex items-center gap-1">
-            <input type="radio" checked={mcpMode() === "none"} onChange={() => setMcpMode("none")} /> none
+            <input type="radio" name={`${uid}-mcp`} checked={effMcpMode() === "none"} onClick={() => setMcpMode("none")} /> none
           </label>
           <label class="flex items-center gap-1">
-            <input type="radio" checked={mcpMode() === "list"} onChange={() => setMcpMode("list")} /> only
+            <input type="radio" name={`${uid}-mcp`} checked={effMcpMode() === "list"} onClick={() => setMcpMode("list")} /> only
           </label>
-          <Show when={mcpMode() === "list"}>
+          <Show when={effMcpMode() === "list"}>
             <input class={`${input} max-w-xs`} value={mcpList()} onInput={(e) => setMcpList(e.currentTarget.value)} placeholder="github, slack" />
           </Show>
         </div>
@@ -371,7 +395,7 @@ export const EndpointEditor: Component<{ existing?: EndpointInfo; onDone: () => 
           <label class="flex items-center gap-2">
             <input
               type="checkbox"
-              checked={strict() ?? flavor() === "llamacpp"}
+              checked={effStrict()}
               onChange={(e) => setStrict(e.currentTarget.checked)}
             />
             Strict tool schemas (for servers that compile tools into a grammar)

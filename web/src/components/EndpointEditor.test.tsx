@@ -11,6 +11,7 @@ vi.mock("../state/connection", () => ({
 
 import { EndpointEditor, tokensOf } from "./EndpointEditor";
 import type { EndpointInfo } from "../protocol/types";
+import { _resetEndpointsForTest, fetchEndpoints } from "../state/endpoints";
 
 const STORED: EndpointInfo = {
   name: "box",
@@ -33,8 +34,17 @@ const sent = () => clientRequestMock.mock.calls.map((c) => c[0]);
 
 afterEach(() => {
   cleanup();
+  _resetEndpointsForTest();
   clientRequestMock.mockReset();
 });
+
+/** A new endpoint named `name` at `url`; returns the render and the Add button. */
+function fillNew(name: string, url = "http://localhost:8080/v1") {
+  const r = render(() => <EndpointEditor onDone={() => {}} />);
+  fireEvent.input(r.getByPlaceholderText("gpu-box"), { target: { value: name } });
+  fireEvent.input(r.getByPlaceholderText("http://localhost:11434/v1"), { target: { value: url } });
+  return { ...r, add: r.getByText("Add endpoint") as HTMLButtonElement };
+}
 
 describe("EndpointEditor", () => {
   it("editing keeps the stored key and headers unless replaced — they are never sent back", async () => {
@@ -190,6 +200,98 @@ describe("EndpointEditor", () => {
     fireEvent.input(url, { target: { value: "http://gpu-box:8000/other" } });
     getByLabelText(/keep stored key/);
     getByText("Replace headers");
+  });
+
+  it("a new endpoint can't take an existing one's name — that would edit it silently", async () => {
+    clientRequestMock.mockResolvedValue({ type: "endpoints.result", requestId: "r", endpoints: [STORED] });
+    await fetchEndpoints();
+    clientRequestMock.mockClear();
+    const { add, getByText, getByPlaceholderText } = fillNew("box");
+    expect(add.disabled).toBe(true);
+    getByText(/an endpoint named "box" already exists/);
+    fireEvent.click(add);
+    expect(sent()).toEqual([]);
+    fireEvent.input(getByPlaceholderText("gpu-box"), { target: { value: "box-2" } });
+    expect(add.disabled).toBe(false);
+  });
+
+  it("a new keyless endpoint says so explicitly: apiKey null, headers {}", async () => {
+    clientRequestMock.mockResolvedValue({ type: "endpoints.result", requestId: "r", endpoints: [] });
+    const { add } = fillNew("local");
+    fireEvent.click(add);
+    await waitFor(() => expect(sent()[0]).toMatchObject({ type: "endpoints.set", name: "local", apiKey: null, headers: {} }));
+  });
+
+  it("a new endpoint's MCP servers follow the flavor until chosen: llama.cpp none, OpenAI all", async () => {
+    clientRequestMock.mockResolvedValue({ type: "endpoints.result", requestId: "r", endpoints: [] });
+    const { add, getByLabelText, getByDisplayValue } = fillNew("llama");
+    const none = getByLabelText(/^none$/) as HTMLInputElement;
+    const all = getByLabelText(/^all$/) as HTMLInputElement;
+    expect(all.checked).toBe(true);
+    fireEvent.change(getByDisplayValue(/OpenAI-compatible/), { target: { value: "llamacpp" } });
+    expect(none.checked).toBe(true);
+    fireEvent.click(add);
+    await waitFor(() => expect(sent()[0]).toMatchObject({ type: "endpoints.set", flavor: "llamacpp", mcpServers: [], strictToolSchemas: true }));
+
+    // OpenAI-compatible: all.
+    cleanup();
+    clientRequestMock.mockClear();
+    fireEvent.click(fillNew("vllm").add);
+    await waitFor(() => expect(sent()[0]).toMatchObject({ type: "endpoints.set", flavor: "openai", mcpServers: "all", strictToolSchemas: false }));
+  });
+
+  it("a choice of MCP servers sticks across a flavor change", async () => {
+    clientRequestMock.mockResolvedValue({ type: "endpoints.result", requestId: "r", endpoints: [] });
+    const { add, getByLabelText, getByDisplayValue } = fillNew("llama");
+    fireEvent.click(getByLabelText(/^all$/));
+    fireEvent.change(getByDisplayValue(/OpenAI-compatible/), { target: { value: "llamacpp" } });
+    expect((getByLabelText(/^all$/) as HTMLInputElement).checked).toBe(true);
+    fireEvent.click(add);
+    await waitFor(() => expect(sent()[0]).toMatchObject({ flavor: "llamacpp", mcpServers: "all" }));
+  });
+
+  it("changing an endpoint's flavor moves strict tool schemas to the new flavor's default unless set", async () => {
+    clientRequestMock.mockResolvedValue({ type: "endpoints.result", requestId: "r", endpoints: [STORED] });
+    const { getByText, getByDisplayValue, getByLabelText } = render(() => <EndpointEditor existing={STORED} onDone={() => {}} />);
+    const strict = getByLabelText(/Strict tool schemas/) as HTMLInputElement;
+    expect(strict.checked).toBe(false);
+    fireEvent.change(getByDisplayValue(/OpenAI-compatible/), { target: { value: "llamacpp" } });
+    expect(strict.checked).toBe(true);
+    fireEvent.click(getByText("Save"));
+    await waitFor(() => expect(sent()[0]).toMatchObject({ type: "endpoints.set", flavor: "llamacpp", strictToolSchemas: true }));
+
+    // A box the user ticked wins over the flavor default.
+    cleanup();
+    clientRequestMock.mockClear();
+    const r = render(() => <EndpointEditor existing={STORED} onDone={() => {}} />);
+    fireEvent.click(r.getByLabelText(/Strict tool schemas/));
+    fireEvent.click(r.getByLabelText(/Strict tool schemas/));
+    fireEvent.change(r.getByDisplayValue(/OpenAI-compatible/), { target: { value: "llamacpp" } });
+    fireEvent.click(r.getByText("Save"));
+    await waitFor(() => expect(sent()[0]).toMatchObject({ flavor: "llamacpp", strictToolSchemas: false }));
+  });
+
+  it("each radio set is one named group with an accessible label, unique per editor", () => {
+    const { getAllByRole } = render(() => (
+      <>
+        <EndpointEditor existing={STORED} onDone={() => {}} />
+        <EndpointEditor onDone={() => {}} />
+      </>
+    ));
+    const groups = getAllByRole("radiogroup");
+    expect(groups.map((g) => g.getAttribute("aria-labelledby") && document.getElementById(g.getAttribute("aria-labelledby")!)?.textContent?.trim())).toEqual([
+      "API key",
+      "External MCP servers offered",
+      "API key",
+      "External MCP servers offered",
+    ]);
+    const names = groups.map((g) => {
+      const ns = new Set([...g.querySelectorAll<HTMLInputElement>('input[type="radio"]')].map((i) => i.name));
+      expect(ns.size).toBe(1);
+      return [...ns][0];
+    });
+    expect(names.every(Boolean)).toBe(true);
+    expect(new Set(names).size).toBe(4);
   });
 
   it("shows the daemon's validation message on save", async () => {
