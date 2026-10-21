@@ -18,7 +18,7 @@
 
 import { createSignal } from "solid-js";
 
-import { getClient, newRequestId, request } from "./connection";
+import { connectionStatus, getClient, newRequestId, request, send } from "./connection";
 import { mergeFullSessionInfo } from "./sessions";
 import type {
   AccountInfo,
@@ -58,6 +58,7 @@ export function _resetAccountsForTest(): void {
   refetch = null;
   attempt++;
   setLogin(LOGIN_EMPTY);
+  resumeAccountLogin();
 }
 
 /** Test-only: seed the list without a daemon. */
@@ -266,9 +267,14 @@ interface LoginState {
   phase: AccountLoginPhase;
   login: PendingBackendLogin | null;
   error: string | null;
+  /**
+   * `waiting` only: the connection dropped mid-wait. The daemon's attempt
+   * carries on regardless; the wait is sent again once the socket is back.
+   */
+  reconnecting: boolean;
 }
 
-const LOGIN_EMPTY: LoginState = { backend: null, account: null, phase: "idle", login: null, error: null };
+const LOGIN_EMPTY: LoginState = { backend: null, account: null, phase: "idle", login: null, error: null, reconnecting: false };
 const [login, setLogin] = createSignal<LoginState>(LOGIN_EMPTY);
 /**
  * Bumped by every start, cancel and dismiss: a reply that lands after its
@@ -280,6 +286,37 @@ let attempt = 0;
 export const accountLoginState = login;
 
 /**
+ * How long the daemon keeps a finished `device` login's outcome for a client
+ * that re-sends its wait (backend-login.ts). Past the attempt's expiry plus
+ * this, a wait can only answer "unknown login", so the client stops asking.
+ */
+const OUTCOME_KEPT_MS = 10 * 60_000;
+
+/**
+ * The transport failed, as opposed to the daemon answering: the socket was
+ * down or dropped, or no answer came in time. These are the core client's own
+ * messages (CodeoidClient.request); a daemon refusal carries the daemon's text.
+ */
+export function isConnectionError(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : String(e);
+  return /^(cannot request while |connection lost|connection reset|client shutdown|request \S+ timed out)/.test(msg);
+}
+
+/** A device wait parked until the socket is back; woken by {@link resumeAccountLogin}. */
+let wakeParkedWait: (() => void) | null = null;
+
+/**
+ * The socket is back (connection.ts calls this on every `connected`): a
+ * device sign-in whose wait was cut off sends it again. Also wakes a parked
+ * wait whose attempt was abandoned, so it can end.
+ */
+export function resumeAccountLogin(): void {
+  const wake = wakeParkedWait;
+  wakeParkedWait = null;
+  wake?.();
+}
+
+/**
  * Start `backend`'s sign-in for account `name` — isolated on the daemon, so
  * it never touches the machine's own login. A `code` login resolves once
  * there is a link to show; a `device` login then waits for the approval on its
@@ -287,7 +324,8 @@ export const accountLoginState = login;
  */
 export async function startAccountLogin(backend: LoginBackend, name: string, replace = false): Promise<boolean> {
   const mine = ++attempt;
-  setLogin({ backend, account: name, phase: "starting", login: null, error: null });
+  resumeAccountLogin();
+  setLogin({ ...LOGIN_EMPTY, backend, account: name, phase: "starting" });
   let pending: PendingBackendLogin;
   try {
     const id = newRequestId();
@@ -300,7 +338,7 @@ export async function startAccountLogin(backend: LoginBackend, name: string, rep
     );
     pending = res.login;
   } catch (e) {
-    if (mine === attempt) setLogin({ backend, account: name, phase: "idle", login: null, error: errText(e) });
+    if (mine === attempt) setLogin({ ...LOGIN_EMPTY, backend, account: name, error: errText(e) });
     return false;
   }
   if (mine !== attempt) {
@@ -309,10 +347,10 @@ export async function startAccountLogin(backend: LoginBackend, name: string, rep
     return false;
   }
   if (pending.mode === "device") {
-    setLogin({ backend, account: name, phase: "waiting", login: pending, error: null });
+    setLogin({ ...LOGIN_EMPTY, backend, account: name, phase: "waiting", login: pending });
     return waitAccountLogin(mine, pending);
   }
-  setLogin({ backend, account: name, phase: "awaiting_code", login: pending, error: null });
+  setLogin({ ...LOGIN_EMPTY, backend, account: name, phase: "awaiting_code", login: pending });
   return false;
 }
 
@@ -326,29 +364,59 @@ async function finished(): Promise<void> {
 /**
  * Long-poll a `device` login until the user approves, it fails, or it
  * expires. Terminal either way: a failure means starting again.
+ *
+ * Losing the connection is not a failure: the daemon's attempt goes on, and
+ * the user may be approving it right now. The wait is safe to send again — the
+ * daemon answers a repeat with the same outcome — so a dropped socket parks
+ * the wait until it is back, and a timeout simply asks again.
  */
 async function waitAccountLogin(mine: number, pending: PendingBackendLogin): Promise<boolean> {
-  try {
-    const id = newRequestId();
-    const res = await getClient().request<BackendLoginWaitResultMsg>(
-      { type: "backend.login.wait", id, loginId: pending.loginId },
-      {
-        waitForResult: (m) => (m.type === "backend.login.wait.result" && m.requestId === id ? m : undefined),
-        // The daemon answers by the attempt's expiry at the latest; a margin
-        // for the command's clean exit and the round trip.
-        timeoutMs: Math.max(pending.expiresAt - Date.now(), 0) + 30_000,
-      },
-    );
+  for (;;) {
+    let res: BackendLoginWaitResultMsg;
+    try {
+      const id = newRequestId();
+      res = await getClient().request<BackendLoginWaitResultMsg>(
+        { type: "backend.login.wait", id, loginId: pending.loginId },
+        {
+          waitForResult: (m) => (m.type === "backend.login.wait.result" && m.requestId === id ? m : undefined),
+          // The daemon answers by the attempt's expiry at the latest; a margin
+          // for the command's clean exit and the round trip.
+          timeoutMs: Math.max(pending.expiresAt - Date.now(), 0) + 30_000,
+        },
+      );
+    } catch (e) {
+      if (mine !== attempt) return false;
+      if (!isConnectionError(e)) {
+        setLogin((s) => ({ ...s, phase: "idle", login: null, reconnecting: false, error: errText(e) }));
+        return false;
+      }
+      if (Date.now() > pending.expiresAt + OUTCOME_KEPT_MS) {
+        // Too late to learn how it ended. If it went through, the list shows it.
+        setLogin((s) => ({
+          ...s,
+          phase: "idle",
+          login: null,
+          reconnecting: false,
+          error: "Lost the connection during the sign-in. If you approved it, the account is listed; otherwise start again.",
+        }));
+        void fetchAccounts(true);
+        return false;
+      }
+      if (connectionStatus().kind !== "connected") {
+        setLogin((s) => ({ ...s, reconnecting: true }));
+        await new Promise<void>((wake) => (wakeParkedWait = wake));
+        if (mine !== attempt) return false;
+        setLogin((s) => ({ ...s, reconnecting: false }));
+      }
+      continue;
+    }
     if (mine !== attempt) return false;
     if (!res.ok) {
-      setLogin((s) => ({ ...s, phase: "idle", login: null, error: res.error ?? "Sign-in failed." }));
+      setLogin((s) => ({ ...s, phase: "idle", login: null, reconnecting: false, error: res.error ?? "Sign-in failed." }));
       return false;
     }
     await finished();
     return true;
-  } catch (e) {
-    if (mine === attempt) setLogin((s) => ({ ...s, phase: "idle", login: null, error: errText(e) }));
-    return false;
   }
 }
 
@@ -370,14 +438,22 @@ export async function submitAccountLoginCode(code: string): Promise<boolean> {
     );
     if (mine !== attempt) return res.ok;
     if (!res.ok) {
-      // A malformed code leaves the daemon's attempt open: let the user retry.
-      setLogin((s) => ({ ...s, phase: "awaiting_code", error: res.error ?? "Sign-in failed." }));
+      const error = res.error ?? "Sign-in failed.";
+      // Only a code refused before it reached the command leaves the daemon's
+      // attempt open; anything else ended it, so the form starts over.
+      if (res.retryable) setLogin((s) => ({ ...s, phase: "awaiting_code", error }));
+      else setLogin((s) => ({ ...s, phase: "idle", login: null, error }));
       return false;
     }
     await finished();
     return true;
   } catch (e) {
-    if (mine === attempt) setLogin((s) => ({ ...s, phase: "awaiting_code", error: errText(e) }));
+    if (mine !== attempt) return false;
+    // The connection failed: whether the code arrived is unknown, so keep the
+    // attempt and let the user send it again — the daemon says if it's over.
+    // A daemon refusal (an unknown or expired attempt) ends it.
+    if (isConnectionError(e)) setLogin((s) => ({ ...s, phase: "awaiting_code", error: errText(e) }));
+    else setLogin((s) => ({ ...s, phase: "idle", login: null, error: errText(e) }));
     return false;
   }
 }
@@ -386,9 +462,15 @@ export async function cancelAccountLogin(): Promise<void> {
   const cur = login();
   attempt++;
   setLogin(LOGIN_EMPTY);
+  resumeAccountLogin();
   if (cur.login) await sendLoginCancel(cur.login.loginId);
 }
 
+/**
+ * End the daemon's attempt. Without a connection the cancel is queued for the
+ * reconnect: an attempt left running could still finish the sign-in the user
+ * walked away from, and store its credential.
+ */
 async function sendLoginCancel(loginId: string): Promise<void> {
   try {
     const id = newRequestId();
@@ -396,12 +478,18 @@ async function sendLoginCancel(loginId: string): Promise<void> {
       { type: "backend.login.cancel", id, loginId },
       { waitForResult: (m) => (m.type === "backend.login.cancel.result" && m.requestId === id ? m : undefined) },
     );
-  } catch {
-    /* the attempt expires on its own */
+  } catch (e) {
+    if (!isConnectionError(e)) return;
+    try {
+      send({ type: "backend.login.cancel", id: newRequestId(), loginId });
+    } catch {
+      /* no client at all (signed out): the attempt expires on its own */
+    }
   }
 }
 
 export function dismissAccountLogin(): void {
   attempt++;
   setLogin(LOGIN_EMPTY);
+  resumeAccountLogin();
 }

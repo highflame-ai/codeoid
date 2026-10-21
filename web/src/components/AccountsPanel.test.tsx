@@ -3,16 +3,20 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, waitFor } from "@solidjs/testing-library";
 
 const clientRequestMock = vi.hoisted(() => vi.fn<(msg: Record<string, unknown>) => Promise<unknown>>());
+const sendMock = vi.hoisted(() => vi.fn());
+const conn = vi.hoisted(() => ({ kind: "connected" }));
 vi.mock("../state/connection", () => ({
   request: vi.fn(),
+  send: sendMock,
   newRequestId: () => "r",
   getClient: () => ({ request: clientRequestMock }),
+  connectionStatus: () => ({ kind: conn.kind }),
 }));
 
-import { Show, createSignal } from "solid-js";
+import { type JSX, Show, createSignal } from "solid-js";
 
 import { AccountsPanel, focusAccountsBackend } from "./AccountsPanel";
-import { _resetAccountsForTest, accountLoginState } from "../state/accounts";
+import { _resetAccountsForTest, accountLoginState, resumeAccountLogin } from "../state/accounts";
 import { accountKindsFor } from "../protocol/types";
 import type { AccountInfo, BackendAccountsInfo } from "../protocol/types";
 
@@ -42,6 +46,8 @@ afterEach(() => {
   _resetAccountsForTest();
   focusAccountsBackend("claude");
   clientRequestMock.mockReset();
+  sendMock.mockReset();
+  conn.kind = "connected";
 });
 
 describe("AccountsPanel — Claude", () => {
@@ -342,16 +348,26 @@ describe("AccountsPanel — device sign-in (Codex)", () => {
     expiresAt: Date.now() + 60_000,
   };
 
-  /** Start a Codex sign-in for `name`; the wait answers via `answerWait`. */
-  async function startDevice(name = "team") {
+  /** Start a Codex sign-in for `name`; the wait answers via `answerWait` / `dropWait`. */
+  async function startDevice(name = "team", wrap: (ui: () => JSX.Element) => () => JSX.Element = (ui) => ui) {
     let answerWait!: (v: unknown) => void;
+    let dropWait!: (e: Error) => void;
     clientRequestMock.mockImplementation((msg) => {
       if (msg.type === "backend.login.start") return Promise.resolve({ type: "backend.login.start.result", requestId: "r", login: LOGIN });
-      if (msg.type === "backend.login.wait") return new Promise((r) => (answerWait = r));
-      if (msg.type === "backend.login.cancel") return Promise.resolve({ type: "backend.login.cancel.result", requestId: "r", ok: true });
+      if (msg.type === "backend.login.wait") {
+        return new Promise((resolve, reject) => {
+          answerWait = resolve;
+          dropWait = reject;
+        });
+      }
+      if (msg.type === "backend.login.cancel") {
+        return conn.kind === "connected"
+          ? Promise.resolve({ type: "backend.login.cancel.result", requestId: "r", ok: true })
+          : Promise.reject(new Error(`cannot request while ${conn.kind}`));
+      }
       return Promise.resolve(result(ALL));
     });
-    const view = render(() => <AccountsPanel />);
+    const view = render(wrap(() => <AccountsPanel />));
     await view.findByText("work");
     fireEvent.click(view.getByRole("tab", { name: /^Codex/ }));
     fireEvent.click(view.getByText("+ Sign in: ChatGPT sign-in"));
@@ -359,8 +375,52 @@ describe("AccountsPanel — device sign-in (Codex)", () => {
     fireEvent.click(view.getByText("Get sign-in link"));
     await view.findByTestId("device-user-code");
     await waitFor(() => expect(sent()).toContainEqual(expect.objectContaining({ type: "backend.login.wait", loginId: "D1" })));
-    return { ...view, answerWait: (v: unknown) => answerWait(v) };
+    return { ...view, answerWait: (v: unknown) => answerWait(v), dropWait: (e: Error) => dropWait(e) };
   }
+
+  const waits = () => sent().filter((m) => m.type === "backend.login.wait");
+
+  it("a dropped connection keeps the code up, says it's reconnecting, and asks again once back", async () => {
+    const { getByTestId, findByText, getByText, answerWait, dropWait } = await startDevice();
+    conn.kind = "reconnecting";
+    dropWait(new Error("connection lost (socket closed (code 1006))"));
+    await findByText(/reconnecting…/);
+    expect(getByTestId("device-user-code").textContent).toBe("8UP4-KHOLU");
+    getByText("Cancel");
+    expect(accountLoginState()).toMatchObject({ phase: "waiting", error: null });
+
+    // The socket is back (connection.ts calls this on `connected`).
+    conn.kind = "connected";
+    resumeAccountLogin();
+    await waitFor(() => expect(waits()).toHaveLength(2));
+    expect(waits()[1]).toMatchObject({ loginId: "D1" });
+    await findByText("Waiting for you to approve…");
+    answerWait({ type: "backend.login.wait.result", requestId: "r", ok: true });
+    await findByText("+ Sign in: ChatGPT sign-in");
+    expect(sent().some((m) => m.type === "backend.login.cancel")).toBe(false);
+  });
+
+  it("closing Settings during the wait cancels the daemon's attempt", async () => {
+    const [open, setOpen] = createSignal(true);
+    await startDevice("team", (ui) => () => <Show when={open()}>{ui()}</Show>);
+    setOpen(false);
+    await waitFor(() => expect(sent()).toContainEqual(expect.objectContaining({ type: "backend.login.cancel", loginId: "D1" })));
+    expect(accountLoginState().phase).toBe("idle");
+  });
+
+  it("closing Settings while the connection is down queues the cancel for the reconnect", async () => {
+    const [open, setOpen] = createSignal(true);
+    const { dropWait } = await startDevice("team", (ui) => () => <Show when={open()}>{ui()}</Show>);
+    conn.kind = "reconnecting";
+    dropWait(new Error("connection lost (x)"));
+    await waitFor(() => expect(accountLoginState().reconnecting).toBe(true));
+    setOpen(false);
+    await waitFor(() => expect(sendMock).toHaveBeenCalledWith(expect.objectContaining({ type: "backend.login.cancel", loginId: "D1" })));
+    conn.kind = "connected";
+    resumeAccountLogin();
+    await Promise.resolve();
+    expect(waits()).toHaveLength(1);
+  });
 
   it("shows the one-time code with the link, waits, and on approval returns to the list", async () => {
     const { getByTestId, getByText, findByText, answerWait } = await startDevice();
@@ -443,5 +503,105 @@ describe("AccountsPanel — code sign-in (Claude subscription)", () => {
     await findByText("work");
     fireEvent.click(getByRole("tab", { name: /^Gemini CLI/ }));
     expect(queryByText(/Sign in/)).toBeNull();
+  });
+});
+
+describe("AccountsPanel — form rules and accessibility", () => {
+  it("a header with a name needs a value, as the daemon requires", async () => {
+    clientRequestMock.mockResolvedValue(result(ALL));
+    const view = render(() => <AccountsPanel />);
+    await view.findByText("work");
+    fireEvent.click(view.getByRole("tab", { name: /^local/ }));
+    fireEvent.click(view.getByText("+ Key and headers"));
+    fireEvent.input(view.getByPlaceholderText("company-max"), { target: { value: "alt" } });
+    fireEvent.input(view.container.querySelector<HTMLInputElement>('input[type="password"]')!, { target: { value: "sk-1" } });
+    fireEvent.click(view.getByText("+ Header"));
+    fireEvent.input(view.getByPlaceholderText("x-workspace"), { target: { value: "x-team" } });
+    expect((view.getByText("Add account") as HTMLButtonElement).disabled).toBe(true);
+    view.getByText("every header needs a value");
+    fireEvent.input(view.getByPlaceholderText("value"), { target: { value: "t-2" } });
+    fireEvent.click(view.getByText("Add account"));
+    await waitFor(() => expect(sent()).toContainEqual(expect.objectContaining({ type: "accounts.set", headers: { "x-team": "t-2" } })));
+  });
+
+  it("secret fields ask the browser not to offer saving them as a password", async () => {
+    clientRequestMock.mockResolvedValue(result(ALL));
+    const view = render(() => <AccountsPanel />);
+    await view.findByText("work");
+    fireEvent.click(view.getByText("+ Anthropic-compatible gateway"));
+    fireEvent.click(view.getByText("+ Header"));
+    const secrets = [...view.container.querySelectorAll<HTMLInputElement>('input[type="password"]')];
+    expect(secrets.length).toBe(2);
+    for (const el of secrets) expect(el.getAttribute("autocomplete")).toBe("new-password");
+    fireEvent.click(view.getByText("Cancel"));
+
+    fireEvent.click(view.getByRole("tab", { name: /^pi/ }));
+    fireEvent.click(view.getByText("+ Provider keys"));
+    fireEvent.click(view.getByText("+ Key"));
+    expect(view.container.querySelector('input[type="password"]')!.getAttribute("autocomplete")).toBe("new-password");
+  });
+
+  it("the sign-in code field asks the browser not to save it", async () => {
+    const LOGIN = { loginId: "C7", verificationUrl: "https://claude.ai/oauth/c7", codeHint: "", mode: "code", expiresAt: 0 };
+    clientRequestMock.mockImplementation(async (msg) => {
+      if (msg.type === "backend.login.start") return { type: "backend.login.start.result", requestId: "r", login: LOGIN };
+      return result([claude()]);
+    });
+    const view = render(() => <AccountsPanel />);
+    fireEvent.click(await view.findByText("+ Sign in: Pro/Max subscription"));
+    fireEvent.input(view.getByPlaceholderText("company-max"), { target: { value: "p" } });
+    fireEvent.click(view.getByText("Get sign-in link"));
+    await view.findByText(LOGIN.verificationUrl);
+    expect(view.getByPlaceholderText("Paste the code").getAttribute("autocomplete")).toBe("new-password");
+  });
+
+  it("the default account can't be removed until another is the default", async () => {
+    clientRequestMock.mockResolvedValue(result([claude([WORK], "work")]));
+    const { findByText, getByText } = render(() => <AccountsPanel />);
+    await findByText("work");
+    const remove = getByText("Remove") as HTMLButtonElement;
+    expect(remove.disabled).toBe(true);
+    expect(remove.title).toMatch(/set another default first/);
+  });
+
+  it("the daemon's refusal to remove a default (changed elsewhere) is shown", async () => {
+    const REFUSAL = '"work" is the claude default — set another default (or "default") first';
+    clientRequestMock.mockImplementation(async (msg) => {
+      if (msg.type === "accounts.remove") throw new Error(REFUSAL);
+      return result([claude([WORK])]);
+    });
+    const { findByText, getByText, getAllByText, findByRole } = render(() => <AccountsPanel />);
+    await findByText("work");
+    fireEvent.click(getByText("Remove"));
+    await findByText(/stop until switched/);
+    fireEvent.click(getAllByText("Remove")[0]!);
+    expect((await findByRole("alert")).textContent).toContain("set another default");
+  });
+
+  it("backend tabs: roving tabindex, arrow keys move focus, and the panel is labelled by the selected tab", async () => {
+    clientRequestMock.mockResolvedValue(result(ALL));
+    const { findByText, getAllByRole, getByRole } = render(() => <AccountsPanel />);
+    await findByText("work");
+    const tabs = getAllByRole("tab");
+    expect(tabs.map((t) => t.tabIndex)).toEqual([0, -1, -1, -1, -1, -1]);
+    const panel = getByRole("tabpanel");
+    expect(tabs[0]!.getAttribute("aria-controls")).toBe(panel.id);
+    expect(panel.getAttribute("aria-labelledby")).toBe(tabs[0]!.id);
+
+    tabs[0]!.focus();
+    fireEvent.keyDown(tabs[0]!, { key: "ArrowRight" });
+    expect(document.activeElement).toBe(tabs[1]);
+    // Focus alone doesn't switch (it would drop a half-filled form).
+    expect(tabs[0]!.getAttribute("aria-selected")).toBe("true");
+    fireEvent.keyDown(tabs[1]!, { key: "ArrowLeft" });
+    fireEvent.keyDown(tabs[0]!, { key: "ArrowLeft" });
+    expect(document.activeElement).toBe(tabs[5]);
+    fireEvent.keyDown(tabs[5]!, { key: "Home" });
+    expect(document.activeElement).toBe(tabs[0]);
+    fireEvent.keyDown(tabs[0]!, { key: "End" });
+    fireEvent.click(tabs[5]!);
+    expect(tabs[5]!.getAttribute("aria-selected")).toBe("true");
+    expect(tabs.map((t) => t.tabIndex)).toEqual([-1, -1, -1, -1, -1, 0]);
+    expect(getByRole("tabpanel").getAttribute("aria-labelledby")).toBe(tabs[5]!.id);
   });
 });

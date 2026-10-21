@@ -181,6 +181,90 @@ describe("NewSessionModal account picker", () => {
     await waitFor(() => expect(requestMock).toHaveBeenCalled());
     expect("account" in (requestMock.mock.calls[0]![0] as Record<string, unknown>)).toBe(false);
   });
+
+  const withClaudeAccount = () =>
+    _setAccountsForTest([
+      {
+        backend: "claude",
+        displayName: "Claude",
+        defaultAccount: "default",
+        accounts: [{ backend: "claude", name: "work", kind: "subscription", createdAt: "", updatedAt: "" }],
+        kinds: accountKindsFor("claude"),
+      },
+      { backend: "pi", displayName: "pi", defaultAccount: "default", accounts: [], kinds: accountKindsFor("pi") },
+    ]);
+
+  it("an account on the default backend is sent with that backend, so a pack role can't move it to another", async () => {
+    authMock.mockReturnValue(authOk(["claude", "pi"]));
+    withClaudeAccount();
+    requestMock.mockResolvedValue({ id: "s-new", name: "n", workdir: "/w" });
+    const { getByText, getByPlaceholderText, getByLabelText } = render(() => <NewSessionModal />);
+    openNewSessionModal();
+    fireEvent.change(getByLabelText("Account"), { target: { value: "work" } });
+    fireEvent.input(getByPlaceholderText("e.g. shield-refactor"), { target: { value: "c" } });
+    fireEvent.click(getByText("create"));
+    await waitFor(() =>
+      expect(requestMock).toHaveBeenCalledWith(expect.objectContaining({ type: "session.create", providerId: "claude", account: "work" })),
+    );
+  });
+
+  it("an account another client removed is dropped, not sent", async () => {
+    authMock.mockReturnValue(authOk(["claude", "pi"]));
+    withClaudeAccount();
+    requestMock.mockResolvedValue({ id: "s-new", name: "n", workdir: "/w" });
+    const { getByText, getByPlaceholderText, getByLabelText } = render(() => <NewSessionModal />);
+    openNewSessionModal();
+    fireEvent.change(getByLabelText("Account"), { target: { value: "work" } });
+    // accounts.changed → refetch: "work" is gone, another account remains.
+    _setAccountsForTest([
+      {
+        backend: "claude",
+        displayName: "Claude",
+        defaultAccount: "default",
+        accounts: [{ backend: "claude", name: "other", kind: "subscription", createdAt: "", updatedAt: "" }],
+        kinds: accountKindsFor("claude"),
+      },
+    ]);
+    expect((getByLabelText("Account") as HTMLSelectElement).value).toBe("");
+    fireEvent.input(getByPlaceholderText("e.g. shield-refactor"), { target: { value: "c" } });
+    fireEvent.click(getByText("create"));
+    await waitFor(() => expect(requestMock).toHaveBeenCalled());
+    const sent = requestMock.mock.calls[0]![0] as Record<string, unknown>;
+    expect("account" in sent).toBe(false);
+    expect("providerId" in sent).toBe(false);
+  });
+
+  it("the daemon's default backend changing under the dialog drops the account", async () => {
+    authMock.mockReturnValue(authOk(["claude", "pi"]));
+    _setAccountsForTest([
+      {
+        backend: "claude",
+        displayName: "Claude",
+        defaultAccount: "default",
+        accounts: [{ backend: "claude", name: "work", kind: "subscription", createdAt: "", updatedAt: "" }],
+        kinds: accountKindsFor("claude"),
+      },
+      {
+        backend: "pi",
+        displayName: "pi",
+        defaultAccount: "default",
+        // Same name on another backend: still not the one that was picked.
+        accounts: [{ backend: "pi", name: "work", kind: "api-keys", createdAt: "", updatedAt: "" }],
+        kinds: accountKindsFor("pi"),
+      },
+    ]);
+    requestMock.mockResolvedValue({ id: "s-new", name: "n", workdir: "/w" });
+    const { getByText, getByPlaceholderText, getByLabelText } = render(() => <NewSessionModal />);
+    openNewSessionModal();
+    fireEvent.change(getByLabelText("Account"), { target: { value: "work" } });
+    // providers.changed: pi is the default now.
+    authOk(["pi", "claude"]);
+    expect((getByLabelText("Account") as HTMLSelectElement).value).toBe("");
+    fireEvent.input(getByPlaceholderText("e.g. shield-refactor"), { target: { value: "c" } });
+    fireEvent.click(getByText("create"));
+    await waitFor(() => expect(requestMock).toHaveBeenCalled());
+    expect("account" in (requestMock.mock.calls[0]![0] as Record<string, unknown>)).toBe(false);
+  });
 });
 
 describe("NewSessionModal pack + role picker", () => {

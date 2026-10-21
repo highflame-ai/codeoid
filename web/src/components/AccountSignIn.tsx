@@ -154,7 +154,7 @@ export const AccountSignIn: Component<{
                 placeholder="Paste the code"
                 value={code()}
                 onInput={(e) => setCode(e.currentTarget.value)}
-                autocomplete="off"
+                autocomplete="new-password"
               />
               <button type="submit" class={button} disabled={!code().trim() || st().phase === "submitting"}>
                 {st().phase === "submitting" ? "Finishing…" : "Finish"}
@@ -192,7 +192,11 @@ export const AccountSignIn: Component<{
             <LoginLink url={login().verificationUrl} />
             <p class="text-[11px] text-fg-faint">{login().codeHint}</p>
             <div class="flex items-center gap-2">
-              <span class="text-[12px] text-fg-muted">Waiting for you to approve…</span>
+              <span class="text-[12px] text-fg-muted" role="status">
+                {st().reconnecting
+                  ? "Connection lost — reconnecting… The sign-in carries on; you can still approve it."
+                  : "Waiting for you to approve…"}
+              </span>
               <button type="button" class={button} onClick={close}>
                 Cancel
               </button>

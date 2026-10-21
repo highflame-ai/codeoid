@@ -13,7 +13,7 @@
  * never sends one back.
  */
 
-import { type Component, For, Index, Show, createSignal, onMount } from "solid-js";
+import { type Component, For, Index, Show, createSignal, createUniqueId, onMount } from "solid-js";
 
 import {
   accountDetail,
@@ -56,6 +56,22 @@ export const AccountsPanel: Component = () => {
 
   const backends = () => accountsState().backends;
   const current = () => backendAccounts(selected() ?? undefined) ?? backends()[0];
+  const tabbed = () => backends().length > 1;
+
+  // ARIA tabs (manual activation): arrows / Home / End move focus along the
+  // tabs, Enter or Space selects. Selecting rebuilds the section below, so
+  // focus alone must not — it would drop a half-filled form or end a sign-in.
+  const uid = createUniqueId();
+  const tabId = (backend: string) => `${uid}-tab-${encodeURIComponent(backend)}`;
+  const panelId = `${uid}-panel`;
+  const onTabKey = (e: KeyboardEvent, i: number) => {
+    const n = backends().length;
+    const to = { ArrowRight: i + 1, ArrowDown: i + 1, ArrowLeft: i - 1, ArrowUp: i - 1, Home: 0, End: n - 1 }[e.key];
+    if (to === undefined) return;
+    e.preventDefault();
+    const next = backends()[(to + n) % n];
+    if (next) document.getElementById(tabId(next.backend))?.focus();
+  };
 
   return (
     <div class="space-y-4">
@@ -72,15 +88,20 @@ export const AccountsPanel: Component = () => {
         <div class="rounded border border-danger/40 bg-danger/10 px-3 py-2 text-sm text-danger">{accountsState().error}</div>
       </Show>
 
-      <Show when={backends().length > 1}>
+      <Show when={tabbed()}>
         <div class="flex flex-wrap gap-1.5" role="tablist" aria-label="Backend">
           <For each={backends()}>
-            {(b) => (
+            {(b, i) => (
               <button
                 type="button"
                 role="tab"
+                id={tabId(b.backend)}
                 aria-selected={current()?.backend === b.backend}
+                aria-controls={panelId}
+                // Roving tabindex: Tab enters the list on the selected tab.
+                tabindex={current()?.backend === b.backend ? 0 : -1}
                 onClick={() => setSelected(b.backend)}
+                onKeyDown={(e) => onTabKey(e, i())}
                 class={`rounded border px-2.5 py-1 text-[12px] transition ${
                   current()?.backend === b.backend
                     ? "border-accent/60 bg-accent/10 text-accent"
@@ -99,7 +120,15 @@ export const AccountsPanel: Component = () => {
 
       {/* Keyed: switching backend drops a half-filled form and a pending removal. */}
       <Show when={current()?.backend} keyed>
-        {(backend) => <BackendSection backend={backend} />}
+        {(backend) => (
+          <div
+            id={panelId}
+            role={tabbed() ? "tabpanel" : undefined}
+            aria-labelledby={tabbed() ? tabId(backend) : undefined}
+          >
+            <BackendSection backend={backend} />
+          </div>
+        )}
       </Show>
     </div>
   );
@@ -250,9 +279,17 @@ const AccountRow: Component<{
     </Show>
     <Show when={props.onRemove}>
       <Show
-        when={props.confirming}
+        when={props.confirming && !props.isDefault}
         fallback={
-          <button type="button" class={button} disabled={props.busy !== null} onClick={() => props.onRemove?.()}>
+          // The daemon refuses removing the default: the sessions following it
+          // would have no account to fall back to.
+          <button
+            type="button"
+            class={button}
+            disabled={props.busy !== null || props.isDefault}
+            title={props.isDefault ? "This is the default — set another default first" : undefined}
+            onClick={() => props.onRemove?.()}
+          >
             Remove
           </button>
         }
@@ -302,6 +339,8 @@ const AccountForm: Component<{ backend: string; kind: AccountKindInfo; onDone: (
     if (k.token?.required && !token().trim()) return `${k.token.label} is required`;
     if (k.baseUrl?.required && !baseUrl()) return `${k.baseUrl.label} is required`;
     if (namedKeys().some((v) => !v.value.trim())) return "every key needs a value";
+    // The daemon refuses a header with no value rather than send it blank.
+    if (namedHeaders().some((h) => !h.value.trim())) return "every header needs a value";
     // A kind with no single required field (an endpoint's key-and/or-headers,
     // pi's key set) still has to carry something.
     if (!token().trim() && namedHeaders().length === 0 && namedKeys().length === 0) {
@@ -317,7 +356,7 @@ const AccountForm: Component<{ backend: string; kind: AccountKindInfo; onDone: (
     setError(null);
     try {
       const hs: Record<string, string> = {};
-      for (const h of namedHeaders()) hs[h.name.trim()] = h.value;
+      for (const h of namedHeaders()) hs[h.name.trim()] = h.value.trim();
       const env: Record<string, string> = {};
       for (const v of namedKeys()) env[v.name] = v.value.trim();
       await saveAccount({
@@ -388,7 +427,13 @@ const AccountForm: Component<{ backend: string; kind: AccountKindInfo; onDone: (
               {spec().label}
               {spec().required ? "" : " (optional)"}
             </span>
-            <input class={input} type="password" value={token()} onInput={(e) => setToken(e.currentTarget.value)} autocomplete="off" />
+            <input
+              class={input}
+              type="password"
+              value={token()}
+              onInput={(e) => setToken(e.currentTarget.value)}
+              autocomplete="new-password"
+            />
           </label>
         )}
       </Show>
@@ -449,6 +494,7 @@ const KeysEditor: Component<{
               type="password"
               placeholder="value"
               aria-label={`${row().name} value`}
+              autocomplete="new-password"
               value={row().value}
               onInput={(e) => props.onChange(props.rows.map((r, j) => (j === i ? { ...r, value: e.currentTarget.value } : r)))}
             />

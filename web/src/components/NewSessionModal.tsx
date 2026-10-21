@@ -193,6 +193,16 @@ const NewSessionModal: Component = () => {
   // than the built-in one to choose from.
   const providerAccounts = () => backendAccounts(effectiveProvider());
   const showAccountPicker = () => (providerAccounts()?.accounts.length ?? 0) > 0;
+  // An account name means something only on the backend it was picked from.
+  // The landing backend can change under it without a click — the daemon's
+  // default backend moves (providers.changed) — so follow the backend, not the
+  // buttons.
+  createEffect(on(effectiveProvider, () => setAccount(""), { defer: true }));
+  // And a named account another client removed is no choice at all.
+  createEffect(() => {
+    const a = account();
+    if (a && a !== DEFAULT_ACCOUNT && !providerAccounts()?.accounts.some((x) => x.name === a)) setAccount("");
+  });
 
   // Installed packs from the daemon-canonical pack state. Empty when none are
   // installed OR when the fetch was rejected (e.g. the session token lacks
@@ -519,8 +529,14 @@ const NewSessionModal: Component = () => {
         id: newRequestId(),
         name: n,
         workdir: wd,
-        ...(providerId() ? { providerId: providerId() } : {}),
-        ...(showAccountPicker() && account() ? { account: account() } : {}),
+        // An account goes with the backend it belongs to, stated explicitly:
+        // left implicit, the daemon picks the backend — a pack role's binding,
+        // say — and the name would land on a backend it wasn't chosen for.
+        ...(showAccountPicker() && account()
+          ? { providerId: effectiveProvider(), account: account() }
+          : providerId()
+            ? { providerId: providerId() }
+            : {}),
         ...(packId() ? { pack: packId() } : {}),
         ...(packRole() ? { packRole: packRole() } : {}),
       });
@@ -868,9 +884,8 @@ const NewSessionModal: Component = () => {
                       role="radio"
                       aria-checked={providerId() === id || (!providerId() && i() === 0)}
                       onClick={() => {
-                        const next = i() === 0 ? "" : id;
-                        if (next !== providerId()) setAccount("");
-                        setProviderId(next);
+                        // A change of backend drops the account (effect above).
+                        setProviderId(i() === 0 ? "" : id);
                       }}
                       class={`rounded border px-2 py-0.5 font-mono text-[12px] transition ${
                         providerId() === id || (!providerId() && i() === 0)

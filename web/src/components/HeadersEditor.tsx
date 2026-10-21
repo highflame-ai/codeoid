@@ -32,6 +32,7 @@ export const HeadersEditor: Component<{
             class={input}
             type="password"
             placeholder="value"
+            autocomplete="new-password"
             value={row().value}
             onInput={(e) => props.onChange(props.rows.map((r, j) => (j === i ? { ...r, value: e.currentTarget.value } : r)))}
           />

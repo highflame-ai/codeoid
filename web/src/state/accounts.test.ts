@@ -1,21 +1,31 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const clientRequestMock = vi.hoisted(() => vi.fn<(msg: { type: string }) => Promise<unknown>>());
+const clientRequestMock = vi.hoisted(() => vi.fn<(msg: { type: string; loginId?: string }) => Promise<unknown>>());
+const sendMock = vi.hoisted(() => vi.fn());
+const conn = vi.hoisted(() => ({ kind: "connected" }));
 vi.mock("./connection", () => ({
   request: vi.fn(),
+  send: sendMock,
   newRequestId: () => "r",
   getClient: () => ({ request: clientRequestMock }),
+  connectionStatus: () => ({ kind: conn.kind }),
 }));
 
 import {
   _resetAccountsForTest,
   _setAccountsForTest,
   accountDetail,
+  accountLoginState,
   accountsState,
   backendOffersAccounts,
+  cancelAccountLogin,
   fetchAccounts,
+  isConnectionError,
   newAccountNameProblem,
   refreshAccounts,
+  resumeAccountLogin,
+  startAccountLogin,
+  submitAccountLoginCode,
 } from "./accounts";
 import type { BackendAccountsInfo } from "../protocol/types";
 
@@ -32,6 +42,8 @@ const OK = { type: "accounts.result", requestId: "r", backends: [CLAUDE] };
 afterEach(() => {
   _resetAccountsForTest();
   clientRequestMock.mockReset();
+  sendMock.mockReset();
+  conn.kind = "connected";
 });
 
 describe("accounts list", () => {
@@ -101,5 +113,113 @@ describe("account helpers", () => {
     expect(
       accountDetail({ backend: "pi", name: "p", kind: "api-keys", envNames: ["OPENAI_API_KEY", "GROQ_API_KEY"], createdAt: "", updatedAt: "" }),
     ).toBe("Provider keys · keys: OPENAI_API_KEY, GROQ_API_KEY");
+  });
+});
+
+describe("device sign-in across a dropped connection", () => {
+  const DEVICE = {
+    loginId: "D1",
+    backend: "codex" as const,
+    verificationUrl: "https://auth.openai.com/codex/device",
+    codeHint: "",
+    mode: "device" as const,
+    userCode: "ABCD-EFGH",
+    expiresAt: Date.now() + 60_000,
+  };
+  const waits = () => clientRequestMock.mock.calls.filter((c) => c[0].type === "backend.login.wait");
+
+  /** Start a device login whose waits are answered, in order, by `answers` (an Error rejects). */
+  function startWith(...answers: unknown[]) {
+    clientRequestMock.mockImplementation(async (msg) => {
+      if (msg.type === "backend.login.start") return { type: "backend.login.start.result", requestId: "r", login: DEVICE };
+      if (msg.type === "backend.login.wait") {
+        const a = answers.shift();
+        if (a instanceof Error) throw a;
+        return a ?? new Promise(() => {});
+      }
+      if (msg.type === "backend.login.cancel") return { type: "backend.login.cancel.result", requestId: "r", ok: true };
+      return OK;
+    });
+    return startAccountLogin("codex", "team");
+  }
+
+  it("keeps waiting through the drop and sends the wait again on reconnect, then finishes", async () => {
+    conn.kind = "reconnecting";
+    const done = startWith(new Error("connection lost (socket closed (code 1006))"), { type: "backend.login.wait.result", requestId: "r", ok: true });
+    await vi.waitFor(() => expect(accountLoginState().reconnecting).toBe(true));
+    // Still the same attempt: the link and code stay up, and Cancel can end it.
+    expect(accountLoginState()).toMatchObject({ phase: "waiting", error: null, login: { loginId: "D1" } });
+    expect(waits()).toHaveLength(1);
+
+    conn.kind = "connected";
+    resumeAccountLogin();
+    expect(await done).toBe(true);
+    expect(waits().map((c) => c[0].loginId)).toEqual(["D1", "D1"]);
+    expect(accountLoginState()).toMatchObject({ phase: "idle", error: null, reconnecting: false });
+    expect(clientRequestMock.mock.calls.some((c) => c[0].type === "accounts.list")).toBe(true);
+  });
+
+  it("a wait that timed out on a live socket simply asks again", async () => {
+    const done = startWith(new Error("request r timed out"), { type: "backend.login.wait.result", requestId: "r", ok: true });
+    expect(await done).toBe(true);
+    expect(waits()).toHaveLength(2);
+  });
+
+  it("a daemon refusal is not a dropped connection: it ends the attempt", async () => {
+    const done = startWith(new Error("unknown sign-in attempt"));
+    expect(await done).toBe(false);
+    expect(accountLoginState()).toMatchObject({ phase: "idle", login: null, error: "unknown sign-in attempt" });
+    expect(waits()).toHaveLength(1);
+  });
+
+  it("Cancel while disconnected queues the cancel for the reconnect and ends the parked wait", async () => {
+    conn.kind = "reconnecting";
+    const done = startWith(new Error("connection lost (x)"));
+    await vi.waitFor(() => expect(accountLoginState().reconnecting).toBe(true));
+    clientRequestMock.mockImplementation(async (msg) => {
+      if (msg.type === "backend.login.cancel") throw new Error("cannot request while reconnecting");
+      throw new Error("unexpected");
+    });
+    await cancelAccountLogin();
+    expect(sendMock).toHaveBeenCalledWith(expect.objectContaining({ type: "backend.login.cancel", loginId: "D1" }));
+    expect(await done).toBe(false);
+    expect(accountLoginState().phase).toBe("idle");
+    // Back online, nothing asks after the abandoned attempt.
+    conn.kind = "connected";
+    resumeAccountLogin();
+    await Promise.resolve();
+    expect(waits()).toHaveLength(1);
+  });
+
+  it("only the core client's transport failures count as a dropped connection", () => {
+    for (const m of ["cannot request while reconnecting", "connection lost (bye)", "connection reset", "client shutdown", "request 1-2-x timed out"]) {
+      expect(isConnectionError(new Error(m))).toBe(true);
+    }
+    expect(isConnectionError(new Error("That sign-in attempt was cancelled."))).toBe(false);
+  });
+});
+
+describe("code sign-in — a rejected code", () => {
+  const CODE = { loginId: "C1", backend: "claude" as const, verificationUrl: "https://claude.ai/x", codeHint: "", mode: "code" as const, expiresAt: 0 };
+
+  async function submitWith(result: Record<string, unknown>) {
+    clientRequestMock.mockImplementation(async (msg) => {
+      if (msg.type === "backend.login.start") return { type: "backend.login.start.result", requestId: "r", login: CODE };
+      if (msg.type === "backend.login.submit") return { type: "backend.login.submit.result", requestId: "r", ...result };
+      return OK;
+    });
+    await startAccountLogin("claude", "personal");
+    expect(accountLoginState().phase).toBe("awaiting_code");
+    return submitAccountLoginCode("bad");
+  }
+
+  it("retryable: the attempt is still open, so the code form stays with the error", async () => {
+    expect(await submitWith({ ok: false, retryable: true, error: "That doesn't look like a code." })).toBe(false);
+    expect(accountLoginState()).toMatchObject({ phase: "awaiting_code", login: { loginId: "C1" }, error: "That doesn't look like a code." });
+  });
+
+  it("not retryable: the daemon ended the attempt, so the form starts over with the error", async () => {
+    expect(await submitWith({ ok: false, error: "The code was rejected." })).toBe(false);
+    expect(accountLoginState()).toMatchObject({ phase: "idle", login: null, error: "The code was rejected." });
   });
 });
