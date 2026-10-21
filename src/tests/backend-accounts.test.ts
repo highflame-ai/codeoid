@@ -185,6 +185,15 @@ describe("daemon: accounts on an endpoint backend", () => {
     expect(seen.filter((r) => r.auth === "Bearer sk-team")).toHaveLength(0);
   });
 
+  test("subscribers hear which backend's accounts changed — never what changed", async () => {
+    await handle({ type: "providers.list", id: "p" });
+    pushed.length = 0;
+    await setup();
+    const changed = pushed.filter((m) => m.type === "accounts.changed");
+    expect(changed).toContainEqual({ type: "accounts.changed", backend: "oai:box" });
+    expect(JSON.stringify(changed)).not.toContain("sk-personal");
+  });
+
   test("listing never carries a secret; names are refused unless replaced explicitly", async () => {
     await setup();
     const listed = await handle({ type: "accounts.list", id: "l", backend: "oai:box" });
@@ -398,6 +407,9 @@ describe("daemon: a Codex sign-in creates a ChatGPT account", () => {
       const again = (await handle({ type: "backend.login.start", id: "4", backend: "codex", account: "chat", replace: true })) as unknown as { login: { loginId: string } };
       expect((await handle({ type: "backend.login.wait", id: "5", loginId: again.login.loginId })).ok).toBe(true);
       expect(accounts.get("codex", "chat")?.generation).toBe(2);
+      // The same rule for every backend: a Claude sign-in under a taken name replaces it only explicitly.
+      accounts.upsert({ backend: "claude", name: "max", kind: "subscription", token: "sk-ant-oat01-EXISTINGTOKEN000000" });
+      expect(await handle({ type: "backend.login.start", id: "6", backend: "claude", account: "max" })).toMatchObject({ error: expect.stringContaining("already exists") });
     } finally {
       broker.dispose();
       await transcript.flush().catch(() => {});

@@ -248,6 +248,17 @@ export interface SessionSetAccountMsg {
 
 // ── Messages (daemon → client) ────────────────────────────────────────────────
 
+/**
+ * Pushed when `backend`'s accounts or default changed (by any client, a
+ * sign-in, or a hand edit of accounts.json), to every client that subscribed
+ * to the backend list (`providers.list`). Names the backend only — a client
+ * that may read accounts refetches them.
+ */
+export interface AccountsChangedMsg {
+  type: "accounts.changed";
+  backend: string;
+}
+
 export interface AccountsResultMsg {
   type: "accounts.result";
   requestId: string;

@@ -34,6 +34,7 @@ import type {
   BackendLoginWaitResultMsg,
 } from "./backend-login.js";
 import type {
+  AccountsChangedMsg,
   AccountsListMsg,
   AccountsRemoveMsg,
   AccountsResultMsg,
@@ -2901,6 +2902,7 @@ export type DaemonMessage =
   | SessionApprovalsResultMsg
   | ClaudeAccountsResultMsg
   | AccountsResultMsg
+  | AccountsChangedMsg
   | ProvidersResultMsg
   | ProvidersChangedMsg
   | EndpointsResultMsg

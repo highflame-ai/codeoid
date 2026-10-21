@@ -47,6 +47,13 @@ export type LoginBackend = "claude" | "codex" | "gemini-cli";
 /** Runtime companion to {@link LoginBackend} — what a client renders a button for. */
 export const LOGIN_CAPABLE_BACKENDS: readonly LoginBackend[] = ["claude", "codex", "gemini-cli"] as const;
 
+/**
+ * Backends whose sign-in only creates a NAMED account (accounts.ts) — there is
+ * no daemon-wide login of theirs to replace. A client offers their sign-in
+ * under Accounts, never as the daemon's own login.
+ */
+export const LOGIN_ACCOUNT_ONLY_BACKENDS: readonly LoginBackend[] = ["codex", "gemini-cli"] as const;
+
 /** A login the daemon has started and is holding open, waiting for a code. */
 export interface PendingBackendLogin {
   /** Opaque handle for the in-flight attempt; required to submit or cancel. */

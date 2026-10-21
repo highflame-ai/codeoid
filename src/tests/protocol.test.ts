@@ -468,6 +468,8 @@ describe("DaemonMessage routing", () => {
           return `claude-accounts:${msg.accounts.length}`;
         case "accounts.result":
           return `accounts:${msg.backends.length}`;
+        case "accounts.changed":
+          return `accounts.changed:${msg.backend}`;
         case "providers.result":
           return `providers:${msg.providers.length}`;
         case "providers.changed":

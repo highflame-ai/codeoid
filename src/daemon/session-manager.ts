@@ -566,8 +566,9 @@ export class SessionManager {
     }
     watchEndpointProviders(this.#providers, this.#endpoints, this.#endpointCatalog, () => this.#pushProviders());
     // A keyed backend that gains accounts while the daemon runs becomes pickable.
-    this.#accounts.onChange(() => {
+    this.#accounts.onChange((backend) => {
       if (registerAccountBackends(this.#providers, this.#accounts)) this.#pushProviders();
+      this.#pushToProviderSubscribers({ type: "accounts.changed", backend });
     });
     this.#hooks = opts?.hooks;
     this.#testProviderFactory = opts?._testProviderFactory;
@@ -2264,16 +2265,15 @@ mcpHub: this.#mcpHub,
       // machine's own login. An existing account is replaced only explicitly.
       if (msg.account !== undefined) {
         validateAccountName(msg.account);
-        if (this.#accounts.get(msg.backend, msg.account) && !msg.replace && msg.backend !== "claude") {
+        if (this.#accounts.get(msg.backend, msg.account) && !msg.replace) {
           throw new AccountError(`a ${msg.backend} account named "${msg.account}" already exists — replace it explicitly, or pick another name`);
         }
       }
       const login = await this.#backendLogin.start(msg.backend, { isolated: msg.account !== undefined });
       // A new attempt supersedes any other for this backend: forget theirs.
       for (const id of [...this.#accountLogins.keys()]) if (!this.#backendLogin.isOpen(id)) this.#accountLogins.delete(id);
-      // Claude keeps #392's contract (a sign-in under a taken name renews it).
       if (msg.account !== undefined) {
-        this.#accountLogins.set(login.loginId, { backend: msg.backend, name: msg.account, replace: msg.backend === "claude" || msg.replace === true });
+        this.#accountLogins.set(login.loginId, { backend: msg.backend, name: msg.account, replace: msg.replace === true });
       }
       this.#store.audit(
         auth.sub,
@@ -2372,6 +2372,10 @@ mcpHub: this.#mcpHub,
           // A named Claude account keeps ONLY the token the command printed:
           // it ran against a throwaway config dir, so there is no on-disk fallback.
           if (outcome.secret?.key !== "CLAUDE_CODE_OAUTH_TOKEN") return "Signed in, but claude setup-token didn't print a token to store for this account.";
+          // Added meanwhile by someone else: replace it only if this sign-in said so.
+          if (!pending.replace && this.#accounts.get("claude", pending.name)) {
+            return `Signed in, but a claude account named "${pending.name}" was added meanwhile — sign in again to replace it`;
+          }
           this.#claudeAccounts.upsert({ name: pending.name, kind: "subscription", token: outcome.secret.value });
         } else {
           if (!outcome.files || Object.keys(outcome.files).length === 0) return `Signed in, but the ${pending.backend} sign-in left no credential to keep.`;
@@ -2746,7 +2750,11 @@ mcpHub: this.#mcpHub,
   }
 
   #pushProviders(): void {
-    const msg: DaemonMessage = { type: "providers.changed", providers: this.providerInfo() };
+    this.#pushToProviderSubscribers({ type: "providers.changed", providers: this.providerInfo() });
+  }
+
+  /** Send to every client subscribed to the backend list (providers.list). */
+  #pushToProviderSubscribers(msg: DaemonMessage): void {
     for (const [id, client] of this.#providerSubscribers) {
       try {
         client.send(msg);
