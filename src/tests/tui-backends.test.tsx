@@ -234,6 +234,28 @@ describe("TUI backend dialogs", () => {
     expect(submissions).toEqual([{ name: "on-default", workdir: process.cwd(), providerId: "claude", account: "work" }]);
   });
 
+  it("takes the daemon default from isDefault, not from its place in the list", async () => {
+    const submissions: unknown[] = [];
+    const requested: string[] = [];
+    const codexDefault: ProviderInfo[] = [
+      { id: "claude", displayName: "Claude", kind: "builtin", isDefault: false },
+      { id: "codex", displayName: "Codex", kind: "builtin", isDefault: true },
+    ];
+    const client = accountsClient({ codex: ["chat"] }, "default", requested);
+    const ui = await mount(<NewSessionModal providers={codexDefault} client={client} onCancel={() => {}}
+      onSubmit={async (name, workdir, options) => { submissions.push({ name, workdir, ...options }); }} />);
+    await ui.press("cx");
+    await ui.press("\t");
+    await ui.press("\t");
+    expect(ui.frame()).toContain("provider: Daemon default (Codex)");
+    await ui.press("\t");
+    await waitFor(() => requested.includes("codex") && ui.frame().includes("Follow daemon default"));
+    await ui.press("\u001b[D");
+    expect(ui.frame()).toContain("account: chat");
+    await ui.press("\r");
+    expect(submissions).toEqual([{ name: "cx", workdir: process.cwd(), providerId: "codex", account: "chat" }]);
+  });
+
   it("leaves the backend to the daemon when no account is chosen", async () => {
     const submissions: unknown[] = [];
     const ui = await mount(<NewSessionModal providers={providers} client={accountsClient({ claude: ["work"] })} onCancel={() => {}}

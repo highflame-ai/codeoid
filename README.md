@@ -348,7 +348,7 @@ A lightweight in-daemon backend that talks to the Gemini API. Set `GOOGLE_API_KE
 
 ### Accounts
 
-Every backend that takes credentials can hold several named accounts: Claude subscriptions and gateways, ChatGPT sign-ins for Codex, and API keys for the Gemini CLI, OpenAI, Gemini, Qwen, pi, llama.cpp and each `oai:<name>` endpoint.
+Every backend that takes credentials can hold several named accounts: Claude subscriptions, gateways and API keys, ChatGPT sign-ins or API keys for Codex, and API keys for the Gemini CLI, OpenAI, Gemini, Qwen, pi, llama.cpp and each `oai:<name>` endpoint.
 An account is only the credential, so a session switched to another account keeps its conversation.
 Each backend has a built-in `default` account (the daemon's own login or environment) and a daemon default that sessions follow unless they pin one.
 A change applies from the session's next turn.

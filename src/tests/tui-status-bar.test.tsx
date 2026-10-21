@@ -54,7 +54,7 @@ describe("TUI StatusBar", () => {
   it("a missing account and the backend stay visible once the session has usage", () => {
     const usage = { inputTokens: 91_000, outputTokens: 12_000, cacheReadTokens: 80_000, cacheCreationTokens: 4_000, totalCostUsd: 3.21, numTurns: 9, durationMs: 1000 };
     const missing = (cols: number) => bar(session({ model: "claude-opus-4-8", claudeAccount: "gone", effectiveClaudeAccount: "gone (missing)", usage }), cols);
-    expect(missing(120)).toContain("account: gone (missing)");
+    expect(missing(120)).toContain("missing account: gone");
     expect(missing(100)).toContain("account: gone"); // narrower: the warning still beats usage
     const endpoint = bar(session({ providerId: "oai:box", model: "qwen3-coder", usage }), 120);
     expect(endpoint).toContain("on oai:box");
@@ -78,8 +78,8 @@ describe("TUI StatusBar", () => {
   });
 
   it("always shows a missing account, pinned or followed", () => {
-    expect(bar(session({ claudeAccount: "gone", effectiveClaudeAccount: "gone (missing)" }), 300)).toContain("account: gone (missing)");
-    expect(bar(session({ effectiveClaudeAccount: "? (missing)" }), 300)).toContain("⚠ account: ? (default, missing)");
+    expect(bar(session({ claudeAccount: "gone", effectiveClaudeAccount: "gone (missing)" }), 300)).toContain("missing account: gone");
+    expect(bar(session({ effectiveClaudeAccount: "? (missing)" }), 300)).toContain("⚠ missing default account: ?");
   });
 
   it("shows no account for a backend without accounts", () => {
@@ -97,15 +97,15 @@ describe("TUI StatusBar", () => {
   it("keeps a Codex session's missing account red next to the model, ahead of usage", () => {
     const usage = { inputTokens: 1000, outputTokens: 200, cacheReadTokens: 0, cacheCreationTokens: 0, totalCostUsd: 0.5, numTurns: 3, durationMs: 1000 };
     const out = bar(session({ providerId: "codex", model: "gpt-5.5-codex", account: "gone", effectiveAccount: "gone (missing)", usage }), 300);
-    expect(out).toContain("idle · ⚠ account: gone (missing) · 12s · mode: interactive · gpt-5.5-codex on codex");
-    expect(out.indexOf("account: gone (missing)")).toBeLessThan(out.indexOf("$"));
-    expect(bar(session({ providerId: "codex", account: "gone", effectiveAccount: "gone (missing)", usage }), 110)).toContain("account: gone (missing)");
+    expect(out).toContain("idle · ⚠ missing account: gone · 12s · mode: interactive · gpt-5.5-codex on codex");
+    expect(out.indexOf("missing account: gone")).toBeLessThan(out.indexOf("$"));
+    expect(bar(session({ providerId: "codex", account: "gone", effectiveAccount: "gone (missing)", usage }), 110)).toContain("missing account: gone");
   });
 
   it("hides a Codex session following the default onto the built-in account, and names a non-default default", () => {
     expect(bar(session({ providerId: "codex", effectiveAccount: "default" }), 300)).not.toContain("account:");
     expect(bar(session({ providerId: "codex", effectiveAccount: "team" }), 300)).toContain("account: team (following default)");
-    expect(bar(session({ providerId: "oai:box", effectiveAccount: "box-key (missing)" }), 300)).toContain("⚠ account: box-key (default, missing)");
+    expect(bar(session({ providerId: "oai:box", effectiveAccount: "box-key (missing)" }), 300)).toContain("⚠ missing default account: box-key");
   });
 
   // ` on <provider>` and a long model id used to come first and push the
@@ -122,16 +122,16 @@ describe("TUI StatusBar", () => {
         const out = bar(session({ status: "waiting_approval", ...extra, usage }), cols);
         expect(out.split("\n")).toHaveLength(1);
         expect(out).toContain("waiting_approval");
-        expect(out).toContain("⚠ account: work (missing)");
+        expect(out).toContain("⚠ missing account: work");
       }
     }
   });
 
   it("puts the missing-account warning right after the status, before the mode, model and backend", () => {
     const out = bar(session({ providerId: "codex", model: "gpt-5.5-codex", account: "work", effectiveAccount: "work (missing)" }), 300);
-    expect(out).toContain("feature-auth · idle · ⚠ account: work (missing) · 12s · mode: interactive");
-    expect(out.indexOf("⚠ account: work (missing)")).toBeLessThan(out.indexOf("gpt-5.5-codex"));
-    expect(out.indexOf("⚠ account: work (missing)")).toBeLessThan(out.indexOf("on codex"));
+    expect(out).toContain("feature-auth · idle · ⚠ missing account: work · 12s · mode: interactive");
+    expect(out.indexOf("⚠ missing account: work")).toBeLessThan(out.indexOf("gpt-5.5-codex"));
+    expect(out.indexOf("⚠ missing account: work")).toBeLessThan(out.indexOf("on codex"));
     // Shown once: not again as a descriptor beside the workdir.
     expect(out.split("account:")).toHaveLength(2);
   });
@@ -139,5 +139,10 @@ describe("TUI StatusBar", () => {
   it("does not show Claude's account on a session that has moved to another backend", () => {
     const out = bar(session({ providerId: "mock", claudeAccount: "work", effectiveClaudeAccount: "work" }), 300);
     expect(out).not.toContain("account:");
+  });
+
+  it("at 80 columns a long missing-account warning still says it is missing", () => {
+    const out = bar(session({ name: "a-rather-long-session-name", status: "waiting_approval", providerId: "codex", model: "gpt-5.5-codex", account: "work-subscription-for-the-team", effectiveAccount: "work-subscription-for-the-team (missing)" }), 80);
+    expect(out).toContain("⚠ missing"); // the point survives even when the name is cut
   });
 });

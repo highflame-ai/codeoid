@@ -1267,7 +1267,12 @@ export function App({ config, createClient = (c, d) => new TuiWsClient(c, d) }: 
     const client = wsRef.current;
     if (!client) throw new Error("Not connected");
     const response = await client.setAccount(sessionId, account || null, backend);
-    if (response.type === "response.error") throw new Error(response.error);
+    if (response.type === "response.error") {
+      // The picker may have closed meanwhile (the session moved backend):
+      // say what happened to a pick nobody is looking at any more.
+      if (modalRef.current?.kind !== "account") dispatch({ type: "error", message: `${backend} account not changed: ${response.error}` });
+      throw new Error(response.error);
+    }
   };
 
   // ── Layout ─────────────────────────────────────────────────────────────

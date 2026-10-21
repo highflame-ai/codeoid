@@ -115,7 +115,7 @@ export function StatusBar({
           {/* A MISSING account fails the next turn, so it comes right after
               the status — ahead of the model and backend, whose ids can
               be long enough to push it off a 100-column terminal. */}
-          {account?.missing && <Text color="red">{` · ⚠ account: ${account.label}`}</Text>}
+          {account?.missing && <Text color="red">{` · ⚠ ${account.label}`}</Text>}
           {workingSec !== null && (
             <Text color="yellow" dimColor>
               {` · ${formatDuration(workingSec)}`}
@@ -281,9 +281,9 @@ export function StatusBar({
  * `default` (the daemon's own login or environment) is the common case and
  * says nothing; a pinned account, a non-default daemon default, or a missing
  * account (which fails the next turn) is shown. A backend without accounts
- * reports neither field and shows nothing. A missing label is kept compact
- * ("work (missing)", "team (default, missing)"): it is shown near the start
- * of the bar.
+ * reports neither field and shows nothing. A missing label leads with what's
+ * wrong ("missing account: work", "missing default account: team"), so a
+ * narrow bar that cuts its end still says it.
  */
 function accountLabel(info: TuiSession["info"]): { label: string; missing: boolean } | null {
   // On a Claude session the daemon also reports the same choice under the
@@ -294,9 +294,10 @@ function accountLabel(info: TuiSession["info"]): { label: string; missing: boole
   if (choice === undefined && reported === undefined) return null;
   const effective = reported ?? choice ?? "default";
   const missing = effective.endsWith(" (missing)");
-  if (choice !== undefined) return { label: effective, missing };
+  const name = missing ? effective.slice(0, -" (missing)".length) : effective;
+  if (choice !== undefined) return missing ? { label: `missing account: ${name}`, missing } : { label: effective, missing };
   if (effective === "default") return null;
-  if (missing) return { label: `${effective.slice(0, -" (missing)".length)} (default, missing)`, missing };
+  if (missing) return { label: `missing default account: ${name}`, missing };
   return { label: `${effective} (following default)`, missing };
 }
 

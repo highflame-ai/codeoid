@@ -186,6 +186,17 @@ describe("TUI App — backend slash commands", () => {
     expect(ui.client().calls).toEqual([["setAccount", "s1", null, "codex"]]);
   });
 
+  it("/account --follow is --follow-default; names are lower-cased; two names get the usage", async () => {
+    const ui = await mountApp();
+    await ui.sessions([info("s1", "alpha", { providerId: "codex", effectiveClaudeAccount: undefined, account: "team-key", effectiveAccount: "team-key" })]);
+    await ui.run("/account --follow");
+    await ui.run("/account Team-Key");
+    expect(ui.client().calls).toEqual([["setAccount", "s1", null, "codex"], ["setAccount", "s1", "team-key", "codex"]]);
+    await ui.run("/account a b");
+    await waitFor(() => ui.frame().includes("Usage: /account"), ui.frame);
+    expect(ui.client().calls).toHaveLength(2);
+  });
+
   it("/account with an unknown flag is refused with the usage, not taken as a name", async () => {
     const ui = await mountApp();
     await ui.sessions([info("s1", "alpha", { providerId: "codex", effectiveClaudeAccount: undefined, effectiveAccount: "default" })]);
