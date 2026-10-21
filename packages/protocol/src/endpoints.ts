@@ -122,12 +122,17 @@ export interface EndpointsListMsg {
 }
 
 /**
- * Add or replace an endpoint. Scope: `settings:write`.
+ * Add or replace an endpoint. Scope: `settings:write`, undelegated.
  *
  * Secrets are write-only: `apiKey` absent keeps the stored key, `null` removes
  * it, a string replaces it. `headers` absent keeps the stored headers; present
  * replaces them all (values included — they are never sent back, so an edit
  * re-enters them).
+ * Stored secrets are kept only while `baseUrl` stays on the same origin
+ * (scheme, host, port): moving an endpoint to another server is refused
+ * unless the request gives `apiKey` (when one is stored) and `headers` (when
+ * any are stored) explicitly — a stored credential is never sent to a server
+ * it wasn't entered for.
  * Other omitted fields keep their stored values. An empty displayName removes
  * the label; null defaultModel or contextWindow removes that override.
  */
@@ -164,8 +169,9 @@ export interface EndpointsRemoveMsg {
  * (`name`) or an unsaved draft (`baseUrl` + optional `apiKey` / `headers`) —
  * with `name` AND draft fields, the draft's values win and the stored key or
  * headers fill what the draft leaves out, so an edit form can test before
- * saving without re-entering secrets. Scope: `settings:write` (the daemon
- * makes a request with a stored credential).
+ * saving without re-entering secrets — on the same origin only, as for
+ * `endpoints.set`. Scope: `settings:write`, undelegated (the daemon makes a
+ * request with a stored credential).
  */
 export interface EndpointsTestMsg {
   type: "endpoints.test";

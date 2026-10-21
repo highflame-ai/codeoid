@@ -127,6 +127,12 @@ export class ProviderRegistry {
     return this.#factories.delete(id);
   }
 
+  /** Swap a registered factory for one with the same id (a re-labelled endpoint) — the default included. */
+  replace(factory: ProviderFactory): void {
+    if (!this.#factories.has(factory.id)) throw new Error(`Provider "${factory.id}" is not registered`);
+    this.#factories.set(factory.id, factory);
+  }
+
   setPrefixResolver(resolver: (id: string) => ProviderFactory | undefined): void {
     this.#prefixResolver = resolver;
   }

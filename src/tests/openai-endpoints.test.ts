@@ -6,10 +6,12 @@
  */
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { EndpointError, EndpointStore, isPrivateHost } from "../daemon/openai-endpoints.js";
+import { draftConnection, EndpointError, EndpointStore, isPrivateHost } from "../daemon/openai-endpoints.js";
+import { EndpointCatalog, syncEndpointProviders, watchEndpointProviders } from "../daemon/providers/endpoint/index.js";
+import { ProviderRegistry } from "../daemon/providers/registry.js";
 import { SessionManager } from "../daemon/session-manager.js";
 import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
@@ -46,6 +48,10 @@ beforeAll(() => {
       const url = new URL(req.url);
       const body = req.method === "POST" ? ((await req.json()) as Record<string, unknown>) : null;
       seen.push({ path: url.pathname, auth: req.headers.get("authorization"), headers: Object.fromEntries(req.headers), body });
+      // A server that bounces requests to another origin (localhost vs 127.0.0.1).
+      if (url.pathname.startsWith("/bounce/")) {
+        return new Response(null, { status: 307, headers: { location: `http://localhost:${url.port}${url.pathname.slice("/bounce".length)}` } });
+      }
       if (req.headers.get("authorization") !== `Bearer ${validKey}`) {
         return Response.json({ error: { message: "bad key" } }, { status: 401 });
       }
@@ -91,6 +97,28 @@ describe("EndpointStore", () => {
       streamUsage: true,
       strictToolSchemas: false,
     });
+  });
+
+  test("stored secrets stay with their server: a different origin must re-enter them", () => {
+    const store = storeAt();
+    store.upsert({ name: "e", baseUrl: "https://api.example.com/v1", apiKey: "k1", headers: { "x-a": "1" } });
+    // Same origin, new path: kept.
+    store.upsert({ name: "e", baseUrl: "https://api.example.com/v2" });
+    expect(store.get("e")).toMatchObject({ apiKey: "k1", headers: { "x-a": "1" } });
+    // Another host, scheme or port: refused while either secret would carry over.
+    for (const elsewhere of ["https://attacker.example/v1", "https://api.example.com:8443/v1", "http://localhost/v1"]) {
+      expect(() => store.upsert({ name: "e", baseUrl: elsewhere })).toThrow(/re-enter its API key and headers/);
+      expect(() => store.upsert({ name: "e", baseUrl: elsewhere, apiKey: "k2" })).toThrow(/re-enter its headers/);
+    }
+    expect(store.get("e")?.baseUrl).toBe("https://api.example.com/v2");
+    // Re-entered (or dropped) explicitly: moves.
+    store.upsert({ name: "e", baseUrl: "https://other.example/v1", apiKey: "k2", headers: {} });
+    expect(store.get("e")).toMatchObject({ baseUrl: "https://other.example/v1", apiKey: "k2" });
+    expect(store.get("e")?.headers).toBeUndefined();
+    // A test of an edit follows the same rule.
+    expect(() => draftConnection({ baseUrl: "https://attacker.example/v1" }, store.get("e"))).toThrow(/re-enter its API key/);
+    expect(draftConnection({ baseUrl: "https://other.example/v2" }, store.get("e")).apiKey).toBe("k2");
+    expect(draftConnection({ baseUrl: "https://attacker.example/v1", apiKey: null }, store.get("e")).apiKey).toBeUndefined();
   });
 
   test("secrets are write-only: absent keeps, null clears, a string replaces", () => {
@@ -145,15 +173,26 @@ describe("EndpointStore", () => {
     expect(() => store.upsert({ name: "e", baseUrl: b, apiKey: "k", headers: { "x-api-key": "v" } })).not.toThrow();
   });
 
-  test("a corrupt file fails closed; an invalid hand-edited entry is ignored, never applied", () => {
+  test("a corrupt file fails closed; an invalid hand-edited entry is ignored, never applied — and never lost", () => {
     const path = join(dir, "endpoints.json");
     writeFileSync(path, "{nope");
     expect(() => storeAt().list()).toThrow(/not valid JSON/);
-    writeFileSync(
-      path,
-      JSON.stringify({ version: 1, endpoints: [{ name: "ok", baseUrl: "http://127.0.0.1:1/v1" }, { name: "bad", baseUrl: "http://public.example.com/v1" }] }),
-    );
-    expect(storeAt().list().map((e) => e.name)).toEqual(["ok"]);
+    const bad = { name: "bad", baseUrl: "http://public.example.com/v1", apiKey: "sk-keep-me" };
+    writeFileSync(path, JSON.stringify({ version: 1, endpoints: [{ name: "ok", baseUrl: "http://127.0.0.1:1/v1" }, bad] }));
+    const store = storeAt();
+    expect(store.list().map((e) => e.name)).toEqual(["ok"]);
+    // An unrelated save writes it back as it was, for the user to fix.
+    store.upsert({ name: "other", baseUrl: "http://127.0.0.1:2/v1" });
+    const onDisk = () => (JSON.parse(readFileSync(path, "utf8")) as { endpoints: Array<{ name: string }> }).endpoints;
+    expect(onDisk()).toContainEqual(bad);
+    expect(storeAt().list().map((e) => e.name)).toEqual(["ok", "other"]);
+    // Replacing it by name, or removing it, does drop it.
+    store.upsert({ name: "bad", baseUrl: "https://public.example.com/v1", apiKey: "sk-new" });
+    expect(onDisk().filter((e) => e.name === "bad")).toHaveLength(1);
+    writeFileSync(path, JSON.stringify({ version: 1, endpoints: [bad] }));
+    const again = storeAt();
+    expect(again.remove("bad")).toBe(true);
+    expect(onDisk()).toEqual([]);
   });
 
   test("onChange fires after each change; resolveConnection throws for a removed endpoint", () => {
@@ -173,7 +212,21 @@ describe("EndpointStore", () => {
     for (const h of ["localhost", "127.0.0.1", "10.1.2.3", "172.20.0.1", "192.168.0.9", "100.100.1.1", "::1", "fd00::1", "gpu-box", "nas.lan"]) {
       expect(isPrivateHost(h)).toBe(true);
     }
-    for (const h of ["8.8.8.8", "172.32.0.1", "api.openai.com", "2001:4860::1"]) expect(isPrivateHost(h)).toBe(false);
+    // Link-local is out: it's where cloud metadata services answer.
+    for (const h of ["8.8.8.8", "172.32.0.1", "api.openai.com", "2001:4860::1", "169.254.169.254", "fe80::1"]) expect(isPrivateHost(h)).toBe(false);
+  });
+
+  test("re-labelling the default endpoint keeps the backends in sync", () => {
+    const store = storeAt();
+    store.upsert({ name: "foo", baseUrl: "http://127.0.0.1:1/v1" });
+    const registry = new ProviderRegistry("oai:foo");
+    const catalog = new EndpointCatalog(store);
+    syncEndpointProviders(registry, store, catalog);
+    watchEndpointProviders(registry, store, catalog);
+    store.upsert({ name: "foo", baseUrl: "http://127.0.0.1:1/v1", displayName: "Foo!" });
+    store.upsert({ name: "bar", baseUrl: "http://127.0.0.1:2/v1" });
+    expect(registry.get("oai:foo")?.displayName).toBe("Foo!");
+    expect(registry.has("oai:bar")).toBe(true);
   });
 });
 
@@ -232,6 +285,16 @@ describe("CLI helpers", () => {
     expect(gw.endpoint.apiKey).toBe("gw-secret");
     expect(gw.endpoint.headers).toBeUndefined(); // ${WS} unset → reported, not sent empty
     expect(gw.warnings[0]).toContain("WS");
+    // Resolved values are explicit, so --replace replaces them too.
+    expect(ollama.endpoint.headers).toEqual({});
+  });
+
+  test("importPiModels: two providers with one endpoint name — the second is skipped, not silently merged", () => {
+    const p = { baseUrl: "http://localhost:1/v1", api: "openai-completions" };
+    const { entries, skipped } = importPiModels({ providers: { "My GPU": p, "my-gpu": { ...p, baseUrl: "http://localhost:2/v1" } } }, {});
+    expect(entries.map((e) => e.endpoint.baseUrl)).toEqual(["http://localhost:1/v1"]);
+    expect(entries[0]!.endpoint.apiKey).toBeNull(); // pi has none: --replace drops a stored one
+    expect(skipped).toEqual([{ provider: "my-gpu", reason: expect.stringContaining('"my-gpu" is already taken') }]);
   });
 });
 
@@ -372,6 +435,66 @@ describe("daemon", () => {
     expect(bad).toMatchObject({ ok: false, error: expect.stringContaining("rejected the credentials") });
     const publicHttp = await handle({ type: "endpoints.test", id: "t4", baseUrl: "http://api.example.com/v1" });
     expect(publicHttp).toMatchObject({ ok: false, error: expect.stringContaining("https") });
+  });
+
+  test("endpoints.test never sends a stored key to another server", async () => {
+    await handle({ type: "endpoints.set", id: "s", name: "box", baseUrl: baseUrl(), apiKey: validKey, headers: { "x-team": "t-secret" } });
+    seen.length = 0;
+    const elsewhere = `http://localhost:${server.port}/v1`; // same server, another origin
+    const refused = await handle({ type: "endpoints.test", id: "t", name: "box", baseUrl: elsewhere });
+    expect(refused).toMatchObject({ ok: false, error: expect.stringContaining("re-enter") });
+    expect(seen).toHaveLength(0);
+    expect(await handle({ type: "endpoints.set", id: "s2", name: "box", baseUrl: elsewhere })).toMatchObject({ type: "response.error" });
+    expect(endpoints.get("box")?.baseUrl).toBe(baseUrl());
+  });
+
+  test("a chat request doesn't follow a redirect with the endpoint's headers", async () => {
+    await handle({
+      type: "endpoints.set",
+      id: "s",
+      name: "box",
+      baseUrl: `http://127.0.0.1:${server.port}/bounce/v1`,
+      apiKey: validKey,
+      headers: { "x-api-key": "hdr-secret" },
+      models: [{ id: "m" }],
+    });
+    const created = (await handle({ type: "session.create", id: "c", name: "sr", workdir: dir, providerId: "oai:box" })) as { data?: SessionInfo };
+    await handle({ type: "session.attach", id: "a", sessionId: created.data!.id });
+    await handle({ type: "session.send", id: "m1", sessionId: created.data!.id, text: "hi" });
+    await waitFor(() => errors().length > 0 || pushed.some((m) => m.type === "session.status_change" && (m as { status?: string }).status === "error"));
+    expect(seen.filter((r) => r.path === "/v1/chat/completions")).toHaveLength(0);
+    expect(assistantTexts()).toEqual([]);
+  });
+
+  test("the endpoint session.defaultProvider names can't be removed — the next start would fail", async () => {
+    await handle({ type: "endpoints.set", id: "s", name: "box", baseUrl: baseUrl(), apiKey: validKey });
+    const saved = process.env.XDG_CONFIG_HOME;
+    process.env.XDG_CONFIG_HOME = dir;
+    try {
+      mkdirSync(join(dir, "codeoid"), { recursive: true });
+      writeFileSync(join(dir, "codeoid", "config.json"), JSON.stringify({ session: { defaultProvider: "oai:box" } }));
+      expect(await handle({ type: "endpoints.remove", id: "r", name: "box" })).toMatchObject({
+        type: "response.error",
+        error: expect.stringContaining("default backend"),
+      });
+      expect(endpoints.has("box")).toBe(true);
+    } finally {
+      if (saved === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = saved;
+    }
+  });
+
+  test("a delegated token can't change, remove or test endpoints", async () => {
+    await handle({ type: "endpoints.set", id: "s", name: "box", baseUrl: baseUrl(), apiKey: validKey });
+    const delegated = { ...AUTH, delegationDepth: 1 };
+    for (const msg of [
+      { type: "endpoints.set", id: "x", name: "e2", baseUrl: baseUrl() },
+      { type: "endpoints.remove", id: "y", name: "box" },
+      { type: "endpoints.test", id: "z", name: "box" },
+    ] as const) {
+      expect(await handle(msg, delegated)).toMatchObject({ type: "response.error", code: "forbidden" });
+    }
+    expect((await handle({ type: "endpoints.list", id: "l" }, delegated)).type).toBe("endpoints.result");
   });
 
   test("scopes: listing needs settings:read; changing or testing needs settings:write; the list never carries secrets", async () => {

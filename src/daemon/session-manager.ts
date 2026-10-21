@@ -547,7 +547,14 @@ export class SessionManager {
     const endpoints = { store: this.#endpoints, catalog: this.#endpointCatalog };
     this.#providers = opts?.providers ?? createDefaultProviderRegistry(opts?.config, process.env, endpoints);
     // An injected registry (tests) gets the endpoints too; startup's already has them.
-    if (opts?.providers) syncEndpointProviders(this.#providers, this.#endpoints, this.#endpointCatalog);
+    // Like startup, an unreadable endpoints file costs the endpoints, not the daemon.
+    if (opts?.providers) {
+      try {
+        syncEndpointProviders(this.#providers, this.#endpoints, this.#endpointCatalog);
+      } catch (err) {
+        console.error(`[codeoid] could not load endpoint backends: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
     watchEndpointProviders(this.#providers, this.#endpoints, this.#endpointCatalog, () => this.#pushProviders());
     this.#hooks = opts?.hooks;
     this.#testProviderFactory = opts?._testProviderFactory;
@@ -2504,9 +2511,36 @@ mcpHub: this.#mcpHub,
     }
   }
 
+  /**
+   * Endpoint changes and tests need `settings:write` from an undelegated
+   * token: they decide where sessions send their code, and a test sends the
+   * stored key — a shared token must not do either.
+   */
+  #endpointsWriteRefusal(requestId: string, auth: AuthContext): DaemonMessage | undefined {
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return this.#loginForbidden(requestId);
+    if (auth.delegationDepth > 0) {
+      return { type: "response.error", requestId, error: "A delegated token can't change or test endpoints.", code: "forbidden" };
+    }
+    return undefined;
+  }
+
+  /**
+   * session.defaultProvider as the next start would read it (config file +
+   * env). It only takes effect on restart, so it can name an endpoint the
+   * live default doesn't. Undefined when the config can't be read.
+   */
+  #configuredDefaultProvider(): string | undefined {
+    try {
+      return loadConfig({ quiet: true }).session.defaultProvider || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   /** Add or replace an endpoint. `settings:write` — it decides where sessions send their code. */
   #endpointsSet(msg: Extract<ClientMessage, { type: "endpoints.set" }>, auth: AuthContext): DaemonMessage {
-    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return this.#loginForbidden(msg.id);
+    const refused = this.#endpointsWriteRefusal(msg.id, auth);
+    if (refused) return refused;
     const existed = this.#endpoints.has(msg.name);
     try {
       const { type: _t, id: _i, ...input } = msg;
@@ -2525,8 +2559,12 @@ mcpHub: this.#mcpHub,
   }
 
   #endpointsRemove(msg: Extract<ClientMessage, { type: "endpoints.remove" }>, auth: AuthContext): DaemonMessage {
-    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return this.#loginForbidden(msg.id);
-    if (endpointProviderId(msg.name) === this.#providers.defaultId) {
+    const refused = this.#endpointsWriteRefusal(msg.id, auth);
+    if (refused) return refused;
+    // The live default, and the configured one a restart would boot with —
+    // removing that would stop the daemon from starting.
+    const id = endpointProviderId(msg.name);
+    if (id === this.#providers.defaultId || id === this.#configuredDefaultProvider()) {
       return {
         type: "response.error",
         requestId: msg.id,
@@ -2553,7 +2591,8 @@ mcpHub: this.#mcpHub,
    * possibly with a stored credential, to a URL the caller chose.
    */
   async #endpointsTest(msg: Extract<ClientMessage, { type: "endpoints.test" }>, auth: AuthContext): Promise<DaemonMessage> {
-    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return this.#loginForbidden(msg.id);
+    const refused = this.#endpointsWriteRefusal(msg.id, auth);
+    if (refused) return refused;
     const fail = (error: string): DaemonMessage => ({ type: "endpoints.test.result", requestId: msg.id, ok: false, error });
     let existing: ReturnType<EndpointStore["get"]>;
     try {

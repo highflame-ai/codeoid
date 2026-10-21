@@ -257,8 +257,9 @@ export function syncEndpointProviders(registry: ProviderRegistry, store: Endpoin
     const displayName = e.displayName || e.name;
     const current = registry.get(id);
     if (current?.displayName === displayName) continue;
-    if (current) registry.unregister(id);
-    registry.register(endpointFactory(e.name, store, catalog, displayName));
+    // Replaced in place: the default can't be unregistered, even to re-label it.
+    if (current) registry.replace(endpointFactory(e.name, store, catalog, displayName));
+    else registry.register(endpointFactory(e.name, store, catalog, displayName));
   }
 }
 

@@ -295,6 +295,29 @@ describe("OpenAIProvider – a second OpenAI-compatible backend", () => {
     ]);
   });
 
+  it("an empty key stays empty — the user's OPENAI_API_KEY never goes to a local server", async () => {
+    const auths: Array<string | null> = [];
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch(req) {
+        auths.push(req.headers.get("authorization"));
+        return Response.json({ data: [{ id: "local" }] });
+      },
+    });
+    const saved = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = "sk-users-real-key";
+    try {
+      const provider = new OpenAIProvider({ apiKey: "", baseURL: `http://127.0.0.1:${server.port}/v1`, modelFilter: () => true, fallbackModels: [] });
+      await provider.listModels();
+      expect(auths).toEqual(["Bearer not-needed"]);
+    } finally {
+      if (saved === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = saved;
+      server.stop(true);
+    }
+  });
+
   it("lists nothing, not GPT models, when a local server is down", async () => {
     modelsResult = new Error("connection refused");
     const provider = new OpenAIProvider({ apiKey: "sk-local", modelFilter: () => true, fallbackModels: [] });

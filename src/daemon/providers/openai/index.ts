@@ -165,7 +165,9 @@ export class OpenAIProvider implements AgentProvider {
     this.displayName = init.displayName ?? "GPT (OpenAI)";
     this.#staticConnection = {
       ...(init.baseURL ? { baseURL: init.baseURL } : {}),
-      ...(init.apiKey ? { apiKey: init.apiKey } : {}),
+      // An empty key is a deliberate "no key" (a local server), not a cue to
+      // fall back to OPENAI_API_KEY and hand the user's key to that server.
+      ...(init.apiKey !== undefined ? { apiKey: init.apiKey } : {}),
     };
     this.#connection = init.connection ?? null;
     this.#streamUsage = init.streamUsage ?? true;
@@ -193,7 +195,9 @@ export class OpenAIProvider implements AgentProvider {
   #clientForTurn(): { client: OpenAI; conn: OpenAIConnection | null } {
     if (!this.#connection) {
       this.#client ??= new OpenAI({
-        apiKey: this.#staticConnection.apiKey ?? process.env.OPENAI_API_KEY ?? "missing",
+        // "" = keyless (the SDK refuses an empty key; a local server ignores the header).
+        apiKey:
+          this.#staticConnection.apiKey === "" ? "not-needed" : (this.#staticConnection.apiKey ?? process.env.OPENAI_API_KEY ?? "missing"),
         ...(this.#staticConnection.baseURL ? { baseURL: this.#staticConnection.baseURL } : {}),
       });
       return { client: this.#client, conn: null };
@@ -206,6 +210,9 @@ export class OpenAIProvider implements AgentProvider {
         apiKey: conn.apiKey ?? "not-needed",
         baseURL: conn.baseURL,
         ...(conn.headers && Object.keys(conn.headers).length > 0 ? { defaultHeaders: conn.headers } : {}),
+        // A redirect would carry custom auth headers (x-api-key, api-key) to
+        // wherever it points — fetch strips only Authorization cross-origin.
+        fetchOptions: { redirect: "error" },
       });
       this.#clientFingerprint = conn.fingerprint;
     }

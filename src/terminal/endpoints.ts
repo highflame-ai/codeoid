@@ -139,18 +139,32 @@ export function importPiModels(json: unknown, env: Record<string, string | undef
       result.skipped.push({ provider: key, reason: "no baseUrl (a built-in provider override)" });
       continue;
     }
+    const name = piNameToEndpointName(key);
+    // Two pi providers can map to one endpoint name ("My GPU" / "my-gpu"):
+    // the second would silently overwrite the first.
+    const clash = result.entries.find((e) => e.endpoint.name === name);
+    if (clash) {
+      result.skipped.push({ provider: key, reason: `its endpoint name "${name}" is already taken by another provider in this file` });
+      continue;
+    }
     const warnings: string[] = [];
-    let apiKey: string | undefined;
+    // Explicit: null = no key, {} = no headers, so `--replace` replaces them
+    // too. Left out only when pi's value didn't resolve (then a stored one is
+    // kept — on the same server only, which the daemon enforces).
+    let apiKey: string | null | undefined = null;
     if (p.apiKey) {
       const r = resolvePiValue(p.apiKey, env);
-      if (r.problem) warnings.push(`apiKey ${r.problem}`);
-      else apiKey = r.value;
+      if (r.problem) {
+        warnings.push(`apiKey ${r.problem}`);
+        apiKey = undefined;
+      } else apiKey = r.value || null;
     }
-    const headers: Record<string, string> = {};
+    let headers: Record<string, string> | undefined = {};
     for (const [h, v] of Object.entries(p.headers ?? {})) {
       const r = resolvePiValue(String(v), env);
       if (r.problem) warnings.push(`header ${h} ${r.problem}`);
-      else headers[h] = r.value!;
+      else if (headers) headers[h] = r.value!;
+      if (r.problem) headers = undefined;
     }
     const models: EndpointModel[] = [];
     for (const m of p.models ?? []) {
@@ -162,15 +176,14 @@ export function importPiModels(json: unknown, env: Record<string, string | undef
         ...(typeof m.maxTokens === "number" && m.maxTokens > 0 ? { maxTokens: Math.round(m.maxTokens) } : {}),
       });
     }
-    const name = piNameToEndpointName(key);
     result.entries.push({
       endpoint: {
         name,
         ...(p.name || key !== name ? { displayName: p.name || key } : {}),
         baseUrl: p.baseUrl,
         // A keyless local server in pi still carries a dummy key; harmless here.
-        ...(apiKey ? { apiKey } : {}),
-        ...(Object.keys(headers).length ? { headers } : {}),
+        ...(apiKey !== undefined ? { apiKey } : {}),
+        ...(headers !== undefined ? { headers } : {}),
         models,
         ...(p.compat?.supportsUsageInStreaming === false ? { streamUsage: false } : {}),
         ...(p.compat?.maxTokensField === "max_completion_tokens" || p.compat?.maxTokensField === "max_tokens"

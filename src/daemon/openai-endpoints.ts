@@ -49,9 +49,9 @@ export interface EndpointInput {
   displayName?: string;
   baseUrl: string;
   flavor?: EndpointFlavor;
-  /** absent = keep the stored key, null = remove it, string = replace it. */
+  /** absent = keep the stored key (same origin only — keptSecrets), null = remove it, string = replace it. */
   apiKey?: string | null;
-  /** absent = keep the stored headers, present = replace them all. */
+  /** absent = keep the stored headers (same origin only), present = replace them all. */
   headers?: Record<string, string>;
   models?: EndpointModel[];
   defaultModel?: string | null;
@@ -112,10 +112,12 @@ export function isPrivateHost(host: string): boolean {
   const ipVersion = isIP(h);
   if (ipVersion === 4) {
     const [a, b] = h.split(".").map(Number) as [number, number];
-    return a === 127 || a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254) || (a === 100 && b >= 64 && b <= 127);
+    // Not link-local (169.254/16): that's where cloud metadata services live,
+    // and no model server is reached there.
+    return a === 127 || a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127);
   }
   if (ipVersion === 6) {
-    return h === "::1" || h.startsWith("fc") || h.startsWith("fd") || h.startsWith("fe80:");
+    return h === "::1" || h.startsWith("fc") || h.startsWith("fd");
   }
   // A single-label name (a container or LAN host: `ollama`, `gpu-box`) or a
   // local-only suffix.
@@ -243,9 +245,42 @@ export function connectionOf(e: Pick<StoredEndpoint, "name" | "baseUrl" | "apiKe
 }
 
 /**
+ * The stored key and headers a change may keep. They were entered for one
+ * origin (scheme, host, port) and are only ever sent there: moving the base
+ * URL elsewhere must re-enter each secret the endpoint holds (null / `{}`
+ * drops it), or a `settings:write` caller could point a stored key at a
+ * server of their choosing. Changing only the path keeps them.
+ */
+function keptSecrets(
+  existing: StoredEndpoint | undefined,
+  baseUrl: string,
+  draft: { apiKey?: string | null; headers?: Record<string, string> },
+): { apiKey?: string; headers?: Record<string, string> } {
+  if (!existing) return {};
+  const moved = new URL(existing.baseUrl).origin !== new URL(baseUrl).origin;
+  if (moved) {
+    const missing = [
+      ...(draft.apiKey === undefined && existing.apiKey !== undefined ? ["API key"] : []),
+      ...(draft.headers === undefined && Object.keys(existing.headers ?? {}).length > 0 ? ["headers"] : []),
+    ];
+    if (missing.length > 0) {
+      throw new EndpointError(
+        `"${existing.name}" is moving to a different server (${new URL(baseUrl).origin}) — re-enter its ${missing.join(" and ")}, or remove them; stored credentials are only sent to the server they were entered for`,
+      );
+    }
+    return {};
+  }
+  return {
+    ...(existing.apiKey !== undefined ? { apiKey: existing.apiKey } : {}),
+    ...(existing.headers ? { headers: existing.headers } : {}),
+  };
+}
+
+/**
  * The connection to TEST: an unsaved draft's values, with a stored endpoint's
  * key and headers filling what the draft leaves out (so an edit form can test
- * without re-entering secrets). Validated by the same rules as a save.
+ * without re-entering secrets — on the same origin only, see keptSecrets).
+ * Validated by the same rules as a save.
  */
 export function draftConnection(
   draft: { baseUrl?: string; apiKey?: string | null; headers?: Record<string, string> },
@@ -255,9 +290,10 @@ export function draftConnection(
   const baseUrlRaw = draft.baseUrl ?? existing?.baseUrl;
   if (!baseUrlRaw) throw new EndpointError("a base URL is required");
   const baseUrl = validateBaseUrl(baseUrlRaw);
-  const apiKey = draft.apiKey === undefined ? existing?.apiKey : draft.apiKey || undefined;
+  const kept = keptSecrets(existing, baseUrl, draft);
+  const apiKey = draft.apiKey === undefined ? kept.apiKey : draft.apiKey || undefined;
   if (apiKey !== undefined && CONTROL_CHARS.test(apiKey)) throw new EndpointError("the API key must be a single line with no control characters");
-  const headers = draft.headers ?? existing?.headers ?? {};
+  const headers = draft.headers ?? kept.headers ?? {};
   validateHeaders(headers, apiKey !== undefined);
   return connectionOf({ name, baseUrl, ...(apiKey !== undefined ? { apiKey } : {}), headers });
 }
@@ -275,6 +311,12 @@ export type EndpointsListener = () => void;
 export class EndpointStore {
   readonly #path: string;
   #data: StoreFile | null = null;
+  /**
+   * Entries that failed validation on load, kept verbatim and written back on
+   * every save: a hand edit with a typo must not cost the user the entry (and
+   * its key). Never applied; replaced or removed by name.
+   */
+  #invalid: Array<Record<string, unknown>> = [];
   readonly #listeners = new Set<EndpointsListener>();
 
   constructor(path: string = join(getConfigDir(), "endpoints.json")) {
@@ -301,20 +343,28 @@ export class EndpointStore {
       throw new EndpointError(`${this.#path} is not valid JSON — fix or remove it`);
     }
     const endpoints: StoredEndpoint[] = [];
-    for (const raw of Array.isArray(parsed.endpoints) ? parsed.endpoints : []) {
+    const invalid: Array<Record<string, unknown>> = [];
+    for (const raw of (Array.isArray(parsed.endpoints) ? parsed.endpoints : []) as unknown[]) {
       try {
+        if (endpoints.some((e) => e.name === (raw as StoredEndpoint).name)) {
+          throw new EndpointError(`"${(raw as StoredEndpoint).name}" is listed twice`);
+        }
         endpoints.push(validateStoredEndpoint(withDefaults(raw as StoredEndpoint)));
       } catch (err) {
-        console.error(`[codeoid] ignoring invalid endpoint in ${this.#path}: ${err instanceof Error ? err.message : String(err)}`);
+        console.error(`[codeoid] ignoring invalid endpoint in ${this.#path} (kept in the file): ${err instanceof Error ? err.message : String(err)}`);
+        if (raw && typeof raw === "object") invalid.push(raw as Record<string, unknown>);
       }
     }
+    this.#invalid = invalid;
     this.#data = { version: 1, endpoints };
     return this.#data;
   }
 
-  #save(data: StoreFile): void {
-    atomicWrite(this.#path, `${JSON.stringify(data, null, 2)}\n`, 0o600);
+  #save(data: StoreFile, replacing?: string): void {
+    const invalid = replacing === undefined ? this.#invalid : this.#invalid.filter((raw) => raw.name !== replacing);
+    atomicWrite(this.#path, `${JSON.stringify({ version: 1, endpoints: [...data.endpoints, ...invalid] }, null, 2)}\n`, 0o600);
     this.#data = data;
+    this.#invalid = invalid;
     for (const l of this.#listeners) {
       try {
         l();
@@ -348,8 +398,9 @@ export class EndpointStore {
     const existing = data.endpoints.find((e) => e.name === input.name);
     const now = new Date().toISOString();
     const flavor = input.flavor ?? existing?.flavor ?? "openai";
-    const apiKey = input.apiKey === undefined ? existing?.apiKey : input.apiKey === null || input.apiKey === "" ? undefined : input.apiKey;
-    const headers = input.headers === undefined ? existing?.headers : input.headers;
+    const kept = keptSecrets(existing, validateBaseUrl(input.baseUrl), input);
+    const apiKey = input.apiKey === undefined ? kept.apiKey : input.apiKey === null || input.apiKey === "" ? undefined : input.apiKey;
+    const headers = input.headers === undefined ? kept.headers : input.headers;
     const next = validateStoredEndpoint({
       name: input.name,
       displayName: input.displayName === undefined ? existing?.displayName : input.displayName.trim() || undefined,
@@ -369,14 +420,15 @@ export class EndpointStore {
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
     });
-    this.#save({ version: 1, endpoints: [...data.endpoints.filter((e) => e.name !== input.name), next] });
+    this.#save({ version: 1, endpoints: [...data.endpoints.filter((e) => e.name !== input.name), next] }, input.name);
     return toEndpointInfo(next);
   }
 
+  /** Remove by name — a valid entry, or an invalid one kept from a hand edit. */
   remove(name: string): boolean {
     const data = this.#load();
-    if (!data.endpoints.some((e) => e.name === name)) return false;
-    this.#save({ version: 1, endpoints: data.endpoints.filter((e) => e.name !== name) });
+    if (!data.endpoints.some((e) => e.name === name) && !this.#invalid.some((raw) => raw.name === name)) return false;
+    this.#save({ version: 1, endpoints: data.endpoints.filter((e) => e.name !== name) }, name);
     return true;
   }
 

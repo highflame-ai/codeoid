@@ -646,7 +646,9 @@ endpoint
 endpoint
   .command("set <name>")
   .alias("add")
-  .description("Add an endpoint, or change one. Fields you leave out keep their stored values; the key and header values are asked for without echo, never taken from the command line")
+  .description(
+    "Add an endpoint, or change one. Fields you leave out keep their stored values — the key and headers only while the base URL stays on the same server (scheme, host, port); moving it elsewhere needs --key/--clear-key and --header/--clear-headers. Key and header values are asked for without echo, never taken from the command line",
+  )
   .requiredOption("--base-url <url>", "the OpenAI-compatible base URL, usually ending in /v1 (https, or http for localhost / a private network)")
   .option("--display-name <label>", "label in pickers")
   .option("--flavor <flavor>", "openai | llamacpp (llama-server: live context window from /props, strict tool schemas)")
@@ -656,6 +658,7 @@ endpoint
   .option("--key", "set the API key (asked for without echo, or read from stdin)")
   .option("--clear-key", "remove the stored API key")
   .option("--header <header>", 'extra request header, repeatable: "Name" (value asked for without echo) or "Name: value" for a non-secret one; replaces all stored headers', collect, [] as string[])
+  .option("--clear-headers", "remove all stored headers")
   .option("--mcp <servers>", "external MCP servers offered: all | none | name,name")
   .option("--no-stream-usage", "don't send stream_options.include_usage (for servers that reject it)")
   .option("--strict-tools", "make tool schemas strict (default for llamacpp)")
@@ -674,6 +677,7 @@ endpoint
         key?: boolean;
         clearKey?: boolean;
         header: string[];
+        clearHeaders?: boolean;
         mcp?: string;
         streamUsage?: boolean;
         strictTools?: boolean;
@@ -682,6 +686,7 @@ endpoint
     ) => {
       try {
         if (o.key && o.clearKey) throw new Error("--key and --clear-key don't go together");
+        if (o.header?.length && o.clearHeaders) throw new Error("--header and --clear-headers don't go together");
         if (o.flavor !== undefined && o.flavor !== "openai" && o.flavor !== "llamacpp") throw new Error("--flavor is openai or llamacpp");
         if (o.maxTokensField !== undefined && o.maxTokensField !== "max_tokens" && o.maxTokensField !== "max_completion_tokens") {
           throw new Error("--max-tokens-field is max_tokens or max_completion_tokens");
@@ -705,7 +710,7 @@ endpoint
           ...(o.displayName !== undefined ? { displayName: o.displayName } : {}),
           ...(o.flavor ? { flavor: o.flavor as "openai" | "llamacpp" } : {}),
           ...(apiKey !== undefined ? { apiKey } : {}),
-          ...(o.header?.length ? { headers } : {}),
+          ...(o.header?.length ? { headers } : o.clearHeaders ? { headers: {} } : {}),
           ...(models.length ? { models } : {}),
           ...(o.defaultModel ? { defaultModel: o.defaultModel } : {}),
           ...(o.context ? { contextWindow: parseTokens(o.context) } : {}),
@@ -732,7 +737,7 @@ endpoint
 endpoint
   .command("test [name]")
   .description("Check an endpoint answers and list its models — a stored one, or a draft with --base-url")
-  .option("--base-url <url>", "test this URL (with a stored endpoint's key and headers when <name> is given)")
+  .option("--base-url <url>", "test this URL (with a stored endpoint's key and headers when <name> is given and the URL is on the same server)")
   .option("--key", "test with an API key (asked for without echo)")
   .action(async (name: string | undefined, o: { baseUrl?: string; key?: boolean }) => {
     if (!name && !o.baseUrl) {
