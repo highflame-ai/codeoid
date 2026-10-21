@@ -639,6 +639,14 @@ export interface SessionProvider extends AgentProvider {
   /** Set by Session before each runTurn(). Handles "backing session lost" errors. */
   onRecoveryNeeded: ((content: string) => void) | undefined;
   /**
+   * Set by Session. A backend that could not resume its native conversation
+   * (a thread written under another account's home, a vendor that lost it)
+   * and is about to start an empty one calls this, synchronously, before it
+   * sends the prompt: Session seeds it with the canonical history so the
+   * conversation carries on instead of silently starting over.
+   */
+  onHistoryLost?: (() => void) | undefined;
+  /**
    * The session-lifetime event listener (at most one — the owning Session).
    * Session-scoped events MUST be delivered here and never through
    * `TurnRun.events`: they can fire between turns, when the turn queue has no

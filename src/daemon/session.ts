@@ -3097,6 +3097,14 @@ export class Session {
     await this.#ensureAgentIdentity(sender);
     this.#currentSender = sender;
 
+    // A backend that couldn't resume its own conversation and is starting an
+    // empty one: hand it everything before this prompt (already pushed).
+    this.#provider.onHistoryLost = () => {
+      const history = this.#accumulator.history;
+      const before = history.at(-1)?.role === "user" ? history.length - 1 : history.length;
+      if (before > 0) this.#provider.seedFromHistory?.(history.slice(0, before));
+    };
+
     // Wire recovery handler. Uses #currentSender rather than closing over `sender`
     // so that if a subsequent send() updates the active sender before recovery fires,
     // audit events are attributed to the turn that actually triggered recovery.

@@ -275,6 +275,7 @@ export class CodexProvider implements SessionProvider {
   readonly displayName = "Codex (OpenAI)";
 
   onRecoveryNeeded: ((content: string) => void) | undefined;
+  onHistoryLost: (() => void) | undefined;
 
   #sessionId: string;
   #backingSessionId: string;
@@ -774,6 +775,10 @@ export class CodexProvider implements SessionProvider {
       } catch {
         /* fall through to thread/start */
       }
+      // The thread is gone (another account's home, a pruned rollout): a
+      // fresh one must not start the conversation over — take the history.
+      console.warn(`[codex-provider ${this.#sessionId.slice(0, 8)}] couldn't resume thread ${this.#backingSessionId} — continuing from codeoid's history`);
+      this.onHistoryLost?.();
     }
     const started = (await this.#proc.request("thread/start", threadConfig(opts))) as { thread?: { id?: string } };
     if (!started.thread?.id) throw new Error("codex thread/start returned no thread id");
