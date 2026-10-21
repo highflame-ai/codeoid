@@ -28,7 +28,8 @@ interface Props {
   client: TuiWsClient | null;
   onSubmitNewSession: (name: string, workdir: string, options: NewSessionOptions) => Promise<void>;
   onSetProvider: (sessionId: string, providerId: string) => Promise<void>;
-  onSetAccount: (sessionId: string, account: string) => Promise<void>;
+  /** "" follows the backend's daemon default; `backend` is the one the picker listed. */
+  onSetAccount: (sessionId: string, account: string, backend: string) => Promise<void>;
   onSelectSession: (sessionId: string) => void;
   onConfirmDestroy: (sessionId: string) => void;
   onCancel: () => void;
@@ -92,17 +93,19 @@ export function Modal(props: Props) {
           // provider picker must not remount on it: the daemon's info update
           // arrives before the switch's reply, and a remount would drop the
           // close that follows a successful pick.
-          key={kind === "model" ? `model:${provider}` : kind}
+          // The account picker lists the accounts of the backend it was
+          // opened on, so it remounts with the backend too.
+          key={kind === "provider" ? kind : `${kind}:${provider}`}
           kind={kind}
           provider={provider}
           sessionName={target.info.name}
           providers={props.providers}
           client={props.client}
-          current={kind === "model" ? target.info.model ?? "" : kind === "provider" ? provider : target.info.claudeAccount ?? ""}
+          current={kind === "model" ? target.info.model ?? "" : kind === "provider" ? provider : target.info.account ?? (provider === "claude" ? target.info.claudeAccount : undefined) ?? ""}
           onPick={async (value) => {
             if (kind === "model") await props.onSetModel?.(sessionId, value);
             else if (kind === "provider") await props.onSetProvider(sessionId, value);
-            else await props.onSetAccount(sessionId, value);
+            else await props.onSetAccount(sessionId, value, provider);
           }}
           onCancel={props.onCancel}
         />

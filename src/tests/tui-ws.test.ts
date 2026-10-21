@@ -207,26 +207,40 @@ describe("TuiWsClient", () => {
     const catalog = { type: "models.list.result" as const, requestId: String(modelRequest.id), provider: "oai:box", live: true, models: [{ value: "local-model", displayName: "Local model" }] };
     socket.recv(catalog);
     expect(await models).toEqual(catalog);
-    const accounts = client.listClaudeAccounts();
+    const accounts = client.listAccounts("codex");
+    expect(socket.parsed.at(-1)).toMatchObject({ type: "accounts.list", backend: "codex" });
     socket.recv({ type: "response.error", requestId: socket.parsed.at(-1)!.id, error: "Missing scope: settings:read", code: "forbidden" });
     await expect(accounts).rejects.toThrow("Missing scope: settings:read");
+  });
+
+  it("returns the requested backend's accounts from accounts.result", async () => {
+    const client = makeClient([], { heartbeatMs: 0 });
+    const socket = await connect(client);
+    const codex = { backend: "codex", displayName: "Codex", defaultAccount: "default", accounts: [], kinds: [] };
+    const listed = client.listAccounts("codex");
+    socket.recv({ type: "accounts.result", requestId: String(socket.parsed.at(-1)!.id), backends: [codex] });
+    expect(await listed).toEqual(codex);
+    const absent = client.listAccounts("qwen");
+    socket.recv({ type: "accounts.result", requestId: String(socket.parsed.at(-1)!.id), backends: [codex] });
+    await expect(absent).rejects.toThrow("no accounts for qwen");
   });
 
   it("sends per-session provider and account choices including follow-default null", async () => {
     const client = makeClient([], { heartbeatMs: 0 });
     const socket = await connect(client);
     const operations: Array<[() => Promise<unknown>, Record<string, unknown>]> = [
-      [() => client.createSession("work", "/repo", { providerId: "claude", claudeAccount: "work" }), { type: "session.create", name: "work", workdir: "/repo", providerId: "claude", claudeAccount: "work" }],
+      [() => client.createSession("work", "/repo", { providerId: "codex", account: "work" }), { type: "session.create", name: "work", workdir: "/repo", providerId: "codex", account: "work" }],
       [() => client.createSession("local", "/repo", { providerId: "oai:box" }), { type: "session.create", providerId: "oai:box" }],
       [() => client.setProvider("session", "oai:box"), { type: "session.set_provider", sessionId: "session", providerId: "oai:box" }],
-      [() => client.setClaudeAccount("session", "default"), { type: "session.set_claude_account", sessionId: "session", account: "default" }],
-      [() => client.setClaudeAccount("session", null), { type: "session.set_claude_account", sessionId: "session", account: null }],
+      [() => client.setAccount("session", "default", "codex"), { type: "session.set_account", sessionId: "session", account: "default", backend: "codex" }],
+      [() => client.setAccount("session", null), { type: "session.set_account", sessionId: "session", account: null }],
     ];
     for (const [operation, expected] of operations) {
       const pending = operation();
       const request = socket.parsed.at(-1)!;
       expect(request).toMatchObject(expected);
-      if (request.providerId === "oai:box") expect(request).not.toHaveProperty("claudeAccount");
+      if (request.providerId === "oai:box") expect(request).not.toHaveProperty("account");
+      if (request.type === "session.set_account" && request.account === null) expect(request).not.toHaveProperty("backend");
       socket.recv({ type: "response.ok", requestId: request.id });
       await pending;
     }

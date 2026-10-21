@@ -29,6 +29,8 @@ const ok = { type: "response.ok", requestId: "r" } as unknown as DaemonMessage;
 class FakeClient {
   calls: Array<[string, ...unknown[]]> = [];
   reply: DaemonMessage = ok;
+  /** Backends whose accounts were listed (kept out of `calls`: dialogs list on open). */
+  listed: string[] = [];
   constructor(public dispatch: React.Dispatch<TuiAction>) {}
   async start() {}
   stop() {}
@@ -47,8 +49,14 @@ class FakeClient {
     return { type: "response.ok", requestId: "r", data: info("s9", name) } as unknown as DaemonMessage;
   }
   async send(sessionId: string, text: string) { this.calls.push(["send", sessionId, text]); return ok; }
-  async setClaudeAccount(sessionId: string, account: string | null) { this.calls.push(["setClaudeAccount", sessionId, account]); return this.reply; }
-  async listClaudeAccounts() { return { defaultAccount: "default", accounts: [] }; }
+  async setAccount(sessionId: string, account: string | null, backend?: string) { this.calls.push(["setAccount", sessionId, account, backend]); return this.reply; }
+  async listAccounts(backend: string) {
+    this.listed.push(backend);
+    const accounts = backend === "codex"
+      ? [{ backend, name: "chatgpt-work", kind: "chatgpt-login" }, { backend, name: "team-key", kind: "api-key" }]
+      : [];
+    return { backend, displayName: backend === "codex" ? "Codex" : backend, defaultAccount: "default", accounts, kinds: [{ kind: "chatgpt-login", label: "ChatGPT sign-in" }] };
+  }
   async listModels() { return { live: true, models: [] }; }
 }
 
@@ -125,17 +133,50 @@ describe("TUI App — backend slash commands", () => {
 
   it("/account --follow-default clears the pin (sends null)", async () => {
     const ui = await mountApp();
-    await ui.sessions([info("s1", "alpha", { claudeAccount: "work" })]);
+    await ui.sessions([info("s1", "alpha", { claudeAccount: "work", account: "work" })]);
     await ui.run("/account --follow-default");
-    expect(ui.client().calls).toEqual([["setClaudeAccount", "s1", null]]);
+    expect(ui.client().calls).toEqual([["setAccount", "s1", null, "claude"]]);
   });
 
-  it("/account on a non-Claude session is refused with a visible error", async () => {
+  it("/account <name> on a Codex session pins that Codex account", async () => {
     const ui = await mountApp();
-    await ui.sessions([info("s1", "alpha", { providerId: "oai:box", effectiveClaudeAccount: undefined })]);
+    await ui.sessions([info("s1", "alpha", { providerId: "codex", effectiveClaudeAccount: undefined, effectiveAccount: "default" })]);
+    await ui.run("/account team-key");
+    expect(ui.client().calls).toEqual([["setAccount", "s1", "team-key", "codex"]]);
+  });
+
+  it("/account on a Codex session lists the Codex accounts and switches to the one picked", async () => {
+    const ui = await mountApp();
+    await ui.sessions([info("s1", "alpha", { providerId: "codex", effectiveClaudeAccount: undefined, effectiveAccount: "default" })]);
+    await ui.run("/account");
+    await waitFor(() => ui.frame().includes("chatgpt-work"), ui.frame);
+    expect(ui.frame()).toContain("Select account (codex) for alpha");
+    expect(ui.frame()).toContain("Follow daemon default (default)");
+    expect(ui.frame()).toContain("default — the daemon's own Codex login or key");
+    expect(ui.frame()).toContain("ChatGPT sign-in");
+    expect(ui.frame()).toContain("team-key");
+    expect(ui.client().listed).toEqual(["codex"]);
+    expect(ui.client().calls).toEqual([]);
+    // Follow default → default → chatgpt-work.
+    await ui.press("\u001b[B");
+    await ui.press("\u001b[B");
+    await ui.press("\r");
+    await waitFor(() => ui.client().calls.length === 1, ui.frame);
+    expect(ui.client().calls).toEqual([["setAccount", "s1", "chatgpt-work", "codex"]]);
+    await waitFor(() => !ui.frame().includes("Select account"), ui.frame);
+  });
+
+  it("/account on a backend without accounts is refused with a visible error", async () => {
+    const ui = await mountApp();
+    await ui.sessions([info("s1", "alpha", { providerId: "mock", effectiveClaudeAccount: undefined })]);
     await ui.run("/account work");
     expect(ui.client().calls).toEqual([]);
-    expect(ui.frame()).toContain("Claude accounts apply to Claude sessions");
+    await waitFor(() => ui.frame().includes("The mock backend has no accounts"), ui.frame);
+    await ui.act({ type: "error", message: "" });
+    await ui.run("/account");
+    expect(ui.client().calls).toEqual([]);
+    expect(ui.client().listed).toEqual([]);
+    expect(ui.frame()).not.toContain("Select account");
   });
 
   it("a daemon refusal reaches the error display", async () => {

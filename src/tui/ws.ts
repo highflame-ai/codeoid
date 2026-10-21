@@ -10,8 +10,9 @@
 import { randomUUID } from "node:crypto";
 import { PROTOCOL_VERSION } from "../protocol/types.js";
 import type {
+  AccountsResultMsg,
   Attachment,
-  ClaudeAccountsResultMsg,
+  BackendAccountsInfo,
   ClientMessage,
   DaemonMessage,
   ModelsListResultMsg,
@@ -116,7 +117,7 @@ export class TuiWsClient {
     return this.#request({ type: "session.list", id: randomUUID() });
   }
 
-  createSession(name: string, workdir: string, opts: { providerId?: string; claudeAccount?: string } = {}): Promise<DaemonMessage> {
+  createSession(name: string, workdir: string, opts: { providerId?: string; account?: string } = {}): Promise<DaemonMessage> {
     return this.#request({ type: "session.create", id: randomUUID(), name, workdir, ...opts });
   }
 
@@ -124,8 +125,13 @@ export class TuiWsClient {
     return this.#request({ type: "session.set_provider", id: randomUUID(), sessionId, providerId });
   }
 
-  setClaudeAccount(sessionId: string, account: string | null): Promise<DaemonMessage> {
-    return this.#request({ type: "session.set_claude_account", id: randomUUID(), sessionId, account });
+  /**
+   * Choose the account a session runs on for `backend` (default: the
+   * session's current backend). `null` follows that backend's daemon default;
+   * the literal "default" pins the built-in account.
+   */
+  setAccount(sessionId: string, account: string | null, backend?: string): Promise<DaemonMessage> {
+    return this.#request({ type: "session.set_account", id: randomUUID(), sessionId, account, ...(backend ? { backend } : {}) });
   }
 
   async listModels(provider: string): Promise<ModelsListResultMsg> {
@@ -135,11 +141,14 @@ export class TuiWsClient {
     return result;
   }
 
-  async listClaudeAccounts(): Promise<ClaudeAccountsResultMsg> {
-    const result = await this.#request({ type: "claude.accounts.list", id: randomUUID() });
+  /** One backend's accounts (names and kinds only — never a credential). */
+  async listAccounts(backend: string): Promise<BackendAccountsInfo> {
+    const result = await this.#request({ type: "accounts.list", id: randomUUID(), backend });
     if (result.type === "response.error") throw new Error(result.error);
-    if (result.type !== "claude.accounts.result") throw new Error("Unexpected account list response");
-    return result;
+    if (result.type !== "accounts.result") throw new Error("Unexpected account list response");
+    const entry = (result as AccountsResultMsg).backends.find((b) => b.backend === backend);
+    if (!entry) throw new Error(`The daemon listed no accounts for ${backend}`);
+    return entry;
   }
 
   attachSession(sessionId: string): Promise<DaemonMessage> {

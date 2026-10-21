@@ -53,7 +53,7 @@ export function StatusBar({
   cols,
 }: Props) {
   const usage = focused?.info.usage;
-  const account = focused ? claudeAccountLabel(focused.info) : null;
+  const account = focused ? accountLabel(focused.info) : null;
   // Background-activity summary: count sessions (other than focused) with
   // unread messages or pending approvals. Shown as a single compact pill
   // at the end of the bar — no per-session chrome.
@@ -274,16 +274,23 @@ export function StatusBar({
 }
 
 /**
- * The Claude account worth showing, or null. A session that follows the
- * daemon default and lands on the machine's own login is the common case and
+ * The account worth showing for the session's current backend, or null. A
+ * session that follows its backend's default and lands on the built-in
+ * `default` (the daemon's own login or environment) is the common case and
  * says nothing; a pinned account, a non-default daemon default, or a missing
- * account (which fails the next turn) is shown.
+ * account (which fails the next turn) is shown. A backend without accounts
+ * reports neither field and shows nothing.
  */
-function claudeAccountLabel(info: TuiSession["info"]): { label: string; missing: boolean } | null {
-  if ((info.providerId ?? "claude") !== "claude") return null;
-  const effective = info.effectiveClaudeAccount ?? info.claudeAccount ?? "default";
+function accountLabel(info: TuiSession["info"]): { label: string; missing: boolean } | null {
+  // `claudeAccount` / `effectiveClaudeAccount` are the older Claude-only
+  // spelling of the same fields, kept for a daemon that predates `account`.
+  const claude = (info.providerId ?? "claude") === "claude";
+  const choice = info.account ?? (claude ? info.claudeAccount : undefined);
+  const reported = info.effectiveAccount ?? (claude ? info.effectiveClaudeAccount : undefined);
+  if (choice === undefined && reported === undefined) return null;
+  const effective = reported ?? choice ?? "default";
   const missing = effective.endsWith(" (missing)");
-  if (info.claudeAccount !== undefined) return { label: effective, missing };
+  if (choice !== undefined) return { label: effective, missing };
   if (effective === "default") return null;
   const name = missing ? effective.slice(0, -" (missing)".length) : effective;
   return { label: `${name} (following default${missing ? ", missing" : ""})`, missing };

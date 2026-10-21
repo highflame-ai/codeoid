@@ -11,6 +11,17 @@ const providers: ProviderInfo[] = [
   { id: "claude", displayName: "Claude", kind: "builtin", isDefault: true },
   { id: "oai:box", displayName: "GPU box", kind: "endpoint", isDefault: false },
 ];
+const withCodex: ProviderInfo[] = [...providers, { id: "codex", displayName: "Codex", kind: "builtin", isDefault: false }, { id: "mock", displayName: "Mock", kind: "builtin", isDefault: false }];
+
+/** A client whose daemon lists `names` (and `defaultAccount`) for every backend asked about. */
+function accountsClient(names: Record<string, string[]>, defaultAccount = "default", requested: string[] = []) {
+  return {
+    listAccounts: async (backend: string) => {
+      requested.push(backend);
+      return { backend, displayName: backend, defaultAccount, kinds: [], accounts: (names[backend] ?? []).map((name) => ({ backend, name, kind: "api-key" })) };
+    },
+  } as unknown as TuiWsClient;
+}
 const cleanups: Array<() => void> = [];
 afterEach(() => { for (const cleanup of cleanups.splice(0)) cleanup(); });
 
@@ -70,7 +81,7 @@ describe("TUI backend dialogs", () => {
 
   it("distinguishes following the daemon default from pinning the machine login", async () => {
     const picked: string[] = [];
-    const client = { listClaudeAccounts: async () => ({ defaultAccount: "work", accounts: [{ name: "work", kind: "subscription" }] }) } as unknown as TuiWsClient;
+    const client = accountsClient({ claude: ["work"] }, "work");
     const ui = await mount(<BackendPicker kind="account" provider="claude" current="work" providers={providers} client={client}
       onPick={async (value) => { picked.push(value); }} onCancel={() => {}} />);
     await waitFor(() => ui.frame().includes("Follow daemon default (work)"));
@@ -95,7 +106,7 @@ describe("TUI backend dialogs", () => {
 
   it("creates on a chosen endpoint without leaking a previously selected Claude account", async () => {
     const submissions: unknown[] = [];
-    const client = { listClaudeAccounts: async () => ({ defaultAccount: "default", accounts: [{ name: "work", kind: "subscription" }] }) } as unknown as TuiWsClient;
+    const client = accountsClient({ claude: ["work"] });
     const ui = await mount(<NewSessionModal providers={providers} client={client} onCancel={() => {}}
       onSubmit={async (name, workdir, options) => { submissions.push({ name, workdir, ...options }); }} />);
     await ui.press("local-work");
@@ -187,7 +198,7 @@ describe("TUI backend dialogs", () => {
 
   it("sends the chosen Claude account when Claude is the provider", async () => {
     const submissions: unknown[] = [];
-    const client = { listClaudeAccounts: async () => ({ defaultAccount: "default", accounts: [{ name: "work", kind: "subscription" }] }) } as unknown as TuiWsClient;
+    const client = accountsClient({ claude: ["work"] });
     const ui = await mount(<NewSessionModal providers={providers} client={client} onCancel={() => {}}
       onSubmit={async (name, workdir, options) => { submissions.push({ name, workdir, ...options }); }} />);
     await ui.press("claude-work");
@@ -200,7 +211,54 @@ describe("TUI backend dialogs", () => {
     await ui.press("\u001b[D");
     expect(ui.frame()).toContain("account: work");
     await ui.press("\r");
-    expect(submissions).toEqual([{ name: "claude-work", workdir: process.cwd(), providerId: "claude", claudeAccount: "work" }]);
+    expect(submissions).toEqual([{ name: "claude-work", workdir: process.cwd(), providerId: "claude", account: "work" }]);
+  });
+
+  it("offers the selected backend's own accounts and sends the one chosen for a Codex session", async () => {
+    const submissions: unknown[] = [];
+    const requested: string[] = [];
+    const client = accountsClient({ claude: ["work"], codex: ["chatgpt-home"] }, "default", requested);
+    const ui = await mount(<NewSessionModal providers={withCodex} client={client} onCancel={() => {}}
+      onSubmit={async (name, workdir, options) => { submissions.push({ name, workdir, ...options }); }} />);
+    await ui.press("codex-work");
+    await ui.press("\t");
+    await ui.press("\t");
+    // A Claude account picked first must not follow the session to Codex.
+    await ui.press("\t");
+    await waitFor(() => ui.frame().includes("Follow daemon default"));
+    await ui.press("\u001b[D");
+    expect(ui.frame()).toContain("account: work");
+    await ui.press("\u001b[Z");
+    for (let i = 0; i < 3; i++) await ui.press("\u001b[C");
+    expect(ui.frame()).toContain("provider: Codex (codex)");
+    await waitFor(() => requested.includes("codex"));
+    expect(ui.frame()).toContain("account: Follow daemon default (default)");
+    expect(ui.frame()).not.toContain("account: work");
+    await ui.press("\t");
+    await ui.press("\u001b[D");
+    expect(ui.frame()).toContain("account: chatgpt-home");
+    await ui.press("\r");
+    expect(submissions).toEqual([{ name: "codex-work", workdir: process.cwd(), providerId: "codex", account: "chatgpt-home" }]);
+  });
+
+  it("has no account field for a backend without accounts", async () => {
+    const submissions: unknown[] = [];
+    const requested: string[] = [];
+    const ui = await mount(<NewSessionModal providers={withCodex} client={accountsClient({}, "default", requested)} onCancel={() => {}}
+      onSubmit={async (name, workdir, options) => { submissions.push({ name, workdir, ...options }); }} />);
+    await ui.press("mocked");
+    await ui.press("\t");
+    await ui.press("\t");
+    await ui.press("\u001b[D");
+    expect(ui.frame()).toContain("provider: Mock (mock)");
+    expect(ui.frame()).not.toContain("account:");
+    // Tab wraps straight back to the name: there is no account field to land on.
+    await ui.press("\t");
+    expect(ui.frame()).toContain("▸ name:");
+    await ui.press("\u001b[Z");
+    await ui.press("\r");
+    expect(submissions).toEqual([{ name: "mocked", workdir: process.cwd(), providerId: "mock" }]);
+    expect(requested).not.toContain("mock");
   });
 
   it("marks a selected provider that disappears as removed and shows the daemon's refusal", async () => {
