@@ -23,6 +23,8 @@ import {
   BackendLoginBroker,
   BackendLoginError,
   CLAUDE_LOGIN_FLOW,
+  CODEX_LOGIN_FLOW,
+  GEMINI_CLI_LOGIN_FLOW,
   type LoginFlow,
   redact,
 } from "../daemon/auth/backend-login.js";
@@ -39,7 +41,7 @@ let evilCmd: string;
 let pidFile: string;
 
 beforeAll(() => {
-  dir = mkdtempSync(join(tmpdir(), "codeoid-login-"));
+  dir = mkdtempSync(join(tmpdir(), "codeoid-logintest-"));
   fakeCmd = join(dir, "fake-login.sh");
   pidFile = join(dir, "pid");
   // Note the two copies of the URL: the OSC-8 hyperlink carries it whole, the
@@ -361,7 +363,7 @@ echo "Your token: ${TOKEN}"
       const broker = newBroker(fakeFlow({ resolve: () => ({ file: cmd, args: [] }) }));
       const login = await broker.start("claude", { isolated: true });
       const [configDir, apiKey] = readFileSync(seen, "utf8").trim().split("|");
-      expect(configDir).toContain("codeoid-claude-login-"); // never ~/.claude
+      expect(configDir).toContain("codeoid-login-"); // never ~/.claude
       expect(apiKey).toBe("none");
       expect(existsSync(configDir!)).toBe(true);
 
@@ -385,5 +387,94 @@ echo "Your token: ${TOKEN}"
     expect(existsSync(stale)).toBe(false);
     expect(existsSync(fresh)).toBe(true);
     rmSync(fresh, { recursive: true, force: true });
+  });
+});
+
+describe("file-credential logins (Codex device code, Gemini CLI)", () => {
+  const script = (name: string, body: string) => {
+    const file = join(dir, name);
+    writeFileSync(file, `#!/usr/bin/env bash\n${body}\n`, "utf8");
+    chmodSync(file, 0o755);
+    return file;
+  };
+
+  test("a Codex device login shows the link and code, finishes on its own, and hands back auth.json", async () => {
+    const seen = join(dir, "codex-seen");
+    const cmd = script(
+      "codex-device.sh",
+      `printf '%s|%s\\n' "\${CODEX_HOME:-unset}" "\${OPENAI_API_KEY:-none}" > "${seen}"
+echo "1. Open this link in your browser and sign in to your account"
+echo "   https://auth.openai.com/codex/device"
+echo "2. Enter this one-time code (expires in 15 minutes)"
+echo "   8UP4-KHOLU"
+sleep 1
+printf '{"auth_mode":"chatgpt","tokens":{"access_token":"at-secret"}}' > "$CODEX_HOME/auth.json"
+echo "Successfully logged in"`,
+    );
+    const saved = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = "daemon-key-must-not-leak";
+    try {
+      const broker = newBroker({ codex: { ...CODEX_LOGIN_FLOW, resolve: () => ({ file: cmd, args: [] }) } });
+      // Codex sign-in is for a named account only.
+      await expect(broker.start("codex")).rejects.toThrow(/named account/);
+      const login = await broker.start("codex", { isolated: true });
+      expect(login).toMatchObject({ mode: "device", userCode: "8UP4-KHOLU", verificationUrl: "https://auth.openai.com/codex/device" });
+      const [home, key] = readFileSync(seen, "utf8").trim().split("|");
+      expect(home).toContain("codeoid-login-");
+      expect(key).toBe("none");
+      const outcome = await broker.wait(login.loginId);
+      expect(outcome.ok).toBe(true);
+      expect(outcome.isolated).toBe(true);
+      expect(outcome.files?.["auth.json"]).toContain("at-secret");
+      expect(existsSync(home!)).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = saved;
+    }
+  });
+
+  test("a Codex device login that exits without a credential fails", async () => {
+    const cmd = script(
+      "codex-fail.sh",
+      `echo "   https://auth.openai.com/codex/device"
+echo "   ABCD-EFGHI"
+sleep 0.5
+echo "Error logging in: device code expired"
+exit 1`,
+    );
+    const broker = newBroker({ codex: { ...CODEX_LOGIN_FLOW, resolve: () => ({ file: cmd, args: [] }) } });
+    const login = await broker.start("codex", { isolated: true });
+    const outcome = await broker.wait(login.loginId);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.error).toMatch(/Error logging in/);
+  });
+
+  test("a Gemini CLI sign-in selects Google login, takes the pasted code, and is done when its creds file appears", async () => {
+    const consent = "https://accounts.google.com/o/oauth2/v2/auth?redirect_uri=x&code_challenge=y&state=z&client_id=c";
+    const cmd = script(
+      "gemini-login.sh",
+      `grep -q oauth-personal "$GEMINI_CLI_HOME/.gemini/settings.json" || { echo "auth type not selected"; exit 3; }
+[ "$NO_BROWSER" = "true" ] || { echo "would open a browser"; exit 4; }
+echo "Please visit the following URL to authorize the application:"
+echo "${consent}"
+printf "Enter the authorization code: "
+read -r code
+[ "$code" = "4/good" ] || { echo "Failed to exchange authorization code"; sleep 30; }
+printf '{"refresh_token":"rt-secret"}' > "$GEMINI_CLI_HOME/.gemini/oauth_creds.json"
+# The CLI carries on as an interactive chat after signing in.
+sleep 60`,
+    );
+    const broker = newBroker({ "gemini-cli": { ...GEMINI_CLI_LOGIN_FLOW, resolve: () => ({ file: cmd, args: [] }) } });
+    const login = await broker.start("gemini-cli", { isolated: true });
+    expect(login.verificationUrl).toBe(consent);
+    expect(login.mode).toBe("code");
+    const outcome = await broker.submit(login.loginId, "4/good");
+    expect(outcome.ok).toBe(true);
+    expect(outcome.files?.[".gemini/oauth_creds.json"]).toContain("rt-secret");
+    // A rejected code is reported, and nothing is kept.
+    const again = await broker.start("gemini-cli", { isolated: true });
+    const bad = await broker.submit(again.loginId, "4/bad");
+    expect(bad.ok).toBe(false);
+    expect(bad.files).toBeUndefined();
   });
 });

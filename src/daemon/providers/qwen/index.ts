@@ -56,6 +56,7 @@ import type {
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
 import { buildQwenEnv } from "../env.js";
 import type { LLMCallUsage } from "../../context-math.js";
+import type { ResolvedAccount } from "../../accounts.js";
 
 /** Where qwen-code persists a qwen.ai subscription login. */
 const QWEN_OAUTH_CREDS = join(homedir(), ".qwen", "oauth_creds.json");
@@ -88,6 +89,12 @@ export interface QwenProviderInit {
   /** Cross-backend MCP registry — mounted natively (qwen owns its MCP client). */
   mcpRegistry?: McpServerView;
   config?: CodeoidConfig;
+  /**
+   * This session's account for the backend, resolved when its query is
+   * built (accounts.ts); null = the daemon's own login. Throws when the
+   * chosen account can't be used — the turn fails, never another credential.
+   */
+  resolveAccount?: () => ResolvedAccount | null;
   onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
 }
 
@@ -113,6 +120,8 @@ export class QwenProvider implements SessionProvider {
   #consumerTask: Promise<void> | null = null;
   #currentTurnQueue: AsyncQueue<ProviderEvent> | null = null;
   #builtSystemPromptAppend = "";
+  /** Fingerprint of the account the running query was built with ("" = the daemon's own). */
+  #builtAccount = "";
   /** Bumped on every (re)build so an orphaned consumer can't clobber the new loop. */
   #loopGeneration = 0;
 
@@ -348,13 +357,17 @@ export class QwenProvider implements SessionProvider {
 
   #ensureQueryLoop(opts: TurnOpts): void {
     const desiredAppend = opts.systemPromptAppend ?? "";
+    // Resolved per query build; throws (failing the turn) when the chosen
+    // account can't be used. A changed account rebuilds and resumes.
+    const account = this.#init.resolveAccount?.() ?? null;
+    const desiredAccount = account?.fingerprint ?? "";
     if (this.#consumerTask && this.#inputQueue && !this.#inputQueue.closed) {
       // The SDK fixes the system prompt at query construction, so a changed
       // append (before_turn hooks, refreshed memory index) needs a rebuild.
       // The fresh query RESUMES the same backing session, so nothing is lost.
-      if (this.#builtSystemPromptAppend === desiredAppend) return;
+      if (this.#builtSystemPromptAppend === desiredAppend && this.#builtAccount === desiredAccount) return;
       console.log(
-        `[qwen-provider ${this.#init.sessionId.slice(0, 8)}] systemPromptAppend changed — rebuilding query loop`,
+        `[qwen-provider ${this.#init.sessionId.slice(0, 8)}] ${this.#builtAccount === desiredAccount ? "systemPromptAppend" : "account"} changed — rebuilding query loop`,
       );
       this.#inputQueue.close();
       this.#abortController?.abort();
@@ -365,6 +378,7 @@ export class QwenProvider implements SessionProvider {
     this.#abortController = new AbortController();
     this.#inputQueue = new AsyncQueue<SDKUserMessage>();
     this.#builtSystemPromptAppend = desiredAppend;
+    this.#builtAccount = desiredAccount;
     this.#loopGeneration += 1;
     const myGeneration = this.#loopGeneration;
 
@@ -392,8 +406,9 @@ export class QwenProvider implements SessionProvider {
       ...(init.fleet ? { codeoid_fleet: init.fleet } : {}),
     };
 
-    const authType = resolveQwenAuthType(qwenCfg?.authType);
-    const baseUrl = resolveQwenBaseUrl(qwenCfg?.baseUrl);
+    // An account is an API key with its endpoint; it replaces the configured auth.
+    const authType = account ? "openai" : resolveQwenAuthType(qwenCfg?.authType);
+    const baseUrl = account ? resolveQwenBaseUrl(account.account.baseUrl) : resolveQwenBaseUrl(qwenCfg?.baseUrl);
     const model = opts.model ?? qwenCfg?.model;
     this.#currentModel = model ?? null;
     this.#currentBaseUrl = baseUrl ?? null;
@@ -408,6 +423,8 @@ export class QwenProvider implements SessionProvider {
         // this over process.env rather than replacing it (see buildQwenEnv).
         env: {
           ...buildQwenEnv(),
+          // An account's key, and none of the daemon's (blanked: the SDK merges over process.env).
+          ...(account ? { OPENAI_API_KEY: account.account.token ?? "", DASHSCOPE_API_KEY: "" } : {}),
           ...(baseUrl ? { OPENAI_BASE_URL: baseUrl } : {}),
           ...(model ? { OPENAI_MODEL: model } : {}),
         },

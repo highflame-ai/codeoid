@@ -77,6 +77,8 @@ import type { McpServerView } from "../../mcp/registry.js";
 import { MCP_PROXY_TOKEN_ENV, McpProxyLease, type McpProxyMount } from "../../mcp/proxy.js";
 import { codexKeySafe, codexShellEnvExcludeArgs } from "./shell-env.js";
 import { resolveEnvMap } from "../../mcp/types.js";
+import type { ResolvedAccount } from "../../accounts.js";
+import { applyCodexAccount } from "../../account-apply.js";
 
 /** codex `tokenUsage.last` / `.total` shape (thread/tokenUsage/updated). */
 interface CodexTokenUsage {
@@ -121,6 +123,12 @@ export interface CodexProviderInit {
   /** Cross-backend MCP registry — external servers mount natively via `-c
    *  mcp_servers.*` (codex owns its client); approval flows through canUseTool. */
   mcpRegistry?: McpServerView;
+  /**
+   * This session's account for the backend, resolved when the process is
+   * spawned (accounts.ts); null = the daemon's own login. Throws when the
+   * chosen account can't be used — the turn fails, never another credential.
+   */
+  resolveAccount?: () => ResolvedAccount | null;
   onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
 }
 
@@ -272,6 +280,7 @@ export class CodexProvider implements SessionProvider {
   #backingSessionId: string;
   #command: string;
   #argsPrefix: string[];
+  #resolveAccount: (() => ResolvedAccount | null) | null;
   #onModels?: CodexProviderInit["onModels"];
   #workspaceId: string;
   #memoryMcp: MemoryMcpMount | null;
@@ -353,6 +362,7 @@ export class CodexProvider implements SessionProvider {
     this.#sessionId = init.sessionId;
     this.#backingSessionId = init.initialBackingId;
     this.#command = init.command;
+    this.#resolveAccount = init.resolveAccount ?? null;
     this.#argsPrefix = init.argsPrefix ?? [];
     this.#onModels = init.onModels;
     this.#workspaceId = init.workspaceId ?? init.sessionId;
@@ -714,7 +724,13 @@ export class CodexProvider implements SessionProvider {
         argsPrefix: this.#argsPrefix,
         args: [...mcp.args, ...bb.args, ...reg.args, ...oauth.args, ...(shellEnv ?? [])],
         cwd: opts.workdir,
-        env: { ...buildCodexEnv(), ...mcp.env, ...bb.env, ...reg.env, ...oauth.env },
+        // The account's own CODEX_HOME (an overlay sharing everything but its
+        // auth.json), applied last so nothing re-adds a daemon key.
+        env: applyCodexAccount(
+          this.#resolveAccount?.() ?? null,
+          { ...buildCodexEnv(), ...mcp.env, ...bb.env, ...reg.env, ...oauth.env },
+          { command: this.#command, argsPrefix: this.#argsPrefix },
+        ),
         onNotification: (method, params) => this.#onNotification(method, params),
         onServerRequest: (method, params) => this.#onServerRequest(method, params),
         onExit: ({ code, signal, stderrTail }) => {

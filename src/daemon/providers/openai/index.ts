@@ -67,6 +67,12 @@ export interface OpenAIProviderInit {
   displayName?: string;
   /** Explicit API key — falls back to OPENAI_API_KEY env var. */
   apiKey?: string;
+  /**
+   * The session's account, per turn (accounts.ts): its key replaces the
+   * static `apiKey` and the client is rebuilt when the account changes. A
+   * throw fails the turn (a removed account never falls back).
+   */
+  resolveApiKey?: () => { key: string; fingerprint: string } | null;
   /** Default model when TurnOpts.model is absent. */
   defaultModel?: string;
   /**
@@ -172,6 +178,7 @@ export class OpenAIProvider implements AgentProvider {
   #fallbackModels: ModelInfo[];
   #contextWindow: ((model: string) => Promise<number | undefined>) | null;
   #toolsTransform: ((tools: OpenAIFunctionTool[]) => OpenAIFunctionTool[]) | null;
+  #resolveApiKey: (() => { key: string; fingerprint: string } | null) | null;
 
   constructor(init: OpenAIProviderInit = {}) {
     this.id = init.id ?? "openai";
@@ -198,6 +205,7 @@ export class OpenAIProvider implements AgentProvider {
     this.#fallbackModels = init.fallbackModels ?? OPENAI_FALLBACK_MODELS;
     this.#contextWindow = init.contextWindow ?? null;
     this.#toolsTransform = init.toolsTransform ?? null;
+    this.#resolveApiKey = init.resolveApiKey ?? null;
   }
 
   /**
@@ -207,6 +215,20 @@ export class OpenAIProvider implements AgentProvider {
    */
   #clientForTurn(): { client: OpenAI; conn: OpenAIConnection | null } {
     if (!this.#connection) {
+      // An account's key, when the session has one; rebuilt when it changes.
+      const account = this.#resolveApiKey?.() ?? null;
+      const fingerprint = account?.fingerprint ?? "";
+      if (this.#client && this.#clientFingerprint !== fingerprint) this.#client = null;
+      this.#clientFingerprint = fingerprint;
+      if (account) {
+        this.#client ??= new OpenAI({
+          apiKey: account.key,
+          ...(this.#staticConnection.baseURL ? { baseURL: this.#staticConnection.baseURL } : {}),
+          organization: null,
+          project: null,
+        });
+        return { client: this.#client, conn: null };
+      }
       this.#client ??= new OpenAI({
         // "" = keyless (the SDK refuses an empty key; a local server ignores the header).
         apiKey:

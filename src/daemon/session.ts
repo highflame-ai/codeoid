@@ -10,7 +10,9 @@
  */
 
 import { ClaudeAccountError, type ClaudeAccountStore, projectCredentialOverride } from "./claude-accounts.js";
-import { CLAUDE_DEFAULT_ACCOUNT } from "../protocol/types.js";
+import { AccountError, type AccountStore, type ResolvedAccount } from "./accounts.js";
+import { geminiProjectOverride } from "./account-apply.js";
+import { backendHasAccounts, CLAUDE_DEFAULT_ACCOUNT, DEFAULT_ACCOUNT } from "../protocol/types.js";
 import {
   CanonicalHistoryAccumulator,
   canonicalTurnChars,
@@ -128,6 +130,12 @@ import type { McpServerSpec } from "./mcp/types.js";
 
 /** Backends that start a new conversation after a teardown, so are handed the history again (the Gemini CLI: a new ACP session, no resume). */
 const RESEED_AFTER_TEARDOWN = new Set(["gemini-cli"]);
+/**
+ * Backends that hold a credential in a running process: an account change
+ * releases it when idle, so the next turn starts one on the new credential.
+ * The rest re-read their account every turn (accounts.ts).
+ */
+const PROCESS_BACKENDS: ReadonlySet<string> = new Set(["claude", "codex", "gemini-cli", "qwen", "pi"]);
 import { adoptableName, adoptionRefusal, claudeMcpServers, fromRepoFile, fullUrlRequired, shellArg } from "./mcp/adopt.js";
 import { cleanMcpError, redactMcpUrl } from "./mcp/redact.js";
 import type { McpHub } from "./mcp/hub.js";
@@ -284,6 +292,10 @@ export interface SessionCreateOptions {
   claudeAccounts?: ClaudeAccountStore;
   /** The Claude account this session chose; absent/null = follow the daemon default. Restored on resume. */
   claudeAccount?: string | null;
+  /** The daemon's account store for every backend (accounts.ts). Absent = every backend on the daemon's own credential. */
+  accounts?: AccountStore;
+  /** This session's account per backend (absent = follow that backend's default). Restored on resume. */
+  accountChoices?: Record<string, string>;
   store: Store;
   transcriptStore: TranscriptStore;
   identityManager?: AgentIdentityManager;
@@ -699,10 +711,15 @@ export class Session {
   // Provider (re-)construction inputs — see switchProvider().
   #providersRegistry?: ProviderRegistry;
   #claudeAccounts?: ClaudeAccountStore;
-  /** This session's own Claude account choice; null = follow the daemon default. */
-  #claudeAccount: string | null = null;
-  /** An account change arrived while busy: release the Claude query once idle. */
-  #releaseClaudeWhenIdle = false;
+  #accounts?: AccountStore;
+  /**
+   * This session's account per backend; absent = follow that backend's
+   * daemon default. One entry per backend, so switching backends picks up
+   * that backend's choice and switching back restores the earlier one.
+   */
+  #accountChoices: Record<string, string> = {};
+  /** An account change arrived while busy: release the provider once idle. */
+  #releaseProviderWhenIdle = false;
   #fleet?: McpSdkServerConfigWithInstance;
   #compressionRegistry?: CompressionRegistry;
   #onModels?: SessionCreateOptions["onModels"];
@@ -1211,7 +1228,9 @@ export class Session {
     // the backend long after the constructor options are gone.
     this.#providersRegistry = opts.providers;
     this.#claudeAccounts = opts.claudeAccounts;
-    this.#claudeAccount = opts.claudeAccount ?? null;
+    this.#accounts = opts.accounts ?? opts.claudeAccounts?.store;
+    this.#accountChoices = { ...(opts.accountChoices ?? {}) };
+    if (opts.claudeAccount) this.#accountChoices.claude = opts.claudeAccount;
     this.#fleet = opts.fleet;
     this.#compressionRegistry = opts.compressionRegistry;
     this.#onModels = opts.onModels;
@@ -1349,7 +1368,7 @@ export class Session {
         projectId: opts.auth.projectId,
         role: this.role,
         providerId: this.#provider.id,
-        ...(this.#claudeAccount ? { claudeAccount: this.#claudeAccount } : {}),
+        ...this.#accountMeta(),
         forkedFrom: this.forkedFrom,
         worktree: this.worktree,
         collaboration: this.collaboration,
@@ -1414,8 +1433,66 @@ export class Session {
       // so the manager caches catalogs per-provider.
       onModels: (m) => this.#onModels?.(factory.id, m),
       // Read per query (not captured), so a switch reaches the next turn.
-      resolveClaudeAccount: () => this.#claudeAccounts?.resolve(this.#claudeAccount) ?? null,
+      resolveClaudeAccount: () => this.#claudeAccounts?.resolve(this.#accountChoices.claude ?? null) ?? null,
+      // Every other backend: this session's account for it (accounts.ts).
+      resolveAccount: () => this.#resolveAccount(factory.id),
     });
+  }
+
+  /** The persisted account choices (the Claude one also under its #392 name, for a rolled-back daemon). */
+  #accountMeta(): { accounts?: Record<string, string>; claudeAccount?: string } {
+    const choices = this.#accountChoices;
+    return {
+      ...(Object.keys(choices).length > 0 ? { accounts: { ...choices } } : {}),
+      ...(choices.claude ? { claudeAccount: choices.claude } : {}),
+    };
+  }
+
+  /** This session's account for `backend`, resolved now (null = the built-in one). Throws when it can't be used. */
+  #resolveAccount(backend: string): ResolvedAccount | null {
+    if (!this.#accounts || !backendHasAccounts(backend)) return null;
+    return this.#accounts.resolve(backend, this.#accountChoices[backend] ?? null);
+  }
+
+  /** This session's choice for `backend` (default: its current one); null = follow the backend default. */
+  accountChoice(backend: string = this.#provider.id): string | null {
+    return this.#accountChoices[backend] ?? null;
+  }
+
+  /** Every backend's choice — copied by a fork. */
+  get accountChoices(): Record<string, string> {
+    return { ...this.#accountChoices };
+  }
+
+  /**
+   * The account this session runs on next for `backend` — its choice, else
+   * the backend default, else `default`. Throws AccountError when that
+   * account no longer exists (never falls back to another credential).
+   */
+  effectiveAccount(backend: string = this.#provider.id): string {
+    if (backend === "claude") return this.effectiveClaudeAccount();
+    return this.#resolveAccount(backend)?.name ?? DEFAULT_ACCOUNT;
+  }
+
+  /**
+   * Choose the account this session runs on for `backend` (default: its
+   * current one); null = follow the backend default. Takes effect on the next
+   * turn: the provider is released when idle and the next turn starts on the
+   * new credential and resumes the same conversation. A running turn keeps
+   * the credential it started with.
+   */
+  setAccount(account: string | null, sender: AuthContext, backend: string = this.#provider.id): void {
+    if (!backendHasAccounts(backend)) throw new AccountError(`the ${backend} backend has no accounts`);
+    if (account !== null && !(this.#accounts?.has(backend, account) ?? account === DEFAULT_ACCOUNT)) {
+      throw new AccountError(`no ${backend} account named ${JSON.stringify(account)}`);
+    }
+    const from = this.#accountChoices[backend] ?? "(follow-default)";
+    if (account === null) delete this.#accountChoices[backend];
+    else this.#accountChoices[backend] = account;
+    this.#store.audit(sender.sub, backend === "claude" ? "session.claude_account" : "session.account", this.id, `backend=${backend} from=${from} to=${account ?? "(follow-default)"}`);
+    this.#saveMetaNow();
+    this.#broadcastInfoUpdate();
+    if (backend === this.#provider.id) this.releaseIdleProvider();
   }
 
   /**
@@ -1423,7 +1500,7 @@ export class Session {
    * default. A literal `default` pins the built-in account.
    */
   get claudeAccount(): string | null {
-    return this.#claudeAccount;
+    return this.#accountChoices.claude ?? null;
   }
 
   /**
@@ -1432,7 +1509,7 @@ export class Session {
    * it would use no longer exists (never falls back to another credential).
    */
   effectiveClaudeAccount(): string {
-    return this.#claudeAccounts?.resolve(this.#claudeAccount)?.name ?? CLAUDE_DEFAULT_ACCOUNT;
+    return this.#claudeAccounts?.resolve(this.#accountChoices.claude ?? null)?.name ?? CLAUDE_DEFAULT_ACCOUNT;
   }
 
   /**
@@ -1446,40 +1523,44 @@ export class Session {
     if (account !== null && account !== CLAUDE_DEFAULT_ACCOUNT && !this.#claudeAccounts?.has(account)) {
       throw new ClaudeAccountError(`no Claude account named ${JSON.stringify(account)}`);
     }
-    const from = this.#claudeAccount ?? "(follow-default)";
-    this.#claudeAccount = account;
-    this.#store.audit(sender.sub, "session.claude_account", this.id, `from=${from} to=${account ?? "(follow-default)"}`);
-    this.#saveMetaNow();
-    this.#broadcastInfoUpdate();
-    this.releaseIdleClaudeQuery();
+    this.setAccount(account, sender, "claude");
   }
 
   /**
-   * Stop this session's Claude query if it is idle, so a warm CLI process does
-   * not keep running on a credential that was just switched away from,
-   * replaced or removed (it would still answer background work on it). The
-   * next turn starts a fresh process on the current account and resumes the
-   * same conversation. A busy session keeps its process — the running turn
-   * finishes on the credential it started with, and the next turn rebuilds.
+   * Stop this session's backend if it is idle, so a warm process does not
+   * keep running on a credential that was just switched away from, replaced
+   * or removed (it would still answer background work on it). The next turn
+   * starts a fresh one on the current account and resumes the same
+   * conversation. A busy session keeps its process — the running turn
+   * finishes on the credential it started with, and it is released once idle.
+   *
+   * HTTP backends re-read their account every turn and hold no process, so
+   * there is nothing to release.
    */
-  releaseIdleClaudeQuery(): void {
-    if (this.#provider.id !== "claude") return;
+  releaseIdleProvider(): void {
+    if (!PROCESS_BACKENDS.has(this.#provider.id)) return;
+    const backend = this.#provider.id;
     this.#sendChain = this.#sendChain
       .catch(() => {})
       .then(async () => {
-        if (this.#provider.id !== "claude") return;
+        if (this.#provider.id !== backend) return;
         if (this.#switchBusyReason() || this.#backgroundTasks.size > 0) {
           // Busy: release once the turn and its background work are done, so
           // background work can't carry on indefinitely on a removed account.
-          this.#releaseClaudeWhenIdle = true;
+          this.#releaseProviderWhenIdle = true;
           return;
         }
-        this.#releaseClaudeWhenIdle = false;
+        this.#releaseProviderWhenIdle = false;
         await this.#teardownProvider();
       })
       .catch((e) => {
-        console.error(`[codeoid/session ${this.id}] releasing the idle Claude query failed: ${e instanceof Error ? e.message : String(e)}`);
+        console.error(`[codeoid/session ${this.id}] releasing the idle ${backend} backend failed: ${e instanceof Error ? e.message : String(e)}`);
       });
+  }
+
+  /** #392's name for {@link releaseIdleProvider}. */
+  releaseIdleClaudeQuery(): void {
+    if (this.#provider.id === "claude") this.releaseIdleProvider();
   }
 
   /** Re-announce this session's info — its effective Claude account moved with the daemon default. */
@@ -1494,7 +1575,7 @@ export class Session {
    */
   assertClaudeAccountUsable(): void {
     if (this.#provider.id !== "claude" || !this.#claudeAccounts) return;
-    const account = this.#claudeAccounts.resolve(this.#claudeAccount); // throws ClaudeAccountError
+    const account = this.#claudeAccounts.resolve(this.#accountChoices.claude ?? null); // throws ClaudeAccountError
     if (!account) return;
     // A named account's token must not be redirectable by the workdir's own
     // Claude settings (claude-accounts.ts projectCredentialOverride).
@@ -1503,6 +1584,29 @@ export class Session {
       throw new ClaudeAccountError(
         `${override.file} sets ${override.key}, which would redirect Claude account "${account.name}"'s credential — remove it, or run this session on the default account`,
       );
+    }
+  }
+
+  /**
+   * Refuse to start a turn on an account of the current backend that no
+   * longer exists, or whose credential the workdir's project files would
+   * redirect. Throws ClaudeAccountError / AccountError.
+   */
+  assertAccountUsable(): void {
+    const backend = this.#provider.id;
+    if (backend === "claude") {
+      this.assertClaudeAccountUsable();
+      return;
+    }
+    const account = this.#resolveAccount(backend); // throws AccountError
+    if (!account) return;
+    if (backend === "gemini-cli") {
+      const override = geminiProjectOverride(this.workdir);
+      if (override) {
+        throw new AccountError(
+          `${override.file} sets ${override.key}, which would redirect gemini-cli account "${account.name}"'s credential — remove it, or run this session on the default account`,
+        );
+      }
     }
   }
 
@@ -2698,7 +2802,7 @@ export class Session {
   ): Promise<void> {
     // Before anything is recorded: a session whose Claude account was removed
     // must not quietly run on some other credential.
-    this.assertClaudeAccountUsable();
+    this.assertAccountUsable();
     // Funnel through the chain. The next send awaits the previous
     // send's full settle (success or thrown). Errors propagate to the
     // caller of THIS send only — the chain itself absorbs them so a
@@ -4413,23 +4517,30 @@ export class Session {
     return this.#currentTurnId;
   }
 
-  #claudeAccountInfo(): Pick<SessionInfo, "claudeAccount" | "effectiveClaudeAccount"> {
-    if (this.#provider.id !== "claude") return {};
+  #accountInfo(): Pick<SessionInfo, "claudeAccount" | "effectiveClaudeAccount" | "account" | "effectiveAccount"> {
+    const backend = this.#provider.id;
+    if (!backendHasAccounts(backend)) return {};
     let effective: string;
     try {
-      effective = this.effectiveClaudeAccount();
+      effective = this.effectiveAccount(backend);
     } catch {
       // Name the account the session can't run on — for a follower, the
-      // daemon default it follows. Clients key on the " (missing)" suffix.
+      // default it follows. Clients key on the " (missing)" suffix.
       let followed: string | undefined;
       try {
-        followed = this.#claudeAccounts?.getDefault();
+        followed = this.#accounts?.getDefault(backend);
       } catch {
         // An unreadable accounts file — no name to show.
       }
-      effective = `${this.#claudeAccount ?? followed ?? "?"} (missing)`;
+      effective = `${this.#accountChoices[backend] ?? followed ?? "?"} (missing)`;
     }
-    return { ...(this.#claudeAccount ? { claudeAccount: this.#claudeAccount } : {}), effectiveClaudeAccount: effective };
+    const choice = this.#accountChoices[backend];
+    return {
+      ...(choice ? { account: choice } : {}),
+      effectiveAccount: effective,
+      // #392's fields — the Claude backend's view, for older clients.
+      ...(backend === "claude" ? { ...(choice ? { claudeAccount: choice } : {}), effectiveClaudeAccount: effective } : {}),
+    };
   }
 
   toInfo(): SessionInfo {
@@ -4444,7 +4555,7 @@ export class Session {
       attachedClients: this.#clients.size,
       role: this.role,
       providerId: this.#provider.id,
-      ...this.#claudeAccountInfo(),
+      ...this.#accountInfo(),
       mode: this.#mode,
       turnsRemaining: this.#turnsRemaining,
       pinnedFiles: [...this.#pinnedFiles],
@@ -6478,7 +6589,7 @@ export class Session {
     this.#reconcileWork("background tasks drained", { keepBackground: false });
     this.#denyPendingApprovals({ keepBackground: false });
     this.#settleBetweenTurns();
-    if (this.#releaseClaudeWhenIdle) this.releaseIdleClaudeQuery();
+    if (this.#releaseProviderWhenIdle) this.releaseIdleProvider();
   }
 
   /** The provider reports background work still running. */
@@ -7539,8 +7650,8 @@ export class Session {
     // for clients or for resume — skip the persistence AND the broadcast.
     if (status === this.#status) return;
     this.#status = status;
-    if (status === "idle" && this.#releaseClaudeWhenIdle && this.#backgroundTasks.size === 0) {
-      this.releaseIdleClaudeQuery();
+    if (status === "idle" && this.#releaseProviderWhenIdle && this.#backgroundTasks.size === 0) {
+      this.releaseIdleProvider();
     }
 
     // Turn exit with settled background work queued mid-turn: wake now. Runs
@@ -7646,7 +7757,7 @@ export class Session {
       role: this.role,
       providerId: this.#provider.id,
       // In BOTH meta writes: each overwrites the whole file (see below).
-      ...(this.#claudeAccount ? { claudeAccount: this.#claudeAccount } : {}),
+      ...this.#accountMeta(),
       ...(this.#backingFresh ? { backingFresh: true } : {}),
       ...(this.#redactedBackings.size > 0 ? { redactedBackings: [...this.#redactedBackings] } : {}),
       forkedFrom: this.forkedFrom,

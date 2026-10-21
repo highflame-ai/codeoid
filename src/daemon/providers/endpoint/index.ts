@@ -11,6 +11,7 @@
  */
 
 import type { McpServerSource } from "../../mcp/tool-source.js";
+import { AccountError, type ResolvedAccount } from "../../accounts.js";
 import {
   configuredContextWindow,
   connectionOf,
@@ -192,6 +193,28 @@ function liveMcpSource(registry: McpServerSource | undefined, store: EndpointSto
 }
 
 /** The factory for endpoint `name`. Works whether or not the endpoint exists right now. */
+/**
+ * The connection with a session's account applied: the account's key and
+ * headers replace the endpoint's own. Only on the server the account was
+ * entered for — an endpoint moved to another origin since makes the account
+ * refuse to run (re-enter it), the same rule as the endpoint's own secrets.
+ */
+export function withAccount(conn: EndpointConnection, account: ResolvedAccount | null): EndpointConnection {
+  if (!account) return conn;
+  const origin = new URL(conn.baseURL).origin;
+  if (account.account.origin !== origin) {
+    throw new AccountError(
+      `the ${account.backend} account "${account.name}" was entered for ${account.account.origin ?? "another server"}, and this endpoint now points at ${origin} — re-enter the account for the new server`,
+    );
+  }
+  return connectionOf({
+    name: conn.name,
+    baseUrl: conn.baseURL,
+    ...(account.account.token !== undefined ? { apiKey: account.account.token } : {}),
+    headers: account.account.headers ?? {},
+  });
+}
+
 export function endpointFactory(
   name: string,
   store: EndpointStore,
@@ -208,7 +231,7 @@ export function endpointFactory(
           id,
           displayName,
           connection: () => {
-            const conn = store.resolveConnection(name); // throws when removed
+            const conn = withAccount(store.resolveConnection(name), init.resolveAccount?.() ?? null); // throws when removed
             const e = store.get(name)!;
             return { ...conn, streamUsage: e.streamUsage, maxTokensField: e.maxTokensField };
           },

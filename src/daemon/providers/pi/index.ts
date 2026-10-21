@@ -52,6 +52,8 @@ import type { McpServerView } from "../../mcp/registry.js";
 import type { McpHub } from "../../mcp/hub.js";
 import { PiRpcProcess, type PiFrame } from "./rpc.js";
 import { translatePiEvent } from "./translate.js";
+import type { ResolvedAccount } from "../../accounts.js";
+import { applyPiAccount } from "../../account-apply.js";
 
 export interface PiProviderInit {
   sessionId: string;
@@ -74,6 +76,12 @@ export interface PiProviderInit {
    *  pi (which has no MCP client) by registering bridge tools that proxy to the hub. */
   mcpRegistry?: McpServerView;
   mcpHub?: McpHub;
+  /**
+   * This session's account for the backend, resolved when the process is
+   * spawned (accounts.ts); null = the daemon's own login. Throws when the
+   * chosen account can't be used — the turn fails, never another credential.
+   */
+  resolveAccount?: () => ResolvedAccount | null;
   onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
 }
 
@@ -100,6 +108,7 @@ export class PiProvider implements SessionProvider {
   #sessionId: string;
   #backingSessionId: string;
   #command: string;
+  #resolveAccount: (() => ResolvedAccount | null) | null;
   #argsPrefix: string[];
   #store: Store;
   #onModels?: PiProviderInit["onModels"];
@@ -130,6 +139,7 @@ export class PiProvider implements SessionProvider {
     this.#sessionId = init.sessionId;
     this.#backingSessionId = init.initialBackingId;
     this.#command = init.command;
+    this.#resolveAccount = init.resolveAccount ?? null;
     this.#argsPrefix = init.argsPrefix ?? [];
     this.#store = init.store;
     this.#onModels = init.onModels;
@@ -311,7 +321,7 @@ export class PiProvider implements SessionProvider {
       cwd: opts.workdir,
       // Allowlisted env (GHSA-38vh): pi gets its credentials (~/.pi via
       // HOME, provider API keys), never codeoid's own secrets.
-      env: buildPiEnv(),
+      env: applyPiAccount(this.#resolveAccount?.() ?? null, buildPiEnv()),
       onEvent: (frame) => this.#onFrame(frame),
       onExit: ({ code, signal, stderrTail }) => {
         this.#bridgeReady = false;
