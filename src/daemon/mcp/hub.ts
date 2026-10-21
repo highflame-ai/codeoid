@@ -25,6 +25,7 @@ import type { MemoryEngine } from "../memory/engine.js";
 import { isOAuthServer, resolveEnvMap } from "./types.js";
 import type { McpHttpTransport, McpServerSpec, McpStdioTransport } from "./types.js";
 import { McpSignInRequired, type McpCredentialSource, type McpTenant } from "./oauth.js";
+import { cleanMcpError } from "./redact.js";
 
 /** A tool as codeoid surfaces it to a backend (bare name; the canonical
  *  `mcp__<server>__<tool>` form is applied by the mounters, not here). */
@@ -114,7 +115,7 @@ export class McpHub {
       // Not having signed in is not a fault of the server: no health to
       // record — and the tool list from before is gone with the credential.
       if (e instanceof McpSignInRequired) this.#status.delete(key);
-      else this.#status.set(key, { tools: [], error: errMsg(e) });
+      else this.#status.set(key, { tools: [], error: cleanMcpError(errMsg(e)) });
       this.#drop(key);
       throw e;
     }
@@ -136,7 +137,7 @@ export class McpHub {
     try {
       client = this.#clientFor(spec, scope.tenant);
     } catch (e) {
-      return { text: `mcp: ${spec.name} unavailable: ${errMsg(e)}`, isError: true };
+      return { text: `mcp: ${spec.name} unavailable: ${cleanMcpError(errMsg(e))}`, isError: true };
     }
     try {
       return await withTimeout(client.callTool(tool, args, scope), this.#timeoutMs, `${spec.name}/${tool}`);
@@ -145,10 +146,13 @@ export class McpHub {
       if (e instanceof McpSignInRequired) return { text: e.message, isError: true };
       // codeoid has no OTEL; a failed external tool call is worth one daemon log
       // line (transport error / timeout) so a flaky server is diagnosable.
-      console.error(`[codeoid] mcp: ${spec.name}/${tool} failed: ${errMsg(e)}`);
+      // A transport error can quote the URL or a server's stderr: cleaned
+      // before it reaches the log, the model or the transcript.
+      const error = cleanMcpError(errMsg(e));
+      console.error(`[codeoid] mcp: ${spec.name}/${tool} failed: ${error}`);
       const key = clientKey(spec, scope.tenant);
-      this.#status.set(key, { tools: this.#status.get(key)?.tools ?? [], error: errMsg(e) });
-      return { text: `Error calling ${spec.name}/${tool}: ${errMsg(e)}`, isError: true };
+      this.#status.set(key, { tools: this.#status.get(key)?.tools ?? [], error });
+      return { text: `Error calling ${spec.name}/${tool}: ${error}`, isError: true };
     }
   }
 

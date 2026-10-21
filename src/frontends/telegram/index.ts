@@ -1022,12 +1022,12 @@ export class TelegramFrontend implements Frontend {
       lines = cfg.skills.map((s) => `• *${escMd(s.name)}* — ${escMd(s.description ?? "")}`);
     } else if (tab === "mcp") {
       lines = cfg.mcpServers.map(
-        (m) => `• *${escMd(m.name)}* — ${escMd(m.command ?? m.scope)}`,
+        (m) => `• *${escMd(m.name)}* — ${escMd(m.note ?? m.command ?? m.scope)}`,
       );
     } else {
       // Inside a MarkdownV2 code span only ` and \ are special — escMd here
       // rendered literal backslashes that broke copy-paste of the command.
-      lines = cfg.hooks.map((h) => `• \`${escCode(h.command)}\``);
+      lines = cfg.hooks.map((h) => (h.note ? `• ${escMd(h.note)}` : `• \`${escCode(h.command || "(empty)")}\``));
     }
     const title = { agents: "Subagents", skills: "Skills", mcp: "MCP servers", hooks: "Hooks" }[tab];
     await ctx.reply(

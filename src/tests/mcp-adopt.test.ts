@@ -291,6 +291,20 @@ describe("the capabilities drawer's view", () => {
   });
 });
 
+describe("a project's server whose URL has parts hidden (#394)", () => {
+  it("isn't offered in the drawer, which says to adopt it by its full URL instead", async () => {
+    writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { vendor: { type: "http", url: "https://mcp.vendor.example/123e4567-e89b-12d3-a456-426614174000/mcp" } } }));
+    const m = manager();
+    const sid = await sessionIn(m, work);
+    m._sessionForTest(sid)!.sdkMcpSnapshot.status.set("vendor", "needs-auth");
+    const row = ((await m.handle({ type: "claude.config", id: "v", sessionId: sid }, auth(WRITE), client)) as { mcpServers: ClaudeConfigMcpServer[] }).mcpServers.find(
+      (s) => s.name === "vendor",
+    );
+    expect(row).toMatchObject({ url: "https://mcp.vendor.example/…/mcp", adoptByFullUrl: true });
+    expect(row?.adoptable).toBeUndefined();
+  });
+});
+
 describe("a repo's file and the user's own config naming the same server", () => {
   it("both show, neither is offered, and adopting takes the URL", async () => {
     // The user's own project entry, and the cloned repo's .mcp.json, both "linear".

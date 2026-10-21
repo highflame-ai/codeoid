@@ -354,13 +354,10 @@ const McpAdopt: Component<{ server: string; url: string | null; path: string; pr
   const run = async () => {
     // Daemon-wide and lasting: say so before doing it — and, for a project's
     // own file, first, that the project chose this address.
-    // The full address, as the browser resolves it: plain ASCII (punycode
-    // host, the rest percent-encoded), so the path that tells two servers on
-    // one host apart is there too.
-    let address = props.url ?? "";
-    try {
-      address = new URL(props.url ?? "").href;
-    } catch {}
+    // The address as the daemon built it from the URL parser's own reading:
+    // punycode host, encoded path, credentials hidden as "…" (#394) — shown
+    // as is, not re-parsed (which would turn "…" into %E2%80%A6).
+    const address = props.url ?? "";
     const origin = props.projectFile ? `This project's own ${props.path} chose this server's address. Adopt it only if you trust that address.\n\n` : "";
     const ok = window.confirm(
       `${origin}codeoid will sign in to ${props.server} at ${address} itself. On this whole daemon, Claude sessions stop using the Claude CLI's own copy of it; each account's sessions get codeoid's copy once that account signs in.\n\nContinue?`,
@@ -471,9 +468,24 @@ const McpList: Component<{ items: ClaudeConfigMcpServer[]; sessionId: string | n
             <Show when={m.adopted}>
               <AdoptedSignIn server={m.name} />
             </Show>
+            <Show when={m.adoptByFullUrl}>
+              <div class="mt-1 text-[11px] text-fg-muted">
+                To sign in with codeoid, adopt it by its full URL, copied from this project's file (parts of it are hidden here):{" "}
+                <code class="font-mono">codeoid mcp adopt {m.name} --session &lt;this session&gt; --url &lt;full URL&gt;</code>
+              </div>
+            </Show>
+            <Show when={m.note}>
+              <div class="mt-1 text-[11px] text-fg-muted">{m.note}</div>
+            </Show>
             <Show when={m.command}>
               <div class="mt-1 break-all font-mono text-[11px] text-fg-muted">
-                {m.command} {m.args.join(" ")}
+                {m.command}
+                <Show when={(m.argCount ?? 0) > 0}>
+                  {" "}
+                  <span class="text-fg-faint">
+                    ({m.argCount} arg{m.argCount === 1 ? "" : "s"} — see the file)
+                  </span>
+                </Show>
               </div>
             </Show>
             <Show when={m.url}>
@@ -571,9 +583,16 @@ const HooksList: Component<{ items: ClaudeConfigHook[] }> = (props) => (
                 </span>
               </Show>
             </div>
-            <pre class="mt-1 overflow-x-auto rounded border border-border bg-bg-active/40 p-2 font-mono text-[11px] text-fg">
-              {h.command}
-            </pre>
+            <Show
+              when={h.note}
+              fallback={
+                <pre class="mt-1 overflow-x-auto rounded border border-border bg-bg-active/40 p-2 font-mono text-[11px] text-fg">
+                  {h.command}
+                </pre>
+              }
+            >
+              <div class="mt-1 text-[11px] text-fg-muted">{h.note}</div>
+            </Show>
             <PathRow path={h.path} />
           </li>
         )}
