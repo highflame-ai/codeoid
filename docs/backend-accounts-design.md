@@ -73,6 +73,7 @@ Removing an account deletes its home.
 | `gemini-cli` | `gemini` with `GEMINI_CLI_HOME`, Google login selected, `NO_BROWSER=true` | `code` |
 
 A `device` login is finished with `backend.login.wait` instead of `submit`.
+The Gemini CLI has no login subcommand, so its sign-in runs the interactive CLI with Google login selected and is done when it writes `oauth_creds.json`.
 The attempt runs in a staging home; only a completed login is moved into the account's home, so a failed or cancelled attempt never replaces a working credential.
 
 ## Switching mechanics
@@ -105,8 +106,8 @@ As for Claude accounts and endpoints: listing needs `settings:read`; adding, rem
 
 A cloned repository can try to redirect a named account's credential.
 Claude's `.claude/settings*.json` check is unchanged.
-The Gemini CLI reads `.env` and `.gemini/.env` from the workdir upward and `.gemini/settings.json`; a named Gemini CLI account refuses to run in a workdir whose project files set a credential, base URL or proxy variable, naming the file.
-Codex's project `.codex/config.toml` cannot change its auth; pi's project settings are checked the same way as the Gemini CLI's.
+The Gemini CLI reads `.env` and `.gemini/.env` from the workdir upward and `.gemini/settings.json`; a named Gemini CLI account refuses to run in a workdir whose project files set a credential, base URL, proxy variable or auth type, naming the file.
+Codex and pi project files are not checked: neither is known to redirect a credential from the workdir, and like every backend they run project code as the daemon user, which no per-account check contains.
 
 ## Storage and migration
 
