@@ -690,12 +690,14 @@ function sweepStaleIsolatedDirs(): void {
  * would orphan the command it wrapped, which for a login command means an
  * abandoned OAuth attempt still holding a pty.
  *
- * `script`'s stdin is a named pipe, not the child's stdin. Bun (and Node)
- * hand a child a socketpair for "pipe" stdio, and `script` asks its stdin
- * for terminal attributes: on a pipe that fails with ENOTTY, which it
- * expects, but on a socket with EOPNOTSUPP, which BSD script (macOS) and
- * older util-linux treat as fatal — "tcgetattr/ioctl: Operation not supported
- * on socket", and no sign-in link. A FIFO is a pipe on every platform.
+ * `script`'s stdin is an ordinary pipe, fed from a named pipe we write to.
+ * `script` asks its stdin for terminal attributes and only expects ENOTTY:
+ * Bun (and Node) hand a child a socketpair for "pipe" stdio, where that fails
+ * with EOPNOTSUPP, fatal to BSD script (macOS) and older util-linux —
+ * "tcgetattr/ioctl: Operation not supported on socket", and no sign-in link.
+ * Recent macOS refuses a named pipe (FIFO) the same way, so neither can be
+ * script's stdin; only an ordinary pipe works everywhere, and only `sh` can
+ * make one. See PTY_SHELL.
  */
 function spawnUnderPty(file: string, args: string[], flow: LoginFlow, isolatedHome?: string): { child: ChildProcess; input: PtyInput } {
   let inherited = buildSubprocessEnv({ prefixes: flow.envPrefixes });
@@ -729,11 +731,9 @@ function spawnUnderPty(file: string, args: string[], flow: LoginFlow, isolatedHo
     rmSync(pipeDir, { recursive: true, force: true });
     throw new BackendLoginError("couldn't create the sign-in command's input pipe (mkfifo failed)");
   }
-  // `sh` opens the FIFO as script's stdin, then becomes script (exec): the
-  // exit status, signals and process group are script's, as before.
   // Run in the staging home: an interactive CLI must not load a project's
   // files from the daemon's cwd while signing in.
-  const child = spawn("/bin/sh", ["-c", 'f=$1; shift; exec script "$@" < "$f"', "sh", fifo, ...argv], {
+  const child = spawn("/bin/sh", ["-c", PTY_SHELL, "sh", fifo, ...argv], {
     env,
     detached: true,
     stdio: ["ignore", "pipe", "pipe"],
@@ -741,6 +741,21 @@ function spawnUnderPty(file: string, args: string[], flow: LoginFlow, isolatedHo
   });
   return { child, input: openPtyInput(fifo, pipeDir, child) };
 }
+
+/**
+ * `sh -c` body: `$1` is the FIFO, the rest script's argv.
+ *
+ * `cat` copies the FIFO into an ordinary pipe that is script's stdin. It
+ * would outlive script — it waits on the FIFO, whose writer (us) stays open
+ * until the command is over, and the command is over only when `sh` exits —
+ * so it is stopped by pid when script exits. The pid travels down the pipe
+ * itself, as its first line: the left side prints its own pid and becomes
+ * `cat` (exec keeps the pid); the right side reads that line before script
+ * starts, so script never sees it and the pid is always known in time.
+ * Nothing is matched by name. The status is script's.
+ */
+const PTY_SHELL =
+  'f=$1; shift; sh -c \'echo $$; exec cat "$1"\' sh "$f" | { read -r c; script "$@"; s=$?; kill "$c" 2>/dev/null; exit "$s"; }';
 
 /** The write side of a login command's input pipe. */
 interface PtyInput {
@@ -752,7 +767,7 @@ interface PtyInput {
 const INPUT_DIR_PREFIX = "codeoid-login-input-";
 
 /**
- * Open the FIFO for writing. The open completes once `sh` opens it for
+ * Open the FIFO for writing. The open completes once `cat` opens it for
  * reading (immediately, as it starts); text written before then is queued.
  * If the command dies before ever opening it, the pending open is released by
  * opening the read side ourselves — it would otherwise hold a worker thread.
