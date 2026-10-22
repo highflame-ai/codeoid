@@ -10,26 +10,38 @@
 
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { type ForkPoint, RewindError, SendStoppedError, Session, type AttachedClient, type WindowScope } from "./session.js";
 import { sweepCheckpoints } from "./checkpoints.js";
 import type { CompareRunRow } from "./store.js";
-import { type CompareState, type CompareTargetState, type ErrorCode, LIMITS } from "../protocol/types.js";
+import { type CompareState, type CompareTargetState, type ErrorCode, LIMITS, backendHasAccounts, DEFAULT_ACCOUNT, type AccountKind, type ClaudeAccountKind } from "../protocol/types.js";
 import { type CatalogEntry, isPlaceholderModel, type SessionProvider } from "./providers/interface.js";
 import {
   createDefaultProviderRegistry,
   DefaultProviderError,
   type ProviderRegistry,
+  registerAccountBackends,
 } from "./providers/registry.js";
 import type { HookBus } from "./hooks/bus.js";
 import type { Store } from "./store.js";
 import { createPushTransport, PushService } from "./push/index.js";
 import { hasScope, SCOPES } from "../protocol/scopes.js";
 import { applyPatches, getManifest, getSnapshot, previewPatches, readMcpServerEntry, writeMcpServerEntry } from "./settings/store.js";
-import { adoptability, adoptableName, adoptedEntry, adoptionRefusal, claudeMcpServers, fromRepoFile, isSameAdoption } from "./mcp/adopt.js";
+import { adoptability, adoptableName, adoptedEntry, adoptionRefusal, claudeMcpServers, fromRepoFile, fullUrlRequired, isSameAdoption, shellArg } from "./mcp/adopt.js";
+import { readWorkdirServers } from "./mcp/workdir-servers.js";
+import { cleanMcpError, commandSummary, MAX_SHOWN_KEYS, quotedVisible, redactMcpUrl, serverProgram, shownLabel, visibleCompact, visibleVerbatim } from "./mcp/redact.js";
 import { canonicalFromTranscript, turnIndexFromHistory } from "./canonical-restore.js";
-import { BackendLoginBroker, BackendLoginError, redact } from "./auth/backend-login.js";
-import { ClaudeAccountError, ClaudeAccountStore, validateAccountName } from "./claude-accounts.js";
+import { BackendLoginBroker, BackendLoginError, type LoginOutcome, redact } from "./auth/backend-login.js";
+import { ClaudeAccountError, ClaudeAccountStore } from "./claude-accounts.js";
+import { AccountError, type AccountStore, LOGIN_KINDS, validateAccountName } from "./accounts.js";
+import { configuredContextWindow, draftConnection, EndpointError, EndpointStore } from "./openai-endpoints.js";
+import {
+  EndpointCatalog,
+  fetchEndpointModels,
+  fetchLlamaCppContext,
+  syncEndpointProviders,
+  watchEndpointProviders,
+} from "./providers/endpoint/index.js";
 import { RateLimiter } from "./rate-limit.js";
 import type { TranscriptMeta, TranscriptStore } from "./transcript.js";
 import {
@@ -116,12 +128,13 @@ import { redactCommand } from "./skill-command.js";
 import type { McpHub } from "./mcp/hub.js";
 import { mcpOAuthBindingCookieName, type McpOAuth, type McpOAuthProof, type McpTenant } from "./mcp/oauth.js";
 import { isOAuthServer, type McpServerSpec, OAUTH_UNSUPPORTED_BACKENDS } from "./mcp/types.js";
-import { type CodeoidConfig, DEFAULT_PROVIDER_ENV, loadConfig, mutateConfigFile, validateConfigObject } from "../config.js";
+import { atomicWrite, type CodeoidConfig, DEFAULT_PROVIDER_ENV, loadConfig, mutateConfigFile, validateConfigObject } from "../config.js";
 import type { CompressionRegistry } from "./compress/index.js";
-import { ORCHESTRATOR_ROLE } from "../protocol/types.js";
+import { endpointNameOf, endpointProviderId, ORCHESTRATOR_ROLE, type ProviderInfo } from "../protocol/types.js";
 import type {
   AuthContext,
   ClaudeConfigMcpServer,
+  McpApprovePreview,
   ClientMessage,
   CollaborationConfig,
   CollaborationCost,
@@ -358,6 +371,9 @@ function resumeSortKey(m: { lastActivityAt?: string; createdAt?: string }): numb
   return Number.isFinite(n) ? n : 0;
 }
 
+/** How long a finished device sign-in's outcome is kept for a client that comes back for it. */
+const LOGIN_OUTCOME_TTL_MS = 10 * 60_000;
+
 export class SessionManager {
   #sessions = new Map<string, Session>();
   #store: Store;
@@ -382,8 +398,21 @@ export class SessionManager {
   readonly #backendLogin: BackendLoginBroker;
   /** Claude accounts (claude-accounts.ts) — shared by every session. */
   #claudeAccounts!: ClaudeAccountStore;
+  /** Every backend's accounts — the store behind #claudeAccounts. */
+  #accounts!: AccountStore;
+  #endpoints!: EndpointStore;
+  #endpointCatalog!: EndpointCatalog;
+  #endpointFetch!: typeof fetch;
+  /** Connections that asked for `providers.list` — they get `providers.changed`. */
+  readonly #providerSubscribers = new Map<string, AttachedClient>();
   /** Logins started for a NAMED Claude account: loginId → account name. */
-  readonly #accountLogins = new Map<string, string>();
+  readonly #accountLogins = new Map<string, { backend: string; name: string; replace: boolean }>();
+  /**
+   * Device sign-ins being waited on, by login id, and kept a while after they
+   * finish: a client whose connection dropped mid-wait waits again and gets
+   * the same outcome — the credential is stored once.
+   */
+  readonly #loginWaits = new Map<string, Promise<{ ok: boolean; error?: string; pending?: { backend: string; name: string } }>>();
   /** Live model catalogs by provider id (via each backend's supportedModels
    *  equivalent), cached daemon-wide once any session of that provider
    *  initializes. Empty until then. */
@@ -507,10 +536,16 @@ export class SessionManager {
        * subprocess. Mirrors SessionCreateOptions._testProvider.
        */
       _testProviderFactory?: () => SessionProvider;
-      /** Claude account store (claude-accounts.ts). Default: `<configDir>/claude-accounts.json`. */
+      /** Claude account store (claude-accounts.ts) — the `claude` backend's view of `accounts`. */
       claudeAccounts?: ClaudeAccountStore;
+      /** Every backend's accounts (accounts.ts). Default: `<configDir>/accounts.json` (or the store behind `claudeAccounts`). */
+      accounts?: AccountStore;
       /** Test-only: a login broker driving a fake login command. */
       _testBackendLogin?: BackendLoginBroker;
+      /** OpenAI-compatible endpoint store (openai-endpoints.ts). Default: `<configDir>/endpoints.json`. */
+      endpoints?: EndpointStore;
+      /** Test-only: the `fetch` endpoint requests (model lists, tests) use. */
+      _testEndpointFetch?: typeof fetch;
     },
   ) {
     this.#store = store;
@@ -521,10 +556,33 @@ export class SessionManager {
     this.#memory = memory;
     this.#config = opts?.config;
     this.#compressionRegistry = opts?.compressionRegistry;
-    this.#providers = opts?.providers ?? createDefaultProviderRegistry(opts?.config);
+    this.#endpoints = opts?.endpoints ?? new EndpointStore();
+    this.#endpointFetch = opts?._testEndpointFetch ?? fetch;
+    this.#endpointCatalog = new EndpointCatalog(this.#endpoints, this.#endpointFetch);
+    const endpoints = { store: this.#endpoints, catalog: this.#endpointCatalog };
+    // Before the registry: a keyed backend with named accounts is registered without an env key.
+    this.#claudeAccounts = opts?.claudeAccounts ?? new ClaudeAccountStore(opts?.accounts);
+    this.#accounts = this.#claudeAccounts.store;
+    this.#providers = opts?.providers ?? createDefaultProviderRegistry(opts?.config, process.env, endpoints, this.#accounts);
+    // An injected registry (tests) gets the endpoints too; startup's already has them.
+    // Like startup, an unreadable endpoints file costs the endpoints, not the daemon.
+    if (opts?.providers) {
+      try {
+        syncEndpointProviders(this.#providers, this.#endpoints, this.#endpointCatalog);
+      } catch (err) {
+        console.error(`[codeoid] could not load endpoint backends: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    watchEndpointProviders(this.#providers, this.#endpoints, this.#endpointCatalog, () => this.#pushProviders());
+    // A keyed backend that gains accounts while the daemon runs becomes pickable.
+    this.#accounts.onChange((backend) => {
+      if (registerAccountBackends(this.#providers, this.#accounts)) this.#pushProviders();
+      // Every change — a handler, a sign-in, a hand edit — reaches the sessions on that backend.
+      this.#refreshSessionsOn(backend);
+      this.#pushToProviderSubscribers({ type: "accounts.changed", backend });
+    });
     this.#hooks = opts?.hooks;
     this.#testProviderFactory = opts?._testProviderFactory;
-    this.#claudeAccounts = opts?.claudeAccounts ?? new ClaudeAccountStore();
     this.#backendLogin = opts?._testBackendLogin ?? new BackendLoginBroker();
     this.#dispatcher = new Dispatcher(store, this.#makeDispatcherHost(), {
       ...opts?.config?.dispatch,
@@ -639,6 +697,20 @@ export class SessionManager {
     const ids = this.#providers.ids();
     const def = this.#providers.defaultId;
     return [def, ...ids.filter((id) => id !== def)];
+  }
+
+  /** The same backends with display names and kinds, default first — `auth.ok` and `providers.list`. */
+  providerInfo(): ProviderInfo[] {
+    return this.providerIds().flatMap((id) => {
+      const f = this.#providers.get(id);
+      if (!f) return [];
+      return [{
+        id,
+        displayName: f.displayName,
+        kind: endpointNameOf(id) !== null ? ("endpoint" as const) : ("builtin" as const),
+        isDefault: id === this.#providers.defaultId,
+      }];
+    });
   }
 
   /** Supported backends that couldn't activate at startup (diagnostics). */
@@ -782,7 +854,9 @@ export class SessionManager {
           transcriptStore: this.#transcriptStore,
           providers: this.#providers,
           claudeAccounts: this.#claudeAccounts,
+          accounts: this.#accounts,
           claudeAccount: meta.claudeAccount ?? null,
+          ...(meta.accounts ? { accountChoices: meta.accounts } : {}),
           hooks: this.#hooks,
           identityManager: this.#identityManager,
           existingId: meta.sessionId,
@@ -1165,6 +1239,12 @@ mcpHub: this.#mcpHub,
         return this.#setProvider(msg, auth);
       case "session.mcp_reconnect":
         return this.#mcpReconnect(msg, auth);
+      case "session.mcp_refresh":
+        return this.#mcpRefresh(msg, auth);
+      case "mcp.approve":
+        return this.#mcpApprove(msg, auth);
+      case "mcp.approve.preview":
+        return this.#mcpApprovePreview(msg, auth);
       case "session.fork":
         return this.#fork(msg, auth);
       case "session.rename":
@@ -1189,6 +1269,16 @@ mcpHub: this.#mcpHub,
         return this.#fleetUnsubscribe(msg, client);
       case "models.list":
         return this.#modelsList(msg);
+      case "providers.list":
+        return this.#providersList(msg, client);
+      case "endpoints.list":
+        return this.#endpointsList(msg, auth);
+      case "endpoints.set":
+        return this.#endpointsSet(msg, auth);
+      case "endpoints.remove":
+        return this.#endpointsRemove(msg, auth);
+      case "endpoints.test":
+        return this.#endpointsTest(msg, auth);
       case "session.export":
         return this.#sessionExport(msg, auth);
       case "session.import":
@@ -1205,6 +1295,18 @@ mcpHub: this.#mcpHub,
         return this.#backendLoginSubmit(msg, auth);
       case "backend.login.cancel":
         return this.#backendLoginCancel(msg, auth);
+      case "backend.login.wait":
+        return this.#backendLoginWait(msg, auth);
+      case "accounts.list":
+        return this.#accountsList(msg, auth);
+      case "accounts.set":
+        return this.#accountsSet(msg, auth);
+      case "accounts.remove":
+        return this.#accountsRemove(msg, auth);
+      case "accounts.set_default":
+        return this.#accountsSetDefault(msg, auth);
+      case "session.set_account":
+        return this.#sessionSetAccount(msg, auth);
       case "claude.accounts.list":
         return this.#claudeAccountsList(msg, auth);
       case "claude.accounts.set":
@@ -1548,8 +1650,10 @@ mcpHub: this.#mcpHub,
     auth: AuthContext,
   ): Promise<DaemonMessage> {
     // Reuse fs:read since this only reads ~/.claude/ + workdir/.claude/ —
-    // strictly broader than session.workdir, but the data is descriptive
-    // (no secrets — env values are stripped, only key names returned).
+    // strictly broader than session.workdir, but the data is descriptive:
+    // env and header values are never read out, MCP and hook commands are
+    // shown by their program's name, args by their count, and URLs by host
+    // and path shape (#394).
     if (!hasScope(auth.scopes as string[], SCOPES.FS_READ)) {
       return {
         type: "response.error",
@@ -1569,25 +1673,57 @@ mcpHub: this.#mcpHub,
     }
     try {
       const snapshot = await readClaudeConfig(session.workdir);
+      // Read for the drawer only — what a session applies changes on its first
+      // turn or a refresh. Freshly, before the rows: a row and its fingerprint
+      // are of the files as they are now.
+      await session.peekMcpView();
+      const mcpStale = await session.mcpStale();
+      const reachOf = session.mcpReachSnapshot();
       const live = session.sdkMcpSnapshot;
       // A name two entries give different URLs to: which one the backend runs
       // isn't known here, so neither is offered for adopting.
       const urlsByName = new Map<string, Set<string | null>>();
       for (const s of snapshot.mcpServers) urlsByName.set(s.name, (urlsByName.get(s.name) ?? new Set()).add(s.url));
-      const mcpServers = snapshot.mcpServers.map((s) => {
+      const mcpServers: ClaudeConfigMcpServer[] = snapshot.mcpServers.map((s): ClaudeConfigMcpServer => {
         const liveStatus = live.status.get(s.name);
         const liveTools = live.tools.get(s.name);
         const spec = this.#mcpRegistry?.get(s.name);
         const adopted = spec !== undefined && isOAuthServer(spec) && spec.transport.kind === "http" && spec.transport.url === s.url;
         return {
           ...s,
+          // What leaves the daemon carries no credential (#394): a Claude
+          // config keeps them in commands, args and URLs as often as in env
+          // and headers (whose values are never read out). So: the program's
+          // name and how many args — not their text — and the URL's shape.
+          command: s.command === null ? null : serverProgram(s.command),
+          args: [],
+          argCount: s.args.length,
+          url: s.url === null ? null : redactMcpUrl(s.url),
+          // Whether it reaches this session's other backends too, and why not (#395).
+          ...(() => {
+            const reach = adopted ? ({ reach: "all" } as const) : reachOf.reach(s);
+            // A project's server carries the fingerprint of the entry shown, so an
+            // approval is of exactly what was looked at (the repo can't swap it).
+            const fp = s.scope === "workdir" ? reachOf.fingerprint(s.name, s.path) : undefined;
+            return { ...(reach ? { otherBackends: reach } : {}), ...(fp ? { fingerprint: fp } : {}) };
+          })(),
+          // Everything else read from the file is a short label, bounded. (A
+          // name is an address, so it's cut, not redacted: one that long is
+          // never adoptable anyway.)
+          name: s.name.length > 128 ? `${s.name.slice(0, 128)}…` : s.name,
+          type: s.type === null ? null : shownLabel(s.type, 40),
+          envKeys: s.envKeys.slice(0, MAX_SHOWN_KEYS).map((k) => shownLabel(k)),
+          ...(s.headerKeys ? { headerKeys: s.headerKeys.slice(0, MAX_SHOWN_KEYS).map((k) => shownLabel(k)) } : {}),
           ...(liveStatus !== undefined ? { liveStatus } : {}),
           ...(liveTools !== undefined ? { liveTools } : {}),
           ...(fromRepoFile(s) ? { projectFile: true as const } : {}),
           ...(adopted
             ? { adopted: true as const }
-            : urlsByName.get(s.name)!.size === 1 && this.#offerAdoption(s, snapshot.mcpServers, liveStatus, auth)
-              ? { adoptable: true as const }
+            : urlsByName.get(s.name)!.size === 1
+              ? (() => {
+                  const offer = this.#offerAdoption(s, snapshot.mcpServers, liveStatus, auth);
+                  return offer === "drawer" ? { adoptable: true as const } : offer === "full-url" ? { adoptByFullUrl: true as const } : {};
+                })()
               : {}),
         };
       });
@@ -1618,8 +1754,15 @@ mcpHub: this.#mcpHub,
         agents: snapshot.agents,
         skills: snapshot.skills,
         mcpServers,
-        hooks: snapshot.hooks,
+        hooks: snapshot.hooks.map((h) => ({
+          ...h,
+          event: shownLabel(h.event),
+          matcher: h.matcher === null ? null : shownLabel(h.matcher, 200),
+          kind: shownLabel(h.kind, 40),
+          command: commandSummary(h.command),
+        })),
         mcpReconnect: session.canReconnectMcp,
+        ...(mcpStale ? { mcpStale: true } : {}),
       };
     } catch (err) {
       return {
@@ -1721,11 +1864,32 @@ mcpHub: this.#mcpHub,
    * which makes it a better answer than codeoid's model-id guess.
    */
   modelContextWindow(scope: WindowScope, providerId: string, model: string): number | undefined {
-    if (!model) return undefined;
+    const endpoint = endpointNameOf(providerId);
+    if (!model) {
+      // An endpoint session on its default model still has a configured window.
+      if (endpoint === null) return undefined;
+      const e = this.#safeEndpoint(endpoint);
+      return e ? configuredContextWindow(e, e.defaultModel ?? e.models[0]?.id) : undefined;
+    }
     const reported = this.#modelLimits.get(SessionManager.#limitsKey(scope, providerId, model));
     if (reported !== undefined) return reported;
+    if (endpoint !== null) {
+      // What the user configured for this endpoint — a local server's window
+      // is whatever it was started with, which no table can guess.
+      const e = this.#safeEndpoint(endpoint);
+      return e ? configuredContextWindow(e, model) : undefined;
+    }
     const published = this.#currentModels(providerId).models.find((m) => m.value === model)?.contextWindow;
     return typeof published === "number" && published > 0 ? published : undefined;
+  }
+
+  /** A stored endpoint, or undefined when it's gone or the store can't be read. */
+  #safeEndpoint(name: string) {
+    try {
+      return this.#endpoints.get(name);
+    } catch {
+      return undefined;
+    }
   }
 
   /** Warm #modelLimits from disk. Called once at construction. */
@@ -1791,11 +1955,27 @@ mcpHub: this.#mcpHub,
     return this.#persistedModelsCache.get(providerId) ?? null;
   }
 
-  #modelsList(
+  async #modelsList(
     msg: Extract<ClientMessage, { type: "models.list" }>,
-  ): DaemonMessage {
+  ): Promise<DaemonMessage> {
     // No provider = the catalog of the backend a new session would land on.
     const provider = msg.provider ?? this.#providers.defaultId;
+    const endpoint = endpointNameOf(provider);
+    if (endpoint !== null) {
+      // Configured models, else the server's own /models (briefly cached).
+      const { models, live } = await this.#endpointCatalog.models(endpoint);
+      return {
+        type: "models.list.result",
+        requestId: msg.id,
+        models: models.map((m) => ({
+          value: m.id,
+          displayName: m.displayName,
+          ...(m.contextWindow ? { contextWindow: m.contextWindow } : {}),
+        })),
+        live,
+        provider,
+      };
+    }
     const { models, live } = this.#currentModels(provider);
     return { type: "models.list.result", requestId: msg.id, models, live, provider };
   }
@@ -1821,10 +2001,9 @@ mcpHub: this.#mcpHub,
     const hub = this.#mcpHub;
     if (!reg || !hub) return [];
     return reg.list().map((spec) => {
-      // An OAuth server runs as the viewer's tenant: show only that.
-      const tenant = isOAuthServer(spec) ? tenantOf(auth) : undefined;
-      const status = hub.statusFor(spec.name, tenant);
-      const connected = hub.hasClient(spec.name, tenant);
+      // An OAuth server runs as the viewer's tenant, and a session's own
+      // snapshot of a global one (#395) is its tenant's: show only those.
+      const { status, connected } = hub.observed(spec, tenantOf(auth));
       const health: McpServerStatus["health"] = !spec.enabled
         ? "disabled"
         : status?.error
@@ -1843,7 +2022,8 @@ mcpHub: this.#mcpHub,
         health,
         toolCount: status?.tools.length ?? 0,
         tools: status?.tools ?? [],
-        ...(status?.error ? { error: status.error } : {}),
+        // A transport error can quote the server's URL, token and all.
+        ...(status?.error ? { error: cleanMcpError(status.error) } : {}),
         ...(isOAuthServer(spec) ? { oauth: this.#oauthStatus(spec, auth) } : {}),
       };
     });
@@ -1957,7 +2137,9 @@ mcpHub: this.#mcpHub,
    */
   #resumeProviderId(persisted: string | undefined, sessionId: string): string {
     if (persisted === undefined) return CLAUDE_PROVIDER_ID;
-    if (this.#providers.has(persisted)) return persisted;
+    // A removed endpoint stays resolvable: the session resumes on it and
+    // refuses to run, telling the user why, instead of quietly moving to Claude.
+    if (this.#providers.resolvable(persisted)) return persisted;
     console.warn(
       `[codeoid/resume] session ${sessionId} ran on "${persisted}", which is not available now — resuming it on ${CLAUDE_PROVIDER_ID}`,
     );
@@ -2053,7 +2235,7 @@ mcpHub: this.#mcpHub,
     const id = config.session.defaultProvider;
     if (!id || id === CLAUDE_PROVIDER_ID) return undefined;
     try {
-      createDefaultProviderRegistry(config, next.env);
+      createDefaultProviderRegistry(config, next.env, { store: this.#endpoints, catalog: this.#endpointCatalog });
       return undefined;
     } catch (err) {
       if (err instanceof DefaultProviderError) return { kind: "provider", message: err.message };
@@ -2085,15 +2267,25 @@ mcpHub: this.#mcpHub,
     if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) {
       return this.#loginForbidden(msg.id);
     }
+    if (msg.account !== undefined && auth.delegationDepth > 0) {
+      return { type: "response.error", requestId: msg.id, error: "A delegated token can't sign accounts in.", code: "forbidden" };
+    }
     try {
-      // A login for a NAMED Claude account runs isolated (its own throwaway
-      // config dir) and its token is stored as that account — it must never
-      // replace the machine's own `claude login`.
-      if (msg.account !== undefined) validateAccountName(msg.account);
+      // A login for a NAMED account runs isolated (its own staging home) and
+      // its credential is stored as that account — it must never replace the
+      // machine's own login. An existing account is replaced only explicitly.
+      if (msg.account !== undefined) {
+        validateAccountName(msg.account);
+        if (this.#accounts.get(msg.backend, msg.account) && !msg.replace) {
+          throw new AccountError(`a ${msg.backend} account named "${msg.account}" already exists — replace it explicitly, or pick another name`);
+        }
+      }
       const login = await this.#backendLogin.start(msg.backend, { isolated: msg.account !== undefined });
       // A new attempt supersedes any other for this backend: forget theirs.
       for (const id of [...this.#accountLogins.keys()]) if (!this.#backendLogin.isOpen(id)) this.#accountLogins.delete(id);
-      if (msg.account !== undefined) this.#accountLogins.set(login.loginId, msg.account);
+      if (msg.account !== undefined) {
+        this.#accountLogins.set(login.loginId, { backend: msg.backend, name: msg.account, replace: msg.replace === true });
+      }
       this.#store.audit(
         auth.sub,
         "backend.login.start",
@@ -2108,7 +2300,7 @@ mcpHub: this.#mcpHub,
         // The message is authored by the broker for display; redact anyway
         // rather than depend on every future flow's error being clean.
         error: redact(err instanceof Error ? err.message : String(err)),
-        code: err instanceof BackendLoginError || err instanceof ClaudeAccountError ? "invalid_request" : "internal",
+        code: err instanceof BackendLoginError || err instanceof ClaudeAccountError || err instanceof AccountError ? "invalid_request" : "internal",
       };
     }
   }
@@ -2128,48 +2320,21 @@ mcpHub: this.#mcpHub,
     }
     try {
       const outcome = await this.#backendLogin.submit(msg.loginId, msg.code);
-      let error = outcome.error;
-      const accountName = this.#accountLogins.get(msg.loginId);
+      const pending = this.#accountLogins.get(msg.loginId);
       // Forget the mapping only once the attempt is over: a code refused before
       // it reached the command (malformed) leaves the attempt open, and a
       // retry must still be stored as the named account.
       if (!this.#backendLogin.isOpen(msg.loginId)) this.#accountLogins.delete(msg.loginId);
-      if (outcome.isolated && accountName === undefined) {
-        // A named-account login whose name we no longer know. Its credential
-        // must never become the daemon's own login: drop it.
-        if (outcome.ok) error = "Signed in, but the account this sign-in was for is no longer known. Start again.";
-      } else if (accountName !== undefined) {
-        // A named account keeps ONLY the token the command printed: it ran
-        // against a throwaway config dir, so there is no on-disk fallback.
-        if (outcome.ok && outcome.secret?.key === "CLAUDE_CODE_OAUTH_TOKEN") {
-          try {
-            this.#claudeAccounts.upsert({ name: accountName, kind: "subscription", token: outcome.secret.value });
-            // A re-login replaced the token: idle processes still hold the old one.
-            this.#releaseClaudeSessionsOn(accountName);
-          } catch (err) {
-            error = `Signed in, but the account could not be saved: ${err instanceof Error ? err.message : String(err)}`;
-          }
-        } else if (outcome.ok) {
-          error = "Signed in, but claude setup-token didn't print a token to store for this account.";
-        }
-      } else if (outcome.ok && outcome.secret) {
-        const written = applyPatches([{ key: outcome.secret.key, value: outcome.secret.value }]);
-        if (!written.ok) {
-          // Signed in with the vendor but could not persist it: report the
-          // failure rather than a success the next session will not honour.
-          error = `Signed in, but the credential could not be saved: ${
-            written.errors[0]?.message ?? "unknown error"
-          }`;
-        }
-      }
+      const error = this.#storeLoginOutcome(outcome, pending);
       const ok = outcome.ok && error === undefined;
       // Never the code, never the credential — only that an exchange happened.
-      this.#store.audit(auth.sub, "backend.login.submit", "", `ok=${ok}${accountName !== undefined ? ` account=${accountName}` : ""}`);
+      this.#store.audit(auth.sub, "backend.login.submit", "", `ok=${ok}${pending ? ` backend=${pending.backend} account=${pending.name}` : ""}`);
       return {
         type: "backend.login.submit.result",
         requestId: msg.id,
         ok,
         ...(error === undefined ? {} : { error }),
+        ...(!ok && this.#backendLogin.isOpen(msg.loginId) ? { retryable: true } : {}),
         snapshot: { ...getSnapshot(), mcpServers: this.#mcpServerStatuses(auth) },
       };
     } catch (err) {
@@ -2198,24 +2363,284 @@ mcpHub: this.#mcpHub,
     };
   }
 
+  /**
+   * Keep what a finished sign-in produced: as the named account it was for,
+   * or — for the daemon's own Claude login only — in `~/.codeoid/.env`.
+   * Returns the error to report, if any.
+   */
+  #storeLoginOutcome(
+    outcome: LoginOutcome,
+    pending: { backend: string; name: string; replace: boolean } | undefined,
+  ): string | undefined {
+    if (outcome.isolated && pending === undefined) {
+      // A named-account login whose name we no longer know. Its credential
+      // must never become the daemon's own login: drop it.
+      return outcome.ok ? "Signed in, but the account this sign-in was for is no longer known. Start again." : outcome.error;
+    }
+    if (!outcome.ok) return outcome.error;
+    if (pending !== undefined) {
+      try {
+        if (pending.backend === "claude") {
+          // A named Claude account keeps ONLY the token the command printed:
+          // it ran against a throwaway config dir, so there is no on-disk fallback.
+          if (outcome.secret?.key !== "CLAUDE_CODE_OAUTH_TOKEN") return "Signed in, but claude setup-token didn't print a token to store for this account.";
+          // Added meanwhile by someone else: replace it only if this sign-in said so.
+          if (!pending.replace && this.#accounts.get("claude", pending.name)) {
+            return `Signed in, but a claude account named "${pending.name}" was added meanwhile — sign in again to replace it`;
+          }
+          this.#claudeAccounts.upsert({ name: pending.name, kind: "subscription", token: outcome.secret.value });
+        } else {
+          if (!outcome.files || Object.keys(outcome.files).length === 0) return `Signed in, but the ${pending.backend} sign-in left no credential to keep.`;
+          const kind: AccountKind = "chatgpt-login";
+          this.#accounts.upsert({ backend: pending.backend, name: pending.name, kind, replace: pending.replace });
+          this.#writeAccountFiles(pending.backend, pending.name, outcome.files);
+        }
+      } catch (err) {
+        return `Signed in, but the account could not be saved: ${err instanceof Error ? err.message : String(err)}`;
+      }
+      return undefined;
+    }
+    if (outcome.secret) {
+      const written = applyPatches([{ key: outcome.secret.key, value: outcome.secret.value }]);
+      // Signed in with the vendor but could not persist it: report the
+      // failure rather than a success the next session will not honour.
+      if (!written.ok) return `Signed in, but the credential could not be saved: ${written.errors[0]?.message ?? "unknown error"}`;
+    }
+    return undefined;
+  }
+
+  /**
+   * Put a sign-in's credential files into the account's home (0700 dir, 0600
+   * files), replacing what was there — the vendor's own format, never parsed.
+   */
+  #writeAccountFiles(backend: string, name: string, files: Record<string, string>): void {
+    const home = this.#accounts.homeOf(backend, name);
+    // A file layout the CLI wrote under the staging home, mirrored here; a
+    // path that climbs out (it can't, the flows name fixed files) is refused.
+    for (const [rel, content] of Object.entries(files)) {
+      const target = join(home, rel);
+      if (!target.startsWith(`${home}/`)) throw new AccountError("a sign-in named a file outside its home");
+      mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
+      atomicWrite(target, content, 0o600);
+    }
+  }
+
+  /** Finish a `device` sign-in (Codex): wait for the user to approve on the vendor's page. */
+  async #backendLoginWait(
+    msg: Extract<ClientMessage, { type: "backend.login.wait" }>,
+    auth: AuthContext,
+  ): Promise<DaemonMessage> {
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return this.#loginForbidden(msg.id);
+    try {
+      let waiting = this.#loginWaits.get(msg.loginId);
+      if (!waiting) {
+        waiting = (async () => {
+          const outcome = await this.#backendLogin.wait(msg.loginId);
+          // Still open = this wasn't a device login (a code login answered
+          // "paste it instead"): its account mapping and outcome stay for submit.
+          if (this.#backendLogin.isOpen(msg.loginId)) {
+            this.#loginWaits.delete(msg.loginId);
+            return { ok: false, ...(outcome.error ? { error: outcome.error } : {}) };
+          }
+          const pending = this.#accountLogins.get(msg.loginId);
+          this.#accountLogins.delete(msg.loginId);
+          const error = this.#storeLoginOutcome(outcome, pending);
+          this.#store.audit(auth.sub, "backend.login.wait", "", `ok=${outcome.ok && error === undefined}${pending ? ` backend=${pending.backend} account=${pending.name}` : ""}`);
+          return { ok: outcome.ok && error === undefined, ...(error === undefined ? {} : { error }) };
+        })();
+        this.#loginWaits.set(msg.loginId, waiting);
+        // Remembered for as long as a client could plausibly come back for it.
+        const forget = () => setTimeout(() => this.#loginWaits.delete(msg.loginId), LOGIN_OUTCOME_TTL_MS).unref?.();
+        waiting.then(forget, forget);
+      }
+      const result = await waiting;
+      return {
+        type: "backend.login.wait.result",
+        requestId: msg.id,
+        ok: result.ok,
+        ...(result.error === undefined ? {} : { error: result.error }),
+        snapshot: { ...getSnapshot(), mcpServers: this.#mcpServerStatuses(auth) },
+      };
+    } catch (err) {
+      return { type: "response.error", requestId: msg.id, error: redact(err instanceof Error ? err.message : String(err)), code: "internal" };
+    }
+  }
+
+  // ── Accounts for every backend (accounts.ts) ─────────────────────────────
+
+  /**
+   * Account changes need `settings:write` from an undelegated token: they
+   * decide whose credential an agent runs on, who is billed, and who is sent
+   * the conversation.
+   */
+  #accountsWriteRefusal(requestId: string, auth: AuthContext): DaemonMessage | undefined {
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return this.#loginForbidden(requestId);
+    if (auth.delegationDepth > 0) {
+      return { type: "response.error", requestId, error: "A delegated token can't change accounts.", code: "forbidden" };
+    }
+    return undefined;
+  }
+
+  #accountsError(requestId: string, err: unknown): DaemonMessage {
+    return {
+      type: "response.error",
+      requestId,
+      error: err instanceof Error ? err.message : String(err),
+      code: err instanceof AccountError || err instanceof ClaudeAccountError ? "invalid_request" : "internal",
+    };
+  }
+
+  /** The backends to list: one, or every registered backend that takes accounts plus any holding accounts. */
+  #accountBackends(only?: string): string[] {
+    if (only !== undefined) return [only];
+    const ids = new Set(this.#providers.ids().filter(backendHasAccounts));
+    for (const b of this.#accounts.backendsWithData()) if (backendHasAccounts(b)) ids.add(b);
+    return [...ids];
+  }
+
+  #accountsResult(requestId: string, only?: string): DaemonMessage {
+    const names = new Map(this.providerInfo().map((p) => [p.id, p.displayName]));
+    return {
+      type: "accounts.result",
+      requestId,
+      backends: this.#accountBackends(only).map((b) => this.#accounts.summary(b, names.get(b) ?? b)),
+    };
+  }
+
+  /** Names, kinds, URLs, header/key names — never a secret. `settings:read`. */
+  #accountsList(msg: Extract<ClientMessage, { type: "accounts.list" }>, auth: AuthContext): DaemonMessage {
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_READ)) {
+      return { type: "response.error", requestId: msg.id, error: "Missing scope: settings:read", code: "forbidden" };
+    }
+    if (msg.backend !== undefined && !backendHasAccounts(msg.backend)) {
+      return { type: "response.error", requestId: msg.id, error: `the ${msg.backend} backend has no accounts`, code: "invalid_request" };
+    }
+    try {
+      return this.#accountsResult(msg.id, msg.backend);
+    } catch (err) {
+      return this.#accountsError(msg.id, err);
+    }
+  }
+
+  #accountsSet(msg: Extract<ClientMessage, { type: "accounts.set" }>, auth: AuthContext): DaemonMessage {
+    const refused = this.#accountsWriteRefusal(msg.id, auth);
+    if (refused) return refused;
+    try {
+      if (LOGIN_KINDS.has(msg.kind)) throw new AccountError(`a ${msg.kind} account is created by signing in (backend.login.start with the account's name)`);
+      if (msg.backend === "claude") {
+        // Claude's own validation (gateway URL rules) on top of the store's.
+        if (this.#accounts.get("claude", msg.name) && !msg.replace) {
+          throw new AccountError(`a claude account named "${msg.name}" already exists — replace it explicitly, or pick another name`);
+        }
+        this.#claudeAccounts.upsert({
+          name: msg.name,
+          kind: msg.kind as ClaudeAccountKind,
+          token: msg.token ?? "",
+          ...(msg.baseUrl !== undefined ? { baseUrl: msg.baseUrl } : {}),
+          ...(msg.headers !== undefined ? { headers: msg.headers } : {}),
+          ...(msg.env !== undefined ? { env: msg.env } : {}),
+        });
+      } else {
+        // An endpoint account is bound to the server the endpoint has now.
+        let origin: string | undefined;
+        const endpoint = endpointNameOf(msg.backend);
+        if (endpoint !== null) {
+          const e = this.#endpoints.get(endpoint);
+          if (!e) throw new AccountError(`no endpoint named "${endpoint}"`);
+          origin = new URL(e.baseUrl).origin;
+        }
+        this.#accounts.upsert({
+          backend: msg.backend,
+          name: msg.name,
+          kind: msg.kind,
+          ...(msg.token !== undefined ? { token: msg.token } : {}),
+          ...(msg.baseUrl !== undefined ? { baseUrl: msg.baseUrl } : {}),
+          ...(msg.headers !== undefined ? { headers: msg.headers } : {}),
+          ...(msg.env !== undefined ? { env: msg.env } : {}),
+          ...(origin ? { origin } : {}),
+          ...(msg.replace ? { replace: true } : {}),
+        });
+      }
+    } catch (err) {
+      return this.#accountsError(msg.id, err);
+    }
+    // Never a secret — only what was set.
+    this.#store.audit(auth.sub, "accounts.set", "", `backend=${msg.backend} name=${msg.name} kind=${msg.kind}${msg.replace ? " replace" : ""}`);
+    return this.#accountsResult(msg.id);
+  }
+
+  #accountsRemove(msg: Extract<ClientMessage, { type: "accounts.remove" }>, auth: AuthContext): DaemonMessage {
+    const refused = this.#accountsWriteRefusal(msg.id, auth);
+    if (refused) return refused;
+    let removed: boolean;
+    try {
+      removed = this.#accounts.remove(msg.backend, msg.name);
+    } catch (err) {
+      return this.#accountsError(msg.id, err);
+    }
+    if (!removed) {
+      return { type: "response.error", requestId: msg.id, error: `no ${msg.backend} account named "${msg.name}"`, code: "not_found" };
+    }
+    this.#store.audit(auth.sub, "accounts.remove", "", `backend=${msg.backend} name=${msg.name}`);
+    return this.#accountsResult(msg.id);
+  }
+
+  #accountsSetDefault(msg: Extract<ClientMessage, { type: "accounts.set_default" }>, auth: AuthContext): DaemonMessage {
+    const refused = this.#accountsWriteRefusal(msg.id, auth);
+    if (refused) return refused;
+    if (!backendHasAccounts(msg.backend)) {
+      return { type: "response.error", requestId: msg.id, error: `the ${msg.backend} backend has no accounts`, code: "invalid_request" };
+    }
+    try {
+      this.#accounts.setDefault(msg.backend, msg.name);
+    } catch (err) {
+      return this.#accountsError(msg.id, err);
+    }
+    this.#store.audit(auth.sub, "accounts.set_default", "", `backend=${msg.backend} name=${msg.name}`);
+    return this.#accountsResult(msg.id);
+  }
+
+  /** Choose a session's account for a backend (default: its current one). `settings:write`, undelegated. */
+  #sessionSetAccount(msg: Extract<ClientMessage, { type: "session.set_account" }>, auth: AuthContext): DaemonMessage {
+    const refused = this.#accountsWriteRefusal(msg.id, auth);
+    if (refused) return refused;
+    const session = this.#getOwnedSession(msg.sessionId, auth);
+    if (!session) return { type: "response.error", requestId: msg.id, error: "Session not found", code: "not_found" };
+    try {
+      session.setAccount(msg.account, auth, msg.backend);
+    } catch (err) {
+      return this.#accountsError(msg.id, err);
+    }
+    return { type: "response.ok", requestId: msg.id, data: session.toInfo() };
+  }
+
+  /**
+   * Re-check every session on `backend` after its accounts changed — by any
+   * handler, a sign-in, or a hand edit of accounts.json (the store's change
+   * listener calls this). A session whose credential changed is released when
+   * idle; every one re-announces its effective account.
+   */
+  #refreshSessionsOn(backend: string): void {
+    for (const session of this.#sessions.values()) {
+      if (session.providerId === backend) session.refreshAccount();
+    }
+  }
+
   // ── Claude accounts (claude-accounts.ts) ─────────────────────────────────
 
   #claudeAccountsResult(requestId: string): DaemonMessage {
     return {
       type: "claude.accounts.result",
       requestId,
-      accounts: this.#claudeAccounts.list(),
+      // Not Bedrock: this message predates the kind, and its clients look a
+      // kind's label up without a fallback. `accounts.list` carries every kind.
+      accounts: this.#claudeAccounts.list().filter((a) => a.kind !== "bedrock"),
       defaultAccount: this.#claudeAccounts.getDefault(),
     };
   }
 
   #claudeAccountsError(requestId: string, err: unknown): DaemonMessage {
-    return {
-      type: "response.error",
-      requestId,
-      error: err instanceof Error ? err.message : String(err),
-      code: err instanceof ClaudeAccountError ? "invalid_request" : "internal",
-    };
+    return this.#accountsError(requestId, err);
   }
 
   /** Names, kinds and gateway URLs — never a token. `settings:read`. */
@@ -2228,7 +2653,8 @@ mcpHub: this.#mcpHub,
 
   /** Add or replace an account. `settings:write` — it decides what sessions bill. */
   #claudeAccountsSet(msg: Extract<ClientMessage, { type: "claude.accounts.set" }>, auth: AuthContext): DaemonMessage {
-    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return this.#loginForbidden(msg.id);
+    const refused = this.#accountsWriteRefusal(msg.id, auth);
+    if (refused) return refused;
     try {
       this.#claudeAccounts.upsert({
         name: msg.name,
@@ -2242,21 +2668,22 @@ mcpHub: this.#mcpHub,
     }
     // Never the token — only that an account was set and what kind.
     this.#store.audit(auth.sub, "claude.accounts.set", "", `name=${msg.name} kind=${msg.kind}`);
-    // A replaced token: idle processes still hold the old one.
-    this.#releaseClaudeSessionsOn(msg.name);
     return this.#claudeAccountsResult(msg.id);
   }
 
   #claudeAccountsRemove(msg: Extract<ClientMessage, { type: "claude.accounts.remove" }>, auth: AuthContext): DaemonMessage {
-    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return this.#loginForbidden(msg.id);
-    // Before removing: afterwards a follower of it no longer resolves to it.
-    this.#releaseClaudeSessionsOn(msg.name);
-    if (!this.#claudeAccounts.remove(msg.name)) {
+    const refused = this.#accountsWriteRefusal(msg.id, auth);
+    if (refused) return refused;
+    let removed: boolean;
+    try {
+      removed = this.#claudeAccounts.remove(msg.name);
+    } catch (err) {
+      return this.#claudeAccountsError(msg.id, err);
+    }
+    if (!removed) {
       return { type: "response.error", requestId: msg.id, error: `no Claude account named "${msg.name}"`, code: "not_found" };
     }
     this.#store.audit(auth.sub, "claude.accounts.remove", "", `name=${msg.name}`);
-    // Sessions on it now refuse to run until switched (never a silent fallback).
-    this.#announceClaudeSessions();
     return this.#claudeAccountsResult(msg.id);
   }
 
@@ -2264,33 +2691,15 @@ mcpHub: this.#mcpHub,
     msg: Extract<ClientMessage, { type: "claude.accounts.set_default" }>,
     auth: AuthContext,
   ): DaemonMessage {
-    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return this.#loginForbidden(msg.id);
+    const refused = this.#accountsWriteRefusal(msg.id, auth);
+    if (refused) return refused;
     try {
       this.#claudeAccounts.setDefault(msg.name);
     } catch (err) {
       return this.#claudeAccountsError(msg.id, err);
     }
-    for (const session of this.#sessions.values()) if (session.claudeAccount === null) session.releaseIdleClaudeQuery();
     this.#store.audit(auth.sub, "claude.accounts.set_default", "", `name=${msg.name}`);
-    // Every session following the default runs on it from its next turn.
-    this.#announceClaudeSessions();
     return this.#claudeAccountsResult(msg.id);
-  }
-
-  /** Re-announce every Claude session's info — its effective account may have moved. */
-  #announceClaudeSessions(): void {
-    for (const session of this.#sessions.values()) {
-      if (session.toInfo().providerId === "claude") session.announceInfo();
-    }
-  }
-
-  /** Stop idle Claude queries running on `name` (chosen, or followed as the daemon default). */
-  #releaseClaudeSessionsOn(name: string): void {
-    const daemonDefault = this.#claudeAccounts.getDefault();
-    for (const session of this.#sessions.values()) {
-      const choice = session.claudeAccount;
-      if (choice === name || (choice === null && daemonDefault === name)) session.releaseIdleClaudeQuery();
-    }
   }
 
   /**
@@ -2313,6 +2722,8 @@ mcpHub: this.#mcpHub,
         code: "forbidden",
       };
     }
+    const refused = this.#accountsWriteRefusal(msg.id, auth);
+    if (refused) return refused;
     const session = this.#getOwnedSession(msg.sessionId, auth);
     if (!session) return { type: "response.error", requestId: msg.id, error: "Session not found", code: "not_found" };
     try {
@@ -2321,6 +2732,183 @@ mcpHub: this.#mcpHub,
       return this.#claudeAccountsError(msg.id, err);
     }
     return { type: "response.ok", requestId: msg.id, data: session.toInfo() };
+  }
+
+  // ── Providers + OpenAI-compatible endpoints (openai-endpoints.ts) ────────
+
+  /** The backend list, and a subscription to `providers.changed`. No scope beyond the connection. */
+  #providersList(msg: Extract<ClientMessage, { type: "providers.list" }>, client: AttachedClient): DaemonMessage {
+    this.#providerSubscribers.set(client.id, client);
+    return { type: "providers.result", requestId: msg.id, providers: this.providerInfo() };
+  }
+
+  #pushProviders(): void {
+    this.#pushToProviderSubscribers({ type: "providers.changed", providers: this.providerInfo() });
+  }
+
+  /** Send to every client subscribed to the backend list (providers.list). */
+  #pushToProviderSubscribers(msg: DaemonMessage): void {
+    for (const [id, client] of this.#providerSubscribers) {
+      try {
+        client.send(msg);
+      } catch {
+        this.#providerSubscribers.delete(id);
+      }
+    }
+  }
+
+  #endpointsResult(requestId: string): DaemonMessage {
+    return { type: "endpoints.result", requestId, endpoints: this.#endpoints.list() };
+  }
+
+  #endpointsError(requestId: string, err: unknown): DaemonMessage {
+    return {
+      type: "response.error",
+      requestId,
+      error: err instanceof Error ? err.message : String(err),
+      code: err instanceof EndpointError ? "invalid_request" : "internal",
+    };
+  }
+
+  /** Names, URLs, models — never a key or header value. `settings:read`. */
+  #endpointsList(msg: Extract<ClientMessage, { type: "endpoints.list" }>, auth: AuthContext): DaemonMessage {
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_READ)) {
+      return { type: "response.error", requestId: msg.id, error: "Missing scope: settings:read", code: "forbidden" };
+    }
+    try {
+      return this.#endpointsResult(msg.id);
+    } catch (err) {
+      return this.#endpointsError(msg.id, err);
+    }
+  }
+
+  /**
+   * Endpoint changes and tests need `settings:write` from an undelegated
+   * token: they decide where sessions send their code, and a test sends the
+   * stored key — a shared token must not do either.
+   */
+  #endpointsWriteRefusal(requestId: string, auth: AuthContext): DaemonMessage | undefined {
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return this.#loginForbidden(requestId);
+    if (auth.delegationDepth > 0) {
+      return { type: "response.error", requestId, error: "A delegated token can't change or test endpoints.", code: "forbidden" };
+    }
+    return undefined;
+  }
+
+  /**
+   * session.defaultProvider as the next start would read it (config file +
+   * env). It only takes effect on restart, so it can name an endpoint the
+   * live default doesn't. Undefined when the config can't be read.
+   */
+  #configuredDefaultProvider(): string | undefined {
+    try {
+      return loadConfig({ quiet: true }).session.defaultProvider || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Add or replace an endpoint. `settings:write` — it decides where sessions send their code. */
+  #endpointsSet(msg: Extract<ClientMessage, { type: "endpoints.set" }>, auth: AuthContext): DaemonMessage {
+    const refused = this.#endpointsWriteRefusal(msg.id, auth);
+    if (refused) return refused;
+    const existed = this.#endpoints.has(msg.name);
+    try {
+      const { type: _t, id: _i, ...input } = msg;
+      this.#endpoints.upsert(input);
+    } catch (err) {
+      return this.#endpointsError(msg.id, err);
+    }
+    // Never the key or header values — only what changed.
+    this.#store.audit(
+      auth.sub,
+      existed ? "endpoints.update" : "endpoints.add",
+      "",
+      `name=${msg.name} baseUrl=${this.#endpoints.get(msg.name)?.baseUrl ?? ""}`,
+    );
+    return this.#endpointsResult(msg.id);
+  }
+
+  #endpointsRemove(msg: Extract<ClientMessage, { type: "endpoints.remove" }>, auth: AuthContext): DaemonMessage {
+    const refused = this.#endpointsWriteRefusal(msg.id, auth);
+    if (refused) return refused;
+    // The live default, and the configured one a restart would boot with —
+    // removing that would stop the daemon from starting.
+    const id = endpointProviderId(msg.name);
+    if (id === this.#providers.defaultId || id === this.#configuredDefaultProvider()) {
+      return {
+        type: "response.error",
+        requestId: msg.id,
+        error: `"${msg.name}" is the daemon's default backend — change session.defaultProvider first`,
+        code: "invalid_request",
+      };
+    }
+    let removed: boolean;
+    try {
+      removed = this.#endpoints.remove(msg.name);
+    } catch (err) {
+      return this.#endpointsError(msg.id, err);
+    }
+    if (!removed) {
+      return { type: "response.error", requestId: msg.id, error: `no endpoint named "${msg.name}"`, code: "not_found" };
+    }
+    this.#store.audit(auth.sub, "endpoints.remove", "", `name=${msg.name}`);
+    // Its accounts go with it: their keys were only ever for that server, and a
+    // later endpoint of the same name must not inherit them.
+    try {
+      this.#accounts.removeBackend(endpointProviderId(msg.name));
+    } catch (err) {
+      console.error(`[codeoid] couldn't remove the accounts of endpoint ${msg.name}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return this.#endpointsResult(msg.id);
+  }
+
+  /**
+   * List an endpoint's models — a stored one, or a draft (falling back to the
+   * stored key / headers). `settings:write`: the daemon makes the request,
+   * possibly with a stored credential, to a URL the caller chose.
+   */
+  async #endpointsTest(msg: Extract<ClientMessage, { type: "endpoints.test" }>, auth: AuthContext): Promise<DaemonMessage> {
+    const refused = this.#endpointsWriteRefusal(msg.id, auth);
+    if (refused) return refused;
+    const fail = (error: string): DaemonMessage => ({ type: "endpoints.test.result", requestId: msg.id, ok: false, error });
+    let existing: ReturnType<EndpointStore["get"]>;
+    try {
+      existing = msg.name ? this.#endpoints.get(msg.name) : undefined;
+    } catch (err) {
+      return this.#endpointsError(msg.id, err);
+    }
+    if (msg.name && !existing && msg.baseUrl === undefined) return fail(`no endpoint named "${msg.name}"`);
+    let conn: ReturnType<typeof draftConnection>;
+    try {
+      conn = draftConnection(
+        {
+          ...(msg.baseUrl !== undefined ? { baseUrl: msg.baseUrl } : {}),
+          ...(msg.apiKey !== undefined ? { apiKey: msg.apiKey } : {}),
+          ...(msg.headers !== undefined ? { headers: msg.headers } : {}),
+        },
+        existing,
+      );
+    } catch (err) {
+      return fail(err instanceof Error ? err.message : String(err));
+    }
+    const started = Date.now();
+    try {
+      const models = await fetchEndpointModels(conn, this.#endpointFetch);
+      const flavor = msg.flavor ?? existing?.flavor ?? "openai";
+      const contextWindow =
+        flavor === "llamacpp" ? await fetchLlamaCppContext(conn, this.#endpointFetch).catch(() => undefined) : undefined;
+      return {
+        type: "endpoints.test.result",
+        requestId: msg.id,
+        ok: true,
+        models,
+        latencyMs: Date.now() - started,
+        ...(contextWindow ? { contextWindow } : {}),
+      };
+    } catch (err) {
+      return fail(err instanceof Error ? err.message : String(err));
+    }
   }
 
   /**
@@ -2442,6 +3030,7 @@ mcpHub: this.#mcpHub,
     const tenant = tenantOf(auth);
     target.oauth.disconnect(target.spec, tenant);
     this.#mcpHub?.dropTenant(msg.server, tenant);
+    this.#mcpHub?.proxy?.credentialsChanged(msg.server, tenant);
     this.#store.audit(auth.sub, "mcp.oauth.disconnect", "", `server=${msg.server}`);
     return {
       type: "mcp.oauth.disconnect.result",
@@ -2461,14 +3050,22 @@ mcpHub: this.#mcpHub,
    * the backend reports `needs-auth` (a sign-in the CLI can't run). A server
    * that's merely down, or not yet reported, isn't offered.
    */
-  #offerAdoption(s: ClaudeConfigMcpServer, all: readonly ClaudeConfigMcpServer[], liveStatus: string | undefined, auth: AuthContext): boolean {
+  #offerAdoption(
+    s: ClaudeConfigMcpServer,
+    all: readonly ClaudeConfigMcpServer[],
+    liveStatus: string | undefined,
+    auth: AuthContext,
+  ): "drawer" | "full-url" | null {
     // Only to someone adopt would accept, and only what adopt would take.
-    if (!this.#mcpOAuth || !this.#mcpRegistry || s.liveOnly) return false;
-    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE) || auth.delegationDepth > 0) return false;
-    if (adoptionRefusal(s, all, this.#mcpRegistry, this.#daemonOrigins())) return false;
+    if (!this.#mcpOAuth || !this.#mcpRegistry || s.liveOnly) return null;
     // A sign-in that the CLI can't run — not any failure: a server that's
     // merely down would only lose its working copy everywhere.
-    return liveStatus === "needs-auth";
+    if (liveStatus !== "needs-auth") return null;
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE) || auth.delegationDepth > 0) return null;
+    if (adoptionRefusal(s, all, this.#mcpRegistry, this.#daemonOrigins())) return null;
+    // The drawer has only the URL as shown, which can't adopt a project's
+    // URL with parts hidden: that one is adopted by its full URL, from the file.
+    return fullUrlRequired(s) ? "full-url" : "drawer";
   }
 
   /**
@@ -2514,7 +3111,28 @@ mcpHub: this.#mcpHub,
     // Which entry: the one at the URL the caller was shown, else the only one.
     const all = await claudeMcpServers(workdir);
     const candidates = all.filter((c) => c.name === name);
-    const atUrl = msg.url !== undefined ? candidates.filter((c) => c.url === msg.url) : candidates;
+    // The URL the caller was shown is the redacted one (#394); one typed from
+    // their own config is the real one. Either picks the entry — but a
+    // project's URL with parts hidden only by its full text, the consent.
+    // ("…" alone is never a URL anyone was shown a host for.)
+    const atUrl =
+      msg.url !== undefined
+        ? candidates.filter(
+            (c) => c.url === msg.url || (c.url !== null && msg.url !== "…" && !fullUrlRequired(c) && redactMcpUrl(c.url) === msg.url),
+          )
+        : candidates;
+    // The shown form of a project's URL with parts hidden picks nothing — and
+    // says why, rather than quietly picking another entry that reads the same.
+    const hiddenRepo =
+      msg.url === undefined ? undefined : candidates.find((c) => fullUrlRequired(c) && c.url !== msg.url && redactMcpUrl(c.url!) === msg.url);
+    if (hiddenRepo) {
+      source = hiddenRepo.path;
+      url = msg.url!;
+      return fail(
+        "unconfirmed",
+        `${name} comes from this project's own files, and parts of its address are hidden here (${msg.url}); adopting it is consent to all of it, so name its full URL, from ${hiddenRepo.path}`,
+      );
+    }
     if (atUrl.length === 0) {
       return fail(
         "not_found",
@@ -2525,11 +3143,21 @@ mcpHub: this.#mcpHub,
       );
     }
     if (new Set(atUrl.map((c) => c.url)).size > 1) {
-      return fail("ambiguous", `${JSON.stringify(name)} names more than one server in Claude's config (${atUrl.map((c) => c.url ?? c.command).join(", ")}); say which URL`);
+      const shown = atUrl.map((c) => (c.url ? redactMcpUrl(c.url) : serverProgram(c.command ?? "")));
+      // Two URLs that read the same once their credentials are hidden: only
+      // the full URL, from the file itself, tells them apart.
+      const shownUrls = atUrl.flatMap((c) => (c.url ? [redactMcpUrl(c.url)] : []));
+      const sameShown = new Set(shownUrls).size < shownUrls.length;
+      return fail(
+        "ambiguous",
+        sameShown
+          ? `${JSON.stringify(name)} names servers that differ only in parts hidden here (${[...new Set(shown)].join(", ")}); pass the full URL, from ${[...new Set(atUrl.map((c) => c.path))].join(" or ")}`
+          : `${JSON.stringify(name)} names more than one server in Claude's config (${shown.join(", ")}); say which URL`,
+      );
     }
     const found = atUrl[0]!;
     source = found.path;
-    url = found.url ?? "";
+    url = found.url ? redactMcpUrl(found.url) : "";
     const can = adoptability(found);
     if (!can.ok) return fail("refused", can.reason);
     const refusal = adoptionRefusal(found, all, registry, this.#daemonOrigins());
@@ -2537,7 +3165,12 @@ mcpHub: this.#mcpHub,
     // A repo's file can name any address (and the CLI connects it unasked):
     // adopted only when the caller names the URL — consent to that address.
     if (fromRepoFile(found) && msg.url === undefined) {
-      return fail("unconfirmed", `${name} comes from this project's own files, which chose its address; to adopt it, name that URL (${can.url})`);
+      return fail(
+        "unconfirmed",
+        fullUrlRequired(found)
+          ? `${name} comes from this project's own files, which chose its address; to adopt it, name its full URL, from ${found.path} (shown here as ${redactMcpUrl(can.url)})`
+          : `${name} comes from this project's own files, which chose its address; to adopt it, name that URL (${redactMcpUrl(can.url)})`,
+      );
     }
     const reply = (alreadyAdopted: boolean): DaemonMessage => ({
       type: "mcp.adopt.result",
@@ -2571,7 +3204,8 @@ mcpHub: this.#mcpHub,
     }
     // Any client held for the old entry (a plain copy imported from ~/.claude.json).
     this.#mcpHub?.drop(spec.name);
-    url = new URL(can.url).href;
+    this.#mcpHub?.proxy?.serverChanged(spec.name);
+    url = redactMcpUrl(new URL(can.url).href);
     audit(`adopted${fromRepoFile(found) ? " projectFile=true" : ""}`);
     return reply(false);
   }
@@ -2590,6 +3224,7 @@ mcpHub: this.#mcpHub,
     if (!oauth) throw new Error("OAuth for MCP servers is not available on this daemon.");
     const done = await oauth.complete(input, proof, (name) => this.#mcpRegistry?.get(name));
     this.#mcpHub?.dropTenant(done.server, done.tenant);
+    this.#mcpHub?.proxy?.credentialsChanged(done.server, done.tenant);
     return done;
   }
 
@@ -2958,6 +3593,7 @@ mcpHub: this.#mcpHub,
     // Also drop any fleet subscription — otherwise a dead socket keeps getting
     // deltas pushed at it for the life of the daemon.
     this.#fleetSubscribers.delete(clientId);
+    this.#providerSubscribers.delete(clientId);
   }
 
   /** Get a session by name within the caller's tenant (for Telegram convenience).
@@ -3284,6 +3920,29 @@ mcpHub: this.#mcpHub,
       }
     }
 
+    // An account for the backend the session lands on (`claudeAccount` is
+    // #392's spelling of the Claude one). Fail closed on an unknown account —
+    // creating the session on some other credential would bill the wrong one.
+    const landingBackend = providerId ?? this.#providers.defaultId;
+    if (msg.account && msg.claudeAccount && landingBackend === "claude" && msg.account !== msg.claudeAccount) {
+      return { type: "response.error", requestId: msg.id, error: "account and claudeAccount name different Claude accounts — send one", code: "invalid_request" };
+    }
+    const createAccount = msg.account ?? (landingBackend === "claude" ? msg.claudeAccount : undefined);
+    if (createAccount || msg.claudeAccount) {
+      const refused = this.#accountsWriteRefusal(msg.id, auth);
+      if (refused) return refused;
+    }
+    if (createAccount) {
+      if (!backendHasAccounts(landingBackend) || !this.#accounts.has(landingBackend, createAccount)) {
+        return {
+          type: "response.error",
+          requestId: msg.id,
+          error: `Unknown ${landingBackend} account "${createAccount}" — see \`codeoid account ls --backend ${landingBackend}\``,
+          code: "invalid_request",
+        };
+      }
+    }
+
     // Plan the role-children BEFORE creating anything, so a fan-out over the
     // ceiling rejects the request outright instead of leaving a half-built
     // collaboration behind.
@@ -3362,7 +4021,9 @@ mcpHub: this.#mcpHub,
       transcriptStore: this.#transcriptStore,
       providers: this.#providers,
       claudeAccounts: this.#claudeAccounts,
+      // The Claude choice also when the session lands elsewhere: it applies if it is switched to Claude.
       claudeAccount: msg.claudeAccount || null,
+      ...(createAccount ? { accountChoices: { [landingBackend]: createAccount } } : {}),
       hooks: this.#hooks,
       // Derived above for a collaborative session; otherwise msg.providerId.
       providerId,
@@ -3745,6 +4406,9 @@ mcpHub: this.#mcpHub,
           transcriptStore: this.#transcriptStore,
           providers: this.#providers,
           claudeAccounts: this.#claudeAccounts,
+          // The collaboration runs on the accounts its lead was created on.
+          claudeAccount: parent.claudeAccount,
+          accountChoices: parent.accountChoices,
           hooks: this.#hooks,
           providerId: child.providerId,
           defaultModel: child.model,
@@ -3866,11 +4530,17 @@ mcpHub: this.#mcpHub,
     // The fork keeps running on the parent's Claude account, and choosing what
     // a session runs on (and bills) is `settings:write` — a fork or a compare
     // must not be a way around that.
-    if (parent.claudeAccount !== null && !hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) {
+    // Named accounts only: a pin to the built-in `default` chooses no one's credential.
+    const parentChoices = Object.entries(parent.accountChoices).filter(([, name]) => name !== DEFAULT_ACCOUNT);
+    if (parentChoices.length > 0 && (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE) || auth.delegationDepth > 0)) {
+      const [backend, name] = parentChoices[0]!;
       return {
         type: "response.error",
         requestId: msg.id,
-        error: `This session runs on Claude account "${parent.claudeAccount}"; forking it needs settings:write`,
+        error:
+          backend === "claude"
+            ? `This session runs on Claude account "${name}"; forking it needs settings:write from an undelegated token`
+            : `This session runs on the ${backend} account "${name}"; forking it needs settings:write from an undelegated token`,
         code: "forbidden",
       };
     }
@@ -4100,8 +4770,9 @@ mcpHub: this.#mcpHub,
         transcriptStore: this.#transcriptStore,
         providers: this.#providers,
         claudeAccounts: this.#claudeAccounts,
-        // A fork continues the same conversation — on the same account.
+        // A fork continues the same conversation — on the same accounts.
         claudeAccount: parent.claudeAccount,
+        accountChoices: parent.accountChoices,
         hooks: this.#hooks,
         providerId,
         forkedFrom: {
@@ -7240,6 +7911,138 @@ mcpHub: this.#mcpHub,
       return { type: "response.error", requestId: msg.id, error: result.refused, code: "invalid_request" };
     }
     return { type: "response.ok", requestId: msg.id, data: result };
+  }
+
+  /** Re-read the session's MCP servers and apply any change (#395). `session:send`. */
+  async #mcpRefresh(
+    msg: Extract<ClientMessage, { type: "session.mcp_refresh" }>,
+    auth: AuthContext,
+  ): Promise<DaemonMessage> {
+    if (!hasScope(auth.scopes as string[], SCOPES.SESSION_SEND)) {
+      return { type: "response.error", requestId: msg.id, error: "Missing scope: session:send", code: "forbidden" };
+    }
+    const session = this.#getOwnedSession(msg.sessionId, auth);
+    if (!session) {
+      return { type: "response.error", requestId: msg.id, error: "Session not found", code: "not_found" };
+    }
+    const result = await session.refreshMcp();
+    this.#store.audit(auth.sub, "session.mcp_refresh", session.id, `changed=${result.changed} deferred=${result.deferred}`);
+    return { type: "response.ok", requestId: msg.id, data: result };
+  }
+
+  /**
+   * What approving a project's MCP server would approve, in full (#395): the
+   * one deciding sees the command, every argument, the URL, and each env var
+   * and header, exactly as they'll run — nothing masked or cut. Same rights as approving.
+   */
+  async #mcpApprovePreview(
+    msg: Extract<ClientMessage, { type: "mcp.approve.preview" }>,
+    auth: AuthContext,
+  ): Promise<DaemonMessage> {
+    const fail = (error: string, code: "invalid_request" | "not_found" | "forbidden" = "invalid_request"): DaemonMessage => ({
+      type: "response.error",
+      requestId: msg.id,
+      error,
+      code,
+    });
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE) || auth.delegationDepth > 0) {
+      return fail("Reviewing a project's MCP server for approval needs settings:write, on a token of your own", "forbidden");
+    }
+    const session = this.#getOwnedSession(msg.sessionId, auth);
+    if (!session) return fail("Session not found", "not_found");
+    const read = await readWorkdirServers(session.workdir);
+    if (!read) return fail("Claude's config can't be read just now (it may be mid-write) — try again");
+    if (read.repoUnreadable) return fail("The project's .mcp.json can't be read just now (mid-edit, not JSON, or too big) — try again once it can");
+    const repo = read.servers.filter((w) => w.origin === "claude-repo" && w.name === msg.server && (msg.path === undefined || w.path === msg.path));
+    if (repo.length === 0) return fail(`This project declares no MCP server ${JSON.stringify(msg.server)}`, "not_found");
+    if (repo.length > 1) return fail(`${JSON.stringify(msg.server)} is declared in ${repo.map((w) => w.path).join(" and ")}; say which file`);
+    const w = repo[0]!;
+    // Everything here is the repo's choice and is what gets approved, so it's
+    // shown exactly — a secret committed to the repo isn't the approver's to
+    // be kept from. Only what wouldn't show (bidi, zero-width, controls) is escaped.
+    const shown = (o: Record<string, string> | undefined) => Object.fromEntries(Object.entries(o ?? {}).map(([k, v]) => [visibleVerbatim(k), visibleVerbatim(v)]));
+    const commandLine = w.raw.command === undefined ? null : [w.raw.command, ...(w.raw.args ?? [])].map((a) => shellArg(visibleCompact(a))).join(" ");
+    const lines: string[] = [];
+    if (commandLine !== null) lines.push(`command: ${commandLine}`);
+    if (w.raw.url !== undefined) {
+      // The host it dials, as the URL parser reads it — a look-alike
+      // (Cyrillic "Ь"), userinfo (`api.github.com@evil.example`) or an
+      // encoded dot can't pass for another.
+      let host = "(not a valid URL)";
+      try {
+        host = new URL(w.raw.url).host;
+      } catch {}
+      lines.push(`url: ${quotedVisible(w.raw.url)} (host: ${quotedVisible(host)})`);
+    }
+    const block = (label: string, o: Record<string, string> | undefined, sep: string) => {
+      const entries = Object.entries(o ?? {});
+      if (entries.length === 0) return;
+      lines.push(`${label} (${entries.length}):`);
+      for (const [k, v] of entries) lines.push(`  ${quotedVisible(k)}${sep}${quotedVisible(v)}`);
+    };
+    block("env", w.raw.env, " = ");
+    block("headers", w.raw.headers, ": ");
+    const preview: McpApprovePreview = {
+      lines,
+      server: w.name,
+      path: w.path, // sent back to name the entry: as is (clients escape it to show)
+      fingerprint: w.fingerprint,
+      shownPath: visibleVerbatim(w.path),
+      commandLine,
+      command: w.raw.command === undefined ? null : visibleVerbatim(w.raw.command),
+      args: (w.raw.args ?? []).map(visibleVerbatim),
+      url: w.raw.url === undefined ? null : visibleVerbatim(w.raw.url),
+      env: shown(w.raw.env),
+      headers: shown(w.raw.headers),
+    };
+    return { type: "response.ok", requestId: msg.id, data: preview };
+  }
+
+  /**
+   * Approve a repo's MCP server — this exact entry — for every backend in the
+   * session's workdir (#395). Consent to what a repo chose, so: the caller's
+   * own session, `settings:write`, never a delegated token, audited with the
+   * file it came from. Applies on a refresh.
+   */
+  async #mcpApprove(
+    msg: Extract<ClientMessage, { type: "mcp.approve" }>,
+    auth: AuthContext,
+  ): Promise<DaemonMessage> {
+    const fail = (error: string, code: "invalid_request" | "not_found" | "forbidden" = "invalid_request"): DaemonMessage => ({
+      type: "response.error",
+      requestId: msg.id,
+      error,
+      code,
+    });
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE) || auth.delegationDepth > 0) {
+      return fail("Approving a project's MCP server needs settings:write, on a token of your own", "forbidden");
+    }
+    const session = this.#getOwnedSession(msg.sessionId, auth);
+    if (!session) return fail("Session not found", "not_found");
+    const read = await readWorkdirServers(session.workdir);
+    if (!read) return fail("Claude's config can't be read just now (it may be mid-write) — try again");
+    if (read.repoUnreadable) return fail("The project's .mcp.json can't be read just now (mid-edit, not JSON, or too big) — try again once it can");
+    const repo = read.servers.filter(
+      (w) => w.origin === "claude-repo" && w.name === msg.server && (msg.path === undefined || w.path === msg.path),
+    );
+    if (repo.length === 0) return fail(`This project declares no MCP server ${JSON.stringify(msg.server)}`, "not_found");
+    // The entry approved is the one the caller looked at: a repo that changed
+    // it since (or a race to) gets nothing.
+    const entry = repo.find((w) => w.fingerprint === msg.fingerprint);
+    if (!entry) return fail(`${JSON.stringify(msg.server)} changed since it was shown — look at it again before approving`);
+    this.#store.approveWorkdirMcpServer(
+      { accountId: auth.accountId, projectId: auth.projectId, workdir: session.workdir },
+      entry.name,
+      entry.fingerprint,
+      auth.sub,
+    );
+    this.#store.audit(
+      auth.sub,
+      "mcp.approve",
+      session.id,
+      `server=${JSON.stringify(entry.name)} source=${JSON.stringify(entry.path)} fingerprint=${entry.fingerprint} program=${JSON.stringify(entry.raw.command ? serverProgram(entry.raw.command) : redactMcpUrl(entry.raw.url ?? ""))}`,
+    );
+    return { type: "response.ok", requestId: msg.id, data: { server: entry.name, path: entry.path } };
   }
 
   #rename(

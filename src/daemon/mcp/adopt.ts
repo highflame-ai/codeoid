@@ -22,6 +22,7 @@ import path from "node:path";
 import { McpServerSchema, type RawMcpServerConfig } from "../../config.js";
 import type { ClaudeConfigMcpServer } from "../../protocol/types.js";
 import { readClaudeConfig } from "../claude-config.js";
+import { urlHasHiddenParts } from "./redact.js";
 import { isReservedMcpName, type McpRegistry } from "./registry.js";
 import { mcpToolPrefix } from "./types.js";
 
@@ -50,11 +51,12 @@ export function adoptionRefusal(
   const can = adoptability(chosen);
   if (!can.ok) return can.reason;
   if (isDaemonEndpoint(can.url, daemonOrigins)) return `${chosen.name} is one of this daemon's own endpoints`;
+  const index = indexOf(all);
   // Every entry at that address, whatever its name, must be adoptable: a
   // repo's header-less copy mustn't stand in for the user's own
   // header-authorized server (which would be denied along with it).
-  for (const other of all) {
-    if (other === chosen || other.url !== can.url) continue;
+  for (const other of index.byUrl.get(can.url) ?? []) {
+    if (other === chosen) continue;
     const ok = adoptability(other);
     if (!ok.ok) return ok.reason;
   }
@@ -62,12 +64,44 @@ export function adoptionRefusal(
   // another address: it would stand in for theirs in every session.
   // Compared loosely (case, "-" vs "_"): a look-alike would sit beside
   // theirs with near-identical tools.
-  const loose = (n: string) => n.toLowerCase().replace(/-/g, "_");
-  const own = all.find((o) => loose(o.name) === loose(chosen.name) && !fromRepoFile(o) && o.url !== can.url);
+  const own = (index.ownByLooseName.get(loose(chosen.name)) ?? []).find((o) => o.url !== can.url);
   if (fromRepoFile(chosen) && own) {
     return `this project's ${chosen.name} would stand in for your own ${own.name}, at another address`;
   }
   return registryConflict(registry, chosen.name, can.url);
+}
+
+const loose = (n: string) => n.toLowerCase().replace(/-/g, "_");
+
+interface AdoptionIndex {
+  byUrl: Map<string | null, ClaudeConfigMcpServer[]>;
+  /** The user's own entries (not a repo's), by loose name. */
+  ownByLooseName: Map<string, ClaudeConfigMcpServer[]>;
+}
+
+/**
+ * One index per snapshot, so checking every entry of a repo file of
+ * thousands is linear, not quadratic (the drawer checks each one).
+ */
+const indexes = new WeakMap<readonly ClaudeConfigMcpServer[], AdoptionIndex>();
+
+function indexOf(all: readonly ClaudeConfigMcpServer[]): AdoptionIndex {
+  let index = indexes.get(all);
+  if (!index) {
+    index = { byUrl: new Map(), ownByLooseName: new Map() };
+    for (const s of all) {
+      const at = index.byUrl.get(s.url);
+      if (at) at.push(s);
+      else index.byUrl.set(s.url, [s]);
+      if (fromRepoFile(s)) continue;
+      const k = loose(s.name);
+      const named = index.ownByLooseName.get(k);
+      if (named) named.push(s);
+      else index.ownByLooseName.set(k, [s]);
+    }
+    indexes.set(all, index);
+  }
+  return index;
 }
 
 /**
@@ -84,6 +118,17 @@ export function fromRepoFile(server: ClaudeConfigMcpServer): boolean {
   // ~/.claude.json (its projects[workdir] entries); every file a repo
   // controls has another (.mcp.json, .claude/settings*.json).
   return path.basename(server.path) !== ".claude.json";
+}
+
+/**
+ * Whether adopting this entry takes its full URL, not the one shown (#394):
+ * a project's server whose URL has parts hidden. Naming a repo's URL is the
+ * consent to it, and consent to "https://host/…/mcp" isn't consent to the
+ * tenant or query a repo put behind the "…". (The user's own URLs match as
+ * shown: what's hidden there is their own credential.)
+ */
+export function fullUrlRequired(server: ClaudeConfigMcpServer): boolean {
+  return fromRepoFile(server) && server.url !== null && urlHasHiddenParts(server.url);
 }
 
 /**
@@ -156,6 +201,9 @@ export function adoptability(server: ClaudeConfigMcpServer): { ok: true; url: st
   }
   // The URL is shown for consent and stored as is: the parser would quietly
   // drop a newline or tab, which could carry text into the prompt.
+  // Long enough that it couldn't be shown in full: refused, rather than
+  // asking for consent to an address the user can't read.
+  if (server.url.length > 2048) return { ok: false, reason: `${server.name}'s URL is unusually long (over 2048 characters)` };
   // ASCII only (an international domain in its punycode form): anything
   // else is either invisible or rewritten by the parser.
   if (/[\s\u0000-\u001f\u007f-\uffff]/.test(server.url)) {

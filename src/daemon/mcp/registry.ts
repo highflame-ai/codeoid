@@ -28,9 +28,27 @@ export function isReservedMcpName(name: string): boolean {
 export interface McpRegistryOptions {
   /** When true, inject the built-in `codeoid_memory` entry (in-process). */
   memoryEnabled: boolean;
+  /** Names imported from Claude's global config (an explicit entry of the same name isn't one). */
+  imported?: ReadonlySet<string>;
 }
 
-export class McpRegistry {
+/**
+ * What a backend reads to know its MCP servers (#395): the daemon-wide
+ * registry itself, or a session's view of it (the registry plus that
+ * session's workdir servers — mcp/session-view.ts).
+ */
+export interface McpServerView {
+  list(): McpServerSpec[];
+  get(name: string): McpServerSpec | undefined;
+  /** Enabled servers that should mount on `backendId` (honoring `backends`). */
+  forBackend(backendId: string): McpServerSpec[];
+  /** Enabled OAuth servers for `backendId` (codeoid signs in and calls them). */
+  oauthFor(backendId: string): McpServerSpec[];
+  /** External servers a native-mount backend mounts itself (no OAuth ones). */
+  forNativeMount(backendId: string): McpServerSpec[];
+}
+
+export class McpRegistry implements McpServerView {
   readonly #specs = new Map<string, McpServerSpec>();
   readonly #warnings: string[] = [];
 
@@ -53,7 +71,8 @@ export class McpRegistry {
         this.#warnings.push(`mcp: ignoring reserved server name "${name}" (codeoid built-in)`);
         continue;
       }
-      this.#specs.set(name, normalizeSpec(name, raw));
+      const spec = normalizeSpec(name, raw);
+      this.#specs.set(name, opts.imported?.has(name) ? { ...spec, origin: "claude-global" } : spec);
     }
   }
 
@@ -107,7 +126,7 @@ export class McpRegistry {
 /** Raw (zod-validated) config → normalized spec. Transport is inferred from
  *  which of `command` / `url` is set (the schema's refine guarantees exactly
  *  one); `url` wins defensively if both somehow slip through. */
-function normalizeSpec(name: string, raw: RawMcpServerConfig): McpServerSpec {
+export function normalizeSpec(name: string, raw: RawMcpServerConfig): McpServerSpec {
   const transport: McpTransport =
     raw.url !== undefined
       ? {

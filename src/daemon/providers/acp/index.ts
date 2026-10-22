@@ -42,8 +42,11 @@ import { buildGeminiCliEnv } from "../env.js";
 import { StdioJsonRpcProcess } from "../jsonrpc-stdio.js";
 import { MEMORY_MCP_SERVER_NAME, type MemoryMcpMount } from "../../memory/mcp-http.js";
 import { BLACKBOARD_MCP_SERVER_NAME } from "../../blackboard/mcp-http.js";
-import type { McpRegistry } from "../../mcp/registry.js";
+import type { McpServerView } from "../../mcp/registry.js";
+import { McpProxyLease, type McpProxyMount } from "../../mcp/proxy.js";
 import { resolveEnvMap } from "../../mcp/types.js";
+import type { ResolvedAccount } from "../../accounts.js";
+import { applyGeminiCliAccount } from "../../account-apply.js";
 
 export interface GeminiAcpProviderInit {
   sessionId: string;
@@ -62,6 +65,9 @@ export interface GeminiAcpProviderInit {
    * store on demand — the precondition for the Verbatim Working Set strategy.
    */
   memoryMcp?: MemoryMcpMount;
+  /** The daemon's OAuth MCP relay (#396): how this backend reaches the
+   *  registry's OAuth servers without holding their tokens. */
+  mcpProxy?: McpProxyMount;
   /**
    * Role-scoped goal-blackboard mount, resolved LAZILY.
    *
@@ -74,7 +80,13 @@ export interface GeminiAcpProviderInit {
 
   /** Cross-backend MCP registry — external servers mount on session/new
    *  (gemini-cli owns its client); approval flows through canUseTool. */
-  mcpRegistry?: McpRegistry;
+  mcpRegistry?: McpServerView;
+  /**
+   * This session's account for the backend, resolved when the process is
+   * spawned (accounts.ts); null = the daemon's own login. Throws when the
+   * chosen account can't be used — the turn fails, never another credential.
+   */
+  resolveAccount?: () => ResolvedAccount | null;
   onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
 }
 
@@ -93,11 +105,12 @@ export class GeminiAcpProvider implements SessionProvider {
   #backingSessionId: string;
   #command: string;
   #argsPrefix: string[];
+  #resolveAccount: (() => ResolvedAccount | null) | null;
   #workspaceId: string;
   #memoryMcp: MemoryMcpMount | null;
   /** Role-scoped blackboard mount; token minted+revoked by the SessionManager. */
   readonly #blackboardMcp: (() => { url: string; token: string } | undefined) | null;
-  #mcpRegistry: McpRegistry | null;
+  #mcpRegistry: McpServerView | null;
   /** Live scoped token for the mounted memory endpoint; revoked on teardown. */
   #memoryToken: string | null = null;
 
@@ -127,12 +140,20 @@ export class GeminiAcpProvider implements SessionProvider {
     this.#sessionId = init.sessionId;
     this.#backingSessionId = init.initialBackingId;
     this.#command = init.command;
+    this.#resolveAccount = init.resolveAccount ?? null;
     this.#argsPrefix = init.argsPrefix ?? [];
     this.#workspaceId = init.workspaceId ?? init.sessionId;
     this.#memoryMcp = init.memoryMcp ?? null;
     this.#blackboardMcp = init.blackboardMcp ?? null;
     this.#mcpRegistry = init.mcpRegistry ?? null;
+    this.#proxy = new McpProxyLease(
+      init.mcpProxy,
+      init.tenant ? { tenant: init.tenant, sessionId: init.sessionId, backendId: this.id } : null,
+    );
   }
+
+  /** This backend's proxy token for the registry's OAuth servers. */
+  readonly #proxy: McpProxyLease;
 
   /**
    * True when the shared memory endpoint is mounted for this session, so
@@ -233,6 +254,7 @@ export class GeminiAcpProvider implements SessionProvider {
       this.#memoryMcp?.endpoint.revoke(this.#memoryToken);
       this.#memoryToken = null;
     }
+    this.#proxy.revoke();
   }
 
   // ── Internal ──────────────────────────────────────────────────────────
@@ -287,7 +309,8 @@ export class GeminiAcpProvider implements SessionProvider {
         command: this.#command,
         args: [...this.#argsPrefix, "--acp"],
         cwd: opts.workdir,
-        env: buildGeminiCliEnv(),
+        // The account's own GEMINI_CLI_HOME (an overlay selecting its auth type).
+        env: applyGeminiCliAccount(this.#resolveAccount?.() ?? null, buildGeminiCliEnv()),
         onNotification: (method, params) => this.#onNotification(method, params),
         onServerRequest: (method, params) => this.#onServerRequest(method, params),
         onExit: ({ code, signal, stderrTail }) => {
@@ -406,6 +429,18 @@ export class GeminiAcpProvider implements SessionProvider {
           servers.push({ name: spec.name, command: t.command, args: t.args ?? [], env });
         }
       }
+    }
+    // OAuth registry servers, through the daemon's relay (#396): the proxy
+    // token rides in the ACP request's headers, in-process — never in an env
+    // var the agent's shell would inherit. Re-minted per backing session.
+    const proxied = this.#proxy.renew();
+    for (const server of proxied?.servers ?? []) {
+      servers.push({
+        type: "http",
+        name: server.name,
+        url: server.url,
+        headers: [{ name: "Authorization", value: `Bearer ${proxied!.token}` }],
+      });
     }
     return servers;
   }

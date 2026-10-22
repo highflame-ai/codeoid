@@ -6,7 +6,7 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { secretPathVerdict } from "../daemon/secret-paths.js";
 
@@ -29,7 +29,7 @@ const verdict = (input: unknown, tool = "Read") => secretPathVerdict(tool, input
 
 describe("secretPathVerdict", () => {
   test("denies the credential files, on every backend's input key", () => {
-    for (const name of ["claude-accounts.json", "config.json", ".env", "local-token-7400", "claude-accounts.json.123.ab.tmp", "codeoid.db", "codeoid.db-wal"]) {
+    for (const name of ["claude-accounts.json", "endpoints.json", "config.json", ".env", "local-token-7400", "claude-accounts.json.123.ab.tmp", "codeoid.db", "codeoid.db-wal"]) {
       expect(verdict({ file_path: join(configDir, name) })?.action).toBe("deny");
     }
     expect(verdict({ absolute_path: join(configDir, ".env") })?.action).toBe("deny"); // gemini / qwen read_file
@@ -68,6 +68,13 @@ describe("secretPathVerdict", () => {
     expect(verdict({ pattern: "*", path: "/proc" }, "Glob")?.action).toBe("ask");
     // No root = the workdir: a session whose workdir holds the config dir asks too.
     expect(secretPathVerdict("Grep", { pattern: "sk-ant-" }, { workdir: join(root, "home"), configDir })?.action).toBe("ask");
+  });
+
+  test("asks before any tool touches ~/.claude.json — its tokens, and where MCP approvals live (#395)", () => {
+    const file = join(homedir(), ".claude.json");
+    expect(verdict({ file_path: file })?.action).toBe("ask");
+    expect(verdict({ file_path: file, content: "{}" }, "Write")?.action).toBe("ask");
+    expect(verdict({ file_path: join(homedir(), ".claude.jsonx") })).toBeNull();
   });
 
   test("leaves everything else alone — including the rest of the config dir", () => {

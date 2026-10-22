@@ -17,7 +17,7 @@ import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { McpCallScope, McpHub } from "../../mcp/hub.js";
-import type { McpRegistry } from "../../mcp/registry.js";
+import type { McpServerView } from "../../mcp/registry.js";
 import type { McpServerSpec } from "../../mcp/types.js";
 
 /** One OAuth server as an in-process server forwarding to the hub. */
@@ -49,7 +49,7 @@ export function oauthBridgeServer(spec: McpServerSpec, hub: McpHub, scope: McpCa
  * that: the CLI still dials its copy. Denying the URL does.
  */
 export function oauthServersForClaude(
-  registry: McpRegistry | undefined,
+  registry: McpServerView | undefined,
   hub: McpHub | undefined,
   scope: McpCallScope,
 ): {

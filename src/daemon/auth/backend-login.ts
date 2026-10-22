@@ -28,15 +28,28 @@
  * escapes this module.
  */
 
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import type { LoginBackend, PendingBackendLogin } from "../../protocol/types.js";
-import { mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
+import {
+  closeSync,
+  constants as fsConstants,
+  createWriteStream,
+  existsSync,
+  mkdtempSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stripClaudeCredentials } from "../claude-accounts.js";
 import { buildSubprocessEnv } from "../providers/env.js";
+import { resolveCodexCommand } from "../providers/codex/resolve.js";
+import { isCodexCredentialVar } from "../account-apply.js";
 
 /** Longest we hold a started attempt open before killing it. */
 const ATTEMPT_TTL_MS = 10 * 60_000;
@@ -66,12 +79,20 @@ const CODE_MAX = 1024;
 export interface LoginFlow {
   backend: LoginBackend;
   /**
+   * `code`: the vendor's page shows a code the user pastes back (submit).
+   * `device`: the user enters the code the COMMAND printed on the vendor's
+   * page, and the command finishes on its own (wait).
+   */
+  mode: "code" | "device";
+  /**
    * Resolve the command to run, or `null` when this installation has no such
    * binary — a clean "not available here" rather than a spawn failure.
    */
   resolve(): { file: string; args: string[] } | null;
   /** Matches the authorize URL in raw terminal output. */
   urlPattern: RegExp;
+  /** `device` only: matches the one-time code the user enters on the vendor's page. */
+  userCodePattern?: RegExp;
   /** Matches the vendor's own rejection of a submitted code. */
   failurePattern: RegExp;
   /** Shown to the user beside the code box; vendor-specific wording. */
@@ -84,6 +105,22 @@ export interface LoginFlow {
    * the attempt still succeeds on the command's exit status.
    */
   extractSecret(transcript: string): { key: string; value: string } | null;
+  /** Variable-name prefixes the command inherits (beyond the shared basics). */
+  envPrefixes: readonly string[];
+  /** The inherited environment without any daemon credential — an isolated login must not see one. */
+  stripCredentials(env: Record<string, string>): Record<string, string>;
+  /** Variables pointing the command at its staging home. */
+  homeEnv(home: string): Record<string, string>;
+  /** Prepare the staging home before the command runs. */
+  prepareHome?(home: string): void;
+  /**
+   * Files (relative to the home) the command writes its credential to. The
+   * first must exist for the sign-in to count as done; all that exist are
+   * handed back to be kept as the account's.
+   */
+  credentialFiles?: readonly string[];
+  /** Only a named account may sign in this way — there is no daemon-wide login to replace. */
+  isolatedOnly?: boolean;
 }
 
 const require_ = createRequire(import.meta.url);
@@ -120,6 +157,10 @@ const CLAUDE_OAUTH_TOKEN = /sk-ant-oat01-[A-Za-z0-9_-]{20,}/;
 
 export const CLAUDE_LOGIN_FLOW: LoginFlow = {
   backend: "claude",
+  mode: "code",
+  envPrefixes: ["ANTHROPIC_", "CLAUDE_", "LC_"],
+  stripCredentials: stripClaudeCredentials,
+  homeEnv: (home) => ({ CLAUDE_CONFIG_DIR: home }),
   resolve() {
     const bin = resolveClaudeBinary();
     return bin ? { file: bin, args: ["setup-token"] } : null;
@@ -146,8 +187,38 @@ export const CLAUDE_LOGIN_FLOW: LoginFlow = {
   },
 };
 
+/**
+ * `codex login --device-auth` against the account's staging CODEX_HOME. It
+ * prints a link and a one-time code, polls OpenAI until the user enters it,
+ * writes `auth.json`, and exits 0. Verified headless (codex-cli 0.154).
+ */
+export const CODEX_LOGIN_FLOW: LoginFlow = {
+  backend: "codex",
+  mode: "device",
+  resolve() {
+    const r = resolveCodexCommand(undefined);
+    return r ? { file: r.command, args: [...r.argsPrefix, "login", "--device-auth"] } : null;
+  },
+  urlPattern: /https:\/\/auth\.openai\.com\/[A-Za-z0-9/_.~-]+(?:\?[A-Za-z0-9_=&%.~+-]+)?/g,
+  // `8UP4-KHOLU`: groups of capitals and digits joined by a dash.
+  userCodePattern: /\b[A-Z0-9]{4}-[A-Z0-9]{4,6}\b/,
+  failurePattern: /Error logging in|Login failed|device code (?:has )?expired|authorization (?:was )?denied/i,
+  codeHint: "Open the link, sign in to ChatGPT, and enter this code. codeoid finishes the sign-in once you approve.",
+  extractSecret: () => null,
+  envPrefixes: ["CODEX_", "OPENAI_", "LC_"],
+  stripCredentials: (env) => {
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(env)) if (!isCodexCredentialVar(k)) out[k] = v;
+    return out;
+  },
+  homeEnv: (home) => ({ CODEX_HOME: home }),
+  credentialFiles: ["auth.json"],
+  isolatedOnly: true,
+};
+
 const FLOWS: Record<LoginBackend, LoginFlow> = {
   claude: CLAUDE_LOGIN_FLOW,
+  codex: CODEX_LOGIN_FLOW,
 };
 
 /** Anything credential-shaped, gone — applied to every string that leaves here. */
@@ -164,6 +235,8 @@ interface Attempt {
   backend: LoginBackend;
   flow: LoginFlow;
   child: ChildProcess;
+  /** What the user types reaches the command through here (see spawnUnderPty). */
+  input: PtyInput;
   transcript: string;
   /**
    * Characters discarded off the FRONT by {@link capTail}, so an offset taken
@@ -180,8 +253,16 @@ interface Attempt {
   exitCode: number | null;
   /** Woken on every chunk of output and on exit, so waiters can re-test. */
   wake: (() => void)[];
-  /** Throwaway Claude config dir an isolated login ran against — removed on dispose. */
+  /** Staging home an isolated login ran against — removed on dispose. */
   isolatedDir?: string;
+  /** `device`: the one-time code the command printed. */
+  userCode: string | null;
+  /**
+   * File-credential flows: re-tests waiters on a timer, because a command
+   * that writes its credential file and then sits quietly (the Gemini CLI
+   * becomes a chat) prints nothing that would wake them.
+   */
+  poller?: ReturnType<typeof setInterval>;
 }
 
 export interface LoginOutcome {
@@ -196,10 +277,18 @@ export interface LoginOutcome {
    * the daemon's own login lives (`~/.codeoid/.env`).
    */
   isolated?: boolean;
+  /**
+   * File-credential flows: the credential files the command wrote, relative
+   * to its home, to be kept as the account's. Read before the staging home
+   * is deleted; never logged.
+   */
+  files?: Record<string, string>;
 }
 
-/** Prefix of the throwaway config dirs isolated logins run against. */
-const ISOLATED_DIR_PREFIX = "codeoid-claude-login-";
+/** Prefix of the staging homes isolated logins run against (any backend). */
+export const ISOLATED_DIR_PREFIX = "codeoid-login-";
+/** #392's prefix — still swept, so an upgrade cleans up after an older daemon. */
+const LEGACY_ISOLATED_DIR_PREFIX = "codeoid-claude-login-";
 
 /**
  * Holds at most one in-flight login per backend.
@@ -241,6 +330,9 @@ export class BackendLoginBroker {
   async start(backend: LoginBackend, opts: { isolated?: boolean } = {}): Promise<PendingBackendLogin> {
     const flow = this.#flows[backend];
     if (!flow) throw new BackendLoginError(`No interactive login for backend '${backend}'.`);
+    if (flow.isolatedOnly && !opts.isolated) {
+      throw new BackendLoginError(`A ${backend} sign-in is for a named account — give the account a name.`);
+    }
 
     const resolved = flow.resolve();
     if (!resolved) {
@@ -254,8 +346,10 @@ export class BackendLoginBroker {
 
     const isolatedDir = opts.isolated ? mkdtempSync(join(tmpdir(), ISOLATED_DIR_PREFIX)) : undefined;
     let child: ChildProcess;
+    let input: PtyInput;
     try {
-      child = spawnUnderPty(resolved.file, resolved.args, isolatedDir);
+      if (isolatedDir) flow.prepareHome?.(isolatedDir);
+      ({ child, input } = spawnUnderPty(resolved.file, resolved.args, flow, isolatedDir));
     } catch (err) {
       if (isolatedDir) rmSync(isolatedDir, { recursive: true, force: true });
       throw err;
@@ -266,6 +360,7 @@ export class BackendLoginBroker {
       backend,
       flow,
       child,
+      input,
       transcript: "",
       dropped: 0,
       verificationUrl: null,
@@ -275,9 +370,14 @@ export class BackendLoginBroker {
       exitCode: null,
       wake: [],
       ...(isolatedDir ? { isolatedDir } : {}),
+      userCode: null,
     };
     // `unref` so a forgotten attempt cannot hold the process open at shutdown.
     attempt.ttlTimer.unref?.();
+    if (flow.credentialFiles?.length) {
+      attempt.poller = setInterval(() => drain(attempt), 500);
+      attempt.poller.unref?.();
+    }
     this.#byId.set(loginId, attempt);
     this.#byBackend.set(backend, loginId);
 
@@ -291,6 +391,9 @@ export class BackendLoginBroker {
         // that a future flow with a looser pattern cannot turn scraped terminal
         // output into a `javascript:` link. One place, all flows, all clients.
         attempt.verificationUrl = found?.startsWith("https://") ? found : null;
+      }
+      if (flow.userCodePattern && !attempt.userCode) {
+        attempt.userCode = flow.userCodePattern.exec(stripAnsi(attempt.transcript))?.[0] ?? null;
       }
       drain(attempt);
     };
@@ -308,14 +411,16 @@ export class BackendLoginBroker {
     });
 
     try {
-      await waitFor(attempt, URL_TIMEOUT_MS, () => attempt.verificationUrl !== null || attempt.exited);
+      // A device login needs its code too — both are printed together.
+      const ready = () => attempt.verificationUrl !== null && (flow.mode !== "device" || attempt.userCode !== null);
+      await waitFor(attempt, URL_TIMEOUT_MS, () => ready() || attempt.exited);
     } catch {
       this.cancel(loginId);
       throw new BackendLoginError(
         `The ${backend} login command did not produce a sign-in link in time.`,
       );
     }
-    if (!attempt.verificationUrl) {
+    if (!attempt.verificationUrl || (flow.mode === "device" && !attempt.userCode)) {
       const tail = redact(lastLine(attempt.transcript));
       this.cancel(loginId);
       throw new BackendLoginError(
@@ -328,8 +433,67 @@ export class BackendLoginBroker {
       backend,
       verificationUrl: attempt.verificationUrl,
       expiresAt: attempt.expiresAt,
+      expiresInMs: Math.max(0, attempt.expiresAt - Date.now()),
       codeHint: flow.codeHint,
+      mode: flow.mode,
+      ...(attempt.userCode ? { userCode: attempt.userCode } : {}),
     };
+  }
+
+  /**
+   * A `device` login: wait until the user approved on the vendor's page (the
+   * command wrote its credential and exited) or it failed. Terminal either
+   * way, like `submit`.
+   */
+  async wait(loginId: string): Promise<LoginOutcome> {
+    const attempt = this.#byId.get(loginId);
+    if (!attempt) return { ok: false, error: "That sign-in attempt is no longer open. Start again." };
+    if (attempt.flow.mode !== "device") {
+      return { ok: false, error: "This sign-in finishes with the code the page shows — paste it instead." };
+    }
+    const isolated = attempt.isolatedDir !== undefined;
+    const done = () => attempt.exited || attempt.flow.failurePattern.test(attempt.transcript) || this.#credentialReady(attempt);
+    try {
+      await waitFor(attempt, Math.max(0, attempt.expiresAt - Date.now()), done);
+    } catch {
+      this.#dispose(attempt);
+      return { ok: false, error: "The sign-in was not approved in time. Start again." };
+    }
+    if (this.#byId.get(loginId) !== attempt) return { ok: false, error: "That sign-in attempt was cancelled." };
+    // Give a command that wrote its credential a moment to exit cleanly.
+    if (!attempt.exited) await waitFor(attempt, 3_000, () => attempt.exited).catch(() => {});
+    const files = this.#collectFiles(attempt);
+    const rejected = attempt.flow.failurePattern.test(attempt.transcript);
+    const reason = rejected ? redact(vendorReason(attempt.transcript)) : null;
+    const exitCode = attempt.exitCode;
+    this.#dispose(attempt);
+    if (files && !rejected) return { ok: true, files, ...(isolated ? { isolated: true } : {}) };
+    return {
+      ok: false,
+      error: reason ? `${reason} Start the sign-in again.` : `The ${attempt.backend} sign-in did not complete${exitCode === null ? "" : ` (exit ${exitCode})`}. Start again.`,
+      ...(isolated ? { isolated: true } : {}),
+    };
+  }
+
+  /** Has the command written the file that proves the sign-in (file-credential flows)? */
+  #credentialReady(attempt: Attempt): boolean {
+    const first = attempt.flow.credentialFiles?.[0];
+    return first !== undefined && attempt.isolatedDir !== undefined && existsSync(join(attempt.isolatedDir, first));
+  }
+
+  /** The credential files the command wrote, or null when the first (required) one is missing. */
+  #collectFiles(attempt: Attempt): Record<string, string> | null {
+    const files = attempt.flow.credentialFiles;
+    if (!files?.length || !attempt.isolatedDir || !this.#credentialReady(attempt)) return null;
+    const out: Record<string, string> = {};
+    for (const rel of files) {
+      try {
+        out[rel] = readFileSync(join(attempt.isolatedDir, rel), "utf8");
+      } catch {
+        // Optional file the vendor didn't write.
+      }
+    }
+    return out;
   }
 
   /**
@@ -371,7 +535,7 @@ export class BackendLoginBroker {
     // transcript (from the URL step) cannot be read as a rejection of THIS
     // code. Stream-absolute, so a mid-exchange trim cannot move it.
     const mark = attempt.dropped + attempt.transcript.length;
-    attempt.child.stdin?.write(`${trimmed}\r`);
+    attempt.input.write(`${trimmed}\r`);
 
     const sinceMark = () => attempt.transcript.slice(Math.max(0, mark - attempt.dropped));
 
@@ -396,6 +560,7 @@ export class BackendLoginBroker {
     const settled = () => {
       if (attempt.flow.failurePattern.test(sinceMark())) return true;
       if (mintedSecret()) return true;
+      if (this.#credentialReady(attempt)) return true;
       return attempt.exited;
     };
 
@@ -418,9 +583,16 @@ export class BackendLoginBroker {
     const since = sinceMark();
     const secret = mintedSecret() ?? undefined;
     const rejected = attempt.flow.failurePattern.test(since);
+    const files = this.#collectFiles(attempt);
     this.#dispose(attempt);
 
     if (secret && !rejected) return { ok: true, secret };
+    if (files && !rejected) return { ok: true, files };
+    // A file-credential flow that ended without its file did not sign in,
+    // whatever its exit status (the Gemini CLI is killed, not exited).
+    if (attempt.flow.credentialFiles?.length && !rejected) {
+      return { ok: false, error: `The ${attempt.backend} sign-in did not complete. Start again.` };
+    }
     if (rejected) {
       return { ok: false, error: `${redact(vendorReason(since))} Start the sign-in again.` };
     }
@@ -452,11 +624,13 @@ export class BackendLoginBroker {
 
   #dispose(attempt: Attempt): void {
     clearTimeout(attempt.ttlTimer);
+    if (attempt.poller) clearInterval(attempt.poller);
     this.#byId.delete(attempt.loginId);
     if (this.#byBackend.get(attempt.backend) === attempt.loginId) {
       this.#byBackend.delete(attempt.backend);
     }
     killTree(attempt.child);
+    attempt.input.close();
     // Anything still awaiting this attempt must not hang on a dead process.
     attempt.exited = true;
     drain(attempt);
@@ -491,7 +665,7 @@ function sweepStaleIsolatedDirs(): void {
   }
   const cutoff = Date.now() - ATTEMPT_TTL_MS;
   for (const name of names) {
-    if (!name.startsWith(ISOLATED_DIR_PREFIX)) continue;
+    if (!name.startsWith(ISOLATED_DIR_PREFIX) && !name.startsWith(LEGACY_ISOLATED_DIR_PREFIX)) continue;
     const dir = join(root, name);
     try {
       if (statSync(dir).mtimeMs < cutoff) rmSync(dir, { recursive: true, force: true });
@@ -515,15 +689,22 @@ function sweepStaleIsolatedDirs(): void {
  * `detached` puts the child in its own process group: killing `script` alone
  * would orphan the command it wrapped, which for a login command means an
  * abandoned OAuth attempt still holding a pty.
+ *
+ * `script`'s stdin is an ordinary pipe, fed from a named pipe we write to.
+ * `script` asks its stdin for terminal attributes and only expects ENOTTY:
+ * Bun (and Node) hand a child a socketpair for "pipe" stdio, where that fails
+ * with EOPNOTSUPP, fatal to BSD script (macOS) and older util-linux —
+ * "tcgetattr/ioctl: Operation not supported on socket", and no sign-in link.
+ * Recent macOS refuses a named pipe (FIFO) the same way, so neither can be
+ * script's stdin; only an ordinary pipe works everywhere, and only `sh` can
+ * make one. See PTY_SHELL.
  */
-function spawnUnderPty(file: string, args: string[], isolatedConfigDir?: string): ChildProcess {
-  const inherited = buildSubprocessEnv({ prefixes: ["ANTHROPIC_", "CLAUDE_", "LC_"] });
-  if (isolatedConfigDir) {
+function spawnUnderPty(file: string, args: string[], flow: LoginFlow, isolatedHome?: string): { child: ChildProcess; input: PtyInput } {
+  let inherited = buildSubprocessEnv({ prefixes: flow.envPrefixes });
+  if (isolatedHome) {
     // A named-account login: nothing of the daemon's own credential may reach
-    // it, and it writes into its own config dir only.
-    const stripped = stripClaudeCredentials(inherited);
-    for (const k of Object.keys(inherited)) if (!(k in stripped)) delete inherited[k];
-    inherited.CLAUDE_CONFIG_DIR = isolatedConfigDir;
+    // it, and it writes into its own staging home only.
+    inherited = { ...flow.stripCredentials(inherited), ...flow.homeEnv(isolatedHome) };
   }
   const env = {
     ...inherited,
@@ -543,7 +724,83 @@ function spawnUnderPty(file: string, args: string[], isolatedConfigDir?: string)
     process.platform === "darwin"
       ? ["-q", "/dev/null", file, ...args]
       : ["-q", "-e", "-c", shellQuote([file, ...args]), "/dev/null"];
-  return spawn("script", argv, { env, detached: true, stdio: ["pipe", "pipe", "pipe"] });
+  const pipeDir = mkdtempSync(join(tmpdir(), INPUT_DIR_PREFIX));
+  const fifo = join(pipeDir, "in");
+  const made = spawnSync("mkfifo", ["-m", "600", fifo]);
+  if (made.status !== 0) {
+    rmSync(pipeDir, { recursive: true, force: true });
+    throw new BackendLoginError("couldn't create the sign-in command's input pipe (mkfifo failed)");
+  }
+  // Run in the staging home: an interactive CLI must not load a project's
+  // files from the daemon's cwd while signing in.
+  const child = spawn("/bin/sh", ["-c", PTY_SHELL, "sh", fifo, ...argv], {
+    env,
+    detached: true,
+    stdio: ["ignore", "pipe", "pipe"],
+    ...(isolatedHome ? { cwd: isolatedHome } : {}),
+  });
+  return { child, input: openPtyInput(fifo, pipeDir, child) };
+}
+
+/**
+ * `sh -c` body: `$1` is the FIFO, the rest script's argv.
+ *
+ * `cat` copies the FIFO into an ordinary pipe that is script's stdin. It
+ * would outlive script — it waits on the FIFO, whose writer (us) stays open
+ * until the command is over, and the command is over only when `sh` exits —
+ * so it is stopped by pid when script exits. The pid travels down the pipe
+ * itself, as its first line: the left side prints its own pid and becomes
+ * `cat` (exec keeps the pid); the right side reads that line before script
+ * starts, so script never sees it and the pid is always known in time.
+ * Nothing is matched by name. The status is script's.
+ */
+const PTY_SHELL =
+  'f=$1; shift; sh -c \'echo $$; exec cat "$1"\' sh "$f" | { read -r c; script "$@"; s=$?; kill "$c" 2>/dev/null; exit "$s"; }';
+
+/** The write side of a login command's input pipe. */
+interface PtyInput {
+  write(text: string): void;
+  close(): void;
+}
+
+/** Prefix of the private dirs holding a login command's input pipe. */
+const INPUT_DIR_PREFIX = "codeoid-login-input-";
+
+/**
+ * Open the FIFO for writing. The open completes once `cat` opens it for
+ * reading (immediately, as it starts); text written before then is queued.
+ * If the command dies before ever opening it, the pending open is released by
+ * opening the read side ourselves — it would otherwise hold a worker thread.
+ */
+function openPtyInput(fifo: string, dir: string, child: ChildProcess): PtyInput {
+  const stream = createWriteStream(fifo);
+  stream.on("error", () => {
+    // The reader is gone (the command exited); nothing more to deliver.
+  });
+  let closed = false;
+  const release = () => {
+    try {
+      closeSync(openSync(fifo, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK));
+    } catch {
+      // Already opened by the command, or gone.
+    }
+  };
+  child.once("exit", () => {
+    release();
+    stream.destroy();
+  });
+  return {
+    write(text) {
+      if (!closed) stream.write(text);
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      release();
+      stream.destroy();
+      rmSync(dir, { recursive: true, force: true });
+    },
+  };
 }
 
 /** POSIX single-quoting — the command path is ours, but it may contain spaces. */

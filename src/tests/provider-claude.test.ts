@@ -99,13 +99,14 @@ import {
   packPluginsOption,
   pluginSkillDirs,
   withoutServers,
+  modelOptions,
 } from "../daemon/providers/claude/index.js";
 import { mcpToolPrefix } from "../daemon/mcp/types.js";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryEngine } from "../daemon/memory/engine.js";
-import { applyAccountEnv, type ResolvedClaudeAccount, type StoredClaudeAccount } from "../daemon/claude-accounts.js";
+import { applyAccountEnv, bedrockModel, type ResolvedClaudeAccount, type StoredClaudeAccount } from "../daemon/claude-accounts.js";
 import { SqliteEpisodeStore } from "../daemon/memory/store.js";
 import { MEMORY_TOOL_NAMES } from "../daemon/memory/index.js";
 import type { Embedder } from "../daemon/memory/embedder.js";
@@ -2029,8 +2030,12 @@ describe("ClaudeProvider – Claude accounts", () => {
   });
 
   /** A provider whose account is whatever `current` holds at query time. */
-  function makeAccountProvider(current: { account: ResolvedClaudeAccount | null }): ClaudeProvider {
+  function makeAccountProvider(
+    current: { account: ResolvedClaudeAccount | null },
+    onModels?: (models: ReadonlyArray<unknown>) => void,
+  ): ClaudeProvider {
     return new ClaudeProvider({
+      ...(onModels ? { onModels } : {}),
       sessionId: "acct-session",
       initialBackingId: "acct-backing",
       workspaceId: "ws_test",
@@ -2046,7 +2051,13 @@ describe("ClaudeProvider – Claude accounts", () => {
   }
   function account(a: Omit<StoredClaudeAccount, "createdAt" | "updatedAt">): ResolvedClaudeAccount {
     const stored = { ...a, createdAt: "t", updatedAt: "t" };
-    return { name: a.name, fingerprint: `${a.name}:${a.token}`, apply: (env) => applyAccountEnv(env, stored) };
+    return {
+      name: a.name,
+      kind: a.kind,
+      fingerprint: `${a.name}:${a.token}`,
+      apply: (env) => applyAccountEnv(env, stored),
+      model: (m) => (a.kind === "bedrock" ? bedrockModel(m, a.env) : m),
+    };
   }
   const turnOn = (provider: ClaudeProvider, msg: string) =>
     provider.runTurn({ history: [], userMessage: msg, workdir: "/tmp", canUseTool: async () => ({ behavior: "allow" as const }) });
@@ -2072,6 +2083,51 @@ describe("ClaudeProvider – Claude accounts", () => {
       if (saved.url === undefined) delete process.env.ANTHROPIC_BASE_URL;
       else process.env.ANTHROPIC_BASE_URL = saved.url;
     }
+  });
+
+  it("a Bedrock account: mapped families go to the CLI as aliases; its catalog never reaches the shared cache", async () => {
+    const reported: unknown[] = [];
+    const current = {
+      account: account({ name: "br", kind: "bedrock", token: "br-token", env: { ANTHROPIC_DEFAULT_OPUS_MODEL: "team.opus" } }),
+    };
+    const provider = makeAccountProvider(current, (m) => reported.push(m));
+    provider.runTurn({
+      history: [],
+      userMessage: "t1",
+      workdir: "/tmp",
+      model: "claude-opus-5-5[1m]",
+      fallbackModel: "claude-sonnet-5",
+      canUseTool: async () => ({ behavior: "allow" as const }),
+    });
+    const options = capturedQueryOpts?.options as { model?: string; fallbackModel?: string; env?: Record<string, string> };
+    // Mapped: the alias, so the CLI applies the account's mapping.
+    expect(options.model).toBe("opus[1m]");
+    // Not mapped: as is (the CLI makes it a Bedrock id itself).
+    expect(options.fallbackModel).toBe("claude-sonnet-5");
+    expect(options.env?.AWS_BEARER_TOKEN_BEDROCK).toBe("br-token");
+    await new Promise((r) => setTimeout(r, 10));
+    expect(reported).toEqual([]);
+    openGate();
+    await provider.teardown();
+  });
+
+  it("a fallback that names the same model on the account is dropped (the SDK refuses it)", () => {
+    const br = account({ name: "br", kind: "bedrock", token: "t", env: { ANTHROPIC_DEFAULT_OPUS_MODEL: "team.opus" } });
+    expect(modelOptions("claude-opus-5-5", "claude-opus-4-8", br)).toEqual({ model: "opus" });
+    expect(modelOptions("claude-opus-5-5", "claude-sonnet-5", br)).toEqual({ model: "opus", fallbackModel: "claude-sonnet-5" });
+    expect(modelOptions(undefined, "claude-opus-4-8", br)).toEqual({ fallbackModel: "opus" });
+    expect(modelOptions("claude-opus-5-5", "claude-opus-4-8", null)).toEqual({ model: "claude-opus-5-5", fallbackModel: "claude-opus-4-8" });
+  });
+
+  it("other accounts report the catalog and pass models through", async () => {
+    const reported: unknown[] = [];
+    const provider = makeAccountProvider({ account: account({ name: "w", kind: "subscription", token: "t" }) }, (m) => reported.push(m));
+    provider.runTurn({ history: [], userMessage: "t1", workdir: "/tmp", model: "claude-opus-5-5", canUseTool: async () => ({ behavior: "allow" as const }) });
+    expect((capturedQueryOpts?.options as { model?: string }).model).toBe("claude-opus-5-5");
+    await new Promise((r) => setTimeout(r, 10));
+    expect(reported).toHaveLength(1);
+    openGate();
+    await provider.teardown();
   });
 
   it("a gateway account sets the base URL, its token and headers", async () => {

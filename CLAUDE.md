@@ -171,11 +171,13 @@ codeoid attach <n>   # interactive attach (with scrollback replay)
 codeoid send <n> <m> # one-shot message
 codeoid interrupt <n>
 codeoid approve <n> [--deny] [--pick N | --id <approvalId>] [--yes]
-codeoid account ls|login <name>|add-gateway|add-token|default <name>|use <session> <name>|--follow-default|rm <name>  # several Claude accounts (docs/CONFIGURATION.md)
+codeoid account ls|login <name>|add-key <name>|add-gateway|add-token|add-bedrock|default <name>|use <session> <name>|--follow-default|rm <name> [--backend <id>]  # accounts for every backend (docs/backend-accounts-design.md)
 codeoid destroy <n>
 codeoid mcp config [--scopes observe|operate|full]  # MCP client entry for /mcp/control
 codeoid mcp headers [--scopes …]                    # fresh bearer header (an MCP headersHelper)
 codeoid mcp reconnect <session> <server>            # redial a backend MCP server that's down (#389)
+codeoid mcp refresh <session>                       # apply MCP servers changed in Claude's config (#395)
+codeoid mcp approve <session> <server> [--path <f>] [--yes <fingerprint>]  # review, then approve a project's MCP server for every backend (#395)
 codeoid mcp adopt <server> [--session <s>] [--url <u>]  # codeoid signs in to a server from Claude's config (#390)
 codeoid mcp signin <server> [--callback-url <u>]        # sign in to an OAuth registry server
 codeoid routine add <name> --prompt … [--cron|--every|--at] [--check <cmd>]  # scheduled agent runs

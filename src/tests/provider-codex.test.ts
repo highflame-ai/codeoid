@@ -30,6 +30,8 @@ import { CodexRpcProcess } from "../daemon/providers/codex/rpc.js";
 import { CodexProvider, describeCodexError } from "../daemon/providers/codex/index.js";
 import { MemoryMcpHttp, MEMORY_MCP_SERVER_NAME } from "../daemon/memory/mcp-http.js";
 import { McpRegistry } from "../daemon/mcp/registry.js";
+import { MCP_PROXY_PATH_PREFIX, MCP_PROXY_TOKEN_ENV, McpProxy } from "../daemon/mcp/proxy.js";
+import { CODEOID_TOKEN_ENV_GLOB } from "../daemon/providers/codex/shell-env.js";
 import type { RawMcpServerConfig } from "../config.js";
 import { MemoryEngine } from "../daemon/memory/engine.js";
 import { SqliteEpisodeStore } from "../daemon/memory/store.js";
@@ -609,6 +611,30 @@ describe("CodexProvider over fake-codex", () => {
     await p.teardown();
   });
 
+  it("C5g: a thread it can't resume starts fresh WITH the history, never empty", async () => {
+    const p = new CodexProvider({
+      sessionId: "sess-1",
+      initialBackingId: "missing-thread-from-another-home",
+      command: process.execPath,
+      argsPrefix: [FIXTURE],
+      store: { setClaudeCodeSessionId: () => {} } as unknown as Store,
+      workspaceId: "wsX",
+    });
+    let lost = 0;
+    p.onHistoryLost = () => {
+      lost++;
+      p.seedFromHistory([
+        { role: "user", content: "what's the plan?" },
+        { role: "assistant", content: "ship the accounts work", providerId: "codex", model: "gpt-5" },
+      ]);
+    };
+    const events = await collect(p.runTurn(turnOpts("echo-prompt")));
+    await p.teardown();
+    expect(lost).toBe(1);
+    const done = events.find((e) => e.type === "text_done");
+    expect(done?.type === "text_done" && done.content).toContain("ship the accounts work");
+  });
+
   it("C6: requestUserInput select question round-trips the picked option", async () => {
     const p = makeProvider();
     const asked: string[] = [];
@@ -997,6 +1023,57 @@ describe("CodexProvider over fake-codex", () => {
     expect(joined).toContain('mcp_servers.ghstdio.env={ TOKEN = '); // TOML inline table, not JSON
     expect(joined).toContain("mcp_servers.linear.url=");
     expect(joined).toContain("mcp_servers.linear.bearer_token_env_var=");
+  });
+
+  it("C28 (#396): OAuth registry servers mount through the daemon's relay — token by env var, never argv, kept from codex's shell", async () => {
+    const raw = (p: Partial<RawMcpServerConfig>): RawMcpServerConfig =>
+      ({ args: [], env: {}, headers: {}, trust: "prompt", scope: "session", enabled: true, native: false, ...p }) as RawMcpServerConfig;
+    const reg = new McpRegistry(
+      {
+        notes: raw({ url: "https://notes.example.com/mcp", oauth: true }),
+        plain: raw({ url: "https://plain.example.com/mcp" }),
+      },
+      { memoryEnabled: false },
+    );
+    const proxy = new McpProxy({ registry: reg, credentials: null, baseUrl: () => "http://127.0.0.1:7400" });
+    const p = new CodexProvider({
+      sessionId: "sess-1",
+      initialBackingId: "sess-1",
+      command: process.execPath,
+      argsPrefix: [FIXTURE],
+      store: {} as Store,
+      mcpRegistry: reg,
+      tenant: { accountId: "a", projectId: "p" },
+      mcpProxy: proxy,
+    });
+    const events = await collect(p.runTurn(turnOpts("echo-mcp")));
+    const seen = JSON.parse((events.find((e) => e.type === "text_done") as { content: string }).content) as {
+      mcpArgs: string[];
+      proxyToken: string | null;
+      shellEnvArgs: string[];
+      argv: string[];
+    };
+    const joined = seen.mcpArgs.join(" ");
+    // The OAuth server at the relay, not at its own URL; the plain one directly.
+    expect(joined).toContain(`mcp_servers.notes.url="http://127.0.0.1:7400${MCP_PROXY_PATH_PREFIX}notes"`);
+    expect(joined).toContain(`mcp_servers.notes.bearer_token_env_var="${MCP_PROXY_TOKEN_ENV}"`);
+    expect(joined).not.toContain("notes.example.com");
+    expect(joined).toContain('mcp_servers.plain.url="https://plain.example.com/mcp"');
+    // The token: in codex's env, a live one, never on its argv, and excluded from its commands' env.
+    expect(seen.proxyToken).toBeTruthy();
+    expect(seen.argv.join(" ")).not.toContain(seen.proxyToken!);
+    expect(seen.shellEnvArgs.some((a) => a.includes(CODEOID_TOKEN_ENV_GLOB))).toBe(true);
+    const live = await proxy.handle(
+      new Request(proxy.url("notes"), { method: "POST", headers: { Authorization: `Bearer ${seen.proxyToken}`, Host: "127.0.0.1:7400" }, body: "{}" }),
+      true,
+    );
+    expect(live.status).not.toBe(403); // a known token: refused only for what it sent
+    await p.teardown();
+    const revoked = await proxy.handle(
+      new Request(proxy.url("notes"), { method: "POST", headers: { Authorization: `Bearer ${seen.proxyToken}`, Host: "127.0.0.1:7400" }, body: "{}" }),
+      true,
+    );
+    expect(revoked.status).toBe(403); // revoked with the backend
   });
 
   it("C12: rpc edges — spawn failure, request timeout, request/notify after exit", async () => {

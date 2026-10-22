@@ -7,7 +7,7 @@
  * pending approval).
  */
 
-import type { SessionInfo, SessionMessage, ToolState } from "../protocol/types.js";
+import type { ProviderInfo, SessionInfo, SessionMessage, ToolState } from "../protocol/types.js";
 
 /** UI-facing session state — derived from daemon events. */
 export interface TuiSession {
@@ -37,6 +37,7 @@ export interface TuiSession {
 
 /** Top-level TUI state. */
 export interface TuiState {
+  providers: ProviderInfo[];
   /** All sessions by id. */
   sessions: Map<string, TuiSession>;
   /** Ordered list of session ids for rendering. */
@@ -67,10 +68,21 @@ export type ModalState =
   | { kind: "confirm-destroy"; sessionId: string }
   | { kind: "help" }
   | { kind: "search"; query: string }
-  | { kind: "model" };
+  /**
+   * Backend pickers carry the session they were opened for, so a focus
+   * change while one is open (reconnect, sessions.set) cannot retarget it.
+   */
+  | { kind: "model" | "provider"; sessionId: string }
+  /**
+   * The account picker also carries the backend whose accounts it lists: if
+   * the session moves to another backend while it is open, it closes rather
+   * than quietly offering (or applying) another backend's accounts.
+   */
+  | { kind: "account"; sessionId: string; backend: string };
 
 /** UI action type — reducer fan-in. */
 export type TuiAction =
+  | { type: "providers.set"; providers: ProviderInfo[] }
   | { type: "connection.change"; state: TuiState["connection"] }
   | { type: "error"; message: string }
   | { type: "sessions.set"; sessions: SessionInfo[] }

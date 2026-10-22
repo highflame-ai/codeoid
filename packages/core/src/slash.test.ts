@@ -235,6 +235,7 @@ describe("dispatchSlash", () => {
     expect(parseSlash("/mcp reconnect slack")).toEqual({ kind: "mcp-reconnect", server: "slack" });
     expect(parseSlash("/mcp reconnect")).toEqual({ kind: "capabilities", tab: "mcp" });
     expect(parseSlash("/mcp reconnect claude.ai Gmail")).toEqual({ kind: "mcp-reconnect", server: "claude.ai Gmail" });
+    expect(parseSlash("/mcp refresh")).toEqual({ kind: "mcp-refresh" }); // #395
     expect(parseSlash("/hooks")).toEqual({ kind: "capabilities", tab: "hooks" });
     expect(parseSlash("/hook")).toEqual({ kind: "capabilities", tab: "hooks" });
   });
@@ -357,5 +358,20 @@ describe("/provider", () => {
       sessionId: c.sessionId,
       providerId: "pi",
     });
+  });
+});
+
+describe("/account", () => {
+  it("parses a name, default, or --follow-default, and requires one", () => {
+    expect(parseSlash("/account Work-Max")).toEqual({ kind: "account", account: "work-max" });
+    expect(parseSlash("/account default")).toEqual({ kind: "account", account: "default" });
+    expect(parseSlash("/account --follow-default")).toEqual({ kind: "account", account: null });
+    expect(() => parseSlash("/account")).toThrow(/\/account <name>/);
+  });
+
+  it("dispatches session.set_claude_account", () => {
+    const c = ctx();
+    dispatchSlash({ kind: "account", account: null }, c);
+    expect(c.sent[0]).toMatchObject({ type: "session.set_claude_account", sessionId: c.sessionId, account: null });
   });
 });

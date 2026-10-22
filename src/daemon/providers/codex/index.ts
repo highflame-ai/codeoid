@@ -73,8 +73,12 @@ import {
   BLACKBOARD_MCP_SERVER_NAME,
   BLACKBOARD_MCP_TOKEN_ENV,
 } from "../../blackboard/mcp-http.js";
-import type { McpRegistry } from "../../mcp/registry.js";
+import type { McpServerView } from "../../mcp/registry.js";
+import { MCP_PROXY_TOKEN_ENV, McpProxyLease, type McpProxyMount } from "../../mcp/proxy.js";
+import { codexKeySafe, codexShellEnvExcludeArgs } from "./shell-env.js";
 import { resolveEnvMap } from "../../mcp/types.js";
+import type { ResolvedAccount } from "../../accounts.js";
+import { applyCodexAccount } from "../../account-apply.js";
 
 /** codex `tokenUsage.last` / `.total` shape (thread/tokenUsage/updated). */
 interface CodexTokenUsage {
@@ -103,6 +107,9 @@ export interface CodexProviderInit {
    * codex can page the verbatim store on demand — the precondition for VWS.
    */
   memoryMcp?: MemoryMcpMount;
+  /** The daemon's OAuth MCP relay (#396): how this backend reaches the
+   *  registry's OAuth servers without holding their tokens. */
+  mcpProxy?: McpProxyMount;
   /**
    * Role-scoped goal-blackboard mount, resolved LAZILY.
    *
@@ -115,7 +122,13 @@ export interface CodexProviderInit {
 
   /** Cross-backend MCP registry — external servers mount natively via `-c
    *  mcp_servers.*` (codex owns its client); approval flows through canUseTool. */
-  mcpRegistry?: McpRegistry;
+  mcpRegistry?: McpServerView;
+  /**
+   * This session's account for the backend, resolved when the process is
+   * spawned (accounts.ts); null = the daemon's own login. Throws when the
+   * chosen account can't be used — the turn fails, never another credential.
+   */
+  resolveAccount?: () => ResolvedAccount | null;
   onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
 }
 
@@ -262,17 +275,19 @@ export class CodexProvider implements SessionProvider {
   readonly displayName = "Codex (OpenAI)";
 
   onRecoveryNeeded: ((content: string) => void) | undefined;
+  onHistoryLost: (() => void) | undefined;
 
   #sessionId: string;
   #backingSessionId: string;
   #command: string;
   #argsPrefix: string[];
+  #resolveAccount: (() => ResolvedAccount | null) | null;
   #onModels?: CodexProviderInit["onModels"];
   #workspaceId: string;
   #memoryMcp: MemoryMcpMount | null;
   /** Role-scoped blackboard mount; token minted+revoked by the SessionManager. */
   readonly #blackboardMcp: (() => { url: string; token: string } | undefined) | null;
-  #mcpRegistry: McpRegistry | null;
+  #mcpRegistry: McpServerView | null;
   /** Live scoped token for the mounted memory endpoint; revoked on teardown. */
   #memoryToken: string | null = null;
 
@@ -340,18 +355,25 @@ export class CodexProvider implements SessionProvider {
    *  server. A LIST: two calls to one server can be in flight at once, and the
    *  elicitation names only the server (#368). */
   #pendingMcpCalls = new Map<string, Array<{ itemId: string; tool: string; input: Record<string, unknown> }>>();
+  /** This backend's proxy token for the registry's OAuth servers. */
+  readonly #proxy: McpProxyLease;
 
   constructor(init: CodexProviderInit) {
     this.#store = init.store;
     this.#sessionId = init.sessionId;
     this.#backingSessionId = init.initialBackingId;
     this.#command = init.command;
+    this.#resolveAccount = init.resolveAccount ?? null;
     this.#argsPrefix = init.argsPrefix ?? [];
     this.#onModels = init.onModels;
     this.#workspaceId = init.workspaceId ?? init.sessionId;
     this.#memoryMcp = init.memoryMcp ?? null;
     this.#blackboardMcp = init.blackboardMcp ?? null;
     this.#mcpRegistry = init.mcpRegistry ?? null;
+    this.#proxy = new McpProxyLease(
+      init.mcpProxy,
+      init.tenant ? { tenant: init.tenant, sessionId: init.sessionId, backendId: this.id } : null,
+    );
   }
 
   /**
@@ -525,6 +547,10 @@ export class CodexProvider implements SessionProvider {
     const args: string[] = [];
     const env: Record<string, string> = {};
     for (const spec of reg.forNativeMount(this.id)) {
+      if (!codexKeySafe(spec.name)) {
+        console.warn(`[codeoid] codex: MCP server "${spec.name}" isn't mounted — codex can't take that name as a config key`);
+        continue;
+      }
       const key = `mcp_servers.${spec.name}`;
       const t = spec.transport;
       if (t.kind === "stdio") {
@@ -542,6 +568,29 @@ export class CodexProvider implements SessionProvider {
       }
     }
     return { args, env };
+  }
+
+  /**
+   * The registry's OAuth servers, through the daemon's relay (#396): each
+   * server's relay URL, and the proxy token by env-var name — never on argv,
+   * where any local process could read it. Re-minted per app-server spawn
+   * (the previous token revoked), revoked on teardown. The commands codex
+   * runs don't inherit it (codexShellEnvExcludeArgs).
+   */
+  #proxyMcpSpawn(): { args: string[]; env: Record<string, string> } {
+    const lease = this.#proxy.renew();
+    if (!lease) return { args: [], env: {} };
+    const args: string[] = [];
+    for (const server of lease.servers) {
+      if (!codexKeySafe(server.name)) {
+        console.warn(`[codeoid] codex: MCP server "${server.name}" isn't mounted — codex can't take that name as a config key`);
+        continue;
+      }
+      const key = `mcp_servers.${server.name}`;
+      args.push("-c", `${key}.url=${JSON.stringify(server.url)}`);
+      args.push("-c", `${key}.bearer_token_env_var=${JSON.stringify(MCP_PROXY_TOKEN_ENV)}`);
+    }
+    return { args, env: { [MCP_PROXY_TOKEN_ENV]: lease.token } };
   }
 
   runTurn(opts: TurnOpts): TurnRun {
@@ -624,6 +673,7 @@ export class CodexProvider implements SessionProvider {
       this.#memoryMcp?.endpoint.revoke(this.#memoryToken);
       this.#memoryToken = null;
     }
+    this.#proxy.revoke();
   }
 
   // ── Internal ──────────────────────────────────────────────────────────
@@ -662,12 +712,26 @@ export class CodexProvider implements SessionProvider {
       const mcp = this.#memoryMcpSpawn();
       const bb = this.#blackboardMcpSpawn();
       const reg = this.#registryMcpArgs();
+      const shellEnv = codexShellEnvExcludeArgs();
+      // Without the exclude, the proxy token would reach the commands codex runs.
+      const oauth = shellEnv ? this.#proxyMcpSpawn() : { args: [], env: {} };
+      if (!shellEnv) {
+        console.warn(
+          "[codeoid] codex: its config.toml couldn't be read here, so codeoid can't add its token variables to shell_environment_policy.exclude — OAuth MCP servers aren't mounted, and codeoid's memory/blackboard tokens rely on Codex's default excludes",
+        );
+      }
       this.#proc = new CodexRpcProcess({
         command: this.#command,
         argsPrefix: this.#argsPrefix,
-        args: [...mcp.args, ...bb.args, ...reg.args],
+        args: [...mcp.args, ...bb.args, ...reg.args, ...oauth.args, ...(shellEnv ?? [])],
         cwd: opts.workdir,
-        env: { ...buildCodexEnv(), ...mcp.env, ...bb.env, ...reg.env },
+        // The account's own CODEX_HOME (an overlay sharing everything but its
+        // auth.json), applied last so nothing re-adds a daemon key.
+        env: await applyCodexAccount(
+          this.#resolveAccount?.() ?? null,
+          { ...buildCodexEnv(), ...mcp.env, ...bb.env, ...reg.env, ...oauth.env },
+          { command: this.#command, argsPrefix: this.#argsPrefix },
+        ),
         onNotification: (method, params) => this.#onNotification(method, params),
         onServerRequest: (method, params) => this.#onServerRequest(method, params),
         onExit: ({ code, signal, stderrTail }) => {
@@ -710,6 +774,15 @@ export class CodexProvider implements SessionProvider {
         }
       } catch {
         /* fall through to thread/start */
+      }
+      // The thread is gone (another account's home, a pruned rollout): a
+      // fresh one must not start the conversation over — take the history.
+      // Unless the session already queued what this thread gets (a switch,
+      // rewind or overflow retry chose a transcript or a session map, sized
+      // for the model): that is never overwritten.
+      if (this.#pendingHistorySeed === null) {
+        console.warn(`[codex-provider ${this.#sessionId.slice(0, 8)}] couldn't resume thread ${this.#backingSessionId} — continuing from codeoid's history`);
+        this.onHistoryLost?.();
       }
     }
     const started = (await this.#proc.request("thread/start", threadConfig(opts))) as { thread?: { id?: string } };

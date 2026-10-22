@@ -39,7 +39,7 @@ import {
 } from "../../memory/index.js";
 import { BLACKBOARD_MCP_SERVER_NAME } from "../../blackboard/mcp-http.js";
 import type { McpHub } from "../../mcp/hub.js";
-import type { McpRegistry } from "../../mcp/registry.js";
+import type { McpServerView } from "../../mcp/registry.js";
 import { oauthServersForClaude } from "./oauth-bridge.js";
 import { mcpToolPrefix, resolveEnvMap } from "../../mcp/types.js";
 import type { CompressionRegistry } from "../../compress/index.js";
@@ -161,7 +161,7 @@ export interface ClaudeProviderInit {
   blackboardMcp?: () => { url: string; token: string } | undefined;
   /** Cross-backend MCP registry — external servers are mounted natively on the
    *  SDK (claude owns its own MCP client); approval flows through canUseTool. */
-  mcpRegistry?: McpRegistry;
+  mcpRegistry?: McpServerView;
   /** The daemon-owned MCP client — what an OAuth registry server is called
    *  through, as the session's tenant (#390). */
   mcpHub?: McpHub;
@@ -872,8 +872,8 @@ export class ClaudeProvider implements SessionProvider {
         // anything for them. (The raw chain of thought is never exposed on any
         // model; this is a summary of it.)
         thinking: { type: "adaptive" as const, display: "summarized" as const },
-        ...(opts.model ? { model: opts.model } : {}),
-        ...(opts.fallbackModel ? { fallbackModel: opts.fallbackModel } : {}),
+        // An account may name models its own way (a Bedrock account's mappings).
+        ...modelOptions(opts.model, opts.fallbackModel, account),
         ...(opts.maxBudgetUsd !== undefined ? { maxBudgetUsd: opts.maxBudgetUsd } : {}),
         stderr: (data: string) => {
           process.stderr.write(`[claude-subprocess ${sessionId.slice(0, 8)}] ${data}`);
@@ -1076,8 +1076,10 @@ export class ClaudeProvider implements SessionProvider {
 
     this.#hasQueried = true;
 
-    // Fetch the live model catalog best-effort.
-    if (init.onModels) {
+    // Fetch the live model catalog best-effort. Not from a Bedrock account:
+    // its catalog lists that endpoint's ids, and the cache is every Claude
+    // session's, whatever its account.
+    if (init.onModels && account?.kind !== "bedrock") {
       void this.#query
         .supportedModels()
         .then((m) => init.onModels?.(m))
@@ -2063,7 +2065,7 @@ function shellQuote(value: string): string {
  *  McpServerConfigs — a native mount, since claude's SDK owns its MCP client.
  *  `${VAR}` env refs and a `bearerTokenEnv` are resolved against the daemon env
  *  here so secrets never live in config; tool calls gate via canUseTool. */
-export function registryServersForClaude(registry: McpRegistry | undefined): Record<string, McpServerConfig> {
+export function registryServersForClaude(registry: McpServerView | undefined): Record<string, McpServerConfig> {
   if (!registry) return {};
   const out: Record<string, McpServerConfig> = {};
   for (const spec of registry.forNativeMount("claude")) {
@@ -2167,6 +2169,22 @@ export function parseMcpServerConfig(value: unknown): McpServerConfig | null {
  *
  * Pure + exported for unit testing.
  */
+/**
+ * The model and fallback to hand the CLI, through the account's own naming.
+ * Two ids can name one model there (a Bedrock account maps a whole family to
+ * one alias), and the SDK refuses a fallback equal to the model — so then the
+ * fallback is dropped: it would be the same model anyway.
+ */
+export function modelOptions(
+  model: string | undefined,
+  fallbackModel: string | undefined,
+  account: { model(m: string): string } | null,
+): { model?: string; fallbackModel?: string } {
+  const m = model ? (account ? account.model(model) : model) : undefined;
+  const f = fallbackModel ? (account ? account.model(fallbackModel) : fallbackModel) : undefined;
+  return { ...(m ? { model: m } : {}), ...(f && f !== m ? { fallbackModel: f } : {}) };
+}
+
 export function buildAgentEnv(
   base: Record<string, string | undefined> = process.env,
   opts: { gatewayCredential?: string } = {},

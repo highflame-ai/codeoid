@@ -23,6 +23,7 @@ import ApprovalBar from "./transcript/ApprovalBar";
 import UiRequestBar from "./transcript/UiRequestBar";
 import PromptBox from "./prompt/PromptBox";
 import SessionControls from "./SessionControls";
+import { AccountChip } from "./AccountChip";
 import Transcript from "./transcript/Transcript";
 import FleetRail from "./FleetRail";
 import WorkerIndicator from "./transcript/WorkerIndicator";
@@ -117,6 +118,7 @@ const SessionHeader: Component = () => (
                 {s().model}
               </span>
             </Show>
+            <AccountChip session={s()} />
             <span class="ml-auto font-mono text-[11px] text-fg-faint">
               created {relativeTime(s().createdAt, nowTick())}
             </span>

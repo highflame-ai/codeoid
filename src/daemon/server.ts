@@ -41,6 +41,7 @@ import { McpHub } from "./mcp/hub.js";
 import { MCP_OAUTH_CALLBACK_PATH, McpOAuth, mcpOAuthBindingCookieName } from "./mcp/oauth.js";
 import { redact } from "./auth/backend-login.js";
 import { importClaudeMcpServers } from "./mcp/import-claude.js";
+import { isLoopbackAddress, MCP_PROXY_PATH_PREFIX, McpProxy } from "./mcp/proxy.js";
 import {
   type CompressionRegistry,
   createRegistry,
@@ -211,6 +212,7 @@ export class DaemonServer {
   #memoryMcp: MemoryMcpHttp | null = null;
   #mcpRegistry: McpRegistry | null = null;
   #mcpHub: McpHub | null = null;
+  #mcpProxy: McpProxy | null = null;
   #bunServer: ReturnType<typeof Bun.serve> | null = null;
   /** Capabilities advertised on auth.ok — SERVER_CAPABILITIES plus PUSH when a
    *  push transport is configured, so clients can feature-detect push support. */
@@ -371,7 +373,10 @@ export class DaemonServer {
     this.#shutdown.register("memory", async () => {
       if (this.#memory) await this.#memory.close();
     });
-    this.#shutdown.register("mcp", () => this.#mcpHub?.closeAll());
+    this.#shutdown.register("mcp", async () => {
+      await this.#mcpProxy?.closeAll();
+      this.#mcpHub?.closeAll();
+    });
     this.#shutdown.register("store", () => this.#store.close());
     this.#shutdown.register("sessions", () => this.#manager.drain(10_000));
     // LIFO: registered after sessions → stops BEFORE the drain, so the
@@ -513,8 +518,10 @@ export class DaemonServer {
     const mcpServers = { ...imported, ...(this.#config.fullConfig?.mcpServers ?? {}) };
     const importedCount = Object.keys(imported).length;
     if (importedCount > 0) console.log(`[codeoid] mcp: imported ${importedCount} server(s) from ~/.claude.json`);
+    const explicit = new Set(Object.keys(this.#config.fullConfig?.mcpServers ?? {}));
     this.#mcpRegistry = new McpRegistry(mcpServers, {
       memoryEnabled: this.#memory != null,
+      imported: new Set(Object.keys(imported).filter((n) => !explicit.has(n))),
     });
     // OAuth for remote servers is codeoid's own — no Highflame dependency. The
     // redirect is the daemon's loopback unless an externally reachable base is
@@ -531,6 +538,17 @@ export class DaemonServer {
       daemonEnv: process.env,
       credentials: mcpOAuth,
     });
+    // The relay for backends that own their MCP clients (#396). Its URL is the
+    // loopback, whatever the daemon binds: the agent subprocess is local.
+    this.#mcpProxy = new McpProxy({
+      registry: this.#mcpRegistry,
+      credentials: mcpOAuth,
+      hub: this.#mcpHub,
+      baseUrl: () => `http://127.0.0.1:${this.#config.port}`,
+      env: process.env,
+      requestTimeoutMs: this.#config.fullConfig?.session.mcpToolTimeoutMs,
+    });
+    this.#mcpHub.proxy = this.#mcpProxy;
     for (const w of this.#mcpRegistry.warnings) console.warn(`[codeoid] ${w}`);
     // Goal blackboard: loopback URL regardless of bind address — the agent
     // subprocess runs on this host, and the endpoint must not become
@@ -604,6 +622,19 @@ export class DaemonServer {
         // request 401s anyway.
         if (url.pathname === BLACKBOARD_MCP_PATH) {
           return self.#manager.blackboardMcp.handle(req);
+        }
+
+        // OAuth MCP relay (#396): Codex, the Gemini CLI and Qwen mount OAuth
+        // servers here with a per-session proxy token. Loopback peers only,
+        // whatever the daemon binds: the agents run on this host.
+        if (url.pathname.startsWith(MCP_PROXY_PATH_PREFIX)) {
+          const proxy = self.#mcpProxy;
+          if (!proxy) return new Response("not found", { status: 404 });
+          return proxy.handle(req, isLoopbackAddress(server.requestIP(req)?.address), {
+            // A relayed call may stay quiet as long as its tool runs (or a
+            // person answers the server): not the daemon's 10 s idle cut.
+            liftIdleTimeout: () => server.timeout(req, 0),
+          });
         }
 
         // Outward control plane (#251). Authorizes with the SAME verifier as
@@ -838,6 +869,7 @@ export class DaemonServer {
               // Registered backends, default first — feeds the new-session
               // provider picker (see AuthOkMsg.providers).
               providers: self.#manager.providerIds(),
+              providerInfo: self.#manager.providerInfo(),
               // Which issuer authenticated this connection. Clients render
               // "local" as a visible badge — degradation must never be silent.
               authMode: self.#verifier.mode,

@@ -38,6 +38,11 @@ test("every ClientMessage variant has a schema and vice versa (compile-time)", (
   expect(covered).toBe(true);
 });
 
+test("endpoint overrides can be explicitly removed without stripping nulls", () => {
+  const message: ClientMessage = { type: "endpoints.set", id: "clear", name: "box", baseUrl: "http://localhost:8000/v1", defaultModel: null, contextWindow: null };
+  expect(parseClientMessage(message)).toEqual({ ok: true, value: message });
+});
+
 // ── 2. Fidelity: one valid sample per variant, keyed so adding a variant
 //      without a sample is a compile error ─────────────────────────────────────
 
@@ -95,6 +100,9 @@ const samples: { [T in ClientTypes]: Extract<ClientMessage, { type: T }> } = {
   "session.search": { type: "session.search", id: "r14", query: "auth bug", scope: "all", limit: 5 },
   "session.set_model": { type: "session.set_model", id: "r15", sessionId: "s1", model: "opus", fallbackModel: null },
   "session.mcp_reconnect": { type: "session.mcp_reconnect", id: "r28m", sessionId: "s1", server: "slack" },
+  "session.mcp_refresh": { type: "session.mcp_refresh", id: "r28r", sessionId: "s1" },
+  "mcp.approve.preview": { type: "mcp.approve.preview", id: "r28p", sessionId: "s1", server: "db" },
+  "mcp.approve": { type: "mcp.approve", id: "r28a", sessionId: "s1", server: "db", path: "/w/.mcp.json", fingerprint: "0123456789abcdef0123456789abcdef" },
   "session.set_provider": {
     type: "session.set_provider",
     id: "r28",
@@ -135,6 +143,7 @@ const samples: { [T in ClientTypes]: Extract<ClientMessage, { type: T }> } = {
     loginId: "11111111-2222-3333-4444-555555555555",
     code: "abc123#state",
   },
+  "backend.login.wait": { type: "backend.login.wait", id: "lw1", loginId: "l1" },
   "backend.login.cancel": {
     type: "backend.login.cancel",
     id: "r27",
@@ -155,7 +164,25 @@ const samples: { [T in ClientTypes]: Extract<ClientMessage, { type: T }> } = {
   "claude.accounts.set": { type: "claude.accounts.set", id: "ca2", name: "work", kind: "gateway", token: "t", baseUrl: "https://gw.example", headers: { "x-workspace": "w1" } },
   "claude.accounts.remove": { type: "claude.accounts.remove", id: "ca3", name: "work" },
   "claude.accounts.set_default": { type: "claude.accounts.set_default", id: "ca4", name: "work" },
+  "providers.list": { type: "providers.list", id: "pl1" },
+  "endpoints.list": { type: "endpoints.list", id: "ep1" },
+  "endpoints.set": {
+    type: "endpoints.set",
+    id: "ep2",
+    name: "vllm",
+    baseUrl: "http://gpu-box:8000/v1",
+    apiKey: null,
+    models: [{ id: "qwen3-coder", contextWindow: 131072 }],
+    mcpServers: ["github"],
+  },
+  "endpoints.remove": { type: "endpoints.remove", id: "ep3", name: "vllm" },
+  "endpoints.test": { type: "endpoints.test", id: "ep4", name: "vllm", baseUrl: "http://gpu-box:8001/v1" },
   "session.set_claude_account": { type: "session.set_claude_account", id: "ca5", sessionId: "s1", account: null },
+  "accounts.list": { type: "accounts.list", id: "ac1", backend: "codex" },
+  "accounts.set": { type: "accounts.set", id: "ac2", backend: "pi", name: "team", kind: "api-keys", env: { OPENROUTER_API_KEY: "k" }, replace: true },
+  "accounts.remove": { type: "accounts.remove", id: "ac3", backend: "codex", name: "work" },
+  "accounts.set_default": { type: "accounts.set_default", id: "ac4", backend: "oai:qwen", name: "team" },
+  "session.set_account": { type: "session.set_account", id: "ac5", sessionId: "s1", account: "work", backend: "codex" },
   "session.compare": { type: "session.compare", id: "r96", sessionId: "s1", prompt: "go", targets: [{ providerId: "claude" }, { providerId: "codex", model: "gpt-5" }] },
   "compare.get": { type: "compare.get", id: "r97", compareId: "c1" },
   "compare.list": { type: "compare.list", id: "r98", sessionId: "s1" },

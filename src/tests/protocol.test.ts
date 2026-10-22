@@ -456,6 +456,8 @@ describe("DaemonMessage routing", () => {
           return `login.submit:${msg.ok}`;
         case "backend.login.cancel.result":
           return `login.cancel:${msg.ok}`;
+        case "backend.login.wait.result":
+          return `login.wait:${msg.ok}`;
         case "skill.grant.result":
           return `skill.grant:${msg.allowed}`;
         case "session.turns.result":
@@ -464,6 +466,18 @@ describe("DaemonMessage routing", () => {
           return `approvals:${msg.approvals.length}`;
         case "claude.accounts.result":
           return `claude-accounts:${msg.accounts.length}`;
+        case "accounts.result":
+          return `accounts:${msg.backends.length}`;
+        case "accounts.changed":
+          return `accounts.changed:${msg.backend}`;
+        case "providers.result":
+          return `providers:${msg.providers.length}`;
+        case "providers.changed":
+          return `providers.changed:${msg.providers.length}`;
+        case "endpoints.result":
+          return `endpoints:${msg.endpoints.length}`;
+        case "endpoints.test.result":
+          return `endpoints.test:${msg.ok}`;
         case "session.rewind.result":
           return `rewind:${msg.removedTurns}`;
         case "compare.state":

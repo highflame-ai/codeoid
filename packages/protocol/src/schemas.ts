@@ -109,6 +109,7 @@ export const sessionCreateSchema = z.object({
    */
   providerId: z.string().min(1).max(64).optional(),
   claudeAccount: z.string().min(1).max(64).optional(),
+  account: z.string().min(1).max(64).optional(),
   /**
    * Collaborative session config (docs/collaborative-session-design.md §9).
    *
@@ -286,6 +287,29 @@ export const sessionMcpReconnectSchema = z.object({
   sessionId: sessionIdField,
   // Server names as backends report them, e.g. "slack", "claude.ai Gmail".
   server: z.string().regex(/^[\w .:()-]{1,128}$/),
+});
+
+export const sessionMcpRefreshSchema = z.object({
+  ...base,
+  type: z.literal("session.mcp_refresh"),
+  sessionId: sessionIdField,
+});
+
+export const mcpApproveSchema = z.object({
+  ...base,
+  type: z.literal("mcp.approve"),
+  sessionId: sessionIdField,
+  server: z.string().regex(/^[\w .:()-]{1,128}$/),
+  path: z.string().max(4096).optional(),
+  fingerprint: z.string().regex(/^[0-9a-f]{32}$/),
+});
+
+export const mcpApprovePreviewSchema = z.object({
+  ...base,
+  type: z.literal("mcp.approve.preview"),
+  sessionId: sessionIdField,
+  server: z.string().regex(/^[\w .:()-]{1,128}$/),
+  path: z.string().max(4096).optional(),
 });
 
 export const sessionSetProviderSchema = z.object({
@@ -485,7 +509,7 @@ export const settingsSetSchema = z.object({
  * it can name belongs in the validated surface rather than in a lookup that
  * happens to miss.
  */
-const loginBackendField = z.enum(["claude"]);
+const loginBackendField = z.enum(["claude", "codex"]);
 
 const claudeAccountNameField = z.string().min(1).max(64);
 
@@ -494,6 +518,56 @@ export const backendLoginStartSchema = z.object({
   type: z.literal("backend.login.start"),
   backend: loginBackendField,
   account: claudeAccountNameField.optional(),
+  replace: z.boolean().optional(),
+});
+
+/**
+ * A backend id an account belongs to. A bounded string, not an enum, so a
+ * frame for a backend this daemon lacks still parses and gets a specific
+ * error; the daemon checks it against the kinds it knows.
+ */
+const accountBackendField = z.string().min(1).max(64);
+const accountNameField = z.string().min(1).max(64);
+
+export const accountsListSchema = z.object({
+  ...base,
+  type: z.literal("accounts.list"),
+  backend: accountBackendField.optional(),
+});
+
+export const accountsSetSchema = z.object({
+  ...base,
+  type: z.literal("accounts.set"),
+  backend: accountBackendField,
+  name: accountNameField,
+  kind: z.enum(["subscription", "gateway", "api-key", "chatgpt-login", "api-keys", "bedrock"]),
+  token: z.string().min(1).max(8192).optional(),
+  baseUrl: z.string().min(1).max(2048).optional(),
+  headers: z.record(z.string().min(1).max(256), z.string().max(8192)).optional(),
+  env: z.record(z.string().min(1).max(128), z.string().min(1).max(8192)).optional(),
+  replace: z.boolean().optional(),
+});
+
+export const accountsRemoveSchema = z.object({
+  ...base,
+  type: z.literal("accounts.remove"),
+  backend: accountBackendField,
+  name: accountNameField,
+});
+
+export const accountsSetDefaultSchema = z.object({
+  ...base,
+  type: z.literal("accounts.set_default"),
+  backend: accountBackendField,
+  name: accountNameField,
+});
+
+export const sessionSetAccountSchema = z.object({
+  ...base,
+  type: z.literal("session.set_account"),
+  sessionId: sessionIdField,
+  account: accountNameField.nullable(),
+  backend: accountBackendField.optional(),
 });
 
 export const claudeAccountsListSchema = z.object({
@@ -530,11 +604,70 @@ export const sessionSetClaudeAccountSchema = z.object({
   account: claudeAccountNameField.nullable(),
 });
 
+const endpointNameField = z.string().min(1).max(64);
+const endpointHeadersField = z.record(z.string().min(1).max(256), z.string().max(8192));
+const endpointModelField = z.object({
+  id: z.string().min(1).max(256),
+  name: z.string().min(1).max(256).optional(),
+  contextWindow: z.number().int().positive().optional(),
+  maxTokens: z.number().int().positive().optional(),
+});
+
+export const providersListSchema = z.object({
+  ...base,
+  type: z.literal("providers.list"),
+});
+
+export const endpointsListSchema = z.object({
+  ...base,
+  type: z.literal("endpoints.list"),
+});
+
+export const endpointsSetSchema = z.object({
+  ...base,
+  type: z.literal("endpoints.set"),
+  name: endpointNameField,
+  displayName: z.string().max(128).optional(),
+  baseUrl: z.string().min(1).max(2048),
+  flavor: z.enum(["openai", "llamacpp"]).optional(),
+  apiKey: z.string().max(8192).nullable().optional(),
+  headers: endpointHeadersField.optional(),
+  models: z.array(endpointModelField).max(500).optional(),
+  defaultModel: z.string().min(1).max(256).nullable().optional(),
+  contextWindow: z.number().int().positive().nullable().optional(),
+  mcpServers: z.union([z.literal("all"), z.array(z.string().min(1).max(128)).max(200)]).optional(),
+  streamUsage: z.boolean().optional(),
+  strictToolSchemas: z.boolean().optional(),
+  maxTokensField: z.enum(["max_tokens", "max_completion_tokens"]).optional(),
+});
+
+export const endpointsRemoveSchema = z.object({
+  ...base,
+  type: z.literal("endpoints.remove"),
+  name: endpointNameField,
+});
+
+export const endpointsTestSchema = z.object({
+  ...base,
+  type: z.literal("endpoints.test"),
+  name: endpointNameField.optional(),
+  baseUrl: z.string().min(1).max(2048).optional(),
+  flavor: z.enum(["openai", "llamacpp"]).optional(),
+  apiKey: z.string().max(8192).nullable().optional(),
+  headers: endpointHeadersField.optional(),
+});
+
 export const backendLoginSubmitSchema = z.object({
   ...base,
   type: z.literal("backend.login.submit"),
   loginId: z.string().min(1).max(128),
   code: z.string().min(1).max(LIMITS.LOGIN_CODE_MAX),
+});
+
+export const backendLoginWaitSchema = z.object({
+  ...base,
+  type: z.literal("backend.login.wait"),
+  loginId: z.string().min(1).max(128),
 });
 
 export const backendLoginCancelSchema = z.object({
@@ -960,6 +1093,9 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   sessionSetModelSchema,
   sessionSetProviderSchema,
   sessionMcpReconnectSchema,
+  sessionMcpRefreshSchema,
+  mcpApproveSchema,
+  mcpApprovePreviewSchema,
   sessionForkSchema,
   scrollbackPageSchema,
   sessionRenameSchema,
@@ -979,6 +1115,7 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   backendLoginStartSchema,
   backendLoginSubmitSchema,
   backendLoginCancelSchema,
+  backendLoginWaitSchema,
   skillGrantSchema,
   sessionTurnsSchema,
   sessionApprovalsSchema,
@@ -987,6 +1124,16 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   claudeAccountsRemoveSchema,
   claudeAccountsSetDefaultSchema,
   sessionSetClaudeAccountSchema,
+  accountsListSchema,
+  accountsSetSchema,
+  accountsRemoveSchema,
+  accountsSetDefaultSchema,
+  sessionSetAccountSchema,
+  providersListSchema,
+  endpointsListSchema,
+  endpointsSetSchema,
+  endpointsRemoveSchema,
+  endpointsTestSchema,
   sessionRewindSchema,
   sessionCompareSchema,
   compareGetSchema,

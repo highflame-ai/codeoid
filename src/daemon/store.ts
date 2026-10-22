@@ -372,6 +372,21 @@ export class Store {
         PRIMARY KEY (account_id, project_id, workdir, provider_id, model)
       );
 
+      -- A repo's MCP server (a workdir's .mcp.json or project settings)
+      -- approved in codeoid to reach every backend there (#395). Bound to the
+      -- entry's fingerprint: a repo that edits the entry needs consent again.
+      -- Tenant- and workdir-scoped, like the sessions that use it.
+      CREATE TABLE IF NOT EXISTS mcp_workdir_approvals (
+        account_id  TEXT NOT NULL,
+        project_id  TEXT NOT NULL,
+        workdir     TEXT NOT NULL,
+        server      TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        approved_by TEXT NOT NULL,
+        approved_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (account_id, project_id, workdir, server, fingerprint)
+      );
+
       -- OAuth credentials for remote MCP servers (docs/mcp-oauth-design.md),
       -- one row per tenant, server and server URL: the registered client
       -- (dynamic registration result) and the tokens, with when they were
@@ -1598,6 +1613,29 @@ export class Store {
            cached_at = excluded.cached_at`,
       )
       .run(providerId, JSON.stringify(models));
+  }
+
+  /** Approve a repo's MCP server (this exact entry) for every backend in a workdir (#395). */
+  approveWorkdirMcpServer(
+    scope: { accountId: string; projectId: string; workdir: string },
+    server: string,
+    fingerprint: string,
+    approvedBy: string,
+  ): void {
+    this.#db
+      .prepare(
+        `INSERT OR IGNORE INTO mcp_workdir_approvals (account_id, project_id, workdir, server, fingerprint, approved_by)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(scope.accountId, scope.projectId, scope.workdir, server, fingerprint, approvedBy);
+  }
+
+  /** The (server, fingerprint) pairs a tenant approved for a workdir. */
+  workdirMcpApprovals(scope: { accountId: string; projectId: string; workdir: string }): Set<string> {
+    const rows = this.#db
+      .prepare("SELECT server, fingerprint FROM mcp_workdir_approvals WHERE account_id = ? AND project_id = ? AND workdir = ?")
+      .all(scope.accountId, scope.projectId, scope.workdir) as { server: string; fingerprint: string }[];
+    return new Set(rows.map((r) => `${r.server}\u0000${r.fingerprint}`));
   }
 
   /** Persist a window a completed turn reported, in the scope it was seen. */

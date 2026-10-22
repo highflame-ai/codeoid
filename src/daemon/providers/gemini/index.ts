@@ -44,12 +44,14 @@ import {
   memoryToolsAsGemini,
 } from "../tool-loop.js";
 import { SessionMcpTools } from "../../mcp/tool-source.js";
-import type { McpRegistry } from "../../mcp/registry.js";
+import type { McpServerView } from "../../mcp/registry.js";
 import type { McpHub } from "../../mcp/hub.js";
 
 export interface GeminiProviderInit {
   /** Explicit API key — falls back to GOOGLE_API_KEY env var. */
   apiKey?: string;
+  /** The session's account, per turn (accounts.ts): its key replaces `apiKey`. A throw fails the turn. */
+  resolveApiKey?: () => { key: string; fingerprint: string } | null;
   /** Model to use when TurnOpts.model is absent. */
   defaultModel?: string;
   /** Memory engine — when present, the memory recall tools are offered as
@@ -62,7 +64,7 @@ export interface GeminiProviderInit {
   sessionId?: string;
   /** Cross-backend MCP registry + daemon-owned client — external servers reach
    *  this backend (which has no MCP client) through the hub. */
-  mcpRegistry?: McpRegistry;
+  mcpRegistry?: McpServerView;
   mcpHub?: McpHub;
 }
 
@@ -73,16 +75,18 @@ export class GeminiProvider implements AgentProvider {
   readonly displayName = "Gemini (Google)";
 
   #apiKey: string;
+  #resolveApiKey: (() => { key: string; fingerprint: string } | null) | null;
   #defaultModel: string;
   #memory: MemoryEngine | null;
   #workspaceId: string;
   #tenant: McpTenant | undefined;
   #sessionId: string;
-  #mcpRegistry: McpRegistry | null;
+  #mcpRegistry: McpServerView | null;
   #mcpHub: McpHub | null;
 
   constructor(init: GeminiProviderInit = {}) {
     this.#apiKey = init.apiKey ?? process.env.GOOGLE_API_KEY ?? "";
+    this.#resolveApiKey = init.resolveApiKey ?? null;
     this.#defaultModel = init.defaultModel ?? "gemini-2.0-flash";
     this.#memory = init.memory ?? null;
     this.#workspaceId = init.workspaceId ?? init.sessionId ?? "";
@@ -144,7 +148,7 @@ export class GeminiProvider implements AgentProvider {
     startMs: number,
   ): Promise<void> {
     const model = opts.model ?? this.#defaultModel;
-    const genAI = new GoogleGenerativeAI(this.#apiKey);
+    const genAI = new GoogleGenerativeAI(this.#resolveApiKey?.()?.key ?? this.#apiKey);
     // Tools offered: the memory tools when a memory engine is wired, plus the
     // ask-user tool when the session can raise dialogs. With neither this stays
     // the plain single-call text path (unchanged behavior).

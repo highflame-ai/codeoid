@@ -407,6 +407,12 @@ Every run is a normal session you can open, approve, continue or fork from any f
 Each routine can carry its own revocable API token for monitors and deploy scripts, and the `routine_end` hook carries each outcome to Slack or a pager.
 Full guide: [routines.md](routines.md).
 
+### MCP servers on every backend
+
+An MCP server you add through Claude Code reaches every backend in the session, not just Claude: your global servers in every session, your local-scope ones (`claude mcp add`) in sessions in that directory, and a project's own (`.mcp.json`, project settings) once approved — in Claude Code, or with the drawer's **Approve** (`codeoid mcp approve`), which binds to that exact entry.
+The capabilities drawer says, for each, whether it reaches the other backends and why not; changes apply when you choose **Refresh MCP servers** (`/mcp refresh`, `codeoid mcp refresh`), which restarts the backend and resumes the conversation.
+Full rules: [mcp-backends.md](mcp-backends.md).
+
 ### When an MCP server is down
 
 A backend connects its MCP servers when its session starts.
@@ -431,8 +437,8 @@ In codeoid's registry (`"oauth": true`) codeoid signs in itself, from any fronte
 
 **Adopting** moves a server from the first to the second: the same URL, in codeoid's registry, signed in by codeoid.
 
-- **Web:** "Sign in with codeoid" next to a server that needs a sign-in, in the capabilities drawer, adopts it after a confirmation and starts the sign-in.
-- **CLI:** `codeoid mcp adopt <server> [--session <s>] [--url <url>]`, then `codeoid mcp signin <server>`. `--session` also looks in that session's workdir (a `.mcp.json`, project servers); `--url` says which server is meant when two share the name, and is required for a project's own server. The sign-in prints an address to open, and finishes from the address the browser lands on, pasted back (or `--callback-url`).
+- **Web:** "Sign in with codeoid" next to a server that needs a sign-in, in the capabilities drawer, adopts it after a confirmation and starts the sign-in. A project's server whose URL has parts hidden in the drawer (an id or key in its path, a query) isn't offered there: the drawer says to adopt it from the CLI with its full URL, copied from the file.
+- **CLI:** `codeoid mcp adopt <server> [--session <s>] [--url <url>]`, then `codeoid mcp signin <server>`. `--session` also looks in that session's workdir (a `.mcp.json`, project servers); `--url` says which server is meant when two share the name, and is required for a project's own server — in full, copied from the file, when the drawer hides parts of it. The sign-in prints an address to open, and finishes from the address the browser lands on, pasted back (or `--callback-url`).
 
 A server that needs a sign-in points at adopting it (for someone who may adopt), with the command that finds it, in its reconnect answer.
 Once adopted and signed in, Claude sessions use codeoid's copy from their next turn (until then, the CLI's copy is only denied): it is mounted in-process in front of codeoid's own MCP client, so the token never reaches the agent, and the CLI is told not to connect its own copy (by URL), so the server isn't connected twice.
@@ -444,13 +450,14 @@ What can be adopted, and why:
 
 - **Remote streamable-HTTP servers** at an ASCII `https` URL (plain `http` only on this machine; an international domain in its `xn--` form), with no credentials or wildcard in the URL, and no headers in Claude's config (they're often its authorization, and adopting would drop them): codeoid holds the token.
 - **A plain name** (letters, digits, `-`, `_`; no `__`, not starting with `-`), never one of codeoid's own servers in any spelling.
-- **A project's own server** (from a repo's `.mcp.json` or `.claude/` settings) only with its URL named: the repo chose that address, and a codeoid session's Claude connects it without asking, so naming it is the consent. The drawer names it in its confirmation.
+- **A project's own server** (from a repo's `.mcp.json` or `.claude/` settings) only with its URL named: the repo chose that address, and a codeoid session's Claude connects it without asking, so naming it is the consent. The drawer names it in its confirmation. Where the drawer shows the URL with parts hidden, only the full URL is consent: `https://host/…/mcp` doesn't say which tenant or query the repo put behind the `…`.
 - **Never over another server:** not over a codeoid entry of the same name at another URL, nor one whose tools would get the same names; and a project's server never stands in for your own server of that name (or a look-alike) at another address, in any workdir — where your own config has one, codeoid's copy isn't mounted there.
 - **Every entry at that address adoptable:** adopting denies the CLI's copy at that URL whatever it's called, so an entry there that can't be adopted (authorized by headers, say) blocks it.
 
 Adopting is daemon-wide and lasting: the server is in codeoid's registry for every session, as any registry server is. It needs `settings:write`, a token's own (not a delegated one), and every attempt is audited with the file the URL came from.
 A claude.ai connector is signed in from claude.ai's connector settings instead.
-OAuth servers reach the daemon-run backends and Claude; Codex, the Gemini CLI and Qwen don't get them yet.
+OAuth servers reach every backend: the daemon-run ones through codeoid's own MCP client, Claude through an in-process server in front of it, and Codex, the Gemini CLI and Qwen through a loopback relay on the daemon with a per-session token (#396).
+The server's token stays in the daemon either way; a backend never holds it.
 
 ### Driven by other agents (MCP)
 

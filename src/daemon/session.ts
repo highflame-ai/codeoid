@@ -9,8 +9,10 @@
  *   - Scrollback stores merged SessionMessage (not deltas)
  */
 
-import { ClaudeAccountError, type ClaudeAccountStore, projectCredentialOverride } from "./claude-accounts.js";
-import { CLAUDE_DEFAULT_ACCOUNT } from "../protocol/types.js";
+import { ClaudeAccountError, type ClaudeAccountStore, projectCredentialOverride, userCredentialOverride } from "./claude-accounts.js";
+import { AccountError, type AccountStore, type ResolvedAccount } from "./accounts.js";
+import { geminiProjectOverride, qwenProjectOverride } from "./account-apply.js";
+import { backendHasAccounts, CLAUDE_DEFAULT_ACCOUNT, DEFAULT_ACCOUNT } from "../protocol/types.js";
 import {
   CanonicalHistoryAccumulator,
   canonicalTurnChars,
@@ -120,8 +122,22 @@ import {
 } from "./memory/index.js";
 import { isElicitationTool, isSafeTool, roleDeniesTool } from "./providers/tool-safety.js";
 import type { PackActivation } from "./pipeline/index.js";
-import type { McpRegistry } from "./mcp/registry.js";
-import { adoptableName, adoptionRefusal, claudeMcpServers, fromRepoFile, shellArg } from "./mcp/adopt.js";
+import { McpRegistry } from "./mcp/registry.js";
+import { mcpSpecKey, SessionMcpView, type WorkdirReach } from "./mcp/session-view.js";
+import { projectDeclaredNames } from "./mcp/workdir-servers.js";
+import type { McpTenant } from "./mcp/oauth.js";
+import type { McpServerSpec } from "./mcp/types.js";
+
+/** Backends that start a new conversation after a teardown, so are handed the history again (the Gemini CLI: a new ACP session, no resume). */
+const RESEED_AFTER_TEARDOWN = new Set(["gemini-cli"]);
+/**
+ * Backends that hold a credential in a running process: an account change
+ * releases it when idle, so the next turn starts one on the new credential.
+ * The rest re-read their account every turn (accounts.ts).
+ */
+const PROCESS_BACKENDS: ReadonlySet<string> = new Set(["claude", "codex", "gemini-cli", "qwen", "pi"]);
+import { adoptableName, adoptionRefusal, claudeMcpServers, fromRepoFile, fullUrlRequired, shellArg } from "./mcp/adopt.js";
+import { cleanMcpError, redactMcpUrl } from "./mcp/redact.js";
 import type { McpHub } from "./mcp/hub.js";
 import type { Attachment } from "../protocol/types.js";
 import { resolveAttachments } from "./attachments.js";
@@ -276,6 +292,10 @@ export interface SessionCreateOptions {
   claudeAccounts?: ClaudeAccountStore;
   /** The Claude account this session chose; absent/null = follow the daemon default. Restored on resume. */
   claudeAccount?: string | null;
+  /** The daemon's account store for every backend (accounts.ts). Absent = every backend on the daemon's own credential. */
+  accounts?: AccountStore;
+  /** This session's account per backend (absent = follow that backend's default). Restored on resume. */
+  accountChoices?: Record<string, string>;
   store: Store;
   transcriptStore: TranscriptStore;
   identityManager?: AgentIdentityManager;
@@ -642,6 +662,9 @@ export class SendStoppedError extends Error {
   }
 }
 
+/** Claude's file tools that write. */
+const CLAUDE_FILE_WRITE_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
+
 export class Session {
   readonly id: string;
   /**
@@ -691,10 +714,21 @@ export class Session {
   // Provider (re-)construction inputs — see switchProvider().
   #providersRegistry?: ProviderRegistry;
   #claudeAccounts?: ClaudeAccountStore;
-  /** This session's own Claude account choice; null = follow the daemon default. */
-  #claudeAccount: string | null = null;
-  /** An account change arrived while busy: release the Claude query once idle. */
-  #releaseClaudeWhenIdle = false;
+  #accounts?: AccountStore;
+  /**
+   * This session's account per backend; absent = follow that backend's
+   * daemon default. One entry per backend, so switching backends picks up
+   * that backend's choice and switching back restores the earlier one.
+   */
+  #accountChoices: Record<string, string> = {};
+  /** An account change arrived while busy: release the provider once idle. */
+  #releaseProviderWhenIdle = false;
+  /**
+   * The credential the current backend was built on: its account's
+   * fingerprint, "" for the daemon's own, or "missing:<why>" — what
+   * `refreshAccount` compares against, so only a real change releases it.
+   */
+  #appliedAccount = "";
   #fleet?: McpSdkServerConfigWithInstance;
   #compressionRegistry?: CompressionRegistry;
   #onModels?: SessionCreateOptions["onModels"];
@@ -832,6 +866,21 @@ export class Session {
   #memory?: MemoryEngine;
   #memoryMcp?: MemoryMcpMount;
   #mcpRegistry?: McpRegistry;
+  /** The registry as this session sees it, with its workdir's servers (#395). */
+  #mcpView?: SessionMcpView;
+  /** A refresh asked for while the backend was busy: applied before the next turn. */
+  #mcpRefreshPending = false;
+  /** What the backend was built with (the view's fingerprint); undefined
+   *  before its first turn ("" when that turn ran without the view loaded). */
+  #mcpBuiltWith: string | undefined;
+  /** This session's own servers whose hub clients it holds (keyed as the view keys them). */
+  readonly #mcpRetained = new Map<string, McpServerSpec>();
+  /** Server names the backend's own project files declared since it was built (`#isReadonlyMcpTool`). */
+  readonly #mcpProjectNames = new Set<string>();
+  /** Project servers already audited as run, per backend (`#auditRepoServers`). */
+  readonly #mcpAudited = new Set<string>();
+  /** Ones it no longer uses, let go once the backend that may still be calling them is rebuilt. */
+  readonly #mcpToRelease = new Map<string, McpServerSpec>();
   #mcpHub?: McpHub;
   #chunker?: EpisodeChunker;
   // Counts mid-turn messages in flight. When the SDK interrupts the current
@@ -1172,12 +1221,25 @@ export class Session {
     this.#memoryMcp = opts.memoryMcp;
     this.#mcpRegistry = opts.mcpRegistry;
     this.#mcpHub = opts.mcpHub;
+    // This session's view of its MCP servers: the registry plus its own
+    // workdir's Claude servers (#395). Read before the first turn, and again
+    // only when asked to refresh.
+    if (opts.mcpRegistry instanceof McpRegistry) {
+      const scope = { accountId: this.accountId, projectId: this.projectId, workdir: this.workdir };
+      this.#mcpView = new SessionMcpView(opts.mcpRegistry, opts.mcpHub ?? null, {
+        workdir: this.workdir,
+        tenant: { accountId: this.accountId, projectId: this.projectId },
+        approvals: () => this.#store.workdirMcpApprovals(scope),
+      });
+    }
     this.#config = opts.config;
     // Retained for provider (re-)construction — switchProvider() rebuilds
     // the backend long after the constructor options are gone.
     this.#providersRegistry = opts.providers;
     this.#claudeAccounts = opts.claudeAccounts;
-    this.#claudeAccount = opts.claudeAccount ?? null;
+    this.#accounts = opts.accounts ?? opts.claudeAccounts?.store;
+    this.#accountChoices = { ...(opts.accountChoices ?? {}) };
+    if (opts.claudeAccount) this.#accountChoices.claude = opts.claudeAccount;
     this.#fleet = opts.fleet;
     this.#compressionRegistry = opts.compressionRegistry;
     this.#onModels = opts.onModels;
@@ -1238,6 +1300,7 @@ export class Session {
       null;
 
     this.#provider = opts._testProvider ?? this.#createProvider(opts.providerId);
+    this.#appliedAccount = this.#accountState(this.#provider.id);
     this.#provider.onSessionEvent = (e) => this.#onSessionScopedEvent(e);
 
     // Restore any pinned files the user had on this session before.
@@ -1315,7 +1378,7 @@ export class Session {
         projectId: opts.auth.projectId,
         role: this.role,
         providerId: this.#provider.id,
-        ...(this.#claudeAccount ? { claudeAccount: this.#claudeAccount } : {}),
+        ...this.#accountMeta(),
         forkedFrom: this.forkedFrom,
         worktree: this.worktree,
         collaboration: this.collaboration,
@@ -1371,7 +1434,7 @@ export class Session {
       // A getter, so a mount attached after construction still reaches the
       // provider when it next builds its server list.
       blackboardMcp: () => this.#blackboardMcp,
-      mcpRegistry: this.#mcpRegistry,
+      mcpRegistry: this.#mcpView ?? this.#mcpRegistry,
       mcpHub: this.#mcpHub,
       fleet: this.#fleet,
       config: this.#config,
@@ -1380,8 +1443,94 @@ export class Session {
       // so the manager caches catalogs per-provider.
       onModels: (m) => this.#onModels?.(factory.id, m),
       // Read per query (not captured), so a switch reaches the next turn.
-      resolveClaudeAccount: () => this.#claudeAccounts?.resolve(this.#claudeAccount) ?? null,
+      resolveClaudeAccount: () => this.#claudeAccounts?.resolve(this.#accountChoices.claude ?? null) ?? null,
+      // Every other backend: this session's account for it (accounts.ts).
+      resolveAccount: () => this.#resolveAccount(factory.id),
     });
+  }
+
+  /** The credential `backend` would run on now, as a comparable string. Never throws. */
+  #accountState(backend: string): string {
+    try {
+      if (backend === "claude") {
+        const a = this.#claudeAccounts?.resolve(this.#accountChoices.claude ?? null) ?? null;
+        return a?.fingerprint ?? "";
+      }
+      return this.#resolveAccount(backend)?.fingerprint ?? "";
+    } catch (err) {
+      return `missing:${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
+
+  /**
+   * Re-check the account this session's backend runs on — after any change to
+   * the accounts (a default, a replaced or removed credential, a hand edit of
+   * accounts.json, this session's own choice). Only when the credential it
+   * would run on actually changed is the backend released, so the next turn
+   * starts on the new one; its info is re-announced either way.
+   */
+  refreshAccount(): void {
+    const now = this.#accountState(this.#provider.id);
+    const changed = now !== this.#appliedAccount;
+    this.#appliedAccount = now;
+    this.#broadcastInfoUpdate();
+    if (changed) this.releaseIdleProvider();
+  }
+
+  /** The persisted account choices (the Claude one also under its #392 name, for a rolled-back daemon). */
+  #accountMeta(): { accounts?: Record<string, string>; claudeAccount?: string } {
+    const choices = this.#accountChoices;
+    return {
+      ...(Object.keys(choices).length > 0 ? { accounts: { ...choices } } : {}),
+      ...(choices.claude ? { claudeAccount: choices.claude } : {}),
+    };
+  }
+
+  /** This session's account for `backend`, resolved now (null = the built-in one). Throws when it can't be used. */
+  #resolveAccount(backend: string): ResolvedAccount | null {
+    if (!this.#accounts || !backendHasAccounts(backend)) return null;
+    return this.#accounts.resolve(backend, this.#accountChoices[backend] ?? null);
+  }
+
+  /** This session's choice for `backend` (default: its current one); null = follow the backend default. */
+  accountChoice(backend: string = this.#provider.id): string | null {
+    return this.#accountChoices[backend] ?? null;
+  }
+
+  /** Every backend's choice — copied by a fork. */
+  get accountChoices(): Record<string, string> {
+    return { ...this.#accountChoices };
+  }
+
+  /**
+   * The account this session runs on next for `backend` — its choice, else
+   * the backend default, else `default`. Throws AccountError when that
+   * account no longer exists (never falls back to another credential).
+   */
+  effectiveAccount(backend: string = this.#provider.id): string {
+    if (backend === "claude") return this.effectiveClaudeAccount();
+    return this.#resolveAccount(backend)?.name ?? DEFAULT_ACCOUNT;
+  }
+
+  /**
+   * Choose the account this session runs on for `backend` (default: its
+   * current one); null = follow the backend default. Takes effect on the next
+   * turn: the provider is released when idle and the next turn starts on the
+   * new credential and resumes the same conversation. A running turn keeps
+   * the credential it started with.
+   */
+  setAccount(account: string | null, sender: AuthContext, backend: string = this.#provider.id): void {
+    if (!backendHasAccounts(backend)) throw new AccountError(`the ${backend} backend has no accounts`);
+    if (account !== null && !(this.#accounts?.has(backend, account) ?? account === DEFAULT_ACCOUNT)) {
+      throw new AccountError(`no ${backend} account named ${JSON.stringify(account)}`);
+    }
+    const from = this.#accountChoices[backend] ?? "(follow-default)";
+    if (account === null) delete this.#accountChoices[backend];
+    else this.#accountChoices[backend] = account;
+    this.#store.audit(sender.sub, backend === "claude" ? "session.claude_account" : "session.account", this.id, `backend=${backend} from=${from} to=${account ?? "(follow-default)"}`);
+    this.#saveMetaNow();
+    if (backend === this.#provider.id) this.refreshAccount();
+    else this.#broadcastInfoUpdate();
   }
 
   /**
@@ -1389,7 +1538,7 @@ export class Session {
    * default. A literal `default` pins the built-in account.
    */
   get claudeAccount(): string | null {
-    return this.#claudeAccount;
+    return this.#accountChoices.claude ?? null;
   }
 
   /**
@@ -1398,7 +1547,7 @@ export class Session {
    * it would use no longer exists (never falls back to another credential).
    */
   effectiveClaudeAccount(): string {
-    return this.#claudeAccounts?.resolve(this.#claudeAccount)?.name ?? CLAUDE_DEFAULT_ACCOUNT;
+    return this.#claudeAccounts?.resolve(this.#accountChoices.claude ?? null)?.name ?? CLAUDE_DEFAULT_ACCOUNT;
   }
 
   /**
@@ -1412,45 +1561,73 @@ export class Session {
     if (account !== null && account !== CLAUDE_DEFAULT_ACCOUNT && !this.#claudeAccounts?.has(account)) {
       throw new ClaudeAccountError(`no Claude account named ${JSON.stringify(account)}`);
     }
-    const from = this.#claudeAccount ?? "(follow-default)";
-    this.#claudeAccount = account;
-    this.#store.audit(sender.sub, "session.claude_account", this.id, `from=${from} to=${account ?? "(follow-default)"}`);
-    this.#saveMetaNow();
-    this.#broadcastInfoUpdate();
-    this.releaseIdleClaudeQuery();
+    this.setAccount(account, sender, "claude");
   }
 
   /**
-   * Stop this session's Claude query if it is idle, so a warm CLI process does
-   * not keep running on a credential that was just switched away from,
-   * replaced or removed (it would still answer background work on it). The
-   * next turn starts a fresh process on the current account and resumes the
-   * same conversation. A busy session keeps its process — the running turn
-   * finishes on the credential it started with, and the next turn rebuilds.
+   * Stop this session's backend if it is idle, so a warm process does not
+   * keep running on a credential that was just switched away from, replaced
+   * or removed (it would still answer background work on it). The next turn
+   * starts a fresh one on the current account and resumes the same
+   * conversation. A busy session keeps its process — the running turn
+   * finishes on the credential it started with, and it is released once idle.
+   *
+   * HTTP backends re-read their account every turn and hold no process, so
+   * there is nothing to release.
    */
-  releaseIdleClaudeQuery(): void {
-    if (this.#provider.id !== "claude") return;
+  releaseIdleProvider(): void {
+    if (!PROCESS_BACKENDS.has(this.#provider.id)) return;
+    const backend = this.#provider.id;
     this.#sendChain = this.#sendChain
       .catch(() => {})
       .then(async () => {
-        if (this.#provider.id !== "claude") return;
+        if (this.#provider.id !== backend) return;
         if (this.#switchBusyReason() || this.#backgroundTasks.size > 0) {
           // Busy: release once the turn and its background work are done, so
           // background work can't carry on indefinitely on a removed account.
-          this.#releaseClaudeWhenIdle = true;
+          this.#releaseProviderWhenIdle = true;
           return;
         }
-        this.#releaseClaudeWhenIdle = false;
+        this.#releaseProviderWhenIdle = false;
         await this.#teardownProvider();
+        // A backend that can't resume its own conversation (the Gemini CLI
+        // starts a new ACP session) is handed the history, as after an MCP
+        // rebuild — an account switch must never start the conversation over.
+        if (RESEED_AFTER_TEARDOWN.has(this.#provider.id) && this.#accumulator.history.length > 0) {
+          await this.#seedProviderFromHistory();
+        }
       })
       .catch((e) => {
-        console.error(`[codeoid/session ${this.id}] releasing the idle Claude query failed: ${e instanceof Error ? e.message : String(e)}`);
+        console.error(`[codeoid/session ${this.id}] releasing the idle ${backend} backend failed: ${e instanceof Error ? e.message : String(e)}`);
       });
+  }
+
+  /** #392's name for {@link releaseIdleProvider}. */
+  releaseIdleClaudeQuery(): void {
+    if (this.#provider.id === "claude") this.releaseIdleProvider();
   }
 
   /** Re-announce this session's info — its effective Claude account moved with the daemon default. */
   announceInfo(): void {
     this.#broadcastInfoUpdate();
+  }
+
+  /**
+   * Is this a file-tool write to a Claude settings file (`.claude/settings.json`
+   * or `settings.local.json`, anywhere) while the session runs on a named
+   * Claude account? Shell commands can't be judged this way (see
+   * secret-paths.ts).
+   */
+  #writesClaudeSettingsOnNamedAccount(toolName: string, input: unknown): boolean {
+    if (this.#provider.id !== "claude" || !CLAUDE_FILE_WRITE_TOOLS.has(toolName) || !input || typeof input !== "object") return false;
+    const o = input as Record<string, unknown>;
+    const target = typeof o.file_path === "string" ? o.file_path : typeof o.notebook_path === "string" ? o.notebook_path : null;
+    if (!target || !/(^|[\\/])\.claude[\\/]settings(\.local)?\.json$/i.test(target)) return false;
+    try {
+      return this.#claudeAccounts?.resolve(this.#accountChoices.claude ?? null) != null;
+    } catch {
+      return true; // an account that can't be resolved won't run anyway; don't wave this through
+    }
   }
 
   /**
@@ -1460,15 +1637,53 @@ export class Session {
    */
   assertClaudeAccountUsable(): void {
     if (this.#provider.id !== "claude" || !this.#claudeAccounts) return;
-    const account = this.#claudeAccounts.resolve(this.#claudeAccount); // throws ClaudeAccountError
+    const account = this.#claudeAccounts.resolve(this.#accountChoices.claude ?? null); // throws ClaudeAccountError
     if (!account) return;
     // A named account's token must not be redirectable by the workdir's own
     // Claude settings (claude-accounts.ts projectCredentialOverride).
-    const override = projectCredentialOverride(this.workdir);
+    const override = projectCredentialOverride(this.workdir, account.kind);
     if (override) {
       throw new ClaudeAccountError(
         `${override.file} sets ${override.key}, which would redirect Claude account "${account.name}"'s credential — remove it, or run this session on the default account`,
       );
+    }
+    // The user's own settings env applies over every session's environment.
+    const own = userCredentialOverride();
+    if (own) {
+      throw new ClaudeAccountError(
+        `${own.file} sets ${own.key}, which applies to every Claude session and would override account "${account.name}" — move that setup into an account (codeoid account add-bedrock --from-settings, add-gateway, add-token) and remove it from the file, or run this session on the default account`,
+      );
+    }
+  }
+
+  /**
+   * Refuse to start a turn on an account of the current backend that no
+   * longer exists, or whose credential the workdir's project files would
+   * redirect. Throws ClaudeAccountError / AccountError.
+   */
+  assertAccountUsable(): void {
+    const backend = this.#provider.id;
+    if (backend === "claude") {
+      this.assertClaudeAccountUsable();
+      return;
+    }
+    const account = this.#resolveAccount(backend); // throws AccountError
+    if (!account) return;
+    if (backend === "qwen") {
+      const override = qwenProjectOverride(this.workdir);
+      if (override) {
+        throw new AccountError(
+          `${override.file} sets ${override.key}, which would redirect qwen account "${account.name}"'s key — remove it, or run this session on the default account`,
+        );
+      }
+    }
+    if (backend === "gemini-cli") {
+      const override = geminiProjectOverride(this.workdir);
+      if (override) {
+        throw new AccountError(
+          `${override.file} sets ${override.key}, which would redirect gemini-cli account "${account.name}"'s credential — remove it, or run this session on the default account`,
+        );
+      }
     }
   }
 
@@ -1581,6 +1796,7 @@ export class Session {
     }
 
     this.#provider = this.#createProvider(requested);
+    this.#appliedAccount = this.#accountState(requested);
     this.#resetMcpState({ backendChanged: true });
     this.#provider.onSessionEvent = (e) => this.#onSessionScopedEvent(e);
 
@@ -1842,20 +2058,204 @@ export class Session {
     const one = can[0]!;
     // Adopt counts every entry of the name: another (even one it would refuse)
     // makes it ambiguous, so the URL is named.
-    if (new Set(named.map((c) => c.url)).size > 1) return { command: `codeoid mcp adopt ${name} ${session} --url=${shellArg(one.url!)}` };
+    // The URL as shown (its credentials hidden): adopt matches that form too.
+    if (new Set(named.map((c) => c.url)).size > 1) {
+      // Another entry reading the same once hidden can't be told apart by
+      // the shown URL: the full one, from the file, is needed.
+      const twin = named.some((c) => c.url !== one.url && c.url && redactMcpUrl(c.url) === redactMcpUrl(one.url!));
+      if (twin || fullUrlRequired(one)) return { command: `codeoid mcp adopt ${name} ${session} --url <the full URL from ${basename(one.path)}>` };
+      return { command: `codeoid mcp adopt ${name} ${session} --url=${shellArg(redactMcpUrl(one.url!))}` };
+    }
     if (one.scope !== "workdir") return { command: `codeoid mcp adopt ${name}` };
     // A project's own server: naming its address is the consent — so say who chose it.
     if (fromRepoFile(one)) {
       return {
-        command: `codeoid mcp adopt ${name} ${session} --url=${shellArg(one.url!)}`,
-        note: `Its address (${new URL(one.url!).href}) was chosen by this project's ${basename(one.path)}: adopt it only if you trust it.`,
+        // Hidden parts are the repo's to name, so the consent is to the full URL.
+        command: fullUrlRequired(one)
+          ? `codeoid mcp adopt ${name} ${session} --url <the full URL from ${basename(one.path)}>`
+          : `codeoid mcp adopt ${name} ${session} --url=${shellArg(redactMcpUrl(one.url!))}`,
+        note: `Its address (${redactMcpUrl(new URL(one.url!).href)}) was chosen by this project's ${basename(one.path)}: adopt it only if you trust it.`,
       };
     }
     return { command: `codeoid mcp adopt ${name} ${session}` };
   }
 
   /** Take the backend's word for a server's state; announce it coming back. */
+  /**
+   * Before a turn: read the session's MCP servers if they haven't been, and
+   * apply a refresh asked for while the backend was busy — rebuilding the
+   * backend when what it was built with differs from what's applied now.
+   */
+  async #applyMcpView(): Promise<void> {
+    const view = this.#mcpView;
+    if (!view || this.#mcpBusy()) return;
+    if (!view.loaded || this.#mcpRefreshPending) {
+      this.#mcpRefreshPending = false;
+      try {
+        await this.#loadMcp();
+      } catch (e) {
+        console.error(`[codeoid/session ${this.id}] reading the session's MCP servers failed: ${e instanceof Error ? e.message : String(e)}`);
+        // The backend is built without them: a later read that succeeds rebuilds it.
+        if (!view.loaded) this.#mcpBuiltWith ??= "";
+      }
+    }
+    if (this.#destroyed) return;
+    await this.#rebuildForMcp();
+    this.#auditRepoServers(); // a backend switched to, or a sign-in hold that lapsed
+  }
+
+  /**
+   * Re-read the session's MCP servers from Claude's config and apply any
+   * change (#395): the backend is rebuilt and picks the conversation back up.
+   * Serialized with sends; while a turn, an approval or background work runs,
+   * applied before the next turn instead (a refresh never cuts work short).
+   * Never done on its own — a config edit shouldn't restart a working backend unasked.
+   */
+  async refreshMcp(): Promise<{ changed: boolean; deferred: boolean }> {
+    const view = this.#mcpView;
+    if (!view) return { changed: false, deferred: false };
+    let result: { changed: boolean; deferred: boolean } = { changed: false, deferred: false };
+    const run = this.#sendChain
+      .catch(() => {})
+      .then(async () => {
+        if (this.#destroyed) return;
+        if (this.#mcpBusy()) {
+          this.#mcpRefreshPending = true;
+          result = { changed: await this.mcpStale(), deferred: true };
+          return;
+        }
+        await this.#loadMcp();
+        // Work that started while the files were read is left alone too.
+        if (this.#mcpBusy()) {
+          this.#mcpRefreshPending = true;
+          result = { changed: this.#mcpRebuildDue(), deferred: true };
+          return;
+        }
+        // A first read that failed left the backend built without the view: this one rebuilds it too.
+        result = { changed: await this.#rebuildForMcp(), deferred: false };
+      });
+    // A failed refresh is the caller's to hear about, not the next send's.
+    this.#sendChain = run.catch(() => {});
+    await run;
+    return result;
+  }
+
+  /** What's applied isn't what the backend was built with: it's rebuilt before its next turn. */
+  #mcpRebuildDue(): boolean {
+    const view = this.#mcpView;
+    return !!view?.loaded && this.#mcpBuiltWith !== undefined && view.fingerprint !== this.#mcpBuiltWith;
+  }
+
+  /** A turn, an approval or background work is running: the backend mustn't be rebuilt under it. */
+  #mcpBusy(): boolean {
+    return this.#activeRun !== null || this.#switchBusyReason() !== null || this.#backgroundTasks.size > 0;
+  }
+
+  /** Read and apply the view; this session's own servers' hub clients follow it. */
+  async #loadMcp(): Promise<void> {
+    await this.#mcpView!.load();
+    if (this.#destroyed) return; // destroy let go of everything already
+    const now = new Map(this.#mcpView!.ownSpecs().map((spec) => [mcpSpecKey(spec), spec]));
+    for (const [key, spec] of now) {
+      if (this.#mcpRetained.has(key)) continue;
+      if (this.#mcpToRelease.has(key)) this.#mcpToRelease.delete(key); // back in use: still held
+      else this.#mcpHub?.retain(spec, this.#mcpTenant());
+      this.#mcpRetained.set(key, spec);
+    }
+    for (const [key, spec] of this.#mcpRetained) {
+      if (now.has(key)) continue;
+      this.#mcpRetained.delete(key);
+      this.#mcpToRelease.set(key, spec);
+    }
+    if (this.#mcpBuiltWith === undefined || !this.#mcpRebuildDue()) this.#releaseMcp();
+    this.#auditRepoServers();
+  }
+
+  /**
+   * Each project server codeoid runs for this session's backend goes on the
+   * record once per backend, with whose approval — when it's first mounted:
+   * on a load, after a switch to a backend that runs it, or once a sign-in
+   * hold lapses (Claude runs its own copy, so not there).
+   */
+  #auditRepoServers(): void {
+    const view = this.#mcpView;
+    if (!view?.loaded) return;
+    for (const spec of view.forBackend(this.providerId)) {
+      const consent = view.repoConsent(spec);
+      const key = `${this.providerId}\u0000${mcpSpecKey(spec)}\u0000${consent}`; // a re-approval elsewhere is a new record
+      if (!consent || this.#mcpAudited.has(key)) continue;
+      this.#mcpAudited.add(key);
+      this.#store.audit(
+        this.createdBy,
+        "mcp.workdir_server_applied",
+        this.id,
+        `server=${JSON.stringify(spec.name)} fingerprint=${spec.variant} approvedIn=${consent} backend=${this.providerId}`,
+      );
+    }
+  }
+
+  /** Let go of the servers this session stopped using (its backend no longer can reach them). */
+  #releaseMcp(): void {
+    for (const spec of this.#mcpToRelease.values()) this.#mcpHub?.release(spec, this.#mcpTenant());
+    this.#mcpToRelease.clear();
+  }
+
+  #mcpTenant(): McpTenant {
+    return { accountId: this.accountId, projectId: this.projectId };
+  }
+
+  /**
+   * Rebuild the backend if what it was built with isn't what's applied: it
+   * picks the conversation back up (Claude, Codex and Qwen resume their own;
+   * the Gemini CLI, which starts a new ACP session, is handed the history).
+   * Whether it was rebuilt. The first time, nothing was built yet: just noted.
+   */
+  async #rebuildForMcp(): Promise<boolean> {
+    const view = this.#mcpView;
+    if (!view?.loaded) return false;
+    if (this.#mcpBuiltWith === undefined) {
+      this.#mcpBuiltWith = view.fingerprint;
+      this.#releaseMcp();
+      return false;
+    }
+    if (view.fingerprint === this.#mcpBuiltWith) return false;
+    await this.#teardownProvider(); // records what's applied, and lets go of what was removed
+    if (RESEED_AFTER_TEARDOWN.has(this.#provider.id) && this.#accumulator.history.length > 0) {
+      await this.#seedProviderFromHistory();
+    }
+    return true;
+  }
+
+  /** Read the session's MCP servers for the drawer without applying anything. */
+  async peekMcpView(): Promise<void> {
+    await this.#mcpView?.peek();
+  }
+
+  /** Whether Claude's config changed since this session applied it. */
+  async mcpStale(): Promise<boolean> {
+    return this.#mcpRebuildDue() || ((await this.#mcpView?.stale()) ?? false);
+  }
+
+  /** How far each server from Claude's config reaches in this session (#395), and a workdir entry's fingerprint — for every row of the drawer at once. */
+  mcpReachSnapshot(): {
+    reach(server: { name: string; scope: string; path: string; url: string | null; command: string | null }): WorkdirReach | undefined;
+    fingerprint(name: string, path: string): string | undefined;
+  } {
+    const snap = this.#mcpView?.snapshot(this.providerId);
+    return {
+      reach: (s) => (!snap ? undefined : s.scope === "workdir" ? snap.reachOf(s.name, s.path) : snap.reachOfGlobal(s.name, s.url, s.command)),
+      fingerprint: (name, path) => snap?.fingerprintOf(name, path),
+    };
+  }
+
   #applyMcpState(name: string, state: { status: string; tools: string[] }): void {
+    // A server Claude found wanting a sign-in is held back from the backends
+    // that would only get 401s from it, until it's adopted (#395).
+    // Only for a name every entry agrees on the URL of: the one Claude dialed.
+    if (state.status === "needs-auth") {
+      const url = this.#mcpView?.claudeUrlOf(name);
+      if (url) this.#mcpHub?.markNeedsSignIn(url, { accountId: this.accountId, projectId: this.projectId });
+    }
     this.#sdkMcpStatus.set(name, state.status);
     this.#sdkMcpTools.set(name, state.tools);
     this.#noteMcpStatus(name, state.status);
@@ -2480,7 +2880,7 @@ export class Session {
   ): Promise<void> {
     // Before anything is recorded: a session whose Claude account was removed
     // must not quietly run on some other credential.
-    this.assertClaudeAccountUsable();
+    this.assertAccountUsable();
     // Funnel through the chain. The next send awaits the previous
     // send's full settle (success or thrown). Errors propagate to the
     // caller of THIS send only — the chain itself absorbs them so a
@@ -2775,6 +3175,14 @@ export class Session {
     await this.#ensureAgentIdentity(sender);
     this.#currentSender = sender;
 
+    // A backend that couldn't resume its own conversation and is starting an
+    // empty one: hand it everything before this prompt (already pushed).
+    this.#provider.onHistoryLost = () => {
+      const history = this.#accumulator.history;
+      const before = history.at(-1)?.role === "user" ? history.length - 1 : history.length;
+      if (before > 0) this.#provider.seedFromHistory?.(history.slice(0, before));
+    };
+
     // Wire recovery handler. Uses #currentSender rather than closing over `sender`
     // so that if a subsequent send() updates the active sender before recovery fires,
     // audit events are attributed to the turn that actually triggered recovery.
@@ -2809,6 +3217,7 @@ export class Session {
         }
         // Do NOT pushUserTurn(content) here — the original send() already
         // pushed it before runTurn(). Pushing again duplicates the user turn.
+        this.#noteProjectMcpNames(); // what this backend may load (readonly trust)
         const recoveryRun = this.#provider.runTurn({
           ...(this.#maxBudgetUsd !== undefined ? { maxBudgetUsd: this.#maxBudgetUsd } : {}),
           history: this.#accumulator.history,
@@ -2845,6 +3254,10 @@ export class Session {
     // A message that meant to join a running turn whose run turned out to be
     // stalled (recovered above) starts a turn of its own instead.
     if (turnId === previousTurnId) turnId = randomUUID();
+    // The session's MCP servers: read before its first turn, and a refresh
+    // asked for meanwhile applied (#395) — before the stop and adopted-turn
+    // checks below, which must come after every await.
+    await this.#applyMcpView();
     // Redial any backend MCP server that's down, so this turn can use a
     // server fixed since it failed (#389) — bounded, and backed off.
     await this.#healMcpServers();
@@ -2892,6 +3305,7 @@ export class Session {
     // A redaction flagged by a turn that never reached turn_done (interrupted,
     // errored, switched away) belongs to that turn's backing, not this one.
     this.#turnRedacted = false;
+    this.#noteProjectMcpNames(); // what this backend may load (readonly trust)
     const run = this.#provider.runTurn({
       ...(this.#maxBudgetUsd !== undefined ? { maxBudgetUsd: this.#maxBudgetUsd } : {}),
       history: this.#accumulator.history,
@@ -3334,6 +3748,14 @@ export class Session {
     this.#eventConsumerTask = null;
     await this.#provider.teardown();
     this.#resetMcpState({ backendChanged: false });
+    // The next backend is built with what's applied now (#395) — and may be
+    // built straight away (a seed-overflow retry), before any pending refresh
+    // is applied: so that's what it's built with, and a refresh loaded later
+    // still rebuilds it. Nothing still running can call a server the session
+    // stopped using.
+    if (this.#mcpView?.loaded) this.#mcpBuiltWith = this.#mcpView.fingerprint;
+    this.#releaseMcp();
+    this.#mcpProjectNames.clear(); // the next backend reads its project files afresh
     try { await taskToAwait; } catch { /* consumer handles its own errors */ }
     // teardown() aborts the SDK query, so any sub-agent still in flight will
     // never get its SubagentStop hook. This is the setModel / rotate /
@@ -3535,6 +3957,10 @@ export class Session {
 
   async destroy(sender: AuthContext, opts: { deleteBranch?: boolean } = {}): Promise<void> {
     this.#destroyed = true;
+    // This session's own servers' clients in the hub: let go (the last user closes them).
+    for (const spec of [...this.#mcpRetained.values(), ...this.#mcpToRelease.values()]) this.#mcpHub?.release(spec, this.#mcpTenant());
+    this.#mcpRetained.clear();
+    this.#mcpToRelease.clear();
     // Cancel any pending debounced status persist — a write firing after the
     // deletes below would resurrect the meta file for a destroyed session,
     // which restart resume would then pick up as a ghost.
@@ -3862,6 +4288,7 @@ export class Session {
         // reply is attributed to the prompt the user sent.
         if (turn) this.#currentTurnId = turn.id;
         this.#accumulator.pushUserTurn(prompt, turn?.id, turn ? { prompt: turn.text, at: turn.at } : undefined);
+        this.#noteProjectMcpNames(); // what this backend may load (readonly trust)
         const run = this.#provider.runTurn({
           ...(this.#maxBudgetUsd !== undefined ? { maxBudgetUsd: this.#maxBudgetUsd } : {}),
           history: this.#accumulator.history,
@@ -4176,15 +4603,30 @@ export class Session {
     return this.#currentTurnId;
   }
 
-  #claudeAccountInfo(): Pick<SessionInfo, "claudeAccount" | "effectiveClaudeAccount"> {
-    if (this.#provider.id !== "claude") return {};
+  #accountInfo(): Pick<SessionInfo, "claudeAccount" | "effectiveClaudeAccount" | "account" | "effectiveAccount"> {
+    const backend = this.#provider.id;
+    if (!backendHasAccounts(backend)) return {};
     let effective: string;
     try {
-      effective = this.effectiveClaudeAccount();
+      effective = this.effectiveAccount(backend);
     } catch {
-      effective = `${this.#claudeAccount ?? "?"} (missing)`;
+      // Name the account the session can't run on — for a follower, the
+      // default it follows. Clients key on the " (missing)" suffix.
+      let followed: string | undefined;
+      try {
+        followed = this.#accounts?.getDefault(backend);
+      } catch {
+        // An unreadable accounts file — no name to show.
+      }
+      effective = `${this.#accountChoices[backend] ?? followed ?? "?"} (missing)`;
     }
-    return { ...(this.#claudeAccount ? { claudeAccount: this.#claudeAccount } : {}), effectiveClaudeAccount: effective };
+    const choice = this.#accountChoices[backend];
+    return {
+      ...(choice ? { account: choice } : {}),
+      effectiveAccount: effective,
+      // #392's fields — the Claude backend's view, for older clients.
+      ...(backend === "claude" ? { ...(choice ? { claudeAccount: choice } : {}), effectiveClaudeAccount: effective } : {}),
+    };
   }
 
   toInfo(): SessionInfo {
@@ -4199,7 +4641,7 @@ export class Session {
       attachedClients: this.#clients.size,
       role: this.role,
       providerId: this.#provider.id,
-      ...this.#claudeAccountInfo(),
+      ...this.#accountInfo(),
       mode: this.#mode,
       turnsRemaining: this.#turnsRemaining,
       pinnedFiles: [...this.#pinnedFiles],
@@ -4281,9 +4723,9 @@ export class Session {
   #knownWindow(providerId: string): number | undefined {
     const obs = this.#observedLimits;
     if (obs && obs.providerId === providerId) return obs.contextWindow;
-    const model = this.#model;
-    if (!model) return undefined;
-    return this.#modelWindow?.(this.#windowScope(), providerId, model);
+    // No model chosen: still ask — an endpoint knows its default model's
+    // window (the hook answers undefined for everything else).
+    return this.#modelWindow?.(this.#windowScope(), providerId, this.#model ?? "");
   }
 
   /**
@@ -5021,12 +5463,37 @@ export class Session {
    *  declared `trust: readonly` — auto-approved on every backend, like the
    *  built-in memory tools. */
   #isReadonlyMcpTool(toolName: string): boolean {
-    const reg = this.#mcpRegistry;
-    if (!reg || !toolName.startsWith("mcp__")) return false;
-    for (const spec of reg.list()) {
+    if (!toolName.startsWith("mcp__")) return false;
+    const view = this.#mcpView;
+    if (!view) {
+      for (const spec of this.#mcpRegistry?.list() ?? []) {
+        if (spec.trust === "readonly" && toolName.startsWith(`mcp__${spec.name}__`)) return true;
+      }
+      return false;
+    }
+    // A backend that loads project files itself (.mcp.json — Claude Code's
+    // from every directory above too —, .qwen/ or .gemini/settings.json, a
+    // project .codex/config.toml) may be running a repo's server whose tools
+    // are named like a trusted one's: a CLI maps, merges and shortens names
+    // its own way, so no name match can rule that out. While those files
+    // declare any server (or since the backend was built did, or can't be
+    // read), no tool there gets a readonly trust: each asks (#395).
+    if (!this.#noteProjectMcpNames() || this.#mcpProjectNames.size > 0) return false;
+    // Claude's own plugin, claude.ai connector and IDE tools: never a codeoid server's.
+    if (this.providerId === "claude" && /^mcp__(plugin_|claude_ai_|ide__)/.test(toolName)) return false;
+    for (const spec of view.forBackend(this.providerId)) {
+      if (view.leftToBackend(spec.name, this.providerId)) continue;
       if (spec.trust === "readonly" && toolName.startsWith(`mcp__${spec.name}__`)) return true;
     }
     return false;
+  }
+
+  /** Add what the backend's project files declare now to what it may have loaded; false when one can't be read. */
+  #noteProjectMcpNames(): boolean {
+    const declared = projectDeclaredNames(this.workdir, this.providerId);
+    if (declared === null) return false;
+    for (const n of declared) this.#mcpProjectNames.add(n);
+    return true;
   }
 
   // ── Internals ─────────────────────────────────────────────────────────
@@ -5250,7 +5717,11 @@ export class Session {
         return { behavior: "deny" as const, message: reason };
       }
 
-      const autoApprove = secret?.action !== "ask" && this.#shouldAutoApprove(toolName);
+      // A write to a Claude settings file on a named account: the CLI reloads
+      // it mid-turn and applies its env, after the turn-start check
+      // (assertClaudeAccountUsable) — so it never runs unasked, in any mode.
+      const settingsWrite = this.#writesClaudeSettingsOnNamedAccount(toolName, effectiveInput);
+      const autoApprove = secret?.action !== "ask" && !settingsWrite && this.#shouldAutoApprove(toolName);
 
       if (autoApprove) {
         this.#approvalIdToMessageId.delete(approvalId); // clean up — no manual approval will reference this
@@ -5930,6 +6401,9 @@ export class Session {
         for (const [name, status] of Object.entries(event.servers)) {
           this.#sdkMcpStatus.set(name, status);
           this.#sdkMcpTools.set(name, []);
+          // What the backend actually loaded beyond the user's own and codeoid's:
+          // a project's, wherever it was declared — no readonly trust while it runs (#395).
+          if (this.#mcpView && !this.#mcpView.isUsersOwn(name) && !name.startsWith("claude.ai ")) this.#mcpProjectNames.add(name);
         }
         for (const [server, tools] of Object.entries(event.tools)) {
           this.#sdkMcpTools.set(server, tools);
@@ -6205,7 +6679,7 @@ export class Session {
     this.#reconcileWork("background tasks drained", { keepBackground: false });
     this.#denyPendingApprovals({ keepBackground: false });
     this.#settleBetweenTurns();
-    if (this.#releaseClaudeWhenIdle) this.releaseIdleClaudeQuery();
+    if (this.#releaseProviderWhenIdle) this.releaseIdleProvider();
   }
 
   /** The provider reports background work still running. */
@@ -7266,8 +7740,8 @@ export class Session {
     // for clients or for resume — skip the persistence AND the broadcast.
     if (status === this.#status) return;
     this.#status = status;
-    if (status === "idle" && this.#releaseClaudeWhenIdle && this.#backgroundTasks.size === 0) {
-      this.releaseIdleClaudeQuery();
+    if (status === "idle" && this.#releaseProviderWhenIdle && this.#backgroundTasks.size === 0) {
+      this.releaseIdleProvider();
     }
 
     // Turn exit with settled background work queued mid-turn: wake now. Runs
@@ -7373,7 +7847,7 @@ export class Session {
       role: this.role,
       providerId: this.#provider.id,
       // In BOTH meta writes: each overwrites the whole file (see below).
-      ...(this.#claudeAccount ? { claudeAccount: this.#claudeAccount } : {}),
+      ...this.#accountMeta(),
       ...(this.#backingFresh ? { backingFresh: true } : {}),
       ...(this.#redactedBackings.size > 0 ? { redactedBackings: [...this.#redactedBackings] } : {}),
       forkedFrom: this.forkedFrom,
@@ -7477,51 +7951,6 @@ export const MCP_TIMINGS = {
  * an instruction.
  */
 const SAFE_MCP_NAME = /^(?:[\w.-]{1,64}|claude\.ai [\w .-]{1,54}|plugin:[\w.-]{1,40}:[\w.-]{1,40})$/;
-
-/** Longest backend error text cleaned at all: every pattern below runs on at most this much. */
-const MCP_ERROR_SCAN_CHARS = 2_000;
-
-/**
- * A backend's MCP error, fit to hand back: no control or direction-changing
- * characters, credentials redacted wherever they commonly sit (URL userinfo,
- * query strings and fragments, token-like path segments, JWTs, auth schemes,
- * key=value / "key": "value" pairs, well-known key prefixes), bounded. The
- * text comes from the server, so it's cut before any pattern runs.
- */
-export function cleanMcpError(raw: string): string {
-  const s = raw
-    .slice(0, MCP_ERROR_SCAN_CHARS)
-    // Invisible characters go (so they can't split a token past the rules
-    // below); control characters become spaces.
-    .replace(/[\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]+/g, "")
-    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ")
-    // scheme://user:pass@ — any scheme, a password with a raw @ included
-    .replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^/\s]*@/gi, "$1…@")
-    // PEM blocks, JWTs
-    .replace(/-----BEGIN [A-Z ]+-----[\s\S]*?(?:-----END [A-Z ]+-----|$)/g, "…")
-    .replace(/\beyJ[\w-]+\.[\w-]+(?:\.[\w-]*)?/g, "…")
-    // Authorization schemes
-    .replace(/\b(digest)\s+[^\r\n]*/gi, "$1 …")
-    .replace(/\b(bearer|basic|token)[\s:=]+[^\s"',;)]+/gi, "$1 …")
-    // key=value, key: value, "key": "value", "key" => {…} — the key may carry a prefix (access_token, client_secret, x-api-key)
-    .replace(
-      /(^|[^a-z0-9])([\w-]*(?:token|secret|password|passwd|pwd|api[_-]?key|apikey|key|pat|auth|credentials?|sig|signature|session(?:_?id)?|cookie|code))(["']?\s*(?:=>|[=:]|%3[dD])\s*)("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[{[][^}\]]{0,200}[}\]]?|[^\s"',;)}]+)/gi,
-      "$1$2$3…",
-    )
-    // well-known key formats (codeoid's own ZeroID keys first)
-    .replace(
-      /\b(?:zid_sk_\w{8,}|hf_(?:sk_)?\w{8,}|sk-[\w-]{8,}|sk_[a-z]+_\w{8,}|gh[pousr]_\w{8,}|github_pat_\w{8,}|glpat-[\w-]{16,}|npm_\w{30,}|xox[abprs]-[\w-]{8,}|AKIA[0-9A-Z]{16}|AIza[\w-]{20,})/g,
-      "…",
-    )
-    // long token-like path segments, then query strings and fragments
-    .replace(/(?<![/:])\/[A-Za-z0-9_.~+%-]{24,}(?=[/\s?#"'),;\]>:]|$)/g, "/…")
-    .replace(/(\b[a-z][a-z0-9+.-]*:\/\/[^\s?#"']+)[?#][^\s"'),;\]>]*/gi, "$1?…")
-    // Backstop for whatever the rules above don't know: a long run of token
-    // characters mixing letters and digits is a credential more often than a
-    // diagnostic. Hostnames (dotted) and words are left alone.
-    .replace(/[A-Za-z0-9+=_-]{20,}/g, (run) => (/[A-Za-z]/.test(run) && /\d/.test(run) ? "…" : run));
-  return s.length > 300 ? `${s.slice(0, 300)}…` : s;
-}
 
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;

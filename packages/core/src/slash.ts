@@ -7,6 +7,7 @@
  *   /rotate                  — rotate context (refresh skills/settings)
  *   /mode <i|g|x>            — interactive | guarded | autonomous
  *   /model <id|alias>        — switch model (opus / sonnet / haiku / full id)
+ *   /account <name|default|--follow-default> — switch the session's Claude account
  *   /help                    — surface help modal (TODO P6)
  *   /clear                   — clear prompt (handled by caller before dispatch)
  *
@@ -19,6 +20,7 @@ import type {
   SessionInfo,
   SessionMode,
   McpReconnectResult,
+  McpRefreshResult,
 } from "@highflame/codeoid-protocol";
 
 export type SlashCommand =
@@ -31,11 +33,13 @@ export type SlashCommand =
   | { kind: "model"; model: string; fallback?: string | null }
   | { kind: "model-picker" }
   | { kind: "provider"; providerId: string }
+  | { kind: "account"; account: string | null }
   | { kind: "help" }
   | { kind: "clear" }
   | { kind: "who" }
   | { kind: "capabilities"; tab: "agents" | "skills" | "mcp" | "hooks" }
   | { kind: "mcp-reconnect"; server: string }
+  | { kind: "mcp-refresh" }
   | { kind: "settings" }
   | { kind: "packs" }
   | { kind: "pipeline"; goal?: string }
@@ -120,6 +124,14 @@ export function parseSlash(raw: string, opts?: ParseSlashOptions): SlashCommand 
       if (!providerId) throw new Error("/provider <id> — e.g. /provider pi");
       return { kind: "provider", providerId };
     }
+    case "account": {
+      // The focused Claude session's account (claude-accounts.ts): a name,
+      // `default` (pin your own login), or `--follow-default`.
+      const arg = rest[0];
+      if (!arg) throw new Error("/account <name> | default | --follow-default");
+      if (arg === "--follow-default" || arg === "--follow") return { kind: "account", account: null };
+      return { kind: "account", account: arg.toLowerCase() };
+    }
     case "help":
       return { kind: "help" };
     case "clear":
@@ -136,6 +148,8 @@ export function parseSlash(raw: string, opts?: ParseSlashOptions): SlashCommand 
     case "mcp":
       // `/mcp reconnect <server>` redials one of the backend's servers (#389).
       if (rest[0] === "reconnect" && rest[1]) return { kind: "mcp-reconnect", server: rest.slice(1).join(" ") };
+      // `/mcp refresh` applies Claude's current MCP config to the session (#395).
+      if (rest[0] === "refresh") return { kind: "mcp-refresh" };
       return { kind: "capabilities", tab: "mcp" };
     case "hooks":
     case "hook":
@@ -286,6 +300,14 @@ export function dispatchSlash(cmd: SlashCommand, ctx: SlashContext): void {
         providerId: cmd.providerId,
       });
       return;
+    case "account":
+      fire({
+        type: "session.set_claude_account",
+        id: ctx.newRequestId(),
+        sessionId: ctx.sessionId,
+        account: cmd.account,
+      });
+      return;
     case "help":
       ctx.showHelp?.();
       return;
@@ -312,6 +334,24 @@ export function dispatchSlash(cmd: SlashCommand, ctx: SlashContext): void {
           const r = (resp as { data?: McpReconnectResult } | undefined)?.data;
           if (!r || r.status === "connected") return;
           ctx.report?.(r.deferred ? `${r.server} connects when the next turn starts.` : (r.error ?? `${r.server} is ${r.status}.`));
+        })
+        .catch((e) => ctx.report?.(e instanceof Error ? e.message : String(e)));
+      return;
+    }
+    case "mcp-refresh": {
+      const msg: ClientMessage = { type: "session.mcp_refresh", id: ctx.newRequestId(), sessionId: ctx.sessionId };
+      if (!ctx.request) {
+        ctx.send(msg);
+        return;
+      }
+      ctx
+        .request(msg)
+        .then((resp) => {
+          const r = (resp as { data?: McpRefreshResult } | undefined)?.data;
+          if (!r) return;
+          ctx.report?.(
+            mcpRefreshSummary(r),
+          );
         })
         .catch((e) => ctx.report?.(e instanceof Error ? e.message : String(e)));
       return;
@@ -353,4 +393,12 @@ export function dispatchSlash(cmd: SlashCommand, ctx: SlashContext): void {
       return;
     }
   }
+}
+
+/** What `/mcp refresh` did, in words every frontend shows the same (#395). */
+export function mcpRefreshSummary(r: McpRefreshResult): string {
+  if (!r.changed) return "MCP servers are up to date.";
+  return r.deferred
+    ? "MCP servers changed: work is running, so they're applied before the next turn."
+    : "MCP servers changed: the backend was stopped and starts with them on your next message.";
 }

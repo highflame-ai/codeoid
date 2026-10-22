@@ -7,6 +7,15 @@
 
 import { mock, describe, it, expect, beforeEach } from "bun:test";
 import type { ProviderEvent, TurnOpts, UiRequest } from "../daemon/providers/interface.js";
+import * as realOpenAIModule from "openai";
+
+/**
+ * The real SDK, captured (as a value, not a live binding) before the mock
+ * below replaces the module. `mock.module` is process-wide in bun:test, so
+ * without this every later test file that drives a REAL OpenAI-compatible
+ * server through the SDK (openai-endpoints.test.ts) would get this mock.
+ */
+const RealOpenAI = realOpenAIModule.default;
 
 // ── OpenAI mock ───────────────────────────────────────────────────────────────
 
@@ -43,20 +52,23 @@ function streamFrom(chunks: CompletionChunk[]): AsyncIterable<CompletionChunk> {
 
 mock.module("openai", () => {
   return {
-    default: class OpenAI {
-      chat = {
-        completions: {
-          create: async (body: Record<string, unknown>, _opts: unknown) => {
-            sentBodies.push(body);
-            if (roundScript) return streamFrom(roundScript.shift() ?? []);
-            return streamFrom([...streamChunks]);
+    default: function OpenAI(opts?: ConstructorParameters<typeof RealOpenAI>[0]) {
+      if (opts?.baseURL) return new RealOpenAI(opts);
+      return {
+        chat: {
+          completions: {
+            create: async (body: Record<string, unknown>, _opts: unknown) => {
+              sentBodies.push(body);
+              if (roundScript) return streamFrom(roundScript.shift() ?? []);
+              return streamFrom([...streamChunks]);
+            },
           },
         },
-      };
-      models = {
-        list: async () => {
-          if (modelsResult instanceof Error) throw modelsResult;
-          return { data: modelsResult };
+        models: {
+          list: async () => {
+            if (modelsResult instanceof Error) throw modelsResult;
+            return { data: modelsResult };
+          },
         },
       };
     },
@@ -281,6 +293,29 @@ describe("OpenAIProvider – a second OpenAI-compatible backend", () => {
     expect(await provider.listModels()).toEqual([
       { id: "/models/Qwen2.5-7B-Instruct-Q8_0.gguf", displayName: "Qwen2.5-7B-Instruct-Q8_0.gguf" },
     ]);
+  });
+
+  it("an empty key stays empty — the user's OPENAI_API_KEY never goes to a local server", async () => {
+    const auths: Array<string | null> = [];
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch(req) {
+        auths.push(req.headers.get("authorization"));
+        return Response.json({ data: [{ id: "local" }] });
+      },
+    });
+    const saved = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = "sk-users-real-key";
+    try {
+      const provider = new OpenAIProvider({ apiKey: "", baseURL: `http://127.0.0.1:${server.port}/v1`, modelFilter: () => true, fallbackModels: [] });
+      await provider.listModels();
+      expect(auths).toEqual(["Bearer not-needed"]);
+    } finally {
+      if (saved === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = saved;
+      server.stop(true);
+    }
   });
 
   it("lists nothing, not GPT models, when a local server is down", async () => {

@@ -8,6 +8,21 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **An MCP server added through Claude reaches every backend in that directory** (#395).
+  codeoid imported only Claude's global servers, once at start; a `claude mcp add` (local scope) or a project's `.mcp.json` stayed Claude-only.
+  Now each session sees, on every backend, its directory's servers too: your own always, a project's once approved — in Claude Code (read only from your `~/.claude.json`), or in codeoid after reviewing the entry in full (the drawer's **Review & approve**, or `codeoid mcp approve`, which prints it and approves only with `--yes <fingerprint>`), bound to exactly the entry shown.
+  Changes apply when you ask: the drawer shows "MCP servers changed", and **Refresh MCP servers** (`/mcp refresh`, `codeoid mcp refresh`) restarts the backend, which resumes the conversation; it waits for a running turn or background work, and picks up global changes (`claude mcp add -s user`) too.
+  A server that answers with the MCP sign-in challenge is held back from that account's backends that would only get 401s, and the drawer says to adopt it.
+  Agents' file tools now ask before reading or writing `~/.claude.json` in every mode, since that is where Claude Code's approvals live.
+  docs/mcp-backends.md says which server reaches which backend, and why.
+
+- **Codex, the Gemini CLI and Qwen use OAuth MCP servers** (#396).
+  An OAuth server in codeoid's registry (`"oauth": true`, or one adopted from Claude's config) used to reach only the daemon-run backends and Claude; Settings said "Not reachable from codex, gemini-cli, qwen yet".
+  These backends now mount it through a loopback relay on the daemon, with a token that belongs to the session and ends with it.
+  The server's own token stays in the daemon: the backend, its config, its argv and the agent's shell never see it.
+  The relay carries the whole MCP protocol (tools, resources, prompts, progress, cancellation, and the server's own requests, such as asking the user a question), and a sign-in mid-session reaches a running session without a restart.
+  The daemon's own MCP client now runs on the official MCP SDK for remote servers, shared with the relay.
+
 - **Sign in to an MCP server from codeoid instead of an interactive Claude Code session** (#390).
   A remote OAuth server in Claude's own config (`~/.claude.json`, a `.mcp.json`) could only be signed in to through `/mcp` in a Claude Code terminal, so in a codeoid session it just reported "needs authentication".
   codeoid can now adopt it: "Sign in with codeoid" in the capabilities drawer, or `codeoid mcp adopt <server>` and `codeoid mcp signin <server>`, puts the same URL in codeoid's registry and runs codeoid's own sign-in, from any frontend.
@@ -171,6 +186,15 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   require a pack; an explicit-`phases` plan cannot declare one.
 
 ### Fixed
+
+- **The capabilities drawer no longer shows credentials from MCP servers or hooks** (#394).
+  Its `claude.config` response already left out env and header values, but returned MCP servers' `args`, `url` and `command`, and hook commands, verbatim, and a Claude config keeps secrets there just as often (`--api-key sk-…`, `--token=…`, `postgres://user:pass@…`, `?api_key=…`, a token in the path, `curl -H "Authorization: Bearer …"`).
+  Commands and args are no longer sent at all: a server shows its program's name and how many args it has, a hook its program's name (`curl …`), and the drawer points at the file for the full text.
+  A URL is shown from the URL parser's own reading, so the host is always the one it resolves to and is never hidden; userinfo, the query, the fragment and any path segment that isn't a plain word (an id, a key, `;key=value`) are hidden.
+  The adopt hint, adopt's errors and its audit rows, transport errors in Settings' MCP list, and MCP tool-call errors in the daemon log and the transcript are redacted too; hook matchers, env and header key names are bounded and redacted.
+  A settings or `.mcp.json` file over 1 MB is shown as one "(file too large)" row instead of being read, since the CLI still loads it; `~/.claude.json`, which also holds Claude Code's history, is read up to 64 MB.
+  Adopting from the drawer still works: it matches the URL as shown, except for a project's server whose URL has parts hidden, which is adopted only by its full URL (consent to `https://host/…/mcp` isn't consent to the tenant a repo put behind the `…`); the drawer says so and how.
+  The drawer's adopt check runs only for servers that need a sign-in, against an index built once per look, so a repo file of thousands of servers no longer stalls the daemon when it opens.
 
 - **An MCP server that failed when a session started no longer stays failed for the whole session** (#389).
   A Claude session redials its backend's MCP servers on demand (the capabilities drawer's Reconnect button, `/mcp reconnect <server>` in the web UI and TUI, `codeoid mcp reconnect`, or the new `session.mcp_reconnect` message, which needs `session:send`).

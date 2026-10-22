@@ -30,7 +30,18 @@ import type {
   BackendLoginStartResultMsg,
   BackendLoginSubmitResultMsg,
   BackendLoginCancelResultMsg,
+  BackendLoginWaitMsg,
+  BackendLoginWaitResultMsg,
 } from "./backend-login.js";
+import type {
+  AccountsChangedMsg,
+  AccountsListMsg,
+  AccountsRemoveMsg,
+  AccountsResultMsg,
+  AccountsSetDefaultMsg,
+  AccountsSetMsg,
+  SessionSetAccountMsg,
+} from "./accounts.js";
 import type { SkillGrantMsg, SkillGrantResultMsg } from "./skill-grant.js";
 import type { SessionRewindMsg, SessionRewindResultMsg, SessionTurnsMsg, SessionTurnsResultMsg } from "./turns.js";
 import type { SessionApprovalsMsg, SessionApprovalsResultMsg } from "./approvals.js";
@@ -42,6 +53,18 @@ import type {
   ClaudeAccountsSetMsg,
   SessionSetClaudeAccountMsg,
 } from "./claude-accounts.js";
+import type {
+  EndpointsListMsg,
+  EndpointsRemoveMsg,
+  EndpointsResultMsg,
+  EndpointsSetMsg,
+  EndpointsTestMsg,
+  EndpointsTestResultMsg,
+  ProviderInfo,
+  ProvidersChangedMsg,
+  ProvidersListMsg,
+  ProvidersResultMsg,
+} from "./endpoints.js";
 import type { CompareGetMsg, CompareKeepMsg, CompareListMsg, CompareListResultMsg, CompareStateMsg, SessionCompareMsg } from "./compare.js";
 import type {
   RoutineCancelRunMsg,
@@ -358,6 +381,17 @@ export interface SessionInfo {
    * the daemon default, else `default` (the daemon's own environment).
    */
   effectiveClaudeAccount?: string;
+  /**
+   * The account this session chose for its current backend (accounts.ts).
+   * Absent = it follows that backend's daemon default.
+   */
+  account?: string;
+  /**
+   * The account it actually runs on for its current backend — its choice,
+   * else the backend's daemon default, else `default`; `"<name> (missing)"`
+   * when that account can't be used. Absent for a backend without accounts.
+   */
+  effectiveAccount?: string;
   /** Current execution mode (default "interactive"). */
   mode?: SessionMode;
   /** Active SDLC pipeline phase id when this session backs a phase. Absent = not a pipeline session. */
@@ -1062,6 +1096,9 @@ export type ClientMessage =
   | SessionSetModelMsg
   | SessionSetProviderMsg
   | SessionMcpReconnectMsg
+  | SessionMcpRefreshMsg
+  | McpApproveMsg
+  | McpApprovePreviewMsg
   | SessionForkMsg
   | ScrollbackPageMsg
   | SessionRenameMsg
@@ -1081,6 +1118,7 @@ export type ClientMessage =
   | BackendLoginStartMsg
   | BackendLoginSubmitMsg
   | BackendLoginCancelMsg
+  | BackendLoginWaitMsg
   | SkillGrantMsg
   | SessionTurnsMsg
   | SessionApprovalsMsg
@@ -1089,6 +1127,16 @@ export type ClientMessage =
   | ClaudeAccountsRemoveMsg
   | ClaudeAccountsSetDefaultMsg
   | SessionSetClaudeAccountMsg
+  | AccountsListMsg
+  | AccountsSetMsg
+  | AccountsRemoveMsg
+  | AccountsSetDefaultMsg
+  | SessionSetAccountMsg
+  | ProvidersListMsg
+  | EndpointsListMsg
+  | EndpointsSetMsg
+  | EndpointsRemoveMsg
+  | EndpointsTestMsg
   | SessionRewindMsg
   | SessionCompareMsg
   | CompareGetMsg
@@ -1255,6 +1303,12 @@ export interface SessionCreateMsg extends BaseClientMsg {
    * follow the daemon default. Unknown names are rejected.
    */
   claudeAccount?: string;
+  /**
+   * Account to run this session on for its backend (accounts.ts). Absent =
+   * follow that backend's daemon default. Unknown names are rejected. For
+   * Claude, `claudeAccount` is the older spelling of the same choice.
+   */
+  account?: string;
   /**
    * Model for this session (docs/role-model-binding.md §6.2). Validated
    * provider-aware at create (a Claude alias on a non-Claude backend is
@@ -1649,6 +1703,89 @@ export interface SessionMcpReconnectMsg extends BaseClientMsg {
   server: string;
 }
 
+/**
+ * Re-read the session's MCP servers from Claude's config (its workdir's, and
+ * approvals since) and apply any change (#395): the backend is rebuilt and
+ * resumes the conversation. Nothing changes on its own — `claude.config`
+ * says when a refresh would (`mcpStale`). During a turn, applied before the
+ * next one. `response.ok` data is {@link McpRefreshResult}. Requires `session:send`.
+ */
+export interface SessionMcpRefreshMsg extends BaseClientMsg {
+  type: "session.mcp_refresh";
+  sessionId: string;
+}
+
+/** `response.ok` data for `session.mcp_refresh`. */
+export interface McpRefreshResult {
+  /** The servers changed (the backend is rebuilt, or will be before the next turn). */
+  changed: boolean;
+  /** A turn is running: applied before the next one. */
+  deferred: boolean;
+}
+
+/**
+ * Approve a repo's MCP server (a workdir's `.mcp.json` or project settings)
+ * for every backend in that workdir (#395) — this exact entry: a repo that
+ * edits it needs approval again. Takes effect on a refresh. Approving in
+ * Claude Code works too. Requires `settings:write` (not a delegated token),
+ * and the session must be the caller's.
+ */
+export interface McpApproveMsg extends BaseClientMsg {
+  type: "mcp.approve";
+  sessionId: string;
+  server: string;
+  /** The file it's declared in, when the name is in more than one. */
+  path?: string;
+  /** The entry's fingerprint as `claude.config` showed it: an entry changed since isn't approved. */
+  fingerprint: string;
+}
+
+/**
+ * What approving a project's MCP server would approve (#395): the entry in
+ * full — its command and every argument, its URL, its environment and header
+ * names with each `${VAR}` reference shown and every literal value masked —
+ * and the fingerprint `mcp.approve` must quote. The same rights as
+ * `mcp.approve` (it shows what a repo committed, to the one who'd consent).
+ * `response.ok` data is {@link McpApprovePreview}.
+ */
+export interface McpApprovePreviewMsg extends BaseClientMsg {
+  type: "mcp.approve.preview";
+  sessionId: string;
+  server: string;
+  /** The file it's declared in, when the name is in more than one. */
+  path?: string;
+}
+
+/** `response.ok` data for `mcp.approve.preview`. */
+export interface McpApprovePreview {
+  server: string;
+  path: string;
+  fingerprint: string;
+  command: string | null;
+  args: string[];
+  url: string | null;
+  /**
+   * Every value below is shown exactly as the repo wrote it — nothing hidden
+   * or cut; only characters that wouldn't show (bidi, zero-width, controls)
+   * are escaped as `\u{…}`, and a backslash doubled.
+   */
+  /**
+   * The whole entry as it's to be shown, one item per line — every value
+   * quoted, a run of spaces counted (`\u{20}×{400}`), a URL's host as the
+   * URL parser reads it (punycode for a look-alike) — so no layout can hide any of it.
+   * Clients show these lines as they are.
+   */
+  lines: string[];
+  /** The command line, each part shell-quoted so it reads as it runs. */
+  commandLine: string | null;
+  /** `path`, escaped for showing. */
+  shownPath: string;
+  /** Each env var as written (`${VAR}` references kept; a reference to codeoid's own secrets already removed, as it runs). */
+  env: Record<string, string>;
+  /** Each header, likewise. */
+  headers: Record<string, string>;
+}
+
 /** `response.ok` data for `session.mcp_reconnect`. */
 export interface McpReconnectResult {
   server: string;
@@ -1919,9 +2056,20 @@ export interface ClaudeConfigMcpServer {
   /** Absolute path to the source file that declared it
    * (`~/.claude.json`, `settings.json`, `.mcp.json`, …). */
   path: string;
-  /** stdio command, when present. */
+  /**
+   * stdio command, when present. In `claude.config` it's the program's file
+   * name only (`npx`, `node`), or "(command)" when that name isn't plain or
+   * reads as a credential — commands and args hold credentials as often as
+   * env does (#394); the full text is in the file at `path`.
+   */
   command: string | null;
+  /** Empty in `claude.config` (see `argCount`); daemon-internal readers get the args. */
   args: string[];
+  /** How many args the command has (`claude.config`; the args themselves aren't sent). */
+  argCount?: number;
+  /** Set by the daemon, never read from a file: why this row stands in for a
+   *  file's servers (e.g. the file is too large to describe). */
+  note?: string;
   /** Just the keys of the `env` block (values are secrets, never returned). */
   envKeys: string[];
   /** http URL for non-stdio servers. */
@@ -1958,6 +2106,21 @@ export interface ClaudeConfigMcpServer {
    * config, which codeoid would then sign in to (`mcp.adopt`).
    */
   adoptable?: true;
+  /** codeoid could adopt it, but only by its full URL (#394): a project's
+   *  server whose URL has parts hidden here. Adopt it from the CLI with
+   *  `--url`, copied from the file at `path`. */
+  adoptByFullUrl?: true;
+  /**
+   * For a server from Claude's config: whether it reaches this session's
+   * other backends too (#395), and if not, why — it needs approval (a repo's
+   * server), another of that name wins, it wants a sign-in (adopt it), or its
+   * name is codeoid's own.
+   */
+  /** For a workdir server: its entry's fingerprint — what `mcp.approve` binds to. */
+  fingerprint?: string;
+  otherBackends?:
+    | { reach: "all" }
+    | { reach: "claude-only"; why: "needs-approval" | "needs-refresh" | "shadowed" | "needs-sign-in" | "reserved-name" | "read-by-backend" };
   /** codeoid has adopted it: its registry signs in to this URL, and Claude
    *  sessions use that copy rather than the CLI's. */
   adopted?: true;
@@ -1976,8 +2139,12 @@ export interface ClaudeConfigHook {
   matcher: string | null;
   /** Hook kind ("command" today; future-proof). */
   kind: string;
-  /** The shell command to run. */
+  /** The shell command to run. In `claude.config`, its program's name only
+   *  ("curl …"): the full command is in the file at `path` (#394). */
   command: string;
+  /** Set by the daemon, never read from a file: why this row stands in for a
+   *  file's hooks (e.g. the file is too large to describe). */
+  note?: string;
 }
 
 export interface ClaudeConfigSnapshot {
@@ -2056,6 +2223,8 @@ export interface ClaudeConfigResultMsg {
   hooks: ClaudeConfigHook[];
   /** Whether this session's backend can redial its MCP servers (`session.mcp_reconnect`). */
   mcpReconnect?: boolean;
+  /** Claude's config changed since this session applied it: `session.mcp_refresh` would apply it (#395). */
+  mcpStale?: boolean;
 }
 
 /** One member of a dispatch group, as a client sees it. */
@@ -2727,10 +2896,17 @@ export type DaemonMessage =
   | BackendLoginStartResultMsg
   | BackendLoginSubmitResultMsg
   | BackendLoginCancelResultMsg
+  | BackendLoginWaitResultMsg
   | SkillGrantResultMsg
   | SessionTurnsResultMsg
   | SessionApprovalsResultMsg
   | ClaudeAccountsResultMsg
+  | AccountsResultMsg
+  | AccountsChangedMsg
+  | ProvidersResultMsg
+  | ProvidersChangedMsg
+  | EndpointsResultMsg
+  | EndpointsTestResultMsg
   | SessionRewindResultMsg
   | CompareStateMsg
   | CompareListResultMsg
@@ -2774,6 +2950,12 @@ export interface AuthOkMsg {
    * session creation (assume claude-only).
    */
   providers?: string[];
+  /**
+   * The same backends with display names and kinds (endpoints.ts), first =
+   * the default. Absent on older daemons — fall back to `providers`. For
+   * updates after connect, send `providers.list`.
+   */
+  providerInfo?: ProviderInfo[];
   /**
    * Which issuer authenticated this connection.
    *

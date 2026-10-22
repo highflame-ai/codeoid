@@ -6,12 +6,15 @@
 
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
+import { mcpRefreshSummary } from "@highflame/codeoid-core";
 import type { CodeoidConfig } from "../config.js";
 import { PIPELINE_INPUT_REQUEST_PREFIX, PROTOCOL_VERSION } from "../protocol/types.js";
 import type {
   ClientMessage,
   CollaborationConfig,
   McpReconnectResult,
+  McpApprovePreview,
+  McpRefreshResult,
   CompareState,
   CompareTargetSpec,
   DaemonMessage,
@@ -350,10 +353,11 @@ export class TerminalClient {
         const status = this.#formatStatus(s.status);
         console.log(`  ${s.name.padEnd(20)} ${status.padEnd(20)} ${s.workdir}`);
         console.log(`  ${"".padEnd(20)} id: ${s.id}  clients: ${s.attachedClients}`);
-        if (s.effectiveClaudeAccount) {
-          // Which Claude account it bills, and whether that is its own choice.
-          const own = s.claudeAccount ? "" : " (daemon default)";
-          console.log(`  ${"".padEnd(20)} claude account: ${S(s.effectiveClaudeAccount)}${own}`);
+        const effective = s.effectiveAccount ?? s.effectiveClaudeAccount;
+        if (effective) {
+          // Which account it bills on its backend, and whether that is its own choice.
+          const own = (s.account ?? s.claudeAccount) ? "" : " (default)";
+          console.log(`  ${"".padEnd(20)} ${s.providerId ?? "claude"} account: ${S(effective)}${own}`);
         }
         if (s.pendingDialog) {
           // What it is waiting on, and how to answer it from here (#348).
@@ -432,6 +436,8 @@ export class TerminalClient {
       providerId?: string;
       model?: string;
       claudeAccount?: string;
+      /** Account for the backend the session lands on (accounts.ts). */
+      account?: string;
       collaboration?: CollaborationConfig;
     } = {},
   ): Promise<void> {
@@ -446,6 +452,7 @@ export class TerminalClient {
       ...(opts.providerId ? { providerId: opts.providerId } : {}),
       ...(opts.model ? { model: opts.model } : {}),
       ...(opts.claudeAccount ? { claudeAccount: opts.claudeAccount } : {}),
+      ...(opts.account ? { account: opts.account } : {}),
       ...(opts.pack ? { pack: opts.pack } : {}),
       ...(opts.packRole ? { packRole: opts.packRole } : {}),
       ...(opts.collaboration ? { collaboration: opts.collaboration } : {}),
@@ -758,6 +765,58 @@ export class TerminalClient {
       const snap = t.checkpoint ? "" : list.checkpointsSupported ? "  [no snapshot]" : "";
       console.log(`${String(t.index).padStart(3)}. ${S(t.preview)}${tag}${snap}`);
     }
+  }
+
+  /** `codeoid mcp refresh` — apply Claude's current MCP config to a session (#395). */
+  async mcpRefresh(sessionIdOrName: string): Promise<void> {
+    const sessionId = await this.#resolveSession(sessionIdOrName);
+    if (!sessionId) return;
+    const resp = await this.#request({ type: "session.mcp_refresh", id: randomUUID(), sessionId });
+    if (resp.type !== "response.ok") {
+      this.#printError(resp);
+      process.exitCode = 1;
+      return;
+    }
+    const r = resp.data as McpRefreshResult;
+    console.log(mcpRefreshSummary(r));
+  }
+
+  /** `codeoid mcp approve` — approve a project's MCP server for every backend in the workdir (#395). */
+  async mcpApprove(sessionIdOrName: string, server: string, opts: { path?: string; yes?: string } = {}): Promise<void> {
+    const sessionId = await this.#resolveSession(sessionIdOrName);
+    if (!sessionId) return;
+    // Review first: the entry in full, and the fingerprint an approval binds to.
+    const pv = await this.#request({ type: "mcp.approve.preview", id: randomUUID(), sessionId, server, ...(opts.path ? { path: opts.path } : {}) });
+    if (pv.type !== "response.ok") {
+      this.#printError(pv);
+      process.exitCode = 1;
+      return;
+    }
+    const p = pv.data as McpApprovePreview;
+    if (!opts.yes) {
+      // The repo wrote these: no terminal control sequences reach the screen.
+      const clean = sanitizeTerminalOutput;
+      console.log(clean(`${p.server}, from ${p.shownPath} — once approved, every backend in this directory runs it, with the daemon user's files and network:`));
+      for (const line of p.lines) console.log(clean(`  ${line}`));
+      console.log("  (shown exactly as it runs; characters that wouldn't show are escaped as \\u{…}, and a run of spaces counted)");
+      console.log("  (an env value that is exactly ${VAR} resolves from the daemon's environment when it starts; header values are sent as written)");
+      const q = (v: string) => clean(`'${v.replace(/'/g, "'\\''")}'`); // pasted back into a shell: quoted
+      console.log(`To approve exactly this entry: codeoid mcp approve --path ${q(p.path)} --yes ${p.fingerprint} -- ${q(sessionIdOrName)} ${q(p.server)}`);
+      return;
+    }
+    // The entry reviewed, not whatever is in the file now.
+    if (opts.yes !== p.fingerprint) {
+      console.error(`${p.server} changed since that review (now ${p.fingerprint}) — review it again.`);
+      process.exitCode = 1;
+      return;
+    }
+    const resp = await this.#request({ type: "mcp.approve", id: randomUUID(), sessionId, server, path: p.path, fingerprint: opts.yes });
+    if (resp.type !== "response.ok") {
+      this.#printError(resp);
+      process.exitCode = 1;
+      return;
+    }
+    console.log(`${server}: approved for every backend in this workdir — run \`codeoid mcp refresh ${sessionIdOrName}\` to use it now.`);
   }
 
   /** `codeoid mcp reconnect` — redial one of the session backend's MCP servers (#389). */
@@ -1344,8 +1403,8 @@ export class TerminalClient {
     return this.#resolveSession(nameOrId);
   }
 
-  request(msg: ClientMessage): Promise<DaemonMessage> {
-    return this.#request(msg);
+  request(msg: ClientMessage, timeoutMs?: number): Promise<DaemonMessage> {
+    return this.#request(msg, timeoutMs);
   }
 
   /** Print a `response.error` (or an unexpected reply) the way every command does. */

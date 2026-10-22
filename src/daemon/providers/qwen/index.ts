@@ -38,7 +38,8 @@ import { join } from "node:path";
 import { AsyncQueue } from "../../async-queue.js";
 import type { Store } from "../../store.js";
 import { buildMemoryMcpServer, MEMORY_TOOL_NAMES, type MemoryEngine } from "../../memory/index.js";
-import type { McpRegistry } from "../../mcp/registry.js";
+import type { McpServerView } from "../../mcp/registry.js";
+import { McpProxyLease, type McpProxyMount } from "../../mcp/proxy.js";
 import { resolveEnvMap } from "../../mcp/types.js";
 import { FLEET_TOOL_NAMES } from "../../fleet.js";
 import { resolveQwenBaseUrl, type CodeoidConfig } from "../../../config.js";
@@ -55,6 +56,8 @@ import type {
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
 import { buildQwenEnv } from "../env.js";
 import type { LLMCallUsage } from "../../context-math.js";
+import type { ResolvedAccount } from "../../accounts.js";
+import { qwenAccountEnv } from "../../account-apply.js";
 
 /** Where qwen-code persists a qwen.ai subscription login. */
 const QWEN_OAUTH_CREDS = join(homedir(), ".qwen", "oauth_creds.json");
@@ -81,9 +84,18 @@ export interface QwenProviderInit {
   memory?: MemoryEngine;
   /** codeoid_fleet MCP server — conductor sessions only. */
   fleet?: { type: "sdk"; name: string; instance: unknown };
+  /** The daemon's OAuth MCP relay (#396): how this backend reaches the
+   *  registry's OAuth servers without holding their tokens. */
+  mcpProxy?: McpProxyMount;
   /** Cross-backend MCP registry — mounted natively (qwen owns its MCP client). */
-  mcpRegistry?: McpRegistry;
+  mcpRegistry?: McpServerView;
   config?: CodeoidConfig;
+  /**
+   * This session's account for the backend, resolved when its query is
+   * built (accounts.ts); null = the daemon's own login. Throws when the
+   * chosen account can't be used — the turn fails, never another credential.
+   */
+  resolveAccount?: () => ResolvedAccount | null;
   onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
 }
 
@@ -109,6 +121,8 @@ export class QwenProvider implements SessionProvider {
   #consumerTask: Promise<void> | null = null;
   #currentTurnQueue: AsyncQueue<ProviderEvent> | null = null;
   #builtSystemPromptAppend = "";
+  /** Fingerprint of the account the running query was built with ("" = the daemon's own). */
+  #builtAccount = "";
   /** Bumped on every (re)build so an orphaned consumer can't clobber the new loop. */
   #loopGeneration = 0;
 
@@ -125,6 +139,10 @@ export class QwenProvider implements SessionProvider {
   /** Resolved gateway URL + credential path of the live loop — see #loadCatalog. */
   #currentBaseUrl: string | null = null;
   #currentAuthType: "openai" | "qwen-oauth" | null = null;
+  /** The key the running query was built with — the catalog asks with the same one, never the daemon's for an account's endpoint. */
+  #currentApiKey: string | null = null;
+  /** The running query is on a named account: its catalog isn't the backend's to publish. */
+  #onAccount = false;
   /** Guards backing-session recovery to one attempt — see the consumer's catch. */
   #backingRecoveryAttempted = false;
   /** Last content pushed to the CLI, replayed if recovery fires. */
@@ -133,7 +151,14 @@ export class QwenProvider implements SessionProvider {
   constructor(init: QwenProviderInit) {
     this.#backingId = coerceBackingId(init.initialBackingId, init.sessionId);
     this.#init = init;
+    this.#proxy = new McpProxyLease(
+      init.mcpProxy,
+      init.tenant ? { tenant: init.tenant, sessionId: init.sessionId, backendId: this.id } : null,
+    );
   }
+
+  /** This backend's proxy token for the registry's OAuth servers. */
+  readonly #proxy: McpProxyLease;
 
   // ── Public accessors ──────────────────────────────────────────────────────
 
@@ -255,7 +280,7 @@ export class QwenProvider implements SessionProvider {
     if (this.#currentAuthType !== "openai") return registry;
 
     const baseUrl = this.#currentBaseUrl ?? process.env.OPENAI_BASE_URL;
-    const apiKey = process.env.OPENAI_API_KEY;
+    const apiKey = this.#currentApiKey;
     if (!baseUrl || !apiKey) return registry;
 
     try {
@@ -300,6 +325,7 @@ export class QwenProvider implements SessionProvider {
     this.#consumerTask = null;
     this.#query = null;
     this.#abortController = null;
+    this.#proxy.revoke();
   }
 
   // ── Internal ──────────────────────────────────────────────────────────────
@@ -336,13 +362,17 @@ export class QwenProvider implements SessionProvider {
 
   #ensureQueryLoop(opts: TurnOpts): void {
     const desiredAppend = opts.systemPromptAppend ?? "";
+    // Resolved per query build; throws (failing the turn) when the chosen
+    // account can't be used. A changed account rebuilds and resumes.
+    const account = this.#init.resolveAccount?.() ?? null;
+    const desiredAccount = account?.fingerprint ?? "";
     if (this.#consumerTask && this.#inputQueue && !this.#inputQueue.closed) {
       // The SDK fixes the system prompt at query construction, so a changed
       // append (before_turn hooks, refreshed memory index) needs a rebuild.
       // The fresh query RESUMES the same backing session, so nothing is lost.
-      if (this.#builtSystemPromptAppend === desiredAppend) return;
+      if (this.#builtSystemPromptAppend === desiredAppend && this.#builtAccount === desiredAccount) return;
       console.log(
-        `[qwen-provider ${this.#init.sessionId.slice(0, 8)}] systemPromptAppend changed — rebuilding query loop`,
+        `[qwen-provider ${this.#init.sessionId.slice(0, 8)}] ${this.#builtAccount === desiredAccount ? "systemPromptAppend" : "account"} changed — rebuilding query loop`,
       );
       this.#inputQueue.close();
       this.#abortController?.abort();
@@ -353,6 +383,7 @@ export class QwenProvider implements SessionProvider {
     this.#abortController = new AbortController();
     this.#inputQueue = new AsyncQueue<SDKUserMessage>();
     this.#builtSystemPromptAppend = desiredAppend;
+    this.#builtAccount = desiredAccount;
     this.#loopGeneration += 1;
     const myGeneration = this.#loopGeneration;
 
@@ -365,6 +396,10 @@ export class QwenProvider implements SessionProvider {
     // `{type:"sdk", name, instance}` shape, so the builder is reused as-is.
     const mcpServers: Record<string, unknown> = {
       ...registryServersForQwen(init.mcpRegistry),
+      // OAuth registry servers through the daemon's relay (#396), re-minted
+      // per query: the SDK hands this config to its CLI in-process (its
+      // initialize control message), not on argv or in the agent's env.
+      ...proxiedServersForQwen(this.#proxy),
       ...(init.memory
         ? {
             codeoid_memory: buildMemoryMcpServer(init.memory, {
@@ -376,12 +411,15 @@ export class QwenProvider implements SessionProvider {
       ...(init.fleet ? { codeoid_fleet: init.fleet } : {}),
     };
 
-    const authType = resolveQwenAuthType(qwenCfg?.authType);
-    const baseUrl = resolveQwenBaseUrl(qwenCfg?.baseUrl);
+    // An account is an API key with its endpoint; it replaces the configured auth.
+    const authType = account ? "openai" : resolveQwenAuthType(qwenCfg?.authType);
+    const baseUrl = account ? resolveQwenBaseUrl(account.account.baseUrl) : resolveQwenBaseUrl(qwenCfg?.baseUrl);
     const model = opts.model ?? qwenCfg?.model;
     this.#currentModel = model ?? null;
     this.#currentBaseUrl = baseUrl ?? null;
     this.#currentAuthType = authType;
+    this.#currentApiKey = account ? (account.account.token ?? null) : (process.env.OPENAI_API_KEY ?? null);
+    this.#onAccount = account !== null;
 
     this.#query = query({
       prompt: this.#inputQueue,
@@ -392,6 +430,9 @@ export class QwenProvider implements SessionProvider {
         // this over process.env rather than replacing it (see buildQwenEnv).
         env: {
           ...buildQwenEnv(),
+          // An account's key, and none of the daemon's (blanked: the SDK merges over process.env).
+          // An account: its key and its own home, and none of the daemon's keys.
+          ...(account ? qwenAccountEnv(account, buildQwenEnv()) : {}),
           ...(baseUrl ? { OPENAI_BASE_URL: baseUrl } : {}),
           ...(model ? { OPENAI_MODEL: model } : {}),
         },
@@ -453,7 +494,9 @@ export class QwenProvider implements SessionProvider {
 
     this.#hasQueried = true;
 
-    if (init.onModels) {
+    // Not for a named account: its endpoint and plan aren't every session's,
+    // and the catalog cache is per backend.
+    if (init.onModels && !this.#onAccount) {
       // Fired on every loop build, so a model added to the gateway shows up on
       // the next session rather than waiting for a daemon restart.
       void this.#loadCatalog()
@@ -1002,6 +1045,15 @@ export function unionCatalogs(
   return [...byId.values()];
 }
 
+/** The registry's OAuth servers as qwen MCP configs, through the relay (#396). */
+export function proxiedServersForQwen(lease: McpProxyLease): Record<string, unknown> {
+  const proxied = lease.renew();
+  if (!proxied) return {};
+  return Object.fromEntries(
+    proxied.servers.map((s) => [s.name, { httpUrl: s.url, headers: { Authorization: `Bearer ${proxied.token}` } }]),
+  );
+}
+
 /**
  * Registry servers for the qwen backend, as SDK MCP configs — a native mount,
  * since qwen-code owns its own MCP client. `${VAR}` env refs and
@@ -1009,7 +1061,7 @@ export function unionCatalogs(
  * in config; tool calls still gate through canUseTool.
  */
 export function registryServersForQwen(
-  registry: McpRegistry | undefined,
+  registry: McpServerView | undefined,
 ): Record<string, unknown> {
   if (!registry) return {};
   const out: Record<string, unknown> = {};
