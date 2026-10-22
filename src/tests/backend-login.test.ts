@@ -480,3 +480,54 @@ describe("script(1)'s stdin is an ordinary pipe — not a socket, not a named pi
     }
   });
 });
+
+describe("a real code and a real token — long ones", () => {
+  // Stand-in modelled on the real CLI's terminal UI: raw keystrokes, where a
+  // chunk arriving at once is a paste and an Enter inside it is text (the
+  // code never submits), and output wrapped at the terminal's width — 80
+  // columns when the pty reports none. Real codes are ~130 characters and
+  // real tokens ~108, so both are long enough to hit each.
+  const LONG_CODE = `${"c".repeat(124)}#state`;
+  const LONG_TOKEN = `sk-ant-oat01-${"T".repeat(95)}`;
+  let tuiCmd: string;
+
+  beforeAll(() => {
+    tuiCmd = join(dir, "fake-tui-login.ts");
+    writeFileSync(
+      tuiCmd,
+      `#!/usr/bin/env bun
+const width = process.stdout.columns || 80;
+const wrap = (text: string) => (text.match(new RegExp(\`.{1,\${width}}\`, "g")) ?? []).join("\\n");
+process.stdout.write(\`Browser didn't open? Use the url below to sign in\\n\${wrap("${URL_}")}\\nPaste code here if prompted > \`);
+process.stdin.setRawMode?.(true);
+let field = "";
+process.stdin.on("data", (chunk: Buffer) => {
+  const text = chunk.toString("utf8");
+  if (text === "\\r") {
+    if (field === "${LONG_CODE}") {
+      process.stdout.write("\\n" + wrap("Success! Your OAuth token: ${LONG_TOKEN}") + "\\n");
+      process.exit(0);
+    }
+    process.stdout.write("\\nOAuth error: Request failed with status code 400\\n");
+    field = "";
+    return;
+  }
+  // One chunk of several characters is a paste: an Enter in it is text.
+  field += text;
+});
+`,
+      "utf8",
+    );
+    chmodSync(tuiCmd, 0o755);
+  });
+
+  test("a long code is typed, then Enter pressed apart — it submits, and the whole token is kept", async () => {
+    const broker = newBroker(fakeFlow({ resolve: () => ({ file: tuiCmd, args: [] }) }));
+    const login = await broker.start("claude");
+    expect(login.verificationUrl).toBe(URL_);
+    const outcome = await broker.submit(login.loginId, LONG_CODE);
+    // Unwrapped: at 80 columns the token would be captured cut short.
+    expect(outcome).toMatchObject({ ok: true, secret: { key: "CLAUDE_CODE_OAUTH_TOKEN", value: LONG_TOKEN } });
+  }, 20_000);
+});
+

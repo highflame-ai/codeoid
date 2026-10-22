@@ -57,6 +57,10 @@ const ATTEMPT_TTL_MS = 10 * 60_000;
 const URL_TIMEOUT_MS = 45_000;
 /** Longest we wait for the vendor to accept or reject a submitted code. */
 const EXCHANGE_TIMEOUT_MS = 90_000;
+/** Pause between typing a code and pressing Enter, so the code isn't read as one paste with the Enter in it. */
+const ENTER_DELAY_MS = 300;
+/** Width of the sign-in command's terminal: wide enough that no URL or token wraps. */
+const PTY_COLUMNS = 500;
 /**
  * Transcript cap. We keep the TAIL (the outcome), never the whole stream: a
  * spinner redrawing at 10 Hz for ten minutes is megabytes of nothing, and the
@@ -535,7 +539,12 @@ export class BackendLoginBroker {
     // transcript (from the URL step) cannot be read as a rejection of THIS
     // code. Stream-absolute, so a mid-exchange trim cannot move it.
     const mark = attempt.dropped + attempt.transcript.length;
-    attempt.input.write(`${trimmed}\r`);
+    // Enter goes separately: a long chunk arriving at once is read as a paste,
+    // and a `\r` inside a paste is text, not Enter — a real code (~130 chars)
+    // then sits in the field forever while a short one submits.
+    attempt.input.write(trimmed);
+    await new Promise((r) => setTimeout(r, ENTER_DELAY_MS));
+    attempt.input.write("\r");
 
     const sinceMark = () => attempt.transcript.slice(Math.max(0, mark - attempt.dropped));
 
@@ -716,14 +725,18 @@ function spawnUnderPty(file: string, args: string[], flow: LoginFlow, isolatedHo
     // Terminal UIs size their output to the pty. Fixing it keeps the URL from
     // being wrapped differently on a client with a different terminal, and
     // keeps the transcript deterministic.
-    COLUMNS: "100",
+    COLUMNS: String(PTY_COLUMNS),
     LINES: "40",
     TERM: "xterm-256color",
   };
+  // The pty script makes has no size, so the command wraps at its 80-column
+  // fallback whatever COLUMNS says — and a wrapped token (`sk-ant-oat01-…` is
+  // ~108 chars) is captured cut short. Size it before the command starts.
+  const sized = ["/bin/sh", "-c", `stty cols ${PTY_COLUMNS} rows 40 2>/dev/null; exec "$@"`, "sh", file, ...args];
   const argv =
     process.platform === "darwin"
-      ? ["-q", "/dev/null", file, ...args]
-      : ["-q", "-e", "-c", shellQuote([file, ...args]), "/dev/null"];
+      ? ["-q", "/dev/null", ...sized]
+      : ["-q", "-e", "-c", shellQuote(sized), "/dev/null"];
   const pipeDir = mkdtempSync(join(tmpdir(), INPUT_DIR_PREFIX));
   const fifo = join(pipeDir, "in");
   const made = spawnSync("mkfifo", ["-m", "600", fifo]);
