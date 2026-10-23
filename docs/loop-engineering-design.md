@@ -5,6 +5,7 @@ Status: proposal, not implemented.
 Date: 2026-10-11.
 
 Code baseline inspected: `528b819` (includes llama.cpp support, PR #365).
+§12 (Fleets) was added on 2026-10-24 against `229edc7`, with herdr `43b36b6` (0.9.5) and Orca `a9d242d` (1.4.214) read at source.
 
 Scope: research synthesis, architecture, product behavior, and implementation sequence.
 
@@ -25,7 +26,7 @@ The ambition is to lead on verified outcomes per unit of cost and human attentio
 ### Where codeoid can lead, not just match
 
 Reliability alone reaches parity: bounded check-and-repair already exists in Aider, Bugbot autofix, and Goose recipes.
-Leadership comes from combining that reliability with five things codeoid is unusually placed to do, each built into the first loops rather than deferred:
+Leadership comes from combining that reliability with seven things codeoid is unusually placed to do, each built into the first loops rather than deferred:
 
 1. **Backend escalation and candidate selection.**
    Codeoid drives many backends behind one session model, and `session.compare` (#364) already forks one prompt to several of them in separate worktrees.
@@ -39,6 +40,10 @@ Leadership comes from combining that reliability with five things codeoid is unu
    The worker can end an attempt by reporting that the objective conflicts with its checks or constraints, with evidence, instead of being pushed toward the checker.
 5. **Learning across runs.**
    Failure fingerprints, rejected approaches, and recipe outcomes persist per repository and inform later runs, as advice that never counts as evidence.
+6. **History by reference, never by summary.**
+   Codeoid owns the conversation and keeps every byte of it, so a hand-off between attempts, runs, or agents can point at the verbatim record instead of a compacted summary (§12.4).
+7. **A shared board for a fleet.**
+   Agents working toward one objective record discoveries, hypotheses, failed approaches, and claims on a typed, attributed board whose entries link to evidence (§12.5).
 
 ## 2. What the research establishes
 
@@ -296,7 +301,7 @@ Track model input/output/cache tokens separately, reported or estimated cost, ve
 | Local process runtime | Enforced by supervisor deadlines, subject to bounded termination latency |
 | Token or dollar accounting from end-of-turn reports | Stops later attempts; cannot cap unseen in-flight spend |
 | Streaming usage with cancellation | Earlier stopping, still subject to reporting delay and remote cancellation behavior |
-| Provider-side request/spend limits | Stronger bounds where the provider exposes and honors them — for example the Claude Agent SDK's `maxBudgetUsd`, which codeoid does not set today and should set per attempt from the remaining run budget |
+| Provider-side request/spend limits | Stronger bounds where the provider exposes and honors them — for example the Claude Agent SDK's `maxBudgetUsd`, which routines already set from `maxCostUsd` (#382) and loops should set per attempt from the remaining run budget |
 
 Reserve budget for admitted concurrent work and final verification. Do not promise a hard dollar ceiling for a subscription CLI or remote agent whose individual requests codeoid cannot bound. Expose per-provider capabilities: usage granularity, request limits, cancellation acknowledgement, managed children, permission enforcement, and recovery support.
 
@@ -329,7 +334,7 @@ A candidate that passes nothing is never selected by default; ties go to the use
 The losing candidates are kept for inspection until the run ends.
 
 Candidates spend from one budget, so `n` is bounded by the remaining limits, and the comparison report shows what each candidate cost.
-Whether candidates beat sequential attempts at equal spend is a measurement for §13, not an assumption.
+Whether candidates beat sequential attempts at equal spend is a measurement for §14, not an assumption.
 
 For optimization, preserve an incumbent and promote candidates only when correctness constraints hold and the declared metric improves under comparable conditions. Repeat noisy measurements; use a practical improvement threshold and hold-out checks where appropriate. Preserve rejected candidates for inspection rather than resetting the user's branch.
 
@@ -337,7 +342,7 @@ For optimization, preserve an incumbent and promote candidates only when correct
 
 Separate run identity from session identity. An attempt can continue in the same session when continuity helps; a retry after repeated failure or a role change can start fresh. Make this a measurable recipe policy, not an unconditional reset after every turn.
 
-The continuation packet contains the contract revision, acceptance criteria, current snapshot, verified progress, open findings, failed approaches, selected diagnostic excerpts, remaining budget, and pending user decisions. Full logs and transcripts are available by reference. Facts inferred by a model are labelled as such. Durable run records survive compaction without relying on a summary remembering the goal.
+The continuation packet contains the contract revision, acceptance criteria, current snapshot, verified progress, open findings, failed approaches, selected diagnostic excerpts, remaining budget, and pending user decisions. Full logs and transcripts are available by reference, as episode and evidence ids rather than summaries (§12.4). Facts inferred by a model are labelled as such. Durable run records survive compaction without relying on a summary remembering the goal.
 
 Use the existing memory tools for historical rationale and, later, Kenning for relevant code context. Neither can overwrite current verification facts.
 
@@ -357,6 +362,8 @@ The rules that keep this honest:
 - entries age out, and an entry contradicted by a later verified run is dropped;
 - per-recipe outcome statistics (verified-completion rate, cost, rung reached) are reported to the user, so recipe changes are judged on recorded results rather than impressions.
 
+These records live on the repository board of §12.5 rather than in a separate store.
+
 ## 10. Packs, pipelines, and triggers
 
 Keep existing pipeline behavior as the default. Introduce a versioned boundary policy with explicit modes such as `human` and `verified`. A verified boundary may advance only with qualifying evidence and no mandatory approval outstanding. Do not implement this by automatically invoking today's human override method: that method can deliberately approve a failed deterministic gate.
@@ -375,7 +382,179 @@ The detail view answers: what changed, what was checked, on which revision, what
 
 Provide pause, resume, cancel, inspect evidence, attach, and revise-contract actions. Scope and budget increases show their concrete effect. Route blocked decisions to the attention inbox; avoid notifying on every retry. A progress graph should represent verification outcomes and expenditure, not a decorative count of agents.
 
-## 12. Implementation sequence
+## 12. Fleets: many runs, one board
+
+The sections above describe one run.
+A fleet is many runs at once, and the fleet tools people already use are built around terminals, not outcomes.
+This section says what codeoid does differently when it runs many loops, grounded in the two strongest peers' source code and in codeoid's own.
+
+### What the peers do, read at source
+
+[herdr](https://github.com/herdrdev/herdr) is a Rust terminal multiplexer for agents.
+It decides an agent's state by matching regular expressions against screen regions and the terminal title (`src/detect/manifests/*.toml`), or by hooks for a handful of agents.
+Its event hub keeps the last 512 events, and a slow subscriber receives `events_lost` and must resynchronize (`src/api/event_hub.rs`, `src/api/subscriptions.rs`).
+It persists layout and the agents' own resume references, not transcripts; pane history is opt-in.
+Its nearest thing to shared notes is pane and workspace metadata: at most 32 keys of 80 characters, display-only, not restored after a restart.
+It has no scheduler, budgets, or loops, and the socket's file mode is its only access control.
+
+[Orca](https://github.com/stablyai/orca) is an Electron IDE that launches about forty agent CLIs in terminals, plus structured chat for a few.
+Its experimental orchestration has a real task graph, a durable SQLite mailbox, decision gates, and a three-failure circuit breaker.
+A task completes when its worker reports `worker_done` with a succeeded outcome, or when the coordinator sets it by hand; dependents are then promoted to `ready` (`worker-report-settlement.ts`, `task-store.ts`).
+Nothing in that path runs a check.
+Workers receive the task text only; an upstream task's results are not passed to its dependents (`preamble.ts`, `coordinator-task-dispatch.ts`).
+Automations complete when the terminal goes idle after a busy period (`runtime-terminal-run-observer.ts`), and "Fix broken checks" is one prompt, not a verified loop (`pr-checks-fix-prompt.ts`).
+Terminal agents launch with their permission-bypass flags by default (`tui-agent-launch-defaults.ts`).
+Context management is left to each CLI's own compaction.
+Orca does offer cross-session search: an opt-in full-text index over the CLIs' own transcript files on one host (`src/main/ai-vault-search/`).
+
+Both are ahead of codeoid on breadth of agents, worktree setup, review and pull-request flow, and multiple machines.
+Neither knows whether a finished agent's work is correct, and neither gives agents a shared, durable place to record what they learned.
+Those two gaps are where codeoid should compete.
+
+### 12.1 The run is the unit of the fleet
+
+The fleet board lists runs, not sessions.
+A row's state is the run's lifecycle state from §6, so "needs you" means a run in `waiting` or `blocked` with a named dependency, not a terminal that looks idle.
+Worker sessions stay attachable underneath their run.
+
+The attention inbox is derived in the web client today (`web/src/lib/attention.ts`).
+For a fleet it becomes a daemon-side record, so the web UI, the TUI, Telegram, and push notifications show the same items and clear them together.
+
+### 12.2 Dependencies are satisfied by evidence
+
+The dispatcher has groups with a join barrier (`enqueueGroup`) but no dependencies between tasks.
+Add a dependency between runs whose default condition is `verified`: the downstream run starts only when the upstream run has completed with every mandatory criterion passing.
+A weaker `finished` condition exists for scouting work whose output is a report, and it is labelled as such on the board.
+The downstream run starts from the upstream run's accepted candidate tree, and its continuation packet references the upstream evidence and history (§12.4) rather than a prose hand-off.
+
+### 12.3 Integration is its own run
+
+Two passing branches do not make a passing merge (§9).
+When several runs in one fleet target the same branch, an **integrate** recipe merges their accepted candidates onto a fresh worktree in a declared order and runs the union of their mandatory checks.
+If the merge or the checks fail, it narrows the failure by merging subsets, then opens a repair run whose objective names the conflicting runs and whose packet references both runs' evidence.
+Nothing is delivered to the target branch until the integrated tree has its own evidence.
+
+### 12.4 History by reference, never by summary
+
+Codeoid's memory keeps every byte of every session.
+Each episode's full body is stored compressed (`memory/store.ts`, `episode_payloads`), search indexes a bounded view of it (`memory/lossless.ts`), and `get_episode` pages the verbatim body back.
+Context rotation replaces lossy compaction: the new context gets the last user turn and the four memory tools, with no summary (`Session.#rotate`, `renderRotationSeed`).
+Every backend that supports memory tools gets them, through the in-process server on Claude and a per-session HTTP endpoint elsewhere.
+Peers cannot match this by design: Orca and herdr do not own the conversation, so the CLI's own compaction decides what survives, and an Orca dependency hands off a short `worker_done` body.
+
+Several codeoid surfaces still hand off truncated prose instead of references, and a fleet multiplies the cost of each one:
+
+| Surface | Today | Change |
+| --- | --- | --- |
+| Dispatch completion digest | Final message cut to 700 characters plus eight one-line episode summaries, no ids (`buildWorkerDigest`) | Carry episode ids and turn ids; the text is a preview of what they point to |
+| `fleet_recall` | Episode one-liners without ids, so `get_episode` cannot expand them | Return episode ids, scoped to the caller's tenant |
+| Routine `{{last_summary}}` | Previous run's final text cut to 4,000 characters | Also pass the previous run's id, so the next run can page what it needs |
+| Switch, fork, and rewind seeding | `transcript` strategy by default; canonical tool output is capped at capture (8K shell, 32K reads, 16K MCP) | Loop workers use the verbatim working-set strategy, and evidence never comes from canonical history |
+| Rotation seed | Worded for Claude (`session.ts`) | Backend-neutral wording, since every backend now has the tools |
+
+Two additions make history addressable at run granularity.
+Episodes gain run and attempt ids and the turn id they belong to, so a continuation packet can say "attempt 2's failing output is episode X" and an evidence report can cite exact spans.
+And cross-workspace recall (`recallGlobal`) gets the tenant scoping its own TODO asks for before any fleet surface relies on it.
+
+The rule for every hand-off in a fleet: a summary may be an index into the record, never a replacement for it.
+A one-line preview is fine when it carries the id of the full record.
+
+### 12.5 A blackboard for the fleet
+
+Codeoid already has a blackboard (`src/daemon/blackboard/`): append-only versioned artifacts, role-fenced reads and writes that fail closed, tenant scoping, and per-writer slots for findings.
+It serves one collaboration goal and is deleted when the goal is torn down.
+Its writers are recorded as synthetic strings (`agent:<goal>:<role>#n`), and it is mounted on Claude, Codex, and the Gemini CLI only.
+Separately, every session in one tenant and repository already shares memory, so workers can recall each other's episodes; that channel is implicit and unstructured.
+
+Generalize the blackboard into boards with two persistent scopes:
+
+- a **fleet board** for the runs working toward one objective, which outlives individual sessions and is retained with the runs;
+- a **repository board** for durable advice, which subsumes the learned run records of §9 instead of adding a second store.
+
+Entries are typed, small, and point to evidence instead of embedding it:
+
+| Kind | Written by | Content |
+| --- | --- | --- |
+| `discovery` | worker | A fact about the code or environment, with the episode or evidence reference that shows it |
+| `hypothesis` | worker | A proposed cause or approach, with the run and attempt testing it |
+| `failed_approach` | controller | An approach, its failure fingerprint, and the evidence that rejected it |
+| `claim` | worker, through the controller | A path or resource the run intends to change, held for as long as the run's dispatch lease |
+| `question` | worker | A decision the worker needs, mirrored to the attention inbox |
+| `decision` | user | An answer that binds later attempts until the contract is revised |
+
+The controller, not the worker, moves an entry between `open`, `confirmed`, `refuted`, and `superseded`, and only on evidence.
+A `failed_approach` is written by the controller from verification results, so a worker cannot erase its own failures.
+Each entry records the writer's ZeroID subject and the run and attempt ids, replacing the synthetic writer strings.
+A claim is fenced by the same lease generation as dispatch, so a stale worker's claim is rejected the way its stale result is.
+Claims make overlap visible before two runs edit the same files; they do not replace the integrate run of §12.3.
+
+Rules that keep the board honest:
+
+- board entries are advice and never count as evidence, as in §9;
+- hidden checks, their names, and their output never reach a board a worker can read (§7);
+- entries are scoped to tenant and repository, and repository-board entries age out or are dropped when a verified run contradicts them;
+- workers read the board through a tool, and relevant new entries are added to the continuation packet at attempt boundaries, never injected mid-turn;
+- the board tools are served over the same per-session HTTP endpoint as memory, so every backend gets them, not only those that take in-process MCP servers.
+
+Independence is a policy, not an accident.
+Matched candidates (§8) and reviewer panels lose their value if they read each other's work, yet today they share repository memory.
+The collaboration code already argues for withholding memory tools to protect panel independence (`fleet.ts`), though whether role-children can recall each other's episodes through workspace memory is an inference that needs a test.
+A recipe therefore declares, per role, whether it reads the fleet board and other runs' memory during an attempt; candidates default to reading neither until selection is over.
+
+### 12.6 Supervision that costs nothing while nothing needs a decision
+
+Today each dispatch event is injected into the conductor as `<fleet_events>`, which starts a model turn.
+In a fleet of loops the controller is deterministic code, so it absorbs routine events itself: attempt started, check failed and a retry was admitted, claim renewed.
+The conductor model is woken only for events that need judgment: `needs_input`, `blocked`, `cannot_satisfy`, a fleet's completion, or budget exhaustion.
+Wakes are batched into one digest of references (§12.4).
+Events go through the durable outbox of §5, so a slow or restarted reader replays them instead of losing them, which is where herdr's in-memory ring falls short.
+The existing `fleet.subscribe` stream already does no work without a subscriber and can carry run deltas.
+
+### 12.7 Workspaces that can actually run the checks
+
+Dispatch workers run directly in the target workdir today, with no worktree, so two ship workers in one repository edit the same files.
+Every run therefore gets the owned worktree of §4.
+`createForkWorktree` carries tracked dirty state only: untracked and ignored files such as `.env` and installed dependencies are not copied, and git hooks are disabled.
+A worktree that cannot build produces infrastructure failures that look like failed attempts.
+
+Add a repository setup recipe, loaded under pack trust and never executed on read: a setup command, files to copy, directories to share, and resources to lease.
+Resource leases hand each run its own port range, database name, and environment variables, and release them when the run ends.
+Orca's `orca.yaml` covers setup scripts, copied files, and shared directories, but allocates no ports or other resources; leases close that gap.
+A setup failure is recorded as `error` evidence, does not consume an attempt, and blocks the run after a bounded number of repeats.
+
+### 12.8 Containment before autonomy
+
+Orca can run fleets unattended because it turns permissions off.
+Codeoid's loops will otherwise stall on approvals or run with broad grants in the user's own checkout.
+The sandbox spike in milestone A is what lets an unattended fleet be both autonomous and contained, and it also secures the evaluator (§7).
+Until it lands, unattended fleets are limited to recipes whose permission profile codeoid can enforce on the selected backend, and the board labels everything else as supervised.
+
+Each run already has ZeroID identity available: dispatch workers get grants by task shape, with no write grant for scouts (`agent-identity.ts`).
+Board writes, claims, and evidence carry that identity, which makes fleet activity attributable and revocable per run, something neither peer can express.
+
+### 12.9 Breadth through structured adapters
+
+Peers reach about forty agents by owning the terminal, at the cost of guessing state from the screen.
+A loop worker needs structured events, enforceable permissions, and usage reports, so codeoid adds breadth through protocols instead.
+The ACP provider is written for the Gemini CLI throughout (fixed id, binary resolution, accounts, model list), although its own comment notes the shape is reusable.
+Parameterize it so any ACP agent becomes a backend whose capabilities come from its declaration.
+Move the fleet tools from the Claude SDK's in-process server to the HTTP endpoint memory uses, so a conductor can run on any backend.
+Agents reachable only through a terminal can be listed as an unmanaged tier but cannot be workers in recipes that require enforced permissions.
+
+### 12.10 Review with the evidence beside the diff
+
+Orca sends line comments to an agent as one prompt.
+In codeoid a line comment on a candidate becomes a finding with an id in the existing findings ledger, the run starts a bounded repair attempt for it, and the comment resolves only when re-verification passes or the user records a disposition.
+The review view shows the candidate diff next to its evidence and the fleet board's entries for that run.
+Pull-request creation is a delivery effect under §6, enabled only when the contract authorizes it.
+
+### What codeoid does not chase
+
+Terminal-scraped breadth, hibernating idle terminals, and a multi-machine terminal view bring parity at best.
+Federation across machines stays on its own design track.
+The measure for this section is the same as for one run: verified completions per unit of cost and human attention, now across a fleet, with board advice and reference hand-offs each measured with and without (§14).
+
+## 13. Implementation sequence
 
 ### A. Evidence foundation
 
@@ -395,7 +574,9 @@ In the same milestone:
 - the three worker outcomes, including `cannot_satisfy` (§5), and the feedback policy (§7);
 - the approval profile and its `waiting` behavior (§6);
 - the escalation ladder through a different backend (§8);
-- the CI-failure and review-comment triggers for repair (§4, §10), delivering to a branch, with a PR comment only when authorized.
+- the CI-failure and review-comment triggers for repair (§4, §10), delivering to a branch, with a PR comment only when authorized;
+- the repository setup recipe and resource leases, so the owned worktree can run its checks (§12.7);
+- episodes tagged with run, attempt, and turn ids, and continuation packets and completion digests that carry episode ids instead of truncated prose (§12.4).
 
 Exit criterion: a real failing regression can be reproduced, repaired, independently checked, interrupted, resumed, and inspected across at least two provider adapters; a stalled run escalates to a second backend; a run started from a failing CI check finishes with revision-bound evidence; and a worker that reports `cannot_satisfy` on a contradictory task ends `blocked` instead of altering the checks.
 
@@ -407,13 +588,22 @@ Add the per-repository run record and its use in continuation packets (§9).
 
 Exit criterion: automated transitions cannot bypass a required human decision, a failing mandatory check, or an unsupported execution guarantee; and candidate selection is measured against sequential attempts at equal spend.
 
+### C2. Fleets
+
+Add the run-level fleet board and the daemon-side attention record (§12.1), evidence-gated dependencies (§12.2), and the integrate recipe (§12.3).
+Generalize the blackboard into fleet and repository boards with typed entries, ZeroID attribution, lease-fenced claims, and per-role independence policy, served over the HTTP tool endpoint (§12.5).
+Move supervision to deterministic absorption with judgment-only wakes over the durable outbox (§12.6).
+Parameterize the ACP provider and move the fleet tools to the HTTP endpoint (§12.9).
+
+Exit criterion: a fleet of at least three runs on one repository, two of them dependent, finishes with each run's evidence and an integrated tree that has its own; a dependent run never starts on a worker's claim alone; a candidate configured for independence cannot read its siblings' board entries or memory; and an idle fleet spends no model tokens.
+
 ### D. Schedules and optimization
 
 Add scheduled triggers, bounded queues, effect reconciliation for remote delivery, and optimization incumbents. Treat unattended execution as opt-in. Evaluate each recipe before recommending default activation.
 
 Do not start with a general workflow canvas, autonomous recipe rewriting, unlimited fleets, or a new orchestration language. The first delivery should make one useful loop dependable end to end.
 
-## 13. Verification and comparative evaluation
+## 14. Verification and comparative evaluation
 
 Use deterministic runtime tests for controller guarantees and a small task suite for agent outcomes. The Python evaluation code can remain a thin driver with JSONL outputs, allowing later integration with model-evals or Agent Almanac without making that migration a dependency.
 
@@ -440,6 +630,14 @@ Required runtime scenarios:
 - An attempt hits an approval outside its profile; the run waits and notifies, and the attempt clock stops.
 - A CI-failure trigger fires twice for the same commit; one run is created.
 - A learned entry contradicts current evidence; the evidence wins and the entry is dropped.
+- An upstream worker reports success but its mandatory check fails; the dependent run does not start.
+- Two runs pass on their own and fail when merged; the integrate run reports the conflicting pair and delivers nothing.
+- A stale worker writes a claim or board entry after lease replacement; it is rejected.
+- A hidden check fails; no board a worker can read contains its name or output.
+- A candidate configured for independence searches memory and the board; its siblings' in-flight work is not returned.
+- A completion digest or continuation packet is built; every excerpt carries the id of its full record, and `get_episode` returns that record verbatim.
+- A fleet sits idle for an hour with routine events; no model turn is started.
+- A setup command fails; the run records an infrastructure error and no attempt is consumed.
 
 For the first outcome study, use roughly a dozen bounded repository tasks covering repairs, small implementations, and performance work, plus blocked and flaky-environment cases. Compare a normal codeoid session, the existing findings workflow, a simple bounded repeat loop, and the proposed controller under matched provider/model and resource limits. Repeat stochastic runs and retain failures.
 
@@ -458,10 +656,11 @@ A claim to lead is earned on four measurements, each at matched model and spend:
 
 Publish the task suite, the matched settings, and the losses alongside the wins.
 
-## 14. Decisions and remaining design work
+## 15. Decisions and remaining design work
 
 Recommended decisions: daemon-owned lifecycle; existing dispatcher for execution; evidence collected outside the worker; stable run identity across sessions; explicit capability limits; human pipeline boundaries preserved by default; packs for recipes; one repair workflow first.
 That first workflow ships with hidden checks, a `cannot_satisfy` outcome, a designed feedback policy, cross-backend escalation, and CI and review-comment triggers; candidate selection and learned run records follow in the next milestone.
+For fleets: the run, not the session, is the unit on the board; dependencies wait for evidence; hand-offs carry references to verbatim history, never summaries; and agents share what they learn through typed, attributed, evidence-linked boards whose entries never count as evidence.
 
 Implementation still needs to settle the sandbox mechanism on supported operating systems, provider cancellation guarantees, artifact retention defaults, the exact store migration, and which acceptance inputs a recipe must pin. These require focused implementation spikes, not another broad market survey.
 
