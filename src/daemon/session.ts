@@ -424,7 +424,7 @@ export interface SessionCreateOptions {
    * Thinking effort chosen at creation (#417): outranks
    * config.session.defaultEffort, and is kept with the session.
    */
-  effort?: EffortLevel;
+  effort?: EffortLevel | null;
   /**
    * Observe every status transition of this session. The dispatcher uses
    * this to detect a worker's turn completing (→ idle/error) or wedging
@@ -1310,7 +1310,11 @@ export class Session {
     // Thinking effort (#417): a resumed session keeps its own (none = the
     // backend's default); a new one takes the effort chosen at creation, else
     // the config default.
-    this.#effort = opts.existingId ? this.#store.getSessionEffort(this.id) : (opts.effort ?? opts.config?.session.defaultEffort ?? null);
+    this.#effort = opts.existingId
+      ? this.#store.getSessionEffort(this.id)
+      : opts.effort !== undefined
+        ? opts.effort
+        : (opts.config?.session.defaultEffort ?? null);
 
     this.#provider = opts._testProvider ?? this.#createProvider(opts.providerId);
     this.#appliedAccount = this.#accountState(this.#provider.id);
@@ -5089,7 +5093,7 @@ export class Session {
       }
     }
     const shown = effort ?? "the backend's default";
-    const when = applies === "now" ? "" : applies === "restart" ? " — the backend restarts with it before the next turn" : " — from the next turn";
+    const when = applies === "now" ? "" : applies === "restart" ? " — the backend restarts with it between turns, once no work is running" : " — from the next turn";
     const info = this.#makeMessage("info", `⎆ Thinking effort: ${shown}${when}.`, SYSTEM_IDENTITY, undefined, undefined, {
       event: "session.effort_changed",
       effort,

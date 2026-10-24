@@ -7,7 +7,7 @@ How hard a session's model thinks before it answers, on one scale for every back
 **Default, Off, Minimal, Low, Medium, High, Extra high (`xhigh`), Max.**
 
 **Default** is the backend's own choice, as it always was.
-Most backends are simply sent nothing; two keep a level once it's set, so Default is sent to them explicitly, as the level they would pick unasked: Codex gets your configured `model_reasoning_effort` (project config included), else the running model's own default; pi gets the default in its settings (the project's `.pi/settings.json`, else yours; `defaultThinkingLevel`, else Medium).
+Most backends are simply sent nothing; two keep a level once it's set, so Default is sent to them explicitly, as the level they would pick unasked: Codex gets your configured `model_reasoning_effort` (project config included), else the running model's own default; pi gets the default in your pi settings (`defaultThinkingLevel`, else Medium; a project's `.pi/settings.json` isn't read, since pi honours it only for a project you trust).
 On Codex, a model its catalog doesn't list, with no effort configured, has no known default: Default then sends nothing, so a level set earlier on that thread stays until the next thread.
 Every other level is mapped to the backend's own setting (below).
 A level a backend has no exact match for goes to its nearest one; pi clamps a level a model doesn't take to the nearest it does.
@@ -41,7 +41,8 @@ A change never cuts a running turn short.
 
 - **Now**, on the running backend: Claude (except to or from Off), Qwen (except back to Default), pi.
 - **From the next turn**: Codex, OpenAI, llama.cpp, Gemini — they take it with every request — and the exceptions above, whose next turn starts a fresh query that resumes the conversation.
-- **After a restart, before the next turn**: the Gemini CLI, which reads it only from its settings at startup. It resumes the conversation, as after a model change.
+- **After a restart, between turns**: the Gemini CLI, which reads it only from its settings at startup.
+  It restarts before the next turn that starts with no background work running, and resumes the conversation, as after a model change.
 
 ## What each level means on each backend
 

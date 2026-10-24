@@ -330,7 +330,7 @@ export class PiProvider implements SessionProvider {
       // Allowlisted env (GHSA-38vh): pi gets its credentials (~/.pi via
       // HOME, provider API keys), never codeoid's own secrets.
       // pi's thinking-level writes stay in a copy of its settings (#417).
-      env: this.#piEnv(opts.workdir),
+      env: this.#piEnv(),
       onEvent: (frame) => this.#onFrame(frame),
       onExit: ({ code, signal, stderrTail }) => {
         this.#bridgeReady = false;
@@ -429,9 +429,9 @@ export class PiProvider implements SessionProvider {
   }
 
   /** pi's environment: the account's, in an overlay whose settings.json is codeoid's copy. */
-  #piEnv(workdir: string): Record<string, string> {
+  #piEnv(): Record<string, string> {
     const env = applyPiAccount(this.#resolveAccount?.() ?? null, buildPiEnv());
-    this.#defaultThinkingLevel = piDefaultThinkingLevel(env, workdir);
+    this.#defaultThinkingLevel = piDefaultThinkingLevel(env);
     return applyPiSettingsOverlay(env);
   }
 

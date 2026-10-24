@@ -4779,7 +4779,7 @@ mcpHub: this.#mcpHub,
         // thinking as hard (#417).
         claudeAccount: parent.claudeAccount,
         accountChoices: parent.accountChoices,
-        ...(parentInfo.effort ? { effort: parentInfo.effort } : {}),
+        effort: parentInfo.effort ?? null, // the parent's Default stays Default
         hooks: this.#hooks,
         providerId,
         forkedFrom: {

@@ -371,7 +371,7 @@ function isLockEntry(dir: string, name: string): boolean {
   try {
     return statSync(join(dir, name)).isDirectory();
   } catch {
-    return false;
+    return true; // gone between the listing and now: a lock just released
   }
 }
 
@@ -391,8 +391,8 @@ function unlinkLink(link: string): void {
  * pi saves a thinking-level change (and a model change) as the user's global
  * default in that file; the copy keeps them out of the user's own pi. (Sessions
  * on the same base share the copy — codeoid sends each its level every turn.)
- * pi locks auth.json by the path it was given, so a pi run elsewhere on the
- * user's own dir doesn't share that lock (docs/thinking-effort.md).
+ * pi's OAuth refresh locks the real auth.json; only a sign-in or sign-out
+ * locks by this overlay's path (docs/thinking-effort.md).
  */
 export function applyPiSettingsOverlay(
   env: Record<string, string>,
@@ -430,18 +430,17 @@ export function applyPiSettingsOverlay(
 }
 
 /**
- * The thinking level pi starts a session at, as the user set it (#417): the
- * project's .pi/settings.json default (pi layers it over the user's), else
- * the user's, else pi's own, Medium.
+ * The thinking level pi starts a session at, as the user set it (#417): their
+ * settings' default, else pi's own, Medium. A project's .pi/settings.json
+ * isn't read: pi honours it only for a project the user trusts, and a repo
+ * mustn't choose the level (and the cost) by committing one.
  */
-export function piDefaultThinkingLevel(env: Record<string, string | undefined>, workdir?: string): string {
-  for (const file of [...(workdir ? [join(workdir, ".pi", "settings.json")] : []), join(piAgentDirOf(env), "settings.json")]) {
-    try {
-      const level = (JSON.parse(readFileSync(file, "utf8")) as { defaultThinkingLevel?: unknown }).defaultThinkingLevel;
-      if (typeof level === "string" && level) return level;
-    } catch {
-      // None, or unreadable: the next.
-    }
+export function piDefaultThinkingLevel(env: Record<string, string | undefined>): string {
+  try {
+    const level = (JSON.parse(readFileSync(join(piAgentDirOf(env), "settings.json"), "utf8")) as { defaultThinkingLevel?: unknown }).defaultThinkingLevel;
+    if (typeof level === "string" && level) return level;
+  } catch {
+    // None, or unreadable: pi's own default.
   }
   return "medium";
 }

@@ -124,15 +124,14 @@ describe("pi's settings overlay", () => {
     expect(readlinkSync(join(home, ".sqlite-maintenance.lock"))).toBe(join(base, ".sqlite-maintenance.lock"));
   });
 
-  it("pi's Default: the project's settings first, then the user's", () => {
+  it("pi's Default is the user's own — never a repo's .pi/settings.json, which pi honours only for a trusted project", () => {
     const agent = join(tmp, "agent");
     const work = join(tmp, "proj");
     mkdirSync(join(work, ".pi"), { recursive: true });
     mkdirSync(agent, { recursive: true });
     writeFileSync(join(agent, "settings.json"), JSON.stringify({ defaultThinkingLevel: "low" }));
-    expect(piDefaultThinkingLevel({ PI_CODING_AGENT_DIR: agent }, work)).toBe("low");
-    writeFileSync(join(work, ".pi", "settings.json"), JSON.stringify({ defaultThinkingLevel: "high" }));
-    expect(piDefaultThinkingLevel({ PI_CODING_AGENT_DIR: agent }, work)).toBe("high");
+    writeFileSync(join(work, ".pi", "settings.json"), JSON.stringify({ defaultThinkingLevel: "xhigh" }));
+    expect(piDefaultThinkingLevel({ PI_CODING_AGENT_DIR: agent })).toBe("low");
   });
 
   it("reads a ~ path as pi does", () => {
@@ -287,6 +286,17 @@ describe("a session's thinking effort", () => {
     // The same level again while a restart is still to come says so.
     expect(await setEffort(m, sid, "low")).toMatchObject({ data: { applies: "restart" } });
     expect(await setEffort(m, sid, "low")).toMatchObject({ data: { applies: "restart" } });
+  });
+
+  it("a fork of a session at Default stays at Default, whatever the config default", async () => {
+    const { m } = manager(() => new MockSessionProvider("claude", []), "claude", "high");
+    const sid = await create(m);
+    expect(await setEffort(m, sid, null)).toMatchObject({ type: "response.ok" });
+    await turn(m, sid);
+    const r = (await m.handle({ type: "session.fork", id: "f", sessionId: sid, name: "f" }, auth([...ALL, SCOPES.SESSION_READ]), client)) as {
+      data?: { id?: string; session?: { id: string } };
+    };
+    expect(m._sessionForTest((r.data?.session?.id ?? r.data?.id)!)!.toInfo().effort).toBeUndefined();
   });
 
   it("a fork thinks as hard as the session it came from", async () => {
