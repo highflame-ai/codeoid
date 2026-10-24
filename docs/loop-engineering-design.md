@@ -41,7 +41,7 @@ Leadership comes from combining that reliability with seven things codeoid is un
 5. **Learning across runs.**
    Failure fingerprints, rejected approaches, and recipe outcomes persist per repository and inform later runs, as advice that never counts as evidence.
 6. **History by reference, never by summary.**
-   Codeoid owns the conversation and keeps every byte of it, so a hand-off between attempts, runs, or agents can point at the verbatim record instead of a compacted summary (§12.4).
+   Codeoid owns the conversation and keeps every byte of it under an explicit retention policy, so a hand-off between attempts, runs, or agents can point at the verbatim record instead of a compacted summary (§12.4).
 7. **A shared board for a fleet.**
    Agents working toward one objective record discoveries, hypotheses, failed approaches, and claims on a typed, attributed board whose entries link to evidence (§12.5).
 
@@ -129,13 +129,15 @@ Every field below is fixed when the run starts and changes only through a contra
 | `checks.visible` | Checks the worker is told about; their bounded output is returned to it as diagnostics. |
 | `checks.hidden` | Checks the worker is never told about and never sees output from. Completion requires them to pass. Their result is reported to the worker only as "not yet accepted". |
 | `protected` | Paths and inputs the worker must not change: the acceptance suite, its launchers, fixtures, and configuration (§7). |
-| `workers` | The permitted backends and models, in escalation order, with any candidate fan-out (§8). |
+| `workers` | The permitted backends, models, and accounts, in escalation order, with any candidate fan-out (§8). Moving to another listed account is a recorded event, not a contract revision. |
 | `permissions` | The tool and approval profile attempts run under (§6). |
 | `limits` | Attempts, time, concurrency, deadline, and spend where enforceable (§8). |
 | `delivery` | Local branch by default; push, PR, or comment only when authorized. |
 
 Hidden checks are not secret from the user; they are listed in the contract and the evidence report.
 A recipe may require them, and a repair started from a failing check uses the wider regression suite as its hidden set by default.
+A hidden check that lives in the repository is *withheld* — named and reported to nobody but the user — rather than *sealed*, stored outside the workspace.
+Only sealed checks support the "never sees output" guarantee, because the worker can run a withheld suite itself; the evidence report says which kind each check was.
 
 Later recipes:
 
@@ -311,9 +313,9 @@ A stopped run always retains the best verified candidate and unresolved work. Ex
 
 Measure progress using criterion results, resolved findings, validated artifacts, or objective improvement. Changed files and tool calls are diagnostic signals, not proof of progress.
 
-Fingerprint failures and candidate snapshots. Repeated identical failures, A/B oscillation, no material evidence change, or repeated infrastructure errors should trigger a bounded response: revise the hypothesis, refresh context, choose another permitted model, or stop with a blocker. Do not mandate monotonic improvement at every internal edit; a repair may require intermediate broken states.
+Fingerprint failures and candidate snapshots. Repeated identical failures, A/B oscillation, no material evidence change, or repeated infrastructure errors (other than a quota wait, §12.11) should trigger a bounded response: revise the hypothesis, refresh context, choose another permitted model, or stop with a blocker. Do not mandate monotonic improvement at every internal edit; a repair may require intermediate broken states.
 
-Oscillation is detected exactly, not heuristically: every candidate is a checkpoint tree, so a candidate whose tree digest matches an earlier one in the run is a revisit.
+Oscillation is detected exactly, not heuristically: every candidate is a pinned tree (§12.4), so a candidate whose tree digest matches an earlier one in the run is a revisit.
 
 ### Escalation ladder
 
@@ -419,6 +421,7 @@ Those two gaps are where codeoid should compete.
 The fleet board lists runs, not sessions.
 A row's state is the run's lifecycle state from §6, so "needs you" means a run in `waiting` or `blocked` with a named dependency, not a terminal that looks idle.
 Worker sessions stay attachable underneath their run.
+An attached client can watch and approve; anything it sends becomes queued steering for the controller (§6), which alone resumes a hibernated worker.
 
 The attention inbox is derived in the web client today (`web/src/lib/attention.ts`).
 For a fleet it becomes a daemon-side record, so the web UI, the TUI, Telegram, and push notifications show the same items and clear them together.
@@ -441,11 +444,11 @@ Nothing is delivered to the target branch until the integrated tree has its own 
 
 ### 12.4 History by reference, never by summary
 
-Codeoid's memory keeps every byte of every session.
+Codeoid's memory keeps every byte of every session for as long as retention allows (§12.11), and never drops what retained evidence references.
 Each episode's full body is stored compressed (`memory/store.ts`, `episode_payloads`), search indexes a bounded view of it (`memory/lossless.ts`), and `get_episode` pages the verbatim body back.
 Context rotation can replace lossy compaction: the new context gets the last user turn (up to 2,000 characters) and the four memory tools, with no summary (`Session.#rotate`, `renderRotationSeed`).
 Soft rotation at 90% occupancy is opt-in today (`autoRotate.enabled` defaults to false); only the 97% hard ceiling fires regardless, so a backend's own compaction can still run first.
-Loops turn soft rotation on for every worker, and making it the default is part of milestone B.
+Loops turn soft rotation on for every worker in milestone B; making it the default for all sessions is evaluated after that.
 Every backend that supports memory tools gets them through its own tool path: in-process servers on Claude and Qwen, the HTTP endpoint on Codex and the Gemini CLI, function tools on OpenAI, Gemini, and llama.cpp, and a bridge on pi — all fed by one definition set (`memory/tools.ts`).
 The peers do not own the conversation, so each CLI's compaction decides what survives.
 Orca's coordinator can page a bounded archive of one worker's latest attempt; codeoid's record is complete, indexed, and addressable by episode and turn id across sessions, runs, and backends.
@@ -458,19 +461,24 @@ Several codeoid surfaces still hand off truncated prose instead of references, a
 | `fleet_recall` | Episode one-liners without ids, so `get_episode` cannot expand them | Return episode ids, scoped to the caller's tenant |
 | Routine `{{last_summary}}` | Previous run's final text cut to 4,000 characters | Also pass the previous run's session id, which each routine run already records, so the next run can page what it needs |
 | Switch, fork, and rewind seeding | Native continuation first on Claude and Codex (#387); otherwise the `transcript` strategy by default, which cuts each tool payload to 2K within a 24K seed, on top of capture caps (8K shell, 32K reads, 16K MCP) | Loop workers use the verbatim working-set strategy, capped at a fraction of the target's reported context window, with anything beyond the cap passed as ids and one-line previews; evidence never comes from canonical history |
-| Rotation seed | Worded for Claude (`session.ts`) | Backend-neutral wording, since every backend now has the tools |
+| Rotation seed | Worded for Claude (`renderRotationSeed`, `providers/context-strategy.ts`) | Backend-neutral wording, since every backend now has the tools |
 
 Two additions make history addressable at run granularity.
 Episodes gain run and attempt ids and the turn id they belong to, so a continuation packet can say "attempt 2's failing output is episode X" and an evidence report can cite exact spans.
-File state is already addressable the same way: each turn's checkpoint tree (`refs/turns/<turnId>`) is the reference a candidate, an integration base, or an evidence record names.
-And cross-workspace recall (`recallGlobal`), which scans every workspace and relies on the store having a single user (the global-retrieval note in `memory/store.ts`), gets tenant scoping before any fleet surface relies on it.
+File state is addressable the same way: each turn's checkpoint tree (`refs/turns/<turnId>`) is the natural reference for a candidate, an integration base, or an evidence record.
+Per-session checkpoints are pruned by count and storage budget, skipped when a tree exceeds their limits, and deleted with the session, so a run pins the refs its candidates and evidence name in run-owned storage, and a skipped snapshot makes the attempt's evidence `error`.
+
+Cross-workspace recall (`recallGlobal`) scans every workspace, relying on the store having a single user (the global-retrieval note in `memory/store.ts`).
+Two surfaces already depend on it: `fleet_recall`, which does not filter hits by tenant at all, and `session.search` with scope `all`, which drops only hits from live cross-tenant sessions (#13).
+Tenant scoping moves into the store before any new fleet surface is built on it, and `fleet_recall` is fixed in milestone B.
 
 The rule for every hand-off in a fleet: a summary may be an index into the record, never a replacement for it.
 A one-line preview is fine when it carries the id of the full record.
 
 References do not widen access.
 Resolving an episode or evidence id is authorized per reader: a worker can resolve visible-check evidence and episodes its run is allowed to see, and nothing else.
-Hidden checks run outside any worker session, so their output never enters workspace memory, and their evidence resolves only for the controller and the user.
+Hidden checks run outside any worker session, on a disposable copy of the frozen candidate; nothing they write returns to any workspace, and their output never enters workspace memory.
+Their evidence resolves only for the controller and a human user's own client; a conductor or any other model session sees a hidden result only as "not yet accepted", so it cannot relay detail to workers.
 
 ### 12.5 A blackboard for the fleet
 
@@ -533,7 +541,7 @@ The existing `fleet.subscribe` stream already does no work without a subscriber 
 ### 12.7 Workspaces that can actually run the checks
 
 Dispatch workers run directly in the target workdir today, with no worktree, so two ship workers in one repository edit the same files.
-Every run therefore gets the owned worktree of §4.
+Every run therefore gets the owned worktree of §3 and milestone B.
 `createForkWorktree` carries tracked dirty state only: untracked and ignored files such as `.env` and installed dependencies are not copied, and the repository's `post-checkout` hooks do not run at creation, so hook-driven setup never happens.
 A worktree that cannot build produces infrastructure failures that look like failed attempts.
 
@@ -563,7 +571,7 @@ A loop worker needs structured events, enforceable permissions, and usage report
 Orca also speaks ACP to some agents; the difference is that codeoid requires a structured adapter for any worker whose recipe needs enforced permissions.
 The ACP provider is written for the Gemini CLI throughout (fixed id, binary resolution, accounts, model list), although its own comment notes the shape is reusable.
 Parameterize it so any ACP agent becomes a backend whose capabilities come from its declaration.
-Serve the fleet and board tools the way memory tools are served — one definition set, delivered through each backend's own tool path — instead of only the Claude SDK's in-process server, so a conductor can run on any backend.
+Serve the fleet and board tools the way memory tools are served — one definition set, delivered through each backend's own tool path — instead of only the in-process servers on Claude and Qwen, so a conductor can run on any backend.
 Agents reachable only through a terminal can be listed as an unmanaged tier but cannot be workers in recipes that require enforced permissions.
 
 ### 12.10 Review with the evidence beside the diff
@@ -580,13 +588,14 @@ Herdr and Orca handle several of these basics; codeoid has to match them, and it
 
 | Need | Peer behaviour | codeoid today | Requirement |
 | --- | --- | --- | --- |
-| Idle backends | Orca hibernates done, idle agents after 30 minutes and resumes them natively, never while a dispatch is unsettled or a subagent is live | A backend starts lazily on first send and resumes natively after a restart (#387), but once started it stays alive until the session is destroyed | Stop idle backends after a configurable period and restart them lazily through the same native resume; never while a run owns the session in `running` or `verifying`, an approval is pending, or background work is live |
-| Usage limits | Orca tracks usage per account, warns at 80%, orders accounts by remaining headroom, and switches accounts | `fallbackModel` and the SDK's retries only; accounts switch by hand (#392, #408); admission counts spawns, not quota | Detect usage-limit and rate-limit errors with their reset time; record them as infrastructure errors that consume no attempt; move the run to `waiting` until the reset, or to another account of the same backend that the contract permits; make dispatch admission consult per-account headroom |
-| Hung work | Orca flags dispatches whose heartbeat goes stale | A 5-minute stall watchdog and 10-minute leases, but the watchdog pauses while a tool runs and the lease keeps renewing, so a hung tool can hold a task indefinitely | Enforce §8's per-attempt and whole-run wall time in the supervisor, independent of tool state and lease renewal |
-| Restart | herdr restores layout and resume references; Orca resumes CLIs natively | Dispatch tasks are reclaimed and continued; routine runs are marked interrupted and not retried; an interactive turn in flight is dropped | Loop runs reconcile per §6; routine runs started by a loop resume as attempts rather than ending as interrupted |
-| Disk and retention | Orca runs archive scripts when worktrees are removed | Worktrees and checkpoints are removed only when a session is destroyed; checkpoints are budgeted per session, not globally; episodes and the audit log are never pruned | Collect worktrees and branches of terminal runs after a retention period, with a global checkpoint budget; add an explicit retention policy for episodes and audit that pins whatever retained evidence references; deleting is a recorded policy action, never a silent summary |
-| Attention | herdr and Orca notifications jump to the waiting agent | Mobile push carries the session id; a browser notification only focuses the window; Telegram reaches only attached users | Every notification opens the run and its pending item, and reaches the run's owner on every connected surface |
-| Fleet budgets | Orca reports usage and estimated cost | Daily and lifetime cost views; budgets exist only on routines (`maxCostUsd`, `dailyCostUsd`); cost views read live sessions, so destroyed workers likely drop out | Per-tenant daily and per-fleet budgets enforced at admission, with cost attributed to runs so it survives worker teardown |
+| Idle backends | Orca's experimental, opt-in hibernation stops done, idle agents after 30 minutes by default and resumes them natively, never while a dispatch is unsettled or a subagent is live | A backend starts lazily on first send and resumes natively after a restart (#387), but once started it stays alive until the session is destroyed | Stop idle backends after a configurable period and restart them lazily through the same native resume; never while a run owns the session in `running` or `verifying`, an approval is pending, or background work is live |
+| Usage limits | Orca reads per-account usage from each CLI's local state, warns at 80% of a window, lists providers tightest-first, and switches the active account in one click for sessions launched afterwards; nothing switches automatically on a limit | `fallbackModel` and the SDK's retries only; accounts switch by hand (#392, #408); admission counts spawns, not quota | Detect usage-limit and rate-limit errors with their reset time; record them as infrastructure errors that consume no attempt; move the run to `waiting` until the reset, or to another account listed in the contract's `workers`; make dispatch admission consult per-account headroom; a quota wait stops the attempt clock and is bounded by the run's deadline |
+| Hung work | Orca logs a warning when a dispatch misses heartbeats for 10 minutes, and never fails it | A 5-minute stall watchdog and 10-minute leases, but the watchdog pauses while a tool runs and the lease keeps renewing, so a tool without its own timeout can hold a task indefinitely (external MCP calls time out at 2 minutes by default) | Enforce §8's per-attempt wall time and whole-run active execution time in the supervisor, independent of tool state and lease renewal |
+| Run nesting | Orca limits nested workers to depth 1 by default | No dispatch depth limit, and §12.9 serves fleet tools to every backend | A worker cannot start runs unless its recipe grants it; nesting depth is a contract limit, default 1, and child runs spend from the parent's budget |
+| Restart | herdr restores layout and resume references; Orca resumes CLIs natively | Dispatch tasks are reclaimed and continued; routine runs are marked interrupted and not retried; an interactive turn in flight is dropped | Loop runs reconcile per §6; a loop run started by a routine reconciles as a loop run instead of closing as interrupted (milestone E) |
+| Disk and retention | Orca runs archive scripts when worktrees are removed | A codeoid-created worktree is removed only when its session is destroyed, and its branch is kept; checkpoints are pruned within each session (200 newest, 2 GiB) but have no global budget; episodes and the audit log are never pruned | Collect worktrees and branches of terminal runs after a retention period, with a global checkpoint budget; add an explicit retention policy for episodes and audit that pins whatever retained evidence references; deleting is a recorded policy action, and resolving a pruned id returns `expired`, never a summary |
+| Attention | Orca's bell and herdr's Windows notifications jump to the waiting pane | Mobile push carries the session id; a browser notification only focuses the window; Telegram reaches only attached users | Every notification opens the run and its pending item, and reaches the run's owner on every connected surface |
+| Fleet budgets | Orca reports usage and estimated cost | Daily and lifetime cost views; budgets exist only on routines (`maxCostUsd`, `dailyCostUsd`); cost views cover only sessions still in the store, and destroying a session deletes its row, so destroyed workers drop out | Per-tenant daily and per-fleet budgets enforced at admission, with cost attributed to runs so it survives worker teardown |
 
 Two further items are useful but not blocking: admission that accounts for the host's CPU and memory as well as worker counts (neither peer does this), and issue-tracker sources such as GitHub issues, Linear, or Jira as run triggers, which reuse the authenticated trigger adapters of §10.
 
@@ -626,7 +635,8 @@ In the same milestone:
 - episodes tagged with run, attempt, and turn ids, and continuation packets and completion digests that carry episode ids instead of truncated prose (§12.4);
 - soft rotation on for every loop worker, with the rotation seed made backend-neutral (§12.4);
 - attempt generations on dispatch, so stale results and claims are fenced (§5, §12.5);
-- reference resolution authorized per reader, and hidden checks run outside worker sessions (§12.4);
+- reference resolution authorized per reader, hidden checks run outside worker sessions on a disposable copy, and `fleet_recall` scoped to the caller's tenant (§12.4);
+- run-pinned candidate and evidence trees (§12.4);
 - usage-limit detection as a non-attempt infrastructure error with a `waiting` wakeup, and supervisor wall-time limits that hold even while a tool is running (§12.11).
 
 Exit criterion: a real failing regression can be reproduced, repaired, independently checked, interrupted, resumed, and inspected across at least two provider adapters; a stalled run escalates to a second backend; a run started from a failing CI check finishes with revision-bound evidence; and a worker that reports `cannot_satisfy` on a contradictory task ends `blocked` instead of altering the checks.
@@ -645,7 +655,7 @@ Add the run-level fleet board and the daemon-side attention record (§12.1), evi
 Generalize the blackboard into fleet and repository boards with typed entries, ZeroID attribution, generation-fenced advisory claims, write quotas, and a per-role independence policy backed by a run-visibility filter in the memory store (§12.5).
 Extend `dispatch_events` with run-level types and a `needs_judgment` flag, so routine events are absorbed without a model turn (§12.6).
 Parameterize the ACP provider, and serve fleet and board tools through every backend's own tool path (§12.9).
-Add the operational floor of §12.11: idle-backend hibernation with run-aware guards, quota-aware admission and permitted account failover, retention and collection for worktrees, checkpoints, episodes, and audit, notifications that open the run, and per-tenant and per-fleet budgets.
+Add the operational floor of §12.11: idle-backend hibernation with run-aware guards, quota-aware admission and permitted account failover, a nesting-depth limit, retention and collection for worktrees, checkpoints, episodes, and audit, notifications that open the run, and per-tenant and per-fleet budgets.
 
 Exit criterion: a fleet of at least three runs on one repository, two of them dependent, finishes with each run's evidence and an integrated tree that has its own; a dependent run never starts on a worker's claim alone; a candidate configured for independence cannot read its siblings' board entries or memory; an idle fleet spends no model tokens; and a fleet left running for a day survives a usage-limit reset, holds no idle backend processes, and stays within its disk budget.
 
@@ -693,7 +703,10 @@ Required runtime scenarios:
 - A subscription hits its usage limit mid-fleet; affected runs wait until the reset or move to a permitted account, and no attempt is consumed.
 - A tool hangs while its lease keeps renewing; the attempt ends at its wall-time limit.
 - An idle worker backend is stopped and the next attempt resumes it natively; a backend with a pending approval or live background work is not stopped.
-- Retention collects an old run; evidence still referenced by a retained run keeps its episodes.
+- Retention collects an old run; evidence still referenced by a retained run keeps its episodes, and a pruned id resolves to `expired`.
+- `fleet_recall` called from one tenant returns no episode from another tenant, live or not.
+- A withheld hidden check writes into the workspace while running; nothing it writes reaches the next attempt.
+- A worker nested past the contract's depth limit tries to start a run; it is refused.
 
 For the first outcome study, use roughly a dozen bounded repository tasks covering repairs, small implementations, and performance work, plus blocked and flaky-environment cases. Compare a normal codeoid session, the existing findings workflow, a simple bounded repeat loop, and the proposed controller under matched provider/model and resource limits. Repeat stochastic runs and retain failures.
 
