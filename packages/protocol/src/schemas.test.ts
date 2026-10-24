@@ -99,6 +99,7 @@ const samples: { [T in ClientTypes]: Extract<ClientMessage, { type: T }> } = {
   "session.rotate": { type: "session.rotate", id: "r13", sessionId: "s1" },
   "session.search": { type: "session.search", id: "r14", query: "auth bug", scope: "all", limit: 5 },
   "session.set_model": { type: "session.set_model", id: "r15", sessionId: "s1", model: "opus", fallbackModel: null },
+  "session.set_effort": { type: "session.set_effort", id: "r15e", sessionId: "s1", effort: "high" },
   "session.mcp_reconnect": { type: "session.mcp_reconnect", id: "r28m", sessionId: "s1", server: "slack" },
   "session.mcp_refresh": { type: "session.mcp_refresh", id: "r28r", sessionId: "s1" },
   "mcp.approve.preview": { type: "mcp.approve.preview", id: "r28p", sessionId: "s1", server: "db" },

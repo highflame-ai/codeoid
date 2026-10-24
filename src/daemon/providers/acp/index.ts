@@ -46,7 +46,8 @@ import type { McpServerView } from "../../mcp/registry.js";
 import { McpProxyLease, type McpProxyMount } from "../../mcp/proxy.js";
 import { resolveEnvMap } from "../../mcp/types.js";
 import type { ResolvedAccount } from "../../accounts.js";
-import { applyGeminiCliAccount } from "../../account-apply.js";
+import { applyGeminiCliAccount, applyGeminiCliEffort } from "../../account-apply.js";
+import { effortRejectionHint } from "../effort.js";
 
 export interface GeminiAcpProviderInit {
   sessionId: string;
@@ -98,6 +99,8 @@ export class GeminiAcpProvider implements SessionProvider {
   readonly appliesToolInputRewrite = false;
   readonly id = "gemini-cli";
   readonly displayName = "Gemini CLI (Google)";
+  /** Its thinking is a settings value, read at startup: a change rebuilds it (#417). */
+  readonly effortChange = "restart" as const;
 
   onRecoveryNeeded: ((content: string) => void) | undefined;
 
@@ -213,9 +216,10 @@ export class GeminiAcpProvider implements SessionProvider {
     this.#hasQueried = true;
 
     void this.#runPrompt(opts).catch((err: unknown) => {
+      const text = err instanceof Error ? err.message : String(err);
       this.#push({
         type: "error",
-        message: `gemini-cli: ${err instanceof Error ? err.message : String(err)}`,
+        message: `gemini-cli: ${text}${opts.effort ? effortRejectionHint(text, opts.effort) : ""}`,
       });
       queue.close();
     });
@@ -310,7 +314,8 @@ export class GeminiAcpProvider implements SessionProvider {
         args: [...this.#argsPrefix, "--acp"],
         cwd: opts.workdir,
         // The account's own GEMINI_CLI_HOME (an overlay selecting its auth type).
-        env: applyGeminiCliAccount(this.#resolveAccount?.() ?? null, buildGeminiCliEnv()),
+        // ...and, for a thinking effort, an overlay of that whose settings set it (#417).
+        env: applyGeminiCliEffort(opts.effort, applyGeminiCliAccount(this.#resolveAccount?.() ?? null, buildGeminiCliEnv())),
         onNotification: (method, params) => this.#onNotification(method, params),
         onServerRequest: (method, params) => this.#onServerRequest(method, params),
         onExit: ({ code, signal, stderrTail }) => {

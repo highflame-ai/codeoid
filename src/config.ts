@@ -19,6 +19,7 @@ import { randomBytes } from "node:crypto";
 import { join, isAbsolute, resolve, dirname } from "node:path";
 import { homedir } from "node:os";
 import { z } from "zod";
+import { EFFORT_LEVELS, type EffortLevel } from "./protocol/types.js";
 import type { AuthConfig } from "./daemon/auth.js";
 import type { OAuthConfig } from "./daemon/oauth.js";
 import {
@@ -371,6 +372,12 @@ const SessionSchema = z
     defaultProvider: z.string().trim().min(1).optional(),
     defaultModel: z.string().optional(),
     fallbackModel: z.string().optional(),
+    /**
+     * Thinking effort for a session created without one (#417), on codeoid's
+     * scale; each backend maps it (docs/thinking-effort.md). Unset = the
+     * backend's own default.
+     */
+    defaultEffort: z.enum(EFFORT_LEVELS).optional(),
     /**
      * Hard backstop against a wedged turn. If the provider event stream goes
      * completely silent (no events at all) for this many ms while the MODEL
@@ -1263,6 +1270,8 @@ export interface CodeoidConfig {
     defaultProvider?: string;
     defaultModel?: string;
     fallbackModel?: string;
+    /** Thinking effort for a new session (#417); unset = the backend's default. */
+    defaultEffort?: EffortLevel;
     /** Stall watchdog: ms of event-stream silence while the model should be generating before a turn is force-recovered (0 = off; paused during tool execution and pending approvals). Defaults to 300000 when omitted. */
     turnStallTimeoutMs?: number;
     /** Per-call timeout (ms) for external MCP servers, surfaced as the SDK's per-server `timeout`. 0 = use SDK default. Defaults to 120000 when omitted. */
@@ -1509,6 +1518,7 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   { env: "CODEOID_AUTO_ROTATE_MIN_TURNS", path: "autoRotate.minTurnsBeforeRotate", kind: "int" },
   { env: DEFAULT_PROVIDER_ENV, path: "session.defaultProvider", kind: "string" },
   { env: "CODEOID_DEFAULT_MODEL", path: "session.defaultModel", kind: "string" },
+  { env: "CODEOID_DEFAULT_EFFORT", path: "session.defaultEffort", kind: "string" },
   { env: "CODEOID_MCP_OAUTH_REDIRECT_BASE_URL", path: "mcpOAuth.redirectBaseUrl", kind: "string" },
   // Dispatch kill switch — disable send-class fleet dispatch per-invocation
   // without touching config.json. Other dispatch knobs are file-config only,

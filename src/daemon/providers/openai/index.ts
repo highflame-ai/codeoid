@@ -15,6 +15,8 @@
  */
 
 import type { McpTenant } from "../../mcp/oauth.js";
+import type { EffortLevel } from "../../../protocol/types.js";
+import { effortRejectionHint } from "../effort.js";
 import OpenAI from "openai";
 import { AsyncQueue } from "../../async-queue.js";
 import type {
@@ -129,6 +131,11 @@ export interface OpenAIProviderInit {
    * OpenAI's about tool schemas (llama.cpp compiles them into a grammar).
    */
   toolsTransform?: (tools: OpenAIFunctionTool[]) => OpenAIFunctionTool[];
+  /**
+   * The request fields for a thinking effort (#417). Default: OpenAI's
+   * `reasoning_effort`. A server that names it otherwise (llama.cpp) says how.
+   */
+  effortParams?: (effort: EffortLevel) => Record<string, unknown>;
 }
 
 const OPENAI_CHAT_MODEL = (id: string) =>
@@ -178,6 +185,7 @@ export class OpenAIProvider implements AgentProvider {
   #fallbackModels: ModelInfo[];
   #contextWindow: ((model: string) => Promise<number | undefined>) | null;
   #toolsTransform: ((tools: OpenAIFunctionTool[]) => OpenAIFunctionTool[]) | null;
+  #effortParams: (effort: EffortLevel) => Record<string, unknown>;
   #resolveApiKey: (() => { key: string; fingerprint: string } | null) | null;
 
   constructor(init: OpenAIProviderInit = {}) {
@@ -205,6 +213,7 @@ export class OpenAIProvider implements AgentProvider {
     this.#fallbackModels = init.fallbackModels ?? OPENAI_FALLBACK_MODELS;
     this.#contextWindow = init.contextWindow ?? null;
     this.#toolsTransform = init.toolsTransform ?? null;
+    this.#effortParams = init.effortParams ?? openAIEffortParams;
     this.#resolveApiKey = init.resolveApiKey ?? null;
   }
 
@@ -364,6 +373,8 @@ export class OpenAIProvider implements AgentProvider {
             ...(streamUsage ? { stream_options: { include_usage: true } } : {}),
             ...(maxTokens ? { [maxTokensField]: maxTokens } : {}),
             ...(offerTools ? { tools } : {}),
+            // Thinking effort (#417): a model that doesn't reason rejects it, and the turn says so.
+            ...(opts.effort ? this.#effortParams(opts.effort) : {}),
           },
           { signal: ac.signal },
         );
@@ -478,9 +489,10 @@ export class OpenAIProvider implements AgentProvider {
       queue.push({ type: "turn_done", result });
     } catch (err) {
       if (!ac.signal.aborted) {
+        const text = isRedirectRefusal(err) ? `the server ${REDIRECT_HINT}` : err instanceof Error ? err.message : String(err);
         queue.push({
           type: "error",
-          message: `${this.displayName}: ${isRedirectRefusal(err) ? `the server ${REDIRECT_HINT}` : err instanceof Error ? err.message : String(err)}`,
+          message: `${this.displayName}: ${text}${opts.effort ? effortRejectionHint(text, opts.effort) : ""}`,
         });
       }
     } finally {
@@ -504,4 +516,9 @@ export class OpenAIProvider implements AgentProvider {
   async dispose(): Promise<void> {
     // Stateless — nothing to tear down.
   }
+}
+
+/** OpenAI's reasoning effort for codeoid's scale (#417): Off is "none"; it has nothing above XHigh, so Max is XHigh. */
+export function openAIEffortParams(effort: EffortLevel): Record<string, unknown> {
+  return { reasoning_effort: effort === "off" ? "none" : effort === "max" ? "xhigh" : effort };
 }

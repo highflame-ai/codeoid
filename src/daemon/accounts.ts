@@ -14,7 +14,7 @@
 
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { atomicWrite, getConfigDir } from "../config.js";
 import {
   type AccountInfo,
@@ -523,12 +523,23 @@ export class AccountStore {
   #discardHome(backend: string, name: string): void {
     const home = this.homeOf(backend, name);
     if (!existsSync(home)) return;
-    const trash = join(this.#homesRoot, ".trash");
+    // ...and the overlays built over it for a thinking effort (#417): they hold a copy of its settings.
+    const key = overlayKey(home);
+    const overlays = [join(this.#homesRoot, "pi-session", key)];
     try {
-      mkdirSync(trash, { recursive: true, mode: 0o700 });
-      renameSync(home, join(trash, `${Date.now()}-${randomBytes(4).toString("hex")}`));
+      for (const n of readdirSync(join(this.#homesRoot, "gemini-cli-effort"))) if (n.startsWith(`${key}-`)) overlays.push(join(this.#homesRoot, "gemini-cli-effort", n));
     } catch {
-      rmSync(home, { recursive: true, force: true });
+      // None built.
+    }
+    const trash = join(this.#homesRoot, ".trash");
+    for (const dir of [home, ...overlays]) {
+      if (!existsSync(dir)) continue;
+      try {
+        mkdirSync(trash, { recursive: true, mode: 0o700 });
+        renameSync(dir, join(trash, `${Date.now()}-${randomBytes(4).toString("hex")}`));
+      } catch {
+        rmSync(dir, { recursive: true, force: true });
+      }
     }
   }
 
@@ -590,3 +601,8 @@ export class AccountStore {
 
 /** Key variables pi reads, for the env allowlist of a pi child. */
 export const PI_ACCOUNT_VARIABLES: readonly string[] = PI_KEY_VARIABLES;
+
+/** The key of an overlay built over `base` (a backend's home) for a thinking effort (#417). */
+export function overlayKey(base: string): string {
+  return createHash("sha256").update(resolve(base)).digest("hex").slice(0, 12);
+}

@@ -8,6 +8,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Choose how hard the model thinks, per session, on every backend** (#417).
+  One scale (Default, Off, Minimal, Low, Medium, High, Extra high, Max), mapped to each backend's own setting: Claude's effort, Codex's and OpenAI's reasoning effort, Qwen's and pi's levels, Gemini's thinking budget or level, llama.cpp's chat-template switches, and the Gemini CLI's model settings.
+  Set it from the web UI's **effort** selector, `/effort` (web, TUI, Telegram), `codeoid new --effort`, or `session.defaultEffort` for new sessions.
+  It stays with the session, like its model; it applies live where the backend can take it, otherwise from the next turn, and never cuts a running turn short.
+  The pickers offer the levels each model takes where the backend reports them (Claude, Codex, pi); elsewhere every level, marked as unknown.
+  docs/thinking-effort.md says what each level means on each backend.
+
 - **An MCP server added through Claude reaches every backend in that directory** (#395).
   codeoid imported only Claude's global servers, once at start; a `claude mcp add` (local scope) or a project's `.mcp.json` stayed Claude-only.
   Now each session sees, on every backend, its directory's servers too: your own always, a project's once approved — in Claude Code (read only from your `~/.claude.json`), or in codeoid after reviewing the entry in full (the drawer's **Review & approve**, or `codeoid mcp approve`, which prints it and approves only with `--yes <fingerprint>`), bound to exactly the entry shown.

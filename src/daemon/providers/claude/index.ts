@@ -47,7 +47,7 @@ import { FLEET_TOOL_NAMES } from "../../fleet.js";
 import { rewriteBashToolInput } from "../../compress/index.js";
 import { type CodeoidConfig, getConfigDir } from "../../../config.js";
 import { secretPathVerdict } from "../../secret-paths.js";
-import type { AuthContext } from "../../../protocol/types.js";
+import { type AuthContext, EFFORT_LEVELS, type EffortLevel } from "../../../protocol/types.js";
 import type {
   BackendMcpServerState,
   SessionProvider,
@@ -259,6 +259,8 @@ export class ClaudeProvider implements SessionProvider {
   #builtOAuthMcp = "";
   /** Fingerprint of the Claude account the live query loop was started with ("" = daemon env). */
   #builtAccount = "";
+  /** The thinking effort the live query loop runs at (#417); "" = the SDK's default. Off is fixed at construction. */
+  #builtEffort = "";
   /** Last TurnOpts — the retry after a skill approval rebuilds the loop with
    * these, then re-pushes #lastPushedContent into the SAME turn queue (#233). */
   #lastTurnOpts: TurnOpts | null = null;
@@ -621,6 +623,23 @@ export class ClaudeProvider implements SessionProvider {
     }
   }
 
+  /**
+   * A new thinking effort on the running query, live (#417) — except to or
+   * from Off, which the SDK fixes when the query is built, and back to the
+   * default: the SDK's live "no level" is the model's default, not the user's
+   * own Claude settings, which only a fresh query reads. Those rebuild the
+   * query before the next turn (it resumes the same conversation).
+   */
+  async applyEffort(effort: EffortLevel | null): Promise<boolean> {
+    const query$ = this.#query;
+    if (!query$ || !this.#consumerTask || effort === null || effort === "off" || this.#builtEffort === "off") return false;
+    await query$.applyFlagSettings({ effortLevel: claudeEffort(effort) });
+    this.#builtEffort = effort;
+    // A retry or recovery later in this turn rebuilds from these: at the new effort.
+    if (this.#lastTurnOpts) this.#lastTurnOpts = { ...this.#lastTurnOpts, effort };
+    return true;
+  }
+
   async dispose(): Promise<void> {
     await this.teardown();
   }
@@ -753,7 +772,8 @@ export class ClaudeProvider implements SessionProvider {
         this.#builtSkillAllowRules === desiredGrants &&
         this.#builtPluginDirs === desiredPlugins &&
         this.#builtOAuthMcp === oauthMcp.fingerprint &&
-        this.#builtAccount === desiredAccount
+        this.#builtAccount === desiredAccount &&
+        this.#builtEffort === (opts.effort ?? "")
       ) {
         return;
       }
@@ -776,7 +796,9 @@ export class ClaudeProvider implements SessionProvider {
               ? "session-scoped skill plugins changed"
               : this.#builtOAuthMcp !== oauthMcp.fingerprint
                 ? "OAuth MCP servers changed"
-                : `Claude account changed (now ${account?.name ?? "default"})`;
+                : this.#builtAccount !== desiredAccount
+                  ? `Claude account changed (now ${account?.name ?? "default"})`
+                  : `thinking effort changed (now ${opts.effort ?? "default"})`;
       console.log(
         `[claude-provider ${this.#init.sessionId.slice(0, 8)}] ${reason} — rebuilding query loop`,
       );
@@ -800,6 +822,7 @@ export class ClaudeProvider implements SessionProvider {
     this.#builtPluginDirs = desiredPlugins;
     this.#builtOAuthMcp = oauthMcp.fingerprint;
     this.#builtAccount = desiredAccount;
+    this.#builtEffort = opts.effort ?? "";
     this.#loopGeneration += 1;
     const myGeneration = this.#loopGeneration;
 
@@ -871,7 +894,9 @@ export class ClaudeProvider implements SessionProvider {
         // way — the tokens were already spent, we just weren't being shown
         // anything for them. (The raw chain of thought is never exposed on any
         // model; this is a summary of it.)
-        thinking: { type: "adaptive" as const, display: "summarized" as const },
+        // Thinking effort (#417): Off disables thinking; any other level rides
+        // on adaptive thinking.
+        ...claudeEffortOptions(opts.effort),
         // An account may name models its own way (a Bedrock account's mappings).
         ...modelOptions(opts.model, opts.fallbackModel, account),
         ...(opts.maxBudgetUsd !== undefined ? { maxBudgetUsd: opts.maxBudgetUsd } : {}),
@@ -1082,7 +1107,7 @@ export class ClaudeProvider implements SessionProvider {
     if (init.onModels && account?.kind !== "bedrock") {
       void this.#query
         .supportedModels()
-        .then((m) => init.onModels?.(m))
+        .then((m) => init.onModels?.(m.map(claudeCatalogEntry)))
         .catch(() => {});
     }
 
@@ -2212,3 +2237,41 @@ export function extractToolResultText(content: unknown): string {
   return parts.join("\n");
 }
 
+
+/** codeoid's effort scale on the Agent SDK's (#417): it has no Minimal, so that is Low. */
+function claudeEffort(effort: Exclude<EffortLevel, "off">): "low" | "medium" | "high" | "xhigh" | "max" {
+  return effort === "minimal" ? "low" : effort;
+}
+
+/**
+ * The query options for a thinking effort (#417). Thinking stays adaptive,
+ * with readable summaries (see the comment where it's used); Off disables it.
+ */
+export function claudeEffortOptions(effort: EffortLevel | undefined): {
+  thinking: { type: "adaptive"; display: "summarized" } | { type: "disabled" };
+  effort?: "low" | "medium" | "high" | "xhigh" | "max";
+} {
+  if (effort === "off") return { thinking: { type: "disabled" } };
+  const thinking = { type: "adaptive" as const, display: "summarized" as const };
+  return effort ? { thinking, effort: claudeEffort(effort) } : { thinking };
+}
+
+/** One of the SDK's model rows as a catalog entry, with the efforts the model takes (#417). */
+export function claudeCatalogEntry(m: {
+  value: string;
+  displayName: string;
+  description?: string;
+  supportsEffort?: boolean;
+  supportedEffortLevels?: string[];
+}): CatalogEntry {
+  // Off (thinking disabled) is always there; the levels are the model's own.
+  // A model that doesn't say which levels it takes leaves them unknown.
+  const levels = m.supportedEffortLevels?.filter((l): l is EffortLevel => (EFFORT_LEVELS as readonly string[]).includes(l));
+  const efforts: EffortLevel[] | undefined = m.supportsEffort === false ? ["off"] : levels ? ["off", ...levels] : undefined;
+  return {
+    value: m.value,
+    displayName: m.displayName,
+    ...(m.description ? { description: m.description } : {}),
+    ...(efforts ? { efforts } : {}),
+  };
+}
