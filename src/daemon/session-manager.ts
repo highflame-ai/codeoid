@@ -1814,7 +1814,7 @@ mcpHub: this.#mcpHub,
       ...(m.contextWindow !== undefined ? { contextWindow: m.contextWindow } : {}),
       ...(m.efforts ? { efforts: m.efforts } : {}),
       ...(m.defaultEffort ? { defaultEffort: m.defaultEffort } : {}),
-      isDefault: m.value === "default",
+      isDefault: m.isDefault === true || m.value === "default",
     }));
     const previous = this.#modelsCache.get(providerId);
     if (previous && JSON.stringify(previous) === JSON.stringify(models)) return;
@@ -4775,9 +4775,11 @@ mcpHub: this.#mcpHub,
         transcriptStore: this.#transcriptStore,
         providers: this.#providers,
         claudeAccounts: this.#claudeAccounts,
-        // A fork continues the same conversation — on the same accounts.
+        // A fork continues the same conversation — on the same accounts,
+        // thinking as hard (#417).
         claudeAccount: parent.claudeAccount,
         accountChoices: parent.accountChoices,
+        ...(parentInfo.effort ? { effort: parentInfo.effort } : {}),
         hooks: this.#hooks,
         providerId,
         forkedFrom: {
@@ -7597,12 +7599,6 @@ mcpHub: this.#mcpHub,
     return best?.workdir ?? null;
   }
 
-  /**
-   * Switch the model for a session. Reuses SESSION_SEND scope (same as
-   * setMode / rotate — anyone who can drive the session can change its
-   * model). Returns `response.ok` with the resolved model in `data` on
-   * success; rejects with a 400 when the model id is unknown.
-   */
   /** Set the session's thinking effort (#417). `session:send` on the caller's own session, as for its model. */
   async #setEffort(msg: Extract<ClientMessage, { type: "session.set_effort" }>, auth: AuthContext): Promise<DaemonMessage> {
     if (!hasScope(auth.scopes as string[], SCOPES.SESSION_SEND)) {
@@ -7614,6 +7610,12 @@ mcpHub: this.#mcpHub,
     return { type: "response.ok", requestId: msg.id, data };
   }
 
+  /**
+   * Switch the model for a session. Reuses SESSION_SEND scope (same as
+   * setMode / rotate — anyone who can drive the session can change its
+   * model). Returns `response.ok` with the resolved model in `data` on
+   * success; rejects with a 400 when the model id is unknown.
+   */
   async #setModel(
     msg: Extract<ClientMessage, { type: "session.set_model" }>,
     auth: AuthContext,

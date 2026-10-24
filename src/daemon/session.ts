@@ -1377,7 +1377,7 @@ export class Session {
         accountId: opts.auth.accountId,
         projectId: opts.auth.projectId,
       });
-      this.#store.audit(opts.auth.sub, "session.create", this.id, `name=${this.name}`);
+      this.#store.audit(opts.auth.sub, "session.create", this.id, `name=${this.name}${this.#effort ? ` effort=${this.#effort}` : ""}`);
       if (this.#effort) this.#store.setSessionEffort(this.id, this.#effort);
 
       this.#transcriptStore.saveMeta({
@@ -5069,10 +5069,15 @@ export class Session {
     const prev = this.#effort;
     this.#effort = effort;
     this.#store.setSessionEffort(this.id, effort);
-    this.#store.audit(sender.sub, "session.set_effort", this.id, `effort=${effort ?? "(default)"} from=${prev ?? "(default)"}`);
+    this.#store.audit(
+      sender.sub,
+      "session.set_effort",
+      this.id,
+      `effort=${effort ?? "(default)"} from=${prev ?? "(default)"}${sender.delegationDepth > 0 ? ` delegated=${sender.delegationDepth}` : ""}`,
+    );
     let applies: EffortChangeResult["applies"] = "next-turn";
     if (effort === prev) {
-      applies = "now";
+      applies = this.#effortRestartPending ? "restart" : "now";
     } else if (this.#provider.effortChange === "restart") {
       this.#effortRestartPending = true;
       applies = "restart";
@@ -5101,6 +5106,8 @@ export class Session {
   async #applyEffortRestart(): Promise<void> {
     if (!this.#effortRestartPending || this.#mcpBusy()) return;
     this.#effortRestartPending = false;
+    // Switched since to a backend that takes it per turn: nothing to rebuild.
+    if (this.#provider.effortChange !== "restart") return;
     await this.#teardownProvider();
     if (RESEED_AFTER_TEARDOWN.has(this.#provider.id) && this.#accumulator.history.length > 0) {
       await this.#seedProviderFromHistory();

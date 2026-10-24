@@ -877,7 +877,7 @@ const EffortPicker: Component<{ sessionId: string; current?: EffortLevel; model?
             class={`flex w-full items-center justify-between px-3 py-1.5 text-left text-[12px] transition hover:bg-bg-hover disabled:opacity-50 ${
               !props.current ? "bg-bg-active text-fg" : "text-fg-muted"
             }`}
-            title="Send no effort: the backend decides"
+            title="The backend's own default"
           >
             <span>
               Default

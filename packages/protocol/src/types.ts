@@ -233,7 +233,7 @@ export type Capability = (typeof CAPABILITIES)[keyof typeof CAPABILITIES];
 /**
  * How hard a model thinks before it answers (#417), on one scale for every
  * backend; each maps it to its own setting (docs/thinking-effort.md). A
- * session with no effort set sends nothing: the backend's default applies.
+ * session with no effort set runs at the backend's own default.
  */
 export const EFFORT_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type EffortLevel = (typeof EFFORT_LEVELS)[number];

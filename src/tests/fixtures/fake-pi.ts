@@ -261,10 +261,21 @@ function handle(cmd: Record<string, unknown>): void {
     case "set_model":
       respond(cmd.id, "set_model", { data: {} });
       return;
-    case "set_thinking_level":
+    case "set_thinking_level": {
       thinkingLevel = String(cmd.level);
+      // As real pi does: the level is saved as the global default, in place, in its agent dir's settings.json.
+      const dir = process.env.PI_CODING_AGENT_DIR;
+      if (dir) {
+        const file = `${dir}/settings.json`;
+        let settings: Record<string, unknown> = {};
+        try {
+          settings = JSON.parse(require("node:fs").readFileSync(file, "utf8"));
+        } catch {}
+        require("node:fs").writeFileSync(file, JSON.stringify({ ...settings, defaultThinkingLevel: thinkingLevel }));
+      }
       respond(cmd.id, "set_thinking_level");
       return;
+    }
     case "switch_session":
     case "new_session":
       respond(cmd.id, String(cmd.type), { data: { cancelled: false } });

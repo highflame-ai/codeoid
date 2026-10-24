@@ -44,13 +44,17 @@ describe("each backend's reading of the scale", () => {
     expect(llamaCppEffortParams("minimal")).toMatchObject({ reasoning_effort: "low" });
   });
 
-  it("Gemini: a budget for 2.5 (Pro can't go below 128, Flash above 24576), a level for 3.x, nothing for others", () => {
+  it("Gemini: a budget for 2.5 within each model's range, a level for 3.x within each model's set, nothing for others", () => {
     expect(geminiThinkingConfig("gemini-2.5-flash", "off")).toEqual({ thinkingBudget: 0 });
-    expect(geminiThinkingConfig("gemini-2.5-pro", "off")).toEqual({ thinkingBudget: 128 });
+    expect(geminiThinkingConfig("gemini-2.5-pro", "off")).toEqual({ thinkingBudget: 128 }); // Pro can't turn it off
+    expect(geminiThinkingConfig("gemini-2.5-flash-lite", "off")).toEqual({ thinkingBudget: 0 });
+    expect(geminiThinkingConfig("gemini-2.5-flash-lite", "minimal")).toEqual({ thinkingBudget: 512 });
     expect(geminiThinkingConfig("gemini-2.5-flash", "max")).toEqual({ thinkingBudget: 24576 });
     expect(geminiThinkingConfig("gemini-2.5-pro", "max")).toEqual({ thinkingBudget: 32768 });
-    expect(geminiThinkingConfig("gemini-3-pro-preview", "xhigh")).toEqual({ thinkingLevel: "high" });
+    expect(geminiThinkingConfig("gemini-3-pro-preview", "medium")).toEqual({ thinkingLevel: "high" }); // Pro: Low or High
+    expect(geminiThinkingConfig("gemini-3-pro-preview", "minimal")).toEqual({ thinkingLevel: "low" });
     expect(geminiThinkingConfig("gemini-3-flash", "off")).toEqual({ thinkingLevel: "minimal" });
+    expect(geminiThinkingConfig("gemini-3-flash", "medium")).toEqual({ thinkingLevel: "medium" });
     expect(geminiThinkingConfig("gemini-1.5-pro", "high")).toBeNull();
   });
 
@@ -63,9 +67,11 @@ describe("each backend's reading of the scale", () => {
       modelConfig: { generateContentConfig: { thinkingConfig: { thinkingBudget: 2048 } } },
     });
     expect(out.modelConfigs.customAliases["chat-base-3"].modelConfig.generateContentConfig.thinkingConfig).toEqual({ thinkingLevel: "LOW" });
-    // Values every 2.5 model takes: the settings can't know which runs.
+    // Values every model of the family takes: the settings can't know which runs.
     const off = JSON.parse(geminiEffortSettings(undefined, "off"));
-    expect(off.modelConfigs.customAliases["chat-base-2.5"].modelConfig.generateContentConfig.thinkingConfig.thinkingBudget).toBe(128);
+    expect(off.modelConfigs.customAliases["chat-base-2.5"].modelConfig.generateContentConfig.thinkingConfig.thinkingBudget).toBe(512);
+    const medium = JSON.parse(geminiEffortSettings(undefined, "medium"));
+    expect(medium.modelConfigs.customAliases["chat-base-3"].modelConfig.generateContentConfig.thinkingConfig.thinkingLevel).toBe("HIGH");
     expect(JSON.parse(geminiEffortSettings("not json", "max")).modelConfigs.customAliases["chat-base-2.5"].modelConfig.generateContentConfig.thinkingConfig.thinkingBudget).toBe(24576);
   });
 
@@ -216,6 +222,36 @@ describe("a session's thinking effort", () => {
     expect(providers[0]!.capturedOpts.at(-1)?.effort).toBe("high");
     await turn(m, sid);
     expect(providers[0]!.teardownCount).toBe(1); // once
+    // The same level again while a restart is still to come says so.
+    expect(await setEffort(m, sid, "low")).toMatchObject({ data: { applies: "restart" } });
+    expect(await setEffort(m, sid, "low")).toMatchObject({ data: { applies: "restart" } });
+  });
+
+  it("a fork thinks as hard as the session it came from", async () => {
+    const { m } = manager(() => new MockSessionProvider("claude", []));
+    const sid = await create(m, "xhigh");
+    await turn(m, sid);
+    const r = (await m.handle({ type: "session.fork", id: "f", sessionId: sid, name: "f" }, auth([...ALL, SCOPES.SESSION_READ]), client)) as {
+      type: string;
+      data?: { id?: string; session?: { id: string } };
+      error?: string;
+    };
+    expect(r.type).toBe("response.ok");
+    const forkId = r.data?.session?.id ?? r.data?.id;
+    expect(m._sessionForTest(forkId!)!.toInfo().effort).toBe("xhigh");
+  });
+
+  it("on the record at creation, and marked when a delegated token changes it", async () => {
+    const { m, store } = manager(() => new MockSessionProvider("claude", []));
+    const sid = await create(m, "max");
+    expect(await setEffort(m, sid, "low", { ...auth(), delegationDepth: 1 })).toMatchObject({ type: "response.ok" });
+    store.close();
+    const db = new Database(join(tmp, "codeoid.db"), { readonly: true });
+    const created = db.query("SELECT detail FROM audit_log WHERE action = 'session.create'").get() as { detail: string };
+    const changed = db.query("SELECT detail FROM audit_log WHERE action = 'session.set_effort'").get() as { detail: string };
+    db.close();
+    expect(created.detail).toBe("name=w effort=max");
+    expect(changed.detail).toBe("effort=low from=max delegated=1");
   });
 
   it("is the session owner's to change: session:send, their own session", async () => {

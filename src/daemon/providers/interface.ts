@@ -511,6 +511,8 @@ export interface ModelInfo {
   /** Thinking efforts the model takes, when the backend reports them (#417). */
   efforts?: EffortLevel[];
   defaultEffort?: EffortLevel;
+  /** The backend's default model, when it says. */
+  isDefault?: boolean;
 }
 
 /**
@@ -531,6 +533,8 @@ export interface CatalogEntry {
   efforts?: EffortLevel[];
   /** The backend's default effort for the model, when it says. */
   defaultEffort?: EffortLevel;
+  /** The backend's default model, when it says (the effort picker finds its levels by it). */
+  isDefault?: boolean;
 }
 
 /**

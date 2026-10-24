@@ -47,6 +47,7 @@ import { McpProxyLease, type McpProxyMount } from "../../mcp/proxy.js";
 import { resolveEnvMap } from "../../mcp/types.js";
 import type { ResolvedAccount } from "../../accounts.js";
 import { applyGeminiCliAccount, applyGeminiCliEffort } from "../../account-apply.js";
+import { effortRejectionHint } from "../effort.js";
 
 export interface GeminiAcpProviderInit {
   sessionId: string;
@@ -215,9 +216,10 @@ export class GeminiAcpProvider implements SessionProvider {
     this.#hasQueried = true;
 
     void this.#runPrompt(opts).catch((err: unknown) => {
+      const text = err instanceof Error ? err.message : String(err);
       this.#push({
         type: "error",
-        message: `gemini-cli: ${err instanceof Error ? err.message : String(err)}`,
+        message: `gemini-cli: ${text}${opts.effort ? effortRejectionHint(text, opts.effort) : ""}`,
       });
       queue.close();
     });

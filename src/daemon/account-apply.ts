@@ -74,7 +74,12 @@ export function ensureOverlayHome(spec: OverlaySpec): void {
       if (readlinkSync(link) === want) continue;
       unlinkSync(link);
     }
-    symlinkSync(want, link);
+    try {
+      symlinkSync(want, link);
+    } catch (err) {
+      // Another session building the same home got there first (#417): fine if it's the same link.
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST" || readlinkSync(link) !== want) throw err;
+    }
   }
   // Links into the source whose entry is gone, and links to anything we
   // now treat as the account's own (a vendor renamed its credential file).
@@ -307,10 +312,12 @@ export function geminiEffortSettings(source: string | undefined, effort: EffortL
   } catch {
     // An unreadable default is unreadable for the CLI too; start clean.
   }
-  // The overlay can't know which 2.5 model runs, so its budgets are ones
-  // every 2.5 model takes: Pro can't go below 128, Flash above 24576.
-  const budgets: Record<EffortLevel, number> = { off: 128, minimal: 512, low: 2048, medium: 8192, high: 16384, xhigh: 24576, max: 24576 };
-  const level = effort === "off" || effort === "minimal" ? "MINIMAL" : effort === "low" ? "LOW" : effort === "medium" ? "MEDIUM" : "HIGH";
+  // The overlay can't know which model runs, so it uses values every model
+  // of the family takes: 2.5 budgets from 512 (Flash-Lite's floor; Pro can't
+  // turn thinking off) to 24576 (Flash's ceiling); 3.x only Low and High
+  // (all Pro takes).
+  const budgets: Record<EffortLevel, number> = { off: 512, minimal: 512, low: 2048, medium: 8192, high: 16384, xhigh: 24576, max: 24576 };
+  const level = effort === "off" || effort === "minimal" || effort === "low" ? "LOW" : "HIGH";
   const configs = (settings.modelConfigs && typeof settings.modelConfigs === "object" ? settings.modelConfigs : {}) as Record<string, unknown>;
   const aliases = (configs.customAliases && typeof configs.customAliases === "object" ? configs.customAliases : {}) as Record<string, unknown>;
   const thinking = (thinkingConfig: Record<string, unknown>) => ({
@@ -347,6 +354,41 @@ export function applyGeminiCliAccount(account: ResolvedAccount | null, env: Reco
 
 export function defaultPiAgentDir(env: Record<string, string | undefined> = process.env): string {
   return env.PI_CODING_AGENT_DIR || join(env.HOME || homedir(), ".pi", "agent");
+}
+
+/**
+ * pi's agent dir for a codeoid session (#417): an overlay of the one it would
+ * use (an account's, or the default) — everything linked, so its logins and
+ * sessions are the user's — except settings.json, a fresh copy at each start.
+ * pi saves a thinking-level change as the user's global default in that file;
+ * the copy keeps one session's effort out of the user's own pi and the others'.
+ */
+export function applyPiSettingsOverlay(
+  env: Record<string, string>,
+  homesRoot: string = join(getConfigDir(), "accounts"),
+): Record<string, string> {
+  const base = env.PI_CODING_AGENT_DIR || defaultPiAgentDir(env);
+  const home = join(homesRoot, "pi-session", createHash("sha256").update(resolve(base)).digest("hex").slice(0, 12));
+  ensureOverlayHome({
+    source: base,
+    target: home,
+    own: [],
+    copies: { "settings.json": (src) => src ?? "{}\n" },
+    shared: ["sessions"],
+  });
+  return { ...env, PI_CODING_AGENT_DIR: home };
+}
+
+/** The thinking level pi starts a session at, as the user set it (#417): their settings' default, else pi's, Medium. */
+export function piDefaultThinkingLevel(env: Record<string, string | undefined>): string {
+  const base = env.PI_CODING_AGENT_DIR || defaultPiAgentDir(env);
+  try {
+    const level = (JSON.parse(readFileSync(join(base, "settings.json"), "utf8")) as { defaultThinkingLevel?: unknown }).defaultThinkingLevel;
+    if (typeof level === "string" && level) return level;
+  } catch {
+    // None, or unreadable: pi's own default.
+  }
+  return "medium";
 }
 
 /**

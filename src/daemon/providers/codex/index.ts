@@ -293,6 +293,10 @@ export class CodexProvider implements SessionProvider {
 
   #proc: CodexRpcProcess | null = null;
   #threadId: string | null = null;
+  /** Each model's default effort, and which model is the default, from model/list (#417). */
+  readonly #modelDefaultEffort = new Map<string, string>();
+  #defaultModelId: string | null = null;
+  #modelListRead = false;
   #hasQueried = false;
   #modelsReported = false;
   #pendingHistorySeed: string | null = null;
@@ -651,8 +655,15 @@ export class CodexProvider implements SessionProvider {
           description?: string;
           supportedReasoningEfforts?: Array<{ reasoningEffort?: string }>;
           defaultReasoningEffort?: string;
+          isDefault?: boolean;
         }>;
       };
+      // Each model's own default effort — what Default sends (#417).
+      for (const m of result.data ?? []) {
+        const id = m.model ?? m.id;
+        if (typeof id === "string" && typeof m.defaultReasoningEffort === "string") this.#modelDefaultEffort.set(id, m.defaultReasoningEffort);
+        if (m.isDefault === true && typeof id === "string") this.#defaultModelId = id;
+      }
       return (result.data ?? [])
         .filter((m) => typeof (m.model ?? m.id) === "string")
         .map((m) => {
@@ -665,6 +676,7 @@ export class CodexProvider implements SessionProvider {
             id: (m.model ?? m.id) as string,
             displayName: m.displayName ?? ((m.model ?? m.id) as string),
             description: m.description,
+            ...(m.isDefault === true ? { isDefault: true } : {}),
             ...(efforts ? { efforts } : {}),
             ...(defaultEffort ? { defaultEffort } : {}),
           };
@@ -694,6 +706,16 @@ export class CodexProvider implements SessionProvider {
 
   // ── Internal ──────────────────────────────────────────────────────────
 
+  /** A model's own default effort (once per process, from model/list), or null. */
+  async #defaultEffortFor(model: string | undefined): Promise<string | null> {
+    if (!this.#modelListRead) {
+      this.#modelListRead = true;
+      await this.listModels();
+    }
+    const id = model ?? this.#defaultModelId;
+    return (id && this.#modelDefaultEffort.get(id)) ?? null;
+  }
+
   async #startTurn(opts: TurnOpts): Promise<void> {
     await this.#ensureThread(opts);
     const seed = this.#pendingHistorySeed;
@@ -714,8 +736,10 @@ export class CodexProvider implements SessionProvider {
       sandboxPolicy: sandboxPolicyWire(sandboxMode, opts.workdir),
       ...(opts.model ? { model: opts.model } : {}),
       // Thinking effort (#417). codex keeps a turn's effort for the turns
-      // after it (a resumed thread too), so none is sent as null: its default.
-      effort: opts.effort ? toCodexEffort(opts.effort) : null,
+      // after it (a resumed thread too), and null there means "no override" —
+      // so Default is sent as the model's own default effort, read from its
+      // catalog; null only for a model the catalog doesn't know.
+      effort: opts.effort ? toCodexEffort(opts.effort) : await this.#defaultEffortFor(opts.model),
     })) as { turn?: { id?: string } };
     this.#currentTurnId = result.turn?.id ?? null;
   }
@@ -842,6 +866,7 @@ export class CodexProvider implements SessionProvider {
           description: m.description,
           ...(m.efforts ? { efforts: m.efforts } : {}),
           ...(m.defaultEffort ? { defaultEffort: m.defaultEffort } : {}),
+          ...(m.isDefault ? { isDefault: true } : {}),
         })),
       );
     }

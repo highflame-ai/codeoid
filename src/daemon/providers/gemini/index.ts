@@ -346,19 +346,21 @@ export function splitForStateless(opts: TurnOpts): {
 }
 
 /**
- * A thinking effort as Gemini's thinkingConfig (#417), by model family:
- * 2.5 models take a token budget (0 = off; Pro can't turn thinking off, so
- * its floor is 128; Flash's ceiling is 24576), 3.x models a level. Other
- * models don't think: nothing is sent.
+ * A thinking effort as Gemini's thinkingConfig (#417), by model family.
+ * 2.5 models take a token budget: 0 turns thinking off, except on Pro (its
+ * floor is 128); Flash-Lite thinks from 512; Flash and Flash-Lite stop at
+ * 24576. 3.x models take a level — Pro only Low and High, Flash also Minimal
+ * and Medium. Other models don't think: nothing is sent.
  */
 export function geminiThinkingConfig(model: string, effort: EffortLevel): Record<string, unknown> | null {
   if (/gemini-2\.5/.test(model)) {
     const pro = /pro/.test(model);
+    // From Minimal up every budget is at least 512, Flash-Lite's floor.
     const budgets: Record<EffortLevel, number> = { off: 0, minimal: 512, low: 2048, medium: 8192, high: 16384, xhigh: 24576, max: 32768 };
-    const budget = Math.min(Math.max(budgets[effort], pro ? 128 : 0), pro ? 32768 : 24576);
-    return { thinkingBudget: budget };
+    return { thinkingBudget: Math.min(Math.max(budgets[effort], pro ? 128 : 0), pro ? 32768 : 24576) };
   }
   if (/gemini-3/.test(model)) {
+    if (/pro/.test(model)) return { thinkingLevel: effort === "off" || effort === "minimal" || effort === "low" ? "low" : "high" };
     const level = effort === "off" || effort === "minimal" ? "minimal" : effort === "low" ? "low" : effort === "medium" ? "medium" : "high";
     return { thinkingLevel: level };
   }

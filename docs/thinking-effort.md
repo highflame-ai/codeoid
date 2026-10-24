@@ -6,9 +6,10 @@ How hard a session's model thinks before it answers, on one scale for every back
 
 **Default, Off, Minimal, Low, Medium, High, Extra high (`xhigh`), Max.**
 
-**Default** sends nothing: the backend picks, as it always has.
+**Default** is the backend's own choice, as it always was.
+Most backends are simply sent nothing; two keep a level once it's set, so Default is sent to them explicitly: Codex gets the model's own default effort (from its model list), and pi the default in your pi settings (`defaultThinkingLevel`, else Medium).
 Every other level is mapped to the backend's own setting (below).
-A level a backend has no exact match for goes to its nearest one.
+A level a backend has no exact match for goes to its nearest one; pi clamps a level a model doesn't take to the nearest it does.
 
 ## Setting it
 
@@ -43,23 +44,26 @@ A change never cuts a running turn short.
 
 ## What each level means on each backend
 
-| codeoid | Claude | Codex | OpenAI | Qwen | pi | Gemini 2.5 | Gemini 3 / Gemini CLI 3 | llama.cpp |
-|---|---|---|---|---|---|---|---|---|
-| Off | thinking disabled | `none` | `none` | `low` (can't turn off) | `off` | budget 0 (Pro: 128) | `minimal` | `enable_thinking: false` |
-| Minimal | `low` | `minimal` | `minimal` | `low` | `minimal` | budget 512 | `minimal` | `low` |
-| Low | `low` | `low` | `low` | `low` | `low` | budget 2048 | `low` | `low` |
-| Medium | `medium` | `medium` | `medium` | `medium` | `medium` | budget 8192 | `medium` | `medium` |
-| High | `high` | `high` | `high` | `high` | `high` | budget 16384 | `high` | `high` |
-| Extra high | `xhigh` | `xhigh` | `xhigh` | `xhigh` | `xhigh` | budget 24576 | `high` | `high` |
-| Max | `max` | `max` | `xhigh` | `max` | `max` | budget 32768 (Flash: 24576) | `high` | `high` |
+| codeoid | Claude | Codex | OpenAI | Qwen | pi | Gemini 2.5 | Gemini 3 Flash / Pro | Gemini CLI (2.5 / 3) | llama.cpp |
+|---|---|---|---|---|---|---|---|---|---|
+| Off | thinking disabled | `none` | `none` | `low` (can't turn off) | `off` | budget 0 (Pro: 128) | `minimal` / `low` | 512 / `LOW` | `enable_thinking: false` |
+| Minimal | `low` | `minimal` | `minimal` | `low` | `minimal` | budget 512 | `minimal` / `low` | 512 / `LOW` | `low` |
+| Low | `low` | `low` | `low` | `low` | `low` | budget 2048 | `low` / `low` | 2048 / `LOW` | `low` |
+| Medium | `medium` | `medium` | `medium` | `medium` | `medium` | budget 8192 | `medium` / `high` | 8192 / `HIGH` | `medium` |
+| High | `high` | `high` | `high` | `high` | `high` | budget 16384 | `high` / `high` | 16384 / `HIGH` | `high` |
+| Extra high | `xhigh` | `xhigh` | `xhigh` | `xhigh` | `xhigh` | budget 24576 | `high` / `high` | 24576 / `HIGH` | `high` |
+| Max | `max` | `max` | `xhigh` | `max` | `max` | budget 32768 (Flash: 24576) | `high` / `high` | 24576 / `HIGH` | `high` |
 
 Notes:
 
 - **Claude** keeps adaptive thinking, with readable summaries, at every level but Off.
 - **OpenAI** sends `reasoning_effort`; a model that doesn't reason rejects it.
-- **Gemini** sends `thinkingConfig` per request: a token budget for 2.5 models, a level for 3.x; other models get nothing.
-- **The Gemini CLI** on 2.5 models takes the Gemini 2.5 budgets, but one that every 2.5 model accepts, since the settings can't know which runs: Off is 128 (Pro's minimum) and Max is 24576 (Flash's maximum).
+- **Gemini** sends `thinkingConfig` per request: a token budget for 2.5 models (Flash-Lite thinks from 512, or 0 for Off), a level for 3.x (Pro takes only Low and High); other models get nothing.
+- **The Gemini CLI** gets values every model of the family accepts, since its settings can't know which model runs: 2.5 budgets from 512 (Flash-Lite's floor; Pro can't turn thinking off, so Off is the lowest budget) to 24576 (Flash's ceiling), and for 3.x only Low and High (all that Pro takes).
   It runs with a settings overlay of its usual home (an account's, or yours) whose `chat-base-2.5` and `chat-base-3` aliases carry the budget or level; logins and chats are linked, so nothing else changes.
   The overlays live under `~/.codeoid/accounts/gemini-cli-effort/`.
 - **llama.cpp** sends both through the model's chat template (`chat_template_kwargs`): `enable_thinking` for Qwen3-style templates, `reasoning_effort` (low / medium / high) for gpt-oss-style ones.
   A template that reads neither ignores them.
+- **pi** saves a thinking-level change as your global default in its settings, so codeoid runs it from an overlay of its agent directory: your logins and sessions are linked, and `settings.json` is a fresh copy at each start, so one session's effort never changes your own pi or other sessions.
+  The overlays live under `~/.codeoid/accounts/pi-session/`.
+- **A project's own Gemini CLI settings** (`.gemini/settings.json` in the workdir) outrank your user settings, so a project that redefines `chat-base-2.5` or `chat-base-3` there overrides the effort on the Gemini CLI.

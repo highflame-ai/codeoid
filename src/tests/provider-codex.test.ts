@@ -676,6 +676,7 @@ describe("CodexProvider over fake-codex", () => {
         // Its efforts on codeoid's scale (#417): "none" is Off; "ultra" has no level.
         efforts: ["off", "low", "high"],
         defaultEffort: "low",
+        isDefault: true,
       },
     ]);
   });
@@ -1304,10 +1305,10 @@ describe("CodexProvider – thinking effort (#417)", () => {
     return JSON.parse((events.find((e) => e.type === "text_done") as { content: string }).content).effort;
   };
 
-  it("sends it on every turn — Off as codex's none, and none set as null (codex keeps a turn's effort)", async () => {
+  it("sends it on every turn — Off as codex's none, Default as the model's own default (codex keeps a turn's; null wouldn't reset it)", async () => {
     expect(await effortSeen("high")).toBe("high");
     expect(await effortSeen("off")).toBe("none");
-    expect(await effortSeen()).toBeNull();
+    expect(await effortSeen()).toBe("low"); // the default model's defaultReasoningEffort
   });
 
   it("reports each model's efforts on codeoid's scale, dropping ones it has no level for", async () => {

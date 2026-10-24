@@ -53,7 +53,7 @@ import type { McpHub } from "../../mcp/hub.js";
 import { PiRpcProcess, type PiFrame } from "./rpc.js";
 import { translatePiEvent } from "./translate.js";
 import type { ResolvedAccount } from "../../accounts.js";
-import { applyPiAccount } from "../../account-apply.js";
+import { applyPiAccount, applyPiSettingsOverlay, piDefaultThinkingLevel } from "../../account-apply.js";
 
 export interface PiProviderInit {
   sessionId: string;
@@ -123,9 +123,9 @@ export class PiProvider implements SessionProvider {
   #bridgeReady = false;
   #hasQueried = false;
   #model: string | null = null;
-  /** pi's thinking level now, and the one it started with — "default" returns to it (#417). */
+  /** pi's thinking level now (#417), and the user's own default, which Default returns to. */
   #thinkingLevel: string | null = null;
-  #startThinkingLevel: string | null = null;
+  #defaultThinkingLevel: string | null = null;
   /** Rendered transcript from seedFromHistory() — prepended to the next prompt. */
   #pendingHistorySeed: string | null = null;
 
@@ -296,8 +296,8 @@ export class PiProvider implements SessionProvider {
     if (opts.model && opts.model !== this.#model) {
       await this.#setModel(opts.model);
     }
-    // Thinking effort (#417): pi's levels are codeoid's; none = what pi started with.
-    const level = opts.effort ?? this.#startThinkingLevel;
+    // Thinking effort (#417): pi's levels are codeoid's; none = the user's own pi default.
+    const level = opts.effort ?? this.#defaultThinkingLevel;
     if (level && level !== this.#thinkingLevel) await this.#setThinkingLevel(level);
 
     let message = opts.userMessage;
@@ -329,7 +329,8 @@ export class PiProvider implements SessionProvider {
       cwd: opts.workdir,
       // Allowlisted env (GHSA-38vh): pi gets its credentials (~/.pi via
       // HOME, provider API keys), never codeoid's own secrets.
-      env: applyPiAccount(this.#resolveAccount?.() ?? null, buildPiEnv()),
+      // pi's thinking-level writes stay in a copy of its settings (#417).
+      env: this.#piEnv(),
       onEvent: (frame) => this.#onFrame(frame),
       onExit: ({ code, signal, stderrTail }) => {
         this.#bridgeReady = false;
@@ -361,10 +362,7 @@ export class PiProvider implements SessionProvider {
 
     const state = await this.#proc.request({ type: "get_state" });
     const data = state.data as { sessionFile?: string; sessionId?: string; thinkingLevel?: string } | undefined;
-    if (typeof data?.thinkingLevel === "string") {
-      this.#startThinkingLevel ??= data.thinkingLevel;
-      this.#thinkingLevel ??= data.thinkingLevel;
-    }
+    if (typeof data?.thinkingLevel === "string") this.#thinkingLevel ??= data.thinkingLevel;
     const file = data?.sessionFile;
     if (typeof file === "string" && file.length > 0 && file !== this.#backingSessionId) {
       this.#backingSessionId = file;
@@ -424,10 +422,17 @@ export class PiProvider implements SessionProvider {
 
   /** A new thinking effort on the running pi, live (#417): it takes the next request at that level. */
   async applyEffort(effort: EffortLevel | null): Promise<boolean> {
-    const level = effort ?? this.#startThinkingLevel;
-    if (!this.#proc || !level) return false;
+    const level = effort ?? this.#defaultThinkingLevel;
+    if (!this.#proc?.alive || !level) return false;
     if (level !== this.#thinkingLevel) await this.#setThinkingLevel(level);
     return true;
+  }
+
+  /** pi's environment: the account's, in an overlay whose settings.json is codeoid's copy. */
+  #piEnv(): Record<string, string> {
+    const env = applyPiAccount(this.#resolveAccount?.() ?? null, buildPiEnv());
+    this.#defaultThinkingLevel = piDefaultThinkingLevel(env);
+    return applyPiSettingsOverlay(env);
   }
 
   async #setThinkingLevel(level: string): Promise<void> {

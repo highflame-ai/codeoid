@@ -633,6 +633,8 @@ export class ClaudeProvider implements SessionProvider {
     if (!query$ || !this.#consumerTask || effort === "off" || this.#builtEffort === "off") return false;
     await query$.applyFlagSettings({ effortLevel: effort ? claudeEffort(effort) : null });
     this.#builtEffort = effort ?? "";
+    // A retry or recovery later in this turn rebuilds from these: at the new effort.
+    if (this.#lastTurnOpts) this.#lastTurnOpts = { ...this.#lastTurnOpts, effort: effort ?? undefined };
     return true;
   }
 
