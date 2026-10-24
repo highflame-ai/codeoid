@@ -470,7 +470,7 @@ Per-session checkpoints are pruned by count and storage budget, skipped when a t
 
 Cross-workspace recall (`recallGlobal`) scans every workspace, relying on the store having a single user (the global-retrieval note in `memory/store.ts`).
 Two surfaces already depend on it: `fleet_recall`, which does not filter hits by tenant at all, and `session.search` with scope `all`, which drops only hits from live cross-tenant sessions (#13).
-Tenant scoping moves into the store before any new fleet surface is built on it, and `fleet_recall` is fixed in milestone B.
+Tenant scoping moves into the store before any new fleet surface is built on it, and `fleet_recall` is fixed now rather than waiting for loops (#415).
 
 The rule for every hand-off in a fleet: a summary may be an index into the record, never a replacement for it.
 A one-line preview is fine when it carries the id of the full record.
@@ -635,7 +635,7 @@ In the same milestone:
 - episodes tagged with run, attempt, and turn ids, and continuation packets and completion digests that carry episode ids instead of truncated prose (§12.4);
 - soft rotation on for every loop worker, with the rotation seed made backend-neutral (§12.4);
 - attempt generations on dispatch, so stale results and claims are fenced (§5, §12.5);
-- reference resolution authorized per reader, hidden checks run outside worker sessions on a disposable copy, and `fleet_recall` scoped to the caller's tenant (§12.4);
+- reference resolution authorized per reader, hidden checks run outside worker sessions on a disposable copy, and `fleet_recall` scoped to the caller's tenant if #415 has not already landed (§12.4);
 - run-pinned candidate and evidence trees (§12.4);
 - usage-limit detection as a non-attempt infrastructure error with a `waiting` wakeup, and supervisor wall-time limits that hold even while a tool is running (§12.11).
 
