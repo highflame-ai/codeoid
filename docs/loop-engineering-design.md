@@ -573,9 +573,31 @@ In codeoid a line comment on a candidate becomes a finding with an id, using the
 The review view shows the candidate diff next to its evidence and the fleet board's entries for that run.
 Pull-request creation is a delivery effect under §6, enabled only when the contract authorizes it.
 
+### 12.11 Operational parity a long-running fleet cannot do without
+
+Verified evidence does not help a fleet that runs out of quota overnight, holds fifty idle backend processes, or fills the disk by Thursday.
+Herdr and Orca handle several of these basics; codeoid has to match them, and its daemon lets it do so with stronger guarantees.
+
+| Need | Peer behaviour | codeoid today | Requirement |
+| --- | --- | --- | --- |
+| Idle backends | Orca hibernates done, idle agents after 30 minutes and resumes them natively, never while a dispatch is unsettled or a subagent is live | A backend starts lazily on first send and resumes natively after a restart (#387), but once started it stays alive until the session is destroyed | Stop idle backends after a configurable period and restart them lazily through the same native resume; never while a run owns the session in `running` or `verifying`, an approval is pending, or background work is live |
+| Usage limits | Orca tracks usage per account, warns at 80%, orders accounts by remaining headroom, and switches accounts | `fallbackModel` and the SDK's retries only; accounts switch by hand (#392, #408); admission counts spawns, not quota | Detect usage-limit and rate-limit errors with their reset time; record them as infrastructure errors that consume no attempt; move the run to `waiting` until the reset, or to another account of the same backend that the contract permits; make dispatch admission consult per-account headroom |
+| Hung work | Orca flags dispatches whose heartbeat goes stale | A 5-minute stall watchdog and 10-minute leases, but the watchdog pauses while a tool runs and the lease keeps renewing, so a hung tool can hold a task indefinitely | Enforce §8's per-attempt and whole-run wall time in the supervisor, independent of tool state and lease renewal |
+| Restart | herdr restores layout and resume references; Orca resumes CLIs natively | Dispatch tasks are reclaimed and continued; routine runs are marked interrupted and not retried; an interactive turn in flight is dropped | Loop runs reconcile per §6; routine runs started by a loop resume as attempts rather than ending as interrupted |
+| Disk and retention | Orca runs archive scripts when worktrees are removed | Worktrees and checkpoints are removed only when a session is destroyed; checkpoints are budgeted per session, not globally; episodes and the audit log are never pruned | Collect worktrees and branches of terminal runs after a retention period, with a global checkpoint budget; add an explicit retention policy for episodes and audit that pins whatever retained evidence references; deleting is a recorded policy action, never a silent summary |
+| Attention | herdr and Orca notifications jump to the waiting agent | Mobile push carries the session id; a browser notification only focuses the window; Telegram reaches only attached users | Every notification opens the run and its pending item, and reaches the run's owner on every connected surface |
+| Fleet budgets | Orca reports usage and estimated cost | Daily and lifetime cost views; budgets exist only on routines (`maxCostUsd`, `dailyCostUsd`); cost views read live sessions, so destroyed workers likely drop out | Per-tenant daily and per-fleet budgets enforced at admission, with cost attributed to runs so it survives worker teardown |
+
+Two further items are useful but not blocking: admission that accounts for the host's CPU and memory as well as worker counts (neither peer does this), and issue-tracker sources such as GitHub issues, Linear, or Jira as run triggers, which reuse the authenticated trigger adapters of §10.
+
+These requirements fit codeoid's model rather than bolting onto it.
+Hibernation is safe because the daemon knows whether a run owns the session.
+A quota stop is a `waiting` state with a wakeup time, not a failed attempt.
+Retention is enforceable because evidence references name exactly which episodes must be kept.
+
 ### What codeoid does not chase
 
-Terminal-scraped breadth, hibernating idle terminals, and a multi-machine terminal view bring parity at best.
+Terminal-scraped breadth and a multi-machine terminal view bring parity at best.
 Federation across machines stays on its own design track.
 The measure for this section is the same as for one run: verified completions per unit of cost and human attention, now across a fleet, with board advice and reference hand-offs each measured with and without (§14).
 
@@ -604,7 +626,8 @@ In the same milestone:
 - episodes tagged with run, attempt, and turn ids, and continuation packets and completion digests that carry episode ids instead of truncated prose (§12.4);
 - soft rotation on for every loop worker, with the rotation seed made backend-neutral (§12.4);
 - attempt generations on dispatch, so stale results and claims are fenced (§5, §12.5);
-- reference resolution authorized per reader, and hidden checks run outside worker sessions (§12.4).
+- reference resolution authorized per reader, and hidden checks run outside worker sessions (§12.4);
+- usage-limit detection as a non-attempt infrastructure error with a `waiting` wakeup, and supervisor wall-time limits that hold even while a tool is running (§12.11).
 
 Exit criterion: a real failing regression can be reproduced, repaired, independently checked, interrupted, resumed, and inspected across at least two provider adapters; a stalled run escalates to a second backend; a run started from a failing CI check finishes with revision-bound evidence; and a worker that reports `cannot_satisfy` on a contradictory task ends `blocked` instead of altering the checks.
 
@@ -622,8 +645,9 @@ Add the run-level fleet board and the daemon-side attention record (§12.1), evi
 Generalize the blackboard into fleet and repository boards with typed entries, ZeroID attribution, generation-fenced advisory claims, write quotas, and a per-role independence policy backed by a run-visibility filter in the memory store (§12.5).
 Extend `dispatch_events` with run-level types and a `needs_judgment` flag, so routine events are absorbed without a model turn (§12.6).
 Parameterize the ACP provider, and serve fleet and board tools through every backend's own tool path (§12.9).
+Add the operational floor of §12.11: idle-backend hibernation with run-aware guards, quota-aware admission and permitted account failover, retention and collection for worktrees, checkpoints, episodes, and audit, notifications that open the run, and per-tenant and per-fleet budgets.
 
-Exit criterion: a fleet of at least three runs on one repository, two of them dependent, finishes with each run's evidence and an integrated tree that has its own; a dependent run never starts on a worker's claim alone; a candidate configured for independence cannot read its siblings' board entries or memory; and an idle fleet spends no model tokens.
+Exit criterion: a fleet of at least three runs on one repository, two of them dependent, finishes with each run's evidence and an integrated tree that has its own; a dependent run never starts on a worker's claim alone; a candidate configured for independence cannot read its siblings' board entries or memory; an idle fleet spends no model tokens; and a fleet left running for a day survives a usage-limit reset, holds no idle backend processes, and stays within its disk budget.
 
 ### E. Schedules and optimization
 
@@ -666,6 +690,10 @@ Required runtime scenarios:
 - A completion digest or continuation packet is built; every excerpt carries the id of its full record, and `get_episode` returns that record verbatim.
 - A fleet sits idle for an hour with routine events; no model turn is started.
 - A setup command fails; the run records an infrastructure error and no attempt is consumed.
+- A subscription hits its usage limit mid-fleet; affected runs wait until the reset or move to a permitted account, and no attempt is consumed.
+- A tool hangs while its lease keeps renewing; the attempt ends at its wall-time limit.
+- An idle worker backend is stopped and the next attempt resumes it natively; a backend with a pending approval or live background work is not stopped.
+- Retention collects an old run; evidence still referenced by a retained run keeps its episodes.
 
 For the first outcome study, use roughly a dozen bounded repository tasks covering repairs, small implementations, and performance work, plus blocked and flaky-environment cases. Compare a normal codeoid session, the existing findings workflow, a simple bounded repeat loop, and the proposed controller under matched provider/model and resource limits. Repeat stochastic runs and retain failures.
 
