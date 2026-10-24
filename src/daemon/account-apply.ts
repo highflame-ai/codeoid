@@ -12,7 +12,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -38,6 +38,15 @@ export interface OverlaySpec {
    * never resume across accounts.
    */
   shared?: readonly string[];
+  /**
+   * Nothing in the target is its own (#417's settings overlays): a file the
+   * vendor created there while it ran — a first sign-in, say, or a file it
+   * saved by replacing our link — is moved into the source, where it would
+   * have gone without the overlay, unless the source's own is newer (then
+   * it's dropped for a link). A directory the source has too is left alone
+   * rather than merged.
+   */
+  adopt?: boolean;
 }
 
 /**
@@ -53,6 +62,7 @@ export function ensureOverlayHome(spec: OverlaySpec): void {
   const copies = spec.copies ?? {};
   const source = resolve(spec.source);
   for (const dir of spec.shared ?? []) mkdirSync(join(source, dir), { recursive: true, mode: 0o700 });
+  if (spec.adopt) adoptIntoSource(spec.target, source, own, copies);
   let entries: string[] = [];
   try {
     entries = readdirSync(source);
@@ -103,6 +113,42 @@ export function ensureOverlayHome(spec: OverlaySpec): void {
       content = undefined;
     }
     atomicWrite(join(spec.target, name), transform(content), 0o600);
+  }
+}
+
+/** {@link OverlaySpec.adopt}: hand what the vendor wrote into `target` back to `source`. */
+function adoptIntoSource(target: string, source: string, own: ReadonlySet<string>, copies: Record<string, unknown>): void {
+  let names: string[] = [];
+  try {
+    names = readdirSync(target);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (own.has(name) || name in copies || isLockEntry(target, name)) continue;
+    const entry = join(target, name);
+    let stat: ReturnType<typeof lstatSync>;
+    try {
+      stat = lstatSync(entry);
+    } catch {
+      continue;
+    }
+    if (stat.isSymbolicLink()) continue;
+    const there = join(source, name);
+    let theirs: ReturnType<typeof statSync> | null = null;
+    try {
+      theirs = statSync(there);
+    } catch {
+      // The source has none.
+    }
+    if (theirs && stat.isDirectory()) continue;
+    try {
+      // The later write wins, as it would have in one home.
+      if (!theirs || stat.mtimeMs > theirs.mtimeMs) renameSync(entry, there);
+      else unlinkSync(entry); // linked to the source's below
+    } catch {
+      // Another filesystem, or the source changed meanwhile: next time.
+    }
   }
 }
 
@@ -226,6 +272,16 @@ export function defaultGeminiCliRoot(env: Record<string, string | undefined> = p
   return env.GEMINI_CLI_HOME || env.HOME || homedir();
 }
 
+/**
+ * `root`, refused unless absolute: the CLI reads a relative GEMINI_CLI_HOME
+ * against each session's workdir, an overlay would build it under the
+ * daemon's own — neither is a home anyone meant.
+ */
+function absoluteGeminiCliRoot(root: string): string {
+  if (!isAbsolute(root)) throw new AccountError(`GEMINI_CLI_HOME must be an absolute path (it's ${JSON.stringify(root)})`);
+  return root;
+}
+
 /** The Gemini CLI's own Google login files — never linked into an API-key account's home. */
 const GEMINI_CLI_OWN = ["oauth_creds.json", "google_accounts.json", "gemini-credentials.json"];
 
@@ -251,7 +307,7 @@ export function geminiAccountSettings(source: string | undefined, authType: stri
 export function ensureGeminiCliHome(account: Pick<ResolvedAccount, "home">): void {
   mkdirSync(account.home, { recursive: true, mode: 0o700 });
   ensureOverlayHome({
-    source: join(defaultGeminiCliRoot(), ".gemini"),
+    source: join(absoluteGeminiCliRoot(defaultGeminiCliRoot()), ".gemini"),
     target: join(account.home, ".gemini"),
     own: GEMINI_CLI_OWN,
     copies: { "settings.json": (src) => geminiAccountSettings(src, "gemini-api-key") },
@@ -285,7 +341,7 @@ export function applyGeminiCliEffort(
   homesRoot: string = join(getConfigDir(), "accounts"),
 ): Record<string, string> {
   if (!effort) return env;
-  const base = env.GEMINI_CLI_HOME || defaultGeminiCliRoot();
+  const base = absoluteGeminiCliRoot(env.GEMINI_CLI_HOME || defaultGeminiCliRoot());
   const key = `${overlayKey(base)}-${effort}`;
   const home = join(homesRoot, "gemini-cli-effort", key);
   mkdirSync(home, { recursive: true, mode: 0o700 });
@@ -295,6 +351,7 @@ export function applyGeminiCliEffort(
     own: [],
     copies: { "settings.json": (src) => geminiEffortSettings(src, effort) },
     shared: ["tmp"],
+    adopt: true,
   });
   return { ...env, GEMINI_CLI_HOME: home };
 }
@@ -435,6 +492,7 @@ export function applyPiSettingsOverlay(
     own: [],
     copies: { "settings.json": (src) => src ?? "{}\n" },
     shared: ["sessions"],
+    adopt: true,
   });
   return { ...env, PI_CODING_AGENT_DIR: home };
 }

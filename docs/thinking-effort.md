@@ -7,7 +7,7 @@ How hard a session's model thinks before it answers, on one scale for every back
 **Default, Off, Minimal, Low, Medium, High, Extra high (`xhigh`), Max.**
 
 **Default** is the backend's own choice, as it always was.
-Most backends are simply sent nothing; two keep a level once it's set, so Default is sent to them explicitly, as the level they would pick unasked: Codex gets your configured `model_reasoning_effort` (project config included), else the running model's own default; pi gets the default in your pi settings (`defaultThinkingLevel`, else Medium; a project's `.pi/settings.json` isn't read, since pi honours it only for a project you trust).
+Most backends are simply sent nothing; two keep a level once it's set, so Default is sent to them explicitly, as the level they would pick unasked: Codex gets your configured `model_reasoning_effort` (project config included) if the running model takes it, else that model's own default; pi gets the default in your pi settings (`defaultThinkingLevel`, else Medium; a project's `.pi/settings.json` isn't read, since pi honours it only for a project you trust).
 On Codex, a model its catalog doesn't list, with no effort configured, has no known default: Default then sends nothing, so a level set earlier on that thread stays until the next thread.
 Every other level is mapped to the backend's own setting (below).
 A level a backend has no exact match for goes to its nearest one; pi clamps a level a model doesn't take to the nearest it does.
@@ -34,6 +34,7 @@ Where the backend says, the pickers offer only the model's own levels:
 
 The others (OpenAI and OpenAI-compatible endpoints, llama.cpp, Qwen, Gemini, the Gemini CLI) don't, so every level is offered and marked "support unknown".
 The Default entry shows what Default means on that session once the backend has said (Codex: your configured effort, the project's included, on the model it actually runs; pi: your default).
+Before a session's first turn, and after a model change until the next one, it shows what the model list says instead; on Codex that reads your user config only, so a project's own `model_reasoning_effort` shows from the first turn.
 A level the server refuses fails the turn with a note saying so; pick another, or Default.
 
 ## When a change applies
@@ -72,6 +73,8 @@ Notes:
 - **pi** saves a thinking-level change as your global default in its settings, so codeoid runs it from an overlay of its agent directory: your logins and sessions are linked, and `settings.json` is a fresh copy at each start, so one session's effort never changes your own pi or other sessions.
   The overlays live under `~/.codeoid/accounts/pi-session/`.
   pi's OAuth refresh locks the real `auth.json`, so codeoid's pi and one you run yourself refresh in turn; only a sign-in or sign-out made in both at the same moment isn't serialized.
+- Anything the Gemini CLI or pi writes in its overlay while it runs (a first sign-in, say) is moved to your own home before the next start, as it would have been written there without codeoid; if yours is newer, it wins.
 - The Gemini CLI and pi overlays of an account's home are removed with the account.
+  Those of your own home stay, each with a copy of your Gemini CLI or pi settings; like everything under `~/.codeoid/accounts/`, agents can't read them.
 - **At Default**, a backend reads its own config as it always did: Qwen applies a project's `.qwen/settings.json` reasoning effort, Claude your Claude Code effort setting (your own, or the project's `.claude/settings.json`). A level you set overrides them.
 - **A project's own Gemini CLI settings** (`.gemini/settings.json` in the workdir) outrank your user settings, so a project that redefines `chat-base-2.5` or `chat-base-3` there overrides the effort on the Gemini CLI.

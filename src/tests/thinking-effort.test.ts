@@ -7,7 +7,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { Database } from "bun:sqlite";
-import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseClientMessage } from "@highflame/codeoid-protocol/schemas";
@@ -95,6 +95,40 @@ describe("each backend's reading of the scale", () => {
     expect(applyGeminiCliEffort("low", { GEMINI_CLI_HOME: base }, homes).GEMINI_CLI_HOME).not.toBe(home);
     expect(applyGeminiCliEffort(undefined, { GEMINI_CLI_HOME: base }, homes)).toEqual({ GEMINI_CLI_HOME: base });
   });
+
+  it("what the Gemini CLI writes in the overlay goes back to its usual home — a first sign-in isn't stranded there", () => {
+    const base = join(tmp, "base");
+    mkdirSync(join(base, ".gemini"), { recursive: true });
+    writeFileSync(join(base, ".gemini", "google_accounts.json"), "old");
+    utimesSync(join(base, ".gemini", "google_accounts.json"), new Date(1000), new Date(1000)); // the file clock is coarse: make "older" certain
+    const homes = join(tmp, "homes");
+    const g = join(applyGeminiCliEffort("high", { GEMINI_CLI_HOME: base }, homes).GEMINI_CLI_HOME!, ".gemini");
+    // A first sign-in, written in the overlay; a file saved by replacing our link; one older than the user's own; a directory both have.
+    writeFileSync(join(g, "oauth_creds.json"), "signed-in");
+    rmSync(join(g, "google_accounts.json"));
+    writeFileSync(join(g, "google_accounts.json"), "new");
+    writeFileSync(join(base, ".gemini", "installation_id"), "users");
+    writeFileSync(join(g, "installation_id"), "stale");
+    utimesSync(join(g, "installation_id"), new Date(0), new Date(0));
+    mkdirSync(join(base, ".gemini", "history"), { recursive: true });
+    utimesSync(join(base, ".gemini", "history"), new Date(1000), new Date(1000));
+    mkdirSync(join(g, "history", "x"), { recursive: true });
+    applyGeminiCliEffort("high", { GEMINI_CLI_HOME: base }, homes);
+    expect(readFileSync(join(base, ".gemini", "oauth_creds.json"), "utf8")).toBe("signed-in");
+    expect(readlinkSync(join(g, "oauth_creds.json"))).toBe(join(base, ".gemini", "oauth_creds.json"));
+    expect(readFileSync(join(base, ".gemini", "google_accounts.json"), "utf8")).toBe("new");
+    expect(lstatSync(join(g, "google_accounts.json")).isSymbolicLink()).toBe(true);
+    expect(readFileSync(join(base, ".gemini", "installation_id"), "utf8")).toBe("users");
+    expect(lstatSync(join(g, "installation_id")).isSymbolicLink()).toBe(true);
+    expect(existsSync(join(g, "history", "x"))).toBe(true); // not merged
+    expect(lstatSync(join(g, "settings.json")).isSymbolicLink()).toBe(false); // the overlay's own
+  });
+
+  it("refuses a GEMINI_CLI_HOME that isn't absolute, building nothing under the daemon's directory", () => {
+    const rel = `codeoid-effort-rel-${process.pid}`;
+    expect(() => applyGeminiCliEffort("high", { GEMINI_CLI_HOME: rel }, join(tmp, "homes"))).toThrow(/absolute/);
+    expect(existsSync(rel)).toBe(false);
+  });
 });
 
 describe("pi's settings overlay", () => {
@@ -108,11 +142,14 @@ describe("pi's settings overlay", () => {
     expect(lstatSync(join(home, "settings.json")).isSymbolicLink()).toBe(false);
     expect(() => lstatSync(join(home, "auth.json.lock"))).toThrow();
     expect(piDefaultThinkingLevel({ PI_CODING_AGENT_DIR: base })).toBe("high");
-    // An overlay that took an empty auth.json of its own before gets the user's linked instead.
+    // An overlay that took an empty auth.json of its own before gets the user's linked instead — never written over it.
+    writeFileSync(join(base, "auth.json"), '{"login":1}');
+    utimesSync(join(base, "auth.json"), new Date(1000), new Date(1000)); // the overlay's empty one is the newer
     rmSync(join(home, "auth.json"));
     writeFileSync(join(home, "auth.json"), "{}");
     applyPiSettingsOverlay({ PI_CODING_AGENT_DIR: base }, homes);
     expect(lstatSync(join(home, "auth.json")).isSymbolicLink()).toBe(true);
+    expect(readFileSync(join(base, "auth.json"), "utf8")).toBe('{"login":1}');
   });
 
   it("a dangling auth.json link is left to pi; a permanent lock FILE (codex's) is still linked", () => {
@@ -137,6 +174,7 @@ describe("pi's settings overlay", () => {
   it("refuses a pi agent dir that isn't absolute — it would put pi's logins under the daemon's own directory", () => {
     expect(() => applyPiSettingsOverlay({ PI_CODING_AGENT_DIR: "relative/pi" }, join(tmp, "homes"))).toThrow(/absolute/);
     expect(() => applyPiSettingsOverlay({ PI_CODING_AGENT_DIR: "file://somehost/x" }, join(tmp, "homes"))).toThrow(/absolute/);
+    expect(existsSync("relative")).toBe(false);
   });
 
   it("reads a ~ path as pi does", () => {
@@ -189,19 +227,26 @@ class RestartProvider extends MockSessionProvider {
   readonly effortChange = "restart" as const;
 }
 
-function manager(make: () => MockSessionProvider, providerId = "claude", defaultEffort?: EffortLevel): { m: SessionManager; store: Store; providers: MockSessionProvider[] } {
+function manager(
+  make: () => MockSessionProvider,
+  providerId = "claude",
+  defaultEffort?: EffortLevel,
+  other?: { id: string; make: () => MockSessionProvider },
+): { m: SessionManager; store: Store; providers: MockSessionProvider[] } {
   const store = new Store(join(tmp, "codeoid.db"));
   const providers: MockSessionProvider[] = [];
   const registry = new ProviderRegistry(providerId);
-  registry.register({
-    id: providerId,
-    displayName: providerId,
-    create: () => {
-      const p = make();
-      providers.push(p);
-      return p;
-    },
-  });
+  for (const [id, mk] of [[providerId, make], ...(other ? [[other.id, other.make] as const] : [])] as const) {
+    registry.register({
+      id,
+      displayName: id,
+      create: () => {
+        const p = mk();
+        providers.push(p);
+        return p;
+      },
+    });
+  }
   const config = {
     daemonUrl: "ws://127.0.0.1:7400",
     dbPath: join(tmp, "codeoid.db"),
@@ -310,6 +355,22 @@ describe("a session's thinking effort", () => {
     // The same level again while a restart is still to come says so.
     expect(await setEffort(m, sid, "low")).toMatchObject({ data: { applies: "restart" } });
     expect(await setEffort(m, sid, "low")).toMatchObject({ data: { applies: "restart" } });
+    // Changed back to what it runs at before a turn: nothing to restart for.
+    expect(await setEffort(m, sid, "high")).toMatchObject({ data: { applies: "now" } });
+    expect(m._sessionForTest(sid)!.toInfo().effortPending).toBeUndefined();
+    await turn(m, sid);
+    expect(providers[0]!.teardownCount).toBe(1);
+  });
+
+  it("a restart still to come is dropped by a backend switch — the new backend starts with the effort", async () => {
+    const { m } = manager(() => new RestartProvider("gemini-cli", []), "gemini-cli", undefined, { id: "claude", make: () => new MockSessionProvider("claude", []) });
+    const sid = await create(m);
+    await turn(m, sid);
+    expect(await setEffort(m, sid, "high")).toMatchObject({ data: { applies: "restart" } });
+    await m._sessionForTest(sid)!.switchProvider("claude", auth());
+    expect(await setEffort(m, sid, "high")).toMatchObject({ data: { applies: "next-turn" } }); // not a restart: it's taken per turn now
+    await turn(m, sid);
+    expect(m._sessionForTest(sid)!.toInfo().effortPending).toBeUndefined();
   });
 
   it("created at Default explicitly, a session takes the backend's default, not the config's", async () => {

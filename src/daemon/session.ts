@@ -1819,6 +1819,7 @@ export class Session {
     }
 
     this.#provider = this.#createProvider(requested);
+    this.#effortRestartPending = false; // the new backend starts with the session's effort
     this.#appliedAccount = this.#accountState(requested);
     this.#resetMcpState({ backendChanged: true });
     this.#provider.onSessionEvent = (e) => this.#onSessionScopedEvent(e);
@@ -5096,8 +5097,9 @@ export class Session {
       // Nothing new — but a change still on its way says so.
       applies = this.#effortRestartPending ? "restart" : this.#effortSent !== undefined && this.#effortSent !== effort ? "next-turn" : "now";
     } else if (this.#provider.effortChange === "restart") {
-      this.#effortRestartPending = true;
-      applies = "restart";
+      // Back to what the running backend has (changed and changed back before a turn): nothing to restart for.
+      this.#effortRestartPending = this.#effortSent === undefined || this.#effortSent !== effort;
+      applies = this.#effortRestartPending ? "restart" : "now";
     } else if (this.#provider.applyEffort) {
       try {
         if (await this.#provider.applyEffort(effort)) {
