@@ -499,6 +499,25 @@ export class DaemonServer {
             );
           }
         }
+        // One-time: record the owning tenant of every persisted session's
+        // workspace, so cross-workspace search (scoped by tenant, #415) still
+        // reaches memory written before ownership was tracked. Runs after the
+        // re-key above so it registers the ids episodes now carry.
+        if (this.#memory.store.needsWorkspaceTenantBackfill()) {
+          try {
+            const r = this.#memory.store.backfillWorkspaceTenants(
+              this.#store.listAllSessionsForMigration(),
+              workspaceIdFromPath,
+            );
+            if (r.applied) {
+              console.log(`[codeoid] memory: recorded the owner of ${r.registered} workspace(s)`);
+            }
+          } catch (err) {
+            console.error(
+              `[codeoid] memory workspace-owner backfill failed (non-fatal; retried next boot): ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        }
       } catch (err) {
         console.error(
           `[codeoid] memory init failed, continuing without recall: ${err instanceof Error ? err.message : String(err)}`,

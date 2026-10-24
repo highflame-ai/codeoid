@@ -182,6 +182,10 @@ export function legacyWorkspaceIdFromPath(workdir: string): string {
 
 /** Bump when adding a new PRAGMA user_version-guarded episode migration. */
 const TENANT_WS_MIGRATION_VERSION = 1;
+/** `memory_migrations` row recording that persisted sessions' workspaces have
+ * tenant rows. Tracked apart from user_version so it neither depends on nor
+ * blocks the re-key migration above. */
+const WORKSPACE_TENANT_BACKFILL = "workspace_tenants_backfill";
 
 export class SqliteEpisodeStore {
   #db: Database;
@@ -349,6 +353,24 @@ export class SqliteEpisodeStore {
 
       CREATE INDEX IF NOT EXISTS idx_episode_vectors_workspace
         ON episode_vectors(workspace_id);
+
+      -- Which tenant owns each workspace id. The id is a one-way hash that folds
+      -- the tenant in, so a query spanning several workspaces cannot recover the
+      -- owner from the id itself; cross-workspace retrieval joins this table and
+      -- a workspace with no row is invisible to it (fail closed).
+      CREATE TABLE IF NOT EXISTS workspace_tenants (
+        workspace_id  TEXT PRIMARY KEY,
+        account_id    TEXT NOT NULL,
+        project_id    TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_workspace_tenants_tenant
+        ON workspace_tenants(account_id, project_id);
+
+      CREATE TABLE IF NOT EXISTS memory_migrations (
+        name        TEXT PRIMARY KEY,
+        applied_at  INTEGER NOT NULL
+      );
     `);
 
     // Idempotent migration: add primary_max_call_input_tokens column to
@@ -1236,28 +1258,97 @@ export class SqliteEpisodeStore {
     return ordered;
   }
 
-  // ── Cross-workspace (global) retrieval primitives ─────────────────────────
-  // The conductor resolves a fuzzy reference to the right session across ALL
-  // workspaces on the machine, not within one. These are the unscoped twins of
-  // ftsSearch / loadVectorMatrix / filter. Ranking a single GLOBAL candidate set
-  // (rather than merging per-workspace results) is what makes BM25 scores
-  // comparable across workspaces — see engine.recallGlobal().
-  //
-  // NOTE: "global" here means the whole store, which is single-tenant per user
-  // (workspace ids already fold in account+project). When the conductor grows a
-  // multi-tenant surface, scope these to the caller's tenant workspace set.
+  // ── Workspace ownership ───────────────────────────────────────────────────
 
-  /** Distinct workspace ids present in the store. */
-  listWorkspaceIds(): string[] {
+  /** Record which tenant owns `workspaceId`. Idempotent; the id already folds
+   * the tenant in, so a workspace can only ever belong to one tenant. */
+  registerWorkspaceTenant(workspaceId: string, tenant: WorkspaceTenant): void {
+    this.#db
+      .prepare(
+        "INSERT OR IGNORE INTO workspace_tenants (workspace_id, account_id, project_id) VALUES (?, ?, ?)",
+      )
+      .run(workspaceId, tenant.accountId, tenant.projectId);
+  }
+
+  /** Whether the one-time workspace-tenant backfill still needs to run. */
+  needsWorkspaceTenantBackfill(): boolean {
     return (
       this.#db
-        .prepare("SELECT DISTINCT workspace_id AS w FROM episodes")
-        .all() as Array<{ w: string }>
+        .prepare("SELECT 1 FROM memory_migrations WHERE name = ?")
+        .get(WORKSPACE_TENANT_BACKFILL) == null
+    );
+  }
+
+  /**
+   * One-time: give every persisted session's workspace a tenant row, so memory
+   * written before `workspace_tenants` existed stays reachable by cross-workspace
+   * retrieval. Sessions created afterwards register themselves at construction.
+   * A workspace whose sessions were all destroyed before this ran gets no row and
+   * stays invisible to cross-workspace retrieval — its owner cannot be proven.
+   * Per-workspace recall (by the owning session's own id) is unaffected.
+   */
+  backfillWorkspaceTenants(
+    sessions: ReadonlyArray<{ workdir: string; accountId: string; projectId: string }>,
+    workspaceIdFor: (workdir: string, tenant: WorkspaceTenant) => string,
+  ): { applied: boolean; registered: number } {
+    if (!this.needsWorkspaceTenantBackfill()) return { applied: false, registered: 0 };
+    let registered = 0;
+    this.#db.transaction(() => {
+      const ins = this.#db.prepare(
+        "INSERT OR IGNORE INTO workspace_tenants (workspace_id, account_id, project_id) VALUES (?, ?, ?)",
+      );
+      for (const s of sessions) {
+        const tenant = { accountId: s.accountId, projectId: s.projectId };
+        registered += Number(ins.run(workspaceIdFor(s.workdir, tenant), s.accountId, s.projectId).changes ?? 0);
+      }
+      this.#db
+        .prepare("INSERT INTO memory_migrations (name, applied_at) VALUES (?, ?)")
+        .run(WORKSPACE_TENANT_BACKFILL, Date.now());
+    })();
+    return { applied: true, registered };
+  }
+
+  // ── Cross-workspace (global) retrieval primitives ─────────────────────────
+  // The conductor resolves a fuzzy reference to the right session across every
+  // workspace its TENANT owns, not within one. These are the cross-workspace
+  // twins of ftsSearch / loadVectorMatrix / filter. Ranking a single candidate
+  // set (rather than merging per-workspace results) is what makes BM25 scores
+  // comparable across workspaces — see engine.recallGlobal().
+  //
+  // Every primitive takes the caller's tenant and joins workspace_tenants: one
+  // daemon can serve several tenants, and an unscoped read here returned other
+  // tenants' episodes to the conductor's fleet tools (#415).
+
+  /** Workspace ids owned by `tenant` that hold at least one episode. */
+  listWorkspaceIds(tenant: WorkspaceTenant): string[] {
+    return (
+      this.#db
+        .prepare(
+          `SELECT DISTINCT e.workspace_id AS w
+           FROM episodes e
+           JOIN workspace_tenants t ON t.workspace_id = e.workspace_id
+           WHERE t.account_id = ? AND t.project_id = ?`,
+        )
+        .all(tenant.accountId, tenant.projectId) as Array<{ w: string }>
     ).map((r) => r.w);
   }
 
-  /** FTS5 keyword search across ALL workspaces. */
-  ftsSearchGlobal(query: string, limit: number): Array<{ id: string; bm25: number }> {
+  /** Distinct tenants that own a workspace — for offline tooling that walks the
+   * whole store one tenant at a time. */
+  listWorkspaceTenants(): WorkspaceTenant[] {
+    return (
+      this.#db
+        .prepare("SELECT DISTINCT account_id, project_id FROM workspace_tenants")
+        .all() as Array<{ account_id: string; project_id: string }>
+    ).map((r) => ({ accountId: r.account_id, projectId: r.project_id }));
+  }
+
+  /** FTS5 keyword search across every workspace `tenant` owns. */
+  ftsSearchGlobal(
+    query: string,
+    limit: number,
+    tenant: WorkspaceTenant,
+  ): Array<{ id: string; bm25: number }> {
     if (!query.trim()) return [];
     const sanitized = sanitizeFtsQuery(query);
     if (!sanitized) return [];
@@ -1266,11 +1357,15 @@ export class SqliteEpisodeStore {
         `SELECT e.id AS id, bm25(episodes_fts) AS bm25
          FROM episodes_fts
          JOIN episodes e ON e.rowid = episodes_fts.rowid
-         WHERE episodes_fts MATCH ?
+         JOIN workspace_tenants t ON t.workspace_id = e.workspace_id
+         WHERE episodes_fts MATCH ? AND t.account_id = ? AND t.project_id = ?
          ORDER BY bm25
          LIMIT ?`,
       )
-      .all(sanitized, limit) as Array<{ id: string; bm25: number }>;
+      .all(sanitized, tenant.accountId, tenant.projectId, limit) as Array<{
+      id: string;
+      bm25: number;
+    }>;
   }
 
   /** Fetch episodes by id (no workspace scoping), preserving input order. */

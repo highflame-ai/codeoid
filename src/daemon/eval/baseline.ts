@@ -78,16 +78,26 @@ async function withinRank(query: string, ws: string): Promise<string[]> {
   return hits.map((h) => h.sessionId);
 }
 
+// Cross-workspace search is tenant-scoped (#415). The eval corpus is one
+// user's store, so "global" here means each owning tenant in turn, merged.
+const tenants = store.listWorkspaceTenants();
+
+async function tenantGlobalRank(query: string, rerank: boolean): Promise<string[]> {
+  const all: SessionSearchHit[] = [];
+  for (const tenant of tenants) {
+    all.push(...(await engine.searchSessions({ query, tenant, limit: 15, rerank })));
+  }
+  return all.sort((a, b) => b.aggregateScore - a.aggregateScore).map((h) => h.sessionId);
+}
+
 /** Cross-workspace GLOBAL fusion, no rerank (P1 slice 1). */
 async function globalRank(query: string): Promise<string[]> {
-  const hits = await engine.searchSessions({ query, limit: 15, rerank: false });
-  return hits.map((h) => h.sessionId);
+  return tenantGlobalRank(query, false);
 }
 
 /** Cross-workspace GLOBAL fusion + cross-encoder rerank (P1 slice 2). */
 async function globalRerankRank(query: string): Promise<string[]> {
-  const hits = await engine.searchSessions({ query, limit: 15, rerank: true });
-  return hits.map((h) => h.sessionId);
+  return tenantGlobalRank(query, true);
 }
 
 const crossRanked: string[][] = [];

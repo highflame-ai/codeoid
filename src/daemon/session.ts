@@ -1277,6 +1277,20 @@ export class Session {
     // Tenant-scoped (auth carries account_id/project_id) so two accounts in
     // the same directory never share memory.
     this.#workspaceId = workspaceIdFromPath(opts.workdir, opts.auth);
+    // Record the owner before the first episode is written, so the tenant's
+    // cross-workspace search can reach this workspace and no other tenant's can.
+    if (this.#memory) {
+      try {
+        this.#memory.registerWorkspace(this.#workspaceId, {
+          accountId: opts.auth.accountId,
+          projectId: opts.auth.projectId,
+        });
+      } catch (err) {
+        console.error(
+          `[codeoid/session ${this.id.slice(0, 8)}] memory: workspace registration failed — cross-workspace search will not find this session: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
     // Rotation counters — populated from Store so they survive restart.
     const stats = this.#store.getRotationStats(this.id);
     this.#rotationCount = stats.count;
