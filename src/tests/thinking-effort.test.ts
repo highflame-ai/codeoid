@@ -134,6 +134,11 @@ describe("pi's settings overlay", () => {
     expect(piDefaultThinkingLevel({ PI_CODING_AGENT_DIR: agent })).toBe("low");
   });
 
+  it("refuses a pi agent dir that isn't absolute — it would put pi's logins under the daemon's own directory", () => {
+    expect(() => applyPiSettingsOverlay({ PI_CODING_AGENT_DIR: "relative/pi" }, join(tmp, "homes"))).toThrow(/absolute/);
+    expect(() => applyPiSettingsOverlay({ PI_CODING_AGENT_DIR: "file://somehost/x" }, join(tmp, "homes"))).toThrow(/absolute/);
+  });
+
   it("reads a ~ path as pi does", () => {
     mkdirSync(join(tmp, "h", "x"), { recursive: true });
     writeFileSync(join(tmp, "h", "x", "settings.json"), JSON.stringify({ defaultThinkingLevel: "minimal" }));
@@ -326,6 +331,19 @@ describe("a session's thinking effort", () => {
     expect(m._sessionForTest((r.data?.session?.id ?? r.data?.id)!)!.toInfo().effort).toBeUndefined();
   });
 
+  it("what Default means is shown only while it's for the model in use", async () => {
+    class Reporting extends MockSessionProvider {
+      readonly defaultEffort = "high" as const;
+      readonly runningModel = "claude-running-model";
+    }
+    const { m } = manager(() => new Reporting("claude", []));
+    const sid = await create(m);
+    const s = m._sessionForTest(sid)!;
+    expect(s.toInfo()).toMatchObject({ defaultEffort: "high", runningModel: "claude-running-model" });
+    await s.setModel("opus", undefined, auth());
+    expect(s.toInfo().defaultEffort).toBeUndefined(); // stale for the new model until its first turn
+  });
+
   it("a fork thinks as hard as the session it came from", async () => {
     const { m } = manager(() => new MockSessionProvider("claude", []));
     const sid = await create(m, "xhigh");
@@ -395,5 +413,14 @@ describe("a session's thinking effort", () => {
     const r = (await m.handle({ type: "models.list", id: "m", provider: "claude" }, auth(), client)) as { models: Array<{ value: string; efforts?: string[]; defaultEffort?: string }> };
     expect(r.models.find((x) => x.value === "opus")).toMatchObject({ efforts: ["off", "low", "high"], defaultEffort: "high" });
     expect(r.models.find((x) => x.value === "other")?.efforts).toBeUndefined();
+  });
+});
+
+describe("the TUI effort picker", () => {
+  it("doesn't show a Default the model's known levels don't include", async () => {
+    const { effortChoices } = await import("../tui/components/BackendPicker.js");
+    expect(effortChoices(["off"], "medium")[0]!.description).toBe("the backend decides");
+    expect(effortChoices(["low", "medium"], "medium")[0]!.description).toBe("the backend decides (Medium)");
+    expect(effortChoices(undefined, "medium")[0]!.description).toBe("the backend decides (Medium)");
   });
 });

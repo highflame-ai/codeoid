@@ -1862,8 +1862,10 @@ export interface SessionSetEffortMsg extends BaseClientMsg {
 /** `response.ok` data for `session.set_effort`. */
 export interface EffortChangeResult {
   effort: EffortLevel | null;
-  /** When it takes effect: now, from the next turn, or once the backend restarts (before the next turn). */
+  /** When it takes effect: now, from the next turn, or once the backend restarts (between turns). */
   applies: "now" | "next-turn" | "restart";
+  /** It needs a rebuild that waits for the session's background work to end (Stop ends it). */
+  waitsForBackground?: boolean;
 }
 
 /**

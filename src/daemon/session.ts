@@ -86,6 +86,7 @@ import {
 } from "./checkpoints.js";
 import { applyRewinds, REWIND_EVENT, type TurnIndexEntry } from "./transcript.js";
 import type { EffortChangeResult, EffortLevel, RewindFiles, RewindIrreversible, TurnSummary } from "../protocol/types.js";
+import { LIMITS } from "../protocol/types.js";
 import { hasScope, SCOPES } from "../protocol/scopes.js";
 import type { PendingToolApproval, SessionApproveOutcome } from "../protocol/types.js";
 import { execFile } from "node:child_process";
@@ -4690,9 +4691,13 @@ export class Session {
       model: this.#model ?? undefined,
       fallbackModel: this.#fallbackModel ?? undefined,
       effort: this.#effort ?? undefined,
-      ...(this.#provider.defaultEffort ? { defaultEffort: this.#provider.defaultEffort } : {}),
+      // What Default means — while it's for the model in use (a model change makes it stale until the next turn).
+      ...(this.#provider.defaultEffort &&
+      (!this.#provider.runningModel || this.#model == null || this.#model === this.#provider.runningModel)
+        ? { defaultEffort: this.#provider.defaultEffort }
+        : {}),
       ...(this.#effortRestartPending || (this.#effortSent !== undefined && this.#effortSent !== this.#effort) ? { effortPending: true } : {}),
-      ...(this.#provider.runningModel ? { runningModel: this.#provider.runningModel } : {}),
+      ...(this.#provider.runningModel ? { runningModel: this.#provider.runningModel.slice(0, LIMITS.MODEL_MAX) } : {}),
       forkedFrom: this.forkedFrom,
       worktree: this.worktree,
       collaboration: this.collaboration,
@@ -5121,7 +5126,7 @@ export class Session {
     this.#persistAndBuffer(info);
     this.#broadcastRaw(info);
     this.#broadcastInfoUpdate();
-    return { effort, applies };
+    return { effort, applies, ...(applies === "next-turn" && this.#backgroundTasks.size > 0 ? { waitsForBackground: true } : {}) };
   }
 
   /**

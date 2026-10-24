@@ -856,6 +856,11 @@ const EffortPicker: Component<{ sessionId: string; current?: EffortLevel; pendin
   const entry = () => modelCatalog().find((m) => m.value === props.model) ?? (props.model ? undefined : modelCatalog().find((m) => m.isDefault));
   const known = () => entry()?.efforts;
   const levels = (): readonly EffortLevel[] => known() ?? EFFORT_LEVELS;
+  // What Default means here — unless the model's known levels don't include it.
+  const shownDefault = () => {
+    const d = props.sessionDefault ?? entry()?.defaultEffort;
+    return d && (!known() || known()!.includes(d)) ? d : undefined;
+  };
   const choose = (effort: EffortLevel | null) =>
     act.run({ type: "session.set_effort", id: newRequestId(), sessionId: props.sessionId, effort }, () => setOpen(false));
   return (
@@ -893,7 +898,7 @@ const EffortPicker: Component<{ sessionId: string; current?: EffortLevel; pendin
           >
             <span>
               Default
-              <Show when={props.sessionDefault ?? entry()?.defaultEffort}>
+              <Show when={shownDefault()}>
                 {(d) => <span class="text-fg-faint"> · {EFFORT_LABELS[d()]}</span>}
               </Show>
             </span>

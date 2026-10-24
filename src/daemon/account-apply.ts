@@ -14,7 +14,7 @@
 import { spawn } from "node:child_process";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { atomicWrite, getConfigDir } from "../config.js";
 import type { EffortLevel } from "../protocol/types.js";
@@ -407,6 +407,8 @@ export function applyPiSettingsOverlay(
   homesRoot: string = join(getConfigDir(), "accounts"),
 ): Record<string, string> {
   const base = piAgentDirOf(env);
+  // A relative (or unparseable) dir would put pi's logins under the daemon's own working directory.
+  if (!isAbsolute(base)) throw new AccountError(`PI_CODING_AGENT_DIR must be an absolute path (it's ${JSON.stringify(base)})`);
   // pi creates its auth.json when it's missing — then it must be the user's,
   // not a file of the overlay's own that a later `pi /login` never reaches.
   mkdirSync(base, { recursive: true, mode: 0o700 });
@@ -460,7 +462,9 @@ export function piDefaultThinkingLevel(env: Record<string, string | undefined>):
  */
 export function applyPiAccount(account: ResolvedAccount | null, env: Record<string, string>): Record<string, string> {
   if (!account) return env;
-  ensureOverlayHome({ source: piAgentDirOf(process.env), target: account.home, own: ["auth.json"], shared: ["sessions"] });
+  const source = piAgentDirOf(process.env);
+  if (!isAbsolute(source)) throw new AccountError(`PI_CODING_AGENT_DIR must be an absolute path (it's ${JSON.stringify(source)})`);
+  ensureOverlayHome({ source, target: account.home, own: ["auth.json"], shared: ["sessions"] });
   const out = without(
     env,
     (k) => k.endsWith("_API_KEY") || k.endsWith("_API_TOKEN") || k === "PI_CODING_AGENT_DIR" || /^(ANTHROPIC|OPENAI|GOOGLE|GEMINI)_/.test(k),

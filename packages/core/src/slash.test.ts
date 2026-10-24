@@ -85,6 +85,7 @@ describe("parseSlash", () => {
     expect(() => parseSlash("/effort turbo")).toThrow(/off\|minimal/);
     expect(effortChangeSummary({ effort: "max", applies: "restart" })).toMatch(/restarts/);
     expect(effortChangeSummary({ effort: null, applies: "next-turn" })).toBe("Thinking effort: the backend's default, from the next turn.");
+    expect(effortChangeSummary({ effort: "off", applies: "next-turn", waitsForBackground: true })).toMatch(/no background work running \(Stop ends it\)/);
   });
 
   it("bare /model opens the picker instead of erroring", () => {

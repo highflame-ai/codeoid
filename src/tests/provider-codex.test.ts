@@ -1309,18 +1309,18 @@ describe("CodexProvider – thinking effort (#417)", () => {
     expect(await effortSeen("off")).toBe("none");
     expect(await effortSeen()).toBe("low"); // the running model's own default (no configured effort)
     const saved = process.env.CODEX_FAKE_CONFIG_EFFORT;
-    process.env.CODEX_FAKE_CONFIG_EFFORT = "xhigh";
+    process.env.CODEX_FAKE_CONFIG_EFFORT = "high";
     try {
-      expect(await effortSeen()).toBe("xhigh"); // the user's model_reasoning_effort wins
+      expect(await effortSeen()).toBe("high"); // the user's model_reasoning_effort wins (a level the model takes)
       // Read afresh for each thread, as codex does: an edit made meanwhile counts.
       const p = makeProvider();
       await collect(p.runTurn(turnOpts("echo-effort")));
       await p.teardown();
       await Bun.sleep(100); // the killed app-server's exit lands before the next turn starts
-      process.env.CODEX_FAKE_CONFIG_EFFORT = "medium";
+      process.env.CODEX_FAKE_CONFIG_EFFORT = "none";
       const events = await collect(p.runTurn(turnOpts("echo-effort")));
       await p.teardown();
-      expect(JSON.parse((events.find((e) => e.type === "text_done") as { content: string }).content).effort).toBe("medium");
+      expect(JSON.parse((events.find((e) => e.type === "text_done") as { content: string }).content).effort).toBe("none");
     } finally {
       if (saved === undefined) delete process.env.CODEX_FAKE_CONFIG_EFFORT;
       else process.env.CODEX_FAKE_CONFIG_EFFORT = saved;
@@ -1414,6 +1414,23 @@ describe("CodexProvider – Default as the catalog shows it (#417)", () => {
         if (v === undefined) delete process.env[k];
         else process.env[k] = v;
       }
+    }
+  });
+});
+
+describe("CodexProvider – Default for a model that doesn't take the configured effort (#417)", () => {
+  it("sends and reports the model's own default instead — as the catalog shows", async () => {
+    const saved = process.env.CODEX_FAKE_CONFIG_EFFORT;
+    process.env.CODEX_FAKE_CONFIG_EFFORT = "xhigh"; // the fake's model takes off/low/high
+    try {
+      const p = makeProvider();
+      const events = await collect(p.runTurn(turnOpts("echo-effort")));
+      expect(JSON.parse((events.find((e) => e.type === "text_done") as { content: string }).content).effort).toBe("low");
+      expect(p.defaultEffort).toBe("low");
+      await p.teardown();
+    } finally {
+      if (saved === undefined) delete process.env.CODEX_FAKE_CONFIG_EFFORT;
+      else process.env.CODEX_FAKE_CONFIG_EFFORT = saved;
     }
   });
 });

@@ -457,5 +457,6 @@ export function effortChangeSummary(r: EffortChangeResult): string {
   const what = r.effort ? EFFORT_LABELS[r.effort] : "the backend's default";
   if (r.applies === "now") return `Thinking effort: ${what}.`;
   if (r.applies === "restart") return `Thinking effort: ${what} — the backend restarts with it between turns, once no work is running.`;
+  if (r.waitsForBackground) return `Thinking effort: ${what}, from the next turn with no background work running (Stop ends it).`;
   return `Thinking effort: ${what}, from the next turn.`;
 }

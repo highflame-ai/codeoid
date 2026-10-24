@@ -296,6 +296,8 @@ export class CodexProvider implements SessionProvider {
   /** Each model's default effort from model/list, the model the thread runs, and the
    *  user's own configured effort (config/read) — what Default sends (#417). */
   readonly #modelDefaultEffort = new Map<string, string>();
+  /** Each model's efforts on codeoid's scale, from model/list. */
+  readonly #modelEfforts = new Map<string, EffortLevel[]>();
   #threadModel: string | null = null;
   #configEffort: string | null | undefined = undefined;
   /** The baseline last worked out, for the session's pickers. */
@@ -670,6 +672,12 @@ export class CodexProvider implements SessionProvider {
       for (const m of result.data ?? []) {
         const id = m.model ?? m.id;
         if (typeof id === "string" && typeof m.defaultReasoningEffort === "string") this.#modelDefaultEffort.set(id, m.defaultReasoningEffort);
+        if (typeof id === "string" && Array.isArray(m.supportedReasoningEfforts)) {
+          this.#modelEfforts.set(
+            id,
+            m.supportedReasoningEfforts.map((e) => fromCodexEffort(e?.reasoningEffort)).filter((e): e is EffortLevel => e !== null),
+          );
+        }
       }
       return (result.data ?? [])
         .filter((m) => typeof (m.model ?? m.id) === "string")
@@ -713,7 +721,6 @@ export class CodexProvider implements SessionProvider {
 
   // ── Internal ──────────────────────────────────────────────────────────
 
-  /** turn/start's effort (#417): the session's, else what codex would use unasked — or nothing when that can't be known. */
   /** What Default means here now (#417): the effort codex would use unasked, once worked out. */
   get defaultEffort(): EffortLevel | null {
     return fromCodexEffort(this.#defaultEffort ?? undefined);
@@ -724,6 +731,7 @@ export class CodexProvider implements SessionProvider {
     return this.#threadModel;
   }
 
+  /** turn/start's effort (#417): the session's, else what codex would use unasked — or nothing when that can't be known. */
   async #effortParam(opts: TurnOpts): Promise<{ effort?: string }> {
     const baseline = await this.#baselineEffort(opts);
     this.#defaultEffort = baseline;
@@ -731,7 +739,11 @@ export class CodexProvider implements SessionProvider {
     return baseline ? { effort: baseline } : {};
   }
 
-  /** The effort codex itself uses unasked: the configured one (project layers included), else the running model's own. */
+  /**
+   * The effort codex itself uses unasked: the configured one (project layers
+   * included) for a model that takes it, else the running model's own — the
+   * same rule the catalog shows.
+   */
   async #baselineEffort(opts: TurnOpts): Promise<string | null> {
     if (this.#configEffort === undefined) {
       try {
@@ -741,12 +753,14 @@ export class CodexProvider implements SessionProvider {
         // Unknown this time; asked again next turn.
       }
     }
-    if (this.#configEffort) return this.#configEffort;
     const model = opts.model ?? this.#threadModel;
-    if (model && !this.#modelDefaultEffort.has(model) && !this.#modelListTried) {
+    if (model && !this.#modelDefaultEffort.has(model) && !this.#modelEfforts.has(model) && !this.#modelListTried) {
       this.#modelListTried = true; // once: a model the list doesn't carry stays unknown
       await this.listModels();
     }
+    const takes = model ? this.#modelEfforts.get(model) : undefined;
+    const configured = fromCodexEffort(this.#configEffort ?? undefined);
+    if (this.#configEffort && (!takes || (configured !== null && takes.includes(configured)))) return this.#configEffort;
     return (model && this.#modelDefaultEffort.get(model)) || null;
   }
 

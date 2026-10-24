@@ -80,7 +80,7 @@ export function BackendPicker({ kind, provider, model, sessionDefaultEffort, eff
       if (!cancelled) setLoading(false);
     });
     return () => { cancelled = true; };
-  }, [client, kind, provider, revision]);
+  }, [client, kind, provider, revision, model, sessionDefaultEffort]);
 
   const options = kind === "provider"
     ? providers.map((entry) => ({ value: entry.id, label: entry.displayName, description: entry.id }))
@@ -145,8 +145,10 @@ export function BackendPicker({ kind, provider, model, sessionDefaultEffort, eff
  */
 export function effortChoices(efforts: readonly EffortLevel[] | undefined, defaultEffort?: EffortLevel): BackendChoice[] {
   const unknown = efforts === undefined;
+  // A Default the model's known levels don't include isn't shown.
+  const shown = defaultEffort && (!efforts || efforts.includes(defaultEffort)) ? defaultEffort : undefined;
   return [
-    { value: "default", label: "Default", description: defaultEffort ? `the backend decides (${EFFORT_LABELS[defaultEffort]})` : "the backend decides" },
+    { value: "default", label: "Default", description: shown ? `the backend decides (${EFFORT_LABELS[shown]})` : "the backend decides" },
     ...(efforts ?? EFFORT_LEVELS).map((level) => ({
       value: level,
       label: EFFORT_LABELS[level],
