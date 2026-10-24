@@ -18,6 +18,7 @@
  *   instead of a cloud-sized table entry that would overflow the server.
  */
 
+import type { EffortLevel } from "../../../protocol/types.js";
 import { OpenAIProvider, type OpenAIProviderInit } from "../openai/index.js";
 import type { OpenAIFunctionTool } from "../tool-loop.js";
 import type { McpServerSource } from "../../mcp/tool-source.js";
@@ -149,7 +150,7 @@ export function createLlamaCppProvider(
   cfg: LlamaCppConfig,
   init: Omit<
     OpenAIProviderInit,
-    "id" | "displayName" | "apiKey" | "baseURL" | "modelFilter" | "fallbackModels" | "contextWindow" | "toolsTransform"
+    "id" | "displayName" | "apiKey" | "baseURL" | "modelFilter" | "fallbackModels" | "contextWindow" | "toolsTransform" | "effortParams"
   >,
 ): OpenAIProvider {
   return new OpenAIProvider({
@@ -164,5 +165,19 @@ export function createLlamaCppProvider(
     fallbackModels: [],
     contextWindow: () => fetchServerContextWindow(cfg.baseUrl),
     toolsTransform: llamaCppTools,
+    effortParams: llamaCppEffortParams,
   });
+}
+
+/**
+ * A thinking effort for llama-server (#417), through the model's chat
+ * template: `enable_thinking` (Qwen3-style templates) and `reasoning_effort`
+ * (gpt-oss-style, low / medium / high — the scale is clamped to those). A
+ * template that reads neither ignores them; the server ignores fields it
+ * doesn't know.
+ */
+export function llamaCppEffortParams(effort: EffortLevel): Record<string, unknown> {
+  if (effort === "off") return { chat_template_kwargs: { enable_thinking: false } };
+  const level = effort === "minimal" || effort === "low" ? "low" : effort === "medium" ? "medium" : "high";
+  return { chat_template_kwargs: { enable_thinking: true, reasoning_effort: level }, reasoning_effort: level };
 }

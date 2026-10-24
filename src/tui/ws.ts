@@ -15,6 +15,7 @@ import type {
   BackendAccountsInfo,
   ClientMessage,
   DaemonMessage,
+  EffortLevel,
   ModelsListResultMsg,
   SessionMessage,
   ToolState,
@@ -318,6 +319,11 @@ export class TuiWsClient {
       limit,
       scope,
     });
+  }
+
+  /** Set the session's thinking effort (#417); null = the backend's default. */
+  setEffort(sessionId: string, effort: EffortLevel | null): Promise<DaemonMessage> {
+    return this.#request({ type: "session.set_effort", id: randomUUID(), sessionId, effort });
   }
 
   setModel(

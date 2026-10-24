@@ -42,6 +42,7 @@ import { createDefaultProviderRegistry } from "../daemon/providers/registry.js";
 import type { ProviderEvent, TurnOpts, TurnRun } from "../daemon/providers/interface.js";
 import type { CodeoidConfig } from "../config.js";
 import type { Store } from "../daemon/store.js";
+import type { EffortLevel } from "../protocol/types.js";
 
 const FIXTURE = join(import.meta.dir, "fixtures", "fake-codex.ts");
 
@@ -668,7 +669,14 @@ describe("CodexProvider over fake-codex", () => {
     const models = await p.listModels();
     await p.teardown();
     expect(models).toEqual([
-      { id: "gpt-5.6-terra", displayName: "GPT-5.6-Terra", description: "Balanced agentic coding model." },
+      {
+        id: "gpt-5.6-terra",
+        displayName: "GPT-5.6-Terra",
+        description: "Balanced agentic coding model.",
+        // Its efforts on codeoid's scale (#417): "none" is Off; "ultra" has no level.
+        efforts: ["off", "low", "high"],
+        defaultEffort: "low",
+      },
     ]);
   });
 
@@ -1284,6 +1292,145 @@ describe("describeCodexError", () => {
       const out = describeCodexError(params);
       expect(out).not.toContain("[object Object]");
       expect(out.length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe("CodexProvider – thinking effort (#417)", () => {
+  const effortSeen = async (effort?: EffortLevel): Promise<unknown> => {
+    const p = makeProvider();
+    const events = await collect(p.runTurn(turnOpts("echo-effort", effort ? { effort } : {})));
+    await p.teardown();
+    return JSON.parse((events.find((e) => e.type === "text_done") as { content: string }).content).effort;
+  };
+
+  it("sends it on every turn — Off as codex's none; Default as what codex would use unasked (null wouldn't reset an override)", async () => {
+    expect(await effortSeen("high")).toBe("high");
+    expect(await effortSeen("off")).toBe("none");
+    expect(await effortSeen()).toBe("low"); // the running model's own default (no configured effort)
+    const saved = process.env.CODEX_FAKE_CONFIG_EFFORT;
+    process.env.CODEX_FAKE_CONFIG_EFFORT = "high";
+    try {
+      expect(await effortSeen()).toBe("high"); // the user's model_reasoning_effort wins (a level the model takes)
+      // Read afresh for each thread, as codex does: an edit made meanwhile counts.
+      const p = makeProvider();
+      await collect(p.runTurn(turnOpts("echo-effort")));
+      await p.teardown();
+      await Bun.sleep(100); // the killed app-server's exit lands before the next turn starts
+      process.env.CODEX_FAKE_CONFIG_EFFORT = "none";
+      const events = await collect(p.runTurn(turnOpts("echo-effort")));
+      await p.teardown();
+      expect(JSON.parse((events.find((e) => e.type === "text_done") as { content: string }).content).effort).toBe("none");
+    } finally {
+      if (saved === undefined) delete process.env.CODEX_FAKE_CONFIG_EFFORT;
+      else process.env.CODEX_FAKE_CONFIG_EFFORT = saved;
+    }
+  });
+
+  it("reports each model's efforts on codeoid's scale, dropping ones it has no level for", async () => {
+    const p = makeProvider();
+    await collect(p.runTurn(turnOpts("hello")));
+    const models = await p.listModels();
+    await p.teardown();
+    expect(models[0]).toMatchObject({ efforts: ["off", "low", "high"], defaultEffort: "low" });
+  });
+});
+
+describe("CodexProvider – the model it runs unasked (#417)", () => {
+  it("marks the user's configured model as the default in the catalog it reports, so a picker shows its levels", async () => {
+    const saved = process.env.CODEX_FAKE_CONFIG_MODEL;
+    process.env.CODEX_FAKE_CONFIG_MODEL = "gpt-5.6-terra";
+    const reported: Array<{ value: string; isDefault?: boolean }> = [];
+    try {
+      const p = new CodexProvider({
+        sessionId: "sess-d",
+        initialBackingId: "sess-d",
+        command: process.execPath,
+        argsPrefix: [FIXTURE],
+        store: {} as Store,
+        onModels: (models) => reported.push(...models.map((m) => ({ value: m.value, ...(m.isDefault ? { isDefault: true } : {}) }))),
+      });
+      await collect(p.runTurn(turnOpts("hello")));
+      await p.teardown();
+    } finally {
+      if (saved === undefined) delete process.env.CODEX_FAKE_CONFIG_MODEL;
+      else process.env.CODEX_FAKE_CONFIG_MODEL = saved;
+    }
+    expect(reported).toEqual([{ value: "gpt-5.6-terra", isDefault: true }]);
+  });
+});
+
+describe("CodexProvider – Default as the catalog shows it (#417)", () => {
+  const report = async (env: Record<string, string>) => {
+    const saved: Record<string, string | undefined> = {};
+    for (const [k, v] of Object.entries(env)) {
+      saved[k] = process.env[k];
+      process.env[k] = v;
+    }
+    const reported: Array<{ value: string; isDefault?: boolean; defaultEffort?: string }> = [];
+    try {
+      const p = new CodexProvider({
+        sessionId: "sess-e",
+        initialBackingId: "sess-e",
+        command: process.execPath,
+        argsPrefix: [FIXTURE],
+        store: {} as Store,
+        onModels: (models) =>
+          reported.push(...models.map((m) => ({ value: m.value, ...(m.isDefault ? { isDefault: true } : {}), ...(m.defaultEffort ? { defaultEffort: m.defaultEffort } : {}) }))),
+      });
+      await collect(p.runTurn(turnOpts("hello")));
+      await p.teardown();
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+    return reported;
+  };
+
+  it("a configured model the catalog doesn't list: no row is the default, not even the catalog's own", async () => {
+    expect(await report({ CODEX_FAKE_LIST_DEFAULT: "1" })).toEqual([{ value: "gpt-5.6-terra", isDefault: true, defaultEffort: "low" }]);
+    expect(await report({ CODEX_FAKE_LIST_DEFAULT: "1", CODEX_FAKE_CONFIG_MODEL: "my-unlisted-model" })).toEqual([{ value: "gpt-5.6-terra", defaultEffort: "low" }]);
+  });
+
+  it("a configured effort is the default of every model that takes it — what Default sends", async () => {
+    expect(await report({ CODEX_FAKE_CONFIG_EFFORT: "high" })).toEqual([{ value: "gpt-5.6-terra", defaultEffort: "high" }]);
+    // One the model doesn't take: its own default stands.
+    expect(await report({ CODEX_FAKE_CONFIG_EFFORT: "xhigh" })).toEqual([{ value: "gpt-5.6-terra", defaultEffort: "low" }]);
+  });
+
+  it("the session itself knows what Default means and which model runs — the project's config included", async () => {
+    const saved = { u: process.env.CODEX_FAKE_CONFIG_EFFORT, p: process.env.CODEX_FAKE_PROJECT_EFFORT };
+    process.env.CODEX_FAKE_CONFIG_EFFORT = "low";
+    process.env.CODEX_FAKE_PROJECT_EFFORT = "high";
+    try {
+      const p = makeProvider();
+      await collect(p.runTurn(turnOpts("hello")));
+      expect([p.defaultEffort, p.runningModel]).toEqual(["high", "gpt-5.6-terra"]);
+      await p.teardown();
+    } finally {
+      for (const [k, v] of [["CODEX_FAKE_CONFIG_EFFORT", saved.u], ["CODEX_FAKE_PROJECT_EFFORT", saved.p]] as const) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  });
+});
+
+describe("CodexProvider – Default for a model that doesn't take the configured effort (#417)", () => {
+  it("sends and reports the model's own default instead — as the catalog shows", async () => {
+    const saved = process.env.CODEX_FAKE_CONFIG_EFFORT;
+    process.env.CODEX_FAKE_CONFIG_EFFORT = "xhigh"; // the fake's model takes off/low/high
+    try {
+      const p = makeProvider();
+      const events = await collect(p.runTurn(turnOpts("echo-effort")));
+      expect(JSON.parse((events.find((e) => e.type === "text_done") as { content: string }).content).effort).toBe("low");
+      expect(p.defaultEffort).toBe("low");
+      await p.teardown();
+    } finally {
+      if (saved === undefined) delete process.env.CODEX_FAKE_CONFIG_EFFORT;
+      else process.env.CODEX_FAKE_CONFIG_EFFORT = saved;
     }
   });
 });

@@ -85,7 +85,8 @@ import {
   restoreTree,
 } from "./checkpoints.js";
 import { applyRewinds, REWIND_EVENT, type TurnIndexEntry } from "./transcript.js";
-import type { RewindFiles, RewindIrreversible, TurnSummary } from "../protocol/types.js";
+import type { EffortChangeResult, EffortLevel, RewindFiles, RewindIrreversible, TurnSummary } from "../protocol/types.js";
+import { LIMITS } from "../protocol/types.js";
 import { hasScope, SCOPES } from "../protocol/scopes.js";
 import type { PendingToolApproval, SessionApproveOutcome } from "../protocol/types.js";
 import { execFile } from "node:child_process";
@@ -420,6 +421,11 @@ export interface SessionCreateOptions {
    * conductor's config.conductor.model override.
    */
   defaultModel?: string;
+  /**
+   * Thinking effort chosen at creation (#417): outranks
+   * config.session.defaultEffort, and is kept with the session.
+   */
+  effort?: EffortLevel | null;
   /**
    * Observe every status transition of this session. The dispatcher uses
    * this to detect a worker's turn completing (→ idle/error) or wedging
@@ -909,6 +915,14 @@ export class Session {
   // effect on the NEXT send() (current stream is torn down on change).
   #model: string | null = null;
   #fallbackModel: string | null = null;
+  /** Thinking effort (#417), on codeoid's scale; null = the backend's default. Kept across a backend switch. */
+  #effort: EffortLevel | null = null;
+  /** A backend whose effort is a startup setting (the Gemini CLI) is rebuilt between turns, once no work is running. */
+  #effortRestartPending = false;
+  /** The effort the backend was last handed (#417); undefined before the first turn. */
+  #effortSent: EffortLevel | null | undefined = undefined;
+  /** The last turn kept the old effort for background work: its change is announced when it lands. */
+  #effortHeld = false;
 
   // ── Auto-rotation (Layer D) ────────────────────────────────────────────
   // Claude Code's backing session id — distinct from codeoid's public
@@ -1298,6 +1312,14 @@ export class Session {
         effectiveProviderId,
       ) ??
       null;
+    // Thinking effort (#417): a resumed session keeps its own (none = the
+    // backend's default); a new one takes the effort chosen at creation, else
+    // the config default.
+    this.#effort = opts.existingId
+      ? this.#store.getSessionEffort(this.id)
+      : opts.effort !== undefined
+        ? opts.effort
+        : (opts.config?.session.defaultEffort ?? null);
 
     this.#provider = opts._testProvider ?? this.#createProvider(opts.providerId);
     this.#appliedAccount = this.#accountState(this.#provider.id);
@@ -1364,7 +1386,8 @@ export class Session {
         accountId: opts.auth.accountId,
         projectId: opts.auth.projectId,
       });
-      this.#store.audit(opts.auth.sub, "session.create", this.id, `name=${this.name}`);
+      this.#store.audit(opts.auth.sub, "session.create", this.id, `name=${this.name}${this.#effort ? ` effort=${this.#effort}` : ""}`);
+      if (this.#effort) this.#store.setSessionEffort(this.id, this.#effort);
 
       this.#transcriptStore.saveMeta({
         sessionId: this.id,
@@ -1796,6 +1819,7 @@ export class Session {
     }
 
     this.#provider = this.#createProvider(requested);
+    this.#effortRestartPending = false; // the new backend starts with the session's effort
     this.#appliedAccount = this.#accountState(requested);
     this.#resetMcpState({ backendChanged: true });
     this.#provider.onSessionEvent = (e) => this.#onSessionScopedEvent(e);
@@ -3223,6 +3247,7 @@ export class Session {
           history: this.#accumulator.history,
           userMessage: content,
           model: this.#model ?? undefined,
+          effort: this.#turnEffort() ?? undefined,
           fallbackModel: this.#fallbackModel ?? undefined,
           workdir: this.workdir,
           systemPromptAppend: this.#buildPromptAppend(),
@@ -3258,6 +3283,8 @@ export class Session {
     // asked for meanwhile applied (#395) — before the stop and adopted-turn
     // checks below, which must come after every await.
     await this.#applyMcpView();
+    // A thinking effort the backend takes only at startup (#417): rebuild it now, between turns.
+    await this.#applyEffortRestart();
     // Redial any backend MCP server that's down, so this turn can use a
     // server fixed since it failed (#389) — bounded, and backed off.
     await this.#healMcpServers();
@@ -3311,6 +3338,7 @@ export class Session {
       history: this.#accumulator.history,
       userMessage: turnPrompt,
       model: this.#model ?? undefined,
+      effort: this.#turnEffort() ?? undefined,
       fallbackModel: this.#fallbackModel ?? undefined,
       workdir: this.workdir,
       systemPromptAppend: this.#composePromptAppend(hookPromptAppend),
@@ -4294,6 +4322,7 @@ export class Session {
           history: this.#accumulator.history,
           userMessage: prompt,
           model: this.#model ?? undefined,
+          effort: this.#turnEffort() ?? undefined,
           fallbackModel: this.#fallbackModel ?? undefined,
           workdir: this.workdir,
           systemPromptAppend: this.#composePromptAppend(),
@@ -4662,6 +4691,14 @@ export class Session {
       queuedMessages: this.#provider.queuedMessages,
       model: this.#model ?? undefined,
       fallbackModel: this.#fallbackModel ?? undefined,
+      effort: this.#effort ?? undefined,
+      // What Default means — while it's for the model in use (a model change makes it stale until the next turn).
+      ...(this.#provider.defaultEffort &&
+      (!this.#provider.runningModel || this.#model == null || this.#model === this.#provider.runningModel)
+        ? { defaultEffort: this.#provider.defaultEffort }
+        : {}),
+      ...(this.#effortRestartPending || (this.#effortSent !== undefined && this.#effortSent !== this.#effort) ? { effortPending: true } : {}),
+      ...(this.#provider.runningModel ? { runningModel: this.#provider.runningModel.slice(0, LIMITS.MODEL_MAX) } : {}),
       forkedFrom: this.forkedFrom,
       worktree: this.worktree,
       collaboration: this.collaboration,
@@ -5036,6 +5073,99 @@ export class Session {
     this.#broadcastInfoUpdate();
 
     return { model: resolved, fallbackModel: this.#fallbackModel };
+  }
+
+  /**
+   * Set how hard the model thinks (#417); null = the backend's default. Kept
+   * with the session. Never cuts a running turn short: applied live where
+   * the backend can take it, otherwise from the next turn's options — or, on
+   * a backend that takes it only at startup, by rebuilding it between turns
+   * once no work is running (it resumes the conversation).
+   */
+  async setEffort(effort: EffortLevel | null, sender: AuthContext): Promise<EffortChangeResult> {
+    const prev = this.#effort;
+    this.#effort = effort;
+    this.#store.setSessionEffort(this.id, effort);
+    this.#store.audit(
+      sender.sub,
+      "session.set_effort",
+      this.id,
+      `effort=${effort ?? "(default)"} from=${prev ?? "(default)"}${sender.delegationDepth > 0 ? ` delegated=${sender.delegationDepth}` : ""}`,
+    );
+    let applies: EffortChangeResult["applies"] = "next-turn";
+    if (effort === prev) {
+      // Nothing new — but a change still on its way says so.
+      applies = this.#effortRestartPending ? "restart" : this.#effortSent !== undefined && this.#effortSent !== effort ? "next-turn" : "now";
+    } else if (this.#provider.effortChange === "restart") {
+      // Back to what the running backend has (changed and changed back before a turn): nothing to restart for.
+      this.#effortRestartPending = this.#effortSent === undefined || this.#effortSent !== effort;
+      applies = this.#effortRestartPending ? "restart" : "now";
+    } else if (this.#provider.applyEffort) {
+      try {
+        if (await this.#provider.applyEffort(effort)) {
+          applies = "now";
+          this.#effortSent = effort; // the running backend has it
+        }
+      } catch (err) {
+        console.error(`[codeoid/session ${this.id}] applying thinking effort live failed (it applies from the next turn): ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    const shown = effort ?? "the backend's default";
+    const when =
+      applies === "now"
+        ? ""
+        : applies === "restart"
+          ? " — the backend restarts with it between turns, once no work is running"
+          : this.#backgroundTasks.size > 0
+            ? " — from the next turn with no background work running (Stop ends it)"
+            : " — from the next turn";
+    const info = this.#makeMessage("info", `⎆ Thinking effort: ${shown}${when}.`, SYSTEM_IDENTITY, undefined, undefined, {
+      event: "session.effort_changed",
+      effort,
+      prev_effort: prev,
+      applies,
+    });
+    this.#persistAndBuffer(info);
+    this.#broadcastRaw(info);
+    this.#broadcastInfoUpdate();
+    return { effort, applies, ...(applies === "next-turn" && this.#backgroundTasks.size > 0 ? { waitsForBackground: true } : {}) };
+  }
+
+  /**
+   * The effort a turn hands the backend (#417). A change the backend can't
+   * take live rebuilds it, which would stop its background work: while any
+   * runs, a turn keeps the effort the backend already has, and the change
+   * lands on the first turn with none.
+   */
+  #turnEffort(): EffortLevel | null {
+    const held = this.#backgroundTasks.size > 0 && this.#effortSent !== undefined;
+    const effort = held ? (this.#effortSent as EffortLevel | null) : this.#effort;
+    // A change background work held back is in effect now: say so (an ordinary next-turn change was announced as such).
+    const landed = !held && this.#effortHeld && this.#effortSent !== effort;
+    this.#effortHeld = held && effort !== this.#effort;
+    this.#effortSent = effort;
+    if (landed) {
+      const info = this.#makeMessage("info", `⎆ Thinking effort now ${effort ?? "the backend's default"}.`, SYSTEM_IDENTITY, undefined, undefined, {
+        event: "session.effort_applied",
+        effort,
+      });
+      this.#persistAndBuffer(info);
+      this.#broadcastRaw(info);
+      this.#broadcastInfoUpdate();
+    }
+    return effort;
+  }
+
+  /** Rebuild a backend that takes its effort only at startup, between turns (#417). */
+  async #applyEffortRestart(): Promise<void> {
+    if (!this.#effortRestartPending || this.#mcpBusy()) return;
+    this.#effortRestartPending = false;
+    // Switched since to a backend that takes it per turn: nothing to rebuild.
+    if (this.#provider.effortChange !== "restart") return;
+    await this.#teardownProvider();
+    if (RESEED_AFTER_TEARDOWN.has(this.#provider.id) && this.#accumulator.history.length > 0) {
+      await this.#seedProviderFromHistory();
+    }
   }
 
   /**

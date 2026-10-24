@@ -166,7 +166,7 @@ bun run lint         # biome check
 
 codeoid start        # daemon + all frontends
 codeoid ls           # list sessions
-codeoid new <n> [d]  # create session (workdir required unless --worktree)
+codeoid new <n> [d]  # create session (workdir required unless --worktree); --model, --effort <level>
 codeoid attach <n>   # interactive attach (with scrollback replay)
 codeoid send <n> <m> # one-shot message
 codeoid interrupt <n>
@@ -211,6 +211,7 @@ TELEGRAM_ALLOWED_USER_IDS=123,456   # Required with bot token
 CODEOID_MCP_CONTROL_ENABLED=false   # mount /mcp/control (docs/mcp-control.md)
 CODEOID_MCP_CONTROL_ACTIONS=false   # also allow create / send / interrupt / destroy there
 CODEOID_ROUTINES_ENABLED=true       # scheduler + routine commands (docs/routines.md)
+CODEOID_DEFAULT_EFFORT=             # thinking effort for new sessions: off|minimal|low|medium|high|xhigh|max (docs/thinking-effort.md)
 
 # Claude auth: uses your existing `claude login` session (Pro/Max subscription).
 # No ANTHROPIC_API_KEY needed if you're logged in via Claude Code CLI.

@@ -6,7 +6,7 @@
 
 import { Database } from "bun:sqlite";
 import { chmodSync, existsSync } from "node:fs";
-import type { ModelInfo, PushPlatform, SessionInfo, SessionStatus } from "../protocol/types.js";
+import { EFFORT_LEVELS, type EffortLevel, type ModelInfo, type PushPlatform, type SessionInfo, type SessionStatus } from "../protocol/types.js";
 
 // ── Dispatch queue types (P4) ─────────────────────────────────────────────
 
@@ -285,6 +285,8 @@ export class Store {
     // Model selection — persisted so /model choice survives daemon restart.
     this.#addColumnIfMissing("sessions", "model", "TEXT");
     this.#addColumnIfMissing("sessions", "fallback_model", "TEXT");
+    // Thinking effort (#417), kept like the model. NULL = the backend's default.
+    this.#addColumnIfMissing("sessions", "effort", "TEXT");
     // Session role ("conductor") + backing provider id — persisted so the
     // conductor keeps its role and every session keeps its provider across
     // daemon restarts. NULL = normal session / claude (pre-upgrade rows).
@@ -870,6 +872,18 @@ export class Store {
          WHERE id = ?`,
       )
       .run(backingId, rotationDelta, rotatedAt ?? null, id);
+  }
+
+  /** The session's persisted thinking effort (#417); null = never set (the backend's default). */
+  getSessionEffort(id: string): EffortLevel | null {
+    const row = this.#db.prepare("SELECT effort AS e FROM sessions WHERE id = ?").get(id) as { e: string | null } | undefined;
+    const e = row?.e ?? null;
+    return e !== null && (EFFORT_LEVELS as readonly string[]).includes(e) ? (e as EffortLevel) : null;
+  }
+
+  /** Persist the session's thinking effort; null clears it. */
+  setSessionEffort(id: string, effort: EffortLevel | null): void {
+    this.#db.prepare(`UPDATE sessions SET effort = ?, updated_at = datetime('now') WHERE id = ?`).run(effort, id);
   }
 
   /**

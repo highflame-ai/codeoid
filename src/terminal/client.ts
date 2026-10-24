@@ -12,6 +12,7 @@ import { PIPELINE_INPUT_REQUEST_PREFIX, PROTOCOL_VERSION } from "../protocol/typ
 import type {
   ClientMessage,
   CollaborationConfig,
+  EffortLevel,
   McpReconnectResult,
   McpApprovePreview,
   McpRefreshResult,
@@ -438,6 +439,7 @@ export class TerminalClient {
       claudeAccount?: string;
       /** Account for the backend the session lands on (accounts.ts). */
       account?: string;
+      effort?: EffortLevel | null;
       collaboration?: CollaborationConfig;
     } = {},
   ): Promise<void> {
@@ -451,6 +453,7 @@ export class TerminalClient {
       // a claude session.
       ...(opts.providerId ? { providerId: opts.providerId } : {}),
       ...(opts.model ? { model: opts.model } : {}),
+      ...(opts.effort !== undefined ? { effort: opts.effort } : {}),
       ...(opts.claudeAccount ? { claudeAccount: opts.claudeAccount } : {}),
       ...(opts.account ? { account: opts.account } : {}),
       ...(opts.pack ? { pack: opts.pack } : {}),

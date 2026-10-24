@@ -41,7 +41,7 @@
 import { existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { defaultCodexHome, defaultGeminiCliRoot, defaultPiAgentDir } from "./account-apply.js";
+import { defaultCodexHome, defaultGeminiCliRoot, piAgentDirOf } from "./account-apply.js";
 
 export type SecretPathVerdict = { action: "deny" | "ask"; path: string } | null;
 
@@ -96,7 +96,7 @@ function cliCredentialFiles(): string[] {
     join(defaultGeminiCliRoot(), ".gemini", "oauth_creds.json"),
     join(defaultGeminiCliRoot(), ".gemini", "google_accounts.json"),
     join(defaultGeminiCliRoot(), ".gemini", "gemini-credentials.json"),
-    join(defaultPiAgentDir(), "auth.json"),
+    join(piAgentDirOf(process.env), "auth.json"), // ~ read as pi reads it
   ];
 }
 
