@@ -12,7 +12,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -116,6 +116,19 @@ export function ensureOverlayHome(spec: OverlaySpec): void {
   }
 }
 
+/**
+ * A save in flight: vendors write a temp file and rename it into place
+ * (the Gemini CLI's `projects.json.<uuid>.tmp`, `trustedFolders.json.tmp.<uuid>`,
+ * codeoid's own atomicWrite). Never adopted — the save completes in the overlay.
+ */
+const TEMP_NAME = /\.tmp($|[.-])/;
+
+/**
+ * How long an entry must have gone unchanged before it's adopted: another
+ * session's backend may be running in the same overlay and still writing it.
+ */
+export const ADOPT_SETTLE_MS = 10_000;
+
 /** {@link OverlaySpec.adopt}: hand what the vendor wrote into `target` back to `source`. */
 function adoptIntoSource(target: string, source: string, own: ReadonlySet<string>, copies: Record<string, unknown>): void {
   let names: string[] = [];
@@ -125,7 +138,7 @@ function adoptIntoSource(target: string, source: string, own: ReadonlySet<string
     return;
   }
   for (const name of names) {
-    if (own.has(name) || name in copies || isLockEntry(target, name)) continue;
+    if (own.has(name) || name in copies || isLockEntry(target, name) || TEMP_NAME.test(name)) continue;
     const entry = join(target, name);
     let stat: ReturnType<typeof lstatSync>;
     try {
@@ -133,7 +146,7 @@ function adoptIntoSource(target: string, source: string, own: ReadonlySet<string
     } catch {
       continue;
     }
-    if (stat.isSymbolicLink()) continue;
+    if (stat.isSymbolicLink() || Date.now() - stat.mtimeMs < ADOPT_SETTLE_MS) continue;
     const there = join(source, name);
     let theirs: ReturnType<typeof statSync> | null = null;
     try {
@@ -143,13 +156,32 @@ function adoptIntoSource(target: string, source: string, own: ReadonlySet<string
     }
     if (theirs && stat.isDirectory()) continue;
     try {
-      // The later write wins, as it would have in one home.
-      if (!theirs || stat.mtimeMs > theirs.mtimeMs) renameSync(entry, there);
+      // The later write wins, as it would have in one home; a tie goes to the backend's (it can't be told apart, and it's the one codeoid ran).
+      if (!theirs || stat.mtimeMs >= theirs.mtimeMs) moveEntry(entry, there, stat.isDirectory());
       else unlinkSync(entry); // linked to the source's below
-    } catch {
-      // Another filesystem, or the source changed meanwhile: next time.
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        // Left in the overlay, where it hides the source's: say so rather than keep it quietly.
+        console.warn(`[codeoid/accounts] couldn't move ${entry} to ${there}: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
   }
+}
+
+/** Rename `from` to `to`; across filesystems, copy beside `to`, rename that into place, then remove `from`. */
+function moveEntry(from: string, to: string, isDir: boolean): void {
+  try {
+    renameSync(from, to);
+    return;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EXDEV") throw err;
+  }
+  const staged = `${to}.codeoid-${process.pid}.tmp`;
+  rmSync(staged, { recursive: true, force: true });
+  if (isDir) cpSync(from, staged, { recursive: true, verbatimSymlinks: true });
+  else copyFileSync(from, staged);
+  renameSync(staged, to);
+  rmSync(from, { recursive: true, force: true });
 }
 
 /** Remove from `env` every name `drop` matches. Pure. */
@@ -466,10 +498,23 @@ export function applyPiSettingsOverlay(
   const base = piAgentDirOf(env);
   // A relative (or unparseable) dir would put pi's logins under the daemon's own working directory.
   if (!isAbsolute(base)) throw new AccountError(`PI_CODING_AGENT_DIR must be an absolute path (it's ${JSON.stringify(base)})`);
-  // pi creates its auth.json when it's missing — then it must be the user's,
-  // not a file of the overlay's own that a later `pi /login` never reaches.
   mkdirSync(base, { recursive: true, mode: 0o700 });
   const auth = join(base, "auth.json");
+  const home = join(homesRoot, "pi-session", overlayKey(base));
+  // An overlay built before this took an auth.json of its own: an empty one
+  // gives way to the user's; a login goes to the user's home, unless the user
+  // has one there already (an empty one is just the stand-in made below).
+  const own = join(home, "auth.json");
+  try {
+    if (!lstatSync(own).isSymbolicLink()) {
+      if (readFileSync(own, "utf8").trim() === "{}") unlinkSync(own);
+      else if (!existsSync(auth) || readFileSync(auth, "utf8").trim() === "{}") moveEntry(own, auth, false);
+    }
+  } catch {
+    // None yet.
+  }
+  // pi creates its auth.json when it's missing — then it must be the user's,
+  // not a file of the overlay's own that a later `pi /login` never reaches.
   if (!existsSync(auth)) {
     try {
       writeFileSync(auth, "{}", { mode: 0o600, flag: "wx" }); // never through a planted link
@@ -477,14 +522,6 @@ export function applyPiSettingsOverlay(
       // There after all (made meanwhile, or a dangling link): pi's to deal with, as without codeoid.
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
     }
-  }
-  const home = join(homesRoot, "pi-session", overlayKey(base));
-  // An overlay built before that took an empty one of its own: link the user's instead.
-  try {
-    const own = join(home, "auth.json");
-    if (!lstatSync(own).isSymbolicLink() && readFileSync(own, "utf8").trim() === "{}") unlinkSync(own);
-  } catch {
-    // None yet.
   }
   ensureOverlayHome({
     source: base,

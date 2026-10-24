@@ -73,7 +73,8 @@ Notes:
 - **pi** saves a thinking-level change as your global default in its settings, so codeoid runs it from an overlay of its agent directory: your logins and sessions are linked, and `settings.json` is a fresh copy at each start, so one session's effort never changes your own pi or other sessions.
   The overlays live under `~/.codeoid/accounts/pi-session/`.
   pi's OAuth refresh locks the real `auth.json`, so codeoid's pi and one you run yourself refresh in turn; only a sign-in or sign-out made in both at the same moment isn't serialized.
-- Anything the Gemini CLI or pi writes in its overlay while it runs (a first sign-in, say) is moved to your own home before the next start, as it would have been written there without codeoid; if yours is newer, it wins.
+- Anything the Gemini CLI or pi writes in its overlay while it runs (a first sign-in, say) is moved to the home the overlay is of (yours, or the account's) at a later start, as it would have been written there without codeoid; if the copy there is newer, that one wins.
+  A save still in progress (a temp file, or anything changed in the last 10 seconds, which another session may still be writing) waits for a later start.
 - The Gemini CLI and pi overlays of an account's home are removed with the account.
   Those of your own home stay, each with a copy of your Gemini CLI or pi settings; like everything under `~/.codeoid/accounts/`, agents can't read them.
 - **At Default**, a backend reads its own config as it always did: Qwen applies a project's `.qwen/settings.json` reasoning effort, Claude your Claude Code effort setting (your own, or the project's `.claude/settings.json`). A level you set overrides them.

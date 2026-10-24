@@ -7,7 +7,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { Database } from "bun:sqlite";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseClientMessage } from "@highflame/codeoid-protocol/schemas";
@@ -113,16 +113,58 @@ describe("each backend's reading of the scale", () => {
     mkdirSync(join(base, ".gemini", "history"), { recursive: true });
     utimesSync(join(base, ".gemini", "history"), new Date(1000), new Date(1000));
     mkdirSync(join(g, "history", "x"), { recursive: true });
+    // A save still in flight, and a file another session's CLI is still writing: neither moved.
+    writeFileSync(join(g, "projects.json.0b1c.tmp"), "{");
+    writeFileSync(join(g, "trustedFolders.json.tmp.0b1c"), "{");
+    writeFileSync(join(g, "fresh.json"), "writing");
+    const settled = new Date(Date.now() - 60_000);
+    for (const n of ["oauth_creds.json", "google_accounts.json", "projects.json.0b1c.tmp", "trustedFolders.json.tmp.0b1c"]) utimesSync(join(g, n), settled, settled);
     applyGeminiCliEffort("high", { GEMINI_CLI_HOME: base }, homes);
+    for (const n of ["projects.json.0b1c.tmp", "trustedFolders.json.tmp.0b1c", "fresh.json"]) {
+      expect(lstatSync(join(g, n)).isFile()).toBe(true);
+      expect(existsSync(join(base, ".gemini", n))).toBe(false);
+    }
     expect(readFileSync(join(base, ".gemini", "oauth_creds.json"), "utf8")).toBe("signed-in");
     expect(readlinkSync(join(g, "oauth_creds.json"))).toBe(join(base, ".gemini", "oauth_creds.json"));
     expect(readFileSync(join(base, ".gemini", "google_accounts.json"), "utf8")).toBe("new");
     expect(lstatSync(join(g, "google_accounts.json")).isSymbolicLink()).toBe(true);
     expect(readFileSync(join(base, ".gemini", "installation_id"), "utf8")).toBe("users");
+    // Written in the same tick of a coarse file clock: the backend's write wins — it can't be told apart, and dropping it could lose a refreshed login.
+    writeFileSync(join(base, ".gemini", "tie.json"), "users");
+    rmSync(join(g, "tie.json"), { force: true });
+    writeFileSync(join(g, "tie.json"), "backend");
+    utimesSync(join(base, ".gemini", "tie.json"), settled, settled);
+    utimesSync(join(g, "tie.json"), settled, settled);
+    applyGeminiCliEffort("high", { GEMINI_CLI_HOME: base }, homes);
+    expect(readFileSync(join(base, ".gemini", "tie.json"), "utf8")).toBe("backend");
     expect(lstatSync(join(g, "installation_id")).isSymbolicLink()).toBe(true);
     expect(existsSync(join(g, "history", "x"))).toBe(true); // not merged
     expect(lstatSync(join(g, "settings.json")).isSymbolicLink()).toBe(false); // the overlay's own
   });
+
+  it.skipIf(!existsSync("/dev/shm") || statSync("/dev/shm").dev === statSync(tmpdir()).dev)(
+    "across filesystems, what the CLI wrote is copied to its usual home rather than left in the overlay",
+    () => {
+      const base = mkdtempSync(join("/dev/shm", "codeoid-effort-"));
+      try {
+        mkdirSync(join(base, ".gemini"), { recursive: true });
+        const homes = join(tmp, "homes");
+        const g = join(applyGeminiCliEffort("low", { GEMINI_CLI_HOME: base }, homes).GEMINI_CLI_HOME!, ".gemini");
+        writeFileSync(join(g, "oauth_creds.json"), "signed-in");
+        mkdirSync(join(g, "extensions", "e"), { recursive: true });
+        const settled = new Date(Date.now() - 60_000);
+        utimesSync(join(g, "oauth_creds.json"), settled, settled);
+        utimesSync(join(g, "extensions"), settled, settled);
+        applyGeminiCliEffort("low", { GEMINI_CLI_HOME: base }, homes);
+        expect(readFileSync(join(base, ".gemini", "oauth_creds.json"), "utf8")).toBe("signed-in");
+        expect(existsSync(join(base, ".gemini", "extensions", "e"))).toBe(true);
+        expect(lstatSync(join(g, "oauth_creds.json")).isSymbolicLink()).toBe(true);
+        expect(lstatSync(join(g, "extensions")).isSymbolicLink()).toBe(true);
+      } finally {
+        rmSync(base, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("refuses a GEMINI_CLI_HOME that isn't absolute, building nothing under the daemon's directory", () => {
     const rel = `codeoid-effort-rel-${process.pid}`;
@@ -150,6 +192,23 @@ describe("pi's settings overlay", () => {
     applyPiSettingsOverlay({ PI_CODING_AGENT_DIR: base }, homes);
     expect(lstatSync(join(home, "auth.json")).isSymbolicLink()).toBe(true);
     expect(readFileSync(join(base, "auth.json"), "utf8")).toBe('{"login":1}');
+  });
+
+  it("a login an earlier overlay kept as its own goes to the user's home, never under codeoid's empty stand-in", () => {
+    const homes = join(tmp, "homes");
+    for (const [dir, theirs] of [["pi-a", null], ["pi-b", "{}"], ["pi-c", '{"mine":1}']] as const) {
+      const base = join(tmp, dir);
+      const home = applyPiSettingsOverlay({ PI_CODING_AGENT_DIR: base }, homes).PI_CODING_AGENT_DIR!;
+      rmSync(join(home, "auth.json"));
+      writeFileSync(join(home, "auth.json"), '{"overlay":1}');
+      if (theirs === null) rmSync(join(base, "auth.json"));
+      else {
+        writeFileSync(join(base, "auth.json"), theirs);
+        utimesSync(join(base, "auth.json"), new Date(), new Date(Date.now() + 60_000)); // newer, as the stand-in always is
+      }
+      applyPiSettingsOverlay({ PI_CODING_AGENT_DIR: base }, homes);
+      expect(readFileSync(join(base, "auth.json"), "utf8")).toBe(theirs === '{"mine":1}' ? theirs : '{"overlay":1}');
+    }
   });
 
   it("a dangling auth.json link is left to pi; a permanent lock FILE (codex's) is still linked", () => {
