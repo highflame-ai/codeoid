@@ -175,6 +175,7 @@ import {
   isGitRepo,
   removeForkWorktree,
 } from "./git-worktree.js";
+import { prepareWorktree, WorktreeSetupFailure, type WorktreeSetupResult } from "./workspace-setup.js";
 import type { DailyUsageBucket, LifetimeUsageTotals } from "./memory/store.js";
 
 /**
@@ -4770,7 +4771,7 @@ mcpHub: this.#mcpHub,
               : "carrying your uncommitted changes";
           const setupHint = this.#config?.fork?.setup
             ? " Running the configured fork setup now — the first turn will wait for it."
-            : " Build dependencies (e.g. node_modules) aren't present in a fresh worktree — run your project's setup before building.";
+            : " Ignored files and build dependencies (e.g. .env, node_modules) aren't in a fresh worktree unless the repository's committed .codeoid/setup.yaml brings them — otherwise run your project's setup before building.";
           workdirNote = `🌿 Isolated in a new git worktree on branch \`${wt.branch}\` (${origin}).${setupHint}`;
         } catch (err) {
           const reason = err instanceof Error ? err.message : String(err);
@@ -4934,9 +4935,12 @@ mcpHub: this.#mcpHub,
     );
 
     // Make the new worktree buildable in the background (fork stays cheap; the
-    // fork's first turn waits for it). Only for worktrees WE created.
-    if (worktree?.createdByCodeoid && this.#config?.fork?.setup) {
-      fork.beginSetup(this.#config.fork.setup);
+    // fork's first turn waits for it). Only for worktrees WE created: the
+    // repository's setup recipe first (its files, then its command when
+    // trusted), then the operator's fork.setup command.
+    if (worktree?.createdByCodeoid) {
+      fork.beginWorktreePrepare(this.#config?.worktree?.setup);
+      if (this.#config?.fork?.setup) fork.beginSetup(this.#config.fork.setup);
     }
 
     return { type: "response.ok", requestId: msg.id, data: fork.toInfo() };
@@ -5964,11 +5968,24 @@ mcpHub: this.#mcpHub,
       createSession: async (o) => {
         let workdir = o.workdir;
         let worktree: SessionWorktree | undefined;
+        let setup: WorktreeSetupResult | undefined;
         if (o.worktree) {
           if (!(await isGitRepo(o.workdir))) throw new Error(`worktree isolation needs a git repository: ${o.workdir}`);
           const wt = await createForkWorktree({ workdir: o.workdir, label: o.label, shortId: randomUUID().slice(0, 8) });
           workdir = normalizeWorkdir(wt.workdir) ?? wt.path;
           worktree = { path: wt.path, branch: wt.branch, createdByCodeoid: true };
+          // A routine run is unattended: prepare before the agent starts, and
+          // fail the run as an infrastructure error (not the agent's) when
+          // the worktree can't be made ready. Nothing but this run's fresh
+          // worktree is removed — the primary checkout is never touched.
+          setup = await prepareWorktree({ worktreePath: wt.path, policy: this.#config?.worktree?.setup });
+          if (setup.error) {
+            await removeForkWorktree({ workdir: o.workdir, worktreePath: wt.path, branch: wt.branch, deleteBranch: true }).catch(() => {});
+            throw new WorktreeSetupFailure(setup);
+          }
+          if (setup.copied.length > 0 || setup.shared.length > 0) {
+            worktree = { ...worktree, setup: { copied: setup.copied, shared: setup.shared } };
+          }
         }
         const session = new Session({
           // The conductor's name is reserved for the singleton.
@@ -5996,6 +6013,7 @@ mcpHub: this.#mcpHub,
           onStatusChange: this.#statusObserver,
           ...this.#modelHooks,
         });
+        if (setup) session.noteWorktreePrepared(setup);
         this.#sessions.set(session.id, session);
         return session.id;
       },

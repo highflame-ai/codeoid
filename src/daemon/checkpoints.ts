@@ -298,6 +298,12 @@ export async function createCheckpoint(opts: {
    */
   excludeDirs?: readonly string[];
   /**
+   * Absolute files (or symlinks) inside the workdir that must never be
+   * snapshotted, matched literally — what a worktree setup recipe copied in
+   * (secrets) or linked (shared dependency dirs).
+   */
+  excludePaths?: readonly string[];
+  /**
    * Asked once the files have been read: has the turn already started? A
    * snapshot that finished after the agent began may include its first edits
    * — recorded as `late` so a restore can say so.
@@ -337,7 +343,7 @@ export async function createCheckpoint(opts: {
     const head = await run(["rev-parse", "--verify", "-q", "HEAD^{commit}"], { cwd: opts.workdir, env: gitEnv({}), timeoutMs: t })
       .then((o) => o.trim())
       .catch(() => "");
-    const staged = await stageWorkTree(shadow, opts.workdir, limits, opts.excludeDirs);
+    const staged = await stageWorkTree(shadow, opts.workdir, limits, opts.excludeDirs, opts.excludePaths);
     if (!staged.ok) return staged;
     const late = opts.isLate?.() === true;
     const { env, first } = staged;
@@ -372,6 +378,7 @@ async function stageWorkTree(
   workdir: string,
   limits: CheckpointLimits,
   excludeDirs: readonly string[] | undefined,
+  excludePaths?: readonly string[],
 ): Promise<{ ok: true; env: Record<string, string>; first: boolean } | { ok: false; reason: string }> {
   const t = limits.timeoutMs;
   {
@@ -379,10 +386,29 @@ async function stageWorkTree(
     // Ours are serialized by `inFlight`, so any lock here now is stale.
     await rm(path.join(shadow, "index.lock"), { force: true });
     const env = gitEnv({ GIT_DIR: shadow, GIT_WORK_TREE: workdir });
-    const extra = (excludeDirs ?? [])
-      .map((d) => path.relative(workdir, d))
-      .filter((rel) => rel && !rel.startsWith("..") && !path.isAbsolute(rel))
-      .map((rel) => `${rel.split(path.sep).join("/")}/**`);
+    const inside = (p: string) => {
+      const rel = path.relative(workdir, p);
+      return rel && !rel.startsWith("..") && !path.isAbsolute(rel) ? rel.split(path.sep).join("/") : null;
+    };
+    // Exact paths git already ignores are left out of the add anyway, and a
+    // pathspec whose literal part names an ignored path makes `git add`
+    // refuse the whole snapshot — so only the ones it doesn't ignore are
+    // named (escaped: a literal name in a glob pathspec). These are files and
+    // symlinks; git never walks through a symlink, so the name is enough.
+    const literal = (excludePaths ?? []).map(inside).filter((r): r is string => !!r);
+    let ignored = new Set<string>(literal);
+    if (literal.length > 0) {
+      ignored = await run(["check-ignore", "-z", "--stdin"], { cwd: workdir, env, timeoutMs: t, input: `${literal.join("\0")}\0` })
+        .catch((err: unknown) => ((err as { code?: unknown }).code === 1 ? "" : literal.join("\0")))
+        .then((out) => new Set(out.split("\0").filter(Boolean)));
+    }
+    const extra = [
+      ...(excludeDirs ?? []).flatMap((d) => {
+        const rel = inside(d);
+        return rel ? [`${rel}/**`] : [];
+      }),
+      ...literal.filter((rel) => !ignored.has(rel)).map((rel) => rel.replace(/[*?[\]\\]/g, "\\$&")),
+    ];
     const spec = pathspecs(extra);
 
     // Bound the content to hash before hashing anything. With no shadow index
@@ -423,6 +449,7 @@ export async function currentTree(opts: {
   workdir: string;
   sessionId: string;
   excludeDirs?: readonly string[];
+  excludePaths?: readonly string[];
   limits?: Partial<CheckpointLimits>;
 }): Promise<{ ok: true; tree: string } | { ok: false; reason: string }> {
   const limits = { ...DEFAULT_CHECKPOINT_LIMITS, ...opts.limits };
@@ -431,7 +458,7 @@ export async function currentTree(opts: {
   inFlight.add(shadow);
   try {
     await ensureShadow(shadow, limits.timeoutMs);
-    const staged = await stageWorkTree(shadow, opts.workdir, limits, opts.excludeDirs);
+    const staged = await stageWorkTree(shadow, opts.workdir, limits, opts.excludeDirs, opts.excludePaths);
     if (!staged.ok) return staged;
     const tree = (await run(["write-tree"], { cwd: opts.workdir, env: staged.env, timeoutMs: limits.timeoutMs })).trim();
     return { ok: true, tree };

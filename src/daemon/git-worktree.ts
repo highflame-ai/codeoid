@@ -20,7 +20,8 @@
  *      the parent was.
  *
  * Untracked/ignored files are NOT carried (git stash create only snapshots
- * tracked content) — a documented follow-up. Everything here runs the local
+ * tracked content); the repository's setup recipe (workspace-setup.ts) copies
+ * the ignored files it names and shares its dependency dirs. Everything here runs the local
  * `git` binary via execFile (the daemon is co-located with the repo); there is
  * no remote-host tunnel.
  *
@@ -30,7 +31,7 @@
  */
 
 import { execFile } from "node:child_process";
-import { lstatSync, mkdirSync, realpathSync } from "node:fs";
+import { lstatSync, mkdirSync, realpathSync, type Stats, unlinkSync } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 
@@ -99,7 +100,7 @@ function slug(label: string): string {
  * linked worktree we ask from — so new worktrees anchor beside the main repo
  * (`<repo>-worktrees/<name>`), never nested inside another worktree.
  */
-async function mainWorktreeRoot(workdir: string): Promise<string> {
+export async function mainWorktreeRoot(workdir: string): Promise<string> {
   const out = await git(["worktree", "list", "--porcelain"], workdir);
   const line = out.split("\n").find((l) => l.startsWith("worktree "));
   if (!line) throw new WorktreeError("could not resolve the repo's main worktree");
@@ -301,8 +302,17 @@ export async function removeForkWorktree(opts: {
   worktreePath: string;
   branch?: string;
   deleteBranch?: boolean;
+  /**
+   * What the workspace setup recipe put in the worktree (worktree-relative,
+   * see workspace-setup.ts). Taken out BEFORE the WIP snapshot: a copied
+   * secret must never land in a commit (even if the agent un-ignored it), and
+   * a shared directory's symlink is the primary checkout's, not the fork's work.
+   */
+  setup?: { copied?: readonly string[]; shared?: readonly string[] };
 }): Promise<void> {
   const mainRoot = await mainWorktreeRoot(opts.workdir).catch(() => opts.workdir);
+
+  if (opts.setup) removeSetupArtifacts(opts.worktreePath, opts.setup);
 
   // Preserve uncommitted work on the KEPT branch before the forced removal —
   // otherwise `worktree remove --force` silently discards it, and "the branch
@@ -341,6 +351,42 @@ export async function removeForkWorktree(opts: {
   if (opts.deleteBranch && opts.branch) {
     await git(["branch", "-D", opts.branch], mainRoot).catch(() => {});
   }
+}
+
+/**
+ * Take the setup recipe's files back out of a worktree: copied files (plain
+ * files only) and shared-directory symlinks (only while still symlinks — a
+ * directory the agent put there instead is its work). Best-effort, never
+ * throws, and never follows a symlink: a path whose parent is one is left
+ * alone, so this can only ever unlink an entry inside `root`.
+ */
+function removeSetupArtifacts(root: string, setup: { copied?: readonly string[]; shared?: readonly string[] }): void {
+  const entry = (rel: string): string | null => {
+    const parts = rel.split("/");
+    if (!rel || path.isAbsolute(rel) || parts.some((p) => !p || p === "." || p === "..")) return null;
+    let at = root;
+    for (const part of parts.slice(0, -1)) {
+      at = path.join(at, part);
+      try {
+        const st = lstatSync(at);
+        if (st.isSymbolicLink() || !st.isDirectory()) return null;
+      } catch {
+        return null;
+      }
+    }
+    return path.join(root, rel);
+  };
+  const unlinkIf = (rel: string, ok: (st: Stats) => boolean) => {
+    const at = entry(rel);
+    if (!at) return;
+    try {
+      if (ok(lstatSync(at))) unlinkSync(at);
+    } catch {
+      // already gone
+    }
+  };
+  for (const rel of setup.shared ?? []) unlinkIf(rel, (st) => st.isSymbolicLink());
+  for (const rel of setup.copied ?? []) unlinkIf(rel, (st) => st.isFile() || st.isSymbolicLink());
 }
 
 /** Current branch of a workdir (for bind mode), or null when detached/non-repo. */

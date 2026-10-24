@@ -412,4 +412,41 @@ describe("budgets and isolation", () => {
     expect(s?.workdir).not.toBe(repo);
     expect(providers[0]!.capturedOpts[0]!.workdir).toBe(s!.workdir);
   });
+
+  const commitRecipe = (yaml: string) => {
+    const git = (...a: string[]) => execFileSync("git", a, { cwd: repo });
+    mkdirSync(join(repo, ".codeoid"), { recursive: true });
+    writeFileSync(join(repo, ".codeoid", "setup.yaml"), yaml);
+    writeFileSync(join(repo, ".gitignore"), ".env\n");
+    git("add", ".");
+    git("commit", "-qm", "recipe");
+  };
+
+  it("a worktree run gets the repository's setup recipe applied before the agent starts", async () => {
+    commitRecipe("copy: [.env]\n");
+    writeFileSync(join(repo, ".env"), "K=v\n");
+    await create({ worktree: true });
+    await call({ type: "routine.run", routine: "triage" });
+    await settled();
+    const run = ((await call({ type: "routine.get", routine: "triage" })) as RoutineSnapshotMsg).runs![0]!;
+    expect(run.status).toBe("succeeded");
+    const list = await call({ type: "session.list" });
+    const s = list.type === "session.list.result" ? list.sessions.find((x) => x.id === run.sessionId)! : undefined;
+    expect(s?.worktree?.setup?.copied).toEqual([".env"]);
+    expect(readFileSync(join(s!.worktree!.path, ".env"), "utf8")).toBe("K=v\n");
+  });
+
+  it("a setup recipe that fails is the run's infrastructure error — the agent never starts, the checkout is untouched", async () => {
+    commitRecipe("copy: [../outside]\n");
+    await create({ worktree: true });
+    await call({ type: "routine.run", routine: "triage" });
+    await settled();
+    const run = ((await call({ type: "routine.get", routine: "triage" })) as RoutineSnapshotMsg).runs![0]!;
+    expect(run.status).toBe("failed");
+    expect(run.reason).toMatch(/^workspace setup failed \(an infrastructure error; the agent never started\): .*\.\. segment/);
+    expect(providers).toHaveLength(0);
+    // Its fresh worktree was removed; the repository has no leftover branch.
+    expect(execFileSync("git", ["branch", "--list", "codeoid/*"], { cwd: repo }).toString().trim()).toBe("");
+    expect(existsSync(join(repo, "README.md"))).toBe(true);
+  });
 });

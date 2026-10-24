@@ -156,6 +156,25 @@ const general: SettingsTab = {
         }),
       ],
     },
+    {
+      id: "worktree-setup",
+      title: "Worktree setup recipe",
+      description:
+        "A repository's committed .codeoid/setup.yaml says which ignored files to copy and which directories to share into a worktree codeoid creates. Those steps always apply; its command is a separate opt-in.",
+      fields: [
+        cfg("worktree.setup.runCommands", "Run recipe commands", "Whether the recipe's setup command may run in a new worktree. Reading a recipe never runs anything.", {
+          kind: "enum",
+          default: "never",
+          options: [
+            { value: "never", label: "Never", description: "Copy and share files only." },
+            { value: "trusted-repos", label: "Trusted repositories", description: "Run it for the repositories listed below." },
+          ],
+        }),
+        cfg("worktree.setup.trustedRepos", "Trusted repositories", "Primary checkouts (absolute paths, ~ allowed) whose recipe command may run.", {
+          kind: "string[]",
+        }),
+      ],
+    },
   ],
 };
 

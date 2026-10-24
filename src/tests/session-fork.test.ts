@@ -655,4 +655,48 @@ describe("SessionManager session.fork — git worktree isolation", () => {
     expect(events).toContain("fork.setup.start");
     expect(events).toContain("fork.setup.done");
   });
+
+  it("W8: the repository's setup recipe prepares the fork's worktree before its first turn, and destroy takes it back out", async () => {
+    const repo = await makeGitRepoWithDirtyEdit();
+    mkdirSync(join(repo, ".codeoid"));
+    writeFileSync(join(repo, ".codeoid", "setup.yaml"), "copy: [.env]\ncommand: cat .env > .recipe-ran\n");
+    writeFileSync(join(repo, ".gitignore"), ".env\n.recipe-ran\n");
+    await gitIn(["add", ".codeoid", ".gitignore"], repo);
+    await gitIn(["commit", "-m", "recipe"], repo);
+    writeFileSync(join(repo, ".env"), "TOKEN=1\n");
+    const { registry } = makeRegistry();
+    const config = { ...loadConfig(), worktree: { setup: { runCommands: "trusted-repos" as const, trustedRepos: [repo] } } };
+    const manager = new SessionManager(store, transcript, undefined, undefined, undefined, {
+      providers: registry,
+      config,
+    } as never);
+    const c = client(AUTH);
+    const parentId = await createIn(manager, c, repo);
+    await sendAndSettle(manager, c, parentId, "hello");
+
+    const resp = await manager.handle({ type: "session.fork", id: "w8", sessionId: parentId }, AUTH, c);
+    const fork = (resp as { data: { id: string; workdir: string; worktree: { path: string; branch: string } } }).data;
+    await sendAndSettle(manager, c, fork.id, "go");
+    expect(readFileSync(join(fork.workdir, ".recipe-ran"), "utf8")).toBe("TOKEN=1\n");
+
+    // Recorded on the session (checkpoint exclusions, cleanup) and surfaced.
+    const info = (await manager.handle({ type: "session.list", id: "l8" }, AUTH, c)) as {
+      sessions: { id: string; worktree?: { setup?: { copied: string[] } } }[];
+    };
+    expect(info.sessions.find((s) => s.id === fork.id)?.worktree?.setup?.copied).toEqual([".env"]);
+    await transcript.flush();
+    const done = (await transcript.loadTranscript(fork.id, {}))
+      .map((r) => r.message)
+      .filter((m) => m.type === "session.message")
+      .find((m) => (m as { metadata?: { event?: string } }).metadata?.event === "worktree.setup.done") as
+      | { content?: string; metadata?: { copied?: string[] } }
+      | undefined;
+    expect(done?.metadata?.copied).toEqual([".env"]);
+
+    await manager.handle({ type: "session.destroy", id: "d8", sessionId: fork.id }, AUTH, c);
+    expect(existsSync(fork.worktree.path)).toBe(false);
+    const kept = (await gitIn(["ls-tree", "-r", "--name-only", fork.worktree.branch], repo)).split("\n");
+    expect(kept).not.toContain(".env");
+    expect(readFileSync(join(repo, ".env"), "utf8")).toBe("TOKEN=1\n");
+  });
 });

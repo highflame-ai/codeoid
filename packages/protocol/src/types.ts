@@ -563,6 +563,13 @@ export interface SessionWorktree {
    * worktree the user already had — codeoid never removes those.
    */
   createdByCodeoid: boolean;
+  /**
+   * What the repository's setup recipe put in this worktree, relative to its
+   * root: copied (ignored, often secret) files and symlinks to the primary
+   * checkout's shared directories. Kept out of checkpoints and taken back out
+   * before the worktree is removed.
+   */
+  setup?: { copied: string[]; shared: string[] };
 }
 
 /**

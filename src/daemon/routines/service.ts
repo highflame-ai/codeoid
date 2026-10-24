@@ -779,7 +779,8 @@ export class RoutineService {
         }
       }
       if (!sessionId) {
-        sessionId = await this.#host.createSession({
+        const created = await this.#host
+          .createSession({
           name: spec.session === "persistent" ? spec.name : `${spec.name}-${run.id.slice(0, 6)}`,
           workdir,
           provider: spec.provider,
@@ -793,7 +794,16 @@ export class RoutineService {
           // TOTAL — only a fresh session's query is exactly one run.
           ...(spec.session === "fresh" && spec.maxCostUsd !== undefined ? { maxCostUsd: spec.maxCostUsd } : {}),
           label: spec.name,
-        });
+          })
+          .catch((err: unknown) => {
+            // A worktree that couldn't be prepared is an infrastructure
+            // error: say so, so it doesn't read as the agent failing.
+            if ((err as { infrastructure?: unknown }).infrastructure !== true) throw err;
+            finish("failed", { reason: clip(`workspace setup failed (an infrastructure error; the agent never started): ${err instanceof Error ? err.message : String(err)}`, 4_000) });
+            return null;
+          });
+        if (created === null) return;
+        sessionId = created;
         // Before any store write, so a failure still finds the session to disarm.
         live.sessionId = sessionId;
         if (spec.session === "persistent") this.#store.setPersistentSession(routine.id, sessionId);

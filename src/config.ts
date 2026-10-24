@@ -22,6 +22,7 @@ import { z } from "zod";
 import { EFFORT_LEVELS, type EffortLevel } from "./protocol/types.js";
 import type { AuthConfig } from "./daemon/auth.js";
 import type { OAuthConfig } from "./daemon/oauth.js";
+import type { WorktreeSetupPolicy } from "./daemon/workspace-setup.js";
 import {
   isLoopbackHost,
   LOCAL_TOKEN_ENV,
@@ -1165,6 +1166,22 @@ const RootSchema = z.object({
       setup: z.string().optional(),
     })
     .default({}),
+  /** Worktrees codeoid creates (forks, compare, routines). */
+  worktree: z
+    .object({
+      /** The repository setup recipe, `.codeoid/setup.yaml` (src/daemon/workspace-setup.ts). */
+      setup: z
+        .object({
+          /** Whether a recipe's `command` may run. `never` (default) still copies
+           *  and shares files; `trusted-repos` runs it for the repositories in
+           *  `trustedRepos` only. Reading a recipe never executes anything. */
+          runCommands: z.enum(["never", "trusted-repos"]).default("never"),
+          /** Primary checkouts whose recipe commands may run (`~` allowed). */
+          trustedRepos: z.array(z.string().min(1)).default([]),
+        })
+        .default({ runCommands: "never", trustedRepos: [] }),
+    })
+    .default({ setup: { runCommands: "never", trustedRepos: [] } }),
 });
 
 type ParsedConfig = z.infer<typeof RootSchema>;
@@ -1321,6 +1338,15 @@ export interface CodeoidConfig {
    */
   fork?: {
     setup?: string;
+  };
+  /**
+   * Worktrees codeoid creates. `setup` is the trust policy for the
+   * repository's `.codeoid/setup.yaml` recipe (workspace-setup.ts): its
+   * files are always applied; its command runs only for `trustedRepos` under
+   * `runCommands: "trusted-repos"`. Optional in the type; loadConfig fills it.
+   */
+  worktree?: {
+    setup: WorktreeSetupPolicy;
   };
   /**
    * Send-class dispatch queue (P4). Optional in the type so hand-built test
@@ -1788,6 +1814,7 @@ export function loadConfig(opts: LoadOptions = {}): CodeoidConfig {
     embed: parsed.embed,
     push: parsed.push,
     fork: parsed.fork,
+    worktree: parsed.worktree,
   };
 }
 
