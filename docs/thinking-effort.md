@@ -7,7 +7,7 @@ How hard a session's model thinks before it answers, on one scale for every back
 **Default, Off, Minimal, Low, Medium, High, Extra high (`xhigh`), Max.**
 
 **Default** is the backend's own choice, as it always was.
-Most backends are simply sent nothing; two keep a level once it's set, so Default is sent to them explicitly, as the level they would pick unasked: Codex gets your configured `model_reasoning_effort` (project config included) if the running model takes it, else that model's own default; pi gets the default in your pi settings (`defaultThinkingLevel`, else Medium; a project's `.pi/settings.json` isn't read, since pi honours it only for a project you trust).
+Most backends are simply sent nothing; two keep a level once it's set, so Default is sent to them explicitly, as the level they would pick unasked: Codex gets your configured `model_reasoning_effort` (a project's `.codex/config.toml` only if you trust the project, as Codex itself reads it) if the running model takes it, else that model's own default; pi gets the default in your pi settings (`defaultThinkingLevel`, else Medium; a project's `.pi/settings.json` isn't read, since pi honours it only for a project you trust).
 On Codex, a model its catalog doesn't list, with no effort configured, has no known default: Default then sends nothing, so a level set earlier on that thread stays until the next thread.
 Every other level is mapped to the backend's own setting (below).
 A level a backend has no exact match for goes to its nearest one; pi clamps a level a model doesn't take to the nearest it does.
@@ -33,7 +33,7 @@ Where the backend says, the pickers offer only the model's own levels:
 - pi reports which models reason and which levels each takes.
 
 The others (OpenAI and OpenAI-compatible endpoints, llama.cpp, Qwen, Gemini, the Gemini CLI) don't, so every level is offered and marked "support unknown".
-The Default entry shows what Default means on that session once the backend has said (Codex: your configured effort, the project's included, on the model it actually runs; pi: your default).
+The Default entry shows what Default means on that session once the backend has said (Codex: your configured effort, a trusted project's included, on the model it actually runs; pi: your default).
 Before a session's first turn, and after a model change until the next one, it shows what the model list says instead; on Codex that reads your user config only, so a project's own `model_reasoning_effort` shows from the first turn.
 A level the server refuses fails the turn with a note saying so; pick another, or Default.
 
