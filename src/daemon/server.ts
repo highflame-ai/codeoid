@@ -9,6 +9,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { homedir } from "node:os";
 import { ZeroIdVerifier, type AuthConfig } from "./auth.js";
 import type { TokenVerifier } from "./verifier.js";
 import {
@@ -511,6 +512,7 @@ export class DaemonServer {
               sessions: this.#store.listAllSessionsForMigration(),
               workspaceIdFor: workspaceIdFromPath,
               extraTenants: [{ accountId: LOCAL_ACCOUNT_ID, projectId: LOCAL_PROJECT_ID }],
+              probeRoots: [homedir()],
             });
             if (r.applied) {
               const unowned =

@@ -184,6 +184,7 @@ describe("cross-workspace retrieval is tenant-scoped (#415)", () => {
 
   test("backfill registers the ids episodes carry, under their sessions' tenant, once", () => {
     const store = new SqliteEpisodeStore(":memory:");
+    store.migrateWorkspaceIdsToTenant([], workspaceIdFromPath);
     // A worktree session's episodes carry the repo's id, not one recomputed
     // from its (possibly removed) workdir — the backfill must use the former.
     store.insert({ ...ep("ws-repo", "s1", "one", "body"), id: "e1" });
@@ -207,6 +208,7 @@ describe("cross-workspace retrieval is tenant-scoped (#415)", () => {
 
   test("backfill gives an orphan an owner only when the hash proves it", () => {
     const store = new SqliteEpisodeStore(":memory:");
+    store.migrateWorkspaceIdsToTenant([], workspaceIdFromPath);
     const proven = workspaceIdFromPath("/srv/proj-gone", TENANT);
     store.insert({ ...ep(proven, "gone-1", "x", "body"), filePaths: ["/srv/proj-gone/src/a.ts"], id: "e1" });
     store.insert({ ...ep("ws-unprovable", "gone-2", "y", "body"), id: "e2" });
@@ -214,6 +216,7 @@ describe("cross-workspace retrieval is tenant-scoped (#415)", () => {
       sessions: [{ id: "live", workdir: "/elsewhere", ...OTHER }],
       workspaceIdFor: workspaceIdFromPath,
       extraTenants: [TENANT],
+      probeRoots: ["/srv"],
     });
     expect(r).toEqual({ applied: true, registered: 1, unowned: 1 });
     expect(store.listWorkspaceIds(TENANT)).toEqual([proven]);
@@ -221,8 +224,41 @@ describe("cross-workspace retrieval is tenant-scoped (#415)", () => {
     store.close();
   });
 
+  test("backfill waits while the pre-tenant re-key is still pending", () => {
+    const store = new SqliteEpisodeStore(":memory:");
+    store.insert({ ...ep("ws-x", "s1", "x", "body"), id: "e1" });
+    expect(store.needsWorkspaceMigration()).toBe(true);
+    const sessions = [{ id: "s1", workdir: "/x", ...TENANT }];
+    expect(store.backfillWorkspaceTenants({ sessions, workspaceIdFor: () => "unused" }).applied).toBe(false);
+    expect(store.needsWorkspaceTenantBackfill()).toBe(true);
+    store.migrateWorkspaceIdsToTenant(sessions, () => "ws-x");
+    expect(store.backfillWorkspaceTenants({ sessions, workspaceIdFor: () => "unused" }).applied).toBe(true);
+    store.close();
+  });
+
+  test("orphan probing stays under session workdirs and the given roots", () => {
+    const store = new SqliteEpisodeStore(":memory:");
+    store.migrateWorkspaceIdsToTenant([], workspaceIdFromPath);
+    const proven = workspaceIdFromPath("/mnt/remote/proj", TENANT);
+    store.insert({ ...ep(proven, "gone", "x", "body"), filePaths: ["/mnt/remote/proj/a.ts"], id: "e1" });
+    const probed: string[] = [];
+    const r = store.backfillWorkspaceTenants({
+      sessions: [],
+      workspaceIdFor: (d, t) => {
+        probed.push(d);
+        return workspaceIdFromPath(d, t);
+      },
+      extraTenants: [TENANT],
+      probeRoots: ["/home/someone"],
+    });
+    expect(probed).toEqual([]);
+    expect(r.unowned).toBe(1);
+    store.close();
+  });
+
   test("backfill never registers a pre-tenant path-only id", () => {
     const store = new SqliteEpisodeStore(":memory:");
+    store.migrateWorkspaceIdsToTenant([], workspaceIdFromPath);
     const legacy = legacyWorkspaceIdFromPath("/shared");
     store.insert({ ...ep(legacy, "s1", "x", "body"), id: "e1" });
     const r = store.backfillWorkspaceTenants({

@@ -140,23 +140,41 @@ export function workspaceIdFromPath(
   return id;
 }
 
-function computeWorkspaceId(normalized: string, scope: string): string {
+/** Bound on the git probe behind a workspace id: a directory on a hung network
+ *  mount must not stall session creation or the boot-time backfill. */
+const GIT_PROBE_TIMEOUT_MS = 5_000;
+
+/** What a workspace id hashes for `normalized`: the repo's shared git dir (so
+ *  every worktree of one repo shares memory), else the path itself. Memoized
+ *  per path — the probe does not depend on the tenant, so a caller hashing one
+ *  directory for several tenants pays for one git process, not one per tenant. */
+const anchorCache = new Map<string, string>();
+
+function workspaceAnchor(normalized: string): string {
+  const cached = anchorCache.get(normalized);
+  if (cached !== undefined) return cached;
+  let anchor = normalized;
   try {
     const out = execSync("git rev-parse --git-common-dir", {
       cwd: normalized,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
+      timeout: GIT_PROBE_TIMEOUT_MS,
     }).trim();
-    if (out) {
-      const absolute = isAbsolute(out) ? out : resolve(normalized, out);
-      const hash = createHash("sha256").update(scope + absolute).digest("hex");
-      return `ws_${hash.slice(0, 16)}`;
-    }
+    if (out) anchor = isAbsolute(out) ? out : resolve(normalized, out);
   } catch {
-    // Not a git repo, or git not installed — fall through.
+    // Not a git repo, git not installed, or the probe timed out — use the path.
   }
+  anchorCache.set(normalized, anchor);
+  if (anchorCache.size > WORKSPACE_ID_CACHE_MAX) {
+    const oldest = anchorCache.keys().next().value;
+    if (oldest !== undefined) anchorCache.delete(oldest);
+  }
+  return anchor;
+}
 
-  const hash = createHash("sha256").update(scope + normalized).digest("hex");
+function computeWorkspaceId(normalized: string, scope: string): string {
+  const hash = createHash("sha256").update(scope + workspaceAnchor(normalized)).digest("hex");
   return `ws_${hash.slice(0, 16)}`;
 }
 
@@ -544,10 +562,13 @@ export class SqliteEpisodeStore {
         "UPDATE episodes SET workspace_id = ? WHERE session_id = ? AND workspace_id != ?",
       );
       for (const s of sessions) {
-        const newWs = workspaceIdFor(s.workdir, {
-          accountId: s.accountId,
-          projectId: s.projectId,
-        });
+        let newWs: string;
+        try {
+          newWs = workspaceIdFor(s.workdir, { accountId: s.accountId, projectId: s.projectId });
+        } catch {
+          // A malformed tenant on one row must not abort every tenant's re-key.
+          continue;
+        }
         reKeyed += Number(bySession.run(newWs, s.id, newWs).changes ?? 0);
       }
 
@@ -1322,9 +1343,17 @@ export class SqliteEpisodeStore {
     workspaceIdFor: (workdir: string, tenant: WorkspaceTenant) => string;
     /** Tenants that may own orphans beyond those in `sessions` (e.g. local mode). */
     extraTenants?: ReadonlyArray<WorkspaceTenant>;
+    /** Directories (besides session workdirs) under which an orphan's file
+     *  paths may be probed — normally the user's home. */
+    probeRoots?: ReadonlyArray<string>;
     maxProbeDirs?: number;
   }): { applied: boolean; registered: number; unowned: number } {
     if (!this.needsWorkspaceTenantBackfill()) return { applied: false, registered: 0, unowned: 0 };
+    // Until the re-key has moved surviving sessions' episodes off their
+    // pre-tenant path-only ids, such an id can hold several tenants' episodes
+    // and the legacy check below can miss it (a recomputed legacy id drifts once
+    // a worktree is removed). Wait for the re-key; this runs again next boot.
+    if (this.needsWorkspaceMigration()) return { applied: false, registered: 0, unowned: 0 };
 
     const tenantKey = (t: WorkspaceTenant) => `${t.accountId}\u0000${t.projectId}`;
     const tenantBySession = new Map<string, WorkspaceTenant>();
@@ -1362,13 +1391,27 @@ export class SqliteEpisodeStore {
     if (orphans.size > 0 && tenants.size > 0) {
       const max = opts.maxProbeDirs ?? 400;
       const dirs = new Set<string>(opts.sessions.map((s) => s.workdir));
-      const pathRows = this.#db
-        .prepare(
-          `SELECT DISTINCT file_paths AS f FROM episodes
-           WHERE workspace_id IN (${[...orphans].map(() => "?").join(",")}) AND file_paths != '[]'
-           LIMIT 2000`,
-        )
-        .all(...orphans) as Array<{ f: string }>;
+      // Only probe where a workspace plausibly lived: under a session workdir or
+      // the user's home. File paths come from agents' tool calls, so an
+      // arbitrary path (a hung network mount, say) must not be probed.
+      const roots = [...dirs, ...(opts.probeRoots ?? [])].map((r) => r.replace(/\/+$/, ""));
+      const underRoot = (d: string) => roots.some((r) => d === r || d.startsWith(`${r}/`));
+      const pathRows: Array<{ f: string }> = [];
+      const orphanList = [...orphans];
+      // Chunked: one placeholder per orphan would overflow SQLite's bound-
+      // parameter limit on a large store and fail the backfill every boot.
+      for (let i = 0; i < orphanList.length && pathRows.length < 2000; i += 500) {
+        const chunk = orphanList.slice(i, i + 500);
+        pathRows.push(
+          ...(this.#db
+            .prepare(
+              `SELECT DISTINCT file_paths AS f FROM episodes
+               WHERE workspace_id IN (${chunk.map(() => "?").join(",")}) AND file_paths != '[]'
+               LIMIT ?`,
+            )
+            .all(...chunk, 2000 - pathRows.length) as Array<{ f: string }>),
+        );
+      }
       outer: for (const r of pathRows) {
         let paths: unknown;
         try {
@@ -1380,6 +1423,7 @@ export class SqliteEpisodeStore {
         for (const p of paths) {
           if (typeof p !== "string" || !isAbsolute(p)) continue;
           for (let d = dirname(p); d !== dirname(d); d = dirname(d)) {
+            if (!underRoot(d)) break;
             if (dirs.size >= max) break outer;
             dirs.add(d);
           }
