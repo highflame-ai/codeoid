@@ -24,6 +24,8 @@
 
 const sessionId = `fake-${process.pid}`;
 const sessionFile = `/tmp/fake-pi-${process.pid}.jsonl`;
+/** pi's thinking level (#417): "medium" at start, as pi's own default. */
+let thinkingLevel = "medium";
 let turns = 0;
 
 const pendingUi = new Map<string, (resp: Record<string, unknown>) => void>();
@@ -147,6 +149,8 @@ async function runPrompt(message: string): Promise<void> {
       result: { content: [{ type: "text", text: "wrote file" }] },
       isError: false,
     });
+  } else if (message.includes("echo-thinking")) {
+    emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: `thinking:${thinkingLevel}` }], stopReason: "stop" } });
   } else if (message.includes("echo-prompt")) {
     // Reflect the FULL received prompt back — lets tests prove what
     // actually reached pi (e.g. the prepended history seed).
@@ -216,7 +220,7 @@ function handle(cmd: Record<string, unknown>): void {
           sessionId,
           sessionFile,
           isStreaming: false,
-          thinkingLevel: "off",
+          thinkingLevel,
           messageCount: turns,
         },
       });
@@ -238,8 +242,8 @@ function handle(cmd: Record<string, unknown>): void {
       respond(cmd.id, "get_available_models", {
         data: {
           models: [
-            { id: "claude-sonnet-4-5", provider: "anthropic", name: "Claude Sonnet 4.5", contextWindow: 200_000 },
-            { id: "gpt-5", provider: "openai", name: "GPT-5", contextWindow: 400_000 },
+            { id: "claude-sonnet-4-5", provider: "anthropic", name: "Claude Sonnet 4.5", contextWindow: 200_000, reasoning: true },
+            { id: "gpt-5", provider: "openai", name: "GPT-5", contextWindow: 400_000, reasoning: true, thinkingLevelMap: { minimal: null, xhigh: "xhigh" } },
           ],
         },
       });
@@ -256,6 +260,10 @@ function handle(cmd: Record<string, unknown>): void {
       return;
     case "set_model":
       respond(cmd.id, "set_model", { data: {} });
+      return;
+    case "set_thinking_level":
+      thinkingLevel = String(cmd.level);
+      respond(cmd.id, "set_thinking_level");
       return;
     case "switch_session":
     case "new_session":

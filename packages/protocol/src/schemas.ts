@@ -19,7 +19,7 @@
 
 import { z } from "zod";
 import type { AuthMsg, ClientMessage } from "./types.js";
-import { LIMITS } from "./types.js";
+import { EFFORT_LEVELS, LIMITS } from "./types.js";
 
 // ── Shared field schemas ──────────────────────────────────────────────────────
 
@@ -127,6 +127,8 @@ export const sessionCreateSchema = z.object({
    * daemon can answer with a specific error, same rule as `providerId`.
    */
   model: z.string().min(1).max(LIMITS.MODEL_MAX).optional(),
+  /** Thinking effort (#417). */
+  effort: z.enum(EFFORT_LEVELS).optional(),
   /**
    * Activate an installed SDLC pack on this session (ambient mode —
    * docs/pack-loading.md): its constitution is injected into the system
@@ -327,6 +329,13 @@ export const sessionSetModelSchema = z.object({
   sessionId: sessionIdField,
   model: z.string().min(1).max(LIMITS.MODEL_MAX),
   fallbackModel: z.string().max(LIMITS.MODEL_MAX).nullable().optional(),
+});
+
+export const sessionSetEffortSchema = z.object({
+  ...base,
+  type: z.literal("session.set_effort"),
+  sessionId: sessionIdField,
+  effort: z.enum(EFFORT_LEVELS).nullable(),
 });
 
 export const sessionForkSchema = z.object({
@@ -1091,6 +1100,7 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   sessionRotateSchema,
   sessionSearchSchema,
   sessionSetModelSchema,
+  sessionSetEffortSchema,
   sessionSetProviderSchema,
   sessionMcpReconnectSchema,
   sessionMcpRefreshSchema,

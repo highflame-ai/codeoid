@@ -13,6 +13,7 @@
 import type {
   AuthContext,
   ContentPart,
+  EffortLevel,
   ProviderCommand,
   SessionMode,
   UiRequestMethod,
@@ -113,6 +114,8 @@ export interface TurnOpts {
   userMessage: string;
   model?: string;
   fallbackModel?: string;
+  /** Thinking effort for this turn (#417), on codeoid's scale; absent = the backend's default. */
+  effort?: EffortLevel;
   workdir: string;
   systemPromptAppend?: string;
   /** Session's unified approval gate — same semantics across all providers. */
@@ -505,6 +508,9 @@ export interface ModelInfo {
   /** Context window in tokens, when the backend publishes it on its catalog.
    *  qwen-code and pi do; Claude and codex report the window per turn. */
   contextWindow?: number;
+  /** Thinking efforts the model takes, when the backend reports them (#417). */
+  efforts?: EffortLevel[];
+  defaultEffort?: EffortLevel;
 }
 
 /**
@@ -521,6 +527,10 @@ export interface CatalogEntry {
   displayName: string;
   description?: string;
   contextWindow?: number;
+  /** Thinking efforts the model takes (#417), when the backend reports them; [] = it doesn't think. */
+  efforts?: EffortLevel[];
+  /** The backend's default effort for the model, when it says. */
+  defaultEffort?: EffortLevel;
 }
 
 /**
@@ -597,6 +607,19 @@ export interface AgentProvider {
    * reconnect: that's a result with `status` and `error`.
    */
   reconnectMcpServer?(name: string): Promise<BackendMcpServerState | null>;
+  /**
+   * Thinking effort (#417): how a change reaches this backend. Absent or
+   * "turn" = it takes each turn's `TurnOpts.effort`; "restart" = only when the
+   * backend starts (the Gemini CLI's settings), so the session rebuilds it
+   * before the next turn.
+   */
+  readonly effortChange?: "turn" | "restart";
+  /**
+   * Apply a new effort to the running backend now, where it can (Claude,
+   * Qwen, pi) — never cutting a turn short. True when it did; false (or
+   * absent) = it applies from the next turn's options.
+   */
+  applyEffort?(effort: EffortLevel | null): Promise<boolean>;
   /**
    * Hand this (fresh) backend an existing conversation in its OWN native form,
    * instead of a transcript in the first prompt (#387): fork its own

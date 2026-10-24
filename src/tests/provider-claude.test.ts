@@ -38,6 +38,8 @@ let sdkInterruptThrows = false;
 let mcpStatuses: Array<Record<string, unknown>> = [];
 let mcpReconnects: string[] = [];
 let mcpReconnectError: Error | null = null;
+/** Live settings the mock query was handed (#417). */
+let flagSettings: Array<Record<string, unknown>> = [];
 
 function makeMockQuery() {
   const err = sdkThrowError;
@@ -64,6 +66,9 @@ function makeMockQuery() {
       if (mcpReconnectError) throw mcpReconnectError;
     },
     mcpServerStatus: async () => mcpStatuses,
+    applyFlagSettings: async (settings: Record<string, unknown>) => {
+      flagSettings.push(settings);
+    },
   };
 }
 
@@ -88,6 +93,8 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
 
 import {
   ClaudeProvider,
+  claudeCatalogEntry,
+  claudeEffortOptions,
   translateSDKMessage,
   parseMcpServerConfig,
   extractToolResultText,
@@ -110,6 +117,7 @@ import { applyAccountEnv, bedrockModel, type ResolvedClaudeAccount, type StoredC
 import { SqliteEpisodeStore } from "../daemon/memory/store.js";
 import { MEMORY_TOOL_NAMES } from "../daemon/memory/index.js";
 import type { Embedder } from "../daemon/memory/embedder.js";
+import type { EffortLevel } from "../protocol/types.js";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -2618,5 +2626,79 @@ describe("ClaudeProvider — adopting a turn the CLI starts on its own", () => {
 
     provider._emitForTest({ type: "tool_start", toolId: "t3", sdkToolUseId: "u3", name: "Bash", input: {}, approvalId: "a3" });
     expect(got.map((e) => e.type)).toEqual(["background_event", "turn_started"]);
+  });
+});
+
+// ── Thinking effort (#417) ────────────────────────────────────────────────────
+
+describe("thinking effort", () => {
+  beforeEach(() => {
+    sdkMessages = [];
+    sdkThrowError = null;
+    capturedQueryOpts = null;
+    sdkGate = null;
+    flagSettings = [];
+  });
+  const turn = (provider: ClaudeProvider, effort?: EffortLevel) =>
+    provider.runTurn({ history: [], userMessage: "hi", workdir: "/tmp", canUseTool: async () => ({ behavior: "allow" as const }), ...(effort ? { effort } : {}) });
+  const options = () => (capturedQueryOpts?.options ?? {}) as { effort?: string; thinking?: unknown };
+
+  it("rides on adaptive thinking at every level, and Off disables thinking", async () => {
+    sdkMessages = [{ type: "result", modelUsage: {} }];
+    for await (const _ of turn(makeProvider(), "xhigh").events) {
+    }
+    expect(options()).toMatchObject({ effort: "xhigh", thinking: { type: "adaptive", display: "summarized" } });
+    for await (const _ of turn(makeProvider(), "off").events) {
+    }
+    expect(options().thinking).toEqual({ type: "disabled" });
+    expect(options().effort).toBeUndefined();
+    for await (const _ of turn(makeProvider()).events) {
+    }
+    expect(options().effort).toBeUndefined(); // the default: nothing sent
+    expect(options().thinking).toEqual({ type: "adaptive", display: "summarized" });
+  });
+
+  it("changes live on a running query — but to or from Off rebuilds it before the next turn", async () => {
+    sdkMessages = [{ type: "result", modelUsage: {} }];
+    let release!: () => void;
+    sdkGate = new Promise<void>((r) => {
+      release = r;
+    });
+    const provider = makeProvider();
+    queryCallCount = 0;
+    const first = turn(provider, "high");
+    for await (const e of first.events) if (e.type === "turn_done") break;
+    expect(await provider.applyEffort("max")).toBe(true);
+    expect(flagSettings).toEqual([{ effortLevel: "max" }]);
+    expect(await provider.applyEffort(null)).toBe(true); // back to the model's default
+    expect(flagSettings.at(-1)).toEqual({ effortLevel: null });
+    expect(await provider.applyEffort("off")).toBe(false); // fixed at construction
+    // An effort the live query already runs at doesn't rebuild it...
+    void turn(provider);
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    expect(queryCallCount).toBe(1);
+    // ...Off does: a fresh query, with thinking disabled.
+    const off = turn(provider, "off");
+    for (let i = 0; i < 50 && queryCallCount < 2; i++) await Bun.sleep(2);
+    expect(queryCallCount).toBe(2);
+    expect(options().thinking).toEqual({ type: "disabled" });
+    release();
+    for await (const _ of off.events) {
+    }
+    await provider.teardown();
+  });
+
+  it("reports which levels each model takes", () => {
+    expect(claudeCatalogEntry({ value: "opus", displayName: "Opus", supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"] }).efforts).toEqual([
+      "off",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+    expect(claudeCatalogEntry({ value: "haiku", displayName: "Haiku", supportsEffort: false }).efforts).toEqual(["off"]);
+    expect(claudeCatalogEntry({ value: "x", displayName: "X" }).efforts).toBeUndefined(); // not said: unknown
+    expect(claudeEffortOptions("minimal")).toMatchObject({ effort: "low" }); // no Minimal on Claude
   });
 });

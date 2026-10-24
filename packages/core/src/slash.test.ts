@@ -1,5 +1,5 @@
 import { describe, expect, it, mock } from "bun:test";
-import { dispatchSlash, parseSlash, type SlashContext } from "./slash.js";
+import { dispatchSlash, effortChangeSummary, parseSlash, type SlashContext } from "./slash.js";
 
 function ctx(): SlashContext & { sent: unknown[] } {
   const sent: unknown[] = [];
@@ -74,6 +74,17 @@ describe("parseSlash", () => {
       model: "opus",
       fallback: "sonnet",
     });
+  });
+
+  it("parses /effort: a level, default, or the picker (#417)", () => {
+    expect(parseSlash("/effort")).toEqual({ kind: "effort-picker" });
+    expect(parseSlash("/effort High")).toEqual({ kind: "effort", effort: "high" });
+    expect(parseSlash("/effort extra-high")).toEqual({ kind: "effort", effort: "xhigh" });
+    expect(parseSlash("/effort off")).toEqual({ kind: "effort", effort: "off" });
+    expect(parseSlash("/effort default")).toEqual({ kind: "effort", effort: null });
+    expect(() => parseSlash("/effort turbo")).toThrow(/off\|minimal/);
+    expect(effortChangeSummary({ effort: "max", applies: "restart" })).toMatch(/restarts/);
+    expect(effortChangeSummary({ effort: null, applies: "next-turn" })).toBe("Thinking effort: the backend's default, from the next turn.");
   });
 
   it("bare /model opens the picker instead of erroring", () => {

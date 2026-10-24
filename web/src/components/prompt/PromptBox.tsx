@@ -36,7 +36,7 @@ import { openHelpModal } from "../HelpModal";
 import { openPackBrowser } from "../PackBrowser";
 import { openPipelineRunner } from "../PipelineRunner";
 import { openSettings } from "../SettingsDrawer";
-import { openModelPicker } from "../SessionControls";
+import { openEffortPicker, openModelPicker } from "../SessionControls";
 import { openIdentityDrawer } from "../IdentityDrawer";
 import { openExportModal } from "../SessionExportModal";
 import { openImportModal } from "../SessionImportModal";
@@ -255,6 +255,7 @@ const PromptBox: Component = () => {
           },
           showHelp: openHelpModal,
           showModelPicker: openModelPicker,
+          showEffortPicker: openEffortPicker,
         });
         clearDraft(draftKey());
         setText("");

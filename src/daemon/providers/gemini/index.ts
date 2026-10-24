@@ -16,10 +16,13 @@
  */
 
 import type { McpTenant } from "../../mcp/oauth.js";
+import type { EffortLevel } from "../../../protocol/types.js";
+import { effortRejectionHint } from "../effort.js";
 import {
   GoogleGenerativeAI,
   type FunctionDeclaration,
   type GenerateContentStreamResult,
+  type GenerationConfig,
   type Part,
 } from "@google/generative-ai";
 import { AsyncQueue } from "../../async-queue.js";
@@ -183,6 +186,11 @@ export class GeminiProvider implements AgentProvider {
       ...(declarations.length > 0
         ? { tools: [{ functionDeclarations: declarations as unknown as FunctionDeclaration[] }] }
         : {}),
+      // Thinking effort (#417). This SDK predates `thinkingConfig` in its
+      // types but sends generationConfig as given; the API reads it.
+      ...(opts.effort && geminiThinkingConfig(model, opts.effort)
+        ? { generationConfig: { thinkingConfig: geminiThinkingConfig(model, opts.effort) } as GenerationConfig }
+        : {}),
     });
 
     try {
@@ -216,7 +224,7 @@ export class GeminiProvider implements AgentProvider {
           if (ac.signal.aborted) return;
           queue.push({
             type: "error",
-            message: `Gemini API error: ${err instanceof Error ? err.message : String(err)}`,
+            message: `Gemini API error: ${err instanceof Error ? err.message : String(err)}${opts.effort ? effortRejectionHint(err instanceof Error ? err.message : String(err), opts.effort) : ""}`,
           });
           return;
         }
@@ -335,4 +343,24 @@ export function splitForStateless(opts: TurnOpts): {
     chatHistory: history,
     userMessage: opts.userMessage,
   };
+}
+
+/**
+ * A thinking effort as Gemini's thinkingConfig (#417), by model family:
+ * 2.5 models take a token budget (0 = off; Pro can't turn thinking off, so
+ * its floor is 128; Flash's ceiling is 24576), 3.x models a level. Other
+ * models don't think: nothing is sent.
+ */
+export function geminiThinkingConfig(model: string, effort: EffortLevel): Record<string, unknown> | null {
+  if (/gemini-2\.5/.test(model)) {
+    const pro = /pro/.test(model);
+    const budgets: Record<EffortLevel, number> = { off: 0, minimal: 512, low: 2048, medium: 8192, high: 16384, xhigh: 24576, max: 32768 };
+    const budget = Math.min(Math.max(budgets[effort], pro ? 128 : 0), pro ? 32768 : 24576);
+    return { thinkingBudget: budget };
+  }
+  if (/gemini-3/.test(model)) {
+    const level = effort === "off" || effort === "minimal" ? "minimal" : effort === "low" ? "low" : effort === "medium" ? "medium" : "high";
+    return { thinkingLevel: level };
+  }
+  return null;
 }

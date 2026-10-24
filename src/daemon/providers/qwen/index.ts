@@ -43,7 +43,7 @@ import { McpProxyLease, type McpProxyMount } from "../../mcp/proxy.js";
 import { resolveEnvMap } from "../../mcp/types.js";
 import { FLEET_TOOL_NAMES } from "../../fleet.js";
 import { resolveQwenBaseUrl, type CodeoidConfig } from "../../../config.js";
-import type { AuthContext } from "../../../protocol/types.js";
+import type { AuthContext, EffortLevel } from "../../../protocol/types.js";
 import type {
   ModelInfo,
   NormalizedTurnResult,
@@ -123,6 +123,8 @@ export class QwenProvider implements SessionProvider {
   #builtSystemPromptAppend = "";
   /** Fingerprint of the account the running query was built with ("" = the daemon's own). */
   #builtAccount = "";
+  /** The thinking effort the live query runs at (#417); "" = the SDK's default. */
+  #builtEffort = "";
   /** Bumped on every (re)build so an orphaned consumer can't clobber the new loop. */
   #loopGeneration = 0;
 
@@ -298,6 +300,14 @@ export class QwenProvider implements SessionProvider {
     }
   }
 
+  /** A new thinking effort on the running query, live (#417); back to the default needs a fresh query (next turn). */
+  async applyEffort(effort: EffortLevel | null): Promise<boolean> {
+    if (!this.#query || !this.#consumerTask || effort === null) return false;
+    const applied = await this.#query.setEffort(qwenEffort(effort));
+    if (applied) this.#builtEffort = effort;
+    return applied;
+  }
+
   async dispose(): Promise<void> {
     await this.teardown();
   }
@@ -370,10 +380,11 @@ export class QwenProvider implements SessionProvider {
       // The SDK fixes the system prompt at query construction, so a changed
       // append (before_turn hooks, refreshed memory index) needs a rebuild.
       // The fresh query RESUMES the same backing session, so nothing is lost.
-      if (this.#builtSystemPromptAppend === desiredAppend && this.#builtAccount === desiredAccount) return;
-      console.log(
-        `[qwen-provider ${this.#init.sessionId.slice(0, 8)}] ${this.#builtAccount === desiredAccount ? "systemPromptAppend" : "account"} changed — rebuilding query loop`,
-      );
+      if (this.#builtSystemPromptAppend === desiredAppend && this.#builtAccount === desiredAccount && this.#builtEffort === (opts.effort ?? "")) return;
+      // A changed effort that setEffort couldn't take (back to the default) rebuilds too (#417).
+      const what =
+        this.#builtSystemPromptAppend !== desiredAppend ? "systemPromptAppend" : this.#builtAccount !== desiredAccount ? "account" : "thinking effort";
+      console.log(`[qwen-provider ${this.#init.sessionId.slice(0, 8)}] ${what} changed — rebuilding query loop`);
       this.#inputQueue.close();
       this.#abortController?.abort();
     }
@@ -384,6 +395,7 @@ export class QwenProvider implements SessionProvider {
     this.#inputQueue = new AsyncQueue<SDKUserMessage>();
     this.#builtSystemPromptAppend = desiredAppend;
     this.#builtAccount = desiredAccount;
+    this.#builtEffort = opts.effort ?? "";
     this.#loopGeneration += 1;
     const myGeneration = this.#loopGeneration;
 
@@ -447,6 +459,8 @@ export class QwenProvider implements SessionProvider {
         // canUseTool; qwen-code's own `auto` mode would silently auto-approve
         // edits and shell commands, bypassing the gate entirely.
         permissionMode: "default",
+        // Thinking effort (#417); the SDK clamps it to what the model takes.
+        ...(opts.effort ? { effort: qwenEffort(opts.effort) } : {}),
         includePartialMessages: true,
         allowedTools: [
           ...(init.memory ? MEMORY_TOOL_NAMES.map((t) => `mcp__codeoid_memory__${t}`) : []),
@@ -1097,4 +1111,9 @@ export function extractToolResultText(content: unknown): string {
     }
   }
   return parts.join("\n");
+}
+
+/** codeoid's effort scale on qwen-code's (#417): it has no Off or Minimal — both are its lowest, Low. */
+export function qwenEffort(effort: EffortLevel): "low" | "medium" | "high" | "xhigh" | "max" {
+  return effort === "off" || effort === "minimal" ? "low" : effort;
 }

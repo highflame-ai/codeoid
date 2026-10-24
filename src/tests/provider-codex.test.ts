@@ -42,6 +42,7 @@ import { createDefaultProviderRegistry } from "../daemon/providers/registry.js";
 import type { ProviderEvent, TurnOpts, TurnRun } from "../daemon/providers/interface.js";
 import type { CodeoidConfig } from "../config.js";
 import type { Store } from "../daemon/store.js";
+import type { EffortLevel } from "../protocol/types.js";
 
 const FIXTURE = join(import.meta.dir, "fixtures", "fake-codex.ts");
 
@@ -668,7 +669,14 @@ describe("CodexProvider over fake-codex", () => {
     const models = await p.listModels();
     await p.teardown();
     expect(models).toEqual([
-      { id: "gpt-5.6-terra", displayName: "GPT-5.6-Terra", description: "Balanced agentic coding model." },
+      {
+        id: "gpt-5.6-terra",
+        displayName: "GPT-5.6-Terra",
+        description: "Balanced agentic coding model.",
+        // Its efforts on codeoid's scale (#417): "none" is Off; "ultra" has no level.
+        efforts: ["off", "low", "high"],
+        defaultEffort: "low",
+      },
     ]);
   });
 
@@ -1285,5 +1293,28 @@ describe("describeCodexError", () => {
       expect(out).not.toContain("[object Object]");
       expect(out.length).toBeGreaterThan(0);
     }
+  });
+});
+
+describe("CodexProvider – thinking effort (#417)", () => {
+  const effortSeen = async (effort?: EffortLevel): Promise<unknown> => {
+    const p = makeProvider();
+    const events = await collect(p.runTurn(turnOpts("echo-effort", effort ? { effort } : {})));
+    await p.teardown();
+    return JSON.parse((events.find((e) => e.type === "text_done") as { content: string }).content).effort;
+  };
+
+  it("sends it on every turn — Off as codex's none, and none set as null (codex keeps a turn's effort)", async () => {
+    expect(await effortSeen("high")).toBe("high");
+    expect(await effortSeen("off")).toBe("none");
+    expect(await effortSeen()).toBeNull();
+  });
+
+  it("reports each model's efforts on codeoid's scale, dropping ones it has no level for", async () => {
+    const p = makeProvider();
+    await collect(p.runTurn(turnOpts("hello")));
+    const models = await p.listModels();
+    await p.teardown();
+    expect(models[0]).toMatchObject({ efforts: ["off", "low", "high"], defaultEffort: "low" });
   });
 });

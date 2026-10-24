@@ -29,9 +29,11 @@ import {
   removeSession,
 } from "../state/sessions";
 import { fetchModels, modelCatalog } from "../state/models";
+import { EFFORT_LABELS } from "@highflame/codeoid-core";
 import { effectiveMode } from "../lib/session-mode";
 import { CAPABILITIES } from "../protocol/types";
-import type { ClientMessage, SessionInfo, SessionMode } from "../protocol/types";
+import { EFFORT_LEVELS } from "../protocol/types";
+import type { ClientMessage, EffortLevel, SessionInfo, SessionMode } from "../protocol/types";
 import { openBlackboard } from "../state/blackboard";
 import { openExportModal } from "./SessionExportModal";
 import { openUndoLast } from "./RewindModal";
@@ -117,6 +119,7 @@ const SessionControls: Component = () => {
             current={s().model}
             provider={s().providerId}
           />
+          <EffortPicker sessionId={s().id} current={s().effort} model={s().model} />
           <ProviderPicker sessionId={s().id} current={s().providerId} />
           <AccountPicker
             sessionId={s().id}
@@ -823,3 +826,94 @@ const DestroyButton: Component<{
 };
 
 export default SessionControls;
+
+// Module-level so a bare `/effort` can open it, as `/model` opens its picker.
+const [effortPickerOpen, setEffortPickerOpen] = createSignal(false);
+/** Open the focused session's thinking-effort picker (wired to a bare `/effort`). */
+export function openEffortPicker(): void {
+  setEffortPickerOpen(true);
+}
+
+/**
+ * How hard the session's model thinks (#417). Offers the levels the current
+ * model takes when its backend says (Claude, Codex, pi); otherwise the whole
+ * scale, marked as not known to the backend — a level it refuses fails the
+ * turn with a message saying so.
+ */
+const EffortPicker: Component<{ sessionId: string; current?: EffortLevel; model?: string }> = (props) => {
+  const open = effortPickerOpen;
+  const setOpen = setEffortPickerOpen;
+  const act = createAction();
+  let rootEl: HTMLDivElement | undefined;
+  useDismissable(() => rootEl, open, () => setOpen(false));
+  // The catalog row of the model in use (or the backend's default one).
+  const entry = () => modelCatalog().find((m) => m.value === props.model) ?? (props.model ? undefined : modelCatalog().find((m) => m.isDefault));
+  const known = () => entry()?.efforts;
+  const levels = (): readonly EffortLevel[] => known() ?? EFFORT_LEVELS;
+  const choose = (effort: EffortLevel | null) =>
+    act.run({ type: "session.set_effort", id: newRequestId(), sessionId: props.sessionId, effort }, () => setOpen(false));
+  return (
+    <div class="relative" ref={rootEl}>
+      <button
+        type="button"
+        onClick={() => {
+          setOpen(!open());
+          act.clearError();
+        }}
+        class="flex items-center gap-1 rounded border border-border bg-bg px-2 py-1 font-mono uppercase tracking-wider text-fg-muted hover:border-accent/40 hover:text-fg"
+        title="How hard the model thinks before it answers"
+      >
+        effort <span class="text-fg">{props.current ? EFFORT_LABELS[props.current] : "default"}</span> ▾
+      </button>
+      <Show when={open()}>
+        <div
+          class="absolute right-0 top-full z-30 mt-1 w-52 rounded border border-border bg-bg-elev shadow-xl"
+          onMouseLeave={() => setOpen(false)}
+        >
+          <button
+            type="button"
+            disabled={act.busy()}
+            onClick={() => choose(null)}
+            class={`flex w-full items-center justify-between px-3 py-1.5 text-left text-[12px] transition hover:bg-bg-hover disabled:opacity-50 ${
+              !props.current ? "bg-bg-active text-fg" : "text-fg-muted"
+            }`}
+            title="Send no effort: the backend decides"
+          >
+            <span>
+              Default
+              <Show when={entry()?.defaultEffort}>
+                {(d) => <span class="text-fg-faint"> · {EFFORT_LABELS[d()]}</span>}
+              </Show>
+            </span>
+            <Show when={!props.current}>
+              <span class="text-accent">●</span>
+            </Show>
+          </button>
+          <For each={levels()}>
+            {(level) => (
+              <button
+                type="button"
+                disabled={act.busy()}
+                onClick={() => choose(level)}
+                class={`flex w-full items-center justify-between px-3 py-1.5 text-left text-[12px] transition hover:bg-bg-hover disabled:opacity-50 ${
+                  level === props.current ? "bg-bg-active text-fg" : "text-fg-muted"
+                }`}
+              >
+                <span>{EFFORT_LABELS[level]}</span>
+                <Show when={level === props.current}>
+                  <span class="text-accent">●</span>
+                </Show>
+              </button>
+            )}
+          </For>
+          <Show when={!known()}>
+            <div class="border-t border-border px-3 py-1.5 text-[10px] text-fg-faint">
+              This backend doesn't say which levels the model takes; one it refuses fails the turn with a note.
+            </div>
+          </Show>
+          <MenuError error={act.error()} />
+        </div>
+      </Show>
+    </div>
+  );
+};

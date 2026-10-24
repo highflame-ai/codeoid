@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { Box, Text, useInput } from "ink";
-import type { ProviderInfo } from "../../protocol/types.js";
+import { EFFORT_LEVELS, type EffortLevel, type ProviderInfo } from "../../protocol/types.js";
+import { EFFORT_LABELS } from "@highflame/codeoid-core";
 import type { TuiWsClient } from "../ws.js";
 import { accountChoices } from "../accounts.js";
 
@@ -11,8 +12,10 @@ export interface BackendChoice {
 }
 
 interface Props {
-  kind: "model" | "provider" | "account";
+  kind: "model" | "provider" | "account" | "effort";
   provider: string;
+  /** For the effort picker: the session's model, whose levels are offered. */
+  model?: string;
   /** Name of the session this picker changes, shown in the header. */
   sessionName?: string;
   current: string;
@@ -22,7 +25,7 @@ interface Props {
   onCancel: () => void;
 }
 
-export function BackendPicker({ kind, provider, sessionName, current, providers, client, onPick, onCancel }: Props) {
+export function BackendPicker({ kind, provider, model, sessionName, current, providers, client, onPick, onCancel }: Props) {
   const [choices, setChoices] = useState<BackendChoice[]>([]);
   const [loading, setLoading] = useState(kind !== "provider");
   const [busy, setBusy] = useState(false);
@@ -43,7 +46,14 @@ export function BackendPicker({ kind, provider, sessionName, current, providers,
     setError(null);
     const load = async () => {
       if (!client) throw new Error("Not connected");
-      if (kind === "model") {
+      if (kind === "effort") {
+        // The levels the model takes, when its backend says (#417); otherwise the whole scale.
+        const result = await client.listModels(provider);
+        if (cancelled) return;
+        const entry = result.models.find((m) => m.value === model) ?? (model ? undefined : result.models.find((m) => m.isDefault));
+        setChoices(effortChoices(entry?.efforts, entry?.defaultEffort));
+        setLive(true);
+      } else if (kind === "model") {
         const result = await client.listModels(provider);
         if (cancelled) return;
         setChoices(result.models.map((model) => ({
@@ -100,7 +110,7 @@ export function BackendPicker({ kind, provider, sessionName, current, providers,
 
   return (
     <Box flexDirection="column" borderStyle="double" borderColor="cyan" paddingX={1}>
-      <Text bold color="cyan">Select {kind}{kind !== "provider" ? ` (${provider})` : ""}{sessionName ? ` for ${sessionName}` : ""}</Text>
+      <Text bold color="cyan">Select {kind === "effort" ? "thinking effort" : kind}{kind !== "provider" ? ` (${provider})` : ""}{sessionName ? ` for ${sessionName}` : ""}</Text>
       {loading ? <Text dimColor>Loading…</Text> : options.slice(start, start + 8).map((choice, offset) => (
         // A server may list an id twice: the position keeps keys unique.
         <Box key={`${start + offset}:${choice.value}`} flexDirection="column">
@@ -121,4 +131,21 @@ export function BackendPicker({ kind, provider, sessionName, current, providers,
       <Text dimColor>{busy ? "Switching… (Esc hides this; the switch still applies)" : "↑↓ navigate · Enter to select · r refresh · Esc cancel"}</Text>
     </Box>
   );
+}
+
+/**
+ * The effort picker's rows (#417): Default (the backend decides), then the
+ * levels the model takes — or the whole scale when its backend doesn't say,
+ * marked so: a level it refuses fails the turn with a note.
+ */
+export function effortChoices(efforts: readonly EffortLevel[] | undefined, defaultEffort?: EffortLevel): BackendChoice[] {
+  const unknown = efforts === undefined;
+  return [
+    { value: "default", label: "Default", description: defaultEffort ? `the backend decides (${EFFORT_LABELS[defaultEffort]})` : "the backend decides" },
+    ...(efforts ?? EFFORT_LEVELS).map((level) => ({
+      value: level,
+      label: EFFORT_LABELS[level],
+      ...(unknown ? { description: "support unknown for this model" } : {}),
+    })),
+  ];
 }

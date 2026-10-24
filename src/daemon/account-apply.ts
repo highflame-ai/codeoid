@@ -15,7 +15,9 @@ import { spawn } from "node:child_process";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { atomicWrite } from "../config.js";
+import { createHash } from "node:crypto";
+import { atomicWrite, getConfigDir } from "../config.js";
+import type { EffortLevel } from "../protocol/types.js";
 import { AccountError, type ResolvedAccount } from "./accounts.js";
 
 // ── Overlay homes ─────────────────────────────────────────────────────────────
@@ -263,6 +265,73 @@ export function isGeminiCredentialVar(name: string): boolean {
     name.startsWith("GOOGLE_GENAI_") ||
     name === "CODE_ASSIST_ENDPOINT"
   );
+}
+
+/**
+ * The Gemini CLI's thinking effort (#417), which it takes only from its
+ * settings: a home that overlays the one it would use (an account's, or the
+ * default) — everything linked, logins and chats included — whose
+ * settings.json redefines the two aliases its chat models think through.
+ * One home per base and effort, kept under codeoid's account homes.
+ */
+export function applyGeminiCliEffort(
+  effort: EffortLevel | undefined,
+  env: Record<string, string>,
+  homesRoot: string = join(getConfigDir(), "accounts"),
+): Record<string, string> {
+  if (!effort) return env;
+  const base = env.GEMINI_CLI_HOME || defaultGeminiCliRoot();
+  const key = `${createHash("sha256").update(resolve(base)).digest("hex").slice(0, 12)}-${effort}`;
+  const home = join(homesRoot, "gemini-cli-effort", key);
+  mkdirSync(home, { recursive: true, mode: 0o700 });
+  ensureOverlayHome({
+    source: join(base, ".gemini"),
+    target: join(home, ".gemini"),
+    own: [],
+    copies: { "settings.json": (src) => geminiEffortSettings(src, effort) },
+    shared: ["tmp"],
+  });
+  return { ...env, GEMINI_CLI_HOME: home };
+}
+
+/**
+ * settings.json with the Gemini CLI's chat aliases set to a thinking effort:
+ * `chat-base-2.5` takes a token budget, `chat-base-3` a level. Each
+ * is redefined as the CLI ships it (extending `chat-base`) but for that value.
+ */
+export function geminiEffortSettings(source: string | undefined, effort: EffortLevel): string {
+  let settings: Record<string, unknown> = {};
+  try {
+    const parsed = source ? JSON.parse(source) : {};
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) settings = parsed as Record<string, unknown>;
+  } catch {
+    // An unreadable default is unreadable for the CLI too; start clean.
+  }
+  // The overlay can't know which 2.5 model runs, so its budgets are ones
+  // every 2.5 model takes: Pro can't go below 128, Flash above 24576.
+  const budgets: Record<EffortLevel, number> = { off: 128, minimal: 512, low: 2048, medium: 8192, high: 16384, xhigh: 24576, max: 24576 };
+  const level = effort === "off" || effort === "minimal" ? "MINIMAL" : effort === "low" ? "LOW" : effort === "medium" ? "MEDIUM" : "HIGH";
+  const configs = (settings.modelConfigs && typeof settings.modelConfigs === "object" ? settings.modelConfigs : {}) as Record<string, unknown>;
+  const aliases = (configs.customAliases && typeof configs.customAliases === "object" ? configs.customAliases : {}) as Record<string, unknown>;
+  const thinking = (thinkingConfig: Record<string, unknown>) => ({
+    extends: "chat-base",
+    modelConfig: { generateContentConfig: { thinkingConfig } },
+  });
+  return `${JSON.stringify(
+    {
+      ...settings,
+      modelConfigs: {
+        ...configs,
+        customAliases: {
+          ...aliases,
+          "chat-base-2.5": thinking({ thinkingBudget: budgets[effort] }),
+          "chat-base-3": thinking({ thinkingLevel: level }),
+        },
+      },
+    },
+    null,
+    2,
+  )}\n`;
 }
 
 export function applyGeminiCliAccount(account: ResolvedAccount | null, env: Record<string, string>): Record<string, string> {

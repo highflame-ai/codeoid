@@ -67,7 +67,7 @@ import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from ".
 import { type ResponsesItem, toResponsesItems } from "./native-history.js";
 import { buildCodexEnv } from "../env.js";
 import { CodexRpcProcess } from "./rpc.js";
-import type { SessionMode } from "../../../protocol/types.js";
+import { EFFORT_LEVELS, type EffortLevel, type SessionMode } from "../../../protocol/types.js";
 import { MEMORY_MCP_SERVER_NAME, MEMORY_MCP_TOKEN_ENV, type MemoryMcpMount } from "../../memory/mcp-http.js";
 import {
   BLACKBOARD_MCP_SERVER_NAME,
@@ -644,15 +644,31 @@ export class CodexProvider implements SessionProvider {
     if (!this.#proc?.alive) return [];
     try {
       const result = (await this.#proc.request("model/list", {})) as {
-        data?: Array<{ id?: string; model?: string; displayName?: string; description?: string }>;
+        data?: Array<{
+          id?: string;
+          model?: string;
+          displayName?: string;
+          description?: string;
+          supportedReasoningEfforts?: Array<{ reasoningEffort?: string }>;
+          defaultReasoningEffort?: string;
+        }>;
       };
       return (result.data ?? [])
         .filter((m) => typeof (m.model ?? m.id) === "string")
-        .map((m) => ({
-          id: (m.model ?? m.id) as string,
-          displayName: m.displayName ?? ((m.model ?? m.id) as string),
-          description: m.description,
-        }));
+        .map((m) => {
+          // The efforts it takes (#417), on codeoid's scale — codex's "none" is Off.
+          const efforts = Array.isArray(m.supportedReasoningEfforts)
+            ? m.supportedReasoningEfforts.map((e) => fromCodexEffort(e?.reasoningEffort)).filter((e): e is EffortLevel => e !== null)
+            : undefined;
+          const defaultEffort = fromCodexEffort(m.defaultReasoningEffort);
+          return {
+            id: (m.model ?? m.id) as string,
+            displayName: m.displayName ?? ((m.model ?? m.id) as string),
+            description: m.description,
+            ...(efforts ? { efforts } : {}),
+            ...(defaultEffort ? { defaultEffort } : {}),
+          };
+        });
     } catch {
       return [];
     }
@@ -697,6 +713,9 @@ export class CodexProvider implements SessionProvider {
       approvalPolicy,
       sandboxPolicy: sandboxPolicyWire(sandboxMode, opts.workdir),
       ...(opts.model ? { model: opts.model } : {}),
+      // Thinking effort (#417). codex keeps a turn's effort for the turns
+      // after it (a resumed thread too), so none is sent as null: its default.
+      effort: opts.effort ? toCodexEffort(opts.effort) : null,
     })) as { turn?: { id?: string } };
     this.#currentTurnId = result.turn?.id ?? null;
   }
@@ -816,7 +835,15 @@ export class CodexProvider implements SessionProvider {
     const models = await this.listModels();
     if (models.length > 0) {
       this.#modelsReported = true;
-      this.#onModels(models.map((m) => ({ value: m.id, displayName: m.displayName, description: m.description })));
+      this.#onModels(
+        models.map((m) => ({
+          value: m.id,
+          displayName: m.displayName,
+          description: m.description,
+          ...(m.efforts ? { efforts: m.efforts } : {}),
+          ...(m.defaultEffort ? { defaultEffort: m.defaultEffort } : {}),
+        })),
+      );
     }
   }
 
@@ -1352,4 +1379,15 @@ function codexItemToTool(
 function extractItemOutput(item: Record<string, unknown>): string {
   const out = item.aggregatedOutput ?? item.output ?? item.result ?? item.text ?? "";
   return typeof out === "string" ? out : JSON.stringify(out);
+}
+
+/** codeoid's effort scale in codex's terms (#417): Off is its "none"; the rest share names. */
+export function toCodexEffort(effort: EffortLevel): string {
+  return effort === "off" ? "none" : effort;
+}
+
+/** A codex reasoning effort on codeoid's scale, or null for one codeoid has no level for. */
+export function fromCodexEffort(effort: string | undefined): EffortLevel | null {
+  if (effort === "none") return "off";
+  return effort && (EFFORT_LEVELS as readonly string[]).includes(effort) ? (effort as EffortLevel) : null;
 }

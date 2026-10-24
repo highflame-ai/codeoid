@@ -230,6 +230,14 @@ export type Capability = (typeof CAPABILITIES)[keyof typeof CAPABILITIES];
  * `attachments` (bounded per-file, surfaced to the model as files it can
  * read selectively).
  */
+/**
+ * How hard a model thinks before it answers (#417), on one scale for every
+ * backend; each maps it to its own setting (docs/thinking-effort.md). A
+ * session with no effort set sends nothing: the backend's default applies.
+ */
+export const EFFORT_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export type EffortLevel = (typeof EFFORT_LEVELS)[number];
+
 export const LIMITS = {
   /** Max `session.send.text` length. ~1M chars ≈ hundreds of thousands of tokens. */
   SEND_TEXT_MAX: 1_000_000,
@@ -477,6 +485,8 @@ export interface SessionInfo {
   model?: string;
   /** Fallback model id used on 429/529 capacity errors. */
   fallbackModel?: string;
+  /** Thinking effort set on this session (#417); absent = the backend's default. */
+  effort?: EffortLevel;
   /**
    * Lineage for a session created via `session.fork`. Absent = not a fork.
    * Frontends surface it as a chip ("⑃ forked from <name> · turn <atTurn>")
@@ -1094,6 +1104,7 @@ export type ClientMessage =
   | SessionRotateMsg
   | SessionSearchMsg
   | SessionSetModelMsg
+  | SessionSetEffortMsg
   | SessionSetProviderMsg
   | SessionMcpReconnectMsg
   | SessionMcpRefreshMsg
@@ -1318,6 +1329,8 @@ export interface SessionCreateMsg extends BaseClientMsg {
    * absent otherwise = the provider's default.
    */
   model?: string;
+  /** Thinking effort (#417). Absent = `session.defaultEffort`, else the backend's default. */
+  effort?: EffortLevel;
   /**
    * Activate an installed SDLC pack on this session (ambient mode): inject its
    * constitution, expose its skills/subagents, and — with `packRole` — run
@@ -1818,6 +1831,28 @@ export interface SessionSetModelMsg extends BaseClientMsg {
 }
 
 /**
+ * Set how hard the session's model thinks (#417); `null` returns it to the
+ * backend's default. Kept with the session, like its model. Never cuts a
+ * running turn short: applied live where the backend can take it (Claude,
+ * Qwen, pi), otherwise from the next turn — on the Gemini CLI, whose
+ * thinking is a startup setting, by restarting its backend, which resumes
+ * the conversation. Requires `session:send`. `response.ok` data is
+ * {@link EffortChangeResult}.
+ */
+export interface SessionSetEffortMsg extends BaseClientMsg {
+  type: "session.set_effort";
+  sessionId: string;
+  effort: EffortLevel | null;
+}
+
+/** `response.ok` data for `session.set_effort`. */
+export interface EffortChangeResult {
+  effort: EffortLevel | null;
+  /** When it takes effect: now, from the next turn, or once the backend restarts (before the next turn). */
+  applies: "now" | "next-turn" | "restart";
+}
+
+/**
  * Full-text + semantic search across ALL sessions in a workspace — the
  * human-facing counterpart to Claude's `recall()` tool. Searches over
  * every user message, Claude reply, tool call, tool result, and reasoning
@@ -1993,6 +2028,14 @@ export interface ModelInfo {
    * the window per turn instead, and gemini, openai and acp not at all.
    */
   contextWindow?: number;
+  /**
+   * The thinking efforts this model takes (#417), when the backend reports
+   * them (Claude, Codex, pi). Absent = unknown: any level may be offered, and
+   * the backend decides; an empty list = the model doesn't think.
+   */
+  efforts?: EffortLevel[];
+  /** The backend's own default effort for this model, when it says. */
+  defaultEffort?: EffortLevel;
 }
 
 /**

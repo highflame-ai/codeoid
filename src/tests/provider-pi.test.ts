@@ -10,7 +10,7 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Store } from "../daemon/store.js";
-import { PiProvider } from "../daemon/providers/pi/index.js";
+import { PiProvider, piThinkingLevels } from "../daemon/providers/pi/index.js";
 import type {
   ProviderEvent,
   ToolApprovalFn,
@@ -409,5 +409,24 @@ describe("PiProvider – memory tools (#178 Phase 4)", () => {
       .map((e) => (e as { content: string }).content)
       .join("");
     expect(text).toContain('MCP:echo:{"msg":"hi"}');
+  });
+});
+
+describe("PiProvider – thinking effort (#417)", () => {
+  const said = (events: ProviderEvent[]) => (events.find((e) => e.type === "text_done") as { content: string } | undefined)?.content;
+
+  it("sets pi's thinking level per turn, live between turns, and back to pi's own for the default", async () => {
+    const p = makeProvider();
+    expect(said(await collect(p.runTurn(turnOpts("echo-thinking", { effort: "high" })).events))).toBe("thinking:high");
+    expect(await p.applyEffort("low")).toBe(true);
+    expect(said(await collect(p.runTurn(turnOpts("echo-thinking", { effort: "low" })).events))).toBe("thinking:low");
+    expect(said(await collect(p.runTurn(turnOpts("echo-thinking")).events))).toBe("thinking:medium"); // what pi started with
+    await p.teardown();
+  });
+
+  it("reports which levels each model takes, as pi-ai decides them", () => {
+    expect(piThinkingLevels({ reasoning: false })).toEqual(["off"]);
+    expect(piThinkingLevels({ reasoning: true })).toEqual(["off", "minimal", "low", "medium", "high"]);
+    expect(piThinkingLevels({ reasoning: true, thinkingLevelMap: { minimal: null, xhigh: "x", max: "m" } })).toEqual(["off", "low", "medium", "high", "xhigh", "max"]);
   });
 });

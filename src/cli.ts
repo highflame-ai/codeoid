@@ -47,7 +47,8 @@ import { ALL_SCOPES_STRING } from "./protocol/scopes.js";
 import { TerminalClient } from "./terminal/client.js";
 import { bedrockFromSettings, formatAccounts, formatClaudeAccounts, parseHeaderFlags, parseSettingFlags } from "./terminal/claude-accounts.js";
 import { formatEndpoints, importPiModels, parseModelFlags, parseTokens } from "./terminal/endpoints.js";
-import type { ClientMessage, DaemonMessage, SessionInfo } from "./protocol/types.js";
+import type { ClientMessage, DaemonMessage, EffortLevel, SessionInfo } from "./protocol/types.js";
+import { parseEffort } from "@highflame/codeoid-core";
 import { mcpConfig, mcpHeaders } from "./terminal/mcp-control-cli.js";
 import { cleartextOffHost, controlUrl, MCP_SCOPE_PRESETS, TokenError } from "./terminal/token.js";
 import { parseTargets } from "./terminal/compare.js";
@@ -988,6 +989,10 @@ program
     "Model for this session (validated against --provider). Omitted with --pack/--pack-role, the model resolves through the role's binding chain (config override → role pin → tier map).",
   )
   .option(
+    "--effort <level>",
+    "Thinking effort: off | minimal | low | medium | high | xhigh | max (default: session.defaultEffort, else the backend's own). Change it later with /effort.",
+  )
+  .option(
     "--pack <id>",
     "Activate an installed SDLC pack on the session (inject its constitution, expose its skills/subagents). With --collaborate, the collaboration ADOPTS the pack: role names bind strictly to the pack's declared roles.",
   )
@@ -1016,6 +1021,7 @@ program
         provider?: string;
         account?: string;
         model?: string;
+        effort?: string;
         pack?: string;
         packRole?: string;
         collaborate?: string;
@@ -1065,11 +1071,21 @@ program
         process.exit(1);
       }
 
+      let effort: EffortLevel | undefined;
+      if (opts.effort) {
+        try {
+          effort = parseEffort(opts.effort) ?? undefined;
+        } catch (e) {
+          console.error(`--effort: ${e instanceof Error ? e.message : String(e)}`);
+          process.exit(1);
+        }
+      }
       const client = new TerminalClient(config);
       await client.connect();
       await client.createSession(name, resolvedWorkdir, {
         providerId: opts.provider,
         model: opts.model,
+        ...(effort ? { effort } : {}),
         account: opts.account,
         pack: opts.pack,
         packRole: opts.packRole,

@@ -19,9 +19,9 @@ import {
   loadWorkspaceCommands,
   type WorkspaceCommand,
 } from "./workspace-commands.js";
-import type { Attachment, McpReconnectResult, McpRefreshResult } from "../protocol/types.js";
+import type { Attachment, EffortChangeResult, EffortLevel, McpReconnectResult, McpRefreshResult } from "../protocol/types.js";
 import { backendHasAccounts } from "../protocol/types.js";
-import { mcpRefreshSummary } from "@highflame/codeoid-core";
+import { effortChangeSummary, mcpRefreshSummary, parseEffort } from "@highflame/codeoid-core";
 import type { TuiAction } from "./types.js";
 import { parseDialogAnswer } from "../terminal/dialog.js";
 import { formatRewind, parseForkArgs, parseUndoArgs } from "../terminal/rewind.js";
@@ -1109,6 +1109,27 @@ export function App({ config, createClient = (c, d) => new TuiWsClient(c, d) }: 
         });
         return;
       }
+      case "/effort": {
+        // Thinking effort (#417): bare opens the picker, else a level or "default".
+        if (!focusedSession || !client) {
+          dispatch({ type: "error", message: !focusedSession ? "No session focused" : "Not connected" });
+          return;
+        }
+        const sessionId = focusedSession.info.id;
+        if (args.length === 0) {
+          dispatch({ type: "modal.open", modal: { kind: "effort", sessionId } });
+          return;
+        }
+        let effort: EffortLevel | null;
+        try {
+          effort = parseEffort(args[0]!);
+        } catch (e) {
+          dispatch({ type: "error", message: `Usage: ${e instanceof Error ? e.message : String(e)}` });
+          return;
+        }
+        void onSetEffort(sessionId, effort).catch((cause: unknown) => dispatch({ type: "error", message: cause instanceof Error ? cause.message : String(cause) }));
+        return;
+      }
       case "/model":
       case "/provider":
       case "/account": {
@@ -1251,6 +1272,14 @@ export function App({ config, createClient = (c, d) => new TuiWsClient(c, d) }: 
     }
   };
 
+  const onSetEffort = async (sessionId: string, effort: EffortLevel | null): Promise<void> => {
+    const client = wsRef.current;
+    if (!client) throw new Error("Not connected");
+    const resp = await client.setEffort(sessionId, effort);
+    if (resp.type === "response.error") throw new Error(resp.error);
+    if (resp.type === "response.ok") printLocalInfo(sessionId, effortChangeSummary(resp.data as EffortChangeResult));
+  };
+
   const onSetProvider = async (sessionId: string, providerId: string): Promise<void> => {
     const client = wsRef.current;
     if (!client) throw new Error("Not connected");
@@ -1354,6 +1383,7 @@ export function App({ config, createClient = (c, d) => new TuiWsClient(c, d) }: 
           onCancel={onCancelModal}
           onSearch={onSearch}
           onSetModel={onSetModel}
+          onSetEffort={onSetEffort}
           onSetProvider={onSetProvider}
           onSetAccount={onSetAccount}
         />

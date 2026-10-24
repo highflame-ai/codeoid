@@ -34,7 +34,7 @@ import type {
   TurnRun,
   UiRequestFn,
 } from "../interface.js";
-import type { ProviderCommand } from "../../../protocol/types.js";
+import { EFFORT_LEVELS, type EffortLevel, type ProviderCommand } from "../../../protocol/types.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
 import { buildPiEnv } from "../env.js";
 import {
@@ -123,6 +123,9 @@ export class PiProvider implements SessionProvider {
   #bridgeReady = false;
   #hasQueried = false;
   #model: string | null = null;
+  /** pi's thinking level now, and the one it started with — "default" returns to it (#417). */
+  #thinkingLevel: string | null = null;
+  #startThinkingLevel: string | null = null;
   /** Rendered transcript from seedFromHistory() — prepended to the next prompt. */
   #pendingHistorySeed: string | null = null;
 
@@ -293,6 +296,9 @@ export class PiProvider implements SessionProvider {
     if (opts.model && opts.model !== this.#model) {
       await this.#setModel(opts.model);
     }
+    // Thinking effort (#417): pi's levels are codeoid's; none = what pi started with.
+    const level = opts.effort ?? this.#startThinkingLevel;
+    if (level && level !== this.#thinkingLevel) await this.#setThinkingLevel(level);
 
     let message = opts.userMessage;
     if (this.#pendingHistorySeed) {
@@ -315,6 +321,7 @@ export class PiProvider implements SessionProvider {
     }
 
     this.#bridgeReady = false;
+    this.#thinkingLevel = null; // a new pi reports its own (get_state, below)
     this.#proc = new PiRpcProcess({
       command: this.#command,
       argsPrefix: this.#argsPrefix,
@@ -353,7 +360,11 @@ export class PiProvider implements SessionProvider {
     }
 
     const state = await this.#proc.request({ type: "get_state" });
-    const data = state.data as { sessionFile?: string; sessionId?: string } | undefined;
+    const data = state.data as { sessionFile?: string; sessionId?: string; thinkingLevel?: string } | undefined;
+    if (typeof data?.thinkingLevel === "string") {
+      this.#startThinkingLevel ??= data.thinkingLevel;
+      this.#thinkingLevel ??= data.thinkingLevel;
+    }
     const file = data?.sessionFile;
     if (typeof file === "string" && file.length > 0 && file !== this.#backingSessionId) {
       this.#backingSessionId = file;
@@ -396,7 +407,7 @@ export class PiProvider implements SessionProvider {
     if (!Array.isArray(data?.models)) return [];
     return data.models
       .filter(
-        (m): m is { id: string; provider: string; name?: string; contextWindow?: unknown } =>
+        (m): m is { id: string; provider: string; name?: string; contextWindow?: unknown; reasoning?: unknown; thinkingLevelMap?: unknown } =>
           !!m &&
           typeof m === "object" &&
           typeof (m as { id?: unknown }).id === "string" &&
@@ -407,7 +418,22 @@ export class PiProvider implements SessionProvider {
         displayName: typeof m.name === "string" ? m.name : m.id,
         // pi's catalog entries are full pi-ai Model objects, window included.
         ...(typeof m.contextWindow === "number" && m.contextWindow > 0 ? { contextWindow: m.contextWindow } : {}),
+        efforts: piThinkingLevels(m),
       }));
+  }
+
+  /** A new thinking effort on the running pi, live (#417): it takes the next request at that level. */
+  async applyEffort(effort: EffortLevel | null): Promise<boolean> {
+    const level = effort ?? this.#startThinkingLevel;
+    if (!this.#proc || !level) return false;
+    if (level !== this.#thinkingLevel) await this.#setThinkingLevel(level);
+    return true;
+  }
+
+  async #setThinkingLevel(level: string): Promise<void> {
+    const resp = await this.#proc!.request({ type: "set_thinking_level", level });
+    if (resp.success === false) throw new Error(`pi could not set thinking level "${level}": ${String(resp.error ?? "")}`);
+    this.#thinkingLevel = level;
   }
 
   async #setModel(model: string): Promise<void> {
@@ -776,4 +802,20 @@ export class PiProvider implements SessionProvider {
       this.#proc?.send({ type: "extension_ui_response", id, value: response.value ?? "" });
     }
   }
+}
+
+/**
+ * The thinking levels a pi model takes (#417), as pi-ai's
+ * getSupportedThinkingLevels decides them: Off alone for a model that doesn't
+ * reason; otherwise every level but one its map marks unsupported (null), and
+ * XHigh / Max only where the map names them.
+ */
+export function piThinkingLevels(m: { reasoning?: unknown; thinkingLevelMap?: unknown }): EffortLevel[] {
+  if (m.reasoning !== true) return ["off"];
+  const map = (m.thinkingLevelMap && typeof m.thinkingLevelMap === "object" ? m.thinkingLevelMap : {}) as Record<string, unknown>;
+  return EFFORT_LEVELS.filter((level) => {
+    const mapped = map[level];
+    if (mapped === null) return false;
+    return level === "xhigh" || level === "max" ? mapped !== undefined : true;
+  });
 }

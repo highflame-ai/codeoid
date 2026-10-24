@@ -8,7 +8,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { Box, Text, useInput } from "ink";
 import TextInput from "ink-text-input";
 import type { ModalState, TuiSession } from "../types.js";
-import type { ProviderInfo, SessionSearchHit } from "../../protocol/types.js";
+import type { EffortLevel, ProviderInfo, SessionSearchHit } from "../../protocol/types.js";
 import type { TuiWsClient } from "../ws.js";
 import { BackendPicker } from "./BackendPicker.js";
 import { NewSessionModal, type NewSessionOptions } from "./NewSessionModal.js";
@@ -37,6 +37,7 @@ interface Props {
   onSearch?: (query: string, scope: SearchScope) => Promise<SessionSearchHit[]>;
   /** Set a session's model. */
   onSetModel?: (sessionId: string, model: string) => Promise<void>;
+  onSetEffort?: (sessionId: string, effort: EffortLevel | null) => Promise<void>;
 }
 
 export function Modal(props: Props) {
@@ -81,6 +82,7 @@ export function Modal(props: Props) {
       );
     case "model":
     case "provider":
+    case "effort":
     case "account": {
       // The session the picker was opened for, not whichever is focused now.
       const { kind, sessionId } = props.modal;
@@ -100,15 +102,25 @@ export function Modal(props: Props) {
           // provider picker must not remount on it: the daemon's info update
           // arrives before the switch's reply, and a remount would drop the
           // close that follows a successful pick.
-          key={kind === "model" ? `${kind}:${provider}` : kind}
+          key={kind === "model" || kind === "effort" ? `${kind}:${provider}` : kind}
           kind={kind}
           provider={provider}
+          model={target.info.model}
           sessionName={target.info.name}
           providers={props.providers}
           client={props.client}
-          current={kind === "model" ? target.info.model ?? "" : kind === "provider" ? provider : target.info.account ?? (provider === "claude" ? target.info.claudeAccount : undefined) ?? ""}
+          current={
+            kind === "model"
+              ? (target.info.model ?? "")
+              : kind === "effort"
+                ? (target.info.effort ?? "default")
+                : kind === "provider"
+                  ? provider
+                  : (target.info.account ?? (provider === "claude" ? target.info.claudeAccount : undefined) ?? "")
+          }
           onPick={async (value) => {
             if (kind === "model") await props.onSetModel?.(sessionId, value);
+            else if (kind === "effort") await props.onSetEffort?.(sessionId, value === "default" ? null : (value as EffortLevel));
             else if (kind === "provider") await props.onSetProvider(sessionId, value);
             else await props.onSetAccount(sessionId, value, provider);
           }}

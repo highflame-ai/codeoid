@@ -37,6 +37,8 @@ const pendingServerReqs = new Map<number, (result: Record<string, unknown>) => v
  *  the "echo-policy" prompt so the provider's wire params can be asserted. */
 let lastThreadPolicies: Record<string, unknown> = {};
 let lastTurnPolicies: Record<string, unknown> = {};
+/** turn/start's `effort` (#417), echoed by "echo-effort". */
+let lastTurnEffort: unknown = "(absent)";
 /** thread/fork and thread/inject_items calls, in order — echoed by "echo-native" (#387). */
 const nativeCalls: Array<{ method: string; params: Record<string, unknown> }> = [];
 
@@ -310,6 +312,8 @@ async function runTurn(threadId: string, prompt: string): Promise<void> {
     const resp = await serverRequest("custom/unknownThing", { anything: true });
     const text = resp.__error ? "server-request-errored" : "server-request-oddly-ok";
     send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text } } });
+  } else if (prompt.includes("echo-effort")) {
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: JSON.stringify({ effort: lastTurnEffort }) } } });
   } else if (prompt.includes("echo-policy")) {
     const text = JSON.stringify({ thread: lastThreadPolicies, turn: lastTurnPolicies });
     send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text } } });
@@ -421,7 +425,14 @@ async function handle(frame: Record<string, unknown>): Promise<void> {
         id,
         result: {
           data: [
-            { id: "gpt-5.6-terra", model: "gpt-5.6-terra", displayName: "GPT-5.6-Terra", description: "Balanced agentic coding model." },
+            {
+              id: "gpt-5.6-terra",
+              model: "gpt-5.6-terra",
+              displayName: "GPT-5.6-Terra",
+              description: "Balanced agentic coding model.",
+              supportedReasoningEfforts: [{ reasoningEffort: "none" }, { reasoningEffort: "low" }, { reasoningEffort: "high" }, { reasoningEffort: "ultra" }],
+              defaultReasoningEffort: "low",
+            },
           ],
         },
       });
@@ -430,6 +441,7 @@ async function handle(frame: Record<string, unknown>): Promise<void> {
       const bad = sandboxPolicyError(params.sandboxPolicy);
       if (bad) return void send({ id, error: { code: -32602, message: bad } });
       lastTurnPolicies = { approvalPolicy: params.approvalPolicy, sandboxPolicy: params.sandboxPolicy };
+      lastTurnEffort = "effort" in params ? params.effort : "(absent)";
       send({ id, result: { turn: { id: "turn-1" } } });
       const input = params.input as Array<{ type: string; text?: string }> | undefined;
       const prompt = input?.find((i) => i.type === "text")?.text ?? "";

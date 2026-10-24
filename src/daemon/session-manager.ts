@@ -1235,6 +1235,8 @@ mcpHub: this.#mcpHub,
         return this.#search(msg, auth);
       case "session.set_model":
         return this.#setModel(msg, auth);
+      case "session.set_effort":
+        return this.#setEffort(msg, auth);
       case "session.set_provider":
         return this.#setProvider(msg, auth);
       case "session.mcp_reconnect":
@@ -1810,6 +1812,8 @@ mcpHub: this.#mcpHub,
       displayName: m.displayName,
       ...(m.description ? { description: m.description } : {}),
       ...(m.contextWindow !== undefined ? { contextWindow: m.contextWindow } : {}),
+      ...(m.efforts ? { efforts: m.efforts } : {}),
+      ...(m.defaultEffort ? { defaultEffort: m.defaultEffort } : {}),
       isDefault: m.value === "default",
     }));
     const previous = this.#modelsCache.get(providerId);
@@ -4030,6 +4034,7 @@ mcpHub: this.#mcpHub,
       // Explicit `model`, or the pack role's resolved binding (§6.2). Outranks
       // config.session.defaultModel; still loses to a persisted choice.
       defaultModel,
+      ...(msg.effort ? { effort: msg.effort } : {}),
       pack,
       collaboration,
       identityManager: this.#identityManager,
@@ -7598,6 +7603,17 @@ mcpHub: this.#mcpHub,
    * model). Returns `response.ok` with the resolved model in `data` on
    * success; rejects with a 400 when the model id is unknown.
    */
+  /** Set the session's thinking effort (#417). `session:send` on the caller's own session, as for its model. */
+  async #setEffort(msg: Extract<ClientMessage, { type: "session.set_effort" }>, auth: AuthContext): Promise<DaemonMessage> {
+    if (!hasScope(auth.scopes as string[], SCOPES.SESSION_SEND)) {
+      return { type: "response.error", requestId: msg.id, error: "Missing scope: session:send", code: "forbidden" };
+    }
+    const session = this.#getOwnedSession(msg.sessionId, auth);
+    if (!session) return { type: "response.error", requestId: msg.id, error: "Session not found", code: "not_found" };
+    const data = await session.setEffort(msg.effort, auth);
+    return { type: "response.ok", requestId: msg.id, data };
+  }
+
   async #setModel(
     msg: Extract<ClientMessage, { type: "session.set_model" }>,
     auth: AuthContext,
