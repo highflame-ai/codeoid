@@ -1329,8 +1329,8 @@ export interface SessionCreateMsg extends BaseClientMsg {
    * absent otherwise = the provider's default.
    */
   model?: string;
-  /** Thinking effort (#417). Absent = `session.defaultEffort`, else the backend's default. */
-  effort?: EffortLevel;
+  /** Thinking effort (#417). Absent = `session.defaultEffort`, else the backend's default; null = the backend's default. */
+  effort?: EffortLevel | null;
   /**
    * Activate an installed SDLC pack on this session (ambient mode): inject its
    * constitution, expose its skills/subagents, and — with `packRole` — run

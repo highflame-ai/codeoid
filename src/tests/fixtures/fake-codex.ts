@@ -422,7 +422,14 @@ async function handle(frame: Record<string, unknown>): Promise<void> {
       break;
     case "config/read":
       // The user's configured effort (#417), set by the test through the env.
-      send({ id, result: { config: { model_reasoning_effort: process.env.CODEX_FAKE_CONFIG_EFFORT || null }, origins: {}, layers: null } });
+      send({
+        id,
+        result: {
+          config: { model_reasoning_effort: process.env.CODEX_FAKE_CONFIG_EFFORT || null, model: process.env.CODEX_FAKE_CONFIG_MODEL || null },
+          origins: {},
+          layers: null,
+        },
+      });
       break;
     case "model/list":
       send({

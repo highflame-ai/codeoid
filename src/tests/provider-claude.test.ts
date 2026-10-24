@@ -2670,11 +2670,13 @@ describe("thinking effort", () => {
     for await (const e of first.events) if (e.type === "turn_done") break;
     expect(await provider.applyEffort("max")).toBe(true);
     expect(flagSettings).toEqual([{ effortLevel: "max" }]);
-    expect(await provider.applyEffort(null)).toBe(true); // back to the model's default
-    expect(flagSettings.at(-1)).toEqual({ effortLevel: null });
+    // Back to the default isn't live: the SDK's live "no level" is the model's
+    // default, not the user's own Claude settings a fresh query reads.
+    expect(await provider.applyEffort(null)).toBe(false);
     expect(await provider.applyEffort("off")).toBe(false); // fixed at construction
+    expect(flagSettings).toEqual([{ effortLevel: "max" }]);
     // An effort the live query already runs at doesn't rebuild it...
-    void turn(provider);
+    void turn(provider, "max");
     for (let i = 0; i < 20; i++) await Promise.resolve();
     expect(queryCallCount).toBe(1);
     // ...Off does: a fresh query, with thinking disabled.

@@ -1814,7 +1814,7 @@ mcpHub: this.#mcpHub,
       ...(m.contextWindow !== undefined ? { contextWindow: m.contextWindow } : {}),
       ...(m.efforts ? { efforts: m.efforts } : {}),
       ...(m.defaultEffort ? { defaultEffort: m.defaultEffort } : {}),
-      isDefault: m.value === "default",
+      isDefault: m.isDefault === true || m.value === "default",
     }));
     const previous = this.#modelsCache.get(providerId);
     if (previous && JSON.stringify(previous) === JSON.stringify(models)) return;
@@ -4034,7 +4034,7 @@ mcpHub: this.#mcpHub,
       // Explicit `model`, or the pack role's resolved binding (§6.2). Outranks
       // config.session.defaultModel; still loses to a persisted choice.
       defaultModel,
-      ...(msg.effort ? { effort: msg.effort } : {}),
+      ...(msg.effort !== undefined ? { effort: msg.effort } : {}),
       pack,
       collaboration,
       identityManager: this.#identityManager,

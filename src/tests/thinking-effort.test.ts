@@ -288,6 +288,14 @@ describe("a session's thinking effort", () => {
     expect(await setEffort(m, sid, "low")).toMatchObject({ data: { applies: "restart" } });
   });
 
+  it("created at Default explicitly, a session takes the backend's default, not the config's", async () => {
+    const { m } = manager(() => new MockSessionProvider("claude", []), "claude", "max");
+    mkdirSync(join(tmp, "work"), { recursive: true });
+    const r = (await m.handle({ type: "session.create", id: "c", name: "d", workdir: join(tmp, "work"), effort: null }, auth(), client)) as { data: { id: string } };
+    expect(m._sessionForTest(r.data.id)!.toInfo().effort).toBeUndefined();
+    expect(parseClientMessage({ type: "session.create", id: "c", name: "d", workdir: "/w", effort: null }).ok).toBe(true);
+  });
+
   it("a fork of a session at Default stays at Default, whatever the config default", async () => {
     const { m } = manager(() => new MockSessionProvider("claude", []), "claude", "high");
     const sid = await create(m);

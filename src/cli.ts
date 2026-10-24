@@ -1071,10 +1071,10 @@ program
         process.exit(1);
       }
 
-      let effort: EffortLevel | undefined;
+      let effort: EffortLevel | null | undefined;
       if (opts.effort) {
         try {
-          effort = parseEffort(opts.effort) ?? undefined;
+          effort = parseEffort(opts.effort); // "default" = the backend's own, not session.defaultEffort
         } catch (e) {
           console.error(`--effort: ${e instanceof Error ? e.message : String(e)}`);
           process.exit(1);
@@ -1085,7 +1085,7 @@ program
       await client.createSession(name, resolvedWorkdir, {
         providerId: opts.provider,
         model: opts.model,
-        ...(effort ? { effort } : {}),
+        ...(effort !== undefined ? { effort } : {}),
         account: opts.account,
         pack: opts.pack,
         packRole: opts.packRole,

@@ -356,7 +356,7 @@ export function defaultPiAgentDir(env: Record<string, string | undefined> = proc
 }
 
 /** pi's agent dir, as pi reads PI_CODING_AGENT_DIR (a leading ~ is home). */
-function piAgentDirOf(env: Record<string, string | undefined>): string {
+export function piAgentDirOf(env: Record<string, string | undefined>): string {
   const dir = env.PI_CODING_AGENT_DIR || defaultPiAgentDir(env);
   return dir === "~" || dir.startsWith("~/") ? join(env.HOME || homedir(), dir.slice(1)) : dir;
 }

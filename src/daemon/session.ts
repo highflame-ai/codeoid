@@ -916,7 +916,7 @@ export class Session {
   #fallbackModel: string | null = null;
   /** Thinking effort (#417), on codeoid's scale; null = the backend's default. Kept across a backend switch. */
   #effort: EffortLevel | null = null;
-  /** A backend whose effort is a startup setting (the Gemini CLI) is rebuilt before the next turn. */
+  /** A backend whose effort is a startup setting (the Gemini CLI) is rebuilt between turns, once no work is running. */
   #effortRestartPending = false;
 
   // ── Auto-rotation (Layer D) ────────────────────────────────────────────
@@ -5066,8 +5066,8 @@ export class Session {
    * Set how hard the model thinks (#417); null = the backend's default. Kept
    * with the session. Never cuts a running turn short: applied live where
    * the backend can take it, otherwise from the next turn's options — or, on
-   * a backend that takes it only at startup, by rebuilding it before the next
-   * turn (it resumes the conversation).
+   * a backend that takes it only at startup, by rebuilding it between turns
+   * once no work is running (it resumes the conversation).
    */
   async setEffort(effort: EffortLevel | null, sender: AuthContext): Promise<EffortChangeResult> {
     const prev = this.#effort;

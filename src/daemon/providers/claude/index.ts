@@ -47,7 +47,7 @@ import { FLEET_TOOL_NAMES } from "../../fleet.js";
 import { rewriteBashToolInput } from "../../compress/index.js";
 import { type CodeoidConfig, getConfigDir } from "../../../config.js";
 import { secretPathVerdict } from "../../secret-paths.js";
-import type { AuthContext, EffortLevel } from "../../../protocol/types.js";
+import { type AuthContext, EFFORT_LEVELS, type EffortLevel } from "../../../protocol/types.js";
 import type {
   BackendMcpServerState,
   SessionProvider,
@@ -625,16 +625,18 @@ export class ClaudeProvider implements SessionProvider {
 
   /**
    * A new thinking effort on the running query, live (#417) — except to or
-   * from Off, which the SDK fixes when the query is built: that one rebuilds
-   * the query before the next turn (it resumes the same conversation).
+   * from Off, which the SDK fixes when the query is built, and back to the
+   * default: the SDK's live "no level" is the model's default, not the user's
+   * own Claude settings, which only a fresh query reads. Those rebuild the
+   * query before the next turn (it resumes the same conversation).
    */
   async applyEffort(effort: EffortLevel | null): Promise<boolean> {
     const query$ = this.#query;
-    if (!query$ || !this.#consumerTask || effort === "off" || this.#builtEffort === "off") return false;
-    await query$.applyFlagSettings({ effortLevel: effort ? claudeEffort(effort) : null });
-    this.#builtEffort = effort ?? "";
+    if (!query$ || !this.#consumerTask || effort === null || effort === "off" || this.#builtEffort === "off") return false;
+    await query$.applyFlagSettings({ effortLevel: claudeEffort(effort) });
+    this.#builtEffort = effort;
     // A retry or recovery later in this turn rebuilds from these: at the new effort.
-    if (this.#lastTurnOpts) this.#lastTurnOpts = { ...this.#lastTurnOpts, effort: effort ?? undefined };
+    if (this.#lastTurnOpts) this.#lastTurnOpts = { ...this.#lastTurnOpts, effort };
     return true;
   }
 
@@ -2260,12 +2262,12 @@ export function claudeCatalogEntry(m: {
   displayName: string;
   description?: string;
   supportsEffort?: boolean;
-  supportedEffortLevels?: ("low" | "medium" | "high" | "xhigh" | "max")[];
+  supportedEffortLevels?: string[];
 }): CatalogEntry {
   // Off (thinking disabled) is always there; the levels are the model's own.
   // A model that doesn't say which levels it takes leaves them unknown.
-  const efforts: EffortLevel[] | undefined =
-    m.supportsEffort === false ? ["off"] : m.supportedEffortLevels ? ["off", ...m.supportedEffortLevels] : undefined;
+  const levels = m.supportedEffortLevels?.filter((l): l is EffortLevel => (EFFORT_LEVELS as readonly string[]).includes(l));
+  const efforts: EffortLevel[] | undefined = m.supportsEffort === false ? ["off"] : levels ? ["off", ...levels] : undefined;
   return {
     value: m.value,
     displayName: m.displayName,

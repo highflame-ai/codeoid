@@ -661,6 +661,7 @@ export class CodexProvider implements SessionProvider {
           description?: string;
           supportedReasoningEfforts?: Array<{ reasoningEffort?: string }>;
           defaultReasoningEffort?: string;
+          isDefault?: boolean;
         }>;
       };
       // Each model's own default effort — what Default falls back to (#417).
@@ -682,6 +683,7 @@ export class CodexProvider implements SessionProvider {
             description: m.description,
             ...(efforts ? { efforts } : {}),
             ...(defaultEffort ? { defaultEffort } : {}),
+            ...(m.isDefault === true ? { isDefault: true } : {}),
           };
         });
     } catch {
@@ -878,7 +880,17 @@ export class CodexProvider implements SessionProvider {
 
   async #reportModelsOnce(): Promise<void> {
     if (this.#modelsReported || !this.#onModels) return;
-    const models = await this.listModels();
+    const listed = await this.listModels();
+    // The model codex runs when none is chosen (#417): the user's configured
+    // one, else its catalog's default — so a picker shows that model's levels.
+    let configured: string | null = null;
+    try {
+      const read = (await this.#proc!.request("config/read", {})) as { config?: { model?: string | null } };
+      configured = read.config?.model ?? null;
+    } catch {
+      // Unknown: the catalog's own default stands.
+    }
+    const models = configured && listed.some((m) => m.id === configured) ? listed.map((m) => ({ ...m, isDefault: m.id === configured })) : listed;
     if (models.length > 0) {
       this.#modelsReported = true;
       this.#onModels(
@@ -888,6 +900,7 @@ export class CodexProvider implements SessionProvider {
           description: m.description,
           ...(m.efforts ? { efforts: m.efforts } : {}),
           ...(m.defaultEffort ? { defaultEffort: m.defaultEffort } : {}),
+          ...(m.isDefault ? { isDefault: true } : {}),
         })),
       );
     }

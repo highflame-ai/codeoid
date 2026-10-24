@@ -1335,3 +1335,27 @@ describe("CodexProvider – thinking effort (#417)", () => {
     expect(models[0]).toMatchObject({ efforts: ["off", "low", "high"], defaultEffort: "low" });
   });
 });
+
+describe("CodexProvider – the model it runs unasked (#417)", () => {
+  it("marks the user's configured model as the default in the catalog it reports, so a picker shows its levels", async () => {
+    const saved = process.env.CODEX_FAKE_CONFIG_MODEL;
+    process.env.CODEX_FAKE_CONFIG_MODEL = "gpt-5.6-terra";
+    const reported: Array<{ value: string; isDefault?: boolean }> = [];
+    try {
+      const p = new CodexProvider({
+        sessionId: "sess-d",
+        initialBackingId: "sess-d",
+        command: process.execPath,
+        argsPrefix: [FIXTURE],
+        store: {} as Store,
+        onModels: (models) => reported.push(...models.map((m) => ({ value: m.value, ...(m.isDefault ? { isDefault: true } : {}) }))),
+      });
+      await collect(p.runTurn(turnOpts("hello")));
+      await p.teardown();
+    } finally {
+      if (saved === undefined) delete process.env.CODEX_FAKE_CONFIG_MODEL;
+      else process.env.CODEX_FAKE_CONFIG_MODEL = saved;
+    }
+    expect(reported).toEqual([{ value: "gpt-5.6-terra", isDefault: true }]);
+  });
+});

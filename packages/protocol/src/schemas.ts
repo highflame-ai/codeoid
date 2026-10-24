@@ -128,7 +128,7 @@ export const sessionCreateSchema = z.object({
    */
   model: z.string().min(1).max(LIMITS.MODEL_MAX).optional(),
   /** Thinking effort (#417). */
-  effort: z.enum(EFFORT_LEVELS).optional(),
+  effort: z.enum(EFFORT_LEVELS).nullable().optional(),
   /**
    * Activate an installed SDLC pack on this session (ambient mode —
    * docs/pack-loading.md): its constitution is injected into the system

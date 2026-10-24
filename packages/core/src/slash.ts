@@ -456,6 +456,6 @@ export function parseEffort(arg: string): EffortLevel | null {
 export function effortChangeSummary(r: EffortChangeResult): string {
   const what = r.effort ? EFFORT_LABELS[r.effort] : "the backend's default";
   if (r.applies === "now") return `Thinking effort: ${what}.`;
-  if (r.applies === "restart") return `Thinking effort: ${what} — the backend restarts with it before your next message.`;
+  if (r.applies === "restart") return `Thinking effort: ${what} — the backend restarts with it between turns, once no work is running.`;
   return `Thinking effort: ${what}, from the next turn.`;
 }
