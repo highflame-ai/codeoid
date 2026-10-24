@@ -12,7 +12,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseClientMessage } from "@highflame/codeoid-protocol/schemas";
 import type { CodeoidConfig } from "../config.js";
-import { applyGeminiCliEffort, geminiEffortSettings } from "../daemon/account-apply.js";
+import { applyGeminiCliEffort, applyPiSettingsOverlay, geminiEffortSettings, piDefaultThinkingLevel } from "../daemon/account-apply.js";
+import { AccountStore } from "../daemon/accounts.js";
 import { geminiThinkingConfig } from "../daemon/providers/gemini/index.js";
 import { llamaCppEffortParams } from "../daemon/providers/llamacpp/index.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
@@ -93,6 +94,47 @@ describe("each backend's reading of the scale", () => {
     // One home per effort; no effort, no overlay.
     expect(applyGeminiCliEffort("low", { GEMINI_CLI_HOME: base }, homes).GEMINI_CLI_HOME).not.toBe(home);
     expect(applyGeminiCliEffort(undefined, { GEMINI_CLI_HOME: base }, homes)).toEqual({ GEMINI_CLI_HOME: base });
+  });
+});
+
+describe("pi's settings overlay", () => {
+  it("links the user's logins — made if missing, as pi would — and copies only settings.json; locks never linked", () => {
+    const base = join(tmp, "pi");
+    mkdirSync(join(base, "auth.json.lock"), { recursive: true }); // another pi holds the lock right now
+    writeFileSync(join(base, "settings.json"), JSON.stringify({ defaultThinkingLevel: "high" }));
+    const homes = join(tmp, "homes");
+    const home = applyPiSettingsOverlay({ PI_CODING_AGENT_DIR: base }, homes).PI_CODING_AGENT_DIR!;
+    expect(readlinkSync(join(home, "auth.json"))).toBe(join(base, "auth.json")); // made in the base, then linked
+    expect(lstatSync(join(home, "settings.json")).isSymbolicLink()).toBe(false);
+    expect(() => lstatSync(join(home, "auth.json.lock"))).toThrow();
+    expect(piDefaultThinkingLevel({ PI_CODING_AGENT_DIR: base })).toBe("high");
+    // An overlay that took an empty auth.json of its own before gets the user's linked instead.
+    rmSync(join(home, "auth.json"));
+    writeFileSync(join(home, "auth.json"), "{}");
+    applyPiSettingsOverlay({ PI_CODING_AGENT_DIR: base }, homes);
+    expect(lstatSync(join(home, "auth.json")).isSymbolicLink()).toBe(true);
+  });
+
+  it("reads a ~ path as pi does", () => {
+    mkdirSync(join(tmp, "h", "x"), { recursive: true });
+    writeFileSync(join(tmp, "h", "x", "settings.json"), JSON.stringify({ defaultThinkingLevel: "minimal" }));
+    expect(piDefaultThinkingLevel({ PI_CODING_AGENT_DIR: "~/x", HOME: join(tmp, "h") })).toBe("minimal");
+    expect(piDefaultThinkingLevel({ PI_CODING_AGENT_DIR: join(tmp, "none") })).toBe("medium");
+  });
+
+  it("an account's overlays go with the account", () => {
+    const homes = join(tmp, "homes");
+    const accounts = new AccountStore({ path: join(tmp, "accounts.json"), homesRoot: homes, legacyClaudePath: null });
+    accounts.upsert({ backend: "pi", name: "work", kind: "api-keys", env: { OPENAI_API_KEY: "sk-test" } } as never);
+    const home = accounts.homeOf("pi", "work");
+    mkdirSync(home, { recursive: true });
+    const piOverlay = applyPiSettingsOverlay({ PI_CODING_AGENT_DIR: home }, homes).PI_CODING_AGENT_DIR!;
+    mkdirSync(join(home, ".gemini"), { recursive: true });
+    const geminiOverlay = applyGeminiCliEffort("high", { GEMINI_CLI_HOME: home }, homes).GEMINI_CLI_HOME!;
+    accounts.setDefault("pi", "default"); // a backend's default can't be removed
+    expect(accounts.remove("pi", "work")).toBe(true);
+    expect(() => lstatSync(piOverlay)).toThrow();
+    expect(() => lstatSync(geminiOverlay)).toThrow();
   });
 });
 

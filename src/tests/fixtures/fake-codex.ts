@@ -394,7 +394,7 @@ async function handle(frame: Record<string, unknown>): Promise<void> {
       const bad = sandboxPolicyError(params.sandboxPolicy);
       if (bad) return void send({ id, error: { code: -32602, message: bad } });
       lastThreadPolicies = { approvalPolicy: params.approvalPolicy, sandboxPolicy: params.sandboxPolicy };
-      send({ id, result: { thread: { id: "codex-thread-1" } } });
+      send({ id, result: { thread: { id: "codex-thread-1" }, model: "gpt-5.6-terra" } });
       send({ method: "thread/started", params: { thread: { id: "codex-thread-1" } } });
       break;
     }
@@ -420,6 +420,10 @@ async function handle(frame: Record<string, unknown>): Promise<void> {
       }
       send({ id, result: { thread: { id: String(params.threadId ?? "codex-thread-1") } } });
       break;
+    case "config/read":
+      // The user's configured effort (#417), set by the test through the env.
+      send({ id, result: { config: { model_reasoning_effort: process.env.CODEX_FAKE_CONFIG_EFFORT || null }, origins: {}, layers: null } });
+      break;
     case "model/list":
       send({
         id,
@@ -432,7 +436,6 @@ async function handle(frame: Record<string, unknown>): Promise<void> {
               description: "Balanced agentic coding model.",
               supportedReasoningEfforts: [{ reasoningEffort: "none" }, { reasoningEffort: "low" }, { reasoningEffort: "high" }, { reasoningEffort: "ultra" }],
               defaultReasoningEffort: "low",
-              isDefault: true,
             },
           ],
         },

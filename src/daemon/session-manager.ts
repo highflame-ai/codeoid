@@ -1814,7 +1814,7 @@ mcpHub: this.#mcpHub,
       ...(m.contextWindow !== undefined ? { contextWindow: m.contextWindow } : {}),
       ...(m.efforts ? { efforts: m.efforts } : {}),
       ...(m.defaultEffort ? { defaultEffort: m.defaultEffort } : {}),
-      isDefault: m.isDefault === true || m.value === "default",
+      isDefault: m.value === "default",
     }));
     const previous = this.#modelsCache.get(providerId);
     if (previous && JSON.stringify(previous) === JSON.stringify(models)) return;

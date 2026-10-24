@@ -259,6 +259,8 @@ function handle(cmd: Record<string, unknown>): void {
       });
       return;
     case "set_model":
+      // pi re-applies its own level on a model change (clamped, or its default).
+      thinkingLevel = "medium";
       respond(cmd.id, "set_model", { data: {} });
       return;
     case "set_thinking_level": {

@@ -459,3 +459,13 @@ describe("PiProvider – thinking effort stays in the session (#417)", () => {
     expect(lstatSync(join(overlayRoot, overlay!, "settings.json")).isSymbolicLink()).toBe(false);
   });
 });
+
+describe("PiProvider – thinking effort across a model change (#417)", () => {
+  it("sends the level again after a model change, which re-applies pi's own", async () => {
+    const p = makeProvider();
+    await collect(p.runTurn(turnOpts("echo-thinking", { effort: "xhigh" })).events);
+    const after = await collect(p.runTurn(turnOpts("echo-thinking", { effort: "xhigh", model: "openai/gpt-5" })).events);
+    expect(after.find((e) => e.type === "text_done")).toMatchObject({ content: "thinking:xhigh" });
+    await p.teardown();
+  });
+});

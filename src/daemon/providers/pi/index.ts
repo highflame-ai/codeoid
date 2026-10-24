@@ -453,6 +453,8 @@ export class PiProvider implements SessionProvider {
       throw new Error(`pi could not switch model to "${model}": ${String(resp.error ?? "")}`);
     }
     this.#model = model;
+    // pi re-applies its own (clamped) level on a model change: send ours again (#417).
+    this.#thinkingLevel = null;
   }
 
   async #fetchStats(): Promise<PiSessionStats> {

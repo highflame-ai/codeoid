@@ -293,10 +293,12 @@ export class CodexProvider implements SessionProvider {
 
   #proc: CodexRpcProcess | null = null;
   #threadId: string | null = null;
-  /** Each model's default effort, and which model is the default, from model/list (#417). */
+  /** Each model's default effort from model/list, the model the thread runs, and the
+   *  user's own configured effort (config/read) — what Default sends (#417). */
   readonly #modelDefaultEffort = new Map<string, string>();
-  #defaultModelId: string | null = null;
-  #modelListRead = false;
+  #threadModel: string | null = null;
+  #configEffort: string | null | undefined = undefined;
+  #modelListTried = false;
   #hasQueried = false;
   #modelsReported = false;
   #pendingHistorySeed: string | null = null;
@@ -471,8 +473,9 @@ export class CodexProvider implements SessionProvider {
         if (!forked.thread?.id) throw new Error("thread/fork returned no thread id");
         return forked.thread.id;
       }
-      const started = (await this.#proc.request("thread/start", config)) as { thread?: { id?: string } };
+      const started = (await this.#proc.request("thread/start", config)) as { thread?: { id?: string }; model?: string };
       if (!started.thread?.id) throw new Error("thread/start returned no thread id");
+      this.#threadModel = started.model ?? null;
       await this.#proc.request("thread/inject_items", { threadId: started.thread.id, items: pending.items });
       return started.thread.id;
     } catch (err) {
@@ -655,14 +658,12 @@ export class CodexProvider implements SessionProvider {
           description?: string;
           supportedReasoningEfforts?: Array<{ reasoningEffort?: string }>;
           defaultReasoningEffort?: string;
-          isDefault?: boolean;
         }>;
       };
-      // Each model's own default effort — what Default sends (#417).
+      // Each model's own default effort — what Default falls back to (#417).
       for (const m of result.data ?? []) {
         const id = m.model ?? m.id;
         if (typeof id === "string" && typeof m.defaultReasoningEffort === "string") this.#modelDefaultEffort.set(id, m.defaultReasoningEffort);
-        if (m.isDefault === true && typeof id === "string") this.#defaultModelId = id;
       }
       return (result.data ?? [])
         .filter((m) => typeof (m.model ?? m.id) === "string")
@@ -676,7 +677,6 @@ export class CodexProvider implements SessionProvider {
             id: (m.model ?? m.id) as string,
             displayName: m.displayName ?? ((m.model ?? m.id) as string),
             description: m.description,
-            ...(m.isDefault === true ? { isDefault: true } : {}),
             ...(efforts ? { efforts } : {}),
             ...(defaultEffort ? { defaultEffort } : {}),
           };
@@ -706,14 +706,25 @@ export class CodexProvider implements SessionProvider {
 
   // ── Internal ──────────────────────────────────────────────────────────
 
-  /** A model's own default effort (once per process, from model/list), or null. */
-  async #defaultEffortFor(model: string | undefined): Promise<string | null> {
-    if (!this.#modelListRead) {
-      this.#modelListRead = true;
+  /** turn/start's effort (#417): the session's, else what codex would use unasked — or nothing when that can't be known. */
+  async #effortParam(opts: TurnOpts): Promise<{ effort?: string }> {
+    if (opts.effort) return { effort: toCodexEffort(opts.effort) };
+    if (this.#configEffort === undefined) {
+      try {
+        const read = (await this.#proc!.request("config/read", { cwd: opts.workdir })) as { config?: { model_reasoning_effort?: string | null } };
+        this.#configEffort = read.config?.model_reasoning_effort ?? null;
+      } catch {
+        // Unknown this time; asked again next turn.
+      }
+    }
+    if (this.#configEffort) return { effort: this.#configEffort };
+    const model = opts.model ?? this.#threadModel;
+    if (model && !this.#modelDefaultEffort.has(model) && !this.#modelListTried) {
+      this.#modelListTried = true; // once: a model the list doesn't carry stays unknown
       await this.listModels();
     }
-    const id = model ?? this.#defaultModelId;
-    return (id && this.#modelDefaultEffort.get(id)) ?? null;
+    const fallback = model ? this.#modelDefaultEffort.get(model) : undefined;
+    return fallback ? { effort: fallback } : {};
   }
 
   async #startTurn(opts: TurnOpts): Promise<void> {
@@ -737,9 +748,10 @@ export class CodexProvider implements SessionProvider {
       ...(opts.model ? { model: opts.model } : {}),
       // Thinking effort (#417). codex keeps a turn's effort for the turns
       // after it (a resumed thread too), and null there means "no override" —
-      // so Default is sent as the model's own default effort, read from its
-      // catalog; null only for a model the catalog doesn't know.
-      effort: opts.effort ? toCodexEffort(opts.effort) : await this.#defaultEffortFor(opts.model),
+      // so Default is sent as the effort codex itself would use: the user's
+      // configured one, else the running model's own default (the same
+      // value codex picks unasked; sending it resets an earlier override).
+      ...(await this.#effortParam(opts)),
     })) as { turn?: { id?: string } };
     this.#currentTurnId = result.turn?.id ?? null;
   }
@@ -810,9 +822,10 @@ export class CodexProvider implements SessionProvider {
       try {
         const resumed = (await this.#proc.request("thread/resume", {
           threadId: this.#backingSessionId,
-        })) as { thread?: { id?: string } };
+        })) as { thread?: { id?: string }; model?: string };
         if (resumed.thread?.id) {
           this.#threadId = resumed.thread.id;
+          this.#threadModel = resumed.model ?? null;
           return;
         }
       } catch {
@@ -828,8 +841,9 @@ export class CodexProvider implements SessionProvider {
         this.onHistoryLost?.();
       }
     }
-    const started = (await this.#proc.request("thread/start", threadConfig(opts))) as { thread?: { id?: string } };
+    const started = (await this.#proc.request("thread/start", threadConfig(opts))) as { thread?: { id?: string }; model?: string };
     if (!started.thread?.id) throw new Error("codex thread/start returned no thread id");
+    this.#threadModel = started.model ?? null;
     this.#adoptThread(started.thread.id);
     await this.#reportModelsOnce();
   }
@@ -866,7 +880,6 @@ export class CodexProvider implements SessionProvider {
           description: m.description,
           ...(m.efforts ? { efforts: m.efforts } : {}),
           ...(m.defaultEffort ? { defaultEffort: m.defaultEffort } : {}),
-          ...(m.isDefault ? { isDefault: true } : {}),
         })),
       );
     }

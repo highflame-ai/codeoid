@@ -15,10 +15,9 @@ import { spawn } from "node:child_process";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { createHash } from "node:crypto";
 import { atomicWrite, getConfigDir } from "../config.js";
 import type { EffortLevel } from "../protocol/types.js";
-import { AccountError, type ResolvedAccount } from "./accounts.js";
+import { AccountError, overlayKey, type ResolvedAccount } from "./accounts.js";
 
 // ── Overlay homes ─────────────────────────────────────────────────────────────
 
@@ -60,7 +59,7 @@ export function ensureOverlayHome(spec: OverlaySpec): void {
     // No default home yet: the account starts from nothing but its own files.
   }
   for (const name of entries) {
-    if (own.has(name) || name in copies) continue;
+    if (own.has(name) || name in copies || isLockEntry(name)) continue;
     const link = join(spec.target, name);
     const want = join(source, name);
     let stat: ReturnType<typeof lstatSync> | null = null;
@@ -72,7 +71,7 @@ export function ensureOverlayHome(spec: OverlaySpec): void {
     if (stat && !stat.isSymbolicLink()) continue; // the account's own copy
     if (stat?.isSymbolicLink()) {
       if (readlinkSync(link) === want) continue;
-      unlinkSync(link);
+      unlinkLink(link);
     }
     try {
       symlinkSync(want, link);
@@ -92,7 +91,7 @@ export function ensureOverlayHome(spec: OverlaySpec): void {
       continue;
     }
     if (!isLink) continue;
-    if (own.has(name) || name in copies || !entries.includes(name)) unlinkSync(link);
+    if (own.has(name) || name in copies || isLockEntry(name) || !entries.includes(name)) unlinkLink(link);
   }
   for (const [name, transform] of Object.entries(copies)) {
     const from = join(source, name);
@@ -286,7 +285,7 @@ export function applyGeminiCliEffort(
 ): Record<string, string> {
   if (!effort) return env;
   const base = env.GEMINI_CLI_HOME || defaultGeminiCliRoot();
-  const key = `${createHash("sha256").update(resolve(base)).digest("hex").slice(0, 12)}-${effort}`;
+  const key = `${overlayKey(base)}-${effort}`;
   const home = join(homesRoot, "gemini-cli-effort", key);
   mkdirSync(home, { recursive: true, mode: 0o700 });
   ensureOverlayHome({
@@ -356,19 +355,54 @@ export function defaultPiAgentDir(env: Record<string, string | undefined> = proc
   return env.PI_CODING_AGENT_DIR || join(env.HOME || homedir(), ".pi", "agent");
 }
 
+/** pi's agent dir, as pi reads PI_CODING_AGENT_DIR (a leading ~ is home). */
+function piAgentDirOf(env: Record<string, string | undefined>): string {
+  const dir = env.PI_CODING_AGENT_DIR || defaultPiAgentDir(env);
+  return dir === "~" || dir.startsWith("~/") ? join(env.HOME || homedir(), dir.slice(1)) : dir;
+}
+
+/** A lock another process holds right now (proper-lockfile's `<file>.lock`): never linked into an overlay. */
+function isLockEntry(name: string): boolean {
+  return name.endsWith(".lock");
+}
+
+/** Remove a link that another session building the same overlay may have removed first. */
+function unlinkLink(link: string): void {
+  try {
+    unlinkSync(link);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+  }
+}
+
 /**
  * pi's agent dir for a codeoid session (#417): an overlay of the one it would
  * use (an account's, or the default) — everything linked, so its logins and
  * sessions are the user's — except settings.json, a fresh copy at each start.
- * pi saves a thinking-level change as the user's global default in that file;
- * the copy keeps one session's effort out of the user's own pi and the others'.
+ * pi saves a thinking-level change (and a model change) as the user's global
+ * default in that file; the copy keeps them out of the user's own pi. (Sessions
+ * on the same base share the copy — codeoid sends each its level every turn.)
+ * pi locks auth.json by the path it was given, so a pi run elsewhere on the
+ * user's own dir doesn't share that lock (docs/thinking-effort.md).
  */
 export function applyPiSettingsOverlay(
   env: Record<string, string>,
   homesRoot: string = join(getConfigDir(), "accounts"),
 ): Record<string, string> {
-  const base = env.PI_CODING_AGENT_DIR || defaultPiAgentDir(env);
-  const home = join(homesRoot, "pi-session", createHash("sha256").update(resolve(base)).digest("hex").slice(0, 12));
+  const base = piAgentDirOf(env);
+  // pi creates its auth.json when it's missing — then it must be the user's,
+  // not a file of the overlay's own that a later `pi /login` never reaches.
+  mkdirSync(base, { recursive: true, mode: 0o700 });
+  const auth = join(base, "auth.json");
+  if (!existsSync(auth)) writeFileSync(auth, "{}", { mode: 0o600, flag: "wx" });
+  const home = join(homesRoot, "pi-session", overlayKey(base));
+  // An overlay built before that took an empty one of its own: link the user's instead.
+  try {
+    const own = join(home, "auth.json");
+    if (!lstatSync(own).isSymbolicLink() && readFileSync(own, "utf8").trim() === "{}") unlinkSync(own);
+  } catch {
+    // None yet.
+  }
   ensureOverlayHome({
     source: base,
     target: home,
@@ -381,7 +415,7 @@ export function applyPiSettingsOverlay(
 
 /** The thinking level pi starts a session at, as the user set it (#417): their settings' default, else pi's, Medium. */
 export function piDefaultThinkingLevel(env: Record<string, string | undefined>): string {
-  const base = env.PI_CODING_AGENT_DIR || defaultPiAgentDir(env);
+  const base = piAgentDirOf(env);
   try {
     const level = (JSON.parse(readFileSync(join(base, "settings.json"), "utf8")) as { defaultThinkingLevel?: unknown }).defaultThinkingLevel;
     if (typeof level === "string" && level) return level;

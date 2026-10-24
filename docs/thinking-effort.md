@@ -7,7 +7,7 @@ How hard a session's model thinks before it answers, on one scale for every back
 **Default, Off, Minimal, Low, Medium, High, Extra high (`xhigh`), Max.**
 
 **Default** is the backend's own choice, as it always was.
-Most backends are simply sent nothing; two keep a level once it's set, so Default is sent to them explicitly: Codex gets the model's own default effort (from its model list), and pi the default in your pi settings (`defaultThinkingLevel`, else Medium).
+Most backends are simply sent nothing; two keep a level once it's set, so Default is sent to them explicitly, as the level they would pick unasked: Codex gets your configured `model_reasoning_effort` (project config included), else the running model's own default; pi gets the default in your pi settings (`defaultThinkingLevel`, else Medium).
 Every other level is mapped to the backend's own setting (below).
 A level a backend has no exact match for goes to its nearest one; pi clamps a level a model doesn't take to the nearest it does.
 
@@ -66,4 +66,6 @@ Notes:
   A template that reads neither ignores them.
 - **pi** saves a thinking-level change as your global default in its settings, so codeoid runs it from an overlay of its agent directory: your logins and sessions are linked, and `settings.json` is a fresh copy at each start, so one session's effort never changes your own pi or other sessions.
   The overlays live under `~/.codeoid/accounts/pi-session/`.
+  One limit: pi locks `auth.json` by the path it was given, so a pi you run yourself on the same login doesn't share codeoid's lock; in the rare case both refresh an expiring OAuth login at the same moment, one may have to sign in again.
+- The Gemini CLI and pi overlays of an account's home are removed with the account.
 - **A project's own Gemini CLI settings** (`.gemini/settings.json` in the workdir) outrank your user settings, so a project that redefines `chat-base-2.5` or `chat-base-3` there overrides the effort on the Gemini CLI.
