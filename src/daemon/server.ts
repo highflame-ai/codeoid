@@ -508,6 +508,7 @@ export class DaemonServer {
         // re-key above so it registers the ids episodes now carry.
         if (this.#memory.store.needsWorkspaceTenantBackfill()) {
           try {
+            const started = Date.now();
             const r = this.#memory.store.backfillWorkspaceTenants({
               sessions: this.#store.listAllSessionsForMigration(),
               workspaceIdFor: workspaceIdFromPath,
@@ -519,7 +520,9 @@ export class DaemonServer {
                 r.unowned > 0
                   ? `; ${r.unowned} workspace(s) from destroyed sessions have no provable owner and stay out of cross-workspace search`
                   : "";
-              console.log(`[codeoid] memory: recorded the owner of ${r.registered} workspace(s)${unowned}`);
+              console.log(
+                `[codeoid] memory: recorded the owner of ${r.registered} workspace(s) in ${Date.now() - started}ms${unowned}`,
+              );
             }
           } catch (err) {
             console.error(

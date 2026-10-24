@@ -181,7 +181,8 @@ function computeWorkspaceId(normalized: string, scope: string): string {
 /**
  * The PRE-tenant workspace-id derivation (path only). Frozen so the one-time
  * migration can recognise ids written before tenant scoping. Do NOT "improve"
- * it — it must reproduce historical ids exactly, or the orphan re-key misses.
+ * it — it must reproduce historical ids exactly, or the ownership backfill
+ * could register a pre-tenant id that holds several tenants' episodes.
  * Exported for the migration test to construct pre-upgrade rows.
  */
 export function legacyWorkspaceIdFromPath(workdir: string): string {
@@ -1336,7 +1337,9 @@ export class SqliteEpisodeStore {
    *   their ancestors) of the orphans' recorded file paths, bounded by
    *   `maxProbeDirs` since each costs a git probe.
    * Pre-tenant path-only ids are never registered. Anything unproven stays
-   * invisible to cross-workspace search; per-workspace recall is unaffected.
+   * invisible to cross-workspace search. Registration never changes what
+   * per-workspace recall returns; episodes still on a pre-tenant id (orphans
+   * the re-key left in place) are outside every tenant's workspace either way.
    */
   backfillWorkspaceTenants(opts: {
     sessions: ReadonlyArray<{ id: string; workdir: string; accountId: string; projectId: string }>;
