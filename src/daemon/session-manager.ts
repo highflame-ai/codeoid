@@ -305,6 +305,8 @@ function toFleetTaskWire(row: DispatchTaskRow): FleetTaskWire {
     error: row.error ?? undefined,
     createdBy: row.createdBy,
     groupId: row.groupId ?? undefined,
+    runId: row.runId ?? undefined,
+    attemptId: row.attemptId ?? undefined,
   };
 }
 
@@ -3529,7 +3531,11 @@ mcpHub: this.#mcpHub,
       panel.members.push({
         sessionId: t.targetSession,
         ordinal: t.groupOrdinal ?? panel.members.length + 1,
-        status: t.status,
+        // A held member is unsettled with its worker still assigned — what a
+        // panel draws as `running`. Nothing holds a panel member today (only
+        // loop attempts are held, and attempts are never grouped), so the
+        // panel's wire union stays as clients already render it.
+        status: t.status === "held" ? "running" : t.status,
       });
       if (TERMINAL_TASK_STATUS.has(t.status)) panel.settled++;
     }

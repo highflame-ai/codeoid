@@ -437,6 +437,21 @@ const textTurn = (text: string): ProviderEvent[] => [
   { type: "turn_done", result: mockResult() } as ProviderEvent,
 ];
 
+/**
+ * Force a dispatch task terminal, bypassing the claim lifecycle. These tests
+ * exercise what is drawn or delivered once a task has settled, not how it got
+ * there — and `dispatchComplete` / `dispatchFail` now refuse a row that was
+ * never claimed (the generation fence), which is exactly right for a worker
+ * result and exactly wrong for staging one.
+ */
+function settleTask(id: string, status: "done" | "failed", digest: string): void {
+  store.database
+    .prepare(
+      "UPDATE dispatch_tasks SET status = ?, result_digest = ?, error = ?, updated_at = ? WHERE id = ?",
+    )
+    .run(status, status === "done" ? digest : null, status === "done" ? null : digest, Date.now(), id);
+}
+
 function mkConfig(over: Partial<CodeoidConfig> = {}): CodeoidConfig {
   return {
     daemonUrl: "ws://127.0.0.1:7400",
@@ -3169,13 +3184,13 @@ describe("collaboration.panels", () => {
     });
     const members = store.dispatchGroupMembers(AUTH.accountId, AUTH.projectId, groupId);
 
-    store.dispatchComplete(members[0]!.id, "one", Date.now());
+    settleTask(members[0]!.id, "done", "one");
     let p = (await panelsOf(goal.id)).panels[0]!;
     expect(p.settled).toBe(1);
     expect(p.joined).toBe(false); // 1/3 — a UI shows progress, not completion
 
-    store.dispatchComplete(members[1]!.id, "two", Date.now());
-    store.dispatchComplete(members[2]!.id, "three", Date.now());
+    settleTask(members[1]!.id, "done", "two");
+    settleTask(members[2]!.id, "done", "three");
     p = (await panelsOf(goal.id)).panels[0]!;
     expect(p.settled).toBe(3);
     expect(p.joined).toBe(true);
@@ -3193,10 +3208,10 @@ describe("collaboration.panels", () => {
       targets: kids.map((k) => k.id), prompt: "review", shape: "scout",
     });
     const members = store.dispatchGroupMembers(AUTH.accountId, AUTH.projectId, groupId);
-    store.dispatchComplete(members[0]!.id, "ok", Date.now());
-    store.dispatchComplete(members[1]!.id, "ok", Date.now());
+    settleTask(members[0]!.id, "done", "ok");
+    settleTask(members[1]!.id, "done", "ok");
     // Burn the third to blocked.
-    for (let i = 0; i < 3; i++) store.dispatchFail(members[2]!.id, "nope", Date.now(), { retryable: false });
+    settleTask(members[2]!.id, "failed", "nope");
 
     const p = (await panelsOf(goal.id)).panels[0]!;
     expect(p.members.some((m) => m.status === "failed" || m.status === "blocked")).toBe(true);

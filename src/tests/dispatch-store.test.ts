@@ -129,11 +129,13 @@ describe("dispatch queue — claims", () => {
 describe("dispatch queue — failure semantics", () => {
   test("retryable failures requeue until failure_limit, then auto-block", () => {
     const id = enqueue(); // failureLimit 2
-    store.dispatchClaimNext("boot-1", 100);
-    expect(store.dispatchFail(id, "worker died", 101, { retryable: true })).toBe("queued");
+    const first = store.dispatchClaimNext("boot-1", 100)!;
+    expect(store.dispatchFail(id, first.generation, "worker died", 101, { retryable: true })).toBe(
+      "queued",
+    );
 
-    store.dispatchClaimNext("boot-1", 102);
-    expect(store.dispatchFail(id, "worker died again", 103, { retryable: true })).toBe(
+    const second = store.dispatchClaimNext("boot-1", 102)!;
+    expect(store.dispatchFail(id, second.generation, "worker died again", 103, { retryable: true })).toBe(
       "blocked",
     );
     const row = store.dispatchGet(id)!;
@@ -143,16 +145,18 @@ describe("dispatch queue — failure semantics", () => {
 
   test("non-retryable failures go terminal immediately", () => {
     const id = enqueue();
-    store.dispatchClaimNext("boot-1", 100);
-    expect(store.dispatchFail(id, "target gone", 101, { retryable: false })).toBe("failed");
+    const claim = store.dispatchClaimNext("boot-1", 100)!;
+    expect(store.dispatchFail(id, claim.generation, "target gone", 101, { retryable: false })).toBe(
+      "failed",
+    );
   });
 
   test("complete stores the digest and clears the error", () => {
     const id = enqueue();
-    store.dispatchClaimNext("boot-1", 100);
-    store.dispatchFail(id, "first try failed", 101, { retryable: true });
-    store.dispatchClaimNext("boot-1", 102);
-    store.dispatchComplete(id, "all done", 103);
+    const first = store.dispatchClaimNext("boot-1", 100)!;
+    store.dispatchFail(id, first.generation, "first try failed", 101, { retryable: true });
+    const second = store.dispatchClaimNext("boot-1", 102)!;
+    expect(store.dispatchComplete(id, second.generation, "all done", 103)).toBe(true);
 
     const row = store.dispatchGet(id)!;
     expect(row.status).toBe("done");
@@ -164,8 +168,8 @@ describe("dispatch queue — failure semantics", () => {
 describe("dispatch queue — stale-claim reclaim (crash recovery)", () => {
   test("claims held by another boot are reclaimed with attempts++", () => {
     const id = enqueue();
-    store.dispatchClaimNext("boot-DEAD", 100);
-    store.dispatchMarkRunning(id, "worker-1", 100);
+    const claim = store.dispatchClaimNext("boot-DEAD", 100)!;
+    store.dispatchMarkRunning(id, claim.generation, "worker-1", 100);
 
     const reclaimed = store.dispatchReclaimStale("boot-NEW", 60_000, 200);
     expect(reclaimed.map((t) => t.id)).toEqual([id]);
@@ -191,8 +195,8 @@ describe("dispatch queue — stale-claim reclaim (crash recovery)", () => {
 
   test("touch renews the lease and prevents reclaim", () => {
     const id = enqueue();
-    store.dispatchClaimNext("boot-1", 1_000);
-    store.dispatchTouch([id], 50_000);
+    const claim = store.dispatchClaimNext("boot-1", 1_000)!;
+    store.dispatchTouch([{ id, generation: claim.generation }], 50_000);
     const reclaimed = store.dispatchReclaimStale("boot-1", 60_000, 100_000);
     expect(reclaimed).toHaveLength(0);
   });
@@ -221,8 +225,8 @@ describe("dispatch queue — tenancy + counters", () => {
     enqueue({ kind: "send", targetSession: "s", workdir: undefined });
     enqueue({ accountId: "acc-b", projectId: "proj-b", id: "task-b" });
 
-    store.dispatchClaimNext("boot-1", 100); // claims `a` (oldest)
-    store.dispatchMarkRunning(a, "w-1", 100);
+    const claim = store.dispatchClaimNext("boot-1", 100)!; // claims `a` (oldest)
+    store.dispatchMarkRunning(a, claim.generation, "w-1", 100);
     expect(store.dispatchActiveSpawnCount(TENANT.accountId, TENANT.projectId)).toBe(1);
     expect(store.dispatchActiveSpawnCount("acc-b", "proj-b")).toBe(0);
   });

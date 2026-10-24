@@ -21,10 +21,25 @@
  *     lease expiry reclaims the task.
  *   - Events are written before delivery and marked delivered after — a
  *     crash between "worker finished" and "conductor saw it" re-delivers.
+ *   - Every claim and reclaim bumps the task's generation. A worker is watched
+ *     under the generation it was started from, and only that generation can
+ *     complete, fail, or hold the task — a replaced worker finishing late is a
+ *     no-op (audited as `dispatch.stale_result`), never an overwrite.
+ *
+ * Loop attempts (`kind: "attempt"`, docs/loop-engineering-design.md §5) ride
+ * the same queue — the dispatcher stays the sole scheduler of worker attempts —
+ * but settle through the host's attempt hooks instead of fleet events: no
+ * conductor turn, no teardown on finish, an approval wedge reports to the loop,
+ * and a reclaim is terminal (`reclaimed`), because retrying is the loop's call.
  */
 
 import { randomUUID } from "node:crypto";
-import type { DispatchEventRow, DispatchTaskRow, Store } from "./store.js";
+import type {
+  DispatchEventRow,
+  DispatchTaskKind,
+  DispatchTaskRow,
+  Store,
+} from "./store.js";
 import type { SessionStatus } from "../protocol/types.js";
 
 export interface DispatchConfig {
@@ -75,6 +90,12 @@ export const DEFAULT_DISPATCH_CONFIG: DispatchConfig = {
 /** Thrown by host methods when retrying can never succeed (target gone, bad input). */
 export class NonRetryableDispatchError extends Error {}
 
+/** The hooks a host must implement before an attempt task may run on it. */
+const ATTEMPT_HOOKS = "spawnAttemptWorker / onAttemptSettled / onAttemptWaiting are not implemented";
+
+/** How an attempt task ended, as reported to `DispatcherHost.onAttemptSettled`. */
+export type AttemptSettledStatus = "done" | "failed" | "reclaimed";
+
 /**
  * The execution surface the SessionManager implements. Deliberately narrow:
  * the dispatcher owns lifecycle/ordering; the host owns sessions.
@@ -96,6 +117,35 @@ export interface DispatcherHost {
   buildWorkerDigest(task: DispatchTaskRow): string;
   /** Tear down a finished worker session (best-effort). */
   destroyWorker(sessionId: string, reason: string): Promise<void>;
+  /**
+   * Loop attempts (§5). All four are optional so a host without a loop service
+   * keeps compiling unchanged — and an attempt task reaching such a host fails
+   * closed rather than running as an ordinary spawn, which would drop the
+   * loop's permission profile and budgets on the floor.
+   *
+   * Start a worker for an attempt task. Returns its session id. The host owns
+   * that session for the attempt's whole life: the dispatcher never destroys it.
+   */
+  spawnAttemptWorker?(task: DispatchTaskRow): Promise<{ sessionId: string }>;
+  /**
+   * Re-attach an attempt to its surviving worker session. False = the session
+   * is gone; the dispatcher then starts a fresh one through `spawnAttemptWorker`.
+   * Optional even for a loop host: without it, continuation is always fresh.
+   */
+  continueAttempt?(task: DispatchTaskRow): Promise<boolean>;
+  /**
+   * An attempt task reached a terminal state. `reclaimed` means its claim died
+   * (crash or lease expiry) and the dispatcher did NOT retry it — whether to
+   * start another attempt is the loop's decision, against the loop's budget.
+   * `task` is the row as stored after the transition.
+   */
+  onAttemptSettled?(task: DispatchTaskRow, status: AttemptSettledStatus): void;
+  /**
+   * An attempt's worker is waiting on an approval. The loop decides whether
+   * it falls inside the run's profile or parks the task with `hold()`; the
+   * dispatcher neither fails it nor tells a conductor.
+   */
+  onAttemptWaiting?(task: DispatchTaskRow): void;
   /**
    * Inject pending events into whichever session each one belongs to, batched
    * per target — the tenant's conductor for its own dispatches, and the
@@ -166,14 +216,17 @@ export class Dispatcher {
    * running one). With one id per key the second registration silently evicted
    * the first, whose task then sat in `running` until the lease expired — and
    * its barrier hung for the whole lease with it.
+   *
+   * Each task id maps to the generation it was started under — the one its
+   * completion must present to the store.
    */
-  #watched = new Map<string, Set<string>>();
+  #watched = new Map<string, Map<string, number>>();
 
-  /** Register a task as watching `sessionId`. */
-  #watch(sessionId: string, taskId: string): void {
+  /** Register a task (at the generation it was started under) as watching `sessionId`. */
+  #watch(sessionId: string, taskId: string, generation: number): void {
     const existing = this.#watched.get(sessionId);
-    if (existing) existing.add(taskId);
-    else this.#watched.set(sessionId, new Set([taskId]));
+    if (existing) existing.set(taskId, generation);
+    else this.#watched.set(sessionId, new Map([[taskId, generation]]));
   }
 
   /** Stop watching one task; drops the key when it was the last watcher. */
@@ -186,6 +239,10 @@ export class Dispatcher {
     }
     set.delete(taskId);
     if (set.size === 0) this.#watched.delete(sessionId);
+  }
+  /** Drop every watch held by one task, whichever session it is on. */
+  #unwatchTask(taskId: string): void {
+    for (const sessionId of [...this.#watched.keys()]) this.#unwatch(sessionId, taskId);
   }
   /** Re-entrancy guard — a slow tick must not overlap the next. */
   #ticking = false;
@@ -207,12 +264,12 @@ export class Dispatcher {
     // a shared send target can have several, and this accessor exists for the
     // spawn case — see `tasksForSession` when you need all of them.
     const set = this.#watched.get(sessionId);
-    return set ? set.values().next().value : undefined;
+    return set ? set.keys().next().value : undefined;
   }
 
   /** Every task currently watching `sessionId`. */
   tasksForSession(sessionId: string): string[] {
-    return [...(this.#watched.get(sessionId) ?? [])];
+    return [...(this.#watched.get(sessionId)?.keys() ?? [])];
   }
 
   start(): void {
@@ -239,11 +296,14 @@ export class Dispatcher {
   enqueue(input: {
     accountId: string;
     projectId: string;
-    kind: "send" | "spawn";
+    kind: DispatchTaskKind;
     shape: "ship" | "scout";
     targetSession?: string;
     workdir?: string;
     prompt: string;
+    /** Loop run + attempt this task executes. Required for `kind: "attempt"`. */
+    runId?: string;
+    attemptId?: string;
     /**
      * Backend the spawned worker runs on. Omit for the daemon default.
      * Validated by the caller (the fleet tool / SessionManager) against the
@@ -256,18 +316,31 @@ export class Dispatcher {
     model?: string;
     createdBy: string;
   }): string {
+    const isAttempt = input.kind === "attempt";
+    // An attempt row without its loop ids could never be reconciled to its
+    // run, and loop ids on a send/spawn would make a fleet task look like one.
+    if (isAttempt !== (input.runId !== undefined && input.attemptId !== undefined)) {
+      throw new Error(
+        isAttempt
+          ? "an attempt task needs both runId and attemptId"
+          : `runId/attemptId are only valid on an attempt task, not ${input.kind}`,
+      );
+    }
     const id = randomUUID();
     this.#store.dispatchEnqueue({
       id,
       ...input,
-      failureLimit: this.#config.failureLimit,
+      // One claim per attempt: a reclaim is terminal and the loop decides what
+      // happens next, so the queue's own retry budget must never re-run one.
+      failureLimit: isAttempt ? 1 : this.#config.failureLimit,
       ownerDaemon: this.#config.daemonId,
       now: Date.now(),
     });
     this.#host.audit(
       "dispatch.enqueued",
       `task=${id} kind=${input.kind} shape=${input.shape} target=${input.targetSession ?? input.workdir ?? "-"}` +
-        `${input.provider ? ` provider=${input.provider}` : ""}${input.model ? ` model=${input.model}` : ""}`,
+        `${input.provider ? ` provider=${input.provider}` : ""}${input.model ? ` model=${input.model}` : ""}` +
+        `${isAttempt ? ` run=${input.runId} attempt=${input.attemptId}` : ""}`,
     );
     this.#signalBoardChange();
     return id;
@@ -343,6 +416,62 @@ export class Dispatcher {
   }
 
   /**
+   * Park a live task as `held` — waiting on something outside its worker (an
+   * approval outside a loop's permission profile, say). Reclaim never touches
+   * a held task, so the wait costs no attempt however long the person takes.
+   *
+   * `generation` is the one the caller was handed with the task (e.g. via
+   * `onAttemptWaiting`); a stale generation is refused, so a replaced worker's
+   * request cannot park its successor. The watch is dropped while held — a
+   * status change is not this dispatcher's to act on until `unhold`, which
+   * re-reads the worker's state rather than relying on a transition it missed.
+   */
+  hold(taskId: string, generation: number, reason: string): boolean {
+    const held = this.#store.dispatchHold(taskId, generation, reason, Date.now());
+    if (!held) {
+      this.#staleResult(taskId, generation, "hold");
+      return false;
+    }
+    const task = this.#store.dispatchGet(taskId);
+    if (task?.workerSessionId) this.#unwatch(task.workerSessionId, taskId);
+    this.#host.audit(
+      "dispatch.held",
+      `task=${taskId} generation=${generation} reason=${reason.slice(0, 200)}`,
+    );
+    this.#signalBoardChange();
+    return true;
+  }
+
+  /**
+   * Resume a held task as `running` under this boot, with a fresh lease, at the
+   * same generation — the same worker carries on, so its result still applies.
+   *
+   * The worker may have moved while held (or the daemon restarted), so its
+   * CURRENT status decides what happens next: still working → watch it;
+   * already settled → finish the task now; gone → leave it unwatched, and the
+   * lease reclaims it like any other dead worker.
+   */
+  async unhold(taskId: string, generation: number): Promise<boolean> {
+    const resumed = this.#store.dispatchUnhold(taskId, generation, this.bootId, Date.now());
+    if (!resumed) {
+      this.#staleResult(taskId, generation, "unhold");
+      return false;
+    }
+    this.#host.audit("dispatch.unheld", `task=${taskId} generation=${generation}`);
+    this.#signalBoardChange();
+    const task = this.#store.dispatchGet(taskId);
+    const sessionId = task?.workerSessionId;
+    if (!sessionId) return true;
+    const status = this.#host.workerStatus(sessionId);
+    if (status === "idle" || status === "error") {
+      await this.#finishWorkerTask(taskId, generation, sessionId, status);
+    } else if (status) {
+      this.#watch(sessionId, taskId, generation);
+    }
+    return true;
+  }
+
+  /**
    * One dispatcher pass: reclaim stale claims, renew live leases, claim +
    * execute ready tasks, deliver pending conductor events. Public so tests
    * drive it deterministically without timers.
@@ -386,14 +515,14 @@ export class Dispatcher {
    * worker's turn completion becomes a digest without polling.
    */
   onSessionStatus(sessionId: string, status: SessionStatus): void {
-    const taskIds = this.tasksForSession(sessionId);
-    if (taskIds.length === 0) return;
+    const watchers = [...(this.#watched.get(sessionId) ?? [])];
+    if (watchers.length === 0) return;
     if (status === "idle" || status === "error") {
       // Every task watching this session completes on the same transition —
       // dropping all but one is what left a panel member's task orphaned.
-      for (const taskId of taskIds) {
+      for (const [taskId, generation] of watchers) {
         this.#unwatch(sessionId, taskId);
-        void this.#finishWorkerTask(taskId, sessionId, status);
+        void this.#finishWorkerTask(taskId, generation, sessionId, status);
       }
       return;
     }
@@ -403,9 +532,18 @@ export class Dispatcher {
       // and STOP renewing the lease; expiry reclaims (attempts++) and either
       // retries fresh or auto-blocks. The owner can also attach and approve
       // before the lease runs out — then the turn simply continues.
-      for (const taskId of taskIds) {
+      for (const [taskId, generation] of watchers) {
         const task = this.#store.dispatchGet(taskId);
         if (!task) continue;
+        // The wedge is a worker's report like any other: only the generation
+        // that worker was started under may raise it.
+        if (task.generation !== generation) continue;
+        if (task.kind === "attempt") {
+          // A loop decides what an approval means for its run — inside the
+          // profile, or `hold()` and wait for a person. Never a fleet event.
+          this.#callAttemptHook("onAttemptWaiting", () => this.#host.onAttemptWaiting?.(task));
+          continue;
+        }
         this.#emitEvent(task, "task_failed", // type refined below if it recovers
           `worker for task ${task.id.slice(0, 8)} (${task.shape}) is WAITING FOR APPROVAL in session ${sessionId.slice(0, 8)} — its autonomous tool budget is exhausted or it hit a gated tool. Attach and approve to let it continue, or it will be reclaimed when the lease expires.`,
           { keepPending: true },
@@ -432,8 +570,17 @@ export class Dispatcher {
       if (task.workerSessionId) this.#unwatch(task.workerSessionId, task.id);
       this.#host.audit(
         "dispatch.reclaimed",
-        `task=${task.id} attempts=${task.attempts} status=${task.status}`,
+        `task=${task.id} attempts=${task.attempts} status=${task.status} generation=${task.generation}`,
       );
+      if (task.kind === "attempt") {
+        // Terminal at its first reclaim (the store never re-queues one), and
+        // reported as `reclaimed` rather than as an ordinary failure: the
+        // worker may still be alive somewhere, which is exactly what a loop's
+        // restart reconciliation needs to know before it starts another. The
+        // worker is the host's — not destroyed here.
+        this.#settleAttempt(task, "reclaimed");
+        continue;
+      }
       if (task.status === "blocked") {
         this.#emitEvent(
           task,
@@ -455,12 +602,14 @@ export class Dispatcher {
 
   /** Renew leases only for workers that are verifiably alive AND working. */
   #renewLiveLeases(): void {
-    const alive: string[] = [];
-    for (const [sessionId, taskIds] of this.#watched) {
+    const alive: Array<{ id: string; generation: number }> = [];
+    for (const [sessionId, watchers] of this.#watched) {
       const status = this.#host.workerStatus(sessionId);
       // Every task watching a live session renews — a shared target keeps all
       // of its dispatches leased, not just whichever registered first.
-      if (status && WORKER_ACTIVE.has(status)) alive.push(...taskIds);
+      if (status && WORKER_ACTIVE.has(status)) {
+        for (const [id, generation] of watchers) alive.push({ id, generation });
+      }
       // idle/error are handled by onSessionStatus; waiting_approval and a
       // vanished session deliberately do NOT renew — the lease reclaims them.
     }
@@ -487,7 +636,7 @@ export class Dispatcher {
       if (!task) return;
       touched.push(task.id);
       if (
-        task.kind === "spawn" &&
+        (task.kind === "spawn" || task.kind === "attempt") &&
         this.#store.dispatchActiveSpawnCount(task.accountId, task.projectId) >
           this.#config.maxConcurrentWorkers
       ) {
@@ -515,21 +664,27 @@ export class Dispatcher {
           return await this.#startGroupedSend(task, now);
         }
         await this.#host.sendToSession(task);
-        this.#store.dispatchComplete(
+        const applied = this.#store.dispatchComplete(
           task.id,
+          task.generation,
           `delivered to session ${task.targetSession?.slice(0, 8) ?? "?"}`,
           Date.now(),
         );
+        if (!applied) return this.#staleResult(task.id, task.generation, "send");
         this.#host.audit("dispatch.sent", `task=${task.id} target=${task.targetSession}`);
         return;
       }
+
+      if (task.kind === "attempt") return await this.#startAttempt(task);
 
       // spawn: continue a surviving worker (post-restart) or create fresh.
       if (task.workerSessionId) {
         const continued = await this.#host.continueWorker(task);
         if (continued) {
-          this.#store.dispatchMarkRunning(task.id, task.workerSessionId, now);
-          this.#watch(task.workerSessionId, task.id);
+          if (!this.#store.dispatchMarkRunning(task.id, task.generation, task.workerSessionId, now)) {
+            return await this.#staleStart(task, task.workerSessionId);
+          }
+          this.#watch(task.workerSessionId, task.id, task.generation);
           this.#host.audit(
             "dispatch.continued",
             `task=${task.id} worker=${task.workerSessionId}`,
@@ -539,21 +694,36 @@ export class Dispatcher {
         // Worker didn't survive the restart — fall through to a fresh spawn.
       }
       const { sessionId } = await this.#host.spawnWorker(task);
-      this.#store.dispatchMarkRunning(task.id, sessionId, Date.now());
-      this.#watch(sessionId, task.id);
+      if (!this.#store.dispatchMarkRunning(task.id, task.generation, sessionId, Date.now())) {
+        return await this.#staleStart(task, sessionId);
+      }
+      this.#watch(sessionId, task.id, task.generation);
       this.#host.audit("dispatch.spawned", `task=${task.id} worker=${sessionId}`);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       const retryable = !(err instanceof NonRetryableDispatchError);
       const now = Date.now();
-      const status = this.#store.dispatchFail(task.id, message, now, {
+      const status = this.#store.dispatchFail(task.id, task.generation, message, now, {
         retryable,
         notBefore: retryable ? this.#retryAt(task.attempts, now) : undefined,
       });
+      if (status === null) return this.#staleResult(task.id, task.generation, "execute");
+      // Whatever this execution registered is now dead: a grouped send watches
+      // its target BEFORE delivering, so a delivery that threw left a watcher
+      // behind, and the target's next idle arrived as a result for a task that
+      // had already failed. A re-queued task re-watches when it runs again.
+      this.#unwatchTask(task.id);
       this.#host.audit(
         "dispatch.failed",
         `task=${task.id} retryable=${retryable} status=${status} error=${message.slice(0, 200)}`,
       );
+      if (task.kind === "attempt") {
+        // Always terminal (the store never re-queues an attempt). No event and
+        // no teardown — both are the loop's.
+        const refreshed = this.#store.dispatchGet(task.id) ?? task;
+        this.#settleAttempt(refreshed, "failed");
+        return;
+      }
       if (status === "failed" || status === "blocked") {
         const refreshed = this.#store.dispatchGet(task.id) ?? task;
         this.#emitEvent(
@@ -575,7 +745,92 @@ export class Dispatcher {
     }
   }
 
-  /** Worker turn ended — digest, complete/fail, notify, tear down. */
+  /**
+   * Start (or re-attach) the worker for a loop attempt.
+   *
+   * Fails CLOSED when the host has no loop support. Falling back to an ordinary
+   * spawn would run the attempt without the loop's permission profile or
+   * budgets, and with nobody listening for its result — a worker doing
+   * unbounded work for a run that can never hear back. `continueAttempt` is
+   * the one optional hook: without it, continuation is a fresh worker.
+   */
+  async #startAttempt(task: DispatchTaskRow): Promise<void> {
+    const host = this.#host;
+    if (!host.spawnAttemptWorker || !host.onAttemptSettled || !host.onAttemptWaiting) {
+      throw new NonRetryableDispatchError(
+        `attempt task ${task.id.slice(0, 8)} (run ${task.runId ?? "?"}) cannot run: this daemon has no loop host (${ATTEMPT_HOOKS})`,
+      );
+    }
+    if (task.workerSessionId && host.continueAttempt && (await host.continueAttempt(task))) {
+      if (!this.#store.dispatchMarkRunning(task.id, task.generation, task.workerSessionId, Date.now())) {
+        return await this.#staleStart(task, task.workerSessionId);
+      }
+      this.#watch(task.workerSessionId, task.id, task.generation);
+      this.#host.audit(
+        "dispatch.attempt_continued",
+        `task=${task.id} run=${task.runId} attempt=${task.attemptId} worker=${task.workerSessionId}`,
+      );
+      return;
+    }
+    const { sessionId } = await host.spawnAttemptWorker(task);
+    if (!this.#store.dispatchMarkRunning(task.id, task.generation, sessionId, Date.now())) {
+      return await this.#staleStart(task, sessionId);
+    }
+    this.#watch(sessionId, task.id, task.generation);
+    this.#host.audit(
+      "dispatch.attempt_started",
+      `task=${task.id} run=${task.runId} attempt=${task.attemptId} worker=${sessionId} generation=${task.generation}`,
+    );
+  }
+
+  /**
+   * A worker came up for a claim that was reclaimed while it was starting —
+   * the start outlived the lease. The successor owns the task now, so this
+   * worker must not be recorded or watched. A spawned worker is ours and is
+   * torn down; an attempt's belongs to the loop host, which the reclaim
+   * already told (`reclaimed`).
+   */
+  async #staleStart(task: DispatchTaskRow, sessionId: string): Promise<void> {
+    this.#staleResult(task.id, task.generation, `start worker=${sessionId}`);
+    if (task.kind === "spawn") {
+      await this.#host.destroyWorker(sessionId, `task ${task.id} claim was replaced while starting`);
+    }
+  }
+
+  /**
+   * A result (or state change) from a generation that no longer owns the task —
+   * a replaced worker finishing late, or a task already terminal. Applying it
+   * would overwrite the successor's outcome or resurrect a settled task, so it
+   * is dropped; logged and audited so a fenced result is visible, not silent.
+   */
+  #staleResult(taskId: string, generation: number, what: string): void {
+    const current = this.#store.dispatchGet(taskId);
+    const detail =
+      `task=${taskId} generation=${generation} current=${current?.generation ?? "-"} ` +
+      `status=${current?.status ?? "missing"} what=${what}`;
+    console.warn(`[codeoid/dispatch] ignored stale result: ${detail}`);
+    this.#host.audit("dispatch.stale_result", detail);
+  }
+
+  /** Report an attempt's terminal state to the loop host. Never throws into the dispatcher. */
+  #settleAttempt(task: DispatchTaskRow, status: AttemptSettledStatus): void {
+    this.#host.audit(
+      "dispatch.attempt_settled",
+      `task=${task.id} run=${task.runId} attempt=${task.attemptId} status=${status} generation=${task.generation}`,
+    );
+    this.#callAttemptHook("onAttemptSettled", () => this.#host.onAttemptSettled?.(task, status));
+  }
+
+  #callAttemptHook(name: string, fn: () => void): void {
+    try {
+      fn();
+    } catch (err) {
+      console.error(
+        `[codeoid/dispatch] ${name} failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
   /**
    * Deliver (or re-attach to) a grouped send and watch its target to completion.
    *
@@ -606,13 +861,20 @@ export class Dispatcher {
           `panel target ${target.slice(0, 8)} no longer exists`,
         );
       }
-      this.#store.dispatchMarkRunning(task.id, target, now);
+      if (!this.#store.dispatchMarkRunning(task.id, task.generation, target, now)) {
+        return this.#staleResult(task.id, task.generation, "group_rewatch");
+      }
       if (!WORKER_ACTIVE.has(status)) {
         // Settled while we were away — complete from what it left behind.
-        await this.#finishWorkerTask(task.id, target, status === "error" ? "error" : "idle");
+        await this.#finishWorkerTask(
+          task.id,
+          task.generation,
+          target,
+          status === "error" ? "error" : "idle",
+        );
         return;
       }
-      this.#watch(target, task.id);
+      this.#watch(target, task.id, task.generation);
       this.#host.audit(
         "dispatch.group_rewatched",
         `task=${task.id} group=${task.groupId} target=${target} status=${status}`,
@@ -625,8 +887,10 @@ export class Dispatcher {
     // it after leaves a window where a crash between delivery and the marker
     // makes the retry re-send, and the reviewer works its brief twice while the
     // digest describes only the second pass.
-    this.#store.dispatchMarkRunning(task.id, target, now);
-    this.#watch(target, task.id);
+    if (!this.#store.dispatchMarkRunning(task.id, task.generation, target, now)) {
+      return this.#staleResult(task.id, task.generation, "group_send");
+    }
+    this.#watch(target, task.id, task.generation);
     await this.#host.sendToSession(task);
     this.#host.audit(
       "dispatch.group_sent",
@@ -634,19 +898,45 @@ export class Dispatcher {
     );
   }
 
+  /**
+   * Worker turn ended — digest, complete/fail, notify, tear down.
+   *
+   * `generation` is the one the worker was started under. A task that has since
+   * been reclaimed (and possibly re-claimed by a successor) carries a newer
+   * one, and this worker's result is dropped rather than recorded over it.
+   */
   async #finishWorkerTask(
     taskId: string,
+    generation: number,
     sessionId: string,
     status: "idle" | "error",
   ): Promise<void> {
     const task = this.#store.dispatchGet(taskId);
-    if (!task || (task.status !== "running" && task.status !== "claimed")) return;
+    if (!task) return;
+    if (
+      task.generation !== generation ||
+      (task.status !== "running" && task.status !== "claimed")
+    ) {
+      this.#staleResult(taskId, generation, `worker=${sessionId} turn=${status}`);
+      return;
+    }
 
     try {
       // Digest BEFORE teardown — it reads the live session + memory.
       const digest = this.#host.buildWorkerDigest(task);
       if (status === "idle") {
-        this.#store.dispatchComplete(task.id, digest, Date.now());
+        // The read above and this write are not one transaction; the store's
+        // generation + status guard is what actually fences the result.
+        if (!this.#store.dispatchComplete(task.id, generation, digest, Date.now())) {
+          this.#staleResult(taskId, generation, `worker=${sessionId} turn=idle`);
+          return;
+        }
+        if (task.kind === "attempt") {
+          // The worker stays: an attempt's session is the loop's to keep for
+          // verification, inspection, or the next attempt's continuation.
+          this.#settleAttempt(this.#store.dispatchGet(task.id) ?? task, "done");
+          return;
+        }
         this.#emitEvent(task, "task_done", digest);
         this.#host.audit("dispatch.done", `task=${task.id} worker=${sessionId}`);
         // Disposable children (design R2): the work products live in the
@@ -665,10 +955,20 @@ export class Dispatcher {
         const failNow = Date.now();
         const failStatus = this.#store.dispatchFail(
           task.id,
+          generation,
           "worker turn ended in error",
           failNow,
           { retryable: true, notBefore: this.#retryAt(task.attempts, failNow) },
         );
+        if (failStatus === null) {
+          this.#staleResult(taskId, generation, `worker=${sessionId} turn=error`);
+          return;
+        }
+        if (task.kind === "attempt") {
+          // Terminal `failed` — the store never re-queues an attempt.
+          this.#settleAttempt(this.#store.dispatchGet(task.id) ?? task, "failed");
+          return;
+        }
         if (failStatus === "blocked") {
           this.#emitEvent(
             task,
@@ -799,6 +1099,10 @@ ${body ?? "no digest"}`;
     digest: string,
     opts?: { keepPending?: boolean },
   ): void {
+    // A loop attempt never wakes a conductor (§12.6): its outcome goes to the
+    // loop host. Every attempt path settles before reaching here; this is the
+    // backstop so a future path cannot start a model turn by accident.
+    if (task.kind === "attempt") return;
     // A grouped task's completion is the barrier's business, not its own.
     if (this.#barrierAbsorb(task)) return;
     this.#store.dispatchEventAdd({

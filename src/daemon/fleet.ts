@@ -51,7 +51,7 @@ export interface FleetSessionView {
 /** A dispatch task as the conductor sees it on the fleet_tasks board. */
 export interface FleetTaskView {
   id: string;
-  kind: "send" | "spawn";
+  kind: "send" | "spawn" | "attempt";
   shape: "ship" | "scout";
   status: string;
   attempts: number;
