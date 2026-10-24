@@ -105,7 +105,9 @@ export function Modal(props: Props) {
           key={kind === "model" || kind === "effort" ? `${kind}:${provider}` : kind}
           kind={kind}
           provider={provider}
-          model={target.info.model}
+          model={target.info.model ?? target.info.runningModel}
+          sessionDefaultEffort={target.info.defaultEffort}
+          effortPending={target.info.effortPending === true}
           sessionName={target.info.name}
           providers={props.providers}
           client={props.client}

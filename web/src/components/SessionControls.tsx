@@ -119,7 +119,13 @@ const SessionControls: Component = () => {
             current={s().model}
             provider={s().providerId}
           />
-          <EffortPicker sessionId={s().id} current={s().effort} model={s().model} />
+          <EffortPicker
+            sessionId={s().id}
+            current={s().effort}
+            pending={s().effortPending === true}
+            model={s().model ?? s().runningModel}
+            sessionDefault={s().defaultEffort}
+          />
           <ProviderPicker sessionId={s().id} current={s().providerId} />
           <AccountPicker
             sessionId={s().id}
@@ -840,7 +846,7 @@ export function openEffortPicker(): void {
  * scale, marked as not known to the backend — a level it refuses fails the
  * turn with a message saying so.
  */
-const EffortPicker: Component<{ sessionId: string; current?: EffortLevel; model?: string }> = (props) => {
+const EffortPicker: Component<{ sessionId: string; current?: EffortLevel; pending?: boolean; model?: string; sessionDefault?: EffortLevel }> = (props) => {
   const open = effortPickerOpen;
   const setOpen = setEffortPickerOpen;
   const act = createAction();
@@ -863,7 +869,13 @@ const EffortPicker: Component<{ sessionId: string; current?: EffortLevel; model?
         class="flex items-center gap-1 rounded border border-border bg-bg px-2 py-1 font-mono uppercase tracking-wider text-fg-muted hover:border-accent/40 hover:text-fg"
         title="How hard the model thinks before it answers"
       >
-        effort <span class="text-fg">{props.current ? EFFORT_LABELS[props.current] : "default"}</span> ▾
+        effort <span class="text-fg">{props.current ? EFFORT_LABELS[props.current] : "default"}</span>
+        <Show when={props.pending}>
+          <span class="normal-case text-fg-faint" title="Not in effect yet: it lands with the next turn — or, while background work runs, once it ends (Stop ends it)">
+            (pending)
+          </span>
+        </Show>{" "}
+        ▾
       </button>
       <Show when={open()}>
         <div
@@ -881,7 +893,7 @@ const EffortPicker: Component<{ sessionId: string; current?: EffortLevel; model?
           >
             <span>
               Default
-              <Show when={entry()?.defaultEffort}>
+              <Show when={props.sessionDefault ?? entry()?.defaultEffort}>
                 {(d) => <span class="text-fg-faint"> · {EFFORT_LABELS[d()]}</span>}
               </Show>
             </span>

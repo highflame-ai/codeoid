@@ -1394,7 +1394,26 @@ describe("CodexProvider – Default as the catalog shows it (#417)", () => {
     expect(await report({ CODEX_FAKE_LIST_DEFAULT: "1", CODEX_FAKE_CONFIG_MODEL: "my-unlisted-model" })).toEqual([{ value: "gpt-5.6-terra", defaultEffort: "low" }]);
   });
 
-  it("a configured effort is every row's default — what Default sends", async () => {
-    expect(await report({ CODEX_FAKE_CONFIG_EFFORT: "xhigh" })).toEqual([{ value: "gpt-5.6-terra", defaultEffort: "xhigh" }]);
+  it("a configured effort is the default of every model that takes it — what Default sends", async () => {
+    expect(await report({ CODEX_FAKE_CONFIG_EFFORT: "high" })).toEqual([{ value: "gpt-5.6-terra", defaultEffort: "high" }]);
+    // One the model doesn't take: its own default stands.
+    expect(await report({ CODEX_FAKE_CONFIG_EFFORT: "xhigh" })).toEqual([{ value: "gpt-5.6-terra", defaultEffort: "low" }]);
+  });
+
+  it("the session itself knows what Default means and which model runs — the project's config included", async () => {
+    const saved = { u: process.env.CODEX_FAKE_CONFIG_EFFORT, p: process.env.CODEX_FAKE_PROJECT_EFFORT };
+    process.env.CODEX_FAKE_CONFIG_EFFORT = "low";
+    process.env.CODEX_FAKE_PROJECT_EFFORT = "high";
+    try {
+      const p = makeProvider();
+      await collect(p.runTurn(turnOpts("hello")));
+      expect([p.defaultEffort, p.runningModel]).toEqual(["high", "gpt-5.6-terra"]);
+      await p.teardown();
+    } finally {
+      for (const [k, v] of [["CODEX_FAKE_CONFIG_EFFORT", saved.u], ["CODEX_FAKE_PROJECT_EFFORT", saved.p]] as const) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
   });
 });

@@ -421,6 +421,12 @@ export class PiProvider implements SessionProvider {
   }
 
   /** A new thinking effort on the running pi, live (#417): it takes the next request at that level. */
+  /** What Default means here (#417): the user's own pi default, once read. */
+  get defaultEffort(): EffortLevel | null {
+    const l = this.#defaultThinkingLevel;
+    return l && (EFFORT_LEVELS as readonly string[]).includes(l) ? (l as EffortLevel) : null;
+  }
+
   async applyEffort(effort: EffortLevel | null): Promise<boolean> {
     const level = effort ?? this.#defaultThinkingLevel;
     if (!this.#proc?.alive || !level) return false;

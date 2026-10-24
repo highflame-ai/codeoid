@@ -618,6 +618,10 @@ export interface AgentProvider {
    * before the next turn.
    */
   readonly effortChange?: "turn" | "restart";
+  /** What Default means on this backend now, once known (#417) — for the session's pickers. */
+  readonly defaultEffort?: EffortLevel | null;
+  /** The model it runs when the session names none, once known. */
+  readonly runningModel?: string | null;
   /**
    * Apply a new effort to the running backend now, where it can (Claude,
    * Qwen, pi) — never cutting a turn short. True when it did; false (or

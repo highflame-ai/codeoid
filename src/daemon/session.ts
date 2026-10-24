@@ -920,6 +920,8 @@ export class Session {
   #effortRestartPending = false;
   /** The effort the backend was last handed (#417); undefined before the first turn. */
   #effortSent: EffortLevel | null | undefined = undefined;
+  /** The last turn kept the old effort for background work: its change is announced when it lands. */
+  #effortHeld = false;
 
   // ── Auto-rotation (Layer D) ────────────────────────────────────────────
   // Claude Code's backing session id — distinct from codeoid's public
@@ -4688,6 +4690,9 @@ export class Session {
       model: this.#model ?? undefined,
       fallbackModel: this.#fallbackModel ?? undefined,
       effort: this.#effort ?? undefined,
+      ...(this.#provider.defaultEffort ? { defaultEffort: this.#provider.defaultEffort } : {}),
+      ...(this.#effortRestartPending || (this.#effortSent !== undefined && this.#effortSent !== this.#effort) ? { effortPending: true } : {}),
+      ...(this.#provider.runningModel ? { runningModel: this.#provider.runningModel } : {}),
       forkedFrom: this.forkedFrom,
       worktree: this.worktree,
       collaboration: this.collaboration,
@@ -5105,7 +5110,7 @@ export class Session {
         : applies === "restart"
           ? " — the backend restarts with it between turns, once no work is running"
           : this.#backgroundTasks.size > 0
-            ? " — from the next turn with no background work running"
+            ? " — from the next turn with no background work running (Stop ends it)"
             : " — from the next turn";
     const info = this.#makeMessage("info", `⎆ Thinking effort: ${shown}${when}.`, SYSTEM_IDENTITY, undefined, undefined, {
       event: "session.effort_changed",
@@ -5126,8 +5131,21 @@ export class Session {
    * lands on the first turn with none.
    */
   #turnEffort(): EffortLevel | null {
-    const effort = this.#backgroundTasks.size > 0 && this.#effortSent !== undefined ? this.#effortSent : this.#effort;
+    const held = this.#backgroundTasks.size > 0 && this.#effortSent !== undefined;
+    const effort = held ? (this.#effortSent as EffortLevel | null) : this.#effort;
+    // A change background work held back is in effect now: say so (an ordinary next-turn change was announced as such).
+    const landed = !held && this.#effortHeld && this.#effortSent !== effort;
+    this.#effortHeld = held && effort !== this.#effort;
     this.#effortSent = effort;
+    if (landed) {
+      const info = this.#makeMessage("info", `⎆ Thinking effort now ${effort ?? "the backend's default"}.`, SYSTEM_IDENTITY, undefined, undefined, {
+        event: "session.effort_applied",
+        effort,
+      });
+      this.#persistAndBuffer(info);
+      this.#broadcastRaw(info);
+      this.#broadcastInfoUpdate();
+    }
     return effort;
   }
 

@@ -298,6 +298,8 @@ export class CodexProvider implements SessionProvider {
   readonly #modelDefaultEffort = new Map<string, string>();
   #threadModel: string | null = null;
   #configEffort: string | null | undefined = undefined;
+  /** The baseline last worked out, for the session's pickers. */
+  #defaultEffort: string | null = null;
   #modelListTried = false;
   #hasQueried = false;
   #modelsReported = false;
@@ -712,8 +714,25 @@ export class CodexProvider implements SessionProvider {
   // ── Internal ──────────────────────────────────────────────────────────
 
   /** turn/start's effort (#417): the session's, else what codex would use unasked — or nothing when that can't be known. */
+  /** What Default means here now (#417): the effort codex would use unasked, once worked out. */
+  get defaultEffort(): EffortLevel | null {
+    return fromCodexEffort(this.#defaultEffort ?? undefined);
+  }
+
+  /** The model the thread runs (codex's configured one, project config included), once known. */
+  get runningModel(): string | null {
+    return this.#threadModel;
+  }
+
   async #effortParam(opts: TurnOpts): Promise<{ effort?: string }> {
+    const baseline = await this.#baselineEffort(opts);
+    this.#defaultEffort = baseline;
     if (opts.effort) return { effort: toCodexEffort(opts.effort) };
+    return baseline ? { effort: baseline } : {};
+  }
+
+  /** The effort codex itself uses unasked: the configured one (project layers included), else the running model's own. */
+  async #baselineEffort(opts: TurnOpts): Promise<string | null> {
     if (this.#configEffort === undefined) {
       try {
         const read = (await this.#proc!.request("config/read", { cwd: opts.workdir })) as { config?: { model_reasoning_effort?: string | null } };
@@ -722,14 +741,13 @@ export class CodexProvider implements SessionProvider {
         // Unknown this time; asked again next turn.
       }
     }
-    if (this.#configEffort) return { effort: this.#configEffort };
+    if (this.#configEffort) return this.#configEffort;
     const model = opts.model ?? this.#threadModel;
     if (model && !this.#modelDefaultEffort.has(model) && !this.#modelListTried) {
       this.#modelListTried = true; // once: a model the list doesn't carry stays unknown
       await this.listModels();
     }
-    const fallback = model ? this.#modelDefaultEffort.get(model) : undefined;
-    return fallback ? { effort: fallback } : {};
+    return (model && this.#modelDefaultEffort.get(model)) || null;
   }
 
   async #startTurn(opts: TurnOpts): Promise<void> {
@@ -897,7 +915,8 @@ export class CodexProvider implements SessionProvider {
     const models = listed.map((m) => ({
       ...m,
       isDefault: configured ? m.id === configured : m.isDefault === true,
-      ...(configuredEffort ? { defaultEffort: configuredEffort } : {}),
+      // ...for a model that takes it (one that doesn't: codex adjusts; its own default is the best guess).
+      ...(configuredEffort && (!m.efforts || m.efforts.includes(configuredEffort)) ? { defaultEffort: configuredEffort } : {}),
     }));
     if (models.length > 0) {
       this.#modelsReported = true;

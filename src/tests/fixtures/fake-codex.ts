@@ -425,7 +425,11 @@ async function handle(frame: Record<string, unknown>): Promise<void> {
       send({
         id,
         result: {
-          config: { model_reasoning_effort: process.env.CODEX_FAKE_CONFIG_EFFORT || null, model: process.env.CODEX_FAKE_CONFIG_MODEL || null },
+          // A project layer (read only with a cwd, as codex does) outranks the user's.
+          config: {
+            model_reasoning_effort: (params.cwd ? process.env.CODEX_FAKE_PROJECT_EFFORT : undefined) || process.env.CODEX_FAKE_CONFIG_EFFORT || null,
+            model: process.env.CODEX_FAKE_CONFIG_MODEL || null,
+          },
           origins: {},
           layers: null,
         },

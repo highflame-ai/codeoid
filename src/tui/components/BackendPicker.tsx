@@ -16,6 +16,10 @@ interface Props {
   provider: string;
   /** For the effort picker: the session's model, whose levels are offered. */
   model?: string;
+  /** For the effort picker: what Default means on the session, when the backend says. */
+  sessionDefaultEffort?: EffortLevel;
+  /** For the effort picker: the set level hasn't reached the backend yet. */
+  effortPending?: boolean;
   /** Name of the session this picker changes, shown in the header. */
   sessionName?: string;
   current: string;
@@ -25,7 +29,7 @@ interface Props {
   onCancel: () => void;
 }
 
-export function BackendPicker({ kind, provider, model, sessionName, current, providers, client, onPick, onCancel }: Props) {
+export function BackendPicker({ kind, provider, model, sessionDefaultEffort, effortPending, sessionName, current, providers, client, onPick, onCancel }: Props) {
   const [choices, setChoices] = useState<BackendChoice[]>([]);
   const [loading, setLoading] = useState(kind !== "provider");
   const [busy, setBusy] = useState(false);
@@ -51,7 +55,7 @@ export function BackendPicker({ kind, provider, model, sessionName, current, pro
         const result = await client.listModels(provider);
         if (cancelled) return;
         const entry = result.models.find((m) => m.value === model) ?? (model ? undefined : result.models.find((m) => m.isDefault));
-        setChoices(effortChoices(entry?.efforts, entry?.defaultEffort));
+        setChoices(effortChoices(entry?.efforts, sessionDefaultEffort ?? entry?.defaultEffort));
         setLive(true);
       } else if (kind === "model") {
         const result = await client.listModels(provider);
@@ -111,6 +115,7 @@ export function BackendPicker({ kind, provider, model, sessionName, current, pro
   return (
     <Box flexDirection="column" borderStyle="double" borderColor="cyan" paddingX={1}>
       <Text bold color="cyan">Select {kind === "effort" ? "thinking effort" : kind}{kind !== "provider" ? ` (${provider})` : ""}{sessionName ? ` for ${sessionName}` : ""}</Text>
+      {kind === "effort" && effortPending && <Text dimColor>The current choice is pending: it lands with the next turn, or once background work ends (Stop ends it).</Text>}
       {loading ? <Text dimColor>Loading…</Text> : options.slice(start, start + 8).map((choice, offset) => (
         // A server may list an id twice: the position keeps keys unique.
         <Box key={`${start + offset}:${choice.value}`} flexDirection="column">

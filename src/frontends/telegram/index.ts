@@ -810,8 +810,10 @@ export class TelegramFrontend implements Frontend {
     }
     const arg = ctx.message?.text?.split(/\s+/)[1];
     if (!arg) {
-      const current = state.attachedSessionName ? this.#manager.findByName(state.attachedSessionName, state.auth!)?.toInfo().effort : undefined;
-      await ctx.reply(`Thinking effort: ${current ? EFFORT_LABELS[current] : "the backend's default"}.\nSet it with /effort ${EFFORT_LEVELS.join("|")}|default`);
+      const info = state.attachedSessionName ? this.#manager.findByName(state.attachedSessionName, state.auth!)?.toInfo() : undefined;
+      const current = info?.effort;
+      const pending = info?.effortPending ? " (pending: it lands with the next turn, or once background work ends)" : "";
+      await ctx.reply(`Thinking effort: ${current ? EFFORT_LABELS[current] : "the backend's default"}${pending}.\nSet it with /effort ${EFFORT_LEVELS.join("|")}|default`);
       return;
     }
     let effort: EffortLevel | null;

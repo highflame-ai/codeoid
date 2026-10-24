@@ -488,6 +488,20 @@ export interface SessionInfo {
   /** Thinking effort set on this session (#417); absent = the backend's default. */
   effort?: EffortLevel;
   /**
+   * What Default means on this session right now, when the backend says
+   * (Codex: the configured effort, the project's included, else the running
+   * model's; pi: the user's default). Known once the backend has started.
+   */
+  defaultEffort?: EffortLevel;
+  /** The model the backend runs when the session names none, once known (Codex). */
+  runningModel?: string;
+  /**
+   * The effort set hasn't reached the backend yet (#417): it lands with the
+   * next turn, or — when it needs a rebuild — the first one with no
+   * background work running (Stop ends that work).
+   */
+  effortPending?: boolean;
+  /**
    * Lineage for a session created via `session.fork`. Absent = not a fork.
    * Frontends surface it as a chip ("⑃ forked from <name> · turn <atTurn>")
    * that links back to the parent. Recorded at fork time and persisted, so

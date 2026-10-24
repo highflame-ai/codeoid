@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseClientMessage } from "@highflame/codeoid-protocol/schemas";
 import type { CodeoidConfig } from "../config.js";
-import { applyGeminiCliEffort, applyPiSettingsOverlay, geminiEffortSettings, piDefaultThinkingLevel } from "../daemon/account-apply.js";
+import { applyGeminiCliEffort, applyPiSettingsOverlay, geminiEffortSettings, piAgentDirOf, piDefaultThinkingLevel } from "../daemon/account-apply.js";
 import { AccountStore } from "../daemon/accounts.js";
 import { geminiThinkingConfig } from "../daemon/providers/gemini/index.js";
 import { llamaCppEffortParams } from "../daemon/providers/llamacpp/index.js";
@@ -139,6 +139,7 @@ describe("pi's settings overlay", () => {
     writeFileSync(join(tmp, "h", "x", "settings.json"), JSON.stringify({ defaultThinkingLevel: "minimal" }));
     expect(piDefaultThinkingLevel({ PI_CODING_AGENT_DIR: "~/x", HOME: join(tmp, "h") })).toBe("minimal");
     expect(piDefaultThinkingLevel({ PI_CODING_AGENT_DIR: `file://${join(tmp, "h", "x")}` })).toBe("minimal"); // and a file URL
+    expect(piAgentDirOf({ PI_CODING_AGENT_DIR: "file://somehost/x" })).toBe("file://somehost/x"); // a bad one never throws (the secret-path guard reads it)
     expect(piDefaultThinkingLevel({ PI_CODING_AGENT_DIR: join(tmp, "none") })).toBe("medium");
   });
 
@@ -282,9 +283,11 @@ describe("a session's thinking effort", () => {
     expect(await setEffort(m, sid, "low")).toMatchObject({ data: { applies: "next-turn" } }); // still on its way
     await turn(m, sid);
     expect(providers[0]!.capturedOpts.at(-1)?.effort).toBe("high"); // background work isn't stopped for it
+    expect(m._sessionForTest(sid)!.toInfo().effortPending).toBe(true); // and the session says it's held
     providers[0]!.onSessionEvent!({ type: "background_tasks", tasks: [] });
     await turn(m, sid);
     expect(providers[0]!.capturedOpts.at(-1)?.effort).toBe("low");
+    expect(m._sessionForTest(sid)!.toInfo().effortPending).toBeUndefined();
     expect(await setEffort(m, sid, "low")).toMatchObject({ data: { applies: "now" } }); // in effect
   });
 

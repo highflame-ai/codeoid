@@ -33,6 +33,7 @@ Where the backend says, the pickers offer only the model's own levels:
 - pi reports which models reason and which levels each takes.
 
 The others (OpenAI and OpenAI-compatible endpoints, llama.cpp, Qwen, Gemini, the Gemini CLI) don't, so every level is offered and marked "support unknown".
+The Default entry shows what Default means on that session once the backend has said (Codex: your configured effort, the project's included, on the model it actually runs; pi: your default).
 A level the server refuses fails the turn with a note saying so; pick another, or Default.
 
 ## When a change applies
@@ -41,6 +42,7 @@ A change never cuts a running turn short.
 
 - **Now**, on the running backend: Claude (except to or from Off, or back to Default), Qwen (except back to Default), pi.
   A change that needs a rebuild waits while the backend has background work running, so that work isn't stopped.
+  Until a change is in effect the pickers mark it "pending" (Stop ends background work), and the session says when it lands.
 - **From the next turn**: Codex, OpenAI, llama.cpp, Gemini — they take it with every request — and the exceptions above, whose next turn starts a fresh query that resumes the conversation.
 - **After a restart, between turns**: the Gemini CLI, which reads it only from its settings at startup.
   It restarts before the next turn that starts with no background work running, and resumes the conversation, as after a model change.
