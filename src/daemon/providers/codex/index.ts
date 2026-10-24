@@ -469,13 +469,16 @@ export class CodexProvider implements SessionProvider {
           // Don't stream the whole thread back over stdio; only its id is used.
           excludeTurns: true,
           ...config,
-        })) as { thread?: { id?: string } };
+        })) as { thread?: { id?: string }; model?: string };
         if (!forked.thread?.id) throw new Error("thread/fork returned no thread id");
+        this.#threadModel = forked.model ?? null;
+        this.#configEffort = undefined;
         return forked.thread.id;
       }
       const started = (await this.#proc.request("thread/start", config)) as { thread?: { id?: string }; model?: string };
       if (!started.thread?.id) throw new Error("thread/start returned no thread id");
       this.#threadModel = started.model ?? null;
+      this.#configEffort = undefined;
       await this.#proc.request("thread/inject_items", { threadId: started.thread.id, items: pending.items });
       return started.thread.id;
     } catch (err) {
@@ -753,6 +756,8 @@ export class CodexProvider implements SessionProvider {
       // value codex picks unasked; sending it resets an earlier override).
       ...(await this.#effortParam(opts)),
     })) as { turn?: { id?: string } };
+    // codex keeps a turn's model for the turns after it: Default's baseline follows it.
+    if (opts.model) this.#threadModel = opts.model;
     this.#currentTurnId = result.turn?.id ?? null;
   }
 
@@ -826,6 +831,7 @@ export class CodexProvider implements SessionProvider {
         if (resumed.thread?.id) {
           this.#threadId = resumed.thread.id;
           this.#threadModel = resumed.model ?? null;
+          this.#configEffort = undefined;
           return;
         }
       } catch {
@@ -844,6 +850,8 @@ export class CodexProvider implements SessionProvider {
     const started = (await this.#proc.request("thread/start", threadConfig(opts))) as { thread?: { id?: string }; model?: string };
     if (!started.thread?.id) throw new Error("codex thread/start returned no thread id");
     this.#threadModel = started.model ?? null;
+    // codex reads its config afresh for each thread; so does Default's baseline.
+    this.#configEffort = undefined;
     this.#adoptThread(started.thread.id);
     await this.#reportModelsOnce();
   }

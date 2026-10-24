@@ -7,7 +7,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { Database } from "bun:sqlite";
-import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseClientMessage } from "@highflame/codeoid-protocol/schemas";
@@ -113,6 +113,26 @@ describe("pi's settings overlay", () => {
     writeFileSync(join(home, "auth.json"), "{}");
     applyPiSettingsOverlay({ PI_CODING_AGENT_DIR: base }, homes);
     expect(lstatSync(join(home, "auth.json")).isSymbolicLink()).toBe(true);
+  });
+
+  it("a dangling auth.json link is left to pi; a permanent lock FILE (codex's) is still linked", () => {
+    const base = join(tmp, "pi2");
+    mkdirSync(base, { recursive: true });
+    symlinkSync(join(tmp, "nowhere", "auth.json"), join(base, "auth.json"));
+    writeFileSync(join(base, ".sqlite-maintenance.lock"), "");
+    const home = applyPiSettingsOverlay({ PI_CODING_AGENT_DIR: base }, join(tmp, "homes")).PI_CODING_AGENT_DIR!;
+    expect(readlinkSync(join(home, ".sqlite-maintenance.lock"))).toBe(join(base, ".sqlite-maintenance.lock"));
+  });
+
+  it("pi's Default: the project's settings first, then the user's", () => {
+    const agent = join(tmp, "agent");
+    const work = join(tmp, "proj");
+    mkdirSync(join(work, ".pi"), { recursive: true });
+    mkdirSync(agent, { recursive: true });
+    writeFileSync(join(agent, "settings.json"), JSON.stringify({ defaultThinkingLevel: "low" }));
+    expect(piDefaultThinkingLevel({ PI_CODING_AGENT_DIR: agent }, work)).toBe("low");
+    writeFileSync(join(work, ".pi", "settings.json"), JSON.stringify({ defaultThinkingLevel: "high" }));
+    expect(piDefaultThinkingLevel({ PI_CODING_AGENT_DIR: agent }, work)).toBe("high");
   });
 
   it("reads a ~ path as pi does", () => {

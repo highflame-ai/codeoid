@@ -12,7 +12,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { atomicWrite, getConfigDir } from "../config.js";
@@ -59,7 +59,7 @@ export function ensureOverlayHome(spec: OverlaySpec): void {
     // No default home yet: the account starts from nothing but its own files.
   }
   for (const name of entries) {
-    if (own.has(name) || name in copies || isLockEntry(name)) continue;
+    if (own.has(name) || name in copies || isLockEntry(source, name)) continue;
     const link = join(spec.target, name);
     const want = join(source, name);
     let stat: ReturnType<typeof lstatSync> | null = null;
@@ -91,7 +91,7 @@ export function ensureOverlayHome(spec: OverlaySpec): void {
       continue;
     }
     if (!isLink) continue;
-    if (own.has(name) || name in copies || isLockEntry(name) || !entries.includes(name)) unlinkLink(link);
+    if (own.has(name) || name in copies || isLockEntry(source, name) || !entries.includes(name)) unlinkLink(link);
   }
   for (const [name, transform] of Object.entries(copies)) {
     const from = join(source, name);
@@ -361,9 +361,18 @@ function piAgentDirOf(env: Record<string, string | undefined>): string {
   return dir === "~" || dir.startsWith("~/") ? join(env.HOME || homedir(), dir.slice(1)) : dir;
 }
 
-/** A lock another process holds right now (proper-lockfile's `<file>.lock`): never linked into an overlay. */
-function isLockEntry(name: string): boolean {
-  return name.endsWith(".lock");
+/**
+ * A lock another process holds right now — proper-lockfile's `<file>.lock`
+ * directory (pi, the Gemini CLI) — never linked into an overlay. A lock FILE
+ * (codex's .sqlite-maintenance.lock) is a permanent shared lock: linked as before.
+ */
+function isLockEntry(dir: string, name: string): boolean {
+  if (!name.endsWith(".lock")) return false;
+  try {
+    return statSync(join(dir, name)).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 /** Remove a link that another session building the same overlay may have removed first. */
@@ -394,7 +403,14 @@ export function applyPiSettingsOverlay(
   // not a file of the overlay's own that a later `pi /login` never reaches.
   mkdirSync(base, { recursive: true, mode: 0o700 });
   const auth = join(base, "auth.json");
-  if (!existsSync(auth)) writeFileSync(auth, "{}", { mode: 0o600, flag: "wx" });
+  if (!existsSync(auth)) {
+    try {
+      writeFileSync(auth, "{}", { mode: 0o600, flag: "wx" }); // never through a planted link
+    } catch (err) {
+      // There after all (made meanwhile, or a dangling link): pi's to deal with, as without codeoid.
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+  }
   const home = join(homesRoot, "pi-session", overlayKey(base));
   // An overlay built before that took an empty one of its own: link the user's instead.
   try {
@@ -413,14 +429,19 @@ export function applyPiSettingsOverlay(
   return { ...env, PI_CODING_AGENT_DIR: home };
 }
 
-/** The thinking level pi starts a session at, as the user set it (#417): their settings' default, else pi's, Medium. */
-export function piDefaultThinkingLevel(env: Record<string, string | undefined>): string {
-  const base = piAgentDirOf(env);
-  try {
-    const level = (JSON.parse(readFileSync(join(base, "settings.json"), "utf8")) as { defaultThinkingLevel?: unknown }).defaultThinkingLevel;
-    if (typeof level === "string" && level) return level;
-  } catch {
-    // None, or unreadable: pi's own default.
+/**
+ * The thinking level pi starts a session at, as the user set it (#417): the
+ * project's .pi/settings.json default (pi layers it over the user's), else
+ * the user's, else pi's own, Medium.
+ */
+export function piDefaultThinkingLevel(env: Record<string, string | undefined>, workdir?: string): string {
+  for (const file of [...(workdir ? [join(workdir, ".pi", "settings.json")] : []), join(piAgentDirOf(env), "settings.json")]) {
+    try {
+      const level = (JSON.parse(readFileSync(file, "utf8")) as { defaultThinkingLevel?: unknown }).defaultThinkingLevel;
+      if (typeof level === "string" && level) return level;
+    } catch {
+      // None, or unreadable: the next.
+    }
   }
   return "medium";
 }
@@ -432,7 +453,7 @@ export function piDefaultThinkingLevel(env: Record<string, string | undefined>):
  */
 export function applyPiAccount(account: ResolvedAccount | null, env: Record<string, string>): Record<string, string> {
   if (!account) return env;
-  ensureOverlayHome({ source: defaultPiAgentDir(), target: account.home, own: ["auth.json"], shared: ["sessions"] });
+  ensureOverlayHome({ source: piAgentDirOf(process.env), target: account.home, own: ["auth.json"], shared: ["sessions"] });
   const out = without(
     env,
     (k) => k.endsWith("_API_KEY") || k.endsWith("_API_TOKEN") || k === "PI_CODING_AGENT_DIR" || /^(ANTHROPIC|OPENAI|GOOGLE|GEMINI)_/.test(k),

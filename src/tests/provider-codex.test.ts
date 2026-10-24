@@ -1312,6 +1312,15 @@ describe("CodexProvider – thinking effort (#417)", () => {
     process.env.CODEX_FAKE_CONFIG_EFFORT = "xhigh";
     try {
       expect(await effortSeen()).toBe("xhigh"); // the user's model_reasoning_effort wins
+      // Read afresh for each thread, as codex does: an edit made meanwhile counts.
+      const p = makeProvider();
+      await collect(p.runTurn(turnOpts("echo-effort")));
+      await p.teardown();
+      await Bun.sleep(100); // the killed app-server's exit lands before the next turn starts
+      process.env.CODEX_FAKE_CONFIG_EFFORT = "medium";
+      const events = await collect(p.runTurn(turnOpts("echo-effort")));
+      await p.teardown();
+      expect(JSON.parse((events.find((e) => e.type === "text_done") as { content: string }).content).effort).toBe("medium");
     } finally {
       if (saved === undefined) delete process.env.CODEX_FAKE_CONFIG_EFFORT;
       else process.env.CODEX_FAKE_CONFIG_EFFORT = saved;
