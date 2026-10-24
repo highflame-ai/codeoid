@@ -12,7 +12,8 @@
  */
 
 import { spawn } from "node:child_process";
-import { chmodSync, copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { chmodSync, constants as fsConstants, copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -146,7 +147,8 @@ function adoptIntoSource(target: string, source: string, own: ReadonlySet<string
     } catch {
       continue;
     }
-    if (stat.isSymbolicLink() || Date.now() - stat.mtimeMs < ADOPT_SETTLE_MS) continue;
+    // Only files and directories: a FIFO's copy would block the daemon.
+    if (!(stat.isFile() || stat.isDirectory()) || Date.now() - stat.mtimeMs < ADOPT_SETTLE_MS) continue;
     const there = join(source, name);
     let theirs: ReturnType<typeof statSync> | null = null;
     try {
@@ -154,19 +156,24 @@ function adoptIntoSource(target: string, source: string, own: ReadonlySet<string
     } catch {
       // The source has none.
     }
-    if (theirs && stat.isDirectory()) continue;
+    // A directory there too is never merged; a file and a directory of one name can't replace each other.
+    if (theirs && (stat.isDirectory() || theirs.isDirectory())) continue;
     try {
       // The later write wins, as it would have in one home; a tie goes to the backend's (it can't be told apart, and it's the one codeoid ran).
       if (!theirs || stat.mtimeMs >= theirs.mtimeMs) moveEntry(entry, there, stat.isDirectory());
       else unlinkSync(entry); // linked to the source's below
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-        // Left in the overlay, where it hides the source's: say so rather than keep it quietly.
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT" && !adoptWarned.has(entry)) {
+        // Left in the overlay, where it hides the source's: say so (once) rather than keep it quietly.
+        adoptWarned.add(entry);
         console.warn(`[codeoid/accounts] couldn't move ${entry} to ${there}: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
   }
 }
+
+/** Overlay entries a failed move was already logged for. */
+const adoptWarned = new Set<string>();
 
 /** Rename `from` to `to`; across filesystems, copy beside `to`, rename that into place, then remove `from`. */
 function moveEntry(from: string, to: string, isDir: boolean): void {
@@ -176,11 +183,16 @@ function moveEntry(from: string, to: string, isDir: boolean): void {
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "EXDEV") throw err;
   }
-  const staged = `${to}.codeoid-${process.pid}.tmp`;
-  rmSync(staged, { recursive: true, force: true });
-  if (isDir) cpSync(from, staged, { recursive: true, verbatimSymlinks: true });
-  else copyFileSync(from, staged);
-  renameSync(staged, to);
+  // A fresh name, created exclusively: never written through a link planted there.
+  const staged = `${to}.codeoid-${randomUUID()}.tmp`;
+  try {
+    if (isDir) cpSync(from, staged, { recursive: true, verbatimSymlinks: true, errorOnExist: true, force: false });
+    else copyFileSync(from, staged, fsConstants.COPYFILE_EXCL);
+    renameSync(staged, to);
+  } catch (err) {
+    rmSync(staged, { recursive: true, force: true }); // no partial copy left in the source
+    throw err;
+  }
   rmSync(from, { recursive: true, force: true });
 }
 

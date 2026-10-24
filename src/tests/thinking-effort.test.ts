@@ -7,7 +7,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { Database } from "bun:sqlite";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseClientMessage } from "@highflame/codeoid-protocol/schemas";
@@ -160,11 +160,33 @@ describe("each backend's reading of the scale", () => {
         expect(existsSync(join(base, ".gemini", "extensions", "e"))).toBe(true);
         expect(lstatSync(join(g, "oauth_creds.json")).isSymbolicLink()).toBe(true);
         expect(lstatSync(join(g, "extensions")).isSymbolicLink()).toBe(true);
+        // A file where the home has a directory of that name: left, with no partial copy in the home.
+        mkdirSync(join(base, ".gemini", "x"));
+        utimesSync(join(base, ".gemini", "x"), new Date(1000), new Date(1000));
+        rmSync(join(g, "x"), { force: true });
+        writeFileSync(join(g, "x"), "file");
+        utimesSync(join(g, "x"), settled, settled);
+        applyGeminiCliEffort("low", { GEMINI_CLI_HOME: base }, homes);
+        expect(lstatSync(join(g, "x")).isFile()).toBe(true);
+        expect(readdirSync(join(base, ".gemini")).filter((n) => n.endsWith(".tmp"))).toEqual([]);
       } finally {
         rmSync(base, { recursive: true, force: true });
       }
     },
   );
+
+  it("only files and directories are handed back — a pipe left in the overlay stays there", () => {
+    const base = join(tmp, "fifo");
+    mkdirSync(join(base, ".gemini"), { recursive: true });
+    const homes = join(tmp, "homes");
+    const g = join(applyGeminiCliEffort("low", { GEMINI_CLI_HOME: base }, homes).GEMINI_CLI_HOME!, ".gemini");
+    expect(Bun.spawnSync(["mkfifo", join(g, "pipe")]).exitCode).toBe(0);
+    const settled = new Date(Date.now() - 60_000);
+    utimesSync(join(g, "pipe"), settled, settled);
+    applyGeminiCliEffort("low", { GEMINI_CLI_HOME: base }, homes);
+    expect(lstatSync(join(g, "pipe")).isFIFO()).toBe(true);
+    expect(existsSync(join(base, ".gemini", "pipe"))).toBe(false);
+  });
 
   it("refuses a GEMINI_CLI_HOME that isn't absolute, building nothing under the daemon's directory", () => {
     const rel = `codeoid-effort-rel-${process.pid}`;
