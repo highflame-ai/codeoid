@@ -138,6 +138,7 @@ describe("pi's settings overlay", () => {
     mkdirSync(join(tmp, "h", "x"), { recursive: true });
     writeFileSync(join(tmp, "h", "x", "settings.json"), JSON.stringify({ defaultThinkingLevel: "minimal" }));
     expect(piDefaultThinkingLevel({ PI_CODING_AGENT_DIR: "~/x", HOME: join(tmp, "h") })).toBe("minimal");
+    expect(piDefaultThinkingLevel({ PI_CODING_AGENT_DIR: `file://${join(tmp, "h", "x")}` })).toBe("minimal"); // and a file URL
     expect(piDefaultThinkingLevel({ PI_CODING_AGENT_DIR: join(tmp, "none") })).toBe("medium");
   });
 
@@ -270,6 +271,21 @@ describe("a session's thinking effort", () => {
     await turn(m, sid);
     expect(await setEffort(m, sid, "max")).toMatchObject({ data: { applies: "now" } });
     expect((providers[0] as LiveProvider).applied).toEqual(["max"]);
+  });
+
+  it("a change that needs a rebuild waits while background work runs; the same level again says it's still coming", async () => {
+    const { m, providers } = manager(() => new MockSessionProvider("claude", []));
+    const sid = await create(m, "high");
+    await turn(m, sid);
+    providers[0]!.onSessionEvent!({ type: "background_tasks", tasks: [{ id: "bg1", kind: "subagent", description: "x", status: "running" }] });
+    expect(await setEffort(m, sid, "low")).toMatchObject({ data: { applies: "next-turn" } });
+    expect(await setEffort(m, sid, "low")).toMatchObject({ data: { applies: "next-turn" } }); // still on its way
+    await turn(m, sid);
+    expect(providers[0]!.capturedOpts.at(-1)?.effort).toBe("high"); // background work isn't stopped for it
+    providers[0]!.onSessionEvent!({ type: "background_tasks", tasks: [] });
+    await turn(m, sid);
+    expect(providers[0]!.capturedOpts.at(-1)?.effort).toBe("low");
+    expect(await setEffort(m, sid, "low")).toMatchObject({ data: { applies: "now" } }); // in effect
   });
 
   it("rebuilds a backend that takes it only at startup — before the next turn, never under a running one", async () => {

@@ -40,6 +40,7 @@ A level the server refuses fails the turn with a note saying so; pick another, o
 A change never cuts a running turn short.
 
 - **Now**, on the running backend: Claude (except to or from Off, or back to Default), Qwen (except back to Default), pi.
+  A change that needs a rebuild waits while the backend has background work running, so that work isn't stopped.
 - **From the next turn**: Codex, OpenAI, llama.cpp, Gemini — they take it with every request — and the exceptions above, whose next turn starts a fresh query that resumes the conversation.
 - **After a restart, between turns**: the Gemini CLI, which reads it only from its settings at startup.
   It restarts before the next turn that starts with no background work running, and resumes the conversation, as after a model change.
@@ -70,5 +71,5 @@ Notes:
   The overlays live under `~/.codeoid/accounts/pi-session/`.
   pi's OAuth refresh locks the real `auth.json`, so codeoid's pi and one you run yourself refresh in turn; only a sign-in or sign-out made in both at the same moment isn't serialized.
 - The Gemini CLI and pi overlays of an account's home are removed with the account.
-- **At Default**, a backend reads its own config as it always did: Qwen applies a project's `.qwen/settings.json` reasoning effort, Claude your Claude Code effort setting. A level you set overrides them.
+- **At Default**, a backend reads its own config as it always did: Qwen applies a project's `.qwen/settings.json` reasoning effort, Claude your Claude Code effort setting (your own, or the project's `.claude/settings.json`). A level you set overrides them.
 - **A project's own Gemini CLI settings** (`.gemini/settings.json` in the workdir) outrank your user settings, so a project that redefines `chat-base-2.5` or `chat-base-3` there overrides the effort on the Gemini CLI.

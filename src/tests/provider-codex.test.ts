@@ -1359,3 +1359,42 @@ describe("CodexProvider – the model it runs unasked (#417)", () => {
     expect(reported).toEqual([{ value: "gpt-5.6-terra", isDefault: true }]);
   });
 });
+
+describe("CodexProvider – Default as the catalog shows it (#417)", () => {
+  const report = async (env: Record<string, string>) => {
+    const saved: Record<string, string | undefined> = {};
+    for (const [k, v] of Object.entries(env)) {
+      saved[k] = process.env[k];
+      process.env[k] = v;
+    }
+    const reported: Array<{ value: string; isDefault?: boolean; defaultEffort?: string }> = [];
+    try {
+      const p = new CodexProvider({
+        sessionId: "sess-e",
+        initialBackingId: "sess-e",
+        command: process.execPath,
+        argsPrefix: [FIXTURE],
+        store: {} as Store,
+        onModels: (models) =>
+          reported.push(...models.map((m) => ({ value: m.value, ...(m.isDefault ? { isDefault: true } : {}), ...(m.defaultEffort ? { defaultEffort: m.defaultEffort } : {}) }))),
+      });
+      await collect(p.runTurn(turnOpts("hello")));
+      await p.teardown();
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+    return reported;
+  };
+
+  it("a configured model the catalog doesn't list: no row is the default, not even the catalog's own", async () => {
+    expect(await report({ CODEX_FAKE_LIST_DEFAULT: "1" })).toEqual([{ value: "gpt-5.6-terra", isDefault: true, defaultEffort: "low" }]);
+    expect(await report({ CODEX_FAKE_LIST_DEFAULT: "1", CODEX_FAKE_CONFIG_MODEL: "my-unlisted-model" })).toEqual([{ value: "gpt-5.6-terra", defaultEffort: "low" }]);
+  });
+
+  it("a configured effort is every row's default — what Default sends", async () => {
+    expect(await report({ CODEX_FAKE_CONFIG_EFFORT: "xhigh" })).toEqual([{ value: "gpt-5.6-terra", defaultEffort: "xhigh" }]);
+  });
+});

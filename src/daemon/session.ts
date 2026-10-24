@@ -918,6 +918,8 @@ export class Session {
   #effort: EffortLevel | null = null;
   /** A backend whose effort is a startup setting (the Gemini CLI) is rebuilt between turns, once no work is running. */
   #effortRestartPending = false;
+  /** The effort the backend was last handed (#417); undefined before the first turn. */
+  #effortSent: EffortLevel | null | undefined = undefined;
 
   // ── Auto-rotation (Layer D) ────────────────────────────────────────────
   // Claude Code's backing session id — distinct from codeoid's public
@@ -3241,7 +3243,7 @@ export class Session {
           history: this.#accumulator.history,
           userMessage: content,
           model: this.#model ?? undefined,
-          effort: this.#effort ?? undefined,
+          effort: this.#turnEffort() ?? undefined,
           fallbackModel: this.#fallbackModel ?? undefined,
           workdir: this.workdir,
           systemPromptAppend: this.#buildPromptAppend(),
@@ -3332,7 +3334,7 @@ export class Session {
       history: this.#accumulator.history,
       userMessage: turnPrompt,
       model: this.#model ?? undefined,
-      effort: this.#effort ?? undefined,
+      effort: this.#turnEffort() ?? undefined,
       fallbackModel: this.#fallbackModel ?? undefined,
       workdir: this.workdir,
       systemPromptAppend: this.#composePromptAppend(hookPromptAppend),
@@ -4316,7 +4318,7 @@ export class Session {
           history: this.#accumulator.history,
           userMessage: prompt,
           model: this.#model ?? undefined,
-          effort: this.#effort ?? undefined,
+          effort: this.#turnEffort() ?? undefined,
           fallbackModel: this.#fallbackModel ?? undefined,
           workdir: this.workdir,
           systemPromptAppend: this.#composePromptAppend(),
@@ -5081,19 +5083,30 @@ export class Session {
     );
     let applies: EffortChangeResult["applies"] = "next-turn";
     if (effort === prev) {
-      applies = this.#effortRestartPending ? "restart" : "now";
+      // Nothing new — but a change still on its way says so.
+      applies = this.#effortRestartPending ? "restart" : this.#effortSent !== undefined && this.#effortSent !== effort ? "next-turn" : "now";
     } else if (this.#provider.effortChange === "restart") {
       this.#effortRestartPending = true;
       applies = "restart";
     } else if (this.#provider.applyEffort) {
       try {
-        if (await this.#provider.applyEffort(effort)) applies = "now";
+        if (await this.#provider.applyEffort(effort)) {
+          applies = "now";
+          this.#effortSent = effort; // the running backend has it
+        }
       } catch (err) {
         console.error(`[codeoid/session ${this.id}] applying thinking effort live failed (it applies from the next turn): ${err instanceof Error ? err.message : String(err)}`);
       }
     }
     const shown = effort ?? "the backend's default";
-    const when = applies === "now" ? "" : applies === "restart" ? " — the backend restarts with it between turns, once no work is running" : " — from the next turn";
+    const when =
+      applies === "now"
+        ? ""
+        : applies === "restart"
+          ? " — the backend restarts with it between turns, once no work is running"
+          : this.#backgroundTasks.size > 0
+            ? " — from the next turn with no background work running"
+            : " — from the next turn";
     const info = this.#makeMessage("info", `⎆ Thinking effort: ${shown}${when}.`, SYSTEM_IDENTITY, undefined, undefined, {
       event: "session.effort_changed",
       effort,
@@ -5104,6 +5117,18 @@ export class Session {
     this.#broadcastRaw(info);
     this.#broadcastInfoUpdate();
     return { effort, applies };
+  }
+
+  /**
+   * The effort a turn hands the backend (#417). A change the backend can't
+   * take live rebuilds it, which would stop its background work: while any
+   * runs, a turn keeps the effort the backend already has, and the change
+   * lands on the first turn with none.
+   */
+  #turnEffort(): EffortLevel | null {
+    const effort = this.#backgroundTasks.size > 0 && this.#effortSent !== undefined ? this.#effortSent : this.#effort;
+    this.#effortSent = effort;
+    return effort;
   }
 
   /** Rebuild a backend that takes its effort only at startup, between turns (#417). */

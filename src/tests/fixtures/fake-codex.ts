@@ -443,6 +443,7 @@ async function handle(frame: Record<string, unknown>): Promise<void> {
               description: "Balanced agentic coding model.",
               supportedReasoningEfforts: [{ reasoningEffort: "none" }, { reasoningEffort: "low" }, { reasoningEffort: "high" }, { reasoningEffort: "ultra" }],
               defaultReasoningEffort: "low",
+              ...(process.env.CODEX_FAKE_LIST_DEFAULT ? { isDefault: true } : {}),
             },
           ],
         },

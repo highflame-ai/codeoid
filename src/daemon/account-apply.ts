@@ -15,6 +15,7 @@ import { spawn } from "node:child_process";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { atomicWrite, getConfigDir } from "../config.js";
 import type { EffortLevel } from "../protocol/types.js";
 import { AccountError, overlayKey, type ResolvedAccount } from "./accounts.js";
@@ -358,6 +359,7 @@ export function defaultPiAgentDir(env: Record<string, string | undefined> = proc
 /** pi's agent dir, as pi reads PI_CODING_AGENT_DIR (a leading ~ is home). */
 export function piAgentDirOf(env: Record<string, string | undefined>): string {
   const dir = env.PI_CODING_AGENT_DIR || defaultPiAgentDir(env);
+  if (dir.startsWith("file://")) return fileURLToPath(dir); // pi takes a file URL too
   return dir === "~" || dir.startsWith("~/") ? join(env.HOME || homedir(), dir.slice(1)) : dir;
 }
 

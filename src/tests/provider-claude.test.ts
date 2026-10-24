@@ -2679,10 +2679,16 @@ describe("thinking effort", () => {
     void turn(provider, "max");
     for (let i = 0; i < 20; i++) await Promise.resolve();
     expect(queryCallCount).toBe(1);
-    // ...Off does: a fresh query, with thinking disabled.
-    const off = turn(provider, "off");
+    // ...nor does a turn at "max"; Default does — a fresh query with no effort option.
+    const back = turn(provider);
     for (let i = 0; i < 50 && queryCallCount < 2; i++) await Bun.sleep(2);
     expect(queryCallCount).toBe(2);
+    expect(options().effort).toBeUndefined();
+    void back;
+    // ...Off does: a fresh query, with thinking disabled.
+    const off = turn(provider, "off");
+    for (let i = 0; i < 50 && queryCallCount < 3; i++) await Bun.sleep(2);
+    expect(queryCallCount).toBe(3);
     expect(options().thinking).toEqual({ type: "disabled" });
     release();
     for await (const _ of off.events) {

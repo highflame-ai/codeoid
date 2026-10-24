@@ -990,7 +990,7 @@ program
   )
   .option(
     "--effort <level>",
-    "Thinking effort: off | minimal | low | medium | high | xhigh | max (default: session.defaultEffort, else the backend's own). Change it later with /effort.",
+    "Thinking effort: off | minimal | low | medium | high | xhigh | max, or default for the backend's own (omitted: session.defaultEffort, else the backend's own). Change it later with /effort.",
   )
   .option(
     "--pack <id>",

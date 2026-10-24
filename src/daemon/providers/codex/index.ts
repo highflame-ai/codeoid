@@ -883,14 +883,22 @@ export class CodexProvider implements SessionProvider {
     const listed = await this.listModels();
     // The model codex runs when none is chosen (#417): the user's configured
     // one, else its catalog's default — so a picker shows that model's levels.
+    // A configured effort is what Default sends for every model: shown as theirs.
     let configured: string | null = null;
+    let configuredEffort: EffortLevel | null = null;
     try {
-      const read = (await this.#proc!.request("config/read", {})) as { config?: { model?: string | null } };
+      const read = (await this.#proc!.request("config/read", {})) as { config?: { model?: string | null; model_reasoning_effort?: string | null } };
       configured = read.config?.model ?? null;
+      configuredEffort = fromCodexEffort(read.config?.model_reasoning_effort ?? undefined);
     } catch {
       // Unknown: the catalog's own default stands.
     }
-    const models = configured && listed.some((m) => m.id === configured) ? listed.map((m) => ({ ...m, isDefault: m.id === configured })) : listed;
+    // A configured model the catalog doesn't list: no row is the one codex runs.
+    const models = listed.map((m) => ({
+      ...m,
+      isDefault: configured ? m.id === configured : m.isDefault === true,
+      ...(configuredEffort ? { defaultEffort: configuredEffort } : {}),
+    }));
     if (models.length > 0) {
       this.#modelsReported = true;
       this.#onModels(
