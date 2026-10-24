@@ -12,6 +12,8 @@ import { randomUUID } from "node:crypto";
 import { ZeroIdVerifier, type AuthConfig } from "./auth.js";
 import type { TokenVerifier } from "./verifier.js";
 import {
+  LOCAL_ACCOUNT_ID,
+  LOCAL_PROJECT_ID,
   LocalVerifier,
   removeLocalTokenFile,
   writeLocalTokenFile,
@@ -505,12 +507,17 @@ export class DaemonServer {
         // re-key above so it registers the ids episodes now carry.
         if (this.#memory.store.needsWorkspaceTenantBackfill()) {
           try {
-            const r = this.#memory.store.backfillWorkspaceTenants(
-              this.#store.listAllSessionsForMigration(),
-              workspaceIdFromPath,
-            );
+            const r = this.#memory.store.backfillWorkspaceTenants({
+              sessions: this.#store.listAllSessionsForMigration(),
+              workspaceIdFor: workspaceIdFromPath,
+              extraTenants: [{ accountId: LOCAL_ACCOUNT_ID, projectId: LOCAL_PROJECT_ID }],
+            });
             if (r.applied) {
-              console.log(`[codeoid] memory: recorded the owner of ${r.registered} workspace(s)`);
+              const unowned =
+                r.unowned > 0
+                  ? `; ${r.unowned} workspace(s) from destroyed sessions have no provable owner and stay out of cross-workspace search`
+                  : "";
+              console.log(`[codeoid] memory: recorded the owner of ${r.registered} workspace(s)${unowned}`);
             }
           } catch (err) {
             console.error(

@@ -81,6 +81,11 @@ async function withinRank(query: string, ws: string): Promise<string[]> {
 // Cross-workspace search is tenant-scoped (#415). The eval corpus is one
 // user's store, so "global" here means each owning tenant in turn, merged.
 const tenants = store.listWorkspaceTenants();
+if (tenants.length === 0) {
+  console.warn(
+    "[eval] no workspace has a recorded owner — boot the daemon once on this store so its backfill runs; global metrics will read 0",
+  );
+}
 
 async function tenantGlobalRank(query: string, rerank: boolean): Promise<string[]> {
   const all: SessionSearchHit[] = [];

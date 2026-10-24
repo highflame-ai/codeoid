@@ -7476,7 +7476,8 @@ mcpHub: this.#mcpHub,
    * able to see sessions to search their content).
    *
    * Resolution of workspace scope:
-   *   - `scope: "all"` → search across every workspace the memory store has
+   *   - `scope: "all"` → search across every workspace the caller's tenant
+   *     owns (never other tenants' memory, #415)
    *   - `scope: "workspace"` (default) + `workdir` explicit → anchor there
    *   - `scope: "workspace"` + no workdir → use the caller's most recent
    *     session if any, else empty-string (engine handles gracefully)

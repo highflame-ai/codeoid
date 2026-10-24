@@ -294,6 +294,11 @@ export class MemoryEngine {
      * default so many sessions are represented across the whole corpus. */
     candidateK?: number;
   }): Promise<RecallHit[]> {
+    // Typed callers cannot omit it; refuse an untyped one rather than search
+    // the whole store.
+    if (!q.tenant?.accountId || !q.tenant.projectId) {
+      throw new Error("recallGlobal requires the caller's tenant");
+    }
     const limit = q.limit ?? 8;
     const candidateK = q.candidateK ?? Math.max(this.#ftsK, 100);
     const now = Date.now();
@@ -387,6 +392,12 @@ export class MemoryEngine {
       opts.candidatePoolSize ??
       (global ? Math.max(150, limit * 15) : Math.max(40, limit * 5));
     const snippetsPerSession = opts.snippetsPerSession ?? 3;
+
+    // A workspace given together with a tenant must belong to it, so a caller
+    // that forwards a client-supplied workspace id cannot cross tenants.
+    if (!global && opts.tenant && !this.#store.isWorkspaceOwnedBy(opts.workspaceId!, opts.tenant)) {
+      return [];
+    }
 
     const hits = global
       ? await this.recallGlobal({

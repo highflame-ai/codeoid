@@ -15,7 +15,7 @@
 import { Database } from "bun:sqlite";
 import { randomUUID, createHash } from "node:crypto";
 import { execSync } from "node:child_process";
-import { resolve, isAbsolute } from "node:path";
+import { resolve, isAbsolute, dirname } from "node:path";
 import type { ClusterableEpisode } from "./cluster.js";
 import type { Episode, FileReadRecord, RecallQuery } from "./types.js";
 import type { TurnUsage } from "../../protocol/types.js";
@@ -114,6 +114,12 @@ export function workspaceIdFromPath(
   // source made git treat this file as binary and refuse to text-merge it
   // (every pair of PRs touching this file conflicted wholesale). The
   // string VALUE is identical, so derived workspace ids are unchanged.
+  // A NUL inside a part would let two different tenants produce the same
+  // scope (and so the same workspace ids). Claims never carry one; refuse it
+  // rather than change the encoding, which would re-key every workspace.
+  if (tenant.accountId.includes("\u0000") || tenant.projectId.includes("\u0000")) {
+    throw new Error("workspace tenant ids must not contain NUL");
+  }
   const scope = `${tenant.accountId}\u0000${tenant.projectId}\u0000`;
 
   const cacheKey = scope + normalized;
@@ -179,6 +185,21 @@ export function legacyWorkspaceIdFromPath(workdir: string): string {
   const hash = createHash("sha256").update(normalized).digest("hex");
   return `ws_${hash.slice(0, 16)}`;
 }
+
+/**
+ * Keyword search across one tenant's workspaces. CROSS JOIN pins the loop
+ * order: the FTS match drives, and each hit is checked against its workspace's
+ * owner. With a plain JOIN the planner starts from workspace_tenants and re-runs
+ * MATCH per owned episode — 200–8000x slower on a real store, and bun:sqlite
+ * blocks the daemon's event loop for the duration.
+ */
+const FTS_SEARCH_GLOBAL_SQL = `SELECT e.id AS id, bm25(episodes_fts) AS bm25
+  FROM episodes_fts
+  CROSS JOIN episodes e ON e.rowid = episodes_fts.rowid
+  CROSS JOIN workspace_tenants t ON t.workspace_id = e.workspace_id
+  WHERE episodes_fts MATCH ? AND t.account_id = ? AND t.project_id = ?
+  ORDER BY bm25
+  LIMIT ?`;
 
 /** Bump when adding a new PRAGMA user_version-guarded episode migration. */
 const TENANT_WS_MIGRATION_VERSION = 1;
@@ -482,9 +503,8 @@ export class SqliteEpisodeStore {
    *
    * `sessions` is every persisted session (id, workdir, tenant). Episodes are
    * re-keyed by their OWNING session — precise, and it isolates two tenants that
-   * shared a directory. Episodes whose session was destroyed are re-keyed only
-   * when their old workspace id maps to a SINGLE tenant (unambiguous); ambiguous
-   * multi-tenant orphans are left untouched rather than risk mis-attribution.
+   * shared a directory. Episodes whose session was destroyed are left on their
+   * old id: which tenant owned them cannot be proven from surviving sessions.
    *
    * Guarded by PRAGMA user_version so it runs once, and idempotent (re-keying to
    * the same id is a no-op) if it runs again. Only `episodes` is re-keyed —
@@ -523,32 +543,20 @@ export class SqliteEpisodeStore {
       const bySession = this.#db.prepare(
         "UPDATE episodes SET workspace_id = ? WHERE session_id = ? AND workspace_id != ?",
       );
-      // old path-only id -> distinct new ids, to detect multi-tenant ambiguity.
-      const oldToNew = new Map<string, Set<string>>();
-
       for (const s of sessions) {
         const newWs = workspaceIdFor(s.workdir, {
           accountId: s.accountId,
           projectId: s.projectId,
         });
         reKeyed += Number(bySession.run(newWs, s.id, newWs).changes ?? 0);
-        const oldWs = legacyWorkspaceIdFromPath(s.workdir);
-        const set = oldToNew.get(oldWs) ?? new Set<string>();
-        set.add(newWs);
-        oldToNew.set(oldWs, set);
       }
 
-      // Orphans (session destroyed): re-key only where the old id resolves to a
-      // single tenant, so we never merge two tenants' memory.
-      const byWorkspace = this.#db.prepare(
-        "UPDATE episodes SET workspace_id = ? WHERE workspace_id = ?",
-      );
-      for (const [oldWs, news] of oldToNew) {
-        if (news.size !== 1) continue;
-        const newWs = [...news][0]!;
-        if (newWs === oldWs) continue;
-        reKeyed += Number(byWorkspace.run(newWs, oldWs).changes ?? 0);
-      }
+      // Orphans (session destroyed) are left on their path-only id. A
+      // "single tenant" test can only count sessions that still exist, so a
+      // destroyed tenant's orphans would look like the survivor's and be handed
+      // to it. Left alone, they have no owner row and stay invisible to every
+      // tenant's cross-workspace search; backfillWorkspaceTenants recovers the
+      // ones whose owner it can prove by hash.
 
       this.#db.exec(`PRAGMA user_version = ${TENANT_WS_MIGRATION_VERSION}`);
       this.#vectorCache.clear();
@@ -1270,6 +1278,17 @@ export class SqliteEpisodeStore {
       .run(workspaceId, tenant.accountId, tenant.projectId);
   }
 
+  /** Whether `tenant` is the recorded owner of `workspaceId`. */
+  isWorkspaceOwnedBy(workspaceId: string, tenant: WorkspaceTenant): boolean {
+    return (
+      this.#db
+        .prepare(
+          "SELECT 1 FROM workspace_tenants WHERE workspace_id = ? AND account_id = ? AND project_id = ?",
+        )
+        .get(workspaceId, tenant.accountId, tenant.projectId) != null
+    );
+  }
+
   /** Whether the one-time workspace-tenant backfill still needs to run. */
   needsWorkspaceTenantBackfill(): boolean {
     return (
@@ -1280,32 +1299,119 @@ export class SqliteEpisodeStore {
   }
 
   /**
-   * One-time: give every persisted session's workspace a tenant row, so memory
-   * written before `workspace_tenants` existed stays reachable by cross-workspace
-   * retrieval. Sessions created afterwards register themselves at construction.
-   * A workspace whose sessions were all destroyed before this ran gets no row and
-   * stays invisible to cross-workspace retrieval — its owner cannot be proven.
-   * Per-workspace recall (by the owning session's own id) is unaffected.
+   * One-time: record the owner of every workspace that already holds episodes,
+   * so memory written before `workspace_tenants` existed stays reachable by its
+   * tenant's cross-workspace search. Sessions created afterwards register
+   * themselves at construction.
+   *
+   * Ownership is taken only from proof:
+   * - a workspace whose episodes belong to persisted sessions of exactly one
+   *   tenant is that tenant's (the ids episodes actually carry, not ids
+   *   recomputed from workdirs, which drift when a worktree is removed);
+   * - a workspace with no persisted session is an orphan, registered only when
+   *   `workspaceIdFor(dir, tenant)` reproduces its id for a candidate directory
+   *   and tenant — the id hashes the tenant in, so a match proves the owner.
+   *   Candidate directories are session workdirs plus the directories (and
+   *   their ancestors) of the orphans' recorded file paths, bounded by
+   *   `maxProbeDirs` since each costs a git probe.
+   * Pre-tenant path-only ids are never registered. Anything unproven stays
+   * invisible to cross-workspace search; per-workspace recall is unaffected.
    */
-  backfillWorkspaceTenants(
-    sessions: ReadonlyArray<{ workdir: string; accountId: string; projectId: string }>,
-    workspaceIdFor: (workdir: string, tenant: WorkspaceTenant) => string,
-  ): { applied: boolean; registered: number } {
-    if (!this.needsWorkspaceTenantBackfill()) return { applied: false, registered: 0 };
+  backfillWorkspaceTenants(opts: {
+    sessions: ReadonlyArray<{ id: string; workdir: string; accountId: string; projectId: string }>;
+    workspaceIdFor: (workdir: string, tenant: WorkspaceTenant) => string;
+    /** Tenants that may own orphans beyond those in `sessions` (e.g. local mode). */
+    extraTenants?: ReadonlyArray<WorkspaceTenant>;
+    maxProbeDirs?: number;
+  }): { applied: boolean; registered: number; unowned: number } {
+    if (!this.needsWorkspaceTenantBackfill()) return { applied: false, registered: 0, unowned: 0 };
+
+    const tenantKey = (t: WorkspaceTenant) => `${t.accountId}\u0000${t.projectId}`;
+    const tenantBySession = new Map<string, WorkspaceTenant>();
+    const tenants = new Map<string, WorkspaceTenant>();
+    const legacyIds = new Set<string>();
+    for (const s of opts.sessions) {
+      const t = { accountId: s.accountId, projectId: s.projectId };
+      tenantBySession.set(s.id, t);
+      tenants.set(tenantKey(t), t);
+      legacyIds.add(legacyWorkspaceIdFromPath(s.workdir));
+    }
+    for (const t of opts.extraTenants ?? []) tenants.set(tenantKey(t), t);
+
+    const owners = new Map<string, Map<string, WorkspaceTenant>>();
+    const orphans = new Set<string>();
+    const rows = this.#db
+      .prepare("SELECT DISTINCT workspace_id AS w, session_id AS s FROM episodes")
+      .all() as Array<{ w: string; s: string }>;
+    for (const r of rows) {
+      const t = tenantBySession.get(r.s);
+      if (!t) continue;
+      const m = owners.get(r.w) ?? new Map<string, WorkspaceTenant>();
+      m.set(tenantKey(t), t);
+      owners.set(r.w, m);
+    }
+    for (const r of rows) if (!owners.has(r.w)) orphans.add(r.w);
+
+    const toRegister = new Map<string, WorkspaceTenant>();
+    for (const [ws, m] of owners) {
+      // Two tenants' sessions in one id can only be a pre-tenant path-only id.
+      if (m.size !== 1 || legacyIds.has(ws)) continue;
+      toRegister.set(ws, [...m.values()][0]!);
+    }
+
+    if (orphans.size > 0 && tenants.size > 0) {
+      const max = opts.maxProbeDirs ?? 400;
+      const dirs = new Set<string>(opts.sessions.map((s) => s.workdir));
+      const pathRows = this.#db
+        .prepare(
+          `SELECT DISTINCT file_paths AS f FROM episodes
+           WHERE workspace_id IN (${[...orphans].map(() => "?").join(",")}) AND file_paths != '[]'
+           LIMIT 2000`,
+        )
+        .all(...orphans) as Array<{ f: string }>;
+      outer: for (const r of pathRows) {
+        let paths: unknown;
+        try {
+          paths = JSON.parse(r.f);
+        } catch {
+          continue;
+        }
+        if (!Array.isArray(paths)) continue;
+        for (const p of paths) {
+          if (typeof p !== "string" || !isAbsolute(p)) continue;
+          for (let d = dirname(p); d !== dirname(d); d = dirname(d)) {
+            if (dirs.size >= max) break outer;
+            dirs.add(d);
+          }
+        }
+      }
+      for (const dir of dirs) {
+        if (orphans.size === 0) break;
+        for (const t of tenants.values()) {
+          let id: string;
+          try {
+            id = opts.workspaceIdFor(dir, t);
+          } catch {
+            continue;
+          }
+          if (orphans.delete(id)) toRegister.set(id, t);
+        }
+      }
+    }
+
     let registered = 0;
     this.#db.transaction(() => {
       const ins = this.#db.prepare(
         "INSERT OR IGNORE INTO workspace_tenants (workspace_id, account_id, project_id) VALUES (?, ?, ?)",
       );
-      for (const s of sessions) {
-        const tenant = { accountId: s.accountId, projectId: s.projectId };
-        registered += Number(ins.run(workspaceIdFor(s.workdir, tenant), s.accountId, s.projectId).changes ?? 0);
+      for (const [ws, t] of toRegister) {
+        registered += Number(ins.run(ws, t.accountId, t.projectId).changes ?? 0);
       }
       this.#db
         .prepare("INSERT INTO memory_migrations (name, applied_at) VALUES (?, ?)")
         .run(WORKSPACE_TENANT_BACKFILL, Date.now());
     })();
-    return { applied: true, registered };
+    return { applied: true, registered, unowned: orphans.size };
   }
 
   // ── Cross-workspace (global) retrieval primitives ─────────────────────────
@@ -1343,6 +1449,16 @@ export class SqliteEpisodeStore {
     ).map((r) => ({ accountId: r.account_id, projectId: r.project_id }));
   }
 
+  /** Query plan of ftsSearchGlobal, outermost loop first — for the regression
+   *  test that keeps the FTS index driving the join. */
+  explainFtsSearchGlobal(tenant: WorkspaceTenant): string[] {
+    return (
+      this.#db
+        .prepare(`EXPLAIN QUERY PLAN ${FTS_SEARCH_GLOBAL_SQL}`)
+        .all("x", tenant.accountId, tenant.projectId, 10) as Array<{ detail: string }>
+    ).map((r) => r.detail);
+  }
+
   /** FTS5 keyword search across every workspace `tenant` owns. */
   ftsSearchGlobal(
     query: string,
@@ -1353,15 +1469,7 @@ export class SqliteEpisodeStore {
     const sanitized = sanitizeFtsQuery(query);
     if (!sanitized) return [];
     return this.#db
-      .prepare(
-        `SELECT e.id AS id, bm25(episodes_fts) AS bm25
-         FROM episodes_fts
-         JOIN episodes e ON e.rowid = episodes_fts.rowid
-         JOIN workspace_tenants t ON t.workspace_id = e.workspace_id
-         WHERE episodes_fts MATCH ? AND t.account_id = ? AND t.project_id = ?
-         ORDER BY bm25
-         LIMIT ?`,
-      )
+      .prepare(FTS_SEARCH_GLOBAL_SQL)
       .all(sanitized, tenant.accountId, tenant.projectId, limit) as Array<{
       id: string;
       bm25: number;

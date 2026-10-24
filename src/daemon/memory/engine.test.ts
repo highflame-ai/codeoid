@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { SqliteEpisodeStore } from "./store";
+import { SqliteEpisodeStore, legacyWorkspaceIdFromPath, workspaceIdFromPath } from "./store";
 import { MemoryEngine } from "./engine";
 import type { Embedder } from "./embedder";
 import type { Episode } from "./types";
@@ -168,26 +168,88 @@ describe("cross-workspace retrieval is tenant-scoped (#415)", () => {
     await engine.close();
   });
 
-  test("backfill records persisted sessions' workspaces once", () => {
+  test("a workspace passed with a tenant must belong to it", async () => {
+    const { engine } = await twoTenantEngine();
+    const own = await engine.searchSessions({ query: "zebra", workspaceId: "wsMine", tenant: TENANT });
+    expect(own.map((h) => h.sessionId)).toEqual(["mine1"]);
+    const foreign = await engine.searchSessions({ query: "zebra", workspaceId: "wsTheirs", tenant: TENANT });
+    expect(foreign).toEqual([]);
+    await engine.close();
+  });
+
+  test("a tenant id containing NUL is refused rather than colliding with another", () => {
+    expect(() => workspaceIdFromPath("/tmp", { accountId: "a\u0000p", projectId: "" })).toThrow();
+    expect(() => workspaceIdFromPath("/tmp", { accountId: "a", projectId: "p\u0000" })).toThrow();
+  });
+
+  test("backfill registers the ids episodes carry, under their sessions' tenant, once", () => {
     const store = new SqliteEpisodeStore(":memory:");
-    store.insert({ ...ep("ws-/a", "s1", "one", "body"), id: "e1" });
-    const idFor = (workdir: string, t: { accountId: string }) => `ws-${workdir}-${t.accountId}`;
+    // A worktree session's episodes carry the repo's id, not one recomputed
+    // from its (possibly removed) workdir — the backfill must use the former.
+    store.insert({ ...ep("ws-repo", "s1", "one", "body"), id: "e1" });
+    store.insert({ ...ep("ws-other", "s2", "two", "body"), id: "e2" });
+    const idFor = () => "ws-recomputed-never-matches";
     expect(store.needsWorkspaceTenantBackfill()).toBe(true);
-    const first = store.backfillWorkspaceTenants(
-      [
-        { workdir: "/a", ...TENANT },
-        { workdir: "/a", ...TENANT },
-        { workdir: "/b", ...OTHER },
+    const first = store.backfillWorkspaceTenants({
+      sessions: [
+        { id: "s1", workdir: "/gone/worktree", ...TENANT },
+        { id: "s2", workdir: "/b", ...OTHER },
       ],
-      idFor,
-    );
-    expect(first).toEqual({ applied: true, registered: 2 });
-    expect(store.needsWorkspaceTenantBackfill()).toBe(false);
-    expect(store.listWorkspaceTenants()).toHaveLength(2);
-    expect(store.backfillWorkspaceTenants([{ workdir: "/c", ...TENANT }], idFor)).toEqual({
-      applied: false,
-      registered: 0,
+      workspaceIdFor: idFor,
     });
+    expect(first).toEqual({ applied: true, registered: 2, unowned: 0 });
+    expect(store.listWorkspaceIds(TENANT)).toEqual(["ws-repo"]);
+    expect(store.listWorkspaceIds(OTHER)).toEqual(["ws-other"]);
+    expect(store.needsWorkspaceTenantBackfill()).toBe(false);
+    expect(store.backfillWorkspaceTenants({ sessions: [], workspaceIdFor: idFor }).applied).toBe(false);
+    store.close();
+  });
+
+  test("backfill gives an orphan an owner only when the hash proves it", () => {
+    const store = new SqliteEpisodeStore(":memory:");
+    const proven = workspaceIdFromPath("/srv/proj-gone", TENANT);
+    store.insert({ ...ep(proven, "gone-1", "x", "body"), filePaths: ["/srv/proj-gone/src/a.ts"], id: "e1" });
+    store.insert({ ...ep("ws-unprovable", "gone-2", "y", "body"), id: "e2" });
+    const r = store.backfillWorkspaceTenants({
+      sessions: [{ id: "live", workdir: "/elsewhere", ...OTHER }],
+      workspaceIdFor: workspaceIdFromPath,
+      extraTenants: [TENANT],
+    });
+    expect(r).toEqual({ applied: true, registered: 1, unowned: 1 });
+    expect(store.listWorkspaceIds(TENANT)).toEqual([proven]);
+    expect(store.listWorkspaceIds(OTHER)).toEqual([]);
+    store.close();
+  });
+
+  test("backfill never registers a pre-tenant path-only id", () => {
+    const store = new SqliteEpisodeStore(":memory:");
+    const legacy = legacyWorkspaceIdFromPath("/shared");
+    store.insert({ ...ep(legacy, "s1", "x", "body"), id: "e1" });
+    const r = store.backfillWorkspaceTenants({
+      sessions: [{ id: "s1", workdir: "/shared", ...TENANT }],
+      workspaceIdFor: workspaceIdFromPath,
+    });
+    expect(r.registered).toBe(0);
+    expect(store.listWorkspaceIds(TENANT)).toEqual([]);
+    store.close();
+  });
+
+  test("keyword search is driven by the FTS index, not by the tenant's episodes", () => {
+    const store = new SqliteEpisodeStore(":memory:");
+    // Guards the CROSS JOIN order: with a plain JOIN SQLite scanned the
+    // tenant's episodes and re-ran MATCH per row (seconds on a real store).
+    const plan = store.explainFtsSearchGlobal(TENANT);
+    expect(plan[0]).toContain("episodes_fts");
+    store.close();
+  });
+
+  test("the keyword LIMIT applies after the tenant filter", () => {
+    const store = new SqliteEpisodeStore(":memory:");
+    store.registerWorkspaceTenant("wa", TENANT);
+    store.registerWorkspaceTenant("wb", OTHER);
+    for (let i = 0; i < 20; i++) store.insert({ ...ep("wb", `b${i}`, "kiwi", "kiwi kiwi kiwi"), id: `b${i}` });
+    store.insert({ ...ep("wa", "a1", "kiwi", "kiwi"), id: "a1" });
+    expect(store.ftsSearchGlobal("kiwi", 5, TENANT).map((r) => r.id)).toEqual(["a1"]);
     store.close();
   });
 
