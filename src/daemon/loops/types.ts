@@ -55,9 +55,10 @@ export interface LoopBaseRef {
   repo?: string;
   /** What to fetch when the commit isn't local, e.g. `refs/pull/12/head`. */
   fetchRef?: string;
-  /** Every commit past the default branch is by someone the owner trusts
-   *  (a watch checked). Only then does the setup recipe copy the owner's
-   *  files next to a commit that isn't on their checkout's history. */
+  /** A watch checked that someone the owner trusts pushed this head (or
+   *  signed every commit past the default branch, verified by GitHub). Only
+   *  then does the setup recipe copy the owner's files next to a commit that
+   *  isn't on their checkout's history. */
   trusted?: boolean;
 }
 
@@ -261,3 +262,13 @@ export const LOOP_LIMITS = {
   /** Event text a trigger carries into a run. */
   TRIGGER_SUMMARY_MAX: 4_000,
 } as const;
+
+/**
+ * The run's workspace can't be prepared for a reason trying again won't
+ * change (a shallow clone can't take a fetched head): a watch drops the event
+ * at once instead of retrying it.
+ */
+export class LoopWorkspaceUnsupportedError extends Error {}
+
+/** The run event that marks a run whose workspace can't be prepared at all. */
+export const WORKSPACE_UNSUPPORTED_EVENT = "workspace.unsupported";

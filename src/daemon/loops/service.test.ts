@@ -12,7 +12,7 @@ import type { CheckRun } from "../evidence/service.js";
 import type { CheckSpec, EvidenceRecord } from "../evidence/types.js";
 import { type CandidateCheckout, LoopError, type LoopHost, LoopService, type LoopStartInput, judgeAttempt } from "./service.js";
 import { LoopStore } from "./store.js";
-import type { LoopAttemptRow, LoopRunRow } from "./types.js";
+import { type LoopAttemptRow, type LoopRunRow, LoopWorkspaceUnsupportedError } from "./types.js";
 
 const OWNER = { sub: "user:a", accountId: "acct", projectId: "proj" };
 
@@ -1061,8 +1061,22 @@ describe("triggered runs", () => {
     const { service } = setup(new BrokenHost());
     const run = await settle(service, service.startRun(input({ baseRef: { sha: SHA }, trigger: trigger("ci_failure") }), OWNER).id, terminal);
     expect(run.status).toBe("failed");
-    expect(service.setupFailure(run.id)).toContain("transport 'file' not allowed");
+    expect(service.setupFailure(run.id)).toMatchObject({ retry: true });
+    expect(service.setupFailure(run.id)!.reason).toContain("transport 'file' not allowed");
     expect(service.isActive(run.id)).toBe(false);
+  });
+
+  test("a workspace that can't be prepared at all says so, for a watch not to retry", async () => {
+    class ShallowHost extends FakeHost {
+      override async prepareWorkspace(): Promise<never> {
+        throw new LoopWorkspaceUnsupportedError("this repository is a shallow clone");
+      }
+    }
+    const { service } = setup(new ShallowHost());
+    const run = await settle(service, service.startRun(input({ baseRef: { sha: SHA }, trigger: trigger("ci_failure") }), OWNER).id, terminal);
+    expect(run.status).toBe("failed");
+    expect(service.setupFailure(run.id)).toMatchObject({ retry: false });
+    expect(service.setupFailure(run.id)!.reason).toContain("shallow clone");
   });
 
   test("a CI trigger whose checks pass locally still has nothing to repair", async () => {

@@ -53,19 +53,26 @@ let ghCalls: string[][];
 let checkRuns: Array<{ id: number; name: string; status: string; conclusion: string }>;
 let prHead: () => string;
 let headCommits: Array<{ author: string | null; committer: string | null }>;
+/** Who GitHub records as having pushed the pull request's head. */
+let pusher: string;
 
 const fakeGh: GhExec = async (args) => {
   ghCalls.push(args);
   const ok = (v: unknown) => ({ code: 0, stdout: JSON.stringify(v), stderr: "" });
   if (args[0] === "api" && args[1] === "user") return ok({ login: "owner" });
-  if (args[0] === "pr") return ok([{ number: 7, headRefName: "feature", headRefOid: prHead(), url: "https://github.com/acme/shop/pull/7" }]);
+  if (args[0] === "pr") {
+    return ok([
+      { number: 7, headRefName: "feature", headRefOid: prHead(), url: "https://github.com/acme/shop/pull/7", headRepository: { name: "shop" }, headRepositoryOwner: { login: "acme" } },
+    ]);
+  }
   const path = args.at(-1)!;
   if (path === "repos/acme/shop") return ok({ default_branch: "main" });
+  if (path.startsWith("repos/acme/shop/activity?")) return ok([{ after: prHead(), activity_type: "push", actor: { login: pusher } }]);
   if (path.includes("/compare/main...")) {
     return ok({ total_commits: headCommits.length, commits: headCommits.map((c, i) => ({ sha: String(i).repeat(40), author: c.author && { login: c.author }, committer: c.committer && { login: c.committer } })) });
   }
   if (path.includes("/check-runs")) {
-    return ok({ total_count: checkRuns.length, check_runs: checkRuns.map((c) => ({ ...c, app: { slug: "github-actions" }, output: { title: "status", summary: "status.txt is not ok" } })) });
+    return ok({ total_count: checkRuns.length, check_runs: checkRuns.map((c) => ({ ...c, app: { slug: "github-actions" }, check_suite: { id: 5 }, output: { title: "status", summary: "status.txt is not ok" } })) });
   }
   if (path.includes("/git/commits/")) return ok({ message: "feat: the feature" });
   if (path.includes("/comments") || path.includes("/reviews")) return ok([]);
@@ -138,6 +145,7 @@ beforeEach(() => {
   checkRuns = [{ id: 41, name: "status", status: "completed", conclusion: "failure" }];
   prHead = () => featureSha;
   headCommits = [{ author: "owner", committer: "owner" }];
+  pusher = "owner";
 });
 
 afterEach(async () => {
@@ -149,10 +157,10 @@ afterEach(async () => {
   rmSync(tmp, { recursive: true, force: true });
 });
 
-const createMsg = (): Extract<ClientMessage, { type: "loop.watch.create" }> => ({
+const createMsg = (workdir = repo): Extract<ClientMessage, { type: "loop.watch.create" }> => ({
   type: "loop.watch.create",
   id: "w",
-  spec: { workdir: repo, myPrs: true, ci: [{ ciName: "status", command: "grep -q ok status.txt", timeoutSec: 30 }], limits: { attempts: 2, attemptMinutes: 5, runMinutes: 10 } },
+  spec: { workdir, myPrs: true, ci: [{ ciName: "status", command: "grep -q ok status.txt", timeoutSec: 30 }], limits: { attempts: 2, attemptMinutes: 5, runMinutes: 10 } },
 });
 
 function wsnap(m: DaemonMessage): LoopWatchSnapshotMsg {
@@ -184,7 +192,7 @@ describe("loop watches end to end", () => {
     const done = await until(runId, ended);
 
     expect(done.run.status).toBe("completed");
-    expect(done.run.trigger).toMatchObject({ kind: "ci_failure", key: `ci:acme/shop:${featureSha}:41:1`, watchId: w.watch.id });
+    expect(done.run.trigger).toMatchObject({ kind: "ci_failure", key: `ci:acme/shop:${featureSha}:41:5`, watchId: w.watch.id });
     expect(done.run.baseRef).toEqual({ sha: featureSha, branch: "feature" });
     // Worked from the PR's head: the feature is there, the owner's edit isn't.
     expect(done.run.baseRevision).toBe(featureSha);
@@ -200,9 +208,11 @@ describe("loop watches end to end", () => {
     expect(again.triggers?.map((t) => t.runId)).toEqual([runId]);
   });
 
-  test("a head carrying a commit by someone you don't trust starts nothing", async () => {
+  test("a head pushed by someone you don't trust starts nothing, even with commits that name you", async () => {
     start([]);
-    headCommits = [{ author: "owner", committer: "owner" }, { author: "mallory", committer: "web-flow" }];
+    // Unsigned commits with your email: GitHub names you, which proves nothing.
+    headCommits = [{ author: "owner", committer: "owner" }];
+    pusher = "mallory";
     const w = wsnap(await manager.handle(createMsg(), AUTH, client(AUTH)));
     const polled = wsnap(await manager.handle({ type: "loop.watch.poll", id: "p", watchId: w.watch.id }, AUTH, client(AUTH)));
     expect(polled.poll?.started).toEqual([]);
@@ -242,6 +252,8 @@ describe("loop watches end to end", () => {
     // Your repository's config would send the fetch somewhere that doesn't exist.
     poisonConfig(`file://${join(tmp, "nowhere")}`);
     gitIn(repo, "config", `url.file://${join(tmp, "nowhere")}.insteadOf`, `file://${other}`);
+    // A remote-tracking tip: what the fetch says it already has.
+    gitIn(repo, "update-ref", "refs/remotes/origin/main", "main");
     const polled = wsnap(await manager.handle({ type: "loop.watch.poll", id: "p", watchId: w.watch.id }, AUTH, client(AUTH)));
     expect(polled.poll?.started).toHaveLength(1);
     const done = await until(polled.poll!.started[0]!, ended);
@@ -278,6 +290,36 @@ describe("loop watches end to end", () => {
     expect(existsSync(join(tmp, "pwned-credential"))).toBe(false);
     expect(existsSync(join(tmp, "pwned-ssh"))).toBe(false);
     expect(() => gitIn(repo, "cat-file", "-e", sha)).toThrow();
+  });
+
+  test("a shallow or partial clone can't take a fetched head: the run says so and the event isn't retried", async () => {
+    const { other, sha } = remoteOnly();
+    prHead = () => sha;
+    start([], () => `file://${other}`);
+    const shallow = join(tmp, "shallow");
+    gitIn(tmp, "clone", "-q", "--depth", "1", "--branch", "main", `file://${repo}`, shallow);
+    gitIn(shallow, "remote", "set-url", "origin", "https://github.com/acme/shop.git");
+    const partial = join(tmp, "partial");
+    gitIn(tmp, "clone", "-q", repo, partial);
+    gitIn(partial, "remote", "set-url", "origin", "https://github.com/acme/shop.git");
+    gitIn(partial, "config", "remote.origin.promisor", "true");
+    gitIn(partial, "config", "extensions.partialClone", "origin");
+    for (const [i, [dir, what]] of ([[shallow, "shallow clone"], [partial, "partial clone"]] as const).entries()) {
+      // A new event each time: the first is the owner's, acted on, whichever watch sees it.
+      checkRuns = [{ id: 50 + i, name: "status", status: "completed", conclusion: "failure" }];
+      const w = wsnap(await manager.handle(createMsg(dir), AUTH, client(AUTH)));
+      const polled = wsnap(await manager.handle({ type: "loop.watch.poll", id: "p", watchId: w.watch.id }, AUTH, client(AUTH)));
+      expect(polled.poll?.started).toHaveLength(1);
+      const done = await until(polled.poll!.started[0]!, ended);
+      expect(done.run.status).toBe("failed");
+      expect(done.run.reason).toContain(`this repository is a ${what}`);
+      expect(() => gitIn(dir, "cat-file", "-e", sha)).toThrow(); // nothing was fetched
+      const again = wsnap(await manager.handle({ type: "loop.watch.poll", id: "p2", watchId: w.watch.id }, AUTH, client(AUTH)));
+      expect(again.poll?.started).toEqual([]);
+      expect(again.triggers?.[0]).toMatchObject({ outcome: "ignored" });
+      expect(again.triggers?.[0]?.note).toContain("can't be prepared");
+      await manager.handle({ type: "loop.watch.delete", id: "d", watchId: w.watch.id }, AUTH, client(AUTH));
+    }
   });
 
   test("gh never sees the daemon's secrets", async () => {

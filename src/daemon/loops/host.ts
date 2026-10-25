@@ -7,7 +7,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { closeSync, constants as fsConstants, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, constants as fsConstants, copyFileSync, createReadStream, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, relative } from "node:path";
 import type { AuthContext } from "../../protocol/types.js";
@@ -23,7 +23,7 @@ import { brokenShares, loadSetupRecipe, parseSetupRecipe, prepareWorktree, SETUP
 import { assertNoLinkedParent, commitTree, copyDir, fingerprint, listTree, removeTree, removeTreeAsync, type NameFolding, ObjectReader, resolveUnder, restoreTree, type Stamps, writeTree } from "./materialize.js";
 import type { CandidateCheckout, LoopHost, PreparedWorkspace, WorkerInfo } from "./service.js";
 import { githubFetch } from "./triggers/github.js";
-import type { LoopRunRow } from "./types.js";
+import { type LoopRunRow, LoopWorkspaceUnsupportedError } from "./types.js";
 
 
 /**
@@ -169,10 +169,15 @@ const SCRATCH_IDENTITY = {
  * into a repository the daemon makes for it under its own directory — no config
  * but the fetch's own (githubFetch: https only, gh as the only credential
  * helper, no global or system config) — which borrows your repository's objects
- * so only what is missing is downloaded. What it fetched is then indexed into
- * your repository by hardened git, offline; an object's id is its content, so
+ * so only what is missing is downloaded: its haves are your repository's
+ * remote-tracking tips, resolved offline and named in its own refs (nothing is
+ * run in your repository to list them). What it fetched is checked as it
+ * comes in, then streamed into your repository by hardened git, offline, and
+ * checked again (`index-pack --strict`); an object's id is its content, so
  * nothing added can pose as anything else. Why the fetch failed is in the
- * error, redacted.
+ * error, redacted. A shallow or partial clone is refused before anything is
+ * fetched (LoopWorkspaceUnsupportedError): its objects aren't whole, so it
+ * can't stand behind the fetch's haves or take what comes.
  */
 async function ensureCommit(
   repo: string,
@@ -192,22 +197,41 @@ async function ensureCommit(
     // The ref names a branch or a pull request head and the repository is a
     // validated `owner/name` (both checked in the contract).
     const fetch = githubFetch(from.repo, from.fetchRef, remote?.(from.repo));
+    const commonDir = (await git(["rev-parse", "--path-format=absolute", "--git-common-dir"], repo)).trim();
+    await refuseIncompleteClone(repo, commonDir);
     let dir: string | null = null;
     try {
-      const commonDir = (await git(["rev-parse", "--path-format=absolute", "--git-common-dir"], repo)).trim();
-      dir = mkdtempSync(join(scratchDir, "fetch-"));
       // From the daemon's own directory, discovering nothing above it.
+      dir = mkdtempSync(join(scratchDir, "fetch-"));
+      const own = { GIT_DIR: dir, GIT_CONFIG_GLOBAL: "/dev/null" };
       await git(["init", "-q", "--bare", "--template=", `--object-format=${sha.length === 64 ? "sha256" : "sha1"}`, dir], scratchDir, {
         GIT_CONFIG_GLOBAL: "/dev/null",
         GIT_CEILING_DIRECTORIES: dirname(scratchDir),
       });
       writeExclusive(join(dir, "objects", "info", "alternates"), Buffer.from(`${join(commonDir, "objects")}\n`));
+      // What the fetch may say it has: your remote-tracking tips (what came
+      // from a remote already), read offline by hardened git and named in the
+      // fetch repository's own refs. Without them it would download the
+      // head's whole history.
+      const tips = (await git(["for-each-ref", "--sort=-committerdate", "--count=32", "--format=%(objectname)", "refs/remotes/"], repo))
+        .split("\n")
+        .filter((l) => /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(l));
+      for (const [i, tip] of [...new Set(tips)].entries()) {
+        await git(["update-ref", "--no-deref", `refs/haves/${i}`, `${tip}^{commit}`], dir, own).catch(() => {});
+      }
       await git(fetch.args, dir, { ...fetch.env, GIT_DIR: dir }, { network: fetch.protocol, timeoutMs: 300_000 });
       const packs = join(dir, "objects", "pack");
       for (const name of readdirSync(packs).filter((n) => n.endsWith(".pack"))) {
-        await git(["index-pack", "--stdin"], repo, {}, { input: readFileSync(join(packs, name)), timeoutMs: 300_000 });
+        const at = join(packs, name);
+        const size = statSync(at).size;
+        if (size > FETCHED_PACK_MAX) {
+          throw new LoopWorkspaceUnsupportedError(`the fetched pack is ${Math.ceil(size / 1024 ** 2)} MiB; a loop takes a head whose missing objects fit in ${FETCHED_PACK_MAX / 1024 ** 3} GiB`);
+        }
+        // Streamed from the file, never read into memory whole.
+        await git(["index-pack", "--stdin", "--strict"], repo, {}, { input: createReadStream(at), timeoutMs: 600_000 });
       }
     } catch (err) {
+      if (err instanceof LoopWorkspaceUnsupportedError) throw err;
       const e = err as { stderr?: unknown; message?: string };
       const text = typeof e.stderr === "string" && e.stderr.trim() ? e.stderr : (e.message ?? "");
       why = redactOutput(text).trim().split("\n").slice(-3).join(" ").slice(0, 500);
@@ -219,6 +243,24 @@ async function ensureCommit(
   throw new Error(
     `commit ${sha.slice(0, 12)} is not in the repository and could not be fetched${from.repo && from.fetchRef ? ` from github.com/${from.repo} (${from.fetchRef})` : ""}${why ? `: ${why}` : ""}`,
   );
+}
+
+/** The largest pack a watch's fetch may bring in. */
+const FETCHED_PACK_MAX = 2 * 1024 ** 3;
+
+/**
+ * A shallow or partial clone is missing objects by design: a fetch can't
+ * build on it, and what it took in wouldn't be whole. Said plainly, and not
+ * retried (nothing changes until the clone does).
+ */
+async function refuseIncompleteClone(repo: string, commonDir: string): Promise<void> {
+  if (existsSync(join(commonDir, "shallow"))) {
+    throw new LoopWorkspaceUnsupportedError("this repository is a shallow clone: a shallow or partial clone can't fetch a pull request head for a loop yet (`git fetch --unshallow`, or clone it whole)");
+  }
+  const set = (values: string[]): boolean => values.some((v) => v !== "?" && v.trim() !== "" && v.trim().toLowerCase() !== "false");
+  if (set(await configValues(repo, "^extensions\\.partialclone$")) || set(await configValues(repo, "^remote\\..*\\.promisor$"))) {
+    throw new LoopWorkspaceUnsupportedError("this repository is a partial clone: a shallow or partial clone can't fetch a pull request head for a loop yet (clone it whole)");
+  }
 }
 
 export interface LoopHostDeps {
@@ -333,7 +375,7 @@ export function buildLoopHost(d: LoopHostDeps): LoopHost {
         const setupSince = ticksNow();
         const setupMark = randomUUID();
         // Your copied files (an .env) land next to a commit off your history
-        // only when a watch vouched for everyone who wrote it.
+        // only when a watch vouched for it (pushed, or every commit signed, by someone you trust).
         const setup = await prepareWorktree({
           worktreePath: wt.path,
           policy: d.worktreeSetupPolicy(),

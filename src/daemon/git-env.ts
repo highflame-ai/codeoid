@@ -11,6 +11,7 @@
  */
 
 import { execFile } from "node:child_process";
+import { Readable } from "node:stream";
 import { promisify } from "node:util";
 import { buildSubprocessEnv } from "./providers/env.js";
 
@@ -60,7 +61,7 @@ export async function hardenedGit(
   args: string[],
   cwd: string,
   extraEnv: Record<string, string> = {},
-  opts: { timeoutMs?: number; maxBuffer?: number; input?: string | Buffer; network?: "https" | "file" } = {},
+  opts: { timeoutMs?: number; maxBuffer?: number; input?: string | Buffer | Readable; network?: "https" | "file" } = {},
 ): Promise<string> {
   const base = {
     ...gitEnv({ LANG: "C", GIT_CONFIG_NOSYSTEM: "1", ...extraEnv }, { network: opts.network !== undefined }),
@@ -69,14 +70,24 @@ export async function hardenedGit(
   };
   const timeout = opts.timeoutMs ?? 60_000;
   const maxBuffer = opts.maxBuffer ?? 16 * 1024 * 1024;
-  const run = async (a: string[], env: Record<string, string>, input?: string | Buffer): Promise<string> => {
+  const run = async (a: string[], env: Record<string, string>, input?: string | Buffer | Readable): Promise<string> => {
     if (input === undefined) return (await execFileAsync(GIT_BIN, a, { cwd, env, timeout, maxBuffer })).stdout;
     return new Promise((res, rej) => {
-      const child = execFile(GIT_BIN, a, { cwd, env, timeout, maxBuffer }, (err, stdout) => (err ? rej(err) : res(stdout)));
+      let readFailed: Error | null = null;
+      const child = execFile(GIT_BIN, a, { cwd, env, timeout, maxBuffer }, (err, stdout) => (readFailed ?? err ? rej(readFailed ?? err) : res(stdout)));
       // git that exits early (a bad repository, a timeout) closes its stdin:
       // that is its error to report, not a crash.
       child.stdin?.on("error", () => {});
-      child.stdin?.end(input);
+      if (input instanceof Readable) {
+        // Streamed: a file of any size never sits in memory.
+        input.on("error", (err) => {
+          readFailed = err;
+          child.kill();
+        });
+        if (child.stdin) input.pipe(child.stdin);
+      } else {
+        child.stdin?.end(input);
+      }
     });
   };
   const overrides: Array<[string, string]> = [

@@ -40,6 +40,8 @@ import {
   isTerminalLoopStatus,
   LOOP_DEFAULTS,
   LOOP_LIMITS,
+  LoopWorkspaceUnsupportedError,
+  WORKSPACE_UNSUPPORTED_EVENT,
   type AttemptResult,
   type LoopAttemptRow,
   type LoopBaseRef,
@@ -344,10 +346,15 @@ export class LoopService {
     return run !== null && !isTerminalLoopStatus(run.status);
   }
 
-  /** Why the run failed before it had a workspace, or null (a watch retries those). */
-  setupFailure(runId: string): string | null {
+  /**
+   * Why the run failed before it had a workspace, and whether trying again
+   * could help; null when it didn't (a watch retries the ones that could).
+   */
+  setupFailure(runId: string): { reason: string; retry: boolean } | null {
     const run = this.#store.getRun(runId);
-    return run?.status === "failed" && !run.worktreePath ? (run.reason ?? "the workspace couldn't be prepared") : null;
+    if (run?.status !== "failed" || run.worktreePath) return null;
+    const retry = !this.#store.listEvents(runId).some((e) => e.type === WORKSPACE_UNSUPPORTED_EVENT);
+    return { reason: run.reason ?? "the workspace couldn't be prepared", retry };
   }
 
   isWorker(sessionId: string): boolean {
@@ -742,7 +749,10 @@ export class LoopService {
         // A cancel stopped it; the cancel ends the run.
         // The host removed the worktree before throwing: the claim goes now.
         this.#reserved.delete(runId);
-        if (!ac.signal.aborted) this.#end(run, "failed", `could not prepare the run's workspace: ${errText(err)}`);
+        if (!ac.signal.aborted) {
+          if (err instanceof LoopWorkspaceUnsupportedError) this.#store.appendEvent(runId, SYSTEM, WORKSPACE_UNSUPPORTED_EVENT, errText(err).slice(0, 500));
+          this.#end(run, "failed", `could not prepare the run's workspace: ${errText(err)}`);
+        }
         return;
       } finally {
         this.#preparing.delete(runId);

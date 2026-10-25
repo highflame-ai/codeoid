@@ -16,20 +16,29 @@
  * identity and the owner's run cap. What it guards:
  *
  *   - Trust: a run executes the code at the head it works on (its checks run
- *     it). A head fires only when every commit past the default branch was
- *     authored and committed by a login the owner trusts — gh's own login,
- *     plus the watch's `trust` list. Anything else is ignored for that head.
- *   - Dedupe: every event has a key (`ci:<repo>:<sha>:<checkRunId>:<attempt>`,
+ *     it). The logins the owner trusts are gh's own login, plus the watch's
+ *     `trust` list. A head fires only when GitHub records that a trusted
+ *     login pushed it onto its branch, or when every commit past the default
+ *     branch is signed, verified, and committed by a trusted login. The
+ *     author and committer logins of an unsigned commit are only its email
+ *     matched to an account, which anyone can write, so they vouch for
+ *     nothing. Anything else is ignored for that head.
+ *   - Dedupe: every event has a key (`ci:<repo>:<sha>:<checkRunId>:<suiteId>`,
  *     `review:<repo>:<kind>:<id>`) recorded per owner in `loop_triggers` with
  *     the run it started, so an event seen on every poll, by any of the
  *     owner's watches, starts one run.
  *   - Coalescing: at most one active run per (owner, repository, branch), and
  *     a head's CI is acted on once every mapped check on it has finished. A
- *     later event on a busy branch is skipped without being recorded, and is
- *     picked up by the first poll after the run ends.
+ *     later CI failure on a busy branch is skipped without being recorded, and
+ *     is picked up by the first poll after the run ends; a comment is kept
+ *     waiting to retry, so the comments are read far enough back to find it.
+ *   - Edits: a comment edited after it was made is ignored — anyone with
+ *     write access can edit someone else's comment, so its text is no longer
+ *     the allowed author's.
  *   - Bounds: at most `maxRunsPerHour` runs per watch, the owner's active-run
- *     cap, 30 pull requests per poll, 10 watches per owner, and backing off
- *     when GitHub rate-limits.
+ *     cap, 30 pull requests per poll, 10 watches per owner, and backing off —
+ *     every watch acting as that gh login together — when GitHub rate-limits.
+ *     A watch whose gh login changed under it pauses itself.
  *   - Cycles: a failure on a commit a loop delivered (`codeoid loop:` subject)
  *     is ignored for good, so a loop can't keep repairing its own output.
  *   - Authority: event text (a check's output, a comment) is task data. The
@@ -45,6 +54,7 @@ import { LoopError, SAFE_BRANCH_RE } from "./service.js";
 import type { LoopTenant } from "./store.js";
 import {
   COMMITS_MAX,
+  PRS_MAX,
   type CheckRunRecord,
   type CommentRecord,
   type GhExec,
@@ -98,6 +108,12 @@ const CREATED_SKEW_MS = 2 * 60 * 1000;
 const BACKOFF_MAX_MS = 6 * HOUR_MS;
 /** The account GitHub commits as when its web UI merges or updates a branch. */
 const WEB_FLOW = "web-flow";
+/** A comment changed this long after it was made was edited. */
+const EDIT_GRACE_MS = 5_000;
+/** An event waiting to retry this long without a run is dropped. */
+const RETRY_MAX_AGE_MS = 7 * 24 * HOUR_MS;
+/** Pushes that put a commit at a branch's head (GitHub's activity types). */
+const PUSHES = new Set(["push", "force_push", "branch_creation"]);
 
 export interface WatchHost {
   gh: GhExec;
@@ -109,8 +125,8 @@ export interface WatchHost {
   startRun(input: LoopStartInput, owner: LoopOwner): LoopRunRow;
   /** The run is still in progress. */
   runActive(runId: string): boolean;
-  /** Why the run ended before it had a workspace (the fetch or setup failed), or null. */
-  runSetupFailure(runId: string): string | null;
+  /** Why the run ended before it had a workspace (the fetch or setup failed), and whether another try could help; or null. */
+  runSetupFailure(runId: string): { reason: string; retry: boolean } | null;
   audit(subject: string, action: string, detail: string): void;
 }
 
@@ -137,6 +153,8 @@ export interface PollResult {
 interface Target {
   branch: string;
   sha: string;
+  /** The repository the branch is in (a fork's, for a fork's pull request); null when GitHub doesn't say. */
+  headRepo: string | null;
   pr?: { number: number; url: string };
 }
 
@@ -160,7 +178,11 @@ export class WatchService {
   #stopped = false;
   /** One poll per watch at a time: a manual poll joins a running tick's. */
   readonly #inflight = new Map<string, Promise<PollResult>>();
-  /** Watches GitHub rate-limited: no poll before `until`; `n` doubles the wait. */
+  /**
+   * gh logins GitHub rate-limited: no watch acting as one polls before
+   * `until`; `n` doubles the wait. A rate limit is the account's, so every
+   * watch through that login waits together.
+   */
   readonly #backoff = new Map<string, { until: number; n: number }>();
 
   constructor(store: WatchStore, host: WatchHost, opts: { pollSeconds?: number; firstPollMs?: number; now?: () => number } = {}) {
@@ -199,7 +221,7 @@ export class WatchService {
     try {
       for (const w of this.#store.listEnabled()) {
         if (this.#stopped) break;
-        if ((this.#backoff.get(w.id)?.until ?? 0) > this.#now()) continue;
+        if ((this.#backoff.get(backoffKey(w))?.until ?? 0) > this.#now()) continue;
         try {
           await this.#pollOnce(w.id);
         } catch (err) {
@@ -286,7 +308,6 @@ export class WatchService {
     if (!next) throw new LoopError("Loop watch not found", "not_found");
     // A different trust list judges the heads it refused again.
     if (spec && !sameSet(spec.trust ?? [], w.spec.trust ?? [])) this.#store.forgetUntrusted(next);
-    if (resumed) this.#backoff.delete(id);
     this.#host.audit(owner.sub, "loop.watch.update", `${id}${patch.enabled !== undefined ? ` enabled=${patch.enabled}` : ""}${spec ? " spec" : ""}`);
     if (resumed) this.#later(() => this.#pollOnce(id));
     return next;
@@ -295,7 +316,6 @@ export class WatchService {
   delete(id: string, owner: LoopOwner): void {
     this.get(id, owner);
     this.#store.delete(id);
-    this.#backoff.delete(id);
     this.#host.audit(owner.sub, "loop.watch.delete", id);
   }
 
@@ -398,43 +418,68 @@ export class WatchService {
     const w = this.#store.get(id);
     if (!w || !w.enabled) return result;
     const now = this.#now();
-    const backoff = this.#backoff.get(id);
+    const limiter = backoffKey(w);
+    const backoff = this.#backoff.get(limiter);
     if (backoff && backoff.until > now) {
-      result.skipped.push(`GitHub is rate-limiting this watch; it polls again after ${new Date(backoff.until).toISOString()}`);
+      result.skipped.push(`GitHub is rate-limiting @${w.spec.ghLogin}; this watch polls again after ${new Date(backoff.until).toISOString()}`);
       return result;
     }
     const problems: string[] = [];
     let rateLimited = false;
+    // Set when the poll stopped before it acted on everything it read: the
+    // next poll reads comments from where this one did.
+    let incomplete = false;
     const problem = (where: string, err: unknown): void => {
       if (err instanceof GhError && err.rateLimited) rateLimited = true;
       problems.push(`${where}: ${errText(err)}`);
     };
     const finish = (): PollResult => {
       const note = [...problems, ...result.skipped.filter((s) => !s.includes("picked up after it ends") && !s.includes("still running"))].join("; ");
-      this.#store.markPolled(id, now, note || null, problems.length === 0);
+      this.#store.markPolled(id, now, note || null, problems.length === 0 && !incomplete);
       if (rateLimited) {
-        const n = (backoff?.n ?? 0) + 1;
-        this.#backoff.set(id, { n, until: now + Math.min(this.#pollMs * 2 ** n, BACKOFF_MAX_MS) });
-      } else {
-        this.#backoff.delete(id);
+        const n = (this.#backoff.get(limiter)?.n ?? 0) + 1;
+        this.#backoff.set(limiter, { n, until: now + Math.min(this.#pollMs * 2 ** n, BACKOFF_MAX_MS) });
+      } else if (problems.length === 0) {
+        this.#backoff.delete(limiter);
       }
       return { started: result.started, skipped: [...problems, ...result.skipped] };
     };
+
+    // The watch reads and acts as the login it was made with, and as no one else.
+    let login: string;
+    try {
+      login = await GitHubSource.me(this.#host.gh);
+    } catch (err) {
+      problem("asking gh who it is signed in as", err);
+      return finish();
+    }
+    if (w.spec.ghLogin && login.toLowerCase() !== w.spec.ghLogin.toLowerCase()) {
+      const why = `gh is now signed in as @${login}, but this watch acts as @${w.spec.ghLogin}, so it paused itself; sign gh in as @${w.spec.ghLogin} and resume it, or make a new watch`;
+      this.#store.update(id, { enabled: false });
+      this.#store.markPolled(id, now, why, false);
+      this.#host.audit(w.ownerSub, "loop.watch.pause", `${id} gh login changed to @${login}`);
+      return { started: [], skipped: [why] };
+    }
+
     const gh = new GitHubSource(this.#host.gh, w.repo);
     this.#settle(w, result);
 
     let targets: Target[];
+    let openPrs: Set<number> | null;
     try {
-      targets = await this.#targets(w, gh, result, problem);
+      ({ targets, openPrs } = await this.#targets(w, gh, result, problem));
     } catch (err) {
       problem("listing what to watch", err);
       return finish();
     }
+    // Events left waiting on a pull request that closed, or for a week, are dropped.
+    const expired = this.#store.expireRetries(w, now - RETRY_MAX_AGE_MS, openPrs);
+    if (expired > 0) result.skipped.push(`${expired} event(s) waiting to retry expired (their pull request closed, or they waited a week)`);
 
     const candidates: Candidate[] = [];
     for (const t of targets) {
       // A head already judged untrusted costs no more calls.
-      if (this.#store.seen(w, [untrustedKey(w, t.sha)]).size > 0) continue;
+      if (this.#store.seen(w, [untrustedKey(w, t)]).size > 0) continue;
       try {
         const ci = await this.#ciCandidate(w, gh, t, now);
         if (typeof ci === "string") result.skipped.push(ci);
@@ -444,7 +489,7 @@ export class WatchService {
       }
       if (!w.spec.review.enabled || !t.pr) continue;
       try {
-        candidates.push(...(await this.#reviewCandidates(w, gh, t)));
+        candidates.push(...(await this.#reviewCandidates(w, gh, t, now)));
       } catch (err) {
         problem(`${t.branch} #${t.pr.number}`, err);
       }
@@ -455,8 +500,19 @@ export class WatchService {
     const trust = new Map<string, Promise<string | null>>();
     let defaultBranch: Promise<string> | null = null;
     for (const c of candidates) {
-      if (this.#stopped) break;
+      if (this.#stopped) {
+        incomplete = true;
+        break;
+      }
       const label = `${c.kind === "ci_failure" ? "CI failure" : "review comment"} on ${c.target.branch}`;
+      // A comment is read again only while it waits to retry: one skipped
+      // now is kept waiting, so it isn't lost when the comments are next read
+      // from a later point. A CI failure is seen again on every poll anyway.
+      const skip = (why: string, waitingSince: number | null = null): void => {
+        result.skipped.push(why);
+        if (c.kind !== "review_comment") return;
+        for (const k of c.keys) this.#store.defer(w, k, c.kind, c.target.branch, c.target.pr?.number ?? null, why, waitingSince ?? now);
+      };
       const blocked = (): string | null => {
         if (busy.has(c.target.branch) || this.#store.runsOnBranch(w, c.target.branch).some((r) => this.#host.runActive(r))) {
           busy.add(c.target.branch);
@@ -469,49 +525,69 @@ export class WatchService {
       };
       const first = blocked();
       if (first) {
-        result.skipped.push(first);
+        skip(first);
         continue;
       }
-      // The run will execute this head's code: everyone who wrote it must be trusted.
+      // The run will execute this head's code: its push, or every commit on it, must be vouched for.
+      const at = `${c.target.headRepo ?? ""}:${c.target.branch}:${c.target.sha}`;
       let untrusted: string | null;
       try {
-        if (!trust.has(c.target.sha)) {
+        if (!trust.has(at)) {
           defaultBranch ??= gh.defaultBranch();
-          trust.set(c.target.sha, defaultBranch.then((base) => this.#untrusted(w, gh, base, c.target.sha)));
+          trust.set(at, defaultBranch.then((base) => this.#untrusted(w, gh, base, c.target)));
         }
-        untrusted = await trust.get(c.target.sha)!;
+        untrusted = await trust.get(at)!;
       } catch (err) {
-        trust.delete(c.target.sha);
-        problem(`${c.target.branch}: judging its commits`, err);
+        trust.delete(at);
+        problem(`${c.target.branch}: judging who pushed it`, err);
         continue;
       }
       if (untrusted) {
-        this.#store.ignore(w, untrustedKey(w, c.target.sha), c.kind, c.target.branch, `commits by someone you don't trust: ${untrusted}`, now);
-        result.skipped.push(`${label}: commits by someone you don't trust (${untrusted})`);
+        this.#store.ignore(w, untrustedKey(w, c.target), c.kind, c.target.branch, `not pushed by someone you trust: ${untrusted}`, now);
+        result.skipped.push(`${label}: not pushed by someone you trust (${untrusted})`);
         continue;
       }
       // From here until the run has started nothing awaits, so a pause, a
-      // delete, or another poll can't slip in between the checks and the claim.
+      // delete, a change, or another poll can't slip in between the checks
+      // and the claim.
+      if (this.#stopped) {
+        incomplete = true;
+        break;
+      }
       const cur = this.#store.get(w.id);
       if (!cur?.enabled) {
         result.skipped.push(`${label}: the watch was paused or deleted`);
+        incomplete = true;
+        break;
+      }
+      if (cur.updatedAt !== w.updatedAt) {
+        result.skipped.push(`${label}: the watch changed while it polled; the next poll uses its new rules`);
+        incomplete = true;
         break;
       }
       const again = blocked();
       if (again) {
-        result.skipped.push(again);
+        skip(again);
         continue;
       }
-      if (!this.#store.claim(w, c.keys, c.kind, c.target.branch, now)) continue;
+      const waitingSince = c.kind === "review_comment" ? this.#store.waitingSince(w, c.keys[0]!) : null;
+      if (!this.#store.claim(w, c.keys, c.kind, c.target.branch, now, c.target.pr?.number ?? null)) continue;
       let run: LoopRunRow;
       try {
         run = this.#host.startRun(c.input, ownerOf(w));
       } catch (err) {
         this.#store.release(w, c.keys);
-        result.skipped.push(`${label}: ${errText(err)}`);
+        skip(`${label}: ${errText(err)}`, waitingSince);
         continue;
       }
-      this.#store.bind(w, c.keys, run.id);
+      try {
+        this.#store.bind(w, c.keys, run.id);
+      } catch (err) {
+        // Unbound, the claim would hold the event with no run: give it back.
+        this.#store.release(w, c.keys);
+        problem(`${label}: recording run ${run.id}`, err);
+        continue;
+      }
       busy.add(c.target.branch);
       result.started.push(run.id);
       this.#host.audit(w.ownerSub, "loop.watch.trigger", `${w.id} ${c.keys[0]} → ${run.id}`);
@@ -522,58 +598,93 @@ export class WatchService {
   /**
    * Look at the runs this watch started that haven't been seen to end. One
    * that ended without a workspace (its commit couldn't be fetched, its setup
-   * failed) gives its event back for another try, up to a bound.
+   * failed) gives its event back for another try, up to a bound — unless
+   * trying again can't help (a shallow clone), when the event is dropped now.
    */
   #settle(w: WatchRow, result: PollResult): void {
     for (const u of this.#store.unsettled(w)) {
       if (this.#host.runActive(u.runId)) continue;
-      const why = this.#host.runSetupFailure(u.runId);
-      if (why === null) {
+      const failed = this.#host.runSetupFailure(u.runId);
+      if (failed === null) {
         this.#store.settle(w, u.runId);
         continue;
       }
-      const gaveUp = this.#store.retryOrGiveUp(w, u, why, WATCH_LIMITS.SETUP_TRIES);
+      const gaveUp = this.#store.retryOrGiveUp(w, u, failed.reason, WATCH_LIMITS.SETUP_TRIES, failed.retry);
       result.skipped.push(
-        gaveUp
-          ? `run ${u.runId.slice(0, 13)} couldn't prepare its workspace ${WATCH_LIMITS.SETUP_TRIES} times; its event is dropped: ${why}`
-          : `run ${u.runId.slice(0, 13)} couldn't prepare its workspace; its event is tried again: ${why}`,
+        !failed.retry
+          ? `run ${u.runId.slice(0, 13)} can't prepare its workspace; its event is dropped: ${failed.reason}`
+          : gaveUp
+            ? `run ${u.runId.slice(0, 13)} couldn't prepare its workspace ${WATCH_LIMITS.SETUP_TRIES} times; its event is dropped: ${failed.reason}`
+            : `run ${u.runId.slice(0, 13)} couldn't prepare its workspace; its event is tried again: ${failed.reason}`,
       );
     }
   }
 
-  /** Why the commits `base..head` aren't all by trusted people, or null when they are. */
-  async #untrusted(w: WatchRow, gh: GitHubSource, base: string, head: string): Promise<string | null> {
+  /**
+   * Why the head at `t` isn't vouched for, or null when it is. Vouched for:
+   * GitHub records that a trusted login made the push that put it on its
+   * branch (in the repository the branch is in — a fork's, for a fork's pull
+   * request); or every commit `base..head` is signed, verified by GitHub, and
+   * committed by a trusted login (GitHub's own web-flow commits by a trusted
+   * author). The logins on an unsigned commit are only its emails matched to
+   * accounts, which anyone can write.
+   */
+  async #untrusted(w: WatchRow, gh: GitHubSource, base: string, t: Target): Promise<string | null> {
     const trusted = new Set([w.spec.ghLogin, ...(w.spec.trust ?? [])].filter((l): l is string => !!l).map((l) => l.toLowerCase()));
     if (trusted.size === 0) return "the watch knows no GitHub login to trust";
-    const commits = await gh.commitsBetween(base, head);
-    if (!commits) return `more than ${COMMITS_MAX} commits past ${base}`;
+    const who = (l: string | null) => (l ? `@${l}` : "an account GitHub doesn't name");
+    let pushed: string;
+    const push = t.headRepo ? await gh.pushOf(t.headRepo, t.branch, t.sha) : null;
+    if (!push) pushed = "GitHub has no record of the push that made this head";
+    else if (!PUSHES.has(push.type)) pushed = `this head came from a ${push.type || "change"}, not a push`;
+    else if (push.actor && trusted.has(push.actor.toLowerCase())) return null;
+    else pushed = `pushed by ${who(push.actor)}`;
+    // Not pushed by anyone trusted: every commit must be signed by one.
+    const commits = await gh.commitsBetween(base, t.sha);
+    if (!commits) return `${pushed}, and it has more than ${COMMITS_MAX} commits past ${base} (or GitHub listed fewer than it counted)`;
     for (const c of commits) {
+      const id = c.sha.slice(0, 12);
+      if (!c.verified) return `${pushed}, and ${id} isn't signed and verified`;
       const author = c.author?.toLowerCase() ?? null;
       const committer = c.committer?.toLowerCase() ?? null;
-      const who = (l: string | null) => (l ? `@${l}` : "an account GitHub doesn't know");
-      if (!author || !trusted.has(author)) return `${c.sha.slice(0, 12)} is authored by ${who(c.author)}`;
-      // GitHub's merge and update-branch buttons commit as web-flow; the author is who pressed them.
-      if (!committer || (!trusted.has(committer) && committer !== WEB_FLOW)) return `${c.sha.slice(0, 12)} is committed by ${who(c.committer)}`;
+      // GitHub's merge and update-branch buttons commit as web-flow, signed by GitHub; the author is who pressed them.
+      if (committer === WEB_FLOW) {
+        if (!author || !trusted.has(author)) return `${pushed}, and ${id} was made on GitHub for ${who(c.author)}`;
+      } else if (!committer || !trusted.has(committer)) {
+        return `${pushed}, and ${id} is signed by ${who(c.committer)}`;
+      }
     }
     return null;
   }
 
-  /** The branch heads this watch looks at. A branch that can't be read is a problem for that branch only. */
-  async #targets(w: WatchRow, gh: GitHubSource, result: PollResult, problem: (where: string, err: unknown) => void): Promise<Target[]> {
+  /**
+   * The branch heads this watch looks at, and the numbers of the owner's open
+   * pull requests (null when there may be more than were listed). A branch
+   * that can't be read is a problem for that branch only.
+   */
+  async #targets(
+    w: WatchRow,
+    gh: GitHubSource,
+    result: PollResult,
+    problem: (where: string, err: unknown) => void,
+  ): Promise<{ targets: Target[]; openPrs: Set<number> | null }> {
     const wantPrs = w.spec.myPrs || w.spec.review.enabled;
     const prs = wantPrs ? await gh.myOpenPrs() : [];
+    const openPrs = wantPrs && prs.length < PRS_MAX ? new Set(prs.map((p) => p.number)) : null;
     const usable = prs.filter((p) => SAFE_BRANCH_RE.test(p.headRefName) && /^[0-9a-f]{40}$/.test(p.headRefOid));
     if (w.spec.myPrs) {
       if (usable.length > WATCH_LIMITS.PR_TARGETS_MAX) {
         result.skipped.push(`watching the newest ${WATCH_LIMITS.PR_TARGETS_MAX} of your ${usable.length} open pull requests`);
       }
-      return usable
+      const targets = usable
         .slice(0, WATCH_LIMITS.PR_TARGETS_MAX)
-        .map((p) => ({ branch: p.headRefName, sha: p.headRefOid, pr: { number: p.number, url: p.url } }));
+        .map((p) => ({ branch: p.headRefName, sha: p.headRefOid, headRepo: p.headRepo, pr: { number: p.number, url: p.url } }));
+      return { targets, openPrs };
     }
     const out: Target[] = [];
     for (const branch of w.spec.branches) {
-      const pr = usable.find((p) => p.headRefName === branch);
+      // A watched branch is this repository's: a fork's branch of the same name is someone else's.
+      const pr = usable.find((p) => p.headRefName === branch && p.headRepo !== null && p.headRepo.toLowerCase() === w.repo.toLowerCase());
       let sha: string;
       try {
         sha = pr?.headRefOid ?? (await gh.branchHead(branch));
@@ -582,9 +693,9 @@ export class WatchService {
         continue;
       }
       if (!/^[0-9a-f]{40}$/.test(sha)) continue;
-      out.push({ branch, sha, ...(pr ? { pr: { number: pr.number, url: pr.url } } : {}) });
+      out.push({ branch, sha, headRepo: w.repo, ...(pr ? { pr: { number: pr.number, url: pr.url } } : {}) });
     }
-    return out;
+    return { targets: out, openPrs };
   }
 
   /**
@@ -601,7 +712,8 @@ export class WatchService {
       .filter((f) => f.maps.length > 0);
     const failing = mapped
       .filter((f) => f.run.status === "completed" && f.run.conclusion !== null && FAILED.has(f.run.conclusion))
-      .map((f) => ({ ...f, key: `ci:${w.repo}:${t.sha}:${f.run.id}:${f.run.attempt}` }));
+      // The check run's own id, and its suite's: a re-run is a new check run.
+      .map((f) => ({ ...f, key: `ci:${w.repo}:${t.sha}:${f.run.id}:${f.run.suiteId ?? 0}` }));
     const seen = this.#store.seen(w, failing.map((f) => f.key));
     const fresh = failing.filter((f) => !seen.has(f.key));
     if (fresh.length === 0) return null;
@@ -633,9 +745,11 @@ export class WatchService {
   /**
    * Comments addressed to codeoid by an allowed author, in their own words
    * (not a quote of someone else's), made since the watch was created or last
-   * resumed.
+   * resumed, and not edited since: anyone with write access to the repository
+   * can edit an allowed author's comment, and an edited one is ignored for
+   * good.
    */
-  async #reviewCandidates(w: WatchRow, gh: GitHubSource, t: Target): Promise<Candidate[]> {
+  async #reviewCandidates(w: WatchRow, gh: GitHubSource, t: Target, now: number): Promise<Candidate[]> {
     const allow = new Set(w.spec.review.allow.map((l) => l.toLowerCase()));
     const floor = Math.max(w.createdAt, w.resumedAt ?? 0) - CREATED_SKEW_MS;
     // Read from shortly before the last complete poll — unless an event waits
@@ -647,8 +761,12 @@ export class WatchService {
       .filter((c) => mentions(c.own, w.spec.review.mention));
     const keyed = comments.map((c) => ({ c, key: `review:${w.repo}:${c.kind}:${c.id}` }));
     const seen = this.#store.seen(w, keyed.map((k) => k.key));
-    return keyed
-      .filter((k) => !seen.has(k.key))
+    const fresh = keyed.filter((k) => !seen.has(k.key));
+    for (const { c, key } of fresh) {
+      if (c.updatedAt - c.createdAt > EDIT_GRACE_MS) this.#store.ignore(w, key, "review_comment", t.branch, "edited after it was made", now);
+    }
+    return fresh
+      .filter(({ c }) => c.updatedAt - c.createdAt <= EDIT_GRACE_MS)
       .map(({ c, key }) => ({
         kind: "review_comment" as const,
         target: t,
@@ -672,7 +790,7 @@ export class WatchService {
       ...(w.spec.model ? { model: w.spec.model } : {}),
       ...(w.spec.toolBudget !== undefined ? { toolBudget: w.spec.toolBudget } : {}),
       ...(w.spec.limits ? { limits: w.spec.limits } : {}),
-      // Only a head whose every commit is by a trusted person gets here.
+      // Only a head a trusted login pushed, or whose every commit one signed, gets here.
       baseRef: {
         sha: t.sha,
         branch: t.branch,
@@ -726,9 +844,14 @@ function ciMatches(m: WatchCiMapping, r: CheckRunRecord): boolean {
   return r.app.toLowerCase() === (m.app ?? WATCH_DEFAULTS.ciApp) && globMatch(m.ciName, r.name);
 }
 
-/** The ledger key that marks a head this watch won't act on. */
-function untrustedKey(w: WatchRow, sha: string): string {
-  return `untrusted:${w.id}:${sha}`;
+/** The ledger key that marks a head this watch won't act on: who pushed it is a fact about the branch, so the branch is in it. */
+function untrustedKey(w: WatchRow, t: Target): string {
+  return `untrusted:${w.id}:${t.sha}:${t.headRepo ?? ""}:${t.branch}`;
+}
+
+/** Watches acting as one gh login share its rate limit. */
+function backoffKey(w: WatchRow): string {
+  return (w.spec.ghLogin ?? `watch:${w.id}`).toLowerCase();
 }
 
 function sameSet(a: string[], b: string[]): boolean {

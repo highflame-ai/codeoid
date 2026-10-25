@@ -7,9 +7,12 @@
  * watches — starts one run. A row is claimed before its run starts and
  * released if the run can't start, so an event that was skipped (a run
  * already active on the branch, the owner's run cap, the hourly bound) is
- * picked up on a later poll. A run whose workspace couldn't be prepared gives
- * its keys back for a bounded number of retries. Rows outlive their watch:
- * a new watch must not act on what an old one already did.
+ * picked up on a later poll; a skipped comment is kept waiting to retry
+ * (`defer`), because it is read again only while one waits. A run whose
+ * workspace couldn't be prepared gives its keys back for a bounded number of
+ * retries. An event left waiting on a pull request that closed, or for a
+ * week, expires. Rows outlive their watch: a new watch must not act on what
+ * an old one already did.
  */
 
 import { Database } from "bun:sqlite";
@@ -77,7 +80,7 @@ export interface TriggerRow {
   branch: string;
   /** The run it started; null while claimed, when ignored, or waiting to retry. */
   runId: string | null;
-  /** `retry`: its run's workspace couldn't be prepared; a later poll tries again. */
+  /** `retry`: skipped, or its run's workspace couldn't be prepared; a later poll tries again. */
   outcome: "run" | "ignored" | "retry";
   note: string | null;
   createdAt: number;
@@ -165,6 +168,7 @@ export class WatchStore {
         note        TEXT,
         retries     INTEGER NOT NULL DEFAULT 0,
         settled     INTEGER NOT NULL DEFAULT 0,
+        pr          INTEGER,
         created_at  INTEGER NOT NULL,
         UNIQUE (account_id, project_id, owner_sub, key)
       );
@@ -174,6 +178,7 @@ export class WatchStore {
     for (const c of ["last_ok_at", "resumed_at"]) {
       if (!cols("loop_watches").includes(c)) this.#db.exec(`ALTER TABLE loop_watches ADD COLUMN ${c} INTEGER`);
     }
+    if (!cols("loop_triggers").includes("pr")) this.#db.exec("ALTER TABLE loop_triggers ADD COLUMN pr INTEGER");
   }
 
   // ── Watches ─────────────────────────────────────────────────────────────
@@ -225,7 +230,9 @@ export class WatchStore {
   }
 
   update(id: string, patch: { spec?: WatchSpec; enabled?: boolean; resumedAt?: number }): WatchRow | null {
-    const sets = ["updated_at = ?"];
+    // Strictly later on every change, even within a millisecond: a poll tells
+    // a watch changed under it by this.
+    const sets = ["updated_at = MAX(?, updated_at + 1)"];
     const values: Array<string | number> = [Date.now()];
     if (patch.spec) {
       sets.push("spec_json = ?");
@@ -276,10 +283,10 @@ export class WatchStore {
    * (another poll, or another of the owner's watches, got there first). A key
    * waiting to retry is claimed again.
    */
-  claim(w: WatchRow, keys: string[], kind: TriggerKind, branch: string, at: number): boolean {
+  claim(w: WatchRow, keys: string[], kind: TriggerKind, branch: string, at: number, pr: number | null = null): boolean {
     const ins = this.#db.prepare(
-      `INSERT OR IGNORE INTO loop_triggers (account_id, project_id, owner_sub, repo, watch_id, key, kind, branch, outcome, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'run', ?)`,
+      `INSERT OR IGNORE INTO loop_triggers (account_id, project_id, owner_sub, repo, watch_id, key, kind, branch, outcome, pr, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'run', ?, ?)`,
     );
     const retry = this.#db.prepare(
       `UPDATE loop_triggers SET outcome = 'run', run_id = NULL, settled = 0, watch_id = ?, branch = ?, created_at = ?
@@ -288,7 +295,7 @@ export class WatchStore {
     try {
       this.#db.transaction(() => {
         for (const k of keys) {
-          if (Number(ins.run(w.accountId, w.projectId, w.ownerSub, w.repo, w.id, k, kind, branch, at).changes ?? 0) === 1) continue;
+          if (Number(ins.run(w.accountId, w.projectId, w.ownerSub, w.repo, w.id, k, kind, branch, pr, at).changes ?? 0) === 1) continue;
           if (Number(retry.run(w.id, branch, at, w.accountId, w.projectId, w.ownerSub, k).changes ?? 0) === 1) continue;
           throw new Rollback();
         }
@@ -334,6 +341,56 @@ export class WatchStore {
       .run(w.accountId, w.projectId, w.ownerSub, w.repo, w.id, key, kind, branch, note.slice(0, 500), at);
   }
 
+  /**
+   * Keep an event the watch had to skip (its branch busy, a bound reached)
+   * waiting to retry, with no run. Its age is when it was first skipped.
+   */
+  defer(w: WatchRow, key: string, kind: TriggerKind, branch: string, pr: number | null, note: string, at: number): void {
+    this.#db
+      .prepare(
+        `INSERT INTO loop_triggers (account_id, project_id, owner_sub, repo, watch_id, key, kind, branch, outcome, note, settled, pr, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'retry', ?, 1, ?, ?)
+         ON CONFLICT (account_id, project_id, owner_sub, key) DO UPDATE
+           SET note = excluded.note, watch_id = excluded.watch_id, created_at = MIN(created_at, excluded.created_at)
+         WHERE outcome = 'retry'`,
+      )
+      .run(w.accountId, w.projectId, w.ownerSub, w.repo, w.id, key, kind, branch, note.slice(0, 500), pr, at);
+  }
+
+  /** When `key` was first left waiting to retry, or null when it isn't waiting. */
+  waitingSince(w: WatchRow, key: string): number | null {
+    const row = this.#db
+      .prepare("SELECT created_at FROM loop_triggers WHERE account_id = ? AND project_id = ? AND owner_sub = ? AND key = ? AND outcome = 'retry'")
+      .get(w.accountId, w.projectId, w.ownerSub, key) as { created_at: number } | null;
+    return row?.created_at ?? null;
+  }
+
+  /**
+   * Give up on this watch's events waiting to retry that were first recorded
+   * before `before`, or that are on a pull request not in `openPrs` (null:
+   * the open ones aren't all known). Returns how many expired.
+   */
+  expireRetries(w: WatchRow, before: number, openPrs: Set<number> | null): number {
+    const rows = this.#db
+      .prepare("SELECT key, pr, created_at FROM loop_triggers WHERE watch_id = ? AND outcome = 'retry'")
+      .all(w.id) as Array<{ key: string; pr: number | null; created_at: number }>;
+    const expire = this.#db.prepare(
+      "UPDATE loop_triggers SET outcome = 'ignored', settled = 1, note = ? WHERE account_id = ? AND project_id = ? AND owner_sub = ? AND key = ? AND outcome = 'retry'",
+    );
+    let n = 0;
+    this.#db.transaction(() => {
+      for (const r of rows) {
+        const why = r.created_at < before
+          ? "expired: it waited a week without a run"
+          : r.pr !== null && openPrs !== null && !openPrs.has(r.pr)
+            ? `expired: pull request #${r.pr} is no longer open`
+            : null;
+        if (why) n += Number(expire.run(why, w.accountId, w.projectId, w.ownerSub, r.key).changes ?? 0);
+      }
+    })();
+    return n;
+  }
+
   /** Forget this watch's untrusted-head notes (its trust list changed: judge them again). */
   forgetUntrusted(w: WatchRow): void {
     this.#db.prepare("DELETE FROM loop_triggers WHERE watch_id = ? AND key LIKE ?").run(w.id, `untrusted:${w.id}:%`);
@@ -361,19 +418,26 @@ export class WatchStore {
 
   /**
    * The run's workspace couldn't be prepared: give its keys back for another
-   * try, or, past `max` tries, ignore them for good with the reason. True when
-   * it gave up.
+   * try, or, past `max` tries or when trying again can't help (`retry`
+   * false), ignore them for good with the reason. True when it gave up.
    */
-  retryOrGiveUp(w: WatchRow, run: UnsettledRun, reason: string, max: number): boolean {
+  retryOrGiveUp(w: WatchRow, run: UnsettledRun, reason: string, max: number, retry = true): boolean {
     const tries = run.retries + 1;
-    const giveUp = tries >= max;
+    const giveUp = !retry || tries >= max;
     this.#db
       .prepare(
         giveUp
           ? "UPDATE loop_triggers SET outcome = 'ignored', settled = 1, retries = ?, note = ? WHERE account_id = ? AND project_id = ? AND owner_sub = ? AND run_id = ?"
           : "UPDATE loop_triggers SET outcome = 'retry', settled = 1, retries = ?, note = ?, run_id = NULL WHERE account_id = ? AND project_id = ? AND owner_sub = ? AND run_id = ?",
       )
-      .run(tries, (giveUp ? `the workspace couldn't be prepared ${tries} times: ${reason}` : reason).slice(0, 500), w.accountId, w.projectId, w.ownerSub, run.runId);
+      .run(
+        tries,
+        (!retry ? `the workspace can't be prepared: ${reason}` : giveUp ? `the workspace couldn't be prepared ${tries} times: ${reason}` : reason).slice(0, 500),
+        w.accountId,
+        w.projectId,
+        w.ownerSub,
+        run.runId,
+      );
     return giveUp;
   }
 

@@ -103,7 +103,7 @@ It is opt-in, yours alone, and reads GitHub through the `gh` CLI you are already
 
 **A watch runs the code at your branch heads, unattended.**
 A run's checks execute that code, and so does the worker.
-What bounds it is the [trust rule](#who-a-watch-trusts): a head starts a run only when every commit on it past the default branch was written by you, or by someone you named.
+What bounds it is the [trust rule](#who-a-watch-trusts): a head starts a run only when it was pushed by you, or by someone you named (or every commit on it is signed by one of you and verified).
 
 ```bash
 codeoid loop watch add --workdir ~/src/shop --my-prs \
@@ -131,10 +131,12 @@ Commit statuses (the older API some CI systems still use) are not read; only che
 When you make a watch it reads the login `gh` is signed in as, and keeps it: that is you.
 `--trust <login>` (repeatable, at most 20) names other people whose commits a head may carry.
 
-Before a run starts, the watch reads every commit between the default branch and the head (at most 250).
-Each must be authored by a trusted login and committed by one.
-A commit committed by `web-flow` counts when its author is trusted: that is GitHub's merge and update-branch buttons.
-A commit GitHub can't tie to an account, more than 250 commits, or anyone else, and the head is ignored for good: `show` lists it as ignored, "commits by someone you don't trust", and a later poll doesn't ask again.
+Before a run starts, the watch asks GitHub who made the push that put the head on its branch, from the repository's activity (for a pull request from a fork, the fork's).
+GitHub records the account that pushed, so a push by a trusted login vouches for the head, whatever its commits say.
+The names on a commit vouch for nothing by themselves: GitHub ties a commit to an account by its email, which anyone can write into a commit.
+So when the push wasn't by a trusted login, or GitHub has no record of it, the head is trusted only if every commit between the default branch and the head (at most 250) is signed, verified by GitHub, and committed by a trusted login.
+A commit committed by `web-flow` counts when GitHub verified it and its author is trusted: that is GitHub's merge and update-branch buttons.
+Anything else and the head is ignored for good: `show` lists it as ignored, "not pushed by someone you trust", with why, and a later poll doesn't ask again.
 Changing a watch's trust list (`loop.watch.update`) judges its ignored heads again.
 
 ### What starts a run
@@ -147,17 +149,21 @@ Changing a watch's trust list (`loop.watch.update`) judges its ignored heads aga
   Comments made while a watch was paused don't start runs when you resume it.
   Up to two minutes of clock difference between GitHub and your machine is allowed on that comparison.
   Allowed authors default to the account `gh` is signed in as; `--allow <login>` names others.
+  An allowed author's comment is an instruction to the agent, on code that a trusted login pushed: allow only people you would let ask for a change.
   Only what the author wrote themselves counts, and only that reaches the run: quoted lines (`>`), code, and HTML comments are left out, so quoting someone else's `@codeoid …` asks for nothing.
+  A comment edited more than a few seconds after it was made is ignored for good (`show` lists it as "edited after it was made"): anyone with write access to the repository can edit someone else's comment, so its text may no longer be the author's.
 
 ### What a triggered run works on
 
 - Its worktree is a clean checkout of the branch head the event happened on, never your current checkout and never your uncommitted changes.
-- A head that isn't in your repository is fetched from `https://github.com/<repo>.git` by URL, not through `origin`, and not in your repository at all: into one the daemon makes for the fetch under its own directory, which borrows your repository's objects so only what's missing is downloaded.
-  Your repository's configuration, which an agent can write, has no say over where the fetch goes or what it presents (no url rewrite, proxy, TLS setting, or credential helper of yours applies).
-  The fetch's own configuration is the only one: no global or system config, https only, no ssh or proxy command, and `gh auth git-credential` as the only credential helper, so private repositories work with the login the watch already uses.
-  This is the only git the daemon runs with the network on; what it fetched is then added to your repository's objects offline, by the same hardened git as every other loop step.
+- A head that isn't in your repository is fetched from `https://github.com/<repo>.git` by URL, not through `origin`, and not in your repository at all: into one the daemon makes for the fetch under its own directory, which borrows your repository's objects and tells GitHub it has your remote-tracking branches, so only what's missing is downloaded.
+  Your repository's configuration, which an agent can write, has no say over where the fetch goes or what it presents (no url rewrite, proxy, TLS setting, or credential helper in it applies), and no git runs in your repository during the fetch.
+  The fetch's own configuration is the only one: no global or system config, https only, no redirects, no ssh command, and `gh auth git-credential` as the only credential helper, so private repositories work with the login the watch already uses.
+  A proxy set in the daemon's own environment (`HTTPS_PROXY`) still applies, as it does to the daemon's other connections.
+  This is the only git the daemon runs with the network on; every object it receives is checked, and what it fetched (at most 2 GiB) is then added to your repository's objects offline, by the same hardened git as every other loop step, and checked again.
   A failed fetch says why in the run's reason.
   A run whose workspace couldn't be prepared gives its event back, and the watch tries it again on later polls, three times in all.
+- A shallow or partial clone can't take a fetched head yet: a run that would need one fails at once, saying so, and its event isn't tried again (`git fetch --unshallow`, or clone the repository whole).
 - The delivered commit sits on the run's own `codeoid/loop-…` branch, on top of that head; push it to the pull request yourself.
 - A repository's [setup recipe](CONFIGURATION.md) copies its files (such as `.env`) into the worktree, because the head passed the trust rule.
   Its trusted setup command does not run on a commit that isn't on your checkout's history, such as most pull request heads; the run's history says so, and the checks then run without what that command would have installed.
@@ -166,16 +172,19 @@ Changing a watch's trust list (`loop.watch.update`) judges its ignored heads aga
 
 ### How a watch stays bounded
 
-- Each event starts at most one run, across all of your watches: its key (the commit and check run, or the comment and its kind) is recorded with the run it started, and stays recorded when the watch is deleted.
+- Each event starts at most one run, across all of your watches: its key (the commit, the check run and its suite, or the comment and its kind) is recorded with the run it started, and stays recorded when the watch is deleted.
 - One repair at a time per branch, across all of your watches on the repository; an event on a branch whose run is still going is skipped and picked up by the first poll after that run ends.
 - A watch starts at most 6 runs an hour (`--per-hour`), and its runs count against your limit of three runs in progress; an event skipped for either is tried again on a later poll.
+- A skipped comment is kept waiting to retry (`show` lists it as `retry`), and the watch reads comments far enough back to find it until it gets its run.
+  One still waiting when its pull request closes, or after a week, is dropped.
 - A failure on a commit a loop delivered (its subject starts with `codeoid loop:`) is ignored for good, so a loop can't keep repairing its own output.
 - Check output and comment text are task data: a run's objective is fixed text, and the event's text reaches the worker only inside a quoted data block, truncated to 4,000 characters.
   The terminal prints it with escape sequences and control characters removed, and links only to github.com.
 - A branch that can't be read (deleted, renamed) is a problem for that branch alone; the watch's other branches are still polled.
 - You can have 10 watches.
   Comments are read from ten minutes before the last complete poll, not from the beginning each time.
-  When GitHub rate-limits a watch (HTTP 403 or 429), it backs off: two poll intervals, then four, doubling up to six hours, until a poll gets through.
+  When GitHub rate-limits a watch (HTTP 429, or a 403 that says a rate limit is spent), every watch acting as that `gh` login backs off together: two poll intervals, then four, doubling up to six hours, until a poll gets through.
+  Any other refusal (a 403 for missing access) is an error the watch records, with GitHub's message.
 - `gh` runs with only `PATH`, `HOME`, and its config location in its environment, never the daemon's credentials, and with a timeout; a failed poll is recorded on the watch (`show` displays it, naming the GitHub endpoint) and the next poll tries again.
 
 Watches poll every `loops.watchPollSeconds` seconds (default 300, at least 60), and a few seconds after the daemon starts or a watch is made or resumed.
@@ -187,6 +196,7 @@ Making, changing, resuming, or polling a watch needs the same scopes as starting
 - **One person per daemon.**
   A watch reads and fetches from GitHub as the daemon's `gh` login, so watches belong to one person.
   Once someone has a watch, nobody else can make one on that daemon until theirs are gone.
+  Every poll asks `gh` who it is signed in as; if that is no longer the login the watch was made with, the watch pauses itself and says why.
 - **A watch keeps acting after your credential is revoked.**
   Your scopes are checked when you make, change, resume, or poll a watch, not each time it starts a run, the same as for [routines](routines.md).
   The daemon has no way to ask ZeroID whether a credential it saw earlier is still valid, so revoking your token does not stop a watch.

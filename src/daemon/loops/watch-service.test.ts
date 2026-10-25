@@ -36,6 +36,7 @@ interface Check {
   summary?: string;
   details_url?: string;
   app?: string;
+  suite?: number;
 }
 
 interface Comment {
@@ -43,6 +44,8 @@ interface Comment {
   login: string;
   body: string;
   at?: number;
+  /** When it was last edited, if it was. */
+  editedAt?: number;
   kind?: "review" | "issue" | "review_body";
 }
 
@@ -50,19 +53,34 @@ interface Commit {
   sha: string;
   author: string | null;
   committer: string | null;
+  verified?: boolean;
 }
 
-/** A scripted GitHub: PRs, branch heads, check runs per sha, comments per PR, commits per head. */
+interface Push {
+  /** The repository the branch is in; default REPO. */
+  repo?: string;
+  branch: string;
+  after: string;
+  actor: string | null;
+  type?: string;
+}
+
+/** A scripted GitHub: PRs, branch heads, check runs per sha, comments per PR, commits per head, pushes. */
 class FakeGitHub {
   me = "ada";
-  prs: Array<{ number: number; headRefName: string; headRefOid: string; url: string }> = [];
+  prs: Array<{ number: number; headRefName: string; headRefOid: string; url: string; headRepo?: string | null }> = [];
   branches = new Map<string, string>();
   checks = new Map<string, Check[]>();
   messages = new Map<string, string>();
   comments = new Map<number, Comment[]>();
-  /** Commits past the default branch, per head; absent = one commit by `me`. */
+  /** Commits past the default branch, per head; absent = one unsigned commit by `me`. */
   commits = new Map<string, Commit[]>();
+  /** The repository's push activity, newest first. A head with none listed was pushed by `defaultPusher`. */
+  pushes: Push[] = [];
+  defaultPusher: string | null = "ada";
   calls: string[][] = [];
+  /** What compare reports as the commit count, when it isn't the commits listed. */
+  totalOverride: number | null = null;
   /** Fail any call whose joined args include this. */
   failOn: string | null = null;
   failWith = "HTTP 502: Bad Gateway";
@@ -75,7 +93,31 @@ class FakeGitHub {
     if (this.failOn && joined.includes(this.failOn)) return { code: 1, stdout: "", stderr: this.failWith };
     const ok = (v: unknown): GhResult => ({ code: 0, stdout: JSON.stringify(v), stderr: "" });
     if (args[0] === "api" && args[1] === "user") return ok({ login: this.me });
-    if (args[0] === "pr" && args[1] === "list") return ok(this.prs);
+    if (args[0] === "pr" && args[1] === "list") {
+      return ok(
+        this.prs.map(({ headRepo, ...p }) => {
+          const head = headRepo === undefined ? REPO : headRepo;
+          return { ...p, headRepository: head ? { name: head.split("/")[1] } : null, headRepositoryOwner: head ? { login: head.split("/")[0] } : null };
+        }),
+      );
+    }
+    if (args[0] === "api" && args[1] === "graphql") {
+      const number = Number(args.find((a) => a.startsWith("number="))!.slice(7));
+      const nodes = (this.comments.get(number) ?? [])
+        .filter((c) => c.kind === "review_body")
+        .map((c) => {
+          const at = c.at ?? Date.now() + 1_000;
+          return {
+            databaseId: c.id,
+            body: c.body,
+            url: `https://github.com/${REPO}/pull/${number}#r${c.id}`,
+            submittedAt: new Date(at).toISOString(),
+            lastEditedAt: c.editedAt === undefined ? null : new Date(c.editedAt).toISOString(),
+            author: { login: c.login },
+          };
+        });
+      return ok({ data: { repository: { pullRequest: { reviews: { pageInfo: { hasNextPage: false, endCursor: null }, nodes } } } } });
+    }
     const path = args[args.length - 1]!;
     this.onCall?.(path);
     if (path === `repos/${REPO}`) return ok({ default_branch: "main" });
@@ -83,6 +125,21 @@ class FakeGitHub {
     if (m) {
       const sha = this.branches.get(decodeURIComponent(m[1]!));
       return sha ? ok({ commit: { sha } }) : { code: 1, stdout: "", stderr: "HTTP 404: Branch not found" };
+    }
+    m = /^repos\/([^/]+\/[^/]+)\/activity\?(.*)$/.exec(path);
+    if (m) {
+      const repo = m[1]!;
+      const ref = new URLSearchParams(m[2]).get("ref") ?? "";
+      const listed = this.pushes.filter((p) => (p.repo ?? REPO) === repo && `refs/heads/${p.branch}` === ref);
+      const heads = new Set([...this.prs.map((p) => p.headRefOid), ...this.branches.values()]);
+      const branchOf = (sha: string) => this.prs.find((p) => p.headRefOid === sha)?.headRefName ?? [...this.branches].find(([, v]) => v === sha)?.[0];
+      // Every head nobody scripted a push for was pushed by the default pusher.
+      const implied = this.defaultPusher
+        ? [...heads].filter((sha) => `refs/heads/${branchOf(sha)}` === ref && !this.pushes.some((p) => p.after === sha)).map((sha) => ({ after: sha, actor: this.defaultPusher, type: "push" }))
+        : [];
+      return ok(
+        [...listed, ...implied].map((p) => ({ id: 1, ref, after: p.after, before: "0".repeat(40), activity_type: p.type ?? "push", actor: p.actor ? { login: p.actor } : null })),
+      );
     }
     m = /^repos\/[^/]+\/[^/]+\/compare\/main\.\.\.([0-9a-f]+)\?per_page=(\d+)&page=(\d+)$/.exec(path);
     if (m) {
@@ -93,8 +150,9 @@ class FakeGitHub {
         sha: c.sha,
         author: c.author ? { login: c.author } : null,
         committer: c.committer ? { login: c.committer } : null,
+        commit: { verification: { verified: c.verified === true, reason: c.verified ? "valid" : "unsigned" } },
       }));
-      return ok({ total_commits: all.length, commits });
+      return ok({ total_commits: this.totalOverride ?? all.length, commits });
     }
     m = /^repos\/[^/]+\/[^/]+\/commits\/([0-9a-f]+)\/check-runs/.exec(path);
     if (m) {
@@ -106,6 +164,7 @@ class FakeGitHub {
         conclusion: c.conclusion,
         html_url: `https://github.com/${REPO}/runs/${c.id}`,
         details_url: c.details_url ?? `https://github.com/${REPO}/actions/runs/9/job/${c.id}`,
+        check_suite: { id: c.suite ?? 900 },
         output: { title: `${c.name} failed`, summary: c.summary ?? "1 test failed", text: "" },
       }));
       // Two pages, as `--paginate` prints them.
@@ -114,22 +173,26 @@ class FakeGitHub {
     }
     m = /^repos\/[^/]+\/[^/]+\/git\/commits\/([0-9a-f]+)$/.exec(path);
     if (m) return ok({ message: this.messages.get(m[1]!) ?? "fix: a human commit" });
-    m = /^repos\/[^/]+\/[^/]+\/(pulls|issues)\/(\d+)\/(comments|reviews)\?(.*)$/.exec(path);
+    m = /^repos\/[^/]+\/[^/]+\/(pulls|issues)\/(\d+)\/(comments)\?(.*)$/.exec(path);
     if (m) {
-      const kind = m[3] === "reviews" ? "review_body" : m[1] === "pulls" ? "review" : "issue";
+      const kind = m[1] === "pulls" ? "review" : "issue";
       const since = Date.parse(new URLSearchParams(m[4]).get("since") ?? "");
       const list = (this.comments.get(Number(m[2])) ?? [])
         .filter((c) => (c.kind ?? "issue") === kind)
         // GitHub's `since` is on the last update; here, when it was made.
-        .filter((c) => Number.isNaN(since) || (c.at ?? Date.now() + 1_000) >= since);
+        .filter((c) => Number.isNaN(since) || (c.editedAt ?? c.at ?? Date.now() + 1_000) >= since);
       return ok(
-        list.map((c) => ({
-          id: c.id,
-          user: { login: c.login },
-          body: c.body,
-          html_url: `https://github.com/${REPO}/pull/${m![2]}#c${c.id}`,
-          [kind === "review_body" ? "submitted_at" : "created_at"]: new Date(c.at ?? Date.now() + 1_000).toISOString(),
-        })),
+        list.map((c) => {
+          const at = new Date(c.at ?? Date.now() + 1_000).toISOString();
+          return {
+            id: c.id,
+            user: { login: c.login },
+            body: c.body,
+            html_url: `https://github.com/${REPO}/pull/${m![2]}#c${c.id}`,
+            created_at: at,
+            updated_at: c.editedAt === undefined ? at : new Date(c.editedAt).toISOString(),
+          };
+        }),
       );
     }
     return { code: 1, stdout: "", stderr: `unscripted: gh ${joined}` };
@@ -145,6 +208,8 @@ class FakeLoops {
   active = new Set<string>();
   /** Runs that ended because their workspace couldn't be prepared, and why. */
   setupFailed = new Map<string, string>();
+  /** Of those, the ones trying again can't help. */
+  unsupported = new Set<string>();
   /** The owner is at their active-run cap. */
   capped = false;
   start(input: LoopStartInput, owner: LoopOwner): LoopRunRow {
@@ -169,7 +234,10 @@ function host(over: Partial<WatchHost> = {}): WatchHost {
     originUrl: async () => `git@github.com:${REPO}.git`,
     startRun: (input, owner) => loops.start(input, owner),
     runActive: (id) => loops.active.has(id),
-    runSetupFailure: (id) => loops.setupFailed.get(id) ?? null,
+    runSetupFailure: (id) => {
+      const reason = loops.setupFailed.get(id);
+      return reason === undefined ? null : { reason, retry: !loops.unsupported.has(id) };
+    },
     audit: (_s, action, detail) => void audits.push(`${action} ${detail}`),
     ...over,
   };
@@ -209,7 +277,7 @@ describe("CI failures", () => {
     expect(run!.input.workdir).toBe("/repo");
     expect(run!.input.baseRef).toEqual({ sha: SHA1, branch: "feature/cart", repo: REPO, fetchRef: "refs/pull/12/head", trusted: true });
     expect(run!.input.checks).toEqual([{ id: "test", command: "bun test", timeoutSec: 600, expectTests: true }]);
-    expect(run!.input.trigger).toMatchObject({ kind: "ci_failure", key: `ci:${REPO}:${SHA1}:501:1`, watchId: w.id });
+    expect(run!.input.trigger).toMatchObject({ kind: "ci_failure", key: `ci:${REPO}:${SHA1}:501:900`, watchId: w.id });
     expect(store.listTriggers(w.id)[0]).toMatchObject({ runId: run!.id, outcome: "run", branch: "feature/cart" });
   });
 
@@ -230,11 +298,18 @@ describe("CI failures", () => {
     expect(loops.started).toHaveLength(1);
   });
 
-  test("a re-run attempt is a new event", async () => {
+  test("a re-run is a new event, told apart by its check run and suite, never by its details URL", async () => {
     const w = await prWatch();
-    gh.checks.set(SHA1, [{ id: 501, name: "test", conclusion: "failure", details_url: "https://github.com/acme/shop/actions/runs/9/attempts/2" }]);
+    gh.checks.set(SHA1, [{ id: 501, name: "test", conclusion: "failure", suite: 900, details_url: "https://github.com/acme/shop/actions/runs/9/attempts/1" }]);
     await svc.poll(w.id, OWNER);
-    expect(loops.started[0]!.input.trigger!.key).toBe(`ci:${REPO}:${SHA1}:501:2`);
+    loops.active.clear();
+    // The same check run with a details URL that claims another attempt is the same event.
+    gh.checks.set(SHA1, [{ id: 501, name: "test", conclusion: "failure", suite: 900, details_url: "https://evil.example/attempts/7" }]);
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
+    // Re-running the job makes a new check run.
+    gh.checks.set(SHA1, [{ id: 502, name: "test", conclusion: "failure", suite: 900 }]);
+    await svc.poll(w.id, OWNER);
+    expect(loops.started.map((s) => s.input.trigger!.key)).toEqual([`ci:${REPO}:${SHA1}:501:900`, `ci:${REPO}:${SHA1}:502:900`]);
   });
 
   test("several failing checks on one head start one run with every mapped command", async () => {
@@ -276,7 +351,7 @@ describe("CI failures", () => {
     const busy = await svc.poll(w.id, OWNER);
     expect(busy.started).toHaveLength(0);
     expect(busy.skipped.join()).toContain("already active");
-    expect(store.seen(w, [`ci:${REPO}:${SHA2}:601:1`]).size).toBe(0); // not recorded
+    expect(store.seen(w, [`ci:${REPO}:${SHA2}:601:900`]).size).toBe(0); // not recorded
     loops.active.clear();
     const after = await svc.poll(w.id, OWNER);
     expect(after.started).toHaveLength(1);
@@ -465,31 +540,100 @@ describe("management", () => {
   });
 });
 
-describe("trust: a head runs only when everyone who wrote it is trusted", () => {
-  const failing = () => gh.checks.set(SHA1, [{ id: 501, name: "test", conclusion: "failure" }]);
+describe("trust: a head runs only when a trusted login pushed it, or signed every commit on it", () => {
+  const failing = (sha = SHA1, id = 501) => gh.checks.set(sha, [{ id, name: "test", conclusion: "failure" }]);
+  const mallory = () => gh.pushes.unshift({ branch: "feature/cart", after: gh.prs[0]!.headRefOid, actor: "mallory" });
 
-  test("a commit by someone else on the head is ignored for that head, and not judged again", async () => {
+  test("a commit claiming to be yours, pushed by a stranger, is untrusted, and not judged again", async () => {
     const w = await prWatch();
     failing();
+    // Unsigned, with your email: GitHub ties it to your login, which proves nothing.
+    gh.commits.set(SHA1, [{ sha: "a".repeat(40), author: "ada", committer: "ada" }]);
+    mallory();
+    const res = await svc.poll(w.id, OWNER);
+    expect(res.started).toHaveLength(0);
+    expect(res.skipped.join()).toContain("not pushed by someone you trust");
+    const [t] = store.listTriggers(w.id);
+    expect(t).toMatchObject({ outcome: "ignored", key: `untrusted:${w.id}:${SHA1}:${REPO}:feature/cart` });
+    expect(t!.note).toContain("pushed by @mallory");
+    expect(t!.note).toContain("isn't signed and verified");
+    await svc.poll(w.id, OWNER);
+    expect(gh.pathsCalled("/activity")).toHaveLength(1);
+    expect(gh.pathsCalled("/check-runs")).toHaveLength(1); // the head is skipped outright
+    expect(loops.started).toHaveLength(0);
+  });
+
+  test("your push vouches for the head, whoever its commits name", async () => {
+    const w = await prWatch();
+    failing();
+    gh.commits.set(SHA1, [{ sha: "b".repeat(40), author: "mallory", committer: "mallory" }]);
+    gh.pushes = [{ branch: "feature/cart", after: SHA1, actor: "Ada", type: "force_push" }];
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(1);
+    expect(gh.pathsCalled("/compare/")).toHaveLength(0); // the push settled it
+    expect(gh.pathsCalled("/activity")[0]).toBe(`repos/${REPO}/activity?ref=refs%2Fheads%2Ffeature%2Fcart&per_page=100`);
+    expect(loops.started[0]!.input.baseRef!.trusted).toBe(true);
+  });
+
+  test("only the newest push that left the branch at the head counts, and only a push", async () => {
+    const w = await prWatch();
+    failing();
+    gh.pushes = [
+      { branch: "feature/cart", after: SHA1, actor: "mallory" },
+      { branch: "feature/cart", after: SHA1, actor: "ada" }, // older
+    ];
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
+    gh.prs[0]!.headRefOid = SHA2;
+    failing(SHA2, 601);
+    gh.pushes = [{ branch: "feature/cart", after: SHA2, actor: "ada", type: "pr_merge" }];
+    const res = await svc.poll(w.id, OWNER);
+    expect(res.started).toHaveLength(0);
+    expect(res.skipped.join()).toContain("pr_merge");
+  });
+
+  test("with no push on record, every commit must be signed, verified, and committed by a trusted login", async () => {
+    const w = await prWatch();
+    gh.defaultPusher = null;
+    failing();
     gh.commits.set(SHA1, [
-      { sha: "a".repeat(40), author: "ada", committer: "ada" },
-      { sha: "b".repeat(40), author: "mallory", committer: "mallory" },
+      { sha: "a".repeat(40), author: "mallory", committer: "ada", verified: true },
+      { sha: "b".repeat(40), author: "ada", committer: "web-flow", verified: true },
+    ]);
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(1);
+    expect(loops.started[0]!.input.baseRef!.trusted).toBe(true);
+    loops.active.clear();
+    // One unsigned commit among them, and the head is untrusted.
+    gh.prs[0]!.headRefOid = SHA2;
+    failing(SHA2, 601);
+    gh.commits.set(SHA2, [
+      { sha: "a".repeat(40), author: "ada", committer: "ada", verified: true },
+      { sha: "c".repeat(40), author: "ada", committer: "ada" },
     ]);
     const res = await svc.poll(w.id, OWNER);
     expect(res.started).toHaveLength(0);
-    expect(res.skipped.join()).toContain("don't trust");
-    expect(store.listTriggers(w.id)[0]).toMatchObject({ outcome: "ignored", key: `untrusted:${w.id}:${SHA1}` });
-    expect(store.listTriggers(w.id)[0]!.note).toContain("@mallory");
-    await svc.poll(w.id, OWNER);
-    expect(gh.pathsCalled("/compare/")).toHaveLength(1);
-    expect(gh.pathsCalled("/check-runs")).toHaveLength(1); // the head is skipped outright
-    expect(loops.started).toHaveLength(0);
+    expect(res.skipped.join()).toContain("GitHub has no record of the push");
+    expect(res.skipped.join()).toContain(`${"c".repeat(12)} isn't signed and verified`);
+  });
+
+  test("a signed commit by someone untrusted, or a web-flow commit for one, is untrusted", async () => {
+    const w = await prWatch();
+    gh.defaultPusher = null;
+    failing();
+    gh.commits.set(SHA1, [{ sha: "e".repeat(40), author: "ada", committer: "mallory", verified: true }]);
+    const first = await svc.poll(w.id, OWNER);
+    expect(first.started).toHaveLength(0);
+    expect(first.skipped.join()).toContain("signed by @mallory");
+    gh.prs[0]!.headRefOid = SHA2;
+    failing(SHA2, 601);
+    gh.commits.set(SHA2, [{ sha: "f".repeat(40), author: "mallory", committer: "web-flow", verified: true }]);
+    const second = await svc.poll(w.id, OWNER);
+    expect(second.started).toHaveLength(0);
+    expect(second.skipped.join()).toContain("made on GitHub for @mallory");
   });
 
   test("`trust` names more people; changing it judges the head again", async () => {
     const w = await prWatch();
     failing();
-    gh.commits.set(SHA1, [{ sha: "b".repeat(40), author: "bob", committer: "bob" }]);
+    gh.pushes = [{ branch: "feature/cart", after: SHA1, actor: "bob" }];
     expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
     await svc.update(w.id, { spec: { trust: ["bob"] } }, OWNER);
     expect((await svc.poll(w.id, OWNER)).started).toHaveLength(1);
@@ -498,50 +642,67 @@ describe("trust: a head runs only when everyone who wrote it is trusted", () => 
     await expect(svc.create({ workdir: "/repo", myPrs: true, ci: CI, trust: ["not a login"] }, OWNER)).rejects.toThrow("login");
   });
 
-  test("GitHub's merge button (web-flow) counts only for a trusted author", async () => {
+  test("a fork's pull request is judged by the pushes to the fork's branch", async () => {
+    const w = await prWatch();
+    gh.prs[0]!.headRepo = "mallory/shop";
+    failing();
+    gh.pushes = [
+      { branch: "feature/cart", after: SHA1, actor: "ada" }, // the base repository's branch of that name
+      { repo: "mallory/shop", branch: "feature/cart", after: SHA1, actor: "mallory" },
+    ];
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
+    expect(gh.pathsCalled("/activity")[0]).toStartWith("repos/mallory/shop/activity?");
+  });
+
+  test("GitHub keeping no activity (404) falls back to the signatures; another failure is a problem, not a judgment", async () => {
     const w = await prWatch();
     failing();
-    gh.commits.set(SHA1, [{ sha: "c".repeat(40), author: "ada", committer: "web-flow" }]);
+    gh.failOn = "/activity";
+    gh.failWith = "gh: Not Found (HTTP 404)";
+    gh.commits.set(SHA1, [{ sha: "a".repeat(40), author: "ada", committer: "ada", verified: true }]);
     expect((await svc.poll(w.id, OWNER)).started).toHaveLength(1);
     loops.active.clear();
     gh.prs[0]!.headRefOid = SHA2;
-    gh.checks.set(SHA2, [{ id: 601, name: "test", conclusion: "failure" }]);
-    gh.commits.set(SHA2, [{ sha: "d".repeat(40), author: "mallory", committer: "web-flow" }]);
-    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
-  });
-
-  test("a commit GitHub can't tie to an account, or a committer who isn't trusted, is untrusted", async () => {
-    const w = await prWatch();
-    failing();
-    gh.commits.set(SHA1, [{ sha: "e".repeat(40), author: null, committer: "ada" }]);
-    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
-    gh.prs[0]!.headRefOid = SHA2;
-    gh.checks.set(SHA2, [{ id: 601, name: "test", conclusion: "failure" }]);
-    gh.commits.set(SHA2, [{ sha: "f".repeat(40), author: "ada", committer: "mallory" }]);
+    failing(SHA2, 601);
+    gh.failWith = "HTTP 502: Bad Gateway";
     const res = await svc.poll(w.id, OWNER);
     expect(res.started).toHaveLength(0);
-    expect(res.skipped.join()).toContain("committed by @mallory");
+    expect(store.get(w.id)!.lastError).toContain("judging who pushed it");
+    expect(store.listTriggers(w.id).filter((t) => t.outcome === "ignored")).toHaveLength(0);
   });
 
   test("more commits than can be read is untrusted, and only the pages the bound needs are read", async () => {
     const w = await prWatch();
+    gh.defaultPusher = null;
     failing();
-    gh.commits.set(SHA1, Array.from({ length: 251 }, (_, i) => ({ sha: i.toString(16).padStart(40, "0"), author: "ada", committer: "ada" })));
+    const signed = (n: number) => Array.from({ length: n }, (_, i) => ({ sha: i.toString(16).padStart(40, "0"), author: "ada", committer: "ada", verified: true }));
+    gh.commits.set(SHA1, signed(251));
     const res = await svc.poll(w.id, OWNER);
     expect(res.started).toHaveLength(0);
     expect(res.skipped.join()).toContain("more than 250 commits");
     expect(gh.pathsCalled("/compare/")).toHaveLength(1);
     // 250 exactly is read in three pages and trusted.
     gh.prs[0]!.headRefOid = SHA2;
-    gh.checks.set(SHA2, [{ id: 601, name: "test", conclusion: "failure" }]);
-    gh.commits.set(SHA2, Array.from({ length: 250 }, (_, i) => ({ sha: i.toString(16).padStart(40, "0"), author: "ada", committer: "ada" })));
+    failing(SHA2, 601);
+    gh.commits.set(SHA2, signed(250));
     expect((await svc.poll(w.id, OWNER)).started).toHaveLength(1);
     expect(gh.pathsCalled("/compare/")).toHaveLength(4);
   });
 
+  test("GitHub listing fewer commits than it counts is untrusted", async () => {
+    const w = await prWatch();
+    gh.defaultPusher = null;
+    failing();
+    gh.commits.set(SHA1, [{ sha: "a".repeat(40), author: "ada", committer: "ada", verified: true }]);
+    gh.totalOverride = 2;
+    const res = await svc.poll(w.id, OWNER);
+    expect(res.started).toHaveLength(0);
+    expect(res.skipped.join()).toContain("fewer than it counted");
+  });
+
   test("a review comment on an untrusted head starts nothing either", async () => {
     const w = await prWatch({ review: { enabled: true } });
-    gh.commits.set(SHA1, [{ sha: "b".repeat(40), author: "mallory", committer: "mallory" }]);
+    mallory();
     gh.comments.set(12, [{ id: 7, login: "ada", body: "@codeoid rename it" }]);
     expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
   });
@@ -598,7 +759,7 @@ describe("check runs from the right app", () => {
       { id: 2, name: "lint", conclusion: "failure", app: "circleci-checks" },
     ]);
     await svc.poll(w.id, OWNER);
-    expect(loops.started[0]!.input.trigger!.key).toBe(`ci:${REPO}:${SHA1}:2:1`);
+    expect(loops.started[0]!.input.trigger!.key).toBe(`ci:${REPO}:${SHA1}:2:900`);
     await expect(prWatch({ ci: [{ ciName: "lint", app: "Not An App!", command: "x" }] })).rejects.toThrow("App slug");
   });
 });
@@ -684,7 +845,7 @@ describe("resilience", () => {
     const w = await prWatch();
     gh.checks.set(SHA1, [{ id: 501, name: "test", conclusion: "failure" }]);
     gh.onCall = (path) => {
-      if (path.includes("/compare/")) store.update(w.id, { enabled: false });
+      if (path.includes("/activity")) store.update(w.id, { enabled: false });
     };
     const res = await svc.poll(w.id, OWNER);
     expect(res.started).toHaveLength(0);
@@ -696,7 +857,7 @@ describe("resilience", () => {
     const w = await prWatch();
     gh.checks.set(SHA1, [{ id: 501, name: "test", conclusion: "failure" }]);
     gh.onCall = (path) => {
-      if (path.includes("/compare/")) svc.delete(w.id, OWNER);
+      if (path.includes("/activity")) svc.delete(w.id, OWNER);
     };
     expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
   });
@@ -748,7 +909,7 @@ describe("API cost", () => {
     await svc.poll(w.id, OWNER);
     expect(sinceOf()).toBe(new Date(second - 10 * 60_000).toISOString());
     // A failed poll doesn't move it.
-    gh.failOn = "/pulls/12/reviews";
+    gh.failOn = "graphql";
     now += 60 * 60_000;
     await svc.poll(w.id, OWNER);
     gh.failOn = null;
@@ -784,10 +945,10 @@ describe("API cost", () => {
     expect((await svc.poll(w.id, OWNER)).skipped.join()).toContain("rate-limiting");
     now += 10 * 60_000 + 1; // past 2 × the 300 s interval
     await svc.tick();
-    expect(gh.calls.length).toBe(calls + 1);
+    expect(gh.calls.length).toBe(calls + 2); // who gh is, then the listing
     now += 10 * 60_000 + 1; // the second back-off is 20 minutes
     await svc.tick();
-    expect(gh.calls.length).toBe(calls + 1);
+    expect(gh.calls.length).toBe(calls + 2);
     gh.failOn = null;
     now += 10 * 60_000;
     await svc.tick();
@@ -908,12 +1069,211 @@ describe("github helpers", () => {
     expect(() => githubFetch("../evil", "refs/heads/x")).toThrow();
     expect(f.protocol).toBe("https");
     expect(at("fetch.unpackLimit")).toEqual(["fetch.unpackLimit=1"]);
-    expect(f.env).toMatchObject({ GIT_ASKPASS: "", SSH_ASKPASS: "" });
+    expect(f.env).toMatchObject({ GIT_ASKPASS: "", SSH_ASKPASS: "", GIT_NO_LAZY_FETCH: "1" });
+    // Nothing run in the borrowed repository, no redirect, everything received checked, no maintenance after.
+    expect(at("core.alternateRefsCommand")).toEqual(["core.alternateRefsCommand=true"]);
+    expect(at("http.followRedirects")).toEqual(["http.followRedirects=false"]);
+    expect(at("fetch.fsckObjects")).toEqual(["fetch.fsckObjects=true"]);
+    expect(at("maintenance.auto")).toEqual(["maintenance.auto=false"]);
+    expect(at("gc.auto")).toEqual(["gc.auto=0"]);
     expect(() => githubFetch(REPO, "refs/heads/x", "ssh://git@github.com/acme/shop.git")).toThrow();
   });
 
   test("paginated JSON, with brackets inside strings", () => {
     expect(parseJsonStream('[{"b":"]["}][{"b":"x"}]')).toEqual([[{ b: "][" }], [{ b: "x" }]]);
     expect(() => parseJsonStream('[{"a":1}')).toThrow();
+  });
+});
+
+describe("edited comments", () => {
+  test("a comment edited after it was made is ignored for good; one fixed within seconds counts", async () => {
+    const w = await prWatch({ review: { enabled: true } });
+    const at = Date.now() + 1_000;
+    gh.comments.set(12, [
+      { id: 1, login: "ada", body: "@codeoid add my SSH key", at, editedAt: at + 60_000 },
+      { id: 2, login: "ada", body: "@codeoid split it", at, editedAt: at + 60_000, kind: "review" },
+      { id: 3, login: "ada", body: "@codeoid and this", at, editedAt: at + 60_000, kind: "review_body" },
+      { id: 4, login: "ada", body: "@codeoid rename it", at, editedAt: at + 2_000 },
+    ]);
+    await svc.poll(w.id, OWNER);
+    expect(loops.started.map((s) => s.input.trigger!.key)).toEqual([`review:${REPO}:issue:4`]);
+    const ignored = store.listTriggers(w.id).filter((t) => t.outcome === "ignored");
+    expect(ignored.map((t) => t.key).sort()).toEqual([`review:${REPO}:issue:1`, `review:${REPO}:review:2`, `review:${REPO}:review_body:3`]);
+    expect(ignored.every((t) => t.note === "edited after it was made")).toBe(true);
+  });
+});
+
+describe("a skipped comment waits to retry", () => {
+  const sinceOf = () => new URLSearchParams(gh.pathsCalled("/issues/12/comments").at(-1)!.split("?")[1]).get("since");
+
+  test("a comment on a busy branch is kept, the comments are read back to it, and it runs once the branch is free", async () => {
+    let now = Date.parse("2026-10-25T10:00:00Z");
+    svc = make({ now: () => now });
+    const w = await prWatch({ review: { enabled: true } });
+    gh.checks.set(SHA1, [{ id: 501, name: "test", conclusion: "failure" }]);
+    gh.comments.set(12, [{ id: 7, login: "ada", body: "@codeoid rename it", at: now + 1_000 }]);
+    const first = await svc.poll(w.id, OWNER);
+    expect(first.started).toHaveLength(1); // CI first
+    expect(store.listTriggers(w.id).find((t) => t.key === `review:${REPO}:issue:7`)).toMatchObject({ outcome: "retry", runId: null });
+    // Polls go by while the CI run works; the comment is read every time.
+    for (let i = 0; i < 3; i++) {
+      now += 60 * 60_000;
+      await svc.poll(w.id, OWNER);
+      expect(sinceOf()).toBe(new Date(w.createdAt - 2 * 60_000).toISOString());
+    }
+    loops.active.clear();
+    now += 60 * 60_000;
+    const after = await svc.poll(w.id, OWNER);
+    expect(after.started).toHaveLength(1);
+    expect(loops.started[1]!.input.trigger!.key).toBe(`review:${REPO}:issue:7`);
+    expect(store.listTriggers(w.id).find((t) => t.key === `review:${REPO}:issue:7`)).toMatchObject({ outcome: "run" });
+  });
+
+  test("the hourly bound and the owner's run cap keep it waiting too", async () => {
+    const w = await prWatch({ review: { enabled: true }, maxRunsPerHour: 1 });
+    gh.comments.set(12, [{ id: 7, login: "ada", body: "@codeoid one" }]);
+    loops.capped = true;
+    await svc.poll(w.id, OWNER);
+    expect(store.listTriggers(w.id)[0]).toMatchObject({ key: `review:${REPO}:issue:7`, outcome: "retry" });
+    expect(store.listTriggers(w.id)[0]!.note).toContain("3 loop runs in progress");
+    loops.capped = false;
+    await svc.poll(w.id, OWNER);
+    expect(loops.started).toHaveLength(1);
+    loops.active.clear();
+    gh.comments.get(12)!.push({ id: 8, login: "ada", body: "@codeoid two" });
+    await svc.poll(w.id, OWNER);
+    expect(store.listTriggers(w.id).find((t) => t.key === `review:${REPO}:issue:8`)).toMatchObject({ outcome: "retry" });
+  });
+
+  test("a comment waiting on a pull request that closed, or for a week, expires", async () => {
+    let now = Date.parse("2026-10-25T10:00:00Z");
+    svc = make({ now: () => now });
+    const w = await prWatch({ review: { enabled: true } });
+    gh.prs.push({ number: 13, headRefName: "feature/other", headRefOid: SHA2, url: "" });
+    loops.capped = true;
+    gh.comments.set(12, [{ id: 7, login: "ada", body: "@codeoid one", at: now + 1_000 }]);
+    gh.comments.set(13, [{ id: 8, login: "ada", body: "@codeoid two", at: now + 1_000 }]);
+    await svc.poll(w.id, OWNER);
+    expect(store.listTriggers(w.id).filter((t) => t.outcome === "retry")).toHaveLength(2);
+    gh.prs = gh.prs.filter((p) => p.number !== 13); // merged
+    now += 60 * 60_000;
+    await svc.poll(w.id, OWNER);
+    expect(store.listTriggers(w.id).find((t) => t.key === `review:${REPO}:issue:8`)).toMatchObject({ outcome: "ignored", note: "expired: pull request #13 is no longer open" });
+    now += 7 * 24 * 60 * 60_000;
+    await svc.poll(w.id, OWNER);
+    expect(store.listTriggers(w.id).find((t) => t.key === `review:${REPO}:issue:7`)).toMatchObject({ outcome: "ignored", note: "expired: it waited a week without a run" });
+    loops.capped = false;
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
+  });
+});
+
+describe("rate limits and gh logins", () => {
+  test("a 403 that isn't a rate limit is an error with its message, not a reason to back off", async () => {
+    let now = Date.parse("2026-10-25T10:00:00Z");
+    svc = make({ now: () => now });
+    const w = await prWatch();
+    gh.failOn = "pr list";
+    gh.failWith = "gh: Resource not accessible by personal access token (HTTP 403)";
+    await svc.tick();
+    expect(store.get(w.id)!.lastError).toContain("Resource not accessible");
+    const calls = gh.calls.length;
+    now += 60_000;
+    await svc.tick();
+    expect(gh.calls.length).toBeGreaterThan(calls);
+    gh.failWith = "gh: API rate limit exceeded for user ID 1. (HTTP 403)";
+    await svc.tick();
+    const limited = gh.calls.length;
+    now += 60_000;
+    await svc.tick();
+    expect(gh.calls.length).toBe(limited);
+  });
+
+  test("a rate limit backs off every watch acting as that gh login", async () => {
+    const now = Date.parse("2026-10-25T10:00:00Z");
+    svc = make({ now: () => now });
+    await prWatch();
+    await svc.create({ workdir: "/repo2", branches: ["main"], ci: CI }, OWNER);
+    gh.branches.set("main", SHA2);
+    gh.failOn = "pr list";
+    gh.failWith = "HTTP 429: Too Many Requests";
+    gh.calls = [];
+    await svc.tick();
+    // The first watch hit the limit; the second didn't call GitHub at all.
+    expect(gh.pathsCalled("/branches/")).toHaveLength(0);
+    expect(gh.calls.filter((c) => c[0] === "api" && c[1] === "user")).toHaveLength(1);
+  });
+
+  test("a watch whose gh login changed pauses itself and says why", async () => {
+    const w = await prWatch();
+    gh.checks.set(SHA1, [{ id: 501, name: "test", conclusion: "failure" }]);
+    gh.me = "someone-else";
+    const res = await svc.poll(w.id, OWNER);
+    expect(res.started).toHaveLength(0);
+    const after = store.get(w.id)!;
+    expect(after.enabled).toBe(false);
+    expect(after.lastError).toContain("gh is now signed in as @someone-else, but this watch acts as @ada");
+    expect(gh.calls.some((c) => c[0] === "pr")).toBe(false);
+    expect(audits.some((a) => a.startsWith("loop.watch.pause"))).toBe(true);
+  });
+});
+
+describe("staleness and claims", () => {
+  test("a branch watch never takes a fork's pull request with the same branch name", async () => {
+    const w = await svc.create({ workdir: "/repo", branches: ["main"], ci: CI, review: { enabled: true } }, OWNER);
+    gh.branches.set("main", SHA1);
+    gh.prs = [{ number: 66, headRefName: "main", headRefOid: SHA2, url: "", headRepo: "mallory/shop" }];
+    gh.checks.set(SHA1, [{ id: 501, name: "test", conclusion: "failure" }]);
+    gh.checks.set(SHA2, [{ id: 601, name: "test", conclusion: "failure" }]);
+    await svc.poll(w.id, OWNER);
+    expect(loops.started).toHaveLength(1);
+    expect(loops.started[0]!.input.baseRef).toMatchObject({ sha: SHA1, fetchRef: "refs/heads/main" });
+  });
+
+  test("a watch changed while its poll is in flight starts nothing, and its comments are read from the same point next time", async () => {
+    const w = await prWatch({ review: { enabled: true } });
+    gh.comments.set(12, [{ id: 7, login: "ada", body: "@codeoid rename it" }]);
+    gh.onCall = (path) => {
+      if (path.includes("/activity")) store.update(w.id, { spec: { ...w.spec, maxRunsPerHour: 5 } });
+    };
+    const res = await svc.poll(w.id, OWNER);
+    expect(res.started).toHaveLength(0);
+    expect(res.skipped.join()).toContain("changed while it polled");
+    expect(store.get(w.id)!.lastOkAt).toBeNull();
+    gh.onCall = null;
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(1);
+  });
+
+  test("a claim whose run can't be recorded is given back", async () => {
+    class FlakyStore extends WatchStore {
+      fail = true;
+      override bind(...args: Parameters<WatchStore["bind"]>): void {
+        if (this.fail) throw new Error("disk I/O error");
+        super.bind(...args);
+      }
+    }
+    const flaky = new FlakyStore(new Database(":memory:"));
+    store = flaky;
+    svc = make();
+    const w = await prWatch();
+    gh.checks.set(SHA1, [{ id: 501, name: "test", conclusion: "failure" }]);
+    const res = await svc.poll(w.id, OWNER);
+    expect(res.skipped.join()).toContain("disk I/O error");
+    expect(store.listTriggers(w.id)).toHaveLength(0);
+  });
+
+  test("an event whose workspace can't be prepared at all is dropped at once", async () => {
+    const w = await prWatch();
+    gh.checks.set(SHA1, [{ id: 501, name: "test", conclusion: "failure" }]);
+    await svc.poll(w.id, OWNER);
+    const id = loops.started[0]!.id;
+    loops.active.delete(id);
+    loops.setupFailed.set(id, "could not prepare the run's workspace: this repository is a shallow clone");
+    loops.unsupported.add(id);
+    const res = await svc.poll(w.id, OWNER);
+    expect(res.skipped.join()).toContain("can't prepare its workspace; its event is dropped");
+    expect(store.listTriggers(w.id)[0]).toMatchObject({ outcome: "ignored" });
+    expect(store.listTriggers(w.id)[0]!.note).toContain("shallow clone");
+    await svc.poll(w.id, OWNER);
+    expect(loops.started).toHaveLength(1);
   });
 });
