@@ -2933,6 +2933,12 @@ export class Session {
    * worktree's dependencies are ready. Cleared once awaited.
    */
   #pendingSetup: Promise<void> | null = null;
+  /** A fork's own files are still waiting for its setup recipe (see beginWorktreePrepare). */
+  #filesPending = false;
+  get filesPending(): boolean {
+    return this.#filesPending;
+  }
+
   /** The worktree setup recipe's step in that chain, and its abort (destroy stops it). */
   #setupRecipe: { done: Promise<void>; abort: AbortController } | null = null;
 
@@ -4518,26 +4524,34 @@ export class Session {
        * and file roll, held back so a setup command only ever sees committed
        * content. Runs whether or not setup succeeded; never after destroy.
        */
-      after?: () => Promise<void>;
+      after?: (result: WorktreeSetupResult) => Promise<void>;
     } = {},
   ): void {
     const wt = this.#worktree;
     if (!wt?.createdByCodeoid) return;
     const abort = new AbortController();
+    // Until `after` has run the folder is the clean checkout, not the fork's
+    // files: a fork, rewind or file read of it is refused meanwhile.
+    if (opts.after) this.#filesPending = true;
     const done = this.#chainSetup(async () => {
-      if (abort.signal.aborted || this.#destroyed) return;
-      const result = await prepareWorktree({
-        worktreePath: wt.path,
-        policy,
-        signal: abort.signal,
-        ...(opts.recipe !== undefined ? { recipe: opts.recipe } : {}),
-      });
-      // Recorded even when destroyed meanwhile: destroy's cleanup reads it to
-      // take the copied files and shared links back out.
-      this.#recordWorktreeSetup(result, !this.#destroyed);
-      if (this.#destroyed) return;
-      this.#announceWorktreeSetup(result);
-      if (opts.after) await opts.after();
+      try {
+        if (abort.signal.aborted || this.#destroyed) return;
+        const result = await prepareWorktree({
+          worktreePath: wt.path,
+          policy,
+          signal: abort.signal,
+          ownerSub: this.createdBy,
+          ...(opts.recipe !== undefined ? { recipe: opts.recipe } : {}),
+        });
+        // Recorded even when destroyed meanwhile: destroy's cleanup reads it to
+        // take the copied files and shared links back out.
+        this.#recordWorktreeSetup(result, !this.#destroyed);
+        if (this.#destroyed) return;
+        this.#announceWorktreeSetup(result);
+        if (opts.after) await opts.after(result);
+      } finally {
+        this.#filesPending = false;
+      }
     });
     this.#setupRecipe = { done, abort };
     void done.finally(() => {

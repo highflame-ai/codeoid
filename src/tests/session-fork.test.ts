@@ -705,6 +705,35 @@ describe("SessionManager session.fork — git worktree isolation", () => {
     expect(readFileSync(join(repo, ".env"), "utf8")).toBe("TOKEN=1\n");
   });
 
+  it("W10: while a fork's files wait for its setup command, reading, forking or rewinding it is refused", async () => {
+    const repo = await makeGitRepoWithDirtyEdit();
+    mkdirSync(join(repo, ".codeoid"));
+    writeFileSync(join(repo, ".codeoid", "setup.yaml"), "command: sleep 1\n");
+    await gitIn(["add", ".codeoid"], repo);
+    await gitIn(["commit", "-m", "recipe"], repo);
+    const recipeHash = (await readSetupRecipe(repo))!.recipeHash;
+    const { registry } = makeRegistry();
+    const config = { ...loadConfig(), worktree: { setup: { runCommands: "trusted-repos" as const, trustedRepos: [{ path: repo, recipeHash }] } } };
+    const manager = new SessionManager(store, transcript, undefined, undefined, undefined, { providers: registry, config } as never);
+    const c = client(AUTH);
+    const parentId = await createIn(manager, c, repo);
+    await sendAndSettle(manager, c, parentId, "hello");
+
+    const resp = await manager.handle({ type: "session.fork", id: "w10", sessionId: parentId }, AUTH, c);
+    const fork = (resp as { data: { id: string; workdir: string } }).data;
+    const preparing = /still preparing its worktree/;
+    expect(await manager.handle({ type: "fs.list", id: "l", sessionId: fork.id, path: "." } as never, AUTH, c)).toMatchObject({ error: expect.stringMatching(preparing) });
+    expect(await manager.handle({ type: "fs.read", id: "r", sessionId: fork.id, path: "file.txt" } as never, AUTH, c)).toMatchObject({ error: expect.stringMatching(preparing) });
+    expect(await manager.handle({ type: "session.fork", id: "ff", sessionId: fork.id }, AUTH, c)).toMatchObject({ error: expect.stringMatching(preparing) });
+    expect(await manager.handle({ type: "session.rewind", id: "rw", sessionId: fork.id, turnId: "t", dryRun: true } as never, AUTH, c)).toMatchObject({
+      error: expect.stringMatching(preparing),
+    });
+
+    await sendAndSettle(manager, c, fork.id, "go");
+    expect(await manager.handle({ type: "fs.read", id: "r2", sessionId: fork.id, path: "file.txt" } as never, AUTH, c)).toMatchObject({ type: "fs.read.result" });
+    expect(readFileSync(join(fork.workdir, "file.txt"), "utf8")).toBe("committed\nWIP\n");
+  });
+
   it("W9: `worktree.trust` pins the recipe — owner only; a changed recipe runs nothing until trusted again", async () => {
     const prevXdg = process.env.XDG_CONFIG_HOME;
     process.env.XDG_CONFIG_HOME = join(tmp, "xdg"); // config.json writes land here
@@ -727,9 +756,12 @@ describe("SessionManager session.fork — git worktree isolation", () => {
       expect(await trust({ recipeHash: shown.recipeHash }, { ...AUTH, delegationDepth: 1 })).toMatchObject({ type: "response.error", code: "forbidden" });
       expect(await trust({ recipeHash: shown.recipeHash }, { ...AUTH, scopes: ["session:create"] as AuthContext["scopes"] })).toMatchObject({ code: "forbidden" });
       expect(await trust({ recipeHash: "f".repeat(40) })).toMatchObject({ type: "response.error", code: "invalid_request" });
+      // A hand edit made while the daemon runs survives a trust change.
+      mkdirSync(join(tmp, "xdg", "codeoid"), { recursive: true });
+      writeFileSync(join(tmp, "xdg", "codeoid", "config.json"), JSON.stringify({ worktree: { setup: { trustedRepos: ["/hand/edited"] } } }));
       expect(await trust({ recipeHash: shown.recipeHash })).toMatchObject({ trusted: true, changed: true });
       const written = JSON.parse(readFileSync(join(tmp, "xdg", "codeoid", "config.json"), "utf8"));
-      expect(written.worktree.setup.trustedRepos).toEqual([{ path: realpathSync(repo), recipeHash: shown.recipeHash }]);
+      expect(written.worktree.setup.trustedRepos).toEqual(["/hand/edited", { path: realpathSync(repo), recipeHash: shown.recipeHash, trustedBy: AUTH.sub }]);
 
       const parentId = await createIn(manager, c, repo);
       await sendAndSettle(manager, c, parentId, "hello");
@@ -761,7 +793,7 @@ describe("SessionManager session.fork — git worktree isolation", () => {
       expect(existsSync(join(third.fork.workdir, ".ran-v2"))).toBe(true);
 
       expect(await trust({ off: true })).toMatchObject({ trusted: false, changed: true });
-      expect(JSON.parse(readFileSync(join(tmp, "xdg", "codeoid", "config.json"), "utf8")).worktree.setup.trustedRepos).toEqual([]);
+      expect(JSON.parse(readFileSync(join(tmp, "xdg", "codeoid", "config.json"), "utf8")).worktree.setup.trustedRepos).toEqual(["/hand/edited"]);
     } finally {
       if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
       else process.env.XDG_CONFIG_HOME = prevXdg;

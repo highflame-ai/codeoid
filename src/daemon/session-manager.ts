@@ -187,6 +187,8 @@ import {
   SETUP_RECIPE_PATH,
   type TrustedRecipe,
   WORKTREE_SETUP_SUPPORTED,
+  brokenShares,
+  commandRefusal,
   willRunCommand,
   WorktreeSetupFailure,
   type WorktreeSetupPolicy,
@@ -2134,6 +2136,7 @@ mcpHub: this.#mcpHub,
     // an undelegated owner only, and every change audited old → new.
     const setupPatches = msg.patches.filter((p) => p.key.startsWith("worktree.setup."));
     if (setupPatches.length > 0 && auth.delegationDepth > 0) {
+      this.#store.audit(auth.sub, "settings.set.denied", "", `keys=${setupPatches.map((p) => p.key).join(",")} reason=delegated`);
       return { type: "response.error", requestId: msg.id, error: "A delegated token can't change worktree setup settings.", code: "forbidden" };
     }
     const setupBefore = setupPatches.length > 0 ? getSnapshot().values : undefined;
@@ -3011,10 +3014,12 @@ mcpHub: this.#mcpHub,
    * run, unasked, in every later worktree of that repository.
    */
   async #worktreeTrust(msg: Extract<ClientMessage, { type: "worktree.trust" }>, auth: AuthContext): Promise<DaemonMessage> {
-    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return this.#loginForbidden(msg.id);
-    if (auth.delegationDepth > 0) {
-      return { type: "response.error", requestId: msg.id, error: "A delegated token can't change which setup commands run.", code: "forbidden" };
-    }
+    const denied = (error: string, code: "forbidden" | "invalid_request"): DaemonMessage => {
+      this.#store.audit(auth.sub, "worktree.trust.denied", "", `dir=${msg.dir} reason=${error}`);
+      return { type: "response.error", requestId: msg.id, error, code };
+    };
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return denied("Missing scope: settings:write", "forbidden");
+    if (auth.delegationDepth > 0) return denied("A delegated token can't change which setup commands run.", "forbidden");
     const invalid = (error: string): DaemonMessage => ({ type: "response.error", requestId: msg.id, error, code: "invalid_request" });
     if (!WORKTREE_SETUP_SUPPORTED) return invalid("worktree setup recipes aren't supported on Windows");
     const dir = normalizeWorkdir(msg.dir);
@@ -3032,43 +3037,50 @@ mcpHub: this.#mcpHub,
       // Withdrawing trust needs no readable recipe.
       if (!msg.off) return invalid(err instanceof Error ? err.message : String(err));
     }
-    const sameRepo = (e: string | TrustedRecipe): boolean => {
+    const sameRepo = (e: unknown): boolean => {
+      const p = typeof e === "string" ? e : e && typeof e === "object" ? (e as { path?: unknown }).path : undefined;
+      if (typeof p !== "string") return false;
       try {
-        return realpathSync.native(typeof e === "string" ? e : e.path) === root;
+        return realpathSync.native(p) === root;
       } catch {
         return false;
       }
     };
-    const policy = this.#worktreeSetupPolicy;
-    const before = policy.trustedRepos;
-    let next = before;
-    if (msg.off) {
-      next = before.filter((e) => !sameRepo(e));
-    } else if (!msg.dryRun) {
+    let entry: TrustedRecipe | undefined;
+    if (!msg.off && !msg.dryRun) {
       if (!found) return invalid(`there is no ${SETUP_RECIPE_PATH} at the committed HEAD of ${root}`);
       if (!msg.recipeHash) return invalid("recipeHash is required to trust a recipe — ask with dryRun first, and review its command");
-      if (msg.recipeHash !== found.recipeHash) return invalid("the recipe changed since it was shown — review it again");
-      next = [...before.filter((e) => !sameRepo(e)), { path: root, recipeHash: found.recipeHash }];
+      if (msg.recipeHash !== found.recipeHash) return denied("the recipe changed since it was shown — review it again", "invalid_request");
+      entry = { path: root, recipeHash: found.recipeHash, trustedBy: auth.sub };
     }
-    const changed = JSON.stringify(next) !== JSON.stringify(before);
-    if (changed) {
-      const written = writeWorktreeTrust(next);
+    // Built from config.json as it is now, not this daemon's copy, so a hand
+    // edit made since it started survives.
+    let list: readonly (string | TrustedRecipe)[] = this.#worktreeSetupPolicy.trustedRepos;
+    let changed = false;
+    if (msg.off || entry) {
+      const add = entry;
+      const written = writeWorktreeTrust((current) => [...current.filter((e) => !sameRepo(e)), ...(add ? [add] : [])]);
       if (!written.ok) return { type: "response.error", requestId: msg.id, error: written.error, code: "internal" };
-      this.#worktreeSetupPolicy = { ...policy, trustedRepos: next };
-      const show = (list: readonly (string | TrustedRecipe)[]) =>
-        list
-          .filter(sameRepo)
-          .map((e) => (typeof e === "string" ? "path-only" : e.recipeHash.slice(0, 12)))
-          .join(",") || "none";
-      this.#store.audit(
-        auth.sub,
-        msg.off ? "worktree.untrust" : "worktree.trust",
-        "",
-        `repo=${root} old=${show(before)} new=${show(next)}${found?.recipe.command ? ` command=${redactCommand(found.recipe.command)}` : ""}`,
-      );
+      changed = JSON.stringify(written.after) !== JSON.stringify(written.before);
+      list = written.after as (string | TrustedRecipe)[];
+      this.#worktreeSetupPolicy = { ...this.#worktreeSetupPolicy, trustedRepos: list };
+      if (changed) {
+        const show = (l: readonly unknown[]) =>
+          l
+            .filter(sameRepo)
+            .map((e) => (typeof e === "string" ? "path-only" : `${String((e as TrustedRecipe).recipeHash).slice(0, 12)}@${(e as TrustedRecipe).trustedBy ?? "config"}`))
+            .join(",") || "none";
+        this.#store.audit(
+          auth.sub,
+          msg.off ? "worktree.untrust" : "worktree.trust",
+          "",
+          `repo=${root} old=${show(written.before)} new=${show(written.after)}${found?.recipe.command ? ` command=${redactCommand(found.recipe.command)}` : ""}`,
+        );
+      }
     }
     const current = found;
-    const trusted = !!current && next.some((e) => typeof e !== "string" && sameRepo(e) && e.recipeHash === current.recipeHash);
+    const trusted =
+      !!current && commandRefusal({ runCommands: "trusted-repos", trustedRepos: list }, root, current.recipeHash, auth.sub) === null;
     return {
       type: "worktree.trust.result",
       requestId: msg.id,
@@ -3077,6 +3089,19 @@ mcpHub: this.#mcpHub,
       trusted,
       changed,
       runCommands: this.#worktreeSetupPolicy.runCommands,
+    };
+  }
+
+  /**
+   * A fork whose files wait for its worktree setup recipe: its folder is the
+   * clean checkout, not its files yet, so nothing may read, fork or rewind it.
+   */
+  #stillPreparing(requestId: string): DaemonMessage {
+    return {
+      type: "response.error",
+      requestId,
+      error: "This session is still preparing its worktree (running its setup recipe) — try again once it's ready.",
+      code: "invalid_request",
     };
   }
 
@@ -3416,6 +3441,7 @@ mcpHub: this.#mcpHub,
         code: "not_found",
       };
     }
+    if (session.filesPending) return this.#stillPreparing(msg.id);
     try {
       return await handleFsList(msg, session.workdir);
     } catch (err) {
@@ -3444,6 +3470,7 @@ mcpHub: this.#mcpHub,
         code: "not_found",
       };
     }
+    if (session.filesPending) return this.#stillPreparing(msg.id);
     try {
       return await handleFsRead(msg, session.workdir);
     } catch (err) {
@@ -4703,6 +4730,7 @@ mcpHub: this.#mcpHub,
     if (parent.role) {
       return { type: "response.error", requestId: msg.id, error: `Cannot fork a ${parent.role} session`, code: "invalid_request" };
     }
+    if (parent.filesPending) return this.#stillPreparing(msg.id);
 
     const providerId = msg.providerId ?? parent.providerId;
     if (providerId && !this.#providers.has(providerId)) {
@@ -4827,9 +4855,12 @@ mcpHub: this.#mcpHub,
     // parent's carried edits, an earlier turn's files — waits until after
     // setup: a trusted command must only ever see committed content.
     let recipe: RecipeRead | undefined;
+    // One snapshot of the policy: what decided the plan is what prepares it.
+    const policy = this.#worktreeSetupPolicy;
     let deferFiles = false;
+    let carryNote: string | undefined;
     let pendingCarry: CarriedState | undefined;
-    let putFiles: () => Promise<void> = async () => {};
+    let putFiles: (setup?: WorktreeSetupResult) => Promise<void> = async () => {};
     if (msg.workdir) {
       // Bind mode: run in a dir/worktree the user manages; record its branch
       // but never create or (later) remove it. Normalize + validate exactly
@@ -4857,7 +4888,10 @@ mcpHub: this.#mcpHub,
           // exists so the snapshot lands where it belongs.
           let rollHead = point?.files && "checkpointId" in point.files ? point.files.head : undefined;
           recipe = await loadSetupRecipe(parent.workdir);
-          deferFiles = willRunCommand(recipe, this.#worktreeSetupPolicy);
+          // Whether the command can run at all is known only once the base
+          // commit is checked out (commandGate): create clean whenever a
+          // trusted recipe has one, then decide.
+          const mayRun = !!recipe && !("error" in recipe) && !!recipe.recipe.command && commandRefusal(policy, recipe.root, recipe.recipeHash, auth.sub) === null;
           const make = (baseCommit?: string) =>
             createForkWorktree({
               workdir: parent.workdir,
@@ -4865,8 +4899,8 @@ mcpHub: this.#mcpHub,
               shortId: worktreeShortId,
               ...(msg.baseBranch ? { baseBranch: msg.baseBranch } : {}),
               ...(baseCommit ? { baseCommit } : {}),
-              ...((point?.files && "checkpointId" in point.files) || deferFiles ? { ensureSubdir: true } : {}),
-              ...(deferFiles ? { deferCarry: true } : {}),
+              ...((point?.files && "checkpointId" in point.files) || mayRun ? { ensureSubdir: true } : {}),
+              ...(mayRun ? { deferCarry: true } : {}),
             });
           let headGone = false;
           const wt = await make(rollHead).catch((err: unknown) => {
@@ -4889,7 +4923,14 @@ mcpHub: this.#mcpHub,
           forkSubdirMapped = wt.subdirMapped && inside;
           forkFromHead = rollHead;
           forkHeadGone = headGone;
-          pendingCarry = wt.carry;
+          deferFiles = mayRun && (await willRunCommand(recipe, policy, wt.path, auth.sub));
+          if (deferFiles) pendingCarry = wt.carry;
+          else if (wt.carry) {
+            // No command will run here after all: carry now, as without a recipe.
+            await applyCarriedState(wt.path, wt.carry).catch((err: unknown) => {
+              carryNote = `⚠️ This fork's worktree didn't get the parent's uncommitted changes: ${err instanceof Error ? err.message : String(err)}.`;
+            });
+          }
           // Surface that this is a fresh isolated worktree (deps aren't
           // present) — previously the isolated path was silent.
           const origin = msg.baseBranch
@@ -4900,7 +4941,7 @@ mcpHub: this.#mcpHub,
           const setupHint = this.#config?.fork?.setup
             ? " Running the configured fork setup now — the first turn will wait for it."
             : " Ignored files and build dependencies (e.g. .env, node_modules) aren't in a fresh worktree unless the repository's committed .codeoid/setup.yaml brings them — otherwise run your project's setup before building.";
-          workdirNote = `🌿 Isolated in a new git worktree on branch \`${wt.branch}\` (${origin}).${setupHint}`;
+          workdirNote = `🌿 Isolated in a new git worktree on branch \`${wt.branch}\` (${origin}).${setupHint}${carryNote ? ` ${carryNote}` : ""}`;
         } catch (err) {
           const reason = err instanceof Error ? err.message : String(err);
           // An explicit baseBranch that can't be honored is a user error
@@ -5003,13 +5044,17 @@ mcpHub: this.#mcpHub,
       // folder lines up with the parent's, never in a shared or bound one.
       // Held back until after the setup recipe when it runs a command.
       const madeWorktree = worktree?.createdByCodeoid ? worktree : undefined;
-      putFiles = async (): Promise<void> => {
+      putFiles = async (setup?: WorktreeSetupResult): Promise<void> => {
         if (pendingCarry && madeWorktree) {
           try {
             await applyCarriedState(madeWorktree.path, pendingCarry);
           } catch (err) {
+            await fork.noteForkFiles(`⚠️ This fork's worktree didn't get the parent's uncommitted changes: ${err instanceof Error ? err.message : String(err)}.`);
+          }
+          const broken = setup ? brokenShares(madeWorktree.path, setup.shared) : [];
+          if (broken.length > 0) {
             await fork.noteForkFiles(
-              `⚠️ This fork's worktree didn't get the parent's uncommitted changes (${err instanceof Error ? err.message : String(err)}); it has the parent's last commit as committed.`,
+              `⚠️ The parent's uncommitted changes replaced the shared link${broken.length > 1 ? "s" : ""} ${broken.join(", ")} with their own files, so ${broken.length > 1 ? "they aren't" : "it isn't"} shared with your checkout any more.`,
             );
           }
         }
@@ -5083,12 +5128,12 @@ mcpHub: this.#mcpHub,
     // trusted), then the operator's fork.setup command.
     if (worktree?.createdByCodeoid) {
       const after = deferFiles ? putFiles : undefined;
-      fork.beginWorktreePrepare(this.#worktreeSetupPolicy, {
+      fork.beginWorktreePrepare(policy, {
         ...(recipe !== undefined ? { recipe } : {}),
         ...(after
           ? {
-              after: () =>
-                after().catch((err: unknown) => {
+              after: (setup: WorktreeSetupResult) =>
+                after(setup).catch((err: unknown) => {
                   console.error(`[codeoid/fork] files after setup failed for ${fork.id.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
                 }),
             }
@@ -6142,7 +6187,12 @@ mcpHub: this.#mcpHub,
           // fail the run as an infrastructure error (not the agent's) when
           // the worktree can't be made ready. Nothing but this run's fresh
           // worktree is removed — the primary checkout is never touched.
-          setup = await prepareWorktree({ worktreePath: wt.path, policy: this.#worktreeSetupPolicy, ...(o.signal ? { signal: o.signal } : {}) });
+          setup = await prepareWorktree({
+            worktreePath: wt.path,
+            policy: this.#worktreeSetupPolicy,
+            ownerSub: o.ownerAuth.sub,
+            ...(o.signal ? { signal: o.signal } : {}),
+          });
           if (setup.error) {
             await discard(setup);
             throw new WorktreeSetupFailure(setup);
@@ -6153,6 +6203,9 @@ mcpHub: this.#mcpHub,
             } catch (err) {
               await discard(setup);
               throw err;
+            }
+            for (const rel of brokenShares(wt.path, setup.shared)) {
+              setup.warnings.push(`the checkout's uncommitted changes replaced the shared link ${rel} with their own files, so it isn't shared any more`);
             }
           }
           if (setup.copied.length > 0 || setup.shared.length > 0) {
@@ -7504,6 +7557,7 @@ mcpHub: this.#mcpHub,
     if (session.role) {
       return { type: "response.error", requestId: msg.id, error: `Cannot go back a turn in a ${session.role} session`, code: "invalid_request" };
     }
+    if (session.filesPending) return this.#stillPreparing(msg.id);
     const canStop = hasScope(auth.scopes as string[], SCOPES.SESSION_INTERRUPT);
     if (msg.dryRun === true) {
       // A preview shows prompts, file paths and commands from the session's

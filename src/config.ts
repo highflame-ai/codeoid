@@ -1188,6 +1188,8 @@ const RootSchema = z.object({
                   .object({
                     path: z.string().min(1).refine(isAbsolute, "must be an absolute path"),
                     recipeHash: z.string().regex(/^[0-9a-f]{40,64}$/, "must be a git blob id"),
+                    /** Who trusted it: honoured only for that owner's sessions. Absent = every owner. */
+                    trustedBy: z.string().min(1).max(512).optional(),
                   })
                   .strict(),
               ]),

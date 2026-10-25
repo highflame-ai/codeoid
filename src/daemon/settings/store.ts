@@ -249,22 +249,30 @@ export function writeMcpServerEntry(name: string, entry: Record<string, unknown>
 }
 
 /**
- * Write `worktree.setup.trustedRepos` (what `codeoid worktree trust`
- * records): merged onto the raw file, the whole config validated, then
- * written atomically — nothing is written if it doesn't validate.
+ * Update `worktree.setup.trustedRepos` (what `codeoid worktree trust`
+ * records) from what config.json holds NOW — so a hand edit made since the
+ * daemon started isn't overwritten — then validate the whole config and
+ * write it atomically; nothing is written if it doesn't validate. Returns the
+ * list before and after.
  */
-export function writeWorktreeTrust(trustedRepos: readonly unknown[]): { ok: true } | { ok: false; error: string } {
+export function writeWorktreeTrust(
+  update: (current: readonly unknown[]) => unknown[],
+): { ok: true; before: unknown[]; after: unknown[] } | { ok: false; error: string } {
   let raw: Record<string, unknown>;
   try {
     raw = readRawConfig();
   } catch (err) {
     return { ok: false, error: `config.json is not valid JSON: ${errMsg(err)}` };
   }
-  setByPath(raw, "worktree.setup.trustedRepos", [...trustedRepos]);
+  const current = getByPath(raw, "worktree.setup.trustedRepos");
+  const before = Array.isArray(current) ? [...current] : [];
+  const after = update(before);
+  if (JSON.stringify(after) === JSON.stringify(before)) return { ok: true, before, after };
+  setByPath(raw, "worktree.setup.trustedRepos", after);
   const validation = validateConfigObject(raw);
   if (!validation.ok) return { ok: false, error: validation.issues.map((i) => i.message).join("; ") };
   writeConfigJson(raw);
-  return { ok: true };
+  return { ok: true, before, after };
 }
 
 // ── config.json IO ──────────────────────────────────────────────────────────

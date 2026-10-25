@@ -213,8 +213,15 @@ Keep it to regenerable dependency directories; config and tooling directories (`
 
 The `command` runs only when you opt in twice.
 Set `worktree.setup.runCommands` to `trusted-repos` (Settings, or `config.json`), then run `codeoid worktree trust` in the repository.
-It shows the command and records the repository with the recipe's git blob id, direnv-allow style.
+It shows the command and records the repository with the recipe's git blob id, direnv-allow style, and with who trusted it: on a shared daemon, the entry applies only to that person's sessions.
 When the recipe changes, its command stops running and the session says so until you trust it again; `codeoid worktree trust --off` withdraws trust.
+
+A trusted command also runs only when the worktree's own base commit is reviewed content.
+That commit must carry the very recipe you trusted, and be on your checkout's branch (an ancestor of its `HEAD`).
+A fork from another branch, a fetched pull request, a fork of a session on a `codeoid/*` branch with commits of its own, or the work-in-progress commit codeoid saves when a session ends all fail that check.
+Such a worktree still gets its copied files and shared directories; its command is skipped, and the session says why.
+This doesn't cover everything: an agent working directly in your checkout can still commit to your branch, and those commits pass.
+That is one more reason to prefer `--ignore-scripts`.
 
 Trust covers the repository's committed content at setup time, not just the one line you reviewed.
 The command runs as you, on a clean checkout of the worktree's base commit (a fork's uncommitted changes are applied only after it), together with every script it invokes from that tree: `package.json` lifecycle scripts, a `Makefile`, a script in the repo.

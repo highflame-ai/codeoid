@@ -16,6 +16,7 @@ import { promisify } from "node:util";
 import { createCheckpoint, deleteCheckpoints, shadowGitLiteral } from "../daemon/checkpoints.js";
 import { applyCarriedState, createForkWorktree, removeForkWorktree } from "../daemon/git-worktree.js";
 import {
+  brokenShares,
   commandRefusal,
   describeSetupResult,
   parseSetupRecipe,
@@ -377,6 +378,86 @@ describe("prepareWorktree — the setup command", () => {
     const r2 = await prepareWorktree({ worktreePath: wt2.path, policy: await trusted() });
     expect(r2.command?.exitCode).toBe(0);
     expect(existsSync(join(wt2.path, "ran-changed"))).toBe(true);
+  });
+
+  it("a base commit off the primary checkout's history runs no command (a branch, a PR ref) — files still apply", async () => {
+    await commitRecipe("copy: [.env]\ncommand: touch ran\n");
+    const policy = await trusted();
+    await g(["checkout", "-q", "-b", "feature"], repo);
+    writeFileSync(join(repo, "feature.txt"), "unreviewed\n");
+    await g(["add", "feature.txt"], repo);
+    await g(["commit", "-qm", "unmerged"], repo);
+    await g(["checkout", "-q", "main"], repo);
+
+    const wt = await newWorktree({ baseBranch: "feature" });
+    const r = await prepareWorktree({ worktreePath: wt.path, policy });
+    expect(r.commandSkippedCode).toBe("base-not-on-primary");
+    expect(setupEvent(r)).toBe("worktree.setup.untrusted");
+    expect(r.copied).toEqual([".env"]);
+    expect(existsSync(join(wt.path, "ran"))).toBe(false);
+  });
+
+  it("a fork of a codeoid branch with an agent's commit runs no command", async () => {
+    await commitRecipe("command: touch ran\n");
+    const policy = await trusted();
+    const parent = await newWorktree();
+    writeFileSync(join(parent.path, "agent.txt"), "agent work\n");
+    await g(["add", "agent.txt"], parent.path);
+    await g(["commit", "-qm", "agent commit"], parent.path);
+    const child = await createForkWorktree({ workdir: parent.path, label: "child", shortId: `t${++n}`, deferCarry: true });
+    const r = await prepareWorktree({ worktreePath: child.path, policy });
+    expect(r.commandSkippedCode).toBe("base-not-on-primary");
+    expect(existsSync(join(child.path, "ran"))).toBe(false);
+  });
+
+  it("an earlier commit on the primary history runs it — unless that commit's recipe isn't the trusted one", async () => {
+    await commitRecipe("command: touch ran\n");
+    const earlier = await g(["rev-parse", "HEAD"], repo);
+    writeFileSync(join(repo, "later.txt"), "x\n");
+    await g(["add", "later.txt"], repo);
+    await g(["commit", "-qm", "later"], repo);
+    const policy = await trusted();
+    const wt = await createForkWorktree({ workdir: repo, label: "earlier", shortId: `t${++n}`, baseCommit: earlier });
+    const r = await prepareWorktree({ worktreePath: wt.path, policy });
+    expect(r.command?.exitCode).toBe(0);
+    expect(existsSync(join(wt.path, "ran"))).toBe(true);
+
+    // The recipe changed after `earlier`, and the new one is what's trusted:
+    // `earlier` carries a recipe nobody trusted, so nothing runs there.
+    await commitRecipe("command: touch ran2\n");
+    const wt2 = await createForkWorktree({ workdir: repo, label: "earlier", shortId: `t${++n}`, baseCommit: earlier });
+    const r2 = await prepareWorktree({ worktreePath: wt2.path, policy: await trusted() });
+    expect(r2.commandSkippedCode).toBe("base-not-on-primary");
+  });
+
+  it("a trust entry holds only for its owner's worktrees", async () => {
+    await commitRecipe("command: touch ran\n");
+    const recipeHash = (await readSetupRecipe(repo))!.recipeHash;
+    const policy: WorktreeSetupPolicy = { runCommands: "trusted-repos", trustedRepos: [{ path: repo, recipeHash, trustedBy: "alice" }] };
+    const wt = await newWorktree();
+    expect((await prepareWorktree({ worktreePath: wt.path, policy, ownerSub: "bob" })).commandSkippedCode).toBe("untrusted");
+    expect(existsSync(join(wt.path, "ran"))).toBe(false);
+    const wt2 = await newWorktree();
+    expect((await prepareWorktree({ worktreePath: wt2.path, policy, ownerSub: "alice" })).command?.exitCode).toBe(0);
+  });
+
+  it("a carry that fails leaves the worktree at its last commit, not half-applied", async () => {
+    writeFileSync(join(repo, "file.txt"), "committed\nedit\n");
+    const wt = await createForkWorktree({ workdir: repo, label: "carry", shortId: `t${++n}`, deferCarry: true });
+    writeFileSync(join(wt.path, "file.txt"), "half\n"); // as if a restore had got part-way
+    await expect(applyCarriedState(wt.path, { ...wt.carry!, snapshot: "f".repeat(40) })).rejects.toThrow(/put back to its last commit/);
+    expect(readFileSync(join(wt.path, "file.txt"), "utf8")).toBe("committed\n");
+    expect(await g(["status", "--porcelain"], wt.path)).toBe("");
+  });
+
+  it("brokenShares names shared entries that are no longer the recipe's links", async () => {
+    await commitRecipe("share: [node_modules]\n");
+    const wt = await newWorktree();
+    const r = await prepareWorktree({ worktreePath: wt.path, policy: NEVER });
+    expect(brokenShares(wt.path, r.shared)).toEqual([]);
+    rmSync(join(wt.path, "node_modules"));
+    mkdirSync(join(wt.path, "node_modules"));
+    expect(brokenShares(wt.path, r.shared)).toEqual(["node_modules"]);
   });
 
   it("kills what the command left running when it exits, and redacts secrets in its output", async () => {

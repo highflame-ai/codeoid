@@ -32,7 +32,12 @@
  *   - `command` runs only under `worktree.setup.runCommands: "trusted-repos"`
  *     and only while the recipe's git blob is the one the owner trusted with
  *     `codeoid worktree trust` (direnv-allow style: a changed recipe runs
- *     nothing until it is trusted again). It runs on the CLEAN checkout of the
+ *     nothing until it is trusted again; an entry holds only for the owner
+ *     who recorded it), and only when the worktree's base commit carries that
+ *     recipe and is on the primary checkout's history ({@link commandGate}) —
+ *     never another branch, a pull request, or an agent's own commit. An
+ *     agent working in the primary checkout itself can still commit there.
+ *     It runs on the CLEAN checkout of the
  *     worktree's base commit, before any uncommitted state a fork carries is
  *     applied, with a built environment, never the daemon's own (GHSA-38vh).
  *     Trust therefore covers the repository's committed content at setup
@@ -288,6 +293,12 @@ export interface TrustedRecipe {
   path: string;
   /** The recipe's git blob id when it was trusted. */
   recipeHash: string;
+  /**
+   * Who trusted it. Honoured only for worktrees whose session owner is the
+   * same subject (a shared daemon); an entry without it (hand-written in
+   * config.json) holds for every owner.
+   */
+  trustedBy?: string;
 }
 
 /** `config.worktree.setup`: whether a recipe's `command` may run. */
@@ -302,8 +313,13 @@ export interface WorktreeSetupPolicy {
 }
 
 export interface CommandRefusal {
-  /** off: commands disabled; untrusted: never trusted; changed: the recipe changed since; unsupported: platform. */
-  code: "off" | "untrusted" | "changed" | "unsupported";
+  /**
+   * off: commands disabled; untrusted: never trusted (by this owner);
+   * changed: the recipe changed since; base-not-on-primary: the worktree's
+   * base commit isn't reviewed content (see {@link commandGate});
+   * unsupported: platform.
+   */
+  code: "off" | "untrusted" | "changed" | "base-not-on-primary" | "unsupported";
   reason: string;
 }
 
@@ -318,24 +334,57 @@ function realOrNull(p: string): string | null {
 const TRUST_HINT = "run `codeoid worktree trust` in the repository to review its command and trust it";
 
 /** Null when `root`'s recipe (blob `recipeHash`) may run its command, else why not. */
-export function commandRefusal(policy: WorktreeSetupPolicy | undefined, root: string, recipeHash: string): CommandRefusal | null {
+export function commandRefusal(policy: WorktreeSetupPolicy | undefined, root: string, recipeHash: string, ownerSub?: string): CommandRefusal | null {
   if (!WORKTREE_SETUP_SUPPORTED) return { code: "unsupported", reason: "setup commands aren't supported on Windows" };
   if (!policy || policy.runCommands !== "trusted-repos") {
     return { code: "off", reason: "recipe commands are off (set worktree.setup.runCommands to trusted-repos, then trust the recipe with `codeoid worktree trust`)" };
   }
   const real = realOrNull(root);
   const mine = real ? policy.trustedRepos.filter((e) => path.isAbsolute(typeof e === "string" ? e : e.path) && realOrNull(typeof e === "string" ? e : e.path) === real) : [];
-  const pinned = mine.filter((e): e is TrustedRecipe => typeof e !== "string");
+  const pinned = mine.filter((e): e is TrustedRecipe => typeof e !== "string" && (e.trustedBy === undefined || e.trustedBy === ownerSub));
   if (pinned.some((e) => e.recipeHash === recipeHash)) return null;
   if (pinned.length > 0) return { code: "changed", reason: `the setup command changed since you trusted it — ${TRUST_HINT}` };
   if (mine.length > 0) return { code: "untrusted", reason: `this repository is trusted by path only, which runs no command — ${TRUST_HINT}` };
   return { code: "untrusted", reason: `this repository's recipe isn't trusted — ${TRUST_HINT}` };
 }
 
-/** Whether preparing from `read` under `policy` would run a command (it then needs the clean checkout). */
-export function willRunCommand(read: RecipeRead, policy: WorktreeSetupPolicy | undefined): boolean {
+/**
+ * The whole decision on whether a worktree's setup command may run — the
+ * trust in {@link commandRefusal}, then the worktree's ACTUAL base commit
+ * (its HEAD, still clean at setup time): it must carry the very recipe
+ * that was trusted, and be on the primary checkout's history. A branch, a
+ * fetched pull request, an agent's commit on a `codeoid/*` branch or the WIP
+ * commit codeoid saves on destroy is content nobody reviewed, and the
+ * command would run its scripts. Null when it may run.
+ */
+export async function commandGate(
+  read: FoundRecipe,
+  policy: WorktreeSetupPolicy | undefined,
+  worktreePath: string,
+  ownerSub?: string,
+): Promise<CommandRefusal | null> {
+  const refusal = commandRefusal(policy, read.root, read.recipeHash, ownerSub);
+  if (refusal) return refusal;
+  const off: CommandRefusal = {
+    code: "base-not-on-primary",
+    reason:
+      "this worktree starts from a commit that isn't on your checkout's branch (another branch, a pull request, or an agent's commit), so the trusted command would run code you haven't reviewed",
+  };
+  try {
+    const base = (await git(["rev-parse", "--verify", "HEAD^{commit}"], worktreePath)).stdout.trim();
+    const blob = await git(["rev-parse", "--verify", "--quiet", `${base}:${SETUP_RECIPE_PATH}`], read.root, { okCodes: [1, 128] });
+    if (blob.code !== 0 || blob.stdout.trim() !== read.recipeHash) return off;
+    const onPrimary = await git(["merge-base", "--is-ancestor", base, read.rev], read.root, { okCodes: [1] });
+    return onPrimary.code === 0 ? null : off;
+  } catch {
+    return off;
+  }
+}
+
+/** Whether preparing `worktreePath` from `read` would run a command (it then needs the clean checkout). */
+export async function willRunCommand(read: RecipeRead, policy: WorktreeSetupPolicy | undefined, worktreePath: string, ownerSub?: string): Promise<boolean> {
   if (!read || "error" in read || !read.recipe.command) return false;
-  return commandRefusal(policy, read.root, read.recipeHash) === null;
+  return (await commandGate(read, policy, worktreePath, ownerSub)) === null;
 }
 
 // ── Prepare ──────────────────────────────────────────────────────────────────
@@ -510,6 +559,8 @@ export async function prepareWorktree(opts: {
   /** Abort a running command (session destroyed, routine cancelled, daemon stopping). */
   signal?: AbortSignal;
   recipe?: RecipeRead;
+  /** The session owner's subject — trust entries recorded by someone else don't apply. */
+  ownerSub?: string;
 }): Promise<WorktreeSetupResult> {
   const result: WorktreeSetupResult = { applied: false, copied: [], shared: [], skipped: [], warnings: [] };
   const fail = (err: unknown): WorktreeSetupResult => {
@@ -667,7 +718,7 @@ export async function prepareWorktree(opts: {
   }
 
   if (recipe.command) {
-    const refusal = commandRefusal(opts.policy, root, recipeHash);
+    const refusal = await commandGate(found, opts.policy, worktree, opts.ownerSub);
     if (refusal) {
       result.commandSkipped = refusal.reason;
       result.commandSkippedCode = refusal.code;
@@ -773,10 +824,27 @@ async function runSetupCommand(
   });
 }
 
+/**
+ * Shared entries that are no longer the recipe's symlinks — what carrying a
+ * fork's uncommitted state can do when it holds tracked files at that path
+ * (git replaces the link with a directory). Empty when all are intact.
+ */
+export function brokenShares(worktreePath: string, shared: readonly string[]): string[] {
+  return shared.filter((rel) => {
+    try {
+      return !lstatSync(path.join(worktreePath, rel)).isSymbolicLink();
+    } catch {
+      return true;
+    }
+  });
+}
+
 /** The session event a result is surfaced as. */
 export function setupEvent(r: WorktreeSetupResult): "worktree.setup.failed" | "worktree.setup.untrusted" | "worktree.setup.done" {
   if (r.error) return "worktree.setup.failed";
-  if (r.commandSkippedCode === "changed" || r.commandSkippedCode === "untrusted") return "worktree.setup.untrusted";
+  if (r.commandSkippedCode === "changed" || r.commandSkippedCode === "untrusted" || r.commandSkippedCode === "base-not-on-primary") {
+    return "worktree.setup.untrusted";
+  }
   return "worktree.setup.done";
 }
 

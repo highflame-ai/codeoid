@@ -299,7 +299,26 @@ export async function applyCarriedState(worktreePath: string, carry: CarriedStat
   try {
     await git(["restore", `--source=${carry.snapshot}`, "--worktree", "--", "."], worktreePath);
   } catch (err) {
-    throw new WorktreeError(`couldn't carry the uncommitted changes: ${err instanceof Error ? err.message : String(err)}`);
+    const why = err instanceof Error ? err.message : String(err);
+    // Never leave a half-carried tree: put the tracked files back to HEAD
+    // and take out the files the carry added.
+    let added: string[] = [];
+    try {
+      added = (await git(["diff", "--name-only", "-z", "--no-renames", "--diff-filter=A", carry.head, carry.snapshot], worktreePath)).split("\0").filter(Boolean);
+    } catch {
+      // the snapshot is unreadable, so the restore wrote nothing of it
+    }
+    try {
+      await git(["restore", "--source=HEAD", "--worktree", "--", "."], worktreePath);
+      removeSetupArtifacts(worktreePath, { copied: added });
+    } catch (rollbackErr) {
+      throw new WorktreeError(
+        `couldn't carry the uncommitted changes (${why}), and putting the worktree back to its last commit failed too, so they may be partially applied: ${
+          rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)
+        }`,
+      );
+    }
+    throw new WorktreeError(`couldn't carry the uncommitted changes (${why}); the worktree was put back to its last commit`);
   }
 }
 
