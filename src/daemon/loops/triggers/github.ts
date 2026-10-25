@@ -303,6 +303,8 @@ export interface PushRecord {
   type: string;
   /** The branch's head before it: {@link NO_COMMIT} for the branch's first push; "" when GitHub doesn't say. */
   before: string;
+  /** When GitHub records it happened (its activity's `timestamp`); null when it doesn't say. */
+  at: number | null;
 }
 
 /** What GitHub's activity writes as `before` for a branch's first push: nothing was there. */
@@ -363,7 +365,13 @@ export class BranchActivity {
     for (const a of page.list as Array<Record<string, unknown>>) {
       const before = str(a?.before);
       const after = str(a?.after);
-      this.entries.push({ actor: login(a?.actor), type: str(a?.activity_type), before: SHA_RE.test(before) ? before : "", after: SHA_RE.test(after) ? after : "" });
+      this.entries.push({
+        actor: login(a?.actor),
+        type: str(a?.activity_type),
+        before: SHA_RE.test(before) ? before : "",
+        after: SHA_RE.test(after) ? after : "",
+        at: time(a?.timestamp),
+      });
     }
     this.#next = page.next;
     return page.list.length > 0;
@@ -389,6 +397,12 @@ export interface MergedPull {
   mergedBy: string | null;
   /** Auto-merge was turned on for it at some point; true when GitHub doesn't say either way. */
   autoMerged: boolean;
+  /** The last time auto-merge was turned on for it, and by whom; null when it never was, or GitHub doesn't say when or by whom. */
+  autoMergeEnabled: { at: number; by: string | null } | null;
+  /** It was added to a merge queue at some point; true when GitHub doesn't say either way. */
+  queued: boolean;
+  /** How many parents its merge commit has; 0 when GitHub doesn't say. */
+  parents: number;
   /** `owner/name` of the repository its head branch is in; null when GitHub doesn't say (a deleted fork). */
   headRepo: string | null;
   headRef: string;
@@ -404,6 +418,15 @@ export interface MergedPull {
  * The merged pull requests in a repository whose merge commit is a given
  * commit: none, one, or (which vouches for nothing) several.
  */
+/** What a commit says about itself that a rebase keeps: its message and author date; and its parents. */
+export interface CommitShape {
+  sha: string;
+  parents: string[];
+  message: string;
+  /** Null when GitHub doesn't say. */
+  authorDate: number | null;
+}
+
 export type MergedAs = { kind: "none" } | { kind: "one"; pull: MergedPull } | { kind: "many"; numbers: number[] };
 
 /** Commits read to judge a head; more than this and it is not trusted. */
@@ -418,7 +441,7 @@ const REVIEWS_QUERY = `query($owner: String!, $name: String!, $number: Int!, $en
     pullRequest(number: $number) {
       reviews(first: 100, after: $endCursor) {
         pageInfo { hasNextPage endCursor }
-        nodes { databaseId body url state publishedAt lastEditedAt author { login } }
+        nodes { databaseId body url state publishedAt lastEditedAt author { __typename login } }
       }
     }
   }
@@ -433,26 +456,39 @@ const REVIEWS_QUERY = `query($owner: String!, $name: String!, $number: Int!, $en
 const COMMENT_NODES_QUERY = `query($ids: [ID!]!) {
   nodes(ids: $ids) {
     __typename
-    ... on IssueComment { databaseId body url publishedAt lastEditedAt author { login } pullRequest { number } repository { nameWithOwner } }
-    ... on PullRequestReviewComment { databaseId body url state publishedAt lastEditedAt path line author { login } pullRequest { number } repository { nameWithOwner } }
+    ... on IssueComment { databaseId body url publishedAt lastEditedAt author { __typename login } pullRequest { number } repository { nameWithOwner } }
+    ... on PullRequestReviewComment { databaseId body url state publishedAt lastEditedAt path line author { __typename login } pullRequest { number } repository { nameWithOwner } }
   }
 }`;
 
 /**
  * What judging a merge needs from its pull request beyond REST: who GitHub
- * records as having merged it (for the merge queue, who queued it), and
- * whether auto-merge was on — now (`autoMergeRequest`, null once it merged
- * by hand) or ever (an enable event in its timeline, kept after a disable);
- * and what its merge commit was made on and how many commits it had, which
- * tell which commits beneath the merge commit it put on the branch.
+ * records as having merged it (for the merge queue, who queued it); whether
+ * auto-merge was on — now (`autoMergeRequest`, null once it merged by hand)
+ * or ever (an enable event in its timeline, kept after a disable) — and when
+ * and by whom it was last turned on; whether it was ever added to a merge
+ * queue; and what its merge commit was made on, how many parents it has, and
+ * how many commits the pull request had, which tell which commits beneath the
+ * merge commit it put on the branch. Logins are asked with their type: GraphQL
+ * names a bot without the `[bot]` that REST and the activity give it.
+ * (A filtered `timelineItems`' `totalCount` counts every item, so the
+ * filtered nodes are what is read.)
  */
 const MERGED_PULL_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
-      merged mergedBy { login } mergeCommit { oid parents(first: 1) { nodes { oid } } }
+      merged mergedBy { __typename login } mergeCommit { oid parents(first: 1) { totalCount nodes { oid } } }
       commits { totalCount }
       autoMergeRequest { enabledAt }
-      timelineItems(itemTypes: [AUTO_MERGE_ENABLED_EVENT, AUTO_REBASE_ENABLED_EVENT, AUTO_SQUASH_ENABLED_EVENT], first: 1) { nodes { __typename } }
+      autoMergeEnabled: timelineItems(itemTypes: [AUTO_MERGE_ENABLED_EVENT, AUTO_REBASE_ENABLED_EVENT, AUTO_SQUASH_ENABLED_EVENT], last: 1) {
+        nodes {
+          __typename
+          ... on AutoMergeEnabledEvent { createdAt actor { __typename login } }
+          ... on AutoRebaseEnabledEvent { createdAt actor { __typename login } }
+          ... on AutoSquashEnabledEvent { createdAt actor { __typename login } }
+        }
+      }
+      mergeQueued: timelineItems(itemTypes: [ADDED_TO_MERGE_QUEUE_EVENT], first: 1) { nodes { __typename } }
     }
   }
 }`;
@@ -465,6 +501,20 @@ const NODE_ID_RE = /^[A-Za-z0-9_=+/-]{1,200}$/;
 const SHA_RE = /^[0-9a-f]{40}$/;
 const str = (v: unknown): string => (typeof v === "string" ? v : "");
 const login = (v: unknown): string | null => str((v as { login?: unknown } | null | undefined)?.login) || null;
+/**
+ * A login GraphQL gave with its `__typename`: a bot's as REST and the
+ * activity write it (`renovate[bot]`), since GraphQL leaves the `[bot]` off —
+ * and a bot named like a person is not that person.
+ */
+const actorLogin = (v: unknown): string | null => {
+  const l = login(v);
+  if (!l || (v as { __typename?: unknown }).__typename !== "Bot" || l.endsWith("[bot]")) return l;
+  return `${l}[bot]`;
+};
+const time = (v: unknown): number | null => {
+  const t = Date.parse(str(v));
+  return Number.isFinite(t) ? t : null;
+};
 
 /** One repository, read through gh. */
 export class GitHubSource {
@@ -597,12 +647,28 @@ export class GitHubSource {
     return { push: log.entries.find((a) => a.after === sha) ?? null, kept: log.kept };
   }
 
-  /** The first parent of `sha` in this repository; "" for a root commit. */
-  async firstParent(sha: string): Promise<string> {
+  /** `sha`'s parents in this repository (none for a root commit), message, and author date. */
+  async commit(sha: string): Promise<CommitShape> {
     const [c] = await this.#api(`repos/${this.repo}/git/commits/${sha}`);
-    const parents = (c as { parents?: unknown } | undefined)?.parents;
-    const first = str((Array.isArray(parents) ? (parents[0] as { sha?: unknown } | undefined) : undefined)?.sha);
-    return SHA_RE.test(first) ? first : "";
+    const body = (c ?? {}) as { parents?: unknown; message?: unknown; author?: { date?: unknown } | null };
+    const parents = Array.isArray(body.parents) ? body.parents.map((p: { sha?: unknown } | null) => str(p?.sha)) : [];
+    return { sha, parents: parents.every((p) => SHA_RE.test(p)) ? parents : [], message: str(body.message), authorDate: time(body.author?.date) };
+  }
+
+  /**
+   * Pull request `number`'s commits, oldest first, with their messages and
+   * author dates; null when it has more than one page of them (100).
+   */
+  async pullCommits(repo: string, number: number): Promise<CommitShape[] | null> {
+    if (!isRepo(repo)) throw new GhError(`not a GitHub repository name: ${repo}`);
+    const [list] = await this.#api(`repos/${repo}/pulls/${number}/commits?per_page=100`);
+    if (!Array.isArray(list)) throw new GhError(`GitHub listed no commits of pull request #${number}`);
+    if (list.length >= 100) return null;
+    return (list as Array<Record<string, unknown>>).map((c) => {
+      const commit = (c.commit ?? {}) as { message?: unknown; author?: { date?: unknown } | null };
+      const parents = Array.isArray(c.parents) ? c.parents.map((p: { sha?: unknown } | null) => str(p?.sha)) : [];
+      return { sha: str(c.sha), parents, message: str(commit.message), authorDate: time(commit.author?.date) };
+    });
   }
 
   /**
@@ -647,20 +713,28 @@ export class GitHubSource {
     const q = (page as { data?: { repository?: { pullRequest?: Record<string, unknown> | null } | null } } | null)?.data?.repository?.pullRequest;
     const mergeCommit = q?.mergeCommit as { oid?: unknown; parents?: { nodes?: unknown } | null } | null | undefined;
     if (!q || q.merged !== true || str(mergeCommit?.oid) !== sha) return { kind: "none" };
-    const events = (q.timelineItems as { nodes?: unknown } | null | undefined)?.nodes;
+    const events = (q.autoMergeEnabled as { nodes?: unknown } | null | undefined)?.nodes;
+    const lastEnable = Array.isArray(events) ? (events.at(-1) as { createdAt?: unknown; actor?: unknown } | null | undefined) : undefined;
+    const enabledAt = time(lastEnable?.createdAt);
+    const queuedEvents = (q.mergeQueued as { nodes?: unknown } | null | undefined)?.nodes;
     const head = (p.head ?? {}) as { ref?: unknown; sha?: unknown; repo?: { full_name?: unknown } | null };
     const headRepo = str(head.repo?.full_name);
     const headSha = str(head.sha);
-    const parents = mergeCommit?.parents?.nodes;
+    const parentsConn = mergeCommit?.parents as { nodes?: unknown; totalCount?: unknown } | null | undefined;
+    const parents = parentsConn?.nodes;
     const parent = str((Array.isArray(parents) ? (parents[0] as { oid?: unknown } | null | undefined) : undefined)?.oid);
+    const parentCount = parentsConn?.totalCount;
     const count = (q.commits as { totalCount?: unknown } | null | undefined)?.totalCount;
     return {
       kind: "one",
       pull: {
         number,
-        mergedBy: login(q.mergedBy),
-        // Not knowing is judged as auto-merged: the stricter rule.
+        mergedBy: actorLogin(q.mergedBy),
+        // Not knowing is judged as auto-merged, and as queued: the stricter rules.
         autoMerged: p.auto_merge !== null || q.autoMergeRequest !== null || !Array.isArray(events) || events.length > 0,
+        autoMergeEnabled: enabledAt !== null ? { at: enabledAt, by: actorLogin(lastEnable?.actor) } : null,
+        queued: !Array.isArray(queuedEvents) || queuedEvents.length > 0,
+        parents: typeof parentCount === "number" && Number.isInteger(parentCount) && parentCount > 0 ? parentCount : 0,
         headRepo: isRepo(headRepo) ? headRepo : null,
         headRef: str(head.ref),
         headSha: SHA_RE.test(headSha) ? headSha : "",
@@ -738,10 +812,6 @@ export class GitHubSource {
    */
   async prComments(pr: number, since: number): Promise<CommentRecord[]> {
     const iso = new Date(since).toISOString();
-    const time = (v: unknown): number | null => {
-      const t = Date.parse(str(v));
-      return Number.isFinite(t) ? t : null;
-    };
     // Unknown is not "never": judged as edited.
     const edited = (v: unknown): boolean => v !== null;
     const nodeIds = (pages: unknown[]): string[] =>
@@ -780,7 +850,7 @@ export class GitHubSource {
         comments.push({
           id: c.databaseId,
           kind,
-          author: login(c.author) ?? "",
+          author: actorLogin(c.author) ?? "",
           body: str(c.body),
           url: str(c.url) || null,
           createdAt: published,
@@ -800,7 +870,7 @@ export class GitHubSource {
         return [{
           id: r.databaseId,
           kind: "review_body" as const,
-          author: login(r.author) ?? "",
+          author: actorLogin(r.author) ?? "",
           body: str(r.body),
           url: str(r.url) || null,
           createdAt: published,

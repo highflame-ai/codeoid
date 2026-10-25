@@ -383,6 +383,9 @@ describe("loop watch authorization", () => {
     await forbidden({ type: "loop.watch.update", id: "u", watchId: w.watch.id, enabled: true });
     await forbidden({ type: "loop.watch.update", id: "u", watchId: w.watch.id, spec: { maxRunsPerHour: 60 } });
     await forbidden({ type: "loop.watch.update", id: "u", watchId: w.watch.id, enabled: false, spec: { maxRunsPerHour: 60 } });
+    // Vouching for a head is standing trust, not a stop, even alongside one.
+    await forbidden({ type: "loop.watch.update", id: "u", watchId: w.watch.id, enabled: false, trustHead: true });
+    await forbidden({ ...createMsg(), trustHead: true });
     const off = wsnap(await manager.handle({ type: "loop.watch.update", id: "u", watchId: w.watch.id, enabled: false }, delegated, client(delegated)));
     expect(off.watch.enabled).toBe(false);
     const gone = await manager.handle({ type: "loop.watch.delete", id: "d", watchId: w.watch.id }, delegated, client(delegated));

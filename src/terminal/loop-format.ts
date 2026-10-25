@@ -133,8 +133,16 @@ export function formatWatch(w: LoopWatchWire, triggers: LoopWatchTriggerWire[] =
   if (triggers.length > 0) {
     lines.push("", "  events:");
     for (const t of triggers) {
-      const what = t.outcome === "run" ? (t.runId ?? "starting") : t.outcome === "retry" ? `to retry — ${S(t.note)}` : `ignored — ${S(t.note)}`;
-      lines.push(`    ${t.createdAt.slice(0, 19).replace("T", " ")} ${t.kind === "ci_failure" ? "ci    " : "review"} ${S(t.branch)}  ${what}`);
+      const what =
+        t.outcome === "run"
+          ? (t.runId ?? "starting")
+          : t.outcome === "retry"
+            ? `to retry — ${S(t.note)}`
+            : t.outcome === "vouched"
+              ? S(t.note)
+              : `ignored — ${S(t.note)}`;
+      const kind = t.kind === "ci_failure" ? "ci    " : t.kind === "trust_anchor" ? "vouch " : "review";
+      lines.push(`    ${t.createdAt.slice(0, 19).replace("T", " ")} ${kind} ${S(t.branch)}  ${what}`);
     }
   }
   // `why` and notes can run over lines; the first stays, the rest is in `show --events`.

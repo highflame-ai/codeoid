@@ -103,9 +103,13 @@ describe("loop formatting", () => {
         createdAt: "2026-10-25T10:00:00.000Z",
         updatedAt: "2026-10-25T10:00:00.000Z",
       } as never,
-      [{ key: "k", kind: "ci_failure", branch: "b", runId: null, outcome: "ignored", note: "commits by someone you don't trust: \x1b]8;;x\x07", createdAt: "2026-10-25T10:00:00.000Z" }],
+      [
+        { key: "k", kind: "ci_failure", branch: "b", runId: null, outcome: "ignored", note: "commits by someone you don't trust: \x1b]8;;x\x07", createdAt: "2026-10-25T10:00:00.000Z" },
+        { key: "v", kind: "trust_anchor", branch: "main", runId: null, outcome: "vouched", note: "you vouched for main at abc123abc123", createdAt: "2026-10-25T10:00:00.000Z" },
+      ],
     ).join("\n");
     expect(watch).toContain("trusts     @ada (you), @bob");
+    expect(watch).toContain("vouch  main  you vouched for main at abc123abc123");
     expect(watch).not.toContain("\x1b[2J");
     expect(watch).not.toContain("\x1b]8");
   });

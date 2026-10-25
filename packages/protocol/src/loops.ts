@@ -277,19 +277,27 @@ export interface LoopWatchWire {
 /** An event a watch acted on: a run it started, or one it ignored for good. */
 export interface LoopWatchTriggerWire {
   key: string;
-  kind: "ci_failure" | "review_comment";
+  /** An event, or `trust_anchor`: you vouched for a branch's head (`trustHead`). */
+  kind: "ci_failure" | "review_comment" | "trust_anchor";
   branch: string;
   runId: string | null;
-  /** `retry`: its run's workspace couldn't be prepared; a later poll tries again. */
-  outcome: "run" | "ignored" | "retry";
+  /** `retry`: its run's workspace couldn't be prepared; a later poll tries again. `vouched`: a trust anchor. */
+  outcome: "run" | "ignored" | "retry" | "vouched";
   note: string | null;
   createdAt: string;
 }
 
+/**
+ * `trustHead` (branch watches only): you vouch for each watched branch's head
+ * as it is now. It is remembered as trusted under the watch's trust list, so
+ * a later merge's chain of trusted merges can end at it; audited, and kept in
+ * the watch's history. Never implied by anything else.
+ */
 export interface LoopWatchCreateMsg {
   type: "loop.watch.create";
   id: string;
   spec: LoopWatchSpecWire;
+  trustHead?: boolean;
 }
 
 export interface LoopWatchListMsg {
@@ -310,6 +318,8 @@ export interface LoopWatchUpdateMsg {
   watchId: string;
   enabled?: boolean;
   spec?: Partial<Omit<LoopWatchSpecWire, "workdir">>;
+  /** As on create: vouch for each watched branch's head as it is now (after `spec` applies). */
+  trustHead?: boolean;
 }
 
 export interface LoopWatchDeleteMsg {

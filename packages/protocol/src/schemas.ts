@@ -924,6 +924,7 @@ export const loopWatchCreateSchema = z.object({
   ...base,
   type: z.literal("loop.watch.create"),
   spec: loopWatchPatchSchema.extend({ workdir: z.string().min(1).max(LIMITS.PATH_MAX), ci: loopWatchSpecFields.ci }),
+  trustHead: z.boolean().optional(),
 });
 export const loopWatchListSchema = z.object({ ...base, type: z.literal("loop.watch.list") });
 export const loopWatchRefSchema = z.object({
@@ -937,6 +938,7 @@ export const loopWatchUpdateSchema = z.object({
   watchId: idField,
   enabled: z.boolean().optional(),
   spec: loopWatchPatchSchema.optional(),
+  trustHead: z.boolean().optional(),
 });
 
 export const routineCreateSchema = z.object({ ...base, type: z.literal("routine.create"), spec: routineSpecSchema });

@@ -16,7 +16,7 @@
  */
 
 import { Database } from "bun:sqlite";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { BUSY_TIMEOUT_MS } from "../store.js";
 import type { LoopTenant } from "./store.js";
 
@@ -76,12 +76,13 @@ export type TriggerKind = "ci_failure" | "review_comment";
 export interface TriggerRow {
   watchId: string;
   key: string;
-  kind: TriggerKind;
+  /** An event, or `trust_anchor`: you vouched for a branch's head (`--trust-head`). */
+  kind: TriggerKind | "trust_anchor";
   branch: string;
   /** The run it started; null while claimed, when ignored, or waiting to retry. */
   runId: string | null;
-  /** `retry`: skipped, or its run's workspace couldn't be prepared; a later poll tries again. */
-  outcome: "run" | "ignored" | "retry";
+  /** `retry`: skipped, or its run's workspace couldn't be prepared; a later poll tries again. `vouched`: a trust anchor. */
+  outcome: "run" | "ignored" | "retry" | "vouched";
   note: string | null;
   createdAt: number;
 }
@@ -174,14 +175,16 @@ export class WatchStore {
       );
       CREATE INDEX IF NOT EXISTS idx_loop_triggers_watch ON loop_triggers(watch_id, created_at);
 
-      -- The newest head each watch judged trusted, per branch: what a merge
-      -- landed on is vouched for when it is that head.
+      -- The newest head each watch judged trusted (or its owner vouched
+      -- for), per branch: what a merge landed on is vouched for when it is
+      -- that head. Judged under the trust list its generation names.
       CREATE TABLE IF NOT EXISTS loop_watch_trusted_heads (
         watch_id    TEXT NOT NULL,
         repo        TEXT NOT NULL,
         branch      TEXT NOT NULL,
         sha         TEXT NOT NULL,
         judged_at   INTEGER NOT NULL,
+        generation  TEXT,
         PRIMARY KEY (watch_id, repo, branch)
       );
       CREATE INDEX IF NOT EXISTS idx_loop_triggers_branch ON loop_triggers(account_id, project_id, owner_sub, repo, branch, settled);
@@ -190,6 +193,8 @@ export class WatchStore {
       if (!cols("loop_watches").includes(c)) this.#db.exec(`ALTER TABLE loop_watches ADD COLUMN ${c} INTEGER`);
     }
     if (!cols("loop_triggers").includes("pr")) this.#db.exec("ALTER TABLE loop_triggers ADD COLUMN pr INTEGER");
+    // A head remembered before generations were kept counts for nothing: its trust list isn't known.
+    if (!cols("loop_watch_trusted_heads").includes("generation")) this.#db.exec("ALTER TABLE loop_watch_trusted_heads ADD COLUMN generation TEXT");
   }
 
   // ── Watches ─────────────────────────────────────────────────────────────
@@ -271,7 +276,7 @@ export class WatchStore {
   /** Delete a watch. Its ledger rows stay (they are the owner's), except its judgments of heads. */
   delete(id: string): void {
     this.#db.transaction(() => {
-      this.#db.prepare("DELETE FROM loop_triggers WHERE watch_id = ? AND key LIKE ?").run(id, `untrusted:${id}:%`);
+      this.#db.prepare("DELETE FROM loop_triggers WHERE watch_id = ? AND (key LIKE ? OR key LIKE ?)").run(id, `untrusted:${id}:%`, `vouch:${id}:%`);
       this.#db.prepare("DELETE FROM loop_watch_trusted_heads WHERE watch_id = ?").run(id);
       this.#db.prepare("DELETE FROM loop_watches WHERE id = ?").run(id);
     })();
@@ -415,22 +420,49 @@ export class WatchStore {
     this.#db.prepare("DELETE FROM loop_triggers WHERE watch_id = ? AND key LIKE ?").run(w.id, `untrusted:${w.id}:%`);
   }
 
-  /** Remember `sha` as the newest head this watch judged trusted on `repo`'s `branch`. */
+  /**
+   * Remember `sha` as the newest head this watch judged trusted on `repo`'s
+   * `branch`, judged under `w`'s trust list (its generation is stamped on it).
+   */
   rememberTrusted(w: WatchRow, repo: string, branch: string, sha: string, at: number): void {
     this.#db
       .prepare(
-        `INSERT INTO loop_watch_trusted_heads (watch_id, repo, branch, sha, judged_at) VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT (watch_id, repo, branch) DO UPDATE SET sha = excluded.sha, judged_at = excluded.judged_at`,
+        `INSERT INTO loop_watch_trusted_heads (watch_id, repo, branch, sha, judged_at, generation) VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT (watch_id, repo, branch) DO UPDATE SET sha = excluded.sha, judged_at = excluded.judged_at, generation = excluded.generation`,
       )
-      .run(w.id, repo.toLowerCase(), branch, sha, at);
+      .run(w.id, repo.toLowerCase(), branch, sha, at, trustGeneration(w.spec));
   }
 
-  /** The newest head this watch judged trusted on `repo`'s `branch`, or null. */
+  /**
+   * The newest head this watch judged trusted on `repo`'s `branch`, or null —
+   * also null when it was judged under another trust list than both `w`'s and
+   * the watch's as stored now: a poll that read the watch before its trust
+   * list changed can't vouch with what the old list trusted, or the new.
+   */
   lastTrusted(w: WatchRow, repo: string, branch: string): string | null {
     const row = this.#db
-      .prepare("SELECT sha FROM loop_watch_trusted_heads WHERE watch_id = ? AND repo = ? AND branch = ?")
-      .get(w.id, repo.toLowerCase(), branch) as { sha: string } | null;
-    return row?.sha ?? null;
+      .prepare("SELECT sha, generation FROM loop_watch_trusted_heads WHERE watch_id = ? AND repo = ? AND branch = ?")
+      .get(w.id, repo.toLowerCase(), branch) as { sha: string; generation: string | null } | null;
+    if (!row) return null;
+    const now = this.get(w.id);
+    const gen = trustGeneration(w.spec);
+    return now && row.generation === gen && trustGeneration(now.spec) === gen ? row.sha : null;
+  }
+
+  /** Forget that the head `key` names was judged untrusted (its owner vouched for it). */
+  forgetUntrustedHead(w: WatchRow, key: string): void {
+    this.#db.prepare("DELETE FROM loop_triggers WHERE watch_id = ? AND key = ? AND outcome = 'ignored'").run(w.id, key);
+  }
+
+  /** Record, in the watch's history, that its owner vouched for `sha` on `branch` (`--trust-head`). */
+  vouch(w: WatchRow, branch: string, sha: string, note: string, at: number): void {
+    this.#db
+      .prepare(
+        `INSERT INTO loop_triggers (account_id, project_id, owner_sub, repo, watch_id, key, kind, branch, outcome, note, settled, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'trust_anchor', ?, 'vouched', ?, 1, ?)
+         ON CONFLICT (account_id, project_id, owner_sub, key) DO UPDATE SET note = excluded.note, created_at = excluded.created_at`,
+      )
+      .run(w.accountId, w.projectId, w.ownerSub, w.repo, w.id, `vouch:${w.id}:${w.repo.toLowerCase()}:${branch}:${sha}`, branch, note.slice(0, 500), at);
   }
 
   /** Forget the heads this watch judged trusted (its trust list changed: they may not be any more). */
@@ -524,6 +556,19 @@ export class WatchStore {
       createdAt: r.created_at,
     }));
   }
+}
+
+/**
+ * Which trust list a judgment was made under: gh's login and the `trust`
+ * logins, case-folded and sorted. A head remembered under one generation
+ * vouches for nothing under another.
+ */
+export function trustGeneration(spec: Pick<WatchSpec, "ghLogin" | "trust">): string {
+  const trust = [...new Set((spec.trust ?? []).map((l) => l.toLowerCase()))].sort();
+  return createHash("sha256")
+    .update(JSON.stringify({ me: spec.ghLogin?.toLowerCase() ?? null, trust }))
+    .digest("hex")
+    .slice(0, 32);
 }
 
 /** Thrown inside a transaction to roll it back. */
