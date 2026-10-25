@@ -12,6 +12,7 @@ import {
   parseLogins,
   parseMovedHead,
   runsStartedBy,
+  suggestedHead,
   trustDiff,
   watchHealth,
   type WatchForm,
@@ -111,6 +112,13 @@ describe("vouching", () => {
     expect(heads.release?.sha).toBe(B);
   });
 
+  it("never suggests an untrusted head for a vouch; a past vouch or a failing check's head is a suggestion", () => {
+    expect(suggestedHead({ sha: A, source: "untrusted head", at: "2026-10-26T11:30:00.000Z" })).toBeNull();
+    expect(suggestedHead({ sha: B, source: "failing check", at: "2026-10-26T11:30:00.000Z" })?.sha).toBe(B);
+    expect(suggestedHead({ sha: C, source: "your last vouch", at: "2026-10-26T11:30:00.000Z" })?.sha).toBe(C);
+    expect(suggestedHead(undefined)).toBeNull();
+  });
+
   it("reads a moved head from the refusal's detail, or from its words when it names the full id", () => {
     const detail = { kind: "head_moved", branch: "main", head: B.toUpperCase(), pinned: A };
     expect(parseMovedHead(Object.assign(new Error("whatever the words say"), { detail }))).toEqual({ branch: "main", now: B, pinned: A });
@@ -160,12 +168,12 @@ describe("the create form", () => {
     });
   });
 
-  it("builds a branch watch, vouching only when asked", () => {
-    const b = buildWatchCreate(form({ target: "branches", branches: "main, release main", trustHead: true }));
-    expect(b).toMatchObject({ msg: { spec: { branches: ["main", "release"] }, trustHead: true } });
-    expect(buildWatchCreate(form({ target: "branches", branches: "main" }))).not.toHaveProperty("msg.trustHead");
-    // A my-PRs watch has no branch heads to vouch for.
-    expect(buildWatchCreate(form({ trustHead: true }))).not.toHaveProperty("msg.trustHead");
+  it("builds a branch watch, and never vouches unpinned at create", () => {
+    const b = buildWatchCreate(form({ target: "branches", branches: "main, release main" }));
+    expect(b).toMatchObject({ msg: { spec: { branches: ["main", "release"] } } });
+    // An unpinned vouch would take whatever each head is when the daemon reads it.
+    expect(b).not.toHaveProperty("msg.trustHead");
+    expect("trustHead" in emptyWatchForm()).toBe(false);
   });
 
   it("keeps a non-default app and drops the default", () => {

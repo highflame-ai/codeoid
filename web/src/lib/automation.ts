@@ -100,9 +100,9 @@ export function githubUrl(url: string | null | undefined): string | null {
   }
 }
 
-/** A commit on github.com for `owner/name` — only for a well-formed repo and hex sha. */
+/** A commit on github.com for `owner/name` — only for a well-formed repo and a hex id (a prefix, or a full SHA-1 or SHA-256 id). */
 export function githubCommitUrl(repo: string, sha: string): string | null {
-  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo) || !/^[0-9a-f]{7,40}$/i.test(sha)) return null;
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo) || !/^(?:[0-9a-f]{7,40}|[0-9a-f]{64})$/i.test(sha)) return null;
   return `https://github.com/${repo}/commit/${sha.toLowerCase()}`;
 }
 
@@ -120,4 +120,15 @@ export function optionalUsd(raw: string, name: string): number | undefined | { e
   if (!v) return undefined;
   if (!/^\d+(\.\d+)?$/.test(v) || Number(v) <= 0) return { error: `${name} must be a dollar amount above 0` };
   return Number(v);
+}
+
+/**
+ * Who a connection acts as, for the automation stores: the subject and its
+ * scopes. A reconnect as the same identity gives the same key, so what it was
+ * shown stays; a different one, or a narrower token, starts them empty. Null
+ * when nobody is signed in.
+ */
+export function identityKey(auth: { identity: { sub: string }; scopes: readonly string[] } | null | undefined): string | null {
+  if (!auth) return null;
+  return `${auth.identity.sub}\n${[...auth.scopes].sort().join(" ")}`;
 }

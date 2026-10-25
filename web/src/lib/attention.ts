@@ -191,13 +191,19 @@ export function collectAttention(src: AttentionSources, now: number): AttentionI
   // Loop runs waiting on your answer, or blocked without you. A run waiting
   // on an approval is left out: its worker session is `waiting_approval`, so
   // the approval row above already stands for it and opens where it is
-  // answered.
+  // answered. `listedLoops` holds every loop run that has a row of its own
+  // either way, so a routine following one doesn't list it a second time.
+  const listedLoops = new Set<string>();
   for (const run of src.loops ?? []) {
     const wait = loopWaitKind(run);
+    if (wait === "approval" && run.workerSessionId && (approvals.has(run.workerSessionId) || asked.has(run.workerSessionId))) {
+      listedLoops.add(run.id);
+    }
     // A blocked run is over; it asks for attention for a day, not forever.
     const recentlyBlocked =
       run.status === "blocked" && run.endedAt !== null && now - Date.parse(run.endedAt) < LOOP_BLOCKED_ATTENTION_MS;
     if (wait !== "question" && !recentlyBlocked) continue;
+    listedLoops.add(run.id);
     items.push({
       key: `loop:${run.id}`,
       kind: wait === "question" ? "question" : "blocked",
@@ -225,39 +231,46 @@ export function collectAttention(src: AttentionSources, now: number): AttentionI
     });
   }
 
-  // Routines that paused themselves, or whose last run failed recently (a
-  // loop routine's loop that ended blocked included). A run waiting on an
-  // approval is left out: its session is `waiting_approval`, so the approval
-  // row above already stands for it. A loop routine whose loop waits on you
-  // (a question, or paused) holds every later fire back, so it is listed as
-  // "waiting on its loop", opening the routine.
+  // Routines that paused themselves, or whose last outcome failed recently (a
+  // loop routine's loop that ended blocked included) — the outcome, not the
+  // last run: fires skipped behind a loop say nothing about how it went. A
+  // run waiting on an approval is left out: its session is
+  // `waiting_approval`, so the approval row above already stands for it. A
+  // loop routine whose loop waits on you (a question, or paused) holds every
+  // later fire back, so it is listed as "waiting on its loop", opening the
+  // routine — unless that loop already has its own row above.
   for (const r of src.routines ?? []) {
     const following = r.activeLoopRun?.loop;
-    if (following && (following.status === "waiting" || following.status === "paused")) {
-      items.push({
-        key: `routine:${r.id}`,
-        kind: "blocked",
-        sessionId: null,
-        routineId: r.id,
-        label: `routine · ${r.name}`,
-        detail: `waiting on its loop (${following.status === "paused" ? "paused" : "it waits on you"}): later fires are skipped until it ends`,
-        since: sinceFor(r.activeLoopRun!.startedAt ?? r.activeLoopRun!.createdAt, now),
-      });
-      continue;
-    }
+    const waitingOnLoop =
+      following && (following.status === "waiting" || following.status === "paused") && !listedLoops.has(following.runId)
+        ? `waiting on its loop (${following.status === "paused" ? "paused" : "it waits on you"}): later fires are skipped until it ends`
+        : null;
     if (!r.enabled && r.pausedReason) {
+      // Its own pause first: resuming is what it needs from you.
       items.push({
         key: `routine:${r.id}`,
         kind: "blocked",
         sessionId: null,
         routineId: r.id,
         label: `routine · ${r.name}`,
-        detail: r.pausedReason,
+        detail: waitingOnLoop ? `${r.pausedReason}; ${waitingOnLoop}` : r.pausedReason,
         since: sinceFor(r.updatedAt, now),
       });
       continue;
     }
-    const last = r.lastRun;
+    if (waitingOnLoop) {
+      items.push({
+        key: `routine:${r.id}`,
+        kind: "blocked",
+        sessionId: null,
+        routineId: r.id,
+        label: `routine · ${r.name}`,
+        detail: waitingOnLoop,
+        since: sinceFor(r.activeLoopRun!.startedAt ?? r.activeLoopRun!.createdAt, now),
+      });
+      continue;
+    }
+    const last = r.lastOutcome;
     if (!last || !isFailingRun(last.status, last.loop)) continue;
     const ended = sinceFor(last.endedAt ?? last.createdAt, now);
     if (now - ended >= ROUTINE_FAILED_ATTENTION_MS) continue;

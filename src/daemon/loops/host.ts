@@ -287,6 +287,8 @@ async function ensureCommit(
 const FETCHED_PACK_MAX = 2 * 1024 ** 3;
 /** How long a watch's fetch may download for: what bounds it while it does. */
 const FETCH_TIMEOUT_MS = 300_000;
+/** How long an interrupted worker's turn may take to end before it's left to finish on its own. */
+const WORKER_DRAIN_MS = 5_000;
 
 /**
  * A shallow or partial clone is missing objects by design: a fetch can't
@@ -571,7 +573,11 @@ export function buildLoopHost(d: LoopHostDeps): LoopHost {
     },
     interruptWorker: async (id) => {
       const s = d.session(id);
-      if (s) await s.interrupt({ sub: "system:loops", scopes: [], delegationDepth: 0, accountId: s.accountId, projectId: s.projectId });
+      if (!s) return;
+      await s.interrupt({ sub: "system:loops", scopes: [], delegationDepth: 0, accountId: s.accountId, projectId: s.projectId });
+      // The interrupted turn is still draining: its result, the spend with
+      // it, lands after interrupt() resolves. A cancel charges that spend.
+      await s.turnDrained(WORKER_DRAIN_MS);
     },
 
     // The candidate is the exact tree that would be committed: the run's base

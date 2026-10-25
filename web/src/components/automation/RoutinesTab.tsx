@@ -19,7 +19,6 @@ import {
   deleteRoutine,
   forgetRoutineToken,
   previewSchedule,
-  revealRoutineToken,
   rotateRoutineToken,
   routinesState,
   runRoutineNow,
@@ -50,23 +49,19 @@ export const routineFormOpen = () => mode() !== null;
 
 export const RoutinesTab: Component<{ onOpenLoopRun: (runId: string) => void; onClose: () => void }> = (props) => {
   const s = routinesState;
-  // Held in the store, so it goes when the connection changes or drops.
+  // Held in the store, so it goes when the identity changes or signs out, and
+  // is only ever shown to the identity that asked for it.
   const token = () => s().token;
   const recentWorkdirs = createMemo(() => [...new Set(sessionList().map((x) => x.workdir).filter(Boolean))].slice(0, 6));
   const sessionIds = createMemo(() => new Set(sessionList().map((x) => x.id)));
   const providers = () => providerIds().map((id) => ({ id, label: providerLabel(id) }));
 
-  const reveal = (routine: RoutineWire, apiToken: string | undefined) => {
-    if (apiToken) revealRoutineToken({ routineId: routine.id, apiToken, endpointPath: `/routines/${routine.id}/fire` });
-  };
-
+  // A token that comes back with a save is held (and shown) by the store.
   const submit = async (m: NonNullable<Mode>, body: RoutineFormSubmit) => {
     if (body.kind === "create") {
-      const res = await createRoutine(body.spec);
-      reveal(res.routine, res.apiToken);
+      await createRoutine(body.spec);
     } else if (m.kind === "edit") {
-      const res = await updateRoutine(m.routine.id, body.patch);
-      reveal(res.routine, res.apiToken);
+      await updateRoutine(m.routine.id, body.patch);
       selectRoutine(m.routine.id);
     }
     setMode(null);
@@ -130,7 +125,7 @@ export const RoutinesTab: Component<{ onOpenLoopRun: (runId: string) => void; on
                 onRunNow={(payload) => runRoutineNow(id, payload).then((run) => !!run)}
                 onCancelRun={(runId) => void cancelRoutineRun(id, runId)}
                 onDelete={() => deleteRoutine(id)}
-                onRotateToken={() => rotateRoutineToken(id).then((t) => revealRoutineToken({ routineId: id, ...t }))}
+                onRotateToken={() => rotateRoutineToken(id).then(() => undefined)}
                 onDismissToken={() => forgetRoutineToken()}
                 onOpenSession={(sessionId) => {
                   focusSession(sessionId);
@@ -178,6 +173,9 @@ export const RoutineList: Component<RoutineListProps> = (props) => (
       <For each={props.routines}>
         {(r) => {
           const st = () => routineState(r);
+          // How it's doing is its last outcome; fires skipped or cancelled
+          // since don't hide it. Until there is one, the last run is all there is.
+          const outcome = () => r.lastOutcome ?? r.lastRun;
           const last = () => r.lastRun;
           return (
             <li>
@@ -202,7 +200,7 @@ export const RoutineList: Component<RoutineListProps> = (props) => (
                   <Show when={routineLoopOf(r)}>
                     <Pill cls="border-accent/50 bg-accent/10 text-accent" title="Each run starts a verified loop run">loop</Pill>
                   </Show>
-                  <Show when={last()} fallback={<span class="text-[10px] text-fg-faint">never run</span>}>
+                  <Show when={outcome()} fallback={<span class="text-[10px] text-fg-faint">never run</span>}>
                     {(run) => (
                       <StatusBadge
                         style={routineRunStatusStyle(run())}

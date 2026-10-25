@@ -337,8 +337,9 @@ describe("loop watches end to end", () => {
     expect(await fetchHaves(repo, "acme/shop")).toEqual([tips.upstream]);
     gitIn(repo, "config", "--unset", "url.https://evil.example/acme/shop.insteadOf");
     expect((await fetchHaves(repo, "acme/shop")).sort()).toEqual([tips.origin, tips.upstream, tips.rewritten].sort());
-    // A remote named under another's name would be listed with it.
-    gitIn(repo, "remote", "add", "origin/x", "https://github.com/mallory/shop.git");
+    // A remote named under another's name would be listed with it. Newer git
+    // refuses `remote add` for that name, but config can still define it.
+    gitIn(repo, "config", "remote.origin/x.url", "https://github.com/mallory/shop.git");
     expect((await fetchHaves(repo, "acme/shop")).sort()).toEqual([tips.upstream, tips.rewritten].sort());
     expect(await fetchHaves(repo, "someone/else")).toEqual([]);
   });

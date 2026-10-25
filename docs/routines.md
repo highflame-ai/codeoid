@@ -149,7 +149,9 @@ When you approve and the agent finishes, the run's cost and summary are updated,
 From the moment it parks, the run's `--max-minutes` and codeoid's in-flight spend check no longer apply: the work goes on because you approved it, as in any session.
 
 The summary is the agent's final message, not the commentary it wrote between tool calls.
-Each routine keeps its newest 500 runs, plus every run from today (the daily cap sums them) and the runs later runs read (the last summary, the last run that dealt with its input).
+A routine's last outcome is its newest run that ended `succeeded`, `silent`, `needs_attention`, `failed`, `timed_out` or `over_budget`, by when it ended; `skipped`, `cancelled` and `interrupted` runs, and runs still going, are not outcomes.
+`codeoid routine ls`, the web UI's routine list and detail, its tab alert and the "Needs you" inbox read the last outcome (`lastOutcome` on the wire), so a loop routine's blocked loop isn't hidden behind the fires skipped while it ran.
+Each routine keeps its newest 500 runs, plus every run from today (the daily cap sums them) and the runs later runs read (the last summary, the last run that dealt with its input, and the last outcome).
 Retention (`--keep`) removes old run sessions, but never one that is parked on you, still working, or that someone has open.
 
 ## Routines that start a loop
@@ -196,9 +198,14 @@ It stays `running` while the loop is in progress, and ends with the loop's outco
 | `cancelled` | `cancelled`. |
 
 The run's cost is the loop's, including the attempt in flight when a loop is cancelled.
-A loop that waits on you (an approval, a question), or that you paused, keeps the routine run `running`, and the web UI's "Needs you" inbox lists the routine as waiting on its loop: no later fire starts until the loop ends.
+A cancel stops the worker first and waits, up to five seconds, for the interrupted turn to report its spend, so that spend is on the loop run and the routine run before either is told it ended.
+A turn that reports nothing in that time is charged what it had reported so far.
+A loop that waits on you (an approval, a question), or that you paused, keeps the routine run `running`, and no later fire starts until the loop ends.
+The web UI's "Needs you" inbox lists the routine as waiting on its loop, unless the loop already has its own row there (its question, or its worker's approval), so one wait isn't listed twice.
+A routine that paused itself is listed with its pause either way.
 A loop run cancelled directly (`codeoid loop cancel`) ends its routine run as `cancelled` at once.
-If the daemon stops between starting the loop and recording it, the routine run picks the loop up again on restart rather than ending `interrupted`.
+A routine run is marked `running` before its loop starts, so if the daemon stops between starting the loop and recording it, the run picks the loop up again on restart rather than ending `interrupted` or starting a second loop.
+Only a loop of the same owner whose trigger names this routine and this run is picked up.
 If loops are no longer available on the daemon (turned off before a restart), a run still following one ends `failed`, saying so.
 
 **One at a time.**
@@ -230,6 +237,7 @@ A loop waiting on you pushes as any loop does, unless the routine's policy is `n
 **Who can do what.**
 Saving, changing, firing, re-tokening or resuming a loop routine needs what `codeoid loop start` needs (`session:create`, `session:send` and `session:approve`), and a delegated token can't do any of it.
 Cancelling its run (`codeoid routine cancel <runId>`) cancels the loop run, and deleting the routine cancels a loop run still in progress (no `routine_end` fires for a routine being deleted).
+While a delete is cancelling that loop, every fire of the routine (its schedule, Run now, the API) is refused, so no loop run outlives the routine.
 As for every routine, your scopes are checked when you save or change it, not each time it fires (see [A routine outlives the token that created it](#who-can-do-what)).
 Nothing is checked at fire time: a loop routine keeps starting autonomous loop runs as you after your credential is revoked or loses `session:approve`, until you pause or delete it.
 So pause or delete it when access should end.
@@ -252,6 +260,8 @@ curl -X POST http://127.0.0.1:7400/routines/<routine-id>/fire \
 # → 202 {"runId":"…","status":"queued"}
 ```
 
+A fire that didn't go ahead says so in general terms (`{"runId":"…","status":"skipped","reason":"this fire was skipped: the routine is busy or at one of its limits"}`), naming no run.
+The run's own reason, which can name the loop run it waited behind, is yours to read: `codeoid routine runs` and the web UI show it.
 The body becomes the payload: JSON `{"text": "…"}`, any other JSON (passed through as text), or a plain-text body.
 A session routine's prompt gets it as `{{payload}}`; a loop routine hands it to the loop's worker as data.
 `codeoid routine token <name>` mints a new token and the old one stops working at once; `--no-api` revokes it.
@@ -259,6 +269,8 @@ Each routine accepts 30 API fires an hour by default (`routines.apiFiresPerHour`
 
 This is what monitors, deploy scripts and CI steps should call.
 The token can fire this one routine and nothing else.
+The web UI shows a new token once, to the identity that asked for it: it stays through a reconnect, and goes when you sign out or sign in as someone else.
+A token that comes back after the identity changed isn't shown at all; rotate again to get one.
 
 ## Notifications and hooks
 
@@ -406,8 +418,8 @@ As of October 2026, from each product's public documentation; — means we found
 ## Known limits
 
 - **The scheduler lives in the daemon.** No daemon, no fires; missed fires are skipped or caught up once, as configured.
-- **No event triggers yet.** GitHub, Slack and similar sources are planned; until then, point their webhooks at a small relay that calls the API trigger, or poll from a check.
-- **CLI only for now.** The web UI shows a routine's run sessions (marked as routine-managed) but has no routine screen yet.
+- **No event triggers yet.** For GitHub CI failures and review comments, use a loop watch ([loops.md](loops.md#watches)).
+  For Slack and other sources, point their webhooks at a small relay that calls the API trigger, or poll from a check.
 - **The qwen backend runs read-only shell commands without asking**, even in a guarded routine (a property of qwen-code itself, described under "Qwen backend" in the repository's CLAUDE.md), so an unattended qwen routine fed outside text could be steered to read any file the daemon user can. codeoid refuses an API trigger on a routine that runs on qwen, whether named or as the daemon's default backend, and fails an API run if the default has since become qwen; a qwen routine whose check reads untrusted text (issues, emails) carries the same risk, so prefer another backend there.
 - **Routines are tied to the identity that made them** (see [Who can do what](#who-can-do-what)): another key or the web UI's sign-in won't see them.
 - **A kept run session keeps the run's spend ceiling.** If you continue a fresh run's session yourself on Claude, its turns stop at that run's `--max-cost`; start a new session for open-ended work.

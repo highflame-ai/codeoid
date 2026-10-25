@@ -141,8 +141,12 @@ class FakeHost implements LoopHost {
     const attempt = this.service.attempts(runId).at(-1)!;
     queueMicrotask(() => this.#perform("worker-1", runId, attempt.id, step));
   }
+  /** Spend an interrupted turn reports as it ends, a moment after the interrupt. */
+  drainSpend = 0;
+  #drained = 0;
+  #draining: Promise<void> | null = null;
   workerInfo() {
-    return { status: this.#hung ? ("thinking" as const) : ("idle" as const), costUsd: 0.1 * this.prompts.length };
+    return { status: this.#hung ? ("thinking" as const) : ("idle" as const), costUsd: 0.1 * this.prompts.length + this.#drained };
   }
   async quiesceWorker(id: string): Promise<void> {
     this.quiesced.push(id);
@@ -150,6 +154,15 @@ class FakeHost implements LoopHost {
   }
   async interruptWorker(): Promise<void> {
     this.interrupts++;
+    if (this.drainSpend && !this.#draining) {
+      const spend = this.drainSpend;
+      this.drainSpend = 0;
+      this.#draining = Bun.sleep(5).then(() => {
+        this.#drained += spend;
+      });
+    }
+    // As the real host: every interrupt resolves once the turn has ended.
+    if (this.#draining) await this.#draining;
     if (this.#hung) {
       const h = this.#hung;
       this.#hung = null;
@@ -231,8 +244,11 @@ class FakeHost implements LoopHost {
     this.commits.push({ message, tree });
     return "c0ffee";
   }
+  /** The run's spend as each notice saw it. */
+  notifiedCost: number[] = [];
   notifyOwner(run: LoopRunRow, kind: string): void {
     this.notified.push(`${kind}:${run.status}`);
+    this.notifiedCost.push(run.costUsd);
   }
   audit(): void {}
 }
@@ -375,6 +391,20 @@ describe("control", () => {
     expect(cancelled.costUsd).toBeCloseTo(0.1);
     expect(service.get(id, OWNER).costUsd).toBeCloseTo(0.1);
     expect(host.notified).toContain("cancelled:cancelled");
+  });
+
+  test("a cancel charges what the interrupted turn reports as it ends, before it tells anyone", async () => {
+    const { host, service } = setup();
+    host.steps = [{ hang: true }];
+    const id = service.startRun(input(), OWNER).id;
+    await settle(service, id, () => service.attempts(id)[0]?.status === "running");
+    host.drainSpend = 0.05;
+    const cancelled = await service.cancel(id, OWNER);
+    expect(service.attempts(id)[0]!.costUsd).toBeCloseTo(0.15);
+    expect(cancelled.costUsd).toBeCloseTo(0.15);
+    expect(service.get(id, OWNER).costUsd).toBeCloseTo(0.15);
+    expect(host.notified.at(-1)).toBe("cancelled:cancelled");
+    expect(host.notifiedCost.at(-1)).toBeCloseTo(0.15);
   });
 
   test("an approval wait holds the task and stops the clock; answering resumes it", async () => {

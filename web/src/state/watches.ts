@@ -8,7 +8,9 @@
  * open (the selected watch, or the list), every {@link WATCH_POLL_MS} while
  * the "Needs you" inbox watches for a failing poll, never while the page is
  * hidden, and not in the background once this connection can't see watches.
- * A new connection starts empty.
+ * What one identity read is never shown to another: the store is emptied the
+ * moment the identity changes or signs out ({@link setWatchesIdentity}); a
+ * reconnect as the same identity keeps it.
  *
  * Read and control errors are kept as strings; create, update (trust) and
  * vouch reject with the daemon's words, so their forms show them where they
@@ -83,10 +85,12 @@ let listApplied = 0;
 let lastListAt = 0;
 const snapApplied = new Map<string, number>();
 const deletedAt = new Map<string, number>();
+/** Requests sent at or before this were asked as an earlier identity: their replies change nothing. */
+let resetAt = 0;
 
 function applySnapshot(snap: LoopWatchSnapshotMsg, sent: number): void {
   const id = snap.watch.id;
-  if ((deletedAt.get(id) ?? 0) > sent || (snapApplied.get(id) ?? 0) > sent) return;
+  if (sent <= resetAt || (deletedAt.get(id) ?? 0) > sent || (snapApplied.get(id) ?? 0) > sent) return;
   snapApplied.set(id, sent);
   setState((s) => {
     const watches = upsert(s.watches, snap.watch);
@@ -105,17 +109,29 @@ function snapshotOf(id: string) {
 // ── Connection ───────────────────────────────────────────────────────────────
 
 let unavailable = false;
-let readOver: object | null = null;
+/** Who the store reads as (identityKey); null = nobody signed in. */
+let identity: string | null = null;
 
 function client() {
-  const c = getClient();
-  if (readOver !== null && readOver !== c) {
-    setState({ ...EMPTY });
-    snapApplied.clear();
-    deletedAt.clear();
-  }
-  readOver = c;
-  return c;
+  return getClient();
+}
+
+/**
+ * The identity this client acts as changed, or signed out (null): everything
+ * shown goes now, and a reply to a request sent before now changes nothing.
+ * The same identity again (a reconnect) keeps it all.
+ */
+export function setWatchesIdentity(key: string | null): void {
+  if (key === identity) return;
+  identity = key;
+  resetAt = seq;
+  inflight = 0;
+  unavailable = false;
+  snapApplied.clear();
+  deletedAt.clear();
+  setState({ ...EMPTY });
+  reschedule();
+  if (key !== null && (viewOpen() || watchers > 0)) void fetchWatches();
 }
 
 function forget(e: unknown): void {
@@ -138,6 +154,7 @@ export async function fetchWatches(): Promise<void> {
         timeoutMs: READ_TIMEOUT_MS,
       },
     );
+    if (sent <= resetAt) return;
     unavailable = false;
     if (sent < listApplied) return;
     listApplied = sent;
@@ -148,6 +165,7 @@ export async function fetchWatches(): Promise<void> {
       return { ...s, watches, loaded: true, error: s.selectedId ? s.error : null };
     });
   } catch (e) {
+    if (sent <= resetAt) return;
     if (isUnavailable(e, OFF)) return forget(e);
     setState((s) => ({ ...s, loaded: true, error: errMessage(e) }));
   }
@@ -163,6 +181,7 @@ export async function fetchWatch(watchId: string): Promise<void> {
     );
     applySnapshot(snap, sent);
   } catch (e) {
+    if (sent <= resetAt) return;
     if (isUnavailable(e, OFF)) return forget(e);
     if (state().selectedId === watchId) setState((s) => ({ ...s, error: errMessage(e) }));
   }
@@ -192,13 +211,16 @@ async function control(build: (id: string) => ClientMessage): Promise<boolean> {
   try {
     const snap = await client().request<LoopWatchSnapshotMsg>(build(id), { waitForResult: snapshotOf(id), timeoutMs: WRITE_TIMEOUT_MS });
     applySnapshot(snap, sent);
-    return true;
+    return sent > resetAt;
   } catch (e) {
-    setState((s) => ({ ...s, error: errMessage(e) }));
+    if (sent > resetAt) setState((s) => ({ ...s, error: errMessage(e) }));
     return false;
   } finally {
-    inflight -= 1;
-    setState((s) => ({ ...s, busy: inflight > 0 }));
+    // A reset already zeroed the count this one was part of.
+    if (sent > resetAt) {
+      inflight -= 1;
+      setState((s) => ({ ...s, busy: inflight > 0 }));
+    }
   }
 }
 
@@ -217,6 +239,7 @@ export async function deleteWatch(watchId: string): Promise<boolean> {
   setState((s) => ({ ...s, busy: true, error: null }));
   try {
     await client().request({ type: "loop.watch.delete", id: newRequestId(), watchId }, { timeoutMs: WRITE_TIMEOUT_MS });
+    if (sent <= resetAt) return false;
     deletedAt.set(watchId, sent);
     setState((s) => ({
       ...s,
@@ -225,11 +248,13 @@ export async function deleteWatch(watchId: string): Promise<boolean> {
     }));
     return true;
   } catch (e) {
-    setState((s) => ({ ...s, error: errMessage(e) }));
+    if (sent > resetAt) setState((s) => ({ ...s, error: errMessage(e) }));
     return false;
   } finally {
-    inflight -= 1;
-    setState((s) => ({ ...s, busy: inflight > 0 }));
+    if (sent > resetAt) {
+      inflight -= 1;
+      setState((s) => ({ ...s, busy: inflight > 0 }));
+    }
   }
 }
 
@@ -245,6 +270,7 @@ export async function createWatch(body: Omit<LoopWatchCreateMsg, "id">): Promise
   } catch (e) {
     throw new Error(errMessage(e));
   }
+  if (sent <= resetAt) throw new Error("You signed in as someone else while the watch was made, so it isn't shown here.");
   setState((s) => ({ ...s, selectedId: snap.watch.id, detail: null, lastPoll: null, error: null }));
   applySnapshot(snap, sent);
   return snap.watch;
@@ -328,7 +354,8 @@ export function watchWatches(): () => void {
 
 /** Test-only: reset the singleton and stop polling. */
 export function _resetWatchesForTest(): void {
-  readOver = null;
+  identity = null;
+  resetAt = 0;
   inflight = 0;
   seq = 0;
   listApplied = 0;

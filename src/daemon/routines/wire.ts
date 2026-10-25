@@ -30,7 +30,7 @@ export function toRunWire(r: RunRow): RoutineRunWire {
 
 export function toRoutineWire(
   r: RoutineRow,
-  extra: { upcoming: string[]; lastRun?: RunRow; activeLoopRun?: RunRow; apiTokenSet: boolean },
+  extra: { upcoming: string[]; lastRun?: RunRow; lastOutcome?: RunRow; activeLoopRun?: RunRow; apiTokenSet: boolean },
 ): RoutineWire {
   return {
     id: r.id,
@@ -45,6 +45,7 @@ export function toRoutineWire(
     consecutiveFailures: r.consecutiveFailures,
     apiTokenSet: extra.apiTokenSet,
     ...(extra.lastRun ? { lastRun: toRunWire(extra.lastRun) } : {}),
+    ...(extra.lastOutcome ? { lastOutcome: toRunWire(extra.lastOutcome) } : {}),
     ...(extra.activeLoopRun ? { activeLoopRun: toRunWire(extra.activeLoopRun) } : {}),
     createdAt: iso(r.createdAt) as string,
     updatedAt: iso(r.updatedAt) as string,

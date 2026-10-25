@@ -43,7 +43,7 @@ import { providerIds, providerLabel } from "../state/providers";
 import { closeRoutines, openRoutines, routinesState, routinesViewOpen } from "../state/routines";
 import { focusSession, sessionList } from "../state/sessions";
 import { closeWatches, openWatches, watchesState, watchesViewOpen } from "../state/watches";
-import { isFailingRun } from "../lib/routines";
+import { routineNeedsALook } from "../lib/routines";
 import type { LoopRunWire } from "../protocol/types";
 
 /** Non-null while the start form shows; the objective it was opened with. */
@@ -153,7 +153,7 @@ const LoopsPanel: Component = () => {
     watches: { n: watchesState().watches.length, alert: watchesState().watches.some((w) => !!w.lastError) },
     routines: {
       n: routinesState().routines.length,
-      alert: routinesState().routines.some((r) => !!r.pausedReason || (!!r.lastRun && isFailingRun(r.lastRun.status, r.lastRun.loop))),
+      alert: routinesState().routines.some(routineNeedsALook),
     },
   }));
   const tabId = (t: AutomationTab) => `automation-tab-${t}`;

@@ -110,6 +110,13 @@ export const ACTIVE_RUN_STATUSES: readonly RunStatus[] = ["queued", "checking", 
 /** Runs that count toward the failure auto-pause. */
 export const FAILURE_RUN_STATUSES: readonly RunStatus[] = ["failed", "timed_out", "over_budget"];
 
+/**
+ * Statuses that are a run's real outcome — they move "last run", the failure
+ * streak, and a routine's `lastOutcome`. A run that never got to do its work
+ * (skipped, cancelled, interrupted) is not one.
+ */
+export const OUTCOME_RUN_STATUSES: readonly RunStatus[] = ["succeeded", "silent", "needs_attention", "failed", "timed_out", "over_budget"];
+
 export interface RoutineRow {
   id: string;
   accountId: string;

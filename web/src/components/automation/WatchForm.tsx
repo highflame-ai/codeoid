@@ -97,6 +97,10 @@ export const WatchForm: Component<WatchFormProps> = (props) => {
             placeholder="main, release"
           />
           <FieldError error={error()} field="branches" />
+          <p class="text-[10px] text-fg-faint" data-testid="watch-form-vouch-note">
+            A branch whose history begins with someone else's push starts no runs until you vouch for its head. Once the watch exists, you're
+            offered that: you look at each head's commit on GitHub and vouch for that exact commit.
+          </p>
         </Show>
       </fieldset>
 
@@ -268,20 +272,6 @@ export const WatchForm: Component<WatchFormProps> = (props) => {
           can make it push; {REFUSED_TRUST.join(", ")} are refused.
         </p>
       </div>
-
-      <Show when={form().target === "branches"}>
-        <label class="flex items-start gap-2 rounded border border-warn/40 bg-warn/5 px-3 py-2 text-[12px] text-fg">
-          <input type="checkbox" class="mt-0.5" checked={form().trustHead} onChange={(e) => set("trustHead", e.currentTarget.checked)} disabled={busy()} />
-          <span>
-            Vouch for each branch's head now
-            <span class="block text-[11px] text-fg-muted">
-              For a branch that changes only through reviewed merges, when its history begins with someone else's push. Everything on it when the
-              daemon reads it is treated as yours, including commits you didn't review. To pin to a commit you looked at, make the watch first,
-              then use "Vouch for current head" on it.
-            </span>
-          </span>
-        </label>
-      </Show>
 
       <details class="rounded border border-border bg-bg/30 px-3 py-2">
         <summary class="cursor-pointer text-[12px] text-fg-muted">More options: runs per hour, backend</summary>

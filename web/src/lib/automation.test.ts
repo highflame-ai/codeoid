@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { absoluteTime, errMessage, githubCommitUrl, githubUrl, isUnavailable, optionalInt, optionalUsd, relativeWhen } from "./automation";
+import { absoluteTime, errMessage, githubCommitUrl, githubUrl, identityKey, isUnavailable, optionalInt, optionalUsd, relativeWhen } from "./automation";
 
 const NOW = Date.parse("2026-10-26T12:00:00.000Z");
 const at = (ms: number) => new Date(NOW + ms).toISOString();
@@ -39,6 +39,10 @@ describe("links", () => {
     expect(githubCommitUrl("acme/shop", "0123456789AB")).toBe("https://github.com/acme/shop/commit/0123456789ab");
     expect(githubCommitUrl("acme/shop/../x", "0123456789ab")).toBeNull();
     expect(githubCommitUrl("acme/shop", "not-a-sha")).toBeNull();
+    // A SHA-256 repository's full ids, but nothing between 40 and 64.
+    expect(githubCommitUrl("acme/shop", "a".repeat(64))).toBe(`https://github.com/acme/shop/commit/${"a".repeat(64)}`);
+    expect(githubCommitUrl("acme/shop", "a".repeat(50))).toBeNull();
+    expect(githubCommitUrl("acme/shop", "a".repeat(65))).toBeNull();
   });
 });
 
@@ -62,5 +66,15 @@ describe("errors", () => {
     // The client rejects a response.error as a plain Error: the words decide.
     expect(isUnavailable(new Error("Missing scope: session:send"), /^Missing scope/)).toBe(true);
     expect(isUnavailable(new Error("request timed out"), /^Missing scope/)).toBe(false);
+  });
+});
+
+describe("identityKey", () => {
+  it("is the same for a reconnect as the same identity, and differs for another or a narrower token", () => {
+    const a = { identity: { sub: "spiffe://t/user/a" }, scopes: ["session:read", "session:create"] };
+    expect(identityKey(a)).toBe(identityKey({ identity: { sub: "spiffe://t/user/a" }, scopes: ["session:create", "session:read"] }));
+    expect(identityKey(a)).not.toBe(identityKey({ ...a, identity: { sub: "spiffe://t/user/b" } }));
+    expect(identityKey(a)).not.toBe(identityKey({ ...a, scopes: ["session:read"] }));
+    expect(identityKey(null)).toBeNull();
   });
 });

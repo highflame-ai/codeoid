@@ -112,6 +112,15 @@ export function isFailingRun(status: RoutineRunStatus, loop?: RoutineRunWire["lo
   return FAILING.includes(status) || (status === "needs_attention" && !!loop);
 }
 
+/**
+ * The routine wants a look (the drawer's tab alert): it paused itself, or its
+ * last outcome failed. The outcome, not the last run: fires skipped behind a
+ * loop, or cancelled, say nothing about how it went.
+ */
+export function routineNeedsALook(r: Pick<RoutineWire, "pausedReason" | "lastOutcome">): boolean {
+  return !!r.pausedReason || (!!r.lastOutcome && isFailingRun(r.lastOutcome.status, r.lastOutcome.loop));
+}
+
 /** A run that is still going, so cancel applies (the daemon decides; this keeps dead buttons off). */
 export function isCancellableRun(status: RoutineRunStatus): boolean {
   return status === "queued" || status === "checking" || status === "running";

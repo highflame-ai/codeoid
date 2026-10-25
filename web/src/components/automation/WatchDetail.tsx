@@ -7,7 +7,7 @@
  * wires them in.
  */
 
-import { Component, For, Show, createMemo, createSignal } from "solid-js";
+import { Component, For, Show, createMemo, createSignal, untrack } from "solid-js";
 
 import { TrustEditor } from "./TrustEditor";
 import { VouchDialog } from "./VouchDialog";
@@ -55,6 +55,8 @@ export interface WatchDetailProps {
   onSaveTrust: (trust: string[]) => Promise<void>;
   onVouch: (trustHead: LoopWatchTrustHead) => Promise<void>;
   onOpenLoopRun: (runId: string) => void;
+  /** This branch watch was just made: offer the (pinned) vouch dialog, as a narrowing does. */
+  justCreated?: boolean;
 }
 
 function repoUrl(repo: string): string | null {
@@ -67,8 +69,14 @@ export const WatchDetail: Component<WatchDetailProps> = (props) => {
   const known = createMemo(() => knownHeads(props.triggers, w().repo));
   const [editTrust, setEditTrust] = createSignal(false);
   const [vouchOpen, setVouchOpen] = createSignal(false);
-  /** A narrowing just forgot every vouched head: offer the (pinned) vouch dialog. */
-  const [offerVouch, setOfferVouch] = createSignal(false);
+  /**
+   * Offer the (pinned) vouch dialog: the watch was just made, or a narrowing
+   * just forgot every vouched head. Never a vouch of its own.
+   */
+  // Read once, when the detail opens: the offer is for the moment after create.
+  const [offerVouch, setOfferVouch] = createSignal<"created" | "narrowed" | null>(
+    untrack(() => (props.justCreated && !props.watch.myPrs ? "created" : null)),
+  );
   const [confirmDelete, setConfirmDelete] = createSignal(false);
   const [deleting, setDeleting] = createSignal(false);
 
@@ -81,7 +89,7 @@ export const WatchDetail: Component<WatchDetailProps> = (props) => {
   const saveTrust = async (trust: string[], narrowed: boolean) => {
     await props.onSaveTrust(trust);
     setEditTrust(false);
-    setOfferVouch(narrowed && !w().myPrs);
+    setOfferVouch(narrowed && !w().myPrs ? "narrowed" : null);
   };
 
   return (
@@ -275,21 +283,22 @@ export const WatchDetail: Component<WatchDetailProps> = (props) => {
       <Show when={offerVouch()}>
         <div class="flex flex-wrap items-center gap-2 rounded border border-warn/50 bg-warn/10 px-3 py-2 text-[12px]" data-testid="watch-offer-vouch">
           <span class="min-w-0 flex-1 text-fg">
-            The narrower list forgot every head you vouched for. A branch whose history the dropped logins touched starts no runs until a trusted
-            login pushes or you vouch for its head again.
+            {offerVouch() === "created"
+              ? "A branch whose history begins with someone else's push starts no runs until a trusted login pushes or you vouch for its head. Look at each head's commit on GitHub, then vouch for that exact commit."
+              : "The narrower list forgot every head you vouched for. A branch whose history the dropped logins touched starts no runs until a trusted login pushes or you vouch for its head again."}
           </span>
           <button
             type="button"
             class={quietBtn}
             disabled={props.busy}
             onClick={() => {
-              setOfferVouch(false);
+              setOfferVouch(null);
               setVouchOpen(true);
             }}
           >
             Vouch for current heads…
           </button>
-          <button type="button" class={linkBtn} onClick={() => setOfferVouch(false)}>
+          <button type="button" class={linkBtn} onClick={() => setOfferVouch(null)}>
             not now
           </button>
         </div>

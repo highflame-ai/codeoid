@@ -6156,6 +6156,7 @@ mcpHub: this.#mcpHub,
       toRoutineWire(r, {
         upcoming: svc.upcoming(r, 3),
         lastRun: svc.store.listRuns(r.id, { limit: 1 })[0],
+        lastOutcome: svc.store.lastOutcome(r.id),
         activeLoopRun: svc.store.activeRuns(r.id).find((x) => x.loopRunId !== null),
         apiTokenSet: svc.store.hasApiToken(r.id),
       });
@@ -6854,7 +6855,7 @@ mcpHub: this.#mcpHub,
         loops
           .listActive(owner)
           .filter((run) => run.contract.trigger?.kind === "routine" && run.contract.trigger.routineRunId)
-          .map((run) => ({ loopRunId: run.id, routineRunId: run.contract.trigger!.routineRunId! })),
+          .map((run) => ({ loopRunId: run.id, routineId: run.contract.trigger!.routineId ?? null, routineRunId: run.contract.trigger!.routineRunId! })),
       cancel: async (id, owner) => {
         await loops.cancel(id, owner);
       },

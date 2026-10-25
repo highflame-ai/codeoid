@@ -53,6 +53,7 @@ import { hashToken, type RoutineStore } from "./store.js";
 import {
   ACTIVE_RUN_STATUSES,
   FAILURE_RUN_STATUSES,
+  OUTCOME_RUN_STATUSES,
   type RoutineRow,
   type RoutineSpec,
   type RunRow,
@@ -219,8 +220,8 @@ export interface RoutineLoopPort {
   start(input: LoopStartInput, owner: RoutineOwner): string;
   /** The run, as its owner sees it; null when it is gone. */
   state(loopRunId: string, owner: RoutineOwner): RoutineLoopState | null;
-  /** The owner's loop runs still in progress that a routine run started: the loop run, and that routine run. */
-  inProgress(owner: RoutineOwner): Array<{ loopRunId: string; routineRunId: string }>;
+  /** The owner's loop runs still in progress that a routine run started: the loop run, and the routine and run its trigger names. */
+  inProgress(owner: RoutineOwner): Array<{ loopRunId: string; routineId: string | null; routineRunId: string }>;
   cancel(loopRunId: string, owner: RoutineOwner): Promise<void>;
 }
 
@@ -501,9 +502,6 @@ function refuseSessionLimits(given: object): void {
 const NAME_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const PLACEHOLDER_RE = /\{\{\s*(check|payload|last_summary|trigger|now|routine)\s*\}\}/;
 
-/** Statuses that are a run's real outcome — they move "last run" and the failure streak. */
-const OUTCOME_RUN_STATUSES: readonly RunStatus[] = ["succeeded", "silent", "needs_attention", "failed", "timed_out", "over_budget"];
-
 // ── The service ──────────────────────────────────────────────────────────────
 
 interface LiveRun {
@@ -536,7 +534,7 @@ export class RoutineService {
    * the daily cap), so they are folded in when the session settles.
    */
   readonly #parked = new Map<string, { runId: string; base: Pick<RunRow, "costUsd" | "inputTokens" | "outputTokens">; turn: string | null }>();
-  /** Routines being deleted: a run that ends meanwhile (its loop cancelled) tells no one. */
+  /** Routines being deleted: nothing fires or starts for them, and a run that ends meanwhile (its loop cancelled) tells no one. */
   readonly #deleting = new Set<string>();
   #stopped = false;
 
@@ -598,25 +596,29 @@ export class RoutineService {
    * Each such loop names the run that started it (its trigger): that run, if
    * it is still in flight or was closed as interrupted, follows it again
    * instead of ending interrupted. Found through the owner-scoped list, so a
-   * loop is only ever linked to a run of its own owner's routine.
+   * loop is only ever linked to a run of its own owner's routine, and only
+   * when the routine its trigger names is that run's routine.
    */
   #relinkLoops(): void {
     const port = this.#host.loops;
     if (!port) return;
     for (const owner of this.#store.owners()) {
-      let loops: Array<{ loopRunId: string; routineRunId: string }>;
+      let loops: Array<{ loopRunId: string; routineId: string | null; routineRunId: string }>;
       try {
         loops = port.inProgress(owner);
       } catch {
         continue;
       }
-      for (const { loopRunId, routineRunId } of loops) {
+      for (const { loopRunId, routineId, routineRunId } of loops) {
         const run = this.#store.getRun(routineRunId);
         const routine = run && this.#store.getRoutine(run.routineId);
-        if (!run || !routine || run.loopRunId !== null) continue;
+        if (!run || !routine || run.loopRunId !== null || routineId !== run.routineId) continue;
         const o = ownerOf(routine);
         if (o.sub !== owner.sub || o.accountId !== owner.accountId || o.projectId !== owner.projectId) continue;
-        if (run.status !== "checking" && run.status !== "running" && run.status !== "interrupted") continue;
+        // A run is `running` before its loop is started (#startLoopRun), so a
+        // crash in between leaves one of these; `queued` covers a run recorded
+        // before that was so.
+        if (!ACTIVE_RUN_STATUSES.includes(run.status) && run.status !== "interrupted") continue;
         const state = port.state(loopRunId, owner);
         this.#store.updateRun(run.id, { status: "running", endedAt: null, reason: null, loopRunId, loopStatus: state?.status ?? "running" });
         this.#host.audit(`routine:${routine.id}`, "routine.run.relinked", undefined, `run=${run.id} loop=${loopRunId}`);
@@ -655,7 +657,8 @@ export class RoutineService {
   #fireScheduled(r: RoutineRow, now: number): void {
     const schedule = r.spec.schedule;
     const due = r.nextFireAt;
-    if (!schedule || due === null) return;
+    // A routine being deleted fires no more (its row goes in a moment).
+    if (!schedule || due === null || this.#deleting.has(r.id)) return;
     let next: number | null;
     try {
       next = this.#nextFire(r, schedule, new Date(Math.max(now, due)));
@@ -692,6 +695,9 @@ export class RoutineService {
    * policy is decided here, against runs of the same routine still in flight.
    */
   #admit(r: RoutineRow, trigger: RunTrigger, opts: { scheduledFor: number | null; payload: string | null }): RunRow {
+    // A run admitted now would outlive the delete (its loop, which nothing
+    // would follow or cancel).
+    if (this.#deleting.has(r.id)) throw new RoutineError("this routine is being deleted", "conflict");
     let active = this.#store.activeRuns(r.id);
     // A loop routine's last loop run still in progress: one at a time, never
     // queued. Its state is read again first: a loop that just ended (its
@@ -798,6 +804,8 @@ export class RoutineService {
     for (const run of this.#store.activeRuns()) {
       if (this.#live.size >= this.config.maxConcurrentRuns) return;
       if (run.status !== "queued" || this.#live.has(run.id)) continue;
+      // Delete removes it with the routine; starting it now would orphan its work.
+      if (this.#deleting.has(run.routineId)) continue;
       const routine = this.#store.getRoutine(run.routineId);
       if (!routine) {
         this.#store.setRunStatus(run.id, "cancelled", { endedAt: this.#now(), reason: "the routine was deleted" });
@@ -1141,7 +1149,16 @@ export class RoutineService {
       finish("failed", { reason: "loops are not available on this daemon", ...kept });
       return;
     }
+    // A loop started for a routine being deleted would be followed by nobody.
+    if (this.#deleting.has(routine.id)) {
+      finish("cancelled", { reason: "the routine was deleted", ...kept });
+      return;
+    }
     const owner = ownerOf(routine);
+    // Running before the loop exists: a daemon that dies between starting the
+    // loop and recording it leaves a run that boot relinks to the loop (it
+    // names this run), never a queued one that a second loop would start for.
+    this.#store.setRunStatus(run.id, "running", { startedAt: run.startedAt ?? startedAt, ...kept });
     // Two pieces of data, each cut to its own budget: a long gate output
     // never crowds out the payload.
     const summary = checkOutput !== null ? clipWithin(checkOutput, LOOP_LIMITS.TRIGGER_SUMMARY_MAX) : "";
@@ -1574,8 +1591,10 @@ export class RoutineService {
   }
 
   async delete(r: RoutineRow, actor: string): Promise<void> {
-    // Marked first: a run that ends while this goes on (its loop cancelled
-    // below) must not announce a routine_end for a routine being removed.
+    // Marked before the first await: a run that ends while this goes on (its
+    // loop cancelled below) announces no routine_end, and a fire that lands
+    // meanwhile (a tick, another client's Run now) is refused, so no run or
+    // loop outlives the routine.
     this.#deleting.add(r.id);
     try {
       for (const live of this.#live.values()) {
@@ -1613,6 +1632,7 @@ export class RoutineService {
   /** Fire now (manual or API). Overlap policy applies; returns the run record. */
   fire(r: RoutineRow, trigger: "manual" | "api", payload: string | null, actor: string): RunRow {
     if (!this.config.enabled) throw new RoutineError("routines are disabled on this daemon", "invalid_request");
+    if (this.#deleting.has(r.id)) throw new RoutineError("this routine is being deleted", "conflict");
     if (payload !== null && payload.length > LIMITS.PAYLOAD_MAX) {
       throw new RoutineError(`payload is longer than ${LIMITS.PAYLOAD_MAX} characters`, "invalid_request");
     }

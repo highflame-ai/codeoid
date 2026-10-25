@@ -19,6 +19,7 @@ import { BUSY_TIMEOUT_MS } from "../store.js";
 import type { LoopStatus } from "../loops/types.js";
 import {
   ACTIVE_RUN_STATUSES,
+  OUTCOME_RUN_STATUSES,
   type RoutineRow,
   type RoutineSpec,
   type RunRow,
@@ -378,6 +379,22 @@ export class RoutineStore {
     return rows.map(toRun);
   }
 
+  /**
+   * The newest run that ended with an outcome, by when it ended: what "how is
+   * this routine doing" means. Skipped, cancelled and interrupted runs are
+   * not outcomes, so a loop routine's blocked loop is not hidden behind the
+   * fires skipped while it ran.
+   */
+  lastOutcome(routineId: string): RunRow | undefined {
+    const ph = OUTCOME_RUN_STATUSES.map(() => "?").join(", ");
+    const row = this.#db
+      .prepare(
+        `SELECT * FROM routine_runs WHERE routine_id = ? AND status IN (${ph}) AND ended_at IS NOT NULL ORDER BY ended_at DESC, rowid DESC LIMIT 1`,
+      )
+      .get(routineId, ...OUTCOME_RUN_STATUSES) as RunDbRow | null;
+    return row ? toRun(row) : undefined;
+  }
+
   /** Spend since `since` (ms) — the daily cap's numerator. */
   costSince(routineId: string, since: number): number {
     const row = this.#db
@@ -416,10 +433,12 @@ export class RoutineStore {
    * Keep a routine's newest `keep` finished runs; delete older ones — except
    * what later runs still read: anything since `keepSince` (today's spend,
    * which the daily cap sums), the newest summary ({{last_summary}}), and the
-   * newest handled run (CODEOID_ROUTINE_SINCE).
+   * newest handled run (CODEOID_ROUTINE_SINCE), and the newest outcome
+   * (`lastOutcome`, which a long run of skips must not push out).
    */
   trimRuns(routineId: string, keep: number, keepSince: number): void {
     const ph = ACTIVE_RUN_STATUSES.map(() => "?").join(", ");
+    const outcomes = OUTCOME_RUN_STATUSES.map(() => "?").join(", ");
     this.#db
       .prepare(
         `DELETE FROM routine_runs WHERE routine_id = ? AND status NOT IN (${ph}) AND created_at < ?
@@ -431,9 +450,12 @@ export class RoutineStore {
              ORDER BY created_at DESC, rowid DESC LIMIT 1)
            AND rowid NOT IN (
              SELECT rowid FROM routine_runs WHERE routine_id = ? AND status IN ('succeeded', 'silent') AND started_at IS NOT NULL
-             ORDER BY created_at DESC, rowid DESC LIMIT 1)`,
+             ORDER BY created_at DESC, rowid DESC LIMIT 1)
+           AND rowid NOT IN (
+             SELECT rowid FROM routine_runs WHERE routine_id = ? AND status IN (${outcomes}) AND ended_at IS NOT NULL
+             ORDER BY ended_at DESC, rowid DESC LIMIT 1)`,
       )
-      .run(routineId, ...ACTIVE_RUN_STATUSES, keepSince, routineId, ...ACTIVE_RUN_STATUSES, keep, routineId, routineId);
+      .run(routineId, ...ACTIVE_RUN_STATUSES, keepSince, routineId, ...ACTIVE_RUN_STATUSES, keep, routineId, routineId, routineId, ...OUTCOME_RUN_STATUSES);
   }
 
   /** The last run that produced a summary — feeds {{last_summary}}. */

@@ -227,7 +227,10 @@ Given alone it vouches for whatever the head is when the daemon reads it, which 
 The commit is named by its full id (40 hex characters, or 64 in a SHA-256 repository; `git rev-parse <commit>` prints it), and a prefix is refused, however long: a prefix could match a commit pushed later that you never looked at.
 If any named head moved, nothing is vouched for and nothing else in the request changes; the refusal names the head's full id now, so look at that commit and vouch again with it.
 Over the protocol, `trustHead` is `true` or an object of branch to full commit id (`{ "main": "<40 hex characters>" }`), and the moved-head refusal carries `detail` `{ "kind": "head_moved", "branch", "head", "pinned" }` with `head` the full id, so a client re-pins without reading the words.
-The web UI always vouches pinned like this, to the full id; it has no unpinned vouch.
+The web UI always vouches pinned like this, to the full id; it has no unpinned vouch, not even when making a watch.
+Making a branch watch there vouches for nothing; once it exists, the watch offers the vouch dialog.
+The dialog fills nothing in: a head you vouched for before, or one a failing check ran on, is offered as "Use <id> (view)", with its commit on GitHub, and an untrusted head is not offered at all.
+If a head moved, the dialog shows its full id now with its link, and vouching for it takes ticking "I've looked at this commit" first.
 It is never implied: making, resuming, or changing a watch without it vouches for nothing.
 It also forgets that head's untrusted record, if the watch had one.
 A trust list that only adds logins afterwards keeps it, like any remembered head.

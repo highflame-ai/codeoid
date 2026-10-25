@@ -27,6 +27,7 @@ import {
   runRoutineNow,
   selectRoutine,
   setRoutineEnabled,
+  setRoutinesIdentity,
   updateRoutine,
   watchRoutines,
 } from "./routines";
@@ -101,17 +102,22 @@ describe("routines store — reads", () => {
     expect(clientRequestMock).toHaveBeenCalledTimes(1);
   });
 
-  it("a new connection starts empty: nothing read over the old one shows", async () => {
+  it("another identity starts empty at once: nothing read as the earlier one shows, even a late reply", async () => {
+    setRoutinesIdentity("a");
     clientRequestMock.mockResolvedValue(snap({}, { runs: [runWire()] }));
     selectRoutine("rt_1");
     await tick();
     expect(routinesState().detail).not.toBeNull();
+    let late!: (v: unknown) => void;
+    clientRequestMock.mockReturnValueOnce(new Promise((r) => (late = r)));
+    const slow = fetchRoutines();
 
-    const second = vi.fn().mockResolvedValue(list([]));
-    clientRef.current = { request: second };
-    await fetchRoutines();
-    expect(second).toHaveBeenCalledTimes(1);
+    setRoutinesIdentity("b");
+    // No request needed: what "a" saw is gone the moment "b" signs in.
     expect(routinesState()).toMatchObject({ routines: [], detail: null, selectedId: null });
+    late(list([routine()]));
+    await slow;
+    expect(routinesState().routines).toEqual([]);
   });
 
   it("an error for a routine the user left doesn't paint over another", async () => {
@@ -174,6 +180,8 @@ describe("routines store — controls", () => {
     expect(sent(0)).toEqual({ type: "routine.create", id: "r", spec });
     expect(res.apiToken).toBe("rt_secret");
     expect(routinesState().selectedId).toBe("rt_new");
+    // Held in the store to show once.
+    expect(routinesState().token).toEqual({ routineId: "rt_new", apiToken: "rt_secret", endpointPath: "/routines/rt_new/fire" });
   });
 
   it("create, update, preview and token reject with the daemon's words", async () => {
@@ -297,18 +305,59 @@ describe("routines store — reply order", () => {
 describe("routines store — a token shown once", () => {
   const token = { routineId: "rt_1", apiToken: "rt_secret", endpointPath: "/routines/rt_1/fire" };
 
-  it("goes when the connection drops or changes hands", async () => {
+  it("goes when dismissed, or when the identity changes or signs out", async () => {
     revealRoutineToken(token);
     expect(routinesState().token).toEqual(token);
     forgetRoutineToken();
     expect(routinesState().token).toBeNull();
 
+    setRoutinesIdentity("a");
+    revealRoutineToken(token);
+    setRoutinesIdentity("b");
+    expect(routinesState().token).toBeNull();
+    revealRoutineToken(token);
+    setRoutinesIdentity(null);
+    expect(routinesState().token).toBeNull();
+  });
+
+  it("stays through a reconnect as the same identity", async () => {
+    setRoutinesIdentity("a");
     clientRequestMock.mockResolvedValue(list([routine()]));
     await fetchRoutines();
     revealRoutineToken(token);
-    clientRef.current = { request: vi.fn().mockResolvedValue(list([])) };
+    // A new connection object (a re-authenticated socket), the same identity.
+    clientRef.current = { request: vi.fn().mockResolvedValue(list([routine()])) };
+    setRoutinesIdentity("a");
     await fetchRoutines();
+    expect(routinesState().token).toEqual(token);
+  });
+
+  it("a rotated token is shown only to the identity that asked for it", async () => {
+    setRoutinesIdentity("a");
+    let answer!: (v: unknown) => void;
+    clientRequestMock.mockReturnValueOnce(new Promise((r) => (answer = r)));
+    const rotating = rotateRoutineToken("rt_1");
+    setRoutinesIdentity("b");
+    answer({ type: "routine.token.result", requestId: "r", routineId: "rt_1", apiToken: "rt_for_a", endpointPath: "/routines/rt_1/fire" });
+    await expect(rotating).rejects.toThrow(/signed in as someone else/);
     expect(routinesState().token).toBeNull();
+
+    // Asked and answered as the same identity: shown.
+    clientRequestMock.mockResolvedValueOnce({ type: "routine.token.result", requestId: "r", routineId: "rt_1", apiToken: "rt_for_b", endpointPath: "/routines/rt_1/fire" });
+    await rotateRoutineToken("rt_1");
+    expect(routinesState().token).toEqual({ routineId: "rt_1", apiToken: "rt_for_b", endpointPath: "/routines/rt_1/fire" });
+  });
+
+  it("a token that comes back with a create is shown only to the identity that asked", async () => {
+    setRoutinesIdentity("a");
+    let answer!: (v: unknown) => void;
+    clientRequestMock.mockReturnValueOnce(new Promise((r) => (answer = r)));
+    const creating = createRoutine({ name: "x", prompt: "p", workdir: "/w", api: true });
+    setRoutinesIdentity("b");
+    answer(snap({ id: "rt_new" }, { apiToken: "rt_secret" }));
+    await expect(creating).rejects.toThrow(/signed in as someone else/);
+    expect(routinesState().token).toBeNull();
+    expect(routinesState().routines).toEqual([]);
   });
 
   it("goes with its routine", async () => {

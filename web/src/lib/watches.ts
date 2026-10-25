@@ -124,10 +124,18 @@ export interface KnownHead {
   at: string;
 }
 
+/** A head the vouch dialog may offer: never an untrusted one (nobody looked at it). */
+export function suggestedHead(h: KnownHead | undefined): KnownHead | null {
+  return h && h.source !== "untrusted head" ? h : null;
+}
+
 /**
  * The newest head the watch's history names for each branch. The wire has no
- * "current head" read, so this is the best this client knows — the vouch
- * dialog pins to it and the daemon's compare-and-set says if it moved.
+ * "current head" read, so this is the best this client knows. The vouch
+ * dialog never fills it in for you: one you vouched for before, or one a
+ * failing check ran on, is offered as a suggestion you look at and take; an
+ * untrusted head (a commit nobody vetted) is not offered at all. The daemon's
+ * compare-and-set says if the head moved since.
  *
  * Keys (src/daemon/loops): `untrusted:<watch>:<sha>:<headRepo>:<branch>`,
  * `vouch:<watch>:<repo>:<branch>:<sha>`, `ci:<repo>:<sha>:<checkRun>:<suite>`.
@@ -301,8 +309,6 @@ export interface WatchForm {
   /** Comma or space separated. */
   trust: string;
   maxRunsPerHour: string;
-  /** Vouch for the branches' heads as they are when the daemon reads them. */
-  trustHead: boolean;
   provider: string;
   model: string;
 }
@@ -322,7 +328,6 @@ export function emptyWatchForm(): WatchForm {
     mention: "",
     trust: "",
     maxRunsPerHour: "",
-    trustHead: false,
     provider: "",
     model: "",
   };
@@ -332,7 +337,12 @@ export function parseBranches(raw: string): string[] {
   return [...new Set(raw.split(/[\s,]+/).map((b) => b.trim()).filter(Boolean))];
 }
 
-/** The `loop.watch.create` body for a filled form (without the request id), or the first thing wrong. */
+/**
+ * The `loop.watch.create` body for a filled form (without the request id), or
+ * the first thing wrong. It never vouches: an unpinned vouch at create would
+ * take whatever each head is when the daemon reads it, commits nobody looked
+ * at included. A branch watch offers the pinned vouch dialog once it exists.
+ */
 export function buildWatchCreate(form: WatchForm): { msg: Omit<LoopWatchCreateMsg, "id"> } | { error: string; field: string } {
   const workdir = form.workdir.trim();
   if (!workdir) return { error: "Choose the repository: its origin must be on github.com", field: "workdir" };
@@ -388,11 +398,5 @@ export function buildWatchCreate(form: WatchForm): { msg: Omit<LoopWatchCreateMs
     ...(form.provider.trim() ? { provider: form.provider.trim() } : {}),
     ...(form.model.trim() ? { model: form.model.trim() } : {}),
   };
-  return {
-    msg: {
-      type: "loop.watch.create",
-      spec,
-      ...(form.target === "branches" && form.trustHead ? { trustHead: true } : {}),
-    },
-  };
+  return { msg: { type: "loop.watch.create", spec } };
 }

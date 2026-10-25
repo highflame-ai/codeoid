@@ -14,8 +14,11 @@
  *
  * Neither ticks while the page is hidden. A daemon with routines off, or a
  * token without the scopes, stops the background watch until a read succeeds
- * again (opening the view asks), rather than asking every half minute. What a
- * connection read is never shown over another: a new connection starts empty.
+ * again (opening the view asks), rather than asking every half minute. What
+ * one identity read is never shown to another: the moment the identity
+ * changes (or signs out) the store is emptied, and a reply to a request sent
+ * before then changes nothing ({@link setRoutinesIdentity}). A reconnect as
+ * the same identity keeps everything.
  *
  * Errors are caught and kept as strings; the form calls (create, update,
  * preview, token) reject with the daemon's words instead, so the form can
@@ -27,8 +30,9 @@
  * back, and an older read can't undo a newer snapshot of one routine.
  *
  * An API token the daemon hands over is shown once, held here rather than in
- * a component, so it goes with everything else when the connection changes
- * or drops ({@link forgetRoutineToken}).
+ * a component, so it goes with everything else when the identity changes or
+ * signs out — and only to the identity that asked for it: one that arrives
+ * after a change of identity is not shown.
  */
 
 import { createSignal } from "solid-js";
@@ -94,6 +98,11 @@ export const DETAIL_RUNS = 10;
  */
 const OFF = /routines are disabled|not available|^Missing scope/i;
 
+/** A reply that arrived after the identity changed: nothing in it is shown. */
+const IDENTITY_CHANGED = "You signed in as someone else while this was saved, so its result (and any API token) isn't shown here.";
+const ROTATED_FOR_ANOTHER =
+  "You signed in as someone else while the token was rotated, so the new token isn't shown here. The old one no longer works: rotate again to get one.";
+
 function upsert(list: RoutineWire[], r: RoutineWire): RoutineWire[] {
   const i = list.findIndex((x) => x.id === r.id);
   if (i === -1) return [r, ...list];
@@ -115,8 +124,13 @@ const snapApplied = new Map<string, number>();
 /** Per routine: the request that deleted it — a reply sent before then can't bring it back. */
 const deletedAt = new Map<string, number>();
 
+/** Requests sent at or before this were asked as an earlier identity: their replies change nothing. */
+let resetAt = 0;
+/** Bumped when the identity changes: what was asked under an earlier one is dropped. */
+let generation = 0;
+
 function stale(routineId: string, sent: number): boolean {
-  return (deletedAt.get(routineId) ?? 0) > sent || (snapApplied.get(routineId) ?? 0) > sent;
+  return sent <= resetAt || (deletedAt.get(routineId) ?? 0) > sent || (snapApplied.get(routineId) ?? 0) > sent;
 }
 
 function applySnapshot(snap: RoutineSnapshotMsg, sent: number): void {
@@ -139,19 +153,31 @@ function snapshotOf(id: string) {
 // ── Connection ───────────────────────────────────────────────────────────────
 
 let unavailable = false;
-/** The connection what is shown was read over; a new one starts empty. */
-let readOver: object | null = null;
+/** Who the store reads as (identityKey); null = nobody signed in. */
+let identity: string | null = null;
 
-/** The client to read over, dropping everything an earlier connection read. */
 function client() {
-  const c = getClient();
-  if (readOver !== null && readOver !== c) {
-    setState({ ...EMPTY });
-    snapApplied.clear();
-    deletedAt.clear();
-  }
-  readOver = c;
-  return c;
+  return getClient();
+}
+
+/**
+ * The identity this client acts as changed, or signed out (null): everything
+ * shown — the routines, the detail, a token shown once — goes now, and a
+ * reply to a request sent before now changes nothing. The same identity again
+ * (a reconnect) keeps it all.
+ */
+export function setRoutinesIdentity(key: string | null): void {
+  if (key === identity) return;
+  identity = key;
+  resetAt = seq;
+  generation += 1;
+  inflight = 0;
+  unavailable = false;
+  snapApplied.clear();
+  deletedAt.clear();
+  setState({ ...EMPTY });
+  reschedule();
+  if (key !== null && (viewOpen() || watchers > 0)) void fetchRoutines();
 }
 
 /** Nothing an identity that can't see routines may keep on screen. */
@@ -161,14 +187,25 @@ function forget(e: unknown): void {
   setState((s) => ({ ...s, routines: [], detail: null, selectedId: null, loaded: true, error: errMessage(e), token: null }));
 }
 
-/** The connection dropped or changed hands: a token shown once doesn't outlive it. */
+/** Put away a token shown once. */
 export function forgetRoutineToken(): void {
   if (state().token) setState((s) => ({ ...s, token: null }));
 }
 
-/** Show a token the daemon just handed over (once). */
-export function revealRoutineToken(token: NonNullable<RoutinesState["token"]>): void {
+/** Which identity the store holds now: pass it back to {@link revealRoutineToken}. */
+export function routinesGeneration(): number {
+  return generation;
+}
+
+/**
+ * Show a token the daemon just handed over (once) — only when the request
+ * that got it was asked as the identity signed in now (`askedIn`, the
+ * {@link routinesGeneration} when it was sent). Says whether it was shown.
+ */
+export function revealRoutineToken(token: NonNullable<RoutinesState["token"]>, askedIn: number = generation): boolean {
+  if (askedIn !== generation) return false;
   setState((s) => ({ ...s, token }));
+  return true;
 }
 
 // ── Reads ────────────────────────────────────────────────────────────────────
@@ -185,8 +222,9 @@ export async function fetchRoutines(): Promise<void> {
         timeoutMs: READ_TIMEOUT_MS,
       },
     );
+    // Asked as an earlier identity, or a newer list already landed: nothing new.
+    if (sent <= resetAt) return;
     unavailable = false;
-    // A newer list already landed: this one says nothing new.
     if (sent < listApplied) return;
     listApplied = sent;
     setState((s) => {
@@ -199,6 +237,7 @@ export async function fetchRoutines(): Promise<void> {
       return { ...s, routines, loaded: true, error: s.selectedId && !gone ? s.error : null };
     });
   } catch (e) {
+    if (sent <= resetAt) return;
     if (isUnavailable(e, OFF)) return forget(e);
     setState((s) => ({ ...s, loaded: true, error: errMessage(e) }));
   }
@@ -214,6 +253,7 @@ export async function fetchRoutine(routineId: string): Promise<void> {
     );
     applySnapshot(snap, sent);
   } catch (e) {
+    if (sent <= resetAt) return;
     if (isUnavailable(e, OFF)) return forget(e);
     // A read for a routine the user has since left must not paint its error over another.
     if (state().selectedId === routineId) setState((s) => ({ ...s, error: errMessage(e) }));
@@ -237,16 +277,21 @@ export function selectRoutine(routineId: string | null): void {
 let inflight = 0;
 
 async function control<T>(run: () => Promise<T>): Promise<T | null> {
+  const asked = generation;
   inflight += 1;
   setState((s) => ({ ...s, busy: true, error: null }));
   try {
-    return await run();
+    const out = await run();
+    return asked === generation ? out : null;
   } catch (e) {
-    setState((s) => ({ ...s, error: errMessage(e) }));
+    if (asked === generation) setState((s) => ({ ...s, error: errMessage(e) }));
     return null;
   } finally {
-    inflight -= 1;
-    setState((s) => ({ ...s, busy: inflight > 0 }));
+    // A reset already zeroed the count this one was part of.
+    if (asked === generation) {
+      inflight -= 1;
+      setState((s) => ({ ...s, busy: inflight > 0 }));
+    }
   }
 }
 
@@ -312,11 +357,22 @@ export async function deleteRoutine(routineId: string): Promise<boolean> {
 
 // ── Form calls (reject with the daemon's words) ──────────────────────────────
 
-/** Save a new routine and select it. `apiToken` is set when its API is on: shown once. */
+/** Hold a token the daemon handed over with a routine, for the identity that asked. */
+function revealWith(routine: RoutineWire, apiToken: string | undefined, askedIn: number): void {
+  if (apiToken) revealRoutineToken({ routineId: routine.id, apiToken, endpointPath: `/routines/${routine.id}/fire` }, askedIn);
+}
+
+/**
+ * Save a new routine and select it. When its API is on, the token comes back
+ * once (`apiToken`) and is held in the store to show.
+ */
 export async function createRoutine(spec: RoutineSpecWire): Promise<{ routine: RoutineWire; apiToken?: string }> {
+  const asked = generation;
   try {
     const snap = await snapshotRequest((id) => ({ type: "routine.create", id, spec }));
+    if (asked !== generation) throw new Error(IDENTITY_CHANGED);
     setState((s) => ({ ...s, selectedId: snap.routine.id, detail: { routine: snap.routine, runs: [] }, error: null }));
+    revealWith(snap.routine, snap.apiToken, asked);
     return { routine: snap.routine, ...(snap.apiToken ? { apiToken: snap.apiToken } : {}) };
   } catch (e) {
     throw new Error(errMessage(e));
@@ -327,29 +383,39 @@ export async function updateRoutine(
   routineId: string,
   spec: NonNullable<RoutineUpdateMsg["spec"]>,
 ): Promise<{ routine: RoutineWire; apiToken?: string }> {
+  const asked = generation;
   try {
     const snap = await snapshotRequest((id) => ({ type: "routine.update", id, routine: routineId, spec }));
+    if (asked !== generation) throw new Error(IDENTITY_CHANGED);
+    revealWith(snap.routine, snap.apiToken, asked);
     return { routine: snap.routine, ...(snap.apiToken ? { apiToken: snap.apiToken } : {}) };
   } catch (e) {
     throw new Error(errMessage(e));
   }
 }
 
-/** A new API token; the old one stops working at once. Shown once. */
+/**
+ * A new API token; the old one stops working at once. Held in the store to
+ * show once — unless the identity changed while it was asked for: then it is
+ * not shown here, and this rejects saying so.
+ */
 export async function rotateRoutineToken(routineId: string): Promise<{ apiToken: string; endpointPath: string }> {
   const id = newRequestId();
+  const asked = generation;
+  let res: RoutineTokenResultMsg;
   try {
-    const res = await client().request<RoutineTokenResultMsg>(
+    res = await client().request<RoutineTokenResultMsg>(
       { type: "routine.token", id, routine: routineId },
       {
         waitForResult: (m) => (m.type === "routine.token.result" && m.requestId === id ? (m as RoutineTokenResultMsg) : undefined),
         timeoutMs: WRITE_TIMEOUT_MS,
       },
     );
-    return { apiToken: res.apiToken, endpointPath: res.endpointPath };
   } catch (e) {
     throw new Error(errMessage(e));
   }
+  if (!revealRoutineToken({ routineId, apiToken: res.apiToken, endpointPath: res.endpointPath }, asked)) throw new Error(ROTATED_FOR_ANOTHER);
+  return { apiToken: res.apiToken, endpointPath: res.endpointPath };
 }
 
 /** Validate a schedule and list its next fires, saving nothing. Rejects with the daemon's reason. */
@@ -430,7 +496,9 @@ export function watchRoutines(): () => void {
 
 /** Test-only: reset the singleton and stop polling. */
 export function _resetRoutinesForTest(): void {
-  readOver = null;
+  identity = null;
+  resetAt = 0;
+  generation = 0;
   inflight = 0;
   seq = 0;
   listApplied = 0;

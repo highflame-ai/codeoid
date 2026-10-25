@@ -220,14 +220,18 @@ function pad(cells: string[][]): string[] {
 
 export function formatRoutineList(routines: RoutineWire[], now = Date.now()): string[] {
   if (routines.length === 0) return ["No routines. Create one with: codeoid routine add <name> --cron \"0 9 * * 1-5\" --prompt \"…\""];
-  const rows = [["NAME", "STATE", "SCHEDULE", "NEXT", "LAST RUN"]];
+  const rows = [["NAME", "STATE", "SCHEDULE", "NEXT", "LAST OUTCOME"]];
   for (const r of routines) {
+    // The last run that did its work: fires skipped behind a loop (or a
+    // cancel) say nothing about how the routine is doing. Until there is one,
+    // the last run is the best there is.
+    const last = r.lastOutcome ?? r.lastRun;
     rows.push([
       r.name,
       r.enabled ? "on" : r.pausedReason ? "paused!" : "paused",
       r.scheduleText,
       r.enabled ? relativeTime(r.upcoming[0], now) : "—",
-      r.lastRun ? `${r.lastRun.status} ${relativeTime(r.lastRun.createdAt, now)}` : "never",
+      last ? `${last.status} ${relativeTime(last.endedAt ?? last.createdAt, now)}` : "never",
     ]);
   }
   return pad(rows);

@@ -6,7 +6,7 @@
  * fresh.
  */
 
-import { Component, For, Show, createMemo, createSignal } from "solid-js";
+import { Component, For, Show, createMemo, createSignal, untrack } from "solid-js";
 
 import { WatchDetail } from "./WatchDetail";
 import { WatchForm } from "./WatchForm";
@@ -28,6 +28,15 @@ import {
 import type { LoopRunWire, LoopWatchWire } from "../../protocol/types";
 
 const [creating, setCreating] = createSignal(false);
+/** A branch watch just made: its detail offers the pinned vouch dialog (create itself never vouches). */
+const [justCreated, setJustCreated] = createSignal<string | null>(null);
+
+/** Whether `watchId` was just made, asked once: the offer shows when its detail first opens, not on every visit. */
+function takeJustCreated(watchId: string): boolean {
+  const yes = untrack(justCreated) === watchId;
+  if (yes) setJustCreated(null);
+  return yes;
+}
 
 export function openWatchCreate(): void {
   setCreating(true);
@@ -52,7 +61,12 @@ export const WatchesTab: Component<{ onOpenLoopRun: (runId: string) => void }> =
           recentWorkdirs={recentWorkdirs()}
           providers={providers()}
           onCancel={() => setCreating(false)}
-          onSubmit={(body) => createWatch(body).then(() => void setCreating(false))}
+          onSubmit={(body) =>
+            createWatch(body).then((w) => {
+              setJustCreated(w.myPrs ? null : w.id);
+              setCreating(false);
+            })
+          }
         />
       }
     >
@@ -96,6 +110,7 @@ export const WatchesTab: Component<{ onOpenLoopRun: (runId: string) => void }> =
                 onSaveTrust={(trust) => updateWatch(id, { spec: { trust } }).then(() => undefined)}
                 onVouch={(trustHead) => updateWatch(id, { trustHead }).then(() => undefined)}
                 onOpenLoopRun={props.onOpenLoopRun}
+                justCreated={takeJustCreated(id)}
               />
             )}
           </Show>

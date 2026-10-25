@@ -145,6 +145,21 @@ export const RoutineDetail: Component<RoutineDetailProps> = (props) => {
           {scheduleWords(s().schedule)}
           <Show when={s().api}> · also fires by its API</Show>
         </p>
+        {/* How it last went: its last outcome, which fires skipped behind a loop (or cancelled) don't hide. */}
+        <Show when={r().lastOutcome}>
+          {(o) => (
+            <p class="flex flex-wrap items-center gap-1.5 text-[12px] text-fg-muted" data-testid="routine-last-outcome">
+              <span>Last outcome</span>
+              <StatusBadge style={routineRunStatusStyle(o())} />
+              <When at={o().endedAt ?? o().createdAt} now={props.now} class="font-mono text-[11px]" />
+              <Show when={o().reason}>
+                <span class="min-w-0 truncate" title={o().reason}>
+                  · {o().reason}
+                </span>
+              </Show>
+            </p>
+          )}
+        </Show>
       </div>
 
       <Show when={!r().enabled && r().pausedReason}>

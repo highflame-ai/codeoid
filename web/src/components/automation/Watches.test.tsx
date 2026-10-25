@@ -165,30 +165,73 @@ describe("WatchDetail", () => {
     expect(onSaveTrust).toHaveBeenCalledWith([]);
     expect(onVouch).not.toHaveBeenCalled();
     fireEvent.click(getByRole("button", { name: "Vouch for current heads…" }));
-    expect((getByLabelText("main head commit") as HTMLInputElement).value).toBe(HEAD);
+    // Nothing filled in: an untrusted head is nobody's choice yet.
+    expect((getByLabelText("main head commit") as HTMLInputElement).value).toBe("");
   });
 
-  it("opens the vouch dialog pinned to the head the history names", () => {
-    const { getByRole, getByLabelText } = render(() => (
+  it("a branch watch just made offers the pinned vouch dialog, once", () => {
+    const { getByRole, getByTestId, getByLabelText, queryByTestId } = render(() => <WatchDetail {...detailProps({ justCreated: true })} />);
+    expect(getByTestId("watch-offer-vouch").textContent).toMatch(/vouch for that exact commit/);
+    fireEvent.click(getByRole("button", { name: "Vouch for current heads…" }));
+    expect(getByRole("alertdialog", { name: "Vouch for the current head" })).toBeTruthy();
+    expect((getByLabelText("main head commit") as HTMLInputElement).value).toBe("");
+    expect(queryByTestId("watch-offer-vouch")).toBeNull();
+  });
+
+  it("a my-PRs watch just made offers no vouch", () => {
+    const { queryByTestId } = render(() => <WatchDetail {...detailProps({ justCreated: true, watch: watch({ myPrs: true, branches: [] }) })} />);
+    expect(queryByTestId("watch-offer-vouch")).toBeNull();
+  });
+
+  it("never fills the vouch dialog from an untrusted head the history names", () => {
+    const { getByRole, getByLabelText, queryByTestId } = render(() => (
       <WatchDetail {...detailProps({ triggers: [trigger({ key: `untrusted:w_1:${HEAD}:acme/shop:main`, kind: "head", outcome: "ignored", runId: null })] })} />
     ));
     fireEvent.click(getByRole("button", { name: "Vouch for current head…" }));
-    expect((getByLabelText("main head commit") as HTMLInputElement).value).toBe(HEAD);
+    expect((getByLabelText("main head commit") as HTMLInputElement).value).toBe("");
+    expect(queryByTestId("vouch-suggestion")).toBeNull();
   });
 });
 
 describe("VouchDialog", () => {
-  const known = { main: { sha: HEAD, source: "untrusted head" as const, at: "2026-10-26T11:00:00.000Z" } };
+  /** A head the watch's history names that isn't untrusted: offered, never filled in. */
+  const known = { main: { sha: HEAD, source: "failing check" as const, at: "2026-10-26T11:00:00.000Z" } };
+  /** Take the suggestion, as a person does after looking at it. */
+  const useSuggestion = (getByRole: (role: string, o: { name: string }) => HTMLElement) =>
+    fireEvent.click(getByRole("button", { name: `Use ${HEAD.slice(0, 12)} for main` }));
 
   it("explains that it vouches for everything beneath the head", () => {
     const { getByRole } = render(() => <VouchDialog open watch={watch()} known={known} now={NOW} onVouch={vi.fn(async () => {})} onClose={vi.fn()} />);
     const dialog = getByRole("alertdialog", { name: "Vouch for the current head" });
     expect(dialog.textContent).toMatch(/It and every commit beneath it become trusted/);
     expect(dialog.textContent).toMatch(/including commits you didn't review/);
-    expect(getByRole("link", { name: "view" }).getAttribute("href")).toBe(`https://github.com/acme/shop/commit/${HEAD}`);
   });
 
-  it("pins to the full commit (compare-and-set), and on a moved head vouches for nothing until asked again", async () => {
+  it("offers a known head as a suggestion with its commit link, and fills nothing in until you take it", () => {
+    const { getByRole, getByLabelText, getByTestId, queryByTestId } = render(() => (
+      <VouchDialog open watch={watch()} known={known} now={NOW} onVouch={vi.fn(async () => {})} onClose={vi.fn()} />
+    ));
+    const field = getByLabelText("main head commit") as HTMLInputElement;
+    expect(field.value).toBe("");
+    expect((getByRole("button", { name: "Vouch for it" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(getByTestId("vouch-suggestion").textContent).toContain("failing check");
+    expect(getByRole("link", { name: "(view)" }).getAttribute("href")).toBe(`https://github.com/acme/shop/commit/${HEAD}`);
+    useSuggestion(getByRole);
+    expect(field.value).toBe(HEAD);
+    expect(queryByTestId("vouch-suggestion")).toBeNull();
+    expect((getByRole("button", { name: "Vouch for it" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("never offers an untrusted head", () => {
+    const untrusted = { main: { sha: HEAD, source: "untrusted head" as const, at: "2026-10-26T11:00:00.000Z" } };
+    const { getByLabelText, queryByTestId } = render(() => (
+      <VouchDialog open watch={watch()} known={untrusted} now={NOW} onVouch={vi.fn(async () => {})} onClose={vi.fn()} />
+    ));
+    expect((getByLabelText("main head commit") as HTMLInputElement).value).toBe("");
+    expect(queryByTestId("vouch-suggestion")).toBeNull();
+  });
+
+  it("pins to the full commit (compare-and-set), and on a moved head vouches for nothing until you say you looked", async () => {
     // The refusal as state/watches rethrows it: the daemon's words, and its structured detail.
     const refusal = Object.assign(new Error(`main's head is ${MOVED} now, not ${HEAD}: it moved, so nothing was vouched for; look at it again`), {
       detail: { kind: "head_moved", branch: "main", head: MOVED, pinned: HEAD },
@@ -197,15 +240,24 @@ describe("VouchDialog", () => {
     const onClose = vi.fn();
     const { getByRole, getByTestId, getByLabelText } = render(() => <VouchDialog open watch={watch()} known={known} now={NOW} onVouch={onVouch} onClose={onClose} />);
 
+    useSuggestion(getByRole);
     fireEvent.click(getByRole("button", { name: "Vouch for it" }));
     await waitFor(() => expect(getByTestId("vouch-moved").textContent).toContain(MOVED));
     expect(onVouch).toHaveBeenNthCalledWith(1, { main: HEAD });
     expect(onClose).not.toHaveBeenCalled();
-    // Re-pinned to the head's full id, never a prefix of it.
+    // The head's full id now, with its link, never a prefix of it.
     expect((getByLabelText("main head commit") as HTMLInputElement).value).toBe(MOVED);
     expect(getByRole("alertdialog", { name: "main moved: nothing was vouched for" })).toBeTruthy();
+    expect(getByRole("link", { name: "view on GitHub" }).getAttribute("href")).toBe(`https://github.com/acme/shop/commit/${MOVED}`);
 
-    fireEvent.click(getByRole("button", { name: "Vouch for the new head" }));
+    // Not one click: vouching for the new head takes saying you looked at it.
+    const again = getByRole("button", { name: "Vouch for the new head" }) as HTMLButtonElement;
+    expect(again.disabled).toBe(true);
+    fireEvent.click(again);
+    expect(onVouch).toHaveBeenCalledTimes(1);
+    fireEvent.click(getByLabelText(`I've looked at commit ${MOVED.slice(0, 12)}`));
+    expect(again.disabled).toBe(false);
+    fireEvent.click(again);
     await waitFor(() => expect(onClose).toHaveBeenCalled());
     expect(onVouch).toHaveBeenNthCalledWith(2, { main: MOVED });
   });
@@ -213,6 +265,7 @@ describe("VouchDialog", () => {
   it("re-pins from the words when a refusal carries no detail, if they name the full id", async () => {
     const onVouch = vi.fn().mockRejectedValueOnce(new Error(`main's head is ${MOVED} now, not ${HEAD}: it moved, so nothing was vouched for`));
     const { getByRole, getByLabelText, getByTestId } = render(() => <VouchDialog open watch={watch()} known={known} now={NOW} onVouch={onVouch} onClose={vi.fn()} />);
+    useSuggestion(getByRole);
     fireEvent.click(getByRole("button", { name: "Vouch for it" }));
     await waitFor(() => expect(getByTestId("vouch-moved")).toBeTruthy());
     expect((getByLabelText("main head commit") as HTMLInputElement).value).toBe(MOVED);
@@ -238,6 +291,7 @@ describe("VouchDialog", () => {
   it("shows any other refusal as the daemon said it", async () => {
     const onVouch = vi.fn().mockRejectedValue(new Error("A delegated token cannot create, change, enable, or poll a loop watch"));
     const { getByRole } = render(() => <VouchDialog open watch={watch()} known={known} now={NOW} onVouch={onVouch} onClose={vi.fn()} />);
+    useSuggestion(getByRole);
     fireEvent.click(getByRole("button", { name: "Vouch for it" }));
     await waitFor(() => expect(getByRole("alert").textContent).toContain("A delegated token cannot"));
   });
@@ -308,9 +362,9 @@ describe("WatchForm", () => {
     expect(p.onSubmit).not.toHaveBeenCalled();
   });
 
-  it("submits a branch watch with a mapping and a vouch", async () => {
+  it("submits a branch watch with its mappings, and never an unpinned vouch", async () => {
     const p = props();
-    const { getByRole, getByLabelText } = render(() => <WatchForm {...p} />);
+    const { getByRole, getByLabelText, queryByLabelText } = render(() => <WatchForm {...p} />);
     fireEvent.input(getByLabelText("Repository"), { target: { value: "/src/shop" } });
     fireEvent.click(getByLabelText(/Named branches/));
     fireEvent.input(getByLabelText("Branches"), { target: { value: "main" } });
@@ -320,7 +374,8 @@ describe("WatchForm", () => {
     fireEvent.input(getByLabelText("Mapping 2 check name"), { target: { value: "lint" } });
     fireEvent.input(getByLabelText("Mapping 2 app"), { target: { value: "circleci-checks" } });
     fireEvent.input(getByLabelText("Mapping 2 command"), { target: { value: "bun run lint" } });
-    fireEvent.click(getByLabelText(/Vouch for each branch's head now/));
+    // No "vouch for whatever the heads are" at create: the pinned dialog comes after.
+    expect(queryByLabelText(/Vouch for each branch's head/)).toBeNull();
     fireEvent.click(getByRole("button", { name: "Create watch" }));
     await waitFor(() => expect(p.onSubmit).toHaveBeenCalled());
     expect((p.onSubmit.mock.calls as unknown[][])[0]![0]).toEqual({
@@ -333,7 +388,6 @@ describe("WatchForm", () => {
           { ciName: "lint", command: "bun run lint", app: "circleci-checks" },
         ],
       },
-      trustHead: true,
     });
   });
 

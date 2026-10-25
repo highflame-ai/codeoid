@@ -123,13 +123,23 @@ describe("output", () => {
   });
 
   it("the list is a table with state, next fire, and the last outcome", () => {
-    const lines = formatRoutineList([routine({ lastRun: run() }), routine({ name: "paused-one", enabled: false, pausedReason: "paused after 3 consecutive failed runs" })], NOW);
-    expect(lines[0]).toMatch(/^NAME\s+STATE\s+SCHEDULE\s+NEXT\s+LAST RUN$/);
+    const lines = formatRoutineList([routine({ lastRun: run(), lastOutcome: run() }), routine({ name: "paused-one", enabled: false, pausedReason: "paused after 3 consecutive failed runs" })], NOW);
+    expect(lines[0]).toMatch(/^NAME\s+STATE\s+SCHEDULE\s+NEXT\s+LAST OUTCOME$/);
     expect(lines[1]).toContain("triage");
     expect(lines[1]).toContain("in 1h");
     expect(lines[1]).toContain("succeeded 2m ago");
     expect(lines[2]).toContain("paused!");
     expect(formatRoutineList([], NOW)[0]).toContain("No routines");
+  });
+
+  it("a loop routine's blocked loop shows, not the fire skipped behind it", () => {
+    const blocked = run({ id: "run-0", status: "needs_attention", createdAt: "2026-10-16T07:40:00Z", endedAt: "2026-10-16T07:55:00Z", loop: { runId: "loop_1", status: "blocked" } });
+    const skipped = run({ status: "skipped", createdAt: "2026-10-16T07:50:00Z", endedAt: "2026-10-16T07:50:00Z" });
+    const [, line] = formatRoutineList([routine({ lastRun: skipped, lastOutcome: blocked })], NOW);
+    expect(line).toContain("needs_attention 5m ago");
+    expect(line).not.toContain("skipped");
+    // Nothing has done its work yet: the last run is all there is.
+    expect(formatRoutineList([routine({ lastRun: skipped })], NOW)[1]).toContain("skipped 10m ago");
   });
 
   it("a run shows its outcome, reason, a bounded summary, and where to look", () => {

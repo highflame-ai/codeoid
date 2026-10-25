@@ -155,6 +155,13 @@ export interface RoutineWire {
   /** The routine's most recent run, if any. */
   lastRun?: RoutineRunWire;
   /**
+   * The newest run that ended with an outcome (succeeded, silent,
+   * needs_attention, failed, timed_out, over_budget), by when it ended — what
+   * "how is this routine doing" reads. Unlike `lastRun`, a later skipped,
+   * cancelled or interrupted fire, or a run still in flight, never hides it.
+   */
+  lastOutcome?: RoutineRunWire;
+  /**
    * A loop routine's run still following the loop run it started, if any
    * (`lastRun` may be a later skipped fire). While it is open the routine
    * starts no other loop; its `loop.status` says whether the loop waits on you.

@@ -80,6 +80,26 @@ describe("RoutineList", () => {
     fireEvent.click(rows[1]!);
     expect(onSelect).toHaveBeenCalledWith("rt_2");
   });
+
+  it("a loop routine's last outcome shows, not the fire skipped behind it", () => {
+    const { getByTestId } = render(() => (
+      <RoutineList
+        routines={[
+          routine({
+            lastRun: runWire({ id: "run_skip", status: "skipped" }),
+            lastOutcome: runWire({ status: "needs_attention", loop: { runId: "loop_1", status: "blocked" } }),
+          }),
+        ]}
+        loaded
+        now={NOW}
+        onSelect={vi.fn()}
+        onNew={vi.fn()}
+      />
+    ));
+    const badge = getByTestId("routine-last-run");
+    expect(badge.textContent).toContain("loop blocked");
+    expect(badge.textContent).not.toContain("skipped");
+  });
 });
 
 describe("RoutineDetail", () => {
@@ -91,6 +111,14 @@ describe("RoutineDetail", () => {
     expect(getByTestId("routine-check").textContent).toContain("gh run list");
     expect(getByTestId("routine-budget").textContent).toContain("guarded");
     expect(getAllByTestId("routine-run")[0]!.textContent).toContain("CI is green again");
+  });
+
+  it("names its last outcome, with why, whatever was skipped since", () => {
+    const outcome = runWire({ status: "failed", reason: "the loop run ran out of budget: 3 attempts", loop: { runId: "loop_1", status: "budget_exhausted" } });
+    const { getByTestId } = render(() => <RoutineDetail {...detailProps({ routine: routine({ lastRun: runWire({ status: "skipped" }), lastOutcome: outcome }) })} />);
+    const line = getByTestId("routine-last-outcome").textContent!;
+    expect(line).toContain("failed");
+    expect(line).toContain("ran out of budget");
   });
 
   it("shows why a routine paused itself, offers resume, and still runs by hand as the daemon allows", () => {

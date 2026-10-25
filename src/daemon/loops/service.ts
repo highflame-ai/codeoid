@@ -119,6 +119,8 @@ export interface LoopHost {
   /** Re-arm the worker's tool budget for a new attempt. */
   armWorker(sessionId: string, toolBudget: number): void;
   workerInfo(sessionId: string): WorkerInfo | null;
+  /** Interrupt the worker's turn; resolves once that turn has ended (its spend
+   *  accounted), or after a short bound when it won't. */
   interruptWorker(sessionId: string): Promise<void>;
   /** Stop everything the worker's backend is running (its tool processes,
    *  background ones included) before a candidate is taken. */
@@ -404,11 +406,22 @@ export class LoopService {
           { actor: owner.sub, type: "run.cancelled" },
         );
         await this.#stopActiveWork(run, "the run was cancelled");
+        // The interrupted turn reports its spend as it ends, so the figure
+        // above can be short: read it again now the worker has stopped, before
+        // whoever follows the run (a routine run, its daily cap) is told.
+        let ended = next ?? this.#store.getRun(id)!;
+        if (next && current && current.startedAt !== null) {
+          this.#store.updateAttempt(current.id, { costUsd: this.#attemptCost(run, current) });
+          const settled = this.#store.listAttempts(id).reduce((n, a) => n + a.costUsd, 0);
+          if (settled !== next.costUsd) {
+            ended =
+              this.#store.transition(id, next.stateVersion, { costUsd: settled }, { actor: SYSTEM, type: "run.accounted" }) ?? this.#store.getRun(id)!;
+          }
+        }
         this.#release(run);
         this.#host.audit(run, "loop.cancel", "");
-        const ended = next ?? this.#store.getRun(id)!;
         // Whoever follows the run (a routine run it was started by) learns now.
-        if (next) this.#host.notifyOwner(next, "cancelled");
+        if (next) this.#host.notifyOwner(ended, "cancelled");
         return ended;
       } finally {
         this.#cancelling.delete(id);

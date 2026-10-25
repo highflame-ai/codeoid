@@ -11,6 +11,7 @@ import {
   intervalWords,
   isCancellableRun,
   isFailingRun,
+  routineNeedsALook,
   isoToLocal,
   localToIso,
   parseEvery,
@@ -83,6 +84,16 @@ describe("outcomes", () => {
     const parked = runWire({ status: "needs_attention" });
     expect(routineRunStatusStyle(parked).label).toBe("needs you");
     expect(isFailingRun(parked.status, parked.loop)).toBe(false);
+  });
+
+  it("a routine wants a look when it paused itself or its last outcome failed, whatever was skipped since", () => {
+    const blocked = runWire({ status: "needs_attention", loop: { runId: "loop_1", status: "blocked" } });
+    expect(routineNeedsALook({ lastOutcome: blocked })).toBe(true);
+    // The tab alert reads the outcome: a skip after it changes nothing.
+    expect(routineNeedsALook(routine({ lastRun: runWire({ status: "skipped" }), lastOutcome: blocked }))).toBe(true);
+    expect(routineNeedsALook(routine({ lastRun: runWire({ status: "failed" }), lastOutcome: runWire() }))).toBe(false);
+    expect(routineNeedsALook({ pausedReason: "paused after 3 consecutive failed runs" })).toBe(true);
+    expect(routineNeedsALook({})).toBe(false);
   });
 
   it("knows which runs fail, which can be cancelled, and a routine's state", () => {

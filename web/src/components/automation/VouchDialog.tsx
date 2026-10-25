@@ -6,17 +6,24 @@
  *
  * It always sends `trustHead: { branch: fullSha }`: a compare-and-set. If any
  * named head moved, the daemon vouches for nothing and names the head's full
- * id now (the refusal's `detail`); the dialog shows that, pins to the new
- * commit, and asks again — so a commit pushed after you looked is never
- * vouched for unseen. There is no unpinned vouch here, and no prefix: either
- * could take a commit nobody looked at. This is the web's one vouch path
- * (narrowing the trust list offers to open it afterwards).
+ * id now (the refusal's `detail`); the dialog shows that id with its link,
+ * and vouching for it takes saying you looked at it first — so a commit
+ * pushed after you looked is never vouched for unseen. There is no unpinned
+ * vouch here, and no prefix: either could take a commit nobody looked at.
+ *
+ * Nothing is filled in for you. A head the watch's history names is offered
+ * as "Use <short id> (view)" — a commit you vouched for before, or one a
+ * failing check ran on — and an untrusted head is not offered at all: nobody
+ * vetted it, and a filled field is one click from vouching for it.
+ *
+ * This is the web's one vouch path: making a branch watch, and narrowing a
+ * trust list, offer to open it afterwards.
  */
 
 import { Component, Index, Show, createEffect, createSignal, on } from "solid-js";
 
 import { githubCommitUrl, relativeWhen } from "../../lib/automation";
-import { SHA_RE, buildTrustHead, parseMovedHead, type KnownHead, type MovedHead } from "../../lib/watches";
+import { SHA_RE, buildTrustHead, parseMovedHead, suggestedHead, type KnownHead, type MovedHead } from "../../lib/watches";
 import type { LoopWatchTrustHead, LoopWatchWire } from "../../protocol/types";
 import { ConfirmDialog, inputClass } from "./common";
 
@@ -42,8 +49,10 @@ export const VouchDialog: Component<VouchDialogProps> = (props) => {
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
   const [moved, setMoved] = createSignal<MovedHead | null>(null);
+  /** You said you looked at the moved head's commit. */
+  const [looked, setLooked] = createSignal(false);
 
-  // Fresh each time it opens, pinned to what the watch last saw.
+  // Fresh each time it opens, and empty: a commit is only ever one you gave or took.
   createEffect(
     on(
       () => props.open,
@@ -51,14 +60,15 @@ export const VouchDialog: Component<VouchDialogProps> = (props) => {
         if (!open) return;
         setError(null);
         setMoved(null);
-        setPicks(props.watch.branches.map((b) => ({ branch: b, on: true, sha: props.known[b]?.sha ?? "" })));
+        setLooked(false);
+        setPicks(props.watch.branches.map((b) => ({ branch: b, on: true, sha: "" })));
       },
     ),
   );
 
   const setPick = (i: number, patch: Partial<BranchPick>) => setPicks((ps) => ps.map((p, j) => (j === i ? { ...p, ...patch } : p)));
   const chosen = () => picks().filter((p) => p.on);
-  const ready = () => chosen().length > 0 && chosen().every((p) => SHA_RE.test(p.sha.trim()));
+  const ready = () => chosen().length > 0 && chosen().every((p) => SHA_RE.test(p.sha.trim())) && (!moved() || looked());
   const trusted = () => ["you" + (props.watch.ghLogin ? ` (@${props.watch.ghLogin})` : ""), ...props.watch.trust].join(", ");
 
   const confirm = async () => {
@@ -73,9 +83,10 @@ export const VouchDialog: Component<VouchDialogProps> = (props) => {
       const msg = e instanceof Error ? e.message : String(e);
       const m = parseMovedHead(e);
       if (m) {
-        // Nothing was vouched for. Show the new head and pin to it; vouching
-        // for it is a new decision, made by pressing again.
+        // Nothing was vouched for. Show the new head; vouching for it is a
+        // new decision, made only after saying you looked at it.
         setMoved(m);
+        setLooked(false);
         setPicks((ps) => ps.map((p) => (p.branch === m.branch ? { ...p, sha: m.now } : p)));
         setError(null);
       } else {
@@ -112,6 +123,16 @@ export const VouchDialog: Component<VouchDialogProps> = (props) => {
                 </>
               )}
             </Show>
+            <label class="mt-1.5 flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={looked()}
+                disabled={busy()}
+                onChange={(e) => setLooked(e.currentTarget.checked)}
+                aria-label={`I've looked at commit ${m().now.slice(0, 12)}`}
+              />
+              <span>I've looked at this commit</span>
+            </label>
           </div>
         )}
       </Show>
@@ -126,6 +147,11 @@ export const VouchDialog: Component<VouchDialogProps> = (props) => {
         <Index each={picks()}>
           {(p, i) => {
             const known = () => props.known[p().branch];
+            /** Offered, never filled in: and never an untrusted head. */
+            const suggestion = () => {
+              const h = suggestedHead(known());
+              return h && h.sha !== p().sha.trim().toLowerCase() && moved()?.branch !== p().branch ? h : null;
+            };
             const url = () => (SHA_RE.test(p().sha.trim()) ? githubCommitUrl(props.watch.repo, p().sha.trim()) : null);
             return (
               <div class="rounded border border-border bg-bg/30 px-2.5 py-1.5" data-testid="vouch-branch">
@@ -161,22 +187,39 @@ export const VouchDialog: Component<VouchDialogProps> = (props) => {
                       )}
                     </Show>
                   </div>
+                  <Show when={suggestion()}>
+                    {(h) => (
+                      <div class="mt-1 flex flex-wrap items-center gap-1.5 text-[11px] text-fg-muted" data-testid="vouch-suggestion">
+                        <button
+                          type="button"
+                          class="rounded border border-border px-1.5 py-0.5 font-mono text-fg hover:border-accent/60"
+                          disabled={busy()}
+                          onClick={() => setPick(i, { sha: h().sha })}
+                          aria-label={`Use ${h().sha.slice(0, 12)} for ${p().branch}`}
+                        >
+                          Use {h().sha.slice(0, 12)}
+                        </button>
+                        <Show when={githubCommitUrl(props.watch.repo, h().sha)}>
+                          {(u) => (
+                            <a class="text-accent underline-offset-2 hover:underline" href={u()} target="_blank" rel="noopener noreferrer">
+                              (view)
+                            </a>
+                          )}
+                        </Show>
+                        <span class="text-fg-faint">
+                          {h().source}, {relativeWhen(h().at, props.now)}
+                        </span>
+                      </div>
+                    )}
+                  </Show>
                   <p class="mt-0.5 text-[10px] text-fg-faint">
                     <Show
                       when={moved()?.branch !== p().branch}
                       fallback={"The head the daemon read just now. If it moves again before you confirm, nothing is vouched for and you'll see the new one."}
                     >
-                    <Show
-                      when={known()}
-                      fallback={"The watch hasn't recorded this branch's head yet; paste the commit's full id from GitHub."}
-                    >
-                      {(k) => (
-                        <>
-                          From the watch's history: {k().source}, {relativeWhen(k().at, props.now)}. The head may have moved since; if it did,
-                          nothing is vouched for and you'll see the new one.
-                        </>
-                      )}
-                    </Show>
+                      {suggestion()
+                        ? "Look at it before you take it: the head may have moved since; if it did, nothing is vouched for and you'll see the new one."
+                        : "Paste the full id of the head commit you looked at on GitHub."}
                     </Show>
                   </p>
                 </Show>

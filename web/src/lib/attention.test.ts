@@ -327,16 +327,16 @@ describe("collectAttention — watches and routines", () => {
     expect(items[0]!.label).toBe("watch · acme/shop");
   });
 
-  it("lists a routine that paused itself, and one whose last run failed in the last day", () => {
+  it("lists a routine that paused itself, and one whose last outcome failed in the last day", () => {
     const items = collectAttention(
       sources({
         routines: [
-          routine({ id: "fine", lastRun: runWire() }),
+          routine({ id: "fine", lastOutcome: runWire() }),
           routine({ id: "auto", name: "auto", enabled: false, pausedReason: "paused after 3 failed runs in a row" }),
-          routine({ id: "bad", name: "bad", lastRun: runWire({ status: "failed", reason: "check exited 1", endedAt: iso(NOW - 10 * MIN) }) }),
-          routine({ id: "old", lastRun: runWire({ status: "timed_out", endedAt: iso(NOW - 25 * 60 * MIN) }) }),
+          routine({ id: "bad", name: "bad", lastOutcome: runWire({ status: "failed", reason: "check exited 1", endedAt: iso(NOW - 10 * MIN) }) }),
+          routine({ id: "old", lastOutcome: runWire({ status: "timed_out", endedAt: iso(NOW - 25 * 60 * MIN) }) }),
           // Parked on an approval: the session's approval row stands for it.
-          routine({ id: "parked", lastRun: runWire({ status: "needs_attention" }) }),
+          routine({ id: "parked", lastOutcome: runWire({ status: "needs_attention" }) }),
         ],
       }),
       NOW,
@@ -348,20 +348,71 @@ describe("collectAttention — watches and routines", () => {
     expect(items[1]!.since).toBe(NOW - 10 * MIN);
   });
 
-  it("lists a loop routine whose loop ended blocked as a failure, labelled as the loop's", () => {
+  it("lists a loop routine whose loop ended blocked as a failure, labelled as the loop's, behind a later skipped fire", () => {
     const items = collectAttention(
       sources({
         routines: [
           routine({
             id: "lb",
             name: "lb",
-            lastRun: runWire({ status: "needs_attention", reason: "the loop run is blocked after 2 attempt(s): no progress", endedAt: iso(NOW - MIN), loop: { runId: "loop_1", status: "blocked" } }),
+            // The newest run is a fire skipped while the loop ran; the outcome is the loop's.
+            lastRun: runWire({ id: "run_skip", status: "skipped", reason: "the loop run its last fire started (loop_1) is still in progress (running)" }),
+            lastOutcome: runWire({ status: "needs_attention", reason: "the loop run is blocked after 2 attempt(s): no progress", endedAt: iso(NOW - MIN), loop: { runId: "loop_1", status: "blocked" } }),
           }),
         ],
       }),
       NOW,
     );
     expect(items.map((i) => [i.key, i.kind, i.detail])).toEqual([["routine:lb", "failed", "loop blocked: the loop run is blocked after 2 attempt(s): no progress"]]);
+  });
+
+  it("doesn't list a waiting loop twice: the loop's own row stands for it, and the routine's pause still shows", () => {
+    const following = (id: string) => runWire({ status: "running", startedAt: iso(NOW - 5 * MIN), endedAt: undefined, loop: { runId: id, status: "waiting" } });
+    const loopRun = (id: string, over: Partial<LoopRunWire>) =>
+      ({ id, objective: "Fix it", status: "waiting", reason: null, waitingOn: null, waitingKind: null, workerSessionId: `w-${id}`, updatedAt: iso(NOW - 5 * MIN), ...over }) as LoopRunWire;
+    const items = collectAttention(
+      sources({
+        sessions: [session("w-loop_a", { status: "waiting_approval" })],
+        loops: [
+          loopRun("loop_q", { waitingOn: "the owner's answer: Keep the old API?" }),
+          loopRun("loop_a", { waitingKind: "approval" }),
+        ],
+        routines: [
+          // Its loop asks a question: the loop:… row is the one to answer.
+          routine({ id: "q", name: "q", activeLoopRun: following("loop_q") }),
+          // Its loop waits on an approval: the approval row stands for it.
+          routine({ id: "a", name: "a", activeLoopRun: following("loop_a") }),
+          // Paused itself while its loop waits: the pause is what it needs from you.
+          routine({ id: "p", name: "p", enabled: false, pausedReason: "paused after 3 consecutive failed runs", activeLoopRun: following("loop_q") }),
+          // A loop this client hasn't listed: the routine's row is all there is.
+          routine({ id: "u", name: "u", activeLoopRun: following("loop_unlisted") }),
+        ],
+      }),
+      NOW,
+    );
+    expect(items.map((i) => i.key).sort()).toEqual(["approval:w-loop_a", "loop:loop_q", "routine:p", "routine:u"]);
+    expect(items.find((i) => i.key === "routine:p")!.detail).toBe("paused after 3 consecutive failed runs");
+    expect(items.find((i) => i.key === "routine:u")!.detail).toMatch(/^waiting on its loop/);
+  });
+
+  it("a routine that paused itself keeps saying so while its unlisted loop waits", () => {
+    const items = collectAttention(
+      sources({
+        routines: [
+          routine({
+            id: "p",
+            name: "p",
+            enabled: false,
+            pausedReason: "paused after 3 consecutive failed runs",
+            activeLoopRun: runWire({ status: "running", startedAt: iso(NOW - 5 * MIN), endedAt: undefined, loop: { runId: "loop_x", status: "paused" } }),
+          }),
+        ],
+      }),
+      NOW,
+    );
+    expect(items.map((i) => [i.key, i.detail])).toEqual([
+      ["routine:p", "paused after 3 consecutive failed runs; waiting on its loop (paused): later fires are skipped until it ends"],
+    ]);
   });
 
   it("lists a loop routine whose loop waits on you, or is paused, even behind a later skipped fire", () => {

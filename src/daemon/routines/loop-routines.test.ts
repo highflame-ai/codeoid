@@ -24,6 +24,7 @@ import {
   type RoutineRunEvent,
   type RoutineSpecInput,
 } from "./service.js";
+import { handleRoutineFire } from "./http.js";
 import { RoutineStore } from "./store.js";
 import { toRunWire } from "./wire.js";
 
@@ -37,6 +38,8 @@ class FakeLoops implements RoutineLoopPort {
   runs = new Map<string, RoutineLoopState>();
   /** Thrown by the next start. */
   failNext: Error | null = null;
+  /** Called as a run starts, before it returns its id. */
+  onStart: ((input: LoopStartInput) => void) | null = null;
   #n = 0;
 
   providerProblem(provider: string | undefined): string | null {
@@ -48,6 +51,7 @@ class FakeLoops implements RoutineLoopPort {
       this.failNext = null;
       throw e;
     }
+    this.onStart?.(input);
     const id = `loop_${++this.#n}`;
     this.started.push({ input, owner, id });
     this.runs.set(id, { status: "running", reason: "checking the unmodified code", attempts: 0, costUsd: 0, branch: null, deliveredCommit: null });
@@ -58,12 +62,12 @@ class FakeLoops implements RoutineLoopPort {
     if (!mine || mine.owner.sub !== owner.sub || mine.owner.accountId !== owner.accountId) return null;
     return this.runs.get(id) ?? null;
   }
-  inProgress(owner: RoutineOwner): Array<{ loopRunId: string; routineRunId: string }> {
+  inProgress(owner: RoutineOwner): Array<{ loopRunId: string; routineId: string | null; routineRunId: string }> {
     return this.started
       .filter((s) => s.owner.sub === owner.sub && s.owner.accountId === owner.accountId && s.owner.projectId === owner.projectId)
       .filter((s) => !["completed", "budget_exhausted", "blocked", "failed", "cancelled"].includes(this.runs.get(s.id)?.status ?? "cancelled"))
       .filter((s) => s.input.trigger?.routineRunId)
-      .map((s) => ({ loopRunId: s.id, routineRunId: s.input.trigger!.routineRunId! }));
+      .map((s) => ({ loopRunId: s.id, routineId: s.input.trigger!.routineId ?? null, routineRunId: s.input.trigger!.routineRunId! }));
   }
   /** Called as the real service's cancel notice is: before cancel resolves. */
   onCancel: ((id: string) => void) | null = null;
@@ -414,6 +418,32 @@ describe("following the loop", () => {
     expect(paused.pausedReason).toContain("2 consecutive failed runs");
   });
 
+  it("the loop's outcome stays the routine's last outcome behind fires skipped while it ran", async () => {
+    const { routine, runId, loopRunId } = await fireAndStart();
+    clock += 60_000;
+    expect(svc.fire(store.getRoutine(routine.id)!, "manual", null, "owner").status).toBe("skipped");
+    clock += 60_000;
+    loops.set(loopRunId, "blocked", { attempts: 2, reason: "no progress" });
+    svc.loopRunEnded(loopRunId);
+    // The newest run is the skip; the newest outcome is the blocked loop.
+    expect(store.listRuns(routine.id, { limit: 1 })[0]!.status).toBe("skipped");
+    const last = store.lastOutcome(routine.id)!;
+    expect(last.id).toBe(runId);
+    expect(toRunWire(last)).toMatchObject({ status: "needs_attention", loop: { runId: loopRunId, status: "blocked" } });
+    // A later fire, skipped or cancelled, doesn't move it either.
+    clock += 60_000;
+    const next = svc.fire(store.getRoutine(routine.id)!, "manual", null, "owner");
+    await started();
+    svc.cancelRun(store.getRun(next.id)!, "owner");
+    for (let i = 0; i < 20 && store.getRun(next.id)!.status === "running"; i++) await new Promise((r) => setTimeout(r, 0));
+    expect(store.getRun(next.id)!.status).toBe("cancelled");
+    expect(store.lastOutcome(routine.id)!.id).toBe(runId);
+    // History trimmed to its newest run still keeps it.
+    store.trimRuns(routine.id, 1, clock + 1);
+    expect(store.listRuns(routine.id, { limit: 10 }).map((r) => r.id)).toContain(runId);
+    expect(store.lastOutcome(routine.id)!.id).toBe(runId);
+  });
+
   it("a loop blocked at its baseline (nothing to repair) is silent and breaks no streak", async () => {
     const { routine, runId, loopRunId } = await fireAndStart({ failurePauseAfter: 1 });
     loops.set(loopRunId, "blocked", { reason: "every check already passes", attempts: 0 });
@@ -486,6 +516,28 @@ describe("following the loop", () => {
     expect(prompt).toMatch(/<loop-data source="routine payload"[^>]*>\nfrom the deploy\n<\/loop-data>/);
   });
 
+  it("a fire that lands while delete cancels the loop is refused, and starts no loop nothing would follow", async () => {
+    const { routine, loopRunId } = await fireAndStart({ schedule: { kind: "every", seconds: 3600 } });
+    const refused: string[] = [];
+    loops.onCancel = (id) => {
+      svc.loopRunEnded(id);
+      // Another client's Run now, and the scheduler's tick with the fire due.
+      try {
+        svc.fire(store.getRoutine(routine.id)!, "manual", null, "owner");
+      } catch (e) {
+        refused.push(e instanceof RoutineError ? `${e.code}: ${e.message}` : String(e));
+      }
+      clock = store.getRoutine(routine.id)!.nextFireAt!;
+      void svc.tick();
+    };
+    await svc.delete(store.getRoutine(routine.id)!, "owner");
+    await new Promise((r) => setTimeout(r, 10));
+    expect(refused).toEqual(["conflict: this routine is being deleted"]);
+    expect(loops.started.map((s) => s.id)).toEqual([loopRunId]);
+    expect(store.getRoutine(routine.id)).toBeUndefined();
+    expect(store.activeRuns()).toEqual([]);
+  });
+
   it("deleting a routine whose loop is cancelled meanwhile announces no routine_end", async () => {
     const { routine, loopRunId } = await fireAndStart();
     loops.onCancel = (id) => svc.loopRunEnded(id);
@@ -498,16 +550,32 @@ describe("following the loop", () => {
 
 describe("a restart between starting a loop and recording it", () => {
   /** A run that died after port.start but before it recorded the loop. */
-  async function orphan(status: "running" | "interrupted") {
+  async function orphan(status: "queued" | "running" | "interrupted") {
     const { routine } = create();
     const fired = svc.fire(routine, "manual", null, "owner");
     await started();
     const loopRunId = loops.started.at(-1)!.id;
-    store.updateRun(fired.id, { status, loopRunId: null, loopStatus: null, ...(status === "interrupted" ? { endedAt: clock } : {}) });
+    store.updateRun(fired.id, {
+      status,
+      loopRunId: null,
+      loopStatus: null,
+      ...(status === "interrupted" ? { endedAt: clock } : {}),
+      ...(status === "queued" ? { startedAt: null } : {}),
+    });
     return { routine, runId: fired.id, loopRunId };
   }
 
-  for (const status of ["running", "interrupted"] as const) {
+  it("a run is running before its loop starts, so no crash can leave it queued", async () => {
+    const { routine } = create();
+    const seen: Array<string | undefined> = [];
+    loops.onStart = (input) => seen.push(store.getRun(input.trigger!.routineRunId!)?.status);
+    svc.fire(routine, "manual", null, "owner");
+    await started();
+    expect(seen).toEqual(["running"]);
+  });
+
+  // `queued`: a run recorded before a run was marked running ahead of its loop.
+  for (const status of ["queued", "running", "interrupted"] as const) {
     it(`a ${status} run whose loop is still in progress follows it again, and ends with it`, async () => {
       const { runId, loopRunId } = await orphan(status);
       const next = new RoutineService(store, host, { tickMs: 1_000_000 }, { now: () => clock });
@@ -517,6 +585,10 @@ describe("a restart between starting a loop and recording it", () => {
         expect(run.status).toBe("running");
         expect(run.loopRunId).toBe(loopRunId);
         expect(run.endedAt).toBeNull();
+        // Followed again, not started over.
+        await next.tick();
+        await new Promise((r) => setTimeout(r, 10));
+        expect(loops.started).toHaveLength(1);
         loops.set(loopRunId, "completed", { attempts: 1 });
         await next.tick();
         expect(store.getRun(runId)!.status).toBe("succeeded");
@@ -525,6 +597,22 @@ describe("a restart between starting a loop and recording it", () => {
       }
     });
   }
+
+  it("a loop whose trigger names another routine is never linked to the run it names", async () => {
+    const { runId } = await orphan("running");
+    const trigger = loops.started.at(-1)!.input.trigger!;
+    trigger.routineId = "00000000-0000-4000-8000-000000000000";
+    const next = new RoutineService(store, host, { tickMs: 1_000_000 }, { now: () => clock });
+    next.start();
+    try {
+      const run = store.getRun(runId)!;
+      expect(run.status).toBe("interrupted");
+      expect(run.loopRunId).toBeNull();
+      expect(host.audits.some((a) => a.includes("routine.run.relinked"))).toBe(false);
+    } finally {
+      next.stop();
+    }
+  });
 
   it("a loop of another owner is never linked to the run it names", async () => {
     const { runId, loopRunId } = await orphan("running");
@@ -539,6 +627,28 @@ describe("a restart between starting a loop and recording it", () => {
     } finally {
       next.stop();
     }
+  });
+});
+
+describe("a loop routine's API trigger", () => {
+  const fireReq = (id: string, token: string) =>
+    new Request(`http://127.0.0.1/routines/${id}/fire`, { method: "POST", headers: { Authorization: `Bearer ${token}` }, body: "" });
+
+  it("a fire skipped behind the loop tells the caller only that it was skipped; the owner sees which loop", async () => {
+    const { routine, apiToken } = create({ api: true });
+    const first = await handleRoutineFire(fireReq(routine.id, apiToken!), routine.id, svc);
+    expect(first.status).toBe(202);
+    await started();
+    const loopRunId = loops.started.at(-1)!.id;
+
+    const res = await handleRoutineFire(fireReq(routine.id, apiToken!), routine.id, svc);
+    expect(res.status).toBe(202);
+    const body = (await res.json()) as { runId: string; status: string; reason?: string };
+    expect(body.status).toBe("skipped");
+    expect(body.reason).toBe("this fire was skipped: the routine is busy or at one of its limits");
+    expect(JSON.stringify(body)).not.toContain(loopRunId);
+    // The run itself keeps the full reason, for its owner.
+    expect(store.getRun(body.runId)!.reason).toContain(loopRunId);
   });
 });
 

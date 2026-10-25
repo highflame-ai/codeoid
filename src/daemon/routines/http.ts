@@ -14,9 +14,29 @@
  */
 
 import { RoutineError, type RoutineService } from "./service.js";
+import type { RunRow } from "./types.js";
 
 const FIRE_PATH = /^\/routines\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/fire$/;
 const MAX_BODY_BYTES = 64 * 1024;
+
+/**
+ * What the caller is told about a fire that didn't go ahead. Generic on
+ * purpose: the run's own reason names what it waited behind (a loop run's id,
+ * the owner's cap), which is the owner's to see over the WebSocket and the
+ * CLI, not a token holder's.
+ */
+function callerReason(run: RunRow): string | undefined {
+  switch (run.status) {
+    case "skipped":
+      return "this fire was skipped: the routine is busy or at one of its limits";
+    case "failed":
+      return "the run could not start";
+    case "cancelled":
+      return "the run was cancelled";
+    default:
+      return undefined;
+  }
+}
 
 /** The routine id if `pathname` is a fire endpoint, else null. */
 export function matchFirePath(pathname: string): string | null {
@@ -79,7 +99,8 @@ export async function handleRoutineFire(
 
   try {
     const run = svc.fire(routine, "api", payload, `routine-token:${routine.id}${opts.clientIp ? `@${opts.clientIp}` : ""}`);
-    return json(202, { runId: run.id, status: run.status, ...(run.reason ? { reason: run.reason } : {}) });
+    const reason = callerReason(run);
+    return json(202, { runId: run.id, status: run.status, ...(reason ? { reason } : {}) });
   } catch (err) {
     if (err instanceof RoutineError) {
       const status = err.code === "rate_limited" ? 429 : err.code === "conflict" ? 409 : 400;

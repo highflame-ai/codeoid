@@ -20,6 +20,7 @@ import {
   pollWatch,
   selectWatch,
   setWatchEnabled,
+  setWatchesIdentity,
   updateWatch,
   watchWatches,
   watchesState,
@@ -78,13 +79,33 @@ describe("watches store — reads", () => {
     expect(clientRequestMock).toHaveBeenCalledTimes(calls);
   });
 
-  it("a new connection starts empty", async () => {
+  it("another identity starts empty at once, and a reply asked as the earlier one changes nothing", async () => {
+    setWatchesIdentity("a");
     clientRequestMock.mockResolvedValue(snap({}, { triggers: [trigger()] }));
     selectWatch("w_1");
     await tick();
-    clientRef.current = { request: vi.fn().mockResolvedValue(list([])) };
-    await fetchWatches();
+    expect(watchesState().detail).not.toBeNull();
+    let late!: (v: unknown) => void;
+    clientRequestMock.mockReturnValueOnce(new Promise((r) => (late = r)));
+    const slow = fetchWatches();
+
+    setWatchesIdentity("b");
+    // Without a request: what "a" saw is gone the moment "b" signs in.
     expect(watchesState()).toMatchObject({ watches: [], detail: null, selectedId: null, lastPoll: null });
+    late(list([watch()]));
+    await slow;
+    expect(watchesState().watches).toEqual([]);
+  });
+
+  it("a reconnect as the same identity keeps what is shown", async () => {
+    setWatchesIdentity("a");
+    clientRequestMock.mockResolvedValue(list([watch()]));
+    await fetchWatches();
+    // A new connection object, the same identity.
+    clientRef.current = { request: vi.fn().mockReturnValue(new Promise(() => {})) };
+    setWatchesIdentity("a");
+    void fetchWatches();
+    expect(watchesState().watches.map((w) => w.id)).toEqual(["w_1"]);
   });
 });
 
