@@ -14,8 +14,10 @@ import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { loadConfig } from "../config.js";
 import {
   type AttemptSettledStatus,
+  DEFAULT_DISPATCH_CONFIG,
   Dispatcher,
   type DispatcherHost,
 } from "../daemon/dispatch.js";
@@ -584,7 +586,7 @@ describe("dispatcher — held attempts", () => {
     expect(statusOf(id)).toBe("held");
 
     host.statuses.set("attempt-worker-1", "thinking");
-    expect(await d.unhold(id, gen)).toBe(true);
+    expect(await d.unhold(id, gen)).toBe("resumed");
     expect(d.tasksForSession("attempt-worker-1")).toEqual([id]);
     d.onSessionStatus("attempt-worker-1", "idle");
     await until(() => host.settled.length > 0, "settled");
@@ -608,7 +610,7 @@ describe("dispatcher — held attempts", () => {
     const { id, gen } = await heldAttempt(d, host);
     host.statuses.set("attempt-worker-1", "idle"); // the turn ended while the daemon was down
     const restarted = makeDispatcher(host);
-    expect(await restarted.unhold(id, gen)).toBe(false);
+    expect(await restarted.unhold(id, gen)).toBe("settled");
     expect(statusOf(id)).toBe("failed");
     expect(host.settled.map((s) => s.status)).toEqual(["reclaimed"]);
   });
@@ -623,7 +625,7 @@ describe("dispatcher — held attempts", () => {
     d.onSessionStatus("attempt-worker-1", "idle");
     expect(statusOf(id)).toBe("held");
 
-    expect(await d.unhold(id, gen)).toBe(true);
+    expect(await d.unhold(id, gen)).toBe("finished");
     expect(statusOf(id)).toBe("done");
     expect(host.settled.map((s) => s.status)).toEqual(["done"]);
   });
@@ -633,7 +635,7 @@ describe("dispatcher — held attempts", () => {
     const d = makeDispatcher(host);
     const { id, gen } = await heldAttempt(d, host);
     host.statuses.delete("attempt-worker-1");
-    expect(await d.unhold(id, gen)).toBe(false);
+    expect(await d.unhold(id, gen)).toBe("settled");
     expect(statusOf(id)).toBe("failed");
     expect(host.settled.map((s) => s.status)).toEqual(["failed"]);
   });
@@ -643,7 +645,7 @@ describe("dispatcher — held attempts", () => {
     const d = makeDispatcher(host);
     const { id, gen } = await heldAttempt(d, host);
     expect(host.waiting).toHaveLength(1);
-    expect(await d.unhold(id, gen)).toBe(true);
+    expect(await d.unhold(id, gen)).toBe("waiting");
     expect(host.waiting).toHaveLength(2);
     expect(host.waiting[1]!.status).toBe("running");
     expect(d.tasksForSession("attempt-worker-1")).toEqual([id]);
@@ -674,6 +676,20 @@ describe("dispatcher — held attempts", () => {
     expect(until_).toBeLessThanOrEqual(Date.now() + 5_000);
   });
 
+  test("the default hold window is 2 hours, in the dispatcher and the config schema", () => {
+    expect(DEFAULT_DISPATCH_CONFIG.holdMaxMs).toBe(2 * 60 * 60_000);
+    const cfg = loadConfig({ configPath: join(tmp, "absent.json"), env: {} });
+    expect(cfg.dispatch?.holdMaxMs).toBe(2 * 60 * 60_000);
+  });
+
+  test("a stale generation is refused without touching the hold", async () => {
+    const host = new LoopHost();
+    const d = makeDispatcher(host);
+    const { id, gen } = await heldAttempt(d, host);
+    expect(await d.unhold(id, gen + 1)).toBe("refused");
+    expect(statusOf(id)).toBe("held");
+  });
+
   test("cancel of a held attempt settles it `failed` and fences its worker", async () => {
     const host = new LoopHost();
     const d = makeDispatcher(host);
@@ -682,7 +698,7 @@ describe("dispatcher — held attempts", () => {
     expect(statusOf(id)).toBe("failed");
     expect(store.dispatchGet(id)!.error).toBe("run cancelled by owner");
     expect(host.settled.map((s) => s.status)).toEqual(["failed"]);
-    expect(await d.unhold(id, gen)).toBe(false);
+    expect(await d.unhold(id, gen)).toBe("refused");
     expect(d.cancel(id, "again")).toBe(false);
     expect(host.settled).toHaveLength(1);
   });
@@ -710,7 +726,7 @@ describe("dispatcher — held attempts", () => {
 
     expect(other.hold(id, gen, "not yours")).toBe(false);
     expect(mine.hold(id, gen, "approval")).toBe(true);
-    expect(await other.unhold(id, gen)).toBe(false);
+    expect(await other.unhold(id, gen)).toBe("refused");
     expect(other.cancel(id, "not yours")).toBe(false);
     expect(statusOf(id)).toBe("held");
     expect(host.settled).toEqual([]);

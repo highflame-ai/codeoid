@@ -608,6 +608,12 @@ const DispatchSchema = z
     workerToolBudget: z.number().int().min(1).default(50),
     /** Base retry backoff (ms) for retryable failures — doubles per attempt, capped at leaseMs. */
     retryBaseMs: z.number().int().min(0).default(15_000),
+    /**
+     * Longest a loop attempt may stay `held` on an approval (ms). A held attempt
+     * keeps its worker session and occupies a `maxConcurrentWorkers` slot, so
+     * past this the hold lapses and the attempt settles as reclaimed.
+     */
+    holdMaxMs: z.number().int().min(60_000).default(2 * 60 * 60_000),
   })
   .default({
     enabled: true,
@@ -617,6 +623,7 @@ const DispatchSchema = z
     maxConcurrentWorkers: 2,
     workerToolBudget: 50,
     retryBaseMs: 15_000,
+    holdMaxMs: 2 * 60 * 60_000,
   });
 
 /**
@@ -1348,6 +1355,8 @@ export interface CodeoidConfig {
     maxConcurrentWorkers: number;
     workerToolBudget: number;
     retryBaseMs: number;
+    /** Longest a loop attempt may stay held (ms). Optional for hand-built configs; default 2h. */
+    holdMaxMs?: number;
   };
   /**
    * Collaborative-session bounds (see CollaborationSchema). Optional in the

@@ -61,9 +61,10 @@ export interface DispatchConfig {
    */
   retryBaseMs: number;
   /**
-   * Longest a loop attempt may stay `held`. A held attempt keeps its worker
-   * session and counts against `maxConcurrentWorkers`; past this the hold is
-   * treated as dead and the attempt settles `reclaimed`, freeing the slot.
+   * Longest a loop attempt may stay `held` (default 2h). A held attempt keeps
+   * its worker session and counts against `maxConcurrentWorkers`; past this the
+   * hold is treated as dead and the attempt settles `reclaimed`, freeing the
+   * slot.
    */
   holdMaxMs: number;
   /**
@@ -91,7 +92,7 @@ export const DEFAULT_DISPATCH_CONFIG: DispatchConfig = {
   maxConcurrentWorkers: 2,
   workerToolBudget: 50,
   retryBaseMs: 15_000,
-  holdMaxMs: 24 * 60 * 60_000,
+  holdMaxMs: 2 * 60 * 60_000,
 };
 
 /** Thrown by host methods when retrying can never succeed (target gone, bad input). */
@@ -99,6 +100,21 @@ export class NonRetryableDispatchError extends Error {}
 
 /** The hooks a host must implement before an attempt task may run on it. */
 const ATTEMPT_HOOKS = "spawnAttemptWorker / onAttemptSettled / onAttemptWaiting are not implemented";
+
+/**
+ * What `Dispatcher.unhold` did with a held attempt.
+ *
+ * - `resumed`  — running again, worker working, watched.
+ * - `waiting`  — running again and watched, but the worker is still parked on
+ *                an approval; `onAttemptWaiting` has fired again.
+ * - `finished` — the worker's turn ended while held; the attempt was settled
+ *                from it (`onAttemptSettled` with `done` or `failed`).
+ * - `settled`  — could not be resumed and was ended instead: the hold outlived
+ *                its boot (`reclaimed`) or the worker session is gone (`failed`).
+ * - `refused`  — nothing changed: not held, a stale generation, or another
+ *                daemon's attempt.
+ */
+export type UnholdOutcome = "resumed" | "waiting" | "finished" | "settled" | "refused";
 
 /** How an attempt task ended, as reported to `DispatcherHost.onAttemptSettled`. */
 export type AttemptSettledStatus = "done" | "failed" | "reclaimed";
@@ -441,6 +457,12 @@ export class Dispatcher {
    * The watch is dropped while held — a status change is not this
    * dispatcher's to act on until `unhold`, which re-reads the worker's state
    * rather than relying on a transition it missed.
+   *
+   * The caller MUST release a hold — `unhold` once the decision is made, or
+   * `cancel` — or leave it to lapse. A held worker is unwatched: its turn
+   * ending, erroring or vanishing goes unnoticed, and the attempt keeps its
+   * worker slot, until one of those happens. `holdMaxMs` (default 2h) is the
+   * backstop, not the plan.
    */
   hold(taskId: string, generation: number, reason: string): boolean {
     const now = Date.now();
@@ -469,7 +491,8 @@ export class Dispatcher {
   /**
    * Resume a held attempt as `running` with a fresh lease, at the same
    * generation — the same worker carries on, so its result still applies.
-   * Returns true only when the attempt is running again.
+   * Returns what happened (`UnholdOutcome`); only `resumed` and `waiting` leave
+   * the attempt running.
    *
    * A hold placed by a previous boot is NOT resumed: the approval it waited on
    * died with that process, and the worker's idle would read as a success it
@@ -480,11 +503,11 @@ export class Dispatcher {
    * finish now; still waiting on an approval → tell the loop again; working →
    * watch it.
    */
-  async unhold(taskId: string, generation: number): Promise<boolean> {
+  async unhold(taskId: string, generation: number): Promise<UnholdOutcome> {
     const task = this.#store.dispatchGet(taskId);
     if (!task || task.status !== "held" || task.generation !== generation) {
       this.#staleResult(taskId, generation, "unhold");
-      return false;
+      return "refused";
     }
     const now = Date.now();
     if (task.claimOwner !== this.bootId) {
@@ -497,15 +520,15 @@ export class Dispatcher {
       );
       if (!settled) {
         this.#staleResult(taskId, generation, "unhold");
-        return false;
+        return "refused";
       }
       this.#settleAttempt(settled, "reclaimed");
       this.#signalBoardChange();
-      return false;
+      return "settled";
     }
     if (!this.#store.dispatchUnhold(taskId, generation, this.bootId, now, this.#config.daemonId)) {
       this.#staleResult(taskId, generation, "unhold");
-      return false;
+      return "refused";
     }
     this.#host.audit("dispatch.unheld", `task=${taskId} generation=${generation}`);
     this.#signalBoardChange();
@@ -522,11 +545,11 @@ export class Dispatcher {
       ) {
         this.#settleAttempt(this.#store.dispatchGet(taskId) ?? task, "failed");
       }
-      return false;
+      return "settled";
     }
     if (status === "idle" || status === "error") {
       await this.#finishWorkerTask(taskId, generation, sessionId, status);
-      return true;
+      return "finished";
     }
     this.#watch(sessionId, taskId, generation);
     if (status === "waiting_approval") {
@@ -534,8 +557,9 @@ export class Dispatcher {
       // report it happened while unwatched, so report it now.
       const fresh = this.#store.dispatchGet(taskId) ?? task;
       this.#callAttemptHook("onAttemptWaiting", () => this.#host.onAttemptWaiting?.(fresh));
+      return "waiting";
     }
-    return true;
+    return "resumed";
   }
 
   /**
