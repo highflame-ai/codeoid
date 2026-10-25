@@ -20,8 +20,9 @@ import {
   type HistorySeedResult,
 } from "./providers/canonical.js";
 import { targetContextWindow, seedBudgetChars, isPromptTooLongError } from "./providers/context-windows.js";
-import { classifyUsageLimit, type UsageLimitKind } from "./providers/usage-limit.js";
+import { classifyCliNotice, classifyUsageLimit, type UsageLimitKind } from "./providers/usage-limit.js";
 import { extraEnvViolations } from "./providers/env.js";
+import { killSurvivors, snapshotTree, type ProcessEntry } from "./process-tree.js";
 import { CONDUCTOR_SYSTEM_PROMPT_APPEND, isFleetSendTool } from "./fleet.js";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import {
@@ -41,6 +42,7 @@ import {
   type TurnOpts,
   type CatalogEntry,
   isPlaceholderModel,
+  BUDGET_STOP_MESSAGE,
 } from "./providers/interface.js";
 import { createDefaultProviderRegistry, type ProviderRegistry } from "./providers/registry.js";
 import { selectContextStrategy, renderSessionMap, renderRotationSeed, type ContextStrategy } from "./providers/context-strategy.js";
@@ -111,6 +113,9 @@ const FORK_SETUP_TIMEOUT_MS = 600_000;
  * the overflow is surfaced as an error.
  */
 const SEED_OVERFLOW_MAX_RETRIES = 3;
+
+/** How long a hard stop (stall recovery, terminateBackend) waits for the backend's teardown. */
+const HARD_STOP_TEARDOWN_MS = 10_000;
 import {
   authToIdentity,
   CAPABILITIES,
@@ -490,17 +495,27 @@ export interface SessionCreateOptions {
    *   session wedge at waiting_approval.
    * - `"end_attempt"`: for an unattended worker whose controller owns the
    *   next step. The call that finds the budget spent is DENIED with a clear
-   *   message, the turn is interrupted, the session settles idle (never
-   *   waiting_approval for that call), the mode reverts to guarded, and
-   *   `budgetExhausted` reads true until a new autonomous budget is set.
+   *   message, the turn is interrupted, background tasks are stopped where the
+   *   backend can, the session settles idle (never waiting_approval for that
+   *   call), the mode reverts to guarded, and `budgetExhausted` reads true.
+   *   Until a new autonomous budget is set (setMode), EVERY tool call is
+   *   denied and ends its turn — including later prompts and turns the
+   *   backend starts on its own. Only enforceable where `toolBudgetEnforced`
+   *   (not codex); elsewhere a warning is logged and wall time must bound it.
    */
   onBudgetExhausted?: "park" | "end_attempt";
   /**
    * Extra environment for the backend's child process — every process-backed
    * provider (Claude Code CLI, codex, gemini-cli, pi, qwen-code). Merged after
    * codeoid builds the backend's env, but a key in codeoid's credential /
-   * account-isolation denylist (`extraEnvViolations`, providers/env.ts) is
+   * account-isolation / code-loading denylist (`extraEnvViolations`,
+   * providers/env.ts), or any name that isn't `^[A-Z][A-Z0-9_]{0,63}$`, is
    * refused: the constructor throws, so a misconfigured caller learns at once.
+   *
+   * DAEMON-CONTROLLED ONLY. The denylist is a backstop, not an authorization:
+   * a name a user (or a contract, or an agent) supplies must first pass an
+   * explicit allowlist the daemon owns — a later slice binds it to the trusted
+   * setup recipe's declared `resources.env`. Never forward client input here.
    * No effect on in-process backends (openai, gemini, llama.cpp, endpoints).
    * Held in memory only, by design — never persisted (it can carry a run's
    * secrets-adjacent settings, and a stale copy must not outlive the run). A
@@ -1050,11 +1065,14 @@ export class Session {
   #turnsRemaining: number | undefined = undefined;
   /** See SessionCreateOptions.onBudgetExhausted. */
   #onBudgetExhausted: "park" | "end_attempt" = "park";
-  /** end_attempt only: the autonomous budget ran out; reset by a new autonomous budget (setMode). */
+  /**
+   * end_attempt only: the autonomous budget ran out. While set, EVERY tool
+   * call is denied — in the turn it ran out in, a later prompted turn, or a
+   * turn the backend starts on its own — until a new autonomous budget is set
+   * (setMode). Only an explicit re-arm clears it, never a turn boundary.
+   */
   #budgetExhausted = false;
-  /** end_attempt only: the turn the budget ran out in is being ended — deny every further call in it. */
-  #endingAttempt = false;
-  /** The ending turn's interrupt has been scheduled (once per ending). */
+  /** This turn's end-attempt interrupt has been scheduled (once per turn). */
   #endAttemptInterruptQueued = false;
   /** See SessionCreateOptions.extraEnv (validated in the constructor). */
   #extraEnv: Readonly<Record<string, string>> | undefined;
@@ -1426,6 +1444,7 @@ export class Session {
         : (opts.config?.session.defaultEffort ?? null);
 
     this.#provider = opts._testProvider ?? this.#createProvider(opts.providerId);
+    this.#warnIfBudgetUnenforced();
     this.#appliedAccount = this.#accountState(this.#provider.id);
     this.#provider.onSessionEvent = (e) => this.#onSessionScopedEvent(e);
 
@@ -1927,6 +1946,7 @@ export class Session {
     }
 
     this.#provider = this.#createProvider(requested);
+    this.#warnIfBudgetUnenforced();
     this.#effortRestartPending = false; // the new backend starts with the session's effort
     this.#appliedAccount = this.#accountState(requested);
     this.#resetMcpState({ backendChanged: true });
@@ -2032,7 +2052,7 @@ export class Session {
   /**
    * The most recent finished turn's failure, when the backend blamed a usage or
    * rate limit (with its reset time when it gave one); null when that turn
-   * failed for another reason, and cleared by the next successful turn. A loop
+   * failed for another reason, succeeded, or a new turn has started. A loop
    * controller reads it to record an infrastructure error that spends no
    * attempt. Retry behavior is unchanged — this only observes.
    */
@@ -2040,7 +2060,8 @@ export class Session {
   /**
    * True once the autonomous tool budget ran out on a session created with
    * `onBudgetExhausted: "end_attempt"` — the attempt was ended, not parked.
-   * Stays true until a new autonomous budget is set (setMode).
+   * Stays true, and every tool call is denied, until a new autonomous budget
+   * is set (setMode).
    */
   get budgetExhausted(): boolean { return this.#budgetExhausted; }
   /**
@@ -2488,6 +2509,22 @@ export class Session {
   get agentUri(): string | undefined { return this.#agentIdentity.sub; }
   get mode(): SessionMode { return this.#mode; }
   get turnsRemaining(): number | undefined { return this.#turnsRemaining; }
+  /**
+   * Whether this session's backend asks codeoid before every tool call in
+   * autonomous mode, so the tool budget (and `onBudgetExhausted`) actually
+   * bounds it. False on codex (SessionProvider.enforcesToolBudget): there a
+   * controller must bound the attempt by wall time (supervisor.ts) instead.
+   * Read it again after a backend switch.
+   */
+  get toolBudgetEnforced(): boolean { return this.#provider.enforcesToolBudget !== false; }
+
+  /** end_attempt on a backend that can't count tool calls: not refused, but said. */
+  #warnIfBudgetUnenforced(): void {
+    if (this.#onBudgetExhausted !== "end_attempt" || this.toolBudgetEnforced) return;
+    console.warn(
+      `[codeoid/session ${this.id}] onBudgetExhausted "end_attempt" requested, but the ${this.#provider.id} backend runs autonomous tool calls without asking codeoid — the tool budget can't be enforced; bound this attempt by wall time (supervise) instead`,
+    );
+  }
   get pinnedFiles(): readonly string[] { return this.#pinnedFiles; }
   get model(): string | null { return this.#model; }
   get fallbackModel(): string | null { return this.#fallbackModel; }
@@ -3095,25 +3132,33 @@ export class Session {
 
   /** Per-turn loop controls, reset when a turn starts. */
   #resetTurnControls(): void {
-    this.#endingAttempt = false;
     this.#endAttemptInterruptQueued = false;
     this.#rateLimitRejection = null;
+    // It describes the last FINISHED turn; a running one has not failed yet.
+    this.#lastTurnInfraError = null;
   }
 
   /**
    * A turn failed: record whether a usage or rate limit was the cause
-   * (lastTurnInfraError). `sources` are what the turn reported, most
-   * authoritative first — the error, then (when this turn wrote it) the
-   * assistant text the Claude CLI puts its limit message in. Any failure
-   * overwrites the previous record, so it always describes the latest turn.
-   * Observation only: nothing here retries or changes status.
+   * (lastTurnInfraError). Any failure overwrites the previous record, so it
+   * always describes the latest turn. Observation only: nothing here retries
+   * or changes status.
+   *
+   * - `errors`: what the backend reported AS the failure (error text, an
+   *   Error, a structured error) — read with the full classifier.
+   * - `cliTexts`: text the turn's reply may hold a CLI notice in (Claude's
+   *   result text on an is_error turn, the turn's own assistant text). It
+   *   can be the model's words, so only CLI-shaped rules apply (classifyCliNotice).
+   * - `explained`: another recognizer already knows the cause (prompt too
+   *   long, the spend ceiling) — then a rate_limit_event alone never makes it
+   *   a usage limit.
    */
-  #recordTurnFailure(sources: readonly unknown[]): void {
+  #recordTurnFailure(
+    errors: readonly unknown[],
+    opts: { cliTexts?: readonly (string | undefined)[]; explained?: boolean } = {},
+  ): void {
     const provider = this.#provider.id;
-    for (const source of sources) {
-      if (source == null || source === "") continue;
-      const hit = classifyUsageLimit(source, { provider });
-      if (!hit) continue;
+    const record = (hit: { kind: UsageLimitKind; resetAt?: number }, source: unknown) => {
       // The text often says only "resets 3pm"; Claude's rate_limit_event in
       // the same turn carries the exact instant.
       const resetAt = hit.resetAt ?? this.#rateLimitRejection?.resetAt;
@@ -3124,13 +3169,28 @@ export class Session {
         provider,
         at: Date.now(),
       };
-      return;
+    };
+    for (const source of errors) {
+      if (source == null || source === "") continue;
+      const hit = classifyUsageLimit(source, { provider });
+      if (hit) {
+        record(hit, source);
+        return;
+      }
     }
-    // No text said so, but the backend reported this turn's request rejected
-    // by a plan limit (Claude's rate_limit_event, status "rejected").
+    for (const text of opts.cliTexts ?? []) {
+      const hit = classifyCliNotice(text, { provider });
+      if (hit) {
+        record(hit, text);
+        return;
+      }
+    }
+    // Nothing said so, but the backend reported this turn's request refused
+    // by a plan limit (Claude's rate_limit_event "rejected", not carried by
+    // overage) — and no other recognizer explains the failure.
     const rejection = this.#rateLimitRejection;
-    if (rejection) {
-      const first = sources.find((s) => s != null && s !== "");
+    if (rejection && !opts.explained) {
+      const first = errors.find((e) => e != null && e !== "");
       this.#lastTurnInfraError = {
         kind: "usage_limit",
         ...(rejection.resetAt !== undefined ? { resetAt: rejection.resetAt } : {}),
@@ -3182,7 +3242,6 @@ export class Session {
     // A new turn is starting — clear any interrupt from the previous one.
     this.#turnInterrupted = false;
     this.#lastTurnError = null;
-    this.#resetTurnControls();
     // Any inbound message invalidates a repeat run: the guard only claims
     // "N identical calls with nothing else happening", and this is something
     // else happening. Applies to system principals too (a background-task
@@ -3258,6 +3317,9 @@ export class Session {
     const joinsRunningTurn = wasWorking && !!this.#activeRun?.pushMidTurn && this.#currentTurnId !== null;
     const previousTurnId = this.#currentTurnId;
     let turnId = joinsRunningTurn ? (previousTurnId as string) : this.#beginTurn();
+    // Per-turn controls belong to a turn that STARTS here, not to one this
+    // message only joins (its rate-limit record and interrupt are still live).
+    if (!joinsRunningTurn) this.#resetTurnControls();
     const turnAt = new Date().toISOString();
     try {
     const userMsg = this.#makeMessage(
@@ -4082,6 +4144,11 @@ export class Session {
       } catch {
         // fall through — the provider's own fallback is a hard abort
       }
+      // While we awaited, the turn may have ended and another started (a
+      // queued send, a backend-adopted turn, a terminateBackend). Its
+      // approvals and status are not this interrupt's to settle; an ended
+      // run's consumer already settled its own.
+      if (this.#activeRun !== run) return;
       // Tool cards are NOT closed here: the interrupted turn is still
       // draining, and a result that lands after interrupt() resolves must
       // still reach its card, the transcript and memory. The consumer's turn
@@ -6028,17 +6095,19 @@ export class Session {
    *
    * The interrupt is scheduled, not awaited: the deny must reach the backend
    * first, and interrupt() awaits the backend, which is waiting on this gate.
-   * Only the first denial interrupts; later calls in the draining turn are
-   * simply refused.
+   * Only a turn's first denial interrupts it; later calls in the draining
+   * turn are simply refused. Background tasks are stopped too where the
+   * backend can (Claude: SDK `stopTask`); on a backend without
+   * stopBackgroundTasks they keep running, but every tool call they make is
+   * still denied here.
    */
   #endAttemptOnBudget(approvalId: string, toolName: string, sender: AuthContext): { behavior: "deny"; message: string } {
-    if (!this.#endingAttempt) {
+    if (!this.#budgetExhausted) {
       // Same reversion as park (reads frictionless, writes ask again if a
       // person takes over); flagged after setMode, which clears the flag only
       // for a NEW autonomous budget.
       this.setMode("guarded");
       this.#budgetExhausted = true;
-      this.#endingAttempt = true;
     }
     const reason = "The autonomous tool budget for this attempt is spent, so the attempt has ended. Do not retry; the controller decides what happens next.";
     this.#resolveToolCallMessage(approvalId, { phase: "cancelled", reason: "denied", message: reason });
@@ -6065,7 +6134,15 @@ export class Session {
       };
       setTimeout(() => {
         if (this.#destroyed) return;
-        this.interrupt(system).catch((e) => {
+        void (async () => {
+          await this.interrupt(system);
+          // interrupt() spares background agents while a turn runs; an ended
+          // attempt must not leave them working on the spent budget.
+          if (this.#backgroundTasks.size > 0 && this.#provider.stopBackgroundTasks) {
+            await this.#provider.stopBackgroundTasks([...this.#backgroundTasks.keys()]);
+            this.#clearBackgroundTasks();
+          }
+        })().catch((e) => {
           console.error(`[codeoid/session ${this.id}] ending the attempt on a spent budget failed: ${e instanceof Error ? e.message : String(e)}`);
         });
       }, 0);
@@ -6090,8 +6167,8 @@ export class Session {
       if (!this.#turnActive()) await this.#backgroundEventChain;
 
       // The attempt already ended on a spent budget (end_attempt): nothing
-      // else runs in it — not even a read — while the interrupt lands.
-      if (this.#endingAttempt) return this.#endAttemptOnBudget(approvalId, toolName, sender);
+      // runs — not even a read — until a new budget re-arms the session.
+      if (this.#budgetExhausted) return this.#endAttemptOnBudget(approvalId, toolName, sender);
 
       // Hook gate — the policy layer, run BEFORE the approval gate. A hook
       // block is a policy deny that never prompts the user (and never burns
@@ -6581,10 +6658,19 @@ export class Session {
    * ran out and the grace period passed). Whatever is in flight — a tool
    * without its own timeout, a wedged turn, background agents — is ended by
    * tearing the backend down (its child process is killed), exactly as stall
-   * recovery does. The session survives and settles idle; the next send starts
-   * a fresh backend and resumes the conversation. Idempotent.
+   * recovery does — and then killing whatever that process had started and
+   * left running (process-tree.ts: the tree under the backend's own pids is
+   * snapshotted first, survivors are SIGKILLed after the bounded teardown).
+   * Self-detached commands and backends with unknown pids (qwen) are outside
+   * that reach; see process-tree.ts for exactly what survives. The session
+   * survives and settles idle; the next send starts a fresh backend and
+   * resumes the conversation. Idempotent.
    */
-  async terminateBackend(sender: AuthContext, reason: string): Promise<void> {
+  async terminateBackend(
+    sender: AuthContext,
+    reason: string,
+    opts: { teardownTimeoutMs?: number } = {},
+  ): Promise<void> {
     this.#store.audit(sender.sub, "session.terminate_backend", this.id, reason);
     // Stop sends still preparing their turn too, as interrupt() does.
     this.#turnInterrupted = true;
@@ -6592,10 +6678,34 @@ export class Session {
     this.#cancelAllUiRequests("interrupted");
     this.#earlyApprovals.clear();
     this.#approvalPatchKeys.clear();
-    await this.#hardStop("backend terminated", {
-      text: `⏹ Backend stopped by ${sender.sub}: ${reason}. Send a new message to continue.`,
-      meta: { event: "session.backend_terminated", sub: sender.sub },
-    });
+    // Before the teardown: once the backend is gone its children re-parent
+    // and can no longer be told apart from anyone else's.
+    let tree: ProcessEntry[] = [];
+    try {
+      const roots = (await withTimeout(this.#provider.backendProcessIds?.() ?? Promise.resolve([]), 3_000)) ?? [];
+      tree = await withTimeout(snapshotTree(roots), 3_000);
+    } catch (e) {
+      console.error(`[codeoid/session ${this.id}] could not snapshot the backend's processes: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    await this.#hardStop(
+      "backend terminated",
+      {
+        text: `⏹ Backend stopped by ${sender.sub}: ${reason}. Send a new message to continue.`,
+        meta: { event: "session.backend_terminated", sub: sender.sub },
+      },
+      opts.teardownTimeoutMs,
+    );
+    // The teardown had its graceful chance (and the backend its own
+    // escalation); what is still running from the snapshot is left over.
+    try {
+      const killed = await killSurvivors(tree);
+      if (killed.length > 0) {
+        this.#store.audit(sender.sub, "session.terminate_backend.reaped", this.id, `pids=${killed.join(",")}`);
+        console.warn(`[codeoid/session ${this.id}] killed ${killed.length} process(es) the backend left running: ${killed.join(", ")}`);
+      }
+    } catch (e) {
+      console.error(`[codeoid/session ${this.id}] killing the backend's leftover processes failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   /**
@@ -6607,7 +6717,11 @@ export class Session {
    * abandoned consumer (if any) unblocks when teardown closes the turn queue
    * and its finally no-ops via the run guard.
    */
-  async #hardStop(label: string, notice: { text: string; meta: Record<string, unknown> }): Promise<void> {
+  async #hardStop(
+    label: string,
+    notice: { text: string; meta: Record<string, unknown> },
+    teardownTimeoutMs = HARD_STOP_TEARDOWN_MS,
+  ): Promise<void> {
     // Stop any spinning UI and release waiters BEFORE we tear down. The
     // teardown below kills the CLI and every background agent with it, so
     // nothing is kept: the whole background set is dead.
@@ -6631,8 +6745,11 @@ export class Session {
     // Hard teardown: abort the controller and reap the (presumed hung)
     // subprocess. Safe to await here — provider.teardown() awaits the
     // PROVIDER's own pump, never this session's consumer.
+    // Bounded: a backend that won't acknowledge its teardown must not hang
+    // the caller (a supervisor's `expired` waits on this). The run slots are
+    // already cleared, so the session is usable either way.
     try {
-      await this.#provider.teardown();
+      await withTimeout(this.#provider.teardown(), teardownTimeoutMs);
     } catch (e) {
       console.error(
         `[codeoid/session ${this.id}] provider teardown during ${label} failed: ${e instanceof Error ? e.message : String(e)}`,
@@ -6771,7 +6888,7 @@ export class Session {
           secretPathVerdict(event.name, event.input, { workdir: this.workdir, configDir: getConfigDir() }) === null &&
           this.#peekAutoApprove(event.name);
         // end_attempt: the gate will refuse this call outright — no approval card.
-        const budgetDenied = this.#endingAttempt || this.#budgetSpentFor(event.name);
+        const budgetDenied = this.#budgetExhausted || this.#budgetSpentFor(event.name);
         const toolMsg = this.#makeMessage(
           "tool_call",
           `${event.name}(${Object.keys(event.input).join(", ")})`,
@@ -6999,8 +7116,9 @@ export class Session {
       case "rate_limit": {
         // Kept for #recordTurnFailure: if this turn fails, the reset is exact.
         // A later "allowed" in the same turn means the rejection was retried past.
+        // Overage carrying the requests means nothing was refused.
         this.#rateLimitRejection =
-          event.status === "rejected" ? (event.resetsAt !== undefined ? { resetAt: event.resetsAt } : {}) : null;
+          event.status === "rejected" && !event.overage ? (event.resetsAt !== undefined ? { resetAt: event.resetsAt } : {}) : null;
         break;
       }
 
@@ -7058,12 +7176,13 @@ export class Session {
           }
           this.#lastTurnError = errText;
           // Before the status change below, like lastTurnError: an error
-          // waiter reads it. The CLI puts a limit message in the turn's
-          // assistant text (only if THIS turn committed it, as above).
-          // Short only: the CLI's limit notice is the whole reply, and a long
-          // reply that happens to discuss rate limits is the model's work.
-          const notice = last?.role === "assistant" && last.content.length <= 500 ? last.content : undefined;
-          this.#recordTurnFailure([event.result.errorMessage, notice, errText]);
+          // waiter reads it. The CLI puts a limit notice in the result text
+          // or the turn's own assistant text (only if THIS turn committed it,
+          // as above) — CLI-shaped rules only there, never the generic ones.
+          this.#recordTurnFailure([event.result.errorMessage], {
+            cliTexts: [event.result.resultText, last?.role === "assistant" ? last.content : undefined],
+            explained: tooLong || event.result.errorMessage === BUDGET_STOP_MESSAGE,
+          });
           const hint = tooLong
             ? " — this session's context no longer fits the model. Send /rotate to continue in a fresh context (memory recall keeps the history reachable)."
             : "";

@@ -198,6 +198,11 @@ export class PiProvider implements SessionProvider {
     this.#hasQueried = value;
   }
 
+  async backendProcessIds(): Promise<number[]> {
+    const pid = this.#proc?.pid;
+    return pid ? [pid] : [];
+  }
+
   async teardown(): Promise<void> {
     this.#failTurn("pi session torn down");
     this.#proc?.kill();

@@ -91,9 +91,10 @@ export function buildSubprocessEnv(
  * home at another login, inject code into the backend (NODE_OPTIONS,
  * LD_PRELOAD), or route its bearer token through a proxy.
  *
- * Matched case-insensitively, by exact name, namespace prefix, or credential
- * suffix. Deliberately broad: a controller that needs one of these has to get
- * it through the account system, not an env side door.
+ * Matched by exact name, namespace prefix, or credential suffix, on
+ * upper-case names (anything else is refused outright). Deliberately broad: a
+ * controller that needs one of these has to get it through the account system
+ * or a trusted setup recipe, not an env side door.
  */
 const EXTRA_ENV_DENY_EXACT = new Set([
   // Identity and the vendor homes every account overlay lives under.
@@ -106,6 +107,14 @@ const EXTRA_ENV_DENY_EXACT = new Set([
   "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
   "NODE_EXTRA_CA_CERTS", "NODE_TLS_REJECT_UNAUTHORIZED", "SSL_CERT_FILE", "SSL_CERT_DIR",
   "CODE_ASSIST_ENDPOINT",
+  // Variables a tool the backend runs reads as configuration or as a command
+  // to execute: shell startup files, pagers and editors, ripgrep's config,
+  // glibc's charset-module path.
+  "RIPGREP_CONFIG_PATH", "BASH_ENV", "ENV", "PROMPT_COMMAND",
+  "PAGER", "GIT_PAGER", "LESSOPEN", "LESSCLOSE", "EDITOR", "VISUAL", "GCONV_PATH",
+  // Backend runtime knobs: logging that can echo requests, and where temp
+  // files (prompts, patches) land.
+  "RUST_LOG", "RUST_BACKTRACE", "TMPDIR", "TEMP", "TMP", "TZ",
 ]);
 const EXTRA_ENV_DENY_PREFIXES = [
   // codeoid's own namespaces (DENY_PREFIXES above) — tokens, the escape hatch.
@@ -117,17 +126,25 @@ const EXTRA_ENV_DENY_PREFIXES = [
   "AWS_", "AZURE_", "VERTEX_", "OTEL_",
   // Dynamic-loader injection.
   "LD_", "DYLD_",
+  // Toolchains whose env is configuration that can run code or swap
+  // credentials: git (hooks via GIT_CONFIG_*, GIT_SSH_COMMAND), npm, Python,
+  // Ruby, Perl, the JVM, gcloud. Locale categories (LC_*) too.
+  "GIT_", "NPM_CONFIG_", "PYTHON", "RUBY", "PERL5", "PERL_", "JAVA_", "_JAVA_", "JDK_", "CLOUDSDK_", "LC_",
 ] as const;
 const EXTRA_ENV_DENY_SUFFIXES = ["_API_KEY", "_API_TOKEN", "_AUTH_TOKEN", "_ACCESS_TOKEN", "_REFRESH_TOKEN", "_OAUTH_TOKEN"] as const;
-const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/**
+ * Upper-case names only: lower-case twins (`http_proxy`, `npm_config_*`) are
+ * read by tools as the same setting, and refusing the shape is simpler and
+ * safer than enumerating every twin.
+ */
+const ENV_NAME = /^[A-Z][A-Z0-9_]{0,63}$/;
 
 function extraEnvRefused(name: string, value: unknown): boolean {
   if (!ENV_NAME.test(name) || typeof value !== "string" || value.includes("\0")) return true;
-  const upper = name.toUpperCase();
   return (
-    EXTRA_ENV_DENY_EXACT.has(upper) ||
-    EXTRA_ENV_DENY_PREFIXES.some((p) => upper.startsWith(p)) ||
-    EXTRA_ENV_DENY_SUFFIXES.some((s) => upper.endsWith(s))
+    EXTRA_ENV_DENY_EXACT.has(name) ||
+    EXTRA_ENV_DENY_PREFIXES.some((p) => name.startsWith(p)) ||
+    EXTRA_ENV_DENY_SUFFIXES.some((s) => name.endsWith(s))
   );
 }
 

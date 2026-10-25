@@ -347,3 +347,210 @@ describe("supervise() — timers", () => {
     expect(() => supervise(s, { wallMs: 10, graceMs: -1 })).toThrow(RangeError);
   });
 });
+
+// ── Round-1 audit fixes ──────────────────────────────────────────────────────
+
+const rejected = (extra: Partial<Extract<ProviderEvent, { type: "rate_limit" }>> = {}): ProviderEvent => ({
+  type: "rate_limit",
+  status: "rejected",
+  resetsAt: Date.now() + 3600_000,
+  ...extra,
+});
+
+describe("rate_limit fallback (audit #1)", () => {
+  test("a rejection that overage is carrying is not a limit", async () => {
+    const provider = new MockSessionProvider("claude", [[rejected({ overage: true }), done({ isError: true, errorMessage: "tool crashed" })]]);
+    const session = makeSession({ _testProvider: provider });
+    await session.send("work", AUTH);
+    await until(() => session.status === "error");
+    expect(session.lastTurnInfraError).toBeNull();
+  });
+
+  for (const [label, errorMessage] of [
+    ["prompt too long", "Prompt is too long"],
+    ["the spend ceiling", "Stopped at the spend ceiling for this run (maxBudgetUsd)."],
+  ] as const) {
+    test(`a rejection does not relabel a failure already explained by ${label}`, async () => {
+      const provider = new MockSessionProvider("claude", [[rejected(), done({ isError: true, errorMessage })]]);
+      const session = makeSession({ _testProvider: provider });
+      await session.send("work", AUTH);
+      await until(() => session.status === "error");
+      expect(session.lastTurnInfraError).toBeNull();
+    });
+  }
+
+  test("an unexplained failure after a plain rejection is still a usage limit", async () => {
+    const r = rejected();
+    const provider = new MockSessionProvider("claude", [[r, done({ isError: true })]]);
+    const session = makeSession({ _testProvider: provider });
+    await session.send("work", AUTH);
+    await until(() => session.status === "error");
+    expect(session.lastTurnInfraError).toMatchObject({ kind: "usage_limit", resetAt: (r as { resetsAt: number }).resetsAt });
+  });
+});
+
+describe("CLI notice in result / assistant text (audit #2)", () => {
+  test("Claude's result text on an is_error turn is classified", async () => {
+    const provider = new MockSessionProvider("claude", [
+      [done({ isError: true, resultText: "You've hit your weekly limit · resets Oct 28, 9am (UTC)" })],
+    ]);
+    const session = makeSession({ _testProvider: provider });
+    await session.send("work", AUTH);
+    await until(() => session.status === "error");
+    expect(session.lastTurnInfraError?.kind).toBe("usage_limit");
+  });
+
+  for (const reply of [
+    "The upstream API returned 429 Too Many Requests twice, so I added retries.",
+    "HTTP 429 handler added; tests pass",
+    "You've reached your goal: the rate limit test passes",
+  ]) {
+    test(`a model reply in a failed turn is not a limit: ${JSON.stringify(reply)}`, async () => {
+      const provider = new MockSessionProvider("claude", [[{ type: "text_done", content: reply }, done({ isError: true, resultText: reply })]]);
+      const session = makeSession({ _testProvider: provider });
+      await session.send("work", AUTH);
+      await until(() => session.status === "error");
+      expect(session.lastTurnInfraError).toBeNull();
+    });
+  }
+});
+
+describe("turn-start clearing (audit #3, #5)", () => {
+  test("lastTurnInfraError is cleared when the next turn starts, not when it ends", async () => {
+    const provider = new MockSessionProvider("claude", [
+      [done({ isError: true, errorMessage: "You've hit your session limit · resets 3pm (UTC)" })],
+      [bash(1)],
+    ]);
+    const session = makeSession({ _testProvider: provider });
+    await session.send("work", AUTH);
+    await until(() => session.status === "error");
+    expect(session.lastTurnInfraError).not.toBeNull();
+    await session.send("again", AUTH);
+    await until(() => session.pendingToolApprovals().length === 1); // turn 2 running, parked on approval
+    expect(session.lastTurnInfraError).toBeNull();
+    await session.interrupt(AUTH);
+  });
+
+  test("a message that joins the running turn keeps that turn's rate-limit record", async () => {
+    const r = rejected();
+    const provider = new MockSessionProvider("claude", [[r, { type: "text_delta", content: "working" }]], { stall: true, midTurn: true });
+    const session = makeSession({ _testProvider: provider });
+    await session.send("work", AUTH);
+    await until(() => session.status === "thinking");
+    await new Promise((res) => setTimeout(res, 20));
+    await session.send("also this", AUTH); // joins (mid-turn push), no new turn
+    expect(provider.midTurnPushes.length).toBe(1);
+    // The interrupted partial turn's boundary is absorbed; the continuation fails.
+    provider.emitLive(done());
+    provider.emitLive(done({ isError: true }));
+    await until(() => session.status === "error");
+    expect(session.lastTurnInfraError).toMatchObject({ kind: "usage_limit", resetAt: (r as { resetsAt: number }).resetsAt });
+  });
+});
+
+describe("end_attempt keeps the attempt ended (audit #4)", () => {
+  test("later prompted and backend-started turns are denied too, and background tasks are stopped", async () => {
+    const provider = new MockSessionProvider("claude", [[bash(1), bashDone(1), bash(2)], [bash(3)]], { stall: true });
+    const session = makeSession({
+      _testProvider: provider,
+      initialMode: { mode: "autonomous", maxTurns: 1 },
+      onBudgetExhausted: "end_attempt",
+    });
+    provider.onSessionEvent?.({ type: "background_tasks", tasks: [{ id: "bg-1", kind: "subagent", description: "bg", status: "running" }] });
+    await session.send("work", AUTH);
+    await until(() => provider.canUseToolResults.length === 2 && session.status === "idle");
+    await until(() => provider.stoppedTasks.includes("bg-1"));
+    expect(session.budgetExhausted).toBe(true);
+
+    // A later prompt: still ended.
+    await session.send("try again", AUTH);
+    await until(() => provider.canUseToolResults.length === 3);
+    expect(provider.canUseToolResults[2]!.behavior).toBe("deny");
+    await until(() => session.status === "idle");
+    expect(session.budgetExhausted).toBe(true);
+
+    // A turn the backend starts on its own: still ended, flag kept.
+    provider.startOwnTurn([bash(4)]);
+    await until(() => provider.boundGates.length === 1);
+    await new Promise((res) => setTimeout(res, 20));
+    const verdict = await provider.boundGates[0]!.canUseTool("t4", "ap-4", "Bash", { command: "echo 4" });
+    expect(verdict.behavior).toBe("deny");
+    expect(session.budgetExhausted).toBe(true);
+
+    session.setMode("autonomous", 2);
+    expect(session.budgetExhausted).toBe(false);
+  });
+});
+
+class UnbudgetedProvider extends MockSessionProvider {
+  readonly enforcesToolBudget = false;
+}
+
+describe("toolBudgetEnforced (audit #7)", () => {
+  test("true on a gated backend; false, with a warning, on one that skips approvals", () => {
+    expect(makeSession({ _testProvider: new MockSessionProvider("claude") }).toolBudgetEnforced).toBe(true);
+    const warn = console.warn;
+    const warnings: string[] = [];
+    console.warn = (m: unknown) => { warnings.push(String(m)); };
+    try {
+      const s = makeSession({ _testProvider: new UnbudgetedProvider("codex"), onBudgetExhausted: "end_attempt" });
+      expect(s.toolBudgetEnforced).toBe(false);
+      expect(warnings.some((w) => w.includes("can't be enforced"))).toBe(true);
+      warnings.length = 0;
+      makeSession({ _testProvider: new UnbudgetedProvider("codex") }); // park: nothing to warn about
+      expect(warnings).toEqual([]);
+    } finally {
+      console.warn = warn;
+    }
+  });
+});
+
+/** A backend whose interrupt waits for the test to release it. */
+class SlowInterruptProvider extends MockSessionProvider {
+  release!: () => void;
+  override runTurn(opts: TurnOpts): TurnRun {
+    const run = super.runTurn(opts);
+    const gate = new Promise<void>((r) => { this.release = r; });
+    return { ...run, interrupt: () => gate };
+  }
+}
+
+/** A backend whose teardown never completes. */
+class StuckTeardownProvider extends MockSessionProvider {
+  override async teardown(): Promise<void> {
+    this.teardownCount++;
+    await new Promise<void>(() => {});
+  }
+}
+
+describe("interrupt and terminate races (audit #8)", () => {
+  test("an interrupt that returns after another turn took over leaves that turn alone", async () => {
+    const provider = new SlowInterruptProvider("claude", [[bash(1)], [bash(2)]], { stall: true });
+    const session = makeSession({ _testProvider: provider });
+    await session.send("first", AUTH);
+    await until(() => session.pendingToolApprovals().length === 1);
+    const releaseFirst = provider.release; // turn 1's gate (turn 2 gets its own)
+    const pending = session.interrupt(AUTH);
+    await session.terminateBackend(AUTH, "test");
+    expect(session.status).toBe("idle");
+    await session.send("second", AUTH);
+    await until(() => session.pendingToolApprovals().some((a) => a.approvalId === "ap-2"));
+    releaseFirst();
+    await pending;
+    expect(session.status).toBe("waiting_approval");
+    expect(session.pendingToolApprovals().map((a) => a.approvalId)).toEqual(["ap-2"]);
+    await session.terminateBackend(AUTH, "cleanup");
+  });
+
+  test("terminateBackend does not hang on a teardown that never finishes", async () => {
+    const provider = new StuckTeardownProvider("claude", [[bash(1)]], { stall: true });
+    const session = makeSession({ _testProvider: provider, initialMode: { mode: "autonomous" } });
+    await session.send("work", AUTH);
+    await until(() => session.status === "tool_running");
+    const t0 = Date.now();
+    await session.terminateBackend(AUTH, "test", { teardownTimeoutMs: 50 });
+    expect(Date.now() - t0).toBeLessThan(2_000);
+    expect(session.status).toBe("idle");
+    expect(provider.teardownCount).toBe(1);
+  });
+});

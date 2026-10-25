@@ -7,7 +7,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { CLAUDE_USAGE_LIMIT_PREFIXES, classifyUsageLimit } from "../daemon/providers/usage-limit.js";
+import { CLAUDE_USAGE_LIMIT_PREFIXES, classifyCliNotice, classifyUsageLimit } from "../daemon/providers/usage-limit.js";
 
 // 2026-10-25 12:00 UTC — 05:00 in Los Angeles (PDT, UTC-7: DST ends Nov 1).
 const NOW = Date.UTC(2026, 9, 25, 12, 0);
@@ -200,6 +200,51 @@ describe("classifyUsageLimit — ordinary errors are not limits", () => {
       expect(at(input)).toBeNull();
     });
   }
+});
+
+// Replies a model might write that discuss limits — the audit's false
+// positives when assistant text was read with the generic rules.
+const MODEL_REPLIES = [
+  "The upstream API returned 429 Too Many Requests twice, so I added retries.",
+  "HTTP 429 handler added; tests pass",
+  "You've reached your goal: the rate limit test passes",
+  "Rate limit exceeded errors are now retried with backoff (RESOURCE_EXHAUSTED included).",
+  "I hit the usage limit reached branch in the parser and fixed it.",
+  "You've hit your target — the overloaded_error path is covered.",
+];
+
+describe("classifyCliNotice — CLI-shaped rules only", () => {
+  test("a notice the CLI composes, at the start of the text", () => {
+    expect(classifyCliNotice("You've hit your session limit · resets 3pm (UTC)", { now: NOW })).toEqual({
+      kind: "usage_limit",
+      resetAt: Date.UTC(2026, 9, 25, 15, 0),
+    });
+    expect(classifyCliNotice("You've reached your Fable limit.", { now: NOW })?.kind).toBe("usage_limit");
+    expect(classifyCliNotice("You've hit your team's shared budget. Switch to another model to continue.", { now: NOW })?.kind).toBe("usage_limit");
+    expect(classifyCliNotice(`Claude AI usage limit reached|${Math.floor(NOW / 1000) + 60}`, { now: NOW })?.resetAt).toBe(NOW + 60_000);
+    expect(classifyCliNotice("API Error: Repeated 529 Overloaded errors", { now: NOW })?.kind).toBe("rate_limit");
+    expect(classifyCliNotice("API Error: Request rejected (429) · this may be a temporary capacity issue.", { now: NOW })?.kind).toBe("rate_limit");
+  });
+
+  test("not when it is not the opening of the text", () => {
+    expect(classifyCliNotice("Done. You've hit your session limit · resets 3pm (UTC)", { now: NOW })).toBeNull();
+    expect(classifyCliNotice("The log said API Error: Repeated 529 Overloaded errors", { now: NOW })).toBeNull();
+  });
+
+  test("an API Error that is not a limit is not one", () => {
+    expect(classifyCliNotice("API Error: 401 Invalid API key · Please run /login", { now: NOW })).toBeNull();
+  });
+
+  for (const reply of MODEL_REPLIES) {
+    test(`a model reply is not a notice: ${JSON.stringify(reply)}`, () => {
+      expect(classifyCliNotice(reply, { now: NOW })).toBeNull();
+    });
+  }
+
+  test("the generic openers need the limit noun right after them in the full classifier too", () => {
+    expect(at("You've reached your goal: the rate limit test passes")).toBeNull();
+    expect(at("codex: You've hit your usage limit.")?.kind).toBe("usage_limit");
+  });
 });
 
 describe("CLAUDE_USAGE_LIMIT_PREFIXES", () => {

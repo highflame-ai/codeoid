@@ -307,6 +307,12 @@ export class CodexProvider implements SessionProvider {
    * codex runs the input IT proposed, so a rewrite can't apply (#367).
    */
   readonly appliesToolInputRewrite = false;
+  /**
+   * Autonomous mode is `approvalPolicy: "never"` (approvalPolicyForMode): codex
+   * runs commands and patches without an approval request, so codeoid's tool
+   * budget never sees them.
+   */
+  readonly enforcesToolBudget = false;
   readonly id = "codex";
   readonly displayName = "Codex (OpenAI)";
 
@@ -741,6 +747,11 @@ export class CodexProvider implements SessionProvider {
 
   async dispose(): Promise<void> {
     await this.teardown();
+  }
+
+  async backendProcessIds(): Promise<number[]> {
+    const pid = this.#proc?.pid;
+    return pid ? [pid] : [];
   }
 
   async teardown(): Promise<void> {

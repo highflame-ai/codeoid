@@ -327,6 +327,25 @@ describe("translateSDKMessage – result", () => {
     });
   });
 
+  it("carries the result text of a success-subtype is_error turn as resultText (where the CLI puts a limit notice)", () => {
+    const events = collectEmits({
+      type: "result",
+      subtype: "success",
+      is_error: true,
+      result: "You've hit your session limit · resets 3pm (UTC)",
+      usage: { input_tokens: 0, output_tokens: 0 },
+      modelUsage: {},
+    });
+    const result = (events[0] as { result: { resultText?: string; errorMessage?: string } }).result;
+    expect(result.resultText).toBe("You've hit your session limit · resets 3pm (UTC)");
+    expect(result.errorMessage).toBeUndefined();
+  });
+
+  it("no resultText on a turn that did not fail", () => {
+    const events = collectEmits({ type: "result", subtype: "success", result: "all done", usage: {}, modelUsage: {} });
+    expect((events[0] as { result: { resultText?: string } }).result.resultText).toBeUndefined();
+  });
+
   it("sets errorMessage when subtype is not 'success' and result is set", () => {
     const events = collectEmits({ type: "result", subtype: "error_during_execution", result: "tool failed" });
     expect(events[0]).toMatchObject({ type: "turn_done", result: { errorMessage: "tool failed" } });
@@ -1336,6 +1355,15 @@ describe("translateSDKMessage – rate_limit_event", () => {
       rate_limit_info: { status: "rejected", resetsAt: 1_800_000_000, rateLimitType: "five_hour" },
     });
     expect(events).toEqual([{ type: "rate_limit", status: "rejected", resetsAt: 1_800_000_000_000, limitType: "five_hour" }]);
+  });
+
+  it("flags a rejection that overage is carrying", () => {
+    for (const info of [{ isUsingOverage: true }, { overageInUse: true }, { overageStatus: "allowed" }, { overageStatus: "allowed_warning" }]) {
+      const events = collectEmits({ type: "rate_limit_event", rate_limit_info: { status: "rejected", ...info } });
+      expect(events[0]).toMatchObject({ type: "rate_limit", status: "rejected", overage: true });
+    }
+    const plain = collectEmits({ type: "rate_limit_event", rate_limit_info: { status: "rejected", overageStatus: "rejected" } });
+    expect((plain[0] as { overage?: boolean }).overage).toBeUndefined();
   });
 
   it("emits nothing for a status it doesn't know", () => {

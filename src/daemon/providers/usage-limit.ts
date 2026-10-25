@@ -73,9 +73,14 @@ export const CLAUDE_USAGE_LIMIT_PREFIXES: readonly string[] = [
   "Your seat type doesn't include extra usage",
 ];
 
-/** Openers too generic to trust alone ("You've hit your stride"): they need a limit word after them. */
+/**
+ * Openers too generic to trust alone ("You've hit your stride", "You've
+ * reached your goal: the rate limit test passes"): the limit noun must follow
+ * within four words, as in every completion the CLIs compose — "session
+ * limit", "monthly spend limit", "team's shared budget", "usage limit".
+ */
 const GENERIC_PREFIXES = new Set(["You've hit your", "You've reached your"]);
-const LIMIT_WORD = /\b(?:limit|usage|quota|budget|credits?|spend)\b/i;
+const GENERIC_TAIL = /^\s+(?:[\w'-]+\s+){0,3}(?:limit|budget)\b/i;
 
 /**
  * gemini-cli treats a quota error whose retry delay is at most this as
@@ -221,8 +226,7 @@ function prefixRule(text: string): boolean {
     const at = new RegExp(`(?:^|[:\\]\\n]\\s*)${escapeRegExp(prefix)}`).exec(text);
     if (!at) continue;
     if (!GENERIC_PREFIXES.has(prefix)) return true;
-    const rest = text.slice(at.index + at[0].length).split("\n", 1)[0] ?? "";
-    if (LIMIT_WORD.test(rest)) return true;
+    if (GENERIC_TAIL.test(text.slice(at.index + at[0].length))) return true;
   }
   return false;
 }
@@ -282,6 +286,45 @@ export function classifyUsageLimit(
     ...(resetAt !== undefined ? { resetAt } : {}),
     ...(resolvedProvider ? { provider: resolvedProvider } : {}),
   };
+}
+
+/**
+ * Classify text the CLI may have written AS the turn's reply — Claude's result
+ * text on an errored turn, or the turn's last assistant message — with the
+ * CLI-shaped rules only. That text can just as well be the model's own words
+ * ("the API returned 429 Too Many Requests twice, so I added retries"), so the
+ * generic rate-limit / 429 / quota rules never apply. A notice counts only
+ * when the text OPENS with what the CLI composes:
+ *
+ *   - one of the SDK's USAGE_LIMIT_ERROR_PREFIXES (the generic openers still
+ *     need a limit word on their first line), or the legacy
+ *     "Claude AI usage limit reached";
+ *   - "API Error:" — the CLI's prefix for an API failure it reports as the
+ *     reply — after which the full classifier reads the rest.
+ */
+export function classifyCliNotice(
+  text: string | null | undefined,
+  opts: ClassifyUsageLimitOptions = {},
+): UsageLimitClassification | null {
+  if (!text) return null;
+  const t = normalize(text).trimStart();
+  if (/^API Error:/.test(t)) return classifyUsageLimit(t, opts);
+  if (/^Claude AI usage limit reached/i.test(t) || startsWithLimitPrefix(t)) {
+    const now = opts.now ?? Date.now();
+    const resetAt = parseResetAt(t, now, { texts: [t] });
+    const provider = opts.provider ?? (t.startsWith("Claude AI") ? "claude" : undefined);
+    return { kind: "usage_limit", ...(resetAt !== undefined ? { resetAt } : {}), ...(provider ? { provider } : {}) };
+  }
+  return null;
+}
+
+function startsWithLimitPrefix(t: string): boolean {
+  for (const prefix of CLAUDE_USAGE_LIMIT_PREFIXES) {
+    if (!t.startsWith(prefix)) continue;
+    if (!GENERIC_PREFIXES.has(prefix)) return true;
+    if (GENERIC_TAIL.test(t.slice(prefix.length))) return true;
+  }
+  return false;
 }
 
 // ── Reset time ────────────────────────────────────────────────────────────────

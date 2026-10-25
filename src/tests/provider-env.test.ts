@@ -185,7 +185,7 @@ describe("extraEnv denylist (SessionCreateOptions.extraEnv)", () => {
   const DENIED = [
     "HOME", "USER", "LOGNAME", "PATH", "SHELL", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
     "NODE_OPTIONS", "NODE_PATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
-    "HTTPS_PROXY", "https_proxy", "NODE_EXTRA_CA_CERTS", "NODE_TLS_REJECT_UNAUTHORIZED", "SSL_CERT_FILE",
+    "HTTPS_PROXY", "NODE_EXTRA_CA_CERTS", "NODE_TLS_REJECT_UNAUTHORIZED", "SSL_CERT_FILE",
     "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS",
     "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_USE_BEDROCK",
     "AWS_BEARER_TOKEN_BEDROCK", "AWS_PROFILE", "OTEL_EXPORTER_OTLP_ENDPOINT",
@@ -193,26 +193,43 @@ describe("extraEnv denylist (SessionCreateOptions.extraEnv)", () => {
     "GEMINI_API_KEY", "GEMINI_CLI_HOME", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT", "CODE_ASSIST_ENDPOINT",
     "QWEN_HOME", "DASHSCOPE_API_KEY", "BAILIAN_API_KEY", "PI_CODING_AGENT_DIR",
     "CODEOID_API_KEY", "CODEOID_AGENT_ENV_ALLOW", "CODEOID_MEMORY_TOKEN", "ZEROID_URL", "TELEGRAM_BOT_TOKEN",
-    "GROQ_API_KEY", "MISTRAL_API_TOKEN", "SOME_AUTH_TOKEN", "VENDOR_ACCESS_TOKEN", "vendor_api_key",
+    "GROQ_API_KEY", "MISTRAL_API_TOKEN", "SOME_AUTH_TOKEN", "VENDOR_ACCESS_TOKEN",
+    // Tool configuration that can run code, and runtime knobs.
+    "RIPGREP_CONFIG_PATH", "BASH_ENV", "ENV", "PROMPT_COMMAND", "PAGER", "GIT_PAGER", "LESSOPEN", "LESSCLOSE",
+    "EDITOR", "VISUAL", "GCONV_PATH", "RUST_LOG", "RUST_BACKTRACE", "TMPDIR", "TEMP", "TMP", "TZ",
+    "GIT_CONFIG_GLOBAL", "GIT_SSH_COMMAND", "NPM_CONFIG_USERCONFIG", "PYTHONPATH", "PYTHONSTARTUP", "RUBYOPT", "RUBYLIB",
+    "PERL5LIB", "PERL5OPT", "PERL_MB_OPT", "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS", "CLOUDSDK_CONFIG", "LC_ALL",
   ];
-  const ALLOWED = ["LOOP_RUN_ID", "DATABASE_URL", "CI", "NODE_ENV", "RUST_LOG", "GITHUB_TOKEN", "TZ", "LANG", "MY_FLAG"];
+  const ALLOWED = ["LOOP_RUN_ID", "DATABASE_URL", "CI", "NODE_ENV", "GITHUB_TOKEN", "LANG", "MY_FLAG", "X"];
 
   it("refuses every denylisted key and none of the ordinary ones", () => {
     const extra = Object.fromEntries([...DENIED, ...ALLOWED].map((k) => [k, "x"]));
     expect(extraEnvViolations(extra).sort()).toEqual([...DENIED].sort());
   });
 
-  it("refuses malformed names and values", () => {
-    expect(extraEnvViolations({ "BAD-NAME": "x", "1X": "x", OK: "x", NUL: "a\0b", NUM: 1 as unknown as string })).toEqual([
-      "BAD-NAME", "1X", "NUL", "NUM",
-    ]);
+  it("refuses malformed names and values, and every lower-case or over-long name", () => {
+    expect(
+      extraEnvViolations({
+        "BAD-NAME": "x",
+        "1X": "x",
+        OK: "x",
+        NUL: "a\0b",
+        NUM: 1 as unknown as string,
+        http_proxy: "x",
+        npm_config_registry: "x",
+        Mixed_Case: "x",
+        _LEADING: "x",
+        ["A".repeat(65)]: "x",
+        ["A".repeat(64)]: "x",
+      }),
+    ).toEqual(["BAD-NAME", "1X", "NUL", "NUM", "http_proxy", "npm_config_registry", "Mixed_Case", "_LEADING", "A".repeat(65)]);
   });
 
   it("withExtraEnv merges allowed keys over the built env and keeps codeoid's value for refused ones", () => {
-    const built = { PATH: "/usr/bin", HOME: "/home/u", ANTHROPIC_API_KEY: "ant-key", TZ: "UTC" };
-    const merged = withExtraEnv(built, { PATH: "/evil", HOME: "/evil", ANTHROPIC_API_KEY: "evil", TZ: "Asia/Kolkata", LOOP_RUN_ID: "r1" });
-    expect(merged).toEqual({ PATH: "/usr/bin", HOME: "/home/u", ANTHROPIC_API_KEY: "ant-key", TZ: "Asia/Kolkata", LOOP_RUN_ID: "r1" });
-    expect(built.TZ).toBe("UTC"); // pure
+    const built = { PATH: "/usr/bin", HOME: "/home/u", ANTHROPIC_API_KEY: "ant-key", TZ: "UTC", LOOP_FLAG: "a" };
+    const merged = withExtraEnv(built, { PATH: "/evil", HOME: "/evil", ANTHROPIC_API_KEY: "evil", TZ: "Asia/Kolkata", LOOP_FLAG: "b", LOOP_RUN_ID: "r1" });
+    expect(merged).toEqual({ PATH: "/usr/bin", HOME: "/home/u", ANTHROPIC_API_KEY: "ant-key", TZ: "UTC", LOOP_FLAG: "b", LOOP_RUN_ID: "r1" });
+    expect(built.LOOP_FLAG).toBe("a"); // pure
     expect(withExtraEnv(built, undefined)).toBe(built);
   });
 

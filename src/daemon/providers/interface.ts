@@ -204,6 +204,13 @@ export interface NormalizedTurnResult {
   isError?: boolean;
   errorMessage?: string;
   /**
+   * The backend's own result text for a turn it flagged as an error without
+   * an error subtype (Claude: `subtype: "success"`, `is_error: true`) — where
+   * the CLI puts a usage-limit or "API Error: …" notice. Text the CLI wrote,
+   * possibly the model's: read only with CLI-shaped rules (classifyCliNotice).
+   */
+  resultText?: string;
+  /**
    * Where this turn ends in the backend's OWN record of the conversation, for
    * a backend that can later fork or resume from that point natively (#387).
    * Stamped on the canonical turn, so a fork, rewind or restart can continue
@@ -342,7 +349,14 @@ export type ProviderEvent =
    * `resetsAt` (epoch ms) — the exact reset a usage-limit error's text often
    * gives only as a wall-clock time. Observational: nothing retries on it.
    */
-  | { type: "rate_limit"; status: "allowed" | "allowed_warning" | "rejected"; resetsAt?: number; limitType?: string }
+  | {
+      type: "rate_limit";
+      status: "allowed" | "allowed_warning" | "rejected";
+      resetsAt?: number;
+      limitType?: string;
+      /** Extra usage (overage) is carrying requests past the spent window — nothing is refused. */
+      overage?: boolean;
+    }
   | { type: "tool_progress"; toolName?: string; elapsedSeconds?: number }
   /**
    * Provider-authored standalone message — extension output, status cards,
@@ -668,6 +682,22 @@ export interface AgentProvider {
    * applies the new input to what it actually executes.
    */
   readonly appliesToolInputRewrite?: boolean;
+  /**
+   * False when, in autonomous mode, the backend runs tool calls WITHOUT
+   * asking canUseTool — so codeoid's autonomous tool budget (and
+   * `onBudgetExhausted`) cannot see, count or stop them. Codex: autonomous
+   * maps to `approvalPolicy: "never"`. Absent = true (every call is gated).
+   * A loop controller falls back to wall-time limits (supervisor.ts) there.
+   */
+  readonly enforcesToolBudget?: boolean;
+  /**
+   * Pids of the processes this backend spawned itself (its CLI / app-server)
+   * that are alive now. Session.terminateBackend snapshots their whole tree
+   * before the teardown and kills what outlives it (process-tree.ts). Absent
+   * or empty = unknown (in-process backends; qwen-code, whose SDK spawns
+   * internally): only the teardown runs.
+   */
+  backendProcessIds?(): Promise<number[]>;
   dispose(): Promise<void>;
 }
 

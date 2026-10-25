@@ -67,6 +67,7 @@ import { BUDGET_STOP_MESSAGE, isBackgroundLifecycleEvent } from "../interface.js
 import { isUngrantableSkillCommand, redactCommand } from "../../skill-command.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
 import { buildSubprocessEnv, withExtraEnv, withGatewayCredential } from "../env.js";
+import { listProcesses } from "../../process-tree.js";
 import type { LLMCallUsage } from "../../context-math.js";
 import type { PackSubagent } from "../../pipeline/subagents.js";
 
@@ -237,6 +238,8 @@ export class ClaudeProvider implements SessionProvider {
 
   // Claude-specific backing-session state
   #claudeCodeSessionId: string;
+  /** The backing id the live query's CLI was spawned with (backendProcessIds). */
+  #spawnedWithId: string | null = null;
   #hasQueried = false;
   #backingRecoveryAttempted = false;
   #lastPushedContent: string | null = null;
@@ -646,6 +649,19 @@ export class ClaudeProvider implements SessionProvider {
     await this.teardown();
   }
 
+  /**
+   * The Claude Code CLI this provider's query runs in. The SDK spawns it
+   * (spawnClaudeCodeProcess is not used: replacing the SDK's spawn would drop
+   * its stderr diagnostics), so it is found as a direct child of this process
+   * whose argv names this provider's backing session (`--resume=<id>` /
+   * `--session-id <id>` — ids are UUIDs, unique per session).
+   */
+  async backendProcessIds(): Promise<number[]> {
+    if (!this.#query) return [];
+    const id = this.#spawnedWithId ?? this.#claudeCodeSessionId;
+    return (await listProcesses()).filter((p) => p.ppid === process.pid && p.args.includes(id)).map((p) => p.pid);
+  }
+
   async teardown(): Promise<void> {
     this.#inputQueue?.close();
     this.#abortController?.abort();
@@ -831,6 +847,8 @@ export class ClaudeProvider implements SessionProvider {
     const sessionOpts = this.#hasQueried
       ? { resume: this.#claudeCodeSessionId }
       : { sessionId: this.#claudeCodeSessionId };
+    // What this query's CLI was started with — its argv names it (backendProcessIds).
+    this.#spawnedWithId = this.#claudeCodeSessionId;
 
     const merged = this.#mcpServerSet(opts, oauthMcp);
     const mcpServers = Object.keys(merged).length > 0 ? merged : undefined;
@@ -1751,6 +1769,11 @@ export function translateSDKMessage(
           // Only a turn that completed is a point to fork at: an errored one
           // (a context overflow) would carry the failure into the fork, and an
           // interrupted one can end mid tool call.
+          // A turn the CLI ends "successfully" but flagged as an error carries
+          // its notice (a usage limit, "API Error: …") as the result text.
+          ...(r.is_error && r.subtype === "success" && typeof r.result === "string" && r.result
+            ? { resultText: r.result }
+            : {}),
           ...(sessionId && chainEnd && !zeroTurn && r.subtype === "success" && !r.is_error
             ? { nativeRef: { backingId: sessionId, ref: chainEnd, ...(state.cwd ? { dir: state.cwd } : {}) } }
             : {}),
@@ -1890,12 +1913,29 @@ export function translateSDKMessage(
       case "rate_limit_event": {
         // SDKRateLimitInfo.resetsAt is epoch SECONDS (the CLI renders it with
         // `new Date(resetsAt * 1000)`); ProviderEvent carries milliseconds.
-        const info = (msg as { rate_limit_info?: { status?: string; resetsAt?: number; rateLimitType?: string } }).rate_limit_info;
+        const info = (msg as {
+          rate_limit_info?: {
+            status?: string;
+            resetsAt?: number;
+            rateLimitType?: string;
+            isUsingOverage?: boolean;
+            overageInUse?: boolean;
+            overageStatus?: string;
+          };
+        }).rate_limit_info;
         const status = info?.status;
         if (status !== "allowed" && status !== "allowed_warning" && status !== "rejected") break;
+        // The plan window is spent but extra usage (overage) is carrying the
+        // requests: not a limit that stops the turn.
+        const overage =
+          info?.isUsingOverage === true ||
+          info?.overageInUse === true ||
+          info?.overageStatus === "allowed" ||
+          info?.overageStatus === "allowed_warning";
         emit({
           type: "rate_limit",
           status,
+          ...(overage ? { overage: true } : {}),
           ...(typeof info?.resetsAt === "number" && info.resetsAt > 0 ? { resetsAt: info.resetsAt * 1000 } : {}),
           ...(info?.rateLimitType ? { limitType: info.rateLimitType } : {}),
         });

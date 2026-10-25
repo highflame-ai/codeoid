@@ -29,7 +29,7 @@ export interface SupervisedSession {
   /** A queued send is about to start a turn — not settled even when idle. */
   readonly preparingTurn: boolean;
   interrupt(sender: AuthContext): Promise<void>;
-  terminateBackend(sender: AuthContext, reason: string): Promise<void>;
+  terminateBackend(sender: AuthContext, reason: string, opts?: { teardownTimeoutMs?: number }): Promise<void>;
 }
 
 export interface DeadlineOptions {
@@ -39,6 +39,8 @@ export interface DeadlineOptions {
   graceMs: number;
   /** Who the interrupt and termination are audited as. Default `system:supervisor` in the session's tenant. */
   sender?: AuthContext;
+  /** Bound on the backend's teardown when it is killed (Session default 10s), so `expired` cannot hang. */
+  teardownTimeoutMs?: number;
   /** How often the grace period re-checks for a settled session. Default 100ms (bounded by graceMs). */
   pollMs?: number;
   /** Observes each step (logging, tests). Exceptions are swallowed. */
@@ -114,7 +116,11 @@ export function supervise(session: SupervisedSession, opts: DeadlineOptions): De
     if (done) return;
     note({ type: "terminated", sessionId: session.id });
     session
-      .terminateBackend(sender, `attempt wall time of ${Math.round(wallMs / 1000)}s ran out and it did not stop within ${Math.round(graceMs / 1000)}s`)
+      .terminateBackend(
+        sender,
+        `attempt wall time of ${Math.round(wallMs / 1000)}s ran out and it did not stop within ${Math.round(graceMs / 1000)}s`,
+        opts.teardownTimeoutMs !== undefined ? { teardownTimeoutMs: opts.teardownTimeoutMs } : {},
+      )
       .catch((e) => {
         console.error(`[codeoid/supervisor] terminating session ${session.id} failed: ${e instanceof Error ? e.message : String(e)}`);
       })

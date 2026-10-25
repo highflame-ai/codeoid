@@ -252,6 +252,11 @@ export class GeminiAcpProvider implements SessionProvider {
     await this.teardown();
   }
 
+  async backendProcessIds(): Promise<number[]> {
+    const pid = this.#proc?.pid;
+    return pid ? [pid] : [];
+  }
+
   async teardown(): Promise<void> {
     this.#turnQueue?.close();
     this.#turnQueue = null;
