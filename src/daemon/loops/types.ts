@@ -26,6 +26,41 @@ export interface LoopLimits {
   runMinutes: number;
 }
 
+/**
+ * The repository event that started a run (§4 "two entry points"), when a
+ * watch started it rather than a person. `summary` is event text — a check's
+ * output, a comment's body — and only ever reaches a worker as data.
+ */
+export interface LoopTrigger {
+  kind: "ci_failure" | "review_comment";
+  /** Dedupe key of the event, e.g. `ci:acme/shop:<sha>:<checkRunId>:1`. */
+  key: string;
+  /** The watch that saw it. */
+  watchId?: string;
+  /** Where the event is on GitHub (the check run, the comment). */
+  url?: string;
+  summary: string;
+}
+
+/**
+ * Base the run's worktree on this commit instead of the user's checkout: a
+ * triggered run repairs the branch the event happened on.
+ */
+export interface LoopBaseRef {
+  /** Full commit id. */
+  sha: string;
+  /** The branch it is the head of, for display. */
+  branch?: string;
+  /** The github.com repository (`owner/name`) to fetch it from when it isn't local. */
+  repo?: string;
+  /** What to fetch when the commit isn't local, e.g. `refs/pull/12/head`. */
+  fetchRef?: string;
+  /** Every commit past the default branch is by someone the owner trusts
+   *  (a watch checked). Only then does the setup recipe copy the owner's
+   *  files next to a commit that isn't on their checkout's history. */
+  trusted?: boolean;
+}
+
 /** The run's rules, fixed at start (§4). */
 export interface LoopContract {
   /** The only recipe so far: reproduce a failing check, repair, verify. */
@@ -38,6 +73,10 @@ export interface LoopContract {
   /** Autonomous tool calls per attempt. Past it the attempt ends; the run decides what's next. */
   toolBudget: number;
   limits: LoopLimits;
+  /** Work from this commit, not the user's checkout (set by watches only). */
+  baseRef?: LoopBaseRef;
+  /** The event that started the run (set by watches only). */
+  trigger?: LoopTrigger;
 }
 
 /**
@@ -219,4 +258,6 @@ export const LOOP_LIMITS = {
   ACTIVE_RUNS_PER_OWNER: 3,
   REPORT_SUMMARY_MAX: 4_000,
   REPORT_DETAIL_MAX: 4_000,
+  /** Event text a trigger carries into a run. */
+  TRIGGER_SUMMARY_MAX: 4_000,
 } as const;

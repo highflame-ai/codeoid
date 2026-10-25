@@ -405,6 +405,14 @@ const fleet: SettingsTab = {
       ],
     },
     {
+      id: "loops",
+      title: "Loops",
+      description: "Runs that pursue an objective until the daemon's own checks pass (docs/loops.md). Watches start repair runs from failing CI checks and review comments.",
+      fields: [
+        cfg("loops.watchPollSeconds", "Watch poll interval (s)", "How often loop watches read GitHub for failing checks and review comments.", { kind: "int", min: 60, max: 86400, default: 300, advanced: true }),
+      ],
+    },
+    {
       id: "mcp-control",
       title: "External control (MCP)",
       description: "Let outside agents (Claude Code, Cursor, CI) drive sessions through `/mcp/control`. Every call is scope-checked and audited under the caller's identity.",

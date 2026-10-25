@@ -61,7 +61,7 @@ import {
   scheduleFromFlags,
   specFromFlags,
 } from "./terminal/routine-format.js";
-import { formatLoop, formatLoopRow, parseCheckFlag } from "./terminal/loop-format.js";
+import { formatLoop, formatLoopRow, formatWatch, formatWatchRow, parseCheckFlag, parseCiFlag } from "./terminal/loop-format.js";
 import {
   getConfigDir,
   getLocalTokenPath,
@@ -1683,6 +1683,171 @@ loop
       console.log(formatLoopRow(res.run));
     }),
   );
+
+// ── Loop watches: repository events start repair runs (docs/loops.md) ───────
+
+const watch = loop
+  .command("watch")
+  .description("Start repair runs from failing CI checks and review comments on your branches (docs/loops.md#watches)");
+
+watch
+  .command("add")
+  .description("Watch a repository's branches (or your open PRs) for failing CI checks, and optionally review comments")
+  .requiredOption("--workdir <dir>", "The repository; its origin remote must be on github.com")
+  .option("--branch <b>", "A branch to watch (repeatable)", collect, [])
+  .option("--my-prs", "Watch the heads of your open pull requests instead")
+  .option(
+    "--ci <map>",
+    "`<check name>: <command>` — a CI check (exact or glob) and the local command that reproduces it; `<name>@<app>: …` for a check another GitHub App reports (default github-actions) (repeatable)",
+    collect,
+    [],
+  )
+  .option("--test", "The mapped commands are test runs: running no tests does not pass")
+  .option("--review", "Also start a run for a PR comment that mentions codeoid")
+  .option("--allow <login>", "GitHub login whose comments count (repeatable; default: you, as gh is signed in)", collect, [])
+  .option("--mention <token>", "The token a comment must contain (default @codeoid)")
+  .option("--trust <login>", "Another GitHub login whose commits may be on a head the watch runs (repeatable; you are always trusted)", collect, [])
+  .option("--per-hour <n>", "Runs the watch may start per hour (default 6)")
+  .option("--attempts <n>", "Worker attempts per run (default 3)")
+  .option("--budget <n>", "Autonomous tool calls per attempt (default 60)")
+  .option("--provider <id>", "Backend for the runs' workers")
+  .option("--model <id>", "Model for the runs' workers")
+  .action(
+    (f: {
+      workdir: string;
+      branch: string[];
+      myPrs?: boolean;
+      ci: string[];
+      test?: boolean;
+      review?: boolean;
+      allow: string[];
+      mention?: string;
+      trust: string[];
+      perHour?: string;
+      attempts?: string;
+      budget?: string;
+      provider?: string;
+      model?: string;
+    }) =>
+      withClient(async (c) => {
+        const fail = (m: string): void => {
+          console.error(m);
+          process.exitCode = 1;
+        };
+        if ((f.branch.length > 0) === (f.myPrs === true)) return fail("Give --branch (one or more) or --my-prs, not both.");
+        if (f.ci.length === 0) return fail('Give at least one --ci "<check name>: <command>".');
+        const ci = [];
+        for (const raw of f.ci) {
+          const m = parseCiFlag(raw);
+          if (!m) return fail(`--ci ${JSON.stringify(raw)}: expected "<check name>: <command>".`);
+          ci.push({ ...m, ...(f.test ? { expectTests: true } : {}) });
+        }
+        const int = (v: string) => Number.parseInt(v, 10);
+        const res = await c.request({
+          type: "loop.watch.create",
+          id: randomUUID(),
+          spec: {
+            workdir: resolve(f.workdir),
+            ...(f.myPrs ? { myPrs: true } : { branches: f.branch }),
+            ci,
+            ...(f.review || f.allow.length > 0 || f.mention
+              ? { review: { enabled: true, ...(f.allow.length > 0 ? { allow: f.allow } : {}), ...(f.mention ? { mention: f.mention } : {}) } }
+              : {}),
+            ...(f.trust.length > 0 ? { trust: f.trust } : {}),
+            ...(f.perHour ? { maxRunsPerHour: int(f.perHour) } : {}),
+            ...(f.attempts ? { limits: { attempts: int(f.attempts) } } : {}),
+            ...(f.budget ? { toolBudget: int(f.budget) } : {}),
+            ...(f.provider ? { provider: f.provider } : {}),
+            ...(f.model ? { model: f.model } : {}),
+          },
+        });
+        if (res.type !== "loop.watch.snapshot") return c.printError(res);
+        console.log(formatWatch(res.watch).join("\n"));
+      }),
+  );
+
+watch
+  .command("ls")
+  .description("Your loop watches")
+  .action(() =>
+    withClient(async (c) => {
+      const res = await c.request({ type: "loop.watch.list", id: randomUUID() });
+      if (res.type !== "loop.watch.list.result") return c.printError(res);
+      if (res.watches.length === 0) console.log("No loop watches.");
+      for (const w of res.watches) console.log(formatWatchRow(w));
+    }),
+  );
+
+watch
+  .command("show <watchId>")
+  .description("A watch's rules, its last poll, and the events it acted on")
+  .action((ref: string) =>
+    withClient(async (c) => {
+      const id = await resolveWatchId(c, ref);
+      if (!id) return;
+      const res = await c.request({ type: "loop.watch.get", id: randomUUID(), watchId: id });
+      if (res.type !== "loop.watch.snapshot") return c.printError(res);
+      console.log(formatWatch(res.watch, res.triggers).join("\n"));
+    }),
+  );
+
+for (const [verb, enabled] of [["pause", false], ["resume", true]] as const) {
+  watch
+    .command(`${verb} <watchId>`)
+    .description(enabled ? "Start polling again" : "Stop polling (runs it started carry on)")
+    .action((ref: string) =>
+      withClient(async (c) => {
+        const id = await resolveWatchId(c, ref);
+        if (!id) return;
+        const res = await c.request({ type: "loop.watch.update", id: randomUUID(), watchId: id, enabled });
+        if (res.type !== "loop.watch.snapshot") return c.printError(res);
+        console.log(formatWatchRow(res.watch));
+      }),
+    );
+}
+
+watch
+  .command("rm <watchId>")
+  .description("Delete a watch (runs it started carry on)")
+  .action((ref: string) =>
+    withClient(async (c) => {
+      const id = await resolveWatchId(c, ref);
+      if (!id) return;
+      const res = await c.request({ type: "loop.watch.delete", id: randomUUID(), watchId: id });
+      if (res.type !== "response.ok") return c.printError(res);
+      console.log(`Deleted ${id}.`);
+    }),
+  );
+
+watch
+  .command("poll <watchId>")
+  .description("Poll now instead of at the next interval")
+  .action((ref: string) =>
+    withClient(async (c) => {
+      const id = await resolveWatchId(c, ref);
+      if (!id) return;
+      const res = await c.request({ type: "loop.watch.poll", id: randomUUID(), watchId: id });
+      if (res.type !== "loop.watch.snapshot") return c.printError(res);
+      const started = res.poll?.started ?? [];
+      console.log(started.length === 0 ? "No run started." : `Started ${started.join(", ")} (codeoid loop show <id>).`);
+      for (const s of res.poll?.skipped ?? []) console.log(`  skipped: ${s}`);
+    }),
+  );
+
+/** A watch id from a full id or an unambiguous prefix of the owner's watches. */
+async function resolveWatchId(c: Parameters<Parameters<typeof withClient>[0]>[0], ref: string): Promise<string | null> {
+  if (/^lw_[0-9a-f-]{36}$/.test(ref)) return ref;
+  const res = await c.request({ type: "loop.watch.list", id: randomUUID() });
+  if (res.type !== "loop.watch.list.result") {
+    c.printError(res);
+    return null;
+  }
+  const hits = res.watches.filter((w) => w.id.startsWith(ref) || w.id.startsWith(`lw_${ref}`));
+  if (hits.length === 1) return hits[0]!.id;
+  console.error(hits.length === 0 ? `No loop watch matches "${ref}".` : `"${ref}" matches ${hits.length} watches; give more of the id.`);
+  process.exitCode = 1;
+  return null;
+}
 
 /** A run id from a full id or an unambiguous prefix of the owner's runs. */
 async function resolveLoopId(c: Parameters<Parameters<typeof withClient>[0]>[0], ref: string): Promise<string | null> {

@@ -52,18 +52,24 @@ const SAFE_DRIVER_NAME = /^[A-Za-z0-9._-]{1,100}$/;
  * apart (a `-c key=value` splits at the first `=`, so a driver whose name holds
  * one would survive it). A driver name we can't be sure to override fails the
  * command closed. git gets git-env.ts's environment: never the daemon's
- * credentials, no network, no replace refs.
+ * credentials, no replace refs, and no network — unless `network` names the
+ * one protocol it may use (a loop watch's fetch, which runs in a repository
+ * the daemon made, never yours: loops/host.ts ensureCommit).
  */
 export async function hardenedGit(
   args: string[],
   cwd: string,
   extraEnv: Record<string, string> = {},
-  opts: { timeoutMs?: number; maxBuffer?: number; input?: string } = {},
+  opts: { timeoutMs?: number; maxBuffer?: number; input?: string | Buffer; network?: "https" | "file" } = {},
 ): Promise<string> {
-  const base = gitEnv({ LANG: "C", GIT_CONFIG_NOSYSTEM: "1", ...extraEnv });
+  const base = {
+    ...gitEnv({ LANG: "C", GIT_CONFIG_NOSYSTEM: "1", ...extraEnv }, { network: opts.network !== undefined }),
+    // Outranks any protocol.* config: this protocol and no other.
+    ...(opts.network !== undefined ? { GIT_ALLOW_PROTOCOL: opts.network } : {}),
+  };
   const timeout = opts.timeoutMs ?? 60_000;
   const maxBuffer = opts.maxBuffer ?? 16 * 1024 * 1024;
-  const run = async (a: string[], env: Record<string, string>, input?: string): Promise<string> => {
+  const run = async (a: string[], env: Record<string, string>, input?: string | Buffer): Promise<string> => {
     if (input === undefined) return (await execFileAsync(GIT_BIN, a, { cwd, env, timeout, maxBuffer })).stdout;
     return new Promise((res, rej) => {
       const child = execFile(GIT_BIN, a, { cwd, env, timeout, maxBuffer }, (err, stdout) => (err ? rej(err) : res(stdout)));

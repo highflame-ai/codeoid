@@ -1,7 +1,15 @@
 /** Loop runs, attempts, and events on the wire (packages/protocol/src/loops.ts). */
 
-import type { LoopAttemptWire, LoopEventWire, LoopRunWire } from "../../protocol/types.js";
+import type {
+  LoopAttemptWire,
+  LoopEventWire,
+  LoopRunWire,
+  LoopWatchTriggerWire,
+  LoopWatchWire,
+} from "../../protocol/types.js";
 import { APPROVAL_WAIT, type LoopAttemptRow, type LoopEventRow, type LoopRunRow } from "./types.js";
+import { WATCH_DEFAULTS } from "./watch-service.js";
+import type { TriggerRow, WatchRow } from "./watch-store.js";
 
 const iso = (ms: number | null): string | null => (ms === null ? null : new Date(ms).toISOString());
 
@@ -32,6 +40,46 @@ export function runToWire(r: LoopRunRow, attempts: number): LoopRunWire {
     createdAt: new Date(r.createdAt).toISOString(),
     updatedAt: new Date(r.updatedAt).toISOString(),
     endedAt: iso(r.endedAt),
+    ...(r.contract.baseRef
+      ? { baseRef: { sha: r.contract.baseRef.sha, ...(r.contract.baseRef.branch ? { branch: r.contract.baseRef.branch } : {}) } }
+      : {}),
+    ...(r.contract.trigger ? { trigger: { ...r.contract.trigger } } : {}),
+  };
+}
+
+export function watchToWire(w: WatchRow): LoopWatchWire {
+  return {
+    id: w.id,
+    workdir: w.workdir,
+    repo: w.repo,
+    branches: w.spec.branches,
+    myPrs: w.spec.myPrs,
+    ci: w.spec.ci.map((c) => ({ ...c, app: c.app ?? WATCH_DEFAULTS.ciApp })),
+    review: w.spec.review,
+    ghLogin: w.spec.ghLogin ?? null,
+    trust: w.spec.trust ?? [],
+    ...(w.spec.provider ? { provider: w.spec.provider } : {}),
+    ...(w.spec.model ? { model: w.spec.model } : {}),
+    ...(w.spec.toolBudget !== undefined ? { toolBudget: w.spec.toolBudget } : {}),
+    ...(w.spec.limits ? { limits: w.spec.limits } : {}),
+    maxRunsPerHour: w.spec.maxRunsPerHour,
+    enabled: w.enabled,
+    lastPolledAt: iso(w.lastPolledAt),
+    lastError: w.lastError,
+    createdAt: new Date(w.createdAt).toISOString(),
+    updatedAt: new Date(w.updatedAt).toISOString(),
+  };
+}
+
+export function triggerToWire(t: TriggerRow): LoopWatchTriggerWire {
+  return {
+    key: t.key,
+    kind: t.kind,
+    branch: t.branch,
+    runId: t.runId,
+    outcome: t.outcome,
+    note: t.note,
+    createdAt: new Date(t.createdAt).toISOString(),
   };
 }
 

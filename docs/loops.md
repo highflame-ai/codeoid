@@ -4,7 +4,7 @@ A loop pursues one objective until the daemon's own checks pass, then hands you 
 The worker agent never decides that it is done: it can only ask for verification, and the daemon runs the checks itself and records what they did.
 
 Design and roadmap: [loop-engineering-design.md](loop-engineering-design.md).
-This page covers what ships today: the **repair** recipe, started by hand.
+This page covers what ships today: the **repair** recipe, started by hand or by a [watch](#watches) when CI fails or a reviewer asks.
 
 ## Start a repair
 
@@ -95,6 +95,102 @@ After a daemon restart the run continues with a new worker session, which is tol
 | `blocked` | The run can't make progress without you: the checks already passed, two attempts in a row changed nothing, the checks passed with the tracked files unchanged, or the worker reported that the objective conflicts with the checks (with the conflict). |
 | `failed` | Something outside the work went wrong: the worktree couldn't be prepared, a check couldn't run on the unmodified code, or the result couldn't be committed. |
 | `cancelled` | You stopped it. |
+
+## Watches
+
+A watch starts repair runs for you from repository events: a CI check that failed on a branch you watch, or a pull request comment that asks codeoid for a change.
+It is opt-in, yours alone, and reads GitHub through the `gh` CLI you are already signed in to.
+
+**A watch runs the code at your branch heads, unattended.**
+A run's checks execute that code, and so does the worker.
+What bounds it is the [trust rule](#who-a-watch-trusts): a head starts a run only when every commit on it past the default branch was written by you, or by someone you named.
+
+```bash
+codeoid loop watch add --workdir ~/src/shop --my-prs \
+  --ci "test (*): bun test" --test \
+  --ci "typecheck: bun run typecheck" \
+  --review
+codeoid loop watch ls
+codeoid loop watch show <id>          # its rules, last poll, and the events it acted on
+codeoid loop watch poll <id>          # poll now instead of waiting
+codeoid loop watch pause <id>         # stop polling; runs it started carry on
+codeoid loop watch resume <id>
+codeoid loop watch rm <id>
+```
+
+The repository is read from the workdir's `origin` remote when the watch is made, and must be on github.com.
+`--branch <b>` (repeatable) watches named branches; `--my-prs` watches the heads of your open pull requests instead, the newest 30 on each poll.
+`--ci "<check name>: <command>"` maps a check's name on GitHub, exact or a glob with `*` and `?`, to the local command that reproduces it; a failing check with no mapping starts nothing.
+A mapping matches only check runs that GitHub Actions reported: any GitHub App with checks access can post a check run under any name, so the name alone isn't enough.
+For a check another app reports, name the app's slug after the check name: `--ci "lint@circleci-checks: bun run lint"`.
+Every watch needs at least one mapping, because the mapped commands are the run's checks.
+Commit statuses (the older API some CI systems still use) are not read; only check runs are.
+
+### Who a watch trusts
+
+When you make a watch it reads the login `gh` is signed in as, and keeps it: that is you.
+`--trust <login>` (repeatable, at most 20) names other people whose commits a head may carry.
+
+Before a run starts, the watch reads every commit between the default branch and the head (at most 250).
+Each must be authored by a trusted login and committed by one.
+A commit committed by `web-flow` counts when its author is trusted: that is GitHub's merge and update-branch buttons.
+A commit GitHub can't tie to an account, more than 250 commits, or anyone else, and the head is ignored for good: `show` lists it as ignored, "commits by someone you don't trust", and a later poll doesn't ask again.
+Changing a watch's trust list (`loop.watch.update`) judges its ignored heads again.
+
+### What starts a run
+
+- **A failing check.** A check run on a watched branch's head that completed as `failure` or `timed_out` and matches a mapping.
+  The watch waits until every mapped check run on that head has finished, then starts one run for the head.
+  Its checks are every mapped command whose check ran on the head: the failing ones are what it repairs, the passing ones what it must keep passing.
+  A check already failing when you add the watch counts: the branch is red now.
+- **A review comment** (with `--review`). A comment on one of your open pull requests — on a line, on the conversation, or a review's own text — that contains `@codeoid` (`--mention` to change it), is by an allowed author, and was made after the watch was created or last resumed.
+  Comments made while a watch was paused don't start runs when you resume it.
+  Up to two minutes of clock difference between GitHub and your machine is allowed on that comparison.
+  Allowed authors default to the account `gh` is signed in as; `--allow <login>` names others.
+  Only what the author wrote themselves counts, and only that reaches the run: quoted lines (`>`), code, and HTML comments are left out, so quoting someone else's `@codeoid …` asks for nothing.
+
+### What a triggered run works on
+
+- Its worktree is a clean checkout of the branch head the event happened on, never your current checkout and never your uncommitted changes.
+- A head that isn't in your repository is fetched from `https://github.com/<repo>.git` by URL, not through `origin`, and not in your repository at all: into one the daemon makes for the fetch under its own directory, which borrows your repository's objects so only what's missing is downloaded.
+  Your repository's configuration, which an agent can write, has no say over where the fetch goes or what it presents (no url rewrite, proxy, TLS setting, or credential helper of yours applies).
+  The fetch's own configuration is the only one: no global or system config, https only, no ssh or proxy command, and `gh auth git-credential` as the only credential helper, so private repositories work with the login the watch already uses.
+  This is the only git the daemon runs with the network on; what it fetched is then added to your repository's objects offline, by the same hardened git as every other loop step.
+  A failed fetch says why in the run's reason.
+  A run whose workspace couldn't be prepared gives its event back, and the watch tries it again on later polls, three times in all.
+- The delivered commit sits on the run's own `codeoid/loop-…` branch, on top of that head; push it to the pull request yourself.
+- A repository's [setup recipe](CONFIGURATION.md) copies its files (such as `.env`) into the worktree, because the head passed the trust rule.
+  Its trusted setup command does not run on a commit that isn't on your checkout's history, such as most pull request heads; the run's history says so, and the checks then run without what that command would have installed.
+- `codeoid loop show` names what started a run, with a link to the check or the comment.
+- A review comment's run whose worker changed nothing ends `blocked` and says so.
+
+### How a watch stays bounded
+
+- Each event starts at most one run, across all of your watches: its key (the commit and check run, or the comment and its kind) is recorded with the run it started, and stays recorded when the watch is deleted.
+- One repair at a time per branch, across all of your watches on the repository; an event on a branch whose run is still going is skipped and picked up by the first poll after that run ends.
+- A watch starts at most 6 runs an hour (`--per-hour`), and its runs count against your limit of three runs in progress; an event skipped for either is tried again on a later poll.
+- A failure on a commit a loop delivered (its subject starts with `codeoid loop:`) is ignored for good, so a loop can't keep repairing its own output.
+- Check output and comment text are task data: a run's objective is fixed text, and the event's text reaches the worker only inside a quoted data block, truncated to 4,000 characters.
+  The terminal prints it with escape sequences and control characters removed, and links only to github.com.
+- A branch that can't be read (deleted, renamed) is a problem for that branch alone; the watch's other branches are still polled.
+- You can have 10 watches.
+  Comments are read from ten minutes before the last complete poll, not from the beginning each time.
+  When GitHub rate-limits a watch (HTTP 403 or 429), it backs off: two poll intervals, then four, doubling up to six hours, until a poll gets through.
+- `gh` runs with only `PATH`, `HOME`, and its config location in its environment, never the daemon's credentials, and with a timeout; a failed poll is recorded on the watch (`show` displays it, naming the GitHub endpoint) and the next poll tries again.
+
+Watches poll every `loops.watchPollSeconds` seconds (default 300, at least 60), and a few seconds after the daemon starts or a watch is made or resumed.
+They cost nothing between polls.
+Making, changing, resuming, or polling a watch needs the same scopes as starting a loop and can't be done with a delegated token; pausing and deleting it are safety stops that can.
+
+### Limits of a watch's authority
+
+- **One person per daemon.**
+  A watch reads and fetches from GitHub as the daemon's `gh` login, so watches belong to one person.
+  Once someone has a watch, nobody else can make one on that daemon until theirs are gone.
+- **A watch keeps acting after your credential is revoked.**
+  Your scopes are checked when you make, change, resume, or poll a watch, not each time it starts a run, the same as for [routines](routines.md).
+  The daemon has no way to ask ZeroID whether a credential it saw earlier is still valid, so revoking your token does not stop a watch.
+  Pause or delete it (any credential that can see it may) when access should end.
 
 ## What is and isn't enforced yet
 

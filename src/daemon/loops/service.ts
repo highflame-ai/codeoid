@@ -33,6 +33,7 @@ import type { CheckSpec, EvidenceRecord } from "../evidence/types.js";
 import { answerPrompt, firstAttemptPrompt, nextAttemptPrompt, takeoverPreamble, withSteering } from "./prompt.js";
 import type { LoopStore, LoopTenant, RunPatch } from "./store.js";
 import type { LoopReportInput } from "./tools.js";
+import { isRepo } from "./triggers/github.js";
 import {
   APPROVAL_WAIT,
   QUESTION_WAIT_PREFIX,
@@ -41,10 +42,12 @@ import {
   LOOP_LIMITS,
   type AttemptResult,
   type LoopAttemptRow,
+  type LoopBaseRef,
   type LoopCheck,
   type LoopContract,
   type LoopRunRow,
   type LoopStatus,
+  type LoopTrigger,
 } from "./types.js";
 
 // ── Host seam ────────────────────────────────────────────────────────────────
@@ -65,7 +68,8 @@ export interface PreparedWorkspace {
   baseRevision: string;
   /** Paths the setup recipe copied or linked; kept out of the delivered commit. */
   setupPaths: string[];
-  /** What preparing the workspace did that the run's history should say. */
+  /** What preparing the workspace did that the run's history should say
+   *  (setup's put-back files, a setup command that didn't run and why). */
   notes?: string[];
 }
 
@@ -170,7 +174,17 @@ export interface LoopStartInput {
   model?: string;
   toolBudget?: number;
   limits?: Partial<LoopContract["limits"]>;
+  /** Work from this commit instead of the user's checkout. Daemon-internal
+   *  (watches): never taken from a client message. */
+  baseRef?: LoopBaseRef;
+  /** The repository event that started the run. Daemon-internal (watches). */
+  trigger?: LoopTrigger;
 }
+
+/** A full commit id, and a branch name git would accept that can't pose as an option. */
+const SHA_RE = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
+export const SAFE_BRANCH_RE = /^(?!-)(?!.*\.\.)[A-Za-z0-9._/-]{1,200}$/;
+const FETCH_REF_RE = /^refs\/(heads\/[A-Za-z0-9._/-]{1,200}|pull\/\d{1,9}\/head)$/;
 
 // ── Service ──────────────────────────────────────────────────────────────────
 
@@ -324,10 +338,16 @@ export class LoopService {
     return null;
   }
 
-  /** The run is still in progress. */
+  /** The run exists and is still in progress (a watch's coalescing asks). */
   isActive(runId: string): boolean {
     const run = this.#store.getRun(runId);
     return run !== null && !isTerminalLoopStatus(run.status);
+  }
+
+  /** Why the run failed before it had a workspace, or null (a watch retries those). */
+  setupFailure(runId: string): string | null {
+    const run = this.#store.getRun(runId);
+    return run?.status === "failed" && !run.worktreePath ? (run.reason ?? "the workspace couldn't be prepared") : null;
   }
 
   isWorker(sessionId: string): boolean {
@@ -696,6 +716,10 @@ export class LoopService {
         attemptMinutes: bounded(limits.attemptMinutes, LOOP_LIMITS.ATTEMPT_MINUTES_MAX, "attemptMinutes"),
         runMinutes: bounded(limits.runMinutes, LOOP_LIMITS.RUN_MINUTES_MAX, "runMinutes"),
       },
+      ...(input.baseRef ? { baseRef: resolveBaseRef(input.baseRef) } : {}),
+      ...(input.trigger
+        ? { trigger: { ...input.trigger, summary: input.trigger.summary.slice(0, LOOP_LIMITS.TRIGGER_SUMMARY_MAX) } }
+        : {}),
     };
   }
 
@@ -767,7 +791,10 @@ export class LoopService {
     const baseline = checked.records;
     const checkedRun = this.#patch(runId, { baseTree: tree.tree }, { type: "baseline.checked", detail: tree.tree });
     if (!checkedRun) return;
-    if (baseline.every((e) => e.result === "pass")) {
+    // A review comment asks for a change, not a repair: its checks are the
+    // guard the change must keep passing, so passing already is expected.
+    // Everything else with nothing failing has nothing to repair.
+    if (baseline.every((e) => e.result === "pass") && checkedRun.contract.trigger?.kind !== "review_comment") {
       this.#end(checkedRun, "blocked", "every check already passes on the unmodified code — there is nothing to repair");
       return;
     }
@@ -979,7 +1006,13 @@ export class LoopService {
   async #deliver(run: LoopRunRow, attempt: LoopAttemptRow): Promise<void> {
     if (this.#stopped || this.#cancelling.has(run.id)) return;
     if (attempt.candidateTree === run.baseTree) {
-      this.#end(run, "blocked", "every check passed, but the tracked files are as they started — the checks may be flaky, or the change is outside the tracked tree");
+      this.#end(
+        run,
+        "blocked",
+        run.contract.trigger?.kind === "review_comment"
+          ? "the worker changed no tracked file — the comment may need no change, or asks for one outside the tracked tree"
+          : "every check passed, but the tracked files are as they started — the checks may be flaky, or the change is outside the tracked tree",
+      );
       return;
     }
     let commit: string;
@@ -1247,6 +1280,21 @@ function describeResult(result: AttemptResult, evidence: EvidenceRecord[]): stri
     default:
       return `${failing.length} of ${evidence.length} check(s) not passing: ${failing.map((e) => `${e.criterionId} ${e.result}`).join(", ")}`;
   }
+}
+
+function resolveBaseRef(ref: LoopBaseRef): LoopBaseRef {
+  if (!SHA_RE.test(ref.sha)) throw new LoopError("baseRef.sha must be a full commit id", "invalid_request");
+  if (ref.branch !== undefined && !SAFE_BRANCH_RE.test(ref.branch)) throw new LoopError("baseRef.branch is not a usable branch name", "invalid_request");
+  if (ref.fetchRef !== undefined && !FETCH_REF_RE.test(ref.fetchRef)) throw new LoopError("baseRef.fetchRef is not a branch or pull request ref", "invalid_request");
+  if (ref.repo !== undefined && !isRepo(ref.repo)) throw new LoopError("baseRef.repo is not a GitHub repository name", "invalid_request");
+  if (ref.fetchRef !== undefined && ref.repo === undefined) throw new LoopError("baseRef.fetchRef needs baseRef.repo", "invalid_request");
+  return {
+    sha: ref.sha,
+    ...(ref.branch ? { branch: ref.branch } : {}),
+    ...(ref.repo ? { repo: ref.repo } : {}),
+    ...(ref.fetchRef ? { fetchRef: ref.fetchRef } : {}),
+    ...(ref.trusted === true ? { trusted: true } : {}),
+  };
 }
 
 function tenantOf(owner: LoopOwner): LoopTenant {

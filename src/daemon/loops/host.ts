@@ -7,11 +7,12 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { closeSync, constants as fsConstants, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, realpathSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, constants as fsConstants, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, relative } from "node:path";
 import type { AuthContext } from "../../protocol/types.js";
 import type { Dispatcher } from "../dispatch.js";
+import { redactOutput } from "../evidence/redact.js";
 import type { EvidenceService } from "../evidence/service.js";
 import { execFile } from "node:child_process";
 import { GIT_BIN, gitEnv, hardenedGit as git } from "../git-env.js";
@@ -21,6 +22,7 @@ import type { Session } from "../session.js";
 import { brokenShares, loadSetupRecipe, parseSetupRecipe, prepareWorktree, SETUP_RECIPE_PATH, type WorktreeSetupPolicy } from "../workspace-setup.js";
 import { assertNoLinkedParent, commitTree, copyDir, fingerprint, listTree, removeTree, removeTreeAsync, type NameFolding, ObjectReader, resolveUnder, restoreTree, type Stamps, writeTree } from "./materialize.js";
 import type { CandidateCheckout, LoopHost, PreparedWorkspace, WorkerInfo } from "./service.js";
+import { githubFetch } from "./triggers/github.js";
 import type { LoopRunRow } from "./types.js";
 
 
@@ -158,6 +160,67 @@ const SCRATCH_IDENTITY = {
   GIT_COMMITTER_EMAIL: "codeoid@localhost",
 };
 
+/**
+ * Make `sha` available in `repo`, fetching `from.fetchRef` from GitHub when it
+ * isn't. This is the only git the daemon runs with the network on, and it never
+ * runs in your repository: your repository's config, which an agent can write,
+ * could otherwise decide where the fetch goes and what it presents (a url
+ * rewrite, a proxy, TLS settings, another credential helper). The fetch goes
+ * into a repository the daemon makes for it under its own directory — no config
+ * but the fetch's own (githubFetch: https only, gh as the only credential
+ * helper, no global or system config) — which borrows your repository's objects
+ * so only what is missing is downloaded. What it fetched is then indexed into
+ * your repository by hardened git, offline; an object's id is its content, so
+ * nothing added can pose as anything else. Why the fetch failed is in the
+ * error, redacted.
+ */
+async function ensureCommit(
+  repo: string,
+  sha: string,
+  from: { repo?: string; fetchRef?: string },
+  scratchDir: string,
+  remote?: (repo: string) => string,
+): Promise<void> {
+  const has = (): Promise<boolean> =>
+    git(["cat-file", "-e", `${sha}^{commit}`], repo).then(
+      () => true,
+      () => false,
+    );
+  if (await has()) return;
+  let why = "";
+  if (from.fetchRef && from.repo) {
+    // The ref names a branch or a pull request head and the repository is a
+    // validated `owner/name` (both checked in the contract).
+    const fetch = githubFetch(from.repo, from.fetchRef, remote?.(from.repo));
+    let dir: string | null = null;
+    try {
+      const commonDir = (await git(["rev-parse", "--path-format=absolute", "--git-common-dir"], repo)).trim();
+      dir = mkdtempSync(join(scratchDir, "fetch-"));
+      // From the daemon's own directory, discovering nothing above it.
+      await git(["init", "-q", "--bare", "--template=", `--object-format=${sha.length === 64 ? "sha256" : "sha1"}`, dir], scratchDir, {
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_CEILING_DIRECTORIES: dirname(scratchDir),
+      });
+      writeExclusive(join(dir, "objects", "info", "alternates"), Buffer.from(`${join(commonDir, "objects")}\n`));
+      await git(fetch.args, dir, { ...fetch.env, GIT_DIR: dir }, { network: fetch.protocol, timeoutMs: 300_000 });
+      const packs = join(dir, "objects", "pack");
+      for (const name of readdirSync(packs).filter((n) => n.endsWith(".pack"))) {
+        await git(["index-pack", "--stdin"], repo, {}, { input: readFileSync(join(packs, name)), timeoutMs: 300_000 });
+      }
+    } catch (err) {
+      const e = err as { stderr?: unknown; message?: string };
+      const text = typeof e.stderr === "string" && e.stderr.trim() ? e.stderr : (e.message ?? "");
+      why = redactOutput(text).trim().split("\n").slice(-3).join(" ").slice(0, 500);
+    } finally {
+      if (dir) await removeTreeAsync(dir).catch(() => {});
+    }
+    if (await has()) return;
+  }
+  throw new Error(
+    `commit ${sha.slice(0, 12)} is not in the repository and could not be fetched${from.repo && from.fetchRef ? ` from github.com/${from.repo} (${from.fetchRef})` : ""}${why ? `: ${why}` : ""}`,
+  );
+}
+
 export interface LoopHostDeps {
   normalizeWorkdir(path: string): string | null;
   hasProvider(id: string): boolean;
@@ -169,6 +232,9 @@ export interface LoopHostDeps {
   /** The daemon's own directory for candidate checkouts and the setup files
    *  captured for them (made 0700). */
   scratchRoot: string;
+  /** Where a watched repository is fetched from (default: github.com over
+   *  https). Test-only override: no network in tests. */
+  githubRemote?: (repo: string) => string;
   /** Create, register, and return a worker session for the run. */
   createWorkerSession(run: LoopRunRow): Promise<string>;
   /** The run ended: stop the worker acting autonomously. */
@@ -232,12 +298,17 @@ export function buildLoopHost(d: LoopHostDeps): LoopHost {
       // Clean checkout first: the setup recipe's command sees committed content
       // only, then the user's uncommitted state is carried — the run repairs
       // what the user has, in its own worktree, without touching theirs.
+      // A triggered run repairs the branch its event happened on: a clean
+      // checkout of that branch's head commit, nothing of your checkout
+      // carried. The commit may only be on GitHub (a pull request).
+      const base = run.contract.baseRef;
+      if (base) await ensureCommit(repo, base.sha, base, scratch().mine, d.githubRemote);
       // Claimed before it exists: no session may open there while setup runs.
       const wt = await createForkWorktree({
         workdir: repo,
         label: `loop-${run.id.slice(5, 13)}`,
         shortId: randomUUID().slice(0, 8),
-        deferCarry: true,
+        ...(base ? { baseCommit: base.sha } : { deferCarry: true }),
         hardened: true,
         onPath: (p) => {
           // Its parent made now, so the real path (through any symlinked
@@ -261,6 +332,8 @@ export function buildLoopHost(d: LoopHostDeps): LoopHost {
         // checks run outside the tree they judge (and the user's checkout).
         const setupSince = ticksNow();
         const setupMark = randomUUID();
+        // Your copied files (an .env) land next to a commit off your history
+        // only when a watch vouched for everyone who wrote it.
         const setup = await prepareWorktree({
           worktreePath: wt.path,
           policy: d.worktreeSetupPolicy(),
@@ -268,10 +341,15 @@ export function buildLoopHost(d: LoopHostDeps): LoopHost {
           share: false,
           signal,
           extraEnv: { CODEOID_LOOP_CHECK: setupMark },
+          ...(base && base.trusted !== true ? { copyNeedsReviewedBase: true } : {}),
         });
         // What setup left running in the worktree is stopped before the worker
         // starts: it would otherwise write there as if it were the worker.
         killMarked("CODEOID_LOOP_CHECK", setupMark, realpathSync(wt.path), setupSince);
+        // A pull request's head is usually not on your checkout's history, so
+        // a trusted setup command refuses to run there (it would run code
+        // nobody reviewed); the run's history says why its checks may lack deps.
+        if (setup.commandSkipped) setupNotes.push(`the repository's setup command did not run: ${setup.commandSkipped}`);
         if (setup.error) throw new Error(`the repository's setup recipe failed: ${setup.error}`);
         // What the recipe copied (often a .env from your checkout), captured
         // now: a candidate's checks get these bytes, not whatever the source

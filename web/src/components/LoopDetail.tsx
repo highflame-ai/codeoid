@@ -235,6 +235,30 @@ export const LoopDetail: Component<LoopDetailProps> = (props) => {
         <dd class="truncate font-mono text-fg-muted" title={r().workdir}>
           {r().workdir}
         </dd>
+        <Show when={r().trigger}>
+          {(t) => (
+            <>
+              <dt class={labelClass}>Started by</dt>
+              <dd class="text-fg-muted" data-testid="loop-trigger">
+                {t().kind === "ci_failure" ? "a failing CI check" : "a review comment"}
+                <Show when={r().baseRef?.branch}>
+                  {" "}on <span class="font-mono">{r().baseRef!.branch}</span>
+                </Show>
+                {/* GitHub links only: the URL came from an API response. */}
+                <Show when={t().url?.startsWith("https://github.com/") ? t().url : undefined}>
+                  {(url) => (
+                    <>
+                      {" "}
+                      <a class="text-accent underline-offset-2 hover:underline" href={url()} target="_blank" rel="noopener noreferrer">
+                        view
+                      </a>
+                    </>
+                  )}
+                </Show>
+              </dd>
+            </>
+          )}
+        </Show>
         <dt class={labelClass}>Branch</dt>
         <dd class="font-mono text-fg-muted">
           {r().branch ?? "not created yet"}

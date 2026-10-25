@@ -416,6 +416,25 @@ describe("prepareWorktree — the setup command", () => {
     expect(existsSync(join(wt.path, "ran"))).toBe(false);
   });
 
+  it("copyNeedsReviewedBase: a base off the primary history gets none of the owner's files; one on it does", async () => {
+    await commitRecipe("copy: [.env]\n");
+    await g(["checkout", "-q", "-b", "feature"], repo);
+    writeFileSync(join(repo, "feature.txt"), "unreviewed\n");
+    await g(["add", "feature.txt"], repo);
+    await g(["commit", "-qm", "unmerged"], repo);
+    await g(["checkout", "-q", "main"], repo);
+
+    const off = await newWorktree({ baseBranch: "feature" });
+    const r = await prepareWorktree({ worktreePath: off.path, policy: NEVER, copyNeedsReviewedBase: true });
+    expect(r.copied).toEqual([]);
+    expect(r.skipped[0]!.reason).toContain("nobody vouched for it");
+    expect(existsSync(join(off.path, ".env"))).toBe(false);
+
+    const on = await newWorktree();
+    const r2 = await prepareWorktree({ worktreePath: on.path, policy: NEVER, copyNeedsReviewedBase: true });
+    expect(r2.copied).toEqual([".env"]);
+  });
+
   it("a fork of a codeoid branch with an agent's commit runs no command", async () => {
     await commitRecipe("command: touch ran\n");
     const policy = await trusted();

@@ -888,6 +888,57 @@ export const loopControlSchema = z.object({
 });
 export const loopSteerSchema = z.object({ ...base, type: z.literal("loop.steer"), runId: idField, text: z.string().min(1).max(8_000) });
 
+const loopWatchCiSchema = z.object({
+  ciName: z.string().min(1).max(200),
+  app: z.string().regex(/^[a-z0-9][a-z0-9-]{0,99}$/).optional(),
+  command: z.string().min(1).max(4_000),
+  timeoutSec: z.number().int().min(1).max(3_600).optional(),
+  expectTests: z.boolean().optional(),
+});
+const loopWatchSpecFields = {
+  branches: z.array(z.string().min(1).max(200)).min(1).max(20),
+  myPrs: z.boolean(),
+  ci: z.array(loopWatchCiSchema).min(1).max(10),
+  review: z.object({
+    enabled: z.boolean(),
+    allow: z.array(z.string().min(1).max(39)).max(20).optional(),
+    mention: z.string().min(2).max(64).optional(),
+  }),
+  trust: z.array(z.string().min(1).max(39)).max(20),
+  provider: z.string().min(1).max(64),
+  model: z.string().min(1).max(200),
+  toolBudget: z.number().int().min(1).max(1_000),
+  limits: z.object({
+    attempts: z.number().int().min(1).max(10).optional(),
+    attemptMinutes: z.number().int().min(1).max(240).optional(),
+    runMinutes: z.number().int().min(1).max(1_440).optional(),
+  }),
+  maxRunsPerHour: z.number().int().min(1).max(60),
+};
+const loopWatchPatchSchema = z.object(
+  Object.fromEntries(Object.entries(loopWatchSpecFields).map(([k, v]) => [k, v.optional()])) as {
+    [K in keyof typeof loopWatchSpecFields]: z.ZodOptional<(typeof loopWatchSpecFields)[K]>;
+  },
+);
+export const loopWatchCreateSchema = z.object({
+  ...base,
+  type: z.literal("loop.watch.create"),
+  spec: loopWatchPatchSchema.extend({ workdir: z.string().min(1).max(LIMITS.PATH_MAX), ci: loopWatchSpecFields.ci }),
+});
+export const loopWatchListSchema = z.object({ ...base, type: z.literal("loop.watch.list") });
+export const loopWatchRefSchema = z.object({
+  ...base,
+  type: z.enum(["loop.watch.get", "loop.watch.delete", "loop.watch.poll"]),
+  watchId: idField,
+});
+export const loopWatchUpdateSchema = z.object({
+  ...base,
+  type: z.literal("loop.watch.update"),
+  watchId: idField,
+  enabled: z.boolean().optional(),
+  spec: loopWatchPatchSchema.optional(),
+});
+
 export const routineCreateSchema = z.object({ ...base, type: z.literal("routine.create"), spec: routineSpecSchema });
 export const routineUpdateSchema = z.object({
   ...base,
@@ -1215,6 +1266,10 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   loopGetSchema,
   loopControlSchema,
   loopSteerSchema,
+  loopWatchCreateSchema,
+  loopWatchListSchema,
+  loopWatchRefSchema,
+  loopWatchUpdateSchema,
   compareListSchema,
   compareKeepSchema,
   mcpOAuthBeginSchema,

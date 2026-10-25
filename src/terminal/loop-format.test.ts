@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { LoopRunWire } from "../protocol/types.js";
-import { formatLoop, formatLoopRow, parseCheckFlag } from "./loop-format";
+import { formatLoop, formatLoopRow, formatWatch, parseCheckFlag, parseCiFlag, startedBy } from "./loop-format";
 
 const run: LoopRunWire = {
   id: "loop_12345678-aaaa-bbbb-cccc-1234567890ab",
@@ -64,5 +64,49 @@ describe("loop formatting", () => {
     expect(parseCheckFlag("unit: bun test --bail")).toEqual({ id: "unit", command: "bun test --bail" });
     expect(parseCheckFlag("NODE_ENV=test bun test")).toEqual({ command: "NODE_ENV=test bun test" });
     expect(parseCheckFlag("go test ./...")).toEqual({ command: "go test ./..." });
+  });
+
+  test("--ci takes `name: command`, and `name@app: command` for another app's check", () => {
+    expect(parseCiFlag("test (*): bun test")).toEqual({ ciName: "test (*)", command: "bun test" });
+    expect(parseCiFlag("lint@circleci-checks: bun run lint")).toEqual({ ciName: "lint", app: "circleci-checks", command: "bun run lint" });
+    expect(parseCiFlag("CI / build @buildkite: make")).toEqual({ ciName: "CI / build", app: "buildkite", command: "make" });
+    expect(parseCiFlag("no command")).toBeNull();
+  });
+
+  test("what came from GitHub is printed without escape sequences, and only github.com links", () => {
+    const trig = (url: string, summary: string) =>
+      startedBy({ ...run, baseRef: { sha: "a".repeat(40), branch: "feature" }, trigger: { kind: "review_comment", key: "k", url, summary } });
+    const evil = trig("https://evil.example/x", "Comment by @ada:\n\x1b]0;pwned\x07@codeoid \x1b[2Jfix\rit");
+    expect(evil).not.toContain("evil.example");
+    expect(evil).not.toContain("\x1b]");
+    expect(evil).not.toContain("\x1b[2J");
+    expect(evil).not.toContain("\r");
+    expect(evil).toContain("@codeoid fixit");
+    expect(trig("https://github.com/acme/shop/pull/1#c1", "x")).toContain("https://github.com/acme/shop/pull/1#c1");
+    expect(trig("https://github.com.evil.example/x", "x")).not.toContain("evil");
+    const watch = formatWatch(
+      {
+        id: "lw_1",
+        workdir: "/r",
+        repo: "acme/shop",
+        branches: [],
+        myPrs: true,
+        ci: [{ ciName: "test", app: "github-actions", command: "bun test", timeoutSec: 600 }],
+        review: { enabled: false, allow: [], mention: "@codeoid" },
+        ghLogin: "ada",
+        trust: ["bob"],
+        maxRunsPerHour: 6,
+        enabled: true,
+        lastPolledAt: null,
+        lastError: "GitHub x failed: \x1b[2Jboom",
+        lastOkAt: null,
+        createdAt: "2026-10-25T10:00:00.000Z",
+        updatedAt: "2026-10-25T10:00:00.000Z",
+      } as never,
+      [{ key: "k", kind: "ci_failure", branch: "b", runId: null, outcome: "ignored", note: "commits by someone you don't trust: \x1b]8;;x\x07", createdAt: "2026-10-25T10:00:00.000Z" }],
+    ).join("\n");
+    expect(watch).toContain("trusts     @ada (you), @bob");
+    expect(watch).not.toContain("\x1b[2J");
+    expect(watch).not.toContain("\x1b]8");
   });
 });

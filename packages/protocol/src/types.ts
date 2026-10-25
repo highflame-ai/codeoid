@@ -86,7 +86,25 @@ import type {
   RoutineUpdateMsg,
 } from "./routines.js";
 import type { EvidenceGetMsg, EvidenceRecordMsg } from "./evidence.js";
-import type { LoopCancelMsg, LoopGetMsg, LoopPauseMsg, LoopResumeMsg, LoopListMsg, LoopListResultMsg, LoopSnapshotMsg, LoopStartMsg, LoopSteerMsg } from "./loops.js";
+import type {
+  LoopCancelMsg,
+  LoopGetMsg,
+  LoopPauseMsg,
+  LoopResumeMsg,
+  LoopListMsg,
+  LoopListResultMsg,
+  LoopSnapshotMsg,
+  LoopStartMsg,
+  LoopSteerMsg,
+  LoopWatchCreateMsg,
+  LoopWatchDeleteMsg,
+  LoopWatchGetMsg,
+  LoopWatchListMsg,
+  LoopWatchListResultMsg,
+  LoopWatchPollMsg,
+  LoopWatchSnapshotMsg,
+  LoopWatchUpdateMsg,
+} from "./loops.js";
 import type {
   McpAdoptMsg,
   McpAdoptResultMsg,
@@ -1208,6 +1226,12 @@ export type ClientMessage =
   | LoopPauseMsg
   | LoopResumeMsg
   | LoopSteerMsg
+  | LoopWatchCreateMsg
+  | LoopWatchListMsg
+  | LoopWatchGetMsg
+  | LoopWatchUpdateMsg
+  | LoopWatchDeleteMsg
+  | LoopWatchPollMsg
   | McpOAuthBeginMsg
   | McpOAuthCompleteMsg
   | McpOAuthDisconnectMsg
@@ -3021,6 +3045,8 @@ export type DaemonMessage =
   | EvidenceRecordMsg
   | LoopSnapshotMsg
   | LoopListResultMsg
+  | LoopWatchSnapshotMsg
+  | LoopWatchListResultMsg
   | McpOAuthBeginResultMsg
   | McpOAuthCompleteResultMsg
   | McpOAuthDisconnectResultMsg

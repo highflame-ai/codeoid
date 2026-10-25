@@ -105,8 +105,11 @@ import { buildLoopHost } from "./loops/host.js";
 import { LoopError, LoopService, type LoopOwner } from "./loops/service.js";
 import { LoopStore } from "./loops/store.js";
 import { buildLoopMcpServer } from "./loops/tools.js";
+import { defaultGhExec, type GhExec } from "./loops/triggers/github.js";
 import type { LoopRunRow } from "./loops/types.js";
-import { attemptToWire, eventToWire, runToWire } from "./loops/wire.js";
+import { WatchService } from "./loops/watch-service.js";
+import { WatchStore } from "./loops/watch-store.js";
+import { attemptToWire, eventToWire, runToWire, triggerToWire, watchToWire } from "./loops/wire.js";
 import type { PipelineManager } from "./pipeline/manager.js";
 import { resolveBinding, type ModelBindingConfig } from "./pipeline/binding.js";
 import type { RoleDef } from "./pipeline/pack.js";
@@ -184,6 +187,7 @@ import {
   mainWorktreeRoot,
   removeForkWorktree,
 } from "./git-worktree.js";
+import { hardenedGit } from "./git-env.js";
 import {
   loadSetupRecipe,
   prepareWorktree,
@@ -489,6 +493,8 @@ export class SessionManager {
   #loops?: LoopService;
   /** A loop worker's unattended mark, lifted when its run hands it back. */
   readonly #loopUnattended = new Map<string, () => void>();
+  /** Loop watches: repository events → repair runs (docs/loops.md "Watches"). */
+  #watches?: WatchService;
   #evidenceTimers: ReturnType<typeof setTimeout>[] = [];
   /** Routines (docs/routines.md); undefined when `routines.enabled` is off. */
   #routines?: RoutineService;
@@ -579,6 +585,10 @@ export class SessionManager {
        * subprocess. Mirrors SessionCreateOptions._testProvider.
        */
       _testProviderFactory?: () => SessionProvider;
+      /** Test-only: how loop watches run `gh` (no network in tests). */
+      _testGhExec?: GhExec;
+      /** Test-only: where a watched repository's commits are fetched from (no network in tests). */
+      _testGithubRemote?: (repo: string) => string;
       /** Claude account store (claude-accounts.ts) — the `claude` backend's view of `accounts`. */
       claudeAccounts?: ClaudeAccountStore;
       /** Every backend's accounts (accounts.ts). Default: `<configDir>/accounts.json` (or the store behind `claudeAccounts`). */
@@ -658,11 +668,30 @@ export class SessionManager {
         }
       };
       this.#evidenceTimers.push(setTimeout(sweep, 60_000).unref(), setInterval(sweep, 24 * 60 * 60 * 1000).unref());
-      const loops = new LoopService(new LoopStore(store.database), this.#makeLoopHost(evidence, join(dirname(opts.config.dbPath), "loop-checks")));
+      const loops = new LoopService(new LoopStore(store.database), this.#makeLoopHost(evidence, join(dirname(opts.config.dbPath), "loop-checks"), opts._testGithubRemote));
       loops.setEvidenceLookup((run, ids) =>
         ids.map((id) => evidence.get(id, { accountId: run.accountId, projectId: run.projectId })).filter((e) => e !== null),
       );
       this.#loops = loops;
+      this.#watches = new WatchService(
+        new WatchStore(store.database),
+        {
+          gh: opts._testGhExec ?? defaultGhExec,
+          normalizeWorkdir: (p) => normalizeWorkdir(p),
+          // Hardened like every git the daemon runs in a repository an agent
+          // can write: reading a remote's URL runs nothing.
+          originUrl: (dir) =>
+            hardenedGit(["remote", "get-url", "origin"], dir, {}, { timeoutMs: 10_000 }).then(
+              (out) => out.trim() || null,
+              () => null,
+            ),
+          startRun: (input, owner) => loops.startRun(input, owner),
+          runActive: (id) => loops.isActive(id),
+          runSetupFailure: (id) => loops.setupFailure(id),
+          audit: (subject, action, detail) => this.#store.audit(subject, action, undefined, detail),
+        },
+        { pollSeconds: opts.config.loops?.watchPollSeconds },
+      );
     }
     this.#pipelines = createPipelineManagerFromConfig(opts?.config, {
       runner: new SessionPhaseRunner(() => this),
@@ -805,10 +834,17 @@ export class SessionManager {
    *  so a run's surviving worker is back and its attempt task is reclaimable. */
   startLoops(): void {
     this.#loops?.start();
+    this.#watches?.start();
   }
 
   stopLoops(): void {
+    this.#watches?.stop();
     this.#loops?.stop();
+  }
+
+  /** Loop watches, or undefined without a daemon config. */
+  get watches(): WatchService | undefined {
+    return this.#watches;
   }
 
   /** Loop service, or undefined without a daemon config. */
@@ -1438,6 +1474,13 @@ mcpHub: this.#mcpHub,
       case "loop.resume":
       case "loop.steer":
         return this.#loopHandle(msg, auth);
+      case "loop.watch.create":
+      case "loop.watch.list":
+      case "loop.watch.get":
+      case "loop.watch.update":
+      case "loop.watch.delete":
+      case "loop.watch.poll":
+        return this.#loopWatchHandle(msg, auth);
       case "routine.create":
       case "routine.update":
       case "routine.delete":
@@ -3854,6 +3897,7 @@ mcpHub: this.#mcpHub,
     this.#backendLogin.dispose();
     // Running checks are detached process groups; without this they outlive
     // the daemon and race the same gate when the pipeline resumes.
+    this.#watches?.stop();
     this.#loops?.stop();
     this.#evidence?.abortAll();
     for (const t of this.#evidenceTimers) clearTimeout(t);
@@ -6313,6 +6357,92 @@ mcpHub: this.#mcpHub,
   }
 
   /**
+   * loop.watch.* — authorized exactly like loop.*: owner-only, session:create
+   * + session:send for everything. What can start runs (create, a change,
+   * enabling, poll-now) also needs session:approve and is refused to a
+   * delegated token: a watch is standing authority to start autonomous runs
+   * as its owner. Disabling and deleting are safety stops any credential that
+   * can see the watch may use.
+   */
+  async #loopWatchHandle(
+    msg: Extract<ClientMessage, { type: `loop.watch.${string}` }>,
+    auth: AuthContext,
+  ): Promise<DaemonMessage> {
+    const err = (error: string, code: "invalid_request" | "not_found" | "forbidden" | "internal"): DaemonMessage => ({
+      type: "response.error",
+      requestId: msg.id,
+      error,
+      code,
+    });
+    const scopes = auth.scopes as string[];
+    if (!hasScope(scopes, SCOPES.SESSION_CREATE) || !hasScope(scopes, SCOPES.SESSION_SEND)) {
+      return err("Missing scope: loops need session:create and session:send", "forbidden");
+    }
+    const svc = this.#watches;
+    if (!svc) return err("Loops are not available on this daemon", "invalid_request");
+    const owner: LoopOwner = {
+      sub: auth.sub,
+      ...(auth.name ? { name: auth.name } : {}),
+      accountId: auth.accountId,
+      projectId: auth.projectId,
+    };
+    const delegated = auth.delegationDepth > 0;
+    // Disabling (and nothing else) is a safety stop.
+    const safetyStop =
+      msg.type === "loop.watch.delete" || (msg.type === "loop.watch.update" && msg.enabled === false && msg.spec === undefined);
+    const reads = msg.type === "loop.watch.list" || msg.type === "loop.watch.get";
+    if (!reads && !safetyStop) {
+      if (delegated) return err("A delegated token cannot create, change, enable, or poll a loop watch", "forbidden");
+      if (!hasScope(scopes, SCOPES.SESSION_APPROVE)) {
+        return err("Missing scope: session:approve (a watch starts autonomous loop runs)", "forbidden");
+      }
+    }
+    const providerOk = (p: string | undefined): DaemonMessage | null =>
+      p !== undefined && !LOOP_WORKER_PROVIDERS.has(p)
+        ? err(`Loops run on ${[...LOOP_WORKER_PROVIDERS].join(", ")} for now; "${p}" cannot report an attempt's outcome yet`, "invalid_request")
+        : null;
+    const snapshot = (watchId: string, extra: { poll?: { started: string[]; skipped: string[] } } = {}): DaemonMessage => ({
+      type: "loop.watch.snapshot",
+      requestId: msg.id,
+      watch: watchToWire(svc.get(watchId, owner)),
+      triggers: svc.store.listTriggers(watchId, 20).map(triggerToWire),
+      ...extra,
+    });
+    try {
+      switch (msg.type) {
+        case "loop.watch.create": {
+          const provider = msg.spec.provider ?? this.#providers.defaultId;
+          const bad = providerOk(provider);
+          if (bad) return bad;
+          const w = await svc.create({ ...msg.spec, provider }, owner);
+          return snapshot(w.id);
+        }
+        case "loop.watch.list":
+          return { type: "loop.watch.list.result", requestId: msg.id, watches: svc.list(owner).map(watchToWire) };
+        case "loop.watch.get":
+          return snapshot(msg.watchId);
+        case "loop.watch.update": {
+          const bad = providerOk(msg.spec?.provider);
+          if (bad) return bad;
+          await svc.update(msg.watchId, { ...(msg.enabled !== undefined ? { enabled: msg.enabled } : {}), ...(msg.spec ? { spec: msg.spec } : {}) }, owner);
+          return snapshot(msg.watchId);
+        }
+        case "loop.watch.delete":
+          svc.delete(msg.watchId, owner);
+          return { type: "response.ok", requestId: msg.id, data: { deleted: msg.watchId } };
+        case "loop.watch.poll": {
+          const poll = await svc.poll(msg.watchId, owner);
+          return snapshot(msg.watchId, { poll });
+        }
+      }
+      return err("Unknown loop watch message", "invalid_request");
+    } catch (e) {
+      if (e instanceof LoopError) return err(e.message, e.code === "conflict" ? "invalid_request" : e.code);
+      return err(e instanceof Error ? e.message : String(e), "internal");
+    }
+  }
+
+  /**
    * A message typed into a loop's worker becomes steering for its run — under
    * the same rules as loop.steer (owner only, loop scopes, no delegated
    * token), with its outcome reported back to the sender.
@@ -6384,7 +6514,7 @@ mcpHub: this.#mcpHub,
   }
 
   /** The loop controller's window onto the daemon (LoopHost). */
-  #makeLoopHost(evidence: EvidenceService, scratchRoot: string) {
+  #makeLoopHost(evidence: EvidenceService, scratchRoot: string, githubRemote?: (repo: string) => string) {
     const owned = (run: LoopRunRow, depth: 0 | 1): AuthContext => ({
       sub: run.ownerSub,
       // The delegated form names the run, so its prompts read "loop:<id>" in
@@ -6403,6 +6533,7 @@ mcpHub: this.#mcpHub,
       evidence,
       worktreeSetupPolicy: () => this.#worktreeSetupPolicy,
       scratchRoot,
+      ...(githubRemote ? { githubRemote } : {}),
       session: (id) => this.#sessions.get(id),
       releaseWorkerSession: (id) => {
         const s = this.#sessions.get(id);

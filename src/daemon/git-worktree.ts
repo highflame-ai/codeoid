@@ -155,11 +155,16 @@ export interface CarriedState {
  * locally resolvable. Rejects a ref that looks like a git flag. Returns the ref
  * (validated to resolve) to hand to `worktree add`.
  */
-async function resolveBaseRef(mainRoot: string, ref: string, opts: { fetch?: boolean } = {}): Promise<string> {
+async function resolveBaseRef(
+  mainRoot: string,
+  ref: string,
+  opts: { fetch?: boolean; git?: (args: string[], cwd: string) => Promise<string> } = {},
+): Promise<string> {
   if (!ref || ref.startsWith("-")) throw new WorktreeError(`invalid base ref: ${JSON.stringify(ref)}`);
+  const run = opts.git ?? git;
   const resolves = async (): Promise<boolean> => {
     try {
-      await git(["rev-parse", "--verify", "--quiet", "--end-of-options", `${ref}^{commit}`], mainRoot);
+      await run(["rev-parse", "--verify", "--quiet", "--end-of-options", `${ref}^{commit}`], mainRoot);
       return true;
     } catch {
       return false;
@@ -231,7 +236,7 @@ export async function createForkWorktree(opts: {
   if (opts.baseCommit) {
     if (!/^[0-9a-f]{40,64}$/.test(opts.baseCommit)) throw new WorktreeError("invalid base commit");
     // Local when it was recorded: a miss means it's gone (gc'd), not remote.
-    base = await resolveBaseRef(mainRoot, opts.baseCommit, { fetch: false });
+    base = await resolveBaseRef(mainRoot, opts.baseCommit, { fetch: false, git });
   } else if (opts.baseBranch) {
     base = await resolveBaseRef(mainRoot, opts.baseBranch);
   } else {

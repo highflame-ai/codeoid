@@ -183,6 +183,8 @@ codeoid mcp signin <server> [--callback-url <u>]        # sign in to an OAuth re
 codeoid evidence <id> [--full]   # one recorded check: what ran, on which tree, what it found
 codeoid loop start "<objective>" --workdir <dir> --check <cmd> [--test] [--wait]  # repair until the daemon's checks pass (docs/loops.md)
 codeoid loop ls | show <id> [--events] | steer <id> <text> | pause | resume | cancel <id>
+codeoid loop watch add --workdir <dir> (--branch <b>... | --my-prs) --ci "<check>[@app]: <cmd>" [--review] [--trust <login>]  # CI failures / review comments start runs
+codeoid loop watch ls | show | poll | pause | resume | rm <id>
 codeoid routine add <name> --prompt … [--cron|--every|--at] [--check <cmd>]  # scheduled agent runs
 codeoid routine ls | show | runs | run [--wait] | edit | pause | resume | rm | cancel <runId> | token | preview
 codeoid worktree trust [dir] [--off] [--yes]  # trust the setup command of a repo's .codeoid/setup.yaml, pinned to its blob (docs/CONFIGURATION.md)

@@ -387,19 +387,25 @@ export async function commandGate(
 ): Promise<CommandRefusal | null> {
   const refusal = commandRefusal(policy, read.root, read.recipeHash, ownerSub);
   if (refusal) return refusal;
-  const off: CommandRefusal = {
-    code: "base-not-on-primary",
-    reason:
-      "this worktree starts from a commit that isn't on your checkout's branch (another branch, a pull request, or an agent's commit), so the trusted command would run code you haven't reviewed",
-  };
+  return (await baseReviewed(read, worktreePath, baseCommit))
+    ? null
+    : {
+        code: "base-not-on-primary",
+        reason:
+          "this worktree starts from a commit that isn't on your checkout's branch (another branch, a pull request, or an agent's commit), so the trusted command would run code you haven't reviewed",
+      };
+}
+
+/** The worktree's base commit carries the recipe that was read and is on the primary checkout's history. */
+async function baseReviewed(read: FoundRecipe, worktreePath: string, baseCommit?: string): Promise<boolean> {
   try {
     const base = baseCommit ?? (await git(["rev-parse", "--verify", "HEAD^{commit}"], worktreePath)).stdout.trim();
     const blob = await git(["rev-parse", "--verify", "--quiet", `${base}:${SETUP_RECIPE_PATH}`], read.root, { okCodes: [1, 128] });
-    if (blob.code !== 0 || blob.stdout.trim() !== read.recipeHash) return off;
+    if (blob.code !== 0 || blob.stdout.trim() !== read.recipeHash) return false;
     const onPrimary = await git(["merge-base", "--is-ancestor", base, read.rev], read.root, { okCodes: [1] });
-    return onPrimary.code === 0 ? null : off;
+    return onPrimary.code === 0;
   } catch {
-    return off;
+    return false;
   }
 }
 
@@ -595,6 +601,9 @@ export async function prepareWorktree(opts: {
   baseCommit?: string;
   /** More environment for the command (a loop's marker, so what it leaves running is found). */
   extraEnv?: Record<string, string>;
+  /** Copy only under the command's base rule ({@link commandGate}): a loop
+   *  working from a commit nobody vouched for gets none of the owner's files. */
+  copyNeedsReviewedBase?: boolean;
 }): Promise<WorktreeSetupResult> {
   const result: WorktreeSetupResult = { applied: false, copied: [], shared: [], skipped: [], warnings: [] };
   const fail = (err: unknown): WorktreeSetupResult => {
@@ -628,10 +637,15 @@ export async function prepareWorktree(opts: {
 
   const copies: Planned[] = [];
   const shares: Planned[] = [];
+  const copyOff = opts.copyNeedsReviewedBase === true && recipe.copy.length > 0 && !(await baseReviewed(found, worktree, opts.baseCommit));
   try {
     let copyBytes = 0;
     const seen = new Set<string>();
     for (const pattern of recipe.copy) {
+      if (copyOff) {
+        skip(pattern, "not copied: the worktree starts from a commit that isn't on your checkout's branch, and nobody vouched for it");
+        continue;
+      }
       const matched = matchCopy(pattern, root);
       if (matched.length === 0) skip(pattern, "nothing matches it in the primary checkout");
       for (const rel of matched) {

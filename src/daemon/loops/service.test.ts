@@ -997,3 +997,78 @@ describe("audit round 4", () => {
   });
 });
 
+describe("triggered runs", () => {
+  const SHA = "a".repeat(40);
+  const trigger = (kind: "ci_failure" | "review_comment") => ({ kind, key: `k:${kind}`, watchId: "lw_1", url: "https://github.com/acme/shop/pull/1", summary: "Check \"test\" concluded failure." });
+
+  test.each([
+    [{ baseRef: { sha: "abc" } }, "full commit id"],
+    [{ baseRef: { sha: SHA, branch: "--force" } }, "branch name"],
+    [{ baseRef: { sha: SHA, repo: "acme/shop", fetchRef: "refs/tags/v1" } }, "fetchRef"],
+    [{ baseRef: { sha: SHA, fetchRef: "refs/pull/1/head" } }, "needs baseRef.repo"],
+    [{ baseRef: { sha: SHA, repo: "../evil", fetchRef: "refs/pull/1/head" } }, "GitHub repository"],
+  ])("rejects %j", (bad, message) => {
+    const { service } = setup();
+    expect(() => service.startRun(input(bad as Partial<LoopStartInput>), OWNER)).toThrow(message);
+  });
+
+  test("the base commit and the event are part of the contract; workspace notes reach the history", async () => {
+    class NotingHost extends FakeHost {
+      prepared: LoopRunRow[] = [];
+      override async prepareWorkspace(run: LoopRunRow) {
+        this.prepared.push(run);
+        return { ...(await super.prepareWorkspace(run)), notes: ["the repository's setup command did not run: base-not-on-primary"] };
+      }
+    }
+    const { host, service } = setup(new NotingHost());
+    host.steps = [{ edit: " fix" }];
+    const started = service.startRun(input({ baseRef: { sha: SHA, branch: "feature/x", repo: "acme/shop", fetchRef: "refs/pull/1/head", trusted: true }, trigger: trigger("ci_failure") }), OWNER);
+    const run = await settle(service, started.id, terminal);
+    expect(run.status).toBe("completed");
+    expect((host as NotingHost).prepared[0]!.contract.baseRef).toEqual({ sha: SHA, branch: "feature/x", repo: "acme/shop", fetchRef: "refs/pull/1/head", trusted: true });
+    expect(run.contract.trigger).toMatchObject({ kind: "ci_failure", watchId: "lw_1" });
+    expect(service.events(run.id).find((e) => e.type === "workspace.note")?.detail).toContain("setup command did not run");
+    expect(host.prompts[0]).toContain('<loop-data source="ci"');
+    expect(host.prompts[0]).toContain("on branch `feature/x`");
+  });
+
+  test("a review comment's run proceeds when its checks already pass: they guard the change", async () => {
+    const { host, service } = setup();
+    host.workspace = "base fix";
+    host.steps = [{ edit: " renamed", report: { outcome: "ready_for_verification", summary: "renamed" } }];
+    const run = await settle(service, service.startRun(input({ baseRef: { sha: SHA }, trigger: trigger("review_comment") }), OWNER).id, terminal);
+    expect(run.status).toBe("completed");
+    expect(host.prompts[0]).toContain("every check passed on the unmodified code");
+    expect(host.prompts[0]).toContain('<loop-data source="review comment"');
+  });
+
+  test("a review comment's run whose worker changed nothing says so, not that the checks are flaky", async () => {
+    const { host, service } = setup();
+    host.workspace = "base fix";
+    host.steps = [{ report: { outcome: "ready_for_verification", summary: "nothing to do" } }];
+    const run = await settle(service, service.startRun(input({ baseRef: { sha: SHA }, trigger: trigger("review_comment") }), OWNER).id, terminal);
+    expect(run.status).toBe("blocked");
+    expect(run.reason).toContain("changed no tracked file");
+    expect(run.reason).not.toContain("flaky");
+  });
+
+  test("a run that couldn't prepare its workspace reports why, for a watch to retry", async () => {
+    class BrokenHost extends FakeHost {
+      override async prepareWorkspace(): Promise<never> {
+        throw new Error("commit aaaa could not be fetched: fatal: transport 'file' not allowed");
+      }
+    }
+    const { service } = setup(new BrokenHost());
+    const run = await settle(service, service.startRun(input({ baseRef: { sha: SHA }, trigger: trigger("ci_failure") }), OWNER).id, terminal);
+    expect(run.status).toBe("failed");
+    expect(service.setupFailure(run.id)).toContain("transport 'file' not allowed");
+    expect(service.isActive(run.id)).toBe(false);
+  });
+
+  test("a CI trigger whose checks pass locally still has nothing to repair", async () => {
+    const { host, service } = setup();
+    host.workspace = "base fix";
+    const run = await settle(service, service.startRun(input({ baseRef: { sha: SHA }, trigger: trigger("ci_failure") }), OWNER).id, terminal);
+    expect(run.status).toBe("blocked");
+  });
+});
