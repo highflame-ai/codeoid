@@ -61,7 +61,7 @@ import {
   scheduleFromFlags,
   specFromFlags,
 } from "./terminal/routine-format.js";
-import { formatLoop, formatLoopRow, formatWatch, formatWatchRow, parseCheckFlag, parseCiFlag, parseTrustHeadFlag } from "./terminal/loop-format.js";
+import { formatLoop, formatLoopRow, formatWatch, formatWatchRow, parseCheckFlag, parseCiFlag, parseTrustHeadFlag, trustHeadOption } from "./terminal/loop-format.js";
 import {
   getConfigDir,
   getLocalTokenPath,
@@ -784,8 +784,6 @@ function printTestResult(resp: DaemonMessage | undefined): void {
 }
 
 const collect = (v: string, prev: string[] = []) => [...prev, v];
-/** `--trust-head [branch=sha]`: `true` given alone, the pins given with values. */
-const collectPin = (v: string, prev: unknown) => [...(Array.isArray(prev) ? (prev as string[]) : []), v];
 const TRUST_HEAD_HELP = (when: string) =>
   `${when}you vouch for each watched branch's head as it is now — it and everything beneath it are trusted, so later merges by trusted logins are judged from it (recorded in the watch's history and the audit log, with who put the head there). <branch>=<sha> (repeatable, at least 12 characters of the commit) vouches for that branch only while its head is still that commit, and for nothing if it moved`;
 
@@ -1711,7 +1709,7 @@ watch
   .option("--allow <login>", "GitHub login whose comments count (repeatable; default: you, as gh is signed in)", collect, [])
   .option("--mention <token>", "The token a comment must contain (default @codeoid)")
   .option("--trust <login>", "Another GitHub login whose commits may be on a head the watch runs; list everyone who merges to a watched branch. A bot as name[bot] trusts anyone who can make that bot push (repeatable; you are always trusted)", collect, [])
-  .option("--trust-head [branch=sha]", TRUST_HEAD_HELP("With --branch: "), collectPin)
+  .addOption(trustHeadOption(TRUST_HEAD_HELP("With --branch: ")))
   .option("--per-hour <n>", "Runs the watch may start per hour (default 6)")
   .option("--attempts <n>", "Worker attempts per run (default 3)")
   .option("--budget <n>", "Autonomous tool calls per attempt (default 60)")
@@ -1728,7 +1726,7 @@ watch
       allow: string[];
       mention?: string;
       trust: string[];
-      trustHead?: true | string[];
+      trustHead?: string[];
       perHour?: string;
       attempts?: string;
       budget?: string;
@@ -1817,8 +1815,8 @@ watch
 watch
   .command("resume <watchId>")
   .description("Start polling again")
-  .option("--trust-head [branch=sha]", TRUST_HEAD_HELP("For a watch of branches: "), collectPin)
-  .action((ref: string, f: { trustHead?: true | string[] }) =>
+  .addOption(trustHeadOption(TRUST_HEAD_HELP("For a watch of branches: ")))
+  .action((ref: string, f: { trustHead?: string[] }) =>
     withClient(async (c) => {
       const trustHead = parseTrustHeadFlag(f.trustHead);
       if (typeof trustHead === "string") {
@@ -1844,8 +1842,8 @@ watch
     [],
   )
   .option("--trust-none", "Trust no one but you: empty the list of trusted logins")
-  .option("--trust-head [branch=sha]", TRUST_HEAD_HELP("For a watch of branches: "), collectPin)
-  .action((ref: string, f: { trust: string[]; trustNone?: boolean; trustHead?: true | string[] }) =>
+  .addOption(trustHeadOption(TRUST_HEAD_HELP("For a watch of branches: ")))
+  .action((ref: string, f: { trust: string[]; trustNone?: boolean; trustHead?: string[] }) =>
     withClient(async (c) => {
       const fail = (m: string): void => {
         console.error(m);

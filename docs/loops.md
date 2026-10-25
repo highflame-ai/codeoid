@@ -173,12 +173,14 @@ An auto-merged one isn't by that alone: GitHub records whoever turned auto-merge
 A merge through the merge queue isn't either: GitHub records its bot as the actor of every merge queue merge, and the pull request names who queued it.
 So an auto-merged or queued pull request is trusted only when a trusted login turned auto-merge on or queued it, and its final head commit is itself trusted: pushed onto its branch by a trusted login, or every commit on it signed and verified by one (a merge one level further down doesn't count).
 An auto-merged one (not queued) is also trusted when GitHub's activity records the push of its final head as earlier than the last time auto-merge was turned on, a trusted login turned it on then, and that push is the newest change to its branch (or lies just beneath the branch's deletion at that head, as a merged pull request's branch usually ends).
+That change must be a push (or a force-push, or the push that created the branch), and the pull request's timeline must record no force-push of its head branch since auto-merge was last turned on; a timeline that doesn't say counts as one that does.
 Whoever turned it on had that head in front of them: a later push by someone with write access would be recorded later, and GitHub turns auto-merge off when someone without write access pushes.
 The push must be the newest because a writer could push the head, push another, and force-push the first back after auto-merge was on: until GitHub's activity lists that last push, the older push of the same commit is the newest that names it.
 GitHub doesn't record which head auto-merge was turned on at, only when, and whether it checks the head then isn't something the watch can rely on (`gh pr merge --auto` sends the head only with `--match-head-commit`; what the web button sends isn't documented), so that is a limit of this rule.
 Otherwise the head is untrusted, with why, for example "auto-merged; its last commit was pushed by @someone".
 When GitHub doesn't say whether auto-merge was ever on for a pull request, it is judged as auto-merged.
 GitHub can take a moment to link a merge commit to its pull request, or to list the push of the pull request's head: like a push it doesn't list yet, the head is judged again for ten minutes.
+The same holds for a hole in the activity whose commit GitHub names no pull request for yet: it is judged again for ten minutes before it is refused.
 
 What this means for a branch other people also merge to, such as a team's default branch:
 
@@ -187,6 +189,7 @@ What this means for a branch other people also merge to, such as a team's defaul
 - Every poll judges a watched branch's head when it has moved, and remembers it when it is trusted, so the remembered head keeps up with the branch and a later merge's chain is a step or two long.
   A head already remembered, or already judged untrusted, costs no calls beyond reading the branch's head; a moved head costs its activity page and, for a merge, two calls per pull request it landed.
   A moved head that isn't trusted is recorded untrusted, event or not (`show` lists it as a `head` ignored, with why), and also costs the read of its signatures.
+  Only the newest three such `head` records are kept per branch; an older one is dropped as a newer one is recorded, and a chain stops at the newest it meets anyway.
   Every head after it then stops its chain there: once something untrusted has landed on the branch, each later head costs the same few calls, not more with every change, until a trusted push or `--trust-head` gives the branch a trusted head again.
   When you make or resume a watch, or change its trust list, its next poll does the same for every head it watches, the heads of your pull requests too; being made trusts nothing by itself.
 - If the branch's chain can't reach a trusted head (it is long, or begins with a push by someone you don't trust), vouch for its head as it is now with `--trust-head`, below.
@@ -216,6 +219,7 @@ Any other kind of account GraphQL names, such as a `Mannequin` an import left be
 `--trust-head` (on `loop watch add`, `update`, and `resume`, for `--branch` watches) is you vouching for each watched branch as it is now.
 The watch reads each branch's current head from GitHub and remembers it as trusted under the watch's trust list: that head is trusted, so are the commits beneath it, and a later merge's chain of trusted merges ends at it.
 It is recorded in the watch's history, which `show` lists as "you vouched for main at abc123… (put there by a push by @someone)", and in the audit log.
+`show` always lists the newest of these for each branch, however many events came after it.
 The command prints that line, so you see which commit you vouched for and who put it on the branch.
 Given alone it vouches for whatever the head is when the daemon reads it, which may be a commit pushed after you last looked.
 `--trust-head <branch>=<sha>` (repeatable, at least 12 characters of the commit) closes that gap: it vouches for that branch only, and only while its head is still that commit.
@@ -223,7 +227,10 @@ If any named head moved, nothing is vouched for and nothing else in the request 
 Over the protocol, `trustHead` is `true` or an object of branch to commit (`{ "main": "0123456789ab" }`).
 It is never implied: making, resuming, or changing a watch without it vouches for nothing.
 It also forgets that head's untrusted record, if the watch had one.
-A change of the trust list afterwards forgets it like any remembered head; give `--trust-head` again with the new list (`update --trust … --trust-head`).
+A trust list that only adds logins afterwards keeps it, like any remembered head.
+One that drops anyone forgets it; give `--trust-head` again with the new list (`update --trust … --trust-head`).
+`--trust-head` alone and `--trust-head <branch>=<sha>` can't be given in one command.
+Given alone, it takes the word after it as its value, so put the watch id before it (`resume <watchId> --trust-head`).
 
 Use it for a branch that changes only through reviewed, protected merges, such as a team's default branch, when the watch can't otherwise reach a head it trusts: its history begins with someone else's push, or reaches back further than the watch reads.
 Vouch only for a head you would run yourself: everything on the branch at that moment is treated as yours, including commits you didn't review.
@@ -255,7 +262,12 @@ What follows from trusting by who pushed:
   A line comment you drafted into a review counts from when the review was submitted, not from when you drafted it; nothing in a review still pending counts.
   A comment GitHub records as edited is ignored for good, however soon after it was made (`show` lists it as "edited after it was made"): anyone with write access to the repository can edit someone else's comment, so its text may no longer be the author's.
   That holds for one already waiting to retry, too.
-  A comment on a pull request whose head is untrusted starts nothing while it is, and isn't lost: the watch keeps reading comments from before it until the head is vouched for (a trusted login pushes on top, or the trust list comes to include whoever pushed it), and then it runs on that head.
+  A comment on a pull request whose head is untrusted starts nothing while it is, and isn't lost.
+  That pull request's comments aren't read while its head is refused, and it keeps its own floor: where the watch read comments from when its head was first refused.
+  Once the head is vouched for (a trusted login pushes on top, or the trust list comes to include whoever pushed it), its comments are read once from that floor, so what was asked meanwhile runs on that head, and then it reads from the watch's floor like the others.
+  A floor held more than seven days reads back seven days only, and the poll says so.
+  The watch's other pull requests aren't held back by it.
+  A held pull request that drops out of the newest 30 a poll looks at keeps its floor until it is looked at again; one that closes forgets it.
 
 ### What a triggered run works on
 
@@ -287,7 +299,7 @@ What follows from trusting by who pushed:
   The terminal prints it with escape sequences and control characters removed, and links only to github.com.
 - A branch that can't be read (deleted, renamed) is a problem for that branch alone; the watch's other branches are still polled.
 - You can have 10 watches.
-  Comments are read from ten minutes before the last complete poll, not from the beginning each time; from further back only while a comment waits to retry, or a pull request with review comments on is at an untrusted head.
+  Comments are read from ten minutes before the last complete poll, not from the beginning each time; from further back only while a comment waits to retry, and for a pull request whose head was refused, from its own floor once (above).
   When GitHub rate-limits a watch (HTTP 429, or a 403 that says a rate limit is spent), every watch acting as that `gh` login backs off together: two poll intervals, then four, doubling up to six hours, until a poll isn't rate-limited (the doubling starts over even if that poll had other errors).
   Any other refusal (a 403 for missing access) is an error the watch records, with GitHub's message.
 - `gh` runs with only `PATH`, `HOME`, and its config location in its environment, never the daemon's credentials, and with a timeout; a failed poll is recorded on the watch (`show` displays it, naming the GitHub endpoint) and the next poll tries again.

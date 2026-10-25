@@ -114,6 +114,10 @@ interface Merge {
   enabledBy?: string;
   /** Added to a merge queue at some point: its timeline has the event. */
   queued?: boolean;
+  /** When its head branch was last force-pushed (its timeline's event); default never. */
+  forcePushedAt?: number;
+  /** GraphQL's answer leaves out its force-pushes alone. */
+  forcePushesMissing?: boolean;
   /** The GraphQL type of the account it names as having merged it; default a user's or a bot's, by its login. */
   mergedByType?: string;
   /** Its commits as `pulls/{n}/commits` lists them, oldest first; default one, with the head's sha. */
@@ -254,6 +258,9 @@ class FakeGitHub {
                       },
                     }),
                 mergeQueued: { nodes: m.queued ? [{ __typename: "AddedToMergeQueueEvent" }] : [] },
+                ...(m.timelineMissing || m.forcePushesMissing
+                  ? {}
+                  : { headForcePushed: { nodes: m.forcePushedAt !== undefined ? [{ __typename: "HeadRefForcePushedEvent", createdAt: iso(m.forcePushedAt) }] : [] } }),
               },
             },
           },
@@ -1143,6 +1150,8 @@ describe("trust: a head runs only when a trusted login pushed it, or signed ever
   });
 
   test("a new watch remembers a head only when it is vouched for, and the head a watch trusted ends a later chain", async () => {
+    let skew = 0;
+    svc = make({ now: () => Date.now() + skew });
     // Made while main's head is your push: remembered, with no event on it.
     gh.branches.set("main", SHA1);
     gh.pushes = [{ branch: "main", after: SHA1, actor: "ada", before: BENEATH }];
@@ -1166,6 +1175,10 @@ describe("trust: a head runs only when a trusted login pushed it, or signed ever
     // One that drops someone forgets it.
     failing(SHA2, 603);
     await svc.update(w.id, { spec: { trust: [] } }, OWNER);
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
+    // The hole names no pull request: GitHub may not have linked it yet, so it is judged again for ten minutes.
+    expect(noteOf(w.id)).toBe("");
+    skew += 11 * 60_000;
     expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
     expect(noteOf(w.id)).toContain(`GitHub's activity has no record of how ${SHA1.slice(0, 12)} came to be on main`);
     // Made while main's head is a stranger's push: nothing is remembered, since being made vouches for nothing.
@@ -1232,6 +1245,8 @@ describe("trust: a head runs only when a trusted login pushed it, or signed ever
   };
 
   test("a stack merged at once: every pull request in it is judged (astral-sh/uv e96aa69)", async () => {
+    let skew = 0;
+    svc = make({ now: () => Date.now() + skew });
     gh.me = "zsol";
     const w = await svc.create({ workdir: "/repo", branches: ["main"], ci: CI, trust: ["zanieb"] }, OWNER);
     const remember = () => store.rememberTrusted(store.get(w.id)!, REPO, "main", UV.below, Date.now());
@@ -1253,6 +1268,8 @@ describe("trust: a head runs only when a trusted login pushed it, or signed ever
     store.forgetTrusted(store.get(w.id)!);
     gh.merges.push({ sha: UV.below, number: 22881, base: "main", head: { ref: "zb/code-quality-review-opt-in", sha: "b8eba9d56b2e413f7f89707e0bd5ce33e92d2fc9" }, mergedBy: "zanieb" });
     failing(UV.top, 603);
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
+    skew += 11 * 60_000;
     expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
     expect(store.listTriggers(w.id).find((t) => t.key.startsWith("untrusted:"))!.note).toContain("no record of how 3a0e63ed902b came to be on main");
   });
@@ -1681,6 +1698,8 @@ describe("trust: a head runs only when a trusted login pushed it, or signed ever
   };
 
   test("a hole in GitHub's activity is crossed at a pull request merged with the button by a trusted login (cli/cli's trunk at fa92838)", async () => {
+    let skew = 0;
+    svc = make({ now: () => Date.now() + skew });
     gh.me = "williammartin";
     const w = await svc.create({ workdir: "/repo", branches: ["trunk"], ci: CI, trust: ["bdehamer", "BagToad"] }, OWNER);
     store.rememberTrusted(store.get(w.id)!, REPO, "trunk", HOLE.under, Date.now());
@@ -1688,7 +1707,7 @@ describe("trust: a head runs only when a trusted login pushed it, or signed ever
     failing(HOLE.top, 901);
     expect((await svc.poll(w.id, OWNER)).started).toHaveLength(1);
     expect(gh.pathsCalled(`/commits/${HOLE.gap}/pulls`)).toHaveLength(1);
-    const refused = async (over: Partial<Merge>, why: string, check: number) => {
+    const refused = async (over: Partial<Merge>, why: string, check: number, transient = false) => {
       loops.active.clear();
       store.forgetUntrusted(store.get(w.id)!);
       store.forgetTrusted(store.get(w.id)!);
@@ -1696,17 +1715,25 @@ describe("trust: a head runs only when a trusted login pushed it, or signed ever
       cliHole(over);
       failing(HOLE.top, check);
       expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
+      if (transient) {
+        // GitHub may not have linked the merge to its commit yet: judged again for ten minutes, then refused.
+        expect(noteOf(w.id)).toBe("");
+        skew += 11 * 60_000;
+        expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
+      }
       // Not a range: the hole is inside what was read.
       expect(noteOf(w.id)).toContain(`GitHub's activity has no record of how ${HOLE.gap.slice(0, 12)} came to be on trunk, and ${why}`);
     };
     await refused({ autoMerge: true }, "pull request #14720, merged as it, was auto-merged", 902);
     await refused({ queued: true }, "pull request #14720, merged as it, went through a merge queue", 903);
     await refused({ mergedBy: "mallory" }, "pull request #14720, merged as it, was merged by @mallory", 904);
-    await refused({ sha: "c".repeat(40) }, "GitHub names no pull request merged as it", 905);
+    await refused({ sha: "c".repeat(40) }, "GitHub names no pull request merged as it", 905, true);
   });
 
   test("at most three holes are crossed in one chain, and past the activity read the reason says so", async () => {
     // Four button merges of yours, none in the activity, beneath your merge at the head.
+    let skew = 0;
+    svc = make({ now: () => Date.now() + skew });
     const g = ["1", "2", "3", "4"].map((n) => `${"e".repeat(39)}${n}`);
     const w = await mainWatch();
     gh.older = [{ branch: "main", after: BENEATH, actor: "ada", type: "push", before: "8".repeat(40) }];
@@ -1729,6 +1756,8 @@ describe("trust: a head runs only when a trusted login pushed it, or signed ever
     gh.merges = rel.pulls;
     gh.pushes = rel.pushes;
     gh.commits.set(rel.head, []);
+    await svc.poll(other.id, OWNER);
+    skew += 11 * 60_000;
     await svc.poll(other.id, OWNER);
     // The oldest merge read (its record is past them) is crossed, as yours; what it was made on isn't anyone's.
     expect(noteOf(other.id)).toContain(`GitHub's activity (the newest 300 entries read) has no record of how ${"f".repeat(12)} came to be on release, and GitHub names no pull request merged as it`);
@@ -1867,12 +1896,12 @@ describe("trust: a head runs only when a trusted login pushed it, or signed ever
       await svc.poll(w.id, OWNER);
       perPoll.push(gh.calls.length - before);
     }
-    // Trusted until the stranger's merge, which is recorded untrusted with no event on it, and shown.
+    // Trusted until the stranger's merge, which is recorded untrusted with no event on it, and shown; of the
+    // heads recorded so after it, only the newest three are kept, and each chain stops at the newest.
     expect(store.lastTrusted(store.get(w.id)!, REPO, "main")).toBe(r.shas[bad + 1]);
     const heads = store.listTriggers(w.id).filter((t) => t.kind === "head");
-    expect(heads).toHaveLength(bad + 1);
-    expect(heads.find((t) => t.key.includes(r.shas[bad]!))!.note).toContain("merged by @mallory");
-    expect(heads.find((t) => t.key.includes(r.shas[0]!))!.note).toContain(`${r.shas[1]!.slice(0, 12)}, beneath it, was judged untrusted`);
+    expect(heads.map((t) => t.key.split(":")[2])).toEqual([r.shas[0], r.shas[1], r.shas[2]]);
+    expect(heads[0]!.note).toContain(`${r.shas[1]!.slice(0, 12)}, beneath it, was judged untrusted`);
     // The stranger's merge and every head after it: who gh is, the head, the activity, its merge (REST and GraphQL),
     // the default branch, and the signatures (no check runs: the refresh refused it first) — flat, however many
     // changes since the stranger's.
@@ -2144,6 +2173,147 @@ describe("trust: a head runs only when a trusted login pushed it, or signed ever
     mallory();
     gh.comments.set(12, [{ id: 7, login: "ada", body: "@codeoid rename it" }]);
     expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
+  });
+
+  // ── Round 9 ───────────────────────────────────────────────────────────────
+
+  test("a pull request at a refused head keeps its own comment floor: the watch's moves on, and the held one is read from its floor once", async () => {
+    let now = Date.now();
+    svc = make({ now: () => now });
+    const w = await prWatch({ review: { enabled: true } });
+    gh.prs.push({ number: 13, headRefName: "feature/menu", headRefOid: "3".repeat(40), url: `https://github.com/${REPO}/pull/13` });
+    mallory();
+    gh.commits.set(SHA1, [{ sha: "a".repeat(40), author: "mallory", committer: "mallory" }]);
+    gh.comments.set(12, [{ id: 7, login: "ada", body: "@codeoid rename the cart", kind: "issue", at: now + 60_000 }]);
+    const sinceOf = (n: number) => Date.parse(new URLSearchParams(gh.pathsCalled(`/issues/${n}/comments`).at(-1)!.split("?")[1]).get("since")!);
+    now += 2 * 60_000;
+    await svc.poll(w.id, OWNER);
+    for (let i = 0; i < 4; i++) {
+      now += 15 * 60_000;
+      await svc.poll(w.id, OWNER);
+    }
+    // #13 is read from shortly before the last complete poll: #12 being held doesn't hold the watch's floor.
+    expect(store.get(w.id)!.lastOkAt).toBe(now);
+    expect(sinceOf(13)).toBe(now - 15 * 60_000 - 10 * 60_000);
+    // #12's comments aren't read while its head is refused; its floor is the watch's when it was first refused.
+    expect(gh.pathsCalled("/issues/12/comments")).toHaveLength(0);
+    expect(store.heldFloor(w, 12)).toBe(w.createdAt - 2 * 60_000);
+    // You push on top: #12 is read from its floor, once, and what you asked meanwhile runs.
+    gh.prs[0]!.headRefOid = SHA2;
+    gh.pushes.unshift({ branch: "feature/cart", after: SHA2, actor: "ada" });
+    now += 15 * 60_000;
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(1);
+    expect(loops.started[0]!.input.trigger!.key).toBe(`review:${REPO}:issue:7`);
+    expect(sinceOf(12)).toBe(w.createdAt - 2 * 60_000);
+    expect(store.heldFloor(w, 12)).toBeNull();
+    // Then it reads from the watch's floor like the rest.
+    loops.active.clear();
+    now += 15 * 60_000;
+    await svc.poll(w.id, OWNER);
+    expect(sinceOf(12)).toBe(now - 15 * 60_000 - 10 * 60_000);
+  });
+
+  test("a held pull request is read back a week at most, saying so; its hold outlasts it leaving the newest 30, and ends when it closes", async () => {
+    const day = 24 * 60 * 60_000;
+    let now = Date.now();
+    svc = make({ now: () => now });
+    const w = await prWatch({ review: { enabled: true } });
+    mallory();
+    gh.commits.set(SHA1, [{ sha: "a".repeat(40), author: "mallory", committer: "mallory" }]);
+    await svc.poll(w.id, OWNER);
+    const floor = store.heldFloor(w, 12)!;
+    expect(floor).toBe(w.createdAt - 2 * 60_000);
+    for (let d = 0; d < 8; d++) {
+      now += day;
+      await svc.poll(w.id, OWNER);
+    }
+    expect(store.heldFloor(w, 12)).toBe(floor);
+    gh.prs[0]!.headRefOid = SHA2;
+    gh.pushes.unshift({ branch: "feature/cart", after: SHA2, actor: "ada" });
+    now += 60_000;
+    const res = await svc.poll(w.id, OWNER);
+    const since = Date.parse(new URLSearchParams(gh.pathsCalled("/issues/12/comments").at(-1)!.split("?")[1]).get("since")!);
+    expect(since).toBe(now - 7 * day);
+    expect(res.skipped.join()).toContain("#12: its comments were held more than 7 days");
+    expect(store.heldFloor(w, 12)).toBeNull();
+    // Held, then pushed past the newest 30 pull requests a poll looks at: it stays held, to be read when it is back.
+    store.hold(w, 12, now);
+    const pr12 = gh.prs[0]!;
+    gh.prs = [...Array.from({ length: 30 }, (_, i) => ({ number: 100 + i, headRefName: `b${i}`, headRefOid: (i + 10).toString(16).padStart(40, "a"), url: "" })), pr12];
+    const reads = gh.pathsCalled("/issues/12/comments").length;
+    now += 60_000;
+    await svc.poll(w.id, OWNER);
+    expect(gh.pathsCalled("/issues/12/comments")).toHaveLength(reads);
+    expect(store.heldFloor(w, 12)).toBe(now - 60_000);
+    // Closed: nothing more to read.
+    gh.prs = gh.prs.slice(0, 30);
+    now += 60_000;
+    await svc.poll(w.id, OWNER);
+    expect(store.heldFloor(w, 12)).toBeNull();
+  });
+
+  test("`show` keeps the newest of what you vouched for in view however many rows are newer; a branch keeps its newest three `head` rows", async () => {
+    gh.branches.set("main", SHA1);
+    const w = await svc.create({ workdir: "/repo", branches: ["main"], ci: CI }, OWNER, { trustHead: true });
+    const wr = store.get(w.id)!;
+    for (let i = 0; i < 25; i++) store.ignore(wr, `ci:${REPO}:${SHA1}:${i}:0`, "ci_failure", "main", "the commit is a loop's own delivery", Date.now() + 1_000 + i);
+    const rows = store.listTriggers(w.id, 20);
+    expect(rows).toHaveLength(21);
+    expect(rows.at(-1)).toMatchObject({ kind: "trust_anchor", branch: "main" });
+    expect(rows.slice(0, 20).every((r) => r.kind === "ci_failure")).toBe(true);
+    // Head rows: the newest three of a branch (in its repository) stay; another branch's are its own.
+    const head = (sha: string, branch = "main", repo = REPO) => `untrusted:${w.id}:${sha}:${repo}:${branch}`;
+    const shas = ["a", "b", "c", "d", "e"].map((c) => c.repeat(40));
+    shas.forEach((sha, i) => store.ignore(wr, head(sha), "head", "main", "not pushed by someone you trust", Date.now() + 2_000 + i));
+    store.ignore(wr, head(SHA2, "dev"), "head", "dev", "not pushed by someone you trust", Date.now() + 3_000);
+    store.ignore(wr, head(SHA2, "main", "fork/shop"), "head", "main", "not pushed by someone you trust", Date.now() + 3_000);
+    const heads = store.listTriggers(w.id).filter((t) => t.kind === "head").map((t) => t.key);
+    expect(heads.filter((k) => k.endsWith(`:${REPO}:main`))).toEqual([head(shas[4]!), head(shas[3]!), head(shas[2]!)]);
+    expect(heads).toContain(head(SHA2, "dev"));
+    expect(heads).toContain(head(SHA2, "main", "fork/shop"));
+    expect(store.seen(wr, [head(shas[4]!), head(shas[0]!)])).toEqual(new Set([head(shas[4]!)]));
+  });
+
+  test("a hole GitHub hasn't linked to its pull request yet, minutes after the merge, is judged again, and crossed once it is", async () => {
+    let skew = 0;
+    svc = make({ now: () => Date.now() + skew });
+    gh.me = "williammartin";
+    const w = await svc.create({ workdir: "/repo", branches: ["trunk"], ci: CI, trust: ["bdehamer", "BagToad"] }, OWNER);
+    store.rememberTrusted(store.get(w.id)!, REPO, "trunk", HOLE.under, Date.now());
+    cliHole({ sha: "c".repeat(40) });
+    failing(HOLE.top, 931);
+    const res = await svc.poll(w.id, OWNER);
+    expect(res.started).toHaveLength(0);
+    expect(res.skipped.join()).toContain(`not vouched for yet (GitHub's activity has no record of how ${HOLE.gap.slice(0, 12)} came to be on trunk, and GitHub names no pull request merged as it`);
+    expect(noteOf(w.id)).toBe("");
+    skew += 5 * 60_000;
+    cliHole();
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(1);
+  });
+
+  test("auto-merge turned on after the final head's push vouches only while its timeline records no force-push since, and only for a push", async () => {
+    const hour = 60 * 60_000;
+    const w = await mainWatch();
+    gh.commits.set(MERGED_HEAD, [{ sha: MERGED_HEAD, author: "mallory", committer: "mallory" }]);
+    const again = async (over: Partial<Merge>, check: number, type = "push") => {
+      loops.active.clear();
+      store.forgetUntrusted(store.get(w.id)!);
+      store.forgetTrusted(store.get(w.id)!);
+      failing(SHA1, check);
+      gh.pushes = [onMain(SHA1, "ada", "pr_merge"), { branch: "feature/cart", after: MERGED_HEAD, actor: "mallory", type, at: Date.now() - 2 * hour }];
+      gh.merges = [merged(SHA1, { autoMerge: true, enabledAt: Date.now() - hour, ...over })];
+      return (await svc.poll(w.id, OWNER)).started.length;
+    };
+    expect(await again({}, 601)).toBe(1);
+    // Force-pushed before auto-merge was turned on: that is the head you had in front of you.
+    expect(await again({ forcePushedAt: Date.now() - 1.5 * hour }, 602, "force_push")).toBe(1);
+    // Force-pushed since, whatever the activity lists as its newest change; or GitHub doesn't say.
+    expect(await again({ forcePushedAt: Date.now() - hour / 2 }, 603)).toBe(0);
+    expect(noteOf(w.id)).toContain("auto-merged; its last commit was pushed by @mallory");
+    expect(await again({ forcePushesMissing: true }, 604)).toBe(0);
+    // The head's change isn't a push.
+    expect(await again({}, 605, "pr_merge")).toBe(0);
+    expect(noteOf(w.id)).toContain("its last commit came from a pr_merge, not a push");
   });
 });
 

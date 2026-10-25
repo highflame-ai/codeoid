@@ -405,6 +405,11 @@ export interface MergedPull {
   autoMerged: boolean;
   /** The last time auto-merge was turned on for it, and by whom; null when it never was, or GitHub doesn't say when or by whom. */
   autoMergeEnabled: { at: number; by: string | null } | null;
+  /**
+   * When its head branch was last force-pushed, from its timeline: null when
+   * it never was, `unknown` when GitHub doesn't say.
+   */
+  headForcePushedAt: number | null | "unknown";
   /** It was added to a merge queue at some point; true when GitHub doesn't say either way. */
   queued: boolean;
   /** How many parents its merge commit has; 0 when GitHub doesn't say. */
@@ -475,9 +480,10 @@ const COMMENT_NODES_QUERY = `query($ids: [ID!]!) {
  * auto-merge was on — now (`autoMergeRequest`, null once it merged by hand)
  * or ever (an enable event in its timeline, kept after a disable) — and when
  * and by whom it was last turned on; whether it was ever added to a merge
- * queue; and what its merge commit was made on, how many parents it has, and
- * how many commits the pull request had, which tell which commits beneath the
- * merge commit it put on the branch. Logins are asked with their type: GraphQL
+ * queue; when its head branch was last force-pushed; and what its merge
+ * commit was made on, how many parents it has, and how many commits the pull
+ * request had, which tell which commits beneath the merge commit it put on
+ * the branch. Logins are asked with their type: GraphQL
  * names a bot without the `[bot]` that REST and the activity give it.
  * (A filtered `timelineItems`' `totalCount` counts every item, so the
  * filtered nodes are what is read.)
@@ -497,6 +503,7 @@ const MERGED_PULL_QUERY = `query($owner: String!, $name: String!, $number: Int!)
         }
       }
       mergeQueued: timelineItems(itemTypes: [ADDED_TO_MERGE_QUEUE_EVENT], first: 1) { nodes { __typename } }
+      headForcePushed: timelineItems(itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT], last: 1) { nodes { __typename ... on HeadRefForcePushedEvent { createdAt } } }
     }
   }
 }`;
@@ -740,6 +747,8 @@ export class GitHubSource {
     const lastEnable = Array.isArray(events) ? (events.at(-1) as { createdAt?: unknown; actor?: unknown } | null | undefined) : undefined;
     const enabledAt = time(lastEnable?.createdAt);
     const queuedEvents = (q.mergeQueued as { nodes?: unknown } | null | undefined)?.nodes;
+    const forcePushes = (q.headForcePushed as { nodes?: unknown } | null | undefined)?.nodes;
+    const lastForcePush = Array.isArray(forcePushes) ? (forcePushes.at(-1) as { createdAt?: unknown } | null | undefined) : undefined;
     const head = (p.head ?? {}) as { ref?: unknown; sha?: unknown; repo?: { full_name?: unknown } | null };
     const baseRef = str((p.base as { ref?: unknown } | null | undefined)?.ref);
     const headRepo = str(head.repo?.full_name);
@@ -758,6 +767,8 @@ export class GitHubSource {
         autoMerged: p.auto_merge !== null || q.autoMergeRequest !== null || !Array.isArray(events) || events.length > 0,
         autoMergeEnabled: enabledAt !== null ? { at: enabledAt, by: actorLogin(lastEnable?.actor) } : null,
         queued: !Array.isArray(queuedEvents) || queuedEvents.length > 0,
+        // A force-push GitHub lists without saying when is as good as not knowing.
+        headForcePushedAt: !Array.isArray(forcePushes) ? "unknown" : forcePushes.length === 0 ? null : (time(lastForcePush?.createdAt) ?? "unknown"),
         parents: typeof parentCount === "number" && Number.isInteger(parentCount) && parentCount > 0 ? parentCount : 0,
         headRepo: isRepo(headRepo) ? headRepo : null,
         headRef: str(head.ref),

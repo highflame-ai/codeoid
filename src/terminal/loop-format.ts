@@ -10,6 +10,7 @@ import type {
   LoopWatchTriggerWire,
   LoopWatchWire,
 } from "../protocol/types.js";
+import { InvalidArgumentError, Option } from "commander";
 import { sanitizeTerminalOutput } from "../tui/ansi/codes.js";
 
 /**
@@ -165,15 +166,41 @@ export function parseCiFlag(raw: string): { ciName: string; app?: string; comman
   return ciName && command ? { ciName, ...(app ? { app: app[2]! } : {}), command } : null;
 }
 
+/** What `--trust-head` collects when it is given alone: commander would otherwise overwrite the pins collected before it with `true`. */
+export const TRUST_HEAD_ALONE = "\u0000alone";
+
 /**
- * Parse `--trust-head`: given alone (`true`), you vouch for each watched
- * branch's head as it is when the daemon reads it; given `<branch>=<sha>`
- * (repeatable), only for those branches, and only while each head is still
- * the commit you name (at least 12 characters of it) — otherwise nothing is
- * vouched for. A string is what is wrong with it.
+ * Collect one `--trust-head`: alone, or a `<branch>=<sha>`. A value without
+ * `=` is refused here, before commander checks the command's arguments: it
+ * is most likely the watch id, taken as the option's value.
+ */
+export function collectTrustHead(v: string, prev: unknown): string[] {
+  if (v !== TRUST_HEAD_ALONE && !v.includes("=")) {
+    throw new InvalidArgumentError(
+      `${JSON.stringify(v)} isn't <branch>=<sha>. Given alone, --trust-head takes the word after it as its value: put the watch id before --trust-head, or another option after it.`,
+    );
+  }
+  return [...(Array.isArray(prev) ? (prev as string[]) : []), v];
+}
+
+/** `--trust-head [branch=sha]`, repeatable, alone or pinned (see {@link parseTrustHeadFlag}). */
+export function trustHeadOption(description: string): Option {
+  return new Option("--trust-head [branch=sha]", description).preset(TRUST_HEAD_ALONE).argParser(collectTrustHead);
+}
+
+/**
+ * Parse `--trust-head`: given alone (`true`, or only {@link TRUST_HEAD_ALONE}),
+ * you vouch for each watched branch's head as it is when the daemon reads it;
+ * given `<branch>=<sha>` (repeatable), only for those branches, and only while
+ * each head is still the commit you name (at least 12 characters of it) —
+ * otherwise nothing is vouched for. Both in one command is refused. A string
+ * is what is wrong with it.
  */
 export function parseTrustHeadFlag(v: true | string[] | undefined): true | Record<string, string> | undefined | string {
   if (v === undefined || v === true) return v;
+  const alone = v.filter((x) => x === TRUST_HEAD_ALONE).length;
+  if (alone > 0 && alone === v.length) return true;
+  if (alone > 0) return "Give --trust-head alone (every watched branch's head as it is) or as <branch>=<sha>, not both.";
   const out: Record<string, string> = {};
   for (const raw of v) {
     const i = raw.lastIndexOf("=");

@@ -191,6 +191,16 @@ export class WatchStore {
         PRIMARY KEY (watch_id, repo, branch)
       );
       CREATE INDEX IF NOT EXISTS idx_loop_triggers_branch ON loop_triggers(account_id, project_id, owner_sub, repo, branch, settled);
+
+      -- Pull requests whose comments aren't read while their head is
+      -- refused, and where their comments are read from once it isn't:
+      -- the floor the watch's comments were read from when it was first refused.
+      CREATE TABLE IF NOT EXISTS loop_watch_held_prs (
+        watch_id    TEXT NOT NULL,
+        pr          INTEGER NOT NULL,
+        floor_at    INTEGER NOT NULL,
+        PRIMARY KEY (watch_id, pr)
+      );
     `);
     for (const c of ["last_ok_at", "resumed_at"]) {
       if (!cols("loop_watches").includes(c)) this.#db.exec(`ALTER TABLE loop_watches ADD COLUMN ${c} INTEGER`);
@@ -281,6 +291,7 @@ export class WatchStore {
     this.#db.transaction(() => {
       this.#db.prepare("DELETE FROM loop_triggers WHERE watch_id = ? AND (key LIKE ? OR key LIKE ?)").run(id, `untrusted:${id}:%`, `vouch:${id}:%`);
       this.#db.prepare("DELETE FROM loop_watch_trusted_heads WHERE watch_id = ?").run(id);
+      this.#db.prepare("DELETE FROM loop_watch_held_prs WHERE watch_id = ?").run(id);
       this.#db.prepare("DELETE FROM loop_watches WHERE id = ?").run(id);
     })();
   }
@@ -357,15 +368,33 @@ export class WatchStore {
    * one already acted on stays as it is.
    */
   ignore(w: WatchRow, key: string, kind: TriggerKind | "head", branch: string, note: string, at: number): void {
-    this.#db
-      .prepare(
-        `INSERT INTO loop_triggers (account_id, project_id, owner_sub, repo, watch_id, key, kind, branch, outcome, note, settled, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ignored', ?, 1, ?)
-         ON CONFLICT (account_id, project_id, owner_sub, key) DO UPDATE
-           SET outcome = 'ignored', note = excluded.note, settled = 1, run_id = NULL, watch_id = excluded.watch_id
-         WHERE outcome = 'retry'`,
-      )
-      .run(w.accountId, w.projectId, w.ownerSub, w.repo, w.id, key, kind, branch, note.slice(0, 500), at);
+    this.#db.transaction(() => {
+      this.#db
+        .prepare(
+          `INSERT INTO loop_triggers (account_id, project_id, owner_sub, repo, watch_id, key, kind, branch, outcome, note, settled, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ignored', ?, 1, ?)
+           ON CONFLICT (account_id, project_id, owner_sub, key) DO UPDATE
+             SET outcome = 'ignored', note = excluded.note, settled = 1, run_id = NULL, watch_id = excluded.watch_id
+           WHERE outcome = 'retry'`,
+        )
+        .run(w.accountId, w.projectId, w.ownerSub, w.repo, w.id, key, kind, branch, note.slice(0, 500), at);
+      if (kind === "head") this.#pruneHeads(w, key, branch);
+    })();
+  }
+
+  /**
+   * Keep the newest {@link HEAD_ROWS_KEPT} `head` rows of `key`'s branch (in
+   * its repository): a chain walking back from a later head stops at the
+   * newest it meets, and the older ones would only crowd `show`.
+   */
+  #pruneHeads(w: WatchRow, key: string, branch: string): void {
+    // `untrusted:<watch>:<sha>:<repo>:<branch>`: what follows the sha names where the head is.
+    const where = key.split(":").slice(3).join(":");
+    const rows = this.#db
+      .prepare("SELECT rowid AS id, key FROM loop_triggers WHERE watch_id = ? AND kind = 'head' AND branch = ? ORDER BY created_at DESC, rowid DESC")
+      .all(w.id, branch) as Array<{ id: number; key: string }>;
+    const del = this.#db.prepare("DELETE FROM loop_triggers WHERE rowid = ?");
+    for (const r of rows.filter((r) => r.key.split(":").slice(3).join(":") === where).slice(HEAD_ROWS_KEPT)) del.run(r.id);
   }
 
   /**
@@ -416,6 +445,37 @@ export class WatchStore {
       }
     })();
     return n;
+  }
+
+  /**
+   * Hold pull request `pr`'s comments: its head is refused, so they aren't
+   * read; once it isn't, they are read from `floor`, or from where an earlier
+   * hold of it put them, whichever is earlier.
+   */
+  hold(w: WatchRow, pr: number, floor: number): void {
+    this.#db
+      .prepare(
+        `INSERT INTO loop_watch_held_prs (watch_id, pr, floor_at) VALUES (?, ?, ?)
+         ON CONFLICT (watch_id, pr) DO UPDATE SET floor_at = MIN(floor_at, excluded.floor_at)`,
+      )
+      .run(w.id, pr, floor);
+  }
+
+  /** Where `pr`'s held comments are read from, or null when they aren't held. */
+  heldFloor(w: WatchRow, pr: number): number | null {
+    const row = this.#db.prepare("SELECT floor_at FROM loop_watch_held_prs WHERE watch_id = ? AND pr = ?").get(w.id, pr) as { floor_at: number } | null;
+    return row?.floor_at ?? null;
+  }
+
+  /** `pr`'s held comments were read: it rejoins the watch's floor. */
+  unhold(w: WatchRow, pr: number): void {
+    this.#db.prepare("DELETE FROM loop_watch_held_prs WHERE watch_id = ? AND pr = ?").run(w.id, pr);
+  }
+
+  /** Forget the holds of pull requests not in `openPrs` (they closed). A held one only past the newest the watch looks at stays held. */
+  pruneHolds(w: WatchRow, openPrs: Set<number>): void {
+    const rows = this.#db.prepare("SELECT pr FROM loop_watch_held_prs WHERE watch_id = ?").all(w.id) as Array<{ pr: number }>;
+    for (const r of rows) if (!openPrs.has(r.pr)) this.unhold(w, r.pr);
   }
 
   /** Forget this watch's untrusted-head notes (its trust list changed: judge them again). */
@@ -557,10 +617,24 @@ export class WatchStore {
     ).n;
   }
 
+  /**
+   * The watch's newest `limit` rows, and with them, however old, the newest
+   * trust anchor of each branch: what you vouched for stays in view.
+   */
   listTriggers(watchId: string, limit = 50): TriggerRow[] {
-    return (
-      this.#db.prepare("SELECT * FROM loop_triggers WHERE watch_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?").all(watchId, limit) as TriggerDbRow[]
-    ).map((r) => ({
+    const rows = this.#db
+      .prepare("SELECT rowid AS rid, * FROM loop_triggers WHERE watch_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?")
+      .all(watchId, limit) as Array<TriggerDbRow & { rid: number }>;
+    const have = new Set(rows.map((r) => r.rid));
+    const anchors = this.#db
+      .prepare(
+        `SELECT rowid AS rid, * FROM loop_triggers t WHERE watch_id = ? AND kind = 'trust_anchor'
+           AND rowid = (SELECT rowid FROM loop_triggers u WHERE u.watch_id = t.watch_id AND u.kind = 'trust_anchor' AND u.branch = t.branch
+                        ORDER BY created_at DESC, rowid DESC LIMIT 1)`,
+      )
+      .all(watchId) as Array<TriggerDbRow & { rid: number }>;
+    const all = [...rows, ...anchors.filter((a) => !have.has(a.rid))].sort((a, b) => b.created_at - a.created_at || b.rid - a.rid);
+    return all.map((r) => ({
       watchId: r.watch_id,
       key: r.key,
       kind: r.kind as TriggerRow["kind"],
@@ -585,6 +659,9 @@ export function trustGeneration(spec: Pick<WatchSpec, "ghLogin" | "trust">): str
     .digest("hex")
     .slice(0, 32);
 }
+
+/** `head` rows (a head judged untrusted with no event on it) kept per branch: the newest. */
+export const HEAD_ROWS_KEPT = 3;
 
 /** Thrown inside a transaction to roll it back. */
 class Rollback extends Error {}

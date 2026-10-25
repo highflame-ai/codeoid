@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { LoopRunWire } from "../protocol/types.js";
-import { formatLoop, formatLoopRow, formatWatch, parseCheckFlag, parseCiFlag, parseTrustHeadFlag, startedBy } from "./loop-format";
+import { Command } from "commander";
+import { formatLoop, formatLoopRow, formatWatch, parseCheckFlag, parseCiFlag, parseTrustHeadFlag, startedBy, TRUST_HEAD_ALONE, trustHeadOption } from "./loop-format";
 
 const run: LoopRunWire = {
   id: "loop_12345678-aaaa-bbbb-cccc-1234567890ab",
@@ -128,5 +129,37 @@ describe("--trust-head", () => {
     expect(parseTrustHeadFlag(["main"])).toContain("expected <branch>=<sha>");
     expect(parseTrustHeadFlag(["=0123456789ab"])).toContain("expected <branch>=<sha>");
     expect(parseTrustHeadFlag(["main=0123456789ab", "main=ba9876543210"])).toContain("two commits for main");
+  });
+
+  // As the CLI declares it: commander overwrites what an optional-value option collected with `true` when it is given alone.
+  const parse = (...argv: string[]) => {
+    let got: { ref?: string; trustHead?: string[] } = {};
+    const cmd = new Command()
+      .exitOverride()
+      .configureOutput({ writeErr: () => {} })
+      .argument("<watchId>")
+      .addOption(trustHeadOption(""))
+      .option("--trust <login>")
+      .action((ref: string, f: { trustHead?: string[] }) => {
+        got = { ref, ...(f.trustHead ? { trustHead: f.trustHead } : {}) };
+      });
+    cmd.parse(argv, { from: "user" });
+    return { ...got, parsed: parseTrustHeadFlag(got.trustHead) };
+  };
+
+  test("alone and pinned in one command is refused, in either order, rather than one silently winning", () => {
+    expect(parse("lw_1", "--trust-head").parsed).toBe(true);
+    expect(parse("lw_1", "--trust-head", "--trust-head").parsed).toBe(true);
+    expect(parse("lw_1", "--trust-head", "--trust", "bob").parsed).toBe(true);
+    expect(parse("lw_1", "--trust-head", "main=0123456789ab").parsed).toEqual({ main: "0123456789ab" });
+    expect(parse("lw_1", "--trust-head", "main=0123456789ab", "--trust-head").parsed).toContain("not both");
+    expect(parse("lw_1", "--trust-head", "--trust-head", "main=0123456789ab").parsed).toContain("not both");
+    expect(parse("lw_1", "--trust-head=main=0123456789ab", "--trust-head").trustHead).toEqual(["main=0123456789ab", TRUST_HEAD_ALONE]);
+  });
+
+  test("a positional taken as --trust-head's value is refused with what to do, not as a missing argument", () => {
+    expect(() => parse("--trust-head", "lw_1")).toThrow(/"lw_1" isn't <branch>=<sha>.*put the watch id before --trust-head/);
+    // A value with "=" is a pin, judged as one.
+    expect(parse("lw_1", "--trust-head", "main=0123").parsed).toContain("at least 12 characters");
   });
 });

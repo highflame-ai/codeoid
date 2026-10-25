@@ -42,8 +42,11 @@
  *     remembered is stamped with the trust list it was judged under (carried
  *     to a list that only adds logins), and a poll records nothing it judged
  *     once the watch changed under it. Comments on a pull request whose head
- *     is refused aren't read, and the comments are read from where they were
- *     until it is vouched for, so what was asked meanwhile still counts.
+ *     is refused aren't read; that pull request keeps the floor its comments
+ *     were read from when it was first refused (a week back at most), and
+ *     they are read from there once it is vouched for, so what was asked
+ *     meanwhile still counts. The watch's other comments read on from its
+ *     own floor.
  *   - Dedupe: every event has a key (`ci:<repo>:<sha>:<checkRunId>:<suiteId>`,
  *     `review:<repo>:<kind>:<id>`) recorded per owner in `loop_triggers` with
  *     the run it started, so an event seen on every poll, by any of the
@@ -149,6 +152,8 @@ const BACKOFF_MAX_MS = 6 * HOUR_MS;
 const WEB_FLOW = "web-flow";
 /** An event waiting to retry this long without a run is dropped. */
 const RETRY_MAX_AGE_MS = 7 * 24 * HOUR_MS;
+/** A pull request's comments held while its head is refused are read back this far, at most, once it isn't. */
+const HELD_MAX_MS = 7 * 24 * HOUR_MS;
 /** Activity that puts a commit at a branch's head as the account recorded as its actor (GitHub's activity types). */
 const PUSHES = new Set(["push", "force_push", "branch_creation"]);
 /**
@@ -614,19 +619,29 @@ export class WatchService {
     // Set when the poll stopped before it acted on everything it read: the
     // next poll reads comments from where this one did.
     let incomplete = false;
-    // Set when a pull request with review comments on is at a head no one
-    // vouches for: its comments aren't read, so the next poll reads comments
-    // from where this one did, and once its head is vouched for (pushed on by
-    // a trusted login, or the trust list widened) what was asked meanwhile
-    // still counts.
-    let heldComments = false;
+    // Pull requests with review comments on at a head no one vouches for:
+    // their comments aren't read, and each keeps its own floor
+    // (store.hold), where they are read from once its head is vouched for
+    // (pushed on by a trusted login, or the trust list widened), so what was
+    // asked meanwhile still counts. The watch's own floor moves on.
+    const held = new Set<number>();
+    // Held pull requests whose comments this poll read from their floor: they
+    // rejoin the watch's floor once the poll has acted on everything it read.
+    const released = new Set<number>();
+    const hold = (t: Target): void => {
+      if (!w.spec.review.enabled || !t.pr) return;
+      this.#store.hold(w, t.pr.number, this.#commentsSince(w));
+      held.add(t.pr.number);
+    };
     const problem = (where: string, err: unknown): void => {
       if (err instanceof GhError && err.rateLimited) rateLimited = true;
       problems.push(`${where}: ${errText(err)}`);
     };
     const finish = (): PollResult => {
       const note = [...problems, ...result.skipped.filter((s) => !s.includes("picked up after it ends") && !s.includes("still running"))].join("; ");
-      this.#store.markPolled(id, now, note || null, problems.length === 0 && !incomplete && !heldComments);
+      const ok = problems.length === 0 && !incomplete;
+      this.#store.markPolled(id, now, note || null, ok);
+      if (ok) for (const pr of released) if (!held.has(pr)) this.#store.unhold(w, pr);
       if (rateLimited) {
         const n = (this.#backoff.get(limiter)?.n ?? 0) + 1;
         this.#backoff.set(limiter, { n, until: now + Math.min(this.#pollMs * 2 ** n, BACKOFF_MAX_MS) });
@@ -667,6 +682,8 @@ export class WatchService {
     // Events left waiting on a pull request that closed, or for a week, are dropped.
     const expired = this.#store.expireRetries(w, now - RETRY_MAX_AGE_MS, openPrs);
     if (expired > 0) result.skipped.push(`${expired} event(s) waiting to retry expired (their pull request closed, or they waited a week)`);
+    // A held pull request that closed has nothing more to read; one only past the newest looked at stays held until it is looked at again.
+    if (openPrs) this.#store.pruneHolds(w, openPrs);
 
     // Each head is judged once a poll, however many events are on it.
     const trust = new Map<string, Promise<Untrusted | null>>();
@@ -725,6 +742,7 @@ export class WatchService {
         judged = false;
       } else {
         this.#store.ignore(w, untrustedKey(w, t), "head", t.branch, `not pushed by someone you trust: ${r.why}`, now);
+        hold(t);
         result.skipped.push(`${t.branch} at ${t.sha.slice(0, 12)}: not pushed by someone you trust (${r.why})`);
       }
     }
@@ -734,7 +752,7 @@ export class WatchService {
     for (const t of targets) {
       // A head already judged untrusted costs no more calls.
       if (this.#store.seen(w, [untrustedKey(w, t)]).size > 0) {
-        if (w.spec.review.enabled && t.pr) heldComments = true;
+        hold(t);
         continue;
       }
       try {
@@ -746,7 +764,7 @@ export class WatchService {
       }
       if (!w.spec.review.enabled || !t.pr) continue;
       try {
-        candidates.push(...(await this.#reviewCandidates(w, gh, t, now)));
+        candidates.push(...(await this.#reviewCandidates(w, gh, t, now, result, released)));
       } catch (err) {
         problem(`${t.branch} #${t.pr.number}`, err);
       }
@@ -811,7 +829,7 @@ export class WatchService {
           break;
         }
         this.#store.ignore(w, headKey, c.kind, c.target.branch, `not pushed by someone you trust: ${untrusted.why}`, now);
-        if (w.spec.review.enabled && c.target.pr) heldComments = true;
+        hold(c.target);
         result.skipped.push(`${label}: not pushed by someone you trust (${untrusted.why})`);
         continue;
       }
@@ -1010,7 +1028,7 @@ export class WatchService {
         if (++step >= CHAIN_MAX) return tooLong;
         if (judgedUntrusted(sha)) return { why: `${gap}, and it was judged untrusted`, transient: false };
         const bridge = await this.#bridgeUntrusted(gh, repo, t.branch, sha, trusted, who, budget);
-        if (typeof bridge === "string") return { why: `${gap}, and ${bridge}`, transient: false };
+        if ("why" in bridge) return { why: `${gap}, and ${bridge.why}`, transient: bridge.transient };
         bridges++;
         gapAt ??= gap;
         if (!bridge.parent) return { why: `${gap}; GitHub doesn't say what its merge commit was made on`, transient: false };
@@ -1031,7 +1049,8 @@ export class WatchService {
    * since), with the button — never auto-merged or through a merge queue,
    * which GitHub records as someone else's act — by a login GitHub records as
    * having merged it and that is trusted. The parent its merge commit was
-   * made on, or why not.
+   * made on, or why not — transient when GitHub names no pull request merged
+   * as it, which it may not have linked yet a few minutes after the merge.
    */
   async #bridgeUntrusted(
     gh: GitHubSource,
@@ -1041,16 +1060,18 @@ export class WatchService {
     trusted: Set<string>,
     who: (l: string | null) => string,
     budget: { commits: number },
-  ): Promise<{ parent: string } | string> {
-    if (--budget.commits < 0) return `more than ${CHAIN_COMMITS_MAX} commits were judged since a head that is vouched for`;
+  ): Promise<{ parent: string } | Untrusted> {
+    const no = (why: string): Untrusted => ({ why, transient: false });
+    if (--budget.commits < 0) return no(`more than ${CHAIN_COMMITS_MAX} commits were judged since a head that is vouched for`);
     const found = await gh.mergedAs(repo, sha);
-    if (found.kind === "none") return "GitHub names no pull request merged as it";
-    if (found.kind === "many") return `it is the merge commit of ${found.numbers.length} pull requests (${found.numbers.map((n) => `#${n}`).join(", ")})`;
+    // Like a merge whose commit isn't linked yet (#mergeUntrusted): judged again for a while, not refused for good at once.
+    if (found.kind === "none") return { why: "GitHub names no pull request merged as it", transient: true };
+    if (found.kind === "many") return no(`it is the merge commit of ${found.numbers.length} pull requests (${found.numbers.map((n) => `#${n}`).join(", ")})`);
     const p = found.pull;
-    if (p.baseRef !== branch) return `pull request #${p.number}, merged as it, was merged into ${p.baseRef ? JSON.stringify(p.baseRef) : "a branch GitHub doesn't name"}, not ${branch}`;
-    if (p.queued) return `pull request #${p.number}, merged as it, went through a merge queue`;
-    if (p.autoMerged) return `pull request #${p.number}, merged as it, was auto-merged`;
-    if (!p.mergedBy || !trusted.has(p.mergedBy.toLowerCase())) return `pull request #${p.number}, merged as it, was merged by ${who(p.mergedBy)}`;
+    if (p.baseRef !== branch) return no(`pull request #${p.number}, merged as it, was merged into ${p.baseRef ? JSON.stringify(p.baseRef) : "a branch GitHub doesn't name"}, not ${branch}`);
+    if (p.queued) return no(`pull request #${p.number}, merged as it, went through a merge queue`);
+    if (p.autoMerged) return no(`pull request #${p.number}, merged as it, was auto-merged`);
+    if (!p.mergedBy || !trusted.has(p.mergedBy.toLowerCase())) return no(`pull request #${p.number}, merged as it, was merged by ${who(p.mergedBy)}`);
     return { parent: p.parent };
   }
 
@@ -1172,7 +1193,10 @@ export class WatchService {
    * change (or lie just beneath the branch's deletion at that head): a writer
    * can push the head, push another, and force-push the first back after
    * auto-merge was turned on, and while GitHub's activity lags that last push
-   * the older push of the same commit is the newest that names it.
+   * the older push of the same commit is the newest that names it. And the
+   * pull request's timeline must record no force-push of its head branch
+   * since auto-merge was last turned on: a second record of the same thing,
+   * which doesn't lag as the activity can.
    *
    * Whether GitHub checks the head when auto-merge is turned on is not
    * something this can rely on: its `enablePullRequestAutoMerge` mutation
@@ -1206,7 +1230,10 @@ export class WatchService {
     const head = await gh.pushOf(pull.headRepo, pull.headRef, pull.headSha);
     const enabled = pull.autoMergeEnabled;
     const pushedAt = head.push?.at ?? null;
-    if (!queued && enabled && isTrusted(enabled.by) && head.latest && pushedAt !== null && pushedAt < enabled.at) return null;
+    // A force-push of its head branch at or after the enable (its timeline's record, beside the activity's) breaks it, as does not knowing.
+    const forced = pull.headForcePushedAt;
+    const unforced = forced === null || (forced !== "unknown" && enabled !== null && forced < enabled.at);
+    if (!queued && enabled && isTrusted(enabled.by) && head.latest && head.push && PUSHES.has(head.push.type) && pushedAt !== null && pushedAt < enabled.at && unforced) return null;
     let last: string;
     if (!head.push) {
       last = head.kept ? "GitHub's activity has no record of the push of its last commit" : "GitHub keeps no activity for the repository its last commit is in";
@@ -1337,13 +1364,21 @@ export class WatchService {
    * repository can edit an allowed author's comment, and an edited one is
    * ignored for good.
    */
-  async #reviewCandidates(w: WatchRow, gh: GitHubSource, t: Target, now: number): Promise<Candidate[]> {
+  async #reviewCandidates(w: WatchRow, gh: GitHubSource, t: Target, now: number, result: PollResult, released: Set<number>): Promise<Candidate[]> {
     const allow = new Set(w.spec.review.allow.map((l) => l.toLowerCase()));
-    const floor = Math.max(w.createdAt, w.resumedAt ?? 0) - CREATED_SKEW_MS;
-    // Read from shortly before the last complete poll — unless an event waits
-    // to retry, which may be older than that.
-    const since = w.lastOkAt !== null && !this.#store.hasRetries(w, "review_comment") ? Math.max(floor, w.lastOkAt - SINCE_SKEW_MS) : floor;
-    const comments = (await gh.prComments(t.pr!.number, since))
+    const floor = commentFloor(w);
+    const pr = t.pr!.number;
+    let since = this.#commentsSince(w);
+    // Held while its head was refused: read from where the hold began, a week back at most.
+    const heldAt = this.#store.heldFloor(w, pr);
+    if (heldAt !== null) {
+      const oldest = now - HELD_MAX_MS;
+      if (heldAt < oldest) result.skipped.push(`#${pr}: its comments were held more than 7 days while its head was refused; only the last 7 days' are read`);
+      since = Math.min(since, Math.max(heldAt, oldest, floor));
+    }
+    const listed = await gh.prComments(pr, since);
+    if (heldAt !== null) released.add(pr);
+    const comments = listed
       .filter((c) => c.createdAt >= floor && allow.has(c.author.toLowerCase()))
       .map((c) => ({ ...c, own: unquoted(c.body) }))
       .filter((c) => mentions(c.own, w.spec.review.mention));
@@ -1367,6 +1402,16 @@ export class WatchService {
           reviewObjective(t),
         ),
       }));
+  }
+
+  /**
+   * Where the watch reads comments from: shortly before its last complete
+   * poll — unless an event waits to retry, which may be older than that —
+   * and never before it was created or last resumed.
+   */
+  #commentsSince(w: WatchRow): number {
+    const floor = commentFloor(w);
+    return w.lastOkAt !== null && !this.#store.hasRetries(w, "review_comment") ? Math.max(floor, w.lastOkAt - SINCE_SKEW_MS) : floor;
   }
 
   #runInput(w: WatchRow, t: Target, maps: WatchCiMapping[], trigger: LoopTrigger, objective: string): LoopStartInput {
@@ -1451,6 +1496,11 @@ function sameCommit(a: CommitShape, b: CommitShape): boolean {
 
 function ciMatches(m: WatchCiMapping, r: CheckRunRecord): boolean {
   return r.app.toLowerCase() === (m.app ?? WATCH_DEFAULTS.ciApp) && globMatch(m.ciName, r.name);
+}
+
+/** Comments made before this (the watch made or last resumed, less clock skew) are not events. */
+function commentFloor(w: WatchRow): number {
+  return Math.max(w.createdAt, w.resumedAt ?? 0) - CREATED_SKEW_MS;
 }
 
 /** The ledger key that marks a head this watch won't act on: who pushed it is a fact about the branch, so the branch is in it. */
