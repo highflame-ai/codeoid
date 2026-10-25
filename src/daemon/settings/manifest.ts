@@ -356,6 +356,7 @@ const fleet: SettingsTab = {
         cfg("dispatch.tickMs", "Tick interval (ms)", "Dispatcher claim/reclaim/deliver cadence.", { kind: "int", min: 250, default: 5000, advanced: true }),
         cfg("dispatch.leaseMs", "Claim lease (ms)", "An unrenewed claim past this is reclaimed.", { kind: "int", min: 10000, default: 600000, advanced: true }),
         cfg("dispatch.retryBaseMs", "Retry backoff base (ms)", "Base backoff for retryable failures — doubles per attempt.", { kind: "int", min: 0, default: 15000, advanced: true }),
+        cfg("dispatch.holdMaxMs", "Approval hold limit (ms)", "Longest a loop attempt may wait on an approval while keeping its worker slot.", { kind: "int", min: 60000, default: 7200000, advanced: true }),
       ],
     },
     {

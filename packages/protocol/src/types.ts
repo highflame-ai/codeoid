@@ -2346,9 +2346,14 @@ export interface CollaborationPanelsResultMsg {
  */
 export interface FleetTaskWire {
   id: string;
-  kind: "send" | "spawn";
+  /** `attempt` = one attempt of a loop run (docs/loop-engineering-design.md §5). */
+  kind: "send" | "spawn" | "attempt";
   shape: "ship" | "scout";
-  status: "queued" | "claimed" | "running" | "done" | "failed" | "blocked";
+  /**
+   * `held` is non-terminal: the task is parked on something outside its worker
+   * (an approval a loop's profile does not cover) and is never reclaimed.
+   */
+  status: "queued" | "claimed" | "running" | "held" | "done" | "failed" | "blocked";
   attempts: number;
   /** Epoch ms. */
   createdAt: number;
@@ -2363,6 +2368,9 @@ export interface FleetTaskWire {
   createdBy: string;
   /** Dispatch group (fan-out barrier); absent = a standalone task. */
   groupId?: string;
+  /** attempt: the loop run and attempt this task executes. Absent on send/spawn. */
+  runId?: string;
+  attemptId?: string;
   /**
    * RESERVED and never populated in P5. The daemon has no dependency model —
    * the conductor sequences in prose. Present so typed fan-in/join edges are a
@@ -2384,7 +2392,7 @@ export interface FleetEventWire {
 
 /** Fleet-wide rollup, normalized across backends so one number spans vendors. */
 export interface FleetUsage {
-  /** Tasks not yet terminal (queued + claimed + running). */
+  /** Tasks not yet terminal (queued + claimed + running + held). */
   activeTasks: number;
   /** Tasks in `blocked` — the anti-spin failure cap tripped; needs a human. */
   blockedTasks: number;
