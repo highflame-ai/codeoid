@@ -15,6 +15,7 @@ import { randomUUID } from "node:crypto";
 // explicit --model on session create (docs/role-model-binding.md §5). No
 // Session dependency: models.ts is a pure catalog module.
 import { resolveModelIdForProvider } from "../models.js";
+import type { EvidenceService } from "../evidence/service";
 import { type ModelBinding, type ModelBindingConfig, resolveBinding } from "./binding";
 import { registerBuiltins } from "./builtin";
 import { PipelineEngine } from "./engine";
@@ -139,6 +140,8 @@ export interface PipelineManagerOptions {
   /** Backend seam for prompt/slash skills — enables the "skill" phase kind to
    *  drive a real session turn. Omit for pure `noop`/`fn`-skill pipelines. */
   runner?: PhaseRunner;
+  /** Records the evidence of every check a gate executes. */
+  evidence?: EvidenceService;
 }
 
 export class PipelineManager {
@@ -152,7 +155,7 @@ export class PipelineManager {
   constructor(store: PipelineStore, options: PipelineManagerOptions = {}) {
     this.#store = store;
     this.#registries = options.registries ?? defaultRegistries(options.runner);
-    this.#engine = new PipelineEngine(this.#registries);
+    this.#engine = new PipelineEngine(this.#registries, { evidence: options.evidence });
     this.resume();
   }
 

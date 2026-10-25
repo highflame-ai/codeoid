@@ -180,6 +180,7 @@ codeoid mcp refresh <session>                       # apply MCP servers changed 
 codeoid mcp approve <session> <server> [--path <f>] [--yes <fingerprint>]  # review, then approve a project's MCP server for every backend (#395)
 codeoid mcp adopt <server> [--session <s>] [--url <u>]  # codeoid signs in to a server from Claude's config (#390)
 codeoid mcp signin <server> [--callback-url <u>]        # sign in to an OAuth registry server
+codeoid evidence <id> [--full]   # one recorded check: what ran, on which tree, what it found
 codeoid routine add <name> --prompt … [--cron|--every|--at] [--check <cmd>]  # scheduled agent runs
 codeoid routine ls | show | runs | run [--wait] | edit | pause | resume | rm | cancel <runId> | token | preview
 ```

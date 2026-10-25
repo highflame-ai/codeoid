@@ -849,6 +849,10 @@ const routinePatchSchema = z.object(
   },
 );
 
+// ── Evidence (docs/loop-engineering-design.md §7) ─────────────────────────────
+
+export const evidenceGetSchema = z.object({ ...base, type: z.literal("evidence.get"), evidenceId: idField });
+
 export const routineCreateSchema = z.object({ ...base, type: z.literal("routine.create"), spec: routineSpecSchema });
 export const routineUpdateSchema = z.object({
   ...base,
@@ -1157,6 +1161,7 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   routineRunsSchema,
   routineTokenSchema,
   routinePreviewSchema,
+  evidenceGetSchema,
   compareListSchema,
   compareKeepSchema,
   mcpOAuthBeginSchema,

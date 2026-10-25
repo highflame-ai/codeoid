@@ -100,6 +100,7 @@ import {
   type DispatcherHost,
 } from "./dispatch.js";
 import { createPipelineManagerFromConfig } from "./pipeline/wiring.js";
+import { EvidenceService, EvidenceStore, evidenceToWire } from "./evidence/index.js";
 import type { PipelineManager } from "./pipeline/manager.js";
 import { resolveBinding, type ModelBindingConfig } from "./pipeline/binding.js";
 import type { RoleDef } from "./pipeline/pack.js";
@@ -448,6 +449,8 @@ export class SessionManager {
   #pushService: PushService;
   /** SDLC pipeline manager — undefined when the pipeline is disabled (default). */
   #pipelines?: PipelineManager;
+  #evidence?: EvidenceService;
+  #evidenceTimers: ReturnType<typeof setTimeout>[] = [];
   /** Routines (docs/routines.md); undefined when `routines.enabled` is off. */
   #routines?: RoutineService;
   /** Pack curation surface (registries + install/trust/select) — always present,
@@ -597,9 +600,28 @@ export class SessionManager {
     // pipelines on construction (resume). The runner drives prompt/slash phases
     // on worker turns; the `() => this` thunk is only dereferenced at run time,
     // after construction. Undefined when disabled ⇒ the daemon stays dark.
+    // Evidence of every executed check (docs/loop-engineering-design.md §7),
+    // in the daemon DB with full output beside it.
+    if (opts?.config) {
+      const evidence = new EvidenceService(
+        new EvidenceStore(store.database),
+        join(dirname(opts.config.dbPath), "evidence"),
+      );
+      this.#evidence = evidence;
+      // Retention: off the boot path, then daily.
+      const sweep = (): void => {
+        try {
+          evidence.sweep();
+        } catch (err) {
+          console.error(`[evidence] retention sweep failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      };
+      this.#evidenceTimers.push(setTimeout(sweep, 60_000).unref(), setInterval(sweep, 24 * 60 * 60 * 1000).unref());
+    }
     this.#pipelines = createPipelineManagerFromConfig(opts?.config, {
       runner: new SessionPhaseRunner(() => this),
       db: store.database,
+      ...(this.#evidence ? { evidence: this.#evidence } : {}),
     });
     // Routines share the daemon DB. Built only when enabled, so the kill
     // switch leaves every routine in place but nothing fires.
@@ -1356,6 +1378,8 @@ mcpHub: this.#mcpHub,
       case "routine.token":
       case "routine.preview":
         return this.#routineHandle(msg, auth);
+      case "evidence.get":
+        return this.#evidenceGet(msg, auth);
       case "pipeline.create":
         return this.#pipelineCreate(msg, auth);
       case "pipeline.list":
@@ -3633,6 +3657,11 @@ mcpHub: this.#mcpHub,
     // An abandoned login is a live pty holding an open OAuth attempt. Kill
     // those first, and unconditionally — they are not work worth draining.
     this.#backendLogin.dispose();
+    // Running checks are detached process groups; without this they outlive
+    // the daemon and race the same gate when the pipeline resumes.
+    this.#evidence?.abortAll();
+    for (const t of this.#evidenceTimers) clearTimeout(t);
+    this.#evidenceTimers = [];
     const deadline = Date.now() + timeoutMs;
     const systemAuth: AuthContext = {
       sub: "system:shutdown",
@@ -5362,6 +5391,8 @@ mcpHub: this.#mcpHub,
           // can show "here's what this phase did" next to Approve/Revise/Reject.
           if (p.lastSummary) w.summary = p.lastSummary;
         }
+        // Evidence whatever the status — a failed phase is where it matters most.
+        if (p.evidence?.length) w.evidence = [...p.evidence];
         if (p.feedback && p.feedback.length > 0) w.feedback = p.feedback;
         // The findings loop (findings.ts): counts + the ledger, so a client can
         // render "2 open (1 blocking), 1 fix leg" and the per-round table.
@@ -5485,6 +5516,29 @@ mcpHub: this.#mcpHub,
     return { type: "pipeline.list.result", requestId: msg.id, pipelines };
   }
 
+  /**
+   * One evidence record. Authorized through its owner: a pipeline's evidence
+   * needs `pipeline:read` and a pipeline the caller can see. Anything the caller
+   * may not read is `not_found`, so an id reveals nothing across tenants.
+   */
+  #evidenceGet(msg: Extract<ClientMessage, { type: "evidence.get" }>, auth: AuthContext): DaemonMessage {
+    const notFound: DaemonMessage = { type: "response.error", requestId: msg.id, error: "Evidence not found", code: "not_found" };
+    // Authorize before looking anything up, so whether an id exists is never
+    // the difference between two answers.
+    const g = this.#pipelineGuard(msg.id, auth, SCOPES.PIPELINE_READ);
+    if ("error" in g) return g.error;
+    const record = this.#evidence?.get(msg.evidenceId, { accountId: auth.accountId, projectId: auth.projectId });
+    if (!record) return notFound;
+    if (record.ownerKind === "pipeline") {
+      if (!this.#ownedPipeline(g.pm, record.ownerId, auth)) return notFound;
+    } else {
+      // Loop evidence is authorized by the loop service, which doesn't exist
+      // yet; until it does, nothing else may read it.
+      return notFound;
+    }
+    return { type: "evidence.record", requestId: msg.id, evidence: evidenceToWire(record) };
+  }
+
   #pipelineGet(msg: Extract<ClientMessage, { type: "pipeline.get" }>, auth: AuthContext): DaemonMessage {
     const g = this.#pipelineGuard(msg.id, auth, SCOPES.PIPELINE_READ);
     if ("error" in g) return g.error;
@@ -5558,6 +5612,9 @@ mcpHub: this.#mcpHub,
     if ("error" in g) return g.error;
     const s = this.#ownedPipeline(g.pm, msg.pipelineId, auth);
     if (!s) return { type: "response.error", requestId: msg.id, error: "Pipeline not found", code: "not_found" };
+    // Stop its running checks first: abort waits behind the in-flight step,
+    // and that step may be a long test run.
+    this.#evidence?.abortOwner("pipeline", msg.pipelineId);
     const next = (await g.pm.abort(msg.pipelineId)) ?? s;
     return { type: "pipeline.snapshot", requestId: msg.id, pipeline: this.#pipelineToWire(next) };
   }

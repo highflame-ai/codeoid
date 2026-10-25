@@ -11,3 +11,4 @@ export * from "./accounts.js";
 export * from "./endpoints.js";
 export * from "./mcp-oauth.js";
 export * from "./routines.js";
+export * from "./evidence.js";
