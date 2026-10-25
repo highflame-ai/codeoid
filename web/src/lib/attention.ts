@@ -12,10 +12,14 @@
  */
 
 import { loopQuestion, loopWaitKind, objectiveTitle } from "./loops";
+import { ROUTINE_RUN_STATUS, isFailingRun } from "./routines";
+import { isRateLimited, isSelfPaused } from "./watches";
 
 /** How long a blocked loop run stays in the inbox after it ended. */
 export const LOOP_BLOCKED_ATTENTION_MS = 24 * 60 * 60 * 1000;
-import type { FleetTaskWire, LoopRunWire, SessionInfo, SessionUiRequestMsg } from "../protocol/types";
+/** How long a routine's failed last run stays in the inbox after it ended. */
+export const ROUTINE_FAILED_ATTENTION_MS = 24 * 60 * 60 * 1000;
+import type { FleetTaskWire, LoopRunWire, LoopWatchWire, RoutineWire, SessionInfo, SessionUiRequestMsg } from "../protocol/types";
 
 export type AttentionKind = "question" | "approval" | "blocked" | "failed";
 
@@ -27,6 +31,10 @@ export interface AttentionItem {
   sessionId: string | null;
   /** A loop run's item opens the run, not a session. */
   runId?: string;
+  /** A watch's item opens the watch. */
+  watchId?: string;
+  /** A routine's item opens the routine. */
+  routineId?: string;
   /** What to show as the row's subject — a session name, or a task id. */
   label: string;
   detail: string;
@@ -78,6 +86,10 @@ export interface AttentionSources {
   taskSession: (task: FleetTaskWire) => SessionInfo | null;
   /** The owner's loop runs; a question or a block contributes (docs/loops.md). */
   loops?: readonly LoopRunWire[];
+  /** The owner's loop watches; a failing poll, a back-off, or a self-pause contributes. */
+  watches?: readonly LoopWatchWire[];
+  /** The owner's routines; an auto-pause or a recently failed last run contributes (docs/routines.md). */
+  routines?: readonly RoutineWire[];
 }
 
 /**
@@ -194,6 +206,53 @@ export function collectAttention(src: AttentionSources, now: number): AttentionI
       label: `loop · ${objectiveTitle(run.objective, 60)}`,
       detail: wait === "question" ? loopQuestion(run.waitingOn) : (run.reason ?? "blocked"),
       since: sinceFor(run.updatedAt, now),
+    });
+  }
+
+  // Watches whose poll couldn't finish (or that paused themselves): until
+  // someone looks, they start no runs. A paused watch is otherwise quiet.
+  for (const w of src.watches ?? []) {
+    const selfPaused = isSelfPaused(w);
+    if (!w.lastError || (!w.enabled && !selfPaused)) continue;
+    items.push({
+      key: `watch:${w.id}`,
+      kind: selfPaused ? "blocked" : "failed",
+      sessionId: null,
+      watchId: w.id,
+      label: `watch · ${w.repo}`,
+      detail: isRateLimited(w.lastError) ? `backing off: ${w.lastError}` : w.lastError,
+      since: sinceFor(w.lastPolledAt ?? w.updatedAt, now),
+    });
+  }
+
+  // Routines that paused themselves, or whose last run failed recently. A run
+  // waiting on an approval is left out: its session is `waiting_approval`, so
+  // the approval row above already stands for it.
+  for (const r of src.routines ?? []) {
+    if (!r.enabled && r.pausedReason) {
+      items.push({
+        key: `routine:${r.id}`,
+        kind: "blocked",
+        sessionId: null,
+        routineId: r.id,
+        label: `routine · ${r.name}`,
+        detail: r.pausedReason,
+        since: sinceFor(r.updatedAt, now),
+      });
+      continue;
+    }
+    const last = r.lastRun;
+    if (!last || !isFailingRun(last.status)) continue;
+    const ended = sinceFor(last.endedAt ?? last.createdAt, now);
+    if (now - ended >= ROUTINE_FAILED_ATTENTION_MS) continue;
+    items.push({
+      key: `routine:${r.id}`,
+      kind: "failed",
+      sessionId: null,
+      routineId: r.id,
+      label: `routine · ${r.name}`,
+      detail: `${ROUTINE_RUN_STATUS[last.status].label}${last.reason ? `: ${last.reason}` : ""}`,
+      since: ended,
     });
   }
 

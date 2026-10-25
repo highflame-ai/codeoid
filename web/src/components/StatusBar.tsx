@@ -249,7 +249,7 @@ const SearchHotkey: Component = () => (
   </button>
 );
 
-/** Opens the loops drawer; counts the runs still going. */
+/** Opens the automation drawer (loop runs, watches, routines); counts the runs still going. */
 const LoopsButton: Component = () => {
   const live = () => loopsState().runs.filter((r) => !isTerminalLoop(r.status)).length;
   return (
@@ -257,9 +257,10 @@ const LoopsButton: Component = () => {
       type="button"
       onClick={showLoops}
       class="flex items-center gap-1 rounded border border-border bg-bg px-1.5 py-0.5 font-mono text-[11px] text-fg-muted hover:border-accent/40 hover:text-fg"
-      title="Loops — runs that end only when the daemon's checks pass (/loops)"
+      title="Automation — loop runs, watches and routines (/loops)"
     >
-      loops
+      <span class="hidden sm:inline">automation</span>
+      <span class="sm:hidden">auto</span>
       <Show when={live() > 0}>
         <span class="text-accent">{live()}</span>
       </Show>

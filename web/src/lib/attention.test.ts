@@ -8,6 +8,7 @@ import {
   type AttentionItem,
   type AttentionSources,
 } from "./attention";
+import { routine, runWire, watch } from "./automation.fixtures";
 import { LOOP_APPROVAL_WAIT } from "./loops";
 import type { FleetTaskWire, LoopRunWire, SessionInfo, SessionUiRequestMsg } from "../protocol/types";
 
@@ -297,5 +298,53 @@ describe("collectAttention — loop runs", () => {
       NOW,
     );
     expect(items.map((i) => i.key)).toEqual(["approval:w-a"]);
+  });
+});
+
+describe("collectAttention — watches and routines", () => {
+  const iso = (ms: number) => new Date(ms).toISOString();
+
+  it("lists a watch whose poll failed, backing off or not, and one that paused itself", () => {
+    const items = collectAttention(
+      sources({
+        watches: [
+          watch({ id: "ok" }),
+          watch({ id: "err", lastError: "reading main's head: HTTP 404", lastPolledAt: iso(NOW - 2 * MIN) }),
+          watch({ id: "rl", lastError: "GitHub API rate limit exceeded", lastPolledAt: iso(NOW - MIN) }),
+          watch({ id: "self", enabled: false, lastError: "gh is now signed in as @x, but this watch acts as @me, so it paused itself" }),
+          // Paused by you: quiet, whatever its last poll said.
+          watch({ id: "paused", enabled: false, lastError: "reading main's head: HTTP 404" }),
+        ],
+      }),
+      NOW,
+    );
+    expect(items.map((i) => [i.key, i.kind, i.watchId])).toEqual([
+      ["watch:err", "failed", "err"],
+      ["watch:rl", "failed", "rl"],
+      ["watch:self", "blocked", "self"],
+    ]);
+    expect(items[1]!.detail).toMatch(/^backing off: /);
+    expect(items[0]!.label).toBe("watch · acme/shop");
+  });
+
+  it("lists a routine that paused itself, and one whose last run failed in the last day", () => {
+    const items = collectAttention(
+      sources({
+        routines: [
+          routine({ id: "fine", lastRun: runWire() }),
+          routine({ id: "auto", name: "auto", enabled: false, pausedReason: "paused after 3 failed runs in a row" }),
+          routine({ id: "bad", name: "bad", lastRun: runWire({ status: "failed", reason: "check exited 1", endedAt: iso(NOW - 10 * MIN) }) }),
+          routine({ id: "old", lastRun: runWire({ status: "timed_out", endedAt: iso(NOW - 25 * 60 * MIN) }) }),
+          // Parked on an approval: the session's approval row stands for it.
+          routine({ id: "parked", lastRun: runWire({ status: "needs_attention" }) }),
+        ],
+      }),
+      NOW,
+    );
+    expect(items.map((i) => [i.key, i.kind, i.routineId, i.detail])).toEqual([
+      ["routine:auto", "blocked", "auto", "paused after 3 failed runs in a row"],
+      ["routine:bad", "failed", "bad", "failed: check exited 1"],
+    ]);
+    expect(items[1]!.since).toBe(NOW - 10 * MIN);
   });
 });

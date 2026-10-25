@@ -15,7 +15,10 @@ import { relativeTime } from "../lib/format";
 import type { AttentionItem, AttentionKind } from "../lib/attention";
 import { attentionCount, attentionItems } from "../state/attention";
 import { nowTick } from "../state/clock";
-import { openLoops, watchLoops } from "../state/loops";
+import { openLoopRun, showRoutines, showWatches } from "./LoopsPanel";
+import { watchLoops } from "../state/loops";
+import { watchRoutines } from "../state/routines";
+import { watchWatches } from "../state/watches";
 import { focusSession } from "../state/sessions";
 
 const KIND_STYLE: Record<AttentionKind, { cls: string; label: string }> = {
@@ -40,6 +43,9 @@ const AttentionInbox: Component = () => {
   // A loop run that waits on you has no session status of its own to show
   // it, so keep the run list fresh in the background while the inbox lives.
   onMount(() => onCleanup(watchLoops()));
+  // The same for watches whose poll fails and routines whose runs fail.
+  onMount(() => onCleanup(watchWatches()));
+  onMount(() => onCleanup(watchRoutines()));
 
   return (
     <div class="relative">
@@ -74,7 +80,8 @@ const AttentionInbox: Component = () => {
               <p class="px-3 py-4 text-xs text-fg-muted">
                 Nothing is waiting on you. Agents that wedge on an approval, ask a
                 question, or hit the failure limit show up here, and so do
-                loop runs that ask you something or are blocked.
+                loop runs that ask you something or are blocked, watches
+                whose poll fails, and routines whose last run failed.
               </p>
             }
           >
@@ -119,12 +126,14 @@ const Row: Component<{ item: AttentionItem; onGo: () => void }> = (props) => {
           renders as a plain row rather than a button that does nothing. A
           loop run's row opens the run. */}
       <Show
-        when={!props.item.runId}
+        when={!props.item.runId && !props.item.watchId && !props.item.routineId}
         fallback={
           <button
             type="button"
             onClick={() => {
-              openLoops(props.item.runId);
+              if (props.item.runId) openLoopRun(props.item.runId);
+              else if (props.item.watchId) showWatches(props.item.watchId);
+              else if (props.item.routineId) showRoutines(props.item.routineId);
               props.onGo();
             }}
             class="flex w-full flex-col gap-1 px-3 py-2 text-left transition hover:bg-bg-hover"
