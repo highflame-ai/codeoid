@@ -65,7 +65,7 @@ import type {
 } from "../interface.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
 import { type ResponsesItem, toResponsesItems } from "./native-history.js";
-import { buildCodexEnv } from "../env.js";
+import { buildCodexEnv, withExtraEnv } from "../env.js";
 import { CodexRpcProcess } from "./rpc.js";
 import { EFFORT_LEVELS, type EffortLevel, type SessionMode } from "../../../protocol/types.js";
 import { MEMORY_MCP_SERVER_NAME, MEMORY_MCP_TOKEN_ENV, type MemoryMcpMount } from "../../memory/mcp-http.js";
@@ -130,6 +130,8 @@ export interface CodexProviderInit {
    */
   resolveAccount?: () => ResolvedAccount | null;
   onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
+  /** Caller env for the child process (ProviderSessionInit.extraEnv), merged last via withExtraEnv. */
+  extraEnv?: Readonly<Record<string, string>>;
 }
 
 /** Item types that surface as tool records (vs text/reasoning streams). */
@@ -282,6 +284,7 @@ export class CodexProvider implements SessionProvider {
   #command: string;
   #argsPrefix: string[];
   #resolveAccount: (() => ResolvedAccount | null) | null;
+  readonly #extraEnv: Readonly<Record<string, string>> | undefined;
   #onModels?: CodexProviderInit["onModels"];
   #workspaceId: string;
   #memoryMcp: MemoryMcpMount | null;
@@ -374,6 +377,7 @@ export class CodexProvider implements SessionProvider {
     this.#backingSessionId = init.initialBackingId;
     this.#command = init.command;
     this.#resolveAccount = init.resolveAccount ?? null;
+    this.#extraEnv = init.extraEnv;
     this.#argsPrefix = init.argsPrefix ?? [];
     this.#onModels = init.onModels;
     this.#workspaceId = init.workspaceId ?? init.sessionId;
@@ -821,10 +825,15 @@ export class CodexProvider implements SessionProvider {
         cwd: opts.workdir,
         // The account's own CODEX_HOME (an overlay sharing everything but its
         // auth.json), applied last so nothing re-adds a daemon key.
-        env: await applyCodexAccount(
-          this.#resolveAccount?.() ?? null,
-          { ...buildCodexEnv(), ...mcp.env, ...bb.env, ...reg.env, ...oauth.env },
-          { command: this.#command, argsPrefix: this.#argsPrefix },
+        // The caller's extra env goes on last (withExtraEnv refuses anything
+        // credential- or home-shaped, so the account stays the account).
+        env: withExtraEnv(
+          await applyCodexAccount(
+            this.#resolveAccount?.() ?? null,
+            { ...buildCodexEnv(), ...mcp.env, ...bb.env, ...reg.env, ...oauth.env },
+            { command: this.#command, argsPrefix: this.#argsPrefix },
+          ),
+          this.#extraEnv,
         ),
         onNotification: (method, params) => this.#onNotification(method, params),
         onServerRequest: (method, params) => this.#onServerRequest(method, params),

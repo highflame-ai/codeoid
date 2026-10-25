@@ -5,7 +5,7 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { buildPiEnv, buildSubprocessEnv, withGatewayCredential } from "../daemon/providers/env.js";
+import { buildPiEnv, buildSubprocessEnv, extraEnvViolations, withExtraEnv, withGatewayCredential } from "../daemon/providers/env.js";
 import { buildAgentEnv } from "../daemon/providers/claude/index.js";
 
 const DAEMON_ENV: Record<string, string> = {
@@ -176,5 +176,47 @@ describe("withGatewayCredential (forge#111)", () => {
     );
     expect(env.ANTHROPIC_CUSTOM_HEADERS).toBe("x-highflame-apikey: zid_sk_session");
     expect(env.ANTHROPIC_AUTH_TOKEN).toBe("zid_sk_session");
+  });
+});
+
+describe("extraEnv denylist (SessionCreateOptions.extraEnv)", () => {
+  // Every variable codeoid sets or scrubs for account isolation, plus
+  // process-loading and request-routing ones. None may be overridden.
+  const DENIED = [
+    "HOME", "USER", "LOGNAME", "PATH", "SHELL", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+    "NODE_OPTIONS", "NODE_PATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
+    "HTTPS_PROXY", "https_proxy", "NODE_EXTRA_CA_CERTS", "NODE_TLS_REJECT_UNAUTHORIZED", "SSL_CERT_FILE",
+    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS",
+    "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_USE_BEDROCK",
+    "AWS_BEARER_TOKEN_BEDROCK", "AWS_PROFILE", "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "CODEX_HOME", "OPENAI_API_KEY", "OPENAI_BASE_URL",
+    "GEMINI_API_KEY", "GEMINI_CLI_HOME", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT", "CODE_ASSIST_ENDPOINT",
+    "QWEN_HOME", "DASHSCOPE_API_KEY", "BAILIAN_API_KEY", "PI_CODING_AGENT_DIR",
+    "CODEOID_API_KEY", "CODEOID_AGENT_ENV_ALLOW", "CODEOID_MEMORY_TOKEN", "ZEROID_URL", "TELEGRAM_BOT_TOKEN",
+    "GROQ_API_KEY", "MISTRAL_API_TOKEN", "SOME_AUTH_TOKEN", "VENDOR_ACCESS_TOKEN", "vendor_api_key",
+  ];
+  const ALLOWED = ["LOOP_RUN_ID", "DATABASE_URL", "CI", "NODE_ENV", "RUST_LOG", "GITHUB_TOKEN", "TZ", "LANG", "MY_FLAG"];
+
+  it("refuses every denylisted key and none of the ordinary ones", () => {
+    const extra = Object.fromEntries([...DENIED, ...ALLOWED].map((k) => [k, "x"]));
+    expect(extraEnvViolations(extra).sort()).toEqual([...DENIED].sort());
+  });
+
+  it("refuses malformed names and values", () => {
+    expect(extraEnvViolations({ "BAD-NAME": "x", "1X": "x", OK: "x", NUL: "a\0b", NUM: 1 as unknown as string })).toEqual([
+      "BAD-NAME", "1X", "NUL", "NUM",
+    ]);
+  });
+
+  it("withExtraEnv merges allowed keys over the built env and keeps codeoid's value for refused ones", () => {
+    const built = { PATH: "/usr/bin", HOME: "/home/u", ANTHROPIC_API_KEY: "ant-key", TZ: "UTC" };
+    const merged = withExtraEnv(built, { PATH: "/evil", HOME: "/evil", ANTHROPIC_API_KEY: "evil", TZ: "Asia/Kolkata", LOOP_RUN_ID: "r1" });
+    expect(merged).toEqual({ PATH: "/usr/bin", HOME: "/home/u", ANTHROPIC_API_KEY: "ant-key", TZ: "Asia/Kolkata", LOOP_RUN_ID: "r1" });
+    expect(built.TZ).toBe("UTC"); // pure
+    expect(withExtraEnv(built, undefined)).toBe(built);
+  });
+
+  it("a refused key absent from the built env is not added either", () => {
+    expect(withExtraEnv({ PATH: "/usr/bin" }, { OPENAI_API_KEY: "evil" })).toEqual({ PATH: "/usr/bin" });
   });
 });

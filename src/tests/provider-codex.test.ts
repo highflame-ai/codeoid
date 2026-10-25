@@ -118,6 +118,40 @@ async function collect(run: TurnRun): Promise<ProviderEvent[]> {
 }
 
 describe("CodexProvider over fake-codex", () => {
+  it("extraEnv reaches the spawned codex; credential, home and codeoid-owned keys keep codeoid's value", async () => {
+    const saved = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = "sk-daemon";
+    try {
+      const p = new CodexProvider({
+        sessionId: "sess-env",
+        initialBackingId: "sess-env",
+        command: process.execPath,
+        argsPrefix: [FIXTURE],
+        store: {} as Store,
+        extraEnv: {
+          LOOP_RUN_ID: "run-9",
+          OPENAI_API_KEY: "sk-evil",
+          CODEX_HOME: "/tmp/other-login",
+          HOME: "/tmp/evil-home",
+          PATH: "/tmp/evil-bin",
+          CODEOID_MEMORY_TOKEN: "forged",
+        },
+      });
+      const events = await collect(p.runTurn(turnOpts("echo-env")));
+      await p.teardown();
+      const env = JSON.parse((events.find((e) => e.type === "text_done") as { content: string }).content) as Record<string, string>;
+      expect(env.LOOP_RUN_ID).toBe("run-9");
+      expect(env.OPENAI_API_KEY).toBe("sk-daemon");
+      expect(env.CODEX_HOME).toBeUndefined();
+      expect(env.HOME).toBe(process.env.HOME!);
+      expect(env.PATH).toBe(process.env.PATH!);
+      expect(env.CODEOID_MEMORY_TOKEN).toBeUndefined();
+    } finally {
+      if (saved === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = saved;
+    }
+  });
+
   it("C1: text turn streams thinking + text and completes with usage", async () => {
     const p = makeProvider();
     const events = await collect(p.runTurn(turnOpts("hello")));

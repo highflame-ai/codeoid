@@ -85,6 +85,15 @@ export interface ProviderSessionInit {
    * HTTP backends call it per turn; process backends when they spawn.
    */
   resolveAccount?: () => ResolvedAccount | null;
+  /**
+   * Caller-supplied env for the backend's child process (SessionCreateOptions
+   * .extraEnv), merged last via `withExtraEnv` (env.ts), which never lets it
+   * override a credential / account-isolation variable. Honored by every
+   * process-backed provider — claude, codex, gemini-cli, pi, qwen. In-process
+   * backends (openai, gemini, llama.cpp, user endpoints) spawn nothing, so it
+   * has no effect there.
+   */
+  extraEnv?: Readonly<Record<string, string>>;
 }
 
 /** An HTTP backend's key from the session's account (accounts.ts), or null for the daemon's own. */
@@ -373,6 +382,7 @@ export function createDefaultProviderRegistry(
         compressionRegistry: init.compressionRegistry,
         onModels: init.onModels,
         resolveAccount: init.resolveClaudeAccount,
+        extraEnv: init.extraEnv,
       }),
   });
   // Stateless API backends: usable only with a key — in the environment (the
@@ -436,6 +446,7 @@ export function createDefaultProviderRegistry(
             mcpHub: init.mcpHub,
             onModels: init.onModels,
             resolveAccount: init.resolveAccount,
+            extraEnv: init.extraEnv,
           }),
       });
     } else {
@@ -469,6 +480,7 @@ export function createDefaultProviderRegistry(
             mcpRegistry: init.mcpRegistry,
             onModels: init.onModels,
             resolveAccount: init.resolveAccount,
+            extraEnv: init.extraEnv,
           }),
       });
     } else {
@@ -502,6 +514,7 @@ export function createDefaultProviderRegistry(
             mcpRegistry: init.mcpRegistry,
             onModels: init.onModels,
             resolveAccount: init.resolveAccount,
+            extraEnv: init.extraEnv,
           }),
       });
     } else {
@@ -536,6 +549,7 @@ export function createDefaultProviderRegistry(
           config: init.config,
           onModels: init.onModels,
           resolveAccount: init.resolveAccount,
+          extraEnv: init.extraEnv,
         }),
     });
   }

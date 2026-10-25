@@ -336,6 +336,13 @@ export type ProviderEvent =
   /** Per-LLM-call usage, split by primary vs subagent (null parent_tool_use_id = primary). */
   | { type: "llm_call"; usage: LLMCallUsage; isPrimary: boolean }
   | { type: "api_retry"; attempt?: number; retryDelayMs?: number; errorStatus?: number | null }
+  /**
+   * The backend's plan rate-limit state changed (Claude's `rate_limit_event`,
+   * subscription accounts only). `rejected` means requests are refused until
+   * `resetsAt` (epoch ms) — the exact reset a usage-limit error's text often
+   * gives only as a wall-clock time. Observational: nothing retries on it.
+   */
+  | { type: "rate_limit"; status: "allowed" | "allowed_warning" | "rejected"; resetsAt?: number; limitType?: string }
   | { type: "tool_progress"; toolName?: string; elapsedSeconds?: number }
   /**
    * Provider-authored standalone message — extension output, status cards,

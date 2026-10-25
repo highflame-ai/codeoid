@@ -66,7 +66,7 @@ import { removeClaudeSession, toClaudeSessionEntries, writeClaudeSession } from 
 import { BUDGET_STOP_MESSAGE, isBackgroundLifecycleEvent } from "../interface.js";
 import { isUngrantableSkillCommand, redactCommand } from "../../skill-command.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
-import { buildSubprocessEnv, withGatewayCredential } from "../env.js";
+import { buildSubprocessEnv, withExtraEnv, withGatewayCredential } from "../env.js";
 import type { LLMCallUsage } from "../../context-math.js";
 import type { PackSubagent } from "../../pipeline/subagents.js";
 
@@ -132,6 +132,8 @@ export interface ClaudeProviderInit {
    * switch takes effect on the next turn and RESUMES the same backing session.
    */
   resolveAccount?: () => ResolvedClaudeAccount | null;
+  /** Caller env for the CLI child process (ProviderSessionInit.extraEnv), merged last via withExtraEnv. */
+  extraEnv?: Readonly<Record<string, string>>;
   /** codeoid session id — used as the initial backing id and for audit/logging. */
   sessionId: string;
   /** Test seam for native continuation (#387); defaults to the real SDK. */
@@ -859,11 +861,18 @@ export class ClaudeProvider implements SessionProvider {
         // applyAccountEnv). The forge gateway re-point applies only to the
         // daemon's own environment: a named account carries the user's own
         // gateway token, which must never be swapped for an agent identity.
-        env: account
-          ? account.apply(buildAgentEnv(process.env))
-          : buildAgentEnv(process.env, {
-              gatewayCredential: init.identityManager?.getGatewayCredential(init.sessionId),
-            }),
+        //
+        // The caller's extra env (a loop worker's) goes on last; withExtraEnv
+        // refuses every ANTHROPIC_/CLAUDE_ and credential-shaped key, so it
+        // can never undo the account or the gateway re-point.
+        env: withExtraEnv(
+          account
+            ? account.apply(buildAgentEnv(process.env))
+            : buildAgentEnv(process.env, {
+                gatewayCredential: init.identityManager?.getGatewayCredential(init.sessionId),
+              }),
+          init.extraEnv,
+        ),
         allowedTools: [
           // Every EXACT TOOL NAME here is auto-approved by the SDK BEFORE
           // canUseTool is consulted, so it never reaches our gate — the SDK
@@ -1875,6 +1884,21 @@ export function translateSDKMessage(
       case "tool_progress": {
         const p = msg as { tool_name?: string; elapsed_time_seconds?: number };
         emit({ type: "tool_progress", toolName: p.tool_name, elapsedSeconds: p.elapsed_time_seconds });
+        break;
+      }
+
+      case "rate_limit_event": {
+        // SDKRateLimitInfo.resetsAt is epoch SECONDS (the CLI renders it with
+        // `new Date(resetsAt * 1000)`); ProviderEvent carries milliseconds.
+        const info = (msg as { rate_limit_info?: { status?: string; resetsAt?: number; rateLimitType?: string } }).rate_limit_info;
+        const status = info?.status;
+        if (status !== "allowed" && status !== "allowed_warning" && status !== "rejected") break;
+        emit({
+          type: "rate_limit",
+          status,
+          ...(typeof info?.resetsAt === "number" && info.resetsAt > 0 ? { resetsAt: info.resetsAt * 1000 } : {}),
+          ...(info?.rateLimitType ? { limitType: info.rateLimitType } : {}),
+        });
         break;
       }
     }

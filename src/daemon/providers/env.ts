@@ -80,6 +80,85 @@ export function buildSubprocessEnv(
   return out;
 }
 
+// ── Caller-supplied extra env (SessionCreateOptions.extraEnv) ────────────────
+
+/**
+ * What a caller's extra env may NEVER set on a backend's child process: the
+ * variables codeoid owns for credential selection and account isolation, and
+ * the ones that change what the backend process loads or where its requests
+ * go. A loop controller passes extra env for the work (a test DB URL, a build
+ * flag); none of it may swap the account a session runs on, re-point a vendor
+ * home at another login, inject code into the backend (NODE_OPTIONS,
+ * LD_PRELOAD), or route its bearer token through a proxy.
+ *
+ * Matched case-insensitively, by exact name, namespace prefix, or credential
+ * suffix. Deliberately broad: a controller that needs one of these has to get
+ * it through the account system, not an env side door.
+ */
+const EXTRA_ENV_DENY_EXACT = new Set([
+  // Identity and the vendor homes every account overlay lives under.
+  "HOME", "USER", "LOGNAME", "USERPROFILE",
+  "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_RUNTIME_DIR",
+  // What runs: the binary lookup, the shell tools run in, Node preloads.
+  "PATH", "SHELL", "NODE_OPTIONS", "NODE_PATH", "BUN_OPTIONS",
+  // Where requests go, and which TLS roots let something read them in flight
+  // (the REDIRECTING_ENV sets in claude-accounts.ts / account-apply.ts).
+  "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+  "NODE_EXTRA_CA_CERTS", "NODE_TLS_REJECT_UNAUTHORIZED", "SSL_CERT_FILE", "SSL_CERT_DIR",
+  "CODE_ASSIST_ENDPOINT",
+]);
+const EXTRA_ENV_DENY_PREFIXES = [
+  // codeoid's own namespaces (DENY_PREFIXES above) — tokens, the escape hatch.
+  "CODEOID_", "ZEROID_", "TELEGRAM_",
+  // Every backend's credential / home / endpoint namespace the account
+  // appliers set or scrub (claude-accounts.ts, account-apply.ts).
+  "ANTHROPIC_", "CLAUDE_", "CODEX_", "OPENAI_", "GEMINI_", "GOOGLE_", "QWEN_", "DASHSCOPE_", "BAILIAN_", "PI_",
+  // Cloud credentials (Bedrock, Vertex, Azure) and where telemetry goes.
+  "AWS_", "AZURE_", "VERTEX_", "OTEL_",
+  // Dynamic-loader injection.
+  "LD_", "DYLD_",
+] as const;
+const EXTRA_ENV_DENY_SUFFIXES = ["_API_KEY", "_API_TOKEN", "_AUTH_TOKEN", "_ACCESS_TOKEN", "_REFRESH_TOKEN", "_OAUTH_TOKEN"] as const;
+const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+function extraEnvRefused(name: string, value: unknown): boolean {
+  if (!ENV_NAME.test(name) || typeof value !== "string" || value.includes("\0")) return true;
+  const upper = name.toUpperCase();
+  return (
+    EXTRA_ENV_DENY_EXACT.has(upper) ||
+    EXTRA_ENV_DENY_PREFIXES.some((p) => upper.startsWith(p)) ||
+    EXTRA_ENV_DENY_SUFFIXES.some((s) => upper.endsWith(s))
+  );
+}
+
+/**
+ * The keys of `extra` codeoid refuses to pass to a backend (denylisted, not a
+ * valid variable name, or a non-string / NUL-bearing value). Empty = all allowed.
+ */
+export function extraEnvViolations(extra: Readonly<Record<string, unknown>>): string[] {
+  return Object.entries(extra)
+    .filter(([k, v]) => extraEnvRefused(k, v))
+    .map(([k]) => k);
+}
+
+/**
+ * `env` (what codeoid built for the backend, account applied) with the
+ * caller's extra env merged over it — minus every refused key, which keeps
+ * codeoid's value. Pure. Session refuses such keys up front; filtering here
+ * again means a provider built by some other path can't be talked into it.
+ */
+export function withExtraEnv(
+  env: Record<string, string>,
+  extra: Readonly<Record<string, string>> | undefined,
+): Record<string, string> {
+  if (!extra) return env;
+  const out: Record<string, string> = { ...env };
+  for (const [k, v] of Object.entries(extra)) {
+    if (!extraEnvRefused(k, v)) out[k] = v;
+  }
+  return out;
+}
+
 /**
  * The header Highflame's AI gateway (firehog) authenticates a sandboxed agent
  * on. Forge injects it at launch carrying the SANDBOX BADGE; see
