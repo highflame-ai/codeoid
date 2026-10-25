@@ -12,6 +12,7 @@ import { Component, Show } from "solid-js";
 
 import AttentionInbox from "./AttentionInbox";
 import HomeToggle from "./HomeToggle";
+import { showLoops } from "./LoopsPanel";
 
 import {
   ctxWindowColorClass,
@@ -26,6 +27,8 @@ import { authIdentity, connectionStatus, disconnect } from "../state/connection"
 import { nowTick } from "../state/clock";
 import { isMobile, toggleNav } from "../state/layout";
 import { focusedSession } from "../state/sessions";
+import { loopsState } from "../state/loops";
+import { isTerminalLoop } from "../lib/loops";
 import { forgetApiKey } from "../lib/auth";
 import { openIdentityDrawer } from "./IdentityDrawer";
 import { openSettings } from "./SettingsDrawer";
@@ -57,6 +60,7 @@ const StatusBar: Component = () => {
       <span class="ml-auto flex items-center gap-3">
         {/* Ambient — §8 wants the count always visible, the queue one click away. */}
         <AttentionInbox />
+        <LoopsButton />
         <SessionMetrics />
         <SearchHotkey />
         <SettingsButton />
@@ -244,6 +248,24 @@ const SearchHotkey: Component = () => (
     <span class="font-mono">Ctrl K</span>
   </button>
 );
+
+/** Opens the loops drawer; counts the runs still going. */
+const LoopsButton: Component = () => {
+  const live = () => loopsState().runs.filter((r) => !isTerminalLoop(r.status)).length;
+  return (
+    <button
+      type="button"
+      onClick={showLoops}
+      class="flex items-center gap-1 rounded border border-border bg-bg px-1.5 py-0.5 font-mono text-[11px] text-fg-muted hover:border-accent/40 hover:text-fg"
+      title="Loops — runs that end only when the daemon's checks pass (/loops)"
+    >
+      loops
+      <Show when={live() > 0}>
+        <span class="text-accent">{live()}</span>
+      </Show>
+    </button>
+  );
+};
 
 const SettingsButton: Component = () => (
   <button

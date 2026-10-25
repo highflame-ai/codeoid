@@ -340,6 +340,25 @@ export class TuiWsClient {
     });
   }
 
+  /** The owner's loop runs, newest first (docs/loops.md). */
+  loopList(limit?: number): Promise<DaemonMessage> {
+    return this.#request({ type: "loop.list", id: randomUUID(), ...(limit ? { limit } : {}) });
+  }
+
+  /** One loop run with its attempts, and its history when `events`. */
+  loopGet(runId: string, events = false): Promise<DaemonMessage> {
+    return this.#request({ type: "loop.get", id: randomUUID(), runId, ...(events ? { events: true } : {}) });
+  }
+
+  loopControl(verb: "pause" | "resume" | "cancel", runId: string): Promise<DaemonMessage> {
+    return this.#request({ type: `loop.${verb}`, id: randomUUID(), runId });
+  }
+
+  /** Guidance for the run's next attempt, or the answer to its worker's question. */
+  loopSteer(runId: string, text: string): Promise<DaemonMessage> {
+    return this.#request({ type: "loop.steer", id: randomUUID(), runId, text });
+  }
+
   // ── Internals ─────────────────────────────────────────────────────────
 
   async #connect(): Promise<void> {

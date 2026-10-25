@@ -22,6 +22,7 @@
 import { execFile } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
+import { GIT_BIN, gitEnv } from "../git-env.js";
 
 const execFileP = promisify(execFile);
 
@@ -97,8 +98,10 @@ function normaliseAlias(s: string): string {
 
 async function tryGit(cwd: string, args: string[]): Promise<string | null> {
   try {
-    const { stdout } = await execFileP("git", args, {
+    const { stdout } = await execFileP(GIT_BIN, args, {
       cwd,
+      // The session's repository: never the daemon's environment.
+      env: gitEnv(),
       timeout: 2_000,
     });
     const out = stdout.trim();

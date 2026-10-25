@@ -72,6 +72,8 @@ export interface ProviderSessionInit {
   mcpHub?: McpHub;
   /** codeoid_fleet MCP server — conductor sessions only. */
   fleet?: McpSdkServerConfigWithInstance;
+  /** codeoid_loop MCP server (`loop_report`) — loop worker sessions only. */
+  loop?: McpSdkServerConfigWithInstance;
   config?: CodeoidConfig;
   compressionRegistry?: CompressionRegistry;
   /** Live model-catalog report, already tagged with the factory's id by Session. */
@@ -375,6 +377,7 @@ export function createDefaultProviderRegistry(
         identityManager: init.identityManager,
         memory: init.memory,
         fleet: init.fleet,
+        loop: init.loop,
         blackboardMcp: init.blackboardMcp,
         mcpRegistry: init.mcpRegistry,
         mcpHub: init.mcpHub,

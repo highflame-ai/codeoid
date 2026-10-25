@@ -31,9 +31,10 @@
  */
 
 import { execFile } from "node:child_process";
-import { lstatSync, mkdirSync, realpathSync, type Stats, unlinkSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, realpathSync, type Stats, unlinkSync } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
+import { GIT_BIN, gitEnv, hardenedGit } from "./git-env.js";
 
 const execFileP = promisify(execFile);
 
@@ -44,8 +45,15 @@ const execFileP = promisify(execFile);
  * `post-checkout` hook would fire on every fork).
  */
 async function git(args: string[], cwd: string): Promise<string> {
-  const { stdout } = await execFileP("git", ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", ...args], {
+  return plainGit(args, cwd);
+}
+
+async function plainGit(args: string[], cwd: string): Promise<string> {
+  const { stdout } = await execFileP(GIT_BIN, ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", ...args], {
     cwd,
+    // An agent's config can make git run a command (a filter on checkout);
+    // it gets an agent's environment, never the daemon's.
+    env: gitEnv({}, { network: true }),
     timeout: 120_000,
     maxBuffer: 64 * 1024 * 1024,
   });
@@ -100,8 +108,8 @@ function slug(label: string): string {
  * linked worktree we ask from — so new worktrees anchor beside the main repo
  * (`<repo>-worktrees/<name>`), never nested inside another worktree.
  */
-export async function mainWorktreeRoot(workdir: string): Promise<string> {
-  const out = await git(["worktree", "list", "--porcelain"], workdir);
+export async function mainWorktreeRoot(workdir: string, opts: { hardened?: boolean } = {}): Promise<string> {
+  const out = opts.hardened ? await hardenedGit(["worktree", "list", "--porcelain"], workdir) : await git(["worktree", "list", "--porcelain"], workdir);
   const line = out.split("\n").find((l) => l.startsWith("worktree "));
   if (!line) throw new WorktreeError("could not resolve the repo's main worktree");
   return line.slice("worktree ".length).trim();
@@ -195,8 +203,17 @@ export async function createForkWorktree(opts: {
    * committed content only, never the parent's (agent-written) edits.
    */
   deferCarry?: boolean;
+  /**
+   * git runs as `hardenedGit` does — no filter driver, no network — for a
+   * repository whose config an earlier agent may have written to run one
+   * (a loop's). The repository must not depend on filters.
+   */
+  hardened?: boolean;
+  /** Told the worktree's path before it is made (a loop claims it first). */
+  onPath?: (worktreePath: string) => void;
 }): Promise<ForkWorktree> {
-  const mainRoot = await mainWorktreeRoot(opts.workdir);
+  const mainRoot = await mainWorktreeRoot(opts.workdir, { hardened: opts.hardened === true });
+  const git = opts.hardened ? (args: string[], cwd: string) => hardenedGit(args, cwd) : plainGit;
 
   const name = `${slug(opts.label)}-${opts.shortId}`;
   const branch = `codeoid/${name}`;
@@ -220,7 +237,9 @@ export async function createForkWorktree(opts: {
   } else {
     try {
       parentHead = (await git(["rev-parse", "HEAD"], opts.workdir)).trim();
-    } catch {
+    } catch (err) {
+      // Hardened git refuses some repositories outright; say why.
+      if (err instanceof Error && err.message.includes("refusing to run git")) throw new WorktreeError(err.message);
       throw new WorktreeError("repository has no commits yet (unborn HEAD)");
     }
     const snapshot = (await git(["stash", "create"], opts.workdir)).trim();
@@ -233,6 +252,7 @@ export async function createForkWorktree(opts: {
     }
   }
 
+  opts.onPath?.(worktreePath);
   try {
     // --end-of-options: treat `base` as a rev, never a flag, so a value
     // starting with '-' can't inject a git option.
@@ -294,8 +314,9 @@ export async function createForkWorktree(opts: {
  * `reset --mixed` leaves it. Untracked and ignored files (what a setup recipe
  * put there) are left alone. Throws {@link WorktreeError}.
  */
-export async function applyCarriedState(worktreePath: string, carry: CarriedState): Promise<void> {
+export async function applyCarriedState(worktreePath: string, carry: CarriedState, opts: { hardened?: boolean } = {}): Promise<void> {
   if (!/^[0-9a-f]{40,64}$/.test(carry.snapshot)) throw new WorktreeError("invalid carried snapshot");
+  const git = opts.hardened ? (args: string[], cwd: string) => hardenedGit(args, cwd) : plainGit;
   try {
     await git(["restore", `--source=${carry.snapshot}`, "--worktree", "--", "."], worktreePath);
   } catch (err) {
@@ -368,8 +389,15 @@ export async function removeForkWorktree(opts: {
    * a shared directory's symlink is the primary checkout's, not the fork's work.
    */
   setup?: { copied?: readonly string[]; shared?: readonly string[] };
+  /** Commit what's left in the worktree to the kept branch first (default
+   *  true). A loop's worktree turns it off: its branch holds only what the
+   *  run delivered, never what a worker left behind. */
+  snapshot?: boolean;
+  /** git runs as `hardenedGit` (a loop's worktree; see createForkWorktree). */
+  hardened?: boolean;
 }): Promise<void> {
-  const mainRoot = await mainWorktreeRoot(opts.workdir).catch(() => opts.workdir);
+  const mainRoot = await mainWorktreeRoot(opts.workdir, { hardened: opts.hardened === true }).catch(() => opts.workdir);
+  const admin = opts.hardened ? (args: string[], cwd: string) => hardenedGit(args, cwd) : git;
 
   if (opts.setup) removeSetupArtifacts(opts.worktreePath, opts.setup);
 
@@ -380,7 +408,7 @@ export async function removeForkWorktree(opts: {
   // and hermetic: a pinned identity means it works with no user git config;
   // `add -A` also sweeps in untracked files. On any failure we just proceed to
   // remove (no worse than before).
-  if (!opts.deleteBranch) {
+  if (!opts.deleteBranch && opts.snapshot !== false && existsSync(opts.worktreePath)) {
     try {
       const dirty = (await git(["status", "--porcelain"], opts.worktreePath)).trim();
       if (dirty) {
@@ -393,22 +421,32 @@ export async function removeForkWorktree(opts: {
             "user.name=codeoid",
             "commit",
             "--no-verify",
+            // codeoid's own commit: never waits on a signing key it may not reach.
+            "--no-gpg-sign",
             "-m",
             "codeoid: WIP snapshot saved on session destroy",
           ],
           opts.worktreePath,
         );
       }
-    } catch {
-      // No commit identity / hook refusal / already-clean race — fall through.
+    } catch (err) {
+      // Work that couldn't be saved is never thrown away: the worktree stays.
+      // Unknown counts as dirty: work is never discarded on a guess.
+      const still = await git(["status", "--porcelain"], opts.worktreePath).catch(() => "?");
+      if (still.trim()) {
+        console.error(
+          `[codeoid/worktree] kept ${opts.worktreePath}: its uncommitted work couldn't be saved to ${opts.branch ?? "its branch"} (${err instanceof Error ? err.message : String(err)})`,
+        );
+        return;
+      }
     }
   }
 
-  await git(["worktree", "remove", "--force", opts.worktreePath], mainRoot).catch(() => {});
+  await admin(["worktree", "remove", "--force", opts.worktreePath], mainRoot).catch(() => {});
   // Prune any dangling administrative entry even if the dir was already gone.
-  await git(["worktree", "prune"], mainRoot).catch(() => {});
+  await admin(["worktree", "prune"], mainRoot).catch(() => {});
   if (opts.deleteBranch && opts.branch) {
-    await git(["branch", "-D", opts.branch], mainRoot).catch(() => {});
+    await admin(["branch", "-D", opts.branch], mainRoot).catch(() => {});
   }
 }
 

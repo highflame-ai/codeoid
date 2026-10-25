@@ -11,7 +11,11 @@
  * they need no reactive root.
  */
 
-import type { FleetTaskWire, SessionInfo, SessionUiRequestMsg } from "../protocol/types";
+import { loopQuestion, loopWaitKind, objectiveTitle } from "./loops";
+
+/** How long a blocked loop run stays in the inbox after it ended. */
+export const LOOP_BLOCKED_ATTENTION_MS = 24 * 60 * 60 * 1000;
+import type { FleetTaskWire, LoopRunWire, SessionInfo, SessionUiRequestMsg } from "../protocol/types";
 
 export type AttentionKind = "question" | "approval" | "blocked" | "failed";
 
@@ -21,6 +25,8 @@ export interface AttentionItem {
   kind: AttentionKind;
   /** The session to open. Null for a task whose session is gone or not yet spawned. */
   sessionId: string | null;
+  /** A loop run's item opens the run, not a session. */
+  runId?: string;
   /** What to show as the row's subject — a session name, or a task id. */
   label: string;
   detail: string;
@@ -70,6 +76,8 @@ export interface AttentionSources {
   tasks: readonly FleetTaskWire[];
   /** Resolve a task to its session, when it still has one. */
   taskSession: (task: FleetTaskWire) => SessionInfo | null;
+  /** The owner's loop runs; a question or a block contributes (docs/loops.md). */
+  loops?: readonly LoopRunWire[];
 }
 
 /**
@@ -165,6 +173,27 @@ export function collectAttention(src: AttentionSources, now: number): AttentionI
       label: session?.name ?? `${task.kind} ${task.id.slice(0, 8)}`,
       detail: task.error ?? (task.status === "blocked" ? "hit the failure limit" : "task failed"),
       since: task.createdAt,
+    });
+  }
+
+  // Loop runs waiting on your answer, or blocked without you. A run waiting
+  // on an approval is left out: its worker session is `waiting_approval`, so
+  // the approval row above already stands for it and opens where it is
+  // answered.
+  for (const run of src.loops ?? []) {
+    const wait = loopWaitKind(run);
+    // A blocked run is over; it asks for attention for a day, not forever.
+    const recentlyBlocked =
+      run.status === "blocked" && run.endedAt !== null && now - Date.parse(run.endedAt) < LOOP_BLOCKED_ATTENTION_MS;
+    if (wait !== "question" && !recentlyBlocked) continue;
+    items.push({
+      key: `loop:${run.id}`,
+      kind: wait === "question" ? "question" : "blocked",
+      sessionId: null,
+      runId: run.id,
+      label: `loop · ${objectiveTitle(run.objective, 60)}`,
+      detail: wait === "question" ? loopQuestion(run.waitingOn) : (run.reason ?? "blocked"),
+      since: sinceFor(run.updatedAt, now),
     });
   }
 

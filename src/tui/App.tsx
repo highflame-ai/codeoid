@@ -1099,6 +1099,20 @@ export function App({ config, createClient = (c, d) => new TuiWsClient(c, d) }: 
         );
         return;
       }
+      case "/loops":
+      case "/loop": {
+        // Loop runs (docs/loops.md). Starting one takes checks and limits as
+        // flags, so it stays with the CLI; say how rather than guess.
+        if (cmd === "/loop" && args[0] === "start") {
+          dispatch({
+            type: "error",
+            message: 'Start a loop from a shell: codeoid loop start "<objective>" --workdir <repo> --check "<command>" [--test]. Then follow it with /loops.',
+          });
+          return;
+        }
+        dispatch({ type: "modal.open", modal: { kind: "loops", ...(args[0] ? { runId: args[0] } : {}) } });
+        return;
+      }
       case "/search": {
         // Opens the search modal pre-populated with whatever the user
         // typed after `/search`. Empty is fine — modal shows the hint.

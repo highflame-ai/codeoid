@@ -853,6 +853,41 @@ const routinePatchSchema = z.object(
 
 export const evidenceGetSchema = z.object({ ...base, type: z.literal("evidence.get"), evidenceId: idField });
 
+// ── Loops (docs/loop-engineering-design.md) ───────────────────────────────────
+
+const loopCheckSchema = z.object({
+  id: z.string().min(1).max(40).optional(),
+  command: z.string().min(1).max(4_000),
+  timeoutSec: z.number().int().min(1).max(3_600).optional(),
+  expectTests: z.boolean().optional(),
+});
+
+export const loopStartSchema = z.object({
+  ...base,
+  type: z.literal("loop.start"),
+  objective: z.string().min(1).max(8_000),
+  workdir: z.string().min(1).max(LIMITS.PATH_MAX),
+  checks: z.array(loopCheckSchema).min(1).max(10),
+  provider: z.string().min(1).max(64).optional(),
+  model: z.string().min(1).max(200).optional(),
+  toolBudget: z.number().int().min(1).max(1_000).optional(),
+  limits: z
+    .object({
+      attempts: z.number().int().min(1).max(10).optional(),
+      attemptMinutes: z.number().int().min(1).max(240).optional(),
+      runMinutes: z.number().int().min(1).max(1_440).optional(),
+    })
+    .optional(),
+});
+export const loopListSchema = z.object({ ...base, type: z.literal("loop.list"), limit: z.number().int().min(1).max(200).optional() });
+export const loopGetSchema = z.object({ ...base, type: z.literal("loop.get"), runId: idField, events: z.boolean().optional() });
+export const loopControlSchema = z.object({
+  ...base,
+  type: z.enum(["loop.cancel", "loop.pause", "loop.resume"]),
+  runId: idField,
+});
+export const loopSteerSchema = z.object({ ...base, type: z.literal("loop.steer"), runId: idField, text: z.string().min(1).max(8_000) });
+
 export const routineCreateSchema = z.object({ ...base, type: z.literal("routine.create"), spec: routineSpecSchema });
 export const routineUpdateSchema = z.object({
   ...base,
@@ -1175,6 +1210,11 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   routineTokenSchema,
   routinePreviewSchema,
   evidenceGetSchema,
+  loopStartSchema,
+  loopListSchema,
+  loopGetSchema,
+  loopControlSchema,
+  loopSteerSchema,
   compareListSchema,
   compareKeepSchema,
   mcpOAuthBeginSchema,

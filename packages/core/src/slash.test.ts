@@ -227,6 +227,25 @@ describe("dispatchSlash", () => {
     });
   });
 
+  it("parses /loops and /loop with and without an objective", () => {
+    expect(parseSlash("/loops")).toEqual({ kind: "loops" });
+    expect(parseSlash("/loop")).toEqual({ kind: "loop" });
+    expect(parseSlash("/loop fix the checkout test")).toEqual({ kind: "loop", objective: "fix the checkout test" });
+  });
+
+  it("/loops and /loop invoke their hooks and emit nothing", () => {
+    const showLoops = mock();
+    const showLoopStart = mock();
+    const c = { ...ctx(), showLoops, showLoopStart };
+    dispatchSlash({ kind: "loops" }, c);
+    dispatchSlash({ kind: "loop", objective: "fix it" }, c);
+    dispatchSlash({ kind: "loop" }, c);
+    expect(showLoops).toHaveBeenCalledTimes(1);
+    expect(showLoopStart).toHaveBeenNthCalledWith(1, "fix it");
+    expect(showLoopStart).toHaveBeenNthCalledWith(2, undefined);
+    expect(c.sent).toEqual([]);
+  });
+
   it("/pipeline invokes the pipeline hook with the goal and emits nothing", () => {
     const showPipeline = mock();
     const c = { ...ctx(), showPipeline };

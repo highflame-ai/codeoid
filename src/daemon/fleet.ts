@@ -17,8 +17,7 @@
  * (only the Claude provider supports MCP today).
  */
 
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { hardenedGit } from "./git-env.js";
 import { z } from "zod";
 import {
   createSdkMcpServer,
@@ -32,7 +31,6 @@ import {
   FLEET_TOOL_PREFIX,
 } from "../protocol/types.js";
 
-const execFileAsync = promisify(execFile);
 
 /** What the conductor is allowed to know about a session — metadata only. */
 export interface FleetSessionView {
@@ -477,16 +475,11 @@ export function createFleetHandlers(deps: FleetDeps) {
 /** Branch + dirty state for a workdir; degrades to "not a git repo" fast. */
 async function probeGit(workdir: string): Promise<string> {
   try {
-    const { stdout: branch } = await execFileAsync(
-      "git",
-      ["-C", workdir, "rev-parse", "--abbrev-ref", "HEAD"],
-      { timeout: GIT_PROBE_TIMEOUT_MS },
-    );
-    const { stdout: status } = await execFileAsync(
-      "git",
-      ["-C", workdir, "status", "--porcelain"],
-      { timeout: GIT_PROBE_TIMEOUT_MS },
-    );
+    // An agent can write this repository's config: hooks, fsmonitor and
+    // filters are off, and git never gets the daemon's environment.
+    const probe = (args: string[]) => hardenedGit(["--no-optional-locks", ...args], workdir, {}, { timeoutMs: GIT_PROBE_TIMEOUT_MS });
+    const branch = await probe(["rev-parse", "--abbrev-ref", "HEAD"]);
+    const status = await probe(["status", "--porcelain", "--ignore-submodules=all"]);
     const dirty = status.trim().length > 0 ? "dirty" : "clean";
     return `${branch.trim()} (${dirty})`;
   } catch {

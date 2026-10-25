@@ -181,6 +181,8 @@ codeoid mcp approve <session> <server> [--path <f>] [--yes <fingerprint>]  # rev
 codeoid mcp adopt <server> [--session <s>] [--url <u>]  # codeoid signs in to a server from Claude's config (#390)
 codeoid mcp signin <server> [--callback-url <u>]        # sign in to an OAuth registry server
 codeoid evidence <id> [--full]   # one recorded check: what ran, on which tree, what it found
+codeoid loop start "<objective>" --workdir <dir> --check <cmd> [--test] [--wait]  # repair until the daemon's checks pass (docs/loops.md)
+codeoid loop ls | show <id> [--events] | steer <id> <text> | pause | resume | cancel <id>
 codeoid routine add <name> --prompt … [--cron|--every|--at] [--check <cmd>]  # scheduled agent runs
 codeoid routine ls | show | runs | run [--wait] | edit | pause | resume | rm | cancel <runId> | token | preview
 codeoid worktree trust [dir] [--off] [--yes]  # trust the setup command of a repo's .codeoid/setup.yaml, pinned to its blob (docs/CONFIGURATION.md)
@@ -191,6 +193,15 @@ sessions over MCP. Every tool call is an ordinary `ClientMessage` run through
 `SessionManager.handle`, so it shares the WebSocket path's verifier, scopes,
 tenancy, and audit. Keep authorization in `handle`; the endpoint may only
 narrow what is reachable, never grant. See docs/mcp-control.md.
+
+Loops (`src/daemon/loops/`, docs/loops.md) pursue an objective in their own
+worktree until the daemon's own checks pass. `LoopService` is the controller:
+it owns lifecycle, verification, and acceptance, reaches the daemon only through
+the `LoopHost` seam (`loops/host.ts`), and schedules attempts only through the
+dispatcher (`kind: "attempt"`). A worker's `loop_report` is a request to verify,
+never a verdict. Every transition is a compare-and-set on the run's
+`state_version`. loop.* is authorized in `SessionManager.#loopHandle`
+(owner-only; session:create + session:send, plus session:approve to start).
 
 Routines (`src/daemon/routines/`, docs/routines.md) run sessions on a schedule
 or an API call. `RoutineService` owns the scheduler and runs; it reaches

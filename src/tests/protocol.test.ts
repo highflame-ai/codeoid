@@ -500,6 +500,10 @@ describe("DaemonMessage routing", () => {
           return `routine.preview:${msg.fires.length}`;
         case "evidence.record":
           return `evidence:${msg.evidence.result}`;
+        case "loop.snapshot":
+          return `loop:${msg.run.status}`;
+        case "loop.list.result":
+          return `loops:${msg.runs.length}`;
         case "mcp.oauth.begin.result":
           return `mcp.oauth.begin:${msg.status}`;
         case "mcp.oauth.complete.result":

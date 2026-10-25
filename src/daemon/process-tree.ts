@@ -32,7 +32,7 @@
  */
 
 import { execFile } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync, readlinkSync, statSync } from "node:fs";
 
 export interface ProcessEntry {
   pid: number;
@@ -176,4 +176,85 @@ export async function killSurvivors(snapshot: readonly ProcessEntry[]): Promise<
     }
   }
   return killed;
+}
+
+/**
+ * Kill every process (Linux) that carries `key=value` in its environment or
+ * works under `root`: what a finished check left behind, background servers
+ * and processes that escaped its process group alike. Not a sandbox — a
+ * process that both clears its environment and leaves the directory isn't
+ * found. Returns the pids signalled; elsewhere, none.
+ */
+export function killMarked(key: string, value: string, root: string, since?: number): number[] {
+  if (process.platform !== "linux") return [];
+  const needle = Buffer.from(`${key}=${value}\0`);
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  const marked = (pid: number): boolean => {
+    // Only this user's processes, started since `since` (clock ticks after
+    // boot): nothing older can carry the marker or sit in the new directory,
+    // and nothing else's memory is read (a process stuck on a hung mount
+    // would hold that read).
+    try {
+      if (uid !== null && statSync(`/proc/${pid}`).uid !== uid) return false;
+      if (since !== undefined && Number(procStartTime(pid) ?? 0) < since) return false;
+    } catch {
+      return false;
+    }
+    try {
+      if (readFileSync(`/proc/${pid}/environ`).includes(needle)) return true;
+    } catch {
+      // gone, not ours, or not readable
+    }
+    try {
+      // A directory removed since reads as "<path> (deleted)".
+      const cwd = readlinkSync(`/proc/${pid}/cwd`).replace(/ \(deleted\)$/, "");
+      return cwd === root || cwd.startsWith(`${root}/`);
+    } catch {
+      return false;
+    }
+  };
+  // Stop what's found and look again until nothing new turns up, so a
+  // process that forks as it goes can't outrun the sweep; then kill it all.
+  const stopped = new Set<number>();
+  for (let pass = 0; pass < 10; pass++) {
+    let found = 0;
+    let pids: number[];
+    try {
+      pids = readdirSync("/proc").filter((n) => /^\d+$/.test(n)).map(Number);
+    } catch {
+      break;
+    }
+    for (const pid of pids) {
+      if (pid === process.pid || pid === process.ppid || stopped.has(pid) || !marked(pid)) continue;
+      try {
+        process.kill(pid, "SIGSTOP");
+        stopped.add(pid);
+        found++;
+      } catch {
+        // already gone
+      }
+    }
+    if (found === 0) break;
+  }
+  const killed: number[] = [];
+  for (const pid of stopped) {
+    try {
+      process.kill(pid, "SIGKILL");
+      killed.push(pid);
+    } catch {
+      // already gone
+    }
+  }
+  return killed;
+}
+
+/** Clock ticks since boot now (as /proc/<pid>/stat's start time counts), on Linux. */
+export function ticksNow(): number | undefined {
+  if (process.platform !== "linux") return undefined;
+  try {
+    // USER_HZ is 100 on every Linux the daemon runs on; a little slack below.
+    return Math.floor(Number(readFileSync("/proc/uptime", "utf8").split(" ")[0]) * 100) - 100;
+  } catch {
+    return undefined;
+  }
 }
