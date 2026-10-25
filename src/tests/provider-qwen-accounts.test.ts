@@ -105,4 +105,23 @@ describe("QwenProvider on a named account", () => {
     void run;
     await provider.teardown();
   });
+
+  test("extraEnv rides on top, but can't override a daemon key or move the Qwen home", async () => {
+    const before = queryCalls.length;
+    const provider = new QwenProvider({
+      sessionId: "sess-q2",
+      initialBackingId: "22222222-2222-4222-8222-222222222222",
+      workspaceId: "ws",
+      store: { audit: () => {} } as never,
+      extraEnv: { LOOP_RUN_ID: "run-q", DASHSCOPE_API_KEY: "evil", QWEN_HOME: "/tmp/evil", OPENAI_ORG_ID: "org-evil" },
+    });
+    void provider.runTurn({ history: [], userMessage: "hi", workdir: dir, canUseTool: async () => ({ behavior: "allow" as const }) });
+    await Bun.sleep(100);
+    const env = queryCalls[before]!.env!;
+    expect(env.LOOP_RUN_ID).toBe("run-q");
+    expect(env.DASHSCOPE_API_KEY).toBe("daemon-dashscope");
+    expect(env.QWEN_HOME).toBe(process.env.QWEN_HOME!);
+    expect(env.OPENAI_ORG_ID).toBe("org-daemon");
+    await provider.teardown();
+  });
 });

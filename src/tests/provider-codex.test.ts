@@ -27,7 +27,7 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CodexRpcProcess } from "../daemon/providers/codex/rpc.js";
-import { CodexProvider, describeCodexError } from "../daemon/providers/codex/index.js";
+import { CodexProvider, codexErrorDetail, describeCodexError } from "../daemon/providers/codex/index.js";
 import { MemoryMcpHttp, MEMORY_MCP_SERVER_NAME } from "../daemon/memory/mcp-http.js";
 import { McpRegistry } from "../daemon/mcp/registry.js";
 import { MCP_PROXY_PATH_PREFIX, MCP_PROXY_TOKEN_ENV, McpProxy } from "../daemon/mcp/proxy.js";
@@ -118,6 +118,40 @@ async function collect(run: TurnRun): Promise<ProviderEvent[]> {
 }
 
 describe("CodexProvider over fake-codex", () => {
+  it("extraEnv reaches the spawned codex; credential, home and codeoid-owned keys keep codeoid's value", async () => {
+    const saved = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = "sk-daemon";
+    try {
+      const p = new CodexProvider({
+        sessionId: "sess-env",
+        initialBackingId: "sess-env",
+        command: process.execPath,
+        argsPrefix: [FIXTURE],
+        store: {} as Store,
+        extraEnv: {
+          LOOP_RUN_ID: "run-9",
+          OPENAI_API_KEY: "sk-evil",
+          CODEX_HOME: "/tmp/other-login",
+          HOME: "/tmp/evil-home",
+          PATH: "/tmp/evil-bin",
+          CODEOID_MEMORY_TOKEN: "forged",
+        },
+      });
+      const events = await collect(p.runTurn(turnOpts("echo-env")));
+      await p.teardown();
+      const env = JSON.parse((events.find((e) => e.type === "text_done") as { content: string }).content) as Record<string, string>;
+      expect(env.LOOP_RUN_ID).toBe("run-9");
+      expect(env.OPENAI_API_KEY).toBe("sk-daemon");
+      expect(env.CODEX_HOME).toBeUndefined();
+      expect(env.HOME).toBe(process.env.HOME!);
+      expect(env.PATH).toBe(process.env.PATH!);
+      expect(env.CODEOID_MEMORY_TOKEN).toBeUndefined();
+    } finally {
+      if (saved === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = saved;
+    }
+  });
+
   it("C1: text turn streams thinking + text and completes with usage", async () => {
     const p = makeProvider();
     const events = await collect(p.runTurn(turnOpts("hello")));
@@ -1293,6 +1327,31 @@ describe("describeCodexError", () => {
       expect(out).not.toContain("[object Object]");
       expect(out.length).toBeGreaterThan(0);
     }
+  });
+});
+
+describe("codexErrorDetail", () => {
+  it("extracts a unit variant and a reset instant from the error object", () => {
+    expect(codexErrorDetail({ error: { message: "x", codexErrorInfo: "usageLimitExceeded", resets_at: 1_800_000_000 } })).toEqual({
+      codexErrorInfo: "usageLimitExceeded",
+      resetsAt: 1_800_000_000,
+    });
+  });
+
+  it("extracts a struct variant's fields (reset, HTTP status)", () => {
+    expect(codexErrorDetail({ error: { message: "x", codexErrorInfo: { usageLimitExceeded: { resetsAt: 1_800_000_000_000 } } } })).toEqual({
+      codexErrorInfo: "usageLimitExceeded",
+      resetsAt: 1_800_000_000_000,
+    });
+    expect(codexErrorDetail({ error: { message: "x", codexErrorInfo: { httpConnectionFailed: { httpStatusCode: 429 } } } })).toEqual({
+      codexErrorInfo: "httpConnectionFailed",
+      status: 429,
+    });
+  });
+
+  it("undefined without error info", () => {
+    expect(codexErrorDetail({ error: { message: "x" } })).toBeUndefined();
+    expect(codexErrorDetail({})).toBeUndefined();
   });
 });
 

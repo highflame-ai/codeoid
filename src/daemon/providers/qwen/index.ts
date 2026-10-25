@@ -54,7 +54,7 @@ import type {
   CatalogEntry,
 } from "../interface.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
-import { buildQwenEnv } from "../env.js";
+import { buildQwenEnv, withExtraEnv } from "../env.js";
 import type { LLMCallUsage } from "../../context-math.js";
 import type { ResolvedAccount } from "../../accounts.js";
 import { qwenAccountEnv } from "../../account-apply.js";
@@ -97,6 +97,8 @@ export interface QwenProviderInit {
    */
   resolveAccount?: () => ResolvedAccount | null;
   onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
+  /** Caller env for the child process (ProviderSessionInit.extraEnv), merged last via withExtraEnv. */
+  extraEnv?: Readonly<Record<string, string>>;
 }
 
 export class QwenProvider implements SessionProvider {
@@ -440,14 +442,20 @@ export class QwenProvider implements SessionProvider {
         abortController: this.#abortController,
         // Explicit allowlist + blanking of everything else — the SDK MERGES
         // this over process.env rather than replacing it (see buildQwenEnv).
-        env: {
-          ...buildQwenEnv(),
-          // An account's key, and none of the daemon's (blanked: the SDK merges over process.env).
-          // An account: its key and its own home, and none of the daemon's keys.
-          ...(account ? qwenAccountEnv(account, buildQwenEnv()) : {}),
-          ...(baseUrl ? { OPENAI_BASE_URL: baseUrl } : {}),
-          ...(model ? { OPENAI_MODEL: model } : {}),
-        },
+        // The caller's extra env goes on last; withExtraEnv refuses every
+        // OPENAI_/QWEN_/DASHSCOPE_ and credential-shaped key, so it can't
+        // undo the blanking or the account.
+        env: withExtraEnv(
+          {
+            ...buildQwenEnv(),
+            // An account's key, and none of the daemon's (blanked: the SDK merges over process.env).
+            // An account: its key and its own home, and none of the daemon's keys.
+            ...(account ? qwenAccountEnv(account, buildQwenEnv()) : {}),
+            ...(baseUrl ? { OPENAI_BASE_URL: baseUrl } : {}),
+            ...(model ? { OPENAI_MODEL: model } : {}),
+          },
+          init.extraEnv,
+        ),
         authType,
         ...(model ? { model } : {}),
         // qwen-code takes a LIST of capacity fallbacks (max 3), where the

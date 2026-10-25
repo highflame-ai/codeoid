@@ -66,7 +66,8 @@ import { removeClaudeSession, toClaudeSessionEntries, writeClaudeSession } from 
 import { BUDGET_STOP_MESSAGE, isBackgroundLifecycleEvent } from "../interface.js";
 import { isUngrantableSkillCommand, redactCommand } from "../../skill-command.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
-import { buildSubprocessEnv, withGatewayCredential } from "../env.js";
+import { buildSubprocessEnv, withExtraEnv, withGatewayCredential } from "../env.js";
+import { listProcesses } from "../../process-tree.js";
 import type { LLMCallUsage } from "../../context-math.js";
 import type { PackSubagent } from "../../pipeline/subagents.js";
 
@@ -132,6 +133,8 @@ export interface ClaudeProviderInit {
    * switch takes effect on the next turn and RESUMES the same backing session.
    */
   resolveAccount?: () => ResolvedClaudeAccount | null;
+  /** Caller env for the CLI child process (ProviderSessionInit.extraEnv), merged last via withExtraEnv. */
+  extraEnv?: Readonly<Record<string, string>>;
   /** codeoid session id — used as the initial backing id and for audit/logging. */
   sessionId: string;
   /** Test seam for native continuation (#387); defaults to the real SDK. */
@@ -235,6 +238,8 @@ export class ClaudeProvider implements SessionProvider {
 
   // Claude-specific backing-session state
   #claudeCodeSessionId: string;
+  /** The backing id the live query's CLI was spawned with (backendProcessIds). */
+  #spawnedWithId: string | null = null;
   #hasQueried = false;
   #backingRecoveryAttempted = false;
   #lastPushedContent: string | null = null;
@@ -644,6 +649,19 @@ export class ClaudeProvider implements SessionProvider {
     await this.teardown();
   }
 
+  /**
+   * The Claude Code CLI this provider's query runs in. The SDK spawns it
+   * (spawnClaudeCodeProcess is not used: replacing the SDK's spawn would drop
+   * its stderr diagnostics), so it is found as a direct child of this process
+   * whose argv names this provider's backing session as an exact token
+   * (argvNamesSession — ids are UUIDs, unique per session).
+   */
+  async backendProcessIds(): Promise<number[]> {
+    if (!this.#query) return [];
+    const id = this.#spawnedWithId ?? this.#claudeCodeSessionId;
+    return (await listProcesses()).filter((p) => p.ppid === process.pid && argvNamesSession(p.args, id)).map((p) => p.pid);
+  }
+
   async teardown(): Promise<void> {
     this.#inputQueue?.close();
     this.#abortController?.abort();
@@ -829,6 +847,8 @@ export class ClaudeProvider implements SessionProvider {
     const sessionOpts = this.#hasQueried
       ? { resume: this.#claudeCodeSessionId }
       : { sessionId: this.#claudeCodeSessionId };
+    // What this query's CLI was started with — its argv names it (backendProcessIds).
+    this.#spawnedWithId = this.#claudeCodeSessionId;
 
     const merged = this.#mcpServerSet(opts, oauthMcp);
     const mcpServers = Object.keys(merged).length > 0 ? merged : undefined;
@@ -859,11 +879,18 @@ export class ClaudeProvider implements SessionProvider {
         // applyAccountEnv). The forge gateway re-point applies only to the
         // daemon's own environment: a named account carries the user's own
         // gateway token, which must never be swapped for an agent identity.
-        env: account
-          ? account.apply(buildAgentEnv(process.env))
-          : buildAgentEnv(process.env, {
-              gatewayCredential: init.identityManager?.getGatewayCredential(init.sessionId),
-            }),
+        //
+        // The caller's extra env (a loop worker's) goes on last; withExtraEnv
+        // refuses every ANTHROPIC_/CLAUDE_ and credential-shaped key, so it
+        // can never undo the account or the gateway re-point.
+        env: withExtraEnv(
+          account
+            ? account.apply(buildAgentEnv(process.env))
+            : buildAgentEnv(process.env, {
+                gatewayCredential: init.identityManager?.getGatewayCredential(init.sessionId),
+              }),
+          init.extraEnv,
+        ),
         allowedTools: [
           // Every EXACT TOOL NAME here is auto-approved by the SDK BEFORE
           // canUseTool is consulted, so it never reaches our gate — the SDK
@@ -1565,6 +1592,22 @@ export interface TranslateState {
 }
 
 /**
+ * Whether a Claude CLI command line names backing session `id` as an EXACT
+ * argv token — the forms the SDK emits (`--resume=<id>`, `--session-id=<id>`,
+ * SDK 0.3.281) and their two-token spelling. A substring match would also hit
+ * a process that merely mentions the id (a prompt, a log path). Exported for tests.
+ */
+export function argvNamesSession(args: string, id: string): boolean {
+  const argv = args.split(/\s+/);
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === `--resume=${id}` || a === `--session-id=${id}`) return true;
+    if ((a === "--resume" || a === "--session-id") && argv[i + 1] === id) return true;
+  }
+  return false;
+}
+
+/**
  * Translate one SDKMessage from the Claude Agent SDK into zero or more
  * ProviderEvents.  Pure function — no I/O, no side-effects beyond calling
  * `emit` and updating the caller-owned `state`.  Extracted so it can be
@@ -1742,6 +1785,11 @@ export function translateSDKMessage(
           // Only a turn that completed is a point to fork at: an errored one
           // (a context overflow) would carry the failure into the fork, and an
           // interrupted one can end mid tool call.
+          // A turn the CLI ends "successfully" but flagged as an error carries
+          // its notice (a usage limit, "API Error: …") as the result text.
+          ...(r.is_error && r.subtype === "success" && typeof r.result === "string" && r.result
+            ? { resultText: r.result }
+            : {}),
           ...(sessionId && chainEnd && !zeroTurn && r.subtype === "success" && !r.is_error
             ? { nativeRef: { backingId: sessionId, ref: chainEnd, ...(state.cwd ? { dir: state.cwd } : {}) } }
             : {}),
@@ -1875,6 +1923,38 @@ export function translateSDKMessage(
       case "tool_progress": {
         const p = msg as { tool_name?: string; elapsed_time_seconds?: number };
         emit({ type: "tool_progress", toolName: p.tool_name, elapsedSeconds: p.elapsed_time_seconds });
+        break;
+      }
+
+      case "rate_limit_event": {
+        // SDKRateLimitInfo.resetsAt is epoch SECONDS (the CLI renders it with
+        // `new Date(resetsAt * 1000)`); ProviderEvent carries milliseconds.
+        const info = (msg as {
+          rate_limit_info?: {
+            status?: string;
+            resetsAt?: number;
+            rateLimitType?: string;
+            isUsingOverage?: boolean;
+            overageInUse?: boolean;
+            overageStatus?: string;
+          };
+        }).rate_limit_info;
+        const status = info?.status;
+        if (status !== "allowed" && status !== "allowed_warning" && status !== "rejected") break;
+        // The plan window is spent but extra usage (overage) is carrying the
+        // requests: not a limit that stops the turn.
+        const overage =
+          info?.isUsingOverage === true ||
+          info?.overageInUse === true ||
+          info?.overageStatus === "allowed" ||
+          info?.overageStatus === "allowed_warning";
+        emit({
+          type: "rate_limit",
+          status,
+          ...(overage ? { overage: true } : {}),
+          ...(typeof info?.resetsAt === "number" && info.resetsAt > 0 ? { resetsAt: info.resetsAt * 1000 } : {}),
+          ...(info?.rateLimitType ? { limitType: info.rateLimitType } : {}),
+        });
         break;
       }
     }

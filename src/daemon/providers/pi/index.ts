@@ -36,7 +36,7 @@ import type {
 } from "../interface.js";
 import { EFFORT_LEVELS, type EffortLevel, type ProviderCommand } from "../../../protocol/types.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
-import { buildPiEnv } from "../env.js";
+import { buildPiEnv, withExtraEnv } from "../env.js";
 import {
   APPROVAL_TITLE,
   type BridgeMcpTool,
@@ -83,6 +83,8 @@ export interface PiProviderInit {
    */
   resolveAccount?: () => ResolvedAccount | null;
   onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
+  /** Caller env for the child process (ProviderSessionInit.extraEnv), merged last via withExtraEnv. */
+  extraEnv?: Readonly<Record<string, string>>;
 }
 
 interface PiSessionStats {
@@ -110,6 +112,7 @@ export class PiProvider implements SessionProvider {
   #backingSessionId: string;
   #command: string;
   #resolveAccount: (() => ResolvedAccount | null) | null;
+  readonly #extraEnv: Readonly<Record<string, string>> | undefined;
   #argsPrefix: string[];
   #store: Store;
   #onModels?: PiProviderInit["onModels"];
@@ -144,6 +147,7 @@ export class PiProvider implements SessionProvider {
     this.#backingSessionId = init.initialBackingId;
     this.#command = init.command;
     this.#resolveAccount = init.resolveAccount ?? null;
+    this.#extraEnv = init.extraEnv;
     this.#argsPrefix = init.argsPrefix ?? [];
     this.#store = init.store;
     this.#onModels = init.onModels;
@@ -192,6 +196,11 @@ export class PiProvider implements SessionProvider {
 
   setHasQueried(value: boolean): void {
     this.#hasQueried = value;
+  }
+
+  async backendProcessIds(): Promise<number[]> {
+    const pid = this.#proc?.pid;
+    return pid ? [pid] : [];
   }
 
   async teardown(): Promise<void> {
@@ -330,7 +339,8 @@ export class PiProvider implements SessionProvider {
       // Allowlisted env (GHSA-38vh): pi gets its credentials (~/.pi via
       // HOME, provider API keys), never codeoid's own secrets.
       // pi's thinking-level writes stay in a copy of its settings (#417).
-      env: this.#piEnv(),
+      // Then the caller's extra env, which can't override the account (withExtraEnv).
+      env: withExtraEnv(this.#piEnv(), this.#extraEnv),
       onEvent: (frame) => this.#onFrame(frame),
       onExit: ({ code, signal, stderrTail }) => {
         this.#bridgeReady = false;

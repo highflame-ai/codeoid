@@ -329,6 +329,9 @@ async function runTurn(threadId: string, prompt: string): Promise<void> {
       argv: process.argv,
     });
     send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text } } });
+  } else if (prompt.includes("echo-env")) {
+    // The environment the provider spawned us with (extraEnv wiring).
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: JSON.stringify(process.env) } } });
   } else if (prompt.includes("echo-native")) {
     send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: JSON.stringify(nativeCalls) } } });
   } else if (prompt.includes("echo-prompt")) {

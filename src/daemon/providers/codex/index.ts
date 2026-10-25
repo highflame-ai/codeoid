@@ -65,7 +65,7 @@ import type {
 } from "../interface.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
 import { type ResponsesItem, toResponsesItems } from "./native-history.js";
-import { buildCodexEnv } from "../env.js";
+import { buildCodexEnv, withExtraEnv } from "../env.js";
 import { CodexRpcProcess } from "./rpc.js";
 import { EFFORT_LEVELS, type EffortLevel, type SessionMode } from "../../../protocol/types.js";
 import { MEMORY_MCP_SERVER_NAME, MEMORY_MCP_TOKEN_ENV, type MemoryMcpMount } from "../../memory/mcp-http.js";
@@ -130,6 +130,8 @@ export interface CodexProviderInit {
    */
   resolveAccount?: () => ResolvedAccount | null;
   onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
+  /** Caller env for the child process (ProviderSessionInit.extraEnv), merged last via withExtraEnv. */
+  extraEnv?: Readonly<Record<string, string>>;
 }
 
 /** Item types that surface as tool records (vs text/reasoning streams). */
@@ -265,12 +267,52 @@ export function describeCodexError(params: Record<string, unknown>): string {
   }
 }
 
+/**
+ * The structured half of a codex `error` notification, for the usage-limit
+ * classifier: the v2 `TurnError.codexErrorInfo` variant (`usageLimitExceeded`,
+ * `rateLimitExceeded`, `httpConnectionFailed { httpStatusCode }`, … — codex-rs
+ * 0.154.0 app-server protocol) and the limit's reset instant when it carries
+ * one (`resets_at` / `resetsAt`, epoch seconds or ms). The info is a bare
+ * string for a unit variant and `{ variant: { …fields } }` otherwise.
+ * Undefined when the notification has no error info. describeCodexError keeps
+ * producing the display text; this never reaches the user.
+ */
+export function codexErrorDetail(params: Record<string, unknown>): Record<string, unknown> | undefined {
+  const err = params.error && typeof params.error === "object" ? (params.error as Record<string, unknown>) : undefined;
+  const info = err?.codexErrorInfo ?? params.codexErrorInfo;
+  let variant: string | undefined;
+  let fields: Record<string, unknown> = {};
+  if (typeof info === "string") variant = info;
+  else if (info && typeof info === "object") {
+    const [name, value] = Object.entries(info as Record<string, unknown>)[0] ?? [];
+    variant = name;
+    if (value && typeof value === "object") fields = value as Record<string, unknown>;
+  }
+  if (!variant) return undefined;
+  const data = err?.data && typeof err.data === "object" ? (err.data as Record<string, unknown>) : {};
+  const reset = [fields.resetsAt, fields.resets_at, err?.resetsAt, err?.resets_at, data.resetsAt, data.resets_at].find(
+    (v): v is number => typeof v === "number" && v > 0,
+  );
+  const status = fields.httpStatusCode;
+  return {
+    codexErrorInfo: variant,
+    ...(reset !== undefined ? { resetsAt: reset } : {}),
+    ...(typeof status === "number" ? { status } : {}),
+  };
+}
+
 export class CodexProvider implements SessionProvider {
   /**
    * codex's approval replies carry only a decision (`approved` / `accept`) —
    * codex runs the input IT proposed, so a rewrite can't apply (#367).
    */
   readonly appliesToolInputRewrite = false;
+  /**
+   * Autonomous mode is `approvalPolicy: "never"` (approvalPolicyForMode): codex
+   * runs commands and patches without an approval request, so codeoid's tool
+   * budget never sees them.
+   */
+  readonly enforcesToolBudget = false;
   readonly id = "codex";
   readonly displayName = "Codex (OpenAI)";
 
@@ -282,6 +324,7 @@ export class CodexProvider implements SessionProvider {
   #command: string;
   #argsPrefix: string[];
   #resolveAccount: (() => ResolvedAccount | null) | null;
+  readonly #extraEnv: Readonly<Record<string, string>> | undefined;
   #onModels?: CodexProviderInit["onModels"];
   #workspaceId: string;
   #memoryMcp: MemoryMcpMount | null;
@@ -374,6 +417,7 @@ export class CodexProvider implements SessionProvider {
     this.#backingSessionId = init.initialBackingId;
     this.#command = init.command;
     this.#resolveAccount = init.resolveAccount ?? null;
+    this.#extraEnv = init.extraEnv;
     this.#argsPrefix = init.argsPrefix ?? [];
     this.#onModels = init.onModels;
     this.#workspaceId = init.workspaceId ?? init.sessionId;
@@ -705,6 +749,11 @@ export class CodexProvider implements SessionProvider {
     await this.teardown();
   }
 
+  async backendProcessIds(): Promise<number[]> {
+    const pid = this.#proc?.pid;
+    return pid ? [pid] : [];
+  }
+
   async teardown(): Promise<void> {
     this.#pendingMcpCalls.clear();
     this.#turnQueue?.close();
@@ -821,10 +870,15 @@ export class CodexProvider implements SessionProvider {
         cwd: opts.workdir,
         // The account's own CODEX_HOME (an overlay sharing everything but its
         // auth.json), applied last so nothing re-adds a daemon key.
-        env: await applyCodexAccount(
-          this.#resolveAccount?.() ?? null,
-          { ...buildCodexEnv(), ...mcp.env, ...bb.env, ...reg.env, ...oauth.env },
-          { command: this.#command, argsPrefix: this.#argsPrefix },
+        // The caller's extra env goes on last (withExtraEnv refuses anything
+        // credential- or home-shaped, so the account stays the account).
+        env: withExtraEnv(
+          await applyCodexAccount(
+            this.#resolveAccount?.() ?? null,
+            { ...buildCodexEnv(), ...mcp.env, ...bb.env, ...reg.env, ...oauth.env },
+            { command: this.#command, argsPrefix: this.#argsPrefix },
+          ),
+          this.#extraEnv,
         ),
         onNotification: (method, params) => this.#onNotification(method, params),
         onServerRequest: (method, params) => this.#onServerRequest(method, params),
@@ -1167,7 +1221,8 @@ export class CodexProvider implements SessionProvider {
         // the literal "[object Object]" — the cause destroyed at the one place
         // it was supposed to be reported. Observed live: a role-child failed
         // twice with `Error: [object Object]` and nothing anywhere said why.
-        this.#push({ type: "error", message: `codex: ${describeCodexError(params)}` });
+        const detail = codexErrorDetail(params);
+        this.#push({ type: "error", message: `codex: ${describeCodexError(params)}`, ...(detail ? { detail } : {}) });
         break;
       }
       default:

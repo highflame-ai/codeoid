@@ -327,6 +327,25 @@ describe("translateSDKMessage – result", () => {
     });
   });
 
+  it("carries the result text of a success-subtype is_error turn as resultText (where the CLI puts a limit notice)", () => {
+    const events = collectEmits({
+      type: "result",
+      subtype: "success",
+      is_error: true,
+      result: "You've hit your session limit · resets 3pm (UTC)",
+      usage: { input_tokens: 0, output_tokens: 0 },
+      modelUsage: {},
+    });
+    const result = (events[0] as { result: { resultText?: string; errorMessage?: string } }).result;
+    expect(result.resultText).toBe("You've hit your session limit · resets 3pm (UTC)");
+    expect(result.errorMessage).toBeUndefined();
+  });
+
+  it("no resultText on a turn that did not fail", () => {
+    const events = collectEmits({ type: "result", subtype: "success", result: "all done", usage: {}, modelUsage: {} });
+    expect((events[0] as { result: { resultText?: string } }).result.resultText).toBeUndefined();
+  });
+
   it("sets errorMessage when subtype is not 'success' and result is set", () => {
     const events = collectEmits({ type: "result", subtype: "error_during_execution", result: "tool failed" });
     expect(events[0]).toMatchObject({ type: "turn_done", result: { errorMessage: "tool failed" } });
@@ -1329,6 +1348,29 @@ describe("translateSDKMessage – system", () => {
   });
 });
 
+describe("translateSDKMessage – rate_limit_event", () => {
+  it("emits the plan limit state with resetsAt converted from epoch seconds to ms", () => {
+    const events = collectEmits({
+      type: "rate_limit_event",
+      rate_limit_info: { status: "rejected", resetsAt: 1_800_000_000, rateLimitType: "five_hour" },
+    });
+    expect(events).toEqual([{ type: "rate_limit", status: "rejected", resetsAt: 1_800_000_000_000, limitType: "five_hour" }]);
+  });
+
+  it("flags a rejection that overage is carrying", () => {
+    for (const info of [{ isUsingOverage: true }, { overageInUse: true }, { overageStatus: "allowed" }, { overageStatus: "allowed_warning" }]) {
+      const events = collectEmits({ type: "rate_limit_event", rate_limit_info: { status: "rejected", ...info } });
+      expect(events[0]).toMatchObject({ type: "rate_limit", status: "rejected", overage: true });
+    }
+    const plain = collectEmits({ type: "rate_limit_event", rate_limit_info: { status: "rejected", overageStatus: "rejected" } });
+    expect((plain[0] as { overage?: boolean }).overage).toBeUndefined();
+  });
+
+  it("emits nothing for a status it doesn't know", () => {
+    expect(collectEmits({ type: "rate_limit_event", rate_limit_info: { status: "mystery" } })).toHaveLength(0);
+  });
+});
+
 describe("translateSDKMessage – user (tool_result)", () => {
   it("emits tool_complete for each tool_result block", () => {
     const events = collectEmits({
@@ -2041,9 +2083,11 @@ describe("ClaudeProvider – Claude accounts", () => {
   function makeAccountProvider(
     current: { account: ResolvedClaudeAccount | null },
     onModels?: (models: ReadonlyArray<unknown>) => void,
+    extraEnv?: Record<string, string>,
   ): ClaudeProvider {
     return new ClaudeProvider({
       ...(onModels ? { onModels } : {}),
+      ...(extraEnv ? { extraEnv } : {}),
       sessionId: "acct-session",
       initialBackingId: "acct-backing",
       workspaceId: "ws_test",
@@ -2090,6 +2134,37 @@ describe("ClaudeProvider – Claude accounts", () => {
       else process.env.ANTHROPIC_API_KEY = saved.key;
       if (saved.url === undefined) delete process.env.ANTHROPIC_BASE_URL;
       else process.env.ANTHROPIC_BASE_URL = saved.url;
+    }
+  });
+
+  it("extraEnv reaches the CLI's env last, but never overrides the account's credential, HOME or a Node preload", async () => {
+    const saved = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "daemon-key-would-win";
+    try {
+      const current = { account: account({ name: "work", kind: "subscription", token: "sk-ant-oat01-WORK" }) };
+      const provider = makeAccountProvider(current, undefined, {
+        LOOP_RUN_ID: "run-7",
+        DATABASE_URL: "postgres://test",
+        CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-EVIL",
+        ANTHROPIC_API_KEY: "sk-evil",
+        CLAUDE_CONFIG_DIR: "/tmp/other-login",
+        HOME: "/tmp/evil-home",
+        NODE_OPTIONS: "--require /tmp/evil.js",
+      });
+      turnOn(provider, "t1");
+      const env = envOf();
+      expect(env.LOOP_RUN_ID).toBe("run-7");
+      expect(env.DATABASE_URL).toBe("postgres://test");
+      expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe("sk-ant-oat01-WORK");
+      expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+      expect(env.CLAUDE_CONFIG_DIR).not.toBe("/tmp/other-login");
+      expect(env.HOME).toBe(process.env.HOME!);
+      expect(env.NODE_OPTIONS).not.toBe("--require /tmp/evil.js");
+      openGate();
+      await provider.teardown();
+    } finally {
+      if (saved === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = saved;
     }
   });
 
