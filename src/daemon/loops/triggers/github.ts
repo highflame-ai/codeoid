@@ -301,11 +301,22 @@ export interface PushRecord {
   actor: string | null;
   /** `push`, `force_push`, `branch_creation`, `pr_merge`, `merge_queue_merge`, … (GitHub's activity types). */
   type: string;
+  /** The branch's head before it: {@link NO_COMMIT} for the branch's first push; "" when GitHub doesn't say. */
+  before: string;
 }
+
+/** What GitHub's activity writes as `before` for a branch's first push: nothing was there. */
+export const NO_COMMIT = "0".repeat(40);
 
 /** What GitHub's activity says about a head: the push that made it, if listed, and whether GitHub keeps activity for the repository at all. */
 export interface PushLookup {
   push: PushRecord | null;
+  /**
+   * The newest activity before `push` that left the branch at `push.before`:
+   * how what the push landed on got there. Null when that isn't on the page
+   * read, or there was nothing before.
+   */
+  prior: PushRecord | null;
   /** False when GitHub keeps no activity for the repository (404): no record will come. */
   kept: boolean;
 }
@@ -365,7 +376,7 @@ const COMMENT_NODES_QUERY = `query($ids: [ID!]!) {
 const MERGED_PULL_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
-      merged mergedBy { login } mergeCommit { oid } baseRefName
+      merged mergedBy { login } mergeCommit { oid }
       autoMergeRequest { enabledAt }
       timelineItems(itemTypes: [AUTO_MERGE_ENABLED_EVENT, AUTO_REBASE_ENABLED_EVENT, AUTO_SQUASH_ENABLED_EVENT], first: 1) { nodes { __typename } }
     }
@@ -377,6 +388,7 @@ const NODES_PER_QUERY = 100;
 /** A GraphQL node id as GitHub writes them (`IC_kwDO…`, `PRRC_kwDO…`, or the legacy base64 form). */
 const NODE_ID_RE = /^[A-Za-z0-9_=+/-]{1,200}$/;
 
+const SHA_RE = /^[0-9a-f]{40}$/;
 const str = (v: unknown): string => (typeof v === "string" ? v : "");
 const login = (v: unknown): string | null => str((v as { login?: unknown } | null | undefined)?.login) || null;
 
@@ -479,35 +491,46 @@ export class GitHubSource {
     try {
       [page] = await this.#api(`repos/${repo}/activity?ref=${encodeURIComponent(`refs/heads/${branch}`)}&per_page=100`);
     } catch (err) {
-      if (err instanceof GhError && err.status === 404) return { push: null, kept: false };
+      if (err instanceof GhError && err.status === 404) return { push: null, prior: null, kept: false };
       throw err;
     }
     if (!Array.isArray(page)) throw new GhError("GitHub's activity list is not a list");
+    const record = (a: Record<string, unknown>): PushRecord => {
+      const before = str(a.before);
+      return { actor: login(a.actor), type: str(a.activity_type), before: SHA_RE.test(before) ? before : "" };
+    };
     // Newest first, as GitHub returns it.
-    for (const a of page as Array<Record<string, unknown>>) {
-      if (str(a.after) === sha) return { push: { actor: login(a.actor), type: str(a.activity_type) }, kept: true };
-    }
-    return { push: null, kept: true };
+    const list = page as Array<Record<string, unknown>>;
+    const at = list.findIndex((a) => str(a.after) === sha);
+    if (at < 0) return { push: null, prior: null, kept: true };
+    const push = record(list[at]!);
+    const below = push.before && push.before !== NO_COMMIT ? list.slice(at + 1).find((a) => str(a.after) === push.before) : undefined;
+    return { push, prior: below ? record(below) : null, kept: true };
   }
 
   /**
-   * The pull request GitHub merged into `repo`'s `branch` as the commit `sha`:
-   * the one REST lists for the commit whose merge commit is `sha` and whose
-   * base is that branch; null when there is none, or GraphQL disagrees about
-   * it. Its merger and auto-merge come from GraphQL ({@link MERGED_PULL_QUERY}).
+   * The pull request GitHub merged in `repo` as the commit `sha`: the one REST
+   * lists for the commit whose merge commit is `sha`, in that repository;
+   * null when there is none, or GraphQL disagrees about it. Its merger and
+   * auto-merge come from GraphQL ({@link MERGED_PULL_QUERY}).
+   *
+   * Its base isn't matched to the branch the commit is on: GitHub's stacked
+   * pull requests merge each onto its parent's branch and then fast-forward
+   * the default branch, so the one named at the default branch's head has
+   * the parent's branch as its base. What pins the branch is the activity
+   * that put `sha` on it, which the caller already read.
    */
-  async mergedPullOf(repo: string, branch: string, sha: string): Promise<MergedPull | null> {
+  async mergedPullOf(repo: string, sha: string): Promise<MergedPull | null> {
     if (!isRepo(repo)) throw new GhError(`not a GitHub repository name: ${repo}`);
     const pages = await this.#api(`repos/${repo}/commits/${sha}/pulls?per_page=100`, true);
     const p = pages
       .flatMap((page) => (Array.isArray(page) ? page : []))
       .find((x: Record<string, unknown>) => {
-        const base = (x.base ?? {}) as { ref?: unknown; repo?: { full_name?: unknown } | null };
+        const base = (x.base ?? {}) as { repo?: { full_name?: unknown } | null };
         return (
           typeof x.number === "number" &&
           str(x.merge_commit_sha) === sha &&
           str(x.merged_at) !== "" &&
-          str(base.ref) === branch &&
           str(base.repo?.full_name).toLowerCase() === repo.toLowerCase()
         );
       }) as Record<string, unknown> | undefined;
@@ -521,7 +544,7 @@ export class GitHubSource {
       ),
     );
     const q = (page as { data?: { repository?: { pullRequest?: Record<string, unknown> | null } | null } } | null)?.data?.repository?.pullRequest;
-    if (!q || q.merged !== true || str((q.mergeCommit as { oid?: unknown } | null | undefined)?.oid) !== sha || str(q.baseRefName) !== branch) return null;
+    if (!q || q.merged !== true || str((q.mergeCommit as { oid?: unknown } | null | undefined)?.oid) !== sha) return null;
     const events = (q.timelineItems as { nodes?: unknown } | null | undefined)?.nodes;
     const head = (p.head ?? {}) as { ref?: unknown; sha?: unknown; repo?: { full_name?: unknown } | null };
     const headRepo = str(head.repo?.full_name);
@@ -533,7 +556,7 @@ export class GitHubSource {
       autoMerged: p.auto_merge !== null || q.autoMergeRequest !== null || !Array.isArray(events) || events.length > 0,
       headRepo: isRepo(headRepo) ? headRepo : null,
       headRef: str(head.ref),
-      headSha: /^[0-9a-f]{40}$/.test(headSha) ? headSha : "",
+      headSha: SHA_RE.test(headSha) ? headSha : "",
     };
   }
 

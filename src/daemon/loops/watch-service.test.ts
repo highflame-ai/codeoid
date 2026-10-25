@@ -72,6 +72,8 @@ interface Push {
   after: string;
   actor: string | null;
   type?: string;
+  /** The branch's head before it (GitHub's `before`); default none: the branch's first push. */
+  before?: string;
 }
 
 /**
@@ -81,6 +83,8 @@ interface Push {
 interface Merge {
   /** The repository it merged in; default REPO. */
   repo?: string;
+  /** The repository REST names as its base's; default `repo`. */
+  baseRepo?: string;
   /** Its merge commit (what the merge queue or the button put on the base). */
   sha: string;
   number: number;
@@ -113,6 +117,8 @@ class FakeGitHub {
   commits = new Map<string, Commit[]>();
   /** The repository's push activity, newest first. A head with none listed was pushed by `defaultPusher`. */
   pushes: Push[] = [];
+  /** Activity older than all of `pushes` (and the default pusher's), newest first. */
+  older: Push[] = [];
   /** Pull requests merged, by merge commit. */
   merges: Merge[] = [];
   defaultPusher: string | null = "ada";
@@ -239,7 +245,8 @@ class FakeGitHub {
     if (m) {
       const repo = m[1]!;
       const ref = new URLSearchParams(m[2]).get("ref") ?? "";
-      const listed = this.pushes.filter((p) => (p.repo ?? REPO) === repo && `refs/heads/${p.branch}` === ref);
+      const on = (p: Push) => (p.repo ?? REPO) === repo && `refs/heads/${p.branch}` === ref;
+      const listed = this.pushes.filter(on);
       const heads = new Set([...this.prs.map((p) => p.headRefOid), ...this.branches.values()]);
       const branchOf = (sha: string) => this.prs.find((p) => p.headRefOid === sha)?.headRefName ?? [...this.branches].find(([, v]) => v === sha)?.[0];
       // Every head nobody scripted a push for was pushed by the default pusher.
@@ -247,7 +254,16 @@ class FakeGitHub {
         ? [...heads].filter((sha) => `refs/heads/${branchOf(sha)}` === ref && !this.pushes.some((p) => p.after === sha)).map((sha) => ({ after: sha, actor: this.defaultPusher, type: "push" }))
         : [];
       return ok(
-        [...listed, ...implied].map((p) => ({ id: 1, ref, after: p.after, before: "0".repeat(40), activity_type: p.type ?? "push", actor: p.actor ? { login: p.actor } : null })),
+        [...listed, ...implied, ...this.older.filter(on)].map((p: Partial<Push> & { after: string; actor: string | null }, i) => ({
+          id: i + 1,
+          node_id: `RA_kwDO${i + 1}`,
+          ref,
+          before: p.before ?? "0".repeat(40),
+          after: p.after,
+          activity_type: p.type ?? "push",
+          actor: p.actor ? { login: p.actor, type: p.actor.endsWith("[bot]") ? "Bot" : "User" } : null,
+          timestamp: new Date(Date.now() - i * 60_000).toISOString(),
+        })),
       );
     }
     m = /^repos\/([^/]+\/[^/]+)\/commits\/([0-9a-f]+)\/pulls\?per_page=100$/.exec(path);
@@ -266,7 +282,7 @@ class FakeGitHub {
               merge_commit_sha: x.sha,
               merged_by: null,
               auto_merge: x.autoMerge ? { enabled_by: { login: x.mergedBy }, merge_method: "merge" } : null,
-              base: { ref: x.base, repo: { full_name: repo } },
+              base: { ref: x.base, repo: { full_name: x.baseRepo ?? repo } },
               head: { ref: x.head.ref, sha: x.head.sha, repo: head ? { full_name: head } : null },
             };
           }),
@@ -732,9 +748,13 @@ describe("trust: a head runs only when a trusted login pushed it, or signed ever
     mergedBy: "ada",
     ...over,
   });
+  // What main was before the merges these tests make: a push of yours, older than anything else listed.
+  const BENEATH = "9".repeat(40);
+  const onMain = (after: string, actor: string, type: string, before = BENEATH): Push => ({ branch: "main", after, actor, type, before });
   const mainWatch = async (sha = SHA1) => {
     const w = await svc.create({ workdir: "/repo", branches: ["main"], ci: CI }, OWNER);
     gh.branches.set("main", sha);
+    gh.older = [{ branch: "main", after: BENEATH, actor: "ada", type: "push", before: "8".repeat(40) }];
     failing(sha);
     // The default branch has no commits past itself: only the merge can vouch for it.
     gh.commits.set(sha, []);
@@ -745,7 +765,7 @@ describe("trust: a head runs only when a trusted login pushed it, or signed ever
   test("a pull request a trusted login merged with the button vouches for the head", async () => {
     const w = await mainWatch();
     gh.merges = [merged(SHA1)];
-    gh.pushes = [{ branch: "main", after: SHA1, actor: "ada", type: "pr_merge" }];
+    gh.pushes = [onMain(SHA1, "ada", "pr_merge")];
     expect((await svc.poll(w.id, OWNER)).started).toHaveLength(1);
     expect(gh.pathsCalled(`/commits/${SHA1}/pulls`)).toEqual([`repos/${REPO}/commits/${SHA1}/pulls?per_page=100`]);
     // Its head isn't consulted: who pressed the button vouches for what it merged.
@@ -757,7 +777,7 @@ describe("trust: a head runs only when a trusted login pushed it, or signed ever
     const w = await mainWatch();
     gh.merges = [merged(SHA1)];
     gh.pushes = [
-      { branch: "main", after: SHA1, actor: "github-merge-queue[bot]", type: "merge_queue_merge" },
+      onMain(SHA1, "github-merge-queue[bot]", "merge_queue_merge"),
       { branch: "feature/cart", after: MERGED_HEAD, actor: "ada", type: "push" },
     ];
     expect((await svc.poll(w.id, OWNER)).started).toHaveLength(1);
@@ -768,7 +788,7 @@ describe("trust: a head runs only when a trusted login pushed it, or signed ever
     failing(SHA2, 601);
     gh.commits.set(SHA2, []);
     gh.merges = [merged(SHA2, { number: 42, mergedBy: "mallory" })];
-    gh.pushes = [{ branch: "main", after: SHA2, actor: "github-merge-queue[bot]", type: "merge_queue_merge" }, ...gh.pushes.slice(1)];
+    gh.pushes = [onMain(SHA2, "github-merge-queue[bot]", "merge_queue_merge"), ...gh.pushes.slice(1)];
     expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
     expect(noteOf(w.id)).toContain("pull request #42, merged by the merge queue, queued by @mallory");
   });
@@ -777,7 +797,7 @@ describe("trust: a head runs only when a trusted login pushed it, or signed ever
     const w = await mainWatch();
     gh.merges = [merged(SHA1)];
     gh.pushes = [
-      { branch: "main", after: SHA1, actor: "github-merge-queue[bot]", type: "merge_queue_merge" },
+      onMain(SHA1, "github-merge-queue[bot]", "merge_queue_merge"),
       { branch: "feature/cart", after: MERGED_HEAD, actor: "mallory", type: "push" },
     ];
     gh.commits.set(MERGED_HEAD, [{ sha: MERGED_HEAD, author: "mallory", committer: "mallory" }]);
@@ -790,21 +810,26 @@ describe("trust: a head runs only when a trusted login pushed it, or signed ever
     // You turned auto-merge on (the activity's actor); someone pushed afterwards, and GitHub merged that.
     gh.merges = [merged(SHA1, { autoMerge: true })];
     gh.pushes = [
-      { branch: "main", after: SHA1, actor: "ada", type: "pr_merge" },
+      onMain(SHA1, "ada", "pr_merge"),
       { branch: "feature/cart", after: MERGED_HEAD, actor: "mallory", type: "push" },
     ];
     gh.commits.set(MERGED_HEAD, [{ sha: MERGED_HEAD, author: "ada", committer: "ada" }]);
     expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
     expect(noteOf(w.id)).toContain("pull request #41, auto-merged; its last commit was pushed by @mallory");
-    // Its commits are read past main as it was before the merge: the merge commit's first parent.
+    // Its commits are read against the merge commit's first parent: main before a merge or squash,
+    // the rebased commit before it for a rebase merge; either way compare lists the pull request's own.
     expect(gh.pathsCalled(`/compare/${SHA1}%5E1...${MERGED_HEAD}`)).toHaveLength(1);
+    store.forgetUntrusted(store.get(w.id)!);
+    gh.commits.set(MERGED_HEAD, []);
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
+    expect(noteOf(w.id)).toContain("pushed by @mallory, and it has no commits of its own, so no signature vouches for it");
   });
 
   test("an auto-merged pull request whose last commit you pushed, or whose every commit you signed, vouches for the head", async () => {
     const w = await mainWatch();
     gh.merges = [merged(SHA1, { autoMerge: true })];
     gh.pushes = [
-      { branch: "main", after: SHA1, actor: "ada", type: "pr_merge" },
+      onMain(SHA1, "ada", "pr_merge"),
       { branch: "feature/cart", after: MERGED_HEAD, actor: "ada", type: "force_push" },
     ];
     expect((await svc.poll(w.id, OWNER)).started).toHaveLength(1);
@@ -815,7 +840,7 @@ describe("trust: a head runs only when a trusted login pushed it, or signed ever
     gh.commits.set(SHA2, []);
     gh.merges = [merged(SHA2, { number: 42, autoMerge: true, head: { ref: "feature/two", sha: head2 } })];
     gh.pushes = [
-      { branch: "main", after: SHA2, actor: "ada", type: "pr_merge" },
+      onMain(SHA2, "ada", "pr_merge"),
       { branch: "feature/two", after: head2, actor: "mallory", type: "push" },
     ];
     gh.commits.set(head2, [{ sha: head2, author: "mallory", committer: "ada", verified: true }]);
@@ -826,7 +851,7 @@ describe("trust: a head runs only when a trusted login pushed it, or signed ever
     const w = await mainWatch();
     gh.merges = [merged(SHA1, { autoMerge: true, mergedBy: "mallory" })];
     gh.pushes = [
-      { branch: "main", after: SHA1, actor: "mallory", type: "pr_merge" },
+      onMain(SHA1, "mallory", "pr_merge"),
       { branch: "feature/cart", after: MERGED_HEAD, actor: "ada", type: "push" },
     ];
     expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
@@ -838,7 +863,7 @@ describe("trust: a head runs only when a trusted login pushed it, or signed ever
     // On and off again: REST's auto_merge is null, only the timeline says.
     gh.merges = [merged(SHA1, { autoMergeEvent: true })];
     gh.pushes = [
-      { branch: "main", after: SHA1, actor: "ada", type: "pr_merge" },
+      onMain(SHA1, "ada", "pr_merge"),
       { branch: "feature/cart", after: MERGED_HEAD, actor: "mallory", type: "push" },
     ];
     expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
@@ -847,7 +872,7 @@ describe("trust: a head runs only when a trusted login pushed it, or signed ever
     failing(SHA2, 601);
     gh.commits.set(SHA2, []);
     gh.merges = [merged(SHA2, { number: 42, timelineMissing: true })];
-    gh.pushes = [{ branch: "main", after: SHA2, actor: "ada", type: "pr_merge" }, ...gh.pushes.slice(1)];
+    gh.pushes = [onMain(SHA2, "ada", "pr_merge"), ...gh.pushes.slice(1)];
     expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
     expect(store.listTriggers(w.id).filter((t) => t.key.includes(SHA2))[0]!.note).toContain("pull request #42, auto-merged;");
   });
@@ -856,7 +881,7 @@ describe("trust: a head runs only when a trusted login pushed it, or signed ever
     const w = await mainWatch();
     gh.merges = [merged(SHA1)];
     gh.pushes = [
-      { branch: "main", after: SHA1, actor: "github-merge-queue[bot]", type: "merge_queue_merge" },
+      onMain(SHA1, "github-merge-queue[bot]", "merge_queue_merge"),
       // Its head is itself a merge (another pull request merged into the branch): not followed.
       { branch: "feature/cart", after: MERGED_HEAD, actor: "ada", type: "pr_merge" },
     ];
@@ -866,14 +891,22 @@ describe("trust: a head runs only when a trusted login pushed it, or signed ever
     expect(gh.pathsCalled(`/commits/${MERGED_HEAD}/pulls`)).toHaveLength(0);
   });
 
-  test("a merge GitHub names no pull request for — none, another base, another merge commit — is untrusted", async () => {
+  test("a merge GitHub names no pull request for — none, another repository's, another merge commit — is judged again for a while, then untrusted", async () => {
+    let now = Date.now();
+    svc = make({ now: () => now });
     const w = await mainWatch();
-    gh.pushes = [{ branch: "main", after: SHA1, actor: "ada", type: "pr_merge" }];
+    gh.pushes = [onMain(SHA1, "ada", "pr_merge")];
     gh.merges = [];
+    // GitHub may not have linked the commit to its pull request yet.
+    const waiting = await svc.poll(w.id, OWNER);
+    expect(waiting.started).toHaveLength(0);
+    expect(waiting.skipped.join()).toContain("judged again on the next poll");
+    expect(noteOf(w.id)).toBe("");
+    now += 11 * 60_000;
     expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
-    expect(noteOf(w.id)).toContain("GitHub names no pull request it merged into main as this commit");
+    expect(noteOf(w.id)).toContain("GitHub names no pull request it merged as this commit");
     for (const [n, m] of [
-      [601, merged(SHA2, { base: "release" })],
+      [601, merged(SHA2, { baseRepo: "mallory/shop" })],
       // SHA2 is only on the pull request (its head), not its merge commit.
       [602, merged("f".repeat(40), { head: { ref: "feature/cart", sha: SHA2 } })],
     ] as const) {
@@ -882,10 +915,140 @@ describe("trust: a head runs only when a trusted login pushed it, or signed ever
       failing(SHA2, n);
       gh.commits.set(SHA2, []);
       gh.merges = [m];
-      gh.pushes = [{ branch: "main", after: SHA2, actor: "ada", type: "pr_merge" }];
+      gh.pushes = [onMain(SHA2, "ada", "pr_merge")];
+      await svc.poll(w.id, OWNER);
+      now += 11 * 60_000;
       expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
       expect(noteOf(w.id)).toContain("names no pull request");
     }
+  });
+
+  test("a merge vouches for what it merged, not for what was already on the branch beneath it", async () => {
+    const w = await mainWatch();
+    // A collaborator you don't trust pushed to main; your pull request then merged on top.
+    gh.older = [{ branch: "main", after: BENEATH, actor: "bob", type: "push", before: "8".repeat(40) }];
+    gh.merges = [merged(SHA1)];
+    gh.pushes = [onMain(SHA1, "ada", "pr_merge")];
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
+    expect(noteOf(w.id)).toContain(`merged pull request #41, but ${BENEATH.slice(0, 12)}, beneath it, was pushed by @bob`);
+    // Then the signatures: main has no commits past itself.
+    expect(noteOf(w.id)).toContain("no commits past main");
+    // The same through the merge queue, queued by you, its head pushed by you.
+    store.forgetUntrusted(store.get(w.id)!);
+    gh.merges = [merged(SHA1)];
+    gh.pushes = [onMain(SHA1, "github-merge-queue[bot]", "merge_queue_merge"), { branch: "feature/cart", after: MERGED_HEAD, actor: "ada" }];
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
+    expect(noteOf(w.id)).toContain("was pushed by @bob");
+  });
+
+  test("beneath a merge: your push, your button merge, or nothing at all vouches; a merge beneath that isn't followed further", async () => {
+    const w = await mainWatch();
+    // Your push beneath your merge.
+    gh.merges = [merged(SHA1)];
+    gh.pushes = [onMain(SHA1, "ada", "pr_merge")];
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(1);
+    loops.active.clear();
+    // Your button merge beneath it, whatever is beneath that (a stranger's push).
+    const merge2 = (beneath: Partial<Merge>) => {
+      gh.branches.set("main", SHA2);
+      failing(SHA2, ++check);
+      gh.commits.set(SHA2, []);
+      gh.merges = [merged(SHA2, { number: 42 }), merged(BENEATH, { number: 40, head: { ref: "feature/old", sha: "7".repeat(40) }, ...beneath })];
+      gh.pushes = [onMain(SHA2, "ada", "pr_merge")];
+      gh.older = [onMain(BENEATH, "ada", "pr_merge", "8".repeat(40)), { branch: "main", after: "8".repeat(40), actor: "mallory" }];
+      store.forgetTrusted(store.get(w.id)!);
+      store.forgetUntrusted(store.get(w.id)!);
+    };
+    let check = 700;
+    merge2({});
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(1);
+    expect(gh.pathsCalled(`/commits/${BENEATH}/pulls`)).toHaveLength(1);
+    loops.active.clear();
+    // An auto-merged one beneath isn't a button merge: whoever pushed after auto-merge was on isn't known here.
+    merge2({ autoMerge: true });
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
+    expect(noteOf(w.id)).toContain(`${BENEATH.slice(0, 12)}, beneath it, was pull request #40, auto-merged`);
+    // A merge on a branch's first push has nothing beneath it.
+    merge2({});
+    gh.pushes = [onMain(SHA2, "ada", "pr_merge", "0".repeat(40))];
+    gh.older = [];
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(1);
+  });
+
+  test("beneath a merge, a head this watch already judged trusted vouches, until the trust list changes", async () => {
+    const w = await mainWatch();
+    gh.older = [];
+    gh.pushes = [{ branch: "main", after: SHA1, actor: "ada", before: BENEATH }];
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(1);
+    loops.active.clear();
+    // Your pull request merges on top; the push of SHA1 is no longer on the activity page read.
+    gh.branches.set("main", SHA2);
+    failing(SHA2, 601);
+    gh.commits.set(SHA2, []);
+    gh.merges = [merged(SHA2, { number: 42 })];
+    gh.pushes = [onMain(SHA2, "ada", "pr_merge", SHA1)];
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(1);
+    loops.active.clear();
+    // Another watch never judged SHA1.
+    const other = await svc.create({ workdir: "/repo2", branches: ["main"], ci: CI }, OWNER);
+    failing(SHA2, 603);
+    expect((await svc.poll(other.id, OWNER)).started).toHaveLength(0);
+    expect(noteOf(other.id)).toContain(`GitHub's activity has no record of how ${SHA1.slice(0, 12)}, beneath it, came to be on main`);
+    // A new trust list forgets what the old one trusted.
+    failing(SHA2, 604);
+    await svc.update(w.id, { spec: { trust: ["bob"] } }, OWNER);
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
+    expect(noteOf(w.id)).toContain("beneath it, came to be on main");
+  });
+
+  test("a stacked pull request merged onto its parent's branch and fast-forwarded to main is found (astral-sh/uv e96aa69, #21458)", async () => {
+    // As GitHub reports it for astral-sh/uv: main's activity is a pr_merge by zsol; the
+    // commit's pull request has the parent pull request's branch as its base, auto-squash
+    // was turned on once, and its head was force-pushed by zsol. Beneath: zanieb's button merge.
+    const [TOP, BELOW, HEAD] = ["e96aa6932bb860f3b950ddb46d1646d45e09315d", "0df7120c1e47ff42cd49c2daaa7cbd1dfbb38536", "952665c97a77df045631a4ddffde1976971328ff"];
+    gh.me = "zsol";
+    const w = await svc.create({ workdir: "/repo", branches: ["main"], ci: CI, trust: ["zanieb"] }, OWNER);
+    gh.branches.set("main", TOP);
+    failing(TOP);
+    gh.commits.set(TOP, []);
+    gh.merges = [
+      {
+        sha: TOP,
+        number: 21458,
+        base: "zsol/guard-active-script-directory",
+        head: { ref: "zsol/pep723-omitted-dependencies", sha: HEAD },
+        mergedBy: "zsol",
+        autoMergeEvent: true,
+      },
+      { sha: BELOW, number: 22881, base: "main", head: { ref: "zb/code-quality-review-opt-in", sha: "b8eba9d56b2e413f7f89707e0bd5ce33e92d2fc9" }, mergedBy: "zanieb" },
+    ];
+    gh.pushes = [
+      onMain(TOP, "zsol", "pr_merge", BELOW),
+      { branch: "zsol/pep723-omitted-dependencies", after: "0".repeat(40), actor: "zsol", type: "branch_deletion", before: HEAD },
+      { branch: "zsol/pep723-omitted-dependencies", after: HEAD, actor: "zsol", type: "force_push", before: "a5bbcc5f5443fd503b8677fb081cf72cee6c7241" },
+    ];
+    gh.older = [onMain(BELOW, "zanieb", "pr_merge", "3a0e63ed902b79fac1a7c66581eb2d4a13aec801")];
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(1);
+    expect(gh.pathsCalled(`/commits/${TOP}/pulls`)).toHaveLength(1);
+    expect(gh.pathsCalled(`/commits/${BELOW}/pulls`)).toHaveLength(1);
+    // Its head's push was what vouched for what it merged.
+    expect(gh.pathsCalled("refs%2Fheads%2Fzsol%2Fpep723-omitted-dependencies")).toHaveLength(1);
+  });
+
+  test("an auto-merged pull request whose head's push GitHub doesn't list yet is judged again, and runs once it appears", async () => {
+    let now = Date.now();
+    svc = make({ now: () => now });
+    const w = await mainWatch();
+    gh.merges = [merged(SHA1, { autoMerge: true })];
+    gh.pushes = [onMain(SHA1, "ada", "pr_merge")];
+    gh.commits.set(MERGED_HEAD, [{ sha: MERGED_HEAD, author: "ada", committer: "ada" }]);
+    const waiting = await svc.poll(w.id, OWNER);
+    expect(waiting.started).toHaveLength(0);
+    expect(waiting.skipped.join()).toContain("judged again on the next poll");
+    expect(noteOf(w.id)).toBe("");
+    now += 5 * 60_000;
+    gh.pushes = [onMain(SHA1, "ada", "pr_merge"), { branch: "feature/cart", after: MERGED_HEAD, actor: "ada" }];
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(1);
   });
 
   test("a merge by a stranger is untrusted", async () => {
@@ -894,20 +1057,24 @@ describe("trust: a head runs only when a trusted login pushed it, or signed ever
     failing();
     gh.commits.set(SHA1, [{ sha: "a".repeat(40), author: "ada", committer: "ada" }]);
     gh.merges = [merged(SHA1, { mergedBy: "mallory" })];
-    gh.pushes = [{ branch: "main", after: SHA1, actor: "mallory", type: "pr_merge" }];
+    gh.pushes = [onMain(SHA1, "mallory", "pr_merge")];
     const res = await svc.poll(w.id, OWNER);
     expect(res.started).toHaveLength(0);
     expect(store.listTriggers(w.id)[0]).toMatchObject({ outcome: "ignored" });
     expect(store.listTriggers(w.id)[0]!.note).toContain("merged by @mallory");
   });
 
-  test("`trust` takes a bot's login, which trusts whoever can make it push; never web-flow or the merge queue's bot", async () => {
+  test("`trust` takes a bot's login, which trusts whoever can make it push; never web-flow, the merge queue's bot, or GitHub Actions' bot", async () => {
     const w = await prWatch({ trust: ["dependabot[bot]"] });
     failing();
     gh.pushes = [{ branch: "feature/cart", after: SHA1, actor: "dependabot[bot]" }];
     expect((await svc.poll(w.id, OWNER)).started).toHaveLength(1);
     for (const bad of ["github-merge-queue[bot]", "GitHub-Merge-Queue[bot]"]) {
       await expect(svc.create({ workdir: "/r3", myPrs: true, ci: CI, trust: [bad] }, OWNER)).rejects.toThrow("github-merge-queue[bot] can't be trusted");
+    }
+    // Any workflow pushes as GitHub Actions' bot, and anyone who can make one run can make it push.
+    for (const bad of ["github-actions[bot]", "GitHub-Actions[bot]"]) {
+      await expect(svc.create({ workdir: "/r3", myPrs: true, ci: CI, trust: [bad] }, OWNER)).rejects.toThrow("github-actions[bot] can't be trusted");
     }
     for (const bad of ["[bot]", "-x[bot]", "a b[bot]", "dependabot[bot]x", "dependabot[app]"]) {
       await expect(svc.create({ workdir: "/r3", myPrs: true, ci: CI, trust: [bad] }, OWNER)).rejects.toThrow("Not a GitHub login");

@@ -173,6 +173,17 @@ export class WatchStore {
         UNIQUE (account_id, project_id, owner_sub, key)
       );
       CREATE INDEX IF NOT EXISTS idx_loop_triggers_watch ON loop_triggers(watch_id, created_at);
+
+      -- The newest head each watch judged trusted, per branch: what a merge
+      -- landed on is vouched for when it is that head.
+      CREATE TABLE IF NOT EXISTS loop_watch_trusted_heads (
+        watch_id    TEXT NOT NULL,
+        repo        TEXT NOT NULL,
+        branch      TEXT NOT NULL,
+        sha         TEXT NOT NULL,
+        judged_at   INTEGER NOT NULL,
+        PRIMARY KEY (watch_id, repo, branch)
+      );
       CREATE INDEX IF NOT EXISTS idx_loop_triggers_branch ON loop_triggers(account_id, project_id, owner_sub, repo, branch, settled);
     `);
     for (const c of ["last_ok_at", "resumed_at"]) {
@@ -257,10 +268,11 @@ export class WatchStore {
       .run(...(ok ? [at, error?.slice(0, 1_000) ?? null, at, id] : [at, error?.slice(0, 1_000) ?? null, id]));
   }
 
-  /** Delete a watch. Its ledger rows stay (they are the owner's), except its untrusted-head notes. */
+  /** Delete a watch. Its ledger rows stay (they are the owner's), except its judgments of heads. */
   delete(id: string): void {
     this.#db.transaction(() => {
       this.#db.prepare("DELETE FROM loop_triggers WHERE watch_id = ? AND key LIKE ?").run(id, `untrusted:${id}:%`);
+      this.#db.prepare("DELETE FROM loop_watch_trusted_heads WHERE watch_id = ?").run(id);
       this.#db.prepare("DELETE FROM loop_watches WHERE id = ?").run(id);
     })();
   }
@@ -401,6 +413,29 @@ export class WatchStore {
   /** Forget this watch's untrusted-head notes (its trust list changed: judge them again). */
   forgetUntrusted(w: WatchRow): void {
     this.#db.prepare("DELETE FROM loop_triggers WHERE watch_id = ? AND key LIKE ?").run(w.id, `untrusted:${w.id}:%`);
+  }
+
+  /** Remember `sha` as the newest head this watch judged trusted on `repo`'s `branch`. */
+  rememberTrusted(w: WatchRow, repo: string, branch: string, sha: string, at: number): void {
+    this.#db
+      .prepare(
+        `INSERT INTO loop_watch_trusted_heads (watch_id, repo, branch, sha, judged_at) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT (watch_id, repo, branch) DO UPDATE SET sha = excluded.sha, judged_at = excluded.judged_at`,
+      )
+      .run(w.id, repo.toLowerCase(), branch, sha, at);
+  }
+
+  /** The newest head this watch judged trusted on `repo`'s `branch`, or null. */
+  lastTrusted(w: WatchRow, repo: string, branch: string): string | null {
+    const row = this.#db
+      .prepare("SELECT sha FROM loop_watch_trusted_heads WHERE watch_id = ? AND repo = ? AND branch = ?")
+      .get(w.id, repo.toLowerCase(), branch) as { sha: string } | null;
+    return row?.sha ?? null;
+  }
+
+  /** Forget the heads this watch judged trusted (its trust list changed: they may not be any more). */
+  forgetTrusted(w: WatchRow): void {
+    this.#db.prepare("DELETE FROM loop_watch_trusted_heads WHERE watch_id = ?").run(w.id);
   }
 
   /** Runs this watch started that the ledger hasn't seen end. */
