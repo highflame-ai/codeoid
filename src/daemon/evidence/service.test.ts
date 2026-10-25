@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EvidenceService, ephemeralCheck } from "./service";
@@ -64,6 +64,47 @@ describe("EvidenceService", () => {
       ownerId: "../../escape",
     });
     for (const a of record!.artifacts) expect(a.path.startsWith(`${root}/`)).toBe(true);
+  });
+
+  test("aborting an owner stops its running checks and records them cancelled", async () => {
+    const svc = new EvidenceService(new EvidenceStore(":memory:"), join(dir, "evidence"));
+    const running = svc.run({ id: "c", command: "sleep 30", timeoutMs: 60_000 }, dir, ctx);
+    const other = svc.run({ id: "c", command: "sleep 0.3", timeoutMs: 60_000 }, dir, { ...ctx, ownerId: "pipe-2" });
+    await Bun.sleep(150);
+    svc.abortOwner("pipeline", "pipe-1");
+    expect((await running).record?.result).toBe("cancelled");
+    expect((await other).record?.result).toBe("pass");
+  });
+
+  test("retention drops old records, then the oldest past the size cap, with their files", async () => {
+    const svc = new EvidenceService(new EvidenceStore(":memory:"), join(dir, "evidence"));
+    const a = (await svc.run({ id: "a", command: "head -c 3000 /dev/zero", timeoutMs: 5_000 }, dir, ctx)).record!;
+    await Bun.sleep(5);
+    const b = (await svc.run({ id: "b", command: "head -c 3000 /dev/zero", timeoutMs: 5_000 }, dir, ctx)).record!;
+    await Bun.sleep(5);
+    const c = (await svc.run({ id: "c", command: "head -c 3000 /dev/zero", timeoutMs: 5_000 }, dir, ctx)).record!;
+    // Size cap fits two records: the oldest goes.
+    expect(svc.sweep({ maxAgeMs: 1e12, maxTotalBytes: 6_500 })).toBe(1);
+    expect(svc.get(a.id, TENANT)).toBeNull();
+    expect(existsSync(a.artifacts[0]!.path)).toBe(false);
+    expect(svc.get(b.id, TENANT)).not.toBeNull();
+    // Age: everything started before now+1 goes.
+    expect(svc.sweep({ maxAgeMs: -1, maxTotalBytes: 1e12 })).toBe(2);
+    expect(existsSync(c.artifacts[0]!.path)).toBe(false);
+  });
+
+  test("retention removes artifact directories no record points at, once they are old", async () => {
+    const root = join(dir, "evidence");
+    const svc = new EvidenceService(new EvidenceStore(":memory:"), root);
+    const orphan = join(root, "pipeline", "pipe-x", "stale");
+    const fresh = join(root, "pipeline", "pipe-x", "fresh");
+    mkdirSync(orphan, { recursive: true });
+    mkdirSync(fresh, { recursive: true });
+    const old = (Date.now() - 2 * 60 * 60 * 1000) / 1000;
+    utimesSync(orphan, old, old);
+    svc.sweep();
+    expect(existsSync(orphan)).toBe(false);
+    expect(existsSync(fresh)).toBe(true);
   });
 
   test("an unrecorded check leaves no files behind", async () => {

@@ -79,11 +79,17 @@ async function runProbe(
 }
 
 /** The diagnostic tail a failed check contributes to its gate's reason — what
- *  the phase's next attempt is shown. Bounded: the full output is evidence. */
+ *  the phase's next attempt is shown. stderr gets most of the room, because
+ *  test runners report failures there and stdout is often console noise. Both
+ *  excerpts are already redacted; the full output is evidence. */
 export function diagnosticTail(outcome: CheckOutcome, max = 1_500): string {
-  const text = [outcome.stderrExcerpt.trim(), outcome.stdoutExcerpt.trim()].filter(Boolean).join("\n");
-  if (!text) return "";
-  return text.length > max ? `…${text.slice(text.length - max)}` : text;
+  const tail = (s: string, n: number): string => (s.length > n ? `…${s.slice(s.length - n)}` : s);
+  const err = outcome.stderrExcerpt.trim();
+  const out = outcome.stdoutExcerpt.trim();
+  if (!err) return tail(out, max);
+  if (!out) return tail(err, max);
+  const outRoom = Math.min(out.length, Math.floor(max / 3));
+  return `${tail(err, max - outRoom)}\n${tail(out, outRoom)}`;
 }
 
 /** Detected build/test/lint commands for a workspace, keyed by the manifest we

@@ -4,7 +4,7 @@
  * account. `EvidenceView` is presentational; `EvidenceLink` fetches on demand.
  */
 
-import { Component, Show, createSignal } from "solid-js";
+import { Component, Show, createEffect, createSignal, on } from "solid-js";
 
 import type { EvidenceWire } from "../protocol/types";
 import { fetchEvidence } from "../state/evidence";
@@ -56,6 +56,9 @@ export const EvidenceLink: Component<{ ids: string[] }> = (props) => {
   const [error, setError] = createSignal<string | null>(null);
   const [loading, setLoading] = createSignal(false);
   const latest = () => props.ids[props.ids.length - 1]!;
+  // A newer check replaces what is shown: drop the old record so the next
+  // open fetches the latest.
+  createEffect(on(latest, () => setRecord(null), { defer: true }));
   const load = async () => {
     setLoading(true);
     setError(null);

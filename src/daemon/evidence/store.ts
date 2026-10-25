@@ -10,6 +10,7 @@
 
 import { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
+import { dirname } from "node:path";
 import { BUSY_TIMEOUT_MS } from "../store.js";
 import type {
   EvidenceArtifact,
@@ -82,10 +83,13 @@ export class EvidenceStore {
         ended_at          INTEGER NOT NULL,
         stdout_excerpt    TEXT NOT NULL,
         stderr_excerpt    TEXT NOT NULL,
-        artifacts_json    TEXT NOT NULL
+        artifacts_json    TEXT NOT NULL,
+        artifact_dir      TEXT,
+        artifact_bytes    INTEGER NOT NULL DEFAULT 0
       );
       CREATE INDEX IF NOT EXISTS idx_evidence_owner
         ON evidence(owner_kind, owner_id, started_at);
+      CREATE INDEX IF NOT EXISTS idx_evidence_started ON evidence(started_at);
     `);
   }
 
@@ -98,8 +102,8 @@ export class EvidenceStore {
            id, account_id, project_id, owner_kind, owner_id, criterion_id,
            candidate_digest, verifier_digest, environment_json, isolation, command,
            result, reason, exit_code, signal, timed_out, started_at, ended_at,
-           stdout_excerpt, stderr_excerpt, artifacts_json
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           stdout_excerpt, stderr_excerpt, artifacts_json, artifact_dir, artifact_bytes
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -123,6 +127,8 @@ export class EvidenceStore {
         record.stdoutExcerpt,
         record.stderrExcerpt,
         JSON.stringify(record.artifacts),
+        record.artifacts[0] ? dirname(record.artifacts[0].path) : null,
+        record.artifacts.reduce((n, a) => n + a.bytes, 0),
       );
     return { ...record, id };
   }
@@ -134,6 +140,45 @@ export class EvidenceStore {
       .prepare("SELECT * FROM evidence WHERE id = ? AND account_id = ? AND project_id = ?")
       .get(id, tenant.accountId, tenant.projectId) as EvidenceDbRow | null;
     return row ? toRecord(row) : null;
+  }
+
+  // ── Retention (EvidenceService.sweep) ─────────────────────────────────
+
+  idsStartedBefore(cutoff: number): string[] {
+    return (this.#db.prepare("SELECT id FROM evidence WHERE started_at < ?").all(cutoff) as Array<{ id: string }>).map(
+      (r) => r.id,
+    );
+  }
+
+  artifactSizesNewestFirst(): Array<{ id: string; bytes: number }> {
+    return this.#db
+      .prepare("SELECT id, artifact_bytes AS bytes FROM evidence ORDER BY started_at DESC, rowid DESC")
+      .all() as Array<{ id: string; bytes: number }>;
+  }
+
+  artifactDirsFor(ids: string[]): string[] {
+    const out: string[] = [];
+    for (let i = 0; i < ids.length; i += 500) {
+      const chunk = ids.slice(i, i + 500);
+      const rows = this.#db
+        .prepare(`SELECT artifact_dir AS d FROM evidence WHERE id IN (${chunk.map(() => "?").join(",")}) AND artifact_dir IS NOT NULL`)
+        .all(...chunk) as Array<{ d: string }>;
+      out.push(...rows.map((r) => r.d));
+    }
+    return out;
+  }
+
+  allArtifactDirs(): string[] {
+    return (
+      this.#db.prepare("SELECT artifact_dir AS d FROM evidence WHERE artifact_dir IS NOT NULL").all() as Array<{ d: string }>
+    ).map((r) => r.d);
+  }
+
+  deleteIds(ids: string[]): void {
+    for (let i = 0; i < ids.length; i += 500) {
+      const chunk = ids.slice(i, i + 500);
+      this.#db.prepare(`DELETE FROM evidence WHERE id IN (${chunk.map(() => "?").join(",")})`).run(...chunk);
+    }
   }
 
   /** Every record for one owner, oldest first. */

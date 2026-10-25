@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { detectZeroTests } from "./parsers";
@@ -164,5 +164,57 @@ describe("detectZeroTests", () => {
     ["unknown runner", "all good"],
   ])("%s with tests run is not flagged", (_name, output) => {
     expect(detectZeroTests(output)).toBeNull();
+  });
+});
+
+describe("audit round 1", () => {
+  test("a check never sees the daemon's own credentials", async () => {
+    process.env.CODEOID_TEST_ROOT_KEY = "zid_sk_should_not_leak";
+    try {
+      const out = await run(spec("env"));
+      expect(out.stdoutExcerpt).not.toContain("zid_sk_should_not_leak");
+      expect(out.stdoutExcerpt).toContain("PATH=");
+    } finally {
+      delete process.env.CODEOID_TEST_ROOT_KEY;
+    }
+  });
+
+  test("excerpts are redacted; the private artifact keeps the raw bytes", async () => {
+    const out = await run(spec("echo 'Authorization: Bearer abc.def-ghi'; echo 'token=s3cr3t-value'"));
+    expect(out.stdoutExcerpt).not.toContain("abc.def-ghi");
+    expect(out.stdoutExcerpt).not.toContain("s3cr3t-value");
+    const raw = readFileSync(out.artifacts.find((a) => a.name === "stdout")!.path, "utf8");
+    expect(raw).toContain("s3cr3t-value");
+  });
+
+  test("artifacts are readable only by the daemon's user", async () => {
+    const out = await run(spec("echo hi"));
+    const file = out.artifacts[0]!.path;
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+    expect(statSync(join(dir, "art")).mode & 0o777).toBe(0o700);
+  });
+
+  test("zero-test detection sees the whole stream, not just the excerpt", async () => {
+    // 40 empty test binaries, real tests in the omitted middle, empty doc-tests.
+    const cmd = [
+      "i=0; while [ $i -lt 400 ]; do echo 'running 0 tests'; echo; i=$((i+1)); done",
+      "echo 'running 2000 tests'",
+      "i=0; while [ $i -lt 3000 ]; do echo \"test t$i ... ok\"; i=$((i+1)); done",
+      "echo 'running 0 tests'",
+    ].join("; ");
+    const out = await run(spec(cmd, { expectTests: true }));
+    expect(out.result).toBe("pass");
+  });
+
+  test("an excerpt cut never splits a UTF-8 character", async () => {
+    // 4095 ASCII bytes then a 3-byte character straddling the 4 KiB head cut.
+    const out = await run(spec("printf '%4095s' '' | tr ' ' a; printf '€'; i=0; while [ $i -lt 2000 ]; do echo line$i; i=$((i+1)); done"));
+    expect(out.stdoutExcerpt).not.toContain("\uFFFD");
+  });
+
+  test("a missing working directory is named as such", async () => {
+    const out = await runCheck(spec("true"), { cwd: join(dir, "nope"), artifactDir: join(dir, "art") });
+    expect(out.result).toBe("error");
+    expect(out.reason).toContain("working directory does not exist");
   });
 });

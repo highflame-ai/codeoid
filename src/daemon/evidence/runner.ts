@@ -4,8 +4,14 @@
  * The runner owns the process it starts: the check runs as the leader of its
  * own process group, so a timeout, a cancel, or the check's own exit can kill
  * everything it spawned — a test server left behind by `sh -c` included. Output
- * is kept twice: bounded excerpts for display and worker feedback, and the full
- * streams as artifact files (up to a cap) so nothing a reviewer needs is lost.
+ * is kept twice: bounded, redacted excerpts for display and worker feedback,
+ * and the full streams as owner-only artifact files (up to a cap) so nothing a
+ * reviewer needs is lost.
+ *
+ * A check gets the same stripped environment as an agent's own subprocesses
+ * (providers/env.ts): its command and output can be shaped by the agent being
+ * judged, and its output is shown back to that agent, so the daemon's own
+ * credentials must never be in reach.
  *
  * Classification is the runner's job, not the caller's: exit 0 is `pass` only
  * when it actually established something (see parsers.ts), a timeout is
@@ -14,16 +20,18 @@
 
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { createWriteStream, mkdirSync, type WriteStream } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, statSync, type WriteStream } from "node:fs";
 import { join } from "node:path";
-import { detectZeroTests } from "./parsers";
+import { buildSubprocessEnv } from "../providers/env.js";
+import { LineSplitter, ZeroTestScan } from "./parsers";
+import { redactOutput } from "./redact";
 import type { CheckOutcome, CheckSpec, EvidenceArtifact, EvidenceEnvironment, EvidenceResult } from "./types";
 
 /** Excerpt kept from each end of a stream for display and worker feedback. */
 export const EXCERPT_HEAD_BYTES = 4 * 1024;
 export const EXCERPT_TAIL_BYTES = 12 * 1024;
 /** Default cap on one stream's artifact file. */
-export const DEFAULT_MAX_ARTIFACT_BYTES = 64 * 1024 * 1024;
+export const DEFAULT_MAX_ARTIFACT_BYTES = 8 * 1024 * 1024;
 /** Between SIGTERM and SIGKILL when the runner stops a check. */
 export const DEFAULT_KILL_GRACE_MS = 2_000;
 /** How long to wait for output pipes to drain after the check exits, before
@@ -33,7 +41,7 @@ const DRAIN_WAIT_MS = 2_000;
 export interface RunCheckOptions {
   /** Directory the check runs in. */
   cwd: string;
-  /** Directory the full output streams are written to (created if missing). */
+  /** Directory the full output streams are written to (created if missing, 0700). */
   artifactDir: string;
   /** Aborting stops the check and records `cancelled`. */
   signal?: AbortSignal;
@@ -63,14 +71,32 @@ function environmentOf(spec: CheckSpec): EvidenceEnvironment {
   };
 }
 
-/** One output stream: written to its artifact file up to a cap, hashed, and
- *  kept as a head + rolling tail for the excerpt. */
+/** Bytes [start, end) of `buf` adjusted inward to whole UTF-8 characters, so a
+ *  cut never leaves a replacement character at either edge. */
+function utf8Whole(buf: Buffer): Buffer {
+  let start = 0;
+  while (start < buf.length && start < 4 && (buf[start]! & 0xc0) === 0x80) start++;
+  let end = buf.length;
+  // Find the last lead byte; drop it if its sequence is incomplete.
+  for (let i = end - 1; i >= Math.max(start, end - 4); i--) {
+    const b = buf[i]!;
+    if ((b & 0xc0) === 0x80) continue;
+    const need = b >= 0xf0 ? 4 : b >= 0xe0 ? 3 : b >= 0xc0 ? 2 : 1;
+    if (end - i < need) end = i;
+    break;
+  }
+  return buf.subarray(start, end);
+}
+
+/** One output stream: written to its artifact file up to a cap, hashed, fed
+ *  line by line to the zero-test scan, and kept as a head + rolling tail. */
 class CapturedStream {
   readonly #name: "stdout" | "stderr";
   readonly #path: string;
   readonly #file: WriteStream;
   readonly #hash = createHash("sha256");
   readonly #max: number;
+  readonly #lines: LineSplitter;
   #bytes = 0;
   #written = 0;
   #head: Buffer[] = [];
@@ -78,15 +104,17 @@ class CapturedStream {
   #tail: Buffer[] = [];
   #tailBytes = 0;
 
-  constructor(name: "stdout" | "stderr", dir: string, max: number) {
+  constructor(name: "stdout" | "stderr", dir: string, max: number, scan: ZeroTestScan) {
     this.#name = name;
     this.#path = join(dir, `${name}.log`);
-    this.#file = createWriteStream(this.#path);
+    this.#file = createWriteStream(this.#path, { mode: 0o600 });
     this.#max = max;
+    this.#lines = new LineSplitter((l) => scan.line(l));
   }
 
   push(chunk: Buffer): void {
     this.#bytes += chunk.length;
+    this.#lines.push(chunk.toString("utf8"));
     if (this.#written < this.#max) {
       const room = this.#max - this.#written;
       const part = chunk.length <= room ? chunk : chunk.subarray(0, room);
@@ -109,10 +137,11 @@ class CapturedStream {
     }
   }
 
-  /** The excerpt: the head, then — if output was longer — a marker and the tail. */
+  /** The excerpt, redacted: the head, then — if output was longer — a marker
+   *  and the tail. */
   excerpt(): string {
-    const head = Buffer.concat(this.#head).toString("utf8");
-    if (this.#tailBytes === 0) return head;
+    const head = utf8Whole(Buffer.concat(this.#head)).toString("utf8");
+    if (this.#tailBytes === 0) return redactOutput(head);
     let tail = Buffer.concat(this.#tail);
     let skipped = this.#bytes - this.#headBytes - tail.length;
     if (tail.length > EXCERPT_TAIL_BYTES) {
@@ -120,11 +149,12 @@ class CapturedStream {
       tail = tail.subarray(tail.length - EXCERPT_TAIL_BYTES);
     }
     const marker = skipped > 0 ? `\n… [${skipped} bytes omitted — full output in the ${this.#name} artifact] …\n` : "";
-    return head + marker + tail.toString("utf8");
+    return redactOutput(head + marker + utf8Whole(tail).toString("utf8"));
   }
 
   /** Flush the artifact file and describe it. */
   async close(): Promise<EvidenceArtifact> {
+    this.#lines.end();
     await new Promise<void>((res) => this.#file.end(res));
     return {
       name: this.#name,
@@ -171,31 +201,28 @@ export async function runCheck(spec: CheckSpec, opts: RunCheckOptions): Promise<
     endedAt: Date.now(),
     ...fields,
   });
+  const notRun = (result: EvidenceResult, reason: string): CheckOutcome =>
+    finish({ result, reason, exitCode: null, signal: null, timedOut: false });
 
-  if (opts.signal?.aborted) {
-    return finish({ result: "cancelled", reason: "cancelled before it started", exitCode: null, signal: null, timedOut: false });
+  if (opts.signal?.aborted) return notRun("cancelled", "cancelled before it started");
+  if (!existsSync(opts.cwd) || !statSync(opts.cwd).isDirectory()) {
+    return notRun("error", `the working directory does not exist: ${opts.cwd}`);
   }
-
   try {
-    mkdirSync(opts.artifactDir, { recursive: true });
+    mkdirSync(opts.artifactDir, { recursive: true, mode: 0o700 });
   } catch (err) {
-    return finish({
-      result: "error",
-      reason: `could not create the artifact directory: ${errText(err)}`,
-      exitCode: null,
-      signal: null,
-      timedOut: false,
-    });
+    return notRun("error", `could not create the artifact directory: ${errText(err)}`);
   }
 
   const max = opts.maxArtifactBytes ?? DEFAULT_MAX_ARTIFACT_BYTES;
-  const out = new CapturedStream("stdout", opts.artifactDir, max);
-  const err = new CapturedStream("stderr", opts.artifactDir, max);
+  const scan = new ZeroTestScan();
+  const out = new CapturedStream("stdout", opts.artifactDir, max, scan);
+  const err = new CapturedStream("stderr", opts.artifactDir, max, scan);
   const grace = opts.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
 
   const child = spawn("sh", ["-c", spec.command], {
     cwd: opts.cwd,
-    env: { ...process.env, ...(spec.env ?? {}) },
+    env: { ...buildSubprocessEnv({}), ...(spec.env ?? {}) },
     stdio: ["ignore", "pipe", "pipe"],
     // Its own process group, so killGroup reaches everything it spawns.
     detached: true,
@@ -206,11 +233,13 @@ export async function runCheck(spec: CheckSpec, opts: RunCheckOptions): Promise<
   const closed = new Promise<void>((res) => child.once("close", () => res()));
 
   let stoppedBy: "timeout" | "cancel" | null = null;
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
   const stop = (why: "timeout" | "cancel"): void => {
     if (stoppedBy || child.pid === undefined) return;
     stoppedBy = why;
-    killGroup(child.pid, "SIGTERM");
-    setTimeout(() => killGroup(child.pid!, "SIGKILL"), grace).unref();
+    const pid = child.pid;
+    killGroup(pid, "SIGTERM");
+    killTimer = setTimeout(() => killGroup(pid, "SIGKILL"), grace);
   };
   const timer = setTimeout(() => stop("timeout"), spec.timeoutMs);
   const onAbort = (): void => stop("cancel");
@@ -225,8 +254,12 @@ export async function runCheck(spec: CheckSpec, opts: RunCheckOptions): Promise<
   clearTimeout(timer);
   opts.signal?.removeEventListener("abort", onAbort);
 
-  // The check is over; anything it left running in its group goes too.
+  // The check is over; anything it left running in its group goes too. The
+  // group id is still held by those stragglers, so this cannot reach another
+  // process group. The delayed SIGKILL is no longer needed — and once every
+  // member is gone the id may be reused, so it must not fire.
   if (child.pid !== undefined) killGroup(child.pid, "SIGKILL");
+  clearTimeout(killTimer);
   let drainTimer: ReturnType<typeof setTimeout> | undefined;
   const drained = new Promise<void>((res) => {
     drainTimer = setTimeout(res, DRAIN_WAIT_MS);
@@ -237,9 +270,7 @@ export async function runCheck(spec: CheckSpec, opts: RunCheckOptions): Promise<
   child.stderr?.destroy();
 
   const artifacts = [await out.close(), await err.close()];
-  const stdoutExcerpt = out.excerpt();
-  const stderrExcerpt = err.excerpt();
-  const captured = { stdoutExcerpt, stderrExcerpt, artifacts };
+  const captured = { stdoutExcerpt: out.excerpt(), stderrExcerpt: err.excerpt(), artifacts };
   const signal = exit.signal ?? null;
 
   if (exit.spawnError) {
@@ -265,14 +296,14 @@ export async function runCheck(spec: CheckSpec, opts: RunCheckOptions): Promise<
       ...captured,
     });
   }
-  return finish({ ...classifyExit(spec, exit.code, signal, `${stdoutExcerpt}\n${stderrExcerpt}`), ...captured });
+  return finish({ ...classifyExit(spec, exit.code, signal, scan.result()), ...captured });
 }
 
 function classifyExit(
   spec: CheckSpec,
   code: number | null,
   signal: NodeJS.Signals | null,
-  output: string,
+  zeroTestsRunner: string | null,
 ): Pick<CheckOutcome, "result" | "reason" | "exitCode" | "signal" | "timedOut"> {
   const at = { exitCode: code, signal, timedOut: false };
   const result = (r: EvidenceResult, reason: string) => ({ result: r, reason, ...at });
@@ -281,9 +312,8 @@ function classifyExit(
     return result("error", code === 127 ? "command not found (exit 127)" : "command not executable (exit 126)");
   }
   if (code !== 0) return result("fail", `exited with code ${code}`);
-  if (spec.expectTests) {
-    const runner = detectZeroTests(output);
-    if (runner) return result("inconclusive", `exited 0 but ran no tests (${runner} reported an empty selection)`);
+  if (spec.expectTests && zeroTestsRunner) {
+    return result("inconclusive", `exited 0 but ran no tests (${zeroTestsRunner} reported an empty selection)`);
   }
   return result("pass", "exited 0");
 }

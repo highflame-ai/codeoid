@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildProbeGate, detectEcosystem, type ProbeSpec } from "./gate-probes";
+import { buildProbeGate, detectEcosystem, diagnosticTail, type ProbeSpec } from "./gate-probes";
 import type { GateCtx, PipelineState } from "./interface";
 
 function tmp(): string {
@@ -165,3 +165,18 @@ describe("probe evidence", () => {
   });
 });
 
+
+describe("diagnosticTail", () => {
+  const outcome = (stdout: string, stderr: string) =>
+    ({ stdoutExcerpt: stdout, stderrExcerpt: stderr }) as Parameters<typeof diagnosticTail>[0];
+
+  test("long console noise on stdout cannot push the failure on stderr out", () => {
+    const tail = diagnosticTail(outcome("noise ".repeat(1_000), "expected 2, received 3"), 600);
+    expect(tail).toContain("expected 2, received 3");
+    expect(tail.length).toBeLessThanOrEqual(600 + 5);
+  });
+
+  test("uses the whole budget for the only stream there is", () => {
+    expect(diagnosticTail(outcome("x".repeat(2_000), ""), 500).length).toBe(501);
+  });
+});
