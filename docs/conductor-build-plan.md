@@ -48,7 +48,7 @@
 | **P2** | Conductor identity foundation | durable owner-delegated conductor identity | P0 |
 | **P3** | Conductor session + read-only fleet tools | conductor can list/find/summarize the fleet | P1, P2 |
 | **P4** | Dispatch + routing (durable queue + roles + hardening) | confirm → act; **restart-proof** workers; child digests | P3 |
-| **P4.5** | Routines (scheduled + triggered autonomy) | unattended cron/webhook fleet tasks; `[SILENT]` monitors | P4 |
+| **P4.5** | Routines (scheduled + triggered autonomy) — **shipped** (#382): schedules + API trigger; event triggers and conductor/MCP tools to follow ([routines.md](routines.md)) | unattended cron/webhook fleet tasks; `[SILENT]` monitors | P4 |
 | **P5** | Front doors: web + Telegram | conductor chat + separate switchable session list | P4 |
 | **P6** | Act on behalf (email/web/calendar) | approval-gated egress via delegated children | P4 |
 | **P7** | Mobile app contract + conductor screen | mobile renders conductor + session switcher | P5 |
@@ -209,6 +209,9 @@ O(active threads).
 ---
 
 ## P4.5 — Routines (scheduled + triggered autonomy)
+
+> **Status:** shipped in #382 as schedules (cron / interval / once) plus a per-routine API trigger; see [routines.md](routines.md) for what was built.
+> GitHub/Slack event triggers and conductor/MCP routine tools are follow-ups. The design notes below are the original plan.
 
 **Goal:** turn the conductor from a fleet *supervisor* into a personal *assistant* —
 it runs tasks unattended, on a schedule or an external trigger.

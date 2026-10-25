@@ -16,10 +16,13 @@
  */
 
 import type { McpTenant } from "../../mcp/oauth.js";
+import type { EffortLevel } from "../../../protocol/types.js";
+import { effortRejectionHint } from "../effort.js";
 import {
   GoogleGenerativeAI,
   type FunctionDeclaration,
   type GenerateContentStreamResult,
+  type GenerationConfig,
   type Part,
 } from "@google/generative-ai";
 import { AsyncQueue } from "../../async-queue.js";
@@ -44,12 +47,14 @@ import {
   memoryToolsAsGemini,
 } from "../tool-loop.js";
 import { SessionMcpTools } from "../../mcp/tool-source.js";
-import type { McpRegistry } from "../../mcp/registry.js";
+import type { McpServerView } from "../../mcp/registry.js";
 import type { McpHub } from "../../mcp/hub.js";
 
 export interface GeminiProviderInit {
   /** Explicit API key — falls back to GOOGLE_API_KEY env var. */
   apiKey?: string;
+  /** The session's account, per turn (accounts.ts): its key replaces `apiKey`. A throw fails the turn. */
+  resolveApiKey?: () => { key: string; fingerprint: string } | null;
   /** Model to use when TurnOpts.model is absent. */
   defaultModel?: string;
   /** Memory engine — when present, the memory recall tools are offered as
@@ -62,7 +67,7 @@ export interface GeminiProviderInit {
   sessionId?: string;
   /** Cross-backend MCP registry + daemon-owned client — external servers reach
    *  this backend (which has no MCP client) through the hub. */
-  mcpRegistry?: McpRegistry;
+  mcpRegistry?: McpServerView;
   mcpHub?: McpHub;
 }
 
@@ -73,16 +78,18 @@ export class GeminiProvider implements AgentProvider {
   readonly displayName = "Gemini (Google)";
 
   #apiKey: string;
+  #resolveApiKey: (() => { key: string; fingerprint: string } | null) | null;
   #defaultModel: string;
   #memory: MemoryEngine | null;
   #workspaceId: string;
   #tenant: McpTenant | undefined;
   #sessionId: string;
-  #mcpRegistry: McpRegistry | null;
+  #mcpRegistry: McpServerView | null;
   #mcpHub: McpHub | null;
 
   constructor(init: GeminiProviderInit = {}) {
     this.#apiKey = init.apiKey ?? process.env.GOOGLE_API_KEY ?? "";
+    this.#resolveApiKey = init.resolveApiKey ?? null;
     this.#defaultModel = init.defaultModel ?? "gemini-2.0-flash";
     this.#memory = init.memory ?? null;
     this.#workspaceId = init.workspaceId ?? init.sessionId ?? "";
@@ -144,7 +151,7 @@ export class GeminiProvider implements AgentProvider {
     startMs: number,
   ): Promise<void> {
     const model = opts.model ?? this.#defaultModel;
-    const genAI = new GoogleGenerativeAI(this.#apiKey);
+    const genAI = new GoogleGenerativeAI(this.#resolveApiKey?.()?.key ?? this.#apiKey);
     // Tools offered: the memory tools when a memory engine is wired, plus the
     // ask-user tool when the session can raise dialogs. With neither this stays
     // the plain single-call text path (unchanged behavior).
@@ -179,6 +186,11 @@ export class GeminiProvider implements AgentProvider {
       ...(declarations.length > 0
         ? { tools: [{ functionDeclarations: declarations as unknown as FunctionDeclaration[] }] }
         : {}),
+      // Thinking effort (#417). This SDK predates `thinkingConfig` in its
+      // types but sends generationConfig as given; the API reads it.
+      ...(opts.effort && geminiThinkingConfig(model, opts.effort)
+        ? { generationConfig: { thinkingConfig: geminiThinkingConfig(model, opts.effort) } as GenerationConfig }
+        : {}),
     });
 
     try {
@@ -212,7 +224,7 @@ export class GeminiProvider implements AgentProvider {
           if (ac.signal.aborted) return;
           queue.push({
             type: "error",
-            message: `Gemini API error: ${err instanceof Error ? err.message : String(err)}`,
+            message: `Gemini API error: ${err instanceof Error ? err.message : String(err)}${opts.effort ? effortRejectionHint(err instanceof Error ? err.message : String(err), opts.effort) : ""}`,
           });
           return;
         }
@@ -331,4 +343,26 @@ export function splitForStateless(opts: TurnOpts): {
     chatHistory: history,
     userMessage: opts.userMessage,
   };
+}
+
+/**
+ * A thinking effort as Gemini's thinkingConfig (#417), by model family.
+ * 2.5 models take a token budget: 0 turns thinking off, except on Pro (its
+ * floor is 128); Flash-Lite thinks from 512; Flash and Flash-Lite stop at
+ * 24576. 3.x models take a level — Pro only Low and High, Flash also Minimal
+ * and Medium. Other models don't think: nothing is sent.
+ */
+export function geminiThinkingConfig(model: string, effort: EffortLevel): Record<string, unknown> | null {
+  if (/gemini-2\.5/.test(model)) {
+    const pro = /pro/.test(model);
+    // From Minimal up every budget is at least 512, Flash-Lite's floor.
+    const budgets: Record<EffortLevel, number> = { off: 0, minimal: 512, low: 2048, medium: 8192, high: 16384, xhigh: 24576, max: 32768 };
+    return { thinkingBudget: Math.min(Math.max(budgets[effort], pro ? 128 : 0), pro ? 32768 : 24576) };
+  }
+  if (/gemini-3/.test(model)) {
+    if (/pro/.test(model)) return { thinkingLevel: effort === "off" || effort === "minimal" || effort === "low" ? "low" : "high" };
+    const level = effort === "off" || effort === "minimal" ? "minimal" : effort === "low" ? "low" : effort === "medium" ? "medium" : "high";
+    return { thinkingLevel: level };
+  }
+  return null;
 }

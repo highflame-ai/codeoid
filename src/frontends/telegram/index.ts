@@ -19,7 +19,7 @@
 import { Bot, type Context, InlineKeyboard } from "grammy";
 import { autoRetry } from "@grammyjs/auto-retry";
 import { randomUUID } from "node:crypto";
-import { formatCollaborationCost } from "@highflame/codeoid-core";
+import { EFFORT_LABELS, effortChangeSummary, formatCollaborationCost, mcpRefreshSummary, parseEffort } from "@highflame/codeoid-core";
 import { getManifest, getSnapshot } from "../../daemon/settings/store.js";
 import { ALL_SCOPES_STRING } from "../../protocol/scopes.js";
 import type { Frontend, FrontendContext } from "../types.js";
@@ -39,7 +39,7 @@ import type {
   ToolInfo,
   UiRequestMethod,
 } from "../../protocol/types.js";
-import { CAPABILITIES } from "../../protocol/types.js";
+import { CAPABILITIES, EFFORT_LEVELS, type EffortChangeResult, type EffortLevel } from "../../protocol/types.js";
 import type { AttachedClient } from "../../daemon/session.js";
 import {
   StreamRelay,
@@ -211,6 +211,7 @@ export class TelegramFrontend implements Frontend {
         { command: "interrupt", description: "Stop the current turn" },
         { command: "mode", description: "Set mode: interactive | guarded | autonomous" },
         { command: "model", description: "Show or switch the model" },
+        { command: "effort", description: "How hard the model thinks: off … max, or default" },
         { command: "provider", description: "Show or switch the backend: /provider <id>" },
         { command: "fork", description: "Branch this session: /fork [backend]" },
         { command: "rotate", description: "Fresh context (memory kept)" },
@@ -272,6 +273,7 @@ export class TelegramFrontend implements Frontend {
     this.#bot.command("rotate", (ctx) => this.#handleRotate(ctx));
     this.#bot.command("mode", (ctx) => this.#handleMode(ctx));
     this.#bot.command("model", (ctx) => this.#handleModel(ctx));
+    this.#bot.command("effort", (ctx) => this.#handleEffort(ctx));
     this.#bot.command("provider", (ctx) => this.#handleProvider(ctx));
     this.#bot.command("fork", (ctx) => this.#handleFork(ctx));
     this.#bot.command("who", (ctx) => this.#handleWho(ctx));
@@ -279,7 +281,8 @@ export class TelegramFrontend implements Frontend {
     // Capabilities discovery — mirror the web /agents /skills /mcp /hooks.
     this.#bot.command("agents", (ctx) => this.#handleCapabilities(ctx, "agents"));
     this.#bot.command("skills", (ctx) => this.#handleCapabilities(ctx, "skills"));
-    this.#bot.command("mcp", (ctx) => this.#handleCapabilities(ctx, "mcp"));
+    // `/mcp refresh` applies Claude's current MCP config to the attached session (#395).
+    this.#bot.command("mcp", (ctx) => (/^\s*refresh\b/i.test(String(ctx.match ?? "")) ? this.#handleMcpRefresh(ctx) : this.#handleCapabilities(ctx, "mcp")));
     this.#bot.command("hooks", (ctx) => this.#handleCapabilities(ctx, "hooks"));
 
     // Inline-keyboard taps (tool approvals + AskUserQuestion answers).
@@ -798,6 +801,36 @@ export class TelegramFrontend implements Frontend {
     await ctx.reply(`Mode → *${escMd(mode)}*\\.`, { parse_mode: "MarkdownV2" });
   }
 
+  /** `/effort [level]` — show or set the attached session's thinking effort (#417). */
+  async #handleEffort(ctx: Context): Promise<void> {
+    const state = this.#requireAuth(ctx);
+    if (!state || !state.attachedSessionId) {
+      await ctx.reply("Not attached. Use /attach <name>.");
+      return;
+    }
+    const arg = ctx.message?.text?.split(/\s+/)[1];
+    if (!arg) {
+      const info = state.attachedSessionName ? this.#manager.findByName(state.attachedSessionName, state.auth!)?.toInfo() : undefined;
+      const current = info?.effort;
+      const pending = info?.effortPending ? " (pending: it lands with the next turn, or once background work ends)" : "";
+      await ctx.reply(`Thinking effort: ${current ? EFFORT_LABELS[current] : "the backend's default"}${pending}.\nSet it with /effort ${EFFORT_LEVELS.join("|")}|default`);
+      return;
+    }
+    let effort: EffortLevel | null;
+    try {
+      effort = parseEffort(arg);
+    } catch (e) {
+      await ctx.reply(`Usage: ${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
+    const resp = await this.#manager.handle(
+      { type: "session.set_effort", id: randomUUID(), sessionId: state.attachedSessionId, effort },
+      state.auth!,
+      this.#makeClient(state, ctx),
+    );
+    await ctx.reply(resp.type === "response.ok" ? effortChangeSummary(resp.data as EffortChangeResult) : resp.type === "response.error" ? resp.error : "Could not set the effort.");
+  }
+
   async #handleModel(ctx: Context): Promise<void> {
     const state = this.#requireAuth(ctx);
     if (!state || !state.attachedSessionId) {
@@ -996,6 +1029,25 @@ export class TelegramFrontend implements Frontend {
     }
   }
 
+  async #handleMcpRefresh(ctx: Context): Promise<void> {
+    const state = this.#requireAuth(ctx);
+    if (!state || !state.attachedSessionId) {
+      await ctx.reply("Not attached. Use /attach <name>.");
+      return;
+    }
+    const resp = await this.#manager.handle(
+      { type: "session.mcp_refresh", id: randomUUID(), sessionId: state.attachedSessionId },
+      state.auth!,
+      this.#makeClient(state, ctx),
+    );
+    if (resp.type !== "response.ok") {
+      await ctx.reply(resp.type === "response.error" ? resp.error : "Refresh failed.");
+      return;
+    }
+    const r = resp.data as { changed: boolean; deferred: boolean };
+    await ctx.reply(mcpRefreshSummary(r));
+  }
+
   async #handleCapabilities(
     ctx: Context,
     tab: "agents" | "skills" | "mcp" | "hooks",
@@ -1022,12 +1074,12 @@ export class TelegramFrontend implements Frontend {
       lines = cfg.skills.map((s) => `• *${escMd(s.name)}* — ${escMd(s.description ?? "")}`);
     } else if (tab === "mcp") {
       lines = cfg.mcpServers.map(
-        (m) => `• *${escMd(m.name)}* — ${escMd(m.command ?? m.scope)}`,
+        (m) => `• *${escMd(m.name)}* — ${escMd(m.note ?? m.command ?? m.scope)}`,
       );
     } else {
       // Inside a MarkdownV2 code span only ` and \ are special — escMd here
       // rendered literal backslashes that broke copy-paste of the command.
-      lines = cfg.hooks.map((h) => `• \`${escCode(h.command)}\``);
+      lines = cfg.hooks.map((h) => (h.note ? `• ${escMd(h.note)}` : `• \`${escCode(h.command || "(empty)")}\``));
     }
     const title = { agents: "Subagents", skills: "Skills", mcp: "MCP servers", hooks: "Hooks" }[tab];
     await ctx.reply(

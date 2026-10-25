@@ -83,9 +83,11 @@ export async function readClaudeConfig(workdir: string): Promise<ClaudeConfigSna
 
   const agents = dedupByPath(agentsLists.flat());
   const skills = dedupByPath(skillsLists.flat());
+  // The same name in two files is two entries, both shown: a repo's file must
+  // not hide the user's own entry of that name (it could stand in for it).
   const mcpServers = dedupBy(
     [...settingsLists.flatMap((s) => s.mcpServers), ...claudeJson.mcpServers],
-    (m) => `${m.scope}:${m.name}`,
+    (m) => `${m.scope}:${m.name}:${m.path}`,
   );
   const hooks = settingsLists.flatMap((s) => s.hooks);
 
@@ -105,7 +107,7 @@ async function readClaudeJson(
   workdir: string,
 ): Promise<{ mcpServers: ClaudeConfigMcpServer[] }> {
   const filePath = path.join(home, ".claude.json");
-  const content = await safeReadFile(filePath);
+  const content = await safeReadFile(filePath, MAX_CLAUDE_JSON_BYTES);
   if (content == null) return { mcpServers: [] };
   let parsed: unknown;
   try {
@@ -280,6 +282,17 @@ async function readSettings(
   filePath: string,
   scope: ClaudeConfigScope,
 ): Promise<{ mcpServers: ClaudeConfigMcpServer[]; hooks: ClaudeConfigHook[] }> {
+  // Too large to describe — but not invisible: the Claude CLI still loads it
+  // (its hooks run, its servers connect), so a repo can't hide what it runs
+  // by padding the file. One row each says so.
+  const size = await fileSize(filePath);
+  if (size !== null && size > MAX_CONFIG_BYTES) {
+    const note = `${path.basename(filePath)} is too large to describe here (${(size / 1_000_000).toFixed(1)} MB); the Claude CLI still loads it`;
+    return {
+      mcpServers: [{ name: "(file too large)", scope, path: filePath, command: null, args: [], envKeys: [], url: null, type: null, note }],
+      hooks: [{ event: "(file too large)", scope, path: filePath, matcher: null, kind: "note", command: "", note }],
+    };
+  }
   const content = await safeReadFile(filePath);
   if (content == null) return { mcpServers: [], hooks: [] };
   let parsed: unknown;
@@ -401,8 +414,24 @@ async function safeReaddir(
   }
 }
 
-async function safeReadFile(p: string): Promise<string | null> {
+/** Largest config file read: one bigger is no one's hand-written config, and
+ *  a repo's file shouldn't cost the daemon seconds to describe. */
+const MAX_CONFIG_BYTES = 1_000_000;
+/** ~/.claude.json is the user's own and also holds Claude Code's per-project
+ *  history, so it can run to megabytes: a ceiling, not the repo-file cap. */
+const MAX_CLAUDE_JSON_BYTES = 64_000_000;
+
+async function fileSize(p: string): Promise<number | null> {
   try {
+    return (await fs.stat(p)).size;
+  } catch {
+    return null;
+  }
+}
+
+async function safeReadFile(p: string, maxBytes = MAX_CONFIG_BYTES): Promise<string | null> {
+  try {
+    if ((await fs.stat(p)).size > maxBytes) return null;
     return await fs.readFile(p, "utf-8");
   } catch {
     return null;

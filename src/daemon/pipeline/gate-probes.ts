@@ -21,6 +21,8 @@
  */
 
 import { existsSync, readFileSync } from "node:fs";
+import { ephemeralCheck } from "../evidence/service";
+import type { CheckOutcome } from "../evidence/types";
 import type { GateCtx, GatePlugin, GateVerdict } from "./interface";
 
 /** A probe path/glob must stay WITHIN the run's workdir: it is relative and has
@@ -59,33 +61,35 @@ export interface ProbeSpec {
 
 const errText = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 
-/** Run a shell command in `cwd`, bounded by a timeout; resolve its exit code (or
- *  a synthetic non-zero on timeout/spawn failure). Mirrors the command gate's
- *  spawn shape (stdout/stderr ignored — a probe's verdict is the exit code). */
-async function runCommand(cmd: string, cwd: string): Promise<{ code: number; timedOut: boolean }> {
-  let proc: ReturnType<typeof Bun.spawn>;
-  try {
-    proc = Bun.spawn(["sh", "-c", cmd], { cwd, stdout: "ignore", stderr: "ignore", stdin: "ignore" });
-  } catch {
-    return { code: 127, timedOut: false };
-  }
-  const TIMED_OUT = Symbol("timeout");
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    const result = await Promise.race<number | typeof TIMED_OUT>([
-      proc.exited,
-      new Promise((res) => {
-        timer = setTimeout(() => res(TIMED_OUT), GATE_PROBE_TIMEOUT_MS);
-      }),
-    ]);
-    if (result === TIMED_OUT) {
-      proc.kill();
-      return { code: 124, timedOut: true };
-    }
-    return { code: result, timedOut: false };
-  } finally {
-    clearTimeout(timer);
-  }
+/** Run one probe command through the gate's check runner (recording evidence
+ *  when the run has an evidence store), bounded by GATE_PROBE_TIMEOUT_MS. */
+async function runProbe(
+  ctx: GateCtx,
+  id: string,
+  label: string,
+  cmd: string,
+  cwd: string,
+): Promise<{ outcome: CheckOutcome; evidenceId?: string }> {
+  const run = ctx.runCheck ?? ephemeralCheck;
+  const { outcome, record } = await run(
+    { id: `${ctx.phase.id}:${id}:${label}`, label, command: cmd, timeoutMs: GATE_PROBE_TIMEOUT_MS, expectTests: label === "test" },
+    cwd,
+  );
+  return { outcome, ...(record ? { evidenceId: record.id } : {}) };
+}
+
+/** The diagnostic tail a failed check contributes to its gate's reason — what
+ *  the phase's next attempt is shown. stderr gets most of the room, because
+ *  test runners report failures there and stdout is often console noise. Both
+ *  excerpts are already redacted; the full output is evidence. */
+export function diagnosticTail(outcome: CheckOutcome, max = 1_500): string {
+  const tail = (s: string, n: number): string => (s.length > n ? `…${s.slice(s.length - n)}` : s);
+  const err = outcome.stderrExcerpt.trim();
+  const out = outcome.stdoutExcerpt.trim();
+  if (!err) return tail(out, max);
+  if (!out) return tail(err, max);
+  const outRoom = Math.min(out.length, Math.floor(max / 3));
+  return `${tail(err, max - outRoom)}\n${tail(out, outRoom)}`;
 }
 
 /** Detected build/test/lint commands for a workspace, keyed by the manifest we
@@ -213,10 +217,18 @@ export function buildProbeGate(
         }
       }
       if (spec.type === "git-diff-nonempty") {
-        const { code } = await runCommand("test -n \"$(git status --porcelain)\"", workdir);
-        return code === 0
-          ? { pass: true }
-          : { pass: false, reason: `probe "${id}": the working tree has no changes` };
+        const { outcome, evidenceId } = await runProbe(ctx, id, "git-diff", "test -n \"$(git status --porcelain)\"", workdir);
+        const evidenceIds = evidenceId ? [evidenceId] : [];
+        if (outcome.result === "cancelled") return { pass: false, cancelled: true, reason: "check cancelled", evidenceIds };
+        if (outcome.result === "pass") return { pass: true, evidenceIds };
+        return {
+          pass: false,
+          reason:
+            outcome.result === "fail"
+              ? `probe "${id}": the working tree has no changes`
+              : `probe "${id}": could not inspect the working tree — ${outcome.reason}`,
+          evidenceIds,
+        };
       }
 
       // ── Execution probes (trust-gated) ────────────────────────────────────
@@ -234,18 +246,21 @@ export function buildProbeGate(
           reason: `probe "${id}" (${spec.type}): no ${spec.type} command auto-derived for this workspace (unrecognized ecosystem)`,
         };
       }
+      const evidenceIds: string[] = [];
       for (const { label, cmd } of cmds) {
-        const { code, timedOut } = await runCommand(cmd, workdir);
-        if (code !== 0) {
+        const { outcome, evidenceId } = await runProbe(ctx, id, label, cmd, workdir);
+        if (evidenceId) evidenceIds.push(evidenceId);
+        if (outcome.result === "cancelled") return { pass: false, cancelled: true, reason: "check cancelled", evidenceIds };
+        if (outcome.result !== "pass") {
+          const tail = diagnosticTail(outcome);
           return {
             pass: false,
-            reason: timedOut
-              ? `probe "${id}": ${label} timed out after ${GATE_PROBE_TIMEOUT_MS}ms (${cmd})`
-              : `probe "${id}": ${label} failed (exit ${code}): ${cmd}`,
+            reason: `probe "${id}": ${label} ${outcome.result} — ${outcome.reason}: ${cmd}${tail ? `\n${tail}` : ""}`,
+            evidenceIds,
           };
         }
       }
-      return { pass: true };
+      return { pass: true, evidenceIds };
     },
   };
 }

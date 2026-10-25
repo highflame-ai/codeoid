@@ -165,12 +165,22 @@ export interface TranscriptMeta {
   role?: "conductor" | "worker";
   /** Provider id backing the session; absent = claude (pre-upgrade metas). */
   providerId?: string;
+  /** The session's own Claude account choice (claude-accounts.ts); absent = follow the daemon default. */
+  claudeAccount?: string;
+  /** The session's account per backend (accounts.ts); a backend absent = follow its default. */
+  accounts?: Record<string, string>;
   /**
    * The backend was reset (a rewind) and has not run a turn since, so it
    * holds no conversation: on resume, re-seed it from the canonical history
    * instead of resuming an empty backing session (#355).
    */
   backingFresh?: boolean;
+  /**
+   * Backing sessions that hold tool output a tool_result hook redacted from
+   * codeoid's record: never forked natively (#387). Persisted the moment a
+   * redaction happens, so a crash before the turn ends can't forget it.
+   */
+  redactedBackings?: string[];
   /** Fork lineage (session.fork). Absent = not a fork. */
   forkedFrom?: { sessionId: string; name: string; atTurn: number };
   /** Git worktree backing workdir (fork isolation / bind). Absent = shared. */

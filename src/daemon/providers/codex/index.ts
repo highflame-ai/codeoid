@@ -34,8 +34,11 @@
  *   - `item/tool/requestUserInput` → requestUserInput (session.ui_request)
  *   - text/reasoning deltas stream; command/fileChange/mcp items surface
  *     as tool records; usage from turn/completed
- *   - seedFromHistory prepends renderHistorySeed to the first prompt (the
- *     warm-backend ceiling; codex threads only resume codex's own state)
+ *   - continueNatively (#387): the thread is created by `thread/fork` at a
+ *     recorded turn (same backend) or `thread/start` + `thread/inject_items`
+ *     (native history from another backend); thread ids are persisted
+ *   - seedFromHistory prepends renderHistorySeed to the first prompt — the
+ *     fallback when the native path is off or fails
  *
  * Non-gated items (codex ran something its policy considers trusted, e.g.
  * read-only commands) are recorded retrospectively at item/completed as a
@@ -49,6 +52,8 @@ import { AsyncQueue } from "../../async-queue.js";
 import type { Store } from "../../store.js";
 import type {
   ModelInfo,
+  NativeContinuationRequest,
+  NativeContinuationResult,
   NormalizedTurnResult,
   ProviderEvent,
   SessionProvider,
@@ -59,16 +64,21 @@ import type {
   CatalogEntry,
 } from "../interface.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
-import { buildCodexEnv } from "../env.js";
+import { type ResponsesItem, toResponsesItems } from "./native-history.js";
+import { buildCodexEnv, withExtraEnv } from "../env.js";
 import { CodexRpcProcess } from "./rpc.js";
-import type { SessionMode } from "../../../protocol/types.js";
+import { EFFORT_LEVELS, type EffortLevel, type SessionMode } from "../../../protocol/types.js";
 import { MEMORY_MCP_SERVER_NAME, MEMORY_MCP_TOKEN_ENV, type MemoryMcpMount } from "../../memory/mcp-http.js";
 import {
   BLACKBOARD_MCP_SERVER_NAME,
   BLACKBOARD_MCP_TOKEN_ENV,
 } from "../../blackboard/mcp-http.js";
-import type { McpRegistry } from "../../mcp/registry.js";
+import type { McpServerView } from "../../mcp/registry.js";
+import { MCP_PROXY_TOKEN_ENV, McpProxyLease, type McpProxyMount } from "../../mcp/proxy.js";
+import { codexKeySafe, codexShellEnvExcludeArgs } from "./shell-env.js";
 import { resolveEnvMap } from "../../mcp/types.js";
+import type { ResolvedAccount } from "../../accounts.js";
+import { applyCodexAccount } from "../../account-apply.js";
 
 /** codex `tokenUsage.last` / `.total` shape (thread/tokenUsage/updated). */
 interface CodexTokenUsage {
@@ -97,6 +107,9 @@ export interface CodexProviderInit {
    * codex can page the verbatim store on demand — the precondition for VWS.
    */
   memoryMcp?: MemoryMcpMount;
+  /** The daemon's OAuth MCP relay (#396): how this backend reaches the
+   *  registry's OAuth servers without holding their tokens. */
+  mcpProxy?: McpProxyMount;
   /**
    * Role-scoped goal-blackboard mount, resolved LAZILY.
    *
@@ -109,8 +122,16 @@ export interface CodexProviderInit {
 
   /** Cross-backend MCP registry — external servers mount natively via `-c
    *  mcp_servers.*` (codex owns its client); approval flows through canUseTool. */
-  mcpRegistry?: McpRegistry;
+  mcpRegistry?: McpServerView;
+  /**
+   * This session's account for the backend, resolved when the process is
+   * spawned (accounts.ts); null = the daemon's own login. Throws when the
+   * chosen account can't be used — the turn fails, never another credential.
+   */
+  resolveAccount?: () => ResolvedAccount | null;
   onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
+  /** Caller env for the child process (ProviderSessionInit.extraEnv), merged last via withExtraEnv. */
+  extraEnv?: Readonly<Record<string, string>>;
 }
 
 /** Item types that surface as tool records (vs text/reasoning streams). */
@@ -184,6 +205,17 @@ function codexPolicies(mode?: SessionMode): { approvalPolicy: string; sandboxMod
  * SandboxPolicyDeserialize` at turn/start. Shapes verified live against
  * @openai/codex@0.144.1 `generate-ts` + a real turn.
  */
+/** What a new thread (started or forked) is created with: cwd, policies, the turn's instructions. */
+function threadConfig(opts: TurnOpts): Record<string, unknown> {
+  const { approvalPolicy, sandboxMode } = codexPolicies(opts.mode);
+  return {
+    cwd: opts.workdir,
+    approvalPolicy,
+    sandboxPolicy: sandboxPolicyWire(sandboxMode, opts.workdir),
+    ...(opts.systemPromptAppend ? { developerInstructions: opts.systemPromptAppend } : {}),
+  };
+}
+
 function sandboxPolicyWire(mode: SandboxMode, workdir: string): Record<string, unknown> {
   switch (mode) {
     case "read-only":
@@ -235,35 +267,96 @@ export function describeCodexError(params: Record<string, unknown>): string {
   }
 }
 
+/**
+ * The structured half of a codex `error` notification, for the usage-limit
+ * classifier: the v2 `TurnError.codexErrorInfo` variant (`usageLimitExceeded`,
+ * `rateLimitExceeded`, `httpConnectionFailed { httpStatusCode }`, … — codex-rs
+ * 0.154.0 app-server protocol) and the limit's reset instant when it carries
+ * one (`resets_at` / `resetsAt`, epoch seconds or ms). The info is a bare
+ * string for a unit variant and `{ variant: { …fields } }` otherwise.
+ * Undefined when the notification has no error info. describeCodexError keeps
+ * producing the display text; this never reaches the user.
+ */
+export function codexErrorDetail(params: Record<string, unknown>): Record<string, unknown> | undefined {
+  const err = params.error && typeof params.error === "object" ? (params.error as Record<string, unknown>) : undefined;
+  const info = err?.codexErrorInfo ?? params.codexErrorInfo;
+  let variant: string | undefined;
+  let fields: Record<string, unknown> = {};
+  if (typeof info === "string") variant = info;
+  else if (info && typeof info === "object") {
+    const [name, value] = Object.entries(info as Record<string, unknown>)[0] ?? [];
+    variant = name;
+    if (value && typeof value === "object") fields = value as Record<string, unknown>;
+  }
+  if (!variant) return undefined;
+  const data = err?.data && typeof err.data === "object" ? (err.data as Record<string, unknown>) : {};
+  const reset = [fields.resetsAt, fields.resets_at, err?.resetsAt, err?.resets_at, data.resetsAt, data.resets_at].find(
+    (v): v is number => typeof v === "number" && v > 0,
+  );
+  const status = fields.httpStatusCode;
+  return {
+    codexErrorInfo: variant,
+    ...(reset !== undefined ? { resetsAt: reset } : {}),
+    ...(typeof status === "number" ? { status } : {}),
+  };
+}
+
 export class CodexProvider implements SessionProvider {
   /**
    * codex's approval replies carry only a decision (`approved` / `accept`) —
    * codex runs the input IT proposed, so a rewrite can't apply (#367).
    */
   readonly appliesToolInputRewrite = false;
+  /**
+   * Autonomous mode is `approvalPolicy: "never"` (approvalPolicyForMode): codex
+   * runs commands and patches without an approval request, so codeoid's tool
+   * budget never sees them.
+   */
+  readonly enforcesToolBudget = false;
   readonly id = "codex";
   readonly displayName = "Codex (OpenAI)";
 
   onRecoveryNeeded: ((content: string) => void) | undefined;
+  onHistoryLost: (() => void) | undefined;
 
   #sessionId: string;
   #backingSessionId: string;
   #command: string;
   #argsPrefix: string[];
+  #resolveAccount: (() => ResolvedAccount | null) | null;
+  readonly #extraEnv: Readonly<Record<string, string>> | undefined;
   #onModels?: CodexProviderInit["onModels"];
   #workspaceId: string;
   #memoryMcp: MemoryMcpMount | null;
   /** Role-scoped blackboard mount; token minted+revoked by the SessionManager. */
   readonly #blackboardMcp: (() => { url: string; token: string } | undefined) | null;
-  #mcpRegistry: McpRegistry | null;
+  #mcpRegistry: McpServerView | null;
   /** Live scoped token for the mounted memory endpoint; revoked on teardown. */
   #memoryToken: string | null = null;
 
   #proc: CodexRpcProcess | null = null;
   #threadId: string | null = null;
+  /** Each model's default effort from model/list, the model the thread runs, and the
+   *  user's own configured effort (config/read) — what Default sends (#417). */
+  readonly #modelDefaultEffort = new Map<string, string>();
+  /** Each model's efforts on codeoid's scale, from model/list. */
+  readonly #modelEfforts = new Map<string, EffortLevel[]>();
+  #threadModel: string | null = null;
+  #configEffort: string | null | undefined = undefined;
+  /** The baseline last worked out, for the session's pickers. */
+  #defaultEffort: string | null = null;
+  #modelListTried = false;
   #hasQueried = false;
   #modelsReported = false;
   #pendingHistorySeed: string | null = null;
+  readonly #store: Store;
+  /**
+   * A native continuation to apply when the thread is first created (#387):
+   * fork the backend's own thread at a turn, or start one and inject history.
+   * Deferred to the first turn because the thread takes that turn's
+   * instructions. `fallback` is the transcript seed used if it fails.
+   */
+  #pendingNative: { kind: "fork"; threadId: string; turnId: string; fallback: string | null } | { kind: "inject"; items: ResponsesItem[]; fallback: string | null } | null = null;
 
   // Per-turn wiring.
   #turnQueue: AsyncQueue<ProviderEvent> | null = null;
@@ -315,17 +408,26 @@ export class CodexProvider implements SessionProvider {
    *  server. A LIST: two calls to one server can be in flight at once, and the
    *  elicitation names only the server (#368). */
   #pendingMcpCalls = new Map<string, Array<{ itemId: string; tool: string; input: Record<string, unknown> }>>();
+  /** This backend's proxy token for the registry's OAuth servers. */
+  readonly #proxy: McpProxyLease;
 
   constructor(init: CodexProviderInit) {
+    this.#store = init.store;
     this.#sessionId = init.sessionId;
     this.#backingSessionId = init.initialBackingId;
     this.#command = init.command;
+    this.#resolveAccount = init.resolveAccount ?? null;
+    this.#extraEnv = init.extraEnv;
     this.#argsPrefix = init.argsPrefix ?? [];
     this.#onModels = init.onModels;
     this.#workspaceId = init.workspaceId ?? init.sessionId;
     this.#memoryMcp = init.memoryMcp ?? null;
     this.#blackboardMcp = init.blackboardMcp ?? null;
     this.#mcpRegistry = init.mcpRegistry ?? null;
+    this.#proxy = new McpProxyLease(
+      init.mcpProxy,
+      init.tenant ? { tenant: init.tenant, sessionId: init.sessionId, backendId: this.id } : null,
+    );
   }
 
   /**
@@ -352,6 +454,7 @@ export class CodexProvider implements SessionProvider {
     // A fresh backing session starts from nothing: a seed queued for the
     // previous one (a backend switch, a rewind) must not ride along (#355).
     this.#pendingHistorySeed = null;
+    this.#pendingNative = null;
     this.#backingSessionId = newBackingId;
     this.#threadId = null;
     this.#hasQueried = false;
@@ -374,6 +477,71 @@ export class CodexProvider implements SessionProvider {
    */
   seedText(block: string): void {
     this.#pendingHistorySeed = block.length > 0 ? block : null;
+  }
+
+  /**
+   * Continue a conversation natively (#387): fork this backend's own thread
+   * at the recorded turn when there is one, else inject codeoid's history as
+   * Responses items into a fresh thread. Applied when the thread is created
+   * on the first turn (it takes that turn's instructions); if it fails then,
+   * the turn says so and falls back to the transcript seed rendered here.
+   */
+  async continueNatively(req: NativeContinuationRequest): Promise<NativeContinuationResult | null> {
+    const fallback = renderHistorySeed(req.history, { maxChars: req.maxChars }).text || null;
+    this.#pendingHistorySeed = null;
+    if (req.forkFrom) {
+      this.#pendingNative = { kind: "fork", threadId: req.forkFrom.backingId, turnId: req.forkFrom.ref, fallback };
+      return { via: "fork" };
+    }
+    if (req.allowHistory === false) return null;
+    const { items, truncation } = toResponsesItems(req.history, { maxChars: req.maxChars });
+    if (items.length === 0) return null;
+    this.#pendingNative = { kind: "inject", items, fallback };
+    return { via: "history", ...(truncation.omittedTurns > 0 || truncation.newestTurnSliced ? { truncation } : {}) };
+  }
+
+  /**
+   * Create the thread a pending native continuation asks for. Returns its id,
+   * or null after falling back to the transcript (and telling the turn why).
+   */
+  async #applyPendingNative(opts: TurnOpts): Promise<string | null> {
+    const pending = this.#pendingNative;
+    this.#pendingNative = null;
+    if (!pending || !this.#proc) return null;
+    const config = threadConfig(opts);
+    try {
+      if (pending.kind === "fork") {
+        const forked = (await this.#proc.request("thread/fork", {
+          threadId: pending.threadId,
+          lastTurnId: pending.turnId,
+          // Don't stream the whole thread back over stdio; only its id is used.
+          excludeTurns: true,
+          ...config,
+        })) as { thread?: { id?: string }; model?: string };
+        if (!forked.thread?.id) throw new Error("thread/fork returned no thread id");
+        this.#threadModel = forked.model ?? null;
+        this.#configEffort = undefined;
+        return forked.thread.id;
+      }
+      const started = (await this.#proc.request("thread/start", config)) as { thread?: { id?: string }; model?: string };
+      if (!started.thread?.id) throw new Error("thread/start returned no thread id");
+      this.#threadModel = started.model ?? null;
+      this.#configEffort = undefined;
+      await this.#proc.request("thread/inject_items", { threadId: started.thread.id, items: pending.items });
+      return started.thread.id;
+    } catch (err) {
+      const why = err instanceof Error ? err.message : String(err);
+      console.error(`[codex-provider ${this.#sessionId.slice(0, 8)}] native ${pending.kind} failed, using the transcript: ${why}`);
+      this.#pendingHistorySeed = pending.fallback;
+      // The cause stays in the daemon log: backend errors name rollout paths
+      // and thread ids, and every attached client (watchers too) sees this.
+      this.#push({
+        type: "custom_message",
+        content: "⚠️ Codex couldn't take this conversation as its own history, so it continues from a text transcript of it instead.",
+        metadata: { event: "history.native_fallback", providerId: this.id },
+      });
+      return null;
+    }
   }
 
   /**
@@ -437,6 +605,10 @@ export class CodexProvider implements SessionProvider {
     const args: string[] = [];
     const env: Record<string, string> = {};
     for (const spec of reg.forNativeMount(this.id)) {
+      if (!codexKeySafe(spec.name)) {
+        console.warn(`[codeoid] codex: MCP server "${spec.name}" isn't mounted — codex can't take that name as a config key`);
+        continue;
+      }
       const key = `mcp_servers.${spec.name}`;
       const t = spec.transport;
       if (t.kind === "stdio") {
@@ -454,6 +626,29 @@ export class CodexProvider implements SessionProvider {
       }
     }
     return { args, env };
+  }
+
+  /**
+   * The registry's OAuth servers, through the daemon's relay (#396): each
+   * server's relay URL, and the proxy token by env-var name — never on argv,
+   * where any local process could read it. Re-minted per app-server spawn
+   * (the previous token revoked), revoked on teardown. The commands codex
+   * runs don't inherit it (codexShellEnvExcludeArgs).
+   */
+  #proxyMcpSpawn(): { args: string[]; env: Record<string, string> } {
+    const lease = this.#proxy.renew();
+    if (!lease) return { args: [], env: {} };
+    const args: string[] = [];
+    for (const server of lease.servers) {
+      if (!codexKeySafe(server.name)) {
+        console.warn(`[codeoid] codex: MCP server "${server.name}" isn't mounted — codex can't take that name as a config key`);
+        continue;
+      }
+      const key = `mcp_servers.${server.name}`;
+      args.push("-c", `${key}.url=${JSON.stringify(server.url)}`);
+      args.push("-c", `${key}.bearer_token_env_var=${JSON.stringify(MCP_PROXY_TOKEN_ENV)}`);
+    }
+    return { args, env: { [MCP_PROXY_TOKEN_ENV]: lease.token } };
   }
 
   runTurn(opts: TurnOpts): TurnRun {
@@ -507,15 +702,44 @@ export class CodexProvider implements SessionProvider {
     if (!this.#proc?.alive) return [];
     try {
       const result = (await this.#proc.request("model/list", {})) as {
-        data?: Array<{ id?: string; model?: string; displayName?: string; description?: string }>;
+        data?: Array<{
+          id?: string;
+          model?: string;
+          displayName?: string;
+          description?: string;
+          supportedReasoningEfforts?: Array<{ reasoningEffort?: string }>;
+          defaultReasoningEffort?: string;
+          isDefault?: boolean;
+        }>;
       };
+      // Each model's own default effort — what Default falls back to (#417).
+      for (const m of result.data ?? []) {
+        const id = m.model ?? m.id;
+        if (typeof id === "string" && typeof m.defaultReasoningEffort === "string") this.#modelDefaultEffort.set(id, m.defaultReasoningEffort);
+        if (typeof id === "string" && Array.isArray(m.supportedReasoningEfforts)) {
+          this.#modelEfforts.set(
+            id,
+            m.supportedReasoningEfforts.map((e) => fromCodexEffort(e?.reasoningEffort)).filter((e): e is EffortLevel => e !== null),
+          );
+        }
+      }
       return (result.data ?? [])
         .filter((m) => typeof (m.model ?? m.id) === "string")
-        .map((m) => ({
-          id: (m.model ?? m.id) as string,
-          displayName: m.displayName ?? ((m.model ?? m.id) as string),
-          description: m.description,
-        }));
+        .map((m) => {
+          // The efforts it takes (#417), on codeoid's scale — codex's "none" is Off.
+          const efforts = Array.isArray(m.supportedReasoningEfforts)
+            ? m.supportedReasoningEfforts.map((e) => fromCodexEffort(e?.reasoningEffort)).filter((e): e is EffortLevel => e !== null)
+            : undefined;
+          const defaultEffort = fromCodexEffort(m.defaultReasoningEffort);
+          return {
+            id: (m.model ?? m.id) as string,
+            displayName: m.displayName ?? ((m.model ?? m.id) as string),
+            description: m.description,
+            ...(efforts ? { efforts } : {}),
+            ...(defaultEffort ? { defaultEffort } : {}),
+            ...(m.isDefault === true ? { isDefault: true } : {}),
+          };
+        });
     } catch {
       return [];
     }
@@ -523,6 +747,11 @@ export class CodexProvider implements SessionProvider {
 
   async dispose(): Promise<void> {
     await this.teardown();
+  }
+
+  async backendProcessIds(): Promise<number[]> {
+    const pid = this.#proc?.pid;
+    return pid ? [pid] : [];
   }
 
   async teardown(): Promise<void> {
@@ -536,9 +765,53 @@ export class CodexProvider implements SessionProvider {
       this.#memoryMcp?.endpoint.revoke(this.#memoryToken);
       this.#memoryToken = null;
     }
+    this.#proxy.revoke();
   }
 
   // ── Internal ──────────────────────────────────────────────────────────
+
+  /** What Default means here now (#417): the effort codex would use unasked, once worked out. */
+  get defaultEffort(): EffortLevel | null {
+    return fromCodexEffort(this.#defaultEffort ?? undefined);
+  }
+
+  /** The model the thread runs (codex's configured one, project config included), once known. */
+  get runningModel(): string | null {
+    return this.#threadModel;
+  }
+
+  /** turn/start's effort (#417): the session's, else what codex would use unasked — or nothing when that can't be known. */
+  async #effortParam(opts: TurnOpts): Promise<{ effort?: string }> {
+    const baseline = await this.#baselineEffort(opts);
+    this.#defaultEffort = baseline;
+    if (opts.effort) return { effort: toCodexEffort(opts.effort) };
+    return baseline ? { effort: baseline } : {};
+  }
+
+  /**
+   * The effort codex itself uses unasked: the configured one (project layers
+   * included) for a model that takes it, else the running model's own — the
+   * same rule the catalog shows.
+   */
+  async #baselineEffort(opts: TurnOpts): Promise<string | null> {
+    if (this.#configEffort === undefined) {
+      try {
+        const read = (await this.#proc!.request("config/read", { cwd: opts.workdir })) as { config?: { model_reasoning_effort?: string | null } };
+        this.#configEffort = read.config?.model_reasoning_effort ?? null;
+      } catch {
+        // Unknown this time; asked again next turn.
+      }
+    }
+    const model = opts.model ?? this.#threadModel;
+    if (model && !this.#modelDefaultEffort.has(model) && !this.#modelEfforts.has(model) && !this.#modelListTried) {
+      this.#modelListTried = true; // once: a model the list doesn't carry stays unknown
+      await this.listModels();
+    }
+    const takes = model ? this.#modelEfforts.get(model) : undefined;
+    const configured = fromCodexEffort(this.#configEffort ?? undefined);
+    if (this.#configEffort && (!takes || (configured !== null && takes.includes(configured)))) return this.#configEffort;
+    return (model && this.#modelDefaultEffort.get(model)) || null;
+  }
 
   async #startTurn(opts: TurnOpts): Promise<void> {
     await this.#ensureThread(opts);
@@ -559,7 +832,15 @@ export class CodexProvider implements SessionProvider {
       approvalPolicy,
       sandboxPolicy: sandboxPolicyWire(sandboxMode, opts.workdir),
       ...(opts.model ? { model: opts.model } : {}),
+      // Thinking effort (#417). codex keeps a turn's effort for the turns
+      // after it (a resumed thread too), and null there means "no override" —
+      // so Default is sent as the effort codex itself would use: the user's
+      // configured one, else the running model's own default (the same
+      // value codex picks unasked; sending it resets an earlier override).
+      ...(await this.#effortParam(opts)),
     })) as { turn?: { id?: string } };
+    // codex keeps a turn's model for the turns after it: Default's baseline follows it.
+    if (opts.model) this.#threadModel = opts.model;
     this.#currentTurnId = result.turn?.id ?? null;
   }
 
@@ -574,12 +855,31 @@ export class CodexProvider implements SessionProvider {
       const mcp = this.#memoryMcpSpawn();
       const bb = this.#blackboardMcpSpawn();
       const reg = this.#registryMcpArgs();
+      const shellEnv = codexShellEnvExcludeArgs();
+      // Without the exclude, the proxy token would reach the commands codex runs.
+      const oauth = shellEnv ? this.#proxyMcpSpawn() : { args: [], env: {} };
+      if (!shellEnv) {
+        console.warn(
+          "[codeoid] codex: its config.toml couldn't be read here, so codeoid can't add its token variables to shell_environment_policy.exclude — OAuth MCP servers aren't mounted, and codeoid's memory/blackboard tokens rely on Codex's default excludes",
+        );
+      }
       this.#proc = new CodexRpcProcess({
         command: this.#command,
         argsPrefix: this.#argsPrefix,
-        args: [...mcp.args, ...bb.args, ...reg.args],
+        args: [...mcp.args, ...bb.args, ...reg.args, ...oauth.args, ...(shellEnv ?? [])],
         cwd: opts.workdir,
-        env: { ...buildCodexEnv(), ...mcp.env, ...bb.env, ...reg.env },
+        // The account's own CODEX_HOME (an overlay sharing everything but its
+        // auth.json), applied last so nothing re-adds a daemon key.
+        // The caller's extra env goes on last (withExtraEnv refuses anything
+        // credential- or home-shaped, so the account stays the account).
+        env: withExtraEnv(
+          await applyCodexAccount(
+            this.#resolveAccount?.() ?? null,
+            { ...buildCodexEnv(), ...mcp.env, ...bb.env, ...reg.env, ...oauth.env },
+            { command: this.#command, argsPrefix: this.#argsPrefix },
+          ),
+          this.#extraEnv,
+        ),
         onNotification: (method, params) => this.#onNotification(method, params),
         onServerRequest: (method, params) => this.#onServerRequest(method, params),
         onExit: ({ code, signal, stderrTail }) => {
@@ -599,39 +899,105 @@ export class CodexProvider implements SessionProvider {
       this.#proc.notify("initialized");
     }
 
-    // Resume the prior thread when the backing id looks like one codex
-    // minted; otherwise (first run: backing id is the codeoid session id)
-    // start fresh. Resume failure degrades to a fresh thread — never wedge.
-    if (this.#backingSessionId !== this.#sessionId) {
+    if (this.#pendingNative) {
+      // A native continuation (#387) creates the thread itself; if it fails,
+      // a fresh thread below takes the transcript instead.
+      const native = await this.#applyPendingNative(opts);
+      if (native) {
+        this.#adoptThread(native);
+        await this.#reportModelsOnce();
+        return;
+      }
+    } else if (this.#backingSessionId !== this.#sessionId) {
+      // Resume the prior thread when the backing id looks like one codex
+      // minted; otherwise (first run: backing id is the codeoid session id)
+      // start fresh. Resume failure degrades to a fresh thread — never wedge.
       try {
         const resumed = (await this.#proc.request("thread/resume", {
           threadId: this.#backingSessionId,
-        })) as { thread?: { id?: string } };
+        })) as { thread?: { id?: string }; model?: string };
         if (resumed.thread?.id) {
           this.#threadId = resumed.thread.id;
+          this.#threadModel = resumed.model ?? null;
+          this.#configEffort = undefined;
           return;
         }
       } catch {
         /* fall through to thread/start */
       }
-    }
-    const { approvalPolicy, sandboxMode } = codexPolicies(opts.mode);
-    const started = (await this.#proc.request("thread/start", {
-      cwd: opts.workdir,
-      approvalPolicy,
-      sandboxPolicy: sandboxPolicyWire(sandboxMode, opts.workdir),
-      ...(opts.systemPromptAppend ? { developerInstructions: opts.systemPromptAppend } : {}),
-    })) as { thread?: { id?: string } };
-    if (!started.thread?.id) throw new Error("codex thread/start returned no thread id");
-    this.#threadId = started.thread.id;
-    this.#backingSessionId = started.thread.id;
-
-    if (!this.#modelsReported && this.#onModels) {
-      const models = await this.listModels();
-      if (models.length > 0) {
-        this.#modelsReported = true;
-        this.#onModels(models.map((m) => ({ value: m.id, displayName: m.displayName, description: m.description })));
+      // The thread is gone (another account's home, a pruned rollout): a
+      // fresh one must not start the conversation over — take the history.
+      // Unless the session already queued what this thread gets (a switch,
+      // rewind or overflow retry chose a transcript or a session map, sized
+      // for the model): that is never overwritten.
+      if (this.#pendingHistorySeed === null) {
+        console.warn(`[codex-provider ${this.#sessionId.slice(0, 8)}] couldn't resume thread ${this.#backingSessionId} — continuing from codeoid's history`);
+        this.onHistoryLost?.();
       }
+    }
+    const started = (await this.#proc.request("thread/start", threadConfig(opts))) as { thread?: { id?: string }; model?: string };
+    if (!started.thread?.id) throw new Error("codex thread/start returned no thread id");
+    this.#threadModel = started.model ?? null;
+    // codex reads its config afresh for each thread; so does Default's baseline.
+    this.#configEffort = undefined;
+    this.#adoptThread(started.thread.id);
+    await this.#reportModelsOnce();
+  }
+
+  /**
+   * Make `id` the session's thread, and remember it: a restart resumes the
+   * thread only if its id was saved. (It wasn't, before #387 — every restart
+   * quietly started an empty thread.)
+   */
+  #adoptThread(id: string): void {
+    // Torn down while the reply was in flight (a backend switch): this thread
+    // is no longer the session's, and must not overwrite its backing id.
+    if (!this.#proc) return;
+    this.#threadId = id;
+    if (this.#backingSessionId === id) return;
+    this.#backingSessionId = id;
+    try {
+      // The column predates multi-provider naming: "the backend's session id".
+      this.#store.setClaudeCodeSessionId(this.#sessionId, id);
+    } catch (err) {
+      console.error(`[codex-provider ${this.#sessionId.slice(0, 8)}] failed to persist thread id: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  async #reportModelsOnce(): Promise<void> {
+    if (this.#modelsReported || !this.#onModels) return;
+    const listed = await this.listModels();
+    // The model codex runs when none is chosen (#417): the user's configured
+    // one, else its catalog's default — so a picker shows that model's levels.
+    // A configured effort is what Default sends for every model: shown as theirs.
+    let configured: string | null = null;
+    let configuredEffort: EffortLevel | null = null;
+    try {
+      const read = (await this.#proc!.request("config/read", {})) as { config?: { model?: string | null; model_reasoning_effort?: string | null } };
+      configured = read.config?.model ?? null;
+      configuredEffort = fromCodexEffort(read.config?.model_reasoning_effort ?? undefined);
+    } catch {
+      // Unknown: the catalog's own default stands.
+    }
+    // A configured model the catalog doesn't list: no row is the one codex runs.
+    const models = listed.map((m) => ({
+      ...m,
+      isDefault: configured ? m.id === configured : m.isDefault === true,
+      // ...for a model that takes it (one that doesn't: codex adjusts; its own default is the best guess).
+      ...(configuredEffort && (!m.efforts || m.efforts.includes(configuredEffort)) ? { defaultEffort: configuredEffort } : {}),
+    }));
+    if (models.length > 0) {
+      this.#modelsReported = true;
+      this.#onModels(
+        models.map((m) => ({
+          value: m.id,
+          displayName: m.displayName,
+          description: m.description,
+          ...(m.efforts ? { efforts: m.efforts } : {}),
+          ...(m.defaultEffort ? { defaultEffort: m.defaultEffort } : {}),
+          ...(m.isDefault ? { isDefault: true } : {}),
+        })),
+      );
     }
   }
 
@@ -824,6 +1190,11 @@ export class CodexProvider implements SessionProvider {
             ? { contextWindow: this.#modelContextWindow }
             : {}),
           stopReason: (turn?.status as string | undefined) ?? undefined,
+          // Where this turn ends in the thread, for a native fork there (#387).
+          // Only a completed turn: a failed one would carry the failure over.
+          ...(this.#threadId && typeof turn?.id === "string" && turn.status === "completed"
+            ? { nativeRef: { backingId: this.#threadId, ref: turn.id } }
+            : {}),
         };
         this.#push({ type: "turn_done", result });
         this.#turnQueue?.close();
@@ -850,7 +1221,8 @@ export class CodexProvider implements SessionProvider {
         // the literal "[object Object]" — the cause destroyed at the one place
         // it was supposed to be reported. Observed live: a role-child failed
         // twice with `Error: [object Object]` and nothing anywhere said why.
-        this.#push({ type: "error", message: `codex: ${describeCodexError(params)}` });
+        const detail = codexErrorDetail(params);
+        this.#push({ type: "error", message: `codex: ${describeCodexError(params)}`, ...(detail ? { detail } : {}) });
         break;
       }
       default:
@@ -1162,4 +1534,15 @@ function codexItemToTool(
 function extractItemOutput(item: Record<string, unknown>): string {
   const out = item.aggregatedOutput ?? item.output ?? item.result ?? item.text ?? "";
   return typeof out === "string" ? out : JSON.stringify(out);
+}
+
+/** codeoid's effort scale in codex's terms (#417): Off is its "none"; the rest share names. */
+export function toCodexEffort(effort: EffortLevel): string {
+  return effort === "off" ? "none" : effort;
+}
+
+/** A codex reasoning effort on codeoid's scale, or null for one codeoid has no level for. */
+export function fromCodexEffort(effort: string | undefined): EffortLevel | null {
+  if (effort === "none") return "off";
+  return effort && (EFFORT_LEVELS as readonly string[]).includes(effort) ? (effort as EffortLevel) : null;
 }

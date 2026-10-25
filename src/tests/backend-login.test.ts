@@ -16,13 +16,14 @@
  */
 
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   BackendLoginBroker,
   BackendLoginError,
   CLAUDE_LOGIN_FLOW,
+  CODEX_LOGIN_FLOW,
   type LoginFlow,
   redact,
 } from "../daemon/auth/backend-login.js";
@@ -39,7 +40,7 @@ let evilCmd: string;
 let pidFile: string;
 
 beforeAll(() => {
-  dir = mkdtempSync(join(tmpdir(), "codeoid-login-"));
+  dir = mkdtempSync(join(tmpdir(), "codeoid-logintest-"));
   fakeCmd = join(dir, "fake-login.sh");
   pidFile = join(dir, "pid");
   // Note the two copies of the URL: the OSC-8 hyperlink carries it whole, the
@@ -339,3 +340,194 @@ async function waitUntil(cond: () => boolean, timeoutMs: number): Promise<void> 
     await new Promise((r) => setTimeout(r, 50));
   }
 }
+
+describe("isolated login (a named Claude account)", () => {
+  test("runs against a throwaway config dir with no inherited credential, and removes it afterwards", async () => {
+    const seen = join(dir, "isolated-seen");
+    const cmd = join(dir, "isolated-login.sh");
+    writeFileSync(
+      cmd,
+      `#!/usr/bin/env bash
+printf '%s|%s\\n' "\${CLAUDE_CONFIG_DIR:-unset}" "\${ANTHROPIC_API_KEY:-none}" > "${seen}"
+printf '%s\\n' "${URL_}"
+read -r code
+echo "Your token: ${TOKEN}"
+`,
+      "utf8",
+    );
+    chmodSync(cmd, 0o755);
+    const saved = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "daemon-key-must-not-leak";
+    try {
+      const broker = newBroker(fakeFlow({ resolve: () => ({ file: cmd, args: [] }) }));
+      const login = await broker.start("claude", { isolated: true });
+      const [configDir, apiKey] = readFileSync(seen, "utf8").trim().split("|");
+      expect(configDir).toContain("codeoid-login-"); // never ~/.claude
+      expect(apiKey).toBe("none");
+      expect(existsSync(configDir!)).toBe(true);
+
+      const outcome = await broker.submit(login.loginId, "any-code");
+      expect(outcome.secret).toEqual({ key: "CLAUDE_CODE_OAUTH_TOKEN", value: TOKEN });
+      // Marked, so the daemon never writes it where its own login lives.
+      expect(outcome.isolated).toBe(true);
+      expect(existsSync(configDir!)).toBe(false); // cleaned up with the attempt
+    } finally {
+      if (saved === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = saved;
+    }
+  });
+
+  test("a stale isolated dir a crashed daemon left behind is swept; a fresh one is not", () => {
+    const stale = mkdtempSync(join(tmpdir(), "codeoid-claude-login-"));
+    const fresh = mkdtempSync(join(tmpdir(), "codeoid-claude-login-"));
+    const old = new Date(Date.now() - 60 * 60_000);
+    utimesSync(stale, old, old);
+    newBroker();
+    expect(existsSync(stale)).toBe(false);
+    expect(existsSync(fresh)).toBe(true);
+    rmSync(fresh, { recursive: true, force: true });
+  });
+});
+
+describe("file-credential logins (Codex device code)", () => {
+  const script = (name: string, body: string) => {
+    const file = join(dir, name);
+    writeFileSync(file, `#!/usr/bin/env bash\n${body}\n`, "utf8");
+    chmodSync(file, 0o755);
+    return file;
+  };
+
+  test("a Codex device login shows the link and code, finishes on its own, and hands back auth.json", async () => {
+    const seen = join(dir, "codex-seen");
+    const cmd = script(
+      "codex-device.sh",
+      `printf '%s|%s\\n' "\${CODEX_HOME:-unset}" "\${OPENAI_API_KEY:-none}" > "${seen}"
+echo "1. Open this link in your browser and sign in to your account"
+echo "   https://auth.openai.com/codex/device"
+echo "2. Enter this one-time code (expires in 15 minutes)"
+echo "   8UP4-KHOLU"
+sleep 1
+printf '{"auth_mode":"chatgpt","tokens":{"access_token":"at-secret"}}' > "$CODEX_HOME/auth.json"
+echo "Successfully logged in"`,
+    );
+    const saved = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = "daemon-key-must-not-leak";
+    try {
+      const broker = newBroker({ codex: { ...CODEX_LOGIN_FLOW, resolve: () => ({ file: cmd, args: [] }) } });
+      // Codex sign-in is for a named account only.
+      await expect(broker.start("codex")).rejects.toThrow(/named account/);
+      const login = await broker.start("codex", { isolated: true });
+      expect(login).toMatchObject({ mode: "device", userCode: "8UP4-KHOLU", verificationUrl: "https://auth.openai.com/codex/device" });
+      const [home, key] = readFileSync(seen, "utf8").trim().split("|");
+      expect(home).toContain("codeoid-login-");
+      expect(key).toBe("none");
+      const outcome = await broker.wait(login.loginId);
+      expect(outcome.ok).toBe(true);
+      expect(outcome.isolated).toBe(true);
+      expect(outcome.files?.["auth.json"]).toContain("at-secret");
+      expect(existsSync(home!)).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = saved;
+    }
+  });
+
+  test("a Codex device login that exits without a credential fails", async () => {
+    const cmd = script(
+      "codex-fail.sh",
+      `echo "   https://auth.openai.com/codex/device"
+echo "   ABCD-EFGHI"
+sleep 0.5
+echo "Error logging in: device code expired"
+exit 1`,
+    );
+    const broker = newBroker({ codex: { ...CODEX_LOGIN_FLOW, resolve: () => ({ file: cmd, args: [] }) } });
+    const login = await broker.start("codex", { isolated: true });
+    const outcome = await broker.wait(login.loginId);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.error).toMatch(/Error logging in/);
+  });
+});
+
+describe("script(1)'s stdin is an ordinary pipe — not a socket, not a named pipe", () => {
+  test.skipIf(process.platform !== "linux")("a script that refuses anything else (BSD script on macOS) still prints the link and takes the code", async () => {
+    // Stand-in for macOS's BSD script: its failure on any stdin but an
+    // ordinary pipe, otherwise the real script. Bun hands a child a
+    // socketpair for "pipe" stdio, which broke sign-in on macOS (#411); recent
+    // macOS refuses a named pipe the same way, which broke #411's fix. On
+    // Linux an ordinary pipe reads as "pipe:[…]" in /proc; a FIFO as its path.
+    const realScript = Bun.which("script");
+    expect(realScript).toBeTruthy();
+    const bin = join(dir, "bsd-like-bin");
+    const { mkdirSync } = await import("node:fs");
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(
+      join(bin, "script"),
+      `#!/bin/sh\ncase "$(readlink /proc/$$/fd/0)" in pipe:*) ;; *) echo "script: tcgetattr/ioctl: Operation not supported on socket" >&2; exit 1;; esac\nexec "${realScript}" "$@"\n`,
+      "utf8",
+    );
+    chmodSync(join(bin, "script"), 0o755);
+    const savedPath = process.env.PATH;
+    process.env.PATH = `${bin}:${savedPath}`;
+    try {
+      const broker = newBroker();
+      const login = await broker.start("claude");
+      expect(login.verificationUrl).toBe(URL_);
+      const outcome = await broker.submit(login.loginId, GOOD_CODE);
+      expect(outcome).toMatchObject({ ok: true, secret: { key: "CLAUDE_CODE_OAUTH_TOKEN", value: TOKEN } });
+    } finally {
+      process.env.PATH = savedPath;
+    }
+  });
+});
+
+describe("a real code and a real token — long ones", () => {
+  // Stand-in modelled on the real CLI's terminal UI: raw keystrokes, where a
+  // chunk arriving at once is a paste and an Enter inside it is text (the
+  // code never submits), and output wrapped at the terminal's width — 80
+  // columns when the pty reports none. Real codes are ~130 characters and
+  // real tokens ~108, so both are long enough to hit each.
+  const LONG_CODE = `${"c".repeat(124)}#state`;
+  const LONG_TOKEN = `sk-ant-oat01-${"T".repeat(95)}`;
+  let tuiCmd: string;
+
+  beforeAll(() => {
+    tuiCmd = join(dir, "fake-tui-login.ts");
+    writeFileSync(
+      tuiCmd,
+      `#!/usr/bin/env bun
+const width = process.stdout.columns || 80;
+const wrap = (text: string) => (text.match(new RegExp(\`.{1,\${width}}\`, "g")) ?? []).join("\\n");
+process.stdout.write(\`Browser didn't open? Use the url below to sign in\\n\${wrap("${URL_}")}\\nPaste code here if prompted > \`);
+process.stdin.setRawMode?.(true);
+let field = "";
+process.stdin.on("data", (chunk: Buffer) => {
+  const text = chunk.toString("utf8");
+  if (text === "\\r") {
+    if (field === "${LONG_CODE}") {
+      process.stdout.write("\\n" + wrap("Success! Your OAuth token: ${LONG_TOKEN}") + "\\n");
+      process.exit(0);
+    }
+    process.stdout.write("\\nOAuth error: Request failed with status code 400\\n");
+    field = "";
+    return;
+  }
+  // One chunk of several characters is a paste: an Enter in it is text.
+  field += text;
+});
+`,
+      "utf8",
+    );
+    chmodSync(tuiCmd, 0o755);
+  });
+
+  test("a long code is typed, then Enter pressed apart — it submits, and the whole token is kept", async () => {
+    const broker = newBroker(fakeFlow({ resolve: () => ({ file: tuiCmd, args: [] }) }));
+    const login = await broker.start("claude");
+    expect(login.verificationUrl).toBe(URL_);
+    const outcome = await broker.submit(login.loginId, LONG_CODE);
+    // Unwrapped: at 80 columns the token would be captured cut short.
+    expect(outcome).toMatchObject({ ok: true, secret: { key: "CLAUDE_CODE_OAUTH_TOKEN", value: LONG_TOKEN } });
+  }, 20_000);
+});
+

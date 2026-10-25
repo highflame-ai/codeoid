@@ -6,7 +6,7 @@
  * `send()` never throws — it resolves a `PushResult`.
  */
 import { signRs256 } from "./jwt.js";
-import { ALERT_BODY, ALERT_TITLE, type Device, type FcmCreds, type PushMessage, type PushChannel, type PushResult } from "./types.js";
+import { ALERT_TITLE, alertBody, type Device, type FcmCreds, type PushMessage, type PushChannel, type PushResult } from "./types.js";
 
 const OAUTH_URL = "https://oauth2.googleapis.com/token";
 const OAUTH_SCOPE = "https://www.googleapis.com/auth/firebase.messaging";
@@ -17,7 +17,7 @@ export function fcmMessageBody(token: string, msg: PushMessage): string {
   return JSON.stringify({
     message: {
       token,
-      notification: { title: ALERT_TITLE, body: ALERT_BODY },
+      notification: { title: ALERT_TITLE, body: alertBody(msg.kind) },
       // Opaque routing data only — no session content.
       data: { sessionId: msg.sessionId, kind: msg.kind },
       android: { priority: "high" },

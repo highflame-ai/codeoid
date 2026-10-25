@@ -29,8 +29,12 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: "/unpin", description: "Unpin a previously-pinned file" },
   { name: "/context", description: "Show detailed context-budget breakdown — or attach files if paths given" },
   { name: "/rotate", description: "Rotate the Claude Code backing session (fresh context, memory preserved)" },
+  { name: "/mcp", description: "/mcp reconnect <server> — redial a server that is down · /mcp refresh — use servers changed in Claude's config" },
   { name: "/search", description: "Search sessions (Ctrl-F) — keywords + semantic + recency; Tab toggles this workspace ↔ all" },
-  { name: "/model", description: "Switch the Claude model for this session (interactive picker, or /model <alias>)" },
+  { name: "/model", description: "Choose a model from this backend's catalog, or /model <id>" },
+  { name: "/effort", description: "How hard the model thinks: pick, or /effort off|low|…|max|default" },
+  { name: "/provider", description: "Choose a backend, or /provider <id> (including oai:<name>)" },
+  { name: "/account", description: "Choose this backend's account, or /account <name|default|--follow-default>" },
   { name: "/who", description: "Show the identity chain (user → agent → sub-agents)" },
   { name: "/help", description: "Show keybindings" },
 ];

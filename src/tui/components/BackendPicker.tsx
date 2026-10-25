@@ -1,0 +1,158 @@
+import React, { useEffect, useRef, useState } from "react";
+import { Box, Text, useInput } from "ink";
+import { EFFORT_LEVELS, type EffortLevel, type ProviderInfo } from "../../protocol/types.js";
+import { EFFORT_LABELS } from "@highflame/codeoid-core";
+import type { TuiWsClient } from "../ws.js";
+import { accountChoices } from "../accounts.js";
+
+export interface BackendChoice {
+  value: string;
+  label: string;
+  description?: string;
+}
+
+interface Props {
+  kind: "model" | "provider" | "account" | "effort";
+  provider: string;
+  /** For the effort picker: the session's model, whose levels are offered. */
+  model?: string;
+  /** For the effort picker: what Default means on the session, when the backend says. */
+  sessionDefaultEffort?: EffortLevel;
+  /** For the effort picker: the set level hasn't reached the backend yet. */
+  effortPending?: boolean;
+  /** Name of the session this picker changes, shown in the header. */
+  sessionName?: string;
+  current: string;
+  providers: ProviderInfo[];
+  client: TuiWsClient | null;
+  onPick: (value: string) => Promise<void>;
+  onCancel: () => void;
+}
+
+export function BackendPicker({ kind, provider, model, sessionDefaultEffort, effortPending, sessionName, current, providers, client, onPick, onCancel }: Props) {
+  const [choices, setChoices] = useState<BackendChoice[]>([]);
+  const [loading, setLoading] = useState(kind !== "provider");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [live, setLive] = useState(true);
+  const [revision, setRevision] = useState(0);
+  const [selected, setSelected] = useState(current);
+  const submitting = useRef(false);
+  // Esc closes the picker even mid-switch; the switch's late result must not
+  // touch state or close whatever dialog has opened since.
+  const mounted = useRef(true);
+  useEffect(() => () => { mounted.current = false; }, []);
+
+  useEffect(() => {
+    if (kind === "provider") return;
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    const load = async () => {
+      if (!client) throw new Error("Not connected");
+      if (kind === "effort") {
+        // The levels the model takes, when its backend says (#417); otherwise the whole scale.
+        const result = await client.listModels(provider);
+        if (cancelled) return;
+        const entry = result.models.find((m) => m.value === model) ?? (model ? undefined : result.models.find((m) => m.isDefault));
+        setChoices(effortChoices(entry?.efforts, sessionDefaultEffort ?? entry?.defaultEffort));
+        setLive(true);
+      } else if (kind === "model") {
+        const result = await client.listModels(provider);
+        if (cancelled) return;
+        setChoices(result.models.map((model) => ({
+          value: model.value,
+          label: model.displayName,
+          description: [model.value, model.contextWindow ? `${Math.round(model.contextWindow / 1000)}k context` : "", model.description].filter(Boolean).join(" · "),
+        })));
+        setLive(result.live);
+      } else {
+        // The accounts of the backend this picker was opened on — a
+        // credential entered for one backend is never offered to another.
+        const result = await client.listAccounts(provider);
+        if (cancelled) return;
+        setChoices(accountChoices(result));
+      }
+    };
+    void load().catch((cause: unknown) => {
+      if (!cancelled) setError(cause instanceof Error ? cause.message : String(cause));
+    }).finally(() => {
+      if (!cancelled) setLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [client, kind, provider, revision, model, sessionDefaultEffort]);
+
+  const options = kind === "provider"
+    ? providers.map((entry) => ({ value: entry.id, label: entry.displayName, description: entry.id }))
+    : choices;
+  const index = Math.max(0, options.findIndex((choice) => choice.value === selected));
+  const start = Math.max(0, Math.min(index - 3, options.length - 8));
+
+  useInput((input, key) => {
+    if (key.escape) { onCancel(); return; }
+    if (submitting.current) return;
+    if (input === "r" && !loading) { setRevision((value) => value + 1); return; }
+    if (loading) return;
+    if (key.upArrow || key.downArrow) {
+      const next = Math.max(0, Math.min(options.length - 1, index + (key.upArrow ? -1 : 1)));
+      if (options[next]) setSelected(options[next].value);
+    }
+    if (key.return && options[index]) {
+      submitting.current = true;
+      setBusy(true);
+      setError(null);
+      void onPick(options[index].value).then(() => {
+        if (mounted.current) onCancel();
+      }, (cause: unknown) => {
+        if (mounted.current) setError(cause instanceof Error ? cause.message : String(cause));
+      }).finally(() => {
+        submitting.current = false;
+        if (mounted.current) setBusy(false);
+      });
+    }
+  });
+
+  return (
+    <Box flexDirection="column" borderStyle="double" borderColor="cyan" paddingX={1}>
+      <Text bold color="cyan">Select {kind === "effort" ? "thinking effort" : kind}{kind !== "provider" ? ` (${provider})` : ""}{sessionName ? ` for ${sessionName}` : ""}</Text>
+      {kind === "effort" && effortPending && <Text dimColor>The current choice is pending: it lands with the next turn, or once background work ends (Stop ends it).</Text>}
+      {loading ? <Text dimColor>Loading…</Text> : options.slice(start, start + 8).map((choice, offset) => (
+        // A server may list an id twice: the position keeps keys unique.
+        <Box key={`${start + offset}:${choice.value}`} flexDirection="column">
+          <Text color={start + offset === index ? "cyan" : undefined}>
+            {start + offset === index ? "▸ " : "  "}{choice.label}{choice.value === current ? " ●" : ""}
+          </Text>
+          {choice.description && <Text dimColor wrap="truncate-end">  {choice.description}</Text>}
+        </Box>
+      ))}
+      {!loading && options.length === 0 && <Text dimColor>No choices available.{kind === "model" ? " Use /model <id> to enter a model directly." : ""}</Text>}
+      {/* Only an endpoint can be asked for its live list on demand; a
+          built-in backend reports its full catalog from inside a turn. */}
+      {!loading && kind === "model" && !live && <Text dimColor>{provider.startsWith("oai:")
+        // An endpoint's list is live unless its /models just failed.
+        ? "Couldn't reach the endpoint's /models — showing configured models; press r to retry."
+        : "Saved catalog — the current list appears after this backend's next turn."}</Text>}
+      {error && <Text color="red">{error}</Text>}
+      <Text dimColor>{busy ? "Switching… (Esc hides this; the switch still applies)" : "↑↓ navigate · Enter to select · r refresh · Esc cancel"}</Text>
+    </Box>
+  );
+}
+
+/**
+ * The effort picker's rows (#417): Default (the backend decides), then the
+ * levels the model takes — or the whole scale when its backend doesn't say,
+ * marked so: a level it refuses fails the turn with a note.
+ */
+export function effortChoices(efforts: readonly EffortLevel[] | undefined, defaultEffort?: EffortLevel): BackendChoice[] {
+  const unknown = efforts === undefined;
+  // A Default the model's known levels don't include isn't shown.
+  const shown = defaultEffort && (!efforts || efforts.includes(defaultEffort)) ? defaultEffort : undefined;
+  return [
+    { value: "default", label: "Default", description: shown ? `the backend decides (${EFFORT_LABELS[shown]})` : "the backend decides" },
+    ...(efforts ?? EFFORT_LEVELS).map((level) => ({
+      value: level,
+      label: EFFORT_LABELS[level],
+      ...(unknown ? { description: "support unknown for this model" } : {}),
+    })),
+  ];
+}

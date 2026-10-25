@@ -25,6 +25,19 @@ describe("stripVariantSuffix", () => {
 });
 
 describe("resolveAgainstList", () => {
+  it("passes a Bedrock model id or ARN through (a Bedrock account's ids aren't in the shared catalog)", () => {
+    for (const id of [
+      "us.anthropic.claude-opus-4-1-20250805-v1:0",
+      "global.anthropic.claude-sonnet-5",
+      "anthropic.claude-haiku-4-5-20251001-v1:0",
+      "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc123",
+    ]) {
+      expect(resolveAgainstList(id, live)).toBe(id);
+    }
+    expect(resolveAgainstList("us.openai.gpt-9", live)).toBeNull();
+    expect(resolveAgainstList("anthropic.claude-", live)).toBeNull();
+  });
+
   it("matches an exact value", () => {
     expect(resolveAgainstList("opus[1m]", live)).toBe("opus[1m]");
     expect(resolveAgainstList("sonnet", live)).toBe("sonnet");

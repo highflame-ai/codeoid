@@ -28,7 +28,8 @@ import { fetchSettings, saveSettings, settingsState } from "../state/settings";
 import { relativeTime } from "../lib/format";
 import { BackendLoginPanel } from "./BackendLoginPanel";
 import { McpOAuthControls } from "./McpOAuthControls";
-import { LOGIN_CAPABLE_BACKENDS } from "../protocol/types";
+import { LOGIN_ACCOUNT_ONLY_BACKENDS } from "../protocol/types";
+import type { OwnLoginBackend } from "./BackendLoginPanel";
 import type {
   LoginBackend,
   McpServerStatus,
@@ -38,18 +39,36 @@ import type {
   SettingState,
   SettingValue,
 } from "../protocol/types";
+import { AccountsPanel, focusAccountsBackend } from "./AccountsPanel";
+import { EndpointsPanel } from "./EndpointsPanel";
 
 /**
- * A backend tab whose id names a backend codeoid can sign in interactively.
- * Returns the narrowed id (so the panel is typed) or `null` — every other tab
- * renders exactly as before.
+ * A backend tab whose id names a backend whose OWN (daemon-wide) login codeoid
+ * can run — Claude only. Returns the narrowed id (so the panel is typed) or
+ * `null` — every other tab renders exactly as before.
  */
-function isLoginBackend(tabId: string): LoginBackend | null {
-  return LOGIN_CAPABLE_BACKENDS.includes(tabId as LoginBackend) ? (tabId as LoginBackend) : null;
+function isOwnLoginBackend(tabId: string): OwnLoginBackend | null {
+  return tabId === "claude" ? tabId : null;
+}
+
+/**
+ * A backend that signs in only as a NAMED account (Codex: the daemon refuses
+ * a sign-in that would replace the machine's own login). Its
+ * tab points to Settings → Accounts instead of offering a sign-in that fails.
+ */
+function signsInAsAccount(tabId: string): boolean {
+  return LOGIN_ACCOUNT_ONLY_BACKENDS.includes(tabId as LoginBackend);
 }
 
 const [openSignal, setOpenSignal] = createSignal(false);
 const [activeTab, setActiveTab] = createSignal<string>("");
+
+/** Tabs that render their own panel instead of manifest fields. */
+const SYNTHETIC_TABS = [
+  { id: "accounts", icon: "⚿", title: "Accounts" },
+  { id: "endpoints", icon: "⇄", title: "OpenAI endpoints" },
+] as const;
+const isSyntheticTab = (id: string) => SYNTHETIC_TABS.some((t) => t.id === id);
 const [showAdvanced, setShowAdvanced] = createSignal(false);
 
 // Staged edits, keyed by field.key. A present key is a pending change; a `null`
@@ -60,6 +79,13 @@ const [dirty, setDirty] = createStore<Record<string, SettingValue>>({});
 export function openSettings(): void {
   setOpenSignal(true);
   void fetchSettings();
+}
+
+/** Open Settings → Accounts, showing `backend`'s accounts. */
+export function openAccountsSettings(backend: string): void {
+  focusAccountsBackend(backend);
+  setActiveTab("accounts");
+  openSettings();
 }
 
 export function closeSettings(): void {
@@ -180,6 +206,24 @@ const SettingsDrawer: Component = () => {
                   <span>MCP Servers</span>
                 </button>
               </Show>
+              {/* Synthetic tabs backed by their own messages, not the manifest:
+                  variable-length collections with write-only secrets. */}
+              <For each={SYNTHETIC_TABS}>
+                {(t) => (
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab(t.id)}
+                    class={`flex w-full items-center gap-2 border-l-2 px-3 py-1.5 text-left text-[13px] transition ${
+                      activeTab() === t.id
+                        ? "border-accent bg-bg-active/40 text-fg"
+                        : "border-transparent text-fg-muted hover:bg-bg-hover hover:text-fg"
+                    }`}
+                  >
+                    <span class="w-4 text-center">{t.icon}</span>
+                    <span>{t.title}</span>
+                  </button>
+                )}
+              </For>
             </nav>
 
             {/* Content */}
@@ -190,7 +234,13 @@ const SettingsDrawer: Component = () => {
               <Show when={activeTab() === "mcp"}>
                 <McpServersPanel servers={settingsState().snapshot?.mcpServers ?? []} />
               </Show>
-              <Show when={activeTab() !== "mcp" && tab()} keyed>
+              <Show when={activeTab() === "accounts"}>
+                <AccountsPanel />
+              </Show>
+              <Show when={activeTab() === "endpoints"}>
+                <EndpointsPanel />
+              </Show>
+              <Show when={activeTab() !== "mcp" && !isSyntheticTab(activeTab()) && tab()} keyed>
                 {(t) => (
                   <div>
                     <div class="mb-3 flex items-start justify-between gap-3">
@@ -220,8 +270,25 @@ const SettingsDrawer: Component = () => {
                     {/* Signing in is the primary path for a backend that has
                         one, so it sits above the fields — a pasted key is the
                         fallback, not the default. */}
-                    <Show when={isLoginBackend(t.id)} keyed>
+                    <Show when={isOwnLoginBackend(t.id)} keyed>
                       {(backend) => <BackendLoginPanel backend={backend} />}
+                    </Show>
+                    <Show when={signsInAsAccount(t.id)}>
+                      <section class="mb-5 flex items-center justify-between gap-3 rounded border border-border bg-bg-subtle/40 p-3">
+                        <p class="text-[11px] text-fg-muted">
+                          Sign in with {t.title} as a named account — the daemon's own login is never replaced.
+                        </p>
+                        <button
+                          type="button"
+                          class="shrink-0 rounded border border-accent/40 px-2.5 py-1 text-[11px] text-accent hover:bg-accent/10"
+                          onClick={() => {
+                            focusAccountsBackend(t.id);
+                            setActiveTab("accounts");
+                          }}
+                        >
+                          Accounts…
+                        </button>
+                      </section>
                     </Show>
 
                     <For each={t.groups}>

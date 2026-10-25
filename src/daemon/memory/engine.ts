@@ -13,7 +13,7 @@
 
 import type { Embedder } from "./embedder.js";
 import { normalize } from "./embedder.js";
-import type { SqliteEpisodeStore } from "./store.js";
+import type { SqliteEpisodeStore, WorkspaceTenant } from "./store.js";
 import { DEFAULT_WEIGHTS, rank, type RankerWeights } from "./ranker.js";
 import type { Reranker } from "./reranker.js";
 import { embedWindows, indexView } from "./lossless.js";
@@ -23,6 +23,15 @@ import type {
   RecallHit,
   RecallQuery,
 } from "./types.js";
+
+/**
+ * Where searchSessions() looks: one workspace, or — when `workspaceId` is absent
+ * — every workspace `tenant` owns. The union makes a tenant mandatory for the
+ * cross-workspace form, so no caller can search the whole store (#415).
+ */
+export type SearchSessionsScope =
+  | { workspaceId: string; tenant?: WorkspaceTenant }
+  | { workspaceId?: undefined; tenant: WorkspaceTenant };
 
 /**
  * One session in the results list returned by searchSessions() — contains
@@ -258,10 +267,17 @@ export class MemoryEngine {
     return hits.slice(0, limit);
   }
 
+  /** Record that `tenant` owns `workspaceId`, making the workspace reachable by
+   *  that tenant's cross-workspace retrieval. Idempotent; called by every session
+   *  at construction, before it writes its first episode. */
+  registerWorkspace(workspaceId: string, tenant: WorkspaceTenant): void {
+    this.#store.registerWorkspaceTenant(workspaceId, tenant);
+  }
+
   /**
    * Cross-workspace hybrid retrieval — the conductor's path. Unlike recall()
-   * (scoped to one workspace), this unions FTS + vector candidates across ALL
-   * workspaces and ranks them in a SINGLE batch, so the ranker's BM25
+   * (scoped to one workspace), this unions FTS + vector candidates across every
+   * workspace the caller's TENANT owns and ranks them in a SINGLE batch, so the ranker's BM25
    * min-max normalization is GLOBAL and scores are comparable across
    * workspaces. That fixes the small-workspace-domination failure a naive
    * per-workspace merge has (a small workspace's batch-relative scores no
@@ -269,12 +285,20 @@ export class MemoryEngine {
    */
   async recallGlobal(q: {
     query: string;
+    /** Whose workspaces to search. Required: one daemon can serve several
+     *  tenants, and nothing outside this tenant may be returned (#415). */
+    tenant: WorkspaceTenant;
     limit?: number;
     filePaths?: string[];
     /** Candidate pool per channel before ranking. Larger than the per-workspace
      * default so many sessions are represented across the whole corpus. */
     candidateK?: number;
   }): Promise<RecallHit[]> {
+    // Typed callers cannot omit it; refuse an untyped one rather than search
+    // the whole store.
+    if (!q.tenant?.accountId || !q.tenant.projectId) {
+      throw new Error("recallGlobal requires the caller's tenant");
+    }
     const limit = q.limit ?? 8;
     const candidateK = q.candidateK ?? Math.max(this.#ftsK, 100);
     const now = Date.now();
@@ -284,14 +308,15 @@ export class MemoryEngine {
         ? normalize((await this.#embedder.embed([q.query]))[0]!)
         : null;
 
-    // Global FTS candidates (all workspaces).
-    const ftsRows = this.#store.ftsSearchGlobal(q.query, candidateK);
+    // FTS candidates across the tenant's workspaces.
+    const ftsRows = this.#store.ftsSearchGlobal(q.query, candidateK, q.tenant);
     const ftsHits = new Map<string, number>(ftsRows.map((r) => [r.id, r.bm25]));
 
-    // Global vector candidates: cosine over every workspace's (in-sync) matrix.
+    // Vector candidates: cosine over each of the tenant's (in-sync) matrices.
+    const workspaces = new Set(this.#store.listWorkspaceIds(q.tenant));
     const vectorScores = new Map<string, number>();
     if (queryVector) {
-      for (const ws of this.#store.listWorkspaceIds()) {
+      for (const ws of workspaces) {
         bestWindowScores(this.#store.loadVectorMatrix(ws), queryVector, vectorScores);
       }
     }
@@ -300,7 +325,11 @@ export class MemoryEngine {
     const candidateIds = [...new Set([...ftsHits.keys(), ...vectorIds])];
     if (candidateIds.length === 0) return [];
 
-    const episodes = this.#store.episodesByIds(candidateIds);
+    // Both candidate channels are already tenant-scoped; re-check ownership on
+    // the rows themselves so a future candidate source cannot widen the result.
+    const episodes = this.#store
+      .episodesByIds(candidateIds)
+      .filter((e) => workspaces.has(e.workspaceId));
     const hits = rank(episodes, {
       queryVector,
       vectorScores,
@@ -339,10 +368,8 @@ export class MemoryEngine {
    * The log bonus rewards sessions that match broadly (many episodes) over
    * sessions that happen to contain a single high-score hit.
    */
-  async searchSessions(opts: {
+  async searchSessions(opts: SearchSessionsScope & {
     query: string;
-    /** Absent = cross-workspace (global) resolution — the conductor's path. */
-    workspaceId?: string;
     limit?: number;
     /** Episode-hit candidates to consider before grouping. */
     candidatePoolSize?: number;
@@ -366,8 +393,19 @@ export class MemoryEngine {
       (global ? Math.max(150, limit * 15) : Math.max(40, limit * 5));
     const snippetsPerSession = opts.snippetsPerSession ?? 3;
 
+    // A workspace given together with a tenant must belong to it, so a caller
+    // that forwards a client-supplied workspace id cannot cross tenants.
+    if (!global && opts.tenant && !this.#store.isWorkspaceOwnedBy(opts.workspaceId!, opts.tenant)) {
+      return [];
+    }
+
     const hits = global
-      ? await this.recallGlobal({ query: opts.query, limit: pool, candidateK: pool })
+      ? await this.recallGlobal({
+          query: opts.query,
+          tenant: opts.tenant!,
+          limit: pool,
+          candidateK: pool,
+        })
       : await this.recall({
           query: opts.query,
           workspaceId: opts.workspaceId!,

@@ -11,6 +11,7 @@ import { TuiWsClient } from "./ws.js";
 import { Prompt } from "./components/Prompt.js";
 import { StatusBar } from "./components/StatusBar.js";
 import { Modal } from "./components/Modal.js";
+import type { NewSessionOptions } from "./components/NewSessionModal.js";
 import { filterCommands } from "./components/SlashHint.js";
 import { fuzzyMatch, scanWorkspaceFiles } from "./file-scanner.js";
 import {
@@ -18,7 +19,10 @@ import {
   loadWorkspaceCommands,
   type WorkspaceCommand,
 } from "./workspace-commands.js";
-import type { Attachment } from "../protocol/types.js";
+import type { Attachment, EffortChangeResult, EffortLevel, McpReconnectResult, McpRefreshResult } from "../protocol/types.js";
+import { backendHasAccounts } from "../protocol/types.js";
+import { effortChangeSummary, mcpRefreshSummary, parseEffort } from "@highflame/codeoid-core";
+import type { TuiAction } from "./types.js";
 import { parseDialogAnswer } from "../terminal/dialog.js";
 import { formatRewind, parseForkArgs, parseUndoArgs } from "../terminal/rewind.js";
 import { formatCompare, parseCompareArgs } from "../terminal/compare.js";
@@ -31,11 +35,16 @@ import {
   type ScrollbackWriter,
 } from "./ansi/scrollback-writer.js";
 
+/** `/account` arguments that follow the backend's daemon default instead of naming an account. */
+const FOLLOW_DEFAULT_FLAGS = new Set(["--follow-default", "--follow"]);
+
 interface Props {
   config: CodeoidConfig;
+  /** Builds the daemon client. Tests inject a fake; production uses the default. */
+  createClient?: (config: CodeoidConfig, dispatch: React.Dispatch<TuiAction>) => TuiWsClient;
 }
 
-export function App({ config }: Props) {
+export function App({ config, createClient = (c, d) => new TuiWsClient(c, d) }: Props) {
   const { state, dispatch } = useTuiStore();
   const { exit } = useApp();
   const { stdout } = useStdout();
@@ -43,7 +52,7 @@ export function App({ config }: Props) {
 
   // Initialize WS client once.
   useEffect(() => {
-    const client = new TuiWsClient(config, dispatch);
+    const client = createClient(config, dispatch);
     wsRef.current = client;
     void client.start();
     return () => client.stop();
@@ -56,6 +65,9 @@ export function App({ config }: Props) {
   /** Per session, the comparison /compare last started or showed here (#357). */
   const lastCompareRef = useRef<Map<string, string>>(new Map());
   const prevConnectionRef = useRef(state.connection);
+  /** The open dialog as of the last render — for async results that must not act on a dialog the user closed. */
+  const modalRef = useRef(state.modal);
+  modalRef.current = state.modal;
   useEffect(() => {
     const client = wsRef.current;
     // The daemon drops all attachments when the socket closes (they're keyed
@@ -1037,6 +1049,49 @@ export function App({ config }: Props) {
         })().catch((err: Error) => dispatch({ type: "error", message: err.message }));
         return;
       }
+      case "/mcp": {
+        // /mcp reconnect <server> (#389). Anything else is Claude Code's own
+        // /mcp, which codeoid doesn't run: say so rather than send it as a prompt.
+        if (!client || !focusedSession) return;
+        // /mcp refresh (#395): apply Claude's current MCP config to the session.
+        if (args[0] === "refresh") {
+          const sid = focusedSession.info.id;
+          void client
+            .mcpRefresh(sid)
+            .then((resp) => {
+              if (resp.type === "response.error") {
+                dispatch({ type: "error", message: resp.error });
+                return;
+              }
+              if (resp.type !== "response.ok") return;
+              const r = resp.data as McpRefreshResult;
+              printLocalInfo(sid, mcpRefreshSummary(r));
+            })
+            .catch((err: Error) => dispatch({ type: "error", message: err.message }));
+          return;
+        }
+        const server = args.slice(1).join(" ").trim();
+        if (args[0] !== "reconnect" || !server) {
+          dispatch({ type: "error", message: "usage: /mcp reconnect <server> | /mcp refresh" });
+          return;
+        }
+        const sessionId = focusedSession.info.id;
+        void client
+          .mcpReconnect(sessionId, server)
+          .then((resp) => {
+            if (resp.type === "response.error") {
+              dispatch({ type: "error", message: resp.error });
+              return;
+            }
+            if (resp.type !== "response.ok") return;
+            const r = resp.data as McpReconnectResult;
+            // A connect is announced in the session itself; only say what didn't work.
+            if (r.deferred) printLocalInfo(sessionId, `${server}: the backend isn't running; it connects its servers when the next turn starts.`);
+            else if (r.status !== "connected") printLocalInfo(sessionId, `${server}: ${r.status}${r.error ? ` — ${r.error}` : ""}`);
+          })
+          .catch((err: Error) => dispatch({ type: "error", message: err.message }));
+        return;
+      }
       case "/rotate": {
         if (!client || !focusedSession) return;
         void client.rotate(focusedSession.info.id).catch((err: Error) =>
@@ -1054,25 +1109,67 @@ export function App({ config }: Props) {
         });
         return;
       }
-      case "/model": {
-        // No args → interactive picker modal. With an arg → direct switch
-        // (skip modal, trust the user knows the alias/id they want).
-        if (args.length === 0) {
-          dispatch({ type: "modal.open", modal: { kind: "model" } });
+      case "/effort": {
+        // Thinking effort (#417): bare opens the picker, else a level or "default".
+        if (!focusedSession || !client) {
+          dispatch({ type: "error", message: !focusedSession ? "No session focused" : "Not connected" });
           return;
         }
-        if (!client || !focusedSession) return;
-        const chosen = args[0]!;
-        void client
-          .setModel(focusedSession.info.id, chosen)
-          .then((resp) => {
-            if (resp.type === "response.error") {
-              dispatch({ type: "error", message: resp.error });
-            }
-          })
-          .catch((err: Error) =>
-            dispatch({ type: "error", message: err.message }),
-          );
+        const sessionId = focusedSession.info.id;
+        if (args.length === 0) {
+          dispatch({ type: "modal.open", modal: { kind: "effort", sessionId } });
+          return;
+        }
+        let effort: EffortLevel | null;
+        try {
+          effort = parseEffort(args[0]!);
+        } catch (e) {
+          dispatch({ type: "error", message: `Usage: ${e instanceof Error ? e.message : String(e)}` });
+          return;
+        }
+        void onSetEffort(sessionId, effort).catch((cause: unknown) => dispatch({ type: "error", message: cause instanceof Error ? cause.message : String(cause) }));
+        return;
+      }
+      case "/model":
+      case "/provider":
+      case "/account": {
+        if (!focusedSession) {
+          dispatch({ type: "error", message: "No session focused" });
+          return;
+        }
+        if (!client) {
+          dispatch({ type: "error", message: "Not connected" });
+          return;
+        }
+        const sessionId = focusedSession.info.id;
+        const backend = focusedSession.info.providerId ?? "claude";
+        if (cmd === "/account" && !backendHasAccounts(backend)) {
+          dispatch({ type: "error", message: `The ${backend} backend has no accounts. Use /provider to switch to one that does.` });
+          return;
+        }
+        // An account is always for the session's current backend; anything
+        // else (`--backend codex work`, two names) would otherwise be read
+        // as an account name.
+        if (cmd === "/account" && (args.length > 1 || (args[0]?.startsWith("-") && !FOLLOW_DEFAULT_FLAGS.has(args[0].toLowerCase())))) {
+          dispatch({ type: "error", message: "Usage: /account [<name> | default | --follow-default]" });
+          return;
+        }
+        // No args → interactive picker for this session. With an arg →
+        // direct switch (trust the user knows the id they want).
+        if (args.length === 0) {
+          dispatch({
+            type: "modal.open",
+            modal: cmd === "/account" ? { kind: "account", sessionId, backend } : { kind: cmd === "/model" ? "model" : "provider", sessionId },
+          });
+          return;
+        }
+        const value = cmd === "/model" ? args[0]! : args[0]!.toLowerCase();
+        const operation = cmd === "/model"
+          ? onSetModel(sessionId, value)
+          : cmd === "/provider"
+            ? onSetProvider(sessionId, value)
+            : onSetAccount(sessionId, FOLLOW_DEFAULT_FLAGS.has(value) ? "" : value, backend);
+        void operation.catch((cause: unknown) => dispatch({ type: "error", message: cause instanceof Error ? cause.message : String(cause) }));
         return;
       }
       default: {
@@ -1108,17 +1205,17 @@ export function App({ config }: Props) {
 
   // ── Modal handlers ─────────────────────────────────────────────────────
 
-  const onSubmitNewSession = (name: string, workdir: string) => {
+  const onSubmitNewSession = async (name: string, workdir: string, options: NewSessionOptions) => {
     const client = wsRef.current;
-    if (!client) return;
-    void client.createSession(name, workdir).then((resp) => {
-      if (resp.type === "response.ok" && resp.data) {
-        const info = resp.data as import("../protocol/types.js").SessionInfo;
-        dispatch({ type: "session.add", session: info });
-        dispatch({ type: "focus", sessionId: info.id });
-      }
-      dispatch({ type: "modal.close" });
-    });
+    if (!client) throw new Error("Not connected");
+    const resp = await client.createSession(name, workdir, options);
+    if (resp.type === "response.error") throw new Error(resp.error);
+    if (resp.type !== "response.ok" || !resp.data) throw new Error("Unexpected session creation response");
+    const info = resp.data as import("../protocol/types.js").SessionInfo;
+    dispatch({ type: "session.add", session: info });
+    // Esc'd while creating: the session still exists, but the user has moved
+    // on — don't yank focus (and their next Enter) over to it.
+    if (modalRef.current?.kind === "new-session") dispatch({ type: "focus", sessionId: info.id });
   };
 
   const onSelectSession = (sessionId: string) => {
@@ -1166,12 +1263,44 @@ export function App({ config }: Props) {
    * forward the user's choice. Surfaces server errors (unknown id) so
    * the modal can show them inline.
    */
-  const onSetModel = async (model: string): Promise<void> => {
+  const onSetModel = async (sessionId: string, model: string): Promise<void> => {
     const client = wsRef.current;
-    if (!client || !focusedSession) return;
-    const resp = await client.setModel(focusedSession.info.id, model);
+    if (!client) throw new Error("Not connected");
+    const resp = await client.setModel(sessionId, model);
     if (resp.type === "response.error") {
       throw new Error(resp.error);
+    }
+  };
+
+  const onSetEffort = async (sessionId: string, effort: EffortLevel | null): Promise<void> => {
+    const client = wsRef.current;
+    if (!client) throw new Error("Not connected");
+    const resp = await client.setEffort(sessionId, effort);
+    if (resp.type === "response.error") throw new Error(resp.error);
+    if (resp.type === "response.ok") printLocalInfo(sessionId, effortChangeSummary(resp.data as EffortChangeResult));
+  };
+
+  const onSetProvider = async (sessionId: string, providerId: string): Promise<void> => {
+    const client = wsRef.current;
+    if (!client) throw new Error("Not connected");
+    const response = await client.setProvider(sessionId, providerId);
+    if (response.type === "response.error") throw new Error(response.error);
+  };
+
+  /**
+   * "" = follow `backend`'s daemon default (sent as null). The backend is the
+   * one the user saw when choosing, so a backend switch racing the choice
+   * can't move a name onto another backend's accounts.
+   */
+  const onSetAccount = async (sessionId: string, account: string, backend: string): Promise<void> => {
+    const client = wsRef.current;
+    if (!client) throw new Error("Not connected");
+    const response = await client.setAccount(sessionId, account || null, backend);
+    if (response.type === "response.error") {
+      // The picker may have closed meanwhile (the session moved backend):
+      // say what happened to a pick nobody is looking at any more.
+      if (modalRef.current?.kind !== "account") dispatch({ type: "error", message: `${backend} account not changed: ${response.error}` });
+      throw new Error(response.error);
     }
   };
 
@@ -1229,6 +1358,7 @@ export function App({ config }: Props) {
           onHistoryCycle={(dir) => dispatch({ type: "history.cycle", direction: dir })}
           hint={promptHint}
           disabled={!focusedSession && !inSlashMode}
+          inputActive={!state.modal}
           slashSelectedIdx={slashIdx}
           fileHint={
             inMentionMode && mention
@@ -1239,6 +1369,11 @@ export function App({ config }: Props) {
       </Box>
       {state.modal && (
         <Modal
+          // Keyed by kind only: a focus change (sessions.set on connect or
+          // reconnect) must not remount an open dialog and wipe its input.
+          key={state.modal.kind}
+          providers={state.providers}
+          client={wsRef.current}
           modal={state.modal}
           sessions={orderedSessions}
           focusedSession={focusedSession}
@@ -1248,6 +1383,9 @@ export function App({ config }: Props) {
           onCancel={onCancelModal}
           onSearch={onSearch}
           onSetModel={onSetModel}
+          onSetEffort={onSetEffort}
+          onSetProvider={onSetProvider}
+          onSetAccount={onSetAccount}
         />
       )}
     </>

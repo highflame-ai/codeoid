@@ -25,7 +25,7 @@ import {
   tool,
   type McpSdkServerConfigWithInstance,
 } from "@anthropic-ai/claude-agent-sdk";
-import type { MemoryEngine } from "./memory/index.js";
+import type { MemoryEngine, WorkspaceTenant } from "./memory/index.js";
 import {
   FLEET_READ_TOOLS,
   FLEET_SEND_TOOLS,
@@ -51,7 +51,7 @@ export interface FleetSessionView {
 /** A dispatch task as the conductor sees it on the fleet_tasks board. */
 export interface FleetTaskView {
   id: string;
-  kind: "send" | "spawn";
+  kind: "send" | "spawn" | "attempt";
   shape: "ship" | "scout";
   status: string;
   attempts: number;
@@ -111,6 +111,9 @@ export interface FleetDispatchDeps {
 }
 
 export interface FleetDeps {
+  /** The tenant these tools act for. Every memory query is scoped to it — the
+   *  memory store spans every tenant on the daemon (#415). */
+  tenant: WorkspaceTenant;
   /** Tenant-scoped session snapshot (the manager closes over auth). */
   listSessions(): FleetSessionView[];
   /** Memory engine — powers fleet_find / fleet_summary / fleet_recall. */
@@ -239,7 +242,8 @@ export function createFleetHandlers(deps: FleetDeps) {
       const hits = (
         await deps.memory.searchSessions({
           query: args.query,
-          // workspaceId absent = cross-workspace global resolution (P1).
+          // No workspaceId = every workspace this tenant owns (P1).
+          tenant: deps.tenant,
           limit: Math.min(args.limit ?? 5, MAX_LIMIT) + 1,
           sessionNames,
         })
@@ -288,6 +292,7 @@ export function createFleetHandlers(deps: FleetDeps) {
       const sessionNames = new Map(deps.listSessions().map((s) => [s.id, s.name]));
       const hits = await deps.memory.recallGlobal({
         query: args.query,
+        tenant: deps.tenant,
         limit: Math.min(args.limit ?? 6, MAX_LIMIT),
       });
       if (hits.length === 0) return `Nothing recalled for "${args.query}".`;

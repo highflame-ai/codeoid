@@ -65,6 +65,7 @@ export function canonicalFromTranscript(messages: readonly DaemonMessage[], prov
         ...(thinking ? { thinking } : {}),
         providerId,
         model: "unknown",
+        restored: true,
       });
     }
     text = [];

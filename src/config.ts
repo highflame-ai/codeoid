@@ -14,12 +14,15 @@
  *      the parsed config, not env vars, so we can mock cleanly in tests.
  */
 
-import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, chmodSync } from "node:fs";
+import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, chmodSync, rmSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { join, isAbsolute, resolve, dirname } from "node:path";
 import { homedir } from "node:os";
 import { z } from "zod";
+import { EFFORT_LEVELS, type EffortLevel } from "./protocol/types.js";
 import type { AuthConfig } from "./daemon/auth.js";
 import type { OAuthConfig } from "./daemon/oauth.js";
+import type { WorktreeSetupPolicy } from "./daemon/workspace-setup.js";
 import {
   isLoopbackHost,
   LOCAL_TOKEN_ENV,
@@ -371,6 +374,12 @@ const SessionSchema = z
     defaultModel: z.string().optional(),
     fallbackModel: z.string().optional(),
     /**
+     * Thinking effort for a session created without one (#417), on codeoid's
+     * scale; each backend maps it (docs/thinking-effort.md). Unset = the
+     * backend's own default.
+     */
+    defaultEffort: z.enum(EFFORT_LEVELS).optional(),
+    /**
      * Hard backstop against a wedged turn. If the provider event stream goes
      * completely silent (no events at all) for this many ms while the MODEL
      * should be producing output (status "thinking"), the turn is treated as
@@ -446,6 +455,13 @@ const SessionSchema = z
     seedBudgetChars: z.number().int().min(0).default(0),
     seedCharsPerToken: z.number().positive().default(2),
     seedWindowFraction: z.number().gt(0).lt(1).default(0.7),
+    /**
+     * Hand the conversation to backends that can take it in their own form
+     * (#387) — Claude and Codex fork their own conversation at the turn, or
+     * take native history codeoid builds — instead of the transcript above.
+     * The transcript is still the fallback. Off = transcript everywhere.
+     */
+    nativeContinuation: z.boolean().default(true),
   })
   .default({
     turnStallTimeoutMs: 300_000,
@@ -455,6 +471,7 @@ const SessionSchema = z
     seedBudgetChars: 0,
     seedCharsPerToken: 2,
     seedWindowFraction: 0.7,
+    nativeContinuation: true,
   })
   // Enforce the "SDK signals first" contract across BOTH fields — not just the
   // defaults. An env override / config file could otherwise set the MCP timeout
@@ -600,6 +617,12 @@ const DispatchSchema = z
     workerToolBudget: z.number().int().min(1).default(50),
     /** Base retry backoff (ms) for retryable failures — doubles per attempt, capped at leaseMs. */
     retryBaseMs: z.number().int().min(0).default(15_000),
+    /**
+     * Longest a loop attempt may stay `held` on an approval (ms). A held attempt
+     * keeps its worker session and occupies a `maxConcurrentWorkers` slot, so
+     * past this the hold lapses and the attempt settles as reclaimed.
+     */
+    holdMaxMs: z.number().int().min(60_000).default(2 * 60 * 60_000),
   })
   .default({
     enabled: true,
@@ -609,6 +632,36 @@ const DispatchSchema = z
     maxConcurrentWorkers: 2,
     workerToolBudget: 50,
     retryBaseMs: 15_000,
+    holdMaxMs: 2 * 60 * 60_000,
+  });
+
+/**
+ * Routines (docs/routines.md): scheduled and triggered agent runs. On by
+ * default — the engine does nothing until a routine exists, and every routine
+ * is created explicitly by its owner. The kill switch stops every routine at
+ * once without deleting any.
+ */
+const RoutinesSchema = z
+  .object({
+    enabled: z.boolean().default(true),
+    /** Scheduler cadence (ms). Fires land within about this of their time. */
+    tickMs: z.number().int().min(250).max(60_000).default(1_000),
+    /** Runs executing at once across all routines; the rest wait queued. */
+    maxConcurrentRuns: z.number().int().min(1).max(50).default(2),
+    /** Floor for `every` intervals and cron frequency, in seconds. */
+    minIntervalSeconds: z.number().int().min(60).max(86_400).default(60),
+    /** API fires accepted per routine per hour. */
+    apiFiresPerHour: z.number().int().min(1).max(10_000).default(30),
+    /** A scheduled fire later than this (the daemon was down) counts as missed. */
+    missedGraceSeconds: z.number().int().min(10).max(86_400).default(120),
+  })
+  .default({
+    enabled: true,
+    tickMs: 1_000,
+    maxConcurrentRuns: 2,
+    minIntervalSeconds: 60,
+    apiFiresPerHour: 30,
+    missedGraceSeconds: 120,
   });
 
 /**
@@ -873,7 +926,7 @@ export function resolveQwenBaseUrl(value: string | undefined): string | undefine
  * `url` (streamable-HTTP). `codeoid_memory` is a built-in entry and is NOT
  * declarable here.
  */
-const McpServerSchema = z
+export const McpServerSchema = z
   .object({
     // ── transport (inferred) ──
     /** stdio: launch this command. Mutually exclusive with `url`. */
@@ -1094,6 +1147,7 @@ const RootSchema = z.object({
   conductor: ConductorSchema,
   dispatch: DispatchSchema,
   mcpControl: McpControlSchema,
+  routines: RoutinesSchema,
   collaboration: CollaborationSchema,
   rateLimit: RateLimitSchema,
   pipeline: PipelineSchema,
@@ -1120,6 +1174,40 @@ const RootSchema = z.object({
       setup: z.string().optional(),
     })
     .default({}),
+  /** Worktrees codeoid creates (forks, compare, routines). */
+  worktree: z
+    .object({
+      /** The repository setup recipe, `.codeoid/setup.yaml` (src/daemon/workspace-setup.ts). */
+      setup: z
+        .object({
+          /** Whether a recipe's `command` may run. `never` (default) still copies
+           *  and shares files; `trusted-repos` runs it only while the recipe is
+           *  the one trusted in `trustedRepos`. Reading a recipe executes nothing. */
+          runCommands: z.enum(["never", "trusted-repos"]).default("never"),
+          /** Trusted recipes, written by `codeoid worktree trust`: the primary
+           *  checkout and the recipe's git blob id (a changed recipe runs no
+           *  command until trusted again). A bare path is the older shape and
+           *  trusts no command. Paths are absolute. */
+          trustedRepos: z
+            .array(
+              z.union([
+                z.string().min(1).refine(isAbsolute, "must be an absolute path"),
+                z
+                  .object({
+                    path: z.string().min(1).refine(isAbsolute, "must be an absolute path"),
+                    recipeHash: z.string().regex(/^[0-9a-f]{40,64}$/, "must be a git blob id"),
+                    /** Who trusted it: honoured only for that owner's sessions. Absent = every owner. */
+                    trustedBy: z.string().min(1).max(512).optional(),
+                  })
+                  .strict(),
+              ]),
+            )
+            .max(256)
+            .default([]),
+        })
+        .default({ runCommands: "never", trustedRepos: [] }),
+    })
+    .default({ setup: { runCommands: "never", trustedRepos: [] } }),
 });
 
 type ParsedConfig = z.infer<typeof RootSchema>;
@@ -1130,6 +1218,9 @@ type ParsedConfig = z.infer<typeof RootSchema>;
  * Flattened, path-resolved config consumed by the daemon + client. Shape is
  * append-only — add new fields here, don't rename existing ones.
  */
+/** Parsed `routines` block (see RoutinesSchema). */
+export type RoutinesConfigBlock = z.infer<typeof RoutinesSchema>;
+
 /** Parsed `mcpControl` block (see McpControlSchema). */
 export type McpControlConfig = z.infer<typeof McpControlSchema>;
 
@@ -1229,6 +1320,8 @@ export interface CodeoidConfig {
     defaultProvider?: string;
     defaultModel?: string;
     fallbackModel?: string;
+    /** Thinking effort for a new session (#417); unset = the backend's default. */
+    defaultEffort?: EffortLevel;
     /** Stall watchdog: ms of event-stream silence while the model should be generating before a turn is force-recovered (0 = off; paused during tool execution and pending approvals). Defaults to 300000 when omitted. */
     turnStallTimeoutMs?: number;
     /** Per-call timeout (ms) for external MCP servers, surfaced as the SDK's per-server `timeout`. 0 = use SDK default. Defaults to 120000 when omitted. */
@@ -1250,6 +1343,8 @@ export interface CodeoidConfig {
     seedCharsPerToken?: number;
     /** Fraction (0..1) of the target window the history seed may fill. Defaults to 0.7 when omitted. */
     seedWindowFraction?: number;
+    /** Continue forks / switches / rewinds in the backend's own conversation where it can (#387). Default true. */
+    nativeContinuation?: boolean;
   };
   /**
    * The per-tenant conductor session (fleet supervisor). Optional in the
@@ -1271,6 +1366,16 @@ export interface CodeoidConfig {
     setup?: string;
   };
   /**
+   * Worktrees codeoid creates. `setup` is the trust policy for the
+   * repository's `.codeoid/setup.yaml` recipe (workspace-setup.ts): its
+   * files are always applied; its command runs only under
+   * `runCommands: "trusted-repos"` for a recipe pinned in `trustedRepos`.
+   * Optional in the type; loadConfig fills it.
+   */
+  worktree?: {
+    setup: WorktreeSetupPolicy;
+  };
+  /**
    * Send-class dispatch queue (P4). Optional in the type so hand-built test
    * configs stay minimal; loadConfig always populates it. Absent = enabled
    * with defaults.
@@ -1290,6 +1395,11 @@ export interface CodeoidConfig {
    * type so hand-built test configs stay minimal; absent = disabled.
    */
   mcpControl?: McpControlConfig;
+  /**
+   * Routines (see RoutinesSchema). Optional in the type so hand-built test
+   * configs stay minimal; absent = the defaults (enabled).
+   */
+  routines?: RoutinesConfigBlock;
   dispatch?: {
     enabled: boolean;
     tickMs: number;
@@ -1298,6 +1408,8 @@ export interface CodeoidConfig {
     maxConcurrentWorkers: number;
     workerToolBudget: number;
     retryBaseMs: number;
+    /** Longest a loop attempt may stay held (ms). Optional for hand-built configs; default 2h. */
+    holdMaxMs?: number;
   };
   /**
    * Collaborative-session bounds (see CollaborationSchema). Optional in the
@@ -1469,6 +1581,7 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   { env: "CODEOID_AUTO_ROTATE_MIN_TURNS", path: "autoRotate.minTurnsBeforeRotate", kind: "int" },
   { env: DEFAULT_PROVIDER_ENV, path: "session.defaultProvider", kind: "string" },
   { env: "CODEOID_DEFAULT_MODEL", path: "session.defaultModel", kind: "string" },
+  { env: "CODEOID_DEFAULT_EFFORT", path: "session.defaultEffort", kind: "string" },
   { env: "CODEOID_MCP_OAUTH_REDIRECT_BASE_URL", path: "mcpOAuth.redirectBaseUrl", kind: "string" },
   // Dispatch kill switch — disable send-class fleet dispatch per-invocation
   // without touching config.json. Other dispatch knobs are file-config only,
@@ -1477,6 +1590,10 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   // Control-plane MCP switches — per-invocation, e.g. a CI runner that turns
   // the endpoint on for one job. The rest of the block is file-config only.
   { env: "CODEOID_MCP_CONTROL_ENABLED", path: "mcpControl.enabled", kind: "boolean" },
+  // Routines kill switch — stop every routine for one run of the daemon
+  // without touching config.json (nothing is deleted). Other knobs: file only.
+  { env: "CODEOID_ROUTINES_ENABLED", path: "routines.enabled", kind: "boolean" },
+  { env: "CODEOID_ROUTINES_MAX_CONCURRENT", path: "routines.maxConcurrentRuns", kind: "int" },
   { env: "CODEOID_MCP_CONTROL_ACTIONS", path: "mcpControl.allowActions", kind: "boolean" },
   { env: "CODEOID_MAX_SESSIONS_PER_USER", path: "rateLimit.maxSessionsPerUser", kind: "int" },
   { env: "CODEOID_MAX_SESSIONS_PER_HOUR", path: "rateLimit.maxCreationsPerHour", kind: "int" },
@@ -1504,6 +1621,7 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   { env: "CODEOID_SEED_BUDGET_CHARS", path: "session.seedBudgetChars", kind: "int" },
   { env: "CODEOID_SEED_CHARS_PER_TOKEN", path: "session.seedCharsPerToken", kind: "float" },
   { env: "CODEOID_SEED_WINDOW_FRACTION", path: "session.seedWindowFraction", kind: "float" },
+  { env: "CODEOID_NATIVE_CONTINUATION", path: "session.nativeContinuation", kind: "boolean" },
   // Embed-SSO trusted framing origins (comma-separated). Each is an exact
   // origin (scheme://host[:port]) permitted to frame the web UI and hand it a
   // credential via the URL hash. Empty ⇒ hash handoff disabled (safe default).
@@ -1715,6 +1833,7 @@ export function loadConfig(opts: LoadOptions = {}): CodeoidConfig {
     conductor: parsed.conductor,
     dispatch: parsed.dispatch,
     mcpControl: parsed.mcpControl,
+    routines: parsed.routines,
     collaboration: parsed.collaboration,
     rateLimit: parsed.rateLimit,
     pipeline: parsed.pipeline,
@@ -1725,6 +1844,7 @@ export function loadConfig(opts: LoadOptions = {}): CodeoidConfig {
     embed: parsed.embed,
     push: parsed.push,
     fork: parsed.fork,
+    worktree: parsed.worktree,
   };
 }
 
@@ -1827,14 +1947,23 @@ export function validateConfigObject(
  */
 export function atomicWrite(path: string, contents: string, mode: number): void {
   mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.tmp`;
-  writeFileSync(tmp, contents, { encoding: "utf8", mode });
+  // A fresh name created exclusively (`wx`): a leftover or planted `.tmp` —
+  // possibly world-readable, possibly a symlink — is never written through,
+  // and two concurrent writers never share one. `mode` applies at creation, so
+  // a secret is never on disk with wider permissions, even briefly.
+  const tmp = `${path}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  writeFileSync(tmp, contents, { encoding: "utf8", mode, flag: "wx" });
   try {
     chmodSync(tmp, mode);
   } catch {
     /* best-effort on platforms without POSIX perms */
   }
-  renameSync(tmp, path);
+  try {
+    renameSync(tmp, path);
+  } catch (err) {
+    rmSync(tmp, { force: true });
+    throw err;
+  }
 }
 
 /** Read `config.json` as a raw object (empty object if absent). Throws if the

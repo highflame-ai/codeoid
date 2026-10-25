@@ -27,9 +27,11 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CodexRpcProcess } from "../daemon/providers/codex/rpc.js";
-import { CodexProvider, describeCodexError } from "../daemon/providers/codex/index.js";
+import { CodexProvider, codexErrorDetail, describeCodexError } from "../daemon/providers/codex/index.js";
 import { MemoryMcpHttp, MEMORY_MCP_SERVER_NAME } from "../daemon/memory/mcp-http.js";
 import { McpRegistry } from "../daemon/mcp/registry.js";
+import { MCP_PROXY_PATH_PREFIX, MCP_PROXY_TOKEN_ENV, McpProxy } from "../daemon/mcp/proxy.js";
+import { CODEOID_TOKEN_ENV_GLOB } from "../daemon/providers/codex/shell-env.js";
 import type { RawMcpServerConfig } from "../config.js";
 import { MemoryEngine } from "../daemon/memory/engine.js";
 import { SqliteEpisodeStore } from "../daemon/memory/store.js";
@@ -40,6 +42,7 @@ import { createDefaultProviderRegistry } from "../daemon/providers/registry.js";
 import type { ProviderEvent, TurnOpts, TurnRun } from "../daemon/providers/interface.js";
 import type { CodeoidConfig } from "../config.js";
 import type { Store } from "../daemon/store.js";
+import type { EffortLevel } from "../protocol/types.js";
 
 const FIXTURE = join(import.meta.dir, "fixtures", "fake-codex.ts");
 
@@ -115,6 +118,40 @@ async function collect(run: TurnRun): Promise<ProviderEvent[]> {
 }
 
 describe("CodexProvider over fake-codex", () => {
+  it("extraEnv reaches the spawned codex; credential, home and codeoid-owned keys keep codeoid's value", async () => {
+    const saved = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = "sk-daemon";
+    try {
+      const p = new CodexProvider({
+        sessionId: "sess-env",
+        initialBackingId: "sess-env",
+        command: process.execPath,
+        argsPrefix: [FIXTURE],
+        store: {} as Store,
+        extraEnv: {
+          LOOP_RUN_ID: "run-9",
+          OPENAI_API_KEY: "sk-evil",
+          CODEX_HOME: "/tmp/other-login",
+          HOME: "/tmp/evil-home",
+          PATH: "/tmp/evil-bin",
+          CODEOID_MEMORY_TOKEN: "forged",
+        },
+      });
+      const events = await collect(p.runTurn(turnOpts("echo-env")));
+      await p.teardown();
+      const env = JSON.parse((events.find((e) => e.type === "text_done") as { content: string }).content) as Record<string, string>;
+      expect(env.LOOP_RUN_ID).toBe("run-9");
+      expect(env.OPENAI_API_KEY).toBe("sk-daemon");
+      expect(env.CODEX_HOME).toBeUndefined();
+      expect(env.HOME).toBe(process.env.HOME!);
+      expect(env.PATH).toBe(process.env.PATH!);
+      expect(env.CODEOID_MEMORY_TOKEN).toBeUndefined();
+    } finally {
+      if (saved === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = saved;
+    }
+  });
+
   it("C1: text turn streams thinking + text and completes with usage", async () => {
     const p = makeProvider();
     const events = await collect(p.runTurn(turnOpts("hello")));
@@ -609,6 +646,30 @@ describe("CodexProvider over fake-codex", () => {
     await p.teardown();
   });
 
+  it("C5g: a thread it can't resume starts fresh WITH the history, never empty", async () => {
+    const p = new CodexProvider({
+      sessionId: "sess-1",
+      initialBackingId: "missing-thread-from-another-home",
+      command: process.execPath,
+      argsPrefix: [FIXTURE],
+      store: { setClaudeCodeSessionId: () => {} } as unknown as Store,
+      workspaceId: "wsX",
+    });
+    let lost = 0;
+    p.onHistoryLost = () => {
+      lost++;
+      p.seedFromHistory([
+        { role: "user", content: "what's the plan?" },
+        { role: "assistant", content: "ship the accounts work", providerId: "codex", model: "gpt-5" },
+      ]);
+    };
+    const events = await collect(p.runTurn(turnOpts("echo-prompt")));
+    await p.teardown();
+    expect(lost).toBe(1);
+    const done = events.find((e) => e.type === "text_done");
+    expect(done?.type === "text_done" && done.content).toContain("ship the accounts work");
+  });
+
   it("C6: requestUserInput select question round-trips the picked option", async () => {
     const p = makeProvider();
     const asked: string[] = [];
@@ -642,7 +703,14 @@ describe("CodexProvider over fake-codex", () => {
     const models = await p.listModels();
     await p.teardown();
     expect(models).toEqual([
-      { id: "gpt-5.6-terra", displayName: "GPT-5.6-Terra", description: "Balanced agentic coding model." },
+      {
+        id: "gpt-5.6-terra",
+        displayName: "GPT-5.6-Terra",
+        description: "Balanced agentic coding model.",
+        // Its efforts on codeoid's scale (#417): "none" is Off; "ultra" has no level.
+        efforts: ["off", "low", "high"],
+        defaultEffort: "low",
+      },
     ]);
   });
 
@@ -999,6 +1067,57 @@ describe("CodexProvider over fake-codex", () => {
     expect(joined).toContain("mcp_servers.linear.bearer_token_env_var=");
   });
 
+  it("C28 (#396): OAuth registry servers mount through the daemon's relay — token by env var, never argv, kept from codex's shell", async () => {
+    const raw = (p: Partial<RawMcpServerConfig>): RawMcpServerConfig =>
+      ({ args: [], env: {}, headers: {}, trust: "prompt", scope: "session", enabled: true, native: false, ...p }) as RawMcpServerConfig;
+    const reg = new McpRegistry(
+      {
+        notes: raw({ url: "https://notes.example.com/mcp", oauth: true }),
+        plain: raw({ url: "https://plain.example.com/mcp" }),
+      },
+      { memoryEnabled: false },
+    );
+    const proxy = new McpProxy({ registry: reg, credentials: null, baseUrl: () => "http://127.0.0.1:7400" });
+    const p = new CodexProvider({
+      sessionId: "sess-1",
+      initialBackingId: "sess-1",
+      command: process.execPath,
+      argsPrefix: [FIXTURE],
+      store: {} as Store,
+      mcpRegistry: reg,
+      tenant: { accountId: "a", projectId: "p" },
+      mcpProxy: proxy,
+    });
+    const events = await collect(p.runTurn(turnOpts("echo-mcp")));
+    const seen = JSON.parse((events.find((e) => e.type === "text_done") as { content: string }).content) as {
+      mcpArgs: string[];
+      proxyToken: string | null;
+      shellEnvArgs: string[];
+      argv: string[];
+    };
+    const joined = seen.mcpArgs.join(" ");
+    // The OAuth server at the relay, not at its own URL; the plain one directly.
+    expect(joined).toContain(`mcp_servers.notes.url="http://127.0.0.1:7400${MCP_PROXY_PATH_PREFIX}notes"`);
+    expect(joined).toContain(`mcp_servers.notes.bearer_token_env_var="${MCP_PROXY_TOKEN_ENV}"`);
+    expect(joined).not.toContain("notes.example.com");
+    expect(joined).toContain('mcp_servers.plain.url="https://plain.example.com/mcp"');
+    // The token: in codex's env, a live one, never on its argv, and excluded from its commands' env.
+    expect(seen.proxyToken).toBeTruthy();
+    expect(seen.argv.join(" ")).not.toContain(seen.proxyToken!);
+    expect(seen.shellEnvArgs.some((a) => a.includes(CODEOID_TOKEN_ENV_GLOB))).toBe(true);
+    const live = await proxy.handle(
+      new Request(proxy.url("notes"), { method: "POST", headers: { Authorization: `Bearer ${seen.proxyToken}`, Host: "127.0.0.1:7400" }, body: "{}" }),
+      true,
+    );
+    expect(live.status).not.toBe(403); // a known token: refused only for what it sent
+    await p.teardown();
+    const revoked = await proxy.handle(
+      new Request(proxy.url("notes"), { method: "POST", headers: { Authorization: `Bearer ${seen.proxyToken}`, Host: "127.0.0.1:7400" }, body: "{}" }),
+      true,
+    );
+    expect(revoked.status).toBe(403); // revoked with the backend
+  });
+
   it("C12: rpc edges — spawn failure, request timeout, request/notify after exit", async () => {
     // Spawn failure rejects in-flight requests.
     const dead = new CodexRpcProcess({
@@ -1207,6 +1326,170 @@ describe("describeCodexError", () => {
       const out = describeCodexError(params);
       expect(out).not.toContain("[object Object]");
       expect(out.length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe("codexErrorDetail", () => {
+  it("extracts a unit variant and a reset instant from the error object", () => {
+    expect(codexErrorDetail({ error: { message: "x", codexErrorInfo: "usageLimitExceeded", resets_at: 1_800_000_000 } })).toEqual({
+      codexErrorInfo: "usageLimitExceeded",
+      resetsAt: 1_800_000_000,
+    });
+  });
+
+  it("extracts a struct variant's fields (reset, HTTP status)", () => {
+    expect(codexErrorDetail({ error: { message: "x", codexErrorInfo: { usageLimitExceeded: { resetsAt: 1_800_000_000_000 } } } })).toEqual({
+      codexErrorInfo: "usageLimitExceeded",
+      resetsAt: 1_800_000_000_000,
+    });
+    expect(codexErrorDetail({ error: { message: "x", codexErrorInfo: { httpConnectionFailed: { httpStatusCode: 429 } } } })).toEqual({
+      codexErrorInfo: "httpConnectionFailed",
+      status: 429,
+    });
+  });
+
+  it("undefined without error info", () => {
+    expect(codexErrorDetail({ error: { message: "x" } })).toBeUndefined();
+    expect(codexErrorDetail({})).toBeUndefined();
+  });
+});
+
+describe("CodexProvider – thinking effort (#417)", () => {
+  const effortSeen = async (effort?: EffortLevel): Promise<unknown> => {
+    const p = makeProvider();
+    const events = await collect(p.runTurn(turnOpts("echo-effort", effort ? { effort } : {})));
+    await p.teardown();
+    return JSON.parse((events.find((e) => e.type === "text_done") as { content: string }).content).effort;
+  };
+
+  it("sends it on every turn — Off as codex's none; Default as what codex would use unasked (null wouldn't reset an override)", async () => {
+    expect(await effortSeen("high")).toBe("high");
+    expect(await effortSeen("off")).toBe("none");
+    expect(await effortSeen()).toBe("low"); // the running model's own default (no configured effort)
+    const saved = process.env.CODEX_FAKE_CONFIG_EFFORT;
+    process.env.CODEX_FAKE_CONFIG_EFFORT = "high";
+    try {
+      expect(await effortSeen()).toBe("high"); // the user's model_reasoning_effort wins (a level the model takes)
+      // Read afresh for each thread, as codex does: an edit made meanwhile counts.
+      const p = makeProvider();
+      await collect(p.runTurn(turnOpts("echo-effort")));
+      await p.teardown();
+      await Bun.sleep(100); // the killed app-server's exit lands before the next turn starts
+      process.env.CODEX_FAKE_CONFIG_EFFORT = "none";
+      const events = await collect(p.runTurn(turnOpts("echo-effort")));
+      await p.teardown();
+      expect(JSON.parse((events.find((e) => e.type === "text_done") as { content: string }).content).effort).toBe("none");
+    } finally {
+      if (saved === undefined) delete process.env.CODEX_FAKE_CONFIG_EFFORT;
+      else process.env.CODEX_FAKE_CONFIG_EFFORT = saved;
+    }
+  });
+
+  it("reports each model's efforts on codeoid's scale, dropping ones it has no level for", async () => {
+    const p = makeProvider();
+    await collect(p.runTurn(turnOpts("hello")));
+    const models = await p.listModels();
+    await p.teardown();
+    expect(models[0]).toMatchObject({ efforts: ["off", "low", "high"], defaultEffort: "low" });
+  });
+});
+
+describe("CodexProvider – the model it runs unasked (#417)", () => {
+  it("marks the user's configured model as the default in the catalog it reports, so a picker shows its levels", async () => {
+    const saved = process.env.CODEX_FAKE_CONFIG_MODEL;
+    process.env.CODEX_FAKE_CONFIG_MODEL = "gpt-5.6-terra";
+    const reported: Array<{ value: string; isDefault?: boolean }> = [];
+    try {
+      const p = new CodexProvider({
+        sessionId: "sess-d",
+        initialBackingId: "sess-d",
+        command: process.execPath,
+        argsPrefix: [FIXTURE],
+        store: {} as Store,
+        onModels: (models) => reported.push(...models.map((m) => ({ value: m.value, ...(m.isDefault ? { isDefault: true } : {}) }))),
+      });
+      await collect(p.runTurn(turnOpts("hello")));
+      await p.teardown();
+    } finally {
+      if (saved === undefined) delete process.env.CODEX_FAKE_CONFIG_MODEL;
+      else process.env.CODEX_FAKE_CONFIG_MODEL = saved;
+    }
+    expect(reported).toEqual([{ value: "gpt-5.6-terra", isDefault: true }]);
+  });
+});
+
+describe("CodexProvider – Default as the catalog shows it (#417)", () => {
+  const report = async (env: Record<string, string>) => {
+    const saved: Record<string, string | undefined> = {};
+    for (const [k, v] of Object.entries(env)) {
+      saved[k] = process.env[k];
+      process.env[k] = v;
+    }
+    const reported: Array<{ value: string; isDefault?: boolean; defaultEffort?: string }> = [];
+    try {
+      const p = new CodexProvider({
+        sessionId: "sess-e",
+        initialBackingId: "sess-e",
+        command: process.execPath,
+        argsPrefix: [FIXTURE],
+        store: {} as Store,
+        onModels: (models) =>
+          reported.push(...models.map((m) => ({ value: m.value, ...(m.isDefault ? { isDefault: true } : {}), ...(m.defaultEffort ? { defaultEffort: m.defaultEffort } : {}) }))),
+      });
+      await collect(p.runTurn(turnOpts("hello")));
+      await p.teardown();
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+    return reported;
+  };
+
+  it("a configured model the catalog doesn't list: no row is the default, not even the catalog's own", async () => {
+    expect(await report({ CODEX_FAKE_LIST_DEFAULT: "1" })).toEqual([{ value: "gpt-5.6-terra", isDefault: true, defaultEffort: "low" }]);
+    expect(await report({ CODEX_FAKE_LIST_DEFAULT: "1", CODEX_FAKE_CONFIG_MODEL: "my-unlisted-model" })).toEqual([{ value: "gpt-5.6-terra", defaultEffort: "low" }]);
+  });
+
+  it("a configured effort is the default of every model that takes it — what Default sends", async () => {
+    expect(await report({ CODEX_FAKE_CONFIG_EFFORT: "high" })).toEqual([{ value: "gpt-5.6-terra", defaultEffort: "high" }]);
+    // One the model doesn't take: its own default stands.
+    expect(await report({ CODEX_FAKE_CONFIG_EFFORT: "xhigh" })).toEqual([{ value: "gpt-5.6-terra", defaultEffort: "low" }]);
+  });
+
+  it("the session itself knows what Default means and which model runs — the project's config included", async () => {
+    const saved = { u: process.env.CODEX_FAKE_CONFIG_EFFORT, p: process.env.CODEX_FAKE_PROJECT_EFFORT };
+    process.env.CODEX_FAKE_CONFIG_EFFORT = "low";
+    process.env.CODEX_FAKE_PROJECT_EFFORT = "high";
+    try {
+      const p = makeProvider();
+      await collect(p.runTurn(turnOpts("hello")));
+      expect([p.defaultEffort, p.runningModel]).toEqual(["high", "gpt-5.6-terra"]);
+      await p.teardown();
+    } finally {
+      for (const [k, v] of [["CODEX_FAKE_CONFIG_EFFORT", saved.u], ["CODEX_FAKE_PROJECT_EFFORT", saved.p]] as const) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  });
+});
+
+describe("CodexProvider – Default for a model that doesn't take the configured effort (#417)", () => {
+  it("sends and reports the model's own default instead — as the catalog shows", async () => {
+    const saved = process.env.CODEX_FAKE_CONFIG_EFFORT;
+    process.env.CODEX_FAKE_CONFIG_EFFORT = "xhigh"; // the fake's model takes off/low/high
+    try {
+      const p = makeProvider();
+      const events = await collect(p.runTurn(turnOpts("echo-effort")));
+      expect(JSON.parse((events.find((e) => e.type === "text_done") as { content: string }).content).effort).toBe("low");
+      expect(p.defaultEffort).toBe("low");
+      await p.teardown();
+    } finally {
+      if (saved === undefined) delete process.env.CODEX_FAKE_CONFIG_EFFORT;
+      else process.env.CODEX_FAKE_CONFIG_EFFORT = saved;
     }
   });
 });

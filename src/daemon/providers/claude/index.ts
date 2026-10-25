@@ -10,8 +10,11 @@
  * SessionMessage state.  ProviderEvents are the interface between the two.
  */
 
+import type { ResolvedClaudeAccount } from "../../claude-accounts.js";
 import type { McpTenant } from "../../mcp/oauth.js";
 import {
+  forkSession,
+  getSessionMessages,
   query,
   type Query,
   type SDKMessage,
@@ -35,18 +38,36 @@ import {
   type MemoryEngine,
 } from "../../memory/index.js";
 import { BLACKBOARD_MCP_SERVER_NAME } from "../../blackboard/mcp-http.js";
-import type { McpRegistry } from "../../mcp/registry.js";
-import { resolveEnvMap } from "../../mcp/types.js";
+import type { McpHub } from "../../mcp/hub.js";
+import type { McpServerView } from "../../mcp/registry.js";
+import { oauthServersForClaude } from "./oauth-bridge.js";
+import { mcpToolPrefix, resolveEnvMap } from "../../mcp/types.js";
 import type { CompressionRegistry } from "../../compress/index.js";
 import { FLEET_TOOL_NAMES } from "../../fleet.js";
 import { rewriteBashToolInput } from "../../compress/index.js";
-import type { CodeoidConfig } from "../../../config.js";
-import type { AuthContext } from "../../../protocol/types.js";
-import type { SessionProvider, ModelInfo, NormalizedTurnResult, ProviderEvent, SessionScopedEvent, TurnOpts, TurnRun, CatalogEntry, UiResponse } from "../interface.js";
-import { isBackgroundLifecycleEvent } from "../interface.js";
+import { type CodeoidConfig, getConfigDir } from "../../../config.js";
+import { secretPathVerdict } from "../../secret-paths.js";
+import { type AuthContext, EFFORT_LEVELS, type EffortLevel } from "../../../protocol/types.js";
+import type {
+  BackendMcpServerState,
+  SessionProvider,
+  ModelInfo,
+  NativeContinuationRequest,
+  NativeContinuationResult,
+  NormalizedTurnResult,
+  ProviderEvent,
+  SessionScopedEvent,
+  TurnOpts,
+  TurnRun,
+  CatalogEntry,
+  UiResponse,
+} from "../interface.js";
+import { removeClaudeSession, toClaudeSessionEntries, writeClaudeSession } from "./native-history.js";
+import { BUDGET_STOP_MESSAGE, isBackgroundLifecycleEvent } from "../interface.js";
 import { isUngrantableSkillCommand, redactCommand } from "../../skill-command.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
-import { buildSubprocessEnv, withGatewayCredential } from "../env.js";
+import { buildSubprocessEnv, withExtraEnv, withGatewayCredential } from "../env.js";
+import { listProcesses } from "../../process-tree.js";
 import type { LLMCallUsage } from "../../context-math.js";
 import type { PackSubagent } from "../../pipeline/subagents.js";
 
@@ -98,9 +119,26 @@ export function packPluginsOption(dirs?: readonly string[]): { plugins?: { type:
 
 // ── Initialisation options ────────────────────────────────────────────────────
 
+/** The SDK's session-file functions native continuation uses; injectable for tests. */
+export interface ClaudeNativeSdk {
+  forkSession(sessionId: string, opts: { upToMessageId: string; dir?: string }): Promise<{ sessionId: string }>;
+  getSessionMessages(sessionId: string, opts?: { dir?: string }): Promise<ReadonlyArray<{ uuid: string }>>;
+}
+
 export interface ClaudeProviderInit {
+  /**
+   * The Claude account this session runs on, resolved per query
+   * (claude-accounts.ts). `null` = the daemon's own environment. Read each
+   * time the query loop is (re)built; a changed fingerprint rebuilds it, so a
+   * switch takes effect on the next turn and RESUMES the same backing session.
+   */
+  resolveAccount?: () => ResolvedClaudeAccount | null;
+  /** Caller env for the CLI child process (ProviderSessionInit.extraEnv), merged last via withExtraEnv. */
+  extraEnv?: Readonly<Record<string, string>>;
   /** codeoid session id — used as the initial backing id and for audit/logging. */
   sessionId: string;
+  /** Test seam for native continuation (#387); defaults to the real SDK. */
+  nativeSdk?: ClaudeNativeSdk;
   /** Persisted backing id from Store, or the session id itself on first run. */
   initialBackingId: string;
   /** Tenant-scoped memory workspace id (computed once by Session). Used to bind
@@ -126,7 +164,13 @@ export interface ClaudeProviderInit {
   blackboardMcp?: () => { url: string; token: string } | undefined;
   /** Cross-backend MCP registry — external servers are mounted natively on the
    *  SDK (claude owns its own MCP client); approval flows through canUseTool. */
-  mcpRegistry?: McpRegistry;
+  mcpRegistry?: McpServerView;
+  /** The daemon-owned MCP client — what an OAuth registry server is called
+   *  through, as the session's tenant (#390). */
+  mcpHub?: McpHub;
+  /** Test seam: the user's own Claude-config servers for a workdir (default:
+   *  read from ~/.claude.json). */
+  userMcpServers?: (workdir: string) => Record<string, McpServerConfig>;
   config?: CodeoidConfig;
   compressionRegistry?: CompressionRegistry;
   /** Called once per session with the live model catalog. */
@@ -194,6 +238,8 @@ export class ClaudeProvider implements SessionProvider {
 
   // Claude-specific backing-session state
   #claudeCodeSessionId: string;
+  /** The backing id the live query's CLI was spawned with (backendProcessIds). */
+  #spawnedWithId: string | null = null;
   #hasQueried = false;
   #backingRecoveryAttempted = false;
   #lastPushedContent: string | null = null;
@@ -211,6 +257,15 @@ export class ClaudeProvider implements SessionProvider {
    * SDK fixes `plugins` at query construction, and a pipeline run swaps the pack
    * activation between phases, so a changed set forces a rebuild too. */
   #builtPluginDirs = "";
+  /** The registry OAuth servers (and which are signed in, with which sign-in)
+   * the LIVE query loop was built with: adopting one, or signing in to or out
+   * of it, changes what the query must mount and deny, which the SDK fixes at
+   * construction — the next turn rebuilds it (#390). */
+  #builtOAuthMcp = "";
+  /** Fingerprint of the Claude account the live query loop was started with ("" = daemon env). */
+  #builtAccount = "";
+  /** The thinking effort the live query loop runs at (#417); "" = the SDK's default. Off is fixed at construction. */
+  #builtEffort = "";
   /** Last TurnOpts — the retry after a skill approval rebuilds the loop with
    * these, then re-pushes #lastPushedContent into the SAME turn queue (#233). */
   #lastTurnOpts: TurnOpts | null = null;
@@ -297,7 +352,11 @@ export class ClaudeProvider implements SessionProvider {
     this.#pendingHistorySeed = null;
     this.#claudeCodeSessionId = newBackingId;
     this.#hasQueried = false;
-    this.#backingRecoveryAttempted = false;
+    // A turn anchor belongs to the session it was seen in.
+    this.#translateState.lastChainUuid = null;
+    // NOT #backingRecoveryAttempted: recovery itself resets the backing (and
+    // may adopt a native one) before retrying, and must not re-arm on the way.
+    // It clears once a turn on the new backing succeeds (#emit).
     this.#zeroTurnRecoveryAttempted = false;
     this.#lastPushedContent = null;
   }
@@ -441,6 +500,110 @@ export class ClaudeProvider implements SessionProvider {
   }
 
   /**
+   * Redial an MCP server through the live query (#389). The CLI connects its
+   * servers once, when the query starts; one that failed then stays failed
+   * until this is called (or the loop is rebuilt).
+   */
+  async reconnectMcpServer(name: string): Promise<BackendMcpServerState | null> {
+    const q = this.#query;
+    if (!q) return null;
+    // A server codeoid signs in to now (#390), at the URL this query still
+    // connects as the CLI's own copy (built before it was adopted): redialing
+    // that copy would only hit its sign-in again. The next query mounts
+    // codeoid's copy instead. Decided by URL — the same name elsewhere is not
+    // codeoid's.
+    const owned = new Set(
+      (this.#init.mcpRegistry?.oauthFor("claude") ?? []).flatMap((s) => (s.transport.kind === "http" ? [s.transport.url] : [])),
+    );
+    if (owned.size > 0) {
+      const current = await q.mcpServerStatus().then((all) => all.find((x) => x.name === name), () => undefined);
+      const url = (current?.config as { url?: unknown } | undefined)?.url;
+      if (current && typeof url === "string" && owned.has(url)) {
+        return { status: current.status, tools: [], codeoidOwned: true };
+      }
+    }
+    let failure: string | undefined;
+    try {
+      await q.reconnectMcpServer(name);
+    } catch (err) {
+      failure = err instanceof Error ? err.message : String(err);
+    }
+    try {
+      const s = (await q.mcpServerStatus()).find((x) => x.name === name);
+      if (!s) return { status: "failed", tools: [], error: failure ?? `this session has no MCP server named "${name}"` };
+      const error = s.error ?? (s.status === "connected" ? undefined : failure);
+      // The backend's account of where the server came from, not its name.
+      const connector = s.source === "claudeai" || s.scope === "claudeai" || s.config?.type === "claudeai-proxy";
+      return {
+        status: s.status,
+        tools: (s.tools ?? []).map((t) => `mcp__${mcpToolPrefix(name)}__${t.name}`),
+        ...(error ? { error } : {}),
+        ...(connector ? { connector: true } : {}),
+      };
+    } catch (err) {
+      return { status: "failed", tools: [], error: failure ?? (err instanceof Error ? err.message : String(err)) };
+    }
+  }
+
+  /**
+   * Continue a conversation natively (#387). Same backend with a recorded
+   * fork point: fork Claude's own session there — nothing is lost, reasoning
+   * included. Otherwise: write codeoid's history as a Claude session and
+   * resume it, so tool calls arrive as real tool_use/tool_result blocks.
+   *
+   * A written session is read back with the SDK's own reader before it is
+   * used; anything short of an exact read-back is removed and reported as
+   * null, so the session falls back to the transcript seed rather than
+   * resuming something Claude may misread.
+   */
+  async continueNatively(req: NativeContinuationRequest): Promise<NativeContinuationResult | null> {
+    const sdk = this.#init.nativeSdk ?? { forkSession, getSessionMessages };
+    const tag = `[claude-provider ${this.#init.sessionId.slice(0, 8)}]`;
+    if (req.forkFrom) {
+      try {
+        // With the source's project dir, the SDK looks there only, never across
+        // every project on the machine.
+        const { sessionId } = await sdk.forkSession(req.forkFrom.backingId, {
+          upToMessageId: req.forkFrom.ref,
+          ...(req.forkFrom.dir ? { dir: req.forkFrom.dir } : {}),
+        });
+        // Read it back the way the CLI will look for it (any project dir):
+        // adopting a session resume can't find would lose the conversation.
+        const read = await sdk.getSessionMessages(sessionId);
+        if (read.length === 0) throw new Error(`the forked session ${sessionId.slice(0, 8)} reads back empty`);
+        this.#adoptBacking(sessionId);
+        return { via: "fork", backingId: sessionId };
+      } catch (err) {
+        // The source session may be gone (cleaned up, another machine): build it instead.
+        console.error(`${tag} native fork of ${req.forkFrom.backingId.slice(0, 8)} failed, building history instead: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (req.history.length === 0 || req.allowHistory === false) return null;
+    const id = randomUUID();
+    const { entries, truncation } = toClaudeSessionEntries(req.history, { sessionId: id, cwd: req.workdir, maxChars: req.maxChars });
+    if (entries.length === 0) return null;
+    const path = await writeClaudeSession(entries, { sessionId: id, cwd: req.workdir });
+    try {
+      const read = await sdk.getSessionMessages(id, { dir: req.workdir });
+      if (read.length !== entries.length || read.at(-1)?.uuid !== entries.at(-1)!.uuid) {
+        throw new Error(`the SDK read back ${read.length} of ${entries.length} entries`);
+      }
+    } catch (err) {
+      await removeClaudeSession(path).catch(() => {});
+      console.error(`${tag} native history didn't verify, using the transcript: ${err instanceof Error ? err.message : String(err)}`);
+      return null;
+    }
+    this.#adoptBacking(id);
+    return { via: "history", backingId: id, ...(truncation.omittedTurns > 0 || truncation.newestTurnSliced ? { truncation } : {}) };
+  }
+
+  /** Make `id` this provider's backing session, resumed (not created) on the next turn. */
+  #adoptBacking(id: string): void {
+    this.resetToNewSession(id);
+    this.#hasQueried = true;
+  }
+
+  /**
    * Claude has the memory recall tools (recall/recall_file/timeline/get_episode)
    * mounted via the in-process MCP server whenever the session has memory, so it
    * can page the verbatim store on demand — the precondition the Verbatim
@@ -465,8 +628,38 @@ export class ClaudeProvider implements SessionProvider {
     }
   }
 
+  /**
+   * A new thinking effort on the running query, live (#417) — except to or
+   * from Off, which the SDK fixes when the query is built, and back to the
+   * default: the SDK's live "no level" is the model's default, not the user's
+   * own Claude settings, which only a fresh query reads. Those rebuild the
+   * query before the next turn (it resumes the same conversation).
+   */
+  async applyEffort(effort: EffortLevel | null): Promise<boolean> {
+    const query$ = this.#query;
+    if (!query$ || !this.#consumerTask || effort === null || effort === "off" || this.#builtEffort === "off") return false;
+    await query$.applyFlagSettings({ effortLevel: claudeEffort(effort) });
+    this.#builtEffort = effort;
+    // A retry or recovery later in this turn rebuilds from these: at the new effort.
+    if (this.#lastTurnOpts) this.#lastTurnOpts = { ...this.#lastTurnOpts, effort };
+    return true;
+  }
+
   async dispose(): Promise<void> {
     await this.teardown();
+  }
+
+  /**
+   * The Claude Code CLI this provider's query runs in. The SDK spawns it
+   * (spawnClaudeCodeProcess is not used: replacing the SDK's spawn would drop
+   * its stderr diagnostics), so it is found as a direct child of this process
+   * whose argv names this provider's backing session as an exact token
+   * (argvNamesSession — ids are UUIDs, unique per session).
+   */
+  async backendProcessIds(): Promise<number[]> {
+    if (!this.#query) return [];
+    const id = this.#spawnedWithId ?? this.#claudeCodeSessionId;
+    return (await listProcesses()).filter((p) => p.ppid === process.pid && argvNamesSession(p.args, id)).map((p) => p.pid);
   }
 
   async teardown(): Promise<void> {
@@ -509,11 +702,74 @@ export class ClaudeProvider implements SessionProvider {
     }
   }
 
+  /**
+   * Every MCP server the query gets. Built-ins go last, so nothing configured
+   * or adopted can take their names (some of their tools are pre-approved).
+   */
+  #mcpServerSet(opts: TurnOpts, oauthMcp: ReturnType<typeof oauthServersForClaude>): Record<string, McpServerConfig> {
+    const init = this.#init;
+    // Apply a per-call wall-clock timeout to the external (user) servers so a
+    // hung MCP tool call surfaces as an SDK error instead of silently wedging
+    // the turn. Not applied to the in-process servers. Kept below the session
+    // stall watchdog so the SDK signals first.
+    const mcpToolTimeoutMs = init.config?.session.mcpToolTimeoutMs ?? 120_000;
+    // A server codeoid now signs in to is codeoid's (mounted below), not the CLI's.
+    const userServers = withoutServers((init.userMcpServers ?? loadUserMcpServers)(opts.workdir), oauthMcp.deniedUrls);
+    // ...but never in place of the user's own server of that name at another
+    // address — in this workdir's config, which adopting (from another
+    // workdir, perhaps) couldn't see. Theirs stays; codeoid's isn't mounted here.
+    const mounts = oauthMcp.mounts();
+    // Compared as adopting compares (case, "-" vs "_"): a look-alike of their
+    // own server would sit beside it with near-identical tools.
+    const loose = (n: string) => n.toLowerCase().replace(/-/g, "_");
+    const own = new Set(Object.keys(userServers).map(loose));
+    for (const name of Object.keys(mounts)) {
+      if (own.has(loose(name))) {
+        console.error(`[claude-provider ${init.sessionId.slice(0, 8)}] not mounting codeoid's ${name}: this workdir's own Claude config has a server of that name at another address`);
+        delete mounts[name];
+      }
+    }
+    return {
+      ...withMcpToolTimeout(userServers, mcpToolTimeoutMs),
+      // Registry servers — mounted natively on the SDK (claude owns its client);
+      // tool calls surface as `mcp__<server>__<tool>` and gate via canUseTool.
+      ...withMcpToolTimeout(registryServersForClaude(init.mcpRegistry), mcpToolTimeoutMs),
+      // Registry OAuth servers the tenant has signed in to — in-process, in
+      // front of the daemon-owned client, which holds the token (#390). The
+      // hub applies its own per-call timeout.
+      ...mounts,
+      ...(init.memory
+        ? {
+            codeoid_memory: buildMemoryMcpServer(init.memory, {
+              workspaceId: init.workspaceId,
+              sessionId: init.sessionId,
+            }),
+          }
+        : {}),
+      // Conductor sessions only — the read-only fleet view (P3). In-process,
+      // so the external-server timeout doesn't apply.
+      ...(init.fleet ? { codeoid_fleet: init.fleet } : {}),
+      // Collaboration children only — the role-scoped goal blackboard. Mounted
+      // over HTTP rather than in-process precisely so the SAME surface works on
+      // gemini/codex; claude deliberately gets no privileged path here (#245).
+      // Resolved per query build, not captured at construction — the
+      // orchestrator's mount is attached after its Session exists.
+      ...blackboardServerEntry(init.blackboardMcp?.()),
+    };
+  }
+
   #ensureQueryLoop(opts: TurnOpts): void {
     const desiredAppend = opts.systemPromptAppend ?? "";
     const skillAllowRules = this.#resolveSkillGrants(opts);
     const desiredGrants = skillAllowRules.join("\n");
     const desiredPlugins = (opts.pluginDirs ?? []).join("\n");
+    const oauthMcp = oauthServersForClaude(this.#init.mcpRegistry, this.#init.mcpHub, {
+      workspaceId: this.#init.workspaceId,
+      sessionId: this.#init.sessionId,
+      tenant: this.#init.tenant,
+    });
+    const account = this.#init.resolveAccount?.() ?? null;
+    const desiredAccount = account ? `${account.name}:${account.fingerprint}` : "";
 
     // Exact tool names we hand the SDK as pre-approved. Kept as its own list
     // (rather than inlined into `allowedTools`) because the PreToolUse hook has
@@ -532,16 +788,21 @@ export class ClaudeProvider implements SessionProvider {
       if (
         this.#builtSystemPromptAppend === desiredAppend &&
         this.#builtSkillAllowRules === desiredGrants &&
-        this.#builtPluginDirs === desiredPlugins
+        this.#builtPluginDirs === desiredPlugins &&
+        this.#builtOAuthMcp === oauthMcp.fingerprint &&
+        this.#builtAccount === desiredAccount &&
+        this.#builtEffort === (opts.effort ?? "")
       ) {
         return;
       }
       // Per-turn contributions the SDK fixes at query construction changed, so
       // the warm loop would silently use the stale value — rebuild instead.
-      // Three triggers: the system-prompt append (before_turn hooks, memory
+      // Five triggers: the system-prompt append (before_turn hooks, memory
       // workspace-index refresh — #153), the skill-command grants (a just-
-      // approved command must reach allowedTools on the retry — #233), and the
-      // session-scoped skill plugins (a pack activation applied or swapped). The
+      // approved command must reach allowedTools on the retry — #233), the
+      // session-scoped skill plugins (a pack activation applied or swapped),
+      // the OAuth MCP servers (adopted, signed in or out — #390), and the
+      // Claude account (switched mid-conversation — #392). The
       // fresh query RESUMES the same backing session, so no context is lost.
       // console.log, not error: an expected control-flow event.
       const reason =
@@ -549,7 +810,13 @@ export class ClaudeProvider implements SessionProvider {
           ? `systemPromptAppend changed (${this.#builtSystemPromptAppend.length}B → ${desiredAppend.length}B)`
           : this.#builtSkillAllowRules !== desiredGrants
             ? "skill-command grants changed"
-            : "session-scoped skill plugins changed";
+            : this.#builtPluginDirs !== desiredPlugins
+              ? "session-scoped skill plugins changed"
+              : this.#builtOAuthMcp !== oauthMcp.fingerprint
+                ? "OAuth MCP servers changed"
+                : this.#builtAccount !== desiredAccount
+                  ? `Claude account changed (now ${account?.name ?? "default"})`
+                  : `thinking effort changed (now ${opts.effort ?? "default"})`;
       console.log(
         `[claude-provider ${this.#init.sessionId.slice(0, 8)}] ${reason} — rebuilding query loop`,
       );
@@ -571,45 +838,26 @@ export class ClaudeProvider implements SessionProvider {
     this.#builtSystemPromptAppend = desiredAppend;
     this.#builtSkillAllowRules = desiredGrants;
     this.#builtPluginDirs = desiredPlugins;
+    this.#builtOAuthMcp = oauthMcp.fingerprint;
+    this.#builtAccount = desiredAccount;
+    this.#builtEffort = opts.effort ?? "";
     this.#loopGeneration += 1;
     const myGeneration = this.#loopGeneration;
 
     const sessionOpts = this.#hasQueried
       ? { resume: this.#claudeCodeSessionId }
       : { sessionId: this.#claudeCodeSessionId };
+    // What this query's CLI was started with — its argv names it (backendProcessIds).
+    this.#spawnedWithId = this.#claudeCodeSessionId;
 
-    // Merge user MCP servers with codeoid's in-process memory server.
-    // Apply a per-call wall-clock timeout to the external (user) servers so a
-    // hung MCP tool call surfaces as an SDK error instead of silently wedging
-    // the turn. Not applied to the in-process memory server. Kept below the
-    // session stall watchdog so the SDK signals first.
-    const mcpToolTimeoutMs = init.config?.session.mcpToolTimeoutMs ?? 120_000;
-    const merged: Record<string, McpServerConfig> = {
-      ...withMcpToolTimeout(loadUserMcpServers(opts.workdir), mcpToolTimeoutMs),
-      ...(init.memory
-        ? {
-            codeoid_memory: buildMemoryMcpServer(init.memory, {
-              workspaceId: init.workspaceId,
-              sessionId,
-            }),
-          }
-        : {}),
-      // Conductor sessions only — the read-only fleet view (P3). In-process,
-      // so the external-server timeout doesn't apply.
-      ...(init.fleet ? { codeoid_fleet: init.fleet } : {}),
-      // Collaboration children only — the role-scoped goal blackboard. Mounted
-      // over HTTP rather than in-process precisely so the SAME surface works on
-      // gemini/codex; claude deliberately gets no privileged path here (#245).
-      // Resolved per query build, not captured at construction — the
-      // orchestrator's mount is attached after its Session exists.
-      ...blackboardServerEntry(init.blackboardMcp?.()),
-      // Registry servers — mounted natively on the SDK (claude owns its client);
-      // tool calls surface as `mcp__<server>__<tool>` and gate via canUseTool.
-      ...withMcpToolTimeout(registryServersForClaude(init.mcpRegistry), mcpToolTimeoutMs),
-    };
+    const merged = this.#mcpServerSet(opts, oauthMcp);
     const mcpServers = Object.keys(merged).length > 0 ? merged : undefined;
 
     // skillAllowRules computed above (used in the rebuild guard).
+    this.#translateState.cwd = opts.workdir;
+    // A rebuilt loop starts a new stream; an anchor from the old one (a turn
+    // that ended without a result) must not be paired with the next result.
+    this.#translateState.lastChainUuid = null;
     this.#query = query({
       prompt: this.#inputQueue,
       options: {
@@ -625,9 +873,24 @@ export class ClaudeProvider implements SessionProvider {
         // not exist when this provider is built — and reading it too early
         // would silently leave every call on the badge, which is the bug
         // (forge#111) rather than a partial fix for it.
-        env: buildAgentEnv(process.env, {
-          gatewayCredential: init.identityManager?.getGatewayCredential(init.sessionId),
-        }),
+        //
+        // A chosen Claude account REPLACES the credential entirely (every
+        // competing credential variable removed, its own set — see
+        // applyAccountEnv). The forge gateway re-point applies only to the
+        // daemon's own environment: a named account carries the user's own
+        // gateway token, which must never be swapped for an agent identity.
+        //
+        // The caller's extra env (a loop worker's) goes on last; withExtraEnv
+        // refuses every ANTHROPIC_/CLAUDE_ and credential-shaped key, so it
+        // can never undo the account or the gateway re-point.
+        env: withExtraEnv(
+          account
+            ? account.apply(buildAgentEnv(process.env))
+            : buildAgentEnv(process.env, {
+                gatewayCredential: init.identityManager?.getGatewayCredential(init.sessionId),
+              }),
+          init.extraEnv,
+        ),
         allowedTools: [
           // Every EXACT TOOL NAME here is auto-approved by the SDK BEFORE
           // canUseTool is consulted, so it never reaches our gate — the SDK
@@ -658,9 +921,12 @@ export class ClaudeProvider implements SessionProvider {
         // way — the tokens were already spent, we just weren't being shown
         // anything for them. (The raw chain of thought is never exposed on any
         // model; this is a summary of it.)
-        thinking: { type: "adaptive" as const, display: "summarized" as const },
-        ...(opts.model ? { model: opts.model } : {}),
-        ...(opts.fallbackModel ? { fallbackModel: opts.fallbackModel } : {}),
+        // Thinking effort (#417): Off disables thinking; any other level rides
+        // on adaptive thinking.
+        ...claudeEffortOptions(opts.effort),
+        // An account may name models its own way (a Bedrock account's mappings).
+        ...modelOptions(opts.model, opts.fallbackModel, account),
+        ...(opts.maxBudgetUsd !== undefined ? { maxBudgetUsd: opts.maxBudgetUsd } : {}),
         stderr: (data: string) => {
           process.stderr.write(`[claude-subprocess ${sessionId.slice(0, 8)}] ${data}`);
         },
@@ -697,6 +963,12 @@ export class ClaudeProvider implements SessionProvider {
         // mode this also surfaces the user's own skills, which is the intended
         // behaviour.
         settingSources: ["project", "user"],
+        // The CLI must not connect its own copy of a server codeoid signs in
+        // to (from ~/.claude.json, a .mcp.json): the flag-settings denylist,
+        // by URL, keeps it from dialing it at all (#390).
+        ...(oauthMcp.deniedUrls.length > 0
+          ? { settings: { deniedMcpServers: oauthMcp.deniedUrls.map((serverUrl) => ({ serverUrl })) } }
+          : {}),
         skills: "all",
         // Permission to RUN a skill's command is not permission to READ the
         // files it touches — the two gates are independent and fail in that
@@ -712,6 +984,31 @@ export class ClaudeProvider implements SessionProvider {
           PreToolUse: [{
             hooks: [async (rawInput) => {
               const input = rawInput as PreToolUseHookInput;
+              // The secret-path rule (secret-paths.ts) is enforced HERE too,
+              // not only in Session's canUseTool gate: the CLI allows some calls
+              // itself without asking canUseTool (reads inside the workdir in
+              // default mode, `permissions.allow` rules, pre-approved tools), and
+              // this hook sees every call whatever its permission outcome. `ask`
+              // hands the call to canUseTool, where the owner decides.
+              const secret = secretPathVerdict(input.tool_name, input.tool_input, {
+                workdir: opts.workdir,
+                configDir: getConfigDir(),
+              });
+              if (secret) {
+                if (secret.action === "deny") {
+                  init.store.audit(this.#currentSender?.sub ?? "unknown", "session.secret_path_deny", sessionId, `tool=${input.tool_name}`);
+                }
+                return {
+                  hookSpecificOutput: {
+                    hookEventName: "PreToolUse" as const,
+                    permissionDecision: secret.action,
+                    permissionDecisionReason:
+                      secret.action === "deny"
+                        ? `${secret.path} holds credentials — agents can't read it. Manage it through codeoid instead.`
+                        : `${secret.path} contains credential files — this search needs the owner's approval.`,
+                  },
+                };
+              }
               // Stand in for canUseTool on the tools the SDK pre-approved.
               // Those never reach the gate, and the gate is the only place this
               // provider emits tool_start — so without this every memory recall
@@ -831,11 +1128,13 @@ export class ClaudeProvider implements SessionProvider {
 
     this.#hasQueried = true;
 
-    // Fetch the live model catalog best-effort.
-    if (init.onModels) {
+    // Fetch the live model catalog best-effort. Not from a Bedrock account:
+    // its catalog lists that endpoint's ids, and the cache is every Claude
+    // session's, whatever its account.
+    if (init.onModels && account?.kind !== "bedrock") {
       void this.#query
         .supportedModels()
-        .then((m) => init.onModels?.(m))
+        .then((m) => init.onModels?.(m.map(claudeCatalogEntry)))
         .catch(() => {});
     }
 
@@ -911,6 +1210,8 @@ export class ClaudeProvider implements SessionProvider {
 
   /** Push a ProviderEvent to the active per-turn queue. */
   #emit(event: ProviderEvent): void {
+    // A backing that just completed a turn is resumable: recovery may arm again.
+    if (event.type === "turn_done" && !event.result.isError) this.#backingRecoveryAttempted = false;
     const queue = this.#currentTurnQueue;
     if (queue) {
       try {
@@ -1280,6 +1581,30 @@ export interface TranslateState {
    * place. The SDK already says which model is primary; ask it instead.
    */
   primaryModel: string | null;
+  /**
+   * The uuid of the last main-conversation entry (assistant message or tool
+   * result, not a subagent's, not a replay) seen this turn: where the turn
+   * ends in Claude's own session, so a fork can be cut there (#387).
+   */
+  lastChainUuid?: string | null;
+  /** The cwd the query runs in — where Claude files the session (#387). */
+  cwd?: string;
+}
+
+/**
+ * Whether a Claude CLI command line names backing session `id` as an EXACT
+ * argv token — the forms the SDK emits (`--resume=<id>`, `--session-id=<id>`,
+ * SDK 0.3.281) and their two-token spelling. A substring match would also hit
+ * a process that merely mentions the id (a prompt, a log path). Exported for tests.
+ */
+export function argvNamesSession(args: string, id: string): boolean {
+  const argv = args.split(/\s+/);
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === `--resume=${id}` || a === `--session-id=${id}`) return true;
+    if ((a === "--resume" || a === "--session-id") && argv[i + 1] === id) return true;
+  }
+  return false;
 }
 
 /**
@@ -1298,6 +1623,10 @@ export function translateSDKMessage(
    *  reader and would drop them unread. */
   emitSession?: (event: SessionScopedEvent) => void,
 ): void {
+    if (msg.type === "assistant" || msg.type === "user") {
+      const m = msg as { uuid?: string; parent_tool_use_id?: string | null; isReplay?: boolean };
+      if (m.uuid && !m.parent_tool_use_id && !m.isReplay) state.lastChainUuid = m.uuid;
+    }
     switch (msg.type) {
       case "assistant": {
         // Per-call LLM usage — split primary vs subagent for accurate ctx tracking.
@@ -1430,6 +1759,9 @@ export function translateSDKMessage(
             }`
           : undefined;
         state.lastLocalCommandStderr = null;
+        const sessionId = (msg as { session_id?: string }).session_id;
+        const chainEnd = state.lastChainUuid;
+        state.lastChainUuid = null;
         const normalized: NormalizedTurnResult = {
           providerId,
           model,
@@ -1444,7 +1776,23 @@ export function translateSDKMessage(
           // Preserve `undefined` when the SDK didn't report — only force true.
           isError: zeroTurn ? true : r.is_error,
           errorMessage:
-            zeroTurnError ?? (r.subtype !== "success" && r.result ? r.result : undefined),
+            zeroTurnError ??
+            (r.subtype === "error_max_budget_usd"
+              ? BUDGET_STOP_MESSAGE
+              : r.subtype !== "success" && r.result
+                ? r.result
+                : undefined),
+          // Only a turn that completed is a point to fork at: an errored one
+          // (a context overflow) would carry the failure into the fork, and an
+          // interrupted one can end mid tool call.
+          // A turn the CLI ends "successfully" but flagged as an error carries
+          // its notice (a usage limit, "API Error: …") as the result text.
+          ...(r.is_error && r.subtype === "success" && typeof r.result === "string" && r.result
+            ? { resultText: r.result }
+            : {}),
+          ...(sessionId && chainEnd && !zeroTurn && r.subtype === "success" && !r.is_error
+            ? { nativeRef: { backingId: sessionId, ref: chainEnd, ...(state.cwd ? { dir: state.cwd } : {}) } }
+            : {}),
         };
         emit({ type: "turn_done", result: normalized });
         // Stay warm — keep the queue open for the next turn.
@@ -1465,16 +1813,32 @@ export function translateSDKMessage(
           if (init.model) state.primaryModel = init.model;
           const servers: Record<string, string> = {};
           const tools: Record<string, string[]> = {};
+          // Tool names carry the server's name as the CLI normalises it; key
+          // them by the server's own name, as `servers` is. Two servers that
+          // normalise alike can't be told apart: neither gets the tools.
+          const byPrefix = new Map<string, string | null>();
           for (const s of init.mcp_servers ?? []) {
             servers[s.name] = s.status;
             tools[s.name] = [];
+            const prefix = mcpToolPrefix(s.name);
+            byPrefix.set(prefix, byPrefix.has(prefix) ? null : s.name);
           }
+          // Longest first, so a server named `a__b` wins its tools over one named `a`.
+          const prefixes = [...byPrefix.keys()].sort((a, b) => b.length - a.length);
           for (const t of init.tools ?? []) {
             if (!t.startsWith("mcp__")) continue;
             const rest = t.slice("mcp__".length);
-            const sep = rest.indexOf("__");
-            if (sep <= 0) continue;
-            const server = rest.slice(0, sep);
+            const known = prefixes.find((p) => rest.startsWith(`${p}__`));
+            let server: string;
+            if (known !== undefined) {
+              const owner = byPrefix.get(known);
+              if (owner === null || owner === undefined) continue;
+              server = owner;
+            } else {
+              const sep = rest.indexOf("__");
+              if (sep <= 0) continue;
+              server = rest.slice(0, sep);
+            }
             tools[server] ??= [];
             tools[server].push(t);
           }
@@ -1559,6 +1923,38 @@ export function translateSDKMessage(
       case "tool_progress": {
         const p = msg as { tool_name?: string; elapsed_time_seconds?: number };
         emit({ type: "tool_progress", toolName: p.tool_name, elapsedSeconds: p.elapsed_time_seconds });
+        break;
+      }
+
+      case "rate_limit_event": {
+        // SDKRateLimitInfo.resetsAt is epoch SECONDS (the CLI renders it with
+        // `new Date(resetsAt * 1000)`); ProviderEvent carries milliseconds.
+        const info = (msg as {
+          rate_limit_info?: {
+            status?: string;
+            resetsAt?: number;
+            rateLimitType?: string;
+            isUsingOverage?: boolean;
+            overageInUse?: boolean;
+            overageStatus?: string;
+          };
+        }).rate_limit_info;
+        const status = info?.status;
+        if (status !== "allowed" && status !== "allowed_warning" && status !== "rejected") break;
+        // The plan window is spent but extra usage (overage) is carrying the
+        // requests: not a limit that stops the turn.
+        const overage =
+          info?.isUsingOverage === true ||
+          info?.overageInUse === true ||
+          info?.overageStatus === "allowed" ||
+          info?.overageStatus === "allowed_warning";
+        emit({
+          type: "rate_limit",
+          status,
+          ...(overage ? { overage: true } : {}),
+          ...(typeof info?.resetsAt === "number" && info.resetsAt > 0 ? { resetsAt: info.resetsAt * 1000 } : {}),
+          ...(info?.rateLimitType ? { limitType: info.rateLimitType } : {}),
+        });
         break;
       }
     }
@@ -1774,7 +2170,7 @@ function shellQuote(value: string): string {
  *  McpServerConfigs — a native mount, since claude's SDK owns its MCP client.
  *  `${VAR}` env refs and a `bearerTokenEnv` are resolved against the daemon env
  *  here so secrets never live in config; tool calls gate via canUseTool. */
-export function registryServersForClaude(registry: McpRegistry | undefined): Record<string, McpServerConfig> {
+export function registryServersForClaude(registry: McpServerView | undefined): Record<string, McpServerConfig> {
   if (!registry) return {};
   const out: Record<string, McpServerConfig> = {};
   for (const spec of registry.forNativeMount("claude")) {
@@ -1795,6 +2191,18 @@ export function registryServersForClaude(registry: McpRegistry | undefined): Rec
     }
   }
   return out;
+}
+
+/** User servers minus those codeoid owns now — by URL: a server of the same
+ *  name elsewhere (another workdir's, at another URL) is not codeoid's. */
+export function withoutServers(servers: Record<string, McpServerConfig>, urls: readonly string[]): Record<string, McpServerConfig> {
+  if (urls.length === 0) return servers;
+  return Object.fromEntries(
+    Object.entries(servers).filter(([, cfg]) => {
+      const url = (cfg as { url?: unknown }).url;
+      return !(typeof url === "string" && urls.includes(url));
+    }),
+  );
 }
 
 function loadUserMcpServers(workdir: string): Record<string, McpServerConfig> {
@@ -1866,6 +2274,22 @@ export function parseMcpServerConfig(value: unknown): McpServerConfig | null {
  *
  * Pure + exported for unit testing.
  */
+/**
+ * The model and fallback to hand the CLI, through the account's own naming.
+ * Two ids can name one model there (a Bedrock account maps a whole family to
+ * one alias), and the SDK refuses a fallback equal to the model — so then the
+ * fallback is dropped: it would be the same model anyway.
+ */
+export function modelOptions(
+  model: string | undefined,
+  fallbackModel: string | undefined,
+  account: { model(m: string): string } | null,
+): { model?: string; fallbackModel?: string } {
+  const m = model ? (account ? account.model(model) : model) : undefined;
+  const f = fallbackModel ? (account ? account.model(fallbackModel) : fallbackModel) : undefined;
+  return { ...(m ? { model: m } : {}), ...(f && f !== m ? { fallbackModel: f } : {}) };
+}
+
 export function buildAgentEnv(
   base: Record<string, string | undefined> = process.env,
   opts: { gatewayCredential?: string } = {},
@@ -1891,4 +2315,43 @@ export function extractToolResultText(content: unknown): string {
     }
   }
   return parts.join("\n");
+}
+
+
+/** codeoid's effort scale on the Agent SDK's (#417): it has no Minimal, so that is Low. */
+function claudeEffort(effort: Exclude<EffortLevel, "off">): "low" | "medium" | "high" | "xhigh" | "max" {
+  return effort === "minimal" ? "low" : effort;
+}
+
+/**
+ * The query options for a thinking effort (#417). Thinking stays adaptive,
+ * with readable summaries (see the comment where it's used); Off disables it.
+ */
+export function claudeEffortOptions(effort: EffortLevel | undefined): {
+  thinking: { type: "adaptive"; display: "summarized" } | { type: "disabled" };
+  effort?: "low" | "medium" | "high" | "xhigh" | "max";
+} {
+  if (effort === "off") return { thinking: { type: "disabled" } };
+  const thinking = { type: "adaptive" as const, display: "summarized" as const };
+  return effort ? { thinking, effort: claudeEffort(effort) } : { thinking };
+}
+
+/** One of the SDK's model rows as a catalog entry, with the efforts the model takes (#417). */
+export function claudeCatalogEntry(m: {
+  value: string;
+  displayName: string;
+  description?: string;
+  supportsEffort?: boolean;
+  supportedEffortLevels?: string[];
+}): CatalogEntry {
+  // Off (thinking disabled) is always there; the levels are the model's own.
+  // A model that doesn't say which levels it takes leaves them unknown.
+  const levels = m.supportedEffortLevels?.filter((l): l is EffortLevel => (EFFORT_LEVELS as readonly string[]).includes(l));
+  const efforts: EffortLevel[] | undefined = m.supportsEffort === false ? ["off"] : levels ? ["off", ...levels] : undefined;
+  return {
+    value: m.value,
+    displayName: m.displayName,
+    ...(m.description ? { description: m.description } : {}),
+    ...(efforts ? { efforts } : {}),
+  };
 }

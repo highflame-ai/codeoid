@@ -17,6 +17,27 @@ A session's *harness* (the agent backend it drives) is chosen when the session i
 
 Pick a harness when you create a session — the New Session modal in the web UI or TUI shows the choice whenever more than one backend is registered — or **fork across backends**: fork a Claude session onto Codex and it resumes with the parent's full conversation, so one backend can pick up exactly where another left off. A backend that isn't authenticated or installed simply doesn't appear as an option (no cryptic first-turn 401s).
 
+#### How a fork, switch or rewind carries the conversation
+
+Files are the checkpoint's business: a fork in its own worktree starts from the turn's checkpoint, and a rewind can restore files too.
+The conversation is handed over in the backend's own form wherever the backend allows it, and as a text transcript only where it doesn't:
+
+| Going to | Same backend (fork, rewind) | From another backend (fork, switch) |
+| --- | --- | --- |
+| `claude` | Claude forks its own session at that turn: nothing converted or cut, reasoning included | codeoid writes the conversation as a Claude session, real tool calls and results, and checks it with the SDK's own reader before using it |
+| `codex` | Codex forks its own thread through that turn | codeoid injects the conversation into a new thread as Codex's own history items |
+| `openai`, `gemini`, `llamacpp` | the full history, natively, every turn | the full history, natively, every turn |
+| `pi`, `gemini-cli`, `qwen` | a text transcript in the first prompt | a text transcript in the first prompt |
+
+Reasoning never crosses vendors (Claude's is signed, OpenAI's encrypted).
+History codeoid builds that doesn't fit the target's window loses its oldest turns, with a notice; a native fork isn't used when the source was already running near the target's window, nor from a turn that ended in an error, so a fork is the way out of an overflowed session rather than a copy of it.
+On a fork or switch the session says which way it went (`↪ … continues its own conversation`, `↪ … was given … as its own history`, or `↪ … carried as a text transcript`), and if a native path fails it falls back to the transcript and says so.
+History a `tool_result` [hook](hooks.md) redacted is never forked natively — a fork would copy the backend's unredacted log — so codeoid's redacted record is used instead.
+Turns rebuilt from a displayed transcript, such as an imported session, are never built into native history (they aren't the model's own words, so they stay quoted); a native fork from a real turn after them is still used.
+Like every Claude session codeoid runs, a session it writes or forks for Claude lives under `projects/` in `CLAUDE_CONFIG_DIR` (default `~/.claude`), and is subject to Claude Code's own `cleanupPeriodDays`.
+`session.nativeContinuation: false` (or `CODEOID_NATIVE_CONTINUATION=false`) keeps everything on the transcript.
+Native continuation is tried before the `CODEOID_CONTEXT_STRATEGY` seed (`transcript` or `vws`), which still applies to every backend it doesn't cover.
+
 Memory, identity, attachments, the multi-frontend clients, and device handoff are all provider-agnostic. A few features lean on Claude Code internals and so apply only to the `claude` harness: backing-session [auto-rotation](#context-reduction-stack), Claude Code slash-command [pass-through](#terminal-client), and `.claude/commands` workspace commands.
 
 ### Terminal client
@@ -376,6 +397,67 @@ Injection uses `later` priority, which merges into the running turn without star
 Append-only. The advisory lands after the reusable request prefix and invalidates no prior cache entry. Cost is the advisory itself: ~60 tokens for the brief form, and up to `argumentsPreviewChars` more for the detailed form.
 
 > The **Model Experience** / **KV Cache effect** headings are a convention borrowed from DeepSeek Harness (see [prior-art-deepseek-harness.md](./prior-art-deepseek-harness.md) §4.9). Any feature that changes what the model sees should state both: what reaches the model, and whether it invalidates the prompt prefix. For a harness, prefix stability *is* cost.
+
+### Routines
+
+Saved agent tasks that run on a cron or interval schedule, when something calls their API, or on demand: `codeoid routine add ci-watch --every 15m --check '…' --prompt '…'`.
+A *check* (a shell command) runs first; if it prints nothing, the run ends `silent` with no agent started and nothing spent.
+An agent that finds nothing worth reporting replies `[SILENT]` and you hear nothing.
+Every run is a normal session you can open, approve, continue or fork from any frontend, bounded by guarded approvals (or, when autonomous, a tool budget), a time limit, per-run and per-day spend ceilings, and an auto-pause after repeated failures.
+Each routine can carry its own revocable API token for monitors and deploy scripts, and the `routine_end` hook carries each outcome to Slack or a pager.
+Full guide: [routines.md](routines.md).
+
+### MCP servers on every backend
+
+An MCP server you add through Claude Code reaches every backend in the session, not just Claude: your global servers in every session, your local-scope ones (`claude mcp add`) in sessions in that directory, and a project's own (`.mcp.json`, project settings) once approved — in Claude Code, or with the drawer's **Approve** (`codeoid mcp approve`), which binds to that exact entry.
+The capabilities drawer says, for each, whether it reaches the other backends and why not; changes apply when you choose **Refresh MCP servers** (`/mcp refresh`, `codeoid mcp refresh`), which restarts the backend and resumes the conversation.
+Full rules: [mcp-backends.md](mcp-backends.md).
+
+### When an MCP server is down
+
+A backend connects its MCP servers when its session starts.
+A server that fails then (a credential that had expired, a server that wasn't up yet) used to stay unusable for the whole session; now it is redialed:
+
+- **On demand:** the Reconnect button next to a down server in the capabilities drawer, `/mcp reconnect <server>` in the web UI or TUI, or `codeoid mcp reconnect <session> <server>`.
+- **By itself:** before each turn, a server the backend reports as failed or needing sign-in is retried, waiting longer after each miss (30 seconds up to 15 minutes), so fixing a credential is enough.
+
+Only a server the backend itself reported as down can be redialed, and one redial of a server runs at a time: asking while one is in flight joins it.
+The drawer lists every server the backend runs, including ones no config file here declares (claude.ai connectors, plugins' servers, codeoid's own), marked `live`.
+
+When a server comes back, however it came back, the session says so, and the next prompt tells the model too: it was told at start that the server had failed, and would otherwise believe that over trying.
+The note goes to that backend only: the session's own history keeps the prompt as typed, so a fork or a backend switch isn't handed a stale report.
+Redialing can't run a sign-in: a server that needs one says so, and where it can be done (see below).
+This covers Claude sessions, which mount their own servers, codeoid's registry servers included; only codeoid's built-in servers and its OAuth registry servers are dialed by the daemon.
+
+### Signing in to an MCP server from codeoid
+
+A remote MCP server that signs in with OAuth (Slack or GitHub through a gateway, Notion, most SaaS servers) can live in Claude's own config or in codeoid's registry.
+In Claude's config the Claude CLI owns the sign-in, and it can only run it in an interactive terminal: a codeoid session drives Claude without one, so the server just reports that it needs authentication.
+In codeoid's registry (`"oauth": true`) codeoid signs in itself, from any frontend, phone included, and holds and refreshes the token.
+
+**Adopting** moves a server from the first to the second: the same URL, in codeoid's registry, signed in by codeoid.
+
+- **Web:** "Sign in with codeoid" next to a server that needs a sign-in, in the capabilities drawer, adopts it after a confirmation and starts the sign-in. A project's server whose URL has parts hidden in the drawer (an id or key in its path, a query) isn't offered there: the drawer says to adopt it from the CLI with its full URL, copied from the file.
+- **CLI:** `codeoid mcp adopt <server> [--session <s>] [--url <url>]`, then `codeoid mcp signin <server>`. `--session` also looks in that session's workdir (a `.mcp.json`, project servers); `--url` says which server is meant when two share the name, and is required for a project's own server — in full, copied from the file, when the drawer hides parts of it. The sign-in prints an address to open, and finishes from the address the browser lands on, pasted back (or `--callback-url`).
+
+A server that needs a sign-in points at adopting it (for someone who may adopt), with the command that finds it, in its reconnect answer.
+Once adopted and signed in, Claude sessions use codeoid's copy from their next turn (until then, the CLI's copy is only denied): it is mounted in-process in front of codeoid's own MCP client, so the token never reaches the agent, and the CLI is told not to connect its own copy (by URL), so the server isn't connected twice.
+Signing in or out later applies to a running session from its next turn: its backend restarts and resumes the same conversation (background work running in the old backend process ends with it).
+A token the server refuses to renew is forgotten, so the server reads as signed out and offers a new sign-in; a renewal that merely fails (the server unreachable) keeps it.
+codeoid never reads or writes the Claude CLI's credentials.
+
+What can be adopted, and why:
+
+- **Remote streamable-HTTP servers** at an ASCII `https` URL (plain `http` only on this machine; an international domain in its `xn--` form), with no credentials or wildcard in the URL, and no headers in Claude's config (they're often its authorization, and adopting would drop them): codeoid holds the token.
+- **A plain name** (letters, digits, `-`, `_`; no `__`, not starting with `-`), never one of codeoid's own servers in any spelling.
+- **A project's own server** (from a repo's `.mcp.json` or `.claude/` settings) only with its URL named: the repo chose that address, and a codeoid session's Claude connects it without asking, so naming it is the consent. The drawer names it in its confirmation. Where the drawer shows the URL with parts hidden, only the full URL is consent: `https://host/…/mcp` doesn't say which tenant or query the repo put behind the `…`.
+- **Never over another server:** not over a codeoid entry of the same name at another URL, nor one whose tools would get the same names; and a project's server never stands in for your own server of that name (or a look-alike) at another address, in any workdir — where your own config has one, codeoid's copy isn't mounted there.
+- **Every entry at that address adoptable:** adopting denies the CLI's copy at that URL whatever it's called, so an entry there that can't be adopted (authorized by headers, say) blocks it.
+
+Adopting is daemon-wide and lasting: the server is in codeoid's registry for every session, as any registry server is. It needs `settings:write`, a token's own (not a delegated one), and every attempt is audited with the file the URL came from.
+A claude.ai connector is signed in from claude.ai's connector settings instead.
+OAuth servers reach every backend: the daemon-run ones through codeoid's own MCP client, Claude through an in-process server in front of it, and Codex, the Gemini CLI and Qwen through a loopback relay on the daemon with a per-session token (#396).
+The server's token stays in the daemon either way; a backend never holds it.
 
 ### Driven by other agents (MCP)
 

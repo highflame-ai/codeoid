@@ -88,23 +88,99 @@ Backends mount MCP servers two ways (see `provider-mcp-registry-design.md` §3):
 | Backends | Today | For an OAuth server |
 | --- | --- | --- |
 | openai, gemini, pi | daemon-owned client (`McpHub`) | `HttpMcpClient` asks the credential source for a token per request; one client per (server, tenant) |
-| claude, codex, gemini-cli, qwen | native mount, header baked at start | **not mounted yet** (`McpRegistry.forNativeMount`); planned: a daemon proxy |
+| claude | native mount, header baked at start | an in-process server per OAuth server, in front of `McpHub` as the session's tenant (#390); the CLI's own copy of the URL is denied |
+| codex, gemini-cli, qwen | native mount, header baked at start | a loopback MCP relay in front of `McpOAuth`, with a per-session proxy token (§5.1, #396) |
 
 A baked-in token cannot work for native backends: an access token lives about an hour, a warm Claude loop lives for hours, and a token in the backend's config is readable by the agent subprocess.
 
-**Status.** The first release leaves OAuth servers off the native backends rather than bake in a token, and Settings names the backends a server does not reach yet.
-The proxy below is the planned way to close that gap; nothing else in this design depends on it.
+**Status.** OAuth servers are never baked into a native backend's config; every backend reaches them, Claude in-process (below) and Codex, the Gemini CLI and Qwen through the relay (§5.1).
 
-**The proxy (planned)** (`/mcp/proxy/<server>`, loopback) is a transparent streamable-HTTP forwarder.
-Each session's provider mints an opaque proxy token bound to (account, project, session) — the memory endpoint's pattern — and mounts `{url: proxy, Authorization: Bearer <proxy token>}`.
-The proxy authenticates the proxy token, looks up the tenant's upstream token, forwards the request (method, body and the MCP headers: `Mcp-Session-Id`, `MCP-Protocol-Version`, `Accept`, `Last-Event-ID`) with the upstream bearer, and streams the response back.
-Unknown or revoked proxy tokens fail closed.
-The provider revokes its token on teardown.
+**Claude (#390)** takes them in-process: for each OAuth registry server the tenant has signed in to, the provider mounts an SDK server under the server's own name (so tools stay `mcp__<server>__<tool>`) whose `tools/list` and `tools/call` go to `McpHub` with the session's tenant (`providers/claude/oauth-bridge.ts`).
+The token stays in the daemon, refresh and the `401` retry are the hub's, and nothing listens on a port.
+The CLI must not also connect its own copy (from `~/.claude.json` or a `.mcp.json`): a same-name mount alone doesn't stop it (measured: the CLI still dials its copy), so the provider passes every OAuth server's URL in the flag settings' `deniedMcpServers`, and leaves those servers out of the user servers it passes in.
+The denylist and the mounts are fixed at query construction, so adopting a server, or signing in to or out of one, rebuilds the query on the next turn (it resumes the same conversation; the CLI's background work ends with the old process, as for any rebuild).
+A live `setMcpServers` swap was tried and dropped: an interrupt while a turn's message waited behind it could not reliably stop that turn, and sign-in changes are rare.
+A session never redials the CLI's copy of a server at a URL codeoid owns (decided by URL, by the provider, which sees the copy's config).
+A server the hub can't list (signed out, a revoked token, down, a timeout) makes the in-process server's `tools/list` fail, so the CLI reports it failed rather than connected with no tools.
+The rebuild key includes a per-tenant sign-in counter (bumped by sign-ins and sign-outs, not refreshes), so signing out and back in between two turns — say after a revoked token — still gets a fresh connection.
+When the authorization server refuses a refresh (`invalid_grant`, or `invalid_client` / `unauthorized_client`, which end the client's registration too), the tokens are forgotten, so the server reads as signed out; a refresh that merely fails (network, 5xx, `temporarily_unavailable`) keeps them for the next try.
 
-**Refresh** happens where the token is used: before a request when the saved token has expired, and once on an upstream `401` (then retry).
-Refreshes for one (tenant, server) are single-flight.
+### 5.1 The proxy: Codex, the Gemini CLI and Qwen (#396)
 
-**Not connected** is an error the model can read ("<server> needs sign-in — connect it in Settings"), returned as a JSON-RPC error, never a `401`: a `401` with `WWW-Authenticate` would make a backend's own MCP client start an OAuth flow of its own inside the agent process.
+Codex, the Gemini CLI and Qwen own their MCP clients, fix a server's headers when they start it, and run the agent's shell commands as their children.
+So an OAuth server reaches them through a loopback **MCP relay** on the daemon: they mount `http://127.0.0.1:<port>/mcp/proxy/<server>` with a per-session proxy token, and the upstream token never leaves the daemon.
+
+**A relay, not a byte forwarder.**
+The proxy is an MCP server toward the backend and an MCP client toward the upstream server, one pair per backend MCP session, both on the official SDK (`WebStandardStreamableHTTPServerTransport` downstream, `Client` + `StreamableHTTPClientTransport` upstream).
+A byte forwarder would have to re-implement, outside the protocol, what the token needs (refresh before a request, a `401` retry that replays the body, single-flight refresh, refusing redirects) and could not apply a tool allowlist to a streamed response.
+A relay keeps all of that at the MCP layer and still carries the whole protocol:
+
+- **Initialization.** On the backend's `initialize`, the relay connects upstream announcing the backend's own client capabilities, then answers with the upstream server's protocol version, capabilities, server info and instructions. Each hop negotiates its version with the SDK.
+- **Requests, both ways.** The client→server methods MCP defines (`tools/*`, `resources/*`, `prompts/*`, `completion/complete`, `logging/setLevel`) are forwarded through the SDK's `fallbackRequestHandler`; any other method is refused without reaching the server, so a method MCP adds later is opened deliberately. `initialize` and `ping` are answered by the relay itself. Server→client requests (`sampling/createMessage`, `elicitation/create`, `roots/list`) are forwarded to the backend — on the stream of the call that made them — and are possible only because the upstream saw the backend's own capabilities. The server's `_meta` on them is dropped: a backend may read markers there as its own (Codex marks its tool approvals that way).
+- **Notifications, both ways.** Progress, cancellation, `*/list_changed`, `resources/updated`, `elicitation/complete` and log messages are relayed (the methods MCP defines, the server's `_meta` dropped as on requests); a cancelled request is cancelled upstream, and so is one whose HTTP request the backend abandons (closes before the answer); ending a session cancels its calls in flight.
+- **Policy at the relay.** A server with a `toolAllowlist` is only those tools here: `tools/list` is filtered, any other `tools/call` is refused, its resources, prompts and completions are neither advertised nor forwarded, and it can ask the backend something only during one of its calls. Each request has the session's MCP timeout (renewed by progress, up to four times it in all), which also bounds a server's question to the backend made during it; a request body is capped.
+
+Tool calls keep the one approval gate: the backend asks codeoid before each call, as for any other MCP server it mounts.
+The relay adds no second prompt.
+
+**One upstream client.**
+The relay and the hub (which serves the daemon-run backends and Claude's in-process bridge) open an HTTP server through the same layer, `mcp/upstream.ts`: the SDK `Client` over streamable HTTP, with codeoid's headers, bearer and redirect policy.
+The hub still exposes only tools to its backends; the relay exposes everything.
+(The hub's stdio client is unchanged: stdio servers have no OAuth.)
+
+**Credentials upstream.**
+The upstream transport gets its bearer from `McpOAuth.accessToken(server, tenant)` per request, the same source as the hub, so refresh-before-expiry, single-flight refresh, forgetting tokens the authorization server refuses, and the per-tenant sign-in counter are one implementation.
+On an upstream `401` it reports the token rejected and retries once with a fresh one.
+It never runs an interactive authorization and never follows a redirect while carrying a token.
+
+**The proxy token.**
+256 random bits, minted by the session's provider when it builds a backend, bound to the session's tenant (account, project), the session, and the names of the OAuth servers that backend may use (`McpRegistry.oauthFor(backend)`).
+It lives only in daemon memory: revoked when the backend is torn down or rebuilt, when the session ends, and on daemon shutdown; a resumed session mints a new one.
+The proxy authenticates it from the `Authorization` header only (no `?token=` fallback), takes the tenant from the token and never from the request, refuses a server the token isn't bound to, and fails closed on an unknown or revoked token.
+It must not reach the agent's shell:
+
+- the Gemini CLI and Qwen get it as a header in their MCP config, which their SDKs pass in-process;
+- Codex reads it through `bearer_token_env_var`, and the provider adds that variable to Codex's `shell_environment_policy.exclude`, so commands Codex runs don't inherit it (never on argv, which any local process can read).
+
+If the user's Codex config can't be read here (to keep their own excludes), OAuth servers aren't mounted on Codex rather than risk the token reaching its commands.
+A command can still read the backend's own process: Codex's environment through `/proc/<pid>/environ` (readable by the same user, and `cat` or `grep` may need no approval there), the Gemini CLI's or Qwen's memory with more effort.
+That's the limit of keeping it from a process the agent's commands run beside; what bounds it is the token's reach — the loopback relay, that session's servers, until the backend is rebuilt — and that using it needs a network call, which is approved like any other.
+
+**Reachability.**
+The relay answers only loopback peers, even when the daemon binds wide, and refuses a request whose `Origin` or `Host` isn't loopback, so a web page can't drive it (DNS rebinding included).
+A tunnel on the same host that rewrites `Host` to a loopback name (one way to reach a daemon for the Telegram Mini App) makes remote requests look local; then the 256-bit token alone guards the relay.
+Once a request is authenticated the daemon's idle-connection cut is lifted for it: a call may stay quiet as long as its tool runs.
+
+**Sign-in, live.**
+A server the tenant hasn't signed in to (or whose credential is lost mid-session, a refresh refused) still initializes, so the backend doesn't mark it failed or start an OAuth flow of its own.
+It lists no tools (an error there may make a backend give up on the server for good, and miss the tools a sign-in brings), its instructions say it needs sign-in, a tool call answers with an error result the model reads ("<server> needs sign-in — connect it in Settings"), and anything else with JSON-RPC error `-32011` saying the same — never an HTTP `401`.
+When the tenant signs in, the relay connects upstream on the next request and sends `notifications/tools/list_changed`, so a running Codex, Gemini CLI or Qwen session gets the tools without a restart.
+A session started before the sign-in advertised only tools, so the server's resources and prompts reach it once the backend starts a new session.
+Signing out closes the upstream sessions for that (tenant, server), and the next request gets the sign-in error.
+
+**One copy per backend.**
+The registry's servers split cleanly: `forNativeMount` (not OAuth) is mounted by the backend directly, `oauthFor` (OAuth) through the relay, so a server is never connected twice.
+A server adopted from Claude's config (#390) is an OAuth registry entry, so it goes through the relay like any other; these backends don't read Claude's config, so there is no CLI copy to deny.
+
+**Limits.**
+At most 8 relay sessions per proxy token for each server: a new one past that closes the least recently used that isn't mid-call (whose backend re-initializes if it returns), so a backend that opens a session per thread never locks itself out, and a call is never cut to make room.
+At most 32 calls running upstream per token, and one JSON-RPC message per POST (no batches).
+A call the backend cancels or abandons is cancelled upstream; since a server may run it to the end anyway (MCP only asks it to stop), its slot stays taken for the call's own timeout, or until its upstream session ends.
+So the bound counts what the relay waits on, and holds a cancelled call's place for a while; it can't see work a server keeps doing past a timeout, or after its session is closed, and a backend that restarts sessions (30 a minute) frees held places sooner. What bounds those is the server's own handling of cancellation and closed sessions.
+A call that arrives without its POST's context is refused rather than run unbounded; a session's notification stream and its `DELETE` aren't calls, so a backend can always close what it opened.
+At most 30 new sessions per token per minute.
+An `initialize` is checked in full (its schema, `Accept`, `Content-Type`) before anything opens upstream or any session makes room, and a request body is capped at 4 MB as it streams in; the daemon's idle-connection cut is lifted only once the body is in.
+An upstream session idle for 10 minutes — no request in flight, no resource subscription held on it — is closed and reopened on the next request; the backend's own session stays, so an idle agent doesn't see its server go away.
+Only a session that is itself gone (connection closed, the server forgot it, no connection to the server) is dropped after a failed request, or one that has failed three times running with timeouts or transport errors (stuck without saying so; a call the backend cancelled is no failure of the session); any other failure is that request's alone, and the calls beside it go on. The hub holds its shared sessions to the same rule, and drops only the session that failed, never a newer one.
+A listing's tool that a strict client would reject is set right (its input schema made an object schema, invalid optional fields dropped) or, with no usable name, left out — so one malformed tool can't make a backend reject the rest, nor be hidden when it can be used.
+Everything closes with the token: when the backend is rebuilt or torn down, or the session ends — the backend's side first, and the server's session with a bounded wait for its `DELETE`.
+
+**Observability.**
+The relay records per-tenant status (tools, last error, cleaned by `cleanMcpError`) where the hub does, so Settings shows one status for a server whichever path used it.
+Minting and revoking a proxy token is not audited (it is the daemon's own bookkeeping); every tool call is already audited by the approval gate.
+
+**Not covered.**
+Legacy HTTP+SSE upstreams (the registry's `http` transport is streamable HTTP); stdio servers (no OAuth); OAuth for `native: true` servers (the backend owns their client).
 
 ## 6. Security
 
@@ -135,9 +211,10 @@ Nothing in §1–§6 assumes Highflame.
 2. OAuth engine on the SDK's `auth()`: begin, complete, access token with refresh, status, disconnect.
 3. Callback route and the `mcp.oauth.*` protocol.
 4. `McpHub` HTTP client uses the engine; tenant flows into the call scope.
-5. Native mounters (claude, codex, gemini-cli, qwen) skip OAuth servers; Settings says so.
+5. Native mounters (claude, codex, gemini-cli, qwen) skip OAuth servers in their direct mounts (claude reaches them since step 7, the rest since step 8).
 6. Settings: connect / disconnect / paste fallback, status per tenant.
-7. Later: the proxy, so native backends mount OAuth servers too.
+7. Claude: in-process mounts in front of the hub, and adopting a server from Claude's config (`mcp.adopt`, #390).
+8. The relay (§5.1), so Codex, the Gemini CLI and Qwen mount OAuth servers too (#396).
 
 ## 9. Testing
 

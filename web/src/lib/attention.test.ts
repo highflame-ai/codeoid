@@ -64,6 +64,26 @@ describe("collectAttention", () => {
     expect(items.some((i) => i.key.includes("t3"))).toBe(false);
   });
 
+  it("lists a held task as an approval, once — not again beside its session's own", () => {
+    const wedged = session("w", { status: "waiting_approval" });
+    const quiet = session("q");
+    const items = collectAttention(
+      sources({
+        sessions: [wedged, quiet],
+        tasks: [
+          task("held-1", { status: "held", workerSessionId: "w", error: "approval outside profile" }),
+          task("held-2", { status: "held", workerSessionId: "q" }),
+        ],
+        taskSession: (t) => (t.workerSessionId === "w" ? wedged : t.workerSessionId === "q" ? quiet : null),
+      }),
+      NOW,
+    );
+    expect(items.map((i) => [i.key, i.kind])).toEqual([
+      ["approval:w", "approval"],
+      ["task:held-2", "approval"],
+    ]);
+  });
+
   it("does not double-count one stoppage as both a dialog and an approval", () => {
     // A session showing a provider dialog is usually ALSO waiting_approval.
     // Counting both would tell the operator two things need them when one does.

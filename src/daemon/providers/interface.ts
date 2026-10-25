@@ -13,6 +13,7 @@
 import type {
   AuthContext,
   ContentPart,
+  EffortLevel,
   ProviderCommand,
   SessionMode,
   UiRequestMethod,
@@ -95,6 +96,13 @@ export interface UiResponse {
 /** Raise a dialog and await the user's answer. Implemented by Session. */
 export type UiRequestFn = (req: UiRequest) => Promise<UiResponse>;
 
+/**
+ * The turn error a backend reports when it stopped itself at its native spend
+ * ceiling (`TurnOpts.maxBudgetUsd`). One constant, so a caller (routines) can
+ * tell "over budget" from any other failure without parsing vendor text.
+ */
+export const BUDGET_STOP_MESSAGE = "Stopped at the spend ceiling for this run (maxBudgetUsd).";
+
 export interface TurnOpts {
   /**
    * Full canonical history up to and including the current user turn.
@@ -106,6 +114,8 @@ export interface TurnOpts {
   userMessage: string;
   model?: string;
   fallbackModel?: string;
+  /** Thinking effort for this turn (#417), on codeoid's scale; absent = the backend's default. */
+  effort?: EffortLevel;
   workdir: string;
   systemPromptAppend?: string;
   /** Session's unified approval gate — same semantics across all providers. */
@@ -131,6 +141,15 @@ export interface TurnOpts {
    * carries the mode. Absent = treat as `guarded`.
    */
   mode?: SessionMode;
+  /**
+   * Spend ceiling (USD) for the backend's own query loop, for backends that
+   * can enforce one natively (Claude: the SDK's `maxBudgetUsd`, which counts
+   * spend since its query started). Set only on sessions whose query lifetime
+   * IS the budget's scope — a routine's fresh run session. Absent = no cap.
+   * Backends without native enforcement ignore it; the daemon still checks
+   * spend between turns.
+   */
+  maxBudgetUsd?: number;
   /**
    * Subagents contributed by an ambient-activated pack (docs/pack-loading.md).
    * The Claude backend maps these to the SDK's programmatic `agents` option so
@@ -184,6 +203,94 @@ export interface NormalizedTurnResult {
   stopReason?: string;
   isError?: boolean;
   errorMessage?: string;
+  /**
+   * The backend's own result text for a turn it flagged as an error without
+   * an error subtype (Claude: `subtype: "success"`, `is_error: true`) — where
+   * the CLI puts a usage-limit or "API Error: …" notice. Text the CLI wrote,
+   * possibly the model's: read only with CLI-shaped rules (classifyCliNotice).
+   */
+  resultText?: string;
+  /**
+   * Where this turn ends in the backend's OWN record of the conversation, for
+   * a backend that can later fork or resume from that point natively (#387).
+   * Stamped on the canonical turn, so a fork, rewind or restart can continue
+   * the backend's own conversation instead of a rendered transcript.
+   */
+  nativeRef?: NativeTurnRef;
+}
+
+/**
+ * A point in a backend's native conversation: the backing session/thread and
+ * the backend's id for the last entry of a turn in it (a Claude transcript
+ * entry uuid, a Codex turn id). Opaque to everything but the provider that
+ * minted it.
+ */
+export interface NativeTurnRef {
+  backingId: string;
+  ref: string;
+  /**
+   * The working directory the backing session ran in, when the backend files
+   * sessions by it (Claude): a fork looks the source up there and nowhere else.
+   */
+  dir?: string;
+  /**
+   * Some tool output in this backing session was redacted by a tool_result
+   * hook: the backend's own record holds the original, so this point must not
+   * be forked natively. Stamped by the session on every later turn of the
+   * backing, so it survives history that no longer shows the redacted call.
+   */
+  redacted?: boolean;
+}
+
+/** What a session asks a provider when it hands it an existing conversation. */
+export interface NativeContinuationRequest {
+  /** The conversation to continue, oldest first. */
+  history: readonly CanonicalTurn[];
+  /**
+   * Set when the history's last turn ran on THIS backend and it recorded where
+   * that turn ends: the provider may fork its own conversation there, which
+   * loses nothing (reasoning included).
+   */
+  forkFrom?: NativeTurnRef;
+  /** Char budget for history the provider builds itself (sized to the target window). */
+  maxChars: number;
+  /**
+   * False when the history holds turns rebuilt from a displayed transcript:
+   * the provider may fork, but must not build native history from them —
+   * resolve null instead (the session uses the transcript).
+   */
+  allowHistory?: boolean;
+  /** Where the continued session runs. */
+  workdir: string;
+}
+
+/** A native continuation that took. */
+export interface NativeContinuationResult {
+  /** `fork`: the backend's own conversation, forked. `history`: native history codeoid built. */
+  via: "fork" | "history";
+  /**
+   * The backend's new backing session/thread id, when it exists already: the
+   * session persists it and treats the backend as holding the conversation.
+   * Absent for a backend that builds it on its first turn (Codex needs that
+   * turn's instructions); until then a restart re-runs the continuation.
+   */
+  backingId?: string;
+  /** Set when building the history dropped older turns to fit the budget. */
+  truncation?: HistorySeedResult;
+}
+
+/** One backend-mounted MCP server's state, as the backend reports it. */
+export interface BackendMcpServerState {
+  status: string;
+  /** Full tool names (`mcp__<server>__<tool>`), matching the `mcp_init` event. */
+  tools: string[];
+  error?: string;
+  /** A claude.ai connector, by the backend's own account (signed in on claude.ai, not by the CLI). */
+  connector?: boolean;
+  /** The backend still runs its own copy of a server codeoid signs in to now
+   *  (adopted since the query started, #390): not redialed — the next query
+   *  uses codeoid's copy. */
+  codeoidOwned?: boolean;
 }
 
 // ── Provider event stream ─────────────────────────────────────────────────────
@@ -227,6 +334,8 @@ export type ProviderEvent =
       /** The backend refused this call itself, never asking codeoid's gate
        *  (codex declining an approval it can't show, #369) — audited. */
       declinedByBackend?: boolean;
+      /** A tool_result hook replaced `output`: the backend's own record still holds the original. */
+      redacted?: boolean;
     }
   | { type: "subagent_start"; agentId: string; agentType: string }
   | { type: "subagent_stop"; agentId: string }
@@ -234,6 +343,20 @@ export type ProviderEvent =
   /** Per-LLM-call usage, split by primary vs subagent (null parent_tool_use_id = primary). */
   | { type: "llm_call"; usage: LLMCallUsage; isPrimary: boolean }
   | { type: "api_retry"; attempt?: number; retryDelayMs?: number; errorStatus?: number | null }
+  /**
+   * The backend's plan rate-limit state changed (Claude's `rate_limit_event`,
+   * subscription accounts only). `rejected` means requests are refused until
+   * `resetsAt` (epoch ms) — the exact reset a usage-limit error's text often
+   * gives only as a wall-clock time. Observational: nothing retries on it.
+   */
+  | {
+      type: "rate_limit";
+      status: "allowed" | "allowed_warning" | "rejected";
+      resetsAt?: number;
+      limitType?: string;
+      /** Extra usage (overage) is carrying requests past the spent window — nothing is refused. */
+      overage?: boolean;
+    }
   | { type: "tool_progress"; toolName?: string; elapsedSeconds?: number }
   /**
    * Provider-authored standalone message — extension output, status cards,
@@ -259,7 +382,12 @@ export type ProviderEvent =
    * denied. Distinct from a tool approval, whose SDK turn is still live.
    */
   | { type: "approval_pending"; command: string }
-  | { type: "error"; message: string };
+  /**
+   * The turn failed. `detail` is the backend's STRUCTURED error, when it gave
+   * one (codex's `codexErrorInfo` + reset instant — codexErrorDetail): read by
+   * the usage-limit classifier, never shown. `message` stays the display text.
+   */
+  | { type: "error"; message: string; detail?: Record<string, unknown> };
 
 /**
  * True when a text/thinking ProviderEvent was produced by a subagent
@@ -406,6 +534,11 @@ export interface ModelInfo {
   /** Context window in tokens, when the backend publishes it on its catalog.
    *  qwen-code and pi do; Claude and codex report the window per turn. */
   contextWindow?: number;
+  /** Thinking efforts the model takes, when the backend reports them (#417). */
+  efforts?: EffortLevel[];
+  defaultEffort?: EffortLevel;
+  /** The model the backend runs when none is chosen. */
+  isDefault?: boolean;
 }
 
 /**
@@ -422,6 +555,12 @@ export interface CatalogEntry {
   displayName: string;
   description?: string;
   contextWindow?: number;
+  /** Thinking efforts the model takes (#417), when the backend reports them; [] = it doesn't think. */
+  efforts?: EffortLevel[];
+  /** The backend's default effort for the model, when it says. */
+  defaultEffort?: EffortLevel;
+  /** The model the backend runs when none is chosen, when it says (the effort picker reads its levels). */
+  isDefault?: boolean;
 }
 
 /**
@@ -491,6 +630,40 @@ export interface AgentProvider {
    */
   seedText?(block: string): void;
   /**
+   * Redial one of the MCP servers the backend itself mounts (#389) and report
+   * its state afterwards. Resolves null when the backend has no live
+   * connection to ask (no live query: before its first turn, or after a teardown) — it dials its
+   * servers when the next turn starts anyway. Never throws for a failed
+   * reconnect: that's a result with `status` and `error`.
+   */
+  reconnectMcpServer?(name: string): Promise<BackendMcpServerState | null>;
+  /**
+   * Thinking effort (#417): how a change reaches this backend. Absent or
+   * "turn" = it takes each turn's `TurnOpts.effort`; "restart" = only when the
+   * backend starts (the Gemini CLI's settings), so the session rebuilds it
+   * before the next turn.
+   */
+  readonly effortChange?: "turn" | "restart";
+  /** What Default means on this backend now, once known (#417) — for the session's pickers. */
+  readonly defaultEffort?: EffortLevel | null;
+  /** The model it runs when the session names none, once known. */
+  readonly runningModel?: string | null;
+  /**
+   * Apply a new effort to the running backend now, where it can (Claude,
+   * Qwen, pi) — never cutting a turn short. True when it did; false (or
+   * absent) = it applies from the next turn's options.
+   */
+  applyEffort?(effort: EffortLevel | null): Promise<boolean>;
+  /**
+   * Hand this (fresh) backend an existing conversation in its OWN native form,
+   * instead of a transcript in the first prompt (#387): fork its own
+   * conversation at `forkFrom` when given, else build native history from
+   * `history`. Resolves null when the backend can't, and the session falls
+   * back to the transcript seed; a throw is treated the same. On success the
+   * backend's backing id is `result.backingId` and its next turn resumes it.
+   */
+  continueNatively?(req: NativeContinuationRequest): Promise<NativeContinuationResult | null>;
+  /**
    * True when codeoid's memory recall tools (recall/recall_file/timeline/
    * get_episode) are mounted for this provider+session, so the model can page
    * the verbatim store on demand. A context-light strategy (session map) is
@@ -509,6 +682,22 @@ export interface AgentProvider {
    * applies the new input to what it actually executes.
    */
   readonly appliesToolInputRewrite?: boolean;
+  /**
+   * False when, in autonomous mode, the backend runs tool calls WITHOUT
+   * asking canUseTool — so codeoid's autonomous tool budget (and
+   * `onBudgetExhausted`) cannot see, count or stop them. Codex: autonomous
+   * maps to `approvalPolicy: "never"`. Absent = true (every call is gated).
+   * A loop controller falls back to wall-time limits (supervisor.ts) there.
+   */
+  readonly enforcesToolBudget?: boolean;
+  /**
+   * Pids of the processes this backend spawned itself (its CLI / app-server)
+   * that are alive now. Session.terminateBackend snapshots their whole tree
+   * before the teardown and kills what outlives it (process-tree.ts). Absent
+   * or empty = unknown (in-process backends; qwen-code, whose SDK spawns
+   * internally): only the teardown runs.
+   */
+  backendProcessIds?(): Promise<number[]>;
   dispose(): Promise<void>;
 }
 
@@ -522,6 +711,14 @@ export interface AgentProvider {
 export interface SessionProvider extends AgentProvider {
   /** Set by Session before each runTurn(). Handles "backing session lost" errors. */
   onRecoveryNeeded: ((content: string) => void) | undefined;
+  /**
+   * Set by Session. A backend that could not resume its native conversation
+   * (a thread written under another account's home, a vendor that lost it)
+   * and is about to start an empty one calls this, synchronously, before it
+   * sends the prompt: Session seeds it with the canonical history so the
+   * conversation carries on instead of silently starting over.
+   */
+  onHistoryLost?: (() => void) | undefined;
   /**
    * The session-lifetime event listener (at most one — the owning Session).
    * Session-scoped events MUST be delivered here and never through

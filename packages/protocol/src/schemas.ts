@@ -19,7 +19,7 @@
 
 import { z } from "zod";
 import type { AuthMsg, ClientMessage } from "./types.js";
-import { LIMITS } from "./types.js";
+import { EFFORT_LEVELS, LIMITS } from "./types.js";
 
 // ── Shared field schemas ──────────────────────────────────────────────────────
 
@@ -108,6 +108,8 @@ export const sessionCreateSchema = z.object({
    * schema opaquely rejecting the whole create.
    */
   providerId: z.string().min(1).max(64).optional(),
+  claudeAccount: z.string().min(1).max(64).optional(),
+  account: z.string().min(1).max(64).optional(),
   /**
    * Collaborative session config (docs/collaborative-session-design.md §9).
    *
@@ -125,6 +127,8 @@ export const sessionCreateSchema = z.object({
    * daemon can answer with a specific error, same rule as `providerId`.
    */
   model: z.string().min(1).max(LIMITS.MODEL_MAX).optional(),
+  /** Thinking effort (#417). */
+  effort: z.enum(EFFORT_LEVELS).nullable().optional(),
   /**
    * Activate an installed SDLC pack on this session (ambient mode —
    * docs/pack-loading.md): its constitution is injected into the system
@@ -279,6 +283,37 @@ export const sessionSearchSchema = z.object({
   limit: z.number().int().min(1).max(100).optional(),
 });
 
+export const sessionMcpReconnectSchema = z.object({
+  ...base,
+  type: z.literal("session.mcp_reconnect"),
+  sessionId: sessionIdField,
+  // Server names as backends report them, e.g. "slack", "claude.ai Gmail".
+  server: z.string().regex(/^[\w .:()-]{1,128}$/),
+});
+
+export const sessionMcpRefreshSchema = z.object({
+  ...base,
+  type: z.literal("session.mcp_refresh"),
+  sessionId: sessionIdField,
+});
+
+export const mcpApproveSchema = z.object({
+  ...base,
+  type: z.literal("mcp.approve"),
+  sessionId: sessionIdField,
+  server: z.string().regex(/^[\w .:()-]{1,128}$/),
+  path: z.string().max(4096).optional(),
+  fingerprint: z.string().regex(/^[0-9a-f]{32}$/),
+});
+
+export const mcpApprovePreviewSchema = z.object({
+  ...base,
+  type: z.literal("mcp.approve.preview"),
+  sessionId: sessionIdField,
+  server: z.string().regex(/^[\w .:()-]{1,128}$/),
+  path: z.string().max(4096).optional(),
+});
+
 export const sessionSetProviderSchema = z.object({
   ...base,
   type: z.literal("session.set_provider"),
@@ -294,6 +329,13 @@ export const sessionSetModelSchema = z.object({
   sessionId: sessionIdField,
   model: z.string().min(1).max(LIMITS.MODEL_MAX),
   fallbackModel: z.string().max(LIMITS.MODEL_MAX).nullable().optional(),
+});
+
+export const sessionSetEffortSchema = z.object({
+  ...base,
+  type: z.literal("session.set_effort"),
+  sessionId: sessionIdField,
+  effort: z.enum(EFFORT_LEVELS).nullable(),
 });
 
 export const sessionForkSchema = z.object({
@@ -476,12 +518,152 @@ export const settingsSetSchema = z.object({
  * it can name belongs in the validated surface rather than in a lookup that
  * happens to miss.
  */
-const loginBackendField = z.enum(["claude"]);
+const loginBackendField = z.enum(["claude", "codex"]);
+
+const claudeAccountNameField = z.string().min(1).max(64);
 
 export const backendLoginStartSchema = z.object({
   ...base,
   type: z.literal("backend.login.start"),
   backend: loginBackendField,
+  account: claudeAccountNameField.optional(),
+  replace: z.boolean().optional(),
+});
+
+/**
+ * A backend id an account belongs to. A bounded string, not an enum, so a
+ * frame for a backend this daemon lacks still parses and gets a specific
+ * error; the daemon checks it against the kinds it knows.
+ */
+const accountBackendField = z.string().min(1).max(64);
+const accountNameField = z.string().min(1).max(64);
+
+export const accountsListSchema = z.object({
+  ...base,
+  type: z.literal("accounts.list"),
+  backend: accountBackendField.optional(),
+});
+
+export const accountsSetSchema = z.object({
+  ...base,
+  type: z.literal("accounts.set"),
+  backend: accountBackendField,
+  name: accountNameField,
+  kind: z.enum(["subscription", "gateway", "api-key", "chatgpt-login", "api-keys", "bedrock"]),
+  token: z.string().min(1).max(8192).optional(),
+  baseUrl: z.string().min(1).max(2048).optional(),
+  headers: z.record(z.string().min(1).max(256), z.string().max(8192)).optional(),
+  env: z.record(z.string().min(1).max(128), z.string().min(1).max(8192)).optional(),
+  replace: z.boolean().optional(),
+});
+
+export const accountsRemoveSchema = z.object({
+  ...base,
+  type: z.literal("accounts.remove"),
+  backend: accountBackendField,
+  name: accountNameField,
+});
+
+export const accountsSetDefaultSchema = z.object({
+  ...base,
+  type: z.literal("accounts.set_default"),
+  backend: accountBackendField,
+  name: accountNameField,
+});
+
+export const sessionSetAccountSchema = z.object({
+  ...base,
+  type: z.literal("session.set_account"),
+  sessionId: sessionIdField,
+  account: accountNameField.nullable(),
+  backend: accountBackendField.optional(),
+});
+
+export const claudeAccountsListSchema = z.object({
+  ...base,
+  type: z.literal("claude.accounts.list"),
+});
+
+export const claudeAccountsSetSchema = z.object({
+  ...base,
+  type: z.literal("claude.accounts.set"),
+  name: claudeAccountNameField,
+  kind: z.enum(["subscription", "gateway", "api-key"]),
+  token: z.string().min(1).max(8192),
+  baseUrl: z.string().min(1).max(2048).optional(),
+  headers: z.record(z.string().min(1).max(256), z.string().max(8192)).optional(),
+});
+
+export const claudeAccountsRemoveSchema = z.object({
+  ...base,
+  type: z.literal("claude.accounts.remove"),
+  name: claudeAccountNameField,
+});
+
+export const claudeAccountsSetDefaultSchema = z.object({
+  ...base,
+  type: z.literal("claude.accounts.set_default"),
+  name: claudeAccountNameField,
+});
+
+export const sessionSetClaudeAccountSchema = z.object({
+  ...base,
+  type: z.literal("session.set_claude_account"),
+  sessionId: sessionIdField,
+  account: claudeAccountNameField.nullable(),
+});
+
+const endpointNameField = z.string().min(1).max(64);
+const endpointHeadersField = z.record(z.string().min(1).max(256), z.string().max(8192));
+const endpointModelField = z.object({
+  id: z.string().min(1).max(256),
+  name: z.string().min(1).max(256).optional(),
+  contextWindow: z.number().int().positive().optional(),
+  maxTokens: z.number().int().positive().optional(),
+});
+
+export const providersListSchema = z.object({
+  ...base,
+  type: z.literal("providers.list"),
+});
+
+export const endpointsListSchema = z.object({
+  ...base,
+  type: z.literal("endpoints.list"),
+});
+
+export const endpointsSetSchema = z.object({
+  ...base,
+  type: z.literal("endpoints.set"),
+  name: endpointNameField,
+  displayName: z.string().max(128).optional(),
+  baseUrl: z.string().min(1).max(2048),
+  flavor: z.enum(["openai", "llamacpp"]).optional(),
+  apiKey: z.string().max(8192).nullable().optional(),
+  headers: endpointHeadersField.optional(),
+  models: z.array(endpointModelField).max(500).optional(),
+  defaultModel: z.string().min(1).max(256).nullable().optional(),
+  contextWindow: z.number().int().positive().nullable().optional(),
+  mcpServers: z.union([z.literal("all"), z.array(z.string().min(1).max(128)).max(200)]).optional(),
+  streamUsage: z.boolean().optional(),
+  strictToolSchemas: z.boolean().optional(),
+  maxTokensField: z.enum(["max_tokens", "max_completion_tokens"]).optional(),
+});
+
+export const endpointsRemoveSchema = z.object({
+  ...base,
+  type: z.literal("endpoints.remove"),
+  name: endpointNameField,
+});
+
+export const endpointsTestSchema = z.object({
+  ...base,
+  type: z.literal("endpoints.test"),
+  name: endpointNameField.optional(),
+  baseUrl: z.string().min(1).max(2048).optional(),
+  flavor: z.enum(["openai", "llamacpp"]).optional(),
+  apiKey: z.string().max(8192).nullable().optional(),
+  headers: endpointHeadersField.optional(),
 });
 
 export const backendLoginSubmitSchema = z.object({
@@ -489,6 +671,12 @@ export const backendLoginSubmitSchema = z.object({
   type: z.literal("backend.login.submit"),
   loginId: z.string().min(1).max(128),
   code: z.string().min(1).max(LIMITS.LOGIN_CODE_MAX),
+});
+
+export const backendLoginWaitSchema = z.object({
+  ...base,
+  type: z.literal("backend.login.wait"),
+  loginId: z.string().min(1).max(128),
 });
 
 export const backendLoginCancelSchema = z.object({
@@ -518,6 +706,14 @@ export const mcpOAuthDisconnectSchema = z.object({
   ...base,
   type: z.literal("mcp.oauth.disconnect"),
   server: mcpServerNameField,
+});
+
+export const mcpAdoptSchema = z.object({
+  ...base,
+  type: z.literal("mcp.adopt"),
+  server: mcpServerNameField,
+  sessionId: sessionIdField.optional(),
+  url: z.string().max(2048).optional(),
 });
 
 // ── Skill command pre-approval (#348) ─────────────────────────────────────────
@@ -590,6 +786,112 @@ export const sessionCompareSchema = z.object({
   afterTurnId: z.string().min(1).max(128).optional(),
 });
 
+// ── Routines (docs/routines.md) ───────────────────────────────────────────────
+// Shape and bounds only; the daemon's RoutineService validates semantics
+// (cron syntax, timezones, workdir, provider, ranges) with specific messages.
+
+const routineRef = z.string().min(1).max(LIMITS.ID_MAX);
+const routineScheduleSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("cron"), expr: z.string().min(1).max(256), timezone: z.string().min(1).max(64).optional() }),
+  z.object({ kind: z.literal("every"), seconds: z.number().int().positive() }),
+  z.object({ kind: z.literal("once"), at: z.string().min(1).max(64) }),
+]);
+const routineSpecFields = {
+  name: z.string().min(1).max(LIMITS.NAME_MAX),
+  prompt: z.string().min(1).max(20_000),
+  workdir: pathField.min(1),
+  provider: z.string().min(1).max(64),
+  model: z.string().min(1).max(LIMITS.MODEL_MAX),
+  schedule: routineScheduleSchema,
+  check: z.object({ command: z.string().min(1).max(4_000), timeoutSeconds: z.number().int().positive().optional() }),
+  approvals: z.enum(["autonomous", "guarded"]),
+  toolBudget: z.number().int(),
+  maxMinutes: z.number().int(),
+  maxCostUsd: z.number(),
+  dailyCostUsd: z.number(),
+  session: z.enum(["fresh", "persistent"]),
+  worktree: z.boolean(),
+  overlap: z.enum(["skip", "queue"]),
+  catchUp: z.boolean(),
+  jitterSeconds: z.number().int(),
+  notify: z.enum(["on_change", "always", "never"]),
+  keepSessions: z.number().int(),
+  api: z.boolean(),
+  failurePauseAfter: z.number().int(),
+};
+const routineSpecSchema = z.object({
+  name: routineSpecFields.name,
+  prompt: routineSpecFields.prompt,
+  workdir: routineSpecFields.workdir,
+  provider: routineSpecFields.provider.optional(),
+  model: routineSpecFields.model.optional(),
+  schedule: routineSpecFields.schedule.optional(),
+  check: routineSpecFields.check.optional(),
+  approvals: routineSpecFields.approvals.optional(),
+  toolBudget: routineSpecFields.toolBudget.optional(),
+  maxMinutes: routineSpecFields.maxMinutes.optional(),
+  maxCostUsd: routineSpecFields.maxCostUsd.optional(),
+  dailyCostUsd: routineSpecFields.dailyCostUsd.optional(),
+  session: routineSpecFields.session.optional(),
+  worktree: routineSpecFields.worktree.optional(),
+  overlap: routineSpecFields.overlap.optional(),
+  catchUp: routineSpecFields.catchUp.optional(),
+  jitterSeconds: routineSpecFields.jitterSeconds.optional(),
+  notify: routineSpecFields.notify.optional(),
+  keepSessions: routineSpecFields.keepSessions.optional(),
+  api: routineSpecFields.api.optional(),
+  failurePauseAfter: routineSpecFields.failurePauseAfter.optional(),
+});
+/** An update: every field optional, and `null` clears an optional one. */
+const routinePatchSchema = z.object(
+  Object.fromEntries(Object.entries(routineSpecFields).map(([k, v]) => [k, v.nullable().optional()])) as {
+    [K in keyof typeof routineSpecFields]: z.ZodOptional<z.ZodNullable<(typeof routineSpecFields)[K]>>;
+  },
+);
+
+// ── Evidence (docs/loop-engineering-design.md §7) ─────────────────────────────
+
+export const evidenceGetSchema = z.object({ ...base, type: z.literal("evidence.get"), evidenceId: idField });
+
+export const routineCreateSchema = z.object({ ...base, type: z.literal("routine.create"), spec: routineSpecSchema });
+export const routineUpdateSchema = z.object({
+  ...base,
+  type: z.literal("routine.update"),
+  routine: routineRef,
+  spec: routinePatchSchema.optional(),
+  enabled: z.boolean().optional(),
+});
+export const routineDeleteSchema = z.object({ ...base, type: z.literal("routine.delete"), routine: routineRef });
+export const routineListSchema = z.object({ ...base, type: z.literal("routine.list") });
+export const routineGetSchema = z.object({
+  ...base,
+  type: z.literal("routine.get"),
+  routine: routineRef,
+  runs: z.number().int().min(0).max(100).optional(),
+});
+export const routineRunSchema = z.object({
+  ...base,
+  type: z.literal("routine.run"),
+  routine: routineRef,
+  payload: z.string().max(16_000).optional(),
+});
+export const routineCancelRunSchema = z.object({ ...base, type: z.literal("routine.cancel_run"), runId: idField });
+export const routineRunsSchema = z.object({
+  ...base,
+  type: z.literal("routine.runs"),
+  routine: routineRef,
+  limit: z.number().int().min(1).max(200).optional(),
+  before: z.string().min(1).max(64).optional(),
+  runId: z.string().min(1).max(64).optional(),
+});
+export const routineTokenSchema = z.object({ ...base, type: z.literal("routine.token"), routine: routineRef });
+export const routinePreviewSchema = z.object({
+  ...base,
+  type: z.literal("routine.preview"),
+  schedule: routineScheduleSchema,
+  count: z.number().int().min(1).max(20).optional(),
+});
+
 export const compareGetSchema = z.object({ ...base, type: z.literal("compare.get"), compareId: z.string().min(1).max(128) });
 export const compareListSchema = z.object({ ...base, type: z.literal("compare.list"), sessionId: sessionIdField });
 export const compareKeepSchema = z.object({
@@ -598,6 +900,18 @@ export const compareKeepSchema = z.object({
   compareId: z.string().min(1).max(128),
   sessionId: sessionIdField,
   discardOthers: z.boolean().optional(),
+});
+
+export const worktreeTrustSchema = z.object({
+  ...base,
+  type: z.literal("worktree.trust"),
+  dir: pathField.min(1),
+  dryRun: z.boolean().optional(),
+  off: z.boolean().optional(),
+  recipeHash: z
+    .string()
+    .regex(/^[0-9a-f]{40,64}$/)
+    .optional(),
 });
 
 export const skillGrantSchema = z.object({
@@ -802,7 +1116,12 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   sessionRotateSchema,
   sessionSearchSchema,
   sessionSetModelSchema,
+  sessionSetEffortSchema,
   sessionSetProviderSchema,
+  sessionMcpReconnectSchema,
+  sessionMcpRefreshSchema,
+  mcpApproveSchema,
+  mcpApprovePreviewSchema,
   sessionForkSchema,
   scrollbackPageSchema,
   sessionRenameSchema,
@@ -822,17 +1141,46 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   backendLoginStartSchema,
   backendLoginSubmitSchema,
   backendLoginCancelSchema,
+  backendLoginWaitSchema,
   skillGrantSchema,
+  worktreeTrustSchema,
   sessionTurnsSchema,
   sessionApprovalsSchema,
+  claudeAccountsListSchema,
+  claudeAccountsSetSchema,
+  claudeAccountsRemoveSchema,
+  claudeAccountsSetDefaultSchema,
+  sessionSetClaudeAccountSchema,
+  accountsListSchema,
+  accountsSetSchema,
+  accountsRemoveSchema,
+  accountsSetDefaultSchema,
+  sessionSetAccountSchema,
+  providersListSchema,
+  endpointsListSchema,
+  endpointsSetSchema,
+  endpointsRemoveSchema,
+  endpointsTestSchema,
   sessionRewindSchema,
   sessionCompareSchema,
   compareGetSchema,
+  routineCreateSchema,
+  routineUpdateSchema,
+  routineDeleteSchema,
+  routineListSchema,
+  routineGetSchema,
+  routineRunSchema,
+  routineCancelRunSchema,
+  routineRunsSchema,
+  routineTokenSchema,
+  routinePreviewSchema,
+  evidenceGetSchema,
   compareListSchema,
   compareKeepSchema,
   mcpOAuthBeginSchema,
   mcpOAuthCompleteSchema,
   mcpOAuthDisconnectSchema,
+  mcpAdoptSchema,
   usageDailySchema,
   pipelineCreateSchema,
   pipelineListSchema,

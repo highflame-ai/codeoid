@@ -12,12 +12,13 @@
  * in Session/SessionManager changes.
  */
 
+import type { ResolvedClaudeAccount } from "../claude-accounts.js";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import type { Store } from "../store.js";
 import type { AgentIdentityManager } from "../agent-identity.js";
 import type { MemoryEngine } from "../memory/index.js";
 import type { MemoryMcpMount } from "../memory/mcp-http.js";
-import type { McpRegistry } from "../mcp/registry.js";
+import type { McpServerView } from "../mcp/registry.js";
 import type { McpHub } from "../mcp/hub.js";
 import type { McpTenant } from "../mcp/oauth.js";
 import type { CompressionRegistry } from "../compress/index.js";
@@ -36,6 +37,9 @@ import { GEMINI_CLI_INSTALL_HINT, resolveGeminiCliCommand } from "./acp/resolve.
 import { QwenProvider } from "./qwen/index.js";
 import { StatelessSessionProvider } from "./stateless.js";
 import { LLAMACPP_DISPLAY_NAME, LLAMACPP_PROVIDER_ID, createLlamaCppProvider } from "./llamacpp/index.js";
+import type { EndpointStore } from "../openai-endpoints.js";
+import { AccountError, type AccountStore, type ResolvedAccount } from "../accounts.js";
+import { type EndpointCatalog, syncEndpointProviders } from "./endpoint/index.js";
 
 /**
  * Everything a factory may need to construct a provider for ONE session.
@@ -62,7 +66,7 @@ export interface ProviderSessionInit {
    *  inits for why it is a getter and not a value. */
   blackboardMcp?: () => { url: string; token: string } | undefined;
   /** Cross-backend MCP registry — the servers to mount on this session's backend. */
-  mcpRegistry?: McpRegistry;
+  mcpRegistry?: McpServerView;
   /** Daemon-owned MCP client pool backing the registry (Model-B backends execute
    *  external tool calls through it; Model-A backends mount servers natively). */
   mcpHub?: McpHub;
@@ -72,6 +76,30 @@ export interface ProviderSessionInit {
   compressionRegistry?: CompressionRegistry;
   /** Live model-catalog report, already tagged with the factory's id by Session. */
   onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
+  /** The session's Claude account, resolved per query — Claude backend only (claude-accounts.ts). */
+  resolveClaudeAccount?: () => ResolvedClaudeAccount | null;
+  /**
+   * The session's account for THIS backend, resolved now (accounts.ts); null
+   * = the daemon's own credential. Throws when the chosen account can't be
+   * used — a provider surfaces that as the turn's error, never falls back.
+   * HTTP backends call it per turn; process backends when they spawn.
+   */
+  resolveAccount?: () => ResolvedAccount | null;
+  /**
+   * Caller-supplied env for the backend's child process (SessionCreateOptions
+   * .extraEnv), merged last via `withExtraEnv` (env.ts), which never lets it
+   * override a credential / account-isolation variable. Honored by every
+   * process-backed provider — claude, codex, gemini-cli, pi, qwen. In-process
+   * backends (openai, gemini, llama.cpp, user endpoints) spawn nothing, so it
+   * has no effect there.
+   */
+  extraEnv?: Readonly<Record<string, string>>;
+}
+
+/** An HTTP backend's key from the session's account (accounts.ts), or null for the daemon's own. */
+function accountKey(init: ProviderSessionInit): { key: string; fingerprint: string } | null {
+  const account = init.resolveAccount?.() ?? null;
+  return account ? { key: account.account.token ?? "", fingerprint: account.fingerprint } : null;
 }
 
 export interface ProviderFactory {
@@ -97,11 +125,50 @@ export class ProviderRegistry {
     this.defaultId = defaultId;
   }
 
+  /**
+   * Builds a factory for an id that is not registered but belongs to a family
+   * whose members come and go at runtime (user-defined endpoints, `oai:*`).
+   * Consulted by `resolve` only — `has` stays strict, so nothing new can be
+   * created on an id that isn't registered.
+   */
+  #prefixResolver: ((id: string) => ProviderFactory | undefined) | null = null;
+
   register(factory: ProviderFactory): void {
     if (this.#factories.has(factory.id)) {
       throw new Error(`Provider "${factory.id}" is already registered`);
     }
     this.#factories.set(factory.id, factory);
+    // Registered after startup (it gained accounts): no longer "unavailable".
+    this.#unavailable.delete(factory.id);
+  }
+
+  /**
+   * Remove a factory (a user-defined endpoint was removed). Sessions already
+   * built from it keep their provider instance; whether that instance still
+   * works is the factory's business (endpoint providers refuse to run).
+   */
+  unregister(id: string): boolean {
+    if (id === this.defaultId) throw new Error(`Provider "${id}" is the default and can't be removed`);
+    return this.#factories.delete(id);
+  }
+
+  /** Swap a registered factory for one with the same id (a re-labelled endpoint) — the default included. */
+  replace(factory: ProviderFactory): void {
+    if (!this.#factories.has(factory.id)) throw new Error(`Provider "${factory.id}" is not registered`);
+    this.#factories.set(factory.id, factory);
+  }
+
+  setPrefixResolver(resolver: (id: string) => ProviderFactory | undefined): void {
+    this.#prefixResolver = resolver;
+  }
+
+  /**
+   * Can a session that ran on `id` be rebuilt on it — registered now, or a
+   * member of a runtime family (a removed endpoint, which then refuses to
+   * run with its own message instead of the session being moved elsewhere)?
+   */
+  resolvable(id: string): boolean {
+    return this.#factories.has(id) || this.#prefixResolver?.(id) !== undefined;
   }
 
   has(id: string): boolean {
@@ -152,7 +219,7 @@ export class ProviderRegistry {
    */
   resolve(id: string | undefined, logContext: string): ProviderFactory {
     const requested = id ?? this.defaultId;
-    const factory = this.#factories.get(requested);
+    const factory = this.#factories.get(requested) ?? this.#prefixResolver?.(requested);
     if (factory) return factory;
     console.warn(
       `[codeoid/${logContext}] unknown provider "${requested}" — falling back to ${this.defaultId}`,
@@ -211,12 +278,88 @@ const ENABLE_KEY: Record<string, string> = {
  * by a newer codeoid — a misspelled default is operator error, and falling
  * back would silently put every new session on a backend they opted out of.
  */
+/** HTTP backends that need a key: one in the environment, or a named account. */
+const KEYED_BACKENDS = [
+  {
+    id: "gemini",
+    displayName: "Gemini (Google)",
+    envKey: "GOOGLE_API_KEY",
+    missing: "GOOGLE_API_KEY is not set — add it to ~/.codeoid/.env, or add a Gemini account, to use the Gemini backend",
+  },
+  {
+    id: "openai",
+    displayName: "OpenAI",
+    envKey: "OPENAI_API_KEY",
+    missing: "OPENAI_API_KEY is not set — add it to ~/.codeoid/.env, or add an OpenAI account, to use the OpenAI backend",
+  },
+] as const;
+
+function hasAccounts(accounts: AccountStore | undefined, backend: string): boolean {
+  try {
+    return (accounts?.list(backend).length ?? 0) > 0;
+  } catch {
+    return false; // an unreadable accounts file: no accounts to offer
+  }
+}
+
+/**
+ * A keyed backend's key for one turn: the session's account, else the
+ * environment's. Neither = a clear refusal, not a 401 from the vendor.
+ */
+function keyFor(init: ProviderSessionInit, backend: (typeof KEYED_BACKENDS)[number], env: Record<string, string | undefined>) {
+  const account = accountKey(init);
+  if (account) return account;
+  if (!env[backend.envKey]) {
+    throw new AccountError(`the ${backend.id} backend has no key of its own (${backend.envKey}) — choose an account for this session, or set a default ${backend.id} account`);
+  }
+  return null;
+}
+
+function keyedFactory(backend: (typeof KEYED_BACKENDS)[number], env: Record<string, string | undefined>): ProviderFactory {
+  const common = (init: ProviderSessionInit) => ({
+    defaultModel: init.model ?? undefined,
+    resolveApiKey: () => keyFor(init, backend, env),
+    memory: init.memory,
+    workspaceId: init.workspaceId,
+    tenant: init.tenant,
+    sessionId: init.sessionId,
+    mcpRegistry: init.mcpRegistry,
+    mcpHub: init.mcpHub,
+  });
+  return {
+    id: backend.id,
+    displayName: backend.displayName,
+    create: (init) =>
+      new StatelessSessionProvider(backend.id === "gemini" ? new GeminiProvider(common(init)) : new OpenAIProvider(common(init)), init.sessionId),
+  };
+}
+
+/**
+ * Register a keyed backend that has gained accounts since startup (accounts
+ * are added while the daemon runs). Never unregisters: sessions may be on it.
+ * Returns whether anything changed.
+ */
+export function registerAccountBackends(registry: ProviderRegistry, accounts: AccountStore, env: Record<string, string | undefined> = process.env): boolean {
+  let changed = false;
+  for (const backend of KEYED_BACKENDS) {
+    if (!registry.has(backend.id) && hasAccounts(accounts, backend.id)) {
+      registry.register(keyedFactory(backend, env));
+      changed = true;
+    }
+  }
+  return changed;
+}
+
 export function createDefaultProviderRegistry(
   config?: CodeoidConfig,
   /** Where backend keys and binary PATH lookups are read. A parameter so the
    *  settings path can dry-run the NEXT boot's registry without touching the
    *  live process env. */
   env: Record<string, string | undefined> = process.env,
+  /** User-defined endpoints to register (openai-endpoints.ts). */
+  endpoints?: { store: EndpointStore; catalog: EndpointCatalog },
+  /** Named accounts: a keyed backend with accounts is registered without an environment key. */
+  accounts?: AccountStore,
 ): ProviderRegistry {
   const registry = new ProviderRegistry(config?.session?.defaultProvider ?? CLAUDE_PROVIDER_ID);
   registry.register({
@@ -234,65 +377,24 @@ export function createDefaultProviderRegistry(
         fleet: init.fleet,
         blackboardMcp: init.blackboardMcp,
         mcpRegistry: init.mcpRegistry,
+        mcpHub: init.mcpHub,
         config: init.config,
         compressionRegistry: init.compressionRegistry,
         onModels: init.onModels,
+        resolveAccount: init.resolveClaudeAccount,
+        extraEnv: init.extraEnv,
       }),
   });
-  // Stateless API backends: usable only with their key in the environment
-  // (the daemon loads ~/.codeoid/.env into process.env at startup). Gate
-  // registration on the key so a backend that would 401 on its first turn
-  // isn't advertised as pickable — same contract as the pi/codex/gemini-cli
-  // binary checks below. Without this, forking onto e.g. openai created a
-  // session that failed cryptically ("401 Incorrect API key: missing")
-  // instead of the option simply not appearing.
-  if (env.GOOGLE_API_KEY) {
-    registry.register({
-      id: "gemini",
-      displayName: "Gemini (Google)",
-      create: (init) =>
-        new StatelessSessionProvider(
-          new GeminiProvider({
-            defaultModel: init.model ?? undefined,
-            memory: init.memory,
-            workspaceId: init.workspaceId,
-            tenant: init.tenant,
-            sessionId: init.sessionId,
-            mcpRegistry: init.mcpRegistry,
-            mcpHub: init.mcpHub,
-          }),
-          init.sessionId,
-        ),
-    });
-  } else {
-    registry.markUnavailable(
-      "gemini",
-      "GOOGLE_API_KEY is not set — add it to ~/.codeoid/.env to use the Gemini backend",
-    );
-  }
-  if (env.OPENAI_API_KEY) {
-    registry.register({
-      id: "openai",
-      displayName: "OpenAI",
-      create: (init) =>
-        new StatelessSessionProvider(
-          new OpenAIProvider({
-            defaultModel: init.model ?? undefined,
-            memory: init.memory,
-            workspaceId: init.workspaceId,
-            tenant: init.tenant,
-            sessionId: init.sessionId,
-            mcpRegistry: init.mcpRegistry,
-            mcpHub: init.mcpHub,
-          }),
-          init.sessionId,
-        ),
-    });
-  } else {
-    registry.markUnavailable(
-      "openai",
-      "OPENAI_API_KEY is not set — add it to ~/.codeoid/.env to use the OpenAI backend",
-    );
+  // Stateless API backends: usable only with a key — in the environment (the
+  // daemon loads ~/.codeoid/.env into process.env at startup) or as a named
+  // account (accounts.ts). Gate registration on one so a backend that would
+  // 401 on its first turn isn't advertised as pickable — same contract as the
+  // pi/codex/gemini-cli binary checks below. Without this, forking onto e.g.
+  // openai created a session that failed cryptically ("401 Incorrect API key:
+  // missing") instead of the option simply not appearing.
+  for (const backend of KEYED_BACKENDS) {
+    if (env[backend.envKey] || hasAccounts(accounts, backend.id)) registry.register(keyedFactory(backend, env));
+    else registry.markUnavailable(backend.id, backend.missing);
   }
   // A local OpenAI-compatible server (llama.cpp's `llama-server`) — a
   // distinct id from "openai" so it runs alongside a cloud gateway there
@@ -307,6 +409,7 @@ export function createDefaultProviderRegistry(
         new StatelessSessionProvider(
           createLlamaCppProvider(llamacpp, {
             defaultModel: init.model ?? undefined,
+            resolveApiKey: () => accountKey(init),
             memory: init.memory,
             workspaceId: init.workspaceId,
             tenant: init.tenant,
@@ -342,6 +445,8 @@ export function createDefaultProviderRegistry(
             mcpRegistry: init.mcpRegistry,
             mcpHub: init.mcpHub,
             onModels: init.onModels,
+            resolveAccount: init.resolveAccount,
+            extraEnv: init.extraEnv,
           }),
       });
     } else {
@@ -370,9 +475,12 @@ export function createDefaultProviderRegistry(
             workspaceId: init.workspaceId,
             tenant: init.tenant,
             memoryMcp: init.memoryMcp,
+            mcpProxy: init.mcpHub?.proxy ?? undefined,
             blackboardMcp: init.blackboardMcp,
             mcpRegistry: init.mcpRegistry,
             onModels: init.onModels,
+            resolveAccount: init.resolveAccount,
+            extraEnv: init.extraEnv,
           }),
       });
     } else {
@@ -401,9 +509,12 @@ export function createDefaultProviderRegistry(
             workspaceId: init.workspaceId,
             tenant: init.tenant,
             memoryMcp: init.memoryMcp,
+            mcpProxy: init.mcpHub?.proxy ?? undefined,
             blackboardMcp: init.blackboardMcp,
             mcpRegistry: init.mcpRegistry,
             onModels: init.onModels,
+            resolveAccount: init.resolveAccount,
+            extraEnv: init.extraEnv,
           }),
       });
     } else {
@@ -433,11 +544,23 @@ export function createDefaultProviderRegistry(
           store: init.store,
           memory: init.memory,
           fleet: init.fleet as { type: "sdk"; name: string; instance: unknown } | undefined,
+          mcpProxy: init.mcpHub?.proxy ?? undefined,
           mcpRegistry: init.mcpRegistry,
           config: init.config,
           onModels: init.onModels,
+          resolveAccount: init.resolveAccount,
+          extraEnv: init.extraEnv,
         }),
     });
+  }
+  // User-defined OpenAI-compatible endpoints (`oai:<name>`) — registered
+  // before the default check, so one of them can be the default backend.
+  if (endpoints) {
+    try {
+      syncEndpointProviders(registry, endpoints.store, endpoints.catalog);
+    } catch (err) {
+      console.error(`[codeoid] could not load endpoints: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
   const problem = defaultProviderProblem(registry, registry.defaultId);
   if (problem) throw new DefaultProviderError(problem);

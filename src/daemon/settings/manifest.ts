@@ -156,6 +156,28 @@ const general: SettingsTab = {
         }),
       ],
     },
+    {
+      id: "worktree-setup",
+      title: "Worktree setup recipe",
+      description:
+        "A repository's committed .codeoid/setup.yaml says which ignored files to copy and which directories to share (writable links into your checkout) into a worktree codeoid creates. Those steps always apply; its command is a separate opt-in, per recipe.",
+      fields: [
+        cfg(
+          "worktree.setup.runCommands",
+          "Run recipe commands",
+          "Whether a recipe's setup command may run in a new worktree. With Trusted recipes it runs only while the recipe is the one you trusted with `codeoid worktree trust` in that repository — a changed recipe runs nothing until trusted again. It runs the repository's committed scripts as you. Reading a recipe never runs anything.",
+          {
+            kind: "enum",
+            default: "never",
+            applies: "live",
+            options: [
+              { value: "never", label: "Never", description: "Copy and share files only." },
+              { value: "trusted-repos", label: "Trusted recipes", description: "Run the command of a recipe trusted with `codeoid worktree trust`." },
+            ],
+          },
+        ),
+      ],
+    },
   ],
 };
 
@@ -278,6 +300,12 @@ const memory: SettingsTab = {
           default: 0.7,
           advanced: true,
         }),
+        cfg("session.nativeContinuation", "Continue natively", "On a fork, backend switch or rewind, hand Claude and Codex the conversation in their own form — their own fork, or native history — instead of a text transcript. The transcript is still the fallback.", {
+          kind: "boolean",
+          envVar: "CODEOID_NATIVE_CONTINUATION",
+          default: true,
+          advanced: true,
+        }),
       ],
     },
     {
@@ -350,6 +378,30 @@ const fleet: SettingsTab = {
         cfg("dispatch.tickMs", "Tick interval (ms)", "Dispatcher claim/reclaim/deliver cadence.", { kind: "int", min: 250, default: 5000, advanced: true }),
         cfg("dispatch.leaseMs", "Claim lease (ms)", "An unrenewed claim past this is reclaimed.", { kind: "int", min: 10000, default: 600000, advanced: true }),
         cfg("dispatch.retryBaseMs", "Retry backoff base (ms)", "Base backoff for retryable failures — doubles per attempt.", { kind: "int", min: 0, default: 15000, advanced: true }),
+        cfg("dispatch.holdMaxMs", "Approval hold limit (ms)", "Longest a loop attempt may wait on an approval while keeping its worker slot.", { kind: "int", min: 60000, default: 7200000, advanced: true }),
+      ],
+    },
+    {
+      id: "routines",
+      title: "Routines",
+      description: "Scheduled and triggered agent runs (docs/routines.md). Each routine carries its own schedule, budgets, and approval posture; these are the daemon-wide limits.",
+      fields: [
+        cfg("routines.enabled", "Enable routines", "Run routines on their schedules and triggers. Off pauses every routine without deleting any.", {
+          kind: "boolean",
+          envVar: "CODEOID_ROUTINES_ENABLED",
+          default: true,
+        }),
+        cfg("routines.maxConcurrentRuns", "Max concurrent runs", "Routine runs executing at once; the rest wait their turn.", {
+          kind: "int",
+          min: 1,
+          max: 50,
+          envVar: "CODEOID_ROUTINES_MAX_CONCURRENT",
+          default: 2,
+        }),
+        cfg("routines.minIntervalSeconds", "Minimum interval (s)", "Floor for how often any routine may fire.", { kind: "int", min: 60, max: 86400, default: 60, advanced: true }),
+        cfg("routines.apiFiresPerHour", "API fires per hour", "Fires accepted per routine per hour on its API endpoint.", { kind: "int", min: 1, max: 10000, default: 30, advanced: true }),
+        cfg("routines.missedGraceSeconds", "Missed-fire grace (s)", "A fire later than this (the daemon was down) is missed; the routine's catch-up setting decides what happens.", { kind: "int", min: 10, max: 86400, default: 120, advanced: true }),
+        cfg("routines.tickMs", "Scheduler tick (ms)", "How often the scheduler checks for due routines.", { kind: "int", min: 250, max: 60000, default: 1000, advanced: true }),
       ],
     },
     {

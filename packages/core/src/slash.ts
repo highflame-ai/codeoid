@@ -7,6 +7,7 @@
  *   /rotate                  — rotate context (refresh skills/settings)
  *   /mode <i|g|x>            — interactive | guarded | autonomous
  *   /model <id|alias>        — switch model (opus / sonnet / haiku / full id)
+ *   /account <name|default|--follow-default> — switch the session's Claude account
  *   /help                    — surface help modal (TODO P6)
  *   /clear                   — clear prompt (handled by caller before dispatch)
  *
@@ -14,10 +15,15 @@
  * thin context object so we can mock send/newRequestId in tests.
  */
 
-import type {
-  ClientMessage,
-  SessionInfo,
-  SessionMode,
+import {
+  EFFORT_LEVELS,
+  type ClientMessage,
+  type EffortChangeResult,
+  type EffortLevel,
+  type SessionInfo,
+  type SessionMode,
+  type McpReconnectResult,
+  type McpRefreshResult,
 } from "@highflame/codeoid-protocol";
 
 export type SlashCommand =
@@ -29,11 +35,16 @@ export type SlashCommand =
   | { kind: "mode"; mode: SessionMode; maxTurns?: number }
   | { kind: "model"; model: string; fallback?: string | null }
   | { kind: "model-picker" }
+  | { kind: "effort"; effort: EffortLevel | null }
+  | { kind: "effort-picker" }
   | { kind: "provider"; providerId: string }
+  | { kind: "account"; account: string | null }
   | { kind: "help" }
   | { kind: "clear" }
   | { kind: "who" }
   | { kind: "capabilities"; tab: "agents" | "skills" | "mcp" | "hooks" }
+  | { kind: "mcp-reconnect"; server: string }
+  | { kind: "mcp-refresh" }
   | { kind: "settings" }
   | { kind: "packs" }
   | { kind: "pipeline"; goal?: string }
@@ -111,12 +122,25 @@ export function parseSlash(raw: string, opts?: ParseSlashOptions): SlashCommand 
         ...(fallback !== undefined ? { fallback } : {}),
       };
     }
+    case "effort": {
+      // Thinking effort (#417). Bare `/effort` opens the picker.
+      if (rest.length === 0) return { kind: "effort-picker" };
+      return { kind: "effort", effort: parseEffort(rest[0]!) };
+    }
     case "provider": {
       // Switch the focused session's BACKEND (e.g. `/provider pi`). The
       // daemon validates the id fail-closed and rejects mid-turn switches.
       const providerId = rest[0]?.toLowerCase();
       if (!providerId) throw new Error("/provider <id> — e.g. /provider pi");
       return { kind: "provider", providerId };
+    }
+    case "account": {
+      // The focused Claude session's account (claude-accounts.ts): a name,
+      // `default` (pin your own login), or `--follow-default`.
+      const arg = rest[0];
+      if (!arg) throw new Error("/account <name> | default | --follow-default");
+      if (arg === "--follow-default" || arg === "--follow") return { kind: "account", account: null };
+      return { kind: "account", account: arg.toLowerCase() };
     }
     case "help":
       return { kind: "help" };
@@ -132,6 +156,10 @@ export function parseSlash(raw: string, opts?: ParseSlashOptions): SlashCommand 
     case "skill":
       return { kind: "capabilities", tab: "skills" };
     case "mcp":
+      // `/mcp reconnect <server>` redials one of the backend's servers (#389).
+      if (rest[0] === "reconnect" && rest[1]) return { kind: "mcp-reconnect", server: rest.slice(1).join(" ") };
+      // `/mcp refresh` applies Claude's current MCP config to the session (#395).
+      if (rest[0] === "refresh") return { kind: "mcp-refresh" };
       return { kind: "capabilities", tab: "mcp" };
     case "hooks":
     case "hook":
@@ -181,6 +209,7 @@ export interface SlashContext {
   /** Optional UI hooks — caller provides as needed. */
   showHelp?: () => void;
   showModelPicker?: () => void;
+  showEffortPicker?: () => void;
   showIdentity?: () => void;
   showCapabilities?: (tab: "agents" | "skills" | "mcp" | "hooks") => void;
   showSettings?: () => void;
@@ -274,12 +303,38 @@ export function dispatchSlash(cmd: SlashCommand, ctx: SlashContext): void {
     case "model-picker":
       ctx.showModelPicker?.();
       return;
+    case "effort-picker":
+      ctx.showEffortPicker?.();
+      return;
+    case "effort": {
+      const msg: ClientMessage = { type: "session.set_effort", id: ctx.newRequestId(), sessionId: ctx.sessionId, effort: cmd.effort };
+      if (!ctx.request) {
+        ctx.send(msg);
+        return;
+      }
+      ctx
+        .request(msg)
+        .then((resp) => {
+          const r = (resp as { data?: EffortChangeResult } | undefined)?.data;
+          if (r) ctx.report?.(effortChangeSummary(r));
+        })
+        .catch((e) => ctx.report?.(e instanceof Error ? e.message : String(e)));
+      return;
+    }
     case "provider":
       fire({
         type: "session.set_provider",
         id: ctx.newRequestId(),
         sessionId: ctx.sessionId,
         providerId: cmd.providerId,
+      });
+      return;
+    case "account":
+      fire({
+        type: "session.set_claude_account",
+        id: ctx.newRequestId(),
+        sessionId: ctx.sessionId,
+        account: cmd.account,
       });
       return;
     case "help":
@@ -294,6 +349,42 @@ export function dispatchSlash(cmd: SlashCommand, ctx: SlashContext): void {
     case "capabilities":
       ctx.showCapabilities?.(cmd.tab);
       return;
+    case "mcp-reconnect": {
+      const msg: ClientMessage = { type: "session.mcp_reconnect", id: ctx.newRequestId(), sessionId: ctx.sessionId, server: cmd.server };
+      if (!ctx.request) {
+        ctx.send(msg);
+        return;
+      }
+      // Success posts "reconnected" into the session itself; say what didn't work.
+      ctx
+        .request(msg)
+        .then((resp) => {
+          // `request` resolves with the whole `response.ok`; the result is its data.
+          const r = (resp as { data?: McpReconnectResult } | undefined)?.data;
+          if (!r || r.status === "connected") return;
+          ctx.report?.(r.deferred ? `${r.server} connects when the next turn starts.` : (r.error ?? `${r.server} is ${r.status}.`));
+        })
+        .catch((e) => ctx.report?.(e instanceof Error ? e.message : String(e)));
+      return;
+    }
+    case "mcp-refresh": {
+      const msg: ClientMessage = { type: "session.mcp_refresh", id: ctx.newRequestId(), sessionId: ctx.sessionId };
+      if (!ctx.request) {
+        ctx.send(msg);
+        return;
+      }
+      ctx
+        .request(msg)
+        .then((resp) => {
+          const r = (resp as { data?: McpRefreshResult } | undefined)?.data;
+          if (!r) return;
+          ctx.report?.(
+            mcpRefreshSummary(r),
+          );
+        })
+        .catch((e) => ctx.report?.(e instanceof Error ? e.message : String(e)));
+      return;
+    }
     case "settings":
       ctx.showSettings?.();
       return;
@@ -331,4 +422,41 @@ export function dispatchSlash(cmd: SlashCommand, ctx: SlashContext): void {
       return;
     }
   }
+}
+
+/** What `/mcp refresh` did, in words every frontend shows the same (#395). */
+export function mcpRefreshSummary(r: McpRefreshResult): string {
+  if (!r.changed) return "MCP servers are up to date.";
+  return r.deferred
+    ? "MCP servers changed: work is running, so they're applied before the next turn."
+    : "MCP servers changed: the backend was stopped and starts with them on your next message.";
+}
+
+/** Words for a thinking effort (#417) — the scale's, or the backend's default. */
+export const EFFORT_LABELS: Record<EffortLevel, string> = {
+  off: "Off",
+  minimal: "Minimal",
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+  xhigh: "Extra high",
+  max: "Max",
+};
+
+/** `/effort <level>`'s argument: a level, or default / auto / reset for the backend's own. */
+export function parseEffort(arg: string): EffortLevel | null {
+  const a = arg.trim().toLowerCase().replace(/[\s_-]/g, "");
+  if (a === "default" || a === "auto" || a === "reset") return null;
+  if (a === "extrahigh") return "xhigh";
+  if ((EFFORT_LEVELS as readonly string[]).includes(a)) return a as EffortLevel;
+  throw new Error(`/effort ${EFFORT_LEVELS.join("|")}|default`);
+}
+
+/** What `/effort` did, in words every frontend shows the same (#417). */
+export function effortChangeSummary(r: EffortChangeResult): string {
+  const what = r.effort ? EFFORT_LABELS[r.effort] : "the backend's default";
+  if (r.applies === "now") return `Thinking effort: ${what}.`;
+  if (r.applies === "restart") return `Thinking effort: ${what} — the backend restarts with it between turns, once no work is running.`;
+  if (r.waitsForBackground) return `Thinking effort: ${what}, from the next turn with no background work running (Stop ends it).`;
+  return `Thinking effort: ${what}, from the next turn.`;
 }

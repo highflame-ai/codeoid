@@ -8,9 +8,10 @@
 
 import { Component, For, Show, createSignal, onCleanup, onMount } from "solid-js";
 
-import { authIdentity, newRequestId, refreshSessions, request } from "../state/connection";
+import { newRequestId, refreshSessions, request } from "../state/connection";
 import { focusSession, getSession, mergeSession } from "../state/sessions";
 import type { SessionInfo } from "../protocol/types";
+import { providerIds, providerLabel } from "../state/providers";
 
 interface Target {
   sessionId: string;
@@ -51,7 +52,7 @@ const ForkFromHereModal: Component = () => {
     const t = target();
     return t ? getSession(t.sessionId)?.providerId : undefined;
   };
-  const providers = () => authIdentity()?.providers ?? [];
+  const providers = providerIds;
   const others = () => providers().filter((p) => p !== (current() ?? providers()[0]));
 
   function doFork(providerId?: string): void {
@@ -119,7 +120,7 @@ const ForkFromHereModal: Component = () => {
               class="flex items-center justify-between rounded bg-accent px-3 py-1.5 text-sm font-semibold text-bg transition hover:bg-accent-hover disabled:opacity-50"
             >
               <span>{busy() ? "forking…" : "Fork"}</span>
-              <span class="font-mono text-[11px] opacity-80">{current() ?? providers()[0] ?? ""}</span>
+              <span class="font-mono text-[11px] opacity-80">{providerLabel(current() ?? providers()[0])}</span>
             </button>
             <For each={others()}>
               {(id) => (
@@ -130,7 +131,7 @@ const ForkFromHereModal: Component = () => {
                   class="flex items-center justify-between rounded border border-border px-3 py-1.5 text-sm text-fg-muted transition hover:bg-bg-hover disabled:opacity-50"
                 >
                   <span>Fork and continue on</span>
-                  <span class="font-mono text-[11px]">{id}</span>
+                  <span class="font-mono text-[11px]">{providerLabel(id)}</span>
                 </button>
               )}
             </For>

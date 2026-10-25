@@ -12,6 +12,9 @@
  *
  * All three need `settings:write`: connecting an account configures the tenant.
  * The credential itself never crosses the wire.
+ *
+ * `mcp.adopt` (#390) puts a remote server from Claude's own config into
+ * codeoid's registry, signed in by codeoid, so the steps above can connect it.
  */
 
 import type { SettingsSnapshot } from "./settings.js";
@@ -36,6 +39,28 @@ export interface McpOAuthDisconnectMsg {
   type: "mcp.oauth.disconnect";
   id: string;
   server: string;
+}
+
+/**
+ * Adopt a remote MCP server from Claude's own config (`~/.claude.json`, a
+ * `.mcp.json`, Claude's settings) into codeoid's registry: the same URL, with
+ * codeoid's OAuth sign-in. Claude sessions then use codeoid's copy, not the
+ * CLI's. Needs `settings:write`; with `sessionId`, also a session the caller
+ * owns, whose workdir's servers are looked in too.
+ */
+export interface McpAdoptMsg {
+  type: "mcp.adopt";
+  id: string;
+  /** The server's name in Claude's config. */
+  server: string;
+  /** A session whose workdir's servers to look in, beside the global ones. */
+  sessionId?: string;
+  /**
+   * The URL the caller was shown for it. Two entries can share a name (a
+   * global one and a repo's); this says which is meant, and a mismatch is
+   * refused. Without it, a name that means two URLs is refused.
+   */
+  url?: string;
 }
 
 // ── Messages (daemon → client) ────────────────────────────────────────────────
@@ -68,5 +93,15 @@ export interface McpOAuthCompleteResultMsg {
 export interface McpOAuthDisconnectResultMsg {
   type: "mcp.oauth.disconnect.result";
   requestId: string;
+  snapshot: SettingsSnapshot;
+}
+
+export interface McpAdoptResultMsg {
+  type: "mcp.adopt.result";
+  requestId: string;
+  server: string;
+  /** It was already adopted (same URL): nothing changed. */
+  alreadyAdopted: boolean;
+  /** Settings after adopting: the server is listed, to be signed in to. */
   snapshot: SettingsSnapshot;
 }

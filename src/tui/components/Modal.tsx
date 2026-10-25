@@ -8,8 +8,10 @@ import React, { useEffect, useRef, useState } from "react";
 import { Box, Text, useInput } from "ink";
 import TextInput from "ink-text-input";
 import type { ModalState, TuiSession } from "../types.js";
-import type { SessionSearchHit } from "../../protocol/types.js";
-import { MODEL_CATALOG, findModel, type ModelDescriptor } from "../../daemon/models.js";
+import type { EffortLevel, ProviderInfo, SessionSearchHit } from "../../protocol/types.js";
+import type { TuiWsClient } from "../ws.js";
+import { BackendPicker } from "./BackendPicker.js";
+import { NewSessionModal, type NewSessionOptions } from "./NewSessionModal.js";
 
 /**
  * Which sessions a search covers. `workspace` scopes to the focused session's
@@ -22,21 +24,27 @@ interface Props {
   modal: ModalState;
   sessions: TuiSession[];
   focusedSession: TuiSession | null;
-  onSubmitNewSession: (name: string, workdir: string) => void;
+  providers: ProviderInfo[];
+  client: TuiWsClient | null;
+  onSubmitNewSession: (name: string, workdir: string, options: NewSessionOptions) => Promise<void>;
+  onSetProvider: (sessionId: string, providerId: string) => Promise<void>;
+  /** "" follows the backend's daemon default; `backend` is the one the picker listed. */
+  onSetAccount: (sessionId: string, account: string, backend: string) => Promise<void>;
   onSelectSession: (sessionId: string) => void;
   onConfirmDestroy: (sessionId: string) => void;
   onCancel: () => void;
   /** Run a full-text + semantic session search. Resolves to result hits. */
   onSearch?: (query: string, scope: SearchScope) => Promise<SessionSearchHit[]>;
-  /** Set the focused session's model. */
-  onSetModel?: (model: string) => Promise<void>;
+  /** Set a session's model. */
+  onSetModel?: (sessionId: string, model: string) => Promise<void>;
+  onSetEffort?: (sessionId: string, effort: EffortLevel | null) => Promise<void>;
 }
 
 export function Modal(props: Props) {
   switch (props.modal.kind) {
     case "new-session":
       return (
-        <NewSessionModal onSubmit={props.onSubmitNewSession} onCancel={props.onCancel} />
+        <NewSessionModal providers={props.providers} client={props.client} onSubmit={props.onSubmitNewSession} onCancel={props.onCancel} />
       );
     case "switch-session":
       return (
@@ -73,89 +81,56 @@ export function Modal(props: Props) {
         />
       );
     case "model":
+    case "provider":
+    case "effort":
+    case "account": {
+      // The session the picker was opened for, not whichever is focused now.
+      const { kind, sessionId } = props.modal;
+      const target = props.sessions.find((s) => s.info.id === sessionId);
+      if (!target) return <SessionGoneModal message="That session no longer exists." onCancel={props.onCancel} />;
+      const provider = target.info.providerId ?? "claude";
+      // The account picker lists, and applies, the accounts of the backend it
+      // was opened on. If the session has moved to another backend since, it
+      // closes and says so: re-targeting it quietly would offer the other
+      // backend's accounts, and drop the close a pick in flight is owed.
+      if (props.modal.kind === "account" && props.modal.backend !== provider) {
+        return <SessionGoneModal message={`${target.info.name} switched to ${provider} — reopen /account`} onCancel={props.onCancel} />;
+      }
       return (
-        <ModelModal
-          current={props.focusedSession?.info.model ?? null}
-          onPick={async (modelId) => {
-            if (!props.onSetModel) return;
-            await props.onSetModel(modelId);
+        <BackendPicker
+          // A provider switch changes which catalog the MODEL picker shows. The
+          // provider picker must not remount on it: the daemon's info update
+          // arrives before the switch's reply, and a remount would drop the
+          // close that follows a successful pick.
+          key={kind === "model" || kind === "effort" ? `${kind}:${provider}` : kind}
+          kind={kind}
+          provider={provider}
+          model={target.info.model ?? target.info.runningModel}
+          sessionDefaultEffort={target.info.defaultEffort}
+          effortPending={target.info.effortPending === true}
+          sessionName={target.info.name}
+          providers={props.providers}
+          client={props.client}
+          current={
+            kind === "model"
+              ? (target.info.model ?? "")
+              : kind === "effort"
+                ? (target.info.effort ?? "default")
+                : kind === "provider"
+                  ? provider
+                  : (target.info.account ?? (provider === "claude" ? target.info.claudeAccount : undefined) ?? "")
+          }
+          onPick={async (value) => {
+            if (kind === "model") await props.onSetModel?.(sessionId, value);
+            else if (kind === "effort") await props.onSetEffort?.(sessionId, value === "default" ? null : (value as EffortLevel));
+            else if (kind === "provider") await props.onSetProvider(sessionId, value);
+            else await props.onSetAccount(sessionId, value, provider);
           }}
           onCancel={props.onCancel}
         />
       );
-  }
-}
-
-function NewSessionModal({
-  onSubmit,
-  onCancel,
-}: {
-  onSubmit: (name: string, workdir: string) => void;
-  onCancel: () => void;
-}) {
-  // Both fields are always rendered as TextInputs so the workdir is
-  // visibly editable. `focused` controls which one captures keystrokes
-  // (via ink-text-input's `focus` prop). Tab / Enter on name moves focus
-  // to workdir; Enter on workdir submits.
-  const [focused, setFocused] = useState<"name" | "workdir">("name");
-  const [name, setName] = useState("");
-  const [workdir, setWorkdir] = useState(process.cwd());
-
-  useInput((_input, key) => {
-    if (key.escape) onCancel();
-    if (key.tab) {
-      setFocused((f) => (f === "name" ? "workdir" : "name"));
     }
-  });
-
-  const pointer = (field: "name" | "workdir") =>
-    focused === field ? "▸ " : "  ";
-
-  return (
-    <Box
-      flexDirection="column"
-      borderStyle="double"
-      borderColor="cyan"
-      paddingX={1}
-      paddingY={0}
-    >
-      <Text bold color="cyan">
-        New Session
-      </Text>
-      <Box marginTop={1}>
-        <Text color={focused === "name" ? "cyan" : undefined}>
-          {pointer("name")}name:
-        </Text>
-        <TextInput
-          focus={focused === "name"}
-          value={name}
-          onChange={setName}
-          onSubmit={() => {
-            if (name.trim()) setFocused("workdir");
-          }}
-        />
-      </Box>
-      <Box>
-        <Text color={focused === "workdir" ? "cyan" : undefined}>
-          {pointer("workdir")}workdir:
-        </Text>
-        <TextInput
-          focus={focused === "workdir"}
-          value={workdir}
-          onChange={setWorkdir}
-          onSubmit={() => {
-            if (name.trim() && workdir.trim())
-              onSubmit(name.trim(), workdir.trim());
-          }}
-        />
-      </Box>
-      <Box marginTop={1}>
-        <Text dimColor>
-          Tab switches fields · Enter on name → workdir · Enter on workdir creates · Esc cancels
-        </Text>
-      </Box>
-    </Box>
-  );
+  }
 }
 
 function SwitchModal({
@@ -207,6 +182,22 @@ function SwitchModal({
       <Box marginTop={1}>
         <Text dimColor>↑↓ to move · Enter to select · Esc to cancel</Text>
       </Box>
+    </Box>
+  );
+}
+
+/**
+ * Replaces a backend picker whose target went away while it was open: the
+ * session was destroyed, or (for the account picker) moved to another backend.
+ */
+function SessionGoneModal({ message, onCancel }: { message: string; onCancel: () => void }) {
+  useInput((_input, key) => {
+    if (key.escape || key.return) onCancel();
+  });
+  return (
+    <Box flexDirection="column" borderStyle="double" borderColor="red" paddingX={1}>
+      <Text color="red">{message}</Text>
+      <Text dimColor>Esc / Enter to close</Text>
     </Box>
   );
 }
@@ -438,121 +429,6 @@ function compactExcerpt(s: string): string {
   const collapsed = s.replace(/\s+/g, " ").trim();
   return collapsed.length > 120 ? `${collapsed.slice(0, 117)}…` : collapsed;
 }
-
-// ── Model picker ────────────────────────────────────────────────────────
-
-function ModelModal({
-  current,
-  onPick,
-  onCancel,
-}: {
-  current: string | null;
-  onPick: (modelId: string) => Promise<void>;
-  onCancel: () => void;
-}) {
-  // Pre-select the current model when present, else default to index 0.
-  const initialIdx = (() => {
-    if (!current) return 0;
-    const hit = MODEL_CATALOG.findIndex(
-      (m) => m.id === current || m.alias === current,
-    );
-    return hit >= 0 ? hit : 0;
-  })();
-  const [idx, setIdx] = useState(initialIdx);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  useInput((_input, key) => {
-    if (busy) return;
-    if (key.escape) onCancel();
-    if (key.upArrow) setIdx((i) => Math.max(0, i - 1));
-    if (key.downArrow) setIdx((i) => Math.min(MODEL_CATALOG.length - 1, i + 1));
-    if (key.return) {
-      const pick = MODEL_CATALOG[idx];
-      if (!pick) return;
-      setBusy(true);
-      setError(null);
-      onPick(pick.id)
-        .then(() => onCancel())
-        .catch((err: unknown) => {
-          setError(err instanceof Error ? err.message : String(err));
-          setBusy(false);
-        });
-    }
-  });
-
-  return (
-    <Box
-      flexDirection="column"
-      borderStyle="double"
-      borderColor="cyan"
-      paddingX={1}
-    >
-      <Text bold color="cyan">
-        Select model
-      </Text>
-      <Box marginTop={1} flexDirection="column">
-        {MODEL_CATALOG.map((m, i) => (
-          <ModelRow
-            key={m.id}
-            model={m}
-            selected={i === idx}
-            active={m.id === current}
-          />
-        ))}
-      </Box>
-      {error && (
-        <Box marginTop={1}>
-          <Text color="red">⚠ {error}</Text>
-        </Box>
-      )}
-      <Box marginTop={1}>
-        <Text dimColor>
-          {busy
-            ? "switching…"
-            : "↑↓ navigate · Enter to switch · Esc to cancel · switching invalidates prompt cache"}
-        </Text>
-      </Box>
-    </Box>
-  );
-}
-
-function ModelRow({
-  model,
-  selected,
-  active,
-}: {
-  model: ModelDescriptor;
-  selected: boolean;
-  active: boolean;
-}) {
-  const tierColor =
-    model.tier === "premium"
-      ? "magenta"
-      : model.tier === "balanced"
-        ? "cyan"
-        : "green";
-  const bar = selected ? "▸ " : "  ";
-  const activeBadge = active ? " ●" : "";
-  return (
-    <Box flexDirection="column" marginBottom={0}>
-      <Text color={selected ? "white" : tierColor} bold={selected}>
-        {bar}
-        {model.label}
-        <Text dimColor>
-          {` — ${model.alias} · ${Math.round(model.contextWindow / 1000)}k ctx`}
-        </Text>
-        {active && <Text color="green">{activeBadge}</Text>}
-      </Text>
-      <Text dimColor>{`    ${model.description}`}</Text>
-    </Box>
-  );
-}
-
-// Re-export so callers (App.tsx slash handler) can resolve aliases without
-// reaching into the daemon module directly — keeps the TUI layer's imports
-// predictable.
-export { findModel };
 
 function HelpModal({ onCancel }: { onCancel: () => void }) {
   useInput((_input, key) => {

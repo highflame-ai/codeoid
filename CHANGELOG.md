@@ -8,6 +8,89 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Choose how hard the model thinks, per session, on every backend** (#417).
+  One scale (Default, Off, Minimal, Low, Medium, High, Extra high, Max), mapped to each backend's own setting: Claude's effort, Codex's and OpenAI's reasoning effort, Qwen's and pi's levels, Gemini's thinking budget or level, llama.cpp's chat-template switches, and the Gemini CLI's model settings.
+  Set it from the web UI's **effort** selector, `/effort` (web, TUI, Telegram), `codeoid new --effort`, or `session.defaultEffort` for new sessions.
+  It stays with the session, like its model; it applies live where the backend can take it, otherwise from the next turn, and never cuts a running turn short.
+  The pickers offer the levels each model takes where the backend reports them (Claude, Codex, pi); elsewhere every level, marked as unknown.
+  docs/thinking-effort.md says what each level means on each backend.
+
+- **An MCP server added through Claude reaches every backend in that directory** (#395).
+  codeoid imported only Claude's global servers, once at start; a `claude mcp add` (local scope) or a project's `.mcp.json` stayed Claude-only.
+  Now each session sees, on every backend, its directory's servers too: your own always, a project's once approved — in Claude Code (read only from your `~/.claude.json`), or in codeoid after reviewing the entry in full (the drawer's **Review & approve**, or `codeoid mcp approve`, which prints it and approves only with `--yes <fingerprint>`), bound to exactly the entry shown.
+  Changes apply when you ask: the drawer shows "MCP servers changed", and **Refresh MCP servers** (`/mcp refresh`, `codeoid mcp refresh`) restarts the backend, which resumes the conversation; it waits for a running turn or background work, and picks up global changes (`claude mcp add -s user`) too.
+  A server that answers with the MCP sign-in challenge is held back from that account's backends that would only get 401s, and the drawer says to adopt it.
+  Agents' file tools now ask before reading or writing `~/.claude.json` in every mode, since that is where Claude Code's approvals live.
+  docs/mcp-backends.md says which server reaches which backend, and why.
+
+- **Codex, the Gemini CLI and Qwen use OAuth MCP servers** (#396).
+  An OAuth server in codeoid's registry (`"oauth": true`, or one adopted from Claude's config) used to reach only the daemon-run backends and Claude; Settings said "Not reachable from codex, gemini-cli, qwen yet".
+  These backends now mount it through a loopback relay on the daemon, with a token that belongs to the session and ends with it.
+  The server's own token stays in the daemon: the backend, its config, its argv and the agent's shell never see it.
+  The relay carries the whole MCP protocol (tools, resources, prompts, progress, cancellation, and the server's own requests, such as asking the user a question), and a sign-in mid-session reaches a running session without a restart.
+  The daemon's own MCP client now runs on the official MCP SDK for remote servers, shared with the relay.
+
+- **Sign in to an MCP server from codeoid instead of an interactive Claude Code session** (#390).
+  A remote OAuth server in Claude's own config (`~/.claude.json`, a `.mcp.json`) could only be signed in to through `/mcp` in a Claude Code terminal, so in a codeoid session it just reported "needs authentication".
+  codeoid can now adopt it: "Sign in with codeoid" in the capabilities drawer, or `codeoid mcp adopt <server>` and `codeoid mcp signin <server>`, puts the same URL in codeoid's registry and runs codeoid's own sign-in, from any frontend.
+  Claude sessions then use codeoid's copy, mounted in-process in front of the daemon's MCP client so the token never reaches the agent, and the CLI is told not to connect its own.
+  OAuth registry servers now reach Claude at all, not only the daemon-run backends; a server that needs sign-in points at adopting it (for someone who may), with the command that finds it.
+  Adopting is daemon-wide, so it is confirmed and bounded: plain names only (never one of codeoid's own), `https` URLs without credentials or wildcards, never over another server, a project's own server only with its URL named (`--url`), `settings:write` on a token's own, every attempt audited.
+  Signing in or out applies to running sessions from their next turn; a refresh the server refuses signs the server out (Settings offers Connect), one that merely fails keeps the sign-in; `codeoid mcp signin --callback-url` finishes a sign-in without a terminal.
+  codeoid never reads or writes the Claude CLI's credentials.
+
+- **Forks, backend switches and rewinds continue the conversation natively on
+  Claude and Codex** (#387). Until now a fork onto Claude, Codex or pi got a
+  text transcript in its first prompt, with each tool's input and output cut
+  to 2,000 characters and reasoning dropped, even when the fork stayed on the
+  same backend. Now:
+  - On the same backend, the backend forks its own conversation at the turn,
+    so nothing is converted or cut and reasoning is kept. Claude uses the
+    Agent SDK's `forkSession`; Codex uses `thread/fork`.
+  - From another backend, codeoid hands the target native history: a Claude
+    session file with real `tool_use`/`tool_result` blocks, verified with the
+    SDK's own reader before use, or Codex history items through
+    `thread/inject_items`.
+
+  The transcript remains the fallback, for pi, the Gemini CLI, qwen, and any native
+  path that fails. The session says which way it went, and
+  `session.nativeContinuation` / `CODEOID_NATIVE_CONTINUATION` turns this off.
+  Each turn now records where it ends in the backend's own conversation
+  (`NormalizedTurnResult.nativeRef`, stamped on the canonical turn).
+
+- **Routines: agents that run on their own** (#54). `codeoid routine add`
+  saves an agent task that runs on a cron or interval schedule (IANA
+  timezones, phase-anchored intervals, 60-second floor), once at a set time, from
+  its own API endpoint (`POST /routines/<id>/fire` with a per-routine,
+  revocable, rate-limited token), or on demand. A *check* command runs first:
+  no output means nothing to do, and the run ends `silent` with no agent
+  started and nothing spent. An agent that finds nothing worth reporting
+  replies `[SILENT]`. The prompt can use `{{check}}`, `{{payload}}` and
+  `{{last_summary}}`, inserted as delimited data the agent is told not to
+  follow.
+
+  Every run is an ordinary session you can open, approve, continue or fork.
+  The daemon enforces the limits: guarded approvals or an autonomous tool
+  budget, a wall-clock limit, per-run and per-day spend ceilings (a hard stop
+  on Claude via the Agent SDK's `maxBudgetUsd`), skip-or-queue overlap,
+  catch-up after downtime, and an auto-pause after repeated failures. A run
+  that parks on an approval ends `needs_attention` and keeps tracking its
+  spend after you approve. Fresh runs can each get their own git worktree.
+
+  A routine is its owner's alone: teammates in the tenant can't see or touch
+  it. No new scope: routines take `session:create` + `session:send`, plus
+  `session:approve` for an autonomous routine or one with a check, and
+  delegated tokens (teammates' share tokens, agents) can't change them. Check commands run with a
+  scrubbed environment, never the daemon's secrets. Runs are
+  attributed to `routine:<name>` under their owner in transcripts and the
+  audit log. Outcomes reach your devices as a content-blind push (`notify`
+  policy) and every run fires the new `routine_end` hook. Config:
+  `routines.*`, `CODEOID_ROUTINES_ENABLED`, `CODEOID_ROUTINES_MAX_CONCURRENT`.
+  Guide: [docs/routines.md](docs/routines.md).
+
+- **Protocol (additive):** `routine.*` client messages and results,
+  `SessionInfo.managedBy: "routine"`, and push kind `"routine"`.
+
 - **Other agents can drive codeoid over MCP** (`/mcp/control`, #251). Claude
   Code, Cursor, or a CI job mounts one URL and can list sessions, read their
   transcripts and usage, wait on them, and — when the operator sets
@@ -110,6 +193,34 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   require a pack; an explicit-`phases` plan cannot declare one.
 
 ### Fixed
+
+- **The capabilities drawer no longer shows credentials from MCP servers or hooks** (#394).
+  Its `claude.config` response already left out env and header values, but returned MCP servers' `args`, `url` and `command`, and hook commands, verbatim, and a Claude config keeps secrets there just as often (`--api-key sk-…`, `--token=…`, `postgres://user:pass@…`, `?api_key=…`, a token in the path, `curl -H "Authorization: Bearer …"`).
+  Commands and args are no longer sent at all: a server shows its program's name and how many args it has, a hook its program's name (`curl …`), and the drawer points at the file for the full text.
+  A URL is shown from the URL parser's own reading, so the host is always the one it resolves to and is never hidden; userinfo, the query, the fragment and any path segment that isn't a plain word (an id, a key, `;key=value`) are hidden.
+  The adopt hint, adopt's errors and its audit rows, transport errors in Settings' MCP list, and MCP tool-call errors in the daemon log and the transcript are redacted too; hook matchers, env and header key names are bounded and redacted.
+  A settings or `.mcp.json` file over 1 MB is shown as one "(file too large)" row instead of being read, since the CLI still loads it; `~/.claude.json`, which also holds Claude Code's history, is read up to 64 MB.
+  Adopting from the drawer still works: it matches the URL as shown, except for a project's server whose URL has parts hidden, which is adopted only by its full URL (consent to `https://host/…/mcp` isn't consent to the tenant a repo put behind the `…`); the drawer says so and how.
+  The drawer's adopt check runs only for servers that need a sign-in, against an index built once per look, so a repo file of thousands of servers no longer stalls the daemon when it opens.
+
+- **An MCP server that failed when a session started no longer stays failed for the whole session** (#389).
+  A Claude session redials its backend's MCP servers on demand (the capabilities drawer's Reconnect button, `/mcp reconnect <server>` in the web UI and TUI, `codeoid mcp reconnect`, or the new `session.mcp_reconnect` message, which needs `session:send`).
+  Before each turn it also retries any that are failed or waiting on a sign-in, with backoff.
+  A server that comes back is announced, and the next prompt tells the model, which otherwise trusts the start-up report that it failed.
+  The drawer now also lists servers no config file declares (claude.ai connectors, plugins' servers, codeoid's own).
+
+- **Codex sessions keep their conversation across a daemon restart.** The
+  Codex provider never saved the thread id it created, so after any restart it
+  tried to resume a stale id and silently started an empty thread. It now
+  saves the id the moment it adopts a thread. A backend switch now also marks
+  the new backend fresh until its first prompt, so a restart in between
+  re-seeds it instead of resuming nothing.
+
+- **Claude's "No conversation found" recovery keeps the conversation.** When
+  a backing session can't be resumed, recovery used to start a blank session
+  and re-send only the latest prompt. It now hands the new session the
+  conversation before that prompt (natively where it can), and can't loop if
+  the new backing is missing too.
 
 - **The context window is no longer guessed from the model id.**
   codeoid inferred every window from a substring table over model ids, and that table was wrong the moment a model shipped: `claude-opus-5-5` inferred to the 200k fallback while every turn result stated 1,000,000.

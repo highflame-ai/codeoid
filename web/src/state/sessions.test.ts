@@ -8,6 +8,7 @@ import {
   focusSession,
   getSession,
   ingestSessionList,
+  mergeFullSessionInfo,
   mergeSession,
   removeSession,
   sessionList,
@@ -294,5 +295,31 @@ describe("removeSession — collaboration cascade", () => {
 
     // Focus must not be left pointing at a session that no longer exists.
     expect(focusedSessionId()).toBe("other");
+  });
+});
+
+describe("mergeFullSessionInfo", () => {
+  beforeEach(() => _resetSessionsForTest());
+
+  it("clears the Claude account fields a full info leaves out (session moved off Claude)", () => {
+    ingestSessionList([s("a", "2026-01-01T00:00:00Z", { providerId: "claude", claudeAccount: "work", effectiveClaudeAccount: "work" })]);
+    mergeFullSessionInfo(s("a", "2026-01-01T00:00:00Z", { providerId: "codex" }));
+    expect(getSession("a")?.providerId).toBe("codex");
+    expect(getSession("a")?.claudeAccount).toBeUndefined();
+    expect(getSession("a")?.effectiveClaudeAccount).toBeUndefined();
+  });
+
+  it("clears the account fields a full info leaves out (session moved to a backend without accounts)", () => {
+    ingestSessionList([s("a", "2026-01-01T00:00:00Z", { providerId: "qwen", account: "team", effectiveAccount: "team" })]);
+    mergeFullSessionInfo(s("a", "2026-01-01T00:00:00Z", { providerId: "mock" }));
+    expect(getSession("a")?.account).toBeUndefined();
+    expect(getSession("a")?.effectiveAccount).toBeUndefined();
+  });
+
+  it("keeps the effective account when only the session's own choice was dropped", () => {
+    ingestSessionList([s("a", "2026-01-01T00:00:00Z", { providerId: "claude", claudeAccount: "work", effectiveClaudeAccount: "work" })]);
+    mergeFullSessionInfo(s("a", "2026-01-01T00:00:00Z", { providerId: "claude", effectiveClaudeAccount: "team" }));
+    expect(getSession("a")?.claudeAccount).toBeUndefined();
+    expect(getSession("a")?.effectiveClaudeAccount).toBe("team");
   });
 });

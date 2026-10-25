@@ -24,6 +24,9 @@ export interface McpStdioTransport {
   /** Literal subprocess env. A `${VAR}` value is resolved from the daemon's own
    *  environment at mount time so secrets never live in the config file. */
   env: Record<string, string>;
+  /** Where it runs: a workdir server (#395) in its workdir, as Claude, Codex,
+   *  the Gemini CLI and Qwen run it; otherwise the daemon user's home. */
+  cwd?: string;
 }
 
 /** POST JSON-RPC to a streamable-HTTP endpoint. */
@@ -73,6 +76,18 @@ export interface McpServerSpec {
   native: boolean;
   /** Built-in (codeoid_memory) — not user-declarable; always readonly+session. */
   builtin: boolean;
+  /**
+   * Where the entry comes from (#395), when not codeoid's own config:
+   * `claude-global` — imported from `~/.claude.json` at the daemon level;
+   * `claude-local` — the session's workdir in the user's own `~/.claude.json`;
+   * `claude-repo` — the workdir's `.mcp.json` or project settings (the repo's
+   * choice, reaching other backends only once approved).
+   * The workdir ones live only in a session's view, never the registry.
+   */
+  origin?: "claude-global" | "claude-local" | "claude-repo";
+  /** For a workdir entry: a fingerprint of its config, so two workdirs'
+   *  same-named servers are different clients (and a repo's edit is a new entry). */
+  variant?: string;
 }
 
 /** The one namespaced tool name used across ALL backends, so isSafeTool /
@@ -82,8 +97,18 @@ export function canonicalToolName(server: string, tool: string): string {
   return `mcp__${server}__${tool}`;
 }
 
-/** True when `spec` should be delivered by codeoid owning the client (Model B
- *  + the default for Model A), vs synced into the backend's native config. */
+/**
+ * The server part of an MCP tool name (`mcp__<this>__<tool>`), as the Claude
+ * CLI derives it from the server's name: anything outside [A-Za-z0-9_-]
+ * becomes `_`, and for a claude.ai connector runs of `_` collapse and the
+ * ends are trimmed (CLI 2.1.281). Two names that map to the same prefix give
+ * their tools the same names — so a reserved name is reserved in this form.
+ */
+export function mcpToolPrefix(name: string): string {
+  const t = name.replace(/[^a-zA-Z0-9_-]/g, "_");
+  return name.startsWith("claude.ai ") ? t.replace(/_+/g, "_").replace(/^_|_$/g, "") : t;
+}
+
 /** True when a server is configured for OAuth. */
 export function isOAuthServer(spec: McpServerSpec): boolean {
   return spec.transport.kind === "http" && spec.transport.oauth !== undefined;
@@ -92,11 +117,30 @@ export function isOAuthServer(spec: McpServerSpec): boolean {
 /**
  * Backends that mount registry servers natively (their own MCP client, headers
  * fixed at start). They cannot carry a refreshing OAuth token, so they do not
- * mount OAuth servers; those reach only the daemon-owned client for now
- * (docs/mcp-oauth-design.md §5).
+ * mount OAuth servers natively (docs/mcp-oauth-design.md §5).
  */
 export const NATIVE_MOUNT_BACKENDS: readonly string[] = ["claude", "codex", "gemini-cli", "qwen"];
 
+/**
+ * Native-mount backends that still get OAuth servers, through an in-process
+ * server in front of the daemon-owned client (#390): codeoid holds and
+ * refreshes the token, the backend never sees it.
+ */
+export const OAUTH_BRIDGED_BACKENDS: readonly string[] = ["claude"];
+
+/**
+ * Native-mount backends that get OAuth servers through the daemon's loopback
+ * relay (#396, mcp/proxy.ts), with a per-session proxy token.
+ */
+export const OAUTH_PROXIED_BACKENDS: readonly string[] = ["codex", "gemini-cli", "qwen"];
+
+/** Backends an OAuth server does not reach at all yet (none, since #396). */
+export const OAUTH_UNSUPPORTED_BACKENDS: readonly string[] = NATIVE_MOUNT_BACKENDS.filter(
+  (b) => !OAUTH_BRIDGED_BACKENDS.includes(b) && !OAUTH_PROXIED_BACKENDS.includes(b),
+);
+
+/** True when `spec` should be delivered by codeoid owning the client (Model B
+ *  + the default for Model A), vs synced into the backend's native config. */
 export function isProxied(spec: McpServerSpec): boolean {
   return !spec.native;
 }

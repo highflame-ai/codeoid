@@ -11,18 +11,44 @@
 
 import type { RawMcpServerConfig } from "../../config.js";
 import { MEMORY_MCP_SERVER_NAME } from "../memory/mcp-http.js";
-import { isOAuthServer, type McpServerSpec, type McpTransport } from "./types.js";
+import { isOAuthServer, mcpToolPrefix, type McpServerSpec, type McpTransport } from "./types.js";
 
 /** Names codeoid owns internally — a user entry using one is ignored (the
- *  built-in wins) rather than silently shadowing an internal server. */
-const RESERVED_NAMES = new Set<string>([MEMORY_MCP_SERVER_NAME, "codeoid_fleet"]);
+ *  built-in wins) rather than silently shadowing an internal server. Compared
+ *  in the form tool names use (`mcpToolPrefix`): `codeoid.memory` would give
+ *  its tools the built-in's names, some of which are pre-approved. The
+ *  blackboard is mounted by name for collaboration children (#245). */
+const RESERVED_PREFIXES = new Set<string>([MEMORY_MCP_SERVER_NAME, "codeoid_fleet", "codeoid_blackboard"].map(mcpToolPrefix));
+
+/** Whether `name` is, or reads in tool names as, one of codeoid's built-in servers. */
+export function isReservedMcpName(name: string): boolean {
+  return RESERVED_PREFIXES.has(mcpToolPrefix(name));
+}
 
 export interface McpRegistryOptions {
   /** When true, inject the built-in `codeoid_memory` entry (in-process). */
   memoryEnabled: boolean;
+  /** Names imported from Claude's global config (an explicit entry of the same name isn't one). */
+  imported?: ReadonlySet<string>;
 }
 
-export class McpRegistry {
+/**
+ * What a backend reads to know its MCP servers (#395): the daemon-wide
+ * registry itself, or a session's view of it (the registry plus that
+ * session's workdir servers — mcp/session-view.ts).
+ */
+export interface McpServerView {
+  list(): McpServerSpec[];
+  get(name: string): McpServerSpec | undefined;
+  /** Enabled servers that should mount on `backendId` (honoring `backends`). */
+  forBackend(backendId: string): McpServerSpec[];
+  /** Enabled OAuth servers for `backendId` (codeoid signs in and calls them). */
+  oauthFor(backendId: string): McpServerSpec[];
+  /** External servers a native-mount backend mounts itself (no OAuth ones). */
+  forNativeMount(backendId: string): McpServerSpec[];
+}
+
+export class McpRegistry implements McpServerView {
   readonly #specs = new Map<string, McpServerSpec>();
   readonly #warnings: string[] = [];
 
@@ -41,11 +67,12 @@ export class McpRegistry {
       });
     }
     for (const [name, raw] of Object.entries(servers ?? {})) {
-      if (RESERVED_NAMES.has(name)) {
+      if (isReservedMcpName(name)) {
         this.#warnings.push(`mcp: ignoring reserved server name "${name}" (codeoid built-in)`);
         continue;
       }
-      this.#specs.set(name, normalizeSpec(name, raw));
+      const spec = normalizeSpec(name, raw);
+      this.#specs.set(name, opts.imported?.has(name) ? { ...spec, origin: "claude-global" } : spec);
     }
   }
 
@@ -69,6 +96,25 @@ export class McpRegistry {
     );
   }
 
+  /**
+   * Add or replace a user server while the daemon runs — a server adopted from
+   * Claude's config (#390). Everything that holds this registry (sessions,
+   * providers, the hub) reads the new entry from here; a reserved name is
+   * refused, as at start.
+   */
+  upsert(name: string, raw: RawMcpServerConfig): McpServerSpec {
+    if (isReservedMcpName(name)) throw new Error(`"${name}" is a codeoid built-in server name`);
+    const spec = normalizeSpec(name, raw);
+    this.#specs.set(name, spec);
+    return spec;
+  }
+
+  /** Enabled OAuth servers for `backendId`: what codeoid signs in to and calls
+   *  itself, for a backend that reaches them through codeoid. */
+  oauthFor(backendId: string): McpServerSpec[] {
+    return this.forBackend(backendId).filter((s) => !s.builtin && isOAuthServer(s));
+  }
+
   /** External servers a native-mount backend mounts itself. OAuth servers are
    *  left out: a header baked in at start cannot follow a token that expires
    *  and refreshes, and would put the user's token in the agent's process. */
@@ -80,7 +126,7 @@ export class McpRegistry {
 /** Raw (zod-validated) config → normalized spec. Transport is inferred from
  *  which of `command` / `url` is set (the schema's refine guarantees exactly
  *  one); `url` wins defensively if both somehow slip through. */
-function normalizeSpec(name: string, raw: RawMcpServerConfig): McpServerSpec {
+export function normalizeSpec(name: string, raw: RawMcpServerConfig): McpServerSpec {
   const transport: McpTransport =
     raw.url !== undefined
       ? {

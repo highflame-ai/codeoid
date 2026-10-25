@@ -34,6 +34,12 @@ let sdkGate: Promise<void> | null = null;
 /** When true, the mock query's interrupt() rejects — forcing the provider's
  *  hard-abort fallback. */
 let sdkInterruptThrows = false;
+/** MCP server states the mock query reports, and the reconnect calls it saw (#389). */
+let mcpStatuses: Array<Record<string, unknown>> = [];
+let mcpReconnects: string[] = [];
+let mcpReconnectError: Error | null = null;
+/** Live settings the mock query was handed (#417). */
+let flagSettings: Array<Record<string, unknown>> = [];
 
 function makeMockQuery() {
   const err = sdkThrowError;
@@ -55,6 +61,14 @@ function makeMockQuery() {
       if (sdkInterruptThrows) throw new Error("interrupt unsupported");
     },
     supportedModels: async () => [{ value: "claude-opus-4", displayName: "Claude Opus 4" }],
+    reconnectMcpServer: async (name: string) => {
+      mcpReconnects.push(name);
+      if (mcpReconnectError) throw mcpReconnectError;
+    },
+    mcpServerStatus: async () => mcpStatuses,
+    applyFlagSettings: async (settings: Record<string, unknown>) => {
+      flagSettings.push(settings);
+    },
   };
 }
 
@@ -79,6 +93,8 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
 
 import {
   ClaudeProvider,
+  claudeCatalogEntry,
+  claudeEffortOptions,
   translateSDKMessage,
   parseMcpServerConfig,
   extractToolResultText,
@@ -89,14 +105,19 @@ import {
   skillSandboxDirs,
   packPluginsOption,
   pluginSkillDirs,
+  withoutServers,
+  modelOptions,
 } from "../daemon/providers/claude/index.js";
+import { mcpToolPrefix } from "../daemon/mcp/types.js";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryEngine } from "../daemon/memory/engine.js";
+import { applyAccountEnv, bedrockModel, type ResolvedClaudeAccount, type StoredClaudeAccount } from "../daemon/claude-accounts.js";
 import { SqliteEpisodeStore } from "../daemon/memory/store.js";
 import { MEMORY_TOOL_NAMES } from "../daemon/memory/index.js";
 import type { Embedder } from "../daemon/memory/embedder.js";
+import type { EffortLevel } from "../protocol/types.js";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -304,6 +325,25 @@ describe("translateSDKMessage – result", () => {
         errorMessage: undefined,
       },
     });
+  });
+
+  it("carries the result text of a success-subtype is_error turn as resultText (where the CLI puts a limit notice)", () => {
+    const events = collectEmits({
+      type: "result",
+      subtype: "success",
+      is_error: true,
+      result: "You've hit your session limit · resets 3pm (UTC)",
+      usage: { input_tokens: 0, output_tokens: 0 },
+      modelUsage: {},
+    });
+    const result = (events[0] as { result: { resultText?: string; errorMessage?: string } }).result;
+    expect(result.resultText).toBe("You've hit your session limit · resets 3pm (UTC)");
+    expect(result.errorMessage).toBeUndefined();
+  });
+
+  it("no resultText on a turn that did not fail", () => {
+    const events = collectEmits({ type: "result", subtype: "success", result: "all done", usage: {}, modelUsage: {} });
+    expect((events[0] as { result: { resultText?: string } }).result.resultText).toBeUndefined();
   });
 
   it("sets errorMessage when subtype is not 'success' and result is set", () => {
@@ -696,6 +736,59 @@ describe("decodeStderrEntities", () => {
   });
 });
 
+describe("ClaudeProvider – backing-session recovery can't loop (#387)", () => {
+  beforeEach(() => { sdkMessages = []; sdkThrowError = null; capturedQueryOpts = null; sdkGate = null; });
+
+  it("recovers once; if the backing it then resumes is missing too, the turn fails instead of recovering again", async () => {
+    const provider = makeProvider();
+    provider.setHasQueried(true); // a resumed backing
+    sdkThrowError = new Error("No conversation found with session ID: gone-1");
+    let recoveries = 0;
+    let retry: Promise<ProviderEvent[]> | null = null;
+    provider.onRecoveryNeeded = (content) => {
+      recoveries += 1;
+      // What the session does: reset, adopt a resumable backing (native
+      // continuation), and run the prompt again — which also fails.
+      provider.resetToNewSession("adopted-2");
+      provider.setHasQueried(true);
+      retry = collectTurnEvents(provider, content);
+    };
+    await collectTurnEvents(provider);
+    for (let i = 0; i < 100 && !retry; i++) await Bun.sleep(5);
+    const events = await retry!;
+    await Bun.sleep(20);
+    expect(recoveries).toBe(1);
+    expect(events.some((e) => e.type === "error" && String((e as { message: string }).message).includes("No conversation found"))).toBe(true);
+  });
+
+  it("re-arms once a turn on the new backing succeeds: a later missing backing recovers again", async () => {
+    const provider = makeProvider();
+    provider.setHasQueried(true);
+    sdkThrowError = new Error("No conversation found with session ID: gone-1");
+    let recoveries = 0;
+    let retry: Promise<ProviderEvent[]> | null = null;
+    provider.onRecoveryNeeded = (content) => {
+      recoveries += 1;
+      provider.resetToNewSession(`adopted-${recoveries}`);
+      provider.setHasQueried(true);
+      // The first recovery's retry succeeds; afterwards the backing goes missing again.
+      if (recoveries === 1) {
+        sdkThrowError = null;
+        sdkMessages = [{ type: "result", subtype: "success", num_turns: 1, result: "ok", modelUsage: {} }];
+      }
+      retry = collectTurnEvents(provider, content);
+    };
+    await collectTurnEvents(provider);
+    for (let i = 0; i < 100 && !retry; i++) await Bun.sleep(5);
+    expect((await retry!).some((e) => e.type === "turn_done")).toBe(true);
+    retry = null;
+    sdkThrowError = new Error("No conversation found with session ID: adopted-1");
+    await collectTurnEvents(provider, "later");
+    for (let i = 0; i < 100 && !retry; i++) await Bun.sleep(5);
+    expect(recoveries).toBe(2);
+  });
+});
+
 // Park-and-retry: a blocked skill command must NOT fail the turn (that killed the
 // pipeline — #233). It parks the turn (approval_pending), and on approval the
 // loop rebuilds with the grant and retries the SAME prompt in place.
@@ -709,6 +802,100 @@ describe("decodeStderrEntities", () => {
  * (anthropics/claude-code#80223) — this recovers whatever produced the zero
  * turn, because it keys on `num_turns` rather than on any cause.
  */
+describe("ClaudeProvider – reconnecting an MCP server (#389)", () => {
+  beforeEach(() => {
+    sdkMessages = [];
+    sdkThrowError = null;
+    sdkGate = null;
+    mcpStatuses = [];
+    mcpReconnects = [];
+    mcpReconnectError = null;
+  });
+
+  /** Start a turn and hold the loop open, so the provider has a live query. */
+  async function live(provider: ClaudeProvider): Promise<() => Promise<void>> {
+    let release!: () => void;
+    sdkGate = new Promise<void>((r) => {
+      release = r;
+    });
+    const events = collectTurnEvents(provider);
+    for (let i = 0; i < 50 && queryCallCount === 0; i++) await Bun.sleep(5);
+    await Bun.sleep(10);
+    return async () => {
+      release();
+      await events;
+    };
+  }
+
+  it("with no live query there is nothing to redial: the next turn dials its servers", async () => {
+    expect(await makeProvider().reconnectMcpServer("slack")).toBeNull();
+  });
+
+  it("redials through the live query and reports the server's new state, tools as full names", async () => {
+    const p = makeProvider();
+    const done = await live(p);
+    mcpStatuses = [{ name: "slack", status: "connected", tools: [{ name: "send_message" }, { name: "search" }] }];
+    expect(await p.reconnectMcpServer("slack")).toEqual({ status: "connected", tools: ["mcp__slack__send_message", "mcp__slack__search"] });
+    expect(mcpReconnects).toEqual(["slack"]);
+    await done();
+  });
+
+  it("a failed redial is a result, not a throw — with the backend's reason", async () => {
+    const p = makeProvider();
+    const done = await live(p);
+    mcpReconnectError = new Error("SyntaxError dialing https://gateway/mcp/x/slack");
+    mcpStatuses = [{ name: "slack", status: "failed" }];
+    expect(await p.reconnectMcpServer("slack")).toEqual({ status: "failed", tools: [], error: "SyntaxError dialing https://gateway/mcp/x/slack" });
+    mcpReconnectError = null;
+    mcpStatuses = [];
+    expect((await p.reconnectMcpServer("nope"))?.error).toContain('no MCP server named "nope"');
+    await done();
+  });
+
+  it("doesn't redial the CLI's own copy of a server codeoid signs in to now (#390)", async () => {
+    const { McpServerSchema } = await import("../config.js");
+    const { McpRegistry } = await import("../daemon/mcp/registry.js");
+    const p = new ClaudeProvider({
+      sessionId: "test-session",
+      initialBackingId: "test-backing",
+      workspaceId: "ws_test",
+      mcpRegistry: new McpRegistry({ notes: McpServerSchema.parse({ url: "https://notes.example.com/mcp", oauth: true }) }, { memoryEnabled: false }),
+      store: {
+        audit: () => {},
+        getClaudeCodeSessionId: () => null,
+        setClaudeCodeSessionId: () => {},
+        getSkillCommandGrants: () => new Map<string, boolean>(),
+        setSkillCommandGrant: () => {},
+      } as never,
+    });
+    const done = await live(p);
+    mcpReconnects.length = 0;
+    // The query was built before it was adopted: the CLI still runs its copy, at that URL.
+    mcpStatuses = [{ name: "notes", status: "needs-auth", config: { type: "http", url: "https://notes.example.com/mcp" } }];
+    expect(await p.reconnectMcpServer("notes")).toEqual({ status: "needs-auth", tools: [], codeoidOwned: true });
+    expect(mcpReconnects).toEqual([]);
+    // Another server of the same name, at another URL, is not codeoid's: redialed as usual.
+    mcpStatuses = [{ name: "notes", status: "needs-auth", config: { type: "http", url: "https://elsewhere.example.com/mcp" } }];
+    expect((await p.reconnectMcpServer("notes"))?.codeoidOwned).toBeUndefined();
+    expect(mcpReconnects).toEqual(["notes"]);
+    mcpStatuses = [];
+    await done();
+  });
+
+  it("tool names carry the server's name as the CLI normalises it", async () => {
+    const p = makeProvider();
+    const done = await live(p);
+    mcpStatuses = [{ name: "claude.ai Google Drive", status: "connected", tools: [{ name: "search" }] }];
+    expect((await p.reconnectMcpServer("claude.ai Google Drive"))?.tools).toEqual(["mcp__claude_ai_Google_Drive__search"]);
+    // Whether it's a connector is the backend's word, not the name's.
+    expect((await p.reconnectMcpServer("claude.ai Google Drive"))?.connector).toBeUndefined();
+    mcpStatuses = [{ name: "Drive", status: "needs-auth", source: "claudeai" } as never];
+    expect((await p.reconnectMcpServer("Drive"))?.connector).toBe(true);
+    mcpStatuses = [];
+    await done();
+  });
+});
+
 describe("ClaudeProvider – unexplained zero-turn re-send", () => {
   beforeEach(() => { sdkMessages = []; sdkThrowError = null; capturedQueryOpts = null; sdkGate = null; });
 
@@ -1105,6 +1292,45 @@ describe("translateSDKMessage – system", () => {
     });
   });
 
+  it("keys tools by the server's own name, not the CLI's normalised one (#389)", () => {
+    const events = collectEmits({
+      type: "system",
+      subtype: "init",
+      mcp_servers: [
+        { name: "claude.ai Google Drive", status: "connected" },
+        { name: "my.server", status: "connected" },
+      ],
+      tools: ["mcp__claude_ai_Google_Drive__search", "mcp__my_server__read"],
+    });
+    expect(events[0]).toMatchObject({
+      tools: { "claude.ai Google Drive": ["mcp__claude_ai_Google_Drive__search"], "my.server": ["mcp__my_server__read"] },
+    });
+  });
+
+  it("tools of servers that normalise alike go to neither; a longer name wins its own (#389)", () => {
+    const events = collectEmits({
+      type: "system",
+      subtype: "init",
+      mcp_servers: [
+        { name: "a.b", status: "connected" },
+        { name: "a_b", status: "connected" },
+        { name: "x", status: "connected" },
+        { name: "x__y", status: "connected" },
+      ],
+      tools: ["mcp__a_b__t", "mcp__x__one", "mcp__x__y__two"],
+    });
+    expect(events[0]).toMatchObject({ tools: { "a.b": [], a_b: [], x: ["mcp__x__one"], x__y: ["mcp__x__y__two"] } });
+  });
+
+  it("names MCP tools' server part the way the CLI does", () => {
+    expect(mcpToolPrefix("slack")).toBe("slack");
+    expect(mcpToolPrefix("my.server v2")).toBe("my_server_v2");
+    expect(mcpToolPrefix("a -- b")).toBe("a_--_b");
+    // claude.ai connectors also collapse runs of _ and trim the ends.
+    expect(mcpToolPrefix("claude.ai Google Drive")).toBe("claude_ai_Google_Drive");
+    expect(mcpToolPrefix("claude.ai  Foo (beta)")).toBe("claude_ai_Foo_beta");
+  });
+
   it("emits api_retry for api_retry subtype", () => {
     const events = collectEmits({
       type: "system",
@@ -1119,6 +1345,29 @@ describe("translateSDKMessage – system", () => {
   it("emits nothing for unknown system subtype", () => {
     const events = collectEmits({ type: "system", subtype: "other" });
     expect(events).toHaveLength(0);
+  });
+});
+
+describe("translateSDKMessage – rate_limit_event", () => {
+  it("emits the plan limit state with resetsAt converted from epoch seconds to ms", () => {
+    const events = collectEmits({
+      type: "rate_limit_event",
+      rate_limit_info: { status: "rejected", resetsAt: 1_800_000_000, rateLimitType: "five_hour" },
+    });
+    expect(events).toEqual([{ type: "rate_limit", status: "rejected", resetsAt: 1_800_000_000_000, limitType: "five_hour" }]);
+  });
+
+  it("flags a rejection that overage is carrying", () => {
+    for (const info of [{ isUsingOverage: true }, { overageInUse: true }, { overageStatus: "allowed" }, { overageStatus: "allowed_warning" }]) {
+      const events = collectEmits({ type: "rate_limit_event", rate_limit_info: { status: "rejected", ...info } });
+      expect(events[0]).toMatchObject({ type: "rate_limit", status: "rejected", overage: true });
+    }
+    const plain = collectEmits({ type: "rate_limit_event", rate_limit_info: { status: "rejected", overageStatus: "rejected" } });
+    expect((plain[0] as { overage?: boolean }).overage).toBeUndefined();
+  });
+
+  it("emits nothing for a status it doesn't know", () => {
+    expect(collectEmits({ type: "rate_limit_event", rate_limit_info: { status: "mystery" } })).toHaveLength(0);
   });
 });
 
@@ -1556,6 +1805,126 @@ describe("ClaudeProvider – runTurn with mocked SDK", () => {
   });
 });
 
+describe("ClaudeProvider – OAuth registry servers (#390)", () => {
+  let openGate: () => void = () => {};
+  beforeEach(() => {
+    sdkMessages = [];
+    sdkThrowError = null;
+    capturedQueryOpts = null;
+    queryCallCount = 0;
+    sdkGate = new Promise<void>((r) => {
+      openGate = r;
+    });
+  });
+
+  it("leaves a server codeoid owns out of the user servers it passes, by URL", () => {
+    const user = {
+      notes: { type: "http", url: "https://notes.example.com/mcp" },
+      renamed: { type: "http", url: "https://tracker.example.com/mcp" },
+      other: { type: "http", url: "https://other.example.com/mcp" },
+      local: { command: "node", args: [] },
+    } as never;
+    // By URL, not by name: another server called "notes" elsewhere is not codeoid's.
+    expect(Object.keys(withoutServers(user, ["https://notes.example.com/mcp", "https://tracker.example.com/mcp"]))).toEqual(["other", "local"]);
+    expect(withoutServers(user, [])).toBe(user);
+  });
+
+  it("never mounts codeoid's copy over the user's own server of that name; drops the user's copy at codeoid's URL", async () => {
+    const { McpServerSchema } = await import("../config.js");
+    const { McpRegistry } = await import("../daemon/mcp/registry.js");
+    const provider = new ClaudeProvider({
+      sessionId: "test-session",
+      initialBackingId: "test-backing",
+      workspaceId: "ws_test",
+      tenant: { accountId: "acc", projectId: "proj" },
+      mcpRegistry: new McpRegistry(
+        {
+          github: McpServerSchema.parse({ url: "https://attacker.example/mcp", oauth: true }),
+          my_tracker: McpServerSchema.parse({ url: "https://tracker.attacker.example/mcp", oauth: true }),
+          notes: McpServerSchema.parse({ url: "https://notes.example.com/mcp", oauth: true }),
+        },
+        { memoryEnabled: false },
+      ),
+      mcpHub: { signedIn: () => true, credentialStamp: () => "1" } as never,
+      // This workdir's own config: its own github elsewhere, and the CLI's copy of notes.
+      userMcpServers: () =>
+        ({
+          github: { type: "http", url: "https://api.githubcopilot.com/mcp" },
+          "My-Tracker": { type: "http", url: "https://tracker.internal/mcp" },
+          notes: { type: "http", url: "https://notes.example.com/mcp" },
+        }) as never,
+      store: {
+        audit: () => {},
+        getClaudeCodeSessionId: () => null,
+        setClaudeCodeSessionId: () => {},
+        getSkillCommandGrants: () => new Map<string, boolean>(),
+        setSkillCommandGrant: () => {},
+      } as never,
+    });
+    provider.runTurn({ history: [], userMessage: "t1", workdir: "/tmp", canUseTool: async () => ({ behavior: "allow" as const }) });
+    const servers = (capturedQueryOpts?.options as { mcpServers?: Record<string, { type?: string; url?: string }> }).mcpServers!;
+    expect(servers.github).toMatchObject({ type: "http", url: "https://api.githubcopilot.com/mcp" }); // theirs stays
+    expect(servers.my_tracker).toBeUndefined(); // nor beside a look-alike of theirs
+    expect(servers.notes).toMatchObject({ type: "sdk" }); // codeoid's, the CLI's copy (same URL) dropped
+    openGate();
+    await provider.teardown();
+  });
+
+  it("mounts codeoid's copy once signed in, denies the CLI's, and rebuilds on a sign-in change", async () => {
+    const { McpServerSchema } = await import("../config.js");
+    const { McpRegistry } = await import("../daemon/mcp/registry.js");
+    const registry = new McpRegistry({ notes: McpServerSchema.parse({ url: "https://notes.example.com/mcp", oauth: true }) }, { memoryEnabled: false });
+    let signedIn = false;
+    let stamp = "1";
+    const hub = { signedIn: () => signedIn, credentialStamp: () => (signedIn ? stamp : undefined) } as never;
+    const provider = new ClaudeProvider({
+      sessionId: "test-session",
+      initialBackingId: "test-backing",
+      workspaceId: "ws_test",
+      tenant: { accountId: "acc", projectId: "proj" },
+      mcpRegistry: registry,
+      mcpHub: hub,
+      store: {
+        audit: () => {},
+        getClaudeCodeSessionId: () => null,
+        setClaudeCodeSessionId: () => {},
+        getSkillCommandGrants: () => new Map<string, boolean>(),
+        setSkillCommandGrant: () => {},
+      } as never,
+    });
+    const turn = (msg: string) =>
+      provider.runTurn({ history: [], userMessage: msg, workdir: "/tmp", canUseTool: async () => ({ behavior: "allow" as const }) });
+    const options = () =>
+      capturedQueryOpts?.options as {
+        mcpServers?: Record<string, { type?: string; url?: string }>;
+        settings?: { deniedMcpServers?: Array<{ serverUrl?: string }> };
+      };
+
+    // Adopted, not signed in yet: no mount, but the CLI's own copy is denied.
+    turn("t1");
+    expect(options().settings?.deniedMcpServers).toEqual([{ serverUrl: "https://notes.example.com/mcp" }]);
+    expect(options().mcpServers?.notes).toBeUndefined();
+
+    turn("t2");
+    expect(queryCallCount).toBe(1); // nothing changed: warm
+
+    signedIn = true;
+    turn("t3");
+    expect(queryCallCount).toBe(2); // the sign-in rebuilt it (same conversation, resumed)
+    expect(options().mcpServers?.notes).toMatchObject({ type: "sdk" });
+    turn("t4");
+    expect(queryCallCount).toBe(2); // nothing changed: warm
+    // Signed out and back in between turns (say after a revoked token): a
+    // fresh connection, though "signed in" reads the same either side.
+    stamp = "2";
+    turn("t5");
+    expect(queryCallCount).toBe(3);
+
+    openGate();
+    await provider.teardown();
+  });
+});
+
 // ── #153: warm loop vs per-turn systemPromptAppend ────────────────────────────
 //
 // The SDK fixes the system prompt at query() construction. The warm
@@ -1693,6 +2062,199 @@ describe("ClaudeProvider – systemPromptAppend loop rebuild (#153)", () => {
     const options = capturedQueryOpts?.options as { resume?: string } | undefined;
     expect(options?.resume).toBe("test-backing");
     await shutdown(provider);
+  });
+});
+
+// ── Claude accounts: per-session credential, switch = rebuild + resume ───────
+
+describe("ClaudeProvider – Claude accounts", () => {
+  let openGate: () => void = () => {};
+  beforeEach(() => {
+    sdkMessages = [];
+    sdkThrowError = null;
+    capturedQueryOpts = null;
+    queryCallCount = 0;
+    sdkGate = new Promise<void>((r) => {
+      openGate = r;
+    });
+  });
+
+  /** A provider whose account is whatever `current` holds at query time. */
+  function makeAccountProvider(
+    current: { account: ResolvedClaudeAccount | null },
+    onModels?: (models: ReadonlyArray<unknown>) => void,
+    extraEnv?: Record<string, string>,
+  ): ClaudeProvider {
+    return new ClaudeProvider({
+      ...(onModels ? { onModels } : {}),
+      ...(extraEnv ? { extraEnv } : {}),
+      sessionId: "acct-session",
+      initialBackingId: "acct-backing",
+      workspaceId: "ws_test",
+      store: {
+        audit: () => {},
+        getClaudeCodeSessionId: () => null,
+        setClaudeCodeSessionId: () => {},
+        getSkillCommandGrants: () => new Map<string, boolean>(),
+        setSkillCommandGrant: () => {},
+      } as never,
+      resolveAccount: () => current.account,
+    });
+  }
+  function account(a: Omit<StoredClaudeAccount, "createdAt" | "updatedAt">): ResolvedClaudeAccount {
+    const stored = { ...a, createdAt: "t", updatedAt: "t" };
+    return {
+      name: a.name,
+      kind: a.kind,
+      fingerprint: `${a.name}:${a.token}`,
+      apply: (env) => applyAccountEnv(env, stored),
+      model: (m) => (a.kind === "bedrock" ? bedrockModel(m, a.env) : m),
+    };
+  }
+  const turnOn = (provider: ClaudeProvider, msg: string) =>
+    provider.runTurn({ history: [], userMessage: msg, workdir: "/tmp", canUseTool: async () => ({ behavior: "allow" as const }) });
+  const envOf = () => (capturedQueryOpts?.options as { env?: Record<string, string> } | undefined)?.env ?? {};
+
+  it("starts the subprocess on the session's account, with every competing credential removed", async () => {
+    const saved = { key: process.env.ANTHROPIC_API_KEY, url: process.env.ANTHROPIC_BASE_URL };
+    process.env.ANTHROPIC_API_KEY = "daemon-key-would-win";
+    process.env.ANTHROPIC_BASE_URL = "https://daemon.example";
+    try {
+      const current = { account: account({ name: "work", kind: "subscription", token: "sk-ant-oat01-WORK" }) };
+      const provider = makeAccountProvider(current);
+      turnOn(provider, "t1");
+      const env = envOf();
+      expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe("sk-ant-oat01-WORK");
+      expect(env.ANTHROPIC_API_KEY).toBeUndefined(); // would otherwise outrank the token
+      expect(env.ANTHROPIC_BASE_URL).toBeUndefined();
+      openGate();
+      await provider.teardown();
+    } finally {
+      if (saved.key === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = saved.key;
+      if (saved.url === undefined) delete process.env.ANTHROPIC_BASE_URL;
+      else process.env.ANTHROPIC_BASE_URL = saved.url;
+    }
+  });
+
+  it("extraEnv reaches the CLI's env last, but never overrides the account's credential, HOME or a Node preload", async () => {
+    const saved = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "daemon-key-would-win";
+    try {
+      const current = { account: account({ name: "work", kind: "subscription", token: "sk-ant-oat01-WORK" }) };
+      const provider = makeAccountProvider(current, undefined, {
+        LOOP_RUN_ID: "run-7",
+        DATABASE_URL: "postgres://test",
+        CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-EVIL",
+        ANTHROPIC_API_KEY: "sk-evil",
+        CLAUDE_CONFIG_DIR: "/tmp/other-login",
+        HOME: "/tmp/evil-home",
+        NODE_OPTIONS: "--require /tmp/evil.js",
+      });
+      turnOn(provider, "t1");
+      const env = envOf();
+      expect(env.LOOP_RUN_ID).toBe("run-7");
+      expect(env.DATABASE_URL).toBe("postgres://test");
+      expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe("sk-ant-oat01-WORK");
+      expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+      expect(env.CLAUDE_CONFIG_DIR).not.toBe("/tmp/other-login");
+      expect(env.HOME).toBe(process.env.HOME!);
+      expect(env.NODE_OPTIONS).not.toBe("--require /tmp/evil.js");
+      openGate();
+      await provider.teardown();
+    } finally {
+      if (saved === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = saved;
+    }
+  });
+
+  it("a Bedrock account: mapped families go to the CLI as aliases; its catalog never reaches the shared cache", async () => {
+    const reported: unknown[] = [];
+    const current = {
+      account: account({ name: "br", kind: "bedrock", token: "br-token", env: { ANTHROPIC_DEFAULT_OPUS_MODEL: "team.opus" } }),
+    };
+    const provider = makeAccountProvider(current, (m) => reported.push(m));
+    provider.runTurn({
+      history: [],
+      userMessage: "t1",
+      workdir: "/tmp",
+      model: "claude-opus-5-5[1m]",
+      fallbackModel: "claude-sonnet-5",
+      canUseTool: async () => ({ behavior: "allow" as const }),
+    });
+    const options = capturedQueryOpts?.options as { model?: string; fallbackModel?: string; env?: Record<string, string> };
+    // Mapped: the alias, so the CLI applies the account's mapping.
+    expect(options.model).toBe("opus[1m]");
+    // Not mapped: as is (the CLI makes it a Bedrock id itself).
+    expect(options.fallbackModel).toBe("claude-sonnet-5");
+    expect(options.env?.AWS_BEARER_TOKEN_BEDROCK).toBe("br-token");
+    await new Promise((r) => setTimeout(r, 10));
+    expect(reported).toEqual([]);
+    openGate();
+    await provider.teardown();
+  });
+
+  it("a fallback that names the same model on the account is dropped (the SDK refuses it)", () => {
+    const br = account({ name: "br", kind: "bedrock", token: "t", env: { ANTHROPIC_DEFAULT_OPUS_MODEL: "team.opus" } });
+    expect(modelOptions("claude-opus-5-5", "claude-opus-4-8", br)).toEqual({ model: "opus" });
+    expect(modelOptions("claude-opus-5-5", "claude-sonnet-5", br)).toEqual({ model: "opus", fallbackModel: "claude-sonnet-5" });
+    expect(modelOptions(undefined, "claude-opus-4-8", br)).toEqual({ fallbackModel: "opus" });
+    expect(modelOptions("claude-opus-5-5", "claude-opus-4-8", null)).toEqual({ model: "claude-opus-5-5", fallbackModel: "claude-opus-4-8" });
+  });
+
+  it("other accounts report the catalog and pass models through", async () => {
+    const reported: unknown[] = [];
+    const provider = makeAccountProvider({ account: account({ name: "w", kind: "subscription", token: "t" }) }, (m) => reported.push(m));
+    provider.runTurn({ history: [], userMessage: "t1", workdir: "/tmp", model: "claude-opus-5-5", canUseTool: async () => ({ behavior: "allow" as const }) });
+    expect((capturedQueryOpts?.options as { model?: string }).model).toBe("claude-opus-5-5");
+    await new Promise((r) => setTimeout(r, 10));
+    expect(reported).toHaveLength(1);
+    openGate();
+    await provider.teardown();
+  });
+
+  it("a gateway account sets the base URL, its token and headers", async () => {
+    const current = {
+      account: account({ name: "gw", kind: "gateway", token: "gw-token", baseUrl: "https://gw.example", headers: { "x-workspace": "ws-7" } }),
+    };
+    const provider = makeAccountProvider(current);
+    turnOn(provider, "t1");
+    const env = envOf();
+    expect(env.ANTHROPIC_BASE_URL).toBe("https://gw.example");
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe("gw-token");
+    expect(env.ANTHROPIC_CUSTOM_HEADERS).toBe("x-workspace: ws-7");
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+    openGate();
+    await provider.teardown();
+  });
+
+  it("switching the account rebuilds the query on the new credential and RESUMES the same session", async () => {
+    const current: { account: ResolvedClaudeAccount | null } = { account: null };
+    const provider = makeAccountProvider(current);
+    turnOn(provider, "t1");
+    expect(queryCallCount).toBe(1);
+    provider.setHasQueried(true);
+    turnOn(provider, "t2"); // same account: the warm loop is reused
+    expect(queryCallCount).toBe(1);
+
+    current.account = account({ name: "work", kind: "subscription", token: "sk-ant-oat01-WORK" });
+    turnOn(provider, "t3");
+    expect(queryCallCount).toBe(2);
+    const options = capturedQueryOpts?.options as { resume?: string; env?: Record<string, string> } | undefined;
+    expect(options?.resume).toBe("acct-backing"); // same conversation
+    expect(options?.env?.CLAUDE_CODE_OAUTH_TOKEN).toBe("sk-ant-oat01-WORK");
+
+    current.account = account({ name: "work", kind: "subscription", token: "sk-ant-oat01-RENEWED" });
+    turnOn(provider, "t4"); // a re-login (new token) is a change too
+    expect(queryCallCount).toBe(3);
+    expect(envOf().CLAUDE_CODE_OAUTH_TOKEN).toBe("sk-ant-oat01-RENEWED");
+
+    current.account = null; // back to the daemon's own environment
+    turnOn(provider, "t5");
+    expect(queryCallCount).toBe(4);
+    expect(envOf().CLAUDE_CODE_OAUTH_TOKEN).toBe(process.env.CLAUDE_CODE_OAUTH_TOKEN as string);
+    openGate();
+    await provider.teardown();
   });
 });
 
@@ -2139,5 +2701,87 @@ describe("ClaudeProvider — adopting a turn the CLI starts on its own", () => {
 
     provider._emitForTest({ type: "tool_start", toolId: "t3", sdkToolUseId: "u3", name: "Bash", input: {}, approvalId: "a3" });
     expect(got.map((e) => e.type)).toEqual(["background_event", "turn_started"]);
+  });
+});
+
+// ── Thinking effort (#417) ────────────────────────────────────────────────────
+
+describe("thinking effort", () => {
+  beforeEach(() => {
+    sdkMessages = [];
+    sdkThrowError = null;
+    capturedQueryOpts = null;
+    sdkGate = null;
+    flagSettings = [];
+  });
+  const turn = (provider: ClaudeProvider, effort?: EffortLevel) =>
+    provider.runTurn({ history: [], userMessage: "hi", workdir: "/tmp", canUseTool: async () => ({ behavior: "allow" as const }), ...(effort ? { effort } : {}) });
+  const options = () => (capturedQueryOpts?.options ?? {}) as { effort?: string; thinking?: unknown };
+
+  it("rides on adaptive thinking at every level, and Off disables thinking", async () => {
+    sdkMessages = [{ type: "result", modelUsage: {} }];
+    for await (const _ of turn(makeProvider(), "xhigh").events) {
+    }
+    expect(options()).toMatchObject({ effort: "xhigh", thinking: { type: "adaptive", display: "summarized" } });
+    for await (const _ of turn(makeProvider(), "off").events) {
+    }
+    expect(options().thinking).toEqual({ type: "disabled" });
+    expect(options().effort).toBeUndefined();
+    for await (const _ of turn(makeProvider()).events) {
+    }
+    expect(options().effort).toBeUndefined(); // the default: nothing sent
+    expect(options().thinking).toEqual({ type: "adaptive", display: "summarized" });
+  });
+
+  it("changes live on a running query — but to or from Off rebuilds it before the next turn", async () => {
+    sdkMessages = [{ type: "result", modelUsage: {} }];
+    let release!: () => void;
+    sdkGate = new Promise<void>((r) => {
+      release = r;
+    });
+    const provider = makeProvider();
+    queryCallCount = 0;
+    const first = turn(provider, "high");
+    for await (const e of first.events) if (e.type === "turn_done") break;
+    expect(await provider.applyEffort("max")).toBe(true);
+    expect(flagSettings).toEqual([{ effortLevel: "max" }]);
+    // Back to the default isn't live: the SDK's live "no level" is the model's
+    // default, not the user's own Claude settings a fresh query reads.
+    expect(await provider.applyEffort(null)).toBe(false);
+    expect(await provider.applyEffort("off")).toBe(false); // fixed at construction
+    expect(flagSettings).toEqual([{ effortLevel: "max" }]);
+    // An effort the live query already runs at doesn't rebuild it...
+    void turn(provider, "max");
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    expect(queryCallCount).toBe(1);
+    // ...nor does a turn at "max"; Default does — a fresh query with no effort option.
+    const back = turn(provider);
+    for (let i = 0; i < 50 && queryCallCount < 2; i++) await Bun.sleep(2);
+    expect(queryCallCount).toBe(2);
+    expect(options().effort).toBeUndefined();
+    void back;
+    // ...Off does: a fresh query, with thinking disabled.
+    const off = turn(provider, "off");
+    for (let i = 0; i < 50 && queryCallCount < 3; i++) await Bun.sleep(2);
+    expect(queryCallCount).toBe(3);
+    expect(options().thinking).toEqual({ type: "disabled" });
+    release();
+    for await (const _ of off.events) {
+    }
+    await provider.teardown();
+  });
+
+  it("reports which levels each model takes", () => {
+    expect(claudeCatalogEntry({ value: "opus", displayName: "Opus", supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"] }).efforts).toEqual([
+      "off",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+    expect(claudeCatalogEntry({ value: "haiku", displayName: "Haiku", supportsEffort: false }).efforts).toEqual(["off"]);
+    expect(claudeCatalogEntry({ value: "x", displayName: "X" }).efforts).toBeUndefined(); // not said: unknown
+    expect(claudeEffortOptions("minimal")).toMatchObject({ effort: "low" }); // no Minimal on Claude
   });
 });

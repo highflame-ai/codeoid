@@ -14,6 +14,7 @@ const focusMock = vi.hoisted(() => vi.fn());
 vi.mock("../state/sessions", () => ({ focusSession: focusMock }));
 
 import CompareModal, { openCompare } from "./CompareModal";
+import { ingestAuthProviders } from "../state/providers";
 
 const STATE = {
   compareId: "c1",
@@ -42,6 +43,7 @@ function respond(overrides: Partial<Record<string, unknown>> = {}) {
 }
 
 beforeEach(() => {
+  ingestAuthProviders({ providers: ["claude", "codex", "pi"] });
   requestMock.mockReset();
   focusMock.mockReset();
 });

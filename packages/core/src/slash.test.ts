@@ -1,5 +1,5 @@
 import { describe, expect, it, mock } from "bun:test";
-import { dispatchSlash, parseSlash, type SlashContext } from "./slash.js";
+import { dispatchSlash, effortChangeSummary, parseSlash, type SlashContext } from "./slash.js";
 
 function ctx(): SlashContext & { sent: unknown[] } {
   const sent: unknown[] = [];
@@ -76,6 +76,18 @@ describe("parseSlash", () => {
     });
   });
 
+  it("parses /effort: a level, default, or the picker (#417)", () => {
+    expect(parseSlash("/effort")).toEqual({ kind: "effort-picker" });
+    expect(parseSlash("/effort High")).toEqual({ kind: "effort", effort: "high" });
+    expect(parseSlash("/effort extra-high")).toEqual({ kind: "effort", effort: "xhigh" });
+    expect(parseSlash("/effort off")).toEqual({ kind: "effort", effort: "off" });
+    expect(parseSlash("/effort default")).toEqual({ kind: "effort", effort: null });
+    expect(() => parseSlash("/effort turbo")).toThrow(/off\|minimal/);
+    expect(effortChangeSummary({ effort: "max", applies: "restart" })).toMatch(/restarts/);
+    expect(effortChangeSummary({ effort: null, applies: "next-turn" })).toBe("Thinking effort: the backend's default, from the next turn.");
+    expect(effortChangeSummary({ effort: "off", applies: "next-turn", waitsForBackground: true })).toMatch(/no background work running \(Stop ends it\)/);
+  });
+
   it("bare /model opens the picker instead of erroring", () => {
     expect(parseSlash("/model")).toEqual({ kind: "model-picker" });
   });
@@ -98,6 +110,30 @@ describe("dispatchSlash", () => {
     const c = ctx();
     dispatchSlash({ kind: "new", name: "demo" }, c);
     expect(c.sent[0]).toMatchObject({ type: "session.create", workdir: "." });
+  });
+
+  it("/mcp reconnect reports what didn't work, from the response's data", async () => {
+    const reported: string[] = [];
+    const answer = (data: Record<string, unknown>) => ({ type: "response.ok", requestId: "req-1", data });
+    for (const [data, expected] of [
+      [{ server: "slack", status: "failed", tools: [], error: "boom" }, ["boom"]],
+      [{ server: "slack", status: "failed", tools: [], deferred: true }, ["slack connects when the next turn starts."]],
+      [{ server: "slack", status: "needs-auth", tools: [] }, ["slack is needs-auth."]],
+      [{ server: "slack", status: "connected", tools: ["mcp__slack__x"] }, []], // the session says it's back
+    ] as const) {
+      reported.length = 0;
+      const sent: unknown[] = [];
+      dispatchSlash(
+        { kind: "mcp-reconnect", server: "slack" },
+        { ...ctx(), request: async (m) => {
+            sent.push(m);
+            return answer(data);
+          }, report: (msg) => void reported.push(msg) },
+      );
+      await Bun.sleep(0);
+      expect(sent[0]).toEqual({ type: "session.mcp_reconnect", id: "req-1", sessionId: "s1", server: "slack" });
+      expect(reported).toEqual([...expected]);
+    }
   });
 
   it("/rename emits session.rename", () => {
@@ -207,6 +243,11 @@ describe("dispatchSlash", () => {
     expect(parseSlash("/skills")).toEqual({ kind: "capabilities", tab: "skills" });
     expect(parseSlash("/skill")).toEqual({ kind: "capabilities", tab: "skills" });
     expect(parseSlash("/mcp")).toEqual({ kind: "capabilities", tab: "mcp" });
+    // #389: redial one of the backend's servers; without a name it's just the list.
+    expect(parseSlash("/mcp reconnect slack")).toEqual({ kind: "mcp-reconnect", server: "slack" });
+    expect(parseSlash("/mcp reconnect")).toEqual({ kind: "capabilities", tab: "mcp" });
+    expect(parseSlash("/mcp reconnect claude.ai Gmail")).toEqual({ kind: "mcp-reconnect", server: "claude.ai Gmail" });
+    expect(parseSlash("/mcp refresh")).toEqual({ kind: "mcp-refresh" }); // #395
     expect(parseSlash("/hooks")).toEqual({ kind: "capabilities", tab: "hooks" });
     expect(parseSlash("/hook")).toEqual({ kind: "capabilities", tab: "hooks" });
   });
@@ -329,5 +370,20 @@ describe("/provider", () => {
       sessionId: c.sessionId,
       providerId: "pi",
     });
+  });
+});
+
+describe("/account", () => {
+  it("parses a name, default, or --follow-default, and requires one", () => {
+    expect(parseSlash("/account Work-Max")).toEqual({ kind: "account", account: "work-max" });
+    expect(parseSlash("/account default")).toEqual({ kind: "account", account: "default" });
+    expect(parseSlash("/account --follow-default")).toEqual({ kind: "account", account: null });
+    expect(() => parseSlash("/account")).toThrow(/\/account <name>/);
+  });
+
+  it("dispatches session.set_claude_account", () => {
+    const c = ctx();
+    dispatchSlash({ kind: "account", account: null }, c);
+    expect(c.sent[0]).toMatchObject({ type: "session.set_claude_account", sessionId: c.sessionId, account: null });
   });
 });
