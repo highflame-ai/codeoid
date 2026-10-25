@@ -72,6 +72,14 @@ import { realpathSync } from "node:fs";
 import { lstat, readdir } from "node:fs/promises";
 import { removeForkWorktree } from "./git-worktree.js";
 import {
+  describeSetupResult,
+  prepareWorktree,
+  type RecipeRead,
+  setupEvent,
+  type WorktreeSetupPolicy,
+  type WorktreeSetupResult,
+} from "./workspace-setup.js";
+import {
   copyCheckpoints,
   createCheckpoint,
   currentTree,
@@ -688,8 +696,14 @@ export class Session {
   #pack?: PackActivation;
   /** Fork lineage (set from opts / restored from meta). */
   readonly forkedFrom?: { sessionId: string; name: string; atTurn: number };
-  /** Git worktree backing workdir, when isolated (set from opts / meta). */
-  readonly worktree?: SessionWorktree;
+  /**
+   * Git worktree backing workdir, when isolated (set from opts / meta).
+   * Mutable only to record what its setup recipe put in it.
+   */
+  #worktree?: SessionWorktree;
+  get worktree(): SessionWorktree | undefined {
+    return this.#worktree;
+  }
   /**
    * Goal + role→backend bindings when this session was created with the
    * Collaborative toggle (set from opts / restored from meta). Readonly: the
@@ -1197,7 +1211,7 @@ export class Session {
     this.role = opts.role;
     this.#pack = opts.pack;
     this.forkedFrom = opts.forkedFrom;
-    this.worktree = opts.worktree;
+    this.#worktree = opts.worktree;
     this.collaboration = opts.collaboration;
     this.collaborationRole = opts.collaborationRole;
     this.#blackboardMcp = opts.blackboardMcp;
@@ -2919,6 +2933,22 @@ export class Session {
    * worktree's dependencies are ready. Cleared once awaited.
    */
   #pendingSetup: Promise<void> | null = null;
+  /** A fork's own files are still waiting for its setup recipe (see beginWorktreePrepare). */
+  #filesPending = false;
+  get filesPending(): boolean {
+    return this.#filesPending;
+  }
+
+  /** The worktree setup recipe's step in that chain, and its abort (destroy stops it). */
+  #setupRecipe: { done: Promise<void>; abort: AbortController } | null = null;
+
+  /** Queue `step` after any setup already pending; the first turn waits for the whole chain. */
+  #chainSetup(step: () => Promise<void>): Promise<void> {
+    const prev = this.#pendingSetup ?? Promise.resolve();
+    const next = prev.catch(() => {}).then(step);
+    this.#pendingSetup = next;
+    return next;
+  }
 
   async send(
     text: string,
@@ -4056,11 +4086,19 @@ export class Session {
     // never blocks destroy). Ownership-gated: only worktrees WE created
     // (createdByCodeoid) are removed; a user-bound worktree is left alone. The
     // branch is KEPT by default so any work committed in the fork survives.
+    // A setup recipe still running is stopped first, so nothing writes into
+    // the worktree while it's being removed.
+    const recipe = this.#setupRecipe;
+    if (recipe) {
+      recipe.abort.abort();
+      await recipe.done.catch(() => {});
+    }
     if (this.worktree?.createdByCodeoid) {
       await removeForkWorktree({
         workdir: this.worktree.path,
         worktreePath: this.worktree.path,
         branch: this.worktree.branch,
+        ...(this.worktree.setup ? { setup: this.worktree.setup } : {}),
         // A session undone by the request that made it leaves no branch behind.
         ...(opts.deleteBranch ? { deleteBranch: true } : {}),
       }).catch(() => {});
@@ -4430,8 +4468,8 @@ export class Session {
     this.#persistAndBuffer(start);
     this.#broadcastRaw(start);
 
-    const t0 = Date.now();
-    this.#pendingSetup = (async () => {
+    this.#chainSetup(async () => {
+      const t0 = Date.now();
       try {
         await execFileP("sh", ["-c", command], {
           cwd: this.workdir,
@@ -4466,7 +4504,103 @@ export class Session {
         this.#persistAndBuffer(fail);
         this.#broadcastRaw(fail);
       }
-    })();
+    });
+  }
+
+  /**
+   * Apply the repository's setup recipe (workspace-setup.ts) to the worktree
+   * codeoid created for this session, in the BACKGROUND like
+   * {@link beginSetup} and ahead of it: the first turn waits for both. A
+   * failure is reported as an infrastructure notice, never thrown, and the
+   * worktree is kept as it is.
+   */
+  beginWorktreePrepare(
+    policy: WorktreeSetupPolicy | undefined,
+    opts: {
+      /** The recipe read the caller planned with (see prepareWorktree). */
+      recipe?: RecipeRead;
+      /**
+       * Work that must wait for setup — a fork's carried uncommitted state
+       * and file roll, held back so a setup command only ever sees committed
+       * content. Runs whether or not setup succeeded; never after destroy.
+       */
+      after?: (result: WorktreeSetupResult) => Promise<void>;
+    } = {},
+  ): void {
+    const wt = this.#worktree;
+    if (!wt?.createdByCodeoid) return;
+    const abort = new AbortController();
+    // Until `after` has run the folder is the clean checkout, not the fork's
+    // files: a fork, rewind or file read of it is refused meanwhile.
+    if (opts.after) this.#filesPending = true;
+    const done = this.#chainSetup(async () => {
+      try {
+        if (abort.signal.aborted || this.#destroyed) return;
+        const result = await prepareWorktree({
+          worktreePath: wt.path,
+          policy,
+          signal: abort.signal,
+          ownerSub: this.createdBy,
+          ...(opts.recipe !== undefined ? { recipe: opts.recipe } : {}),
+        });
+        // Recorded even when destroyed meanwhile: destroy's cleanup reads it to
+        // take the copied files and shared links back out.
+        this.#recordWorktreeSetup(result, !this.#destroyed);
+        if (this.#destroyed) return;
+        this.#announceWorktreeSetup(result);
+        if (opts.after) await opts.after(result);
+      } finally {
+        this.#filesPending = false;
+      }
+    });
+    this.#setupRecipe = { done, abort };
+    void done.finally(() => {
+      if (this.#setupRecipe?.done === done) this.#setupRecipe = null;
+    });
+  }
+
+  /**
+   * Record what a setup recipe put in this session's worktree (so it stays
+   * out of checkpoints and is taken back out on removal) and tell the
+   * client. Called by {@link beginWorktreePrepare}, or directly when the
+   * recipe ran before the session existed (routines).
+   */
+  noteWorktreePrepared(result: WorktreeSetupResult): void {
+    this.#recordWorktreeSetup(result, true);
+    this.#announceWorktreeSetup(result);
+  }
+
+  #recordWorktreeSetup(result: WorktreeSetupResult, persist: boolean): void {
+    const wt = this.#worktree;
+    if (wt && (result.copied.length > 0 || result.shared.length > 0)) {
+      this.#worktree = { ...wt, setup: { copied: [...result.copied], shared: [...result.shared] } };
+      if (persist) this.#saveMetaNow();
+    }
+  }
+
+  #announceWorktreeSetup(result: WorktreeSetupResult): void {
+    if (result.error) {
+      console.error(`[codeoid/session ${this.id.slice(0, 8)}] worktree setup failed: ${result.error}`);
+    }
+    const text = describeSetupResult(result);
+    if (!text) return;
+    const msg = this.#makeMessage("info", text, SYSTEM_IDENTITY, undefined, undefined, {
+      event: setupEvent(result),
+      infrastructure: true,
+      copied: result.copied,
+      shared: result.shared,
+      ...(result.command ? { exitCode: result.command.exitCode, timedOut: result.command.timedOut } : {}),
+      ...(result.commandSkipped ? { commandSkipped: result.commandSkipped } : {}),
+    });
+    this.#persistAndBuffer(msg);
+    this.#broadcastRaw(msg);
+  }
+
+  /** Worktree-root paths the setup recipe added, as absolute paths (checkpoint exclusions). */
+  #setupPaths(): string[] {
+    const wt = this.#worktree;
+    if (!wt?.setup) return [];
+    return [...wt.setup.copied, ...wt.setup.shared].map((rel) => join(wt.path, rel));
   }
 
   /**
@@ -7084,6 +7218,7 @@ export class Session {
         // start snapshot, past its wait; for an end one, the next turn began.
         isLate: opts.lateWhen ?? (() => started),
         excludeDirs: this.#protectedDirs(),
+        excludePaths: this.#setupPaths(),
         limits: this.#checkpointLimits(),
         ...(opts.onlyIfMissing ? { onlyIfMissing: true } : {}),
       }),
@@ -7301,6 +7436,7 @@ export class Session {
         workdir: this.workdir,
         sessionId: this.id,
         excludeDirs: this.#protectedDirs(),
+        excludePaths: this.#setupPaths(),
         limits: this.#checkpointLimits(),
       });
       if (!now.ok) throw new Error(now.reason);
@@ -7449,6 +7585,7 @@ export class Session {
       workdir: this.workdir,
       sessionId: this.id,
       excludeDirs: this.#protectedDirs(),
+      excludePaths: this.#setupPaths(),
       limits: this.#checkpointLimits(),
     });
     if (!now.ok) return { ...plan, planId: planHash([turnId, ...removedIds]), filesUnavailable: `the current files couldn't be read: ${now.reason}` };

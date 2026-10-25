@@ -156,6 +156,28 @@ const general: SettingsTab = {
         }),
       ],
     },
+    {
+      id: "worktree-setup",
+      title: "Worktree setup recipe",
+      description:
+        "A repository's committed .codeoid/setup.yaml says which ignored files to copy and which directories to share (writable links into your checkout) into a worktree codeoid creates. Those steps always apply; its command is a separate opt-in, per recipe.",
+      fields: [
+        cfg(
+          "worktree.setup.runCommands",
+          "Run recipe commands",
+          "Whether a recipe's setup command may run in a new worktree. With Trusted recipes it runs only while the recipe is the one you trusted with `codeoid worktree trust` in that repository — a changed recipe runs nothing until trusted again. It runs the repository's committed scripts as you. Reading a recipe never runs anything.",
+          {
+            kind: "enum",
+            default: "never",
+            applies: "live",
+            options: [
+              { value: "never", label: "Never", description: "Copy and share files only." },
+              { value: "trusted-repos", label: "Trusted recipes", description: "Run the command of a recipe trusted with `codeoid worktree trust`." },
+            ],
+          },
+        ),
+      ],
+    },
   ],
 };
 

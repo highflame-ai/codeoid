@@ -43,6 +43,7 @@ import type {
   SessionSetAccountMsg,
 } from "./accounts.js";
 import type { SkillGrantMsg, SkillGrantResultMsg } from "./skill-grant.js";
+import type { WorktreeTrustMsg, WorktreeTrustResultMsg } from "./worktree-trust.js";
 import type { SessionRewindMsg, SessionRewindResultMsg, SessionTurnsMsg, SessionTurnsResultMsg } from "./turns.js";
 import type { SessionApprovalsMsg, SessionApprovalsResultMsg } from "./approvals.js";
 import type {
@@ -563,6 +564,13 @@ export interface SessionWorktree {
    * worktree the user already had — codeoid never removes those.
    */
   createdByCodeoid: boolean;
+  /**
+   * What the repository's setup recipe put in this worktree, relative to its
+   * root: copied (ignored, often secret) files and symlinks to the primary
+   * checkout's shared directories. Kept out of checkpoints and taken back out
+   * before the worktree is removed.
+   */
+  setup?: { copied: string[]; shared: string[] };
 }
 
 /**
@@ -1146,6 +1154,7 @@ export type ClientMessage =
   | BackendLoginCancelMsg
   | BackendLoginWaitMsg
   | SkillGrantMsg
+  | WorktreeTrustMsg
   | SessionTurnsMsg
   | SessionApprovalsMsg
   | ClaudeAccountsListMsg
@@ -2970,6 +2979,7 @@ export type DaemonMessage =
   | BackendLoginCancelResultMsg
   | BackendLoginWaitResultMsg
   | SkillGrantResultMsg
+  | WorktreeTrustResultMsg
   | SessionTurnsResultMsg
   | SessionApprovalsResultMsg
   | ClaudeAccountsResultMsg

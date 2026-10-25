@@ -17,6 +17,7 @@ import { MockSessionProvider } from "../daemon/providers/mock/session-provider.j
 import { ProviderRegistry } from "../daemon/providers/registry.js";
 import { handleRoutineFire } from "../daemon/routines/http.js";
 import { SessionManager } from "../daemon/session-manager.js";
+import { readSetupRecipe } from "../daemon/workspace-setup.js";
 import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
 import { ALL_SCOPES, OPERATOR_SCOPES, SCOPES, WATCHER_SCOPES } from "../protocol/scopes.js";
@@ -79,6 +80,7 @@ let manager: SessionManager;
 let providers: MockSessionProvider[];
 let nextScript: ProviderEvent[][];
 let hookFile: string;
+let registry: ProviderRegistry;
 
 const CLIENT = (auth: AuthContext) => ({ id: `c-${auth.sub}`, auth, send: () => {} });
 const call = (msg: Record<string, unknown>, auth: AuthContext = OWNER): Promise<DaemonMessage> =>
@@ -109,7 +111,7 @@ beforeEach(() => {
   providers = [];
   nextScript = [reply("Found 2 stale PRs: #12, #15.")];
   hookFile = join(tmp, "hook.json");
-  const registry = new ProviderRegistry("claude");
+  registry = new ProviderRegistry("claude");
   registry.register({
     id: "claude",
     displayName: "claude",
@@ -411,5 +413,64 @@ describe("budgets and isolation", () => {
     expect(s?.worktree?.branch).toMatch(/^codeoid\/triage-/);
     expect(s?.workdir).not.toBe(repo);
     expect(providers[0]!.capturedOpts[0]!.workdir).toBe(s!.workdir);
+  });
+
+  const commitRecipe = (yaml: string) => {
+    const git = (...a: string[]) => execFileSync("git", a, { cwd: repo });
+    mkdirSync(join(repo, ".codeoid"), { recursive: true });
+    writeFileSync(join(repo, ".codeoid", "setup.yaml"), yaml);
+    writeFileSync(join(repo, ".gitignore"), ".env\n");
+    git("add", ".");
+    git("commit", "-qm", "recipe");
+  };
+
+  it("a worktree run gets the repository's setup recipe applied before the agent starts", async () => {
+    commitRecipe("copy: [.env]\n");
+    writeFileSync(join(repo, ".env"), "K=v\n");
+    await create({ worktree: true });
+    await call({ type: "routine.run", routine: "triage" });
+    await settled();
+    const run = ((await call({ type: "routine.get", routine: "triage" })) as RoutineSnapshotMsg).runs![0]!;
+    expect(run.status).toBe("succeeded");
+    const list = await call({ type: "session.list" });
+    const s = list.type === "session.list.result" ? list.sessions.find((x) => x.id === run.sessionId)! : undefined;
+    expect(s?.worktree?.setup?.copied).toEqual([".env"]);
+    expect(readFileSync(join(s!.worktree!.path, ".env"), "utf8")).toBe("K=v\n");
+  });
+
+  it("a trusted setup command runs on the committed tree; the checkout's uncommitted edit is carried after it", async () => {
+    commitRecipe("command: cat README.md > .seen\n");
+    writeFileSync(join(repo, ".gitignore"), ".env\n.seen\n");
+    execFileSync("git", ["commit", "-qam", "ignore"], { cwd: repo });
+    const recipeHash = (await readSetupRecipe(repo))!.recipeHash;
+    writeFileSync(join(repo, "README.md"), "hi\nuncommitted\n");
+    await manager.drain(2_000).catch(() => {});
+    manager = new SessionManager(store, transcript, undefined, undefined, undefined, {
+      config: { ...mkConfig(tmp), worktree: { setup: { runCommands: "trusted-repos", trustedRepos: [{ path: repo, recipeHash }] } } } as CodeoidConfig,
+      providers: registry,
+    });
+    await create({ worktree: true });
+    await call({ type: "routine.run", routine: "triage" });
+    await settled();
+    const run = ((await call({ type: "routine.get", routine: "triage" })) as RoutineSnapshotMsg).runs![0]!;
+    expect(run.status).toBe("succeeded");
+    const list = await call({ type: "session.list" });
+    const s = list.type === "session.list.result" ? list.sessions.find((x) => x.id === run.sessionId)! : undefined;
+    expect(readFileSync(join(s!.worktree!.path, ".seen"), "utf8")).toBe("hi\n");
+    expect(readFileSync(join(s!.worktree!.path, "README.md"), "utf8")).toBe("hi\nuncommitted\n");
+  });
+
+  it("a setup recipe that fails is the run's infrastructure error — the agent never starts, the checkout is untouched", async () => {
+    commitRecipe("copy: [../outside]\n");
+    await create({ worktree: true });
+    await call({ type: "routine.run", routine: "triage" });
+    await settled();
+    const run = ((await call({ type: "routine.get", routine: "triage" })) as RoutineSnapshotMsg).runs![0]!;
+    expect(run.status).toBe("failed");
+    expect(run.reason).toMatch(/^workspace setup failed \(an infrastructure error; the agent never started\): .*\.\. segment/);
+    expect(providers).toHaveLength(0);
+    // Its fresh worktree was removed; the repository has no leftover branch.
+    expect(execFileSync("git", ["branch", "--list", "codeoid/*"], { cwd: repo }).toString().trim()).toBe("");
+    expect(existsSync(join(repo, "README.md"))).toBe(true);
   });
 });
