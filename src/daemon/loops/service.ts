@@ -28,6 +28,7 @@
  * `LoopHost`, so it is testable without a SessionManager.
  */
 
+import type { ResponseErrorDetail } from "../../protocol/types.js";
 import type { CheckRun } from "../evidence/service.js";
 import type { CheckSpec, EvidenceRecord } from "../evidence/types.js";
 import { answerPrompt, firstAttemptPrompt, nextAttemptPrompt, takeoverPreamble, withSteering } from "./prompt.js";
@@ -142,8 +143,9 @@ export interface LoopHost {
   forgetRun(run: LoopRunRow): void;
   /** At boot: drop what was kept for any run not in `runIds`. */
   keepInputs(runIds: Set<string>): void;
-  /** Tell the owner something needs them (push + attention). */
-  notifyOwner(run: LoopRunRow, kind: "waiting" | "finished"): void;
+  /** Tell the owner something needs them (push + attention), or that the run
+   *  ended: `finished` on its own, `cancelled` by its owner (no push: they did it). */
+  notifyOwner(run: LoopRunRow, kind: "waiting" | "finished" | "cancelled"): void;
   audit(run: LoopRunRow, action: string, detail: string): void;
 }
 
@@ -151,6 +153,8 @@ export class LoopError extends Error {
   constructor(
     message: string,
     readonly code: "invalid_request" | "not_found" | "forbidden" | "conflict",
+    /** What a client can act on without parsing the message (`response.error`'s `detail`). */
+    readonly detail?: ResponseErrorDetail,
   ) {
     super(message);
   }
@@ -315,6 +319,11 @@ export class LoopService {
     return this.#store.listOwnedRuns(tenantOf(owner), owner.sub, limit);
   }
 
+  /** The owner's runs still in progress, oldest first (at most ACTIVE_RUNS_PER_OWNER). */
+  listActive(owner: LoopOwner): LoopRunRow[] {
+    return this.#store.listActiveOwnedRuns(tenantOf(owner), owner.sub);
+  }
+
   attempts(runId: string): LoopAttemptRow[] {
     return this.#store.listAttempts(runId);
   }
@@ -381,16 +390,26 @@ export class LoopService {
       try {
         const run = this.#store.getRun(id)!;
         if (isTerminalLoopStatus(run.status)) return run;
+        // The attempt in flight was paid for: its spend is the run's, as for
+        // an attempt that ended on its own.
+        const current = this.#currentAttempt(id);
+        if (current && current.status !== "done" && current.startedAt !== null) {
+          this.#store.updateAttempt(current.id, { costUsd: this.#attemptCost(run, current) });
+        }
+        const costUsd = this.#store.listAttempts(id).reduce((n, a) => n + a.costUsd, 0);
         const next = this.#store.transition(
           id,
           run.stateVersion,
-          { status: "cancelled", reason: "cancelled by the owner", waitingOn: null, endedAt: Date.now() },
+          { status: "cancelled", reason: "cancelled by the owner", waitingOn: null, endedAt: Date.now(), costUsd },
           { actor: owner.sub, type: "run.cancelled" },
         );
         await this.#stopActiveWork(run, "the run was cancelled");
         this.#release(run);
         this.#host.audit(run, "loop.cancel", "");
-        return next ?? this.#store.getRun(id)!;
+        const ended = next ?? this.#store.getRun(id)!;
+        // Whoever follows the run (a routine run it was started by) learns now.
+        if (next) this.#host.notifyOwner(next, "cancelled");
+        return ended;
       } finally {
         this.#cancelling.delete(id);
       }
@@ -702,7 +721,13 @@ export class LoopService {
       limits,
       ...(input.baseRef ? { baseRef: resolveBaseRef(input.baseRef) } : {}),
       ...(input.trigger
-        ? { trigger: { ...input.trigger, summary: input.trigger.summary.slice(0, LOOP_LIMITS.TRIGGER_SUMMARY_MAX) } }
+        ? {
+            trigger: {
+              ...input.trigger,
+              summary: input.trigger.summary.slice(0, LOOP_LIMITS.TRIGGER_SUMMARY_MAX),
+              ...(input.trigger.payload !== undefined ? { payload: input.trigger.payload.slice(0, LOOP_LIMITS.TRIGGER_PAYLOAD_MAX) } : {}),
+            },
+          }
         : {}),
     };
   }

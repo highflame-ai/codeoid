@@ -347,4 +347,44 @@ describe("collectAttention — watches and routines", () => {
     ]);
     expect(items[1]!.since).toBe(NOW - 10 * MIN);
   });
+
+  it("lists a loop routine whose loop ended blocked as a failure, labelled as the loop's", () => {
+    const items = collectAttention(
+      sources({
+        routines: [
+          routine({
+            id: "lb",
+            name: "lb",
+            lastRun: runWire({ status: "needs_attention", reason: "the loop run is blocked after 2 attempt(s): no progress", endedAt: iso(NOW - MIN), loop: { runId: "loop_1", status: "blocked" } }),
+          }),
+        ],
+      }),
+      NOW,
+    );
+    expect(items.map((i) => [i.key, i.kind, i.detail])).toEqual([["routine:lb", "failed", "loop blocked: the loop run is blocked after 2 attempt(s): no progress"]]);
+  });
+
+  it("lists a loop routine whose loop waits on you, or is paused, even behind a later skipped fire", () => {
+    const following = (status: "waiting" | "paused" | "running") =>
+      runWire({ status: "running", startedAt: iso(NOW - 5 * MIN), endedAt: undefined, loop: { runId: `loop_${status}`, status } });
+    const skipped = runWire({ id: "run_skip", status: "skipped", reason: "the loop run its last fire started (loop_waiting) is still in progress (waiting)" });
+    const items = collectAttention(
+      sources({
+        routines: [
+          routine({ id: "w", name: "w", lastRun: skipped, activeLoopRun: following("waiting") }),
+          routine({ id: "p", name: "p", lastRun: following("paused"), activeLoopRun: following("paused") }),
+          // Working on its own: nothing for you to do.
+          routine({ id: "r", name: "r", lastRun: following("running"), activeLoopRun: following("running") }),
+        ],
+      }),
+      NOW,
+    );
+    expect(items.map((i) => [i.key, i.kind, i.routineId])).toEqual([
+      ["routine:w", "blocked", "w"],
+      ["routine:p", "blocked", "p"],
+    ]);
+    expect(items[0]!.detail).toMatch(/^waiting on its loop/);
+    expect(items[1]!.detail).toContain("paused");
+    expect(items[0]!.since).toBe(NOW - 5 * MIN);
+  });
 });

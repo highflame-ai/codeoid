@@ -12,7 +12,8 @@ import { loopRun, trigger, watch } from "../../lib/automation.fixtures";
 afterEach(cleanup);
 
 const NOW = Date.parse("2026-10-26T12:00:00.000Z");
-const HEAD = "0123456789abcdef0123";
+const HEAD = "0123456789abcdef0123456789abcdef01234567";
+const MOVED = "fedcba9876543210fedcba9876543210fedcba98";
 
 function detailProps(over: Partial<WatchDetailProps> = {}): WatchDetailProps {
   return {
@@ -87,7 +88,7 @@ describe("WatchDetail", () => {
           triggers: [
             trigger(),
             trigger({
-              key: `untrusted:w_1:${HEAD}::main`,
+              key: `untrusted:w_1:${HEAD}:acme/shop:main`,
               kind: "head",
               runId: null,
               outcome: "ignored",
@@ -148,9 +149,28 @@ describe("WatchDetail", () => {
     expect(onDelete).toHaveBeenCalled();
   });
 
+  it("after a narrowing save, offers the pinned vouch dialog, and the save itself vouches for nothing", async () => {
+    const onSaveTrust = vi.fn(async () => {});
+    const onVouch = vi.fn(async () => {});
+    const { getByRole, getByTestId, getByLabelText } = render(() => (
+      <WatchDetail
+        {...detailProps({ onSaveTrust, onVouch, triggers: [trigger({ key: `untrusted:w_1:${HEAD}:acme/shop:main`, kind: "head", outcome: "ignored", runId: null })] })}
+      />
+    ));
+    fireEvent.click(getByRole("button", { name: "edit" }));
+    fireEvent.click(getByRole("button", { name: "Stop trusting alice" }));
+    fireEvent.click(getByRole("button", { name: "Save trust list" }));
+    fireEvent.click(getByRole("button", { name: "Narrow it" }));
+    await waitFor(() => expect(getByTestId("watch-offer-vouch")).toBeTruthy());
+    expect(onSaveTrust).toHaveBeenCalledWith([]);
+    expect(onVouch).not.toHaveBeenCalled();
+    fireEvent.click(getByRole("button", { name: "Vouch for current heads…" }));
+    expect((getByLabelText("main head commit") as HTMLInputElement).value).toBe(HEAD);
+  });
+
   it("opens the vouch dialog pinned to the head the history names", () => {
     const { getByRole, getByLabelText } = render(() => (
-      <WatchDetail {...detailProps({ triggers: [trigger({ key: `untrusted:w_1:${HEAD}::main`, kind: "head", outcome: "ignored", runId: null })] })} />
+      <WatchDetail {...detailProps({ triggers: [trigger({ key: `untrusted:w_1:${HEAD}:acme/shop:main`, kind: "head", outcome: "ignored", runId: null })] })} />
     ));
     fireEvent.click(getByRole("button", { name: "Vouch for current head…" }));
     expect((getByLabelText("main head commit") as HTMLInputElement).value).toBe(HEAD);
@@ -168,35 +188,51 @@ describe("VouchDialog", () => {
     expect(getByRole("link", { name: "view" }).getAttribute("href")).toBe(`https://github.com/acme/shop/commit/${HEAD}`);
   });
 
-  it("pins to the commit (compare-and-set), and on a moved head vouches for nothing until asked again", async () => {
-    const onVouch = vi
-      .fn()
-      .mockRejectedValueOnce(new Error(`main's head is fedcba987654 now, not ${HEAD.slice(0, 12)}: it moved, so nothing was vouched for; look at it again`))
-      .mockResolvedValueOnce(undefined);
+  it("pins to the full commit (compare-and-set), and on a moved head vouches for nothing until asked again", async () => {
+    // The refusal as state/watches rethrows it: the daemon's words, and its structured detail.
+    const refusal = Object.assign(new Error(`main's head is ${MOVED} now, not ${HEAD}: it moved, so nothing was vouched for; look at it again`), {
+      detail: { kind: "head_moved", branch: "main", head: MOVED, pinned: HEAD },
+    });
+    const onVouch = vi.fn().mockRejectedValueOnce(refusal).mockResolvedValueOnce(undefined);
     const onClose = vi.fn();
     const { getByRole, getByTestId, getByLabelText } = render(() => <VouchDialog open watch={watch()} known={known} now={NOW} onVouch={onVouch} onClose={onClose} />);
 
     fireEvent.click(getByRole("button", { name: "Vouch for it" }));
-    await waitFor(() => expect(getByTestId("vouch-moved").textContent).toContain("fedcba987654"));
+    await waitFor(() => expect(getByTestId("vouch-moved").textContent).toContain(MOVED));
     expect(onVouch).toHaveBeenNthCalledWith(1, { main: HEAD });
     expect(onClose).not.toHaveBeenCalled();
-    expect((getByLabelText("main head commit") as HTMLInputElement).value).toBe("fedcba987654");
+    // Re-pinned to the head's full id, never a prefix of it.
+    expect((getByLabelText("main head commit") as HTMLInputElement).value).toBe(MOVED);
     expect(getByRole("alertdialog", { name: "main moved: nothing was vouched for" })).toBeTruthy();
 
     fireEvent.click(getByRole("button", { name: "Vouch for the new head" }));
     await waitFor(() => expect(onClose).toHaveBeenCalled());
-    expect(onVouch).toHaveBeenNthCalledWith(2, { main: "fedcba987654" });
+    expect(onVouch).toHaveBeenNthCalledWith(2, { main: MOVED });
   });
 
-  it("can't confirm a pin without a commit; unpinned vouches for every head as read", async () => {
+  it("re-pins from the words when a refusal carries no detail, if they name the full id", async () => {
+    const onVouch = vi.fn().mockRejectedValueOnce(new Error(`main's head is ${MOVED} now, not ${HEAD}: it moved, so nothing was vouched for`));
+    const { getByRole, getByLabelText, getByTestId } = render(() => <VouchDialog open watch={watch()} known={known} now={NOW} onVouch={onVouch} onClose={vi.fn()} />);
+    fireEvent.click(getByRole("button", { name: "Vouch for it" }));
+    await waitFor(() => expect(getByTestId("vouch-moved")).toBeTruthy());
+    expect((getByLabelText("main head commit") as HTMLInputElement).value).toBe(MOVED);
+  });
+
+  it("can't confirm without each chosen branch's full commit id, and has no unpinned vouch", async () => {
     const onVouch = vi.fn(async () => {});
-    const { getByRole, getByLabelText } = render(() => (
+    const { getByRole, getByLabelText, queryByLabelText } = render(() => (
       <VouchDialog open watch={watch({ branches: ["main", "release"] })} known={{}} now={NOW} onVouch={onVouch} onClose={vi.fn()} />
     ));
-    expect((getByRole("button", { name: "Vouch for 2 branches" }) as HTMLButtonElement).disabled).toBe(true);
-    fireEvent.click(getByLabelText(/Only while each head is still the commit above/));
-    fireEvent.click(getByRole("button", { name: "Vouch for 2 branches" }));
-    await waitFor(() => expect(onVouch).toHaveBeenCalledWith(true));
+    const confirm = () => getByRole("button", { name: "Vouch for 2 branches" }) as HTMLButtonElement;
+    expect(confirm().disabled).toBe(true);
+    expect(queryByLabelText(/Only while each head is still the commit above/)).toBeNull();
+    fireEvent.input(getByLabelText("main head commit"), { target: { value: HEAD.slice(0, 12) } });
+    fireEvent.input(getByLabelText("release head commit"), { target: { value: MOVED } });
+    expect(confirm().disabled).toBe(true);
+    fireEvent.input(getByLabelText("main head commit"), { target: { value: HEAD } });
+    expect(confirm().disabled).toBe(false);
+    fireEvent.click(confirm());
+    await waitFor(() => expect(onVouch).toHaveBeenCalledWith({ main: HEAD, release: MOVED }));
   });
 
   it("shows any other refusal as the daemon said it", async () => {
@@ -231,9 +267,9 @@ describe("TrustEditor", () => {
     expect(getByRole("alert").textContent).toMatch(/is you/);
   });
 
-  it("narrowing explains it forgets vouched heads and takes a confirm, optionally vouching again", async () => {
+  it("narrowing explains it forgets vouched heads and takes a confirm, with no vouch folded into it", async () => {
     const onSave = vi.fn(async () => {});
-    const { getByRole, getByTestId, getByLabelText } = render(() => (
+    const { getByRole, getByTestId, queryByLabelText } = render(() => (
       <TrustEditor trust={["alice", "bob"]} ghLogin="me" canVouch onSave={onSave} onCancel={vi.fn()} />
     ));
     fireEvent.click(getByRole("button", { name: "Stop trusting alice" }));
@@ -242,8 +278,8 @@ describe("TrustEditor", () => {
     const dialog = getByRole("alertdialog", { name: "Narrow the trust list?" });
     expect(dialog.textContent).toContain("alice");
     expect(onSave).not.toHaveBeenCalled();
-    fireEvent.click(getByLabelText(/Also vouch for each watched branch's head/));
-    fireEvent.click(getByRole("button", { name: "Narrow and vouch again" }));
+    expect(queryByLabelText(/Also vouch for each watched branch's head/)).toBeNull();
+    fireEvent.click(getByRole("button", { name: "Narrow it" }));
     await waitFor(() => expect(onSave).toHaveBeenCalledWith(["bob"], true));
   });
 
@@ -253,7 +289,7 @@ describe("TrustEditor", () => {
     fireEvent.click(getByRole("button", { name: "Trust no one but me" }));
     fireEvent.click(getByRole("button", { name: "Save trust list" }));
     fireEvent.click(getByRole("button", { name: "Narrow it" }));
-    await waitFor(() => expect(onSave).toHaveBeenCalledWith([], false));
+    await waitFor(() => expect(onSave).toHaveBeenCalledWith([], true));
   });
 });
 

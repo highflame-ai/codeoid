@@ -77,37 +77,62 @@ describe("the trust list", () => {
 });
 
 describe("vouching", () => {
+  const A = "a".repeat(40);
+  const B = "b".repeat(40);
+  const C = "c".repeat(40);
+
   it("reads the newest head each branch's history names", () => {
-    const heads = knownHeads([
-      trigger({ key: "untrusted:w_1:aaaaaaaaaaaaaaaa:" + ":main", kind: "head", outcome: "ignored", createdAt: "2026-10-26T11:30:00.000Z" }),
-      trigger({ key: "ci:acme/shop:bbbbbbbbbbbbbbbb:9:1", createdAt: "2026-10-26T10:00:00.000Z" }),
-      trigger({ key: "vouch:w_1:acme/shop:release:cccccccccccccccc", kind: "trust_anchor", branch: "release", outcome: "vouched" }),
-      // A fork's head is not the branch's head in the watched repository.
-      trigger({ key: "untrusted:w_1:dddddddddddddddd:someone/shop:feature", kind: "head", branch: "feature", outcome: "ignored" }),
-      trigger({ key: "review:acme/shop:issue:42", kind: "review_comment", branch: "feature" }),
-    ]);
-    expect(heads.main).toMatchObject({ sha: "aaaaaaaaaaaaaaaa", source: "untrusted head" });
-    expect(heads.release).toMatchObject({ sha: "cccccccccccccccc", source: "your last vouch" });
+    const heads = knownHeads(
+      [
+        // As the daemon writes it: a branch watch's untrusted head names the watched repository.
+        trigger({ key: `untrusted:w_1:${A}:acme/shop:main`, kind: "head", outcome: "ignored", createdAt: "2026-10-26T11:30:00.000Z" }),
+        trigger({ key: `ci:acme/shop:${B}:9:1`, createdAt: "2026-10-26T10:00:00.000Z" }),
+        trigger({ key: `vouch:w_1:acme/shop:release:${C}`, kind: "trust_anchor", branch: "release", outcome: "vouched" }),
+        // A fork's head is not the branch's head in the watched repository.
+        trigger({ key: `untrusted:w_1:${"d".repeat(40)}:someone/shop:feature`, kind: "head", branch: "feature", outcome: "ignored" }),
+        trigger({ key: "review:acme/shop:issue:42", kind: "review_comment", branch: "feature" }),
+      ],
+      "acme/shop",
+    );
+    expect(heads.main).toMatchObject({ sha: A, source: "untrusted head" });
+    expect(heads.release).toMatchObject({ sha: C, source: "your last vouch" });
     expect(heads.feature).toBeUndefined();
   });
 
-  it("reads a moved head out of the daemon's compare-and-set refusal", () => {
-    expect(
-      parseMovedHead("main's head is 0123456789ab now, not fedcba987654: it moved, so nothing was vouched for; look at it again"),
-    ).toEqual({ branch: "main", now: "0123456789ab", pinned: "fedcba987654" });
+  it("matches the watched repository whatever its case, and keeps a record with no head repository", () => {
+    const heads = knownHeads(
+      [
+        trigger({ key: `untrusted:w_1:${A}:Acme/Shop:main`, kind: "head", outcome: "ignored" }),
+        trigger({ key: `untrusted:w_1:${B}::release`, kind: "head", branch: "release", outcome: "ignored" }),
+      ],
+      "acme/shop",
+    );
+    expect(heads.main?.sha).toBe(A);
+    expect(heads.release?.sha).toBe(B);
+  });
+
+  it("reads a moved head from the refusal's detail, or from its words when it names the full id", () => {
+    const detail = { kind: "head_moved", branch: "main", head: B.toUpperCase(), pinned: A };
+    expect(parseMovedHead(Object.assign(new Error("whatever the words say"), { detail }))).toEqual({ branch: "main", now: B, pinned: A });
+    expect(parseMovedHead(`main's head is ${B} now, not ${A}: it moved, so nothing was vouched for; look at it again`)).toEqual({
+      branch: "main",
+      now: B,
+      pinned: A,
+    });
+    // A prefix is never something to pin to.
+    expect(parseMovedHead("main's head is 0123456789ab now, not fedcba987654: it moved, so nothing was vouched for")).toBeNull();
     expect(parseMovedHead("Missing scope: session:approve")).toBeNull();
   });
 
-  it("pins each chosen branch to its commit, or vouches for every head as read", () => {
+  it("always pins each chosen branch to its full commit id", () => {
     const picks = [
-      { branch: "main", on: true, sha: "0123456789AB" },
+      { branch: "main", on: true, sha: A.toUpperCase() },
       { branch: "release", on: false, sha: "" },
     ];
-    expect(buildTrustHead(true, picks)).toEqual({ trustHead: { main: "0123456789ab" } });
-    expect(buildTrustHead(true, [{ branch: "main", on: true, sha: "abc" }])).toHaveProperty("error");
-    expect(buildTrustHead(false, picks)).toHaveProperty("error");
-    expect(buildTrustHead(false, picks.map((p) => ({ ...p, on: true })))).toEqual({ trustHead: true });
-    expect(buildTrustHead(true, picks.map((p) => ({ ...p, on: false })))).toEqual({ error: "Choose at least one branch to vouch for" });
+    expect(buildTrustHead(picks)).toEqual({ trustHead: { main: A } });
+    expect(buildTrustHead([{ branch: "main", on: true, sha: "0123456789ab" }])).toHaveProperty("error");
+    expect(buildTrustHead([{ branch: "main", on: true, sha: A.slice(0, 39) }])).toHaveProperty("error");
+    expect(buildTrustHead(picks.map((p) => ({ ...p, on: false })))).toEqual({ error: "Choose at least one branch to vouch for" });
   });
 });
 
@@ -159,5 +184,8 @@ describe("the create form", () => {
     expect(buildWatchCreate(form({ trust: "web-flow" }))).toMatchObject({ field: "trust" });
     expect(buildWatchCreate(form({ review: true, allow: "renovate[bot]" }))).toMatchObject({ field: "allow" });
     expect(buildWatchCreate(form({ maxRunsPerHour: "61" }))).toMatchObject({ field: "maxRunsPerHour" });
+    // The daemon's rule for the mention: no whitespace in it.
+    expect(buildWatchCreate(form({ review: true, mention: "@code oid" }))).toMatchObject({ field: "mention" });
+    expect(buildWatchCreate(form({ review: true, mention: "@codeoid" }))).toHaveProperty("msg");
   });
 });

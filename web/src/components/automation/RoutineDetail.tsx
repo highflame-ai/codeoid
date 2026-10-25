@@ -11,11 +11,11 @@ import { Component, For, Show, createSignal } from "solid-js";
 import { formatCostUsd, formatDuration, formatTokens } from "../../lib/format";
 import {
   RUN_TRIGGER,
-  ROUTINE_RUN_STATUS,
   isCancellableRun,
   routineBudgetText,
   routineLoopOf,
   routineRunLoop,
+  routineRunStatusStyle,
   routineState,
   scheduleWords,
 } from "../../lib/routines";
@@ -183,13 +183,13 @@ export const RoutineDetail: Component<RoutineDetailProps> = (props) => {
         <button
           type="button"
           class={primaryBtn}
-          disabled={props.busy || !r().enabled}
-          title={r().enabled ? "Fire it now, outside its schedule" : "Resume it first: a paused routine doesn't run"}
+          disabled={props.busy}
+          title={r().enabled ? "Fire it now, outside its schedule" : "Fire it once now: it stays paused, and its schedule and API stay off"}
           onClick={() => (payloadOpen() ? void runNow() : void props.onRunNow())}
         >
           {payloadOpen() ? "Run with payload" : "Run now"}
         </button>
-        <Show when={!payloadOpen() && r().enabled}>
+        <Show when={!payloadOpen()}>
           <button type="button" class={linkBtn} disabled={props.busy} onClick={() => setPayloadOpen(true)}>
             with a payload…
           </button>
@@ -221,7 +221,7 @@ export const RoutineDetail: Component<RoutineDetailProps> = (props) => {
 
       <Show when={payloadOpen()}>
         <label class="flex flex-col gap-1">
-          <span class={labelClass}>Payload ({"{{payload}}"} in the prompt)</span>
+          <span class={labelClass}>{loop() ? "Payload (reaches the loop's worker as data)" : <>Payload ({"{{payload}}"} in the prompt)</>}</span>
           <textarea
             rows={2}
             value={payload()}
@@ -235,7 +235,7 @@ export const RoutineDetail: Component<RoutineDetailProps> = (props) => {
             }}
             class={`${inputClass} resize-y font-sans`}
             aria-label="Payload"
-            placeholder="Text the agent gets as data, e.g. the alert that fired"
+            placeholder={loop() ? "Text the loop's worker gets as data, e.g. the alert that fired" : "Text the agent gets as data, e.g. the alert that fired"}
             disabled={props.busy}
           />
           <div class="flex justify-end">
@@ -259,7 +259,7 @@ export const RoutineDetail: Component<RoutineDetailProps> = (props) => {
               </button>
             </div>
             <pre class="mt-1.5 overflow-x-auto whitespace-pre rounded border border-border bg-bg px-2 py-1 font-mono text-[10px] text-fg-muted">
-              {`curl -X POST <daemon>${t().endpointPath} \\\n  -H "Authorization: Bearer ${t().apiToken.slice(0, 6)}…" \\\n  -d '{"text": "…"}'`}
+              {`curl -X POST <daemon>${t().endpointPath} \\\n  -H "Authorization: Bearer ${t().apiToken.slice(0, 6)}…" \\\n  -H "Content-Type: application/json" \\\n  -d '{"text": "…"}'`}
             </pre>
             <div class="mt-1 flex justify-end">
               <button type="button" class={linkBtn} onClick={() => props.onDismissToken()}>
@@ -426,7 +426,7 @@ const RunRow: Component<{
   onOpenLoopRun: (runId: string) => void;
 }> = (props) => {
   const run = () => props.run;
-  const style = () => ROUTINE_RUN_STATUS[run().status];
+  const style = () => routineRunStatusStyle(run());
   const [confirmCancel, setConfirmCancel] = createSignal(false);
   const duration = () => {
     const start = run().startedAt;

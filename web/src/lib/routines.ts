@@ -87,11 +87,29 @@ export const ROUTINE_RUN_STATUS: Record<RoutineRunStatus, LoopStatusStyle> = {
   },
 };
 
+/**
+ * A loop routine's run whose loop tried and ended blocked: `needs_attention`
+ * on the wire, but it is the loop that is stuck, not a session waiting on an
+ * approval — and it counts toward the failure pause.
+ */
+const LOOP_BLOCKED: LoopStatusStyle = {
+  mark: "⏸",
+  label: "loop blocked",
+  cls: "border-warn/60 bg-warn/15 text-warn",
+  meaning: "The loop it started tried and stopped blocked: it isn't making progress, or the objective conflicts with its checks. Open the loop run to see why. Counts toward the failure pause.",
+};
+
+/** How a run's outcome reads: as its status says, except a loop routine's blocked loop. */
+export function routineRunStatusStyle(run: Pick<RoutineRunWire, "status" | "loop">): LoopStatusStyle {
+  return run.status === "needs_attention" && run.loop ? LOOP_BLOCKED : ROUTINE_RUN_STATUS[run.status];
+}
+
 /** Statuses that count toward the failure pause (docs/routines.md "Outcomes"). */
 const FAILING: readonly RoutineRunStatus[] = ["failed", "timed_out", "over_budget"];
 
-export function isFailingRun(status: RoutineRunStatus): boolean {
-  return FAILING.includes(status);
+/** Counts toward the failure pause: a failure, or a loop routine's loop that ended blocked after trying. */
+export function isFailingRun(status: RoutineRunStatus, loop?: RoutineRunWire["loop"]): boolean {
+  return FAILING.includes(status) || (status === "needs_attention" && !!loop);
 }
 
 /** A run that is still going, so cancel applies (the daemon decides; this keeps dead buttons off). */
@@ -565,7 +583,7 @@ export function buildRoutineSpec(form: RoutineForm): { spec: RoutineSpecWire } |
     ["toolBudget", "Tool budget", 1],
     ["maxMinutes", "Minutes per run", 1],
     ["jitterSeconds", "Jitter", 0],
-    ["keepSessions", "Sessions kept", 0],
+    ["keepSessions", "Sessions kept", 1],
     ["failurePauseAfter", "Failure pause", 0],
   ] as const) {
     const v = optionalInt(form[key], label, min);
@@ -671,9 +689,16 @@ export function buildRoutinePatch(current: RoutineWire, form: RoutineForm): { pa
     if (v !== cur[k]) set(k, v);
   }
   // A cron saved without a zone keeps the routine's (the daemon fills it in),
-  // so compare with the zone it would end up with.
+  // so compare with the zone it would end up with. A `once` the form shows to
+  // the minute is the saved instant while the field still reads the same:
+  // the saved value, seconds and all, is what is compared (and kept).
   const sched = next.schedule;
-  const effective = sched?.kind === "cron" && !sched.timezone && cur.schedule?.kind === "cron" ? { ...sched, timezone: cur.schedule.timezone } : sched;
+  const unchangedOnce = sched?.kind === "once" && cur.schedule?.kind === "once" && form.onceAt === isoToLocal(cur.schedule.at);
+  const effective = unchangedOnce
+    ? cur.schedule
+    : sched?.kind === "cron" && !sched.timezone && cur.schedule?.kind === "cron"
+      ? { ...sched, timezone: cur.schedule.timezone }
+      : sched;
   if (!sameJson(effective, cur.schedule)) set("schedule", sched ?? null);
   const curCheck = cur.check ? { command: cur.check.command, timeoutSeconds: cur.check.timeoutSeconds ?? ROUTINE_DEFAULTS.checkTimeoutSeconds } : null;
   const nextCheck = next.check

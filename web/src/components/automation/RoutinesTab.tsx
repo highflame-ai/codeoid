@@ -7,17 +7,19 @@
 
 import { Component, For, Show, createMemo, createSignal } from "solid-js";
 
-import { RoutineDetail, type RevealedToken } from "./RoutineDetail";
+import { RoutineDetail } from "./RoutineDetail";
 import { RoutineForm, type RoutineFormSubmit } from "./RoutineForm";
 import { AutomationExplainer, ErrorBox, Pill, StatusBadge, When, primaryBtn } from "./common";
-import { ROUTINE_RUN_STATUS, isFailingRun, routineLoopOf, routineState, scheduleWords } from "../../lib/routines";
+import { isFailingRun, routineLoopOf, routineRunStatusStyle, routineState, scheduleWords } from "../../lib/routines";
 import { nowTick } from "../../state/clock";
 import { providerIds, providerLabel } from "../../state/providers";
 import {
   cancelRoutineRun,
   createRoutine,
   deleteRoutine,
+  forgetRoutineToken,
   previewSchedule,
+  revealRoutineToken,
   rotateRoutineToken,
   routinesState,
   runRoutineNow,
@@ -48,13 +50,14 @@ export const routineFormOpen = () => mode() !== null;
 
 export const RoutinesTab: Component<{ onOpenLoopRun: (runId: string) => void; onClose: () => void }> = (props) => {
   const s = routinesState;
-  const [token, setToken] = createSignal<(RevealedToken & { routineId: string }) | null>(null);
+  // Held in the store, so it goes when the connection changes or drops.
+  const token = () => s().token;
   const recentWorkdirs = createMemo(() => [...new Set(sessionList().map((x) => x.workdir).filter(Boolean))].slice(0, 6));
   const sessionIds = createMemo(() => new Set(sessionList().map((x) => x.id)));
   const providers = () => providerIds().map((id) => ({ id, label: providerLabel(id) }));
 
   const reveal = (routine: RoutineWire, apiToken: string | undefined) => {
-    if (apiToken) setToken({ routineId: routine.id, apiToken, endpointPath: `/routines/${routine.id}/fire` });
+    if (apiToken) revealRoutineToken({ routineId: routine.id, apiToken, endpointPath: `/routines/${routine.id}/fire` });
   };
 
   const submit = async (m: NonNullable<Mode>, body: RoutineFormSubmit) => {
@@ -127,8 +130,8 @@ export const RoutinesTab: Component<{ onOpenLoopRun: (runId: string) => void; on
                 onRunNow={(payload) => runRoutineNow(id, payload).then((run) => !!run)}
                 onCancelRun={(runId) => void cancelRoutineRun(id, runId)}
                 onDelete={() => deleteRoutine(id)}
-                onRotateToken={() => rotateRoutineToken(id).then((t) => void setToken({ routineId: id, ...t }))}
-                onDismissToken={() => setToken(null)}
+                onRotateToken={() => rotateRoutineToken(id).then((t) => revealRoutineToken({ routineId: id, ...t }))}
+                onDismissToken={() => forgetRoutineToken()}
                 onOpenSession={(sessionId) => {
                   focusSession(sessionId);
                   props.onClose();
@@ -202,8 +205,8 @@ export const RoutineList: Component<RoutineListProps> = (props) => (
                   <Show when={last()} fallback={<span class="text-[10px] text-fg-faint">never run</span>}>
                     {(run) => (
                       <StatusBadge
-                        style={ROUTINE_RUN_STATUS[run().status]}
-                        class={isFailingRun(run().status) ? "font-semibold" : ""}
+                        style={routineRunStatusStyle(run())}
+                        class={isFailingRun(run().status, run().loop) ? "font-semibold" : ""}
                         testid="routine-last-run"
                       />
                     )}

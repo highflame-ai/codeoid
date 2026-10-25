@@ -223,13 +223,16 @@ It is recorded in the watch's history, which `show` lists as "you vouched for ma
 `show` always lists the newest of these for each branch, however many events came after it.
 The command prints that line, so you see which commit you vouched for and who put it on the branch.
 Given alone it vouches for whatever the head is when the daemon reads it, which may be a commit pushed after you last looked.
-`--trust-head <branch>=<sha>` (repeatable, at least 12 characters of the commit) closes that gap: it vouches for that branch only, and only while its head is still that commit.
-If any named head moved, nothing is vouched for and nothing else in the request changes; look at the new head and vouch again.
-Over the protocol, `trustHead` is `true` or an object of branch to commit (`{ "main": "0123456789ab" }`).
+`--trust-head <branch>=<sha>` (repeatable) closes that gap: it vouches for that branch only, and only while its head is still that commit.
+The commit is named by its full id (40 hex characters, or 64 in a SHA-256 repository; `git rev-parse <commit>` prints it), and a prefix is refused, however long: a prefix could match a commit pushed later that you never looked at.
+If any named head moved, nothing is vouched for and nothing else in the request changes; the refusal names the head's full id now, so look at that commit and vouch again with it.
+Over the protocol, `trustHead` is `true` or an object of branch to full commit id (`{ "main": "<40 hex characters>" }`), and the moved-head refusal carries `detail` `{ "kind": "head_moved", "branch", "head", "pinned" }` with `head` the full id, so a client re-pins without reading the words.
+The web UI always vouches pinned like this, to the full id; it has no unpinned vouch.
 It is never implied: making, resuming, or changing a watch without it vouches for nothing.
 It also forgets that head's untrusted record, if the watch had one.
 A trust list that only adds logins afterwards keeps it, like any remembered head.
 One that drops anyone forgets it; give `--trust-head` again with the new list (`update --trust … --trust-head`).
+In the web UI a narrowing save vouches for nothing; afterwards it offers the vouch dialog, pinned to the commits you look at.
 `--trust-head` alone and `--trust-head <branch>=<sha>` can't be given in one command.
 Given alone, it takes the word after it as its value, so put the watch id before it (`resume <watchId> --trust-head`).
 

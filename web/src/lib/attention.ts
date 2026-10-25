@@ -12,7 +12,7 @@
  */
 
 import { loopQuestion, loopWaitKind, objectiveTitle } from "./loops";
-import { ROUTINE_RUN_STATUS, isFailingRun } from "./routines";
+import { isFailingRun, routineRunStatusStyle } from "./routines";
 import { isRateLimited, isSelfPaused } from "./watches";
 
 /** How long a blocked loop run stays in the inbox after it ended. */
@@ -225,10 +225,26 @@ export function collectAttention(src: AttentionSources, now: number): AttentionI
     });
   }
 
-  // Routines that paused themselves, or whose last run failed recently. A run
-  // waiting on an approval is left out: its session is `waiting_approval`, so
-  // the approval row above already stands for it.
+  // Routines that paused themselves, or whose last run failed recently (a
+  // loop routine's loop that ended blocked included). A run waiting on an
+  // approval is left out: its session is `waiting_approval`, so the approval
+  // row above already stands for it. A loop routine whose loop waits on you
+  // (a question, or paused) holds every later fire back, so it is listed as
+  // "waiting on its loop", opening the routine.
   for (const r of src.routines ?? []) {
+    const following = r.activeLoopRun?.loop;
+    if (following && (following.status === "waiting" || following.status === "paused")) {
+      items.push({
+        key: `routine:${r.id}`,
+        kind: "blocked",
+        sessionId: null,
+        routineId: r.id,
+        label: `routine · ${r.name}`,
+        detail: `waiting on its loop (${following.status === "paused" ? "paused" : "it waits on you"}): later fires are skipped until it ends`,
+        since: sinceFor(r.activeLoopRun!.startedAt ?? r.activeLoopRun!.createdAt, now),
+      });
+      continue;
+    }
     if (!r.enabled && r.pausedReason) {
       items.push({
         key: `routine:${r.id}`,
@@ -242,7 +258,7 @@ export function collectAttention(src: AttentionSources, now: number): AttentionI
       continue;
     }
     const last = r.lastRun;
-    if (!last || !isFailingRun(last.status)) continue;
+    if (!last || !isFailingRun(last.status, last.loop)) continue;
     const ended = sinceFor(last.endedAt ?? last.createdAt, now);
     if (now - ended >= ROUTINE_FAILED_ATTENTION_MS) continue;
     items.push({
@@ -251,7 +267,7 @@ export function collectAttention(src: AttentionSources, now: number): AttentionI
       sessionId: null,
       routineId: r.id,
       label: `routine · ${r.name}`,
-      detail: `${ROUTINE_RUN_STATUS[last.status].label}${last.reason ? `: ${last.reason}` : ""}`,
+      detail: `${routineRunStatusStyle(last).label}${last.reason ? `: ${last.reason}` : ""}`,
       since: ended,
     });
   }

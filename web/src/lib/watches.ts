@@ -5,7 +5,7 @@
  * Pure, so the decisions are tested without a reactive root.
  */
 
-import { optionalInt } from "./automation";
+import { errMessage, optionalInt } from "./automation";
 import type {
   LoopRunWire,
   LoopWatchCreateMsg,
@@ -131,9 +131,11 @@ export interface KnownHead {
  *
  * Keys (src/daemon/loops): `untrusted:<watch>:<sha>:<headRepo>:<branch>`,
  * `vouch:<watch>:<repo>:<branch>:<sha>`, `ci:<repo>:<sha>:<checkRun>:<suite>`.
- * Git refnames can't hold ':', so splitting on it is safe.
+ * Git refnames can't hold ':', so splitting on it is safe. A branch watch's
+ * untrusted heads name the watched repository as their `headRepo`; only one
+ * naming another repository (a fork's pull request) isn't this branch's head.
  */
-export function knownHeads(triggers: readonly LoopWatchTriggerWire[]): Record<string, KnownHead> {
+export function knownHeads(triggers: readonly LoopWatchTriggerWire[], repo: string): Record<string, KnownHead> {
   const out: Record<string, KnownHead> = {};
   const seen = (branch: string, h: KnownHead) => {
     const prev = out[branch];
@@ -144,8 +146,8 @@ export function knownHeads(triggers: readonly LoopWatchTriggerWire[]): Record<st
     let sha: string | undefined;
     let source: KnownHead["source"] | undefined;
     if (parts[0] === "untrusted" && parts.length >= 5) {
-      // A fork's head (headRepo set) isn't the branch's head in this repository.
-      if (parts[3]) continue;
+      // A fork's head (another repository) isn't the branch's head in this one.
+      if (parts[3] && parts[3].toLowerCase() !== repo.toLowerCase()) continue;
       sha = parts[2];
       source = "untrusted head";
     } else if (parts[0] === "vouch" && parts.length >= 5) {
@@ -155,39 +157,51 @@ export function knownHeads(triggers: readonly LoopWatchTriggerWire[]): Record<st
       sha = parts[2];
       source = "failing check";
     }
-    if (sha && source && /^[0-9a-f]{12,40}$/i.test(sha)) seen(t.branch, { sha: sha.toLowerCase(), source, at: t.createdAt });
+    if (sha && source && SHA_RE.test(sha)) seen(t.branch, { sha: sha.toLowerCase(), source, at: t.createdAt });
   }
   return out;
 }
 
-/** The daemon's compare-and-set refusal: `main's head is <sha> now, not <pinned>: it moved, …`. */
-export function parseMovedHead(error: string): { branch: string; now: string; pinned: string } | null {
-  const m = /^(.+?)'s head is ([0-9a-f]{7,40}) now, not ([0-9a-f]{7,40}): it moved/i.exec(error.trim());
+/** A full commit id (SHA-1, or SHA-256): what a vouch pins to, never a prefix. */
+export const SHA_RE = /^[0-9a-f]{40}([0-9a-f]{24})?$/i;
+
+export interface MovedHead {
+  branch: string;
+  /** The head's full id now. */
+  now: string;
+  pinned: string;
+}
+
+/**
+ * The daemon's compare-and-set refusal: its structured `detail` (`head_moved`),
+ * or failing that its words (`main's head is <full sha> now, not <pinned>: it
+ * moved, …`). Only a full id counts: the dialog pins to it as it is.
+ */
+export function parseMovedHead(e: unknown): MovedHead | null {
+  const detail = e && typeof e === "object" && "detail" in e ? (e as { detail?: unknown }).detail : undefined;
+  if (detail && typeof detail === "object" && (detail as { kind?: unknown }).kind === "head_moved") {
+    const d = detail as { branch?: unknown; head?: unknown; pinned?: unknown };
+    if (typeof d.branch === "string" && typeof d.head === "string" && SHA_RE.test(d.head)) {
+      return { branch: d.branch, now: d.head.toLowerCase(), pinned: typeof d.pinned === "string" ? d.pinned.toLowerCase() : "" };
+    }
+  }
+  const m = /^(.+?)'s head is ([0-9a-f]{40}(?:[0-9a-f]{24})?) now, not ([0-9a-f]{4,64}): it moved/i.exec(errMessage(e).trim());
   return m ? { branch: m[1]!, now: m[2]!.toLowerCase(), pinned: m[3]!.toLowerCase() } : null;
 }
 
-export const SHA_RE = /^[0-9a-f]{12,40}$/i;
-
 /**
- * The `trustHead` to send for a vouch: `true` (whatever each head is when the
- * daemon reads it) or a branch → commit record (compare-and-set: nothing is
- * vouched for if any named head moved).
+ * The `trustHead` to send for a vouch: always a branch → full commit record,
+ * a compare-and-set (nothing is vouched for if any named head moved). There
+ * is no unpinned vouch from here: one could take a commit pushed after you
+ * looked.
  */
-export function buildTrustHead(
-  pinned: boolean,
-  picks: readonly { branch: string; on: boolean; sha: string }[],
-): { trustHead: true | Record<string, string> } | { error: string } {
+export function buildTrustHead(picks: readonly { branch: string; on: boolean; sha: string }[]): { trustHead: Record<string, string> } | { error: string } {
   const chosen = picks.filter((p) => p.on);
   if (chosen.length === 0) return { error: "Choose at least one branch to vouch for" };
-  if (!pinned) {
-    // `true` vouches for every watched branch; a subset needs the record.
-    if (chosen.length !== picks.length) return { error: "Vouching for some branches only needs each one pinned to its commit" };
-    return { trustHead: true };
-  }
   const rec: Record<string, string> = {};
   for (const p of chosen) {
     const sha = p.sha.trim();
-    if (!SHA_RE.test(sha)) return { error: `${p.branch}: give at least 12 hex characters of the commit you looked at` };
+    if (!SHA_RE.test(sha)) return { error: `${p.branch}: give the full id of the commit you looked at (40 hex characters)` };
     rec[p.branch] = sha.toLowerCase();
   }
   return { trustHead: rec };
@@ -355,7 +369,8 @@ export function buildWatchCreate(form: WatchForm): { msg: Omit<LoopWatchCreateMs
   const allow = parseLogins(form.allow, { bots: false, max: 20, what: "allowed authors" });
   if ("error" in allow) return { ...allow, field: "allow" };
   const mention = form.mention.trim();
-  if (mention && (mention.length < 2 || mention.length > 64)) return { error: "The mention is 2–64 characters", field: "mention" };
+  // The daemon's rule: 2–64 characters, none of them whitespace.
+  if (mention && !/^\S{2,64}$/.test(mention)) return { error: "The mention is 2–64 characters, with no spaces", field: "mention" };
   const trust = parseLogins(form.trust, { bots: true, max: TRUST_MAX, what: "trusted logins" });
   if ("error" in trust) return { ...trust, field: "trust" };
   const perHour = optionalInt(form.maxRunsPerHour, "Runs per hour");

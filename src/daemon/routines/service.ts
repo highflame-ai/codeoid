@@ -219,12 +219,16 @@ export interface RoutineLoopPort {
   start(input: LoopStartInput, owner: RoutineOwner): string;
   /** The run, as its owner sees it; null when it is gone. */
   state(loopRunId: string, owner: RoutineOwner): RoutineLoopState | null;
+  /** The owner's loop runs still in progress that a routine run started: the loop run, and that routine run. */
+  inProgress(owner: RoutineOwner): Array<{ loopRunId: string; routineRunId: string }>;
   cancel(loopRunId: string, owner: RoutineOwner): Promise<void>;
 }
 
 /**
  * What a routine run records when the loop it follows ends. Only a verified
  * loop is a success; a loop whose checks already passed found nothing to do.
+ * A loop that tried and ended blocked is `needs_attention`, and for a loop
+ * routine that counts toward the failure pause (see #finishRun).
  */
 export function routineOutcomeOfLoop(s: RoutineLoopState): { status: RunStatus; reason?: string; summary?: string } {
   const why = s.reason ?? s.status;
@@ -239,7 +243,7 @@ export function routineOutcomeOfLoop(s: RoutineLoopState): { status: RunStatus; 
       // pass on the unmodified code: nothing to repair.
       return s.attempts === 0
         ? { status: "silent", reason: `the loop found nothing to repair: ${why}` }
-        : { status: "needs_attention", reason: `the loop run is blocked: ${why}` };
+        : { status: "needs_attention", reason: `the loop run is blocked after ${s.attempts} attempt(s): ${why}` };
     case "budget_exhausted":
       return { status: "failed", reason: `the loop run ran out of budget: ${why}` };
     case "cancelled":
@@ -276,6 +280,13 @@ function ownerOf(r: RoutineRow): RoutineOwner {
 
 function clip(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max)}\n…[truncated ${text.length - max} chars]` : text;
+}
+
+/** As {@link clip}, but the result, marker included, is at most `max` characters. */
+function clipWithin(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const marker = `\n…[truncated: ${text.length} chars, the first part kept]`;
+  return `${text.slice(0, Math.max(0, max - marker.length))}${marker}`;
 }
 
 /** Wrap untrusted text as data. Closing tags inside are defused so it can't break out. */
@@ -467,6 +478,26 @@ function withZone(s: RoutineScheduleInput): RoutineSchedule {
   return s.kind === "cron" && !s.timezone ? { ...s, timezone: hostTimezone() } : (s as RoutineSchedule);
 }
 
+/**
+ * The session-run fields a loop routine has no use for. They are kept on the
+ * spec (a loop routine can become a session routine again), but one that is
+ * given for a loop routine would be silently ignored, so it is refused.
+ */
+const SESSION_ONLY_FIELDS = [
+  ["toolBudget", "use the loop's toolBudget (tool calls per attempt)"],
+  ["maxMinutes", "use the loop's attemptMinutes and runMinutes"],
+  ["keepSessions", "a loop keeps its own worker session"],
+] as const;
+
+function refuseSessionLimits(given: object): void {
+  for (const [field, instead] of SESSION_ONLY_FIELDS) {
+    const v = (given as Record<string, unknown>)[field];
+    if (v !== undefined && v !== null) {
+      throw new RoutineError(`${field} doesn't apply to a routine that starts a loop: ${instead}`, "invalid_request");
+    }
+  }
+}
+
 const NAME_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const PLACEHOLDER_RE = /\{\{\s*(check|payload|last_summary|trigger|now|routine)\s*\}\}/;
 
@@ -505,6 +536,8 @@ export class RoutineService {
    * the daily cap), so they are folded in when the session settles.
    */
   readonly #parked = new Map<string, { runId: string; base: Pick<RunRow, "costUsd" | "inputTokens" | "outputTokens">; turn: string | null }>();
+  /** Routines being deleted: a run that ends meanwhile (its loop cancelled) tells no one. */
+  readonly #deleting = new Set<string>();
   #stopped = false;
 
   constructor(
@@ -535,6 +568,9 @@ export class RoutineService {
   start(): void {
     if (!this.config.enabled || this.#timer) return;
     this.#stopped = false;
+    // First: a run whose loop started but which died before it recorded the
+    // loop (or was closed as interrupted for it) follows that loop again.
+    this.#relinkLoops();
     const orphaned = this.#store.interruptActiveRuns(this.#now(), "the daemon stopped while this run was in flight");
     for (const r of orphaned) {
       this.#host.audit(`routine:${r.routineId}`, "routine.run.interrupted", r.sessionId ?? undefined, `run=${r.id}`);
@@ -556,11 +592,48 @@ export class RoutineService {
     }
   }
 
-  /** One scheduler pass: claim due fires, settle runs whose loop ended, then start queued runs into free slots. */
+  /**
+   * A loop is started before the routine run records it, so a daemon that
+   * died in between left a loop run in progress that no routine run follows.
+   * Each such loop names the run that started it (its trigger): that run, if
+   * it is still in flight or was closed as interrupted, follows it again
+   * instead of ending interrupted. Found through the owner-scoped list, so a
+   * loop is only ever linked to a run of its own owner's routine.
+   */
+  #relinkLoops(): void {
+    const port = this.#host.loops;
+    if (!port) return;
+    for (const owner of this.#store.owners()) {
+      let loops: Array<{ loopRunId: string; routineRunId: string }>;
+      try {
+        loops = port.inProgress(owner);
+      } catch {
+        continue;
+      }
+      for (const { loopRunId, routineRunId } of loops) {
+        const run = this.#store.getRun(routineRunId);
+        const routine = run && this.#store.getRoutine(run.routineId);
+        if (!run || !routine || run.loopRunId !== null) continue;
+        const o = ownerOf(routine);
+        if (o.sub !== owner.sub || o.accountId !== owner.accountId || o.projectId !== owner.projectId) continue;
+        if (run.status !== "checking" && run.status !== "running" && run.status !== "interrupted") continue;
+        const state = port.state(loopRunId, owner);
+        this.#store.updateRun(run.id, { status: "running", endedAt: null, reason: null, loopRunId, loopStatus: state?.status ?? "running" });
+        this.#host.audit(`routine:${routine.id}`, "routine.run.relinked", undefined, `run=${run.id} loop=${loopRunId}`);
+      }
+    }
+  }
+
+  /**
+   * One scheduler pass: settle runs whose loop ended (first, so a fire due now
+   * isn't skipped behind a loop that already ended), claim due fires, then
+   * start queued runs into free slots.
+   */
   async tick(): Promise<void> {
     if (this.#ticking || this.#stopped) return;
     this.#ticking = true;
     try {
+      this.#followLoops();
       const now = this.#now();
       for (const r of this.#store.listDue(now)) {
         // One routine's failure must not starve every routine due after it.
@@ -619,11 +692,24 @@ export class RoutineService {
    * policy is decided here, against runs of the same routine still in flight.
    */
   #admit(r: RoutineRow, trigger: RunTrigger, opts: { scheduledFor: number | null; payload: string | null }): RunRow {
-    const active = this.#store.activeRuns(r.id);
-    // A loop routine's last loop run still in progress: one at a time, never queued.
+    let active = this.#store.activeRuns(r.id);
+    // A loop routine's last loop run still in progress: one at a time, never
+    // queued. Its state is read again first: a loop that just ended (its
+    // notice not yet handled) doesn't hold this fire back.
+    const followed = active.find((a) => a.loopRunId !== null);
+    if (followed) {
+      this.#followLoops(followed.loopRunId as string);
+      active = this.#store.activeRuns(r.id);
+    }
     const following = active.find((a) => a.loopRunId !== null);
     if (following) {
-      return this.#recordSkip(r, trigger, opts.scheduledFor, `the loop run its last fire started (${following.loopRunId}) is still in progress`, opts.payload);
+      return this.#recordSkip(
+        r,
+        trigger,
+        opts.scheduledFor,
+        `the loop run its last fire started (${following.loopRunId}) is still in progress (${following.loopStatus ?? "running"})`,
+        opts.payload,
+      );
     }
     if (active.length > 0) {
       // A run already started still reads "queued" until its session exists;
@@ -700,7 +786,7 @@ export class RoutineService {
 
   /** Tell hooks (and, per policy, the owner) that a run ended outside #execute. */
   #announce(routineId: string, runId: string): void {
-    const routine = this.#store.getRoutine(routineId);
+    const routine = this.#deleting.has(routineId) ? null : this.#store.getRoutine(routineId);
     const run = this.#store.getRun(runId);
     if (!routine || !run) return;
     this.#host.runFinished({ routine, run, paused: false, push: this.#shouldNotify(routine.spec.notify, run.status, false) });
@@ -765,7 +851,11 @@ export class RoutineService {
     }
     const endedAt = this.#now();
     this.#store.setRunStatus(run.id, status, { ...extra, endedAt });
-    const failed = FAILURE_RUN_STATUSES.includes(status);
+    // A loop that tried and ended blocked failed at the routine's job, so it
+    // counts toward the pause; a session run's needs_attention (a park on
+    // the owner) does not.
+    const loopBlocked = status === "needs_attention" && (extra.loopStatus ?? run.loopStatus) === "blocked";
+    const failed = FAILURE_RUN_STATUSES.includes(status) || loopBlocked;
     // A run that never got to do its work (skipped, cancelled, interrupted)
     // is not an outcome: it neither breaks a failure streak nor moves
     // "last run".
@@ -780,8 +870,8 @@ export class RoutineService {
     }
     const final = this.#store.getRun(run.id) ?? { ...run, ...extra, status, endedAt };
     this.#host.audit(subject, "routine.run.finished", final.sessionId ?? undefined, `run=${run.id} status=${status} cost=${final.costUsd.toFixed(4)}`);
-    // A routine deleted mid-run has nobody left to tell.
-    const current = this.#store.getRoutine(routine.id);
+    // A routine deleted mid-run (or being deleted) has nobody left to tell.
+    const current = this.#deleting.has(routine.id) ? null : this.#store.getRoutine(routine.id);
     if (current) this.#host.runFinished({ routine: current, run: final, paused, push: this.#shouldNotify(spec.notify, status, paused) });
     this.#store.trimRuns(routine.id, LIMITS.RUN_HISTORY, utcDayStart(endedAt));
     return final;
@@ -1052,12 +1142,10 @@ export class RoutineService {
       return;
     }
     const owner = ownerOf(routine);
-    const summary = [
-      checkOutput !== null ? `The routine's check found:\n${checkOutput}` : null,
-      run.payload !== null ? `Sent with the ${run.trigger} fire:\n${run.payload}` : null,
-    ]
-      .filter((x) => x !== null)
-      .join("\n\n");
+    // Two pieces of data, each cut to its own budget: a long gate output
+    // never crowds out the payload.
+    const summary = checkOutput !== null ? clipWithin(checkOutput, LOOP_LIMITS.TRIGGER_SUMMARY_MAX) : "";
+    const payload = run.payload !== null ? clipWithin(run.payload, LOOP_LIMITS.TRIGGER_PAYLOAD_MAX) : null;
     let loopRunId: string;
     try {
       loopRunId = port.start(
@@ -1069,7 +1157,15 @@ export class RoutineService {
           ...(spec.model !== undefined ? { model: spec.model } : {}),
           toolBudget: loop.toolBudget,
           limits: loop.limits,
-          trigger: { kind: "routine", key: `routine:${routine.id}:${run.id}`, routineId: routine.id, routineName: spec.name, routineRunId: run.id, summary },
+          trigger: {
+            kind: "routine",
+            key: `routine:${routine.id}:${run.id}`,
+            routineId: routine.id,
+            routineName: spec.name,
+            routineRunId: run.id,
+            summary,
+            ...(payload !== null ? { payload } : {}),
+          },
         },
         owner,
       );
@@ -1093,17 +1189,25 @@ export class RoutineService {
   /**
    * Bring the runs that follow a loop up to date: one whose loop ended ends
    * with its outcome; the others note the loop's status and spend. Runs on
-   * every tick and when a loop ends, so a restart or a missed notice only
-   * delays it.
+   * every tick, before a fire is judged, and when a loop ends or is
+   * cancelled, so a restart or a missed notice only delays it. Without loops
+   * on the daemon any more, a following run ends failed: nothing would end it.
    */
   #followLoops(onlyLoopRunId?: string): void {
     const port = this.#host.loops;
-    if (!port) return;
     for (const run of this.#store.loopFollowingRuns()) {
       if (onlyLoopRunId !== undefined && run.loopRunId !== onlyLoopRunId) continue;
       try {
         const routine = this.#store.getRoutine(run.routineId);
         if (!routine) continue;
+        if (!port) {
+          // Loops were turned off (a restart without them): nothing will
+          // drive or end the loop, so the run would otherwise wait forever.
+          this.#finishRun(routine, run, null, "failed", {
+            reason: `loops are not available on this daemon any more, so the loop run it started (${run.loopRunId}) can't be followed`,
+          });
+          continue;
+        }
         const state = port.state(run.loopRunId as string, ownerOf(routine));
         if (!state) {
           this.#finishRun(routine, run, null, "failed", { reason: `the loop run it started (${run.loopRunId}) is gone` });
@@ -1300,8 +1404,9 @@ export class RoutineService {
   /**
    * A loop routine's contract, validated as `loop.start` validates a run's.
    * The session-run fields (toolBudget, maxMinutes, keepSessions) don't apply
-   * and are left as they are; a setting that would promise what a loop can't
-   * keep is refused rather than silently dropped.
+   * and are left as they are (create and update refuse them when given); a
+   * setting that would promise what a loop can't keep is refused rather than
+   * silently dropped.
    */
   #normalizeLoop(spec: RoutineSpec, input: RoutineLoopInput, bad: (m: string) => never): NonNullable<RoutineSpec["loop"]> {
     const port = this.#host.loops;
@@ -1327,6 +1432,7 @@ export class RoutineService {
 
   /** Create a routine. Returns it, plus the API token once when `api` is on. */
   create(owner: RoutineOwner, input: RoutineSpecInput): { routine: RoutineRow; apiToken: string | null } {
+    if (input.loop) refuseSessionLimits(input);
     const spec = this.normalizeSpec(input);
     if (this.#store.getRoutineByName(owner.accountId, owner.projectId, owner.sub, spec.name)) {
       throw new RoutineError(`a routine named "${spec.name}" already exists`, "conflict");
@@ -1399,6 +1505,9 @@ export class RoutineService {
       for (const k of ["maxCostUsd", "dailyCostUsd", "provider", "model"] as const) {
         if (k in patch.spec && (patch.spec as Record<string, unknown>)[k] === null) delete merged[k];
       }
+      // A routine that is, or becomes, a loop routine refuses what only a
+      // session run would honour, as on create.
+      if (merged.loop) refuseSessionLimits(patch.spec);
       // A cron without a timezone keeps the one it had.
       const s = merged.schedule;
       if (s?.kind === "cron" && !s.timezone && r.spec.schedule?.kind === "cron") {
@@ -1465,21 +1574,40 @@ export class RoutineService {
   }
 
   async delete(r: RoutineRow, actor: string): Promise<void> {
-    for (const live of this.#live.values()) {
-      if (live.routineId === r.id) {
-        live.cancelled = "the routine was deleted";
-        live.abort.abort();
-        live.wake();
+    // Marked first: a run that ends while this goes on (its loop cancelled
+    // below) must not announce a routine_end for a routine being removed.
+    this.#deleting.add(r.id);
+    try {
+      for (const live of this.#live.values()) {
+        if (live.routineId === r.id) {
+          live.cancelled = "the routine was deleted";
+          live.abort.abort();
+          live.wake();
+        }
       }
+      for (const q of this.#store.activeRuns(r.id)) {
+        if (q.status === "queued") this.#store.setRunStatus(q.id, "cancelled", { endedAt: this.#now(), reason: "the routine was deleted" });
+        // The loop run is the routine's run in progress: it goes with it.
+        if (q.loopRunId && this.#host.loops) await this.#host.loops.cancel(q.loopRunId, ownerOf(r)).catch(() => {});
+      }
+      this.#store.deleteRoutine(r.id);
+      this.#store.deleteRuns(r.id);
+      this.#host.audit(actor, "routine.delete", undefined, `routine=${r.id} name=${r.spec.name}`);
+    } finally {
+      this.#deleting.delete(r.id);
     }
-    for (const q of this.#store.activeRuns(r.id)) {
-      if (q.status === "queued") this.#store.setRunStatus(q.id, "cancelled", { endedAt: this.#now(), reason: "the routine was deleted" });
-      // The loop run is the routine's run in progress: it goes with it.
-      if (q.loopRunId && this.#host.loops) await this.#host.loops.cancel(q.loopRunId, ownerOf(r)).catch(() => {});
-    }
-    this.#store.deleteRoutine(r.id);
-    this.#store.deleteRuns(r.id);
-    this.#host.audit(actor, "routine.delete", undefined, `routine=${r.id} name=${r.spec.name}`);
+  }
+
+  /**
+   * Whether a loop run a routine started may push its owner itself (`kind`
+   * waiting: it needs them). The routine's notify policy decides: `never`
+   * keeps it quiet. A loop's end is never pushed by the loop: the routine
+   * run ends with it and pushes per the policy, as a session routine does.
+   */
+  loopMayPush(routineId: string | undefined, kind: "waiting" | "finished"): boolean {
+    if (kind === "finished") return false;
+    const r = routineId ? this.#store.getRoutine(routineId) : null;
+    return !r || r.spec.notify !== "never";
   }
 
   /** Fire now (manual or API). Overlap policy applies; returns the run record. */

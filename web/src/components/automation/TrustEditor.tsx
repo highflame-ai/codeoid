@@ -4,9 +4,10 @@
  *
  * Widening keeps what the watch remembered; narrowing forgets every head it
  * judged trusted and every head you vouched for. The editor says which one a
- * change is before it is saved, and a narrowing takes a confirm — with the
- * option to vouch for the branches' current heads again in the same request
- * (`update --trust … --trust-head`).
+ * change is before it is saved, and a narrowing takes a confirm. Vouching
+ * again is not folded into the save: the watch's detail offers the pinned
+ * vouch dialog afterwards, so every vouch from the web is pinned to commits
+ * you looked at.
  */
 
 import { Component, For, Show, createMemo, createSignal } from "solid-js";
@@ -18,10 +19,10 @@ export interface TrustEditorProps {
   trust: readonly string[];
   /** The login the watch acts as: always trusted. */
   ghLogin: string | null;
-  /** A branch watch can vouch for heads; a "my PRs" watch has none to vouch for. */
+  /** A branch watch can vouch for heads again after a narrowing; a "my PRs" watch has none to vouch for. */
   canVouch: boolean;
-  /** Rejects with the daemon's words. `vouch`: also send `trustHead: true`. */
-  onSave: (trust: string[], vouch: boolean) => Promise<void>;
+  /** Rejects with the daemon's words. `narrowed`: the save forgot every vouched head. */
+  onSave: (trust: string[], narrowed: boolean) => Promise<void>;
   onCancel: () => void;
 }
 
@@ -34,7 +35,6 @@ export const TrustEditor: Component<TrustEditorProps> = (props) => {
   const [error, setError] = createSignal<string | null>(null);
   const [busy, setBusy] = createSignal(false);
   const [confirm, setConfirm] = createSignal(false);
-  const [vouch, setVouch] = createSignal(false);
 
   const diff = createMemo(() => trustDiff(props.trust, list()));
   const changed = () => diff().added.length > 0 || diff().removed.length > 0;
@@ -61,7 +61,7 @@ export const TrustEditor: Component<TrustEditorProps> = (props) => {
     setBusy(true);
     setError(null);
     try {
-      await props.onSave(list(), diff().forgets && vouch());
+      await props.onSave(list(), diff().forgets);
       setConfirm(false);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -162,7 +162,7 @@ export const TrustEditor: Component<TrustEditorProps> = (props) => {
       <ConfirmDialog
         open={confirm()}
         title="Narrow the trust list?"
-        confirmLabel={vouch() ? "Narrow and vouch again" : "Narrow it"}
+        confirmLabel="Narrow it"
         danger
         busy={busy()}
         error={error()}
@@ -177,15 +177,7 @@ export const TrustEditor: Component<TrustEditorProps> = (props) => {
           the new list. Until a trusted login pushes or you vouch again, a branch whose history includes their work starts no runs.
         </p>
         <Show when={props.canVouch}>
-          <label class="flex items-start gap-2 text-[12px]">
-            <input type="checkbox" class="mt-0.5" checked={vouch()} onChange={(e) => setVouch(e.currentTarget.checked)} disabled={busy()} />
-            <span class="text-fg">
-              Also vouch for each watched branch's head as it is now
-              <span class="block text-[11px] text-fg-muted">
-                Everything on those branches at that moment is then trusted under the new list, including what the dropped logins wrote.
-              </span>
-            </span>
-          </label>
+          <p class="text-[12px]">Once it is saved, you can vouch for each branch's head again, pinned to the commit you look at.</p>
         </Show>
       </ConfirmDialog>
     </div>

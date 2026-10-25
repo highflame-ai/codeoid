@@ -29,8 +29,8 @@ export interface LoopLimits {
 /**
  * What started a run (§4 "two entry points"), when a watch or a routine
  * started it rather than a person. `summary` is event text — a check's
- * output, a comment's body, a routine's gate output or payload — and only
- * ever reaches a worker as data.
+ * output, a comment's body, a routine's gate output — and `payload` a routine
+ * fire's payload; both only ever reach a worker as data.
  */
 export interface LoopTrigger {
   kind: "ci_failure" | "review_comment" | "routine";
@@ -45,7 +45,10 @@ export interface LoopTrigger {
   routineRunId?: string;
   /** Where the event is on GitHub (the check run, the comment). */
   url?: string;
+  /** Event text; for a routine, its gate's output. */
   summary: string;
+  /** A routine fire's payload: data from whoever fired it, kept apart from the gate's output. */
+  payload?: string;
 }
 
 /**
@@ -267,6 +270,8 @@ export const LOOP_LIMITS = {
   REPORT_DETAIL_MAX: 4_000,
   /** Event text a trigger carries into a run. */
   TRIGGER_SUMMARY_MAX: 4_000,
+  /** A routine fire's payload, carried apart from the gate's output (its own budget). */
+  TRIGGER_PAYLOAD_MAX: 4_000,
 } as const;
 
 /**

@@ -157,6 +157,7 @@ import type {
   ModelInfo,
   PipelinePhaseWire,
   PipelineWire,
+  ResponseErrorDetail,
   SessionInfo,
   SessionMode,
   SessionWorktree,
@@ -6155,6 +6156,7 @@ mcpHub: this.#mcpHub,
       toRoutineWire(r, {
         upcoming: svc.upcoming(r, 3),
         lastRun: svc.store.listRuns(r.id, { limit: 1 })[0],
+        activeLoopRun: svc.store.activeRuns(r.id).find((x) => x.loopRunId !== null),
         apiTokenSet: svc.store.hasApiToken(r.id),
       });
     const actor = auth.sub;
@@ -6371,11 +6373,12 @@ mcpHub: this.#mcpHub,
     msg: Extract<ClientMessage, { type: `loop.watch.${string}` }>,
     auth: AuthContext,
   ): Promise<DaemonMessage> {
-    const err = (error: string, code: "invalid_request" | "not_found" | "forbidden" | "internal"): DaemonMessage => ({
+    const err = (error: string, code: "invalid_request" | "not_found" | "forbidden" | "internal", detail?: ResponseErrorDetail): DaemonMessage => ({
       type: "response.error",
       requestId: msg.id,
       error,
       code,
+      ...(detail ? { detail } : {}),
     });
     const scopes = auth.scopes as string[];
     if (!hasScope(scopes, SCOPES.SESSION_CREATE) || !hasScope(scopes, SCOPES.SESSION_SEND)) {
@@ -6449,7 +6452,7 @@ mcpHub: this.#mcpHub,
       }
       return err("Unknown loop watch message", "invalid_request");
     } catch (e) {
-      if (e instanceof LoopError) return err(e.message, e.code === "conflict" ? "invalid_request" : e.code);
+      if (e instanceof LoopError) return err(e.message, e.code === "conflict" ? "invalid_request" : e.code, e.detail);
       return err(e instanceof Error ? e.message : String(e), "internal");
     }
   }
@@ -6560,16 +6563,24 @@ mcpHub: this.#mcpHub,
       systemAuth: (run) => ({ sub: "system:loops", scopes: [], delegationDepth: 0, accountId: run.accountId, projectId: run.projectId }),
       audit: (subject, action, sessionId, detail) => this.#store.audit(subject, action, sessionId, detail),
       notifyOwner: (run, kind) => {
+        // A loop a routine started pushes as the routine's notify policy
+        // says: its end through the routine run, which ends with it; a wait
+        // on the owner unless the routine is never to notify. An owner's
+        // cancel is theirs: nobody is pushed.
+        const trigger = run.contract.trigger;
+        const push =
+          kind !== "cancelled" &&
+          (trigger?.kind === "routine" ? (this.#routines?.loopMayPush(trigger.routineId, kind) ?? true) : true);
         // Content-blind push opens the worker session; without one, the run's
         // history and the fleet board carry it.
-        if (run.workerSessionId && this.#pushService.enabled) {
+        if (push && run.workerSessionId && this.#pushService.enabled) {
           void this.#pushService
             .notifyRoutine(run.workerSessionId, { sub: run.ownerSub, accountId: run.accountId, projectId: run.projectId })
             .catch((e) => console.error("[codeoid/push] loop notify failed:", e));
         }
-        // A routine run following this loop ends with it (the scheduler's
-        // tick would catch it too, a moment later).
-        if (kind === "finished") this.#routines?.loopRunEnded(run.id);
+        // A routine run following this loop ends with it, cancelled or not
+        // (the scheduler's tick would catch it too, a moment later).
+        if (kind !== "waiting") this.#routines?.loopRunEnded(run.id);
       },
       createWorkerSession: async (run) => {
         const workdir = run.worktreePath ?? run.contract.workdir;
@@ -6765,11 +6776,14 @@ mcpHub: this.#mcpHub,
       runFinished: (e) => {
         const r = e.routine;
         const sessionId = e.run.sessionId;
-        // Content-blind push needs a session to open; a run that never
-        // started an agent reaches the owner through hooks and its history.
-        if (e.push && sessionId && this.#pushService.enabled) {
+        // Content-blind push needs a session to open: the run's own, or the
+        // worker of the loop it started (whose own end push is left to this,
+        // so the routine's notify policy decides). A run that never started
+        // an agent reaches the owner through hooks and its history.
+        const pushTo = sessionId ?? (e.run.loopRunId ? this.#loopWorkerOf(e.run.loopRunId, r) : null);
+        if (e.push && pushTo && this.#pushService.enabled) {
           void this.#pushService
-            .notifyRoutine(sessionId, { sub: r.ownerSub, accountId: r.accountId, projectId: r.projectId })
+            .notifyRoutine(pushTo, { sub: r.ownerSub, accountId: r.accountId, projectId: r.projectId })
             .catch((err) => console.error("[codeoid/push] routine notify failed:", err));
         }
         const s = sessionId ? this.#sessions.get(sessionId) : undefined;
@@ -6790,6 +6804,15 @@ mcpHub: this.#mcpHub,
       normalizeWorkdir: (p) => normalizeWorkdir(p),
       ...(this.#loops ? { loops: this.#makeRoutineLoopPort(this.#loops) } : {}),
     };
+  }
+
+  /** The worker session of a loop run a routine started, as its owner sees it. */
+  #loopWorkerOf(loopRunId: string, r: RoutineRow): string | null {
+    try {
+      return this.#loops?.get(loopRunId, { sub: r.ownerSub, accountId: r.accountId, projectId: r.projectId }).workerSessionId ?? null;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -6827,6 +6850,11 @@ mcpHub: this.#mcpHub,
           throw e;
         }
       },
+      inProgress: (owner) =>
+        loops
+          .listActive(owner)
+          .filter((run) => run.contract.trigger?.kind === "routine" && run.contract.trigger.routineRunId)
+          .map((run) => ({ loopRunId: run.id, routineRunId: run.contract.trigger!.routineRunId! })),
       cancel: async (id, owner) => {
         await loops.cancel(id, owner);
       },

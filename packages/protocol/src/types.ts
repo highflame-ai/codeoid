@@ -3124,7 +3124,16 @@ export interface ResponseErrorMsg {
   requestId: string;
   error: string;
   code: ErrorCode;
+  /** Structured facts about the refusal, for a client to act on without parsing `error`. */
+  detail?: ResponseErrorDetail;
 }
+
+/**
+ * `head_moved`: a vouch pinned to a commit (`loop.watch.* trustHead`) was
+ * refused because the branch's head is another commit now. `head` is that
+ * commit's full id: pin to it, after looking at it, to vouch again.
+ */
+export type ResponseErrorDetail = { kind: "head_moved"; branch: string; head: string; pinned: string };
 
 export type ErrorCode =
   | "unauthorized"

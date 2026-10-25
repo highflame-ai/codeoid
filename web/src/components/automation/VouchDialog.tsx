@@ -4,18 +4,19 @@
  * so it and everything beneath it are trusted, and later trusted merges'
  * chains can end at it.
  *
- * Pinned (the default) sends `trustHead: { branch: sha }`: a compare-and-set.
- * If any named head moved, the daemon vouches for nothing and says what the
- * head is now; the dialog shows that, pins to the new commit, and asks again
- * — so a commit pushed after you looked is never vouched for unseen.
- * Unpinned sends `trustHead: true`: whatever each head is when the daemon
- * reads it.
+ * It always sends `trustHead: { branch: fullSha }`: a compare-and-set. If any
+ * named head moved, the daemon vouches for nothing and names the head's full
+ * id now (the refusal's `detail`); the dialog shows that, pins to the new
+ * commit, and asks again — so a commit pushed after you looked is never
+ * vouched for unseen. There is no unpinned vouch here, and no prefix: either
+ * could take a commit nobody looked at. This is the web's one vouch path
+ * (narrowing the trust list offers to open it afterwards).
  */
 
 import { Component, Index, Show, createEffect, createSignal, on } from "solid-js";
 
 import { githubCommitUrl, relativeWhen } from "../../lib/automation";
-import { SHA_RE, buildTrustHead, parseMovedHead, type KnownHead } from "../../lib/watches";
+import { SHA_RE, buildTrustHead, parseMovedHead, type KnownHead, type MovedHead } from "../../lib/watches";
 import type { LoopWatchTrustHead, LoopWatchWire } from "../../protocol/types";
 import { ConfirmDialog, inputClass } from "./common";
 
@@ -25,7 +26,7 @@ export interface VouchDialogProps {
   /** The newest head the watch's history names per branch (lib/watches `knownHeads`). */
   known: Record<string, KnownHead>;
   now: number;
-  /** Rejects with the daemon's words. */
+  /** Rejects with the daemon's words (and its `detail`, when the head moved). */
   onVouch: (trustHead: LoopWatchTrustHead) => Promise<void>;
   onClose: () => void;
 }
@@ -37,11 +38,10 @@ interface BranchPick {
 }
 
 export const VouchDialog: Component<VouchDialogProps> = (props) => {
-  const [pinned, setPinned] = createSignal(true);
   const [picks, setPicks] = createSignal<BranchPick[]>([]);
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
-  const [moved, setMoved] = createSignal<{ branch: string; now: string; pinned: string } | null>(null);
+  const [moved, setMoved] = createSignal<MovedHead | null>(null);
 
   // Fresh each time it opens, pinned to what the watch last saw.
   createEffect(
@@ -49,7 +49,6 @@ export const VouchDialog: Component<VouchDialogProps> = (props) => {
       () => props.open,
       (open) => {
         if (!open) return;
-        setPinned(true);
         setError(null);
         setMoved(null);
         setPicks(props.watch.branches.map((b) => ({ branch: b, on: true, sha: props.known[b]?.sha ?? "" })));
@@ -59,11 +58,11 @@ export const VouchDialog: Component<VouchDialogProps> = (props) => {
 
   const setPick = (i: number, patch: Partial<BranchPick>) => setPicks((ps) => ps.map((p, j) => (j === i ? { ...p, ...patch } : p)));
   const chosen = () => picks().filter((p) => p.on);
-  const ready = () => chosen().length > 0 && (!pinned() || chosen().every((p) => SHA_RE.test(p.sha.trim())));
+  const ready = () => chosen().length > 0 && chosen().every((p) => SHA_RE.test(p.sha.trim()));
   const trusted = () => ["you" + (props.watch.ghLogin ? ` (@${props.watch.ghLogin})` : ""), ...props.watch.trust].join(", ");
 
   const confirm = async () => {
-    const built = buildTrustHead(pinned(), picks());
+    const built = buildTrustHead(picks());
     if ("error" in built) return setError(built.error);
     setBusy(true);
     setError(null);
@@ -72,7 +71,7 @@ export const VouchDialog: Component<VouchDialogProps> = (props) => {
       props.onClose();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      const m = parseMovedHead(msg);
+      const m = parseMovedHead(e);
       if (m) {
         // Nothing was vouched for. Show the new head and pin to it; vouching
         // for it is a new decision, made by pressing again.
@@ -140,7 +139,7 @@ export const VouchDialog: Component<VouchDialogProps> = (props) => {
                   />
                   <span class="font-mono">{p().branch}</span>
                 </label>
-                <Show when={pinned() && p().on}>
+                <Show when={p().on}>
                   <div class="mt-1 flex flex-wrap items-center gap-1.5">
                     <input
                       type="text"
@@ -152,7 +151,7 @@ export const VouchDialog: Component<VouchDialogProps> = (props) => {
                       disabled={busy()}
                       aria-label={`${p().branch} head commit`}
                       aria-invalid={p().sha && !SHA_RE.test(p().sha.trim()) ? "true" : undefined}
-                      placeholder="the head commit you looked at (12+ hex characters)"
+                      placeholder="the full id of the head commit you looked at"
                     />
                     <Show when={url()}>
                       {(u) => (
@@ -169,7 +168,7 @@ export const VouchDialog: Component<VouchDialogProps> = (props) => {
                     >
                     <Show
                       when={known()}
-                      fallback={"The watch hasn't recorded this branch's head yet; paste the commit from GitHub."}
+                      fallback={"The watch hasn't recorded this branch's head yet; paste the commit's full id from GitHub."}
                     >
                       {(k) => (
                         <>
@@ -187,16 +186,9 @@ export const VouchDialog: Component<VouchDialogProps> = (props) => {
         </Index>
       </div>
 
-      <label class="flex items-start gap-2 text-[12px]">
-        <input type="checkbox" class="mt-0.5" checked={pinned()} disabled={busy()} onChange={(e) => setPinned(e.currentTarget.checked)} />
-        <span class="text-fg">
-          Only while each head is still the commit above (recommended)
-          <span class="block text-[11px] text-fg-muted">
-            Off: vouch for whatever each head is when the daemon reads it, which may be a commit pushed after you last looked. Off vouches for
-            every watched branch.
-          </span>
-        </span>
-      </label>
+      <p class="text-[11px] text-fg-muted">
+        Only while each head is still the commit above: if one moved, nothing is vouched for and you see the new one.
+      </p>
     </ConfirmDialog>
   );
 };

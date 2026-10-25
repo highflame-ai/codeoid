@@ -459,6 +459,17 @@ export class RoutineStore {
     this.#db.prepare("DELETE FROM routine_runs WHERE routine_id = ?").run(routineId);
   }
 
+  /** Everyone who holds a routine, once each, with their tenant. */
+  owners(): Array<{ sub: string; accountId: string; projectId: string }> {
+    return (
+      this.#db.prepare("SELECT DISTINCT account_id, project_id, owner_sub FROM routines").all() as Array<{
+        account_id: string;
+        project_id: string;
+        owner_sub: string;
+      }>
+    ).map((r) => ({ sub: r.owner_sub, accountId: r.account_id, projectId: r.project_id }));
+  }
+
   /** Runs following a loop run they started — still open until the loop ends. */
   loopFollowingRuns(): RunRow[] {
     return this.activeRuns().filter((r) => r.loopRunId !== null);

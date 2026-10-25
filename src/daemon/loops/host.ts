@@ -326,7 +326,7 @@ export interface LoopHostDeps {
   senderFor(run: LoopRunRow): AuthContext;
   systemAuth(run: LoopRunRow): AuthContext;
   audit(subject: string, action: string, sessionId: string | undefined, detail: string): void;
-  notifyOwner(run: LoopRunRow, kind: "waiting" | "finished"): void;
+  notifyOwner(run: LoopRunRow, kind: "waiting" | "finished" | "cancelled"): void;
 }
 
 export function buildLoopHost(d: LoopHostDeps): LoopHost {

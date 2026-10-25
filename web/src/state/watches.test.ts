@@ -159,3 +159,45 @@ describe("watches store — polling", () => {
     expect(sent(0)).toEqual({ type: "loop.watch.get", id: "r", watchId: "w_1" });
   });
 });
+
+describe("watches store — reply order", () => {
+  it("a list read sent before a delete can't bring the watch back", async () => {
+    let answer!: (v: unknown) => void;
+    clientRequestMock.mockReturnValueOnce(new Promise((r) => (answer = r)));
+    const slow = fetchWatches();
+    clientRequestMock.mockResolvedValueOnce({ type: "response.ok", requestId: "r" });
+    expect(await deleteWatch("w_1")).toBe(true);
+    answer(list([watch(), watch({ id: "w_2" })]));
+    await slow;
+    expect(watchesState().watches.map((w) => w.id)).toEqual(["w_2"]);
+  });
+
+  it("a watch's newer snapshot outranks a list read sent before it", async () => {
+    let late!: (v: unknown) => void;
+    clientRequestMock.mockReturnValueOnce(new Promise((r) => (late = r)));
+    const listing = fetchWatches();
+    clientRequestMock.mockResolvedValueOnce(snap({ enabled: false }));
+    await setWatchEnabled("w_1", false);
+    late(list([watch({ enabled: true })]));
+    await listing;
+    expect(watchesState().watches[0]!.enabled).toBe(false);
+  });
+
+  it("keeps the inbox's list fresh while a watch's detail is open", async () => {
+    vi.useFakeTimers();
+    clientRequestMock.mockImplementation(async (m: { type: string }) => (m.type === "loop.watch.list" ? list([watch()]) : snap()));
+    const stop = watchWatches();
+    openWatches("w_1");
+    await vi.advanceTimersByTimeAsync(WATCH_POLL_MS + VIEW_POLL_MS);
+    const lists = clientRequestMock.mock.calls.filter(([m]) => (m as { type: string }).type === "loop.watch.list").length;
+    expect(lists).toBeGreaterThanOrEqual(2);
+    stop();
+  });
+
+  it("a refused vouch keeps the daemon's detail for the dialog to re-pin from", async () => {
+    const detail = { kind: "head_moved", branch: "main", head: "b".repeat(40), pinned: "a".repeat(40) };
+    clientRequestMock.mockRejectedValueOnce(Object.assign(new Error("main's head is … now"), { code: "invalid_request", detail }));
+    const err = await updateWatch("w_1", { trustHead: { main: "a".repeat(40) } }).catch((e: unknown) => e);
+    expect(err).toMatchObject({ message: "main's head is … now", detail });
+  });
+});

@@ -608,16 +608,18 @@ describe("session.ui_response payload exclusivity", () => {
 });
 
 describe("loop.watch trustHead", () => {
-  test("true, or branches each pinned to a commit (12–40 hex characters): a compare-and-set", () => {
+  test("true, or branches each pinned to a commit by its full id (never a prefix): a compare-and-set", () => {
     const update = (trustHead: unknown) => parseClientMessage({ type: "loop.watch.update", id: "u1", watchId: "lw_1", trustHead });
     expect(update(true).ok).toBe(true);
-    expect(update({ main: "0123456789ab" }).ok).toBe(true);
-    expect(update({ main: "0123456789AB", release: "f".repeat(40) }).ok).toBe(true);
-    expect(update({ main: "0123456789a" }).ok).toBe(false);
-    expect(update({ main: "g".repeat(12) }).ok).toBe(false);
+    expect(update({ main: "0123456789abcdef0123456789abcdef01234567" }).ok).toBe(true);
+    expect(update({ main: "0123456789ABCDEF0123456789ABCDEF01234567", release: "f".repeat(64) }).ok).toBe(true);
+    expect(update({ main: "0123456789ab" }).ok).toBe(false);
+    expect(update({ main: "f".repeat(39) }).ok).toBe(false);
+    expect(update({ main: "f".repeat(41) }).ok).toBe(false);
+    expect(update({ main: "g".repeat(40) }).ok).toBe(false);
     expect(update({}).ok).toBe(false);
     expect(update("main").ok).toBe(false);
-    const create = parseClientMessage({ type: "loop.watch.create", id: "c1", spec: { workdir: "/r", branches: ["main"], ci: [{ ciName: "t", command: "t" }] }, trustHead: { main: "0123456789ab" } });
+    const create = parseClientMessage({ type: "loop.watch.create", id: "c1", spec: { workdir: "/r", branches: ["main"], ci: [{ ciName: "t", command: "t" }] }, trustHead: { main: "0123456789abcdef0123456789abcdef01234567" } });
     expect(create.ok).toBe(true);
   });
 });

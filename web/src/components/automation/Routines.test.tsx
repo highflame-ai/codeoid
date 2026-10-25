@@ -93,15 +93,41 @@ describe("RoutineDetail", () => {
     expect(getAllByTestId("routine-run")[0]!.textContent).toContain("CI is green again");
   });
 
-  it("shows why a routine paused itself, and offers resume", () => {
+  it("shows why a routine paused itself, offers resume, and still runs by hand as the daemon allows", () => {
     const onSetEnabled = vi.fn();
+    const onRunNow = vi.fn(async () => true);
     const { getByTestId, getByRole } = render(() => (
-      <RoutineDetail {...detailProps({ routine: routine({ enabled: false, pausedReason: "paused after 3 failed runs in a row" }), onSetEnabled })} />
+      <RoutineDetail {...detailProps({ routine: routine({ enabled: false, pausedReason: "paused after 3 failed runs in a row" }), onSetEnabled, onRunNow })} />
     ));
     expect(getByTestId("routine-paused-reason").textContent).toContain("paused after 3 failed runs in a row");
-    expect((getByRole("button", { name: "Run now" }) as HTMLButtonElement).disabled).toBe(true);
+    const run = getByRole("button", { name: "Run now" }) as HTMLButtonElement;
+    expect(run.disabled).toBe(false);
+    fireEvent.click(run);
+    expect(onRunNow).toHaveBeenCalled();
     fireEvent.click(getByRole("button", { name: "Resume" }));
     expect(onSetEnabled).toHaveBeenCalledWith(true);
+  });
+
+  it("a shown API token's curl example sends the JSON content type the endpoint reads", () => {
+    const { getByTestId } = render(() => <RoutineDetail {...detailProps({ token: { apiToken: "rt_abcdef_secret", endpointPath: "/routines/rt_1/fire" } })} />);
+    expect(getByTestId("routine-token").textContent).toContain('-H "Content-Type: application/json"');
+  });
+
+  it("a loop routine's run whose loop ended blocked reads as the loop's block, and its payload isn't promised to {{payload}}", () => {
+    const loopSpec = { checks: [{ id: "unit", command: "bun test", timeoutSec: 600 }], toolBudget: 60, limits: { attempts: 3, attemptMinutes: 10, runMinutes: 30 } };
+    const { getAllByTestId, getByRole, getByText, queryByText } = render(() => (
+      <RoutineDetail
+        {...detailProps({
+          routine: routine({ spec: { ...routine().spec, loop: loopSpec } }),
+          runs: [runWire({ status: "needs_attention", reason: "the loop run is blocked after 2 attempt(s): no progress", loop: { runId: "loop_1", status: "blocked" } })],
+        })}
+      />
+    ));
+    expect(getAllByTestId("routine-run")[0]!.textContent).toContain("loop blocked");
+    expect(getAllByTestId("routine-run")[0]!.textContent).not.toContain("needs you");
+    fireEvent.click(getByRole("button", { name: "with a payload…" }));
+    expect(getByText("Payload (reaches the loop's worker as data)")).toBeTruthy();
+    expect(queryByText(/in the prompt/)).toBeNull();
   });
 
   it("runs now, with a payload when one is given", async () => {

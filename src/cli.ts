@@ -785,7 +785,7 @@ function printTestResult(resp: DaemonMessage | undefined): void {
 
 const collect = (v: string, prev: string[] = []) => [...prev, v];
 const TRUST_HEAD_HELP = (when: string) =>
-  `${when}you vouch for each watched branch's head as it is now — it and everything beneath it are trusted, so later merges by trusted logins are judged from it (recorded in the watch's history and the audit log, with who put the head there). <branch>=<sha> (repeatable, at least 12 characters of the commit) vouches for that branch only while its head is still that commit, and for nothing if it moved`;
+  `${when}you vouch for each watched branch's head as it is now — it and everything beneath it are trusted, so later merges by trusted logins are judged from it (recorded in the watch's history and the audit log, with who put the head there). <branch>=<sha> (repeatable, the commit's full id: a prefix is refused) vouches for that branch only while its head is still that commit, and for nothing if it moved — the refusal names the full id the head is now`;
 
 endpoint
   .command("ls")
@@ -1564,7 +1564,7 @@ function routineSpecOptions(cmd: Command, mode: "add" | "edit"): Command {
 function printRoutineToken(token: string, routineId: string): void {
   const base = loadConfig().daemonUrl.replace(/^ws/, "http").replace(/\/+$/, "");
   console.log(`\n  API token (shown once — store it now):\n    ${token}`);
-  console.log(`\n  Fire it:\n    curl -X POST ${base}${routineFirePath(routineId)} \\\n      -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \\\n      -d '{"text": "optional payload for {{payload}}"}'\n`);
+  console.log(`\n  Fire it:\n    curl -X POST ${base}${routineFirePath(routineId)} \\\n      -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \\\n      -d '{"text": "optional payload: data for the run"}'\n`);
 }
 
 // ── Loops (docs/loop-engineering-design.md) ─────────────────────────────────
@@ -2029,7 +2029,7 @@ routine
 routine
   .command("run <name>")
   .description("Run a routine now")
-  .option("--payload <text>", "text for the prompt's {{payload}}")
+  .option("--payload <text>", "data for the run: a session routine's prompt gets it as {{payload}}; a loop routine hands it to the loop's worker as data")
   .option("--wait", "wait for the run to finish and print its outcome")
   .action((name: string, o: { payload?: string; wait?: boolean }) =>
     withClient(async (c) => {

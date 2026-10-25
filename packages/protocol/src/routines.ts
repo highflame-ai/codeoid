@@ -62,7 +62,8 @@ export interface RoutineSpecWire {
    * a loop"). The prompt becomes the loop's objective (at most 8,000
    * characters, no placeholders). A loop routine can't be guarded,
    * persistent, worktree, overlap queue, or take maxCostUsd; toolBudget,
-   * maxMinutes and keepSessions don't apply to it.
+   * maxMinutes and keepSessions don't apply to it, and are refused when given
+   * on create or on an update of (or into) a loop routine.
    */
   loop?: RoutineLoopWire;
 }
@@ -153,6 +154,12 @@ export interface RoutineWire {
   apiTokenSet: boolean;
   /** The routine's most recent run, if any. */
   lastRun?: RoutineRunWire;
+  /**
+   * A loop routine's run still following the loop run it started, if any
+   * (`lastRun` may be a later skipped fire). While it is open the routine
+   * starts no other loop; its `loop.status` says whether the loop waits on you.
+   */
+  activeLoopRun?: RoutineRunWire;
   createdAt: string;
   updatedAt: string;
 }
@@ -197,7 +204,7 @@ export interface RoutineGetMsg {
   runs?: number;
 }
 
-/** Fire now, optionally with a payload (available to the prompt as {{payload}}). */
+/** Fire now, optionally with a payload (a session routine's prompt gets it as {{payload}}; a loop routine hands it to the loop's worker as data). */
 export interface RoutineRunMsg {
   type: "routine.run";
   id: string;

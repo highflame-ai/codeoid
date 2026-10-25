@@ -29,6 +29,7 @@ import { focusedSession, focusedSessionId, mergeSession } from "./state/sessions
 import { resumeFor } from "./state/resume";
 import type { SessionInfo } from "./protocol/types";
 import { resetClaudeConfig } from "./state/claude-config";
+import { forgetRoutineToken } from "./state/routines";
 import { installApprovalNotifications } from "./state/desktop-notifications";
 
 const App: Component = () => {
@@ -103,12 +104,17 @@ const App: Component = () => {
   const attached = new Set<string>();
   createEffect(
     on(connectionStatus, (s) => {
-      if (s.kind !== "connected") attached.clear();
+      if (s.kind !== "connected") {
+        attached.clear();
+        // A routine API token is shown once, to this connection only.
+        forgetRoutineToken();
+      }
     }),
   );
   createEffect(
-    on(authIdentity, (auth) => {
+    on(authIdentity, (auth, prev) => {
       if (!auth) attached.clear();
+      if (auth !== prev) forgetRoutineToken();
     }),
   );
   createEffect(

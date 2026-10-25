@@ -952,13 +952,14 @@ const loopWatchPatchSchema = z.object(
 );
 /**
  * `true`: vouch for each watched branch's head as it is now. A record of
- * branch to commit (12–40 hex characters): only for those branches, and only
- * while each head is still that commit (compare-and-set).
+ * branch to commit (its full id: 40 hex characters, or 64 for SHA-256; never a
+ * prefix): only for those branches, and only while each head is still that
+ * commit (compare-and-set).
  */
 const trustHeadSchema = z.union([
   z.boolean(),
   z
-    .record(z.string().min(1).max(200), z.string().regex(/^[0-9a-fA-F]{12,40}$/))
+    .record(z.string().min(1).max(200), z.string().regex(/^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$/, "a full commit id (40 or 64 hex characters), not a prefix"))
     .refine((r) => Object.keys(r).length >= 1 && Object.keys(r).length <= 20, "name 1–20 branches"),
 ]);
 export const loopWatchCreateSchema = z.object({

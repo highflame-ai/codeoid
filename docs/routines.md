@@ -136,7 +136,7 @@ So a routine that asks "is anything wrong?" stays quiet on the days when nothing
 | --- | --- |
 | `succeeded` | The agent finished and reported something. Its summary is the run's headline. |
 | `silent` | Nothing to do: the check printed nothing, or the agent replied `[SILENT]`. |
-| `needs_attention` | The agent is waiting on you for a tool approval (including one an exhausted tool budget raised). The session stays parked so you can answer it. |
+| `needs_attention` | The agent is waiting on you for a tool approval (including one an exhausted tool budget raised). The session stays parked so you can answer it. On a [loop routine](#routines-that-start-a-loop) it means the loop tried and ended blocked, and there it counts toward the failure pause. |
 | `failed` | The check failed, the agent errored, or the session went away. Counts toward the failure pause. |
 | `timed_out` | It ran past `--max-minutes` and was interrupted. Counts toward the failure pause. |
 | `over_budget` | It crossed `--max-cost` and was stopped. Counts toward the failure pause. |
@@ -178,7 +178,9 @@ Two flags look alike and do different jobs:
 
 When the routine fires and the gate finds work, it starts a loop run as you, the routine's owner, in your tenant.
 The prompt is the loop's objective, as saved: placeholders aren't expanded (a prompt with `{{…}}` is refused), and it may be at most 8,000 characters.
-What the gate printed, and any payload sent with an API or manual fire, reach the worker as quoted data, never as instructions (the first 4,000 characters).
+What the gate printed, and any payload sent with an API or manual fire, reach the worker as quoted data, never as instructions.
+They are two separate blocks, labelled `routine check` and `routine payload`, and each keeps its own first 4,000 characters, so a long gate output never crowds out the payload.
+A loop routine's prompt has no `{{payload}}`: the payload reaches the worker on its own.
 The run is an ordinary loop run: `codeoid loop ls`, `show`, `cancel` and the web UI's loops panel show it, with `started by your routine <name>`.
 
 The routine's run follows the loop run, and `routine runs` and `routine show` name it (`loop <id> <status>`).
@@ -188,23 +190,27 @@ It stays `running` while the loop is in progress, and ends with the loop's outco
 | --- | --- |
 | `completed` | `succeeded`: the summary names the verified commit and its branch. Nothing is pushed. |
 | `blocked` before any attempt (the checks already pass) | `silent`: nothing to repair. |
-| `blocked` otherwise | `needs_attention`: the worker reported a conflict, or made no progress. |
+| `blocked` otherwise | `needs_attention` ("loop blocked"): the worker reported a conflict, or made no progress. Counts toward the failure pause. |
 | `budget_exhausted` | `failed` (counts toward the failure pause). |
 | `failed` | `failed` (counts toward the failure pause). |
 | `cancelled` | `cancelled`. |
 
-The run's cost is the loop's.
-A loop that waits on you (an approval, a question) keeps the routine run `running`; the loop tells you itself.
+The run's cost is the loop's, including the attempt in flight when a loop is cancelled.
+A loop that waits on you (an approval, a question), or that you paused, keeps the routine run `running`, and the web UI's "Needs you" inbox lists the routine as waiting on its loop: no later fire starts until the loop ends.
+A loop run cancelled directly (`codeoid loop cancel`) ends its routine run as `cancelled` at once.
+If the daemon stops between starting the loop and recording it, the routine run picks the loop up again on restart rather than ending `interrupted`.
+If loops are no longer available on the daemon (turned off before a restart), a run still following one ends `failed`, saying so.
 
 **One at a time.**
-A fire while the loop run its last fire started is still in progress is `skipped`, saying so.
+A fire while the loop run its last fire started is still in progress is `skipped`, naming the loop run and its status.
+The loop's state is read again first, so a loop that has just ended doesn't hold the fire back.
 A fire when you already have three loop runs in progress (the loop limit per owner) is `skipped` too, and doesn't count as a failure.
 A loop routine's run doesn't take one of the two routine run slots while its loop works: the loop has its own bounds.
 
 **Budgets.**
 The loop's own limits bound the run: `--attempts` (default 3), `--attempt-minutes` (10), `--run-minutes` (30), and `--budget`, its tool calls per attempt (60).
 `--daily-cost` still applies, against what the routine's loop runs spent that UTC day.
-The settings that shape a session run don't apply to a loop routine: `--tool-budget`, `--max-minutes` and `--keep` are refused by the CLI (the daemon leaves them unused).
+The settings that shape a session run don't apply to a loop routine: the daemon refuses `toolBudget`, `maxMinutes` and `keepSessions` (`--tool-budget`, `--max-minutes`, `--keep`) on a routine that starts a loop, or that an edit turns into one, so no client can set one that would be silently ignored.
 Those that would promise something a loop can't keep are refused: `--guarded` (a loop's worker runs autonomously within its budget), `--persistent`, `--worktree` (a loop always has its own), `--max-cost` (a loop has no per-run spend ceiling), and `--overlap queue`.
 Loops run on the Claude backend for now, so `--provider` must be `claude` (or left to a Claude default).
 
@@ -212,10 +218,21 @@ Loops run on the Claude backend for now, so `--provider` must be `claude` (or le
 `routine edit <name> --loop --verify "…"` makes a routine start a loop, and `--no-loop` makes it run a session again.
 On a loop routine, `--verify` replaces its checks and `--attempts`, `--budget` and the other limits change only themselves.
 
+**Pausing and cancelling.**
+Pausing a loop routine stops its fires; it doesn't stop a loop run it already started, which carries on to its end.
+To stop that loop, cancel the routine's run (`codeoid routine cancel <runId>`), or the loop run itself.
+
+**Notifications.**
+A loop a routine started follows the routine's notify policy.
+Its end is pushed by the routine run, which ends with it, per the policy as for any routine; the push opens the loop's worker session.
+A loop waiting on you pushes as any loop does, unless the routine's policy is `never`.
+
 **Who can do what.**
 Saving, changing, firing, re-tokening or resuming a loop routine needs what `codeoid loop start` needs (`session:create`, `session:send` and `session:approve`), and a delegated token can't do any of it.
-Cancelling its run (`codeoid routine cancel <runId>`) cancels the loop run, and deleting the routine cancels a loop run still in progress.
-As for every routine, your scopes are checked when you save or change it, not each time it fires (see [A routine outlives the token that created it](#who-can-do-what)): revoking your credential doesn't stop a loop routine you already saved, so pause or delete it when access should end.
+Cancelling its run (`codeoid routine cancel <runId>`) cancels the loop run, and deleting the routine cancels a loop run still in progress (no `routine_end` fires for a routine being deleted).
+As for every routine, your scopes are checked when you save or change it, not each time it fires (see [A routine outlives the token that created it](#who-can-do-what)).
+Nothing is checked at fire time: a loop routine keeps starting autonomous loop runs as you after your credential is revoked or loses `session:approve`, until you pause or delete it.
+So pause or delete it when access should end.
 
 ## Triggers
 
@@ -223,6 +240,7 @@ As for every routine, your scopes are checked when you save or change it, not ea
 
 **Manual.** `codeoid routine run <name> [--payload "…"] [--wait]`.
 `--wait` polls until the run reaches an outcome and prints it.
+A manual fire works on a paused routine too (the web UI's Run now included): it runs once, and the routine stays paused.
 
 **API.** Turn it on with `--api` (on `add` or `edit`), and codeoid prints a token once:
 
@@ -234,7 +252,8 @@ curl -X POST http://127.0.0.1:7400/routines/<routine-id>/fire \
 # → 202 {"runId":"…","status":"queued"}
 ```
 
-The body becomes `{{payload}}`: JSON `{"text": "…"}`, any other JSON (passed through as text), or a plain-text body.
+The body becomes the payload: JSON `{"text": "…"}`, any other JSON (passed through as text), or a plain-text body.
+A session routine's prompt gets it as `{{payload}}`; a loop routine hands it to the loop's worker as data.
 `codeoid routine token <name>` mints a new token and the old one stops working at once; `--no-api` revokes it.
 Each routine accepts 30 API fires an hour by default (`routines.apiFiresPerHour`); past that the endpoint answers `429` with `Retry-After`.
 

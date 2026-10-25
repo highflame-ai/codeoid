@@ -16,6 +16,16 @@ export function errMessage(e: unknown): string {
 }
 
 /**
+ * A rejection as an `Error` with the daemon's words, keeping its `detail`
+ * (what a form can act on without parsing the words, e.g. a moved head).
+ */
+export function asRequestError(e: unknown): Error & { detail?: unknown } {
+  const out: Error & { detail?: unknown } = new Error(errMessage(e));
+  if (e && typeof e === "object" && "detail" in e && (e as { detail?: unknown }).detail !== undefined) out.detail = (e as { detail?: unknown }).detail;
+  return out;
+}
+
+/**
  * This feature isn't usable on this connection at all — the token lacks the
  * scopes, or the daemon has it off — so background refreshes stop asking.
  */

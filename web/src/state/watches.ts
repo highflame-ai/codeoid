@@ -12,12 +12,16 @@
  *
  * Read and control errors are kept as strings; create, update (trust) and
  * vouch reject with the daemon's words, so their forms show them where they
- * were caused — the vouch dialog reads a moved head out of them.
+ * were caused — the vouch dialog reads a moved head out of their `detail`.
+ *
+ * As in state/routines.ts, every request is numbered when it is sent and a
+ * reply older than what is shown changes nothing: a list read sent before a
+ * delete can't bring the watch back.
  */
 
 import { createSignal } from "solid-js";
 
-import { errMessage, isUnavailable } from "../lib/automation";
+import { asRequestError, errMessage, isUnavailable } from "../lib/automation";
 import { getClient, newRequestId } from "./connection";
 import type {
   ClientMessage,
@@ -71,7 +75,19 @@ function upsert(list: LoopWatchWire[], w: LoopWatchWire): LoopWatchWire[] {
   return next;
 }
 
-function applySnapshot(snap: LoopWatchSnapshotMsg): void {
+// ── Reply ordering ───────────────────────────────────────────────────────────
+
+let seq = 0;
+let listApplied = 0;
+/** When the list was last asked for: the inbox reads it while a watch's detail is open too. */
+let lastListAt = 0;
+const snapApplied = new Map<string, number>();
+const deletedAt = new Map<string, number>();
+
+function applySnapshot(snap: LoopWatchSnapshotMsg, sent: number): void {
+  const id = snap.watch.id;
+  if ((deletedAt.get(id) ?? 0) > sent || (snapApplied.get(id) ?? 0) > sent) return;
+  snapApplied.set(id, sent);
   setState((s) => {
     const watches = upsert(s.watches, snap.watch);
     const lastPoll = snap.poll ? { watchId: snap.watch.id, ...snap.poll } : s.lastPoll;
@@ -93,7 +109,11 @@ let readOver: object | null = null;
 
 function client() {
   const c = getClient();
-  if (readOver !== null && readOver !== c) setState({ ...EMPTY });
+  if (readOver !== null && readOver !== c) {
+    setState({ ...EMPTY });
+    snapApplied.clear();
+    deletedAt.clear();
+  }
   readOver = c;
   return c;
 }
@@ -108,6 +128,8 @@ function forget(e: unknown): void {
 
 export async function fetchWatches(): Promise<void> {
   const id = newRequestId();
+  const sent = ++seq;
+  lastListAt = Date.now();
   try {
     const res = await client().request<LoopWatchListResultMsg>(
       { type: "loop.watch.list", id },
@@ -117,7 +139,14 @@ export async function fetchWatches(): Promise<void> {
       },
     );
     unavailable = false;
-    setState((s) => ({ ...s, watches: res.watches, loaded: true, error: s.selectedId ? s.error : null }));
+    if (sent < listApplied) return;
+    listApplied = sent;
+    setState((s) => {
+      const watches = res.watches
+        .filter((w) => (deletedAt.get(w.id) ?? 0) <= sent)
+        .map((w) => ((snapApplied.get(w.id) ?? 0) > sent ? (s.watches.find((x) => x.id === w.id) ?? w) : w));
+      return { ...s, watches, loaded: true, error: s.selectedId ? s.error : null };
+    });
   } catch (e) {
     if (isUnavailable(e, OFF)) return forget(e);
     setState((s) => ({ ...s, loaded: true, error: errMessage(e) }));
@@ -126,12 +155,13 @@ export async function fetchWatches(): Promise<void> {
 
 export async function fetchWatch(watchId: string): Promise<void> {
   const id = newRequestId();
+  const sent = ++seq;
   try {
     const snap = await client().request<LoopWatchSnapshotMsg>(
       { type: "loop.watch.get", id, watchId },
       { waitForResult: snapshotOf(id), timeoutMs: READ_TIMEOUT_MS },
     );
-    applySnapshot(snap);
+    applySnapshot(snap, sent);
   } catch (e) {
     if (isUnavailable(e, OFF)) return forget(e);
     if (state().selectedId === watchId) setState((s) => ({ ...s, error: errMessage(e) }));
@@ -156,11 +186,12 @@ let inflight = 0;
 
 async function control(build: (id: string) => ClientMessage): Promise<boolean> {
   const id = newRequestId();
+  const sent = ++seq;
   inflight += 1;
   setState((s) => ({ ...s, busy: true, error: null }));
   try {
     const snap = await client().request<LoopWatchSnapshotMsg>(build(id), { waitForResult: snapshotOf(id), timeoutMs: WRITE_TIMEOUT_MS });
-    applySnapshot(snap);
+    applySnapshot(snap, sent);
     return true;
   } catch (e) {
     setState((s) => ({ ...s, error: errMessage(e) }));
@@ -181,10 +212,12 @@ export function pollWatch(watchId: string): Promise<boolean> {
 }
 
 export async function deleteWatch(watchId: string): Promise<boolean> {
+  const sent = ++seq;
   inflight += 1;
   setState((s) => ({ ...s, busy: true, error: null }));
   try {
     await client().request({ type: "loop.watch.delete", id: newRequestId(), watchId }, { timeoutMs: WRITE_TIMEOUT_MS });
+    deletedAt.set(watchId, sent);
     setState((s) => ({
       ...s,
       watches: s.watches.filter((w) => w.id !== watchId),
@@ -205,6 +238,7 @@ export async function deleteWatch(watchId: string): Promise<boolean> {
 /** Make a watch and select it. */
 export async function createWatch(body: Omit<LoopWatchCreateMsg, "id">): Promise<LoopWatchWire> {
   const id = newRequestId();
+  const sent = ++seq;
   let snap: LoopWatchSnapshotMsg;
   try {
     snap = await client().request<LoopWatchSnapshotMsg>({ ...body, id }, { waitForResult: snapshotOf(id), timeoutMs: WRITE_TIMEOUT_MS });
@@ -212,7 +246,7 @@ export async function createWatch(body: Omit<LoopWatchCreateMsg, "id">): Promise
     throw new Error(errMessage(e));
   }
   setState((s) => ({ ...s, selectedId: snap.watch.id, detail: null, lastPoll: null, error: null }));
-  applySnapshot(snap);
+  applySnapshot(snap, sent);
   return snap.watch;
 }
 
@@ -222,15 +256,17 @@ export async function createWatch(body: Omit<LoopWatchCreateMsg, "id">): Promise
  */
 export async function updateWatch(watchId: string, patch: Pick<LoopWatchUpdateMsg, "spec" | "trustHead" | "enabled">): Promise<LoopWatchWire> {
   const id = newRequestId();
+  const sent = ++seq;
   try {
     const snap = await client().request<LoopWatchSnapshotMsg>(
       { type: "loop.watch.update", id, watchId, ...patch },
       { waitForResult: snapshotOf(id), timeoutMs: WRITE_TIMEOUT_MS },
     );
-    applySnapshot(snap);
+    applySnapshot(snap, sent);
     return snap.watch;
   } catch (e) {
-    throw new Error(errMessage(e));
+    // The refusal's detail rides along: the vouch dialog re-pins from it.
+    throw asRequestError(e);
   }
 }
 
@@ -247,8 +283,11 @@ function hidden(): boolean {
 function tick(): void {
   if (hidden()) return;
   const selected = state().selectedId;
-  if (viewOpen() && selected) void fetchWatch(selected);
-  else void fetchWatches();
+  if (viewOpen() && selected) {
+    void fetchWatch(selected);
+    // The inbox reads the list: kept fresh at its own pace while a detail is open.
+    if (watchers > 0 && Date.now() - lastListAt >= WATCH_POLL_MS) void fetchWatches();
+  } else void fetchWatches();
 }
 
 function reschedule(): void {
@@ -291,6 +330,11 @@ export function watchWatches(): () => void {
 export function _resetWatchesForTest(): void {
   readOver = null;
   inflight = 0;
+  seq = 0;
+  listApplied = 0;
+  lastListAt = 0;
+  snapApplied.clear();
+  deletedAt.clear();
   if (timer !== null) clearInterval(timer);
   timer = null;
   timerMs = null;

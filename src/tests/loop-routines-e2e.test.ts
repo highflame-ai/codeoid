@@ -167,7 +167,7 @@ describe("a routine that starts a loop", () => {
     expect(loop.attempts.map((a) => a.result)).toEqual(["unverified", "verified"]);
     // "Started by" names the routine and this routine run; the payload rode as data.
     expect(loop.run.trigger).toMatchObject({ kind: "routine", routineId: routine.id, routineName: "status-repair", routineRunId: fired.run.id });
-    expect(loop.run.trigger!.summary).toContain("since the last deploy");
+    expect(loop.run.trigger!.payload).toContain("since the last deploy");
     expect(loop.run.objective).toBe("Make the status check pass.");
     // The summary names the delivered commit; the user's checkout is untouched.
     expect(done.summary).toContain(loop.run.deliveredCommit!.slice(0, 12));
@@ -198,7 +198,7 @@ describe("a routine that starts a loop", () => {
     expect(done.trigger).toBe("api");
     expect(done.status).toBe("succeeded");
     const loop = await loopSnapshot(done.loop!.runId);
-    expect(loop.run.trigger?.summary).toContain("the status monitor went red");
+    expect(loop.run.trigger?.payload).toContain("the status monitor went red");
   });
 
   test("checks that already pass: nothing to repair, the routine run is silent", async () => {

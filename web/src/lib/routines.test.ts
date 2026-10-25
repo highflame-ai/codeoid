@@ -16,6 +16,7 @@ import {
   parseEvery,
   routineLoopOf,
   routineRunLoop,
+  routineRunStatusStyle,
   routineBudgetText,
   routineState,
   routineWarnings,
@@ -74,6 +75,16 @@ describe("schedules in words", () => {
 });
 
 describe("outcomes", () => {
+  it("a loop routine's blocked loop reads as such and counts as failing; a session's park does neither", () => {
+    const blocked = runWire({ status: "needs_attention", loop: { runId: "loop_1", status: "blocked" } });
+    expect(routineRunStatusStyle(blocked).label).toBe("loop blocked");
+    expect(routineRunStatusStyle(blocked).meaning).toMatch(/Counts toward the failure pause/);
+    expect(isFailingRun(blocked.status, blocked.loop)).toBe(true);
+    const parked = runWire({ status: "needs_attention" });
+    expect(routineRunStatusStyle(parked).label).toBe("needs you");
+    expect(isFailingRun(parked.status, parked.loop)).toBe(false);
+  });
+
   it("knows which runs fail, which can be cancelled, and a routine's state", () => {
     expect(isFailingRun("failed")).toBe(true);
     expect(isFailingRun("over_budget")).toBe(true);
@@ -127,6 +138,9 @@ describe("the form", () => {
     expect(buildRoutineSpec(filled({ checkCommand: "x", checkTimeout: "-1" }))).toMatchObject({ field: "check" });
     expect(buildRoutineSpec(filled({ maxCostUsd: "free" }))).toMatchObject({ field: "maxCostUsd" });
     expect(buildRoutineSpec(filled({ toolBudget: "0" }))).toMatchObject({ field: "toolBudget" });
+    // The daemon keeps at least one session.
+    expect(buildRoutineSpec(filled({ keepSessions: "0" }))).toMatchObject({ field: "keepSessions" });
+    expect(buildRoutineSpec(filled({ keepSessions: "1" }))).toHaveProperty("spec.keepSessions", 1);
   });
 
   it("on demand sends no schedule", () => {
@@ -164,6 +178,18 @@ describe("editing", () => {
     expect(buildRoutinePatch(cron, { ...formFromRoutine(cron), scheduleKind: "none" })).toEqual({ patch: { schedule: null }, changed: ["schedule"] });
     const p = buildRoutinePatch(cron, { ...formFromRoutine(cron), cronExpr: "0 10 * * 1-5" });
     expect(p).toEqual({ patch: { schedule: { kind: "cron", expr: "0 10 * * 1-5", timezone: "Asia/Singapore" } }, changed: ["schedule"] });
+  });
+
+  it("a one-off whose time wasn't touched is not a change, though the field shows it only to the minute", () => {
+    const at = "2026-11-02T09:30:45.250Z";
+    const once = routine({}, { schedule: { kind: "once", at } });
+    expect(formFromRoutine(once).onceAt).toBe(isoToLocal(at));
+    expect(buildRoutinePatch(once, formFromRoutine(once))).toEqual({ patch: {}, changed: [] });
+    // An unrelated edit leaves the schedule out, so the daemon keeps the saved instant.
+    expect(buildRoutinePatch(once, { ...formFromRoutine(once), prompt: "Another prompt" })).toEqual({ patch: { prompt: "Another prompt" }, changed: ["prompt"] });
+    // Moving it is a change.
+    const moved = buildRoutinePatch(once, { ...formFromRoutine(once), onceAt: isoToLocal("2026-11-03T09:30:00.000Z") });
+    expect(moved).toMatchObject({ changed: ["schedule"], patch: { schedule: { kind: "once", at: "2026-11-03T09:30:00.000Z" } } });
   });
 
   it("a check left at the default timeout is not a change", () => {

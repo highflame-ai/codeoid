@@ -1799,12 +1799,19 @@ describe("trust: a head runs only when a trusted login pushed it, or signed ever
     gh.pushes = [{ branch: "main", after: SHA2, actor: "mallory", before: SHA1 }];
     // You looked at SHA1; mallory pushed SHA2 since.
     const make = (trustHead: Record<string, string>, workdir = "/repo") => svc.create({ workdir, branches: ["main"], ci: CI }, OWNER, { trustHead });
-    await expect(make({ main: SHA1.slice(0, 12) })).rejects.toThrow(`main's head is ${SHA2.slice(0, 12)} now, not ${SHA1.slice(0, 12)}: it moved, so nothing was vouched for`);
+    // The refusal names the head's full id, in its words and structured, so a re-pin is to the commit itself.
+    const moved = await make({ main: SHA1 }).catch((e: unknown) => e);
+    expect(moved).toBeInstanceOf(LoopError);
+    expect((moved as LoopError).message).toContain(`main's head is ${SHA2} now, not ${SHA1}: it moved, so nothing was vouched for`);
+    expect((moved as LoopError).detail).toEqual({ kind: "head_moved", branch: "main", head: SHA2, pinned: SHA1 });
     expect(svc.list(OWNER)).toHaveLength(0);
-    await expect(make({ dev: SHA2.slice(0, 12) })).rejects.toThrow(`names "dev", which the watch doesn't watch`);
-    await expect(make({ main: SHA2.slice(0, 8) })).rejects.toThrow("at least 12 characters");
+    await expect(make({ dev: SHA2 })).rejects.toThrow(`names "dev", which the watch doesn't watch`);
+    // A prefix is refused, however long: it could name a commit nobody looked at.
+    await expect(make({ main: SHA2.slice(0, 8) })).rejects.toThrow("full id");
+    await expect(make({ main: SHA2.slice(0, 12) })).rejects.toThrow("not a prefix");
+    await expect(make({ main: SHA2.slice(0, 39) })).rejects.toThrow("not a prefix");
     expect(svc.list(OWNER)).toHaveLength(0);
-    const w = await make({ main: SHA2.slice(0, 12).toUpperCase() });
+    const w = await make({ main: SHA2.toUpperCase() });
     expect(store.lastTrusted(store.get(w.id)!, REPO, "main")).toBe(SHA2);
     const anchors = () => store.listTriggers(w.id).filter((t) => t.kind === "trust_anchor");
     expect(anchors().map((t) => t.note)).toEqual([expect.stringContaining(`you vouched for main at ${SHA2} (put there by a push by @mallory)`)]);
@@ -1817,7 +1824,7 @@ describe("trust: a head runs only when a trusted login pushed it, or signed ever
     expect(anchors()).toHaveLength(1);
     // On a watch of two branches, a pin vouches for its branch alone.
     gh.branches.set("dev", SHA1);
-    const two = await svc.create({ workdir: "/repo2", branches: ["main", "dev"], ci: CI }, OWNER, { trustHead: { dev: SHA1.slice(0, 12) } });
+    const two = await svc.create({ workdir: "/repo2", branches: ["main", "dev"], ci: CI }, OWNER, { trustHead: { dev: SHA1 } });
     expect(store.lastTrusted(store.get(two.id)!, REPO, "dev")).toBe(SHA1);
     expect(store.lastTrusted(store.get(two.id)!, REPO, "main")).toBeNull();
   });

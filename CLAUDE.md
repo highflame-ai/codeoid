@@ -217,6 +217,10 @@ with a check, or one that starts a loop; changes are refused to delegated tokens
 starts a loop run through `RoutineHost.loops` after its gate; its routine run
 follows the loop (`loopRunId`) without holding a run slot and ends with the
 loop's outcome.
+A loop that ends blocked after trying is `needs_attention` there, and for a loop routine that counts toward the failure pause.
+`#followLoops` runs at the start of every tick and on every loop end or cancel (`notifyOwner` kind `cancelled`); without a loop port it fails the following runs.
+`RoutineService.start` relinks a run whose loop started before the run recorded it (`RoutineLoopPort.inProgress`, owner-scoped), and the routine's `notify` policy decides a routine-started loop's pushes (`loopMayPush`).
+A pinned vouch (`trustHead` record) takes full commit ids only, and its moved-head refusal carries `response.error` `detail` (`head_moved`), which `RequestError` in packages/core keeps.
 
 ## Config
 

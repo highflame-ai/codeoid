@@ -364,6 +364,19 @@ describe("control", () => {
     expect(host.commits).toHaveLength(0);
   });
 
+  test("a cancel charges the attempt in flight, and tells whoever follows the run", async () => {
+    const { host, service } = setup();
+    host.steps = [{ hang: true }];
+    const id = service.startRun(input(), OWNER).id;
+    await settle(service, id, () => service.attempts(id)[0]?.status === "running");
+    const cancelled = await service.cancel(id, OWNER);
+    // The worker spent 0.10 on the attempt before it was stopped.
+    expect(service.attempts(id)[0]!.costUsd).toBeCloseTo(0.1);
+    expect(cancelled.costUsd).toBeCloseTo(0.1);
+    expect(service.get(id, OWNER).costUsd).toBeCloseTo(0.1);
+    expect(host.notified).toContain("cancelled:cancelled");
+  });
+
   test("an approval wait holds the task and stops the clock; answering resumes it", async () => {
     const { host, service } = setup();
     host.steps = [{ waitApproval: true }];

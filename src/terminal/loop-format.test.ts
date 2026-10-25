@@ -119,16 +119,20 @@ describe("loop formatting", () => {
 });
 
 describe("--trust-head", () => {
-  test("alone it vouches for every watched branch's head; <branch>=<sha> pins a branch to a commit of at least 12 characters", () => {
+  const A = "0123456789abcdef0123456789abcdef01234567";
+  const B = "ba9876543210fedcba9876543210fedcba987654";
+  test("alone it vouches for every watched branch's head; <branch>=<sha> pins a branch to a commit by its full id", () => {
     expect(parseTrustHeadFlag(undefined)).toBeUndefined();
     expect(parseTrustHeadFlag(true)).toBe(true);
-    expect(parseTrustHeadFlag(["main=0123456789AB", `release/1.x=${"f".repeat(40)}`])).toEqual({ main: "0123456789ab", "release/1.x": "f".repeat(40) });
+    expect(parseTrustHeadFlag([`main=${A.toUpperCase()}`, `release/1.x=${"f".repeat(64)}`])).toEqual({ main: A, "release/1.x": "f".repeat(64) });
     // A branch name may hold "=": the commit is after the last one.
-    expect(parseTrustHeadFlag(["a=b=0123456789ab"])).toEqual({ "a=b": "0123456789ab" });
-    expect(parseTrustHeadFlag(["main=0123456789a"])).toContain("at least 12 characters");
+    expect(parseTrustHeadFlag([`a=b=${A}`])).toEqual({ "a=b": A });
+    // A prefix is refused, however long.
+    expect(parseTrustHeadFlag(["main=0123456789ab"])).toContain("full id");
+    expect(parseTrustHeadFlag([`main=${A.slice(0, 39)}`])).toContain("not a prefix");
     expect(parseTrustHeadFlag(["main"])).toContain("expected <branch>=<sha>");
-    expect(parseTrustHeadFlag(["=0123456789ab"])).toContain("expected <branch>=<sha>");
-    expect(parseTrustHeadFlag(["main=0123456789ab", "main=ba9876543210"])).toContain("two commits for main");
+    expect(parseTrustHeadFlag([`=${A}`])).toContain("expected <branch>=<sha>");
+    expect(parseTrustHeadFlag([`main=${A}`, `main=${B}`])).toContain("two commits for main");
   });
 
   // As the CLI declares it: commander overwrites what an optional-value option collected with `true` when it is given alone.
@@ -151,15 +155,15 @@ describe("--trust-head", () => {
     expect(parse("lw_1", "--trust-head").parsed).toBe(true);
     expect(parse("lw_1", "--trust-head", "--trust-head").parsed).toBe(true);
     expect(parse("lw_1", "--trust-head", "--trust", "bob").parsed).toBe(true);
-    expect(parse("lw_1", "--trust-head", "main=0123456789ab").parsed).toEqual({ main: "0123456789ab" });
-    expect(parse("lw_1", "--trust-head", "main=0123456789ab", "--trust-head").parsed).toContain("not both");
-    expect(parse("lw_1", "--trust-head", "--trust-head", "main=0123456789ab").parsed).toContain("not both");
-    expect(parse("lw_1", "--trust-head=main=0123456789ab", "--trust-head").trustHead).toEqual(["main=0123456789ab", TRUST_HEAD_ALONE]);
+    expect(parse("lw_1", "--trust-head", `main=${A}`).parsed).toEqual({ main: A });
+    expect(parse("lw_1", "--trust-head", `main=${A}`, "--trust-head").parsed).toContain("not both");
+    expect(parse("lw_1", "--trust-head", "--trust-head", `main=${A}`).parsed).toContain("not both");
+    expect(parse("lw_1", `--trust-head=main=${A}`, "--trust-head").trustHead).toEqual([`main=${A}`, TRUST_HEAD_ALONE]);
   });
 
   test("a positional taken as --trust-head's value is refused with what to do, not as a missing argument", () => {
     expect(() => parse("--trust-head", "lw_1")).toThrow(/"lw_1" isn't <branch>=<sha>.*put the watch id before --trust-head/);
     // A value with "=" is a pin, judged as one.
-    expect(parse("lw_1", "--trust-head", "main=0123").parsed).toContain("at least 12 characters");
+    expect(parse("lw_1", "--trust-head", "main=0123").parsed).toContain("not a prefix");
   });
 });

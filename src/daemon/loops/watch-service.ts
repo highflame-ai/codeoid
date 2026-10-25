@@ -141,6 +141,8 @@ const EVERYONES_BOTS: Record<string, string> = {
   "github-actions[bot]": "every workflow pushes as it, so anyone who can run one pushes as it",
 };
 const APP_RE = /^[a-z0-9][a-z0-9-]{0,99}$/;
+/** A full commit id: SHA-1, or SHA-256. A vouch pins to nothing shorter. */
+const FULL_SHA_RE = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
 const FAILED = new Set(["failure", "timed_out"]);
 const HOUR_MS = 60 * 60 * 1000;
 /** Comments are read from this long before the last complete poll, so one that lands mid-poll isn't missed. */
@@ -225,7 +227,7 @@ interface Candidate {
   input: LoopStartInput;
 }
 
-/** `--trust-head`: every watched branch's head as it is (`true`), or the named branches' while each is the commit named. */
+/** `--trust-head`: every watched branch's head as it is (`true`), or the named branches' while each is the commit named (by its full id). */
 export type TrustHead = true | Record<string, string>;
 
 /** A head the owner vouches for, and what GitHub's activity says put it there (null: it doesn't say). */
@@ -370,7 +372,8 @@ export class WatchService {
   /**
    * The heads to vouch for, read now: of each branch `spec` watches (`true`),
    * or of the branches `want` names, each only while it is still the commit
-   * named there (at least 12 characters of it) — a compare-and-set, so a push
+   * named there (its full id: a prefix could name a commit you never looked
+   * at) — a compare-and-set, so a push
    * between your look and this read vouches for nothing: one head that moved
    * fails the whole request, before anything changes. With each, who GitHub's
    * activity says put it there, for the record. Only a branch watch has
@@ -386,7 +389,9 @@ export class WatchService {
       if (pins.size === 0) throw new LoopError("--trust-head names no branch", "invalid_request");
       for (const [b, sha] of pins) {
         if (!spec.branches.includes(b)) throw new LoopError(`--trust-head names ${JSON.stringify(b)}, which the watch doesn't watch`, "invalid_request");
-        if (!/^[0-9a-f]{12,40}$/.test(sha)) throw new LoopError(`--trust-head ${b}=${sha}: give at least 12 characters of the commit id`, "invalid_request");
+        if (!FULL_SHA_RE.test(sha)) {
+          throw new LoopError(`--trust-head ${b}=${sha}: give the commit's full id (40 hex characters, or 64 for a SHA-256 repository), not a prefix`, "invalid_request");
+        }
       }
     }
     const gh = new GitHubSource(this.#host.gh, repo);
@@ -398,10 +403,17 @@ export class WatchService {
       } catch (err) {
         throw new LoopError(`reading ${branch}'s head to vouch for it: ${errText(err)}`, "invalid_request");
       }
-      if (!/^[0-9a-f]{40}$/.test(sha)) throw new LoopError(`GitHub gave no usable head for ${branch}`, "invalid_request");
+      if (!FULL_SHA_RE.test(sha)) throw new LoopError(`GitHub gave no usable head for ${branch}`, "invalid_request");
       const pinned = pins?.get(branch);
-      if (pinned !== undefined && !sha.startsWith(pinned)) {
-        throw new LoopError(`${branch}'s head is ${sha.slice(0, 12)} now, not ${pinned.slice(0, 12)}: it moved, so nothing was vouched for; look at it again`, "conflict");
+      if (pinned !== undefined && sha !== pinned) {
+        // The full id, in the words and structured: pinning to it is how
+        // the owner vouches again, once they have looked at it.
+        throw new LoopError(`${branch}'s head is ${sha} now, not ${pinned}: it moved, so nothing was vouched for; look at it again`, "conflict", {
+          kind: "head_moved",
+          branch,
+          head: sha,
+          pinned,
+        });
       }
       out.push({ branch, sha, by: await this.#whoPutThere(gh, repo, branch, sha) });
     }

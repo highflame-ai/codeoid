@@ -91,7 +91,7 @@ export interface LoopRunWire {
 /**
  * What started a run: a repository event a watch saw, or a routine's fire.
  * `summary` is event text (a check's output, a comment, a routine's gate
- * output or payload): data.
+ * output) and `payload` a routine fire's payload: data.
  */
 export interface LoopTriggerWire {
   kind: "ci_failure" | "review_comment" | "routine";
@@ -103,6 +103,8 @@ export interface LoopTriggerWire {
   routineRunId?: string;
   url?: string;
   summary: string;
+  /** kind `routine`: what was sent with its fire, kept apart from its gate's output in `summary`. Data. */
+  payload?: string;
 }
 
 export interface LoopAttemptWire {
@@ -304,9 +306,11 @@ export interface LoopWatchTriggerWire {
  * a later merge's chain of trusted merges can end at it; audited, and kept in
  * the watch's history with who put the head there. Never implied by anything
  * else. `true` vouches for every watched branch's head as the daemon reads
- * it; a record of branch to commit id (at least 12 hex characters) vouches
- * for only those branches, and only while each head is still that commit —
- * when any moved, nothing is vouched for and the request fails.
+ * it; a record of branch to full commit id (40 hex characters, or 64 for a
+ * SHA-256 repository; a prefix is refused) vouches for only those branches,
+ * and only while each head is still that commit — when any moved, nothing is
+ * vouched for and the request fails with `detail` `head_moved`, which names
+ * the head's full id now.
  */
 export type LoopWatchTrustHead = boolean | Record<string, string>;
 

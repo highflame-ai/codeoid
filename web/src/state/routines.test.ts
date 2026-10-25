@@ -18,8 +18,10 @@ import {
   createRoutine,
   deleteRoutine,
   fetchRoutines,
+  forgetRoutineToken,
   openRoutines,
   previewSchedule,
+  revealRoutineToken,
   rotateRoutineToken,
   routinesState,
   runRoutineNow,
@@ -239,5 +241,80 @@ describe("routines store — polling", () => {
     stop();
     await vi.advanceTimersByTimeAsync(WATCH_POLL_MS * 3);
     expect(clientRequestMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("routines store — reply order", () => {
+  it("a list read sent before a delete can't bring the routine back", async () => {
+    let answer!: (v: unknown) => void;
+    clientRequestMock.mockResolvedValueOnce(list([routine(), routine({ id: "rt_2", name: "digest" })]));
+    await fetchRoutines();
+    // A slow list read, then the delete lands first.
+    clientRequestMock.mockReturnValueOnce(new Promise((r) => (answer = r)));
+    const slow = fetchRoutines();
+    clientRequestMock.mockResolvedValueOnce({ type: "response.ok", requestId: "r" });
+    expect(await deleteRoutine("rt_1")).toBe(true);
+    answer(list([routine(), routine({ id: "rt_2", name: "digest" })]));
+    await slow;
+    expect(routinesState().routines.map((r) => r.id)).toEqual(["rt_2"]);
+  });
+
+  it("an older reply can't undo a newer one", async () => {
+    let first!: (v: unknown) => void;
+    clientRequestMock.mockReturnValueOnce(new Promise((r) => (first = r)));
+    const older = fetchRoutines();
+    clientRequestMock.mockResolvedValueOnce(list([routine({ enabled: false })]));
+    await fetchRoutines();
+    first(list([routine({ enabled: true })]));
+    await older;
+    expect(routinesState().routines[0]!.enabled).toBe(false);
+
+    // A routine's snapshot from a pause outranks a list read sent before it.
+    let late!: (v: unknown) => void;
+    clientRequestMock.mockReturnValueOnce(new Promise((r) => (late = r)));
+    const listing = fetchRoutines();
+    clientRequestMock.mockResolvedValueOnce(snap({ enabled: true }));
+    await setRoutineEnabled("rt_1", true);
+    late(list([routine({ enabled: false })]));
+    await listing;
+    expect(routinesState().routines[0]!.enabled).toBe(true);
+  });
+
+  it("keeps the inbox's list fresh while a routine's detail is open", async () => {
+    vi.useFakeTimers();
+    clientRequestMock.mockImplementation(async (m: { type: string }) => (m.type === "routine.list" ? list([routine()]) : snap()));
+    const stop = watchRoutines();
+    openRoutines("rt_1");
+    await vi.advanceTimersByTimeAsync(WATCH_POLL_MS + VIEW_POLL_MS);
+    const lists = clientRequestMock.mock.calls.filter(([m]) => (m as { type: string }).type === "routine.list").length;
+    // The watcher's first read, and at least one more while the detail polled.
+    expect(lists).toBeGreaterThanOrEqual(2);
+    expect(clientRequestMock.mock.calls.some(([m]) => (m as { type: string }).type === "routine.get")).toBe(true);
+    stop();
+  });
+});
+
+describe("routines store — a token shown once", () => {
+  const token = { routineId: "rt_1", apiToken: "rt_secret", endpointPath: "/routines/rt_1/fire" };
+
+  it("goes when the connection drops or changes hands", async () => {
+    revealRoutineToken(token);
+    expect(routinesState().token).toEqual(token);
+    forgetRoutineToken();
+    expect(routinesState().token).toBeNull();
+
+    clientRequestMock.mockResolvedValue(list([routine()]));
+    await fetchRoutines();
+    revealRoutineToken(token);
+    clientRef.current = { request: vi.fn().mockResolvedValue(list([])) };
+    await fetchRoutines();
+    expect(routinesState().token).toBeNull();
+  });
+
+  it("goes with its routine", async () => {
+    revealRoutineToken(token);
+    clientRequestMock.mockResolvedValueOnce({ type: "response.ok", requestId: "r" });
+    await deleteRoutine("rt_1");
+    expect(routinesState().token).toBeNull();
   });
 });

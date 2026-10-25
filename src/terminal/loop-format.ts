@@ -195,9 +195,9 @@ export function trustHeadOption(description: string): Option {
  * Parse `--trust-head`: given alone (`true`, or only {@link TRUST_HEAD_ALONE}),
  * you vouch for each watched branch's head as it is when the daemon reads it;
  * given `<branch>=<sha>` (repeatable), only for those branches, and only while
- * each head is still the commit you name (at least 12 characters of it) —
- * otherwise nothing is vouched for. Both in one command is refused. A string
- * is what is wrong with it.
+ * each head is still the commit you name, by its full id (a prefix could name
+ * a commit you never looked at) — otherwise nothing is vouched for. Both in
+ * one command is refused. A string is what is wrong with it.
  */
 export function parseTrustHeadFlag(v: true | string[] | undefined): true | Record<string, string> | undefined | string {
   if (v === undefined || v === true) return v;
@@ -209,7 +209,10 @@ export function parseTrustHeadFlag(v: true | string[] | undefined): true | Recor
     const i = raw.lastIndexOf("=");
     const branch = i > 0 ? raw.slice(0, i).trim() : "";
     const sha = i > 0 ? raw.slice(i + 1).trim().toLowerCase() : "";
-    if (!branch || !/^[0-9a-f]{12,40}$/.test(sha)) return `--trust-head ${JSON.stringify(raw)}: expected <branch>=<sha>, with at least 12 characters of the commit id.`;
+    if (!branch || !sha) return `--trust-head ${JSON.stringify(raw)}: expected <branch>=<sha>, with the commit's full id.`;
+    if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(sha)) {
+      return `--trust-head ${JSON.stringify(raw)}: give the commit's full id (40 hex characters, or 64 for a SHA-256 repository), not a prefix — \`git rev-parse <commit>\` prints it.`;
+    }
     if (out[branch] !== undefined && out[branch] !== sha) return `--trust-head names two commits for ${branch}.`;
     out[branch] = sha;
   }

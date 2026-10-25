@@ -93,7 +93,7 @@ export const WatchesTab: Component<{ onOpenLoopRun: (runId: string) => void }> =
                 onSetEnabled={(enabled) => void setWatchEnabled(id, enabled)}
                 onPoll={() => void pollWatch(id)}
                 onDelete={() => deleteWatch(id)}
-                onSaveTrust={(trust, vouch) => updateWatch(id, { spec: { trust }, ...(vouch ? { trustHead: true } : {}) }).then(() => undefined)}
+                onSaveTrust={(trust) => updateWatch(id, { spec: { trust } }).then(() => undefined)}
                 onVouch={(trustHead) => updateWatch(id, { trustHead }).then(() => undefined)}
                 onOpenLoopRun={props.onOpenLoopRun}
               />

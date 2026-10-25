@@ -20,6 +20,15 @@
  * Errors are caught and kept as strings; the form calls (create, update,
  * preview, token) reject with the daemon's words instead, so the form can
  * show them next to the inputs that caused them.
+ *
+ * Replies can land out of order (a slow list read behind a delete). Every
+ * request is numbered when it is sent, and a reply older than what is shown
+ * changes nothing: a list read sent before a delete can't bring the routine
+ * back, and an older read can't undo a newer snapshot of one routine.
+ *
+ * An API token the daemon hands over is shown once, held here rather than in
+ * a component, so it goes with everything else when the connection changes
+ * or drops ({@link forgetRoutineToken}).
  */
 
 import { createSignal } from "solid-js";
@@ -56,9 +65,11 @@ interface RoutinesState {
   busy: boolean;
   /** Last read or control error, verbatim from the daemon. */
   error: string | null;
+  /** An API token just handed over, shown once (with its routine and endpoint). */
+  token: { routineId: string; apiToken: string; endpointPath: string } | null;
 }
 
-const EMPTY: RoutinesState = { routines: [], loaded: false, selectedId: null, detail: null, busy: false, error: null };
+const EMPTY: RoutinesState = { routines: [], loaded: false, selectedId: null, detail: null, busy: false, error: null, token: null };
 
 const [state, setState] = createSignal<RoutinesState>(EMPTY);
 const [viewOpen, setViewOpen] = createSignal(false);
@@ -91,7 +102,26 @@ function upsert(list: RoutineWire[], r: RoutineWire): RoutineWire[] {
   return next;
 }
 
-function applySnapshot(snap: RoutineSnapshotMsg): void {
+// ── Reply ordering ───────────────────────────────────────────────────────────
+
+/** Numbers requests as they are sent. */
+let seq = 0;
+/** The newest list read applied. */
+let listApplied = 0;
+/** When the list was last asked for: the inbox reads it while a routine's detail is open too. */
+let lastListAt = 0;
+/** Per routine: the newest snapshot applied. */
+const snapApplied = new Map<string, number>();
+/** Per routine: the request that deleted it — a reply sent before then can't bring it back. */
+const deletedAt = new Map<string, number>();
+
+function stale(routineId: string, sent: number): boolean {
+  return (deletedAt.get(routineId) ?? 0) > sent || (snapApplied.get(routineId) ?? 0) > sent;
+}
+
+function applySnapshot(snap: RoutineSnapshotMsg, sent: number): void {
+  if (stale(snap.routine.id, sent)) return;
+  snapApplied.set(snap.routine.id, sent);
   setState((s) => {
     const routines = upsert(s.routines, snap.routine);
     if (s.selectedId !== snap.routine.id) return { ...s, routines };
@@ -115,7 +145,11 @@ let readOver: object | null = null;
 /** The client to read over, dropping everything an earlier connection read. */
 function client() {
   const c = getClient();
-  if (readOver !== null && readOver !== c) setState({ ...EMPTY });
+  if (readOver !== null && readOver !== c) {
+    setState({ ...EMPTY });
+    snapApplied.clear();
+    deletedAt.clear();
+  }
   readOver = c;
   return c;
 }
@@ -124,13 +158,25 @@ function client() {
 function forget(e: unknown): void {
   unavailable = true;
   reschedule();
-  setState((s) => ({ ...s, routines: [], detail: null, selectedId: null, loaded: true, error: errMessage(e) }));
+  setState((s) => ({ ...s, routines: [], detail: null, selectedId: null, loaded: true, error: errMessage(e), token: null }));
+}
+
+/** The connection dropped or changed hands: a token shown once doesn't outlive it. */
+export function forgetRoutineToken(): void {
+  if (state().token) setState((s) => ({ ...s, token: null }));
+}
+
+/** Show a token the daemon just handed over (once). */
+export function revealRoutineToken(token: NonNullable<RoutinesState["token"]>): void {
+  setState((s) => ({ ...s, token }));
 }
 
 // ── Reads ────────────────────────────────────────────────────────────────────
 
 export async function fetchRoutines(): Promise<void> {
   const id = newRequestId();
+  const sent = ++seq;
+  lastListAt = Date.now();
   try {
     const res = await client().request<RoutineListResultMsg>(
       { type: "routine.list", id },
@@ -140,10 +186,17 @@ export async function fetchRoutines(): Promise<void> {
       },
     );
     unavailable = false;
+    // A newer list already landed: this one says nothing new.
+    if (sent < listApplied) return;
+    listApplied = sent;
     setState((s) => {
+      // Not one deleted since this was sent; a routine with a newer snapshot keeps it.
+      const routines = res.routines
+        .filter((r) => (deletedAt.get(r.id) ?? 0) <= sent)
+        .map((r) => ((snapApplied.get(r.id) ?? 0) > sent ? (s.routines.find((x) => x.id === r.id) ?? r) : r));
       // A routine deleted elsewhere leaves the detail too.
-      const gone = s.selectedId !== null && !res.routines.some((r) => r.id === s.selectedId);
-      return { ...s, routines: res.routines, loaded: true, error: s.selectedId && !gone ? s.error : null };
+      const gone = s.selectedId !== null && !routines.some((r) => r.id === s.selectedId);
+      return { ...s, routines, loaded: true, error: s.selectedId && !gone ? s.error : null };
     });
   } catch (e) {
     if (isUnavailable(e, OFF)) return forget(e);
@@ -153,12 +206,13 @@ export async function fetchRoutines(): Promise<void> {
 
 export async function fetchRoutine(routineId: string): Promise<void> {
   const id = newRequestId();
+  const sent = ++seq;
   try {
     const snap = await client().request<RoutineSnapshotMsg>(
       { type: "routine.get", id, routine: routineId, runs: DETAIL_RUNS },
       { waitForResult: snapshotOf(id), timeoutMs: READ_TIMEOUT_MS },
     );
-    applySnapshot(snap);
+    applySnapshot(snap, sent);
   } catch (e) {
     if (isUnavailable(e, OFF)) return forget(e);
     // A read for a routine the user has since left must not paint its error over another.
@@ -198,8 +252,9 @@ async function control<T>(run: () => Promise<T>): Promise<T | null> {
 
 async function snapshotRequest(build: (id: string) => ClientMessage, timeoutMs = WRITE_TIMEOUT_MS): Promise<RoutineSnapshotMsg> {
   const id = newRequestId();
+  const sent = ++seq;
   const snap = await client().request<RoutineSnapshotMsg>(build(id), { waitForResult: snapshotOf(id), timeoutMs });
-  applySnapshot(snap);
+  applySnapshot(snap, sent);
   return snap;
 }
 
@@ -241,12 +296,16 @@ export async function cancelRoutineRun(routineId: string, runId: string): Promis
 }
 
 export async function deleteRoutine(routineId: string): Promise<boolean> {
+  const sent = ++seq;
   const ok = await control(() => client().request({ type: "routine.delete", id: newRequestId(), routine: routineId }, { timeoutMs: WRITE_TIMEOUT_MS }));
   if (ok === null) return false;
+  // Any reply sent before the delete is about a routine that is gone.
+  deletedAt.set(routineId, sent);
   setState((s) => ({
     ...s,
     routines: s.routines.filter((r) => r.id !== routineId),
     ...(s.selectedId === routineId ? { selectedId: null, detail: null } : {}),
+    ...(s.token?.routineId === routineId ? { token: null } : {}),
   }));
   return true;
 }
@@ -323,8 +382,12 @@ function hidden(): boolean {
 function tick(): void {
   if (hidden()) return;
   const selected = state().selectedId;
-  if (viewOpen() && selected) void fetchRoutine(selected);
-  else void fetchRoutines();
+  if (viewOpen() && selected) {
+    void fetchRoutine(selected);
+    // The detail reads one routine; the "Needs you" inbox reads the list,
+    // which is kept fresh at its own pace meanwhile.
+    if (watchers > 0 && Date.now() - lastListAt >= WATCH_POLL_MS) void fetchRoutines();
+  } else void fetchRoutines();
 }
 
 function reschedule(): void {
@@ -369,6 +432,11 @@ export function watchRoutines(): () => void {
 export function _resetRoutinesForTest(): void {
   readOver = null;
   inflight = 0;
+  seq = 0;
+  listApplied = 0;
+  lastListAt = 0;
+  snapApplied.clear();
+  deletedAt.clear();
   if (timer !== null) clearInterval(timer);
   timer = null;
   timerMs = null;

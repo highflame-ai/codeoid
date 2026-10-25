@@ -153,7 +153,7 @@ const LoopsPanel: Component = () => {
     watches: { n: watchesState().watches.length, alert: watchesState().watches.some((w) => !!w.lastError) },
     routines: {
       n: routinesState().routines.length,
-      alert: routinesState().routines.some((r) => !!r.pausedReason || (!!r.lastRun && isFailingRun(r.lastRun.status))),
+      alert: routinesState().routines.some((r) => !!r.pausedReason || (!!r.lastRun && isFailingRun(r.lastRun.status, r.lastRun.loop))),
     },
   }));
   const tabId = (t: AutomationTab) => `automation-tab-${t}`;
