@@ -54,6 +54,13 @@ export class EvidenceService {
   readonly #artifactRoot: string;
   /** Live checks by owner, so an owner or the daemon can stop them. */
   readonly #live = new Map<string, Set<AbortController>>();
+  /** Artifact directories of checks still running — never swept. */
+  readonly #liveDirs = new Set<string>();
+  /** Owners whose checks were stopped: anything they start afterwards is
+   *  cancelled before it runs, so an abort can't miss a check that was about
+   *  to start. Cleared with `clearAbort` when the owner can run again. */
+  readonly #aborted = new Set<string>();
+  #stopping = false;
 
   /** `artifactRoot` holds one directory per check's full output. */
   constructor(store: EvidenceStore, artifactRoot: string) {
@@ -63,18 +70,21 @@ export class EvidenceService {
 
   /** Run `spec` in `cwd` and persist the result. */
   async run(spec: CheckSpec, cwd: string, ctx: EvidenceContext): Promise<CheckRun> {
-    const artifactDir = join(this.#artifactRoot, ctx.ownerKind, safeSegment(ctx.ownerId), randomUUID());
+    const relDir = join(ctx.ownerKind, safeSegment(ctx.ownerId), randomUUID());
+    const artifactDir = join(this.#artifactRoot, relDir);
     const key = ownerKey(ctx.ownerKind, ctx.ownerId);
     const ac = new AbortController();
+    if (this.#stopping || this.#aborted.has(key)) ac.abort();
     const onAbort = (): void => ac.abort();
     ctx.signal?.addEventListener("abort", onAbort, { once: true });
     if (ctx.signal?.aborted) ac.abort();
     const live = this.#live.get(key) ?? new Set<AbortController>();
     live.add(ac);
     this.#live.set(key, live);
+    this.#liveDirs.add(relDir);
     try {
       const outcome = await runCheck(spec, { cwd, artifactDir, signal: ac.signal });
-      const record = this.#store.insert({
+      const record = this.#store.insert(relDir, {
         ...outcome,
         accountId: ctx.tenant.accountId,
         projectId: ctx.tenant.projectId,
@@ -85,6 +95,7 @@ export class EvidenceService {
       return { outcome, record };
     } finally {
       ctx.signal?.removeEventListener("abort", onAbort);
+      this.#liveDirs.delete(relDir);
       live.delete(ac);
       if (live.size === 0) this.#live.delete(key);
     }
@@ -95,13 +106,22 @@ export class EvidenceService {
     return (spec, cwd) => this.run(spec, cwd, ctx);
   }
 
-  /** Stop every check running for one owner (e.g. a pipeline being aborted). */
+  /** Stop every check running for one owner (e.g. a pipeline being aborted),
+   *  and any it starts until `clearAbort`. */
   abortOwner(ownerKind: EvidenceOwnerKind, ownerId: string): void {
-    for (const ac of this.#live.get(ownerKey(ownerKind, ownerId)) ?? []) ac.abort();
+    const key = ownerKey(ownerKind, ownerId);
+    this.#aborted.add(key);
+    for (const ac of this.#live.get(key) ?? []) ac.abort();
   }
 
-  /** Stop every running check (daemon shutdown). */
+  /** Let an owner run checks again after `abortOwner`. */
+  clearAbort(ownerKind: EvidenceOwnerKind, ownerId: string): void {
+    this.#aborted.delete(ownerKey(ownerKind, ownerId));
+  }
+
+  /** Stop every running check, and refuse new ones (daemon shutdown). */
   abortAll(): void {
+    this.#stopping = true;
     for (const set of this.#live.values()) for (const ac of set) ac.abort();
   }
 
@@ -129,9 +149,16 @@ export class EvidenceService {
     }
     const dirs = this.#store.artifactDirsFor([...doomed]);
     this.#store.deleteIds([...doomed]);
-    for (const d of dirs) rmSync(d, { recursive: true, force: true });
-    this.#removeOrphanDirs(new Set(this.#store.allArtifactDirs()), now);
+    for (const d of dirs) rmSync(this.#inRoot(d), { recursive: true, force: true });
+    this.#removeOrphanDirs(new Set([...this.#store.allArtifactDirs(), ...this.#liveDirs]), now);
     return doomed.size;
+  }
+
+  /** A stored artifact directory (relative to the root) as an absolute path,
+   *  refusing anything that would resolve outside the root. */
+  #inRoot(rel: string): string {
+    const abs = join(this.#artifactRoot, rel);
+    return abs.startsWith(`${this.#artifactRoot}/`) ? abs : join(this.#artifactRoot, "_invalid_");
   }
 
   /** Remove check directories under the root that no record points at, once
@@ -149,7 +176,7 @@ export class EvidenceService {
         const ownerDir = join(this.#artifactRoot, kind, owner);
         for (const check of safeReaddir(ownerDir)) {
           const dir = join(ownerDir, check);
-          if (known.has(dir)) continue;
+          if (known.has(join(kind, owner, check))) continue;
           try {
             if (now - statSync(dir).mtimeMs < minAgeMs) continue;
           } catch {

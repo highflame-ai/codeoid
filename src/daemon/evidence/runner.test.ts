@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { detectZeroTests } from "./parsers";
-import { EXCERPT_HEAD_BYTES, EXCERPT_TAIL_BYTES, runCheck, verifierDigest } from "./runner";
+import { EXCERPT_HEAD_BYTES, EXCERPT_TAIL_BYTES, checkEnv, runCheck, verifierDigest } from "./runner";
 import type { CheckSpec } from "./types";
 
 let dir: string;
@@ -99,7 +99,7 @@ describe("output", () => {
     const out = await run(spec("i=0; while [ $i -lt 4000 ]; do echo line-$i; i=$((i+1)); done"));
     expect(out.stdoutExcerpt.startsWith("line-0\n")).toBe(true);
     expect(out.stdoutExcerpt).toContain("line-3999");
-    expect(out.stdoutExcerpt).toContain("bytes omitted");
+    expect(out.stdoutExcerpt).toContain("omitted — full output in the stdout artifact");
     expect(out.stdoutExcerpt.length).toBeLessThan(EXCERPT_HEAD_BYTES + EXCERPT_TAIL_BYTES + 200);
     const stdout = out.artifacts.find((a) => a.name === "stdout")!;
     const full = readFileSync(stdout.path, "utf8");
@@ -216,5 +216,40 @@ describe("audit round 1", () => {
     const out = await runCheck(spec("true"), { cwd: join(dir, "nope"), artifactDir: join(dir, "art") });
     expect(out.result).toBe("error");
     expect(out.reason).toContain("working directory does not exist");
+  });
+});
+
+describe("audit round 2", () => {
+  test("an artifact file that cannot be written does not crash, and says it is truncated", async () => {
+    const art = join(dir, "art");
+    mkdirSync(join(art, "stdout.log"), { recursive: true });
+    const out = await runCheck(spec("echo still-classified; exit 3"), { cwd: dir, artifactDir: art });
+    expect(out.result).toBe("fail");
+    expect(out.stdoutExcerpt).toContain("still-classified");
+    expect(out.artifacts.find((a) => a.name === "stdout")!.truncated).toBe(true);
+  });
+
+  test("checks keep the toolchain variables builds need, never the daemon's", () => {
+    const env = checkEnv({
+      PATH: "/bin",
+      LC_ALL: "C.UTF-8",
+      CI: "1",
+      GOPATH: "/go",
+      CODEOID_API_KEY: "zid_sk_x",
+      CODEOID_CHECK_ENV_ALLOW: "MY_FLAG,CODEOID_API_KEY",
+      MY_FLAG: "on",
+      RANDOM_SECRET: "nope",
+    });
+    expect(env.LC_ALL).toBe("C.UTF-8");
+    expect(env.CI).toBe("1");
+    expect(env.GOPATH).toBe("/go");
+    expect(env.MY_FLAG).toBe("on");
+    expect(env.CODEOID_API_KEY).toBeUndefined();
+    expect(env.RANDOM_SECRET).toBeUndefined();
+  });
+
+  test("output between the excerpt sizes loses no character at the seam", async () => {
+    const out = await run(spec("printf '%4095s' '' | tr ' ' a; printf 'é'; printf '%2000s' '' | tr ' ' b"));
+    expect(out.stdoutExcerpt).toContain("aé");
   });
 });

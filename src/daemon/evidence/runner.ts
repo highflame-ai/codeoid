@@ -71,6 +71,39 @@ function environmentOf(spec: CheckSpec): EvidenceEnvironment {
   };
 }
 
+/**
+ * The environment a check runs with: the agent subprocess basics plus the
+ * toolchain variables builds and test runners commonly need, and anything the
+ * operator lists in CODEOID_CHECK_ENV_ALLOW (comma-separated). Never the
+ * daemon's own credentials (CODEOID_ / ZEROID_ / TELEGRAM_ stay denied).
+ */
+const CHECK_ENV_EXACT = [
+  "CI",
+  "NODE_ENV",
+  "TERM",
+  "GOPATH",
+  "GOFLAGS",
+  "GOPRIVATE",
+  "GOPROXY",
+  "GOCACHE",
+  "GOMODCACHE",
+  "CARGO_HOME",
+  "RUSTUP_HOME",
+  "JAVA_HOME",
+  "VIRTUAL_ENV",
+  "CONDA_PREFIX",
+  "PYTHONPATH",
+  "DOCKER_HOST",
+];
+
+export function checkEnv(base: Record<string, string | undefined> = process.env): Record<string, string> {
+  const extra = (base.CODEOID_CHECK_ENV_ALLOW ?? "")
+    .split(",")
+    .map((n) => n.trim())
+    .filter((n) => n.length > 0 && !/^(CODEOID_|ZEROID_|TELEGRAM_)/.test(n));
+  return buildSubprocessEnv({ exact: [...CHECK_ENV_EXACT, ...extra], prefixes: ["LC_", "XDG_"] }, base);
+}
+
 /** Bytes [start, end) of `buf` adjusted inward to whole UTF-8 characters, so a
  *  cut never leaves a replacement character at either edge. */
 function utf8Whole(buf: Buffer): Buffer {
@@ -103,11 +136,18 @@ class CapturedStream {
   #headBytes = 0;
   #tail: Buffer[] = [];
   #tailBytes = 0;
+  /** The artifact file failed (disk full, too many open files): stop writing
+   *  it, keep building excerpts. An unhandled stream error would take the
+   *  whole daemon down. */
+  #writeFailed = false;
 
   constructor(name: "stdout" | "stderr", dir: string, max: number, scan: ZeroTestScan) {
     this.#name = name;
     this.#path = join(dir, `${name}.log`);
     this.#file = createWriteStream(this.#path, { mode: 0o600 });
+    this.#file.on("error", () => {
+      this.#writeFailed = true;
+    });
     this.#max = max;
     this.#lines = new LineSplitter((l) => scan.line(l));
   }
@@ -115,7 +155,7 @@ class CapturedStream {
   push(chunk: Buffer): void {
     this.#bytes += chunk.length;
     this.#lines.push(chunk.toString("utf8"));
-    if (this.#written < this.#max) {
+    if (!this.#writeFailed && this.#written < this.#max) {
       const room = this.#max - this.#written;
       const part = chunk.length <= room ? chunk : chunk.subarray(0, room);
       this.#file.write(part);
@@ -140,28 +180,45 @@ class CapturedStream {
   /** The excerpt, redacted: the head, then — if output was longer — a marker
    *  and the tail. */
   excerpt(): string {
-    const head = utf8Whole(Buffer.concat(this.#head)).toString("utf8");
-    if (this.#tailBytes === 0) return redactOutput(head);
     let tail = Buffer.concat(this.#tail);
     let skipped = this.#bytes - this.#headBytes - tail.length;
     if (tail.length > EXCERPT_TAIL_BYTES) {
       skipped += tail.length - EXCERPT_TAIL_BYTES;
       tail = tail.subarray(tail.length - EXCERPT_TAIL_BYTES);
     }
-    const marker = skipped > 0 ? `\n… [${skipped} bytes omitted — full output in the ${this.#name} artifact] …\n` : "";
-    return redactOutput(head + marker + utf8Whole(tail).toString("utf8"));
+    const headBuf = Buffer.concat(this.#head);
+    // Nothing omitted: one contiguous text, decoded as one so no character is
+    // lost at the head/tail seam.
+    if (skipped <= 0) return redactOutput(Buffer.concat([headBuf, tail]).toString("utf8"));
+    // Cut at line boundaries, so redaction never sees half a token at an edge.
+    let head = utf8Whole(headBuf).toString("utf8");
+    const headCut = head.lastIndexOf("\n");
+    if (headCut > 0) head = head.slice(0, headCut + 1);
+    let rest = utf8Whole(tail).toString("utf8");
+    const tailCut = rest.indexOf("\n");
+    if (tailCut >= 0 && tailCut < rest.length - 1) rest = rest.slice(tailCut + 1);
+    const marker = `\n… [${skipped} bytes or more omitted — full output in the ${this.#name} artifact] …\n`;
+    return redactOutput(head + marker + rest);
   }
 
-  /** Flush the artifact file and describe it. */
+  /** Flush the artifact file and describe it. Resolves even when the file
+   *  failed; the artifact then says it is truncated. */
   async close(): Promise<EvidenceArtifact> {
     this.#lines.end();
-    await new Promise<void>((res) => this.#file.end(res));
+    if (!this.#writeFailed) {
+      await new Promise<void>((res) => {
+        this.#file.once("error", () => res());
+        this.#file.end(() => res());
+      });
+    } else {
+      this.#file.destroy();
+    }
     return {
       name: this.#name,
       path: this.#path,
       sha256: this.#hash.digest("hex"),
       bytes: this.#written,
-      truncated: this.#bytes > this.#written,
+      truncated: this.#writeFailed || this.#bytes > this.#written,
     };
   }
 }
@@ -222,7 +279,7 @@ export async function runCheck(spec: CheckSpec, opts: RunCheckOptions): Promise<
 
   const child = spawn("sh", ["-c", spec.command], {
     cwd: opts.cwd,
-    env: { ...buildSubprocessEnv({}), ...(spec.env ?? {}) },
+    env: { ...checkEnv(), ...(spec.env ?? {}) },
     stdio: ["ignore", "pipe", "pipe"],
     // Its own process group, so killGroup reaches everything it spawns.
     detached: true,

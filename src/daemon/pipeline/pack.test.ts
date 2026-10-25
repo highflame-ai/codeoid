@@ -403,6 +403,28 @@ phases:
     rmSync(root, { recursive: true, force: true });
   });
 
+  test("a gate check stopped by an abort is dropped, never recorded as a failure", async () => {
+    const db = new Database(":memory:");
+    const root = mkdtempSync(join(tmpdir(), "pack-evidence-"));
+    const evidence = new EvidenceService(new EvidenceStore(db), root);
+    const mgr = new PipelineManager(new PipelineStore(db), { evidence });
+    mgr.installPack(loadPack(noopPack('  - id: slow\n    kind: command\n    run: "sleep 30"', "slow"), { trusted: true }));
+    const p = mgr.create({ name: "run", pack: "noop-pack", ...tenant });
+    const advancing = mgr.advance(p.id);
+    await Bun.sleep(300);
+    evidence.abortOwner("pipeline", p.id);
+    const after = await advancing;
+    // Not halted, not failed, not retried: the step was dropped, so the run
+    // stays at its last saved state and re-runs the gate when resumed.
+    expect(["draft", "running"]).toContain(after.status);
+    const stored = mgr.get(p.id)!;
+    expect(["draft", "running"]).toContain(stored.status);
+    expect(stored.phases[0].state.status).not.toBe("halted");
+    expect(stored.phases[0].state.status).not.toBe("failed");
+    expect(stored.phases[0].feedback ?? []).toEqual([]);
+    rmSync(root, { recursive: true, force: true });
+  });
+
   test("an UNTRUSTED command gate never executes — fails closed (registry default)", async () => {
     const mgr = new PipelineManager(new PipelineStore(new Database(":memory:")));
     // No { trusted } → default false. Even a "true" command must not run.

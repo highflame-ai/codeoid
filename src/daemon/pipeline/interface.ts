@@ -219,6 +219,10 @@ export interface GateVerdict {
   questions?: string[];
   /** Evidence the gate recorded for this verdict, in the order it ran. */
   evidenceIds?: string[];
+  /** The gate's check was stopped (pipeline abort, daemon shutdown) before it
+   *  reached a verdict. Not a failure: the step is dropped, unsaved, so the
+   *  gate runs again when the pipeline resumes. */
+  cancelled?: boolean;
 }
 
 /** A gate: a pass/fail predicate positioned at phase entry (grounding) or exit

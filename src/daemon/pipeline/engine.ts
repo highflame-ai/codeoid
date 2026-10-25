@@ -57,6 +57,13 @@ const MAX_STEPS = 10_000;
 const clone = <T>(x: T): T => structuredClone(x);
 const now = (): number => Date.now();
 
+/** A gate's check was stopped before its verdict — the step is dropped. */
+export class GateCancelled extends Error {
+  constructor(readonly gateId: string) {
+    super(`gate "${gateId}" was cancelled before it reached a verdict`);
+  }
+}
+
 /** Evidence kept per phase in the run state; older ids stay in the store. */
 const PHASE_EVIDENCE_MAX = 50;
 
@@ -275,7 +282,15 @@ export class PipelineEngine {
     let s = state;
     let guard = 0;
     while ((s.status === "draft" || s.status === "running") && guard++ < MAX_STEPS) {
-      s = await this.step(s);
+      try {
+        s = await this.step(s);
+      } catch (err) {
+        // A gate's check was stopped (abort, shutdown): drop the step unsaved
+        // and stop driving. The last persisted state re-runs the gate when the
+        // pipeline resumes; it is never recorded as a failed check.
+        if (err instanceof GateCancelled) return s;
+        throw err;
+      }
       if (onProgress) await onProgress(s);
     }
     // Guard tripped (a mis-authored retry loop) — fail terminally rather than
@@ -466,19 +481,21 @@ export class PipelineEngine {
       ownerKind: "pipeline",
       ownerId: pipeline.id,
     });
+    let verdict: GateVerdict;
     try {
-      const verdict = await g.evaluate({ pipeline: clone(pipeline), phase, ...(runCheck ? { runCheck } : {}) });
-      // Every gate runs for the active phase, so its evidence belongs there.
-      const active = pipeline.phases[pipeline.cursor];
-      if (active && verdict.evidenceIds?.length) {
-        active.evidence = [...(active.evidence ?? []), ...verdict.evidenceIds].slice(-PHASE_EVIDENCE_MAX);
-      }
-      return verdict;
+      verdict = await g.evaluate({ pipeline: clone(pipeline), phase, ...(runCheck ? { runCheck } : {}) });
     } catch (err) {
       // A throwing gate is a failing verdict, not a crash — same reasoning as
       // the phase kind above: never leave the pipeline stuck mid-advance.
       return { pass: false, reason: `${at} gate "${id}" threw: ${errMessage(err)}` };
     }
+    if (verdict.cancelled) throw new GateCancelled(id);
+    // Every gate runs for the active phase, so its evidence belongs there.
+    const active = pipeline.phases[pipeline.cursor];
+    if (active && verdict.evidenceIds?.length) {
+      active.evidence = [...(active.evidence ?? []), ...verdict.evidenceIds].slice(-PHASE_EVIDENCE_MAX);
+    }
+    return verdict;
   }
 }
 

@@ -500,6 +500,7 @@ function buildGate(g: PackManifest["gates"][number], dir: string, trusted: boole
           cwd,
         );
         const evidenceIds = record ? [record.id] : [];
+        if (outcome.result === "cancelled") return { pass: false, cancelled: true, reason: "check cancelled", evidenceIds };
         if (outcome.result === "pass") return { pass: true, evidenceIds };
         const tail = diagnosticTail(outcome);
         return {

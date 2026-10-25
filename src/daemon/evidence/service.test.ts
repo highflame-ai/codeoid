@@ -76,6 +76,28 @@ describe("EvidenceService", () => {
     expect((await other).record?.result).toBe("pass");
   });
 
+  test("an aborted owner's next check is cancelled before it starts", async () => {
+    const svc = new EvidenceService(new EvidenceStore(":memory:"), join(dir, "evidence"));
+    svc.abortOwner("pipeline", "pipe-1");
+    const marker = join(dir, "ran");
+    const { record } = await svc.run({ id: "c", command: `touch ${marker}`, timeoutMs: 5_000 }, dir, ctx);
+    expect(record?.result).toBe("cancelled");
+    expect(existsSync(marker)).toBe(false);
+    svc.clearAbort("pipeline", "pipe-1");
+    expect((await svc.run({ id: "c", command: "true", timeoutMs: 5_000 }, dir, ctx)).record?.result).toBe("pass");
+  });
+
+  test("retention never sweeps the directory of a check still running", async () => {
+    const root = join(dir, "evidence");
+    const svc = new EvidenceService(new EvidenceStore(":memory:"), root);
+    const running = svc.run({ id: "c", command: "sleep 0.5", timeoutMs: 5_000 }, dir, ctx);
+    await Bun.sleep(100);
+    // Age every directory past the orphan threshold, then sweep.
+    svc.sweep({ maxAgeMs: 1e12, maxTotalBytes: 1e12 }, Date.now() + 2 * 60 * 60 * 1000);
+    const { record } = await running;
+    expect(existsSync(record!.artifacts[0]!.path)).toBe(true);
+  });
+
   test("retention drops old records, then the oldest past the size cap, with their files", async () => {
     const svc = new EvidenceService(new EvidenceStore(":memory:"), join(dir, "evidence"));
     const a = (await svc.run({ id: "a", command: "head -c 3000 /dev/zero", timeoutMs: 5_000 }, dir, ctx)).record!;

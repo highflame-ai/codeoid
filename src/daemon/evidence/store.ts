@@ -10,7 +10,6 @@
 
 import { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
-import { dirname } from "node:path";
 import { BUSY_TIMEOUT_MS } from "../store.js";
 import type {
   EvidenceArtifact,
@@ -93,8 +92,10 @@ export class EvidenceStore {
     `);
   }
 
-  /** Persist a record and return it with its id. */
-  insert(record: Omit<EvidenceRecord, "id">): EvidenceRecord {
+  /** Persist a record and return it with its id. `artifactDir` is the
+   *  record's directory relative to the artifact root, so moving or
+   *  re-pathing the data directory never orphans it. */
+  insert(artifactDir: string, record: Omit<EvidenceRecord, "id">): EvidenceRecord {
     const id = `ev_${randomUUID()}`;
     this.#db
       .prepare(
@@ -127,7 +128,7 @@ export class EvidenceStore {
         record.stdoutExcerpt,
         record.stderrExcerpt,
         JSON.stringify(record.artifacts),
-        record.artifacts[0] ? dirname(record.artifacts[0].path) : null,
+        artifactDir,
         record.artifacts.reduce((n, a) => n + a.bytes, 0),
       );
     return { ...record, id };

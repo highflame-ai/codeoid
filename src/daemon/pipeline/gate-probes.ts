@@ -219,9 +219,16 @@ export function buildProbeGate(
       if (spec.type === "git-diff-nonempty") {
         const { outcome, evidenceId } = await runProbe(ctx, id, "git-diff", "test -n \"$(git status --porcelain)\"", workdir);
         const evidenceIds = evidenceId ? [evidenceId] : [];
-        return outcome.result === "pass"
-          ? { pass: true, evidenceIds }
-          : { pass: false, reason: `probe "${id}": the working tree has no changes`, evidenceIds };
+        if (outcome.result === "cancelled") return { pass: false, cancelled: true, reason: "check cancelled", evidenceIds };
+        if (outcome.result === "pass") return { pass: true, evidenceIds };
+        return {
+          pass: false,
+          reason:
+            outcome.result === "fail"
+              ? `probe "${id}": the working tree has no changes`
+              : `probe "${id}": could not inspect the working tree — ${outcome.reason}`,
+          evidenceIds,
+        };
       }
 
       // ── Execution probes (trust-gated) ────────────────────────────────────
@@ -243,6 +250,7 @@ export function buildProbeGate(
       for (const { label, cmd } of cmds) {
         const { outcome, evidenceId } = await runProbe(ctx, id, label, cmd, workdir);
         if (evidenceId) evidenceIds.push(evidenceId);
+        if (outcome.result === "cancelled") return { pass: false, cancelled: true, reason: "check cancelled", evidenceIds };
         if (outcome.result !== "pass") {
           const tail = diagnosticTail(outcome);
           return {
