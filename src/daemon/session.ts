@@ -905,6 +905,9 @@ export class Session {
    *  enough in the prompt; live memory is via the recall/timeline tools. */
   #frozenMemoryIndex: string | null = null;
   #workspaceId: string;
+  /** Owner recorded for #workspaceId in the memory store (#415). */
+  #workspaceTenant!: { accountId: string; projectId: string };
+  #workspaceRegistered = false;
 
   #config?: CodeoidConfig;
 
@@ -1277,6 +1280,10 @@ export class Session {
     // Tenant-scoped (auth carries account_id/project_id) so two accounts in
     // the same directory never share memory.
     this.#workspaceId = workspaceIdFromPath(opts.workdir, opts.auth);
+    // Record the owner before the first episode is written, so the tenant's
+    // cross-workspace search can reach this workspace and no other tenant's can.
+    this.#workspaceTenant = { accountId: opts.auth.accountId, projectId: opts.auth.projectId };
+    this.#registerWorkspace();
     // Rotation counters — populated from Store so they survive restart.
     const stats = this.#store.getRotationStats(this.id);
     this.#rotationCount = stats.count;
@@ -1369,6 +1376,9 @@ export class Session {
         },
         (episode) => {
           try {
+            // Retry a registration that failed at construction; until it
+            // succeeds the workspace is invisible to cross-workspace search.
+            if (!this.#workspaceRegistered) this.#registerWorkspace();
             memory.ingest(episode);
             scheduler.onEpisode();
           } catch (err) {
@@ -1871,6 +1881,20 @@ export class Session {
   get providerId(): string { return this.#provider.id; }
   /** Tenant-scoped memory workspace id (for fleet views / cross-session search). */
   get workspaceId(): string { return this.#workspaceId; }
+
+  /** Record this session's tenant as the owner of its memory workspace. A
+   *  failure is logged and retried before the next episode is written. */
+  #registerWorkspace(): void {
+    if (!this.#memory) return;
+    try {
+      this.#memory.registerWorkspace(this.#workspaceId, this.#workspaceTenant);
+      this.#workspaceRegistered = true;
+    } catch (err) {
+      console.error(
+        `[codeoid/session ${this.id.slice(0, 8)}] memory: workspace registration failed — cross-workspace search will not find this session until it succeeds: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
   /**
    * Final text of the most recent assistant turn (null before any turn).
    * Bounded consumer beware: this is the FULL turn text — digest builders

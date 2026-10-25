@@ -87,8 +87,12 @@ function fleet(): FleetSessionView[] {
   ];
 }
 
+const TENANT = { accountId: "acct-owner", projectId: "proj-1" };
+const OTHER_TENANT = { accountId: "acct-other", projectId: "proj-1" };
+
 function makeDeps(overrides?: Partial<FleetDeps>): FleetDeps {
   return {
+    tenant: TENANT,
     listSessions: () => fleet(),
     memory,
     audit: (action, detail) => audits.push({ action, detail }),
@@ -103,6 +107,7 @@ beforeEach(async () => {
   memory = new MemoryEngine({ store: episodeStore, embedder: new StubEmbedder() });
   await memory.init();
   audits = [];
+  for (const ws of ["ws-authz", "ws-admin", "ws-conductor"]) memory.registerWorkspace(ws, TENANT);
   // Distinct episodes per session so find/recall/summary have signal.
   memory.ingest({
     workspaceId: "ws-authz",
@@ -226,6 +231,38 @@ describe("fleet handlers — read surface", () => {
     });
     expect(out).toContain("migration-work");
     expect(audits.some((a) => a.action === "fleet.recall")).toBe(true);
+  });
+
+  // #415: the memory store spans every tenant on the daemon. A destroyed
+  // session's episodes have no live session to check ownership against, so the
+  // tenant filter must come from the store itself.
+  test("fleet_recall and fleet_find never return another tenant's memory", async () => {
+    memory.registerWorkspace("ws-other", OTHER_TENANT);
+    memory.ingest({
+      workspaceId: "ws-other",
+      sessionId: "sess-other-gone",
+      kind: "user_turn",
+      summary: "rotate the quota migration credentials for the other tenant",
+      content: "other tenant migration quota columns and production credentials",
+      filePaths: [],
+      tokenEstimate: 20,
+      createdAt: Date.now(),
+      createdBy: "user:other",
+    });
+    await memory.drain();
+    const handlers = createFleetHandlers(makeDeps());
+    const recalled = await handlers.fleet_recall({ query: "quota migration credentials", limit: 20 });
+    expect(recalled).not.toContain("other tenant");
+    expect(recalled).not.toContain("sess-oth");
+    const found = await handlers.fleet_find({ query: "quota migration credentials", limit: 20 });
+    expect(found).not.toContain("sess-oth");
+    expect(found).not.toContain("other tenant");
+
+    // The other tenant's conductor does see it — the filter is by owner, not a blanket drop.
+    const theirs = await createFleetHandlers(
+      makeDeps({ tenant: OTHER_TENANT, listSessions: () => [] }),
+    ).fleet_recall({ query: "quota migration credentials" });
+    expect(theirs).toContain("other tenant");
   });
 
   test("machine_map lists workspaces with git state (non-repo dirs → 'not a git repo')", async () => {

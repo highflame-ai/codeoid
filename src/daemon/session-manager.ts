@@ -6455,6 +6455,7 @@ mcpHub: this.#mcpHub,
    *  test can compare them against the orchestrator's scoped ones. */
   #conductorFleetDeps(accountId: string, projectId: string): FleetDeps {
     return {
+      tenant: { accountId, projectId },
       listSessions: (): FleetSessionView[] => {
         const views: FleetSessionView[] = [];
         for (const s of this.#sessions.values()) {
@@ -6678,6 +6679,7 @@ mcpHub: this.#mcpHub,
     const createdBy = () => orchestratorCreatedBy(goalId());
 
     return {
+        tenant: { accountId, projectId },
         listSessions: (): FleetSessionView[] =>
           children().map((s) => ({
             id: s.id,
@@ -7474,7 +7476,8 @@ mcpHub: this.#mcpHub,
    * able to see sessions to search their content).
    *
    * Resolution of workspace scope:
-   *   - `scope: "all"` → search across every workspace the memory store has
+   *   - `scope: "all"` → search across every workspace the caller's tenant
+   *     owns (never other tenants' memory, #415)
    *   - `scope: "workspace"` (default) + `workdir` explicit → anchor there
    *   - `scope: "workspace"` + no workdir → use the caller's most recent
    *     session if any, else empty-string (engine handles gracefully)
@@ -7537,7 +7540,12 @@ mcpHub: this.#mcpHub,
       // resolved (no msg.workdir and no caller focus). The protocol says that
       // case "falls back to cross-workspace", so omit the key instead of
       // passing "" — which matched nothing and silently returned zero hits.
-      ...(scope === "all" || !workspaceId ? {} : { workspaceId }),
+      //
+      // Cross-workspace means every workspace the CALLER's tenant owns — never
+      // the whole store, which can hold other tenants' memory (#415).
+      ...(scope === "all" || !workspaceId
+        ? { tenant: { accountId: auth.accountId, projectId: auth.projectId } }
+        : { workspaceId }),
       limit,
       sessionNames,
     });
