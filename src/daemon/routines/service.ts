@@ -23,6 +23,12 @@
  *   6. Record cost, tokens, summary; apply the failure auto-pause; notify per
  *      the routine's policy; prune old run sessions.
  *
+ * A loop routine replaces steps 3–5: after the gate it starts a loop run as
+ * its owner (LoopService.startRun, through `RoutineHost.loops`) and follows
+ * it. The routine run stays `running` without holding a run slot — the loop
+ * has its own bounds — and ends with the loop's outcome, picked up on every
+ * tick and when the loop ends.
+ *
  * The service talks to sessions only through `RoutineHost`, so it is testable
  * without a SessionManager and holds no session objects itself.
  */
@@ -32,6 +38,8 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { AuthContext } from "../../protocol/types.js";
 import { buildSubprocessEnv } from "../providers/env.js";
 import { BUDGET_STOP_MESSAGE } from "../providers/interface.js";
+import { LoopError, resolveLoopBudget, resolveLoopChecks, type LoopStartInput } from "../loops/service.js";
+import { isTerminalLoopStatus, LOOP_LIMITS, type LoopLimits, type LoopStatus } from "../loops/types.js";
 import {
   jitterMs as jitterFor,
   nextFireAfter,
@@ -43,6 +51,7 @@ import {
 } from "./schedule.js";
 import { hashToken, type RoutineStore } from "./store.js";
 import {
+  ACTIVE_RUN_STATUSES,
   FAILURE_RUN_STATUSES,
   type RoutineRow,
   type RoutineSpec,
@@ -187,6 +196,57 @@ export interface RoutineHost {
   providerIds(): string[];
   /** Expand `~`, resolve, and confirm the directory exists; null when unusable. */
   normalizeWorkdir(path: string): string | null;
+  /** Loops, for routines that start one; absent when the daemon has none. */
+  loops?: RoutineLoopPort;
+}
+
+/** A loop run as the routine run following it sees it. */
+export interface RoutineLoopState {
+  status: LoopStatus;
+  reason: string | null;
+  /** Attempts made; none means the run stopped at its baseline. */
+  attempts: number;
+  costUsd: number;
+  branch: string | null;
+  deliveredCommit: string | null;
+}
+
+/** Loops as routines reach them (SessionManager wires this to LoopService). */
+export interface RoutineLoopPort {
+  /** Why a loop worker can't run on this backend (undefined = the daemon's default), or null. */
+  providerProblem(provider: string | undefined): string | null;
+  /** Start a run as `owner`; its id. Throws LoopError — `conflict` for the owner's cap on runs in progress. */
+  start(input: LoopStartInput, owner: RoutineOwner): string;
+  /** The run, as its owner sees it; null when it is gone. */
+  state(loopRunId: string, owner: RoutineOwner): RoutineLoopState | null;
+  cancel(loopRunId: string, owner: RoutineOwner): Promise<void>;
+}
+
+/**
+ * What a routine run records when the loop it follows ends. Only a verified
+ * loop is a success; a loop whose checks already passed found nothing to do.
+ */
+export function routineOutcomeOfLoop(s: RoutineLoopState): { status: RunStatus; reason?: string; summary?: string } {
+  const why = s.reason ?? s.status;
+  switch (s.status) {
+    case "completed":
+      return {
+        status: "succeeded",
+        summary: `Verified: every check passed. ${s.deliveredCommit ? `Commit ${s.deliveredCommit.slice(0, 12)}` : "The result"} is on ${s.branch ?? "the run's branch"} — nothing was pushed. (${why})`,
+      };
+    case "blocked":
+      // A loop stops blocked before any attempt only when its checks already
+      // pass on the unmodified code: nothing to repair.
+      return s.attempts === 0
+        ? { status: "silent", reason: `the loop found nothing to repair: ${why}` }
+        : { status: "needs_attention", reason: `the loop run is blocked: ${why}` };
+    case "budget_exhausted":
+      return { status: "failed", reason: `the loop run ran out of budget: ${why}` };
+    case "cancelled":
+      return { status: "cancelled", reason: `the loop run was cancelled: ${why}` };
+    default:
+      return { status: "failed", reason: `the loop run failed: ${why}` };
+  }
 }
 
 // ── Errors ───────────────────────────────────────────────────────────────────
@@ -208,6 +268,10 @@ export interface RoutineOwner {
   name?: string;
   accountId: string;
   projectId: string;
+}
+
+function ownerOf(r: RoutineRow): RoutineOwner {
+  return { sub: r.ownerSub, accountId: r.accountId, projectId: r.projectId };
 }
 
 function clip(text: string, max: number): string {
@@ -365,12 +429,20 @@ function checkEnv(): Record<string, string> {
 /** A schedule as it arrives: a cron may leave its timezone to the daemon. */
 export type RoutineScheduleInput = RoutineSchedule | { kind: "cron"; expr: string; timezone?: string };
 
+/** A loop routine's contract as it arrives: `checks` required on create; on an update, what is left out is kept. */
+export interface RoutineLoopInput {
+  checks?: LoopStartInput["checks"];
+  toolBudget?: number;
+  limits?: Partial<LoopLimits>;
+}
+
 /** A spec as it arrives over the wire: name/prompt/workdir required, everything else defaulted. */
-export type RoutineSpecInput = Omit<Partial<RoutineSpec>, "check" | "schedule"> &
+export type RoutineSpecInput = Omit<Partial<RoutineSpec>, "check" | "schedule" | "loop"> &
   Pick<RoutineSpec, "name" | "prompt" | "workdir"> & {
     /** `timeoutSeconds` defaults to 60. */
     check?: { command: string; timeoutSeconds?: number };
     schedule?: RoutineScheduleInput;
+    loop?: RoutineLoopInput;
   };
 
 /**
@@ -396,6 +468,7 @@ function withZone(s: RoutineScheduleInput): RoutineSchedule {
 }
 
 const NAME_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+const PLACEHOLDER_RE = /\{\{\s*(check|payload|last_summary|trigger|now|routine)\s*\}\}/;
 
 /** Statuses that are a run's real outcome — they move "last run" and the failure streak. */
 const OUTCOME_RUN_STATUSES: readonly RunStatus[] = ["succeeded", "silent", "needs_attention", "failed", "timed_out", "over_budget"];
@@ -483,7 +556,7 @@ export class RoutineService {
     }
   }
 
-  /** One scheduler pass: claim due fires, then start queued runs into free slots. */
+  /** One scheduler pass: claim due fires, settle runs whose loop ended, then start queued runs into free slots. */
   async tick(): Promise<void> {
     if (this.#ticking || this.#stopped) return;
     this.#ticking = true;
@@ -497,6 +570,7 @@ export class RoutineService {
           console.error(`[codeoid/routines] routine ${r.id} could not fire: ${err instanceof Error ? err.message : String(err)}`);
         }
       }
+      this.#followLoops();
       this.#drainQueue();
     } catch (err) {
       console.error(`[codeoid/routines] tick failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -546,6 +620,11 @@ export class RoutineService {
    */
   #admit(r: RoutineRow, trigger: RunTrigger, opts: { scheduledFor: number | null; payload: string | null }): RunRow {
     const active = this.#store.activeRuns(r.id);
+    // A loop routine's last loop run still in progress: one at a time, never queued.
+    const following = active.find((a) => a.loopRunId !== null);
+    if (following) {
+      return this.#recordSkip(r, trigger, opts.scheduledFor, `the loop run its last fire started (${following.loopRunId}) is still in progress`, opts.payload);
+    }
     if (active.length > 0) {
       // A run already started still reads "queued" until its session exists;
       // only one that hasn't started is waiting behind.
@@ -579,6 +658,8 @@ export class RoutineService {
       reason: null,
       checkOutput: null,
       payload: opts.payload,
+      loopRunId: null,
+      loopStatus: null,
     };
     this.#store.insertRun(run);
     this.#host.audit(`routine:${r.id}`, "routine.run.queued", undefined, `run=${run.id} trigger=${trigger}`);
@@ -607,6 +688,8 @@ export class RoutineService {
       reason,
       checkOutput: null,
       payload,
+      loopRunId: null,
+      loopStatus: null,
     };
     this.#store.insertRun(run);
     this.#host.audit(`routine:${r.id}`, "routine.run.skipped", undefined, `run=${run.id} trigger=${trigger} reason=${reason}`);
@@ -663,43 +746,52 @@ export class RoutineService {
 
   // ── Execution ──────────────────────────────────────────────────────────────
 
+  /**
+   * End a run: record its outcome, apply the failure auto-pause, tell hooks
+   * (and, per policy, the owner), and trim history. `sessionId` is the run's
+   * session, if it had one, to step down from autonomous.
+   */
+  #finishRun(routine: RoutineRow, run: RunRow, sessionId: string | null, status: RunStatus, extra: Partial<RunRow>): RunRow {
+    const spec = routine.spec;
+    const subject = `routine:${routine.id}`;
+    // Autonomy is the run's, not the session's: from the moment the run ends
+    // — or parks on the owner — a kept or persistent session must not
+    // auto-approve for whoever prompts it next. First, so no later failure
+    // can skip it.
+    if (sessionId) {
+      try {
+        this.#host.disarm(sessionId);
+      } catch {}
+    }
+    const endedAt = this.#now();
+    this.#store.setRunStatus(run.id, status, { ...extra, endedAt });
+    const failed = FAILURE_RUN_STATUSES.includes(status);
+    // A run that never got to do its work (skipped, cancelled, interrupted)
+    // is not an outcome: it neither breaks a failure streak nor moves
+    // "last run".
+    const streak = OUTCOME_RUN_STATUSES.includes(status)
+      ? this.#store.recordOutcome(routine.id, { at: endedAt, failed })
+      : routine.consecutiveFailures;
+    let paused = false;
+    if (failed && spec.failurePauseAfter > 0 && streak >= spec.failurePauseAfter) {
+      this.#store.setPaused(routine.id, `paused after ${streak} consecutive failed runs`, endedAt);
+      paused = true;
+      this.#host.audit(subject, "routine.paused", undefined, `failures=${streak}`);
+    }
+    const final = this.#store.getRun(run.id) ?? { ...run, ...extra, status, endedAt };
+    this.#host.audit(subject, "routine.run.finished", final.sessionId ?? undefined, `run=${run.id} status=${status} cost=${final.costUsd.toFixed(4)}`);
+    // A routine deleted mid-run has nobody left to tell.
+    const current = this.#store.getRoutine(routine.id);
+    if (current) this.#host.runFinished({ routine: current, run: final, paused, push: this.#shouldNotify(spec.notify, status, paused) });
+    this.#store.trimRuns(routine.id, LIMITS.RUN_HISTORY, utcDayStart(endedAt));
+    return final;
+  }
+
   async #execute(routine: RoutineRow, run: RunRow, live: LiveRun): Promise<void> {
     const spec = routine.spec;
     const startedAt = this.#now();
     const subject = `routine:${routine.id}`;
-    const finish = (status: RunStatus, extra: Partial<RunRow>): RunRow => {
-      // Autonomy is the run's, not the session's: from the moment the run ends
-      // — or parks on the owner — a kept or persistent session must not
-      // auto-approve for whoever prompts it next. First, so no later failure
-      // can skip it.
-      if (live.sessionId) {
-        try {
-          this.#host.disarm(live.sessionId);
-        } catch {}
-      }
-      const endedAt = this.#now();
-      this.#store.setRunStatus(run.id, status, { ...extra, endedAt });
-      const failed = FAILURE_RUN_STATUSES.includes(status);
-      // A run that never got to do its work (skipped, cancelled, interrupted)
-      // is not an outcome: it neither breaks a failure streak nor moves
-      // "last run".
-      const streak = OUTCOME_RUN_STATUSES.includes(status)
-        ? this.#store.recordOutcome(routine.id, { at: endedAt, failed })
-        : routine.consecutiveFailures;
-      let paused = false;
-      if (failed && spec.failurePauseAfter > 0 && streak >= spec.failurePauseAfter) {
-        this.#store.setPaused(routine.id, `paused after ${streak} consecutive failed runs`, endedAt);
-        paused = true;
-        this.#host.audit(subject, "routine.paused", undefined, `failures=${streak}`);
-      }
-      const final = this.#store.getRun(run.id) ?? { ...run, ...extra, status, endedAt };
-      this.#host.audit(subject, "routine.run.finished", final.sessionId ?? undefined, `run=${run.id} status=${status} cost=${final.costUsd.toFixed(4)}`);
-      // A routine deleted mid-run has nobody left to tell.
-      const current = this.#store.getRoutine(routine.id);
-      if (current) this.#host.runFinished({ routine: current, run: final, paused, push: this.#shouldNotify(spec.notify, status, paused) });
-      this.#store.trimRuns(routine.id, LIMITS.RUN_HISTORY, utcDayStart(endedAt));
-      return final;
-    };
+    const finish = (status: RunStatus, extra: Partial<RunRow>): RunRow => this.#finishRun(routine, run, live.sessionId, status, extra);
     /** A cancel and a daemon stop both end the run; only one is the owner's doing. */
     const stopped = (extra: Partial<RunRow> = {}): RunRow =>
       finish(live.interrupted ? "interrupted" : "cancelled", { reason: live.cancelled, ...extra });
@@ -756,6 +848,12 @@ export class RoutineService {
           return;
         }
         checkOutput = res.stdout.trimEnd();
+      }
+
+      // A loop routine hands the work to a loop run and follows it from here.
+      if (spec.loop) {
+        this.#startLoopRun(routine, run, workdir, checkOutput, startedAt, finish);
+        return;
       }
 
       // 2. The session.
@@ -928,6 +1026,106 @@ export class RoutineService {
     }
   }
 
+  // ── Loop routines ────────────────────────────────────────────────────────
+
+  /**
+   * After the gate: start the routine's loop run as its owner. What the gate
+   * found and any payload ride on the run's trigger, which reaches the worker
+   * only as data; the objective is the owner's prompt as saved. The owner's
+   * cap on loop runs in progress is a reason to stand down (skipped), not a
+   * failure.
+   */
+  #startLoopRun(
+    routine: RoutineRow,
+    run: RunRow,
+    workdir: string,
+    checkOutput: string | null,
+    startedAt: number,
+    finish: (status: RunStatus, extra: Partial<RunRow>) => RunRow,
+  ): void {
+    const spec = routine.spec;
+    const loop = spec.loop as NonNullable<RoutineSpec["loop"]>;
+    const port = this.#host.loops;
+    const kept = { checkOutput: checkOutput && clip(checkOutput, 4_000) };
+    if (!port) {
+      finish("failed", { reason: "loops are not available on this daemon", ...kept });
+      return;
+    }
+    const owner = ownerOf(routine);
+    const summary = [
+      checkOutput !== null ? `The routine's check found:\n${checkOutput}` : null,
+      run.payload !== null ? `Sent with the ${run.trigger} fire:\n${run.payload}` : null,
+    ]
+      .filter((x) => x !== null)
+      .join("\n\n");
+    let loopRunId: string;
+    try {
+      loopRunId = port.start(
+        {
+          objective: spec.prompt,
+          workdir,
+          checks: loop.checks,
+          ...(spec.provider !== undefined ? { provider: spec.provider } : {}),
+          ...(spec.model !== undefined ? { model: spec.model } : {}),
+          toolBudget: loop.toolBudget,
+          limits: loop.limits,
+          trigger: { kind: "routine", key: `routine:${routine.id}:${run.id}`, routineId: routine.id, routineName: spec.name, routineRunId: run.id, summary },
+        },
+        owner,
+      );
+    } catch (err) {
+      const why = err instanceof Error ? err.message : String(err);
+      if (err instanceof LoopError && err.code === "conflict") finish("skipped", { reason: `no loop run was started: ${why}`, ...kept });
+      else finish("failed", { reason: `could not start the loop run: ${why}`, ...kept });
+      return;
+    }
+    this.#host.audit(`routine:${routine.id}`, "routine.run.started", undefined, `run=${run.id} loop=${loopRunId}`);
+    this.#store.setRunStatus(run.id, "running", {
+      startedAt: run.startedAt ?? startedAt,
+      loopRunId,
+      loopStatus: port.state(loopRunId, owner)?.status ?? "running",
+      ...kept,
+    });
+    // The state is the authority, even for a run that ended at once.
+    this.#followLoops(loopRunId);
+  }
+
+  /**
+   * Bring the runs that follow a loop up to date: one whose loop ended ends
+   * with its outcome; the others note the loop's status and spend. Runs on
+   * every tick and when a loop ends, so a restart or a missed notice only
+   * delays it.
+   */
+  #followLoops(onlyLoopRunId?: string): void {
+    const port = this.#host.loops;
+    if (!port) return;
+    for (const run of this.#store.loopFollowingRuns()) {
+      if (onlyLoopRunId !== undefined && run.loopRunId !== onlyLoopRunId) continue;
+      try {
+        const routine = this.#store.getRoutine(run.routineId);
+        if (!routine) continue;
+        const state = port.state(run.loopRunId as string, ownerOf(routine));
+        if (!state) {
+          this.#finishRun(routine, run, null, "failed", { reason: `the loop run it started (${run.loopRunId}) is gone` });
+        } else if (!isTerminalLoopStatus(state.status)) {
+          if (state.status !== run.loopStatus || state.costUsd !== run.costUsd) {
+            this.#store.updateRun(run.id, { loopStatus: state.status, costUsd: state.costUsd });
+          }
+        } else {
+          const { status, ...outcome } = routineOutcomeOfLoop(state);
+          this.#finishRun(routine, run, null, status, { ...outcome, loopStatus: state.status, costUsd: state.costUsd });
+        }
+      } catch (err) {
+        console.error(`[codeoid/routines] run ${run.id} could not follow its loop: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  }
+
+  /** A loop run ended: the routine run following it, if any, ends with it. */
+  loopRunEnded(loopRunId: string): void {
+    this.#followLoops(loopRunId);
+  }
+
   /** Session status changed — wake the run waiting on it, if any. */
   onSessionStatus(sessionId: string): void {
     this.#bySession.get(sessionId)?.wake();
@@ -1091,11 +1289,40 @@ export class RoutineService {
       failurePauseAfter: int(input.failurePauseAfter, SPEC_DEFAULTS.failurePauseAfter, 0, 100, "failurePauseAfter"),
     };
     if (spec.worktree && spec.session === "persistent") bad("worktree isolation is per run, so it needs session: fresh");
+    if (input.loop) spec.loop = this.#normalizeLoop(spec, input.loop, bad);
     // qwen-code runs shell commands it judges read-only without asking, even
     // when guarded, so a routine fed by outside callers could be steered to
     // read any file the daemon can. Refused rather than documented away.
     if (spec.api && (spec.provider ?? this.#host.defaultProviderId()) === "qwen") bad("the qwen backend can't take an API trigger: it runs read-only shell commands without approval");
     return spec;
+  }
+
+  /**
+   * A loop routine's contract, validated as `loop.start` validates a run's.
+   * The session-run fields (toolBudget, maxMinutes, keepSessions) don't apply
+   * and are left as they are; a setting that would promise what a loop can't
+   * keep is refused rather than silently dropped.
+   */
+  #normalizeLoop(spec: RoutineSpec, input: RoutineLoopInput, bad: (m: string) => never): NonNullable<RoutineSpec["loop"]> {
+    const port = this.#host.loops;
+    if (!port) return bad("loops are not available on this daemon, so a routine can't start one");
+    if (spec.prompt.length > LOOP_LIMITS.OBJECTIVE_MAX) bad(`a loop routine's prompt is the loop's objective: at most ${LOOP_LIMITS.OBJECTIVE_MAX} characters`);
+    if (PLACEHOLDER_RE.test(spec.prompt)) {
+      bad("a loop routine's prompt is the loop's fixed objective, so {{…}} placeholders aren't expanded — the check's output and any payload reach the worker as data on their own");
+    }
+    if (spec.approvals === "guarded") bad("a loop's worker runs autonomously within its tool budget, so a loop routine can't be guarded");
+    if (spec.session === "persistent") bad("a loop has its own worker session, so a loop routine can't be persistent");
+    if (spec.worktree) bad("a loop always works in its own worktree, so worktree doesn't apply to a loop routine");
+    if (spec.maxCostUsd !== undefined) bad("a loop has no per-run spend ceiling, so a loop routine can't take maxCostUsd — use dailyCostUsd, or the loop's attempt and time limits");
+    if (spec.overlap === "queue") bad("a loop routine never queues behind its last loop run, so overlap must be skip");
+    const problem = port.providerProblem(spec.provider);
+    if (problem) bad(problem);
+    try {
+      return { checks: resolveLoopChecks(input.checks), ...resolveLoopBudget(input.toolBudget, input.limits) };
+    } catch (err) {
+      if (err instanceof LoopError) bad(`loop: ${err.message}`);
+      throw err;
+    }
   }
 
   /** Create a routine. Returns it, plus the API token once when `api` is on. */
@@ -1129,7 +1356,7 @@ export class RoutineService {
       owner.sub,
       "routine.create",
       undefined,
-      `routine=${id} name=${spec.name} approvals=${spec.approvals} workdir=${spec.workdir} provider=${spec.provider ?? "-"} api=${spec.api} check=${commandDigest(spec.check?.command)}`,
+      `routine=${id} name=${spec.name} approvals=${spec.approvals} workdir=${spec.workdir} provider=${spec.provider ?? "-"} api=${spec.api} check=${commandDigest(spec.check?.command)}${spec.loop ? ` loop=${spec.loop.checks.map((c) => commandDigest(c.command)).join(",")}` : ""}`,
     );
     return { routine: this.#store.getRoutine(id) as RoutineRow, apiToken };
   }
@@ -1140,7 +1367,15 @@ export class RoutineService {
    */
   update(
     r: RoutineRow,
-    patch: { spec?: Omit<Partial<RoutineSpec>, "schedule" | "check"> & { schedule?: RoutineScheduleInput | null; check?: RoutineSpec["check"] | null }; enabled?: boolean },
+    patch: {
+      spec?: Omit<Partial<RoutineSpec>, "schedule" | "check" | "loop"> & {
+        schedule?: RoutineScheduleInput | null;
+        check?: RoutineSpec["check"] | null;
+        /** Merged over the current loop: what is left out is kept. `null` makes it a session routine again. */
+        loop?: RoutineLoopInput | null;
+      };
+      enabled?: boolean;
+    },
     actor: string,
   ): { routine: RoutineRow; apiToken: string | null } {
     const now = this.#now();
@@ -1152,6 +1387,15 @@ export class RoutineService {
       // `null` clears an optional block.
       if ("schedule" in patch.spec && patch.spec.schedule === null) delete merged.schedule;
       if ("check" in patch.spec && patch.spec.check === null) delete merged.check;
+      if ("loop" in patch.spec && patch.spec.loop === null) delete merged.loop;
+      else if (patch.spec.loop && r.spec.loop) {
+        const l = patch.spec.loop;
+        merged.loop = {
+          checks: l.checks ?? r.spec.loop.checks,
+          toolBudget: l.toolBudget ?? r.spec.loop.toolBudget,
+          limits: { ...r.spec.loop.limits, ...(l.limits ?? {}) },
+        };
+      }
       for (const k of ["maxCostUsd", "dailyCostUsd", "provider", "model"] as const) {
         if (k in patch.spec && (patch.spec as Record<string, unknown>)[k] === null) delete merged[k];
       }
@@ -1198,6 +1442,10 @@ export class RoutineService {
       .filter((k) => changed.includes(k))
       .map((k) => `${k}:${String(r.spec[k] ?? "-")}->${String(spec[k] ?? "-")}`);
     if (changed.includes("check")) shown.push(`check:${commandDigest(r.spec.check?.command)}->${commandDigest(spec.check?.command)}`);
+    if (changed.includes("loop")) {
+      const checks = (l: RoutineSpec["loop"]) => (l ? l.checks.map((c) => commandDigest(c.command)).join(",") : "none");
+      shown.push(`loop:${checks(r.spec.loop)}->${checks(spec.loop)}`);
+    }
     this.#host.audit(
       actor,
       "routine.update",
@@ -1226,6 +1474,8 @@ export class RoutineService {
     }
     for (const q of this.#store.activeRuns(r.id)) {
       if (q.status === "queued") this.#store.setRunStatus(q.id, "cancelled", { endedAt: this.#now(), reason: "the routine was deleted" });
+      // The loop run is the routine's run in progress: it goes with it.
+      if (q.loopRunId && this.#host.loops) await this.#host.loops.cancel(q.loopRunId, ownerOf(r)).catch(() => {});
     }
     this.#store.deleteRoutine(r.id);
     this.#store.deleteRuns(r.id);
@@ -1249,13 +1499,20 @@ export class RoutineService {
     return this.#admit(r, trigger, { scheduledFor: null, payload });
   }
 
-  /** Cancel a queued or running run. */
+  /** Cancel a queued or running run. A run following a loop cancels the loop, and ends with it. */
   cancelRun(run: RunRow, actor: string): boolean {
     const live = this.#live.get(run.id);
+    const routine = this.#store.getRoutine(run.routineId);
     if (live) {
       live.cancelled = `cancelled by ${actor}`;
       live.abort.abort();
       live.wake();
+    } else if (run.loopRunId && ACTIVE_RUN_STATUSES.includes(run.status) && this.#host.loops && routine) {
+      const loopRunId = run.loopRunId;
+      void this.#host.loops
+        .cancel(loopRunId, ownerOf(routine))
+        .catch(() => {})
+        .finally(() => this.#followLoops(loopRunId));
     } else if (run.status === "queued") {
       this.#store.setRunStatus(run.id, "cancelled", { endedAt: this.#now(), reason: `cancelled by ${actor}` });
       this.#announce(run.routineId, run.id);

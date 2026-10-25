@@ -621,3 +621,48 @@ describe("loop.watch trustHead", () => {
     expect(create.ok).toBe(true);
   });
 });
+
+describe("routine loop (a routine that starts a loop)", () => {
+  const spec = (loop: unknown) => ({ name: "flaky", prompt: "Fix the flaky tests.", workdir: "/r", loop });
+  const create = (loop: unknown) => parseClientMessage({ type: "routine.create", id: "c1", spec: spec(loop) });
+  const update = (loop: unknown) => parseClientMessage({ type: "routine.update", id: "u1", routine: "flaky", spec: { loop } });
+
+  test("a loop round-trips through create unchanged", () => {
+    const msg = {
+      type: "routine.create",
+      id: "c1",
+      spec: spec({
+        checks: [{ id: "unit", command: "bun test", timeoutSec: 900, expectTests: true }],
+        toolBudget: 40,
+        limits: { attempts: 4, attemptMinutes: 15, runMinutes: 60 },
+      }),
+    };
+    expect(parseClientMessage(msg)).toEqual({ ok: true, value: msg as ClientMessage });
+  });
+
+  test("bounds match loop.start: 1–10 checks, attempts 1–10, attemptMinutes 1–240, runMinutes 1–1440, toolBudget 1–1000", () => {
+    const check = { command: "bun test" };
+    expect(create({ checks: [check] }).ok).toBe(true);
+    expect(create({ checks: [] }).ok).toBe(false);
+    expect(create({}).ok).toBe(false);
+    expect(create({ checks: Array.from({ length: 11 }, () => check) }).ok).toBe(false);
+    expect(create({ checks: [{ command: "" }] }).ok).toBe(false);
+    expect(create({ checks: [{ command: "x".repeat(4_001) }] }).ok).toBe(false);
+    expect(create({ checks: [{ command: "a", timeoutSec: 3_601 }] }).ok).toBe(false);
+    expect(create({ checks: [{ id: "x".repeat(41), command: "a" }] }).ok).toBe(false);
+    expect(create({ checks: [check], limits: { attempts: 11 } }).ok).toBe(false);
+    expect(create({ checks: [check], limits: { attemptMinutes: 241 } }).ok).toBe(false);
+    expect(create({ checks: [check], limits: { runMinutes: 1_441 } }).ok).toBe(false);
+    expect(create({ checks: [check], toolBudget: 0 }).ok).toBe(false);
+    expect(create({ checks: [check], toolBudget: 1_001 }).ok).toBe(false);
+  });
+
+  test("an update may leave the checks out (merged over the current loop), or clear the loop with null", () => {
+    expect(update({ limits: { attempts: 5 } }).ok).toBe(true);
+    expect(update({ checks: [{ command: "bun test" }] }).ok).toBe(true);
+    expect(update(null).ok).toBe(true);
+    expect(update({ checks: [] }).ok).toBe(false);
+    const parsed = update({ toolBudget: 30 });
+    expect(parsed.ok && (parsed.value as { spec?: { loop?: unknown } }).spec?.loop).toEqual({ toolBudget: 30 });
+  });
+});

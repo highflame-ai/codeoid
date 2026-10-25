@@ -179,7 +179,7 @@ export interface LoopStartInput {
   /** Work from this commit instead of the user's checkout. Daemon-internal
    *  (watches): never taken from a client message. */
   baseRef?: LoopBaseRef;
-  /** The repository event that started the run. Daemon-internal (watches). */
+  /** What started the run. Daemon-internal (watches, routines). */
   trigger?: LoopTrigger;
 }
 
@@ -687,42 +687,19 @@ export class LoopService {
     if (objective.length > LOOP_LIMITS.OBJECTIVE_MAX) throw new LoopError(`The objective is over ${LOOP_LIMITS.OBJECTIVE_MAX} characters`, "invalid_request");
     const workdir = this.#host.normalizeWorkdir(input.workdir);
     if (!workdir) throw new LoopError(`workdir not usable: ${input.workdir}`, "invalid_request");
-    if (!input.checks?.length) throw new LoopError("A repair run needs at least one check", "invalid_request");
-    if (input.checks.length > LOOP_LIMITS.CHECKS_MAX) throw new LoopError(`At most ${LOOP_LIMITS.CHECKS_MAX} checks`, "invalid_request");
-    const seen = new Set<string>();
-    const checks: LoopCheck[] = input.checks.map((c, i) => {
-      const command = c.command?.trim() ?? "";
-      if (!command) throw new LoopError(`Check ${i + 1} has no command`, "invalid_request");
-      if (command.length > LOOP_LIMITS.CHECK_COMMAND_MAX) throw new LoopError(`Check ${i + 1}'s command is too long`, "invalid_request");
-      const id = (c.id?.trim() || `check${i + 1}`).replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 40);
-      if (seen.has(id)) throw new LoopError(`Two checks are named "${id}"`, "invalid_request");
-      seen.add(id);
-      const timeoutSec = c.timeoutSec ?? LOOP_DEFAULTS.checkTimeoutSec;
-      if (!Number.isInteger(timeoutSec) || timeoutSec < 1 || timeoutSec > LOOP_LIMITS.CHECK_TIMEOUT_MAX_S) {
-        throw new LoopError(`Check "${id}" timeout must be 1–${LOOP_LIMITS.CHECK_TIMEOUT_MAX_S}s`, "invalid_request");
-      }
-      return { id, command, timeoutSec, ...(c.expectTests ? { expectTests: true } : {}) };
-    });
+    const checks = resolveLoopChecks(input.checks);
     if (input.provider && !this.#host.hasProvider(input.provider)) {
       throw new LoopError(`Unknown backend "${input.provider}"`, "invalid_request");
     }
-    const limits = { ...LOOP_DEFAULTS.limits, ...(input.limits ?? {}) };
-    const bounded = (v: number, max: number, name: string): number => {
-      if (!Number.isInteger(v) || v < 1 || v > max) throw new LoopError(`${name} must be 1–${max}`, "invalid_request");
-      return v;
-    };
+    const { toolBudget, limits } = resolveLoopBudget(input.toolBudget, input.limits);
     return {
       recipe: "repair",
       objective,
       workdir,
       checks,
       worker: { ...(input.provider ? { provider: input.provider } : {}), ...(input.model ? { model: input.model } : {}) },
-      toolBudget: bounded(input.toolBudget ?? LOOP_DEFAULTS.toolBudget, LOOP_LIMITS.TOOL_BUDGET_MAX, "toolBudget"),
-      limits: {
-        attempts: bounded(limits.attempts, LOOP_LIMITS.ATTEMPTS_MAX, "attempts"),
-        attemptMinutes: bounded(limits.attemptMinutes, LOOP_LIMITS.ATTEMPT_MINUTES_MAX, "attemptMinutes"),
-        runMinutes: bounded(limits.runMinutes, LOOP_LIMITS.RUN_MINUTES_MAX, "runMinutes"),
-      },
+      toolBudget,
+      limits,
       ...(input.baseRef ? { baseRef: resolveBaseRef(input.baseRef) } : {}),
       ...(input.trigger
         ? { trigger: { ...input.trigger, summary: input.trigger.summary.slice(0, LOOP_LIMITS.TRIGGER_SUMMARY_MAX) } }
@@ -1290,6 +1267,49 @@ function describeResult(result: AttemptResult, evidence: EvidenceRecord[]): stri
     default:
       return `${failing.length} of ${evidence.length} check(s) not passing: ${failing.map((e) => `${e.criterionId} ${e.result}`).join(", ")}`;
   }
+}
+
+/**
+ * A run's checks, validated and filled (ids, timeouts). Shared with routines
+ * that start a loop, so a saved routine holds exactly what a run would.
+ */
+export function resolveLoopChecks(input: LoopStartInput["checks"] | undefined): LoopCheck[] {
+  if (!input?.length) throw new LoopError("A repair run needs at least one check", "invalid_request");
+  if (input.length > LOOP_LIMITS.CHECKS_MAX) throw new LoopError(`At most ${LOOP_LIMITS.CHECKS_MAX} checks`, "invalid_request");
+  const seen = new Set<string>();
+  return input.map((c, i) => {
+    const command = c.command?.trim() ?? "";
+    if (!command) throw new LoopError(`Check ${i + 1} has no command`, "invalid_request");
+    if (command.length > LOOP_LIMITS.CHECK_COMMAND_MAX) throw new LoopError(`Check ${i + 1}'s command is too long`, "invalid_request");
+    const id = (c.id?.trim() || `check${i + 1}`).replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 40);
+    if (seen.has(id)) throw new LoopError(`Two checks are named "${id}"`, "invalid_request");
+    seen.add(id);
+    const timeoutSec = c.timeoutSec ?? LOOP_DEFAULTS.checkTimeoutSec;
+    if (!Number.isInteger(timeoutSec) || timeoutSec < 1 || timeoutSec > LOOP_LIMITS.CHECK_TIMEOUT_MAX_S) {
+      throw new LoopError(`Check "${id}" timeout must be 1–${LOOP_LIMITS.CHECK_TIMEOUT_MAX_S}s`, "invalid_request");
+    }
+    return { id, command, timeoutSec, ...(c.expectTests ? { expectTests: true } : {}) };
+  });
+}
+
+/** A run's tool budget and limits, bounded and defaulted (shared with routines). */
+export function resolveLoopBudget(
+  toolBudget: number | undefined,
+  input: Partial<LoopContract["limits"]> | undefined,
+): Pick<LoopContract, "toolBudget" | "limits"> {
+  const limits = { ...LOOP_DEFAULTS.limits, ...(input ?? {}) };
+  const bounded = (v: number, max: number, name: string): number => {
+    if (!Number.isInteger(v) || v < 1 || v > max) throw new LoopError(`${name} must be 1–${max}`, "invalid_request");
+    return v;
+  };
+  return {
+    toolBudget: bounded(toolBudget ?? LOOP_DEFAULTS.toolBudget, LOOP_LIMITS.TOOL_BUDGET_MAX, "toolBudget"),
+    limits: {
+      attempts: bounded(limits.attempts, LOOP_LIMITS.ATTEMPTS_MAX, "attempts"),
+      attemptMinutes: bounded(limits.attemptMinutes, LOOP_LIMITS.ATTEMPT_MINUTES_MAX, "attemptMinutes"),
+      runMinutes: bounded(limits.runMinutes, LOOP_LIMITS.RUN_MINUTES_MAX, "runMinutes"),
+    },
+  };
 }
 
 function resolveBaseRef(ref: LoopBaseRef): LoopBaseRef {

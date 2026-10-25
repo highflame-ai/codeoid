@@ -24,6 +24,7 @@ export function toRunWire(r: RunRow): RoutineRunWire {
     ...(r.reason ? { reason: r.reason } : {}),
     ...(r.checkOutput ? { checkOutput: r.checkOutput } : {}),
     ...(r.payload ? { payload: r.payload } : {}),
+    ...(r.loopRunId ? { loop: { runId: r.loopRunId, status: r.loopStatus ?? "running" } } : {}),
   };
 }
 

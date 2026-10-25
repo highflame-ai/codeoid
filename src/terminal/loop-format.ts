@@ -106,6 +106,9 @@ export function formatLoop(r: LoopRunWire, attempts: LoopAttemptWire[], events?:
 export function startedBy(r: LoopRunWire): string {
   const t = r.trigger;
   if (!t) return "you";
+  if (t.kind === "routine") {
+    return `your routine ${S(t.routineName ?? t.routineId ?? "?")}${t.routineRunId ? ` (run ${t.routineRunId.slice(0, 8)}; codeoid routine runs ${S(t.routineName ?? t.routineId ?? "")})` : ""}`;
+  }
   const what = t.kind === "ci_failure" ? "a failing CI check" : "a review comment";
   const on = r.baseRef?.branch ? ` on ${S(r.baseRef.branch)}` : "";
   const url = githubUrl(t.url);

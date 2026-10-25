@@ -7,6 +7,7 @@ import { readFileSync } from "node:fs";
 import type { RoutineRunWire, RoutineScheduleWire, RoutineSpecWire, RoutineWire } from "../protocol/types.js";
 import { isAbsolute, resolve } from "node:path";
 import { parseInterval } from "../daemon/routines/schedule.js";
+import { parseCheckFlag } from "./loop-format.js";
 
 /** A relative path means relative to where the command was typed, not the daemon's cwd. `~` is the daemon's to expand. */
 const absWorkdir = (p: string): string => (isAbsolute(p) || p.startsWith("~") ? p : resolve(p));
@@ -41,6 +42,15 @@ export interface RoutineFlags {
   keep?: string;
   api?: boolean;
   failurePause?: string;
+  /** --loop: start a loop instead of a session; --no-loop (edit) → false. */
+  loop?: boolean;
+  /** --verify: the loop's acceptance checks, `cmd` or `id: cmd` (repeatable). */
+  verify?: string[];
+  test?: boolean;
+  attempts?: string;
+  attemptMinutes?: string;
+  runMinutes?: string;
+  budget?: string;
 }
 
 export class RoutineFlagError extends Error {}
@@ -133,7 +143,60 @@ export function specFromFlags(
   if (f.api !== undefined) out.api = f.api;
   if (f.overlap !== undefined) out.overlap = f.overlap;
   if (f.notify !== undefined) out.notify = f.notify;
+  const loop = loopFromFlags(f, mode);
+  if (loop !== undefined) out.loop = loop;
   return out;
+}
+
+/**
+ * The loop a routine starts, from `--loop` and its flags: `null` for
+ * --no-loop, `undefined` when none given. `--check` stays the routine's gate;
+ * `--verify` names the loop's acceptance checks. On edit the daemon merges
+ * what is given over the current loop, so `--verify` replaces the checks and
+ * a limit alone changes just that limit.
+ */
+function loopFromFlags(f: RoutineFlags, mode: "add" | "edit"): Record<string, unknown> | null | undefined {
+  const verify = f.verify ?? [];
+  const limits: Record<string, number> = {};
+  const lim: Array<[keyof RoutineFlags, string, string]> = [
+    ["attempts", "attempts", "attempts"],
+    ["attemptMinutes", "attemptMinutes", "attempt-minutes"],
+    ["runMinutes", "runMinutes", "run-minutes"],
+  ];
+  for (const [flag, field, label] of lim) {
+    const v = num(f[flag] as string | undefined, label);
+    if (v !== undefined) limits[field] = v;
+  }
+  const budget = num(f.budget, "budget");
+  const given = verify.length > 0 || f.test !== undefined || Object.keys(limits).length > 0 || budget !== undefined;
+  if (f.loop === false) {
+    if (given) throw new RoutineFlagError("--no-loop can't be combined with --verify, --test, or a loop limit");
+    return null;
+  }
+  if (f.test && verify.length === 0) throw new RoutineFlagError("--test applies to the --verify checks: give them with it");
+  if (mode === "add") {
+    if (!f.loop) {
+      if (given) throw new RoutineFlagError("--verify, --test, --attempts, --attempt-minutes, --run-minutes and --budget need --loop");
+      return undefined;
+    }
+    if (verify.length === 0) throw new RoutineFlagError('a loop routine needs at least one --verify "id: cmd" — the check its loop must make pass (--check is the gate that decides whether it starts)');
+    // These shape a session run and would be silently ignored by a loop.
+    const ignored: Array<[keyof RoutineFlags, string, string]> = [
+      ["toolBudget", "--tool-budget", "use --budget (tool calls per attempt)"],
+      ["maxMinutes", "--max-minutes", "use --attempt-minutes and --run-minutes"],
+      ["keep", "--keep", "a loop keeps its own worker session"],
+    ];
+    for (const [flag, label, instead] of ignored) {
+      if (f[flag] !== undefined) throw new RoutineFlagError(`${label} doesn't apply to a loop routine: ${instead}`);
+    }
+  } else if (!f.loop && !given) {
+    return undefined;
+  }
+  return {
+    ...(verify.length > 0 ? { checks: verify.map((raw) => ({ ...parseCheckFlag(raw), ...(f.test ? { expectTests: true } : {}) })) } : {}),
+    ...(budget !== undefined ? { toolBudget: budget } : {}),
+    ...(Object.keys(limits).length > 0 ? { limits } : {}),
+  };
 }
 
 // ── Output ───────────────────────────────────────────────────────────────────
@@ -176,23 +239,36 @@ export function formatRun(run: RoutineRunWire, now = Date.now()): string[] {
   if (run.reason) lines.push(`    ${run.reason}`);
   if (run.summary) lines.push(...run.summary.split("\n").slice(0, 6).map((l) => `    │ ${l}`));
   if (run.sessionId) lines.push(`    session ${run.sessionId}`);
+  if (run.loop) lines.push(`    loop ${run.loop.runId}  ${run.loop.status}  (codeoid loop show ${run.loop.runId})`);
   return lines;
 }
 
 export function formatRoutine(r: RoutineWire, runs: RoutineRunWire[] = [], now = Date.now()): string[] {
   const s = r.spec;
-  const out = [
+  const head = [
     `${r.name}  (${r.enabled ? "on" : "paused"})${r.pausedReason ? ` — ${r.pausedReason}` : ""}`,
     `  schedule   ${r.scheduleText}${r.enabled && r.upcoming.length > 0 ? `  · next ${r.upcoming.map((u) => relativeTime(u, now)).join(", ")}` : ""}`,
-    `  workdir    ${s.workdir}${s.worktree ? "  (fresh git worktree per run)" : ""}`,
-    `  backend    ${s.provider ?? "default"}${s.model ? ` · ${s.model}` : ""}  · ${s.session} session`,
-    `  approvals  ${s.approvals}${s.approvals === "autonomous" ? ` (up to ${s.toolBudget} tool calls)` : " (non-read tools wait for you)"}`,
-    `  limits     ${s.maxMinutes}m per run${s.maxCostUsd !== undefined ? ` · ${money(s.maxCostUsd)} per run` : ""}${s.dailyCostUsd !== undefined ? ` · ${money(s.dailyCostUsd)}/day` : ""} · pause after ${s.failurePauseAfter || "never"} failures`,
   ];
+  const daily = s.dailyCostUsd !== undefined ? ` · ${money(s.dailyCostUsd)}/day` : "";
+  const out = s.loop
+    ? [
+        ...head,
+        `  action     starts a loop run (codeoid loop ls), in its own worktree of ${s.workdir}`,
+        `  backend    ${s.provider ?? "default"}${s.model ? ` · ${s.model}` : ""}`,
+        ...s.loop.checks.map((c) => `  verify     ${c.id}: ${c.command}${c.expectTests ? " (tests)" : ""}`),
+        `  limits     ${s.loop.limits.attempts} attempts · ${s.loop.limits.attemptMinutes}m each · ${s.loop.limits.runMinutes}m per run · ${s.loop.toolBudget} tool calls per attempt${daily} · pause after ${s.failurePauseAfter || "never"} failures`,
+      ]
+    : [
+        ...head,
+        `  workdir    ${s.workdir}${s.worktree ? "  (fresh git worktree per run)" : ""}`,
+        `  backend    ${s.provider ?? "default"}${s.model ? ` · ${s.model}` : ""}  · ${s.session} session`,
+        `  approvals  ${s.approvals}${s.approvals === "autonomous" ? ` (up to ${s.toolBudget} tool calls)` : " (non-read tools wait for you)"}`,
+        `  limits     ${s.maxMinutes}m per run${s.maxCostUsd !== undefined ? ` · ${money(s.maxCostUsd)} per run` : ""}${daily} · pause after ${s.failurePauseAfter || "never"} failures`,
+      ];
   if (s.check) out.push(`  check      ${s.check.command}  (timeout ${s.check.timeoutSeconds}s; no output = nothing to do)`);
   out.push(`  notify     ${s.notify.replace("_", " ")} · overlap ${s.overlap}${s.catchUp ? " · catch up missed runs" : ""}`);
   out.push(`  api        ${s.api ? (r.apiTokenSet ? "on (token set)" : "on (no token — run `codeoid routine token`)") : "off"}`);
-  out.push("", "  prompt", ...s.prompt.split("\n").map((l) => `    ${l}`));
+  out.push("", s.loop ? "  objective" : "  prompt", ...s.prompt.split("\n").map((l) => `    ${l}`));
   if (runs.length > 0) {
     out.push("", "  recent runs");
     for (const run of runs) out.push(...formatRun(run, now).map((l) => `  ${l}`));

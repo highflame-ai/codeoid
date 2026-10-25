@@ -186,6 +186,7 @@ codeoid loop ls | show <id> [--events] | steer <id> <text> | pause | resume | ca
 codeoid loop watch add --workdir <dir> (--branch <b>... | --my-prs) --ci "<check>[@app]: <cmd>" [--review] [--trust <login>]  # CI failures / review comments start runs
 codeoid loop watch ls | show | poll | pause | resume | rm <id>
 codeoid routine add <name> --prompt … [--cron|--every|--at] [--check <cmd>]  # scheduled agent runs
+codeoid routine add <name> --loop --prompt … --verify "id: cmd" [--test] [--attempts N] [--attempt-minutes N] [--run-minutes N] [--budget N]  # start a loop (--check = gate, --verify = its acceptance checks)
 codeoid routine ls | show | runs | run [--wait] | edit | pause | resume | rm | cancel <runId> | token | preview
 codeoid worktree trust [dir] [--off] [--yes]  # trust the setup command of a repo's .codeoid/setup.yaml, pinned to its blob (docs/CONFIGURATION.md)
 ```
@@ -210,9 +211,12 @@ or an API call. `RoutineService` owns the scheduler and runs; it reaches
 sessions only through the `RoutineHost` seam that `SessionManager` implements,
 and every routine.* message is authorized in `SessionManager.#routineHandle`
 (owner-only, no scope of its own: session:create + session:send for
-everything but preview, plus session:approve for an autonomous routine or one
-with a check; changes are refused to delegated tokens). The fire claim is a compare-and-set on
-`next_fire_at`, which is the only scheduler lock.
+everything but preview, plus session:approve for an autonomous routine, one
+with a check, or one that starts a loop; changes are refused to delegated tokens). The fire claim is a compare-and-set on
+`next_fire_at`, which is the only scheduler lock. A loop routine (`spec.loop`)
+starts a loop run through `RoutineHost.loops` after its gate; its routine run
+follows the loop (`loopRunId`) without holding a run slot and ends with the
+loop's outcome.
 
 ## Config
 

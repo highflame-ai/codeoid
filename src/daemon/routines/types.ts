@@ -5,6 +5,7 @@
  * posture, and a delivery rule.
  */
 
+import type { LoopCheck, LoopLimits, LoopStatus } from "../loops/types.js";
 import type { RoutineSchedule } from "./schedule.js";
 
 export type ApprovalPosture = "autonomous" | "guarded";
@@ -53,6 +54,22 @@ export interface RoutineSpec {
   api: boolean;
   /** Pause the routine after this many consecutive failed runs (0 = never). */
   failurePauseAfter: number;
+  /**
+   * Start a loop instead of a session (docs/routines.md "Routines that start
+   * a loop"): the prompt is the loop's objective, these are its acceptance
+   * checks and budget. The session-run fields (toolBudget, maxMinutes,
+   * keepSessions) don't apply; normalizeSpec refuses the ones a loop can't
+   * honour.
+   */
+  loop?: RoutineLoopSpec;
+}
+
+/** A loop routine's run contract, stored validated and filled. */
+export interface RoutineLoopSpec {
+  checks: LoopCheck[];
+  /** Autonomous tool calls per attempt. */
+  toolBudget: number;
+  limits: LoopLimits;
 }
 
 export type RunTrigger = "schedule" | "catchup" | "api" | "manual";
@@ -136,4 +153,12 @@ export interface RunRow {
   reason: string | null;
   checkOutput: string | null;
   payload: string | null;
+  /**
+   * The loop run this run started (loop routines). While it is in progress
+   * the routine run stays `running` without holding a run slot; it ends with
+   * the loop's outcome.
+   */
+  loopRunId: string | null;
+  /** The loop run's status as last seen; terminal once the routine run ended. */
+  loopStatus: LoopStatus | null;
 }

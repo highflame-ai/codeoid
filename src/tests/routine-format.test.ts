@@ -148,3 +148,42 @@ describe("output", () => {
     expect(text).toContain("recent runs");
   });
 });
+
+describe("loop routine flags", () => {
+  it("--loop with --verify builds the loop; --check stays the gate", () => {
+    const spec = specFromFlags(
+      "flaky",
+      { prompt: "Fix it.", loop: true, check: "bun test | grep fail", verify: ["unit: bun test", "bun run lint"], test: true, attempts: "4", runMinutes: "45", budget: "30" },
+      "add",
+    );
+    expect(spec.check).toEqual({ command: "bun test | grep fail" });
+    expect(spec.loop).toEqual({
+      checks: [
+        { id: "unit", command: "bun test", expectTests: true },
+        { command: "bun run lint", expectTests: true },
+      ],
+      toolBudget: 30,
+      limits: { attempts: 4, runMinutes: 45 },
+    });
+  });
+
+  it("refuses loop flags without --loop, --loop without --verify, and session-run flags a loop would ignore", () => {
+    expect(() => specFromFlags("x", { prompt: "p", verify: ["bun test"] }, "add")).toThrow(RoutineFlagError);
+    expect(() => specFromFlags("x", { prompt: "p", loop: true, verify: [] }, "add")).toThrow(/--verify/);
+    expect(() => specFromFlags("x", { prompt: "p", loop: true, verify: ["t"], toolBudget: "5" }, "add")).toThrow(/--budget/);
+    expect(() => specFromFlags("x", { prompt: "p", loop: true, verify: ["t"], maxMinutes: "5" }, "add")).toThrow(/--run-minutes/);
+    expect(() => specFromFlags("x", { prompt: "p", loop: true, test: true }, "add")).toThrow(/--test/);
+  });
+
+  it("edit sends only what changed; --no-loop clears it", () => {
+    expect(specFromFlags("x", { attempts: "5" }, "edit")).toEqual({ loop: { limits: { attempts: 5 } } });
+    expect(specFromFlags("x", { loop: false }, "edit")).toEqual({ loop: null });
+    expect(specFromFlags("x", { verify: [] }, "edit")).toEqual({});
+    expect(() => specFromFlags("x", { loop: false, attempts: "2" }, "edit")).toThrow(RoutineFlagError);
+  });
+
+  it("show and runs name the loop", () => {
+    const run = { id: "r1", routineId: "rt", trigger: "manual", status: "running", createdAt: new Date().toISOString(), costUsd: 0, inputTokens: 0, outputTokens: 0, loop: { runId: "loop_1", status: "verifying" } } as RoutineRunWire;
+    expect(formatRun(run).join("\n")).toContain("loop loop_1  verifying  (codeoid loop show loop_1)");
+  });
+});

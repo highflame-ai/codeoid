@@ -5,6 +5,7 @@ The worker agent never decides that it is done: it can only ask for verification
 
 Design and roadmap: [loop-engineering-design.md](loop-engineering-design.md).
 This page covers what ships today: the **repair** recipe, started by hand or by a [watch](#watches) when CI fails or a reviewer asks.
+A [routine](routines.md#routines-that-start-a-loop) can start one too, on a schedule or an API call, after its gate says there is work; its runs show `started by your routine <name>` and are listed with every other run.
 
 ## Start a repair
 

@@ -232,6 +232,8 @@ describe("routine lifecycle through the protocol", () => {
       reason: null,
       checkOutput: null,
       payload: null,
+      loopRunId: null,
+      loopStatus: null,
     });
     const list = await call({ type: "session.list" });
     expect(list.type === "session.list.result" && list.sessions.find((s) => s.id === id)?.managedBy).toBe("routine");

@@ -11,15 +11,17 @@
  *   - changing anything (create, update, delete, run, cancel, token) is
  *     refused to a delegated token (a teammate's share token, an agent): a
  *     routine is standing authority, and delegation is meant to be narrow;
- *   - saving, firing, re-tokening or resuming a routine that is autonomous or
- *     has a check command also needs `session:approve`: it pre-approves tool
- *     use and host commands. Pausing never does.
+ *   - saving, firing, re-tokening or resuming a routine that is autonomous,
+ *     has a check command, or starts a loop also needs `session:approve`: it
+ *     pre-approves tool use and host commands. Pausing never does.
  *
  * A routine is its owner's alone: another user in the same tenant sees no
  * routine of theirs, by id or by name.
  *
  * Every request names its routine by id or by name (`routine`).
  */
+
+import type { LoopCheckWire, LoopLimitsWire, LoopStatusWire } from "./loops.js";
 
 // ── Shapes ────────────────────────────────────────────────────────────────────
 
@@ -55,6 +57,34 @@ export interface RoutineSpecWire {
   keepSessions?: number;
   api?: boolean;
   failurePauseAfter?: number;
+  /**
+   * Start a loop instead of a session (docs/routines.md "Routines that start
+   * a loop"). The prompt becomes the loop's objective (at most 8,000
+   * characters, no placeholders). A loop routine can't be guarded,
+   * persistent, worktree, overlap queue, or take maxCostUsd; toolBudget,
+   * maxMinutes and keepSessions don't apply to it.
+   */
+  loop?: RoutineLoopWire;
+}
+
+/** A loop routine's contract: the same shapes and bounds as `loop.start`. */
+export interface RoutineLoopWire {
+  /** 1–10 acceptance checks (`id` defaults to check1, check2, …; `timeoutSec` 1–3600, default 600). */
+  checks: LoopCheckWire[];
+  /** Autonomous tool calls per attempt, 1–1000 (default 60). */
+  toolBudget?: number;
+  /** attempts 1–10 (3), attemptMinutes 1–240 (10), runMinutes 1–1440 (30). */
+  limits?: Partial<LoopLimitsWire>;
+}
+
+/** On update: merged over the routine's current loop, so what is left out (checks included) is kept. */
+export type RoutineLoopPatchWire = Partial<RoutineLoopWire>;
+
+/** A loop routine's contract as saved: every default filled. */
+export interface RoutineLoopSpecWire {
+  checks: Array<Required<Pick<LoopCheckWire, "id" | "command" | "timeoutSec">> & Pick<LoopCheckWire, "expectTests">>;
+  toolBudget: number;
+  limits: LoopLimitsWire;
 }
 
 export type RoutineRunStatus =
@@ -92,6 +122,12 @@ export interface RoutineRunWire {
   reason?: string;
   checkOutput?: string;
   payload?: string;
+  /**
+   * The loop run this run started (a loop routine), and its status: live
+   * while the routine run is `running`, terminal once it ended. Open it with
+   * `loop.get`.
+   */
+  loop?: { runId: string; status: LoopStatusWire };
 }
 
 export interface RoutineWire {
@@ -102,8 +138,11 @@ export interface RoutineWire {
   pausedReason?: string;
   ownerSub: string;
   /** The full configuration, defaults filled in. */
-  spec: Required<Omit<RoutineSpecWire, "provider" | "model" | "schedule" | "check" | "maxCostUsd" | "dailyCostUsd">> &
-    Pick<RoutineSpecWire, "provider" | "model" | "schedule" | "check" | "maxCostUsd" | "dailyCostUsd">;
+  spec: Required<Omit<RoutineSpecWire, "provider" | "model" | "schedule" | "check" | "maxCostUsd" | "dailyCostUsd" | "loop">> &
+    Pick<RoutineSpecWire, "provider" | "model" | "schedule" | "check" | "maxCostUsd" | "dailyCostUsd"> & {
+      /** Present on a loop routine. */
+      loop?: RoutineLoopSpecWire;
+    };
   /** "cron 0 9 * * 1-5 (Asia/Singapore)", "every 15m", "once at …", or "on demand". */
   scheduleText: string;
   /** Next fires (ISO), soonest first; empty when paused or unscheduled. */
@@ -128,13 +167,14 @@ export interface RoutineCreateMsg {
 
 /**
  * Change a routine. `spec` is merged over the current one; `null` clears an
- * optional field (schedule, check, maxCostUsd, …). `enabled` pauses/resumes.
+ * optional field (schedule, check, maxCostUsd, loop, …). `enabled`
+ * pauses/resumes. `loop` is merged over the current loop.
  */
 export interface RoutineUpdateMsg {
   type: "routine.update";
   id: string;
   routine: string;
-  spec?: { [K in keyof RoutineSpecWire]?: RoutineSpecWire[K] | null };
+  spec?: { [K in Exclude<keyof RoutineSpecWire, "loop">]?: RoutineSpecWire[K] | null } & { loop?: RoutineLoopPatchWire | null };
   enabled?: boolean;
 }
 

@@ -6096,9 +6096,11 @@ mcpHub: this.#mcpHub,
    * read-only watchers can't read its definition or history. Changing anything
    * is refused to delegated tokens (teammates' share tokens, agents): a
    * routine is standing authority that outlives them. Saving,
-   * firing, re-tokening or resuming a routine that pre-approves (autonomous)
-   * or runs host commands (a check) also needs session:approve; pausing never
-   * does. A routine is its owner's alone: anyone else gets not-found.
+   * firing, re-tokening or resuming a routine that pre-approves (autonomous),
+   * runs host commands (a check), or starts a loop also needs
+   * session:approve; pausing never does. A loop routine therefore needs
+   * everything loop.start needs. A routine is its owner's alone: anyone else
+   * gets not-found.
    */
   async #routineHandle(
     msg: Extract<ClientMessage, { type: `routine.${string}` }>,
@@ -6132,11 +6134,12 @@ mcpHub: this.#mcpHub,
         }
       }
     }
-    /** Autonomy or a host command needs the approval scope as well. */
-    const needsApprove = (spec: { approvals?: string | null; check?: unknown } | undefined, current?: RoutineRow): boolean => {
+    /** Autonomy, a host command, or a loop (whose worker is autonomous) needs the approval scope as well. */
+    const needsApprove = (spec: { approvals?: string | null; check?: unknown; loop?: unknown } | undefined, current?: RoutineRow): boolean => {
       const approvals = spec?.approvals !== undefined ? spec.approvals : current?.spec.approvals;
       const check = spec && "check" in spec ? spec.check : current?.spec.check;
-      return (approvals ?? "autonomous") === "autonomous" || !!check;
+      const loop = spec && "loop" in spec ? spec.loop : current?.spec.loop;
+      return (approvals ?? "autonomous") === "autonomous" || !!check || !!loop;
     };
     // A routine is its owner's alone: its runs act as them, so nobody else in
     // the tenant may read, steer, fire, or delete it. Others get "not found".
@@ -6167,7 +6170,7 @@ mcpHub: this.#mcpHub,
           return { type: "routine.preview.result", requestId: msg.id, fires: svc.preview(msg.schedule, msg.count ?? 5) };
         case "routine.create": {
           if (needsApprove(msg.spec) && !hasScope(scopes, SCOPES.SESSION_APPROVE)) {
-            return err("Missing scope: session:approve (an autonomous routine, or one with a check command, pre-approves work)", "forbidden");
+            return err("Missing scope: session:approve (an autonomous routine, one with a check command, or one that starts a loop pre-approves work)", "forbidden");
           }
           const { routine, apiToken } = svc.create(
             { sub: auth.sub, name: auth.name, accountId: auth.accountId, projectId: auth.projectId },
@@ -6215,8 +6218,8 @@ mcpHub: this.#mcpHub,
           // Pausing is a safety stop: any credential that can manage the
           // routine may pull it, whatever the routine pre-approves.
           const pauseOnly = msg.spec === undefined && msg.enabled === false;
-          if (!pauseOnly && needsApprove(msg.spec as { approvals?: string | null; check?: unknown } | undefined, r) && !hasScope(scopes, SCOPES.SESSION_APPROVE)) {
-            return err("Missing scope: session:approve (an autonomous routine, or one with a check command, pre-approves work)", "forbidden");
+          if (!pauseOnly && needsApprove(msg.spec as { approvals?: string | null; check?: unknown; loop?: unknown } | undefined, r) && !hasScope(scopes, SCOPES.SESSION_APPROVE)) {
+            return err("Missing scope: session:approve (an autonomous routine, one with a check command, or one that starts a loop pre-approves work)", "forbidden");
           }
           const { routine, apiToken } = svc.update(
             r,
@@ -6556,7 +6559,7 @@ mcpHub: this.#mcpHub,
       senderFor: (run) => owned(run, 1),
       systemAuth: (run) => ({ sub: "system:loops", scopes: [], delegationDepth: 0, accountId: run.accountId, projectId: run.projectId }),
       audit: (subject, action, sessionId, detail) => this.#store.audit(subject, action, sessionId, detail),
-      notifyOwner: (run) => {
+      notifyOwner: (run, kind) => {
         // Content-blind push opens the worker session; without one, the run's
         // history and the fleet board carry it.
         if (run.workerSessionId && this.#pushService.enabled) {
@@ -6564,6 +6567,9 @@ mcpHub: this.#mcpHub,
             .notifyRoutine(run.workerSessionId, { sub: run.ownerSub, accountId: run.accountId, projectId: run.projectId })
             .catch((e) => console.error("[codeoid/push] loop notify failed:", e));
         }
+        // A routine run following this loop ends with it (the scheduler's
+        // tick would catch it too, a moment later).
+        if (kind === "finished") this.#routines?.loopRunEnded(run.id);
       },
       createWorkerSession: async (run) => {
         const workdir = run.worktreePath ?? run.contract.workdir;
@@ -6782,6 +6788,48 @@ mcpHub: this.#mcpHub,
       hasProvider: (id) => this.#providers.has(id),
       providerIds: () => this.#providers.ids(),
       normalizeWorkdir: (p) => normalizeWorkdir(p),
+      ...(this.#loops ? { loops: this.#makeRoutineLoopPort(this.#loops) } : {}),
+    };
+  }
+
+  /**
+   * Loops as routines reach them: a fire starts a run as the routine's
+   * owner, under the same rules as loop.start (its backends, its owner cap).
+   * Authorization happened when the routine was saved (#routineHandle).
+   */
+  #makeRoutineLoopPort(loops: LoopService): NonNullable<RoutineHost["loops"]> {
+    const providerProblem = (p: string | undefined): string | null => {
+      const provider = p ?? this.#providers.defaultId;
+      return LOOP_WORKER_PROVIDERS.has(provider)
+        ? null
+        : `Loops run on ${[...LOOP_WORKER_PROVIDERS].join(", ")} for now; "${provider}" cannot report an attempt's outcome yet`;
+    };
+    return {
+      providerProblem,
+      start: (input, owner) => {
+        const problem = providerProblem(input.provider);
+        if (problem) throw new LoopError(problem, "invalid_request");
+        return loops.startRun({ ...input, provider: input.provider ?? this.#providers.defaultId }, owner).id;
+      },
+      state: (id, owner) => {
+        try {
+          const run = loops.get(id, owner);
+          return {
+            status: run.status,
+            reason: run.reason,
+            attempts: loops.attempts(run.id).length,
+            costUsd: run.costUsd,
+            branch: run.branch,
+            deliveredCommit: run.deliveredCommit,
+          };
+        } catch (e) {
+          if (e instanceof LoopError && e.code === "not_found") return null;
+          throw e;
+        }
+      },
+      cancel: async (id, owner) => {
+        await loops.cancel(id, owner);
+      },
     };
   }
 

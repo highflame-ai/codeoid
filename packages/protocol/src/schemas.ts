@@ -796,6 +796,33 @@ const routineScheduleSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("every"), seconds: z.number().int().positive() }),
   z.object({ kind: z.literal("once"), at: z.string().min(1).max(64) }),
 ]);
+// A loop routine's contract: the bounds of loop.start (below).
+const routineLoopCheckSchema = z.object({
+  id: z.string().min(1).max(40).optional(),
+  command: z.string().min(1).max(4_000),
+  timeoutSec: z.number().int().min(1).max(3_600).optional(),
+  expectTests: z.boolean().optional(),
+});
+const routineLoopFields = {
+  checks: z.array(routineLoopCheckSchema).min(1).max(10),
+  toolBudget: z.number().int().min(1).max(1_000),
+  limits: z.object({
+    attempts: z.number().int().min(1).max(10).optional(),
+    attemptMinutes: z.number().int().min(1).max(240).optional(),
+    runMinutes: z.number().int().min(1).max(1_440).optional(),
+  }),
+};
+const routineLoopSchema = z.object({
+  checks: routineLoopFields.checks,
+  toolBudget: routineLoopFields.toolBudget.optional(),
+  limits: routineLoopFields.limits.optional(),
+});
+/** On update, merged over the current loop: every field optional. */
+const routineLoopPatchSchema = z.object({
+  checks: routineLoopFields.checks.optional(),
+  toolBudget: routineLoopFields.toolBudget.optional(),
+  limits: routineLoopFields.limits.optional(),
+});
 const routineSpecFields = {
   name: z.string().min(1).max(LIMITS.NAME_MAX),
   prompt: z.string().min(1).max(20_000),
@@ -841,13 +868,16 @@ const routineSpecSchema = z.object({
   keepSessions: routineSpecFields.keepSessions.optional(),
   api: routineSpecFields.api.optional(),
   failurePauseAfter: routineSpecFields.failurePauseAfter.optional(),
+  loop: routineLoopSchema.optional(),
 });
 /** An update: every field optional, and `null` clears an optional one. */
-const routinePatchSchema = z.object(
-  Object.fromEntries(Object.entries(routineSpecFields).map(([k, v]) => [k, v.nullable().optional()])) as {
-    [K in keyof typeof routineSpecFields]: z.ZodOptional<z.ZodNullable<(typeof routineSpecFields)[K]>>;
-  },
-);
+const routinePatchSchema = z
+  .object(
+    Object.fromEntries(Object.entries(routineSpecFields).map(([k, v]) => [k, v.nullable().optional()])) as {
+      [K in keyof typeof routineSpecFields]: z.ZodOptional<z.ZodNullable<(typeof routineSpecFields)[K]>>;
+    },
+  )
+  .extend({ loop: routineLoopPatchSchema.nullable().optional() });
 
 // ── Evidence (docs/loop-engineering-design.md §7) ─────────────────────────────
 

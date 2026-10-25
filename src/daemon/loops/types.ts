@@ -27,16 +27,22 @@ export interface LoopLimits {
 }
 
 /**
- * The repository event that started a run (§4 "two entry points"), when a
- * watch started it rather than a person. `summary` is event text — a check's
- * output, a comment's body — and only ever reaches a worker as data.
+ * What started a run (§4 "two entry points"), when a watch or a routine
+ * started it rather than a person. `summary` is event text — a check's
+ * output, a comment's body, a routine's gate output or payload — and only
+ * ever reaches a worker as data.
  */
 export interface LoopTrigger {
-  kind: "ci_failure" | "review_comment";
-  /** Dedupe key of the event, e.g. `ci:acme/shop:<sha>:<checkRunId>:1`. */
+  kind: "ci_failure" | "review_comment" | "routine";
+  /** Dedupe key of the event, e.g. `ci:acme/shop:<sha>:<checkRunId>:1`, or
+   *  `routine:<routineId>:<routineRunId>`. */
   key: string;
   /** The watch that saw it. */
   watchId?: string;
+  /** The routine that fired, and its run that started this one. */
+  routineId?: string;
+  routineName?: string;
+  routineRunId?: string;
   /** Where the event is on GitHub (the check run, the comment). */
   url?: string;
   summary: string;
@@ -76,7 +82,7 @@ export interface LoopContract {
   limits: LoopLimits;
   /** Work from this commit, not the user's checkout (set by watches only). */
   baseRef?: LoopBaseRef;
-  /** The event that started the run (set by watches only). */
+  /** What started the run (set by watches and routines only). */
   trigger?: LoopTrigger;
 }
 

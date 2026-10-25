@@ -1540,14 +1540,22 @@ function routineSpecOptions(cmd: Command, mode: "add" | "edit"): Command {
     .option("--notify <policy>", "on_change (default), always, or never")
     .option("--keep <n>", "run sessions to keep (default 5)")
     .option("--api", "enable the routine's API trigger (prints its token once)")
-    .option("--failure-pause <n>", "pause after N consecutive failures (default 3, 0 = never)");
+    .option("--failure-pause <n>", "pause after N consecutive failures (default 3, 0 = never)")
+    .option("--loop", "start a loop run instead of a session: the prompt is its objective, --verify its acceptance checks (docs/routines.md)")
+    .option("--verify <check>", "loop: a check its run must make pass, as `cmd` or `id: cmd` (repeatable; --check is the gate before it)", collect, [])
+    .option("--test", "loop: the --verify checks are test runs (running no tests does not pass)")
+    .option("--attempts <n>", "loop: worker attempts, including the first (default 3)")
+    .option("--attempt-minutes <n>", "loop: wall time per attempt (default 10)")
+    .option("--run-minutes <n>", "loop: active time across the run (default 30)")
+    .option("--budget <n>", "loop: autonomous tool calls per attempt (default 60)");
   if (mode === "edit") {
     cmd
       .option("--no-schedule", "remove the schedule (run on demand only)")
       .option("--no-check", "remove the check")
       .option("--no-worktree", "stop using a worktree")
       .option("--no-catch-up", "don't catch up missed fires")
-      .option("--no-api", "turn the API trigger off (revokes its token)");
+      .option("--no-api", "turn the API trigger off (revokes its token)")
+      .option("--no-loop", "run a session again instead of starting a loop");
   }
   return cmd;
 }

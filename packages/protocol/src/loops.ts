@@ -84,15 +84,23 @@ export interface LoopRunWire {
   endedAt: string | null;
   /** The commit a triggered run works from, instead of the owner's checkout. */
   baseRef?: { sha: string; branch?: string };
-  /** What started the run, when a watch did ("started by"). */
+  /** What started the run, when a watch or a routine did ("started by"). */
   trigger?: LoopTriggerWire;
 }
 
-/** The repository event that started a run. `summary` is event text: data. */
+/**
+ * What started a run: a repository event a watch saw, or a routine's fire.
+ * `summary` is event text (a check's output, a comment, a routine's gate
+ * output or payload): data.
+ */
 export interface LoopTriggerWire {
-  kind: "ci_failure" | "review_comment";
+  kind: "ci_failure" | "review_comment" | "routine";
   key: string;
   watchId?: string;
+  /** kind `routine`: the routine, and the routine run that started this one. */
+  routineId?: string;
+  routineName?: string;
+  routineRunId?: string;
   url?: string;
   summary: string;
 }

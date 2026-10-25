@@ -57,9 +57,10 @@ Leave it off and the routine runs autonomously within a tool-call budget (50 by 
 | Retention | `--keep <n>` | 5 | Run sessions kept around for you to open; older ones are cleaned up. |
 | API trigger | `--api` | off | Lets something outside codeoid fire this routine with its own token. |
 | Failure pause | `--failure-pause <n>` | 3 | Pause the routine after N failed runs in a row (0 = never). |
+| Loop | `--loop`, `--verify`, `--test`, `--attempts`, `--attempt-minutes`, `--run-minutes`, `--budget` | off | Start a verified loop run instead of a session ([below](#routines-that-start-a-loop)). |
 
 `codeoid routine edit <name>` takes the same flags and changes only the ones you pass.
-`--no-schedule`, `--no-check`, `--no-worktree`, `--no-catch-up` and `--no-api` remove a setting.
+`--no-schedule`, `--no-check`, `--no-worktree`, `--no-catch-up`, `--no-api` and `--no-loop` remove a setting.
 `codeoid routine pause`, `resume` and `rm` do what they say.
 
 ### Schedules
@@ -151,6 +152,71 @@ The summary is the agent's final message, not the commentary it wrote between to
 Each routine keeps its newest 500 runs, plus every run from today (the daily cap sums them) and the runs later runs read (the last summary, the last run that dealt with its input).
 Retention (`--keep`) removes old run sessions, but never one that is parked on you, still working, or that someone has open.
 
+## Routines that start a loop
+
+A routine can start a [loop](loops.md) instead of a session.
+A loop is a verified repair: it works in its own worktree, and its result counts only when checks the daemon runs itself pass.
+So the routine decides *when* to try, and the loop decides whether the work is done.
+
+```bash
+# Every night at 2, if the test suite has a flaky failure, try to fix it — verified, on its own branch.
+codeoid routine add flaky-repair -w ~/src/shop --cron "0 2 * * *" \
+  --check 'bun test 2>&1 | grep -E "^\(fail\)" | head -20 || true' \
+  --loop \
+  --prompt 'Fix the flaky test failures the check found. Make the tests deterministic; do not skip or delete them.' \
+  --verify 'unit: bun test' --test \
+  --attempts 3 --run-minutes 45 --daily-cost 5
+
+codeoid routine run flaky-repair --wait   # fire it now; waits for the loop run to end
+codeoid loop ls                           # the run it started, with every other loop run
+```
+
+Two flags look alike and do different jobs:
+
+- `--check <cmd>` is the routine's **gate**, the same as for any routine. It runs first; no output means nothing to do, and no loop starts.
+- `--verify "id: cmd"` is the loop's **acceptance check**, as `codeoid loop start --check` takes it (repeatable; `--test` marks them as test runs). The loop is done only when every one passes on its work.
+
+When the routine fires and the gate finds work, it starts a loop run as you, the routine's owner, in your tenant.
+The prompt is the loop's objective, as saved: placeholders aren't expanded (a prompt with `{{…}}` is refused), and it may be at most 8,000 characters.
+What the gate printed, and any payload sent with an API or manual fire, reach the worker as quoted data, never as instructions (the first 4,000 characters).
+The run is an ordinary loop run: `codeoid loop ls`, `show`, `cancel` and the web UI's loops panel show it, with `started by your routine <name>`.
+
+The routine's run follows the loop run, and `routine runs` and `routine show` name it (`loop <id> <status>`).
+It stays `running` while the loop is in progress, and ends with the loop's outcome:
+
+| Loop run | Routine run |
+| --- | --- |
+| `completed` | `succeeded`: the summary names the verified commit and its branch. Nothing is pushed. |
+| `blocked` before any attempt (the checks already pass) | `silent`: nothing to repair. |
+| `blocked` otherwise | `needs_attention`: the worker reported a conflict, or made no progress. |
+| `budget_exhausted` | `failed` (counts toward the failure pause). |
+| `failed` | `failed` (counts toward the failure pause). |
+| `cancelled` | `cancelled`. |
+
+The run's cost is the loop's.
+A loop that waits on you (an approval, a question) keeps the routine run `running`; the loop tells you itself.
+
+**One at a time.**
+A fire while the loop run its last fire started is still in progress is `skipped`, saying so.
+A fire when you already have three loop runs in progress (the loop limit per owner) is `skipped` too, and doesn't count as a failure.
+A loop routine's run doesn't take one of the two routine run slots while its loop works: the loop has its own bounds.
+
+**Budgets.**
+The loop's own limits bound the run: `--attempts` (default 3), `--attempt-minutes` (10), `--run-minutes` (30), and `--budget`, its tool calls per attempt (60).
+`--daily-cost` still applies, against what the routine's loop runs spent that UTC day.
+The settings that shape a session run don't apply to a loop routine: `--tool-budget`, `--max-minutes` and `--keep` are refused by the CLI (the daemon leaves them unused).
+Those that would promise something a loop can't keep are refused: `--guarded` (a loop's worker runs autonomously within its budget), `--persistent`, `--worktree` (a loop always has its own), `--max-cost` (a loop has no per-run spend ceiling), and `--overlap queue`.
+Loops run on the Claude backend for now, so `--provider` must be `claude` (or left to a Claude default).
+
+**Editing.**
+`routine edit <name> --loop --verify "…"` makes a routine start a loop, and `--no-loop` makes it run a session again.
+On a loop routine, `--verify` replaces its checks and `--attempts`, `--budget` and the other limits change only themselves.
+
+**Who can do what.**
+Saving, changing, firing, re-tokening or resuming a loop routine needs what `codeoid loop start` needs (`session:create`, `session:send` and `session:approve`), and a delegated token can't do any of it.
+Cancelling its run (`codeoid routine cancel <runId>`) cancels the loop run, and deleting the routine cancels a loop run still in progress.
+As for every routine, your scopes are checked when you save or change it, not each time it fires (see [A routine outlives the token that created it](#who-can-do-what)): revoking your credential doesn't stop a loop routine you already saved, so pause or delete it when access should end.
+
 ## Triggers
 
 **Schedule.** As above.
@@ -228,7 +294,7 @@ Two consequences of runs being ordinary sessions are worth knowing when your ten
 Routines have no scope of their own; they use the ones you already hold.
 A routine creates sessions and prompts them, so every routine command needs `session:create` and `session:send`, reading included: a routine's definition and run history are not for read-only watchers.
 Only `routine preview`, which saves nothing, needs just `session:list`.
-A routine that is autonomous, or that has a check, also needs `session:approve` to save, run by hand, re-token or resume (pausing never does: it is a safety stop): an autonomous run approves its own tool calls, and a check is a shell command that runs on the daemon's host without asking anyone, so only someone who could approve that command interactively may set it going.
+A routine that is autonomous, that has a check, or that starts a loop also needs `session:approve` to save, run by hand, re-token or resume (pausing never does: it is a safety stop): an autonomous run approves its own tool calls, and a check is a shell command that runs on the daemon's host without asking anyone, so only someone who could approve that command interactively may set it going.
 A delegated token can list routines but not create, change, fire or delete them: a routine is standing authority, and delegation is meant to be narrow.
 That covers a teammate's share token (it arrives delegated, whatever scopes it carries) and an agent acting for someone, so a teammate you share a session with cannot schedule work on your machine.
 
