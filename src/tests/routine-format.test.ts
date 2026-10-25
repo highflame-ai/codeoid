@@ -123,13 +123,23 @@ describe("output", () => {
   });
 
   it("the list is a table with state, next fire, and the last outcome", () => {
-    const lines = formatRoutineList([routine({ lastRun: run() }), routine({ name: "paused-one", enabled: false, pausedReason: "paused after 3 consecutive failed runs" })], NOW);
-    expect(lines[0]).toMatch(/^NAME\s+STATE\s+SCHEDULE\s+NEXT\s+LAST RUN$/);
+    const lines = formatRoutineList([routine({ lastRun: run(), lastOutcome: run() }), routine({ name: "paused-one", enabled: false, pausedReason: "paused after 3 consecutive failed runs" })], NOW);
+    expect(lines[0]).toMatch(/^NAME\s+STATE\s+SCHEDULE\s+NEXT\s+LAST OUTCOME$/);
     expect(lines[1]).toContain("triage");
     expect(lines[1]).toContain("in 1h");
     expect(lines[1]).toContain("succeeded 2m ago");
     expect(lines[2]).toContain("paused!");
     expect(formatRoutineList([], NOW)[0]).toContain("No routines");
+  });
+
+  it("a loop routine's blocked loop shows, not the fire skipped behind it", () => {
+    const blocked = run({ id: "run-0", status: "needs_attention", createdAt: "2026-10-16T07:40:00Z", endedAt: "2026-10-16T07:55:00Z", loop: { runId: "loop_1", status: "blocked" } });
+    const skipped = run({ status: "skipped", createdAt: "2026-10-16T07:50:00Z", endedAt: "2026-10-16T07:50:00Z" });
+    const [, line] = formatRoutineList([routine({ lastRun: skipped, lastOutcome: blocked })], NOW);
+    expect(line).toContain("needs_attention 5m ago");
+    expect(line).not.toContain("skipped");
+    // Nothing has done its work yet: the last run is all there is.
+    expect(formatRoutineList([routine({ lastRun: skipped })], NOW)[1]).toContain("skipped 10m ago");
   });
 
   it("a run shows its outcome, reason, a bounded summary, and where to look", () => {
@@ -146,5 +156,44 @@ describe("output", () => {
     expect(text).toContain("15m per run · $1.00 per run");
     expect(text).toContain("no output = nothing to do");
     expect(text).toContain("recent runs");
+  });
+});
+
+describe("loop routine flags", () => {
+  it("--loop with --verify builds the loop; --check stays the gate", () => {
+    const spec = specFromFlags(
+      "flaky",
+      { prompt: "Fix it.", loop: true, check: "bun test | grep fail", verify: ["unit: bun test", "bun run lint"], test: true, attempts: "4", runMinutes: "45", budget: "30" },
+      "add",
+    );
+    expect(spec.check).toEqual({ command: "bun test | grep fail" });
+    expect(spec.loop).toEqual({
+      checks: [
+        { id: "unit", command: "bun test", expectTests: true },
+        { command: "bun run lint", expectTests: true },
+      ],
+      toolBudget: 30,
+      limits: { attempts: 4, runMinutes: 45 },
+    });
+  });
+
+  it("refuses loop flags without --loop, --loop without --verify, and session-run flags a loop would ignore", () => {
+    expect(() => specFromFlags("x", { prompt: "p", verify: ["bun test"] }, "add")).toThrow(RoutineFlagError);
+    expect(() => specFromFlags("x", { prompt: "p", loop: true, verify: [] }, "add")).toThrow(/--verify/);
+    expect(() => specFromFlags("x", { prompt: "p", loop: true, verify: ["t"], toolBudget: "5" }, "add")).toThrow(/--budget/);
+    expect(() => specFromFlags("x", { prompt: "p", loop: true, verify: ["t"], maxMinutes: "5" }, "add")).toThrow(/--run-minutes/);
+    expect(() => specFromFlags("x", { prompt: "p", loop: true, test: true }, "add")).toThrow(/--test/);
+  });
+
+  it("edit sends only what changed; --no-loop clears it", () => {
+    expect(specFromFlags("x", { attempts: "5" }, "edit")).toEqual({ loop: { limits: { attempts: 5 } } });
+    expect(specFromFlags("x", { loop: false }, "edit")).toEqual({ loop: null });
+    expect(specFromFlags("x", { verify: [] }, "edit")).toEqual({});
+    expect(() => specFromFlags("x", { loop: false, attempts: "2" }, "edit")).toThrow(RoutineFlagError);
+  });
+
+  it("show and runs name the loop", () => {
+    const run = { id: "r1", routineId: "rt", trigger: "manual", status: "running", createdAt: new Date().toISOString(), costUsd: 0, inputTokens: 0, outputTokens: 0, loop: { runId: "loop_1", status: "verifying" } } as RoutineRunWire;
+    expect(formatRun(run).join("\n")).toContain("loop loop_1  verifying  (codeoid loop show loop_1)");
   });
 });

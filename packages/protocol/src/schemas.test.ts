@@ -213,6 +213,16 @@ const samples: { [T in ClientTypes]: Extract<ClientMessage, { type: T }> } = {
   "loop.pause": { type: "loop.pause", id: "lp5", runId: "loop_1" },
   "loop.resume": { type: "loop.resume", id: "lp6", runId: "loop_1" },
   "loop.steer": { type: "loop.steer", id: "lp7", runId: "loop_1", text: "keep the old API" },
+  "loop.watch.create": {
+    type: "loop.watch.create",
+    id: "lw1",
+    spec: { workdir: "/tmp/repo", myPrs: true, ci: [{ ciName: "test (*)", command: "bun test", expectTests: true }, { ciName: "lint", app: "circleci-checks", command: "bun run lint" }], review: { enabled: true, allow: ["octocat"] }, trust: ["hubot"] },
+  },
+  "loop.watch.list": { type: "loop.watch.list", id: "lw2" },
+  "loop.watch.get": { type: "loop.watch.get", id: "lw3", watchId: "lw_1" },
+  "loop.watch.update": { type: "loop.watch.update", id: "lw4", watchId: "lw_1", enabled: false, spec: { maxRunsPerHour: 2 } },
+  "loop.watch.delete": { type: "loop.watch.delete", id: "lw5", watchId: "lw_1" },
+  "loop.watch.poll": { type: "loop.watch.poll", id: "lw6", watchId: "lw_1" },
   "routine.run": { type: "routine.run", id: "rt6", routine: "nightly", payload: "PR #12" },
   "routine.cancel_run": { type: "routine.cancel_run", id: "rt7", runId: "run-1" },
   "routine.runs": { type: "routine.runs", id: "rt8", routine: "nightly", limit: 20, before: "2026-10-16T00:00:00.000Z" },
@@ -594,5 +604,67 @@ describe("session.ui_response payload exclusivity", () => {
       });
       expect(result.ok).toBe(true);
     }
+  });
+});
+
+describe("loop.watch trustHead", () => {
+  test("true, or branches each pinned to a commit by its full id (never a prefix): a compare-and-set", () => {
+    const update = (trustHead: unknown) => parseClientMessage({ type: "loop.watch.update", id: "u1", watchId: "lw_1", trustHead });
+    expect(update(true).ok).toBe(true);
+    expect(update({ main: "0123456789abcdef0123456789abcdef01234567" }).ok).toBe(true);
+    expect(update({ main: "0123456789ABCDEF0123456789ABCDEF01234567", release: "f".repeat(64) }).ok).toBe(true);
+    expect(update({ main: "0123456789ab" }).ok).toBe(false);
+    expect(update({ main: "f".repeat(39) }).ok).toBe(false);
+    expect(update({ main: "f".repeat(41) }).ok).toBe(false);
+    expect(update({ main: "g".repeat(40) }).ok).toBe(false);
+    expect(update({}).ok).toBe(false);
+    expect(update("main").ok).toBe(false);
+    const create = parseClientMessage({ type: "loop.watch.create", id: "c1", spec: { workdir: "/r", branches: ["main"], ci: [{ ciName: "t", command: "t" }] }, trustHead: { main: "0123456789abcdef0123456789abcdef01234567" } });
+    expect(create.ok).toBe(true);
+  });
+});
+
+describe("routine loop (a routine that starts a loop)", () => {
+  const spec = (loop: unknown) => ({ name: "flaky", prompt: "Fix the flaky tests.", workdir: "/r", loop });
+  const create = (loop: unknown) => parseClientMessage({ type: "routine.create", id: "c1", spec: spec(loop) });
+  const update = (loop: unknown) => parseClientMessage({ type: "routine.update", id: "u1", routine: "flaky", spec: { loop } });
+
+  test("a loop round-trips through create unchanged", () => {
+    const msg = {
+      type: "routine.create",
+      id: "c1",
+      spec: spec({
+        checks: [{ id: "unit", command: "bun test", timeoutSec: 900, expectTests: true }],
+        toolBudget: 40,
+        limits: { attempts: 4, attemptMinutes: 15, runMinutes: 60 },
+      }),
+    };
+    expect(parseClientMessage(msg)).toEqual({ ok: true, value: msg as ClientMessage });
+  });
+
+  test("bounds match loop.start: 1–10 checks, attempts 1–10, attemptMinutes 1–240, runMinutes 1–1440, toolBudget 1–1000", () => {
+    const check = { command: "bun test" };
+    expect(create({ checks: [check] }).ok).toBe(true);
+    expect(create({ checks: [] }).ok).toBe(false);
+    expect(create({}).ok).toBe(false);
+    expect(create({ checks: Array.from({ length: 11 }, () => check) }).ok).toBe(false);
+    expect(create({ checks: [{ command: "" }] }).ok).toBe(false);
+    expect(create({ checks: [{ command: "x".repeat(4_001) }] }).ok).toBe(false);
+    expect(create({ checks: [{ command: "a", timeoutSec: 3_601 }] }).ok).toBe(false);
+    expect(create({ checks: [{ id: "x".repeat(41), command: "a" }] }).ok).toBe(false);
+    expect(create({ checks: [check], limits: { attempts: 11 } }).ok).toBe(false);
+    expect(create({ checks: [check], limits: { attemptMinutes: 241 } }).ok).toBe(false);
+    expect(create({ checks: [check], limits: { runMinutes: 1_441 } }).ok).toBe(false);
+    expect(create({ checks: [check], toolBudget: 0 }).ok).toBe(false);
+    expect(create({ checks: [check], toolBudget: 1_001 }).ok).toBe(false);
+  });
+
+  test("an update may leave the checks out (merged over the current loop), or clear the loop with null", () => {
+    expect(update({ limits: { attempts: 5 } }).ok).toBe(true);
+    expect(update({ checks: [{ command: "bun test" }] }).ok).toBe(true);
+    expect(update(null).ok).toBe(true);
+    expect(update({ checks: [] }).ok).toBe(false);
+    const parsed = update({ toolBudget: 30 });
+    expect(parsed.ok && (parsed.value as { spec?: { loop?: unknown } }).spec?.loop).toEqual({ toolBudget: 30 });
   });
 });

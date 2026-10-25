@@ -12,7 +12,7 @@ import type { CheckRun } from "../evidence/service.js";
 import type { CheckSpec, EvidenceRecord } from "../evidence/types.js";
 import { type CandidateCheckout, LoopError, type LoopHost, LoopService, type LoopStartInput, judgeAttempt } from "./service.js";
 import { LoopStore } from "./store.js";
-import type { LoopAttemptRow, LoopRunRow } from "./types.js";
+import { type LoopAttemptRow, type LoopRunRow, LoopWorkspaceUnsupportedError } from "./types.js";
 
 const OWNER = { sub: "user:a", accountId: "acct", projectId: "proj" };
 
@@ -141,8 +141,12 @@ class FakeHost implements LoopHost {
     const attempt = this.service.attempts(runId).at(-1)!;
     queueMicrotask(() => this.#perform("worker-1", runId, attempt.id, step));
   }
+  /** Spend an interrupted turn reports as it ends, a moment after the interrupt. */
+  drainSpend = 0;
+  #drained = 0;
+  #draining: Promise<void> | null = null;
   workerInfo() {
-    return { status: this.#hung ? ("thinking" as const) : ("idle" as const), costUsd: 0.1 * this.prompts.length };
+    return { status: this.#hung ? ("thinking" as const) : ("idle" as const), costUsd: 0.1 * this.prompts.length + this.#drained };
   }
   async quiesceWorker(id: string): Promise<void> {
     this.quiesced.push(id);
@@ -150,6 +154,15 @@ class FakeHost implements LoopHost {
   }
   async interruptWorker(): Promise<void> {
     this.interrupts++;
+    if (this.drainSpend && !this.#draining) {
+      const spend = this.drainSpend;
+      this.drainSpend = 0;
+      this.#draining = Bun.sleep(5).then(() => {
+        this.#drained += spend;
+      });
+    }
+    // As the real host: every interrupt resolves once the turn has ended.
+    if (this.#draining) await this.#draining;
     if (this.#hung) {
       const h = this.#hung;
       this.#hung = null;
@@ -231,8 +244,11 @@ class FakeHost implements LoopHost {
     this.commits.push({ message, tree });
     return "c0ffee";
   }
+  /** The run's spend as each notice saw it. */
+  notifiedCost: number[] = [];
   notifyOwner(run: LoopRunRow, kind: string): void {
     this.notified.push(`${kind}:${run.status}`);
+    this.notifiedCost.push(run.costUsd);
   }
   audit(): void {}
 }
@@ -362,6 +378,33 @@ describe("control", () => {
     await Bun.sleep(20);
     expect(service.get(id, OWNER).status).toBe("cancelled");
     expect(host.commits).toHaveLength(0);
+  });
+
+  test("a cancel charges the attempt in flight, and tells whoever follows the run", async () => {
+    const { host, service } = setup();
+    host.steps = [{ hang: true }];
+    const id = service.startRun(input(), OWNER).id;
+    await settle(service, id, () => service.attempts(id)[0]?.status === "running");
+    const cancelled = await service.cancel(id, OWNER);
+    // The worker spent 0.10 on the attempt before it was stopped.
+    expect(service.attempts(id)[0]!.costUsd).toBeCloseTo(0.1);
+    expect(cancelled.costUsd).toBeCloseTo(0.1);
+    expect(service.get(id, OWNER).costUsd).toBeCloseTo(0.1);
+    expect(host.notified).toContain("cancelled:cancelled");
+  });
+
+  test("a cancel charges what the interrupted turn reports as it ends, before it tells anyone", async () => {
+    const { host, service } = setup();
+    host.steps = [{ hang: true }];
+    const id = service.startRun(input(), OWNER).id;
+    await settle(service, id, () => service.attempts(id)[0]?.status === "running");
+    host.drainSpend = 0.05;
+    const cancelled = await service.cancel(id, OWNER);
+    expect(service.attempts(id)[0]!.costUsd).toBeCloseTo(0.15);
+    expect(cancelled.costUsd).toBeCloseTo(0.15);
+    expect(service.get(id, OWNER).costUsd).toBeCloseTo(0.15);
+    expect(host.notified.at(-1)).toBe("cancelled:cancelled");
+    expect(host.notifiedCost.at(-1)).toBeCloseTo(0.15);
   });
 
   test("an approval wait holds the task and stops the clock; answering resumes it", async () => {
@@ -997,3 +1040,92 @@ describe("audit round 4", () => {
   });
 });
 
+describe("triggered runs", () => {
+  const SHA = "a".repeat(40);
+  const trigger = (kind: "ci_failure" | "review_comment") => ({ kind, key: `k:${kind}`, watchId: "lw_1", url: "https://github.com/acme/shop/pull/1", summary: "Check \"test\" concluded failure." });
+
+  test.each([
+    [{ baseRef: { sha: "abc" } }, "full commit id"],
+    [{ baseRef: { sha: SHA, branch: "--force" } }, "branch name"],
+    [{ baseRef: { sha: SHA, repo: "acme/shop", fetchRef: "refs/tags/v1" } }, "fetchRef"],
+    [{ baseRef: { sha: SHA, fetchRef: "refs/pull/1/head" } }, "needs baseRef.repo"],
+    [{ baseRef: { sha: SHA, repo: "../evil", fetchRef: "refs/pull/1/head" } }, "GitHub repository"],
+  ])("rejects %j", (bad, message) => {
+    const { service } = setup();
+    expect(() => service.startRun(input(bad as Partial<LoopStartInput>), OWNER)).toThrow(message);
+  });
+
+  test("the base commit and the event are part of the contract; workspace notes reach the history", async () => {
+    class NotingHost extends FakeHost {
+      prepared: LoopRunRow[] = [];
+      override async prepareWorkspace(run: LoopRunRow) {
+        this.prepared.push(run);
+        return { ...(await super.prepareWorkspace(run)), notes: ["the repository's setup command did not run: base-not-on-primary"] };
+      }
+    }
+    const { host, service } = setup(new NotingHost());
+    host.steps = [{ edit: " fix" }];
+    const started = service.startRun(input({ baseRef: { sha: SHA, branch: "feature/x", repo: "acme/shop", fetchRef: "refs/pull/1/head", trusted: true }, trigger: trigger("ci_failure") }), OWNER);
+    const run = await settle(service, started.id, terminal);
+    expect(run.status).toBe("completed");
+    expect((host as NotingHost).prepared[0]!.contract.baseRef).toEqual({ sha: SHA, branch: "feature/x", repo: "acme/shop", fetchRef: "refs/pull/1/head", trusted: true });
+    expect(run.contract.trigger).toMatchObject({ kind: "ci_failure", watchId: "lw_1" });
+    expect(service.events(run.id).find((e) => e.type === "workspace.note")?.detail).toContain("setup command did not run");
+    expect(host.prompts[0]).toContain('<loop-data source="ci"');
+    expect(host.prompts[0]).toContain("on branch `feature/x`");
+  });
+
+  test("a review comment's run proceeds when its checks already pass: they guard the change", async () => {
+    const { host, service } = setup();
+    host.workspace = "base fix";
+    host.steps = [{ edit: " renamed", report: { outcome: "ready_for_verification", summary: "renamed" } }];
+    const run = await settle(service, service.startRun(input({ baseRef: { sha: SHA }, trigger: trigger("review_comment") }), OWNER).id, terminal);
+    expect(run.status).toBe("completed");
+    expect(host.prompts[0]).toContain("every check passed on the unmodified code");
+    expect(host.prompts[0]).toContain('<loop-data source="review comment"');
+  });
+
+  test("a review comment's run whose worker changed nothing says so, not that the checks are flaky", async () => {
+    const { host, service } = setup();
+    host.workspace = "base fix";
+    host.steps = [{ report: { outcome: "ready_for_verification", summary: "nothing to do" } }];
+    const run = await settle(service, service.startRun(input({ baseRef: { sha: SHA }, trigger: trigger("review_comment") }), OWNER).id, terminal);
+    expect(run.status).toBe("blocked");
+    expect(run.reason).toContain("changed no tracked file");
+    expect(run.reason).not.toContain("flaky");
+  });
+
+  test("a run that couldn't prepare its workspace reports why, for a watch to retry", async () => {
+    class BrokenHost extends FakeHost {
+      override async prepareWorkspace(): Promise<never> {
+        throw new Error("commit aaaa could not be fetched: fatal: transport 'file' not allowed");
+      }
+    }
+    const { service } = setup(new BrokenHost());
+    const run = await settle(service, service.startRun(input({ baseRef: { sha: SHA }, trigger: trigger("ci_failure") }), OWNER).id, terminal);
+    expect(run.status).toBe("failed");
+    expect(service.setupFailure(run.id)).toMatchObject({ retry: true });
+    expect(service.setupFailure(run.id)!.reason).toContain("transport 'file' not allowed");
+    expect(service.isActive(run.id)).toBe(false);
+  });
+
+  test("a workspace that can't be prepared at all says so, for a watch not to retry", async () => {
+    class ShallowHost extends FakeHost {
+      override async prepareWorkspace(): Promise<never> {
+        throw new LoopWorkspaceUnsupportedError("this repository is a shallow clone");
+      }
+    }
+    const { service } = setup(new ShallowHost());
+    const run = await settle(service, service.startRun(input({ baseRef: { sha: SHA }, trigger: trigger("ci_failure") }), OWNER).id, terminal);
+    expect(run.status).toBe("failed");
+    expect(service.setupFailure(run.id)).toMatchObject({ retry: false });
+    expect(service.setupFailure(run.id)!.reason).toContain("shallow clone");
+  });
+
+  test("a CI trigger whose checks pass locally still has nothing to repair", async () => {
+    const { host, service } = setup();
+    host.workspace = "base fix";
+    const run = await settle(service, service.startRun(input({ baseRef: { sha: SHA }, trigger: trigger("ci_failure") }), OWNER).id, terminal);
+    expect(run.status).toBe("blocked");
+  });
+});

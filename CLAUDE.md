@@ -183,7 +183,10 @@ codeoid mcp signin <server> [--callback-url <u>]        # sign in to an OAuth re
 codeoid evidence <id> [--full]   # one recorded check: what ran, on which tree, what it found
 codeoid loop start "<objective>" --workdir <dir> --check <cmd> [--test] [--wait]  # repair until the daemon's checks pass (docs/loops.md)
 codeoid loop ls | show <id> [--events] | steer <id> <text> | pause | resume | cancel <id>
+codeoid loop watch add --workdir <dir> (--branch <b>... | --my-prs) --ci "<check>[@app]: <cmd>" [--review] [--trust <login>]  # CI failures / review comments start runs
+codeoid loop watch ls | show | poll | pause | resume | rm <id>
 codeoid routine add <name> --prompt … [--cron|--every|--at] [--check <cmd>]  # scheduled agent runs
+codeoid routine add <name> --loop --prompt … --verify "id: cmd" [--test] [--attempts N] [--attempt-minutes N] [--run-minutes N] [--budget N]  # start a loop (--check = gate, --verify = its acceptance checks)
 codeoid routine ls | show | runs | run [--wait] | edit | pause | resume | rm | cancel <runId> | token | preview
 codeoid worktree trust [dir] [--off] [--yes]  # trust the setup command of a repo's .codeoid/setup.yaml, pinned to its blob (docs/CONFIGURATION.md)
 ```
@@ -208,9 +211,22 @@ or an API call. `RoutineService` owns the scheduler and runs; it reaches
 sessions only through the `RoutineHost` seam that `SessionManager` implements,
 and every routine.* message is authorized in `SessionManager.#routineHandle`
 (owner-only, no scope of its own: session:create + session:send for
-everything but preview, plus session:approve for an autonomous routine or one
-with a check; changes are refused to delegated tokens). The fire claim is a compare-and-set on
-`next_fire_at`, which is the only scheduler lock.
+everything but preview, plus session:approve for an autonomous routine, one
+with a check, or one that starts a loop; changes are refused to delegated tokens). The fire claim is a compare-and-set on
+`next_fire_at`, which is the only scheduler lock. A loop routine (`spec.loop`)
+starts a loop run through `RoutineHost.loops` after its gate; its routine run
+follows the loop (`loopRunId`) without holding a run slot and ends with the
+loop's outcome.
+A loop that ends blocked after trying is `needs_attention` there, and for a loop routine that counts toward the failure pause.
+`#followLoops` runs at the start of every tick and on every loop end or cancel (`notifyOwner` kind `cancelled`); without a loop port it fails the following runs.
+A loop routine's run is set `running` before `port.start`, and `RoutineService.start` relinks a run whose loop started before the run recorded it (`RoutineLoopPort.inProgress`, owner-scoped, and only when the loop's trigger names that run's routine); the routine's `notify` policy decides a routine-started loop's pushes (`loopMayPush`).
+`delete` marks the routine in `#deleting` before its first await, and `fire`, `#fireScheduled`, `#admit`, `#drainQueue` and `#startLoopRun` refuse a routine being deleted.
+`RoutineWire.lastOutcome` (`RoutineStore.lastOutcome`) is the newest run with an outcome by `ended_at`; anything meaning "how is it doing" reads it, not `lastRun`.
+The API fire reply (`routines/http.ts`) gives a generic reason, never the run's own (it can name a loop run).
+A loop cancel re-reads the worker's spend after the worker stopped (the host's `interruptWorker` waits, bounded, for the interrupted turn to drain: `Session.turnDrained`) and only then notifies.
+A pinned vouch (`trustHead` record) takes full commit ids only, and its moved-head refusal carries `response.error` `detail` (`head_moved`), which `RequestError` in packages/core keeps.
+The web never vouches unpinned (not on create either) and never pre-fills a vouch from an untrusted head.
+The web's automation stores reset on an identity change (`web/src/state/automation-identity.ts`, keyed by `identityKey`), not on a new connection, so a routine token shown once survives a reconnect and is shown only to the identity that asked.
 
 ## Config
 

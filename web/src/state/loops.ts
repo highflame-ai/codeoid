@@ -16,6 +16,11 @@
  * without the scopes, stops the background watch until a read succeeds again
  * (opening the view asks), rather than asking every half minute.
  *
+ * What one identity read is never shown to another: the store is emptied the
+ * moment the identity changes or signs out ({@link setLoopsIdentity}), and a
+ * reply to a request asked before then changes nothing. A reconnect as the
+ * same identity keeps it.
+ *
  * Every control replies with a `loop.snapshot`; each reply replaces the run.
  * Errors are caught and kept as strings; nothing here throws except
  * `startLoop`, whose caller shows the daemon's words in its form.
@@ -122,16 +127,30 @@ function applySnapshot(snap: LoopSnapshotMsg): void {
 // ── Reads ────────────────────────────────────────────────────────────────────
 
 let unavailable = false;
-/** The connection the shown runs were read over; a new one starts empty. */
-let readOver: object | null = null;
+/** Who the store reads as (identityKey); null = nobody signed in. */
+let identity: string | null = null;
+/** Bumped when the identity changes: a reply to what was asked before changes nothing. */
+let generation = 0;
+
+/**
+ * The identity this client acts as changed, or signed out (null): every run
+ * shown goes now. The same identity again (a reconnect) keeps them.
+ */
+export function setLoopsIdentity(key: string | null): void {
+  if (key === identity) return;
+  identity = key;
+  generation += 1;
+  inflight = 0;
+  unavailable = false;
+  setState({ ...EMPTY });
+  reschedule();
+  if (key !== null && (viewOpen() || watchers > 0)) void fetchLoops();
+}
 
 export async function fetchLoops(): Promise<void> {
   const id = newRequestId();
   const client = getClient();
-  if (readOver !== null && readOver !== client) {
-    setState((s) => ({ ...s, runs: [], detail: null, selectedId: null, loaded: false }));
-  }
-  readOver = client;
+  const asked = generation;
   try {
     const res = await client.request<LoopListResultMsg>(
       { type: "loop.list", id },
@@ -140,9 +159,11 @@ export async function fetchLoops(): Promise<void> {
         timeoutMs: READ_TIMEOUT_MS,
       },
     );
+    if (asked !== generation) return;
     unavailable = false;
     setState((s) => ({ ...s, runs: res.runs, loaded: true, error: s.selectedId ? s.error : null }));
   } catch (e) {
+    if (asked !== generation) return;
     if (isUnavailable(e)) {
       unavailable = true;
       reschedule();
@@ -157,13 +178,16 @@ export async function fetchLoops(): Promise<void> {
 export async function fetchLoop(runId: string): Promise<void> {
   const id = newRequestId();
   const events = state().historyOpen;
+  const asked = generation;
   try {
     const snap = await getClient().request<LoopSnapshotMsg>(
       { type: "loop.get", id, runId, ...(events ? { events: true } : {}) },
       { waitForResult: snapshotOf(id), timeoutMs: READ_TIMEOUT_MS },
     );
+    if (asked !== generation) return;
     applySnapshot(snap);
   } catch (e) {
+    if (asked !== generation) return;
     // A read for a run the user has since left must not paint its error over another.
     if (state().selectedId === runId) setState((s) => ({ ...s, error: errMessage(e) }));
   }
@@ -198,6 +222,7 @@ let inflight = 0;
 
 async function control(build: (id: string) => ClientMessage): Promise<boolean> {
   const id = newRequestId();
+  const asked = generation;
   inflight += 1;
   setState((s) => ({ ...s, busy: true, error: null }));
   try {
@@ -205,14 +230,18 @@ async function control(build: (id: string) => ClientMessage): Promise<boolean> {
       waitForResult: snapshotOf(id),
       timeoutMs: READ_TIMEOUT_MS,
     });
+    if (asked !== generation) return false;
     applySnapshot(snap);
     return true;
   } catch (e) {
-    setState((s) => ({ ...s, error: errMessage(e) }));
+    if (asked === generation) setState((s) => ({ ...s, error: errMessage(e) }));
     return false;
   } finally {
-    inflight -= 1;
-    setState((s) => ({ ...s, busy: inflight > 0 }));
+    // A reset already zeroed the count this one was part of.
+    if (asked === generation) {
+      inflight -= 1;
+      setState((s) => ({ ...s, busy: inflight > 0 }));
+    }
   }
 }
 
@@ -239,12 +268,14 @@ export function steerLoop(runId: string, text: string): Promise<boolean> {
  */
 export async function startLoop(body: Omit<LoopStartMsg, "id">): Promise<LoopRunWire> {
   const id = newRequestId();
+  const asked = generation;
   let snap: LoopSnapshotMsg;
   try {
     snap = await getClient().request<LoopSnapshotMsg>({ ...body, id }, { waitForResult: snapshotOf(id), timeoutMs: START_TIMEOUT_MS });
   } catch (e) {
     throw new Error(errMessage(e));
   }
+  if (asked !== generation) throw new Error("You signed in as someone else while the run was started, so it isn't shown here.");
   setState((s) => ({ ...s, selectedId: snap.run.id, detail: null, historyOpen: false, error: null }));
   applySnapshot(snap);
   return snap.run;
@@ -311,7 +342,9 @@ export function watchLoops(): () => void {
 
 /** Test-only: reset the singleton and stop polling. */
 export function _resetLoopsForTest(): void {
-  readOver = null;
+  identity = null;
+  generation = 0;
+  inflight = 0;
   if (timer !== null) clearInterval(timer);
   timer = null;
   timerMs = null;

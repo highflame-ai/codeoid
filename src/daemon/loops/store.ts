@@ -340,6 +340,19 @@ export class LoopStore {
     ).map(toRun);
   }
 
+  /** One owner's runs not in a terminal status, oldest first. */
+  listActiveOwnedRuns(tenant: LoopTenant, ownerSub: string): LoopRunRow[] {
+    return (
+      this.#db
+        .prepare(
+          `SELECT * FROM loop_runs WHERE account_id = ? AND project_id = ? AND owner_sub = ?
+           AND status NOT IN ('completed','budget_exhausted','blocked','failed','cancelled')
+           ORDER BY created_at`,
+        )
+        .all(tenant.accountId, tenant.projectId, ownerSub) as RunDbRow[]
+    ).map(toRun);
+  }
+
   /** Runs not in a terminal status — what boot reconciliation looks at. */
   listActiveRuns(): LoopRunRow[] {
     return (

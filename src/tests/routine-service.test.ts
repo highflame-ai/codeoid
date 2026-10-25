@@ -953,6 +953,8 @@ describe("management", () => {
       reason: null,
       checkOutput: null,
       payload: null,
+      loopRunId: null,
+      loopStatus: null,
     });
     svc.start();
     svc.stop();

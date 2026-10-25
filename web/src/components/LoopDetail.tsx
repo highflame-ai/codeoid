@@ -40,6 +40,8 @@ export interface LoopDetailProps {
   onSteer: (text: string) => Promise<boolean>;
   onOpenWorker: () => void;
   onToggleHistory: (open: boolean) => void;
+  /** A run a routine started links to the routine. */
+  onOpenRoutine?: (routineId: string) => void;
 }
 
 const labelClass = "text-[10px] font-semibold uppercase tracking-wider text-fg-faint";
@@ -235,6 +237,44 @@ export const LoopDetail: Component<LoopDetailProps> = (props) => {
         <dd class="truncate font-mono text-fg-muted" title={r().workdir}>
           {r().workdir}
         </dd>
+        <Show when={r().trigger}>
+          {(t) => (
+            <>
+              <dt class={labelClass}>Started by</dt>
+              <dd class="text-fg-muted" data-testid="loop-trigger">
+                <Show
+                  when={t().kind === "routine"}
+                  fallback={t().kind === "ci_failure" ? "a failing CI check" : "a review comment"}
+                >
+                  your routine{" "}
+                  <Show when={t().routineId && props.onOpenRoutine} fallback={<span class="font-mono">{t().routineName ?? t().routineId}</span>}>
+                    <button
+                      type="button"
+                      class="font-mono text-accent underline-offset-2 hover:underline"
+                      onClick={() => props.onOpenRoutine!(t().routineId!)}
+                    >
+                      {t().routineName ?? t().routineId}
+                    </button>
+                  </Show>
+                </Show>
+                <Show when={r().baseRef?.branch}>
+                  {" "}on <span class="font-mono">{r().baseRef!.branch}</span>
+                </Show>
+                {/* GitHub links only: the URL came from an API response. */}
+                <Show when={t().url?.startsWith("https://github.com/") ? t().url : undefined}>
+                  {(url) => (
+                    <>
+                      {" "}
+                      <a class="text-accent underline-offset-2 hover:underline" href={url()} target="_blank" rel="noopener noreferrer">
+                        view
+                      </a>
+                    </>
+                  )}
+                </Show>
+              </dd>
+            </>
+          )}
+        </Show>
         <dt class={labelClass}>Branch</dt>
         <dd class="font-mono text-fg-muted">
           {r().branch ?? "not created yet"}

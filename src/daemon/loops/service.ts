@@ -28,23 +28,29 @@
  * `LoopHost`, so it is testable without a SessionManager.
  */
 
+import type { ResponseErrorDetail } from "../../protocol/types.js";
 import type { CheckRun } from "../evidence/service.js";
 import type { CheckSpec, EvidenceRecord } from "../evidence/types.js";
 import { answerPrompt, firstAttemptPrompt, nextAttemptPrompt, takeoverPreamble, withSteering } from "./prompt.js";
 import type { LoopStore, LoopTenant, RunPatch } from "./store.js";
 import type { LoopReportInput } from "./tools.js";
+import { isRepo } from "./triggers/github.js";
 import {
   APPROVAL_WAIT,
   QUESTION_WAIT_PREFIX,
   isTerminalLoopStatus,
   LOOP_DEFAULTS,
   LOOP_LIMITS,
+  LoopWorkspaceUnsupportedError,
+  WORKSPACE_UNSUPPORTED_EVENT,
   type AttemptResult,
   type LoopAttemptRow,
+  type LoopBaseRef,
   type LoopCheck,
   type LoopContract,
   type LoopRunRow,
   type LoopStatus,
+  type LoopTrigger,
 } from "./types.js";
 
 // ── Host seam ────────────────────────────────────────────────────────────────
@@ -65,7 +71,8 @@ export interface PreparedWorkspace {
   baseRevision: string;
   /** Paths the setup recipe copied or linked; kept out of the delivered commit. */
   setupPaths: string[];
-  /** What preparing the workspace did that the run's history should say. */
+  /** What preparing the workspace did that the run's history should say
+   *  (setup's put-back files, a setup command that didn't run and why). */
   notes?: string[];
 }
 
@@ -112,6 +119,8 @@ export interface LoopHost {
   /** Re-arm the worker's tool budget for a new attempt. */
   armWorker(sessionId: string, toolBudget: number): void;
   workerInfo(sessionId: string): WorkerInfo | null;
+  /** Interrupt the worker's turn; resolves once that turn has ended (its spend
+   *  accounted), or after a short bound when it won't. */
   interruptWorker(sessionId: string): Promise<void>;
   /** Stop everything the worker's backend is running (its tool processes,
    *  background ones included) before a candidate is taken. */
@@ -136,8 +145,9 @@ export interface LoopHost {
   forgetRun(run: LoopRunRow): void;
   /** At boot: drop what was kept for any run not in `runIds`. */
   keepInputs(runIds: Set<string>): void;
-  /** Tell the owner something needs them (push + attention). */
-  notifyOwner(run: LoopRunRow, kind: "waiting" | "finished"): void;
+  /** Tell the owner something needs them (push + attention), or that the run
+   *  ended: `finished` on its own, `cancelled` by its owner (no push: they did it). */
+  notifyOwner(run: LoopRunRow, kind: "waiting" | "finished" | "cancelled"): void;
   audit(run: LoopRunRow, action: string, detail: string): void;
 }
 
@@ -145,6 +155,8 @@ export class LoopError extends Error {
   constructor(
     message: string,
     readonly code: "invalid_request" | "not_found" | "forbidden" | "conflict",
+    /** What a client can act on without parsing the message (`response.error`'s `detail`). */
+    readonly detail?: ResponseErrorDetail,
   ) {
     super(message);
   }
@@ -170,7 +182,17 @@ export interface LoopStartInput {
   model?: string;
   toolBudget?: number;
   limits?: Partial<LoopContract["limits"]>;
+  /** Work from this commit instead of the user's checkout. Daemon-internal
+   *  (watches): never taken from a client message. */
+  baseRef?: LoopBaseRef;
+  /** What started the run. Daemon-internal (watches, routines). */
+  trigger?: LoopTrigger;
 }
+
+/** A full commit id, and a branch name git would accept that can't pose as an option. */
+const SHA_RE = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
+export const SAFE_BRANCH_RE = /^(?!-)(?!.*\.\.)[A-Za-z0-9._/-]{1,200}$/;
+const FETCH_REF_RE = /^refs\/(heads\/[A-Za-z0-9._/-]{1,200}|pull\/\d{1,9}\/head)$/;
 
 // ── Service ──────────────────────────────────────────────────────────────────
 
@@ -299,6 +321,11 @@ export class LoopService {
     return this.#store.listOwnedRuns(tenantOf(owner), owner.sub, limit);
   }
 
+  /** The owner's runs still in progress, oldest first (at most ACTIVE_RUNS_PER_OWNER). */
+  listActive(owner: LoopOwner): LoopRunRow[] {
+    return this.#store.listActiveOwnedRuns(tenantOf(owner), owner.sub);
+  }
+
   attempts(runId: string): LoopAttemptRow[] {
     return this.#store.listAttempts(runId);
   }
@@ -324,10 +351,21 @@ export class LoopService {
     return null;
   }
 
-  /** The run is still in progress. */
+  /** The run exists and is still in progress (a watch's coalescing asks). */
   isActive(runId: string): boolean {
     const run = this.#store.getRun(runId);
     return run !== null && !isTerminalLoopStatus(run.status);
+  }
+
+  /**
+   * Why the run failed before it had a workspace, and whether trying again
+   * could help; null when it didn't (a watch retries the ones that could).
+   */
+  setupFailure(runId: string): { reason: string; retry: boolean } | null {
+    const run = this.#store.getRun(runId);
+    if (run?.status !== "failed" || run.worktreePath) return null;
+    const retry = !this.#store.listEvents(runId).some((e) => e.type === WORKSPACE_UNSUPPORTED_EVENT);
+    return { reason: run.reason ?? "the workspace couldn't be prepared", retry };
   }
 
   isWorker(sessionId: string): boolean {
@@ -354,16 +392,37 @@ export class LoopService {
       try {
         const run = this.#store.getRun(id)!;
         if (isTerminalLoopStatus(run.status)) return run;
+        // The attempt in flight was paid for: its spend is the run's, as for
+        // an attempt that ended on its own.
+        const current = this.#currentAttempt(id);
+        if (current && current.status !== "done" && current.startedAt !== null) {
+          this.#store.updateAttempt(current.id, { costUsd: this.#attemptCost(run, current) });
+        }
+        const costUsd = this.#store.listAttempts(id).reduce((n, a) => n + a.costUsd, 0);
         const next = this.#store.transition(
           id,
           run.stateVersion,
-          { status: "cancelled", reason: "cancelled by the owner", waitingOn: null, endedAt: Date.now() },
+          { status: "cancelled", reason: "cancelled by the owner", waitingOn: null, endedAt: Date.now(), costUsd },
           { actor: owner.sub, type: "run.cancelled" },
         );
         await this.#stopActiveWork(run, "the run was cancelled");
+        // The interrupted turn reports its spend as it ends, so the figure
+        // above can be short: read it again now the worker has stopped, before
+        // whoever follows the run (a routine run, its daily cap) is told.
+        let ended = next ?? this.#store.getRun(id)!;
+        if (next && current && current.startedAt !== null) {
+          this.#store.updateAttempt(current.id, { costUsd: this.#attemptCost(run, current) });
+          const settled = this.#store.listAttempts(id).reduce((n, a) => n + a.costUsd, 0);
+          if (settled !== next.costUsd) {
+            ended =
+              this.#store.transition(id, next.stateVersion, { costUsd: settled }, { actor: SYSTEM, type: "run.accounted" }) ?? this.#store.getRun(id)!;
+          }
+        }
         this.#release(run);
         this.#host.audit(run, "loop.cancel", "");
-        return next ?? this.#store.getRun(id)!;
+        // Whoever follows the run (a routine run it was started by) learns now.
+        if (next) this.#host.notifyOwner(ended, "cancelled");
+        return ended;
       } finally {
         this.#cancelling.delete(id);
       }
@@ -660,42 +719,29 @@ export class LoopService {
     if (objective.length > LOOP_LIMITS.OBJECTIVE_MAX) throw new LoopError(`The objective is over ${LOOP_LIMITS.OBJECTIVE_MAX} characters`, "invalid_request");
     const workdir = this.#host.normalizeWorkdir(input.workdir);
     if (!workdir) throw new LoopError(`workdir not usable: ${input.workdir}`, "invalid_request");
-    if (!input.checks?.length) throw new LoopError("A repair run needs at least one check", "invalid_request");
-    if (input.checks.length > LOOP_LIMITS.CHECKS_MAX) throw new LoopError(`At most ${LOOP_LIMITS.CHECKS_MAX} checks`, "invalid_request");
-    const seen = new Set<string>();
-    const checks: LoopCheck[] = input.checks.map((c, i) => {
-      const command = c.command?.trim() ?? "";
-      if (!command) throw new LoopError(`Check ${i + 1} has no command`, "invalid_request");
-      if (command.length > LOOP_LIMITS.CHECK_COMMAND_MAX) throw new LoopError(`Check ${i + 1}'s command is too long`, "invalid_request");
-      const id = (c.id?.trim() || `check${i + 1}`).replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 40);
-      if (seen.has(id)) throw new LoopError(`Two checks are named "${id}"`, "invalid_request");
-      seen.add(id);
-      const timeoutSec = c.timeoutSec ?? LOOP_DEFAULTS.checkTimeoutSec;
-      if (!Number.isInteger(timeoutSec) || timeoutSec < 1 || timeoutSec > LOOP_LIMITS.CHECK_TIMEOUT_MAX_S) {
-        throw new LoopError(`Check "${id}" timeout must be 1–${LOOP_LIMITS.CHECK_TIMEOUT_MAX_S}s`, "invalid_request");
-      }
-      return { id, command, timeoutSec, ...(c.expectTests ? { expectTests: true } : {}) };
-    });
+    const checks = resolveLoopChecks(input.checks);
     if (input.provider && !this.#host.hasProvider(input.provider)) {
       throw new LoopError(`Unknown backend "${input.provider}"`, "invalid_request");
     }
-    const limits = { ...LOOP_DEFAULTS.limits, ...(input.limits ?? {}) };
-    const bounded = (v: number, max: number, name: string): number => {
-      if (!Number.isInteger(v) || v < 1 || v > max) throw new LoopError(`${name} must be 1–${max}`, "invalid_request");
-      return v;
-    };
+    const { toolBudget, limits } = resolveLoopBudget(input.toolBudget, input.limits);
     return {
       recipe: "repair",
       objective,
       workdir,
       checks,
       worker: { ...(input.provider ? { provider: input.provider } : {}), ...(input.model ? { model: input.model } : {}) },
-      toolBudget: bounded(input.toolBudget ?? LOOP_DEFAULTS.toolBudget, LOOP_LIMITS.TOOL_BUDGET_MAX, "toolBudget"),
-      limits: {
-        attempts: bounded(limits.attempts, LOOP_LIMITS.ATTEMPTS_MAX, "attempts"),
-        attemptMinutes: bounded(limits.attemptMinutes, LOOP_LIMITS.ATTEMPT_MINUTES_MAX, "attemptMinutes"),
-        runMinutes: bounded(limits.runMinutes, LOOP_LIMITS.RUN_MINUTES_MAX, "runMinutes"),
-      },
+      toolBudget,
+      limits,
+      ...(input.baseRef ? { baseRef: resolveBaseRef(input.baseRef) } : {}),
+      ...(input.trigger
+        ? {
+            trigger: {
+              ...input.trigger,
+              summary: input.trigger.summary.slice(0, LOOP_LIMITS.TRIGGER_SUMMARY_MAX),
+              ...(input.trigger.payload !== undefined ? { payload: input.trigger.payload.slice(0, LOOP_LIMITS.TRIGGER_PAYLOAD_MAX) } : {}),
+            },
+          }
+        : {}),
     };
   }
 
@@ -718,7 +764,10 @@ export class LoopService {
         // A cancel stopped it; the cancel ends the run.
         // The host removed the worktree before throwing: the claim goes now.
         this.#reserved.delete(runId);
-        if (!ac.signal.aborted) this.#end(run, "failed", `could not prepare the run's workspace: ${errText(err)}`);
+        if (!ac.signal.aborted) {
+          if (err instanceof LoopWorkspaceUnsupportedError) this.#store.appendEvent(runId, SYSTEM, WORKSPACE_UNSUPPORTED_EVENT, errText(err).slice(0, 500));
+          this.#end(run, "failed", `could not prepare the run's workspace: ${errText(err)}`);
+        }
         return;
       } finally {
         this.#preparing.delete(runId);
@@ -767,7 +816,10 @@ export class LoopService {
     const baseline = checked.records;
     const checkedRun = this.#patch(runId, { baseTree: tree.tree }, { type: "baseline.checked", detail: tree.tree });
     if (!checkedRun) return;
-    if (baseline.every((e) => e.result === "pass")) {
+    // A review comment asks for a change, not a repair: its checks are the
+    // guard the change must keep passing, so passing already is expected.
+    // Everything else with nothing failing has nothing to repair.
+    if (baseline.every((e) => e.result === "pass") && checkedRun.contract.trigger?.kind !== "review_comment") {
       this.#end(checkedRun, "blocked", "every check already passes on the unmodified code — there is nothing to repair");
       return;
     }
@@ -979,7 +1031,13 @@ export class LoopService {
   async #deliver(run: LoopRunRow, attempt: LoopAttemptRow): Promise<void> {
     if (this.#stopped || this.#cancelling.has(run.id)) return;
     if (attempt.candidateTree === run.baseTree) {
-      this.#end(run, "blocked", "every check passed, but the tracked files are as they started — the checks may be flaky, or the change is outside the tracked tree");
+      this.#end(
+        run,
+        "blocked",
+        run.contract.trigger?.kind === "review_comment"
+          ? "the worker changed no tracked file — the comment may need no change, or asks for one outside the tracked tree"
+          : "every check passed, but the tracked files are as they started — the checks may be flaky, or the change is outside the tracked tree",
+      );
       return;
     }
     let commit: string;
@@ -1247,6 +1305,64 @@ function describeResult(result: AttemptResult, evidence: EvidenceRecord[]): stri
     default:
       return `${failing.length} of ${evidence.length} check(s) not passing: ${failing.map((e) => `${e.criterionId} ${e.result}`).join(", ")}`;
   }
+}
+
+/**
+ * A run's checks, validated and filled (ids, timeouts). Shared with routines
+ * that start a loop, so a saved routine holds exactly what a run would.
+ */
+export function resolveLoopChecks(input: LoopStartInput["checks"] | undefined): LoopCheck[] {
+  if (!input?.length) throw new LoopError("A repair run needs at least one check", "invalid_request");
+  if (input.length > LOOP_LIMITS.CHECKS_MAX) throw new LoopError(`At most ${LOOP_LIMITS.CHECKS_MAX} checks`, "invalid_request");
+  const seen = new Set<string>();
+  return input.map((c, i) => {
+    const command = c.command?.trim() ?? "";
+    if (!command) throw new LoopError(`Check ${i + 1} has no command`, "invalid_request");
+    if (command.length > LOOP_LIMITS.CHECK_COMMAND_MAX) throw new LoopError(`Check ${i + 1}'s command is too long`, "invalid_request");
+    const id = (c.id?.trim() || `check${i + 1}`).replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 40);
+    if (seen.has(id)) throw new LoopError(`Two checks are named "${id}"`, "invalid_request");
+    seen.add(id);
+    const timeoutSec = c.timeoutSec ?? LOOP_DEFAULTS.checkTimeoutSec;
+    if (!Number.isInteger(timeoutSec) || timeoutSec < 1 || timeoutSec > LOOP_LIMITS.CHECK_TIMEOUT_MAX_S) {
+      throw new LoopError(`Check "${id}" timeout must be 1–${LOOP_LIMITS.CHECK_TIMEOUT_MAX_S}s`, "invalid_request");
+    }
+    return { id, command, timeoutSec, ...(c.expectTests ? { expectTests: true } : {}) };
+  });
+}
+
+/** A run's tool budget and limits, bounded and defaulted (shared with routines). */
+export function resolveLoopBudget(
+  toolBudget: number | undefined,
+  input: Partial<LoopContract["limits"]> | undefined,
+): Pick<LoopContract, "toolBudget" | "limits"> {
+  const limits = { ...LOOP_DEFAULTS.limits, ...(input ?? {}) };
+  const bounded = (v: number, max: number, name: string): number => {
+    if (!Number.isInteger(v) || v < 1 || v > max) throw new LoopError(`${name} must be 1–${max}`, "invalid_request");
+    return v;
+  };
+  return {
+    toolBudget: bounded(toolBudget ?? LOOP_DEFAULTS.toolBudget, LOOP_LIMITS.TOOL_BUDGET_MAX, "toolBudget"),
+    limits: {
+      attempts: bounded(limits.attempts, LOOP_LIMITS.ATTEMPTS_MAX, "attempts"),
+      attemptMinutes: bounded(limits.attemptMinutes, LOOP_LIMITS.ATTEMPT_MINUTES_MAX, "attemptMinutes"),
+      runMinutes: bounded(limits.runMinutes, LOOP_LIMITS.RUN_MINUTES_MAX, "runMinutes"),
+    },
+  };
+}
+
+function resolveBaseRef(ref: LoopBaseRef): LoopBaseRef {
+  if (!SHA_RE.test(ref.sha)) throw new LoopError("baseRef.sha must be a full commit id", "invalid_request");
+  if (ref.branch !== undefined && !SAFE_BRANCH_RE.test(ref.branch)) throw new LoopError("baseRef.branch is not a usable branch name", "invalid_request");
+  if (ref.fetchRef !== undefined && !FETCH_REF_RE.test(ref.fetchRef)) throw new LoopError("baseRef.fetchRef is not a branch or pull request ref", "invalid_request");
+  if (ref.repo !== undefined && !isRepo(ref.repo)) throw new LoopError("baseRef.repo is not a GitHub repository name", "invalid_request");
+  if (ref.fetchRef !== undefined && ref.repo === undefined) throw new LoopError("baseRef.fetchRef needs baseRef.repo", "invalid_request");
+  return {
+    sha: ref.sha,
+    ...(ref.branch ? { branch: ref.branch } : {}),
+    ...(ref.repo ? { repo: ref.repo } : {}),
+    ...(ref.fetchRef ? { fetchRef: ref.fetchRef } : {}),
+    ...(ref.trusted === true ? { trusted: true } : {}),
+  };
 }
 
 function tenantOf(owner: LoopOwner): LoopTenant {

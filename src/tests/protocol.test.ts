@@ -504,6 +504,10 @@ describe("DaemonMessage routing", () => {
           return `loop:${msg.run.status}`;
         case "loop.list.result":
           return `loops:${msg.runs.length}`;
+        case "loop.watch.snapshot":
+          return `loop.watch:${msg.watch.enabled}`;
+        case "loop.watch.list.result":
+          return `loop.watches:${msg.watches.length}`;
         case "mcp.oauth.begin.result":
           return `mcp.oauth.begin:${msg.status}`;
         case "mcp.oauth.complete.result":

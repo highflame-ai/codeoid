@@ -24,12 +24,13 @@ export function toRunWire(r: RunRow): RoutineRunWire {
     ...(r.reason ? { reason: r.reason } : {}),
     ...(r.checkOutput ? { checkOutput: r.checkOutput } : {}),
     ...(r.payload ? { payload: r.payload } : {}),
+    ...(r.loopRunId ? { loop: { runId: r.loopRunId, status: r.loopStatus ?? "running" } } : {}),
   };
 }
 
 export function toRoutineWire(
   r: RoutineRow,
-  extra: { upcoming: string[]; lastRun?: RunRow; apiTokenSet: boolean },
+  extra: { upcoming: string[]; lastRun?: RunRow; lastOutcome?: RunRow; activeLoopRun?: RunRow; apiTokenSet: boolean },
 ): RoutineWire {
   return {
     id: r.id,
@@ -44,6 +45,8 @@ export function toRoutineWire(
     consecutiveFailures: r.consecutiveFailures,
     apiTokenSet: extra.apiTokenSet,
     ...(extra.lastRun ? { lastRun: toRunWire(extra.lastRun) } : {}),
+    ...(extra.lastOutcome ? { lastOutcome: toRunWire(extra.lastOutcome) } : {}),
+    ...(extra.activeLoopRun ? { activeLoopRun: toRunWire(extra.activeLoopRun) } : {}),
     createdAt: iso(r.createdAt) as string,
     updatedAt: iso(r.updatedAt) as string,
   };

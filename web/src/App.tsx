@@ -29,6 +29,7 @@ import { focusedSession, focusedSessionId, mergeSession } from "./state/sessions
 import { resumeFor } from "./state/resume";
 import type { SessionInfo } from "./protocol/types";
 import { resetClaudeConfig } from "./state/claude-config";
+import { followAutomationIdentity } from "./state/automation-identity";
 import { installApprovalNotifications } from "./state/desktop-notifications";
 
 const App: Component = () => {
@@ -111,6 +112,10 @@ const App: Component = () => {
       if (!auth) attached.clear();
     }),
   );
+  // What the automation stores show (a routine API token shown once among
+  // it) belongs to the identity signed in: another one, or a sign-out, empties
+  // them at once. A reconnect as the same identity keeps them.
+  followAutomationIdentity(authIdentity);
   createEffect(
     // MUST track connectionStatus too: on reconnect, neither auth nor the
     // focused id changes, so without this dep the effect wouldn't re-fire and

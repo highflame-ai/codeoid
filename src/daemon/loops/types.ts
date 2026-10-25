@@ -26,6 +26,51 @@ export interface LoopLimits {
   runMinutes: number;
 }
 
+/**
+ * What started a run (§4 "two entry points"), when a watch or a routine
+ * started it rather than a person. `summary` is event text — a check's
+ * output, a comment's body, a routine's gate output — and `payload` a routine
+ * fire's payload; both only ever reach a worker as data.
+ */
+export interface LoopTrigger {
+  kind: "ci_failure" | "review_comment" | "routine";
+  /** Dedupe key of the event, e.g. `ci:acme/shop:<sha>:<checkRunId>:1`, or
+   *  `routine:<routineId>:<routineRunId>`. */
+  key: string;
+  /** The watch that saw it. */
+  watchId?: string;
+  /** The routine that fired, and its run that started this one. */
+  routineId?: string;
+  routineName?: string;
+  routineRunId?: string;
+  /** Where the event is on GitHub (the check run, the comment). */
+  url?: string;
+  /** Event text; for a routine, its gate's output. */
+  summary: string;
+  /** A routine fire's payload: data from whoever fired it, kept apart from the gate's output. */
+  payload?: string;
+}
+
+/**
+ * Base the run's worktree on this commit instead of the user's checkout: a
+ * triggered run repairs the branch the event happened on.
+ */
+export interface LoopBaseRef {
+  /** Full commit id. */
+  sha: string;
+  /** The branch it is the head of, for display. */
+  branch?: string;
+  /** The github.com repository (`owner/name`) to fetch it from when it isn't local. */
+  repo?: string;
+  /** What to fetch when the commit isn't local, e.g. `refs/pull/12/head`. */
+  fetchRef?: string;
+  /** A watch checked that someone the owner trusts pushed this head (or
+   *  signed every commit past the default branch, verified by GitHub). Only
+   *  then does the setup recipe copy the owner's files next to a commit that
+   *  isn't on their checkout's history. */
+  trusted?: boolean;
+}
+
 /** The run's rules, fixed at start (§4). */
 export interface LoopContract {
   /** The only recipe so far: reproduce a failing check, repair, verify. */
@@ -38,6 +83,10 @@ export interface LoopContract {
   /** Autonomous tool calls per attempt. Past it the attempt ends; the run decides what's next. */
   toolBudget: number;
   limits: LoopLimits;
+  /** Work from this commit, not the user's checkout (set by watches only). */
+  baseRef?: LoopBaseRef;
+  /** What started the run (set by watches and routines only). */
+  trigger?: LoopTrigger;
 }
 
 /**
@@ -219,4 +268,18 @@ export const LOOP_LIMITS = {
   ACTIVE_RUNS_PER_OWNER: 3,
   REPORT_SUMMARY_MAX: 4_000,
   REPORT_DETAIL_MAX: 4_000,
+  /** Event text a trigger carries into a run. */
+  TRIGGER_SUMMARY_MAX: 4_000,
+  /** A routine fire's payload, carried apart from the gate's output (its own budget). */
+  TRIGGER_PAYLOAD_MAX: 4_000,
 } as const;
+
+/**
+ * The run's workspace can't be prepared for a reason trying again won't
+ * change (a shallow clone can't take a fetched head): a watch drops the event
+ * at once instead of retrying it.
+ */
+export class LoopWorkspaceUnsupportedError extends Error {}
+
+/** The run event that marks a run whose workspace can't be prepared at all. */
+export const WORKSPACE_UNSUPPORTED_EVENT = "workspace.unsupported";

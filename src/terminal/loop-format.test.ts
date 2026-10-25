@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { LoopRunWire } from "../protocol/types.js";
-import { formatLoop, formatLoopRow, parseCheckFlag } from "./loop-format";
+import { Command } from "commander";
+import { formatLoop, formatLoopRow, formatWatch, parseCheckFlag, parseCiFlag, parseTrustHeadFlag, startedBy, TRUST_HEAD_ALONE, trustHeadOption } from "./loop-format";
 
 const run: LoopRunWire = {
   id: "loop_12345678-aaaa-bbbb-cccc-1234567890ab",
@@ -64,5 +65,105 @@ describe("loop formatting", () => {
     expect(parseCheckFlag("unit: bun test --bail")).toEqual({ id: "unit", command: "bun test --bail" });
     expect(parseCheckFlag("NODE_ENV=test bun test")).toEqual({ command: "NODE_ENV=test bun test" });
     expect(parseCheckFlag("go test ./...")).toEqual({ command: "go test ./..." });
+  });
+
+  test("--ci takes `name: command`, and `name@app: command` for another app's check", () => {
+    expect(parseCiFlag("test (*): bun test")).toEqual({ ciName: "test (*)", command: "bun test" });
+    expect(parseCiFlag("lint@circleci-checks: bun run lint")).toEqual({ ciName: "lint", app: "circleci-checks", command: "bun run lint" });
+    expect(parseCiFlag("CI / build @buildkite: make")).toEqual({ ciName: "CI / build", app: "buildkite", command: "make" });
+    expect(parseCiFlag("no command")).toBeNull();
+  });
+
+  test("what came from GitHub is printed without escape sequences, and only github.com links", () => {
+    const trig = (url: string, summary: string) =>
+      startedBy({ ...run, baseRef: { sha: "a".repeat(40), branch: "feature" }, trigger: { kind: "review_comment", key: "k", url, summary } });
+    const evil = trig("https://evil.example/x", "Comment by @ada:\n\x1b]0;pwned\x07@codeoid \x1b[2Jfix\rit");
+    expect(evil).not.toContain("evil.example");
+    expect(evil).not.toContain("\x1b]");
+    expect(evil).not.toContain("\x1b[2J");
+    expect(evil).not.toContain("\r");
+    expect(evil).toContain("@codeoid fixit");
+    expect(trig("https://github.com/acme/shop/pull/1#c1", "x")).toContain("https://github.com/acme/shop/pull/1#c1");
+    expect(trig("https://github.com.evil.example/x", "x")).not.toContain("evil");
+    const watch = formatWatch(
+      {
+        id: "lw_1",
+        workdir: "/r",
+        repo: "acme/shop",
+        branches: [],
+        myPrs: true,
+        ci: [{ ciName: "test", app: "github-actions", command: "bun test", timeoutSec: 600 }],
+        review: { enabled: false, allow: [], mention: "@codeoid" },
+        ghLogin: "ada",
+        trust: ["bob"],
+        maxRunsPerHour: 6,
+        enabled: true,
+        lastPolledAt: null,
+        lastError: "GitHub x failed: \x1b[2Jboom",
+        lastOkAt: null,
+        createdAt: "2026-10-25T10:00:00.000Z",
+        updatedAt: "2026-10-25T10:00:00.000Z",
+      } as never,
+      [
+        { key: "k", kind: "ci_failure", branch: "b", runId: null, outcome: "ignored", note: "commits by someone you don't trust: \x1b]8;;x\x07", createdAt: "2026-10-25T10:00:00.000Z" },
+        { key: "v", kind: "trust_anchor", branch: "main", runId: null, outcome: "vouched", note: "you vouched for main at abc123abc123", createdAt: "2026-10-25T10:00:00.000Z" },
+        { key: "h", kind: "head", branch: "main", runId: null, outcome: "ignored", note: "not pushed by someone you trust: pushed by @mallory", createdAt: "2026-10-25T10:00:00.000Z" },
+      ],
+    ).join("\n");
+    expect(watch).toContain("head   main  ignored — not pushed by someone you trust: pushed by @mallory");
+    expect(watch).toContain("trusts     @ada (you), @bob");
+    expect(watch).toContain("vouch  main  you vouched for main at abc123abc123");
+    expect(watch).not.toContain("\x1b[2J");
+    expect(watch).not.toContain("\x1b]8");
+  });
+});
+
+describe("--trust-head", () => {
+  const A = "0123456789abcdef0123456789abcdef01234567";
+  const B = "ba9876543210fedcba9876543210fedcba987654";
+  test("alone it vouches for every watched branch's head; <branch>=<sha> pins a branch to a commit by its full id", () => {
+    expect(parseTrustHeadFlag(undefined)).toBeUndefined();
+    expect(parseTrustHeadFlag(true)).toBe(true);
+    expect(parseTrustHeadFlag([`main=${A.toUpperCase()}`, `release/1.x=${"f".repeat(64)}`])).toEqual({ main: A, "release/1.x": "f".repeat(64) });
+    // A branch name may hold "=": the commit is after the last one.
+    expect(parseTrustHeadFlag([`a=b=${A}`])).toEqual({ "a=b": A });
+    // A prefix is refused, however long.
+    expect(parseTrustHeadFlag(["main=0123456789ab"])).toContain("full id");
+    expect(parseTrustHeadFlag([`main=${A.slice(0, 39)}`])).toContain("not a prefix");
+    expect(parseTrustHeadFlag(["main"])).toContain("expected <branch>=<sha>");
+    expect(parseTrustHeadFlag([`=${A}`])).toContain("expected <branch>=<sha>");
+    expect(parseTrustHeadFlag([`main=${A}`, `main=${B}`])).toContain("two commits for main");
+  });
+
+  // As the CLI declares it: commander overwrites what an optional-value option collected with `true` when it is given alone.
+  const parse = (...argv: string[]) => {
+    let got: { ref?: string; trustHead?: string[] } = {};
+    const cmd = new Command()
+      .exitOverride()
+      .configureOutput({ writeErr: () => {} })
+      .argument("<watchId>")
+      .addOption(trustHeadOption(""))
+      .option("--trust <login>")
+      .action((ref: string, f: { trustHead?: string[] }) => {
+        got = { ref, ...(f.trustHead ? { trustHead: f.trustHead } : {}) };
+      });
+    cmd.parse(argv, { from: "user" });
+    return { ...got, parsed: parseTrustHeadFlag(got.trustHead) };
+  };
+
+  test("alone and pinned in one command is refused, in either order, rather than one silently winning", () => {
+    expect(parse("lw_1", "--trust-head").parsed).toBe(true);
+    expect(parse("lw_1", "--trust-head", "--trust-head").parsed).toBe(true);
+    expect(parse("lw_1", "--trust-head", "--trust", "bob").parsed).toBe(true);
+    expect(parse("lw_1", "--trust-head", `main=${A}`).parsed).toEqual({ main: A });
+    expect(parse("lw_1", "--trust-head", `main=${A}`, "--trust-head").parsed).toContain("not both");
+    expect(parse("lw_1", "--trust-head", "--trust-head", `main=${A}`).parsed).toContain("not both");
+    expect(parse("lw_1", `--trust-head=main=${A}`, "--trust-head").trustHead).toEqual([`main=${A}`, TRUST_HEAD_ALONE]);
+  });
+
+  test("a positional taken as --trust-head's value is refused with what to do, not as a missing argument", () => {
+    expect(() => parse("--trust-head", "lw_1")).toThrow(/"lw_1" isn't <branch>=<sha>.*put the watch id before --trust-head/);
+    // A value with "=" is a pin, judged as one.
+    expect(parse("lw_1", "--trust-head", "main=0123").parsed).toContain("not a prefix");
   });
 });

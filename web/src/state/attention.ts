@@ -3,7 +3,8 @@
  *
  * Thin by design: `lib/attention.ts` owns collection and ranking, and this
  * only joins the sources — the session population, pending provider dialogs,
- * the fleet board, and the owner's loop runs — and re-ranks as the clock moves.
+ * the fleet board, and the owner's loop runs, watches and routines — and
+ * re-ranks as the clock moves.
  */
 
 import { createMemo } from "solid-js";
@@ -12,6 +13,8 @@ import { attentionQueue, type AttentionItem } from "../lib/attention";
 import { nowTick } from "./clock";
 import { fleetBoard, taskSession } from "./fleet";
 import { loopsState } from "./loops";
+import { routinesState } from "./routines";
+import { watchesState } from "./watches";
 import { sessionList } from "./sessions";
 import { allPendingUiRequests } from "./ui-requests";
 
@@ -31,6 +34,8 @@ export const attentionItems = createMemo<AttentionItem[]>(() => {
       tasks: board.tasks,
       taskSession: (t) => taskSession(board, t),
       loops: loopsState().runs,
+      watches: watchesState().watches,
+      routines: routinesState().routines,
     },
     nowTick(),
   );

@@ -665,6 +665,17 @@ const RoutinesSchema = z
   });
 
 /**
+ * Loops (docs/loops.md). `watchPollSeconds` is how often loop watches read
+ * GitHub for failing checks and review comments; a watch costs nothing
+ * between polls.
+ */
+const LoopsSchema = z
+  .object({
+    watchPollSeconds: z.number().int().min(60).max(86_400).default(300),
+  })
+  .default({ watchPollSeconds: 300 });
+
+/**
  * Outward control-plane MCP endpoint (`/mcp/control`, docs/mcp-control.md):
  * lets an EXTERNAL agent (Claude Code, Cursor, a CI job) drive codeoid
  * sessions over MCP Streamable HTTP.
@@ -1148,6 +1159,7 @@ const RootSchema = z.object({
   dispatch: DispatchSchema,
   mcpControl: McpControlSchema,
   routines: RoutinesSchema,
+  loops: LoopsSchema,
   collaboration: CollaborationSchema,
   rateLimit: RateLimitSchema,
   pipeline: PipelineSchema,
@@ -1400,6 +1412,8 @@ export interface CodeoidConfig {
    * configs stay minimal; absent = the defaults (enabled).
    */
   routines?: RoutinesConfigBlock;
+  /** Loops (see LoopsSchema). Optional in the type; absent = the defaults. */
+  loops?: { watchPollSeconds: number };
   dispatch?: {
     enabled: boolean;
     tickMs: number;
@@ -1834,6 +1848,7 @@ export function loadConfig(opts: LoadOptions = {}): CodeoidConfig {
     dispatch: parsed.dispatch,
     mcpControl: parsed.mcpControl,
     routines: parsed.routines,
+    loops: parsed.loops,
     collaboration: parsed.collaboration,
     rateLimit: parsed.rateLimit,
     pipeline: parsed.pipeline,

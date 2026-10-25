@@ -5037,6 +5037,25 @@ export class Session {
     return this.#pack;
   }
 
+  /**
+   * Resolves once the turn in flight, if any, has fully ended — its stream
+   * drained and its result, spend included, accounted — or after `timeoutMs`.
+   * An interrupt resolves before that: the interrupted turn is still draining.
+   */
+  async turnDrained(timeoutMs: number): Promise<void> {
+    const task = this.#eventConsumerTask;
+    if (!task) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      task.catch(() => {}),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+    clearTimeout(timer);
+  }
+
   /** The turn messages currently belong to (the latest, once it has ended). */
   get currentTurnId(): string | null {
     return this.#currentTurnId;

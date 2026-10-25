@@ -61,7 +61,7 @@ import {
   scheduleFromFlags,
   specFromFlags,
 } from "./terminal/routine-format.js";
-import { formatLoop, formatLoopRow, parseCheckFlag } from "./terminal/loop-format.js";
+import { formatLoop, formatLoopRow, formatWatch, formatWatchRow, parseCheckFlag, parseCiFlag, parseTrustHeadFlag, trustHeadOption } from "./terminal/loop-format.js";
 import {
   getConfigDir,
   getLocalTokenPath,
@@ -784,6 +784,8 @@ function printTestResult(resp: DaemonMessage | undefined): void {
 }
 
 const collect = (v: string, prev: string[] = []) => [...prev, v];
+const TRUST_HEAD_HELP = (when: string) =>
+  `${when}you vouch for each watched branch's head as it is now — it and everything beneath it are trusted, so later merges by trusted logins are judged from it (recorded in the watch's history and the audit log, with who put the head there). <branch>=<sha> (repeatable, the commit's full id: a prefix is refused) vouches for that branch only while its head is still that commit, and for nothing if it moved — the refusal names the full id the head is now`;
 
 endpoint
   .command("ls")
@@ -1538,14 +1540,22 @@ function routineSpecOptions(cmd: Command, mode: "add" | "edit"): Command {
     .option("--notify <policy>", "on_change (default), always, or never")
     .option("--keep <n>", "run sessions to keep (default 5)")
     .option("--api", "enable the routine's API trigger (prints its token once)")
-    .option("--failure-pause <n>", "pause after N consecutive failures (default 3, 0 = never)");
+    .option("--failure-pause <n>", "pause after N consecutive failures (default 3, 0 = never)")
+    .option("--loop", "start a loop run instead of a session: the prompt is its objective, --verify its acceptance checks (docs/routines.md)")
+    .option("--verify <check>", "loop: a check its run must make pass, as `cmd` or `id: cmd` (repeatable; --check is the gate before it)", collect, [])
+    .option("--test", "loop: the --verify checks are test runs (running no tests does not pass)")
+    .option("--attempts <n>", "loop: worker attempts, including the first (default 3)")
+    .option("--attempt-minutes <n>", "loop: wall time per attempt (default 10)")
+    .option("--run-minutes <n>", "loop: active time across the run (default 30)")
+    .option("--budget <n>", "loop: autonomous tool calls per attempt (default 60)");
   if (mode === "edit") {
     cmd
       .option("--no-schedule", "remove the schedule (run on demand only)")
       .option("--no-check", "remove the check")
       .option("--no-worktree", "stop using a worktree")
       .option("--no-catch-up", "don't catch up missed fires")
-      .option("--no-api", "turn the API trigger off (revokes its token)");
+      .option("--no-api", "turn the API trigger off (revokes its token)")
+      .option("--no-loop", "run a session again instead of starting a loop");
   }
   return cmd;
 }
@@ -1554,7 +1564,7 @@ function routineSpecOptions(cmd: Command, mode: "add" | "edit"): Command {
 function printRoutineToken(token: string, routineId: string): void {
   const base = loadConfig().daemonUrl.replace(/^ws/, "http").replace(/\/+$/, "");
   console.log(`\n  API token (shown once — store it now):\n    ${token}`);
-  console.log(`\n  Fire it:\n    curl -X POST ${base}${routineFirePath(routineId)} \\\n      -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \\\n      -d '{"text": "optional payload for {{payload}}"}'\n`);
+  console.log(`\n  Fire it:\n    curl -X POST ${base}${routineFirePath(routineId)} \\\n      -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \\\n      -d '{"text": "optional payload: data for the run"}'\n`);
 }
 
 // ── Loops (docs/loop-engineering-design.md) ─────────────────────────────────
@@ -1684,6 +1694,230 @@ loop
     }),
   );
 
+// ── Loop watches: repository events start repair runs (docs/loops.md) ───────
+
+const watch = loop
+  .command("watch")
+  .description("Start repair runs from failing CI checks and review comments on your branches (docs/loops.md#watches)");
+
+watch
+  .command("add")
+  .description("Watch a repository's branches (or your open PRs) for failing CI checks, and optionally review comments")
+  .requiredOption("--workdir <dir>", "The repository; its origin remote must be on github.com")
+  .option("--branch <b>", "A branch to watch (repeatable)", collect, [])
+  .option("--my-prs", "Watch the heads of your open pull requests instead")
+  .option(
+    "--ci <map>",
+    "`<check name>: <command>` — a CI check (exact or glob) and the local command that reproduces it; `<name>@<app>: …` for a check another GitHub App reports (default github-actions) (repeatable)",
+    collect,
+    [],
+  )
+  .option("--test", "The mapped commands are test runs: running no tests does not pass")
+  .option("--review", "Also start a run for a PR comment that mentions codeoid")
+  .option("--allow <login>", "GitHub login whose comments count (repeatable; default: you, as gh is signed in)", collect, [])
+  .option("--mention <token>", "The token a comment must contain (default @codeoid)")
+  .option("--trust <login>", "Another GitHub login whose commits may be on a head the watch runs; list everyone who merges to a watched branch. A bot as name[bot] trusts anyone who can make that bot push (repeatable; you are always trusted)", collect, [])
+  .addOption(trustHeadOption(TRUST_HEAD_HELP("With --branch: ")))
+  .option("--per-hour <n>", "Runs the watch may start per hour (default 6)")
+  .option("--attempts <n>", "Worker attempts per run (default 3)")
+  .option("--budget <n>", "Autonomous tool calls per attempt (default 60)")
+  .option("--provider <id>", "Backend for the runs' workers")
+  .option("--model <id>", "Model for the runs' workers")
+  .action(
+    (f: {
+      workdir: string;
+      branch: string[];
+      myPrs?: boolean;
+      ci: string[];
+      test?: boolean;
+      review?: boolean;
+      allow: string[];
+      mention?: string;
+      trust: string[];
+      trustHead?: string[];
+      perHour?: string;
+      attempts?: string;
+      budget?: string;
+      provider?: string;
+      model?: string;
+    }) =>
+      withClient(async (c) => {
+        const fail = (m: string): void => {
+          console.error(m);
+          process.exitCode = 1;
+        };
+        if ((f.branch.length > 0) === (f.myPrs === true)) return fail("Give --branch (one or more) or --my-prs, not both.");
+        if (f.trustHead && f.myPrs) return fail("--trust-head vouches for watched branches' heads; give it with --branch.");
+        const trustHead = parseTrustHeadFlag(f.trustHead);
+        if (typeof trustHead === "string") return fail(trustHead);
+        if (f.ci.length === 0) return fail('Give at least one --ci "<check name>: <command>".');
+        const ci = [];
+        for (const raw of f.ci) {
+          const m = parseCiFlag(raw);
+          if (!m) return fail(`--ci ${JSON.stringify(raw)}: expected "<check name>: <command>".`);
+          ci.push({ ...m, ...(f.test ? { expectTests: true } : {}) });
+        }
+        const int = (v: string) => Number.parseInt(v, 10);
+        const res = await c.request({
+          type: "loop.watch.create",
+          id: randomUUID(),
+          spec: {
+            workdir: resolve(f.workdir),
+            ...(f.myPrs ? { myPrs: true } : { branches: f.branch }),
+            ci,
+            ...(f.review || f.allow.length > 0 || f.mention
+              ? { review: { enabled: true, ...(f.allow.length > 0 ? { allow: f.allow } : {}), ...(f.mention ? { mention: f.mention } : {}) } }
+              : {}),
+            ...(f.trust.length > 0 ? { trust: f.trust } : {}),
+            ...(f.perHour ? { maxRunsPerHour: int(f.perHour) } : {}),
+            ...(f.attempts ? { limits: { attempts: int(f.attempts) } } : {}),
+            ...(f.budget ? { toolBudget: int(f.budget) } : {}),
+            ...(f.provider ? { provider: f.provider } : {}),
+            ...(f.model ? { model: f.model } : {}),
+          },
+          ...(trustHead ? { trustHead } : {}),
+        });
+        if (res.type !== "loop.watch.snapshot") return c.printError(res);
+        console.log(formatWatch(res.watch, res.triggers).join("\n"));
+      }),
+  );
+
+watch
+  .command("ls")
+  .description("Your loop watches")
+  .action(() =>
+    withClient(async (c) => {
+      const res = await c.request({ type: "loop.watch.list", id: randomUUID() });
+      if (res.type !== "loop.watch.list.result") return c.printError(res);
+      if (res.watches.length === 0) console.log("No loop watches.");
+      for (const w of res.watches) console.log(formatWatchRow(w));
+    }),
+  );
+
+watch
+  .command("show <watchId>")
+  .description("A watch's rules, its last poll, and the events it acted on")
+  .action((ref: string) =>
+    withClient(async (c) => {
+      const id = await resolveWatchId(c, ref);
+      if (!id) return;
+      const res = await c.request({ type: "loop.watch.get", id: randomUUID(), watchId: id });
+      if (res.type !== "loop.watch.snapshot") return c.printError(res);
+      console.log(formatWatch(res.watch, res.triggers).join("\n"));
+    }),
+  );
+
+watch
+  .command("pause <watchId>")
+  .description("Stop polling (runs it started carry on)")
+  .action((ref: string) =>
+    withClient(async (c) => {
+      const id = await resolveWatchId(c, ref);
+      if (!id) return;
+      const res = await c.request({ type: "loop.watch.update", id: randomUUID(), watchId: id, enabled: false });
+      if (res.type !== "loop.watch.snapshot") return c.printError(res);
+      console.log(formatWatchRow(res.watch));
+    }),
+  );
+
+watch
+  .command("resume <watchId>")
+  .description("Start polling again")
+  .addOption(trustHeadOption(TRUST_HEAD_HELP("For a watch of branches: ")))
+  .action((ref: string, f: { trustHead?: string[] }) =>
+    withClient(async (c) => {
+      const trustHead = parseTrustHeadFlag(f.trustHead);
+      if (typeof trustHead === "string") {
+        console.error(trustHead);
+        process.exitCode = 1;
+        return;
+      }
+      const id = await resolveWatchId(c, ref);
+      if (!id) return;
+      const res = await c.request({ type: "loop.watch.update", id: randomUUID(), watchId: id, enabled: true, ...(trustHead ? { trustHead } : {}) });
+      if (res.type !== "loop.watch.snapshot") return c.printError(res);
+      console.log(f.trustHead ? formatWatch(res.watch, res.triggers).join("\n") : formatWatchRow(res.watch));
+    }),
+  );
+
+watch
+  .command("update <watchId>")
+  .description("Change who a watch trusts, or vouch for its branches' heads as they are now")
+  .option(
+    "--trust <login>",
+    "Replace the trusted logins with these (repeatable; you are always trusted). Judges the heads it refused again; the heads it trusted are kept when the new list only adds logins",
+    collect,
+    [],
+  )
+  .option("--trust-none", "Trust no one but you: empty the list of trusted logins")
+  .addOption(trustHeadOption(TRUST_HEAD_HELP("For a watch of branches: ")))
+  .action((ref: string, f: { trust: string[]; trustNone?: boolean; trustHead?: string[] }) =>
+    withClient(async (c) => {
+      const fail = (m: string): void => {
+        console.error(m);
+        process.exitCode = 1;
+      };
+      if (f.trust.length === 0 && !f.trustNone && !f.trustHead) return fail("Give --trust <login> (one or more), --trust-none, or --trust-head.");
+      if (f.trust.length > 0 && f.trustNone) return fail("Give --trust or --trust-none, not both.");
+      const trustHead = parseTrustHeadFlag(f.trustHead);
+      if (typeof trustHead === "string") return fail(trustHead);
+      const id = await resolveWatchId(c, ref);
+      if (!id) return;
+      const res = await c.request({
+        type: "loop.watch.update",
+        id: randomUUID(),
+        watchId: id,
+        ...(f.trust.length > 0 || f.trustNone ? { spec: { trust: f.trustNone ? [] : f.trust } } : {}),
+        ...(trustHead ? { trustHead } : {}),
+      });
+      if (res.type !== "loop.watch.snapshot") return c.printError(res);
+      console.log(formatWatch(res.watch, res.triggers).join("\n"));
+    }),
+  );
+
+watch
+  .command("rm <watchId>")
+  .description("Delete a watch (runs it started carry on)")
+  .action((ref: string) =>
+    withClient(async (c) => {
+      const id = await resolveWatchId(c, ref);
+      if (!id) return;
+      const res = await c.request({ type: "loop.watch.delete", id: randomUUID(), watchId: id });
+      if (res.type !== "response.ok") return c.printError(res);
+      console.log(`Deleted ${id}.`);
+    }),
+  );
+
+watch
+  .command("poll <watchId>")
+  .description("Poll now instead of at the next interval")
+  .action((ref: string) =>
+    withClient(async (c) => {
+      const id = await resolveWatchId(c, ref);
+      if (!id) return;
+      const res = await c.request({ type: "loop.watch.poll", id: randomUUID(), watchId: id });
+      if (res.type !== "loop.watch.snapshot") return c.printError(res);
+      const started = res.poll?.started ?? [];
+      console.log(started.length === 0 ? "No run started." : `Started ${started.join(", ")} (codeoid loop show <id>).`);
+      for (const s of res.poll?.skipped ?? []) console.log(`  skipped: ${s}`);
+    }),
+  );
+
+/** A watch id from a full id or an unambiguous prefix of the owner's watches. */
+async function resolveWatchId(c: Parameters<Parameters<typeof withClient>[0]>[0], ref: string): Promise<string | null> {
+  if (/^lw_[0-9a-f-]{36}$/.test(ref)) return ref;
+  const res = await c.request({ type: "loop.watch.list", id: randomUUID() });
+  if (res.type !== "loop.watch.list.result") {
+    c.printError(res);
+    return null;
+  }
+  const hits = res.watches.filter((w) => w.id.startsWith(ref) || w.id.startsWith(`lw_${ref}`));
+  if (hits.length === 1) return hits[0]!.id;
+  console.error(hits.length === 0 ? `No loop watch matches "${ref}".` : `"${ref}" matches ${hits.length} watches; give more of the id.`);
+  process.exitCode = 1;
+  return null;
+}
+
 /** A run id from a full id or an unambiguous prefix of the owner's runs. */
 async function resolveLoopId(c: Parameters<Parameters<typeof withClient>[0]>[0], ref: string): Promise<string | null> {
   if (/^loop_[0-9a-f-]{36}$/.test(ref)) return ref;
@@ -1795,7 +2029,7 @@ routine
 routine
   .command("run <name>")
   .description("Run a routine now")
-  .option("--payload <text>", "text for the prompt's {{payload}}")
+  .option("--payload <text>", "data for the run: a session routine's prompt gets it as {{payload}}; a loop routine hands it to the loop's worker as data")
   .option("--wait", "wait for the run to finish and print its outcome")
   .action((name: string, o: { payload?: string; wait?: boolean }) =>
     withClient(async (c) => {

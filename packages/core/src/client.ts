@@ -50,6 +50,22 @@ export class AuthRejectedError extends Error {
   }
 }
 
+/**
+ * A request the daemon refused (`response.error`): its words as the message,
+ * with its `code`, and its `detail` when it gave one — so a caller can act on
+ * the refusal (a moved head to re-pin) without parsing the words.
+ */
+export class RequestError extends Error {
+  readonly code: ResponseErrorMsg["code"];
+  readonly detail?: ResponseErrorMsg["detail"];
+  constructor(msg: ResponseErrorMsg) {
+    super(msg.error);
+    this.name = "RequestError";
+    this.code = msg.code;
+    if (msg.detail) this.detail = msg.detail;
+  }
+}
+
 export interface ConnectOptions {
   url: string; // ws://host:port — daemon's WS endpoint
   /** Initial access token used for the first handshake (and the fallback
@@ -266,7 +282,7 @@ export class CodeoidClient {
 
       this.#pending.set(id, {
         resolve: (ok) => resolve(ok as unknown as T),
-        reject: (e) => reject(e instanceof Error ? e : new Error(e.error)),
+        reject: (e) => reject(e instanceof Error ? e : new RequestError(e)),
         waitForResult: options.waitForResult,
         timer,
       });

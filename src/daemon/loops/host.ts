@@ -7,11 +7,12 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { closeSync, constants as fsConstants, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, realpathSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, constants as fsConstants, copyFileSync, createReadStream, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, relative } from "node:path";
 import type { AuthContext } from "../../protocol/types.js";
 import type { Dispatcher } from "../dispatch.js";
+import { redactOutput } from "../evidence/redact.js";
 import type { EvidenceService } from "../evidence/service.js";
 import { execFile } from "node:child_process";
 import { GIT_BIN, gitEnv, hardenedGit as git } from "../git-env.js";
@@ -21,7 +22,8 @@ import type { Session } from "../session.js";
 import { brokenShares, loadSetupRecipe, parseSetupRecipe, prepareWorktree, SETUP_RECIPE_PATH, type WorktreeSetupPolicy } from "../workspace-setup.js";
 import { assertNoLinkedParent, commitTree, copyDir, fingerprint, listTree, removeTree, removeTreeAsync, type NameFolding, ObjectReader, resolveUnder, restoreTree, type Stamps, writeTree } from "./materialize.js";
 import type { CandidateCheckout, LoopHost, PreparedWorkspace, WorkerInfo } from "./service.js";
-import type { LoopRunRow } from "./types.js";
+import { githubFetch, parseGithubRemote } from "./triggers/github.js";
+import { type LoopRunRow, LoopWorkspaceUnsupportedError } from "./types.js";
 
 
 /**
@@ -70,20 +72,57 @@ async function clockPast(dir: string, ctimeNs: bigint): Promise<void> {
   }
 }
 
-/** The values of every config key matching `pattern`, in every scope. */
-function configValues(cwd: string, pattern: string): Promise<string[]> {
+/** Every config key matching `pattern`, in every scope, with its value; null when git can't tell. */
+function configEntries(cwd: string, pattern: string): Promise<Array<[string, string]> | null> {
   return new Promise((res) => {
     execFile(GIT_BIN, ["config", "--null", "--get-regexp", pattern], { cwd, env: gitEnv({ LANG: "C" }), timeout: 30_000 }, (err, stdout) => {
-      // Exit 1: nothing matches. Anything else can't tell, so it refuses.
-      if (err) return (err as { code?: unknown }).code === 1 ? res([]) : res(["?"]);
+      // Exit 1: nothing matches.
+      if (err) return res((err as { code?: unknown }).code === 1 ? [] : null);
       res(
         stdout
           .split("\0")
           .filter(Boolean)
-          .map((kv) => kv.slice(kv.indexOf("\n") + 1)),
+          .map((kv): [string, string] => (kv.includes("\n") ? [kv.slice(0, kv.indexOf("\n")), kv.slice(kv.indexOf("\n") + 1)] : [kv, ""])),
       );
     });
   });
+}
+
+/** The values of every config key matching `pattern`, in every scope; `["?"]` when git can't tell, so a caller refuses. */
+async function configValues(cwd: string, pattern: string): Promise<string[]> {
+  const entries = await configEntries(cwd, pattern);
+  return entries ? entries.map(([, v]) => v) : ["?"];
+}
+
+/**
+ * What a fetch of github.com/`ghRepo` may say it already has: the newest tips
+ * of the remote-tracking branches of remotes whose every URL is that
+ * repository on github.com and that no `url.*.insteadOf` rewrites (so what
+ * they hold came from there), read offline. A remote that points elsewhere —
+ * or a ref under `refs/remotes/` no such remote owns — is not a have.
+ */
+export async function fetchHaves(repo: string, ghRepo: string, max = 32): Promise<string[]> {
+  const [urls, rewrites] = await Promise.all([configEntries(repo, "^remote\\..+\\.url$"), configEntries(repo, "^url\\..+\\.insteadof$")]);
+  if (!urls || !rewrites) return [];
+  const byRemote = new Map<string, string[]>();
+  for (const [key, url] of urls) {
+    // `remote.<name>.url`: the name keeps its case, and may hold dots.
+    const name = key.slice("remote.".length, -".url".length);
+    byRemote.set(name, [...(byRemote.get(name) ?? []), url]);
+  }
+  const want = ghRepo.toLowerCase();
+  const names = [...byRemote].flatMap(([name, list]) => {
+    // A name that would be a pattern, or not a plain path segment run, owns no refs here.
+    if (!/^[A-Za-z0-9._/-]+$/.test(name) || name.split("/").some((part) => part === "" || part === "." || part === "..")) return [];
+    // `refs/remotes/a/` would list the refs of a remote named `a/b` too.
+    if ([...byRemote.keys()].some((other) => other.startsWith(`${name}/`))) return [];
+    const ours = list.every((url) => parseGithubRemote(url)?.toLowerCase() === want && !rewrites.some(([, prefix]) => prefix !== "" && url.startsWith(prefix)));
+    return ours ? [name] : [];
+  });
+  // No pattern lists every ref: none to list is no haves.
+  if (names.length === 0) return [];
+  const out = await git(["for-each-ref", "--sort=-committerdate", `--count=${max}`, "--format=%(objectname)", ...names.map((n) => `refs/remotes/${n}/`)], repo);
+  return [...new Set(out.split("\n").filter((l) => /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(l)))];
 }
 
 /**
@@ -158,6 +197,114 @@ const SCRATCH_IDENTITY = {
   GIT_COMMITTER_EMAIL: "codeoid@localhost",
 };
 
+/**
+ * Make `sha` available in `repo`, fetching `from.fetchRef` from GitHub when it
+ * isn't. This is the only git the daemon runs with the network on, and it never
+ * runs in your repository: your repository's config, which an agent can write,
+ * could otherwise decide where the fetch goes and what it presents (a url
+ * rewrite, a proxy, TLS settings, another credential helper). The fetch goes
+ * into a repository the daemon makes for it under its own directory — no config
+ * but the fetch's own (githubFetch: https only, gh as the only credential
+ * helper, no global or system config) — which borrows your repository's objects
+ * so only what is missing is downloaded: its haves are your repository's
+ * remote-tracking tips, resolved offline and named in its own refs (nothing is
+ * run in your repository to list them). What it fetched is checked as it
+ * comes in, then streamed into your repository by hardened git, offline, and
+ * checked again (`index-pack --strict`); an object's id is its content, so
+ * nothing added can pose as anything else. Why the fetch failed is in the
+ * error, redacted. A shallow or partial clone is refused before anything is
+ * fetched (LoopWorkspaceUnsupportedError): its objects aren't whole, so it
+ * can't stand behind the fetch's haves or take what comes.
+ */
+async function ensureCommit(
+  repo: string,
+  sha: string,
+  from: { repo?: string; fetchRef?: string },
+  scratchDir: string,
+  remote?: (repo: string) => string,
+): Promise<void> {
+  const has = (): Promise<boolean> =>
+    git(["cat-file", "-e", `${sha}^{commit}`], repo).then(
+      () => true,
+      () => false,
+    );
+  if (await has()) return;
+  let why = "";
+  if (from.fetchRef && from.repo) {
+    // The ref names a branch or a pull request head and the repository is a
+    // validated `owner/name` (both checked in the contract).
+    const fetch = githubFetch(from.repo, from.fetchRef, remote?.(from.repo));
+    const commonDir = (await git(["rev-parse", "--path-format=absolute", "--git-common-dir"], repo)).trim();
+    await refuseIncompleteClone(repo, commonDir);
+    let dir: string | null = null;
+    try {
+      // From the daemon's own directory, discovering nothing above it.
+      dir = mkdtempSync(join(scratchDir, "fetch-"));
+      const own = { GIT_DIR: dir, GIT_CONFIG_GLOBAL: "/dev/null" };
+      await git(["init", "-q", "--bare", "--template=", `--object-format=${sha.length === 64 ? "sha256" : "sha1"}`, dir], scratchDir, {
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_CEILING_DIRECTORIES: dirname(scratchDir),
+      });
+      writeExclusive(join(dir, "objects", "info", "alternates"), Buffer.from(`${join(commonDir, "objects")}\n`));
+      // What the fetch may say it has: the remote-tracking tips of your
+      // remotes of this repository on github.com (what came from there
+      // already), read offline by hardened git and named in the fetch
+      // repository's own refs. Without them it would download the head's
+      // whole history.
+      for (const [i, tip] of (await fetchHaves(repo, from.repo)).entries()) {
+        await git(["update-ref", "--no-deref", `refs/haves/${i}`, `${tip}^{commit}`], dir, own).catch(() => {});
+      }
+      // git has no client-side cap on what a fetch downloads (`receive.maxInputSize`
+      // is the server's): the timeout bounds the download, and the size is
+      // checked once it has finished.
+      await git(fetch.args, dir, { ...fetch.env, GIT_DIR: dir }, { network: fetch.protocol, timeoutMs: FETCH_TIMEOUT_MS });
+      const packs = join(dir, "objects", "pack");
+      for (const name of readdirSync(packs).filter((n) => n.endsWith(".pack"))) {
+        const at = join(packs, name);
+        const size = statSync(at).size;
+        if (size > FETCHED_PACK_MAX) {
+          throw new LoopWorkspaceUnsupportedError(`the fetched pack is ${Math.ceil(size / 1024 ** 2)} MiB; a loop takes a head whose missing objects fit in ${FETCHED_PACK_MAX / 1024 ** 3} GiB`);
+        }
+        // Streamed from the file, never read into memory whole.
+        await git(["index-pack", "--stdin", "--strict"], repo, {}, { input: createReadStream(at), timeoutMs: 600_000 });
+      }
+    } catch (err) {
+      if (err instanceof LoopWorkspaceUnsupportedError) throw err;
+      const e = err as { stderr?: unknown; message?: string };
+      const text = typeof e.stderr === "string" && e.stderr.trim() ? e.stderr : (e.message ?? "");
+      why = redactOutput(text).trim().split("\n").slice(-3).join(" ").slice(0, 500);
+    } finally {
+      if (dir) await removeTreeAsync(dir).catch(() => {});
+    }
+    if (await has()) return;
+  }
+  throw new Error(
+    `commit ${sha.slice(0, 12)} is not in the repository and could not be fetched${from.repo && from.fetchRef ? ` from github.com/${from.repo} (${from.fetchRef})` : ""}${why ? `: ${why}` : ""}`,
+  );
+}
+
+/** The largest pack a watch's fetch may bring in, checked once it has downloaded. */
+const FETCHED_PACK_MAX = 2 * 1024 ** 3;
+/** How long a watch's fetch may download for: what bounds it while it does. */
+const FETCH_TIMEOUT_MS = 300_000;
+/** How long an interrupted worker's turn may take to end before it's left to finish on its own. */
+const WORKER_DRAIN_MS = 5_000;
+
+/**
+ * A shallow or partial clone is missing objects by design: a fetch can't
+ * build on it, and what it took in wouldn't be whole. Said plainly, and not
+ * retried (nothing changes until the clone does).
+ */
+async function refuseIncompleteClone(repo: string, commonDir: string): Promise<void> {
+  if (existsSync(join(commonDir, "shallow"))) {
+    throw new LoopWorkspaceUnsupportedError("this repository is a shallow clone: a shallow or partial clone can't fetch a pull request head for a loop yet (`git fetch --unshallow`, or clone it whole)");
+  }
+  const set = (values: string[]): boolean => values.some((v) => v !== "?" && v.trim() !== "" && v.trim().toLowerCase() !== "false");
+  if (set(await configValues(repo, "^extensions\\.partialclone$")) || set(await configValues(repo, "^remote\\..*\\.promisor$"))) {
+    throw new LoopWorkspaceUnsupportedError("this repository is a partial clone: a shallow or partial clone can't fetch a pull request head for a loop yet (clone it whole)");
+  }
+}
+
 export interface LoopHostDeps {
   normalizeWorkdir(path: string): string | null;
   hasProvider(id: string): boolean;
@@ -169,6 +316,9 @@ export interface LoopHostDeps {
   /** The daemon's own directory for candidate checkouts and the setup files
    *  captured for them (made 0700). */
   scratchRoot: string;
+  /** Where a watched repository is fetched from (default: github.com over
+   *  https). Test-only override: no network in tests. */
+  githubRemote?: (repo: string) => string;
   /** Create, register, and return a worker session for the run. */
   createWorkerSession(run: LoopRunRow): Promise<string>;
   /** The run ended: stop the worker acting autonomously. */
@@ -178,7 +328,7 @@ export interface LoopHostDeps {
   senderFor(run: LoopRunRow): AuthContext;
   systemAuth(run: LoopRunRow): AuthContext;
   audit(subject: string, action: string, sessionId: string | undefined, detail: string): void;
-  notifyOwner(run: LoopRunRow, kind: "waiting" | "finished"): void;
+  notifyOwner(run: LoopRunRow, kind: "waiting" | "finished" | "cancelled"): void;
 }
 
 export function buildLoopHost(d: LoopHostDeps): LoopHost {
@@ -232,12 +382,17 @@ export function buildLoopHost(d: LoopHostDeps): LoopHost {
       // Clean checkout first: the setup recipe's command sees committed content
       // only, then the user's uncommitted state is carried — the run repairs
       // what the user has, in its own worktree, without touching theirs.
+      // A triggered run repairs the branch its event happened on: a clean
+      // checkout of that branch's head commit, nothing of your checkout
+      // carried. The commit may only be on GitHub (a pull request).
+      const base = run.contract.baseRef;
+      if (base) await ensureCommit(repo, base.sha, base, scratch().mine, d.githubRemote);
       // Claimed before it exists: no session may open there while setup runs.
       const wt = await createForkWorktree({
         workdir: repo,
         label: `loop-${run.id.slice(5, 13)}`,
         shortId: randomUUID().slice(0, 8),
-        deferCarry: true,
+        ...(base ? { baseCommit: base.sha } : { deferCarry: true }),
         hardened: true,
         onPath: (p) => {
           // Its parent made now, so the real path (through any symlinked
@@ -261,6 +416,8 @@ export function buildLoopHost(d: LoopHostDeps): LoopHost {
         // checks run outside the tree they judge (and the user's checkout).
         const setupSince = ticksNow();
         const setupMark = randomUUID();
+        // Your copied files (an .env) land next to a commit off your history
+        // only when a watch vouched for it (pushed, or every commit signed, by someone you trust).
         const setup = await prepareWorktree({
           worktreePath: wt.path,
           policy: d.worktreeSetupPolicy(),
@@ -268,10 +425,15 @@ export function buildLoopHost(d: LoopHostDeps): LoopHost {
           share: false,
           signal,
           extraEnv: { CODEOID_LOOP_CHECK: setupMark },
+          ...(base && base.trusted !== true ? { copyNeedsReviewedBase: true } : {}),
         });
         // What setup left running in the worktree is stopped before the worker
         // starts: it would otherwise write there as if it were the worker.
         killMarked("CODEOID_LOOP_CHECK", setupMark, realpathSync(wt.path), setupSince);
+        // A pull request's head is usually not on your checkout's history, so
+        // a trusted setup command refuses to run there (it would run code
+        // nobody reviewed); the run's history says why its checks may lack deps.
+        if (setup.commandSkipped) setupNotes.push(`the repository's setup command did not run: ${setup.commandSkipped}`);
         if (setup.error) throw new Error(`the repository's setup recipe failed: ${setup.error}`);
         // What the recipe copied (often a .env from your checkout), captured
         // now: a candidate's checks get these bytes, not whatever the source
@@ -411,7 +573,11 @@ export function buildLoopHost(d: LoopHostDeps): LoopHost {
     },
     interruptWorker: async (id) => {
       const s = d.session(id);
-      if (s) await s.interrupt({ sub: "system:loops", scopes: [], delegationDepth: 0, accountId: s.accountId, projectId: s.projectId });
+      if (!s) return;
+      await s.interrupt({ sub: "system:loops", scopes: [], delegationDepth: 0, accountId: s.accountId, projectId: s.projectId });
+      // The interrupted turn is still draining: its result, the spend with
+      // it, lands after interrupt() resolves. A cancel charges that spend.
+      await s.turnDrained(WORKER_DRAIN_MS);
     },
 
     // The candidate is the exact tree that would be committed: the run's base

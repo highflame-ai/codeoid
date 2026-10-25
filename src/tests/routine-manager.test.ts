@@ -155,6 +155,7 @@ describe("routine lifecycle through the protocol", () => {
     const [run] = got.runs!;
     expect(run).toMatchObject({ trigger: "manual", status: "succeeded", summary: "Found 2 stale PRs: #12, #15.", costUsd: 0.05 });
     expect(got.routine.lastRun?.id).toBe(run!.id);
+    expect(got.routine.lastOutcome?.id).toBe(run!.id);
 
     // The run's session is real, the owner's, and the prompt is attributed to the routine.
     const page = (await call({ type: "scrollback.page", sessionId: run!.sessionId })) as ScrollbackPageResultMsg;
@@ -232,6 +233,8 @@ describe("routine lifecycle through the protocol", () => {
       reason: null,
       checkOutput: null,
       payload: null,
+      loopRunId: null,
+      loopStatus: null,
     });
     const list = await call({ type: "session.list" });
     expect(list.type === "session.list.result" && list.sessions.find((s) => s.id === id)?.managedBy).toBe("routine");
