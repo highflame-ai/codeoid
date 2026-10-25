@@ -18,10 +18,12 @@
  *   - Trust: a run executes the code at the head it works on (its checks run
  *     it). The logins the owner trusts are gh's own login, plus the watch's
  *     `trust` list. A head fires only when GitHub records that a trusted
- *     login pushed it onto its branch (or pressed the button that merged
- *     into it), or when it has commits past the default branch and every one
- *     is signed, verified, and committed by a trusted login — never by
- *     `web-flow`, whose signature is GitHub's, for whoever the commit names.
+ *     login pushed it onto its branch, or pressed the button that merged its
+ *     pull request into it — or auto-merged or queued that pull request, and
+ *     its final head is itself trusted — or when it has commits past the
+ *     default branch and every one is signed, verified, and committed by a
+ *     trusted login — never by `web-flow`, whose signature is GitHub's, for
+ *     whoever the commit names.
  *     The author and committer logins of an unsigned commit are only its
  *     email matched to an account, which anyone can write, so they vouch for
  *     nothing. A head GitHub's activity doesn't list yet is judged again for
@@ -63,6 +65,7 @@ import {
   type GhExec,
   GhError,
   GitHubSource,
+  type PushRecord,
   globMatch,
   mentions,
   parseGithubRemote,
@@ -101,6 +104,10 @@ export const WATCH_LIMITS = {
 } as const;
 
 export const LOGIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
+/** A GitHub App's bot account (`dependabot[bot]`): `--trust` takes one, `--allow` doesn't. */
+const BOT_LOGIN_RE = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}\[bot\]$/;
+/** The merge queue's bot: GitHub records it as the actor of every merge queue merge, whoever queued what. */
+const MERGE_QUEUE_BOT = "github-merge-queue[bot]";
 const APP_RE = /^[a-z0-9][a-z0-9-]{0,99}$/;
 const FAILED = new Set(["failure", "timed_out"]);
 const HOUR_MS = 60 * 60 * 1000;
@@ -113,12 +120,14 @@ const BACKOFF_MAX_MS = 6 * HOUR_MS;
 const WEB_FLOW = "web-flow";
 /** An event waiting to retry this long without a run is dropped. */
 const RETRY_MAX_AGE_MS = 7 * 24 * HOUR_MS;
+/** Activity that puts a commit at a branch's head as the account recorded as its actor (GitHub's activity types). */
+const PUSHES = new Set(["push", "force_push", "branch_creation"]);
 /**
- * Activity that puts a commit at a branch's head as the account recorded as
- * its actor (GitHub's activity types): a push, or a merge whose button that
- * account pressed.
+ * Activity that puts a pull request's merge at the head. Its actor is who
+ * pressed the merge button, who turned auto-merge on (`pr_merge`), or the
+ * merge queue's bot (`merge_queue_merge`): only the first vouches for the
+ * code merged, so the others are judged by the pull request's head as well.
  */
-const HEAD_MOVES = new Set(["push", "force_push", "branch_creation", "pr_merge", "merge_queue_merge"]);
 const MERGES = new Set(["pr_merge", "merge_queue_merge"]);
 /** GitHub's activity list lags a push: a head it doesn't list yet is judged again on later polls for this long. */
 const ACTIVITY_LAG_MS = 10 * 60 * 1000;
@@ -375,10 +384,10 @@ export class WatchService {
       return { ciName, app, command, timeoutSec, ...(c.expectTests ? { expectTests: true } : {}) };
     });
 
-    const logins = (list: string[], max: number, what: string): string[] => {
+    const logins = (list: string[], max: number, what: string, bots = false): string[] => {
       const out = [...new Set(list.map((l) => l.trim()).filter(Boolean))];
       if (out.length > max) bad(`At most ${max} ${what}`);
-      for (const l of out) if (!LOGIN_RE.test(l)) bad(`Not a GitHub login: ${JSON.stringify(l)}`);
+      for (const l of out) if (!LOGIN_RE.test(l) && !(bots && BOT_LOGIN_RE.test(l))) bad(`Not a GitHub login: ${JSON.stringify(l)}`);
       return out;
     };
     // The owner as GitHub knows them: trusted for commits, and the default
@@ -391,8 +400,10 @@ export class WatchService {
         bad(`${errText(err)}; a watch reads GitHub as you, through gh`);
       }
     }
-    const trust = logins(input.trust ?? current?.trust ?? [], WATCH_LIMITS.TRUST_MAX, "trusted logins");
+    // A bot is trusted as whoever can make it push; these two act for everyone.
+    const trust = logins(input.trust ?? current?.trust ?? [], WATCH_LIMITS.TRUST_MAX, "trusted logins", true);
     if (trust.some((l) => l.toLowerCase() === WEB_FLOW)) bad("web-flow can't be trusted: GitHub signs its commits for whoever they name");
+    if (trust.some((l) => l.toLowerCase() === MERGE_QUEUE_BOT)) bad(`${MERGE_QUEUE_BOT} can't be trusted: it merges whatever anyone with write access queues`);
 
     const reviewIn = input.review ?? current?.review ?? { enabled: false };
     const mention = (reviewIn.mention ?? current?.review.mention ?? WATCH_DEFAULTS.mention).trim();
@@ -657,14 +668,14 @@ export class WatchService {
   /**
    * Why the head at `t` isn't vouched for, or null when it is. Vouched for:
    * GitHub records that a trusted login made the push that put it on its
-   * branch, or pressed the button that merged into it (in the repository the
-   * branch is in — a fork's, for a fork's pull request); or it has commits
-   * `base..head` and every one is signed, verified by GitHub, and committed
-   * by a trusted login. The logins on an unsigned commit are only its emails
-   * matched to accounts, which anyone can write; a `web-flow` commit is
-   * signed by GitHub for whoever it names; and a head with no commits past
-   * `base` has no signature at all. Transient when GitHub's activity may not
-   * list the head's push yet.
+   * branch (in the repository the branch is in — a fork's, for a fork's pull
+   * request), or a merge that {@link #mergeUntrusted} vouches for; or it has
+   * commits `base..head` and every one is signed, verified by GitHub, and
+   * committed by a trusted login. The logins on an unsigned commit are only
+   * its emails matched to accounts, which anyone can write; a `web-flow`
+   * commit is signed by GitHub for whoever it names; and a head with no
+   * commits past `base` has no signature at all. Transient when GitHub's
+   * activity may not list the head's push yet.
    */
   async #untrusted(w: WatchRow, gh: GitHubSource, base: string, t: Target): Promise<Untrusted | null> {
     const trusted = new Set([w.spec.ghLogin, ...(w.spec.trust ?? [])].filter((l): l is string => !!l).map((l) => l.toLowerCase()));
@@ -676,23 +687,76 @@ export class WatchService {
     if (!push) {
       pushed = !t.headRepo ? "GitHub doesn't say which repository the head is in" : kept ? "GitHub's activity has no record of the push that made this head" : "GitHub keeps no activity for this repository";
       transient = kept;
-    } else if (!HEAD_MOVES.has(push.type)) {
+    } else if (MERGES.has(push.type)) {
+      const merge = await this.#mergeUntrusted(gh, t.headRepo!, t, push, trusted, who);
+      if (!merge) return null;
+      pushed = merge;
+    } else if (!PUSHES.has(push.type)) {
       pushed = `this head came from a ${push.type || "change"}, not a push or a merge`;
     } else if (push.actor && trusted.has(push.actor.toLowerCase())) {
       return null;
     } else {
-      pushed = `${MERGES.has(push.type) ? "merged" : "pushed"} by ${who(push.actor)}`;
+      pushed = `pushed by ${who(push.actor)}`;
     }
     // Not pushed by anyone trusted: every commit must be signed by one.
-    const unsigned = await this.#unsigned(gh, base, t, trusted, who);
+    const unsigned = await this.#unsigned(gh, base, t.sha, base, trusted, who);
     return unsigned ? { why: `${pushed}, and ${unsigned}`, transient } : null;
   }
 
-  /** Why the commits `base..head` don't vouch for the head, or null when every one is signed by a trusted login. */
-  async #unsigned(gh: GitHubSource, base: string, t: Target, trusted: Set<string>, who: (l: string | null) => string): Promise<string | null> {
-    const commits = await gh.commitsBetween(base, t.sha);
-    if (!commits) return `it has more than ${COMMITS_MAX} commits past ${base} (or GitHub listed fewer than it counted)`;
-    if (commits.length === 0) return `it has no commits past ${base}, so no signature vouches for it`;
+  /**
+   * Why the merge that put `t`'s head on its branch isn't vouched for, or
+   * null when it is. The merge is the pull request GitHub merged as that
+   * commit into that branch. Merged with the button by a trusted login, it is
+   * vouched for, like a trusted push. Auto-merged, or through the merge queue,
+   * the activity's actor didn't merge what was there at the end: auto-merge
+   * merges commits anyone with write access pushed after it was turned on,
+   * and the merge queue's bot is the actor of every queued merge. Then it is
+   * vouched for only when a trusted login merged it (turned auto-merge on, or
+   * queued it) and the pull request's final head is itself trusted: pushed by
+   * a trusted login, or every commit on it signed by one — never through
+   * another merge.
+   */
+  async #mergeUntrusted(
+    gh: GitHubSource,
+    repo: string,
+    t: Target,
+    push: PushRecord,
+    trusted: Set<string>,
+    who: (l: string | null) => string,
+  ): Promise<string | null> {
+    const isTrusted = (l: string | null) => !!l && trusted.has(l.toLowerCase());
+    const pull = await gh.mergedPullOf(repo, t.branch, t.sha);
+    if (!pull) return `merged by ${who(push.actor)}, but GitHub names no pull request it merged into ${t.branch} as this commit`;
+    const queued = push.type === "merge_queue_merge";
+    if (!queued && !pull.autoMerged) return isTrusted(push.actor) ? null : `merged by ${who(push.actor)}`;
+    const how = `pull request #${pull.number}, ${queued ? "merged by the merge queue" : "auto-merged"}`;
+    const merger = queued ? pull.mergedBy : push.actor;
+    if (!isTrusted(merger)) return `${how}, ${queued ? "queued" : "with auto-merge turned on"} by ${who(merger)}`;
+    if (!pull.headRepo || !pull.headSha) return `${how}, from a head GitHub no longer names`;
+    const head = await gh.pushOf(pull.headRepo, pull.headRef, pull.headSha);
+    let last: string;
+    if (!head.push) {
+      last = head.kept ? "GitHub's activity has no record of the push of its last commit" : "GitHub keeps no activity for the repository its last commit is in";
+    } else if (!PUSHES.has(head.push.type)) {
+      last = `its last commit came from a ${head.push.type || "change"}, not a push`;
+    } else if (isTrusted(head.push.actor)) {
+      return null;
+    } else {
+      last = `its last commit was pushed by ${who(head.push.actor)}`;
+    }
+    // What it merged: the pull request's commits past the branch as it was before the merge.
+    const unsigned = await this.#unsigned(gh, `${t.sha}^1`, pull.headSha, `${t.branch} before the merge`, trusted, who);
+    return unsigned ? `${how}; ${last}, and ${unsigned}` : null;
+  }
+
+  /**
+   * Why the commits `base..head` don't vouch for `head`, or null when every
+   * one is signed by a trusted login. `label` names `base` in the reason.
+   */
+  async #unsigned(gh: GitHubSource, base: string, head: string, label: string, trusted: Set<string>, who: (l: string | null) => string): Promise<string | null> {
+    const commits = await gh.commitsBetween(base, head);
+    if (!commits) return `it has more than ${COMMITS_MAX} commits past ${label} (or GitHub listed fewer than it counted)`;
+    if (commits.length === 0) return `it has no commits past ${label}, so no signature vouches for it`;
     for (const c of commits) {
       const id = c.sha.slice(0, 12);
       if (!c.verified) return `${id} isn't signed and verified`;

@@ -103,7 +103,7 @@ It is opt-in, yours alone, and reads GitHub through the `gh` CLI you are already
 
 **A watch runs the code at your branch heads, unattended.**
 A run's checks execute that code, and so does the worker.
-What bounds it is the [trust rule](#who-a-watch-trusts): a head starts a run only when it was pushed by you, or by someone you named, or merged into its branch by one of you (or every commit on it is signed by one of you and verified).
+What bounds it is the [trust rule](#who-a-watch-trusts): a head starts a run only when it was pushed by you, or by someone you named, or merged into its branch by one of you (an auto-merged or queued pull request also needs its own head pushed or signed by one of you), or every commit on it is signed by one of you and verified.
 
 ```bash
 codeoid loop watch add --workdir ~/src/shop --my-prs \
@@ -130,10 +130,19 @@ Commit statuses (the older API some CI systems still use) are not read; only che
 
 When you make a watch it reads the login `gh` is signed in as, and keeps it: that is you.
 `--trust <login>` (repeatable, at most 20) names other people whose commits a head may carry.
+It also takes a GitHub App's bot login, such as `dependabot[bot]`, which trusts anyone who can make that bot push.
+`web-flow` and `github-merge-queue[bot]` are refused: GitHub commits and merges as them for everyone with write access, so trusting either would trust everyone.
 
 Before a run starts, the watch asks GitHub who made the push that put the head on its branch, from the repository's activity (for a pull request from a fork, the fork's).
 GitHub records the account that authenticated, so a push by a trusted login vouches for the head, whatever its commits say.
-So does a merge GitHub records as a trusted login's: a pull request merged with the button, or through the merge queue, puts its merge commit at the head of the branch it merged into, and the activity names who merged it.
+A merge puts the pull request's merge commit at the head of the branch it merged into, and the watch finds that pull request: the one GitHub merged as that commit, into that branch.
+A pull request a trusted login merged with the button vouches for the head, like a trusted push.
+An auto-merged one doesn't by that alone: GitHub records whoever turned auto-merge on as the merger, and anyone with write access can push commits after that, which GitHub then merges.
+A merge through the merge queue doesn't either: GitHub records its bot as the actor of every merge queue merge, and the pull request names who queued it.
+So an auto-merged or queued pull request vouches for the head only when a trusted login turned auto-merge on or queued it, and its final head commit is itself trusted: pushed onto its branch by a trusted login, or every commit on it signed and verified by one (a merge one level further down doesn't count).
+Otherwise the head is untrusted, with why, for example "auto-merged; its last commit was pushed by @someone".
+When GitHub doesn't say whether auto-merge was ever on for a pull request, it is judged as auto-merged.
+A merge queue merge can land a batch of pull requests at once, and GitHub names only the last as the one merged at the head; when that one is vouched for, the batch vouches for what's beneath it, like a trusted push.
 A trusted push vouches for every commit beneath the head too, including commits someone else wrote that you pulled and pushed on: pushing a branch is how you say its code is yours to run.
 The names on a commit vouch for nothing by themselves: GitHub ties a commit to an account by its email, which anyone can write into a commit.
 So when the push wasn't by a trusted login, or GitHub has no record of it, the head is trusted only if it has commits past the default branch (at most 250) and every one is signed, verified by GitHub, and committed by a trusted login.
@@ -149,7 +158,7 @@ What follows from trusting by who pushed:
 - Anything that holds your `gh` login or a personal access token of yours pushes as you, and so is trusted as you: a script, a CI job, a tool or another agent you gave the token to.
   Keep such tokens out of automation you wouldn't let run code on your machine.
 - A push by a bot or app (a CI autofix, a formatter bot, Dependabot) is not a push by you: its head is untrusted unless every commit on it is signed by a trusted login, which a bot's commits aren't.
-  Push on top of it yourself, or name the bot's login with `--trust` if you trust what it pushes.
+  Push on top of it yourself, or name the bot's login with `--trust` (`--trust "dependabot[bot]"`) if you trust what it pushes: that trusts anyone who can make that bot push.
 
 ### What starts a run
 

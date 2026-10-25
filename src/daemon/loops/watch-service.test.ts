@@ -52,6 +52,10 @@ interface Comment {
   /** When it was last edited, if it was. */
   editedAt?: number;
   kind?: "review" | "issue" | "review_body";
+  /** Deleted between REST listing it and GraphQL reading it: GraphQL answers NOT_FOUND for its id. */
+  deleted?: boolean;
+  /** The repository GraphQL says it is in; default REPO. */
+  repo?: string;
 }
 
 interface Commit {
@@ -68,6 +72,28 @@ interface Push {
   after: string;
   actor: string | null;
   type?: string;
+}
+
+/**
+ * A pull request GitHub merged, as `commits/{sha}/pulls` (REST) and the
+ * pull request's GraphQL node report it after the merge.
+ */
+interface Merge {
+  /** The repository it merged in; default REPO. */
+  repo?: string;
+  /** Its merge commit (what the merge queue or the button put on the base). */
+  sha: string;
+  number: number;
+  base: string;
+  head: { repo?: string | null; ref: string; sha: string };
+  /** `merged_by`: who pressed the button, turned auto-merge on, or queued it. */
+  mergedBy: string | null;
+  /** Auto-merge on when it merged: REST's `auto_merge` and GraphQL's `autoMergeRequest` stay set after the merge. */
+  autoMerge?: boolean;
+  /** Auto-merge turned on and off again: only the enable event in its timeline says so. */
+  autoMergeEvent?: boolean;
+  /** GraphQL's answer leaves out its timeline: whether auto-merge was on can't be told. */
+  timelineMissing?: boolean;
 }
 
 /** A comment's GraphQL node id, as REST reports it. */
@@ -87,6 +113,8 @@ class FakeGitHub {
   commits = new Map<string, Commit[]>();
   /** The repository's push activity, newest first. A head with none listed was pushed by `defaultPusher`. */
   pushes: Push[] = [];
+  /** Pull requests merged, by merge commit. */
+  merges: Merge[] = [];
   defaultPusher: string | null = "ada";
   calls: string[][] = [];
   /** What compare reports as the commit count, when it isn't the commits listed. */
@@ -119,10 +147,12 @@ class FakeGitHub {
         // when their review was submitted (null while it is pending), drafted
         // at `createdAt`, and `lastEditedAt` only for an edit.
         const ids = args.filter((a) => a.startsWith("ids[]=")).map((a) => a.slice(6));
-        const nodes = ids.map((nodeId) => {
+        const missing: number[] = [];
+        const nodes = ids.map((nodeId, i) => {
           for (const [number, list] of this.comments) {
             const c = list.find((x) => nodeIdOf(x) === nodeId);
             if (!c) continue;
+            if (c.deleted) break;
             const at = c.at ?? Date.now() + 1_000;
             const review = c.kind === "review";
             return {
@@ -136,11 +166,49 @@ class FakeGitHub {
               ...(review ? { state: c.pending ? "PENDING" : "SUBMITTED", path: "src/cart.ts", line: 3 } : {}),
               author: { login: c.login },
               pullRequest: { number },
+              repository: { nameWithOwner: c.repo ?? REPO },
             };
           }
+          missing.push(i);
           return null;
         });
-        return ok({ data: { nodes } });
+        if (missing.length === 0) return ok({ data: { nodes } });
+        // As gh reports it: exit 1, the data still on stdout, a NOT_FOUND error per missing id.
+        return {
+          code: 1,
+          stdout: JSON.stringify({
+            data: { nodes },
+            errors: missing.map((i) => ({ type: "NOT_FOUND", path: ["nodes", i], message: `Could not resolve to a node with the global id of '${ids[i]}'` })),
+          }),
+          stderr: `gh: Could not resolve to a node with the global id of '${ids[missing[0]!]}'`,
+        };
+      }
+      if (query.includes("autoMergeRequest")) {
+        const repo = `${args.find((a) => a.startsWith("owner="))!.slice(6)}/${args.find((a) => a.startsWith("name="))!.slice(5)}`;
+        const number = Number(args.find((a) => a.startsWith("number="))!.slice(7));
+        const m = this.merges.find((x) => (x.repo ?? REPO) === repo && x.number === number);
+        if (!m) {
+          return {
+            code: 1,
+            stdout: JSON.stringify({ data: { repository: { pullRequest: null } }, errors: [{ type: "NOT_FOUND", path: ["repository", "pullRequest"] }] }),
+            stderr: `gh: Could not resolve to a PullRequest with the number of ${number}.`,
+          };
+        }
+        const auto = m.autoMerge === true;
+        return ok({
+          data: {
+            repository: {
+              pullRequest: {
+                merged: true,
+                mergedBy: m.mergedBy ? { login: m.mergedBy } : null,
+                mergeCommit: { oid: m.sha },
+                baseRefName: m.base,
+                autoMergeRequest: auto ? { enabledAt: "2026-10-25T09:00:00Z" } : null,
+                ...(m.timelineMissing ? {} : { timelineItems: { nodes: auto || m.autoMergeEvent ? [{ __typename: "AutoMergeEnabledEvent" }] : [] } }),
+              },
+            },
+          },
+        });
       }
       const number = Number(args.find((a) => a.startsWith("number="))!.slice(7));
       const nodes = (this.comments.get(number) ?? [])
@@ -182,7 +250,29 @@ class FakeGitHub {
         [...listed, ...implied].map((p) => ({ id: 1, ref, after: p.after, before: "0".repeat(40), activity_type: p.type ?? "push", actor: p.actor ? { login: p.actor } : null })),
       );
     }
-    m = /^repos\/[^/]+\/[^/]+\/compare\/main\.\.\.([0-9a-f]+)\?per_page=(\d+)&page=(\d+)$/.exec(path);
+    m = /^repos\/([^/]+\/[^/]+)\/commits\/([0-9a-f]+)\/pulls\?per_page=100$/.exec(path);
+    if (m) {
+      // Every pull request the commit is on, as REST lists them: merged_by is null in a list.
+      const [repo, sha] = [m[1]!, m[2]!];
+      return ok(
+        this.merges
+          .filter((x) => (x.repo ?? REPO) === repo && (x.sha === sha || x.head.sha === sha))
+          .map((x) => {
+            const head = x.head.repo === undefined ? REPO : x.head.repo;
+            return {
+              number: x.number,
+              state: "closed",
+              merged_at: "2026-10-25T09:30:00Z",
+              merge_commit_sha: x.sha,
+              merged_by: null,
+              auto_merge: x.autoMerge ? { enabled_by: { login: x.mergedBy }, merge_method: "merge" } : null,
+              base: { ref: x.base, repo: { full_name: repo } },
+              head: { ref: x.head.ref, sha: x.head.sha, repo: head ? { full_name: head } : null },
+            };
+          }),
+      );
+    }
+    m = /^repos\/[^/]+\/[^/]+\/compare\/(?:main|[0-9a-f]{40}%5E1)\.\.\.([0-9a-f]+)\?per_page=(\d+)&page=(\d+)$/.exec(path);
     if (m) {
       const all = this.commits.get(m[1]!) ?? [{ sha: m[1]!, author: this.me, committer: this.me }];
       const per = Number(m[2]);
@@ -632,20 +722,170 @@ describe("trust: a head runs only when a trusted login pushed it, or signed ever
     expect(res.skipped.join()).toContain("branch_deletion, not a push or a merge");
   });
 
-  test("a merge GitHub records as a trusted login's (its button, or the merge queue) vouches for the head", async () => {
-    // Watching the default branch: the merge commit is its head, and the activity names who merged.
+  // Watching the default branch: a merge commit is its head. `pr` is the pull request merged as `sha` into main.
+  const MERGED_HEAD = "d".repeat(40);
+  const merged = (sha: string, over: Partial<Merge> = {}): Merge => ({
+    sha,
+    number: 41,
+    base: "main",
+    head: { ref: "feature/cart", sha: MERGED_HEAD },
+    mergedBy: "ada",
+    ...over,
+  });
+  const mainWatch = async (sha = SHA1) => {
     const w = await svc.create({ workdir: "/repo", branches: ["main"], ci: CI }, OWNER);
-    gh.branches.set("main", SHA1);
-    failing();
-    gh.commits.set(SHA1, [{ sha: "a".repeat(40), author: "mallory", committer: "web-flow", verified: true }]);
+    gh.branches.set("main", sha);
+    failing(sha);
+    // The default branch has no commits past itself: only the merge can vouch for it.
+    gh.commits.set(sha, []);
+    return w;
+  };
+  const noteOf = (id: string) => store.listTriggers(id).find((t) => t.key.startsWith("untrusted:"))?.note ?? "";
+
+  test("a pull request a trusted login merged with the button vouches for the head", async () => {
+    const w = await mainWatch();
+    gh.merges = [merged(SHA1)];
     gh.pushes = [{ branch: "main", after: SHA1, actor: "ada", type: "pr_merge" }];
     expect((await svc.poll(w.id, OWNER)).started).toHaveLength(1);
+    expect(gh.pathsCalled(`/commits/${SHA1}/pulls`)).toEqual([`repos/${REPO}/commits/${SHA1}/pulls?per_page=100`]);
+    // Its head isn't consulted: who pressed the button vouches for what it merged.
+    expect(gh.pathsCalled("feature%2Fcart")).toHaveLength(0);
+  });
+
+  test("a merge queue merge is the merge queue bot's: it vouches only when a trusted login queued it and the pull request's head is trusted", async () => {
+    // As GitHub records it: the bot is the activity's actor, the person who queued it is merged_by.
+    const w = await mainWatch();
+    gh.merges = [merged(SHA1)];
+    gh.pushes = [
+      { branch: "main", after: SHA1, actor: "github-merge-queue[bot]", type: "merge_queue_merge" },
+      { branch: "feature/cart", after: MERGED_HEAD, actor: "ada", type: "push" },
+    ];
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(1);
+    expect(gh.pathsCalled("/activity?ref=refs%2Fheads%2Ffeature%2Fcart")).toHaveLength(1);
     loops.active.clear();
+    // Queued by a stranger.
     gh.branches.set("main", SHA2);
     failing(SHA2, 601);
-    gh.pushes = [{ branch: "main", after: SHA2, actor: "ada", type: "merge_queue_merge" }];
+    gh.commits.set(SHA2, []);
+    gh.merges = [merged(SHA2, { number: 42, mergedBy: "mallory" })];
+    gh.pushes = [{ branch: "main", after: SHA2, actor: "github-merge-queue[bot]", type: "merge_queue_merge" }, ...gh.pushes.slice(1)];
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
+    expect(noteOf(w.id)).toContain("pull request #42, merged by the merge queue, queued by @mallory");
+  });
+
+  test("a queued pull request whose last commit a stranger pushed is untrusted", async () => {
+    const w = await mainWatch();
+    gh.merges = [merged(SHA1)];
+    gh.pushes = [
+      { branch: "main", after: SHA1, actor: "github-merge-queue[bot]", type: "merge_queue_merge" },
+      { branch: "feature/cart", after: MERGED_HEAD, actor: "mallory", type: "push" },
+    ];
+    gh.commits.set(MERGED_HEAD, [{ sha: MERGED_HEAD, author: "mallory", committer: "mallory" }]);
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
+    expect(noteOf(w.id)).toContain("pull request #41, merged by the merge queue; its last commit was pushed by @mallory");
+  });
+
+  test("an auto-merged pull request needs its last commit trusted too: anyone with write access can push after auto-merge is on", async () => {
+    const w = await mainWatch();
+    // You turned auto-merge on (the activity's actor); someone pushed afterwards, and GitHub merged that.
+    gh.merges = [merged(SHA1, { autoMerge: true })];
+    gh.pushes = [
+      { branch: "main", after: SHA1, actor: "ada", type: "pr_merge" },
+      { branch: "feature/cart", after: MERGED_HEAD, actor: "mallory", type: "push" },
+    ];
+    gh.commits.set(MERGED_HEAD, [{ sha: MERGED_HEAD, author: "ada", committer: "ada" }]);
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
+    expect(noteOf(w.id)).toContain("pull request #41, auto-merged; its last commit was pushed by @mallory");
+    // Its commits are read past main as it was before the merge: the merge commit's first parent.
+    expect(gh.pathsCalled(`/compare/${SHA1}%5E1...${MERGED_HEAD}`)).toHaveLength(1);
+  });
+
+  test("an auto-merged pull request whose last commit you pushed, or whose every commit you signed, vouches for the head", async () => {
+    const w = await mainWatch();
+    gh.merges = [merged(SHA1, { autoMerge: true })];
+    gh.pushes = [
+      { branch: "main", after: SHA1, actor: "ada", type: "pr_merge" },
+      { branch: "feature/cart", after: MERGED_HEAD, actor: "ada", type: "force_push" },
+    ];
     expect((await svc.poll(w.id, OWNER)).started).toHaveLength(1);
-    expect(loops.started.map((r) => r.input.baseRef!.sha)).toEqual([SHA1, SHA2]);
+    loops.active.clear();
+    const head2 = "e".repeat(40);
+    gh.branches.set("main", SHA2);
+    failing(SHA2, 601);
+    gh.commits.set(SHA2, []);
+    gh.merges = [merged(SHA2, { number: 42, autoMerge: true, head: { ref: "feature/two", sha: head2 } })];
+    gh.pushes = [
+      { branch: "main", after: SHA2, actor: "ada", type: "pr_merge" },
+      { branch: "feature/two", after: head2, actor: "mallory", type: "push" },
+    ];
+    gh.commits.set(head2, [{ sha: head2, author: "mallory", committer: "ada", verified: true }]);
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(1);
+  });
+
+  test("an auto-merged pull request is judged by who turned auto-merge on", async () => {
+    const w = await mainWatch();
+    gh.merges = [merged(SHA1, { autoMerge: true, mergedBy: "mallory" })];
+    gh.pushes = [
+      { branch: "main", after: SHA1, actor: "mallory", type: "pr_merge" },
+      { branch: "feature/cart", after: MERGED_HEAD, actor: "ada", type: "push" },
+    ];
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
+    expect(noteOf(w.id)).toContain("pull request #41, auto-merged, with auto-merge turned on by @mallory");
+  });
+
+  test("auto-merge turned on at any point, or not knowing whether it was, is judged as auto-merged", async () => {
+    const w = await mainWatch();
+    // On and off again: REST's auto_merge is null, only the timeline says.
+    gh.merges = [merged(SHA1, { autoMergeEvent: true })];
+    gh.pushes = [
+      { branch: "main", after: SHA1, actor: "ada", type: "pr_merge" },
+      { branch: "feature/cart", after: MERGED_HEAD, actor: "mallory", type: "push" },
+    ];
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
+    expect(noteOf(w.id)).toContain("auto-merged; its last commit was pushed by @mallory");
+    gh.branches.set("main", SHA2);
+    failing(SHA2, 601);
+    gh.commits.set(SHA2, []);
+    gh.merges = [merged(SHA2, { number: 42, timelineMissing: true })];
+    gh.pushes = [{ branch: "main", after: SHA2, actor: "ada", type: "pr_merge" }, ...gh.pushes.slice(1)];
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
+    expect(store.listTriggers(w.id).filter((t) => t.key.includes(SHA2))[0]!.note).toContain("pull request #42, auto-merged;");
+  });
+
+  test("the pull request's head is judged by its push, never by another merge", async () => {
+    const w = await mainWatch();
+    gh.merges = [merged(SHA1)];
+    gh.pushes = [
+      { branch: "main", after: SHA1, actor: "github-merge-queue[bot]", type: "merge_queue_merge" },
+      // Its head is itself a merge (another pull request merged into the branch): not followed.
+      { branch: "feature/cart", after: MERGED_HEAD, actor: "ada", type: "pr_merge" },
+    ];
+    gh.commits.set(MERGED_HEAD, [{ sha: MERGED_HEAD, author: "ada", committer: "web-flow", verified: true }]);
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
+    expect(noteOf(w.id)).toContain("its last commit came from a pr_merge, not a push");
+    expect(gh.pathsCalled(`/commits/${MERGED_HEAD}/pulls`)).toHaveLength(0);
+  });
+
+  test("a merge GitHub names no pull request for — none, another base, another merge commit — is untrusted", async () => {
+    const w = await mainWatch();
+    gh.pushes = [{ branch: "main", after: SHA1, actor: "ada", type: "pr_merge" }];
+    gh.merges = [];
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
+    expect(noteOf(w.id)).toContain("GitHub names no pull request it merged into main as this commit");
+    for (const [n, m] of [
+      [601, merged(SHA2, { base: "release" })],
+      // SHA2 is only on the pull request (its head), not its merge commit.
+      [602, merged("f".repeat(40), { head: { ref: "feature/cart", sha: SHA2 } })],
+    ] as const) {
+      store.forgetUntrusted(store.get(w.id)!);
+      gh.branches.set("main", SHA2);
+      failing(SHA2, n);
+      gh.commits.set(SHA2, []);
+      gh.merges = [m];
+      gh.pushes = [{ branch: "main", after: SHA2, actor: "ada", type: "pr_merge" }];
+      expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
+      expect(noteOf(w.id)).toContain("names no pull request");
+    }
   });
 
   test("a merge by a stranger is untrusted", async () => {
@@ -653,11 +893,27 @@ describe("trust: a head runs only when a trusted login pushed it, or signed ever
     gh.branches.set("main", SHA1);
     failing();
     gh.commits.set(SHA1, [{ sha: "a".repeat(40), author: "ada", committer: "ada" }]);
+    gh.merges = [merged(SHA1, { mergedBy: "mallory" })];
     gh.pushes = [{ branch: "main", after: SHA1, actor: "mallory", type: "pr_merge" }];
     const res = await svc.poll(w.id, OWNER);
     expect(res.started).toHaveLength(0);
     expect(store.listTriggers(w.id)[0]).toMatchObject({ outcome: "ignored" });
     expect(store.listTriggers(w.id)[0]!.note).toContain("merged by @mallory");
+  });
+
+  test("`trust` takes a bot's login, which trusts whoever can make it push; never web-flow or the merge queue's bot", async () => {
+    const w = await prWatch({ trust: ["dependabot[bot]"] });
+    failing();
+    gh.pushes = [{ branch: "feature/cart", after: SHA1, actor: "dependabot[bot]" }];
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(1);
+    for (const bad of ["github-merge-queue[bot]", "GitHub-Merge-Queue[bot]"]) {
+      await expect(svc.create({ workdir: "/r3", myPrs: true, ci: CI, trust: [bad] }, OWNER)).rejects.toThrow("github-merge-queue[bot] can't be trusted");
+    }
+    for (const bad of ["[bot]", "-x[bot]", "a b[bot]", "dependabot[bot]x", "dependabot[app]"]) {
+      await expect(svc.create({ workdir: "/r3", myPrs: true, ci: CI, trust: [bad] }, OWNER)).rejects.toThrow("Not a GitHub login");
+    }
+    // A comment is an instruction: `allow` names people, not bots.
+    await expect(svc.create({ workdir: "/r3", myPrs: true, ci: CI, review: { enabled: true, allow: ["dependabot[bot]"] } }, OWNER)).rejects.toThrow("Not a GitHub login");
   });
 
   test("with no trusted push on record, every commit must be signed, verified, and committed by a trusted login", async () => {
@@ -1312,6 +1568,42 @@ describe("comments in a review", () => {
     await svc.poll(w.id, OWNER);
     const reads = gh.calls.filter((c) => c[1] === "graphql" && c.some((a) => a.includes("nodes(ids:")));
     expect(reads.map((c) => c.filter((a) => a.startsWith("ids[]=")).length)).toEqual([100, 50]);
+  });
+
+  test("a comment deleted between REST listing it and GraphQL reading it is skipped, and the rest still count", async () => {
+    const w = await prWatch({ review: { enabled: true } });
+    gh.comments.set(12, [
+      { id: 7, login: "ada", body: "@codeoid rename it", deleted: true },
+      { id: 8, login: "ada", body: "@codeoid and the test" },
+    ]);
+    const res = await svc.poll(w.id, OWNER);
+    expect(res.started).toHaveLength(1);
+    expect(loops.started[0]!.input.trigger!.key).toBe(`review:${REPO}:issue:8`);
+    expect(store.get(w.id)!.lastError).toBeNull();
+  });
+
+  test("a GraphQL error other than NOT_FOUND fails the read, even with data on stdout", async () => {
+    const w = await prWatch({ review: { enabled: true } });
+    gh.comments.set(12, [{ id: 8, login: "ada", body: "@codeoid rename it" }]);
+    const real = gh.exec;
+    gh.exec = async (args, opts) => {
+      if (args[1] === "graphql" && args.some((a) => a.includes("nodes(ids:"))) {
+        return { code: 1, stdout: JSON.stringify({ data: { nodes: [null] }, errors: [{ type: "NOT_FOUND" }, { type: "FORBIDDEN" }] }), stderr: "gh: Resource not accessible by integration" };
+      }
+      return real(args, opts);
+    };
+    const res = await svc.poll(w.id, OWNER);
+    expect(res.started).toHaveLength(0);
+    expect(store.get(w.id)!.lastError).toContain("Resource not accessible by integration");
+  });
+
+  test("a comment GraphQL places in another repository is not this pull request's", async () => {
+    const w = await prWatch({ review: { enabled: true } });
+    gh.comments.set(12, [{ id: 8, login: "ada", body: "@codeoid rename it", repo: "evil/shop" }]);
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
+    gh.comments.set(12, [{ id: 9, login: "ada", body: "@codeoid rename it", repo: "ACME/Shop" }]);
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(1);
+    expect(gh.calls.find((c) => c.some((a) => a.includes("nodes(ids:")))!.find((a) => a.startsWith("query="))).toContain("repository { nameWithOwner }");
   });
 });
 

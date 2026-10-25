@@ -310,6 +310,20 @@ export interface PushLookup {
   kept: boolean;
 }
 
+/** The pull request GitHub merged as a commit, as far as judging that merge needs. */
+export interface MergedPull {
+  number: number;
+  /** Who GitHub records as having merged it — for the merge queue, who queued it; null when it doesn't say. */
+  mergedBy: string | null;
+  /** Auto-merge was turned on for it at some point; true when GitHub doesn't say either way. */
+  autoMerged: boolean;
+  /** `owner/name` of the repository its head branch is in; null when GitHub doesn't say (a deleted fork). */
+  headRepo: string | null;
+  headRef: string;
+  /** Its final head commit; "" when GitHub doesn't give one. */
+  headSha: string;
+}
+
 /** Commits read to judge a head; more than this and it is not trusted. */
 export const COMMITS_MAX = 250;
 
@@ -337,8 +351,24 @@ const REVIEWS_QUERY = `query($owner: String!, $name: String!, $number: Int!, $en
 const COMMENT_NODES_QUERY = `query($ids: [ID!]!) {
   nodes(ids: $ids) {
     __typename
-    ... on IssueComment { databaseId body url publishedAt lastEditedAt author { login } pullRequest { number } }
-    ... on PullRequestReviewComment { databaseId body url state publishedAt lastEditedAt path line author { login } pullRequest { number } }
+    ... on IssueComment { databaseId body url publishedAt lastEditedAt author { login } pullRequest { number } repository { nameWithOwner } }
+    ... on PullRequestReviewComment { databaseId body url state publishedAt lastEditedAt path line author { login } pullRequest { number } repository { nameWithOwner } }
+  }
+}`;
+
+/**
+ * What judging a merge needs from its pull request beyond REST: who GitHub
+ * records as having merged it (for the merge queue, who queued it), and
+ * whether auto-merge was on — now (`autoMergeRequest`, null once it merged
+ * by hand) or ever (an enable event in its timeline, kept after a disable).
+ */
+const MERGED_PULL_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      merged mergedBy { login } mergeCommit { oid } baseRefName
+      autoMergeRequest { enabledAt }
+      timelineItems(itemTypes: [AUTO_MERGE_ENABLED_EVENT, AUTO_REBASE_ENABLED_EVENT, AUTO_SQUASH_ENABLED_EVENT], first: 1) { nodes { __typename } }
+    }
   }
 }`;
 
@@ -366,6 +396,28 @@ export class GitHubSource {
     const r = await this.#gh(args, { timeoutMs: GH_TIMEOUT_MS });
     if (r.code !== 0) throw ghFailure(`${what} failed`, r);
     return r.stdout;
+  }
+
+  /**
+   * A GraphQL read whose nodes may be gone: gh exits 1 when any node id
+   * resolves to nothing (deleted since it was listed), with the data still on
+   * stdout and each missing node null in it. That answer is used when every
+   * error in it is NOT_FOUND; any other error fails the read.
+   */
+  async #graphqlNodes(args: string[], what: string): Promise<unknown> {
+    const r = await this.#gh(args, { timeoutMs: GH_TIMEOUT_MS });
+    if (r.code === 0) return parseJsonStream(r.stdout)[0];
+    let page: { data?: unknown; errors?: unknown } | undefined;
+    try {
+      page = parseJsonStream(r.stdout)[0] as typeof page;
+    } catch {
+      page = undefined;
+    }
+    const errors = page?.errors;
+    const onlyMissing =
+      Array.isArray(errors) && errors.length > 0 && errors.every((e) => (e as { type?: unknown } | null)?.type === "NOT_FOUND") && page?.data != null;
+    if (!onlyMissing) throw ghFailure(`${what} failed`, r);
+    return page;
   }
 
   async #api(path: string, paginate = false): Promise<unknown[]> {
@@ -436,6 +488,53 @@ export class GitHubSource {
       if (str(a.after) === sha) return { push: { actor: login(a.actor), type: str(a.activity_type) }, kept: true };
     }
     return { push: null, kept: true };
+  }
+
+  /**
+   * The pull request GitHub merged into `repo`'s `branch` as the commit `sha`:
+   * the one REST lists for the commit whose merge commit is `sha` and whose
+   * base is that branch; null when there is none, or GraphQL disagrees about
+   * it. Its merger and auto-merge come from GraphQL ({@link MERGED_PULL_QUERY}).
+   */
+  async mergedPullOf(repo: string, branch: string, sha: string): Promise<MergedPull | null> {
+    if (!isRepo(repo)) throw new GhError(`not a GitHub repository name: ${repo}`);
+    const pages = await this.#api(`repos/${repo}/commits/${sha}/pulls?per_page=100`, true);
+    const p = pages
+      .flatMap((page) => (Array.isArray(page) ? page : []))
+      .find((x: Record<string, unknown>) => {
+        const base = (x.base ?? {}) as { ref?: unknown; repo?: { full_name?: unknown } | null };
+        return (
+          typeof x.number === "number" &&
+          str(x.merge_commit_sha) === sha &&
+          str(x.merged_at) !== "" &&
+          str(base.ref) === branch &&
+          str(base.repo?.full_name).toLowerCase() === repo.toLowerCase()
+        );
+      }) as Record<string, unknown> | undefined;
+    if (!p) return null;
+    const number = p.number as number;
+    const [owner, name] = repo.split("/") as [string, string];
+    const [page] = parseJsonStream(
+      await this.#run(
+        ["api", "graphql", "-f", `owner=${owner}`, "-f", `name=${name}`, "-F", `number=${number}`, "-f", `query=${MERGED_PULL_QUERY}`],
+        `GitHub pull request #${number} of ${repo}`,
+      ),
+    );
+    const q = (page as { data?: { repository?: { pullRequest?: Record<string, unknown> | null } | null } } | null)?.data?.repository?.pullRequest;
+    if (!q || q.merged !== true || str((q.mergeCommit as { oid?: unknown } | null | undefined)?.oid) !== sha || str(q.baseRefName) !== branch) return null;
+    const events = (q.timelineItems as { nodes?: unknown } | null | undefined)?.nodes;
+    const head = (p.head ?? {}) as { ref?: unknown; sha?: unknown; repo?: { full_name?: unknown } | null };
+    const headRepo = str(head.repo?.full_name);
+    const headSha = str(head.sha);
+    return {
+      number,
+      mergedBy: login(q.mergedBy),
+      // Not knowing is judged as auto-merged: the stricter rule.
+      autoMerged: p.auto_merge !== null || q.autoMergeRequest !== null || !Array.isArray(events) || events.length > 0,
+      headRepo: isRepo(headRepo) ? headRepo : null,
+      headRef: str(head.ref),
+      headSha: /^[0-9a-f]{40}$/.test(headSha) ? headSha : "",
+    };
   }
 
   /**
@@ -529,16 +628,19 @@ export class GitHubSource {
     const comments: CommentRecord[] = [];
     for (let i = 0; i < ids.length; i += NODES_PER_QUERY) {
       const chunk = ids.slice(i, i + NODES_PER_QUERY);
-      const [page] = parseJsonStream(
-        await this.#run(["api", "graphql", ...chunk.flatMap((id) => ["-f", `ids[]=${id}`]), "-f", `query=${COMMENT_NODES_QUERY}`], `GitHub comments on pull request #${pr}`),
+      const page = await this.#graphqlNodes(
+        ["api", "graphql", ...chunk.flatMap((id) => ["-f", `ids[]=${id}`]), "-f", `query=${COMMENT_NODES_QUERY}`],
+        `GitHub comments on pull request #${pr}`,
       );
       const nodes = (page as { data?: { nodes?: unknown } } | null)?.data?.nodes;
       if (!Array.isArray(nodes)) throw new GhError(`GitHub returned no comments on pull request #${pr}`);
       for (const c of nodes as Array<Record<string, unknown> | null>) {
-        // Null: deleted since it was listed.
+        // Null: deleted since it was listed (GitHub's NOT_FOUND for its id).
         if (!c || typeof c.databaseId !== "number") continue;
         const kind = c.__typename === "PullRequestReviewComment" ? "review" : c.__typename === "IssueComment" ? "issue" : null;
         if (!kind || (c.pullRequest as { number?: unknown } | null | undefined)?.number !== pr) continue;
+        // On this repository's pull request, not one of the same number elsewhere.
+        if (str((c.repository as { nameWithOwner?: unknown } | null | undefined)?.nameWithOwner).toLowerCase() !== this.repo.toLowerCase()) continue;
         // A line comment in a review not yet submitted isn't published: no one but its author sees it.
         const published = time(c.publishedAt);
         if (published === null || (kind === "review" && str(c.state) !== "SUBMITTED")) continue;
