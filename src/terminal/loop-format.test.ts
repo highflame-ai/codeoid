@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { LoopRunWire } from "../protocol/types.js";
-import { formatLoop, formatLoopRow, formatWatch, parseCheckFlag, parseCiFlag, startedBy } from "./loop-format";
+import { formatLoop, formatLoopRow, formatWatch, parseCheckFlag, parseCiFlag, parseTrustHeadFlag, startedBy } from "./loop-format";
 
 const run: LoopRunWire = {
   id: "loop_12345678-aaaa-bbbb-cccc-1234567890ab",
@@ -106,11 +106,27 @@ describe("loop formatting", () => {
       [
         { key: "k", kind: "ci_failure", branch: "b", runId: null, outcome: "ignored", note: "commits by someone you don't trust: \x1b]8;;x\x07", createdAt: "2026-10-25T10:00:00.000Z" },
         { key: "v", kind: "trust_anchor", branch: "main", runId: null, outcome: "vouched", note: "you vouched for main at abc123abc123", createdAt: "2026-10-25T10:00:00.000Z" },
+        { key: "h", kind: "head", branch: "main", runId: null, outcome: "ignored", note: "not pushed by someone you trust: pushed by @mallory", createdAt: "2026-10-25T10:00:00.000Z" },
       ],
     ).join("\n");
+    expect(watch).toContain("head   main  ignored — not pushed by someone you trust: pushed by @mallory");
     expect(watch).toContain("trusts     @ada (you), @bob");
     expect(watch).toContain("vouch  main  you vouched for main at abc123abc123");
     expect(watch).not.toContain("\x1b[2J");
     expect(watch).not.toContain("\x1b]8");
+  });
+});
+
+describe("--trust-head", () => {
+  test("alone it vouches for every watched branch's head; <branch>=<sha> pins a branch to a commit of at least 12 characters", () => {
+    expect(parseTrustHeadFlag(undefined)).toBeUndefined();
+    expect(parseTrustHeadFlag(true)).toBe(true);
+    expect(parseTrustHeadFlag(["main=0123456789AB", `release/1.x=${"f".repeat(40)}`])).toEqual({ main: "0123456789ab", "release/1.x": "f".repeat(40) });
+    // A branch name may hold "=": the commit is after the last one.
+    expect(parseTrustHeadFlag(["a=b=0123456789ab"])).toEqual({ "a=b": "0123456789ab" });
+    expect(parseTrustHeadFlag(["main=0123456789a"])).toContain("at least 12 characters");
+    expect(parseTrustHeadFlag(["main"])).toContain("expected <branch>=<sha>");
+    expect(parseTrustHeadFlag(["=0123456789ab"])).toContain("expected <branch>=<sha>");
+    expect(parseTrustHeadFlag(["main=0123456789ab", "main=ba9876543210"])).toContain("two commits for main");
   });
 });

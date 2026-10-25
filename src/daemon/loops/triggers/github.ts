@@ -313,6 +313,12 @@ export const NO_COMMIT = "0".repeat(40);
 /** What GitHub's activity says about a head: the push that made it, if listed, and whether GitHub keeps activity for the repository at all. */
 export interface PushLookup {
   push: PushRecord | null;
+  /**
+   * The push is the branch's newest change: nothing moved the branch after it,
+   * but a deletion of the branch at that head (the usual end of a merged pull
+   * request's branch). False when it isn't, or there is no push.
+   */
+  latest: boolean;
   /** False when GitHub keeps no activity for the repository (404): no record will come. */
   kept: boolean;
 }
@@ -406,6 +412,8 @@ export interface MergedPull {
   /** `owner/name` of the repository its head branch is in; null when GitHub doesn't say (a deleted fork). */
   headRepo: string | null;
   headRef: string;
+  /** The branch it was merged into (its base when it merged); "" when GitHub doesn't say. */
+  baseRef: string;
   /** Its final head commit; "" when GitHub doesn't give one. */
   headSha: string;
   /** The merge commit's first parent: what it was made on; "" when GitHub doesn't say. */
@@ -502,14 +510,20 @@ const SHA_RE = /^[0-9a-f]{40}$/;
 const str = (v: unknown): string => (typeof v === "string" ? v : "");
 const login = (v: unknown): string | null => str((v as { login?: unknown } | null | undefined)?.login) || null;
 /**
- * A login GraphQL gave with its `__typename`: a bot's as REST and the
- * activity write it (`renovate[bot]`), since GraphQL leaves the `[bot]` off —
- * and a bot named like a person is not that person.
+ * A login GraphQL gave with its `__typename`: a user's as it is, and a bot's
+ * as REST and the activity write it (`renovate[bot]`), since GraphQL leaves
+ * the `[bot]` off — a bot named like a person is not that person. Any other
+ * kind of actor (a `Mannequin` left by an import, an `EnterpriseUserAccount`,
+ * an `Organization`, or no type at all) is no one: its login names no account
+ * a trust list or an allow list could mean.
  */
 const actorLogin = (v: unknown): string | null => {
   const l = login(v);
-  if (!l || (v as { __typename?: unknown }).__typename !== "Bot" || l.endsWith("[bot]")) return l;
-  return `${l}[bot]`;
+  if (!l) return null;
+  const type = (v as { __typename?: unknown }).__typename;
+  if (type === "User") return l;
+  if (type === "Bot") return l.endsWith("[bot]") ? l : `${l}[bot]`;
+  return null;
 };
 const time = (v: unknown): number | null => {
   const t = Date.parse(str(v));
@@ -641,10 +655,17 @@ export class GitHubSource {
     return log;
   }
 
-  /** The newest push (or merge) to `repo`'s `branch` that left it at `sha`, on the newest page of its activity. */
+  /**
+   * The newest push (or merge) to `repo`'s `branch` that left it at `sha`, on
+   * the newest page of its activity, and whether it is the branch's newest
+   * change ({@link PushLookup.latest}).
+   */
   async pushOf(repo: string, branch: string, sha: string): Promise<PushLookup> {
     const log = await this.activity(repo, branch);
-    return { push: log.entries.find((a) => a.after === sha) ?? null, kept: log.kept };
+    const at = log.entries.findIndex((a) => a.after === sha);
+    const top = log.entries[0];
+    const latest = at === 0 || (at === 1 && top !== undefined && top.type === "branch_deletion" && top.before === sha);
+    return { push: at >= 0 ? log.entries[at]! : null, latest, kept: log.kept };
   }
 
   /** `sha`'s parents in this repository (none for a root commit), message, and author date. */
@@ -679,10 +700,12 @@ export class GitHubSource {
    * commit's parent and commit count come from GraphQL
    * ({@link MERGED_PULL_QUERY}), and GraphQL disagreeing makes it none.
    *
-   * Its base branch isn't matched: GitHub's stacked pull requests merge each
-   * onto its parent's branch and then move the default branch, so most in a
-   * stack have another pull request's branch as their base. What pins the
-   * branch is the activity that put the commit on it, which the caller read.
+   * Its base branch isn't matched here, only reported: GitHub's stacked pull
+   * requests merge each onto its parent's branch and then move the default
+   * branch, so most in a stack have another pull request's branch as their
+   * base. What pins the branch is the activity that put the commit on it,
+   * which the caller read — or, where the activity has no record of it, the
+   * base, which the caller then matches.
    */
   async mergedAs(repo: string, sha: string): Promise<MergedAs> {
     if (!isRepo(repo)) throw new GhError(`not a GitHub repository name: ${repo}`);
@@ -718,6 +741,7 @@ export class GitHubSource {
     const enabledAt = time(lastEnable?.createdAt);
     const queuedEvents = (q.mergeQueued as { nodes?: unknown } | null | undefined)?.nodes;
     const head = (p.head ?? {}) as { ref?: unknown; sha?: unknown; repo?: { full_name?: unknown } | null };
+    const baseRef = str((p.base as { ref?: unknown } | null | undefined)?.ref);
     const headRepo = str(head.repo?.full_name);
     const headSha = str(head.sha);
     const parentsConn = mergeCommit?.parents as { nodes?: unknown; totalCount?: unknown } | null | undefined;
@@ -737,6 +761,7 @@ export class GitHubSource {
         parents: typeof parentCount === "number" && Number.isInteger(parentCount) && parentCount > 0 ? parentCount : 0,
         headRepo: isRepo(headRepo) ? headRepo : null,
         headRef: str(head.ref),
+        baseRef,
         headSha: SHA_RE.test(headSha) ? headSha : "",
         parent: SHA_RE.test(parent) ? parent : "",
         commits: typeof count === "number" && Number.isInteger(count) && count > 0 ? count : 0,

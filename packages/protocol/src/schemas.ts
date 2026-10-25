@@ -920,11 +920,22 @@ const loopWatchPatchSchema = z.object(
     [K in keyof typeof loopWatchSpecFields]: z.ZodOptional<(typeof loopWatchSpecFields)[K]>;
   },
 );
+/**
+ * `true`: vouch for each watched branch's head as it is now. A record of
+ * branch to commit (12–40 hex characters): only for those branches, and only
+ * while each head is still that commit (compare-and-set).
+ */
+const trustHeadSchema = z.union([
+  z.boolean(),
+  z
+    .record(z.string().min(1).max(200), z.string().regex(/^[0-9a-fA-F]{12,40}$/))
+    .refine((r) => Object.keys(r).length >= 1 && Object.keys(r).length <= 20, "name 1–20 branches"),
+]);
 export const loopWatchCreateSchema = z.object({
   ...base,
   type: z.literal("loop.watch.create"),
   spec: loopWatchPatchSchema.extend({ workdir: z.string().min(1).max(LIMITS.PATH_MAX), ci: loopWatchSpecFields.ci }),
-  trustHead: z.boolean().optional(),
+  trustHead: trustHeadSchema.optional(),
 });
 export const loopWatchListSchema = z.object({ ...base, type: z.literal("loop.watch.list") });
 export const loopWatchRefSchema = z.object({
@@ -938,7 +949,7 @@ export const loopWatchUpdateSchema = z.object({
   watchId: idField,
   enabled: z.boolean().optional(),
   spec: loopWatchPatchSchema.optional(),
-  trustHead: z.boolean().optional(),
+  trustHead: trustHeadSchema.optional(),
 });
 
 export const routineCreateSchema = z.object({ ...base, type: z.literal("routine.create"), spec: routineSpecSchema });

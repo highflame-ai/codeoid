@@ -277,8 +277,11 @@ export interface LoopWatchWire {
 /** An event a watch acted on: a run it started, or one it ignored for good. */
 export interface LoopWatchTriggerWire {
   key: string;
-  /** An event, or `trust_anchor`: you vouched for a branch's head (`trustHead`). */
-  kind: "ci_failure" | "review_comment" | "trust_anchor";
+  /**
+   * An event; `trust_anchor`: you vouched for a branch's head (`trustHead`);
+   * `head`: a watched head the watch judged untrusted with no event on it.
+   */
+  kind: "ci_failure" | "review_comment" | "trust_anchor" | "head";
   branch: string;
   runId: string | null;
   /** `retry`: its run's workspace couldn't be prepared; a later poll tries again. `vouched`: a trust anchor. */
@@ -291,13 +294,19 @@ export interface LoopWatchTriggerWire {
  * `trustHead` (branch watches only): you vouch for each watched branch's head
  * as it is now. It is remembered as trusted under the watch's trust list, so
  * a later merge's chain of trusted merges can end at it; audited, and kept in
- * the watch's history. Never implied by anything else.
+ * the watch's history with who put the head there. Never implied by anything
+ * else. `true` vouches for every watched branch's head as the daemon reads
+ * it; a record of branch to commit id (at least 12 hex characters) vouches
+ * for only those branches, and only while each head is still that commit —
+ * when any moved, nothing is vouched for and the request fails.
  */
+export type LoopWatchTrustHead = boolean | Record<string, string>;
+
 export interface LoopWatchCreateMsg {
   type: "loop.watch.create";
   id: string;
   spec: LoopWatchSpecWire;
-  trustHead?: boolean;
+  trustHead?: LoopWatchTrustHead;
 }
 
 export interface LoopWatchListMsg {
@@ -319,7 +328,7 @@ export interface LoopWatchUpdateMsg {
   enabled?: boolean;
   spec?: Partial<Omit<LoopWatchSpecWire, "workdir">>;
   /** As on create: vouch for each watched branch's head as it is now (after `spec` applies). */
-  trustHead?: boolean;
+  trustHead?: LoopWatchTrustHead;
 }
 
 export interface LoopWatchDeleteMsg {

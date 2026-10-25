@@ -141,7 +141,7 @@ export function formatWatch(w: LoopWatchWire, triggers: LoopWatchTriggerWire[] =
             : t.outcome === "vouched"
               ? S(t.note)
               : `ignored — ${S(t.note)}`;
-      const kind = t.kind === "ci_failure" ? "ci    " : t.kind === "trust_anchor" ? "vouch " : "review";
+      const kind = t.kind === "ci_failure" ? "ci    " : t.kind === "trust_anchor" ? "vouch " : t.kind === "head" ? "head  " : "review";
       lines.push(`    ${t.createdAt.slice(0, 19).replace("T", " ")} ${kind} ${S(t.branch)}  ${what}`);
     }
   }
@@ -163,6 +163,27 @@ export function parseCiFlag(raw: string): { ciName: string; app?: string; comman
   const app = /^(.*?)\s*@([a-z0-9][a-z0-9-]{0,99})$/.exec(ciName);
   if (app) ciName = app[1]!.trim();
   return ciName && command ? { ciName, ...(app ? { app: app[2]! } : {}), command } : null;
+}
+
+/**
+ * Parse `--trust-head`: given alone (`true`), you vouch for each watched
+ * branch's head as it is when the daemon reads it; given `<branch>=<sha>`
+ * (repeatable), only for those branches, and only while each head is still
+ * the commit you name (at least 12 characters of it) — otherwise nothing is
+ * vouched for. A string is what is wrong with it.
+ */
+export function parseTrustHeadFlag(v: true | string[] | undefined): true | Record<string, string> | undefined | string {
+  if (v === undefined || v === true) return v;
+  const out: Record<string, string> = {};
+  for (const raw of v) {
+    const i = raw.lastIndexOf("=");
+    const branch = i > 0 ? raw.slice(0, i).trim() : "";
+    const sha = i > 0 ? raw.slice(i + 1).trim().toLowerCase() : "";
+    if (!branch || !/^[0-9a-f]{12,40}$/.test(sha)) return `--trust-head ${JSON.stringify(raw)}: expected <branch>=<sha>, with at least 12 characters of the commit id.`;
+    if (out[branch] !== undefined && out[branch] !== sha) return `--trust-head names two commits for ${branch}.`;
+    out[branch] = sha;
+  }
+  return out;
 }
 
 /**

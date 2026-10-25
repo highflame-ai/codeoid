@@ -61,7 +61,7 @@ import {
   scheduleFromFlags,
   specFromFlags,
 } from "./terminal/routine-format.js";
-import { formatLoop, formatLoopRow, formatWatch, formatWatchRow, parseCheckFlag, parseCiFlag } from "./terminal/loop-format.js";
+import { formatLoop, formatLoopRow, formatWatch, formatWatchRow, parseCheckFlag, parseCiFlag, parseTrustHeadFlag } from "./terminal/loop-format.js";
 import {
   getConfigDir,
   getLocalTokenPath,
@@ -784,6 +784,10 @@ function printTestResult(resp: DaemonMessage | undefined): void {
 }
 
 const collect = (v: string, prev: string[] = []) => [...prev, v];
+/** `--trust-head [branch=sha]`: `true` given alone, the pins given with values. */
+const collectPin = (v: string, prev: unknown) => [...(Array.isArray(prev) ? (prev as string[]) : []), v];
+const TRUST_HEAD_HELP = (when: string) =>
+  `${when}you vouch for each watched branch's head as it is now — it and everything beneath it are trusted, so later merges by trusted logins are judged from it (recorded in the watch's history and the audit log, with who put the head there). <branch>=<sha> (repeatable, at least 12 characters of the commit) vouches for that branch only while its head is still that commit, and for nothing if it moved`;
 
 endpoint
   .command("ls")
@@ -1707,7 +1711,7 @@ watch
   .option("--allow <login>", "GitHub login whose comments count (repeatable; default: you, as gh is signed in)", collect, [])
   .option("--mention <token>", "The token a comment must contain (default @codeoid)")
   .option("--trust <login>", "Another GitHub login whose commits may be on a head the watch runs; list everyone who merges to a watched branch. A bot as name[bot] trusts anyone who can make that bot push (repeatable; you are always trusted)", collect, [])
-  .option("--trust-head", "With --branch: you vouch for each watched branch's head as it is now — it and everything beneath it are trusted, so later merges by trusted logins are judged from it (recorded in the watch's history and the audit log)")
+  .option("--trust-head [branch=sha]", TRUST_HEAD_HELP("With --branch: "), collectPin)
   .option("--per-hour <n>", "Runs the watch may start per hour (default 6)")
   .option("--attempts <n>", "Worker attempts per run (default 3)")
   .option("--budget <n>", "Autonomous tool calls per attempt (default 60)")
@@ -1724,7 +1728,7 @@ watch
       allow: string[];
       mention?: string;
       trust: string[];
-      trustHead?: boolean;
+      trustHead?: true | string[];
       perHour?: string;
       attempts?: string;
       budget?: string;
@@ -1738,6 +1742,8 @@ watch
         };
         if ((f.branch.length > 0) === (f.myPrs === true)) return fail("Give --branch (one or more) or --my-prs, not both.");
         if (f.trustHead && f.myPrs) return fail("--trust-head vouches for watched branches' heads; give it with --branch.");
+        const trustHead = parseTrustHeadFlag(f.trustHead);
+        if (typeof trustHead === "string") return fail(trustHead);
         if (f.ci.length === 0) return fail('Give at least one --ci "<check name>: <command>".');
         const ci = [];
         for (const raw of f.ci) {
@@ -1763,7 +1769,7 @@ watch
             ...(f.provider ? { provider: f.provider } : {}),
             ...(f.model ? { model: f.model } : {}),
           },
-          ...(f.trustHead ? { trustHead: true } : {}),
+          ...(trustHead ? { trustHead } : {}),
         });
         if (res.type !== "loop.watch.snapshot") return c.printError(res);
         console.log(formatWatch(res.watch, res.triggers).join("\n"));
@@ -1811,12 +1817,18 @@ watch
 watch
   .command("resume <watchId>")
   .description("Start polling again")
-  .option("--trust-head", "With --branch: you vouch for each watched branch's head as it is now — it and everything beneath it are trusted, so later merges by trusted logins are judged from it (recorded in the watch's history and the audit log)")
-  .action((ref: string, f: { trustHead?: boolean }) =>
+  .option("--trust-head [branch=sha]", TRUST_HEAD_HELP("For a watch of branches: "), collectPin)
+  .action((ref: string, f: { trustHead?: true | string[] }) =>
     withClient(async (c) => {
+      const trustHead = parseTrustHeadFlag(f.trustHead);
+      if (typeof trustHead === "string") {
+        console.error(trustHead);
+        process.exitCode = 1;
+        return;
+      }
       const id = await resolveWatchId(c, ref);
       if (!id) return;
-      const res = await c.request({ type: "loop.watch.update", id: randomUUID(), watchId: id, enabled: true, ...(f.trustHead ? { trustHead: true } : {}) });
+      const res = await c.request({ type: "loop.watch.update", id: randomUUID(), watchId: id, enabled: true, ...(trustHead ? { trustHead } : {}) });
       if (res.type !== "loop.watch.snapshot") return c.printError(res);
       console.log(f.trustHead ? formatWatch(res.watch, res.triggers).join("\n") : formatWatchRow(res.watch));
     }),
@@ -1825,23 +1837,32 @@ watch
 watch
   .command("update <watchId>")
   .description("Change who a watch trusts, or vouch for its branches' heads as they are now")
-  .option("--trust <login>", "Replace the trusted logins with these (repeatable; you are always trusted). Judges its heads again", collect, [])
-  .option("--trust-head", "With --branch: you vouch for each watched branch's head as it is now — it and everything beneath it are trusted, so later merges by trusted logins are judged from it (recorded in the watch's history and the audit log)")
-  .action((ref: string, f: { trust: string[]; trustHead?: boolean }) =>
+  .option(
+    "--trust <login>",
+    "Replace the trusted logins with these (repeatable; you are always trusted). Judges the heads it refused again; the heads it trusted are kept when the new list only adds logins",
+    collect,
+    [],
+  )
+  .option("--trust-none", "Trust no one but you: empty the list of trusted logins")
+  .option("--trust-head [branch=sha]", TRUST_HEAD_HELP("For a watch of branches: "), collectPin)
+  .action((ref: string, f: { trust: string[]; trustNone?: boolean; trustHead?: true | string[] }) =>
     withClient(async (c) => {
-      if (f.trust.length === 0 && !f.trustHead) {
-        console.error("Give --trust <login> (one or more) or --trust-head.");
+      const fail = (m: string): void => {
+        console.error(m);
         process.exitCode = 1;
-        return;
-      }
+      };
+      if (f.trust.length === 0 && !f.trustNone && !f.trustHead) return fail("Give --trust <login> (one or more), --trust-none, or --trust-head.");
+      if (f.trust.length > 0 && f.trustNone) return fail("Give --trust or --trust-none, not both.");
+      const trustHead = parseTrustHeadFlag(f.trustHead);
+      if (typeof trustHead === "string") return fail(trustHead);
       const id = await resolveWatchId(c, ref);
       if (!id) return;
       const res = await c.request({
         type: "loop.watch.update",
         id: randomUUID(),
         watchId: id,
-        ...(f.trust.length > 0 ? { spec: { trust: f.trust } } : {}),
-        ...(f.trustHead ? { trustHead: true } : {}),
+        ...(f.trust.length > 0 || f.trustNone ? { spec: { trust: f.trustNone ? [] : f.trust } } : {}),
+        ...(trustHead ? { trustHead } : {}),
       });
       if (res.type !== "loop.watch.snapshot") return c.printError(res);
       console.log(formatWatch(res.watch, res.triggers).join("\n"));

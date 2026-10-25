@@ -606,3 +606,18 @@ describe("session.ui_response payload exclusivity", () => {
     }
   });
 });
+
+describe("loop.watch trustHead", () => {
+  test("true, or branches each pinned to a commit (12–40 hex characters): a compare-and-set", () => {
+    const update = (trustHead: unknown) => parseClientMessage({ type: "loop.watch.update", id: "u1", watchId: "lw_1", trustHead });
+    expect(update(true).ok).toBe(true);
+    expect(update({ main: "0123456789ab" }).ok).toBe(true);
+    expect(update({ main: "0123456789AB", release: "f".repeat(40) }).ok).toBe(true);
+    expect(update({ main: "0123456789a" }).ok).toBe(false);
+    expect(update({ main: "g".repeat(12) }).ok).toBe(false);
+    expect(update({}).ok).toBe(false);
+    expect(update("main").ok).toBe(false);
+    const create = parseClientMessage({ type: "loop.watch.create", id: "c1", spec: { workdir: "/r", branches: ["main"], ci: [{ ciName: "t", command: "t" }] }, trustHead: { main: "0123456789ab" } });
+    expect(create.ok).toBe(true);
+  });
+});

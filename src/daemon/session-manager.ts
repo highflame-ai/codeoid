@@ -6390,7 +6390,7 @@ mcpHub: this.#mcpHub,
     // Disabling (and nothing else) is a safety stop.
     const safetyStop =
       msg.type === "loop.watch.delete" ||
-      (msg.type === "loop.watch.update" && msg.enabled === false && msg.spec === undefined && msg.trustHead !== true);
+      (msg.type === "loop.watch.update" && msg.enabled === false && msg.spec === undefined && !msg.trustHead);
     const reads = msg.type === "loop.watch.list" || msg.type === "loop.watch.get";
     if (!reads && !safetyStop) {
       if (delegated) return err("A delegated token cannot create, change, enable, or poll a loop watch", "forbidden");
@@ -6415,7 +6415,7 @@ mcpHub: this.#mcpHub,
           const provider = msg.spec.provider ?? this.#providers.defaultId;
           const bad = providerOk(provider);
           if (bad) return bad;
-          const w = await svc.create({ ...msg.spec, provider }, owner, { trustHead: msg.trustHead === true });
+          const w = await svc.create({ ...msg.spec, provider }, owner, msg.trustHead ? { trustHead: msg.trustHead } : {});
           return snapshot(w.id);
         }
         case "loop.watch.list":
@@ -6430,7 +6430,7 @@ mcpHub: this.#mcpHub,
             {
               ...(msg.enabled !== undefined ? { enabled: msg.enabled } : {}),
               ...(msg.spec ? { spec: msg.spec } : {}),
-              ...(msg.trustHead ? { trustHead: true } : {}),
+              ...(msg.trustHead ? { trustHead: msg.trustHead } : {}),
             },
             owner,
           );

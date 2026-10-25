@@ -76,8 +76,11 @@ export type TriggerKind = "ci_failure" | "review_comment";
 export interface TriggerRow {
   watchId: string;
   key: string;
-  /** An event, or `trust_anchor`: you vouched for a branch's head (`--trust-head`). */
-  kind: TriggerKind | "trust_anchor";
+  /**
+   * An event; `trust_anchor`: you vouched for a branch's head (`--trust-head`);
+   * `head`: a watched head judged untrusted with no event on it.
+   */
+  kind: TriggerKind | "trust_anchor" | "head";
   branch: string;
   /** The run it started; null while claimed, when ignored, or waiting to retry. */
   runId: string | null;
@@ -353,7 +356,7 @@ export class WatchStore {
    * untrusted head, an edited comment). One waiting to retry becomes ignored;
    * one already acted on stays as it is.
    */
-  ignore(w: WatchRow, key: string, kind: TriggerKind, branch: string, note: string, at: number): void {
+  ignore(w: WatchRow, key: string, kind: TriggerKind | "head", branch: string, note: string, at: number): void {
     this.#db
       .prepare(
         `INSERT INTO loop_triggers (account_id, project_id, owner_sub, repo, watch_id, key, kind, branch, outcome, note, settled, created_at)
@@ -465,6 +468,18 @@ export class WatchStore {
       .run(w.accountId, w.projectId, w.ownerSub, w.repo, w.id, `vouch:${w.id}:${w.repo.toLowerCase()}:${branch}:${sha}`, branch, note.slice(0, 500), at);
   }
 
+  /**
+   * The watch's trust list changed from `from`'s to `to`'s and trusts no one
+   * less: every head remembered under the old generation is trusted under the
+   * new one too, so it is stamped with the new. A head remembered under any
+   * other generation stays as it is, counting for nothing.
+   */
+  carryTrusted(from: WatchRow, to: WatchRow): void {
+    this.#db
+      .prepare("UPDATE loop_watch_trusted_heads SET generation = ? WHERE watch_id = ? AND generation = ?")
+      .run(trustGeneration(to.spec), to.id, trustGeneration(from.spec));
+  }
+
   /** Forget the heads this watch judged trusted (its trust list changed: they may not be any more). */
   forgetTrusted(w: WatchRow): void {
     this.#db.prepare("DELETE FROM loop_watch_trusted_heads WHERE watch_id = ?").run(w.id);
@@ -548,7 +563,7 @@ export class WatchStore {
     ).map((r) => ({
       watchId: r.watch_id,
       key: r.key,
-      kind: r.kind as TriggerKind,
+      kind: r.kind as TriggerRow["kind"],
       branch: r.branch,
       runId: r.run_id,
       outcome: r.outcome as TriggerRow["outcome"],

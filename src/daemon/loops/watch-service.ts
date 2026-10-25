@@ -24,9 +24,11 @@
  *     `--trust-head`) is a trusted merge — each pull request it landed merged
  *     with the button by a trusted login, or auto-merged or queued by one
  *     with its final head itself trusted (or, auto-merged, pushed before a
- *     trusted login last turned auto-merge on); a hole in GitHub's activity
- *     is crossed, at most three times, only at a pull request merged with the
- *     button by a trusted login; or
+ *     trusted login last turned auto-merge on, that push being its branch's
+ *     newest change); a hole in GitHub's activity is crossed, at most three
+ *     times, only at a pull request merged into the branch with the button by
+ *     a trusted login, and never over a deletion or creation of the branch;
+ *     or
  *     when it has commits past the default branch and every one is signed,
  *     verified, and committed by a trusted login — never by `web-flow`, whose
  *     signature is GitHub's, for whoever the commit names.
@@ -35,9 +37,13 @@
  *     nothing. A head GitHub's activity doesn't list yet is judged again for
  *     a while (the list lags a push); anything else is ignored for that head.
  *     A watched branch's head is judged whenever it moves, and remembered when
- *     trusted, so the remembered head keeps up with the branch. What is
- *     remembered is stamped with the trust list it was judged under, and a
- *     poll records nothing it judged once the watch changed under it.
+ *     trusted (recorded untrusted when not), so the remembered head keeps up
+ *     with the branch and a chain stops at the first head refused. What is
+ *     remembered is stamped with the trust list it was judged under (carried
+ *     to a list that only adds logins), and a poll records nothing it judged
+ *     once the watch changed under it. Comments on a pull request whose head
+ *     is refused aren't read, and the comments are read from where they were
+ *     until it is vouched for, so what was asked meanwhile still counts.
  *   - Dedupe: every event has a key (`ci:<repo>:<sha>:<checkRunId>:<suiteId>`,
  *     `review:<repo>:<kind>:<id>`) recorded per owner in `loop_triggers` with
  *     the run it started, so an event seen on every poll, by any of the
@@ -87,7 +93,7 @@ import {
   unquoted,
 } from "./triggers/github.js";
 import { LOOP_DEFAULTS, LOOP_LIMITS, type LoopRunRow, type LoopTrigger } from "./types.js";
-import { type TriggerKind, type WatchCiMapping, type WatchRow, type WatchSpec, type WatchStore, trustGeneration } from "./watch-store.js";
+import type { TriggerKind, WatchCiMapping, WatchRow, WatchSpec, WatchStore } from "./watch-store.js";
 
 /** Subject prefix of the commits loops deliver (LoopService #deliver). */
 export const DELIVERY_SUBJECT_PREFIX = "codeoid loop:";
@@ -214,6 +220,16 @@ interface Candidate {
   input: LoopStartInput;
 }
 
+/** `--trust-head`: every watched branch's head as it is (`true`), or the named branches' while each is the commit named. */
+export type TrustHead = true | Record<string, string>;
+
+/** A head the owner vouches for, and what GitHub's activity says put it there (null: it doesn't say). */
+interface VouchedHead {
+  branch: string;
+  sha: string;
+  by: string | null;
+}
+
 /** Why a head isn't vouched for; `transient` when GitHub's activity may not list its push yet. */
 interface Untrusted {
   why: string;
@@ -251,12 +267,6 @@ export class WatchService {
    * Being made is not itself a reason to trust a head.
    */
   readonly #baseline = new Set<string>();
-  /**
-   * Per watch, trust generation, and branch: the head the last refresh judged
-   * untrusted for good with no event on it, so an unchanged head isn't judged
-   * again every poll. Not kept across a restart, which costs one judgment.
-   */
-  readonly #refused = new Map<string, string>();
 
   constructor(store: WatchStore, host: WatchHost, opts: { pollSeconds?: number; firstPollMs?: number; now?: () => number } = {}) {
     this.#store = store;
@@ -321,9 +331,10 @@ export class WatchService {
 
   /**
    * Make a watch. `trustHead`: you vouch for each watched branch's head as it
-   * is now ({@link #vouch}).
+   * is now, or for the named branches' while they are the commits named
+   * ({@link #currentHeads}, {@link #vouch}).
    */
-  async create(input: WatchSpecInput & { workdir: string }, owner: LoopOwner, opts: { trustHead?: boolean } = {}): Promise<WatchRow> {
+  async create(input: WatchSpecInput & { workdir: string }, owner: LoopOwner, opts: { trustHead?: TrustHead } = {}): Promise<WatchRow> {
     this.#admit(owner);
     const workdir = this.#host.normalizeWorkdir(input.workdir);
     if (!workdir) throw new LoopError(`workdir not usable: ${input.workdir}`, "invalid_request");
@@ -332,7 +343,7 @@ export class WatchService {
     const repo = parseGithubRemote(origin);
     if (!repo) throw new LoopError(`origin is not a github.com repository (${redactUrl(origin)})`, "invalid_request");
     const spec = await this.#resolveSpec(input);
-    const heads = opts.trustHead ? await this.#currentHeads(repo, spec) : [];
+    const heads = opts.trustHead ? await this.#currentHeads(repo, spec, opts.trustHead) : [];
     // Again after the awaits: two creates racing must not both pass the bound.
     this.#admit(owner);
     const w = this.#store.create({
@@ -352,17 +363,30 @@ export class WatchService {
   }
 
   /**
-   * The head of each branch `spec` watches, read now, for the owner to vouch
-   * for. Only a branch watch has them: a `--my-prs` watch's heads are your
-   * own pushes, judged by who pushed them.
+   * The heads to vouch for, read now: of each branch `spec` watches (`true`),
+   * or of the branches `want` names, each only while it is still the commit
+   * named there (at least 12 characters of it) — a compare-and-set, so a push
+   * between your look and this read vouches for nothing: one head that moved
+   * fails the whole request, before anything changes. With each, who GitHub's
+   * activity says put it there, for the record. Only a branch watch has
+   * heads to vouch for: a `--my-prs` watch's are your own pushes, judged by
+   * who pushed them.
    */
-  async #currentHeads(repo: string, spec: WatchSpec): Promise<Array<{ branch: string; sha: string }>> {
+  async #currentHeads(repo: string, spec: WatchSpec, want: TrustHead): Promise<VouchedHead[]> {
     if (spec.myPrs || spec.branches.length === 0) {
       throw new LoopError("--trust-head vouches for watched branches' heads; a watch of your pull requests has none to vouch for", "invalid_request");
     }
+    const pins = want === true ? null : new Map(Object.entries(want).map(([b, sha]) => [b, sha.toLowerCase()]));
+    if (pins) {
+      if (pins.size === 0) throw new LoopError("--trust-head names no branch", "invalid_request");
+      for (const [b, sha] of pins) {
+        if (!spec.branches.includes(b)) throw new LoopError(`--trust-head names ${JSON.stringify(b)}, which the watch doesn't watch`, "invalid_request");
+        if (!/^[0-9a-f]{12,40}$/.test(sha)) throw new LoopError(`--trust-head ${b}=${sha}: give at least 12 characters of the commit id`, "invalid_request");
+      }
+    }
     const gh = new GitHubSource(this.#host.gh, repo);
-    const out: Array<{ branch: string; sha: string }> = [];
-    for (const branch of spec.branches) {
+    const out: VouchedHead[] = [];
+    for (const branch of pins ? [...pins.keys()] : spec.branches) {
       let sha: string;
       try {
         sha = await gh.branchHead(branch);
@@ -370,9 +394,24 @@ export class WatchService {
         throw new LoopError(`reading ${branch}'s head to vouch for it: ${errText(err)}`, "invalid_request");
       }
       if (!/^[0-9a-f]{40}$/.test(sha)) throw new LoopError(`GitHub gave no usable head for ${branch}`, "invalid_request");
-      out.push({ branch, sha });
+      const pinned = pins?.get(branch);
+      if (pinned !== undefined && !sha.startsWith(pinned)) {
+        throw new LoopError(`${branch}'s head is ${sha.slice(0, 12)} now, not ${pinned.slice(0, 12)}: it moved, so nothing was vouched for; look at it again`, "conflict");
+      }
+      out.push({ branch, sha, by: await this.#whoPutThere(gh, repo, branch, sha) });
     }
     return out;
+  }
+
+  /** "a push by @x": what GitHub's activity says put `sha` at `branch`'s head; null when it doesn't say. Informational: never a reason to refuse. */
+  async #whoPutThere(gh: GitHubSource, repo: string, branch: string, sha: string): Promise<string | null> {
+    try {
+      const e = (await gh.activity(repo, branch)).entries.find((a) => a.after === sha);
+      if (!e) return null;
+      return `a ${e.type ? e.type.replace(/_/g, " ") : "change"} by ${e.actor ? `@${e.actor}` : "an account GitHub doesn't name"}`;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -383,14 +422,15 @@ export class WatchService {
    * asked for (`--trust-head`), never implied. Synchronous, so `w` is the
    * watch as stored.
    */
-  #vouch(w: WatchRow, heads: Array<{ branch: string; sha: string }>, owner: LoopOwner): void {
+  #vouch(w: WatchRow, heads: VouchedHead[], owner: LoopOwner): void {
     const now = this.#now();
-    for (const { branch, sha } of heads) {
+    for (const { branch, sha, by } of heads) {
       const t: Target = { branch, sha, headRepo: w.repo };
       this.#store.rememberTrusted(w, w.repo, branch, sha, now);
       this.#store.forgetUntrustedHead(w, untrustedKey(w, t));
-      this.#store.vouch(w, branch, sha, `you vouched for ${branch} at ${sha.slice(0, 12)}: it and everything beneath it are trusted`, now);
-      this.#host.audit(owner.sub, "loop.watch.vouch", `${w.id} ${w.repo} ${branch}@${sha}`);
+      const how = by ? `put there by ${by}` : "GitHub's activity doesn't say who put it there";
+      this.#store.vouch(w, branch, sha, `you vouched for ${branch} at ${sha} (${how}): it and everything beneath it are trusted`, now);
+      this.#host.audit(owner.sub, "loop.watch.vouch", `${w.id} ${w.repo} ${branch}@${sha}${by ? ` (${by})` : ""}`);
     }
   }
 
@@ -418,11 +458,11 @@ export class WatchService {
     return this.#store.listOwned(tenantOf(owner), owner.sub);
   }
 
-  /** Change, pause, or resume a watch. `trustHead`: you vouch for each watched branch's head as it is now ({@link #vouch}). */
-  async update(id: string, patch: { enabled?: boolean; spec?: WatchSpecInput; trustHead?: boolean }, owner: LoopOwner): Promise<WatchRow> {
+  /** Change, pause, or resume a watch. `trustHead`: as on {@link create}. */
+  async update(id: string, patch: { enabled?: boolean; spec?: WatchSpecInput; trustHead?: TrustHead }, owner: LoopOwner): Promise<WatchRow> {
     let w = this.get(id, owner);
     const spec = patch.spec ? await this.#resolveSpec(patch.spec, w.spec) : undefined;
-    const heads = patch.trustHead ? await this.#currentHeads(w.repo, spec ?? w.spec) : [];
+    const heads = patch.trustHead ? await this.#currentHeads(w.repo, spec ?? w.spec, patch.trustHead) : [];
     // After the awaits: what is stored now is what changes.
     w = this.get(id, owner);
     // Resuming sets the floor for comments: what was said while it was paused isn't an event.
@@ -433,10 +473,14 @@ export class WatchService {
       ...(resumed ? { resumedAt: this.#now() } : {}),
     });
     if (!next) throw new LoopError("Loop watch not found", "not_found");
-    // A different trust list judges the heads it refused, and the ones it trusted, again.
+    // A different trust list judges the heads it refused again. The ones it
+    // trusted (and those you vouched for) are judged again too when it trusts
+    // anyone less; one that only adds logins still trusts all it did, so they
+    // are carried over to it, stamped with its generation.
     if (spec && !sameSet(spec.trust ?? [], w.spec.trust ?? [])) {
       this.#store.forgetUntrusted(next);
-      this.#store.forgetTrusted(next);
+      if (superset(spec.trust ?? [], w.spec.trust ?? [])) this.#store.carryTrusted(w, next);
+      else this.#store.forgetTrusted(next);
       this.#baseline.add(id);
     }
     if (resumed) this.#baseline.add(id);
@@ -451,7 +495,6 @@ export class WatchService {
     this.get(id, owner);
     this.#store.delete(id);
     this.#baseline.delete(id);
-    for (const k of this.#refused.keys()) if (k.startsWith(`${id}:`)) this.#refused.delete(k);
     this.#host.audit(owner.sub, "loop.watch.delete", id);
   }
 
@@ -571,13 +614,19 @@ export class WatchService {
     // Set when the poll stopped before it acted on everything it read: the
     // next poll reads comments from where this one did.
     let incomplete = false;
+    // Set when a pull request with review comments on is at a head no one
+    // vouches for: its comments aren't read, so the next poll reads comments
+    // from where this one did, and once its head is vouched for (pushed on by
+    // a trusted login, or the trust list widened) what was asked meanwhile
+    // still counts.
+    let heldComments = false;
     const problem = (where: string, err: unknown): void => {
       if (err instanceof GhError && err.rateLimited) rateLimited = true;
       problems.push(`${where}: ${errText(err)}`);
     };
     const finish = (): PollResult => {
       const note = [...problems, ...result.skipped.filter((s) => !s.includes("picked up after it ends") && !s.includes("still running"))].join("; ");
-      this.#store.markPolled(id, now, note || null, problems.length === 0 && !incomplete);
+      this.#store.markPolled(id, now, note || null, problems.length === 0 && !incomplete && !heldComments);
       if (rateLimited) {
         const n = (this.#backoff.get(limiter)?.n ?? 0) + 1;
         this.#backoff.set(limiter, { n, until: now + Math.min(this.#pollMs * 2 ** n, BACKOFF_MAX_MS) });
@@ -644,15 +693,14 @@ export class WatchService {
     // remembered keeps up with the branch and a chain stays a step or two
     // long; every head is judged on a new baseline (a watch made, resumed, or
     // given a new trust list). A head already remembered, or already judged
-    // untrusted, costs nothing.
+    // untrusted, costs nothing. One judged untrusted for good is recorded so,
+    // event or not: a later merge's chain stops at it, rather than walking
+    // down to the change that broke it again on every head after.
     const baseline = this.#baseline.has(id);
-    const generation = trustGeneration(w.spec);
     let judged = true;
     for (const t of targets) {
       if (!t.headRepo || (!baseline && w.spec.myPrs)) continue;
       if (this.#store.lastTrusted(w, t.headRepo, t.branch) === t.sha || this.#store.seen(w, [untrustedKey(w, t)]).size > 0) continue;
-      const refusedKey = `${w.id}:${generation}:${t.headRepo.toLowerCase()}:${t.branch}`;
-      if (!baseline && this.#refused.get(refusedKey) === t.sha) continue;
       let r: Untrusted | null;
       try {
         r = await judge(t);
@@ -676,7 +724,8 @@ export class WatchService {
         this.#unlisted.set(untrustedKey(w, t), first);
         judged = false;
       } else {
-        this.#refused.set(refusedKey, t.sha);
+        this.#store.ignore(w, untrustedKey(w, t), "head", t.branch, `not pushed by someone you trust: ${r.why}`, now);
+        result.skipped.push(`${t.branch} at ${t.sha.slice(0, 12)}: not pushed by someone you trust (${r.why})`);
       }
     }
     if (baseline && judged && this.#fresh(w)) this.#baseline.delete(id);
@@ -684,7 +733,10 @@ export class WatchService {
     const candidates: Candidate[] = [];
     for (const t of targets) {
       // A head already judged untrusted costs no more calls.
-      if (this.#store.seen(w, [untrustedKey(w, t)]).size > 0) continue;
+      if (this.#store.seen(w, [untrustedKey(w, t)]).size > 0) {
+        if (w.spec.review.enabled && t.pr) heldComments = true;
+        continue;
+      }
       try {
         const ci = await this.#ciCandidate(w, gh, t, now);
         if (typeof ci === "string") result.skipped.push(ci);
@@ -759,6 +811,7 @@ export class WatchService {
           break;
         }
         this.#store.ignore(w, headKey, c.kind, c.target.branch, `not pushed by someone you trust: ${untrusted.why}`, now);
+        if (w.spec.review.enabled && c.target.pr) heldComments = true;
         result.skipped.push(`${label}: not pushed by someone you trust (${untrusted.why})`);
         continue;
       }
@@ -934,40 +987,56 @@ export class WatchService {
       if (merge) return step === 0 ? merge : { why: `${beneath}${merge.why}`, transient: merge.transient };
       let sha = cur.before;
       let next = -1;
+      // The first gap crossed on this step, if one was: what the crossing skips must hold the branch's own history.
+      let gapAt: string | null = null;
       for (;;) {
-        if (sha === NO_COMMIT || sha === remembered) return null;
+        if (sha === NO_COMMIT || sha === remembered) {
+          if (gapAt === null) return null;
+          // Where the remembered head's own change is, if it was read; otherwise everything older that was.
+          const end = log.entries.findIndex((a, k) => k > i && a.after === sha);
+          const broken = branchBroken(log.entries, i, end < 0 ? log.entries.length : end);
+          return broken ? { why: `${gapAt}, and ${broken}`, transient: false } : null;
+        }
         next = await log.olderTo(i, sha);
         if (next >= 0) break;
         // A hole in the activity, or the end of what was read. Crossed only
-        // at a pull request merged with the button by a trusted login, the
-        // walk going on from what its merge commit was made on.
+        // at a pull request merged into this branch with the button by a
+        // trusted login, the walk going on from what its merge commit was
+        // made on.
         // Inside what was read (an older entry is there, just not this one), the record is missing; past it, it wasn't read.
         const past = log.truncated && i === log.entries.length - 1 ? ` (the newest ${ACTIVITY_PAGES_MAX * 100} entries read)` : "";
         const gap = `GitHub's activity${past} has no record of how ${sha.slice(0, 12)} came to be on ${t.branch}`;
         if (bridges >= GAP_BRIDGES_MAX) return { why: `${gap}, and the chain crossed ${GAP_BRIDGES_MAX} such gaps already`, transient: false };
         if (++step >= CHAIN_MAX) return tooLong;
         if (judgedUntrusted(sha)) return { why: `${gap}, and it was judged untrusted`, transient: false };
-        const bridge = await this.#bridgeUntrusted(gh, repo, sha, trusted, who, budget);
+        const bridge = await this.#bridgeUntrusted(gh, repo, t.branch, sha, trusted, who, budget);
         if (typeof bridge === "string") return { why: `${gap}, and ${bridge}`, transient: false };
         bridges++;
+        gapAt ??= gap;
         if (!bridge.parent) return { why: `${gap}; GitHub doesn't say what its merge commit was made on`, transient: false };
         sha = bridge.parent;
       }
+      // A crossing lands on an older change; the branch's changes it skips must not have deleted or made it anew.
+      const broken = gapAt === null ? null : branchBroken(log.entries, i, next);
+      if (broken) return { why: `${gapAt}, and ${broken}`, transient: false };
       i = next;
     }
   }
 
   /**
-   * Whether `sha`, a commit the branch's activity has no record of, may be
+   * Whether `sha`, a commit `branch`'s activity has no record of, may be
    * crossed: it is the merge commit of exactly one merged pull request of
-   * `repo`, merged with the button — never auto-merged or through a merge
-   * queue, which GitHub records as someone else's act — by a login GitHub
-   * records as having merged it and that is trusted. The parent its merge
-   * commit was made on, or why not.
+   * `repo`, merged into `branch` itself (a pull request merged into another
+   * branch put its commit somewhere else, whatever came to be on this one
+   * since), with the button — never auto-merged or through a merge queue,
+   * which GitHub records as someone else's act — by a login GitHub records as
+   * having merged it and that is trusted. The parent its merge commit was
+   * made on, or why not.
    */
   async #bridgeUntrusted(
     gh: GitHubSource,
     repo: string,
+    branch: string,
     sha: string,
     trusted: Set<string>,
     who: (l: string | null) => string,
@@ -978,6 +1047,7 @@ export class WatchService {
     if (found.kind === "none") return "GitHub names no pull request merged as it";
     if (found.kind === "many") return `it is the merge commit of ${found.numbers.length} pull requests (${found.numbers.map((n) => `#${n}`).join(", ")})`;
     const p = found.pull;
+    if (p.baseRef !== branch) return `pull request #${p.number}, merged as it, was merged into ${p.baseRef ? JSON.stringify(p.baseRef) : "a branch GitHub doesn't name"}, not ${branch}`;
     if (p.queued) return `pull request #${p.number}, merged as it, went through a merge queue`;
     if (p.autoMerged) return `pull request #${p.number}, merged as it, was auto-merged`;
     if (!p.mergedBy || !trusted.has(p.mergedBy.toLowerCase())) return `pull request #${p.number}, merged as it, was merged by ${who(p.mergedBy)}`;
@@ -1098,7 +1168,19 @@ export class WatchService {
    * was pushed before auto-merge was last turned on, by a trusted login:
    * they turned it on with that head in front of them, and a later push by
    * someone with write access would have been later, while one by someone
-   * without turns auto-merge off.
+   * without turns auto-merge off. That push must be the head branch's newest
+   * change (or lie just beneath the branch's deletion at that head): a writer
+   * can push the head, push another, and force-push the first back after
+   * auto-merge was turned on, and while GitHub's activity lags that last push
+   * the older push of the same commit is the newest that names it.
+   *
+   * Whether GitHub checks the head when auto-merge is turned on is not
+   * something this can rely on: its `enablePullRequestAutoMerge` mutation
+   * takes an optional `expectedHeadOid`, which `gh pr merge --auto` sends only
+   * with `--match-head-commit`, and nothing GitHub documents or records says
+   * whether its web button sends one. So an accepted limitation: turning
+   * auto-merge on is taken as done with the head as GitHub's activity had it
+   * then, and the timeline says only when, not at which head.
    */
   async #pullUntrusted(
     gh: GitHubSource,
@@ -1124,7 +1206,7 @@ export class WatchService {
     const head = await gh.pushOf(pull.headRepo, pull.headRef, pull.headSha);
     const enabled = pull.autoMergeEnabled;
     const pushedAt = head.push?.at ?? null;
-    if (!queued && enabled && isTrusted(enabled.by) && pushedAt !== null && pushedAt < enabled.at) return null;
+    if (!queued && enabled && isTrusted(enabled.by) && head.latest && pushedAt !== null && pushedAt < enabled.at) return null;
     let last: string;
     if (!head.push) {
       last = head.kept ? "GitHub's activity has no record of the push of its last commit" : "GitHub keeps no activity for the repository its last commit is in";
@@ -1346,6 +1428,22 @@ function commentSummary(c: CommentRecord, own: string): string {
   return `${what} by @${c.author}${where}:\n${own}`.slice(0, WATCH_LIMITS.EVENT_TEXT_MAX);
 }
 
+/**
+ * Why the branch's own changes strictly between `entries[from]` and
+ * `entries[to]` (newest first) break a crossing of a hole in its activity, or
+ * null: a deletion or a creation of the branch among them, after which the
+ * branch's history beneath is another branch's that had its name.
+ */
+function branchBroken(entries: ActivityEntry[], from: number, to: number): string | null {
+  for (let k = from + 1; k < to; k++) {
+    const e = entries[k]!;
+    if (e.type === "branch_deletion" || e.type === "branch_creation") {
+      return `the activity it skips has a ${e.type === "branch_deletion" ? "deletion" : "creation"} of the branch${e.actor ? ` by @${e.actor}` : ""}, so what is beneath may be another branch's of that name`;
+    }
+  }
+  return null;
+}
+
 /** Two commits a rebase could have made one of the other: the same message and author date. */
 function sameCommit(a: CommitShape, b: CommitShape): boolean {
   return a.message === b.message && a.authorDate !== null && a.authorDate === b.authorDate;
@@ -1363,6 +1461,12 @@ function untrustedKey(w: WatchRow, t: Target): string {
 /** Watches acting as one gh login share its rate limit. */
 function backoffKey(w: WatchRow): string {
   return (w.spec.ghLogin ?? `watch:${w.id}`).toLowerCase();
+}
+
+/** Every login of `b` is in `a`. */
+function superset(a: string[], b: string[]): boolean {
+  const x = new Set(a.map((l) => l.toLowerCase()));
+  return b.every((l) => x.has(l.toLowerCase()));
 }
 
 function sameSet(a: string[], b: string[]): boolean {
