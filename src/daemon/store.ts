@@ -86,6 +86,12 @@ export interface DispatchTaskRow {
    * what every row written before generations existed reads as.
    */
   generation: number;
+  /**
+   * Epoch ms a `held` task's hold lapses. A hold occupies a worker session and
+   * counts against the worker cap, so it must not be able to do so forever:
+   * past this, reclaim treats the hold as dead. NULL unless held.
+   */
+  heldUntil: number | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -132,6 +138,7 @@ interface RawDispatchRow {
   run_id: string | null;
   attempt_id: string | null;
   generation: number;
+  held_until: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -165,6 +172,7 @@ function rowToDispatchTask(r: RawDispatchRow): DispatchTaskRow {
     runId: r.run_id ?? null,
     attemptId: r.attempt_id ?? null,
     generation: r.generation ?? 0,
+    heldUntil: r.held_until ?? null,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -507,6 +515,7 @@ export class Store {
         run_id            TEXT,                      -- attempt: loop run id; NULL otherwise
         attempt_id        TEXT,                      -- attempt: loop attempt id; NULL otherwise
         generation        INTEGER NOT NULL DEFAULT 0, -- claim generation; fences stale worker results
+        held_until        INTEGER,                   -- held: epoch ms the hold lapses; NULL otherwise
         created_at        INTEGER NOT NULL,
         updated_at        INTEGER NOT NULL
       );
@@ -619,6 +628,7 @@ export class Store {
     this.#addColumnIfMissing("dispatch_tasks", "run_id", "TEXT");
     this.#addColumnIfMissing("dispatch_tasks", "attempt_id", "TEXT");
     this.#addColumnIfMissing("dispatch_tasks", "generation", "INTEGER NOT NULL DEFAULT 0");
+    this.#addColumnIfMissing("dispatch_tasks", "held_until", "INTEGER");
     // AFTER the ALTERs, never inside the CREATE block above. On an existing
     // database `CREATE TABLE IF NOT EXISTS` is a no-op, so an index declared
     // there would run against a table that does not have the column yet and
@@ -1278,40 +1288,117 @@ export class Store {
   }
 
   /**
-   * Park a live task on something outside its worker (`held`). Fenced on the
-   * generation like a result, since it is one: a stale worker's approval
-   * request must not park the claim its successor holds. Returns whether it
-   * applied. The claim owner and worker are kept — the task is still this
-   * daemon's, just not progressing — and reclaim never selects a held row.
+   * Park a live loop attempt on something outside its worker (`held`) until
+   * `heldUntil`. Fenced on the generation like a result, since it is one: a
+   * stale worker's approval request must not park the claim its successor
+   * holds. Returns whether it applied.
+   *
+   * Attempts only. A hold exists so a loop can wait on a person without its
+   * attempt being reclaimed; a send or spawn has no loop to resolve the wait,
+   * so a held one would sit on a worker session with nobody to release it.
+   *
+   * Scoped to this daemon's tasks (or unowned pre-upgrade rows): another
+   * daemon's attempt is not this daemon's to park. The claim owner and worker
+   * are kept — the task is still this boot's, just not progressing.
    */
-  dispatchHold(id: string, generation: number, reason: string, now: number): boolean {
+  dispatchHold(
+    id: string,
+    generation: number,
+    reason: string,
+    now: number,
+    heldUntil: number,
+    ownerDaemon?: string,
+  ): boolean {
     const res = this.#db
       .prepare(
         `UPDATE dispatch_tasks
-         SET status = 'held', error = ?, updated_at = ?
-         WHERE id = ? AND generation = ? AND status IN ('claimed', 'running')`,
+         SET status = 'held', error = ?, held_until = ?, updated_at = ?
+         WHERE id = ? AND generation = ? AND status IN ('claimed', 'running')
+           AND kind = 'attempt'
+           AND (owner_daemon IS NULL OR owner_daemon IS ?)`,
       )
-      .run(reason, now, id, generation);
+      .run(reason, heldUntil, now, id, generation, ownerDaemon ?? null);
     return res.changes > 0;
   }
 
   /**
-   * Resume a held task as `running` under THIS boot with a fresh lease.
+   * Resume a held task as `running` with a fresh lease, at the same generation
+   * — the same worker carries on, so its eventual result still applies.
    *
-   * Re-owned by the caller's boot id because the hold may have outlived the
-   * daemon that placed it; keeping the old boot id would have the very next
-   * tick reclaim the task as a crashed claim. The generation is unchanged —
-   * the same worker carries on — so its eventual result still applies.
+   * Only for a hold THIS boot placed (`claim_owner = bootId`). A hold that
+   * outlived its boot waited on an approval that died with that process; the
+   * caller settles it as reclaimed (`dispatchSettleHeld`) instead, because
+   * resuming would read the worker's idle as success it never had.
    */
-  dispatchUnhold(id: string, generation: number, bootId: string, now: number): boolean {
+  dispatchUnhold(
+    id: string,
+    generation: number,
+    bootId: string,
+    now: number,
+    ownerDaemon?: string,
+  ): boolean {
     const res = this.#db
       .prepare(
         `UPDATE dispatch_tasks
-         SET status = 'running', claim_owner = ?, claimed_at = ?, error = NULL, updated_at = ?
-         WHERE id = ? AND generation = ? AND status = 'held'`,
+         SET status = 'running', claimed_at = ?, held_until = NULL, error = NULL, updated_at = ?
+         WHERE id = ? AND generation = ? AND status = 'held' AND claim_owner IS ?
+           AND (owner_daemon IS NULL OR owner_daemon IS ?)`,
       )
-      .run(bootId, now, now, id, generation);
+      .run(now, now, id, generation, bootId, ownerDaemon ?? null);
     return res.changes > 0;
+  }
+
+  /**
+   * Settle a held task terminal `failed` with `error`, bumping the generation so
+   * its worker can no longer report. Same fence and scope as `dispatchUnhold`,
+   * minus the boot check — it is how a hold that cannot be resumed ends.
+   */
+  dispatchSettleHeld(
+    id: string,
+    generation: number,
+    error: string,
+    now: number,
+    ownerDaemon?: string,
+  ): DispatchTaskRow | null {
+    const row = this.#db
+      .prepare(
+        `UPDATE dispatch_tasks
+         SET status = 'failed', attempts = attempts + 1, error = ?, claim_owner = NULL,
+             claimed_at = NULL, held_until = NULL, generation = generation + 1, updated_at = ?
+         WHERE id = ? AND generation = ? AND status = 'held'
+           AND (owner_daemon IS NULL OR owner_daemon IS ?)
+         RETURNING *`,
+      )
+      .get(error, now, id, generation, ownerDaemon ?? null) as RawDispatchRow | null;
+    return row ? rowToDispatchTask(row) : null;
+  }
+
+  /**
+   * Cancel a loop attempt in any non-terminal state — terminal `failed` with
+   * `reason`. Not generation-fenced: cancellation is the loop controller's
+   * decision, not a worker's result, and must land whichever worker currently
+   * holds the claim. It bumps the generation instead, so that worker's late
+   * result is fenced off. Returns the settled row, or null when there was
+   * nothing to cancel (already terminal, not an attempt, another daemon's).
+   */
+  dispatchCancelAttempt(
+    id: string,
+    reason: string,
+    now: number,
+    ownerDaemon?: string,
+  ): DispatchTaskRow | null {
+    const row = this.#db
+      .prepare(
+        `UPDATE dispatch_tasks
+         SET status = 'failed', error = ?, claim_owner = NULL, claimed_at = NULL,
+             held_until = NULL, generation = generation + 1, updated_at = ?
+         WHERE id = ? AND kind = 'attempt'
+           AND status IN ('queued', 'claimed', 'running', 'held')
+           AND (owner_daemon IS NULL OR owner_daemon IS ?)
+         RETURNING *`,
+      )
+      .get(reason, now, id, ownerDaemon ?? null) as RawDispatchRow | null;
+    return row ? rowToDispatchTask(row) : null;
   }
 
   /**
@@ -1323,10 +1410,14 @@ export class Store {
    * a re-claimed spawn can continue its (resumed) worker session.
    *
    * A reclaim bumps `generation`, fencing the replaced worker the moment its
-   * claim is declared dead rather than only at the next claim. `held` rows are
-   * never selected — they are parked, not dead. A loop attempt is never
-   * re-queued: a reclaimed attempt goes terminal `failed`, and the loop decides
-   * whether to start another.
+   * claim is declared dead rather than only at the next claim. A loop attempt
+   * is never re-queued: a reclaimed attempt goes terminal `failed`, and the
+   * loop decides whether to start another.
+   *
+   * A `held` row is parked, not dead, and is left alone — with two exceptions
+   * that bound it. Its hold lapsed (`held_until`), so it cannot sit on a worker
+   * slot forever; or a previous boot of this daemon placed it, so the approval
+   * it waited on died with that process and nothing will ever release it.
    */
   /**
    * Reclaim claims this daemon can prove are dead.
@@ -1351,9 +1442,12 @@ export class Store {
                WHEN kind = 'attempt' THEN 'failed'
                WHEN attempts + 1 >= failure_limit THEN 'blocked'
                ELSE 'queued' END,
-             claim_owner = NULL, claimed_at = NULL, generation = generation + 1,
-             error = COALESCE(error, 'reclaimed: stale claim'), updated_at = ?
-         WHERE status IN ('claimed', 'running')
+             claim_owner = NULL, claimed_at = NULL, held_until = NULL, generation = generation + 1,
+             error = CASE WHEN status = 'held' THEN 'reclaimed: hold lapsed or outlived its boot'
+                          ELSE COALESCE(error, 'reclaimed: stale claim') END,
+             updated_at = ?
+         WHERE (
+           status IN ('claimed', 'running')
            AND (
              -- Mine: a previous boot of THIS daemon crashed, or the lease ran out.
              (owner_daemon IS ? AND (claim_owner IS NOT ? OR claimed_at IS NULL OR claimed_at + ? < ?))
@@ -1361,6 +1455,15 @@ export class Store {
              -- is what let another daemon steal a healthy claim.
              OR (owner_daemon IS NULL AND (claimed_at IS NULL OR claimed_at + ? < ?))
            )
+         ) OR (
+           status = 'held'
+           AND (
+             -- Mine, held by a previous boot: the wait died with that process.
+             (owner_daemon IS ? AND claim_owner IS NOT ?)
+             -- Mine or unowned, and the hold lapsed.
+             OR ((owner_daemon IS NULL OR owner_daemon IS ?) AND held_until IS NOT NULL AND held_until < ?)
+           )
+         )
          RETURNING *`,
       )
       .all(
@@ -1370,6 +1473,10 @@ export class Store {
         leaseMs,
         now,
         leaseMs,
+        now,
+        ownerDaemon ?? null,
+        bootId,
+        ownerDaemon ?? null,
         now,
       ) as RawDispatchRow[];
     return rows.map(rowToDispatchTask);
@@ -1490,6 +1597,10 @@ export class Store {
    * showing every other session's dispatches — target names, prompts' result
    * digests — would be the one place that scoping leaked. Filtered in SQL, not
    * after the fact, so `limit` still returns `limit` of the caller's own rows.
+   *
+   * Loop attempts are excluded (as on every fleet-board read): they are a
+   * loop's internals, not conductor dispatches, and get board rows of their
+   * own — one per run — in a later slice.
    */
   dispatchListForTenant(
     accountId: string,
@@ -1502,6 +1613,7 @@ export class Store {
         `SELECT * FROM dispatch_tasks
          WHERE account_id = ? AND project_id = ?
            AND (? IS NULL OR created_by = ?)
+           AND kind != 'attempt'
          ORDER BY created_at DESC LIMIT ?`,
       )
       .all(
@@ -1545,6 +1657,10 @@ export class Store {
    * Computed in SQL over the WHOLE table rather than by counting the capped
    * task list the snapshot ships: a tenant with more than `limit` tasks would
    * otherwise report "3 active" purely because the older ones fell off the page.
+   *
+   * Loop attempts are excluded (as on every fleet-board read): they are a
+   * loop's internals, not conductor dispatches, and get board rows of their
+   * own — one per run — in a later slice.
    */
   dispatchStatusCounts(
     accountId: string,
@@ -1556,7 +1672,7 @@ export class Store {
            SUM(CASE WHEN status IN ('queued','claimed','running','held') THEN 1 ELSE 0 END) AS active,
            SUM(CASE WHEN status = 'blocked' THEN 1 ELSE 0 END) AS blocked
          FROM dispatch_tasks
-         WHERE account_id = ? AND project_id = ?`,
+         WHERE account_id = ? AND project_id = ? AND kind != 'attempt'`,
       )
       .get(accountId, projectId) as { active: number | null; blocked: number | null };
     // SUM over zero rows is NULL, not 0.
@@ -1573,6 +1689,10 @@ export class Store {
    * watermark. Re-sending a task the client already has is harmless — a delta
    * carries the whole row and is idempotent by construction — whereas dropping
    * one strands a node in a stale state until the next unrelated change.
+   *
+   * Loop attempts are excluded (as on every fleet-board read): they are a
+   * loop's internals, not conductor dispatches, and get board rows of their
+   * own — one per run — in a later slice.
    */
   dispatchTasksUpdatedSince(
     accountId: string,
@@ -1583,6 +1703,7 @@ export class Store {
       .prepare(
         `SELECT * FROM dispatch_tasks
          WHERE account_id = ? AND project_id = ? AND updated_at >= ?
+           AND kind != 'attempt'
          ORDER BY updated_at ASC`,
       )
       .all(accountId, projectId, since) as RawDispatchRow[];

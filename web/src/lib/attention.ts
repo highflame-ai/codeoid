@@ -125,8 +125,10 @@ export function collectAttention(src: AttentionSources, now: number): AttentionI
   // listed for that session: they are the same stoppage, and showing both
   // would double-count one interruption in a queue whose whole job is to say
   // how many things need you.
+  const approvals = new Set<string>();
   for (const s of src.sessions) {
     if (s.status !== "waiting_approval" || asked.has(s.id)) continue;
+    approvals.add(s.id);
     items.push({
       key: `approval:${s.id}`,
       kind: "approval",
@@ -139,8 +141,23 @@ export function collectAttention(src: AttentionSources, now: number): AttentionI
 
   // Stopped dispatch tasks.
   for (const task of src.tasks) {
-    if (task.status !== "blocked" && task.status !== "failed") continue;
     const session = src.taskSession(task);
+    if (task.status === "held") {
+      // Parked on a decision outside the worker (a loop's out-of-profile
+      // approval). Same stoppage as its session's approval when that is
+      // already listed, so it is not counted twice.
+      if (session && (asked.has(session.id) || approvals.has(session.id))) continue;
+      items.push({
+        key: `task:${task.id}`,
+        kind: "approval",
+        sessionId: session?.id ?? null,
+        label: session?.name ?? `${task.kind} ${task.id.slice(0, 8)}`,
+        detail: task.error ?? "held: waiting on a decision",
+        since: task.createdAt,
+      });
+      continue;
+    }
+    if (task.status !== "blocked" && task.status !== "failed") continue;
     items.push({
       key: `task:${task.id}`,
       kind: task.status,
