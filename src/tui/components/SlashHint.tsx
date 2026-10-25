@@ -35,6 +35,8 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: "/effort", description: "How hard the model thinks: pick, or /effort off|low|…|max|default" },
   { name: "/provider", description: "Choose a backend, or /provider <id> (including oai:<name>)" },
   { name: "/account", description: "Choose this backend's account, or /account <name|default|--follow-default>" },
+  { name: "/loops", description: "Your loop runs — detail, steer or answer, pause, resume, cancel" },
+  { name: "/loop", description: "/loop opens your loop runs; start one with `codeoid loop start` (it takes the checks)" },
   { name: "/who", description: "Show the identity chain (user → agent → sub-agents)" },
   { name: "/help", description: "Show keybindings" },
 ];

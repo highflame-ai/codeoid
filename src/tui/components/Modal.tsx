@@ -11,6 +11,7 @@ import type { ModalState, TuiSession } from "../types.js";
 import type { EffortLevel, ProviderInfo, SessionSearchHit } from "../../protocol/types.js";
 import type { TuiWsClient } from "../ws.js";
 import { BackendPicker } from "./BackendPicker.js";
+import { LoopsModal } from "./LoopsModal.js";
 import { NewSessionModal, type NewSessionOptions } from "./NewSessionModal.js";
 
 /**
@@ -68,6 +69,15 @@ export function Modal(props: Props) {
     }
     case "help":
       return <HelpModal onCancel={props.onCancel} />;
+    case "loops":
+      return (
+        <LoopsModal
+          client={props.client}
+          {...(props.modal.runId ? { initialRunId: props.modal.runId } : {})}
+          onOpenSession={props.onSelectSession}
+          onCancel={props.onCancel}
+        />
+      );
     case "search":
       return (
         <SearchModal
@@ -457,6 +467,9 @@ function HelpModal({ onCancel }: { onCancel: () => void }) {
         </Text>
         <Text>
           <Text bold>Shift-Tab / Ctrl-M</Text> cycle mode (interactive → guarded → autonomous)
+        </Text>
+        <Text>
+          <Text bold>/loops</Text> loop runs: steer, pause, resume, cancel (start with `codeoid loop start`)
         </Text>
         <Text>
           <Text bold>?</Text> show this help

@@ -396,6 +396,7 @@ export class DaemonServer {
     // Registered after the dispatcher, so (LIFO) it stops scheduling before
     // the session drain interrupts any run in flight.
     this.#shutdown.register("routines", () => this.#manager.stopRoutines());
+    this.#shutdown.register("loops", () => this.#manager.stopLoops());
     this.#shutdown.register("websockets", () => {
       for (const { ws } of this.#sockets.values()) {
         ws.close(1001, "Server shutting down");
@@ -609,6 +610,7 @@ export class DaemonServer {
     // claimed by the previous boot, and surviving workers must already be
     // back in the session map for continuation to find them.
     this.#manager.startDispatcher();
+    this.#manager.startLoops();
 
     // Re-drive any SDLC pipelines interrupted mid-run before the restart
     // (no-op when the pipeline feature is disabled).

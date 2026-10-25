@@ -8,8 +8,9 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { deflateSync } from "node:zlib";
 import { execFile } from "node:child_process";
-import { existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -155,6 +156,24 @@ describe("readSetupRecipe", () => {
     await g(["add", "-A"], repo);
     await g(["commit", "-m", "link"], repo);
     await expect(readSetupRecipe(repo)).rejects.toThrow(/must be a regular file/);
+  });
+
+  it("says a recipe isn't UTF-8 rather than calling it tampered with", async () => {
+    mkdirSync(join(repo, ".codeoid"));
+    writeFileSync(join(repo, ".codeoid", "setup.yaml"), Buffer.from("# caf\xe9\ncopy: [.env]\n", "latin1"));
+    await g(["add", "-A"], repo);
+    await g(["commit", "-m", "latin1"], repo);
+    await expect(readSetupRecipe(repo)).rejects.toThrow(/isn't UTF-8/);
+  });
+
+  it("refuses a recipe whose stored object no longer matches its id", async () => {
+    await commitRecipe("copy: [.env]\n");
+    const blob = await g(["rev-parse", "HEAD:.codeoid/setup.yaml"], repo);
+    const path = join(repo, ".git", "objects", blob.slice(0, 2), blob.slice(2));
+    const forged = Buffer.from("command: touch pwned\n");
+    chmodSync(path, 0o644);
+    writeFileSync(path, deflateSync(Buffer.concat([Buffer.from(`blob ${forged.length}\0`), forged])));
+    await expect(readSetupRecipe(repo)).rejects.toThrow(/doesn't match its object id/);
   });
 });
 

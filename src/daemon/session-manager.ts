@@ -101,6 +101,12 @@ import {
 } from "./dispatch.js";
 import { createPipelineManagerFromConfig } from "./pipeline/wiring.js";
 import { EvidenceService, EvidenceStore, evidenceToWire } from "./evidence/index.js";
+import { buildLoopHost } from "./loops/host.js";
+import { LoopError, LoopService, type LoopOwner } from "./loops/service.js";
+import { LoopStore } from "./loops/store.js";
+import { buildLoopMcpServer } from "./loops/tools.js";
+import type { LoopRunRow } from "./loops/types.js";
+import { attemptToWire, eventToWire, runToWire } from "./loops/wire.js";
 import type { PipelineManager } from "./pipeline/manager.js";
 import { resolveBinding, type ModelBindingConfig } from "./pipeline/binding.js";
 import type { RoleDef } from "./pipeline/pack.js";
@@ -396,6 +402,9 @@ function resumeSortKey(m: { lastActivityAt?: string; createdAt?: string }): numb
 /** How long a finished device sign-in's outcome is kept for a client that comes back for it. */
 const LOGIN_OUTCOME_TTL_MS = 10 * 60_000;
 
+/** Backends that can carry a loop worker's `loop_report` tool today. */
+const LOOP_WORKER_PROVIDERS: ReadonlySet<string> = new Set(["claude"]);
+
 export class SessionManager {
   #sessions = new Map<string, Session>();
   #store: Store;
@@ -476,6 +485,10 @@ export class SessionManager {
   /** SDLC pipeline manager — undefined when the pipeline is disabled (default). */
   #pipelines?: PipelineManager;
   #evidence?: EvidenceService;
+  /** Loops (docs/loop-engineering-design.md) — needs evidence, so only with a config. */
+  #loops?: LoopService;
+  /** A loop worker's unattended mark, lifted when its run hands it back. */
+  readonly #loopUnattended = new Map<string, () => void>();
   #evidenceTimers: ReturnType<typeof setTimeout>[] = [];
   /** Routines (docs/routines.md); undefined when `routines.enabled` is off. */
   #routines?: RoutineService;
@@ -495,6 +508,7 @@ export class SessionManager {
   #statusObserver = (sessionId: string, status: SessionInfo["status"]): void => {
     this.#dispatcher.onSessionStatus(sessionId, status);
     this.#routines?.onSessionStatus(sessionId);
+    this.#loops?.workerStatusChanged(sessionId, status as Parameters<LoopService["workerStatusChanged"]>[1]);
     // Content-blind push: a session that just blocked on approval alerts its
     // owner's registered devices off-LAN. Fire-and-forget — a push hiccup must
     // never touch the status path (the emit itself only ever sees an opaque
@@ -644,6 +658,11 @@ export class SessionManager {
         }
       };
       this.#evidenceTimers.push(setTimeout(sweep, 60_000).unref(), setInterval(sweep, 24 * 60 * 60 * 1000).unref());
+      const loops = new LoopService(new LoopStore(store.database), this.#makeLoopHost(evidence, join(dirname(opts.config.dbPath), "loop-checks")));
+      loops.setEvidenceLookup((run, ids) =>
+        ids.map((id) => evidence.get(id, { accountId: run.accountId, projectId: run.projectId })).filter((e) => e !== null),
+      );
+      this.#loops = loops;
     }
     this.#pipelines = createPipelineManagerFromConfig(opts?.config, {
       runner: new SessionPhaseRunner(() => this),
@@ -780,6 +799,21 @@ export class SessionManager {
 
   stopRoutines(): void {
     this.#routines?.stop();
+  }
+
+  /** Start loop reconciliation. Call AFTER resumeSessions and the dispatcher,
+   *  so a run's surviving worker is back and its attempt task is reclaimable. */
+  startLoops(): void {
+    this.#loops?.start();
+  }
+
+  stopLoops(): void {
+    this.#loops?.stop();
+  }
+
+  /** Loop service, or undefined without a daemon config. */
+  get loops(): LoopService | undefined {
+    return this.#loops;
   }
 
   /** Start the dispatcher loop. Call AFTER resumeSessions so surviving
@@ -1271,23 +1305,23 @@ mcpHub: this.#mcpHub,
       case "session.commands":
         return this.#sessionCommands(msg, auth);
       case "session.destroy":
-        return this.#destroySession(msg, auth);
+        return this.#loopWorkerGuard(msg, "destroy") ?? this.#destroySession(msg, auth);
       case "session.set_mode":
-        return this.#setMode(msg, auth);
+        return this.#loopWorkerGuard(msg, "change the mode of") ?? this.#setMode(msg, auth);
       case "session.pin":
         return this.#pin(msg, auth);
       case "session.unpin":
         return this.#unpin(msg, auth);
       case "session.rotate":
-        return this.#rotate(msg, auth);
+        return this.#loopWorkerGuard(msg, "rotate") ?? this.#rotate(msg, auth);
       case "session.search":
         return this.#search(msg, auth);
       case "session.set_model":
-        return this.#setModel(msg, auth);
+        return this.#loopWorkerGuard(msg, "change the model of") ?? this.#setModel(msg, auth);
       case "session.set_effort":
-        return this.#setEffort(msg, auth);
+        return this.#loopWorkerGuard(msg, "change the effort of") ?? this.#setEffort(msg, auth);
       case "session.set_provider":
-        return this.#setProvider(msg, auth);
+        return this.#loopWorkerGuard(msg, "switch the backend of") ?? this.#setProvider(msg, auth);
       case "session.mcp_reconnect":
         return this.#mcpReconnect(msg, auth);
       case "session.mcp_refresh":
@@ -1357,7 +1391,7 @@ mcpHub: this.#mcpHub,
       case "accounts.set_default":
         return this.#accountsSetDefault(msg, auth);
       case "session.set_account":
-        return this.#sessionSetAccount(msg, auth);
+        return this.#loopWorkerGuard(msg, "change the account of") ?? this.#sessionSetAccount(msg, auth);
       case "claude.accounts.list":
         return this.#claudeAccountsList(msg, auth);
       case "claude.accounts.set":
@@ -1367,13 +1401,13 @@ mcpHub: this.#mcpHub,
       case "claude.accounts.set_default":
         return this.#claudeAccountsSetDefault(msg, auth);
       case "session.set_claude_account":
-        return this.#sessionSetClaudeAccount(msg, auth);
+        return this.#loopWorkerGuard(msg, "change the account of") ?? this.#sessionSetClaudeAccount(msg, auth);
       case "session.approvals":
         return this.#sessionApprovals(msg, auth);
       case "session.turns":
         return this.#sessionTurns(msg, auth);
       case "session.rewind":
-        return this.#sessionRewind(msg, auth);
+        return this.#loopWorkerGuard(msg, "rewind") ?? this.#sessionRewind(msg, auth);
       case "session.compare":
         return this.#sessionCompare(msg, auth);
       case "compare.get":
@@ -1396,6 +1430,14 @@ mcpHub: this.#mcpHub,
         return this.#mcpAdopt(msg, auth);
       case "usage.daily":
         return this.#usageDaily(msg, auth);
+      case "loop.start":
+      case "loop.list":
+      case "loop.get":
+      case "loop.cancel":
+      case "loop.pause":
+      case "loop.resume":
+      case "loop.steer":
+        return this.#loopHandle(msg, auth);
       case "routine.create":
       case "routine.update":
       case "routine.delete":
@@ -1645,6 +1687,8 @@ mcpHub: this.#mcpHub,
             // Create the Session shell first so we have an id; we don't
             // start() its query loop — the importer attaches via the
             // normal session.attach flow afterwards.
+            const problem = this.#loopWorktreeProblem(init.workdir);
+            if (problem) throw new Error(problem);
             const session = new Session({
               name: init.name,
               workdir: init.workdir,
@@ -3001,6 +3045,8 @@ mcpHub: this.#mcpHub,
         code: "invalid_request",
       };
     }
+    const looped = this.#loopWorktreeRefusal(msg.id, workdir);
+    if (looped) return looped;
     const command = msg.command.trim();
     this.#store.setSkillCommandGrant(workspaceIdFromPath(workdir, auth), `Bash(${command})`, msg.allowed);
     this.#store.audit(auth.sub, msg.allowed ? "skill.grant" : "skill.deny", "", `workdir=${workdir} command=${redactCommand(command)}`);
@@ -3808,6 +3854,7 @@ mcpHub: this.#mcpHub,
     this.#backendLogin.dispose();
     // Running checks are detached process groups; without this they outlive
     // the daemon and race the same gate when the pipeline resumes.
+    this.#loops?.stop();
     this.#evidence?.abortAll();
     for (const t of this.#evidenceTimers) clearTimeout(t);
     this.#evidenceTimers = [];
@@ -3916,6 +3963,8 @@ mcpHub: this.#mcpHub,
         code: "invalid_request",
       };
     }
+    const looped = this.#loopWorktreeRefusal(msg.id, workdir);
+    if (looped) return looped;
 
     // Collaborative session (docs/collaborative-session-design.md §9): the
     // role→backend bindings are validated fail-closed up front, for the same
@@ -4875,6 +4924,8 @@ mcpHub: this.#mcpHub,
           code: "invalid_request",
         };
       }
+      const looped = this.#loopWorktreeRefusal(msg.id, bound);
+      if (looped) return looped;
       forkWorkdir = bound;
       const branch = await currentBranch(bound);
       if (branch) worktree = { path: bound, branch, createdByCodeoid: false };
@@ -4969,6 +5020,11 @@ mcpHub: this.#mcpHub,
           "concurrent file edits in both sessions will collide.";
       }
     }
+
+    // A fork that shares its parent's directory (isolate:false, no worktree,
+    // not a repository) may not share an active run's worktree.
+    const sharedLoop = this.#loopWorktreeRefusal(msg.id, forkWorkdir);
+    if (sharedLoop) return sharedLoop;
 
     let fork: Session;
     try {
@@ -5505,6 +5561,8 @@ mcpHub: this.#mcpHub,
     model?: string;
     auth: AuthContext;
   }): Session {
+    const problem = this.#loopWorktreeProblem(opts.workdir);
+    if (problem) throw new Error(problem);
     const session = new Session({
       name: opts.name,
       workdir: opts.workdir,
@@ -5638,6 +5696,8 @@ mcpHub: this.#mcpHub,
       if (!normalized) {
         return { type: "response.error", requestId: msg.id, error: `workdir not usable: ${msg.workdir}`, code: "invalid_request" };
       }
+      const looped = this.#loopWorktreeRefusal(msg.id, normalized);
+      if (looped) return looped;
       workdir = normalized;
     }
     // Resolve the plan: explicit `pack`, else explicit `phases`, else the
@@ -5731,19 +5791,21 @@ mcpHub: this.#mcpHub,
    * may not read is `not_found`, so an id reveals nothing across tenants.
    */
   #evidenceGet(msg: Extract<ClientMessage, { type: "evidence.get" }>, auth: AuthContext): DaemonMessage {
+    // Every refusal is the same not_found — a missing scope, a disabled
+    // feature, another tenant's or owner's record, or no record at all — so an
+    // id never reveals whether it exists.
     const notFound: DaemonMessage = { type: "response.error", requestId: msg.id, error: "Evidence not found", code: "not_found" };
-    // Authorize before looking anything up, so whether an id exists is never
-    // the difference between two answers.
-    const g = this.#pipelineGuard(msg.id, auth, SCOPES.PIPELINE_READ);
-    if ("error" in g) return g.error;
+    const scopes = auth.scopes as string[];
     const record = this.#evidence?.get(msg.evidenceId, { accountId: auth.accountId, projectId: auth.projectId });
     if (!record) return notFound;
     if (record.ownerKind === "pipeline") {
-      if (!this.#ownedPipeline(g.pm, record.ownerId, auth)) return notFound;
+      // A pipeline's evidence: pipeline:read and a pipeline the caller can see.
+      if (!hasScope(scopes, SCOPES.PIPELINE_READ) || !this.#pipelines) return notFound;
+      if (!this.#ownedPipeline(this.#pipelines, record.ownerId, auth)) return notFound;
     } else {
-      // Loop evidence is authorized by the loop service, which doesn't exist
-      // yet; until it does, nothing else may read it.
-      return notFound;
+      // A loop's evidence is its run owner's alone, under the loop scopes.
+      if (!hasScope(scopes, SCOPES.SESSION_CREATE) || !hasScope(scopes, SCOPES.SESSION_SEND)) return notFound;
+      if (!this.#loops?.ownsRun(record.ownerId, { sub: auth.sub, accountId: auth.accountId, projectId: auth.projectId })) return notFound;
     }
     return { type: "evidence.record", requestId: msg.id, evidence: evidenceToWire(record) };
   }
@@ -6154,6 +6216,256 @@ mcpHub: this.#mcpHub,
     }
   }
 
+  // ── Loops (docs/loop-engineering-design.md) ───────────────────────────
+
+  /**
+   * loop.* — owner-only, authorized like routines: session:create +
+   * session:send for everything; starting also needs session:approve (the
+   * worker runs autonomously within the run's budget). Starting, steering,
+   * and resuming are refused to delegated tokens; pausing and cancelling are
+   * safety stops any credential that can see the run may use.
+   */
+  async #loopHandle(
+    msg: Extract<
+      ClientMessage,
+      { type: "loop.start" | "loop.list" | "loop.get" | "loop.cancel" | "loop.pause" | "loop.resume" | "loop.steer" }
+    >,
+    auth: AuthContext,
+  ): Promise<DaemonMessage> {
+    const err = (error: string, code: "invalid_request" | "not_found" | "forbidden" | "internal"): DaemonMessage => ({
+      type: "response.error",
+      requestId: msg.id,
+      error,
+      code,
+    });
+    const scopes = auth.scopes as string[];
+    if (!hasScope(scopes, SCOPES.SESSION_CREATE) || !hasScope(scopes, SCOPES.SESSION_SEND)) {
+      return err("Missing scope: loops need session:create and session:send", "forbidden");
+    }
+    const svc = this.#loops;
+    if (!svc) return err("Loops are not available on this daemon", "invalid_request");
+    const owner: LoopOwner = {
+      sub: auth.sub,
+      ...(auth.name ? { name: auth.name } : {}),
+      accountId: auth.accountId,
+      projectId: auth.projectId,
+    };
+    const delegated = auth.delegationDepth > 0;
+    const snapshot = (run: LoopRunRow, events = false): DaemonMessage => {
+      const attempts = svc.attempts(run.id);
+      return {
+        type: "loop.snapshot",
+        requestId: msg.id,
+        run: runToWire(run, attempts.length),
+        attempts: attempts.map(attemptToWire),
+        ...(events ? { events: svc.events(run.id).map(eventToWire) } : {}),
+      };
+    };
+    try {
+      switch (msg.type) {
+        case "loop.start": {
+          if (delegated) return err("A delegated token cannot start a loop", "forbidden");
+          if (!hasScope(scopes, SCOPES.SESSION_APPROVE)) {
+            return err("Missing scope: session:approve (a loop's worker runs autonomously within its budget)", "forbidden");
+          }
+          const provider = msg.provider ?? this.#providers.defaultId;
+          if (!LOOP_WORKER_PROVIDERS.has(provider)) {
+            return err(`Loops run on ${[...LOOP_WORKER_PROVIDERS].join(", ")} for now; "${provider}" cannot report an attempt's outcome yet`, "invalid_request");
+          }
+          const run = svc.startRun(
+            {
+              objective: msg.objective,
+              workdir: msg.workdir,
+              checks: msg.checks,
+              provider,
+              ...(msg.model ? { model: msg.model } : {}),
+              ...(msg.toolBudget !== undefined ? { toolBudget: msg.toolBudget } : {}),
+              ...(msg.limits ? { limits: msg.limits } : {}),
+            },
+            owner,
+          );
+          return snapshot(run);
+        }
+        case "loop.list":
+          return {
+            type: "loop.list.result",
+            requestId: msg.id,
+            runs: svc.list(owner, msg.limit ?? 50).map((r) => runToWire(r, svc.attempts(r.id).length)),
+          };
+        case "loop.get":
+          return snapshot(svc.get(msg.runId, owner), msg.events === true);
+        case "loop.cancel":
+          return snapshot(await svc.cancel(msg.runId, owner));
+        case "loop.pause":
+          return snapshot(await svc.pause(msg.runId, owner));
+        case "loop.resume":
+          if (delegated) return err("A delegated token cannot resume a loop", "forbidden");
+          return snapshot(await svc.resume(msg.runId, owner));
+        case "loop.steer":
+          if (delegated) return err("A delegated token cannot steer a loop", "forbidden");
+          return snapshot(await svc.steer(msg.runId, msg.text, owner));
+      }
+      return err("Unknown loop message", "invalid_request");
+    } catch (e) {
+      if (e instanceof LoopError) return err(e.message, e.code === "conflict" ? "invalid_request" : e.code);
+      return err(e instanceof Error ? e.message : String(e), "internal");
+    }
+  }
+
+  /**
+   * A message typed into a loop's worker becomes steering for its run — under
+   * the same rules as loop.steer (owner only, loop scopes, no delegated
+   * token), with its outcome reported back to the sender.
+   */
+  async #steerFromSend(
+    msg: Extract<ClientMessage, { type: "session.send" }>,
+    auth: AuthContext,
+    runId: string,
+  ): Promise<DaemonMessage> {
+    const scopes = auth.scopes as string[];
+    const owner = { sub: auth.sub, accountId: auth.accountId, projectId: auth.projectId };
+    if (
+      auth.delegationDepth > 0 ||
+      !hasScope(scopes, SCOPES.SESSION_CREATE) ||
+      !this.#loops!.ownsRun(runId, owner)
+    ) {
+      return { type: "response.error", requestId: msg.id, error: "This session is a loop's worker; only the run's owner can steer it", code: "forbidden" };
+    }
+    try {
+      await this.#loops!.steer(runId, msg.text, owner);
+      return { type: "response.ok", requestId: msg.id, data: { steered: runId } };
+    } catch (e) {
+      const code = e instanceof LoopError && e.code !== "conflict" ? e.code : "invalid_request";
+      return { type: "response.error", requestId: msg.id, error: e instanceof Error ? e.message : String(e), code };
+    }
+  }
+
+  /** Mode changes, rewinds and destroys of an active loop's worker go through
+   *  its run: the controller owns the session until the run ends. */
+  #loopWorkerGuard(msg: { id: string; sessionId: string }, what: string): DaemonMessage | null {
+    if (!this.#isLiveLoopWorker(msg.sessionId)) return null;
+    return {
+      type: "response.error",
+      requestId: msg.id,
+      error: `This session is a running loop's worker; you can't ${what} it until the run ends (cancel it with codeoid loop cancel)`,
+      code: "invalid_request",
+    };
+  }
+
+  /** The session works in an active loop run's worktree: its current worker,
+   *  or an earlier one (replaced after a restart) still holding the same tree. */
+  #isLiveLoopWorker(sessionId: string): boolean {
+    return this.#liveLoopRunOf(sessionId) !== null;
+  }
+
+  /** A session can't be opened inside an active loop's worktree: it would
+   *  edit what the run verifies, outside the run's rules. Every way a
+   *  session gets a workdir asks this (create, bind, import, dispatch,
+   *  routines, pipelines). */
+  #loopWorktreeProblem(dir: string): string | null {
+    const normalized = normalizeWorkdir(dir) ?? dir;
+    return this.#loops?.activeRunAt(normalized)
+      ? "That directory is an active loop run's worktree; attach to its worker, or wait for the run to end"
+      : null;
+  }
+
+  #loopWorktreeRefusal(requestId: string, dir: string): DaemonMessage | null {
+    const problem = this.#loopWorktreeProblem(dir);
+    return problem ? { type: "response.error", requestId, error: problem, code: "invalid_request" } : null;
+  }
+
+  /** The active run whose worktree the session works in, if any. */
+  #liveLoopRunOf(sessionId: string): string | null {
+    if (!this.#loops) return null;
+    const current = this.#loops.runOfWorker(sessionId);
+    if (current) return current;
+    const run = this.#sessions.get(sessionId)?.toInfo().worktree?.loopRun;
+    return run !== undefined && this.#loops.isActive(run) ? run : null;
+  }
+
+  /** The loop controller's window onto the daemon (LoopHost). */
+  #makeLoopHost(evidence: EvidenceService, scratchRoot: string) {
+    const owned = (run: LoopRunRow, depth: 0 | 1): AuthContext => ({
+      sub: run.ownerSub,
+      // The delegated form names the run, so its prompts read "loop:<id>" in
+      // the transcript, not the owner typing.
+      ...(depth === 1 ? { name: `loop:${run.id.slice(5, 13)}`, delegatedBy: run.ownerSub } : {}),
+      scopes: [],
+      delegationDepth: depth,
+      accountId: run.accountId,
+      projectId: run.projectId,
+    });
+    return buildLoopHost({
+      normalizeWorkdir: (p) => normalizeWorkdir(p),
+      hasProvider: (id) => this.#providers.has(id),
+      dispatcher: this.#dispatcher,
+      taskGeneration: (taskId) => this.#store.dispatchGet(taskId)?.generation ?? null,
+      evidence,
+      worktreeSetupPolicy: () => this.#worktreeSetupPolicy,
+      scratchRoot,
+      session: (id) => this.#sessions.get(id),
+      releaseWorkerSession: (id) => {
+        const s = this.#sessions.get(id);
+        if (!s) return;
+        // Guarded, by the owner's authority (a system sender can't lift an
+        // ended attempt's lock): the session is an ordinary one again.
+        s.setMode("guarded", undefined, { sub: s.createdBy, scopes: [], delegationDepth: 0, accountId: s.accountId, projectId: s.projectId });
+        this.#loopUnattended.get(id)?.();
+        this.#loopUnattended.delete(id);
+      },
+      senderFor: (run) => owned(run, 1),
+      systemAuth: (run) => ({ sub: "system:loops", scopes: [], delegationDepth: 0, accountId: run.accountId, projectId: run.projectId }),
+      audit: (subject, action, sessionId, detail) => this.#store.audit(subject, action, sessionId, detail),
+      notifyOwner: (run) => {
+        // Content-blind push opens the worker session; without one, the run's
+        // history and the fleet board carry it.
+        if (run.workerSessionId && this.#pushService.enabled) {
+          void this.#pushService
+            .notifyRoutine(run.workerSessionId, { sub: run.ownerSub, accountId: run.accountId, projectId: run.projectId })
+            .catch((e) => console.error("[codeoid/push] loop notify failed:", e));
+        }
+      },
+      createWorkerSession: async (run) => {
+        const workdir = run.worktreePath ?? run.contract.workdir;
+        // Destroying the worker (once the run is over) removes the run's
+        // worktree like any codeoid-made fork; the branch stays, holding only
+        // what the run delivered.
+        const session = new Session({
+          name: `loop-${run.id.slice(5, 13)}`,
+          workdir,
+          ...(run.worktreeRoot && run.branch
+            ? { worktree: { path: run.worktreeRoot, branch: run.branch, createdByCodeoid: true, loopRun: run.id } }
+            : {}),
+          ...(run.contract.worker.provider ? { providerId: run.contract.worker.provider } : {}),
+          ...(run.contract.worker.model ? { defaultModel: run.contract.worker.model } : {}),
+          initialMode: { mode: "autonomous", maxTurns: run.contract.toolBudget },
+          // An attempt that spends its budget ends; the run decides what's next.
+          onBudgetExhausted: "end_attempt",
+          auth: owned(run, 0),
+          store: this.#store,
+          transcriptStore: this.#transcriptStore,
+          providers: this.#providers,
+          claudeAccounts: this.#claudeAccounts,
+          hooks: this.#hooks,
+          identityManager: this.#identityManager,
+          memory: this.#memory,
+          memoryMcp: this.#memoryMcp,
+          mcpRegistry: this.#mcpRegistry,
+          mcpHub: this.#mcpHub,
+          config: this.#config,
+          compressionRegistry: this.#compressionRegistry,
+          loopTools: (id) => buildLoopMcpServer(id, (sid, report) => this.#loops?.recordReport(sid, report) ?? "Loops are not running."),
+          _testProvider: this.#testProviderFactory?.(),
+          onStatusChange: this.#statusObserver,
+          ...this.#modelHooks,
+        });
+        this.#loopUnattended.set(session.id, session.beginUnattended());
+        this.#sessions.set(session.id, session);
+        return session.id;
+      },
+    });
+  }
+
   /** The routine engine's window onto sessions (RoutineHost). */
   #makeRoutineHost(): RoutineHost {
     const systemAuth = (accountId: string, projectId: string): AuthContext => ({
@@ -6165,6 +6477,10 @@ mcpHub: this.#mcpHub,
     });
     return {
       createSession: async (o) => {
+        if (!o.worktree) {
+          const problem = this.#loopWorktreeProblem(o.workdir);
+          if (problem) throw new Error(problem);
+        }
         let workdir = o.workdir;
         let worktree: SessionWorktree | undefined;
         let setup: WorktreeSetupResult | undefined;
@@ -6331,11 +6647,37 @@ mcpHub: this.#mcpHub,
 
   #makeDispatcherHost(): DispatcherHost {
     return {
+      // Loop attempts (docs/loop-engineering-design.md §5): the dispatcher is
+      // the only scheduler; the loop controller owns everything else.
+      spawnAttemptWorker: async (task: DispatchTaskRow): Promise<{ sessionId: string }> => {
+        const loops = this.#loops;
+        if (!loops || !task.runId || !task.attemptId) {
+          throw new NonRetryableDispatchError("loop attempts are not available on this daemon");
+        }
+        return { sessionId: await loops.spawnAttemptWorker(task.runId, task.attemptId, task.prompt) };
+      },
+      onAttemptSettled: (task: DispatchTaskRow, status) => {
+        if (task.runId && task.attemptId) this.#loops?.attemptSettled(task.runId, task.attemptId, status);
+      },
+      onAttemptWaiting: (task: DispatchTaskRow) => {
+        if (task.runId && task.attemptId) this.#loops?.attemptWaiting(task.runId, task.attemptId);
+      },
+      onAttemptOrphanWorker: () => {
+        // A worker that came up after its claim was lost belongs to its run;
+        // the run reuses its session on the next attempt.
+      },
+
       sendToSession: async (task: DispatchTaskRow): Promise<void> => {
         const target = this.#sessionForTask(task.targetSession, task);
         if (!target) {
           throw new NonRetryableDispatchError(
             `target session ${task.targetSession ?? "?"} no longer exists`,
+          );
+        }
+        // A loop's worker has one driver, its run (§5).
+        if (this.#loops?.runOfWorker(target.id)) {
+          throw new NonRetryableDispatchError(
+            `session ${target.name} is a loop's worker; steer it with codeoid loop steer instead`,
           );
         }
         // Re-arm a collaboration child's autonomous budget on every dispatch.
@@ -6363,6 +6705,8 @@ mcpHub: this.#mcpHub,
             `workdir not usable: ${task.workdir ?? "(none)"}`,
           );
         }
+        const looped = this.#loopWorktreeProblem(workdir);
+        if (looped) throw new NonRetryableDispatchError(looped);
         // Same reasoning for the backend: the task was validated when queued,
         // but the registry is rebuilt at startup and gates backends on their
         // env keys / binaries, so a task that outlived a restart can name a
@@ -6828,7 +7172,12 @@ mcpHub: this.#mcpHub,
         }
         await session.interrupt(this.#dispatchSystemAuth(accountId, projectId));
       },
-      checkWorkdir: (path: string) => normalizeWorkdir(path),
+      // Not an active loop's worktree: a dispatched worker there would edit
+      // what the run verifies.
+      checkWorkdir: (path: string) => {
+        const n = normalizeWorkdir(path);
+        return n && !this.#loopWorktreeProblem(n) ? n : null;
+      },
       resolveBackend: (provider?: string, model?: string) => {
         // Fail closed on an unknown provider — same rule and same wording as
         // session.create / fork / set_provider. Rejecting here (pre-queue)
@@ -7658,7 +8007,7 @@ mcpHub: this.#mcpHub,
   #send(
     msg: Extract<ClientMessage, { type: "session.send" }>,
     auth: AuthContext,
-  ): DaemonMessage {
+  ): DaemonMessage | Promise<DaemonMessage> {
     if (!hasScope(auth.scopes as string[], SCOPES.SESSION_SEND)) {
       return { type: "response.error", requestId: msg.id, error: "Missing scope: session:send", code: "forbidden" };
     }
@@ -7667,6 +8016,12 @@ mcpHub: this.#mcpHub,
     if (!session) {
       return { type: "response.error", requestId: msg.id, error: "Session not found", code: "not_found" };
     }
+
+    // A loop's worker has one driver, its run (§5): a message typed into it
+    // becomes steering for the run's next attempt (or the answer to its
+    // question) instead of a second conversation the controller can't see.
+    const loopRun = this.#liveLoopRunOf(session.id);
+    if (loopRun) return this.#steerFromSend(msg, auth, loopRun);
 
     // Duplicate-send suppression (`send.idempotency`): a client that
     // couldn't observe whether its send survived a dropped socket resends
@@ -8068,6 +8423,11 @@ mcpHub: this.#mcpHub,
     if (!session) {
       return { type: "response.error", requestId: msg.id, error: "Session not found", code: "not_found" };
     }
+    // A loop is started only with the owner's own token; what its worker may
+    // do past its rules is the owner's call too, not a delegate's.
+    if (auth.delegationDepth > 0 && this.#isLiveLoopWorker(session.id)) {
+      return { type: "response.error", requestId: msg.id, error: "A delegated token can't approve a loop worker's tool calls", code: "forbidden" };
+    }
 
     // Still `response.ok` for a stale id — the web ApprovalBar sends one to
     // dismiss a leftover prompt — but say so, for callers that report it.
@@ -8092,6 +8452,9 @@ mcpHub: this.#mcpHub,
     const session = this.#getOwnedSession(msg.sessionId, auth);
     if (!session) {
       return { type: "response.error", requestId: msg.id, error: "Session not found", code: "not_found" };
+    }
+    if (auth.delegationDepth > 0 && this.#isLiveLoopWorker(session.id)) {
+      return { type: "response.error", requestId: msg.id, error: "A delegated token can't answer a loop worker's dialogs", code: "forbidden" };
     }
     const applied = session.resolveUiRequestFromClient(
       msg.requestId,

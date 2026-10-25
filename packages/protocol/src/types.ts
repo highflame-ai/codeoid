@@ -86,6 +86,7 @@ import type {
   RoutineUpdateMsg,
 } from "./routines.js";
 import type { EvidenceGetMsg, EvidenceRecordMsg } from "./evidence.js";
+import type { LoopCancelMsg, LoopGetMsg, LoopPauseMsg, LoopResumeMsg, LoopListMsg, LoopListResultMsg, LoopSnapshotMsg, LoopStartMsg, LoopSteerMsg } from "./loops.js";
 import type {
   McpAdoptMsg,
   McpAdoptResultMsg,
@@ -570,6 +571,12 @@ export interface SessionWorktree {
    * worktree the user already had — codeoid never removes those.
    */
   createdByCodeoid: boolean;
+  /**
+   * The loop run whose worktree this is. Its sessions can't remove it while
+   * the run is in progress, and removing it never commits what's left in it:
+   * the run's branch holds only what the run delivered.
+   */
+  loopRun?: string;
   /**
    * What the repository's setup recipe put in this worktree, relative to its
    * root: copied (ignored, often secret) files and symlinks to the primary
@@ -1194,6 +1201,13 @@ export type ClientMessage =
   | RoutineTokenMsg
   | RoutinePreviewMsg
   | EvidenceGetMsg
+  | LoopStartMsg
+  | LoopListMsg
+  | LoopGetMsg
+  | LoopCancelMsg
+  | LoopPauseMsg
+  | LoopResumeMsg
+  | LoopSteerMsg
   | McpOAuthBeginMsg
   | McpOAuthCompleteMsg
   | McpOAuthDisconnectMsg
@@ -3005,6 +3019,8 @@ export type DaemonMessage =
   | RoutineTokenResultMsg
   | RoutinePreviewResultMsg
   | EvidenceRecordMsg
+  | LoopSnapshotMsg
+  | LoopListResultMsg
   | McpOAuthBeginResultMsg
   | McpOAuthCompleteResultMsg
   | McpOAuthDisconnectResultMsg

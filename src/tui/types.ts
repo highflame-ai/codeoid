@@ -68,6 +68,8 @@ export type ModalState =
   | { kind: "confirm-destroy"; sessionId: string }
   | { kind: "help" }
   | { kind: "search"; query: string }
+  /** `/loops`: the owner's loop runs, opened on one when `runId` is given. */
+  | { kind: "loops"; runId?: string }
   /**
    * Backend pickers carry the session they were opened for, so a focus
    * change while one is open (reconnect, sessions.set) cannot retarget it.

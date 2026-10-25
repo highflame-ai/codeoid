@@ -51,6 +51,8 @@ const COMMANDS: readonly CommandDoc[] = [
   { usage: "/settings", desc: "Open the settings drawer" },
   { usage: "/packs", desc: "Browse, install, trust & select SDLC packs" },
   { usage: "/pipeline [goal]", desc: "Run a governed SDLC pipeline from an installed pack" },
+  { usage: "/loop [objective]", desc: "Start a loop: repair in its own worktree until the daemon's checks pass" },
+  { usage: "/loops", desc: "Your loop runs: status, attempts, evidence, steer, pause, cancel" },
   { usage: "/fork", desc: "Branch the session — optionally continue on another backend" },
   { usage: "/export", desc: "Export / share the focused session" },
   { usage: "/import", desc: "Import (fork) a session from a share" },

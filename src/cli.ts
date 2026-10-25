@@ -61,6 +61,7 @@ import {
   scheduleFromFlags,
   specFromFlags,
 } from "./terminal/routine-format.js";
+import { formatLoop, formatLoopRow, parseCheckFlag } from "./terminal/loop-format.js";
 import {
   getConfigDir,
   getLocalTokenPath,
@@ -1554,6 +1555,166 @@ function printRoutineToken(token: string, routineId: string): void {
   const base = loadConfig().daemonUrl.replace(/^ws/, "http").replace(/\/+$/, "");
   console.log(`\n  API token (shown once — store it now):\n    ${token}`);
   console.log(`\n  Fire it:\n    curl -X POST ${base}${routineFirePath(routineId)} \\\n      -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \\\n      -d '{"text": "optional payload for {{payload}}"}'\n`);
+}
+
+// ── Loops (docs/loop-engineering-design.md) ─────────────────────────────────
+
+const loop = program
+  .command("loop")
+  .description("Pursue an objective in its own worktree until the daemon's own checks pass (docs/loops.md)");
+
+
+loop
+  .command("start <objective>")
+  .description("Start a repair run: reproduce failing checks, repair in an isolated worktree, verify, commit to the run's branch")
+  .requiredOption("--workdir <dir>", "The git repository to repair (it is never modified; the run works in its own worktree)")
+  .option("--check <cmd>", "A check that must pass, as `cmd` or `id: cmd` (repeatable)", collect, [])
+  .option("--test", "The checks are test runs: exiting 0 after running no tests does not pass")
+  .option("--attempts <n>", "Worker attempts, including the first (default 3)")
+  .option("--attempt-minutes <n>", "Wall time per attempt (default 10)")
+  .option("--run-minutes <n>", "Active time across the run (default 30)")
+  .option("--budget <n>", "Autonomous tool calls per attempt (default 60)")
+  .option("--provider <id>", "Backend for the worker (default: the daemon's)")
+  .option("--model <id>", "Model for the worker")
+  .option("--wait", "Follow the run until it ends")
+  .action(
+    (
+      objective: string,
+      f: {
+        workdir: string;
+        check: string[];
+        test?: boolean;
+        attempts?: string;
+        attemptMinutes?: string;
+        runMinutes?: string;
+        budget?: string;
+        provider?: string;
+        model?: string;
+        wait?: boolean;
+      },
+    ) =>
+      withClient(async (c) => {
+        if (f.check.length === 0) {
+          console.error("Give at least one --check: the command that must pass.");
+          process.exitCode = 1;
+          return;
+        }
+        const int = (v: string | undefined) => (v === undefined ? undefined : Number.parseInt(v, 10));
+        const limits = {
+          ...(f.attempts ? { attempts: int(f.attempts) } : {}),
+          ...(f.attemptMinutes ? { attemptMinutes: int(f.attemptMinutes) } : {}),
+          ...(f.runMinutes ? { runMinutes: int(f.runMinutes) } : {}),
+        };
+        const res = await c.request({
+          type: "loop.start",
+          id: randomUUID(),
+          objective,
+          workdir: resolve(f.workdir),
+          checks: f.check.map((raw) => ({ ...parseCheckFlag(raw), ...(f.test ? { expectTests: true } : {}) })),
+          ...(f.provider ? { provider: f.provider } : {}),
+          ...(f.model ? { model: f.model } : {}),
+          ...(f.budget ? { toolBudget: int(f.budget) } : {}),
+          ...(Object.keys(limits).length > 0 ? { limits: limits as never } : {}),
+        });
+        if (res.type !== "loop.snapshot") return c.printError(res);
+        console.log(formatLoop(res.run, res.attempts).join("\n"));
+        if (f.wait) await followLoop(c, res.run.id);
+      }),
+  );
+
+loop
+  .command("ls")
+  .description("Your loop runs, newest first")
+  .action(() =>
+    withClient(async (c) => {
+      const res = await c.request({ type: "loop.list", id: randomUUID() });
+      if (res.type !== "loop.list.result") return c.printError(res);
+      if (res.runs.length === 0) console.log("No loop runs.");
+      for (const r of res.runs) console.log(formatLoopRow(r));
+    }),
+  );
+
+loop
+  .command("show <runId>")
+  .description("A run's contract, attempts, evidence, and (with --events) its history")
+  .option("--events", "Include the run's event history")
+  .option("--wait", "Follow the run until it ends")
+  .action((runId: string, f: { events?: boolean; wait?: boolean }) =>
+    withClient(async (c) => {
+      const id = await resolveLoopId(c, runId);
+      if (!id) return;
+      const res = await c.request({ type: "loop.get", id: randomUUID(), runId: id, events: f.events === true });
+      if (res.type !== "loop.snapshot") return c.printError(res);
+      console.log(formatLoop(res.run, res.attempts, res.events).join("\n"));
+      if (f.wait) await followLoop(c, id);
+    }),
+  );
+
+for (const verb of ["cancel", "pause", "resume"] as const) {
+  loop
+    .command(`${verb} <runId>`)
+    .description(
+      verb === "cancel"
+        ? "Stop the run now"
+        : verb === "pause"
+          ? "Stop at the next attempt boundary (a running attempt finishes)"
+          : "Continue a paused run",
+    )
+    .action((runId: string) =>
+      withClient(async (c) => {
+        const id = await resolveLoopId(c, runId);
+        if (!id) return;
+        const res = await c.request({ type: `loop.${verb}`, id: randomUUID(), runId: id });
+        if (res.type !== "loop.snapshot") return c.printError(res);
+        console.log(formatLoopRow(res.run));
+      }),
+    );
+}
+
+loop
+  .command("steer <runId> <text>")
+  .description("Guidance for the next attempt, or the answer to the worker's question")
+  .action((runId: string, text: string) =>
+    withClient(async (c) => {
+      const id = await resolveLoopId(c, runId);
+      if (!id) return;
+      const res = await c.request({ type: "loop.steer", id: randomUUID(), runId: id, text });
+      if (res.type !== "loop.snapshot") return c.printError(res);
+      console.log(formatLoopRow(res.run));
+    }),
+  );
+
+/** A run id from a full id or an unambiguous prefix of the owner's runs. */
+async function resolveLoopId(c: Parameters<Parameters<typeof withClient>[0]>[0], ref: string): Promise<string | null> {
+  if (/^loop_[0-9a-f-]{36}$/.test(ref)) return ref;
+  const res = await c.request({ type: "loop.list", id: randomUUID(), limit: 200 });
+  if (res.type !== "loop.list.result") {
+    c.printError(res);
+    return null;
+  }
+  const hits = res.runs.filter((r) => r.id.startsWith(ref) || r.id.startsWith(`loop_${ref}`));
+  if (hits.length === 1) return hits[0]!.id;
+  console.error(hits.length === 0 ? `No loop run matches "${ref}".` : `"${ref}" matches ${hits.length} runs; give more of the id.`);
+  process.exitCode = 1;
+  return null;
+}
+
+/** Print each status change until the run ends. */
+async function followLoop(c: Parameters<Parameters<typeof withClient>[0]>[0], runId: string): Promise<void> {
+  let last = "";
+  for (;;) {
+    const res = await c.request({ type: "loop.get", id: randomUUID(), runId });
+    if (res.type !== "loop.snapshot") return c.printError(res);
+    const line = formatLoopRow(res.run) + (res.run.reason ? ` — ${res.run.reason}` : "");
+    if (line !== last) console.log(line);
+    last = line;
+    if (["completed", "budget_exhausted", "blocked", "failed", "cancelled"].includes(res.run.status)) {
+      console.log(formatLoop(res.run, res.attempts).join("\n"));
+      if (res.run.status !== "completed") process.exitCode = 1;
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 2_000));
+  }
 }
 
 const routine = program

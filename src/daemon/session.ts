@@ -460,6 +460,9 @@ export interface SessionCreateOptions {
    * scoped session view; the Session just hands it to the provider.
    */
   fleet?: McpSdkServerConfigWithInstance;
+  /** codeoid_loop MCP server, built for this session's id — set for a loop
+   *  run's worker only. The factory receives the session id. */
+  loopTools?: (sessionId: string) => McpSdkServerConfigWithInstance;
   /**
    * Model default that outranks config.session.defaultModel for THIS
    * session (still loses to a persisted per-session choice). Used by the
@@ -823,6 +826,7 @@ export class Session {
    */
   #appliedAccount = "";
   #fleet?: McpSdkServerConfigWithInstance;
+  #loopTools?: McpSdkServerConfigWithInstance;
   #compressionRegistry?: CompressionRegistry;
   #onModels?: SessionCreateOptions["onModels"];
   #onModelLimits?: SessionCreateOptions["onModelLimits"];
@@ -1378,6 +1382,7 @@ export class Session {
     this.#accountChoices = { ...(opts.accountChoices ?? {}) };
     if (opts.claudeAccount) this.#accountChoices.claude = opts.claudeAccount;
     this.#fleet = opts.fleet;
+    this.#loopTools = opts.loopTools?.(this.id);
     this.#compressionRegistry = opts.compressionRegistry;
     this.#onModels = opts.onModels;
     this.#onModelLimits = opts.onModelLimits;
@@ -1591,6 +1596,7 @@ export class Session {
       mcpRegistry: this.#mcpView ?? this.#mcpRegistry,
       mcpHub: this.#mcpHub,
       fleet: this.#fleet,
+      loop: this.#loopTools,
       config: this.#config,
       compressionRegistry: this.#compressionRegistry,
       // Tag model reports with the factory's id (known before construction),
@@ -2004,6 +2010,12 @@ export class Session {
   get providerId(): string { return this.#provider.id; }
   /** Tenant-scoped memory workspace id (for fleet views / cross-session search). */
   get workspaceId(): string { return this.#workspaceId; }
+
+  /** Whether this session carries the codeoid_loop tool (a loop worker built
+   *  this boot; a resumed session never does). */
+  get hasLoopTools(): boolean {
+    return this.#loopTools !== undefined;
+  }
 
   /** Record this session's tenant as the owner of its memory workspace. A
    *  failure is logged and retried before the next episode is written. */
@@ -4338,6 +4350,7 @@ export class Session {
         worktreePath: this.worktree.path,
         branch: this.worktree.branch,
         ...(this.worktree.setup ? { setup: this.worktree.setup } : {}),
+        ...(this.worktree.loopRun ? { snapshot: false } : {}),
         // A session undone by the request that made it leaves no branch behind.
         ...(opts.deleteBranch ? { deleteBranch: true } : {}),
       }).catch(() => {});

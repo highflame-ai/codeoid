@@ -52,6 +52,8 @@
  */
 
 import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
+import { GIT_BIN, gitEnv } from "./git-env.js";
 import {
   closeSync,
   constants,
@@ -193,12 +195,12 @@ export function parseSetupRecipe(text: string): SetupRecipe {
 
 // ── git ──────────────────────────────────────────────────────────────────────
 
-/** git with hooks and fsmonitor off (as git-worktree.ts); `okCodes` are exits that aren't errors. */
+/** git with hooks and fsmonitor off and git-env.ts's environment (no network, no replace refs); `okCodes` are exits that aren't errors. */
 async function git(args: string[], cwd: string, opts: { okCodes?: number[]; input?: string } = {}): Promise<{ code: number; stdout: string }> {
   const argv = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", ...args];
   if (opts.input !== undefined) {
     return new Promise((resolve, reject) => {
-      const child = spawn("git", argv, { cwd, stdio: ["pipe", "pipe", "pipe"] });
+      const child = spawn(GIT_BIN, argv, { cwd, env: gitEnv(), stdio: ["pipe", "pipe", "pipe"] });
       let stdout = "";
       let stderr = "";
       child.stdout.on("data", (b: Buffer) => {
@@ -217,7 +219,9 @@ async function git(args: string[], cwd: string, opts: { okCodes?: number[]; inpu
     });
   }
   try {
-    const { stdout } = await execFileP("git", argv, { cwd, timeout: 60_000, maxBuffer: 16 * 1024 * 1024 });
+    // No network: a lazy fetch would run whatever remote config an agent wrote
+    // (this runs during a loop's verification, after its worker is stopped).
+    const { stdout } = await execFileP(GIT_BIN, argv, { cwd, env: gitEnv(), timeout: 60_000, maxBuffer: 16 * 1024 * 1024 });
     return { code: 0, stdout };
   } catch (err) {
     const code = (err as { code?: unknown }).code;
@@ -272,7 +276,23 @@ export async function readSetupRecipe(repoDir: string): Promise<FoundRecipe | nu
     throw new SetupRecipeError(`${SETUP_RECIPE_PATH} is larger than ${LIMITS.RECIPE_BYTES / 1024} KiB`);
   }
   const blob = m[3] as string;
-  const text = (await git(["cat-file", "blob", blob], root)).stdout;
+  // Trust is pinned to this id: the text run must be the text it names, not
+  // whatever a rewritten object in the store holds. Hashed as raw bytes.
+  const { stdout: bytes } = await execFileP(GIT_BIN, ["-c", "core.hooksPath=/dev/null", "cat-file", "blob", blob], {
+    cwd: root,
+    env: gitEnv(),
+    encoding: "buffer",
+    timeout: 60_000,
+    maxBuffer: LIMITS.RECIPE_BYTES + 1024,
+  });
+  const hash = createHash(blob.length === 64 ? "sha256" : "sha1").update(`blob ${bytes.length}\0`).update(bytes).digest("hex");
+  if (hash !== blob) throw new SetupRecipeError(`${SETUP_RECIPE_PATH} at ${rev.slice(0, 10)} doesn't match its object id — the repository's object store was altered`);
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new SetupRecipeError(`${SETUP_RECIPE_PATH} at ${rev.slice(0, 10)} isn't UTF-8`);
+  }
   return { recipe: parseSetupRecipe(text), rev, root, recipeHash: blob };
 }
 
@@ -362,6 +382,8 @@ export async function commandGate(
   policy: WorktreeSetupPolicy | undefined,
   worktreePath: string,
   ownerSub?: string,
+  /** The commit the worktree's content builds on, when its HEAD isn't it. */
+  baseCommit?: string,
 ): Promise<CommandRefusal | null> {
   const refusal = commandRefusal(policy, read.root, read.recipeHash, ownerSub);
   if (refusal) return refusal;
@@ -371,7 +393,7 @@ export async function commandGate(
       "this worktree starts from a commit that isn't on your checkout's branch (another branch, a pull request, or an agent's commit), so the trusted command would run code you haven't reviewed",
   };
   try {
-    const base = (await git(["rev-parse", "--verify", "HEAD^{commit}"], worktreePath)).stdout.trim();
+    const base = baseCommit ?? (await git(["rev-parse", "--verify", "HEAD^{commit}"], worktreePath)).stdout.trim();
     const blob = await git(["rev-parse", "--verify", "--quiet", `${base}:${SETUP_RECIPE_PATH}`], read.root, { okCodes: [1, 128] });
     if (blob.code !== 0 || blob.stdout.trim() !== read.recipeHash) return off;
     const onPrimary = await git(["merge-base", "--is-ancestor", base, read.rev], read.root, { okCodes: [1] });
@@ -561,6 +583,18 @@ export async function prepareWorktree(opts: {
   recipe?: RecipeRead;
   /** The session owner's subject — trust entries recorded by someone else don't apply. */
   ownerSub?: string;
+  /** Apply the recipe's `share` links (default true). A loop turns them off:
+   *  a shared directory is a writable link into the primary checkout, so its
+   *  worker could change what the checks run without it showing in the diff. */
+  share?: boolean;
+  /**
+   * The commit the worktree's content builds on, when its HEAD is not that
+   * commit: a loop checks a candidate in a scratch checkout of a commit made
+   * for it. The command's gate asks of this commit what it asks of a HEAD.
+   */
+  baseCommit?: string;
+  /** More environment for the command (a loop's marker, so what it leaves running is found). */
+  extraEnv?: Record<string, string>;
 }): Promise<WorktreeSetupResult> {
   const result: WorktreeSetupResult = { applied: false, copied: [], shared: [], skipped: [], warnings: [] };
   const fail = (err: unknown): WorktreeSetupResult => {
@@ -641,6 +675,10 @@ export async function prepareWorktree(opts: {
     }
 
     for (const rel of recipe.share) {
+      if (opts.share === false) {
+        skip(rel, "not shared into a loop's worktree (its worker could change it outside the diff); install it with the setup command instead");
+        continue;
+      }
       if (!exists(path.join(root, rel))) {
         skip(rel, "doesn't exist in the primary checkout");
         continue;
@@ -718,7 +756,7 @@ export async function prepareWorktree(opts: {
   }
 
   if (recipe.command) {
-    const refusal = await commandGate(found, opts.policy, worktree, opts.ownerSub);
+    const refusal = await commandGate(found, opts.policy, worktree, opts.ownerSub, opts.baseCommit);
     if (refusal) {
       result.commandSkipped = refusal.reason;
       result.commandSkippedCode = refusal.code;
@@ -727,7 +765,7 @@ export async function prepareWorktree(opts: {
       result.command = await runSetupCommand(recipe.command, {
         cwd: worktree,
         timeoutMs: timeoutSec * 1000,
-        env: { CODEOID_PRIMARY_CHECKOUT: realRoot, CODEOID_WORKTREE: worktree },
+        env: { ...(opts.extraEnv ?? {}), CODEOID_PRIMARY_CHECKOUT: realRoot, CODEOID_WORKTREE: worktree },
         ...(opts.signal ? { signal: opts.signal } : {}),
       });
       if (result.command.timedOut) result.error = `the setup command timed out after ${timeoutSec}s`;

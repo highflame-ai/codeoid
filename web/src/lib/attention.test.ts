@@ -8,7 +8,8 @@ import {
   type AttentionItem,
   type AttentionSources,
 } from "./attention";
-import type { FleetTaskWire, SessionInfo, SessionUiRequestMsg } from "../protocol/types";
+import { LOOP_APPROVAL_WAIT } from "./loops";
+import type { FleetTaskWire, LoopRunWire, SessionInfo, SessionUiRequestMsg } from "../protocol/types";
 
 const NOW = 1_000_000_000_000;
 const MIN = 60_000;
@@ -241,5 +242,60 @@ describe("attentionQueue", () => {
 
   it("returns an empty queue when nothing needs you", () => {
     expect(attentionQueue(sources({ sessions: [session("a")] }), NOW)).toEqual([]);
+  });
+});
+
+describe("collectAttention — loop runs", () => {
+  const loop = (id: string, over: Partial<LoopRunWire>): LoopRunWire =>
+    ({
+      id,
+      objective: `Objective ${id}\nmore`,
+      status: "running",
+      reason: null,
+      waitingOn: null, waitingKind: null,
+      workerSessionId: `w-${id}`,
+      updatedAt: iso(NOW - 5 * MIN),
+      ...over,
+    }) as LoopRunWire;
+
+  it("lists a run's question and a blocked run, deep-linked to the run", () => {
+    const items = collectAttention(
+      sources({
+        loops: [
+          loop("q", { status: "waiting", waitingOn: "the owner's answer: Keep the old API?" }),
+          loop("b", { status: "blocked", reason: "the checks already pass", endedAt: new Date(NOW - 5 * MIN).toISOString() }),
+          // Blocked more than a day ago: no longer asks for attention.
+          loop("old", { status: "blocked", reason: "stale", endedAt: new Date(NOW - 25 * 60 * MIN).toISOString() }),
+          loop("r", { status: "running" }),
+          loop("c", { status: "completed" }),
+        ],
+      }),
+      NOW,
+    );
+    expect(items.map((i) => [i.key, i.kind, i.runId, i.sessionId, i.detail])).toEqual([
+      ["loop:q", "question", "q", null, "Keep the old API?"],
+      ["loop:b", "blocked", "b", null, "the checks already pass"],
+    ]);
+    expect(items[0]!.label).toBe("loop · Objective q");
+    expect(items[0]!.since).toBe(NOW - 5 * MIN);
+  });
+
+  it("uses the daemon's waitingKind over the text", () => {
+    const items = collectAttention(
+      sources({ loops: [loop("k", { status: "waiting", waitingOn: "anything", waitingKind: "approval" })] }),
+      NOW,
+    );
+    expect(items.filter((i) => i.key === "loop:k")).toEqual([]);
+  });
+
+  it("leaves an approval wait to its worker session's approval row", () => {
+    const items = collectAttention(
+      sources({
+        sessions: [session("w-a", { status: "waiting_approval" })],
+        loops: [loop("a", { status: "waiting", waitingOn: LOOP_APPROVAL_WAIT })],
+      }),
+      NOW,
+    );
+    expect(items.map((i) => i.key)).toEqual(["approval:w-a"]);
   });
 });

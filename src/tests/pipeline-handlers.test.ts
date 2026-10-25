@@ -411,12 +411,12 @@ describe("evidence.get", () => {
     if (unknown.type === "response.error") expect(unknown.code).toBe("not_found");
   });
 
-  test("reading pipeline evidence needs pipeline:read", async () => {
+  test("reading pipeline evidence needs pipeline:read, and its absence looks like a missing id", async () => {
     const run = await createRun();
     const id = await record("pipeline", run.id);
     const res = await get(id, { ...AUTH, scopes: [SCOPES.SESSION_LIST] as AuthContext["scopes"] });
     expect(res.type).toBe("response.error");
-    if (res.type === "response.error") expect(res.code).toBe("forbidden");
+    if (res.type === "response.error") expect(res.code).toBe("not_found");
   });
 
   test("evidence whose pipeline is gone is not_found", async () => {
@@ -426,8 +426,8 @@ describe("evidence.get", () => {
     else throw new Error("expected not_found");
   });
 
-  test("loop evidence is not readable here until loops authorize it", async () => {
-    const id = await record("loop", "run-1");
+  test("loop evidence for a run the caller doesn't own is not_found", async () => {
+    const id = await record("loop", "loop_not-theirs");
     const res = await get(id);
     if (res.type === "response.error") expect(res.code).toBe("not_found");
     else throw new Error("expected not_found");

@@ -44,6 +44,7 @@ import { oauthServersForClaude } from "./oauth-bridge.js";
 import { mcpToolPrefix, resolveEnvMap } from "../../mcp/types.js";
 import type { CompressionRegistry } from "../../compress/index.js";
 import { FLEET_TOOL_NAMES } from "../../fleet.js";
+import { LOOP_MCP_SERVER_NAME, LOOP_REPORT_TOOL_FQ } from "../../loops/tools.js";
 import { rewriteBashToolInput } from "../../compress/index.js";
 import { type CodeoidConfig, getConfigDir } from "../../../config.js";
 import { secretPathVerdict } from "../../secret-paths.js";
@@ -151,6 +152,9 @@ export interface ClaudeProviderInit {
   identityManager?: AgentIdentityManager;
   /** Codeoid memory engine — injected as an MCP server. */
   memory?: MemoryEngine;
+  /** codeoid_loop MCP server — loop worker sessions only. `loop_report` records
+   *  a request for verification and decides nothing, so it runs unprompted. */
+  loop?: McpSdkServerConfigWithInstance;
   /** codeoid_fleet MCP server — conductor sessions only (read-only fleet view). */
   fleet?: McpSdkServerConfigWithInstance;
   /**
@@ -749,6 +753,7 @@ export class ClaudeProvider implements SessionProvider {
       // Conductor sessions only — the read-only fleet view (P3). In-process,
       // so the external-server timeout doesn't apply.
       ...(init.fleet ? { codeoid_fleet: init.fleet } : {}),
+      ...(init.loop ? { [LOOP_MCP_SERVER_NAME]: init.loop } : {}),
       // Collaboration children only — the role-scoped goal blackboard. Mounted
       // over HTTP rather than in-process precisely so the SAME surface works on
       // gemini/codex; claude deliberately gets no privileged path here (#245).
@@ -782,6 +787,7 @@ export class ClaudeProvider implements SessionProvider {
       // is FLEET_TOOL_NAMES (the READ set) only: the send-class verbs are
       // deliberately absent so they still ride the owner's approval flow.
       ...(this.#init.fleet ? FLEET_TOOL_NAMES.map((t) => `mcp__codeoid_fleet__${t}`) : []),
+      ...(this.#init.loop ? [LOOP_REPORT_TOOL_FQ] : []),
     ];
     this.#autoApprovedTools = new Set(autoApprovedToolNames);
     if (this.#consumerTask && this.#inputQueue && !this.#inputQueue.closed) {

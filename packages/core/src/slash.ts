@@ -48,6 +48,8 @@ export type SlashCommand =
   | { kind: "settings" }
   | { kind: "packs" }
   | { kind: "pipeline"; goal?: string }
+  | { kind: "loops" }
+  | { kind: "loop"; objective?: string }
   | { kind: "export" }
   | { kind: "import" }
   | { kind: "fork"; providerId?: string };
@@ -174,6 +176,12 @@ export function parseSlash(raw: string, opts?: ParseSlashOptions): SlashCommand 
     case "pipeline":
       // `/pipeline` opens the runner; `/pipeline <goal…>` prefills the goal.
       return { kind: "pipeline", ...(rest.length > 0 ? { goal: rest.join(" ") } : {}) };
+    case "loops":
+      return { kind: "loops" };
+    case "loop":
+      // `/loop` opens the start form, like `/pipeline`; `/loop <objective…>`
+      // prefills it (docs/loops.md).
+      return { kind: "loop", ...(rest.length > 0 ? { objective: rest.join(" ") } : {}) };
     case "export":
     case "share":
       return { kind: "export" };
@@ -218,6 +226,10 @@ export interface SlashContext {
   /** Open the pipeline runner, optionally prefilling the goal
    *  (governed SDLC run — docs/pipeline-run.md). */
   showPipeline?: (goal?: string) => void;
+  /** Open the loop runs list (docs/loops.md). */
+  showLoops?: () => void;
+  /** Open the loop start form, optionally prefilling the objective. */
+  showLoopStart?: (objective?: string) => void;
   showExport?: () => void;
   showImport?: () => void;
   /**
@@ -393,6 +405,12 @@ export function dispatchSlash(cmd: SlashCommand, ctx: SlashContext): void {
       return;
     case "pipeline":
       ctx.showPipeline?.(cmd.goal);
+      return;
+    case "loops":
+      ctx.showLoops?.();
+      return;
+    case "loop":
+      ctx.showLoopStart?.(cmd.objective);
       return;
     case "export":
       ctx.showExport?.();
