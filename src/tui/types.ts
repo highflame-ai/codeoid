@@ -72,7 +72,7 @@ export type ModalState =
    * Backend pickers carry the session they were opened for, so a focus
    * change while one is open (reconnect, sessions.set) cannot retarget it.
    */
-  | { kind: "model" | "provider"; sessionId: string }
+  | { kind: "model" | "provider" | "effort"; sessionId: string }
   /**
    * The account picker also carries the backend whose accounts it lists: if
    * the session moves to another backend while it is open, it closes rather

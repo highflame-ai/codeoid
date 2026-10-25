@@ -47,7 +47,7 @@ import { FLEET_TOOL_NAMES } from "../../fleet.js";
 import { rewriteBashToolInput } from "../../compress/index.js";
 import { type CodeoidConfig, getConfigDir } from "../../../config.js";
 import { secretPathVerdict } from "../../secret-paths.js";
-import type { AuthContext } from "../../../protocol/types.js";
+import { type AuthContext, EFFORT_LEVELS, type EffortLevel } from "../../../protocol/types.js";
 import type {
   BackendMcpServerState,
   SessionProvider,
@@ -66,7 +66,8 @@ import { removeClaudeSession, toClaudeSessionEntries, writeClaudeSession } from 
 import { BUDGET_STOP_MESSAGE, isBackgroundLifecycleEvent } from "../interface.js";
 import { isUngrantableSkillCommand, redactCommand } from "../../skill-command.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
-import { buildSubprocessEnv, withGatewayCredential } from "../env.js";
+import { buildSubprocessEnv, withExtraEnv, withGatewayCredential } from "../env.js";
+import { listProcesses } from "../../process-tree.js";
 import type { LLMCallUsage } from "../../context-math.js";
 import type { PackSubagent } from "../../pipeline/subagents.js";
 
@@ -132,6 +133,8 @@ export interface ClaudeProviderInit {
    * switch takes effect on the next turn and RESUMES the same backing session.
    */
   resolveAccount?: () => ResolvedClaudeAccount | null;
+  /** Caller env for the CLI child process (ProviderSessionInit.extraEnv), merged last via withExtraEnv. */
+  extraEnv?: Readonly<Record<string, string>>;
   /** codeoid session id — used as the initial backing id and for audit/logging. */
   sessionId: string;
   /** Test seam for native continuation (#387); defaults to the real SDK. */
@@ -235,6 +238,8 @@ export class ClaudeProvider implements SessionProvider {
 
   // Claude-specific backing-session state
   #claudeCodeSessionId: string;
+  /** The backing id the live query's CLI was spawned with (backendProcessIds). */
+  #spawnedWithId: string | null = null;
   #hasQueried = false;
   #backingRecoveryAttempted = false;
   #lastPushedContent: string | null = null;
@@ -259,6 +264,8 @@ export class ClaudeProvider implements SessionProvider {
   #builtOAuthMcp = "";
   /** Fingerprint of the Claude account the live query loop was started with ("" = daemon env). */
   #builtAccount = "";
+  /** The thinking effort the live query loop runs at (#417); "" = the SDK's default. Off is fixed at construction. */
+  #builtEffort = "";
   /** Last TurnOpts — the retry after a skill approval rebuilds the loop with
    * these, then re-pushes #lastPushedContent into the SAME turn queue (#233). */
   #lastTurnOpts: TurnOpts | null = null;
@@ -621,8 +628,38 @@ export class ClaudeProvider implements SessionProvider {
     }
   }
 
+  /**
+   * A new thinking effort on the running query, live (#417) — except to or
+   * from Off, which the SDK fixes when the query is built, and back to the
+   * default: the SDK's live "no level" is the model's default, not the user's
+   * own Claude settings, which only a fresh query reads. Those rebuild the
+   * query before the next turn (it resumes the same conversation).
+   */
+  async applyEffort(effort: EffortLevel | null): Promise<boolean> {
+    const query$ = this.#query;
+    if (!query$ || !this.#consumerTask || effort === null || effort === "off" || this.#builtEffort === "off") return false;
+    await query$.applyFlagSettings({ effortLevel: claudeEffort(effort) });
+    this.#builtEffort = effort;
+    // A retry or recovery later in this turn rebuilds from these: at the new effort.
+    if (this.#lastTurnOpts) this.#lastTurnOpts = { ...this.#lastTurnOpts, effort };
+    return true;
+  }
+
   async dispose(): Promise<void> {
     await this.teardown();
+  }
+
+  /**
+   * The Claude Code CLI this provider's query runs in. The SDK spawns it
+   * (spawnClaudeCodeProcess is not used: replacing the SDK's spawn would drop
+   * its stderr diagnostics), so it is found as a direct child of this process
+   * whose argv names this provider's backing session as an exact token
+   * (argvNamesSession — ids are UUIDs, unique per session).
+   */
+  async backendProcessIds(): Promise<number[]> {
+    if (!this.#query) return [];
+    const id = this.#spawnedWithId ?? this.#claudeCodeSessionId;
+    return (await listProcesses()).filter((p) => p.ppid === process.pid && argvNamesSession(p.args, id)).map((p) => p.pid);
   }
 
   async teardown(): Promise<void> {
@@ -753,7 +790,8 @@ export class ClaudeProvider implements SessionProvider {
         this.#builtSkillAllowRules === desiredGrants &&
         this.#builtPluginDirs === desiredPlugins &&
         this.#builtOAuthMcp === oauthMcp.fingerprint &&
-        this.#builtAccount === desiredAccount
+        this.#builtAccount === desiredAccount &&
+        this.#builtEffort === (opts.effort ?? "")
       ) {
         return;
       }
@@ -776,7 +814,9 @@ export class ClaudeProvider implements SessionProvider {
               ? "session-scoped skill plugins changed"
               : this.#builtOAuthMcp !== oauthMcp.fingerprint
                 ? "OAuth MCP servers changed"
-                : `Claude account changed (now ${account?.name ?? "default"})`;
+                : this.#builtAccount !== desiredAccount
+                  ? `Claude account changed (now ${account?.name ?? "default"})`
+                  : `thinking effort changed (now ${opts.effort ?? "default"})`;
       console.log(
         `[claude-provider ${this.#init.sessionId.slice(0, 8)}] ${reason} — rebuilding query loop`,
       );
@@ -800,12 +840,15 @@ export class ClaudeProvider implements SessionProvider {
     this.#builtPluginDirs = desiredPlugins;
     this.#builtOAuthMcp = oauthMcp.fingerprint;
     this.#builtAccount = desiredAccount;
+    this.#builtEffort = opts.effort ?? "";
     this.#loopGeneration += 1;
     const myGeneration = this.#loopGeneration;
 
     const sessionOpts = this.#hasQueried
       ? { resume: this.#claudeCodeSessionId }
       : { sessionId: this.#claudeCodeSessionId };
+    // What this query's CLI was started with — its argv names it (backendProcessIds).
+    this.#spawnedWithId = this.#claudeCodeSessionId;
 
     const merged = this.#mcpServerSet(opts, oauthMcp);
     const mcpServers = Object.keys(merged).length > 0 ? merged : undefined;
@@ -836,11 +879,18 @@ export class ClaudeProvider implements SessionProvider {
         // applyAccountEnv). The forge gateway re-point applies only to the
         // daemon's own environment: a named account carries the user's own
         // gateway token, which must never be swapped for an agent identity.
-        env: account
-          ? account.apply(buildAgentEnv(process.env))
-          : buildAgentEnv(process.env, {
-              gatewayCredential: init.identityManager?.getGatewayCredential(init.sessionId),
-            }),
+        //
+        // The caller's extra env (a loop worker's) goes on last; withExtraEnv
+        // refuses every ANTHROPIC_/CLAUDE_ and credential-shaped key, so it
+        // can never undo the account or the gateway re-point.
+        env: withExtraEnv(
+          account
+            ? account.apply(buildAgentEnv(process.env))
+            : buildAgentEnv(process.env, {
+                gatewayCredential: init.identityManager?.getGatewayCredential(init.sessionId),
+              }),
+          init.extraEnv,
+        ),
         allowedTools: [
           // Every EXACT TOOL NAME here is auto-approved by the SDK BEFORE
           // canUseTool is consulted, so it never reaches our gate — the SDK
@@ -871,7 +921,9 @@ export class ClaudeProvider implements SessionProvider {
         // way — the tokens were already spent, we just weren't being shown
         // anything for them. (The raw chain of thought is never exposed on any
         // model; this is a summary of it.)
-        thinking: { type: "adaptive" as const, display: "summarized" as const },
+        // Thinking effort (#417): Off disables thinking; any other level rides
+        // on adaptive thinking.
+        ...claudeEffortOptions(opts.effort),
         // An account may name models its own way (a Bedrock account's mappings).
         ...modelOptions(opts.model, opts.fallbackModel, account),
         ...(opts.maxBudgetUsd !== undefined ? { maxBudgetUsd: opts.maxBudgetUsd } : {}),
@@ -1082,7 +1134,7 @@ export class ClaudeProvider implements SessionProvider {
     if (init.onModels && account?.kind !== "bedrock") {
       void this.#query
         .supportedModels()
-        .then((m) => init.onModels?.(m))
+        .then((m) => init.onModels?.(m.map(claudeCatalogEntry)))
         .catch(() => {});
     }
 
@@ -1540,6 +1592,22 @@ export interface TranslateState {
 }
 
 /**
+ * Whether a Claude CLI command line names backing session `id` as an EXACT
+ * argv token — the forms the SDK emits (`--resume=<id>`, `--session-id=<id>`,
+ * SDK 0.3.281) and their two-token spelling. A substring match would also hit
+ * a process that merely mentions the id (a prompt, a log path). Exported for tests.
+ */
+export function argvNamesSession(args: string, id: string): boolean {
+  const argv = args.split(/\s+/);
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === `--resume=${id}` || a === `--session-id=${id}`) return true;
+    if ((a === "--resume" || a === "--session-id") && argv[i + 1] === id) return true;
+  }
+  return false;
+}
+
+/**
  * Translate one SDKMessage from the Claude Agent SDK into zero or more
  * ProviderEvents.  Pure function — no I/O, no side-effects beyond calling
  * `emit` and updating the caller-owned `state`.  Extracted so it can be
@@ -1717,6 +1785,11 @@ export function translateSDKMessage(
           // Only a turn that completed is a point to fork at: an errored one
           // (a context overflow) would carry the failure into the fork, and an
           // interrupted one can end mid tool call.
+          // A turn the CLI ends "successfully" but flagged as an error carries
+          // its notice (a usage limit, "API Error: …") as the result text.
+          ...(r.is_error && r.subtype === "success" && typeof r.result === "string" && r.result
+            ? { resultText: r.result }
+            : {}),
           ...(sessionId && chainEnd && !zeroTurn && r.subtype === "success" && !r.is_error
             ? { nativeRef: { backingId: sessionId, ref: chainEnd, ...(state.cwd ? { dir: state.cwd } : {}) } }
             : {}),
@@ -1850,6 +1923,38 @@ export function translateSDKMessage(
       case "tool_progress": {
         const p = msg as { tool_name?: string; elapsed_time_seconds?: number };
         emit({ type: "tool_progress", toolName: p.tool_name, elapsedSeconds: p.elapsed_time_seconds });
+        break;
+      }
+
+      case "rate_limit_event": {
+        // SDKRateLimitInfo.resetsAt is epoch SECONDS (the CLI renders it with
+        // `new Date(resetsAt * 1000)`); ProviderEvent carries milliseconds.
+        const info = (msg as {
+          rate_limit_info?: {
+            status?: string;
+            resetsAt?: number;
+            rateLimitType?: string;
+            isUsingOverage?: boolean;
+            overageInUse?: boolean;
+            overageStatus?: string;
+          };
+        }).rate_limit_info;
+        const status = info?.status;
+        if (status !== "allowed" && status !== "allowed_warning" && status !== "rejected") break;
+        // The plan window is spent but extra usage (overage) is carrying the
+        // requests: not a limit that stops the turn.
+        const overage =
+          info?.isUsingOverage === true ||
+          info?.overageInUse === true ||
+          info?.overageStatus === "allowed" ||
+          info?.overageStatus === "allowed_warning";
+        emit({
+          type: "rate_limit",
+          status,
+          ...(overage ? { overage: true } : {}),
+          ...(typeof info?.resetsAt === "number" && info.resetsAt > 0 ? { resetsAt: info.resetsAt * 1000 } : {}),
+          ...(info?.rateLimitType ? { limitType: info.rateLimitType } : {}),
+        });
         break;
       }
     }
@@ -2212,3 +2317,41 @@ export function extractToolResultText(content: unknown): string {
   return parts.join("\n");
 }
 
+
+/** codeoid's effort scale on the Agent SDK's (#417): it has no Minimal, so that is Low. */
+function claudeEffort(effort: Exclude<EffortLevel, "off">): "low" | "medium" | "high" | "xhigh" | "max" {
+  return effort === "minimal" ? "low" : effort;
+}
+
+/**
+ * The query options for a thinking effort (#417). Thinking stays adaptive,
+ * with readable summaries (see the comment where it's used); Off disables it.
+ */
+export function claudeEffortOptions(effort: EffortLevel | undefined): {
+  thinking: { type: "adaptive"; display: "summarized" } | { type: "disabled" };
+  effort?: "low" | "medium" | "high" | "xhigh" | "max";
+} {
+  if (effort === "off") return { thinking: { type: "disabled" } };
+  const thinking = { type: "adaptive" as const, display: "summarized" as const };
+  return effort ? { thinking, effort: claudeEffort(effort) } : { thinking };
+}
+
+/** One of the SDK's model rows as a catalog entry, with the efforts the model takes (#417). */
+export function claudeCatalogEntry(m: {
+  value: string;
+  displayName: string;
+  description?: string;
+  supportsEffort?: boolean;
+  supportedEffortLevels?: string[];
+}): CatalogEntry {
+  // Off (thinking disabled) is always there; the levels are the model's own.
+  // A model that doesn't say which levels it takes leaves them unknown.
+  const levels = m.supportedEffortLevels?.filter((l): l is EffortLevel => (EFFORT_LEVELS as readonly string[]).includes(l));
+  const efforts: EffortLevel[] | undefined = m.supportsEffort === false ? ["off"] : levels ? ["off", ...levels] : undefined;
+  return {
+    value: m.value,
+    displayName: m.displayName,
+    ...(m.description ? { description: m.description } : {}),
+    ...(efforts ? { efforts } : {}),
+  };
+}

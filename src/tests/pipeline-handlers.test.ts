@@ -356,3 +356,80 @@ describe("pipeline.* handlers", () => {
     if (r.type === "response.error") expect(r.code).toBe("invalid_request");
   });
 });
+
+describe("evidence.get", () => {
+  async function createRun(): Promise<PipelineWire> {
+    return snapshot(
+      await manager.handle(
+        {
+          type: "pipeline.create",
+          id: "1",
+          name: "EV-1",
+          phases: [{ id: "one", kind: "noop", gate: "always" }],
+          workdir: join(tmp, "repo"),
+        },
+        AUTH,
+        CLIENT,
+      ),
+    );
+  }
+
+  async function record(ownerKind: "pipeline" | "loop", ownerId: string, tenant = AUTH): Promise<string> {
+    const { EvidenceService } = await import("../daemon/evidence/service.js");
+    const { EvidenceStore } = await import("../daemon/evidence/store.js");
+    const svc = new EvidenceService(new EvidenceStore(store.database), join(tmp, "evidence"));
+    const { record } = await svc.run({ id: "one:gate", command: "echo nope >&2; exit 1", timeoutMs: 5_000 }, tmp, {
+      tenant: { accountId: tenant.accountId, projectId: tenant.projectId },
+      ownerKind,
+      ownerId,
+    });
+    return record!.id;
+  }
+
+  const get = (evidenceId: string, auth: AuthContext = AUTH) =>
+    manager.handle({ type: "evidence.get", id: "e", evidenceId }, auth, { ...CLIENT, auth });
+
+  test("the pipeline's tenant reads its evidence, without artifact paths", async () => {
+    const run = await createRun();
+    const id = await record("pipeline", run.id);
+    const res = await get(id);
+    if (res.type !== "evidence.record") throw new Error(`expected evidence.record, got ${JSON.stringify(res)}`);
+    expect(res.evidence.result).toBe("fail");
+    expect(res.evidence.ownerId).toBe(run.id);
+    expect(res.evidence.stderrExcerpt.trim()).toBe("nope");
+    expect(JSON.stringify(res.evidence)).not.toContain(tmp);
+  });
+
+  test("another tenant gets not_found, the same as an unknown id", async () => {
+    const run = await createRun();
+    const id = await record("pipeline", run.id);
+    const other = { ...AUTH, accountId: "other" };
+    const res = await get(id, other);
+    expect(res.type).toBe("response.error");
+    if (res.type === "response.error") expect(res.code).toBe("not_found");
+    const unknown = await get("ev_nope");
+    if (unknown.type === "response.error") expect(unknown.code).toBe("not_found");
+  });
+
+  test("reading pipeline evidence needs pipeline:read", async () => {
+    const run = await createRun();
+    const id = await record("pipeline", run.id);
+    const res = await get(id, { ...AUTH, scopes: [SCOPES.SESSION_LIST] as AuthContext["scopes"] });
+    expect(res.type).toBe("response.error");
+    if (res.type === "response.error") expect(res.code).toBe("forbidden");
+  });
+
+  test("evidence whose pipeline is gone is not_found", async () => {
+    const id = await record("pipeline", "pipeline-that-never-existed");
+    const res = await get(id);
+    if (res.type === "response.error") expect(res.code).toBe("not_found");
+    else throw new Error("expected not_found");
+  });
+
+  test("loop evidence is not readable here until loops authorize it", async () => {
+    const id = await record("loop", "run-1");
+    const res = await get(id);
+    if (res.type === "response.error") expect(res.code).toBe("not_found");
+    else throw new Error("expected not_found");
+  });
+});

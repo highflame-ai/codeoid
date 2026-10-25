@@ -43,6 +43,7 @@ import type {
   SessionSetAccountMsg,
 } from "./accounts.js";
 import type { SkillGrantMsg, SkillGrantResultMsg } from "./skill-grant.js";
+import type { WorktreeTrustMsg, WorktreeTrustResultMsg } from "./worktree-trust.js";
 import type { SessionRewindMsg, SessionRewindResultMsg, SessionTurnsMsg, SessionTurnsResultMsg } from "./turns.js";
 import type { SessionApprovalsMsg, SessionApprovalsResultMsg } from "./approvals.js";
 import type {
@@ -84,6 +85,7 @@ import type {
   RoutineTokenResultMsg,
   RoutineUpdateMsg,
 } from "./routines.js";
+import type { EvidenceGetMsg, EvidenceRecordMsg } from "./evidence.js";
 import type {
   McpAdoptMsg,
   McpAdoptResultMsg,
@@ -230,6 +232,14 @@ export type Capability = (typeof CAPABILITIES)[keyof typeof CAPABILITIES];
  * `attachments` (bounded per-file, surfaced to the model as files it can
  * read selectively).
  */
+/**
+ * How hard a model thinks before it answers (#417), on one scale for every
+ * backend; each maps it to its own setting (docs/thinking-effort.md). A
+ * session with no effort set runs at the backend's own default.
+ */
+export const EFFORT_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export type EffortLevel = (typeof EFFORT_LEVELS)[number];
+
 export const LIMITS = {
   /** Max `session.send.text` length. ~1M chars ≈ hundreds of thousands of tokens. */
   SEND_TEXT_MAX: 1_000_000,
@@ -430,6 +440,12 @@ export interface SessionInfo {
   turnQueued?: true;
   /** Remaining turns budget for autonomous mode (undefined = unbounded, 0 = exhausted). */
   turnsRemaining?: number;
+  /**
+   * An unattended worker (onBudgetExhausted "end_attempt") spent its
+   * autonomous tool budget: its tool calls are refused until a person sets a
+   * mode or sends a message, or its controller sets a new budget. Absent = not.
+   */
+  budgetExhausted?: true;
   /** Files pinned to the session — prepended to every turn's prompt. */
   pinnedFiles?: string[];
   /** SPIFFE/WIMSE URI of the primary session agent (falls back to anonymous:session:<id>). */
@@ -477,6 +493,22 @@ export interface SessionInfo {
   model?: string;
   /** Fallback model id used on 429/529 capacity errors. */
   fallbackModel?: string;
+  /** Thinking effort set on this session (#417); absent = the backend's default. */
+  effort?: EffortLevel;
+  /**
+   * What Default means on this session right now, when the backend says
+   * (Codex: the configured effort, the project's included, else the running
+   * model's; pi: the user's default). Known once the backend has started.
+   */
+  defaultEffort?: EffortLevel;
+  /** The model the backend runs when the session names none, once known (Codex). */
+  runningModel?: string;
+  /**
+   * The effort set hasn't reached the backend yet (#417): it lands with the
+   * next turn, or — when it needs a rebuild — the first one with no
+   * background work running (Stop ends that work).
+   */
+  effortPending?: boolean;
   /**
    * Lineage for a session created via `session.fork`. Absent = not a fork.
    * Frontends surface it as a chip ("⑃ forked from <name> · turn <atTurn>")
@@ -538,6 +570,13 @@ export interface SessionWorktree {
    * worktree the user already had — codeoid never removes those.
    */
   createdByCodeoid: boolean;
+  /**
+   * What the repository's setup recipe put in this worktree, relative to its
+   * root: copied (ignored, often secret) files and symlinks to the primary
+   * checkout's shared directories. Kept out of checkpoints and taken back out
+   * before the worktree is removed.
+   */
+  setup?: { copied: string[]; shared: string[] };
 }
 
 /**
@@ -1094,6 +1133,7 @@ export type ClientMessage =
   | SessionRotateMsg
   | SessionSearchMsg
   | SessionSetModelMsg
+  | SessionSetEffortMsg
   | SessionSetProviderMsg
   | SessionMcpReconnectMsg
   | SessionMcpRefreshMsg
@@ -1120,6 +1160,7 @@ export type ClientMessage =
   | BackendLoginCancelMsg
   | BackendLoginWaitMsg
   | SkillGrantMsg
+  | WorktreeTrustMsg
   | SessionTurnsMsg
   | SessionApprovalsMsg
   | ClaudeAccountsListMsg
@@ -1152,6 +1193,7 @@ export type ClientMessage =
   | RoutineRunsMsg
   | RoutineTokenMsg
   | RoutinePreviewMsg
+  | EvidenceGetMsg
   | McpOAuthBeginMsg
   | McpOAuthCompleteMsg
   | McpOAuthDisconnectMsg
@@ -1318,6 +1360,8 @@ export interface SessionCreateMsg extends BaseClientMsg {
    * absent otherwise = the provider's default.
    */
   model?: string;
+  /** Thinking effort (#417). Absent = `session.defaultEffort`, else the backend's default; null = the backend's default. */
+  effort?: EffortLevel | null;
   /**
    * Activate an installed SDLC pack on this session (ambient mode): inject its
    * constitution, expose its skills/subagents, and — with `packRole` — run
@@ -1818,6 +1862,30 @@ export interface SessionSetModelMsg extends BaseClientMsg {
 }
 
 /**
+ * Set how hard the session's model thinks (#417); `null` returns it to the
+ * backend's default. Kept with the session, like its model. Never cuts a
+ * running turn short: applied live where the backend can take it (Claude,
+ * Qwen, pi), otherwise from the next turn — on the Gemini CLI, whose
+ * thinking is a startup setting, by restarting its backend, which resumes
+ * the conversation. Requires `session:send`. `response.ok` data is
+ * {@link EffortChangeResult}.
+ */
+export interface SessionSetEffortMsg extends BaseClientMsg {
+  type: "session.set_effort";
+  sessionId: string;
+  effort: EffortLevel | null;
+}
+
+/** `response.ok` data for `session.set_effort`. */
+export interface EffortChangeResult {
+  effort: EffortLevel | null;
+  /** When it takes effect: now, from the next turn, or once the backend restarts (between turns). */
+  applies: "now" | "next-turn" | "restart";
+  /** It needs a rebuild that waits for the session's background work to end (Stop ends it). */
+  waitsForBackground?: boolean;
+}
+
+/**
  * Full-text + semantic search across ALL sessions in a workspace — the
  * human-facing counterpart to Claude's `recall()` tool. Searches over
  * every user message, Claude reply, tool call, tool result, and reasoning
@@ -1993,6 +2061,14 @@ export interface ModelInfo {
    * the window per turn instead, and gemini, openai and acp not at all.
    */
   contextWindow?: number;
+  /**
+   * The thinking efforts this model takes (#417), when the backend reports
+   * them (Claude, Codex, pi). Absent = unknown: any level may be offered, and
+   * the backend decides; an empty list = the model doesn't think.
+   */
+  efforts?: EffortLevel[];
+  /** The backend's own default effort for this model, when it says. */
+  defaultEffort?: EffortLevel;
 }
 
 /**
@@ -2285,9 +2361,14 @@ export interface CollaborationPanelsResultMsg {
  */
 export interface FleetTaskWire {
   id: string;
-  kind: "send" | "spawn";
+  /** `attempt` = one attempt of a loop run (docs/loop-engineering-design.md §5). */
+  kind: "send" | "spawn" | "attempt";
   shape: "ship" | "scout";
-  status: "queued" | "claimed" | "running" | "done" | "failed" | "blocked";
+  /**
+   * `held` is non-terminal: the task is parked on something outside its worker
+   * (an approval a loop's profile does not cover) and is never reclaimed.
+   */
+  status: "queued" | "claimed" | "running" | "held" | "done" | "failed" | "blocked";
   attempts: number;
   /** Epoch ms. */
   createdAt: number;
@@ -2302,6 +2383,9 @@ export interface FleetTaskWire {
   createdBy: string;
   /** Dispatch group (fan-out barrier); absent = a standalone task. */
   groupId?: string;
+  /** attempt: the loop run and attempt this task executes. Absent on send/spawn. */
+  runId?: string;
+  attemptId?: string;
   /**
    * RESERVED and never populated in P5. The daemon has no dependency model —
    * the conductor sequences in prose. Present so typed fan-in/join edges are a
@@ -2323,7 +2407,7 @@ export interface FleetEventWire {
 
 /** Fleet-wide rollup, normalized across backends so one number spans vendors. */
 export interface FleetUsage {
-  /** Tasks not yet terminal (queued + claimed + running). */
+  /** Tasks not yet terminal (queued + claimed + running + held). */
   activeTasks: number;
   /** Tasks in `blocked` — the anti-spin failure cap tripped; needs a human. */
   blockedTasks: number;
@@ -2589,6 +2673,9 @@ export interface PipelinePhaseWire {
   /** Human revise notes accumulated on this phase (newest last) — the client
    *  renders the revision history. */
   feedback?: string[];
+  /** Evidence ids recorded by this phase's gates, oldest first — read each
+   *  with `evidence.get`. Absent when no gate executed a check. */
+  evidence?: string[];
   /** The findings loop's state for a phase that declares `findings:` (the
    *  engine's review → fix → re-review loop): counts plus a markdown ledger of
    *  every round. Optional (additive) — absent on phases without the loop and
@@ -2898,6 +2985,7 @@ export type DaemonMessage =
   | BackendLoginCancelResultMsg
   | BackendLoginWaitResultMsg
   | SkillGrantResultMsg
+  | WorktreeTrustResultMsg
   | SessionTurnsResultMsg
   | SessionApprovalsResultMsg
   | ClaudeAccountsResultMsg
@@ -2916,6 +3004,7 @@ export type DaemonMessage =
   | RoutineRunsResultMsg
   | RoutineTokenResultMsg
   | RoutinePreviewResultMsg
+  | EvidenceRecordMsg
   | McpOAuthBeginResultMsg
   | McpOAuthCompleteResultMsg
   | McpOAuthDisconnectResultMsg

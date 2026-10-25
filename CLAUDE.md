@@ -166,7 +166,7 @@ bun run lint         # biome check
 
 codeoid start        # daemon + all frontends
 codeoid ls           # list sessions
-codeoid new <n> [d]  # create session (workdir required unless --worktree)
+codeoid new <n> [d]  # create session (workdir required unless --worktree); --model, --effort <level>
 codeoid attach <n>   # interactive attach (with scrollback replay)
 codeoid send <n> <m> # one-shot message
 codeoid interrupt <n>
@@ -180,8 +180,10 @@ codeoid mcp refresh <session>                       # apply MCP servers changed 
 codeoid mcp approve <session> <server> [--path <f>] [--yes <fingerprint>]  # review, then approve a project's MCP server for every backend (#395)
 codeoid mcp adopt <server> [--session <s>] [--url <u>]  # codeoid signs in to a server from Claude's config (#390)
 codeoid mcp signin <server> [--callback-url <u>]        # sign in to an OAuth registry server
+codeoid evidence <id> [--full]   # one recorded check: what ran, on which tree, what it found
 codeoid routine add <name> --prompt … [--cron|--every|--at] [--check <cmd>]  # scheduled agent runs
 codeoid routine ls | show | runs | run [--wait] | edit | pause | resume | rm | cancel <runId> | token | preview
+codeoid worktree trust [dir] [--off] [--yes]  # trust the setup command of a repo's .codeoid/setup.yaml, pinned to its blob (docs/CONFIGURATION.md)
 ```
 
 `/mcp/control` (off by default, `mcpControl.*`) lets external agents drive
@@ -211,6 +213,7 @@ TELEGRAM_ALLOWED_USER_IDS=123,456   # Required with bot token
 CODEOID_MCP_CONTROL_ENABLED=false   # mount /mcp/control (docs/mcp-control.md)
 CODEOID_MCP_CONTROL_ACTIONS=false   # also allow create / send / interrupt / destroy there
 CODEOID_ROUTINES_ENABLED=true       # scheduler + routine commands (docs/routines.md)
+CODEOID_DEFAULT_EFFORT=             # thinking effort for new sessions: off|minimal|low|medium|high|xhigh|max (docs/thinking-effort.md)
 
 # Claude auth: uses your existing `claude login` session (Pro/Max subscription).
 # No ANTHROPIC_API_KEY needed if you're logged in via Claude Code CLI.

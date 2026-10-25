@@ -156,6 +156,28 @@ const general: SettingsTab = {
         }),
       ],
     },
+    {
+      id: "worktree-setup",
+      title: "Worktree setup recipe",
+      description:
+        "A repository's committed .codeoid/setup.yaml says which ignored files to copy and which directories to share (writable links into your checkout) into a worktree codeoid creates. Those steps always apply; its command is a separate opt-in, per recipe.",
+      fields: [
+        cfg(
+          "worktree.setup.runCommands",
+          "Run recipe commands",
+          "Whether a recipe's setup command may run in a new worktree. With Trusted recipes it runs only while the recipe is the one you trusted with `codeoid worktree trust` in that repository — a changed recipe runs nothing until trusted again. It runs the repository's committed scripts as you. Reading a recipe never runs anything.",
+          {
+            kind: "enum",
+            default: "never",
+            applies: "live",
+            options: [
+              { value: "never", label: "Never", description: "Copy and share files only." },
+              { value: "trusted-repos", label: "Trusted recipes", description: "Run the command of a recipe trusted with `codeoid worktree trust`." },
+            ],
+          },
+        ),
+      ],
+    },
   ],
 };
 
@@ -356,6 +378,7 @@ const fleet: SettingsTab = {
         cfg("dispatch.tickMs", "Tick interval (ms)", "Dispatcher claim/reclaim/deliver cadence.", { kind: "int", min: 250, default: 5000, advanced: true }),
         cfg("dispatch.leaseMs", "Claim lease (ms)", "An unrenewed claim past this is reclaimed.", { kind: "int", min: 10000, default: 600000, advanced: true }),
         cfg("dispatch.retryBaseMs", "Retry backoff base (ms)", "Base backoff for retryable failures — doubles per attempt.", { kind: "int", min: 0, default: 15000, advanced: true }),
+        cfg("dispatch.holdMaxMs", "Approval hold limit (ms)", "Longest a loop attempt may wait on an approval while keeping its worker slot.", { kind: "int", min: 60000, default: 7200000, advanced: true }),
       ],
     },
     {

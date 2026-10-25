@@ -13,6 +13,7 @@
 import type {
   AuthContext,
   ContentPart,
+  EffortLevel,
   ProviderCommand,
   SessionMode,
   UiRequestMethod,
@@ -113,6 +114,8 @@ export interface TurnOpts {
   userMessage: string;
   model?: string;
   fallbackModel?: string;
+  /** Thinking effort for this turn (#417), on codeoid's scale; absent = the backend's default. */
+  effort?: EffortLevel;
   workdir: string;
   systemPromptAppend?: string;
   /** Session's unified approval gate — same semantics across all providers. */
@@ -200,6 +203,13 @@ export interface NormalizedTurnResult {
   stopReason?: string;
   isError?: boolean;
   errorMessage?: string;
+  /**
+   * The backend's own result text for a turn it flagged as an error without
+   * an error subtype (Claude: `subtype: "success"`, `is_error: true`) — where
+   * the CLI puts a usage-limit or "API Error: …" notice. Text the CLI wrote,
+   * possibly the model's: read only with CLI-shaped rules (classifyCliNotice).
+   */
+  resultText?: string;
   /**
    * Where this turn ends in the backend's OWN record of the conversation, for
    * a backend that can later fork or resume from that point natively (#387).
@@ -333,6 +343,20 @@ export type ProviderEvent =
   /** Per-LLM-call usage, split by primary vs subagent (null parent_tool_use_id = primary). */
   | { type: "llm_call"; usage: LLMCallUsage; isPrimary: boolean }
   | { type: "api_retry"; attempt?: number; retryDelayMs?: number; errorStatus?: number | null }
+  /**
+   * The backend's plan rate-limit state changed (Claude's `rate_limit_event`,
+   * subscription accounts only). `rejected` means requests are refused until
+   * `resetsAt` (epoch ms) — the exact reset a usage-limit error's text often
+   * gives only as a wall-clock time. Observational: nothing retries on it.
+   */
+  | {
+      type: "rate_limit";
+      status: "allowed" | "allowed_warning" | "rejected";
+      resetsAt?: number;
+      limitType?: string;
+      /** Extra usage (overage) is carrying requests past the spent window — nothing is refused. */
+      overage?: boolean;
+    }
   | { type: "tool_progress"; toolName?: string; elapsedSeconds?: number }
   /**
    * Provider-authored standalone message — extension output, status cards,
@@ -358,7 +382,12 @@ export type ProviderEvent =
    * denied. Distinct from a tool approval, whose SDK turn is still live.
    */
   | { type: "approval_pending"; command: string }
-  | { type: "error"; message: string };
+  /**
+   * The turn failed. `detail` is the backend's STRUCTURED error, when it gave
+   * one (codex's `codexErrorInfo` + reset instant — codexErrorDetail): read by
+   * the usage-limit classifier, never shown. `message` stays the display text.
+   */
+  | { type: "error"; message: string; detail?: Record<string, unknown> };
 
 /**
  * True when a text/thinking ProviderEvent was produced by a subagent
@@ -505,6 +534,11 @@ export interface ModelInfo {
   /** Context window in tokens, when the backend publishes it on its catalog.
    *  qwen-code and pi do; Claude and codex report the window per turn. */
   contextWindow?: number;
+  /** Thinking efforts the model takes, when the backend reports them (#417). */
+  efforts?: EffortLevel[];
+  defaultEffort?: EffortLevel;
+  /** The model the backend runs when none is chosen. */
+  isDefault?: boolean;
 }
 
 /**
@@ -521,6 +555,12 @@ export interface CatalogEntry {
   displayName: string;
   description?: string;
   contextWindow?: number;
+  /** Thinking efforts the model takes (#417), when the backend reports them; [] = it doesn't think. */
+  efforts?: EffortLevel[];
+  /** The backend's default effort for the model, when it says. */
+  defaultEffort?: EffortLevel;
+  /** The model the backend runs when none is chosen, when it says (the effort picker reads its levels). */
+  isDefault?: boolean;
 }
 
 /**
@@ -598,6 +638,23 @@ export interface AgentProvider {
    */
   reconnectMcpServer?(name: string): Promise<BackendMcpServerState | null>;
   /**
+   * Thinking effort (#417): how a change reaches this backend. Absent or
+   * "turn" = it takes each turn's `TurnOpts.effort`; "restart" = only when the
+   * backend starts (the Gemini CLI's settings), so the session rebuilds it
+   * before the next turn.
+   */
+  readonly effortChange?: "turn" | "restart";
+  /** What Default means on this backend now, once known (#417) — for the session's pickers. */
+  readonly defaultEffort?: EffortLevel | null;
+  /** The model it runs when the session names none, once known. */
+  readonly runningModel?: string | null;
+  /**
+   * Apply a new effort to the running backend now, where it can (Claude,
+   * Qwen, pi) — never cutting a turn short. True when it did; false (or
+   * absent) = it applies from the next turn's options.
+   */
+  applyEffort?(effort: EffortLevel | null): Promise<boolean>;
+  /**
    * Hand this (fresh) backend an existing conversation in its OWN native form,
    * instead of a transcript in the first prompt (#387): fork its own
    * conversation at `forkFrom` when given, else build native history from
@@ -625,6 +682,22 @@ export interface AgentProvider {
    * applies the new input to what it actually executes.
    */
   readonly appliesToolInputRewrite?: boolean;
+  /**
+   * False when, in autonomous mode, the backend runs tool calls WITHOUT
+   * asking canUseTool — so codeoid's autonomous tool budget (and
+   * `onBudgetExhausted`) cannot see, count or stop them. Codex: autonomous
+   * maps to `approvalPolicy: "never"`. Absent = true (every call is gated).
+   * A loop controller falls back to wall-time limits (supervisor.ts) there.
+   */
+  readonly enforcesToolBudget?: boolean;
+  /**
+   * Pids of the processes this backend spawned itself (its CLI / app-server)
+   * that are alive now. Session.terminateBackend snapshots their whole tree
+   * before the teardown and kills what outlives it (process-tree.ts). Absent
+   * or empty = unknown (in-process backends; qwen-code, whose SDK spawns
+   * internally): only the teardown runs.
+   */
+  backendProcessIds?(): Promise<number[]>;
   dispose(): Promise<void>;
 }
 

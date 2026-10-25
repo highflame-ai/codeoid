@@ -47,7 +47,8 @@ import { ALL_SCOPES_STRING } from "./protocol/scopes.js";
 import { TerminalClient } from "./terminal/client.js";
 import { bedrockFromSettings, formatAccounts, formatClaudeAccounts, parseHeaderFlags, parseSettingFlags } from "./terminal/claude-accounts.js";
 import { formatEndpoints, importPiModels, parseModelFlags, parseTokens } from "./terminal/endpoints.js";
-import type { ClientMessage, DaemonMessage, SessionInfo } from "./protocol/types.js";
+import type { ClientMessage, DaemonMessage, EffortLevel, SessionInfo } from "./protocol/types.js";
+import { parseEffort } from "@highflame/codeoid-core";
 import { mcpConfig, mcpHeaders } from "./terminal/mcp-control-cli.js";
 import { cleartextOffHost, controlUrl, MCP_SCOPE_PRESETS, TokenError } from "./terminal/token.js";
 import { parseTargets } from "./terminal/compare.js";
@@ -988,6 +989,10 @@ program
     "Model for this session (validated against --provider). Omitted with --pack/--pack-role, the model resolves through the role's binding chain (config override → role pin → tier map).",
   )
   .option(
+    "--effort <level>",
+    "Thinking effort: off | minimal | low | medium | high | xhigh | max, or default for the backend's own (omitted: session.defaultEffort, else the backend's own). Change it later with /effort.",
+  )
+  .option(
     "--pack <id>",
     "Activate an installed SDLC pack on the session (inject its constitution, expose its skills/subagents). With --collaborate, the collaboration ADOPTS the pack: role names bind strictly to the pack's declared roles.",
   )
@@ -1016,6 +1021,7 @@ program
         provider?: string;
         account?: string;
         model?: string;
+        effort?: string;
         pack?: string;
         packRole?: string;
         collaborate?: string;
@@ -1065,11 +1071,21 @@ program
         process.exit(1);
       }
 
+      let effort: EffortLevel | null | undefined;
+      if (opts.effort) {
+        try {
+          effort = parseEffort(opts.effort); // "default" = the backend's own, not session.defaultEffort
+        } catch (e) {
+          console.error(`--effort: ${e instanceof Error ? e.message : String(e)}`);
+          process.exit(1);
+        }
+      }
       const client = new TerminalClient(config);
       await client.connect();
       await client.createSession(name, resolvedWorkdir, {
         providerId: opts.provider,
         model: opts.model,
+        ...(effort !== undefined ? { effort } : {}),
         account: opts.account,
         pack: opts.pack,
         packRole: opts.packRole,
@@ -1305,6 +1321,93 @@ program
     await client.connect();
     await client.destroySession(session);
     client.disconnect();
+  });
+
+// ── Worktree setup recipe trust (src/daemon/workspace-setup.ts) ────────────
+
+const worktreeCmd = program
+  .command("worktree")
+  .description("Worktrees codeoid creates (forks, compare, routines): trust a repository's setup recipe, .codeoid/setup.yaml");
+
+/** Ask y/N on the terminal; off a terminal, only --yes says yes. EOF is "no". */
+async function confirmOnTerminal(question: string, yes: boolean | undefined): Promise<boolean> {
+  if (yes) return true;
+  if (!process.stdin.isTTY) {
+    console.error("Not trusted: pass --yes to trust without a terminal to confirm in.");
+    return false;
+  }
+  const { createInterface } = await import("node:readline");
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const answer = await new Promise<string>((done) => {
+    rl.once("close", () => done(""));
+    rl.question(question, done);
+  });
+  rl.close();
+  return /^y(es)?$/i.test(answer.trim());
+}
+
+worktreeCmd
+  .command("trust [dir]")
+  .description(
+    "Review the setup command in the repository's committed .codeoid/setup.yaml and let it run in new worktrees — pinned to that exact recipe: a changed recipe runs nothing until trusted again",
+  )
+  .option("--off", "stop trusting this repository's setup command")
+  .option("--yes", "trust without asking to confirm (needed without a terminal)")
+  .action(async (dir: string | undefined, o: { off?: boolean; yes?: boolean }) => {
+    const target = resolve(dir ?? process.cwd());
+    const config = loadConfig();
+    const client = new TerminalClient(config);
+    await client.connect();
+    const fail = (resp: DaemonMessage): void => {
+      console.error(`Error: ${resp.type === "response.error" ? resp.error : `unexpected reply ${resp.type}`}`);
+      process.exitCode = 1;
+    };
+    try {
+      const ask = await client.request({ type: "worktree.trust", id: randomUUID(), dir: target, ...(o.off ? { off: true } : { dryRun: true }) });
+      if (ask.type !== "worktree.trust.result") return fail(ask);
+      if (o.off) {
+        console.log(ask.changed ? `No longer trusting the setup command of ${ask.path}.` : `${ask.path} had no trusted setup command.`);
+        return;
+      }
+      if (!ask.recipeHash) {
+        console.error(`There is no .codeoid/setup.yaml at the committed HEAD of ${ask.path}.`);
+        process.exitCode = 1;
+        return;
+      }
+      if (!ask.command) {
+        console.log(`The recipe in ${ask.path} has no setup command — nothing to trust (its copy/share steps need no trust).`);
+        return;
+      }
+      console.log(
+        [
+          `Repository: ${ask.path}`,
+          `Recipe:     .codeoid/setup.yaml at HEAD (blob ${ask.recipeHash.slice(0, 12)})`,
+          "Command:",
+          ...ask.command.split("\n").map((l) => `  ${l}`),
+          "",
+          "It runs, as you, in every new worktree codeoid creates for this repository — together with",
+          "any script it invokes from the committed tree (package.json lifecycle scripts, a Makefile, …).",
+          "Prefer a command that runs no repository scripts, e.g. `bun install --ignore-scripts`.",
+        ].join("\n"),
+      );
+      if (ask.trusted) {
+        console.log("\nAlready trusted.");
+        return;
+      }
+      if (!(await confirmOnTerminal("\nTrust this setup command? [y/N] ", o.yes))) {
+        if (process.stdin.isTTY) console.error("Not trusted.");
+        process.exitCode = 1;
+        return;
+      }
+      const res = await client.request({ type: "worktree.trust", id: randomUUID(), dir: target, recipeHash: ask.recipeHash });
+      if (res.type !== "worktree.trust.result") return fail(res);
+      console.log(`Trusted: new worktrees of ${res.path} run this setup command while the recipe stays as it is.`);
+      if (res.runCommands !== "trusted-repos") {
+        console.log("Note: worktree.setup.runCommands is \"never\" — set it to \"trusted-repos\" (Settings, or config.json) for the command to run.");
+      }
+    } finally {
+      client.disconnect();
+    }
   });
 
 // ── Outward control plane (/mcp/control — docs/mcp-control.md) ─────────────
@@ -1691,6 +1794,14 @@ pack
   .command("remove <id>")
   .description("Uninstall a pack")
   .action((id: string) => withClient((c) => c.packRemove(id)));
+
+// ── Evidence (docs/loop-engineering-design.md §7) ───────────────────────────
+
+program
+  .command("evidence <id>")
+  .description("Show one evidence record: what a check ran, on which tree, and what it found")
+  .option("--full", "Print the whole stored excerpt instead of its last 40 lines")
+  .action((id: string, opts: { full?: boolean }) => withClient((c) => c.evidenceShow(id, opts)));
 
 // ── Pipeline runs (docs/pipeline-run.md) ────────────────────────────────────
 

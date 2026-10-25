@@ -55,6 +55,20 @@ describe("secretPathVerdict", () => {
     expect(verdict({ source: join(configDir, ".env"), destination: join(workdir, "x") }, "move_file")?.action).toBe("deny");
   });
 
+  test("denies pi's logins where pi reads them, a ~ in PI_CODING_AGENT_DIR included (#417)", () => {
+    const saved = { dir: process.env.PI_CODING_AGENT_DIR, home: process.env.HOME };
+    process.env.HOME = join(root, "home");
+    process.env.PI_CODING_AGENT_DIR = "~/pi-agent";
+    try {
+      expect(verdict({ file_path: join(root, "home", "pi-agent", "auth.json") })?.action).toBe("deny");
+    } finally {
+      for (const [k, v] of [["PI_CODING_AGENT_DIR", saved.dir], ["HOME", saved.home]] as const) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  });
+
   test("denies a process environment or memory", () => {
     for (const p of ["/proc/self/environ", "/proc/1234/environ", "/proc/self/mem", "/proc/self/fd/3", "/proc/self/task/9/environ"]) {
       expect(verdict({ file_path: p })?.action).toBe("deny");

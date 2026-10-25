@@ -39,6 +39,7 @@ const COMMANDS: readonly CommandDoc[] = [
   { usage: "/rotate", desc: "Rotate context — fresh backing session, memory preserved" },
   { usage: "/mode <g|i|x>", desc: "Switch mode: guarded · interactive · autonomous" },
   { usage: "/model <id|alias> [fallback]", desc: "Switch model: opus / sonnet / haiku, or a full claude-* id" },
+  { usage: "/effort [off|minimal|low|medium|high|xhigh|max|default]", desc: "How hard the model thinks; bare /effort opens the picker" },
   { usage: "/account <name|default|--follow-default>", desc: "Switch a Claude session's account (subscription, gateway, API key)" },
   { usage: "/agents", desc: "Show subagents available to this session" },
   { usage: "/skills", desc: "Show skills available to this session" },

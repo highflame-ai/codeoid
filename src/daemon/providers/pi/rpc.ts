@@ -100,6 +100,11 @@ export class PiRpcProcess {
     return !this.#exited;
   }
 
+  /** The child's pid while it runs (process-tree kill on terminateBackend). */
+  get pid(): number | undefined {
+    return this.#exited ? undefined : this.#proc.pid;
+  }
+
   /**
    * Strict-LF line assembly. pi warns that Unicode-separator-splitting
    * readers corrupt frames — we split on `\n` only and strip a trailing

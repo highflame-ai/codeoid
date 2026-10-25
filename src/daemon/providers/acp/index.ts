@@ -38,7 +38,7 @@ import type {
   CatalogEntry,
 } from "../interface.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
-import { buildGeminiCliEnv } from "../env.js";
+import { buildGeminiCliEnv, withExtraEnv } from "../env.js";
 import { StdioJsonRpcProcess } from "../jsonrpc-stdio.js";
 import { MEMORY_MCP_SERVER_NAME, type MemoryMcpMount } from "../../memory/mcp-http.js";
 import { BLACKBOARD_MCP_SERVER_NAME } from "../../blackboard/mcp-http.js";
@@ -46,7 +46,8 @@ import type { McpServerView } from "../../mcp/registry.js";
 import { McpProxyLease, type McpProxyMount } from "../../mcp/proxy.js";
 import { resolveEnvMap } from "../../mcp/types.js";
 import type { ResolvedAccount } from "../../accounts.js";
-import { applyGeminiCliAccount } from "../../account-apply.js";
+import { applyGeminiCliAccount, applyGeminiCliEffort } from "../../account-apply.js";
+import { effortRejectionHint } from "../effort.js";
 
 export interface GeminiAcpProviderInit {
   sessionId: string;
@@ -88,6 +89,8 @@ export interface GeminiAcpProviderInit {
    */
   resolveAccount?: () => ResolvedAccount | null;
   onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
+  /** Caller env for the child process (ProviderSessionInit.extraEnv), merged last via withExtraEnv. */
+  extraEnv?: Readonly<Record<string, string>>;
 }
 
 export class GeminiAcpProvider implements SessionProvider {
@@ -98,6 +101,8 @@ export class GeminiAcpProvider implements SessionProvider {
   readonly appliesToolInputRewrite = false;
   readonly id = "gemini-cli";
   readonly displayName = "Gemini CLI (Google)";
+  /** Its thinking is a settings value, read at startup: a change rebuilds it (#417). */
+  readonly effortChange = "restart" as const;
 
   onRecoveryNeeded: ((content: string) => void) | undefined;
 
@@ -106,6 +111,7 @@ export class GeminiAcpProvider implements SessionProvider {
   #command: string;
   #argsPrefix: string[];
   #resolveAccount: (() => ResolvedAccount | null) | null;
+  readonly #extraEnv: Readonly<Record<string, string>> | undefined;
   #workspaceId: string;
   #memoryMcp: MemoryMcpMount | null;
   /** Role-scoped blackboard mount; token minted+revoked by the SessionManager. */
@@ -141,6 +147,7 @@ export class GeminiAcpProvider implements SessionProvider {
     this.#backingSessionId = init.initialBackingId;
     this.#command = init.command;
     this.#resolveAccount = init.resolveAccount ?? null;
+    this.#extraEnv = init.extraEnv;
     this.#argsPrefix = init.argsPrefix ?? [];
     this.#workspaceId = init.workspaceId ?? init.sessionId;
     this.#memoryMcp = init.memoryMcp ?? null;
@@ -213,9 +220,10 @@ export class GeminiAcpProvider implements SessionProvider {
     this.#hasQueried = true;
 
     void this.#runPrompt(opts).catch((err: unknown) => {
+      const text = err instanceof Error ? err.message : String(err);
       this.#push({
         type: "error",
-        message: `gemini-cli: ${err instanceof Error ? err.message : String(err)}`,
+        message: `gemini-cli: ${text}${opts.effort ? effortRejectionHint(text, opts.effort) : ""}`,
       });
       queue.close();
     });
@@ -242,6 +250,11 @@ export class GeminiAcpProvider implements SessionProvider {
 
   async dispose(): Promise<void> {
     await this.teardown();
+  }
+
+  async backendProcessIds(): Promise<number[]> {
+    const pid = this.#proc?.pid;
+    return pid ? [pid] : [];
   }
 
   async teardown(): Promise<void> {
@@ -310,7 +323,12 @@ export class GeminiAcpProvider implements SessionProvider {
         args: [...this.#argsPrefix, "--acp"],
         cwd: opts.workdir,
         // The account's own GEMINI_CLI_HOME (an overlay selecting its auth type).
-        env: applyGeminiCliAccount(this.#resolveAccount?.() ?? null, buildGeminiCliEnv()),
+        // ...and, for a thinking effort, an overlay of that whose settings set it (#417).
+        // Then the caller's extra env, which can't override either (withExtraEnv).
+        env: withExtraEnv(
+          applyGeminiCliEffort(opts.effort, applyGeminiCliAccount(this.#resolveAccount?.() ?? null, buildGeminiCliEnv())),
+          this.#extraEnv,
+        ),
         onNotification: (method, params) => this.#onNotification(method, params),
         onServerRequest: (method, params) => this.#onServerRequest(method, params),
         onExit: ({ code, signal, stderrTail }) => {

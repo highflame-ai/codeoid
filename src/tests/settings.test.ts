@@ -5,6 +5,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync, mkdirSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -269,6 +270,19 @@ describe("settings RPC handlers", () => {
     )) as { type: string; manifest: { tabs: unknown[] } };
     expect(ok.type).toBe("settings.schema.result");
     expect(ok.manifest.tabs.length).toBeGreaterThan(0);
+  });
+
+  it("worktree setup settings: a delegated token is refused, and a change is audited old → new", async () => {
+    const owner = auth([SCOPES.SETTINGS_WRITE, SCOPES.SETTINGS_READ]);
+    const patch = { type: "settings.set" as const, id: "w1", patches: [{ key: "worktree.setup.runCommands", value: "trusted-repos" }] };
+    const denied = await mgr().handle(patch, { ...owner, delegationDepth: 1 }, client);
+    expect(denied).toMatchObject({ type: "response.error", code: "forbidden" });
+    const ok = await mgr().handle(patch, owner, client);
+    expect(ok).toMatchObject({ type: "settings.set.result", ok: true });
+    const db = new Database(join(tmp, "codeoid.db"), { readonly: true });
+    const row = db.query("SELECT detail FROM audit_log WHERE action = 'settings.set.worktree_setup'").get() as { detail: string } | null;
+    db.close();
+    expect(row?.detail).toBe('key=worktree.setup.runCommands old="never" new="trusted-repos"');
   });
 
   it("settings.get requires settings:read and returns a snapshot", async () => {

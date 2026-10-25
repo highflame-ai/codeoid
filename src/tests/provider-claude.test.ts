@@ -38,6 +38,8 @@ let sdkInterruptThrows = false;
 let mcpStatuses: Array<Record<string, unknown>> = [];
 let mcpReconnects: string[] = [];
 let mcpReconnectError: Error | null = null;
+/** Live settings the mock query was handed (#417). */
+let flagSettings: Array<Record<string, unknown>> = [];
 
 function makeMockQuery() {
   const err = sdkThrowError;
@@ -64,6 +66,9 @@ function makeMockQuery() {
       if (mcpReconnectError) throw mcpReconnectError;
     },
     mcpServerStatus: async () => mcpStatuses,
+    applyFlagSettings: async (settings: Record<string, unknown>) => {
+      flagSettings.push(settings);
+    },
   };
 }
 
@@ -88,6 +93,8 @@ mock.module("@anthropic-ai/claude-agent-sdk", () => ({
 
 import {
   ClaudeProvider,
+  claudeCatalogEntry,
+  claudeEffortOptions,
   translateSDKMessage,
   parseMcpServerConfig,
   extractToolResultText,
@@ -110,6 +117,7 @@ import { applyAccountEnv, bedrockModel, type ResolvedClaudeAccount, type StoredC
 import { SqliteEpisodeStore } from "../daemon/memory/store.js";
 import { MEMORY_TOOL_NAMES } from "../daemon/memory/index.js";
 import type { Embedder } from "../daemon/memory/embedder.js";
+import type { EffortLevel } from "../protocol/types.js";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -317,6 +325,25 @@ describe("translateSDKMessage – result", () => {
         errorMessage: undefined,
       },
     });
+  });
+
+  it("carries the result text of a success-subtype is_error turn as resultText (where the CLI puts a limit notice)", () => {
+    const events = collectEmits({
+      type: "result",
+      subtype: "success",
+      is_error: true,
+      result: "You've hit your session limit · resets 3pm (UTC)",
+      usage: { input_tokens: 0, output_tokens: 0 },
+      modelUsage: {},
+    });
+    const result = (events[0] as { result: { resultText?: string; errorMessage?: string } }).result;
+    expect(result.resultText).toBe("You've hit your session limit · resets 3pm (UTC)");
+    expect(result.errorMessage).toBeUndefined();
+  });
+
+  it("no resultText on a turn that did not fail", () => {
+    const events = collectEmits({ type: "result", subtype: "success", result: "all done", usage: {}, modelUsage: {} });
+    expect((events[0] as { result: { resultText?: string } }).result.resultText).toBeUndefined();
   });
 
   it("sets errorMessage when subtype is not 'success' and result is set", () => {
@@ -1321,6 +1348,29 @@ describe("translateSDKMessage – system", () => {
   });
 });
 
+describe("translateSDKMessage – rate_limit_event", () => {
+  it("emits the plan limit state with resetsAt converted from epoch seconds to ms", () => {
+    const events = collectEmits({
+      type: "rate_limit_event",
+      rate_limit_info: { status: "rejected", resetsAt: 1_800_000_000, rateLimitType: "five_hour" },
+    });
+    expect(events).toEqual([{ type: "rate_limit", status: "rejected", resetsAt: 1_800_000_000_000, limitType: "five_hour" }]);
+  });
+
+  it("flags a rejection that overage is carrying", () => {
+    for (const info of [{ isUsingOverage: true }, { overageInUse: true }, { overageStatus: "allowed" }, { overageStatus: "allowed_warning" }]) {
+      const events = collectEmits({ type: "rate_limit_event", rate_limit_info: { status: "rejected", ...info } });
+      expect(events[0]).toMatchObject({ type: "rate_limit", status: "rejected", overage: true });
+    }
+    const plain = collectEmits({ type: "rate_limit_event", rate_limit_info: { status: "rejected", overageStatus: "rejected" } });
+    expect((plain[0] as { overage?: boolean }).overage).toBeUndefined();
+  });
+
+  it("emits nothing for a status it doesn't know", () => {
+    expect(collectEmits({ type: "rate_limit_event", rate_limit_info: { status: "mystery" } })).toHaveLength(0);
+  });
+});
+
 describe("translateSDKMessage – user (tool_result)", () => {
   it("emits tool_complete for each tool_result block", () => {
     const events = collectEmits({
@@ -2033,9 +2083,11 @@ describe("ClaudeProvider – Claude accounts", () => {
   function makeAccountProvider(
     current: { account: ResolvedClaudeAccount | null },
     onModels?: (models: ReadonlyArray<unknown>) => void,
+    extraEnv?: Record<string, string>,
   ): ClaudeProvider {
     return new ClaudeProvider({
       ...(onModels ? { onModels } : {}),
+      ...(extraEnv ? { extraEnv } : {}),
       sessionId: "acct-session",
       initialBackingId: "acct-backing",
       workspaceId: "ws_test",
@@ -2082,6 +2134,37 @@ describe("ClaudeProvider – Claude accounts", () => {
       else process.env.ANTHROPIC_API_KEY = saved.key;
       if (saved.url === undefined) delete process.env.ANTHROPIC_BASE_URL;
       else process.env.ANTHROPIC_BASE_URL = saved.url;
+    }
+  });
+
+  it("extraEnv reaches the CLI's env last, but never overrides the account's credential, HOME or a Node preload", async () => {
+    const saved = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "daemon-key-would-win";
+    try {
+      const current = { account: account({ name: "work", kind: "subscription", token: "sk-ant-oat01-WORK" }) };
+      const provider = makeAccountProvider(current, undefined, {
+        LOOP_RUN_ID: "run-7",
+        DATABASE_URL: "postgres://test",
+        CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-EVIL",
+        ANTHROPIC_API_KEY: "sk-evil",
+        CLAUDE_CONFIG_DIR: "/tmp/other-login",
+        HOME: "/tmp/evil-home",
+        NODE_OPTIONS: "--require /tmp/evil.js",
+      });
+      turnOn(provider, "t1");
+      const env = envOf();
+      expect(env.LOOP_RUN_ID).toBe("run-7");
+      expect(env.DATABASE_URL).toBe("postgres://test");
+      expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe("sk-ant-oat01-WORK");
+      expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+      expect(env.CLAUDE_CONFIG_DIR).not.toBe("/tmp/other-login");
+      expect(env.HOME).toBe(process.env.HOME!);
+      expect(env.NODE_OPTIONS).not.toBe("--require /tmp/evil.js");
+      openGate();
+      await provider.teardown();
+    } finally {
+      if (saved === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = saved;
     }
   });
 
@@ -2618,5 +2701,87 @@ describe("ClaudeProvider — adopting a turn the CLI starts on its own", () => {
 
     provider._emitForTest({ type: "tool_start", toolId: "t3", sdkToolUseId: "u3", name: "Bash", input: {}, approvalId: "a3" });
     expect(got.map((e) => e.type)).toEqual(["background_event", "turn_started"]);
+  });
+});
+
+// ── Thinking effort (#417) ────────────────────────────────────────────────────
+
+describe("thinking effort", () => {
+  beforeEach(() => {
+    sdkMessages = [];
+    sdkThrowError = null;
+    capturedQueryOpts = null;
+    sdkGate = null;
+    flagSettings = [];
+  });
+  const turn = (provider: ClaudeProvider, effort?: EffortLevel) =>
+    provider.runTurn({ history: [], userMessage: "hi", workdir: "/tmp", canUseTool: async () => ({ behavior: "allow" as const }), ...(effort ? { effort } : {}) });
+  const options = () => (capturedQueryOpts?.options ?? {}) as { effort?: string; thinking?: unknown };
+
+  it("rides on adaptive thinking at every level, and Off disables thinking", async () => {
+    sdkMessages = [{ type: "result", modelUsage: {} }];
+    for await (const _ of turn(makeProvider(), "xhigh").events) {
+    }
+    expect(options()).toMatchObject({ effort: "xhigh", thinking: { type: "adaptive", display: "summarized" } });
+    for await (const _ of turn(makeProvider(), "off").events) {
+    }
+    expect(options().thinking).toEqual({ type: "disabled" });
+    expect(options().effort).toBeUndefined();
+    for await (const _ of turn(makeProvider()).events) {
+    }
+    expect(options().effort).toBeUndefined(); // the default: nothing sent
+    expect(options().thinking).toEqual({ type: "adaptive", display: "summarized" });
+  });
+
+  it("changes live on a running query — but to or from Off rebuilds it before the next turn", async () => {
+    sdkMessages = [{ type: "result", modelUsage: {} }];
+    let release!: () => void;
+    sdkGate = new Promise<void>((r) => {
+      release = r;
+    });
+    const provider = makeProvider();
+    queryCallCount = 0;
+    const first = turn(provider, "high");
+    for await (const e of first.events) if (e.type === "turn_done") break;
+    expect(await provider.applyEffort("max")).toBe(true);
+    expect(flagSettings).toEqual([{ effortLevel: "max" }]);
+    // Back to the default isn't live: the SDK's live "no level" is the model's
+    // default, not the user's own Claude settings a fresh query reads.
+    expect(await provider.applyEffort(null)).toBe(false);
+    expect(await provider.applyEffort("off")).toBe(false); // fixed at construction
+    expect(flagSettings).toEqual([{ effortLevel: "max" }]);
+    // An effort the live query already runs at doesn't rebuild it...
+    void turn(provider, "max");
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    expect(queryCallCount).toBe(1);
+    // ...nor does a turn at "max"; Default does — a fresh query with no effort option.
+    const back = turn(provider);
+    for (let i = 0; i < 50 && queryCallCount < 2; i++) await Bun.sleep(2);
+    expect(queryCallCount).toBe(2);
+    expect(options().effort).toBeUndefined();
+    void back;
+    // ...Off does: a fresh query, with thinking disabled.
+    const off = turn(provider, "off");
+    for (let i = 0; i < 50 && queryCallCount < 3; i++) await Bun.sleep(2);
+    expect(queryCallCount).toBe(3);
+    expect(options().thinking).toEqual({ type: "disabled" });
+    release();
+    for await (const _ of off.events) {
+    }
+    await provider.teardown();
+  });
+
+  it("reports which levels each model takes", () => {
+    expect(claudeCatalogEntry({ value: "opus", displayName: "Opus", supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"] }).efforts).toEqual([
+      "off",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+    expect(claudeCatalogEntry({ value: "haiku", displayName: "Haiku", supportsEffort: false }).efforts).toEqual(["off"]);
+    expect(claudeCatalogEntry({ value: "x", displayName: "X" }).efforts).toBeUndefined(); // not said: unknown
+    expect(claudeEffortOptions("minimal")).toMatchObject({ effort: "low" }); // no Minimal on Claude
   });
 });

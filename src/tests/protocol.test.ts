@@ -460,6 +460,8 @@ describe("DaemonMessage routing", () => {
           return `login.wait:${msg.ok}`;
         case "skill.grant.result":
           return `skill.grant:${msg.allowed}`;
+        case "worktree.trust.result":
+          return `worktree.trust:${msg.trusted}`;
         case "session.turns.result":
           return `turns:${msg.turns.length}`;
         case "session.approvals.result":
@@ -496,6 +498,8 @@ describe("DaemonMessage routing", () => {
           return `routine.token:${msg.routineId}`;
         case "routine.preview.result":
           return `routine.preview:${msg.fires.length}`;
+        case "evidence.record":
+          return `evidence:${msg.evidence.result}`;
         case "mcp.oauth.begin.result":
           return `mcp.oauth.begin:${msg.status}`;
         case "mcp.oauth.complete.result":

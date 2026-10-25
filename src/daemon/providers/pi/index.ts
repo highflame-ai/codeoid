@@ -34,9 +34,9 @@ import type {
   TurnRun,
   UiRequestFn,
 } from "../interface.js";
-import type { ProviderCommand } from "../../../protocol/types.js";
+import { EFFORT_LEVELS, type EffortLevel, type ProviderCommand } from "../../../protocol/types.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
-import { buildPiEnv } from "../env.js";
+import { buildPiEnv, withExtraEnv } from "../env.js";
 import {
   APPROVAL_TITLE,
   type BridgeMcpTool,
@@ -53,7 +53,7 @@ import type { McpHub } from "../../mcp/hub.js";
 import { PiRpcProcess, type PiFrame } from "./rpc.js";
 import { translatePiEvent } from "./translate.js";
 import type { ResolvedAccount } from "../../accounts.js";
-import { applyPiAccount } from "../../account-apply.js";
+import { applyPiAccount, applyPiSettingsOverlay, piDefaultThinkingLevel } from "../../account-apply.js";
 
 export interface PiProviderInit {
   sessionId: string;
@@ -83,6 +83,8 @@ export interface PiProviderInit {
    */
   resolveAccount?: () => ResolvedAccount | null;
   onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
+  /** Caller env for the child process (ProviderSessionInit.extraEnv), merged last via withExtraEnv. */
+  extraEnv?: Readonly<Record<string, string>>;
 }
 
 interface PiSessionStats {
@@ -110,6 +112,7 @@ export class PiProvider implements SessionProvider {
   #backingSessionId: string;
   #command: string;
   #resolveAccount: (() => ResolvedAccount | null) | null;
+  readonly #extraEnv: Readonly<Record<string, string>> | undefined;
   #argsPrefix: string[];
   #store: Store;
   #onModels?: PiProviderInit["onModels"];
@@ -123,6 +126,9 @@ export class PiProvider implements SessionProvider {
   #bridgeReady = false;
   #hasQueried = false;
   #model: string | null = null;
+  /** pi's thinking level now (#417), and the user's own default, which Default returns to. */
+  #thinkingLevel: string | null = null;
+  #defaultThinkingLevel: string | null = null;
   /** Rendered transcript from seedFromHistory() — prepended to the next prompt. */
   #pendingHistorySeed: string | null = null;
 
@@ -141,6 +147,7 @@ export class PiProvider implements SessionProvider {
     this.#backingSessionId = init.initialBackingId;
     this.#command = init.command;
     this.#resolveAccount = init.resolveAccount ?? null;
+    this.#extraEnv = init.extraEnv;
     this.#argsPrefix = init.argsPrefix ?? [];
     this.#store = init.store;
     this.#onModels = init.onModels;
@@ -189,6 +196,11 @@ export class PiProvider implements SessionProvider {
 
   setHasQueried(value: boolean): void {
     this.#hasQueried = value;
+  }
+
+  async backendProcessIds(): Promise<number[]> {
+    const pid = this.#proc?.pid;
+    return pid ? [pid] : [];
   }
 
   async teardown(): Promise<void> {
@@ -293,6 +305,9 @@ export class PiProvider implements SessionProvider {
     if (opts.model && opts.model !== this.#model) {
       await this.#setModel(opts.model);
     }
+    // Thinking effort (#417): pi's levels are codeoid's; none = the user's own pi default.
+    const level = opts.effort ?? this.#defaultThinkingLevel;
+    if (level && level !== this.#thinkingLevel) await this.#setThinkingLevel(level);
 
     let message = opts.userMessage;
     if (this.#pendingHistorySeed) {
@@ -315,6 +330,7 @@ export class PiProvider implements SessionProvider {
     }
 
     this.#bridgeReady = false;
+    this.#thinkingLevel = null; // a new pi reports its own (get_state, below)
     this.#proc = new PiRpcProcess({
       command: this.#command,
       argsPrefix: this.#argsPrefix,
@@ -322,7 +338,9 @@ export class PiProvider implements SessionProvider {
       cwd: opts.workdir,
       // Allowlisted env (GHSA-38vh): pi gets its credentials (~/.pi via
       // HOME, provider API keys), never codeoid's own secrets.
-      env: applyPiAccount(this.#resolveAccount?.() ?? null, buildPiEnv()),
+      // pi's thinking-level writes stay in a copy of its settings (#417).
+      // Then the caller's extra env, which can't override the account (withExtraEnv).
+      env: withExtraEnv(this.#piEnv(), this.#extraEnv),
       onEvent: (frame) => this.#onFrame(frame),
       onExit: ({ code, signal, stderrTail }) => {
         this.#bridgeReady = false;
@@ -353,7 +371,8 @@ export class PiProvider implements SessionProvider {
     }
 
     const state = await this.#proc.request({ type: "get_state" });
-    const data = state.data as { sessionFile?: string; sessionId?: string } | undefined;
+    const data = state.data as { sessionFile?: string; sessionId?: string; thinkingLevel?: string } | undefined;
+    if (typeof data?.thinkingLevel === "string") this.#thinkingLevel ??= data.thinkingLevel;
     const file = data?.sessionFile;
     if (typeof file === "string" && file.length > 0 && file !== this.#backingSessionId) {
       this.#backingSessionId = file;
@@ -396,7 +415,7 @@ export class PiProvider implements SessionProvider {
     if (!Array.isArray(data?.models)) return [];
     return data.models
       .filter(
-        (m): m is { id: string; provider: string; name?: string; contextWindow?: unknown } =>
+        (m): m is { id: string; provider: string; name?: string; contextWindow?: unknown; reasoning?: unknown; thinkingLevelMap?: unknown } =>
           !!m &&
           typeof m === "object" &&
           typeof (m as { id?: unknown }).id === "string" &&
@@ -407,7 +426,35 @@ export class PiProvider implements SessionProvider {
         displayName: typeof m.name === "string" ? m.name : m.id,
         // pi's catalog entries are full pi-ai Model objects, window included.
         ...(typeof m.contextWindow === "number" && m.contextWindow > 0 ? { contextWindow: m.contextWindow } : {}),
+        efforts: piThinkingLevels(m),
       }));
+  }
+
+  /** What Default means here (#417): the user's own pi default, once read. */
+  get defaultEffort(): EffortLevel | null {
+    const l = this.#defaultThinkingLevel;
+    return l && (EFFORT_LEVELS as readonly string[]).includes(l) ? (l as EffortLevel) : null;
+  }
+
+  /** A new thinking effort on the running pi, live (#417): it takes the next request at that level. */
+  async applyEffort(effort: EffortLevel | null): Promise<boolean> {
+    const level = effort ?? this.#defaultThinkingLevel;
+    if (!this.#proc?.alive || !level) return false;
+    if (level !== this.#thinkingLevel) await this.#setThinkingLevel(level);
+    return true;
+  }
+
+  /** pi's environment: the account's, in an overlay whose settings.json is codeoid's copy. */
+  #piEnv(): Record<string, string> {
+    const env = applyPiAccount(this.#resolveAccount?.() ?? null, buildPiEnv());
+    this.#defaultThinkingLevel = piDefaultThinkingLevel(env);
+    return applyPiSettingsOverlay(env);
+  }
+
+  async #setThinkingLevel(level: string): Promise<void> {
+    const resp = await this.#proc!.request({ type: "set_thinking_level", level });
+    if (resp.success === false) throw new Error(`pi could not set thinking level "${level}": ${String(resp.error ?? "")}`);
+    this.#thinkingLevel = level;
   }
 
   async #setModel(model: string): Promise<void> {
@@ -422,6 +469,8 @@ export class PiProvider implements SessionProvider {
       throw new Error(`pi could not switch model to "${model}": ${String(resp.error ?? "")}`);
     }
     this.#model = model;
+    // pi re-applies its own (clamped) level on a model change: send ours again (#417).
+    this.#thinkingLevel = null;
   }
 
   async #fetchStats(): Promise<PiSessionStats> {
@@ -776,4 +825,20 @@ export class PiProvider implements SessionProvider {
       this.#proc?.send({ type: "extension_ui_response", id, value: response.value ?? "" });
     }
   }
+}
+
+/**
+ * The thinking levels a pi model takes (#417), as pi-ai's
+ * getSupportedThinkingLevels decides them: Off alone for a model that doesn't
+ * reason; otherwise every level but one its map marks unsupported (null), and
+ * XHigh / Max only where the map names them.
+ */
+export function piThinkingLevels(m: { reasoning?: unknown; thinkingLevelMap?: unknown }): EffortLevel[] {
+  if (m.reasoning !== true) return ["off"];
+  const map = (m.thinkingLevelMap && typeof m.thinkingLevelMap === "object" ? m.thinkingLevelMap : {}) as Record<string, unknown>;
+  return EFFORT_LEVELS.filter((level) => {
+    const mapped = map[level];
+    if (mapped === null) return false;
+    return level === "xhigh" || level === "max" ? mapped !== undefined : true;
+  });
 }

@@ -676,10 +676,12 @@ const PanelProgress: Component<{
 /** A child's position and state within the live fan-out. */
 const PanelMemberBadge: Component<{
   ordinal: number;
-  status: "queued" | "claimed" | "running" | "done" | "failed" | "blocked";
+  status: "queued" | "claimed" | "running" | "held" | "done" | "failed" | "blocked";
 }> = (props) => {
   const look = () => {
     switch (props.status) {
+      case "held":
+        return { cls: "border-warn/50 bg-warn/10 text-warn", note: "waiting on you" };
       case "running":
       case "claimed":
         return { cls: "border-warn/50 bg-warn/10 text-warn animate-pulse", note: "working" };

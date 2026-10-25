@@ -19,7 +19,7 @@
 
 import { z } from "zod";
 import type { AuthMsg, ClientMessage } from "./types.js";
-import { LIMITS } from "./types.js";
+import { EFFORT_LEVELS, LIMITS } from "./types.js";
 
 // ── Shared field schemas ──────────────────────────────────────────────────────
 
@@ -127,6 +127,8 @@ export const sessionCreateSchema = z.object({
    * daemon can answer with a specific error, same rule as `providerId`.
    */
   model: z.string().min(1).max(LIMITS.MODEL_MAX).optional(),
+  /** Thinking effort (#417). */
+  effort: z.enum(EFFORT_LEVELS).nullable().optional(),
   /**
    * Activate an installed SDLC pack on this session (ambient mode —
    * docs/pack-loading.md): its constitution is injected into the system
@@ -327,6 +329,13 @@ export const sessionSetModelSchema = z.object({
   sessionId: sessionIdField,
   model: z.string().min(1).max(LIMITS.MODEL_MAX),
   fallbackModel: z.string().max(LIMITS.MODEL_MAX).nullable().optional(),
+});
+
+export const sessionSetEffortSchema = z.object({
+  ...base,
+  type: z.literal("session.set_effort"),
+  sessionId: sessionIdField,
+  effort: z.enum(EFFORT_LEVELS).nullable(),
 });
 
 export const sessionForkSchema = z.object({
@@ -840,6 +849,10 @@ const routinePatchSchema = z.object(
   },
 );
 
+// ── Evidence (docs/loop-engineering-design.md §7) ─────────────────────────────
+
+export const evidenceGetSchema = z.object({ ...base, type: z.literal("evidence.get"), evidenceId: idField });
+
 export const routineCreateSchema = z.object({ ...base, type: z.literal("routine.create"), spec: routineSpecSchema });
 export const routineUpdateSchema = z.object({
   ...base,
@@ -887,6 +900,18 @@ export const compareKeepSchema = z.object({
   compareId: z.string().min(1).max(128),
   sessionId: sessionIdField,
   discardOthers: z.boolean().optional(),
+});
+
+export const worktreeTrustSchema = z.object({
+  ...base,
+  type: z.literal("worktree.trust"),
+  dir: pathField.min(1),
+  dryRun: z.boolean().optional(),
+  off: z.boolean().optional(),
+  recipeHash: z
+    .string()
+    .regex(/^[0-9a-f]{40,64}$/)
+    .optional(),
 });
 
 export const skillGrantSchema = z.object({
@@ -1091,6 +1116,7 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   sessionRotateSchema,
   sessionSearchSchema,
   sessionSetModelSchema,
+  sessionSetEffortSchema,
   sessionSetProviderSchema,
   sessionMcpReconnectSchema,
   sessionMcpRefreshSchema,
@@ -1117,6 +1143,7 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   backendLoginCancelSchema,
   backendLoginWaitSchema,
   skillGrantSchema,
+  worktreeTrustSchema,
   sessionTurnsSchema,
   sessionApprovalsSchema,
   claudeAccountsListSchema,
@@ -1147,6 +1174,7 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   routineRunsSchema,
   routineTokenSchema,
   routinePreviewSchema,
+  evidenceGetSchema,
   compareListSchema,
   compareKeepSchema,
   mcpOAuthBeginSchema,

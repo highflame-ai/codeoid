@@ -65,9 +65,9 @@ import type {
 } from "../interface.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
 import { type ResponsesItem, toResponsesItems } from "./native-history.js";
-import { buildCodexEnv } from "../env.js";
+import { buildCodexEnv, withExtraEnv } from "../env.js";
 import { CodexRpcProcess } from "./rpc.js";
-import type { SessionMode } from "../../../protocol/types.js";
+import { EFFORT_LEVELS, type EffortLevel, type SessionMode } from "../../../protocol/types.js";
 import { MEMORY_MCP_SERVER_NAME, MEMORY_MCP_TOKEN_ENV, type MemoryMcpMount } from "../../memory/mcp-http.js";
 import {
   BLACKBOARD_MCP_SERVER_NAME,
@@ -130,6 +130,8 @@ export interface CodexProviderInit {
    */
   resolveAccount?: () => ResolvedAccount | null;
   onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
+  /** Caller env for the child process (ProviderSessionInit.extraEnv), merged last via withExtraEnv. */
+  extraEnv?: Readonly<Record<string, string>>;
 }
 
 /** Item types that surface as tool records (vs text/reasoning streams). */
@@ -265,12 +267,52 @@ export function describeCodexError(params: Record<string, unknown>): string {
   }
 }
 
+/**
+ * The structured half of a codex `error` notification, for the usage-limit
+ * classifier: the v2 `TurnError.codexErrorInfo` variant (`usageLimitExceeded`,
+ * `rateLimitExceeded`, `httpConnectionFailed { httpStatusCode }`, … — codex-rs
+ * 0.154.0 app-server protocol) and the limit's reset instant when it carries
+ * one (`resets_at` / `resetsAt`, epoch seconds or ms). The info is a bare
+ * string for a unit variant and `{ variant: { …fields } }` otherwise.
+ * Undefined when the notification has no error info. describeCodexError keeps
+ * producing the display text; this never reaches the user.
+ */
+export function codexErrorDetail(params: Record<string, unknown>): Record<string, unknown> | undefined {
+  const err = params.error && typeof params.error === "object" ? (params.error as Record<string, unknown>) : undefined;
+  const info = err?.codexErrorInfo ?? params.codexErrorInfo;
+  let variant: string | undefined;
+  let fields: Record<string, unknown> = {};
+  if (typeof info === "string") variant = info;
+  else if (info && typeof info === "object") {
+    const [name, value] = Object.entries(info as Record<string, unknown>)[0] ?? [];
+    variant = name;
+    if (value && typeof value === "object") fields = value as Record<string, unknown>;
+  }
+  if (!variant) return undefined;
+  const data = err?.data && typeof err.data === "object" ? (err.data as Record<string, unknown>) : {};
+  const reset = [fields.resetsAt, fields.resets_at, err?.resetsAt, err?.resets_at, data.resetsAt, data.resets_at].find(
+    (v): v is number => typeof v === "number" && v > 0,
+  );
+  const status = fields.httpStatusCode;
+  return {
+    codexErrorInfo: variant,
+    ...(reset !== undefined ? { resetsAt: reset } : {}),
+    ...(typeof status === "number" ? { status } : {}),
+  };
+}
+
 export class CodexProvider implements SessionProvider {
   /**
    * codex's approval replies carry only a decision (`approved` / `accept`) —
    * codex runs the input IT proposed, so a rewrite can't apply (#367).
    */
   readonly appliesToolInputRewrite = false;
+  /**
+   * Autonomous mode is `approvalPolicy: "never"` (approvalPolicyForMode): codex
+   * runs commands and patches without an approval request, so codeoid's tool
+   * budget never sees them.
+   */
+  readonly enforcesToolBudget = false;
   readonly id = "codex";
   readonly displayName = "Codex (OpenAI)";
 
@@ -282,6 +324,7 @@ export class CodexProvider implements SessionProvider {
   #command: string;
   #argsPrefix: string[];
   #resolveAccount: (() => ResolvedAccount | null) | null;
+  readonly #extraEnv: Readonly<Record<string, string>> | undefined;
   #onModels?: CodexProviderInit["onModels"];
   #workspaceId: string;
   #memoryMcp: MemoryMcpMount | null;
@@ -293,6 +336,16 @@ export class CodexProvider implements SessionProvider {
 
   #proc: CodexRpcProcess | null = null;
   #threadId: string | null = null;
+  /** Each model's default effort from model/list, the model the thread runs, and the
+   *  user's own configured effort (config/read) — what Default sends (#417). */
+  readonly #modelDefaultEffort = new Map<string, string>();
+  /** Each model's efforts on codeoid's scale, from model/list. */
+  readonly #modelEfforts = new Map<string, EffortLevel[]>();
+  #threadModel: string | null = null;
+  #configEffort: string | null | undefined = undefined;
+  /** The baseline last worked out, for the session's pickers. */
+  #defaultEffort: string | null = null;
+  #modelListTried = false;
   #hasQueried = false;
   #modelsReported = false;
   #pendingHistorySeed: string | null = null;
@@ -364,6 +417,7 @@ export class CodexProvider implements SessionProvider {
     this.#backingSessionId = init.initialBackingId;
     this.#command = init.command;
     this.#resolveAccount = init.resolveAccount ?? null;
+    this.#extraEnv = init.extraEnv;
     this.#argsPrefix = init.argsPrefix ?? [];
     this.#onModels = init.onModels;
     this.#workspaceId = init.workspaceId ?? init.sessionId;
@@ -463,12 +517,16 @@ export class CodexProvider implements SessionProvider {
           // Don't stream the whole thread back over stdio; only its id is used.
           excludeTurns: true,
           ...config,
-        })) as { thread?: { id?: string } };
+        })) as { thread?: { id?: string }; model?: string };
         if (!forked.thread?.id) throw new Error("thread/fork returned no thread id");
+        this.#threadModel = forked.model ?? null;
+        this.#configEffort = undefined;
         return forked.thread.id;
       }
-      const started = (await this.#proc.request("thread/start", config)) as { thread?: { id?: string } };
+      const started = (await this.#proc.request("thread/start", config)) as { thread?: { id?: string }; model?: string };
       if (!started.thread?.id) throw new Error("thread/start returned no thread id");
+      this.#threadModel = started.model ?? null;
+      this.#configEffort = undefined;
       await this.#proc.request("thread/inject_items", { threadId: started.thread.id, items: pending.items });
       return started.thread.id;
     } catch (err) {
@@ -644,15 +702,44 @@ export class CodexProvider implements SessionProvider {
     if (!this.#proc?.alive) return [];
     try {
       const result = (await this.#proc.request("model/list", {})) as {
-        data?: Array<{ id?: string; model?: string; displayName?: string; description?: string }>;
+        data?: Array<{
+          id?: string;
+          model?: string;
+          displayName?: string;
+          description?: string;
+          supportedReasoningEfforts?: Array<{ reasoningEffort?: string }>;
+          defaultReasoningEffort?: string;
+          isDefault?: boolean;
+        }>;
       };
+      // Each model's own default effort — what Default falls back to (#417).
+      for (const m of result.data ?? []) {
+        const id = m.model ?? m.id;
+        if (typeof id === "string" && typeof m.defaultReasoningEffort === "string") this.#modelDefaultEffort.set(id, m.defaultReasoningEffort);
+        if (typeof id === "string" && Array.isArray(m.supportedReasoningEfforts)) {
+          this.#modelEfforts.set(
+            id,
+            m.supportedReasoningEfforts.map((e) => fromCodexEffort(e?.reasoningEffort)).filter((e): e is EffortLevel => e !== null),
+          );
+        }
+      }
       return (result.data ?? [])
         .filter((m) => typeof (m.model ?? m.id) === "string")
-        .map((m) => ({
-          id: (m.model ?? m.id) as string,
-          displayName: m.displayName ?? ((m.model ?? m.id) as string),
-          description: m.description,
-        }));
+        .map((m) => {
+          // The efforts it takes (#417), on codeoid's scale — codex's "none" is Off.
+          const efforts = Array.isArray(m.supportedReasoningEfforts)
+            ? m.supportedReasoningEfforts.map((e) => fromCodexEffort(e?.reasoningEffort)).filter((e): e is EffortLevel => e !== null)
+            : undefined;
+          const defaultEffort = fromCodexEffort(m.defaultReasoningEffort);
+          return {
+            id: (m.model ?? m.id) as string,
+            displayName: m.displayName ?? ((m.model ?? m.id) as string),
+            description: m.description,
+            ...(efforts ? { efforts } : {}),
+            ...(defaultEffort ? { defaultEffort } : {}),
+            ...(m.isDefault === true ? { isDefault: true } : {}),
+          };
+        });
     } catch {
       return [];
     }
@@ -660,6 +747,11 @@ export class CodexProvider implements SessionProvider {
 
   async dispose(): Promise<void> {
     await this.teardown();
+  }
+
+  async backendProcessIds(): Promise<number[]> {
+    const pid = this.#proc?.pid;
+    return pid ? [pid] : [];
   }
 
   async teardown(): Promise<void> {
@@ -677,6 +769,49 @@ export class CodexProvider implements SessionProvider {
   }
 
   // ── Internal ──────────────────────────────────────────────────────────
+
+  /** What Default means here now (#417): the effort codex would use unasked, once worked out. */
+  get defaultEffort(): EffortLevel | null {
+    return fromCodexEffort(this.#defaultEffort ?? undefined);
+  }
+
+  /** The model the thread runs (codex's configured one, project config included), once known. */
+  get runningModel(): string | null {
+    return this.#threadModel;
+  }
+
+  /** turn/start's effort (#417): the session's, else what codex would use unasked — or nothing when that can't be known. */
+  async #effortParam(opts: TurnOpts): Promise<{ effort?: string }> {
+    const baseline = await this.#baselineEffort(opts);
+    this.#defaultEffort = baseline;
+    if (opts.effort) return { effort: toCodexEffort(opts.effort) };
+    return baseline ? { effort: baseline } : {};
+  }
+
+  /**
+   * The effort codex itself uses unasked: the configured one (project layers
+   * included) for a model that takes it, else the running model's own — the
+   * same rule the catalog shows.
+   */
+  async #baselineEffort(opts: TurnOpts): Promise<string | null> {
+    if (this.#configEffort === undefined) {
+      try {
+        const read = (await this.#proc!.request("config/read", { cwd: opts.workdir })) as { config?: { model_reasoning_effort?: string | null } };
+        this.#configEffort = read.config?.model_reasoning_effort ?? null;
+      } catch {
+        // Unknown this time; asked again next turn.
+      }
+    }
+    const model = opts.model ?? this.#threadModel;
+    if (model && !this.#modelDefaultEffort.has(model) && !this.#modelEfforts.has(model) && !this.#modelListTried) {
+      this.#modelListTried = true; // once: a model the list doesn't carry stays unknown
+      await this.listModels();
+    }
+    const takes = model ? this.#modelEfforts.get(model) : undefined;
+    const configured = fromCodexEffort(this.#configEffort ?? undefined);
+    if (this.#configEffort && (!takes || (configured !== null && takes.includes(configured)))) return this.#configEffort;
+    return (model && this.#modelDefaultEffort.get(model)) || null;
+  }
 
   async #startTurn(opts: TurnOpts): Promise<void> {
     await this.#ensureThread(opts);
@@ -697,7 +832,15 @@ export class CodexProvider implements SessionProvider {
       approvalPolicy,
       sandboxPolicy: sandboxPolicyWire(sandboxMode, opts.workdir),
       ...(opts.model ? { model: opts.model } : {}),
+      // Thinking effort (#417). codex keeps a turn's effort for the turns
+      // after it (a resumed thread too), and null there means "no override" —
+      // so Default is sent as the effort codex itself would use: the user's
+      // configured one, else the running model's own default (the same
+      // value codex picks unasked; sending it resets an earlier override).
+      ...(await this.#effortParam(opts)),
     })) as { turn?: { id?: string } };
+    // codex keeps a turn's model for the turns after it: Default's baseline follows it.
+    if (opts.model) this.#threadModel = opts.model;
     this.#currentTurnId = result.turn?.id ?? null;
   }
 
@@ -727,10 +870,15 @@ export class CodexProvider implements SessionProvider {
         cwd: opts.workdir,
         // The account's own CODEX_HOME (an overlay sharing everything but its
         // auth.json), applied last so nothing re-adds a daemon key.
-        env: await applyCodexAccount(
-          this.#resolveAccount?.() ?? null,
-          { ...buildCodexEnv(), ...mcp.env, ...bb.env, ...reg.env, ...oauth.env },
-          { command: this.#command, argsPrefix: this.#argsPrefix },
+        // The caller's extra env goes on last (withExtraEnv refuses anything
+        // credential- or home-shaped, so the account stays the account).
+        env: withExtraEnv(
+          await applyCodexAccount(
+            this.#resolveAccount?.() ?? null,
+            { ...buildCodexEnv(), ...mcp.env, ...bb.env, ...reg.env, ...oauth.env },
+            { command: this.#command, argsPrefix: this.#argsPrefix },
+          ),
+          this.#extraEnv,
         ),
         onNotification: (method, params) => this.#onNotification(method, params),
         onServerRequest: (method, params) => this.#onServerRequest(method, params),
@@ -767,9 +915,11 @@ export class CodexProvider implements SessionProvider {
       try {
         const resumed = (await this.#proc.request("thread/resume", {
           threadId: this.#backingSessionId,
-        })) as { thread?: { id?: string } };
+        })) as { thread?: { id?: string }; model?: string };
         if (resumed.thread?.id) {
           this.#threadId = resumed.thread.id;
+          this.#threadModel = resumed.model ?? null;
+          this.#configEffort = undefined;
           return;
         }
       } catch {
@@ -785,8 +935,11 @@ export class CodexProvider implements SessionProvider {
         this.onHistoryLost?.();
       }
     }
-    const started = (await this.#proc.request("thread/start", threadConfig(opts))) as { thread?: { id?: string } };
+    const started = (await this.#proc.request("thread/start", threadConfig(opts))) as { thread?: { id?: string }; model?: string };
     if (!started.thread?.id) throw new Error("codex thread/start returned no thread id");
+    this.#threadModel = started.model ?? null;
+    // codex reads its config afresh for each thread; so does Default's baseline.
+    this.#configEffort = undefined;
     this.#adoptThread(started.thread.id);
     await this.#reportModelsOnce();
   }
@@ -813,10 +966,38 @@ export class CodexProvider implements SessionProvider {
 
   async #reportModelsOnce(): Promise<void> {
     if (this.#modelsReported || !this.#onModels) return;
-    const models = await this.listModels();
+    const listed = await this.listModels();
+    // The model codex runs when none is chosen (#417): the user's configured
+    // one, else its catalog's default — so a picker shows that model's levels.
+    // A configured effort is what Default sends for every model: shown as theirs.
+    let configured: string | null = null;
+    let configuredEffort: EffortLevel | null = null;
+    try {
+      const read = (await this.#proc!.request("config/read", {})) as { config?: { model?: string | null; model_reasoning_effort?: string | null } };
+      configured = read.config?.model ?? null;
+      configuredEffort = fromCodexEffort(read.config?.model_reasoning_effort ?? undefined);
+    } catch {
+      // Unknown: the catalog's own default stands.
+    }
+    // A configured model the catalog doesn't list: no row is the one codex runs.
+    const models = listed.map((m) => ({
+      ...m,
+      isDefault: configured ? m.id === configured : m.isDefault === true,
+      // ...for a model that takes it (one that doesn't: codex adjusts; its own default is the best guess).
+      ...(configuredEffort && (!m.efforts || m.efforts.includes(configuredEffort)) ? { defaultEffort: configuredEffort } : {}),
+    }));
     if (models.length > 0) {
       this.#modelsReported = true;
-      this.#onModels(models.map((m) => ({ value: m.id, displayName: m.displayName, description: m.description })));
+      this.#onModels(
+        models.map((m) => ({
+          value: m.id,
+          displayName: m.displayName,
+          description: m.description,
+          ...(m.efforts ? { efforts: m.efforts } : {}),
+          ...(m.defaultEffort ? { defaultEffort: m.defaultEffort } : {}),
+          ...(m.isDefault ? { isDefault: true } : {}),
+        })),
+      );
     }
   }
 
@@ -1040,7 +1221,8 @@ export class CodexProvider implements SessionProvider {
         // the literal "[object Object]" — the cause destroyed at the one place
         // it was supposed to be reported. Observed live: a role-child failed
         // twice with `Error: [object Object]` and nothing anywhere said why.
-        this.#push({ type: "error", message: `codex: ${describeCodexError(params)}` });
+        const detail = codexErrorDetail(params);
+        this.#push({ type: "error", message: `codex: ${describeCodexError(params)}`, ...(detail ? { detail } : {}) });
         break;
       }
       default:
@@ -1352,4 +1534,15 @@ function codexItemToTool(
 function extractItemOutput(item: Record<string, unknown>): string {
   const out = item.aggregatedOutput ?? item.output ?? item.result ?? item.text ?? "";
   return typeof out === "string" ? out : JSON.stringify(out);
+}
+
+/** codeoid's effort scale in codex's terms (#417): Off is its "none"; the rest share names. */
+export function toCodexEffort(effort: EffortLevel): string {
+  return effort === "off" ? "none" : effort;
+}
+
+/** A codex reasoning effort on codeoid's scale, or null for one codeoid has no level for. */
+export function fromCodexEffort(effort: string | undefined): EffortLevel | null {
+  if (effort === "none") return "off";
+  return effort && (EFFORT_LEVELS as readonly string[]).includes(effort) ? (effort as EffortLevel) : null;
 }

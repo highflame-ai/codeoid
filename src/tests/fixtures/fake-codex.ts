@@ -37,6 +37,8 @@ const pendingServerReqs = new Map<number, (result: Record<string, unknown>) => v
  *  the "echo-policy" prompt so the provider's wire params can be asserted. */
 let lastThreadPolicies: Record<string, unknown> = {};
 let lastTurnPolicies: Record<string, unknown> = {};
+/** turn/start's `effort` (#417), echoed by "echo-effort". */
+let lastTurnEffort: unknown = "(absent)";
 /** thread/fork and thread/inject_items calls, in order — echoed by "echo-native" (#387). */
 const nativeCalls: Array<{ method: string; params: Record<string, unknown> }> = [];
 
@@ -310,6 +312,8 @@ async function runTurn(threadId: string, prompt: string): Promise<void> {
     const resp = await serverRequest("custom/unknownThing", { anything: true });
     const text = resp.__error ? "server-request-errored" : "server-request-oddly-ok";
     send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text } } });
+  } else if (prompt.includes("echo-effort")) {
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: JSON.stringify({ effort: lastTurnEffort }) } } });
   } else if (prompt.includes("echo-policy")) {
     const text = JSON.stringify({ thread: lastThreadPolicies, turn: lastTurnPolicies });
     send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text } } });
@@ -325,6 +329,9 @@ async function runTurn(threadId: string, prompt: string): Promise<void> {
       argv: process.argv,
     });
     send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text } } });
+  } else if (prompt.includes("echo-env")) {
+    // The environment the provider spawned us with (extraEnv wiring).
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: JSON.stringify(process.env) } } });
   } else if (prompt.includes("echo-native")) {
     send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: JSON.stringify(nativeCalls) } } });
   } else if (prompt.includes("echo-prompt")) {
@@ -390,7 +397,7 @@ async function handle(frame: Record<string, unknown>): Promise<void> {
       const bad = sandboxPolicyError(params.sandboxPolicy);
       if (bad) return void send({ id, error: { code: -32602, message: bad } });
       lastThreadPolicies = { approvalPolicy: params.approvalPolicy, sandboxPolicy: params.sandboxPolicy };
-      send({ id, result: { thread: { id: "codex-thread-1" } } });
+      send({ id, result: { thread: { id: "codex-thread-1" }, model: "gpt-5.6-terra" } });
       send({ method: "thread/started", params: { thread: { id: "codex-thread-1" } } });
       break;
     }
@@ -416,12 +423,35 @@ async function handle(frame: Record<string, unknown>): Promise<void> {
       }
       send({ id, result: { thread: { id: String(params.threadId ?? "codex-thread-1") } } });
       break;
+    case "config/read":
+      // The user's configured effort (#417), set by the test through the env.
+      send({
+        id,
+        result: {
+          // A project layer (read only with a cwd, as codex does) outranks the user's.
+          config: {
+            model_reasoning_effort: (params.cwd ? process.env.CODEX_FAKE_PROJECT_EFFORT : undefined) || process.env.CODEX_FAKE_CONFIG_EFFORT || null,
+            model: process.env.CODEX_FAKE_CONFIG_MODEL || null,
+          },
+          origins: {},
+          layers: null,
+        },
+      });
+      break;
     case "model/list":
       send({
         id,
         result: {
           data: [
-            { id: "gpt-5.6-terra", model: "gpt-5.6-terra", displayName: "GPT-5.6-Terra", description: "Balanced agentic coding model." },
+            {
+              id: "gpt-5.6-terra",
+              model: "gpt-5.6-terra",
+              displayName: "GPT-5.6-Terra",
+              description: "Balanced agentic coding model.",
+              supportedReasoningEfforts: [{ reasoningEffort: "none" }, { reasoningEffort: "low" }, { reasoningEffort: "high" }, { reasoningEffort: "ultra" }],
+              defaultReasoningEffort: "low",
+              ...(process.env.CODEX_FAKE_LIST_DEFAULT ? { isDefault: true } : {}),
+            },
           ],
         },
       });
@@ -430,6 +460,7 @@ async function handle(frame: Record<string, unknown>): Promise<void> {
       const bad = sandboxPolicyError(params.sandboxPolicy);
       if (bad) return void send({ id, error: { code: -32602, message: bad } });
       lastTurnPolicies = { approvalPolicy: params.approvalPolicy, sandboxPolicy: params.sandboxPolicy };
+      lastTurnEffort = "effort" in params ? params.effort : "(absent)";
       send({ id, result: { turn: { id: "turn-1" } } });
       const input = params.input as Array<{ type: string; text?: string }> | undefined;
       const prompt = input?.find((i) => i.type === "text")?.text ?? "";

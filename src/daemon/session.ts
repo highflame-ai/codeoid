@@ -20,6 +20,9 @@ import {
   type HistorySeedResult,
 } from "./providers/canonical.js";
 import { targetContextWindow, seedBudgetChars, isPromptTooLongError } from "./providers/context-windows.js";
+import { classifyCliNotice, classifyUsageLimit, type UsageLimitKind } from "./providers/usage-limit.js";
+import { extraEnvViolations } from "./providers/env.js";
+import { killSurvivors, snapshotTree, type ProcessEntry } from "./process-tree.js";
 import { CONDUCTOR_SYSTEM_PROMPT_APPEND, isFleetSendTool } from "./fleet.js";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import {
@@ -39,6 +42,7 @@ import {
   type TurnOpts,
   type CatalogEntry,
   isPlaceholderModel,
+  BUDGET_STOP_MESSAGE,
 } from "./providers/interface.js";
 import { createDefaultProviderRegistry, type ProviderRegistry } from "./providers/registry.js";
 import { selectContextStrategy, renderSessionMap, renderRotationSeed, type ContextStrategy } from "./providers/context-strategy.js";
@@ -72,6 +76,14 @@ import { realpathSync } from "node:fs";
 import { lstat, readdir } from "node:fs/promises";
 import { removeForkWorktree } from "./git-worktree.js";
 import {
+  describeSetupResult,
+  prepareWorktree,
+  type RecipeRead,
+  setupEvent,
+  type WorktreeSetupPolicy,
+  type WorktreeSetupResult,
+} from "./workspace-setup.js";
+import {
   copyCheckpoints,
   createCheckpoint,
   currentTree,
@@ -85,7 +97,8 @@ import {
   restoreTree,
 } from "./checkpoints.js";
 import { applyRewinds, REWIND_EVENT, type TurnIndexEntry } from "./transcript.js";
-import type { RewindFiles, RewindIrreversible, TurnSummary } from "../protocol/types.js";
+import type { EffortChangeResult, EffortLevel, RewindFiles, RewindIrreversible, TurnSummary } from "../protocol/types.js";
+import { LIMITS } from "../protocol/types.js";
 import { hasScope, SCOPES } from "../protocol/scopes.js";
 import type { PendingToolApproval, SessionApproveOutcome } from "../protocol/types.js";
 import { execFile } from "node:child_process";
@@ -100,6 +113,9 @@ const FORK_SETUP_TIMEOUT_MS = 600_000;
  * the overflow is surfaced as an error.
  */
 const SEED_OVERFLOW_MAX_RETRIES = 3;
+
+/** How long a hard stop (stall recovery, terminateBackend) waits for the backend's teardown. */
+const HARD_STOP_TEARDOWN_MS = 10_000;
 import {
   authToIdentity,
   CAPABILITIES,
@@ -201,6 +217,19 @@ const CANCEL_REASON: Record<SessionUiResolvedMsg["reason"], NonNullable<UiRespon
   interrupted: "interrupted",
 };
 
+/** A person (or their token), as opposed to a daemon principal (`system:dispatch`, `system:routines`, …). */
+function isPersonSender(sender: AuthContext): boolean {
+  return !sender.sub.startsWith("system:");
+}
+
+/** The text of a turn failure source: an Error's message, a string, or an error object's `message`. */
+function failureText(source: unknown): string {
+  if (source instanceof Error) return source.message;
+  if (typeof source === "string") return source;
+  const message = (source as { message?: unknown } | null)?.message;
+  return typeof message === "string" ? message : String(source);
+}
+
 /**
  * A task digest as it sits inside the wake's <background_tasks> block. The
  * digest is sub-agent output, which tool content can steer, so it must not be
@@ -274,6 +303,23 @@ export interface AttachedClient {
    * matching capability. Absent = legacy client (no capabilities).
    */
   capabilities?: readonly string[];
+}
+
+/**
+ * A failed turn the backend blamed on a usage or rate limit (classifyUsageLimit)
+ * rather than on the work — the infrastructure error a loop controller records
+ * without spending an attempt (loop design §12.11). Epoch milliseconds.
+ */
+export interface TurnInfraError {
+  kind: UsageLimitKind;
+  /** When the limit is expected to lift, if the backend said. */
+  resetAt?: number;
+  /** The backend's error text, as the turn reported it. */
+  message: string;
+  /** The backend the turn ran on (the session's provider id at the time). */
+  provider: string;
+  /** When the failure was recorded. */
+  at: number;
 }
 
 /** Where a context window was observed; the manager scopes what it remembers
@@ -421,6 +467,11 @@ export interface SessionCreateOptions {
    */
   defaultModel?: string;
   /**
+   * Thinking effort chosen at creation (#417): outranks
+   * config.session.defaultEffort, and is kept with the session.
+   */
+  effort?: EffortLevel | null;
+  /**
    * Observe every status transition of this session. The dispatcher uses
    * this to detect a worker's turn completing (→ idle/error) or wedging
    * (→ waiting_approval) without polling. Called AFTER the transition is
@@ -441,6 +492,42 @@ export interface SessionCreateOptions {
    * approval — which the dispatcher detects as a wedge.
    */
   initialMode?: { mode: SessionMode; maxTurns?: number };
+  /**
+   * What happens when the autonomous tool budget runs out (loop design §6).
+   *
+   * - `"park"` (default, today's behavior): the mode reverts to guarded and
+   *   the next write/exec call waits for approval — the dispatcher sees the
+   *   session wedge at waiting_approval.
+   * - `"end_attempt"`: for an unattended worker whose controller owns the
+   *   next step. The call that finds the budget spent is DENIED with a clear
+   *   message, the turn is interrupted, background tasks are stopped where the
+   *   backend can, the session settles idle (never waiting_approval for that
+   *   call), the mode reverts to guarded, and `budgetExhausted` reads true.
+   *   Until a new autonomous budget is set (setMode), EVERY tool call is
+   *   denied and ends its turn — including later prompts and turns the
+   *   backend starts on its own. Only enforceable where `toolBudgetEnforced`
+   *   (not codex); elsewhere a warning is logged and wall time must bound it.
+   */
+  onBudgetExhausted?: "park" | "end_attempt";
+  /**
+   * Extra environment for the backend's child process — every process-backed
+   * provider (Claude Code CLI, codex, gemini-cli, pi, qwen-code). Merged after
+   * codeoid builds the backend's env, but a key in codeoid's credential /
+   * account-isolation / code-loading denylist (`extraEnvViolations`,
+   * providers/env.ts), or any name that isn't `^[A-Z][A-Z0-9_]{0,63}$`, is
+   * refused: the constructor throws, so a misconfigured caller learns at once.
+   *
+   * DAEMON-CONTROLLED ONLY. The denylist is a backstop, not an authorization:
+   * a name a user (or a contract, or an agent) supplies must first pass an
+   * explicit allowlist the daemon owns — a later slice binds it to the trusted
+   * setup recipe's declared `resources.env`. Never forward client input here.
+   * No effect on in-process backends (openai, gemini, llama.cpp, endpoints).
+   * Held in memory only, by design — never persisted (it can carry a run's
+   * secrets-adjacent settings, and a stale copy must not outlive the run). A
+   * session restored after a daemon restart has none: the loop controller
+   * re-supplies it when it re-arms the worker during restart reconciliation.
+   */
+  extraEnv?: Readonly<Record<string, string>>;
   /**
    * Native spend ceiling for this session's backend query (TurnOpts.maxBudgetUsd).
    * Routines set it on a fresh run session, whose query lifetime is the run.
@@ -682,8 +769,14 @@ export class Session {
   #pack?: PackActivation;
   /** Fork lineage (set from opts / restored from meta). */
   readonly forkedFrom?: { sessionId: string; name: string; atTurn: number };
-  /** Git worktree backing workdir, when isolated (set from opts / meta). */
-  readonly worktree?: SessionWorktree;
+  /**
+   * Git worktree backing workdir, when isolated (set from opts / meta).
+   * Mutable only to record what its setup recipe put in it.
+   */
+  #worktree?: SessionWorktree;
+  get worktree(): SessionWorktree | undefined {
+    return this.#worktree;
+  }
   /**
    * Goal + role→backend bindings when this session was created with the
    * Collaborative toggle (set from opts / restored from meta). Readonly: the
@@ -899,6 +992,9 @@ export class Session {
    *  enough in the prompt; live memory is via the recall/timeline tools. */
   #frozenMemoryIndex: string | null = null;
   #workspaceId: string;
+  /** Owner recorded for #workspaceId in the memory store (#415). */
+  #workspaceTenant!: { accountId: string; projectId: string };
+  #workspaceRegistered = false;
 
   #config?: CodeoidConfig;
 
@@ -909,6 +1005,14 @@ export class Session {
   // effect on the NEXT send() (current stream is torn down on change).
   #model: string | null = null;
   #fallbackModel: string | null = null;
+  /** Thinking effort (#417), on codeoid's scale; null = the backend's default. Kept across a backend switch. */
+  #effort: EffortLevel | null = null;
+  /** A backend whose effort is a startup setting (the Gemini CLI) is rebuilt between turns, once no work is running. */
+  #effortRestartPending = false;
+  /** The effort the backend was last handed (#417); undefined before the first turn. */
+  #effortSent: EffortLevel | null | undefined = undefined;
+  /** The last turn kept the old effort for background work: its change is announced when it lands. */
+  #effortHeld = false;
 
   // ── Auto-rotation (Layer D) ────────────────────────────────────────────
   // Claude Code's backing session id — distinct from codeoid's public
@@ -964,6 +1068,27 @@ export class Session {
   #collaborationCost?: () => CollaborationCost | undefined;
   #workerShape?: "ship" | "scout";
   #turnsRemaining: number | undefined = undefined;
+  /** See SessionCreateOptions.onBudgetExhausted. */
+  #onBudgetExhausted: "park" | "end_attempt" = "park";
+  /**
+   * end_attempt only: the autonomous budget ran out. While set, EVERY tool
+   * call is denied — in the turn it ran out in, a later prompted turn, or a
+   * turn the backend starts on its own — until a new autonomous budget is set
+   * (setMode). Only an explicit re-arm clears it, never a turn boundary.
+   */
+  #budgetExhausted = false;
+  /** This turn's end-attempt interrupt has been scheduled (once per turn). */
+  #endAttemptInterruptQueued = false;
+  /** See SessionCreateOptions.extraEnv (validated in the constructor). */
+  #extraEnv: Readonly<Record<string, string>> | undefined;
+  /** Why the last finished turn failed, when a usage or rate limit was the cause; null after a success. */
+  #lastTurnInfraError: TurnInfraError | null = null;
+  /**
+   * Claude's `rate_limit_event` reported `rejected` during the current turn,
+   * with the reset instant it carried — exact where the error text says only
+   * "resets 3pm". Cleared when a turn starts.
+   */
+  #rateLimitRejection: { resetAt?: number } | null = null;
 
   // Cumulative token + cost totals, aggregated from SDK `result` messages
   // (one per turn). Broadcast via session.info_update so StatusBar-style
@@ -1180,7 +1305,7 @@ export class Session {
     this.role = opts.role;
     this.#pack = opts.pack;
     this.forkedFrom = opts.forkedFrom;
-    this.worktree = opts.worktree;
+    this.#worktree = opts.worktree;
     this.collaboration = opts.collaboration;
     this.collaborationRole = opts.collaborationRole;
     this.#blackboardMcp = opts.blackboardMcp;
@@ -1188,6 +1313,18 @@ export class Session {
     this.#workerShape = opts.workerShape;
     this.#collaborationCost = opts.collaborationCost;
     this.#maxBudgetUsd = opts.maxBudgetUsd;
+    this.#onBudgetExhausted = opts.onBudgetExhausted ?? "park";
+    if (opts.extraEnv) {
+      // Before any side effect: a refused key must fail the create, not run a
+      // backend with half the env the caller asked for.
+      const refused = extraEnvViolations(opts.extraEnv);
+      if (refused.length > 0) {
+        throw new Error(
+          `extraEnv may not set ${refused.join(", ")}: codeoid owns credential, account and process-loading variables for the backend`,
+        );
+      }
+      this.#extraEnv = Object.freeze({ ...opts.extraEnv });
+    }
     if (opts.initialMode) {
       this.#mode = opts.initialMode.mode;
       this.#turnsRemaining =
@@ -1263,6 +1400,10 @@ export class Session {
     // Tenant-scoped (auth carries account_id/project_id) so two accounts in
     // the same directory never share memory.
     this.#workspaceId = workspaceIdFromPath(opts.workdir, opts.auth);
+    // Record the owner before the first episode is written, so the tenant's
+    // cross-workspace search can reach this workspace and no other tenant's can.
+    this.#workspaceTenant = { accountId: opts.auth.accountId, projectId: opts.auth.projectId };
+    this.#registerWorkspace();
     // Rotation counters — populated from Store so they survive restart.
     const stats = this.#store.getRotationStats(this.id);
     this.#rotationCount = stats.count;
@@ -1298,8 +1439,17 @@ export class Session {
         effectiveProviderId,
       ) ??
       null;
+    // Thinking effort (#417): a resumed session keeps its own (none = the
+    // backend's default); a new one takes the effort chosen at creation, else
+    // the config default.
+    this.#effort = opts.existingId
+      ? this.#store.getSessionEffort(this.id)
+      : opts.effort !== undefined
+        ? opts.effort
+        : (opts.config?.session.defaultEffort ?? null);
 
     this.#provider = opts._testProvider ?? this.#createProvider(opts.providerId);
+    this.#warnIfBudgetUnenforced();
     this.#appliedAccount = this.#accountState(this.#provider.id);
     this.#provider.onSessionEvent = (e) => this.#onSessionScopedEvent(e);
 
@@ -1347,6 +1497,9 @@ export class Session {
         },
         (episode) => {
           try {
+            // Retry a registration that failed at construction; until it
+            // succeeds the workspace is invisible to cross-workspace search.
+            if (!this.#workspaceRegistered) this.#registerWorkspace();
             memory.ingest(episode);
             scheduler.onEpisode();
           } catch (err) {
@@ -1364,7 +1517,8 @@ export class Session {
         accountId: opts.auth.accountId,
         projectId: opts.auth.projectId,
       });
-      this.#store.audit(opts.auth.sub, "session.create", this.id, `name=${this.name}`);
+      this.#store.audit(opts.auth.sub, "session.create", this.id, `name=${this.name}${this.#effort ? ` effort=${this.#effort}` : ""}`);
+      if (this.#effort) this.#store.setSessionEffort(this.id, this.#effort);
 
       this.#transcriptStore.saveMeta({
         sessionId: this.id,
@@ -1446,6 +1600,7 @@ export class Session {
       resolveClaudeAccount: () => this.#claudeAccounts?.resolve(this.#accountChoices.claude ?? null) ?? null,
       // Every other backend: this session's account for it (accounts.ts).
       resolveAccount: () => this.#resolveAccount(factory.id),
+      ...(this.#extraEnv ? { extraEnv: this.#extraEnv } : {}),
     });
   }
 
@@ -1796,6 +1951,8 @@ export class Session {
     }
 
     this.#provider = this.#createProvider(requested);
+    this.#warnIfBudgetUnenforced();
+    this.#effortRestartPending = false; // the new backend starts with the session's effort
     this.#appliedAccount = this.#accountState(requested);
     this.#resetMcpState({ backendChanged: true });
     this.#provider.onSessionEvent = (e) => this.#onSessionScopedEvent(e);
@@ -1847,6 +2004,20 @@ export class Session {
   get providerId(): string { return this.#provider.id; }
   /** Tenant-scoped memory workspace id (for fleet views / cross-session search). */
   get workspaceId(): string { return this.#workspaceId; }
+
+  /** Record this session's tenant as the owner of its memory workspace. A
+   *  failure is logged and retried before the next episode is written. */
+  #registerWorkspace(): void {
+    if (!this.#memory) return;
+    try {
+      this.#memory.registerWorkspace(this.#workspaceId, this.#workspaceTenant);
+      this.#workspaceRegistered = true;
+    } catch (err) {
+      console.error(
+        `[codeoid/session ${this.id.slice(0, 8)}] memory: workspace registration failed — cross-workspace search will not find this session until it succeeds: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
   /**
    * Final text of the most recent assistant turn (null before any turn).
    * Bounded consumer beware: this is the FULL turn text — digest builders
@@ -1883,6 +2054,21 @@ export class Session {
    * the failure — a pipeline phase — needs this, not lastAssistantText.
    */
   get lastTurnError(): string | null { return this.#lastTurnError; }
+  /**
+   * The most recent finished turn's failure, when the backend blamed a usage or
+   * rate limit (with its reset time when it gave one); null when that turn
+   * failed for another reason, succeeded, or a new turn has started. A loop
+   * controller reads it to record an infrastructure error that spends no
+   * attempt. Retry behavior is unchanged — this only observes.
+   */
+  get lastTurnInfraError(): TurnInfraError | null { return this.#lastTurnInfraError; }
+  /**
+   * True once the autonomous tool budget ran out on a session created with
+   * `onBudgetExhausted: "end_attempt"` — the attempt was ended, not parked.
+   * Stays true, and every tool call is denied, until a new autonomous budget
+   * is set (setMode).
+   */
+  get budgetExhausted(): boolean { return this.#budgetExhausted; }
   /**
    * Role of the MOST RECENT canonical turn (undefined before any turn). Right
    * after `send()` the last turn is our USER prompt/nudge; a transient query-loop
@@ -2328,6 +2514,22 @@ export class Session {
   get agentUri(): string | undefined { return this.#agentIdentity.sub; }
   get mode(): SessionMode { return this.#mode; }
   get turnsRemaining(): number | undefined { return this.#turnsRemaining; }
+  /**
+   * Whether this session's backend asks codeoid before every tool call in
+   * autonomous mode, so the tool budget (and `onBudgetExhausted`) actually
+   * bounds it. False on codex (SessionProvider.enforcesToolBudget): there a
+   * controller must bound the attempt by wall time (supervisor.ts) instead.
+   * Read it again after a backend switch.
+   */
+  get toolBudgetEnforced(): boolean { return this.#provider.enforcesToolBudget !== false; }
+
+  /** end_attempt on a backend that can't count tool calls: not refused, but said. */
+  #warnIfBudgetUnenforced(): void {
+    if (this.#onBudgetExhausted !== "end_attempt" || this.toolBudgetEnforced) return;
+    console.warn(
+      `[codeoid/session ${this.id}] onBudgetExhausted "end_attempt" requested, but the ${this.#provider.id} backend runs autonomous tool calls without asking codeoid — the tool budget can't be enforced; bound this attempt by wall time (supervise) instead`,
+    );
+  }
   get pinnedFiles(): readonly string[] { return this.#pinnedFiles; }
   get model(): string | null { return this.#model; }
   get fallbackModel(): string | null { return this.#fallbackModel; }
@@ -2370,9 +2572,17 @@ export class Session {
 
   /** Change execution mode. Resets turn budget if moving out of autonomous. */
   setMode(mode: SessionMode, maxTurns?: number, sender?: AuthContext): void {
+    // A person choosing a mode is taking over: the ended attempt's lock is
+    // theirs to lift, whatever mode they pick (even the one already set).
+    if (this.#budgetExhausted && sender && isPersonSender(sender)) {
+      this.#budgetExhausted = false;
+      this.#broadcastInfoUpdate();
+    }
     if (this.#mode === mode && this.#turnsRemaining === maxTurns) return;
     this.#mode = mode;
     this.#turnsRemaining = mode === "autonomous" ? maxTurns : undefined;
+    // A fresh autonomous budget is a new attempt's: the spent flag is the old one's.
+    if (mode === "autonomous") this.#budgetExhausted = false;
     if (sender) {
       this.#store.audit(sender.sub, "session.set_mode", this.id, `mode=${mode}`);
     }
@@ -2871,6 +3081,22 @@ export class Session {
    * worktree's dependencies are ready. Cleared once awaited.
    */
   #pendingSetup: Promise<void> | null = null;
+  /** A fork's own files are still waiting for its setup recipe (see beginWorktreePrepare). */
+  #filesPending = false;
+  get filesPending(): boolean {
+    return this.#filesPending;
+  }
+
+  /** The worktree setup recipe's step in that chain, and its abort (destroy stops it). */
+  #setupRecipe: { done: Promise<void>; abort: AbortController } | null = null;
+
+  /** Queue `step` after any setup already pending; the first turn waits for the whole chain. */
+  #chainSetup(step: () => Promise<void>): Promise<void> {
+    const prev = this.#pendingSetup ?? Promise.resolve();
+    const next = prev.catch(() => {}).then(step);
+    this.#pendingSetup = next;
+    return next;
+  }
 
   async send(
     text: string,
@@ -2915,6 +3141,79 @@ export class Session {
     return this.#preparingSends > 0;
   }
 
+  /** Per-turn loop controls, reset when a turn starts. */
+  #resetTurnControls(): void {
+    this.#endAttemptInterruptQueued = false;
+    this.#rateLimitRejection = null;
+    // It describes the last FINISHED turn; a running one has not failed yet.
+    this.#lastTurnInfraError = null;
+  }
+
+  /**
+   * A turn failed: record whether a usage or rate limit was the cause
+   * (lastTurnInfraError). Any failure overwrites the previous record, so it
+   * always describes the latest turn. Observation only: nothing here retries
+   * or changes status.
+   *
+   * - `errors`: what the backend reported AS the failure (error text, an
+   *   Error, a structured error) — read with the full classifier.
+   * - `cliTexts`: text the turn's reply may hold a CLI notice in (Claude's
+   *   result text on an is_error turn, the turn's own assistant text). It
+   *   can be the model's words, so only CLI-shaped rules apply (classifyCliNotice).
+   * - `explained`: another recognizer already knows the cause (prompt too
+   *   long, the spend ceiling) — then a rate_limit_event alone never makes it
+   *   a usage limit.
+   */
+  #recordTurnFailure(
+    errors: readonly unknown[],
+    opts: { cliTexts?: readonly (string | undefined)[]; explained?: boolean } = {},
+  ): void {
+    const provider = this.#provider.id;
+    const record = (hit: { kind: UsageLimitKind; resetAt?: number }, source: unknown) => {
+      // The text often says only "resets 3pm"; Claude's rate_limit_event in
+      // the same turn carries the exact instant.
+      const resetAt = hit.resetAt ?? this.#rateLimitRejection?.resetAt;
+      this.#lastTurnInfraError = {
+        kind: hit.kind,
+        ...(resetAt !== undefined ? { resetAt } : {}),
+        message: failureText(source),
+        provider,
+        at: Date.now(),
+      };
+    };
+    for (const source of errors) {
+      if (source == null || source === "") continue;
+      const hit = classifyUsageLimit(source, { provider });
+      if (hit) {
+        record(hit, source);
+        return;
+      }
+    }
+    for (const text of opts.cliTexts ?? []) {
+      const hit = classifyCliNotice(text, { provider });
+      if (hit) {
+        record(hit, text);
+        return;
+      }
+    }
+    // Nothing said so, but the backend reported this turn's request refused
+    // by a plan limit (Claude's rate_limit_event "rejected", not carried by
+    // overage) — and no other recognizer explains the failure.
+    const rejection = this.#rateLimitRejection;
+    if (rejection && !opts.explained) {
+      const first = errors.find((e) => e != null && e !== "");
+      this.#lastTurnInfraError = {
+        kind: "usage_limit",
+        ...(rejection.resetAt !== undefined ? { resetAt: rejection.resetAt } : {}),
+        message: first === undefined ? "usage limit reached" : failureText(first),
+        provider,
+        at: Date.now(),
+      };
+      return;
+    }
+    this.#lastTurnInfraError = null;
+  }
+
   /**
    * Surface a send-path failure as a visible system message instead of
    * swallowing it. Called by SessionManager#send when the async send()
@@ -2924,6 +3223,7 @@ export class Session {
    */
   reportSendFailure(err: unknown): void {
     const emsg = err instanceof Error ? err.message : String(err);
+    this.#recordTurnFailure([err]);
     console.error(
       `[codeoid/session ${this.id}] send failed after ack: ${
         err instanceof Error ? (err.stack ?? emsg) : emsg
@@ -3028,6 +3328,17 @@ export class Session {
     const joinsRunningTurn = wasWorking && !!this.#activeRun?.pushMidTurn && this.#currentTurnId !== null;
     const previousTurnId = this.#currentTurnId;
     let turnId = joinsRunningTurn ? (previousTurnId as string) : this.#beginTurn();
+    // Per-turn controls belong to a turn that STARTS here, not to one this
+    // message only joins (its rate-limit record and interrupt are still live).
+    if (!joinsRunningTurn) {
+      this.#resetTurnControls();
+      // A person prompting a spent end_attempt worker is taking over; a
+      // system principal (dispatcher, routines, the loop controller) is not.
+      if (this.#budgetExhausted && isPersonSender(sender)) {
+        this.#budgetExhausted = false;
+        this.#broadcastInfoUpdate();
+      }
+    }
     const turnAt = new Date().toISOString();
     try {
     const userMsg = this.#makeMessage(
@@ -3223,6 +3534,7 @@ export class Session {
           history: this.#accumulator.history,
           userMessage: content,
           model: this.#model ?? undefined,
+          effort: this.#turnEffort() ?? undefined,
           fallbackModel: this.#fallbackModel ?? undefined,
           workdir: this.workdir,
           systemPromptAppend: this.#buildPromptAppend(),
@@ -3258,6 +3570,8 @@ export class Session {
     // asked for meanwhile applied (#395) — before the stop and adopted-turn
     // checks below, which must come after every await.
     await this.#applyMcpView();
+    // A thinking effort the backend takes only at startup (#417): rebuild it now, between turns.
+    await this.#applyEffortRestart();
     // Redial any backend MCP server that's down, so this turn can use a
     // server fixed since it failed (#389) — bounded, and backed off.
     await this.#healMcpServers();
@@ -3311,6 +3625,7 @@ export class Session {
       history: this.#accumulator.history,
       userMessage: turnPrompt,
       model: this.#model ?? undefined,
+      effort: this.#turnEffort() ?? undefined,
       fallbackModel: this.#fallbackModel ?? undefined,
       workdir: this.workdir,
       systemPromptAppend: this.#composePromptAppend(hookPromptAppend),
@@ -3490,6 +3805,7 @@ export class Session {
     void this.#checkpointTurn(turnId, 0);
     this.#turnInterrupted = false;
     this.#lastTurnError = null;
+    this.#resetTurnControls();
     // A turn with no prompt reads as the agent talking to itself; say why.
     const note = this.#makeMessage(
       "info",
@@ -3847,6 +4163,11 @@ export class Session {
       } catch {
         // fall through — the provider's own fallback is a hard abort
       }
+      // While we awaited, the turn may have ended and another started (a
+      // queued send, a backend-adopted turn, a terminateBackend). Its
+      // approvals and status are not this interrupt's to settle; an ended
+      // run's consumer already settled its own.
+      if (this.#activeRun !== run) return;
       // Tool cards are NOT closed here: the interrupted turn is still
       // draining, and a result that lands after interrupt() resolves must
       // still reach its card, the transcript and memory. The consumer's turn
@@ -4004,11 +4325,19 @@ export class Session {
     // never blocks destroy). Ownership-gated: only worktrees WE created
     // (createdByCodeoid) are removed; a user-bound worktree is left alone. The
     // branch is KEPT by default so any work committed in the fork survives.
+    // A setup recipe still running is stopped first, so nothing writes into
+    // the worktree while it's being removed.
+    const recipe = this.#setupRecipe;
+    if (recipe) {
+      recipe.abort.abort();
+      await recipe.done.catch(() => {});
+    }
     if (this.worktree?.createdByCodeoid) {
       await removeForkWorktree({
         workdir: this.worktree.path,
         worktreePath: this.worktree.path,
         branch: this.worktree.branch,
+        ...(this.worktree.setup ? { setup: this.worktree.setup } : {}),
         // A session undone by the request that made it leaves no branch behind.
         ...(opts.deleteBranch ? { deleteBranch: true } : {}),
       }).catch(() => {});
@@ -4294,6 +4623,7 @@ export class Session {
           history: this.#accumulator.history,
           userMessage: prompt,
           model: this.#model ?? undefined,
+          effort: this.#turnEffort() ?? undefined,
           fallbackModel: this.#fallbackModel ?? undefined,
           workdir: this.workdir,
           systemPromptAppend: this.#composePromptAppend(),
@@ -4377,8 +4707,8 @@ export class Session {
     this.#persistAndBuffer(start);
     this.#broadcastRaw(start);
 
-    const t0 = Date.now();
-    this.#pendingSetup = (async () => {
+    this.#chainSetup(async () => {
+      const t0 = Date.now();
       try {
         await execFileP("sh", ["-c", command], {
           cwd: this.workdir,
@@ -4413,7 +4743,103 @@ export class Session {
         this.#persistAndBuffer(fail);
         this.#broadcastRaw(fail);
       }
-    })();
+    });
+  }
+
+  /**
+   * Apply the repository's setup recipe (workspace-setup.ts) to the worktree
+   * codeoid created for this session, in the BACKGROUND like
+   * {@link beginSetup} and ahead of it: the first turn waits for both. A
+   * failure is reported as an infrastructure notice, never thrown, and the
+   * worktree is kept as it is.
+   */
+  beginWorktreePrepare(
+    policy: WorktreeSetupPolicy | undefined,
+    opts: {
+      /** The recipe read the caller planned with (see prepareWorktree). */
+      recipe?: RecipeRead;
+      /**
+       * Work that must wait for setup — a fork's carried uncommitted state
+       * and file roll, held back so a setup command only ever sees committed
+       * content. Runs whether or not setup succeeded; never after destroy.
+       */
+      after?: (result: WorktreeSetupResult) => Promise<void>;
+    } = {},
+  ): void {
+    const wt = this.#worktree;
+    if (!wt?.createdByCodeoid) return;
+    const abort = new AbortController();
+    // Until `after` has run the folder is the clean checkout, not the fork's
+    // files: a fork, rewind or file read of it is refused meanwhile.
+    if (opts.after) this.#filesPending = true;
+    const done = this.#chainSetup(async () => {
+      try {
+        if (abort.signal.aborted || this.#destroyed) return;
+        const result = await prepareWorktree({
+          worktreePath: wt.path,
+          policy,
+          signal: abort.signal,
+          ownerSub: this.createdBy,
+          ...(opts.recipe !== undefined ? { recipe: opts.recipe } : {}),
+        });
+        // Recorded even when destroyed meanwhile: destroy's cleanup reads it to
+        // take the copied files and shared links back out.
+        this.#recordWorktreeSetup(result, !this.#destroyed);
+        if (this.#destroyed) return;
+        this.#announceWorktreeSetup(result);
+        if (opts.after) await opts.after(result);
+      } finally {
+        this.#filesPending = false;
+      }
+    });
+    this.#setupRecipe = { done, abort };
+    void done.finally(() => {
+      if (this.#setupRecipe?.done === done) this.#setupRecipe = null;
+    });
+  }
+
+  /**
+   * Record what a setup recipe put in this session's worktree (so it stays
+   * out of checkpoints and is taken back out on removal) and tell the
+   * client. Called by {@link beginWorktreePrepare}, or directly when the
+   * recipe ran before the session existed (routines).
+   */
+  noteWorktreePrepared(result: WorktreeSetupResult): void {
+    this.#recordWorktreeSetup(result, true);
+    this.#announceWorktreeSetup(result);
+  }
+
+  #recordWorktreeSetup(result: WorktreeSetupResult, persist: boolean): void {
+    const wt = this.#worktree;
+    if (wt && (result.copied.length > 0 || result.shared.length > 0)) {
+      this.#worktree = { ...wt, setup: { copied: [...result.copied], shared: [...result.shared] } };
+      if (persist) this.#saveMetaNow();
+    }
+  }
+
+  #announceWorktreeSetup(result: WorktreeSetupResult): void {
+    if (result.error) {
+      console.error(`[codeoid/session ${this.id.slice(0, 8)}] worktree setup failed: ${result.error}`);
+    }
+    const text = describeSetupResult(result);
+    if (!text) return;
+    const msg = this.#makeMessage("info", text, SYSTEM_IDENTITY, undefined, undefined, {
+      event: setupEvent(result),
+      infrastructure: true,
+      copied: result.copied,
+      shared: result.shared,
+      ...(result.command ? { exitCode: result.command.exitCode, timedOut: result.command.timedOut } : {}),
+      ...(result.commandSkipped ? { commandSkipped: result.commandSkipped } : {}),
+    });
+    this.#persistAndBuffer(msg);
+    this.#broadcastRaw(msg);
+  }
+
+  /** Worktree-root paths the setup recipe added, as absolute paths (checkpoint exclusions). */
+  #setupPaths(): string[] {
+    const wt = this.#worktree;
+    if (!wt?.setup) return [];
+    return [...wt.setup.copied, ...wt.setup.shared].map((rel) => join(wt.path, rel));
   }
 
   /**
@@ -4644,6 +5070,7 @@ export class Session {
       ...this.#accountInfo(),
       mode: this.#mode,
       turnsRemaining: this.#turnsRemaining,
+      ...(this.#budgetExhausted ? { budgetExhausted: true as const } : {}),
       pinnedFiles: [...this.#pinnedFiles],
       agentUri: this.#agentIdentity.sub,
       subagents: this.subagentSnapshot,
@@ -4662,6 +5089,14 @@ export class Session {
       queuedMessages: this.#provider.queuedMessages,
       model: this.#model ?? undefined,
       fallbackModel: this.#fallbackModel ?? undefined,
+      effort: this.#effort ?? undefined,
+      // What Default means — while it's for the model in use (a model change makes it stale until the next turn).
+      ...(this.#provider.defaultEffort &&
+      (!this.#provider.runningModel || this.#model == null || this.#model === this.#provider.runningModel)
+        ? { defaultEffort: this.#provider.defaultEffort }
+        : {}),
+      ...(this.#effortRestartPending || (this.#effortSent !== undefined && this.#effortSent !== this.#effort) ? { effortPending: true } : {}),
+      ...(this.#provider.runningModel ? { runningModel: this.#provider.runningModel.slice(0, LIMITS.MODEL_MAX) } : {}),
       forkedFrom: this.forkedFrom,
       worktree: this.worktree,
       collaboration: this.collaboration,
@@ -5036,6 +5471,99 @@ export class Session {
     this.#broadcastInfoUpdate();
 
     return { model: resolved, fallbackModel: this.#fallbackModel };
+  }
+
+  /**
+   * Set how hard the model thinks (#417); null = the backend's default. Kept
+   * with the session. Never cuts a running turn short: applied live where
+   * the backend can take it, otherwise from the next turn's options — or, on
+   * a backend that takes it only at startup, by rebuilding it between turns
+   * once no work is running (it resumes the conversation).
+   */
+  async setEffort(effort: EffortLevel | null, sender: AuthContext): Promise<EffortChangeResult> {
+    const prev = this.#effort;
+    this.#effort = effort;
+    this.#store.setSessionEffort(this.id, effort);
+    this.#store.audit(
+      sender.sub,
+      "session.set_effort",
+      this.id,
+      `effort=${effort ?? "(default)"} from=${prev ?? "(default)"}${sender.delegationDepth > 0 ? ` delegated=${sender.delegationDepth}` : ""}`,
+    );
+    let applies: EffortChangeResult["applies"] = "next-turn";
+    if (effort === prev) {
+      // Nothing new — but a change still on its way says so.
+      applies = this.#effortRestartPending ? "restart" : this.#effortSent !== undefined && this.#effortSent !== effort ? "next-turn" : "now";
+    } else if (this.#provider.effortChange === "restart") {
+      // Back to what the running backend has (changed and changed back before a turn): nothing to restart for.
+      this.#effortRestartPending = this.#effortSent === undefined || this.#effortSent !== effort;
+      applies = this.#effortRestartPending ? "restart" : "now";
+    } else if (this.#provider.applyEffort) {
+      try {
+        if (await this.#provider.applyEffort(effort)) {
+          applies = "now";
+          this.#effortSent = effort; // the running backend has it
+        }
+      } catch (err) {
+        console.error(`[codeoid/session ${this.id}] applying thinking effort live failed (it applies from the next turn): ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    const shown = effort ?? "the backend's default";
+    const when =
+      applies === "now"
+        ? ""
+        : applies === "restart"
+          ? " — the backend restarts with it between turns, once no work is running"
+          : this.#backgroundTasks.size > 0
+            ? " — from the next turn with no background work running (Stop ends it)"
+            : " — from the next turn";
+    const info = this.#makeMessage("info", `⎆ Thinking effort: ${shown}${when}.`, SYSTEM_IDENTITY, undefined, undefined, {
+      event: "session.effort_changed",
+      effort,
+      prev_effort: prev,
+      applies,
+    });
+    this.#persistAndBuffer(info);
+    this.#broadcastRaw(info);
+    this.#broadcastInfoUpdate();
+    return { effort, applies, ...(applies === "next-turn" && this.#backgroundTasks.size > 0 ? { waitsForBackground: true } : {}) };
+  }
+
+  /**
+   * The effort a turn hands the backend (#417). A change the backend can't
+   * take live rebuilds it, which would stop its background work: while any
+   * runs, a turn keeps the effort the backend already has, and the change
+   * lands on the first turn with none.
+   */
+  #turnEffort(): EffortLevel | null {
+    const held = this.#backgroundTasks.size > 0 && this.#effortSent !== undefined;
+    const effort = held ? (this.#effortSent as EffortLevel | null) : this.#effort;
+    // A change background work held back is in effect now: say so (an ordinary next-turn change was announced as such).
+    const landed = !held && this.#effortHeld && this.#effortSent !== effort;
+    this.#effortHeld = held && effort !== this.#effort;
+    this.#effortSent = effort;
+    if (landed) {
+      const info = this.#makeMessage("info", `⎆ Thinking effort now ${effort ?? "the backend's default"}.`, SYSTEM_IDENTITY, undefined, undefined, {
+        event: "session.effort_applied",
+        effort,
+      });
+      this.#persistAndBuffer(info);
+      this.#broadcastRaw(info);
+      this.#broadcastInfoUpdate();
+    }
+    return effort;
+  }
+
+  /** Rebuild a backend that takes its effort only at startup, between turns (#417). */
+  async #applyEffortRestart(): Promise<void> {
+    if (!this.#effortRestartPending || this.#mcpBusy()) return;
+    this.#effortRestartPending = false;
+    // Switched since to a backend that takes it per turn: nothing to rebuild.
+    if (this.#provider.effortChange !== "restart") return;
+    await this.#teardownProvider();
+    if (RESEED_AFTER_TEARDOWN.has(this.#provider.id) && this.#accumulator.history.length > 0) {
+      await this.#seedProviderFromHistory();
+    }
   }
 
   /**
@@ -5440,6 +5968,20 @@ export class Session {
   }
 
   /**
+   * True when `toolName` would spend autonomous budget that is already spent,
+   * on a session that ends the attempt rather than parking
+   * (`onBudgetExhausted: "end_attempt"`). Side-effect free — shared by the
+   * gate and the tool_start peek so the card never offers an approval the
+   * gate will not wait for. The set of budgeted tools is #shouldAutoApprove's.
+   */
+  #budgetSpentFor(toolName: string): boolean {
+    if (this.#onBudgetExhausted !== "end_attempt" || this.#mode !== "autonomous") return false;
+    if (this.#turnsRemaining === undefined || this.#turnsRemaining > 0) return false;
+    if (isFleetSendTool(toolName) || isElicitationTool(toolName)) return false;
+    return !isSafeTool(toolName) && !this.#isReadonlyMcpTool(toolName);
+  }
+
+  /**
    * Side-effect-free read of auto-approve state. Used ONLY in the tool_start
    * event handler to determine the initial UI phase (executing vs
    * waiting_confirmation) without touching the turn budget or mode.
@@ -5565,6 +6107,77 @@ export class Session {
     }
   }
 
+  /**
+   * Deny a tool call because the autonomous budget is spent on an
+   * `end_attempt` session, and end the turn it belongs to (loop design §6:
+   * the attempt ends as budget_exhausted and control returns to the
+   * controller, rather than the session parking at waiting_approval).
+   *
+   * The interrupt is scheduled, not awaited: the deny must reach the backend
+   * first, and interrupt() awaits the backend, which is waiting on this gate.
+   * Only a turn's first denial interrupts it; later calls in the draining
+   * turn are simply refused. Background tasks are stopped too where the
+   * backend can (Claude: SDK `stopTask`); on a backend without
+   * stopBackgroundTasks they keep running, but every tool call they make is
+   * still denied here.
+   */
+  #endAttemptOnBudget(approvalId: string, toolName: string, sender: AuthContext): { behavior: "deny"; message: string } {
+    if (!this.#budgetExhausted) {
+      // Same reversion as park (reads frictionless, writes ask again if a
+      // person takes over); flagged after setMode, which clears the flag only
+      // for a NEW autonomous budget.
+      this.setMode("guarded");
+      this.#budgetExhausted = true;
+      this.#broadcastInfoUpdate(); // setMode announced before the flag was set
+    }
+    const reason =
+      "The autonomous tool budget for this attempt is spent, so the attempt has ended. Do not retry; the controller decides what happens next. " +
+      "(Operator: to take over, set a mode with /mode or send a message yourself; a controller re-arms it with a new autonomous budget.)";
+    this.#resolveToolCallMessage(approvalId, { phase: "cancelled", reason: "denied", message: reason });
+    this.#approvalPatchKeys.delete(approvalId);
+    this.#store.audit(sender.sub, "session.budget_deny", this.id, `tool=${toolName}`);
+    if (!this.#endAttemptInterruptQueued) {
+      this.#endAttemptInterruptQueued = true;
+      const infoMsg = this.#makeMessage(
+        "info",
+        `⏹ Autonomous tool budget spent — ${toolName} was refused and this attempt has ended.`,
+        SYSTEM_IDENTITY,
+        undefined,
+        undefined,
+        { event: "budget.end_attempt", tool: toolName },
+      );
+      this.#persistAndBuffer(infoMsg);
+      this.#broadcastRaw(infoMsg);
+      const system: AuthContext = {
+        sub: "system:budget",
+        scopes: [],
+        delegationDepth: 0,
+        accountId: this.accountId,
+        projectId: this.projectId,
+      };
+      // Bound to the turn and background work of NOW: if the turn has moved
+      // on by the time this fires (a person took over and started another),
+      // it is not this denial's to stop.
+      const turnAtDenial = this.#currentTurnId;
+      const tasksAtDenial = [...this.#backgroundTasks.keys()];
+      setTimeout(() => {
+        if (this.#destroyed || this.#currentTurnId !== turnAtDenial) return;
+        void (async () => {
+          await this.interrupt(system);
+          // interrupt() spares background agents while a turn runs; an ended
+          // attempt must not leave them working on the spent budget. Each
+          // stopped task settles itself out of the set; one whose stop failed
+          // stays listed — it is still running.
+          const live = tasksAtDenial.filter((id) => this.#backgroundTasks.has(id));
+          if (live.length > 0 && this.#provider.stopBackgroundTasks) await this.#provider.stopBackgroundTasks(live);
+        })().catch((e) => {
+          console.error(`[codeoid/session ${this.id}] ending the attempt on a spent budget failed: ${e instanceof Error ? e.message : String(e)}`);
+        });
+      }, 0);
+    }
+    return { behavior: "deny", message: reason };
+  }
+
   #makeCanUseToolFn(sender: AuthContext): ToolApprovalFn {
     // The backend this gate is handed to — the one that will ASK. Captured
     // here, not at call time, so the rewrite check below refers to it even if
@@ -5580,6 +6193,10 @@ export class Session {
       // not enough. Deciding first leaks the approval mapping and renders an
       // approvable card for a call the gate already resolved.
       if (!this.#turnActive()) await this.#backgroundEventChain;
+
+      // The attempt already ended on a spent budget (end_attempt): nothing
+      // runs — not even a read — until a new budget re-arms the session.
+      if (this.#budgetExhausted) return this.#endAttemptOnBudget(approvalId, toolName, sender);
 
       // Hook gate — the policy layer, run BEFORE the approval gate. A hook
       // block is a policy deny that never prompts the user (and never burns
@@ -5721,6 +6338,9 @@ export class Session {
       // it mid-turn and applies its env, after the turn-start check
       // (assertClaudeAccountUsable) — so it never runs unasked, in any mode.
       const settingsWrite = this.#writesClaudeSettingsOnNamedAccount(toolName, effectiveInput);
+      // end_attempt: a call the spent budget would have parked is denied and
+      // ends the attempt instead — whatever else would have asked about it.
+      if (this.#budgetSpentFor(toolName)) return this.#endAttemptOnBudget(approvalId, toolName, sender);
       const autoApprove = secret?.action !== "ask" && !settingsWrite && this.#shouldAutoApprove(toolName);
 
       if (autoApprove) {
@@ -5976,6 +6596,7 @@ export class Session {
       console.error(`[codeoid/session ${this.id}] provider event consumer failed:`, err);
       // Before the status change: it wakes a pipeline phase waiter that reads it.
       this.#lastTurnError = emsg;
+      this.#recordTurnFailure([err]);
       this.#setStatus("error");
       const errorMsg = this.#makeMessage("system", `Error: ${emsg}`, SYSTEM_IDENTITY, undefined, undefined, { event: "agent_error", errorCode: "agent_error" });
       this.#persistAndBuffer(errorMsg);
@@ -6038,12 +6659,7 @@ export class Session {
    * run). Idempotent and run-scoped: if `run` is no longer the active run, the
    * turn already ended and we no-op.
    *
-   * Crucially this does NOT route through #teardownProvider (which awaits the
-   * session event-consumer task — i.e. potentially itself). It nulls the run
-   * slots up front, surfaces a clear message, resets status to idle, and hard
-   * tears down the PROVIDER (abort → reap the hung subprocess). The next send()
-   * recreates a fresh query loop. The abandoned consumer (if any) unblocks when
-   * teardown closes the turn queue and its finally no-ops via the run guard.
+   * The stop itself is #hardStop (shared with terminateBackend).
    */
   async #recoverStalledRun(
     run: TurnRun,
@@ -6056,11 +6672,89 @@ export class Session {
       `[codeoid/session ${this.id}] turn stalled — no provider events for ${stallMs}ms; force-recovering`,
     );
 
+    await this.#hardStop("stall recovery", {
+      text: opts?.continuingCurrentSend
+        ? `⚠️ Previous turn timed out — no activity for ${Math.round(stallMs / 1000)}s. The session was reset and your latest message is being retried in a fresh turn.`
+        : `⚠️ Turn timed out — no activity for ${Math.round(stallMs / 1000)}s. The session was reset; send your message again to continue.`,
+      meta: { event: "turn_stalled", errorCode: "turn_stalled" },
+    });
+  }
+
+  /**
+   * Stop this session's backend outright — the escalation after an interrupt
+   * that did not settle the session (supervisor.ts: an attempt's wall time
+   * ran out and the grace period passed). Whatever is in flight — a tool
+   * without its own timeout, a wedged turn, background agents — is ended by
+   * tearing the backend down (its child process is killed), exactly as stall
+   * recovery does — and then killing whatever that process had started and
+   * left running (process-tree.ts: the tree under the backend's own pids is
+   * snapshotted first, survivors are SIGKILLed after the bounded teardown).
+   * Self-detached commands and backends with unknown pids (qwen) are outside
+   * that reach; see process-tree.ts for exactly what survives. The session
+   * survives and settles idle; the next send starts a fresh backend and
+   * resumes the conversation. Idempotent.
+   */
+  async terminateBackend(
+    sender: AuthContext,
+    reason: string,
+    opts: { teardownTimeoutMs?: number } = {},
+  ): Promise<void> {
+    this.#store.audit(sender.sub, "session.terminate_backend", this.id, reason);
+    // Stop sends still preparing their turn too, as interrupt() does.
+    this.#turnInterrupted = true;
+    this.#stopGen++;
+    this.#cancelAllUiRequests("interrupted");
+    this.#earlyApprovals.clear();
+    this.#approvalPatchKeys.clear();
+    // Before the teardown: once the backend is gone its children re-parent
+    // and can no longer be told apart from anyone else's.
+    let tree: ProcessEntry[] = [];
+    try {
+      const roots = (await withTimeout(this.#provider.backendProcessIds?.() ?? Promise.resolve([]), 3_000)) ?? [];
+      tree = await withTimeout(snapshotTree(roots), 3_000);
+    } catch (e) {
+      console.error(`[codeoid/session ${this.id}] could not snapshot the backend's processes: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    await this.#hardStop(
+      "backend terminated",
+      {
+        text: `⏹ Backend stopped by ${sender.sub}: ${reason}. Send a new message to continue.`,
+        meta: { event: "session.backend_terminated", sub: sender.sub },
+      },
+      opts.teardownTimeoutMs,
+    );
+    // The teardown had its graceful chance (and the backend its own
+    // escalation); what is still running from the snapshot is left over.
+    try {
+      const killed = await killSurvivors(tree);
+      if (killed.length > 0) {
+        this.#store.audit(sender.sub, "session.terminate_backend.reaped", this.id, `pids=${killed.join(",")}`);
+        console.warn(`[codeoid/session ${this.id}] killed ${killed.length} process(es) the backend left running: ${killed.join(", ")}`);
+      }
+    } catch (e) {
+      console.error(`[codeoid/session ${this.id}] killing the backend's leftover processes failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  /**
+   * Shared by stall recovery and terminateBackend. Does NOT route through
+   * #teardownProvider (which awaits the session event-consumer task — i.e.
+   * potentially the caller). It nulls the run slots up front, surfaces a clear
+   * message, resets status to idle, and hard tears down the PROVIDER (abort →
+   * reap the subprocess). The next send() recreates a fresh query loop. The
+   * abandoned consumer (if any) unblocks when teardown closes the turn queue
+   * and its finally no-ops via the run guard.
+   */
+  async #hardStop(
+    label: string,
+    notice: { text: string; meta: Record<string, unknown> },
+    teardownTimeoutMs = HARD_STOP_TEARDOWN_MS,
+  ): Promise<void> {
     // Stop any spinning UI and release waiters BEFORE we tear down. The
     // teardown below kills the CLI and every background agent with it, so
     // nothing is kept: the whole background set is dead.
     this.#clearBackgroundTasks();
-    this.#reconcileWork("stall recovery", { keepBackground: false });
+    this.#reconcileWork(label, { keepBackground: false });
     this.#flushActiveAssistant();
     this.#finalizeActiveThinking();
     this.#chunker?.onTurnEnd();
@@ -6071,16 +6765,7 @@ export class Session {
     this.#activeRun = null;
     this.#eventConsumerTask = null;
 
-    const msg = this.#makeMessage(
-      "system",
-      opts?.continuingCurrentSend
-        ? `⚠️ Previous turn timed out — no activity for ${Math.round(stallMs / 1000)}s. The session was reset and your latest message is being retried in a fresh turn.`
-        : `⚠️ Turn timed out — no activity for ${Math.round(stallMs / 1000)}s. The session was reset; send your message again to continue.`,
-      SYSTEM_IDENTITY,
-      undefined,
-      undefined,
-      { event: "turn_stalled", errorCode: "turn_stalled" },
-    );
+    const msg = this.#makeMessage("system", notice.text, SYSTEM_IDENTITY, undefined, undefined, notice.meta);
     this.#persistAndBuffer(msg);
     this.#broadcastRaw(msg);
     this.#setStatus("idle");
@@ -6088,11 +6773,14 @@ export class Session {
     // Hard teardown: abort the controller and reap the (presumed hung)
     // subprocess. Safe to await here — provider.teardown() awaits the
     // PROVIDER's own pump, never this session's consumer.
+    // Bounded: a backend that won't acknowledge its teardown must not hang
+    // the caller (a supervisor's `expired` waits on this). The run slots are
+    // already cleared, so the session is usable either way.
     try {
-      await this.#provider.teardown();
+      await withTimeout(this.#provider.teardown(), teardownTimeoutMs);
     } catch (e) {
       console.error(
-        `[codeoid/session ${this.id}] provider teardown during stall recovery failed: ${e instanceof Error ? e.message : String(e)}`,
+        `[codeoid/session ${this.id}] provider teardown during ${label} failed: ${e instanceof Error ? e.message : String(e)}`,
       );
     }
   }
@@ -6227,6 +6915,8 @@ export class Session {
         const autoApprove =
           secretPathVerdict(event.name, event.input, { workdir: this.workdir, configDir: getConfigDir() }) === null &&
           this.#peekAutoApprove(event.name);
+        // end_attempt: the gate will refuse this call outright — no approval card.
+        const budgetDenied = this.#budgetExhausted || this.#budgetSpentFor(event.name);
         const toolMsg = this.#makeMessage(
           "tool_call",
           `${event.name}(${Object.keys(event.input).join(", ")})`,
@@ -6236,7 +6926,9 @@ export class Session {
             toolId: event.toolId,
             name: event.name,
             input: event.input,
-            state: autoApprove
+            state: budgetDenied
+              ? { phase: "cancelled", reason: "denied", message: "autonomous tool budget spent" }
+              : autoApprove
               ? ({ phase: "executing", input: event.input } as unknown as ToolState)
               : ({
                   phase: "waiting_confirmation",
@@ -6260,7 +6952,7 @@ export class Session {
         this.#persistAndBuffer(toolMsg);
         this.#broadcastRaw(toolMsg);
         this.#maybeInjectRepeatReminder(event.name, event.input, event.sdkAgentId);
-        if (!autoApprove) this.#setStatus("waiting_approval");
+        if (!autoApprove && !budgetDenied) this.#setStatus("waiting_approval");
         break;
       }
 
@@ -6449,6 +7141,15 @@ export class Session {
         break;
       }
 
+      case "rate_limit": {
+        // Kept for #recordTurnFailure: if this turn fails, the reset is exact.
+        // A later "allowed" in the same turn means the rejection was retried past.
+        // Overage carrying the requests means nothing was refused.
+        this.#rateLimitRejection =
+          event.status === "rejected" && !event.overage ? (event.resetsAt !== undefined ? { resetAt: event.resetsAt } : {}) : null;
+        break;
+      }
+
       case "custom_message": {
         // Provider-authored standalone message (extension output, status
         // cards, rich widgets). Not part of the LLM conversation — the
@@ -6502,6 +7203,19 @@ export class Session {
             break;
           }
           this.#lastTurnError = errText;
+          // Before the status change below, like lastTurnError: an error
+          // waiter reads it. The CLI puts a limit notice in the result text
+          // or the turn's own assistant text (only if THIS turn committed it,
+          // as above) — CLI-shaped rules only there, never the generic ones.
+          this.#recordTurnFailure([event.result.errorMessage], {
+            cliTexts: [
+              event.result.resultText,
+              last?.role === "assistant" ? last.content : undefined,
+              // The reply's final text block on its own (the notice after narration).
+              last?.role === "assistant" ? (this.#accumulator.lastTextBlock ?? undefined) : undefined,
+            ],
+            explained: tooLong || event.result.errorMessage === BUDGET_STOP_MESSAGE,
+          });
           const hint = tooLong
             ? " — this session's context no longer fits the model. Send /rotate to continue in a fresh context (memory recall keeps the history reachable)."
             : "";
@@ -6513,6 +7227,7 @@ export class Session {
           // The seed made it into a successful turn — it's spent.
           this.#pendingSeed = null;
           this.#promptTooLong = false;
+          this.#lastTurnInfraError = null;
           if (this.#status !== "error") this.#setStatus("idle");
         }
         break;
@@ -6545,6 +7260,8 @@ export class Session {
       case "error": {
         console.error(`[codeoid/session ${this.id}] provider error:`, event.message);
         this.#lastTurnError = event.message; // before the status change (see above)
+        // The structured detail (codex's error info + reset) rides with the text.
+        this.#recordTurnFailure([event.detail ? { message: event.message, error: event.detail } : event.message]);
         this.#setStatus("error");
         const errorMsg = this.#makeMessage("system", `Error: ${event.message}`, SYSTEM_IDENTITY, undefined, undefined, { event: "agent_error" });
         this.#persistAndBuffer(errorMsg);
@@ -6930,6 +7647,7 @@ export class Session {
         // start snapshot, past its wait; for an end one, the next turn began.
         isLate: opts.lateWhen ?? (() => started),
         excludeDirs: this.#protectedDirs(),
+        excludePaths: this.#setupPaths(),
         limits: this.#checkpointLimits(),
         ...(opts.onlyIfMissing ? { onlyIfMissing: true } : {}),
       }),
@@ -7147,6 +7865,7 @@ export class Session {
         workdir: this.workdir,
         sessionId: this.id,
         excludeDirs: this.#protectedDirs(),
+        excludePaths: this.#setupPaths(),
         limits: this.#checkpointLimits(),
       });
       if (!now.ok) throw new Error(now.reason);
@@ -7295,6 +8014,7 @@ export class Session {
       workdir: this.workdir,
       sessionId: this.id,
       excludeDirs: this.#protectedDirs(),
+      excludePaths: this.#setupPaths(),
       limits: this.#checkpointLimits(),
     });
     if (!now.ok) return { ...plan, planId: planHash([turnId, ...removedIds]), filesUnavailable: `the current files couldn't be read: ${now.reason}` };

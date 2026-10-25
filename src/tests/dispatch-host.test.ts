@@ -79,6 +79,21 @@ function sayTurn(text: string): ProviderEvent[] {
 let tmp: string;
 let workdir: string;
 let store: Store;
+
+/**
+ * Force a dispatch task terminal, bypassing the claim lifecycle. These tests
+ * exercise what is drawn or delivered once a task has settled, not how it got
+ * there — and `dispatchComplete` / `dispatchFail` now refuse a row that was
+ * never claimed (the generation fence), which is exactly right for a worker
+ * result and exactly wrong for staging one.
+ */
+function settleTask(id: string, status: "done" | "failed", digest: string): void {
+  store.database
+    .prepare(
+      "UPDATE dispatch_tasks SET status = ?, result_digest = ?, error = ?, updated_at = ? WHERE id = ?",
+    )
+    .run(status, status === "done" ? digest : null, status === "done" ? null : digest, Date.now(), id);
+}
 let transcript: TranscriptStore;
 let providers: MockSessionProvider[];
 let manager: SessionManager;
@@ -391,7 +406,7 @@ describe("dispatch host — event routing", () => {
       shape: "scout",
     });
     for (const m of store.dispatchGroupMembers(AUTH.accountId, AUTH.projectId, groupId)) {
-      store.dispatchComplete(m.id, `digest ${m.id.slice(0, 4)}`, Date.now());
+      settleTask(m.id, "done", `digest ${m.id.slice(0, 4)}`);
     }
     store.dispatchEventAdd({
       accountId: AUTH.accountId,
@@ -437,7 +452,7 @@ describe("dispatch host — event routing", () => {
       targetSession: targetId,
       prompt: "go",
     });
-    store.dispatchComplete(taskId, "delivered", Date.now());
+    settleTask(taskId, "done", "delivered");
     store.dispatchEventAdd({
       accountId: AUTH.accountId,
       projectId: AUTH.projectId,

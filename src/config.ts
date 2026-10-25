@@ -19,8 +19,10 @@ import { randomBytes } from "node:crypto";
 import { join, isAbsolute, resolve, dirname } from "node:path";
 import { homedir } from "node:os";
 import { z } from "zod";
+import { EFFORT_LEVELS, type EffortLevel } from "./protocol/types.js";
 import type { AuthConfig } from "./daemon/auth.js";
 import type { OAuthConfig } from "./daemon/oauth.js";
+import type { WorktreeSetupPolicy } from "./daemon/workspace-setup.js";
 import {
   isLoopbackHost,
   LOCAL_TOKEN_ENV,
@@ -372,6 +374,12 @@ const SessionSchema = z
     defaultModel: z.string().optional(),
     fallbackModel: z.string().optional(),
     /**
+     * Thinking effort for a session created without one (#417), on codeoid's
+     * scale; each backend maps it (docs/thinking-effort.md). Unset = the
+     * backend's own default.
+     */
+    defaultEffort: z.enum(EFFORT_LEVELS).optional(),
+    /**
      * Hard backstop against a wedged turn. If the provider event stream goes
      * completely silent (no events at all) for this many ms while the MODEL
      * should be producing output (status "thinking"), the turn is treated as
@@ -601,6 +609,12 @@ const DispatchSchema = z
     workerToolBudget: z.number().int().min(1).default(50),
     /** Base retry backoff (ms) for retryable failures — doubles per attempt, capped at leaseMs. */
     retryBaseMs: z.number().int().min(0).default(15_000),
+    /**
+     * Longest a loop attempt may stay `held` on an approval (ms). A held attempt
+     * keeps its worker session and occupies a `maxConcurrentWorkers` slot, so
+     * past this the hold lapses and the attempt settles as reclaimed.
+     */
+    holdMaxMs: z.number().int().min(60_000).default(2 * 60 * 60_000),
   })
   .default({
     enabled: true,
@@ -610,6 +624,7 @@ const DispatchSchema = z
     maxConcurrentWorkers: 2,
     workerToolBudget: 50,
     retryBaseMs: 15_000,
+    holdMaxMs: 2 * 60 * 60_000,
   });
 
 /**
@@ -1151,6 +1166,40 @@ const RootSchema = z.object({
       setup: z.string().optional(),
     })
     .default({}),
+  /** Worktrees codeoid creates (forks, compare, routines). */
+  worktree: z
+    .object({
+      /** The repository setup recipe, `.codeoid/setup.yaml` (src/daemon/workspace-setup.ts). */
+      setup: z
+        .object({
+          /** Whether a recipe's `command` may run. `never` (default) still copies
+           *  and shares files; `trusted-repos` runs it only while the recipe is
+           *  the one trusted in `trustedRepos`. Reading a recipe executes nothing. */
+          runCommands: z.enum(["never", "trusted-repos"]).default("never"),
+          /** Trusted recipes, written by `codeoid worktree trust`: the primary
+           *  checkout and the recipe's git blob id (a changed recipe runs no
+           *  command until trusted again). A bare path is the older shape and
+           *  trusts no command. Paths are absolute. */
+          trustedRepos: z
+            .array(
+              z.union([
+                z.string().min(1).refine(isAbsolute, "must be an absolute path"),
+                z
+                  .object({
+                    path: z.string().min(1).refine(isAbsolute, "must be an absolute path"),
+                    recipeHash: z.string().regex(/^[0-9a-f]{40,64}$/, "must be a git blob id"),
+                    /** Who trusted it: honoured only for that owner's sessions. Absent = every owner. */
+                    trustedBy: z.string().min(1).max(512).optional(),
+                  })
+                  .strict(),
+              ]),
+            )
+            .max(256)
+            .default([]),
+        })
+        .default({ runCommands: "never", trustedRepos: [] }),
+    })
+    .default({ setup: { runCommands: "never", trustedRepos: [] } }),
 });
 
 type ParsedConfig = z.infer<typeof RootSchema>;
@@ -1263,6 +1312,8 @@ export interface CodeoidConfig {
     defaultProvider?: string;
     defaultModel?: string;
     fallbackModel?: string;
+    /** Thinking effort for a new session (#417); unset = the backend's default. */
+    defaultEffort?: EffortLevel;
     /** Stall watchdog: ms of event-stream silence while the model should be generating before a turn is force-recovered (0 = off; paused during tool execution and pending approvals). Defaults to 300000 when omitted. */
     turnStallTimeoutMs?: number;
     /** Per-call timeout (ms) for external MCP servers, surfaced as the SDK's per-server `timeout`. 0 = use SDK default. Defaults to 120000 when omitted. */
@@ -1307,6 +1358,16 @@ export interface CodeoidConfig {
     setup?: string;
   };
   /**
+   * Worktrees codeoid creates. `setup` is the trust policy for the
+   * repository's `.codeoid/setup.yaml` recipe (workspace-setup.ts): its
+   * files are always applied; its command runs only under
+   * `runCommands: "trusted-repos"` for a recipe pinned in `trustedRepos`.
+   * Optional in the type; loadConfig fills it.
+   */
+  worktree?: {
+    setup: WorktreeSetupPolicy;
+  };
+  /**
    * Send-class dispatch queue (P4). Optional in the type so hand-built test
    * configs stay minimal; loadConfig always populates it. Absent = enabled
    * with defaults.
@@ -1339,6 +1400,8 @@ export interface CodeoidConfig {
     maxConcurrentWorkers: number;
     workerToolBudget: number;
     retryBaseMs: number;
+    /** Longest a loop attempt may stay held (ms). Optional for hand-built configs; default 2h. */
+    holdMaxMs?: number;
   };
   /**
    * Collaborative-session bounds (see CollaborationSchema). Optional in the
@@ -1509,6 +1572,7 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   { env: "CODEOID_AUTO_ROTATE_MIN_TURNS", path: "autoRotate.minTurnsBeforeRotate", kind: "int" },
   { env: DEFAULT_PROVIDER_ENV, path: "session.defaultProvider", kind: "string" },
   { env: "CODEOID_DEFAULT_MODEL", path: "session.defaultModel", kind: "string" },
+  { env: "CODEOID_DEFAULT_EFFORT", path: "session.defaultEffort", kind: "string" },
   { env: "CODEOID_MCP_OAUTH_REDIRECT_BASE_URL", path: "mcpOAuth.redirectBaseUrl", kind: "string" },
   // Dispatch kill switch — disable send-class fleet dispatch per-invocation
   // without touching config.json. Other dispatch knobs are file-config only,
@@ -1769,6 +1833,7 @@ export function loadConfig(opts: LoadOptions = {}): CodeoidConfig {
     embed: parsed.embed,
     push: parsed.push,
     fork: parsed.fork,
+    worktree: parsed.worktree,
   };
 }
 

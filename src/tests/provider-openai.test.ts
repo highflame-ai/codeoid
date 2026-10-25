@@ -7,6 +7,7 @@
 
 import { mock, describe, it, expect, beforeEach } from "bun:test";
 import type { ProviderEvent, TurnOpts, UiRequest } from "../daemon/providers/interface.js";
+import type { EffortLevel } from "../protocol/types.js";
 import * as realOpenAIModule from "openai";
 
 /**
@@ -135,6 +136,20 @@ describe("OpenAIProvider – streaming", () => {
     modelsResult = [];
     roundScript = null;
     sentBodies.length = 0;
+  });
+
+  it("sends the thinking effort as reasoning_effort, on OpenAI's scale (#417)", async () => {
+    const done = [{ choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] }];
+    const effortOf = async (effort?: EffortLevel) => {
+      streamChunks = [...done];
+      sentBodies.length = 0;
+      await runProvider(new OpenAIProvider({ apiKey: "k" }), "hi", effort ? { effort } : {});
+      return sentBodies[0]?.reasoning_effort;
+    };
+    expect(await effortOf("high")).toBe("high");
+    expect(await effortOf("off")).toBe("none");
+    expect(await effortOf("max")).toBe("xhigh"); // nothing above XHigh
+    expect(await effortOf()).toBeUndefined(); // the default: nothing sent
   });
 
   it("emits text_delta + text_done + turn_done for a normal response", async () => {
