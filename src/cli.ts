@@ -1706,7 +1706,7 @@ watch
   .option("--review", "Also start a run for a PR comment that mentions codeoid")
   .option("--allow <login>", "GitHub login whose comments count (repeatable; default: you, as gh is signed in)", collect, [])
   .option("--mention <token>", "The token a comment must contain (default @codeoid)")
-  .option("--trust <login>", "Another GitHub login whose commits may be on a head the watch runs; a bot as name[bot] trusts anyone who can make that bot push (repeatable; you are always trusted)", collect, [])
+  .option("--trust <login>", "Another GitHub login whose commits may be on a head the watch runs; list everyone who merges to a watched branch. A bot as name[bot] trusts anyone who can make that bot push (repeatable; you are always trusted)", collect, [])
   .option("--per-hour <n>", "Runs the watch may start per hour (default 6)")
   .option("--attempts <n>", "Worker attempts per run (default 3)")
   .option("--budget <n>", "Autonomous tool calls per attempt (default 60)")

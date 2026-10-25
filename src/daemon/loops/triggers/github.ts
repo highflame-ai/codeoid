@@ -311,14 +311,75 @@ export const NO_COMMIT = "0".repeat(40);
 /** What GitHub's activity says about a head: the push that made it, if listed, and whether GitHub keeps activity for the repository at all. */
 export interface PushLookup {
   push: PushRecord | null;
-  /**
-   * The newest activity before `push` that left the branch at `push.before`:
-   * how what the push landed on got there. Null when that isn't on the page
-   * read, or there was nothing before.
-   */
-  prior: PushRecord | null;
   /** False when GitHub keeps no activity for the repository (404): no record will come. */
   kept: boolean;
+}
+
+/** One entry of a branch's activity: who moved the branch, how, and from what head to what head. */
+export interface ActivityEntry extends PushRecord {
+  /** The branch's head after it. */
+  after: string;
+}
+
+/** Pages of a branch's activity (100 entries each) one judgment reads, at most. */
+export const ACTIVITY_PAGES_MAX = 3;
+const ACTIVITY_PER_PAGE = 100;
+/** The opaque cursor GitHub's activity pages by (`after=` in its `Link` header). */
+const CURSOR_RE = /^[A-Za-z0-9_=+/-]{1,500}$/;
+
+/**
+ * A branch's activity, newest first, read a page at a time and never more
+ * than {@link ACTIVITY_PAGES_MAX} pages. GitHub pages it by cursor only (its
+ * `page` parameter is ignored), so the next page is the one its `Link` header
+ * names.
+ */
+export class BranchActivity {
+  readonly entries: ActivityEntry[] = [];
+  /** False when GitHub keeps no activity for the repository (404): no record will come. */
+  kept = true;
+  #pages = 0;
+  #next: string | null = null;
+  readonly #read: (cursor: string | null) => Promise<{ list: unknown[]; next: string | null } | null>;
+
+  constructor(read: (cursor: string | null) => Promise<{ list: unknown[]; next: string | null } | null>) {
+    this.#read = read;
+  }
+
+  /** Whether there was more activity than the pages read hold. */
+  get truncated(): boolean {
+    return this.#pages >= ACTIVITY_PAGES_MAX && this.#next !== null;
+  }
+
+  /** Read the next page; false when there is none, or the bound is reached. */
+  async more(): Promise<boolean> {
+    if (!this.kept || this.#pages >= ACTIVITY_PAGES_MAX || (this.#pages > 0 && this.#next === null)) return false;
+    const page = await this.#read(this.#pages === 0 ? null : this.#next);
+    this.#pages++;
+    if (!page) {
+      this.kept = false;
+      this.#next = null;
+      return false;
+    }
+    for (const a of page.list as Array<Record<string, unknown>>) {
+      const before = str(a?.before);
+      const after = str(a?.after);
+      this.entries.push({ actor: login(a?.actor), type: str(a?.activity_type), before: SHA_RE.test(before) ? before : "", after: SHA_RE.test(after) ? after : "" });
+    }
+    this.#next = page.next;
+    return page.list.length > 0;
+  }
+
+  /**
+   * The index of the newest entry older than `entries[from]` that left the
+   * branch at `sha`, reading further pages as needed; -1 when none of the
+   * pages that may be read has one.
+   */
+  async olderTo(from: number, sha: string): Promise<number> {
+    for (let i = from + 1; ; i++) {
+      while (i >= this.entries.length) if (!(await this.more())) return -1;
+      if (this.entries[i]!.after === sha) return i;
+    }
+  }
 }
 
 /** The pull request GitHub merged as a commit, as far as judging that merge needs. */
@@ -333,7 +394,17 @@ export interface MergedPull {
   headRef: string;
   /** Its final head commit; "" when GitHub doesn't give one. */
   headSha: string;
+  /** The merge commit's first parent: what it was made on; "" when GitHub doesn't say. */
+  parent: string;
+  /** How many commits the pull request had (a rebase merge puts that many on the branch); 0 when GitHub doesn't say. */
+  commits: number;
 }
+
+/**
+ * The merged pull requests in a repository whose merge commit is a given
+ * commit: none, one, or (which vouches for nothing) several.
+ */
+export type MergedAs = { kind: "none" } | { kind: "one"; pull: MergedPull } | { kind: "many"; numbers: number[] };
 
 /** Commits read to judge a head; more than this and it is not trusted. */
 export const COMMITS_MAX = 250;
@@ -371,12 +442,15 @@ const COMMENT_NODES_QUERY = `query($ids: [ID!]!) {
  * What judging a merge needs from its pull request beyond REST: who GitHub
  * records as having merged it (for the merge queue, who queued it), and
  * whether auto-merge was on — now (`autoMergeRequest`, null once it merged
- * by hand) or ever (an enable event in its timeline, kept after a disable).
+ * by hand) or ever (an enable event in its timeline, kept after a disable);
+ * and what its merge commit was made on and how many commits it had, which
+ * tell which commits beneath the merge commit it put on the branch.
  */
 const MERGED_PULL_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
-      merged mergedBy { login } mergeCommit { oid }
+      merged mergedBy { login } mergeCommit { oid parents(first: 1) { nodes { oid } } }
+      commits { totalCount }
       autoMergeRequest { enabledAt }
       timelineItems(itemTypes: [AUTO_MERGE_ENABLED_EVENT, AUTO_REBASE_ENABLED_EVENT, AUTO_SQUASH_ENABLED_EVENT], first: 1) { nodes { __typename } }
     }
@@ -479,53 +553,77 @@ export class GitHubSource {
   }
 
   /**
-   * The newest push (or merge) to `repo`'s `branch` that left it at `sha`,
-   * from GitHub's record of the repository's activity; none when the newest
-   * page has none. GitHub records the account that authenticated — who
-   * pushed, or who pressed the merge button — not anything a commit says
-   * about itself.
+   * `repo`'s `branch`'s activity from GitHub's record of the repository's
+   * activity, its newest page read (more on {@link BranchActivity.more}).
+   * GitHub records the account that authenticated — who pushed, or who
+   * pressed the merge button — not anything a commit says about itself.
    */
-  async pushOf(repo: string, branch: string, sha: string): Promise<PushLookup> {
+  async activity(repo: string, branch: string): Promise<BranchActivity> {
     if (!isRepo(repo)) throw new GhError(`not a GitHub repository name: ${repo}`);
-    let page: unknown;
-    try {
-      [page] = await this.#api(`repos/${repo}/activity?ref=${encodeURIComponent(`refs/heads/${branch}`)}&per_page=100`);
-    } catch (err) {
-      if (err instanceof GhError && err.status === 404) return { push: null, prior: null, kept: false };
-      throw err;
-    }
-    if (!Array.isArray(page)) throw new GhError("GitHub's activity list is not a list");
-    const record = (a: Record<string, unknown>): PushRecord => {
-      const before = str(a.before);
-      return { actor: login(a.actor), type: str(a.activity_type), before: SHA_RE.test(before) ? before : "" };
-    };
-    // Newest first, as GitHub returns it.
-    const list = page as Array<Record<string, unknown>>;
-    const at = list.findIndex((a) => str(a.after) === sha);
-    if (at < 0) return { push: null, prior: null, kept: true };
-    const push = record(list[at]!);
-    const below = push.before && push.before !== NO_COMMIT ? list.slice(at + 1).find((a) => str(a.after) === push.before) : undefined;
-    return { push, prior: below ? record(below) : null, kept: true };
+    const path = `repos/${repo}/activity?ref=${encodeURIComponent(`refs/heads/${branch}`)}&per_page=${ACTIVITY_PER_PAGE}`;
+    const log = new BranchActivity(async (cursor) => {
+      let out: string;
+      try {
+        // With the response's headers (`-i`): the next page is named in its `Link` header.
+        out = await this.#run(
+          ["api", "-i", "-H", "Accept: application/vnd.github+json", cursor ? `${path}&after=${encodeURIComponent(cursor)}` : path],
+          `GitHub repos/${repo}/activity`,
+        );
+      } catch (err) {
+        if (err instanceof GhError && err.status === 404) return null;
+        throw err;
+      }
+      const gap = /\r?\n\r?\n/.exec(out);
+      const headers = gap ? out.slice(0, gap.index) : "";
+      const [list] = parseJsonStream(gap ? out.slice(gap.index + gap[0].length) : out);
+      if (!Array.isArray(list)) throw new GhError("GitHub's activity list is not a list");
+      const url = /<([^>]+)>\s*;\s*rel="next"/.exec(/^link:(.*)$/im.exec(headers)?.[1] ?? "")?.[1];
+      let next: string | null = null;
+      try {
+        const c = url ? new URL(url).searchParams.get("after") : null;
+        if (c && CURSOR_RE.test(c)) next = c;
+      } catch {
+        next = null;
+      }
+      return { list, next };
+    });
+    await log.more();
+    return log;
+  }
+
+  /** The newest push (or merge) to `repo`'s `branch` that left it at `sha`, on the newest page of its activity. */
+  async pushOf(repo: string, branch: string, sha: string): Promise<PushLookup> {
+    const log = await this.activity(repo, branch);
+    return { push: log.entries.find((a) => a.after === sha) ?? null, kept: log.kept };
+  }
+
+  /** The first parent of `sha` in this repository; "" for a root commit. */
+  async firstParent(sha: string): Promise<string> {
+    const [c] = await this.#api(`repos/${this.repo}/git/commits/${sha}`);
+    const parents = (c as { parents?: unknown } | undefined)?.parents;
+    const first = str((Array.isArray(parents) ? (parents[0] as { sha?: unknown } | undefined) : undefined)?.sha);
+    return SHA_RE.test(first) ? first : "";
   }
 
   /**
-   * The pull request GitHub merged in `repo` as the commit `sha`: the one REST
-   * lists for the commit whose merge commit is `sha`, in that repository;
-   * null when there is none, or GraphQL disagrees about it. Its merger and
-   * auto-merge come from GraphQL ({@link MERGED_PULL_QUERY}).
+   * The merged pull requests of `repo` whose merge commit is `sha`: the ones
+   * REST lists for the commit, based in that repository, with that merge
+   * commit. More than one vouches for nothing, since which of them put the
+   * commit there can't be told. For exactly one, its merger, auto-merge, merge
+   * commit's parent and commit count come from GraphQL
+   * ({@link MERGED_PULL_QUERY}), and GraphQL disagreeing makes it none.
    *
-   * Its base isn't matched to the branch the commit is on: GitHub's stacked
-   * pull requests merge each onto its parent's branch and then fast-forward
-   * the default branch, so the one named at the default branch's head has
-   * the parent's branch as its base. What pins the branch is the activity
-   * that put `sha` on it, which the caller already read.
+   * Its base branch isn't matched: GitHub's stacked pull requests merge each
+   * onto its parent's branch and then move the default branch, so most in a
+   * stack have another pull request's branch as their base. What pins the
+   * branch is the activity that put the commit on it, which the caller read.
    */
-  async mergedPullOf(repo: string, sha: string): Promise<MergedPull | null> {
+  async mergedAs(repo: string, sha: string): Promise<MergedAs> {
     if (!isRepo(repo)) throw new GhError(`not a GitHub repository name: ${repo}`);
     const pages = await this.#api(`repos/${repo}/commits/${sha}/pulls?per_page=100`, true);
-    const p = pages
+    const matches = pages
       .flatMap((page) => (Array.isArray(page) ? page : []))
-      .find((x: Record<string, unknown>) => {
+      .filter((x: Record<string, unknown>) => {
         const base = (x.base ?? {}) as { repo?: { full_name?: unknown } | null };
         return (
           typeof x.number === "number" &&
@@ -533,8 +631,11 @@ export class GitHubSource {
           str(x.merged_at) !== "" &&
           str(base.repo?.full_name).toLowerCase() === repo.toLowerCase()
         );
-      }) as Record<string, unknown> | undefined;
-    if (!p) return null;
+      }) as Array<Record<string, unknown>>;
+    const numbers = [...new Set(matches.map((x) => x.number as number))];
+    if (numbers.length === 0) return { kind: "none" };
+    if (numbers.length > 1) return { kind: "many", numbers };
+    const p = matches[0]!;
     const number = p.number as number;
     const [owner, name] = repo.split("/") as [string, string];
     const [page] = parseJsonStream(
@@ -544,19 +645,28 @@ export class GitHubSource {
       ),
     );
     const q = (page as { data?: { repository?: { pullRequest?: Record<string, unknown> | null } | null } } | null)?.data?.repository?.pullRequest;
-    if (!q || q.merged !== true || str((q.mergeCommit as { oid?: unknown } | null | undefined)?.oid) !== sha) return null;
+    const mergeCommit = q?.mergeCommit as { oid?: unknown; parents?: { nodes?: unknown } | null } | null | undefined;
+    if (!q || q.merged !== true || str(mergeCommit?.oid) !== sha) return { kind: "none" };
     const events = (q.timelineItems as { nodes?: unknown } | null | undefined)?.nodes;
     const head = (p.head ?? {}) as { ref?: unknown; sha?: unknown; repo?: { full_name?: unknown } | null };
     const headRepo = str(head.repo?.full_name);
     const headSha = str(head.sha);
+    const parents = mergeCommit?.parents?.nodes;
+    const parent = str((Array.isArray(parents) ? (parents[0] as { oid?: unknown } | null | undefined) : undefined)?.oid);
+    const count = (q.commits as { totalCount?: unknown } | null | undefined)?.totalCount;
     return {
-      number,
-      mergedBy: login(q.mergedBy),
-      // Not knowing is judged as auto-merged: the stricter rule.
-      autoMerged: p.auto_merge !== null || q.autoMergeRequest !== null || !Array.isArray(events) || events.length > 0,
-      headRepo: isRepo(headRepo) ? headRepo : null,
-      headRef: str(head.ref),
-      headSha: SHA_RE.test(headSha) ? headSha : "",
+      kind: "one",
+      pull: {
+        number,
+        mergedBy: login(q.mergedBy),
+        // Not knowing is judged as auto-merged: the stricter rule.
+        autoMerged: p.auto_merge !== null || q.autoMergeRequest !== null || !Array.isArray(events) || events.length > 0,
+        headRepo: isRepo(headRepo) ? headRepo : null,
+        headRef: str(head.ref),
+        headSha: SHA_RE.test(headSha) ? headSha : "",
+        parent: SHA_RE.test(parent) ? parent : "",
+        commits: typeof count === "number" && Number.isInteger(count) && count > 0 ? count : 0,
+      },
     };
   }
 

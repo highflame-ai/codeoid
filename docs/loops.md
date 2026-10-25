@@ -103,7 +103,7 @@ It is opt-in, yours alone, and reads GitHub through the `gh` CLI you are already
 
 **A watch runs the code at your branch heads, unattended.**
 A run's checks execute that code, and so does the worker.
-What bounds it is the [trust rule](#who-a-watch-trusts): a head starts a run only when it was pushed by you, or by someone you named, or merged into its branch by one of you on top of code one of you vouched for (an auto-merged or queued pull request also needs its own head pushed or signed by one of you), or every commit on it is signed by one of you and verified.
+What bounds it is the [trust rule](#who-a-watch-trusts): a head starts a run only when it was pushed by you, or by someone you named, or merged by one of you with every change to the branch since a head one of you vouched for also a merge by one of you (an auto-merged or queued pull request also needs its own head pushed or signed by one of you), or every commit on it is signed by one of you and verified.
 
 ```bash
 codeoid loop watch add --workdir ~/src/shop --my-prs \
@@ -135,30 +135,51 @@ It also takes a GitHub App's bot login, such as `dependabot[bot]`, which trusts 
 
 Before a run starts, the watch asks GitHub who made the push that put the head on its branch, from the repository's activity (for a pull request from a fork, the fork's).
 GitHub records the account that authenticated, so a push by a trusted login vouches for the head, whatever its commits say.
-A merge puts the pull request's merge commit at the head of the branch it merged into, and the watch finds that pull request: the one GitHub merged as that commit.
-The activity already says which branch the merge landed on, so the pull request's own base isn't compared to it.
-That is what makes stacked pull requests work: GitHub merges each one in a stack onto its parent's branch and then fast-forwards the default branch, so the pull request named at the default branch's head has its parent's branch as its base.
-A pull request a trusted login merged with the button vouches for the head, like a trusted push.
-An auto-merged one doesn't by that alone: GitHub records whoever turned auto-merge on as the merger, and anyone with write access can push commits after that, which GitHub then merges.
-A merge through the merge queue doesn't either: GitHub records its bot as the actor of every merge queue merge, and the pull request names who queued it.
-So an auto-merged or queued pull request vouches for the head only when a trusted login turned auto-merge on or queued it, and its final head commit is itself trusted: pushed onto its branch by a trusted login, or every commit on it signed and verified by one (a merge one level further down doesn't count).
+A merge vouches for what it merged, not for what was already on the branch beneath it.
+A collaborator you don't trust can push straight to the branch, and your pull request merging on top of that push doesn't make their code yours.
+So a head that a merge put on its branch is trusted only when every change to the branch since a trusted head was a trusted merge.
+The watch follows the branch's activity back from the merge, one change at a time, each to the change that left the branch where the last one began.
+It stops, trusted, at the first of these:
+
+- a push by a trusted login (a trusted push vouches for everything beneath it);
+- the head this watch last judged trusted on that branch;
+- nothing at all (the branch's first change).
+
+Every change it passes on the way must be a trusted merge.
+Anything else on the way, and the merge vouches for nothing: a push by someone you don't trust, a merge that isn't trusted, any other kind of change, a head the watch already recorded untrusted, more than 30 changes, a merge that put more than 20 commits on the branch or more than 60 commits in all, or a change older than the newest 300 entries of the branch's activity (three pages).
+Only branches of the watched repository itself are followed this way: a merge on a fork's branch names no pull request of the watched repository.
+Then the head falls to the signature rule below, which the default branch itself never passes.
+
+A merge is trusted when every commit it put on the branch is the merge commit of exactly one merged pull request in the watched repository, and each of those pull requests is trusted.
+A commit that two merged pull requests both name as their merge commit vouches for nothing, since which of them put it there can't be told.
+A stack merged at once puts one commit per pull request on the branch, and a merge queue batch one per queued pull request: each pull request is judged, not only the one at the head.
+A rebase merge puts one commit per commit of the pull request on the branch, and GitHub names the pull request only at the last; the commits beneath it are taken as its own, as many as it had.
+A pull request's own base branch isn't compared to the branch: in a stack most pull requests are based on another one's branch.
+
+A pull request merged with the button is trusted when the login that pressed it is trusted, and GitHub records that same login as having merged it.
+An auto-merged one isn't by that alone: GitHub records whoever turned auto-merge on as the merger, and anyone with write access can push commits after that, which GitHub then merges.
+A merge through the merge queue isn't either: GitHub records its bot as the actor of every merge queue merge, and the pull request names who queued it.
+So an auto-merged or queued pull request is trusted only when a trusted login turned auto-merge on or queued it, and its final head commit is itself trusted: pushed onto its branch by a trusted login, or every commit on it signed and verified by one (a merge one level further down doesn't count).
 Otherwise the head is untrusted, with why, for example "auto-merged; its last commit was pushed by @someone".
 When GitHub doesn't say whether auto-merge was ever on for a pull request, it is judged as auto-merged.
 GitHub can take a moment to link a merge commit to its pull request, or to list the push of the pull request's head: like a push it doesn't list yet, the head is judged again for ten minutes.
 
-A merge vouches for what it merged, not for what was already on the branch beneath it.
-A collaborator you don't trust can push straight to the branch, and your pull request merging on top of that push doesn't make their code yours.
-So a merge vouches for the head only when what it landed on (the branch's head just before it, which GitHub's activity records) is itself vouched for, one level down: the branch had nothing before (its first push), or this watch already judged that head trusted, or the newest activity that put it on the branch is a push by a trusted login or a pull request a trusted login merged with the button (not auto-merged or queued).
-That one level isn't followed any further.
-When none of those holds, the merge vouches for nothing and the head falls to the signature rule below, which the default branch itself never passes.
-A merge queue merge can land a batch of pull requests at once, and GitHub names only the last as the one merged at the head; when that one is vouched for, the rest of the batch is trusted with it, but what's beneath the batch (the branch's head before the queue merged it) must itself be vouched for, as beneath any merge.
+What this means for a branch other people also merge to, such as a team's default branch:
+
+- List everyone who merges to it with `--trust`.
+  Otherwise each merge by someone not listed leaves every later head on that branch untrusted, until a trusted login pushes to it or the chain reaches the head the watch last trusted.
+- When you make or resume a watch, or change its trust list, its next poll judges every head it watches, and remembers the ones it trusts; being made trusts nothing by itself.
+  The remembered head is what lets a later chain stop short of the 30-change bound, so a branch that moves a lot is best watched from a head the watch trusts.
+- Turn on branch protection for the branch, so changes to it come through reviewed pull requests rather than direct pushes.
+- `--my-prs` is unaffected: your pull requests' heads are judged by who pushed them, and a trusted push vouches for everything beneath it.
+
 A trusted push vouches for every commit beneath the head too, including commits someone else wrote that you pulled and pushed on: pushing a branch is how you say its code is yours to run.
 The names on a commit vouch for nothing by themselves: GitHub ties a commit to an account by its email, which anyone can write into a commit.
 So when the push wasn't by a trusted login, or GitHub has no record of it, the head is trusted only if it has commits past the default branch (at most 250) and every one is signed, verified by GitHub, and committed by a trusted login.
 A head with no commits past the default branch — the default branch itself, or a head it already contains — has no signature to vouch for it, so only a trusted push or merge does.
 A commit committed by `web-flow` never counts: GitHub signs those for its web buttons (merge, rebase, update branch) whatever author the commit names, and the author is the commit's own say-so; what vouches for a button press is the activity record of who pressed it.
 GitHub's activity can lag a push by a few minutes: a head it doesn't list yet is judged again on each poll for ten minutes before it is recorded untrusted, and a comment on it waits to retry meanwhile.
-The activity only reaches back to 2023, and the watch reads its newest 100 entries for the branch, so a head pushed before that falls to the signature rule, and what a merge landed on that far back is vouched for only when the watch already judged it trusted.
+The activity only reaches back to 2023, and the watch reads the newest 100 entries for the branch to find who pushed a head (300 to follow a merge's chain), so a head pushed before that falls to the signature rule.
 Anything else and the head is ignored for good: `show` lists it as ignored, "not pushed by someone you trust", with why, and a later poll doesn't ask again.
 Changing a watch's trust list (`loop.watch.update`) judges its ignored heads again, and forgets the heads it judged trusted.
 
