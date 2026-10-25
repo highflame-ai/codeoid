@@ -653,13 +653,13 @@ export class ClaudeProvider implements SessionProvider {
    * The Claude Code CLI this provider's query runs in. The SDK spawns it
    * (spawnClaudeCodeProcess is not used: replacing the SDK's spawn would drop
    * its stderr diagnostics), so it is found as a direct child of this process
-   * whose argv names this provider's backing session (`--resume=<id>` /
-   * `--session-id <id>` — ids are UUIDs, unique per session).
+   * whose argv names this provider's backing session as an exact token
+   * (argvNamesSession — ids are UUIDs, unique per session).
    */
   async backendProcessIds(): Promise<number[]> {
     if (!this.#query) return [];
     const id = this.#spawnedWithId ?? this.#claudeCodeSessionId;
-    return (await listProcesses()).filter((p) => p.ppid === process.pid && p.args.includes(id)).map((p) => p.pid);
+    return (await listProcesses()).filter((p) => p.ppid === process.pid && argvNamesSession(p.args, id)).map((p) => p.pid);
   }
 
   async teardown(): Promise<void> {
@@ -1589,6 +1589,22 @@ export interface TranslateState {
   lastChainUuid?: string | null;
   /** The cwd the query runs in — where Claude files the session (#387). */
   cwd?: string;
+}
+
+/**
+ * Whether a Claude CLI command line names backing session `id` as an EXACT
+ * argv token — the forms the SDK emits (`--resume=<id>`, `--session-id=<id>`,
+ * SDK 0.3.281) and their two-token spelling. A substring match would also hit
+ * a process that merely mentions the id (a prompt, a log path). Exported for tests.
+ */
+export function argvNamesSession(args: string, id: string): boolean {
+  const argv = args.split(/\s+/);
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === `--resume=${id}` || a === `--session-id=${id}`) return true;
+    if ((a === "--resume" || a === "--session-id") && argv[i + 1] === id) return true;
+  }
+  return false;
 }
 
 /**

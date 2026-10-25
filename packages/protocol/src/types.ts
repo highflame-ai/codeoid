@@ -440,6 +440,12 @@ export interface SessionInfo {
   turnQueued?: true;
   /** Remaining turns budget for autonomous mode (undefined = unbounded, 0 = exhausted). */
   turnsRemaining?: number;
+  /**
+   * An unattended worker (onBudgetExhausted "end_attempt") spent its
+   * autonomous tool budget: its tool calls are refused until a person sets a
+   * mode or sends a message, or its controller sets a new budget. Absent = not.
+   */
+  budgetExhausted?: true;
   /** Files pinned to the session — prepended to every turn's prompt. */
   pinnedFiles?: string[];
   /** SPIFFE/WIMSE URI of the primary session agent (falls back to anonymous:session:<id>). */

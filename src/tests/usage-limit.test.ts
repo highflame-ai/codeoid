@@ -226,6 +226,13 @@ describe("classifyCliNotice — CLI-shaped rules only", () => {
     expect(classifyCliNotice("API Error: Request rejected (429) · this may be a temporary capacity issue.", { now: NOW })?.kind).toBe("rate_limit");
   });
 
+  test("the last block of a reply that narrated first", () => {
+    expect(classifyCliNotice("Working on it.\n\nYou've hit your weekly limit · resets Oct 28, 9am (UTC)", { now: NOW })?.resetAt).toBe(
+      Date.UTC(2026, 9, 28, 9, 0),
+    );
+    expect(classifyCliNotice("Done.\n\nThe API returned 429 Too Many Requests, so I added retries.", { now: NOW })).toBeNull();
+  });
+
   test("not when it is not the opening of the text", () => {
     expect(classifyCliNotice("Done. You've hit your session limit · resets 3pm (UTC)", { now: NOW })).toBeNull();
     expect(classifyCliNotice("The log said API Error: Repeated 529 Overloaded errors", { now: NOW })).toBeNull();

@@ -217,6 +217,11 @@ const CANCEL_REASON: Record<SessionUiResolvedMsg["reason"], NonNullable<UiRespon
   interrupted: "interrupted",
 };
 
+/** A person (or their token), as opposed to a daemon principal (`system:dispatch`, `system:routines`, …). */
+function isPersonSender(sender: AuthContext): boolean {
+  return !sender.sub.startsWith("system:");
+}
+
 /** The text of a turn failure source: an Error's message, a string, or an error object's `message`. */
 function failureText(source: unknown): string {
   if (source instanceof Error) return source.message;
@@ -2567,6 +2572,12 @@ export class Session {
 
   /** Change execution mode. Resets turn budget if moving out of autonomous. */
   setMode(mode: SessionMode, maxTurns?: number, sender?: AuthContext): void {
+    // A person choosing a mode is taking over: the ended attempt's lock is
+    // theirs to lift, whatever mode they pick (even the one already set).
+    if (this.#budgetExhausted && sender && isPersonSender(sender)) {
+      this.#budgetExhausted = false;
+      this.#broadcastInfoUpdate();
+    }
     if (this.#mode === mode && this.#turnsRemaining === maxTurns) return;
     this.#mode = mode;
     this.#turnsRemaining = mode === "autonomous" ? maxTurns : undefined;
@@ -3319,7 +3330,15 @@ export class Session {
     let turnId = joinsRunningTurn ? (previousTurnId as string) : this.#beginTurn();
     // Per-turn controls belong to a turn that STARTS here, not to one this
     // message only joins (its rate-limit record and interrupt are still live).
-    if (!joinsRunningTurn) this.#resetTurnControls();
+    if (!joinsRunningTurn) {
+      this.#resetTurnControls();
+      // A person prompting a spent end_attempt worker is taking over; a
+      // system principal (dispatcher, routines, the loop controller) is not.
+      if (this.#budgetExhausted && isPersonSender(sender)) {
+        this.#budgetExhausted = false;
+        this.#broadcastInfoUpdate();
+      }
+    }
     const turnAt = new Date().toISOString();
     try {
     const userMsg = this.#makeMessage(
@@ -5051,6 +5070,7 @@ export class Session {
       ...this.#accountInfo(),
       mode: this.#mode,
       turnsRemaining: this.#turnsRemaining,
+      ...(this.#budgetExhausted ? { budgetExhausted: true as const } : {}),
       pinnedFiles: [...this.#pinnedFiles],
       agentUri: this.#agentIdentity.sub,
       subagents: this.subagentSnapshot,
@@ -6108,8 +6128,11 @@ export class Session {
       // for a NEW autonomous budget.
       this.setMode("guarded");
       this.#budgetExhausted = true;
+      this.#broadcastInfoUpdate(); // setMode announced before the flag was set
     }
-    const reason = "The autonomous tool budget for this attempt is spent, so the attempt has ended. Do not retry; the controller decides what happens next.";
+    const reason =
+      "The autonomous tool budget for this attempt is spent, so the attempt has ended. Do not retry; the controller decides what happens next. " +
+      "(Operator: to take over, set a mode with /mode or send a message yourself; a controller re-arms it with a new autonomous budget.)";
     this.#resolveToolCallMessage(approvalId, { phase: "cancelled", reason: "denied", message: reason });
     this.#approvalPatchKeys.delete(approvalId);
     this.#store.audit(sender.sub, "session.budget_deny", this.id, `tool=${toolName}`);
@@ -6132,16 +6155,21 @@ export class Session {
         accountId: this.accountId,
         projectId: this.projectId,
       };
+      // Bound to the turn and background work of NOW: if the turn has moved
+      // on by the time this fires (a person took over and started another),
+      // it is not this denial's to stop.
+      const turnAtDenial = this.#currentTurnId;
+      const tasksAtDenial = [...this.#backgroundTasks.keys()];
       setTimeout(() => {
-        if (this.#destroyed) return;
+        if (this.#destroyed || this.#currentTurnId !== turnAtDenial) return;
         void (async () => {
           await this.interrupt(system);
           // interrupt() spares background agents while a turn runs; an ended
-          // attempt must not leave them working on the spent budget.
-          if (this.#backgroundTasks.size > 0 && this.#provider.stopBackgroundTasks) {
-            await this.#provider.stopBackgroundTasks([...this.#backgroundTasks.keys()]);
-            this.#clearBackgroundTasks();
-          }
+          // attempt must not leave them working on the spent budget. Each
+          // stopped task settles itself out of the set; one whose stop failed
+          // stays listed — it is still running.
+          const live = tasksAtDenial.filter((id) => this.#backgroundTasks.has(id));
+          if (live.length > 0 && this.#provider.stopBackgroundTasks) await this.#provider.stopBackgroundTasks(live);
         })().catch((e) => {
           console.error(`[codeoid/session ${this.id}] ending the attempt on a spent budget failed: ${e instanceof Error ? e.message : String(e)}`);
         });
@@ -7180,7 +7208,12 @@ export class Session {
           // or the turn's own assistant text (only if THIS turn committed it,
           // as above) — CLI-shaped rules only there, never the generic ones.
           this.#recordTurnFailure([event.result.errorMessage], {
-            cliTexts: [event.result.resultText, last?.role === "assistant" ? last.content : undefined],
+            cliTexts: [
+              event.result.resultText,
+              last?.role === "assistant" ? last.content : undefined,
+              // The reply's final text block on its own (the notice after narration).
+              last?.role === "assistant" ? (this.#accumulator.lastTextBlock ?? undefined) : undefined,
+            ],
             explained: tooLong || event.result.errorMessage === BUDGET_STOP_MESSAGE,
           });
           const hint = tooLong

@@ -115,6 +115,11 @@ const EXTRA_ENV_DENY_EXACT = new Set([
   // Backend runtime knobs: logging that can echo requests, and where temp
   // files (prompts, patches) land.
   "RUST_LOG", "RUST_BACKTRACE", "TMPDIR", "TEMP", "TMP", "TZ",
+  // Build tools that run a wrapper or take flags (a rustc wrapper is a
+  // program), CA bundles that let a proxy read requests, the user's SSH
+  // agent, and bash options / xtrace prompt (PS4 is expanded, so it runs code).
+  "RUSTC_WRAPPER", "RUSTFLAGS", "GOFLAGS", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "SSH_AUTH_SOCK",
+  "SHELLOPTS", "BASHOPTS", "PS4",
 ]);
 const EXTRA_ENV_DENY_PREFIXES = [
   // codeoid's own namespaces (DENY_PREFIXES above) — tokens, the escape hatch.
@@ -129,7 +134,7 @@ const EXTRA_ENV_DENY_PREFIXES = [
   // Toolchains whose env is configuration that can run code or swap
   // credentials: git (hooks via GIT_CONFIG_*, GIT_SSH_COMMAND), npm, Python,
   // Ruby, Perl, the JVM, gcloud. Locale categories (LC_*) too.
-  "GIT_", "NPM_CONFIG_", "PYTHON", "RUBY", "PERL5", "PERL_", "JAVA_", "_JAVA_", "JDK_", "CLOUDSDK_", "LC_",
+  "GIT_", "NPM_CONFIG_", "PYTHON", "RUBY", "PERL5", "PERL_", "JAVA_", "_JAVA_", "JDK_", "CLOUDSDK_", "LC_", "CARGO_",
 ] as const;
 const EXTRA_ENV_DENY_SUFFIXES = ["_API_KEY", "_API_TOKEN", "_AUTH_TOKEN", "_ACCESS_TOKEN", "_REFRESH_TOKEN", "_OAUTH_TOKEN"] as const;
 /**

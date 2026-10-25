@@ -29,6 +29,7 @@ import type { AuthContext, SessionStatus } from "../protocol/types.js";
 import type { CodeoidConfig } from "../config.js";
 
 const AUTH: AuthContext = { sub: "user:loops", scopes: [], delegationDepth: 0, accountId: "acc", projectId: "proj" };
+const SYSTEM: AuthContext = { ...AUTH, sub: "system:dispatch" };
 
 let tmp: string;
 let store: Store;
@@ -462,8 +463,8 @@ describe("end_attempt keeps the attempt ended (audit #4)", () => {
     await until(() => provider.stoppedTasks.includes("bg-1"));
     expect(session.budgetExhausted).toBe(true);
 
-    // A later prompt: still ended.
-    await session.send("try again", AUTH);
+    // A later prompt from a system principal (the dispatcher, a controller): still ended.
+    await session.send("try again", SYSTEM);
     await until(() => provider.canUseToolResults.length === 3);
     expect(provider.canUseToolResults[2]!.behavior).toBe("deny");
     await until(() => session.status === "idle");
@@ -552,5 +553,60 @@ describe("interrupt and terminate races (audit #8)", () => {
     expect(Date.now() - t0).toBeLessThan(2_000);
     expect(session.status).toBe("idle");
     expect(provider.teardownCount).toBe(1);
+  });
+});
+
+// ── Round-2 audit fixes ──────────────────────────────────────────────────────
+
+describe("a person can take over a spent end_attempt worker (audit-2 #1)", () => {
+  async function spentWorker() {
+    const provider = new MockSessionProvider("claude", [[bash(1), bashDone(1), bash(2)], [bash(3)]], { stall: true });
+    const session = makeSession({
+      _testProvider: provider,
+      initialMode: { mode: "autonomous", maxTurns: 1 },
+      onBudgetExhausted: "end_attempt",
+    });
+    const infos: Array<Record<string, unknown>> = [];
+    session.attach({ id: "c", auth: AUTH, send: (m) => { if (m.type === "session.info_update") infos.push(m as unknown as Record<string, unknown>); } });
+    await session.send("work", SYSTEM);
+    await until(() => provider.canUseToolResults.length === 2 && session.status === "idle");
+    expect(session.budgetExhausted).toBe(true);
+    return { provider, session, infos };
+  }
+
+  test("session info says so, and the denial says how to re-arm", async () => {
+    const { provider, session, infos } = await spentWorker();
+    const last = infos.at(-1) as { session?: { budgetExhausted?: boolean } } | undefined;
+    expect(JSON.stringify(last)).toContain('"budgetExhausted":true');
+    expect(provider.canUseToolResults[1]!.message).toContain("/mode");
+    void session;
+  });
+
+  test("a person's setMode lifts it — even to the mode already set; a system one does not", async () => {
+    const { session } = await spentWorker();
+    session.setMode("guarded", undefined, SYSTEM);
+    expect(session.budgetExhausted).toBe(true);
+    session.setMode("guarded", undefined, AUTH); // already guarded
+    expect(session.budgetExhausted).toBe(false);
+  });
+
+  test("a person's new turn lifts it: the call is gated normally, not denied", async () => {
+    const { provider, session } = await spentWorker();
+    await session.send("let me look", AUTH);
+    await until(() => session.pendingToolApprovals().length === 1);
+    expect(session.budgetExhausted).toBe(false);
+    expect(provider.canUseToolResults).toHaveLength(2); // the third call is waiting on a person, not refused
+    await session.interrupt(AUTH);
+  });
+});
+
+describe("the CLI notice as the reply's last block (audit-2 #6)", () => {
+  test("narration, then the limit notice", async () => {
+    const reply = "I'll start with the failing test.\n\nYou've hit your session limit · resets 3pm (UTC)";
+    const provider = new MockSessionProvider("claude", [[{ type: "text_done", content: reply }, done({ isError: true })]]);
+    const session = makeSession({ _testProvider: provider });
+    await session.send("work", AUTH);
+    await until(() => session.status === "error");
+    expect(session.lastTurnInfraError?.kind).toBe("usage_limit");
   });
 });

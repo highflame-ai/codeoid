@@ -294,7 +294,7 @@ export function classifyUsageLimit(
  * CLI-shaped rules only. That text can just as well be the model's own words
  * ("the API returned 429 Too Many Requests twice, so I added retries"), so the
  * generic rate-limit / 429 / quota rules never apply. A notice counts only
- * when the text OPENS with what the CLI composes:
+ * when the text — or its last block — OPENS with what the CLI composes:
  *
  *   - one of the SDK's USAGE_LIMIT_ERROR_PREFIXES (the generic openers still
  *     need a limit word on their first line), or the legacy
@@ -307,7 +307,15 @@ export function classifyCliNotice(
   opts: ClassifyUsageLimitOptions = {},
 ): UsageLimitClassification | null {
   if (!text) return null;
-  const t = normalize(text).trimStart();
+  const whole = cliNotice(normalize(text).trimStart(), opts);
+  if (whole) return whole;
+  // A turn that wrote something before the limit hit ends with the notice as
+  // its own last block: "I'll start with the tests.\n\nYou've hit your…".
+  const blocks = normalize(text).split(/\n\s*\n/).map((b) => b.trim()).filter(Boolean);
+  return blocks.length > 1 ? cliNotice(blocks[blocks.length - 1]!, opts) : null;
+}
+
+function cliNotice(t: string, opts: ClassifyUsageLimitOptions): UsageLimitClassification | null {
   if (/^API Error:/.test(t)) return classifyUsageLimit(t, opts);
   if (/^Claude AI usage limit reached/i.test(t) || startsWithLimitPrefix(t)) {
     const now = opts.now ?? Date.now();

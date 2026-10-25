@@ -13,7 +13,8 @@ import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { killSurvivors, listProcesses, parsePs, snapshotTree, treeOf } from "../daemon/process-tree.js";
+import { killSurvivors, listProcesses, parsePs, procStartTime, snapshotTree, treeOf } from "../daemon/process-tree.js";
+import { argvNamesSession } from "../daemon/providers/claude/index.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
 import { Session } from "../daemon/session.js";
 import { Store } from "../daemon/store.js";
@@ -33,6 +34,19 @@ describe("parsePs / treeOf", () => {
   test("the tree under a root, root included, nothing else", () => {
     expect(treeOf(table, [20]).map((p) => p.pid)).toEqual([20, 30, 31]);
     expect(treeOf(table, [99])).toEqual([]);
+  });
+
+  test("macOS lstart columns: five fields kept as the start token", () => {
+    expect(parsePs("  42     1 Sat Oct 24 10:08:43 2026 /bin/sh -c x", { lstart: true })).toEqual([
+      { pid: 42, ppid: 1, start: "Sat Oct 24 10:08:43 2026", args: "/bin/sh -c x" },
+    ]);
+  });
+
+  test.skipIf(process.platform !== "linux")("Linux start time from /proc/<pid>/stat field 22", () => {
+    const t = procStartTime(process.pid);
+    expect(t).toMatch(/^\d+$/);
+    expect(procStartTime(process.pid)).toBe(t);
+    expect(procStartTime(2 ** 30)).toBeUndefined();
   });
 
   test("never includes this process", () => {
@@ -111,6 +125,31 @@ describe.skipIf(process.platform === "win32")("killing what a backend left runni
     await until(() => !alive(grandchild));
   });
 
+  test.skipIf(process.platform !== "linux" && process.platform !== "darwin")("a different start time means a different process: spared", async () => {
+    const mark = String(800000 + Math.floor(Math.random() * 99999));
+    const { proc, grandchild } = await spawnBackend(mark);
+    leftovers.push(grandchild, proc.pid!);
+    const snap = await snapshotTree([proc.pid!]);
+    expect(snap.every((p) => p.start !== undefined)).toBe(true);
+    expect(await killSurvivors(snap.map((p) => ({ ...p, start: `${p.start}0` })))).toEqual([]);
+    expect(alive(grandchild)).toBe(true);
+  });
+
+  test("descendants spawned AFTER the snapshot are killed with the survivor", async () => {
+    const mark = String(800000 + Math.floor(Math.random() * 99999));
+    // The "backend" only starts its long command after we have snapshotted it.
+    const proc = spawn("sh", ["-c", `sleep 0.3; sleep ${mark} & echo $!; wait`], { stdio: ["ignore", "pipe", "ignore"] });
+    leftovers.push(proc.pid!);
+    const snap = await snapshotTree([proc.pid!]);
+    expect(snap.some((p) => p.args === `sleep ${mark}`)).toBe(false);
+    const late = await new Promise<number>((r) => proc.stdout!.once("data", (d: Buffer) => r(Number(String(d).trim()))));
+    leftovers.push(late);
+    const killed = await killSurvivors(snap);
+    expect(killed).toContain(proc.pid!);
+    expect(killed).toContain(late);
+    await until(() => !alive(late));
+  });
+
   test("Session.terminateBackend snapshots before the teardown and kills the leftover", async () => {
     const mark = String(800000 + Math.floor(Math.random() * 99999));
     const backend = new ProcessBackend("codex", [[{ type: "tool_start", toolId: "t1", sdkToolUseId: "s1", name: "Bash", input: { command: "x" }, approvalId: "a1" }]], { stall: true });
@@ -129,5 +168,21 @@ describe.skipIf(process.platform === "win32")("killing what a backend left runni
     expect(backend.teardownCount).toBe(1);
     await until(() => !alive(grandchild));
     expect(session.status).toBe("idle");
+  });
+});
+
+describe("argvNamesSession", () => {
+  const id = "0b9a3c1e-1111-4222-8333-444455556666";
+  test("the forms the SDK emits, and their two-token spelling", () => {
+    expect(argvNamesSession(`/x/claude --output-format stream-json --resume=${id} --verbose`, id)).toBe(true);
+    expect(argvNamesSession(`/x/claude --session-id=${id}`, id)).toBe(true);
+    expect(argvNamesSession(`/x/claude --resume ${id}`, id)).toBe(true);
+    expect(argvNamesSession(`/x/claude --session-id ${id} -p`, id)).toBe(true);
+  });
+  test("a mention of the id is not a match", () => {
+    expect(argvNamesSession(`grep ${id} /tmp/log`, id)).toBe(false);
+    expect(argvNamesSession(`/x/claude --resume=${id}-fork`, id)).toBe(false);
+    expect(argvNamesSession(`/x/claude --append-system-prompt=--resume=${id}`, id)).toBe(false);
+    expect(argvNamesSession(`/x/claude --resume=other ${id}`, id)).toBe(false);
   });
 });
