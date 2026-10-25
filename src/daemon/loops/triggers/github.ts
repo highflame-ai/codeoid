@@ -271,9 +271,13 @@ export interface CommentRecord {
   author: string;
   body: string;
   url: string | null;
+  /**
+   * When it was published: when its review was submitted, for a comment on a
+   * line drafted into a review (drafting it doesn't publish it).
+   */
   createdAt: number;
-  /** When it was last edited; `createdAt` when it never was. */
-  updatedAt: number;
+  /** GitHub records an edit of it (or doesn't say that it doesn't). */
+  edited: boolean;
   /** Review comments: the file and line it is on. */
   path?: string;
   line?: number;
@@ -292,11 +296,18 @@ export interface CommitPeople {
   verified: boolean;
 }
 
-/** Who made the push that put a commit at a branch's head. */
+/** Who made the push (or the merge) that put a commit at a branch's head. */
 export interface PushRecord {
   actor: string | null;
-  /** `push`, `force_push`, `branch_creation`, … (GitHub's activity types). */
+  /** `push`, `force_push`, `branch_creation`, `pr_merge`, `merge_queue_merge`, … (GitHub's activity types). */
   type: string;
+}
+
+/** What GitHub's activity says about a head: the push that made it, if listed, and whether GitHub keeps activity for the repository at all. */
+export interface PushLookup {
+  push: PushRecord | null;
+  /** False when GitHub keeps no activity for the repository (404): no record will come. */
+  kept: boolean;
 }
 
 /** Commits read to judge a head; more than this and it is not trusted. */
@@ -305,17 +316,36 @@ export const COMMITS_MAX = 250;
 /** Open pull requests one listing reads. */
 export const PRS_MAX = 100;
 
-/** A pull request's reviews, with when each was last edited (REST doesn't say). */
+/** A pull request's reviews, with when each was published and whether it was edited (REST says neither). */
 const REVIEWS_QUERY = `query($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       reviews(first: 100, after: $endCursor) {
         pageInfo { hasNextPage endCursor }
-        nodes { databaseId body url submittedAt lastEditedAt author { login } }
+        nodes { databaseId body url state publishedAt lastEditedAt author { login } }
       }
     }
   }
 }`;
+
+/**
+ * Comments REST listed, read again by their node ids: when each was published
+ * and whether it was edited, which REST doesn't say (its `created_at` on a
+ * line comment is when it was drafted, and its `updated_at` moves when the
+ * review is submitted), with the text read in the same response.
+ */
+const COMMENT_NODES_QUERY = `query($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    __typename
+    ... on IssueComment { databaseId body url publishedAt lastEditedAt author { login } pullRequest { number } }
+    ... on PullRequestReviewComment { databaseId body url state publishedAt lastEditedAt path line author { login } pullRequest { number } }
+  }
+}`;
+
+/** Node ids one GraphQL `nodes` query reads (GitHub's limit). */
+const NODES_PER_QUERY = 100;
+/** A GraphQL node id as GitHub writes them (`IC_kwDO…`, `PRRC_kwDO…`, or the legacy base64 form). */
+const NODE_ID_RE = /^[A-Za-z0-9_=+/-]{1,200}$/;
 
 const str = (v: unknown): string => (typeof v === "string" ? v : "");
 const login = (v: unknown): string | null => str((v as { login?: unknown } | null | undefined)?.login) || null;
@@ -385,27 +415,27 @@ export class GitHubSource {
   }
 
   /**
-   * The newest push to `repo`'s `branch` that left it at `sha`, from GitHub's
-   * record of the repository's activity, or null when the newest page has
-   * none (or GitHub keeps no activity for the repository). GitHub records the
-   * account that pushed — the one that authenticated — not anything a commit
-   * says about itself.
+   * The newest push (or merge) to `repo`'s `branch` that left it at `sha`,
+   * from GitHub's record of the repository's activity; none when the newest
+   * page has none. GitHub records the account that authenticated — who
+   * pushed, or who pressed the merge button — not anything a commit says
+   * about itself.
    */
-  async pushOf(repo: string, branch: string, sha: string): Promise<PushRecord | null> {
+  async pushOf(repo: string, branch: string, sha: string): Promise<PushLookup> {
     if (!isRepo(repo)) throw new GhError(`not a GitHub repository name: ${repo}`);
     let page: unknown;
     try {
       [page] = await this.#api(`repos/${repo}/activity?ref=${encodeURIComponent(`refs/heads/${branch}`)}&per_page=100`);
     } catch (err) {
-      if (err instanceof GhError && err.status === 404) return null;
+      if (err instanceof GhError && err.status === 404) return { push: null, kept: false };
       throw err;
     }
     if (!Array.isArray(page)) throw new GhError("GitHub's activity list is not a list");
     // Newest first, as GitHub returns it.
     for (const a of page as Array<Record<string, unknown>>) {
-      if (str(a.after) === sha) return { actor: login(a.actor), type: str(a.activity_type) };
+      if (str(a.after) === sha) return { push: { actor: login(a.actor), type: str(a.activity_type) }, kept: true };
     }
-    return null;
+    return { push: null, kept: true };
   }
 
   /**
@@ -468,9 +498,11 @@ export class GitHubSource {
 
   /**
    * Review comments, conversation comments, and review bodies on a pull
-   * request, each with when it was made and last edited. `since` narrows the
-   * two comment lists by when they were last updated (the reviews list has no
-   * such filter); callers still judge each by when it was made.
+   * request, each with when it was published and whether it was edited, read
+   * through GraphQL; nothing still pending (a draft, an unsubmitted review).
+   * `since` narrows the two comment lists by when they were last updated
+   * (REST lists them, then GraphQL reads each; the reviews list has no such
+   * filter); callers still judge each by when it was published.
    */
   async prComments(pr: number, since: number): Promise<CommentRecord[]> {
     const iso = new Date(since).toISOString();
@@ -478,25 +510,12 @@ export class GitHubSource {
       const t = Date.parse(str(v));
       return Number.isFinite(t) ? t : null;
     };
-    const records = (kind: "review" | "issue", pages: unknown[]): CommentRecord[] =>
+    // Unknown is not "never": judged as edited.
+    const edited = (v: unknown): boolean => v !== null;
+    const nodeIds = (pages: unknown[]): string[] =>
       pages
         .flatMap((page) => (Array.isArray(page) ? page : []))
-        .flatMap((c: Record<string, unknown>) => {
-          if (typeof c.id !== "number") return [];
-          const created = time(c.created_at) ?? 0;
-          return [{
-            id: c.id,
-            kind,
-            author: str((c.user as { login?: unknown } | undefined)?.login),
-            body: str(c.body),
-            url: str(c.html_url) || null,
-            createdAt: created,
-            // Unknown is not "never": judged as edited.
-            updatedAt: time(c.updated_at) ?? Number.POSITIVE_INFINITY,
-            ...(str(c.path) ? { path: str(c.path) } : {}),
-            ...(typeof c.line === "number" ? { line: c.line } : {}),
-          }];
-        });
+        .flatMap((c: Record<string, unknown>) => (typeof c.id === "number" && NODE_ID_RE.test(str(c.node_id)) ? [str(c.node_id)] : []));
     const [owner, name] = this.repo.split("/") as [string, string];
     const [review, issue, reviewPages] = await Promise.all([
       this.#api(`repos/${this.repo}/pulls/${pr}/comments?per_page=100&since=${iso}`, true),
@@ -506,23 +525,54 @@ export class GitHubSource {
         `GitHub reviews of pull request #${pr}`,
       ).then(parseJsonStream),
     ]);
+    const ids = [...new Set([...nodeIds(review), ...nodeIds(issue)])];
+    const comments: CommentRecord[] = [];
+    for (let i = 0; i < ids.length; i += NODES_PER_QUERY) {
+      const chunk = ids.slice(i, i + NODES_PER_QUERY);
+      const [page] = parseJsonStream(
+        await this.#run(["api", "graphql", ...chunk.flatMap((id) => ["-f", `ids[]=${id}`]), "-f", `query=${COMMENT_NODES_QUERY}`], `GitHub comments on pull request #${pr}`),
+      );
+      const nodes = (page as { data?: { nodes?: unknown } } | null)?.data?.nodes;
+      if (!Array.isArray(nodes)) throw new GhError(`GitHub returned no comments on pull request #${pr}`);
+      for (const c of nodes as Array<Record<string, unknown> | null>) {
+        // Null: deleted since it was listed.
+        if (!c || typeof c.databaseId !== "number") continue;
+        const kind = c.__typename === "PullRequestReviewComment" ? "review" : c.__typename === "IssueComment" ? "issue" : null;
+        if (!kind || (c.pullRequest as { number?: unknown } | null | undefined)?.number !== pr) continue;
+        // A line comment in a review not yet submitted isn't published: no one but its author sees it.
+        const published = time(c.publishedAt);
+        if (published === null || (kind === "review" && str(c.state) !== "SUBMITTED")) continue;
+        comments.push({
+          id: c.databaseId,
+          kind,
+          author: login(c.author) ?? "",
+          body: str(c.body),
+          url: str(c.url) || null,
+          createdAt: published,
+          edited: edited(c.lastEditedAt),
+          ...(str(c.path) ? { path: str(c.path) } : {}),
+          ...(typeof c.line === "number" ? { line: c.line } : {}),
+        });
+      }
+    }
     const reviews = reviewPages.flatMap((page): CommentRecord[] => {
       const conn = (page as { data?: { repository?: { pullRequest?: { reviews?: { nodes?: unknown } } } } } | null)?.data?.repository?.pullRequest?.reviews;
       if (!conn || !Array.isArray(conn.nodes)) throw new GhError(`GitHub returned no reviews of pull request #${pr}`);
       return (conn.nodes as Array<Record<string, unknown> | null>).flatMap((r) => {
         if (!r || typeof r.databaseId !== "number" || str(r.body).trim() === "") return [];
-        const created = time(r.submittedAt) ?? 0;
+        const published = time(r.publishedAt);
+        if (published === null || str(r.state) === "PENDING") return [];
         return [{
           id: r.databaseId,
           kind: "review_body" as const,
           author: login(r.author) ?? "",
           body: str(r.body),
           url: str(r.url) || null,
-          createdAt: created,
-          updatedAt: r.lastEditedAt === null ? created : (time(r.lastEditedAt) ?? Number.POSITIVE_INFINITY),
+          createdAt: published,
+          edited: edited(r.lastEditedAt),
         }];
       });
     });
-    return [...records("review", review), ...records("issue", issue), ...reviews].sort((a, b) => a.createdAt - b.createdAt || a.id - b.id);
+    return [...comments, ...reviews].sort((a, b) => a.createdAt - b.createdAt || a.id - b.id);
   }
 }

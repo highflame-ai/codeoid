@@ -43,7 +43,12 @@ interface Comment {
   id: number;
   login: string;
   body: string;
+  /** When it was published (for a line comment in a review: when the review was submitted). */
   at?: number;
+  /** A line comment drafted into a review before the review was submitted: when it was drafted. */
+  draftedAt?: number;
+  /** In a review not yet submitted. */
+  pending?: boolean;
   /** When it was last edited, if it was. */
   editedAt?: number;
   kind?: "review" | "issue" | "review_body";
@@ -63,6 +68,11 @@ interface Push {
   after: string;
   actor: string | null;
   type?: string;
+}
+
+/** A comment's GraphQL node id, as REST reports it. */
+function nodeIdOf(c: Comment): string {
+  return `${c.kind === "review" ? "PRRC" : "IC"}_kwDO${c.id}`;
 }
 
 /** A scripted GitHub: PRs, branch heads, check runs per sha, comments per PR, commits per head, pushes. */
@@ -102,6 +112,36 @@ class FakeGitHub {
       );
     }
     if (args[0] === "api" && args[1] === "graphql") {
+      const query = args.find((a) => a.startsWith("query="))!;
+      const iso = (t: number | undefined) => (t === undefined ? null : new Date(t).toISOString());
+      if (query.includes("nodes(ids:")) {
+        // Comments by node id, as GitHub's GraphQL reports them: published
+        // when their review was submitted (null while it is pending), drafted
+        // at `createdAt`, and `lastEditedAt` only for an edit.
+        const ids = args.filter((a) => a.startsWith("ids[]=")).map((a) => a.slice(6));
+        const nodes = ids.map((nodeId) => {
+          for (const [number, list] of this.comments) {
+            const c = list.find((x) => nodeIdOf(x) === nodeId);
+            if (!c) continue;
+            const at = c.at ?? Date.now() + 1_000;
+            const review = c.kind === "review";
+            return {
+              __typename: review ? "PullRequestReviewComment" : "IssueComment",
+              databaseId: c.id,
+              body: c.body,
+              url: `https://github.com/${REPO}/pull/${number}#c${c.id}`,
+              createdAt: new Date(c.draftedAt ?? at).toISOString(),
+              publishedAt: c.pending ? null : new Date(at).toISOString(),
+              lastEditedAt: iso(c.editedAt),
+              ...(review ? { state: c.pending ? "PENDING" : "SUBMITTED", path: "src/cart.ts", line: 3 } : {}),
+              author: { login: c.login },
+              pullRequest: { number },
+            };
+          }
+          return null;
+        });
+        return ok({ data: { nodes } });
+      }
       const number = Number(args.find((a) => a.startsWith("number="))!.slice(7));
       const nodes = (this.comments.get(number) ?? [])
         .filter((c) => c.kind === "review_body")
@@ -111,8 +151,9 @@ class FakeGitHub {
             databaseId: c.id,
             body: c.body,
             url: `https://github.com/${REPO}/pull/${number}#r${c.id}`,
-            submittedAt: new Date(at).toISOString(),
-            lastEditedAt: c.editedAt === undefined ? null : new Date(c.editedAt).toISOString(),
+            state: c.pending ? "PENDING" : "COMMENTED",
+            publishedAt: c.pending ? null : new Date(at).toISOString(),
+            lastEditedAt: iso(c.editedAt),
             author: { login: c.login },
           };
         });
@@ -177,22 +218,23 @@ class FakeGitHub {
     if (m) {
       const kind = m[1] === "pulls" ? "review" : "issue";
       const since = Date.parse(new URLSearchParams(m[4]).get("since") ?? "");
+      // As REST reports them: a line comment's `created_at` is when it was
+      // drafted, and submitting its review moves its `updated_at` (as an
+      // edit does), which is what `since` filters on. Pending ones listed too.
+      const updated = (c: Comment) => Math.max(c.editedAt ?? 0, c.at ?? Date.now() + 1_000);
       const list = (this.comments.get(Number(m[2])) ?? [])
         .filter((c) => (c.kind ?? "issue") === kind)
-        // GitHub's `since` is on the last update; here, when it was made.
-        .filter((c) => Number.isNaN(since) || (c.editedAt ?? c.at ?? Date.now() + 1_000) >= since);
+        .filter((c) => Number.isNaN(since) || updated(c) >= since);
       return ok(
-        list.map((c) => {
-          const at = new Date(c.at ?? Date.now() + 1_000).toISOString();
-          return {
-            id: c.id,
-            user: { login: c.login },
-            body: c.body,
-            html_url: `https://github.com/${REPO}/pull/${m![2]}#c${c.id}`,
-            created_at: at,
-            updated_at: c.editedAt === undefined ? at : new Date(c.editedAt).toISOString(),
-          };
-        }),
+        list.map((c) => ({
+          id: c.id,
+          node_id: nodeIdOf(c),
+          user: { login: c.login },
+          body: c.body,
+          html_url: `https://github.com/${REPO}/pull/${m![2]}#c${c.id}`,
+          created_at: new Date(c.draftedAt ?? c.at ?? Date.now() + 1_000).toISOString(),
+          updated_at: new Date(updated(c)).toISOString(),
+        })),
       );
     }
     return { code: 1, stdout: "", stderr: `unscripted: gh ${joined}` };
@@ -574,7 +616,7 @@ describe("trust: a head runs only when a trusted login pushed it, or signed ever
     expect(loops.started[0]!.input.baseRef!.trusted).toBe(true);
   });
 
-  test("only the newest push that left the branch at the head counts, and only a push", async () => {
+  test("only the newest activity that left the branch at the head counts, and only a push or a merge", async () => {
     const w = await prWatch();
     failing();
     gh.pushes = [
@@ -584,19 +626,47 @@ describe("trust: a head runs only when a trusted login pushed it, or signed ever
     expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
     gh.prs[0]!.headRefOid = SHA2;
     failing(SHA2, 601);
-    gh.pushes = [{ branch: "feature/cart", after: SHA2, actor: "ada", type: "pr_merge" }];
+    gh.pushes = [{ branch: "feature/cart", after: SHA2, actor: "ada", type: "branch_deletion" }];
     const res = await svc.poll(w.id, OWNER);
     expect(res.started).toHaveLength(0);
-    expect(res.skipped.join()).toContain("pr_merge");
+    expect(res.skipped.join()).toContain("branch_deletion, not a push or a merge");
   });
 
-  test("with no push on record, every commit must be signed, verified, and committed by a trusted login", async () => {
+  test("a merge GitHub records as a trusted login's (its button, or the merge queue) vouches for the head", async () => {
+    // Watching the default branch: the merge commit is its head, and the activity names who merged.
+    const w = await svc.create({ workdir: "/repo", branches: ["main"], ci: CI }, OWNER);
+    gh.branches.set("main", SHA1);
+    failing();
+    gh.commits.set(SHA1, [{ sha: "a".repeat(40), author: "mallory", committer: "web-flow", verified: true }]);
+    gh.pushes = [{ branch: "main", after: SHA1, actor: "ada", type: "pr_merge" }];
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(1);
+    loops.active.clear();
+    gh.branches.set("main", SHA2);
+    failing(SHA2, 601);
+    gh.pushes = [{ branch: "main", after: SHA2, actor: "ada", type: "merge_queue_merge" }];
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(1);
+    expect(loops.started.map((r) => r.input.baseRef!.sha)).toEqual([SHA1, SHA2]);
+  });
+
+  test("a merge by a stranger is untrusted", async () => {
+    const w = await svc.create({ workdir: "/repo", branches: ["main"], ci: CI }, OWNER);
+    gh.branches.set("main", SHA1);
+    failing();
+    gh.commits.set(SHA1, [{ sha: "a".repeat(40), author: "ada", committer: "ada" }]);
+    gh.pushes = [{ branch: "main", after: SHA1, actor: "mallory", type: "pr_merge" }];
+    const res = await svc.poll(w.id, OWNER);
+    expect(res.started).toHaveLength(0);
+    expect(store.listTriggers(w.id)[0]).toMatchObject({ outcome: "ignored" });
+    expect(store.listTriggers(w.id)[0]!.note).toContain("merged by @mallory");
+  });
+
+  test("with no trusted push on record, every commit must be signed, verified, and committed by a trusted login", async () => {
     const w = await prWatch();
-    gh.defaultPusher = null;
+    mallory();
     failing();
     gh.commits.set(SHA1, [
       { sha: "a".repeat(40), author: "mallory", committer: "ada", verified: true },
-      { sha: "b".repeat(40), author: "ada", committer: "web-flow", verified: true },
+      { sha: "b".repeat(40), author: "bob", committer: "ada", verified: true },
     ]);
     expect((await svc.poll(w.id, OWNER)).started).toHaveLength(1);
     expect(loops.started[0]!.input.baseRef!.trusted).toBe(true);
@@ -604,30 +674,85 @@ describe("trust: a head runs only when a trusted login pushed it, or signed ever
     // One unsigned commit among them, and the head is untrusted.
     gh.prs[0]!.headRefOid = SHA2;
     failing(SHA2, 601);
+    mallory();
     gh.commits.set(SHA2, [
       { sha: "a".repeat(40), author: "ada", committer: "ada", verified: true },
       { sha: "c".repeat(40), author: "ada", committer: "ada" },
     ]);
     const res = await svc.poll(w.id, OWNER);
     expect(res.started).toHaveLength(0);
-    expect(res.skipped.join()).toContain("GitHub has no record of the push");
+    expect(res.skipped.join()).toContain("pushed by @mallory");
     expect(res.skipped.join()).toContain(`${"c".repeat(12)} isn't signed and verified`);
   });
 
-  test("a signed commit by someone untrusted, or a web-flow commit for one, is untrusted", async () => {
+  test("a signed commit by someone untrusted is untrusted", async () => {
     const w = await prWatch();
-    gh.defaultPusher = null;
+    mallory();
     failing();
     gh.commits.set(SHA1, [{ sha: "e".repeat(40), author: "ada", committer: "mallory", verified: true }]);
     const first = await svc.poll(w.id, OWNER);
     expect(first.started).toHaveLength(0);
     expect(first.skipped.join()).toContain("signed by @mallory");
-    gh.prs[0]!.headRefOid = SHA2;
-    failing(SHA2, 601);
-    gh.commits.set(SHA2, [{ sha: "f".repeat(40), author: "mallory", committer: "web-flow", verified: true }]);
-    const second = await svc.poll(w.id, OWNER);
-    expect(second.started).toHaveLength(0);
-    expect(second.skipped.join()).toContain("made on GitHub for @mallory");
+  });
+
+  test("a web-flow commit vouches for no one: a rebase-merge that names you as its author is untrusted", async () => {
+    const w = await prWatch();
+    mallory();
+    failing();
+    // GitHub signs web-flow commits for whatever author they carry, and the author is the commit's own say-so.
+    gh.commits.set(SHA1, [{ sha: "f".repeat(40), author: "ada", committer: "web-flow", verified: true }]);
+    const res = await svc.poll(w.id, OWNER);
+    expect(res.started).toHaveLength(0);
+    expect(store.listTriggers(w.id)[0]!.note).toContain("committed on GitHub by web-flow");
+    await expect(svc.create({ workdir: "/r2", myPrs: true, ci: CI, trust: ["Web-Flow"] }, OWNER)).rejects.toThrow("web-flow can't be trusted");
+  });
+
+  test("a head with no commits past the default branch has nothing to vouch for it", async () => {
+    // Watching the default branch itself: compare finds no commits.
+    const w = await svc.create({ workdir: "/repo", branches: ["main"], ci: CI }, OWNER);
+    gh.branches.set("main", SHA1);
+    failing();
+    gh.commits.set(SHA1, []);
+    gh.pushes = [{ branch: "main", after: SHA1, actor: "mallory" }];
+    const res = await svc.poll(w.id, OWNER);
+    expect(res.started).toHaveLength(0);
+    expect(store.listTriggers(w.id)[0]).toMatchObject({ outcome: "ignored" });
+    expect(store.listTriggers(w.id)[0]!.note).toContain("no commits past main");
+  });
+
+  test("a head GitHub's activity doesn't list yet is judged again, and runs once its push appears", async () => {
+    let now = Date.now();
+    svc = make({ now: () => now });
+    const w = await prWatch();
+    gh.defaultPusher = null; // the activity list lags the push
+    failing();
+    const waiting = await svc.poll(w.id, OWNER);
+    expect(waiting.started).toHaveLength(0);
+    expect(waiting.skipped.join()).toContain("judged again on the next poll");
+    expect(store.listTriggers(w.id)).toHaveLength(0); // not recorded untrusted
+    now += 5 * 60_000;
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
+    gh.pushes = [{ branch: "feature/cart", after: SHA1, actor: "ada" }];
+    now += 60_000;
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(1);
+  });
+
+  test("a head GitHub's activity still doesn't list after ten minutes is recorded untrusted", async () => {
+    let now = Date.now();
+    svc = make({ now: () => now });
+    const w = await prWatch({ review: { enabled: true } });
+    gh.defaultPusher = null;
+    failing();
+    gh.comments.set(12, [{ id: 7, login: "ada", body: "@codeoid rename it", at: now + 1_000 }]);
+    await svc.poll(w.id, OWNER);
+    // A comment on it waits to retry meanwhile, so it isn't lost.
+    expect(store.listTriggers(w.id).find((t) => t.key === `review:${REPO}:issue:7`)).toMatchObject({ outcome: "retry" });
+    now += 11 * 60_000;
+    const res = await svc.poll(w.id, OWNER);
+    expect(res.started).toHaveLength(0);
+    const t = store.listTriggers(w.id).find((r) => r.key.startsWith("untrusted:"));
+    expect(t).toMatchObject({ outcome: "ignored" });
+    expect(t!.note).toContain("GitHub's activity has no record of the push");
   });
 
   test("`trust` names more people; changing it judges the head again", async () => {
@@ -931,6 +1056,25 @@ describe("API cost", () => {
     await expect(svc.create({ workdir: "/r10", myPrs: true, ci: CI }, OWNER)).rejects.toThrow("10 loop watches");
   });
 
+  test("a poll whose errors aren't rate limits starts the doubling over", async () => {
+    let now = Date.parse("2026-10-25T10:00:00Z");
+    svc = make({ now: () => now });
+    await prWatch();
+    gh.failOn = "pr list";
+    gh.failWith = "HTTP 429: Too Many Requests";
+    await svc.tick(); // backs off 10 minutes
+    now += 10 * 60_000 + 1;
+    gh.failWith = "HTTP 502: Bad Gateway";
+    await svc.tick(); // an error, but not a rate limit
+    now += 60_000;
+    gh.failWith = "HTTP 429: Too Many Requests";
+    await svc.tick(); // backs off 10 minutes again, not 20
+    const calls = gh.calls.length;
+    now += 10 * 60_000 + 1;
+    await svc.tick();
+    expect(gh.calls.length).toBe(calls + 2);
+  });
+
   test("rate limiting backs the watch off, doubling, and a good poll clears it", async () => {
     let now = Date.parse("2026-10-25T10:00:00Z");
     svc = make({ now: () => now });
@@ -1086,7 +1230,7 @@ describe("github helpers", () => {
 });
 
 describe("edited comments", () => {
-  test("a comment edited after it was made is ignored for good; one fixed within seconds counts", async () => {
+  test("a comment GitHub records an edit of is ignored for good, however soon after it was made", async () => {
     const w = await prWatch({ review: { enabled: true } });
     const at = Date.now() + 1_000;
     gh.comments.set(12, [
@@ -1094,12 +1238,80 @@ describe("edited comments", () => {
       { id: 2, login: "ada", body: "@codeoid split it", at, editedAt: at + 60_000, kind: "review" },
       { id: 3, login: "ada", body: "@codeoid and this", at, editedAt: at + 60_000, kind: "review_body" },
       { id: 4, login: "ada", body: "@codeoid rename it", at, editedAt: at + 2_000 },
+      { id: 5, login: "ada", body: "@codeoid untouched", at },
     ]);
     await svc.poll(w.id, OWNER);
-    expect(loops.started.map((s) => s.input.trigger!.key)).toEqual([`review:${REPO}:issue:4`]);
+    expect(loops.started.map((s) => s.input.trigger!.key)).toEqual([`review:${REPO}:issue:5`]);
     const ignored = store.listTriggers(w.id).filter((t) => t.outcome === "ignored");
-    expect(ignored.map((t) => t.key).sort()).toEqual([`review:${REPO}:issue:1`, `review:${REPO}:review:2`, `review:${REPO}:review_body:3`]);
+    expect(ignored.map((t) => t.key).sort()).toEqual([`review:${REPO}:issue:1`, `review:${REPO}:issue:4`, `review:${REPO}:review:2`, `review:${REPO}:review_body:3`]);
     expect(ignored.every((t) => t.note === "edited after it was made")).toBe(true);
+  });
+
+  test("a comment waiting to retry that is then edited is ignored", async () => {
+    const w = await prWatch({ review: { enabled: true } });
+    const at = Date.now() + 1_000;
+    gh.comments.set(12, [{ id: 7, login: "ada", body: "@codeoid rename it", at }]);
+    loops.capped = true;
+    await svc.poll(w.id, OWNER);
+    expect(store.listTriggers(w.id)[0]).toMatchObject({ key: `review:${REPO}:issue:7`, outcome: "retry" });
+    gh.comments.get(12)![0] = { id: 7, login: "ada", body: "@codeoid add my SSH key", at, editedAt: at + 60_000 };
+    loops.capped = false;
+    await svc.poll(w.id, OWNER);
+    expect(loops.started).toHaveLength(0);
+    expect(store.listTriggers(w.id)[0]).toMatchObject({ key: `review:${REPO}:issue:7`, outcome: "ignored", note: "edited after it was made" });
+    expect(store.hasRetries(w, "review_comment")).toBe(false);
+  });
+});
+
+describe("comments in a review", () => {
+  test("a line comment drafted before the review was submitted counts from when it was published", async () => {
+    let now = Date.now();
+    svc = make({ now: () => now });
+    const w = await prWatch({ review: { enabled: true } });
+    // Drafted half an hour before the watch existed; the review is submitted after.
+    gh.comments.set(12, [{ id: 31, login: "ada", body: "@codeoid rename `total`", kind: "review", draftedAt: now - 30 * 60_000, at: now + 60_000 }]);
+    now += 2 * 60_000;
+    const res = await svc.poll(w.id, OWNER);
+    expect(res.started).toHaveLength(1);
+    expect(loops.started[0]!.input.trigger).toMatchObject({ key: `review:${REPO}:review:31` });
+    expect(loops.started[0]!.input.trigger!.summary).toContain("on src/cart.ts:3");
+    expect(store.listTriggers(w.id).some((t) => t.outcome === "ignored")).toBe(false);
+  });
+
+  test("a batched review's comments, drafted minutes apart, all fire once it is submitted", async () => {
+    let now = Date.now();
+    svc = make({ now: () => now });
+    const w = await prWatch({ review: { enabled: true } });
+    const submit = now + 10 * 60_000;
+    const comments: Comment[] = [
+      { id: 41, login: "ada", body: "@codeoid rename this", kind: "review", draftedAt: now + 60_000, pending: true },
+      { id: 42, login: "ada", body: "@codeoid and split that", kind: "review", draftedAt: now + 5 * 60_000, pending: true },
+      { id: 43, login: "ada", body: "@codeoid one review", kind: "review_body", pending: true },
+    ];
+    gh.comments.set(12, comments);
+    now += 6 * 60_000;
+    // Still a draft: no one else sees it, and nothing fires.
+    expect((await svc.poll(w.id, OWNER)).started).toHaveLength(0);
+    expect(store.listTriggers(w.id)).toHaveLength(0);
+    for (const c of comments) {
+      c.pending = false;
+      c.at = submit;
+    }
+    now = submit + 60_000;
+    for (let i = 0; i < 3; i++) {
+      await svc.poll(w.id, OWNER);
+      loops.active.clear(); // one run at a time on the branch
+      now += 60_000;
+    }
+    expect(loops.started.map((r) => r.input.trigger!.key).sort()).toEqual([`review:${REPO}:review:41`, `review:${REPO}:review:42`, `review:${REPO}:review_body:43`]);
+  });
+
+  test("comments are read through GraphQL by the node ids REST listed, a hundred at a time", async () => {
+    const w = await prWatch({ review: { enabled: true } });
+    gh.comments.set(12, Array.from({ length: 150 }, (_, i) => ({ id: 1_000 + i, login: "bob", body: "lgtm" })));
+    await svc.poll(w.id, OWNER);
+    const reads = gh.calls.filter((c) => c[1] === "graphql" && c.some((a) => a.includes("nodes(ids:")));
+    expect(reads.map((c) => c.filter((a) => a.startsWith("ids[]=")).length)).toEqual([100, 50]);
   });
 });
 

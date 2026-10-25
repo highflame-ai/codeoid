@@ -22,7 +22,7 @@ import type { Session } from "../session.js";
 import { brokenShares, loadSetupRecipe, parseSetupRecipe, prepareWorktree, SETUP_RECIPE_PATH, type WorktreeSetupPolicy } from "../workspace-setup.js";
 import { assertNoLinkedParent, commitTree, copyDir, fingerprint, listTree, removeTree, removeTreeAsync, type NameFolding, ObjectReader, resolveUnder, restoreTree, type Stamps, writeTree } from "./materialize.js";
 import type { CandidateCheckout, LoopHost, PreparedWorkspace, WorkerInfo } from "./service.js";
-import { githubFetch } from "./triggers/github.js";
+import { githubFetch, parseGithubRemote } from "./triggers/github.js";
 import { type LoopRunRow, LoopWorkspaceUnsupportedError } from "./types.js";
 
 
@@ -72,20 +72,57 @@ async function clockPast(dir: string, ctimeNs: bigint): Promise<void> {
   }
 }
 
-/** The values of every config key matching `pattern`, in every scope. */
-function configValues(cwd: string, pattern: string): Promise<string[]> {
+/** Every config key matching `pattern`, in every scope, with its value; null when git can't tell. */
+function configEntries(cwd: string, pattern: string): Promise<Array<[string, string]> | null> {
   return new Promise((res) => {
     execFile(GIT_BIN, ["config", "--null", "--get-regexp", pattern], { cwd, env: gitEnv({ LANG: "C" }), timeout: 30_000 }, (err, stdout) => {
-      // Exit 1: nothing matches. Anything else can't tell, so it refuses.
-      if (err) return (err as { code?: unknown }).code === 1 ? res([]) : res(["?"]);
+      // Exit 1: nothing matches.
+      if (err) return res((err as { code?: unknown }).code === 1 ? [] : null);
       res(
         stdout
           .split("\0")
           .filter(Boolean)
-          .map((kv) => kv.slice(kv.indexOf("\n") + 1)),
+          .map((kv): [string, string] => (kv.includes("\n") ? [kv.slice(0, kv.indexOf("\n")), kv.slice(kv.indexOf("\n") + 1)] : [kv, ""])),
       );
     });
   });
+}
+
+/** The values of every config key matching `pattern`, in every scope; `["?"]` when git can't tell, so a caller refuses. */
+async function configValues(cwd: string, pattern: string): Promise<string[]> {
+  const entries = await configEntries(cwd, pattern);
+  return entries ? entries.map(([, v]) => v) : ["?"];
+}
+
+/**
+ * What a fetch of github.com/`ghRepo` may say it already has: the newest tips
+ * of the remote-tracking branches of remotes whose every URL is that
+ * repository on github.com and that no `url.*.insteadOf` rewrites (so what
+ * they hold came from there), read offline. A remote that points elsewhere —
+ * or a ref under `refs/remotes/` no such remote owns — is not a have.
+ */
+export async function fetchHaves(repo: string, ghRepo: string, max = 32): Promise<string[]> {
+  const [urls, rewrites] = await Promise.all([configEntries(repo, "^remote\\..+\\.url$"), configEntries(repo, "^url\\..+\\.insteadof$")]);
+  if (!urls || !rewrites) return [];
+  const byRemote = new Map<string, string[]>();
+  for (const [key, url] of urls) {
+    // `remote.<name>.url`: the name keeps its case, and may hold dots.
+    const name = key.slice("remote.".length, -".url".length);
+    byRemote.set(name, [...(byRemote.get(name) ?? []), url]);
+  }
+  const want = ghRepo.toLowerCase();
+  const names = [...byRemote].flatMap(([name, list]) => {
+    // A name that would be a pattern, or not a plain path segment run, owns no refs here.
+    if (!/^[A-Za-z0-9._/-]+$/.test(name) || name.split("/").some((part) => part === "" || part === "." || part === "..")) return [];
+    // `refs/remotes/a/` would list the refs of a remote named `a/b` too.
+    if ([...byRemote.keys()].some((other) => other.startsWith(`${name}/`))) return [];
+    const ours = list.every((url) => parseGithubRemote(url)?.toLowerCase() === want && !rewrites.some(([, prefix]) => prefix !== "" && url.startsWith(prefix)));
+    return ours ? [name] : [];
+  });
+  // No pattern lists every ref: none to list is no haves.
+  if (names.length === 0) return [];
+  const out = await git(["for-each-ref", "--sort=-committerdate", `--count=${max}`, "--format=%(objectname)", ...names.map((n) => `refs/remotes/${n}/`)], repo);
+  return [...new Set(out.split("\n").filter((l) => /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(l)))];
 }
 
 /**
@@ -209,17 +246,18 @@ async function ensureCommit(
         GIT_CEILING_DIRECTORIES: dirname(scratchDir),
       });
       writeExclusive(join(dir, "objects", "info", "alternates"), Buffer.from(`${join(commonDir, "objects")}\n`));
-      // What the fetch may say it has: your remote-tracking tips (what came
-      // from a remote already), read offline by hardened git and named in the
-      // fetch repository's own refs. Without them it would download the
-      // head's whole history.
-      const tips = (await git(["for-each-ref", "--sort=-committerdate", "--count=32", "--format=%(objectname)", "refs/remotes/"], repo))
-        .split("\n")
-        .filter((l) => /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(l));
-      for (const [i, tip] of [...new Set(tips)].entries()) {
+      // What the fetch may say it has: the remote-tracking tips of your
+      // remotes of this repository on github.com (what came from there
+      // already), read offline by hardened git and named in the fetch
+      // repository's own refs. Without them it would download the head's
+      // whole history.
+      for (const [i, tip] of (await fetchHaves(repo, from.repo)).entries()) {
         await git(["update-ref", "--no-deref", `refs/haves/${i}`, `${tip}^{commit}`], dir, own).catch(() => {});
       }
-      await git(fetch.args, dir, { ...fetch.env, GIT_DIR: dir }, { network: fetch.protocol, timeoutMs: 300_000 });
+      // git has no client-side cap on what a fetch downloads (`receive.maxInputSize`
+      // is the server's): the timeout bounds the download, and the size is
+      // checked once it has finished.
+      await git(fetch.args, dir, { ...fetch.env, GIT_DIR: dir }, { network: fetch.protocol, timeoutMs: FETCH_TIMEOUT_MS });
       const packs = join(dir, "objects", "pack");
       for (const name of readdirSync(packs).filter((n) => n.endsWith(".pack"))) {
         const at = join(packs, name);
@@ -245,8 +283,10 @@ async function ensureCommit(
   );
 }
 
-/** The largest pack a watch's fetch may bring in. */
+/** The largest pack a watch's fetch may bring in, checked once it has downloaded. */
 const FETCHED_PACK_MAX = 2 * 1024 ** 3;
+/** How long a watch's fetch may download for: what bounds it while it does. */
+const FETCH_TIMEOUT_MS = 300_000;
 
 /**
  * A shallow or partial clone is missing objects by design: a fetch can't

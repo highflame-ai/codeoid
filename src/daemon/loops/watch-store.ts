@@ -331,12 +331,19 @@ export class WatchStore {
     })();
   }
 
-  /** Remember an event the watch will never act on (codeoid's own commit, an untrusted head). */
+  /**
+   * Remember an event the watch will never act on (codeoid's own commit, an
+   * untrusted head, an edited comment). One waiting to retry becomes ignored;
+   * one already acted on stays as it is.
+   */
   ignore(w: WatchRow, key: string, kind: TriggerKind, branch: string, note: string, at: number): void {
     this.#db
       .prepare(
-        `INSERT OR IGNORE INTO loop_triggers (account_id, project_id, owner_sub, repo, watch_id, key, kind, branch, outcome, note, settled, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ignored', ?, 1, ?)`,
+        `INSERT INTO loop_triggers (account_id, project_id, owner_sub, repo, watch_id, key, kind, branch, outcome, note, settled, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ignored', ?, 1, ?)
+         ON CONFLICT (account_id, project_id, owner_sub, key) DO UPDATE
+           SET outcome = 'ignored', note = excluded.note, settled = 1, run_id = NULL, watch_id = excluded.watch_id
+         WHERE outcome = 'retry'`,
       )
       .run(w.accountId, w.projectId, w.ownerSub, w.repo, w.id, key, kind, branch, note.slice(0, 500), at);
   }

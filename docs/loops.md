@@ -103,7 +103,7 @@ It is opt-in, yours alone, and reads GitHub through the `gh` CLI you are already
 
 **A watch runs the code at your branch heads, unattended.**
 A run's checks execute that code, and so does the worker.
-What bounds it is the [trust rule](#who-a-watch-trusts): a head starts a run only when it was pushed by you, or by someone you named (or every commit on it is signed by one of you and verified).
+What bounds it is the [trust rule](#who-a-watch-trusts): a head starts a run only when it was pushed by you, or by someone you named, or merged into its branch by one of you (or every commit on it is signed by one of you and verified).
 
 ```bash
 codeoid loop watch add --workdir ~/src/shop --my-prs \
@@ -132,12 +132,24 @@ When you make a watch it reads the login `gh` is signed in as, and keeps it: tha
 `--trust <login>` (repeatable, at most 20) names other people whose commits a head may carry.
 
 Before a run starts, the watch asks GitHub who made the push that put the head on its branch, from the repository's activity (for a pull request from a fork, the fork's).
-GitHub records the account that pushed, so a push by a trusted login vouches for the head, whatever its commits say.
+GitHub records the account that authenticated, so a push by a trusted login vouches for the head, whatever its commits say.
+So does a merge GitHub records as a trusted login's: a pull request merged with the button, or through the merge queue, puts its merge commit at the head of the branch it merged into, and the activity names who merged it.
+A trusted push vouches for every commit beneath the head too, including commits someone else wrote that you pulled and pushed on: pushing a branch is how you say its code is yours to run.
 The names on a commit vouch for nothing by themselves: GitHub ties a commit to an account by its email, which anyone can write into a commit.
-So when the push wasn't by a trusted login, or GitHub has no record of it, the head is trusted only if every commit between the default branch and the head (at most 250) is signed, verified by GitHub, and committed by a trusted login.
-A commit committed by `web-flow` counts when GitHub verified it and its author is trusted: that is GitHub's merge and update-branch buttons.
+So when the push wasn't by a trusted login, or GitHub has no record of it, the head is trusted only if it has commits past the default branch (at most 250) and every one is signed, verified by GitHub, and committed by a trusted login.
+A head with no commits past the default branch — the default branch itself, or a head it already contains — has no signature to vouch for it, so only a trusted push or merge does.
+A commit committed by `web-flow` never counts: GitHub signs those for its web buttons (merge, rebase, update branch) whatever author the commit names, and the author is the commit's own say-so; what vouches for a button press is the activity record of who pressed it.
+GitHub's activity can lag a push by a few minutes: a head it doesn't list yet is judged again on each poll for ten minutes before it is recorded untrusted, and a comment on it waits to retry meanwhile.
+The activity only reaches back to 2023, and the watch reads its newest 100 entries for the branch, so a head pushed before that falls to the signature rule.
 Anything else and the head is ignored for good: `show` lists it as ignored, "not pushed by someone you trust", with why, and a later poll doesn't ask again.
 Changing a watch's trust list (`loop.watch.update`) judges its ignored heads again.
+
+What follows from trusting by who pushed:
+
+- Anything that holds your `gh` login or a personal access token of yours pushes as you, and so is trusted as you: a script, a CI job, a tool or another agent you gave the token to.
+  Keep such tokens out of automation you wouldn't let run code on your machine.
+- A push by a bot or app (a CI autofix, a formatter bot, Dependabot) is not a push by you: its head is untrusted unless every commit on it is signed by a trusted login, which a bot's commits aren't.
+  Push on top of it yourself, or name the bot's login with `--trust` if you trust what it pushes.
 
 ### What starts a run
 
@@ -151,16 +163,19 @@ Changing a watch's trust list (`loop.watch.update`) judges its ignored heads aga
   Allowed authors default to the account `gh` is signed in as; `--allow <login>` names others.
   An allowed author's comment is an instruction to the agent, on code that a trusted login pushed: allow only people you would let ask for a change.
   Only what the author wrote themselves counts, and only that reaches the run: quoted lines (`>`), code, and HTML comments are left out, so quoting someone else's `@codeoid …` asks for nothing.
-  A comment edited more than a few seconds after it was made is ignored for good (`show` lists it as "edited after it was made"): anyone with write access to the repository can edit someone else's comment, so its text may no longer be the author's.
+  A line comment you drafted into a review counts from when the review was submitted, not from when you drafted it; nothing in a review still pending counts.
+  A comment GitHub records as edited is ignored for good, however soon after it was made (`show` lists it as "edited after it was made"): anyone with write access to the repository can edit someone else's comment, so its text may no longer be the author's.
+  That holds for one already waiting to retry, too.
 
 ### What a triggered run works on
 
 - Its worktree is a clean checkout of the branch head the event happened on, never your current checkout and never your uncommitted changes.
-- A head that isn't in your repository is fetched from `https://github.com/<repo>.git` by URL, not through `origin`, and not in your repository at all: into one the daemon makes for the fetch under its own directory, which borrows your repository's objects and tells GitHub it has your remote-tracking branches, so only what's missing is downloaded.
+- A head that isn't in your repository is fetched from `https://github.com/<repo>.git` by URL, not through `origin`, and not in your repository at all: into one the daemon makes for the fetch under its own directory, which borrows your repository's objects and tells GitHub it has the remote-tracking branches of your remotes that are `github.com/<repo>` (and that no `url.*.insteadOf` rewrites), so only what's missing is downloaded.
   Your repository's configuration, which an agent can write, has no say over where the fetch goes or what it presents (no url rewrite, proxy, TLS setting, or credential helper in it applies), and no git runs in your repository during the fetch.
   The fetch's own configuration is the only one: no global or system config, https only, no redirects, no ssh command, and `gh auth git-credential` as the only credential helper, so private repositories work with the login the watch already uses.
   A proxy set in the daemon's own environment (`HTTPS_PROXY`) still applies, as it does to the daemon's other connections.
   This is the only git the daemon runs with the network on; every object it receives is checked, and what it fetched (at most 2 GiB) is then added to your repository's objects offline, by the same hardened git as every other loop step, and checked again.
+  git has no setting that caps a fetch's size while it downloads, so the 2 GiB bound is checked once the download has finished; during it, what bounds the download is its five-minute timeout, and what it wrote is removed either way.
   A failed fetch says why in the run's reason.
   A run whose workspace couldn't be prepared gives its event back, and the watch tries it again on later polls, three times in all.
 - A shallow or partial clone can't take a fetched head yet: a run that would need one fails at once, saying so, and its event isn't tried again (`git fetch --unshallow`, or clone the repository whole).
@@ -183,7 +198,7 @@ Changing a watch's trust list (`loop.watch.update`) judges its ignored heads aga
 - A branch that can't be read (deleted, renamed) is a problem for that branch alone; the watch's other branches are still polled.
 - You can have 10 watches.
   Comments are read from ten minutes before the last complete poll, not from the beginning each time.
-  When GitHub rate-limits a watch (HTTP 429, or a 403 that says a rate limit is spent), every watch acting as that `gh` login backs off together: two poll intervals, then four, doubling up to six hours, until a poll gets through.
+  When GitHub rate-limits a watch (HTTP 429, or a 403 that says a rate limit is spent), every watch acting as that `gh` login backs off together: two poll intervals, then four, doubling up to six hours, until a poll isn't rate-limited (the doubling starts over even if that poll had other errors).
   Any other refusal (a 403 for missing access) is an error the watch records, with GitHub's message.
 - `gh` runs with only `PATH`, `HOME`, and its config location in its environment, never the daemon's credentials, and with a timeout; a failed poll is recorded on the watch (`show` displays it, naming the GitHub endpoint) and the next poll tries again.
 

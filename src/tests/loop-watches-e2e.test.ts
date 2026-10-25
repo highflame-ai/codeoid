@@ -322,6 +322,27 @@ describe("loop watches end to end", () => {
     }
   });
 
+  test("the fetch's haves are only the remote-tracking tips of remotes that are github.com/<repo>", async () => {
+    const { fetchHaves } = await import("../daemon/loops/host.js");
+    const tree = gitIn(repo, "rev-parse", "main^{tree}").trim();
+    const commit = (msg: string) => gitIn(repo, "commit-tree", tree, "-m", msg).trim();
+    const tips = { origin: commit("origin"), upstream: commit("upstream"), evil: commit("evil"), stray: commit("stray"), rewritten: commit("rewritten") };
+    gitIn(repo, "remote", "add", "upstream", "git@github.com:Acme/Shop.git");
+    gitIn(repo, "remote", "add", "evil", "https://github.com/mallory/shop.git");
+    gitIn(repo, "remote", "add", "rewritten", "https://github.com/acme/shop");
+    // Fetched through this, `rewritten`'s refs came from somewhere else.
+    gitIn(repo, "config", "url.https://evil.example/acme/shop.insteadOf", "https://github.com/acme/shop");
+    for (const [name, sha] of Object.entries(tips)) gitIn(repo, "update-ref", `refs/remotes/${name}/main`, sha);
+    // `rewritten`'s prefix also matches `origin`'s URL (`https://github.com/acme/shop.git`): neither is a have.
+    expect(await fetchHaves(repo, "acme/shop")).toEqual([tips.upstream]);
+    gitIn(repo, "config", "--unset", "url.https://evil.example/acme/shop.insteadOf");
+    expect((await fetchHaves(repo, "acme/shop")).sort()).toEqual([tips.origin, tips.upstream, tips.rewritten].sort());
+    // A remote named under another's name would be listed with it.
+    gitIn(repo, "remote", "add", "origin/x", "https://github.com/mallory/shop.git");
+    expect((await fetchHaves(repo, "acme/shop")).sort()).toEqual([tips.upstream, tips.rewritten].sort());
+    expect(await fetchHaves(repo, "someone/else")).toEqual([]);
+  });
+
   test("gh never sees the daemon's secrets", async () => {
     const { ghEnv } = await import("../daemon/loops/triggers/github.js");
     const env = ghEnv({ PATH: "/bin", HOME: "/h", GH_CONFIG_DIR: "/h/gh", CODEOID_API_KEY: "zid_sk_x", ZEROID_URL: "u", ANTHROPIC_API_KEY: "k", GH_TOKEN: "t" });

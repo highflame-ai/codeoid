@@ -18,11 +18,14 @@
  *   - Trust: a run executes the code at the head it works on (its checks run
  *     it). The logins the owner trusts are gh's own login, plus the watch's
  *     `trust` list. A head fires only when GitHub records that a trusted
- *     login pushed it onto its branch, or when every commit past the default
- *     branch is signed, verified, and committed by a trusted login. The
- *     author and committer logins of an unsigned commit are only its email
- *     matched to an account, which anyone can write, so they vouch for
- *     nothing. Anything else is ignored for that head.
+ *     login pushed it onto its branch (or pressed the button that merged
+ *     into it), or when it has commits past the default branch and every one
+ *     is signed, verified, and committed by a trusted login — never by
+ *     `web-flow`, whose signature is GitHub's, for whoever the commit names.
+ *     The author and committer logins of an unsigned commit are only its
+ *     email matched to an account, which anyone can write, so they vouch for
+ *     nothing. A head GitHub's activity doesn't list yet is judged again for
+ *     a while (the list lags a push); anything else is ignored for that head.
  *   - Dedupe: every event has a key (`ci:<repo>:<sha>:<checkRunId>:<suiteId>`,
  *     `review:<repo>:<kind>:<id>`) recorded per owner in `loop_triggers` with
  *     the run it started, so an event seen on every poll, by any of the
@@ -32,7 +35,7 @@
  *     later CI failure on a busy branch is skipped without being recorded, and
  *     is picked up by the first poll after the run ends; a comment is kept
  *     waiting to retry, so the comments are read far enough back to find it.
- *   - Edits: a comment edited after it was made is ignored — anyone with
+ *   - Edits: a comment GitHub records an edit of is ignored — anyone with
  *     write access can edit someone else's comment, so its text is no longer
  *     the allowed author's.
  *   - Bounds: at most `maxRunsPerHour` runs per watch, the owner's active-run
@@ -106,14 +109,19 @@ const SINCE_SKEW_MS = 10 * 60 * 1000;
 /** Clock skew allowed between GitHub and the daemon on when a comment was made. */
 const CREATED_SKEW_MS = 2 * 60 * 1000;
 const BACKOFF_MAX_MS = 6 * HOUR_MS;
-/** The account GitHub commits as when its web UI merges or updates a branch. */
+/** The account GitHub commits as when its web UI merges, rebases, or updates a branch: its signature is GitHub's, for whoever the commit names. */
 const WEB_FLOW = "web-flow";
-/** A comment changed this long after it was made was edited. */
-const EDIT_GRACE_MS = 5_000;
 /** An event waiting to retry this long without a run is dropped. */
 const RETRY_MAX_AGE_MS = 7 * 24 * HOUR_MS;
-/** Pushes that put a commit at a branch's head (GitHub's activity types). */
-const PUSHES = new Set(["push", "force_push", "branch_creation"]);
+/**
+ * Activity that puts a commit at a branch's head as the account recorded as
+ * its actor (GitHub's activity types): a push, or a merge whose button that
+ * account pressed.
+ */
+const HEAD_MOVES = new Set(["push", "force_push", "branch_creation", "pr_merge", "merge_queue_merge"]);
+const MERGES = new Set(["pr_merge", "merge_queue_merge"]);
+/** GitHub's activity list lags a push: a head it doesn't list yet is judged again on later polls for this long. */
+const ACTIVITY_LAG_MS = 10 * 60 * 1000;
 
 export interface WatchHost {
   gh: GhExec;
@@ -166,6 +174,12 @@ interface Candidate {
   input: LoopStartInput;
 }
 
+/** Why a head isn't vouched for; `transient` when GitHub's activity may not list its push yet. */
+interface Untrusted {
+  why: string;
+  transient: boolean;
+}
+
 export class WatchService {
   readonly #store: WatchStore;
   readonly #host: WatchHost;
@@ -184,6 +198,12 @@ export class WatchService {
    * watch through that login waits together.
    */
   readonly #backoff = new Map<string, { until: number; n: number }>();
+  /**
+   * Heads judged while GitHub's activity didn't list their push, and when one
+   * first was: each is judged again until {@link ACTIVITY_LAG_MS} has passed.
+   * Not kept across a restart, which only gives a head that long again.
+   */
+  readonly #unlisted = new Map<string, number>();
 
   constructor(store: WatchStore, host: WatchHost, opts: { pollSeconds?: number; firstPollMs?: number; now?: () => number } = {}) {
     this.#store = store;
@@ -372,6 +392,7 @@ export class WatchService {
       }
     }
     const trust = logins(input.trust ?? current?.trust ?? [], WATCH_LIMITS.TRUST_MAX, "trusted logins");
+    if (trust.some((l) => l.toLowerCase() === WEB_FLOW)) bad("web-flow can't be trusted: GitHub signs its commits for whoever they name");
 
     const reviewIn = input.review ?? current?.review ?? { enabled: false };
     const mention = (reviewIn.mention ?? current?.review.mention ?? WATCH_DEFAULTS.mention).trim();
@@ -439,7 +460,8 @@ export class WatchService {
       if (rateLimited) {
         const n = (this.#backoff.get(limiter)?.n ?? 0) + 1;
         this.#backoff.set(limiter, { n, until: now + Math.min(this.#pollMs * 2 ** n, BACKOFF_MAX_MS) });
-      } else if (problems.length === 0) {
+      } else {
+        // Not a rate limit this time: the doubling starts over.
         this.#backoff.delete(limiter);
       }
       return { started: result.started, skipped: [...problems, ...result.skipped] };
@@ -495,9 +517,11 @@ export class WatchService {
       }
     }
 
+    // Heads no longer polled are forgotten; a day outlasts the longest back-off.
+    for (const [k, first] of this.#unlisted) if (first < now - 24 * HOUR_MS) this.#unlisted.delete(k);
     // Per branch, CI comes first: a red branch is repaired before it's changed.
     const busy = new Set<string>();
-    const trust = new Map<string, Promise<string | null>>();
+    const trust = new Map<string, Promise<Untrusted | null>>();
     let defaultBranch: Promise<string> | null = null;
     for (const c of candidates) {
       if (this.#stopped) {
@@ -530,7 +554,7 @@ export class WatchService {
       }
       // The run will execute this head's code: its push, or every commit on it, must be vouched for.
       const at = `${c.target.headRepo ?? ""}:${c.target.branch}:${c.target.sha}`;
-      let untrusted: string | null;
+      let untrusted: Untrusted | null;
       try {
         if (!trust.has(at)) {
           defaultBranch ??= gh.defaultBranch();
@@ -542,9 +566,19 @@ export class WatchService {
         problem(`${c.target.branch}: judging who pushed it`, err);
         continue;
       }
+      const headKey = untrustedKey(w, c.target);
+      if (untrusted?.transient) {
+        const first = this.#unlisted.get(headKey) ?? now;
+        this.#unlisted.set(headKey, first);
+        if (now - first < ACTIVITY_LAG_MS) {
+          skip(`${label}: not vouched for yet (${untrusted.why}); judged again on the next poll`);
+          continue;
+        }
+      }
+      this.#unlisted.delete(headKey);
       if (untrusted) {
-        this.#store.ignore(w, untrustedKey(w, c.target), c.kind, c.target.branch, `not pushed by someone you trust: ${untrusted}`, now);
-        result.skipped.push(`${label}: not pushed by someone you trust (${untrusted})`);
+        this.#store.ignore(w, headKey, c.kind, c.target.branch, `not pushed by someone you trust: ${untrusted.why}`, now);
+        result.skipped.push(`${label}: not pushed by someone you trust (${untrusted.why})`);
         continue;
       }
       // From here until the run has started nothing awaits, so a pause, a
@@ -623,36 +657,49 @@ export class WatchService {
   /**
    * Why the head at `t` isn't vouched for, or null when it is. Vouched for:
    * GitHub records that a trusted login made the push that put it on its
-   * branch (in the repository the branch is in — a fork's, for a fork's pull
-   * request); or every commit `base..head` is signed, verified by GitHub, and
-   * committed by a trusted login (GitHub's own web-flow commits by a trusted
-   * author). The logins on an unsigned commit are only its emails matched to
-   * accounts, which anyone can write.
+   * branch, or pressed the button that merged into it (in the repository the
+   * branch is in — a fork's, for a fork's pull request); or it has commits
+   * `base..head` and every one is signed, verified by GitHub, and committed
+   * by a trusted login. The logins on an unsigned commit are only its emails
+   * matched to accounts, which anyone can write; a `web-flow` commit is
+   * signed by GitHub for whoever it names; and a head with no commits past
+   * `base` has no signature at all. Transient when GitHub's activity may not
+   * list the head's push yet.
    */
-  async #untrusted(w: WatchRow, gh: GitHubSource, base: string, t: Target): Promise<string | null> {
+  async #untrusted(w: WatchRow, gh: GitHubSource, base: string, t: Target): Promise<Untrusted | null> {
     const trusted = new Set([w.spec.ghLogin, ...(w.spec.trust ?? [])].filter((l): l is string => !!l).map((l) => l.toLowerCase()));
-    if (trusted.size === 0) return "the watch knows no GitHub login to trust";
+    if (trusted.size === 0) return { why: "the watch knows no GitHub login to trust", transient: false };
     const who = (l: string | null) => (l ? `@${l}` : "an account GitHub doesn't name");
     let pushed: string;
-    const push = t.headRepo ? await gh.pushOf(t.headRepo, t.branch, t.sha) : null;
-    if (!push) pushed = "GitHub has no record of the push that made this head";
-    else if (!PUSHES.has(push.type)) pushed = `this head came from a ${push.type || "change"}, not a push`;
-    else if (push.actor && trusted.has(push.actor.toLowerCase())) return null;
-    else pushed = `pushed by ${who(push.actor)}`;
+    let transient = false;
+    const { push, kept } = t.headRepo ? await gh.pushOf(t.headRepo, t.branch, t.sha) : { push: null, kept: false };
+    if (!push) {
+      pushed = !t.headRepo ? "GitHub doesn't say which repository the head is in" : kept ? "GitHub's activity has no record of the push that made this head" : "GitHub keeps no activity for this repository";
+      transient = kept;
+    } else if (!HEAD_MOVES.has(push.type)) {
+      pushed = `this head came from a ${push.type || "change"}, not a push or a merge`;
+    } else if (push.actor && trusted.has(push.actor.toLowerCase())) {
+      return null;
+    } else {
+      pushed = `${MERGES.has(push.type) ? "merged" : "pushed"} by ${who(push.actor)}`;
+    }
     // Not pushed by anyone trusted: every commit must be signed by one.
+    const unsigned = await this.#unsigned(gh, base, t, trusted, who);
+    return unsigned ? { why: `${pushed}, and ${unsigned}`, transient } : null;
+  }
+
+  /** Why the commits `base..head` don't vouch for the head, or null when every one is signed by a trusted login. */
+  async #unsigned(gh: GitHubSource, base: string, t: Target, trusted: Set<string>, who: (l: string | null) => string): Promise<string | null> {
     const commits = await gh.commitsBetween(base, t.sha);
-    if (!commits) return `${pushed}, and it has more than ${COMMITS_MAX} commits past ${base} (or GitHub listed fewer than it counted)`;
+    if (!commits) return `it has more than ${COMMITS_MAX} commits past ${base} (or GitHub listed fewer than it counted)`;
+    if (commits.length === 0) return `it has no commits past ${base}, so no signature vouches for it`;
     for (const c of commits) {
       const id = c.sha.slice(0, 12);
-      if (!c.verified) return `${pushed}, and ${id} isn't signed and verified`;
-      const author = c.author?.toLowerCase() ?? null;
+      if (!c.verified) return `${id} isn't signed and verified`;
       const committer = c.committer?.toLowerCase() ?? null;
-      // GitHub's merge and update-branch buttons commit as web-flow, signed by GitHub; the author is who pressed them.
-      if (committer === WEB_FLOW) {
-        if (!author || !trusted.has(author)) return `${pushed}, and ${id} was made on GitHub for ${who(c.author)}`;
-      } else if (!committer || !trusted.has(committer)) {
-        return `${pushed}, and ${id} is signed by ${who(c.committer)}`;
-      }
+      // GitHub's buttons commit as web-flow and sign for whoever the commit names, which the commit says itself.
+      if (committer === WEB_FLOW) return `${id} was committed on GitHub by web-flow, whose signature vouches for no one`;
+      if (!committer || !trusted.has(committer)) return `${id} is signed by ${who(c.committer)}`;
     }
     return null;
   }
@@ -744,10 +791,10 @@ export class WatchService {
 
   /**
    * Comments addressed to codeoid by an allowed author, in their own words
-   * (not a quote of someone else's), made since the watch was created or last
-   * resumed, and not edited since: anyone with write access to the repository
-   * can edit an allowed author's comment, and an edited one is ignored for
-   * good.
+   * (not a quote of someone else's), published since the watch was created or
+   * last resumed, and never edited: anyone with write access to the
+   * repository can edit an allowed author's comment, and an edited one is
+   * ignored for good.
    */
   async #reviewCandidates(w: WatchRow, gh: GitHubSource, t: Target, now: number): Promise<Candidate[]> {
     const allow = new Set(w.spec.review.allow.map((l) => l.toLowerCase()));
@@ -762,11 +809,10 @@ export class WatchService {
     const keyed = comments.map((c) => ({ c, key: `review:${w.repo}:${c.kind}:${c.id}` }));
     const seen = this.#store.seen(w, keyed.map((k) => k.key));
     const fresh = keyed.filter((k) => !seen.has(k.key));
-    for (const { c, key } of fresh) {
-      if (c.updatedAt - c.createdAt > EDIT_GRACE_MS) this.#store.ignore(w, key, "review_comment", t.branch, "edited after it was made", now);
-    }
+    // One waiting to retry is ignored too: its retry row is overwritten.
+    for (const { c, key } of fresh) if (c.edited) this.#store.ignore(w, key, "review_comment", t.branch, "edited after it was made", now);
     return fresh
-      .filter(({ c }) => c.updatedAt - c.createdAt <= EDIT_GRACE_MS)
+      .filter(({ c }) => !c.edited)
       .map(({ c, key }) => ({
         kind: "review_comment" as const,
         target: t,
@@ -790,7 +836,7 @@ export class WatchService {
       ...(w.spec.model ? { model: w.spec.model } : {}),
       ...(w.spec.toolBudget !== undefined ? { toolBudget: w.spec.toolBudget } : {}),
       ...(w.spec.limits ? { limits: w.spec.limits } : {}),
-      // Only a head a trusted login pushed, or whose every commit one signed, gets here.
+      // Only a head a trusted login pushed or merged into, or whose every commit one signed, gets here.
       baseRef: {
         sha: t.sha,
         branch: t.branch,
