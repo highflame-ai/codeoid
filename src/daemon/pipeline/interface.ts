@@ -10,6 +10,7 @@
 
 import type { ResolvedFrom, RoleModelSource } from "./binding";
 import type { FindingsLoopState, FindingsSpec } from "./findings";
+import type { CheckRunner } from "../evidence/service";
 
 // ── Phase definition (the static plan) ────────────────────────────────────
 
@@ -123,6 +124,8 @@ export interface PipelinePhase {
   /** The findings loop's persisted state (rounds, dispositions, what runs
    *  next) — present only for a phase that declares `def.findings`. */
   findings?: FindingsLoopState;
+  /** Evidence ids recorded by this phase's gates, oldest first (bounded). */
+  evidence?: string[];
 }
 
 /** The full, daemon-owned pipeline state — the source of truth persisted per
@@ -205,12 +208,17 @@ export interface PhaseKind {
 export interface GateCtx {
   pipeline: PipelineState;
   phase: PhaseDef;
+  /** Runs a check and records its evidence, bound to this run. Gates that
+   *  execute commands go through it; absent, they run unrecorded. */
+  runCheck?: CheckRunner;
 }
 
 export interface GateVerdict {
   pass: boolean;
   reason?: string;
   questions?: string[];
+  /** Evidence the gate recorded for this verdict, in the order it ran. */
+  evidenceIds?: string[];
 }
 
 /** A gate: a pass/fail predicate positioned at phase entry (grounding) or exit

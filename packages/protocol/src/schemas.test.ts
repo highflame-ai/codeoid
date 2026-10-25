@@ -197,6 +197,7 @@ const samples: { [T in ClientTypes]: Extract<ClientMessage, { type: T }> } = {
   "routine.delete": { type: "routine.delete", id: "rt3", routine: "nightly" },
   "routine.list": { type: "routine.list", id: "rt4" },
   "routine.get": { type: "routine.get", id: "rt5", routine: "nightly", runs: 5 },
+  "evidence.get": { type: "evidence.get", id: "ev1", evidenceId: "ev_123" },
   "routine.run": { type: "routine.run", id: "rt6", routine: "nightly", payload: "PR #12" },
   "routine.cancel_run": { type: "routine.cancel_run", id: "rt7", runId: "run-1" },
   "routine.runs": { type: "routine.runs", id: "rt8", routine: "nightly", limit: 20, before: "2026-10-16T00:00:00.000Z" },

@@ -1708,6 +1708,14 @@ pack
   .description("Uninstall a pack")
   .action((id: string) => withClient((c) => c.packRemove(id)));
 
+// ── Evidence (docs/loop-engineering-design.md §7) ───────────────────────────
+
+program
+  .command("evidence <id>")
+  .description("Show one evidence record: what a check ran, on which tree, and what it found")
+  .option("--full", "Print the whole stored excerpt instead of its last 40 lines")
+  .action((id: string, opts: { full?: boolean }) => withClient((c) => c.evidenceShow(id, opts)));
+
 // ── Pipeline runs (docs/pipeline-run.md) ────────────────────────────────────
 
 const pipeline = program

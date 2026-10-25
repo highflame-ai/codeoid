@@ -11,6 +11,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LIMITS } from "../../protocol/types.js";
 import { ARTIFACT_KIND_MAX } from "../blackboard/types.js";
+import { EvidenceService } from "../evidence/service";
+import { EvidenceStore } from "../evidence/store";
 import { createRegistries } from "./registry";
 import type { PhaseDef } from "./interface";
 import { PipelineManager } from "./manager";
@@ -371,6 +373,34 @@ phases:
     if (halted.phases[0].state.status === "halted") {
       expect(halted.phases[0].state.reason).toContain("command gate");
     }
+  });
+
+  test("a trusted command gate records revision-free evidence on the phase, with diagnostics in the reason", async () => {
+    const db = new Database(":memory:");
+    const root = mkdtempSync(join(tmpdir(), "pack-evidence-"));
+    const evidence = new EvidenceService(new EvidenceStore(db), root);
+    const mgr = new PipelineManager(new PipelineStore(db), { evidence });
+    mgr.installPack(
+      loadPack(noopPack('  - id: red\n    kind: command\n    run: "echo assertion failed: want 2 got 3 >&2; exit 1"', "red"), {
+        trusted: true,
+      }),
+    );
+    const p = mgr.create({ name: "run", pack: "noop-pack", ...tenant });
+    const halted = await mgr.advance(p.id);
+    const phase = halted.phases[0];
+    expect(phase.evidence).toHaveLength(1);
+    const rec = evidence.get(phase.evidence![0]!, { accountId: tenant.accountId, projectId: tenant.projectId })!;
+    expect(rec.result).toBe("fail");
+    expect(rec.ownerKind).toBe("pipeline");
+    expect(rec.ownerId).toBe(p.id);
+    expect(rec.criterionId).toBe("a:red");
+    expect(rec.candidateDigest).toBeNull();
+    if (phase.state.status !== "halted") throw new Error("expected halt");
+    expect(phase.state.reason).toContain("assertion failed: want 2 got 3");
+    // The evidence survives a manager rebuilt over the same database.
+    const again = new PipelineManager(new PipelineStore(db), { evidence });
+    expect(again.get(p.id)?.phases[0].evidence).toEqual(phase.evidence);
+    rmSync(root, { recursive: true, force: true });
   });
 
   test("an UNTRUSTED command gate never executes — fails closed (registry default)", async () => {

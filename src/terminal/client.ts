@@ -27,6 +27,7 @@ import { acquireToken, TokenError } from "./token.js";
 import { sanitizeTerminalOutput } from "../tui/ansi/codes.js";
 import { formatPackList, formatPackShow } from "./pack-format.js";
 import { formatPipeline, haltedRequestId } from "./pipeline-format.js";
+import { formatEvidence } from "./evidence-format.js";
 import { type PendingDialog, parseDialogAnswer } from "./dialog.js";
 import { formatRewind, parseUndoArgs } from "./rewind.js";
 import { awaitingApproval, compareSettled, formatCompare } from "./compare.js";
@@ -404,6 +405,15 @@ export class TerminalClient {
 
   async packSelect(id: string | null): Promise<void> {
     this.#renderPacks(await this.#request({ type: "pipeline.pack.select", id: randomUUID(), packId: id }));
+  }
+
+  async evidenceShow(evidenceId: string, opts: { full?: boolean } = {}): Promise<void> {
+    const resp = await this.#request({ type: "evidence.get", id: randomUUID(), evidenceId });
+    if (resp.type !== "evidence.record") {
+      this.#printError(resp);
+      return;
+    }
+    for (const line of formatEvidence(resp.evidence, opts)) console.log(line);
   }
 
   async packShow(id: string, opts: { resolve?: boolean } = {}): Promise<void> {

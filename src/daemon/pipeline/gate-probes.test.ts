@@ -142,3 +142,26 @@ describe("workdir guard", () => {
     expect(v.reason).toContain("needs a workdir");
   });
 });
+
+describe("probe evidence", () => {
+  test("a test probe that ran no tests fails as inconclusive, and its check is recorded", async () => {
+    const d = tmp();
+    writeFileSync(join(d, "package.json"), JSON.stringify({ scripts: { test: "echo 'Ran 0 tests across 0 files.'" } }));
+    const seen: string[] = [];
+    const c: GateCtx = {
+      ...ctx(d),
+      runCheck: async (spec, cwd) => {
+        seen.push(`${spec.id}@${cwd}:${spec.expectTests}`);
+        const { ephemeralCheck } = await import("../evidence/service");
+        const run = await ephemeralCheck(spec, cwd);
+        return { ...run, record: { ...run.outcome, id: "ev_1" } as never };
+      },
+    };
+    const v = await buildProbeGate("g", { type: "test" }, "exit", true).evaluate(c);
+    expect(v.pass).toBe(false);
+    expect(v.reason).toContain("inconclusive");
+    expect(v.evidenceIds).toEqual(["ev_1"]);
+    expect(seen).toEqual([`x:g:test@${d}:true`]);
+  });
+});
+

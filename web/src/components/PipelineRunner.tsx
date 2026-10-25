@@ -20,6 +20,7 @@
 
 import { Component, For, Show, createSignal, onCleanup, onMount } from "solid-js";
 
+import { EvidenceLink } from "./EvidenceView";
 import { openPipelineModal } from "./NewSessionModal";
 import { abort, approve, pipelinesState, reject, revise } from "../state/pipelines";
 import { focusSession, focusedSessionId, sessionList } from "../state/sessions";
@@ -393,6 +394,10 @@ const HaltCard: Component<{
           line of pipes. */}
       <Show when={props.phase.reason}>
         <p class="mt-2 whitespace-pre-wrap text-[12px] text-fg-muted">{props.phase.reason}</p>
+      </Show>
+
+      <Show when={(props.phase.evidence?.length ?? 0) > 0}>
+        <EvidenceLink ids={props.phase.evidence!} />
       </Show>
 
       <Show when={props.phase.findings}>

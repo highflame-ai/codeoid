@@ -496,6 +496,8 @@ describe("DaemonMessage routing", () => {
           return `routine.token:${msg.routineId}`;
         case "routine.preview.result":
           return `routine.preview:${msg.fires.length}`;
+        case "evidence.record":
+          return `evidence:${msg.evidence.result}`;
         case "mcp.oauth.begin.result":
           return `mcp.oauth.begin:${msg.status}`;
         case "mcp.oauth.complete.result":

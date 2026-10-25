@@ -84,6 +84,7 @@ import type {
   RoutineTokenResultMsg,
   RoutineUpdateMsg,
 } from "./routines.js";
+import type { EvidenceGetMsg, EvidenceRecordMsg } from "./evidence.js";
 import type {
   McpAdoptMsg,
   McpAdoptResultMsg,
@@ -1177,6 +1178,7 @@ export type ClientMessage =
   | RoutineRunsMsg
   | RoutineTokenMsg
   | RoutinePreviewMsg
+  | EvidenceGetMsg
   | McpOAuthBeginMsg
   | McpOAuthCompleteMsg
   | McpOAuthDisconnectMsg
@@ -2648,6 +2650,9 @@ export interface PipelinePhaseWire {
   /** Human revise notes accumulated on this phase (newest last) — the client
    *  renders the revision history. */
   feedback?: string[];
+  /** Evidence ids recorded by this phase's gates, oldest first — read each
+   *  with `evidence.get`. Absent when no gate executed a check. */
+  evidence?: string[];
   /** The findings loop's state for a phase that declares `findings:` (the
    *  engine's review → fix → re-review loop): counts plus a markdown ledger of
    *  every round. Optional (additive) — absent on phases without the loop and
@@ -2975,6 +2980,7 @@ export type DaemonMessage =
   | RoutineRunsResultMsg
   | RoutineTokenResultMsg
   | RoutinePreviewResultMsg
+  | EvidenceRecordMsg
   | McpOAuthBeginResultMsg
   | McpOAuthCompleteResultMsg
   | McpOAuthDisconnectResultMsg

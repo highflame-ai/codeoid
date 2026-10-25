@@ -100,6 +100,7 @@ import {
   type DispatcherHost,
 } from "./dispatch.js";
 import { createPipelineManagerFromConfig } from "./pipeline/wiring.js";
+import { EvidenceService, EvidenceStore, evidenceToWire } from "./evidence/index.js";
 import type { PipelineManager } from "./pipeline/manager.js";
 import { resolveBinding, type ModelBindingConfig } from "./pipeline/binding.js";
 import type { RoleDef } from "./pipeline/pack.js";
@@ -448,6 +449,7 @@ export class SessionManager {
   #pushService: PushService;
   /** SDLC pipeline manager — undefined when the pipeline is disabled (default). */
   #pipelines?: PipelineManager;
+  #evidence?: EvidenceService;
   /** Routines (docs/routines.md); undefined when `routines.enabled` is off. */
   #routines?: RoutineService;
   /** Pack curation surface (registries + install/trust/select) — always present,
@@ -597,9 +599,18 @@ export class SessionManager {
     // pipelines on construction (resume). The runner drives prompt/slash phases
     // on worker turns; the `() => this` thunk is only dereferenced at run time,
     // after construction. Undefined when disabled ⇒ the daemon stays dark.
+    // Evidence of every executed check (docs/loop-engineering-design.md §7),
+    // in the daemon DB with full output beside it.
+    if (opts?.config) {
+      this.#evidence = new EvidenceService(
+        new EvidenceStore(store.database),
+        join(dirname(opts.config.dbPath), "evidence"),
+      );
+    }
     this.#pipelines = createPipelineManagerFromConfig(opts?.config, {
       runner: new SessionPhaseRunner(() => this),
       db: store.database,
+      ...(this.#evidence ? { evidence: this.#evidence } : {}),
     });
     // Routines share the daemon DB. Built only when enabled, so the kill
     // switch leaves every routine in place but nothing fires.
@@ -1356,6 +1367,8 @@ mcpHub: this.#mcpHub,
       case "routine.token":
       case "routine.preview":
         return this.#routineHandle(msg, auth);
+      case "evidence.get":
+        return this.#evidenceGet(msg, auth);
       case "pipeline.create":
         return this.#pipelineCreate(msg, auth);
       case "pipeline.list":
@@ -5361,6 +5374,7 @@ mcpHub: this.#mcpHub,
           // Surface the phase's produced output at the boundary halt so the UI
           // can show "here's what this phase did" next to Approve/Revise/Reject.
           if (p.lastSummary) w.summary = p.lastSummary;
+          if (p.evidence?.length) w.evidence = [...p.evidence];
         }
         if (p.feedback && p.feedback.length > 0) w.feedback = p.feedback;
         // The findings loop (findings.ts): counts + the ledger, so a client can
@@ -5483,6 +5497,27 @@ mcpHub: this.#mcpHub,
     if ("error" in g) return g.error;
     const pipelines = g.pm.list(auth.accountId, auth.projectId).map((s) => this.#pipelineToWire(s));
     return { type: "pipeline.list.result", requestId: msg.id, pipelines };
+  }
+
+  /**
+   * One evidence record. Authorized through its owner: a pipeline's evidence
+   * needs `pipeline:read` and a pipeline the caller can see. Anything the caller
+   * may not read is `not_found`, so an id reveals nothing across tenants.
+   */
+  #evidenceGet(msg: Extract<ClientMessage, { type: "evidence.get" }>, auth: AuthContext): DaemonMessage {
+    const notFound: DaemonMessage = { type: "response.error", requestId: msg.id, error: "Evidence not found", code: "not_found" };
+    const record = this.#evidence?.get(msg.evidenceId, { accountId: auth.accountId, projectId: auth.projectId });
+    if (!record) return notFound;
+    if (record.ownerKind === "pipeline") {
+      const g = this.#pipelineGuard(msg.id, auth, SCOPES.PIPELINE_READ);
+      if ("error" in g) return g.error;
+      if (!this.#ownedPipeline(g.pm, record.ownerId, auth)) return notFound;
+    } else {
+      // Loop evidence is authorized by the loop service, which doesn't exist
+      // yet; until it does, nothing else may read it.
+      return notFound;
+    }
+    return { type: "evidence.record", requestId: msg.id, evidence: evidenceToWire(record) };
   }
 
   #pipelineGet(msg: Extract<ClientMessage, { type: "pipeline.get" }>, auth: AuthContext): DaemonMessage {

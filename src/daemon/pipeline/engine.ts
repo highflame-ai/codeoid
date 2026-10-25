@@ -15,6 +15,7 @@
  * loop persists between legs and resumes after a restart exactly where it was.
  */
 
+import type { EvidenceService } from "../evidence/service";
 import type {
   GateVerdict,
   PhaseCtx,
@@ -56,11 +57,21 @@ const MAX_STEPS = 10_000;
 const clone = <T>(x: T): T => structuredClone(x);
 const now = (): number => Date.now();
 
+/** Evidence kept per phase in the run state; older ids stay in the store. */
+const PHASE_EVIDENCE_MAX = 50;
+
+export interface PipelineEngineOptions {
+  /** Records every check a gate executes. Absent, checks run unrecorded. */
+  evidence?: EvidenceService;
+}
+
 export class PipelineEngine {
   #registries: PipelineRegistries;
+  #evidence?: EvidenceService;
 
-  constructor(registries: PipelineRegistries) {
+  constructor(registries: PipelineRegistries, options: PipelineEngineOptions = {}) {
     this.#registries = registries;
+    this.#evidence = options.evidence;
   }
 
   /** Advance the active phase by one unit of work and return a new state. */
@@ -450,8 +461,19 @@ export class PipelineEngine {
     // (`always` / `manual`) or directly registered gate — see scoped.ts.
     const g = resolveScoped(this.#registries.gates, pipeline.packId, id);
     if (!g) return { pass: false, reason: `unknown ${at} gate "${id}"` };
+    const runCheck = this.#evidence?.runnerFor({
+      tenant: { accountId: pipeline.accountId, projectId: pipeline.projectId },
+      ownerKind: "pipeline",
+      ownerId: pipeline.id,
+    });
     try {
-      return await g.evaluate({ pipeline: clone(pipeline), phase });
+      const verdict = await g.evaluate({ pipeline: clone(pipeline), phase, ...(runCheck ? { runCheck } : {}) });
+      // Every gate runs for the active phase, so its evidence belongs there.
+      const active = pipeline.phases[pipeline.cursor];
+      if (active && verdict.evidenceIds?.length) {
+        active.evidence = [...(active.evidence ?? []), ...verdict.evidenceIds].slice(-PHASE_EVIDENCE_MAX);
+      }
+      return verdict;
     } catch (err) {
       // A throwing gate is a failing verdict, not a crash — same reasoning as
       // the phase kind above: never leave the pipeline stuck mid-advance.

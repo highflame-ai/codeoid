@@ -74,6 +74,11 @@ The only thing it saves is one auto-attach, which the client does for free.
   On a phase without `findings:` a `review` gate behaves as before (passes; the human is the reviewer).
 - **`skill` gates remain optional automated verdicts (later slice).**
   Until implemented they are simply absent, not fake.
+- **Every check a gate executes leaves evidence** (docs/loop-engineering-design.md §7).
+  `command` gates and execution probes record what ran, its result, its exit status or signal, bounded output excerpts, and the full output as files beside the daemon database (`<dbdir>/evidence/`).
+  A check that exits 0 after running no tests is `inconclusive`, not a pass; a missing command is `error`; a check past its time bound is stopped with everything it spawned and recorded as a timed-out `fail`.
+  The halted phase shows the latest check's output in the cockpit, `codeoid pipeline show` lists each phase's evidence ids, and `codeoid evidence <id>` prints one record.
+  Pipeline evidence names no pinned tree yet; it records what ran in the workdir, not which revision it certified.
 
 ---
 
