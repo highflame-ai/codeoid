@@ -160,19 +160,22 @@ const general: SettingsTab = {
       id: "worktree-setup",
       title: "Worktree setup recipe",
       description:
-        "A repository's committed .codeoid/setup.yaml says which ignored files to copy and which directories to share into a worktree codeoid creates. Those steps always apply; its command is a separate opt-in.",
+        "A repository's committed .codeoid/setup.yaml says which ignored files to copy and which directories to share (writable links into your checkout) into a worktree codeoid creates. Those steps always apply; its command is a separate opt-in, per recipe.",
       fields: [
-        cfg("worktree.setup.runCommands", "Run recipe commands", "Whether the recipe's setup command may run in a new worktree. Reading a recipe never runs anything.", {
-          kind: "enum",
-          default: "never",
-          options: [
-            { value: "never", label: "Never", description: "Copy and share files only." },
-            { value: "trusted-repos", label: "Trusted repositories", description: "Run it for the repositories listed below." },
-          ],
-        }),
-        cfg("worktree.setup.trustedRepos", "Trusted repositories", "Primary checkouts (absolute paths, ~ allowed) whose recipe command may run.", {
-          kind: "string[]",
-        }),
+        cfg(
+          "worktree.setup.runCommands",
+          "Run recipe commands",
+          "Whether a recipe's setup command may run in a new worktree. With Trusted recipes it runs only while the recipe is the one you trusted with `codeoid worktree trust` in that repository — a changed recipe runs nothing until trusted again. It runs the repository's committed scripts as you. Reading a recipe never runs anything.",
+          {
+            kind: "enum",
+            default: "never",
+            applies: "live",
+            options: [
+              { value: "never", label: "Never", description: "Copy and share files only." },
+              { value: "trusted-repos", label: "Trusted recipes", description: "Run the command of a recipe trusted with `codeoid worktree trust`." },
+            ],
+          },
+        ),
       ],
     },
   ],

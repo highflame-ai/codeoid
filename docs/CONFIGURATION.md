@@ -193,6 +193,35 @@ TELEGRAM_ALLOWED_USER_IDS=6714605885
 # ANTHROPIC_API_KEY=          # only if you have neither a sign-in nor a Claude Code login
 ```
 
+## Worktree setup recipe
+
+A worktree codeoid creates (a fork, a compare branch, a routine's `--worktree` run) holds tracked files only.
+A repository says how to make one usable in a committed `.codeoid/setup.yaml`:
+
+```yaml
+copy: [.env, "config/*.local.json"]   # ignored files, copied from your checkout
+share: [node_modules]                  # directories, linked to your checkout
+command: bun install --ignore-scripts  # runs in the new worktree, only once you trust it
+timeoutSec: 600
+resources: { ports: 2, env: [DATABASE_URL] }   # declared only, for now
+```
+
+The recipe is read from your checkout's committed `HEAD`, never from a branch, the new worktree, or uncommitted edits, so a branch can't change how its own worktree is prepared.
+`copy` takes ignored files only, never overwrites anything, and never follows a symlink out of the repository.
+`share` is a deliberate isolation break: each entry is a writable link into your checkout, so a worker writing there changes it for you and for every other worktree.
+Keep it to regenerable dependency directories; config and tooling directories (`.claude`, `.codeoid`, `.vscode`, `.idea`, `.husky`, `.git*`) are refused.
+
+The `command` runs only when you opt in twice.
+Set `worktree.setup.runCommands` to `trusted-repos` (Settings, or `config.json`), then run `codeoid worktree trust` in the repository.
+It shows the command and records the repository with the recipe's git blob id, direnv-allow style.
+When the recipe changes, its command stops running and the session says so until you trust it again; `codeoid worktree trust --off` withdraws trust.
+
+Trust covers the repository's committed content at setup time, not just the one line you reviewed.
+The command runs as you, on a clean checkout of the worktree's base commit (a fork's uncommitted changes are applied only after it), together with every script it invokes from that tree: `package.json` lifecycle scripts, a `Makefile`, a script in the repo.
+Prefer a command that runs no repository scripts, such as `bun install --ignore-scripts` or `npm ci --ignore-scripts`.
+A setup failure is reported as an infrastructure problem, not the agent's; a routine run fails before its agent starts.
+Recipes aren't supported on Windows.
+
 ## Signing a backend in, instead of pasting a key
 
 Settings → **Claude** → **Sign in with Claude** runs the backend's own login

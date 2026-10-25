@@ -902,6 +902,18 @@ export const compareKeepSchema = z.object({
   discardOthers: z.boolean().optional(),
 });
 
+export const worktreeTrustSchema = z.object({
+  ...base,
+  type: z.literal("worktree.trust"),
+  dir: pathField.min(1),
+  dryRun: z.boolean().optional(),
+  off: z.boolean().optional(),
+  recipeHash: z
+    .string()
+    .regex(/^[0-9a-f]{40,64}$/)
+    .optional(),
+});
+
 export const skillGrantSchema = z.object({
   ...base,
   type: z.literal("skill.grant"),
@@ -1131,6 +1143,7 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   backendLoginCancelSchema,
   backendLoginWaitSchema,
   skillGrantSchema,
+  worktreeTrustSchema,
   sessionTurnsSchema,
   sessionApprovalsSchema,
   claudeAccountsListSchema,

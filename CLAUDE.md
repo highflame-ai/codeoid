@@ -183,6 +183,7 @@ codeoid mcp signin <server> [--callback-url <u>]        # sign in to an OAuth re
 codeoid evidence <id> [--full]   # one recorded check: what ran, on which tree, what it found
 codeoid routine add <name> --prompt … [--cron|--every|--at] [--check <cmd>]  # scheduled agent runs
 codeoid routine ls | show | runs | run [--wait] | edit | pause | resume | rm | cancel <runId> | token | preview
+codeoid worktree trust [dir] [--off] [--yes]  # trust the setup command of a repo's .codeoid/setup.yaml, pinned to its blob (docs/CONFIGURATION.md)
 ```
 
 `/mcp/control` (off by default, `mcpControl.*`) lets external agents drive

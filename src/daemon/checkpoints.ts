@@ -399,7 +399,10 @@ async function stageWorkTree(
     let ignored = new Set<string>(literal);
     if (literal.length > 0) {
       ignored = await run(["check-ignore", "-z", "--stdin"], { cwd: workdir, env, timeoutMs: t, input: `${literal.join("\0")}\0` })
-        .catch((err: unknown) => ((err as { code?: unknown }).code === 1 ? "" : literal.join("\0")))
+        // Exit 1 = none ignored. Any other failure fails CLOSED the same way:
+        // every path is named, so it's excluded or `git add` refuses the
+        // snapshot — never a snapshot that might hold a copied secret.
+        .catch(() => "")
         .then((out) => new Set(out.split("\0").filter(Boolean)));
     }
     const extra = [

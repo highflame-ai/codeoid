@@ -248,6 +248,25 @@ export function writeMcpServerEntry(name: string, entry: Record<string, unknown>
   return { ok: true };
 }
 
+/**
+ * Write `worktree.setup.trustedRepos` (what `codeoid worktree trust`
+ * records): merged onto the raw file, the whole config validated, then
+ * written atomically — nothing is written if it doesn't validate.
+ */
+export function writeWorktreeTrust(trustedRepos: readonly unknown[]): { ok: true } | { ok: false; error: string } {
+  let raw: Record<string, unknown>;
+  try {
+    raw = readRawConfig();
+  } catch (err) {
+    return { ok: false, error: `config.json is not valid JSON: ${errMsg(err)}` };
+  }
+  setByPath(raw, "worktree.setup.trustedRepos", [...trustedRepos]);
+  const validation = validateConfigObject(raw);
+  if (!validation.ok) return { ok: false, error: validation.issues.map((i) => i.message).join("; ") };
+  writeConfigJson(raw);
+  return { ok: true };
+}
+
 // ── config.json IO ──────────────────────────────────────────────────────────
 
 function readRawConfig(): Record<string, unknown> {

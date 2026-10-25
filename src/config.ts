@@ -1173,11 +1173,27 @@ const RootSchema = z.object({
       setup: z
         .object({
           /** Whether a recipe's `command` may run. `never` (default) still copies
-           *  and shares files; `trusted-repos` runs it for the repositories in
-           *  `trustedRepos` only. Reading a recipe never executes anything. */
+           *  and shares files; `trusted-repos` runs it only while the recipe is
+           *  the one trusted in `trustedRepos`. Reading a recipe executes nothing. */
           runCommands: z.enum(["never", "trusted-repos"]).default("never"),
-          /** Primary checkouts whose recipe commands may run (`~` allowed). */
-          trustedRepos: z.array(z.string().min(1)).default([]),
+          /** Trusted recipes, written by `codeoid worktree trust`: the primary
+           *  checkout and the recipe's git blob id (a changed recipe runs no
+           *  command until trusted again). A bare path is the older shape and
+           *  trusts no command. Paths are absolute. */
+          trustedRepos: z
+            .array(
+              z.union([
+                z.string().min(1).refine(isAbsolute, "must be an absolute path"),
+                z
+                  .object({
+                    path: z.string().min(1).refine(isAbsolute, "must be an absolute path"),
+                    recipeHash: z.string().regex(/^[0-9a-f]{40,64}$/, "must be a git blob id"),
+                  })
+                  .strict(),
+              ]),
+            )
+            .max(256)
+            .default([]),
         })
         .default({ runCommands: "never", trustedRepos: [] }),
     })
@@ -1342,8 +1358,9 @@ export interface CodeoidConfig {
   /**
    * Worktrees codeoid creates. `setup` is the trust policy for the
    * repository's `.codeoid/setup.yaml` recipe (workspace-setup.ts): its
-   * files are always applied; its command runs only for `trustedRepos` under
-   * `runCommands: "trusted-repos"`. Optional in the type; loadConfig fills it.
+   * files are always applied; its command runs only under
+   * `runCommands: "trusted-repos"` for a recipe pinned in `trustedRepos`.
+   * Optional in the type; loadConfig fills it.
    */
   worktree?: {
     setup: WorktreeSetupPolicy;

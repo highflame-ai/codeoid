@@ -460,6 +460,8 @@ describe("DaemonMessage routing", () => {
           return `login.wait:${msg.ok}`;
         case "skill.grant.result":
           return `skill.grant:${msg.allowed}`;
+        case "worktree.trust.result":
+          return `worktree.trust:${msg.trusted}`;
         case "session.turns.result":
           return `turns:${msg.turns.length}`;
         case "session.approvals.result":

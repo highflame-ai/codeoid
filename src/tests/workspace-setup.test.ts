@@ -9,21 +9,23 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { execFile } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { createCheckpoint, deleteCheckpoints, shadowGitLiteral } from "../daemon/checkpoints.js";
-import { createForkWorktree, removeForkWorktree } from "../daemon/git-worktree.js";
+import { applyCarriedState, createForkWorktree, removeForkWorktree } from "../daemon/git-worktree.js";
 import {
   commandRefusal,
+  describeSetupResult,
   parseSetupRecipe,
+  setupEvent,
   prepareWorktree,
   readSetupRecipe,
   SetupRecipeError,
   type WorktreeSetupPolicy,
 } from "../daemon/workspace-setup.js";
-import { loadConfig } from "../config.js";
+import { loadConfig, validateConfigObject } from "../config.js";
 
 const execFileP = promisify(execFile);
 const g = (args: string[], cwd: string) => execFileP("git", args, { cwd }).then((r) => r.stdout.trim());
@@ -33,7 +35,11 @@ let repo: string;
 let n = 0;
 
 const NEVER: WorktreeSetupPolicy = { runCommands: "never", trustedRepos: [] };
-const trusted = (): WorktreeSetupPolicy => ({ runCommands: "trusted-repos", trustedRepos: [repo] });
+/** Trust the recipe now committed at the primary checkout's HEAD, as `codeoid worktree trust` records it. */
+const trusted = async (): Promise<WorktreeSetupPolicy> => {
+  const found = await readSetupRecipe(repo).catch(() => null);
+  return { runCommands: "trusted-repos", trustedRepos: found ? [{ path: repo, recipeHash: found.recipeHash }] : [] };
+};
 
 async function commitRecipe(yaml: string, extra: Record<string, string> = {}): Promise<void> {
   mkdirSync(join(repo, ".codeoid"), { recursive: true });
@@ -103,6 +109,14 @@ describe("parseSetupRecipe", () => {
       "share: ['node_*']",
       "share: ['.']",
       "share: ['../deps']",
+      "share: ['.claude']",
+      "share: ['.codeoid']",
+      "share: ['tools/.VSCode']",
+      "share: ['.idea']",
+      "share: ['.husky']",
+      "share: ['.github']",
+      "share: ['.git-hooks']",
+      "copy: ['.GIT/config']",
       "commands: echo",
       "resources: { ports: 1, cpus: 2 }",
       "resources: { env: [lower_case] }",
@@ -147,7 +161,7 @@ describe("prepareWorktree", () => {
   it("without a recipe, a worktree is exactly what createForkWorktree made", async () => {
     const wt = await newWorktree();
     const before = listing(wt.path);
-    const r = await prepareWorktree({ worktreePath: wt.path, policy: trusted() });
+    const r = await prepareWorktree({ worktreePath: wt.path, policy: await trusted() });
     expect(r).toEqual({ applied: false, copied: [], shared: [], skipped: [], warnings: [] });
     expect(listing(wt.path)).toEqual(before);
   });
@@ -181,7 +195,7 @@ describe("prepareWorktree", () => {
     // A clean worktree of the branch …
     const wt = await newWorktree({ baseBranch: "feature" });
     expect(readFileSync(join(wt.path, ".codeoid", "setup.yaml"), "utf8")).toContain("pwned");
-    const r = await prepareWorktree({ worktreePath: wt.path, policy: trusted() });
+    const r = await prepareWorktree({ worktreePath: wt.path, policy: await trusted() });
     expect(r.copied).toEqual([".env"]);
     expect(r.shared).toEqual([]);
     expect(r.command).toBeUndefined();
@@ -191,7 +205,7 @@ describe("prepareWorktree", () => {
     const parent = join(tmp, "feature-wt");
     await g(["worktree", "add", parent, "feature"], repo);
     const child = await newWorktree({ workdir: parent });
-    const r2 = await prepareWorktree({ worktreePath: child.path, policy: trusted() });
+    const r2 = await prepareWorktree({ worktreePath: child.path, policy: await trusted() });
     expect(r2.recipeRev).toBe(await g(["rev-parse", "main"], repo));
     expect(r2.command).toBeUndefined();
     expect(existsSync(join(child.path, "pwned"))).toBe(false);
@@ -214,6 +228,37 @@ describe("prepareWorktree", () => {
     expect(r.skipped.every((s) => /outside the primary checkout/.test(s.reason))).toBe(true);
     expect(existsSync(join(wt.path, ".env.escape"))).toBe(false);
     expect(existsSync(join(wt.path, "deps"))).toBe(false);
+  });
+
+  it("never copies a file with other hard links", async () => {
+    const outside = join(tmp, "outside-secret");
+    writeFileSync(outside, "elsewhere\n");
+    linkSync(outside, join(repo, ".env.linked"));
+    await commitRecipe("copy: [.env.linked, .env]\n");
+    const wt = await newWorktree();
+    const r = await prepareWorktree({ worktreePath: wt.path, policy: NEVER });
+    expect(r.copied).toEqual([".env"]);
+    expect(r.skipped).toEqual([{ path: ".env.linked", reason: "has other hard links (the same file may live outside the primary checkout)" }]);
+  });
+
+  it("with deferCarry, the command sees only committed content and the uncommitted edits arrive after", async () => {
+    await commitRecipe("copy: [.env]\ncommand: cat file.txt > seen.txt\n");
+    writeFileSync(join(repo, ".gitignore"), ".env\n.env.*\nnode_modules\n*.local.json\nseen.txt\n");
+    await g(["commit", "-qam", "ignore seen"], repo);
+    const policy = await trusted();
+    writeFileSync(join(repo, "file.txt"), "committed\nagent edit\n"); // uncommitted
+    const wt = await createForkWorktree({ workdir: repo, label: "setup", shortId: `t${++n}`, deferCarry: true });
+    expect(wt.carry).toBeDefined();
+    expect(readFileSync(join(wt.path, "file.txt"), "utf8")).toBe("committed\n");
+    const r = await prepareWorktree({ worktreePath: wt.path, policy });
+    expect(r.command?.exitCode).toBe(0);
+    expect(readFileSync(join(wt.path, "seen.txt"), "utf8")).toBe("committed\n");
+    await applyCarriedState(wt.path, wt.carry!);
+    expect(readFileSync(join(wt.path, "file.txt"), "utf8")).toBe("committed\nagent edit\n");
+    // Uncommitted, on HEAD — as an immediate carry leaves it — and the recipe's files untouched.
+    expect(await g(["rev-parse", "HEAD"], wt.path)).toBe(await g(["rev-parse", "HEAD"], repo));
+    expect(await g(["status", "--porcelain"], wt.path)).toBe("M file.txt");
+    expect(readFileSync(join(wt.path, ".env"), "utf8")).toBe("SECRET=1\n");
   });
 
   it("never copies a file git wouldn't ignore, and never overwrites one", async () => {
@@ -258,14 +303,14 @@ describe("prepareWorktree", () => {
     await commitRecipe("copy: [.env]\nshare: [node_modules\n");
     const wt = await newWorktree();
     const before = listing(wt.path);
-    const r = await prepareWorktree({ worktreePath: wt.path, policy: trusted() });
+    const r = await prepareWorktree({ worktreePath: wt.path, policy: await trusted() });
     expect(r.applied).toBe(false);
     expect(r.error).toMatch(/setup\.yaml is not valid YAML/);
     expect(listing(wt.path)).toEqual(before);
 
     await commitRecipe("copy: [.env, ../escape]\n");
     const wt2 = await newWorktree();
-    const r2 = await prepareWorktree({ worktreePath: wt2.path, policy: trusted() });
+    const r2 = await prepareWorktree({ worktreePath: wt2.path, policy: await trusted() });
     expect(r2.error).toMatch(/\.\. segment/);
     expect(existsSync(join(wt2.path, ".env"))).toBe(false);
   });
@@ -279,7 +324,14 @@ describe("prepareWorktree", () => {
 
 describe("prepareWorktree — the setup command", () => {
   it("never runs when the setting is never (the default)", async () => {
-    expect(loadConfig().worktree?.setup).toEqual({ runCommands: "never", trustedRepos: [] });
+    const prevXdg = process.env.XDG_CONFIG_HOME;
+    process.env.XDG_CONFIG_HOME = tmp; // an empty config: the defaults
+    try {
+      expect(loadConfig().worktree?.setup).toEqual({ runCommands: "never", trustedRepos: [] });
+    } finally {
+      if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = prevXdg;
+    }
     await commitRecipe("command: touch ran\n");
     const wt = await newWorktree();
     const r = await prepareWorktree({ worktreePath: wt.path, policy: NEVER });
@@ -289,12 +341,53 @@ describe("prepareWorktree — the setup command", () => {
     expect(existsSync(join(wt.path, "ran"))).toBe(false);
   });
 
-  it("never runs for a repository the operator didn't list", async () => {
-    await commitRecipe("command: touch ran\n");
+  it("never runs for a repository the owner didn't trust, nor one trusted by path only", async () => {
+    await commitRecipe("copy: [.env]\ncommand: touch ran\n");
     const wt = await newWorktree();
     const r = await prepareWorktree({ worktreePath: wt.path, policy: { runCommands: "trusted-repos", trustedRepos: [join(tmp, "other")] } });
-    expect(r.commandSkipped).toMatch(/isn't in worktree\.setup\.trustedRepos/);
+    expect(r.commandSkippedCode).toBe("untrusted");
+    expect(r.commandSkipped).toMatch(/isn't trusted — run `codeoid worktree trust`/);
+    expect(r.copied).toEqual([".env"]);
+    const wt2 = await newWorktree();
+    const r2 = await prepareWorktree({ worktreePath: wt2.path, policy: { runCommands: "trusted-repos", trustedRepos: [repo] } });
+    expect(r2.commandSkippedCode).toBe("untrusted");
+    expect(r2.commandSkipped).toMatch(/trusted by path only/);
+    expect(setupEvent(r2)).toBe("worktree.setup.untrusted");
     expect(existsSync(join(wt.path, "ran"))).toBe(false);
+    expect(existsSync(join(wt2.path, "ran"))).toBe(false);
+  });
+
+  it("a recipe changed since it was trusted runs no command — copy/share still apply — until trusted again", async () => {
+    await commitRecipe("copy: [.env]\ncommand: touch ran\n");
+    const policy = await trusted();
+    await commitRecipe("copy: [.env]\ncommand: touch ran-changed\n");
+
+    const wt = await newWorktree();
+    const r = await prepareWorktree({ worktreePath: wt.path, policy });
+    expect(r.commandSkippedCode).toBe("changed");
+    expect(r.commandSkipped).toMatch(/the setup command changed since you trusted it — run `codeoid worktree trust`/);
+    expect(setupEvent(r)).toBe("worktree.setup.untrusted");
+    expect(describeSetupResult(r)).toMatch(/without its setup command/);
+    expect(r.error).toBeUndefined();
+    expect(r.copied).toEqual([".env"]);
+    expect(existsSync(join(wt.path, "ran-changed"))).toBe(false);
+
+    // Re-trusting the new recipe runs it.
+    const wt2 = await newWorktree();
+    const r2 = await prepareWorktree({ worktreePath: wt2.path, policy: await trusted() });
+    expect(r2.command?.exitCode).toBe(0);
+    expect(existsSync(join(wt2.path, "ran-changed"))).toBe(true);
+  });
+
+  it("kills what the command left running when it exits, and redacts secrets in its output", async () => {
+    await commitRecipe("command: '(sleep 1; touch late) & echo api_key=sk-abcdef0123456789abcdef0123'\n");
+    const wt = await newWorktree();
+    const r = await prepareWorktree({ worktreePath: wt.path, policy: await trusted() });
+    expect(r.command?.exitCode).toBe(0);
+    expect(r.command?.outputTail).toContain("api_key=");
+    expect(r.command?.outputTail).not.toContain("sk-abcdef0123456789abcdef0123");
+    await new Promise((res) => setTimeout(res, 1_500));
+    expect(existsSync(join(wt.path, "late"))).toBe(false);
   });
 
   it("runs in the new worktree for a trusted repository, after the files are in place", async () => {
@@ -303,7 +396,7 @@ describe("prepareWorktree — the setup command", () => {
     const prev = process.env.CODEOID_API_KEY;
     process.env.CODEOID_API_KEY = "zid_sk_must_not_leak";
     try {
-      const r = await prepareWorktree({ worktreePath: wt.path, policy: trusted() });
+      const r = await prepareWorktree({ worktreePath: wt.path, policy: await trusted() });
       expect(r.error).toBeUndefined();
       expect(r.command?.exitCode).toBe(0);
       expect(r.command?.timedOut).toBe(false);
@@ -318,7 +411,7 @@ describe("prepareWorktree — the setup command", () => {
   it("a failing command is reported with its output and keeps the worktree", async () => {
     await commitRecipe("copy: [.env]\ncommand: 'echo boom >&2; exit 3'\n");
     const wt = await newWorktree();
-    const r = await prepareWorktree({ worktreePath: wt.path, policy: trusted() });
+    const r = await prepareWorktree({ worktreePath: wt.path, policy: await trusted() });
     expect(r.command?.exitCode).toBe(3);
     expect(r.command?.outputTail).toContain("boom");
     expect(r.error).toBe("the setup command exited 3");
@@ -330,7 +423,7 @@ describe("prepareWorktree — the setup command", () => {
     await commitRecipe("command: 'sleep 30 & sleep 30'\ntimeoutSec: 1\n");
     const wt = await newWorktree();
     const t0 = Date.now();
-    const r = await prepareWorktree({ worktreePath: wt.path, policy: trusted() });
+    const r = await prepareWorktree({ worktreePath: wt.path, policy: await trusted() });
     expect(Date.now() - t0).toBeLessThan(10_000);
     expect(r.command?.timedOut).toBe(true);
     expect(r.error).toBe("the setup command timed out after 1s");
@@ -341,14 +434,25 @@ describe("prepareWorktree — the setup command", () => {
     const wt = await newWorktree();
     const abort = new AbortController();
     setTimeout(() => abort.abort(), 200);
-    const r = await prepareWorktree({ worktreePath: wt.path, policy: trusted(), signal: abort.signal });
+    const r = await prepareWorktree({ worktreePath: wt.path, policy: await trusted(), signal: abort.signal });
     expect(r.command?.exitCode).toBeNull();
     expect(r.error).toBeDefined();
   });
 
-  it("commandRefusal compares real paths", () => {
-    expect(commandRefusal(undefined, repo)).toMatch(/off/);
-    expect(commandRefusal({ runCommands: "trusted-repos", trustedRepos: [`${repo}/`] }, repo)).toBeNull();
+  it("commandRefusal pins the blob and compares real, absolute paths", () => {
+    const hash = "0".repeat(40);
+    expect(commandRefusal(undefined, repo, hash)?.code).toBe("off");
+    expect(commandRefusal({ runCommands: "trusted-repos", trustedRepos: [{ path: `${repo}/`, recipeHash: hash }] }, repo, hash)).toBeNull();
+    expect(commandRefusal({ runCommands: "trusted-repos", trustedRepos: [{ path: `${repo}/`, recipeHash: hash }] }, repo, "1".repeat(40))?.code).toBe("changed");
+    // A relative path is never a trust entry.
+    const rel = join("..", repo.split("/").slice(1).join("/"));
+    expect(commandRefusal({ runCommands: "trusted-repos", trustedRepos: [{ path: rel, recipeHash: hash }] }, repo, hash)?.code).toBe("untrusted");
+  });
+
+  it("the config schema takes trust entries with an absolute path and a blob id", () => {
+    expect(validateConfigObject({ worktree: { setup: { trustedRepos: ["/abs", { path: "/abs", recipeHash: "a".repeat(40) }] } } }).ok).toBe(true);
+    expect(validateConfigObject({ worktree: { setup: { trustedRepos: ["relative/path"] } } }).ok).toBe(false);
+    expect(validateConfigObject({ worktree: { setup: { trustedRepos: [{ path: "/abs", recipeHash: "nope" }] } } }).ok).toBe(false);
   });
 });
 

@@ -13,7 +13,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -30,6 +30,7 @@ import type { CanonicalTurn } from "../daemon/providers/canonical.js";
 import type { AuthContext, DaemonMessage } from "../protocol/types.js";
 import { ALL_SCOPES } from "../protocol/scopes.js";
 import { loadConfig } from "../config.js";
+import { readSetupRecipe } from "../daemon/workspace-setup.js";
 
 const AUTH: AuthContext = {
   sub: "user:fork",
@@ -659,13 +660,14 @@ describe("SessionManager session.fork — git worktree isolation", () => {
   it("W8: the repository's setup recipe prepares the fork's worktree before its first turn, and destroy takes it back out", async () => {
     const repo = await makeGitRepoWithDirtyEdit();
     mkdirSync(join(repo, ".codeoid"));
-    writeFileSync(join(repo, ".codeoid", "setup.yaml"), "copy: [.env]\ncommand: cat .env > .recipe-ran\n");
+    writeFileSync(join(repo, ".codeoid", "setup.yaml"), "copy: [.env]\ncommand: cat .env file.txt > .recipe-ran\n");
     writeFileSync(join(repo, ".gitignore"), ".env\n.recipe-ran\n");
     await gitIn(["add", ".codeoid", ".gitignore"], repo);
     await gitIn(["commit", "-m", "recipe"], repo);
     writeFileSync(join(repo, ".env"), "TOKEN=1\n");
     const { registry } = makeRegistry();
-    const config = { ...loadConfig(), worktree: { setup: { runCommands: "trusted-repos" as const, trustedRepos: [repo] } } };
+    const recipeHash = (await readSetupRecipe(repo))!.recipeHash;
+    const config = { ...loadConfig(), worktree: { setup: { runCommands: "trusted-repos" as const, trustedRepos: [{ path: repo, recipeHash }] } } };
     const manager = new SessionManager(store, transcript, undefined, undefined, undefined, {
       providers: registry,
       config,
@@ -677,7 +679,10 @@ describe("SessionManager session.fork — git worktree isolation", () => {
     const resp = await manager.handle({ type: "session.fork", id: "w8", sessionId: parentId }, AUTH, c);
     const fork = (resp as { data: { id: string; workdir: string; worktree: { path: string; branch: string } } }).data;
     await sendAndSettle(manager, c, fork.id, "go");
-    expect(readFileSync(join(fork.workdir, ".recipe-ran"), "utf8")).toBe("TOKEN=1\n");
+    // The command ran on the committed tree — before the parent's
+    // uncommitted edit was carried in, which the fork has once it's ready.
+    expect(readFileSync(join(fork.workdir, ".recipe-ran"), "utf8")).toBe("TOKEN=1\ncommitted\n");
+    expect(readFileSync(join(fork.workdir, "file.txt"), "utf8")).toBe("committed\nWIP\n");
 
     // Recorded on the session (checkpoint exclusions, cleanup) and surfaced.
     const info = (await manager.handle({ type: "session.list", id: "l8" }, AUTH, c)) as {
@@ -698,5 +703,68 @@ describe("SessionManager session.fork — git worktree isolation", () => {
     const kept = (await gitIn(["ls-tree", "-r", "--name-only", fork.worktree.branch], repo)).split("\n");
     expect(kept).not.toContain(".env");
     expect(readFileSync(join(repo, ".env"), "utf8")).toBe("TOKEN=1\n");
+  });
+
+  it("W9: `worktree.trust` pins the recipe — owner only; a changed recipe runs nothing until trusted again", async () => {
+    const prevXdg = process.env.XDG_CONFIG_HOME;
+    process.env.XDG_CONFIG_HOME = join(tmp, "xdg"); // config.json writes land here
+    try {
+      const repo = await makeGitRepoWithDirtyEdit();
+      mkdirSync(join(repo, ".codeoid"));
+      writeFileSync(join(repo, ".codeoid", "setup.yaml"), "command: touch .ran-v1\n");
+      writeFileSync(join(repo, ".gitignore"), ".ran-*\n");
+      await gitIn(["add", ".codeoid", ".gitignore"], repo);
+      await gitIn(["commit", "-m", "recipe"], repo);
+      const { registry } = makeRegistry();
+      const config = { ...loadConfig(), worktree: { setup: { runCommands: "trusted-repos" as const, trustedRepos: [] } } };
+      const manager = new SessionManager(store, transcript, undefined, undefined, undefined, { providers: registry, config } as never);
+      const c = client(AUTH);
+      const trust = (extra: Record<string, unknown>, auth: AuthContext = AUTH) =>
+        manager.handle({ type: "worktree.trust", id: randomUUID(), dir: repo, ...extra } as never, auth, c);
+
+      const shown = (await trust({ dryRun: true })) as { type: string; command?: string; recipeHash?: string; trusted: boolean };
+      expect(shown).toMatchObject({ type: "worktree.trust.result", command: "touch .ran-v1", trusted: false, changed: false });
+      expect(await trust({ recipeHash: shown.recipeHash }, { ...AUTH, delegationDepth: 1 })).toMatchObject({ type: "response.error", code: "forbidden" });
+      expect(await trust({ recipeHash: shown.recipeHash }, { ...AUTH, scopes: ["session:create"] as AuthContext["scopes"] })).toMatchObject({ code: "forbidden" });
+      expect(await trust({ recipeHash: "f".repeat(40) })).toMatchObject({ type: "response.error", code: "invalid_request" });
+      expect(await trust({ recipeHash: shown.recipeHash })).toMatchObject({ trusted: true, changed: true });
+      const written = JSON.parse(readFileSync(join(tmp, "xdg", "codeoid", "config.json"), "utf8"));
+      expect(written.worktree.setup.trustedRepos).toEqual([{ path: realpathSync(repo), recipeHash: shown.recipeHash }]);
+
+      const parentId = await createIn(manager, c, repo);
+      await sendAndSettle(manager, c, parentId, "hello");
+      const forkOnce = async (id: string) => {
+        const resp = await manager.handle({ type: "session.fork", id, sessionId: parentId }, AUTH, c);
+        const fork = (resp as { data: { id: string; workdir: string } }).data;
+        await sendAndSettle(manager, c, fork.id, "go");
+        await transcript.flush();
+        const events = (await transcript.loadTranscript(fork.id, {}))
+          .map((r) => r.message)
+          .filter((m) => m.type === "session.message")
+          .map((m) => (m as { metadata?: { event?: string } }).metadata?.event);
+        return { fork, events };
+      };
+      const first = await forkOnce("w9a");
+      expect(existsSync(join(first.fork.workdir, ".ran-v1"))).toBe(true);
+
+      // The recipe changes: the next fork runs nothing and says why.
+      writeFileSync(join(repo, ".codeoid", "setup.yaml"), "command: touch .ran-v2\n");
+      await gitIn(["commit", "-qam", "recipe v2"], repo);
+      const second = await forkOnce("w9b");
+      expect(existsSync(join(second.fork.workdir, ".ran-v2"))).toBe(false);
+      expect(second.events).toContain("worktree.setup.untrusted");
+
+      // Trusted again, it runs.
+      const again = (await trust({ dryRun: true })) as { recipeHash?: string };
+      await trust({ recipeHash: again.recipeHash });
+      const third = await forkOnce("w9c");
+      expect(existsSync(join(third.fork.workdir, ".ran-v2"))).toBe(true);
+
+      expect(await trust({ off: true })).toMatchObject({ trusted: false, changed: true });
+      expect(JSON.parse(readFileSync(join(tmp, "xdg", "codeoid", "config.json"), "utf8")).worktree.setup.trustedRepos).toEqual([]);
+    } finally {
+      if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = prevXdg;
+    }
   });
 });

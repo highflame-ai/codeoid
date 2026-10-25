@@ -128,6 +128,18 @@ export interface ForkWorktree {
    * the parent's workdir then don't line up with the fork's.
    */
   subdirMapped: boolean;
+  /**
+   * With `deferCarry`: the parent's uncommitted tracked state, not yet in the
+   * worktree (which is a clean checkout of `head`). Apply it with
+   * {@link applyCarriedState} once setup has run.
+   */
+  carry?: CarriedState;
+}
+
+/** A parent's uncommitted tracked state (`git stash create`) and the HEAD it sits on. */
+export interface CarriedState {
+  snapshot: string;
+  head: string;
 }
 
 /**
@@ -177,6 +189,12 @@ export async function createForkWorktree(opts: {
    * (an untracked directory isn't carried), so the fork still opens in it.
    */
   ensureSubdir?: boolean;
+  /**
+   * Check out the parent's HEAD clean and hand the uncommitted state back as
+   * `carry` instead of applying it — so a setup command runs against
+   * committed content only, never the parent's (agent-written) edits.
+   */
+  deferCarry?: boolean;
 }): Promise<ForkWorktree> {
   const mainRoot = await mainWorktreeRoot(opts.workdir);
 
@@ -192,6 +210,7 @@ export async function createForkWorktree(opts: {
   let base: string;
   let parentHead: string | null = null;
   let carriedSnapshot = false;
+  let deferred: CarriedState | undefined;
   if (opts.baseCommit) {
     if (!/^[0-9a-f]{40,64}$/.test(opts.baseCommit)) throw new WorktreeError("invalid base commit");
     // Local when it was recorded: a miss means it's gone (gc'd), not remote.
@@ -205,8 +224,13 @@ export async function createForkWorktree(opts: {
       throw new WorktreeError("repository has no commits yet (unborn HEAD)");
     }
     const snapshot = (await git(["stash", "create"], opts.workdir)).trim();
-    base = snapshot || parentHead;
-    carriedSnapshot = snapshot.length > 0;
+    if (snapshot && opts.deferCarry) {
+      base = parentHead;
+      deferred = { snapshot, head: parentHead };
+    } else {
+      base = snapshot || parentHead;
+      carriedSnapshot = snapshot.length > 0;
+    }
   }
 
   try {
@@ -260,7 +284,23 @@ export async function createForkWorktree(opts: {
     subdirMapped = false;
   }
 
-  return { path: worktreePath, workdir, branch, subdirMapped };
+  return { path: worktreePath, workdir, branch, subdirMapped, ...(deferred ? { carry: deferred } : {}) };
+}
+
+/**
+ * Apply a deferred {@link CarriedState} to a worktree: its tracked files
+ * become the snapshot's (edits and deletions included) as UNCOMMITTED
+ * changes — the index stays at HEAD, exactly as the immediate path's
+ * `reset --mixed` leaves it. Untracked and ignored files (what a setup recipe
+ * put there) are left alone. Throws {@link WorktreeError}.
+ */
+export async function applyCarriedState(worktreePath: string, carry: CarriedState): Promise<void> {
+  if (!/^[0-9a-f]{40,64}$/.test(carry.snapshot)) throw new WorktreeError("invalid carried snapshot");
+  try {
+    await git(["restore", `--source=${carry.snapshot}`, "--worktree", "--", "."], worktreePath);
+  } catch (err) {
+    throw new WorktreeError(`couldn't carry the uncommitted changes: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 /**

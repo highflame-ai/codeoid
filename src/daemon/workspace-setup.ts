@@ -8,7 +8,7 @@
  * ```yaml
  * copy: [.env, "config/*.local.json"]   # ignored files, copied from the primary checkout
  * share: [node_modules]                  # directories, symlinked to the primary checkout
- * command: bun install --frozen-lockfile # run in the new worktree, only when trusted
+ * command: bun install --ignore-scripts  # run in the new worktree, only when trusted
  * timeoutSec: 600
  * resources: { ports: 2, env: [DATABASE_URL] }   # declared only; leased in a later slice
  * ```
@@ -22,25 +22,53 @@
  *   - `copy` / `share` sources resolve inside the primary checkout (realpath
  *     containment, never `.git`); destinations are created inside the new
  *     worktree without following a symlink. A copied file must be ignored by
- *     git there, so it can never be committed; nothing existing is overwritten.
+ *     git there, so it can never be committed; nothing existing is
+ *     overwritten, and a file with other hard links is never copied.
+ *   - `share` is a deliberate isolation break: a WRITABLE link into the
+ *     primary checkout, so a worker can change what every other worktree and
+ *     the user see there. Use it for regenerable dependency directories only;
+ *     config and tooling directories (`.claude`, `.codeoid`, `.vscode`,
+ *     `.idea`, `.husky`, `.git*`) are refused.
  *   - `command` runs only under `worktree.setup.runCommands: "trusted-repos"`
- *     for a repository the operator listed — the pack-trust model (an
- *     untrusted command gate fails closed; declaring is not executing). It
- *     gets a built environment, never the daemon's own (GHSA-38vh).
+ *     and only while the recipe's git blob is the one the owner trusted with
+ *     `codeoid worktree trust` (direnv-allow style: a changed recipe runs
+ *     nothing until it is trusted again). It runs on the CLEAN checkout of the
+ *     worktree's base commit, before any uncommitted state a fork carries is
+ *     applied, with a built environment, never the daemon's own (GHSA-38vh).
+ *     Trust therefore covers the repository's committed content at setup
+ *     time — including every script the command invokes (package.json
+ *     lifecycle scripts, a Makefile, a script in the repo). Prefer commands
+ *     that run no repository scripts, e.g. `bun install --ignore-scripts`.
  *
  * Everything is validated before anything is written; a failure while
  * writing rolls back what this run created. A setup failure is an
  * infrastructure error: it is reported, never thrown, and never removes the
- * worktree or touches the primary checkout.
+ * worktree or touches the primary checkout. Not available on Windows.
  */
 
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { chmodSync, constants, copyFileSync, lstatSync, mkdirSync, realpathSync, rmdirSync, type Stats, statSync, symlinkSync, unlinkSync } from "node:fs";
-import os from "node:os";
+import {
+  closeSync,
+  constants,
+  fchmodSync,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readSync,
+  realpathSync,
+  rmdirSync,
+  type Stats,
+  statSync,
+  symlinkSync,
+  unlinkSync,
+  writeSync,
+} from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 import { z } from "zod";
 import { mainWorktreeRoot } from "./git-worktree.js";
+import { redactSecretText } from "./mcp/redact.js";
 import { buildSubprocessEnv } from "./providers/env.js";
 
 const execFileP = promisify(execFile);
@@ -49,13 +77,23 @@ const execFileP = promisify(execFile);
 export const SETUP_RECIPE_PATH = ".codeoid/setup.yaml";
 /** Default wall-clock for the setup command (dependency installs can be slow). */
 export const DEFAULT_SETUP_TIMEOUT_SEC = 600;
+/** Recipes are POSIX-only: symlinked shares, process groups, `/bin/sh`. */
+export const WORKTREE_SETUP_SUPPORTED = process.platform !== "win32";
 
 const LIMITS = {
   RECIPE_BYTES: 64 * 1024,
   COPY_FILES: 500,
   COPY_BYTES: 256 * 1024 * 1024,
   OUTPUT_TAIL: 8 * 1024,
+  /** After the shell exits, how long its output pipes may still drain. */
+  DRAIN_MS: 500,
 } as const;
+
+/**
+ * Directories `share` refuses: a writable link to one would let a worker
+ * change the primary checkout's agent config, editor settings or git hooks.
+ */
+const UNSHAREABLE = new Set([".claude", ".codeoid", ".vscode", ".idea", ".husky"]);
 
 // ── Recipe schema ────────────────────────────────────────────────────────────
 
@@ -69,38 +107,45 @@ function normalizeRel(p: string): string {
 
 const GLOB_CHARS = /[*?[\]{}]/;
 
+/** `.git` in any case: case-insensitive filesystems treat `.GIT` as the same directory. */
+const isGitSegment = (s: string) => s.toLowerCase() === ".git";
+
 /** Why `p` can't name a path inside the repository, or null when it can. */
-function relPathProblem(p: string, glob: boolean): string | null {
+function relPathProblem(p: string, kind: "copy" | "share"): string | null {
   if (p.includes("\0")) return "contains a NUL byte";
   if (p.includes("\\")) return "uses a backslash (use / separators)";
   if (path.posix.isAbsolute(p) || /^[A-Za-z]:/.test(p)) return "is absolute (paths are relative to the repository root)";
   if (p.startsWith("~")) return "starts with ~ (paths are relative to the repository root)";
   const segs = p.split("/");
   if (segs.includes("..")) return "has a .. segment (paths must stay inside the repository)";
-  if (segs.includes(".git")) return "is inside .git";
+  if (segs.some(isGitSegment)) return "is inside .git";
   if (segs.every((s) => s === "" || s === ".")) return "names the repository root";
-  if (!glob && GLOB_CHARS.test(p)) return "is a glob (share takes plain directory paths)";
+  if (kind === "share") {
+    if (GLOB_CHARS.test(p)) return "is a glob (share takes plain directory paths)";
+    const tooling = segs.find((s) => UNSHAREABLE.has(s.toLowerCase()) || s.toLowerCase().startsWith(".git"));
+    if (tooling) return `is a config or tooling directory (${tooling}) — sharing it would let a worker change the primary checkout's`;
+  }
   return null;
 }
 
-const relPath = (glob: boolean) =>
+const relPath = (kind: "copy" | "share") =>
   z
     .string()
     .min(1)
     .max(1024)
     .transform(normalizeRel)
     .superRefine((p, ctx) => {
-      const why = relPathProblem(p, glob);
+      const why = relPathProblem(p, kind);
       if (why) ctx.addIssue({ code: "custom", message: `${JSON.stringify(p)} ${why}` });
     });
 
 export const SetupRecipeSchema = z
   .object({
     /** Ignored files to copy from the primary checkout; globs allowed. */
-    copy: z.array(relPath(true)).max(256).default([]),
-    /** Directories to symlink from the primary checkout (e.g. node_modules). */
-    share: z.array(relPath(false)).max(64).default([]),
-    /** Shell command run in the new worktree's root — only for a trusted repository. */
+    copy: z.array(relPath("copy")).max(256).default([]),
+    /** Directories to symlink, writable, from the primary checkout (e.g. node_modules). */
+    share: z.array(relPath("share")).max(64).default([]),
+    /** Shell command run in the new worktree's root — only for a trusted recipe. */
     command: z.string().trim().min(1).max(16_384).optional(),
     /** Wall-clock limit for `command`, in seconds. */
     timeoutSec: z.number().int().min(1).max(7_200).optional(),
@@ -185,6 +230,20 @@ async function ignoredIn(worktree: string, rels: readonly string[]): Promise<Set
   return new Set(stdout.split("\0").filter(Boolean));
 }
 
+/** A recipe as committed: the parsed content, where it came from, and its git blob id (what trust pins). */
+export interface FoundRecipe {
+  recipe: SetupRecipe;
+  /** The commit it was read from (the primary checkout's HEAD). */
+  rev: string;
+  /** The primary checkout. */
+  root: string;
+  /** The recipe file's git blob id — the content `codeoid worktree trust` pins. */
+  recipeHash: string;
+}
+
+/** {@link readSetupRecipe}'s outcome without a throw: a recipe, none, or why it's unusable. */
+export type RecipeRead = FoundRecipe | null | { error: string };
+
 /**
  * The recipe at the primary checkout's committed `HEAD`, or null when there
  * is none (no file, or no commit yet). The working tree is never read: the
@@ -192,7 +251,7 @@ async function ignoredIn(worktree: string, rels: readonly string[]): Promise<Set
  * agent left uncommitted or put on a branch. Throws {@link SetupRecipeError}
  * when the file is there but unusable.
  */
-export async function readSetupRecipe(repoDir: string): Promise<{ recipe: SetupRecipe; rev: string; root: string } | null> {
+export async function readSetupRecipe(repoDir: string): Promise<FoundRecipe | null> {
   const root = await mainWorktreeRoot(repoDir);
   const head = await git(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], root, { okCodes: [1, 128] });
   const rev = head.stdout.trim();
@@ -207,40 +266,76 @@ export async function readSetupRecipe(repoDir: string): Promise<{ recipe: SetupR
   if (Number(m[4]) > LIMITS.RECIPE_BYTES) {
     throw new SetupRecipeError(`${SETUP_RECIPE_PATH} is larger than ${LIMITS.RECIPE_BYTES / 1024} KiB`);
   }
-  const text = (await git(["cat-file", "blob", m[3] as string], root)).stdout;
-  return { recipe: parseSetupRecipe(text), rev, root };
+  const blob = m[3] as string;
+  const text = (await git(["cat-file", "blob", blob], root)).stdout;
+  return { recipe: parseSetupRecipe(text), rev, root, recipeHash: blob };
+}
+
+/** {@link readSetupRecipe} that never throws. */
+export async function loadSetupRecipe(repoDir: string): Promise<RecipeRead> {
+  try {
+    return await readSetupRecipe(repoDir);
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
 }
 
 // ── Policy ───────────────────────────────────────────────────────────────────
 
+/** A repository whose recipe command the owner trusted, pinned to the recipe's content. */
+export interface TrustedRecipe {
+  /** The primary checkout (absolute). */
+  path: string;
+  /** The recipe's git blob id when it was trusted. */
+  recipeHash: string;
+}
+
 /** `config.worktree.setup`: whether a recipe's `command` may run. */
 export interface WorktreeSetupPolicy {
-  /** `never` (default): never run a recipe command. `trusted-repos`: only for a repository in `trustedRepos`. */
+  /** `never` (default): never run a recipe command. `trusted-repos`: only a recipe in `trustedRepos`. */
   runCommands: "never" | "trusted-repos";
-  /** Primary checkouts whose recipe commands may run (`~` allowed; compared by real path). */
-  trustedRepos: readonly string[];
+  /**
+   * Trusted recipes. A bare path (the first shape of this setting) trusts no
+   * command: there is no content to pin, so it waits for `codeoid worktree trust`.
+   */
+  trustedRepos: readonly (string | TrustedRecipe)[];
+}
+
+export interface CommandRefusal {
+  /** off: commands disabled; untrusted: never trusted; changed: the recipe changed since; unsupported: platform. */
+  code: "off" | "untrusted" | "changed" | "unsupported";
+  reason: string;
 }
 
 function realOrNull(p: string): string | null {
   try {
-    return realpathSync(p);
+    return realpathSync.native(p);
   } catch {
     return null;
   }
 }
 
-function expandHome(p: string): string {
-  return p === "~" ? os.homedir() : p.startsWith("~/") ? path.join(os.homedir(), p.slice(2)) : p;
-}
+const TRUST_HINT = "run `codeoid worktree trust` in the repository to review its command and trust it";
 
-/** Null when `root`'s recipe command may run, else why not. */
-export function commandRefusal(policy: WorktreeSetupPolicy | undefined, root: string): string | null {
+/** Null when `root`'s recipe (blob `recipeHash`) may run its command, else why not. */
+export function commandRefusal(policy: WorktreeSetupPolicy | undefined, root: string, recipeHash: string): CommandRefusal | null {
+  if (!WORKTREE_SETUP_SUPPORTED) return { code: "unsupported", reason: "setup commands aren't supported on Windows" };
   if (!policy || policy.runCommands !== "trusted-repos") {
-    return "recipe commands are off (set worktree.setup.runCommands to trusted-repos and list this repository in worktree.setup.trustedRepos)";
+    return { code: "off", reason: "recipe commands are off (set worktree.setup.runCommands to trusted-repos, then trust the recipe with `codeoid worktree trust`)" };
   }
   const real = realOrNull(root);
-  const trusted = !!real && policy.trustedRepos.some((r) => realOrNull(path.resolve(expandHome(r))) === real);
-  return trusted ? null : `this repository isn't in worktree.setup.trustedRepos (${root})`;
+  const mine = real ? policy.trustedRepos.filter((e) => path.isAbsolute(typeof e === "string" ? e : e.path) && realOrNull(typeof e === "string" ? e : e.path) === real) : [];
+  const pinned = mine.filter((e): e is TrustedRecipe => typeof e !== "string");
+  if (pinned.some((e) => e.recipeHash === recipeHash)) return null;
+  if (pinned.length > 0) return { code: "changed", reason: `the setup command changed since you trusted it — ${TRUST_HINT}` };
+  if (mine.length > 0) return { code: "untrusted", reason: `this repository is trusted by path only, which runs no command — ${TRUST_HINT}` };
+  return { code: "untrusted", reason: `this repository's recipe isn't trusted — ${TRUST_HINT}` };
+}
+
+/** Whether preparing from `read` under `policy` would run a command (it then needs the clean checkout). */
+export function willRunCommand(read: RecipeRead, policy: WorktreeSetupPolicy | undefined): boolean {
+  if (!read || "error" in read || !read.recipe.command) return false;
+  return commandRefusal(policy, read.root, read.recipeHash) === null;
 }
 
 // ── Prepare ──────────────────────────────────────────────────────────────────
@@ -250,7 +345,7 @@ export interface WorktreeSetupCommandResult {
   /** Exit code; null when it couldn't start or was killed. */
   exitCode: number | null;
   timedOut: boolean;
-  /** The last few KiB of combined stdout + stderr. */
+  /** The last few KiB of combined stdout + stderr, with token-like strings redacted. */
   outputTail: string;
   durationMs: number;
 }
@@ -260,6 +355,8 @@ export interface WorktreeSetupResult {
   applied: boolean;
   /** The commit the recipe was read from. */
   recipeRev?: string;
+  /** The recipe's git blob id. */
+  recipeHash?: string;
   /** Worktree-relative files copied in — secrets, so excluded from evidence and checkpoints. */
   copied: string[];
   /** Worktree-relative symlinks to the primary checkout's directories. */
@@ -272,6 +369,7 @@ export interface WorktreeSetupResult {
   command?: WorktreeSetupCommandResult;
   /** Why the recipe's command didn't run. */
   commandSkipped?: string;
+  commandSkippedCode?: CommandRefusal["code"];
   /** Set when setup failed — an infrastructure error, never the agent's. */
   error?: string;
 }
@@ -293,9 +391,12 @@ export class WorktreeSetupFailure extends Error {
 interface Planned {
   rel: string;
   src: string;
+  st?: Stats;
 }
 
 const isInside = (child: string, root: string) => child === root || child.startsWith(root + path.sep);
+/** {@link isInside}, case-insensitively — for `.git`, which a case-insensitive filesystem also answers to as `.GIT`. */
+const isInsideCi = (child: string, root: string) => isInside(child.toLowerCase(), root.toLowerCase());
 
 /**
  * Walk `rel`'s parent directories under `root`, creating missing ones
@@ -354,39 +455,75 @@ function matchCopy(pattern: string, root: string): string[] {
   const out: string[] = [];
   for (const rel of new Bun.Glob(pattern).scanSync({ cwd: root, dot: true, onlyFiles: true, followSymlinks: false })) {
     const posix = rel.split(path.sep).join("/");
-    if (!posix.split("/").includes(".git")) out.push(posix);
+    if (!posix.split("/").some(isGitSegment)) out.push(posix);
     if (out.length > LIMITS.COPY_FILES) break;
   }
   return out.sort();
 }
 
 /**
+ * Copy `src` to a new `dest` through file descriptors: the source opened
+ * without following a symlink and re-checked to be the very file planned (a
+ * single-link regular file), the destination created exclusively, never
+ * through a symlink. `dest` goes into `created` as soon as it exists, so a
+ * failure part-way still rolls it back.
+ */
+function copyNoFollow(src: string, dest: string, planned: Stats, created: string[]): void {
+  const from = openSync(src, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const st = fstatSync(from);
+    if (!st.isFile() || st.nlink !== 1 || st.ino !== planned.ino || st.dev !== planned.dev) {
+      throw new Error(`${src} changed while setup was copying it`);
+    }
+    const mode = st.mode & 0o777;
+    const to = openSync(dest, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, mode);
+    created.push(dest);
+    try {
+      const buf = Buffer.allocUnsafe(1 << 20);
+      for (let pos = 0; ; ) {
+        const n = readSync(from, buf, 0, buf.length, pos);
+        if (n === 0) break;
+        for (let off = 0; off < n; ) off += writeSync(to, buf, off, n - off);
+        pos += n;
+      }
+      fchmodSync(to, mode);
+    } finally {
+      closeSync(to);
+    }
+  } finally {
+    closeSync(from);
+  }
+}
+
+/**
  * Apply the repository's setup recipe to a worktree codeoid just created:
  * copy the ignored files it names, symlink its shared directories, and (when
- * the policy trusts the repository) run its command. `worktreePath` is the
- * worktree ROOT. Never throws; failures come back in `error`.
+ * the owner trusted this exact recipe) run its command. `worktreePath` is the
+ * worktree ROOT, still a clean checkout of its base commit when a command
+ * will run (see git-worktree.ts `deferCarry`). `recipe`, when given, is the
+ * read a caller already decided on — so what it planned for is what runs.
+ * Never throws; failures come back in `error`.
  */
 export async function prepareWorktree(opts: {
   worktreePath: string;
   policy?: WorktreeSetupPolicy;
-  /** Abort a running command (session destroyed, daemon stopping). */
+  /** Abort a running command (session destroyed, routine cancelled, daemon stopping). */
   signal?: AbortSignal;
+  recipe?: RecipeRead;
 }): Promise<WorktreeSetupResult> {
   const result: WorktreeSetupResult = { applied: false, copied: [], shared: [], skipped: [], warnings: [] };
   const fail = (err: unknown): WorktreeSetupResult => {
     result.error = err instanceof Error ? err.message : String(err);
     return result;
   };
+  if (!WORKTREE_SETUP_SUPPORTED) return result;
 
-  let found: Awaited<ReturnType<typeof readSetupRecipe>>;
-  try {
-    found = await readSetupRecipe(opts.worktreePath);
-  } catch (err) {
-    return fail(err);
-  }
+  const found = opts.recipe !== undefined ? opts.recipe : await loadSetupRecipe(opts.worktreePath);
   if (!found) return result;
-  const { recipe, rev, root } = found;
+  if ("error" in found) return fail(found.error);
+  const { recipe, rev, root, recipeHash } = found;
   result.recipeRev = rev;
+  result.recipeHash = recipeHash;
   if (recipe.resources) result.resources = recipe.resources;
 
   const realRoot = realOrNull(root);
@@ -401,12 +538,13 @@ export async function prepareWorktree(opts: {
   const source = (rel: string): string | null => {
     const real = realOrNull(path.join(root, rel));
     if (!real) return null;
-    return isInside(real, realRoot) && real !== realRoot && !isInside(real, gitDir) ? real : null;
+    return isInside(real, realRoot) && real !== realRoot && !isInsideCi(real, gitDir) ? real : null;
   };
 
   const copies: Planned[] = [];
-  let copyBytes = 0;
+  const shares: Planned[] = [];
   try {
+    let copyBytes = 0;
     const seen = new Set<string>();
     for (const pattern of recipe.copy) {
       const matched = matchCopy(pattern, root);
@@ -419,9 +557,13 @@ export async function prepareWorktree(opts: {
           skip(rel, "resolves outside the primary checkout (a symlink escape) or is missing");
           continue;
         }
-        const st = statSync(src);
+        const st = lstatSync(src);
         if (!st.isFile()) {
           skip(rel, "is not a file (use share for directories)");
+          continue;
+        }
+        if (st.nlink > 1) {
+          skip(rel, "has other hard links (the same file may live outside the primary checkout)");
           continue;
         }
         const blocked = parentProblem(worktree, rel);
@@ -434,7 +576,7 @@ export async function prepareWorktree(opts: {
           continue;
         }
         copyBytes += st.size;
-        copies.push({ rel, src });
+        copies.push({ rel, src, st });
       }
     }
     if (copies.length > LIMITS.COPY_FILES) throw new SetupRecipeError(`copy matches more than ${LIMITS.COPY_FILES} files`);
@@ -446,35 +588,34 @@ export async function prepareWorktree(opts: {
       if (ignored.has(c.rel)) copies.push(c);
       else skip(c.rel, "is not ignored by git in the new worktree (copying it would let it be committed)");
     }
+
+    for (const rel of recipe.share) {
+      if (!exists(path.join(root, rel))) {
+        skip(rel, "doesn't exist in the primary checkout");
+        continue;
+      }
+      const src = source(rel);
+      if (!src) {
+        skip(rel, "resolves outside the primary checkout (a symlink escape)");
+        continue;
+      }
+      if (!statSync(src).isDirectory()) {
+        skip(rel, "is not a directory (use copy for files)");
+        continue;
+      }
+      const blocked = parentProblem(worktree, rel);
+      if (blocked) {
+        skip(rel, blocked);
+        continue;
+      }
+      if (exists(path.join(worktree, rel))) {
+        skip(rel, "already exists in the new worktree (not replaced)");
+        continue;
+      }
+      shares.push({ rel, src });
+    }
   } catch (err) {
     return fail(err);
-  }
-
-  const shares: Planned[] = [];
-  for (const rel of recipe.share) {
-    if (!exists(path.join(root, rel))) {
-      skip(rel, "doesn't exist in the primary checkout");
-      continue;
-    }
-    const src = source(rel);
-    if (!src) {
-      skip(rel, "resolves outside the primary checkout (a symlink escape)");
-      continue;
-    }
-    if (!statSync(src).isDirectory()) {
-      skip(rel, "is not a directory (use copy for files)");
-      continue;
-    }
-    const blocked = parentProblem(worktree, rel);
-    if (blocked) {
-      skip(rel, blocked);
-      continue;
-    }
-    if (exists(path.join(worktree, rel))) {
-      skip(rel, "already exists in the new worktree (not replaced)");
-      continue;
-    }
-    shares.push({ rel, src });
   }
 
   // ── Apply, rolling back on any failure. ──
@@ -483,11 +624,7 @@ export async function prepareWorktree(opts: {
   try {
     for (const c of copies) {
       ensureParents(worktree, c.rel, createdDirs);
-      const dest = path.join(worktree, c.rel);
-      // EXCL: never overwrite, and never write through a symlink planted at dest.
-      copyFileSync(c.src, dest, constants.COPYFILE_EXCL);
-      createdFiles.push(dest);
-      chmodSync(dest, statSync(c.src).mode & 0o777);
+      copyNoFollow(c.src, path.join(worktree, c.rel), c.st as Stats, createdFiles);
       result.copied.push(c.rel);
     }
     for (const s of shares) {
@@ -530,9 +667,10 @@ export async function prepareWorktree(opts: {
   }
 
   if (recipe.command) {
-    const refusal = commandRefusal(opts.policy, root);
+    const refusal = commandRefusal(opts.policy, root, recipeHash);
     if (refusal) {
-      result.commandSkipped = refusal;
+      result.commandSkipped = refusal.reason;
+      result.commandSkippedCode = refusal.code;
     } else {
       const timeoutSec = recipe.timeoutSec ?? DEFAULT_SETUP_TIMEOUT_SEC;
       result.command = await runSetupCommand(recipe.command, {
@@ -542,6 +680,7 @@ export async function prepareWorktree(opts: {
         ...(opts.signal ? { signal: opts.signal } : {}),
       });
       if (result.command.timedOut) result.error = `the setup command timed out after ${timeoutSec}s`;
+      else if (opts.signal?.aborted) result.error = "the setup command was stopped";
       else if (result.command.exitCode !== 0) {
         result.error = result.command.exitCode === null ? "the setup command didn't run to completion" : `the setup command exited ${result.command.exitCode}`;
       }
@@ -551,10 +690,12 @@ export async function prepareWorktree(opts: {
 }
 
 /**
- * Run the setup command in its own process group (killed whole at the
- * timeout or on abort — a package manager's children otherwise hold the
- * pipes open), with a built environment: the shared safe basics, never the
- * daemon's secrets. `CODEOID_AGENT_ENV_ALLOW` passes more, as everywhere.
+ * Run the setup command in its own process group, with a built environment:
+ * the shared safe basics, never the daemon's secrets
+ * (`CODEOID_AGENT_ENV_ALLOW` passes more, as everywhere). The WHOLE group is
+ * killed when the shell exits as well as at the timeout or an abort, so a
+ * daemonized descendant can't outlive setup and keep running in the
+ * worktree. Settles on the shell's exit, then lets the pipes drain briefly.
  */
 async function runSetupCommand(
   command: string,
@@ -579,12 +720,16 @@ async function runSetupCommand(
       resolve({ command, exitCode: null, timedOut: false, outputTail: err instanceof Error ? err.message : String(err), durationMs: 0 });
       return;
     }
+    // Listeners go on before anything can be emitted.
     child.stdout?.on("data", push);
     child.stderr?.on("data", push);
     let timedOut = false;
     let settled = false;
+    let exited: number | null | undefined;
+    let drain: ReturnType<typeof setTimeout> | undefined;
     const killGroup = () => {
       try {
+        // Negative pid: the process group the detached shell leads.
         if (child.pid) process.kill(-child.pid, "SIGKILL");
       } catch {}
     };
@@ -592,8 +737,9 @@ async function runSetupCommand(
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (drain) clearTimeout(drain);
       opts.signal?.removeEventListener("abort", onAbort);
-      const text = tail.toString("utf8");
+      const text = redactSecretText(tail.toString("utf8"));
       resolve({
         command,
         exitCode,
@@ -618,8 +764,20 @@ async function runSetupCommand(
       push(Buffer.from(e.message));
       done(null);
     });
-    child.on("close", (code) => done(code));
+    child.on("exit", (code) => {
+      exited = code;
+      killGroup();
+      drain = setTimeout(() => done(exited ?? null), LIMITS.DRAIN_MS);
+    });
+    child.on("close", (code) => done(exited !== undefined ? exited : code));
   });
+}
+
+/** The session event a result is surfaced as. */
+export function setupEvent(r: WorktreeSetupResult): "worktree.setup.failed" | "worktree.setup.untrusted" | "worktree.setup.done" {
+  if (r.error) return "worktree.setup.failed";
+  if (r.commandSkippedCode === "changed" || r.commandSkippedCode === "untrusted") return "worktree.setup.untrusted";
+  return "worktree.setup.done";
 }
 
 /**
@@ -630,10 +788,11 @@ export function describeSetupResult(r: WorktreeSetupResult): string | null {
   if (!r.applied && !r.error) return null;
   const parts: string[] = [];
   if (r.copied.length) parts.push(`copied ${r.copied.join(", ")}`);
-  if (r.shared.length) parts.push(`shared ${r.shared.join(", ")}`);
+  if (r.shared.length) parts.push(`shared ${r.shared.join(", ")} (writable links into the primary checkout)`);
   if (r.command && !r.error) parts.push(`ran \`${r.command.command}\` in ${(r.command.durationMs / 1000).toFixed(1)}s`);
   const skipped = r.skipped.map((s) => `${s.path} ${s.reason}`);
-  const notes = [...skipped, ...r.warnings, ...(r.commandSkipped ? [`the setup command didn't run: ${r.commandSkipped}`] : [])];
+  const untrusted = setupEvent(r) === "worktree.setup.untrusted";
+  const notes = [...skipped, ...r.warnings, ...(r.commandSkipped && !untrusted ? [`the setup command didn't run: ${r.commandSkipped}`] : [])];
   const rev = r.recipeRev ? ` (recipe from ${r.recipeRev.slice(0, 10)})` : "";
   if (r.error) {
     const tail = r.command?.outputTail.trim() ? `\n${r.command.outputTail.trim().slice(-600)}` : "";
@@ -641,5 +800,6 @@ export function describeSetupResult(r: WorktreeSetupResult): string | null {
       parts.length ? ` Done before it failed: ${parts.join("; ")}.` : ""
     }${notes.length ? ` Notes: ${notes.join("; ")}.` : ""}${tail}`;
   }
-  return `✓ Worktree prepared${rev}${parts.length ? `: ${parts.join("; ")}` : ""}.${notes.length ? ` Notes: ${notes.join("; ")}.` : ""}`;
+  const head = untrusted ? `⚠️ Worktree prepared without its setup command${rev}: ${r.commandSkipped}.` : `✓ Worktree prepared${rev}.`;
+  return `${head}${parts.length ? ` ${parts.join("; ")}.` : ""}${notes.length ? ` Notes: ${notes.join("; ")}.` : ""}`;
 }

@@ -71,7 +71,14 @@ import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { lstat, readdir } from "node:fs/promises";
 import { removeForkWorktree } from "./git-worktree.js";
-import { describeSetupResult, prepareWorktree, type WorktreeSetupPolicy, type WorktreeSetupResult } from "./workspace-setup.js";
+import {
+  describeSetupResult,
+  prepareWorktree,
+  type RecipeRead,
+  setupEvent,
+  type WorktreeSetupPolicy,
+  type WorktreeSetupResult,
+} from "./workspace-setup.js";
 import {
   copyCheckpoints,
   createCheckpoint,
@@ -4501,15 +4508,36 @@ export class Session {
    * failure is reported as an infrastructure notice, never thrown, and the
    * worktree is kept as it is.
    */
-  beginWorktreePrepare(policy: WorktreeSetupPolicy | undefined): void {
+  beginWorktreePrepare(
+    policy: WorktreeSetupPolicy | undefined,
+    opts: {
+      /** The recipe read the caller planned with (see prepareWorktree). */
+      recipe?: RecipeRead;
+      /**
+       * Work that must wait for setup — a fork's carried uncommitted state
+       * and file roll, held back so a setup command only ever sees committed
+       * content. Runs whether or not setup succeeded; never after destroy.
+       */
+      after?: () => Promise<void>;
+    } = {},
+  ): void {
     const wt = this.#worktree;
     if (!wt?.createdByCodeoid) return;
     const abort = new AbortController();
     const done = this.#chainSetup(async () => {
       if (abort.signal.aborted || this.#destroyed) return;
-      const result = await prepareWorktree({ worktreePath: wt.path, policy, signal: abort.signal });
+      const result = await prepareWorktree({
+        worktreePath: wt.path,
+        policy,
+        signal: abort.signal,
+        ...(opts.recipe !== undefined ? { recipe: opts.recipe } : {}),
+      });
+      // Recorded even when destroyed meanwhile: destroy's cleanup reads it to
+      // take the copied files and shared links back out.
+      this.#recordWorktreeSetup(result, !this.#destroyed);
       if (this.#destroyed) return;
-      this.noteWorktreePrepared(result);
+      this.#announceWorktreeSetup(result);
+      if (opts.after) await opts.after();
     });
     this.#setupRecipe = { done, abort };
     void done.finally(() => {
@@ -4524,18 +4552,26 @@ export class Session {
    * recipe ran before the session existed (routines).
    */
   noteWorktreePrepared(result: WorktreeSetupResult): void {
+    this.#recordWorktreeSetup(result, true);
+    this.#announceWorktreeSetup(result);
+  }
+
+  #recordWorktreeSetup(result: WorktreeSetupResult, persist: boolean): void {
     const wt = this.#worktree;
     if (wt && (result.copied.length > 0 || result.shared.length > 0)) {
       this.#worktree = { ...wt, setup: { copied: [...result.copied], shared: [...result.shared] } };
-      this.#saveMetaNow();
+      if (persist) this.#saveMetaNow();
     }
+  }
+
+  #announceWorktreeSetup(result: WorktreeSetupResult): void {
     if (result.error) {
       console.error(`[codeoid/session ${this.id.slice(0, 8)}] worktree setup failed: ${result.error}`);
     }
     const text = describeSetupResult(result);
     if (!text) return;
     const msg = this.#makeMessage("info", text, SYSTEM_IDENTITY, undefined, undefined, {
-      event: result.error ? "worktree.setup.failed" : "worktree.setup.done",
+      event: setupEvent(result),
       infrastructure: true,
       copied: result.copied,
       shared: result.shared,

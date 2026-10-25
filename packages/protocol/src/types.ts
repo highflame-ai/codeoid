@@ -43,6 +43,7 @@ import type {
   SessionSetAccountMsg,
 } from "./accounts.js";
 import type { SkillGrantMsg, SkillGrantResultMsg } from "./skill-grant.js";
+import type { WorktreeTrustMsg, WorktreeTrustResultMsg } from "./worktree-trust.js";
 import type { SessionRewindMsg, SessionRewindResultMsg, SessionTurnsMsg, SessionTurnsResultMsg } from "./turns.js";
 import type { SessionApprovalsMsg, SessionApprovalsResultMsg } from "./approvals.js";
 import type {
@@ -1153,6 +1154,7 @@ export type ClientMessage =
   | BackendLoginCancelMsg
   | BackendLoginWaitMsg
   | SkillGrantMsg
+  | WorktreeTrustMsg
   | SessionTurnsMsg
   | SessionApprovalsMsg
   | ClaudeAccountsListMsg
@@ -2977,6 +2979,7 @@ export type DaemonMessage =
   | BackendLoginCancelResultMsg
   | BackendLoginWaitResultMsg
   | SkillGrantResultMsg
+  | WorktreeTrustResultMsg
   | SessionTurnsResultMsg
   | SessionApprovalsResultMsg
   | ClaudeAccountsResultMsg

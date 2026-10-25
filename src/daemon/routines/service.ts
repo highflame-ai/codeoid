@@ -145,6 +145,8 @@ export interface CreateRunSessionOpts {
   maxCostUsd?: number;
   /** Label for the worktree branch. */
   label: string;
+  /** Aborted when the run is cancelled or the daemon stops (stops a running setup command). */
+  signal?: AbortSignal;
 }
 
 export interface RoutineRunEvent {
@@ -794,8 +796,13 @@ export class RoutineService {
           // TOTAL — only a fresh session's query is exactly one run.
           ...(spec.session === "fresh" && spec.maxCostUsd !== undefined ? { maxCostUsd: spec.maxCostUsd } : {}),
           label: spec.name,
+          signal: live.abort.signal,
           })
           .catch((err: unknown) => {
+            if (live.cancelled) {
+              stopped();
+              return null;
+            }
             // A worktree that couldn't be prepared is an infrastructure
             // error: say so, so it doesn't read as the agent failing.
             if ((err as { infrastructure?: unknown }).infrastructure !== true) throw err;
