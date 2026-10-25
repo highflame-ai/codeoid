@@ -27,7 +27,7 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CodexRpcProcess } from "../daemon/providers/codex/rpc.js";
-import { CodexProvider, describeCodexError } from "../daemon/providers/codex/index.js";
+import { CodexProvider, codexErrorDetail, describeCodexError } from "../daemon/providers/codex/index.js";
 import { MemoryMcpHttp, MEMORY_MCP_SERVER_NAME } from "../daemon/memory/mcp-http.js";
 import { McpRegistry } from "../daemon/mcp/registry.js";
 import { MCP_PROXY_PATH_PREFIX, MCP_PROXY_TOKEN_ENV, McpProxy } from "../daemon/mcp/proxy.js";
@@ -1327,6 +1327,31 @@ describe("describeCodexError", () => {
       expect(out).not.toContain("[object Object]");
       expect(out.length).toBeGreaterThan(0);
     }
+  });
+});
+
+describe("codexErrorDetail", () => {
+  it("extracts a unit variant and a reset instant from the error object", () => {
+    expect(codexErrorDetail({ error: { message: "x", codexErrorInfo: "usageLimitExceeded", resets_at: 1_800_000_000 } })).toEqual({
+      codexErrorInfo: "usageLimitExceeded",
+      resetsAt: 1_800_000_000,
+    });
+  });
+
+  it("extracts a struct variant's fields (reset, HTTP status)", () => {
+    expect(codexErrorDetail({ error: { message: "x", codexErrorInfo: { usageLimitExceeded: { resetsAt: 1_800_000_000_000 } } } })).toEqual({
+      codexErrorInfo: "usageLimitExceeded",
+      resetsAt: 1_800_000_000_000,
+    });
+    expect(codexErrorDetail({ error: { message: "x", codexErrorInfo: { httpConnectionFailed: { httpStatusCode: 429 } } } })).toEqual({
+      codexErrorInfo: "httpConnectionFailed",
+      status: 429,
+    });
+  });
+
+  it("undefined without error info", () => {
+    expect(codexErrorDetail({ error: { message: "x" } })).toBeUndefined();
+    expect(codexErrorDetail({})).toBeUndefined();
   });
 });
 

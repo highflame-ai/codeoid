@@ -502,8 +502,10 @@ export interface SessionCreateOptions {
    * account-isolation denylist (`extraEnvViolations`, providers/env.ts) is
    * refused: the constructor throws, so a misconfigured caller learns at once.
    * No effect on in-process backends (openai, gemini, llama.cpp, endpoints).
-   * Held in memory only — not persisted, so a session restored after a daemon
-   * restart runs without it unless its owner supplies it again.
+   * Held in memory only, by design — never persisted (it can carry a run's
+   * secrets-adjacent settings, and a stale copy must not outlive the run). A
+   * session restored after a daemon restart has none: the loop controller
+   * re-supplies it when it re-arms the worker during restart reconciliation.
    */
   extraEnv?: Readonly<Record<string, string>>;
   /**
@@ -7106,7 +7108,8 @@ export class Session {
       case "error": {
         console.error(`[codeoid/session ${this.id}] provider error:`, event.message);
         this.#lastTurnError = event.message; // before the status change (see above)
-        this.#recordTurnFailure([event.message]);
+        // The structured detail (codex's error info + reset) rides with the text.
+        this.#recordTurnFailure([event.detail ? { message: event.message, error: event.detail } : event.message]);
         this.#setStatus("error");
         const errorMsg = this.#makeMessage("system", `Error: ${event.message}`, SYSTEM_IDENTITY, undefined, undefined, { event: "agent_error" });
         this.#persistAndBuffer(errorMsg);

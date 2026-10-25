@@ -153,6 +153,8 @@ const RATE_RULES: readonly Rule[] = [
   re(/\b(?:status|code|HTTP)\s*[:=]?\s*429\b/i, "rate_limit"),
   re(/"code"\s*:\s*429\b/, "rate_limit"),
   re(/(?:^|[:\]\n]\s*)429\s+(?:\w+\s+){0,2}(?:rate|limit|quota|too many)/im, "rate_limit"),
+  // codex's v2 `codexErrorInfo: "rateLimitExceeded"` (codex-rs 0.154.0).
+  re(/\brateLimitExceeded\b/, "rate_limit", "codex"),
   // DashScope throttling codes other than the allocation quota (e.g. Throttling.RateQuota).
   re(/\bThrottling\.(?!AllocationQuota)\w+/, "rate_limit", "qwen"),
 ];
@@ -161,6 +163,8 @@ interface Signals {
   texts: string[];
   status?: number;
   retryDelayMs?: number;
+  /** A reset instant the error carried as data (codex `resets_at`), epoch ms. */
+  resetAtMs?: number;
 }
 
 function collect(input: unknown, out: Signals, depth: number): void {
@@ -187,10 +191,20 @@ function collect(input: unknown, out: Signals, depth: number): void {
   if (out.retryDelayMs === undefined && typeof o.retryDelayMs === "number" && o.retryDelayMs > 0) {
     out.retryDelayMs = o.retryDelayMs;
   }
-  // codex: { codexErrorInfo: "usageLimitExceeded" } or { usageLimitExceeded: {...} }.
+  // A structured reset: codex's `resets_at` / `resetsAt` (seconds or ms).
+  if (out.resetAtMs === undefined) {
+    const reset = [o.resetsAt, o.resets_at, o.resetAt].find((v): v is number => typeof v === "number" && v > 0);
+    if (reset !== undefined) out.resetAtMs = toEpochMs(reset);
+  }
+  // codex: { codexErrorInfo: "usageLimitExceeded" } or { codexErrorInfo: { usageLimitExceeded: {...} } }.
   const info = o.codexErrorInfo;
   if (typeof info === "string") out.texts.push(info);
-  else if (info && typeof info === "object") out.texts.push(Object.keys(info).join(" "));
+  else if (info && typeof info === "object") {
+    for (const [variant, fields] of Object.entries(info as Record<string, unknown>)) {
+      out.texts.push(variant);
+      if (fields && typeof fields === "object") collect(fields, out, depth + 1);
+    }
+  }
   if (o.error !== undefined && o.error !== input) collect(o.error, out, depth + 1);
   if (o.cause !== undefined && o.cause !== input) collect(o.cause, out, depth + 1);
 }
@@ -261,7 +275,7 @@ export function classifyUsageLimit(
     kind = "usage_limit";
   }
 
-  const resetAt = parseResetAt(text, now, signals.retryDelayMs);
+  const resetAt = parseResetAt(text, now, signals);
   const resolvedProvider = opts.provider ?? provider;
   return {
     kind,
@@ -312,7 +326,12 @@ const MONTHS: Record<string, number> = {
  * "resets Oct 28, 9am (UTC)" / "resets Oct 28, 2027, 9:30am" (its `Yc`
  * formatter: en-US time, lower-cased am/pm, the zone in parentheses) and
  * Codex's "Try again at 3:30 PM." / "try again at Oct 28th, 2026 3:30 PM."
- * (codex-rs `%-I:%M %p` / `%b %-d, %Y %-I:%M %p`, local time).
+ * (codex-rs `%-I:%M %p` / `%b %-d, %Y %-I:%M %p`, local time), and
+ * gemini-cli's "Access resets at 3:30 PM PDT." (getResetTimeMessage, gemini-cli
+ * 0.50.0 interactiveCli bundle: en-US `hour: numeric, minute: 2-digit,
+ * timeZoneName: short` in the host zone). A short zone name ("PDT") is not a
+ * zone id and is ignored: these CLIs run on the daemon's host, so host time is
+ * the zone they printed in. Only a parenthesized IANA id (Claude's) is applied.
  */
 const CLOCK =
   /(?:resets?(?:\s+at)?|try again at)\s+(?:(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(?:(\d{4}),?\s+)?)?(\d{1,2})(?::(\d{2}))?\s*([ap])\.?\s?m\.?(?:\s*\(([^)]+)\))?/i;
@@ -394,8 +413,10 @@ function wallToEpoch(year: number, month: number, day: number, hour: number, min
   return at;
 }
 
-function parseResetAt(text: string, now: number, retryDelayMs: number | undefined): number | undefined {
-  const candidates: Array<number | undefined> = [];
+function parseResetAt(text: string, now: number, signals: Signals): number | undefined {
+  const { retryDelayMs } = signals;
+  // Data beats prose: an instant the error carried as a field is exact.
+  const candidates: Array<number | undefined> = [signals.resetAtMs];
   // Claude's legacy `Claude AI usage limit reached|1730000000`.
   const legacy = /usage limit reached\|(\d{9,13})/i.exec(text);
   if (legacy) candidates.push(toEpochMs(Number(legacy[1])));

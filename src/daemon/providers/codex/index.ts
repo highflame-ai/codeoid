@@ -267,6 +267,40 @@ export function describeCodexError(params: Record<string, unknown>): string {
   }
 }
 
+/**
+ * The structured half of a codex `error` notification, for the usage-limit
+ * classifier: the v2 `TurnError.codexErrorInfo` variant (`usageLimitExceeded`,
+ * `rateLimitExceeded`, `httpConnectionFailed { httpStatusCode }`, … — codex-rs
+ * 0.154.0 app-server protocol) and the limit's reset instant when it carries
+ * one (`resets_at` / `resetsAt`, epoch seconds or ms). The info is a bare
+ * string for a unit variant and `{ variant: { …fields } }` otherwise.
+ * Undefined when the notification has no error info. describeCodexError keeps
+ * producing the display text; this never reaches the user.
+ */
+export function codexErrorDetail(params: Record<string, unknown>): Record<string, unknown> | undefined {
+  const err = params.error && typeof params.error === "object" ? (params.error as Record<string, unknown>) : undefined;
+  const info = err?.codexErrorInfo ?? params.codexErrorInfo;
+  let variant: string | undefined;
+  let fields: Record<string, unknown> = {};
+  if (typeof info === "string") variant = info;
+  else if (info && typeof info === "object") {
+    const [name, value] = Object.entries(info as Record<string, unknown>)[0] ?? [];
+    variant = name;
+    if (value && typeof value === "object") fields = value as Record<string, unknown>;
+  }
+  if (!variant) return undefined;
+  const data = err?.data && typeof err.data === "object" ? (err.data as Record<string, unknown>) : {};
+  const reset = [fields.resetsAt, fields.resets_at, err?.resetsAt, err?.resets_at, data.resetsAt, data.resets_at].find(
+    (v): v is number => typeof v === "number" && v > 0,
+  );
+  const status = fields.httpStatusCode;
+  return {
+    codexErrorInfo: variant,
+    ...(reset !== undefined ? { resetsAt: reset } : {}),
+    ...(typeof status === "number" ? { status } : {}),
+  };
+}
+
 export class CodexProvider implements SessionProvider {
   /**
    * codex's approval replies carry only a decision (`approved` / `accept`) —
@@ -1176,7 +1210,8 @@ export class CodexProvider implements SessionProvider {
         // the literal "[object Object]" — the cause destroyed at the one place
         // it was supposed to be reported. Observed live: a role-child failed
         // twice with `Error: [object Object]` and nothing anywhere said why.
-        this.#push({ type: "error", message: `codex: ${describeCodexError(params)}` });
+        const detail = codexErrorDetail(params);
+        this.#push({ type: "error", message: `codex: ${describeCodexError(params)}`, ...(detail ? { detail } : {}) });
         break;
       }
       default:

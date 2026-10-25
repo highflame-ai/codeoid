@@ -127,6 +127,22 @@ describe("lastTurnInfraError", () => {
     await until(() => session.status === "error" && session.lastTurnInfraError === null);
   });
 
+  test("a provider error's structured detail (codex) gives the exact reset", async () => {
+    const resetSec = Math.floor(Date.now() / 1000) + 3 * 3600;
+    const provider = new MockSessionProvider("codex", [
+      [{ type: "error", message: "codex: You've hit your usage limit.", detail: { codexErrorInfo: "usageLimitExceeded", resetsAt: resetSec } }],
+    ]);
+    const session = makeSession({ _testProvider: provider });
+    await session.send("work", AUTH);
+    await until(() => session.status === "error");
+    expect(session.lastTurnInfraError).toMatchObject({
+      kind: "usage_limit",
+      resetAt: resetSec * 1000,
+      message: "codex: You've hit your usage limit.",
+      provider: "codex",
+    });
+  });
+
   test("Claude's rate_limit_event supplies the exact reset when the error text has none", async () => {
     const resetsAt = Date.now() + 4 * 3600_000;
     const provider = new MockSessionProvider("claude", [

@@ -67,6 +67,30 @@ describe("classifyUsageLimit — usage limits", () => {
     expect(at({ message: "turn failed", codexErrorInfo: "usageLimitExceeded" })).toEqual({ kind: "usage_limit", provider: "codex" });
   });
 
+  test("Codex structured error info carries the exact reset (seconds or ms, unit or struct variant)", () => {
+    const resetSec = Math.floor(NOW / 1000) + 7200;
+    expect(at({ message: "codex: You've hit your usage limit.", error: { codexErrorInfo: "usageLimitExceeded", resetsAt: resetSec } })).toEqual({
+      kind: "usage_limit",
+      resetAt: resetSec * 1000,
+      provider: "codex",
+    });
+    // The struct field beats the prose time.
+    expect(
+      at({ message: "codex: You've hit your usage limit. Try again at 3:30 PM.", error: { codexErrorInfo: { usageLimitExceeded: { resets_at: resetSec * 1000 } } } })
+        ?.resetAt,
+    ).toBe(resetSec * 1000);
+    expect(at({ message: "codex: slow down", error: { codexErrorInfo: "rateLimitExceeded" } })).toEqual({ kind: "rate_limit", provider: "codex" });
+    expect(at({ message: "codex: request failed", error: { codexErrorInfo: "httpConnectionFailed", status: 429 } })?.kind).toBe("rate_limit");
+    expect(at({ message: "codex: boom", error: { codexErrorInfo: "contextWindowExceeded" } })).toBeNull();
+  });
+
+  test("gemini-cli: Usage limit reached … Access resets at 3:30 PM PDT (host time; the short zone name is ignored)", () => {
+    const r = at("Usage limit reached for gemini-2.5-pro.\nAccess resets at 3:30 PM PDT.\n/stats model for usage details\n/model to switch models.");
+    expect(r?.kind).toBe("usage_limit");
+    const d = new Date(r!.resetAt!);
+    expect([d.getHours(), d.getMinutes()]).toEqual([15, 30]);
+  });
+
   test("gemini-cli TerminalQuotaError (message, class name, retry delay)", () => {
     expect(at("gemini-cli: You have exhausted your daily quota on this model.")).toEqual({ kind: "usage_limit", provider: "gemini" });
     const err = Object.assign(new Error("quota"), { name: "TerminalQuotaError", retryDelayMs: 3_600_000 });

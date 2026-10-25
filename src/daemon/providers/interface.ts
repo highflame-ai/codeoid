@@ -368,7 +368,12 @@ export type ProviderEvent =
    * denied. Distinct from a tool approval, whose SDK turn is still live.
    */
   | { type: "approval_pending"; command: string }
-  | { type: "error"; message: string };
+  /**
+   * The turn failed. `detail` is the backend's STRUCTURED error, when it gave
+   * one (codex's `codexErrorInfo` + reset instant — codexErrorDetail): read by
+   * the usage-limit classifier, never shown. `message` stays the display text.
+   */
+  | { type: "error"; message: string; detail?: Record<string, unknown> };
 
 /**
  * True when a text/thinking ProviderEvent was produced by a subagent
