@@ -287,7 +287,8 @@ class Walker {
           if (!c) continue;
           if (c.type === "string_content") value = value === null ? null : value + unescapeDouble(c.text);
           else {
-            this.substitutionsIn(c, ctx, owner);
+            // `$X`, `$(…)` inside the quotes: known at run time, and a substitution runs.
+            this.word(c, ctx, owner);
             value = null;
           }
         }
@@ -297,7 +298,8 @@ class Walker {
       }
       case "concatenation": {
         let value: string | null = "";
-        let glob = false;
+        // The grammar splits `b{1,2}` into pieces none of which looks like a brace expansion.
+        let glob = /(^|[^\\])\{[^}]*,/.test(raw);
         for (const c of n.namedChildren) {
           if (!c) continue;
           const w = this.word(c, ctx, owner);
@@ -382,9 +384,10 @@ class Walker {
         }
         return;
       }
+      // A wrapper with nothing to run (`env`, `sudo` alone) is judged as itself.
+      if (inner.argv.length === 0) return;
       cmd.via = [...cmd.via, prog];
       cmd.argv = inner.argv;
-      if (inner.argv.length === 0) return;
     }
     this.out.problems.push("wrappers nested too deep");
   }
