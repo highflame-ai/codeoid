@@ -29,9 +29,9 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { closeSync, constants, existsSync, mkdirSync, openSync, readFileSync, realpathSync, writeSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, ftruncateSync, mkdirSync, openSync, readFileSync, realpathSync, writeSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
-import { AsyncQueue } from "../../async-queue.js";
+import { AsyncQueue, AsyncQueueOverflowError } from "../../async-queue.js";
 import type { AgentProvider, ModelInfo, NormalizedTurnResult, ProviderEvent, TurnOpts, TurnRun } from "../interface.js";
 
 export const SCRIPTED_PROVIDER_ID = "scripted";
@@ -128,8 +128,11 @@ export class ScriptedProvider implements AgentProvider {
       try {
         queue.push(e);
         return true;
-      } catch {
-        return false; // closed by an interrupt
+      } catch (err) {
+        // Closed by an interrupt: nothing more to say. Full: the script outran the
+        // session — fail the turn loudly rather than drop the rest of it.
+        if (err instanceof AsyncQueueOverflowError) crash.message = `scripted backend: ${err.message}`;
+        return false;
       }
     };
     // Let the session start reading before the first event.
@@ -149,7 +152,12 @@ export class ScriptedProvider implements AgentProvider {
       if (signal.aborted) return;
       if ("text" in step) {
         const text = step.text.replaceAll("{{message}}", () => opts.userMessage);
-        for (const word of text.split(/(?<=\s)/)) emit({ type: "text_delta", content: word });
+        const words = text.split(/(?<=\s)/);
+        for (const [i, word] of words.entries()) {
+          emit({ type: "text_delta", content: word });
+          // Let the session drain the queue now and then: it holds a bounded number of events.
+          if (i % 64 === 63) await new Promise((r) => setTimeout(r, 0));
+        }
         emit({ type: "text_done", content: text });
       } else if ("thinking" in step) {
         emit({ type: "thinking_delta", content: step.thinking, blockIndex: 0 });
@@ -205,33 +213,39 @@ export class ScriptedProvider implements AgentProvider {
 }
 
 /**
- * The scripted `Write`: a file under the workdir, never outside it — symlinks
- * included. The containment check runs on real paths (the deepest existing
- * ancestor of the target), and the file is opened without following a link.
+ * The scripted `Write`: a file under the workdir, never outside it. The path
+ * must name a place under the workdir (as given, so an absolute path through a
+ * symlinked workdir is fine), its deepest existing directory must really be
+ * there (no symlink out), and the file itself must not be a symlink or a
+ * hardlink to something else. Not proof against a concurrent writer swapping
+ * a directory for a link between the check and the write — this backend runs
+ * only in tests, on a workdir nothing else writes to.
  */
 function writeInWorkdir(workdir: string, input: Record<string, unknown>): string {
   const path = input.file_path;
   const content = input.content;
   if (typeof path !== "string" || typeof content !== "string") throw new Error("Write needs file_path and content");
-  const root = realpathSync(workdir);
-  const target = resolve(root, path);
-  const inside = (p: string) => {
+  const under = (root: string, p: string) => {
     const rel = relative(root, p);
-    return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+    return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
   };
-  if (!inside(target)) throw new Error(`refusing to write outside the workdir: ${path}`);
+  const given = resolve(workdir);
+  const target = resolve(given, path);
+  if (target === given || !under(given, target)) throw new Error(`refusing to write outside the workdir: ${path}`);
   let ancestor = dirname(target);
   while (!existsSync(ancestor)) ancestor = dirname(ancestor);
-  const real = realpathSync(ancestor);
-  if (real !== root && !inside(real)) throw new Error(`refusing to write outside the workdir: ${path}`);
+  if (!under(realpathSync(given), realpathSync(ancestor))) throw new Error(`refusing to write outside the workdir: ${path}`);
   mkdirSync(dirname(target), { recursive: true });
-  const fd = openSync(target, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o644);
+  // Truncate only once the file is known to be this one's own.
+  const fd = openSync(target, constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW, 0o644);
   try {
+    if (fstatSync(fd).nlink > 1) throw new Error(`refusing to write through a hardlink: ${path}`);
+    ftruncateSync(fd, 0);
     writeSync(fd, content);
   } finally {
     closeSync(fd);
   }
-  return `wrote ${relative(root, target)}`;
+  return `wrote ${relative(given, target)}`;
 }
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {

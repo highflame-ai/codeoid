@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ProviderEvent, TurnOpts } from "../interface.js";
@@ -99,6 +99,55 @@ describe("the scripted backend (#429)", () => {
     }
     expect(existsSync(join(tmp, "outside", "pwned.txt"))).toBe(false);
     expect(existsSync(join(tmp, "outside", "f.txt"))).toBe(false);
+  });
+
+  it("never writes through a hardlink to a file outside the workdir", async () => {
+    mkdirSync(join(tmp, "outside"));
+    writeFileSync(join(tmp, "outside", "victim"), "keep");
+    linkSync(join(tmp, "outside", "victim"), join(work, "hl"));
+    script([{ match: ".", steps: [{ tool: "Write", input: { file_path: "hl", content: "pwned" } }] }]);
+    const events = await turn("x");
+    expect(events.find((e) => e.type === "tool_complete")).toMatchObject({ success: false });
+    expect(readFileSync(join(tmp, "outside", "victim"), "utf8")).toBe("keep");
+  });
+
+  it("takes an absolute path under a workdir reached through a symlink", async () => {
+    symlinkSync(work, join(tmp, "worklink"));
+    script([{ match: ".", steps: [{ tool: "Write", input: { file_path: join(tmp, "worklink", "abs.txt"), content: "ok" } }] }]);
+    const run = new ScriptedProvider(scriptPath).runTurn({
+      history: [],
+      userMessage: "x",
+      workdir: join(tmp, "worklink"),
+      canUseTool: async () => ({ behavior: "allow" }),
+    } as unknown as TurnOpts);
+    const events: ProviderEvent[] = [];
+    for await (const e of run.events) events.push(e);
+    expect(events.find((e) => e.type === "tool_complete")).toMatchObject({ success: true });
+    expect(readFileSync(join(work, "abs.txt"), "utf8")).toBe("ok");
+  });
+
+  it("streams a long text step whole, past the queue's bound", async () => {
+    const long = Array.from({ length: 3000 }, (_, i) => `w${i}`).join(" ");
+    script([{ match: ".", steps: [{ text: long }, { text: "after" }] }]);
+    const events = await turn("x");
+    expect(events.filter((e) => e.type === "text_done").map((e) => (e as { content: string }).content)).toEqual([long, "after"]);
+    expect(events.at(-1)?.type).toBe("turn_done");
+  });
+
+  it("a reader that falls too far behind fails the turn loudly instead of losing its end", async () => {
+    const long = Array.from({ length: 3000 }, (_, i) => `w${i}`).join(" ");
+    script([{ match: ".", steps: [{ text: long }] }]);
+    const run = new ScriptedProvider(scriptPath).runTurn({ history: [], userMessage: "x", workdir: work, canUseTool: async () => ({ behavior: "allow" }) } as unknown as TurnOpts);
+    await Bun.sleep(300); // nobody reads meanwhile
+    let thrown: unknown;
+    try {
+      for await (const _ of run.events) {
+        // drain
+      }
+    } catch (err) {
+      thrown = err;
+    }
+    expect(String(thrown)).toContain("scripted backend:");
   });
 
   it("a waitFor step holds the turn until the file exists", async () => {

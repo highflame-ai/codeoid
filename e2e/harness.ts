@@ -134,42 +134,46 @@ export class Codeoid {
       stdio: ["ignore", "pipe", "pipe"],
     });
     this.#daemon = child;
+    const from = this.#log.length;
     const onData = (chunk: Buffer) => {
       this.#log += chunk.toString();
     };
     child.stdout?.on("data", onData);
     child.stderr?.on("data", onData);
-    // Ready means THIS process answers on the port — never a line left in the
-    // log by the previous boot (restart), and never a port another process holds.
+    // Ready means THIS process bound the port (its own "listening" line, printed
+    // after the bind — not one left by the previous boot) and it answers there.
     const deadline = Date.now() + 30_000;
     for (;;) {
       if (child.exitCode !== null || child.signalCode !== null) {
         this.#daemon = null;
         throw new Error(`daemon exited (${child.exitCode ?? child.signalCode}) before it was ready:\n${this.#log}`);
       }
-      try {
-        const res = await fetch(`http://127.0.0.1:${this.port}/health`, { signal: AbortSignal.timeout(1_000) });
-        if (res.ok) return;
-      } catch {
-        // Not listening yet.
+      if (this.#log.slice(from).includes("daemon listening on")) {
+        try {
+          const res = await fetch(`http://127.0.0.1:${this.port}/health`, { signal: AbortSignal.timeout(1_000) });
+          if (res.ok) return;
+        } catch {
+          // Bound, not answering yet.
+        }
       }
       if (Date.now() > deadline) {
-        await this.stop();
+        // Hung at boot: no grace period, so the error (and log) lands inside the test's timeout.
+        await this.stop({ force: true });
         throw new Error(`daemon not ready after 30s:\n${this.#log}`);
       }
       await new Promise((r) => setTimeout(r, 100));
     }
   }
 
-  /** Stop the daemon the way an operator does (SIGTERM), and wait for it to exit. */
-  async stop(): Promise<void> {
+  /** Stop the daemon the way an operator does (SIGTERM; SIGKILL with `force`), and wait for it to exit. */
+  async stop(opts: { force?: boolean } = {}): Promise<void> {
     const child = this.#daemon;
     if (!child) return;
     this.#daemon = null;
     // Already gone, by exiting or by a signal (an OOM kill, a crash).
     if (child.exitCode !== null || child.signalCode !== null) return;
     const exited = new Promise<void>((done) => child.once("exit", () => done()));
-    child.kill("SIGTERM");
+    child.kill(opts.force ? "SIGKILL" : "SIGTERM");
     const timer = setTimeout(() => child.kill("SIGKILL"), 35_000);
     await exited;
     clearTimeout(timer);
