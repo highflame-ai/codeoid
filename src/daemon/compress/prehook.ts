@@ -72,6 +72,19 @@ export function rewriteBashToolInput(
 }
 
 /**
+ * The command a rewritten call really runs (#431): the approval gate judges
+ * that, not the wrapper. Only codeoid's own wrapper is seen through — it
+ * runs exactly what it decodes — so a look-alike path is judged as itself.
+ */
+export function decodeCompressedCommand(command: string, wrapperPath: string = resolveWrapperPath()): string | null {
+  const prefix = `bun ${shellQuote(wrapperPath)} --b64 `;
+  if (!command.startsWith(prefix)) return null;
+  const m = /^([A-Za-z0-9+/]+={0,2}) --cwd \S/.exec(command.slice(prefix.length));
+  if (!m) return null;
+  return Buffer.from(m[1]!, "base64").toString("utf8");
+}
+
+/**
  * Minimal single-quote shell escape. We only need it for paths which shouldn't
  * normally contain quotes, but belt-and-suspenders.
  */

@@ -16,6 +16,8 @@
  * arguments codex reports, and declined when that is ambiguous (#368).
  */
 
+import type { ToolRisk } from "./types.js";
+
 // ── Messages (client → daemon) ────────────────────────────────────────────────
 
 /** List the tool calls a session is waiting on, oldest first. Scope: `session:watch`. */
@@ -33,6 +35,8 @@ export interface PendingToolApproval {
   toolName: string;
   /** The input the approval gate received — what runs if approved, within the limits above. */
   input: unknown;
+  /** A shell command's risk (#431). */
+  risk?: ToolRisk;
 }
 
 export interface SessionApprovalsResultMsg {

@@ -204,7 +204,9 @@ describe("session.approvals", () => {
       DaemonMessage,
       { type: "session.approvals.result" }
     >;
-    expect(res.approvals).toEqual([{ approvalId: "approval-1", toolName: "Bash", input: { command: "rm -rf build" } }]);
+    expect(res.approvals).toEqual([
+      { approvalId: "approval-1", toolName: "Bash", input: { command: "rm -rf build" }, risk: { level: "medium", reasons: [expect.stringContaining("rm deletes")] } },
+    ]);
 
     const session = manager._sessionForTest(id)!;
     expect(session.approve("approval-1", false, AUTH)).toBe("settled");
