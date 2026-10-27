@@ -30,7 +30,7 @@
 
 import { randomUUID } from "node:crypto";
 import { closeSync, constants, existsSync, fstatSync, ftruncateSync, mkdirSync, openSync, readFileSync, realpathSync, writeSync } from "node:fs";
-import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { AsyncQueue, AsyncQueueOverflowError } from "../../async-queue.js";
 import type { AgentProvider, ModelInfo, NormalizedTurnResult, ProviderEvent, TurnOpts, TurnRun } from "../interface.js";
 
@@ -123,8 +123,11 @@ export class ScriptedProvider implements AgentProvider {
       totalCostUsd: 0,
       durationMs: 0,
     };
+    // Once the queue overflowed, the turn is lost: nothing more is played, so no
+    // later turn_done can end it as a success with its middle missing.
+    const stopped = () => signal.aborted || crash.message !== null;
     const emit = (e: ProviderEvent): boolean => {
-      if (signal.aborted) return false;
+      if (stopped()) return false;
       try {
         queue.push(e);
         return true;
@@ -149,12 +152,12 @@ export class ScriptedProvider implements AgentProvider {
     }
 
     for (const step of steps) {
-      if (signal.aborted) return;
+      if (stopped()) return;
       if ("text" in step) {
         const text = step.text.replaceAll("{{message}}", () => opts.userMessage);
         const words = text.split(/(?<=\s)/);
         for (const [i, word] of words.entries()) {
-          emit({ type: "text_delta", content: word });
+          if (!emit({ type: "text_delta", content: word })) return;
           // Let the session drain the queue now and then: it holds a bounded number of events.
           if (i % 64 === 63) await new Promise((r) => setTimeout(r, 0));
         }
@@ -181,6 +184,7 @@ export class ScriptedProvider implements AgentProvider {
         result.totalCostUsd = step.usage.costUsd ?? result.totalCostUsd;
       }
     }
+    if (stopped()) return;
     emit({ type: "turn_done", result: { ...result, durationMs: Date.now() - started } });
   }
 
@@ -213,11 +217,10 @@ export class ScriptedProvider implements AgentProvider {
 }
 
 /**
- * The scripted `Write`: a file under the workdir, never outside it. The path
- * must name a place under the workdir (as given, so an absolute path through a
- * symlinked workdir is fine), its deepest existing directory must really be
- * there (no symlink out), and the file itself must not be a symlink or a
- * hardlink to something else. Not proof against a concurrent writer swapping
+ * The scripted `Write`: a regular file under the workdir, never outside it.
+ * Where the path really leads (through any symlinked directory on the way)
+ * must be under the workdir's real path, and the file itself must not be a
+ * symlink, a hardlink to something else, or anything but a regular file. Not proof against a concurrent writer swapping
  * a directory for a link between the check and the write — this backend runs
  * only in tests, on a workdir nothing else writes to.
  */
@@ -227,25 +230,30 @@ function writeInWorkdir(workdir: string, input: Record<string, unknown>): string
   if (typeof path !== "string" || typeof content !== "string") throw new Error("Write needs file_path and content");
   const under = (root: string, p: string) => {
     const rel = relative(root, p);
-    return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+    return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
   };
-  const given = resolve(workdir);
-  const target = resolve(given, path);
-  if (target === given || !under(given, target)) throw new Error(`refusing to write outside the workdir: ${path}`);
+  // Compare real paths: the daemon hands the workdir over resolved, while a
+  // script may name a path through a symlink to it (macOS's /tmp, /var).
+  const target = resolve(workdir, path);
   let ancestor = dirname(target);
   while (!existsSync(ancestor)) ancestor = dirname(ancestor);
-  if (!under(realpathSync(given), realpathSync(ancestor))) throw new Error(`refusing to write outside the workdir: ${path}`);
+  const realRoot = realpathSync(workdir);
+  const realTarget = join(realpathSync(ancestor), relative(ancestor, target));
+  if (!under(realRoot, realTarget)) throw new Error(`refusing to write outside the workdir: ${path}`);
   mkdirSync(dirname(target), { recursive: true });
-  // Truncate only once the file is known to be this one's own.
-  const fd = openSync(target, constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW, 0o644);
+  // Non-blocking, so a FIFO fails at once instead of freezing the daemon on a
+  // reader that never comes; truncate only once it's known to be our own file.
+  const fd = openSync(target, constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o644);
   try {
-    if (fstatSync(fd).nlink > 1) throw new Error(`refusing to write through a hardlink: ${path}`);
+    const st = fstatSync(fd);
+    if (!st.isFile()) throw new Error(`refusing to write to something that isn't a regular file: ${path}`);
+    if (st.nlink > 1) throw new Error(`refusing to write through a hardlink: ${path}`);
     ftruncateSync(fd, 0);
     writeSync(fd, content);
   } finally {
     closeSync(fd);
   }
-  return `wrote ${relative(given, target)}`;
+  return `wrote ${relative(realRoot, realTarget)}`;
 }
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {

@@ -111,19 +111,35 @@ describe("the scripted backend (#429)", () => {
     expect(readFileSync(join(tmp, "outside", "victim"), "utf8")).toBe("keep");
   });
 
-  it("takes an absolute path under a workdir reached through a symlink", async () => {
+  it("takes an absolute path through a symlink to the workdir — the daemon hands over the real path", async () => {
     symlinkSync(work, join(tmp, "worklink"));
     script([{ match: ".", steps: [{ tool: "Write", input: { file_path: join(tmp, "worklink", "abs.txt"), content: "ok" } }] }]);
-    const run = new ScriptedProvider(scriptPath).runTurn({
-      history: [],
-      userMessage: "x",
-      workdir: join(tmp, "worklink"),
-      canUseTool: async () => ({ behavior: "allow" }),
-    } as unknown as TurnOpts);
+    const events = await turn("x"); // runs in the real workdir
+    expect(events.find((e) => e.type === "tool_complete")).toMatchObject({ success: true });
+    expect(readFileSync(join(work, "abs.txt"), "utf8")).toBe("ok");
+  });
+
+  it("never writes to a FIFO (it would block the daemon) or anything but a regular file", async () => {
+    expect(Bun.spawnSync(["mkfifo", join(work, "pipe")]).exitCode).toBe(0);
+    script([{ match: ".", steps: [{ tool: "Write", input: { file_path: "pipe", content: "x" } }] }]);
+    const events = await turn("x");
+    expect(events.find((e) => e.type === "tool_complete")).toMatchObject({ success: false });
+    // With something reading it the open succeeds: still refused, as not a regular file.
+    const reader = Bun.spawn(["cat", join(work, "pipe")], { stdout: "pipe" });
+    await Bun.sleep(100);
+    const read = await turn("x");
+    expect(read.find((e) => e.type === "tool_complete")).toMatchObject({ success: false });
+    reader.kill();
+  });
+
+  it("takes a workdir handed over through a symlink, too", async () => {
+    symlinkSync(work, join(tmp, "worklink"));
+    script([{ match: ".", steps: [{ tool: "Write", input: { file_path: "via-link.txt", content: "ok" } }] }]);
+    const run = new ScriptedProvider(scriptPath).runTurn({ history: [], userMessage: "x", workdir: join(tmp, "worklink"), canUseTool: async () => ({ behavior: "allow" }) } as unknown as TurnOpts);
     const events: ProviderEvent[] = [];
     for await (const e of run.events) events.push(e);
     expect(events.find((e) => e.type === "tool_complete")).toMatchObject({ success: true });
-    expect(readFileSync(join(work, "abs.txt"), "utf8")).toBe("ok");
+    expect(readFileSync(join(work, "via-link.txt"), "utf8")).toBe("ok");
   });
 
   it("streams a long text step whole, past the queue's bound", async () => {
@@ -147,6 +163,28 @@ describe("the scripted backend (#429)", () => {
     } catch (err) {
       thrown = err;
     }
+    expect(String(thrown)).toContain("scripted backend:");
+  });
+
+  it("an overflow with steps still to come ends the turn as a failure, never as a success missing its middle", async () => {
+    const long = Array.from({ length: 3000 }, (_, i) => `w${i}`).join(" ");
+    script([{ match: ".", steps: [{ text: long }, { sleep: 400 }, { text: "after" }] }]);
+    const run = new ScriptedProvider(scriptPath).runTurn({ history: [], userMessage: "x", workdir: work, canUseTool: async () => ({ behavior: "allow" }) } as unknown as TurnOpts);
+    await Bun.sleep(200); // a reader that falls behind
+    let thrown: unknown;
+    let done = false;
+    try {
+      // Read like the session: stop at turn_done.
+      for await (const e of run.events) {
+        if (e.type === "turn_done") {
+          done = true;
+          break;
+        }
+      }
+    } catch (err) {
+      thrown = err;
+    }
+    expect(done).toBe(false);
     expect(String(thrown)).toContain("scripted backend:");
   });
 
