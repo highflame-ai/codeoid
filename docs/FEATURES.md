@@ -38,6 +38,54 @@ Like every Claude session codeoid runs, a session it writes or forks for Claude 
 `session.nativeContinuation: false` (or `CODEOID_NATIVE_CONTINUATION=false`) keeps everything on the transcript.
 Native continuation is tried before the `CODEOID_CONTEXT_STRATEGY` seed (`transcript` or `vws`), which still applies to every backend it doesn't cover.
 
+#### A fork leaves the parent's background work with the parent
+
+Background agents and shells the parent started before the fork keep running in the parent and report only there.
+The fork works on its own instruction and never waits for them, reports them, or counts them as its own.
+Each fork records the moment it began, and its Claude backend is started with `CLAUDE_CODE_RESUME_SOURCE_ALIVE` set to that time, so Claude Code doesn't report background work recorded before it (deliver its result, or tell the model to relaunch it).
+Background work the fork starts itself comes after that moment, and Claude Code recovers it after a restart as it would for any session.
+The `env` of a project's `.claude/settings.json` or of your own `~/.claude/settings.json` can set or clear that variable; the rest of this section doesn't depend on it.
+Claude Code keeps its cloud agents' registrations next to the session, and polls every one it finds there when the session is resumed.
+Before a fork's copy of the parent's Claude session is first resumed, codeoid removes any registration of the parent's from the copy, so the fork never polls the parent's cloud agents; the parent's own session is left as it was.
+If the copy's directories aren't plain directories of the copy's own (a symlink, say), or can't be read, codeoid doesn't use the copy: it removes it and builds the fork's Claude session from codeoid's history instead.
+Task ids the parent knew of are the parent's: if the fork's backend reports one anyway, the fork stops it in its own process (the parent's copy runs on) and doesn't wake on it.
+If that stop fails, or the task is still there three updates or 30 seconds after the stop, it stays in the fork's background list as the parent's, being stopped, until it's gone, the fork's scrollback says so once (even across a restart), and Stop still stops it.
+A task that had already finished when it was asked to stop counts as stopped.
+A cloud agent of the parent's is never stopped from the fork, because stopping one archives the cloud session it runs in, which would end it for the parent too.
+It is listed in the fork as the parent's (cloud), not stopped from here, and the fork doesn't wait on it, report it, or stop it on Stop.
+No agent of the fork can stop a task of the parent's either.
+Claude Code's stop-task tool takes a task id, an agent id or a name, so in a fork it is allowed only for a task or agent the fork's own backend has listed, or a teammate of the fork's own team (`name@team`), and refused for anything else.
+An id with spaces around it is refused rather than trimmed, and a stop-task call a codeoid hook rewrites is checked again as rewritten.
+When one of the parent's tasks finishes in the fork's backend, Claude Code may hand its result to the fork's model: in the turn that's running, in a turn it starts on its own, or with the next prompt.
+Whichever of those comes first carries a one-shot reminder that the result belongs to the original session and isn't to be acted on, continued or relaunched in the fork.
+That holds for an agent the fork stopped too, since Claude Code tells the model a stopped agent's partial result; a background shell the fork stopped needs no reminder, because Claude Code says nothing about it.
+The reminder goes out exactly once, even when the task finishes, or Claude Code starts a turn, while a prompt of yours is on its way to the backend.
+The reminder is saved with the fork until it has gone out, so a restart doesn't lose it, and it is kept in the fork's history, so a later backend or fork sees it too.
+The fork's scrollback shows `A background task of the parent session finished; its result stays with the parent.` once for each such task, even across a restart.
+Nothing is stopped or refused for it: the fork's own turns and agents carry on as usual.
+The result itself stays in Claude Code's own copy of the conversation, which codeoid can't edit; the reminder is what tells the model it isn't the fork's.
+Every tool call made in the fork by a parent's agent that wasn't known to have finished is refused, including the ones Claude Code would allow without asking (reads inside the working directory, `permissions.allow` rules, codeoid's memory and fleet tools), so it can't start agents of its own there either.
+Teammates are handled on a best-effort basis, and this likely never comes into play: Claude Code doesn't set up teams when codeoid runs it.
+Where a teammate does run, one of a team other than the fork's own is taken as the parent's, since Claude Code names a session's team after the session by default.
+With `CLAUDE_INTERNAL_ASSISTANT_TEAM_NAME` set in the daemon's environment, every session's team has that name, so a fork refuses every teammate, and says so once in the daemon's log.
+A team named in Claude Code's settings (`existingTeamName`) can't be seen by codeoid at all.
+A parent's agent that had finished isn't refused, since nothing of it runs in the fork, but it is still stopped if the fork's backend ever runs it.
+Claude Code keeps an agent's transcript with the session that ran it, so the fork can't continue it, and can't change the parent's copy.
+The refusal is decided before anything else and fails closed: an error while handling it still refuses the call.
+It is checked again when Claude Code asks codeoid to approve a call, in case the first check was skipped.
+Refusals are audited as `session.foreign_agent_deny`, the first for each agent and then at most one a minute, and the fork's scrollback says once per agent (even across a restart) that an agent of the parent session tried to use a tool and was refused; the agent's activity itself isn't shown.
+Two limits remain.
+A sandbox network request carries no agent id, so one from a parent's agent asks you like any other.
+A teammate that runs as a separate Claude Code process (in a terminal pane) runs its own hooks, which the fork never sees.
+When the parent had unfinished background work, the fork's first prompt tells the model, on every backend, that the work belongs to the original session and can't be continued from the fork, and the fork's scrollback shows `Background work the parent was running stays with the parent`.
+A fork from an earlier turn counts only the work the parent had launched by that turn, where its history shows when that was.
+A fork of a fork is told about its grandparent's work too, unless the history it starts from holds the prompt that carried its parent's own note.
+A note an older ancestor gave doesn't count, because it covers only the work launched before that earlier fork.
+The note is spent only when a prompt carrying it reaches the backend, and going back to before that prompt brings it back for the next one.
+Every session remembers its own background tasks and which ones finished, across a restart, so a fork made later still finds that work in a long history.
+All of this is saved with the fork, so it holds across a daemon restart, and a fork of a fork also holds its grandparent's tasks as foreign.
+A rewind or backend switch inside a session that isn't a fork is unchanged: that session owns its background work.
+
 Memory, identity, attachments, the multi-frontend clients, and device handoff are all provider-agnostic. A few features lean on Claude Code internals and so apply only to the `claude` harness: backing-session [auto-rotation](#context-reduction-stack), Claude Code slash-command [pass-through](#terminal-client), and `.claude/commands` workspace commands.
 
 ### Terminal client

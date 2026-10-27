@@ -24,6 +24,7 @@
  */
 
 import { type NativeTurnRef, type ProviderEvent, isSubagentEvent } from "./interface.js";
+import { SHELL_LAUNCH_ANCHORS } from "../fork-isolation.js";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -143,12 +144,39 @@ export const TOOL_OUTPUT_LIMITS: Readonly<Record<string, number>> = {
   default_mcp: 16_384,
 };
 
+/**
+ * Characters kept from the END of an output cut to size, per category. A
+ * shell result ends with what the CLI itself wrote after the command's own
+ * output — the line that names a command moved to the background, which is
+ * how a fork tells its parent's background work apart (fork-isolation.ts).
+ */
+const TOOL_OUTPUT_TAILS: Readonly<Record<string, number>> = {
+  run_shell: 400,
+};
+
+/**
+ * A shell result with a launch anchor near its end keeps everything from the
+ * last anchor on, up to this much, instead of the fixed tail: the CLI's
+ * launch text can run longer than that tail.
+ */
+const SHELL_LAUNCH_TAIL_MAX = 1024;
+
+/** How much of a shell result's end to keep: from its last launch anchor, or the fixed tail. */
+function shellTail(output: string, fixed: number): number {
+  const at = Math.max(...SHELL_LAUNCH_ANCHORS.map((a) => output.lastIndexOf(a)));
+  return at === -1 ? fixed : Math.min(output.length - at, SHELL_LAUNCH_TAIL_MAX);
+}
+
 export function limitToolOutput(canonicalName: string, output: string): string {
   const limit = canonicalName.startsWith("mcp__")
     ? TOOL_OUTPUT_LIMITS.default_mcp
     : (TOOL_OUTPUT_LIMITS[canonicalName] ?? Number.POSITIVE_INFINITY);
   if (!Number.isFinite(limit) || output.length <= limit) return output;
-  return `${output.slice(0, limit)}\n…output truncated at ${limit} chars (full output was ${output.length} chars)`;
+  const fixed = TOOL_OUTPUT_TAILS[canonicalName] ?? 0;
+  const tail = Math.min(canonicalName === "run_shell" ? shellTail(output, fixed) : fixed, limit);
+  if (tail === 0) return `${output.slice(0, limit)}\n…output truncated at ${limit} chars (full output was ${output.length} chars)`;
+  const head = limit - tail;
+  return `${output.slice(0, head)}\n…output truncated (full output was ${output.length} chars): kept the first ${head} and the last ${tail}, which follow\n${output.slice(-tail)}`;
 }
 
 // ── Native message shapes ─────────────────────────────────────────────────────

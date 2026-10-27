@@ -163,9 +163,19 @@ export class MockSessionProvider implements SessionProvider {
   /** Task ids the session asked to stop (`stopBackgroundTasks`). */
   readonly stoppedTasks: string[] = [];
 
-  async stopBackgroundTasks(taskIds: readonly string[]): Promise<void> {
+  /** Task ids whose stop fails (returned as not stopped); set in tests. */
+  readonly failingStops = new Set<string>();
+
+  async stopBackgroundTasks(taskIds: readonly string[]): Promise<string[]> {
     this.stoppedTasks.push(...taskIds);
+    return taskIds.filter((id) => this.failingStops.has(id));
   }
+
+  /** A fork's refusal of its parent's work (`foreignCallRefusal`), off unless a test installs it. */
+  foreignCallRefusal?: (toolName: string, input: unknown, agentId: string | undefined) => string | null;
+
+  /** Times the session interrupted a self-started turn (`startOwnTurn`). */
+  ownTurnInterrupts = 0;
 
   /** Gates the session bound to self-started turns (`TurnRun.bindGate`). */
   readonly boundGates: Array<Pick<TurnOpts, "canUseTool" | "requestUserInput" | "sender">> = [];
@@ -180,7 +190,10 @@ export class MockSessionProvider implements SessionProvider {
     this.#currentQueue = queue;
     const run: TurnRun = {
       events: queue,
-      interrupt: async () => { queue.close(); },
+      interrupt: async () => {
+        this.ownTurnInterrupts++;
+        queue.close();
+      },
       endTurn: () => {
         this.endTurnCount++;
         queue.close();
@@ -193,8 +206,10 @@ export class MockSessionProvider implements SessionProvider {
         this.midTurnPushes.push({ content, priority });
       };
     }
-    this.onSessionEvent?.({ type: "turn_started", run });
+    // Queued before the hand-over, as the Claude provider queues the event
+    // that opened the turn: a session that stops the turn at once closes it.
     for (const e of events) queue.push(e);
+    this.onSessionEvent?.({ type: "turn_started", run });
     return (e) => this.emitLive(e);
   }
 
