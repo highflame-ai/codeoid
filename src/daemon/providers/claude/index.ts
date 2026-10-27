@@ -28,7 +28,7 @@ import {
 import { randomUUID } from "node:crypto";
 import { readFileSync, readdirSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve as resolvePath } from "node:path";
 import { AsyncQueue } from "../../async-queue.js";
 import type { AgentIdentityManager } from "../../agent-identity.js";
 import type { Store } from "../../store.js";
@@ -47,8 +47,10 @@ import { FLEET_TOOL_NAMES } from "../../fleet.js";
 import { LOOP_MCP_SERVER_NAME, LOOP_REPORT_TOOL_FQ } from "../../loops/tools.js";
 import { rewriteBashToolInput } from "../../compress/index.js";
 import { type CodeoidConfig, getConfigDir } from "../../../config.js";
+import { assessShellCommandSync } from "../../risk/shell-risk.js";
 import { secretPathVerdict } from "../../secret-paths.js";
 import { FOREIGN_AGENT_DENY, FOREIGN_TASK_STOP_DENY, FORK_TEAMMATE_DENY } from "../../fork-isolation.js";
+import { shellCallOf } from "../../shell/tool-call.js";
 import { type AuthContext, EFFORT_LEVELS, type EffortLevel, SYSTEM_IDENTITY } from "../../../protocol/types.js";
 import type {
   BackendMcpServerState,
@@ -594,6 +596,52 @@ export class ClaudeProvider implements SessionProvider {
       console.error(`${tag} checking a call against the credential paths failed, refusing it: ${err instanceof Error ? err.message : String(err)}`);
       action = "deny";
       reason = "codeoid couldn't check this call against the paths that hold credentials, so it was refused.";
+    }
+    if (action === "deny") {
+      try {
+        this.#init.store.audit(this.#currentSender?.sub ?? "unknown", "session.secret_path_deny", this.#init.sessionId, `tool=${input.tool_name}`);
+      } catch (err) {
+        console.error(`${tag} auditing a refused credential-path call failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    return { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: action, permissionDecisionReason: reason } };
+  }
+
+  /**
+   * The PreToolUse hook's shell-risk decision (#431), or null for a call that
+   * isn't a shell command or that the rule lets the CLI decide. A risky
+   * command, one the parser can't read, or one naming a credential file is
+   * handed to canUseTool (`ask`); one reading a credential file is refused.
+   * Fail-closed, as #secretPathDecision is: a throw asks.
+   */
+  #shellRiskDecision(
+    input: PreToolUseHookInput,
+    workdir: string,
+  ): { hookSpecificOutput: { hookEventName: "PreToolUse"; permissionDecision: "deny" | "ask"; permissionDecisionReason: string } } | null {
+    const tag = `[claude-provider ${this.#init.sessionId.slice(0, 8)}]`;
+    let action: "deny" | "ask";
+    let reason: string;
+    try {
+      const shell = shellCallOf(input.tool_name, (input.tool_input ?? {}) as Record<string, unknown>);
+      if (!shell) return null;
+      const risk = assessShellCommandSync(shell.command, {
+        cwd: resolvePath(workdir, shell.cwd ?? "."),
+        workdir,
+        configDir: getConfigDir(),
+      });
+      if (risk.secret?.action === "deny") {
+        action = "deny";
+        reason = `${risk.secret.path} holds credentials — agents can't read it. Manage it through codeoid instead.`;
+      } else if (risk.level === "high" || risk.level === "unknown" || risk.secret) {
+        action = "ask";
+        reason = `${risk.level} risk: ${risk.reasons[0] ?? "a credential directory"}`;
+      } else {
+        return null;
+      }
+    } catch (err) {
+      console.error(`${tag} judging a shell command's risk failed, asking the owner: ${err instanceof Error ? err.message : String(err)}`);
+      action = "ask";
+      reason = "codeoid couldn't judge this shell command's risk, so it needs the owner's approval.";
     }
     if (action === "deny") {
       try {
@@ -1206,6 +1254,12 @@ export class ClaudeProvider implements SessionProvider {
               // Fail-closed too (#secretPathDecision).
               const secret = this.#secretPathDecision(input, opts.workdir);
               if (secret) return secret;
+              // A shell command is judged by what it runs (#431): a risky one,
+              // one the gate can't read, or one naming a credential file never
+              // runs on an allow rule — it goes to canUseTool, which decides.
+              // Fail-closed (#shellRiskDecision).
+              const shellRisk = this.#shellRiskDecision(input, opts.workdir);
+              if (shellRisk) return shellRisk;
               // Past this point a throw fails OPEN: the CLI takes a hook that
               // errors as having no opinion (its createHookCallback returns {}),
               // so a call it would allow itself goes ahead.

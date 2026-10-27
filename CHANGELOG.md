@@ -8,6 +8,14 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Approvals judge what a shell command does** (#431).
+  Every shell command an agent wants to run is parsed (pipelines, chains, subshells, `bash -c`, `sudo`, `xargs`, `find -exec` and other wrappers seen through) and given a risk level: low, medium, high, or not understood.
+  High-risk commands (`rm -rf ~`, `git push --force`, `curl … | sh`, writes to start-up files, credential reads, `sudo`) and ones that can't be read ask in every mode, autonomous included; a command naming one of codeoid's credential files is refused like the file tools.
+  `approvals.autoAllowLowRisk` lets guarded mode run low-risk reads without asking.
+  The approval prompt shows the level and the reason on every surface, and rewind's "not undone by going back" list uses the same reading.
+  On Claude, a high-risk command never runs on a `permissions.allow` rule without codeoid's gate seeing it.
+  See [docs/approvals.md](docs/approvals.md).
+
 - **End-to-end tests against a scripted backend** (#429).
   `bun run test:e2e` boots a real daemon per test on a throwaway home and drives it through the web UI (Chromium, via Playwright) and the CLI, with a scripted backend that replays a written conversation instead of a model: no credentials, the same result every time.
   The first journeys: creating a session and seeing the reply and tool call, approving from the web UI, denying from the CLI while the web UI shows the request, a second device attaching mid-turn, a daemon restart, going back a turn with the files restored, forking from an earlier turn, and a backend error mid-turn.

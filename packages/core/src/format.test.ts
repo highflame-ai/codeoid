@@ -216,3 +216,14 @@ describe("formatTurnCost (#430)", () => {
     expect(formatTurnCost(0, "free")).toBe("$0");
   });
 });
+
+describe("formatToolRisk (#431)", () => {
+  it("says the level and the most serious reason, and nothing for a low-risk command", async () => {
+    const { formatToolRisk } = await import("./format.js");
+    expect(formatToolRisk({ level: "high", reasons: ["rm deletes ~", "runs rm"] })).toBe("high risk: rm deletes ~");
+    expect(formatToolRisk({ level: "unknown", reasons: ["a syntax error"] })).toBe("not understood: a syntax error");
+    expect(formatToolRisk({ level: "medium", reasons: [] })).toBe("medium risk");
+    expect(formatToolRisk({ level: "low", reasons: [] })).toBe("");
+    expect(formatToolRisk(undefined)).toBe("");
+  });
+});

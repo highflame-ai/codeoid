@@ -161,7 +161,8 @@ TELEGRAM_ALLOWED_USER_IDS=123,456
 
 ### Config file
 
-Optional `~/.codeoid/config.json` (env vars take precedence):
+Optional `~/.codeoid/config.json` (env vars take precedence).
+How shell commands are approved by risk (`approvals.*`) is in [approvals.md](approvals.md).
 
 ```json
 {

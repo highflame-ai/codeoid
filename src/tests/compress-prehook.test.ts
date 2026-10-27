@@ -180,3 +180,16 @@ describe("rewriteBashToolInput", () => {
     expect(cmd).toContain("'/Users/alice/my repo'");
   });
 });
+
+describe("decodeCompressedCommand (#431)", () => {
+  it("sees through codeoid's own wrapper to the command it runs — and only that wrapper", async () => {
+    const { decodeCompressedCommand, resolveWrapperPath } = await import("../daemon/compress/prehook.js");
+    const b64 = Buffer.from("rm -rf ~", "utf8").toString("base64");
+    expect(decodeCompressedCommand(`bun ${resolveWrapperPath()} --b64 ${b64} --cwd /w`)).toBe("rm -rf ~");
+    expect(decodeCompressedCommand(`bun /tmp/evil/wrapper-cli.ts --b64 ${b64} --cwd /w`)).toBeNull();
+    // A look-alike of the same length, too.
+    const lookAlike = resolveWrapperPath().replace("compress", "compresX");
+    expect(decodeCompressedCommand(`bun ${lookAlike} --b64 ${b64} --cwd /w`)).toBeNull();
+    expect(decodeCompressedCommand("git status")).toBeNull();
+  });
+});

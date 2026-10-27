@@ -192,6 +192,7 @@ import { secretPathVerdict } from "./secret-paths.js";
 import type { CompressionRegistry } from "./compress/index.js";
 import { defaultSpillDir } from "./compress/spill.js";
 import { type TurnOrigin, turnOrigin } from "./turn-origin.js";
+import { outsideEffects } from "./risk/effects.js";
 import { assessShellCommandSync, type ShellRisk } from "./risk/shell-risk.js";
 import { loadShellParser, shellParserReady } from "./shell/parse.js";
 import { isShellTool, shellCallOf, shellCommandOf } from "./shell/tool-call.js";
@@ -715,19 +716,12 @@ export class RewindError extends Error {
 }
 
 /**
- * Shell commands whose effects live outside the working directory (or in
- * git's own state), which restoring files can't undo.
- */
-const OUTSIDE_EFFECT_COMMAND =
-  /\b(git\s+(push|commit|tag|reset|rebase|merge|checkout|switch|stash|cherry-pick|revert|branch\s+-[dD])|gh\s|curl\s|wget\s|scp\s|rsync\s|ssh\s|npm\s+(publish|install|i\b)|pnpm\s|yarn\s|pip3?\s+install|uv\s+(pip|add)|cargo\s+(publish|install)|docker\s|kubectl\s|helm\s|terraform\s|aws\s|gcloud\s|az\s|deploy|psql\s|mysql\s|redis-cli\s|rm\s+-[a-z]*r|mv\s)/i;
-
-/**
  * What the taken-back turns did that going back can't undo (#355):
  * external (MCP) tool calls, and shell commands with effects outside the
  * working directory. Informational — derived from codeoid's own history, so
  * it reads the same for every backend.
  */
-export function irreversibleEffects(turns: readonly CanonicalTurn[]): RewindIrreversible[] {
+export function irreversibleEffects(turns: readonly CanonicalTurn[], ctx: { workdir: string }): RewindIrreversible[] {
   const out: RewindIrreversible[] = [];
   for (const t of turns) {
     if (t.role !== "assistant" || !t.toolCalls) continue;
@@ -737,7 +731,8 @@ export function irreversibleEffects(turns: readonly CanonicalTurn[]): RewindIrre
         out.push({ tool, detail: shorten(JSON.stringify(tc.input)) });
       } else if (isShellTool(tc.name, tool)) {
         const cmd = shellCommandOf(tc.input);
-        if (OUTSIDE_EFFECT_COMMAND.test(cmd)) out.push({ tool, detail: shorten(cmd) });
+        // Judged by what it runs (#431), from the workspace it ran in.
+        if (outsideEffects(cmd, ctx)) out.push({ tool, detail: shorten(cmd) });
       }
     }
   }
@@ -9284,7 +9279,7 @@ export class Session {
       removedTurnIds: removedIds,
       keptHistory: history.slice(0, cut),
       restoredPrompt,
-      irreversible: irreversibleEffects(removedCanon),
+      irreversible: irreversibleEffects(removedCanon, { workdir: this.workdir }),
       planId: "",
     };
     if (!restoreFiles) return { ...plan, planId: planHash([turnId, ...removedIds]) };
