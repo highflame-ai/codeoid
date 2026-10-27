@@ -491,22 +491,26 @@ const LazyJsonDetails: Component<{ value: unknown }> = (props) => {
 };
 
 const PhaseBadge: Component<{ state: ToolState }> = (props) => {
-  const phase = props.state.phase;
-  const cls =
-    phase === "completed"
+  // Read through props on every render: a tool's state changes in place
+  // (executing → completed), and a value captured once would freeze the badge.
+  const phase = () => props.state.phase;
+  const cls = () => {
+    const p = phase();
+    return p === "completed"
       ? "border-success/40 text-success"
-      : phase === "executing" || phase === "streaming"
+      : p === "executing" || p === "streaming"
         ? "border-warn/40 text-warn animate-pulse"
-        : phase === "waiting_confirmation"
+        : p === "waiting_confirmation"
           ? "border-accent/40 text-accent"
-          : phase === "cancelled"
+          : p === "cancelled"
             ? "border-danger/40 text-danger"
             : "border-border text-fg-faint";
+  };
   return (
     <span
-      class={`rounded border px-1.5 py-0.5 text-[10px] uppercase tracking-wider ${cls}`}
+      class={`rounded border px-1.5 py-0.5 text-[10px] uppercase tracking-wider ${cls()}`}
     >
-      {phase.replace("_", " ")}
+      {phase().replace("_", " ")}
     </span>
   );
 };

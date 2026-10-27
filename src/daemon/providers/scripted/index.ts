@@ -1,0 +1,281 @@
+/**
+ * ScriptedProvider — a backend that replays a written conversation, for the
+ * end-to-end suite (#429). It drives the REAL session machinery: its tool
+ * calls go through the session's approval gate (so approvals, the autonomous
+ * budget and audit are real), an allowed `Write` really writes into the
+ * workdir (so checkpoints, fork and rewind have something to restore), and its
+ * text, usage and errors take the same paths a model's would.
+ *
+ * Registered only when `CODEOID_E2E_SCRIPT` names a script file — never in a
+ * normal install. The script is read on every turn, so a test can rewrite it
+ * between steps.
+ *
+ * Script (JSON):
+ *
+ *   { "rules": [ { "match": "<regex on the user message>", "steps": [ ... ] } ] }
+ *
+ * The first rule whose `match` finds the user message runs; with none, the
+ * turn replies `scripted: <message>`. Steps, in order:
+ *
+ *   { "text": "..." }                       streamed word by word; `{{message}}` is the user message
+ *   { "thinking": "..." }
+ *   { "tool": "Write", "input": { "file_path": "a.txt", "content": "..." } }
+ *   { "tool": "<any>", "input": { ... }, "output": "..." }   gated, never executed
+ *   { "sleep": 500 }                        milliseconds; an interrupt cuts it short
+ *   { "waitFor": "/abs/path" }              hold the turn until the file exists (a test releases it)
+ *   { "error": "...", "detail": { ... } }   the turn fails with this message (and the backend's structured detail)
+ *   { "crash": "..." }                      the event stream throws, as a backend that died mid-turn
+ *   { "usage": { "inputTokens": 1, "outputTokens": 1, "costUsd": 0.01 } }
+ */
+
+import { randomUUID } from "node:crypto";
+import { closeSync, constants, existsSync, fstatSync, ftruncateSync, mkdirSync, openSync, readFileSync, realpathSync, writeSync } from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { AsyncQueue, AsyncQueueOverflowError } from "../../async-queue.js";
+import type { AgentProvider, ModelInfo, NormalizedTurnResult, ProviderEvent, TurnOpts, TurnRun } from "../interface.js";
+
+export const SCRIPTED_PROVIDER_ID = "scripted";
+export const SCRIPTED_MODEL = "scripted-model";
+/** The variable that names the script and, by being set, registers the backend. */
+export const SCRIPTED_ENV = "CODEOID_E2E_SCRIPT";
+
+export type ScriptStep =
+  | { text: string }
+  | { thinking: string }
+  | { tool: string; input?: Record<string, unknown>; output?: string }
+  | { sleep: number }
+  | { waitFor: string }
+  | { error: string; detail?: Record<string, unknown> }
+  | { crash: string }
+  | { usage: { inputTokens?: number; outputTokens?: number; costUsd?: number } };
+
+export interface ScriptRule {
+  match: string;
+  steps: ScriptStep[];
+}
+
+export interface Script {
+  rules: ScriptRule[];
+}
+
+/** Read and check a script file. Throws with the file and what's wrong. */
+export function loadScript(path: string): Script {
+  const raw = JSON.parse(readFileSync(path, "utf8")) as unknown;
+  const rules = (raw as { rules?: unknown })?.rules;
+  if (!Array.isArray(rules)) throw new Error(`${path}: expected { "rules": [...] }`);
+  for (const [i, rule] of rules.entries()) {
+    const r = rule as Partial<ScriptRule>;
+    if (typeof r.match !== "string" || !Array.isArray(r.steps)) throw new Error(`${path}: rule ${i} needs "match" (string) and "steps" (array)`);
+    new RegExp(r.match); // throws on a bad pattern
+  }
+  return { rules: rules as ScriptRule[] };
+}
+
+/** The steps for `message`: the first matching rule's, else an echo. */
+export function stepsFor(script: Script, message: string): ScriptStep[] {
+  const rule = script.rules.find((r) => new RegExp(r.match).test(message));
+  return rule ? rule.steps : [{ text: "scripted: {{message}}" }];
+}
+
+export class ScriptedProvider implements AgentProvider {
+  readonly id = SCRIPTED_PROVIDER_ID;
+  readonly displayName = "Scripted (end-to-end tests)";
+  readonly #scriptPath: string;
+
+  constructor(scriptPath: string) {
+    this.#scriptPath = scriptPath;
+  }
+
+  async listModels(): Promise<ModelInfo[]> {
+    return [{ id: SCRIPTED_MODEL, displayName: "Scripted model", isDefault: true }];
+  }
+
+  async dispose(): Promise<void> {}
+
+  runTurn(opts: TurnOpts): TurnRun {
+    const queue = new AsyncQueue<ProviderEvent>();
+    const abort = new AbortController();
+    // A `crash` step ends the stream with an error instead of a turn_done.
+    const crash: { message: string | null } = { message: null };
+    void this.#play(opts, queue, abort.signal, crash).finally(() => queue.close());
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      for await (const e of queue) yield e;
+      if (crash.message !== null) throw new Error(crash.message);
+    }
+    return {
+      events: events(),
+      interrupt: async () => {
+        abort.abort();
+        queue.close();
+      },
+    };
+  }
+
+  async #play(opts: TurnOpts, queue: AsyncQueue<ProviderEvent>, signal: AbortSignal, crash: { message: string | null }): Promise<void> {
+    const started = Date.now();
+    const result: NormalizedTurnResult = {
+      providerId: this.id,
+      model: SCRIPTED_MODEL,
+      inputTokens: 10,
+      outputTokens: 5,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      totalCostUsd: 0,
+      durationMs: 0,
+    };
+    // Once the queue overflowed, the turn is lost: nothing more is played, so no
+    // later turn_done can end it as a success with its middle missing.
+    const stopped = () => signal.aborted || crash.message !== null;
+    const emit = (e: ProviderEvent): boolean => {
+      if (stopped()) return false;
+      try {
+        queue.push(e);
+        return true;
+      } catch (err) {
+        // Closed by an interrupt: nothing more to say. Full: the script outran the
+        // session — fail the turn loudly rather than drop the rest of it.
+        if (err instanceof AsyncQueueOverflowError) crash.message = `scripted backend: ${err.message}`;
+        return false;
+      }
+    };
+    // Let the session start reading before the first event.
+    await Promise.resolve();
+
+    let steps: ScriptStep[];
+    try {
+      steps = stepsFor(loadScript(this.#scriptPath), opts.userMessage);
+    } catch (err) {
+      const message = `scripted backend: ${err instanceof Error ? err.message : String(err)}`;
+      emit({ type: "error", message });
+      emit({ type: "turn_done", result: { ...result, isError: true, errorMessage: message, durationMs: Date.now() - started } });
+      return;
+    }
+
+    for (const step of steps) {
+      if (stopped()) return;
+      if ("text" in step) {
+        const text = step.text.replaceAll("{{message}}", () => opts.userMessage);
+        const words = text.split(/(?<=\s)/);
+        for (const [i, word] of words.entries()) {
+          if (!emit({ type: "text_delta", content: word })) return;
+          // Let the session drain the queue now and then: it holds a bounded number of events.
+          if (i % 64 === 63) await new Promise((r) => setTimeout(r, 0));
+        }
+        emit({ type: "text_done", content: text });
+      } else if ("thinking" in step) {
+        emit({ type: "thinking_delta", content: step.thinking, blockIndex: 0 });
+        emit({ type: "thinking_done", blockIndex: 0 });
+      } else if ("tool" in step) {
+        await this.#tool(step, opts, emit, signal);
+      } else if ("sleep" in step) {
+        await sleep(step.sleep, signal);
+      } else if ("waitFor" in step) {
+        while (!existsSync(step.waitFor) && !signal.aborted) await sleep(25, signal);
+      } else if ("crash" in step) {
+        crash.message = step.crash;
+        return;
+      } else if ("error" in step) {
+        emit({ type: "error", message: step.error, ...(step.detail ? { detail: step.detail } : {}) });
+        emit({ type: "turn_done", result: { ...result, isError: true, errorMessage: step.error, durationMs: Date.now() - started } });
+        return;
+      } else if ("usage" in step) {
+        result.inputTokens = step.usage.inputTokens ?? result.inputTokens;
+        result.outputTokens = step.usage.outputTokens ?? result.outputTokens;
+        result.totalCostUsd = step.usage.costUsd ?? result.totalCostUsd;
+      }
+    }
+    if (stopped()) return;
+    emit({ type: "turn_done", result: { ...result, durationMs: Date.now() - started } });
+  }
+
+  /** One tool call: announced, put to the session's gate, run only if allowed. */
+  async #tool(
+    step: { tool: string; input?: Record<string, unknown>; output?: string },
+    opts: TurnOpts,
+    emit: (e: ProviderEvent) => boolean,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const toolId = randomUUID();
+    const input = step.input ?? {};
+    if (!emit({ type: "tool_start", toolId, sdkToolUseId: toolId, name: step.tool, input, approvalId: `scripted-${toolId}` })) return;
+    // Let the session register the call before the gate is asked about it.
+    await new Promise<void>((r) => setTimeout(r, 0));
+    if (signal.aborted) return;
+    let verdict: Awaited<ReturnType<TurnOpts["canUseTool"]>>;
+    try {
+      // The signal withdraws a pending approval when the turn is stopped.
+      verdict = await opts.canUseTool(toolId, `scripted-${toolId}`, step.tool, input, signal);
+    } catch (err) {
+      emit({ type: "tool_complete", sdkToolUseId: toolId, output: `gate failed: ${err instanceof Error ? err.message : String(err)}`, success: false });
+      return;
+    }
+    // Stopped while the gate decided: nothing runs after Stop.
+    if (signal.aborted) return;
+    if (verdict.behavior === "deny") {
+      emit({ type: "tool_complete", sdkToolUseId: toolId, output: verdict.message ?? "denied", success: false });
+      return;
+    }
+    const ran = verdict.updatedInput ?? input;
+    try {
+      const output = step.tool === "Write" ? writeInWorkdir(opts.workdir, ran) : (step.output ?? "ok");
+      emit({ type: "tool_complete", sdkToolUseId: toolId, output, success: true });
+    } catch (err) {
+      emit({ type: "tool_complete", sdkToolUseId: toolId, output: err instanceof Error ? err.message : String(err), success: false });
+    }
+  }
+}
+
+/**
+ * The scripted `Write`: a regular file under the workdir, never outside it.
+ * Where the path really leads (through any symlinked directory on the way)
+ * must be under the workdir's real path, and the file itself must not be a
+ * symlink, a hardlink to something else, or anything but a regular file. Not proof against a concurrent writer swapping
+ * a directory for a link between the check and the write — this backend runs
+ * only in tests, on a workdir nothing else writes to.
+ */
+function writeInWorkdir(workdir: string, input: Record<string, unknown>): string {
+  const path = input.file_path;
+  const content = input.content;
+  if (typeof path !== "string" || typeof content !== "string") throw new Error("Write needs file_path and content");
+  const under = (root: string, p: string) => {
+    const rel = relative(root, p);
+    return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+  };
+  // Compare real paths: the daemon hands the workdir over resolved, while a
+  // script may name a path through a symlink to it (macOS's /tmp, /var).
+  const target = resolve(workdir, path);
+  let ancestor = dirname(target);
+  while (!existsSync(ancestor)) ancestor = dirname(ancestor);
+  const realRoot = realpathSync(workdir);
+  const realTarget = join(realpathSync(ancestor), relative(ancestor, target));
+  if (!under(realRoot, realTarget)) throw new Error(`refusing to write outside the workdir: ${path}`);
+  mkdirSync(dirname(target), { recursive: true });
+  // Non-blocking, so a FIFO fails at once instead of freezing the daemon on a
+  // reader that never comes; truncate only once it's known to be our own file.
+  const fd = openSync(target, constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o644);
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile()) throw new Error(`refusing to write to something that isn't a regular file: ${path}`);
+    if (st.nlink > 1) throw new Error(`refusing to write through a hardlink: ${path}`);
+    ftruncateSync(fd, 0);
+    writeSync(fd, content);
+  } finally {
+    closeSync(fd);
+  }
+  return `wrote ${relative(realRoot, realTarget)}`;
+}
+
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((done) => {
+    if (signal.aborted) return done();
+    const timer = setTimeout(done, ms);
+    signal.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timer);
+        done();
+      },
+      { once: true },
+    );
+  });
+}

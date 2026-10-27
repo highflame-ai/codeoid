@@ -8,6 +8,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **End-to-end tests against a scripted backend** (#429).
+  `bun run test:e2e` boots a real daemon per test on a throwaway home and drives it through the web UI (Chromium, via Playwright) and the CLI, with a scripted backend that replays a written conversation instead of a model: no credentials, the same result every time.
+  The first journeys: creating a session and seeing the reply and tool call, approving from the web UI, denying from the CLI while the web UI shows the request, a second device attaching mid-turn, a daemon restart, going back a turn with the files restored, forking from an earlier turn, and a backend error mid-turn.
+  CI runs it on every PR. e2e/README.md says how to add one.
+
 - **Choose how hard the model thinks, per session, on every backend** (#417).
   One scale (Default, Off, Minimal, Low, Medium, High, Extra high, Max), mapped to each backend's own setting: Claude's effort, Codex's and OpenAI's reasoning effort, Qwen's and pi's levels, Gemini's thinking budget or level, llama.cpp's chat-template switches, and the Gemini CLI's model settings.
   Set it from the web UI's **effort** selector, `/effort` (web, TUI, Telegram), `codeoid new --effort`, or `session.defaultEffort` for new sessions.
@@ -193,6 +198,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   require a pack; an explicit-`phases` plan cannot declare one.
 
 ### Fixed
+
+- **The web UI's tool badge follows the call** (#429).
+  The badge read a tool call's state once, so it stayed at "executing" or "waiting confirmation" after the call finished, until the page was reloaded.
 
 - **The capabilities drawer no longer shows credentials from MCP servers or hooks** (#394).
   Its `claude.config` response already left out env and header values, but returned MCP servers' `args`, `url` and `command`, and hook commands, verbatim, and a Claude config keeps secrets there just as often (`--api-key sk-…`, `--token=…`, `postgres://user:pass@…`, `?api_key=…`, a token in the path, `curl -H "Authorization: Bearer …"`).
