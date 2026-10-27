@@ -1,3 +1,5 @@
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { createSessionInUi, expect, focusSession, messages, openUi, send, setMode, test, waitIdle } from "../harness";
 
 const SCRIPT = [
@@ -39,7 +41,7 @@ test("go back a turn with the files: the turn is taken back and the files restor
   expect(() => codeoid.readFile("extra.md")).toThrow();
 });
 
-test("fork from an earlier turn: a new session with the conversation up to there", async ({ page, codeoid }) => {
+test("fork from an earlier turn: a new session with the conversation and the files up to there", async ({ page, codeoid }) => {
   codeoid.setScript(SCRIPT);
   await openUi(page, codeoid);
   await twoTurns(page, "origin", codeoid.workdir);
@@ -58,7 +60,17 @@ test("fork from an earlier turn: a new session with the conversation up to there
   await send(page, "in the fork");
   await expect(messages(page).filter({ hasText: "scripted: in the fork" })).toHaveCount(1);
 
-  // The original is untouched.
+  // The fork works in its own worktree, with the files as they were after that turn.
+  const worktrees = join(codeoid.root, "work-worktrees");
+  const forks = readdirSync(worktrees);
+  expect(forks).toHaveLength(1);
+  const forkPath = join(worktrees, forks[0] ?? "");
+  expect(readFileSync(join(forkPath, "plan.md"), "utf8")).toBe("v1\n");
+  expect(readdirSync(forkPath)).not.toContain("extra.md");
+
+  // The original is untouched: its files and its conversation.
+  expect(codeoid.readFile("plan.md")).toBe("v2\n");
+  expect(codeoid.readFile("extra.md")).toBe("extra\n");
   await focusSession(page, "origin");
   await expect(messages(page).filter({ hasText: "Wrote v2." })).toHaveCount(1);
   await expect(messages(page).filter({ hasText: "in the fork" })).toHaveCount(0);

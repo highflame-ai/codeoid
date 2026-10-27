@@ -22,12 +22,14 @@
  *   { "tool": "Write", "input": { "file_path": "a.txt", "content": "..." } }
  *   { "tool": "<any>", "input": { ... }, "output": "..." }   gated, never executed
  *   { "sleep": 500 }                        milliseconds; an interrupt cuts it short
- *   { "error": "..." }                      the turn fails with this message
+ *   { "waitFor": "/abs/path" }              hold the turn until the file exists (a test releases it)
+ *   { "error": "...", "detail": { ... } }   the turn fails with this message (and the backend's structured detail)
+ *   { "crash": "..." }                      the event stream throws, as a backend that died mid-turn
  *   { "usage": { "inputTokens": 1, "outputTokens": 1, "costUsd": 0.01 } }
  */
 
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, mkdirSync, openSync, readFileSync, realpathSync, writeSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { AsyncQueue } from "../../async-queue.js";
 import type { AgentProvider, ModelInfo, NormalizedTurnResult, ProviderEvent, TurnOpts, TurnRun } from "../interface.js";
@@ -42,7 +44,9 @@ export type ScriptStep =
   | { thinking: string }
   | { tool: string; input?: Record<string, unknown>; output?: string }
   | { sleep: number }
-  | { error: string }
+  | { waitFor: string }
+  | { error: string; detail?: Record<string, unknown> }
+  | { crash: string }
   | { usage: { inputTokens?: number; outputTokens?: number; costUsd?: number } };
 
 export interface ScriptRule {
@@ -91,9 +95,15 @@ export class ScriptedProvider implements AgentProvider {
   runTurn(opts: TurnOpts): TurnRun {
     const queue = new AsyncQueue<ProviderEvent>();
     const abort = new AbortController();
-    void this.#play(opts, queue, abort.signal).finally(() => queue.close());
+    // A `crash` step ends the stream with an error instead of a turn_done.
+    const crash: { message: string | null } = { message: null };
+    void this.#play(opts, queue, abort.signal, crash).finally(() => queue.close());
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      for await (const e of queue) yield e;
+      if (crash.message !== null) throw new Error(crash.message);
+    }
     return {
-      events: queue,
+      events: events(),
       interrupt: async () => {
         abort.abort();
         queue.close();
@@ -101,7 +111,7 @@ export class ScriptedProvider implements AgentProvider {
     };
   }
 
-  async #play(opts: TurnOpts, queue: AsyncQueue<ProviderEvent>, signal: AbortSignal): Promise<void> {
+  async #play(opts: TurnOpts, queue: AsyncQueue<ProviderEvent>, signal: AbortSignal, crash: { message: string | null }): Promise<void> {
     const started = Date.now();
     const result: NormalizedTurnResult = {
       providerId: this.id,
@@ -138,7 +148,7 @@ export class ScriptedProvider implements AgentProvider {
     for (const step of steps) {
       if (signal.aborted) return;
       if ("text" in step) {
-        const text = step.text.replaceAll("{{message}}", opts.userMessage);
+        const text = step.text.replaceAll("{{message}}", () => opts.userMessage);
         for (const word of text.split(/(?<=\s)/)) emit({ type: "text_delta", content: word });
         emit({ type: "text_done", content: text });
       } else if ("thinking" in step) {
@@ -148,8 +158,13 @@ export class ScriptedProvider implements AgentProvider {
         await this.#tool(step, opts, emit);
       } else if ("sleep" in step) {
         await sleep(step.sleep, signal);
+      } else if ("waitFor" in step) {
+        while (!existsSync(step.waitFor) && !signal.aborted) await sleep(25, signal);
+      } else if ("crash" in step) {
+        crash.message = step.crash;
+        return;
       } else if ("error" in step) {
-        emit({ type: "error", message: step.error });
+        emit({ type: "error", message: step.error, ...(step.detail ? { detail: step.detail } : {}) });
         emit({ type: "turn_done", result: { ...result, isError: true, errorMessage: step.error, durationMs: Date.now() - started } });
         return;
       } else if ("usage" in step) {
@@ -189,17 +204,34 @@ export class ScriptedProvider implements AgentProvider {
   }
 }
 
-/** The scripted `Write`: a file under the workdir, never outside it. */
+/**
+ * The scripted `Write`: a file under the workdir, never outside it — symlinks
+ * included. The containment check runs on real paths (the deepest existing
+ * ancestor of the target), and the file is opened without following a link.
+ */
 function writeInWorkdir(workdir: string, input: Record<string, unknown>): string {
   const path = input.file_path;
   const content = input.content;
   if (typeof path !== "string" || typeof content !== "string") throw new Error("Write needs file_path and content");
-  const target = resolve(workdir, path);
-  const rel = relative(resolve(workdir), target);
-  if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) throw new Error(`refusing to write outside the workdir: ${path}`);
+  const root = realpathSync(workdir);
+  const target = resolve(root, path);
+  const inside = (p: string) => {
+    const rel = relative(root, p);
+    return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+  };
+  if (!inside(target)) throw new Error(`refusing to write outside the workdir: ${path}`);
+  let ancestor = dirname(target);
+  while (!existsSync(ancestor)) ancestor = dirname(ancestor);
+  const real = realpathSync(ancestor);
+  if (real !== root && !inside(real)) throw new Error(`refusing to write outside the workdir: ${path}`);
   mkdirSync(dirname(target), { recursive: true });
-  writeFileSync(target, content);
-  return `wrote ${rel}`;
+  const fd = openSync(target, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o644);
+  try {
+    writeSync(fd, content);
+  } finally {
+    closeSync(fd);
+  }
+  return `wrote ${relative(root, target)}`;
 }
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {

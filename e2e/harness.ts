@@ -78,7 +78,13 @@ export class Codeoid {
     );
     c.initRepo(c.workdir);
     c.setScript(rules);
-    await c.start();
+    try {
+      await c.start();
+    } catch (err) {
+      // The fixture never gets an object to dispose: clean up here.
+      await c.dispose();
+      throw err;
+    }
     return c;
   }
 
@@ -119,6 +125,7 @@ export class Codeoid {
     };
   }
 
+  /** Start the daemon; resolves once it answers /health. */
   async start(): Promise<void> {
     if (this.#daemon) throw new Error("daemon already running");
     const child = spawn("bun", [CLI, "start", "--local", "--port", String(this.port), "--host", "127.0.0.1", "--no-telegram"], {
@@ -127,17 +134,31 @@ export class Codeoid {
       stdio: ["ignore", "pipe", "pipe"],
     });
     this.#daemon = child;
-    const ready = new Promise<void>((done, fail) => {
-      const onData = (chunk: Buffer) => {
-        this.#log += chunk.toString();
-        if (this.#log.includes("daemon listening on")) done();
-      };
-      child.stdout?.on("data", onData);
-      child.stderr?.on("data", onData);
-      child.once("exit", (code) => fail(new Error(`daemon exited (${code}) before it was ready:\n${this.#log}`)));
-      setTimeout(() => fail(new Error(`daemon not ready after 30s:\n${this.#log}`)), 30_000).unref();
-    });
-    await ready;
+    const onData = (chunk: Buffer) => {
+      this.#log += chunk.toString();
+    };
+    child.stdout?.on("data", onData);
+    child.stderr?.on("data", onData);
+    // Ready means THIS process answers on the port — never a line left in the
+    // log by the previous boot (restart), and never a port another process holds.
+    const deadline = Date.now() + 30_000;
+    for (;;) {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        this.#daemon = null;
+        throw new Error(`daemon exited (${child.exitCode ?? child.signalCode}) before it was ready:\n${this.#log}`);
+      }
+      try {
+        const res = await fetch(`http://127.0.0.1:${this.port}/health`, { signal: AbortSignal.timeout(1_000) });
+        if (res.ok) return;
+      } catch {
+        // Not listening yet.
+      }
+      if (Date.now() > deadline) {
+        await this.stop();
+        throw new Error(`daemon not ready after 30s:\n${this.#log}`);
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
   }
 
   /** Stop the daemon the way an operator does (SIGTERM), and wait for it to exit. */
@@ -145,7 +166,8 @@ export class Codeoid {
     const child = this.#daemon;
     if (!child) return;
     this.#daemon = null;
-    if (child.exitCode !== null) return;
+    // Already gone, by exiting or by a signal (an OOM kill, a crash).
+    if (child.exitCode !== null || child.signalCode !== null) return;
     const exited = new Promise<void>((done) => child.once("exit", () => done()));
     child.kill("SIGTERM");
     const timer = setTimeout(() => child.kill("SIGKILL"), 35_000);
@@ -177,6 +199,15 @@ export class Codeoid {
     const r = await this.cli(...args);
     if (r.code !== 0) throw new Error(`codeoid ${args.join(" ")} exited ${r.code}:\n${r.output}`);
     return r.output;
+  }
+
+  /** A path for a `waitFor` step; `release(path)` lets the held turn go on. */
+  gate(name: string): string {
+    return join(this.root, `gate-${name}`);
+  }
+
+  release(gatePath: string): void {
+    writeFileSync(gatePath, "");
   }
 
   readFile(rel: string): string {

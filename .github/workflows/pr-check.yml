@@ -12,6 +12,11 @@ on:
     types:
       - checks_requested
 
+# PR code runs in every job (install scripts, the daemon, the tests): its
+# token may only read the repository.
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref }}
   cancel-in-progress: true

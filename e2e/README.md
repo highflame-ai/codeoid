@@ -29,7 +29,8 @@ The `codeoid` fixture gives the test:
 | `codeoid.setScript(rules)` | what the backend does next (read again on every turn) |
 | `codeoid.workdir`, `readFile(path)` | the session's git repo |
 | `codeoid.cli(...args)`, `cliOk(...args)` | run the CLI against this daemon |
-| `codeoid.restart()` | stop (SIGTERM) and start the daemon again; the local token is pinned, so open pages reconnect |
+| `codeoid.restart()` | stop (SIGTERM) and start the daemon again, returning once it answers; the local token is pinned, so open pages reconnect |
+| `codeoid.gate(name)`, `release(path)` | hold a turn at a `waitFor` step until the test lets it go on |
 | `codeoid.uiUrl`, `log` | the web UI's address; the daemon's output (attached to a failing test) |
 
 Helpers for the web UI: `openUi`, `createSessionInUi`, `focusSession`, `send`, `messages`, `setMode`, `waitIdle`.
@@ -45,16 +46,20 @@ A script is a list of rules; the first whose `match` (a regular expression) find
   { "match": "^write it", "steps": [
     { "text": "Writing." },
     { "tool": "Write", "input": { "file_path": "a.txt", "content": "hi\n" } },
-    { "sleep": 500 },
+    { "waitFor": "/path/from/codeoid.gate()" },
     { "text": "Done." },
     { "usage": { "inputTokens": 100, "outputTokens": 20, "costUsd": 0.01 } }
   ] },
-  { "match": "^break", "steps": [ { "error": "upstream failed" } ] }
+  { "match": "^break", "steps": [ { "error": "upstream failed", "detail": { "status": 429 } } ] },
+  { "match": "^die", "steps": [ { "crash": "backend process exited" } ] }
 ] }
 ```
 
+`sleep` waits a number of milliseconds; `waitFor` holds the turn until a file exists, so a test decides when the turn goes on instead of racing a timer.
+`error` fails the turn as a backend reports it (with optional structured `detail`); `crash` makes the event stream throw, as a backend process that died mid-turn.
+
 Every tool call goes through the session's real approval gate, so modes, approvals, the autonomous budget and the audit log behave as they do with a model.
-An allowed `Write` really writes (inside the workdir only), so checkpoints, rewind and fork have files to restore; any other tool returns its `output` without running anything.
+An allowed `Write` really writes (inside the workdir only, never through a symlink out of it), so checkpoints, rewind and fork have files to restore; any other tool returns its `output` without running anything.
 
 ## Adding a journey
 

@@ -42,3 +42,30 @@ test("a backend error mid-turn is shown, and the session takes the next prompt",
   await send(page, "still there?");
   await expect(messages(page).filter({ hasText: "scripted: still there?" })).toHaveCount(1);
 });
+
+test("a backend that dies mid-turn: the failure is shown, and the session takes the next prompt", async ({ page, codeoid }) => {
+  codeoid.setScript([{ match: "^die", steps: [{ text: "About to go." }, { crash: "backend process exited (scripted)" }] }]);
+  await openUi(page, codeoid);
+  await createSessionInUi(page, "crash", codeoid.workdir);
+
+  await send(page, "die");
+  await expect(page.getByRole("main")).toContainText("backend process exited (scripted)");
+  await waitIdle(page);
+
+  await send(page, "back?");
+  await expect(messages(page).filter({ hasText: "scripted: back?" })).toHaveCount(1);
+});
+
+test("a turn's usage shows in the session's totals", async ({ page, codeoid }) => {
+  codeoid.setScript([{ match: "^count", steps: [{ text: "Counted." }, { usage: { inputTokens: 321, outputTokens: 87, costUsd: 0.42 } }] }]);
+  await openUi(page, codeoid);
+  await createSessionInUi(page, "usage", codeoid.workdir);
+
+  await send(page, "count");
+  await expect(messages(page).filter({ hasText: "Counted." })).toHaveCount(1);
+  await waitIdle(page);
+  const header = page.getByRole("main");
+  await expect(header.getByText("New input").locator("..")).toContainText("321");
+  await expect(header.getByText("Output", { exact: true }).locator("..")).toContainText("87");
+  await expect(header.getByText("Cost", { exact: true }).locator("..")).toContainText("$0.42");
+});

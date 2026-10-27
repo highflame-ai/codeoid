@@ -8,6 +8,8 @@ test("after a daemon restart the session comes back with its history and takes n
   await waitIdle(page);
 
   await codeoid.restart();
+  // Ready means ready: the CLI works the moment restart() returns.
+  expect(await codeoid.cliOk("ls")).toContain("survivor");
 
   // The open page reconnects by itself.
   await expect(page.getByText("live", { exact: true })).toBeVisible({ timeout: 20_000 });

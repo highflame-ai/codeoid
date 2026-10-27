@@ -1,10 +1,12 @@
 import { createSessionInUi, expect, focusSession, messages, openUi, send, test, waitIdle } from "../harness";
 
 test("a second device attaching mid-turn sees the history replayed and the rest of the turn live", async ({ page, codeoid, browser }) => {
+  const gate = codeoid.gate("handoff");
   codeoid.setScript([
     {
       match: "^long job",
-      steps: [{ text: "Step one is done." }, { sleep: 2500 }, { text: "Step two is done." }],
+      // Held until the test releases it, so the second device provably attaches mid-turn.
+      steps: [{ text: "Step one is done." }, { waitFor: gate }, { text: "Step two is done." }],
     },
   ]);
   await openUi(page, codeoid);
@@ -16,17 +18,26 @@ test("a second device attaching mid-turn sees the history replayed and the rest 
   await expect(messages(page).filter({ hasText: "Step one is done." })).toHaveCount(1);
 
   // Another device, mid-turn.
-  const other = await (await browser.newContext({ viewport: { width: 1400, height: 950 } })).newPage();
-  await openUi(other, codeoid);
-  await focusSession(other, "handoff");
-  for (const text of ["first message", "scripted: first message", "long job", "Step one is done."]) {
-    await expect(messages(other).filter({ hasText: text }).first()).toBeVisible();
-  }
-  await expect(messages(other).filter({ hasText: "Step two is done." })).toHaveCount(1);
-  await waitIdle(other);
+  const context = await browser.newContext({ viewport: { width: 1400, height: 950 } });
+  try {
+    const other = await context.newPage();
+    await openUi(other, codeoid);
+    await focusSession(other, "handoff");
+    for (const text of ["first message", "scripted: first message", "long job", "Step one is done."]) {
+      await expect(messages(other).filter({ hasText: text }).first()).toBeVisible();
+    }
+    // Still running there, and the rest hasn't happened yet.
+    await expect(other.getByRole("button", { name: /interrupt/ })).toBeEnabled();
+    await expect(messages(other).filter({ hasText: "Step two is done." })).toHaveCount(0);
 
-  // Exactly what the first device shows, message for message.
-  await waitIdle(page);
-  expect(await messages(other).allInnerTexts()).toEqual(await messages(page).allInnerTexts());
-  await other.context().close();
+    codeoid.release(gate);
+    await expect(messages(other).filter({ hasText: "Step two is done." })).toHaveCount(1);
+    await waitIdle(other);
+
+    // Exactly what the first device shows, message for message.
+    await waitIdle(page);
+    expect(await messages(other).allInnerTexts()).toEqual(await messages(page).allInnerTexts());
+  } finally {
+    await context.close();
+  }
 });

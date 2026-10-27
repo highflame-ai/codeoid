@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ProviderEvent, TurnOpts } from "../interface.js";
@@ -83,6 +83,63 @@ describe("the scripted backend (#429)", () => {
     const events = await turn("write");
     expect(existsSync(join(tmp, "escape.txt"))).toBe(false);
     expect(events.find((e) => e.type === "tool_complete")).toMatchObject({ success: false });
+  });
+
+  it("never writes through a symlink that leads out of the workdir", async () => {
+    mkdirSync(join(tmp, "outside"));
+    symlinkSync(join(tmp, "outside"), join(work, "link"));
+    symlinkSync(join(tmp, "outside", "f.txt"), join(work, "f.txt"));
+    script([
+      { match: "^dir", steps: [{ tool: "Write", input: { file_path: "link/pwned.txt", content: "x" } }] },
+      { match: "^file", steps: [{ tool: "Write", input: { file_path: "f.txt", content: "x" } }] },
+    ]);
+    for (const m of ["dir", "file"]) {
+      const events = await turn(m);
+      expect(events.find((e) => e.type === "tool_complete")).toMatchObject({ success: false });
+    }
+    expect(existsSync(join(tmp, "outside", "pwned.txt"))).toBe(false);
+    expect(existsSync(join(tmp, "outside", "f.txt"))).toBe(false);
+  });
+
+  it("a waitFor step holds the turn until the file exists", async () => {
+    const gate = join(tmp, "gate");
+    script([{ match: ".", steps: [{ text: "one" }, { waitFor: gate }, { text: "two" }] }]);
+    let released = false;
+    setTimeout(() => {
+      released = true;
+      writeFileSync(gate, "");
+    }, 150);
+    const events = await turn("x");
+    expect(released).toBe(true);
+    expect(events.filter((e) => e.type === "text_done").map((e) => (e as { content: string }).content)).toEqual(["one", "two"]);
+  });
+
+  it("a crash step ends the stream with an error and no turn_done, as a backend that died", async () => {
+    script([{ match: ".", steps: [{ text: "before" }, { crash: "process exited" }, { text: "never" }] }]);
+    const run = new ScriptedProvider(scriptPath).runTurn({ history: [], userMessage: "x", workdir: work, canUseTool: async () => ({ behavior: "allow" }) } as unknown as TurnOpts);
+    const events: ProviderEvent[] = [];
+    let thrown: unknown;
+    try {
+      for await (const e of run.events) events.push(e);
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toBe("process exited");
+    expect(events.some((e) => e.type === "turn_done")).toBe(false);
+    expect(events.some((e) => e.type === "text_done" && e.content === "never")).toBe(false);
+  });
+
+  it("an error step carries the backend's structured detail", async () => {
+    script([{ match: ".", steps: [{ error: "rate limited", detail: { codexErrorInfo: "usageLimitExceeded" } }] }]);
+    const events = await turn("x");
+    expect(events.find((e) => e.type === "error")).toEqual({ type: "error", message: "rate limited", detail: { codexErrorInfo: "usageLimitExceeded" } });
+  });
+
+  it("echoes a message with replacement patterns in it verbatim", async () => {
+    script([]);
+    const events = await turn("cost is $& and $1");
+    expect(events.find((e) => e.type === "text_done")).toMatchObject({ content: "scripted: cost is $& and $1" });
   });
 
   it("an error step fails the turn with that message", async () => {
