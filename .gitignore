@@ -21,3 +21,7 @@ package-lock.json
 # These were committed by accident once; keep them out of the tree.
 .claude/worktrees/
 .claude/settings.local.json
+
+# end-to-end suite output (#429)
+test-results/
+playwright-report/
