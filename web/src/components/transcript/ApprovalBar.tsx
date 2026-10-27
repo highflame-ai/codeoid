@@ -45,8 +45,8 @@ import {
   type DispatchPreview as DispatchPreviewModel,
 } from "../../lib/dispatch-preview";
 import { sessionList } from "../../state/sessions";
-import type { CollaborationCost, SessionMessage } from "../../protocol/types";
-import { formatCollaborationCost } from "../../lib/format";
+import type { CollaborationCost, SessionMessage, ToolRisk } from "../../protocol/types";
+import { formatCollaborationCost, formatToolRisk } from "../../lib/format";
 
 /**
  * Repo/branch/content preview for a send-class fleet dispatch, or null for any
@@ -138,6 +138,7 @@ const ApprovalBar: Component = () => {
       input: s.input,
       toolName: m.tool.name,
       collaborationCost: s.collaborationCost,
+      risk: s.risk,
     };
   });
 
@@ -223,6 +224,7 @@ const ApprovalBar: Component = () => {
                 toolName={snap().toolName}
                 description={snap().description}
                 collaborationCost={snap().collaborationCost}
+                risk={snap().risk}
                 dispatch={dispatchFor(snap().toolName, snap().input)}
                 isPlanMode={isPlanMode()}
                 busy={busy()}
@@ -311,6 +313,8 @@ const BinaryBar: Component<{
   description: string;
   /** Present only for a send-class fleet dispatch from a collaborative session. */
   collaborationCost?: CollaborationCost;
+  /** A shell command's risk (#431). */
+  risk?: ToolRisk;
   /** Present only for a send-class fleet dispatch — repo/branch/content (R3). */
   dispatch?: DispatchPreviewModel | null;
   isPlanMode: boolean;
@@ -343,6 +347,7 @@ const BinaryBar: Component<{
         <Show when={props.dispatch}>
           {(d) => <DispatchDetails preview={d()} />}
         </Show>
+        <RiskLine risk={props.risk} />
         <Show when={props.collaborationCost}>
           {(c) => (
             <div class="mt-1 truncate font-mono text-[11px] text-warn" title="Rolled up across this collaboration's orchestrator and its live role-children">
@@ -380,6 +385,21 @@ const BinaryBar: Component<{
       </button>
     </div>
   </div>
+);
+
+/** A shell command's risk, next to the decision (#431); nothing for a low-risk one. */
+export const RiskLine: Component<{ risk?: ToolRisk }> = (props) => (
+  <Show when={formatToolRisk(props.risk)}>
+    {(text) => (
+      <div
+        class={`mt-1 truncate text-[11px] font-semibold ${props.risk?.level === "medium" ? "text-warn" : "text-danger"}`}
+        title={props.risk?.reasons.join("\n")}
+        data-risk={props.risk?.level}
+      >
+        ▲ {text()}
+      </div>
+    )}
+  </Show>
 );
 
 const AskUserQuestionForm: Component<{

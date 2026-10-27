@@ -222,6 +222,13 @@ never a verdict. Every transition is a compare-and-set on the run's
 `state_version`. loop.* is authorized in `SessionManager.#loopHandle`
 (owner-only; session:create + session:send, plus session:approve to start).
 
+Shell commands are approved by risk (#431, docs/approvals.md): `src/daemon/shell/`
+parses a command line with tree-sitter-bash (WASM, vendored `tree-sitter-bash.wasm`;
+the daemon loads it at start, so the gate judges synchronously and the approval
+card always matches the decision), and `src/daemon/risk/` gives it a level. High
+and not-understood commands ask in every mode; a credential path is refused.
+On Claude the PreToolUse hook routes them to the gate past any allow rule.
+
 Routines (`src/daemon/routines/`, docs/routines.md) run sessions on a schedule
 or an API call. `RoutineService` owns the scheduler and runs; it reaches
 sessions only through the `RoutineHost` seam that `SessionManager` implements,

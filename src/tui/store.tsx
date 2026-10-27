@@ -19,6 +19,7 @@ import type {
   ToolState,
   ToolWaitingConfirmationState,
 } from "../protocol/types.js";
+import { formatToolRisk } from "@highflame/codeoid-core";
 import type { TuiAction, TuiSession, TuiState } from "./types.js";
 
 /**
@@ -317,6 +318,7 @@ function applyMessage(
       approvalId: st.approvalId,
       toolName: msg.tool.name,
       description: st.description,
+      ...(formatToolRisk(st.risk) ? { risk: formatToolRisk(st.risk) } : {}),
     };
   }
 

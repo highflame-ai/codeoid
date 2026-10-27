@@ -26,9 +26,10 @@ import type {
 	SessionInfo,
 	SessionMessage,
 	ToolInfo,
+	ToolRisk,
 	ToolState,
 } from "../../protocol/types.js";
-import { formatCollaborationCost, isBackgroundWake, parseBackgroundWake } from "@highflame/codeoid-core";
+import { formatCollaborationCost, formatToolRisk, isBackgroundWake, parseBackgroundWake } from "@highflame/codeoid-core";
 import { renderMarkdown, type Segment } from "../markdown.js";
 import { computeDiff, truncateToolOutput } from "../diff.js";
 import { fileUri, maybeLink } from "../osc8.js";
@@ -274,6 +275,8 @@ function renderToolRow(
 		const cost = (tool.state as { collaborationCost?: CollaborationCost })
 			.collaborationCost;
 		if (cost) lines.push(dim(`  \u25c7 ${formatCollaborationCost(cost)}`));
+		const risk = formatToolRisk((tool.state as { risk?: ToolRisk }).risk);
+		if (risk) lines.push(red(`  \u25b2 ${risk}`));
 	}
 
 	if (isEdit) {
