@@ -66,9 +66,14 @@ const MAX_DEPTH = 8;
 const MAX_LENGTH = 100_000;
 
 let ready: Promise<Parser> | null = null;
+let loaded: Parser | null = null;
 
-/** The parser, loaded once. A load that fails is retried on the next call. */
-function parser(): Promise<Parser> {
+/**
+ * Load the parser (once; a load that fails is retried on the next call). The
+ * daemon loads it at start, so the approval gate can judge a command in the
+ * same step as it decides — see parseShellSync.
+ */
+export function loadShellParser(): Promise<Parser> {
   ready ??= (async () => {
     await Parser.init({
       locateFile: (name: string) => fileURLToPath(import.meta.resolve(`web-tree-sitter/${name}`)),
@@ -76,6 +81,7 @@ function parser(): Promise<Parser> {
     const language = await Language.load(await Bun.file(bashWasm).bytes());
     const p = new Parser();
     p.setLanguage(language);
+    loaded = p;
     return p;
   })().catch((err) => {
     ready = null;
@@ -84,21 +90,37 @@ function parser(): Promise<Parser> {
   return ready;
 }
 
-/** Parse a command line. Never throws: a failure to parse is a problem, reported. */
+/** The parser is loaded: parseShellSync understands commands. */
+export function shellParserReady(): boolean {
+  return loaded !== null;
+}
+
+/** Parse a command line, loading the parser first if need be. Never throws: a failure to parse is a problem, reported. */
 export async function parseShell(source: string): Promise<ParsedShell> {
+  try {
+    await loadShellParser();
+  } catch (err) {
+    return { commands: [], problems: [`the shell parser failed to load: ${err instanceof Error ? err.message : String(err)}`] };
+  }
+  return parseShellSync(source);
+}
+
+/** Parse with the parser already loaded; before it is, nothing is understood. */
+export function parseShellSync(source: string): ParsedShell {
   const out: ParsedShell = { commands: [], problems: [] };
   if (source.length > MAX_LENGTH) {
     out.problems.push(`the command is over ${MAX_LENGTH} characters`);
     return out;
   }
-  let p: Parser;
-  try {
-    p = await parser();
-  } catch (err) {
-    out.problems.push(`the shell parser failed to load: ${err instanceof Error ? err.message : String(err)}`);
+  if (!loaded) {
+    out.problems.push("the shell parser isn't loaded");
     return out;
   }
-  new Walker(p, out).line(source, [], 0);
+  try {
+    new Walker(loaded, out).line(source, [], 0);
+  } catch (err) {
+    out.problems.push(`the command couldn't be parsed: ${err instanceof Error ? err.message : String(err)}`);
+  }
   return out;
 }
 

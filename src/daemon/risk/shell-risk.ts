@@ -22,7 +22,7 @@
 import { homedir } from "node:os";
 import { isAbsolute, join, normalize, resolve, sep } from "node:path";
 import { secretPathVerdict } from "../secret-paths.js";
-import { type ParsedShell, parseShell, type ShellWord, type SimpleCommand } from "../shell/parse.js";
+import { loadShellParser, type ParsedShell, parseShellSync, type ShellWord, type SimpleCommand } from "../shell/parse.js";
 
 export type RiskLevel = "low" | "medium" | "high" | "unknown";
 
@@ -51,10 +51,20 @@ export function maxRisk(a: RiskLevel, b: RiskLevel): RiskLevel {
   return RANK[a] >= RANK[b] ? a : b;
 }
 
-/** Judge a command line. Never throws: an analyser failure is `high` (fail closed). */
+/** Judge a command line, loading the parser first if need be. */
 export async function assessShellCommand(command: string, ctx: RiskContext): Promise<ShellRisk> {
+  await loadShellParser().catch(() => {});
+  return assessShellCommandSync(command, ctx);
+}
+
+/**
+ * Judge a command line with the parser already loaded (the daemon loads it
+ * at start); before then the line is `unknown`. Never throws: an analyser
+ * failure is `high` (fail closed).
+ */
+export function assessShellCommandSync(command: string, ctx: RiskContext): ShellRisk {
   try {
-    return judge(await parseShell(command), { ...ctx, home: ctx.home ?? homedir() });
+    return judge(parseShellSync(command), { ...ctx, home: ctx.home ?? homedir() });
   } catch (err) {
     return { level: "high", reasons: [`the command couldn't be analysed: ${err instanceof Error ? err.message : String(err)}`] };
   }
