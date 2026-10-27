@@ -82,6 +82,7 @@
     "openai": "^6.45.0",
     "react": "^19.2.5",
     "react-devtools-core": "^7.0.1",
+    "web-tree-sitter": "0.25.10",
     "zod": "^4.0.0"
   },
   "devDependencies": {
