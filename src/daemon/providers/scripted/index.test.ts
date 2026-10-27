@@ -255,6 +255,28 @@ describe("the scripted backend (#429)", () => {
     expect(events.some((e) => e.type === "text_done")).toBe(false);
   });
 
+  it("nothing runs after Stop, even when the gate allows the call late", async () => {
+    script([{ match: ".", steps: [{ tool: "Write", input: { file_path: "late.txt", content: "x" } }] }]);
+    let signalled: AbortSignal | undefined;
+    const run = new ScriptedProvider(scriptPath).runTurn({
+      history: [],
+      userMessage: "x",
+      workdir: work,
+      canUseTool: async (_id: string, _a: string, _t: string, _i: Record<string, unknown>, signal?: AbortSignal) => {
+        signalled = signal;
+        await Bun.sleep(100);
+        return { behavior: "allow" as const };
+      },
+    } as unknown as TurnOpts);
+    setTimeout(() => void run.interrupt(), 30);
+    for await (const _ of run.events) {
+      // drain
+    }
+    await Bun.sleep(150);
+    expect(existsSync(join(work, "late.txt"))).toBe(false);
+    expect(signalled?.aborted).toBe(true); // the gate was told, so it can withdraw the approval
+  });
+
   it("stepsFor falls back to the echo", () => {
     expect(stepsFor({ rules: [] }, "m")).toEqual([{ text: "scripted: {{message}}" }]);
   });

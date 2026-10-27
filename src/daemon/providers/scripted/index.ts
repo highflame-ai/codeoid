@@ -166,7 +166,7 @@ export class ScriptedProvider implements AgentProvider {
         emit({ type: "thinking_delta", content: step.thinking, blockIndex: 0 });
         emit({ type: "thinking_done", blockIndex: 0 });
       } else if ("tool" in step) {
-        await this.#tool(step, opts, emit);
+        await this.#tool(step, opts, emit, signal);
       } else if ("sleep" in step) {
         await sleep(step.sleep, signal);
       } else if ("waitFor" in step) {
@@ -189,19 +189,28 @@ export class ScriptedProvider implements AgentProvider {
   }
 
   /** One tool call: announced, put to the session's gate, run only if allowed. */
-  async #tool(step: { tool: string; input?: Record<string, unknown>; output?: string }, opts: TurnOpts, emit: (e: ProviderEvent) => boolean): Promise<void> {
+  async #tool(
+    step: { tool: string; input?: Record<string, unknown>; output?: string },
+    opts: TurnOpts,
+    emit: (e: ProviderEvent) => boolean,
+    signal: AbortSignal,
+  ): Promise<void> {
     const toolId = randomUUID();
     const input = step.input ?? {};
     if (!emit({ type: "tool_start", toolId, sdkToolUseId: toolId, name: step.tool, input, approvalId: `scripted-${toolId}` })) return;
     // Let the session register the call before the gate is asked about it.
     await new Promise<void>((r) => setTimeout(r, 0));
+    if (signal.aborted) return;
     let verdict: Awaited<ReturnType<TurnOpts["canUseTool"]>>;
     try {
-      verdict = await opts.canUseTool(toolId, `scripted-${toolId}`, step.tool, input);
+      // The signal withdraws a pending approval when the turn is stopped.
+      verdict = await opts.canUseTool(toolId, `scripted-${toolId}`, step.tool, input, signal);
     } catch (err) {
       emit({ type: "tool_complete", sdkToolUseId: toolId, output: `gate failed: ${err instanceof Error ? err.message : String(err)}`, success: false });
       return;
     }
+    // Stopped while the gate decided: nothing runs after Stop.
+    if (signal.aborted) return;
     if (verdict.behavior === "deny") {
       emit({ type: "tool_complete", sdkToolUseId: toolId, output: verdict.message ?? "denied", success: false });
       return;
