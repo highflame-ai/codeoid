@@ -670,7 +670,7 @@ const frontends: SettingsTab = {
       id: "web",
       title: "Web",
       fields: [
-        env("CODEOID_FS_BROWSE_ROOT", "File-browser root", "Root directory the web file picker is allowed to browse. Defaults to your home directory.", {}),
+        env("CODEOID_FS_BROWSE_ROOT", "File-browser root", "Bounds the web folder picker and every session workdir to this directory. Unset: the picker browses the whole filesystem (starting at your home directory) and workdirs can be anywhere.", {}),
         cfg("embed.allowedOrigins", "Embed SSO allowed origins", "Parent origins (scheme://host[:port]) permitted to frame the web UI and pre-authenticate it via the URL-hash handoff. Empty = the hash handoff is disabled (safe default).", {
           kind: "string[]",
           envVar: "CODEOID_EMBED_ALLOWED_ORIGINS",
