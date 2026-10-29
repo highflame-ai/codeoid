@@ -59,6 +59,7 @@ import {
   resolveModelIdForProvider,
 } from "./models.js";
 import { Blackboard, type OwnerBlackboard } from "./blackboard/service.js";
+import { launchedAmong } from "./fork-isolation.js";
 import { BlackboardStore, type GoalScope } from "./blackboard/store.js";
 import { BlackboardMcpHttp } from "./blackboard/mcp-http.js";
 import {
@@ -1047,6 +1048,11 @@ mcpHub: this.#mcpHub,
           onStatusChange: this.#statusObserver,
           ...this.#modelHooks,
         });
+        // First, before anything rewrites the meta (a whole-file write that
+        // would drop it) or the backend's first query reads it.
+        session.adoptForkIsolation(meta.forkIsolation);
+        session.adoptReportedBackgroundTasks(meta.reportedBackgroundTasks);
+        session.adoptKnownBackgroundTasks(meta.knownBackgroundTasks);
 
         // Restore scrollback from transcript, seeding the seq counter past
         // the persisted tail so new appends continue the monotonic sequence.
@@ -4901,6 +4907,19 @@ mcpHub: this.#mcpHub,
       }
     }
     const history = (point ? point.history : await parent.fullCanonicalHistory()).map((t) => ({ ...t }));
+    // From an earlier turn: the parent's background launches after that turn
+    // are its own business, not news for the fork's model (they stay foreign).
+    // Only the parent's unfinished work matters, and it is looked for in the
+    // turns after the point (the same read as the point's own history), so
+    // no cap on the launches of a long history can crowd it out.
+    let launchedAfterFork: string[] | undefined;
+    if (point) {
+      const bw = parent.backgroundWork;
+      const settled = new Set(bw.settled);
+      const unfinished = new Set([...bw.live, ...bw.pendingReports, ...(bw.known ?? []).filter((id) => !settled.has(id))]);
+      const before = new Set(launchedAmong(history, unfinished));
+      launchedAfterFork = launchedAmong(point.later, unfinished).filter((id) => !before.has(id));
+    }
     const parentInfo = parent.toInfo();
     let transcriptRows: DaemonMessage[] = [];
     let sizeHints: Array<number | undefined> = [];
@@ -5133,6 +5152,9 @@ mcpHub: this.#mcpHub,
       await fork.primeFromFork(history, transcriptRows, sizeHints, workdirNote, {
         parentContextTokens: parent.lastContextTokens,
         redactedBackings: parent.redactedBackings,
+        // Its background work stays its own: the fork neither adopts nor reports it.
+        parentBackground: parent.backgroundWork,
+        ...(launchedAfterFork ? { launchedAfterFork } : {}),
       });
       // The inherited turns keep their ids, list entries and file snapshots
       // (#354) — and the snapshots survive the parent being destroyed.

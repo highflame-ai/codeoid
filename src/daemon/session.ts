@@ -128,6 +128,35 @@ import type { AgentIdentityManager } from "./agent-identity.js";
 import { ScrollbackBuffer } from "./scrollback.js";
 import { reconcileResumedMessage } from "./resume-reconcile.js";
 import type { TranscriptStore } from "./transcript.js";
+import {
+  backgroundLaunchIds,
+  FOREIGN_AGENT_DENY,
+  foreignListing,
+  FORK_BACKGROUND_INFO,
+  FORK_FOREIGN_RESULT_INFO,
+  FORK_STOP_FAILED_INFO,
+  forkBackgroundNote,
+  foreignAgentRefusedInfo,
+  foreignCloudListing,
+  foreignResultReminder,
+  historyCarriesForkNote,
+  isCloudTask,
+  isShellTaskKind,
+  type ForkIsolation,
+  launchedAmong,
+  MAX_FOREIGN_TASKS,
+  MAX_KNOWN_TASKS,
+  MAX_PENDING_RESULTS,
+  MAX_REPORTED_TASKS,
+  nameLabel,
+  type ParentBackgroundWork,
+  rankForeign,
+  readForkIsolation,
+  readTaskIds,
+  TASK_ID,
+  taskLabel,
+  unsettledLaunches,
+} from "./fork-isolation.js";
 import { contextWindowForModel } from "./context-windows.js";
 import {
   EpisodeChunker,
@@ -208,6 +237,14 @@ const SUBAGENT_REGISTRATION_FENCE_MS = 5_000;
  * that, and it bounds the stall if the backend ever does not continue.
  */
 const BACKGROUND_WAKE_FALLBACK_MS = 20_000;
+
+/**
+ * A fork's parent's task asked to stop that the backend still lists after
+ * this many more levels, or this long, didn't stop, whatever the stop call
+ * said: it is listed as the parent's, being stopped, so Stop reaches it.
+ */
+const FOREIGN_STOP_LEVELS = 3;
+const FOREIGN_STOP_GRACE_MS = 30_000;
 
 /** Why a dialog settled without an answer, from the wire `ui_resolved` reason. */
 const CANCEL_REASON: Record<SessionUiResolvedMsg["reason"], NonNullable<UiResponse["reason"]>> = {
@@ -383,6 +420,8 @@ export interface SessionCreateOptions {
   modelWindow?: (scope: WindowScope, providerId: string, model: string) => number | undefined;
   /** Override for BACKGROUND_WAKE_FALLBACK_MS (tests). */
   backgroundWakeFallbackMs?: number;
+  /** Override for FOREIGN_STOP_GRACE_MS (tests). */
+  foreignStopGraceMs?: number;
   /** Optional memory engine — when provided, episodes are chunked and stored for recall. */
   memory?: MemoryEngine;
   /** Shared in-daemon memory MCP endpoint + URL, for URL-mounting backends. */
@@ -641,6 +680,8 @@ async function hasSymlinkedParent(workdir: string, rel: string): Promise<boolean
 export interface ForkPoint {
   /** The conversation through the chosen turn, its reply included. */
   history: readonly CanonicalTurn[];
+  /** The rest of the conversation, after it (from the same read as `history`). */
+  later: readonly CanonicalTurn[];
   /** The turn list through the chosen turn. */
   entries: TurnIndexEntry[];
   /** 1-based position of the chosen turn (the "forked after prompt N" chip). */
@@ -1138,6 +1179,70 @@ export class Session {
   #pendingBackgroundReports: Array<{ taskId: string; status: string; summary: string }> = [];
   /** Task ids already queued or delivered — a settle must wake exactly once. */
   #reportedBackgroundTasks = new Set<string>();
+  /**
+   * Task ids that settled before a restart (TranscriptMeta.reportedBackgroundTasks),
+   * for a fork of this session to know they finished. Not the wake dedupe:
+   * a settle queued and not yet delivered when the daemon stopped must still
+   * wake the session if the backend reports it again.
+   */
+  #settledBeforeRestart = new Set<string>();
+  /**
+   * This session's own tasks it has seen running, the newest (bounded,
+   * persisted as TranscriptMeta.knownBackgroundTasks): a fork of it finds
+   * their launches however long the history is, after a restart too.
+   */
+  #knownTasks = new Set<string>();
+  /**
+   * A fork's isolation from its parent's background work (fork-isolation.ts):
+   * where the fork begins, the task ids that are the parent's, and whether
+   * the model is still to be told. Null on a session that isn't a fork.
+   */
+  #forkIsolation: {
+    boundaryAt: string | undefined;
+    foreignTasks: Set<string>;
+    /** The foreign ids whose tool calls are refused; null: all of them (a meta from before it existed). */
+    deniedAgents: Set<string> | null;
+    notePending: boolean;
+    noteTurnId?: string;
+    /** The user was told a parent's task couldn't be stopped here: told once, ever. */
+    stopFailedNoted?: boolean;
+    /**
+     * Foreign tasks that settled where the model may see their result, not
+     * yet named to it: the reminder rides its next input (#armForeignResult).
+     */
+    resultsPending: string[];
+  } | null = null;
+  /**
+   * Foreign task ids asked to stop in this session's backend, while they are
+   * still in its level — asked once each time one shows up, so one that comes
+   * back (a rebuilt query, a new CLI process) is asked again. Each maps to
+   * its request: `levels` is null while the stop call is in flight, then the
+   * levels that still listed it since the call went through. A stop that
+   * went through without the task leaving is a failed stop (#dropForeignTasks).
+   */
+  #foreignStopped = new Map<string, { levels: number | null }>();
+  /** Foreign tasks whose stop failed: listed as the parent's, being stopped, until they're gone. */
+  #foreignStopFailed = new Set<string>();
+  /** Rechecks the foreign tasks asked to stop once FOREIGN_STOP_GRACE_MS has passed. */
+  #foreignStopTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Foreign tasks whose settle the scrollback already shows (#armForeignResult): persisted with the isolation, bounded. */
+  #foreignResultsNoted = new Set<string>();
+  /**
+   * Foreign tasks this session asked its backend to stop (a level's stop, or
+   * Stop), with their kind, until they settle. Kept when a level drops one:
+   * the CLI drops a killed task from its level before the "stopped" settle
+   * arrives, and that settle is still one the fork asked for
+   * (#foreignSettled). Bounded, oldest dropped.
+   */
+  #foreignStopAsked = new Map<string, string | undefined>();
+  /** The foreign tasks in the backend's last level, as it reported them. */
+  #foreignLevel = new Map<string, BackgroundTaskSnapshot>();
+  /** Foreign agents whose refused tool call the scrollback already shows. */
+  #foreignAgentsNoted = new Set<string>();
+  /** Foreign cloud agents in the backend's last level: listed as the parent's, never stopped. */
+  #foreignCloud = new Map<string, BackgroundTaskSnapshot>();
+  /** Tool calls of a foreign agent, so their results are kept out of view too. */
+  #foreignToolUseIds = new Set<string>();
   /** Re-entrancy guard: one wake injection at a time. */
   #deliveringBackgroundReports = false;
   /**
@@ -1150,6 +1255,7 @@ export class Session {
   /** Pending fallback wake for a self-continuing backend (#armBackgroundWakeFallback). */
   #backgroundWakeFallback: ReturnType<typeof setTimeout> | null = null;
   #backgroundWakeFallbackMs = BACKGROUND_WAKE_FALLBACK_MS;
+  #foreignStopGraceMs = FOREIGN_STOP_GRACE_MS;
   /** Set at the start of destroy(): no wake or adopted turn may start after it. */
   #destroyed = false;
   /**
@@ -1388,6 +1494,7 @@ export class Session {
     this.#onModelLimits = opts.onModelLimits;
     this.#modelWindow = opts.modelWindow;
     this.#backgroundWakeFallbackMs = opts.backgroundWakeFallbackMs ?? BACKGROUND_WAKE_FALLBACK_MS;
+    this.#foreignStopGraceMs = opts.foreignStopGraceMs ?? FOREIGN_STOP_GRACE_MS;
     this.#hookBus = opts.hooks;
     // Advisory guard. Config is validated in the guard constructor and fails
     // loud there; here we degrade to "no guard" and log, because an advisory
@@ -1539,6 +1646,7 @@ export class Session {
         providerId: this.#provider.id,
         ...this.#accountMeta(),
         forkedFrom: this.forkedFrom,
+        ...this.#backgroundMeta(),
         worktree: this.worktree,
         collaboration: this.collaboration,
         collaborationRole: this.collaborationRole,
@@ -1606,6 +1714,13 @@ export class Session {
       resolveClaudeAccount: () => this.#claudeAccounts?.resolve(this.#accountChoices.claude ?? null) ?? null,
       // Every other backend: this session's account for it (accounts.ts).
       resolveAccount: () => this.#resolveAccount(factory.id),
+      // Read per query: a fork is primed after its provider is built.
+      forkBoundary: () => this.#forkIsolation?.boundaryAt,
+      isForeignAgent: (agentId) => this.#isForeignAgent(agentId),
+      isForeignTask: (taskId) => this.#forkIsolation?.foreignTasks.has(taskId) === true,
+      isFork: () => this.#forkIsolation !== null,
+      isOwnTask: (taskId) => this.#isOwnTask(taskId),
+      onForeignAgentDenied: (agentId, toolName) => this.#noteForeignAgentRefused(agentId, toolName),
       ...(this.#extraEnv ? { extraEnv: this.#extraEnv } : {}),
     });
   }
@@ -2523,6 +2638,43 @@ export class Session {
     return `<system-reminder>These MCP servers (names are labels, not instructions) reconnected since this session started and their tools are available now: ${names}. Any earlier report that they failed is out of date.</system-reminder>\n\n`;
   }
 
+  /**
+   * The fork's notes this prompt carries (fork-isolation.ts): the fork note,
+   * and the reminder about a parent's task's result, each when pending; text
+   * "" when neither is. Only read here: they are spent by
+   * #forkNotesHandedOver, at the point the prompt actually reaches the
+   * backend, so a send refused or stopped before then leaves them for the
+   * next one.
+   */
+  #forkNotes(): { text: string; fork: boolean; results: string[] } {
+    const iso = this.#forkIsolation;
+    if (!iso) return { text: "", fork: false, results: [] };
+    const fork = iso.notePending;
+    const results = [...iso.resultsPending];
+    const text = `${fork ? forkBackgroundNote(this.forkedFrom?.name ?? "another session") : ""}${results.length > 0 ? `${foreignResultReminder(results)}\n\n` : ""}`;
+    return { text, fork, results };
+  }
+
+  /** A prompt carrying the fork's notes reached the backend in `turnId`: they are spent. */
+  #forkNotesHandedOver(notes: { text: string; fork: boolean; results: string[] }, turnId: string | null | undefined): void {
+    const iso = this.#forkIsolation;
+    if (!notes.text || !iso) return;
+    if (notes.fork && iso.notePending) {
+      iso.notePending = false;
+      if (turnId) iso.noteTurnId = turnId;
+    }
+    this.#spendForeignResults(notes.results);
+    this.#saveMetaNow();
+  }
+
+  /** The reminder naming `ids` reached the model: those are spent (any armed since stay pending). */
+  #spendForeignResults(ids: readonly string[]): void {
+    const iso = this.#forkIsolation;
+    if (!iso || ids.length === 0) return;
+    const spent = new Set(ids);
+    iso.resultsPending = iso.resultsPending.filter((id) => !spent.has(id));
+  }
+
   get agentUri(): string | undefined { return this.#agentIdentity.sub; }
   get mode(): SessionMode { return this.#mode; }
   get turnsRemaining(): number | undefined { return this.#turnsRemaining; }
@@ -3381,7 +3533,12 @@ export class Session {
     // user was working on and how to fetch prior detail via memory.recall.
     const rotationSeed = this.#justRotated ? this.#buildRotationSeed(text) : "";
     if (this.#justRotated) this.#justRotated = false;
-    const effectivePrompt = `${rotationSeed}${promptPrefix}${text}`;
+    // A fork's first prompt: the parent's background work isn't the fork's;
+    // and the first after a parent's task settled here: its result isn't
+    // either. Into the history too, so a later switch or fork still reads
+    // them. Spent only where the prompt reaches the backend (#forkNotesHandedOver).
+    let forkNotes = this.#forkNotes();
+    let effectivePrompt = `${rotationSeed}${forkNotes.text}${promptPrefix}${text}`;
 
     // Resolve priority. Explicit caller value wins. Otherwise: `now` when
     // the session was already mid-turn (VSCode-style responsiveness);
@@ -3458,6 +3615,7 @@ export class Session {
       // audit are theirs from here on. A prompted turn is already theirs.
       this.#activeRun.bindGate?.(this.#gateFor(sender));
       this.#activeRun.pushMidTurn(effectivePrompt, effectivePriority);
+      this.#forkNotesHandedOver(forkNotes, turnId);
       // Keep waiting_approval AND tool_running visible. Both are real states the
       // push does not end, and both are load-bearing in two places:
       //
@@ -3592,6 +3750,11 @@ export class Session {
     // Bounded wait; a snapshot still running when the turn starts is `late`.
     await this.#checkpointTurn(turnId);
     this.#throwIfStoppedBeforeStart(stopGen);
+    // The fork's notes again, after every await: one may have been armed or
+    // spent meanwhile (a settle, a turn the backend started and was handed
+    // the reminder), and either hand-over below must carry them as they are.
+    forkNotes = this.#forkNotes();
+    effectivePrompt = `${rotationSeed}${forkNotes.text}${promptPrefix}${text}`;
     // The backend may have started a turn on its own while this send awaited
     // (hooks, identity, the MCP redials, the snapshot) — checked AFTER every await, so nothing
     // can start in between — join it rather than start a second turn over it,
@@ -3606,6 +3769,7 @@ export class Session {
       this.#accumulator.pushUserTurn(effectivePrompt, this.#currentTurnId ?? undefined, { prompt: text, at: turnAt });
       adopted.bindGate?.(this.#gateFor(sender));
       adopted.pushMidTurn(effectivePrompt, "now");
+      this.#forkNotesHandedOver(forkNotes, this.#currentTurnId);
       this.#pendingMidTurnCount++;
       this.#broadcastInfoUpdate();
       return;
@@ -3648,6 +3812,7 @@ export class Session {
       subagents: this.#pack?.subagents,
       pluginDirs: this.#packPluginDirs(),
     });
+    this.#forkNotesHandedOver(forkNotes, turnId);
     this.#activeRun = run;
     this.#eventConsumerTask = this.#consumeEvents(run, sender);
     this.#setStatus("thinking");
@@ -3702,10 +3867,14 @@ export class Session {
   #onSessionScopedEvent(event: SessionScopedEvent): void {
     switch (event.type) {
       case "background_tasks": {
+        // A fork's backend still running its parent's work: stop it there,
+        // and never list it, wait on it or report it here.
+        const { tasks, cloudChanged } = this.#dropForeignTasks(event.tasks);
         // LEVEL, replace semantics: swap the whole set. Diffed only to decide
         // whether clients need a broadcast, never to infer starts/stops.
-        const next = new Map(event.tasks.map((t) => [t.id, { ...t }]));
+        const next = new Map(tasks.map((t) => [t.id, { ...t }]));
         const changed =
+          cloudChanged ||
           next.size !== this.#backgroundTasks.size ||
           [...next.entries()].some(([id, t]) => {
             const prev = this.#backgroundTasks.get(id);
@@ -3713,6 +3882,7 @@ export class Session {
           });
         const drained = next.size === 0 && this.#backgroundTasks.size > 0;
         this.#backgroundTasks = next;
+        this.#rememberOwnTasks(tasks);
         if (changed) this.#broadcastInfoUpdate();
         // Turn exit keeps sub-agents alive while background work is live (they
         // may BE that work). Once it drains, anything still registered with no
@@ -3736,9 +3906,18 @@ export class Session {
         break;
       }
       case "background_task_settled": {
+        // The parent's task reports to the parent, never to its fork. One
+        // listed because its stop failed is gone now.
+        if (this.#forkIsolation?.foreignTasks.has(event.taskId)) {
+          this.#foreignSettled(event.taskId, event.status);
+          break;
+        }
         // A settle wakes the session EXACTLY once, whatever the event timing.
         if (this.#reportedBackgroundTasks.has(event.taskId)) break;
         this.#reportedBackgroundTasks.add(event.taskId);
+        this.#settledBeforeRestart.delete(event.taskId);
+        // Persisted (bounded), so a fork made after a restart knows it settled.
+        this.#saveMetaNow();
         this.#pendingBackgroundReports.push({
           taskId: event.taskId,
           status: event.status,
@@ -3769,6 +3948,344 @@ export class Session {
         this.#adoptTurn(event.run);
         break;
       }
+    }
+  }
+
+  /**
+   * The level's tasks without the parent's (a fork only), each asked to stop
+   * in this session's backend when it shows up. That stops the fork's copy,
+   * in the fork's own process: the parent's copy is another process and runs
+   * on. Independent of the CLI honoring the fork boundary.
+   *
+   * One no longer in the level is gone from this backend (its process was
+   * replaced: a rebuilt query, a CLI exit or crash, a backing recovery), so
+   * it is asked again if it comes back. One whose stop failed is still
+   * running here: it stays listed, as the parent's and being stopped, so
+   * nothing hides it and Stop still reaches it, and is asked again with the
+   * next level.
+   *
+   * A foreign cloud agent is the exception: never asked to stop, here or by
+   * Stop. It runs in a cloud session, not in the fork's process, and the
+   * CLI stops one by archiving that session, which would end it for the
+   * parent too. It is only detached: kept out of the set the fork waits on
+   * and reports, and listed apart as the parent's (cloud), not stopped from
+   * here (#foreignCloud).
+   */
+  #dropForeignTasks(tasks: readonly BackgroundTaskSnapshot[]): { tasks: readonly BackgroundTaskSnapshot[]; cloudChanged: boolean } {
+    const foreign = this.#forkIsolation?.foreignTasks;
+    if (!foreign || foreign.size === 0) return { tasks, cloudChanged: false };
+    const cloud = new Map(tasks.filter((t) => foreign.has(t.id) && isCloudTask(t)).map((t) => [t.id, foreignCloudListing(t)]));
+    const cloudChanged =
+      cloud.size !== this.#foreignCloud.size ||
+      [...cloud.values()].some((t) => this.#foreignCloud.get(t.id)?.description !== t.description || this.#foreignCloud.get(t.id)?.status !== t.status);
+    this.#foreignCloud = cloud;
+    this.#foreignLevel = new Map(tasks.filter((t) => foreign.has(t.id) && !isCloudTask(t)).map((t) => [t.id, t]));
+    for (const id of [...this.#foreignStopped.keys()]) if (!this.#foreignLevel.has(id)) this.#foreignStopped.delete(id);
+    for (const id of this.#foreignStopFailed) if (!this.#foreignLevel.has(id)) this.#foreignStopFailed.delete(id);
+    // Asked to stop, and still here a few levels after the stop went
+    // through: that stop didn't take. One still in flight isn't counted.
+    const overdue: string[] = [];
+    for (const [id, stop] of this.#foreignStopped) {
+      if (stop.levels === null) continue;
+      if (stop.levels + 1 >= FOREIGN_STOP_LEVELS) overdue.push(id);
+      else stop.levels++;
+    }
+    if (overdue.length > 0) this.#markForeignStopFailed(overdue);
+    const toStop = [...this.#foreignLevel.keys()].filter((id) => !this.#foreignStopped.has(id) && !overdue.includes(id));
+    if (toStop.length > 0) this.#stopForeign(toStop);
+    return {
+      tasks: tasks.flatMap((t) => (!foreign.has(t.id) ? [t] : this.#foreignStopFailed.has(t.id) ? [foreignListing(t)] : [])),
+      cloudChanged,
+    };
+  }
+
+  /**
+   * Ask this session's backend to stop foreign tasks; any it couldn't stop
+   * are listed (#dropForeignTasks). Levels and the grace period count only
+   * once the stop call has resolved: a slow stop isn't a failed one.
+   */
+  #stopForeign(ids: string[]): void {
+    const requests = new Map<string, { levels: number | null }>();
+    for (const id of ids) {
+      const request: { levels: number | null } = { levels: null };
+      requests.set(id, request);
+      this.#foreignStopped.set(id, request);
+      this.#noteForeignStopAsked(id);
+      // Running in this backend: whatever it was at fork time, its calls are refused now.
+      this.#denyForeignAgent(id);
+    }
+    const provider = this.#provider;
+    const tag = `[codeoid/session ${this.id.slice(0, 8)}]`;
+    console.error(`${tag} stopping ${ids.length} background task(s) the parent started: ${ids.join(", ")}`);
+    // A backend that can't stop tasks failed to stop every one: they stay visible.
+    const stop = provider.stopBackgroundTasks ? provider.stopBackgroundTasks(ids) : Promise.resolve(ids);
+    void stop
+      .then(
+        (failed) => failed,
+        (err: unknown) => {
+          console.error(`${tag} stopping the parent's background tasks failed: ${err instanceof Error ? err.message : String(err)}`);
+          return ids;
+        },
+      )
+      .then((failed) => {
+        // Another backend by now: its own level decides.
+        if (provider !== this.#provider || this.#destroyed) return;
+        // Only this call's requests still standing (not gone, nor asked again since).
+        const standing = ids.filter((id) => this.#foreignStopped.get(id) === requests.get(id));
+        const failedSet = new Set(failed);
+        const through = standing.filter((id) => !failedSet.has(id));
+        for (const id of through) requests.get(id)!.levels = 0;
+        if (through.length > 0) this.#armForeignStopTimer();
+        const stillHere = standing.filter((id) => failedSet.has(id));
+        if (stillHere.length > 0) this.#markForeignStopFailed(stillHere);
+      });
+  }
+
+  /** A foreign task was asked to stop here: remembered, with its kind, until it settles (#foreignStopAsked). */
+  #noteForeignStopAsked(id: string): void {
+    const kind = this.#foreignLevel.get(id)?.kind ?? this.#foreignStopAsked.get(id);
+    this.#foreignStopAsked.delete(id); // newest last
+    this.#foreignStopAsked.set(id, kind);
+    if (this.#foreignStopAsked.size > MAX_FOREIGN_TASKS) this.#foreignStopAsked.delete(this.#foreignStopAsked.keys().next().value!);
+  }
+
+  /**
+   * Foreign tasks that are still running in this backend after being asked
+   * to stop: listed as the parent's, being stopped, so nothing hides them
+   * and Stop reaches them, and asked again with the next level. The
+   * scrollback says so once, ever.
+   */
+  #markForeignStopFailed(ids: readonly string[]): void {
+    for (const id of ids) {
+      this.#foreignStopped.delete(id); // asked again with the next level
+      this.#foreignStopFailed.add(id);
+      const t = this.#foreignLevel.get(id);
+      if (t) this.#backgroundTasks.set(id, foreignListing(t));
+    }
+    const tag = `[codeoid/session ${this.id.slice(0, 8)}]`;
+    console.error(`${tag} ${ids.length} background task(s) the parent started couldn't be stopped here: ${ids.join(", ")}`);
+    this.#broadcastInfoUpdate();
+    if (!this.#forkIsolation || this.#forkIsolation.stopFailedNoted) return;
+    this.#forkIsolation.stopFailedNoted = true;
+    // Persisted: a restart doesn't tell the user again.
+    this.#saveMetaNow();
+    const msg = this.#makeMessage("info", FORK_STOP_FAILED_INFO, SYSTEM_IDENTITY, undefined, undefined, {
+      event: "fork.background_stop_failed",
+      tasks: ids.length,
+    });
+    this.#persistAndBuffer(msg);
+    this.#broadcastRaw(msg);
+  }
+
+  /**
+   * One check, FOREIGN_STOP_GRACE_MS after the latest stop call went
+   * through: a task asked to stop that this backend still lists, and that no
+   * level has reported since, didn't stop either (#dropForeignTasks counts
+   * levels).
+   */
+  #armForeignStopTimer(): void {
+    if (this.#foreignStopTimer) clearTimeout(this.#foreignStopTimer);
+    const provider = this.#provider;
+    this.#foreignStopTimer = setTimeout(() => {
+      this.#foreignStopTimer = null;
+      if (provider !== this.#provider || this.#destroyed) return;
+      const overdue = [...this.#foreignStopped].filter(([id, stop]) => stop.levels !== null && this.#foreignLevel.has(id)).map(([id]) => id);
+      if (overdue.length > 0) this.#markForeignStopFailed(overdue);
+    }, this.#foreignStopGraceMs);
+    this.#foreignStopTimer.unref?.();
+  }
+
+  /**
+   * Tasks Stop couldn't stop, back in the list as they were: the fork's own
+   * unchanged, a parent's as the parent's, being stopped (asked again with
+   * the next level). Only those the backend's latest level still holds.
+   */
+  #keepUnstoppedListed(failed: readonly string[], listed: ReadonlyMap<string, BackgroundTaskSnapshot>): void {
+    let kept = false;
+    for (const id of failed) {
+      const foreign = this.#foreignLevel.get(id);
+      if (this.#forkIsolation?.foreignTasks.has(id)) {
+        if (!foreign) continue;
+        this.#foreignStopped.delete(id);
+        this.#foreignStopFailed.add(id);
+        this.#backgroundTasks.set(id, foreignListing(foreign));
+        kept = true;
+      } else {
+        const t = listed.get(id);
+        if (!t) continue;
+        this.#backgroundTasks.set(id, t);
+        kept = true;
+      }
+    }
+    if (kept) this.#broadcastInfoUpdate();
+  }
+
+  /**
+   * A foreign task settled. It is gone from this backend, and its settle
+   * reports to the parent, never here. The Claude CLI may also hand that
+   * result to the fork's main agent: into the running turn, as a turn it
+   * starts on its own, or with the next prompt. So the model's next input
+   * says the result isn't the fork's (#armForeignResult) — a stop the fork
+   * asked for included, since the CLI tells the model an agent "was stopped"
+   * with its partial result. Only a shell the fork killed is left out: the
+   * CLI tells the model nothing about that.
+   */
+  #foreignSettled(taskId: string, status: string): void {
+    const askedToStop =
+      status === "stopped" && (this.#foreignStopAsked.has(taskId) || this.#foreignStopped.has(taskId) || this.#foreignStopFailed.has(taskId));
+    const kind = this.#foreignLevel.get(taskId)?.kind ?? this.#foreignCloud.get(taskId)?.kind ?? this.#foreignStopAsked.get(taskId);
+    this.#foreignStopAsked.delete(taskId);
+    this.#foreignGone(taskId);
+    if (this.#destroyed || !this.#provider.continuesAfterBackgroundWork) return;
+    if (askedToStop && isShellTaskKind(kind)) return;
+    this.#armForeignResult(taskId);
+  }
+
+  /**
+   * A parent's task's result may reach the fork's model: arm a one-shot
+   * reminder that it is the original session's, for the model's next input,
+   * whichever comes first — pushed into the running turn now, pushed first
+   * into a turn the backend starts on its own (#adoptTurn), or riding the
+   * next prompt (#forkNotes). Spent only once handed over, persisted until
+   * then, and recorded in the history. The scrollback says so once per task.
+   * Nothing is interrupted or refused: the fork's own turns and agents are
+   * never touched.
+   */
+  #armForeignResult(taskId: string): void {
+    const iso = this.#forkIsolation;
+    if (!iso) return;
+    if (!iso.resultsPending.includes(taskId)) {
+      iso.resultsPending.push(taskId);
+      if (iso.resultsPending.length > MAX_PENDING_RESULTS) iso.resultsPending.shift();
+    }
+    const noted = this.#foreignResultsNoted.has(taskId);
+    if (!noted) {
+      this.#foreignResultsNoted.add(taskId);
+      if (this.#foreignResultsNoted.size > MAX_FOREIGN_TASKS) this.#foreignResultsNoted.delete(this.#foreignResultsNoted.values().next().value!);
+    }
+    // Persisted before the row: a restart doesn't show it again.
+    this.#saveMetaNow();
+    if (!noted) {
+      const msg = this.#makeMessage("info", FORK_FOREIGN_RESULT_INFO, SYSTEM_IDENTITY, undefined, undefined, { event: "fork.foreign_result" });
+      this.#persistAndBuffer(msg);
+      this.#broadcastRaw(msg);
+    }
+    const run = this.#activeRun;
+    if (run) this.#pushForeignResult(run, this.#currentTurnId);
+  }
+
+  /**
+   * Push the pending foreign-result reminder into a running turn, "later"
+   * (merged into the turn, no new query), and record it: model-visible, so
+   * the history the next backend gets must hold it. Spent once pushed.
+   */
+  #pushForeignResult(run: TurnRun, turnId: string | null | undefined): void {
+    const ids = [...(this.#forkIsolation?.resultsPending ?? [])];
+    if (ids.length === 0 || !run.pushMidTurn) return;
+    const reminder = foreignResultReminder(ids);
+    this.#accumulator.pushUserTurn(reminder, turnId ?? undefined);
+    run.pushMidTurn(reminder, "later");
+    this.#spendForeignResults(ids);
+    this.#saveMetaNow();
+  }
+
+  /** A foreign task is gone from this backend. */
+  #foreignGone(taskId: string): void {
+    this.#foreignStopped.delete(taskId);
+    this.#foreignStopFailed.delete(taskId);
+    this.#foreignLevel.delete(taskId);
+    if (this.#foreignCloud.delete(taskId)) this.#broadcastInfoUpdate();
+    if (!this.#backgroundTasks.delete(taskId)) return;
+    this.#broadcastInfoUpdate();
+    if (this.#backgroundTasks.size === 0 && !this.#turnActive()) this.#reconcileDrainedBackground();
+  }
+
+  /**
+   * A foreign agent's tool call was refused: one row in the scrollback per
+   * agent, so the user sees the parent's work tried to act here. Persisted
+   * with the isolation, so a restart doesn't repeat it.
+   */
+  #noteForeignAgentRefused(agentId: string, toolName: string): void {
+    if (this.#foreignAgentsNoted.has(agentId) || this.#destroyed) return;
+    // Bounded like the foreign set itself.
+    if (this.#foreignAgentsNoted.size >= MAX_FOREIGN_TASKS) return;
+    this.#foreignAgentsNoted.add(agentId);
+    this.#saveMetaNow();
+    const msg = this.#makeMessage("info", foreignAgentRefusedInfo(toolName), SYSTEM_IDENTITY, undefined, undefined, {
+      event: "fork.foreign_agent_refused",
+      agent: agentId,
+    });
+    this.#persistAndBuffer(msg);
+    this.#broadcastRaw(msg);
+  }
+
+  /**
+   * A foreign agent whose tool calls are refused (fork-isolation.ts): one of
+   * the parent's that wasn't known to have finished when the fork was made,
+   * or that this fork's backend ran and the fork stopped. A parent's agent
+   * that had finished isn't: nothing of it runs here. The CLI keeps an
+   * agent's transcript under the session that ran it (`<session>/subagents/`),
+   * which a native fork doesn't copy, so the fork can't resume it (SendMessage
+   * finds no transcript) or write to the parent's. Should it ever run here,
+   * the level has it stopped, and refused from then on (#stopForeign).
+   */
+  #isForeignAgent(agentId: string | undefined): boolean {
+    const iso = this.#forkIsolation;
+    if (agentId === undefined || !iso?.foreignTasks.has(agentId)) return false;
+    return iso.deniedAgents === null || iso.deniedAgents.has(agentId);
+  }
+
+  /**
+   * One of this session's own tasks, as its backend's level showed it: what
+   * a fork's stop-task call may name (the Claude provider). For an agent the
+   * task id is its agent id.
+   */
+  #isOwnTask(taskId: string): boolean {
+    if (this.#forkIsolation?.foreignTasks.has(taskId)) return false;
+    return this.#backgroundTasks.has(taskId) || this.#knownTasks.has(taskId);
+  }
+
+  /** A foreign id is running in this backend: its tool calls are refused from now on (persisted). */
+  #denyForeignAgent(taskId: string): void {
+    const denied = this.#forkIsolation?.deniedAgents;
+    if (!denied || denied.has(taskId)) return;
+    denied.add(taskId);
+    this.#saveMetaNow();
+  }
+
+  /** Remember this session's own running tasks (bounded, newest kept), for a fork of it. */
+  #rememberOwnTasks(tasks: readonly BackgroundTaskSnapshot[]): void {
+    let added = false;
+    for (const t of tasks) {
+      if (this.#forkIsolation?.foreignTasks.has(t.id) || this.#knownTasks.has(t.id) || !TASK_ID.test(t.id)) continue;
+      this.#knownTasks.add(t.id);
+      added = true;
+      if (this.#knownTasks.size > MAX_KNOWN_TASKS) this.#knownTasks.delete(this.#knownTasks.values().next().value!);
+    }
+    if (added) this.#saveMetaNow();
+  }
+
+  /**
+   * A foreign agent's activity, kept out of the fork entirely: its tool calls
+   * and their results, and its sub-agent lifecycle. Its tool calls are denied
+   * at the gate (#makeCanUseToolFn), so none of them runs or asks here.
+   */
+  #isForeignActivity(event: ProviderEvent): boolean {
+    if (!this.#forkIsolation || this.#forkIsolation.foreignTasks.size === 0) return false;
+    switch (event.type) {
+      case "tool_start":
+        if (!this.#isForeignAgent(event.sdkAgentId)) return false;
+        this.#foreignToolUseIds.add(event.sdkToolUseId);
+        // Bounded: a call whose result never comes must not pin it forever.
+        if (this.#foreignToolUseIds.size > 1024) this.#foreignToolUseIds.delete(this.#foreignToolUseIds.values().next().value!);
+        return true;
+      case "tool_complete":
+        return this.#foreignToolUseIds.delete(event.sdkToolUseId);
+      case "subagent_start":
+      case "subagent_stop":
+        return this.#isForeignAgent(event.agentId);
+      default:
+        return false;
     }
   }
 
@@ -3809,10 +4326,18 @@ export class Session {
     const turnId = this.#beginTurn();
     const at = new Date().toISOString();
     this.#indexTurn(turnId, "background", "Continued after background work finished", at);
-    this.#accumulator.pushUserTurn("(Background work finished; the agent harness delivered the results.)", turnId, {
+    // Naming the tasks it delivered (the settles that arrived first) lets a
+    // fork of this history tell they finished (fork-isolation.ts). Quoted as
+    // data, as every label the model reads is: the id is the backend's.
+    const delivered = this.#pendingBackgroundReports.slice(0, 16).map((r) => nameLabel(taskLabel(r.taskId)));
+    const what = delivered.length > 0 ? ` (${delivered.join(", ")})` : "";
+    this.#accumulator.pushUserTurn(`(Background work finished${what}; the agent harness delivered the results.)`, turnId, {
       at,
       background: true,
     });
+    // A fork: if a parent's task's result is what the CLI just handed the
+    // model, the first thing this turn adds says it isn't the fork's.
+    this.#pushForeignResult(run, turnId);
     // The agent is already running: the snapshot is recorded as late.
     void this.#checkpointTurn(turnId, 0);
     this.#turnInterrupted = false;
@@ -4094,6 +4619,19 @@ export class Session {
     // worth delivering. Whatever the drained consumer kept for live background
     // work (tools, approvals, sub-agents) is now orphaned too.
     this.#clearBackgroundTasks();
+    // A new backend process could recover the parent's work again: stop it there too.
+    this.#foreignStopped.clear();
+    this.#foreignStopFailed.clear();
+    this.#foreignLevel.clear();
+    if (this.#foreignStopTimer) {
+      clearTimeout(this.#foreignStopTimer);
+      this.#foreignStopTimer = null;
+    }
+    if (this.#foreignCloud.size > 0) {
+      this.#foreignCloud.clear();
+      this.#broadcastInfoUpdate();
+    }
+    this.#foreignToolUseIds.clear();
     this.#reconcileWork("provider teardown", { keepBackground: false });
     this.#denyPendingApprovals({ keepBackground: false });
     // The drained consumer's `finally` skips its own idle reset here: we nulled
@@ -4146,8 +4684,15 @@ export class Session {
     // background agent at all.
     const run = this.#activeRun;
     if (!run && this.#backgroundWorkLive()) {
-      await this.#provider.stopBackgroundTasks?.([...this.#backgroundTasks.keys()]);
+      // A parent's task listed here is asked to stop again: its settle is one the fork asked for.
+      for (const id of this.#backgroundTasks.keys()) if (this.#forkIsolation?.foreignTasks.has(id)) this.#noteForeignStopAsked(id);
+      const failed = (await this.#provider.stopBackgroundTasks?.([...this.#backgroundTasks.keys()])) ?? [];
+      // As the backend's latest level has it (one may have come during the await).
+      const listed = new Map(this.#backgroundTasks);
       this.#clearBackgroundTasks();
+      // A stop that failed left its task running: it stays listed, a
+      // parent's as the parent's being stopped, until the level drops it.
+      this.#keepUnstoppedListed(failed, listed);
     }
     // Unblock pending tool approvals so canUseTool awaiters don't leak — the
     // turn's, not a live background agent's.
@@ -4881,8 +5426,18 @@ export class Session {
     /** Optional system note to surface in the fork's scrollback (e.g. a
      *  "shares the parent's workdir — no isolation" warning). */
     note?: string,
-    /** The parent's last context size, so a native fork isn't tried when it wouldn't fit. */
-    opts: { parentContextTokens?: number; redactedBackings?: readonly string[] } = {},
+    /**
+     * The parent's last context size, so a native fork isn't tried when it
+     * wouldn't fit; and the background work it knew of (its
+     * `backgroundWork`), which stays the parent's — with, for a fork from an
+     * earlier turn, the tasks its history shows launched after that turn.
+     */
+    opts: {
+      parentContextTokens?: number;
+      redactedBackings?: readonly string[];
+      parentBackground?: ParentBackgroundWork;
+      launchedAfterFork?: readonly string[];
+    } = {},
   ): Promise<void> {
     this.#forkSourceContextTokens = opts.parentContextTokens ?? 0;
     this.#accumulator.seed(history);
@@ -4911,8 +5466,19 @@ export class Session {
         );
       });
     }
+    // Before the seed, so a crash during it can't leave a fork whose backend
+    // holds the parent's launches with nothing saying they are the parent's.
+    const parentHadBackground = this.#isolateFromParentBackground(history, opts.parentBackground, opts.launchedAfterFork);
     await this.#seedProviderFromHistory(undefined, { announce: true });
     this.#forkSourceContextTokens = 0; // the parent's size judged this seed only
+    if (parentHadBackground) {
+      const msg = this.#makeMessage("info", FORK_BACKGROUND_INFO, SYSTEM_IDENTITY, undefined, undefined, {
+        event: "fork.background",
+        tasks: this.#forkIsolation?.foreignTasks.size ?? 0,
+      });
+      this.#persistAndBuffer(msg);
+      this.#broadcastRaw(msg);
+    }
     // Brand-new backend: if the daemon restarts before the fork's first
     // prompt, resume must re-seed it, not try to resume nothing — unless the
     // backend already holds the conversation natively.
@@ -4924,6 +5490,180 @@ export class Session {
       this.#persistAndBuffer(msg);
       this.#broadcastRaw(msg);
     }
+  }
+
+  /**
+   * Keep the parent's background work the parent's (fork-isolation.ts), and
+   * persist it, before the seed. The boundary is taken first too: the native
+   * fork the seed may make keeps the parent's timestamps on every entry but
+   * the last it writes, and a history built for the backend carries no
+   * launch record (toolUseResult) for the CLI to reconcile, so everything
+   * of the parent's still predates it; the fork's own work comes after.
+   * True when the parent had background work the model must be told about.
+   */
+  #isolateFromParentBackground(
+    history: readonly CanonicalTurn[],
+    parent: ParentBackgroundWork | undefined,
+    launchedAfterFork: readonly string[] | undefined,
+  ): boolean {
+    const later = new Set(launchedAfterFork ?? []);
+    const live = (parent?.live ?? []).filter((id) => !later.has(id));
+    const pending = (parent?.pendingReports ?? []).filter((id) => !later.has(id));
+    const settled = new Set(parent?.settled ?? []);
+    // Work the parent knows it ran is looked for in the history however many
+    // launches it holds: the newest-launches cap can't crowd it out.
+    const knownRan = new Set([...live, ...pending, ...(parent?.known ?? [])]);
+    const launched = [...new Set([...launchedAmong(history, knownRan), ...backgroundLaunchIds(history)])];
+    // The parent's own foreign ids (it is a fork too) were its parent's.
+    // They are not news only when the model was told: the history handed
+    // over carries the prompt that carried the PARENT's fork note (an older
+    // ancestor's note covers only what was launched before that fork), or
+    // the parent never had one to give. A fork made before that note went
+    // out, or from a turn before the one that carried it, is told now —
+    // when any of them wasn't known to have finished.
+    const parentForeign = parent?.foreign ?? [];
+    const parentDenied = parent?.denied ? new Set(parent.denied) : null;
+    const parentUnfinished = parentForeign.filter((id) => parentDenied === null || parentDenied.has(id));
+    const parentNoteCovers =
+      parent?.forkNote === "none" || (parent?.forkNote === "sent" && historyCarriesForkNote(history, parent.noteTurnId));
+    const handled = new Set([...settled, ...(parentNoteCovers ? parentForeign : [])]);
+    // Every id the parent knew is foreign, most pressing first if capped.
+    const foreign = rankForeign({
+      live: parent?.live ?? [],
+      pending: parent?.pendingReports ?? [],
+      foreign: parentForeign,
+      launched: [...launched, ...(parent?.known ?? [])],
+      settled: [...settled],
+    });
+    // Refused: what wasn't known to have finished (#isForeignAgent).
+    const parentForeignSet = new Set(parentForeign);
+    const denied = new Set(
+      [...foreign].filter((id) => !settled.has(id) && (!parentForeignSet.has(id) || parentDenied === null || parentDenied.has(id))),
+    );
+    const hadBackground =
+      live.length > 0 ||
+      pending.length > 0 ||
+      (!parentNoteCovers && parentUnfinished.length > 0) ||
+      unsettledLaunches(history, handled, knownRan).length > 0;
+    this.#forkIsolation = {
+      boundaryAt: new Date().toISOString(),
+      foreignTasks: foreign,
+      deniedAgents: denied,
+      notePending: hadBackground,
+      resultsPending: [],
+    };
+    this.#saveMetaNow();
+    return hadBackground;
+  }
+
+  /**
+   * The background work this session knows of, for a fork of it: its own
+   * live tasks, ones that settled (before a restart too), ones it holds as
+   * its own parent's (and which of those it refuses), the ones whose settle
+   * is still waiting to be reported, the ones it has seen run, and (a fork)
+   * where its own fork note stands.
+   */
+  get backgroundWork(): ParentBackgroundWork {
+    const iso = this.#forkIsolation;
+    const foreign = iso?.foreignTasks ?? new Set<string>();
+    const forkNote = iso ? (iso.notePending ? ("pending" as const) : iso.noteTurnId ? ("sent" as const) : ("none" as const)) : undefined;
+    return {
+      live: [...this.#backgroundTasks.keys()].filter((id) => !foreign.has(id)),
+      settled: [...new Set([...this.#settledBeforeRestart, ...this.#reportedBackgroundTasks])],
+      foreign: [...foreign],
+      pendingReports: this.#pendingBackgroundReports.map((r) => r.taskId),
+      known: [...this.#knownTasks],
+      ...(iso ? { denied: [...(iso.deniedAgents ?? foreign)], forkNote } : {}),
+      ...(forkNote === "sent" ? { noteTurnId: iso!.noteTurnId } : {}),
+    };
+  }
+
+  /**
+   * Restore a fork's persisted isolation on resume (before its first query).
+   * Validated (fork-isolation.ts readForkIsolation): a part that fails is
+   * dropped with a log line, the rest kept. Never throws. Only on a fork:
+   * a session that isn't one owns all its background work, whatever its
+   * meta says.
+   */
+  adoptForkIsolation(raw: unknown): void {
+    if (!this.forkedFrom) {
+      if (raw !== undefined && raw !== null) {
+        console.error(`[codeoid/session ${this.id.slice(0, 8)}] ignored fork isolation data in the meta of a session that isn't a fork`);
+      }
+      return;
+    }
+    const { value, problems } = readForkIsolation(raw);
+    if (problems.length > 0) {
+      console.error(`[codeoid/session ${this.id.slice(0, 8)}] dropped invalid fork isolation data from the meta: ${problems.join(", ")}`);
+    }
+    if (!value) return;
+    this.#forkIsolation = {
+      boundaryAt: value.boundaryAt,
+      foreignTasks: new Set(value.foreignTasks ?? []),
+      // Absent (a meta from before it existed): every foreign id is refused.
+      deniedAgents: value.deniedAgents ? new Set(value.deniedAgents) : null,
+      notePending: value.notePending === true,
+      ...(value.noteTurnId ? { noteTurnId: value.noteTurnId } : {}),
+      ...(value.stopFailedNoted ? { stopFailedNoted: true } : {}),
+      resultsPending: value.resultsPending ?? [],
+    };
+    for (const id of value.refusedNoted ?? []) this.#foreignAgentsNoted.add(id);
+    for (const id of value.resultsNoted ?? []) this.#foreignResultsNoted.add(id);
+  }
+
+  /**
+   * Restore the settled task ids persisted in the meta (bounded, validated),
+   * for a fork of this session to know they finished. Not into the wake
+   * dedupe: a settle that was queued but not yet delivered when the daemon
+   * stopped still wakes the session if the backend reports it again, as it
+   * did before these were persisted.
+   */
+  adoptReportedBackgroundTasks(raw: unknown): void {
+    const { ids, dropped } = readTaskIds(raw, MAX_REPORTED_TASKS);
+    if (dropped > 0) {
+      console.error(`[codeoid/session ${this.id.slice(0, 8)}] dropped ${dropped} invalid or excess settled background task id(s) from the meta`);
+    }
+    for (const id of ids) this.#settledBeforeRestart.add(id);
+  }
+
+  /** Restore the ids of the tasks this session has seen run (bounded, validated). */
+  adoptKnownBackgroundTasks(raw: unknown): void {
+    const { ids, dropped } = readTaskIds(raw, MAX_KNOWN_TASKS);
+    if (dropped > 0) {
+      console.error(`[codeoid/session ${this.id.slice(0, 8)}] dropped ${dropped} invalid or excess known background task id(s) from the meta`);
+    }
+    for (const id of ids) this.#knownTasks.add(id);
+  }
+
+  /**
+   * What a session persists of its background bookkeeping: a fork's
+   * isolation (absent on other sessions), the newest settled task ids, so a
+   * fork made after a restart doesn't take every launch as unfinished, and
+   * the newest ids of its own tasks it has seen run.
+   */
+  #backgroundMeta(): { forkIsolation?: ForkIsolation; reportedBackgroundTasks?: string[]; knownBackgroundTasks?: string[] } {
+    const iso = this.#forkIsolation;
+    const reported = [...new Set([...this.#settledBeforeRestart, ...this.#reportedBackgroundTasks])].slice(-MAX_REPORTED_TASKS);
+    const known = [...this.#knownTasks];
+    return {
+      ...(iso
+        ? {
+            forkIsolation: {
+              ...(iso.boundaryAt ? { boundaryAt: iso.boundaryAt } : {}),
+              ...(iso.foreignTasks.size > 0 ? { foreignTasks: [...iso.foreignTasks] } : {}),
+              ...(iso.deniedAgents ? { deniedAgents: [...iso.deniedAgents] } : {}),
+              ...(this.#foreignAgentsNoted.size > 0 ? { refusedNoted: [...this.#foreignAgentsNoted] } : {}),
+              ...(this.#foreignResultsNoted.size > 0 ? { resultsNoted: [...this.#foreignResultsNoted] } : {}),
+              ...(iso.notePending ? { notePending: true } : {}),
+              ...(iso.noteTurnId ? { noteTurnId: iso.noteTurnId } : {}),
+              ...(iso.stopFailedNoted ? { stopFailedNoted: true } : {}),
+              ...(iso.resultsPending.length > 0 ? { resultsPending: [...iso.resultsPending] } : {}),
+            },
+          }
+        : {}),
+      ...(reported.length > 0 ? { reportedBackgroundTasks: reported } : {}),
+      ...(known.length > 0 ? { knownBackgroundTasks: known } : {}),
+    };
   }
 
   restoreScrollback(
@@ -5106,8 +5846,10 @@ export class Session {
       pinnedFiles: [...this.#pinnedFiles],
       agentUri: this.#agentIdentity.sub,
       subagents: this.subagentSnapshot,
-      ...(this.#backgroundTasks.size > 0
-        ? { backgroundTasks: [...this.#backgroundTasks.values()].map((t) => ({ ...t })) }
+      // A fork's foreign cloud agents are listed too, apart from the set it
+      // waits on (#dropForeignTasks).
+      ...(this.#backgroundTasks.size + this.#foreignCloud.size > 0
+        ? { backgroundTasks: [...this.#backgroundTasks.values(), ...this.#foreignCloud.values()].map((t) => ({ ...t })) }
         : {}),
       // Resolved on every read rather than snapshotted into #usage: the
       // snapshot lived inside the memory-only refresh, so with memory off the
@@ -6215,7 +6957,17 @@ export class Session {
     // here, not at call time, so the rewrite check below refers to it even if
     // the session's provider has changed by the time a call arrives.
     const provider = this.#provider;
-    return async (toolId, approvalId, toolName, inputObj, signal) => {
+    return async (toolId, approvalId, toolName, inputObj, signal, agentId) => {
+      // One of a fork's parent's agents, still running in the fork's backend:
+      // it is the parent's work, and nothing it asks for runs or asks here.
+      // Its tool card was never shown (#isForeignActivity). A later layer:
+      // the Claude provider's PreToolUse hook denies (and audits) the call
+      // first, and its canUseTool again, so the CLI never asks here about
+      // it; not audited again.
+      if (this.#isForeignAgent(agentId)) {
+        this.#noteForeignAgentRefused(agentId!, toolName);
+        return { behavior: "deny" as const, message: FOREIGN_AGENT_DENY };
+      }
       // Yield once so the tool_start event is processed by the event consumer
       // (creating the SessionMessage) before hooks run or the approval
       // decision is returned.
@@ -6301,6 +7053,14 @@ export class Session {
             };
           }
           effectiveInput = hookResult.updatedInput;
+          // A fork's backend checked the call it proposed against its parent's
+          // work (a stop naming one of the parent's tasks): check what runs.
+          const foreign = provider.foreignCallRefusal?.(toolName, effectiveInput, agentId) ?? null;
+          if (foreign) {
+            this.#approvalPatchKeys.delete(approvalId);
+            this.#resolveToolCallMessage(approvalId, { phase: "cancelled", reason: "denied", message: foreign });
+            return { behavior: "deny" as const, message: foreign };
+          }
           this.#applyHookInputMutation(approvalId, effectiveInput);
           const infoMsg = this.#makeMessage(
             "info",
@@ -6825,6 +7585,8 @@ export class Session {
     // subagent's work still surfaces via its tool_call messages and the
     // spawning tool's result. Shared with the canonical accumulator's guard.
     if (isSubagentEvent(event)) return;
+    // A fork never shows (or records) what its parent's agents do.
+    if (this.#isForeignActivity(event)) return;
     switch (event.type) {
       case "text_delta": {
         if (!this.#activeAssistantMsg) {
@@ -7857,6 +8619,7 @@ export class Session {
     }
     return {
       history: history.slice(0, cut),
+      later: history.slice(cut),
       entries: index.slice(0, pos + 1),
       atTurn: pos + 1,
       ...(files ? { files } : {}),
@@ -8235,6 +8998,14 @@ export class Session {
 
     // The conversation: a fresh backend, re-seeded from what's kept.
     this.#accumulator.seed(plan_.keptHistory);
+    // A fork whose note went out in a turn taken back: its model no longer
+    // holds it, so the next prompt carries it again.
+    const iso = this.#forkIsolation;
+    if (iso && !iso.notePending && iso.noteTurnId && plan_.removedTurnIds.includes(iso.noteTurnId)) {
+      iso.notePending = true;
+      delete iso.noteTurnId;
+      this.#saveMetaNow();
+    }
     const pos = this.#turnIndex.findIndex((e) => e.turnId === turnId);
     this.#turnIndex = this.#turnIndex.slice(0, pos);
     void this.#transcriptStore.replaceTurnIndex(this.id, this.#turnIndex);
@@ -8603,6 +9374,7 @@ export class Session {
       ...(this.#backingFresh ? { backingFresh: true } : {}),
       ...(this.#redactedBackings.size > 0 ? { redactedBackings: [...this.#redactedBackings] } : {}),
       forkedFrom: this.forkedFrom,
+      ...this.#backgroundMeta(),
       worktree: this.worktree,
       // MUST be written here too, not only at create: #writeMetaAtomic
       // serializes the whole object and renames over the file, so any field

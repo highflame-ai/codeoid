@@ -97,6 +97,35 @@ export interface ProviderSessionInit {
    * has no effect there.
    */
   extraEnv?: Readonly<Record<string, string>>;
+  /**
+   * When this session is a fork, the moment it began (ISO; fork-isolation.ts),
+   * read each time the backend is started. Background work recorded before it
+   * is the parent's. Claude only (CLAUDE_CODE_RESUME_SOURCE_ALIVE).
+   */
+  forkBoundary?: () => string | undefined;
+  /**
+   * When this session is a fork: whether an agent id is one of its parent's
+   * agents (fork-isolation.ts), read on every tool call. Claude only: its
+   * PreToolUse hook denies such an agent's every call, the ones the CLI
+   * approves itself included.
+   */
+  isForeignAgent?: (agentId: string) => boolean;
+  /**
+   * When this session is a fork: whether a task id is one of its parent's
+   * (fork-isolation.ts). Claude only: a native fork's copy of the parent's
+   * cloud-agent registrations is cleared by it.
+   */
+  isForeignTask?: (taskId: string) => boolean;
+  /** Whether this session is a fork (fork-isolation.ts), read on every tool call. */
+  isFork?: () => boolean;
+  /**
+   * Whether a task id is one of this session's own, as its level showed it
+   * (Session#isOwnTask). Claude only: on a fork a stop-task call may name
+   * only one of these, or a teammate of its own team.
+   */
+  isOwnTask?: (taskId: string) => boolean;
+  /** One of the parent's agents had a tool call denied (for the scrollback; the provider audits it). */
+  onForeignAgentDenied?: (agentId: string, toolName: string) => void;
 }
 
 /** An HTTP backend's key from the session's account (accounts.ts), or null for the daemon's own. */
@@ -387,6 +416,12 @@ export function createDefaultProviderRegistry(
         onModels: init.onModels,
         resolveAccount: init.resolveClaudeAccount,
         extraEnv: init.extraEnv,
+        forkBoundary: init.forkBoundary,
+        isForeignAgent: init.isForeignAgent,
+        isForeignTask: init.isForeignTask,
+        isFork: init.isFork,
+        isOwnTask: init.isOwnTask,
+        onForeignAgentDenied: init.onForeignAgentDenied,
       }),
   });
   // Stateless API backends: usable only with a key — in the environment (the

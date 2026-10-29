@@ -126,6 +126,21 @@ At the start of each turn the working directory is snapshotted into a daemon-own
 The backend-neutral canonical history is persisted per session (`<id>.canonical.jsonl`) so forks, backend switches and stateless backends keep the conversation across a daemon restart.
 It is the source of truth, and it doesn't depend on a provider's native session.
 What a backend is handed on a fork, switch or rewind is chosen by `Session.#seedProviderFromHistory` (#387): `continueNatively` first — Claude and Codex fork their own conversation at the turn's recorded `native` point (stamped on each canonical assistant turn from `NormalizedTurnResult.nativeRef`), or take native history built from the canonical turns — then the transcript seed as the fallback.
+A fork never takes over the background work its parent started (`src/daemon/fork-isolation.ts`).
+`Session.primeFromFork` records a boundary (an ISO time taken before the seed) and the parent's task ids as foreign, both persisted in the meta's `forkIsolation` before the seed runs and validated when read back.
+The Claude provider sets `CLAUDE_CODE_RESUME_SOURCE_ALIVE` to that boundary on a fork's queries, and removes any inherited value from every other session's, so the CLI's resume reconciliation ignores launches recorded before it.
+The CLI keeps cloud-agent registrations in a sidecar (`<project>/<session>/remote-agents/`), not the JSONL; `continueNatively` clears a fork's native copy of the parent's before it is resumed (`clearInheritedRemoteAgents`), and refuses the copy (removing its JSONL) on a symlink, an id that isn't the fork's, or any error but a missing dir.
+A foreign task the fork's backend still reports is stopped there and never woken on; one whose stop fails, or that is still listed three levels or 30s after its stop call resolved, stays listed as the parent's, being stopped, until it's gone.
+A foreign settle arms a one-shot reminder (`Session#armForeignResult`, persisted as `forkIsolation.resultsPending`) that the result is the original session's, since the CLI may hand it to the fork's model; it rides the model's next input: pushed into a running turn, pushed first into a turn the backend starts on its own (`#adoptTurn`), or prefixed to the next prompt as the fork note is, and it is recorded in the canonical history.
+Nothing is interrupted or refused for a foreign result, and a background shell the fork killed arms nothing (the CLI doesn't tell the model).
+A kill is recognized from `#foreignStopAsked` (kept until the settle), since the CLI drops a killed task from its level before the "stopped" settle arrives.
+`Session#send` reads the fork's notes again after its last await, so the note and the reminder each reach the model once, whether the prompt starts a turn or joins one the backend started meanwhile.
+The Claude provider clears `#lastPushedContent` when it adopts a turn, so no recovery re-sends an earlier prompt into a turn nobody prompted.
+Foreign ids not known to have finished (`deniedAgents`) have their tool calls denied first in the Claude provider's PreToolUse hook (`isForeignAgent`, fail-closed, audited at most once a minute per agent), again in its `canUseTool` and at the session's gate (`ToolApprovalFn`'s `agentId`), and their activity is never shown.
+On a fork a stop-task call (TaskStop, KillShell, KillBash) is allowed only for the fork's own task or agent ids (`isOwnTask`) or a teammate of its own team; teammates of another team are denied, and every teammate is when `CLAUDE_INTERNAL_ASSISTANT_TEAM_NAME` is set (team handling is best effort, likely inert under the SDK).
+A target with whitespace around it is refused, never trimmed (`stopTaskTarget`), and the session's gate runs the provider's verdict again (`SessionProvider.foreignCallRefusal`) on an input a codeoid hook rewrote.
+A foreign cloud agent (`remote_agent`) is never stopped from a fork, since stopping it archives the shared cloud session; it is only listed as the parent's.
+The fork's first prompt carries a one-shot note when the parent had unfinished background work; it is spent only when the prompt reaches the backend, and a rewind past it re-arms it.
 
 ### Device Handoff
 Sessions live in the daemon. Clients are stateless.

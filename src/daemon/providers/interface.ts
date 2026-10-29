@@ -52,6 +52,12 @@ export type ToolApprovalFn = (
    * waiting on an answer nobody will read.
    */
   signal?: AbortSignal,
+  /**
+   * The agent that asked, when it isn't the session's main agent (Claude: the
+   * SDK's `agentID`, which for a background agent is its task id). Lets the
+   * gate refuse an agent that isn't this session's (a fork's parent's).
+   */
+  agentId?: string,
 ) => Promise<{
   behavior: "allow" | "deny";
   updatedInput?: Record<string, unknown>;
@@ -739,9 +745,17 @@ export interface SessionProvider extends AgentProvider {
    * Stop background tasks by id (the ids of the `background_tasks` level).
    * What Stop does when no turn is in flight: without it, nobody holding only
    * `session:interrupt` could halt a misbehaving background agent. Optional —
-   * a backend with no background work never has any to stop.
+   * a backend with no background work never has any to stop. Resolves to
+   * the ids it couldn't stop (still running), [] when every stop went through.
    */
-  stopBackgroundTasks?(taskIds: readonly string[]): Promise<void>;
+  stopBackgroundTasks?(taskIds: readonly string[]): Promise<string[]>;
+  /**
+   * On a fork, why a tool call is its parent's work and is refused, or null:
+   * the backend's own check (the Claude provider's), run again by Session on
+   * an input a codeoid hook rewrote, since the backend checked the input it
+   * proposed. Absent on a backend with no such check.
+   */
+  foreignCallRefusal?(toolName: string, input: unknown, agentId: string | undefined): string | null;
   /** Underlying backing session ID (for display and Store persistence). */
   readonly backingSessionId: string;
   /** True once runTurn() has been called at least once (guards agent registration). */

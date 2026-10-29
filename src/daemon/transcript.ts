@@ -18,6 +18,7 @@ import { appendFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { CanonicalHistoryChange, CanonicalToolCall, CanonicalTurn } from "./providers/canonical.js";
 import type { TurnSummary } from "../protocol/types.js";
+import type { ForkIsolation } from "./fork-isolation.js";
 
 /** One turn in a session's turn index (#354): what `session.turns` lists. */
 export type TurnIndexEntry = Pick<TurnSummary, "turnId" | "kind" | "preview" | "startedAt">;
@@ -183,6 +184,24 @@ export interface TranscriptMeta {
   redactedBackings?: string[];
   /** Fork lineage (session.fork). Absent = not a fork. */
   forkedFrom?: { sessionId: string; name: string; atTurn: number };
+  /**
+   * A fork's boundary and the parent's task ids (fork-isolation.ts), so the
+   * parent's background work stays the parent's across a restart. Validated
+   * on load (readForkIsolation): it is read back from a file.
+   */
+  forkIsolation?: ForkIsolation;
+  /**
+   * The newest background task ids whose settle this session queued or
+   * delivered (bounded), so a fork made after a restart doesn't take each of
+   * their launches as still running. Validated on load.
+   */
+  reportedBackgroundTasks?: string[];
+  /**
+   * The newest ids of this session's own background tasks it has seen
+   * running (bounded), so a fork made after a restart (which empties the
+   * live set) still finds their launches. Validated on load.
+   */
+  knownBackgroundTasks?: string[];
   /** Git worktree backing workdir (fork isolation / bind). Absent = shared. */
   worktree?: SessionWorktree;
   /**
