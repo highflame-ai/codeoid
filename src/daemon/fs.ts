@@ -445,6 +445,8 @@ export async function handleFsBrowseDir(
   try {
     // A symlink may lead into a refused dir.
     if (browseRefused(resolved)) throw unavailable();
+    // Checked, not left to opendir: Bun 1.3 opens a plain file without ENOTDIR.
+    if (!(await fs.stat(resolved)).isDirectory()) throw unavailable();
     dir = await fs.opendir(resolved);
   } catch {
     // ENOENT, ENOTDIR (a file), EACCES, ELOOP: all one answer (see above).
@@ -476,7 +478,11 @@ export async function handleFsBrowseDir(
     truncated = true;
   } finally {
     // `break` closes the handle; a completed or failed iteration may not have.
-    await dir.close().catch(() => {});
+    // Bun 1.3's Dir.close() returns no promise, and closing an iterator-closed
+    // handle throws; neither may fail the browse.
+    try {
+      await dir.close();
+    } catch {}
   }
 
   const describe = async (dirent: Dirent): Promise<FsEntry | null> => {
