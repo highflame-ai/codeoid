@@ -31,6 +31,9 @@ let queryCallCount = 0;
 /** When set, the mock loop blocks before finishing so tests can invoke captured
  *  callbacks (canUseTool, hooks) while the turn queue is still open. */
 let sdkGate: Promise<void> | null = null;
+/** When set, the mock loop, out of messages, waits for it and then reads any
+ *  messages pushed meanwhile: a CLI that goes on after a turn ended. */
+let sdkMore: Promise<void> | null = null;
 /** When true, the mock query's interrupt() rejects — forcing the provider's
  *  hard-abort fallback. */
 let sdkInterruptThrows = false;
@@ -40,6 +43,11 @@ let mcpReconnects: string[] = [];
 let mcpReconnectError: Error | null = null;
 /** Live settings the mock query was handed (#417). */
 let flagSettings: Array<Record<string, unknown>> = [];
+/** Task ids the mock query's stopTask was asked to stop, and the ones it fails. */
+let stopTaskCalls: string[] = [];
+let stopTaskFails = new Set<string>();
+/** What a failing stopTask throws for an id (default: "no such task <id>"). */
+let stopTaskMessage: ((id: string) => string) | null = null;
 
 function makeMockQuery() {
   const err = sdkThrowError;
@@ -49,6 +57,7 @@ function makeMockQuery() {
       return {
         async next(): Promise<{ done: boolean; value: SDKMsg | undefined }> {
           if (err) throw err;
+          while (i >= sdkMessages.length && sdkMore) await sdkMore;
           if (i >= sdkMessages.length) {
             if (sdkGate) await sdkGate;
             return { done: true, value: undefined };
@@ -68,6 +77,10 @@ function makeMockQuery() {
     mcpServerStatus: async () => mcpStatuses,
     applyFlagSettings: async (settings: Record<string, unknown>) => {
       flagSettings.push(settings);
+    },
+    stopTask: async (id: string) => {
+      stopTaskCalls.push(id);
+      if (stopTaskFails.has(id)) throw new Error(stopTaskMessage?.(id) ?? `no such task ${id}`);
     },
   };
 }
@@ -107,7 +120,12 @@ import {
   pluginSkillDirs,
   withoutServers,
   modelOptions,
+  isTaskNotRunningError,
+  stopTaskTarget,
+  type ClaudeProviderInit,
 } from "../daemon/providers/claude/index.js";
+import { FOREIGN_AGENT_DENY, FOREIGN_TASK_STOP_DENY, FORK_TEAMMATE_DENY } from "../daemon/fork-isolation.js";
+import { getConfigDir } from "../config.js";
 import { mcpToolPrefix } from "../daemon/mcp/types.js";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -897,7 +915,7 @@ describe("ClaudeProvider – reconnecting an MCP server (#389)", () => {
 });
 
 describe("ClaudeProvider – unexplained zero-turn re-send", () => {
-  beforeEach(() => { sdkMessages = []; sdkThrowError = null; capturedQueryOpts = null; sdkGate = null; });
+  beforeEach(() => { sdkMessages = []; sdkThrowError = null; capturedQueryOpts = null; sdkGate = null; sdkMore = null; });
 
   const ZERO_TURN = { type: "result", subtype: "success", is_error: false, num_turns: 0, result: "" };
   const REAL_TURN = { type: "result", subtype: "success", num_turns: 2, result: "done", modelUsage: {} };
@@ -923,6 +941,50 @@ describe("ClaudeProvider – unexplained zero-turn re-send", () => {
     expect(zeroTurnErrors(events)).toHaveLength(0);
     // The turn still ends normally, on the real result.
     expect(events.some((e) => e.type === "turn_done")).toBe(true);
+  });
+
+  it("re-sends the prompt, not a reminder merged into the turn after it (P2)", async () => {
+    sdkMessages = [ZERO_TURN, REAL_TURN];
+    const provider = makeProvider();
+    const run = provider.runTurn({ history: [], userMessage: "the user's prompt", workdir: "/tmp", canUseTool: async () => ({ behavior: "allow" as const }) });
+    // A fork's reminder, merged into the running turn ("later": no new query).
+    run.pushMidTurn!("<system-reminder>a foreign result</system-reminder>", "later");
+    for await (const _ of run.events) { /* drain */ }
+    const pushed: Array<{ message: { content: string }; shouldQuery?: boolean }> = [];
+    const it = (capturedQueryOpts!.prompt as AsyncIterable<{ message: { content: string }; shouldQuery?: boolean }>)[Symbol.asyncIterator]();
+    for (let i = 0; i < 3; i++) pushed.push((await it.next()).value);
+    expect(pushed.map((m) => m.message.content)).toEqual(["the user's prompt", "<system-reminder>a foreign result</system-reminder>", "the user's prompt"]);
+    expect(pushed[2]!.shouldQuery).toBe(true);
+  });
+
+  it("never re-sends an earlier prompt into a turn the CLI started itself, where none was pushed (P1)", async () => {
+    let more!: () => void;
+    sdkMore = new Promise<void>((r) => { more = r; });
+    sdkMessages = [REAL_TURN];
+    const provider = makeProvider();
+    const got: SessionScopedEvent[] = [];
+    provider.onSessionEvent = (e) => got.push(e);
+    const run = provider.runTurn({ history: [], userMessage: "the user's prompt", workdir: "/tmp", canUseTool: async () => ({ behavior: "allow" as const }) });
+    for await (const e of run.events) if (e.type === "turn_done") break;
+    run.endTurn?.();
+    // The CLI goes on by itself (a background task settled), and that turn comes back empty.
+    sdkMessages.push({ type: "assistant", message: { content: [{ type: "text", text: "on it" }] }, parent_tool_use_id: null }, ZERO_TURN);
+    sdkMore = null;
+    more();
+    for (let i = 0; i < 100 && !got.some((e) => e.type === "turn_started"); i++) await Bun.sleep(5);
+    const adopted = (got.find((e) => e.type === "turn_started") as Extract<SessionScopedEvent, { type: "turn_started" }>).run;
+    const events: ProviderEvent[] = [];
+    for await (const e of adopted.events) {
+      events.push(e);
+      if (e.type === "turn_done") break;
+    }
+    adopted.endTurn?.();
+    // Not re-sent: the turn ends as the zero-turn it was.
+    expect(info(events)).toHaveLength(0);
+    expect(zeroTurnErrors(events)).toHaveLength(1);
+    const pushed: string[] = [];
+    for await (const m of capturedQueryOpts!.prompt as AsyncIterable<{ message: { content: string } }>) pushed.push(m.message.content);
+    expect(pushed).toEqual(["the user's prompt"]);
   });
 
   it("gives up after ONE attempt — a second zero-turn is a real error", async () => {
@@ -2253,6 +2315,458 @@ describe("ClaudeProvider – Claude accounts", () => {
     turnOn(provider, "t5");
     expect(queryCallCount).toBe(4);
     expect(envOf().CLAUDE_CODE_OAUTH_TOKEN).toBe(process.env.CLAUDE_CODE_OAUTH_TOKEN as string);
+    openGate();
+    await provider.teardown();
+  });
+});
+
+// ── A fork's boundary: the CLI leaves the parent's background work alone ─────
+
+describe("ClaudeProvider – fork boundary (CLAUDE_CODE_RESUME_SOURCE_ALIVE)", () => {
+  let openGate: () => void = () => {};
+  beforeEach(() => {
+    sdkMessages = [];
+    sdkThrowError = null;
+    capturedQueryOpts = null;
+    queryCallCount = 0;
+    sdkGate = new Promise<void>((r) => {
+      openGate = r;
+    });
+  });
+
+  function makeForkProvider(boundary: { at: string | undefined }, account: ResolvedClaudeAccount | null = null): ClaudeProvider {
+    return new ClaudeProvider({
+      sessionId: "fork-session",
+      initialBackingId: "fork-backing",
+      workspaceId: "ws_test",
+      store: {
+        audit: () => {},
+        getClaudeCodeSessionId: () => null,
+        setClaudeCodeSessionId: () => {},
+        getSkillCommandGrants: () => new Map<string, boolean>(),
+        setSkillCommandGrant: () => {},
+      } as never,
+      resolveAccount: () => account,
+      // A loop worker's env can't set it either: withExtraEnv refuses CLAUDE_*.
+      extraEnv: { CLAUDE_CODE_RESUME_SOURCE_ALIVE: "2000-01-01T00:00:00.000Z" },
+      forkBoundary: () => boundary.at,
+    });
+  }
+  const envOf = () => (capturedQueryOpts?.options as { env?: Record<string, string> } | undefined)?.env ?? {};
+  const turnOn = (provider: ClaudeProvider) =>
+    provider.runTurn({ history: [], userMessage: "go", workdir: "/tmp", canUseTool: async () => ({ behavior: "allow" as const }) });
+
+  async function withInherited<T>(value: string | undefined, fn: () => Promise<T>): Promise<T> {
+    const saved = process.env.CLAUDE_CODE_RESUME_SOURCE_ALIVE;
+    if (value === undefined) delete process.env.CLAUDE_CODE_RESUME_SOURCE_ALIVE;
+    else process.env.CLAUDE_CODE_RESUME_SOURCE_ALIVE = value;
+    try {
+      return await fn();
+    } finally {
+      if (saved === undefined) delete process.env.CLAUDE_CODE_RESUME_SOURCE_ALIVE;
+      else process.env.CLAUDE_CODE_RESUME_SOURCE_ALIVE = saved;
+    }
+  }
+
+  it("a fork's query carries its boundary, in the boundary-only form, over an inherited value", async () => {
+    await withInherited("other-session|2001-01-01T00:00:00.000Z|parent", async () => {
+      const provider = makeForkProvider({ at: "2026-10-27T10:00:00.000Z" });
+      turnOn(provider);
+      expect(envOf().CLAUDE_CODE_RESUME_SOURCE_ALIVE).toBe("2026-10-27T10:00:00.000Z");
+      openGate();
+      await provider.teardown();
+    });
+  });
+
+  it("on a named account too: the account's env doesn't drop it", async () => {
+    const work: ResolvedClaudeAccount = {
+      name: "work",
+      kind: "subscription",
+      fingerprint: "work:t",
+      apply: (env) => applyAccountEnv(env, { name: "work", kind: "subscription", token: "sk-ant-oat01-W", createdAt: "t", updatedAt: "t" }),
+      model: (m) => m,
+    };
+    const provider = makeForkProvider({ at: "2026-10-27T10:00:00.000Z" }, work);
+    turnOn(provider);
+    expect(envOf().CLAUDE_CODE_OAUTH_TOKEN).toBe("sk-ant-oat01-W");
+    expect(envOf().CLAUDE_CODE_RESUME_SOURCE_ALIVE).toBe("2026-10-27T10:00:00.000Z");
+    openGate();
+    await provider.teardown();
+  });
+
+  it("a session that isn't a fork never carries it — an inherited value is removed", async () => {
+    await withInherited("2001-01-01T00:00:00.000Z", async () => {
+      const provider = makeForkProvider({ at: undefined });
+      turnOn(provider);
+      expect("CLAUDE_CODE_RESUME_SOURCE_ALIVE" in envOf()).toBe(false);
+      openGate();
+      await provider.teardown();
+    });
+  });
+
+  it("stopBackgroundTasks reports the ids whose stop failed, so the session can retry them", async () => {
+    stopTaskCalls = [];
+    stopTaskFails = new Set(["b"]);
+    const provider = makeForkProvider({ at: "2026-10-27T10:00:00.000Z" });
+    // No CLI yet: nothing runs, nothing to fail.
+    expect(await provider.stopBackgroundTasks(["a"])).toEqual([]);
+    turnOn(provider);
+    expect(await provider.stopBackgroundTasks(["a", "b", "c"])).toEqual(["b"]);
+    expect(stopTaskCalls).toEqual(["a", "b", "c"]);
+    stopTaskFails = new Set();
+    openGate();
+    await provider.teardown();
+  });
+
+  it("the session's gate hears which agent asked (the SDK's agentID)", async () => {
+    const asked: Array<string | undefined> = [];
+    const provider = makeForkProvider({ at: "2026-10-27T10:00:00.000Z" });
+    provider.runTurn({
+      history: [],
+      userMessage: "go",
+      workdir: "/tmp",
+      canUseTool: async (_t, _a, _n, _i, _s, agentId) => {
+        asked.push(agentId);
+        return { behavior: "deny" as const, message: "no" };
+      },
+    });
+    const gate = (capturedQueryOpts as { options: { canUseTool: (n: string, i: unknown, o: { toolUseID: string; agentID?: string; signal: AbortSignal }) => Promise<unknown> } }).options.canUseTool;
+    await gate("Bash", { command: "ls" }, { toolUseID: "tu-1", agentID: "a7f3c2e19b", signal: new AbortController().signal });
+    await gate("Bash", { command: "ls" }, { toolUseID: "tu-2", signal: new AbortController().signal });
+    expect(asked).toEqual(["a7f3c2e19b", undefined]);
+    openGate();
+    await provider.teardown();
+  });
+
+  it("the boundary is read when the query is built, so a fork primed after construction has it", async () => {
+    const boundary: { at: string | undefined } = { at: undefined };
+    const provider = makeForkProvider(boundary);
+    boundary.at = "2026-10-27T11:00:00.000Z"; // primeFromFork, after the provider exists
+    turnOn(provider);
+    expect(envOf().CLAUDE_CODE_RESUME_SOURCE_ALIVE).toBe("2026-10-27T11:00:00.000Z");
+    openGate();
+    await provider.teardown();
+  });
+
+  // ── Round-2 audit: M-1 (the deny reaches every call), L4 (a stop of a finished task) ──
+
+  /** A fork's provider whose parent's agent is "a-parent", with a pre-approved tool (the fleet's). */
+  function makeForeignAwareProvider(over: Partial<ClaudeProviderInit> = {}) {
+    const audits: Array<{ action: string; detail?: string }> = [];
+    const denied: Array<[string, string]> = [];
+    const provider = new ClaudeProvider({
+      sessionId: "fork-session",
+      initialBackingId: "fork-backing",
+      workspaceId: "ws_test",
+      fleet: { type: "sdk", name: "codeoid_fleet", instance: {} } as never,
+      store: {
+        audit: (_s: string, action: string, _id?: string, detail?: string) => audits.push({ action, detail }),
+        getClaudeCodeSessionId: () => null,
+        setClaudeCodeSessionId: () => {},
+        getSkillCommandGrants: () => new Map<string, boolean>(),
+        setSkillCommandGrant: () => {},
+      } as never,
+      forkBoundary: () => "2026-10-27T10:00:00.000Z",
+      isFork: () => true,
+      isForeignAgent: (id) => id === "a-parent",
+      onForeignAgentDenied: (id, tool) => denied.push([id, tool]),
+      ...over,
+    });
+    return { provider, audits, denied };
+  }
+  const preToolUseOf = () =>
+    (capturedQueryOpts as { options: { hooks: { PreToolUse: Array<{ hooks: Array<(i: unknown) => Promise<unknown>> }> } } }).options.hooks.PreToolUse[0]!.hooks[0]!;
+
+  it("a parent's agent is denied in the PreToolUse hook, before anything else, on calls the CLI would allow itself", async () => {
+    const { provider, audits, denied } = makeForeignAwareProvider();
+    const events: ProviderEvent[] = [];
+    const run = turnOn(provider);
+    const drain = (async () => { for await (const e of run.events) events.push(e); })();
+    const hook = preToolUseOf();
+    const call = (tool_name: string, tool_input: unknown, agent_id?: string) =>
+      hook({ hook_event_name: "PreToolUse", tool_name, tool_input, tool_use_id: `tu-${tool_name}`, ...(agent_id ? { agent_id } : {}) });
+    const deny = { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: FOREIGN_AGENT_DENY } };
+
+    // A read inside the workdir (the CLI allows it without asking canUseTool).
+    expect(await call("Read", { file_path: "/tmp/notes.txt" }, "a-parent")).toEqual(deny);
+    // A pre-approved tool: denied, and no tool card emitted on its behalf.
+    expect(await call("mcp__codeoid_fleet__fleet_list", {}, "a-parent")).toEqual(deny);
+    // Starting an agent of its own.
+    expect(await call("Agent", { prompt: "go", run_in_background: true }, "a-parent")).toEqual(deny);
+    // A credential path: still the foreign deny (it comes first), not the secret-path one.
+    const secret = join(getConfigDir(), "config.json");
+    expect(await call("Read", { file_path: secret }, "a-parent")).toEqual(deny);
+
+    // The session's own agents and the main agent are untouched.
+    expect(await call("mcp__codeoid_fleet__fleet_list", {}, "a-own")).toEqual({});
+    expect(await call("Read", { file_path: "/tmp/notes.txt" })).toEqual({});
+    expect((await call("Read", { file_path: secret }, "a-own")) as unknown).toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+
+    // Audited here, the agent's first refusal (then at most one a minute), and
+    // nothing else recorded for those calls.
+    const foreignAudits = audits.filter((a) => a.action === "session.foreign_agent_deny");
+    expect(foreignAudits.map((a) => a.detail)).toEqual(["tool=Read agent=a-parent"]);
+    expect(audits.filter((a) => a.action === "session.tool_call")).toHaveLength(2);
+    expect(audits.filter((a) => a.action === "session.secret_path_deny")).toHaveLength(1);
+    expect(denied).toEqual([["a-parent", "Read"], ["a-parent", "mcp__codeoid_fleet__fleet_list"], ["a-parent", "Agent"], ["a-parent", "Read"]]);
+    openGate();
+    await drain;
+    expect(events.filter((e) => e.type === "tool_start").map((e) => (e as { sdkAgentId?: string }).sdkAgentId)).toEqual(["a-own"]);
+    await provider.teardown();
+  });
+
+  it("a stop the CLI refuses because the task isn't running (it just finished, or is gone) is not a failure", async () => {
+    stopTaskCalls = [];
+    const provider = makeForkProvider({ at: "2026-10-27T10:00:00.000Z" });
+    turnOn(provider);
+    stopTaskFails = new Set(["done1", "gone1", "stuck1"]);
+    // What the CLI says when it refuses each stop.
+    const messages: Record<string, string> = {
+      done1: "Task done1 is not running (status: completed)",
+      gone1: "No task found with ID: gone1",
+      stuck1: "control request timed out",
+    };
+    stopTaskMessage = (id) => messages[id] ?? `no such task ${id}`;
+    expect(await provider.stopBackgroundTasks(["done1", "gone1", "stuck1", "fine1"])).toEqual(["stuck1"]);
+    expect(isTaskNotRunningError(new Error("Task done1 is not running (status: killed)"))).toBe(true);
+    expect(isTaskNotRunningError(new Error("stopTask failed: is not running"))).toBe(false);
+    stopTaskFails = new Set();
+    stopTaskMessage = null;
+    openGate();
+    await provider.teardown();
+  });
+
+  // ── Round-3 audit ──
+
+  it("only a terminal status counts as not running: a task still pending may yet run (L2)", () => {
+    for (const status of ["completed", "failed", "killed", "stopped"]) {
+      expect(isTaskNotRunningError(new Error(`Task t1 is not running (status: ${status})`))).toBe(true);
+    }
+    for (const status of ["pending", "starting", "queued"]) {
+      expect(isTaskNotRunningError(new Error(`Task t1 is not running (status: ${status})`))).toBe(false);
+    }
+    expect(isTaskNotRunningError(new Error("No task found with ID: t1"))).toBe(true);
+  });
+
+  /** One PreToolUse call on a running fork provider. */
+  const hookCall = (tool_name: string, tool_input: unknown, agent_id?: string) =>
+    preToolUseOf()({ hook_event_name: "PreToolUse", tool_name, tool_input, tool_use_id: `tu-${tool_name}-${Math.random()}`, ...(agent_id ? { agent_id } : {}) });
+  const denyWith = (reason: string) => ({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason } });
+
+  it("refuses fail-closed: a throw deciding, auditing or noting a foreign call still denies it (L-1)", async () => {
+    const throwing = (msg: string) => () => {
+      throw new Error(msg);
+    };
+    // Deciding throws: refused.
+    const a = makeForeignAwareProvider({ isForeignAgent: throwing("lookup broke") });
+    turnOn(a.provider);
+    expect(await hookCall("Read", { file_path: "/tmp/x" }, "a-any")).toEqual(denyWith(FOREIGN_AGENT_DENY));
+    openGate();
+    await a.provider.teardown();
+    // Noting and auditing throw: still refused.
+    const b = makeForeignAwareProvider({ onForeignAgentDenied: throwing("note broke") });
+    sdkGate = new Promise<void>((r) => { openGate = r; });
+    turnOn(b.provider);
+    expect(await hookCall("Bash", { command: "rm -rf /" }, "a-parent")).toEqual(denyWith(FOREIGN_AGENT_DENY));
+    openGate();
+    await b.provider.teardown();
+    const c = makeForeignAwareProvider({
+      store: {
+        audit: throwing("audit broke"),
+        getClaudeCodeSessionId: () => null,
+        setClaudeCodeSessionId: () => {},
+        getSkillCommandGrants: () => new Map<string, boolean>(),
+        setSkillCommandGrant: () => {},
+      } as never,
+    });
+    sdkGate = new Promise<void>((r) => { openGate = r; });
+    turnOn(c.provider);
+    expect(await hookCall("Bash", { command: "rm -rf /" }, "a-parent")).toEqual(denyWith(FOREIGN_AGENT_DENY));
+    openGate();
+    await c.provider.teardown();
+  });
+
+  it("no agent of the fork can stop a parent's task, under any of the stop tool's names (I-1)", async () => {
+    const { provider } = makeForeignAwareProvider({ isOwnTask: (id) => id === "bown0001" });
+    turnOn(provider);
+    const refused = denyWith(FOREIGN_TASK_STOP_DENY);
+    expect(await hookCall("TaskStop", { task_id: "rparent1" })).toEqual(refused); // the main agent
+    expect(await hookCall("TaskStop", { task_id: " rparent1 " }, "a-own")).toEqual(refused);
+    expect(await hookCall("KillShell", { shell_id: "bparent1" })).toEqual(refused);
+    expect(await hookCall("KillBash", { shell_id: "bparent1" })).toEqual(refused);
+    // A teammate of the parent's team too.
+    expect(await hookCall("TaskStop", { task_id: "reviewer@session-parent00" })).toEqual(refused);
+    // The fork's own tasks stop as usual.
+    expect(await hookCall("TaskStop", { task_id: "bown0001" })).toEqual({});
+    openGate();
+    await provider.teardown();
+  });
+
+  it("on a fork a stop names only the fork's own: a name, an unknown id or no target is refused; elsewhere unchanged (L4-2)", async () => {
+    const { provider } = makeForeignAwareProvider({ isOwnTask: (id) => id === "a7f3c2e19b" || id === "bown0001" });
+    turnOn(provider);
+    const refused = denyWith(FOREIGN_TASK_STOP_DENY);
+    // TaskStop takes a name too: a named background agent, a bare teammate name.
+    expect(await hookCall("TaskStop", { task_id: "researcher" })).toEqual(refused);
+    expect(await hookCall("TaskStop", { task_id: "reviewer" }, "a-own")).toEqual(refused);
+    // An id the fork's level never showed, and a call with no target.
+    expect(await hookCall("TaskStop", { task_id: "bunknown1" })).toEqual(refused);
+    expect(await hookCall("TaskStop", {})).toEqual(refused);
+    // Its own: a task id, an agent id, a teammate of its own team.
+    expect(await hookCall("TaskStop", { task_id: "a7f3c2e19b" })).toEqual({});
+    expect(await hookCall("KillShell", { shell_id: "bown0001" })).toEqual({});
+    expect(await hookCall("TaskStop", { task_id: "reviewer@session-fork-bac" })).toEqual({});
+    openGate();
+    await provider.teardown();
+    // Not a fork: a stop by name goes through as it always did.
+    sdkGate = new Promise<void>((r) => { openGate = r; });
+    const plain = makeForeignAwareProvider({ isFork: () => false, forkBoundary: () => undefined });
+    turnOn(plain.provider);
+    expect(await hookCall("TaskStop", { task_id: "researcher" })).toEqual({});
+    openGate();
+    await plain.provider.teardown();
+  });
+
+  it("on a fork a stop naming its own id with whitespace around it, or an empty one, is refused, never trimmed (I5-1)", async () => {
+    const { provider } = makeForeignAwareProvider({ isOwnTask: (id) => id === "bown0001" });
+    turnOn(provider);
+    const refused = denyWith(FOREIGN_TASK_STOP_DENY);
+    expect(await hookCall("TaskStop", { task_id: " bown0001" })).toEqual(refused);
+    expect(await hookCall("TaskStop", { task_id: "bown0001\n" })).toEqual(refused);
+    expect(await hookCall("KillShell", { shell_id: "\tbown0001" })).toEqual(refused);
+    expect(await hookCall("TaskStop", { task_id: "" })).toEqual(refused);
+    expect(await hookCall("TaskStop", { task_id: "   " })).toEqual(refused);
+    expect(stopTaskTarget({ task_id: " bown0001" })).toBeUndefined();
+    expect(stopTaskTarget({ task_id: "bown0001" })).toBe("bown0001");
+    // The same verdict, for an input Session rewrote (I5-3).
+    expect(provider.foreignCallRefusal("TaskStop", { task_id: "rparent1" }, undefined)).toBe(FOREIGN_TASK_STOP_DENY);
+    expect(provider.foreignCallRefusal("TaskStop", { task_id: "bown0001" }, undefined)).toBeNull();
+    expect(await hookCall("TaskStop", { task_id: "bown0001" })).toEqual({});
+    openGate();
+    await provider.teardown();
+  });
+
+  it("canUseTool refuses the parent's work too, a second layer under the hook, and shows nothing of it (I4-4)", async () => {
+    const { provider } = makeForeignAwareProvider({ isOwnTask: (id) => id === "bown0001" });
+    const asked: Array<string | undefined> = [];
+    const events: ProviderEvent[] = [];
+    const run = provider.runTurn({
+      history: [],
+      userMessage: "go",
+      workdir: "/tmp",
+      canUseTool: async (_t, _a, _n, _i, _s, agentId) => {
+        asked.push(agentId);
+        return { behavior: "allow" as const };
+      },
+    });
+    const drain = (async () => { for await (const e of run.events) events.push(e); })();
+    const gate = (capturedQueryOpts as { options: { canUseTool: (n: string, i: unknown, o: { toolUseID: string; agentID?: string; signal: AbortSignal }) => Promise<unknown> } }).options.canUseTool;
+    const signal = new AbortController().signal;
+    expect(await gate("Bash", { command: "ls" }, { toolUseID: "tu-1", agentID: "a-parent", signal })).toEqual({ behavior: "deny", message: FOREIGN_AGENT_DENY });
+    expect(await gate("TaskStop", { task_id: "researcher" }, { toolUseID: "tu-2", signal })).toEqual({ behavior: "deny", message: FOREIGN_TASK_STOP_DENY });
+    expect(await gate("TaskStop", { task_id: "bown0001" }, { toolUseID: "tu-3", signal })).toMatchObject({ behavior: "allow" });
+    expect(asked).toEqual([undefined]);
+    openGate();
+    await drain;
+    expect(events.filter((e) => e.type === "tool_start").map((e) => (e as { name: string }).name)).toEqual(["TaskStop"]);
+    await provider.teardown();
+  });
+
+  it("with CLAUDE_INTERNAL_ASSISTANT_TEAM_NAME set a fork refuses every teammate, logged once (I4-1)", async () => {
+    const saved = process.env.CLAUDE_INTERNAL_ASSISTANT_TEAM_NAME;
+    process.env.CLAUDE_INTERNAL_ASSISTANT_TEAM_NAME = "shared-team";
+    const logged: string[] = [];
+    const realError = console.error;
+    console.error = (...a: unknown[]) => { logged.push(a.map(String).join(" ")); };
+    try {
+      const { provider } = makeForeignAwareProvider({ isOwnTask: () => false });
+      turnOn(provider);
+      // The parent's teammate and the fork's carry the same team name: neither can be told apart.
+      expect(await hookCall("Read", { file_path: "/tmp/x" }, "reviewer@shared-team")).toEqual(denyWith(FORK_TEAMMATE_DENY));
+      expect(await hookCall("Read", { file_path: "/tmp/x" }, "reviewer@session-fork-bac")).toEqual(denyWith(FORK_TEAMMATE_DENY));
+      expect(await hookCall("TaskStop", { task_id: "reviewer@shared-team" })).toEqual(denyWith(FOREIGN_TASK_STOP_DENY));
+      // A non-teammate agent of the fork's own is untouched.
+      expect(await hookCall("Read", { file_path: "/tmp/x" }, "a-own")).toEqual({});
+      expect(logged.filter((l) => l.includes("CLAUDE_INTERNAL_ASSISTANT_TEAM_NAME"))).toHaveLength(1);
+      openGate();
+      await provider.teardown();
+      // Not a fork: teammates are left alone.
+      sdkGate = new Promise<void>((r) => { openGate = r; });
+      const plain = makeForeignAwareProvider({ isFork: () => false, forkBoundary: () => undefined });
+      turnOn(plain.provider);
+      expect(await hookCall("Read", { file_path: "/tmp/x" }, "reviewer@shared-team")).toEqual({});
+      openGate();
+      await plain.provider.teardown();
+    } finally {
+      console.error = realError;
+      if (saved === undefined) delete process.env.CLAUDE_INTERNAL_ASSISTANT_TEAM_NAME;
+      else process.env.CLAUDE_INTERNAL_ASSISTANT_TEAM_NAME = saved;
+    }
+  });
+
+  it("the secret-path check fails closed: a throw reaching its verdict denies the call (L4-6)", async () => {
+    const audits: string[] = [];
+    const { provider: p } = makeForeignAwareProvider({
+      isFork: () => false,
+      forkBoundary: () => undefined,
+      isForeignAgent: () => false,
+      store: {
+        audit: (_s: string, action: string) => {
+          audits.push(action);
+          throw new Error("audit broke");
+        },
+        getClaudeCodeSessionId: () => null,
+        setClaudeCodeSessionId: () => {},
+        getSkillCommandGrants: () => new Map<string, boolean>(),
+        setSkillCommandGrant: () => {},
+      } as never,
+    });
+    turnOn(p);
+    // A tool input the check can't read: it throws inside the verdict.
+    const hostile = { get file_path(): string { throw new Error("no reading this"); } };
+    const verdict = (await hookCall("Read", hostile)) as { hookSpecificOutput: { permissionDecision: string } };
+    expect(verdict.hookSpecificOutput.permissionDecision).toBe("deny");
+    // A real deny whose audit throws still denies.
+    const secret = join(getConfigDir(), "config.json");
+    expect((await hookCall("Read", { file_path: secret })) as unknown).toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+    expect(audits.filter((a) => a === "session.secret_path_deny")).toHaveLength(2);
+    openGate();
+    await p.teardown();
+  });
+
+  it("a teammate of another team is the parent's on a fork; its own team's are the fork's (L-4)", async () => {
+    const { provider } = makeForeignAwareProvider();
+    turnOn(provider);
+    // The CLI names a session's team after its own id: this one resumes "fork-backing".
+    expect(await hookCall("Read", { file_path: "/tmp/x" }, "reviewer@session-parent00")).toEqual(denyWith(FOREIGN_AGENT_DENY));
+    expect(await hookCall("Read", { file_path: "/tmp/x" }, "reviewer@session-fork-bac")).toEqual({});
+    openGate();
+    await provider.teardown();
+    // Not a fork: no team is foreign.
+    sdkGate = new Promise<void>((r) => { openGate = r; });
+    const plain = makeForeignAwareProvider({ isFork: () => false, forkBoundary: () => undefined });
+    turnOn(plain.provider);
+    expect(await hookCall("Read", { file_path: "/tmp/x" }, "reviewer@session-parent00")).toEqual({});
+    openGate();
+    await plain.provider.teardown();
+  });
+
+  it("a foreign agent's refusals are audited once, then at most once a minute (I-3)", async () => {
+    const { provider, audits } = makeForeignAwareProvider();
+    turnOn(provider);
+    const realNow = Date.now;
+    let now = realNow();
+    Date.now = () => now;
+    try {
+      for (let i = 0; i < 5; i++) await hookCall("Bash", { command: "x" }, "a-parent");
+      now += 59_000;
+      await hookCall("Bash", { command: "x" }, "a-parent");
+      now += 2_000;
+      await hookCall("Bash", { command: "x" }, "a-parent");
+    } finally {
+      Date.now = realNow;
+    }
+    expect(audits.filter((a) => a.action === "session.foreign_agent_deny")).toHaveLength(2);
     openGate();
     await provider.teardown();
   });
