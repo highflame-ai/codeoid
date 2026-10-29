@@ -348,11 +348,28 @@ function browseRoot(): string {
 /** VCS internals are never a workdir, so they stay out even with `showHidden`. */
 const BROWSE_ALWAYS_HIDDEN: ReadonlySet<string> = new Set([".git", ".hg", ".svn"]);
 
+/**
+ * Kernel pseudo-filesystems: never a workdir, and `/proc/<pid>/cwd` would
+ * hand out other processes' working directories. Neither listed nor entered.
+ */
+const BROWSE_DENIED: readonly string[] = ["/proc", "/sys", "/dev"];
+
 /** Concurrent child stats per browse — a dir like `/usr/lib` has thousands. */
 const BROWSE_STAT_CONCURRENCY = 64;
 
+/**
+ * Raw entries read per browse. The directory cap (MAX_LIST_ENTRIES) alone
+ * would stat every entry of a huge dir that holds few subdirectories.
+ */
+const BROWSE_SCAN_LIMIT = 20_000;
+
 function within(p: string, root: string): boolean {
   return p === root || p.startsWith(root.endsWith(path.sep) ? root : root + path.sep);
+}
+
+/** Never browsable: a credential store, or a kernel pseudo-filesystem. */
+function browseRefused(p: string): boolean {
+  return isProtectedPath(p) || BROWSE_DENIED.some((d) => within(p, d));
 }
 
 async function exists(p: string): Promise<boolean> {
@@ -364,6 +381,16 @@ async function exists(p: string): Promise<boolean> {
   }
 }
 
+/**
+ * Session-less directory browse for the workdir picker. Bounded to the browse
+ * root; never enters or lists a protected dir or pseudo-filesystem.
+ *
+ * Anything that isn't a browsable directory — missing, a file, unreadable,
+ * protected, behind a symlink out of the root — gets the SAME `not_found`, so
+ * the verb can't be used to probe whether a path exists (a credential file,
+ * another user's tree). Only a path outside the configured root says so, and
+ * that is decided on the typed path before the filesystem is touched.
+ */
 export async function handleFsBrowseDir(
   msg: Pick<FsBrowseDirMsg, "id" | "path" | "showHidden">,
 ): Promise<FsBrowseDirResultMsg> {
@@ -395,97 +422,90 @@ export async function handleFsBrowseDir(
         ? path.join(os.homedir(), requested.slice(2))
         : requested;
   // path.resolve handles relative-to-root + absolute paths uniformly.
-  const joined = path.isAbsolute(expanded)
-    ? expanded
-    : path.resolve(canonicalRoot, expanded);
+  const lexical = path.resolve(canonicalRoot, expanded);
+  const unavailable = () => new FsAccessError(`no such directory: ${requested}`, "not_found");
+
+  const escapes = () =>
+    new FsAccessError(`path escapes browse root (${canonicalRoot}): ${requested}`, "forbidden");
+  // Refused before realpath, so a protected dir answers like a missing one
+  // whatever lies inside it.
+  if (browseRefused(lexical)) throw unavailable();
 
   let resolved: string;
+  let dir: Awaited<ReturnType<typeof fs.opendir>>;
   try {
-    resolved = await fs.realpath(joined);
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === "ENOENT") {
-      throw new FsAccessError(`no such path: ${requested}`, "not_found");
-    }
-    throw new FsAccessError(
-      `cannot resolve path: ${(err as Error).message}`,
-      "internal",
-    );
+    resolved = await fs.realpath(lexical);
+  } catch {
+    // Outside the root, existing or not, the answer is the same.
+    throw within(lexical, canonicalRoot) ? unavailable() : escapes();
   }
-
-  if (!within(resolved, canonicalRoot)) {
-    throw new FsAccessError(
-      `path escapes browse root (${canonicalRoot}): ${requested}`,
-      "forbidden",
-    );
-  }
-  // Credential stores can't be a workdir (normalizeWorkdir), so there's
-  // nothing in them to pick — and their layout is nobody's business.
-  if (isProtectedPath(resolved)) {
-    throw new FsAccessError(`protected directory: ${requested}`, "forbidden");
-  }
-
-  let stat: Awaited<ReturnType<typeof fs.stat>>;
+  // Judged on the canonical path: the root, home or the typed path may sit
+  // behind a symlink (macOS /tmp → /private/tmp), so the typed form can't be.
+  if (!within(resolved, canonicalRoot)) throw within(lexical, canonicalRoot) ? unavailable() : escapes();
   try {
-    stat = await fs.stat(resolved);
-  } catch (err) {
-    throw new FsAccessError(
-      `cannot stat: ${(err as Error).message}`,
-      "internal",
-    );
-  }
-  if (!stat.isDirectory()) {
-    throw new FsAccessError(`not a directory: ${requested}`, "invalid_request");
-  }
-
-  let dirents: Dirent[];
-  try {
-    dirents = await fs.readdir(resolved, { withFileTypes: true });
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === "EACCES" || code === "EPERM") {
-      throw new FsAccessError(`permission denied: ${resolved}`, "forbidden");
-    }
-    throw new FsAccessError(
-      `cannot read directory: ${(err as Error).message}`,
-      "internal",
-    );
+    // A symlink may lead into a refused dir.
+    if (browseRefused(resolved)) throw unavailable();
+    dir = await fs.opendir(resolved);
+  } catch {
+    // ENOENT, ENOTDIR (a file), EACCES, ELOOP: all one answer (see above).
+    throw unavailable();
   }
 
   const candidates: Dirent[] = [];
   // Dirs `showHidden` would reveal; counted off the dirent (no stat), so a
   // hidden symlink to a file counts too — it is only a hint.
   let hiddenCount = 0;
-  for (const d of dirents) {
-    if (BROWSE_ALWAYS_HIDDEN.has(d.name)) continue;
-    if (msg.showHidden || (!DEFAULT_HIDDEN.has(d.name) && !d.name.startsWith("."))) {
-      candidates.push(d);
-    } else if ((d.isDirectory() || d.isSymbolicLink()) && !isProtectedPath(path.join(resolved, d.name))) {
-      hiddenCount++;
+  let scanned = 0;
+  let truncated = false;
+  try {
+    for await (const d of dir) {
+      if (++scanned > BROWSE_SCAN_LIMIT) {
+        truncated = true;
+        break;
+      }
+      if (BROWSE_ALWAYS_HIDDEN.has(d.name)) continue;
+      if (msg.showHidden || (!DEFAULT_HIDDEN.has(d.name) && !d.name.startsWith("."))) {
+        candidates.push(d);
+      } else if ((d.isDirectory() || d.isSymbolicLink()) && !browseRefused(path.join(resolved, d.name))) {
+        hiddenCount++;
+      }
     }
+  } catch {
+    // A read error mid-listing (dir removed, I/O error): keep what was read.
+  } finally {
+    // `break` closes the handle; a completed or failed iteration may not have.
+    await dir.close().catch(() => {});
   }
 
   const describe = async (dirent: Dirent): Promise<FsEntry | null> => {
     const childAbs = path.join(resolved, dirent.name);
-    if (isProtectedPath(childAbs)) return null;
+    if (browseRefused(childAbs)) return null;
     const isSymlink = dirent.isSymbolicLink();
-    let isDirectory = dirent.isDirectory();
-    let mtimeMs: number | undefined;
-    try {
-      const childStat = await fs.stat(childAbs);
-      isDirectory = childStat.isDirectory();
-      mtimeMs = childStat.mtimeMs;
-    } catch {
-      // Broken symlink or race — keep dirent's view.
+    // A symlink is judged by where it leads: one into a credential store would
+    // otherwise leak that dir's mtime and whether it holds a `.git`.
+    let target = childAbs;
+    if (isSymlink) {
+      try {
+        target = await fs.realpath(childAbs);
+      } catch {
+        return null; // Broken or looping link — nothing to browse into.
+      }
+      if (browseRefused(target)) return null;
     }
-    if (!isDirectory) return null; // browse mode = directories only
+    let childStat: Awaited<ReturnType<typeof fs.stat>>;
+    try {
+      childStat = await fs.stat(target);
+    } catch {
+      return null; // Vanished, or unreadable.
+    }
+    if (!childStat.isDirectory()) return null; // browse mode = directories only
     // `.git` is a dir in a clone and a file in a worktree; either marks a repo.
-    const isGitRepo = await exists(path.join(childAbs, ".git"));
+    const isGitRepo = await exists(path.join(target, ".git"));
     return {
       name: dirent.name,
       path: childAbs, // ABSOLUTE here so client can dispatch directly
       kind: "directory",
-      ...(mtimeMs !== undefined ? { mtimeMs } : {}),
+      mtimeMs: childStat.mtimeMs,
       ...(isSymlink ? { isSymlink: true } : {}),
       ...(isGitRepo ? { isGitRepo: true } : {}),
     };
@@ -498,6 +518,8 @@ export async function handleFsBrowseDir(
       if (entry && out.length < MAX_LIST_ENTRIES) out.push(entry);
     }
   }
+  if (out.length >= MAX_LIST_ENTRIES) truncated = true;
+
   out.sort((a, b) => a.name.localeCompare(b.name));
 
   const parent =
@@ -512,6 +534,7 @@ export async function handleFsBrowseDir(
     home,
     isGitRepo: await exists(path.join(resolved, ".git")),
     ...(hiddenCount > 0 ? { hiddenCount } : {}),
+    ...(truncated ? { truncated: true } : {}),
     entries: out,
   };
 }

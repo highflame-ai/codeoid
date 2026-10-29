@@ -192,8 +192,56 @@ describe("handleFsBrowseDir", () => {
     const parent = await handleFsBrowseDir({ id: "b9", path: join(tmp, "xdg"), showHidden: true });
     expect(parent.entries.map((e) => e.name)).toEqual(["other"]);
     await expect(handleFsBrowseDir({ id: "b10", path: join(tmp, "xdg", "codeoid") })).rejects.toMatchObject({
-      code: "forbidden",
+      code: "not_found",
     });
+  });
+
+  it("answers the same for a missing path, a file and anything protected, so it can't probe existence", async () => {
+    process.env.CODEOID_FS_BROWSE_ROOT = tmp;
+    process.env.XDG_CONFIG_HOME = join(tmp, "xdg");
+    mkdirSync(join(tmp, "xdg", "codeoid"), { recursive: true });
+    writeFileSync(join(tmp, "xdg", "codeoid", "config.json"), "{}");
+    writeFileSync(join(tmp, "notes.txt"), "x");
+    const answers = await Promise.all(
+      [
+        join(tmp, "missing"),
+        join(tmp, "notes.txt"),
+        join(tmp, "xdg", "codeoid", "config.json"),
+        join(tmp, "xdg", "codeoid", "nope"),
+      ].map((p) => handleFsBrowseDir({ id: "p", path: p }).then(() => null, (e: FsAccessError) => [e.code, e.message.split(":")[0]])),
+    );
+    expect(answers).toEqual(Array(4).fill(["not_found", "no such directory"]));
+  });
+
+  it("drops a symlink that leads into a protected dir, and refuses to enter it", async () => {
+    process.env.CODEOID_FS_BROWSE_ROOT = tmp;
+    process.env.XDG_CONFIG_HOME = join(tmp, "xdg");
+    mkdirSync(join(tmp, "xdg", "codeoid"), { recursive: true });
+    mkdirSync(join(tmp, "pub", "real"), { recursive: true });
+    symlinkSync(join(tmp, "xdg", "codeoid"), join(tmp, "pub", "sneaky"));
+    symlinkSync(join(tmp, "pub", "real"), join(tmp, "pub", "alias"));
+    const r = await handleFsBrowseDir({ id: "s1", path: join(tmp, "pub") });
+    expect(r.entries.map((e) => [e.name, e.isSymlink ?? false])).toEqual([["alias", true], ["real", false]]);
+    await expect(handleFsBrowseDir({ id: "s2", path: join(tmp, "pub", "sneaky") })).rejects.toMatchObject({ code: "not_found" });
+  });
+
+  it("follows a symlinked root and answers the same for anything outside it", async () => {
+    mkdirSync(join(tmp, "real-root", "proj"), { recursive: true });
+    symlinkSync(join(tmp, "real-root"), join(tmp, "link-root"));
+    process.env.CODEOID_FS_BROWSE_ROOT = join(tmp, "link-root");
+    // Typed through the symlink, the way the operator configured it.
+    const r = await handleFsBrowseDir({ id: "l1", path: join(tmp, "link-root", "proj") });
+    expect(r.path).toBe(realpathSync(join(tmp, "real-root", "proj")));
+    for (const outside of [tmp, join(tmp, "does-not-exist")]) {
+      await expect(handleFsBrowseDir({ id: "l2", path: outside })).rejects.toMatchObject({ code: "forbidden" });
+    }
+  });
+
+  it("never lists or enters kernel pseudo-filesystems", async () => {
+    delete process.env.CODEOID_FS_BROWSE_ROOT;
+    const top = await handleFsBrowseDir({ id: "k1", path: "/" });
+    expect(top.entries.map((e) => e.name)).not.toContain("proc");
+    await expect(handleFsBrowseDir({ id: "k2", path: "/proc/self/cwd" })).rejects.toMatchObject({ code: "not_found" });
   });
 
   it("keeps a configured root as the boundary", async () => {

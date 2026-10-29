@@ -157,4 +157,16 @@ describe("session.create workdir containment (vector 2)", () => {
       else process.env.CODEOID_FS_BROWSE_ROOT = savedRoot;
     }
   });
+
+  it("keeps the host-wide folder browser away from a read-only watcher (fs:read without session:create)", async () => {
+    const watcher: AuthContext = { ...AUTH, scopes: ["session:list", "session:watch", "fs:read"] as AuthContext["scopes"] };
+    const refused = (await manager.handle({ type: "fs.browse_dir", id: "w1", path: "/" }, watcher, CLIENT)) as {
+      type: string;
+      code?: string;
+      error?: string;
+    };
+    expect(refused).toMatchObject({ type: "response.error", code: "forbidden", error: "Missing scope: session:create" });
+    const allowed = (await manager.handle({ type: "fs.browse_dir", id: "w2", path: tmp }, AUTH, CLIENT)) as { type: string };
+    expect(allowed.type).toBe("fs.browse_dir.result");
+  });
 });

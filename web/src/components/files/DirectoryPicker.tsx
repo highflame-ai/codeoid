@@ -47,6 +47,7 @@ interface Listing {
   parent: string | null;
   isGitRepo: boolean;
   hiddenCount: number;
+  truncated: boolean;
   entries: FsEntry[];
 }
 
@@ -95,6 +96,9 @@ const DirectoryPicker: Component<{
   const [query, setQuery] = createSignal("");
   const [active, setActive] = createSignal(-1);
   const [showHidden, setShowHidden] = createSignal(readShowHidden());
+  // The typed directory (`~/x/`, unresolved) the listing answers, when it came
+  // from a path query — so "is the listing for what's typed" needs no resolving.
+  const [listedFor, setListedFor] = createSignal<string | null>(null);
 
   let input: HTMLInputElement | undefined;
   let listEl: HTMLUListElement | undefined;
@@ -128,6 +132,7 @@ const DirectoryPicker: Component<{
       parent: r.parent,
       isGitRepo: r.isGitRepo ?? false,
       hiddenCount: r.hiddenCount ?? 0,
+      truncated: r.truncated ?? false,
       entries: r.entries,
     };
   }
@@ -144,6 +149,7 @@ const DirectoryPicker: Component<{
       const next = await fetchDir(path);
       if (mine !== seq) return false;
       setListing(next);
+      setListedFor(opts.keepQuery ? (path ?? null) : null);
       setError(null);
       lastPath = next.path;
       if (!opts.keepQuery) {
@@ -199,7 +205,16 @@ const DirectoryPicker: Component<{
   );
 
   const parsed = createMemo(() => parseQuery(query()));
-  const visible = createMemo(() => filterEntries(listing()?.entries ?? [], parsed().needle));
+  /** False while a typed path's directory is still loading: the listing on screen is another folder's. */
+  const fresh = createMemo(() => {
+    const dir = parsed().dir;
+    if (dir === null) return true;
+    const l = listing();
+    const asked = listedFor();
+    return !!l && (sameDir(dir, l.path) || (asked !== null && sameDir(dir, asked)));
+  });
+  // Never match a typed segment against a stale listing: Enter or Tab would act on the wrong folder.
+  const visible = createMemo(() => (fresh() ? filterEntries(listing()?.entries ?? [], parsed().needle) : []));
 
   // Typing a path browses its directory part (debounced), once per change of it.
   createEffect(
@@ -231,14 +246,39 @@ const DirectoryPicker: Component<{
     return i >= 0 ? visible()[i] : undefined;
   };
 
-  /** What "Select" would hand back: the highlighted folder, else the one on screen. */
-  const target = (): string | undefined => highlighted()?.path ?? listing()?.path;
+  /**
+   * What "Select" hands back: the highlighted folder; else a typed path the
+   * listing can't vouch for (still loading, or a last segment matching
+   * nothing), which the daemon resolves first; else the folder on screen.
+   */
+  const target = (): { path: string; typed: boolean } | undefined => {
+    const h = highlighted();
+    if (h) return { path: h.path, typed: false };
+    const q = query().trim();
+    if (isPathQuery(q) && (!fresh() || parsed().needle)) return { path: q, typed: true };
+    const here = listing()?.path;
+    return here ? { path: here, typed: false } : undefined;
+  };
 
-  function pick(path: string | undefined): void {
-    if (!path) return;
+  function pick(path: string): void {
     lastPath = path;
     props.onPick(path);
     props.onClose();
+  }
+
+  async function pickTarget(): Promise<void> {
+    const t = target();
+    if (!t) return;
+    if (!t.typed) {
+      pick(t.path);
+      return;
+    }
+    // Resolve through the daemon so a pasted path is picked canonical, and a
+    // wrong one shows its error instead of closing the picker.
+    if (await browse(t.path)) {
+      const here = listing()?.path;
+      if (here) pick(here);
+    }
   }
 
   function goUp(): void {
@@ -282,7 +322,7 @@ const DirectoryPicker: Component<{
       }
       if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
         handled();
-        pick(target());
+        void pickTarget();
         return;
       }
       if (!typing) return;
@@ -312,7 +352,8 @@ const DirectoryPicker: Component<{
         case "Backspace":
           if (!query()) {
             handled();
-            goUp();
+            // Held down to clear the filter, auto-repeat must not keep climbing.
+            if (!e.repeat) goUp();
           }
           return;
         case "l":
@@ -359,7 +400,7 @@ const DirectoryPicker: Component<{
 
   const targetLabel = () => {
     const t = target();
-    return t ? basename(t) : "";
+    return t ? basename(t.path) : "";
   };
 
   return (
@@ -503,13 +544,12 @@ const DirectoryPicker: Component<{
                       index={i()}
                       active={active() === i()}
                       needle={parsed().needle}
-                      onHover={() => setActive(i())}
                       onOpen={() => void browse(entry.path)}
                       onPick={() => pick(entry.path)}
                     />
                   )}
                 </For>
-                <Show when={listing() && visible().length === 0 && !loading()}>
+                <Show when={listing() && fresh() && visible().length === 0 && !loading()}>
                   <li class="px-6 py-8 text-center text-sm text-fg-muted">
                     <Show
                       when={parsed().needle}
@@ -533,6 +573,11 @@ const DirectoryPicker: Component<{
                   </li>
                 </Show>
               </ul>
+              <Show when={listing()?.truncated && fresh()}>
+                <div class="border-t border-border/50 px-3 py-1.5 text-[11px] text-fg-faint">
+                  This folder is too big to list in full — filter, or type the path you want.
+                </div>
+              </Show>
             </div>
           </div>
 
@@ -557,10 +602,10 @@ const DirectoryPicker: Component<{
               </button>
               <button
                 type="button"
-                onClick={() => pick(target())}
+                onClick={() => void pickTarget()}
                 disabled={!target()}
                 class="flex min-w-0 items-center gap-1.5 rounded bg-accent px-3 py-1 text-xs font-semibold text-bg transition hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
-                title={target() ? `Use ${target()} (⌘/Ctrl+Enter)` : undefined}
+                title={target() ? `Use ${target()!.path} (⌘/Ctrl+Enter)` : undefined}
               >
                 <span>Select</span>
                 <span class="max-w-[14rem] truncate font-mono font-normal">{targetLabel()}</span>
@@ -578,7 +623,6 @@ const Row: Component<{
   index: number;
   active: boolean;
   needle: string;
-  onHover: () => void;
   onOpen: () => void;
   onPick: () => void;
 }> = (props) => {
@@ -594,17 +638,17 @@ const Row: Component<{
       role="option"
       aria-selected={props.active}
       class={`group flex items-center gap-2 px-3 py-1 ${props.active ? "bg-bg-active" : "hover:bg-bg-hover"}`}
-      onMouseMove={() => {
-        if (!props.active) props.onHover();
-      }}
     >
       <button
         type="button"
         tabIndex={-1}
-        onClick={() => props.onOpen()}
-        onDblClick={() => props.onPick()}
+        // A double-click's second click would land on a row of the folder the
+        // first one opened, so only the first click counts.
+        onClick={(e) => {
+          if (e.detail <= 1) props.onOpen();
+        }}
         class="flex min-w-0 flex-1 items-center gap-2 py-0.5 text-left text-sm text-fg"
-        title={`${props.entry.path}\nClick to open · double-click to select`}
+        title={`${props.entry.path}\nClick to open`}
       >
         <FolderIcon class={`h-4 w-4 shrink-0 ${props.entry.isGitRepo ? "text-accent" : "text-fg-faint"}`} />
         <span class="truncate font-mono">

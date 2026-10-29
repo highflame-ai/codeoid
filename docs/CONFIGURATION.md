@@ -37,7 +37,7 @@ one-way door, and how clients discover the token.
 | `session:approve` | Approve / deny tool requests; also required for `/mode`, `/pin`, `/unpin` |
 | `session:read` | Read-only fleet visibility (conductor): list / find / summarize sessions |
 | `session:dispatch` | Send-class fleet routing (conductor): direct / interrupt / spawn on the owner's behalf |
-| `fs:read` | Read files + list directories under a session's workdir |
+| `fs:read` | Read files + list directories under a session's workdir. With `session:create` too, browse folder names anywhere under `CODEOID_FS_BROWSE_ROOT` (default: the whole host, never credential stores) to pick a workdir |
 | `settings:read` | Read the settings manifest + current (non-secret) configuration |
 | `settings:write` | Write daemon configuration (`config.json` + `.env`), including secrets |
 

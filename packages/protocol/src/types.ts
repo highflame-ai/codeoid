@@ -2332,6 +2332,8 @@ export interface FsBrowseDirResultMsg {
   isGitRepo?: boolean;
   /** Directories left out because `showHidden` was off (a hint; absent when none). */
   hiddenCount?: number;
+  /** The directory was too big to list in full; `entries` is a partial view. */
+  truncated?: boolean;
   /** Directory entries; daemon only emits directories for this verb. */
   entries: FsEntry[];
 }

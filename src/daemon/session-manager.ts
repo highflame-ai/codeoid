@@ -3493,13 +3493,18 @@ mcpHub: this.#mcpHub,
     msg: Extract<ClientMessage, { type: "fs.browse_dir" }>,
     auth: AuthContext,
   ): Promise<DaemonMessage> {
-    if (!hasScope(auth.scopes as string[], SCOPES.FS_READ)) {
-      return {
-        type: "response.error",
-        requestId: msg.id,
-        error: "Missing scope: fs:read",
-        code: "forbidden",
-      };
+    // The browser reaches the whole host (not one session's workdir like
+    // fs.list), and exists only to pick a workdir — so it takes session:create
+    // too, which keeps a read-only watcher (fs:read alone) from mapping the host.
+    for (const scope of [SCOPES.FS_READ, SCOPES.SESSION_CREATE]) {
+      if (!hasScope(auth.scopes as string[], scope)) {
+        return {
+          type: "response.error",
+          requestId: msg.id,
+          error: `Missing scope: ${scope}`,
+          code: "forbidden",
+        };
+      }
     }
     try {
       return await handleFsBrowseDir(msg);

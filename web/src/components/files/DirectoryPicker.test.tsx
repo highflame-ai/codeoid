@@ -107,15 +107,66 @@ describe("DirectoryPicker", () => {
   });
 
   it("keeps the listing when a typed path is wrong, and Esc clears before it closes", async () => {
-    const { findByText, findByRole, getByText, input, onClose } = setup();
+    const { findByText, findByRole, getByText, queryByText, input, onClose } = setup();
     await findByText("src");
     fireEvent.input(input, { target: { value: "/nope/" } });
     expect((await findByRole("alert")).textContent).toContain("no such path");
-    expect(getByText("src")).toBeTruthy();
+    // Home's folders aren't offered for a path they don't belong to…
+    expect(queryByText("src")).toBeNull();
     fireEvent.keyDown(input, { key: "Escape" });
     expect(input.value).toBe("");
+    // …and come back once the path is cleared.
+    expect(getByText("src")).toBeTruthy();
     expect(onClose).not.toHaveBeenCalled();
     fireEvent.keyDown(input, { key: "Escape" });
     expect(onClose).toHaveBeenCalled();
+  });
+
+  it("selects the typed path on ⌘/Ctrl+Enter right after a paste, before its listing lands", async () => {
+    const { findByText, input, onPick } = setup();
+    await findByText("src");
+    // No wait: the debounced browse of /Workspace/ hasn't run, so the listing is still home.
+    fireEvent.input(input, { target: { value: "/Workspace/codeoid" } });
+    fireEvent.keyDown(input, { key: "Enter", ctrlKey: true });
+    await waitFor(() => expect(onPick).toHaveBeenCalledWith("/Workspace/codeoid"));
+  });
+
+  it("opens the typed path on Enter, never a same-named folder of the stale listing", async () => {
+    const { findByText, findByRole, getByRole, input } = setup();
+    await findByText("src");
+    // Home has "notes"; while /Workspace/ is pending the needle "no" must not open ~/notes.
+    fireEvent.input(input, { target: { value: "/Workspace/no" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect((await findByRole("alert")).textContent).toContain("no such path");
+    expect(clientRequestMock.mock.calls.map((c) => c[0].path)).not.toContain(`${HOME}/notes`);
+    expect(getByRole("navigation", { name: "Path" }).textContent).not.toContain("notes");
+  });
+
+  it("selects the folder on screen from the footer even after the pointer crossed a row", async () => {
+    const { findByText, getByText, getByTitle, onPick } = setup("/Workspace");
+    await findByText("zeroid");
+    fireEvent.mouseMove(getByText("zeroid"));
+    fireEvent.click(getByTitle(/Use \/Workspace \(/));
+    expect(onPick).toHaveBeenCalledWith("/Workspace");
+  });
+
+  it("does not climb folders while Backspace auto-repeats after clearing the filter", async () => {
+    const { findByText, getByRole, input } = setup("/Workspace");
+    await findByText("zeroid");
+    fireEvent.keyDown(input, { key: "Backspace", repeat: true });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(getByRole("navigation", { name: "Path" }).textContent).toContain("Workspace");
+    expect(clientRequestMock.mock.calls.map((c) => c[0].path)).not.toContain("/");
+  });
+
+  it("ignores a double-click's second click on a row", async () => {
+    const { findByText, getByText } = setup("/Workspace");
+    await findByText("zeroid");
+    const calls = clientRequestMock.mock.calls.length;
+    fireEvent.click(getByText("zeroid"), { detail: 2 });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(clientRequestMock.mock.calls.length).toBe(calls);
+    fireEvent.click(getByText("zeroid"), { detail: 1 });
+    await waitFor(() => expect(clientRequestMock.mock.calls.length).toBe(calls + 1));
   });
 });
