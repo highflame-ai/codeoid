@@ -2001,8 +2001,10 @@ export interface FsListMsg extends BaseClientMsg {
  */
 export interface FsBrowseDirMsg extends BaseClientMsg {
   type: "fs.browse_dir";
-  /** Absolute path to browse. Defaults to the daemon user's HOME. */
+  /** Path to browse: absolute, `~`-prefixed, or relative to the root. Defaults to the daemon user's HOME. */
   path?: string;
+  /** Include dot-dirs and the usual build/dependency dirs. VCS internals and protected dirs stay out. */
+  showHidden?: boolean;
 }
 
 /**
@@ -2288,6 +2290,8 @@ export interface FsEntry {
   mtimeMs?: number;
   /** True when this entry is a symlink (kind reflects the resolved target). */
   isSymlink?: boolean;
+  /** `fs.browse_dir` only: the directory holds a `.git` (a clone or a worktree). */
+  isGitRepo?: boolean;
 }
 
 export interface FsListResultMsg {
@@ -2318,10 +2322,16 @@ export interface FsBrowseDirResultMsg {
   requestId: string;
   /** Canonical absolute path that was browsed. */
   path: string;
-  /** Configured root that bounds the browse (HOME by default). */
+  /** Configured root that bounds the browse (`CODEOID_FS_BROWSE_ROOT`, else the filesystem root). */
   root: string;
   /** Parent path (canonical) — null when `path` is at the root. */
   parent: string | null;
+  /** The daemon user's HOME (canonical), or null when it lies outside `root`. */
+  home?: string | null;
+  /** `path` itself holds a `.git`. */
+  isGitRepo?: boolean;
+  /** Directories left out because `showHidden` was off (a hint; absent when none). */
+  hiddenCount?: number;
   /** Directory entries; daemon only emits directories for this verb. */
   entries: FsEntry[];
 }

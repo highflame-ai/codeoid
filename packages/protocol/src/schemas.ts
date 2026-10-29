@@ -388,6 +388,7 @@ export const fsBrowseDirSchema = z.object({
   ...base,
   type: z.literal("fs.browse_dir"),
   path: pathField.optional(),
+  showHidden: z.boolean().optional(),
 });
 
 export const claudeConfigSchema = z.object({
