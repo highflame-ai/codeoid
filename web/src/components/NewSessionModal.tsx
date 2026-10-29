@@ -573,14 +573,14 @@ const NewSessionModal: Component = () => {
   return (
     <Show when={openSignal()}>
       <div
-        class="fixed inset-0 z-40 flex items-start justify-center bg-bg/70 backdrop-blur-sm"
+        class="fixed inset-0 z-40 flex items-start justify-center overflow-y-auto bg-bg/70 backdrop-blur-sm"
         onClick={(e) => {
           if (e.target === e.currentTarget) setOpenSignal(false);
         }}
       >
         <form
           onSubmit={submit}
-          class="mt-[16vh] w-full max-w-md space-y-4 rounded-lg border border-border bg-bg-elev p-5 shadow-2xl"
+          class="my-[16vh] w-full max-w-md space-y-4 rounded-lg border border-border bg-bg-elev p-5 shadow-2xl"
         >
           <header class="space-y-2">
             <h2 class="text-base font-semibold tracking-tight text-fg">
