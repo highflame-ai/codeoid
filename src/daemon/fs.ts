@@ -471,7 +471,9 @@ export async function handleFsBrowseDir(
       }
     }
   } catch {
-    // A read error mid-listing (dir removed, I/O error): keep what was read.
+    // A read error mid-listing (dir removed, I/O error): keep what was read,
+    // flagged as partial rather than passed off as the whole folder.
+    truncated = true;
   } finally {
     // `break` closes the handle; a completed or failed iteration may not have.
     await dir.close().catch(() => {});
@@ -490,7 +492,9 @@ export async function handleFsBrowseDir(
       } catch {
         return null; // Broken or looping link — nothing to browse into.
       }
-      if (browseRefused(target)) return null;
+      // Into a refused dir, or out of the root: neither is browsable, and the
+      // row would leak the target's mtime and git flag.
+      if (browseRefused(target) || !within(target, canonicalRoot)) return null;
     }
     let childStat: Awaited<ReturnType<typeof fs.stat>>;
     try {

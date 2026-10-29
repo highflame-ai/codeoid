@@ -225,6 +225,16 @@ describe("handleFsBrowseDir", () => {
     await expect(handleFsBrowseDir({ id: "s2", path: join(tmp, "pub", "sneaky") })).rejects.toMatchObject({ code: "not_found" });
   });
 
+  it("drops a symlink that leads out of a configured root", async () => {
+    mkdirSync(join(tmp, "root", "inside"), { recursive: true });
+    mkdirSync(join(tmp, "outside", ".git"), { recursive: true });
+    symlinkSync(join(tmp, "outside"), join(tmp, "root", "out"));
+    symlinkSync(join(tmp, "root", "inside"), join(tmp, "root", "in"));
+    process.env.CODEOID_FS_BROWSE_ROOT = join(tmp, "root");
+    const r = await handleFsBrowseDir({ id: "o1" });
+    expect(r.entries.map((e) => e.name)).toEqual(["in", "inside"]);
+  });
+
   it("follows a symlinked root and answers the same for anything outside it", async () => {
     mkdirSync(join(tmp, "real-root", "proj"), { recursive: true });
     symlinkSync(join(tmp, "real-root"), join(tmp, "link-root"));

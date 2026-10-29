@@ -8,6 +8,8 @@ vi.mock("../../state/connection", () => ({
   getClient: () => ({ request: clientRequestMock }),
 }));
 
+import { createSignal } from "solid-js";
+
 import DirectoryPicker, { _resetDirectoryPickerForTest } from "./DirectoryPicker";
 
 const HOME = "/home/me";
@@ -15,6 +17,7 @@ const TREE: Record<string, string[]> = {
   "/": ["Workspace", "home", "usr"],
   "/home": ["me"],
   [HOME]: ["notes", "src"],
+  [`${HOME}/src`]: ["alpha", "beta"],
   "/Workspace": ["codeoid", "zeroid"],
   "/Workspace/codeoid": [],
   "/Workspace/zeroid": [],
@@ -168,5 +171,81 @@ describe("DirectoryPicker", () => {
     expect(clientRequestMock.mock.calls.length).toBe(calls);
     fireEvent.click(getByText("zeroid"), { detail: 1 });
     await waitFor(() => expect(clientRequestMock.mock.calls.length).toBe(calls + 1));
+  });
+
+  it("keeps a typed ~/ path's listing when hidden folders are toggled", async () => {
+    const { findByText, getByLabelText, getByText, input } = setup();
+    await findByText("notes");
+    fireEvent.input(input, { target: { value: "~/src/" } });
+    await findByText("alpha");
+    fireEvent.click(getByLabelText(/Hidden folders/));
+    await waitFor(() => expect(clientRequestMock.mock.calls.at(-1)?.[0]).toMatchObject({ showHidden: true }));
+    await new Promise((r) => setTimeout(r, 30)); // the refreshed listing has landed
+    expect(getByText("alpha")).toBeTruthy();
+  });
+
+  it("stops the initial-path walk once the user navigates elsewhere", async () => {
+    let fail!: () => void;
+    clientRequestMock.mockImplementation((msg) =>
+      msg.path === "/gone/deep" ? new Promise((_res, rej) => (fail = () => rej(new Error("no such directory")))) : serve(msg),
+    );
+    const onPick = vi.fn();
+    const utils = render(() => <DirectoryPicker open initialPath="/gone/deep" onPick={onPick} onClose={() => {}} />);
+    const input = utils.getByLabelText("Filter folders, or type a path") as HTMLInputElement;
+    await waitFor(() => expect(fail).toBeTypeOf("function"));
+    fireEvent.input(input, { target: { value: "/usr/" } });
+    await utils.findByText("local");
+    fail();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(clientRequestMock.mock.calls.map((c) => c[0].path)).not.toContain("/gone");
+    expect(input.value).toBe("/usr/");
+    expect(utils.getByText("local")).toBeTruthy();
+    expect(utils.queryByText(/isn't available/)).toBeNull();
+  });
+
+  it("leaves Enter and Esc to an IME composition", async () => {
+    const { findByText, getByRole, input, onClose } = setup();
+    await findByText("notes");
+    fireEvent.input(input, { target: { value: "s" } });
+    fireEvent.keyDown(input, { key: "Enter", isComposing: true, keyCode: 229 });
+    fireEvent.keyDown(input, { key: "Escape", isComposing: true, keyCode: 229 });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(getByRole("navigation", { name: "Path" }).textContent).not.toContain("src");
+    expect(input.value).toBe("s");
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("keeps a filter typed while the folder it opened was loading", async () => {
+    let release!: () => void;
+    clientRequestMock.mockImplementation((msg) =>
+      msg.path === `${HOME}/src` ? new Promise((res) => (release = () => res(serve(msg)))) : serve(msg),
+    );
+    const utils = render(() => <DirectoryPicker open onPick={() => {}} onClose={() => {}} />);
+    const input = utils.getByLabelText("Filter folders, or type a path") as HTMLInputElement;
+    await utils.findByText("notes");
+    fireEvent.input(input, { target: { value: "src" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    fireEvent.input(input, { target: { value: "be" } });
+    release();
+    await utils.findByText("be", { selector: "mark" });
+    expect(input.value).toBe("be");
+    expect(utils.queryByText("alpha")).toBeNull();
+  });
+
+  it("gives focus back to what had it when the picker closes", async () => {
+    clientRequestMock.mockImplementation(serve);
+    const [open, setOpen] = createSignal(false);
+    const utils = render(() => (
+      <>
+        <button type="button">Browse…</button>
+        <DirectoryPicker open={open()} onPick={() => {}} onClose={() => setOpen(false)} />
+      </>
+    ));
+    const opener = utils.getByText("Browse…");
+    opener.focus();
+    setOpen(true);
+    await utils.findByText("notes");
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => expect(document.activeElement).toBe(opener));
   });
 });

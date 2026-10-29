@@ -139,30 +139,37 @@ const DirectoryPicker: Component<{
 
   /**
    * Show `path`. A failure keeps the current listing on screen with the error
-   * above it, so a mistyped path never blanks the picker. Resolves true when
-   * the folder was shown.
+   * above it, so a mistyped path never blanks the picker. "superseded" means a
+   * newer browse (the user moved on) took over before this one answered.
    */
-  async function browse(path: string | undefined, opts: { keepQuery?: boolean } = {}): Promise<boolean> {
+  async function browse(
+    path: string | undefined,
+    opts: { keepQuery?: boolean } = {},
+  ): Promise<"shown" | "failed" | "superseded"> {
     const mine = ++seq;
+    // What a navigation clears is the query that led to it; one typed while
+    // the folder loads (a filter for it) survives.
+    const asked = query();
     setLoading(true);
     try {
       const next = await fetchDir(path);
-      if (mine !== seq) return false;
+      if (mine !== seq) return "superseded";
       setListing(next);
       setListedFor(opts.keepQuery ? (path ?? null) : null);
       setError(null);
       lastPath = next.path;
-      if (!opts.keepQuery) {
+      if (!opts.keepQuery && query() === asked) {
         setQuery("");
         queriedDir = null;
       }
       // Highlight only while narrowing, so ⌘↵ on `/a/b/` selects b itself.
       setActive(opts.keepQuery && parseQuery(query()).needle ? 0 : -1);
       listEl?.scrollTo?.({ top: 0 });
-      return true;
+      return "shown";
     } catch (err) {
-      if (mine === seq) setError(err instanceof Error ? err.message : String(err));
-      return false;
+      if (mine !== seq) return "superseded";
+      setError(err instanceof Error ? err.message : String(err));
+      return "failed";
     } finally {
       if (mine === seq) setLoading(false);
     }
@@ -177,7 +184,10 @@ const DirectoryPicker: Component<{
     }
     const candidates = selfAndAncestors(start);
     for (const [i, p] of candidates.entries()) {
-      if (await browse(p)) {
+      const outcome = await browse(p);
+      // The user navigated while the walk ran: theirs wins, so stop here.
+      if (outcome === "superseded") return;
+      if (outcome === "shown") {
         if (i > 0) setNotice(`${start} isn't available — showing the nearest folder above it.`);
         return;
       }
@@ -186,11 +196,17 @@ const DirectoryPicker: Component<{
     await browse(undefined);
   }
 
+  // Focus goes back where it was on close (the Browse… button), as ConfirmDialog does.
+  let focusBefore: HTMLElement | null = null;
   createEffect(
     on(
       () => props.open,
-      (o) => {
-        if (!o) return;
+      (o, was) => {
+        if (!o) {
+          if (was) queueMicrotask(() => focusBefore?.focus?.());
+          return;
+        }
+        focusBefore = document.activeElement as HTMLElement | null;
         setQuery("");
         setError(null);
         queriedDir = null;
@@ -275,7 +291,7 @@ const DirectoryPicker: Component<{
     }
     // Resolve through the daemon so a pasted path is picked canonical, and a
     // wrong one shows its error instead of closing the picker.
-    if (await browse(t.path)) {
+    if ((await browse(t.path)) === "shown") {
       const here = listing()?.path;
       if (here) pick(here);
     }
@@ -309,6 +325,8 @@ const DirectoryPicker: Component<{
   createEffect(() => {
     if (!props.open) return;
     const onKey = (e: KeyboardEvent) => {
+      // Enter/Esc while composing (CJK input) commit or cancel the composition.
+      if (e.isComposing || e.keyCode === 229) return;
       const typing = document.activeElement === input;
       const handled = (): void => {
         e.preventDefault();
@@ -393,8 +411,7 @@ const DirectoryPicker: Component<{
     const v = !showHidden();
     setShowHidden(v);
     writeShowHidden(v);
-    const p = listing()?.path;
-    void browse(p, { keepQuery: true });
+    void browse(parsed().dir ?? listing()?.path, { keepQuery: true });
     input?.focus();
   }
 
@@ -525,7 +542,7 @@ const DirectoryPicker: Component<{
                 class="min-h-16 flex-1 overflow-y-auto py-1 sm:max-h-[50vh] [@media(min-height:560px)]:min-h-[12rem]"
               >
                 <Show when={listing()?.parent && !parsed().needle}>
-                  <li>
+                  <li role="presentation">
                     <button
                       type="button"
                       onClick={goUp}
@@ -550,7 +567,7 @@ const DirectoryPicker: Component<{
                   )}
                 </For>
                 <Show when={listing() && fresh() && visible().length === 0 && !loading()}>
-                  <li class="px-6 py-8 text-center text-sm text-fg-muted">
+                  <li role="presentation" class="px-6 py-8 text-center text-sm text-fg-muted">
                     <Show
                       when={parsed().needle}
                       fallback={
