@@ -35,6 +35,7 @@ import { CODEX_INSTALL_HINT, resolveCodexCommand } from "./codex/resolve.js";
 import { GeminiAcpProvider } from "./acp/index.js";
 import { GEMINI_CLI_INSTALL_HINT, resolveGeminiCliCommand } from "./acp/resolve.js";
 import { QwenProvider } from "./qwen/index.js";
+import { SCRIPTED_ENV, SCRIPTED_PROVIDER_ID, ScriptedProvider } from "./scripted/index.js";
 import { StatelessSessionProvider } from "./stateless.js";
 import { LLAMACPP_DISPLAY_NAME, LLAMACPP_PROVIDER_ID, createLlamaCppProvider } from "./llamacpp/index.js";
 import type { EndpointStore } from "../openai-endpoints.js";
@@ -589,6 +590,16 @@ export function createDefaultProviderRegistry(
           resolveAccount: init.resolveAccount,
           extraEnv: init.extraEnv,
         }),
+    });
+  }
+  // The end-to-end suite's scripted backend (#429): only when a test names a
+  // script, so a normal install never offers it.
+  const script = env[SCRIPTED_ENV];
+  if (script) {
+    registry.register({
+      id: SCRIPTED_PROVIDER_ID,
+      displayName: "Scripted (end-to-end tests)",
+      create: (init) => new StatelessSessionProvider(new ScriptedProvider(script), init.sessionId),
     });
   }
   // User-defined OpenAI-compatible endpoints (`oai:<name>`) — registered

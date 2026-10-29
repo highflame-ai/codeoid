@@ -177,6 +177,7 @@ supported. First response wins.
 bun run build        # bun build src/cli.ts --outdir dist
 bun run dev          # bun --watch src/cli.ts
 bun run typecheck    # tsc --noEmit
+bun run test:e2e     # end-to-end: real daemon + web UI + CLI, scripted backend (e2e/README.md)
 bun run lint         # biome check
 
 codeoid start        # daemon + all frontends
