@@ -1159,6 +1159,23 @@ describe("run outcomes", () => {
     expect(store.listRuns(routine.id, { limit: 1 })[0]).toMatchObject({ costUnknown: true });
   });
 
+  it("the run's own turn that ignores its forced stop is taken down without waiting for a status change (#430)", async () => {
+    const { routine } = create({ name: "stubborn-run", maxMinutes: 1, maxCostUsd: 5 });
+    host.ignoreStops = true;
+    host.script = { kind: "hang", costPerPoll: 0.01 };
+    svc.fire(routine, "manual", null, "owner");
+    await settle();
+    const s = [...host.sessions.values()][0]!;
+    expect(store.listRuns(routine.id, { limit: 1 })[0]).toMatchObject({ status: "timed_out", costUnknown: true });
+    // No status notification ever arrives: the turn just keeps generating.
+    for (let i = 0; i < 3; i++) {
+      timers.fire();
+      await Promise.resolve();
+    }
+    await new Promise((r) => setTimeout(r, 0));
+    expect(s.terminated).toBe(1);
+  });
+
   it("a stop held back while the owner joined the turn never lands on it (#430)", async () => {
     const { routine } = create({ name: "joined-later" });
     host.script = { kind: "reply", text: "done" };

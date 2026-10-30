@@ -1394,6 +1394,8 @@ export class RoutineService {
         this.#store.updateRun(t.runId, usageSince(t, info));
         this.#carry(t, totalsOf(info));
         this.#trailing.set(live.sessionId, t);
+        // A turn still running past its stop may never change status again: hold it now.
+        this.#flushTrailing(live.sessionId);
       }
       void this.#prune(routine.id).catch(() => {});
     }
