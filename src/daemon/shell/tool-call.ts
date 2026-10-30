@@ -27,8 +27,9 @@ const CWD_KEYS = ["cwd", "directory", "dir_path", "workdir", "working_directory"
 /**
  * The command line a shell tool call runs, exactly — an argv is quoted back
  * into one line, and codeoid's own output-compression wrapper is seen
- * through — with the directory it names, if any. Null when the call isn't a
- * shell command, or its command can't be read.
+ * through (to the command it runs, in its `--cwd`) — with the directory it
+ * names, if any. Null when the call isn't a shell command, or its command
+ * can't be read.
  */
 export function shellCallOf(toolName: string, input: Record<string, unknown>): { command: string; cwd: string | null } | null {
   if (!isShellTool(toolName)) return null;
@@ -40,7 +41,8 @@ export function shellCallOf(toolName: string, input: Record<string, unknown>): {
     if (command !== null) break;
   }
   if (command === null) return null;
-  command = decodeCompressedCommand(command) ?? command;
+  const compressed = decodeCompressedCommand(command);
+  if (compressed) return { command: compressed.command, cwd: compressed.cwd };
   let cwd: string | null = null;
   for (const k of CWD_KEYS) {
     const v = input[k];

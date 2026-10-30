@@ -185,11 +185,46 @@ describe("decodeCompressedCommand (#431)", () => {
   it("sees through codeoid's own wrapper to the command it runs — and only that wrapper", async () => {
     const { decodeCompressedCommand, resolveWrapperPath } = await import("../daemon/compress/prehook.js");
     const b64 = Buffer.from("rm -rf ~", "utf8").toString("base64");
-    expect(decodeCompressedCommand(`bun ${resolveWrapperPath()} --b64 ${b64} --cwd /w`)).toBe("rm -rf ~");
+    expect(decodeCompressedCommand(`bun ${resolveWrapperPath()} --b64 ${b64} --cwd /w`)).toEqual({ command: "rm -rf ~", cwd: "/w" });
     expect(decodeCompressedCommand(`bun /tmp/evil/wrapper-cli.ts --b64 ${b64} --cwd /w`)).toBeNull();
     // A look-alike of the same length, too.
     const lookAlike = resolveWrapperPath().replace("compress", "compresX");
     expect(decodeCompressedCommand(`bun ${lookAlike} --b64 ${b64} --cwd /w`)).toBeNull();
     expect(decodeCompressedCommand("git status")).toBeNull();
+  });
+
+  it("sees through only a line exactly as the rewrite writes it (round-1 audit)", async () => {
+    const { decodeCompressedCommand, resolveWrapperPath, rewriteBashToolInput } = await import("../daemon/compress/prehook.js");
+    const wrapper = resolveWrapperPath();
+    const ls = Buffer.from("ls", "utf8").toString("base64");
+    // The agent can write the prefix itself: what follows it runs too.
+    expect(decodeCompressedCommand(`bun ${wrapper} --b64 ${ls} --cwd /w ; rm -rf ~`)).toBeNull();
+    expect(decodeCompressedCommand(`bun ${wrapper} --b64 ${ls} --cwd /w --cmd 'rm -rf ~'`)).toBeNull();
+    expect(decodeCompressedCommand(`bun ${wrapper} --b64 ${ls} --cwd /w\nrm -rf ~`)).toBeNull();
+    expect(decodeCompressedCommand(`bun ${wrapper} --b64 ${ls} --cwd '/w'; rm -rf ~; '/x'`)).toBeNull();
+    // A payload that doesn't round-trip (lenient decoding) isn't codeoid's.
+    expect(decodeCompressedCommand(`bun ${wrapper} --b64 bHM --cwd /w`)).toBeNull();
+    // What the rewrite produces decodes, with its quoted --cwd.
+    const out = rewriteBashToolInput({
+      toolName: "Bash",
+      toolInput: { command: "git diff" },
+      config: mkConfig(true),
+      registry: mkRegistry(),
+      workdir: "/Users/alice/it's here",
+      wrapperPath: wrapper,
+    });
+    expect(decodeCompressedCommand(out!.command as string)).toEqual({ command: "git diff", cwd: "/Users/alice/it's here" });
+  });
+
+  it("is judged in the --cwd the wrapper runs it in", async () => {
+    const { resolveWrapperPath } = await import("../daemon/compress/prehook.js");
+    const { shellCallOf } = await import("../daemon/shell/tool-call.js");
+    const b64 = Buffer.from("cat config.json", "utf8").toString("base64");
+    expect(shellCallOf("Bash", { command: `bun ${resolveWrapperPath()} --b64 ${b64} --cwd /home/u/.codeoid` })).toEqual({
+      command: "cat config.json",
+      cwd: "/home/u/.codeoid",
+    });
+    const forged = `bun ${resolveWrapperPath()} --b64 ${Buffer.from("ls").toString("base64")} --cwd /w ; rm -rf ~`;
+    expect(shellCallOf("Bash", { command: forged })?.command).toBe(forged);
   });
 });
