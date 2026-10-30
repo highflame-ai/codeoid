@@ -347,6 +347,22 @@ describe("a turn's cost (#430)", () => {
     expect(s.turnInFlight).toBe(false);
   });
 
+  it("a routine's stop of a task that fails to stop leaves it listed, and still spending (#430)", async () => {
+    const { s, provider } = await sessionWith([]);
+    provider.failingStops.add("a");
+    provider.onSessionEvent!({
+      type: "background_tasks",
+      tasks: [
+        { id: "a", kind: "local_agent", description: "run's, won't stop", status: "running" },
+        { id: "b", kind: "local_bash", description: "run's", status: "running" },
+      ],
+    });
+    await s.stopBackgroundTasksById(["a", "b"], auth);
+    expect(provider.stoppedTasks).toEqual(["a", "b"]);
+    expect(s.liveBackgroundTaskIds).toEqual(["a"]);
+    expect(s.spendingBackgroundTaskIds).toEqual(["a"]);
+  });
+
   it("a Stop that catches a wake before its turn starts drops it for good: never requeued to wake again (#430)", async () => {
     const { s, provider } = await sessionWith([result({}), result({})]);
     provider.onSessionEvent!({ type: "background_tasks", tasks: [{ id: "a", kind: "local_agent", description: "x", status: "running" }] });

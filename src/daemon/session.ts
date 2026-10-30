@@ -6243,8 +6243,12 @@ export class Session {
       this.#store.audit(sender.sub, "session.background_stop", this.id, `tasks=${ids.map((id) => id.slice(0, 8)).join(",")}`);
     }
     for (const id of ids) this.#reportedBackgroundTasks.add(id);
-    if (live.length > 0) await this.#provider.stopBackgroundTasks?.(live);
+    const failed = live.length > 0 ? ((await this.#provider.stopBackgroundTasks?.(live)) ?? []) : [];
+    // As the backend's latest level has it (one may have come during the await).
+    const listed = new Map(this.#backgroundTasks);
     for (const id of live) this.#backgroundTasks.delete(id);
+    // A stop that failed left its task running, and spending: it stays listed, as on Stop.
+    this.#keepUnstoppedListed(failed, listed);
     // The set emptied with no turn running: settle what the drain would have (approvals its agents asked, their identities).
     if (live.length > 0 && this.#backgroundTasks.size === 0 && !this.#turnActive()) this.#reconcileDrainedBackground();
     // A listed task that settled just before is stopped too: its result wakes nothing.
