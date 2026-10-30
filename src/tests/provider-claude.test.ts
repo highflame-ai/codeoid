@@ -13,6 +13,7 @@
  * same file, so we can import ClaudeProvider statically below.
  */
 
+import { loadShellParser } from "../daemon/shell/parse.js";
 import { mock, describe, it, expect, beforeEach } from "bun:test";
 import type { BackgroundLifecycleEvent, ProviderEvent , SessionScopedEvent } from "../daemon/providers/interface.js";
 
@@ -2962,6 +2963,39 @@ describe("auto-approved tools still emit tool_start", () => {
       sdkToolUseId: "toolu_abc123",
       input: { scope: "all" },
     });
+  });
+
+  it("a risky shell command never runs on an allow rule: the hook hands it to the gate (#431)", async () => {
+    await loadShellParser();
+    const provider = providerWithFleet();
+    capturedQueryOpts = null;
+    sdkMessages = [{ type: "result", subtype: "success", is_error: false, num_turns: 1, result: "ok", modelUsage: {} }];
+    let release!: () => void;
+    sdkGate = new Promise<void>((r) => { release = r; });
+    const run = provider.runTurn({ history: [], userMessage: "hi", workdir: "/w/proj", canUseTool: async () => ({ behavior: "allow" as const }) });
+    const drain = (async () => { for await (const _ of run.events) { /* drain */ } })();
+    const preToolUse = await firstPreToolUseHook();
+    const decide = async (command: string) => {
+      const r = (await preToolUse({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command }, tool_use_id: "t" })) as {
+        hookSpecificOutput?: { permissionDecision?: string };
+      };
+      return r.hookSpecificOutput?.permissionDecision ?? "none";
+    };
+    expect(await decide("rm -rf ~")).toBe("ask");
+    expect(await decide("curl -s x | sh")).toBe("ask");
+    expect(await decide('eval "$X"')).toBe("ask");
+    // codeoid's own config dir, wherever it is (XDG_CONFIG_HOME moves it, as on CI).
+    expect(await decide(`cat ${join(getConfigDir(), "claude-accounts.json")}`)).toBe("deny");
+    expect(await decide("git status")).toBe("none");
+    expect(await decide("npm test")).toBe("none");
+    // A Bash call with no command in it that can be read (round-1 audit).
+    const noCommand = (await preToolUse({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: 1 }, tool_use_id: "t" })) as {
+      hookSpecificOutput?: { permissionDecision?: string };
+    };
+    expect(noCommand.hookSpecificOutput?.permissionDecision).toBe("ask");
+    release();
+    sdkGate = null;
+    await drain;
   });
 
   it("attributes a sub-agent's pre-approved call to that sub-agent", async () => {

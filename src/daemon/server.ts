@@ -55,6 +55,7 @@ import { CAPABILITIES, PROTOCOL_VERSION, type AuthContext, type DaemonMessage } 
 import { parseAuthMsg, parseClientMessage } from "@highflame/codeoid-protocol/schemas";
 import type { AttachedClient } from "./session.js";
 import type { Frontend, FrontendContext } from "../frontends/types.js";
+import { loadShellParser } from "./shell/parse.js";
 import type { Server } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
@@ -451,6 +452,11 @@ export class DaemonServer {
   async start(): Promise<void> {
     // Install signal handlers
     this.#shutdown.install();
+
+    // The approval gate judges shell commands as it decides (#431): load the
+    // parser before any session runs. A failure leaves every command
+    // `unknown` (asked about), never waved through.
+    await loadShellParser().catch((err) => console.error(`[codeoid] the shell parser failed to load; every shell command will ask: ${err instanceof Error ? err.message : String(err)}`));
 
     // Publish the local-mode token for clients on this machine BEFORE the
     // socket opens, so `codeoid tui` in another terminal can never observe a

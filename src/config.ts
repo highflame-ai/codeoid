@@ -225,6 +225,27 @@ export function resolveZeroidUrl(value: string): string {
  * passed through so future additions don't break older loaders. Required
  * fields are minimal (nothing) — defaults cover everything.
  */
+/**
+ * How the approval gate treats shell commands by risk (#431). High-risk
+ * commands always ask, in every mode; these settings cover the rest.
+ */
+const ApprovalsSchema = z
+  .object({
+    /**
+     * In guarded mode, run low-risk commands without asking. Low is a strict
+     * allow-list (vetted read-only programs, every path in the workspace, no
+     * `cd`, variables or writing redirects); anything else is at least medium.
+     */
+    autoAllowLowRisk: z.boolean().default(false),
+    /**
+     * Ask about a command the gate can't understand, in autonomous mode too.
+     * One nothing could be read of (no parser, no command) asks regardless.
+     * Levels are read from the command line, not enforced: a best effort, not a sandbox.
+     */
+    askOnUnknown: z.boolean().default(true),
+  })
+  .default({ autoAllowLowRisk: false, askOnUnknown: true });
+
 const CompressSchema = z
   .object({
     enabled: z.boolean().default(false),
@@ -1150,6 +1171,7 @@ const RootSchema = z.object({
   memory: MemorySchema,
   workspaceIndex: WorkspaceIndexSchema,
   compress: CompressSchema,
+  approvals: ApprovalsSchema,
   guard: GuardSchema,
   labeling: LabelingSchema,
   telemetry: TelemetrySchema,
@@ -1287,6 +1309,11 @@ export interface CodeoidConfig {
     timeThresholdMs: number;
     debounceMs: number;
   };
+  /**
+   * Shell command approvals by risk (#431). Optional on the type so a
+   * hand-built config literal need not carry it; the defaults apply.
+   */
+  approvals?: { autoAllowLowRisk: boolean; askOnUnknown: boolean };
   /** Homegrown CLI output compressor (RTK-style). Disabled by default. */
   compress: {
     enabled: boolean;
@@ -1839,6 +1866,7 @@ export function loadConfig(opts: LoadOptions = {}): CodeoidConfig {
     },
     workspaceIndex: parsed.workspaceIndex,
     compress: parsed.compress,
+    approvals: parsed.approvals,
     guard: parsed.guard,
     labeling: parsed.labeling,
     telemetry: { osc8: osc8Mode },

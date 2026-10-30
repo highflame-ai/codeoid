@@ -119,3 +119,15 @@ export function formatCollaborationCost(c: {
     `across ${fleet}`,
   ].join(" · ");
 }
+
+/**
+ * One line on a shell command's risk, for the approval prompt (#431): the
+ * level and the most serious reason. Shared so every approval surface says it
+ * in the same words; empty for a low-risk command, which needs no warning.
+ */
+export function formatToolRisk(risk: { level: "low" | "medium" | "high" | "unknown"; reasons: readonly string[] } | undefined): string {
+  if (!risk || risk.level === "low") return "";
+  const label = risk.level === "unknown" ? "not understood" : `${risk.level} risk`;
+  const reason = risk.reasons[0];
+  return reason ? `${label}: ${reason}` : label;
+}

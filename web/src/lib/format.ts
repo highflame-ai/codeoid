@@ -13,6 +13,7 @@ export {
   formatDuration,
   formatPercent,
   formatTokens,
+  formatToolRisk,
   relativeTime,
 } from "@highflame/codeoid-core";
 export type { CtxSeverity } from "@highflame/codeoid-core";

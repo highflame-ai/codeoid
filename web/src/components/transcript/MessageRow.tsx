@@ -32,6 +32,7 @@ import PartsView, { hasRichParts } from "./PartsView";
 import { openRewind } from "../RewindModal";
 import { openForkFromHere } from "../ForkFromHereModal";
 import { openCompare } from "../CompareModal";
+import { RiskLine } from "./ApprovalBar";
 
 const ROLE_LABEL: Record<MessageRole, string> = {
   user: "you",
@@ -456,6 +457,7 @@ const WaitingConfirmationBody: Component<{
           <div class="rounded bg-bg-active/50 px-2 py-1.5 text-sm text-fg">
             {props.state.description}
           </div>
+          <RiskLine risk={props.state.risk} />
           <LazyJsonDetails value={props.state.input} />
         </div>
       </Match>

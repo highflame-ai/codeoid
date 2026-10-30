@@ -70,7 +70,7 @@ import type {
   SessionWorktree,
   McpReconnectResult,
 } from "../protocol/types.js";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve as resolvePath } from "node:path";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { lstat, readdir } from "node:fs/promises";
@@ -190,6 +190,10 @@ import { type CodeoidConfig, getConfigDir } from "../config.js";
 import { secretPathVerdict } from "./secret-paths.js";
 import type { CompressionRegistry } from "./compress/index.js";
 import { defaultSpillDir } from "./compress/spill.js";
+import { outsideEffects } from "./risk/effects.js";
+import { assessShellCommandSync, type ShellRisk, UNREADABLE_SHELL_CALL } from "./risk/shell-risk.js";
+import { loadShellParser, shellParserReady } from "./shell/parse.js";
+import { isShellTool, shellCallOf, shellCommandOf } from "./shell/tool-call.js";
 import { PRIMARY_CHAIN, RepeatToolGuard } from "./guard/index.js";
 import {
   CLAUDE_PROVIDER_ID,
@@ -705,19 +709,12 @@ export class RewindError extends Error {
 }
 
 /**
- * Shell commands whose effects live outside the working directory (or in
- * git's own state), which restoring files can't undo.
- */
-const OUTSIDE_EFFECT_COMMAND =
-  /\b(git\s+(push|commit|tag|reset|rebase|merge|checkout|switch|stash|cherry-pick|revert|branch\s+-[dD])|gh\s|curl\s|wget\s|scp\s|rsync\s|ssh\s|npm\s+(publish|install|i\b)|pnpm\s|yarn\s|pip3?\s+install|uv\s+(pip|add)|cargo\s+(publish|install)|docker\s|kubectl\s|helm\s|terraform\s|aws\s|gcloud\s|az\s|deploy|psql\s|mysql\s|redis-cli\s|rm\s+-[a-z]*r|mv\s)/i;
-
-/**
  * What the taken-back turns did that going back can't undo (#355):
  * external (MCP) tool calls, and shell commands with effects outside the
  * working directory. Informational — derived from codeoid's own history, so
  * it reads the same for every backend.
  */
-export function irreversibleEffects(turns: readonly CanonicalTurn[]): RewindIrreversible[] {
+export function irreversibleEffects(turns: readonly CanonicalTurn[], ctx: { workdir: string }): RewindIrreversible[] {
   const out: RewindIrreversible[] = [];
   for (const t of turns) {
     if (t.role !== "assistant" || !t.toolCalls) continue;
@@ -727,28 +724,12 @@ export function irreversibleEffects(turns: readonly CanonicalTurn[]): RewindIrre
         out.push({ tool, detail: shorten(JSON.stringify(tc.input)) });
       } else if (isShellTool(tc.name, tool)) {
         const cmd = shellCommandOf(tc.input);
-        if (OUTSIDE_EFFECT_COMMAND.test(cmd)) out.push({ tool, detail: shorten(cmd) });
+        // Judged by what it runs (#431), from the workspace it ran in.
+        if (outsideEffects(cmd, ctx)) out.push({ tool, detail: shorten(cmd) });
       }
     }
   }
   return out;
-}
-
-/** Shell tools under every backend's name (normalized or raw: Bash, bash, run_shell_command, shell, exec_command…). */
-const SHELL_TOOL_NAMES = new Set(["run_shell", "bash", "shell", "run_shell_command", "exec_command", "local_shell", "terminal", "exec"]);
-
-function isShellTool(name: string, original: string): boolean {
-  return SHELL_TOOL_NAMES.has(name.toLowerCase()) || SHELL_TOOL_NAMES.has(original.toLowerCase());
-}
-
-/** The command a shell tool ran, whichever field shape the backend used. */
-function shellCommandOf(input: Record<string, unknown>): string {
-  for (const k of ["command", "cmd", "script"]) {
-    const v = input[k];
-    if (typeof v === "string") return v;
-    if (Array.isArray(v)) return v.map(String).join(" ");
-  }
-  return "";
 }
 
 /** Secret-looking values never reach the list (auth headers, tokens, keys). */
@@ -3413,6 +3394,9 @@ export class Session {
     priority: "now" | "next" | "later" | undefined,
     stopGen: number,
   ): Promise<void> {
+    // Tool calls are judged as they're decided (#431); the daemon loads the
+    // shell parser at start, and a turn never begins without it.
+    if (!shellParserReady()) await loadShellParser().catch(() => {});
     this.#store.audit(sender.sub, "session.send", this.id);
     // A new turn is starting — clear any interrupt from the previous one.
     this.#turnInterrupted = false;
@@ -4751,7 +4735,9 @@ export class Session {
     const out: PendingToolApproval[] = [];
     for (const approvalId of this.#pendingApprovals.keys()) {
       const gated = this.#approvalInputs.get(approvalId);
-      if (gated) out.push({ approvalId, toolName: gated.toolName, input: gated.input });
+      if (!gated) continue;
+      const risk = this.#shellRisk(gated.toolName, gated.input as Record<string, unknown>);
+      out.push({ approvalId, toolName: gated.toolName, input: gated.input, ...(risk ? { risk: { level: risk.level, reasons: risk.reasons } } : {}) });
     }
     return out;
   }
@@ -6952,6 +6938,33 @@ export class Session {
     return { behavior: "deny", message: reason };
   }
 
+  /**
+   * A shell call's risk (#431), judged from the command it runs in the
+   * directory it names; null for any other tool, and not understood for a
+   * shell call whose command can't be read. Synchronous (the parser is
+   * loaded at daemon start), so the gate and the approval card it draws
+   * read the same verdict.
+   */
+  #shellRisk(toolName: string, input: Record<string, unknown>): ShellRisk | null {
+    const call = shellCallOf(toolName, input);
+    if (!call) return isShellTool(toolName) ? UNREADABLE_SHELL_CALL : null;
+    const cwd = call.cwd ? resolvePath(this.workdir, call.cwd) : this.workdir;
+    return assessShellCommandSync(call.command, { cwd, workdir: this.workdir, configDir: getConfigDir() });
+  }
+
+  /** A shell call that asks whatever the mode: high risk, a credential search, or not understood (#431). */
+  #riskAsks(risk: ShellRisk | null): boolean {
+    if (!risk) return false;
+    // Unreadable (no parser, no command): askOnUnknown doesn't cover it.
+    if (risk.level === "high" || risk.secret || risk.unreadable) return true;
+    return risk.level === "unknown" && (this.#config?.approvals?.askOnUnknown ?? true);
+  }
+
+  /** A low-risk shell call that guarded mode runs unasked, when the config says so (#431). */
+  #riskAllows(risk: ShellRisk | null): boolean {
+    return risk?.level === "low" && !risk.secret && this.#mode === "guarded" && (this.#config?.approvals?.autoAllowLowRisk ?? false);
+  }
+
   #makeCanUseToolFn(sender: AuthContext): ToolApprovalFn {
     // The backend this gate is handed to — the one that will ASK. Captured
     // here, not at call time, so the rewrite check below refers to it even if
@@ -7108,8 +7121,12 @@ export class Session {
       // daemon's credential files or a process environment is refused; one
       // searching a directory that holds them is asked about, never auto-run.
       const secret = secretPathVerdict(toolName, effectiveInput, { workdir: this.workdir, configDir: getConfigDir() });
-      if (secret?.action === "deny") {
-        const reason = `${secret.path} holds credentials — agents can't read it. Manage it through codeoid instead.`;
+      // A shell command is judged by what it runs (#431): one naming a
+      // credential file is refused like the file tools; a risky one asks.
+      const risk = this.#shellRisk(toolName, effectiveInput);
+      const refused = secret?.action === "deny" ? secret : risk?.secret?.action === "deny" ? risk.secret : null;
+      if (refused) {
+        const reason = `${refused.path} holds credentials — agents can't read it. Manage it through codeoid instead.`;
         this.#approvalPatchKeys.delete(approvalId);
         this.#resolveToolCallMessage(approvalId, { phase: "cancelled", reason: "denied", message: reason });
         this.#store.audit(sender.sub, "session.secret_path_deny", this.id, `tool=${toolName}`);
@@ -7133,7 +7150,12 @@ export class Session {
       // end_attempt: a call the spent budget would have parked is denied and
       // ends the attempt instead — whatever else would have asked about it.
       if (this.#budgetSpentFor(toolName)) return this.#endAttemptOnBudget(approvalId, toolName, sender);
-      const autoApprove = secret?.action !== "ask" && !settingsWrite && this.#shouldAutoApprove(toolName);
+      const riskAsks = this.#riskAsks(risk);
+      const autoApprove =
+        !riskAsks && secret?.action !== "ask" && !settingsWrite && (this.#riskAllows(risk) || this.#shouldAutoApprove(toolName));
+      if (riskAsks && this.#mode === "autonomous") {
+        this.#store.audit(sender.sub, "session.risk_ask", this.id, `tool=${toolName} risk=${risk?.level} ${risk?.reasons[0] ?? ""}`.trim());
+      }
 
       if (autoApprove) {
         this.#approvalIdToMessageId.delete(approvalId); // clean up — no manual approval will reference this
@@ -7706,9 +7728,12 @@ export class Session {
         // #shouldAutoApprove. Using #shouldAutoApprove here would decrement
         // twice per tool call (this handler runs in the same microtask batch
         // as canUseTool's synchronous section, always after it).
+        const risk = this.#shellRisk(event.name, event.input);
         const autoApprove =
           secretPathVerdict(event.name, event.input, { workdir: this.workdir, configDir: getConfigDir() }) === null &&
-          this.#peekAutoApprove(event.name);
+          !risk?.secret &&
+          !this.#riskAsks(risk) &&
+          (this.#riskAllows(risk) || this.#peekAutoApprove(event.name));
         // end_attempt: the gate will refuse this call outright — no approval card.
         const budgetDenied = this.#budgetExhausted || this.#budgetSpentFor(event.name);
         const toolMsg = this.#makeMessage(
@@ -7730,6 +7755,7 @@ export class Session {
                   description: `${event.name}(${Object.keys(event.input).join(", ")})`,
                   approvalId: event.approvalId,
                   ...this.#collaborationCostFor(event.name),
+                  ...(risk ? { risk: { level: risk.level, reasons: risk.reasons } } : {}),
                 } as unknown as ToolState),
           },
         );
@@ -8792,7 +8818,7 @@ export class Session {
       removedTurnIds: removedIds,
       keptHistory: history.slice(0, cut),
       restoredPrompt,
-      irreversible: irreversibleEffects(removedCanon),
+      irreversible: irreversibleEffects(removedCanon, { workdir: this.workdir }),
       planId: "",
     };
     if (!restoreFiles) return { ...plan, planId: planHash([turnId, ...removedIds]) };

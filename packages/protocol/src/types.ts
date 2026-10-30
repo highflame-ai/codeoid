@@ -977,6 +977,16 @@ export interface ToolWaitingConfirmationState {
    * roll-up could not be computed.
    */
   collaborationCost?: CollaborationCost;
+  /** A shell command's risk, judged from what it runs (#431). Absent for other tools. */
+  risk?: ToolRisk;
+}
+
+/** How risky a shell command is, and why (#431). */
+export interface ToolRisk {
+  /** low: reads in the workspace; medium: changes or runs things; high: hard to undo or a way to lose data or credentials; unknown: not understood. */
+  level: "low" | "medium" | "high" | "unknown";
+  /** Most serious first; empty for low. */
+  reasons: string[];
 }
 
 export interface ToolExecutingState {
