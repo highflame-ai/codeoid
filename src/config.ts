@@ -234,7 +234,10 @@ const ApprovalsSchema = z
   .object({
     /** In guarded mode, run low-risk commands (reads inside the workspace) without asking. */
     autoAllowLowRisk: z.boolean().default(false),
-    /** Ask about a command the gate can't understand, in autonomous mode too. */
+    /**
+     * Ask about a command the gate can't understand, in autonomous mode too.
+     * One nothing could be read of (no parser, no command) asks regardless.
+     */
     askOnUnknown: z.boolean().default(true),
   })
   .default({ autoAllowLowRisk: false, askOnUnknown: true });
