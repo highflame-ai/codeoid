@@ -39,6 +39,19 @@ describe("shell parsing (#431)", () => {
     expect(await argvs("sh <<< 'rm y'")).toEqual([["sh"], ["rm", "y"]]);
   });
 
+  it("finds a shell's -c script past options and their values (round-1 audit)", async () => {
+    const script = async (c: string) => (await argvs(c)).slice(1);
+    expect(await script("bash -o pipefail -c 'rm -rf x'")).toEqual([["rm", "-rf", "x"]]);
+    expect(await script("bash -O extglob --rcfile r -c 'rm x'")).toEqual([["rm", "x"]]);
+    expect(await script("bash -eo pipefail -c 'rm x'")).toEqual([["rm", "x"]]);
+    expect(await script("sh -c -- 'rm x'")).toEqual([["rm", "x"]]);
+    expect(await script("bash -c -e 'rm x'")).toEqual([["rm", "x"]]);
+    expect(await script("fish --command='rm x'")).toEqual([["rm", "x"]]);
+    expect(await script("bash -o pipefail run.sh")).toEqual([]);
+    expect((await parseShell("bash -c")).problems.length).toBeGreaterThan(0);
+    expect((await parseShell("fish -C 'rm x'")).problems.length).toBeGreaterThan(0);
+  });
+
   it("parses the `…` an unquoted here-document runs, and not a quoted one's", async () => {
     expect(await argvs("cat <<EOF\nhi `rm -rf x` \\`y\\` `a \\`b\\``\nEOF")).toEqual([["rm", "-rf", "x"], ["a", null], ["b"], ["cat"]]);
     expect(await argvs("cat <<'EOF'\nhi `rm -rf x`\nEOF")).toEqual([["cat"]]);

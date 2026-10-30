@@ -605,19 +605,39 @@ const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "fish
  */
 function shellScript(cmd: SimpleCommand): string | null | undefined {
   const args = cmd.argv.slice(1);
-  for (let i = 0; i < args.length; i++) {
+  // `-c` runs its first operand, whatever options come between: `bash -c -e 'x'`, `sh -c -- 'x'`.
+  let inline = false;
+  const fish = basename(cmd.argv[0]?.value ?? "") === "fish";
+  let i = 0;
+  for (; i < args.length; i++) {
     const v = args[i]!.value;
     if (v === null) return null;
-    if (v === "--") break;
-    if (!v.startsWith("-") && !v.startsWith("+")) return undefined; // a script file
-    if (/^-[a-zA-Z]*c[a-zA-Z]*$/.test(v)) return args[i + 1] ? args[i + 1]!.value : null;
+    // fish's `-C`/`--init-command` runs a line before anything else.
+    if (fish && (v === "-C" || v.startsWith("--init-command"))) return null;
+    if (v === "--" || v === "-") {
+      i++;
+      break;
+    }
+    if (v === "--command") inline = true; // fish
+    else if (v.startsWith("--command=")) return v.slice("--command=".length);
+    else if (SHELL_VALUE_OPTIONS.has(v)) i++; // `-o pipefail`: its value is no script
+    else if (!v.startsWith("-") && !v.startsWith("+")) break;
+    else if (/^[-+][a-zA-Z]+$/.test(v)) {
+      if (v.startsWith("-") && v.includes("c")) inline = true;
+      if (/[oO]$/.test(v)) i++; // `-eo pipefail`
+    }
   }
+  if (inline) return args[i] ? args[i]!.value : null;
+  if (i < args.length) return undefined; // a script file
   const input = cmd.redirects.filter((r) => (r.fd === null || r.fd === 0) && (r.op.startsWith("<<") || r.op === "<<<"));
   const last = input.at(-1);
   if (!last) return undefined;
   if (last.op === "<<<") return last.target?.value ?? null;
   return last.body ?? null;
 }
+
+/** Shell options that take the next word as their value. */
+const SHELL_VALUE_OPTIONS = new Set(["-o", "+o", "-O", "+O", "--rcfile", "--init-file"]);
 
 const lit = (value: string): ShellWord => ({ value, raw: value, glob: false });
 /** An argument supplied at run time (xargs input, find's `{}`). */
