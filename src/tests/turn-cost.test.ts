@@ -260,6 +260,27 @@ describe("a turn's cost (#430)", () => {
     expect(after.s.toInfo().usage!.costEstimated).toBe(true);
   });
 
+  describe("...whichever agent's request streams, a tool call's included — only that agent's own report with tokens clears it (#430)", () => {
+    const usage = { inputTokens: 10_000, outputTokens: 100, cacheReadTokens: 0, cacheCreationTokens: 0 };
+    const reported: ProviderEvent = { type: "llm_call", isPrimary: true, usage };
+    const sub = (parentToolUseId?: string): ProviderEvent => ({ type: "llm_call", isPrimary: false, usage, ...(parentToolUseId ? { parentToolUseId } : {}) });
+    const cases: Array<[string, ProviderEvent[], number]> = [
+      ["a request that streams only a tool call's input", [{ type: "model_output" }], 1],
+      ["qwen-code's zeroed report for a request's earlier block", [{ type: "text_delta", content: "request 2" }, { type: "llm_call", isPrimary: true, usage: { ...usage, inputTokens: 0, outputTokens: 0 } }], 1],
+      ["another sub-agent's report", [{ type: "model_output", parentToolUseId: "toolu_X" }, sub("toolu_Y")], 1],
+      ["a report that names no agent", [{ type: "text_delta", content: "x", parentToolUseId: "toolu_X" }, sub()], 1],
+      ["...but that sub-agent's own report", [{ type: "model_output", parentToolUseId: "toolu_X" }, sub("toolu_X")], 0],
+      ["...and the main agent's own report", [{ type: "model_output" }, reported], 0],
+    ];
+    for (const [name, events, unknown] of cases) {
+      it(name, async () => {
+        const { s, run } = await sessionWith([[reported, ...events, { type: "turn_done", result: result({ inputTokens: 10_000, outputTokens: 100, isError: true }) }]]);
+        await run();
+        expect(s.toInfo().usage!.costUnknownTurns ?? 0).toBe(unknown);
+      });
+    }
+  });
+
   it("...and so is a turn stopped while a request streams, whose result says it ended normally (Codex's interrupted turn) (#430)", async () => {
     class StopReportsProvider extends MockSessionProvider {
       override runTurn(opts: TurnOpts): TurnRun {

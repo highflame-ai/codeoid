@@ -366,12 +366,19 @@ export type ProviderEvent =
       isPrimary: boolean;
       /** The request's id, for a backend that reports one request several times: a repeat replaces the earlier report (#430). */
       requestId?: string;
+      /** The sub-agent whose request this is (its spawning tool call's id), where the backend says (#430). */
+      parentToolUseId?: string | null;
     }
   /**
    * A request was sent to the model (#430), for a backend whose usage arrives
    * only when the request ends: a turn stopped before then still spent.
    */
   | { type: "model_request" }
+  /**
+   * The model began streaming an output block (a tool call's, say) that no
+   * text or thinking delta shows (#430): its request's usage hasn't come yet.
+   */
+  | { type: "model_output"; parentToolUseId?: string | null }
   | { type: "api_retry"; attempt?: number; retryDelayMs?: number; errorStatus?: number | null }
   /**
    * The backend's plan rate-limit state changed (Claude's `rate_limit_event`,

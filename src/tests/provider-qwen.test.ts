@@ -349,6 +349,16 @@ describe("translateQwenMessage — streaming + result", () => {
     expect((events.at(-1) as { result: { costSource?: string } }).result.costSource).toBeUndefined();
   });
 
+  test("a request's zeroed per-block report is no report, a sub-agent's is a request never reported, and a tool call's block marks output streaming (#430)", () => {
+    const { events, emit } = collector();
+    const state = freshState();
+    // qwen-code finalizes a request's text block with zeroed usage as it turns to a tool call.
+    translateQwenMessage({ type: "assistant", parent_tool_use_id: null, message: { content: [{ type: "text", text: "Let me" }], usage: { input_tokens: 0, output_tokens: 0 } } } as never, emit, "qwen", state);
+    translateQwenMessage({ type: "stream_event", parent_tool_use_id: null, event: { type: "content_block_start", index: 0, content_block: { type: "tool_use" } } } as never, emit, "qwen", state);
+    translateQwenMessage({ type: "assistant", parent_tool_use_id: "t1", message: { content: [], usage: { input_tokens: 0, output_tokens: 0 } } } as never, emit, "qwen", state);
+    expect(events.map((e) => e.type)).toEqual(["text_done", "model_output", "subagent_start", "model_request"]);
+  });
+
   test("a failed turn that never reached the model spent nothing — not an unknown that blocks a capped routine (#430)", () => {
     const { events, emit } = collector();
     translateQwenMessage({ type: "result", subtype: "error_during_execution", is_error: true, error: { message: "auth" } } as never, emit, "qwen", freshState());

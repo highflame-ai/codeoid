@@ -201,6 +201,7 @@ export class QwenProvider implements SessionProvider {
   runTurn(opts: TurnOpts): TurnRun {
     // A new turn's usage starts from nothing, whatever an interrupted one left (#430).
     if (this.#translateState) this.#translateState.turnUsage = undefined;
+    this.#seenSubagents.clear();
     this.#currentCanUseTool = opts.canUseTool;
     this.#currentSender = opts.sender ?? null;
 
@@ -713,7 +714,12 @@ export function translateQwenMessage(
       }
 
       const perCall = m.message?.usage;
-      if (perCall) {
+      // qwen-code splits a request into a message per block type, all but the
+      // last with zeroed usage; a sub-agent's never has any. Neither is a
+      // report: a sub-agent's request is one whose spend is never told (#430).
+      const reported = !!perCall && (perCall.input_tokens ?? 0) + (perCall.output_tokens ?? 0) + (perCall.cache_read_input_tokens ?? 0) + (perCall.cache_creation_input_tokens ?? 0) > 0;
+      if (parentToolUseId && !reported) emit({ type: "model_request" });
+      if (perCall && reported) {
         // qwen-code's input_tokens includes the cached ones it also reports as cache reads.
         const cached = perCall.cache_read_input_tokens ?? 0;
         const usage: LLMCallUsage = {
@@ -722,7 +728,7 @@ export function translateQwenMessage(
           cacheCreationTokens: perCall.cache_creation_input_tokens ?? 0,
           outputTokens: perCall.output_tokens ?? 0,
         };
-        emit({ type: "llm_call", usage, isPrimary: parentToolUseId === null });
+        emit({ type: "llm_call", usage, isPrimary: parentToolUseId === null, parentToolUseId });
         // Every request costs, a sub-agent's included.
         if (!state.turnUsage) state.turnUsage = { inputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, outputTokens: 0, calls: 0 };
         const t = state.turnUsage;
@@ -787,6 +793,11 @@ export function translateQwenMessage(
 
       if (event.type === "content_block_start" && event.content_block?.type === "thinking") {
         emit({ type: "thinking_delta", content: "", blockIndex: event.index, parentToolUseId });
+        break;
+      }
+      // Any other block (a tool call's input streams no text): the request's usage is still to come (#430).
+      if (event.type === "content_block_start") {
+        emit({ type: "model_output", parentToolUseId });
         break;
       }
       if (event.type === "content_block_delta" && event.delta) {

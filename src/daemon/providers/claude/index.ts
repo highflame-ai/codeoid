@@ -1864,7 +1864,13 @@ export function translateSDKMessage(
           };
           // One message per content block, all of the same request: its id says so (#430).
           const requestId = assistantMsg.message.id;
-          emit({ type: "llm_call", usage: callUsage, isPrimary: assistantMsg.parent_tool_use_id === null, ...(requestId ? { requestId } : {}) });
+          emit({
+            type: "llm_call",
+            usage: callUsage,
+            isPrimary: assistantMsg.parent_tool_use_id === null,
+            parentToolUseId: assistantMsg.parent_tool_use_id ?? null,
+            ...(requestId ? { requestId } : {}),
+          });
         }
 
         // Text content (tool_use blocks are handled via canUseTool → tool_start).
@@ -1907,6 +1913,11 @@ export function translateSDKMessage(
         if (event.type === "content_block_start" && event.content_block?.type === "thinking") {
           // Signal a new thinking block — Session creates the message.
           emit({ type: "thinking_delta", content: "", blockIndex: event.index, parentToolUseId });
+          break;
+        }
+        // Any other block (a tool call's input streams no text): the request's usage is still to come (#430).
+        if (event.type === "content_block_start") {
+          emit({ type: "model_output", parentToolUseId });
           break;
         }
 

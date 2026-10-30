@@ -201,7 +201,7 @@ describe("translateSDKMessage – assistant", () => {
       message: { content: [], usage: { input_tokens: 1, output_tokens: 1 } },
       parent_tool_use_id: "parent-id",
     });
-    expect(events[0]).toMatchObject({ type: "llm_call", isPrimary: false });
+    expect(events[0]).toMatchObject({ type: "llm_call", isPrimary: false, parentToolUseId: "parent-id" });
   });
 
   it("llm_call carries the request's id: one message per content block is still one request (#430)", () => {
@@ -210,7 +210,7 @@ describe("translateSDKMessage – assistant", () => {
       message: { id: "msg_1", content: [{ type: "text", text: "Let me look." }], usage: { input_tokens: 10, output_tokens: 1 } },
       parent_tool_use_id: null,
     });
-    expect(events[0]).toMatchObject({ type: "llm_call", requestId: "msg_1" });
+    expect(events[0]).toMatchObject({ type: "llm_call", requestId: "msg_1", parentToolUseId: null });
   });
 
   it("skips text_done when no text blocks", () => {
@@ -284,6 +284,15 @@ describe("translateSDKMessage – stream_event", () => {
       event: { type: "content_block_stop", index: 2 },
     });
     expect(events[0]).toMatchObject({ type: "thinking_done", blockIndex: 2 });
+  });
+
+  it("emits model_output when a tool call's block starts: a request streaming no text is still a request whose usage is to come (#430)", () => {
+    const events = collectEmits({
+      type: "stream_event",
+      event: { type: "content_block_start", index: 0, content_block: { type: "tool_use", name: "Write" } },
+      parent_tool_use_id: "tu-task-2",
+    });
+    expect(events).toEqual([{ type: "model_output", parentToolUseId: "tu-task-2" }]);
   });
 
   it("emits nothing for null event", () => {
