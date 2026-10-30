@@ -152,6 +152,11 @@ function candidatePaths(toolName: string, input: unknown): string[] {
   return out;
 }
 
+/** The directories credential files live in: codeoid's config dir and each agent CLI's login dir. */
+export function secretDirsOf(configDir: string): string[] {
+  return [resolve(configDir), ...cliCredentialFiles().map((f) => dirname(f))];
+}
+
 /**
  * The verdict for one tool call: `deny` when it names a secret file, `ask`
  * when it searches a directory that contains one, null otherwise.
