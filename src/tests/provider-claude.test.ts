@@ -345,6 +345,15 @@ describe("translateSDKMessage – result", () => {
     });
   });
 
+  it("its own cost is the backend's — but a $0 with tokens spent isn't a price: left for the session to price (#430)", () => {
+    const priced = collectEmits({ type: "result", subtype: "success", usage: { input_tokens: 10, output_tokens: 1 }, total_cost_usd: 0.01, modelUsage: {} });
+    expect((priced[0] as { result: { costSource?: string } }).result.costSource).toBe("backend");
+    const zero = collectEmits({ type: "result", subtype: "success", usage: { input_tokens: 10, output_tokens: 1 }, total_cost_usd: 0, modelUsage: {} });
+    expect((zero[0] as { result: { costSource?: string } }).result.costSource).toBeUndefined();
+    const nothing = collectEmits({ type: "result", subtype: "success", usage: { input_tokens: 0, output_tokens: 0 }, total_cost_usd: 0, modelUsage: {} });
+    expect((nothing[0] as { result: { costSource?: string } }).result.costSource).toBe("backend");
+  });
+
   it("carries the result text of a success-subtype is_error turn as resultText (where the CLI puts a limit notice)", () => {
     const events = collectEmits({
       type: "result",

@@ -71,6 +71,15 @@ export interface GeminiProviderInit {
   mcpHub?: McpHub;
 }
 
+/** The Gemini API models the picker offers (#430: every one has a price in the snapshot). */
+export const GEMINI_MODELS: ReadonlyArray<{ id: string; displayName: string }> = [
+  { id: "gemini-3.5-flash", displayName: "Gemini 3.5 Flash" },
+  { id: "gemini-2.5-pro", displayName: "Gemini 2.5 Pro" },
+  { id: "gemini-2.5-flash", displayName: "Gemini 2.5 Flash" },
+  { id: "gemini-2.5-flash-lite", displayName: "Gemini 2.5 Flash-Lite" },
+];
+export const GEMINI_DEFAULT_MODEL = "gemini-2.5-flash";
+
 export class GeminiProvider implements AgentProvider {
   /** tool-loop runs `verdict.updatedInput ?? args` (see AgentProvider.appliesToolInputRewrite). */
   readonly appliesToolInputRewrite = true;
@@ -90,7 +99,8 @@ export class GeminiProvider implements AgentProvider {
   constructor(init: GeminiProviderInit = {}) {
     this.#apiKey = init.apiKey ?? process.env.GOOGLE_API_KEY ?? "";
     this.#resolveApiKey = init.resolveApiKey ?? null;
-    this.#defaultModel = init.defaultModel ?? "gemini-2.0-flash";
+    // A current, priced model (#430): 2.0 and 1.5 are retired, and their turns couldn't be priced.
+    this.#defaultModel = init.defaultModel ?? GEMINI_DEFAULT_MODEL;
     this.#memory = init.memory ?? null;
     this.#workspaceId = init.workspaceId ?? init.sessionId ?? "";
     this.#tenant = init.tenant;
@@ -208,6 +218,8 @@ export class GeminiProvider implements AgentProvider {
 
       let finalText = "";
       let inputTokens = 0;
+      let cacheReadTokens = 0;
+      let largestPrompt = 0;
       let outputTokens = 0;
       let stopReason: string | undefined;
       // First message is the user turn; later rounds send functionResponse parts.
@@ -218,10 +230,25 @@ export class GeminiProvider implements AgentProvider {
       // a runaway/cost guard. A no-memory turn ends after one round (no calls).
       for (let round = 0; ; round++) {
         let streamResult: GenerateContentStreamResult;
+        // The request counts once the API takes it (#430): a refusal spent
+        // nothing; one stopped while pending may have.
+        const spent = () => {
+          try {
+            queue.push({ type: "model_request" });
+          } catch {
+            // The turn's queue already closed.
+          }
+        };
         try {
           streamResult = await chat.sendMessageStream(message, { signal: ac.signal });
+          spent();
         } catch (err) {
-          if (ac.signal.aborted) return;
+          if (ac.signal.aborted) {
+            spent();
+            return;
+          }
+          // Only a refusal before any work is unsent; a 5xx or a reset may have spent (#430).
+          if (!isRefusal(err)) spent();
           queue.push({
             type: "error",
             message: `Gemini API error: ${err instanceof Error ? err.message : String(err)}${opts.effort ? effortRejectionHint(err instanceof Error ? err.message : String(err), opts.effort) : ""}`,
@@ -241,8 +268,27 @@ export class GeminiProvider implements AgentProvider {
         if (ac.signal.aborted) return;
 
         const response = await streamResult.response;
-        inputTokens += response.usageMetadata?.promptTokenCount ?? 0;
-        outputTokens += response.usageMetadata?.candidatesTokenCount ?? 0;
+        // Cached prompt tokens are priced apart, and thinking tokens are billed as output (#430).
+        const usage = response.usageMetadata as
+          | { promptTokenCount?: number; candidatesTokenCount?: number; cachedContentTokenCount?: number; thoughtsTokenCount?: number }
+          | undefined;
+        const cached = usage?.cachedContentTokenCount ?? 0;
+        inputTokens += Math.max(0, (usage?.promptTokenCount ?? 0) - cached);
+        largestPrompt = Math.max(largestPrompt, usage?.promptTokenCount ?? 0);
+        // This request's own usage, so a turn that ends mid-loop is still counted
+        // (#430) — only when the API sent it: zeros would hide what it spent.
+        if (usage) queue.push({
+          type: "llm_call",
+          isPrimary: true,
+          usage: {
+            inputTokens: Math.max(0, (usage?.promptTokenCount ?? 0) - cached),
+            cacheReadTokens: cached,
+            cacheCreationTokens: 0,
+            outputTokens: (usage?.candidatesTokenCount ?? 0) + (usage?.thoughtsTokenCount ?? 0),
+          },
+        });
+        cacheReadTokens += cached;
+        outputTokens += (usage?.candidatesTokenCount ?? 0) + (usage?.thoughtsTokenCount ?? 0);
         finalText = roundText;
         stopReason = response.candidates?.[0]?.finishReason
           ? String(response.candidates[0].finishReason)
@@ -279,9 +325,10 @@ export class GeminiProvider implements AgentProvider {
         model,
         inputTokens,
         outputTokens,
-        cacheReadTokens: 0,
+        cacheReadTokens,
         cacheCreationTokens: 0,
-        totalCostUsd: 0, // Gemini does not return cost in the API response.
+        totalCostUsd: 0, // no cost in the response: the session prices the tokens (#430)
+        ...(largestPrompt > 0 ? { largestPromptTokens: largestPrompt } : {}),
         durationMs: Date.now() - startMs,
         stopReason,
       };
@@ -303,12 +350,7 @@ export class GeminiProvider implements AgentProvider {
     // Gemini's REST model-list endpoint requires a separate authenticated call.
     // Return a static list of well-known models; this is enough for the
     // session model-picker UI and can be replaced with a live fetch in Phase 2.
-    return [
-      { id: "gemini-2.0-flash", displayName: "Gemini 2.0 Flash" },
-      { id: "gemini-2.0-flash-lite", displayName: "Gemini 2.0 Flash Lite" },
-      { id: "gemini-1.5-pro", displayName: "Gemini 1.5 Pro" },
-      { id: "gemini-1.5-flash", displayName: "Gemini 1.5 Flash" },
-    ];
+    return GEMINI_MODELS.map((m) => ({ ...m, ...(m.id === this.#defaultModel ? { isDefault: true } : {}) }));
   }
 
   async dispose(): Promise<void> {
@@ -365,4 +407,10 @@ export function geminiThinkingConfig(model: string, effort: EffortLevel): Record
     return { thinkingLevel: level };
   }
   return null;
+}
+
+/** A request the API refused before doing any work (#430): a client error it answered at once. */
+function isRefusal(err: unknown): boolean {
+  const status = (err as { status?: unknown } | null)?.status;
+  return typeof status === "number" && [400, 401, 403, 404, 422, 429].includes(status);
 }

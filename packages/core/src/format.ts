@@ -30,6 +30,30 @@ export function formatCostUsd(usd: number | null | undefined): string {
   return `$${Math.round(usd).toLocaleString()}`;
 }
 
+/** What a session's cost display needs (a subset of `SessionUsage`). */
+export interface CostUsage {
+  totalCostUsd: number;
+  costEstimated?: boolean;
+  costUnknownTurns?: number;
+}
+
+/**
+ * A session's cost, honest about where it came from (#430): `~$0.42` when
+ * some of it is an estimate (tokens × list price), `$0.42+` when some turns'
+ * cost isn't known, `$?` when none is. `title` says why, for a tooltip.
+ */
+export function formatSessionCost(u: CostUsage | null | undefined): { text: string; title: string } {
+  if (!u) return { text: "—", title: "No usage yet" };
+  const unknown = u.costUnknownTurns ?? 0;
+  if (unknown > 0 && u.totalCostUsd === 0 && !u.costEstimated) {
+    return { text: "$?", title: `Cost unknown: no price for the model, or the backend reports no token counts (${unknown} turn${unknown === 1 ? "" : "s"})` };
+  }
+  const base = formatCostUsd(u.totalCostUsd);
+  const parts: string[] = [u.costEstimated ? "Partly estimated from tokens × the model's list price" : "As reported by the backend"];
+  if (unknown > 0) parts.push(`plus ${unknown} turn${unknown === 1 ? "" : "s"} whose cost isn't known`);
+  return { text: `${u.costEstimated ? "~" : ""}${base}${unknown > 0 ? "+" : ""}`, title: parts.join(", ") };
+}
+
 /** Duration in ms → "1h 24m" / "2m 15s" / "8s" / "240ms". */
 export function formatDuration(ms: number | null | undefined): string {
   if (ms == null || !Number.isFinite(ms) || ms < 0) return "—";

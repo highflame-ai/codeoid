@@ -25,7 +25,8 @@
  *   { "waitFor": "/abs/path" }              hold the turn until the file exists (a test releases it)
  *   { "error": "...", "detail": { ... } }   the turn fails with this message (and the backend's structured detail)
  *   { "crash": "..." }                      the event stream throws, as a backend that died mid-turn
- *   { "usage": { "inputTokens": 1, "outputTokens": 1, "costUsd": 0.01 } }
+ *   { "usage": { "inputTokens": 1, "outputTokens": 1, "costUsd": 0.01, "model": "..." } }
+ *                                           no costUsd: the session prices the tokens (at `model`'s price, if given)
  */
 
 import { randomUUID } from "node:crypto";
@@ -47,7 +48,7 @@ export type ScriptStep =
   | { waitFor: string }
   | { error: string; detail?: Record<string, unknown> }
   | { crash: string }
-  | { usage: { inputTokens?: number; outputTokens?: number; costUsd?: number } };
+  | { usage: { inputTokens?: number; outputTokens?: number; costUsd?: number; model?: string } };
 
 export interface ScriptRule {
   match: string;
@@ -181,7 +182,12 @@ export class ScriptedProvider implements AgentProvider {
       } else if ("usage" in step) {
         result.inputTokens = step.usage.inputTokens ?? result.inputTokens;
         result.outputTokens = step.usage.outputTokens ?? result.outputTokens;
-        result.totalCostUsd = step.usage.costUsd ?? result.totalCostUsd;
+        if (step.usage.model) result.model = step.usage.model;
+        // A cost given is the backend's own figure; without one the session prices the tokens (#430).
+        if (step.usage.costUsd !== undefined) {
+          result.totalCostUsd = step.usage.costUsd;
+          result.costSource = "backend";
+        }
       }
     }
     if (stopped()) return;

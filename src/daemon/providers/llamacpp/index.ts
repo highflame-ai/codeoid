@@ -18,6 +18,7 @@
  *   instead of a cloud-sized table entry that would overflow the server.
  */
 
+import { isLoopbackHost } from "../../local-auth.js";
 import type { EffortLevel } from "../../../protocol/types.js";
 import { OpenAIProvider, type OpenAIProviderInit } from "../openai/index.js";
 import type { OpenAIFunctionTool } from "../tool-loop.js";
@@ -130,6 +131,8 @@ export interface LlamaCppConfig {
   model?: string;
   /** External MCP servers this backend is offered; none when empty. */
   mcpServers?: readonly string[];
+  /** Its turns cost nothing (#430); unset = only a loopback server. */
+  free?: boolean;
 }
 
 /**
@@ -146,17 +149,34 @@ export function allowedMcpServers(
   return { forBackend: (id) => registry.forBackend(id).filter((s) => allow.includes(s.name)) };
 }
 
+/**
+ * A turn on this server costs nothing (#430): when the config says so, else
+ * only a server on this machine. A private-network name can be a gateway to a
+ * paid API, so it counts as free only when you declare it.
+ */
+export function isOwnServer(baseUrl: string, declared?: boolean): boolean {
+  if (declared !== undefined) return declared;
+  try {
+    return isLoopbackHost(new URL(baseUrl).hostname);
+  } catch {
+    return false;
+  }
+}
+
 export function createLlamaCppProvider(
   cfg: LlamaCppConfig,
   init: Omit<
     OpenAIProviderInit,
-    "id" | "displayName" | "apiKey" | "baseURL" | "modelFilter" | "fallbackModels" | "contextWindow" | "toolsTransform" | "effortParams"
+    "id" | "displayName" | "apiKey" | "baseURL" | "modelFilter" | "fallbackModels" | "contextWindow" | "toolsTransform" | "effortParams" | "free"
   >,
 ): OpenAIProvider {
   return new OpenAIProvider({
     ...init,
     id: LLAMACPP_PROVIDER_ID,
     displayName: LLAMACPP_DISPLAY_NAME,
+    // The user's own server costs nothing (#430) — a private or local host
+    // only: one pointed at a paid public host is priced (or unknown) instead.
+    free: isOwnServer(cfg.baseUrl, cfg.free),
     apiKey: cfg.apiKey,
     baseURL: cfg.baseUrl,
     defaultModel: init.defaultModel ?? cfg.model ?? "local",

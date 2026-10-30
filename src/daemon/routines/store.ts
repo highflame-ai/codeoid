@@ -67,6 +67,7 @@ interface RunDbRow {
   payload: string | null;
   loop_run_id: string | null;
   loop_status: string | null;
+  cost_unknown?: number | null;
 }
 
 /** sha256 of an API token — only the hash is stored. */
@@ -143,6 +144,21 @@ export class RoutineStore {
     for (const c of ["loop_run_id", "loop_status"]) {
       if (!cols.includes(c)) this.#db.exec(`ALTER TABLE routine_runs ADD COLUMN ${c} TEXT`);
     }
+    // A run that spent an amount nobody can count (#430).
+    if (!cols.includes("cost_unknown")) this.#db.exec("ALTER TABLE routine_runs ADD COLUMN cost_unknown INTEGER NOT NULL DEFAULT 0");
+    // What a run spent on a later UTC day than it started, for that day's cap (#430).
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS routine_spend_carry (
+        run_id       TEXT NOT NULL,
+        routine_id   TEXT NOT NULL,
+        day          INTEGER NOT NULL,
+        cost_usd     REAL NOT NULL DEFAULT 0,
+        cost_unknown INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (run_id, day)
+      );
+      CREATE INDEX IF NOT EXISTS idx_routine_spend_carry_routine
+        ON routine_spend_carry(routine_id, day);
+    `);
   }
 
   // ── Routines ────────────────────────────────────────────────────────────
@@ -334,6 +350,7 @@ export class RoutineStore {
       payload: "payload",
       loopRunId: "loop_run_id",
       loopStatus: "loop_status",
+      costUnknown: "cost_unknown",
     };
     const sets: string[] = [];
     const vals: (string | number | null)[] = [];
@@ -341,7 +358,7 @@ export class RoutineStore {
       const col = cols[k];
       if (!col || v === undefined) continue;
       sets.push(`${col} = ?`);
-      vals.push(v as string | number | null);
+      vals.push(typeof v === "boolean" ? (v ? 1 : 0) : (v as string | number | null));
     }
     if (sets.length === 0) return;
     this.#db.prepare(`UPDATE routine_runs SET ${sets.join(", ")} WHERE id = ?`).run(...vals, id);
@@ -395,12 +412,40 @@ export class RoutineStore {
     return row ? toRun(row) : undefined;
   }
 
-  /** Spend since `since` (ms) — the daily cap's numerator. */
+  /** True when what was spent since `since` (ms) includes an amount nobody can count (#430). */
+  unknownCostSince(routineId: string, since: number): boolean {
+    const row = this.#db
+      .prepare(
+        `SELECT (SELECT COUNT(*) FROM routine_runs WHERE routine_id = ? AND created_at >= ? AND cost_unknown = 1)
+              + (SELECT COUNT(*) FROM routine_spend_carry WHERE routine_id = ? AND day >= ? AND cost_unknown = 1) AS n`,
+      )
+      .get(routineId, since, routineId, since) as { n: number };
+    return row.n > 0;
+  }
+
+  /**
+   * Spend since `since` (ms) — the daily cap's numerator: the runs started
+   * since, and what earlier runs went on to spend since (#430). A run's own
+   * row holds all it spent; the carry is only the part on a later day.
+   */
   costSince(routineId: string, since: number): number {
     const row = this.#db
-      .prepare("SELECT COALESCE(SUM(cost_usd), 0) AS c FROM routine_runs WHERE routine_id = ? AND created_at >= ?")
-      .get(routineId, since) as { c: number };
+      .prepare(
+        `SELECT (SELECT COALESCE(SUM(cost_usd), 0) FROM routine_runs WHERE routine_id = ? AND created_at >= ?)
+              + (SELECT COALESCE(SUM(cost_usd), 0) FROM routine_spend_carry WHERE routine_id = ? AND day >= ?) AS c`,
+      )
+      .get(routineId, since, routineId, since) as { c: number };
     return row.c;
+  }
+
+  /** What a run spent on a UTC day after the one it started (`day`, ms at 00:00 UTC). */
+  carrySpend(runId: string, routineId: string, day: number, costUsd: number, unknown: boolean): void {
+    this.#db
+      .prepare(
+        `INSERT INTO routine_spend_carry (run_id, routine_id, day, cost_usd, cost_unknown) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT (run_id, day) DO UPDATE SET cost_usd = excluded.cost_usd, cost_unknown = excluded.cost_unknown`,
+      )
+      .run(runId, routineId, day, costUsd, unknown ? 1 : 0);
   }
 
   /** Session ids of finished runs, newest first — retention picks from here. */
@@ -456,6 +501,8 @@ export class RoutineStore {
              ORDER BY ended_at DESC, rowid DESC LIMIT 1)`,
       )
       .run(routineId, ...ACTIVE_RUN_STATUSES, keepSince, routineId, ...ACTIVE_RUN_STATUSES, keep, routineId, routineId, routineId, ...OUTCOME_RUN_STATUSES);
+    // Carried spend only ever counts for its own day.
+    this.#db.prepare("DELETE FROM routine_spend_carry WHERE routine_id = ? AND day < ?").run(routineId, keepSince);
   }
 
   /** The last run that produced a summary — feeds {{last_summary}}. */
@@ -479,6 +526,7 @@ export class RoutineStore {
   /** Delete a routine's runs (with the routine). */
   deleteRuns(routineId: string): void {
     this.#db.prepare("DELETE FROM routine_runs WHERE routine_id = ?").run(routineId);
+    this.#db.prepare("DELETE FROM routine_spend_carry WHERE routine_id = ?").run(routineId);
   }
 
   /** Everyone who holds a routine, once each, with their tenant. */
@@ -563,5 +611,6 @@ function toRun(r: RunDbRow): RunRow {
     payload: r.payload,
     loopRunId: r.loop_run_id ?? null,
     loopStatus: (r.loop_status as LoopStatus | null) ?? null,
+    ...(r.cost_unknown ? { costUnknown: true } : {}),
   };
 }

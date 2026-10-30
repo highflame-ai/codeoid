@@ -170,6 +170,29 @@ async function collect(events: AsyncIterable<ProviderEvent>): Promise<ProviderEv
 }
 
 describe("PiProvider", () => {
+  it("a turn pi priced at $0 with tokens spent is left for the session to price, not trusted as $0 (#430)", async () => {
+    const p = makeProvider();
+    const events = await collect(p.runTurn(turnOpts("hello no-cost")).events);
+    const done = events.find((e) => e.type === "turn_done") as Extract<ProviderEvent, { type: "turn_done" }>;
+    expect(done.result.inputTokens).toBe(100);
+    expect(done.result.costSource).toBeUndefined();
+  });
+
+  it("after the session is reset, a turn counts its own tokens — pi's stats start over with the new session (#430)", async () => {
+    const p = makeProvider();
+    await collect(p.runTurn(turnOpts("hello")).events);
+    await collect(p.runTurn(turnOpts("hello")).events);
+    p.resetToNewSession("fresh-backing");
+    const events = await collect(p.runTurn(turnOpts("hello")).events);
+    expect(events.find((e) => e.type === "turn_done")).toMatchObject({ result: { inputTokens: 100, outputTokens: 40 } });
+  });
+
+  it("a turn pi priced is pi's own figure (#430)", async () => {
+    const p = makeProvider();
+    const events = await collect(p.runTurn(turnOpts("hello")).events);
+    expect(events.find((e) => e.type === "turn_done")).toMatchObject({ result: { costSource: "backend" } });
+  });
+
   it("T1: streams a text turn and settles with per-turn usage", async () => {
     const p = makeProvider();
     const events = await collect(p.runTurn(turnOpts("hello")).events);

@@ -10,6 +10,7 @@
  * them refuse to run rather than fall back to another backend.
  */
 
+import { isOwnServer } from "../llamacpp/index.js";
 import type { McpServerSource } from "../../mcp/tool-source.js";
 import { AccountError, type ResolvedAccount } from "../../accounts.js";
 import {
@@ -230,6 +231,13 @@ export function endpointFactory(
         new OpenAIProvider({
           id,
           displayName,
+          // A llama-server on this machine costs nothing (#430); a LAN one is
+          // free by a $0 price in pricing.models — it may be a paid gateway.
+          // Asked each turn: the endpoint's address can change under a live session.
+          free: () => {
+            const e = store.get(name);
+            return e?.flavor === "llamacpp" && isOwnServer(e.baseUrl);
+          },
           connection: () => {
             const conn = withAccount(store.resolveConnection(name), init.resolveAccount?.() ?? null); // throws when removed
             const e = store.get(name)!;

@@ -429,6 +429,11 @@ export class SqliteEpisodeStore {
         "ALTER TABLE turn_usage ADD COLUMN primary_max_call_input_tokens INTEGER",
       );
     }
+    // Where each turn's cost came from (#430); NULL on rows recorded before it.
+    const hasCostSource = (
+      this.#db.prepare("SELECT COUNT(*) AS n FROM pragma_table_info('turn_usage') WHERE name = 'cost_source'").get() as { n: number } | undefined
+    )?.n ?? 0;
+    if (!hasCostSource) this.#db.exec("ALTER TABLE turn_usage ADD COLUMN cost_source TEXT");
   }
 
   // ── Writes ────────────────────────────────────────────────────────────
@@ -694,8 +699,8 @@ export class SqliteEpisodeStore {
         `INSERT INTO turn_usage (
           workspace_id, session_id, turn_number, created_at,
           input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
-          total_cost_usd, duration_ms, stop_reason, primary_max_call_input_tokens
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          total_cost_usd, duration_ms, stop_reason, primary_max_call_input_tokens, cost_source
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(session_id, turn_number) DO UPDATE SET
           created_at = excluded.created_at,
           input_tokens = excluded.input_tokens,
@@ -705,7 +710,8 @@ export class SqliteEpisodeStore {
           total_cost_usd = excluded.total_cost_usd,
           duration_ms = excluded.duration_ms,
           stop_reason = excluded.stop_reason,
-          primary_max_call_input_tokens = excluded.primary_max_call_input_tokens`,
+          primary_max_call_input_tokens = excluded.primary_max_call_input_tokens,
+          cost_source = excluded.cost_source`,
       )
       .run(
         input.workspaceId,
@@ -720,6 +726,7 @@ export class SqliteEpisodeStore {
         input.turn.durationMs,
         input.turn.stopReason ?? null,
         input.turn.primaryMaxCallInputTokens ?? null,
+        input.turn.costSource ?? null,
       );
   }
 
@@ -730,7 +737,7 @@ export class SqliteEpisodeStore {
         `SELECT turn_number, created_at, input_tokens, output_tokens,
                 cache_read_tokens, cache_creation_tokens,
                 total_cost_usd, duration_ms, stop_reason,
-                primary_max_call_input_tokens
+                primary_max_call_input_tokens, cost_source
          FROM turn_usage
          WHERE session_id = ?
          ORDER BY turn_number DESC
@@ -747,6 +754,7 @@ export class SqliteEpisodeStore {
         duration_ms: number;
         stop_reason: string | null;
         primary_max_call_input_tokens: number | null;
+        cost_source: string | null;
       }>;
 
     return rows.map((r) => this.#rowToTurnUsage(r));
@@ -765,6 +773,10 @@ export class SqliteEpisodeStore {
     durationMs: number;
     numTurns: number;
     peakInputTokens: number;
+    /** Some cost is estimated (#430). */
+    costEstimated: boolean;
+    /** Turns whose cost isn't known (#430) — not in totalCostUsd. */
+    costUnknownTurns: number;
   } {
     const row = this.#db
       .prepare(
@@ -776,6 +788,8 @@ export class SqliteEpisodeStore {
            COALESCE(SUM(total_cost_usd), 0)         AS total_cost_usd,
            COALESCE(SUM(duration_ms), 0)            AS duration_ms,
            COUNT(*)                                  AS num_turns,
+           COALESCE(SUM(cost_source = 'estimated'), 0) AS estimated_turns,
+           COALESCE(SUM(cost_source = 'unknown'), 0)   AS unknown_turns,
            COALESCE(MAX(
              COALESCE(
                primary_max_call_input_tokens,
@@ -792,6 +806,8 @@ export class SqliteEpisodeStore {
         total_cost_usd: number;
         duration_ms: number;
         num_turns: number;
+        estimated_turns: number;
+        unknown_turns: number;
         peak_input_tokens: number;
       } | null;
 
@@ -804,6 +820,8 @@ export class SqliteEpisodeStore {
       durationMs: row?.duration_ms ?? 0,
       numTurns: row?.num_turns ?? 0,
       peakInputTokens: row?.peak_input_tokens ?? 0,
+      costEstimated: (row?.estimated_turns ?? 0) > 0,
+      costUnknownTurns: row?.unknown_turns ?? 0,
     };
   }
 
@@ -920,6 +938,7 @@ export class SqliteEpisodeStore {
     duration_ms: number;
     stop_reason: string | null;
     primary_max_call_input_tokens: number | null;
+    cost_source?: string | null;
   }): TurnUsage {
     // Anthropic's input_tokens counts NEW bytes only. `total` here SUMS
     // across the multiple internal Messages-API calls a tool-using turn
@@ -946,6 +965,7 @@ export class SqliteEpisodeStore {
       ...(row.primary_max_call_input_tokens != null
         ? { primaryMaxCallInputTokens: row.primary_max_call_input_tokens }
         : {}),
+      ...(isCostSource(row.cost_source) ? { costSource: row.cost_source } : {}),
     };
   }
 
@@ -1614,4 +1634,9 @@ function matchesQuery(ep: Episode, q: RecallQuery): boolean {
     if (!has) return false;
   }
   return true;
+}
+
+const COST_SOURCES = new Set(["backend", "estimated", "free", "unknown"]);
+function isCostSource(v: string | null | undefined): v is NonNullable<TurnUsage["costSource"]> {
+  return typeof v === "string" && COST_SOURCES.has(v);
 }

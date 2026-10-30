@@ -14,6 +14,7 @@
  *      the parsed config, not env vars, so we can mock cleanly in tests.
  */
 
+import type { ModelPrice } from "./daemon/pricing/index.js";
 import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, chmodSync, rmSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { join, isAbsolute, resolve, dirname } from "node:path";
@@ -342,6 +343,27 @@ const TelemetrySchema = z
     osc8: z.enum(["auto", "force", "disable"]).default("auto"),
   })
   .default({ osc8: "auto" });
+
+/** A model's price, USD per million tokens (#430). */
+const ModelPriceSchema = z.object({
+  input: z.number().nonnegative(),
+  output: z.number().nonnegative(),
+  cacheRead: z.number().nonnegative().optional(),
+  cacheWrite: z.number().nonnegative().optional(),
+  inputAbove200k: z.number().nonnegative().optional(),
+  outputAbove200k: z.number().nonnegative().optional(),
+});
+
+/**
+ * Prices for estimating the cost of a turn on a backend that reports tokens
+ * but no cost (#430). Wins over the built-in snapshot; `{ input: 0, output: 0 }`
+ * marks a model as free.
+ */
+const PricingSchema = z
+  .object({
+    models: z.record(z.string().min(1), ModelPriceSchema).default({}),
+  })
+  .default({ models: {} });
 
 /**
  * Auto-rotation: proactively roll over Claude Code's backing session when
@@ -898,6 +920,12 @@ const ProvidersSchema = z
          * typed a word. codeoid's own memory tools are always offered.
          */
         mcpServers: z.array(z.string()).default([]),
+        /**
+         * Its turns cost nothing (#430). Unset: only a server on this machine
+         * (loopback) is; set true for your own server elsewhere on your
+         * network, false for one that bills (a gateway to a paid API).
+         */
+        free: z.boolean().optional(),
       })
       .default({ enabled: false, baseUrl: "http://127.0.0.1:8080/v1", apiKey: "sk-local", mcpServers: [] }),
   })
@@ -1153,6 +1181,7 @@ const RootSchema = z.object({
   guard: GuardSchema,
   labeling: LabelingSchema,
   telemetry: TelemetrySchema,
+  pricing: PricingSchema,
   autoRotate: AutoRotateSchema,
   session: SessionSchema,
   conductor: ConductorSchema,
@@ -1316,6 +1345,10 @@ export interface CodeoidConfig {
   /** Misc display toggles. */
   telemetry: {
     osc8: "auto" | "force" | "disable";
+  };
+  /** Model prices that override the built-in snapshot (#430); keyed by model id. */
+  pricing?: {
+    models: Record<string, ModelPrice>;
   };
   /** Auto-rotation of the Claude Code backing session near the context ceiling. */
   autoRotate: {
@@ -1842,6 +1875,7 @@ export function loadConfig(opts: LoadOptions = {}): CodeoidConfig {
     guard: parsed.guard,
     labeling: parsed.labeling,
     telemetry: { osc8: osc8Mode },
+    pricing: parsed.pricing,
     autoRotate: parsed.autoRotate,
     session: parsed.session,
     conductor: parsed.conductor,

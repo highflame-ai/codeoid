@@ -179,7 +179,7 @@ export function StatusBar({
             <>
               <Text dimColor>{"   │   "}</Text>
               <Text color="cyan" bold>
-                {formatCost(usage.totalCostUsd)}
+                {formatCostOf(usage)}
               </Text>
               {usage.lastTurnCostUsd !== undefined && usage.lastTurnCostUsd > 0 && (
                 <Text color="cyan" dimColor>
@@ -326,6 +326,13 @@ function formatTokens(n: number): string {
  * whole dollars above (e.g. "$42", "$1.2k"). Tiny costs collapse to "$0.00"
  * rather than a noisy exponential.
  */
+/** The session's cost, marked when estimated (`~`) or partly unknown (`+`, `?`) — #430. */
+function formatCostOf(u: { totalCostUsd: number; costEstimated?: boolean; costUnknownTurns?: number }): string {
+  const unknown = u.costUnknownTurns ?? 0;
+  if (unknown > 0 && u.totalCostUsd === 0 && !u.costEstimated) return "$?";
+  return `${u.costEstimated ? "~" : ""}${formatCost(u.totalCostUsd)}${unknown > 0 ? "+" : ""}`;
+}
+
 function formatCost(usd: number): string {
   if (!Number.isFinite(usd) || usd <= 0) return "$0.00";
   if (usd < 10) return `$${usd.toFixed(2)}`;

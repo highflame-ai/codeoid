@@ -199,6 +199,8 @@ export class QwenProvider implements SessionProvider {
   // ── AgentProvider ─────────────────────────────────────────────────────────
 
   runTurn(opts: TurnOpts): TurnRun {
+    // A new turn's usage starts from nothing, whatever an interrupted one left (#430).
+    if (this.#translateState) this.#translateState.turnUsage = undefined;
     this.#currentCanUseTool = opts.canUseTool;
     this.#currentSender = opts.sender ?? null;
 
@@ -636,13 +638,18 @@ export class QwenProvider implements SessionProvider {
     return synthetic;
   }
 
+  /** Kept across messages: a turn's usage is summed request by request (#430). */
+  #translateState: QwenTranslateState | null = null;
+
   /** Translate one SDKMessage into ProviderEvents. */
   #translate(msg: SDKMessage): void {
-    translateQwenMessage(msg, this.#emit.bind(this), this.id, {
-      pendingTools: this.#pendingTools,
-      seenSubagents: this.#seenSubagents,
-      requestedModel: this.#currentModel,
-    });
+    if (!this.#translateState) this.#translateState = { pendingTools: this.#pendingTools, seenSubagents: this.#seenSubagents };
+    const state = this.#translateState;
+    // Interrupt and a session reset swap these for fresh ones: follow them.
+    state.pendingTools = this.#pendingTools;
+    state.seenSubagents = this.#seenSubagents;
+    state.requestedModel = this.#currentModel;
+    translateQwenMessage(msg, this.#emit.bind(this), this.id, state);
   }
 }
 
@@ -658,6 +665,11 @@ export interface QwenTranslateState {
    * the requested id is the fallback.
    */
   requestedModel?: string | null;
+  /**
+   * This turn's usage so far, request by request (#430). qwen-code's result
+   * carries the session's cumulative totals, so a turn's own are summed here.
+   */
+  turnUsage?: LLMCallUsage & { calls: number };
 }
 
 /**
@@ -702,13 +714,23 @@ export function translateQwenMessage(
 
       const perCall = m.message?.usage;
       if (perCall) {
+        // qwen-code's input_tokens includes the cached ones it also reports as cache reads.
+        const cached = perCall.cache_read_input_tokens ?? 0;
         const usage: LLMCallUsage = {
-          inputTokens: perCall.input_tokens ?? 0,
-          cacheReadTokens: perCall.cache_read_input_tokens ?? 0,
+          inputTokens: Math.max(0, (perCall.input_tokens ?? 0) - cached),
+          cacheReadTokens: cached,
           cacheCreationTokens: perCall.cache_creation_input_tokens ?? 0,
           outputTokens: perCall.output_tokens ?? 0,
         };
         emit({ type: "llm_call", usage, isPrimary: parentToolUseId === null });
+        // Every request costs, a sub-agent's included.
+        if (!state.turnUsage) state.turnUsage = { inputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, outputTokens: 0, calls: 0 };
+        const t = state.turnUsage;
+        t.inputTokens += usage.inputTokens;
+        t.cacheReadTokens += usage.cacheReadTokens;
+        t.cacheCreationTokens += usage.cacheCreationTokens;
+        t.outputTokens += usage.outputTokens;
+        t.calls += 1;
       }
 
       const content = Array.isArray(m.message?.content)
@@ -848,17 +870,27 @@ export function translateQwenMessage(
       // entry would mis-correlate a later same-named call.
       state.pendingTools.length = 0;
       state.seenSubagents.clear();
+      // The turn's own usage, summed per request — never the result's, which
+      // is the session's cumulative total (#430).
+      const turn = state.turnUsage;
+      state.turnUsage = undefined;
 
       const normalized: NormalizedTurnResult = {
         providerId,
         model: Object.keys(r.modelUsage ?? {})[0] ?? state.requestedModel ?? "unknown",
-        inputTokens: r.usage?.input_tokens ?? 0,
-        outputTokens: r.usage?.output_tokens ?? 0,
-        cacheReadTokens: r.usage?.cache_read_input_tokens ?? 0,
-        cacheCreationTokens: r.usage?.cache_creation_input_tokens ?? 0,
-        // The Qwen gateway does not price responses; cost stays 0 like the
-        // other non-Anthropic backends.
+        inputTokens: turn?.inputTokens ?? 0,
+        outputTokens: turn?.outputTokens ?? 0,
+        cacheReadTokens: turn?.cacheReadTokens ?? 0,
+        cacheCreationTokens: turn?.cacheCreationTokens ?? 0,
+        // Qwen doesn't price responses: the session prices the tokens. A turn
+        // that ran without reporting usage is unknown (a failed one spent
+        // nothing); so is one that used several models, whose tokens can't be
+        // priced at one model's rate.
         totalCostUsd: 0,
+        // A failed result that still went to the model (num_turns) spent too.
+        ...((!turn && (r.is_error !== true || (r.num_turns ?? 0) > 0)) || Object.keys(r.modelUsage ?? {}).length > 1
+          ? { costSource: "unknown" as const }
+          : {}),
         durationMs: r.duration_ms ?? 0,
         stopReason: r.subtype,
         isError: r.is_error,

@@ -13,17 +13,36 @@
 
 import { describe, test, expect, mock, beforeEach } from "bun:test";
 
-type Opts = { abortController: AbortController; resume?: string; sessionId?: string };
+type Opts = {
+  abortController: AbortController;
+  resume?: string;
+  sessionId?: string;
+  canUseTool?: (name: string, input: unknown) => Promise<unknown>;
+};
+
+/** When set, the next query announces this tool call, then asks to run it (as the real SDK does). */
+let nextToolCall: { id: string; name: string; input: Record<string, unknown> } | null = null;
 
 let queryCalls: Opts[] = [];
 let softInterruptCalls = 0;
 
 function makeMockQuery(opts: Opts) {
   let poisoned = false;
+  const tool = nextToolCall;
+  nextToolCall = null;
+  let announced = false;
   return {
     [Symbol.asyncIterator]() {
       return {
         next(): Promise<{ done: boolean; value: unknown }> {
+          if (tool && !announced) {
+            announced = true;
+            setTimeout(() => void opts.canUseTool?.(tool.name, tool.input), 10);
+            return Promise.resolve({
+              done: false,
+              value: { type: "assistant", parent_tool_use_id: null, message: { content: [{ type: "tool_use", ...tool }] } },
+            });
+          }
           return new Promise((_resolve, reject) => {
             opts.abortController.signal.addEventListener("abort", () =>
               reject(Object.assign(new Error("CLI process aborted by user"), { name: "AbortError" })),
@@ -98,6 +117,33 @@ describe("QwenProvider interrupt", () => {
     expect(queryCalls[0]?.abortController.signal.aborted).toBe(true);
     expect(recoveries).toBe(0);
     expect(events.filter((e) => (e as { type: string }).type === "error")).toHaveLength(0);
+  });
+
+  test("after a Stop, the next turn's approval still belongs to the call it announced (#430 round 2)", async () => {
+    const provider = makeProvider();
+    // The first turn translates a message (the provider's translation state is made then), and is stopped.
+    nextToolCall = { id: "early-1", name: "read_file", input: { path: "a" } };
+    const first = provider.runTurn(turnOpts("first"));
+    await new Promise((r) => setTimeout(r, 40));
+    await first.interrupt();
+    for await (const _ of first.events) {
+      /* drain */
+    }
+    nextToolCall = { id: "real-1", name: "run_shell_command", input: { command: "ls" } };
+    const asked: string[] = [];
+    const second = provider.runTurn({ ...turnOpts("second"), canUseTool: async (toolId: string) => {
+      asked.push(toolId);
+      return { behavior: "allow" as const };
+    } });
+    const starts: string[] = [];
+    const reader = (async () => {
+      for await (const e of second.events) if ((e as { type: string }).type === "tool_start") starts.push((e as { toolId: string }).toolId);
+    })();
+    await new Promise((r) => setTimeout(r, 80));
+    await second.interrupt();
+    await reader;
+    expect(starts).toEqual(["real-1"]);
+    expect(asked).toEqual(["real-1"]);
   });
 
   test("the next turn rebuilds the loop with resume, keeping the backing session", async () => {

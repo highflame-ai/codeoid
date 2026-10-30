@@ -18,6 +18,7 @@ import {
   ctxWindowColorClass,
   elapsedSince,
   formatCostUsd,
+  formatSessionCost,
   formatDuration,
   formatPercent,
   formatTokens,
@@ -183,8 +184,8 @@ const SessionMetrics: Component = () => {
               <span class="text-fg-faint">⇡</span>{" "}
               <span>{formatTokens(usage()?.outputTokens)}</span>
             </span>
-            <span class="font-semibold text-accent" title="Estimated cost (SDK-reported)">
-              {formatCostUsd(usage()?.totalCostUsd)}
+            <span class="font-semibold text-accent" title={formatSessionCost(usage()).title}>
+              {formatSessionCost(usage()).text}
             </span>
             <Show when={s().model}>
               <span class="rounded border border-border px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-fg-muted">

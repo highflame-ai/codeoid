@@ -306,6 +306,7 @@ export class GeminiAcpProvider implements SessionProvider {
       cacheReadTokens: 0,
       cacheCreationTokens: 0,
       totalCostUsd: 0,
+      costSource: "unknown", // ACP carries no tokens to price (#430)
       durationMs: Date.now() - this.#turnStartedAt,
       stopReason: result.stopReason,
     };
