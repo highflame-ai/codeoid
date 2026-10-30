@@ -62,8 +62,24 @@ describe("shell parsing (#431)", () => {
   });
 
   it("finds xargs and find -exec commands, their run-time arguments unknown", async () => {
-    expect(await argvs("xargs -n1 -I{} rm {}")).toEqual([["rm", "{}", null]]);
+    expect(await argvs("xargs -n1 -I{} rm {}")).toEqual([["rm", null]]);
     expect(await argvs("find . -exec rm -f {} +")).toEqual([["find", ".", "-exec", "rm", "-f", "{}", "+"], ["rm", "-f", null]]);
+  });
+
+  it("reads wrappers' own options only, and sees through more of them (round-1 audit)", async () => {
+    expect(await argvs("xargs -l rm -rf")).toEqual([["rm", "-rf", null]]);
+    expect(await argvs("xargs -i rm -rf {}")).toEqual([["rm", "-rf", null]]);
+    expect(await argvs("xargs -I% sh -c 'rm ~/%'")).toEqual([["sh", "-c", null]]);
+    expect(await argvs("env - rm x")).toEqual([["rm", "x"]]);
+    expect(await argvs("command rm -r -v x")).toEqual([["rm", "-r", "-v", "x"]]);
+    expect(await argvs("busybox rm -rf x")).toEqual([["rm", "-rf", "x"]]);
+    expect(await argvs("coproc rm x")).toEqual([["rm", "x"]]);
+    expect(await argvs("trap 'rm x' EXIT")).toEqual([["trap", "rm x", "EXIT"], ["rm", "x"]]);
+    expect(await argvs("script -qc 'rm x' /dev/null")).toEqual([["script", "-qc", "rm x", "/dev/null"], ["rm", "x"]]);
+    expect(await argvs("find . -exec rm -rf {}/ \\;")).toEqual([["find", ".", "-exec", "rm", "-rf", "{}/", ";"], ["rm", "-rf", null]]);
+    for (const c of ["env -iS'rm x'", "env -C /etc cat passwd", "strace -f rm x", "parallel rm ::: x", "unshare -r rm x", "/bin/r? x", "r{m,} x"]) {
+      expect((await parseShell(c)).problems.length).toBeGreaterThan(0);
+    }
   });
 
   it("records pipeline stages and what substitutions feed", async () => {
