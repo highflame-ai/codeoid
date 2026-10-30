@@ -672,7 +672,7 @@ function operandsAfter(cmd: SimpleCommand, withValue: string[]): ShellWord[] {
   for (let i = 0; i < args.length; i++) {
     const x = args[i]!.value;
     if (x === "--") return [...out, ...args.slice(i + 1)];
-    if (x !== null && x.startsWith("-") && x !== "-") {
+    if (x?.startsWith("-") && x !== "-") {
       if (withValue.includes(x)) i++;
       continue;
     }
