@@ -96,6 +96,15 @@ describe("shell parsing (#431)", () => {
     expect(await argvs("a[$(z)]=7")).toEqual([["z"]]);
   });
 
+  it("doesn't understand arithmetic on a variable, or a prompt expansion (round-1 audit)", async () => {
+    for (const c of ["echo $((x))", "echo $[x]", "((x++))", "[[ $x -eq 0 ]]", "let y=x", "echo ${a[$i]}", "a[$i]=1", "echo ${x:0:len}", "echo ${x@P}", "for ((i=0; i<3; i++)); do :; done"]) {
+      expect((await parseShell(c)).problems.length).toBeGreaterThan(0);
+    }
+    for (const c of ["echo $((1+2))", "[[ $x == y ]]", "[ $x -eq 0 ]", "echo ${a[0]} ${x:0:3} ${x: -2} ${x@Q} ${#x}"]) {
+      expect((await parseShell(c)).problems).toEqual([]);
+    }
+  });
+
   it("finds what fd -x / -X runs on each match", async () => {
     expect(await argvs("fd -e ts -x wc -l")).toEqual([["fd", "-e", "ts", "-x", "wc", "-l"], ["wc", "-l", null]]);
     expect(await argvs("fd . -X rm {} \\;")).toEqual([["fd", ".", "-X", "rm", "{}", ";"], ["rm", null]]);

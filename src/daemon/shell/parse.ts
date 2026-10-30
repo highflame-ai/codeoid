@@ -236,8 +236,18 @@ class Walker {
       }
       case "unset_command":
       case "test_command":
+        // `[[ $x -eq 0 ]]` compares as arithmetic.
+        if (n.text.startsWith("[[") && n.descendantsOfType("test_operator").some((o) => o && /^-(eq|ne|lt|le|gt|ge)$/.test(o.text))) this.#arithmetic(n);
         // No program runs, but a substitution inside does.
         this.substitutionsIn(n, ctx, null);
+        return;
+      case "compound_statement":
+      case "c_style_for_statement":
+        // `((x++))`, `for ((i=0; i<n; i++))`.
+        if (n.type === "c_style_for_statement" || n.text.startsWith("((")) {
+          for (const c of n.namedChildren) if (c && c.type !== "do_group" && c.type !== "compound_statement") this.#arithmetic(c);
+        }
+        for (const c of n.namedChildren) if (c) this.node(c, ctx);
         return;
       case "program":
         // Each statement is a pipeline of its own.
@@ -283,6 +293,10 @@ class Walker {
       }
     }
     cmd.heredoc = heredoc;
+    // `let` evaluates its arguments as arithmetic.
+    if (words[0]?.value === "let" && words.slice(1).some((w) => /[A-Za-z_]/.test(w.raw))) {
+      this.out.problems.push(`arithmetic on a variable, whose value bash may run as code (${n.text})`);
+    }
     this.unwrap(cmd, ctx);
   }
 
@@ -388,6 +402,8 @@ class Walker {
       }
       default:
         // $X, ${X}, $((…)), brace expressions, and anything else: known only at run time.
+        if (n.type === "arithmetic_expansion") this.#arithmetic(n);
+        if (n.type === "expansion") this.#expansion(n);
         this.substitutionsIn(n, ctx, owner);
         if (raw === "$HOME" || raw === "${HOME}") return { value: null, raw, glob: false, home: "~" };
         return { value: null, raw, glob: n.type === "brace_expression" };
@@ -448,11 +464,39 @@ class Walker {
     const name = n.namedChildren[0];
     const value = n.namedChildren.length > 1 ? n.namedChildren.at(-1) : null;
     if (name) this.substitutionsIn(name, ctx, owner); // `a[$(x)]=1`
+    if (name?.type === "subscript") this.#arithmetic(name, 1);
     this.out.assignments.push({
       name: (name?.text ?? "").replace(/\[[\s\S]*$/, ""),
       value: value ? this.word(value, ctx, owner) : lit(""),
       exported,
     });
+  }
+
+  /**
+   * Arithmetic that reads a variable: bash evaluates a variable's value as
+   * an expression there, so `x='a[$(cmd)]'; echo $((x))` runs cmd — the
+   * value, from wherever it came, is code. Not understood.
+   */
+  #arithmetic(n: Node, from = 0): void {
+    const reads = (x: Node): boolean =>
+      x.type === "variable_name" ||
+      x.type === "simple_expansion" ||
+      x.type === "expansion" ||
+      (x.type === "word" && /^[A-Za-z_]/.test(x.text)) ||
+      // A `$(…)`'s commands are judged as commands.
+      (x.type !== "command_substitution" && x.namedChildren.some((c) => c !== null && reads(c)));
+    if (n.namedChildren.slice(from).some((c) => c !== null && reads(c))) this.out.problems.push(`arithmetic on a variable, whose value bash may run as code (${n.text})`);
+  }
+
+  /** `${…}`: a prompt expansion (`@P`) runs the value's `$(…)`; an index is arithmetic; one the grammar cut short isn't read. */
+  #expansion(n: Node): void {
+    if (!n.text.endsWith("}")) this.out.problems.push(`an expansion the parser doesn't know (${n.text})`);
+    else if (/@P\}$/.test(n.text)) this.out.problems.push(`a prompt expansion runs what the value holds (${n.text})`);
+    // `${x:off:len}`: the offset and length are arithmetic.
+    else if (/[A-Za-z_]/.test(/^\$\{[!#]?\w+(?:\[[^\]]*\])?:(?![-=?+])([\s\S]*)\}$/.exec(n.text)?.[1] ?? "")) {
+      this.out.problems.push(`arithmetic on a variable, whose value bash may run as code (${n.text})`);
+    }
+    for (const s of n.namedChildren) if (s?.type === "subscript") this.#arithmetic(s, 1);
   }
 
   /** Commands inside `$(…)` / `<(…)` anywhere under n. */
