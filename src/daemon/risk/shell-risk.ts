@@ -88,9 +88,14 @@ class Verdict {
 
 export function judge(parsed: ParsedShell, ctx: Ctx): ShellRisk {
   const v = new Verdict();
+  judgeLine(parsed, ctx.cwd, ctx, v);
+  return v.out();
+}
+
+function judgeLine(parsed: ParsedShell, start: string | null, ctx: Ctx, v: Verdict): void {
   for (const p of parsed.problems) v.add("unknown", p);
   // A `cd` moves every relative path after it: null once where to isn't known.
-  let cwd: string | null = ctx.cwd;
+  let cwd: string | null = start;
   for (const cmd of parsed.commands) {
     const prog = programOf(cmd);
     if (prog === "cd" || prog === "pushd" || prog === "popd") {
@@ -99,7 +104,6 @@ export function judge(parsed: ParsedShell, ctx: Ctx): ShellRisk {
     }
     judgeCommand(cmd, parsed, cwd, ctx, v);
   }
-  return v.out();
 }
 
 /** Where a `cd` goes: null for `cd -`, `popd`, and anything only known at run time. */
@@ -310,7 +314,7 @@ function judgeCommand(cmd: SimpleCommand, parsed: ParsedShell, cwd: string | nul
   if (cmd.delegates) return;
 
   if (INTERPRETERS.has(prog)) {
-    judgeInterpreter(cmd, prog, parsed, v);
+    judgeInterpreter(cmd, prog, parsed, cwd, ctx, v);
     return;
   }
   if (DOWNLOADERS.has(prog)) {
@@ -536,7 +540,7 @@ function judgeCopy(cmd: SimpleCommand, prog: string, cwd: string | null, ctx: Ct
   if (!remote(target)) judgeWrite(resolvePath(target, cwd, ctx), target, ctx, v, `${prog} writes`);
 }
 
-function judgeInterpreter(cmd: SimpleCommand, prog: string, parsed: ParsedShell, v: Verdict): void {
+function judgeInterpreter(cmd: SimpleCommand, prog: string, parsed: ParsedShell, cwd: string | null, ctx: Ctx, v: Verdict): void {
   const index = parsed.commands.indexOf(cmd);
   // Fed by a download: `curl … | sh`, `sh <(curl …)`, `source <(wget …)`.
   const fedByDownload =
@@ -546,7 +550,36 @@ function judgeInterpreter(cmd: SimpleCommand, prog: string, parsed: ParsedShell,
     v.add("high", `${prog} runs code downloaded from the internet`);
     return;
   }
+  if (cmd.stdinScript) {
+    // A shell running its input: judged as the script when the line holds
+    // it (`echo '…' | sh`, `cat <<EOF | sh`), and not understood otherwise.
+    const script = fedText(cmd, parsed);
+    if (script === null) v.add("unknown", `${prog} runs a script it reads from its input`);
+    else judgeLine(parseShellSync(script), cwd, ctx, v);
+    return;
+  }
   v.add("medium", `${prog} runs code`);
+}
+
+/** The text the stage before cmd writes, when the line holds it: a plain `echo`, a `printf` of plain text, a `cat` of a here-document. */
+function fedText(cmd: SimpleCommand, parsed: ParsedShell): string | null {
+  if (cmd.stage === 0) return null;
+  const feeders = parsed.commands.filter((c) => c.pipeline === cmd.pipeline && c.stage === cmd.stage - 1);
+  const f = feeders[0];
+  if (feeders.length !== 1 || !f || f.via.length > 0 || f.delegates) return null;
+  if (f.redirects.some((r) => r.op.startsWith(">") || r.op === "&>" || r.op === "&>>")) return null;
+  const args = f.argv.slice(1);
+  const values = args.map((w) => w.value);
+  if (values.some((x) => x === null)) return null;
+  const prog = programOf(f);
+  if (prog === "echo" && !values[0]?.startsWith("-")) return values.join(" ");
+  if (prog === "printf" && values.length === 1 && !/^-|[%\\]/.test(values[0]!)) return values[0]!;
+  if (prog === "cat" && args.length === 0) {
+    const last = f.redirects.filter((r) => (r.fd === null || r.fd === 0) && r.op.startsWith("<<")).at(-1);
+    if (!last) return null;
+    return last.op === "<<<" ? (last.target?.value ?? null) : (last.body ?? null);
+  }
+  return null;
 }
 
 function judgeDownloader(cmd: SimpleCommand, prog: string, v: Verdict): void {

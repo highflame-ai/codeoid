@@ -75,6 +75,18 @@ describe("shell parsing (#431)", () => {
     expect(commands[by("wget").feeds!]!.argv[0]!.value).toBe("bash");
   });
 
+  it("marks a shell that runs its input, and what a statement's redirect substitution feeds (round-1 audit)", async () => {
+    const stdin = async (c: string) => (await parseShell(c)).commands.filter((x) => x.stdinScript).map((x) => x.argv[0]!.value);
+    expect(await stdin("x | sh")).toEqual(["sh"]);
+    expect(await stdin("x | bash -s -- a")).toEqual(["bash"]);
+    expect(await stdin("bash < <(x)")).toEqual(["bash"]);
+    expect(await stdin("source <(x)")).toEqual(["source"]);
+    expect(await stdin("x | bash run.sh")).toEqual([]);
+    expect(await stdin("bash < run.sh")).toEqual([]);
+    const { commands } = await parseShell("bash < <(curl x)");
+    expect(commands[commands.find((c) => c.argv[0]?.value === "curl")!.feeds!]!.argv[0]!.value).toBe("bash");
+  });
+
   it("carries what follows a here-document's start: a pipe, a redirect, a list", async () => {
     const { commands } = await parseShell("cat <<EOF | sh > out && ls\nx\nEOF");
     const by = (n: string) => commands.find((c) => c.argv[0]?.value === n)!;
