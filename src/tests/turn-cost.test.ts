@@ -187,6 +187,24 @@ describe("a turn's cost (#430)", () => {
     expect(b.s.toInfo().usage!.totalCostUsd).toBeCloseTo(2, 6);
   });
 
+  it("...and bills only that request at the tier when every request's tokens were reported (#430)", async () => {
+    const tiered = { models: { tiered: { input: 1, output: 0, inputAbove200k: 2 } } };
+    const call = (inputTokens: number): ProviderEvent => ({ type: "llm_call", isPrimary: true, usage: { inputTokens, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 } });
+    const t = await sessionWith(
+      [[call(100_000), call(100_000), call(250_000), { type: "turn_done", result: result({ model: "tiered", inputTokens: 450_000, outputTokens: 0, largestPromptTokens: 250_000 }) }]],
+      tiered,
+    );
+    await t.run();
+    expect(t.s.toInfo().usage!.totalCostUsd).toBeCloseTo(0.2 + 0.5, 6);
+    // Reports that don't add up to the turn: the whole turn at the tier, never less.
+    const short = await sessionWith(
+      [[call(250_000), { type: "turn_done", result: result({ model: "tiered", inputTokens: 450_000, outputTokens: 0, largestPromptTokens: 250_000 }) }]],
+      tiered,
+    );
+    await short.run();
+    expect(short.s.toInfo().usage!.totalCostUsd).toBeCloseTo(0.9, 6);
+  });
+
   it("a turn that did model work but ended with no result is recorded — unknown, never $0 (#430)", async () => {
     const { s, run } = await sessionWith([[{ type: "text_delta", content: "working" }, { type: "error", message: "stream reset" }]]);
     await run();

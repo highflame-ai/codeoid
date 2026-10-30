@@ -34,6 +34,8 @@ interface Entry {
   cache_creation_input_token_cost?: number | null;
   input_cost_per_token_above_200k_tokens?: number | null;
   output_cost_per_token_above_200k_tokens?: number | null;
+  cache_read_input_token_cost_above_200k_tokens?: number | null;
+  cache_creation_input_token_cost_above_200k_tokens?: number | null;
 }
 
 const perMillion = (v: number | null | undefined) => (typeof v === "number" ? Math.round(v * 1e6 * 1e6) / 1e6 : undefined);
@@ -61,6 +63,10 @@ for (const [key, e] of Object.entries(table)) {
   if (cacheWrite !== undefined) price.cacheWrite = cacheWrite;
   if (inputLong !== undefined) price.inputAbove200k = inputLong;
   if (outputLong !== undefined) price.outputAbove200k = outputLong;
+  const cacheReadLong = perMillion(e.cache_read_input_token_cost_above_200k_tokens);
+  const cacheWriteLong = perMillion(e.cache_creation_input_token_cost_above_200k_tokens);
+  if (cacheReadLong !== undefined) price.cacheReadAbove200k = cacheReadLong;
+  if (cacheWriteLong !== undefined) price.cacheWriteAbove200k = cacheWriteLong;
   // The first listing wins: the provider's own (`gemini/…`) and Vertex's agree or differ only in ways that don't matter here.
   models[id] ??= price;
 }

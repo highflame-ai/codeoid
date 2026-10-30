@@ -9,7 +9,7 @@
  *   - Scrollback stores merged SessionMessage (not deltas)
  */
 
-import { type CostSource, estimateCost, priceFor } from "./pricing/index.js";
+import { type CostSource, estimateCost, estimateCostByRequest, priceFor } from "./pricing/index.js";
 import { ClaudeAccountError, type ClaudeAccountStore, projectCredentialOverride, userCredentialOverride } from "./claude-accounts.js";
 import { AccountError, type AccountStore, type ResolvedAccount } from "./accounts.js";
 import { geminiProjectOverride, qwenProjectOverride } from "./account-apply.js";
@@ -6112,7 +6112,8 @@ export class Session {
       : result.model;
     const price = priceFor(model, this.#config?.pricing?.models);
     if (!price) return { usd: 0, source: "unknown" };
-    const usd = estimateCost(price, tokens, largestPrompt);
+    // Each request at its own long-context tier, where its reports add up to the turn.
+    const usd = estimateCostByRequest(price, tokens, [...this.#primaryTurnCalls, ...this.#subagentTurnCalls]) ?? estimateCost(price, tokens, largestPrompt);
     return Number.isFinite(usd) && usd >= 0 ? { usd, source: "estimated" } : { usd: 0, source: "unknown" };
   }
 

@@ -352,6 +352,8 @@ const ModelPriceSchema = z.object({
   cacheWrite: z.number().nonnegative().optional(),
   inputAbove200k: z.number().nonnegative().optional(),
   outputAbove200k: z.number().nonnegative().optional(),
+  cacheReadAbove200k: z.number().nonnegative().optional(),
+  cacheWriteAbove200k: z.number().nonnegative().optional(),
 });
 
 /**

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { estimateCost, PRICING_SNAPSHOT_DATE, priceFor } from "./index.js";
+import { estimateCost, estimateCostByRequest, PRICING_SNAPSHOT_DATE, priceFor } from "./index.js";
 
 describe("model prices (#430)", () => {
   it("finds a model in the snapshot, with a models/ prefix or a date suffix too", () => {
@@ -35,6 +35,22 @@ describe("model prices (#430)", () => {
     expect(estimateCost(price, tokens, 150_000)).toBe(1.25);
     expect(estimateCost(price, tokens, 250_000)).toBe(2.5);
     expect(estimateCost({ input: 1, output: 1 }, tokens, 250_000)).toBe(1);
+  });
+
+  it("bills cached tokens at the long-context tier too: their own long rate, else raised as input's is", () => {
+    const cached = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 1_000_000, cacheCreationTokens: 1_000_000 };
+    const price = { input: 1.25, output: 10, cacheRead: 0.125, cacheWrite: 2, inputAbove200k: 2.5 };
+    expect(estimateCost(price, cached, 150_000)).toBeCloseTo(2.125, 9);
+    expect(estimateCost(price, cached, 250_000)).toBeCloseTo(4.25, 9);
+    expect(estimateCost({ ...price, cacheReadAbove200k: 0.3, cacheWriteAbove200k: 5 }, cached, 250_000)).toBeCloseTo(5.3, 9);
+  });
+
+  it("bills each request at its own tier when the requests add up to the turn, else gives up", () => {
+    const price = { input: 1, output: 0, inputAbove200k: 2 };
+    const req = (inputTokens: number) => ({ inputTokens, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 });
+    expect(estimateCostByRequest(price, req(350_000), [req(100_000), req(250_000)])).toBeCloseTo(0.6, 9);
+    expect(estimateCostByRequest(price, req(400_000), [req(100_000), req(250_000)])).toBeUndefined();
+    expect(estimateCostByRequest(price, req(0), [])).toBeUndefined();
   });
 });
 

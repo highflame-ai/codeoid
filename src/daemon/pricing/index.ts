@@ -20,6 +20,8 @@ export interface ModelPrice {
   /** Rates for a request whose prompt is over 200k tokens (Gemini Pro). */
   inputAbove200k?: number;
   outputAbove200k?: number;
+  cacheReadAbove200k?: number;
+  cacheWriteAbove200k?: number;
 }
 
 /** Where a turn's cost came from. */
@@ -96,10 +98,26 @@ export function estimateCost(price: ModelPrice, tokens: TurnTokens, largestPromp
   const long = largestPrompt > 200_000;
   const input = (long ? price.inputAbove200k : undefined) ?? price.input;
   const output = (long ? price.outputAbove200k : undefined) ?? price.output;
+  // Cached tokens go up with the tier too: at their own long rate, else as input does.
+  const scale = long && price.input > 0 ? input / price.input : 1;
+  const cacheRead = (long ? price.cacheReadAbove200k : undefined) ?? (price.cacheRead !== undefined ? price.cacheRead * scale : input);
+  const cacheWrite = (long ? price.cacheWriteAbove200k : undefined) ?? (price.cacheWrite !== undefined ? price.cacheWrite * scale : input);
   const usd =
     tokens.inputTokens * input +
     tokens.outputTokens * output +
-    tokens.cacheReadTokens * (price.cacheRead ?? input) +
-    tokens.cacheCreationTokens * (price.cacheWrite ?? input);
+    tokens.cacheReadTokens * cacheRead +
+    tokens.cacheCreationTokens * cacheWrite;
   return usd / 1_000_000;
+}
+
+/**
+ * The cost of a turn request by request, each at its own tier, when the
+ * requests add up to the turn's tokens exactly; else undefined (price the
+ * turn whole at its largest request's tier, which never under-counts).
+ */
+export function estimateCostByRequest(price: ModelPrice, tokens: TurnTokens, requests: readonly TurnTokens[]): number | undefined {
+  if (requests.length === 0) return undefined;
+  const keys = ["inputTokens", "outputTokens", "cacheReadTokens", "cacheCreationTokens"] as const;
+  if (keys.some((k) => requests.reduce((n, r) => n + r[k], 0) !== tokens[k])) return undefined;
+  return requests.reduce((usd, r) => usd + estimateCost(price, r, r.inputTokens + r.cacheReadTokens + r.cacheCreationTokens), 0);
 }
