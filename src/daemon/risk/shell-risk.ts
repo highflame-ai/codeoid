@@ -449,8 +449,11 @@ function judgeCommand(cmd: SimpleCommand, parsed: ParsedShell, cwd: string | nul
       judgeReader(cmd, prog, parsed, cwd, ctx, v);
       return;
     case "hostname":
-    case "date":
       if (positionals(cmd).length > 0 || hasFlag(cmd, "s", "--set")) v.add("high", `${prog} changes the machine's settings`);
+      else judgeReader(cmd, prog, parsed, cwd, ctx, v);
+      return;
+    case "date":
+      if (dateSets(cmd)) v.add("high", "date changes the machine's clock");
       else judgeReader(cmd, prog, parsed, cwd, ctx, v);
       return;
   }
@@ -459,6 +462,31 @@ function judgeCommand(cmd: SimpleCommand, parsed: ParsedShell, cwd: string | nul
     return;
   }
   v.add("medium", `runs ${prog}`);
+}
+
+/** `date -s …`, `date --set=…` or `date MMDDhhmm…` sets the clock; `+FORMAT`, `-d DATE` and `-r FILE` only read. */
+function dateSets(cmd: SimpleCommand): boolean {
+  const args = cmd.argv.slice(1);
+  for (let i = 0; i < args.length; i++) {
+    const x = args[i]!.value;
+    // A run-time operand could be a time to set; a format starts with `+`.
+    if (x === null) {
+      if (!/^["']?\+/.test(args[i]!.raw)) return true;
+    } else if (/^--set(=|$)/.test(x)) return true;
+    else if (x === "--date" || x === "--reference" || x === "--file") i++;
+    else if (/^-[a-zA-Z]/.test(x)) {
+      // A cluster: `-s` sets; `-d`, `-r`, `-f` take a value, `-I` an attached format.
+      for (const c of x.slice(1)) {
+        if (c === "s") return true;
+        if (c === "I") break;
+        if (c === "d" || c === "r" || c === "f") {
+          if (x.endsWith(c)) i++;
+          break;
+        }
+      }
+    } else if (/^\d{4,}(\.\d{2})?$/.test(x)) return true;
+  }
+  return false;
 }
 
 /** Readers whose arguments are never files they read (`echo`, `tr`'s sets). */
