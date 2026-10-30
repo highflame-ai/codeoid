@@ -9,6 +9,8 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CodeoidConfig } from "../config.js";
+import type { Embedder } from "../daemon/memory/embedder.js";
+import { MemoryEngine, SqliteEpisodeStore } from "../daemon/memory/index.js";
 import { priceFor } from "../daemon/pricing/index.js";
 import type { NormalizedTurnResult, ProviderEvent, TurnOpts, TurnRun } from "../daemon/providers/interface.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
@@ -51,7 +53,7 @@ function result(overrides: Partial<NormalizedTurnResult>): NormalizedTurnResult 
 async function sessionWith(
   turns: Array<NormalizedTurnResult | ProviderEvent[]>,
   pricing?: CodeoidConfig["pricing"],
-  opts: { stall?: boolean; midTurn?: boolean; session?: CodeoidConfig["session"]; provider?: MockSessionProvider } = {},
+  opts: { stall?: boolean; midTurn?: boolean; session?: CodeoidConfig["session"]; provider?: MockSessionProvider; memory?: MemoryEngine } = {},
 ) {
   const store = new Store(join(tmp, "codeoid.db"));
   const registry = new ProviderRegistry("codex");
@@ -78,7 +80,7 @@ async function sessionWith(
     conductor: { enabled: false, name: "conductor", provider: "claude" },
     ...(pricing ? { pricing } : {}),
   } as CodeoidConfig;
-  const m = new SessionManager(store, new TranscriptStore(join(tmp, "t")), undefined, undefined, undefined, { config, providers: registry });
+  const m = new SessionManager(store, new TranscriptStore(join(tmp, "t")), undefined, undefined, opts.memory, { config, providers: registry });
   mkdirSync(join(tmp, "work"), { recursive: true });
   const r = (await m.handle({ type: "session.create", id: "c", name: "w", workdir: join(tmp, "work") }, auth, client)) as { data: { id: string } };
   const s = m._sessionForTest(r.data.id)!;
@@ -135,6 +137,30 @@ describe("a turn's cost (#430)", () => {
     expect(s.toInfo().usage!.recentTurns?.map((t) => t.costSource)).toEqual(["unknown"]);
     await run();
     expect(s.toInfo().usage!.recentTurns?.map((t) => t.costSource)).toEqual(["estimated", "unknown"]);
+  });
+
+  it("a turn whose usage row fails to write is of unknown cost — never gone from the totals a cap reads (#430)", async () => {
+    const embedder: Embedder = { modelName: "stub", dimensions: 8, init: async () => {}, close: async () => {}, embed: async (t) => t.map(() => new Float32Array(8).fill(0.35)) };
+    const memStore = new SqliteEpisodeStore(join(tmp, "memory.db"));
+    const memory = new MemoryEngine({ store: memStore, embedder });
+    await memory.init();
+    try {
+      const { s, run } = await sessionWith([result({}), result({})], undefined, { memory });
+      const write = memStore.recordTurnUsage.bind(memStore);
+      memStore.recordTurnUsage = () => {
+        throw new Error("SQLITE_FULL: database or disk is full");
+      };
+      await run();
+      expect(s.toInfo().usage!.costUnknownTurns).toBe(1);
+      // A later turn that's written doesn't make the lost one known.
+      memStore.recordTurnUsage = write;
+      await run();
+      const u = s.toInfo().usage!;
+      expect(u.costUnknownTurns).toBe(1);
+      expect(u.totalCostUsd).toBeGreaterThan(0);
+    } finally {
+      memStore.close();
+    }
   });
 
   it("counts a backend with no token counts as unknown", async () => {

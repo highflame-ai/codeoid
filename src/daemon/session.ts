@@ -1334,6 +1334,8 @@ export class Session {
    */
   #turnRequests = 0;
   #turnUsageReports = 0;
+  /** Turns whose usage row failed to write: not in the store's totals, so their cost is unknown (#430). */
+  #unrecordedTurns = 0;
   /** The agents (null: the main one) whose output streamed after their last usage report (#430). */
   #turnUnreported = new Set<string | null>();
   #subagentTurnCalls: LLMCallUsage[] = [];
@@ -6481,6 +6483,7 @@ export class Session {
         turn: record,
       });
     } catch (err) {
+      this.#unrecordedTurns++;
       console.error(
         `[codeoid/usage] recordTurnUsage failed: ${err instanceof Error ? err.message : String(err)}`,
       );
@@ -6551,7 +6554,7 @@ export class Session {
       cacheCreationTokens: totals.cacheCreationTokens,
       totalCostUsd: totals.totalCostUsd,
       ...(totals.costEstimated ? { costEstimated: true } : {}),
-      ...(totals.costUnknownTurns > 0 ? { costUnknownTurns: totals.costUnknownTurns } : {}),
+      ...(totals.costUnknownTurns + this.#unrecordedTurns > 0 ? { costUnknownTurns: totals.costUnknownTurns + this.#unrecordedTurns } : {}),
       numTurns: totals.numTurns,
       durationMs: totals.durationMs,
       recentTurns: recent,
