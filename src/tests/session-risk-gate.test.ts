@@ -36,9 +36,10 @@ afterEach(async () => {
   try { rmSync(tmp, { recursive: true, force: true }); } catch {}
 });
 
-function bash(command: string): ProviderEvent[] {
+function bash(command: string | Record<string, unknown>): ProviderEvent[] {
+  const input = typeof command === "string" ? { command } : command;
   return [
-    { type: "tool_start", toolId: "t1", sdkToolUseId: "sdk-t1", name: "Bash", input: { command }, approvalId: "ap-1" },
+    { type: "tool_start", toolId: "t1", sdkToolUseId: "sdk-t1", name: "Bash", input, approvalId: "ap-1" },
     {
       type: "turn_done",
       result: { providerId: "mock", model: "m", inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheCreationTokens: 0, totalCostUsd: 0, durationMs: 1 },
@@ -83,7 +84,7 @@ async function until(cond: () => boolean, ms = 2_000): Promise<void> {
 }
 
 /** Run one command; say whether the gate let it through unasked, and what the card showed. */
-async function gate(command: string, mode: SessionMode, approvals?: CodeoidConfig["approvals"]) {
+async function gate(command: string | Record<string, unknown>, mode: SessionMode, approvals?: CodeoidConfig["approvals"]) {
   const provider = new MockSessionProvider("mock", [bash(command)]);
   const { session, cards } = makeSession(provider, mode, approvals);
   void session.send("go", AUTH);
@@ -119,6 +120,15 @@ describe("the approval gate judges shell commands by risk (#431)", () => {
   test("a command it can't read asks in autonomous mode — unless the config says not to", async () => {
     expect((await gate('eval "$X"', "autonomous")).asked).toBe(true);
     expect((await gate('eval "$X"', "autonomous", { autoAllowLowRisk: false, askOnUnknown: false })).asked).toBe(false);
+  });
+
+  test("a shell call whose command can't be read, or that nothing could parse, asks even when unknown is let through (round-1 audit)", async () => {
+    const relaxed = { autoAllowLowRisk: false, askOnUnknown: false };
+    const missing = await gate({ description: "no command here" }, "autonomous", relaxed);
+    expect(missing.asked).toBe(true);
+    expect(missing.card?.risk?.level).toBe("unknown");
+    expect((await gate({ command: ["rm", "-rf", 1] }, "autonomous", relaxed)).asked).toBe(true);
+    expect((await gate("x".repeat(100_001), "autonomous", relaxed)).asked).toBe(true);
   });
 
   test("an ordinary command still runs unasked in autonomous mode, and its card says it ran", async () => {

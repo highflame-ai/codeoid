@@ -193,7 +193,7 @@ import type { CompressionRegistry } from "./compress/index.js";
 import { defaultSpillDir } from "./compress/spill.js";
 import { type TurnOrigin, turnOrigin } from "./turn-origin.js";
 import { outsideEffects } from "./risk/effects.js";
-import { assessShellCommandSync, type ShellRisk } from "./risk/shell-risk.js";
+import { assessShellCommandSync, type ShellRisk, UNREADABLE_SHELL_CALL } from "./risk/shell-risk.js";
 import { loadShellParser, shellParserReady } from "./shell/parse.js";
 import { isShellTool, shellCallOf, shellCommandOf } from "./shell/tool-call.js";
 import { PRIMARY_CHAIN, RepeatToolGuard } from "./guard/index.js";
@@ -7337,13 +7337,14 @@ export class Session {
 
   /**
    * A shell call's risk (#431), judged from the command it runs in the
-   * directory it names; null for any other tool. Synchronous (the parser is
+   * directory it names; null for any other tool, and not understood for a
+   * shell call whose command can't be read. Synchronous (the parser is
    * loaded at daemon start), so the gate and the approval card it draws
    * read the same verdict.
    */
   #shellRisk(toolName: string, input: Record<string, unknown>): ShellRisk | null {
     const call = shellCallOf(toolName, input);
-    if (!call) return null;
+    if (!call) return isShellTool(toolName) ? UNREADABLE_SHELL_CALL : null;
     const cwd = call.cwd ? resolvePath(this.workdir, call.cwd) : this.workdir;
     return assessShellCommandSync(call.command, { cwd, workdir: this.workdir, configDir: getConfigDir() });
   }
@@ -7351,7 +7352,8 @@ export class Session {
   /** A shell call that asks whatever the mode: high risk, a credential search, or not understood (#431). */
   #riskAsks(risk: ShellRisk | null): boolean {
     if (!risk) return false;
-    if (risk.level === "high" || risk.secret) return true;
+    // Unreadable (no parser, no command): askOnUnknown doesn't cover it.
+    if (risk.level === "high" || risk.secret || risk.unreadable) return true;
     return risk.level === "unknown" && (this.#config?.approvals?.askOnUnknown ?? true);
   }
 

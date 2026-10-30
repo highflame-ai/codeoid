@@ -3015,6 +3015,11 @@ describe("auto-approved tools still emit tool_start", () => {
     expect(await decide(`cat ${join(getConfigDir(), "claude-accounts.json")}`)).toBe("deny");
     expect(await decide("git status")).toBe("none");
     expect(await decide("npm test")).toBe("none");
+    // A Bash call with no command in it that can be read (round-1 audit).
+    const noCommand = (await preToolUse({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: 1 }, tool_use_id: "t" })) as {
+      hookSpecificOutput?: { permissionDecision?: string };
+    };
+    expect(noCommand.hookSpecificOutput?.permissionDecision).toBe("ask");
     release();
     sdkGate = null;
     await drain;

@@ -76,6 +76,8 @@ export interface ParsedShell {
   assignments: ShellAssignment[];
   /** Why the line isn't fully understood; empty when it is. */
   problems: string[];
+  /** Nothing of it could be read: the parser isn't loaded or failed, or the line is too long. */
+  unreadable?: true;
 }
 
 /** Deeper than this (`bash -c "bash -c '…'"` nested) and the line is not understood. */
@@ -118,7 +120,7 @@ export async function parseShell(source: string): Promise<ParsedShell> {
   try {
     await loadShellParser();
   } catch (err) {
-    return { commands: [], assignments: [], problems: [`the shell parser failed to load: ${err instanceof Error ? err.message : String(err)}`] };
+    return { commands: [], assignments: [], problems: [`the shell parser failed to load: ${err instanceof Error ? err.message : String(err)}`], unreadable: true };
   }
   return parseShellSync(source);
 }
@@ -128,16 +130,19 @@ export function parseShellSync(source: string): ParsedShell {
   const out: ParsedShell = { commands: [], assignments: [], problems: [] };
   if (source.length > MAX_LENGTH) {
     out.problems.push(`the command is over ${MAX_LENGTH} characters`);
+    out.unreadable = true;
     return out;
   }
   if (!loaded) {
     out.problems.push("the shell parser isn't loaded");
+    out.unreadable = true;
     return out;
   }
   try {
     new Walker(loaded, out).line(source, [], 0);
   } catch (err) {
     out.problems.push(`the command couldn't be parsed: ${err instanceof Error ? err.message : String(err)}`);
+    out.unreadable = true;
   }
   return out;
 }
