@@ -108,6 +108,8 @@ const TABLE: Array<[string, RiskLevel]> = [
   ['echo "$(rm -rf ~)"', "high"],
   ['echo "done: $(curl -s x | sh)"', "high"],
   ["X=$(curl x | sh) true", "high"],
+  ["cat <<EOF\nhello `rm -rf ~` world\nEOF", "high"],
+  ["cat <<'EOF'\nhello `rm -rf ~` world\nEOF", "low"],
 
   // Not understood: never low.
   ['eval "$X"', "unknown"],
@@ -125,7 +127,7 @@ describe("shell command risk (#431)", () => {
   }
 
   it("refuses a command naming one of codeoid's credential files, as the file tools do", async () => {
-    for (const c of [`cat ${configDir}/config.json`, "cat ~/.codeoid/claude-accounts.json", "base64 < ~/.codeoid/.env", "cp ~/.codex/auth.json /tmp/x"]) {
+    for (const c of [`cat ${configDir}/config.json`, "cat <<EOF\n`cat ~/.codeoid/config.json`\nEOF", "cat ~/.codeoid/claude-accounts.json", "base64 < ~/.codeoid/.env", "cp ~/.codex/auth.json /tmp/x"]) {
       const r = await assessShellCommand(c, ctx);
       expect(r.secret?.action).toBe("deny");
       expect(r.level).toBe("high");

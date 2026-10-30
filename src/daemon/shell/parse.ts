@@ -260,17 +260,21 @@ class Walker {
     let op = "";
     let target: ShellWord | null = null;
     let body: string | null = "";
+    let quoted = false;
     const more: ShellRedirect[] = [];
     for (const c of n.children) {
       if (!c) continue;
       if (c.type === "file_descriptor") fd = Number(c.text);
       else if (!c.isNamed) op ||= c.text;
       else if (n.type !== "heredoc_redirect") target = this.word(c, ctx, owner);
-      else if (c.type === "heredoc_start" || c.type === "heredoc_end") continue;
+      else if (c.type === "heredoc_start") quoted = /['"\\]/.test(c.text);
+      else if (c.type === "heredoc_end") continue;
       else if (c.type === "heredoc_body") {
         // Data to most programs — but `$(…)` in an unquoted body runs, and a shell runs all of it.
         this.substitutionsIn(c, ctx, owner);
         body = c.namedChildren.some((x) => x && x.type !== "heredoc_content") ? null : c.text;
+        // So does `…`, which the grammar leaves as text in a body.
+        if (!quoted && this.#backticks(c.text, ctx, owner)) body = null;
       } else if (c.type === "file_redirect" || c.type === "herestring_redirect" || c.type === "heredoc_redirect") {
         more.push(...this.redirect(c, ctx, owner));
       } else if (c.type === "pipeline") {
@@ -342,6 +346,55 @@ class Walker {
         // $X, ${X}, $((…)), brace expressions, and anything else: known only at run time.
         this.substitutionsIn(n, ctx, owner);
         return { value: null, raw, glob: n.type === "brace_expression" };
+    }
+  }
+
+  /**
+   * The `…` substitutions in an unquoted here-document's text, parsed as the
+   * commands they run. True when there is one.
+   */
+  #backticks(text: string, ctx: Ctx, owner: number | null): boolean {
+    let found = false;
+    for (let i = 0; i < text.length; i++) {
+      if (text[i] === "\\") {
+        i++;
+        continue;
+      }
+      if (text[i] !== "`") continue;
+      found = true;
+      let inner = "";
+      let j = i + 1;
+      for (; j < text.length && text[j] !== "`"; j++) {
+        // Inside backquotes a backslash quotes only $ ` and \.
+        if (text[j] === "\\" && /[$`\\]/.test(text[j + 1] ?? "")) inner += text[++j];
+        else inner += text[j];
+      }
+      if (j >= text.length) {
+        this.out.problems.push("a here-document has an unterminated `…`");
+        return true;
+      }
+      this.#substitution(inner, ctx, owner);
+      i = j;
+    }
+    return found;
+  }
+
+  /** The text of a `$(…)`-like substitution, parsed as the commands it runs. */
+  #substitution(source: string, ctx: Ctx, owner: number | null): void {
+    if (ctx.depth + 1 > MAX_DEPTH) {
+      this.out.problems.push("shells nested too deep");
+      return;
+    }
+    const tree = this.parser.parse(source);
+    if (!tree) {
+      this.out.problems.push("the command could not be parsed");
+      return;
+    }
+    try {
+      if (tree.rootNode.hasError) this.out.problems.push("the command has a syntax error or a construct the parser doesn't know");
+      this.node(tree.rootNode, this.#fresh(ctx.via, ctx.depth + 1, { feeds: owner, substitution: "command" }));
+    } finally {
+      tree.delete();
     }
   }
 
