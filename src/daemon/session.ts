@@ -6194,9 +6194,9 @@ export class Session {
     return this.#pendingApprovals.has(approvalId) ? "pending" : "gone";
   }
 
-  /** A person's own yes — an approval or an answer — not a system sender's, a delegate's or automation's. */
+  /** The owner's own yes — an approval or an answer — not a system sender's, a delegate's, automation's or a teammate's. */
   #isOwnApproval(sender: AuthContext): boolean {
-    return turnOrigin(sender) === "user";
+    return turnOrigin(sender) === "user" && sender.sub === this.createdBy;
   }
   #lastTurnOrigin: TurnOrigin = "user";
   /** A sender whose turn is someone else's than its token says: a wake delivering only the user's results. */
@@ -6207,7 +6207,11 @@ export class Session {
   #settledSinceTurn: string[] = [];
 
   #originOf(sender: AuthContext): TurnOrigin {
-    return this.#originOverride.get(sender) ?? turnOrigin(sender);
+    const override = this.#originOverride.get(sender);
+    if (override) return override;
+    // A person's own turn is the session owner's: anyone else in the tenant acts beside them, not as them.
+    const o = turnOrigin(sender);
+    return o === "user" && sender.sub !== this.createdBy ? "delegated" : o;
   }
 
   /** Every one of these tasks was started in the user's own turns (and there's at least one). */

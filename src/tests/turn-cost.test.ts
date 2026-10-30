@@ -574,6 +574,20 @@ describe("a turn's cost (#430)", () => {
     await s.interrupt(auth);
   });
 
+  it("a teammate in the same tenant is not the owner: their turn, their joining and their yes are someone else's (#430)", async () => {
+    const teammate: AuthContext = { ...auth, sub: "user:teammate" };
+    const tool: ProviderEvent = { type: "tool_start", toolId: "a1", sdkToolUseId: "a1", name: "Bash", input: { command: "make" }, approvalId: "a1" };
+    const { s } = await sessionWith([[tool, { type: "turn_done", result: result({}) }], result({})]);
+    void s.send("go", auth);
+    for (let i = 0; i < 100 && !s.pendingToolApprovals().some((p) => p.approvalId === "a1"); i++) await Bun.sleep(5);
+    s.approve("a1", true, teammate);
+    expect(s.approvalState("a1")).toBe("gone");
+    for (let i = 0; i < 100 && s.status !== "idle"; i++) await Bun.sleep(5);
+    await s.send("my turn now", teammate);
+    for (let i = 0; i < 100 && s.status !== "idle"; i++) await Bun.sleep(5);
+    expect(s.lastTurnOrigin).toBe("delegated");
+  });
+
   it("MCP control's sends are automation, not the person — whatever the token's depth (#430)", async () => {
     const { s } = await sessionWith([result({})]);
     const automation: AuthContext = { ...auth, automation: true };
