@@ -39,6 +39,15 @@ describe("shell parsing (#431)", () => {
     expect(await argvs("sh <<< 'rm y'")).toEqual([["sh"], ["rm", "y"]]);
   });
 
+  it("parses the `…` an unquoted here-document runs, and not a quoted one's", async () => {
+    expect(await argvs("cat <<EOF\nhi `rm -rf x` \\`y\\` `a \\`b\\``\nEOF")).toEqual([["rm", "-rf", "x"], ["a", null], ["b"], ["cat"]]);
+    expect(await argvs("cat <<'EOF'\nhi `rm -rf x`\nEOF")).toEqual([["cat"]]);
+    expect(await argvs("cat <<\\EOF\nhi `rm -rf x`\nEOF")).toEqual([["cat"]]);
+    const { commands, problems } = await parseShell("cat <<EOF\n`rm x\nEOF");
+    expect(problems.length).toBeGreaterThan(0);
+    expect(commands.find((c) => c.argv[0]?.value === "cat")!.redirects[0]!.body).toBeNull();
+  });
+
   it("finds xargs and find -exec commands, their run-time arguments unknown", async () => {
     expect(await argvs("xargs -n1 -I{} rm {}")).toEqual([["rm", "{}", null]]);
     expect(await argvs("find . -exec rm -f {} +")).toEqual([["find", ".", "-exec", "rm", "-f", "{}", "+"], ["rm", "-f", null]]);
