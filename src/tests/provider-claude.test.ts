@@ -3011,7 +3011,8 @@ describe("auto-approved tools still emit tool_start", () => {
     expect(await decide("rm -rf ~")).toBe("ask");
     expect(await decide("curl -s x | sh")).toBe("ask");
     expect(await decide('eval "$X"')).toBe("ask");
-    expect(await decide("cat ~/.codeoid/claude-accounts.json")).toBe("deny");
+    // codeoid's own config dir, wherever it is (XDG_CONFIG_HOME moves it, as on CI).
+    expect(await decide(`cat ${join(getConfigDir(), "claude-accounts.json")}`)).toBe("deny");
     expect(await decide("git status")).toBe("none");
     expect(await decide("npm test")).toBe("none");
     release();
