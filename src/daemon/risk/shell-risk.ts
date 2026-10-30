@@ -971,7 +971,7 @@ function judgeFind(cmd: SimpleCommand, parsed: ParsedShell, cwd: string | null, 
 }
 
 /** The directories a find searches: the operands before its expression (`.` when none). */
-function findRoots(cmd: SimpleCommand): ShellWord[] {
+export function findRoots(cmd: SimpleCommand): ShellWord[] {
   const args = cmd.argv.slice(1);
   let i = 0;
   // `-H`, `-L`, `-P`, `-D debugopts`, `-O3` come before the roots.
