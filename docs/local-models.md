@@ -65,13 +65,14 @@ The daemon cannot tell at startup whether a server is listening, and advertising
 | `apiKey` | `sk-local` | Only checked if you started llama-server with `--api-key`. |
 | `model` | — | Cosmetic. llama-server serves the GGUF it was launched with, whatever the request names. |
 | `mcpServers` | `[]` | External MCP servers whose tools this backend is offered. See below. |
-| `free` | — | Its turns cost nothing. Unset: only a server on this machine is free. See [Cost](#cost). |
+| `free` | — | Its turns cost nothing. Unset: only llama-server on this machine is free. See [Cost](#cost). |
 
 `llamacpp` is a separate backend from `openai`, so a local server and a cloud OpenAI-compatible gateway can be enabled side by side.
 
 ## Cost
 
 A llama-server on this machine (`127.0.0.1`, `localhost`) costs nothing: its turns count as $0 in session totals and routine spend caps.
+It counts as llama-server once it has answered `/props` the way llama-server does (codeoid asks before each turn is recorded); anything else on a loopback address (a LiteLLM proxy, an `ssh -L` tunnel or Ollama, any of which may forward to a paid API) isn't free unless you say so, and its turns show as unknown cost (`$?`) or at a price you set.
 One elsewhere on your network counts as free only when you say so (`"free": true` under `providers.llamacpp`, or a `{ "input": 0, "output": 0 }` price for its model in `pricing.models`), since a server on another host may be a gateway to a paid API; otherwise its turns show as unknown cost (`$?`).
 
 ## Context size

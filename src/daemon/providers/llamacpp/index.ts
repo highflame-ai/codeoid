@@ -131,7 +131,7 @@ export interface LlamaCppConfig {
   model?: string;
   /** External MCP servers this backend is offered; none when empty. */
   mcpServers?: readonly string[];
-  /** Its turns cost nothing (#430); unset = only a loopback server. */
+  /** Its turns cost nothing (#430); unset = only a loopback server that answers as llama-server. */
   free?: boolean;
 }
 
@@ -170,20 +170,28 @@ export function createLlamaCppProvider(
     "id" | "displayName" | "apiKey" | "baseURL" | "modelFilter" | "fallbackModels" | "contextWindow" | "toolsTransform" | "effortParams" | "free"
   >,
 ): OpenAIProvider {
+  // A loopback address may be a proxy to a paid API (a LiteLLM proxy, a
+  // tunnel): free only once the server answered /props as llama-server (#430).
+  let llamaServer = false;
   return new OpenAIProvider({
     ...init,
     id: LLAMACPP_PROVIDER_ID,
     displayName: LLAMACPP_DISPLAY_NAME,
     // The user's own server costs nothing (#430) — a private or local host
     // only: one pointed at a paid public host is priced (or unknown) instead.
-    free: isOwnServer(cfg.baseUrl, cfg.free),
+    free: () => (cfg.free !== undefined ? cfg.free : llamaServer && isOwnServer(cfg.baseUrl)),
     apiKey: cfg.apiKey,
     baseURL: cfg.baseUrl,
     defaultModel: init.defaultModel ?? cfg.model ?? "local",
     mcpRegistry: allowedMcpServers(init.mcpRegistry, cfg.mcpServers),
     modelFilter: () => true,
     fallbackModels: [],
-    contextWindow: () => fetchServerContextWindow(cfg.baseUrl),
+    // Asked before each turn's result is built, so its answer decides that turn's cost.
+    contextWindow: async () => {
+      const n = await fetchServerContextWindow(cfg.baseUrl);
+      if (n !== undefined) llamaServer = true;
+      return n;
+    },
     toolsTransform: llamaCppTools,
     effortParams: llamaCppEffortParams,
   });

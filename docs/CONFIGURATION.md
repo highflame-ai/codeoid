@@ -204,7 +204,7 @@ TELEGRAM_ALLOWED_USER_IDS=6714605885
 
 Some backends report what each turn cost (Claude, pi); the others report tokens only (Codex, OpenAI and OpenAI-compatible endpoints, Gemini, Qwen).
 For those, codeoid prices the tokens at the model's list price, so session totals, routine spend caps and the fleet board count them; the UI marks such a total as an estimate (`~$0.42`).
-A model on your own machine costs nothing: llama.cpp on a loopback host (`127.0.0.1`, `localhost`).
+A model on your own machine costs nothing: llama.cpp on a loopback host (`127.0.0.1`, `localhost`) that answers `/props` as llama-server (a proxy on a loopback port doesn't, so it isn't free unless you say so).
 For your own server elsewhere on your network, set `providers.llamacpp.free: true`; anything else (it could be a gateway forwarding to a paid API) is priced like any other backend, and a price in `pricing.models` always wins.
 
 Prices come from a snapshot of [LiteLLM's maintained price table](https://github.com/BerriAI/litellm) (MIT), shipped with codeoid; `bun scripts/update-pricing.ts` refreshes it.

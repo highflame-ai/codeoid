@@ -255,6 +255,41 @@ describe("EndpointStore", () => {
     expect(readFileSync(path, "utf8")).toBe("{broken");
   });
 
+  test("a loopback llama.cpp endpoint is free only once it answered /props as llama-server — a proxy to a paid API isn't (#430)", async () => {
+    for (const llamaServer of [true, false]) {
+      const chunk = (o: unknown) => `data: ${JSON.stringify(o)}\n\n`;
+      const local = Bun.serve({
+        port: 0,
+        hostname: "127.0.0.1",
+        fetch(req) {
+          if (new URL(req.url).pathname === "/props") {
+            return llamaServer ? Response.json({ default_generation_settings: { n_ctx: 4096 } }) : new Response("not found", { status: 404 });
+          }
+          const sse = [
+            chunk({ id: "c", object: "chat.completion.chunk", model: "m", choices: [{ index: 0, delta: { content: "hi" }, finish_reason: "stop" }] }),
+            chunk({ id: "c", object: "chat.completion.chunk", model: "m", choices: [], usage: { prompt_tokens: 12, completion_tokens: 3 } }),
+            "data: [DONE]\n\n",
+          ].join("");
+          return new Response(sse, { headers: { "content-type": "text/event-stream" } });
+        },
+      });
+      try {
+        const store = storeAt();
+        store.upsert({ name: "box", baseUrl: `http://127.0.0.1:${local.port}/v1`, flavor: "llamacpp", models: [{ id: "m" }] });
+        const registry = new ProviderRegistry("oai:box");
+        syncEndpointProviders(registry, store, new EndpointCatalog(store));
+        const provider = registry.get("oai:box")!.create({ sessionId: "s" } as never);
+        expect(provider.free).toBe(false); // not asked yet
+        const run = provider.runTurn({ history: [], userMessage: "x", workdir: dir, canUseTool: async () => ({ behavior: "allow" }) } as never);
+        let done: { result: { costSource?: string } } | undefined;
+        for await (const e of run.events) if (e.type === "turn_done") done = e as never;
+        expect(done?.result.costSource).toBe(llamaServer ? "free" : undefined);
+      } finally {
+        local.stop(true);
+      }
+    }
+  });
+
   test("re-labelling the default endpoint keeps the backends in sync", () => {
     const store = storeAt();
     store.upsert({ name: "foo", baseUrl: "http://127.0.0.1:1/v1" });

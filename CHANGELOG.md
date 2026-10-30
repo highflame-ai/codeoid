@@ -201,7 +201,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Spend caps work on every backend, and costs are never shown as $0 when they aren't known** (#430).
   Codex, OpenAI-compatible endpoints, Gemini, Qwen and the Gemini CLI recorded every turn as costing $0, so a routine's `--max-cost` and `--daily-cost` never stopped anything there.
-  Now a backend that reports tokens but no cost has them priced at the model's list price (a snapshot of LiteLLM's table, overridable per model in `pricing.models`), shown as an estimate (`~$0.42`); a model on your own machine costs nothing; and a turn whose cost can't be known shows as `$?`, and stops a capped routine run instead of letting it run uncapped.
+  Now a backend that reports tokens but no cost has them priced at the model's list price (a snapshot of LiteLLM's table, overridable per model in `pricing.models`), shown as an estimate (`~$0.42`); a model on your own machine costs nothing (llama-server on a loopback address; a proxy there to a paid API isn't free unless you say so); and a turn whose cost can't be known shows as `$?`, and stops a capped routine run instead of letting it run uncapped.
   OpenAI's cached prompt tokens and Gemini's cached and thinking tokens are now counted as such, Codex counts every request of a turn (not only its last), and Qwen a turn's own tokens (not the session's running total), so the cache figures and the estimates are right; a Qwen turn that ran a sub-agent is of unknown cost, since qwen-code reports no usage for a sub-agent's requests.
   The Gemini API backend's default model is now Gemini 2.5 Flash, and its picker offers 3.5 Flash and 2.5 Pro / Flash / Flash-Lite: the 2.0 and 1.5 models it offered are retired.
 

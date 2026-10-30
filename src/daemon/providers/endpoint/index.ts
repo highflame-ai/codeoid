@@ -226,8 +226,10 @@ export function endpointFactory(
   return {
     id,
     displayName,
-    create: (init: ProviderSessionInit) =>
-      new StatelessSessionProvider(
+    create: (init: ProviderSessionInit) => {
+      // The address whose /props answered as llama-server: a loopback proxy to a paid API doesn't (#430).
+      let llamaServerAt: string | null = null;
+      return new StatelessSessionProvider(
         new OpenAIProvider({
           id,
           displayName,
@@ -236,7 +238,7 @@ export function endpointFactory(
           // Asked each turn: the endpoint's address can change under a live session.
           free: () => {
             const e = store.get(name);
-            return e?.flavor === "llamacpp" && isOwnServer(e.baseUrl);
+            return e?.flavor === "llamacpp" && isOwnServer(e.baseUrl) && llamaServerAt === e.baseUrl;
           },
           connection: () => {
             const conn = withAccount(store.resolveConnection(name), init.resolveAccount?.() ?? null); // throws when removed
@@ -253,7 +255,10 @@ export function endpointFactory(
             // beats anything configured, which can drift from it.
             if (e.flavor === "llamacpp") {
               const live = await fetchLlamaCppContext(connectionOf(e)).catch(() => undefined);
-              if (live) return live;
+              if (live) {
+                llamaServerAt = e.baseUrl;
+                return live;
+              }
             }
             return configuredContextWindow(e, model);
           },
@@ -268,7 +273,8 @@ export function endpointFactory(
           mcpHub: init.mcpHub,
         }),
         init.sessionId,
-      ),
+      );
+    },
   };
 }
 
