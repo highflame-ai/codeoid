@@ -225,9 +225,11 @@ never a verdict. Every transition is a compare-and-set on the run's
 Shell commands are approved by risk (#431, docs/approvals.md): `src/daemon/shell/`
 parses a command line with tree-sitter-bash (WASM, vendored `tree-sitter-bash.wasm`;
 the daemon loads it at start, so the gate judges synchronously and the approval
-card always matches the decision), and `src/daemon/risk/` gives it a level. High
-and not-understood commands ask in every mode; a credential path is refused.
-On Claude the PreToolUse hook routes them to the gate past any allow rule.
+card always matches the decision), and `src/daemon/risk/` gives it a level. The
+levels are guidance, not a sandbox: high and not-understood commands ask in every
+mode and a recognised credential path is refused, as a best effort. Low is a strict
+allow-list (`notLow` in shell-risk.ts); keep it one, never widen it by rules.
+On Claude the PreToolUse hook routes high and not-understood ones to the gate past any allow rule.
 
 Routines (`src/daemon/routines/`, docs/routines.md) run sessions on a schedule
 or an API call. `RoutineService` owns the scheduler and runs; it reaches

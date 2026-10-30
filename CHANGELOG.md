@@ -10,12 +10,14 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Approvals judge what a shell command does** (#431).
   Every shell command an agent wants to run is parsed (pipelines, chains, subshells, `bash -c`, `sudo`, `xargs`, `find -exec` and other wrappers seen through) and given a risk level: low, medium, high, or not understood.
-  High-risk commands (`rm -rf ~`, `git push --force`, `curl … | sh`, writes to start-up files, credential reads, `sudo`) and ones that can't be read ask in every mode, autonomous included; a command naming one of codeoid's credential files is refused like the file tools.
-  `approvals.autoAllowLowRisk` lets guarded mode run low-risk reads without asking.
+  The levels are guidance drawn from reading the command line, not a sandbox.
+  High-risk commands (`rm -rf ~`, `git push --force`, `curl … | sh`, writes to start-up files, credential reads, `sudo`) and ones that can't be read ask in every mode, autonomous included, and a command naming one of codeoid's credential files is refused like the file tools, as a best effort: a command written in a way the reader doesn't recognise is medium instead.
+  Low is a strict allow-list (vetted read-only programs, no options that run or write, no `cd`, variables, assignments, loops or writing redirects, every path inside the workspace), so `approvals.autoAllowLowRisk`, which lets guarded mode run low-risk reads without asking, can't be tricked into running anything unusual.
+  Everyday idioms (`IFS= read -r`, `PATH=…:$PATH`, `EDITOR=vim`, arithmetic on loop counters) are medium, not not-understood, so they don't stall unattended runs.
   The approval prompt shows the level and the reason on every surface, and rewind's "not undone by going back" list uses the same reading.
-  On Claude, a high-risk command never runs on a `permissions.allow` rule without codeoid's gate seeing it.
-  Paths written with `$HOME`, paths only known at run time, a `cd`'s target, a shell running its input, variables that steer what runs (`PATH`, `LD_PRELOAD`, `GIT_*`, …) and arithmetic on variables are all read, over-stating when in doubt; a command nothing could be read of asks even with `approvals.askOnUnknown` off.
-  See [docs/approvals.md](docs/approvals.md).
+  On Claude, a high-risk or not-understood command never runs on a `permissions.allow` rule without codeoid's gate seeing it.
+  Protecting credentials and files outside the workspace for real needs the agent's commands to run in a sandbox, a separate issue.
+  See [docs/approvals.md](docs/approvals.md), which lists the known ways past "high".
 
 - **End-to-end tests against a scripted backend** (#429).
   `bun run test:e2e` boots a real daemon per test on a throwaway home and drives it through the web UI (Chromium, via Playwright) and the CLI, with a scripted backend that replays a written conversation instead of a model: no credentials, the same result every time.

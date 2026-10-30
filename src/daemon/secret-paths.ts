@@ -27,7 +27,8 @@
  * but never runs unprompted: the owner sees it and decides.
  *
  * Shell commands are judged too (#431): the risk check (risk/shell-risk.ts)
- * parses a command line and runs every path it names through this verdict.
+ * parses a command line and runs every path it recognises through this verdict
+ * (a best effort: a path spelled in a way it doesn't follow isn't checked).
  *
  * LIMITS. A command a backend runs without asking codeoid isn't seen: Codex's
  * `untrusted` policy and qwen run commands they consider read-only without
