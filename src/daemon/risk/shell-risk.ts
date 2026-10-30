@@ -222,15 +222,25 @@ function where(path: string | null, ctx: Ctx): Where {
   if (path === null) return "unknown";
   if (path === "/" ) return "root";
   if (path === "/dev/null" || path === "/dev/stdout" || path === "/dev/stderr" || path === "/dev/tty") return "outside";
-  if (insideOf(path, ctx.workdir)) return "workspace";
-  if (insideOf(path, ctx.configDir)) return "home-sensitive";
+  const sensitive = sensitiveArea(path, ctx);
+  // A workspace inside a sensitive area is its own ground; one that holds
+  // it (a workspace at `~` or `/`) doesn't make `~/.bashrc` or `/etc` its own.
+  if (insideOf(path, ctx.workdir) && (!sensitive || insideOf(ctx.workdir, sensitive.root))) return "workspace";
+  if (sensitive) return sensitive.kind;
   if (path === ctx.home) return "home";
+  return "outside";
+}
+
+/** The start-up file, key or tool config, or system directory a path is in. */
+function sensitiveArea(path: string, ctx: Ctx): { root: string; kind: "home-sensitive" | "system" } | null {
+  if (insideOf(path, ctx.configDir)) return { root: ctx.configDir, kind: "home-sensitive" };
   if (insideOf(path, ctx.home)) {
     const rel = path.slice(ctx.home.length + 1);
-    return HOME_SENSITIVE.some((s) => rel === s || rel.startsWith(`${s}/`)) ? "home-sensitive" : "outside";
+    const s = HOME_SENSITIVE.find((x) => rel === x || rel.startsWith(`${x}/`));
+    return s ? { root: join(ctx.home, s), kind: "home-sensitive" } : null;
   }
-  if (SYSTEM_PREFIXES.some((p) => insideOf(path, p))) return "system";
-  return "outside";
+  const p = SYSTEM_PREFIXES.find((x) => insideOf(path, x));
+  return p ? { root: p, kind: "system" } : null;
 }
 
 function isCredentialPath(path: string | null, ctx: Ctx): boolean {
