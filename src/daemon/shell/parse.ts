@@ -62,8 +62,18 @@ export interface SimpleCommand {
   inputFrom?: number;
 }
 
+/** A variable the line sets. */
+export interface ShellAssignment {
+  name: string;
+  value: ShellWord;
+  /** In a program's environment: a prefix (`X=1 cmd`), `env X=1 cmd`, or `export X=1`. */
+  exported: boolean;
+}
+
 export interface ParsedShell {
   commands: SimpleCommand[];
+  /** Every variable the line sets, wherever. */
+  assignments: ShellAssignment[];
   /** Why the line isn't fully understood; empty when it is. */
   problems: string[];
 }
@@ -108,14 +118,14 @@ export async function parseShell(source: string): Promise<ParsedShell> {
   try {
     await loadShellParser();
   } catch (err) {
-    return { commands: [], problems: [`the shell parser failed to load: ${err instanceof Error ? err.message : String(err)}`] };
+    return { commands: [], assignments: [], problems: [`the shell parser failed to load: ${err instanceof Error ? err.message : String(err)}`] };
   }
   return parseShellSync(source);
 }
 
 /** Parse with the parser already loaded; before it is, nothing is understood. */
 export function parseShellSync(source: string): ParsedShell {
-  const out: ParsedShell = { commands: [], problems: [] };
+  const out: ParsedShell = { commands: [], assignments: [], problems: [] };
   if (source.length > MAX_LENGTH) {
     out.problems.push(`the command is over ${MAX_LENGTH} characters`);
     return out;
@@ -210,8 +220,20 @@ class Walker {
         return;
       }
       case "variable_assignment":
+        this.#assignment(n, ctx, null, false);
+        return;
       case "variable_assignments":
-      case "declaration_command":
+        for (const c of n.namedChildren) if (c) this.node(c, ctx);
+        return;
+      case "declaration_command": {
+        // `export X=1`, `declare -x X=1`: into the environment of what runs next.
+        const exported = n.child(0)?.text === "export" || n.namedChildren.some((c) => c?.type === "word" && /^-[a-zA-Z]*x/.test(c.text));
+        for (const c of n.namedChildren) {
+          if (c?.type === "variable_assignment") this.#assignment(c, ctx, null, exported);
+          else if (c) this.substitutionsIn(c, ctx, null);
+        }
+        return;
+      }
       case "unset_command":
       case "test_command":
         // No program runs, but a substitution inside does.
@@ -249,7 +271,7 @@ class Walker {
     for (const c of n.namedChildren) {
       if (!c) continue;
       if (c.type === "variable_assignment") {
-        this.substitutionsIn(c, ctx, index);
+        this.#assignment(c, ctx, index, true);
       } else if (c.type === "command_name") {
         const w = c.firstNamedChild;
         if (w) words.push(this.word(w, ctx, index));
@@ -421,6 +443,18 @@ class Walker {
     }
   }
 
+  /** A `NAME=value`, recorded, and the commands inside its substitutions. */
+  #assignment(n: Node, ctx: Ctx, owner: number | null, exported: boolean): void {
+    const name = n.namedChildren[0];
+    const value = n.namedChildren.length > 1 ? n.namedChildren.at(-1) : null;
+    if (name) this.substitutionsIn(name, ctx, owner); // `a[$(x)]=1`
+    this.out.assignments.push({
+      name: (name?.text ?? "").replace(/\[[\s\S]*$/, ""),
+      value: value ? this.word(value, ctx, owner) : lit(""),
+      exported,
+    });
+  }
+
   /** Commands inside `$(…)` / `<(…)` anywhere under n. */
   substitutionsIn(n: Node, ctx: Ctx, owner: number | null): void {
     for (const c of n.namedChildren) {
@@ -483,7 +517,7 @@ class Walker {
       }
       if (inner.kind === "exec") {
         // find -exec: the command runs per match, its `{}` a path from the search.
-        const inputFrom = this.out.commands.indexOf(cmd);
+        const inputFrom = inner.rooted ? this.out.commands.indexOf(cmd) : undefined;
         for (const run of inner.runs) {
           if (run.length === 0) continue;
           const sub: SimpleCommand = { ...cmd, argv: run, via: [...cmd.via, prog], redirects: [], heredoc: false, delegates: false, inputFrom };
@@ -491,6 +525,11 @@ class Walker {
           this.unwrap(sub, ctx);
         }
         return;
+      }
+      // `env X=1 cmd`, `sudo X=1 cmd`: X is in cmd's environment.
+      for (const w of cmd.argv.slice(1, cmd.argv.length - inner.argv.length)) {
+        const m = w.value === null ? null : /^([A-Za-z_][A-Za-z0-9_]*)=([\s\S]*)$/.exec(w.value);
+        if (m && (prog === "env" || prog === "sudo")) this.out.assignments.push({ name: m[1]!, value: { ...w, value: m[2]! }, exported: true });
       }
       // A wrapper with nothing to run (`env`, `sudo` alone) is judged as itself.
       if (inner.argv.length === 0) return;
@@ -501,7 +540,8 @@ class Walker {
   }
 }
 
-type Unwrapped = { kind: "run"; argv: ShellWord[] } | { kind: "eval"; argv: ShellWord[] } | { kind: "exec"; runs: ShellWord[][] };
+/** `exec`: commands run on each match; `rooted` when the matches are under the wrapper's search roots, as find's are. */
+type Unwrapped = { kind: "run"; argv: ShellWord[] } | { kind: "eval"; argv: ShellWord[] } | { kind: "exec"; runs: ShellWord[][]; rooted: boolean };
 
 /** Options taking a value, per wrapper: `sudo -u root` is not a command named `root`. */
 function skipOptions(args: ShellWord[], withValue: ReadonlySet<string>, opts: { stopAtNonOption?: boolean; assignments?: boolean; dash?: boolean } = {}): ShellWord[] | null {
@@ -631,6 +671,19 @@ const WRAPPERS: Record<string, (args: ShellWord[]) => Unwrapped | null | undefin
     return run(rest.map((w) => (w.value?.includes(replace) ? { ...DYNAMIC_ARG, raw: w.raw } : w)));
   },
   eval: (a) => ({ kind: "eval", argv: a }),
+  // fd -x / -X: everything after it (to a `;`) is the command, run on each match.
+  fd: (a) => {
+    for (let i = 0; i < a.length; i++) {
+      const v = a[i]!.value;
+      if (v === null || v === "--") return v === null ? null : undefined;
+      if (!(v === "--exec" || v === "--exec-batch" || /^-[a-zA-Z]*[xX]$/.test(v))) continue;
+      const argv: ShellWord[] = [];
+      for (i++; i < a.length && a[i]!.value !== ";"; i++) argv.push(a[i]!.value?.includes("{") ? { ...DYNAMIC_ARG, raw: a[i]!.raw } : a[i]!);
+      if (!argv.slice(1).some((w) => w.input)) argv.push(DYNAMIC_ARG);
+      return { kind: "exec", runs: [argv], rooted: false };
+    }
+    return undefined;
+  },
   find: (a) => {
     const runs: ShellWord[][] = [];
     for (let i = 0; i < a.length; i++) {
@@ -644,7 +697,7 @@ const WRAPPERS: Record<string, (args: ShellWord[]) => Unwrapped | null | undefin
         runs.push(argv);
       }
     }
-    return runs.length > 0 ? { kind: "exec", runs } : undefined;
+    return runs.length > 0 ? { kind: "exec", runs, rooted: true } : undefined;
   },
 };
 

@@ -82,6 +82,25 @@ describe("shell parsing (#431)", () => {
     }
   });
 
+  it("records every variable the line sets, and whether a program's environment gets it (round-1 audit)", async () => {
+    const { assignments } = await parseShell("A=1 x; B=2; export C=3 D; declare -x E=4; local F=5; env G=6 y; a[$(z)]=7");
+    expect(assignments.map((a) => [a.name, a.value.value, a.exported])).toEqual([
+      ["A", "1", true],
+      ["B", "2", false],
+      ["C", "3", true],
+      ["E", "4", true],
+      ["F", "5", false],
+      ["G", "6", true],
+      ["a", "7", false],
+    ]);
+    expect(await argvs("a[$(z)]=7")).toEqual([["z"]]);
+  });
+
+  it("finds what fd -x / -X runs on each match", async () => {
+    expect(await argvs("fd -e ts -x wc -l")).toEqual([["fd", "-e", "ts", "-x", "wc", "-l"], ["wc", "-l", null]]);
+    expect(await argvs("fd . -X rm {} \\;")).toEqual([["fd", ".", "-X", "rm", "{}", ";"], ["rm", null]]);
+  });
+
   it("records pipeline stages and what substitutions feed", async () => {
     const { commands } = await parseShell("curl x | sh; bash <(wget y)");
     const by = (n: string) => commands.find((c) => c.argv[0]?.value === n)!;

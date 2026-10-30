@@ -22,7 +22,7 @@
 import { homedir } from "node:os";
 import { isAbsolute, join, normalize, resolve, sep } from "node:path";
 import { secretDirsOf, secretPathVerdict } from "../secret-paths.js";
-import { loadShellParser, type ParsedShell, parseShellSync, type ShellWord, type SimpleCommand } from "../shell/parse.js";
+import { loadShellParser, type ParsedShell, parseShellSync, type ShellAssignment, type ShellWord, type SimpleCommand } from "../shell/parse.js";
 
 export type RiskLevel = "low" | "medium" | "high" | "unknown";
 
@@ -94,6 +94,7 @@ export function judge(parsed: ParsedShell, ctx: Ctx): ShellRisk {
 
 function judgeLine(parsed: ParsedShell, start: string | null, ctx: Ctx, v: Verdict): void {
   for (const p of parsed.problems) v.add("unknown", p);
+  for (const a of parsed.assignments) judgeAssignment(a, v);
   // A `cd` moves every relative path after it: null once where to isn't known.
   let cwd: string | null = start;
   for (const cmd of parsed.commands) {
@@ -104,6 +105,26 @@ function judgeLine(parsed: ParsedShell, start: string | null, ctx: Ctx, v: Verdi
     }
     judgeCommand(cmd, parsed, cwd, ctx, v);
   }
+}
+
+/** Variables that change what a program runs or loads, or where a path points. */
+const STEERING_VARS = /^(LD_\w+|DYLD_\w+|GIT_\w+|\w+_PAGER|\w+_EDITOR|\w+_COMMAND|BASH_ENV|ENV|PS4|PROMPT_COMMAND|SHELLOPTS|BASHOPTS|IFS|CDPATH|OLDPWD|HOME|PATH|PAGER|MANPAGER|EDITOR|VISUAL|BROWSER|LESSOPEN|LESSCLOSE|NODE_OPTIONS|PYTHONSTARTUP|PYTHONPATH|PERL5OPT|PERL5LIB|RUBYOPT|SSH_ASKPASS|SUDO_ASKPASS)$/;
+/** In a program's environment, these change nothing it runs. */
+const PLAIN_VARS = /^(LANG|LANGUAGE|LC_\w+|TZ|NO_COLOR|FORCE_COLOR|CLICOLOR|CLICOLOR_FORCE|TERM|COLUMNS|LINES|CI|GIT_TERMINAL_PROMPT|GIT_OPTIONAL_LOCKS|GIT_AUTHOR_(NAME|EMAIL|DATE)|GIT_COMMITTER_(NAME|EMAIL|DATE))$/;
+/** A pager or editor that runs nothing: `GIT_PAGER=cat git log`, `GIT_EDITOR=true git rebase --continue`. */
+const PLAIN_PROGRAM = /(PAGER|EDITOR)$/;
+
+/**
+ * A variable the line sets: one that steers what runs or where paths point
+ * (`LD_PRELOAD`, `PATH`, `GIT_*`, `PAGER`, `HOME`, `CDPATH`, …) isn't
+ * understood, wherever it is set; any other one in a program's environment
+ * makes it medium.
+ */
+function judgeAssignment(a: ShellAssignment, v: Verdict): void {
+  if (PLAIN_VARS.test(a.name)) return;
+  if (PLAIN_PROGRAM.test(a.name) && ["", "cat", "true", ":"].includes(a.value.value ?? "-")) return;
+  if (STEERING_VARS.test(a.name)) v.add("unknown", `it sets ${a.name}, which changes what programs run or where paths point`);
+  else if (a.exported) v.add("medium", `runs with ${a.name} set in its environment`);
 }
 
 /** Where a `cd` goes: null for `cd -`, `popd`, and anything only known at run time. */
@@ -412,6 +433,15 @@ function judgeCommand(cmd: SimpleCommand, parsed: ParsedShell, cwd: string | nul
     }
     case "sort":
       if (hasFlag(cmd, "o", "--output")) v.add("medium", "sort writes a file");
+      if (flags(cmd).some((f) => f.startsWith("--compress-program"))) v.add("medium", "sort runs the compression program it is given");
+      judgeReader(cmd, prog, parsed, cwd, ctx, v);
+      return;
+    case "rg":
+      if (flags(cmd).some((f) => /^--pre(=|$)/.test(f))) v.add("medium", "rg runs the preprocessor it is given on each file");
+      judgeReader(cmd, prog, parsed, cwd, ctx, v);
+      return;
+    case "jq":
+      if (cmd.argv.slice(1).some((w) => /\$ENV\b|\benv\b/.test(w.value ?? ""))) v.add("medium", "jq prints the environment, which may hold secrets");
       judgeReader(cmd, prog, parsed, cwd, ctx, v);
       return;
     case "uniq":
@@ -436,6 +466,8 @@ const NOT_FILES = new Set(["echo", "printf", "tr", "true", "false", "seq", "slee
 
 /** A read-only program: low inside the workspace, medium for anything it names outside. */
 function judgeReader(cmd: SimpleCommand, prog: string, parsed: ParsedShell, cwd: string | null, ctx: Ctx, v: Verdict): void {
+  // `--files0-from=F`: the files are whatever F lists.
+  if (flags(cmd).some((f) => f.startsWith("--files0-from"))) v.add("medium", `${prog} reads the files a list names`);
   for (const w of cmd.argv.slice(1)) {
     // find -exec's `{}` is a match under find's roots; xargs's input is
     // whatever the words it splits name, anywhere.
@@ -686,9 +718,9 @@ function judgeGit(cmd: SimpleCommand, cwd: string | null, ctx: Ctx, v: Verdict):
       // A config override can name a program to run (core.pager, core.sshCommand, alias.*).
       v.add("medium", "git runs with a configuration override");
       if (a === "-c") i++;
-    } else if (a === "--git-dir" || a === "--work-tree" || a === "--namespace" || a === "--exec-path") {
-      i++;
-      v.add("medium", `git ${a} points it somewhere else`);
+    } else if (/^--(git-dir|work-tree|namespace|exec-path)(=|$)/.test(a)) {
+      if (!a.includes("=") && a !== "--exec-path") i++;
+      v.add("medium", `git ${a.replace(/=.*/, "")} points it somewhere else`);
     }
   }
   const sub = args[i]?.value;
@@ -728,6 +760,11 @@ function judgeGit(cmd: SimpleCommand, cwd: string | null, ctx: Ctx, v: Verdict):
     (sub === "notes" && (rest.length === 0 || restValues[0] === "list" || restValues[0] === "show"));
   if (readOnly) {
     if (!inWorkspace) v.add("medium", `git ${sub} reads a repository outside the workspace`);
+    // A program it's told to run: `--upload-pack`, `grep -O`/`--open-files-in-pager`, `--ext-diff`.
+    if (restValues.some((x) => /^--(upload-pack|receive-pack|exec|open-files-in-pager|ext-diff)(=|$)/.test(x) || (sub === "grep" && /^-[a-zA-Z]*O/.test(x)) || (sub === "ls-remote" && x === "-u"))) {
+      v.add("medium", `git ${sub} runs a program it is given`);
+    }
+    if (sub === "ls-remote") v.add("medium", "git ls-remote asks a remote over the network");
     // `git diff --output=f`, `git log --output`: a write.
     if (restValues.some((x) => x.startsWith("--output"))) v.add("medium", `git ${sub} writes a file`);
     for (const w of rest) for (const p of pathLike(w)) {
@@ -779,29 +816,90 @@ function rootsInside(find: SimpleCommand | undefined, cwd: string | null, ctx: C
 const SAFE_SED = /^(-n\s*)?((\d+|\$)(,(\d+|\$))?)?\s*[pdq]?$|^s(.)(?:(?!\6).)*\6(?:(?!\6).)*\6[gpiI0-9]*$/;
 
 function judgeSed(cmd: SimpleCommand, parsed: ParsedShell, cwd: string | null, ctx: Ctx, v: Verdict): void {
-  if (hasFlag(cmd, "i", "--in-place")) {
-    v.add("medium", "sed edits files in place");
-    for (const t of positionals(cmd).slice(1)) judgeWrite(resolvePath(t, cwd, ctx), t, ctx, v, "sed edits");
-    return;
-  }
-  const values = cmd.argv.slice(1);
+  // Read as sed reads its options: `-e S`, `-eS`, `--expression=S`, `-f F`, `-l N`, `-i[SUFFIX]`, `--in-place[=SUFFIX]`.
+  const args = cmd.argv.slice(1);
   const scripts: Array<string | null> = [];
-  for (let i = 0; i < values.length; i++) {
-    const x = values[i]!.value;
-    if (x === "-e" || x === "--expression") scripts.push(values[++i]?.value ?? null);
-    else if (x === "-f" || x === "--file") scripts.push(null);
+  const operands: ShellWord[] = [];
+  let inPlace = false;
+  let ended = false;
+  for (let i = 0; i < args.length; i++) {
+    const x = args[i]!.value;
+    if (ended || x === null || !x.startsWith("-") || x === "-") {
+      operands.push(args[i]!);
+      continue;
+    }
+    if (x === "--") {
+      ended = true;
+      continue;
+    }
+    if (x.startsWith("--")) {
+      const eq = x.indexOf("=");
+      const name = eq < 0 ? x : x.slice(0, eq);
+      const value = () => (eq < 0 ? (args[++i]?.value ?? null) : x.slice(eq + 1));
+      if (name === "--expression") scripts.push(value());
+      else if (name === "--file") {
+        value();
+        scripts.push(null);
+      }
+      else if (name === "--line-length") value();
+      else if (name === "--in-place") inPlace = true;
+      continue;
+    }
+    for (let k = 1; k < x.length; k++) {
+      const c = x[k];
+      if (c === "i") {
+        inPlace = true; // the rest is a backup suffix
+        break;
+      }
+      if (c === "e" || c === "f" || c === "l") {
+        const value = x.length > k + 1 ? x.slice(k + 1) : (args[++i]?.value ?? null);
+        if (c === "e") scripts.push(value);
+        else if (c === "f") scripts.push(null);
+        break;
+      }
+    }
   }
   // Without -e / -f, the first operand is the script; the rest are files.
-  const inline = scripts.length === 0;
-  if (inline) scripts.push(positionals(cmd)[0]?.value ?? null);
+  if (scripts.length === 0) scripts.push(operands.shift()?.value ?? null);
+  if (inPlace) {
+    v.add("medium", "sed edits files in place");
+    for (const t of operands) judgeWrite(resolvePath(t, cwd, ctx), t, ctx, v, "sed edits");
+    return;
+  }
   if (scripts.some((s) => s === null || !SAFE_SED.test(s.trim()))) v.add("medium", "sed runs a script that may write files or run commands");
-  judgeReader({ ...cmd, argv: [cmd.argv[0]!, ...positionals(cmd).slice(inline ? 1 : 0)] }, "sed", parsed, cwd, ctx, v);
+  judgeReader({ ...cmd, argv: [cmd.argv[0]!, ...operands] }, "sed", parsed, cwd, ctx, v);
 }
 
+/** awk options that take a value; the ones marked load code from elsewhere. */
+const AWK_VALUE = new Set(["-v", "-F", "-W", "--assign", "--field-separator"]);
+const AWK_CODE = new Set(["-f", "-e", "-i", "-l", "-E", "--file", "--source", "--include", "--load", "--exec"]);
+
 function judgeAwk(cmd: SimpleCommand, parsed: ParsedShell, cwd: string | null, ctx: Ctx, v: Verdict): void {
-  const program = positionals(cmd)[0]?.value ?? null;
-  if (hasFlag(cmd, "f") || program === null || /system\s*\(|\||>|getline|close\s*\(|fflush/.test(program)) {
+  // The program is the first operand after the options (`-v x=1`, `-F :` take values); none with -f / -e.
+  const args = cmd.argv.slice(1);
+  const programs: Array<string | null> = [];
+  let elsewhere = false;
+  let i = 0;
+  for (; i < args.length; i++) {
+    const x = args[i]!.value;
+    if (x === null || !x.startsWith("-") || x === "-") break;
+    if (x === "--") {
+      i++;
+      break;
+    }
+    const eq = x.startsWith("--") ? x.indexOf("=") : -1;
+    const name = x.startsWith("--") ? (eq < 0 ? x : x.slice(0, eq)) : x.slice(0, 2);
+    const attached = x.startsWith("--") ? eq >= 0 : x.length > 2;
+    if (AWK_CODE.has(name)) {
+      const value = attached ? x.slice(eq >= 0 ? eq + 1 : 2) : (args[++i]?.value ?? null);
+      if (name === "-e" || name === "--source") programs.push(value);
+      else elsewhere = true;
+    } else if (AWK_VALUE.has(name) && !attached) i++;
+    else if (/^-[opd]/.test(x) || /^--(pretty-print|profile|dump-variables)/.test(x)) elsewhere = true; // gawk writes a file
+  }
+  if (!elsewhere && programs.length === 0) programs.push(i < args.length ? args[i++]!.value : null);
+  if (elsewhere || programs.some((p) => p === null || /system\s*\(|\||>|getline|close\s*\(|fflush|@load|@include/.test(p))) {
     v.add("medium", "awk runs a program that may write files or run commands");
   }
-  judgeReader({ ...cmd, argv: [cmd.argv[0]!, ...positionals(cmd).slice(1)] }, "awk", parsed, cwd, ctx, v);
+  judgeReader({ ...cmd, argv: [cmd.argv[0]!, ...args.slice(i)] }, "awk", parsed, cwd, ctx, v);
 }
