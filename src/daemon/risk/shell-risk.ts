@@ -182,18 +182,34 @@ const HOME_SENSITIVE = [
   ".bashrc",
   ".bash_profile",
   ".bash_login",
+  ".bash_aliases",
+  ".bash_logout",
   ".profile",
   ".zshrc",
   ".zprofile",
   ".zshenv",
   ".zlogin",
+  ".zlogout",
+  ".xprofile",
+  ".xinitrc",
+  ".pam_environment",
   ".inputrc",
+  ".vimrc",
   ".gitconfig",
   ".git-credentials",
   ".netrc",
   ".npmrc",
   ".pypirc",
   ".local/bin",
+  ".cargo/env",
+  // Agents' own settings and logins: a Claude hook is a command that runs outside the gate.
+  ".claude",
+  ".claude.json",
+  ".codex",
+  ".gemini",
+  ".qwen",
+  ".pi",
+  ".codeoid",
 ];
 /** Files that are credentials themselves: reading one is high. */
 const CREDENTIAL_FILES = [".ssh/id_", ".aws/credentials", ".netrc", ".git-credentials", ".docker/config.json", ".kube/config", ".npmrc", ".pypirc", ".config/gh/hosts.yml", ".gnupg/"];
@@ -207,6 +223,7 @@ function where(path: string | null, ctx: Ctx): Where {
   if (path === "/" ) return "root";
   if (path === "/dev/null" || path === "/dev/stdout" || path === "/dev/stderr" || path === "/dev/tty") return "outside";
   if (insideOf(path, ctx.workdir)) return "workspace";
+  if (insideOf(path, ctx.configDir)) return "home-sensitive";
   if (path === ctx.home) return "home";
   if (insideOf(path, ctx.home)) {
     const rel = path.slice(ctx.home.length + 1);
@@ -345,7 +362,7 @@ function judgeCommand(cmd: SimpleCommand, parsed: ParsedShell, cwd: string | nul
     return;
   }
   if (DOWNLOADERS.has(prog)) {
-    judgeDownloader(cmd, prog, v);
+    judgeDownloader(cmd, prog, cwd, ctx, v);
     return;
   }
   if (NET_RAW.has(prog)) {
@@ -362,7 +379,17 @@ function judgeCommand(cmd: SimpleCommand, parsed: ParsedShell, cwd: string | nul
   }
   switch (prog) {
     case "rm":
-      judgeRm(cmd, cwd, ctx, v);
+    case "rmdir":
+    case "unlink":
+      judgeRm(cmd, prog, parsed, cwd, ctx, v);
+      return;
+    case "truncate":
+    case "touch":
+    case "mkdir":
+      // Their targets are writes: `truncate -s 0 /etc/passwd` is `> /etc/passwd`.
+      for (const t of operandsAfter(cmd, prog === "truncate" ? ["-s", "-r", "--size", "--reference"] : prog === "touch" ? ["-d", "-r", "-t", "--date", "--reference"] : ["-m", "--mode", "--context"])) {
+        judgeWrite(resolvePath(t, cwd, ctx), t, ctx, v, `${prog} writes`);
+      }
       return;
     case "dd":
       judgeDd(cmd, cwd, ctx, v);
@@ -412,10 +439,19 @@ function judgeCommand(cmd: SimpleCommand, parsed: ParsedShell, cwd: string | nul
       return;
     case "crontab":
     case "at":
+    case "batch":
     case "launchctl":
-    case "systemctl":
-      v.add("medium", `${prog} changes what runs on the machine later`);
+    case "systemctl": {
+      // Scheduling or installing something to run later is as lasting as a start-up file.
+      const sub = positionals(cmd)[0]?.value ?? "";
+      const lasting =
+        prog === "at" || prog === "batch" ||
+        (prog === "crontab" && !flags(cmd).includes("-l")) ||
+        (prog === "systemctl" && ["enable", "link", "edit", "set-environment", "import-environment", "preset", "reenable", "set-property", "add-wants", "add-requires"].includes(sub)) ||
+        (prog === "launchctl" && ["load", "bootstrap", "enable", "submit", "setenv"].includes(sub));
+      v.add(lasting ? "high" : "medium", `${prog} changes what runs on the machine later`);
       return;
+    }
     case "history":
       v.add("medium", "history changes the shell's history");
       return;
@@ -436,6 +472,19 @@ function judgeCommand(cmd: SimpleCommand, parsed: ParsedShell, cwd: string | nul
       if (flags(cmd).some((f) => f.startsWith("--compress-program"))) v.add("medium", "sort runs the compression program it is given");
       judgeReader(cmd, prog, parsed, cwd, ctx, v);
       return;
+    case "xxd":
+      // `xxd in out`, `xxd -r in out`: the second operand is written.
+      for (const t of operandsAfter(cmd, ["-c", "-g", "-l", "-o", "-s", "-n", "-C", "--cols", "--groupsize", "--len", "--offset", "--seek", "--name"]).slice(1, 2)) {
+        judgeWrite(resolvePath(t, cwd, ctx), t, ctx, v, "xxd writes");
+      }
+      judgeReader(cmd, prog, parsed, cwd, ctx, v);
+      return;
+    case "tree": {
+      const o = cmd.argv.findIndex((w) => w.value === "-o");
+      if (o > 0 && cmd.argv[o + 1]) judgeWrite(resolvePath(cmd.argv[o + 1]!, cwd, ctx), cmd.argv[o + 1]!, ctx, v, "tree writes");
+      judgeReader(cmd, prog, parsed, cwd, ctx, v);
+      return;
+    }
     case "rg":
       if (flags(cmd).some((f) => /^--pre(=|$)/.test(f))) v.add("medium", "rg runs the preprocessor it is given on each file");
       judgeReader(cmd, prog, parsed, cwd, ctx, v);
@@ -547,30 +596,70 @@ function judgeWrite(abs: string | null, w: ShellWord, ctx: Ctx, v: Verdict, what
   else v.add("medium", `${what} ${abs}, outside the workspace`);
 }
 
-function judgeRm(cmd: SimpleCommand, cwd: string | null, ctx: Ctx, v: Verdict): void {
-  const recursive = hasFlag(cmd, "r", "--recursive") || hasFlag(cmd, "R");
+function judgeRm(cmd: SimpleCommand, prog: string, parsed: ParsedShell, cwd: string | null, ctx: Ctx, v: Verdict): void {
+  const recursive = prog === "rm" && (hasFlag(cmd, "r", "--recursive") || hasFlag(cmd, "R"));
   const targets = positionals(cmd);
   if (targets.length === 0) {
-    v.add("medium", "rm deletes files");
+    v.add("medium", `${prog} deletes files`);
     return;
   }
   for (const t of targets) {
+    // What find or xargs hands it: a delete of whatever the search outside the workspace found.
+    if (t.input) {
+      const from = inputSource(cmd, parsed, cwd, ctx);
+      if (from !== null) {
+        v.add(from === "workspace" ? "medium" : "high", `${prog} deletes files ${from === "workspace" ? "a search in the workspace finds" : "found outside the workspace"}`);
+        continue;
+      }
+    }
     const abs = resolvePath(t, cwd, ctx);
     const at = where(abs, ctx);
     const precious = abs !== null && (abs === ctx.workdir || abs === join(ctx.workdir, ".git") || insideOf(abs, join(ctx.workdir, ".git")));
     if (at === "root" || at === "system" || at === "home" || at === "home-sensitive") {
-      v.add("high", `rm deletes ${abs}${recursive ? " and everything under it" : ""}`);
+      v.add("high", `${prog} deletes ${abs}${recursive ? " and everything under it" : ""}`);
     } else if (precious) {
-      v.add("high", `rm deletes ${abs === ctx.workdir ? "the whole workspace" : "the repository's history (.git)"}`);
+      v.add("high", `${prog} deletes ${abs === ctx.workdir ? "the whole workspace" : "the repository's history (.git)"}`);
     } else if (at === "unknown") {
       const why = t.value === null ? "a path only known at run time" : "relative to a directory outside the workspace";
-      v.add(recursive ? "high" : "medium", `rm deletes ${t.raw}, ${why}${recursive ? ", recursively" : ""}`);
+      v.add(recursive ? "high" : "medium", `${prog} deletes ${t.raw}, ${why}${recursive ? ", recursively" : ""}`);
     } else if (at === "outside") {
-      v.add(recursive ? "high" : "medium", `rm deletes ${abs}, outside the workspace${recursive ? ", recursively" : ""}`);
+      v.add(recursive ? "high" : "medium", `${prog} deletes ${abs}, outside the workspace${recursive ? ", recursively" : ""}`);
     } else {
-      v.add("medium", `rm deletes ${abs} in the workspace`);
+      v.add("medium", `${prog} deletes ${abs} in the workspace`);
     }
   }
+}
+
+/**
+ * Where the paths find or xargs hands a command come from: "workspace" when
+ * every search root, or every path the earlier pipeline stages name, is in
+ * it; "outside" when one isn't; null when there's nothing to tell by.
+ */
+function inputSource(cmd: SimpleCommand, parsed: ParsedShell, cwd: string | null, ctx: Ctx): "workspace" | "outside" | null {
+  if (cmd.inputFrom !== undefined) {
+    const find = parsed.commands[cmd.inputFrom];
+    return find && rootsInside(find, cwd, ctx) ? "workspace" : "outside";
+  }
+  const feeders = parsed.commands.filter((c) => c.pipeline === cmd.pipeline && c.stage < cmd.stage);
+  const named = feeders.flatMap((c) => (programOf(c) === "find" ? findRoots(c) : c.argv.slice(1).flatMap(pathLike)));
+  if (named.some((w) => where(resolvePath(w, cwd, ctx), ctx) !== "workspace")) return "outside";
+  return null;
+}
+
+/** A command's operands, skipping the values of the options listed. */
+function operandsAfter(cmd: SimpleCommand, withValue: string[]): ShellWord[] {
+  const args = cmd.argv.slice(1);
+  const out: ShellWord[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const x = args[i]!.value;
+    if (x === "--") return [...out, ...args.slice(i + 1)];
+    if (x !== null && x.startsWith("-") && x !== "-") {
+      if (withValue.includes(x)) i++;
+      continue;
+    }
+    out.push(args[i]!);
+  }
+  return out;
 }
 
 function judgeDd(cmd: SimpleCommand, cwd: string | null, ctx: Ctx, v: Verdict): void {
@@ -600,12 +689,26 @@ function judgePermissions(cmd: SimpleCommand, prog: string, cwd: string | null, 
 }
 
 function judgeCopy(cmd: SimpleCommand, prog: string, cwd: string | null, ctx: Ctx, v: Verdict): void {
-  const args = positionals(cmd);
+  let args = positionals(cmd);
   const remote = (w: ShellWord) => w.value !== null && /^[^/]*:/.test(w.value) && !w.value.startsWith("./");
   if ((prog === "scp" || prog === "rsync") && args.some(remote)) {
     v.add(args.at(-1) && remote(args.at(-1)!) ? "high" : "medium", `${prog} copies over the network`);
   }
+  // `cp -t DIR src…`, `--target-directory=DIR`: the target comes first.
+  const all = cmd.argv.slice(1);
+  const t = all.findIndex((w) => w.value === "-t" || w.value === "--target-directory" || /^(-t.|--target-directory=)/.test(w.value ?? ""));
+  if (t >= 0 && prog !== "rsync" && prog !== "scp") {
+    const x = all[t]!.value!;
+    const dirWord = x === "-t" || x === "--target-directory" ? all[t + 1] : { ...all[t]!, value: x.startsWith("-t") ? x.slice(2) : x.slice(x.indexOf("=") + 1) };
+    args = args.filter((w) => w !== all[t + 1]);
+    if (dirWord) args = [...args, dirWord];
+  }
   const target = args.at(-1);
+  // rsync --delete removes whatever the target has that the source doesn't.
+  if (prog === "rsync" && target && !remote(target) && flags(cmd).some((f) => f.startsWith("--delete") || f === "--remove-source-files")) {
+    const at = where(resolvePath(target, cwd, ctx), ctx);
+    v.add(at === "workspace" ? "medium" : "high", `rsync deletes files under ${resolvePath(target, cwd, ctx) ?? target.raw}`);
+  }
   if (!target) {
     v.add("medium", `runs ${prog}`);
     return;
@@ -660,7 +763,29 @@ function fedText(cmd: SimpleCommand, parsed: ParsedShell): string | null {
   return null;
 }
 
-function judgeDownloader(cmd: SimpleCommand, prog: string, v: Verdict): void {
+/** Downloader options naming a file it writes, short and long. */
+const DOWNLOAD_OUTPUT: Record<string, { short: string; long: RegExp }> = {
+  curl: { short: "oDc", long: /^--(output|output-dir|dump-header|cookie-jar|trace|trace-ascii|stderr)$/ },
+  wget: { short: "OoaP", long: /^--(output-document|output-file|append-output|directory-prefix)$/ },
+};
+
+function judgeDownloader(cmd: SimpleCommand, prog: string, cwd: string | null, ctx: Ctx, v: Verdict): void {
+  // What it writes: `curl -o ~/.bashrc …`, `wget -qO ~/.local/bin/ls …`.
+  const out = DOWNLOAD_OUTPUT[prog];
+  const args = cmd.argv.slice(1);
+  for (let i = 0; out && i < args.length; i++) {
+    const x = args[i]!.value;
+    if (x === null || !x.startsWith("-") || x === "-") continue;
+    let target: ShellWord | undefined;
+    if (x.startsWith("--")) {
+      const eq = x.indexOf("=");
+      if (out.long.test(eq < 0 ? x : x.slice(0, eq))) target = eq < 0 ? args[++i] : { ...args[i]!, value: x.slice(eq + 1) };
+    } else {
+      const k = [...x.slice(1)].findIndex((c) => out.short.includes(c));
+      if (k >= 0) target = x.length > k + 2 ? { ...args[i]!, value: x.slice(k + 2) } : args[++i];
+    }
+    if (target && target.value !== "-") judgeWrite(resolvePath(target, cwd, ctx), target, ctx, v, `${prog} writes`);
+  }
   // A word only known at run time is read as written: `-d @"$F"` still sends a file.
   const words = cmd.argv.slice(1).map((w) => w.value ?? w.raw.replace(/^["']/, ""));
   // Sends a local file out: `-d @f`, `--data-binary @f`, `-F x=@f`, `-T f`, `--upload-file`, `--post-file`.
@@ -760,8 +885,14 @@ function judgeGit(cmd: SimpleCommand, cwd: string | null, ctx: Ctx, v: Verdict):
     return;
   }
   if (sub === "push") {
-    const force = restValues.some((x) => x === "-f" || x === "--force" || x.startsWith("--force-with-lease") || x === "--force-if-includes" || x === "--mirror" || x === "--delete" || x === "-d" || x === "--prune" || (/^\+/.test(x) && x.length > 1) || /^-[a-zA-Z]*f/.test(x) && !x.startsWith("--"));
+    const force = restValues.some((x) => x === "-f" || x === "--force" || x.startsWith("--force-with-lease") || x === "--force-if-includes" || x === "--mirror" || x === "--delete" || x === "-d" || x === "--prune" || (/^\+/.test(x) && x.length > 1) || /^:./.test(x) || /^-[a-zA-Z]*f/.test(x) && !x.startsWith("--"));
     v.add(force ? "high" : "medium", force ? "git push rewrites or deletes history on a remote" : "git push publishes commits to a remote");
+    return;
+  }
+  // `git config --global core.fsmonitor …`: the user's own git config, as `>> ~/.gitconfig` is.
+  const configReads = ["--get", "--get-all", "--list", "-l", "--get-regexp", "--get-urlmatch", "--show-origin", "--show-scope"];
+  if (sub === "config" && restValues.some((x) => /^(--global|--system|--file|-f$|--file=)/.test(x)) && !restValues.some((x) => configReads.includes(x))) {
+    v.add("high", "git config changes git's configuration outside the repository");
     return;
   }
   if (sub === "filter-branch" || sub === "filter-repo" || (sub === "update-ref" && restValues.includes("-d"))) {

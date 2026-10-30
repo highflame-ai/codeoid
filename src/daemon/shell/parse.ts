@@ -715,6 +715,13 @@ const WRAPPERS: Record<string, (args: ShellWord[]) => Unwrapped | null | undefin
     return run(rest.map((w) => (w.value?.includes(replace) ? { ...DYNAMIC_ARG, raw: w.raw } : w)));
   },
   eval: (a) => ({ kind: "eval", argv: a }),
+  // `alias ll='…'`: the line runs wherever the name is used (aliases expand where expand_aliases is on).
+  alias: (a) => {
+    const lines = a.flatMap((w) => (w.value === null ? [null] : /^[^=]+=([\s\S]*)$/.exec(w.value)?.slice(1) ?? []));
+    if (lines.length === 0) return undefined;
+    if (lines.some((l) => l === null)) return null;
+    return { kind: "eval", argv: [lit(lines.join("\n"))] };
+  },
   // fd -x / -X: everything after it (to a `;`) is the command, run on each match.
   fd: (a) => {
     for (let i = 0; i < a.length; i++) {
