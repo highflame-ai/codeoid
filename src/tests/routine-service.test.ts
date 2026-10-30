@@ -1095,6 +1095,28 @@ describe("run outcomes", () => {
     expect(store.listRuns(routine.id, { limit: 1 })[0]).toMatchObject({ status: "skipped" });
   });
 
+  it("a run whose session is destroyed mid-run keeps what it was seen to spend, its cost unknown (#430)", async () => {
+    const { routine } = create({ name: "vanished", dailyCostUsd: 2, failurePauseAfter: 0, maxMinutes: 60 });
+    host.script = { kind: "hang", costPerPoll: 1 };
+    const info = host.info.bind(host);
+    host.info = (id: string) => {
+      const s = host.sessions.get(id);
+      // Someone else in the tenant destroys it once it has spent $3.
+      if (s && s.info.costUsd >= 3) s.destroyed = true;
+      return info(id);
+    };
+    svc.fire(routine, "manual", null, "owner");
+    await settle();
+    const run = store.listRuns(routine.id, { limit: 1 })[0]!;
+    expect(run.status).toBe("failed");
+    expect(run.costUsd).toBeGreaterThanOrEqual(2);
+    expect(run.costUnknown).toBe(true);
+    host.script = { kind: "reply", text: "done", cost: 0.01 };
+    svc.fire(store.getRoutine(routine.id)!, "manual", null, "owner");
+    await settle();
+    expect(store.listRuns(routine.id, { limit: 1 })[0]).toMatchObject({ status: "skipped" });
+  });
+
   it("before a run checks the daily cap, the routine's other sessions report what they spent (#430)", async () => {
     const { routine } = create({ name: "flush-first", dailyCostUsd: 1 });
     host.script = { kind: "reply", text: "done", cost: 0.2 };

@@ -1199,12 +1199,15 @@ export class RoutineService {
       let unsettled = false;
       const usage = (): Pick<RunRow, "costUsd" | "inputTokens" | "outputTokens" | "costUnknown"> => {
         const i = this.#host.info(sessionId as string);
+        // Gone mid-run (destroyed): what it was last seen to have spent, and
+        // the turn then in flight was never recorded, so the cost is unknown (#430).
+        const now = i ? totalsOf(i) : (trail?.last ?? base);
         return {
-          costUsd: Math.max(0, (i?.costUsd ?? baseCost) - baseCost),
-          inputTokens: Math.max(0, (i?.inputTokens ?? baseIn) - baseIn),
-          outputTokens: Math.max(0, (i?.outputTokens ?? baseOut) - baseOut),
+          costUsd: Math.max(0, now.costUsd - baseCost),
+          inputTokens: Math.max(0, now.inputTokens - baseIn),
+          outputTokens: Math.max(0, now.outputTokens - baseOut),
           // However the run ends, a turn of unknown cost in it is on the record (#430).
-          ...((i?.costUnknownTurns ?? 0) > baseUnknown || unsettled ? { costUnknown: true } : {}),
+          ...(now.unknownTurns > baseUnknown || unsettled || !i ? { costUnknown: true } : {}),
         };
       };
       /**
