@@ -869,6 +869,9 @@ export function translateQwenMessage(
       // A turn is over: nothing may stay pending into the next one, or a stale
       // entry would mis-correlate a later same-named call.
       state.pendingTools.length = 0;
+      // qwen-code reports no usage for a sub-agent's requests (only the
+      // session's running total has them): a turn that ran one is unknown (#430).
+      const ranSubagent = state.seenSubagents.size > 0;
       state.seenSubagents.clear();
       // The turn's own usage, summed per request — never the result's, which
       // is the session's cumulative total (#430).
@@ -885,10 +888,10 @@ export function translateQwenMessage(
         // Qwen doesn't price responses: the session prices the tokens. A turn
         // that ran without reporting usage is unknown (a failed one spent
         // nothing); so is one that used several models, whose tokens can't be
-        // priced at one model's rate.
+        // priced at one model's rate, and one that ran a sub-agent.
         totalCostUsd: 0,
         // A failed result that still went to the model (num_turns) spent too.
-        ...((!turn && (r.is_error !== true || (r.num_turns ?? 0) > 0)) || Object.keys(r.modelUsage ?? {}).length > 1
+        ...((!turn && (r.is_error !== true || (r.num_turns ?? 0) > 0)) || Object.keys(r.modelUsage ?? {}).length > 1 || ranSubagent
           ? { costSource: "unknown" as const }
           : {}),
         durationMs: r.duration_ms ?? 0,

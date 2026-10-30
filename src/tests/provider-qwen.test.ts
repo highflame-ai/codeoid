@@ -335,6 +335,20 @@ describe("translateQwenMessage — streaming + result", () => {
     expect(events.at(-1)).toMatchObject({ type: "turn_done", result: { costSource: "unknown" } });
   });
 
+  test("a turn that ran a sub-agent is of unknown cost: qwen-code reports no usage for its requests (#430)", () => {
+    const { events, emit } = collector();
+    const state = freshState();
+    translateQwenMessage({ type: "assistant", parent_tool_use_id: null, message: { content: [{ type: "tool_use", id: "t1", name: "task", input: {} }], usage: { input_tokens: 1000, output_tokens: 50 } } } as never, emit, "qwen", state);
+    // The sub-agent's requests, as the SDK sends them: usage all zeros.
+    translateQwenMessage({ type: "assistant", parent_tool_use_id: "t1", message: { content: [], usage: { input_tokens: 0, output_tokens: 0 } } } as never, emit, "qwen", state);
+    translateQwenMessage({ type: "result", subtype: "success", is_error: false, modelUsage: { "qwen3.8-max": {} } } as never, emit, "qwen", state);
+    expect(events.at(-1)).toMatchObject({ type: "turn_done", result: { costSource: "unknown" } });
+    // The next turn, with no sub-agent, is priced again.
+    translateQwenMessage({ type: "assistant", parent_tool_use_id: null, message: { content: [], usage: { input_tokens: 10, output_tokens: 1 } } } as never, emit, "qwen", state);
+    translateQwenMessage({ type: "result", subtype: "success", is_error: false, modelUsage: { "qwen3.8-max": {} } } as never, emit, "qwen", state);
+    expect((events.at(-1) as { result: { costSource?: string } }).result.costSource).toBeUndefined();
+  });
+
   test("a failed turn that never reached the model spent nothing — not an unknown that blocks a capped routine (#430)", () => {
     const { events, emit } = collector();
     translateQwenMessage({ type: "result", subtype: "error_during_execution", is_error: true, error: { message: "auth" } } as never, emit, "qwen", freshState());
