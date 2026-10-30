@@ -60,6 +60,8 @@ export interface SimpleCommand {
   stdinScript?: true;
   /** For a command find -exec runs: the index of that find, whose search roots its `{}` is under. */
   inputFrom?: number;
+  /** Words its wrappers took for themselves (`xargs -a FILE`, `time -o FILE`): not part of argv, but still files. */
+  wrapped?: ShellWord[];
 }
 
 /** A variable the line sets. */
@@ -76,6 +78,18 @@ export interface ParsedShell {
   assignments: ShellAssignment[];
   /** Why the line isn't fully understood; empty when it is. */
   problems: string[];
+  /**
+   * Shell constructs beyond plain commands, pipelines, `&&` / `||` / `;`
+   * lists, subshells, `{ … }` and `if`: loops, `case`, functions, `declare`,
+   * `[[ … ]]`, `(( … ))`. Understood, but never low.
+   */
+  constructs: string[];
+  /**
+   * Where bash evaluates a variable's value as an expression or a name:
+   * arithmetic (`$((x))`, `[[ $x -eq 1 ]]`, `${a[$i]}`, `let`), `${!x}`. A
+   * value holding `a[$(cmd)]` runs cmd there.
+   */
+  arithmetic: string[];
   /** Nothing of it could be read: the parser isn't loaded or failed, or the line is too long. */
   unreadable?: true;
 }
@@ -120,14 +134,14 @@ export async function parseShell(source: string): Promise<ParsedShell> {
   try {
     await loadShellParser();
   } catch (err) {
-    return { commands: [], assignments: [], problems: [`the shell parser failed to load: ${err instanceof Error ? err.message : String(err)}`], unreadable: true };
+    return { commands: [], assignments: [], problems: [`the shell parser failed to load: ${err instanceof Error ? err.message : String(err)}`], constructs: [], arithmetic: [], unreadable: true };
   }
   return parseShellSync(source);
 }
 
 /** Parse with the parser already loaded; before it is, nothing is understood. */
 export function parseShellSync(source: string): ParsedShell {
-  const out: ParsedShell = { commands: [], assignments: [], problems: [] };
+  const out: ParsedShell = { commands: [], assignments: [], problems: [], constructs: [], arithmetic: [] };
   if (source.length > MAX_LENGTH) {
     out.problems.push(`the command is over ${MAX_LENGTH} characters`);
     out.unreadable = true;
@@ -189,6 +203,7 @@ class Walker {
   }
 
   node(n: Node, ctx: Ctx): void {
+    if (!PLAIN_NODES.has(n.type) || (n.type === "compound_statement" && n.text.startsWith("(("))) this.out.constructs.push(constructName(n));
     switch (n.type) {
       case "comment":
         return;
@@ -235,7 +250,8 @@ class Walker {
         const exported = n.child(0)?.text === "export" || n.namedChildren.some((c) => c?.type === "word" && /^-[a-zA-Z]*x/.test(c.text));
         for (const c of n.namedChildren) {
           if (c?.type === "variable_assignment") this.#assignment(c, ctx, null, exported);
-          else if (c) this.substitutionsIn(c, ctx, null);
+          // `declare 'a[$(cmd)]=1'`: a quoted name's subscript runs as arithmetic.
+          else if (c) this.#subscriptName(this.word(c, ctx, null), n.child(0)?.text ?? "declare");
         }
         return;
       }
@@ -243,6 +259,14 @@ class Walker {
       case "test_command":
         // `[[ $x -eq 0 ]]` compares as arithmetic.
         if (n.text.startsWith("[[") && n.descendantsOfType("test_operator").some((o) => o && /^-(eq|ne|lt|le|gt|ge)$/.test(o.text))) this.#arithmetic(n);
+        // `[[ -v 'a[$(cmd)]' ]]`, `unset 'a[$(cmd)]'`: the subscript of a name runs.
+        if ((n.type === "unset_command" || /(^|\s)-[vR]\s/.test(n.text)) && /\[/.test(n.text)) {
+          const literal =
+            n.descendantsOfType(["raw_string", "word", "string_content"]).some((c) => c !== null && SUBSCRIPT_CODE.test(c.text)) ||
+            n.descendantsOfType("ansi_c_string").some((c) => c !== null && SUBSCRIPT_CODE.test(decodeAnsiC(c.text.slice(2, -1)) ?? "$"));
+          if (literal) this.out.problems.push(`a variable name's subscript runs as code (${n.text})`);
+          else if (/\[[^\]]*\$/.test(n.text)) this.out.arithmetic.push(n.text);
+        }
         // No program runs, but a substitution inside does.
         this.substitutionsIn(n, ctx, null);
         return;
@@ -299,10 +323,57 @@ class Walker {
     }
     cmd.heredoc = heredoc;
     // `let` evaluates its arguments as arithmetic.
-    if (words[0]?.value === "let" && words.slice(1).some((w) => /[A-Za-z_]/.test(w.raw))) {
-      this.out.problems.push(`arithmetic on a variable, whose value bash may run as code (${n.text})`);
-    }
+    if (words[0]?.value === "let" && words.slice(1).some((w) => /[A-Za-z_]/.test(w.raw))) this.out.arithmetic.push(n.text);
     this.unwrap(cmd, ctx);
+    this.#namesSet(cmd);
+  }
+
+  /**
+   * Builtins that set or read a variable named in an argument: `printf -v X`,
+   * `read X`, `mapfile X`, `test -v X`. The variable is recorded as set, and
+   * a name's subscript is arithmetic (`printf -v 'a[$(cmd)]' x` runs cmd).
+   */
+  #namesSet(cmd: SimpleCommand): void {
+    const prog = basename(cmd.argv[0]?.value ?? "");
+    const args = cmd.argv.slice(1);
+    const set = (name: ShellWord | undefined, value: ShellWord = DYNAMIC_VALUE) => {
+      if (!name) return;
+      this.#subscriptName(name, prog);
+      if (name.value !== null && /^[A-Za-z_]\w*(\[|$)/.test(name.value)) this.out.assignments.push({ name: name.value.replace(/\[[\s\S]*$/, ""), value, exported: false });
+    };
+    if (prog === "printf") {
+      const v = args.findIndex((w) => w.value?.startsWith("-v"));
+      if (v < 0) return;
+      const attached = args[v]!.value!.length > 2;
+      const name = attached ? { ...args[v]!, value: args[v]!.value!.slice(2) } : args[v + 1];
+      // What it sets is the format applied to the rest: their text is what could hold code.
+      const rest = args.slice(v + (attached ? 1 : 2));
+      set(name, { value: null, raw: rest.map((w) => w.raw).join(" "), glob: false });
+    } else if (prog === "test" || prog === "[") {
+      args.forEach((w, i) => (w.value === "-v" || w.value === "-R") && args[i + 1] && this.#subscriptName(args[i + 1]!, prog));
+    } else if (prog === "read" || prog === "mapfile" || prog === "readarray" || prog === "wait") {
+      // `mapfile -C cmd` runs cmd as each line is read.
+      if (prog !== "read" && prog !== "wait" && args.some((w) => w.value !== null && /^-[a-zA-Z]*C/.test(w.value))) this.out.problems.push(`${prog} -C runs a callback`);
+      const withValue = prog === "read" ? /^-[a-zA-Z]*[dinNptu]$/ : /^-[a-zA-Z]*[dnOsucC]$/;
+      for (let i = 0; i < args.length; i++) {
+        const x = args[i]!.value;
+        if (x?.startsWith("-") && x !== "-") {
+          // `read -a NAME`, `wait -p NAME`: an option whose value is a name.
+          if ((prog === "read" && /^-[a-zA-Z]*a$/.test(x)) || (prog === "wait" && x === "-p")) set(args[++i]);
+          else if (withValue.test(x)) i++;
+          continue;
+        }
+        if (prog !== "wait") set(args[i]);
+      }
+    }
+  }
+
+  /** A variable name given as an argument: a subscript in it is arithmetic, and code when it holds `$(…)` or `…` as text. */
+  #subscriptName(w: ShellWord, what: string): void {
+    const name = (w.value ?? w.raw).replace(/=[\s\S]*$/, "");
+    if (!name.includes("[")) return;
+    if (w.value !== null && SUBSCRIPT_CODE.test(name)) this.out.problems.push(`a variable name's subscript runs as code in ${what} (${w.raw})`);
+    else if (/\[[^\]]*\$/.test(name)) this.out.arithmetic.push(w.raw);
   }
 
   /**
@@ -490,17 +561,17 @@ class Walker {
       (x.type === "word" && /^[A-Za-z_]/.test(x.text)) ||
       // A `$(…)`'s commands are judged as commands.
       (x.type !== "command_substitution" && x.namedChildren.some((c) => c !== null && reads(c)));
-    if (n.namedChildren.slice(from).some((c) => c !== null && reads(c))) this.out.problems.push(`arithmetic on a variable, whose value bash may run as code (${n.text})`);
+    if (n.namedChildren.slice(from).some((c) => c !== null && reads(c))) this.out.arithmetic.push(n.text);
   }
 
   /** `${…}`: a prompt expansion (`@P`) runs the value's `$(…)`; an index is arithmetic; one the grammar cut short isn't read. */
   #expansion(n: Node): void {
     if (!n.text.endsWith("}")) this.out.problems.push(`an expansion the parser doesn't know (${n.text})`);
     else if (/@P\}$/.test(n.text)) this.out.problems.push(`a prompt expansion runs what the value holds (${n.text})`);
+    // `${!x}` looks up the variable x names, whose subscript is arithmetic.
+    else if (/^\$\{!\w+\}$/.test(n.text)) this.out.arithmetic.push(n.text);
     // `${x:off:len}`: the offset and length are arithmetic.
-    else if (/[A-Za-z_]/.test(/^\$\{[!#]?\w+(?:\[[^\]]*\])?:(?![-=?+])([\s\S]*)\}$/.exec(n.text)?.[1] ?? "")) {
-      this.out.problems.push(`arithmetic on a variable, whose value bash may run as code (${n.text})`);
-    }
+    else if (/[A-Za-z_]/.test(/^\$\{[!#]?\w+(?:\[[^\]]*\])?:(?![-=?+])([\s\S]*)\}$/.exec(n.text)?.[1] ?? "")) this.out.arithmetic.push(n.text);
     for (const s of n.namedChildren) if (s?.type === "subscript") this.#arithmetic(s, 1);
   }
 
@@ -532,6 +603,14 @@ class Walker {
         return;
       }
       const prog = basename(name.value);
+      if (RESERVED.has(name.value)) {
+        // `time { …; }`, `coproc X while …`: the grammar doesn't know these
+        // keywords there and reads a compound command as plain words. What
+        // follows the keyword is judged, but the line isn't understood.
+        this.out.problems.push(`a compound command the parser can't read (${name.raw})`);
+        cmd.argv = cmd.argv.slice(1);
+        continue;
+      }
       const inner = WRAPPERS[prog]?.(cmd.argv.slice(1));
       if (inner === undefined) {
         if (!SHELLS.has(prog) && prog !== "source" && prog !== ".") return;
@@ -576,10 +655,14 @@ class Walker {
         return;
       }
       // `env X=1 cmd`, `sudo X=1 cmd`: X is in cmd's environment.
-      for (const w of cmd.argv.slice(1, cmd.argv.length - inner.argv.length)) {
+      const own = cmd.argv.slice(1, cmd.argv.length - inner.argv.length);
+      for (const w of own) {
         const m = w.value === null ? null : /^([A-Za-z_][A-Za-z0-9_]*)=([\s\S]*)$/.exec(w.value);
         if (m && (prog === "env" || prog === "sudo")) this.out.assignments.push({ name: m[1]!, value: { ...w, value: m[2]! }, exported: true });
       }
+      // What the wrapper kept for itself (xargs adds its input to what it runs).
+      const kept = cmd.argv.slice(1).filter((w) => !inner.argv.includes(w));
+      if (kept.length > 0) cmd.wrapped = [...(cmd.wrapped ?? []), ...kept];
       // A wrapper with nothing to run (`env`, `sudo` alone) is judged as itself.
       if (inner.argv.length === 0) return;
       cmd.via = [...cmd.via, prog];
@@ -653,7 +736,8 @@ const WRAPPERS: Record<string, (args: ShellWord[]) => Unwrapped | null | undefin
   // `busybox rm …`: the applet is the program.
   busybox: (a) => (a[0]?.value?.startsWith("-") ? undefined : run(a)),
   toybox: (a) => (a[0]?.value?.startsWith("-") ? undefined : run(a)),
-  coproc: (a) => run(a),
+  // `coproc NAME { …; }`: a name, then a compound command (a reserved word, read in unwrap).
+  coproc: (a) => run(a[1]?.value && RESERVED.has(a[1].value) ? a.slice(1) : a),
   // `trap 'line' SIGNAL…` runs the line when the signal comes; `trap - X` / `trap '' X` reset or ignore.
   trap: (a) => {
     const rest = skipOptions(a, new Set());
@@ -809,7 +893,8 @@ function shellScript(cmd: SimpleCommand): string | null | undefined | typeof STD
     }
   }
   if (inline) return args[i] ? args[i]!.value : null;
-  if (i < args.length && !fromInput) return undefined; // a script file
+  // `bash /dev/stdin`: the script file is its input.
+  if (i < args.length && !fromInput && !STDIN_FILES.has(args[i]!.value ?? "")) return undefined; // a script file
   return inputOf(cmd);
 }
 
@@ -819,13 +904,19 @@ function sourcedScript(cmd: SimpleCommand): string | null | undefined | typeof S
   const file = args[0]?.value === "--" ? args[1] : args[0];
   if (!file) return undefined;
   if (file.value === null) return file.raw.startsWith("<(") ? STDIN : null;
-  if (file.value === "/dev/stdin" || file.value === "/dev/fd/0" || file.value === "/proc/self/fd/0") return inputOf(cmd);
+  if (STDIN_FILES.has(file.value)) return inputOf(cmd);
   return undefined;
 }
 
+/** Names of a process's own input. */
+const STDIN_FILES = new Set(["/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"]);
+
 /** A script read from the input: a here-document's or here-string's text, a pipe's or a `< <(…)`'s output (STDIN), or a `< file` (undefined). */
 function inputOf(cmd: SimpleCommand): string | null | undefined | typeof STDIN {
-  const input = cmd.redirects.filter((r) => (r.fd === null || r.fd === 0) && (r.op.startsWith("<<") || r.op === "<<<" || r.op === "<"));
+  // `< /dev/stdin` is no redirect at all.
+  const input = cmd.redirects.filter(
+    (r) => (r.fd === null || r.fd === 0) && (r.op.startsWith("<<") || r.op === "<<<" || r.op === "<") && !(r.op === "<" && STDIN_FILES.has(r.target?.value ?? "")),
+  );
   const last = input.at(-1);
   // A later pipeline stage, or the inside of `>(…)`, reads what's written to it.
   if (!last) return cmd.stage > 0 || cmd.substitution === "process-out" ? STDIN : undefined;
@@ -843,7 +934,44 @@ const STDIN = Symbol("stdin");
 /** Shell options that take the next word as their value. */
 const SHELL_VALUE_OPTIONS = new Set(["-o", "+o", "-O", "+O", "--rcfile", "--init-file"]);
 
+/** Bash's reserved words: never a program, though the grammar can leave one as a command's first word. */
+const RESERVED = new Set(["{", "}", "!", "[[", "]]", "((", "while", "until", "for", "select", "if", "then", "else", "elif", "fi", "do", "done", "case", "esac", "in", "function"]);
+
+/** Statements a plain command line is made of: anything else is a construct (see ParsedShell.constructs). */
+const PLAIN_NODES = new Set(["program", "list", "pipeline", "command", "redirected_statement", "variable_assignment", "variable_assignments", "subshell", "compound_statement", "if_statement", "elif_clause", "else_clause", "negated_command", "comment"]);
+
+function constructName(n: Node): string {
+  switch (n.type) {
+    case "for_statement":
+    case "c_style_for_statement":
+      return "a for loop";
+    case "while_statement":
+      return n.text.startsWith("until") ? "an until loop" : "a while loop";
+    case "case_statement":
+      return "a case statement";
+    case "function_definition":
+      return "a function definition";
+    case "declaration_command":
+    case "unset_command":
+      return n.child(0)?.text ?? "declare";
+    case "test_command":
+      return n.text.startsWith("[[") ? "[[ … ]]" : "[ … ]";
+    case "variable_assignment":
+    case "variable_assignments":
+      return "a variable assignment";
+    case "compound_statement":
+      return "(( … ))";
+    default:
+      return n.type.replaceAll("_", " ");
+  }
+}
+
+/** A subscript holding `$` or `` ` `` as text: bash runs a `$(…)` in it when it evaluates the name. */
+const SUBSCRIPT_CODE = /\[[^\]]*[$`]/;
+
 const lit = (value: string): ShellWord => ({ value, raw: value, glob: false });
+/** A value the line sets only at run time (`read X`). */
+const DYNAMIC_VALUE: ShellWord = { value: null, raw: "", glob: false };
 /** An argument supplied at run time (xargs input, find's `{}`). */
 const DYNAMIC_ARG: ShellWord = { value: null, raw: "{}", glob: false, input: true };
 
