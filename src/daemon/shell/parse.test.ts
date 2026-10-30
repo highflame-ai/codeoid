@@ -96,13 +96,74 @@ describe("shell parsing (#431)", () => {
     expect(await argvs("a[$(z)]=7")).toEqual([["z"]]);
   });
 
-  it("doesn't understand arithmetic on a variable, or a prompt expansion (round-1 audit)", async () => {
-    for (const c of ["echo $((x))", "echo $[x]", "((x++))", "[[ $x -eq 0 ]]", "let y=x", "echo ${a[$i]}", "a[$i]=1", "echo ${x:0:len}", "echo ${x@P}", "for ((i=0; i<3; i++)); do :; done"]) {
-      expect((await parseShell(c)).problems.length).toBeGreaterThan(0);
+  it("records arithmetic on a variable, and doesn't understand a prompt expansion (round-1 audit)", async () => {
+    for (const c of ["echo $((x))", "echo $[x]", "((x++))", "[[ $x -eq 0 ]]", "let y=x", "echo ${a[$i]}", "a[$i]=1", "echo ${x:0:len}", "for ((i=0; i<3; i++)); do :; done", "echo ${!x}"]) {
+      const p = await parseShell(c);
+      expect(p.arithmetic.length).toBeGreaterThan(0);
+      expect(p.problems).toEqual([]);
     }
     for (const c of ["echo $((1+2))", "[[ $x == y ]]", "[ $x -eq 0 ]", "echo ${a[0]} ${x:0:3} ${x: -2} ${x@Q} ${#x}"]) {
-      expect((await parseShell(c)).problems).toEqual([]);
+      const p = await parseShell(c);
+      expect(p.arithmetic).toEqual([]);
+      expect(p.problems).toEqual([]);
     }
+    expect((await parseShell("echo ${x@P}")).problems.length).toBeGreaterThan(0);
+  });
+
+  it("doesn't understand a variable name whose subscript holds code as text (round-2 audit)", async () => {
+    for (const c of ["printf -v 'a[$(rm x)]' y", "test -v 'a[$(rm x)]'", "[ -v 'a[`rm x`]' ]", "[[ -v 'a[$(rm x)]' ]]", "declare 'a[$(rm x)]=1'", "unset 'a[$(rm x)]'", "read 'a[$(rm x)]'", "mapfile -C 'rm x' a"]) {
+      expect((await parseShell(c)).problems.length).toBeGreaterThan(0);
+    }
+    // A run-time subscript is arithmetic on a variable.
+    expect((await parseShell('printf -v "a[$i]" y')).arithmetic.length).toBeGreaterThan(0);
+  });
+
+  it("records the variables printf -v, read and mapfile set (round-2 audit)", async () => {
+    const names = async (c: string) => (await parseShell(c)).assignments.map((a) => a.name);
+    expect(await names("printf -v X '%s' y")).toEqual(["X"]);
+    expect(await names("printf -vX y")).toEqual(["X"]);
+    expect(await names("read -r -p 'go? ' A B <<< x")).toEqual(["A", "B"]);
+    expect(await names("read -ra ARR <<< x")).toEqual(["ARR"]);
+    expect(await names("mapfile -t lines < f")).toEqual(["lines"]);
+  });
+
+  it("lists the constructs beyond plain commands and lists (round-2 redesign)", async () => {
+    const constructs = async (c: string) => (await parseShell(c)).constructs;
+    const first = async (c: string) => (await constructs(c))[0];
+    for (const c of ["ls; pwd", "a && b || c", "(cd x; ls)", "{ ls; }", "if true; then ls; elif false; then pwd; else id; fi", "! ls", "x=1", "ls | wc -l # count"]) {
+      expect(await constructs(c)).toEqual([]);
+    }
+    // The outermost first: a loop's words and body follow it.
+    expect(await first("for f in a; do ls; done")).toBe("a for loop");
+    expect(await first("while true; do ls; done")).toBe("a while loop");
+    expect(await first("[[ -f a ]] && ls")).toBe("[[ … ]]");
+    expect(await first("((n++))")).toBe("(( … ))");
+    expect(await first("declare -x A=1")).toBe("declare");
+    expect(await first("f() { ls; }")).toBe("a function definition");
+  });
+
+  it("reads time and coproc in front of a compound command as not understood, with what's inside listed (round-2 audit)", async () => {
+    for (const c of ["time { rm -rf x; }", "time while true; do rm x; done", "coproc X { rm x; }", "coproc { rm x; }"]) {
+      const p = await parseShell(c);
+      expect(p.problems.length).toBeGreaterThan(0);
+      expect(p.commands.some((k) => k.argv[0]?.value === "rm")).toBe(true);
+    }
+    expect((await parseShell("time ls")).problems).toEqual([]);
+    expect((await parseShell("coproc ls")).problems).toEqual([]);
+  });
+
+  it("reads a shell's /dev/stdin script as its input (round-2 audit)", async () => {
+    expect(await argvs("echo 'rm x' | bash /dev/stdin")).toEqual([["echo", "rm x"], ["bash", "/dev/stdin"]]);
+    expect((await parseShell("echo 'rm x' | bash /dev/stdin")).commands[1]!.stdinScript).toBe(true);
+    expect((await parseShell("echo 'rm x' | bash < /dev/stdin")).commands[1]!.stdinScript).toBe(true);
+    expect(await argvs("bash /dev/fd/0 <<< 'rm x'")).toEqual([["bash", "/dev/fd/0"], ["rm", "x"]]);
+  });
+
+  it("keeps the words a wrapper takes for itself (round-2 audit)", async () => {
+    const { commands } = await parseShell("xargs -a list.txt echo");
+    expect(commands[0]!.argv.map((w) => w.value)).toEqual(["echo", null]);
+    expect(commands[0]!.wrapped?.map((w) => w.value)).toEqual(["-a", "list.txt"]);
+    expect((await parseShell("time -o out.txt ls")).commands[0]!.wrapped?.map((w) => w.value)).toEqual(["-o", "out.txt"]);
   });
 
   it("finds what fd -x / -X runs on each match", async () => {

@@ -1,28 +1,32 @@
 /**
- * How risky a shell command line is (#431), judged from what it runs
- * (src/daemon/shell/parse.ts), not from the tool's name:
+ * How risky a shell command line is (#431), judged from reading it
+ * (src/daemon/shell/parse.ts), not from the tool's name. This is guidance,
+ * not a sandbox: a command can be written in ways the reader doesn't
+ * recognise, so `high`, `unknown` and a refused credential file are a best
+ * effort. Only `low` is a promise, and it is kept by being an allow-list.
  *
- * - `low`: reads inside the workspace and nothing else — `git status`, `ls`,
- *   `grep -r foo src`.
- * - `medium`: changes something, runs code, or reaches outside the workspace
- *   — `npm test`, `echo x > f`, `git commit`, `cat /etc/hosts`.
+ * - `low`: a plain read inside the workspace, of a shape vetted for it
+ *   (notLow): `git status`, `ls -la`, `grep -rn foo src | head`. Anything
+ *   unusual (a `cd`, a variable, a loop, a wrapper, an option that runs or
+ *   writes) simply isn't low.
+ * - `medium`: everything else that isn't high or unknown: changes something,
+ *   runs code, reaches outside the workspace, or isn't of a vetted shape —
+ *   `npm test`, `echo x > f`, `git commit`, `cat /etc/hosts`, `cd src && ls`.
  * - `high`: hard or impossible to undo, or a classic way to lose data or
  *   credentials — `rm -rf ~`, `git push --force`, `curl … | sh`, writes to
  *   system paths or shell start-up files, credential reads, `sudo`.
  * - `unknown`: the line can't be read with certainty (a syntax error, a
- *   program or script only known at run time). Never treated as low.
+ *   program or script only known at run time, a value set to code that
+ *   arithmetic evaluates).
  *
- * A command that touches one of codeoid's own credential files, or another
- * agent's login, is refused outright (`deny`), as the file tools are.
- *
- * Rules over-state rather than under-state: a word that merely looks like a
- * path outside the workspace makes a read medium, and a recursive delete of
- * anything that isn't plainly inside the workspace is high.
+ * A command that names one of codeoid's own credential files, or another
+ * agent's login, as the reader sees it, is refused (`deny`), as the file
+ * tools are.
  */
-import { homedir } from "node:os";
+import { homedir, userInfo } from "node:os";
 import { isAbsolute, join, normalize, resolve, sep } from "node:path";
 import { secretDirsOf, secretPathVerdict } from "../secret-paths.js";
-import { loadShellParser, type ParsedShell, parseShellSync, type ShellAssignment, type ShellWord, type SimpleCommand } from "../shell/parse.js";
+import { loadShellParser, type ParsedShell, parseShellSync, type ShellAssignment, type ShellRedirect, type ShellWord, type SimpleCommand } from "../shell/parse.js";
 
 export type RiskLevel = "low" | "medium" | "high" | "unknown";
 
@@ -95,7 +99,226 @@ class Verdict {
 export function judge(parsed: ParsedShell, ctx: Ctx): ShellRisk {
   const v = new Verdict();
   judgeLine(parsed, ctx.cwd, ctx, v);
+  // Low is an allow-list: what the rules above found harmless is low only if
+  // every part of the line is of a shape vetted as a plain read.
+  if (v.level === "low") {
+    const why = notLow(parsed, ctx);
+    if (why) v.add("medium", `not a plain read: ${why}`);
+  }
   return parsed.unreadable ? { ...v.out(), unreadable: true } : v.out();
+}
+
+/**
+ * Programs a low line may run: read-only ones. The options that make one of
+ * them run another program or write (`find -exec`, `rg --pre`, `sed -i`,
+ * `sort -o`, `git -c`, …) are refused in lowOptions.
+ */
+const LOW_PROGRAMS = new Set([
+  "ls", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "rg", "ag", "fd", "echo", "printf", "pwd", "which", "whereis", "type",
+  "file", "stat", "du", "df", "tree", "cut", "tr", "diff", "cmp", "comm", "nl", "tac", "rev", "paste", "column", "fold",
+  "fmt", "expand", "unexpand", "md5sum", "sha1sum", "sha224sum", "sha256sum", "sha384sum", "sha512sum", "shasum", "cksum", "b2sum",
+  "whoami", "id", "uname", "true", "false", "test", "basename", "dirname", "realpath", "readlink", "seq", "sleep", "jq", "od",
+  "hexdump", "xxd", "strings", "date", "uptime", "nproc", "arch", "groups", "locale", "tty", "hostname", "sort", "uniq", "find",
+  "sed", "awk", "gawk", "mawk", "nawk", "git",
+]);
+/** git subcommands that only read the repository (no network, no pager or browser of their own). */
+const GIT_LOW = new Set([
+  "status", "log", "diff", "show", "rev-parse", "ls-files", "ls-tree", "blame", "describe", "shortlog", "grep", "cat-file",
+  "show-ref", "merge-base", "name-rev", "rev-list", "count-objects", "check-ignore", "version", "whatchanged", "annotate",
+  "for-each-ref", "var", "cherry", "range-diff",
+]);
+/** Programs whose arguments are never files: what they're given isn't checked against the workspace. */
+const LOW_NOT_FILES = new Set(["echo", "printf", "tr", "true", "false", "seq", "sleep", "basename", "dirname", "which", "whereis", "type", "uname", "whoami", "id", "groups", "nproc", "arch", "uptime", "locale", "tty", "hostname"]);
+
+/**
+ * Why a line the rules found harmless still isn't low, or null when it is.
+ * Every simple command must run a LOW_PROGRAMS program, by name, with no
+ * wrapper and none of the options that make it run or write something;
+ * every word must be known before it runs (no `$X`, `$(…)`, arithmetic, or
+ * glob that could reach outside); every path must be inside the workspace;
+ * and the line may only be commands, pipelines, `&&` / `||` / `;` lists,
+ * subshells, `{ … }` and `if`: no `cd`, no assignment, no loop, no
+ * `declare`, no `[[ … ]]`. A redirect may only read a file in the workspace,
+ * duplicate a descriptor, or write to /dev/null.
+ */
+function notLow(parsed: ParsedShell, ctx: Ctx): string | null {
+  if (parsed.unreadable || parsed.problems.length > 0) return "it isn't fully understood";
+  if (parsed.constructs.length > 0) return `it uses ${parsed.constructs[0]}`;
+  if (parsed.assignments.length > 0) return `it sets ${parsed.assignments[0]!.name}`;
+  if (parsed.arithmetic.length > 0) return `it does arithmetic on a variable (${parsed.arithmetic[0]})`;
+  if (where(ctx.cwd, ctx) !== "workspace") return `it runs in ${ctx.cwd}, outside the workspace`;
+  for (const cmd of parsed.commands) {
+    const why = notLowCommand(cmd, ctx);
+    if (why) return why;
+  }
+  return null;
+}
+
+function notLowCommand(cmd: SimpleCommand, ctx: Ctx): string | null {
+  const name = cmd.argv[0];
+  if (!name || name.value === null) return "a program only known at run time";
+  if (cmd.via.length > 0) return `it runs ${name.value} through ${cmd.via[0]}`;
+  if (cmd.substitution !== null) return `it runs ${name.value} in a substitution`;
+  if (cmd.delegates || cmd.stdinScript || cmd.inputFrom !== undefined) return `${name.value} runs other commands`;
+  const prog = name.value;
+  if (prog === "cd" || prog === "pushd" || prog === "popd") return `it changes directory (${prog})`;
+  if (prog.includes("/")) return `it runs ${prog} by its path`;
+  if (!LOW_PROGRAMS.has(prog)) return `${prog} isn't one of the read-only programs`;
+  const args = cmd.argv.slice(1);
+  for (const w of args) {
+    const why = notStatic(w);
+    if (why) return why;
+  }
+  const values = args.map((w) => w.value!);
+  const option = lowOptions(prog, values, cmd);
+  if (option) return option;
+  if (!LOW_NOT_FILES.has(prog)) {
+    for (const w of args) {
+      for (const p of pathCandidates(w.value!)) {
+        const why = outsideWorkspace({ ...w, value: p }, ctx);
+        if (why) return `${prog} ${why}`;
+      }
+    }
+  }
+  for (const r of cmd.redirects) {
+    const why = notLowRedirect(r, ctx);
+    if (why) return why;
+  }
+  return null;
+}
+
+/** Why a word isn't known before the line runs, or could name something outside the workspace by expanding. */
+function notStatic(w: ShellWord): string | null {
+  if (w.value === null || w.input) return `${w.raw} is only known at run time`;
+  // bash expands `~` after `=` or `:` in a word that looks like an assignment (`if=~/x`).
+  if (/[=:]~/.test(w.value)) return `${w.raw} may expand ~`;
+  if (w.glob) {
+    // A pattern stays under its fixed directory only without braces,
+    // brackets, `..`, `~` and a wildcard that could match a leading dot.
+    if (/[{[(~]/.test(w.raw) || /(^|\/)\.\.(\/|$)/.test(w.value) || /(^|\/)\.[^/]*[*?]/.test(w.value)) return `the pattern ${w.raw} could reach outside the workspace`;
+  }
+  return null;
+}
+
+/** The parts of an argument that may be a path: the word, the value after `=`, an attached short-option value. */
+function pathCandidates(v: string): string[] {
+  if (v === "-" || v === "--") return [];
+  if (v.startsWith("-")) {
+    const eq = v.indexOf("=");
+    if (eq >= 0) return [v.slice(eq + 1)];
+    // `-C/x`, `-f~/x`: an attached value that looks like a path.
+    return /[/~]/.test(v) ? [v.replace(/^-+[a-zA-Z0-9]?/, "")] : [];
+  }
+  const eq = v.indexOf("=");
+  return eq > 0 ? [v, v.slice(eq + 1)] : [v];
+}
+
+/** Why a path-like word isn't inside the workspace, or null when it is (or isn't path-like). */
+function outsideWorkspace(w: ShellWord, ctx: Ctx): string | null {
+  const v = w.value!;
+  if (v === "" || !(/^[.~/]/.test(v) || v.includes("/"))) return null;
+  const abs = resolvePath(w, ctx.cwd, ctx);
+  if (isCredentialPath(abs, ctx)) return `reads ${abs}, a credential file`;
+  if (where(abs, ctx) !== "workspace") return `names ${abs ?? w.raw}, outside the workspace`;
+  return null;
+}
+
+function notLowRedirect(r: ShellRedirect, ctx: Ctx): string | null {
+  if (r.fd !== null && !Number.isInteger(r.fd)) return "it redirects through a named descriptor";
+  // A here-document or here-string: plain text, unless it expands something.
+  if (r.op === "<<" || r.op === "<<-") return r.body === null ? "a here-document expands something at run time" : null;
+  if (!r.target) return `the ${r.op} redirect can't be read`;
+  const why = notStatic(r.target);
+  if (why) return why;
+  if (r.op === "<<<") return null;
+  if ((r.op === ">&" || r.op === "<&") && /^(\d+|-)$/.test(r.target.value!)) return null;
+  if (r.op === "<") return outsideWorkspace({ ...r.target, value: r.target.value!.includes("/") ? r.target.value : `./${r.target.value}` }, ctx);
+  if (/^(>|>>|>\||&>|&>>|>&)$/.test(r.op) && r.target.value === "/dev/null") return null;
+  return `it writes ${r.target.raw}`;
+}
+
+/** Options that make a read-only program run another program or write a file. */
+function lowOptions(prog: string, args: string[], cmd: SimpleCommand): string | null {
+  const opts = args.filter((a) => a.startsWith("-") && a !== "-" && a !== "--");
+  /** A short-option cluster holding any of these letters. */
+  const short = (letters: string) => opts.some((o) => /^-[a-zA-Z0-9]+$/.test(o) && [...letters].some((c) => o.includes(c)));
+  const long = (re: RegExp) => opts.some((o) => re.test(o));
+  const refuse = `${prog} is given an option that can run or write something`;
+  if (long(/^--files0-from/)) return `${prog} reads the files a list names`;
+  switch (prog) {
+    case "printf":
+      return args.some((a) => a.startsWith("-v")) ? "printf -v sets a variable" : null;
+    case "test":
+      return args.some((a) => a === "-v" || a === "-R" || a.includes("[")) ? "test -v reads a variable by name" : null;
+    case "find":
+      return args.some((a) => /^-(exec|execdir|ok|okdir|delete|fprint|fprint0|fprintf|fls)$/.test(a)) ? "find runs commands, deletes, or writes" : null;
+    case "fd":
+      return short("xXl") || long(/^--(exec|exec-batch|list-details)/) ? refuse : null;
+    case "rg":
+      return short("z") || long(/^--(pre|search-zip|hostname-bin)/) ? refuse : null;
+    case "ag":
+      return long(/^--pager/) ? refuse : null;
+    case "sed":
+      return short("if") || long(/^--(in-place|file)/) ? refuse : null;
+    case "awk":
+    case "gawk":
+    case "mawk":
+    case "nawk":
+      // Only -F and -v, and a program that neither runs, writes, nor reads the environment.
+      if (opts.some((o) => !/^-[Fv]/.test(o) && !/^--(field-separator|assign)(=|$)/.test(o))) return refuse;
+      return args.some((a) => /system|getline|close|fflush|ENVIRON|PROCINFO|[@|>]/.test(a)) ? "awk runs a program that may run, write, or read the environment" : null;
+    case "sort":
+      return short("oT") || long(/^--(output|compress-program|temporary-directory)/) ? refuse : null;
+    case "uniq":
+      return operandsAfter(cmd, ["-f", "-s", "-w", "--skip-fields", "--skip-chars", "--check-chars"]).length > 1 ? "uniq writes a file" : null;
+    case "xxd":
+      return operandsAfter(cmd, ["-c", "-g", "-l", "-o", "-s", "-n", "-C", "--cols", "--groupsize", "--len", "--offset", "--seek", "--name"]).length > 1 ? "xxd writes a file" : null;
+    case "tree":
+      return short("oR") ? refuse : null;
+    case "file":
+      return short("C") || long(/^--compile/) ? refuse : null;
+    case "hostname":
+      return args.length === 0 || (args.length === 1 && ["-f", "-i", "-I", "--fqdn"].includes(args[0]!)) ? null : "hostname may change the machine's name";
+    case "date":
+      return dateSets(cmd) ? "date may set the clock" : null;
+    case "jq":
+      return args.some((a) => /\$ENV\b|\benv\b/.test(a)) ? "jq reads the environment" : null;
+    case "git":
+      return gitNotLow(args);
+  }
+  return null;
+}
+
+/** Why a git command isn't a plain read of the repository. */
+function gitNotLow(args: string[]): string | null {
+  let i = 0;
+  for (; i < args.length && args[i]!.startsWith("-"); i++) {
+    const a = args[i]!;
+    // Paths after it are judged from where the line runs: `-C` may only go down.
+    if (a === "-C") {
+      const dir = args[++i] ?? "";
+      if (dir === "" || /^[/~]/.test(dir) || /(^|\/)\.\.(\/|$)/.test(dir)) return `git -C ${dir} reads a repository elsewhere`;
+    }
+    else if (!["--no-pager", "-P", "--no-optional-locks", "--literal-pathspecs"].includes(a)) return `git ${a} changes what git runs or reads`;
+  }
+  const sub = args[i];
+  if (sub === undefined) return null;
+  const rest = args.slice(i + 1);
+  const read =
+    GIT_LOW.has(sub) ||
+    (sub === "branch" && rest.every((x) => BRANCH_LIST_FLAGS.test(x))) ||
+    (sub === "remote" && (rest.length === 0 || (rest.length === 1 && ["-v", "--verbose"].includes(rest[0]!)) || rest[0] === "get-url")) ||
+    (sub === "tag" && rest.every((x) => x === "-l" || x === "--list" || x === "-n" || x.startsWith("--sort=") || x.startsWith("--contains"))) ||
+    (sub === "config" && rest.some((x) => ["--get", "--get-all", "--list", "-l", "--get-regexp"].includes(x))) ||
+    (sub === "stash" && (rest[0] === "list" || rest[0] === "show")) ||
+    (sub === "worktree" && rest[0] === "list") ||
+    (sub === "reflog" && (rest.length === 0 || rest[0] === "show")) ||
+    (sub === "notes" && (rest.length === 0 || rest[0] === "list" || rest[0] === "show"));
+  if (!read) return `git ${sub} isn't a plain read`;
+  if (rest.some((x) => /^--(upload-pack|receive-pack|exec|open-files-in-pager|ext-diff|textconv|filters|output|paginate)(=|$)/.test(x) || (sub === "grep" && /^-[a-zA-Z]*O/.test(x)))) {
+    return `git ${sub} is told to run or write something`;
+  }
+  return null;
 }
 
 /** A shell tool call with no command in it that can be read. */
@@ -104,6 +327,12 @@ export const UNREADABLE_SHELL_CALL: ShellRisk = { level: "unknown", reasons: ["t
 function judgeLine(parsed: ParsedShell, start: string | null, ctx: Ctx, v: Verdict): void {
   for (const p of parsed.problems) v.add("unknown", p);
   for (const a of parsed.assignments) judgeAssignment(a, v);
+  // Arithmetic evaluates a variable's value as an expression, and runs a
+  // `$(…)` in a subscript there: not understood when the line itself sets a
+  // variable to text that could hold one (`x='a[$(cmd)]'; echo $((x))`).
+  // Arithmetic on any other value is medium (never low: see notLow).
+  const carrier = codeInArithmetic(parsed);
+  if (carrier) v.add("unknown", `arithmetic (${carrier.where}) may run code the line puts in ${carrier.name}`);
   // A `cd` moves every relative path after it: null once where to isn't known.
   let cwd: string | null = start;
   for (const cmd of parsed.commands) {
@@ -116,24 +345,72 @@ function judgeLine(parsed: ParsedShell, start: string | null, ctx: Ctx, v: Verdi
   }
 }
 
-/** Variables that change what a program runs or loads, or where a path points. */
-const STEERING_VARS = /^(LD_\w+|DYLD_\w+|GIT_\w+|\w+_PAGER|\w+_EDITOR|\w+_COMMAND|BASH_ENV|ENV|PS4|PROMPT_COMMAND|SHELLOPTS|BASHOPTS|IFS|CDPATH|OLDPWD|HOME|PATH|PAGER|MANPAGER|EDITOR|VISUAL|BROWSER|LESSOPEN|LESSCLOSE|NODE_OPTIONS|PYTHONSTARTUP|PYTHONPATH|PERL5OPT|PERL5LIB|RUBYOPT|SSH_ASKPASS|SUDO_ASKPASS)$/;
+/**
+ * Variables that make a program or the shell load or run code, or move where
+ * a `cd` goes: `LD_PRELOAD=./x.so ls`, `GIT_EXTERNAL_DIFF=… git diff`,
+ * `BASH_ENV=x bash -c …`, `CDPATH=~ cd .codeoid`.
+ */
+const CODE_VARS = /^(LD_\w+|DYLD_\w+|GIT_\w+|\w+_COMMAND|BASH_ENV|ENV|PS4|PROMPT_COMMAND|SHELLOPTS|BASHOPTS|CDPATH|OLDPWD|LESSOPEN|LESSCLOSE|PYTHONSTARTUP|PERL5OPT|PERL5LIB|RUBYOPT|SSH_ASKPASS|SUDO_ASKPASS)$/;
+/**
+ * Variables that choose which program runs, or how words split, in everyday
+ * ways (`PATH=./node_modules/.bin:$PATH`, `EDITOR=vim git commit`,
+ * `while IFS= read -r l`): medium, wherever set.
+ */
+const TOOL_VARS = /^(PATH|PYTHONPATH|NODE_OPTIONS|IFS|HOME|EDITOR|VISUAL|PAGER|MANPAGER|BROWSER|\w+_PAGER|\w+_EDITOR)$/;
 /** In a program's environment, these change nothing it runs. */
 const PLAIN_VARS = /^(LANG|LANGUAGE|LC_\w+|TZ|NO_COLOR|FORCE_COLOR|CLICOLOR|CLICOLOR_FORCE|TERM|COLUMNS|LINES|CI|GIT_TERMINAL_PROMPT|GIT_OPTIONAL_LOCKS|GIT_AUTHOR_(NAME|EMAIL|DATE)|GIT_COMMITTER_(NAME|EMAIL|DATE))$/;
 /** A pager or editor that runs nothing: `GIT_PAGER=cat git log`, `GIT_EDITOR=true git rebase --continue`. */
 const PLAIN_PROGRAM = /(PAGER|EDITOR)$/;
 
 /**
- * A variable the line sets: one that steers what runs or where paths point
- * (`LD_PRELOAD`, `PATH`, `GIT_*`, `PAGER`, `HOME`, `CDPATH`, …) isn't
- * understood, wherever it is set; any other one in a program's environment
- * makes it medium.
+ * A variable the line sets. One that makes programs load or run code
+ * (`LD_PRELOAD`, `GIT_*`, `BASH_ENV`, `CDPATH`, …) isn't understood,
+ * wherever it is set; one that picks a program or splits words (`PATH`,
+ * `EDITOR`, `IFS`, `HOME`, …) is medium, and so is any other one put in a
+ * program's environment. Any assignment at all keeps a line from being low
+ * (notLow).
  */
 function judgeAssignment(a: ShellAssignment, v: Verdict): void {
   if (PLAIN_VARS.test(a.name)) return;
   if (PLAIN_PROGRAM.test(a.name) && ["", "cat", "true", ":"].includes(a.value.value ?? "-")) return;
-  if (STEERING_VARS.test(a.name)) v.add("unknown", `it sets ${a.name}, which changes what programs run or where paths point`);
+  if (TOOL_VARS.test(a.name)) v.add("medium", `it sets ${a.name}, which changes ${a.name === "IFS" ? "how words are split" : "which programs run or where paths point"}`);
+  else if (CODE_VARS.test(a.name)) v.add("unknown", `it sets ${a.name}, which can make programs load or run other code`);
   else if (a.exported) v.add("medium", `runs with ${a.name} set in its environment`);
+}
+
+/** A value whose text could hold code arithmetic would run: `$(…)`, `` `…` ``, or a subscript. */
+function carriesCode(w: ShellWord): boolean {
+  const code = /\$\((?!\()|`|\[/;
+  return code.test(w.raw) || (w.value !== null && code.test(w.value));
+}
+
+const namesIn = (text: string): string[] => text.match(/[A-Za-z_]\w*/g) ?? [];
+
+/**
+ * A variable that arithmetic on the line reads, and that the line gives a
+ * value that could hold code: directly, or through a value naming another
+ * such variable (`n=y; y='a[$(cmd)]'; echo $((n))`, which arithmetic follows).
+ */
+function codeInArithmetic(parsed: ParsedShell): { name: string; where: string } | null {
+  if (parsed.arithmetic.length === 0) return null;
+  // Who names whom: tainted spreads from a variable to the ones whose values name it.
+  const namedBy = new Map<string, string[]>();
+  for (const a of parsed.assignments) {
+    for (const n of new Set(namesIn(`${a.value.raw} ${a.value.value ?? ""}`))) namedBy.set(n, [...(namedBy.get(n) ?? []), a.name]);
+  }
+  const tainted = new Set<string>();
+  const queue = parsed.assignments.filter((a) => carriesCode(a.value)).map((a) => a.name);
+  while (queue.length > 0) {
+    const name = queue.pop()!;
+    if (tainted.has(name)) continue;
+    tainted.add(name);
+    queue.push(...(namedBy.get(name) ?? []));
+  }
+  for (const where of parsed.arithmetic) {
+    const name = namesIn(where).find((n) => tainted.has(n));
+    if (name) return { name, where };
+  }
+  return null;
 }
 
 /** Where a `cd` goes: null for `cd -`, `popd`, and anything only known at run time. */
@@ -167,9 +444,26 @@ function resolvePath(w: ShellWord, cwd: string | null, ctx: Ctx): string | null 
     if (v === "") v = ".";
   }
   if (v === "~" || v.startsWith("~/")) return normalize(join(ctx.home, v.slice(1)));
-  if (v.startsWith("~")) return null; // another user's home
+  // `~me/x` is `~/x`; `~+` is the directory it runs in.
+  const tilde = /^~([^/]*)(\/[\s\S]*)?$/.exec(v);
+  if (tilde?.[1] === ownUser() && ownUser() !== "") return normalize(join(ctx.home, tilde[2] ?? ""));
+  if (tilde?.[1] === "+" && cwd !== null) return normalize(join(cwd, tilde[2] ?? ""));
+  if (v.startsWith("~")) return null; // another user's home, or `~-`
   if (isAbsolute(v)) return normalize(v);
   return cwd === null ? null : resolve(cwd, v);
+}
+
+let user: string | undefined;
+/** The daemon's user name, whose `~name` is the home directory ("" when it can't be read). */
+function ownUser(): string {
+  if (user === undefined) {
+    try {
+      user = userInfo().username;
+    } catch {
+      user = "";
+    }
+  }
+  return user;
 }
 
 function insideOf(path: string, dir: string): boolean {
@@ -287,7 +581,8 @@ function fileWords(w: ShellWord): ShellWord[] {
 
 /** Note a credential file the command names: codeoid's and other agents' logins are refused. */
 function checkSecrets(cmd: SimpleCommand, cwd: string | null, ctx: Ctx, v: Verdict): void {
-  const words = [...cmd.argv.slice(1), ...cmd.redirects.map((r) => r.target).filter((t): t is ShellWord => t !== null)];
+  // A wrapper's own words name files too: `xargs -a FILE`, `time -o FILE`.
+  const words = [...cmd.argv.slice(1), ...(cmd.wrapped ?? []), ...cmd.redirects.map((r) => r.target).filter((t): t is ShellWord => t !== null)];
   for (const w of words) {
     for (const p of fileWords(w)) {
       const abs = resolvePath(p, cwd, ctx);
@@ -976,6 +1271,8 @@ export function findRoots(cmd: SimpleCommand): ShellWord[] {
   let i = 0;
   // `-H`, `-L`, `-P`, `-D debugopts`, `-O3` come before the roots.
   while (i < args.length && /^-([HLP]|D|O\d*)$/.test(args[i]!.value ?? "")) i += args[i]!.value === "-D" ? 2 : 1;
+  // `find -- ROOT …`: the end of those options.
+  if (args[i]?.value === "--") i++;
   const roots: ShellWord[] = [];
   for (; i < args.length; i++) {
     const x = args[i]!.value;
