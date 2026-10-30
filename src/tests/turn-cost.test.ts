@@ -434,7 +434,8 @@ describe("a turn's cost (#430)", () => {
     expect(s.lastTurnOrigin).toBe("user");
     // A wake sent mid-turn joins it: the turn now carries the agent's work too.
     const queued = s.send("wake", { ...auth, sub: "system:background" }).catch(() => {});
-    await Bun.sleep(10);
+    // Joining waits on the send's own preparation: wait for it, not a fixed time.
+    for (let i = 0; i < 400 && s.lastTurnOrigin === "user"; i++) await Bun.sleep(5);
     expect(s.lastTurnOrigin).toBe("agent");
     await s.interrupt(auth);
     await queued;
