@@ -6,6 +6,7 @@
 import { homedir } from "node:os";
 import { isAbsolute, normalize, resolve, sep } from "node:path";
 import { parseShellSync, type ShellWord, type SimpleCommand } from "../shell/parse.js";
+import { findRoots } from "./shell-risk.js";
 
 /** Git subcommands whose effect lives in git's own state or on a remote. */
 const GIT_OUTSIDE = new Set([
@@ -63,8 +64,25 @@ export function outsideEffects(command: string, ctx: EffectContext): boolean {
     if (cmd.stdinScript) return true;
     if (OUTSIDE_PROGRAMS.has(prog)) return true;
     const sub = cmd.argv[1]?.value ?? null;
-    if (prog === "git" && (sub === null || GIT_OUTSIDE.has(gitSubcommand(cmd) ?? ""))) return true;
-    if (PACKAGE_VERBS[prog]?.has(sub ?? "")) return true;
+    if (prog === "git" && (sub === null || gitOutside(cmd))) return true;
+    // The verb is the first operand: `npm --global install x`.
+    const verb = cmd.argv.slice(1).find((w) => w.value === null || !w.value.startsWith("-"))?.value ?? "";
+    if (PACKAGE_VERBS[prog]?.has(verb)) return true;
+    // `python3 -m pip install x`
+    if (/^python[0-9.]*$/.test(prog) && sub === "-m" && /^pip[0-9.]*$/.test(cmd.argv[2]?.value ?? "") && PACKAGE_VERBS.pip!.has(cmd.argv[3]?.value ?? "")) return true;
+    // find -delete / -fprint, and sed -i: what they change is under the roots or the files they name.
+    const values = cmd.argv.slice(1).map((w) => w.value);
+    const findChanges = prog === "find" && values.some((x) => x === "-delete" || x?.startsWith("-fprint") || x === "-fls");
+    const sedEdits = prog === "sed" && values.some((x) => x !== null && (/^-[a-zA-Z]*i/.test(x) || x.startsWith("--in-place")));
+    if (findChanges || sedEdits) {
+      const operands = cmd.argv.slice(1).filter((w) => w.value === null || !/^[-(!]/.test(w.value));
+      // find's roots come before its expression; sed's first operand is its script unless -e/-f gives one.
+      const named = findChanges ? findRoots(cmd) : operands.slice(values.some((x) => x !== null && /^(-[a-zA-Z]*[ef]|--expression|--file)/.test(x)) ? 0 : 1);
+      for (const w of named) {
+        const at = pathOf(w, cwd, home);
+        if (at === null || !inside(at, ctx.workdir)) return true;
+      }
+    }
     // Writes and deletes outside the workspace: redirects, and what rm/mv/cp/tee/ln touch.
     for (const r of cmd.redirects) {
       if (!r.target || r.op === "<" || r.op === "<<<" || ((r.op === ">&" || r.op === "<&") && /^\d+$|^-$/.test(r.target.value ?? ""))) continue;
@@ -94,6 +112,13 @@ export function outsideEffects(command: string, ctx: EffectContext): boolean {
 function targetInside(path: string, cwd: string | null, workdir: string, home: string): boolean {
   const at = pathOf({ value: path, raw: path, glob: false }, cwd, home);
   return at !== null && inside(at, workdir);
+}
+
+/** A git command whose effect is in git's own state or on a remote; `git config --get` only reads. */
+function gitOutside(cmd: SimpleCommand): boolean {
+  const sub = gitSubcommand(cmd);
+  if (sub === "config" && cmd.argv.some((w) => w.value !== null && /^(--get|--get-all|--get-regexp|--get-urlmatch|--list|-l)$/.test(w.value))) return false;
+  return GIT_OUTSIDE.has(sub ?? "");
 }
 
 function gitSubcommand(cmd: SimpleCommand): string | null {

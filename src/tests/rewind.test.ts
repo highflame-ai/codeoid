@@ -705,6 +705,41 @@ describe("irreversibleEffects", () => {
     );
     expect(effects.map((e) => e.detail)).toEqual(["bash -c 'git push -f'", "sudo make install", "echo x > ~/.bashrc", "rm -rf ../sibling", 'eval "$CMD"']);
   });
+
+  it("lists more of what going back can't undo, and not git's reads (round-1 audit)", () => {
+    const shell = (command: string) => ({ id: command, name: "run_shell", originalName: "Bash", input: { command }, output: "", success: true });
+    const effects = irreversibleEffects(
+      [
+        { role: "user", content: "x" },
+        {
+          role: "assistant",
+          content: "",
+          providerId: "p",
+          model: "m",
+          toolCalls: [
+            shell("find /tmp -delete"),
+            shell("find . -name '*.o' -delete"), // inside the workspace
+            shell("sed -i 's/a/b/' ~/.bashrc"),
+            shell("sed -i 's/a/b/' src/a.ts"),
+            shell("python3 -m pip install x"),
+            shell("npm --global install x"),
+            shell("bash -o pipefail -c 'git push'"),
+            shell("echo 'git push' | sh"),
+            shell("git config --get user.name"),
+          ],
+        },
+      ],
+      { workdir: "/w/proj" },
+    );
+    expect(effects.map((e) => e.detail)).toEqual([
+      "find /tmp -delete",
+      "sed -i 's/a/b/' ~/.bashrc",
+      "python3 -m pip install x",
+      "npm --global install x",
+      "bash -o pipefail -c 'git push'",
+      "echo 'git push' | sh",
+    ]);
+  });
 });
 
 describe("applyRewinds", () => {
