@@ -224,6 +224,48 @@ describe("a turn's cost (#430)", () => {
     expect(s.toInfo().usage!.totalCostUsd).toBeCloseTo(4, 6);
   });
 
+  it("a turn that fails while a request streams is unknown — that request's usage never came (#430)", async () => {
+    // Claude, Codex and Qwen report a request's usage only when it ends, and send no model_request.
+    const reported: ProviderEvent = { type: "llm_call", isPrimary: true, usage: { inputTokens: 10_000, outputTokens: 100, cacheReadTokens: 0, cacheCreationTokens: 0 } };
+    const died = await sessionWith([[reported, { type: "text_delta", content: "request 2 streaming" }, { type: "error", message: "stream reset" }]]);
+    Object.defineProperty(died.provider, "runningModel", { get: () => "gpt-5.5" });
+    await died.run();
+    expect(died.s.toInfo().usage!.costUnknownTurns).toBe(1);
+    // ...and so is one whose result carries only the finished requests (Codex's, on a stop).
+    const ended = await sessionWith([[reported, { type: "thinking_delta", content: "request 2" }, { type: "turn_done", result: result({ inputTokens: 10_000, outputTokens: 100, isError: true }) }]]);
+    await ended.run();
+    expect(ended.s.toInfo().usage!.costUnknownTurns).toBe(1);
+    // A request that reported before the turn failed is priced, as before.
+    const after = await sessionWith([[{ type: "text_delta", content: "request 1" }, reported, { type: "turn_done", result: result({ inputTokens: 10_000, outputTokens: 100, isError: true }) }]]);
+    await after.run();
+    expect(after.s.toInfo().usage!.costUnknownTurns ?? 0).toBe(0);
+    expect(after.s.toInfo().usage!.costEstimated).toBe(true);
+  });
+
+  it("...and so is a turn stopped while a request streams, whose result says it ended normally (Codex's interrupted turn) (#430)", async () => {
+    class StopReportsProvider extends MockSessionProvider {
+      override runTurn(opts: TurnOpts): TurnRun {
+        const r = super.runTurn(opts);
+        const q = r.events as unknown as { push(e: ProviderEvent): void; close(): void };
+        // On a stop, the turn ends with what its finished requests spent, and no error.
+        const interrupt = async () => {
+          q.push({ type: "turn_done", result: result({ inputTokens: 10_000, outputTokens: 100 }) });
+          q.close();
+        };
+        return { ...r, interrupt };
+      }
+    }
+    const usage = { inputTokens: 10_000, outputTokens: 100, cacheReadTokens: 0, cacheCreationTokens: 0 };
+    const provider = new StopReportsProvider("codex", [[{ type: "llm_call", isPrimary: true, usage }, { type: "text_delta", content: "request 2 streaming" }]], { stall: true });
+    const { s } = await sessionWith([], undefined, { provider });
+    void s.send("go", auth);
+    for (let i = 0; i < 50 && !s.turnInFlight; i++) await Bun.sleep(5);
+    await Bun.sleep(20);
+    await s.interrupt(auth);
+    for (let i = 0; i < 50 && s.turnInFlight; i++) await Bun.sleep(5);
+    expect(s.toInfo().usage!.costUnknownTurns).toBe(1);
+  });
+
   it("a turn that failed before any model request spent nothing — not unknown (#430)", async () => {
     const { s, run } = await sessionWith([result({ inputTokens: 0, outputTokens: 0, isError: true, errorMessage: "auth" })]);
     await run();

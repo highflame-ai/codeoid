@@ -225,7 +225,7 @@ Your own prices win, per model, in USD per million tokens:
 `cacheRead` and `cacheWrite` default to the input price; `inputAbove200k` / `outputAbove200k` apply when a request's prompt is over 200k tokens.
 The snapshot never lists a model as free (a provider's free tier isn't the model's price elsewhere); only `pricing.models` can.
 A model with no price (here or in the snapshot) has an **unknown** cost, shown as `$?` (or `$0.42+` when some turns were priced), never as $0; a routine with a spend cap stops on such a turn (docs/routines.md).
-The Gemini CLI reports no token counts, so its turns are always of unknown cost; so is a turn whose usage never arrived (a server that leaves it out of the stream), a turn that ended mid-way (an error, a stop) without saying what it spent, a Qwen turn that used more than one model, and a Qwen turn that ran a sub-agent (qwen-code reports no usage for its requests).
+The Gemini CLI reports no token counts, so its turns are always of unknown cost; so is a turn whose usage never arrived (a server that leaves it out of the stream), a turn that ended mid-way (an error, a stop) without saying what it spent, or while a request was still streaming (its usage comes only when it ends), a Qwen turn that used more than one model, and a Qwen turn that ran a sub-agent (qwen-code reports no usage for its requests).
 A turn that failed before reaching the model spent nothing.
 Qwen doesn't report thinking tokens separately, so a Qwen estimate leaves them out.
 

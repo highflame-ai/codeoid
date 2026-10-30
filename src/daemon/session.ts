@@ -814,6 +814,8 @@ interface TurnCounts {
   activity: boolean;
   requests: number;
   reports: number;
+  /** The model streamed output after the last usage report: a request whose usage hasn't come yet (#430). */
+  unreported?: boolean;
 }
 
 const SHELL_TASK_KINDS: ReadonlySet<string> = new Set(["local_bash", "bash", "shell", "monitor_ws", "mcp_task"]);
@@ -1327,6 +1329,7 @@ export class Session {
    */
   #turnRequests = 0;
   #turnUsageReports = 0;
+  #turnUnreported = false;
   #subagentTurnCalls: LLMCallUsage[] = [];
   /** This turn's reports by request id: a repeat report of one request replaces its entry, never adds one (#430). */
   #turnCallIds = new Map<string, { calls: LLMCallUsage[]; index: number }>();
@@ -6078,6 +6081,8 @@ export class Session {
     if (result.costSource === "unknown") return { usd: 0, source: "unknown" };
     // A request went out with no usage reported for it: part of the spend is missing.
     if (counts.requests > counts.reports) return { usd: 0, source: "unknown" };
+    // ...or one was streaming when the turn failed or was stopped: its usage never came.
+    if (counts.unreported && (result.isError || this.#turnInterrupted)) return { usd: 0, source: "unknown" };
     const tokens = {
       inputTokens: result.inputTokens,
       outputTokens: result.outputTokens,
@@ -6305,7 +6310,7 @@ export class Session {
 
   /** The current turn's counts, as its own event consumer kept them. */
   get #turnCounts(): TurnCounts {
-    return { activity: this.#turnHadActivity, requests: this.#turnRequests, reports: this.#turnUsageReports };
+    return { activity: this.#turnHadActivity, requests: this.#turnRequests, reports: this.#turnUsageReports, unreported: this.#turnUnreported };
   }
 
   #recordUnfinishedTurn(counts: TurnCounts): void {
@@ -7701,9 +7706,11 @@ export class Session {
     // resets the session's, and this turn must be recorded with its own (#430).
     let requests = 0;
     let reports = 0;
+    let unreported = false;
     this.#turnHadActivity = false;
     this.#turnRequests = 0;
     this.#turnUsageReports = 0;
+    this.#turnUnreported = false;
     // In flight until this consumer has recorded its turn — even after a stop
     // or a stall recovery has let go of the run (#430).
     this.#drainingConsumers++;
@@ -7756,6 +7763,9 @@ export class Session {
           this.#turnUsageReports++;
           reports++;
         }
+        // Output streams before its request's usage report (Claude, Codex, Qwen send no model_request).
+        if (event.type === "text_delta" || event.type === "thinking_delta") unreported = this.#turnUnreported = true;
+        else if (event.type === "llm_call") unreported = this.#turnUnreported = false;
         // When a mid-turn message interrupts the current turn, the SDK emits a
         // turn_done (often with isError) for the aborted partial turn BEFORE it
         // starts the continuation turn for the injected message. Absorb that
@@ -7771,8 +7781,10 @@ export class Session {
           this.#turnHadActivity = false;
           this.#turnRequests = 0;
           this.#turnUsageReports = 0;
+          this.#turnUnreported = false;
           requests = 0;
           reports = 0;
+          unreported = false;
           // Flush per-turn accumulators so the continuation turn starts clean.
           // Same boundary, same reasoning as turn exit: the partial turn's
           // tools and sub-agents are done with it — except live background
@@ -7809,7 +7821,7 @@ export class Session {
     } finally {
       try {
         // With this consumer's own counts: a newer consumer's (after a recovery) aren't this turn's.
-        if (modelActivity && !resultRecorded) this.#recordUnfinishedTurn({ activity: true, requests, reports });
+        if (modelActivity && !resultRecorded) this.#recordUnfinishedTurn({ activity: true, requests, reports, unreported });
       } finally {
         this.#drainingConsumers--;
         queueMicrotask(() => this.#notifySettled());
