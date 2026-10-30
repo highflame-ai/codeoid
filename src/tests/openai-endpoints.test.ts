@@ -290,6 +290,31 @@ describe("EndpointStore", () => {
     }
   });
 
+  test("...and it answers /props before the first request, so a first turn that fails there is free too (#430)", async () => {
+    const local = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch(req) {
+        if (new URL(req.url).pathname === "/props") return Response.json({ default_generation_settings: { n_ctx: 4096 } });
+        return Response.json({ error: { message: "context overflow" } }, { status: 500 });
+      },
+    });
+    try {
+      const store = storeAt();
+      store.upsert({ name: "box", baseUrl: `http://127.0.0.1:${local.port}/v1`, flavor: "llamacpp", models: [{ id: "m" }] });
+      const registry = new ProviderRegistry("oai:box");
+      syncEndpointProviders(registry, store, new EndpointCatalog(store));
+      const provider = registry.get("oai:box")!.create({ sessionId: "s" } as never);
+      const run = provider.runTurn({ history: [], userMessage: "x", workdir: dir, canUseTool: async () => ({ behavior: "allow" }) } as never);
+      for await (const _ of run.events) {
+        /* drain */
+      }
+      expect(provider.free).toBe(true);
+    } finally {
+      local.stop(true);
+    }
+  });
+
   test("re-labelling the default endpoint keeps the backends in sync", () => {
     const store = storeAt();
     store.upsert({ name: "foo", baseUrl: "http://127.0.0.1:1/v1" });

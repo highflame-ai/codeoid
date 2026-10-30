@@ -72,6 +72,11 @@ export interface OpenAIProviderInit {
    * (#430). A function is asked each turn (an endpoint whose address can change).
    */
   free?: boolean | (() => boolean);
+  /**
+   * Settles what `free` answers, before a turn's first request (#430): a turn
+   * that fails or is stopped part-way is priced by it, with no result to wait for.
+   */
+  proveFree?: () => Promise<void>;
   /** Explicit API key — falls back to OPENAI_API_KEY env var. */
   apiKey?: string;
   /**
@@ -193,6 +198,7 @@ export class OpenAIProvider implements AgentProvider {
   #effortParams: (effort: EffortLevel) => Record<string, unknown>;
   #resolveApiKey: (() => { key: string; fingerprint: string } | null) | null;
   readonly #free: boolean | (() => boolean);
+  readonly #proveFree: (() => Promise<void>) | null;
 
   get free(): boolean {
     return typeof this.#free === "function" ? this.#free() : this.#free;
@@ -201,6 +207,7 @@ export class OpenAIProvider implements AgentProvider {
   constructor(init: OpenAIProviderInit = {}) {
     this.id = init.id ?? "openai";
     this.#free = init.free ?? false;
+    this.#proveFree = init.proveFree ?? null;
     this.displayName = init.displayName ?? "GPT (OpenAI)";
     this.#staticConnection = {
       ...(init.baseURL ? { baseURL: init.baseURL } : {}),
@@ -311,6 +318,7 @@ export class OpenAIProvider implements AgentProvider {
     let model = opts.model ?? this.#defaultModel;
 
     try {
+      await this.#proveFree?.().catch(() => undefined);
       if (!opts.model && this.#resolveDefaultModel) model = (await this.#resolveDefaultModel()) ?? this.#defaultModel;
       const { client, conn } = this.#clientForTurn();
       const maxTokens = this.#maxTokens?.(model);

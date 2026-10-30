@@ -240,6 +240,12 @@ export function endpointFactory(
             const e = store.get(name);
             return e?.flavor === "llamacpp" && isOwnServer(e.baseUrl) && llamaServerAt === e.baseUrl;
           },
+          // Before the first request, not only at a result: a first turn that fails or is stopped is priced too.
+          proveFree: async () => {
+            const e = store.get(name);
+            if (e?.flavor !== "llamacpp" || !isOwnServer(e.baseUrl) || llamaServerAt === e.baseUrl) return;
+            if (await fetchLlamaCppContext(connectionOf(e)).catch(() => undefined)) llamaServerAt = e.baseUrl;
+          },
           connection: () => {
             const conn = withAccount(store.resolveConnection(name), init.resolveAccount?.() ?? null); // throws when removed
             const e = store.get(name)!;

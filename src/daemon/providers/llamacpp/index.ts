@@ -167,7 +167,7 @@ export function createLlamaCppProvider(
   cfg: LlamaCppConfig,
   init: Omit<
     OpenAIProviderInit,
-    "id" | "displayName" | "apiKey" | "baseURL" | "modelFilter" | "fallbackModels" | "contextWindow" | "toolsTransform" | "effortParams" | "free"
+    "id" | "displayName" | "apiKey" | "baseURL" | "modelFilter" | "fallbackModels" | "contextWindow" | "toolsTransform" | "effortParams" | "free" | "proveFree"
   >,
 ): OpenAIProvider {
   // A loopback address may be a proxy to a paid API (a LiteLLM proxy, a
@@ -180,6 +180,11 @@ export function createLlamaCppProvider(
     // The user's own server costs nothing (#430) — a private or local host
     // only: one pointed at a paid public host is priced (or unknown) instead.
     free: () => (cfg.free !== undefined ? cfg.free : llamaServer && isOwnServer(cfg.baseUrl)),
+    // Before the first request, not only at a result: a first turn that fails or is stopped is priced too.
+    proveFree: async () => {
+      if (cfg.free !== undefined || llamaServer || !isOwnServer(cfg.baseUrl)) return;
+      if ((await fetchServerContextWindow(cfg.baseUrl)) !== undefined) llamaServer = true;
+    },
     apiKey: cfg.apiKey,
     baseURL: cfg.baseUrl,
     defaultModel: init.defaultModel ?? cfg.model ?? "local",

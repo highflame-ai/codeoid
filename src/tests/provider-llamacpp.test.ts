@@ -159,6 +159,30 @@ describe("llama.cpp cost (#430)", () => {
   });
 });
 
+describe("llama.cpp cost before a first result (#430)", () => {
+  it("a first turn that fails is free on llama-server: it answered /props before the request, not only after a result", async () => {
+    const server = Bun.serve({
+      port: 0,
+      fetch(req) {
+        if (new URL(req.url).pathname.endsWith("/props")) return Response.json({ default_generation_settings: { n_ctx: 4096 } });
+        return Response.json({ error: { message: "context overflow" } }, { status: 500 });
+      },
+    });
+    try {
+      const provider = createLlamaCppProvider({ baseUrl: `http://127.0.0.1:${server.port}/v1`, apiKey: "" }, {});
+      expect(provider.free).toBe(false);
+      const run = provider.runTurn({ history: [], userMessage: "x", workdir: "/tmp", canUseTool: async () => ({ behavior: "allow" }) } as unknown as TurnOpts);
+      const events: ProviderEvent[] = [];
+      for await (const e of run.events) events.push(e);
+      expect(events.some((e) => e.type === "turn_done")).toBe(false);
+      // What the session prices the failed turn by.
+      expect(provider.free).toBe(true);
+    } finally {
+      server.stop(true);
+    }
+  });
+});
+
 describe("a llama.cpp server is free only when it's the user's own (#430)", () => {
   it("one on this machine is; one elsewhere only when you say so — it may be a gateway to a paid API", () => {
     expect(isOwnServer("http://127.0.0.1:8080/v1")).toBe(true);
