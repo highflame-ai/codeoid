@@ -20,6 +20,10 @@ export interface ShellWord {
   raw: string;
   /** Unquoted glob or brace characters: it may expand to several words, or none. */
   glob: boolean;
+  /** An argument supplied at run time: xargs's input, or a match find -exec runs on. */
+  input?: true;
+  /** When the word is unknown only for a leading `$HOME` / `${HOME}`: its value with that written `~` (`"$HOME/.ssh"` is `~/.ssh`). */
+  home?: string;
 }
 
 export interface ShellRedirect {
@@ -52,6 +56,8 @@ export interface SimpleCommand {
    * what it runs is in the commands parsed from that script, listed after it.
    */
   delegates: boolean;
+  /** For a command find -exec runs: the index of that find, whose search roots its `{}` is under. */
+  inputFrom?: number;
 }
 
 export interface ParsedShell {
@@ -309,30 +315,39 @@ class Walker {
       case "string":
       case "translated_string": {
         let value: string | null = "";
+        let home: string | undefined = "";
         for (const c of n.namedChildren) {
           if (!c) continue;
-          if (c.type === "string_content") value = value === null ? null : value + unescapeDouble(c.text);
-          else {
+          if (c.type === "string_content") {
+            value = value === null ? null : value + unescapeDouble(c.text);
+            home = home === undefined ? undefined : home + unescapeDouble(c.text);
+          } else {
             // `$X`, `$(…)` inside the quotes: known at run time, and a substitution runs.
-            this.word(c, ctx, owner);
+            const w = this.word(c, ctx, owner);
+            home = home === "" && w.home !== undefined ? w.home : undefined;
             value = null;
           }
         }
         // The grammar leaves a string of nothing but quotes without content nodes.
         if (value === "" && n.namedChildCount === 0) value = unescapeDouble(raw.replace(/^\$?"|"$/g, ""));
-        return { value, raw, glob: false };
+        return { value, raw, glob: false, ...(value === null && home ? { home } : {}) };
       }
       case "concatenation": {
         let value: string | null = "";
+        let home: string | undefined;
         // The grammar splits `b{1,2}` into pieces none of which looks like a brace expansion.
         let glob = /(^|[^\\])\{[^}]*,/.test(raw);
+        let first = true;
         for (const c of n.namedChildren) {
           if (!c) continue;
           const w = this.word(c, ctx, owner);
           glob ||= w.glob;
+          if (first) home = w.home;
+          else home = home === undefined || w.value === null ? undefined : home + w.value;
+          first = false;
           value = value === null || w.value === null ? null : value + w.value;
         }
-        return { value, raw, glob };
+        return { value, raw, glob, ...(value === null && home !== undefined ? { home } : {}) };
       }
       case "command_substitution":
       case "process_substitution": {
@@ -345,6 +360,7 @@ class Walker {
       default:
         // $X, ${X}, $((…)), brace expressions, and anything else: known only at run time.
         this.substitutionsIn(n, ctx, owner);
+        if (raw === "$HOME" || raw === "${HOME}") return { value: null, raw, glob: false, home: "~" };
         return { value: null, raw, glob: n.type === "brace_expression" };
     }
   }
@@ -451,9 +467,10 @@ class Walker {
       }
       if (inner.kind === "exec") {
         // find -exec: the command runs per match, its `{}` a path from the search.
+        const inputFrom = this.out.commands.indexOf(cmd);
         for (const run of inner.runs) {
           if (run.length === 0) continue;
-          const sub: SimpleCommand = { ...cmd, argv: run, via: [...cmd.via, prog], redirects: [], heredoc: false, delegates: false };
+          const sub: SimpleCommand = { ...cmd, argv: run, via: [...cmd.via, prog], redirects: [], heredoc: false, delegates: false, inputFrom };
           this.out.commands.push(sub);
           this.unwrap(sub, ctx);
         }
@@ -604,7 +621,7 @@ function shellScript(cmd: SimpleCommand): string | null | undefined {
 
 const lit = (value: string): ShellWord => ({ value, raw: value, glob: false });
 /** An argument supplied at run time (xargs input, find's `{}`). */
-const DYNAMIC_ARG: ShellWord = { value: null, raw: "{}", glob: false };
+const DYNAMIC_ARG: ShellWord = { value: null, raw: "{}", glob: false, input: true };
 
 function basename(p: string): string {
   const i = p.lastIndexOf("/");

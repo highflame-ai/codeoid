@@ -21,7 +21,7 @@
  */
 import { homedir } from "node:os";
 import { isAbsolute, join, normalize, resolve, sep } from "node:path";
-import { secretPathVerdict } from "../secret-paths.js";
+import { secretDirsOf, secretPathVerdict } from "../secret-paths.js";
 import { loadShellParser, type ParsedShell, parseShellSync, type ShellWord, type SimpleCommand } from "../shell/parse.js";
 
 export type RiskLevel = "low" | "medium" | "high" | "unknown";
@@ -89,19 +89,29 @@ class Verdict {
 export function judge(parsed: ParsedShell, ctx: Ctx): ShellRisk {
   const v = new Verdict();
   for (const p of parsed.problems) v.add("unknown", p);
-  // A `cd` moves every relative path after it; where to is only sure inside the workspace.
+  // A `cd` moves every relative path after it: null once where to isn't known.
   let cwd: string | null = ctx.cwd;
   for (const cmd of parsed.commands) {
     const prog = programOf(cmd);
-    if (prog === "cd" || prog === "pushd") {
-      const to = cmd.argv[1];
-      const dir: string | null = to ? resolvePath(to, cwd, ctx) : ctx.home;
-      cwd = dir && insideOf(dir, ctx.workdir) ? dir : null;
+    if (prog === "cd" || prog === "pushd" || prog === "popd") {
+      cwd = cdTarget(cmd, prog, cwd, ctx);
       continue;
     }
     judgeCommand(cmd, parsed, cwd, ctx, v);
   }
   return v.out();
+}
+
+/** Where a `cd` goes: null for `cd -`, `popd`, and anything only known at run time. */
+function cdTarget(cmd: SimpleCommand, prog: string, cwd: string | null, ctx: Ctx): string | null {
+  if (prog === "popd") return null;
+  let args = cmd.argv.slice(1);
+  while (args[0]?.value && /^-[LPe@]+$/.test(args[0].value)) args = args.slice(1);
+  if (args[0]?.value === "--") args = args.slice(1);
+  const to = args[0];
+  if (!to) return prog === "cd" ? ctx.home : null; // `pushd` alone swaps with the stack
+  if (to.value === "-" || /^[+-]\d+$/.test(to.value ?? "")) return null;
+  return resolvePath(to, cwd, ctx);
 }
 
 function programOf(cmd: SimpleCommand): string | null {
@@ -113,7 +123,8 @@ function programOf(cmd: SimpleCommand): string | null {
 
 /** A word as an absolute path, or null when it isn't known (dynamic, or relative to an unknown cwd). */
 function resolvePath(w: ShellWord, cwd: string | null, ctx: Ctx): string | null {
-  let v = w.value;
+  // `$HOME/x` is `~/x`: both are the home directory the shell has.
+  let v = w.value ?? w.home ?? null;
   if (v === null) return null;
   if (w.glob) {
     // The fixed part before the first wildcard: `/tmp/x*` is somewhere in /tmp.
@@ -190,7 +201,7 @@ function isCredentialPath(path: string | null, ctx: Ctx): boolean {
 
 /** Words that look like paths: `./x`, `a/b`, `~`, `/x`, or the value after `--opt=`. */
 function pathLike(w: ShellWord): ShellWord[] {
-  const v = w.value;
+  const v = w.value ?? w.home ?? null;
   if (v === null) return [];
   const out: ShellWord[] = [];
   const eq = v.startsWith("-") ? v.indexOf("=") : -1;
@@ -202,18 +213,50 @@ function pathLike(w: ShellWord): ShellWord[] {
   return out;
 }
 
+/**
+ * Words that may name a file: path-like ones, and a bare name (`config.json`),
+ * which is a file in the directory the command runs in.
+ */
+function fileWords(w: ShellWord): ShellWord[] {
+  const p = pathLike(w);
+  if (p.length > 0) return p;
+  const v = w.value;
+  return v && !v.startsWith("-") && !v.includes("=") && !/^[a-z][a-z0-9+.-]*:/i.test(v) ? [w] : [];
+}
+
 /** Note a credential file the command names: codeoid's and other agents' logins are refused. */
 function checkSecrets(cmd: SimpleCommand, cwd: string | null, ctx: Ctx, v: Verdict): void {
   const words = [...cmd.argv.slice(1), ...cmd.redirects.map((r) => r.target).filter((t): t is ShellWord => t !== null)];
   for (const w of words) {
-    for (const p of pathLike(w)) {
+    for (const p of fileWords(w)) {
       const abs = resolvePath(p, cwd, ctx);
-      if (abs === null) continue;
+      if (abs === null) {
+        if (cwd === null) checkSecretsAnywhere(p, ctx, v);
+        continue;
+      }
       const s = secretPathVerdict("Grep", { path: abs }, { workdir: ctx.workdir, configDir: ctx.configDir });
       if (!s) continue;
       if (s.action === "deny" || !v.secret) v.secret = s;
       if (s.action === "deny") v.add("high", `touches ${s.path}, which holds credentials`);
       else v.add("medium", `reaches ${s.path}, which contains credential files`);
+    }
+  }
+}
+
+/**
+ * A relative path after a `cd` to a directory only known at run time: if it
+ * would name a credential file in any of the directories that hold them,
+ * it's asked about, never run unasked.
+ */
+function checkSecretsAnywhere(w: ShellWord, ctx: Ctx, v: Verdict): void {
+  const rel = w.value;
+  if (rel === null || isAbsolute(rel) || rel.startsWith("~")) return;
+  for (const dir of [ctx.home, join(ctx.home, ".ssh"), ...secretDirsOf(ctx.configDir)]) {
+    const abs = resolve(dir, rel);
+    if (secretPathVerdict("Grep", { path: abs }, { workdir: ctx.workdir, configDir: ctx.configDir })?.action === "deny" || isCredentialPath(abs, ctx)) {
+      v.secret ??= { action: "ask", path: abs };
+      v.add("medium", `may read ${abs}, a credential file, from a directory only known at run time`);
+      return;
     }
   }
 }
@@ -313,16 +356,16 @@ function judgeCommand(cmd: SimpleCommand, parsed: ParsedShell, cwd: string | nul
       judgeGit(cmd, cwd, ctx, v);
       return;
     case "find":
-      judgeFind(cmd, cwd, ctx, v);
+      judgeFind(cmd, parsed, cwd, ctx, v);
       return;
     case "sed":
-      judgeSed(cmd, cwd, ctx, v);
+      judgeSed(cmd, parsed, cwd, ctx, v);
       return;
     case "awk":
     case "gawk":
     case "mawk":
     case "nawk":
-      judgeAwk(cmd, cwd, ctx, v);
+      judgeAwk(cmd, parsed, cwd, ctx, v);
       return;
     case "kill":
     case "pkill":
@@ -347,28 +390,38 @@ function judgeCommand(cmd: SimpleCommand, parsed: ParsedShell, cwd: string | nul
       return;
     case "sort":
       if (hasFlag(cmd, "o", "--output")) v.add("medium", "sort writes a file");
-      judgeReader(cmd, prog, cwd, ctx, v);
+      judgeReader(cmd, prog, parsed, cwd, ctx, v);
       return;
     case "uniq":
       if (positionals(cmd).length >= 2) v.add("medium", "uniq writes a file");
-      judgeReader(cmd, prog, cwd, ctx, v);
+      judgeReader(cmd, prog, parsed, cwd, ctx, v);
       return;
     case "hostname":
     case "date":
       if (positionals(cmd).length > 0 || hasFlag(cmd, "s", "--set")) v.add("high", `${prog} changes the machine's settings`);
-      else judgeReader(cmd, prog, cwd, ctx, v);
+      else judgeReader(cmd, prog, parsed, cwd, ctx, v);
       return;
   }
   if (READERS.has(prog)) {
-    judgeReader(cmd, prog, cwd, ctx, v);
+    judgeReader(cmd, prog, parsed, cwd, ctx, v);
     return;
   }
   v.add("medium", `runs ${prog}`);
 }
 
+/** Readers whose arguments are never files they read (`echo`, `tr`'s sets). */
+const NOT_FILES = new Set(["echo", "printf", "tr", "true", "false", "seq", "sleep", "basename", "dirname", "which", "whereis", "type"]);
+
 /** A read-only program: low inside the workspace, medium for anything it names outside. */
-function judgeReader(cmd: SimpleCommand, prog: string, cwd: string | null, ctx: Ctx, v: Verdict): void {
+function judgeReader(cmd: SimpleCommand, prog: string, parsed: ParsedShell, cwd: string | null, ctx: Ctx, v: Verdict): void {
   for (const w of cmd.argv.slice(1)) {
+    // find -exec's `{}` is a match under find's roots; xargs's input is
+    // whatever the words it splits name, anywhere.
+    if (w.input && cmd.inputFrom !== undefined && rootsInside(parsed.commands[cmd.inputFrom], cwd, ctx)) continue;
+    if (w.value === null && w.home === undefined && !NOT_FILES.has(prog)) {
+      v.add("medium", `${prog} reads ${w.input ? "files it is given at run time" : `${w.raw}, a path only known at run time`}`);
+      continue;
+    }
     for (const p of pathLike(w)) {
       const abs = resolvePath(p, cwd, ctx);
       if (isCredentialPath(abs, ctx)) {
@@ -378,9 +431,13 @@ function judgeReader(cmd: SimpleCommand, prog: string, cwd: string | null, ctx: 
       const at = where(abs, ctx);
       if (at !== "workspace" && abs !== "/dev/null") v.add("medium", `${prog} reads ${abs ?? p.raw}, outside the workspace`);
     }
+    // A bare name is a file in the directory it runs in: `cd ~/.ssh; cat id_rsa`.
+    if (cwd !== null && pathLike(w).length === 0 && fileWords(w).length > 0 && isCredentialPath(resolvePath(w, cwd, ctx), ctx)) {
+      v.add("high", `${prog} reads ${resolvePath(w, cwd, ctx)}, a credential file`);
+    }
   }
-  if (cwd === null && cmd.argv.slice(1).some((w) => w.value !== null && !w.value.startsWith("-"))) {
-    v.add("medium", `${prog} runs in a directory outside the workspace`);
+  if ((cwd === null || !insideOf(cwd, ctx.workdir)) && !NOT_FILES.has(prog)) {
+    v.add("medium", cwd === null ? `${prog} runs in a directory only known at run time` : `${prog} runs in ${cwd}, outside the workspace`);
   }
 }
 
@@ -493,7 +550,8 @@ function judgeInterpreter(cmd: SimpleCommand, prog: string, parsed: ParsedShell,
 }
 
 function judgeDownloader(cmd: SimpleCommand, prog: string, v: Verdict): void {
-  const words = cmd.argv.slice(1).map((w) => w.value ?? "");
+  // A word only known at run time is read as written: `-d @"$F"` still sends a file.
+  const words = cmd.argv.slice(1).map((w) => w.value ?? w.raw.replace(/^["']/, ""));
   // Sends a local file out: `-d @f`, `--data-binary @f`, `-F x=@f`, `-T f`, `--upload-file`, `--post-file`.
   const sendsFile = words.some(
     (w, i) =>
@@ -599,14 +657,11 @@ function judgeGit(cmd: SimpleCommand, cwd: string | null, ctx: Ctx, v: Verdict):
   v.add("medium", `git ${sub} changes the repository`);
 }
 
-function judgeFind(cmd: SimpleCommand, cwd: string | null, ctx: Ctx, v: Verdict): void {
+function judgeFind(cmd: SimpleCommand, parsed: ParsedShell, cwd: string | null, ctx: Ctx, v: Verdict): void {
   const values = cmd.argv.slice(1).map((w) => w.value ?? "");
   if (values.includes("-delete")) {
     // Deleting whatever matches under the roots: as rm -r on them.
-    const firstExpr = values.findIndex((x) => x.startsWith("-") || x === "(" || x === "!");
-    const roots = cmd.argv.slice(1, firstExpr < 0 ? undefined : 1 + firstExpr);
-    if (roots.length === 0) roots.push({ value: ".", raw: ".", glob: false });
-    for (const r of roots) {
+    for (const r of findRoots(cmd)) {
       const abs = resolvePath(r, cwd, ctx);
       const at = where(abs, ctx);
       v.add(at === "workspace" ? "medium" : "high", `find -delete removes files under ${abs ?? r.raw}`);
@@ -615,13 +670,33 @@ function judgeFind(cmd: SimpleCommand, cwd: string | null, ctx: Ctx, v: Verdict)
   }
   if (values.some((x) => x === "-fprint" || x === "-fprint0" || x === "-fprintf" || x === "-fls")) v.add("medium", "find writes a file");
   // -exec commands are judged where they're listed.
-  judgeReader(cmd, "find", cwd, ctx, v);
+  judgeReader(cmd, "find", parsed, cwd, ctx, v);
+}
+
+/** The directories a find searches: the operands before its expression (`.` when none). */
+function findRoots(cmd: SimpleCommand): ShellWord[] {
+  const args = cmd.argv.slice(1);
+  let i = 0;
+  // `-H`, `-L`, `-P`, `-D debugopts`, `-O3` come before the roots.
+  while (i < args.length && /^-([HLP]|D|O\d*)$/.test(args[i]!.value ?? "")) i += args[i]!.value === "-D" ? 2 : 1;
+  const roots: ShellWord[] = [];
+  for (; i < args.length; i++) {
+    const x = args[i]!.value;
+    if (x !== null && (x.startsWith("-") || x === "(" || x === "!")) break;
+    roots.push(args[i]!);
+  }
+  return roots.length > 0 ? roots : [{ value: ".", raw: ".", glob: false }];
+}
+
+/** Every root of a search is inside the workspace. */
+function rootsInside(find: SimpleCommand | undefined, cwd: string | null, ctx: Ctx): boolean {
+  return find !== undefined && findRoots(find).every((r) => where(resolvePath(r, cwd, ctx), ctx) === "workspace");
 }
 
 /** A sed script that only prints or substitutes (no `w`, `e`, `r` commands or flags). */
 const SAFE_SED = /^(-n\s*)?((\d+|\$)(,(\d+|\$))?)?\s*[pdq]?$|^s(.)(?:(?!\6).)*\6(?:(?!\6).)*\6[gpiI0-9]*$/;
 
-function judgeSed(cmd: SimpleCommand, cwd: string | null, ctx: Ctx, v: Verdict): void {
+function judgeSed(cmd: SimpleCommand, parsed: ParsedShell, cwd: string | null, ctx: Ctx, v: Verdict): void {
   if (hasFlag(cmd, "i", "--in-place")) {
     v.add("medium", "sed edits files in place");
     for (const t of positionals(cmd).slice(1)) judgeWrite(resolvePath(t, cwd, ctx), t, ctx, v, "sed edits");
@@ -638,13 +713,13 @@ function judgeSed(cmd: SimpleCommand, cwd: string | null, ctx: Ctx, v: Verdict):
   const inline = scripts.length === 0;
   if (inline) scripts.push(positionals(cmd)[0]?.value ?? null);
   if (scripts.some((s) => s === null || !SAFE_SED.test(s.trim()))) v.add("medium", "sed runs a script that may write files or run commands");
-  judgeReader({ ...cmd, argv: [cmd.argv[0]!, ...positionals(cmd).slice(inline ? 1 : 0)] }, "sed", cwd, ctx, v);
+  judgeReader({ ...cmd, argv: [cmd.argv[0]!, ...positionals(cmd).slice(inline ? 1 : 0)] }, "sed", parsed, cwd, ctx, v);
 }
 
-function judgeAwk(cmd: SimpleCommand, cwd: string | null, ctx: Ctx, v: Verdict): void {
+function judgeAwk(cmd: SimpleCommand, parsed: ParsedShell, cwd: string | null, ctx: Ctx, v: Verdict): void {
   const program = positionals(cmd)[0]?.value ?? null;
   if (hasFlag(cmd, "f") || program === null || /system\s*\(|\||>|getline|close\s*\(|fflush/.test(program)) {
     v.add("medium", "awk runs a program that may write files or run commands");
   }
-  judgeReader({ ...cmd, argv: [cmd.argv[0]!, ...positionals(cmd).slice(1)] }, "awk", cwd, ctx, v);
+  judgeReader({ ...cmd, argv: [cmd.argv[0]!, ...positionals(cmd).slice(1)] }, "awk", parsed, cwd, ctx, v);
 }
