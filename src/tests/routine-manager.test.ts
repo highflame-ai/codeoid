@@ -185,7 +185,7 @@ describe("routine lifecycle through the protocol", () => {
     await call({ type: "routine.run", routine: "capped" });
     await settled();
     const got = (await call({ type: "routine.get", routine: "capped" })) as RoutineSnapshotMsg;
-    expect(got.runs![0]).toMatchObject({ status: "failed", reason: "stream reset by peer" });
+    expect(got.runs![0]).toMatchObject({ status: "failed", reason: "stream reset by peer", costUnknown: true });
     expect(manager.routines!.store.getRun(got.runs![0]!.id)!.costUnknown).toBe(true);
   });
 

@@ -3,6 +3,7 @@ import {
   formatCollaborationCost,
   formatSessionCost,
   formatTokens,
+  formatTurnCost,
   formatCostUsd,
   formatDuration,
   formatPercent,
@@ -204,5 +205,14 @@ describe("formatSessionCost (#430)", () => {
   });
   it("has nothing to show before any usage", () => {
     expect(formatSessionCost(undefined).text).toBe("—");
+  });
+});
+
+describe("formatTurnCost (#430)", () => {
+  it("never shows an unknown turn as $0, and marks an estimate", () => {
+    expect(formatTurnCost(0, "unknown")).toBe("$?");
+    expect(formatTurnCost(0.42, "estimated")).toBe("~$0.42");
+    expect(formatTurnCost(0.42, "backend")).toBe("$0.42");
+    expect(formatTurnCost(0, "free")).toBe("$0");
   });
 });

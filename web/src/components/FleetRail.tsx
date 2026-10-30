@@ -13,7 +13,7 @@
 
 import { Component, For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 
-import { formatCostUsd, formatSessionCost, formatTokens } from "../lib/format";
+import { formatSessionCost, formatTokens } from "../lib/format";
 import { costShare, fleetEconomics, type FleetEconomics } from "../lib/fleet-economics";
 import { buildTimeline, groupByDay, type TimelineDay, type TimelineEntry, type TimelineKind } from "../lib/fleet-timeline";
 import {
@@ -309,7 +309,7 @@ const BackendSpendTable: Component<{ econ: FleetEconomics }> = (props) => (
               class="w-14 shrink-0 text-right text-accent"
               title={`${formatTokens(b.inputTokens)} in · ${formatTokens(b.outputTokens)} out`}
             >
-              {formatCostUsd(b.costUsd)}
+              {formatSessionCost({ totalCostUsd: b.costUsd, costEstimated: b.costEstimated, costUnknownTurns: b.costUnknownTurns }).text}
             </span>
           </li>
         )}

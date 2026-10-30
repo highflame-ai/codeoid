@@ -17,11 +17,11 @@ import { showLoops } from "./LoopsPanel";
 import {
   ctxWindowColorClass,
   elapsedSince,
-  formatCostUsd,
   formatSessionCost,
   formatDuration,
   formatPercent,
   formatTokens,
+  formatTurnCost,
 } from "../lib/format";
 import { identityLabel, identityColorClass } from "../lib/identity";
 import { authIdentity, connectionStatus, disconnect } from "../state/connection";
@@ -194,7 +194,7 @@ const SessionMetrics: Component = () => {
             </Show>
             <Show when={usage()?.lastTurnCostUsd != null}>
               <span class="text-fg-faint" title="Last turn cost / latency">
-                last {formatCostUsd(usage()?.lastTurnCostUsd)} ·{" "}
+                last {formatTurnCost(usage()?.lastTurnCostUsd, usage()?.recentTurns?.[0]?.costSource)} ·{" "}
                 {formatDuration(usage()?.recentTurns?.[0]?.durationMs)}
               </span>
             </Show>

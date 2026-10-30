@@ -54,6 +54,12 @@ export function formatSessionCost(u: CostUsage | null | undefined): { text: stri
   return { text: `${u.costEstimated ? "~" : ""}${base}${unknown > 0 ? "+" : ""}`, title: parts.join(", ") };
 }
 
+/** One turn's cost by where it came from (#430): `$?` when unknown, `~$0.42` when estimated. */
+export function formatTurnCost(usd: number | null | undefined, source?: "backend" | "estimated" | "free" | "unknown"): string {
+  if (source === "unknown") return "$?";
+  return `${source === "estimated" ? "~" : ""}${formatCostUsd(usd)}`;
+}
+
 /** Duration in ms → "1h 24m" / "2m 15s" / "8s" / "240ms". */
 export function formatDuration(ms: number | null | undefined): string {
   if (ms == null || !Number.isFinite(ms) || ms < 0) return "—";

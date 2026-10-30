@@ -150,6 +150,13 @@ describe("output", () => {
     expect(lines.at(-1)).toBe("    session s1");
   });
 
+  it("a run whose cost is partly unknown never shows as a plain figure (#430)", () => {
+    expect(formatRun(run({ costUnknown: true }), NOW)[0]).toContain("$0.042+");
+    expect(formatRun(run({ costUsd: 0, costUnknown: true }), NOW)[0]).toContain("$?");
+    expect(formatRun(run(), NOW)[0]).toContain("$0.042");
+    expect(formatRun(run(), NOW)[0]).not.toContain("+");
+  });
+
   it("the detail view spells out the safety posture", () => {
     const text = formatRoutine(routine(), [run()], NOW).join("\n");
     expect(text).toContain("autonomous (up to 50 tool calls)");

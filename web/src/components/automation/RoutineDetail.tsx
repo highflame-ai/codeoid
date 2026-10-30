@@ -8,7 +8,7 @@
 
 import { Component, For, Show, createSignal } from "solid-js";
 
-import { formatCostUsd, formatDuration, formatTokens } from "../../lib/format";
+import { formatDuration, formatSessionCost, formatTokens } from "../../lib/format";
 import {
   RUN_TRIGGER,
   isCancellableRun,
@@ -457,9 +457,9 @@ const RunRow: Component<{
         <span class="text-fg-muted">{RUN_TRIGGER[run().trigger]}</span>
         <When at={run().startedAt ?? run().createdAt} now={props.now} class="font-mono text-[11px] text-fg-faint" />
         <span class="text-fg-faint">· {formatDuration(duration())}</span>
-        <Show when={run().costUsd > 0 || run().inputTokens > 0}>
+        <Show when={run().costUsd > 0 || run().inputTokens > 0 || run().costUnknown}>
           <span class="text-fg-faint" title={`${formatTokens(run().inputTokens)} in · ${formatTokens(run().outputTokens)} out`}>
-            · {formatCostUsd(run().costUsd)}
+            · {formatSessionCost({ totalCostUsd: run().costUsd, costUnknownTurns: run().costUnknown ? 1 : 0 }).text}
           </span>
         </Show>
         <span class="ml-auto flex items-center gap-2">
