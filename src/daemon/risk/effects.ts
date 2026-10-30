@@ -59,6 +59,8 @@ export function outsideEffects(command: string, ctx: EffectContext): boolean {
       continue;
     }
     if (cmd.via.some((w) => w === "sudo" || w === "doas")) return true;
+    // A shell running its input runs something this line doesn't show.
+    if (cmd.stdinScript) return true;
     if (OUTSIDE_PROGRAMS.has(prog)) return true;
     const sub = cmd.argv[1]?.value ?? null;
     if (prog === "git" && (sub === null || GIT_OUTSIDE.has(gitSubcommand(cmd) ?? ""))) return true;

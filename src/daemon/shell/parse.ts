@@ -56,6 +56,8 @@ export interface SimpleCommand {
    * what it runs is in the commands parsed from that script, listed after it.
    */
   delegates: boolean;
+  /** A shell (or `source`) running the script its input carries: a pipe's output or a process substitution. */
+  stdinScript?: true;
   /** For a command find -exec runs: the index of that find, whose search roots its `{}` is under. */
   inputFrom?: number;
 }
@@ -193,13 +195,18 @@ class Walker {
         // ever over-states what is written.
         const redirects = [...ctx.redirects];
         let heredoc = ctx.heredoc;
+        // A substitution in these redirects (`bash < <(curl …)`) feeds the
+        // command that is the body, which isn't listed yet: patched below.
+        const owner = -2 - this.#nextPipeline++;
         for (const r of n.childrenForFieldName("redirect")) {
           if (!r) continue;
-          redirects.push(...this.redirect(r, ctx));
+          redirects.push(...this.redirect(r, ctx, owner));
           if (r.type === "heredoc_redirect" || r.type === "herestring_redirect") heredoc = true;
         }
         const body = n.childForFieldName("body");
+        const index = this.out.commands.length;
         if (body) this.node(body, { ...ctx, redirects, heredoc });
+        for (const c of this.out.commands) if (c.feeds === owner) c.feeds = body?.type === "command" ? index : null;
         return;
       }
       case "variable_assignment":
@@ -439,9 +446,13 @@ class Walker {
       const prog = basename(name.value);
       const inner = WRAPPERS[prog]?.(cmd.argv.slice(1));
       if (inner === undefined) {
-        if (!SHELLS.has(prog)) return;
-        const script = shellScript(cmd);
-        if (script === undefined) return; // a script file, or stdin from a pipe: judged as the shell itself
+        if (!SHELLS.has(prog) && prog !== "source" && prog !== ".") return;
+        const script = SHELLS.has(prog) ? shellScript(cmd) : sourcedScript(cmd);
+        if (script === undefined) return; // a script file: judged as the shell itself
+        if (script === STDIN) {
+          cmd.stdinScript = true; // judged from what feeds it
+          return;
+        }
         if (script === null) {
           this.out.problems.push(`${prog} runs a script only known at run time`);
           return;
@@ -600,13 +611,15 @@ const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "fish
 /**
  * The script a shell runs, when it's on the command line: its `-c` string,
  * or a here-document or here-string it reads. Undefined when it runs a file
- * or a pipe's output (the shell itself is judged then); null when the script
- * is only known at run time.
+ * (the shell itself is judged then); STDIN when it runs a pipe's output or a
+ * process substitution; null when the script is only known at run time.
  */
-function shellScript(cmd: SimpleCommand): string | null | undefined {
+function shellScript(cmd: SimpleCommand): string | null | undefined | typeof STDIN {
   const args = cmd.argv.slice(1);
   // `-c` runs its first operand, whatever options come between: `bash -c -e 'x'`, `sh -c -- 'x'`.
   let inline = false;
+  // `-s` reads the script from the input; its operands are arguments.
+  let fromInput = false;
   const fish = basename(cmd.argv[0]?.value ?? "") === "fish";
   let i = 0;
   for (; i < args.length; i++) {
@@ -624,17 +637,41 @@ function shellScript(cmd: SimpleCommand): string | null | undefined {
     else if (!v.startsWith("-") && !v.startsWith("+")) break;
     else if (/^[-+][a-zA-Z]+$/.test(v)) {
       if (v.startsWith("-") && v.includes("c")) inline = true;
+      if (v.startsWith("-") && v.includes("s")) fromInput = true;
       if (/[oO]$/.test(v)) i++; // `-eo pipefail`
     }
   }
   if (inline) return args[i] ? args[i]!.value : null;
-  if (i < args.length) return undefined; // a script file
-  const input = cmd.redirects.filter((r) => (r.fd === null || r.fd === 0) && (r.op.startsWith("<<") || r.op === "<<<"));
+  if (i < args.length && !fromInput) return undefined; // a script file
+  return inputOf(cmd);
+}
+
+/** What `source` / `.` runs: a file (undefined), or its input when the file is `/dev/stdin` or a `<(…)`. */
+function sourcedScript(cmd: SimpleCommand): string | null | undefined | typeof STDIN {
+  const args = cmd.argv.slice(1);
+  const file = args[0]?.value === "--" ? args[1] : args[0];
+  if (!file) return undefined;
+  if (file.value === null) return file.raw.startsWith("<(") ? STDIN : null;
+  if (file.value === "/dev/stdin" || file.value === "/dev/fd/0" || file.value === "/proc/self/fd/0") return inputOf(cmd);
+  return undefined;
+}
+
+/** A script read from the input: a here-document's or here-string's text, a pipe's or a `< <(…)`'s output (STDIN), or a `< file` (undefined). */
+function inputOf(cmd: SimpleCommand): string | null | undefined | typeof STDIN {
+  const input = cmd.redirects.filter((r) => (r.fd === null || r.fd === 0) && (r.op.startsWith("<<") || r.op === "<<<" || r.op === "<"));
   const last = input.at(-1);
-  if (!last) return undefined;
+  // A later pipeline stage, or the inside of `>(…)`, reads what's written to it.
+  if (!last) return cmd.stage > 0 || cmd.substitution === "process-out" ? STDIN : undefined;
+  if (last.op === "<") {
+    if (last.target?.value != null) return undefined; // a script file
+    return last.target?.raw.startsWith("<(") ? STDIN : null;
+  }
   if (last.op === "<<<") return last.target?.value ?? null;
   return last.body ?? null;
 }
+
+/** A shell's script is whatever its input carries. */
+const STDIN = Symbol("stdin");
 
 /** Shell options that take the next word as their value. */
 const SHELL_VALUE_OPTIONS = new Set(["-o", "+o", "-O", "+O", "--rcfile", "--init-file"]);
