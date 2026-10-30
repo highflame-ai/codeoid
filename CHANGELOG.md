@@ -14,6 +14,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `approvals.autoAllowLowRisk` lets guarded mode run low-risk reads without asking.
   The approval prompt shows the level and the reason on every surface, and rewind's "not undone by going back" list uses the same reading.
   On Claude, a high-risk command never runs on a `permissions.allow` rule without codeoid's gate seeing it.
+  Paths written with `$HOME`, paths only known at run time, a `cd`'s target, a shell running its input, variables that steer what runs (`PATH`, `LD_PRELOAD`, `GIT_*`, …) and arithmetic on variables are all read, over-stating when in doubt; a command nothing could be read of asks even with `approvals.askOnUnknown` off.
   See [docs/approvals.md](docs/approvals.md).
 
 - **End-to-end tests against a scripted backend** (#429).
