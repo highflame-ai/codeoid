@@ -280,7 +280,9 @@ const INTERPRETERS = new Set([
 ]);
 const DISK_TOOLS = new Set(["mkfs", "mke2fs", "mkfs.ext4", "mkfs.ext3", "mkfs.xfs", "mkfs.vfat", "mkfs.btrfs", "fdisk", "sfdisk", "gdisk", "parted", "wipefs", "shred", "blkdiscard", "mkswap", "hdparm", "diskutil", "format"]);
 const POWER = new Set(["shutdown", "reboot", "halt", "poweroff", "init", "telinit"]);
-const ELEVATE = new Set(["sudo", "doas", "su", "pkexec", "runas"]);
+const ELEVATE = new Set(["sudo", "doas", "su", "pkexec", "runas", "run0", "runuser", "sudoedit", "machinectl", "systemd-run"]);
+/** Run a command as root inside another root directory or namespace. */
+const ROOT_TOOLS = new Set(["chroot", "nsenter"]);
 const NET_RAW = new Set(["nc", "ncat", "netcat", "socat", "telnet"]);
 
 const flags = (cmd: SimpleCommand): string[] => cmd.argv.slice(1).map((w) => w.value ?? "").filter((x) => x.startsWith("-"));
@@ -308,6 +310,10 @@ function judgeCommand(cmd: SimpleCommand, parsed: ParsedShell, cwd: string | nul
   if (prog === null) return; // a dynamic program is already a parse problem
   if (ELEVATE.has(prog)) {
     v.add("high", `runs as another user (${prog})`);
+    return;
+  }
+  if (ROOT_TOOLS.has(prog)) {
+    v.add("high", `${prog} runs a command as root in another root or namespace`);
     return;
   }
   // A shell given a script: what the script runs is judged where it's listed.
@@ -392,6 +398,18 @@ function judgeCommand(cmd: SimpleCommand, parsed: ParsedShell, cwd: string | nul
     case "history":
       v.add("medium", "history changes the shell's history");
       return;
+    case "ssh":
+      judgeSsh(cmd, v);
+      return;
+    case "tar": {
+      // A command tar is told to run: `--to-command`, `--checkpoint-action=exec=…`, `-I prog`, `-F script`.
+      const first = cmd.argv[1]?.value ?? "";
+      const runs =
+        flags(cmd).some((f) => /^--(to-command|checkpoint-action|use-compress-program|rsh-command|rmt-command|info-script|new-volume-script)/.test(f) || /^-[a-zA-Z]*[IF]/.test(f)) ||
+        (!first.startsWith("-") && /[IF]/.test(first));
+      v.add(runs ? "unknown" : "medium", runs ? "tar runs a command it is given" : "runs tar");
+      return;
+    }
     case "sort":
       if (hasFlag(cmd, "o", "--output")) v.add("medium", "sort writes a file");
       judgeReader(cmd, prog, parsed, cwd, ctx, v);
@@ -601,6 +619,37 @@ function judgeDownloader(cmd: SimpleCommand, prog: string, v: Verdict): void {
   );
   if (sendsFile) v.add("high", `${prog} uploads a local file`);
   else v.add("medium", `${prog} fetches from the network`);
+}
+
+/** ssh options that take a value. */
+const SSH_VALUE = new Set(["-b", "-B", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-p", "-P", "-Q", "-R", "-S", "-W", "-w"]);
+
+/** ssh: a connection is medium; a command it runs, here (`ProxyCommand`, a config file) or there, isn't understood. */
+function judgeSsh(cmd: SimpleCommand, v: Verdict): void {
+  const args = cmd.argv.slice(1);
+  const operands: ShellWord[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const x = args[i]!.value;
+    if (x === null) {
+      v.add("unknown", "ssh's arguments are only known at run time");
+      return;
+    }
+    if (operands.length > 0 || x === "--" || !x.startsWith("-")) {
+      if (x !== "--") operands.push(args[i]!);
+      continue;
+    }
+    // A cluster (`-vo X`) gives the value to its first option that takes one.
+    const k = [...x.slice(1)].findIndex((c) => SSH_VALUE.has(`-${c}`));
+    if (k < 0) continue;
+    const opt = `-${x[k + 1]}`;
+    const value = x.length > k + 2 ? x.slice(k + 2) : (args[++i]?.value ?? null);
+    if ((opt === "-o" &&(value === null || /^\s*(proxycommand|localcommand|permitlocalcommand|knownhostscommand|proxyusefdpass|match)/i.test(value))) || opt === "-F") {
+      v.add("unknown", "ssh runs a local command its options name");
+      return;
+    }
+  }
+  if (operands.length > 1) v.add("unknown", "ssh runs a command on another machine");
+  else v.add("medium", "ssh connects to another machine");
 }
 
 function judgeKill(cmd: SimpleCommand, prog: string, v: Verdict): void {

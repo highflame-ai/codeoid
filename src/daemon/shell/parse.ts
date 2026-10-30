@@ -443,6 +443,11 @@ class Walker {
         this.out.problems.push(`the program to run is only known at run time (${name.raw})`);
         return;
       }
+      if (name.glob) {
+        // `/bin/r? -rf x`, `r{m,} x`: the program is whatever the pattern expands to.
+        this.out.problems.push(`the program to run is a pattern (${name.raw})`);
+        return;
+      }
       const prog = basename(name.value);
       const inner = WRAPPERS[prog]?.(cmd.argv.slice(1));
       if (inner === undefined) {
@@ -499,13 +504,13 @@ class Walker {
 type Unwrapped = { kind: "run"; argv: ShellWord[] } | { kind: "eval"; argv: ShellWord[] } | { kind: "exec"; runs: ShellWord[][] };
 
 /** Options taking a value, per wrapper: `sudo -u root` is not a command named `root`. */
-function skipOptions(args: ShellWord[], withValue: ReadonlySet<string>, opts: { stopAtNonOption?: boolean; assignments?: boolean } = {}): ShellWord[] | null {
+function skipOptions(args: ShellWord[], withValue: ReadonlySet<string>, opts: { stopAtNonOption?: boolean; assignments?: boolean; dash?: boolean } = {}): ShellWord[] | null {
   let i = 0;
   while (i < args.length) {
     const v = args[i]!.value;
     if (v === null) return null;
     if (v === "--") return args.slice(i + 1);
-    if (opts.assignments && /^[A-Za-z_][A-Za-z0-9_]*=/.test(v)) {
+    if ((opts.assignments && /^[A-Za-z_][A-Za-z0-9_]*=/.test(v)) || (opts.dash && v === "-")) {
       i++;
       continue;
     }
@@ -539,19 +544,51 @@ const WRAPPERS: Record<string, (args: ShellWord[]) => Unwrapped | null | undefin
   },
   doas: (a) => run(skipOptions(a, new Set(["-u", "-C"]))),
   env: (a) => {
-    // `env -S "…"` splits a string into a command line.
-    if (a.some((w) => w.value === "-S" || w.value?.startsWith("--split-string") || (w.value?.startsWith("-S") ?? false))) return null;
-    return run(skipOptions(a, new Set(["-u", "-C", "--unset", "--chdir"]), { assignments: true }));
+    // `env -S "…"` (or `-iS…`) splits a string into a command line; `-C` runs it elsewhere.
+    if (a.some((w) => w.value !== null && (/^-[a-zA-Z]*[SC]/.test(w.value) || w.value.startsWith("--split-string") || w.value.startsWith("--chdir")))) return null;
+    // `env -` is `env -i`.
+    return run(skipOptions(a, new Set(["-u", "--unset"]), { assignments: true, dash: true }));
   },
   nice: (a) => run(skipOptions(a, new Set(["-n", "--adjustment"]))),
   nohup: (a) => run(skipOptions(a, new Set())),
   setsid: (a) => run(skipOptions(a, new Set())),
   time: (a) => run(skipOptions(a, new Set(["-f", "-o", "--format", "--output"]))),
   command: (a) => {
-    // `command -v x` looks x up; it runs nothing.
-    if (a.some((w) => w.value === "-v" || w.value === "-V")) return undefined;
+    // `command -v x` looks x up; it runs nothing. Only its own options count: `command rm -v x` runs rm.
+    for (const w of a) {
+      if (w.value === null || w.value === "--" || !w.value.startsWith("-")) break;
+      if (/[vV]/.test(w.value)) return undefined;
+    }
     return run(skipOptions(a, new Set()));
   },
+  // `busybox rm …`: the applet is the program.
+  busybox: (a) => (a[0]?.value?.startsWith("-") ? undefined : run(a)),
+  toybox: (a) => (a[0]?.value?.startsWith("-") ? undefined : run(a)),
+  coproc: (a) => run(a),
+  // `trap 'line' SIGNAL…` runs the line when the signal comes; `trap - X` / `trap '' X` reset or ignore.
+  trap: (a) => {
+    const rest = skipOptions(a, new Set());
+    if (rest === null) return null;
+    const action = rest[0];
+    if (!action || rest.length === 1 || action.value === "-" || action.value === "") return undefined;
+    return { kind: "eval", argv: [action] };
+  },
+  // `script -c 'line'` runs the line; without -c it starts an interactive shell.
+  script: (a) => {
+    for (let i = 0; i < a.length; i++) {
+      const v = a[i]!.value;
+      if (v === null) return null;
+      if (v.startsWith("--command=")) return { kind: "eval", argv: [{ ...a[i]!, value: v.slice("--command=".length) }] };
+      if (v === "--command" || /^-[a-zA-Z]*c$/.test(v)) return a[i + 1] ? { kind: "eval", argv: [a[i + 1]!] } : null;
+      if (/^-[a-zA-Z]*c./.test(v)) return { kind: "eval", argv: [{ ...a[i]!, value: v.slice(v.indexOf("c") + 1) }] };
+    }
+    return undefined;
+  },
+  // Wrappers whose options are too many to read with certainty: what they run isn't known.
+  strace: (a) => (a.length > 0 ? null : undefined),
+  ltrace: (a) => (a.length > 0 ? null : undefined),
+  parallel: (a) => (a.length > 0 ? null : undefined),
+  unshare: (a) => (a.length > 0 ? null : undefined),
   builtin: (a) => run(a),
   exec: (a) => run(skipOptions(a, new Set(["-a"]))),
   stdbuf: (a) => run(skipOptions(a, new Set(["-i", "-o", "-e", "--input", "--output", "--error"]))),
@@ -583,10 +620,15 @@ const WRAPPERS: Record<string, (args: ShellWord[]) => Unwrapped | null | undefin
     return run(rest.slice(1));
   },
   xargs: (a) => {
-    const rest = skipOptions(a, new Set(["-I", "-i", "-n", "-P", "-d", "-E", "-e", "-L", "-l", "-s", "-a", "--max-args", "--max-procs", "--delimiter", "--eof", "--max-lines", "--max-chars", "--arg-file", "--replace"]));
+    // `-i`, `-l` and `-e` take their value attached only (`-i{}`, `-l1`).
+    const rest = skipOptions(a, new Set(["-I", "-n", "-P", "-d", "-E", "-L", "-s", "-a", "--max-args", "--max-procs", "--delimiter", "--eof", "--max-lines", "--max-chars", "--arg-file"]));
     if (rest === null) return null;
     // No command: xargs echoes. What it appends comes from input, unknown here.
-    return run(rest.length === 0 ? [lit("echo")] : [...rest, DYNAMIC_ARG]);
+    if (rest.length === 0) return run([lit("echo")]);
+    // `-I R` / `-i` / `--replace`: R in an argument is replaced by an input line.
+    const replace = xargsReplace(a.slice(0, a.length - rest.length));
+    if (replace === null) return run([...rest, DYNAMIC_ARG]);
+    return run(rest.map((w) => (w.value?.includes(replace) ? { ...DYNAMIC_ARG, raw: w.raw } : w)));
   },
   eval: (a) => ({ kind: "eval", argv: a }),
   find: (a) => {
@@ -595,8 +637,9 @@ const WRAPPERS: Record<string, (args: ShellWord[]) => Unwrapped | null | undefin
       const v = a[i]!.value;
       if (v === "-exec" || v === "-execdir" || v === "-ok" || v === "-okdir") {
         const argv: ShellWord[] = [];
+        // GNU find replaces `{}` anywhere in an argument: `{}/`, `sh -c 'rm {}'`.
         for (i++; i < a.length && a[i]!.value !== ";" && a[i]!.value !== "+"; i++) {
-          argv.push(a[i]!.value === "{}" ? DYNAMIC_ARG : a[i]!);
+          argv.push(a[i]!.value?.includes("{}") ? { ...DYNAMIC_ARG, raw: a[i]!.raw } : a[i]!);
         }
         runs.push(argv);
       }
@@ -605,8 +648,23 @@ const WRAPPERS: Record<string, (args: ShellWord[]) => Unwrapped | null | undefin
   },
 };
 
+/** The replace string of xargs's options, or null when it appends its input. */
+function xargsReplace(options: ShellWord[]): string | null {
+  let replace: string | null = null;
+  for (let i = 0; i < options.length; i++) {
+    const v = options[i]!.value ?? "";
+    if (v === "-I") replace = options[++i]?.value ?? "{}";
+    else if (v.startsWith("--replace")) replace = v.startsWith("--replace=") ? v.slice("--replace=".length) : "{}";
+    else if (/^-[a-zA-Z0-9]*[Ii]/.test(v) && !v.startsWith("--")) {
+      const k = v.search(/[Ii]/);
+      replace = v.slice(k + 1) || (v[k] === "I" ? (options[++i]?.value ?? "{}") : "{}");
+    }
+  }
+  return replace;
+}
+
 /** Shells that run a string given with `-c`. */
-const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "fish", "busybox"]);
+const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "fish"]);
 
 /**
  * The script a shell runs, when it's on the command line: its `-c` string,
