@@ -86,6 +86,10 @@ export interface CompareTargetState {
   /** The branch's reply to the prompt (that turn's only; shortened). Set once done. */
   reply?: string;
   costUsd?: number;
+  /** Some of `costUsd` is estimated from tokens (#430). */
+  costEstimated?: boolean;
+  /** Turns of this branch whose cost isn't known — not in `costUsd`. */
+  costUnknownTurns?: number;
   durationMs?: number;
   inputTokens?: number;
   outputTokens?: number;

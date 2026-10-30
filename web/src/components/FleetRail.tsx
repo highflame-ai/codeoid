@@ -13,7 +13,7 @@
 
 import { Component, For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 
-import { formatCostUsd, formatTokens } from "../lib/format";
+import { formatSessionCost, formatTokens } from "../lib/format";
 import { costShare, fleetEconomics, type FleetEconomics } from "../lib/fleet-economics";
 import { buildTimeline, groupByDay, type TimelineDay, type TimelineEntry, type TimelineKind } from "../lib/fleet-timeline";
 import {
@@ -138,9 +138,9 @@ const FleetRail: Component = () => {
             onClick={() => setShowSpend((v) => !v)}
             aria-expanded={showSpend()}
             class="ml-auto rounded px-1 text-accent transition hover:bg-bg-hover"
-            title="Fleet cost across every backend — click for the per-backend split"
+            title={`Fleet cost across every backend (${formatSessionCost(board().agg).title}) — click for the per-backend split`}
           >
-            {formatCostUsd(board().agg.totalCostUsd)} {showSpend() ? "▾" : "▸"}
+            {formatSessionCost(board().agg).text} {showSpend() ? "▾" : "▸"}
           </button>
         </div>
         <Show when={showSpend()}>
@@ -309,7 +309,7 @@ const BackendSpendTable: Component<{ econ: FleetEconomics }> = (props) => (
               class="w-14 shrink-0 text-right text-accent"
               title={`${formatTokens(b.inputTokens)} in · ${formatTokens(b.outputTokens)} out`}
             >
-              {formatCostUsd(b.costUsd)}
+              {formatSessionCost({ totalCostUsd: b.costUsd, costEstimated: b.costEstimated, costUnknownTurns: b.costUnknownTurns }).text}
             </span>
           </li>
         )}

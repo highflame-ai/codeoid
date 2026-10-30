@@ -46,7 +46,7 @@ const reply = (text: string, cost = 0.05): ProviderEvent[] => [
   { type: "text_done", content: text } as ProviderEvent,
   {
     type: "turn_done",
-    result: { providerId: "claude", model: "mock", inputTokens: 40, outputTokens: 9, cacheReadTokens: 0, cacheCreationTokens: 0, totalCostUsd: cost, durationMs: 3 },
+    result: { providerId: "claude", model: "mock", inputTokens: 40, outputTokens: 9, cacheReadTokens: 0, cacheCreationTokens: 0, totalCostUsd: cost, costSource: "backend", durationMs: 3 },
   } as ProviderEvent,
 ];
 /** A turn that asks to run a shell command — parks unless auto-approved. */
@@ -54,7 +54,7 @@ const shell: ProviderEvent[] = [
   { type: "tool_start", toolId: "t1", sdkToolUseId: "u1", name: "Bash", input: { command: "rm -rf build" }, approvalId: "a1" } as ProviderEvent,
 ];
 
-function mkConfig(tmp: string): CodeoidConfig {
+function mkConfig(tmp: string, session: Record<string, unknown> = {}): CodeoidConfig {
   return {
     daemonUrl: "ws://127.0.0.1:7400",
     dbPath: join(tmp, "codeoid.db"),
@@ -66,7 +66,7 @@ function mkConfig(tmp: string): CodeoidConfig {
     labeling: {},
     telemetry: { osc8: "auto" },
     autoRotate: { enabled: false, warnPct: 0.6, rotatePct: 0.8, hardRotatePct: 0.9, minTurnsBeforeRotate: 3, strategy: "task-anchor" },
-    session: {},
+    session,
     conductor: { enabled: false, name: "conductor", provider: "claude" },
     routines: { enabled: true, tickMs: 600_000, maxConcurrentRuns: 2, minIntervalSeconds: 60, apiFiresPerHour: 30, missedGraceSeconds: 120 },
   } as CodeoidConfig;
@@ -79,6 +79,8 @@ let transcript: TranscriptStore;
 let manager: SessionManager;
 let providers: MockSessionProvider[];
 let nextScript: ProviderEvent[][];
+/** The next backend's stream goes silent after its script (a hung provider). */
+let nextStall = false;
 let hookFile: string;
 let registry: ProviderRegistry;
 
@@ -110,13 +112,14 @@ beforeEach(() => {
   transcript = new TranscriptStore(join(tmp, "transcripts"));
   providers = [];
   nextScript = [reply("Found 2 stale PRs: #12, #15.")];
+  nextStall = false;
   hookFile = join(tmp, "hook.json");
   registry = new ProviderRegistry("claude");
   registry.register({
     id: "claude",
     displayName: "claude",
     create: () => {
-      const p = new MockSessionProvider("claude", nextScript.map((t) => [...t]));
+      const p = new MockSessionProvider("claude", nextScript.map((t) => [...t]), { stall: nextStall });
       providers.push(p);
       return p;
     },
@@ -175,6 +178,33 @@ describe("routine lifecycle through the protocol", () => {
     expect(audits.at(-1)!.subject).toBe(`routine:${created.routine.id}`);
   });
 
+  it("a capped run whose real turn fails mid-way: the run carries the real error and its spend, unknown here (#430)", async () => {
+    // The model worked (a text delta), then the backend failed with no result: what it spent is unknown.
+    nextScript = [[{ type: "text_delta", content: "working…" } as ProviderEvent, { type: "error", message: "stream reset by peer" } as ProviderEvent]];
+    await create({ name: "capped", maxCostUsd: 1 });
+    await call({ type: "routine.run", routine: "capped" });
+    await settled();
+    const got = (await call({ type: "routine.get", routine: "capped" })) as RoutineSnapshotMsg;
+    expect(got.runs![0]).toMatchObject({ status: "failed", reason: "stream reset by peer", costUnknown: true });
+    expect(manager.routines!.store.getRun(got.runs![0]!.id)!.costUnknown).toBe(true);
+  });
+
+  it("a run whose backend stalls and is recovered still carries that turn's spend, unknown here (#430)", async () => {
+    // A backend that streams, then goes silent: the session recovers the stalled turn.
+    await manager.drain(2_000).catch(() => {});
+    manager = new SessionManager(store, transcript, undefined, undefined, undefined, {
+      config: mkConfig(tmp, { turnStallTimeoutMs: 150 }),
+      providers: registry,
+    });
+    nextStall = true;
+    nextScript = [[{ type: "text_delta", content: "working…" } as ProviderEvent]];
+    await create({ name: "stalls", dailyCostUsd: 5 });
+    await call({ type: "routine.run", routine: "stalls" });
+    await settled();
+    const got = (await call({ type: "routine.get", routine: "stalls" })) as RoutineSnapshotMsg;
+    expect(manager.routines!.store.getRun(got.runs![0]!.id)!.costUnknown).toBe(true);
+  });
+
   it("lists, pages runs, previews, pauses, and deletes", async () => {
     await create({});
     await call({ type: "routine.run", routine: "triage" });
@@ -208,6 +238,19 @@ describe("routine lifecycle through the protocol", () => {
     expect(s?.status).toBe("waiting_approval");
     // Once the run has ended, the session is the owner's to act on.
     expect(s?.managedBy).toBeUndefined();
+  });
+
+  it("a parked run the owner approves, whose turn then fails mid-way, records that turn's unknown cost (#430)", async () => {
+    nextScript = [[...shell, { type: "text_delta", content: "running it" } as ProviderEvent, { type: "error", message: "backend died" } as ProviderEvent]];
+    await create({ approvals: "guarded" });
+    await call({ type: "routine.run", routine: "triage" });
+    await settled();
+    const run = ((await call({ type: "routine.get", routine: "triage" })) as RoutineSnapshotMsg).runs![0]!;
+    expect(run.status).toBe("needs_attention");
+    await call({ type: "session.approve", sessionId: run.sessionId, approvalId: "a1", decision: "allow" });
+    const rows = manager.routines!.store;
+    for (let i = 0; i < 100 && !rows.getRun(run.id)!.costUnknown; i++) await new Promise((r) => setTimeout(r, 20));
+    expect(rows.getRun(run.id)!.costUnknown).toBe(true);
   });
 
   it("an in-flight run's session is marked managedBy=routine", async () => {

@@ -372,6 +372,16 @@ export class CodexProvider implements SessionProvider {
    * counts. Captured here and folded into turn_done.
    */
   #lastTokenUsage: CodexTokenUsage | null = null;
+  /**
+   * The thread's running total (`tokenUsage.total`) as last reported, and its
+   * value when this turn started (#430). A turn makes many model requests and
+   * `last` is only the latest one; the turn's usage is the total's change.
+   * Null until the thread reports one; reset with the thread.
+   */
+  #threadTotal: CodexTokenUsage | null = null;
+  #turnBaseTotal: CodexTokenUsage | null = null;
+  /** Model requests reported in this turn. */
+  #turnRequests = 0;
   /** Window codex reported for the model driving this thread, if it has. */
   #modelContextWindow: number | null = null;
   /** item id → {name, input} for items already announced via tool_start. */
@@ -457,6 +467,8 @@ export class CodexProvider implements SessionProvider {
     this.#pendingNative = null;
     this.#backingSessionId = newBackingId;
     this.#threadId = null;
+    this.#threadTotal = null; // a new thread's total starts over (#430)
+    this.#turnBaseTotal = null; // ...so a turn's base is taken from its first report
     this.#hasQueried = false;
   }
 
@@ -667,6 +679,8 @@ export class CodexProvider implements SessionProvider {
     this.#approvalsInFlight.clear();
     this.#patchChangedInFlight.clear();
     this.#lastTokenUsage = null;
+    this.#turnBaseTotal = this.#threadTotal;
+    this.#turnRequests = 0;
     // Per turn, like the usage beside it. This provider instance outlives a
     // `/model` switch or a pipeline overrideModel, so a turn interrupted before
     // its first token-usage notification would otherwise report the PREVIOUS
@@ -761,6 +775,8 @@ export class CodexProvider implements SessionProvider {
     this.#proc?.kill();
     this.#proc = null;
     this.#threadId = null;
+    this.#threadTotal = null; // a new thread's total starts over (#430)
+    this.#turnBaseTotal = null; // ...so a turn's base is taken from its first report
     if (this.#memoryToken) {
       this.#memoryMcp?.endpoint.revoke(this.#memoryToken);
       this.#memoryToken = null;
@@ -883,6 +899,9 @@ export class CodexProvider implements SessionProvider {
         onNotification: (method, params) => this.#onNotification(method, params),
         onServerRequest: (method, params) => this.#onServerRequest(method, params),
         onExit: ({ code, signal, stderrTail }) => {
+          // The process is gone: whatever thread comes next reports its own total (#430).
+          this.#threadTotal = null;
+          this.#turnBaseTotal = null;
           const queue = this.#turnQueue;
           if (queue && !queue.closed) {
             this.#push({
@@ -918,6 +937,8 @@ export class CodexProvider implements SessionProvider {
         })) as { thread?: { id?: string }; model?: string };
         if (resumed.thread?.id) {
           this.#threadId = resumed.thread.id;
+          this.#threadTotal = null; // a new thread's total starts over (#430)
+          this.#turnBaseTotal = null; // ...so a turn's base is taken from its first report
           this.#threadModel = resumed.model ?? null;
           this.#configEffort = undefined;
           return;
@@ -954,6 +975,8 @@ export class CodexProvider implements SessionProvider {
     // is no longer the session's, and must not overwrite its backing id.
     if (!this.#proc) return;
     this.#threadId = id;
+    this.#threadTotal = null; // a new thread's total starts over (#430)
+    this.#turnBaseTotal = null; // ...so a turn's base is taken from its first report
     if (this.#backingSessionId === id) return;
     this.#backingSessionId = id;
     try {
@@ -1173,18 +1196,31 @@ export class CodexProvider implements SessionProvider {
       }
       case "turn/completed": {
         const turn = params.turn as Record<string, unknown> | undefined;
-        const u = this.#lastTokenUsage;
+        // The whole turn: the change in the thread's running total across it
+        // (#430) — or, from a codex that sends no total, its last request.
+        // A codex that sends no total: its last request is the turn only when
+        // the turn made one request; for more, the turn's usage isn't known.
+        const u = this.#threadTotal
+          ? usageDelta(this.#threadTotal, this.#turnBaseTotal)
+          : this.#turnRequests <= 1
+            ? this.#lastTokenUsage
+            : null;
         // Match the claude convention: inputTokens = NEW tokens (cache reads
         // excluded); codex's inputTokens INCLUDES its cachedInputTokens.
         const cacheRead = u?.cachedInputTokens ?? 0;
         const result: NormalizedTurnResult = {
           providerId: this.id,
-          model: this.#turnModel,
+          // The model the thread actually runs when none was chosen, so the turn can be priced.
+          model: this.#turnModel === "codex" ? (this.#threadModel ?? this.#turnModel) : this.#turnModel,
           inputTokens: Math.max(0, (u?.inputTokens ?? 0) - cacheRead),
           outputTokens: u?.outputTokens ?? 0,
           cacheReadTokens: cacheRead,
           cacheCreationTokens: 0,
           totalCostUsd: 0,
+          // No usage reported for the turn: its cost can't be known (#430), not $0.
+          // A completed turn with no usage ran without saying what it spent (#430). A failed one is
+          // left to the session: $0 if the model never ran, else priced from its requests or unknown.
+          ...(u || turn?.status !== "completed" ? {} : { costSource: "unknown" as const }),
           durationMs: Date.now() - this.#turnStartedAt,
           ...(this.#modelContextWindow !== null
             ? { contextWindow: this.#modelContextWindow }
@@ -1207,9 +1243,36 @@ export class CodexProvider implements SessionProvider {
         // only `last` and inferred the window from the model id instead, which
         // is the guess this change exists to stop making.
         const tu = params.tokenUsage as
-          | { last?: CodexTokenUsage; modelContextWindow?: number }
+          | { last?: CodexTokenUsage; total?: CodexTokenUsage; modelContextWindow?: number }
           | undefined;
-        if (tu?.last) this.#lastTokenUsage = tu.last;
+        if (tu?.last) {
+          this.#lastTokenUsage = tu.last;
+          this.#turnRequests += 1;
+          // One model request: what the session's context figure is made of.
+          if (this.#turnQueue) {
+            const cached = tu.last.cachedInputTokens ?? 0;
+            try {
+              this.#turnQueue.push({
+                type: "llm_call",
+                isPrimary: true,
+                usage: {
+                  inputTokens: Math.max(0, (tu.last.inputTokens ?? 0) - cached),
+                  cacheReadTokens: cached,
+                  cacheCreationTokens: 0,
+                  outputTokens: tu.last.outputTokens ?? 0,
+                },
+              });
+            } catch {
+              // The turn's queue already closed.
+            }
+          }
+        }
+        if (tu?.total) {
+          // The first report of a turn on a thread whose earlier total we never
+          // saw (resumed, or forked): the total before this request.
+          if (!this.#turnBaseTotal && tu.last) this.#turnBaseTotal = usageDelta(tu.total, tu.last);
+          this.#threadTotal = tu.total;
+        }
         if (typeof tu?.modelContextWindow === "number" && tu.modelContextWindow > 0) {
           this.#modelContextWindow = tu.modelContextWindow;
         }
@@ -1545,4 +1608,16 @@ export function toCodexEffort(effort: EffortLevel): string {
 export function fromCodexEffort(effort: string | undefined): EffortLevel | null {
   if (effort === "none") return "off";
   return effort && (EFFORT_LEVELS as readonly string[]).includes(effort) ? (effort as EffortLevel) : null;
+}
+
+/** `to - from`, field by field, never below zero; `from` null = from nothing (#430). */
+function usageDelta(to: CodexTokenUsage, from: CodexTokenUsage | null): CodexTokenUsage {
+  const d = (k: keyof CodexTokenUsage) => Math.max(0, (to[k] ?? 0) - (from?.[k] ?? 0));
+  return {
+    totalTokens: d("totalTokens"),
+    inputTokens: d("inputTokens"),
+    cachedInputTokens: d("cachedInputTokens"),
+    outputTokens: d("outputTokens"),
+    reasoningOutputTokens: d("reasoningOutputTokens"),
+  };
 }

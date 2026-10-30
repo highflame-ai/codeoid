@@ -129,6 +129,37 @@ export interface RunSessionInfo {
   /** A provider dialog or an approval is waiting on the owner. */
   waitingOn: string | null;
   costUsd: number;
+  /** Turns whose cost isn't known (#430): no price for the model, or no token counts. */
+  costUnknownTurns?: number;
+  /** A turn is running or still draining: its spend isn't recorded yet (#430). */
+  turnInFlight?: boolean;
+  /**
+   * Background agents still at work (#430): they spend after the turn that
+   * started them. Shells and watchers aren't counted — they make no model calls.
+   */
+  backgroundTasks?: number;
+  /** Every live background task, shells and monitors included: they can wake the agent later, so a run's end stops them (#430). */
+  liveBackgroundTasks?: number;
+  /** Ids of every live background task: a run stops only the ones it started (#430). */
+  backgroundTaskIds?: string[];
+  /** Tasks that settled, their results still waiting to wake the agent. */
+  pendingReportTaskIds?: string[];
+  /** Ids of the live background agents (the tasks counted in `backgroundTasks`). */
+  spendingTaskIds?: string[];
+  /**
+   * Who started the latest turn (#430): a person with their own token
+   * (`user`), the backend or a wake on its own (`agent`), or someone acting
+   * for another — a routine's prompt, a delegated token (`delegated`).
+   */
+  lastTurnOrigin?: "user" | "agent" | "delegated";
+  /** The request the main turn waits on, when it waits on one. */
+  waitingApprovalId?: string | null;
+  /** Whose each background task (live, or with a result to deliver) is: the turn that started it. */
+  taskOrigins?: Record<string, "user" | "agent" | "delegated">;
+  /** Background tasks the backend runs for itself (a watcher), not the agent's work. */
+  ambientTaskIds?: string[];
+  /** A turn is actually running — not only draining, or a wake still to come. */
+  turnRunning?: boolean;
   inputTokens: number;
   outputTokens: number;
   /** Clients attached right now — a person may be reading or typing. */
@@ -139,6 +170,58 @@ export interface RunSessionInfo {
    * length, which context rotation can shrink mid-run.
    */
   lastTurnId: string | null;
+}
+
+/** A session's spend totals, as a run counts them. */
+interface Totals {
+  costUsd: number;
+  inputTokens: number;
+  outputTokens: number;
+  unknownTurns: number;
+}
+
+/**
+ * A routine run's hold on its session (#430): from the run's start, and
+ * after it ends, what the session spends is that run's.
+ */
+interface Trailing {
+  runId: string;
+  routineId: string;
+  /** 00:00 UTC of the day the run was created: its row counts for that day. */
+  day: number;
+  base: Totals;
+  /** The newest turn before the run: its reply is a later one. */
+  turn: string | null;
+  /** Background tasks live when the run started: the owner's, never stopped or waited on. */
+  baseTasks: Set<string>;
+  /** Ended needs_attention, and the call it waits on isn't decided yet. */
+  parked: boolean;
+  /** The request the run parked on: the owner's yes to it hands that turn over. */
+  parkedOn?: string | null;
+  /** The turn that parked, the session's totals and the run's tasks then: anything new while it waits ends the wait. */
+  parkTurn?: string | null;
+  parkTotals?: Totals;
+  parkTasks?: Set<string>;
+  /** The turn the owner took over (approved its call, or joined it): theirs, never stopped. */
+  ownerTurn?: string | null;
+  /** The run's tasks the owner took over with its parked turn, and what that turn started since. */
+  adopted: Set<string>;
+  /** The owner's turn came to rest: its reply becomes the run's summary then. */
+  summaryDue?: boolean;
+  /** Spend that couldn't be counted (agents stopped mid-work): the run's cost is unknown. */
+  uncounted?: boolean;
+  /** ...and the run's row says so. */
+  uncountedWritten?: boolean;
+  /** The totals last counted: unchanged, nothing is written. */
+  last?: Totals;
+  /** Spend on a later UTC day than the run's, counted against that day as well. */
+  carry?: { day: number; base: Totals };
+  /** The turn already being stopped: stopping it again would only repeat the notice. */
+  stoppedTurn?: string | null;
+  /** Later UTC days on which the run's cost became uncountable: those days are uncountable too. */
+  unknownDays?: Set<number>;
+  /** Last seen working (a turn, a queued one, background tasks, a wait): a destroy then loses that spend. */
+  busy?: boolean;
 }
 
 export interface CreateRunSessionOpts {
@@ -168,6 +251,14 @@ export interface RoutineRunEvent {
   push: boolean;
 }
 
+/** Why a daily-capped run didn't start: today's spend can't be counted (#430). */
+export const UNKNOWN_DAILY_REASON =
+  "daily spend cap can't be kept: a run today spent an amount whose cost isn't known (no price for the model). Set pricing.models for it; the cap counts again from tomorrow (UTC)";
+
+/** Why a capped run stopped on a turn it couldn't price (#430). */
+export const UNKNOWN_COST_REASON =
+  "stopped: this routine has a spend cap, and the cost of its last turn isn't known (no price for the model, or the backend reports no token counts). Set pricing.models for the model, or remove the cap (docs/routines.md)";
+
 export interface RoutineHost {
   createSession(opts: CreateRunSessionOpts): Promise<string>;
   /** The session still exists and belongs to this tenant. */
@@ -188,7 +279,18 @@ export interface RoutineHost {
   result(sessionId: string, sinceTurnId: string | null): { text: string | null; error: string | null };
   /** Mark the session as running unattended (provider dialogs don't park); returns the release. */
   beginUnattended(sessionId: string): () => void;
-  interrupt(sessionId: string): Promise<void>;
+  /**
+   * Stop the session's turn — and, with none running, its background work.
+   * `turnOnly` stops a running turn and nothing else; `keepQueuedSends`
+   * spares messages still waiting for their turn.
+   */
+  interrupt(sessionId: string, opts?: { turnOnly?: boolean; keepQueuedSends?: boolean }): Promise<void>;
+  /** Stop these background tasks and only these (#430): a run's, never the owner's. */
+  stopBackgroundTasks(sessionId: string, ids: readonly string[]): Promise<void>;
+  /** What became of a tool call's approval: still pending, approved by its owner with their own token, or gone (denied, withdrawn, someone else's). */
+  approvalState(sessionId: string, approvalId: string): "pending" | "owner" | "gone";
+  /** Tear the session's backend down: a turn that wouldn't stop. */
+  terminate(sessionId: string): Promise<void>;
   destroy(sessionId: string): Promise<void>;
   /** A run reached a terminal status: push per `event.push`, hooks always. Best effort. */
   runFinished(event: RoutineRunEvent): void;
@@ -468,6 +570,28 @@ function commandDigest(command: string | undefined): string {
 }
 
 /** Midnight UTC of the day `ms` falls in — the daily spend cap's window. */
+/** How long a stop on a held session gets to land before it's tried again, and how often it is. */
+const STOP_RETRY_MS = 10_000;
+const STOP_TRIES = 3;
+
+function totalsOf(info: RunSessionInfo): Totals {
+  return { costUsd: info.costUsd, inputTokens: info.inputTokens, outputTokens: info.outputTokens, unknownTurns: info.costUnknownTurns ?? 0 };
+}
+
+/** What a run spent from its baseline to now, as its row records it. */
+function usageSince(t: Trailing, info: RunSessionInfo): Pick<RunRow, "costUsd" | "inputTokens" | "outputTokens" | "costUnknown"> {
+  return {
+    costUsd: Math.max(0, info.costUsd - t.base.costUsd),
+    inputTokens: Math.max(0, info.inputTokens - t.base.inputTokens),
+    outputTokens: Math.max(0, info.outputTokens - t.base.outputTokens),
+    ...((info.costUnknownTurns ?? 0) > t.base.unknownTurns || t.uncounted ? { costUnknown: true } : {}),
+  };
+}
+
+function sameTotals(a: Totals | undefined, b: Totals): boolean {
+  return !!a && a.costUsd === b.costUsd && a.inputTokens === b.inputTokens && a.outputTokens === b.outputTokens && a.unknownTurns === b.unknownTurns;
+}
+
 function utcDayStart(ms: number): number {
   const d = new Date(ms);
   d.setUTCHours(0, 0, 0, 0);
@@ -523,17 +647,21 @@ export class RoutineService {
   readonly config: RoutinesConfig;
   readonly #now: () => number;
   readonly #sleep: (ms: number) => Promise<void>;
+  /** Call `fn` after `ms`; returns the cancel. */
+  readonly #after: (ms: number, fn: () => void) => () => void;
   #timer: ReturnType<typeof setInterval> | null = null;
   #ticking = false;
   readonly #live = new Map<string, LiveRun>();
   /** sessionId → the live run waiting on it. */
   readonly #bySession = new Map<string, LiveRun>();
   /**
-   * Runs that ended needs_attention, by session. The owner may approve and the
-   * agent finish later; its spend and reply still belong to that run (and to
-   * the daily cap), so they are folded in when the session settles.
+   * The last run on each routine session, after it ended (#430). Everything a
+   * routine's session spends counts against the routine: what happens there
+   * after the run — the work the owner approved on a parked run, a turn the
+   * backend starts on its own, the owner carrying the conversation on — is
+   * folded into that run when the session changes, so the daily cap sees it.
    */
-  readonly #parked = new Map<string, { runId: string; base: Pick<RunRow, "costUsd" | "inputTokens" | "outputTokens">; turn: string | null }>();
+  readonly #trailing = new Map<string, Trailing>();
   /** Routines being deleted: nothing fires or starts for them, and a run that ends meanwhile (its loop cancelled) tells no one. */
   readonly #deleting = new Set<string>();
   #stopped = false;
@@ -542,13 +670,20 @@ export class RoutineService {
     store: RoutineStore,
     host: RoutineHost,
     config: Partial<RoutinesConfig> = {},
-    deps: { now?: () => number; sleep?: (ms: number) => Promise<void> } = {},
+    deps: { now?: () => number; sleep?: (ms: number) => Promise<void>; timer?: (ms: number, fn: () => void) => () => void } = {},
   ) {
     this.#store = store;
     this.#host = host;
     this.config = { ...DEFAULT_ROUTINES_CONFIG, ...config };
     this.#now = deps.now ?? Date.now;
     this.#sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+    this.#after =
+      deps.timer ??
+      ((ms, fn) => {
+        const h = setTimeout(fn, ms);
+        h.unref?.();
+        return () => clearTimeout(h);
+      });
   }
 
   get store(): RoutineStore {
@@ -582,6 +717,7 @@ export class RoutineService {
     this.#stopped = true;
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = null;
+    for (const id of [...this.#trailing.keys()]) this.#dropTrailing(id);
     for (const live of this.#live.values()) {
       live.cancelled = "the daemon stopped while this run was in flight";
       live.interrupted = true;
@@ -889,7 +1025,14 @@ export class RoutineService {
     const spec = routine.spec;
     const startedAt = this.#now();
     const subject = `routine:${routine.id}`;
-    const finish = (status: RunStatus, extra: Partial<RunRow>): RunRow => this.#finishRun(routine, run, live.sessionId, status, extra);
+    /** From the run's baseline on: its hold on the session (see #trailing). */
+    let trail: Trailing | null = null;
+    let endedAs: RunStatus | null = null;
+    const finish = (status: RunStatus, extra: Partial<RunRow>): RunRow => {
+      endedAs = status;
+      if (trail && extra.costUnknown) this.#markUncounted(trail);
+      return this.#finishRun(routine, run, live.sessionId, status, extra);
+    };
     /** A cancel and a daemon stop both end the run; only one is the owner's doing. */
     const stopped = (extra: Partial<RunRow> = {}): RunRow =>
       finish(live.interrupted ? "interrupted" : "cancelled", { reason: live.cancelled, ...extra });
@@ -898,6 +1041,13 @@ export class RoutineService {
       // Daily spend cap — checked at start, not at admission, so a queued run
       // sees the spend of the runs that went before it.
       if (spec.dailyCostUsd !== undefined) {
+        // What the routine's sessions spent since they last reported is today's too.
+        for (const [id, t] of this.#trailing) if (t.routineId === routine.id) this.#flushTrailing(id);
+        // Today's spend can't be counted once a run spent an unknown amount (#430).
+        if (this.#store.unknownCostSince(routine.id, utcDayStart(startedAt))) {
+          finish("skipped", { reason: UNKNOWN_DAILY_REASON });
+          return;
+        }
         const spent = this.#store.costSince(routine.id, utcDayStart(startedAt));
         if (spent >= spec.dailyCostUsd) {
           finish("skipped", { reason: `daily spend cap reached ($${spent.toFixed(2)} of $${spec.dailyCostUsd.toFixed(2)} today, UTC)` });
@@ -965,7 +1115,15 @@ export class RoutineService {
           // earlier run may still be waiting on them there. A prompt sent now
           // would join their turn, so this fire stands down instead.
           const k = this.#host.info(kept);
-          const busy = !k || this.#parked.has(kept) || k.waitingOn !== null || k.turnQueued || (k.status !== "idle" && k.status !== "error");
+          const busy =
+            !k ||
+            this.#trailing.get(kept)?.parked === true ||
+            k.waitingOn !== null ||
+            k.turnQueued ||
+            k.turnInFlight === true ||
+            // Background work of the owner's still going: theirs, and a run would run beside it.
+            (k.liveBackgroundTasks ?? 0) - (k.ambientTaskIds?.length ?? 0) > 0 ||
+            (k.status !== "idle" && k.status !== "error");
           if (busy) {
             // No session on the row: the owner was already told about the park,
             // and this skip is no reason to point them at it again.
@@ -1025,14 +1183,94 @@ export class RoutineService {
       const baseIn = before?.inputTokens ?? 0;
       const baseOut = before?.outputTokens ?? 0;
       const baseTurn = before?.lastTurnId ?? null;
-      const usage = (): Pick<RunRow, "costUsd" | "inputTokens" | "outputTokens"> => {
+      const baseUnknown = before?.costUnknownTurns ?? 0;
+      // The session's spend since the last run's end is that run's; from here on it is this one's.
+      this.#flushTrailing(sessionId);
+      this.#dropTrailing(sessionId);
+      const base: Totals = { costUsd: baseCost, inputTokens: baseIn, outputTokens: baseOut, unknownTurns: baseUnknown };
+      // What was running before the run is the owner's: the run counts and stops only what it started (#430).
+      const baseTasks = new Set(before?.backgroundTaskIds ?? []);
+      trail = { runId: run.id, routineId: routine.id, day: utcDayStart(run.createdAt), base, turn: baseTurn, baseTasks, adopted: new Set(), parked: false, last: base };
+      // Its tasks still live, and those that settled with a result still to wake the agent.
+      const runTasks = (i: RunSessionInfo | null): string[] =>
+        [...new Set([...(i?.backgroundTaskIds ?? []), ...(i?.pendingReportTaskIds ?? [])])].filter((id) => !baseTasks.has(id));
+      const runSpending = (i: RunSessionInfo | null): number =>
+        i?.spendingTaskIds ? i.spendingTaskIds.filter((id) => !baseTasks.has(id)).length : (i?.backgroundTasks ?? 0);
+      const capped = spec.maxCostUsd !== undefined || spec.dailyCostUsd !== undefined;
+      /** A stopped turn that never settled: whatever it spent lands after the run is recorded. */
+      let unsettled = false;
+      const usage = (): Pick<RunRow, "costUsd" | "inputTokens" | "outputTokens" | "costUnknown"> => {
         const i = this.#host.info(sessionId as string);
+        // Gone mid-run (destroyed): what it was last seen to have spent, and
+        // the turn then in flight was never recorded, so the cost is unknown (#430).
+        const now = i ? totalsOf(i) : (trail?.last ?? base);
         return {
-          costUsd: Math.max(0, (i?.costUsd ?? baseCost) - baseCost),
-          inputTokens: Math.max(0, (i?.inputTokens ?? baseIn) - baseIn),
-          outputTokens: Math.max(0, (i?.outputTokens ?? baseOut) - baseOut),
+          costUsd: Math.max(0, now.costUsd - baseCost),
+          inputTokens: Math.max(0, now.inputTokens - baseIn),
+          outputTokens: Math.max(0, now.outputTokens - baseOut),
+          // However the run ends, a turn of unknown cost in it is on the record (#430).
+          ...(now.unknownTurns > baseUnknown || unsettled || !i ? { costUnknown: true } : {}),
         };
       };
+      /**
+       * Wind the run down and wait for it to settle; spend is recorded when a
+       * turn ends, after the stop (#430). The status is no signal: a stop
+       * shows idle at once, while the turn still drains.
+       *
+       * Forced (a limit, a cap, a cancel): everything stops — the turn, the
+       * messages still waiting for theirs (a wake among them), and results
+       * waiting to wake the agent. Then, either way, the background tasks the
+       * run started (never the owner's), and a turn the backend starts on its
+       * own meanwhile; that one's spend is unknown. A message from the owner
+       * is theirs and ends the wait. What won't settle is counted unknown.
+       * Anything that still slips past is the routine's spend all the same
+       * (see #trailing).
+       */
+      const windDown = async (force: boolean): Promise<void> => {
+        const id = sessionId as string;
+        const atStop = this.#host.info(id);
+        // Background agents stopped here spent what isn't the run's to count reliably yet.
+        if (runSpending(atStop)) unsettled = true;
+        let turnAtStop = atStop?.lastTurnId ?? null;
+        // Turn-only: the owner's background work is theirs; the run's own is stopped below.
+        if (force) await this.#host.interrupt(id, { turnOnly: true }).catch(() => {});
+        let stoppedTasks = false;
+        let quiet = 0;
+        for (let i = 0; i < 100; i++) {
+          const info = this.#host.info(id);
+          if (!info) return;
+          if (info.turnInFlight && info.lastTurnId !== turnAtStop) {
+            turnAtStop = info.lastTurnId;
+            unsettled = true;
+            if ((info.lastTurnOrigin ?? "user") === "user") {
+              // The owner took over: their turn isn't the run's to stop — what the run started still is.
+              const left = runTasks(info).filter((id) => info.taskOrigins?.[id] !== "user");
+              if (left.length > 0) await this.#host.stopBackgroundTasks(id, left).catch(() => {});
+              return;
+            }
+            quiet = 0;
+            await this.#host.interrupt(id, { turnOnly: true, keepQueuedSends: true }).catch(() => {});
+          }
+          // A message still preparing its turn (a wake) isn't quiet: watch for the turn it starts.
+          if (!info.turnInFlight && !info.turnQueued) {
+            const left = runTasks(info);
+            if (left.length > 0) {
+              // Agents among them spent what isn't counted yet; shells and
+              // monitors spent nothing, but would wake the agent past the run.
+              if (runSpending(info)) unsettled = true;
+              stoppedTasks = true;
+              quiet = 0;
+              await this.#host.stopBackgroundTasks(id, left).catch(() => {});
+            } else if (!(force || stoppedTasks) || ++quiet >= 3) {
+              // After a stop, a few quiet polls: a wake that slipped in shows up as a turn.
+              return;
+            }
+          }
+          await this.#sleep(100);
+        }
+        unsettled = true;
+      };
+      const interrupt = () => windDown(true);
 
       // 3. Prompt and send.
       const prompt = buildPrompt({
@@ -1060,7 +1298,7 @@ export class RoutineService {
         let unnamedParkPolls = 0;
         for (;;) {
           if (live.cancelled) {
-            await this.#host.interrupt(sessionId).catch(() => {});
+            await interrupt();
             stopped(usage());
             return;
           }
@@ -1069,29 +1307,53 @@ export class RoutineService {
             finish("failed", { reason: "the run's session disappeared", ...usage() });
             return;
           }
-          const spent = usage();
+          // A run going past midnight UTC: what it spends from then counts for the new day too.
+          this.#carry(trail, totalsOf(info));
+          let spent = usage();
+          // Ended: at rest, nothing queued, and the turn settled (its spend recorded).
+          // ...and no background agent still at work: what it spends is this run's (#430).
+          const atRest =
+            (info.status === "idle" || info.status === "error") && !info.turnQueued && !info.turnInFlight && !runSpending(info);
+          // A cap can't be kept on spend nobody can count (#430): stop rather
+          // than run unbounded. A turn that ended reports below, its own error first.
+          if (capped && spent.costUnknown && !atRest) {
+            await interrupt();
+            finish("failed", { reason: UNKNOWN_COST_REASON, ...usage() });
+            return;
+          }
           if (spec.maxCostUsd !== undefined && spent.costUsd > spec.maxCostUsd) {
-            await this.#host.interrupt(sessionId).catch(() => {});
+            await interrupt();
             finish("over_budget", { reason: `spent $${spent.costUsd.toFixed(2)}, over the $${spec.maxCostUsd.toFixed(2)} ceiling`, ...usage() });
             return;
           }
           if (info.status === "waiting_approval" && !info.waitingOn && unnamedParkPolls < 2) {
             unnamedParkPolls++;
-          } else if (info.status === "waiting_approval" || info.waitingOn) {
-            // Left parked on purpose: the owner can approve and the work goes
-            // on. The run ends here; the deadline no longer applies to it.
+          } else if ((info.status === "waiting_approval" || info.waitingOn) && !runSpending(info)) {
+            // Parked. Left parked on purpose: the owner can approve and the
+            // work goes on. The run ends here; the deadline no longer applies
+            // to it. Never while the run's background agents still work: that
+            // would lift the deadline and the cap off their spend (#430) — a
+            // run waits on them, or stops them at its deadline.
             finish("needs_attention", { reason: info.waitingOn ?? "waiting for an approval", ...spent });
-            this.#parked.set(sessionId, { runId: run.id, base: { costUsd: baseCost, inputTokens: baseIn, outputTokens: baseOut }, turn: baseTurn });
             return;
           }
-          if ((info.status === "idle" || info.status === "error") && !info.turnQueued) {
+          if (atRest) {
+            // The run's own reply, before anything after it can take its place.
             const res = this.#host.result(sessionId, baseTurn);
+            // Shells and monitors the run left running would wake the agent
+            // after the run is recorded: stop them first, then count (#430).
+            if (runTasks(info).length > 0) {
+              await windDown(false);
+              spent = usage();
+            }
             const summary = res.text ? clip(res.text.trim(), LIMITS.SUMMARY_MAX) : null;
             if (res.error === BUDGET_STOP_MESSAGE) {
               // The backend stopped itself at the native ceiling we handed it.
               finish("over_budget", { reason: `stopped by the backend at the $${spec.maxCostUsd?.toFixed(2) ?? "?"} ceiling`, summary, ...spent });
             } else if (info.status === "error" || res.error) {
               finish("failed", { reason: res.error ?? "the turn ended with an error", summary, ...spent });
+            } else if (capped && spent.costUnknown) {
+              finish("failed", { reason: UNKNOWN_COST_REASON, summary, ...spent });
             } else if (isSilentReply(res.text)) {
               finish("silent", { reason: "the agent had nothing to report", ...spent });
             } else {
@@ -1100,7 +1362,7 @@ export class RoutineService {
             return;
           }
           if (this.#now() >= deadline) {
-            await this.#host.interrupt(sessionId).catch(() => {});
+            await interrupt();
             const res = this.#host.result(sessionId, baseTurn);
             finish("timed_out", {
               reason: `ran past its ${spec.maxMinutes}-minute limit and was stopped`,
@@ -1120,6 +1382,26 @@ export class RoutineService {
     } catch (err) {
       finish("failed", { reason: `internal error: ${err instanceof Error ? err.message : String(err)}` });
     } finally {
+      // From here, what the session spends is still this run's.
+      const t = trail as Trailing | null;
+      const status = endedAs as RunStatus | null;
+      const info = live.sessionId ? this.#host.info(live.sessionId) : null;
+      if (t && info && live.sessionId && status && status !== "interrupted") {
+        t.parked = status === "needs_attention";
+        if (t.parked) {
+          t.parkedOn = info.waitingApprovalId ?? null;
+          t.parkTurn = info.lastTurnId;
+          t.parkTotals = totalsOf(info);
+          t.parkTasks = new Set(this.#strayTasks(t, info));
+        }
+        // Whatever path ended it, the row has everything the run spent — a
+        // stop's late spend included — and what fell after midnight is the new day's too.
+        this.#store.updateRun(t.runId, usageSince(t, info));
+        this.#carry(t, totalsOf(info));
+        this.#trailing.set(live.sessionId, t);
+        // A turn still running past its stop may never change status again: hold it now.
+        this.#flushTrailing(live.sessionId);
+      }
       void this.#prune(routine.id).catch(() => {});
     }
   }
@@ -1250,28 +1532,192 @@ export class RoutineService {
   /** Session status changed — wake the run waiting on it, if any. */
   onSessionStatus(sessionId: string): void {
     this.#bySession.get(sessionId)?.wake();
-    const parked = this.#parked.get(sessionId);
-    if (!parked) return;
+    this.#flushTrailing(sessionId);
+  }
+
+  /**
+   * After a routine run ends (#430): fold what its session spends into that
+   * run, and let nothing run there but the owner.
+   *
+   * Spend: the session's is the routine's, so the daily cap sees it.
+   *
+   * Owner-only: a turn that isn't the owner's own (the agent's, a delegated
+   * token's, MCP control's) is stopped as it starts, and so is a background
+   * task not started in one of the owner's turns. A parked run's turn waits
+   * on its one call: the owner's yes to it (an approval or an answer), or the
+   * owner joining the turn, makes the turn theirs; any other outcome ends it.
+   * Anything spent while it waits ends the wait.
+   */
+  #flushTrailing(sessionId: string): void {
+    const t = this.#trailing.get(sessionId);
+    if (!t) return;
+    const routine = this.#store.getRoutine(t.routineId);
     const info = this.#host.info(sessionId);
-    if (!info) {
-      this.#parked.delete(sessionId);
+    if (!info || !routine) {
+      // Gone (destroyed) with work in flight when last seen: what that work
+      // spent was never recorded, so the run's cost is unknown (#430).
+      if (!info && routine && t.busy) {
+        this.#markUncounted(t);
+        this.#store.updateRun(t.runId, { costUnknown: true });
+        this.#carry(t, t.last ?? t.base);
+      }
+      this.#dropTrailing(sessionId);
       return;
     }
-    const { base } = parked;
-    const usage = {
-      costUsd: Math.max(0, info.costUsd - base.costUsd),
-      inputTokens: Math.max(0, info.inputTokens - base.inputTokens),
-      outputTokens: Math.max(0, info.outputTokens - base.outputTokens),
-    };
-    if ((info.status === "idle" || info.status === "error") && !info.turnQueued) {
-      // The owner answered and the agent finished: the run keeps its status
-      // (it did need attention) but now carries what the agent went on to do.
-      this.#parked.delete(sessionId);
-      const text = this.#host.result(sessionId, parked.turn).text?.trim();
-      this.#store.updateRun(parked.runId, { ...usage, ...(text && !isSilentReply(text) ? { summary: clip(text, LIMITS.SUMMARY_MAX) } : {}) });
-    } else {
-      this.#store.updateRun(parked.runId, usage);
+    const totals = totalsOf(info);
+    if (t.parked) this.#decidePark(sessionId, t, info, totals);
+
+    const usage = usageSince(t, info);
+    const atRest = (info.status === "idle" || info.status === "error") && !info.turnQueued && !info.turnInFlight && !info.backgroundTasks;
+    t.busy = !atRest;
+    const summarize = t.summaryDue === true && atRest;
+    if (summarize || !sameTotals(t.last, totals) || (t.uncounted && !t.uncountedWritten)) {
+      if (summarize) {
+        // The owner's go-ahead finished: the run keeps its status (it did
+        // need attention) but now carries what the agent went on to do.
+        t.summaryDue = false;
+        const text = this.#host.result(sessionId, t.turn).text?.trim();
+        this.#store.updateRun(t.runId, { ...usage, ...(text && !isSilentReply(text) ? { summary: clip(text, LIMITS.SUMMARY_MAX) } : {}) });
+      } else {
+        this.#store.updateRun(t.runId, usage);
+      }
+      t.uncountedWritten = t.uncounted === true;
+      this.#carry(t, totals);
+      t.last = totals;
     }
+    if (!t.parked) this.#ownerOnly(sessionId, t, info);
+  }
+
+  /** A parked run: the request it waits on decides whose its turn is. */
+  #decidePark(sessionId: string, t: Trailing, info: RunSessionInfo, totals: Totals): void {
+    // Waiting is all it may do. A task that isn't the owner's appearing ends
+    // it, whatever the answer turns out to be; so does any spend before one
+    // (spend is recorded as work ends, and each end is looked at here).
+    const ended = (): void => {
+      this.#markUncounted(t);
+      t.parked = false;
+    };
+    if (this.#strayTasks(t, info).some((id) => !t.parkTasks?.has(id))) {
+      ended();
+      return;
+    }
+    // Named a moment after the run ended: take the name now.
+    t.parkedOn ??= info.waitingApprovalId ?? null;
+    const state = t.parkedOn ? this.#host.approvalState(sessionId, t.parkedOn) : null;
+    if (state === "pending" || (state === null && (info.status === "waiting_approval" || info.turnInFlight))) {
+      if (!sameTotals(t.parkTotals, totals)) ended();
+      return;
+    }
+    t.parked = false;
+    // The owner's yes to its call, or the owner in the turn already (they
+    // joined it, then answered): the turn is theirs, with what the run had
+    // going when it parked. Any other outcome — denied, withdrawn, someone
+    // else's answer — ends the run, and #ownerOnly stops what's left.
+    if (state === "owner" || ((info.lastTurnOrigin ?? "user") === "user" && info.lastTurnId === t.parkTurn)) {
+      t.ownerTurn = t.parkTurn ?? null;
+      t.summaryDue = true;
+      for (const id of t.parkTasks ?? []) t.adopted.add(id);
+    }
+  }
+
+  /** Nothing runs in a routine session after its run but the owner's own turns and what they start. */
+  #ownerOnly(sessionId: string, t: Trailing, info: RunSessionInfo): void {
+    const running = info.turnRunning ?? info.turnInFlight === true;
+    const takenOver = info.lastTurnId !== null && info.lastTurnId === t.ownerTurn;
+    const ownersTurn = running && ((info.lastTurnOrigin ?? "user") === "user" || takenOver);
+    if (running && !ownersTurn) this.#stopTrailingTurn(sessionId, t, info.lastTurnId);
+    const stray = this.#strayTasks(t, info);
+    if (stray.length === 0) return;
+    if (takenOver && running) {
+      // Started by the turn the owner took over: theirs.
+      for (const id of stray) t.adopted.add(id);
+      return;
+    }
+    if ((info.spendingTaskIds ?? []).some((id) => stray.includes(id))) this.#markUncounted(t);
+    void this.#host.stopBackgroundTasks(sessionId, stray).catch(() => {});
+  }
+
+  /**
+   * Background tasks (live, or settled with a result to deliver) that aren't
+   * the owner's: not started in their turns, not from before the run, not one
+   * they took over, and not a watcher the backend runs for itself.
+   */
+  #strayTasks(t: Trailing, info: RunSessionInfo): string[] {
+    const origins = info.taskOrigins ?? {};
+    const ambient = new Set(info.ambientTaskIds ?? []);
+    return [...new Set([...(info.backgroundTaskIds ?? []), ...(info.pendingReportTaskIds ?? [])])].filter(
+      (id) => origins[id] !== "user" && !t.baseTasks.has(id) && !t.adopted.has(id) && !ambient.has(id),
+    );
+  }
+
+  /** The run's cost can't be counted: its row says so, and so does any later day it reached. */
+  #markUncounted(t: Trailing): void {
+    t.uncounted = true;
+    const day = utcDayStart(this.#now());
+    if (day <= t.day) return;
+    t.unknownDays ??= new Set();
+    if (t.unknownDays.has(day)) return;
+    t.unknownDays.add(day);
+    // A new day to mark: the row written for an earlier one doesn't cover it.
+    t.uncountedWritten = false;
+  }
+
+  /** Stop a turn on a held session — once: its draining status changes ask again. */
+  #stopTrailingTurn(sessionId: string, t: Trailing, turnId: string | null): void {
+    if (t.stoppedTurn === turnId) return;
+    t.stoppedTurn = turnId;
+    this.#tryStop(sessionId, t, turnId, 1);
+  }
+
+  /**
+   * One attempt, if the turn still isn't the owner's (they may have joined
+   * it since). One that didn't land is tried again; one that still won't
+   * stop takes the backend down with it, and its cost is unknown.
+   */
+  #tryStop(sessionId: string, t: Trailing, turnId: string | null, attempt: number): void {
+    const stillTheirs = (): boolean => {
+      const now = this.#host.info(sessionId);
+      return !!now && this.#trailing.get(sessionId) === t && now.lastTurnId === turnId && (now.lastTurnOrigin ?? "user") !== "user" && turnId !== t.ownerTurn;
+    };
+    // After the turn's start has finished: this can run inside its status change.
+    queueMicrotask(() => {
+      if (stillTheirs()) void this.#host.interrupt(sessionId, { turnOnly: true, keepQueuedSends: true }).catch(() => {});
+    });
+    this.#after(STOP_RETRY_MS, () => {
+      if (t.stoppedTurn !== turnId || !stillTheirs() || !(this.#host.info(sessionId)?.turnRunning ?? true)) return;
+      if (attempt < STOP_TRIES) {
+        this.#tryStop(sessionId, t, turnId, attempt + 1);
+        return;
+      }
+      this.#markUncounted(t);
+      void this.#host
+        .terminate(sessionId)
+        .catch(() => {})
+        .then(() => this.#flushTrailing(sessionId));
+    });
+  }
+
+  /**
+   * Count spend on a later UTC day than the run's against that day too (#430):
+   * the daily cap sums runs by the day they started, and this is the part a
+   * run spent after midnight. What changed since it was last counted is the
+   * new day's.
+   */
+  #carry(t: Trailing, totals: Totals): void {
+    const today = utcDayStart(this.#now());
+    if (today <= t.day) {
+      t.last = totals;
+      return;
+    }
+    if (!t.carry || t.carry.day !== today) t.carry = { day: today, base: t.last ?? totals };
+    const c = t.carry;
+    const unknown = totals.unknownTurns > c.base.unknownTurns || t.unknownDays?.has(today) === true;
+    this.#store.carrySpend(t.runId, t.routineId, today, Math.max(0, totals.costUsd - c.base.costUsd), unknown);
+    t.last = totals;
+  }
+
+  #dropTrailing(sessionId: string): void {
+    this.#trailing.delete(sessionId);
   }
 
   /** Session ids of runs in flight in this tenant (SessionInfo.managedBy). */
@@ -1308,8 +1754,11 @@ export class RoutineService {
       if (sessionId === routine.persistentSessionId) continue;
       const info = this.#host.info(sessionId);
       if (!info) continue;
-      if (this.#parked.has(sessionId) || info.waitingOn || info.attachedClients > 0) continue;
-      if ((info.status !== "idle" && info.status !== "error") || info.turnQueued) continue;
+      if (this.#trailing.get(sessionId)?.parked || info.waitingOn || info.attachedClients > 0) continue;
+      if ((info.status !== "idle" && info.status !== "error") || info.turnQueued || info.turnInFlight || info.backgroundTasks) continue;
+      // Its last spend goes on the run before the session goes.
+      this.#flushTrailing(sessionId);
+      this.#dropTrailing(sessionId);
       await this.#host.destroy(sessionId).catch(() => {});
     }
   }
@@ -1611,6 +2060,8 @@ export class RoutineService {
       }
       this.#store.deleteRoutine(r.id);
       this.#store.deleteRuns(r.id);
+      // Its sessions are the owner's own from now: nothing more is counted or stopped there.
+      for (const [id, t] of this.#trailing) if (t.routineId === r.id) this.#dropTrailing(id);
       this.#host.audit(actor, "routine.delete", undefined, `routine=${r.id} name=${r.spec.name}`);
     } finally {
       this.#deleting.delete(r.id);

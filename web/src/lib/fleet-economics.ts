@@ -23,6 +23,9 @@ export interface BackendSpend {
   inputTokens: number;
   outputTokens: number;
   costUsd: number;
+  /** Some of `costUsd` is an estimate, and turns whose cost isn't known (#430). */
+  costEstimated: boolean;
+  costUnknownTurns: number;
 }
 
 export interface FleetEconomics {
@@ -84,6 +87,8 @@ export function fleetEconomics(sessions: readonly SessionInfo[]): FleetEconomics
       inputTokens: 0,
       outputTokens: 0,
       costUsd: 0,
+      costEstimated: false,
+      costUnknownTurns: 0,
     };
     row.sessions += 1;
     if (BUSY.has(s.status)) row.active += 1;
@@ -92,6 +97,8 @@ export function fleetEconomics(sessions: readonly SessionInfo[]): FleetEconomics
       row.inputTokens += u.inputTokens;
       row.outputTokens += u.outputTokens;
       row.costUsd += u.totalCostUsd;
+      if (u.costEstimated) row.costEstimated = true;
+      row.costUnknownTurns += u.costUnknownTurns ?? 0;
     }
     byId.set(id, row);
   }

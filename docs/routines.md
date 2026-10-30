@@ -140,13 +140,13 @@ So a routine that asks "is anything wrong?" stays quiet on the days when nothing
 | `failed` | The check failed, the agent errored, or the session went away. Counts toward the failure pause. |
 | `timed_out` | It ran past `--max-minutes` and was interrupted. Counts toward the failure pause. |
 | `over_budget` | It crossed `--max-cost` and was stopped. Counts toward the failure pause. |
-| `skipped` | It didn't run: the last run was still going (`--overlap skip`), a run was already queued behind it (`--overlap queue`), a persistent routine's session was busy or waiting on you, the daily spend cap was reached, the routine was paused before it started, or the fire was missed during downtime. |
+| `skipped` | It didn't run: the last run was still going (`--overlap skip`), a run was already queued behind it (`--overlap queue`), a persistent routine's session was busy, waiting on you, or had your background work going, the daily spend cap was reached, the routine was paused before it started, or the fire was missed during downtime. |
 | `cancelled` | You cancelled it (`codeoid routine cancel <runId>`). |
 | `interrupted` | The daemon stopped while it was in flight. |
 
 A `needs_attention` run keeps tracking its session after it ends.
 When you approve and the agent finishes, the run's cost and summary are updated, so the spend counts toward the daily cap and the history shows what was actually done.
-From the moment it parks, the run's `--max-minutes` and codeoid's in-flight spend check no longer apply: the work goes on because you approved it, as in any session.
+It waits on that one request. Approve it (or answer the agent's question) yourself and the turn is yours from then, along with what the run had running when it parked. Deny it, or let anyone but you answer it, and the run is over: its turn and the background tasks it started stop there. Waiting is all it may do: if it spends or starts anything new while it waits, it is stopped, and the run's cost becomes unknown.
 
 The summary is the agent's final message, not the commentary it wrote between tool calls.
 A routine's last outcome is its newest run that ended `succeeded`, `silent`, `needs_attention`, `failed`, `timed_out` or `over_budget`, by when it ended; `skipped`, `cancelled` and `interrupted` runs, and runs still going, are not outcomes.
@@ -298,9 +298,25 @@ That is the place to post to Slack, open a ticket, or page someone:
 
 A routine runs an agent with nobody watching, on a machine that holds your code and credentials, so every limit is enforced by the daemon rather than requested of the model.
 
-- **Approvals.** A guarded routine parks every non-read tool call on your approval, exactly like an interactive session. An autonomous one runs within a tool-call budget and reverts to guarded when it is spent. Either way nobody answers the agent's questions for it: a question it asks in an unattended run is answered as cancelled, and it carries on without one.
+- **Approvals.** A guarded routine parks every non-read tool call on your approval, exactly like an interactive session. An autonomous one runs within a tool-call budget and reverts to guarded when it is spent. Either way nobody answers the agent's questions for it: a question the agent asks parks the run on you like an approval, and a backend's own prompt (a login, a confirmation) is answered as cancelled.
 - **Time.** Past `--max-minutes` the agent is interrupted.
 - **Money.** On the Claude backend, a fresh run's `--max-cost` is handed to the agent itself, which stops at the ceiling; it is metered per model response, so a run can overshoot by the cost of the response that crossed it. codeoid also checks the run's spend whenever the session reports it, and stops and records `over_budget` past the ceiling. `--daily-cost` is checked before each run starts, against everything the routine's runs spent that UTC day.
+  Every backend counts: where a backend reports tokens but no cost (Codex, OpenAI-compatible endpoints, Gemini, Qwen), codeoid prices the tokens at the model's list price (see [Model prices](CONFIGURATION.md#model-prices)); a model on your own machine (llama-server on a loopback host, or wherever `providers.llamacpp.free` says) costs nothing.
+  On those backends the spend is known when a turn ends, so `--max-cost` is checked then, not mid-turn: a single long turn can go past it, and `--max-minutes` is what bounds a turn.
+  A run isn't over while a background agent it started still works: that spend is the run's. A background shell or watcher doesn't hold it (it makes no model calls), and a run doesn't park on an approval while its background agents still work.
+  A run stopped with background agents still working (at its limit, or cancelled) stops them too, and its cost is unknown: what they spent isn't counted against the run reliably yet, so the daily cap treats the day as uncountable rather than under-counting it.
+  When a run ends, it stops the background tasks it started (shells and watchers too, since they would wake the agent after the run is recorded), and only those.
+  A turn the backend starts on its own as the run stops (answering a task that just finished) is stopped too, and makes the run's cost unknown; a message you send at that moment is yours, and is left alone.
+  A run stopped at its limit, over its cap or by a cancel also stops the messages in its session still waiting for their turn, yours included; your background work keeps running.
+  Everything a routine's session spends counts against the routine: what happens there after a run ends (the work you approved on a parked run, a turn the backend starts on its own, or you carrying the conversation on) is added to that run, and what any run spends after midnight UTC counts toward the new day's `--daily-cost`.
+  After a run ends, nothing runs in its session but you: a turn the agent starts on its own, or one sent for someone else (a delegated token, a conductor dispatch, MCP control), is stopped as it starts, and so is a background task that wasn't started in one of your own turns.
+  A turn you send or join with your own login is never stopped, and what it starts is yours (someone else's login isn't yours, even in your account and project: their turns and their answers count as someone else's), including the turn that carries on with its results when they come back. A turn someone else joins as well is no longer only yours. A watcher the backend runs for itself is left alone.
+  A turn that won't stop is ended by restarting the session's backend, and the run's cost becomes unknown.
+  A run whose session is destroyed while it runs keeps what it was last seen to spend, and its cost is unknown: the turn in flight then was never recorded. The same goes for a session destroyed after its run while something still worked there (a turn you approved, a turn being stopped, background work).
+  This is counted while the daemon runs: spend after a daemon restart isn't added to the run before it.
+  When a turn's cost can't be known (no price for the model, the Gemini CLI, which reports no token counts, or a server that sent no usage), a run with either cap ends as `failed` after that turn, saying so, and a routine with `--daily-cost` starts no more runs that UTC day. Give the model a price in `pricing.models`, or drop the cap.
+  A loop routine's `--daily-cost` counts its loops' priced turns; a loop turn of unknown cost isn't counted yet (#440).
+  What the caps can't see: spend through the agent's own tools (a shell running `curl` with an API key, or another agent CLI) and a backend CLI's retries inside one request (Claude's and Codex's). Give an unattended routine `--guarded` if its agent shouldn't run commands unasked.
 - **Failure.** After three failed runs in a row (`--failure-pause`) the routine pauses itself and tells you. `resume` clears the streak.
 - **Concurrency.** At most two runs execute at once across all routines (`routines.maxConcurrentRuns`), and a routine never runs twice in parallel.
 - **Isolation.** `--worktree` runs each fresh session in its own git worktree, so an autonomous run never edits your checkout.

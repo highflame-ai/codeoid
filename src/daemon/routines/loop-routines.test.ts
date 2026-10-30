@@ -107,6 +107,11 @@ class Host implements RoutineHost {
     return () => {};
   }
   async interrupt(): Promise<void> {}
+  async stopBackgroundTasks(): Promise<void> {}
+  approvalState(): "pending" | "owner" | "gone" {
+    return "gone";
+  }
+  async terminate(): Promise<void> {}
   async destroy(): Promise<void> {}
   runFinished(e: RoutineRunEvent): void {
     this.finished.push(e);

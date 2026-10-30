@@ -115,6 +115,8 @@ export interface RoutineRunWire {
   /** The run's session — open it to see everything the agent did. */
   sessionId?: string;
   costUsd: number;
+  /** Part of what the run spent can't be counted: `costUsd` is a floor (#430). */
+  costUnknown?: true;
   inputTokens: number;
   outputTokens: number;
   /** The agent's final message (bounded). */

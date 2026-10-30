@@ -1730,6 +1730,7 @@ export class ClaudeProvider implements SessionProvider {
         cacheReadTokens: 0,
         cacheCreationTokens: 0,
         totalCostUsd: 0,
+        costSource: "free", // no model call was made
         durationMs: 0,
         isError: true,
         errorMessage: `Skill command not run — ${reason}${detail}`,
@@ -1842,6 +1843,7 @@ export function translateSDKMessage(
         // Per-call LLM usage — split primary vs subagent for accurate ctx tracking.
         const assistantMsg = msg as unknown as {
           message: {
+            id?: string;
             content: unknown;
             usage?: {
               input_tokens?: number;
@@ -1860,7 +1862,15 @@ export function translateSDKMessage(
             cacheCreationTokens: perCall.cache_creation_input_tokens ?? 0,
             outputTokens: perCall.output_tokens ?? 0,
           };
-          emit({ type: "llm_call", usage: callUsage, isPrimary: assistantMsg.parent_tool_use_id === null });
+          // One message per content block, all of the same request: its id says so (#430).
+          const requestId = assistantMsg.message.id;
+          emit({
+            type: "llm_call",
+            usage: callUsage,
+            isPrimary: assistantMsg.parent_tool_use_id === null,
+            parentToolUseId: assistantMsg.parent_tool_use_id ?? null,
+            ...(requestId ? { requestId } : {}),
+          });
         }
 
         // Text content (tool_use blocks are handled via canUseTool → tool_start).
@@ -1903,6 +1913,11 @@ export function translateSDKMessage(
         if (event.type === "content_block_start" && event.content_block?.type === "thinking") {
           // Signal a new thinking block — Session creates the message.
           emit({ type: "thinking_delta", content: "", blockIndex: event.index, parentToolUseId });
+          break;
+        }
+        // Any other block (a tool call's input streams no text): the request's usage is still to come (#430).
+        if (event.type === "content_block_start") {
+          emit({ type: "model_output", parentToolUseId });
           break;
         }
 
@@ -1980,6 +1995,13 @@ export function translateSDKMessage(
           cacheReadTokens: r.usage?.cache_read_input_tokens ?? 0,
           cacheCreationTokens: r.usage?.cache_creation_input_tokens ?? 0,
           totalCostUsd: r.total_cost_usd ?? 0,
+          // The SDK prices its own turns; without a figure the session prices the tokens (#430).
+          // A $0 with tokens spent isn't a price (a gateway or a model the CLI can't price): the session prices those (#430).
+          ...(typeof r.total_cost_usd === "number" &&
+          (r.total_cost_usd > 0 ||
+            (r.usage?.input_tokens ?? 0) + (r.usage?.output_tokens ?? 0) + (r.usage?.cache_read_input_tokens ?? 0) + (r.usage?.cache_creation_input_tokens ?? 0) === 0)
+            ? { costSource: "backend" as const }
+            : {}),
           durationMs: r.duration_ms ?? 0,
           ...(typeof reportedWindow === "number" && reportedWindow > 0 ? { contextWindow: reportedWindow } : {}),
           stopReason: r.stop_reason ?? undefined,
@@ -2071,7 +2093,7 @@ export function translateSDKMessage(
           // session listener, never the turn queue: it can fire between turns,
           // when the queue has no reader and would drop it unread.
           const r = msg as {
-            tasks?: Array<{ task_id?: string; task_type?: string; description?: string; status?: string }>;
+            tasks?: Array<{ task_id?: string; task_type?: string; description?: string; status?: string; ambient?: boolean }>;
           };
           emitSession?.({
             type: "background_tasks",
@@ -2082,6 +2104,7 @@ export function translateSDKMessage(
                 kind: t.task_type ?? "task",
                 description: t.description ?? "",
                 status: t.status ?? "running",
+                ...(t.ambient ? { ambient: true } : {}),
               })),
           });
         } else if (subtype === "task_notification") {

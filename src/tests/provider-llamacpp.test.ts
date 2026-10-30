@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import { allowedMcpServers, fetchServerContextWindow, llamaCppTools, propsUrl, strictJsonSchema } from "../daemon/providers/llamacpp/index.js";
+import { allowedMcpServers, createLlamaCppProvider, isOwnServer, fetchServerContextWindow, llamaCppTools, propsUrl, strictJsonSchema } from "../daemon/providers/llamacpp/index.js";
+import type { ProviderEvent, TurnOpts } from "../daemon/providers/interface.js";
 import { targetContextWindow } from "../daemon/providers/context-windows.js";
 
 const respond = (body: unknown, status = 200) =>
@@ -96,5 +97,102 @@ describe("llama.cpp MCP servers", () => {
   it("offers exactly the servers named", () => {
     const view = allowedMcpServers(registry, ["github"])!;
     expect(view.forBackend("llamacpp").map((s) => (s as { name: string }).name)).toEqual(["github"]);
+  });
+});
+
+describe("llama.cpp cost (#430)", () => {
+  const sse = (o: unknown) => `data: ${JSON.stringify(o)}\n\n`;
+  /** An OpenAI-compatible server on this machine; `llamaServer` says whether it answers /props as llama-server. */
+  async function turnOn(llamaServer: boolean, cfg: { free?: boolean } = {}): Promise<ProviderEvent | undefined> {
+    const server = Bun.serve({
+      port: 0,
+      fetch(req) {
+        if (new URL(req.url).pathname.endsWith("/props")) {
+          return llamaServer ? Response.json({ default_generation_settings: { n_ctx: 4096 } }) : new Response("not found", { status: 404 });
+        }
+        const body = [
+          sse({ choices: [{ delta: { content: "hi" }, finish_reason: "stop" }] }),
+          sse({ choices: [], usage: { prompt_tokens: 12, completion_tokens: 3 } }),
+          "data: [DONE]\n\n",
+        ].join("");
+        return new Response(body, { headers: { "content-type": "text/event-stream" } });
+      },
+    });
+    try {
+      const provider = createLlamaCppProvider({ baseUrl: `http://127.0.0.1:${server.port}/v1`, apiKey: "", ...cfg }, {});
+      const run = provider.runTurn({ history: [], userMessage: "x", workdir: "/tmp", canUseTool: async () => ({ behavior: "allow" }) } as unknown as TurnOpts);
+      const events: ProviderEvent[] = [];
+      for await (const e of run.events) events.push(e);
+      return events.find((e) => e.type === "turn_done");
+    } finally {
+      server.stop(true);
+    }
+  }
+
+  it("a loopback server that isn't llama-server (a proxy to a paid API) isn't free unless you say so", async () => {
+    expect(((await turnOn(false)) as { result: { costSource?: string } }).result.costSource).toBeUndefined();
+    expect(await turnOn(false, { free: true })).toMatchObject({ result: { costSource: "free" } });
+  });
+
+  it("a turn on the user's own server costs nothing — not an unknown a spend cap would stop on", async () => {
+    const server = Bun.serve({
+      port: 0,
+      fetch(req) {
+        if (new URL(req.url).pathname.endsWith("/props")) return Response.json({ default_generation_settings: { n_ctx: 4096 } });
+        const body = [
+          sse({ choices: [{ delta: { content: "hi" }, finish_reason: "stop" }] }),
+          sse({ choices: [], usage: { prompt_tokens: 12, completion_tokens: 3 } }),
+          "data: [DONE]\n\n",
+        ].join("");
+        return new Response(body, { headers: { "content-type": "text/event-stream" } });
+      },
+    });
+    try {
+      const provider = createLlamaCppProvider({ baseUrl: `http://127.0.0.1:${server.port}/v1`, apiKey: "" }, {});
+      const run = provider.runTurn({ history: [], userMessage: "x", workdir: "/tmp", canUseTool: async () => ({ behavior: "allow" }) } as unknown as TurnOpts);
+      const events: ProviderEvent[] = [];
+      for await (const e of run.events) events.push(e);
+      expect(events.find((e) => e.type === "turn_done")).toMatchObject({ result: { costSource: "free", inputTokens: 12 } });
+    } finally {
+      server.stop(true);
+    }
+  });
+});
+
+describe("llama.cpp cost before a first result (#430)", () => {
+  it("a first turn that fails is free on llama-server: it answered /props before the request, not only after a result", async () => {
+    const server = Bun.serve({
+      port: 0,
+      fetch(req) {
+        if (new URL(req.url).pathname.endsWith("/props")) return Response.json({ default_generation_settings: { n_ctx: 4096 } });
+        return Response.json({ error: { message: "context overflow" } }, { status: 500 });
+      },
+    });
+    try {
+      const provider = createLlamaCppProvider({ baseUrl: `http://127.0.0.1:${server.port}/v1`, apiKey: "" }, {});
+      expect(provider.free).toBe(false);
+      const run = provider.runTurn({ history: [], userMessage: "x", workdir: "/tmp", canUseTool: async () => ({ behavior: "allow" }) } as unknown as TurnOpts);
+      const events: ProviderEvent[] = [];
+      for await (const e of run.events) events.push(e);
+      expect(events.some((e) => e.type === "turn_done")).toBe(false);
+      // What the session prices the failed turn by.
+      expect(provider.free).toBe(true);
+    } finally {
+      server.stop(true);
+    }
+  });
+});
+
+describe("a llama.cpp server is free only when it's the user's own (#430)", () => {
+  it("one on this machine is; one elsewhere only when you say so — it may be a gateway to a paid API", () => {
+    expect(isOwnServer("http://127.0.0.1:8080/v1")).toBe(true);
+    expect(isOwnServer("http://localhost:8080/v1")).toBe(true);
+    expect(isOwnServer("http://[::1]:8080/v1")).toBe(true);
+    expect(isOwnServer("http://192.168.1.20:8080/v1")).toBe(false);
+    expect(isOwnServer("http://litellm:4000/v1")).toBe(false);
+    expect(isOwnServer("http://gpu-box:8080/v1", true)).toBe(true);
+    expect(isOwnServer("http://127.0.0.1:8080/v1", false)).toBe(false);
+    expect(isOwnServer("https://api.some-inference-host.com/v1")).toBe(false);
+    expect(isOwnServer("not a url")).toBe(false);
   });
 });

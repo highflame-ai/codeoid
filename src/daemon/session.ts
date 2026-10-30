@@ -9,6 +9,7 @@
  *   - Scrollback stores merged SessionMessage (not deltas)
  */
 
+import { type CostSource, estimateCost, estimateCostByRequest, priceFor } from "./pricing/index.js";
 import { ClaudeAccountError, type ClaudeAccountStore, projectCredentialOverride, userCredentialOverride } from "./claude-accounts.js";
 import { AccountError, type AccountStore, type ResolvedAccount } from "./accounts.js";
 import { geminiProjectOverride, qwenProjectOverride } from "./account-apply.js";
@@ -190,6 +191,7 @@ import { type CodeoidConfig, getConfigDir } from "../config.js";
 import { secretPathVerdict } from "./secret-paths.js";
 import type { CompressionRegistry } from "./compress/index.js";
 import { defaultSpillDir } from "./compress/spill.js";
+import { type TurnOrigin, turnOrigin } from "./turn-origin.js";
 import { PRIMARY_CHAIN, RepeatToolGuard } from "./guard/index.js";
 import {
   CLAUDE_PROVIDER_ID,
@@ -519,7 +521,12 @@ export interface SessionCreateOptions {
    * (→ waiting_approval) without polling. Called AFTER the transition is
    * applied; exceptions are swallowed (observability must not break turns).
    */
-  onStatusChange?: (sessionId: string, status: SessionStatus) => void;
+  /**
+   * Status transitions; also, with `settled: true` and no status change, a
+   * turn that has settled — its spend recorded (#430). Observers that only
+   * care about status ignore those.
+   */
+  onStatusChange?: (sessionId: string, status: SessionStatus, opts?: { settled: true }) => void;
   /**
    * What this session's collaboration has spent so far, for the approval
    * prompt on a send-class dispatch. Injected by the manager because a Session
@@ -795,6 +802,31 @@ export class SendStoppedError extends Error {
 
 /** Claude's file tools that write. */
 const CLAUDE_FILE_WRITE_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
+
+/**
+ * Background task kinds that make no model calls while they run (#430): a
+ * shell (a command Monitor is one), a WebSocket Monitor, a backgrounded MCP
+ * call. Any other kind — agents, workflows, teammates, dreams, unknown ones —
+ * counts as spending.
+ */
+/** What one turn's event consumer counted (#430): model work, requests sent, usage reports received. */
+interface TurnCounts {
+  activity: boolean;
+  requests: number;
+  reports: number;
+  /** The model streamed output after the last usage report: a request whose usage hasn't come yet (#430). */
+  unreported?: boolean;
+}
+
+/** A usage report that counts some tokens. */
+function hasTokens(u: LLMCallUsage): boolean {
+  return u.inputTokens + u.outputTokens + u.cacheReadTokens + u.cacheCreationTokens > 0;
+}
+
+const SHELL_TASK_KINDS: ReadonlySet<string> = new Set(["local_bash", "bash", "shell", "monitor_ws", "mcp_task"]);
+
+/** Events that mean the model did work in a turn — so the turn spent something (#430). */
+const MODEL_ACTIVITY: ReadonlySet<ProviderEvent["type"]> = new Set(["model_request", "model_output", "text_delta", "text_done", "thinking_delta", "tool_start", "llm_call"]);
 
 export class Session {
   readonly id: string;
@@ -1109,7 +1141,7 @@ export class Session {
   // `interactive` (prompt for everything, incl. reads) and `autonomous` (auto
   // until budget) are opt-in via /mode.
   #mode: SessionMode = "guarded";
-  #onStatusChange?: (sessionId: string, status: SessionStatus) => void;
+  #onStatusChange?: (sessionId: string, status: SessionStatus, opts?: { settled: true }) => void;
   #collaborationCost?: () => CollaborationCost | undefined;
   #workerShape?: "ship" | "scout";
   #turnsRemaining: number | undefined = undefined;
@@ -1293,7 +1325,22 @@ export class Session {
   // biggest single primary-agent API call seen this turn. That's the
   // number we report as `ctx` + use for rotation decisions.
   #primaryTurnCalls: LLMCallUsage[] = [];
+  /** The current turn did model work (#430): a failed one with no token counts still spent. */
+  #turnHadActivity = false;
+  /**
+   * Requests the backend said it sent this turn, and per-request usage
+   * reports it gave (#430). Fewer reports than requests: some request's spend
+   * is missing, so the turn's cost isn't known.
+   */
+  #turnRequests = 0;
+  #turnUsageReports = 0;
+  /** Turns whose usage row failed to write: not in the store's totals, so their cost is unknown (#430). */
+  #unrecordedTurns = 0;
+  /** The agents (null: the main one) whose output streamed after their last usage report (#430). */
+  #turnUnreported = new Set<string | null>();
   #subagentTurnCalls: LLMCallUsage[] = [];
+  /** This turn's reports by request id: a repeat report of one request replaces its entry, never adds one (#430). */
+  #turnCallIds = new Map<string, { calls: LLMCallUsage[]; index: number }>();
   /**
    * Running max of primaryCtx across all turns this session — the real
    * "peak" indicator. Persisted implicitly via being recomputed from the
@@ -1338,7 +1385,7 @@ export class Session {
    */
   #earlyApprovals = new Map<
     string,
-    { approved: boolean; updatedInput?: Record<string, unknown> }
+    { approved: boolean; updatedInput?: Record<string, unknown>; /** A person's own yes (#430). */ owner?: boolean }
   >();
 
   /**
@@ -3614,6 +3661,8 @@ export class Session {
       // bindGate: the owner joining it now steers it, so its approvals and
       // audit are theirs from here on. A prompted turn is already theirs.
       this.#activeRun.bindGate?.(this.#gateFor(sender));
+      // A person joining the turn makes it theirs; anyone else joining makes it no longer only theirs (#430).
+      this.#joinTurn(sender);
       this.#activeRun.pushMidTurn(effectivePrompt, effectivePriority);
       this.#forkNotesHandedOver(forkNotes, turnId);
       // Keep waiting_approval AND tool_running visible. Both are real states the
@@ -3716,6 +3765,9 @@ export class Session {
           pluginDirs: this.#packPluginDirs(),
         });
         this.#activeRun = recoveryRun;
+        // The same turn, retried: it keeps whose it was.
+        this.#announceTurn();
+        this.#settledSinceTurn = [];
         this.#eventConsumerTask = this.#consumeEvents(recoveryRun, recoverySender);
         this.#setStatus("thinking");
       });
@@ -3768,6 +3820,7 @@ export class Session {
       if (this.#currentTurnId === turnId) this.#currentTurnId = previousTurnId;
       this.#accumulator.pushUserTurn(effectivePrompt, this.#currentTurnId ?? undefined, { prompt: text, at: turnAt });
       adopted.bindGate?.(this.#gateFor(sender));
+      this.#joinTurn(sender);
       adopted.pushMidTurn(effectivePrompt, "now");
       this.#forkNotesHandedOver(forkNotes, this.#currentTurnId);
       this.#pendingMidTurnCount++;
@@ -3814,6 +3867,9 @@ export class Session {
     });
     this.#forkNotesHandedOver(forkNotes, turnId);
     this.#activeRun = run;
+    this.#lastTurnOrigin = this.#originOf(sender);
+    this.#announceTurn();
+    this.#settledSinceTurn = [];
     this.#eventConsumerTask = this.#consumeEvents(run, sender);
     this.#setStatus("thinking");
     this.#onTurnStarted();
@@ -3873,6 +3929,12 @@ export class Session {
         // LEVEL, replace semantics: swap the whole set. Diffed only to decide
         // whether clients need a broadcast, never to infer starts/stops.
         const next = new Map(tasks.map((t) => [t.id, { ...t }]));
+        // Whose each new task is (#430): the turn it was started in — one
+        // running, or one just ended and still draining. Anything else (a
+        // background agent's own spawn) is the agent's.
+        for (const id of next.keys()) {
+          if (!this.#taskOrigins.has(id)) this.#taskOrigins.set(id, this.#activeRun || this.#drainingConsumers > 0 ? this.#lastTurnOrigin : "agent");
+        }
         const changed =
           cloudChanged ||
           next.size !== this.#backgroundTasks.size ||
@@ -3888,6 +3950,8 @@ export class Session {
         // may BE that work). Once it drains, anything still registered with no
         // turn in flight really is stale — reconcile it here instead.
         if (drained && !this.#turnActive()) this.#reconcileDrainedBackground();
+        // Whoever watches this session hears of new and finished tasks, not only of status (#430).
+        if (changed) this.#announceTurn();
         break;
       }
       case "background_event": {
@@ -3923,6 +3987,8 @@ export class Session {
           status: event.status,
           summary: event.summary,
         });
+        this.#settledSinceTurn.push(event.taskId);
+        this.#announceTurn();
         // The level event usually removes it too, but do not depend on
         // ordering the contract leaves unspecified.
         if (this.#backgroundTasks.delete(event.taskId)) {
@@ -4355,6 +4421,11 @@ export class Session {
     this.#persistAndBuffer(note);
     this.#broadcastRaw(note);
     this.#activeRun = run;
+    // The backend carrying on with results it was handed: the user's turn when every one is theirs (#430).
+    this.#lastTurnOrigin = this.#deliversOnlyUsers(this.#settledSinceTurn) ? "user" : "agent";
+    this.#currentSender = systemAuth;
+    this.#announceTurn();
+    this.#settledSinceTurn = [];
     this.#eventConsumerTask = this.#consumeEvents(run, systemAuth);
     this.#setStatus("thinking");
     this.#onTurnStarted();
@@ -4530,6 +4601,8 @@ export class Session {
       accountId: this.accountId,
       projectId: this.projectId,
     };
+    // Delivering only the user's own tasks' results: the user's turn, carried on (#430).
+    if (this.#deliversOnlyUsers(reports.map((r) => r.taskId))) this.#originOverride.set(systemAuth, "user");
     this.#store.audit(
       systemAuth.sub,
       "session.background_wake",
@@ -4542,8 +4615,9 @@ export class Session {
         stopped = err instanceof SendStoppedError;
         // A failed wake must not lose the digests — requeue and let the next
         // idle transition (or the next settle) retry. Re-dedup is already
-        // handled: these ids stay in #reportedBackgroundTasks.
-        this.#pendingBackgroundReports.unshift(...reports);
+        // handled: these ids stay in #reportedBackgroundTasks. A Stop is no
+        // failure: it dropped them on purpose (#430).
+        if (!stopped) this.#pendingBackgroundReports.unshift(...reports);
         console.error(
           `[codeoid/session ${this.id.slice(0, 8)}] background wake failed: ${err instanceof Error ? err.message : String(err)}`,
         );
@@ -4551,8 +4625,7 @@ export class Session {
       .finally(() => {
         this.#deliveringBackgroundReports = false;
         // Settles that arrived DURING the wake turn deliver on its idle. Not
-        // after a Stop: re-waking at once would undo it — the requeued
-        // reports go out with the next turn's end instead.
+        // after a Stop: re-waking at once would undo it.
         if (!stopped) this.#maybeDeliverBackgroundReports();
       });
   }
@@ -4663,7 +4736,17 @@ export class Session {
    * correctness over warmth. Idempotent: a second interrupt on an
    * already-idle session is a harmless no-op.
    */
-  async interrupt(sender: AuthContext, opts: { keepQueuedSends?: boolean } = {}): Promise<void> {
+  async interrupt(sender: AuthContext, opts: { keepQueuedSends?: boolean; turnOnly?: boolean } = {}): Promise<void> {
+    // `turnOnly`: stop the running turn and nothing else — no turn, no-op. A
+    // routine's stop must not reach the owner's background work (#430).
+    if (opts.turnOnly && !this.#activeRun) {
+      // Nor its background work; messages still waiting for their turn (a wake among them) are stopped unless kept.
+      if (!opts.keepQueuedSends) {
+        this.#store.audit(sender.sub, "session.interrupt", this.id, "queued messages");
+        this.#stopGen++;
+      }
+      return;
+    }
     this.#store.audit(sender.sub, "session.interrupt", this.id);
     // Mark BEFORE cancelling dialogs, so a driver whose requestUserInput resolves
     // cancelled sees the interrupt and stops rather than treating it as a dismiss.
@@ -4683,16 +4766,33 @@ export class Session {
     // holder of only session:interrupt had no way to halt a misbehaving
     // background agent at all.
     const run = this.#activeRun;
-    if (!run && this.#backgroundWorkLive()) {
-      // A parent's task listed here is asked to stop again: its settle is one the fork asked for.
-      for (const id of this.#backgroundTasks.keys()) if (this.#forkIsolation?.foreignTasks.has(id)) this.#noteForeignStopAsked(id);
-      const failed = (await this.#provider.stopBackgroundTasks?.([...this.#backgroundTasks.keys()])) ?? [];
-      // As the backend's latest level has it (one may have come during the await).
-      const listed = new Map(this.#backgroundTasks);
-      this.#clearBackgroundTasks();
-      // A stop that failed left its task running: it stays listed, a
-      // parent's as the parent's being stopped, until the level drops it.
-      this.#keepUnstoppedListed(failed, listed);
+    if (!run) {
+      if (this.#backgroundWorkLive()) {
+        const ids = [...this.#backgroundTasks.keys()];
+        // A parent's task listed here is asked to stop again: its settle is one the fork asked for.
+        for (const id of ids) if (this.#forkIsolation?.foreignTasks.has(id)) this.#noteForeignStopAsked(id);
+        // Stopped is stopped: their settle reports must not wake the agent —
+        // nor a task whose stop failed: no uncapped turn follows a Stop (#430).
+        for (const id of ids) this.#reportedBackgroundTasks.add(id);
+        const failed = (await this.#provider.stopBackgroundTasks?.(ids)) ?? [];
+        // As the backend's latest level has it (one may have come during the await).
+        const listed = new Map(this.#backgroundTasks);
+        this.#clearBackgroundTasks();
+        // A stop that failed left its task running: it stays listed, a
+        // parent's as the parent's being stopped, until the level drops it.
+        this.#keepUnstoppedListed(failed, listed);
+        // A turn started while we stopped them (the owner's, or the backend's
+        // own): this Stop isn't about it — don't deny its approvals or idle
+        // it under its feet. Whoever stops it stops it (#430).
+        if (this.#activeRun) return;
+      }
+      // Nor may results that settled just before: no "continue what you
+      // deferred" turn after Stop — it would run uncapped (#430).
+      this.#pendingBackgroundReports = [];
+      if (this.#backgroundWakeFallback) {
+        clearTimeout(this.#backgroundWakeFallback);
+        this.#backgroundWakeFallback = null;
+      }
     }
     // Unblock pending tool approvals so canUseTool awaiters don't leak — the
     // turn's, not a live background agent's.
@@ -4781,7 +4881,8 @@ export class Session {
       // the live turn — buffer the decision for #waitForApproval to consume
       // instead of dropping it (which hung the turn forever).
       if (this.#approvalIdToMessageId.has(approvalId)) {
-        this.#earlyApprovals.set(approvalId, { approved, updatedInput });
+        // Whose yes it was goes with the decision, for the request it lands on.
+        this.#earlyApprovals.set(approvalId, { approved, updatedInput, owner: approved && this.#isOwnApproval(sender) });
         this.#store.audit(
           sender.sub,
           approved ? "session.approve" : "session.deny",
@@ -4801,6 +4902,7 @@ export class Session {
     }
 
     this.#store.audit(sender.sub, approved ? "session.approve" : "session.deny", this.id, `approvalId=${approvalId}`);
+    if (approved && this.#isOwnApproval(sender)) this.#noteOwnerApproval(approvalId);
     resolve({ approved, updatedInput });
     this.#pendingApprovals.delete(approvalId);
     return "settled";
@@ -5193,6 +5295,9 @@ export class Session {
           pluginDirs: this.#packPluginDirs(),
         });
         this.#activeRun = run;
+        this.#lastTurnOrigin = this.#originOf(sender);
+        this.#announceTurn();
+        this.#settledSinceTurn = [];
         this.#eventConsumerTask = this.#consumeEvents(run, sender);
         this.#setStatus("thinking");
         this.#onTurnStarted();
@@ -5968,7 +6073,289 @@ export class Session {
     this.#observedLimits = { ...obs };
   }
 
-  #recordTurnFromResult(result: NormalizedTurnResult): void {
+  /**
+   * What a turn cost (#430): the backend's own figure where it gives one
+   * (Claude, pi), nothing for a model on this machine (llama.cpp), else the
+   * tokens at the model's price — and when there's no price (or no token
+   * counts), unknown: never a $0 that a spend cap would count as nothing spent.
+   */
+  #turnCost(result: NormalizedTurnResult, largestPrompt: number, counts: TurnCounts): { usd: number; source: CostSource } {
+    if (result.costSource === "backend") return { usd: result.totalCostUsd, source: "backend" };
+    // A local server is free unless you priced its model: a gateway on your
+    // network may forward to a paid API, and your price says so (#430).
+    if (result.costSource === "free" && !priceFor(result.model, this.#config?.pricing?.models, { overridesOnly: true })) {
+      return { usd: 0, source: "free" };
+    }
+    if (result.costSource === "unknown") return { usd: 0, source: "unknown" };
+    // A request went out with no usage reported for it: part of the spend is missing.
+    if (counts.requests > counts.reports) return { usd: 0, source: "unknown" };
+    // ...or one was streaming when the turn failed or was stopped: its usage never came.
+    if (counts.unreported && (result.isError || this.#turnInterrupted)) return { usd: 0, source: "unknown" };
+    const tokens = {
+      inputTokens: result.inputTokens,
+      outputTokens: result.outputTokens,
+      cacheReadTokens: result.cacheReadTokens,
+      cacheCreationTokens: result.cacheCreationTokens,
+    };
+    // No token counts. A turn that failed before any model request spent
+    // nothing; a turn that ran without reporting usage (a server that leaves
+    // it out) spent an amount nobody can count — never $0 to a cap.
+    if (tokens.inputTokens + tokens.outputTokens + tokens.cacheReadTokens + tokens.cacheCreationTokens === 0) {
+      if (result.isError && !counts.activity) return { usd: 0, source: "estimated" };
+      // The model did work and the result says nothing of it: the requests it
+      // reported along the way are what the turn spent, else nobody knows.
+      const calls = [...this.#primaryTurnCalls, ...this.#subagentTurnCalls];
+      for (const c of calls) {
+        tokens.inputTokens += c.inputTokens;
+        tokens.outputTokens += c.outputTokens;
+        tokens.cacheReadTokens += c.cacheReadTokens;
+        tokens.cacheCreationTokens += c.cacheCreationTokens;
+      }
+      if (tokens.inputTokens + tokens.outputTokens + tokens.cacheReadTokens + tokens.cacheCreationTokens === 0) return { usd: 0, source: "unknown" };
+    }
+    // A placeholder in the result ("pi-default", codex's own id) names no
+    // model: the one the backend says it runs does, else the session's choice.
+    const model = isPlaceholderModel(this.#provider.id, result.model)
+      ? (this.#provider.runningModel ?? this.#model ?? result.model)
+      : result.model;
+    const price = priceFor(model, this.#config?.pricing?.models);
+    if (!price) return { usd: 0, source: "unknown" };
+    // Each request at its own long-context tier, where its reports add up to the turn.
+    const usd = estimateCostByRequest(price, tokens, [...this.#primaryTurnCalls, ...this.#subagentTurnCalls]) ?? estimateCost(price, tokens, largestPrompt);
+    return Number.isFinite(usd) && usd >= 0 ? { usd, source: "estimated" } : { usd: 0, source: "unknown" };
+  }
+
+  /**
+   * A turn that did model work but ended with no result (#430): its spend is
+   * real. Priced from the per-request usage the backend reported during it,
+   * where there is any; else of unknown cost — never $0.
+   */
+  /** A turn is running or still draining (its spend not yet recorded) — #430. */
+  get turnInFlight(): boolean {
+    // A continuation still to come (background results to deliver, a wake
+    // armed) is a turn on its way: its spend belongs with this one's (#430).
+    return (
+      this.#activeRun !== null ||
+      this.#drainingConsumers > 0 ||
+      this.#backgroundWakeFallback !== null ||
+      // Reports that can still be delivered (a wake runs at rest); after an
+      // error they wait for the next turn, which is no turn on its way.
+      (this.#pendingBackgroundReports.length > 0 && (this.#status === "idle" || this.#status === "waiting_approval"))
+    );
+  }
+
+  /** Every live background task, a shell or a watcher included (#430). */
+  get liveBackgroundTasks(): number {
+    return this.#backgroundTasks.size;
+  }
+
+  /** The ids of the live background tasks (#430): a routine stops the ones its run started. */
+  get liveBackgroundTaskIds(): string[] {
+    return [...this.#backgroundTasks.keys()];
+  }
+
+  /** Tasks that settled and whose results still wait to wake the agent (#430). */
+  get pendingReportTaskIds(): string[] {
+    return this.#pendingBackgroundReports.map((r) => r.taskId);
+  }
+
+  /**
+   * Who started the latest turn (#430), stamped when it starts, not when its
+   * message was queued: a prompt someone sent (`user`), or the backend or a
+   * wake on its own (`agent`) — what a routine may stop after its run without
+   * touching the owner's message.
+   */
+  get lastTurnOrigin(): TurnOrigin {
+    return this.#lastTurnOrigin;
+  }
+
+  /**
+   * Requests a person settled yes with their own token — an approval or an
+   * answer — by id, for the request now holding that id (bounded): a new
+   * request under the same id forgets the old decision (#430).
+   */
+  readonly #ownerApproved = new Set<string>();
+
+  #noteOwnerApproval(approvalId: string): void {
+    this.#ownerApproved.add(approvalId);
+    if (this.#ownerApproved.size > 256) this.#ownerApproved.delete(this.#ownerApproved.values().next().value as string);
+  }
+
+  /**
+   * The request the main turn waits on, if it waits on one — never a
+   * background agent's (#430): a routine run parks on its own call.
+   */
+  get waitingApprovalId(): string | null {
+    for (const approvalId of this.#pendingApprovals.keys()) {
+      if (this.#approvalInputs.has(approvalId) && !this.#isBackgroundApproval(approvalId)) return approvalId;
+    }
+    return null;
+  }
+
+  /**
+   * What became of a tool call's approval (#430): still `pending`, approved
+   * by a person with their own token (`owner`), or `gone` — denied,
+   * withdrawn, answered by anyone else, or never known here.
+   */
+  approvalState(approvalId: string): "pending" | "owner" | "gone" {
+    if (this.#ownerApproved.has(approvalId)) return "owner";
+    // A run parks only on a call the gate holds, so "pending" is the gate still waiting.
+    return this.#pendingApprovals.has(approvalId) ? "pending" : "gone";
+  }
+
+  /** The owner's own yes — an approval or an answer — not a system sender's, a delegate's, automation's or a teammate's. */
+  #isOwnApproval(sender: AuthContext): boolean {
+    return turnOrigin(sender) === "user" && sender.sub === this.createdBy;
+  }
+  #lastTurnOrigin: TurnOrigin = "user";
+  /** A sender whose turn is someone else's than its token says: a wake delivering only the user's results. */
+  readonly #originOverride = new WeakMap<AuthContext, TurnOrigin>();
+  /** Whose each background task is: the turn that started it (#430). */
+  readonly #taskOrigins = new Map<string, TurnOrigin>();
+  /** Tasks that settled since the last turn began: what a turn the backend starts carries on with. */
+  #settledSinceTurn: string[] = [];
+
+  #originOf(sender: AuthContext): TurnOrigin {
+    const override = this.#originOverride.get(sender);
+    if (override) return override;
+    // A person's own turn is the session owner's: anyone else in the tenant acts beside them, not as them.
+    const o = turnOrigin(sender);
+    return o === "user" && sender.sub !== this.createdBy ? "delegated" : o;
+  }
+
+  /** Every one of these tasks was started in the user's own turns (and there's at least one). */
+  #deliversOnlyUsers(taskIds: readonly string[]): boolean {
+    return taskIds.length > 0 && taskIds.every((id) => this.#taskOrigins.get(id) === "user");
+  }
+
+  #joinTurn(sender: AuthContext): void {
+    const o = this.#originOf(sender);
+    if (o === "user") this.#lastTurnOrigin = "user";
+    else if (this.#lastTurnOrigin === "user") this.#lastTurnOrigin = o;
+  }
+
+  /** Whose each live background task is, and each with a result still to deliver (#430). */
+  get backgroundTaskOrigins(): Record<string, TurnOrigin> {
+    const out: Record<string, TurnOrigin> = {};
+    for (const id of [...this.#backgroundTasks.keys(), ...this.#pendingBackgroundReports.map((r) => r.taskId)]) {
+      out[id] = this.#taskOrigins.get(id) ?? "agent";
+    }
+    return out;
+  }
+
+  /** Background tasks the backend runs for itself (a watcher), not the agent's work. */
+  get ambientTaskIds(): string[] {
+    return [...this.#backgroundTasks.entries()].filter(([, t]) => t.ambient === true).map(([id]) => id);
+  }
+
+  /** A turn is actually running — not only draining, or a wake still to come. */
+  get turnRunning(): boolean {
+    return this.#activeRun !== null;
+  }
+
+  /**
+   * Stop these background tasks, and only these (#430): what a routine run
+   * started, never the owner's. Their settles wake nothing.
+   */
+  async stopBackgroundTasksById(ids: readonly string[], sender: AuthContext): Promise<void> {
+    const live = ids.filter((id) => this.#backgroundTasks.has(id));
+    if (live.length > 0 || this.#pendingBackgroundReports.some((r) => ids.includes(r.taskId))) {
+      this.#store.audit(sender.sub, "session.background_stop", this.id, `tasks=${ids.map((id) => id.slice(0, 8)).join(",")}`);
+    }
+    for (const id of ids) this.#reportedBackgroundTasks.add(id);
+    const failed = live.length > 0 ? ((await this.#provider.stopBackgroundTasks?.(live)) ?? []) : [];
+    // As the backend's latest level has it (one may have come during the await).
+    const listed = new Map(this.#backgroundTasks);
+    for (const id of live) this.#backgroundTasks.delete(id);
+    // A stop that failed left its task running, and spending: it stays listed, as on Stop.
+    this.#keepUnstoppedListed(failed, listed);
+    // The set emptied with no turn running: settle what the drain would have (approvals its agents asked, their identities).
+    if (live.length > 0 && this.#backgroundTasks.size === 0 && !this.#turnActive()) this.#reconcileDrainedBackground();
+    // A listed task that settled just before is stopped too: its result wakes nothing.
+    this.#pendingBackgroundReports = this.#pendingBackgroundReports.filter((r) => !ids.includes(r.taskId));
+    // Nothing left to deliver, nothing to wake for: a task still live arms its own when it settles.
+    if (this.#pendingBackgroundReports.length === 0 && this.#backgroundWakeFallback) {
+      clearTimeout(this.#backgroundWakeFallback);
+      this.#backgroundWakeFallback = null;
+    }
+    this.#broadcastInfoUpdate();
+  }
+
+  /**
+   * Background tasks that spend while they run (#430): everything but a plain
+   * shell — agents, workflows, remote and ambient tasks alike. A shell or a
+   * monitor doesn't hold a routine run open (a dev server would hold it until
+   * its deadline), but it can wake the agent when it finishes: a run's end
+   * stops it (see liveBackgroundTasks).
+   */
+  get spendingBackgroundTasks(): number {
+    return this.spendingBackgroundTaskIds.length;
+  }
+
+  /** The ids of the live background agents — the tasks that spend (#430). */
+  get spendingBackgroundTaskIds(): string[] {
+    const ids: string[] = [];
+    for (const [id, t] of this.#backgroundTasks) if (!SHELL_TASK_KINDS.has(t.kind)) ids.push(id);
+    return ids;
+  }
+
+  /** Event consumers that haven't finished recording their turn (a stopped or recovered run still draining). */
+  #drainingConsumers = 0;
+
+  /**
+   * A turn began: tell whoever watches turns (#430) — its status may not
+   * change (one draining turn's "thinking" into the next), so it wouldn't
+   * hear of it otherwise. After the start completes.
+   */
+  #announceTurn(): void {
+    queueMicrotask(() => this.#notifySettled());
+  }
+
+  /** A turn settled, its spend recorded: tell whoever waits on that (#430) — not a status change. */
+  #notifySettled(): void {
+    if (!this.#onStatusChange) return;
+    try {
+      this.#onStatusChange(this.id, this.#status, { settled: true });
+    } catch (err) {
+      console.error(`[codeoid/session ${this.id}] onStatusChange observer failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** The current turn's counts, as its own event consumer kept them. */
+  get #turnCounts(): TurnCounts {
+    return { activity: this.#turnHadActivity, requests: this.#turnRequests, reports: this.#turnUsageReports, unreported: this.#turnUnreported.size > 0 };
+  }
+
+  #recordUnfinishedTurn(counts: TurnCounts): void {
+    const calls = [...this.#primaryTurnCalls, ...this.#subagentTurnCalls];
+    const sum = (k: keyof LLMCallUsage) => calls.reduce((n, c) => n + c[k], 0);
+    const tokens = {
+      inputTokens: sum("inputTokens"),
+      outputTokens: sum("outputTokens"),
+      cacheReadTokens: sum("cacheReadTokens"),
+      cacheCreationTokens: sum("cacheCreationTokens"),
+    };
+    // Every request it sent reported its usage, or what it spent isn't fully known.
+    const any = tokens.inputTokens + tokens.outputTokens + tokens.cacheReadTokens + tokens.cacheCreationTokens > 0 && counts.requests <= counts.reports;
+    try {
+      this.#recordTurnFromResult(
+        {
+        providerId: this.#provider.id,
+        model: this.#provider.runningModel ?? this.#model ?? "unknown",
+        ...tokens,
+        totalCostUsd: 0,
+        ...(this.#provider.free ? { costSource: "free" as const } : any ? {} : { costSource: "unknown" as const }),
+        durationMs: 0,
+        isError: true,
+        },
+        counts,
+      );
+    } catch (err) {
+      console.error(`[codeoid/usage] recording an unfinished turn failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  #recordTurnFromResult(result: NormalizedTurnResult, counts: TurnCounts = this.#turnCounts): void {
     // The backend's own statement of the window for the model that ran this
     // turn. Kept only while it is still about this session's provider and
     // model (see #observedLimits); a later turn that omits it leaves it be,
@@ -6011,10 +6398,14 @@ export class Session {
       if (size > primaryCtx) primaryCtx = size;
       primaryCacheReadThisTurn += c.cacheReadTokens;
     }
+    // The tier needs one request's prompt: the largest the backend reported per
+    // request — never the turn's sum, which would bill five small requests as one big one.
+    const cost = this.#turnCost(result, Math.max(primaryCtx, result.largestPromptTokens ?? 0), counts);
     const subagentCallCount = this.#subagentTurnCalls.length;
     // Reset accumulators for the next turn (result marks turn end).
     this.#primaryTurnCalls = [];
     this.#subagentTurnCalls = [];
+    this.#turnCallIds.clear();
     if (primaryCtx === 0 && total > 0) {
       // Per-call usage missing — fall back to summed usage but cap at
       // window so a multi-call sum doesn't report > 100% occupancy.
@@ -6038,38 +6429,15 @@ export class Session {
     // If the memory engine isn't enabled we have no durable store — fall
     // back to pure in-memory accumulation so StatusBar still gets usage.
     const store = this.#memory?.store;
-    if (!store) {
-      this.#usage.inputTokens += input;
-      this.#usage.outputTokens += output;
-      this.#usage.cacheReadTokens += cacheRead;
-      this.#usage.cacheCreationTokens += cacheCreate;
-      this.#usage.totalCostUsd += result.totalCostUsd;
-      this.#usage.durationMs += result.durationMs;
-      this.#usage.numTurns += 1;
-      // PEAK tracks primary-only — ignore subagent contributions so a
-      // subagent-heavy turn doesn't poison the bloat canary.
-      this.#usage.peakInputTokens = Math.max(
-        this.#usage.peakInputTokens ?? 0,
-        primaryCtx,
-      );
-      this.#usage.lastTurnInputTokens = primaryCtx;
-      this.#usage.lastTurnOutputTokens = output;
-      this.#usage.lastTurnCostUsd = result.totalCostUsd;
-      this.#usage.lastTurnCacheHitRate = hitRate;
-      this.#broadcastInfoUpdate();
-      return;
-    }
-    void subagentCallCount; // intentionally tracked for future telemetry
-
-    const turnNumber = store.nextTurnNumber(this.id);
     const record: TurnUsage = {
-      turnNumber,
+      turnNumber: store ? store.nextTurnNumber(this.id) : this.#usage.numTurns + 1,
       createdAt: Date.now(),
       inputTokens: input,
       outputTokens: output,
       cacheReadTokens: cacheRead,
       cacheCreationTokens: cacheCreate,
-      totalCostUsd: result.totalCostUsd,
+      totalCostUsd: cost.usd,
+      costSource: cost.source,
       durationMs: result.durationMs,
       stopReason: result.stopReason,
       totalInputTokens: total,
@@ -6081,6 +6449,32 @@ export class Session {
       // sum-based math for those rows.
       ...(primaryCtx > 0 ? { primaryMaxCallInputTokens: primaryCtx } : {}),
     };
+    if (!store) {
+      this.#usage.inputTokens += input;
+      this.#usage.outputTokens += output;
+      this.#usage.cacheReadTokens += cacheRead;
+      this.#usage.cacheCreationTokens += cacheCreate;
+      this.#usage.totalCostUsd += cost.usd;
+      if (cost.source === "estimated") this.#usage.costEstimated = true;
+      if (cost.source === "unknown") this.#usage.costUnknownTurns = (this.#usage.costUnknownTurns ?? 0) + 1;
+      this.#usage.durationMs += result.durationMs;
+      this.#usage.numTurns += 1;
+      // PEAK tracks primary-only — ignore subagent contributions so a
+      // subagent-heavy turn doesn't poison the bloat canary.
+      this.#usage.peakInputTokens = Math.max(
+        this.#usage.peakInputTokens ?? 0,
+        primaryCtx,
+      );
+      this.#usage.lastTurnInputTokens = primaryCtx;
+      this.#usage.lastTurnOutputTokens = output;
+      this.#usage.lastTurnCostUsd = cost.usd;
+      this.#usage.lastTurnCacheHitRate = hitRate;
+      // Newest first, as the store's are: the last turn's cost source and duration (#430).
+      this.#usage.recentTurns = [record, ...(this.#usage.recentTurns ?? [])].slice(0, Session.RECENT_TURNS_KEEP);
+      this.#broadcastInfoUpdate();
+      return;
+    }
+    void subagentCallCount; // intentionally tracked for future telemetry
 
     try {
       store.recordTurnUsage({
@@ -6089,6 +6483,7 @@ export class Session {
         turn: record,
       });
     } catch (err) {
+      this.#unrecordedTurns++;
       console.error(
         `[codeoid/usage] recordTurnUsage failed: ${err instanceof Error ? err.message : String(err)}`,
       );
@@ -6158,6 +6553,8 @@ export class Session {
       cacheReadTokens: totals.cacheReadTokens,
       cacheCreationTokens: totals.cacheCreationTokens,
       totalCostUsd: totals.totalCostUsd,
+      ...(totals.costEstimated ? { costEstimated: true } : {}),
+      ...(totals.costUnknownTurns + this.#unrecordedTurns > 0 ? { costUnknownTurns: totals.costUnknownTurns + this.#unrecordedTurns } : {}),
       numTurns: totals.numTurns,
       durationMs: totals.durationMs,
       recentTurns: recent,
@@ -7151,6 +7548,9 @@ export class Session {
       this.#setStatus("waiting_approval");
       this.#withdrawOnAbort(approvalId, signal);
       this.#approvalInputs.set(approvalId, { toolName, input: effectiveInput });
+      // This request's own decision, never a past one's under the same id (#430).
+      if (this.#earlyApprovals.get(approvalId)?.owner) this.#noteOwnerApproval(approvalId);
+      else this.#ownerApproved.delete(approvalId);
       let decision: { approved: boolean; updatedInput?: Record<string, unknown> };
       try {
         decision = await this.#waitForApproval(approvalId);
@@ -7312,6 +7712,22 @@ export class Session {
     // loop back and re-await the SAME pull instead of issuing a concurrent
     // iter.next() against the queue.
     let pending: Promise<IteratorResult<ProviderEvent>> | null = null;
+    // A turn that did model work but ends with no result (an error mid-way, an
+    // abort, the backend's process dying) still spent: it's recorded at exit (#430).
+    let modelActivity = false;
+    let resultRecorded = false;
+    // This consumer's own counts: a replacement consumer (a stall recovery)
+    // resets the session's, and this turn must be recorded with its own (#430).
+    let requests = 0;
+    let reports = 0;
+    const unreported = new Set<string | null>();
+    this.#turnHadActivity = false;
+    this.#turnRequests = 0;
+    this.#turnUsageReports = 0;
+    this.#turnUnreported = unreported;
+    // In flight until this consumer has recorded its turn — even after a stop
+    // or a stall recovery has let go of the run (#430).
+    this.#drainingConsumers++;
     try {
       while (true) {
         let next: IteratorResult<ProviderEvent> | typeof STALL;
@@ -7350,6 +7766,26 @@ export class Session {
         if (this.#activeRun !== run) break;
         const event = next.value;
         this.#lastEventAt = Date.now();
+        if (MODEL_ACTIVITY.has(event.type)) {
+          modelActivity = true;
+          this.#turnHadActivity = true;
+        }
+        if (event.type === "model_request") {
+          this.#turnRequests++;
+          requests++;
+        } else if (event.type === "llm_call" && !(event.requestId && this.#turnCallIds.has(event.requestId))) {
+          this.#turnUsageReports++;
+          reports++;
+        }
+        // Output streams before its request's usage report (Claude, Codex, Qwen send no model_request).
+        // Per agent: sub-agents stream at once, and one's report says nothing of
+        // another's request. A report of no tokens (qwen-code's placeholder for
+        // a request's earlier blocks), or one that names no agent, clears none.
+        if (event.type === "text_delta" || event.type === "thinking_delta" || event.type === "model_output") {
+          unreported.add(event.parentToolUseId ?? null);
+        } else if (event.type === "llm_call" && hasTokens(event.usage) && (event.isPrimary || event.parentToolUseId)) {
+          unreported.delete(event.parentToolUseId ?? null);
+        }
         // When a mid-turn message interrupts the current turn, the SDK emits a
         // turn_done (often with isError) for the aborted partial turn BEFORE it
         // starts the continuation turn for the injected message. Absorb that
@@ -7361,6 +7797,13 @@ export class Session {
           // Record history / cost for the interrupted partial turn.
           this.#accumulator.handleEvent(this.#stampRedaction(event));
           this.#recordTurnFromResult(event.result);
+          modelActivity = false; // the continuation is a turn of its own
+          this.#turnHadActivity = false;
+          this.#turnRequests = 0;
+          this.#turnUsageReports = 0;
+          requests = 0;
+          reports = 0;
+          unreported.clear();
           // Flush per-turn accumulators so the continuation turn starts clean.
           // Same boundary, same reasoning as turn exit: the partial turn's
           // tools and sub-agents are done with it — except live background
@@ -7380,6 +7823,7 @@ export class Session {
         }
 
         await this.#handleProviderEvent(event);
+        if (event.type === "turn_done") resultRecorded = true;
         if (event.type === "turn_done" || event.type === "error") break;
       }
     } catch (err) {
@@ -7394,6 +7838,13 @@ export class Session {
       this.#persistAndBuffer(errorMsg);
       this.#broadcastRaw(errorMsg);
     } finally {
+      try {
+        // With this consumer's own counts: a newer consumer's (after a recovery) aren't this turn's.
+        if (modelActivity && !resultRecorded) this.#recordUnfinishedTurn({ activity: true, requests, reports, unreported: unreported.size > 0 });
+      } finally {
+        this.#drainingConsumers--;
+        queueMicrotask(() => this.#notifySettled());
+      }
       this.#pendingMidTurnCount = 0; // safety: reset on any exit path
       // Background agents outlive the turn that spawned them. While the
       // provider reports live background work, a sub-agent's in-flight tools,
@@ -7553,9 +8004,18 @@ export class Session {
     this.#pendingMidTurnCount = 0;
     this.#denyPendingApprovals({ keepBackground: false });
 
-    // Drop the wedged run so a concurrent send() doesn't queue into it.
+    // Drop the wedged run so a concurrent send() doesn't queue into it — and
+    // release its consumer: it still has to record the turn (#430), and a
+    // teardown that hangs would otherwise leave it waiting, its turn in
+    // flight for good.
+    const abandoned = this.#activeRun;
     this.#activeRun = null;
     this.#eventConsumerTask = null;
+    try {
+      abandoned?.endTurn?.();
+    } catch {
+      // Best-effort: the teardown below closes it anyway.
+    }
 
     const msg = this.#makeMessage("system", notice.text, SYSTEM_IDENTITY, undefined, undefined, notice.meta);
     this.#persistAndBuffer(msg);
@@ -7911,11 +8371,14 @@ export class Session {
       }
 
       case "llm_call": {
-        if (event.isPrimary) {
-          this.#primaryTurnCalls.push(event.usage);
-        } else {
-          this.#subagentTurnCalls.push(event.usage);
+        const seen = event.requestId ? this.#turnCallIds.get(event.requestId) : undefined;
+        if (seen) {
+          seen.calls[seen.index] = event.usage;
+          break;
         }
+        const calls = event.isPrimary ? this.#primaryTurnCalls : this.#subagentTurnCalls;
+        calls.push(event.usage);
+        if (event.requestId) this.#turnCallIds.set(event.requestId, { calls, index: calls.length - 1 });
         break;
       }
 

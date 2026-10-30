@@ -7,7 +7,7 @@
 
 import { Component, createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js";
 
-import { formatCostUsd, formatTokens, relativeTime } from "../lib/format";
+import { formatSessionCost, formatTokens, relativeTime } from "../lib/format";
 import {
   countVisible,
   filterFleet,
@@ -470,8 +470,8 @@ const SessionRow: Component<{
           </Show>
           <Show when={props.session.usage}>
             {(u) => (
-              <span class="font-mono text-[11px] text-accent" title="Estimated cost">
-                {formatCostUsd(u().totalCostUsd)}
+              <span class="font-mono text-[11px] text-accent" title={formatSessionCost(u()).title}>
+                {formatSessionCost(u()).text}
               </span>
             )}
           </Show>

@@ -621,8 +621,16 @@ export interface SessionUsage {
   cacheReadTokens: number;
   /** Tokens written to the prompt cache (a premium on cache-misses). */
   cacheCreationTokens: number;
-  /** Total cost in USD across all turns, as reported by the SDK. */
+  /**
+   * Total cost in USD across all turns: what backends reported, plus estimates
+   * from tokens × list price where they report none (#430). Excludes turns
+   * whose cost is unknown — see `costUnknownTurns`.
+   */
   totalCostUsd: number;
+  /** Some of `totalCostUsd` is estimated from tokens × list price, not reported by the backend. */
+  costEstimated?: boolean;
+  /** Turns whose cost isn't known (no price for the model, or no token counts) — not in `totalCostUsd`. */
+  costUnknownTurns?: number;
   /** Number of turns (round-trips) included in these totals. */
   numTurns: number;
   /** Wall-clock duration of agent work (sum of per-turn `duration_ms`). */
@@ -693,8 +701,15 @@ export interface TurnUsage {
   cacheReadTokens: number;
   /** Cache-write tokens (billed at ~125% of full input). */
   cacheCreationTokens: number;
-  /** Total cost for the turn in USD, as reported by the SDK. */
+  /** Total cost for the turn in USD — see `costSource` (#430). */
   totalCostUsd: number;
+  /**
+   * Where the cost came from: `backend` (it said), `estimated` (tokens × list
+   * price), `free` (a model on this machine), `unknown` (no price or no token
+   * counts; `totalCostUsd` is then 0 and means nothing). Absent on turns
+   * recorded before #430: reported by the backend, or $0 if it gave nothing.
+   */
+  costSource?: "backend" | "estimated" | "free" | "unknown";
   /** Wall-clock duration in ms (agent work, not network). */
   durationMs: number;
   /** Stop reason ("end_turn", "max_tokens", "tool_use", "error", …) if known. */
@@ -957,6 +972,10 @@ export interface CollaborationCost {
   children: number;
   /** Summed `SessionUsage.totalCostUsd` across orchestrator + children. */
   totalCostUsd: number;
+  /** Some of it is estimated from tokens (#430). */
+  costEstimated?: boolean;
+  /** Turns whose cost isn't known — not in `totalCostUsd`. */
+  costUnknownTurns?: number;
   inputTokens: number;
   outputTokens: number;
   /** Summed turns — how much agent work the goal has already consumed. */
@@ -2463,8 +2482,12 @@ export interface FleetUsage {
   blockedTasks: number;
   inputTokens: number;
   outputTokens: number;
-  /** USD, summed across every backend that reports cost. */
+  /** USD, summed across every session: reported, or estimated from tokens (#430). */
   totalCostUsd: number;
+  /** Some of it is estimated from tokens × list price. */
+  costEstimated?: boolean;
+  /** Turns whose cost isn't known, across the fleet — not in `totalCostUsd`. */
+  costUnknownTurns?: number;
 }
 
 /** Everything a client needs to draw the fleet, in one payload. */
@@ -3286,6 +3309,12 @@ export interface AuthContext {
    * expired token on a long-lived connection instead of trusting the
    * handshake forever. 0/undefined means the token carried no exp. */
   exp?: number;
+  /**
+   * Set by the daemon on a sender that acts for its holder by automation (MCP
+   * control): never the person themselves, whatever the token's depth (#430).
+   * Never read from a token.
+   */
+  automation?: true;
 }
 
 /**
