@@ -220,6 +220,8 @@ interface Trailing {
   stoppedTurn?: string | null;
   /** Later UTC days on which the run's cost became uncountable: those days are uncountable too. */
   unknownDays?: Set<number>;
+  /** Last seen working (a turn, a queued one, background tasks, a wait): a destroy then loses that spend. */
+  busy?: boolean;
 }
 
 export interface CreateRunSessionOpts {
@@ -1552,6 +1554,13 @@ export class RoutineService {
     const routine = this.#store.getRoutine(t.routineId);
     const info = this.#host.info(sessionId);
     if (!info || !routine) {
+      // Gone (destroyed) with work in flight when last seen: what that work
+      // spent was never recorded, so the run's cost is unknown (#430).
+      if (!info && routine && t.busy) {
+        this.#markUncounted(t);
+        this.#store.updateRun(t.runId, { costUnknown: true });
+        this.#carry(t, t.last ?? t.base);
+      }
       this.#dropTrailing(sessionId);
       return;
     }
@@ -1560,6 +1569,7 @@ export class RoutineService {
 
     const usage = usageSince(t, info);
     const atRest = (info.status === "idle" || info.status === "error") && !info.turnQueued && !info.turnInFlight && !info.backgroundTasks;
+    t.busy = !atRest;
     const summarize = t.summaryDue === true && atRest;
     if (summarize || !sameTotals(t.last, totals) || (t.uncounted && !t.uncountedWritten)) {
       if (summarize) {

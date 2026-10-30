@@ -1117,6 +1117,39 @@ describe("run outcomes", () => {
     expect(store.listRuns(routine.id, { limit: 1 })[0]).toMatchObject({ status: "skipped" });
   });
 
+  it("a session destroyed after its run, while the owner's go-ahead turn still works, leaves that run's cost unknown — not a day fully counted (#430)", async () => {
+    const { routine } = create({ name: "vanished-after", dailyCostUsd: 2 });
+    host.script = { kind: "park", waitingOn: "approve Bash: make" };
+    svc.fire(routine, "manual", null, "owner");
+    await settle();
+    const s = [...host.sessions.values()][0]!;
+    s.approvals.set(s.info.waitingApprovalId!, "owner");
+    s.info = { ...s.info, status: "thinking", turnInFlight: true, waitingOn: null, waitingApprovalId: null };
+    svc.onSessionStatus(s.id);
+    s.destroyed = true;
+    host.script = { kind: "reply", text: "done", cost: 0.01 };
+    svc.fire(store.getRoutine(routine.id)!, "manual", null, "owner");
+    await settle();
+    const [next, parked] = store.listRuns(routine.id, { limit: 2 });
+    expect(parked!.costUnknown).toBe(true);
+    expect(next).toMatchObject({ status: "skipped" });
+  });
+
+  it("...but one destroyed at rest after its run leaves the run as counted (#430)", async () => {
+    const { routine } = create({ name: "vanished-at-rest", dailyCostUsd: 2 });
+    host.script = { kind: "reply", text: "done", cost: 0.2 };
+    svc.fire(routine, "manual", null, "owner");
+    await settle();
+    const s = [...host.sessions.values()][0]!;
+    svc.onSessionStatus(s.id);
+    s.destroyed = true;
+    svc.fire(store.getRoutine(routine.id)!, "manual", null, "owner");
+    await settle();
+    const [next, first] = store.listRuns(routine.id, { limit: 2 });
+    expect(first!.costUnknown).toBeUndefined();
+    expect(next!.status).not.toBe("skipped");
+  });
+
   it("before a run checks the daily cap, the routine's other sessions report what they spent (#430)", async () => {
     const { routine } = create({ name: "flush-first", dailyCostUsd: 1 });
     host.script = { kind: "reply", text: "done", cost: 0.2 };
