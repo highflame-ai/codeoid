@@ -6427,6 +6427,26 @@ export class Session {
     // If the memory engine isn't enabled we have no durable store — fall
     // back to pure in-memory accumulation so StatusBar still gets usage.
     const store = this.#memory?.store;
+    const record: TurnUsage = {
+      turnNumber: store ? store.nextTurnNumber(this.id) : this.#usage.numTurns + 1,
+      createdAt: Date.now(),
+      inputTokens: input,
+      outputTokens: output,
+      cacheReadTokens: cacheRead,
+      cacheCreationTokens: cacheCreate,
+      totalCostUsd: cost.usd,
+      costSource: cost.source,
+      durationMs: result.durationMs,
+      stopReason: result.stopReason,
+      totalInputTokens: total,
+      billableInputTokens: billable,
+      cacheHitRate: hitRate,
+      // Honest per-turn ctx-of-window denominator. > 0 only when the SDK
+      // streamed per-call usage AND we tracked it; 0 fallback ends up
+      // null in storage, so refreshUsageFromStore degrades to legacy
+      // sum-based math for those rows.
+      ...(primaryCtx > 0 ? { primaryMaxCallInputTokens: primaryCtx } : {}),
+    };
     if (!store) {
       this.#usage.inputTokens += input;
       this.#usage.outputTokens += output;
@@ -6447,32 +6467,12 @@ export class Session {
       this.#usage.lastTurnOutputTokens = output;
       this.#usage.lastTurnCostUsd = cost.usd;
       this.#usage.lastTurnCacheHitRate = hitRate;
+      // Newest first, as the store's are: the last turn's cost source and duration (#430).
+      this.#usage.recentTurns = [record, ...(this.#usage.recentTurns ?? [])].slice(0, Session.RECENT_TURNS_KEEP);
       this.#broadcastInfoUpdate();
       return;
     }
     void subagentCallCount; // intentionally tracked for future telemetry
-
-    const turnNumber = store.nextTurnNumber(this.id);
-    const record: TurnUsage = {
-      turnNumber,
-      createdAt: Date.now(),
-      inputTokens: input,
-      outputTokens: output,
-      cacheReadTokens: cacheRead,
-      cacheCreationTokens: cacheCreate,
-      totalCostUsd: cost.usd,
-      costSource: cost.source,
-      durationMs: result.durationMs,
-      stopReason: result.stopReason,
-      totalInputTokens: total,
-      billableInputTokens: billable,
-      cacheHitRate: hitRate,
-      // Honest per-turn ctx-of-window denominator. > 0 only when the SDK
-      // streamed per-call usage AND we tracked it; 0 fallback ends up
-      // null in storage, so refreshUsageFromStore degrades to legacy
-      // sum-based math for those rows.
-      ...(primaryCtx > 0 ? { primaryMaxCallInputTokens: primaryCtx } : {}),
-    };
 
     try {
       store.recordTurnUsage({

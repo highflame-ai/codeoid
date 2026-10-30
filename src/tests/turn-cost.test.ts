@@ -129,6 +129,14 @@ describe("a turn's cost (#430)", () => {
     expect(u.totalCostUsd).toBeGreaterThan(0);
   });
 
+  it("with no memory engine, the last turn's cost source is still the newest of the recent turns — the status bar's `last $?` (#430)", async () => {
+    const { s, run } = await sessionWith([result({ model: "my-local-finetune" }), result({})]);
+    await run();
+    expect(s.toInfo().usage!.recentTurns?.map((t) => t.costSource)).toEqual(["unknown"]);
+    await run();
+    expect(s.toInfo().usage!.recentTurns?.map((t) => t.costSource)).toEqual(["estimated", "unknown"]);
+  });
+
   it("counts a backend with no token counts as unknown", async () => {
     const { s, run } = await sessionWith([result({ inputTokens: 0, outputTokens: 0, costSource: "unknown" })]);
     await run();
