@@ -6,7 +6,7 @@ Every shell command an agent wants to run is parsed, wrappers and all, and given
 **The levels are guidance drawn from reading the command line. They are not a sandbox.**
 High and not-understood commands ask, and codeoid's credential files are refused when the reader recognises them, but both are a best effort: a command can be written in ways the reader doesn't recognise, and then it is rated medium.
 Only "low" is a promise, and it is kept by being a strict allow-list (below): anything unusual simply isn't low.
-The real protection for your credentials and for files outside the workspace is running the agent's commands in a sandbox, which is a separate codeoid issue.
+The real protection for your credentials and for files outside the workspace is running the agent's commands in a sandbox ([#448](https://github.com/highflame-ai/codeoid/issues/448)).
 
 ## The levels
 

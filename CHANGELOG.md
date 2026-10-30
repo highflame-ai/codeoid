@@ -16,7 +16,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Everyday idioms (`IFS= read -r`, `PATH=…:$PATH`, `EDITOR=vim`, arithmetic on loop counters) are medium, not not-understood, so they don't stall unattended runs.
   The approval prompt shows the level and the reason on every surface, and rewind's "not undone by going back" list uses the same reading.
   On Claude, a high-risk or not-understood command never runs on a `permissions.allow` rule without codeoid's gate seeing it.
-  Protecting credentials and files outside the workspace for real needs the agent's commands to run in a sandbox, a separate issue.
+  Protecting credentials and files outside the workspace for real needs the agent's commands to run in a sandbox (#448).
   See [docs/approvals.md](docs/approvals.md), which lists the known ways past "high".
 
 - **End-to-end tests against a scripted backend** (#429).
