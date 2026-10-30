@@ -204,6 +204,15 @@ describe("translateSDKMessage – assistant", () => {
     expect(events[0]).toMatchObject({ type: "llm_call", isPrimary: false });
   });
 
+  it("llm_call carries the request's id: one message per content block is still one request (#430)", () => {
+    const events = collectEmits({
+      type: "assistant",
+      message: { id: "msg_1", content: [{ type: "text", text: "Let me look." }], usage: { input_tokens: 10, output_tokens: 1 } },
+      parent_tool_use_id: null,
+    });
+    expect(events[0]).toMatchObject({ type: "llm_call", requestId: "msg_1" });
+  });
+
   it("skips text_done when no text blocks", () => {
     const events = collectEmits({ type: "assistant", message: { content: [] }, parent_tool_use_id: null });
     expect(events.find((e) => e.type === "text_done")).toBeUndefined();

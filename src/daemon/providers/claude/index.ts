@@ -1843,6 +1843,7 @@ export function translateSDKMessage(
         // Per-call LLM usage — split primary vs subagent for accurate ctx tracking.
         const assistantMsg = msg as unknown as {
           message: {
+            id?: string;
             content: unknown;
             usage?: {
               input_tokens?: number;
@@ -1861,7 +1862,9 @@ export function translateSDKMessage(
             cacheCreationTokens: perCall.cache_creation_input_tokens ?? 0,
             outputTokens: perCall.output_tokens ?? 0,
           };
-          emit({ type: "llm_call", usage: callUsage, isPrimary: assistantMsg.parent_tool_use_id === null });
+          // One message per content block, all of the same request: its id says so (#430).
+          const requestId = assistantMsg.message.id;
+          emit({ type: "llm_call", usage: callUsage, isPrimary: assistantMsg.parent_tool_use_id === null, ...(requestId ? { requestId } : {}) });
         }
 
         // Text content (tool_use blocks are handled via canUseTool → tool_start).

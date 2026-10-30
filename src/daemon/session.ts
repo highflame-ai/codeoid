@@ -1328,6 +1328,8 @@ export class Session {
   #turnRequests = 0;
   #turnUsageReports = 0;
   #subagentTurnCalls: LLMCallUsage[] = [];
+  /** This turn's reports by request id: a repeat report of one request replaces its entry, never adds one (#430). */
+  #turnCallIds = new Map<string, { calls: LLMCallUsage[]; index: number }>();
   /**
    * Running max of primaryCtx across all turns this session — the real
    * "peak" indicator. Persisted implicitly via being recomputed from the
@@ -6385,6 +6387,7 @@ export class Session {
     // Reset accumulators for the next turn (result marks turn end).
     this.#primaryTurnCalls = [];
     this.#subagentTurnCalls = [];
+    this.#turnCallIds.clear();
     if (primaryCtx === 0 && total > 0) {
       // Per-call usage missing — fall back to summed usage but cap at
       // window so a multi-call sum doesn't report > 100% occupancy.
@@ -7749,7 +7752,7 @@ export class Session {
         if (event.type === "model_request") {
           this.#turnRequests++;
           requests++;
-        } else if (event.type === "llm_call") {
+        } else if (event.type === "llm_call" && !(event.requestId && this.#turnCallIds.has(event.requestId))) {
           this.#turnUsageReports++;
           reports++;
         }
@@ -8337,11 +8340,14 @@ export class Session {
       }
 
       case "llm_call": {
-        if (event.isPrimary) {
-          this.#primaryTurnCalls.push(event.usage);
-        } else {
-          this.#subagentTurnCalls.push(event.usage);
+        const seen = event.requestId ? this.#turnCallIds.get(event.requestId) : undefined;
+        if (seen) {
+          seen.calls[seen.index] = event.usage;
+          break;
         }
+        const calls = event.isPrimary ? this.#primaryTurnCalls : this.#subagentTurnCalls;
+        calls.push(event.usage);
+        if (event.requestId) this.#turnCallIds.set(event.requestId, { calls, index: calls.length - 1 });
         break;
       }
 

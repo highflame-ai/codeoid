@@ -360,7 +360,13 @@ export type ProviderEvent =
   | { type: "subagent_stop"; agentId: string }
   | { type: "mcp_init"; servers: Record<string, string>; tools: Record<string, string[]> }
   /** Per-LLM-call usage, split by primary vs subagent (null parent_tool_use_id = primary). */
-  | { type: "llm_call"; usage: LLMCallUsage; isPrimary: boolean }
+  | {
+      type: "llm_call";
+      usage: LLMCallUsage;
+      isPrimary: boolean;
+      /** The request's id, for a backend that reports one request several times: a repeat replaces the earlier report (#430). */
+      requestId?: string;
+    }
   /**
    * A request was sent to the model (#430), for a backend whose usage arrives
    * only when the request ends: a turn stopped before then still spent.

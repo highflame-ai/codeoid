@@ -207,6 +207,23 @@ describe("a turn's cost (#430)", () => {
     expect(u.costEstimated).toBe(true);
   });
 
+  it("...counting each request once, however many times the backend reported it (#430)", async () => {
+    // Claude reports one request once per content block (thinking, text, tool_use), with its usage each time.
+    const block = (outputTokens: number): ProviderEvent => ({
+      type: "llm_call",
+      isPrimary: true,
+      requestId: "msg_1",
+      usage: { inputTokens: 1_000_000, outputTokens, cacheReadTokens: 0, cacheCreationTokens: 0 },
+    });
+    const { s, run, provider } = await sessionWith([[block(1), block(1), block(1_000_000), { type: "error", message: "stream reset" }]], {
+      models: { "gpt-5.5": { input: 3, output: 1 } },
+    });
+    Object.defineProperty(provider, "runningModel", { get: () => "gpt-5.5" });
+    await run();
+    // One request: its prompt once, and its latest output count.
+    expect(s.toInfo().usage!.totalCostUsd).toBeCloseTo(4, 6);
+  });
+
   it("a turn that failed before any model request spent nothing — not unknown (#430)", async () => {
     const { s, run } = await sessionWith([result({ inputTokens: 0, outputTokens: 0, isError: true, errorMessage: "auth" })]);
     await run();
