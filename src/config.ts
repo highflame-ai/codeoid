@@ -232,11 +232,16 @@ export function resolveZeroidUrl(value: string): string {
  */
 const ApprovalsSchema = z
   .object({
-    /** In guarded mode, run low-risk commands (reads inside the workspace) without asking. */
+    /**
+     * In guarded mode, run low-risk commands without asking. Low is a strict
+     * allow-list (vetted read-only programs, every path in the workspace, no
+     * `cd`, variables or writing redirects); anything else is at least medium.
+     */
     autoAllowLowRisk: z.boolean().default(false),
     /**
      * Ask about a command the gate can't understand, in autonomous mode too.
      * One nothing could be read of (no parser, no command) asks regardless.
+     * Levels are read from the command line, not enforced: a best effort, not a sandbox.
      */
     askOnUnknown: z.boolean().default(true),
   })
