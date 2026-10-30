@@ -1643,7 +1643,10 @@ export class RoutineService {
     const day = utcDayStart(this.#now());
     if (day <= t.day) return;
     t.unknownDays ??= new Set();
+    if (t.unknownDays.has(day)) return;
     t.unknownDays.add(day);
+    // A new day to mark: the row written for an earlier one doesn't cover it.
+    t.uncountedWritten = false;
   }
 
   /** Stop a turn on a held session — once: its draining status changes ask again. */

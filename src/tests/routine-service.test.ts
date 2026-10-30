@@ -1075,6 +1075,26 @@ describe("run outcomes", () => {
     expect(store.unknownCostSince(routine.id, Date.parse("2026-10-17T00:00:00Z"))).toBe(true);
   });
 
+  it("a run already uncountable on its own day makes a later day uncountable too when a stray agent is stopped then (#430)", async () => {
+    const { routine } = create({ name: "uncounted-twice", maxMinutes: 1, dailyCostUsd: 5 });
+    host.script = { kind: "reply", text: "started agents", background: { polls: 1_000_000, cost: 1 } };
+    svc.fire(routine, "manual", null, "owner");
+    await settle();
+    const s = [...host.sessions.values()][0]!;
+    expect(store.listRuns(routine.id, { limit: 1 })[0]).toMatchObject({ status: "timed_out", costUnknown: true });
+    svc.onSessionStatus(s.id);
+    // The next UTC day: an agent nobody's own turn started is stopped mid-work.
+    clock = Date.parse("2026-10-17T08:00:00Z");
+    s.agents.push("stray");
+    s.tasks.push("stray");
+    svc.onSessionStatus(s.id);
+    expect(s.stopped).toContain("stray");
+    host.script = { kind: "reply", text: "done", cost: 0.1 };
+    svc.fire(store.getRoutine(routine.id)!, "manual", null, "owner");
+    await settle();
+    expect(store.listRuns(routine.id, { limit: 1 })[0]).toMatchObject({ status: "skipped" });
+  });
+
   it("before a run checks the daily cap, the routine's other sessions report what they spent (#430)", async () => {
     const { routine } = create({ name: "flush-first", dailyCostUsd: 1 });
     host.script = { kind: "reply", text: "done", cost: 0.2 };
