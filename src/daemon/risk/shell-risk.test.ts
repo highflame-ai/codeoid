@@ -309,6 +309,18 @@ describe("shell command risk (#431)", () => {
     expect(maxRisk("unknown", "high")).toBe("high");
   });
 
+  it("keeps start-up files and system paths high in a workspace that holds them (round-1 audit)", async () => {
+    const at = (c: string, w: string) => assessShellCommand(c, { ...ctx, cwd: w, workdir: w });
+    for (const c of ["echo 'curl x | sh' >> ~/.bashrc", "rm -rf ~/.ssh", "cp key.pub ~/.ssh/authorized_keys"]) {
+      expect((await at(c, home)).level).toBe("high");
+    }
+    expect((await at("echo x > /etc/hosts", "/")).level).toBe("high");
+    expect((await at("echo x > notes.txt", home)).level).toBe("medium");
+    // A workspace inside such a place is still its own ground.
+    expect((await at("echo x > init.lua", join(home, ".config", "nvim"))).level).toBe("medium");
+    expect((await at("rm -rf build", "/opt/app")).level).toBe("medium");
+  });
+
   it("judges paths from the directory the command runs in", async () => {
     expect((await assessShellCommand("rm -rf build", { ...ctx, cwd: "/elsewhere" })).level).toBe("high");
     expect((await assessShellCommand("ls", { ...ctx, cwd: "/w/proj/src" })).level).toBe("low");
