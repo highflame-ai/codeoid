@@ -32,6 +32,12 @@ export interface ShellRisk {
   reasons: string[];
   /** A credential file the line names: refused (`deny`) or asked about (`ask`), whatever the level. */
   secret?: { action: "deny" | "ask"; path: string };
+  /**
+   * Nothing of the command could be read (the parser isn't there, the line is
+   * too long, the call holds no command): it asks even where `unknown` is
+   * let through (`approvals.askOnUnknown: false`).
+   */
+  unreadable?: true;
 }
 
 export interface RiskContext {
@@ -89,8 +95,11 @@ class Verdict {
 export function judge(parsed: ParsedShell, ctx: Ctx): ShellRisk {
   const v = new Verdict();
   judgeLine(parsed, ctx.cwd, ctx, v);
-  return v.out();
+  return parsed.unreadable ? { ...v.out(), unreadable: true } : v.out();
 }
+
+/** A shell tool call with no command in it that can be read. */
+export const UNREADABLE_SHELL_CALL: ShellRisk = { level: "unknown", reasons: ["the shell command in the request can't be read"], unreadable: true };
 
 function judgeLine(parsed: ParsedShell, start: string | null, ctx: Ctx, v: Verdict): void {
   for (const p of parsed.problems) v.add("unknown", p);

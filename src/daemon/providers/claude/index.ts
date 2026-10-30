@@ -50,7 +50,7 @@ import { type CodeoidConfig, getConfigDir } from "../../../config.js";
 import { assessShellCommandSync } from "../../risk/shell-risk.js";
 import { secretPathVerdict } from "../../secret-paths.js";
 import { FOREIGN_AGENT_DENY, FOREIGN_TASK_STOP_DENY, FORK_TEAMMATE_DENY } from "../../fork-isolation.js";
-import { shellCallOf } from "../../shell/tool-call.js";
+import { isShellTool, shellCallOf } from "../../shell/tool-call.js";
 import { type AuthContext, EFFORT_LEVELS, type EffortLevel, SYSTEM_IDENTITY } from "../../../protocol/types.js";
 import type {
   BackendMcpServerState,
@@ -623,6 +623,9 @@ export class ClaudeProvider implements SessionProvider {
     let reason: string;
     try {
       const shell = shellCallOf(input.tool_name, (input.tool_input ?? {}) as Record<string, unknown>);
+      if (!shell && isShellTool(input.tool_name)) {
+        return { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "ask", permissionDecisionReason: "unknown risk: the shell command in the request can't be read" } };
+      }
       if (!shell) return null;
       const risk = assessShellCommandSync(shell.command, {
         cwd: resolvePath(workdir, shell.cwd ?? "."),
