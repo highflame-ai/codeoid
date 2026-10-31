@@ -1370,12 +1370,14 @@ export class OpencodeProvider implements SessionProvider {
       return;
     }
     const executions = turn.executions;
+    const queued = new Set(turn.queued);
     void Promise.race([conn.client.getSession(ses).catch(() => null), Bun.sleep(SPEND_READ_MS).then(() => null)]).then((info) => {
       // Another execution of the turn began meanwhile (a steer taken late): its end ends the turn.
       if (this.#turn !== turn || turn.queue.closed || turn.executions !== executions) return;
       if (info && this.#ses === ses) this.#usageUpdated({ cost: info.cost, tokens: info.tokens });
       // A message pushed while the total was read: opencode runs it next, still this turn.
-      if (turn.settling.size > 0 || turn.owed > 0 || turn.queued.size > 0) this.#executionEnded(turn, outcome, error);
+      const pushed = turn.settling.size > 0 || (turn.owed > 0 && !turn.budgetStopped) || [...turn.queued].some((id) => !queued.has(id));
+      if (pushed) this.#executionEnded(turn, outcome, error);
       else this.#finishTurn(turn, outcome, error);
     });
   }
