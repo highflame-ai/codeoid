@@ -450,23 +450,29 @@ export class OpencodeProvider implements SessionProvider {
   }
 
   async #startTurn(turn: Turn, opts: TurnOpts): Promise<void> {
+    // Replaced, or interrupted before anything was posted: nothing more goes
+    // out. (#interrupt ends a turn that started nothing; a prompt posted after
+    // it would run anyway, adopted as a turn of its own.)
+    const stale = () => this.#turn !== turn || turn.interrupted;
     const conn = await this.#server.ensure();
-    if (this.#turn !== turn) return;
+    if (stale()) return;
     const ses = await this.#attach(conn, opts.workdir);
-    if (this.#turn !== turn) return;
+    if (stale()) return;
     await this.#applySelection(conn, ses, opts);
+    if (stale()) return;
     if (opts.systemPromptAppend && opts.systemPromptAppend !== this.#sentInstructions) {
       await conn.client.synthetic(ses, opts.systemPromptAppend, INSTRUCTIONS_DESCRIPTION);
       this.#sentInstructions = opts.systemPromptAppend;
+      if (stale()) return;
     }
     const seed = this.#pendingHistorySeed;
-    this.#pendingHistorySeed = null;
     const message = opts.userMessage;
 
     const slash = /^\/([^\s/]+)(?:\s+([\s\S]*))?$/.exec(message.trim());
     if (!seed && slash) {
       const [, name, args = ""] = slash;
       if (this.#commands.length === 0) await this.listCommands().catch(() => []);
+      if (stale()) return;
       if (this.#commands.some((c) => c.name === name && c.source === "command")) {
         await conn.client.command(ses, { name: name!, text: args });
         // A command may run the agent (most do: they submit a prompt) or
@@ -485,6 +491,8 @@ export class OpencodeProvider implements SessionProvider {
         return;
       }
     }
+    // The seed is spent only by the prompt that carries it.
+    this.#pendingHistorySeed = null;
     turn.promptId = (await conn.client.prompt(ses, { text: seed ? `${seed}\n\n${message}` : message })).id;
   }
 

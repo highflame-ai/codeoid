@@ -53,7 +53,8 @@
  * subagent that allows shell unless overridden), FAKE_OPENCODE_STUBBORN=1
  * (ignore agent overrides), FAKE_OPENCODE_SAVED=1 (one saved "always" rule),
  * FAKE_OPENCODE_STEER_REPLY_MS (answer a steer's prompt request that long
- * after taking it, so its delivery comes first).
+ * after taking it, so its delivery comes first), FAKE_OPENCODE_SLOW_SYNTHETIC_MS
+ * (answer a synthetic input that late).
  * `GET /__fake/state` (test-only, no auth) returns everything recorded.
  */
 
@@ -806,6 +807,7 @@ const server = Bun.serve({
       return new Response(null, { status: 204 });
     }
     if (rest === "/synthetic" && method === "POST") {
+      if (process.env.FAKE_OPENCODE_SLOW_SYNTHETIC_MS) await sleep(Number(process.env.FAKE_OPENCODE_SLOW_SYNTHETIC_MS));
       state.synthetic.push({ sessionID: ses.id, ...body });
       return json({ data: { id: nextId("msg"), sessionID: ses.id, type: "synthetic" } });
     }

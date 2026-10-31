@@ -468,6 +468,24 @@ describe("opencode interrupt", () => {
     const st = await fakeState(server);
     expect(st.interrupts).toHaveLength(1);
   });
+
+  it("an interrupt before the prompt went out stops it from going out", async () => {
+    const { server } = makeServer({ FAKE_OPENCODE_SLOW_SYNTHETIC_MS: "1000" });
+    const p = makeProvider(server);
+    const adopted: string[] = [];
+    p.onSessionEvent = (e) => adopted.push(e.type);
+    await collect(p.runTurn(opts("hi"))); // attached, no instructions yet
+    // The instructions' request is slow: the interrupt lands before the prompt is posted.
+    const run = p.runTurn(opts("hi again", { systemPromptAppend: "be brief" }));
+    setTimeout(() => void run.interrupt(), 50);
+    const events = await collect(run);
+    expect(done(events)?.stopReason).toBe("interrupted");
+    await Bun.sleep(1_500);
+    const st = await fakeState(server);
+    expect(st.prompts.map((x: { text: string }) => x.text)).toEqual(["hi"]);
+    expect(adopted).not.toContain("turn_started");
+    await p.teardown();
+  });
 });
 
 // ── O7 models and effort ─────────────────────────────────────────────────────
