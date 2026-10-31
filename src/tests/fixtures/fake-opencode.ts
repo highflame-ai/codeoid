@@ -47,6 +47,11 @@
  *                    (two `webfetch` asks naming the script's call)
  *   "gap"          → the live feed is cut (subscribers dropped) mid-turn and
  *                    the execution ends while nobody is connected
+ *   "midgap"       → the feed is cut after a call is approved, over its
+ *                    result and a whole step, and back while the execution
+ *                    still runs
+ *   "gap-open"     → a block ends in the gap, the feed is back while its
+ *                    step still runs (a call follows in the same message)
  *
  * Knobs (env): FAKE_OPENCODE_VERSION (default 2.2.2), FAKE_OPENCODE_STARTS
  * (append a line per start), FAKE_OPENCODE_UNSAFE_AGENT=1 (an `explore`
@@ -299,27 +304,49 @@ function step(ses: Ses): string {
 }
 
 function endStep(ses: Ses, msg: string, cost = 0.0123, tokens: Json = TOKENS): void {
-  durable(ses, "session.step.ended", { assistantMessageID: msg, finish: "stop", cost, tokens });
+  // As stored: the response ended (`streamed`), then the step (`completed`, finish, cost).
   const m = ses.messages.find((x) => x.id === msg);
-  if (m) Object.assign(m, { cost, tokens, finish: "stop" });
+  if (m) Object.assign(m, { cost, tokens, finish: "stop", time: { ...m.time, streamed: Date.now(), completed: Date.now() } });
+  durable(ses, "session.step.ended", { assistantMessageID: msg, finish: "stop", cost, tokens });
   bill(ses, cost, tokens);
 }
 
-async function toolCall(ses: Ses, msg: string, name: string, input: Json, req: Json): Promise<{ ok: boolean; message?: string; decision: string }> {
+/** The message's stored tool block, as real 2.2.x keeps it (`state.input` from the moment it's called). */
+function toolBlock(ses: Ses, msg: string, id: string): Json | undefined {
+  return ses.messages.find((x) => x.id === msg)?.content?.find((b) => b.type === "tool" && b.id === id);
+}
+
+/** Drop every live-feed subscriber; until `up()`, events reach nobody and new connections wait. */
+function dropFeed(): () => void {
+  let up!: () => void;
+  feedDown = new Promise<void>((r) => {
+    up = r;
+  });
+  for (const sub of [...liveSubs]) sub.close();
+  liveSubs.clear();
+  return () => {
+    feedDown = null;
+    up();
+  };
+}
+
+async function toolCall(ses: Ses, msg: string, name: string, input: Json, req: Json, afterReply?: () => void): Promise<{ ok: boolean; message?: string; decision: string }> {
   const id = nextId("call");
+  ses.messages.find((x) => x.id === msg)?.content?.push({ type: "tool", id, name, state: { status: "running", input, metadata: {} } });
   durable(ses, "session.tool.input.started", { assistantMessageID: msg, id, name });
   durable(ses, "session.tool.called", { assistantMessageID: msg, id, input, executed: false });
   const reply = await askPermission(ses, { ...req, source: { type: "tool", messageID: msg, id } });
+  afterReply?.();
+  const block = toolBlock(ses, msg, id);
   if (reply.decision === "once" || reply.decision === "always") {
-    durable(ses, "session.tool.success", { assistantMessageID: msg, id, content: [{ type: "text", text: `${name} ran` }], executed: true });
+    const content = [{ type: "text", text: name === "shell" ? `${name} ran: ${String(input.command ?? "")}` : `${name} ran` }];
+    if (block) block.state = { status: "completed", input, content };
+    durable(ses, "session.tool.success", { assistantMessageID: msg, id, content, executed: true });
     return { ok: true, decision: reply.decision };
   }
-  durable(ses, "session.tool.failed", {
-    assistantMessageID: msg,
-    id,
-    error: reply.message ? { type: "permission.rejected", message: reply.message } : { type: "aborted", message: "The user declined this tool call" },
-    executed: false,
-  });
+  const error = reply.message ? { type: "permission.rejected", message: reply.message } : { type: "aborted", message: "The user declined this tool call" };
+  if (block) block.state = { status: "error", input, error };
+  durable(ses, "session.tool.failed", { assistantMessageID: msg, id, error, executed: false });
   return { ok: false, message: reply.message, decision: reply.decision };
 }
 
@@ -539,24 +566,54 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
     endStep(ses, msg2);
     return "succeeded";
   }
+  if (text.includes("midgap")) {
+    // The feed drops and comes back while the execution is still running:
+    // a call's result, a whole step and its text fall in the gap.
+    const msg = step(ses);
+    await say(ses, msg, "before the gap");
+    let up = () => {};
+    await toolCall(ses, msg, "shell", { command: "echo in-gap", description: "x" }, { action: "shell", resources: ["echo in-gap"] }, () => {
+      up = dropFeed();
+    });
+    endStep(ses, msg);
+    const msg2 = step(ses);
+    await say(ses, msg2, "said in the gap");
+    endStep(ses, msg2, 0.5);
+    up();
+    await sleep(600); // reconnected; the execution keeps going
+    check();
+    const msg3 = step(ses);
+    await say(ses, msg3, "after the gap");
+    endStep(ses, msg3);
+    return "succeeded";
+  }
+  if (text.includes("gap-open")) {
+    // A block ends in the gap; the feed is back while its step still runs
+    // (a call follows in the same message), so the block is the last one
+    // stored when codeoid reads back.
+    const msg = step(ses);
+    const up = dropFeed();
+    await say(ses, msg, "said in the gap");
+    up();
+    await sleep(600);
+    check();
+    await toolCall(ses, msg, "shell", { command: "echo after", description: "x" }, { action: "shell", resources: ["echo after"] });
+    endStep(ses, msg);
+    const msg2 = step(ses);
+    await say(ses, msg2, "after the gap");
+    endStep(ses, msg2);
+    return "succeeded";
+  }
   if (text.includes("gap")) {
     const msg = step(ses);
     await say(ses, msg, "before the gap");
     endStep(ses, msg);
     // The feed drops everyone; until it's back, events reach nobody.
-    let up!: () => void;
-    feedDown = new Promise<void>((r) => {
-      up = r;
-    });
-    for (const sub of [...liveSubs]) sub.close();
-    liveSubs.clear();
+    const up = dropFeed();
     const msg2 = step(ses);
     await say(ses, msg2, "said in the gap");
     endStep(ses, msg2, 0.5);
-    setTimeout(() => {
-      feedDown = null;
-      up();
-    }, 400);
+    setTimeout(up, 400);
     return "succeeded";
   }
   if (text.includes("echo-state")) {
@@ -855,6 +912,11 @@ const server = Bun.serve({
       const running = ses.executing;
       ses.cancel?.();
       return json({ interrupted: running });
+    }
+    const mm = /^\/message\/([^/]+)$/.exec(rest);
+    if (mm && method === "GET") {
+      const msg = ses.messages.find((x) => x.id === mm[1]);
+      return msg ? json({ data: msg }) : notFound("MessageNotFoundError", "no such message");
     }
     if (rest === "/message" && method === "GET") {
       // One page (the fake never has more); `order=desc` is newest first.

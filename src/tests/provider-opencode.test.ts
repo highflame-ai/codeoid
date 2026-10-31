@@ -1130,6 +1130,32 @@ describe("opencode as real 2.2.x servers behave", () => {
     await p.teardown();
   });
 
+  it("a gap that closes while the execution runs: its result, text and spend are read back, once", async () => {
+    const { server } = makeServer();
+    const p = makeProvider(server);
+    const events = await collect(p.runTurn(opts("midgap")));
+    expect(events.find((e) => e.type === "error")).toBeUndefined();
+    expect(texts(events, "text_done")).toEqual(["before the gap", "said in the gap", "after the gap"]);
+    // The call settled in the gap: its card completes from the stored message.
+    const call = events.find((e) => e.type === "tool_start") as Extract<ProviderEvent, { type: "tool_start" }>;
+    expect(events.filter((e) => e.type === "tool_complete")).toEqual([
+      { type: "tool_complete", sdkToolUseId: call.toolId, output: "shell ran: echo in-gap", success: true },
+    ]);
+    // Each step once: 0.0123 + 0.5 + 0.0123 (the title lands after the turn).
+    expect(done(events)!.totalCostUsd).toBeCloseTo(0.0123 + 0.5 + 0.0123, 6);
+    expect(events.filter((e) => e.type === "llm_call" && e.isPrimary)).toHaveLength(3);
+    await p.teardown();
+  });
+
+  it("a block that ended in a gap closing mid-step is read again once its step ends", async () => {
+    const { server } = makeServer();
+    const p = makeProvider(server);
+    const events = await collect(p.runTurn(opts("gap-open")));
+    expect(events.find((e) => e.type === "error")).toBeUndefined();
+    expect(texts(events, "text_done").sort()).toEqual(["after the gap", "said in the gap"]);
+    await p.teardown();
+  });
+
   it("a child session inherits its parent's rules, and still gets codeoid's set on it", async () => {
     const { server } = makeServer();
     const p = makeProvider(server, { sessionId: "sess-kid", initialBackingId: "sess-kid" });

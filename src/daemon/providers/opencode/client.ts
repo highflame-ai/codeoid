@@ -140,17 +140,27 @@ export interface OcSkillInfo {
   description?: string;
 }
 
+/** A tool block's `state` (`Session.Message.ToolState`): `streaming` input is still partial JSON text. */
+export interface OcToolState {
+  status: "streaming" | "running" | "completed" | "error";
+  input?: Record<string, unknown> | string;
+  content?: unknown[];
+  metadata?: Record<string, unknown>;
+  error?: OcError;
+}
+
 /** `Session.Message.Info` (what a fork boundary and a feed gap need). */
 export interface OcMessage {
   id: string;
   type: string;
   /** An assistant message's blocks, in order. */
-  content?: Array<{ type: string; text?: string; id?: string }>;
+  content?: Array<{ type: string; text?: string; id?: string; name?: string; state?: OcToolState }>;
   cost?: number;
   tokens?: OcTokenUsage;
   error?: OcError;
   finish?: string;
-  time?: { created?: number; completed?: number };
+  /** `streamed`: the model's response ended (every text and reasoning block is final); `completed`: the step ended. */
+  time?: { created?: number; streamed?: number; completed?: number };
 }
 
 /** `ServerInfo`. */
@@ -322,6 +332,10 @@ export class OpencodeClient {
     return this.#request("GET", `/api/session/${encodeURIComponent(sessionID)}/message`, {
       query: cursor ? { cursor, limit: "200" } : { order: "asc", limit: "200" },
     });
+  }
+
+  async message(sessionID: string, messageID: string): Promise<OcMessage> {
+    return (await this.#request<{ data: OcMessage }>("GET", `/api/session/${encodeURIComponent(sessionID)}/message/${encodeURIComponent(messageID)}`)).data;
   }
 
   /** One page of messages, newest first. */

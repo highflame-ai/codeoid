@@ -172,8 +172,12 @@ interface Turn {
   owed: number;
   /** Inbox ids of those steers, to pay at their delivery. */
   steers: Set<string>;
-  /** Steers whose request hasn't answered yet: opencode can take one before codeoid learns its id. */
-  inflight: Set<Promise<void>>;
+  /**
+   * What the execution's end waits for: steer requests not answered yet
+   * (opencode can take one before codeoid learns its id), and read-backs of
+   * what a feed gap swallowed.
+   */
+  settling: Set<Promise<void>>;
   /** Inbox ids opencode delivered while this turn ran. */
   delivered: Set<string>;
   /** Executions started in this turn: an end decided late is moot once another began. */
@@ -300,6 +304,8 @@ export class OpencodeProvider implements SessionProvider {
   #streamedBlocks = new Set<string>();
   /** Assistant messages whose step was counted (from the feed, or read back after a gap): never twice. */
   #countedSteps = new Set<string>();
+  /** Assistant messages read back after a gap while still being written: read again when their step ends. */
+  #streamingReadBack = new Set<string>();
   #blockIndex = new Map<string, number>();
   #children = new Map<string, Child>();
 
@@ -401,7 +407,7 @@ export class OpencodeProvider implements SessionProvider {
       started: false,
       owed: 0,
       steers: new Set(),
-      inflight: new Set(),
+      settling: new Set(),
       delivered: new Set(),
       executions: 0,
       usage: emptyUsage(),
@@ -418,6 +424,7 @@ export class OpencodeProvider implements SessionProvider {
     this.#streamedBlocks.clear();
     this.#blockIndex.clear();
     this.#countedSteps.clear();
+    this.#streamingReadBack.clear();
 
     void this.#startTurn(turn, opts).catch((err: unknown) => {
       this.#failTurn(turn, `opencode: ${err instanceof Error ? err.message : String(err)}`);
@@ -537,12 +544,7 @@ export class OpencodeProvider implements SessionProvider {
         throw err;
       },
     );
-    const settled = sent.then(
-      () => {},
-      () => {},
-    );
-    turn.inflight.add(settled);
-    void settled.then(() => turn.inflight.delete(settled));
+    this.#settling(turn, sent);
     await sent;
   }
 
@@ -1083,6 +1085,8 @@ export class OpencodeProvider implements SessionProvider {
           this.#turn.finish = d.finish;
         }
         if (typeof d.assistantMessageID === "string") {
+          // Read back while still being written: its last block may have ended in the gap.
+          if (this.#streamingReadBack.delete(d.assistantMessageID)) this.#catchUp(d.assistantMessageID);
           if (this.#countedSteps.has(d.assistantMessageID)) return; // already read back after a gap
           this.#countedSteps.add(d.assistantMessageID);
         }
@@ -1120,11 +1124,12 @@ export class OpencodeProvider implements SessionProvider {
 
   /** The execution the turn waits on ended: so does the turn, unless a steer is still to run in another. */
   #executionEnded(turn: Turn, outcome: "succeeded" | "interrupted" | "failed", error: OcError | undefined): void {
-    if (turn.inflight.size > 0) {
-      // A steer's request hasn't answered: whether opencode took it in this
-      // execution (its delivery can come first) decides what comes next.
+    if (turn.settling.size > 0) {
+      // A steer's request hasn't answered (whether opencode took it in this
+      // execution decides what comes next — its delivery can come first), or
+      // a read-back is still recovering what a feed gap swallowed.
       const executions = turn.executions;
-      void Promise.all([...turn.inflight]).then(() => {
+      void Promise.all([...turn.settling]).then(() => {
         if (this.#turn === turn && !turn.queue.closed && turn.executions === executions) this.#executionEnded(turn, outcome, error);
       });
       return;
@@ -1138,6 +1143,16 @@ export class OpencodeProvider implements SessionProvider {
       return;
     }
     this.#finishTurn(turn, outcome, error);
+  }
+
+  /** Track `work` as something the turn's end waits for (failures are its own to report). */
+  #settling(turn: Turn, work: Promise<unknown>): void {
+    const settled = work.then(
+      () => {},
+      () => {},
+    );
+    turn.settling.add(settled);
+    void settled.then(() => turn.settling.delete(settled));
   }
 
   /** Session absorbs one `turn_done` per steer: the part of the reply before the steered message was taken. */
@@ -1157,7 +1172,7 @@ export class OpencodeProvider implements SessionProvider {
       started: true,
       owed: 0,
       steers: new Set(),
-      inflight: new Set(),
+      settling: new Set(),
       delivered: new Set(),
       executions: 1,
       usage: emptyUsage(),
@@ -1569,9 +1584,13 @@ export class OpencodeProvider implements SessionProvider {
     if (conn !== this.#conn || !this.#ses) return;
     const turn = this.#turn;
     if (turn && !turn.queue.closed) {
-      void this.#reconcile(conn, turn).catch((err: unknown) => {
-        console.error(`[opencode-provider ${this.#sessionId.slice(0, 8)}] reading back a turn after a feed gap failed: ${err instanceof Error ? err.message : String(err)}`);
-      });
+      // The turn's end waits for it: what the gap swallowed comes first.
+      this.#settling(
+        turn,
+        this.#reconcile(conn, turn).catch((err: unknown) => {
+          console.error(`[opencode-provider ${this.#sessionId.slice(0, 8)}] reading back a turn after a feed gap failed: ${err instanceof Error ? err.message : String(err)}`);
+        }),
+      );
     }
     for (const sid of [this.#ses, ...this.#children.keys()]) {
       void conn.client
@@ -1590,10 +1609,13 @@ export class OpencodeProvider implements SessionProvider {
   }
 
   /**
-   * After a gap in the feed. A turn whose execution ended in the gap would
-   * wait forever: if the session went idle after the turn began, its blocks,
-   * steps and outcome are read back from the session's messages (only what
-   * the feed didn't deliver) and the turn ends as opencode says it did.
+   * After a gap in the feed. The turn's messages are read back from the
+   * session, and what the feed didn't deliver is emitted: the blocks of
+   * every message whose response ended (of one still being written, all but
+   * its last block, which is read again when its step ends — #catchUp), the
+   * steps that ended, and the cards of calls that settled. A turn whose
+   * execution ended in the gap would wait forever: if the session went idle
+   * after the turn began, it ends as opencode says it did.
    */
   async #reconcile(conn: OpencodeConnection, turn: Turn): Promise<void> {
     const ses = this.#ses;
@@ -1609,7 +1631,8 @@ export class OpencodeProvider implements SessionProvider {
     const { busy, idle } = info.time ?? {};
     // A turn opencode started was seen after it began; a prompted one began before.
     const since = turn.adopted ? turn.startedAt - 5_000 : turn.startedAt;
-    if (busy === undefined || idle === undefined || idle < busy || busy < since) return; // still running, or not started yet
+    if (busy === undefined || busy < since) return; // not started yet: the feed has it all
+    const ended = idle !== undefined && idle >= busy;
     const mine: OcMessage[] = [];
     let cursor: string | undefined;
     let reachedStart = false;
@@ -1625,35 +1648,16 @@ export class OpencodeProvider implements SessionProvider {
       cursor = res.cursor?.next;
       if (!cursor) break;
     }
-    if (this.#turn !== turn || turn.queue.closed) return;
+    if (this.#turn !== turn || turn.queue.closed || this.#ses !== ses) return;
     let lastError: OcError | undefined;
     for (const m of mine.reverse()) {
       if (m.type !== "assistant") continue;
-      turn.lastAssistantMessageID = m.id;
+      if (ended) turn.lastAssistantMessageID = m.id;
       if (m.error) lastError = m.error;
-      let text = 0;
-      let reasoning = 0;
-      for (const block of m.content ?? []) {
-        if (block.type === "text") {
-          const key = `${m.id}:${text++}`;
-          if (this.#endedBlocks.has(key) || typeof block.text !== "string") continue;
-          this.#endedBlocks.add(key);
-          this.#emit({ type: "text_done", content: block.text });
-        } else if (block.type === "reasoning") {
-          const key = `r:${m.id}:${reasoning++}`;
-          if (this.#endedBlocks.has(key)) continue;
-          this.#endedBlocks.add(key);
-          const blockIndex = this.#thinkingIndex(key);
-          if (!this.#streamedBlocks.has(key) && block.text) this.#emit({ type: "thinking_delta", content: block.text, blockIndex });
-          this.#emit({ type: "thinking_done", blockIndex });
-        }
-      }
-      if (!this.#countedSteps.has(m.id) && (m.cost !== undefined || m.tokens)) {
-        this.#countedSteps.add(m.id);
-        addTokens(this.#counted, m.tokens, m.cost);
-        this.#recordStep(m.tokens, m.cost, true);
-      }
+      // Once the execution ended every message is final.
+      if (this.#emitReadBack(ses, m, ended || messageStreamed(m))) this.#streamingReadBack.add(m.id);
     }
+    if (!ended) return; // still running: the feed carries the rest
     // Spend no step reported (the title), from opencode's own total.
     this.#usageUpdated({ cost: info.cost, tokens: info.tokens });
     if (this.#turn !== turn || turn.queue.closed) return;
@@ -1663,6 +1667,65 @@ export class OpencodeProvider implements SessionProvider {
     while (turn.owed > 0) this.#payBoundary(turn);
     const outcome = info.outcome ?? (lastError ? "failed" : "succeeded");
     this.#finishTurn(turn, outcome, outcome === "failed" ? lastError : undefined);
+  }
+
+  /**
+   * What the feed didn't deliver of one assistant message read back: its
+   * ended blocks, its step once ended, and the results of calls whose card
+   * is showing. `final`: every block has ended; otherwise the last text or
+   * reasoning block may still be written, and is left to the feed. Returns
+   * whether one was left.
+   */
+  #emitReadBack(ses: string, m: OcMessage, final: boolean): boolean {
+    const blocks = m.content ?? [];
+    const last = blocks.at(-1);
+    const open = !final && (last?.type === "text" || last?.type === "reasoning") ? last : undefined;
+    let text = 0;
+    let reasoning = 0;
+    for (const block of blocks) {
+      if (block.type === "text") {
+        const key = `${m.id}:${text++}`;
+        if (block === open || this.#endedBlocks.has(key) || typeof block.text !== "string") continue;
+        this.#endedBlocks.add(key);
+        this.#emit({ type: "text_done", content: block.text });
+      } else if (block.type === "reasoning") {
+        const key = `r:${m.id}:${reasoning++}`;
+        if (block === open || this.#endedBlocks.has(key)) continue;
+        this.#endedBlocks.add(key);
+        const blockIndex = this.#thinkingIndex(key);
+        if (!this.#streamedBlocks.has(key) && block.text) this.#emit({ type: "thinking_delta", content: block.text, blockIndex });
+        this.#emit({ type: "thinking_done", blockIndex });
+      } else if (block.type === "tool" && block.id && this.#announced.has(`${ses}:${block.id}`)) {
+        const state = block.state;
+        if (state?.status === "completed") this.#toolSettled(ses, { id: block.id, content: state.content, metadata: state.metadata }, true);
+        else if (state?.status === "error") this.#toolSettled(ses, { id: block.id, content: state.content, error: state.error, metadata: state.metadata }, false);
+      }
+    }
+    if (!this.#countedSteps.has(m.id) && (m.finish !== undefined || m.time?.completed !== undefined) && (m.cost !== undefined || m.tokens)) {
+      this.#countedSteps.add(m.id);
+      addTokens(this.#counted, m.tokens, m.cost);
+      this.#recordStep(m.tokens, m.cost, true);
+    }
+    return open !== undefined;
+  }
+
+  /** A message read back while it was being written: its step ended, so its last block is final — read it again. */
+  #catchUp(messageID: string): void {
+    const conn = this.#conn;
+    const ses = this.#ses;
+    const turn = this.#turn;
+    if (!conn || !ses || !turn) return;
+    this.#settling(
+      turn,
+      conn.client
+        .message(ses, messageID)
+        .then((m) => {
+          if (this.#turn === turn && !turn.queue.closed && this.#ses === ses) this.#emitReadBack(ses, m, true);
+        })
+        .catch((err: unknown) => {
+          console.error(`[opencode-provider ${this.#sessionId.slice(0, 8)}] reading back a message after a feed gap failed: ${err instanceof Error ? err.message : String(err)}`);
+        }),
+    );
   }
 
   /** The server went away: every pending request with it counts as rejected. */
@@ -1742,6 +1805,11 @@ function remote(url: string, token: string | undefined): Record<string, unknown>
 /** The permission action a tool asks under (for a call recorded without a request). */
 function actionOfTool(name: string): string {
   return name === "write" || name === "patch" ? "edit" : name;
+}
+
+/** An assistant message whose response ended: all its text and reasoning blocks are final. */
+function messageStreamed(m: OcMessage): boolean {
+  return m.time?.streamed !== undefined || m.time?.completed !== undefined || m.finish !== undefined || m.error !== undefined;
 }
 
 /** A request about a session opencode no longer has. */
