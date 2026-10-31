@@ -9,7 +9,7 @@ codeoid start
   ├── Bun.serve() — HTTP + WebSocket server
   ├── ShutdownManager — cleanup registry, signal handlers, 30s grace period
   ├── SessionManager — rate limiting, session resume, scope enforcement
-  │   ├── ProviderRegistry — pluggable backends (claude default; openai, gemini, codex, pi, gemini-cli, qwen, llamacpp)
+  │   ├── ProviderRegistry — pluggable backends (claude default; openai, gemini, codex, pi, gemini-cli, qwen, llamacpp, opencode)
   │   └── Session × N — each drives one provider backend (Claude Agent SDK by default)
   │       ├── ScrollbackBuffer — circular ring, replayed on device handoff
   │       ├── TranscriptStore — JSONL persistence, survives daemon restart
@@ -54,7 +54,7 @@ src/
 │   ├── providers/                # Pluggable agent backends behind one SessionProvider interface
 │   │   ├── registry.ts           #   ProviderRegistry + createDefaultProviderRegistry()
 │   │   ├── interface.ts          #   SessionProvider contract
-│   │   └── claude|openai|gemini|codex|pi|acp|qwen|llamacpp/  # one dir per backend (acp = Gemini CLI)
+│   │   └── claude|openai|gemini|codex|pi|acp|qwen|llamacpp|opencode/  # one dir per backend (acp = Gemini CLI)
 │   ├── store.ts                  # bun:sqlite — sessions + audit_log tables
 │   ├── auth.ts                   # ZeroID JWT verification via @highflame/sdk
 │   ├── agent-identity.ts         # ZeroID identities for coding agents + sub-agents
@@ -79,7 +79,7 @@ src/
 ## Tech Stack
 
 - **Runtime**: Bun (native WebSocket, bun:sqlite, Bun.serve())
-- **Agent backends**: pluggable via `ProviderRegistry` — Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`, default), plus OpenAI, Gemini, Codex, pi, the Gemini CLI, Qwen Code (`@qwen-code/sdk`), and llama.cpp (`llamacpp`, opt-in)
+- **Agent backends**: pluggable via `ProviderRegistry` — Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`, default), plus OpenAI, Gemini, Codex, pi, the Gemini CLI, Qwen Code (`@qwen-code/sdk`), llama.cpp (`llamacpp`, opt-in), and opencode 2.2 (one shared private server)
 - **Auth**: ZeroID via `@highflame/sdk` (local JWKS verification)
 - **Telegram**: Grammy
 - **CLI**: Commander
@@ -91,7 +91,7 @@ No native addon dependencies. Single `bun build` produces a 1.1MB bundle.
 
 ### Sessions
 A session = one agent backend (the Claude Agent SDK by default; also Codex,
-Gemini, OpenAI, pi, the Gemini CLI, Qwen Code, or a local llama.cpp server)
+Gemini, OpenAI, pi, the Gemini CLI, Qwen Code, opencode, or a local llama.cpp server)
 working in one directory.
 Sessions are named, persistent, and daemon-owned. Multiple clients can
 attach/detach simultaneously from any frontend.
@@ -331,6 +331,32 @@ token exchange and writes `apiKey` (+ `zeroidUrl` if `--zeroid` given) to the
 config file. The shipped default issuer is the Highflame SaaS, so a hosted user
 just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
 `resolveZeroidUrl()` live in `src/config.ts`.
+
+### opencode backend
+
+`src/daemon/providers/opencode/` drives opencode 2.2 over its HTTP API
+(user guide: [docs/opencode.md](docs/opencode.md)). What's particular:
+
+- **One private server per daemon** (`OpencodeServer`, server.ts): started by
+  the first opencode session's first turn, shared, restarted on next use if it
+  died, stopped by the `opencode` shutdown step (and by opencode itself when
+  codeoid's stdin pipe closes). Loopback, fresh password per start, database
+  `providers.opencode.dbPath` (default beside codeoid's `dbPath`). The version
+  from `GET /api/info` must be 2.2.x (`opencodeVersionProblem`); outside it the
+  registry takes the backend off with the reason as its hint.
+- **Policy** (policy.ts): opencode asks about every action. Session rules end
+  in ask-everything; the server's agents are checked at start and a subagent
+  that would act unasked gets overrides (one restart) or the server is refused;
+  never-asking tool plugins are disabled; saved "always" rules are deleted.
+  Replies are `once` or `reject` with a message, never `always`
+  (`OpencodeClient.replyPermission` can't express it).
+- **Events**: the durable session log is the record (blocks, tools, steps with
+  cost, executions); the live feed only adds deltas, `permission.asked`, forms
+  and child sessions. A turn ends with its execution; a `now`/`next` push
+  steers and owes Session one absorbed `turn_done` (paid at the steer's
+  `session.inbox.delivered`).
+- **MCP** mounts are per location in opencode, so each session's are named
+  `coid<sha(session)>_<name>` and its rules deny other sessions' (`coid*`).
 
 ### Local models (llama.cpp)
 

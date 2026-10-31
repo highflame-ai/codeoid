@@ -88,8 +88,8 @@ CODEOID_RESUME_MAX_SESSIONS=200          # sessions restored from disk at startu
                                         #   startup time; the remainder stays on disk and loads
                                         #   on a later restart.
 CODEOID_DEFAULT_PROVIDER=claude         # backend for sessions created without --provider
-                                        #   (claude | codex | pi | qwen | gemini-cli | openai | gemini |
-                                        #    llamacpp — see docs/local-models.md).
+                                        #   (claude | codex | pi | qwen | gemini-cli | opencode | openai |
+                                        #    gemini | llamacpp — see docs/local-models.md, docs/opencode.md).
                                         #   An unknown, disabled or uninstalled backend stops the
                                         #   daemon at startup. Resumed sessions and the conductor
                                         #   keep their own backend.
@@ -182,6 +182,27 @@ Optional `~/.codeoid/config.json` (env vars take precedence):
   }
 }
 ```
+
+### opencode
+
+The opencode backend (opencode 2.2.x) is on by default when an `opencode` binary resolves. codeoid runs one private `opencode serve` per daemon, with its own database; docs/opencode.md has setup, credentials, and what it supports.
+
+```json
+{
+  "providers": {
+    "opencode": {
+      "enabled": true,
+      "command": "opencode",
+      "dbPath": "opencode/opencode.db",
+      "agent": "build"
+    }
+  }
+}
+```
+
+- `dbPath` — opencode's database for codeoid's sessions. Default: an `opencode` folder beside codeoid's own database (`dbPath` / `CODEOID_DB_PATH`); a relative path resolves from codeoid's config dir. It is never your own opencode's database.
+- `agent` — the opencode agent sessions run (`build`, `plan`, or your own); omit for opencode's default.
+- opencode's sign-ins live in its database: sign in against codeoid's with `OPENCODE_DB=<that path> opencode auth login`, or give it keys in `~/.codeoid/.env`. `codeoid account` doesn't apply to it.
 
 ### `~/.codeoid/.env` — env-only secrets
 

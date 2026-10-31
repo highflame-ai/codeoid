@@ -38,6 +38,7 @@ This page says where each kind of server comes from, which backends it reaches, 
     It doesn't cover the code a command runs: a server started from a script in the repo (`node ./mcp/server.js`) runs whatever that script is when it starts.
   - Approving in codeoid also covers a server you denied in Claude Code: the two approvals are separate.
 - **Claude** always loads its own copies of Claude's servers (the Claude CLI reads its config itself); codeoid adds the rest of the registry.
+- **opencode** gets every server through codeoid, mounted for the session alone (opencode's MCP set is per directory, so each session's mounts are named for it and its rules deny every other session's). It doesn't read a project's opencode config, and MCP servers in your own opencode config are refused at the approval gate (docs/opencode.md).
 - **Qwen** reads a project's `.mcp.json` itself, under its own rules rather than codeoid's approval (measured: codeoid's copy of the same name is overridden by Qwen's own), so on Qwen every name the `.mcp.json` declares is left to Qwen.
   Your own servers of other names still reach Qwen through codeoid.
 
