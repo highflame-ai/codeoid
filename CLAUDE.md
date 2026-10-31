@@ -9,7 +9,7 @@ codeoid start
   ├── Bun.serve() — HTTP + WebSocket server
   ├── ShutdownManager — cleanup registry, signal handlers, 30s grace period
   ├── SessionManager — rate limiting, session resume, scope enforcement
-  │   ├── ProviderRegistry — pluggable backends (claude default; openai, gemini, codex, pi, gemini-cli, qwen, llamacpp)
+  │   ├── ProviderRegistry — pluggable backends (claude default; openai, gemini, codex, pi, gemini-cli, qwen, llamacpp, opencode)
   │   └── Session × N — each drives one provider backend (Claude Agent SDK by default)
   │       ├── ScrollbackBuffer — circular ring, replayed on device handoff
   │       ├── TranscriptStore — JSONL persistence, survives daemon restart
@@ -54,7 +54,7 @@ src/
 │   ├── providers/                # Pluggable agent backends behind one SessionProvider interface
 │   │   ├── registry.ts           #   ProviderRegistry + createDefaultProviderRegistry()
 │   │   ├── interface.ts          #   SessionProvider contract
-│   │   └── claude|openai|gemini|codex|pi|acp|qwen|llamacpp/  # one dir per backend (acp = Gemini CLI)
+│   │   └── claude|openai|gemini|codex|pi|acp|qwen|llamacpp|opencode/  # one dir per backend (acp = Gemini CLI)
 │   ├── store.ts                  # bun:sqlite — sessions + audit_log tables
 │   ├── auth.ts                   # ZeroID JWT verification via @highflame/sdk
 │   ├── agent-identity.ts         # ZeroID identities for coding agents + sub-agents
@@ -79,7 +79,7 @@ src/
 ## Tech Stack
 
 - **Runtime**: Bun (native WebSocket, bun:sqlite, Bun.serve())
-- **Agent backends**: pluggable via `ProviderRegistry` — Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`, default), plus OpenAI, Gemini, Codex, pi, the Gemini CLI, Qwen Code (`@qwen-code/sdk`), and llama.cpp (`llamacpp`, opt-in)
+- **Agent backends**: pluggable via `ProviderRegistry` — Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`, default), plus OpenAI, Gemini, Codex, pi, the Gemini CLI, Qwen Code (`@qwen-code/sdk`), llama.cpp (`llamacpp`, opt-in), and opencode 2.2.5+ (one shared private server)
 - **Auth**: ZeroID via `@highflame/sdk` (local JWKS verification)
 - **Telegram**: Grammy
 - **CLI**: Commander
@@ -91,7 +91,7 @@ No native addon dependencies. Single `bun build` produces a 1.1MB bundle.
 
 ### Sessions
 A session = one agent backend (the Claude Agent SDK by default; also Codex,
-Gemini, OpenAI, pi, the Gemini CLI, Qwen Code, or a local llama.cpp server)
+Gemini, OpenAI, pi, the Gemini CLI, Qwen Code, opencode, or a local llama.cpp server)
 working in one directory.
 Sessions are named, persistent, and daemon-owned. Multiple clients can
 attach/detach simultaneously from any frontend.
@@ -331,6 +331,93 @@ token exchange and writes `apiKey` (+ `zeroidUrl` if `--zeroid` given) to the
 config file. The shipped default issuer is the Highflame SaaS, so a hosted user
 just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
 `resolveZeroidUrl()` live in `src/config.ts`.
+
+### opencode backend
+
+`src/daemon/providers/opencode/` drives opencode 2.2 over its HTTP API
+(user guide: [docs/opencode.md](docs/opencode.md)). What's particular:
+
+- **One private server per daemon** (`OpencodeServer`, server.ts): started by
+  the first opencode session's first turn, shared, restarted on next use if it
+  died, stopped by the `opencode` shutdown step (and by opencode itself when
+  codeoid's stdin pipe closes). Loopback, fresh password per start, database
+  `providers.opencode.dbPath` (default beside codeoid's `dbPath`). The version
+  from `GET /api/info` must be 2.2.x from 2.2.5 on (`opencodeVersionProblem`;
+  2.2.2 runs a redirection-only shell line unasked); outside it the
+  registry takes the backend off with the reason as its hint.
+- **Policy** (policy.ts): opencode asks about every action. Session rules end
+  in ask-everything; the server's agents are checked at start and a subagent
+  that would act unasked gets overrides (one restart) or the server is refused;
+  never-asking tool plugins are disabled; saved "always" rules are deleted.
+  Replies are `once` or `reject` with a message, never `always`
+  (`OpencodeClient.replyPermission` can't express it). opencode follows a
+  `webfetch`'s redirects itself, checking hops only against the rules, so an
+  approved fetch's session carries a fence while it runs (`fetchFence`: other
+  origins denied) and it is lifted when the call settles. A plugin can settle a
+  request itself, so the server's global config dir is codeoid's
+  (`OPENCODE_CONFIG_DIR`, `config/` beside the DB; only the provider and model
+  keys of the user's `~/.config/opencode` are carried in), a server listing a
+  plugin that isn't a built-in is refused at start and before every turn
+  (`checkPlugins`), and a call that succeeded without asking stops the server
+  (its own turn says why; the server's other sessions get a neutral reason;
+  a call read back after a feed gap is judged the same, `#settleReadBack`) —
+  except a shell line with no command in it (`commandlessShellLine`), which
+  opencode 2.2.5 runs unasked by its own rule. Such a line can still expand a
+  variable, so every session's and child's shell runs with a bare environment
+  (`opencodeShellEnv`, `PUT …/environment` before every turn and as a child is
+  learned; a child's requests are allowed only once it's set): the server's
+  model keys and injected config never reach it.
+- **Location**: opencode runs a session's tools in its location, and a fork
+  keeps its source's. A fork (or a resumed session) whose location isn't the
+  workdir is moved there (`#moveInto`, `POST …/move`; the move's own
+  execution is waited out before the session is followed) before anything
+  runs; one that didn't move falls back to the transcript seed in a new session.
+- **Teardown** stops the session's execution, subagents and background shells
+  (`GET`/`DELETE /api/shell`: a stopped shell still wakes its session), and the
+  wake. A fresh attach to a session found running stops that leftover
+  execution before prompting (`#stopLeftover`). Running means listed in
+  `GET /api/session/active`, for a child as for the session: a server that
+  died mid-execution never wrote their `idle`, so a stored `busy` is stale
+  on the next server (a gap's read-back neither adopts nor keeps such a child).
+- **Events**: the live feed is the only stream: it carries each session's
+  durable events (blocks, tools, steps with cost, executions; deduped by
+  `durable.seq`) and the ephemeral ones (deltas, `permission.asked`, forms,
+  `usage.updated`, child sessions). opencode 2.2's per-session log endpoint
+  replays nothing and follows nothing, so it isn't read; after a feed gap
+  (`#afterGap`) children created in it are listed (`?parentID=`) and each
+  running child is read back (cards, steps, end), then the turn is read back
+  from the session's messages (`#reconcile`: ended blocks, steps, settled
+  cards, steers delivered — a delivered input is a user message under its
+  inbox id; a turn whose execution ended in the gap ends there), or with no
+  turn open an execution that started unseen is adopted and read back. A
+  request re-offered after one takes its call's input from the stored
+  message. A session the feed names that the provider doesn't know (a
+  subagent continued by its id after a rebuild: opencode reuses it silently)
+  is looked up when it starts or asks, and adopted if it's a child, what
+  came meanwhile replayed (`#whenChild`). Settled calls and counted steps are remembered across turns, so a
+  late feed repeats nothing. Spend past the steps in `usage.updated` (the
+  title opencode generates, a compaction's requests) is billed as a side
+  call, and the running total is read as a turn ends (`#finishCounted`: the
+  title lands just after the execution; a message pushed during that read
+  still joins the turn); a compaction's end isn't counted. A turn ends with its execution
+  (after any steer request still in flight, and any read-back); a
+  `now`/`next` push waits for the turn's prompt to be posted, steers and owes
+  Session one absorbed `turn_done` (paid at the steer's
+  `session.inbox.delivered`, when its request answers if delivery came first,
+  or — refused — just before the turn's last `turn_done`); `later` is
+  delivered inside the running execution (one queued after its last step
+  runs in the next execution, which the turn waits for). A user interrupt withdraws the
+  turn's undelivered inputs from opencode's inbox.
+- **Code Mode** (`execute`) and opencode's `browser` tools are hidden by deny
+  rules: on 2.2.2 a Code Mode script's `fetch` runs without asking.
+- **MCP** mounts are per location in opencode, so each session's are named
+  `coid<sha(session)>_<name>` and its rules deny other sessions' (`coid*`).
+- **Commands** (`runnableCommand`, policy.ts): only opencode's built-ins
+  (known by name and listed description: a config command replaces one of
+  the same name) and the prompts of the session's own mounts run as
+  commands. Another session's mount prompt would run with its credential;
+  a config command's template runs `` !`…` `` through the shell, arguments
+  included, unasked. Any other `/name …` goes to the model as text.
 
 ### Local models (llama.cpp)
 

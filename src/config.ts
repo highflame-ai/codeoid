@@ -900,6 +900,27 @@ const ProvidersSchema = z
         mcpServers: z.array(z.string()).default([]),
       })
       .default({ enabled: false, baseUrl: "http://127.0.0.1:8080/v1", apiKey: "sk-local", mcpServers: [] }),
+    /**
+     * opencode 2.x (https://opencode.ai), driven over its HTTP server. codeoid
+     * runs ONE private `opencode serve` per daemon, started on the first
+     * opencode session (docs/opencode.md).
+     */
+    opencode: z
+      .object({
+        /** Register the opencode backend in the provider catalog. */
+        enabled: z.boolean().default(true),
+        /** Binary to spawn — override for a wrapper script or absolute path. */
+        command: z.string().default("opencode"),
+        /**
+         * opencode's database for codeoid's sessions. Default: an `opencode`
+         * folder beside codeoid's own database (`dbPath`). Relative paths
+         * resolve from codeoid's config dir. Never the user's own opencode DB.
+         */
+        dbPath: z.string().optional(),
+        /** opencode agent sessions run (`build`, `plan`, or a custom one); omit for opencode's default. */
+        agent: z.string().optional(),
+      })
+      .default({ enabled: true, command: "opencode" }),
   })
   .default({
     pi: { enabled: true, command: "pi" },
@@ -907,6 +928,7 @@ const ProvidersSchema = z
     geminiCli: { enabled: true, command: "gemini" },
     qwen: { enabled: true },
     llamacpp: { enabled: false, baseUrl: "http://127.0.0.1:8080/v1", apiKey: "sk-local", mcpServers: [] },
+    opencode: { enabled: true, command: "opencode" },
   });
 
 /**
@@ -1493,6 +1515,14 @@ export interface CodeoidConfig {
       model?: string;
       mcpServers: string[];
     };
+    /** Optional in the type (older hand-built configs predate it); loadConfig always fills it. */
+    opencode?: {
+      enabled: boolean;
+      command: string;
+      /** Absolute once loadConfig resolved it (default beside `dbPath`). */
+      dbPath?: string;
+      agent?: string;
+    };
   };
   /**
    * Canonical MCP server registry — declared once, mounted on every backend
@@ -1852,7 +1882,17 @@ export function loadConfig(opts: LoadOptions = {}): CodeoidConfig {
     collaboration: parsed.collaboration,
     rateLimit: parsed.rateLimit,
     pipeline: parsed.pipeline,
-    providers: parsed.providers,
+    providers: {
+      ...parsed.providers,
+      // opencode's database lives with codeoid's data: beside codeoid's own
+      // database unless overridden, never the user's opencode home.
+      opencode: {
+        ...parsed.providers.opencode,
+        dbPath: parsed.providers.opencode.dbPath
+          ? configRelResolve(parsed.providers.opencode.dbPath)
+          : join(dirname(dbPath), "opencode", "opencode.db"),
+      },
+    },
     mcpServers: parsed.mcpServers,
     mcpOAuth: parsed.mcpOAuth,
     hooks: parsed.hooks,

@@ -44,7 +44,7 @@ A change never cuts a running turn short.
 - **Now**, on the running backend: Claude (except to or from Off, or back to Default), Qwen (except back to Default), pi.
   A change that needs a rebuild waits while the backend has background work running, so that work isn't stopped.
   Until a change is in effect the pickers mark it "pending" (Stop ends background work), and the session says when it lands.
-- **From the next turn**: Codex, OpenAI, llama.cpp, Gemini — they take it with every request — and the exceptions above, whose next turn starts a fresh query that resumes the conversation.
+- **From the next turn**: Codex, OpenAI, llama.cpp, Gemini, opencode — they take it with every request — and the exceptions above, whose next turn starts a fresh query that resumes the conversation.
 - **After a restart, between turns**: the Gemini CLI, which reads it only from its settings at startup.
   It restarts before the next turn that starts with no background work running, and resumes the conversation, as after a model change.
 
@@ -64,6 +64,7 @@ Notes:
 
 - **Claude** keeps adaptive thinking, with readable summaries, at every level but Off.
 - **OpenAI** sends `reasoning_effort`; a model that doesn't reason rejects it.
+- **opencode** picks the model's reasoning variant named like the level (`minimal` … `max`, `none` for Off), switched on its session before the prompt; Default, or a level the model has no variant for, runs it without one (opencode's own default). The pickers offer the levels each model has a variant for.
 - **Gemini** sends `thinkingConfig` per request: a token budget for 2.5 models (Flash-Lite thinks from 512, or 0 for Off), a level for 3.x (Pro takes only Low and High); other models get nothing.
 - **The Gemini CLI** gets values every model of the family accepts, since its settings can't know which model runs: 2.5 budgets from 512 (Flash-Lite's floor; Pro can't turn thinking off, so Off is the lowest budget) to 24576 (Flash's ceiling), and for 3.x only Low and High (all that Pro takes).
   It runs with a settings overlay of its usual home (an account's, or yours) whose `chat-base-2.5` and `chat-base-3` aliases carry the budget or level; logins and chats are linked, so nothing else changes.

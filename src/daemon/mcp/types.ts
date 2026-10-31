@@ -119,7 +119,7 @@ export function isOAuthServer(spec: McpServerSpec): boolean {
  * fixed at start). They cannot carry a refreshing OAuth token, so they do not
  * mount OAuth servers natively (docs/mcp-oauth-design.md §5).
  */
-export const NATIVE_MOUNT_BACKENDS: readonly string[] = ["claude", "codex", "gemini-cli", "qwen"];
+export const NATIVE_MOUNT_BACKENDS: readonly string[] = ["claude", "codex", "gemini-cli", "qwen", "opencode"];
 
 /**
  * Native-mount backends that still get OAuth servers, through an in-process
@@ -132,7 +132,7 @@ export const OAUTH_BRIDGED_BACKENDS: readonly string[] = ["claude"];
  * Native-mount backends that get OAuth servers through the daemon's loopback
  * relay (#396, mcp/proxy.ts), with a per-session proxy token.
  */
-export const OAUTH_PROXIED_BACKENDS: readonly string[] = ["codex", "gemini-cli", "qwen"];
+export const OAUTH_PROXIED_BACKENDS: readonly string[] = ["codex", "gemini-cli", "qwen", "opencode"];
 
 /** Backends an OAuth server does not reach at all yet (none, since #396). */
 export const OAUTH_UNSUPPORTED_BACKENDS: readonly string[] = NATIVE_MOUNT_BACKENDS.filter(

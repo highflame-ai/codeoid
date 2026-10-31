@@ -35,6 +35,9 @@ import { CODEX_INSTALL_HINT, resolveCodexCommand } from "./codex/resolve.js";
 import { GeminiAcpProvider } from "./acp/index.js";
 import { GEMINI_CLI_INSTALL_HINT, resolveGeminiCliCommand } from "./acp/resolve.js";
 import { QwenProvider } from "./qwen/index.js";
+import { OPENCODE_DISPLAY_NAME, OPENCODE_PROVIDER_ID, OpencodeProvider } from "./opencode/index.js";
+import { OPENCODE_INSTALL_HINT, opencodeDbPath, resolveOpencodeCommand } from "./opencode/resolve.js";
+import { OpencodeServer } from "./opencode/server.js";
 import { SCRIPTED_ENV, SCRIPTED_PROVIDER_ID, ScriptedProvider } from "./scripted/index.js";
 import { StatelessSessionProvider } from "./stateless.js";
 import { LLAMACPP_DISPLAY_NAME, LLAMACPP_PROVIDER_ID, createLlamaCppProvider } from "./llamacpp/index.js";
@@ -297,6 +300,7 @@ const ENABLE_KEY: Record<string, string> = {
   "gemini-cli": "geminiCli",
   qwen: "qwen",
   llamacpp: "llamacpp",
+  opencode: "opencode",
 };
 
 /**
@@ -591,6 +595,56 @@ export function createDefaultProviderRegistry(
           extraEnv: init.extraEnv,
         }),
     });
+  }
+  if (config?.providers?.opencode?.enabled !== false) {
+    const configured = config?.providers?.opencode?.command;
+    const resolution = resolveOpencodeCommand(configured === "opencode" ? undefined : configured, env);
+    if (resolution) {
+      // ONE server for every opencode session of this daemon, started by the
+      // first one's first turn (opencode/server.ts). A server reporting a
+      // version outside the supported range takes the backend off the
+      // catalog, with the reason as its hint.
+      let server: OpencodeServer | null = null;
+      const shared = (): OpencodeServer => {
+        server ??= new OpencodeServer({
+          command: resolution.command,
+          argsPrefix: resolution.argsPrefix,
+          dbPath: opencodeDbPath(config),
+          onIncompatible: (hint) => {
+            // The default backend stays registered: its sessions keep failing with the hint instead.
+            if (registry.has(OPENCODE_PROVIDER_ID) && registry.defaultId !== OPENCODE_PROVIDER_ID) registry.unregister(OPENCODE_PROVIDER_ID);
+            registry.markUnavailable(OPENCODE_PROVIDER_ID, hint);
+          },
+        });
+        return server;
+      };
+      registry.register({
+        id: OPENCODE_PROVIDER_ID,
+        displayName: OPENCODE_DISPLAY_NAME,
+        create: (init) =>
+          new OpencodeProvider({
+            sessionId: init.sessionId,
+            initialBackingId: init.initialBackingId,
+            server: shared(),
+            store: init.store,
+            workspaceId: init.workspaceId,
+            tenant: init.tenant,
+            memoryMcp: init.memoryMcp,
+            mcpProxy: init.mcpHub?.proxy ?? undefined,
+            blackboardMcp: init.blackboardMcp,
+            mcpRegistry: init.mcpRegistry,
+            onModels: init.onModels,
+            agent: config?.providers?.opencode?.agent,
+          }),
+      });
+    } else {
+      registry.markUnavailable(
+        OPENCODE_PROVIDER_ID,
+        configured !== undefined && configured !== "opencode"
+          ? `providers.opencode.command (${JSON.stringify(configured)}) does not exist or is not on PATH`
+          : OPENCODE_INSTALL_HINT,
+      );
+    }
   }
   // The end-to-end suite's scripted backend (#429): only when a test names a
   // script, so a normal install never offers it.
