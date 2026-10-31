@@ -1203,13 +1203,24 @@ describe("opencode commands and fork", () => {
 // ── O13 version range, agent check, saved approvals ─────────────────────────
 
 describe("opencode version and safety checks", () => {
-  it("accepts 2.2.x only", () => {
-    expect(opencodeVersionProblem("2.2.2")).toBeNull();
+  it("accepts 2.2.5 and later 2.2 releases only", () => {
+    expect(opencodeVersionProblem("2.2.5")).toBeNull();
+    expect(opencodeVersionProblem("v2.2.5")).toBeNull();
+    expect(opencodeVersionProblem("2.2.5+build.7")).toBeNull();
     expect(opencodeVersionProblem("2.2.10-beta.1")).toBeNull();
+    // 2.2.2 runs a shell line made only of redirections without asking.
+    expect(opencodeVersionProblem("2.2.2")).toContain("runs some shell commands without asking codeoid");
+    expect(opencodeVersionProblem("2.2.4")).toContain("2.2.5 or a later 2.2.x");
+    expect(opencodeVersionProblem("2.2.5-beta.1")).toContain("without asking");
     expect(opencodeVersionProblem("1.4.0")).toContain("1.x");
-    expect(opencodeVersionProblem("2.3.0")).toContain("2.2.x");
+    expect(opencodeVersionProblem("2.3.0")).toContain("2.2.5 or a later 2.2.x");
     expect(opencodeVersionProblem("2.1.9")).toContain("predates");
     expect(opencodeVersionProblem("local")).toContain("can't read");
+  });
+
+  it("refuses a 2.2 release below the floor", async () => {
+    const { server } = makeServer({ FAKE_OPENCODE_VERSION: "2.2.2" });
+    await expect(server.ensure()).rejects.toThrow(/opencode 2\.2\.2 is installed.*without asking codeoid/);
   });
 
   it("refuses a server outside the range, and says so", async () => {

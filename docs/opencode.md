@@ -4,7 +4,7 @@
 
 ## Setup
 
-1. Install opencode **2.2.x**. codeoid speaks the 2.x server API only (2.x replaced 1.x's API wholesale) and checks the version the server reports; anything else is refused with a message saying so, and the backend is taken off the picker.
+1. Install opencode **2.2.5 or a later 2.2 release**. codeoid speaks the 2.x server API only (2.x replaced 1.x's API wholesale) and checks the version the server reports; anything else is refused with a message saying so, and the backend is taken off the picker. Earlier 2.2 releases are refused too: opencode 2.2.2 runs a shell command made only of redirections (`> file`) without asking anyone, so it could create or empty any file you can write. 2.2.5 asks for these.
 2. Give opencode a model credential. Two ways:
    - **Environment keys.** `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY` and other `*_API_KEY` / `*_API_TOKEN` variables in the daemon's environment (`~/.codeoid/.env`) reach opencode. Anything else (`AWS_*` for Bedrock, say) goes through `CODEOID_AGENT_ENV_ALLOW`.
    - **A stored sign-in.** opencode keeps sign-ins in its database, and codeoid's opencode has its own (below), so sign in against that one: `OPENCODE_DB=~/.codeoid/opencode/opencode.db opencode auth login`. Don't run opencode's TUI on that database: approvals you save there ("always") would be rules codeoid never sees, so codeoid deletes any it finds.
@@ -97,7 +97,7 @@ Because every call reaches the gate under these names, a pipeline phase's capabi
 ## Troubleshooting
 
 - *opencode is unavailable: no opencode binary found* — install it, or set `providers.opencode.command`.
-- *opencode X is installed, but codeoid supports opencode 2.2.x* — install a 2.2 release.
+- *opencode X is installed, but codeoid supports opencode 2.2.5 or a later 2.2.x* — install 2.2.5 or a later 2.2 release (2.2.0 to 2.2.4 are refused, see Setup).
 - *opencode agents … would run tools without asking codeoid* — an agent's rules allow tools in a way codeoid's overrides can't reach. Remove it from opencode's system config directory (`/etc/opencode`).
 - *opencode runs plugins codeoid doesn't know* — a plugin in opencode's system config directory, or in codeoid's own opencode config dir (`config/` beside its database), which codeoid never writes. Remove it there.
 - *opencode ran … without asking codeoid* — something settled a permission request itself; codeoid stopped the server. The next turn starts a new one, checked again.

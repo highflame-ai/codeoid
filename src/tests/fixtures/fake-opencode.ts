@@ -71,7 +71,7 @@
  *                    behind: the call's result is stored before the late feed
  *                    delivers it
  *
- * Knobs (env): FAKE_OPENCODE_VERSION (default 2.2.2), FAKE_OPENCODE_STARTS
+ * Knobs (env): FAKE_OPENCODE_VERSION (default 2.2.5), FAKE_OPENCODE_STARTS
  * (append a line per start), FAKE_OPENCODE_UNSAFE_AGENT=1 (an `explore`
  * subagent that allows shell unless overridden), FAKE_OPENCODE_STUBBORN=1
  * (ignore agent overrides), FAKE_OPENCODE_SAVED=1 (one saved "always" rule),
@@ -92,7 +92,7 @@
 import { appendFileSync } from "node:fs";
 
 const password = process.env.OPENCODE_PASSWORD ?? "";
-const version = process.env.FAKE_OPENCODE_VERSION ?? "2.2.2";
+const version = process.env.FAKE_OPENCODE_VERSION ?? "2.2.5";
 const config = (() => {
   try {
     return JSON.parse(process.env.OPENCODE_CONFIG_CONTENT ?? "{}") as Record<string, unknown>;

@@ -79,7 +79,7 @@ src/
 ## Tech Stack
 
 - **Runtime**: Bun (native WebSocket, bun:sqlite, Bun.serve())
-- **Agent backends**: pluggable via `ProviderRegistry` — Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`, default), plus OpenAI, Gemini, Codex, pi, the Gemini CLI, Qwen Code (`@qwen-code/sdk`), llama.cpp (`llamacpp`, opt-in), and opencode 2.2 (one shared private server)
+- **Agent backends**: pluggable via `ProviderRegistry` — Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`, default), plus OpenAI, Gemini, Codex, pi, the Gemini CLI, Qwen Code (`@qwen-code/sdk`), llama.cpp (`llamacpp`, opt-in), and opencode 2.2.5+ (one shared private server)
 - **Auth**: ZeroID via `@highflame/sdk` (local JWKS verification)
 - **Telegram**: Grammy
 - **CLI**: Commander
@@ -342,7 +342,8 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
   died, stopped by the `opencode` shutdown step (and by opencode itself when
   codeoid's stdin pipe closes). Loopback, fresh password per start, database
   `providers.opencode.dbPath` (default beside codeoid's `dbPath`). The version
-  from `GET /api/info` must be 2.2.x (`opencodeVersionProblem`); outside it the
+  from `GET /api/info` must be 2.2.x from 2.2.5 on (`opencodeVersionProblem`;
+  2.2.2 runs a redirection-only shell line unasked); outside it the
   registry takes the backend off with the reason as its hint.
 - **Policy** (policy.ts): opencode asks about every action. Session rules end
   in ask-everything; the server's agents are checked at start and a subagent

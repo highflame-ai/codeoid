@@ -185,7 +185,7 @@ Optional `~/.codeoid/config.json` (env vars take precedence):
 
 ### opencode
 
-The opencode backend (opencode 2.2.x) is on by default when an `opencode` binary resolves. codeoid runs one private `opencode serve` per daemon, with its own database; docs/opencode.md has setup, credentials, and what it supports.
+The opencode backend (opencode 2.2.5 or a later 2.2.x) is on by default when an `opencode` binary resolves. codeoid runs one private `opencode serve` per daemon, with its own database; docs/opencode.md has setup, credentials, and what it supports.
 
 ```json
 {

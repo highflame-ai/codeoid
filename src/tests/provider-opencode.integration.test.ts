@@ -20,6 +20,7 @@
  *
  * The database is a temp one unless CODEOID_OPENCODE_DB names one.
  *
+ *   I0  a release below the supported floor (2.2.2) is refused; every other case is skipped on it
  *   I1  the server starts: version in range, password, the agent check, the DB where codeoid put it
  *   I2  catalogs decode: models (provider/model ids, variants), agents, commands
  *   I3  a text turn: text_done, turn_done with real cost and tokens, nativeRef — promptly
@@ -40,6 +41,7 @@
  *   I18 (scripted only) a subagent created in a feed gap is found again (`?parentID=`): its request reaches the gate
  *   I19 (scripted only) a steer the user's interrupt dropped is withdrawn from opencode's inbox: the next turn doesn't get it
  *   I20 (scripted only) only opencode's built-in commands run as commands: a config command's shell spans never run
+ *   I21 (scripted only) a shell line made only of redirections asks first: denied, the file outside the workdir is untouched
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
@@ -47,21 +49,39 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { OpencodeProvider } from "../daemon/providers/opencode/index.js";
-import { OpencodeServer } from "../daemon/providers/opencode/server.js";
+import { OpencodeIncompatibleError, OpencodeServer } from "../daemon/providers/opencode/server.js";
 import { buildOpencodeEnv } from "../daemon/providers/opencode/policy.js";
-import { resolveOpencodeCommand } from "../daemon/providers/opencode/resolve.js";
+import { opencodeVersionProblem, resolveOpencodeCommand } from "../daemon/providers/opencode/resolve.js";
 import type { ProviderEvent, ToolApprovalFn, TurnOpts, TurnRun, UiRequest } from "../daemon/providers/interface.js";
 import type { Store } from "../daemon/store.js";
 
 const resolved = resolveOpencodeCommand(process.env.CODEOID_OPENCODE_COMMAND);
-const RUN = process.env.CODEOID_OPENCODE_INTEGRATION === "1" && resolved !== null;
+const ENABLED = process.env.CODEOID_OPENCODE_INTEGRATION === "1" && resolved !== null;
+/** The binary's own version (`opencode --version`), to know before the cases are defined whether codeoid takes it. */
+const VERSION = ENABLED ? binaryVersion(resolved!.command, resolved!.argsPrefix) : undefined;
+/** A release codeoid refuses (2.2.2): only I0 runs, checking that it is refused. */
+const REFUSED = ENABLED && opencodeVersionProblem(VERSION) !== null;
+const RUN = ENABLED && !REFUSED;
 const SCRIPTED = process.env.CODEOID_OPENCODE_MODEL === "scripted";
 const MODEL = SCRIPTED ? "scripted/scripted-1" : process.env.CODEOID_OPENCODE_MODEL;
 const maybe = RUN ? it : it.skip;
+const maybeRefused = REFUSED ? it : it.skip;
 const maybeTurn = RUN && MODEL ? it : it.skip;
 const maybeScripted = RUN && SCRIPTED ? it : it.skip;
 
-if (!RUN) {
+function binaryVersion(command: string, argsPrefix: string[]): string | undefined {
+  const home = mkdtempSync(join(tmpdir(), "codeoid-opencode-version-"));
+  try {
+    const out = Bun.spawnSync([command, ...argsPrefix, "--version"], { stdin: "ignore", env: { ...process.env, HOME: home }, timeout: 30_000 });
+    return /\d+\.\d+\.\d+\S*/.exec(out.stdout.toString())?.[0];
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+if (REFUSED) {
+  console.log(`[opencode integration] opencode ${VERSION} is below codeoid's floor — only I0 (it is refused) runs.`);
+} else if (!RUN) {
   console.log(
     `[opencode integration] SKIPPED — set CODEOID_OPENCODE_INTEGRATION=1 and install opencode 2.2 to run (resolved=${resolved ? resolved.command : "none"}).`,
   );
@@ -69,13 +89,17 @@ if (!RUN) {
   console.log("[opencode integration] turn tests SKIPPED — set CODEOID_OPENCODE_MODEL=scripted, or provider/model (with its credential).");
 }
 
-const WORK = RUN ? mkdtempSync(join(tmpdir(), "codeoid-opencode-it-")) : "/tmp";
+const WORK = ENABLED ? mkdtempSync(join(tmpdir(), "codeoid-opencode-it-")) : "/tmp";
 const DB = process.env.CODEOID_OPENCODE_DB ?? join(WORK, "data", "opencode", "opencode.db");
 let server: OpencodeServer | null = null;
 let scripted: ReturnType<typeof Bun.spawn> | null = null;
 let modelProviders: Record<string, unknown> | undefined;
 
 beforeAll(async () => {
+  if (REFUSED) {
+    server = new OpencodeServer({ command: resolved!.command, argsPrefix: resolved!.argsPrefix, dbPath: DB });
+    return;
+  }
   if (!RUN) return;
   if (SCRIPTED) {
     scripted = Bun.spawn([process.execPath, join(import.meta.dir, "fixtures", "scripted-chat-model.ts")], { stdout: "pipe", stderr: "inherit" });
@@ -104,7 +128,7 @@ beforeAll(async () => {
 afterAll(async () => {
   await server?.stop();
   scripted?.kill();
-  if (RUN) rmSync(WORK, { recursive: true, force: true });
+  if (ENABLED) rmSync(WORK, { recursive: true, force: true });
 });
 
 /** The prompt for this run: plain words for a real model, the script for the scripted one. */
@@ -183,6 +207,13 @@ function texts(events: ProviderEvent[]): string[] {
 }
 
 describe("opencode (real binary)", () => {
+  maybeRefused("I0 a release below the supported floor is refused, saying why", async () => {
+    // opencode 2.2.2 runs a shell line made only of redirections without a permission request.
+    await expect(server!.ensure()).rejects.toBeInstanceOf(OpencodeIncompatibleError);
+    await expect(server!.ensure()).rejects.toThrow(/without asking codeoid/);
+    expect(server!.running).toBe(false);
+  }, 60_000);
+
   maybe("I1 starts a private server: version in range, password, agent check, codeoid's DB", async () => {
     const conn = await server!.ensure();
     expect(new URL(conn.client.baseUrl).hostname).toBe("127.0.0.1");
@@ -654,6 +685,31 @@ describe("opencode (real binary)", () => {
       await p.teardown();
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  }, 180_000);
+
+  maybeScripted("I21 a shell line made only of redirections asks first: denied, the file outside the workdir is untouched", async () => {
+    // opencode 2.2.2 found no command in such a line and ran it unasked (the
+    // reason codeoid needs 2.2.5): `> file` truncated any file the daemon's user can write.
+    const outside = mkdtempSync(join(tmpdir(), "codeoid-opencode-outside-"));
+    const victim = join(outside, "victim.txt");
+    writeFileSync(victim, "12345");
+    try {
+      for (const command of [`> ${victim}`, `2>${victim}`, `<> ${victim}`, `X=1 >> ${victim}`]) {
+        const asked: string[] = [];
+        const p = provider();
+        const deny: ToolApprovalFn = async (_t, _a, name) => {
+          asked.push(name);
+          return { behavior: "deny", message: "not approved" };
+        };
+        const events = await collect(p.runTurn(opts(`[[tool:shell ${JSON.stringify({ command, description: "redirect" })}]]`, { canUseTool: deny })));
+        expect(events.find((e) => e.type === "error")).toBeUndefined();
+        expect(asked).toEqual(["Bash"]);
+        expect(readFileSync(victim, "utf8")).toBe("12345");
+        await p.teardown();
+      }
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
     }
   }, 180_000);
 });
