@@ -102,6 +102,8 @@ const TEARDOWN_SETTLE_MS = 1_500;
 const WAKE_GRACE_MS = 300;
 /** After an execution ends with a `later` message still queued, how long to wait for the one opencode runs it in. */
 const QUEUED_START_MS = 3_000;
+/** How long a turn's end waits to read the session's running total (#finishCounted). */
+const SPEND_READ_MS = 1_000;
 /** After a slash command, how long to wait for it to start an execution. */
 const COMMAND_START_MS = 1_500;
 /** A turn's messages read back after a feed gap — far more than one turn writes. */
@@ -1308,11 +1310,35 @@ export class OpencodeProvider implements SessionProvider {
       turn.started = false;
       const executions = turn.executions;
       setTimeout(() => {
-        if (this.#turn === turn && !turn.queue.closed && !turn.started && turn.executions === executions) this.#finishTurn(turn, outcome, error);
+        if (this.#turn === turn && !turn.queue.closed && !turn.started && turn.executions === executions) this.#finishCounted(turn, outcome, error);
       }, QUEUED_START_MS).unref?.();
       return;
     }
-    this.#finishTurn(turn, outcome, error);
+    this.#finishCounted(turn, outcome, error);
+  }
+
+  /**
+   * End the turn once opencode's running total for the session was read:
+   * it books what no step reported as the execution ends (the title of a
+   * session's first prompt lands just after `execution.succeeded`), and the
+   * turn reports it rather than a next turn that may never come (a
+   * routine's run, a session's last). Bounded; a total that can't be read
+   * leaves it to the next turn, as before.
+   */
+  #finishCounted(turn: Turn, outcome: "succeeded" | "interrupted" | "failed", error: OcError | undefined): void {
+    const conn = this.#conn;
+    const ses = this.#ses;
+    if (!conn || !ses || outcome === "failed") {
+      this.#finishTurn(turn, outcome, error);
+      return;
+    }
+    const executions = turn.executions;
+    void Promise.race([conn.client.getSession(ses).catch(() => null), Bun.sleep(SPEND_READ_MS).then(() => null)]).then((info) => {
+      // Another execution of the turn began meanwhile (a steer taken late): its end ends the turn.
+      if (this.#turn !== turn || turn.queue.closed || turn.executions !== executions) return;
+      if (info && this.#ses === ses) this.#usageUpdated({ cost: info.cost, tokens: info.tokens });
+      this.#finishTurn(turn, outcome, error);
+    });
   }
 
   /** Track `work` as something the turn's end waits for (failures are its own to report). */

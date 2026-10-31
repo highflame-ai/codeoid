@@ -784,8 +784,8 @@ describe("opencode interrupt", () => {
     expect(done(events)?.stopReason).toBe("interrupted");
     expect(held[0]!.aborted).toBe(true);
     expect(events.some((e) => e.type === "tool_complete" && !e.success && e.output.includes("Tool execution interrupted"))).toBe(true);
-    // The interrupted step is billed.
-    expect(done(events)!.totalCostUsd).toBeCloseTo(0.0123, 6);
+    // The interrupted step is billed, and the first prompt's title (booked as the execution ends).
+    expect(done(events)!.totalCostUsd).toBeCloseTo(0.0123 + 0.0007, 6);
   });
 
   it("a foreground subagent's request the interrupt dropped is withdrawn too", async () => {
@@ -902,12 +902,13 @@ describe("opencode cost and tokens", () => {
   it("sums each step's real cost and tokens into turn_done, with an llm_call per step", async () => {
     const { server } = makeServer();
     const events = await collect(makeProvider(server).runTurn(opts("use-shell")));
-    const calls = events.filter((e) => e.type === "llm_call");
+    const calls = events.filter((e) => e.type === "llm_call" && e.isPrimary);
     expect(calls).toHaveLength(2);
     expect(calls[0]).toMatchObject({ isPrimary: true, usage: { inputTokens: 100, cacheReadTokens: 30, cacheCreationTokens: 10, outputTokens: 25 } });
     const r = done(events)!;
-    expect(r.totalCostUsd).toBeCloseTo(0.0246, 6);
-    expect(r).toMatchObject({ providerId: "opencode", inputTokens: 200, outputTokens: 50, cacheReadTokens: 60, cacheCreationTokens: 20, contextWindow: 200_000 });
+    // Two steps, and the first prompt's title (a side call).
+    expect(r.totalCostUsd).toBeCloseTo(0.0246 + 0.0007, 6);
+    expect(r).toMatchObject({ providerId: "opencode", inputTokens: 200 + 40, outputTokens: 50 + 6, cacheReadTokens: 60, cacheCreationTokens: 20, contextWindow: 200_000 });
     expect(r.nativeRef?.backingId.startsWith("ses_")).toBe(true);
     expect(r.nativeRef?.ref.startsWith("msg_")).toBe(true);
   });
@@ -915,14 +916,17 @@ describe("opencode cost and tokens", () => {
   it("bills the title opencode generates, which only its running total reports", async () => {
     const { server } = makeServer();
     const p = makeProvider(server);
+    // The title is billed just after the first execution ended: that turn
+    // still reports it (the running total is read before its end), not a
+    // next turn that may never come.
     const first = await collect(p.runTurn(opts("hi")));
-    expect(done(first)!.totalCostUsd).toBeCloseTo(0.0123, 6);
-    // The title is billed after the first execution ended: it lands in the next turn.
-    const second = await collect(p.runTurn(opts("hi again")));
-    expect(done(second)!.totalCostUsd).toBeCloseTo(0.0123 + 0.0007, 6);
-    const side = second.filter((e) => e.type === "llm_call" && !e.isPrimary);
+    expect(done(first)!.totalCostUsd).toBeCloseTo(0.0123 + 0.0007, 6);
+    const side = first.filter((e) => e.type === "llm_call" && !e.isPrimary);
     expect(side).toEqual([{ type: "llm_call", usage: { inputTokens: 40, cacheReadTokens: 0, cacheCreationTokens: 0, outputTokens: 6 }, isPrimary: false }]);
-    // Only once: the running total after it adds nothing more.
+    // Only once: the running total landing after the turn's end adds nothing more.
+    const second = await collect(p.runTurn(opts("hi again")));
+    expect(done(second)!.totalCostUsd).toBeCloseTo(0.0123, 6);
+    expect(second.filter((e) => e.type === "llm_call" && !e.isPrimary)).toEqual([]);
     const third = await collect(p.runTurn(opts("and again")));
     expect(done(third)!.totalCostUsd).toBeCloseTo(0.0123, 6);
     await p.teardown();
@@ -934,10 +938,10 @@ describe("opencode cost and tokens", () => {
     await collect(p.runTurn(opts("hi")));
     const events = await collect(p.runTurn(opts("compact")));
     const r = done(events)!;
-    // Two steps, the compaction's two requests, and the first turn's title (billed after it ended, carried).
-    expect(r.totalCostUsd).toBeCloseTo(0.0123 * 2 + 0.003 + 0.0007, 6);
-    expect(r.inputTokens).toBe(100 * 2 + 2 * 1000 + 40);
-    expect(events.filter((e) => e.type === "llm_call" && !e.isPrimary)).toHaveLength(3);
+    // Two steps and the compaction's two requests (the first turn reported its title).
+    expect(r.totalCostUsd).toBeCloseTo(0.0123 * 2 + 0.003, 6);
+    expect(r.inputTokens).toBe(100 * 2 + 2 * 1000);
+    expect(events.filter((e) => e.type === "llm_call" && !e.isPrimary)).toHaveLength(2);
     await p.teardown();
   });
 
@@ -947,7 +951,7 @@ describe("opencode cost and tokens", () => {
     const r = done(events)!;
     expect(r.isError).toBe(true);
     expect(r.errorMessage).toBe(BUDGET_STOP_MESSAGE);
-    expect(events.filter((e) => e.type === "llm_call").length).toBeLessThan(3);
+    expect(events.filter((e) => e.type === "llm_call" && e.isPrimary).length).toBeLessThan(3);
     const st = await fakeState(server);
     expect(st.interrupts).toHaveLength(1);
   });
@@ -968,8 +972,8 @@ describe("opencode cost and tokens", () => {
     const doneEvents = events.filter((e) => e.type === "turn_done") as Array<Extract<ProviderEvent, { type: "turn_done" }>>;
     expect(doneEvents.map((d) => d.result.stopReason)).toEqual(["steered", "budget"]);
     expect(doneEvents[1]!.result).toMatchObject({ isError: true, errorMessage: BUDGET_STOP_MESSAGE });
-    // The spend is reported once across the two.
-    expect(doneEvents.reduce((sum, d) => sum + d.result.totalCostUsd, 0)).toBeCloseTo(4, 6);
+    // The spend is reported once across the two (two steps, and the first prompt's title).
+    expect(doneEvents.reduce((sum, d) => sum + d.result.totalCostUsd, 0)).toBeCloseTo(4 + 0.0007, 6);
   });
 
   it("a turn the server's death ended still reports its spend, on the next turn", async () => {
@@ -986,8 +990,9 @@ describe("opencode cost and tokens", () => {
     expect(events.at(-1)?.type).toBe("error");
     expect(calls).toBe(2);
     // Two $2 steps ran before the death; Session records no cost for an error.
+    // The new server's session bills its own first prompt's title.
     const next = await collect(p.runTurn(opts("hi")));
-    expect(done(next)!.totalCostUsd).toBeCloseTo(4 + 0.0123, 6);
+    expect(done(next)!.totalCostUsd).toBeCloseTo(4 + 0.0123 + 0.0007, 6);
     await p.teardown();
   });
 });
@@ -1049,7 +1054,8 @@ describe("opencode subagents", () => {
     expect(asks[0]).toEqual(["Task", undefined]);
     expect(asks[1]).toEqual(["Bash", start.agentId]);
     expect(events.some((e) => e.type === "llm_call" && !e.isPrimary)).toBe(true);
-    expect(done(events)!.totalCostUsd).toBeCloseTo(0.0123 * 2 + 0.5, 6);
+    // The parent's two steps, the child's, and the first prompt's title.
+    expect(done(events)!.totalCostUsd).toBeCloseTo(0.0123 * 2 + 0.5 + 0.0007, 6);
     // The child is held to codeoid's rules too.
     const st = await fakeState(server);
     expect(st.patches.some((x: { sessionID: string; permissions?: unknown }) => x.sessionID === start.agentId && x.permissions)).toBe(true);
@@ -1060,7 +1066,7 @@ describe("opencode subagents", () => {
     const events = await collect(makeProvider(server).runTurn(opts("subagent-fail")));
     const start = events.find((e) => e.type === "subagent_start") as Extract<ProviderEvent, { type: "subagent_start" }>;
     expect(events.some((e) => e.type === "subagent_stop" && e.agentId === start.agentId)).toBe(true);
-    expect(done(events)!.totalCostUsd).toBeCloseTo(0.0123 * 2 + 0.25, 6);
+    expect(done(events)!.totalCostUsd).toBeCloseTo(0.0123 * 2 + 0.25 + 0.0007, 6);
   });
 
   it("a background subagent is background work; opencode's own follow-up turn is adopted", async () => {
@@ -1083,8 +1089,8 @@ describe("opencode subagents", () => {
     adopted[0]!.bindGate?.({ canUseTool: allow });
     const follow = await collect(adopted[0]!);
     expect(texts(follow, "text_done")).toEqual(["background result received"]);
-    // The child's spend and the first prompt's title (billed after that turn ended), carried.
-    expect(done(follow)!.totalCostUsd).toBeCloseTo(0.0123 + 0.5 + 0.0007, 6);
+    // The child's spend, carried (the launching turn reported the first prompt's title).
+    expect(done(follow)!.totalCostUsd).toBeCloseTo(0.0123 + 0.5, 6);
   });
 
   /** A turn that an unanswered request would hang: interrupted after `ms`, so the test reads "interrupted", not a timeout. */
@@ -1151,9 +1157,10 @@ describe("opencode subagents", () => {
     for (let i = 0; i < 2; i++) await collect(other.runTurn(opts("use-shell", { canUseTool: allowing((name) => asks.push(name)) })));
     expect(asks).toEqual(["Bash", "Bash"]);
     const st = await fakeState(server);
-    // `p` answered none of it, and read the other session once (to learn it isn't a child of its own).
+    // `p` answered none of it, and read the other session once (to learn it
+    // isn't a child of its own); `other` read its own total as each turn ended.
     expect(st.replies).toHaveLength(2);
-    expect(st.requests.filter((r: string) => r === `GET /api/session/${other.backingSessionId}`)).toHaveLength(1);
+    expect(st.requests.filter((r: string) => r === `GET /api/session/${other.backingSessionId}`)).toHaveLength(1 + 2);
     await other.teardown();
     await p.teardown();
   });
@@ -1839,8 +1846,8 @@ describe("opencode as real 2.2.x servers behave", () => {
     expect(events.filter((e) => e.type === "tool_complete")).toEqual([
       { type: "tool_complete", sdkToolUseId: call.toolId, output: "shell ran: echo in-gap", success: true },
     ]);
-    // Each step once: 0.0123 + 0.5 + 0.0123 (the title lands after the turn).
-    expect(done(events)!.totalCostUsd).toBeCloseTo(0.0123 + 0.5 + 0.0123, 6);
+    // Each step once: 0.0123 + 0.5 + 0.0123, and the title (booked as the execution ends).
+    expect(done(events)!.totalCostUsd).toBeCloseTo(0.0123 + 0.5 + 0.0123 + 0.0007, 6);
     expect(events.filter((e) => e.type === "llm_call" && e.isPrimary)).toHaveLength(3);
     await p.teardown();
   });
@@ -1865,7 +1872,7 @@ describe("opencode as real 2.2.x servers behave", () => {
     expect(events.filter((e) => e.type === "tool_complete")).toEqual([
       { type: "tool_complete", sdkToolUseId: call.toolId, output: "shell ran: echo lagged", success: true },
     ]);
-    expect(done(events)!.totalCostUsd).toBeCloseTo(0.0123 * 2, 6);
+    expect(done(events)!.totalCostUsd).toBeCloseTo(0.0123 * 2 + 0.0007, 6);
     // The shared server wasn't stopped as one that runs tools unasked.
     expect((await server.ensure()).generation).toBe(generation);
     await p.teardown();
@@ -1923,8 +1930,8 @@ describe("opencode as real 2.2.x servers behave", () => {
     expect(events.find((e) => e.type === "tool_complete" && e.sdkToolUseId === childCard.toolId)).toMatchObject({ success: true, output: "shell ran: grep -r auth ." });
     expect(events.some((e) => e.type === "subagent_stop" && e.agentId === start.agentId)).toBe(true);
     expect(texts(events, "text_done")).toEqual(["subagent done"]);
-    // The parent's two steps and the child's, each once.
-    expect(done(events)!.totalCostUsd).toBeCloseTo(0.0123 * 2 + 0.5, 6);
+    // The parent's two steps and the child's, each once, and the title.
+    expect(done(events)!.totalCostUsd).toBeCloseTo(0.0123 * 2 + 0.5 + 0.0007, 6);
     await p.teardown();
   });
 
@@ -1947,8 +1954,8 @@ describe("opencode as real 2.2.x servers behave", () => {
     expect(adopted).toHaveLength(1);
     const follow = await Promise.race([collect(adopted[0]!), Bun.sleep(3_000).then(() => [] as ProviderEvent[])]);
     expect(texts(follow, "text_done")).toEqual(["background result received"]);
-    // The follow-up's step, the child's (read back with no turn open, carried) and the first prompt's title.
-    expect(done(follow)!.totalCostUsd).toBeCloseTo(0.0123 + 0.5 + 0.0007, 6);
+    // The follow-up's step and the child's (read back with no turn open, carried); the launching turn reported the title.
+    expect(done(follow)!.totalCostUsd).toBeCloseTo(0.0123 + 0.5, 6);
     await p.teardown();
   });
 

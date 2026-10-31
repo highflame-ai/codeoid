@@ -388,7 +388,8 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
   came meanwhile replayed (`#whenChild`). Settled calls and counted steps are remembered across turns, so a
   late feed repeats nothing. Spend past the steps in `usage.updated` (the
   title opencode generates, a compaction's requests) is billed as a side
-  call; a compaction's end isn't counted. A turn ends with its execution
+  call, and the running total is read as a turn ends (`#finishCounted`: the
+  title lands just after the execution); a compaction's end isn't counted. A turn ends with its execution
   (after any steer request still in flight, and any read-back); a
   `now`/`next` push waits for the turn's prompt to be posted, steers and owes
   Session one absorbed `turn_done` (paid at the steer's
