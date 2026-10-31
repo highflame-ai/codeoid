@@ -53,6 +53,9 @@
  *   "gap-open"     → a block ends in the gap, the feed is back while its
  *                    step still runs (a call follows in the same message)
  *   "gap-ask"      → a shell call and its permission request fall in the gap
+ *   "lag-settle"   → the feed drops after a call is approved and comes back
+ *                    behind: the call's result is stored before the late feed
+ *                    delivers it
  *
  * Knobs (env): FAKE_OPENCODE_VERSION (default 2.2.2), FAKE_OPENCODE_STARTS
  * (append a line per start), FAKE_OPENCODE_UNSAFE_AGENT=1 (an `explore`
@@ -179,7 +182,32 @@ function sseResponse(start: (push: (e: Json) => void, close: () => void) => () =
 }
 
 function publishLive(e: Json): void {
+  if (backlog) {
+    backlog.push(e);
+    return;
+  }
   for (const s of liveSubs) if (!s.types || s.types.has(String(e.type))) s.push(e);
+}
+
+/** "lag": what the feed holds back — a reconnected server-wide feed can be behind a direct read. */
+let backlog: Json[] | null = null;
+const LAG_MS = 400;
+
+/**
+ * Drop the feed as `dropFeed` does, but lose nothing: what is published until
+ * the feed is back, and for LAG_MS after, reaches the new connection late.
+ */
+function lagFeed(): () => void {
+  const up = dropFeed();
+  backlog = [];
+  return () => {
+    up();
+    setTimeout(() => {
+      const held = backlog ?? [];
+      backlog = null;
+      for (const e of held) publishLive(e);
+    }, LAG_MS);
+  };
 }
 
 /** A durable session event. The real log endpoint never delivers these: the live feed does. */
@@ -595,6 +623,24 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
     const msg3 = step(ses);
     await say(ses, msg3, "after the gap");
     endStep(ses, msg3);
+    return "succeeded";
+  }
+  if (text.includes("lag-settle")) {
+    // The feed drops after a call is approved and comes back behind: the
+    // call's result is read back first, then the late feed delivers it too.
+    const msg = step(ses);
+    let up = () => {};
+    await toolCall(ses, msg, "shell", { command: "echo lagged", description: "x" }, { action: "shell", resources: ["echo lagged"] }, () => {
+      up = lagFeed();
+    });
+    await say(ses, msg, "after the call");
+    endStep(ses, msg);
+    up();
+    await sleep(LAG_MS + 500);
+    check();
+    const msg2 = step(ses);
+    await say(ses, msg2, "after the lag");
+    endStep(ses, msg2);
     return "succeeded";
   }
   if (text.includes("gap-open")) {

@@ -101,6 +101,8 @@ const INTERRUPT_SETTLE_MS = 5_000;
 const COMMAND_START_MS = 1_500;
 /** A turn's messages read back after a feed gap — far more than one turn writes. */
 const RECONCILE_PAGES = 20;
+/** Ids remembered across turns (settled calls, counted steps): far more than a feed can lag by. */
+const REMEMBERED = 4_096;
 /**
  * Tools opencode runs without a permission request of their own. Code Mode
  * (`execute`) runs a script whose every external effect asks by itself (its
@@ -295,6 +297,12 @@ export class OpencodeProvider implements SessionProvider {
   #callWaiters = new Map<string, Array<() => void>>();
   #announced = new Set<string>();
   #declined = new Set<string>();
+  /**
+   * Calls whose card was settled: a result read back after a feed gap can be
+   * delivered again by a feed that's behind, and must not count as one that
+   * ran unasked. Kept across turns (the late copy can land in the next one), bounded.
+   */
+  #settledCalls = new Set<string>();
   #handledAsks = new Set<string>();
   #pendingAsks = new Map<string, PendingAsk>();
   #handledForms = new Set<string>();
@@ -1462,6 +1470,8 @@ export class OpencodeProvider implements SessionProvider {
   #toolSettled(sessionID: string, d: Record<string, unknown>, success: boolean): void {
     const id = String(d.id ?? "");
     const key = `${sessionID}:${id}`;
+    if (this.#settledCalls.has(key)) return; // read back already, now from the feed
+    remember(this.#settledCalls, key);
     const call = this.#toolCalls.get(key);
     this.#toolCalls.delete(key);
     if (this.#declined.delete(key)) {
@@ -1846,6 +1856,12 @@ function remote(url: string, token: string | undefined): Record<string, unknown>
     oauth: false,
     codemode: false,
   };
+}
+
+/** Remember `key`, forgetting the oldest past `max` (a Set keeps insertion order). */
+function remember(set: Set<string>, key: string, max = REMEMBERED): void {
+  set.add(key);
+  if (set.size > max) set.delete(set.values().next().value!);
 }
 
 /** The permission action a tool asks under (for a call recorded without a request). */

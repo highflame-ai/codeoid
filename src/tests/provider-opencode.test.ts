@@ -1297,6 +1297,23 @@ describe("opencode as real 2.2.x servers behave", () => {
     await p.teardown();
   });
 
+  it("a result read back after a gap, then delivered by a feed that's behind, settles once and isn't 'ran unasked'", async () => {
+    const { server } = makeServer();
+    const p = makeProvider(server);
+    const generation = (await server.ensure()).generation;
+    const events = await collect(p.runTurn(opts("lag-settle")));
+    expect(events.find((e) => e.type === "error")).toBeUndefined();
+    expect(texts(events, "text_done")).toEqual(["after the call", "after the lag"]);
+    const call = events.find((e) => e.type === "tool_start") as Extract<ProviderEvent, { type: "tool_start" }>;
+    expect(events.filter((e) => e.type === "tool_complete")).toEqual([
+      { type: "tool_complete", sdkToolUseId: call.toolId, output: "shell ran: echo lagged", success: true },
+    ]);
+    expect(done(events)!.totalCostUsd).toBeCloseTo(0.0123 * 2, 6);
+    // The shared server wasn't stopped as one that runs tools unasked.
+    expect((await server.ensure()).generation).toBe(generation);
+    await p.teardown();
+  });
+
   it("a permission asked in a gap is judged on the call opencode stored, not refused", async () => {
     const { server } = makeServer();
     const asked: Array<[string, Record<string, unknown>]> = [];
