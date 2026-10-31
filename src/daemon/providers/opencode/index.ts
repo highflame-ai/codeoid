@@ -101,6 +101,12 @@ const INTERRUPT_SETTLE_MS = 5_000;
 const COMMAND_START_MS = 1_500;
 /** A turn's messages read back after a feed gap — far more than one turn writes. */
 const RECONCILE_PAGES = 20;
+/**
+ * Tools opencode runs without a permission request of their own. Code Mode
+ * (`execute`) runs a script whose every external effect asks by itself (its
+ * `fetch` asks `webfetch`); the call is shown, its asks are gated one by one.
+ */
+const UNASKED_TOOLS: Record<string, string> = { execute: "opencode_execute" };
 
 export interface OpencodeProviderInit {
   sessionId: string;
@@ -186,6 +192,8 @@ interface PendingAsk {
   sessionID: string;
   toolId: string;
   abort: AbortController;
+  /** Made from inside a Code Mode script: no tool result of its own will settle it. */
+  nested: boolean;
 }
 
 function eventSession(event: OcEvent): string | undefined {
@@ -988,6 +996,7 @@ export class OpencodeProvider implements SessionProvider {
         const sid = String(d.sessionID ?? this.#ses);
         const id = String(d.id ?? "");
         this.#recordCall(sid, id, { input: (d.input as Record<string, unknown>) ?? {} });
+        this.#announceUnasked(sid, id);
         return;
       }
       case "session.tool.success":
@@ -1290,6 +1299,19 @@ export class OpencodeProvider implements SessionProvider {
     }
   }
 
+  /**
+   * A call to a tool that never asks (Code Mode): its card is shown when it's
+   * called, so the gated requests it makes have a context and its result a card.
+   */
+  #announceUnasked(sessionID: string, id: string): void {
+    const key = `${sessionID}:${id}`;
+    const call = this.#toolCalls.get(key);
+    const name = call ? UNASKED_TOOLS[call.name] : undefined;
+    if (!name || sessionID !== this.#ses || this.#announced.has(key)) return;
+    this.#announced.add(key);
+    this.#emit({ type: "tool_start", toolId: id, sdkToolUseId: id, name, input: call!.input, approvalId: `opencode-auto-${id}` });
+  }
+
   async #waitForCall(key: string): Promise<OcToolCall | undefined> {
     const known = this.#toolCalls.get(key);
     if (known && Object.keys(known.input).length > 0) return known;
@@ -1361,14 +1383,20 @@ export class OpencodeProvider implements SessionProvider {
     if (!conn || !ses) return;
     const isChild = req.sessionID !== ses;
     const gate = this.#turn && !this.#turn.queue.closed ? this.#turn.gate : isChild ? this.#lastGate : null;
-    const toolId = req.source?.id ?? req.id;
+    const callKey = `${req.sessionID}:${req.source?.id ?? req.id}`;
+    const source = req.source?.id ? await this.#waitForCall(callKey) : undefined;
+    // A request made from inside a Code Mode script (its `fetch`) names the
+    // script's call: it gets a card of its own, settled by its reply. One
+    // script can make many.
+    const nested = source !== undefined && UNASKED_TOOLS[source.name] !== undefined;
+    const call = nested ? undefined : source;
+    const toolId = nested ? `${req.source!.id}:${req.id}` : (req.source?.id ?? req.id);
     const key = `${req.sessionID}:${toolId}`;
-    const call = req.source?.id ? await this.#waitForCall(key) : undefined;
     const mapped = gateCallFor(req, call, this.#mapContext());
     const approvalId = `opencode-${req.id}`;
-    const pending: PendingAsk = { sessionID: req.sessionID, toolId, abort: new AbortController() };
+    const pending: PendingAsk = { sessionID: req.sessionID, toolId, abort: new AbortController(), nested };
     this.#pendingAsks.set(req.id, pending);
-    this.#announced.add(key);
+    if (!nested) this.#announced.add(key);
     this.#emit({
       type: "tool_start",
       toolId,
@@ -1383,7 +1411,7 @@ export class OpencodeProvider implements SessionProvider {
       // Never ask for a yes on something the approver can't see — rejected,
       // with the reason on the card and to the model.
       this.#pendingAsks.delete(req.id);
-      this.#declined.add(key);
+      if (!nested) this.#declined.add(key);
       this.#emit({ type: "tool_complete", sdkToolUseId: toolId, output: `Declined — ${refusal}`, success: false, declinedByBackend: true });
       await this.#reply(conn, req, "reject", `codeoid declined this: ${refusal}`);
       return;
@@ -1398,9 +1426,11 @@ export class OpencodeProvider implements SessionProvider {
     this.#pendingAsks.delete(req.id);
     if (verdict.behavior === "allow") {
       await this.#reply(conn, req, "once");
+      // No result of its own comes back: it is part of the script's.
+      if (nested) this.#emit({ type: "tool_complete", sdkToolUseId: toolId, output: "Allowed — its result goes to the Code Mode script.", success: true });
       return;
     }
-    this.#declined.add(key);
+    if (!nested) this.#declined.add(key);
     // A message makes it feedback the model reads and carries on from; a bare reject ends the step.
     await this.#reply(conn, req, "reject", verdict.message || "The user denied this action.");
   }
@@ -1554,7 +1584,7 @@ export class OpencodeProvider implements SessionProvider {
   #onLost(reason: string): void {
     for (const [id, pending] of this.#pendingAsks) {
       pending.abort.abort();
-      this.#declined.add(`${pending.sessionID}:${pending.toolId}`);
+      if (!pending.nested) this.#declined.add(`${pending.sessionID}:${pending.toolId}`);
       this.#emit({ type: "tool_complete", sdkToolUseId: pending.toolId, output: "Rejected — the opencode server stopped while this was waiting.", success: false, declinedByBackend: true });
       this.#pendingAsks.delete(id);
     }

@@ -40,6 +40,11 @@
  *   "costly"       → three steps of $2 each
  *   "echo-state"   → reports model/agent/synthetic/prompt text it received
  *   "die-asking"   → asks a permission, then the process dies
+ *   "use-codemode" → a Code Mode `execute` call. A session rule denying
+ *                    `execute` hides the tool, so the call fails unrun (as on
+ *                    real 2.2.x); with FAKE_OPENCODE_CODEMODE=1 it runs as on
+ *                    2.2.5: asks nothing itself, its script fetches twice
+ *                    (two `webfetch` asks naming the script's call)
  *   "gap"          → the live feed is cut (subscribers dropped) mid-turn and
  *                    the execution ends while nobody is connected
  *
@@ -499,6 +504,35 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
       check();
       endStep(ses, msg, 2);
     }
+    return "succeeded";
+  }
+  if (text.includes("use-codemode")) {
+    const msg = step(ses);
+    const call = nextId("call");
+    const code = "const a = await fetch('https://example.com/a'); const b = await fetch('https://example.com/b', { method: 'POST' }); return [a.status, b.status];";
+    durable(ses, "session.tool.input.started", { assistantMessageID: msg, id: call, name: "execute" });
+    durable(ses, "session.tool.called", { assistantMessageID: msg, id: call, input: { code }, executed: false });
+    const hidden = ses.permissions.some((r) => r.action === "execute" && r.effect === "deny");
+    if (hidden && process.env.FAKE_OPENCODE_CODEMODE !== "1") {
+      const message = 'No tool named "execute" is currently available. Please use a tool from the available tool list.';
+      durable(ses, "session.tool.failed", { assistantMessageID: msg, id: call, error: { type: "tool.execution", message }, executed: false });
+      endStep(ses, msg);
+      const msg2 = step(ses);
+      await say(ses, msg2, "no code mode");
+      endStep(ses, msg2);
+      return "succeeded";
+    }
+    // The script asks nothing for itself; each fetch asks webfetch, naming the script's call.
+    const statuses: string[] = [];
+    for (const [url, method] of [["https://example.com/a", "GET"], ["https://example.com/b", "POST"]] as const) {
+      const r = await askPermission(ses, { action: "webfetch", resources: [url], save: ["*"], metadata: { method, url }, source: { type: "tool", messageID: msg, id: call } });
+      statuses.push(r.decision === "once" ? "200" : "rejected");
+    }
+    durable(ses, "session.tool.success", { assistantMessageID: msg, id: call, content: [{ type: "text", text: statuses.join(",") }], metadata: { toolCalls: [] }, executed: false });
+    endStep(ses, msg);
+    const msg2 = step(ses);
+    await say(ses, msg2, `fetched: ${statuses.join(",")}`);
+    endStep(ses, msg2);
     return "succeeded";
   }
   if (text.includes("gap")) {

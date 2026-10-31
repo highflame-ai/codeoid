@@ -126,8 +126,12 @@ export function gateCallFor(req: OcPermissionRequest, call: OcToolCall | undefin
       return pattern ? gate : { ...gate, unshowable: "opencode didn't say what it's searching for" };
     }
     case "webfetch": {
-      const url = str(input.url) ?? str(meta.url) ?? str(resources[0]);
-      return url ? { name: "WebFetch", input: { url } } : { name: "WebFetch", input: {}, unshowable: "opencode didn't say which URL" };
+      // The resource is what opencode authorizes. From a Code Mode script's
+      // `fetch`, the request — not the script's call — says what it is.
+      const url = [resources[0], meta.url, input.url].map(str).find((u) => u !== undefined && u !== "*");
+      const method = str(meta.method)?.toUpperCase();
+      if (!url) return { name: "WebFetch", input: {}, unshowable: "opencode didn't say which URL" };
+      return { name: "WebFetch", input: { url, ...(method && method !== "GET" ? { method } : {}) } };
     }
     case "websearch": {
       const query = str(input.query) ?? str(meta.query) ?? str(resources[0]);

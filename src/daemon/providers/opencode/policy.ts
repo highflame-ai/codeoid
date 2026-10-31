@@ -25,7 +25,12 @@
  * Tools that never ask (opencode's session-utility tools: `session_rename`,
  * `session_move`, `worktree_*`, and the `schedule_*` tools, which would run
  * work nobody is watching) are removed by disabling the plugins that add
- * them.
+ * them. Code Mode (`execute`) is removed by a deny rule, which hides the
+ * tool: on opencode 2.2.2 a Code Mode script's `fetch` runs without asking
+ * anything (2.2.5 asks `webfetch`), so the script could reach any URL past
+ * codeoid's gate. With Code Mode gone opencode lists the tools it kept in its
+ * catalog directly, so opencode's own `browser` deny (its agents have it,
+ * and codeoid's ask-everything would reopen it) is kept too.
  */
 
 import { createHash } from "node:crypto";
@@ -58,10 +63,17 @@ export function mcpNamespace(name: string): string {
   return name.replace(/[^a-zA-Z0-9_-]/g, "_");
 }
 
-/** The session rules: ask for everything, and only this session's own mounts. */
+/** Tools opencode must not offer at all: a deny rule hides them (see the file header). */
+export const HIDDEN_TOOL_RULES: readonly OcRule[] = [
+  { action: "execute", resource: "*", effect: "deny" },
+  { action: "browser", resource: "*", effect: "deny" },
+];
+
+/** The session rules: ask for everything, only this session's own mounts, and never Code Mode. */
 export function sessionRules(sessionId: string): OcRule[] {
   return [
     { action: "*", resource: "*", effect: "ask" },
+    ...HIDDEN_TOOL_RULES,
     { action: `${MCP_MOUNT_PREFIX}*`, resource: "*", effect: "deny" },
     { action: `${ownMountPrefix(sessionId)}*`, resource: "*", effect: "ask" },
   ];
@@ -119,7 +131,7 @@ export function agentOverrides(agents: readonly OcAgentInfo[]): Record<string, {
 /** The config injected with `OPENCODE_CONFIG_CONTENT`. */
 export function opencodeConfig(overrides: Record<string, { permissions: OcRule[] }> = {}): Record<string, unknown> {
   return {
-    permissions: [{ action: "*", resource: "*", effect: "ask" }],
+    permissions: [{ action: "*", resource: "*", effect: "ask" }, ...HIDDEN_TOOL_RULES],
     plugins: [...DISABLED_PLUGINS],
     // codeoid pins the version it speaks; opencode must not replace itself.
     update: "disable",

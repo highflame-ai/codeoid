@@ -20,7 +20,7 @@
  *   O14 database location, registry available / unavailable / disabled
  *   O15 what real 2.2.2 / 2.2.5 servers showed: the feed is the only record
  *       (the durable log replays nothing), the title is billed without a
- *       step, a dropped feed is read back
+ *       step, Code Mode asks per fetch, a dropped feed is read back
  *
  * See provider-opencode.integration.test.ts for a real `opencode` binary.
  */
@@ -154,7 +154,11 @@ describe("opencode server lifecycle", () => {
     expect(st.env.OPENCODE_DB).toBe(join(dir, "data", "opencode", "opencode.db"));
     expect(st.env.OPENCODE_DISABLE_PROJECT_CONFIG).toBe("1");
     expect(st.env.OPENCODE_DISABLE_CLAUDE_CODE).toBe("1");
-    expect(st.config.permissions).toEqual([{ action: "*", resource: "*", effect: "ask" }]);
+    expect(st.config.permissions).toEqual([
+      { action: "*", resource: "*", effect: "ask" },
+      { action: "execute", resource: "*", effect: "deny" },
+      { action: "browser", resource: "*", effect: "deny" },
+    ]);
     expect(st.config.plugins).toEqual(["-opencode.tools", "-opencode.tool.schedule"]);
     expect(st.config.update).toBe("disable");
   });
@@ -592,11 +596,16 @@ describe("opencode MCP mounts", () => {
     expect(after.mcpRemoved.map((r: { name: string }) => r.name)).toContain(mount.name);
   });
 
-  it("session rules deny every codeoid mount but the session's own", () => {
+  it("session rules deny every codeoid mount but the session's own, and hide Code Mode", () => {
     const rules = sessionRules("sess-1");
-    expect(rules[0]).toEqual({ action: "*", resource: "*", effect: "ask" });
-    expect(rules[1]).toEqual({ action: "coid*", resource: "*", effect: "deny" });
-    expect(rules[2]).toEqual({ action: `${ownMountPrefix("sess-1")}*`, resource: "*", effect: "ask" });
+    expect(rules).toEqual([
+      { action: "*", resource: "*", effect: "ask" },
+      // Code Mode's fetch runs unasked on 2.2.2; the deny hides the tool on 2.2.2 and 2.2.5.
+      { action: "execute", resource: "*", effect: "deny" },
+      { action: "browser", resource: "*", effect: "deny" },
+      { action: "coid*", resource: "*", effect: "deny" },
+      { action: `${ownMountPrefix("sess-1")}*`, resource: "*", effect: "ask" },
+    ]);
     expect(ownMountPrefix("sess-1")).not.toBe(ownMountPrefix("sess-2"));
   });
 });
@@ -927,6 +936,50 @@ describe("opencode as real 2.2.x servers behave", () => {
     expect(texts(events, "text_done")).toEqual(["Hello, world"]);
     const st = await fakeState(server);
     expect(st.requests.some((r: string) => r.includes("/log"))).toBe(false);
+    await p.teardown();
+  });
+
+  it("hides Code Mode: a script call fails unrun, so its fetch can't get past the gate (2.2.2 runs it unasked)", async () => {
+    const { server } = makeServer();
+    const asked: string[] = [];
+    const p = makeProvider(server);
+    const events = await collect(p.runTurn(opts("use-codemode", { canUseTool: allowing((name) => asked.push(name)) })));
+    expect(asked).toEqual([]);
+    const card = events.find((e) => e.type === "tool_start") as Extract<ProviderEvent, { type: "tool_start" }>;
+    expect(card.name).toBe("opencode_execute");
+    expect(events.find((e) => e.type === "tool_complete")).toMatchObject({ sdkToolUseId: card.toolId, success: false });
+    expect(texts(events, "text_done")).toEqual(["no code mode"]);
+    expect((await fakeState(server)).replies).toEqual([]);
+    await p.teardown();
+  });
+
+  it("if Code Mode runs anyway, each fetch of a script is gated under a card of its own, inside the script's card", async () => {
+    // As 2.2.5 behaves with the tool offered: every fetch asks webfetch, naming the script's call.
+    const { server } = makeServer({ FAKE_OPENCODE_CODEMODE: "1" });
+    const asked: Array<[string, Record<string, unknown>]> = [];
+    const gate: ToolApprovalFn = async (_t, _a, name, input) => {
+      asked.push([name, input]);
+      return input.method === "POST" ? { behavior: "deny", message: "no posting" } : { behavior: "allow" };
+    };
+    const p = makeProvider(server);
+    const events = await collect(p.runTurn(opts("use-codemode", { canUseTool: gate })));
+    expect(asked).toEqual([
+      ["WebFetch", { url: "https://example.com/a" }],
+      ["WebFetch", { url: "https://example.com/b", method: "POST" }],
+    ]);
+    const starts = events.filter((e) => e.type === "tool_start") as Array<Extract<ProviderEvent, { type: "tool_start" }>>;
+    expect(starts.map((e) => e.name)).toEqual(["opencode_execute", "WebFetch", "WebFetch"]);
+    const script = starts[0]!;
+    expect(script.input).toMatchObject({ code: expect.stringContaining("fetch(") });
+    // Each fetch has its own card id, under the script's call.
+    expect(new Set(starts.map((e) => e.toolId)).size).toBe(3);
+    expect(starts[1]!.toolId.startsWith(`${script.toolId}:`)).toBe(true);
+    const completes = events.filter((e) => e.type === "tool_complete") as Array<Extract<ProviderEvent, { type: "tool_complete" }>>;
+    expect(completes.find((e) => e.sdkToolUseId === starts[1]!.toolId)?.success).toBe(true);
+    expect(completes.find((e) => e.sdkToolUseId === script.toolId)).toMatchObject({ success: true, output: "200,rejected" });
+    const st = await fakeState(server);
+    expect(st.replies.map((r: { decision: string }) => r.decision)).toEqual(["once", "reject"]);
+    expect(texts(events, "text_done")).toEqual(["fetched: 200,rejected"]);
     await p.teardown();
   });
 
