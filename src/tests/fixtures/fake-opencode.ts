@@ -79,6 +79,8 @@
  *   "gap-open"     → a block ends in the gap, the feed is back while its
  *                    step still runs (a call follows in the same message)
  *   "gap-ask"      → a shell call and its permission request fall in the gap
+ *   "gap-reason-ask" → reasoning starts on the feed; its end, then two
+ *                    parallel shell calls and their requests, fall in the gap
  *   "lag-settle"   → the feed drops after a call is approved and comes back
  *                    behind: the call's result is stored before the late feed
  *                    delivers it
@@ -854,6 +856,25 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
     endStep(ses, msg);
     const msg2 = step(ses);
     await say(ses, msg2, "after the gap");
+    endStep(ses, msg2);
+    return "succeeded";
+  }
+  if (text.includes("gap-reason-ask")) {
+    const msg = step(ses);
+    ses.messages.find((x) => x.id === msg)?.content?.push({ type: "reasoning", text: "pondering the calls" });
+    durable(ses, "session.reasoning.started", { assistantMessageID: msg, ordinal: 0 });
+    ephemeral("session.reasoning.delta", { sessionID: ses.id, assistantMessageID: msg, ordinal: 0, delta: "pondering" });
+    await sleep(20);
+    const up = dropFeed();
+    setTimeout(up, 400);
+    durable(ses, "session.reasoning.ended", { assistantMessageID: msg, ordinal: 0, text: "pondering the calls" });
+    const [a, b] = await Promise.all([
+      toolCall(ses, msg, "shell", { command: "echo one", description: "first" }, { action: "shell", resources: ["echo one"] }),
+      toolCall(ses, msg, "shell", { command: "echo two", description: "second" }, { action: "shell", resources: ["echo two"] }),
+    ]);
+    endStep(ses, msg, 0.0123, TOKENS, "tool-calls");
+    const msg2 = step(ses);
+    await say(ses, msg2, a.ok && b.ok ? "ran both" : "refused");
     endStep(ses, msg2);
     return "succeeded";
   }

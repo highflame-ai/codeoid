@@ -1720,6 +1720,17 @@ describe("opencode as real 2.2.x servers behave", () => {
     await p.teardown();
   });
 
+  it("requests re-offered after a gap come after the reasoning that led to them, in the order they were made", async () => {
+    const { server } = makeServer();
+    const p = makeProvider(server);
+    const events = await collect(p.runTurn(opts("gap-reason-ask")));
+    const order = events.flatMap((e) => (e.type === "thinking_done" ? ["thinking_done"] : e.type === "tool_start" ? [`tool_start ${String(e.input.command)}`] : []));
+    expect(order).toEqual(["thinking_done", "tool_start echo one", "tool_start echo two"]);
+    expect(texts(events, "text_done")).toEqual(["ran both"]);
+    expect(done(events)?.stopReason).toBe("stop");
+    await p.teardown();
+  });
+
   it("a subagent created in a feed gap is found again: its request is asked and answered, and the turn ends", async () => {
     const { server } = makeServer();
     const asks: Array<[string, string | undefined]> = [];

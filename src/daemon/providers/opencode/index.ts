@@ -1732,7 +1732,7 @@ export class OpencodeProvider implements SessionProvider {
   // ── Approvals ─────────────────────────────────────────────────────────
 
   /** A permission request. `missed`: re-offered after a feed gap, so its call's announcement may be lost. */
-  async #onAsk(req: OcPermissionRequest, opts: { missed?: boolean } = {}): Promise<void> {
+  async #onAsk(req: OcPermissionRequest, opts: { missed?: boolean; onShown?: () => void } = {}): Promise<void> {
     if (!req?.id || this.#handledAsks.has(req.id)) return;
     this.#handledAsks.add(req.id);
     const conn = this.#conn;
@@ -1765,6 +1765,7 @@ export class OpencodeProvider implements SessionProvider {
       input: mapped.input,
       approvalId,
     });
+    opts.onShown?.();
     const refusal = mapped.unshowable ?? (gate?.canUseTool ? undefined : "nobody can approve it here");
     if (refusal) {
       // Never ask for a yes on something the approver can't see — rejected,
@@ -1893,8 +1894,8 @@ export class OpencodeProvider implements SessionProvider {
 
   /**
    * The live feed (re)connected: re-read what the gap swallowed — children
-   * created in it, what was asked, how each child went, and the running turn
-   * (or an execution opencode ran by itself with no turn open).
+   * created in it, how each child went, the running turn (or an execution
+   * opencode ran by itself with no turn open), then what was asked.
    */
   #resync(conn: OpencodeConnection): void {
     const ses = this.#ses;
@@ -1919,20 +1920,6 @@ export class OpencodeProvider implements SessionProvider {
       if (!sessionRunning(info) && (info.time?.created ?? 0) < this.#attachedAt) continue; // an old one, done before codeoid attached
       this.#childCreated(info.id, { agent: info.agent, title: info.title });
     }
-    for (const sid of [ses, ...this.#children.keys()]) {
-      void conn.client
-        .pendingPermissions(sid)
-        .then((reqs) => {
-          for (const r of reqs) void this.#onAsk(r, { missed: true }).catch(() => {});
-        })
-        .catch(() => {});
-      void conn.client
-        .pendingForms(sid)
-        .then((forms) => {
-          for (const f of forms) void this.#onForm(f).catch(() => {});
-        })
-        .catch(() => {});
-    }
     // Children first: a foreground one's spend belongs to the turn its parent's read-back may end.
     await Promise.all(
       [...this.#children.entries()]
@@ -1946,6 +1933,22 @@ export class OpencodeProvider implements SessionProvider {
     if (!live()) return;
     if (turn) await this.#reconcile(conn, turn);
     else await this.#adoptMissed(conn, ses);
+    if (!live()) return;
+    // What was asked in the gap, after what was said before it: a card
+    // comes after the reasoning and text that led to its call, and the
+    // cards in the order opencode made the requests (as it lists them).
+    for (const sid of [ses, ...this.#children.keys()]) {
+      const [reqs, forms] = await Promise.all([conn.client.pendingPermissions(sid).catch(() => []), conn.client.pendingForms(sid).catch(() => [])]);
+      if (!live()) return;
+      for (const r of reqs) {
+        await new Promise<void>((shown) => {
+          void this.#onAsk(r, { missed: true, onShown: shown })
+            .catch(() => {})
+            .finally(shown);
+        });
+      }
+      for (const f of forms) void this.#onForm(f).catch(() => {});
+    }
   }
 
   /**
