@@ -45,6 +45,11 @@
  *   "subagent"     → foreground subagent in a child session (with a cost)
  *   "subagent-fail" → its child's step fails after the model answered (billed)
  *   "subagent-gapstart" → the child is created, starts and asks in a feed gap
+ *   "subagent-gapunasked:<line>" → the feed drops as the subagent call is
+ *                    approved; the child, created in the gap, runs <line> as
+ *                    an unasked shell call (as "unasked-shell:", with the
+ *                    server's environment until its own was set), and its
+ *                    output is the subagent's result; back while the parent runs
  *   "subagent-gapend" → the feed drops once the child's call is approved, over
  *                    the rest of the child's run; back while the parent runs
  *   "background-gap" → a background child whose call is approved, then the
@@ -705,6 +710,10 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
     }
     // "subagent-gapstart": the child is created, starts and asks in a feed gap.
     if (text.includes("subagent-gapstart")) setTimeout(dropFeed(), 400);
+    // "subagent-gapunasked:<line>": the feed drops as the call is approved; the child, created in the gap, runs <line> unasked.
+    const unaskedLine = /subagent-gapunasked:(.*)$/s.exec(text)?.[1];
+    const gap: { up?: () => void } = {};
+    if (unaskedLine !== undefined) gap.up = dropFeed();
     // Continuing an existing child (the call's `sessionID`): opencode reuses it and announces nothing.
     const continued = /continue:(ses_\w+)/.exec(text);
     const child = (continued ? sessions.get(continued[1]!) : undefined) ?? createSession({ parentID: ses.id, directory: ses.directory, title: "look around", agent: "explore" });
@@ -712,7 +721,7 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
     await sleep(20);
     // "subagent-gapend" / "background-gap": the feed drops once the child's call is approved,
     // over the rest of the child's run (and, for a background one, the parent's follow-up).
-    const gap: { up?: () => void } = {};
+    let childOutput = "found it";
     const gapEnd =
       text.includes("subagent-gapend") || text.includes("background-gap")
         ? () => {
@@ -745,6 +754,25 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
         child.outcome = "failed";
         return false;
       }
+      if (unaskedLine !== undefined) {
+        // As real 2.2.5: no command in it, so nothing asks; it runs with the
+        // child's environment — the server's own until codeoid sets one.
+        const id = nextId("call");
+        const input = { command: unaskedLine };
+        const env: Record<string, string | undefined> = child.env ?? process.env;
+        childOutput = [...unaskedLine.matchAll(/\$\{?([A-Za-z_][A-Za-z0-9_]*)/g)].map((m) => env[m[1]!] ?? "").join("\n") || "(no output)";
+        state.shellRan.push(unaskedLine);
+        const content = [{ type: "text", text: childOutput }];
+        child.messages.find((x) => x.id === cm)?.content?.push({ type: "tool", id, name: "shell", state: { status: "completed", input, content } });
+        durable(child, "session.tool.input.started", { assistantMessageID: cm, id, name: "shell" });
+        durable(child, "session.tool.called", { assistantMessageID: cm, id, input, executed: false });
+        durable(child, "session.tool.success", { assistantMessageID: cm, id, content, executed: true });
+        endStep(child, cm, 0.5);
+        child.idle = Date.now();
+        child.outcome = "succeeded";
+        durable(child, "session.execution.succeeded", {});
+        return true;
+      }
       // The child asks too, under its own session id.
       const cr = await toolCall(child, cm, "shell", { command: "grep -r auth ." }, { action: "shell", resources: ["grep -r auth ."] }, afterReply);
       endStep(child, cm, 0.5);
@@ -776,7 +804,7 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
     // Stopped with its parent: the parent's call fails as interrupted, and so does its execution.
     if (ran === "interrupted") interruptedCall(ses, msg, call);
     const ok = ran;
-    const block = { type: "tool", id: call, name: "subagent", state: { status: "completed", input: {}, content: [{ type: "text", text: ok ? "found it" : "child refused" }], metadata: { sessionID: child.id, status: "completed" } } };
+    const block = { type: "tool", id: call, name: "subagent", state: { status: "completed", input: {}, content: [{ type: "text", text: ok ? childOutput : "child refused" }], metadata: { sessionID: child.id, status: "completed" } } };
     ses.messages.find((x) => x.id === msg)?.content?.push(block);
     durable(ses, "session.tool.success", { assistantMessageID: msg, id: call, content: block.state.content, metadata: block.state.metadata, executed: true });
     endStep(ses, msg);

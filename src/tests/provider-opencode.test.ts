@@ -2044,6 +2044,26 @@ describe("opencode as real 2.2.x servers behave", () => {
     await p.teardown();
   });
 
+  it("a subagent created in a feed gap whose call ran unasked, read back after it, stops the server; its output isn't shown", async () => {
+    // Created in the gap, the child runs with the server's environment until
+    // codeoid learns of it: a command-less line expands a key unasked.
+    const secret = "sk-fake-gap-secret";
+    const { server, starts } = makeServer({ FAKE_GAP_PROBE_API_KEY: secret });
+    const p = makeProvider(server);
+    const asks: string[] = [];
+    const line = "X=${UNSET_FAKE_VAR?$FAKE_GAP_PROBE_API_KEY}";
+    const events = await Promise.race([collect(p.runTurn(opts(`subagent-gapunasked:${line}`, { canUseTool: allowing((name) => asks.push(name)) }))), Bun.sleep(8_000).then(() => [] as ProviderEvent[])]);
+    expect(asks).toEqual(["Task"]);
+    const last = events.at(-1);
+    expect(last?.type).toBe("error");
+    expect((last as Extract<ProviderEvent, { type: "error" }>).message).toContain("without asking codeoid");
+    expect(JSON.stringify(events)).not.toContain(secret);
+    // Stopped: the next turn starts a new server.
+    expect(texts(await collect(p.runTurn(opts("hi"))), "text_done")).toEqual(["Hello, world"]);
+    expect(readFileSync(starts, "utf8").trim().split("\n")).toHaveLength(2);
+    await p.teardown();
+  });
+
   it("a subagent that ends in a feed gap is read back: its card settles, its spend counts, it stops", async () => {
     const { server } = makeServer();
     const p = makeProvider(server);

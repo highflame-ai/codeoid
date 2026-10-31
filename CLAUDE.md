@@ -359,7 +359,8 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
   keys of the user's `~/.config/opencode` are carried in), a server listing a
   plugin that isn't a built-in is refused at start and before every turn
   (`checkPlugins`), and a call that succeeded without asking stops the server
-  (its own turn says why; the server's other sessions get a neutral reason) —
+  (its own turn says why; the server's other sessions get a neutral reason;
+  a call read back after a feed gap is judged the same, `#settleReadBack`) —
   except a shell line with no command in it (`commandlessShellLine`), which
   opencode 2.2.5 runs unasked by its own rule. Such a line can still expand a
   variable, so every session's and child's shell runs with a bare environment

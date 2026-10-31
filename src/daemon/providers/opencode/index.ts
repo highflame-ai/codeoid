@@ -2109,12 +2109,7 @@ export class OpencodeProvider implements SessionProvider {
     if (this.#children.get(id) !== child || !child.running) return;
     for (const m of messages.reverse()) {
       if (m.type !== "assistant") continue;
-      for (const block of m.content ?? []) {
-        if (block.type !== "tool" || !block.id || !this.#announced.has(`${id}:${block.id}`)) continue;
-        const state = block.state;
-        if (state?.status === "completed") this.#toolSettled(id, { id: block.id, content: state.content, metadata: state.metadata }, true);
-        else if (state?.status === "error") this.#toolSettled(id, { id: block.id, content: state.content, error: state.error, metadata: state.metadata }, false);
-      }
+      for (const block of m.content ?? []) if (block.type === "tool") this.#settleReadBack(id, m, block);
       if (!this.#countedSteps.has(m.id) && stepEnded(m)) {
         remember(this.#countedSteps, m.id);
         this.#recordStep(m.tokens, m.cost, false);
@@ -2239,10 +2234,8 @@ export class OpencodeProvider implements SessionProvider {
         const blockIndex = this.#thinkingIndex(key);
         if (!this.#streamedBlocks.has(key) && block.text) this.#emit({ type: "thinking_delta", content: block.text, blockIndex });
         this.#emit({ type: "thinking_done", blockIndex });
-      } else if (block.type === "tool" && block.id && this.#announced.has(`${ses}:${block.id}`)) {
-        const state = block.state;
-        if (state?.status === "completed") this.#toolSettled(ses, { id: block.id, content: state.content, metadata: state.metadata }, true);
-        else if (state?.status === "error") this.#toolSettled(ses, { id: block.id, content: state.content, error: state.error, metadata: state.metadata }, false);
+      } else if (block.type === "tool") {
+        this.#settleReadBack(ses, m, block);
       }
     }
     if (!this.#countedSteps.has(m.id) && stepEnded(m)) {
@@ -2251,6 +2244,26 @@ export class OpencodeProvider implements SessionProvider {
       this.#recordStep(m.tokens, m.cost, true);
     }
     return open !== undefined;
+  }
+
+  /**
+   * A call of session `sid` read back after a feed gap that has settled: its
+   * card completes, and it's judged as the feed would have had it — one that
+   * ran without asking codeoid (its announcement fell in the gap with it:
+   * a subagent created in the gap runs with the server's environment until
+   * codeoid learns of it) stops the server. One already settled, or made
+   * before codeoid attached, isn't news.
+   */
+  #settleReadBack(sid: string, m: OcMessage, block: NonNullable<OcMessage["content"]>[number]): void {
+    const state = block.state;
+    if (!block.id || (state?.status !== "completed" && state?.status !== "error")) return;
+    const key = `${sid}:${block.id}`;
+    if (!this.#announced.has(key)) {
+      if (this.#settledCalls.has(key) || (m.time?.created ?? 0) < this.#attachedAt) return;
+      if (block.name && state.input && typeof state.input === "object" && !Array.isArray(state.input)) this.#recordCall(sid, block.id, { name: block.name, input: state.input });
+    }
+    if (state.status === "completed") this.#toolSettled(sid, { id: block.id, content: state.content, metadata: state.metadata }, true);
+    else this.#toolSettled(sid, { id: block.id, content: state.content, error: state.error, metadata: state.metadata }, false);
   }
 
   /** A message read back while it was being written: its step ended, so its last block is final — read it again. */

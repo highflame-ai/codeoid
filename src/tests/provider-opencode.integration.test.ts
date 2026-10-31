@@ -939,4 +939,28 @@ describe("opencode (real binary)", () => {
       }
     }
   }, 180_000);
+
+  maybeScripted("I29 a subagent created in a feed gap that ran a line unasked, with the server's environment, stops the server once read back; codeoid shows nothing of it", async () => {
+    // Known gap (docs/opencode.md): the child's shell has the server's
+    // environment until codeoid learns of it, so the line itself still runs.
+    const asked: string[] = [];
+    const gate: ToolApprovalFn = async (_t, _a, name, _input, _signal, agentId) => {
+      asked.push(agentId ? `${name}@child` : name);
+      if (!agentId) {
+        cutFeed();
+        setTimeout(restoreFeed, 3_000);
+      }
+      return { behavior: "allow" };
+    };
+    const p = provider();
+    const command = `X=\${UNSET_IT_VAR?$${PROBE_KEY}}`;
+    const sub = { agent: "general", description: "gap child", prompt: `[[tool:shell ${JSON.stringify({ command })}]]` };
+    const events = await collect(p.runTurn(opts(`[[tool:subagent ${JSON.stringify(sub)}]]`, { canUseTool: gate })));
+    expect(asked).toEqual(["Task"]);
+    const last = events.at(-1) as Extract<ProviderEvent, { type: "error" }>;
+    expect(last.type).toBe("error");
+    expect(last.message).toContain("without asking codeoid");
+    expect(JSON.stringify(events)).not.toContain(PROBE_VALUE);
+    await p.teardown();
+  }, 180_000);
 });
