@@ -2052,11 +2052,13 @@ export class OpencodeProvider implements SessionProvider {
     const live = () => conn === this.#conn && this.#ses === ses;
     // A child whose `session.created` fell in the gap would never be learned:
     // its requests and forms ignored, a foreground one blocking the turn.
-    const listed = await conn.client.childSessions(ses).catch(() => [] as OcSessionInfo[]);
+    // Running is what the server runs now, not the stored times: a child a
+    // dead server left behind stays `busy` for good.
+    const [listed, active] = await Promise.all([conn.client.childSessions(ses).catch(() => [] as OcSessionInfo[]), conn.client.activeSessions().catch(() => ({}))]);
     if (!live()) return;
     for (const info of listed) {
       if (this.#children.has(info.id) || info.parentID !== ses) continue;
-      if (!sessionRunning(info) && (info.time?.created ?? 0) < this.#attachedAt) continue; // an old one, done before codeoid attached
+      if (!(info.id in active) && (info.time?.created ?? 0) < this.#attachedAt) continue; // an old one, not running since codeoid attached
       this.#childCreated(info.id, { agent: info.agent, title: info.title });
     }
     // Children first: a foreground one's spend belongs to the turn its parent's read-back may end.
@@ -2096,8 +2098,8 @@ export class OpencodeProvider implements SessionProvider {
    * that ended (each once), and its end if it's idle now.
    */
   async #readBackChild(conn: OpencodeConnection, id: string, child: Child): Promise<void> {
-    // The session first: once it says idle, the messages read after it are final.
-    const info = await conn.client.getSession(id);
+    // Whether it runs first: once it doesn't, the messages read after are final.
+    const [info, running] = await Promise.all([conn.client.getSession(id), this.#runsNow(conn, id)]);
     const messages: OcMessage[] = [];
     let cursor: string | undefined;
     for (let page = 0; page < RECONCILE_PAGES; page++) {
@@ -2115,7 +2117,7 @@ export class OpencodeProvider implements SessionProvider {
         this.#recordStep(m.tokens, m.cost, false);
       }
     }
-    if (!sessionRunning(info) && info.time?.busy !== undefined) this.#childEnded(id, child, info.outcome ?? "succeeded");
+    if (!running && info.time?.busy !== undefined) this.#childEnded(id, child, info.outcome ?? "succeeded");
   }
 
   /**
@@ -2434,10 +2436,10 @@ function stepEnded(m: OcMessage): boolean {
   return (m.finish !== undefined || m.time?.completed !== undefined) && (m.cost !== undefined || m.tokens !== undefined);
 }
 
-/** A session executing now, by its times: busy since it last went idle. */
 /** An opencode session that couldn't be bound to the directory the codeoid session works in. */
 class UnmovedError extends Error {}
 
+/** A session executing, by its stored times: busy since it last went idle (a dead server's session stays so). */
 function sessionRunning(info: OcSessionInfo): boolean {
   const { busy, idle } = info.time ?? {};
   return busy !== undefined && (idle === undefined || idle < busy);

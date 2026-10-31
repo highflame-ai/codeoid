@@ -376,8 +376,9 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
   (`GET`/`DELETE /api/shell`: a stopped shell still wakes its session), and the
   wake. A fresh attach to a session found running stops that leftover
   execution before prompting (`#stopLeftover`). Running means listed in
-  `GET /api/session/active`: a server that died mid-execution never wrote
-  the session's `idle`, so its stored `busy` is stale on the next server.
+  `GET /api/session/active`, for a child as for the session: a server that
+  died mid-execution never wrote their `idle`, so a stored `busy` is stale
+  on the next server (a gap's read-back neither adopts nor keeps such a child).
 - **Events**: the live feed is the only stream: it carries each session's
   durable events (blocks, tools, steps with cost, executions; deduped by
   `durable.seq`) and the ephemeral ones (deltas, `permission.asked`, forms,

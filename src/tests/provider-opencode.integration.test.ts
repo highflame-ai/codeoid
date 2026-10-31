@@ -963,4 +963,36 @@ describe("opencode (real binary)", () => {
     expect(JSON.stringify(events)).not.toContain(PROBE_VALUE);
     await p.teardown();
   }, 180_000);
+
+  maybeScripted("I30 a subagent running when its server died isn't picked up again by a later feed gap; a running one is listed active", async () => {
+    const sessionId = `it-deadchild-${Math.random().toString(36).slice(2)}`;
+    const listed: boolean[] = [];
+    const killing: ToolApprovalFn = async (_t, _a, _name, _input, _signal, agentId) => {
+      if (agentId) {
+        const conn = await server!.ensure();
+        // What a gap's read-back goes by: a running child is in `/active`.
+        listed.push(agentId in (await conn.client.activeSessions()));
+        setTimeout(() => process.kill(conn.pid!, "SIGKILL"), 500);
+      }
+      return { behavior: "allow" };
+    };
+    const p = provider({ sessionId });
+    const sub = { agent: "general", description: "dies", prompt: '[[tool:shell {"command":"sleep 5","description":"Wait"}]]' };
+    const dead = await collect(p.runTurn(opts(`[[tool:subagent ${JSON.stringify(sub)}]]`, { canUseTool: killing })));
+    expect(dead.some((e) => e.type === "error")).toBe(true);
+    expect(listed).toEqual([true]);
+    const ses = p.backingSessionId;
+    await p.teardown();
+    const rebuilt = provider({ sessionId, initialBackingId: ses });
+    const gapping: ToolApprovalFn = async () => {
+      cutFeed();
+      setTimeout(restoreFeed, 800);
+      return { behavior: "allow" };
+    };
+    const events = await collect(rebuilt.runTurn(opts('[[tool:shell {"command":"echo after","description":"After"}]]', { canUseTool: gapping })));
+    expect(events.find((e) => e.type === "error")).toBeUndefined();
+    expect(events.filter((e) => e.type === "subagent_start" || e.type === "subagent_stop")).toEqual([]);
+    expect(done(events)?.stopReason).toBe("stop");
+    await rebuilt.teardown();
+  }, 180_000);
 });

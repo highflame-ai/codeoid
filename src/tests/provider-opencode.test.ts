@@ -1253,6 +1253,23 @@ describe("opencode background shells", () => {
       await fetch(`${conn.client.baseUrl}/__fake/died/${ses}`, { method: "POST" });
     }
   });
+
+  it("a subagent its dead server left marked busy is not picked up again after a later feed gap", async () => {
+    const { server } = makeServer();
+    const p = makeProvider(server, { sessionId: "sess-deadchild", initialBackingId: "sess-deadchild" });
+    const first = await collect(p.runTurn(opts("subagent")));
+    const child = (first.find((e) => e.type === "subagent_start") as Extract<ProviderEvent, { type: "subagent_start" }>).agentId;
+    const ses = p.backingSessionId;
+    await p.teardown();
+    const conn = await server.ensure();
+    await fetch(`${conn.client.baseUrl}/__fake/died/${child}`, { method: "POST" });
+    const rebuilt = makeProvider(server, { sessionId: "sess-deadchild", initialBackingId: ses });
+    const events = await collect(rebuilt.runTurn(opts("gap")));
+    expect(events.find((e) => e.type === "error")).toBeUndefined();
+    expect(events.filter((e) => e.type === "subagent_start" || e.type === "subagent_stop")).toEqual([]);
+    expect(events.at(-1)?.type).toBe("turn_done");
+    await rebuilt.teardown();
+  });
 });
 
 // ── O11 questions ────────────────────────────────────────────────────────────
