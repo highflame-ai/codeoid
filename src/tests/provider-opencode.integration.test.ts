@@ -44,6 +44,7 @@
  *   I21 (scripted only) a shell line made only of redirections asks first: denied, the file outside the workdir is untouched
  *   I22 (scripted only) an approved fetch doesn't follow a redirect to another site; one on the approved site is followed
  *   I23 (scripted only) a subagent continued by its id after the provider was rebuilt: its request reaches the gate, the turn ends
+ *   I25 (scripted only) a session's shell has no key: a line of assignments that runs unasked can't print one, nor the injected config
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
@@ -92,6 +93,10 @@ if (REFUSED) {
 }
 
 const WORK = ENABLED ? mkdtempSync(join(tmpdir(), "codeoid-opencode-it-")) : "/tmp";
+/** A credential-shaped variable the server's environment carries (`*_API_KEY` passes, for model providers); its shell must not (I25). */
+const PROBE_KEY = "IT_SHELL_PROBE_API_KEY";
+const PROBE_VALUE = "sk-it-shell-probe-value";
+if (RUN) process.env[PROBE_KEY] = PROBE_VALUE;
 const DB = process.env.CODEOID_OPENCODE_DB ?? join(WORK, "data", "opencode", "opencode.db");
 let server: OpencodeServer | null = null;
 let scripted: ReturnType<typeof Bun.spawn> | null = null;
@@ -796,4 +801,40 @@ describe("opencode (real binary)", () => {
     expect(events.some((e) => e.type === "subagent_stop" && e.agentId === child)).toBe(true);
     await p.teardown();
   }, 180_000);
+
+  maybeScripted("I25 a session's shell has no key: a line of assignments that runs unasked can't print one, nor the injected config", async () => {
+    // No command in it, so opencode asks nothing; `${U?…}` prints the expansion as its error.
+    for (const command of [`X=\${UNSET_IT_VAR?$${PROBE_KEY}}`, "X=${UNSET_IT_VAR?${OPENCODE_CONFIG_CONTENT}}", "X=${UNSET_IT_VAR?$PATH}"]) {
+      const asked: string[] = [];
+      const p = provider();
+      const deny: ToolApprovalFn = async (_t, _a, name) => {
+        asked.push(name);
+        return { behavior: "deny", message: "not approved" };
+      };
+      const events = await collect(p.runTurn(opts(`[[tool:shell ${JSON.stringify({ command })}]]`, { canUseTool: deny })));
+      expect(asked).toEqual([]);
+      const result = events.find((e) => e.type === "tool_complete") as Extract<ProviderEvent, { type: "tool_complete" }> | undefined;
+      expect(result?.output).toBeDefined();
+      expect(result!.output).not.toContain(PROBE_VALUE);
+      expect(result!.output).not.toContain("permissions");
+      // The shell still has what it needs.
+      if (command.includes("$PATH")) expect(result!.output).toContain("/bin");
+      // codeoid can't tell such a line ran no command: the server was stopped, as for any call that ran unasked.
+      expect(events.at(-1)?.type).toBe("error");
+      await p.teardown();
+    }
+    // A subagent's shell too (opencode doesn't pass the parent's environment on): read back from its stored call.
+    const command = `X=\${UNSET_IT_VAR?$${PROBE_KEY}}`;
+    const p = provider();
+    const sub = { agent: "general", description: "probe", prompt: `[[tool:shell ${JSON.stringify({ command })}]]` };
+    const events = await collect(p.runTurn(opts(`[[tool:subagent ${JSON.stringify(sub)}]]`)));
+    const child = (events.find((e) => e.type === "subagent_start") as Extract<ProviderEvent, { type: "subagent_start" }>).agentId;
+    await p.teardown();
+    const conn = await server!.ensure();
+    const stored = (await conn.client.messages(child)).data.flatMap((m) => m.content ?? []).find((b) => b.type === "tool" && b.name === "shell");
+    expect(stored?.state?.status).toBe("completed");
+    expect(JSON.stringify(stored?.state?.content)).toContain("UNSET_IT_VAR");
+    expect(JSON.stringify(stored)).not.toContain(PROBE_VALUE);
+  }, 180_000);
+
 });

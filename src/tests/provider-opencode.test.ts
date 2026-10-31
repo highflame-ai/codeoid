@@ -31,7 +31,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { OpencodeProvider } from "../daemon/providers/opencode/index.js";
 import { OpencodeServer, OpencodeIncompatibleError } from "../daemon/providers/opencode/server.js";
-import { buildOpencodeEnv, opencodeConfig, ownMountPrefix, sessionRules, survivingAllows, unsafeAgents } from "../daemon/providers/opencode/policy.js";
+import { buildOpencodeEnv, opencodeConfig, opencodeShellEnv, ownMountPrefix, sessionRules, survivingAllows, unsafeAgents } from "../daemon/providers/opencode/policy.js";
 import { OPENCODE_INSTALL_HINT, opencodeDbPath, opencodeVersionProblem, resolveOpencodeCommand } from "../daemon/providers/opencode/resolve.js";
 import { effortOfVariant, gateCallFor, parseModelValue } from "../daemon/providers/opencode/translate.js";
 import { parseSse } from "../daemon/providers/opencode/client.js";
@@ -244,6 +244,37 @@ describe("opencode server lifecycle", () => {
     await p.teardown();
   });
 
+  it("a session's shell runs without the server's environment: a line that runs unasked can't print a key", async () => {
+    const { server } = makeServer({ R4_SECRET_API_KEY: "sk-test-not-for-the-shell" });
+    const p = makeProvider(server);
+    await collect(p.runTurn(opts("hi")));
+    const st = await fakeState(server);
+    const set = st.environments.find((e: { sessionID: string }) => e.sessionID === p.backingSessionId);
+    expect(set.variables.PATH).toBe(process.env.PATH);
+    expect(Object.keys(set.variables).filter((k) => /API_KEY|OPENCODE_/.test(k))).toEqual([]);
+    // `$` in it: codeoid can't tell it ran no command, so the server is stopped — but the value never left.
+    const events = await collect(p.runTurn(opts("unasked-shell:X=${UNSET?$R4_SECRET_API_KEY}", { canUseTool: async () => ({ behavior: "deny", message: "no" }) })));
+    expect(events.find((e) => e.type === "tool_complete")).toMatchObject({ success: true });
+    expect(JSON.stringify(events)).not.toContain("sk-test-not-for-the-shell");
+    await p.teardown();
+  });
+
+  it("a subagent's shell environment is set before anything it asks is allowed; one that can't be set is declined", async () => {
+    const { server } = makeServer();
+    const events = await collect(makeProvider(server).runTurn(opts("subagent")));
+    const child = (events.find((e) => e.type === "subagent_start") as Extract<ProviderEvent, { type: "subagent_start" }>).agentId;
+    const st = await fakeState(server);
+    expect(st.environments.some((e: { sessionID: string }) => e.sessionID === child)).toBe(true);
+    expect(st.replies.find((r: { sessionID: string }) => r.sessionID === child)).toMatchObject({ decision: "once" });
+
+    const failing = makeServer({ FAKE_OPENCODE_ENV_FAIL: "child" }).server;
+    const declined = await collect(makeProvider(failing).runTurn(opts("subagent")));
+    const failedChild = (declined.find((e) => e.type === "subagent_start") as Extract<ProviderEvent, { type: "subagent_start" }>).agentId;
+    const st2 = await fakeState(failing);
+    expect(st2.replies.find((r: { sessionID: string }) => r.sessionID === failedChild)).toMatchObject({ decision: "reject" });
+    expect(declined.some((e) => e.type === "tool_complete" && e.output.includes("couldn't set up this subagent's shell environment"))).toBe(true);
+  });
+
   it("requires the per-start password", async () => {
     const { server } = makeServer();
     const conn = await server.ensure();
@@ -300,6 +331,23 @@ describe("opencode server lifecycle", () => {
     expect(env.CODEOID_API_KEY).toBeUndefined();
     expect(env.ANTHROPIC_API_KEY).toBe("k");
     expect(env.OPENROUTER_API_KEY).toBe("o");
+  });
+
+  it("a session's shell gets basics only: no model key, no injected config, no proxy credentials", () => {
+    const env = opencodeShellEnv({
+      PATH: "/bin",
+      HOME: "/home/u",
+      LC_ALL: "C",
+      ANTHROPIC_API_KEY: "k",
+      GITHUB_API_TOKEN: "t",
+      OPENCODE_CONFIG_CONTENT: "{}",
+      AWS_SECRET_ACCESS_KEY: "s",
+      CODEOID_AGENT_ENV_ALLOW: "AWS_SECRET_ACCESS_KEY",
+      HTTPS_PROXY: "http://user:pw@proxy:3128",
+      HTTP_PROXY: "http://proxy:3128",
+      NO_PROXY: "localhost,.internal",
+    });
+    expect(env).toEqual({ PATH: "/bin", HOME: "/home/u", LC_ALL: "C", HTTP_PROXY: "http://proxy:3128", NO_PROXY: "localhost,.internal" });
   });
 });
 

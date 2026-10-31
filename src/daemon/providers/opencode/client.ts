@@ -301,6 +301,11 @@ export class OpencodeClient {
     await this.#request("PATCH", `/api/session/${encodeURIComponent(sessionID)}`, { body });
   }
 
+  /** Replace the environment the session's shell commands run with (opencode 2.2.5: `process.env` otherwise). */
+  async setEnvironment(sessionID: string, variables: Record<string, string>): Promise<void> {
+    await this.#request("PUT", `/api/session/${encodeURIComponent(sessionID)}/environment`, { body: { variables } });
+  }
+
   async forkSession(sessionID: string, before?: string): Promise<OcSessionInfo> {
     return (await this.#request<{ data: OcSessionInfo }>("POST", `/api/session/${encodeURIComponent(sessionID)}/fork`, { body: before ? { before } : {} })).data;
   }

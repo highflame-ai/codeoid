@@ -295,6 +295,42 @@ export function buildOpencodeEnv(base: Record<string, string | undefined> = proc
   return env;
 }
 
+/** What a session's shell keeps of the daemon's environment: nothing secret-bearing. */
+const SHELL_EXACT = new Set([
+  "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "TZ", "TERM", "TMPDIR", "TEMP", "TMP", "COLORTERM",
+  "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
+]);
+const SHELL_PROXY = new Set(["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"]);
+
+/**
+ * The environment a codeoid session's shell commands run with (set per
+ * opencode session: `PUT …/environment`; opencode uses the server's own
+ * otherwise). opencode asks about a shell line only when its scanner finds a
+ * command in it, so a line of assignments runs unasked and can print any
+ * variable it expands (`X=${U?$KEY}`). The server's environment carries
+ * model credentials and the injected config: none of it reaches the shell.
+ * Only basics, locale, CA trust, and proxies that carry no credentials;
+ * `CODEOID_AGENT_ENV_ALLOW` names are the server's, not its shell's.
+ */
+export function opencodeShellEnv(base: Record<string, string | undefined> = process.env): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(base)) {
+    if (v === undefined) continue;
+    if (SHELL_EXACT.has(k) || k.startsWith("LC_") || (SHELL_PROXY.has(k) && !proxyHasCredentials(v))) env[k] = v;
+  }
+  return env;
+}
+
+function proxyHasCredentials(value: string): boolean {
+  try {
+    const u = new URL(value.includes("://") ? value : `http://${value}`);
+    return u.username !== "" || u.password !== "";
+  } catch {
+    // Not a URL (NO_PROXY's host list): credentials would need an `@`.
+    return value.includes("@");
+  }
+}
+
 /** The server's own settings, set last over {@link buildOpencodeEnv}. */
 export function serverEnv(opts: { password: string; dbPath: string; configDir: string; config: Record<string, unknown> }): Record<string, string> {
   return {

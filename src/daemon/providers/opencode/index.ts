@@ -74,7 +74,7 @@ import {
   type OcSessionInfo,
   type OcTokenUsage,
 } from "./client.js";
-import { fetchFence, fetchOrigin, mcpNamespace, ownMountPrefix, runnableCommand, sessionRules } from "./policy.js";
+import { fetchFence, fetchOrigin, mcpNamespace, opencodeShellEnv, ownMountPrefix, runnableCommand, sessionRules } from "./policy.js";
 import type { OpencodeConnection, OpencodeServer } from "./server.js";
 import {
   type OcToolCall,
@@ -223,6 +223,8 @@ interface Child {
   title: string;
   background: boolean;
   running: boolean;
+  /** Its rules and shell environment were set (#setUpChild): nothing it asks is allowed before. */
+  ready: Promise<boolean>;
 }
 
 interface PendingAsk {
@@ -812,6 +814,10 @@ export class OpencodeProvider implements SessionProvider {
     // the session's rules, a saved "always", a plugin dropped into a config
     // dir opencode watches (#ensureMounts' requests loaded the location).
     if (!fresh) await conn.client.updateSession(ses, { permissions: this.#rulesFor(ses) });
+    // Its shell runs without the server's environment (model keys, the
+    // injected config): a line with no command in it runs unasked. Kept in
+    // the server's memory only, so set on every turn; a failure fails it.
+    await conn.client.setEnvironment(ses, opencodeShellEnv());
     await this.#sweepSaved(conn, workdir);
     await this.#server.checkPlugins(conn, workdir);
     if (!this.#modelsReported) await this.#reportModelsOnce();
@@ -1525,13 +1531,30 @@ export class OpencodeProvider implements SessionProvider {
       title: typeof d.title === "string" && d.title ? d.title : "subagent",
       background: false,
       running: true,
+      ready: this.#setUpChild(this.#conn, id),
     };
     this.#children.set(id, child);
-    // The child may not carry this session's rules (its agent's own come
-    // first); set them before its first step. The server's agent check
-    // (policy.ts) is what guarantees it, this is belt and braces.
-    void this.#conn?.client.updateSession(id, { permissions: this.#rulesFor(id) }).catch(() => {});
     this.#emit({ type: "subagent_start", agentId: id, agentType: child.agentType });
+  }
+
+  /**
+   * A child session gets this session's rules (its agent's own come first:
+   * the server's agent check, policy.ts, is what guarantees it asks, this is
+   * belt and braces) and a shell environment without the server's secrets
+   * (opencode doesn't pass the parent's on). Set as it's learned, before its
+   * first step; what it asks is allowed only once this held (#onAsk).
+   */
+  #setUpChild(conn: OpencodeConnection | null, id: string): Promise<boolean> {
+    if (!conn) return Promise.resolve(false);
+    const env = conn.client.setEnvironment(id, opencodeShellEnv()).then(
+      () => true,
+      (err: unknown) => {
+        console.error(`[opencode-provider ${this.#sessionId.slice(0, 8)}] couldn't set subagent ${id}'s shell environment: ${err instanceof Error ? err.message : String(err)}`);
+        return false;
+      },
+    );
+    void conn.client.updateSession(id, { permissions: this.#rulesFor(id) }).catch(() => {});
+    return env;
   }
 
   /**
@@ -1565,9 +1588,8 @@ export class OpencodeProvider implements SessionProvider {
         }
         let child = this.#children.get(sid);
         if (!child) {
-          child = { agentType: info.agent ?? "subagent", title: info.title || "subagent", background: false, running: false };
+          child = { agentType: info.agent ?? "subagent", title: info.title || "subagent", background: false, running: false, ready: this.#setUpChild(conn, sid) };
           this.#children.set(sid, child);
-          void conn.client.updateSession(sid, { permissions: this.#rulesFor(sid) }).catch(() => {});
         }
         for (const run of queued) run(child);
       },
@@ -1784,6 +1806,13 @@ export class OpencodeProvider implements SessionProvider {
     }
     if (this.#pendingAsks.get(req.id) !== pending) return; // withdrawn: settled elsewhere, or the server went away
     this.#pendingAsks.delete(req.id);
+    if (verdict.behavior === "allow" && isChild && !(await (this.#children.get(req.sessionID)?.ready ?? false))) {
+      // Its shell would still run with the server's environment, keys included.
+      if (!nested) this.#declined.add(key);
+      this.#emit({ type: "tool_complete", sdkToolUseId: toolId, output: "Declined — codeoid couldn't set up this subagent's shell environment.", success: false, declinedByBackend: true });
+      await this.#reply(conn, req, "reject", "codeoid declined this: it couldn't set up this subagent's environment. Try again.");
+      return;
+    }
     if (verdict.behavior === "allow" && !nested && req.action === "webfetch" && !(await this.#fence(conn, req.sessionID, key, String(mapped.input.url ?? "")))) {
       // Unfenced, its redirects would reach any site unasked: not run.
       this.#declined.add(key);

@@ -84,6 +84,12 @@
  *   "lag-settle"   → the feed drops after a call is approved and comes back
  *                    behind: the call's result is stored before the late feed
  *                    delivers it
+ *   "unasked-shell:<line>" → a shell call of the rest of the prompt that runs
+ *                    without a permission request, as real 2.2.5 runs a line
+ *                    its scanner finds no command in; its output is the
+ *                    value of each `$NAME` in it, from the session's
+ *                    environment (`PUT …/environment`) if one was set, else
+ *                    the server's own, as the real shell expands them
  *
  * Knobs (env): FAKE_OPENCODE_VERSION (default 2.2.5), FAKE_OPENCODE_STARTS
  * (append a line per start), FAKE_OPENCODE_UNSAFE_AGENT=1 (an `explore`
@@ -97,7 +103,8 @@
  * plugin that isn't a built-in, listed from the start or once a prompt was
  * posted), FAKE_OPENCODE_AUTOALLOW=1|child (every permission request — or a
  * child session's only — is settled "once" without being published, as
- * such a plugin's hook does).
+ * such a plugin's hook does), FAKE_OPENCODE_ENV_FAIL=child (setting a child
+ * session's environment answers 500).
  * `GET /__fake/state` (test-only, no auth) returns everything recorded;
  * `POST /__fake/delete/<id>[?quiet=1]` deletes a session (quiet: no event);
  * `POST /__fake/tamper/<id>` sets its rules to allow-all and saves an "always".
@@ -138,6 +145,8 @@ interface Ses {
   titled: boolean;
   /** A subagent's child session its parent's call waits on: the parent's interrupt stops it too. */
   foreground?: boolean;
+  /** What its shell commands run with (`PUT …/environment`); the server's own when unset. */
+  env?: Record<string, string>;
   outcome?: string;
   busy?: number;
   idle?: number;
@@ -174,6 +183,8 @@ const state = {
   shellRan: [] as string[],
   /** URLs a webfetch call really fetched (each redirect hop too). */
   fetched: [] as string[],
+  /** `PUT …/environment` calls, in order. */
+  environments: [] as Json[],
   saved: process.env.FAKE_OPENCODE_SAVED === "1" ? [{ id: "prm_1", action: "shell", resource: "git *" }] : ([] as Json[]),
   savedRemoved: [] as string[],
 };
@@ -483,6 +494,28 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
     durable(ses, "session.reasoning.ended", { assistantMessageID: msg, ordinal: 0, text: "pondering" });
     await say(ses, msg, "thought about it", 1);
     endStep(ses, msg);
+    return "succeeded";
+  }
+  if (text.startsWith("unasked-shell:")) {
+    const command = text.slice("unasked-shell:".length);
+    const msg = step(ses);
+    const id = nextId("call");
+    const input = { command };
+    ses.messages.find((x) => x.id === msg)?.content?.push({ type: "tool", id, name: "shell", state: { status: "running", input, metadata: {} } });
+    durable(ses, "session.tool.input.started", { assistantMessageID: msg, id, name: "shell" });
+    durable(ses, "session.tool.called", { assistantMessageID: msg, id, input, executed: false });
+    // No command in it: real 2.2.5 asks nothing, and runs it with the session's environment.
+    const env: Record<string, string | undefined> = ses.env ?? process.env;
+    const output = [...command.matchAll(/\$\{?([A-Za-z_][A-Za-z0-9_]*)/g)].map((m) => env[m[1]!] ?? "").join("\n") || "(no output)";
+    state.shellRan.push(command);
+    const content = [{ type: "text", text: output }];
+    const block = toolBlock(ses, msg, id);
+    if (block) block.state = { status: "completed", input, content };
+    durable(ses, "session.tool.success", { assistantMessageID: msg, id, content, executed: true });
+    endStep(ses, msg);
+    const msg2 = step(ses);
+    await say(ses, msg2, "ran it");
+    endStep(ses, msg2);
     return "succeeded";
   }
   if (text.includes("use-shell")) {
@@ -1216,6 +1249,12 @@ const server = Bun.serve({
     if (rest === "" && method === "PATCH") {
       if (Array.isArray(body.permissions)) ses.permissions = body.permissions as Json[];
       state.patches.push({ sessionID: ses.id, ...body });
+      return new Response(null, { status: 204 });
+    }
+    if (rest === "/environment" && method === "PUT") {
+      if (process.env.FAKE_OPENCODE_ENV_FAIL === "child" && ses.parentID) return json({ _tag: "UnknownError", message: "environment refused" }, 500);
+      ses.env = { ...(body.variables as Record<string, string>) };
+      state.environments.push({ sessionID: ses.id, variables: body.variables });
       return new Response(null, { status: 204 });
     }
     if (rest === "/fork" && method === "POST") {

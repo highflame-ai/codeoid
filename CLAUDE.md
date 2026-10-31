@@ -359,6 +359,11 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
   keys of the user's `~/.config/opencode` are carried in), a server listing a
   plugin that isn't a built-in is refused at start and before every turn
   (`checkPlugins`), and a call that succeeded without asking stops the server.
+  opencode 2.2.5 runs a shell line with no command in it unasked, and such a
+  line can expand a variable, so every session's and child's shell runs with a bare environment
+  (`opencodeShellEnv`, `PUT …/environment` before every turn and as a child is
+  learned; a child's requests are allowed only once it's set): the server's
+  model keys and injected config never reach it.
 - **Events**: the live feed is the only stream: it carries each session's
   durable events (blocks, tools, steps with cost, executions; deduped by
   `durable.seq`) and the ephemeral ones (deltas, `permission.asked`, forms,
