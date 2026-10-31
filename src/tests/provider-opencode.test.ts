@@ -941,6 +941,56 @@ describe("opencode mid-turn messages", () => {
     expect(texts(events, "text_done")).toEqual(["first part", "steered: also this (steer)"]);
   });
 
+  it("a message pushed before the turn's prompt is posted goes after it, and the turn answers both", async () => {
+    // The instructions request is slow, so the push lands while the turn is
+    // still attaching (turn 1: no opencode session yet) or switching (turn 2).
+    const { server } = makeServer({ FAKE_OPENCODE_SLOW_SYNTHETIC_MS: "400" });
+    const p = makeProvider(server);
+    for (const [instructions, pushAfterMs] of [["be brief", 0], ["be briefer", 150]] as const) {
+      const run = p.runTurn(opts("steer", { systemPromptAppend: instructions }));
+      if (pushAfterMs === 0) run.pushMidTurn?.("also this", "now");
+      else setTimeout(() => run.pushMidTurn?.("also this", "now"), pushAfterMs);
+      const events: ProviderEvent[] = [];
+      let dones = 0;
+      const reader = (async () => {
+        for await (const e of run.events) {
+          events.push(e);
+          if ((e.type === "turn_done" && ++dones === 2) || e.type === "error") break;
+        }
+      })();
+      await Promise.race([reader, Bun.sleep(6_000)]);
+      const doneEvents = events.filter((e) => e.type === "turn_done") as Array<Extract<ProviderEvent, { type: "turn_done" }>>;
+      expect(doneEvents.map((d) => d.result.stopReason)).toEqual(["steered", "stop"]);
+      expect(texts(events, "text_done")).toEqual(["first part", "steered: also this (steer)"]);
+    }
+    const st = await fakeState(server);
+    expect(st.prompts.map((x: { text: string }) => x.text)).toEqual(["steer", "also this", "steer", "also this"]);
+    await p.teardown();
+  });
+
+  it("a steer opencode refuses still pays the boundary Session counted, at the turn's end", async () => {
+    const { server } = makeServer({ FAKE_OPENCODE_STEER_FAIL: "1" });
+    const run = makeProvider(server).runTurn(opts("steer"));
+    const events: ProviderEvent[] = [];
+    let pushed = false;
+    let dones = 0;
+    const reader = (async () => {
+      for await (const e of run.events) {
+        events.push(e);
+        if (!pushed && e.type === "text_done") {
+          pushed = true;
+          run.pushMidTurn?.("also this", "now");
+        }
+        if ((e.type === "turn_done" && ++dones === 2) || e.type === "error") break;
+      }
+    })();
+    await Promise.race([reader, Bun.sleep(6_000)]);
+    expect(events.some((e) => e.type === "custom_message" && e.metadata?.event === "opencode.steer_failed")).toBe(true);
+    const doneEvents = events.filter((e) => e.type === "turn_done") as Array<Extract<ProviderEvent, { type: "turn_done" }>>;
+    // Session absorbs the first; the second is the turn's end.
+    expect(doneEvents.map((d) => d.result.stopReason)).toEqual(["steered", "stop"]);
+  });
+
   it("a later message is queued behind the turn", async () => {
     const { server } = makeServer();
     const p = makeProvider(server);

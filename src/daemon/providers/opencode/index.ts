@@ -174,6 +174,16 @@ interface Turn {
   owed: number;
   /** Inbox ids of those steers, to pay at their delivery. */
   steers: Set<string>;
+  /** Steers Session counted that opencode never took (the request failed): paid just before the turn's last `turn_done`. */
+  unpaid: number;
+  /**
+   * The turn's own prompt (or command) was posted, or never will be. A
+   * message pushed mid-turn waits for it: sent first, a steer would start an
+   * execution of its own on the idle session, the turn would end on it, and
+   * the prompt would never go out.
+   */
+  posted: Promise<void>;
+  markPosted: () => void;
   /**
    * What the execution's end waits for: steer requests not answered yet
    * (opencode can take one before codeoid learns its id), and read-backs of
@@ -407,6 +417,10 @@ export class OpencodeProvider implements SessionProvider {
     // still open had its reader leave — a stall recovery: nobody reads it.)
     const prior = this.#turn;
     if (prior) this.#closeTurn(prior, prior.adopted ? "superseded" : "replaced");
+    let markPosted = () => {};
+    const posted = new Promise<void>((resolve) => {
+      markPosted = resolve;
+    });
     const turn: Turn = {
       queue: new AsyncQueue<ProviderEvent>({ maxBuffered: 20_000 }),
       gate: { canUseTool: opts.canUseTool, requestUserInput: opts.requestUserInput, sender: opts.sender },
@@ -415,6 +429,9 @@ export class OpencodeProvider implements SessionProvider {
       started: false,
       owed: 0,
       steers: new Set(),
+      unpaid: 0,
+      posted,
+      markPosted,
       settling: new Set(),
       delivered: new Set(),
       executions: 0,
@@ -469,18 +486,22 @@ export class OpencodeProvider implements SessionProvider {
     // out. (#interrupt ends a turn that started nothing; a prompt posted after
     // it would run anyway, adopted as a turn of its own.)
     const stale = () => this.#turn !== turn || turn.interrupted;
-    const conn = await this.#server.ensure();
-    if (stale()) return;
     try {
-      await this.#post(conn, turn, opts, stale);
-    } catch (err) {
-      if (!sessionGone(err) || stale()) throw err;
-      // Deleted on the server while attached (pruned, or through opencode's
-      // own API) and the feed didn't say so: the turn goes to a new session,
-      // which continues from codeoid's history (#openSession).
-      console.warn(`[opencode-provider ${this.#sessionId.slice(0, 8)}] opencode session ${this.#ses} is gone — continuing in a new one`);
-      this.#detachSession();
-      await this.#post(conn, turn, opts, stale);
+      const conn = await this.#server.ensure();
+      if (stale()) return;
+      try {
+        await this.#post(conn, turn, opts, stale);
+      } catch (err) {
+        if (!sessionGone(err) || stale()) throw err;
+        // Deleted on the server while attached (pruned, or through opencode's
+        // own API) and the feed didn't say so: the turn goes to a new session,
+        // which continues from codeoid's history (#openSession).
+        console.warn(`[opencode-provider ${this.#sessionId.slice(0, 8)}] opencode session ${this.#ses} is gone — continuing in a new one`);
+        this.#detachSession();
+        await this.#post(conn, turn, opts, stale);
+      }
+    } finally {
+      turn.markPosted();
     }
   }
 
@@ -505,6 +526,7 @@ export class OpencodeProvider implements SessionProvider {
       if (stale()) return;
       if (this.#commands.some((c) => c.name === name && c.source === "command")) {
         await conn.client.command(ses, { name: name!, text: args });
+        turn.markPosted();
         // A command may run the agent (most do: they submit a prompt) or
         // only act. Give it a moment to start an execution; one that didn't
         // has finished.
@@ -528,32 +550,45 @@ export class OpencodeProvider implements SessionProvider {
 
   /** A message sent while the turn runs: steer it now (`now`/`next`), or queue it behind (`later`). */
   async #push(turn: Turn, content: string, priority: "now" | "next" | "later"): Promise<void> {
+    if (priority === "later") {
+      await this.#send(turn, content, "queue");
+      return;
+    }
+    // Owed from the moment Session counts it: its delivery can beat the
+    // reply, and the execution can end while the turn's prompt is still
+    // going out (the end then waits for this request).
+    turn.owed++;
+    const sent = this.#send(turn, content, "steer");
+    this.#settling(turn, sent);
+    try {
+      await sent;
+    } catch (err) {
+      // Never taken, so never delivered: Session still absorbs a turn_done
+      // for it, which the turn pays at its end — not here, mid-turn, where
+      // Session's boundary would dismiss the turn's pending approvals.
+      if (turn.owed > 0) {
+        turn.owed--;
+        turn.unpaid++;
+      }
+      throw err;
+    }
+  }
+
+  /** Post a pushed message once the turn's own prompt went out. */
+  async #send(turn: Turn, content: string, delivery: "steer" | "queue"): Promise<void> {
+    await turn.posted;
+    if (this.#turn !== turn || turn.queue.closed || turn.interrupted) throw new Error("the turn ended before the message could be sent");
     const ses = this.#ses;
     const conn = this.#conn;
     if (!ses || !conn) throw new Error("no opencode session to steer");
-    if (priority === "later") {
-      await conn.client.prompt(ses, { text: content, delivery: "queue" });
-      return;
+    const item = await conn.client.prompt(ses, { text: content, delivery });
+    if (delivery === "queue" || this.#turn !== turn) return;
+    // Delivered before its id came back: its boundary is due now.
+    if (turn.delivered.has(item.id)) {
+      if (turn.owed > 0) this.#payBoundary(turn);
+    } else {
+      turn.steers.add(item.id);
     }
-    // Owed before the request goes out: its delivery can beat the reply.
-    turn.owed++;
-    const sent = conn.client.prompt(ses, { text: content, delivery: "steer" }).then(
-      (item) => {
-        if (this.#turn !== turn) return;
-        // Delivered before its id came back: its boundary is due now.
-        if (turn.delivered.has(item.id)) {
-          if (turn.owed > 0) this.#payBoundary(turn);
-        } else {
-          turn.steers.add(item.id);
-        }
-      },
-      (err: unknown) => {
-        turn.owed = Math.max(0, turn.owed - 1);
-        throw err;
-      },
-    );
-    this.#settling(turn, sent);
-    await sent;
   }
 
   /** Stop the turn's execution: the user's interrupt, or the provider's own budget stop (`budget`). */
@@ -562,7 +597,10 @@ export class OpencodeProvider implements SessionProvider {
     // Session cancels its pending mid-turn continuations when it interrupts.
     // A budget stop is the provider's own: Session still counts the steers it
     // pushed, so they are paid before the final turn_done (#finishTurn).
-    if (!opts.budget) turn.owed = 0;
+    if (!opts.budget) {
+      turn.owed = 0;
+      turn.unpaid = 0;
+    }
     const ses = this.#ses;
     const conn = this.#conn;
     if (!ses || !conn) {
@@ -652,8 +690,10 @@ export class OpencodeProvider implements SessionProvider {
       this.#closeTurn(turn, "failed");
       return;
     }
-    // Steers the budget stop left unanswered: Session absorbs one turn_done for each, then reads the stop.
+    // Steers the budget stop left unanswered, and ones opencode never took:
+    // Session absorbs one turn_done for each, then reads the turn's end.
     if (turn.budgetStopped) while (turn.owed > 0) this.#payBoundary(turn);
+    for (; turn.unpaid > 0; turn.unpaid--) this.#emitTo(turn, { type: "turn_done", result: this.#result(turn, "steered") });
     const result = this.#result(turn, turn.budgetStopped ? "budget" : outcome === "interrupted" ? "interrupted" : (turn.finish ?? "stop"));
     if (turn.budgetStopped) {
       result.isError = true;
@@ -1188,6 +1228,9 @@ export class OpencodeProvider implements SessionProvider {
       started: true,
       owed: 0,
       steers: new Set(),
+      unpaid: 0,
+      posted: Promise.resolve(),
+      markPosted: () => {},
       settling: new Set(),
       delivered: new Set(),
       executions: 1,

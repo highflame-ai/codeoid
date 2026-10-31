@@ -98,6 +98,22 @@ describe("opencode through a Session", () => {
     expect(store.getClaudeCodeSessionId(id)).toBe(reply.native!.backingId);
   });
 
+  it("a message sent before the first turn reached opencode steers it once the prompt is posted, and the session goes idle", async () => {
+    const id = await newSession();
+    const s = manager._sessionForTest(id)!;
+    const first = s.send("steer", AUTH);
+    await until(() => s.status === "thinking");
+    await s.send("and also this", AUTH, undefined, "now");
+    await first;
+    await until(() => s.status === "idle" && s.canonicalHistory.at(-1)?.role === "assistant");
+    expect(s.status).toBe("idle");
+    expect(s.canonicalHistory.at(-1)?.content).toContain("steered: and also this (steer)");
+    const conn = await server.ensure();
+    const msgs = await conn.client.messages(store.getClaudeCodeSessionId(id)!);
+    // The turn's own prompt went first.
+    expect(msgs.data.filter((m) => m.type === "user").map((m) => (m as { text?: string }).text)).toEqual(["steer", "and also this"]);
+  });
+
   it("an opencode permission waits on codeoid's approval bar, and the approver's yes runs it", async () => {
     const id = await newSession();
     const s = manager._sessionForTest(id)!;

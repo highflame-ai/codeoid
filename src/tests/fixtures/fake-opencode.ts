@@ -62,7 +62,8 @@
  * subagent that allows shell unless overridden), FAKE_OPENCODE_STUBBORN=1
  * (ignore agent overrides), FAKE_OPENCODE_SAVED=1 (one saved "always" rule),
  * FAKE_OPENCODE_STEER_REPLY_MS (answer a steer's prompt request that long
- * after taking it, so its delivery comes first), FAKE_OPENCODE_SLOW_SYNTHETIC_MS
+ * after taking it, so its delivery comes first), FAKE_OPENCODE_STEER_FAIL=1
+ * (refuse a steer request with a 500), FAKE_OPENCODE_SLOW_SYNTHETIC_MS
  * (answer a synthetic input that late), FAKE_OPENCODE_PLUGIN=1|late (a
  * plugin that isn't a built-in, listed from the start or once a prompt was
  * posted), FAKE_OPENCODE_AUTOALLOW=1|child (every permission request — or a
@@ -736,6 +737,12 @@ async function startExecution(ses: Ses, text: string, inboxID?: string): Promise
     ses.titled = true;
     bill(ses, TITLE_COST, TITLE_TOKENS);
   }
+  // A steer that came after the last step runs next, in an execution of its own.
+  const steer = outcome === "succeeded" ? ses.inbox.findIndex((x) => x.delivery === "steer") : -1;
+  if (steer >= 0) {
+    const [item] = ses.inbox.splice(steer, 1);
+    setTimeout(() => void startExecution(ses, item!.text, item!.id), 5);
+  }
 }
 
 function createSession(input: { directory: string; permissions?: Json[]; agent?: string; model?: Json; parentID?: string; title?: string }): Ses {
@@ -977,6 +984,7 @@ const server = Bun.serve({
       const id = nextId("msg");
       const text = String(body.text ?? "");
       const delivery = String(body.delivery ?? "steer");
+      if (ses.executing && delivery === "steer" && process.env.FAKE_OPENCODE_STEER_FAIL === "1") return json({ _tag: "UnknownError", message: "steer refused" }, 500);
       state.prompts.push({ sessionID: ses.id, id, ...body });
       ses.messages.push({ id, type: "user", text, time: { created: Date.now() } });
       durable(ses, "session.inbox.enqueued", { inboxID: id, item: { type: "user", payload: { text }, delivery } });
@@ -984,7 +992,11 @@ const server = Bun.serve({
         ses.inbox.push({ id, text, delivery });
         // The reply can lag the steer's delivery (FAKE_OPENCODE_STEER_REPLY_MS): opencode takes it at the next step boundary.
         if (delivery === "steer" && process.env.FAKE_OPENCODE_STEER_REPLY_MS) await sleep(Number(process.env.FAKE_OPENCODE_STEER_REPLY_MS));
-      } else setTimeout(() => void startExecution(ses, text, id), 5);
+      } else {
+        // Busy from admission: an input posted before the execution's first event joins it.
+        ses.executing = true;
+        setTimeout(() => void startExecution(ses, text, id), 5);
+      }
       return json({ data: { id, sessionID: ses.id, type: "user", payload: { text }, delivery, time: { created: Date.now() } } });
     }
     if (rest === "/command" && method === "POST") {
