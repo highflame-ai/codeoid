@@ -39,6 +39,7 @@
  *   I17 (scripted only) a plugin can't settle permissions: the user's global one isn't loaded, one in codeoid's config dir is refused
  *   I18 (scripted only) a subagent created in a feed gap is found again (`?parentID=`): its request reaches the gate
  *   I19 (scripted only) a steer the user's interrupt dropped is withdrawn from opencode's inbox: the next turn doesn't get it
+ *   I20 (scripted only) only opencode's built-in commands run as commands: a config command's shell spans never run
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
@@ -622,5 +623,34 @@ describe("opencode (real binary)", () => {
     const stored = JSON.stringify((await conn.client.messages(p.backingSessionId)).data);
     expect(stored).not.toContain("dropped-steer");
     await p.teardown();
+  }, 180_000);
+
+  maybeScripted("I20 only opencode's built-in commands run as commands: a config command's shell spans never run", async () => {
+    // A config command runs every !`…` of its template, the arguments
+    // substituted in, through the shell — without asking anything.
+    const dir = join(server!.configDir, "commands");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "summarize.md"), "Summarize this topic briefly: $ARGUMENTS\n");
+    const marker = join(WORK, "command_marker");
+    const asked: string[] = [];
+    try {
+      const p = provider();
+      const deny: ToolApprovalFn = async (_t, _a, name) => {
+        asked.push(name);
+        return { behavior: "deny", message: "not approved" };
+      };
+      await collect(p.runTurn(opts("[[text:hi]]", { canUseTool: deny })));
+      const conn = await server!.ensure();
+      expect((await conn.client.commands(WORK)).map((c) => c.name)).toContain("summarize");
+      // The built-ins are recognized as the real server lists them; the config command isn't offered.
+      const commands = (await p.listCommands()).filter((c) => c.source === "command").map((c) => c.name);
+      expect(commands).toEqual(["init", "review", "goal"]);
+      await collect(p.runTurn(opts(`/summarize the build !\`touch ${marker}\``, { canUseTool: deny })));
+      expect(existsSync(marker)).toBe(false);
+      expect(asked).toEqual([]);
+      await p.teardown();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   }, 180_000);
 });

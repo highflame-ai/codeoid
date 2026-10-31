@@ -77,6 +77,39 @@ export function mcpNamespace(name: string): string {
   return name.replace(/[^a-zA-Z0-9_-]/g, "_");
 }
 
+/**
+ * opencode's own slash commands, by the description each lists (2.2.2 and
+ * 2.2.5 alike). A command from a config dir (`commands/*.md`, codeoid's own
+ * or `/etc/opencode`'s) runs every `` !`…` `` of its template through the
+ * shell, the message's arguments substituted in first, with no permission
+ * request — past codeoid's gate. One named like a built-in replaces it, so a
+ * built-in is known by its description too.
+ */
+const BUILTIN_COMMANDS = new Map([
+  ["init", "guided AGENTS.md setup"],
+  ["review", "review changes [commit|branch|pr], defaults to uncommitted"],
+  ["goal", "keep working until an objective is met [pause|resume|clear]"],
+]);
+
+/**
+ * Whether a command opencode lists runs as a command in this session (else a
+ * `/name …` message goes to the model as text): one of opencode's built-ins,
+ * or a prompt of one of this session's own MCP mounts (`<mount>:<prompt>`,
+ * `ownMounts` the mounts' normalized names). Another session's mount in the
+ * same location lists its prompts too: run here, its server would be called
+ * with that session's credential, the result landing in this conversation.
+ * With `args`, a built-in carries none with a shell span: it doesn't
+ * interpolate them, but a config command that took its name and description
+ * would.
+ */
+export function runnableCommand(sessionId: string, command: { name: string; description?: string }, ownMounts: Iterable<string>, args?: string): boolean {
+  const builtin = BUILTIN_COMMANDS.get(command.name);
+  if (builtin !== undefined) return command.description === builtin && !args?.includes("!`");
+  const prefix = ownMountPrefix(sessionId);
+  for (const mount of ownMounts) if (command.name.startsWith(`${prefix}${mount}:`)) return true;
+  return false;
+}
+
 /** Tools opencode must not offer at all: a deny rule hides them (see the file header). */
 export const HIDDEN_TOOL_RULES: readonly OcRule[] = [
   { action: "execute", resource: "*", effect: "deny" },

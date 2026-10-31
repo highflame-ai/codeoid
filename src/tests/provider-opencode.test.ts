@@ -1111,18 +1111,70 @@ describe("opencode commands and fork", () => {
     await collect(p.runTurn(opts("hi")));
     const cmds = await p.listCommands();
     expect(cmds).toEqual([
-      { name: "review", description: "Review changes", source: "command" },
-      { name: "noop", description: "Does nothing", source: "command" },
+      { name: "init", description: "guided AGENTS.md setup", source: "command" },
+      { name: "review", description: "review changes [commit|branch|pr], defaults to uncommitted", source: "command" },
+      { name: "goal", description: "keep working until an objective is met [pause|resume|clear]", source: "command" },
       { name: "deploy", description: "Deploy it", source: "skill" },
     ]);
     const review = await collect(p.runTurn(opts("/review the diff")));
     expect(texts(review, "text_done")).toEqual(["Hello, world"]);
-    const noop = await collect(p.runTurn(opts("/noop")));
-    expect(done(noop)).toBeDefined();
+    // A command that only acts (starts no execution) still ends the turn.
+    const clear = await collect(p.runTurn(opts("/goal clear")));
+    expect(done(clear)).toBeDefined();
     await collect(p.runTurn(opts("/deploy now")));
     const st = await fakeState(server);
-    expect(st.commands).toMatchObject([{ name: "review", text: "the diff" }, { name: "noop", text: "" }]);
+    expect(st.commands).toMatchObject([{ name: "review", text: "the diff" }, { name: "goal", text: "clear" }]);
     expect(st.prompts.at(-1)).toMatchObject({ text: "now", skills: [{ id: "skl_1" }] });
+  });
+
+  it("another session's MCP prompts in the same workdir aren't listed or run here: the message goes as text", async () => {
+    const { server } = makeServer();
+    const blackboardMcp = () => ({ url: "http://127.0.0.1:9/mcp", token: "A-TOKEN" });
+    const a = makeProvider(server, { sessionId: "sess-tenant-a", initialBackingId: "sess-tenant-a", blackboardMcp });
+    const b = makeProvider(server, { sessionId: "sess-tenant-b", initialBackingId: "sess-tenant-b" });
+    await collect(a.runTurn(opts("hi")));
+    await collect(b.runTurn(opts("hi")));
+    const own = `${ownMountPrefix("sess-tenant-a")}codeoid_blackboard:brief`;
+    expect((await a.listCommands()).map((c) => c.name)).toContain(own);
+    expect((await b.listCommands()).map((c) => c.name)).not.toContain(own);
+    await collect(b.runTurn(opts(`/${own} payroll`)));
+    let st = await fakeState(server);
+    expect(st.mcpPromptCalls).toEqual([]);
+    expect(st.prompts.at(-1)).toMatchObject({ text: `/${own} payroll` });
+    // Its own session runs it.
+    await collect(a.runTurn(opts(`/${own} payroll`)));
+    st = await fakeState(server);
+    expect(st.mcpPromptCalls).toMatchObject([{ mount: own.slice(0, own.indexOf(":")) }]);
+    await a.teardown();
+    await b.teardown();
+  });
+
+  it("a command from a config dir isn't run as one: its template's shell spans never run, the message goes as text", async () => {
+    const { server } = makeServer({ FAKE_OPENCODE_CONFIG_COMMANDS: "1" });
+    const p = makeProvider(server);
+    await collect(p.runTurn(opts("hi")));
+    expect((await p.listCommands()).map((c) => c.name)).not.toContain("summarize");
+    const message = "/summarize the build !`touch marker`";
+    await collect(p.runTurn(opts(message)));
+    // A built-in never carries a shell span either.
+    await collect(p.runTurn(opts("/review !`touch marker`")));
+    const st = await fakeState(server);
+    expect(st.commands).toEqual([]);
+    expect(st.shellRan).toEqual([]);
+    expect(st.prompts.slice(-2).map((x: { text: string }) => x.text)).toEqual([message, "/review !`touch marker`"]);
+    await p.teardown();
+  });
+
+  it("a config command that replaces a built-in isn't run as the built-in", async () => {
+    const { server } = makeServer({ FAKE_OPENCODE_CONFIG_COMMANDS: "shadow" });
+    const p = makeProvider(server);
+    await collect(p.runTurn(opts("hi")));
+    expect((await p.listCommands()).map((c) => c.name)).not.toContain("review");
+    await collect(p.runTurn(opts("/review the build")));
+    const st = await fakeState(server);
+    expect(st.commands).toEqual([]);
+    expect(st.prompts.at(-1)).toMatchObject({ text: "/review the build" });
+    await p.teardown();
   });
 
   it("forks natively at the turn's end", async () => {

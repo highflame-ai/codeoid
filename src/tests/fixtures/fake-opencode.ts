@@ -75,7 +75,8 @@
  * (append a line per start), FAKE_OPENCODE_UNSAFE_AGENT=1 (an `explore`
  * subagent that allows shell unless overridden), FAKE_OPENCODE_STUBBORN=1
  * (ignore agent overrides), FAKE_OPENCODE_SAVED=1 (one saved "always" rule),
- * FAKE_OPENCODE_STEER_REPLY_MS (answer a steer's prompt request that long
+ * FAKE_OPENCODE_CONFIG_COMMANDS=1|shadow (commands from a config dir, see
+ * `commandsAt`), FAKE_OPENCODE_STEER_REPLY_MS (answer a steer's prompt request that long
  * after taking it, so its delivery comes first), FAKE_OPENCODE_STEER_FAIL=1
  * (refuse a steer request with a 500), FAKE_OPENCODE_SLOW_SYNTHETIC_MS
  * (answer a synthetic input that late), FAKE_OPENCODE_PLUGIN=1|late (a
@@ -153,6 +154,8 @@ const state = {
   forks: [] as Json[],
   interrupts: [] as string[],
   inboxCancels: [] as string[],
+  mcpPromptCalls: [] as Json[],
+  shellRan: [] as string[],
   saved: process.env.FAKE_OPENCODE_SAVED === "1" ? [{ id: "prm_1", action: "shell", resource: "git *" }] : ([] as Json[]),
   savedRemoved: [] as string[],
 };
@@ -903,6 +906,33 @@ function info(ses: Ses): Json {
   };
 }
 
+// ── Commands ───────────────────────────────────────────────────────────────
+
+/** opencode's built-in commands, as 2.2.2 and 2.2.5 list them. */
+const BUILTIN_COMMANDS: Record<string, string> = {
+  init: "guided AGENTS.md setup",
+  review: "review changes [commit|branch|pr], defaults to uncommitted",
+  goal: "keep working until an objective is met [pause|resume|clear]",
+};
+const CONFIG_COMMAND_TEMPLATE = "Summarize this topic briefly:";
+
+/**
+ * What `GET /api/command` lists at a location: the built-ins, one prompt
+ * (`<mount>:brief`) for every MCP server mounted there — whichever session
+ * mounted it — and, with FAKE_OPENCODE_CONFIG_COMMANDS, commands from a
+ * config dir: `1` a `summarize` one, `shadow` a `review` that replaces the
+ * built-in (listed, as real 2.2.x does, without the built-in's description).
+ */
+function commandsAt(directory: string): Array<{ name: string; description?: string }> {
+  const knob = process.env.FAKE_OPENCODE_CONFIG_COMMANDS;
+  const list: Array<{ name: string; description?: string }> = Object.entries(BUILTIN_COMMANDS).map(([name, description]) =>
+    knob === "shadow" && name === "review" ? { name } : { name, description },
+  );
+  if (knob === "1") list.push({ name: "summarize" });
+  for (const mount of mounts.get(directory)?.keys() ?? []) list.push({ name: `${mount}:brief`, description: "a prompt of the server" });
+  return list;
+}
+
 // ── HTTP ───────────────────────────────────────────────────────────────────
 
 const json = (body: unknown, status = 200) => Response.json(body, { status });
@@ -989,7 +1019,10 @@ const server = Bun.serve({
     }
     if (path === "/api/model") return json({ location: { directory: directoryOf(req, url) }, data: MODELS });
     if (path === "/api/model/default") return json({ location: { directory: directoryOf(req, url) }, data: MODELS[0] });
-    if (path === "/api/command") return json({ location: { directory: directoryOf(req, url) }, data: [{ name: "review", description: "Review changes" }, { name: "noop", description: "Does nothing" }] });
+    if (path === "/api/command") {
+      const dir = directoryOf(req, url);
+      return json({ location: { directory: dir }, data: commandsAt(dir) });
+    }
     if (path === "/api/skill") return json({ location: { directory: directoryOf(req, url) }, data: [{ id: "skl_1", name: "deploy", description: "Deploy it", path: "/x", content: "" }] });
     if (path === "/api/session/active") return json({ data: Object.fromEntries([...sessions.values()].filter((s) => s.executing).map((s) => [s.id, { type: "running" }])) });
     if (path === "/api/permission/saved") {
@@ -1106,9 +1139,21 @@ const server = Bun.serve({
       return json({ data: { id, sessionID: ses.id, type: "user", payload: { text }, delivery, time: { created: Date.now() } } });
     }
     if (rest === "/command" && method === "POST") {
+      const name = String(body.name ?? "");
+      const input = String(body.text ?? "");
+      const command = commandsAt(ses.directory).find((c) => c.name === name);
+      if (!command) return notFound("CommandNotFoundError", "no such command");
       state.commands.push({ sessionID: ses.id, ...body });
-      if (body.name === "review") setTimeout(() => void startExecution(ses, `review ${String(body.text ?? "")}`), 5);
-      else if (body.name !== "noop") return notFound("CommandNotFoundError", "no such command");
+      if (name.includes(":")) {
+        // An MCP prompt: opencode calls the mount's server (`prompts/get`, with its credential), asking nothing.
+        state.mcpPromptCalls.push({ sessionID: ses.id, mount: name.slice(0, name.indexOf(":")), config: mounts.get(ses.directory)?.get(name.slice(0, name.indexOf(":"))) });
+      } else if (command.description !== BUILTIN_COMMANDS[name]) {
+        // A config command: every !`…` of its template, arguments substituted in, runs through the shell unasked.
+        const text = `${CONFIG_COMMAND_TEMPLATE} ${input}`;
+        for (const m of text.matchAll(/!`([^`]+)`/g)) state.shellRan.push(m[1]!);
+      }
+      // `goal clear` only acts; everything else prompts the agent.
+      if (!(name === "goal" && input === "clear")) setTimeout(() => void startExecution(ses, `${name} ${input}`), 5);
       return new Response(null, { status: 204 });
     }
     if (rest === "/interrupt" && method === "POST") {

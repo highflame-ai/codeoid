@@ -74,7 +74,7 @@ import {
   type OcSessionInfo,
   type OcTokenUsage,
 } from "./client.js";
-import { mcpNamespace, ownMountPrefix, sessionRules } from "./policy.js";
+import { mcpNamespace, ownMountPrefix, runnableCommand, sessionRules } from "./policy.js";
 import type { OpencodeConnection, OpencodeServer } from "./server.js";
 import {
   type OcToolCall,
@@ -536,7 +536,9 @@ export class OpencodeProvider implements SessionProvider {
       const [, name, args = ""] = slash;
       if (this.#commands.length === 0) await this.listCommands().catch(() => []);
       if (stale()) return;
-      if (this.#commands.some((c) => c.name === name && c.source === "command")) {
+      // Judged again here, not only when listed: the list is a cache, and the mounts change.
+      const command = this.#commands.find((c) => c.name === name && c.source === "command");
+      if (command && runnableCommand(this.#sessionId, command, this.#mounts.keys(), args)) {
         await conn.client.command(ses, { name: name!, text: args });
         turn.markPosted();
         // A command may run the agent (most do: they submit a prompt) or
@@ -988,7 +990,12 @@ export class OpencodeProvider implements SessionProvider {
 
   // ── Commands ──────────────────────────────────────────────────────────
 
-  /** opencode's slash commands and skills, for `session.commands`; run by sending `/name args`. */
+  /**
+   * opencode's slash commands and skills, for `session.commands`; run by
+   * sending `/name args`. Only the commands that run as one here are listed
+   * (`runnableCommand`): opencode's built-ins and this session's own MCP
+   * prompts. Any other `/name …` message goes to the model as text.
+   */
   async listCommands(): Promise<ProviderCommand[]> {
     const conn = this.#conn;
     if (!conn) return this.#commands;
@@ -999,7 +1006,9 @@ export class OpencodeProvider implements SessionProvider {
     ]);
     this.#skills = new Map(skills.map((s) => [s.name, s.id]));
     this.#commands = [
-      ...commands.map((c) => ({ name: c.name, ...(c.description ? { description: c.description } : {}), source: "command" })),
+      ...commands
+        .filter((c) => runnableCommand(this.#sessionId, c, this.#mounts.keys()))
+        .map((c) => ({ name: c.name, ...(c.description ? { description: c.description } : {}), source: "command" })),
       ...skills.map((s) => ({ name: s.name, ...(s.description ? { description: s.description } : {}), source: "skill" })),
     ];
     return this.#commands;
