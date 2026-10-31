@@ -69,6 +69,12 @@ describe("secretPathVerdict", () => {
     }
   });
 
+  test("denies a multi-file edit when any of its files is a secret, not only the first (opencode's patch)", () => {
+    const harmless = join(root, "home", "code", "notes.txt");
+    expect(verdict({ file_path: harmless, files: [harmless, join(configDir, "config.json")] }, "Edit")?.action).toBe("deny");
+    expect(verdict({ file_path: harmless, files: [harmless] }, "Edit")).toBeNull();
+  });
+
   test("denies a process environment or memory", () => {
     for (const p of ["/proc/self/environ", "/proc/1234/environ", "/proc/self/mem", "/proc/self/fd/3", "/proc/self/task/9/environ"]) {
       expect(verdict({ file_path: p })?.action).toBe("deny");
@@ -82,6 +88,9 @@ describe("secretPathVerdict", () => {
     expect(verdict({ pattern: "*", path: "/proc" }, "Glob")?.action).toBe("ask");
     // No root = the workdir: a session whose workdir holds the config dir asks too.
     expect(secretPathVerdict("Grep", { pattern: "sk-ant-" }, { workdir: join(root, "home"), configDir })?.action).toBe("ask");
+    // opencode's card for reaching outside the workdir names directories.
+    expect(verdict({ directories: [configDir], tool: "grep" }, "opencode_external_directory")?.action).toBe("ask");
+    expect(verdict({ directories: [join(root, "home", "code")], tool: "grep" }, "opencode_external_directory")).toBeNull();
   });
 
   test("asks before any tool touches ~/.claude.json — its tokens, and where MCP approvals live (#395)", () => {

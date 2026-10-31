@@ -88,8 +88,8 @@ CODEOID_RESUME_MAX_SESSIONS=200          # sessions restored from disk at startu
                                         #   startup time; the remainder stays on disk and loads
                                         #   on a later restart.
 CODEOID_DEFAULT_PROVIDER=claude         # backend for sessions created without --provider
-                                        #   (claude | codex | pi | qwen | gemini-cli | openai | gemini |
-                                        #    llamacpp — see docs/local-models.md).
+                                        #   (claude | codex | pi | qwen | gemini-cli | opencode | openai |
+                                        #    gemini | llamacpp — see docs/local-models.md, docs/opencode.md).
                                         #   An unknown, disabled or uninstalled backend stops the
                                         #   daemon at startup. Resumed sessions and the conductor
                                         #   keep their own backend.
@@ -183,6 +183,32 @@ How shell commands are approved by risk (`approvals.*`) is in [approvals.md](app
   }
 }
 ```
+
+### opencode
+
+The opencode backend (opencode 2.2.5 or a later 2.2.x) is on by default when an `opencode` binary resolves. codeoid runs one private `opencode serve` per daemon, with its own database; docs/opencode.md has setup, credentials, and what it supports.
+
+```json
+{
+  "providers": {
+    "opencode": {
+      "enabled": true,
+      "command": "opencode",
+      "dbPath": "opencode/opencode.db",
+      "dataDir": "opencode",
+      "agent": "build",
+      "model": "qwen/qwen3.8-max"
+    }
+  }
+}
+```
+
+- `dbPath` — opencode's database for codeoid's sessions. Default: an `opencode` folder beside codeoid's own database (`dbPath` / `CODEOID_DB_PATH`); a relative path resolves from codeoid's config dir. It is never your own opencode's database.
+- `dataDir` — opencode's logs, shell output, state, caches and temp files (its XDG data, state and cache dirs, as `data/`, `state/`, `cache/` under it, and its `TMPDIR`, as `tmp/`). Default: an `opencode` folder beside codeoid's transcript dir (`transcriptDir` / `CODEOID_TRANSCRIPT_DIR`); a relative path resolves from codeoid's config dir. Nothing goes to your own `~/.local/share/opencode` or `~/.cache/opencode`, nor to a shared `/tmp/opencode`.
+- `agent` — the opencode agent sessions run (`build`, `plan`, or your own); omit for opencode's default.
+- `model` — the default model, `provider/model`, for sessions that don't pick one; omit for opencode's default. Refused with `{`, `}`, quotes, backslashes or spaces in it (opencode would expand a `{file:…}` there).
+- Credentials are codeoid's own: its `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and `GOOGLE_API_KEY` (or `GEMINI_API_KEY`), each sent to the gateway its `*_BASE_URL` names when one does, its Qwen backend on an API key or its default account (`providers.qwen`, as provider `qwen`), and its OpenAI-compatible endpoints (as `oai-<name>`). codeoid writes each to a file only it can read and names the file in opencode's config; the files are removed when the server stops, and a daemon that's gone has its files removed when another starts (each daemon keeps its own). The opencode server's environment carries no key, nor a proxy URL with credentials in it. Sign-ins stored in codeoid's opencode database (`OPENCODE_DB=<that path> opencode auth login`) work too. `codeoid account` doesn't apply to it.
+- Every setting here is read when the daemon starts; change one, then restart the daemon (the settings UI says so).
 
 ### `~/.codeoid/.env` — env-only secrets
 
@@ -363,7 +389,7 @@ It decides whose credential the agent runs on, which account is billed, and wher
 The account list is daemon-wide, not per tenant: like the rest of `settings:write`, it belongs to whoever runs the daemon.
 
 **Agents can't read the stored tokens.**
-Agent file tools are refused on codeoid's credential files (`accounts.json`, `claude-accounts.json`, `endpoints.json`, `config.json`, `.env`, `codeoid.db`, the local-mode token), on every account's home under `~/.codeoid/accounts/`, on each agent CLI's own stored login (`~/.claude/.credentials.json`, Codex's `auth.json`, `~/.qwen/oauth_creds.json`, the Gemini CLI's `oauth_creds.json` and `google_accounts.json`, pi's `auth.json`), and on any process's `/proc/<pid>/environ` or memory, in every mode.
+Agent file tools are refused on codeoid's credential files (`accounts.json`, `claude-accounts.json`, `endpoints.json`, `config.json`, `.env`, `codeoid.db`, the local-mode token), on every account's home under `~/.codeoid/accounts/`, on each agent CLI's own stored login (`~/.claude/.credentials.json`, Codex's `auth.json`, `~/.qwen/oauth_creds.json`, the Gemini CLI's `oauth_creds.json` and `google_accounts.json`, pi's `auth.json`), on codeoid's opencode credential files and database (`codeoid-credentials/` and `opencode.db` beside it, see `providers.opencode.dbPath`), and on any process's `/proc/<pid>/environ` or memory, in every mode.
 On Claude this is enforced in a `PreToolUse` hook as well as the approval gate, so it also holds for reads the CLI would allow by itself.
 A search rooted above those files, such as a `Grep` over your home directory, is never auto-approved and waits for you instead.
 

@@ -27,6 +27,8 @@ import { type Command, program } from "commander";
 import pkg from "../package.json" with { type: "json" };
 import { DaemonServer } from "./daemon/server.js";
 import { DefaultProviderError } from "./daemon/providers/registry.js";
+import { clearStaleOpencodeCredentials } from "./daemon/providers/opencode/credentials.js";
+import { opencodeSecretLocations } from "./daemon/providers/opencode/resolve.js";
 import { parseRoleSpec } from "./daemon/collaboration.js";
 import { type ModelBinding, roleBindingsFromSpecs } from "./daemon/pipeline/binding.js";
 import {
@@ -161,7 +163,6 @@ program
       console.error(`\n[codeoid] ${err.message}\n`);
       process.exit(1);
     }
-
     // ── Register frontends ────────────────────────────────────────
 
     // Web UI (always enabled unless --no-web) — the SolidJS app at /ui,
@@ -204,7 +205,13 @@ program
       }
     }
 
-    await daemon.start();
+    try {
+      await daemon.start();
+    } catch (err) {
+      // Its port taken (another daemon runs there), or anything else: not started.
+      console.error(`\n[codeoid] the daemon couldn't start: ${err instanceof Error ? err.message : String(err)}\n`);
+      process.exit(1);
+    }
 
     // ZeroID mode: sweep a stale local-mode token for THIS port. Reaching here
     // means we successfully bound it, so no local-mode daemon can be listening
@@ -216,6 +223,11 @@ program
     if (!localMode) {
       removeLocalTokenFile(getLocalTokenPath(bindPort));
     }
+    // opencode key files a daemon that's gone left — with opencode since
+    // disabled or gone, or its dbPath moved — don't stay on disk. A running
+    // daemon's (another port, or the one whose port we'd have taken) are
+    // its own: its server reads them again as it loads each new location.
+    clearStaleOpencodeCredentials(opencodeSecretLocations(config).dirs);
 
     const displayHost = bindHost === "0.0.0.0" || bindHost === "::" ? "localhost" : bindHost;
     if (opts.web !== false) {

@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SETTINGS_MANIFEST, manifestFields } from "../daemon/settings/manifest.js";
 import { getSnapshot, applyPatches } from "../daemon/settings/store.js";
-import { validateConfigObject, configFilePaths } from "../config.js";
+import { validateConfigObject, configFilePaths, loadConfig } from "../config.js";
 import { SessionManager } from "../daemon/session-manager.js";
 import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
@@ -215,6 +215,48 @@ describe("settings store", () => {
     expect(r.ok).toBe(false);
     expect(r.errors[0]?.message).toMatch(/single line/i);
     expect(existsSync(configFilePaths().envPath)).toBe(false); // nothing written
+  });
+
+  it("the opencode tab: its settings, each applied when the daemon restarts its opencode server", () => {
+    const tab = SETTINGS_MANIFEST.tabs.find((t) => t.id === "opencode");
+    const fields = tab?.groups.flatMap((g) => g.fields) ?? [];
+    expect(fields.map((f) => f.key)).toEqual([
+      "providers.opencode.enabled",
+      "providers.opencode.command",
+      "providers.opencode.agent",
+      "providers.opencode.model",
+      "providers.opencode.dbPath",
+      "providers.opencode.dataDir",
+    ]);
+    for (const f of fields) expect([f.key, f.applies]).toEqual([f.key, "restart"]);
+    expect(fields.filter((f) => f.advanced).map((f) => f.key)).toEqual(["providers.opencode.command", "providers.opencode.dbPath", "providers.opencode.dataDir"]);
+  });
+
+  it("writes opencode settings, and loadConfig resolves its paths from the config dir", () => {
+    const r = applyPatches([
+      { key: "providers.opencode.model", value: "qwen/qwen3.8-max" },
+      { key: "providers.opencode.agent", value: "plan" },
+      { key: "providers.opencode.dataDir", value: "oc-data" },
+      { key: "providers.opencode.dbPath", value: "/var/lib/oc/opencode.db" },
+    ]);
+    expect(r.ok).toBe(true);
+    expect(r.restartRequired).toBe(true);
+    const s = getSnapshot();
+    expect(s.values["providers.opencode.model"]).toEqual({ value: "qwen/qwen3.8-max", source: "config" });
+    expect(s.values["providers.opencode.dataDir"]).toEqual({ value: "oc-data", source: "config" });
+    const oc = loadConfig().providers?.opencode;
+    expect(oc).toMatchObject({ enabled: true, agent: "plan", model: "qwen/qwen3.8-max", dbPath: "/var/lib/oc/opencode.db", dataDir: join(tmp, "codeoid", "oc-data") });
+  });
+
+  it("refuses an opencode default model opencode would expand a substitution in, and writes nothing", () => {
+    applyPatches([{ key: "memory.enabled", value: false }]); // establish a file
+    const before = readFileSync(configFilePaths().configPath, "utf8");
+    for (const value of ["x/{file:/home/u/.ssh/id_ed25519}", "anthropic/{env:OPENCODE_PASSWORD}"]) {
+      const r = applyPatches([{ key: "providers.opencode.model", value }]);
+      expect(r.ok).toBe(false);
+      expect(r.errors[0]?.key).toBe("providers.opencode.model");
+    }
+    expect(readFileSync(configFilePaths().configPath, "utf8")).toBe(before);
   });
 
   it("quotes an env value with spaces (round-trips through the loader)", () => {

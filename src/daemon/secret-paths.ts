@@ -8,7 +8,9 @@
  * ZeroID key), `claude-accounts.json` (every stored Claude subscription,
  * gateway and API-key token), `endpoints.json` (OpenAI-compatible endpoint
  * keys), `codeoid.db` (MCP OAuth tokens), the local-mode
- * token, and each CLI's own login (`~/.claude/.credentials.json`, …) — so a
+ * token, each CLI's own login (`~/.claude/.credentials.json`, …), and what a
+ * backend keeps where codeoid put it (opencode's credential files and its
+ * database, {@link registerSecretPaths}) — so a
  * prompt-injected "read ~/.codeoid/claude-accounts.json" would hand them over
  * without anyone seeing a prompt. `/proc/<pid>/environ` is the same leak one
  * hop removed: the backend's process carries its credential in its
@@ -59,8 +61,8 @@ const PATH_KEYS = [
   "source",
   "destination",
 ] as const;
-/** Input keys holding a list of paths. */
-const PATH_LIST_KEYS = ["paths", "file_paths", "absolute_paths", "include"] as const;
+/** Input keys holding a list of paths (`directories`: opencode's external-directory card; `files`: every target of its patch). */
+const PATH_LIST_KEYS = ["paths", "file_paths", "absolute_paths", "include", "directories", "files"] as const;
 
 /** Tools whose `pattern` is a path glob (not a regex) and whose absent root means the workdir. */
 const GLOB_TOOLS = new Set(["Glob", "glob"]);
@@ -101,6 +103,39 @@ function cliCredentialFiles(): string[] {
     join(piAgentDirOf(process.env), "auth.json"), // ~ read as pi reads it
   ];
 }
+
+/** Credential locations a backend registered (`registerSecretPaths`): dirs whose contents are secret, files (and their SQLite sidecars). */
+const REGISTERED_DIRS = new Map<string, number>();
+const REGISTERED_FILES = new Map<string, number>();
+
+function bump(map: Map<string, number>, key: string, by: 1 | -1): void {
+  const n = (map.get(key) ?? 0) + by;
+  if (n > 0) map.set(key, n);
+  else map.delete(key);
+}
+
+/**
+ * Add credential locations codeoid chose for a backend: every file under one
+ * of `dirs`, and each of `files` (with its `-wal` / `-shm` / `-journal`), is
+ * refused like codeoid's own; a search rooted above one asks. opencode's
+ * credential dir and database are registered with the registry
+ * (registry.ts). Returns the undo (tests).
+ */
+export function registerSecretPaths(paths: { dirs?: readonly string[]; files?: readonly string[] }): () => void {
+  const dirs = (paths.dirs ?? []).map((d) => resolve(d));
+  const files = (paths.files ?? []).map((f) => resolve(f));
+  for (const d of dirs) bump(REGISTERED_DIRS, d, 1);
+  for (const f of files) bump(REGISTERED_FILES, f, 1);
+  let undone = false;
+  return () => {
+    if (undone) return;
+    undone = true;
+    for (const d of dirs) bump(REGISTERED_DIRS, d, -1);
+    for (const f of files) bump(REGISTERED_FILES, f, -1);
+  };
+}
+
+const SQLITE_SIDECARS = ["", "-wal", "-shm", "-journal"];
 
 /** `/proc/<pid>/environ`, `/proc/self/mem`, `/proc/<pid>/task/<tid>/fd/3`, … */
 const PROC_SECRET = /^\/proc\/[^/]+(?:\/task\/[^/]+)?\/(?:environ|mem|fd|fdinfo|map_files)(?:\/|$)/;
@@ -171,7 +206,9 @@ export function secretPathVerdict(
   const secretFiles = [
     ...cliCredentialFiles().map((f) => real(f)),
   ];
-  const secretDirs = [configDir, ...secretFiles.map((f) => dirname(f))];
+  const registeredDirs = [...REGISTERED_DIRS.keys()].map((d) => real(d));
+  const registeredFiles = [...REGISTERED_FILES.keys()].map((f) => real(f));
+  const secretDirs = [configDir, ...secretFiles.map((f) => dirname(f)), ...registeredDirs, ...registeredFiles.map((f) => dirname(f))];
   // Found as the MCP reader finds it (workdir-servers.ts): HOME first.
   const claudeJson = real(join(process.env.HOME ?? homedir(), ".claude.json"));
   let verdict: SecretPathVerdict = null;
@@ -182,6 +219,8 @@ export function secretPathVerdict(
     if (PROC_SECRET.test(literal) || PROC_SECRET.test(p)) return { action: "deny", path: raw };
     if (norm(dirname(p)) === norm(configDir) && isSecretConfigFile(norm(basename(p)))) return { action: "deny", path: raw };
     if (secretFiles.some((f) => norm(f) === norm(p))) return { action: "deny", path: raw };
+    if (registeredDirs.some((d) => within(p, d))) return { action: "deny", path: raw };
+    if (registeredFiles.some((f) => SQLITE_SIDECARS.some((s) => norm(`${f}${s}`) === norm(p)))) return { action: "deny", path: raw };
     if (LOGIN_DIR.test(p)) return { action: "deny", path: raw };
     // An account's home (accounts.ts): its own files are its credential. The
     // shared entries are symlinks, which `real` has already resolved to the

@@ -2407,7 +2407,7 @@ mcpHub: this.#mcpHub,
     const id = config.session.defaultProvider;
     if (!id || id === CLAUDE_PROVIDER_ID) return undefined;
     try {
-      createDefaultProviderRegistry(config, next.env, { store: this.#endpoints, catalog: this.#endpointCatalog });
+      createDefaultProviderRegistry(config, next.env, { store: this.#endpoints, catalog: this.#endpointCatalog }, undefined, { preview: true });
       return undefined;
     } catch (err) {
       if (err instanceof DefaultProviderError) return { kind: "provider", message: err.message };

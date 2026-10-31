@@ -50,6 +50,7 @@ import {
   createRegistry,
 } from "./compress/index.js";
 import { createHookBus } from "./hooks/bus.js";
+import { stopOpencodeServers } from "./providers/opencode/server.js";
 import type { CodeoidConfig, McpControlConfig } from "../config.js";
 import { CAPABILITIES, PROTOCOL_VERSION, type AuthContext, type DaemonMessage } from "../protocol/types.js";
 import { parseAuthMsg, parseClientMessage } from "@highflame/codeoid-protocol/schemas";
@@ -218,6 +219,8 @@ export class DaemonServer {
   #mcpHub: McpHub | null = null;
   #mcpProxy: McpProxy | null = null;
   #bunServer: ReturnType<typeof Bun.serve> | null = null;
+  /** Boot recovery done: until then every request is answered 503 (`start`). */
+  #ready = false;
   /** Capabilities advertised on auth.ok — SERVER_CAPABILITIES plus PUSH when a
    *  push transport is configured, so clients can feature-detect push support. */
   #advertisedCapabilities: string[];
@@ -390,6 +393,9 @@ export class DaemonServer {
       this.#mcpHub?.closeAll();
     });
     this.#shutdown.register("store", () => this.#store.close());
+    // The shared opencode server outlives any one session; it stops once
+    // they have drained (LIFO: registered before "sessions", runs after it).
+    this.#shutdown.register("opencode", () => stopOpencodeServers());
     this.#shutdown.register("sessions", () => this.#manager.drain(10_000));
     // LIFO: registered after sessions → stops BEFORE the drain, so the
     // dispatcher can't claim new work or inject events into draining sessions.
@@ -457,15 +463,6 @@ export class DaemonServer {
     // parser before any session runs. A failure leaves every command
     // `unknown` (asked about), never waved through.
     await loadShellParser().catch((err) => console.error(`[codeoid] the shell parser failed to load; every shell command will ask: ${err instanceof Error ? err.message : String(err)}`));
-
-    // Publish the local-mode token for clients on this machine BEFORE the
-    // socket opens, so `codeoid tui` in another terminal can never observe a
-    // listening daemon without a readable token.
-    const localMode = this.#config.localMode;
-    if (localMode?.tokenFile) {
-      writeLocalTokenFile(localMode.tokenFile, localMode.token);
-      console.log(`[codeoid] local-mode token published to ${localMode.tokenFile} (0600)`);
-    }
 
     // Boot memory engine if configured — before resume so ingestion queue is ready.
     if (this.#config.memory) {
@@ -606,25 +603,11 @@ export class DaemonServer {
     const mcpCount = this.#mcpRegistry.list().filter((s) => !s.builtin).length;
     if (mcpCount > 0) console.log(`[codeoid] mcp: ${mcpCount} external server(s) registered`);
 
-    // Resume sessions from transcripts
-    const resumed = await this.#manager.resumeSessions();
-    if (resumed > 0) {
-      console.log(`[codeoid] resumed ${resumed} session(s) from transcript`);
-    }
-
-    // Start the dispatch queue AFTER resume: the first tick reclaims tasks
-    // claimed by the previous boot, and surviving workers must already be
-    // back in the session map for continuation to find them.
-    this.#manager.startDispatcher();
-    this.#manager.startLoops();
-
-    // Re-drive any SDLC pipelines interrupted mid-run before the restart
-    // (no-op when the pipeline feature is disabled).
-    this.#manager.startPipelines();
-    // After resume: boot recovery closes runs a previous process left in flight.
-    this.#manager.startRoutines();
-
-    // Start Bun HTTP + WebSocket server
+    // Bind before anything that takes over a previous boot's state (resume,
+    // the dispatcher's reclaim, routine and pipeline recovery): those assume
+    // that boot is gone, and a start whose port another daemon holds would
+    // otherwise run them against that live daemon's database before failing
+    // here. Until recovery is done every request is answered 503.
     const self = this;
     const authConfig = this.#config.auth;
 
@@ -636,6 +619,9 @@ export class DaemonServer {
       idleTimeout: IDLE_TIMEOUT_SECONDS,
 
       async fetch(req, server) {
+        if (!self.#ready) {
+          return new Response("codeoid is starting", { status: 503, headers: { "Retry-After": "1" } });
+        }
         const url = new URL(req.url);
 
         // WebSocket upgrade
@@ -1027,6 +1013,35 @@ export class DaemonServer {
     });
 
     console.log(`[codeoid] daemon listening on ${this.#config.host}:${this.#config.port}`);
+
+    // Publish the local-mode token for clients on this machine once the port
+    // is ours (a start that couldn't bind must not replace a running daemon's
+    // token), in the same tick as the bind: no request is answered before
+    // the token is readable.
+    const localMode = this.#config.localMode;
+    if (localMode?.tokenFile) {
+      writeLocalTokenFile(localMode.tokenFile, localMode.token);
+      console.log(`[codeoid] local-mode token published to ${localMode.tokenFile} (0600)`);
+    }
+
+    // Resume sessions from transcripts
+    const resumed = await this.#manager.resumeSessions();
+    if (resumed > 0) {
+      console.log(`[codeoid] resumed ${resumed} session(s) from transcript`);
+    }
+
+    // Start the dispatch queue AFTER resume: the first tick reclaims tasks
+    // claimed by the previous boot, and surviving workers must already be
+    // back in the session map for continuation to find them.
+    this.#manager.startDispatcher();
+    this.#manager.startLoops();
+
+    // Re-drive any SDLC pipelines interrupted mid-run before the restart
+    // (no-op when the pipeline feature is disabled).
+    this.#manager.startPipelines();
+    // After resume: boot recovery closes runs a previous process left in flight.
+    this.#manager.startRoutines();
+    this.#ready = true;
 
     // Start all registered frontends
     const ctx: FrontendContext = {

@@ -73,7 +73,7 @@ export class Codeoid {
         session: { defaultProvider: "scripted" },
         memory: { enabled: false },
         workspaceIndex: { enabled: false },
-        providers: { pi: { enabled: false }, codex: { enabled: false }, geminiCli: { enabled: false }, qwen: { enabled: false } },
+        providers: { pi: { enabled: false }, codex: { enabled: false }, geminiCli: { enabled: false }, qwen: { enabled: false }, opencode: { enabled: false } },
         // Priced like a real model, so a turn with no reported cost is estimated (#430).
         pricing: { models: { "scripted-model": { input: 1, output: 2 } } },
       }),

@@ -166,7 +166,7 @@ import {
   type MemoryEngine,
   type MemoryMcpMount,
 } from "./memory/index.js";
-import { isElicitationTool, isSafeTool, roleDeniesTool } from "./providers/tool-safety.js";
+import { isElicitationTool, isSafeTool, isUnresolvedPathTool, roleDeniesTool } from "./providers/tool-safety.js";
 import type { PackActivation } from "./pipeline/index.js";
 import { McpRegistry } from "./mcp/registry.js";
 import { mcpSpecKey, SessionMcpView, type WorkdirReach } from "./mcp/session-view.js";
@@ -243,6 +243,8 @@ const SUBAGENT_REGISTRATION_FENCE_MS = 5_000;
  * that, and it bounds the stall if the backend ever does not continue.
  */
 const BACKGROUND_WAKE_FALLBACK_MS = 20_000;
+/** How long a send waits for an ended run's last events before its own turn replaces it. */
+const ENDED_RUN_DRAIN_MS = 5_000;
 
 /**
  * A fork's parent's task asked to stop that the backend still lists after
@@ -258,6 +260,7 @@ const CANCEL_REASON: Record<SessionUiResolvedMsg["reason"], NonNullable<UiRespon
   cancelled: "dismissed",
   timeout: "timeout",
   interrupted: "interrupted",
+  withdrawn: "withdrawn",
 };
 
 /** A person (or their token), as opposed to a daemon principal (`system:dispatch`, `system:routines`, …). */
@@ -1382,6 +1385,8 @@ export class Session {
       msg: SessionUiRequestMsg;
       resolve: (r: UiResponse) => void;
       timer?: ReturnType<typeof setTimeout>;
+      /** Stops listening for the provider's withdrawal (`UiRequest.signal`). */
+      unlisten?: () => void;
     }
   >();
 
@@ -3054,8 +3059,9 @@ export class Session {
   /**
    * Raise a dialog on behalf of the provider and await the user's answer.
    * Passed to providers as `TurnOpts.requestUserInput`. The promise settles
-   * when the first client answers, the request times out (`timeoutMs`), or
-   * the session is interrupted/destroyed — never rejects. With no deadline it
+   * when the first client answers, the request times out (`timeoutMs`), the
+   * provider withdraws it (`signal`), or the session is interrupted/destroyed
+   * — never rejects. With no deadline it
    * waits for a human however long, like a tool approval: it is re-sent to
    * every client that attaches and can render it, and shows in the session's
    * info (`pendingDialog`) so any surface can see what it is waiting on. A
@@ -3063,6 +3069,7 @@ export class Session {
    */
   requestUserInput(req: UiRequest): Promise<UiResponse> {
     if (this.#unattended > 0) return Promise.resolve({ cancelled: true, reason: "unattended" });
+    if (req.signal?.aborted) return Promise.resolve({ cancelled: true, reason: "withdrawn" });
     const requestId = randomUUID();
     const msg: SessionUiRequestMsg = {
       type: "session.ui_request",
@@ -3084,7 +3091,12 @@ export class Session {
               this.#settleUiRequest(requestId, { cancelled: true }, "timeout");
             }, req.timeoutMs)
           : undefined;
-      this.#pendingUiRequests.set(requestId, { msg, resolve, timer });
+      // The provider withdrew it (the backend settled the question itself): nobody's answer would reach it.
+      const signal = req.signal;
+      const withdraw = () => this.#settleUiRequest(requestId, { cancelled: true }, "withdrawn");
+      signal?.addEventListener("abort", withdraw, { once: true });
+      const unlisten = signal ? () => signal.removeEventListener("abort", withdraw) : undefined;
+      this.#pendingUiRequests.set(requestId, { msg, resolve, timer, ...(unlisten ? { unlisten } : {}) });
       this.#broadcastToCapable(CAPABILITIES.UI_DIALOGS, msg);
       this.#broadcastInfoUpdate(); // pendingDialog
     });
@@ -3158,6 +3170,7 @@ export class Session {
     if (!pending) return false;
     this.#pendingUiRequests.delete(requestId);
     if (pending.timer) clearTimeout(pending.timer);
+    pending.unlisten?.();
     pending.resolve(
       response.cancelled && response.reason === undefined
         ? { ...response, reason: CANCEL_REASON[reason] }
@@ -3520,7 +3533,7 @@ export class Session {
     // it shapes that run rather than starting one — so the running turn's
     // remaining output stays attributed to it. `previousTurnId` lets a send
     // that is refused or stopped below hand attribution back.
-    const joinsRunningTurn = wasWorking && !!this.#activeRun?.pushMidTurn && this.#currentTurnId !== null;
+    const joinsRunningTurn = wasWorking && this.#takesMidTurn(this.#activeRun) && this.#currentTurnId !== null;
     const previousTurnId = this.#currentTurnId;
     let turnId = joinsRunningTurn ? (previousTurnId as string) : this.#beginTurn();
     // Per-turn controls belong to a turn that STARTS here, not to one this
@@ -3604,7 +3617,7 @@ export class Session {
     }
 
     // For keep-warm mid-turn pushes (ClaudeProvider), inject directly into the live run.
-    if (wasWorking && this.#activeRun?.pushMidTurn) {
+    if (wasWorking && this.#activeRun && this.#takesMidTurn(this.#activeRun)) {
       const hint =
         effectivePriority === "now"
           ? // Provider-agnostic: this path is reached by any keep-warm backend
@@ -3785,6 +3798,11 @@ export class Session {
     // agent can touch them — what "go back to before this message" restores.
     // Bounded wait; a snapshot still running when the turn starts is `late`.
     await this.#checkpointTurn(turnId);
+    // A run whose turn the backend already ended, its last events still being
+    // read: let its end land (its result, spend included) before this turn
+    // replaces it, or the ownership guard would drop it.
+    const ended = this.#activeRun;
+    if (ended?.pushMidTurn && !this.#takesMidTurn(ended)) await this.turnDrained(ENDED_RUN_DRAIN_MS);
     this.#throwIfStoppedBeforeStart(stopGen);
     // The fork's notes again, after every await: one may have been armed or
     // spent meanwhile (a settle, a turn the backend started and was handed
@@ -3797,7 +3815,7 @@ export class Session {
     // whose runTurn would close the adopted queue mid-reply. Joining means
     // the adopted turn's id, not the one minted for this prompt.
     const adopted = this.#activeRun;
-    if (adopted?.pushMidTurn) {
+    if (adopted && this.#takesMidTurn(adopted)) {
       // The snapshot was for a turn that won't happen.
       void this.#dropCheckpoint(turnId);
       // #adoptTurn gave the adopted run its own id (current, unless unset).
@@ -5868,6 +5886,11 @@ export class Session {
     return this.#pack;
   }
 
+  /** The run takes a mid-turn message (its backend's turn hasn't ended under it). */
+  #takesMidTurn(run: TurnRun | null): run is TurnRun & Required<Pick<TurnRun, "pushMidTurn">> {
+    return !!run?.pushMidTurn && run.acceptsMidTurn?.() !== false;
+  }
+
   /**
    * Resolves once the turn in flight, if any, has fully ended — its stream
    * drained and its result, spend included, accounted — or after `timeoutMs`.
@@ -7098,6 +7121,10 @@ export class Session {
     // waiting_approval until the owner attaches and answers.
     if (isElicitationTool(toolName)) return false;
 
+    // HARD gate, mode-independent: a call whose path the backend couldn't
+    // resolve for certain is never run unasked (tool-safety.ts).
+    if (isUnresolvedPathTool(toolName)) return false;
+
     if (this.#mode === "interactive") return false;
 
     // Read-only / retrieval tools — safe in both guarded and autonomous.
@@ -7134,7 +7161,7 @@ export class Session {
   #budgetSpentFor(toolName: string): boolean {
     if (this.#onBudgetExhausted !== "end_attempt" || this.#mode !== "autonomous") return false;
     if (this.#turnsRemaining === undefined || this.#turnsRemaining > 0) return false;
-    if (isFleetSendTool(toolName) || isElicitationTool(toolName)) return false;
+    if (isFleetSendTool(toolName) || isElicitationTool(toolName) || isUnresolvedPathTool(toolName)) return false;
     return !isSafeTool(toolName) && !this.#isReadonlyMcpTool(toolName);
   }
 
@@ -7149,6 +7176,7 @@ export class Session {
   #peekAutoApprove(toolName: string): boolean {
     if (isFleetSendTool(toolName)) return false;
     if (isElicitationTool(toolName)) return false;
+    if (isUnresolvedPathTool(toolName)) return false;
     if (this.#mode === "interactive") return false;
     if (isSafeTool(toolName)) return true;
     if (this.#isReadonlyMcpTool(toolName)) return true;

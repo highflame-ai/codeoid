@@ -2703,8 +2703,11 @@ export interface SessionUiResolvedMsg {
   type: "session.ui_resolved";
   sessionId: string;
   requestId: string;
-  /** Why it settled. Open string — clients treat unknown values as "dismiss". */
-  reason: "answered" | "cancelled" | "timeout" | "interrupted";
+  /**
+   * Why it settled. Open string — clients treat unknown values as "dismiss".
+   * `withdrawn`: the backend settled the question itself (its call ended).
+   */
+  reason: "answered" | "cancelled" | "timeout" | "interrupted" | "withdrawn";
   timestamp: string;
 }
 

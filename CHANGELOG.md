@@ -18,6 +18,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   On Claude, a high-risk or not-understood command never runs on a `permissions.allow` rule without codeoid's gate seeing it.
   Protecting credentials and files outside the workspace for real needs the agent's commands to run in a sandbox (#448).
   See [docs/approvals.md](docs/approvals.md), which lists the known ways past "high".
+- **opencode as a backend** (#447).
+  opencode 2.2 opens its 75+ model providers (GitHub Copilot, OpenRouter, Bedrock, Vertex, Azure, local Ollama, …) to sessions, routines and loops, with codeoid's approvals, spend caps and memory on top.
+  codeoid runs one private opencode server per daemon — started by the first opencode session, loopback-only with a fresh password, its own database beside codeoid's (`providers.opencode.dbPath`), restarted if it dies and stopped with the daemon — so codeoid's sessions never mix with your own opencode.
+  Every action opencode takes asks codeoid's gate first, under codeoid's tool names (a shell command is `Bash` with its command line), including its subagents', whose own allow rules codeoid turns into asks; codeoid answers each once, never "always", and refuses what it can't show.
+  Replies and thinking stream into the session's history; stop, resume after a restart, native forks, models with their reasoning variants as efforts, real per-step cost and tokens (a routine's cap stops a turn as the spend lands), codeoid's memory, blackboard and registry MCP servers, subagents and background subagents, slash commands and skills, questions, and messages that steer a running turn all work.
+  `providers.opencode.agent` picks the opencode agent (`plan` for read-only planning).
+  docs/opencode.md has setup and limits.
 
 - **End-to-end tests against a scripted backend** (#429).
   `bun run test:e2e` boots a real daemon per test on a throwaway home and drives it through the web UI (Chromium, via Playwright) and the CLI, with a scripted backend that replays a written conversation instead of a model: no credentials, the same result every time.

@@ -2442,6 +2442,8 @@ function skillNoAnswer(reason: NonNullable<UiResponse["reason"]>, command: strin
       return "the approval timed out";
     case "interrupted":
       return "the turn was interrupted before it was approved";
+    case "withdrawn":
+      return "the approval was withdrawn before it was answered";
     case "unattended":
       // Like `claude -p`: an unattended run (a pipeline phase) never prompts,
       // so a command must be allowed before the run (#348).

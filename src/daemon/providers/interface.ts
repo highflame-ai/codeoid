@@ -79,6 +79,12 @@ export interface UiRequest {
   prefill?: string;
   /** Auto-cancel deadline in ms. Absent = wait for a human (or interrupt). */
   timeoutMs?: number;
+  /**
+   * Aborted when the backend no longer wants the answer (it settled the
+   * question itself: its call ended, its agent stopped). The dialog is
+   * dismissed everywhere and settles cancelled, reason `withdrawn`.
+   */
+  signal?: AbortSignal;
 }
 
 /**
@@ -94,9 +100,10 @@ export interface UiResponse {
    * Why a cancelled dialog got no answer: a client dismissed it, its own
    * `timeoutMs` elapsed, the turn was interrupted / the session torn down, or
    * the turn is unattended (`unattended` — the daemon is driving it, e.g. a
-   * pipeline phase, and never prompts). Absent when answered.
+   * pipeline phase, and never prompts), or the provider withdrew it
+   * (`withdrawn`, its `signal`). Absent when answered.
    */
-  reason?: "dismissed" | "timeout" | "interrupted" | "unattended";
+  reason?: "dismissed" | "timeout" | "interrupted" | "unattended" | "withdrawn";
 }
 
 /** Raise a dialog and await the user's answer. Implemented by Session. */
@@ -539,6 +546,13 @@ export interface TurnRun {
   interrupt(): Promise<void>;
   /** Push a message mid-turn (ClaudeProvider only). */
   pushMidTurn?(content: string, priority: "now" | "next" | "later"): void;
+  /**
+   * False once the run can't take a `pushMidTurn` any more: the backend's
+   * turn already ended, though Session may not have read its end yet. The
+   * message then starts a turn of its own, as on a backend with no mid-turn
+   * injection. Absent means it always can.
+   */
+  acceptsMidTurn?(): boolean;
   /**
    * Signal that the consumer has stopped reading `events` — called from
    * Session's turn-exit path, exactly once per run.
