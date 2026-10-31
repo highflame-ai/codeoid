@@ -375,6 +375,10 @@ export class OpencodeProvider implements SessionProvider {
     this.#lastGate = turn.gate;
     this.#maxBudgetUsd = opts.maxBudgetUsd;
     this.#hasQueried = true;
+    // Per-block state is a turn's: a late delta of an earlier turn has no reader anyway.
+    this.#endedBlocks.clear();
+    this.#streamedBlocks.clear();
+    this.#blockIndex.clear();
 
     void this.#startTurn(turn, opts).catch((err: unknown) => {
       this.#failTurn(turn, `opencode: ${err instanceof Error ? err.message : String(err)}`);
