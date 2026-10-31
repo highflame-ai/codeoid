@@ -523,10 +523,13 @@ export class OpencodeProvider implements SessionProvider {
     await sent;
   }
 
-  async #interrupt(turn: Turn): Promise<void> {
+  /** Stop the turn's execution: the user's interrupt, or the provider's own budget stop (`budget`). */
+  async #interrupt(turn: Turn, opts: { budget?: boolean } = {}): Promise<void> {
     turn.interrupted = true;
-    // Session cancels its pending mid-turn continuations on interrupt.
-    turn.owed = 0;
+    // Session cancels its pending mid-turn continuations when it interrupts.
+    // A budget stop is the provider's own: Session still counts the steers it
+    // pushed, so they are paid before the final turn_done (#finishTurn).
+    if (!opts.budget) turn.owed = 0;
     const ses = this.#ses;
     const conn = this.#conn;
     if (!ses || !conn) {
@@ -616,6 +619,8 @@ export class OpencodeProvider implements SessionProvider {
       this.#closeTurn(turn, "failed");
       return;
     }
+    // Steers the budget stop left unanswered: Session absorbs one turn_done for each, then reads the stop.
+    if (turn.budgetStopped) while (turn.owed > 0) this.#payBoundary(turn);
     const result = this.#result(turn, turn.budgetStopped ? "budget" : outcome === "interrupted" ? "interrupted" : (turn.finish ?? "stop"));
     if (turn.budgetStopped) {
       result.isError = true;
@@ -1091,7 +1096,7 @@ export class OpencodeProvider implements SessionProvider {
       });
       return;
     }
-    if (turn.owed > 0) {
+    if (turn.owed > 0 && !turn.budgetStopped) {
       // The steered input arrived after the last step: opencode runs it
       // next. This execution's part of the turn ends here (Session
       // absorbs it); the turn waits for the next execution.
@@ -1160,7 +1165,7 @@ export class OpencodeProvider implements SessionProvider {
     // The routine's cap, enforced as the spend lands — not only between turns.
     if (turn && !turn.budgetStopped && this.#maxBudgetUsd !== undefined && this.#spentUsd >= this.#maxBudgetUsd) {
       turn.budgetStopped = true;
-      void this.#interrupt(turn);
+      void this.#interrupt(turn, { budget: true });
     }
   }
 

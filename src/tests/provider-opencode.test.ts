@@ -567,6 +567,26 @@ describe("opencode cost and tokens", () => {
     expect(st.interrupts).toHaveLength(1);
   });
 
+  it("a budget stop with a steer pending pays the steer's boundary first, so Session reads the stop", async () => {
+    const { server } = makeServer();
+    const run = makeProvider(server).runTurn(opts("costly", { maxBudgetUsd: 3 }));
+    const events: ProviderEvent[] = [];
+    let pushed = false;
+    for await (const e of run.events) {
+      events.push(e);
+      if (!pushed && e.type === "llm_call") {
+        pushed = true;
+        run.pushMidTurn?.("also this", "now");
+      }
+    }
+    // Session absorbs one turn_done per now/next push; the last one is the stop.
+    const doneEvents = events.filter((e) => e.type === "turn_done") as Array<Extract<ProviderEvent, { type: "turn_done" }>>;
+    expect(doneEvents.map((d) => d.result.stopReason)).toEqual(["steered", "budget"]);
+    expect(doneEvents[1]!.result).toMatchObject({ isError: true, errorMessage: BUDGET_STOP_MESSAGE });
+    // The spend is reported once across the two.
+    expect(doneEvents.reduce((sum, d) => sum + d.result.totalCostUsd, 0)).toBeCloseTo(4, 6);
+  });
+
   it("a turn the server's death ended still reports its spend, on the next turn", async () => {
     const { server } = makeServer();
     const p = makeProvider(server);
